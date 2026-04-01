@@ -569,6 +569,11 @@ impl Parser {
                     let end = self.parse_addition()?;
                     expr = Expr::Range(Box::new(expr), Box::new(end), false);
                 }
+                Token::DotDotEq => {
+                    self.advance();
+                    let end = self.parse_addition()?;
+                    expr = Expr::Range(Box::new(expr), Box::new(end), true);
+                }
                 _ => break,
             }
         }

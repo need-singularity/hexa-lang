@@ -308,7 +308,12 @@ impl Lexer {
             '.' => {
                 if self.peek() == Some('.') {
                     self.advance();
-                    Ok(Token::DotDot)
+                    if self.peek() == Some('=') {
+                        self.advance();
+                        Ok(Token::DotDotEq)
+                    } else {
+                        Ok(Token::DotDot)
+                    }
                 } else {
                     Ok(Token::Dot)
                 }

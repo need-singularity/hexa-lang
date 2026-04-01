@@ -47,8 +47,8 @@ pub enum Token {
     BitAnd, BitOr, BitXor, BitNot,
     // Assignment (φ=2): = :=
     Eq, ColonEq,
-    // Special (φ=2): .. ->
-    DotDot, Arrow,
+    // Special (φ=2): .. ..= ->
+    DotDot, DotDotEq, Arrow,
 
     // === Delimiters ===
     LParen, RParen, LBrace, RBrace, LBracket, RBracket,
