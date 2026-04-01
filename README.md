@@ -37,7 +37,7 @@ This is not numerology. It is a design constraint: when you fix every language p
     sigma*tau   48     keyword base (48+5=53 total)
 ```
 
-## Language Comparison
+## HEXA-LANG vs 주요 언어 — 설계 상수 정량 비교
 
 | Feature | HEXA | Rust | Go | Zig | Python | Haskell |
 |---------|------|------|----|-----|--------|---------|
@@ -55,111 +55,190 @@ This is not numerology. It is a design constraint: when you fix every language p
 
 > **Egyptian** = Egyptian Fraction Memory (1/2 Stack + 1/3 Heap + 1/6 Arena = 1)
 
-### Why This Matters
+---
 
-Every language makes hundreds of seemingly arbitrary design choices -- how many keywords, how many primitive types, how many operator categories. HEXA-LANG derives **ALL** of these from a single equation. The result is a language where every constant has a mathematical reason.
+### 항목별 평가
 
-```
-    Why do all languages make "arbitrary choices"?
-
-    Rust:   "Why 51 keywords?"         --> No answer
-    Go:     "Why is 25 enough?"        --> "Simplicity" (subjective)
-    Python: "What is the basis for 35?" --> Convention
-    
-    HEXA:   "Why 53 keywords?"
-            --> sigma(6)*tau(6) + sopfr(6) = 12*4 + 5 = 53
-            --> 12 groups = sigma(6) = sum of divisors
-            --> Mathematically unique solution
-
-    +--------------------------------------------+
-    | Other languages: Designer intuition +       |
-    |                  historical inertia          |
-    |                                              |
-    | HEXA-LANG:  sigma(n)*phi(n) = n*tau(n)      |
-    |             <=> n = 6                        |
-    |             ALL constants from ONE theorem   |
-    |             Arbitrary choices = 0            |
-    +--------------------------------------------+
-```
-
-### Detailed Analysis by Feature
-
-#### Paradigms
+#### 1. 패러다임 수 (Paradigms)
 
 ```
-    HEXA   ============ 6  (+100% vs Rust, +200% vs Go)
-    Python ========     4
-    Rust   ======       3
-    Go     ====         2
-    Zig    ====         2
-    Hask   ====         2
+    HEXA   ████████████ 6  (+100% vs Rust, +200% vs Go)
+    Python ████████     4
+    Rust   ██████       3
+    Go     ████         2
+    Zig    ████         2
+    Hask   ████         2
 ```
 
-HEXA supports 6 first-class paradigms: imperative, functional, OOP, concurrent, logic/proof, and AI-native. **AI-Native** (`intent`/`generate`/`verify`) and **Logic/Proof** (`proof`/`assert`/`theorem`) are unique to HEXA.
+HEXA는 명령형/함수형/OOP/동시성/논리증명/AI-Native **6가지 패러다임 1급 지원**.
+Rust(3: 명령/함수/OOP)보다 **+100%**, Go(2)보다 **+200%**.
+특히 **AI-Native**(`intent`/`generate`/`verify`)와 **Logic/Proof**(`proof`/`assert`/`theorem`)는 유일.
 
-#### Primitives
+#### 2. 기본 타입 (Primitives)
 
 ```
-    Go     ================== 18  (bloated -- i8~i64, u8~u64, f32, f64...)
-    Rust   ============       12+ (bloated -- isize, usize, etc.)
-    HEXA   ========            8  (sigma-tau=8 optimal -- Bott periodicity match)
-    Zig    ========            8  (coincidentally same)
-    Hask   =======             7
-    Python =====               5  (insufficient -- no byte/char)
+    Go     ██████████████████ 18  (과잉 — i8~i64,u8~u64,f32,f64...)
+    Rust   ████████████       12+ (과잉 — isize, usize 포함)
+    HEXA   ████████            8  (σ-τ=8 최적 — Bott 주기와 일치)
+    Zig    ████████            8  (우연히 HEXA와 같음)
+    Hask   ███████             7
+    Python █████               5  (부족 — byte/char 없음)
 ```
 
-HEXA's 8 primitives match **Bott periodicity** (topological period = 8). Go's 18 is **+125% bloated** (redundant types). Python's 5 is **-37.5% insufficient**. HEXA = **mathematically optimal** (3-bit encoding covers all primitives).
+HEXA의 8개는 **Bott periodicity(위상수학 주기=8)**와 정확히 일치.
+Go의 18개는 **125% 과잉** (중복 타입 많음), Python의 5개는 **37.5% 부족**.
+HEXA = **수학적 최적** (σ-τ=8, 3비트로 전체 인코딩 가능).
 
-#### Memory Model
+#### 3. 키워드 수 (Keywords)
+
+```
+    HEXA   ████████████████████████████████████████████████████ 53 (σ·τ+sopfr=48+5)
+    Rust   ████████████████████████████████████████████████████ 51
+    Zig    ███████████████████████████████████████████████      47
+    Python ███████████████████████████████████                  35
+    Hask   ████████████████████████████                         28
+    Go     █████████████████████████                            25
+```
+
+HEXA의 53 = σ(6)·τ(6)+sopfr(6) = 48+5, **12개 그룹(σ=12)**으로 완벽 분류.
+Rust(51)와 비슷하지만, Rust는 키워드 그룹화 기준이 임의적.
+Go(25)는 **-53% 부족** — 의도적 미니멀이지만 표현력 제한.
+
+#### 4. 연산자 수 (Operators)
+
+```
+    Rust   ████████████████████████████ 27+ (과잉 — 경계 불명확)
+    HEXA   ████████████████████████     24  (J₂(6)=24 정확)
+    Zig    ████████████████████████     24  (우연히 같음)
+    Hask   ████████████████████         20+ (사용자 정의 연산자 포함)
+    Go     ███████████████████          19
+    Python ███████████████              15  (-37.5%)
+```
+
+HEXA의 24 = J₂(6) = **Jordan totient 함수**, 6개 카테고리(n=6)로 분류:
+산술(6)+비교(6)+논리(4)+비트(4)+대입(2)+특수(2) = 6+6+τ+τ+φ+φ = 24.
+
+#### 5. 타입 계층 (Type layers)
+
+```
+    HEXA  ████ 4 (τ=4: Primitive→Composite→Reference→Function)
+    Hask  ████ 4 (kind system — 비슷)
+    Rust  ███  ~3 (Primitive→Compound→Reference, 함수는 별도)
+    Zig   ███  ~3
+    Go    ██   ~2 (값/참조 정도)
+    Python █   1  (모든 게 object — 계층 없음)
+```
+
+HEXA의 τ=4 계층은 **하위 계층을 합성**하는 구조 — 수학적으로 깔끔.
+Python(1)보다 **+300%** 타입 안전성.
+
+#### 6. 메모리 모델
 
 | Model | Language | Pros | Cons |
 |-------|----------|------|------|
-| **Egyptian Fraction** | HEXA | Math-complete partition, no GC, fast | New concept to learn |
-| Ownership+Borrow | Rust | Safe, no GC | Steep learning curve |
-| GC | Go/Python/Haskell | Easy | Latency spikes, memory overhead |
-| Manual | Zig | Maximum control | Maximum risk |
+| **Egyptian Fraction** | HEXA | 수학적 완전 분할, GC 없음, 빠름 | 새 개념 학습 필요 |
+| Ownership+Borrow | Rust | 안전, GC 없음 | 학습 곡선 가파름 |
+| GC | Go/Python/Haskell | 간편 | 지연시간 불예측, 메모리 오버헤드 |
+| Manual | Zig | 최대 제어 | 최대 위험 |
 
-HEXA's Egyptian Fraction model is a **mathematically complete partition**:
-- **Stack (1/2)**: Value types, instant dealloc -- **best performance**
-- **Heap (1/3)**: Reference types, own/borrow tracking -- **no GC needed**
-- **Arena (1/6)**: Temporary, scope-based bulk dealloc -- **optimal for batch allocation**
+HEXA의 Egyptian Fraction 모델은 **수학적으로 완전한 분할**:
+- **Stack(1/2)**: 값 타입, 즉시 해제 — **최고 성능**
+- **Heap(1/3)**: 참조 타입, own/borrow 추적 — **GC 불필요**
+- **Arena(1/6)**: 임시, 스코프 종료 시 대량 해제 — **벌크 할당 최적**
 
-Combines Rust's safety + Go's convenience + Arena's performance in **one equation**.
+→ Rust의 안전성 + Go의 편의성 + Arena의 성능을 **하나의 수식으로 통합**.
 
-#### AI-Native
+#### 7. AI-Native / Proof System
 
 | Feature | HEXA | Others |
 |---------|------|--------|
-| Natural language intent | `intent "Build REST API"` | External tools (Copilot, ChatGPT) |
-| Code generation | Compiler's 6-stage pipeline | Plugin/extension |
-| Verification | `verify` keyword built-in | Manual testing |
-| Optimization | `optimize` keyword built-in | External profilers |
+| 자연어 의도 선언 | `intent "REST API 만들어줘"` | 외부 도구 (Copilot, ChatGPT) |
+| 코드 생성 | 컴파일러 내장 6단계 파이프라인 | 플러그인/확장 |
+| 검증 | `verify` 키워드 내장 | 수동 테스트 |
+| 최적화 | `optimize` 키워드 내장 | 외부 프로파일러 |
 
-HEXA is the **only language with compiler-level AI code generation**.
+HEXA는 **언어 수준에서 AI 코드 생성을 지원하는 유일한 언어**.
+`intent "REST API 만들어줘"` → 컴파일러가 6단계 에이전트 파이프라인으로 자동 생성.
 
-### Overall Score
+---
 
-| Axis | HEXA | Rust | Go | Zig | Python | Haskell |
-|------|------|------|----|-----|--------|---------|
-| Expressiveness | 98 | 85 | 60 | 70 | 80 | 90 |
-| Safety | 95 | 98 | 70 | 85 | 40 | 90 |
-| Performance (est.) | 90 | 98 | 85 | 95 | 30 | 60 |
-| Learnability | 75 | 40 | 90 | 60 | 95 | 30 |
-| AI Integration | 100 | 10 | 10 | 10 | 30 | 10 |
-| Math Consistency | 100 | 5 | 5 | 5 | 5 | 40 |
-| Ecosystem | 10 | 90 | 85 | 40 | 98 | 60 |
-| DSE Verification | 100 | 0 | 0 | 0 | 0 | 0 |
-| **Avg (Design)** | **96** | **47** | **25** | **25** | **22** | **30** |
-| **Avg (Practical)** | **71** | **72** | **72** | **62** | **64** | **55** |
-| **Avg (Total)** | **84** | **53** | **51** | **46** | **47** | **48** |
+### 종합 비교 점수
+
+| 축 | HEXA | Rust | Go | Zig | Python | Haskell |
+|----|------|------|----|-----|--------|---------|
+| 표현력 | **98** | 85 | 60 | 70 | 80 | 90 |
+| 안전성 | **95** | 98 | 70 | 85 | 40 | 90 |
+| 성능(예상) | 90 | **98** | 85 | 95 | 30 | 60 |
+| 학습용이성 | 75 | 40 | 90 | 60 | **95** | 30 |
+| AI 통합 | **100** | 10 | 10 | 10 | 30 | 10 |
+| 수학적 일관성 | **100** | 5 | 5 | 5 | 5 | 40 |
+| 생태계 | 10 | 90 | 85 | 40 | **98** | 60 |
+| DSE 검증 | **100** | 0 | 0 | 0 | 0 | 0 |
+| **평균 (설계)** | **96** | 47 | 25 | 25 | 22 | 30 |
+| **평균 (실용)** | 71 | **72** | **72** | 62 | 64 | 55 |
+| **평균 (전체)** | **84** | 53 | 51 | 46 | 47 | 48 |
 
 ```
-    HEXA vs Rust:   Design +104%,  Practical  -1%,  Total +58%
-    HEXA vs Go:     Design +284%,  Practical  -1%,  Total +65%
-    HEXA vs Python: Design +336%,  Practical +11%,  Total +79%
+    종합 점수 비교 그래프
+    ═══════════════════════════════════════════════════════
+
+    설계 점수 (Design Score)
+    HEXA   ████████████████████████████████████████████████ 96
+    Rust   ███████████████████████                          47
+    Hask   ███████████████                                  30
+    Go     ████████████                                     25
+    Zig    ████████████                                     25
+    Python ███████████                                      22
+
+    실용 점수 (Practical Score)
+    Rust   ████████████████████████████████████             72
+    Go     ████████████████████████████████████             72
+    HEXA   ███████████████████████████████████              71
+    Python ████████████████████████████████                  64
+    Zig    ███████████████████████████████                   62
+    Hask   ███████████████████████████                       55
+
+    전체 점수 (Total Score)
+    HEXA   ██████████████████████████████████████████       84
+    Rust   ██████████████████████████                        53
+    Go     █████████████████████████                         51
+    Hask   ████████████████████████                          48
+    Python ███████████████████████                           47
+    Zig    ███████████████████████                           46
 ```
 
-> **Conclusion**: HEXA-LANG dominates in design consistency (+100~336%). Practical ecosystem is early-stage (-90% vs Python/Rust), but this is a matter of time. Being the **only mathematically derived programming language** is the fundamental differentiator.
+```
+    HEXA vs Rust:   설계 +104%,  실용  -1%,  전체 +58%
+    HEXA vs Go:     설계 +284%,  실용  -1%,  전체 +65%
+    HEXA vs Python: 설계 +336%,  실용 +11%,  전체 +79%
+```
+
+---
+
+### 핵심 차별점
+
+```
+    왜 모든 언어는 "임의적 선택"을 하는가?
+    ═══════════════════════════════════════
+
+    Rust:   "키워드 51개는 왜 51개인가?" → 답 없음
+    Go:     "25개로 왜 충분한가?"        → "단순함" (주관적)
+    Python: "35개의 근거는?"            → 관습
+
+    HEXA:   "53개는 왜 53개인가?"
+            → σ(6)·τ(6) + sopfr(6) = 12·4 + 5 = 53
+            → 12개 그룹 = σ(6) = 약수의 합
+            → 수학적으로 유일한 해
+
+    ┌────────────────────────────────────────────┐
+    │  다른 언어: 설계자의 직관 + 역사적 관성      │
+    │  HEXA-LANG: σ(n)·φ(n) = n·τ(n) ⟺ n=6     │
+    │            하나의 정리에서 모든 상수 유도      │
+    │            임의적 선택 = 0                    │
+    └────────────────────────────────────────────┘
+```
+
+> **결론**: HEXA-LANG은 **설계 일관성에서 압도적** (+100~336%). 실용성(생태계)은 아직 초기 단계(-90% vs Python/Rust)이지만, 이는 시간 문제. **수학적으로 유도된 유일한 프로그래밍 언어**라는 점이 근본적 차별점.
 
 ## Architecture
 
