@@ -1,5 +1,10 @@
 # HEXA-LANG
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.19365284.svg)](https://doi.org/10.5281/zenodo.19365284)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Tests](https://img.shields.io/badge/tests-58%20passing-brightgreen.svg)]()
+[![n6 EXACT](https://img.shields.io/badge/n%3D6%20EXACT-100%25-gold.svg)]()
+
 ```
     +==================================================+
     ||              H E X A - L A N G                  ||
