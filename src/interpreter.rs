@@ -790,4 +790,107 @@ mod tests {
         let src = "fn fact(n: int) -> int {\n  if n <= 1 { return 1 }\n  return n * fact(n - 1)\n}\nfact(6)";
         assert!(matches!(eval(src), Value::Int(720)));
     }
+
+    // ── Integration tests (Task 13) ─────────────────────────
+
+    #[test]
+    fn test_run_hello_example() {
+        let source = std::fs::read_to_string("examples/hello.hexa").unwrap();
+        let tokens = Lexer::new(&source).tokenize().unwrap();
+        let stmts = Parser::new(tokens).parse().unwrap();
+        let mut interp = Interpreter::new();
+        interp.run(&stmts).unwrap();
+    }
+
+    #[test]
+    fn test_run_fibonacci_example() {
+        let source = std::fs::read_to_string("examples/fibonacci.hexa").unwrap();
+        let tokens = Lexer::new(&source).tokenize().unwrap();
+        let stmts = Parser::new(tokens).parse().unwrap();
+        let mut interp = Interpreter::new();
+        interp.run(&stmts).unwrap();
+    }
+
+    #[test]
+    fn test_run_sigma_phi_example() {
+        let source = std::fs::read_to_string("examples/sigma_phi.hexa").unwrap();
+        let tokens = Lexer::new(&source).tokenize().unwrap();
+        let stmts = Parser::new(tokens).parse().unwrap();
+        let mut interp = Interpreter::new();
+        interp.run(&stmts).unwrap();
+    }
+
+    #[test]
+    fn test_run_egyptian_fraction_example() {
+        let source = std::fs::read_to_string("examples/egyptian_fraction.hexa").unwrap();
+        let tokens = Lexer::new(&source).tokenize().unwrap();
+        let stmts = Parser::new(tokens).parse().unwrap();
+        let mut interp = Interpreter::new();
+        interp.run(&stmts).unwrap();
+    }
+
+    #[test]
+    fn test_run_pattern_match_example() {
+        let source = std::fs::read_to_string("examples/pattern_match.hexa").unwrap();
+        let tokens = Lexer::new(&source).tokenize().unwrap();
+        let stmts = Parser::new(tokens).parse().unwrap();
+        let mut interp = Interpreter::new();
+        interp.run(&stmts).unwrap();
+    }
+
+    #[test]
+    fn test_n6_constants_comprehensive() {
+        assert!(matches!(eval("sigma(6)"), Value::Int(12)));
+        assert!(matches!(eval("phi(6)"), Value::Int(2)));
+        assert!(matches!(eval("tau(6)"), Value::Int(4)));
+        assert!(matches!(eval("sigma(6) * phi(6)"), Value::Int(24)));
+        assert!(matches!(eval("6 * tau(6)"), Value::Int(24)));
+        assert!(matches!(eval("sigma(6) * phi(6) == 6 * tau(6)"), Value::Bool(true)));
+    }
+
+    #[test]
+    fn test_factorial_720() {
+        let src = "fn fact(n: int) -> int {\n  if n <= 1 { return 1 }\n  return n * fact(n - 1)\n}\nfact(6)";
+        assert!(matches!(eval(src), Value::Int(720))); // 6! = 720
+    }
+
+    #[test]
+    fn test_inclusive_range() {
+        let src = "let mut s = 0\nfor i in 1..=6 {\n  s = s + i\n}\ns";
+        assert!(matches!(eval(src), Value::Int(21))); // 1+2+3+4+5+6 = 21
+    }
+
+    #[test]
+    fn test_fibonacci_function() {
+        let src = "fn fib(n: int) -> int {\n  if n <= 1 { return n }\n  return fib(n - 1) + fib(n - 2)\n}\nfib(6)";
+        assert!(matches!(eval(src), Value::Int(8))); // fib(6) = 8
+    }
+
+    #[test]
+    fn test_float_arithmetic() {
+        let src = "1.0 / 2.0 + 1.0 / 3.0 + 1.0 / 6.0";
+        match eval(src) {
+            Value::Float(f) => assert!((f - 1.0).abs() < 1e-10),
+            other => panic!("expected Float, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_string_return() {
+        let src = "fn greet() -> string {\n  return \"hexa\"\n}\ngreet()";
+        assert!(matches!(eval(src), Value::Str(s) if s == "hexa"));
+    }
+
+    #[test]
+    fn test_nested_if() {
+        let src = "fn classify(n: int) -> int {\n  if n % 6 == 0 { return 6 }\n  if n % 3 == 0 { return 3 }\n  if n % 2 == 0 { return 2 }\n  return 1\n}\nclassify(12)";
+        assert!(matches!(eval(src), Value::Int(6)));
+    }
+
+    #[test]
+    fn test_sigma_other_values() {
+        assert!(matches!(eval("sigma(1)"), Value::Int(1)));
+        assert!(matches!(eval("sigma(12)"), Value::Int(28)));
+        assert!(matches!(eval("sigma(28)"), Value::Int(56))); // 28 is perfect: sigma(28)=56=2*28
+    }
 }
