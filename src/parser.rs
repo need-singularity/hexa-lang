@@ -1794,4 +1794,27 @@ mod tests {
         let stmts = parse_source("resume(42)");
         assert!(matches!(&stmts[0], Stmt::Expr(Expr::Resume(_))));
     }
+
+    #[test]
+    fn test_parse_scope() {
+        let stmts = parse_source("scope {\n  spawn { 1 + 2 }\n  spawn { 3 + 4 }\n}");
+        assert!(matches!(&stmts[0], Stmt::Scope(_)));
+        if let Stmt::Scope(body) = &stmts[0] {
+            assert_eq!(body.len(), 2);
+            assert!(matches!(&body[0], Stmt::Spawn(_)));
+            assert!(matches!(&body[1], Stmt::Spawn(_)));
+        }
+    }
+
+    #[test]
+    fn test_parse_nested_scope() {
+        let src = "scope {\n  spawn { 1 }\n  scope {\n    spawn { 2 }\n  }\n}";
+        let stmts = parse_source(src);
+        assert!(matches!(&stmts[0], Stmt::Scope(_)));
+        if let Stmt::Scope(body) = &stmts[0] {
+            assert_eq!(body.len(), 2);
+            assert!(matches!(&body[0], Stmt::Spawn(_)));
+            assert!(matches!(&body[1], Stmt::Scope(_)));
+        }
+    }
 }

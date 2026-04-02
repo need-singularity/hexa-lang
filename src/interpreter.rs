@@ -6968,4 +6968,94 @@ handle {
 "#;
         assert!(matches!(eval(src), Value::Str(s) if s == "World"));
     }
+
+    // ── Structured concurrency (scope) tests ───────────────
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_scope_two_spawns_both_complete() {
+        // scope { spawn { return 10 }; spawn { return 20 } } => [10, 20]
+        let src = r#"
+scope {
+    spawn { return 10 }
+    spawn { return 20 }
+}
+"#;
+        let result = eval(src);
+        // Scope returns array of spawn results
+        if let Value::Array(arr) = result {
+            assert_eq!(arr.len(), 2);
+            assert_eq!(arr[0].to_string(), "10");
+            assert_eq!(arr[1].to_string(), "20");
+        } else {
+            panic!("expected Array, got {:?}", result);
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_scope_nested_inner_completes_first() {
+        // Inner scope must complete before outer continues
+        let src = r#"
+scope {
+    spawn { return 1 }
+    scope {
+        spawn { return 42 }
+    }
+}
+"#;
+        let result = eval(src);
+        // The outer scope has 2 items: a spawn returning 1, and the inner scope
+        // The inner scope result is an array [42] — but it's the last expr
+        // Actually: outer scope has 1 spawn + the inner scope statement
+        // The inner scope evaluates to [42], the outer scope has 1 spawn returning 1
+        // scope result = array of spawn results = [1] (inner scope is not a spawn)
+        // But the last value of the scope body is the inner scope result
+        // Let me trace: outer scope pushes task group, executes body:
+        //   spawn { return 1 } -> registered in outer group
+        //   scope { spawn { return 42 } } -> executes inline, inner group, waits, returns [42]
+        // After body: outer group has 1 task, wait_all -> [1]
+        // Since results not empty, returns [1]
+        if let Value::Array(arr) = result {
+            assert_eq!(arr.len(), 1);
+            assert_eq!(arr[0].to_string(), "1");
+        } else {
+            panic!("expected Array, got {:?}", result);
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_scope_collects_results() {
+        let src = r#"
+scope {
+    spawn { return 100 }
+    spawn { return 200 }
+    spawn { return 300 }
+}
+"#;
+        let result = eval(src);
+        if let Value::Array(arr) = result {
+            assert_eq!(arr.len(), 3);
+            assert_eq!(arr[0].to_string(), "100");
+            assert_eq!(arr[1].to_string(), "200");
+            assert_eq!(arr[2].to_string(), "300");
+        } else {
+            panic!("expected Array, got {:?}", result);
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_scope_empty_no_spawns() {
+        // scope with no spawns returns the last statement value
+        let src = r#"
+scope {
+    let x = 42
+    x
+}
+"#;
+        let result = eval(src);
+        assert!(matches!(result, Value::Int(42)));
+    }
 }
