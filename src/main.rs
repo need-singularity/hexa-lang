@@ -39,7 +39,11 @@ mod linter;
 #[allow(dead_code)]
 mod macro_expand;
 #[allow(dead_code)]
+mod comptime;
+#[allow(dead_code)]
 mod llm;
+#[allow(dead_code)]
+mod memory;
 
 use std::io::{self, Write, BufRead};
 
@@ -70,6 +74,15 @@ fn main() {
             }
             "--lsp" => lsp::run_lsp(),
             "--bench" => run_benchmark(),
+            "--mem-stats" => {
+                if args.len() < 3 {
+                    eprintln!("Usage: hexa --mem-stats <file.hexa> [--memory-budget <MB>]");
+                    std::process::exit(1);
+                }
+                let file = &args[2];
+                let budget = parse_memory_budget(&args);
+                run_file_with_mem_stats(file, budget);
+            }
             "build" => {
                 if args.len() < 4 || args[2] != "--target" {
                     eprintln!("Usage: hexa build --target <esp32|fpga|wgpu|cpu> <file.hexa>");
@@ -151,6 +164,69 @@ fn run_file(path: &str) {
         }
     };
     run_source_with_dir(&source, path);
+}
+
+fn parse_memory_budget(args: &[String]) -> usize {
+    for i in 0..args.len() {
+        if args[i] == "--memory-budget" {
+            if let Some(mb_str) = args.get(i + 1) {
+                if let Ok(mb) = mb_str.parse::<usize>() {
+                    return mb * 1024 * 1024;
+                }
+            }
+        }
+    }
+    memory::DEFAULT_BUDGET
+}
+
+fn run_file_with_mem_stats(path: &str, budget: usize) {
+    let source = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error reading {}: {}", path, e);
+            std::process::exit(1);
+        }
+    };
+    let source_lines: Vec<String> = source.lines().map(String::from).collect();
+    let file_name = path;
+    let tokens = match lexer::Lexer::new(&source).tokenize() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(1);
+        }
+    };
+    let result = match parser::Parser::new(tokens).parse_with_spans() {
+        Ok(r) => r,
+        Err(e) => {
+            eprint_diagnostic(&e, &source_lines, file_name);
+            std::process::exit(1);
+        }
+    };
+    let mut checker = type_checker::TypeChecker::new();
+    if let Err(e) = checker.check(&result.stmts, &result.spans) {
+        eprint_diagnostic(&e, &source_lines, file_name);
+        std::process::exit(1);
+    }
+    let mut interp = interpreter::Interpreter::new_with_memory_budget(budget);
+    interp.source_lines = source_lines.clone();
+    interp.file_name = file_name.to_string();
+    if !path.is_empty() {
+        let p = std::path::Path::new(path);
+        if let Some(parent) = p.parent() {
+            interp.source_dir = Some(parent.to_string_lossy().to_string());
+        }
+    }
+    match interp.run_with_spans(&result.stmts, &result.spans) {
+        Ok(_) => {}
+        Err(e) => {
+            eprint_diagnostic(&e, &source_lines, file_name);
+            std::process::exit(1);
+        }
+    }
+    // Print memory report after execution
+    println!();
+    println!("{}", interp.memory_stats());
 }
 
 fn run_test(path: &str) {

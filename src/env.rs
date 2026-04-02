@@ -26,6 +26,8 @@ pub enum Value {
     Receiver(Arc<Mutex<mpsc::Receiver<Value>>>), // channel receiver
     Future(Arc<Mutex<Option<Value>>>),           // async future value
     Set(Arc<Mutex<std::collections::HashSet<String>>>), // unique value set
+    /// Algebraic effect request — propagated up the call stack to be caught by a handler.
+    EffectRequest(String, String, Vec<Value>),  // effect_name, op_name, args
 }
 
 impl std::fmt::Display for Value {
@@ -88,6 +90,7 @@ impl std::fmt::Display for Value {
                 let items: Vec<String> = guard.iter().cloned().collect();
                 write!(f, "Set({{{}}})", items.join(", "))
             }
+            Value::EffectRequest(effect, op, _) => write!(f, "<effect {}.{}>", effect, op),
         }
     }
 }
@@ -220,6 +223,11 @@ impl Env {
         env.define("hexad_left", Value::BuiltinFn("hexad_left".into()));
         // Number theory: sopfr (sum of prime factors with repetition)
         env.define("sopfr", Value::BuiltinFn("sopfr".into()));
+        // Egyptian Fraction memory introspection (1/2 + 1/3 + 1/6 = 1)
+        env.define("mem_stats", Value::BuiltinFn("mem_stats".into()));
+        env.define("mem_region", Value::BuiltinFn("mem_region".into()));
+        env.define("arena_reset", Value::BuiltinFn("arena_reset".into()));
+        env.define("mem_budget", Value::BuiltinFn("mem_budget".into()));
         env
 
     }

@@ -406,6 +406,18 @@ impl TypeChecker {
                     .unwrap_or(CheckType::Unknown);
                 self.define(&decl.name, CheckType::Fn(param_types, Box::new(ret)));
             }
+            Stmt::ComptimeFn(decl) => {
+                let param_types: Vec<CheckType> = decl.params.iter()
+                    .map(|p| p.typ.as_ref()
+                        .map(|t| CheckType::from_annotation(t))
+                        .unwrap_or(CheckType::Unknown))
+                    .collect();
+                let ret = decl.ret_type.as_ref()
+                    .map(|t| CheckType::from_annotation(t))
+                    .unwrap_or(CheckType::Unknown);
+                self.define(&decl.name, CheckType::Fn(param_types, Box::new(ret)));
+            }
+            Stmt::EffectDecl(_) => {}
         }
     }
 

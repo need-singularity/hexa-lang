@@ -28,6 +28,11 @@ pub enum Expr {
     Borrow(Box<Expr>),  // borrow x — read-only reference
     Await(Box<Expr>),   // await expr — await a future value
     MacroInvoc(MacroInvocation),  // name!(args) or name![args]
+    Comptime(Box<Expr>),           // comptime { ... } — compile-time evaluated block
+    // Algebraic effects
+    HandleWith(Box<Expr>, Vec<EffectHandler>),  // handle { body } with { handlers }
+    EffectCall(String, String, Vec<Expr>),       // Effect.op(args)
+    Resume(Box<Expr>),                           // resume(val)
 }
 
 #[allow(dead_code)]
@@ -72,6 +77,9 @@ pub enum Stmt {
     DeriveDecl(String, Vec<String>),  // derive(Trait1, Trait2) for TypeName
     Generate(GenerateTarget),  // generate fn/expr with LLM
     Optimize(FnDecl),          // optimize fn with LLM rewrite
+    ComptimeFn(FnDecl),        // comptime fn — function evaluated at compile time
+    // Algebraic effects
+    EffectDecl(EffectDecl),    // effect Name { fn op(...) -> ret }
 }
 
 /// Target for AI code generation.
@@ -219,6 +227,7 @@ pub struct FnDecl {
     pub where_clauses: Vec<WhereClause>,  // where T: Display, U: Clone
     pub body: Block,
     pub vis: Visibility,
+    pub is_pure: bool,  // pure fn — no effects allowed
 }
 
 #[allow(dead_code)]
@@ -272,6 +281,33 @@ pub struct ImplBlock {
 pub struct MatchArm {
     pub pattern: Expr,
     pub guard: Option<Expr>,
+    pub body: Block,
+}
+
+// ── Algebraic effects ────────────────────────────────────
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct EffectDecl {
+    pub name: String,
+    pub type_params: Vec<String>,
+    pub operations: Vec<EffectOp>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct EffectOp {
+    pub name: String,
+    pub params: Vec<Param>,
+    pub return_type: Option<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct EffectHandler {
+    pub effect: String,
+    pub op: String,
+    pub params: Vec<String>,
     pub body: Block,
 }
 

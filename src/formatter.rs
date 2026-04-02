@@ -234,6 +234,12 @@ fn format_stmt(stmt: &Stmt, indent: usize) -> String {
         Stmt::Optimize(decl) => {
             format!("{}optimize fn {}", prefix, decl.name)
         }
+        Stmt::ComptimeFn(decl) => {
+            format_fn_decl(decl, indent, false).replacen("fn ", "comptime fn ", 1)
+        }
+        Stmt::EffectDecl(_) => {
+            format!("{}effect {{ ... }}", prefix)
+        }
     }
 }
 
@@ -355,6 +361,12 @@ fn format_expr(expr: &Expr) -> String {
         Expr::MacroInvoc(invoc) => {
             format!("{}!(...)", invoc.name)
         }
+        Expr::Comptime(inner) => {
+            format!("comptime {}", format_expr(inner))
+        }
+        Expr::HandleWith(_, _) => "handle { ... } with { ... }".to_string(),
+        Expr::EffectCall(effect, op, _) => format!("{}.{}(...)", effect, op),
+        Expr::Resume(inner) => format!("resume({})", format_expr(inner)),
     }
 }
 

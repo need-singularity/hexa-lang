@@ -434,7 +434,8 @@ impl Compiler {
             | Stmt::AsyncFnDecl(_) | Stmt::Select(_)
             | Stmt::Const(_, _, _, _) | Stmt::Static(_, _, _, _)
             | Stmt::MacroDef(_) | Stmt::DeriveDecl(_, _)
-            | Stmt::Generate(_) | Stmt::Optimize(_) => Ok(()),
+            | Stmt::Generate(_) | Stmt::Optimize(_)
+            | Stmt::ComptimeFn(_) | Stmt::EffectDecl(_) => Ok(()),
         }
     }
 
@@ -714,7 +715,8 @@ impl Compiler {
             Expr::Lambda(_, _) | Expr::Field(_, _) | Expr::Match(_, _)
             | Expr::StructInit(_, _) | Expr::MapLit(_) | Expr::EnumPath(_, _, _)
             | Expr::Wildcard | Expr::Own(_) | Expr::MoveExpr(_) | Expr::Borrow(_)
-            | Expr::Await(_) | Expr::MacroInvoc(_) => {
+            | Expr::Await(_) | Expr::MacroInvoc(_) | Expr::Comptime(_)
+            | Expr::HandleWith(_, _) | Expr::EffectCall(_, _, _) | Expr::Resume(_) => {
                 chunk.emit(OpCode::Void);
                 Ok(())
             }

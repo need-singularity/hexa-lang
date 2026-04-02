@@ -7,6 +7,7 @@ use crate::ast::*;
 use crate::env::{Env, Value};
 use crate::error::{HexaError, ErrorClass};
 use crate::lexer::Lexer;
+use crate::memory::{EgyptianMemory, MemRegion, MemoryStats, estimate_value_size, classify_region};
 use crate::parser::Parser;
 
 /// Sentinel error message used to propagate `return` across call frames.
@@ -51,6 +52,22 @@ pub struct Interpreter {
     named_spawns: HashMap<String, thread::JoinHandle<()>>,
     /// Macro definitions: name -> StoredMacro
     macro_defs: HashMap<String, crate::macro_expand::StoredMacro>,
+    /// Compile-time function definitions: name -> (param_names, body)
+    comptime_fns: HashMap<String, (Vec<String>, Vec<Stmt>)>,
+    /// When true, I/O and side-effectful builtins are forbidden (comptime mode).
+    comptime_mode: bool,
+    /// Algebraic effect definitions: effect_name -> list of operation names
+    effect_defs: HashMap<String, Vec<String>>,
+    /// Algebraic effect handler stack: each entry is a map of (effect.op) -> handler
+    effect_handler_stack: Vec<HashMap<String, (Vec<String>, Vec<Stmt>)>>,
+    /// Current effect request being handled (for resume)
+    effect_request: Option<Value>,
+    /// Resume value set by resume(val) in a handler
+    resume_value: Option<Value>,
+    /// Whether we are inside a pure function (effects disallowed)
+    in_pure_fn: bool,
+    /// Egyptian Fraction memory manager (1/2 + 1/3 + 1/6 = 1, n=6).
+    pub memory: EgyptianMemory,
 }
 
 /// Stored data for a loaded/declared module.
@@ -85,7 +102,37 @@ impl Interpreter {
             spawn_handles: Vec::new(),
             named_spawns: HashMap::new(),
             macro_defs: HashMap::new(),
+            comptime_fns: HashMap::new(),
+            effect_defs: HashMap::new(),
+            effect_handler_stack: Vec::new(),
+            effect_request: None,
+            resume_value: None,
+            in_pure_fn: false,
+            comptime_mode: false,
+            memory: EgyptianMemory::with_default_budget(),
         }
+    }
+
+    /// Create an interpreter with a specific memory budget in bytes.
+    pub fn new_with_memory_budget(budget: usize) -> Self {
+        let mut s = Self::new();
+        s.memory = EgyptianMemory::new(budget);
+        s
+    }
+
+    /// Get memory stats as a displayable report.
+    pub fn memory_stats(&self) -> MemoryStats {
+        self.memory.stats()
+    }
+
+    /// Enable or disable comptime (sandboxed) mode.
+    pub fn set_comptime_mode(&mut self, mode: bool) {
+        self.comptime_mode = mode;
+    }
+
+    /// Public wrapper around eval_expr for use by the comptime evaluator.
+    pub fn eval_expr_pub(&mut self, expr: &Expr) -> Result<Value, HexaError> {
+        self.eval_expr(expr)
     }
 
     // ── Public entry point ──────────────────────────────────
@@ -150,6 +197,14 @@ impl Interpreter {
                     Some(e) => self.eval_expr(e)?,
                     None => Value::Void,
                 };
+                // Track allocation in Egyptian memory
+                let size = estimate_value_size(&val);
+                let region = classify_region(&val);
+                match region {
+                    MemRegion::Stack => { let _ = self.memory.stack_alloc(name, size); }
+                    MemRegion::Heap => { let _ = self.memory.heap_alloc(name, size); }
+                    MemRegion::Arena => { let _ = self.memory.arena_alloc(size); }
+                }
                 self.env.define(name, val);
                 if is_own {
                     use crate::env::OwnershipState;
@@ -243,9 +298,14 @@ impl Interpreter {
             }
             Stmt::FnDecl(decl) => {
                 let param_names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
+                let internal_name = if decl.is_pure {
+                    format!("__pure__{}", decl.name)
+                } else {
+                    decl.name.clone()
+                };
                 self.env.define(
                     &decl.name,
-                    Value::Fn(decl.name.clone(), param_names, decl.body.clone()),
+                    Value::Fn(internal_name, param_names, decl.body.clone()),
                 );
                 Ok(Value::Void)
             }
@@ -413,6 +473,23 @@ impl Interpreter {
                 self.macro_defs.insert(mac_def.name.clone(), crate::macro_expand::StoredMacro {
                     rules: mac_def.rules.clone(),
                 });
+                Ok(Value::Void)
+            }
+            Stmt::ComptimeFn(decl) => {
+                // Register a compile-time function (available only in comptime contexts)
+                let param_names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
+                self.comptime_fns.insert(decl.name.clone(), (param_names.clone(), decl.body.clone()));
+                // Also make it callable as a regular function so `const X = factorial(10)` works
+                self.env.define(
+                    &decl.name,
+                    Value::Fn(decl.name.clone(), param_names, decl.body.clone()),
+                );
+                Ok(Value::Void)
+            }
+            Stmt::EffectDecl(decl) => {
+                // Register effect definition: store operation names
+                let op_names: Vec<String> = decl.operations.iter().map(|o| o.name.clone()).collect();
+                self.effect_defs.insert(decl.name.clone(), op_names);
                 Ok(Value::Void)
             }
             Stmt::DeriveDecl(type_name, traits) => {
@@ -702,6 +779,14 @@ impl Interpreter {
                 self.eval_unary(op, val)
             }
             Expr::Call(callee, args) => {
+                // Check for effect call: Effect.op(args) where Effect is a known effect
+                if let Expr::Field(obj_expr, method_name) = callee.as_ref() {
+                    if let Expr::Ident(name) = obj_expr.as_ref() {
+                        if self.effect_defs.contains_key(name) {
+                            return self.eval_effect_call(name, method_name, args);
+                        }
+                    }
+                }
                 // Check for method call pattern: obj.method(args)
                 if let Expr::Field(obj_expr, method_name) = callee.as_ref() {
                     let obj_val = self.eval_expr(obj_expr)?;
@@ -1131,6 +1216,21 @@ impl Interpreter {
                 self.env.pop_scope();
                 Ok(last)
             }
+            Expr::Comptime(inner) => {
+                // Evaluate the inner expression in a sandboxed comptime interpreter
+                crate::comptime::eval_comptime(inner, &self.comptime_fns)
+            }
+            Expr::HandleWith(body_expr, handlers) => {
+                self.eval_handle_with(body_expr, handlers)
+            }
+            Expr::EffectCall(effect, op, args) => {
+                self.eval_effect_call(effect, op, args)
+            }
+            Expr::Resume(val_expr) => {
+                let val = self.eval_expr(val_expr)?;
+                self.resume_value = Some(val.clone());
+                Ok(val)
+            }
         }
     }
 
@@ -1320,8 +1420,21 @@ impl Interpreter {
                         args.len()
                     )));
                 }
+                let is_pure = _name.starts_with("__pure__");
+                let prev_pure = self.in_pure_fn;
+                if is_pure { self.in_pure_fn = true; }
+                // Track memory frame for Egyptian allocator
+                self.memory.push_frame(&_name);
                 self.env.push_scope();
                 for (param, arg) in params.iter().zip(args) {
+                    // Track parameter allocation in Egyptian memory
+                    let size = estimate_value_size(&arg);
+                    let region = classify_region(&arg);
+                    match region {
+                        MemRegion::Stack => { let _ = self.memory.stack_alloc(param, size); }
+                        MemRegion::Heap => { let _ = self.memory.heap_alloc(param, size); }
+                        MemRegion::Arena => { let _ = self.memory.arena_alloc(size); }
+                    }
                     self.env.define(param, arg);
                 }
                 let mut result = Value::Void;
@@ -1331,8 +1444,14 @@ impl Interpreter {
                         result = self.return_value.take().unwrap();
                         break;
                     }
+                    // Propagate effect requests up the call stack
+                    if matches!(result, Value::EffectRequest(..)) {
+                        break;
+                    }
                 }
                 self.env.pop_scope();
+                self.memory.pop_frame();
+                self.in_pure_fn = prev_pure;
                 Ok(result)
             }
             Value::Lambda(params, body, captured) => {
@@ -1865,6 +1984,12 @@ impl Interpreter {
     }
 
     fn call_builtin(&mut self, name: &str, args: Vec<Value>) -> Result<Value, HexaError> {
+        // Block I/O and side-effectful builtins in comptime mode
+        if self.comptime_mode && crate::comptime::is_forbidden_builtin(name) {
+            return Err(self.runtime_err(format!(
+                "comptime blocks cannot perform I/O: '{}' is not allowed at compile time", name
+            )));
+        }
         match name {
             "print" => {
                 for (i, arg) in args.iter().enumerate() {
@@ -1923,6 +2048,7 @@ impl Interpreter {
                         Value::Receiver(_) => "receiver",
                         Value::Future(_) => "future",
                         Value::Set(_) => "set",
+                        Value::EffectRequest(_, _, _) => "effect_request",
                     }
                     .to_string(),
                 ))
@@ -2592,6 +2718,47 @@ impl Interpreter {
                     Err(self.type_err("sopfr() requires int".into()))
                 }
             }
+            // ── Egyptian Fraction memory introspection (1/2 + 1/3 + 1/6 = 1) ──
+            "mem_stats" => {
+                let stats = self.memory.stats();
+                let mut map = HashMap::new();
+                map.insert("stack_used".into(), Value::Int(stats.stack_used as i64));
+                map.insert("stack_capacity".into(), Value::Int(stats.stack_capacity as i64));
+                map.insert("heap_used".into(), Value::Int(stats.heap_used as i64));
+                map.insert("heap_capacity".into(), Value::Int(stats.heap_capacity as i64));
+                map.insert("heap_allocs".into(), Value::Int(stats.heap_allocs as i64));
+                map.insert("arena_used".into(), Value::Int(stats.arena_used as i64));
+                map.insert("arena_capacity".into(), Value::Int(stats.arena_capacity as i64));
+                map.insert("arena_resets".into(), Value::Int(stats.arena_resets as i64));
+                map.insert("total_budget".into(), Value::Int(stats.total_budget as i64));
+                map.insert("total_allocs".into(), Value::Int(stats.total_allocs as i64));
+                map.insert("stack_frames".into(), Value::Int(stats.stack_frame_depth as i64));
+                Ok(Value::Map(map))
+            }
+            "mem_region" => {
+                if args.is_empty() {
+                    return Err(self.type_err("mem_region() requires 1 argument".into()));
+                }
+                let region = classify_region(&args[0]);
+                Ok(Value::Str(region.to_string()))
+            }
+            "arena_reset" => {
+                self.memory.arena_reset();
+                Ok(Value::Void)
+            }
+            "mem_budget" => {
+                let total = self.memory.total_budget();
+                let mut map = HashMap::new();
+                map.insert("total".into(), Value::Int(total as i64));
+                map.insert("stack".into(), Value::Int((total / 2) as i64));
+                map.insert("heap".into(), Value::Int((total / 3) as i64));
+                map.insert("arena".into(), Value::Int((total / 6) as i64));
+                map.insert("stack_fraction".into(), Value::Str("1/2".into()));
+                map.insert("heap_fraction".into(), Value::Str("1/3".into()));
+                map.insert("arena_fraction".into(), Value::Str("1/6".into()));
+                map.insert("identity".into(), Value::Str("1/2 + 1/3 + 1/6 = 1".into()));
+                Ok(Value::Map(map))
+            }
             _ => Err(HexaError {
                 class: ErrorClass::Name,
                 message: format!("unknown builtin: {}", name),
@@ -3177,6 +3344,70 @@ impl Interpreter {
             }
             _ => "...".into(),
         }
+    }
+
+    /// Evaluate an algebraic effect call: Effect.op(args)
+    fn eval_effect_call(&mut self, effect: &str, op: &str, arg_exprs: &[Expr]) -> Result<Value, HexaError> {
+        // Pure function check
+        if self.in_pure_fn {
+            return Err(self.runtime_err(format!(
+                "effect {}.{} not allowed in pure function", effect, op
+            )));
+        }
+        // Verify the effect and operation exist
+        if let Some(ops) = self.effect_defs.get(effect) {
+            if !ops.iter().any(|o| o == op) {
+                return Err(self.runtime_err(format!(
+                    "undefined operation '{}' on effect '{}'", op, effect
+                )));
+            }
+        } else {
+            return Err(self.runtime_err(format!(
+                "undefined effect: {}", effect
+            )));
+        }
+        let mut args = Vec::new();
+        for a in arg_exprs {
+            args.push(self.eval_expr(a)?);
+        }
+        // Check if there's a handler on the stack
+        let key = format!("{}.{}", effect, op);
+        let handler = self.effect_handler_stack.iter().rev()
+            .find_map(|handlers| handlers.get(&key).cloned());
+        if let Some((params, body)) = handler {
+            self.env.push_scope();
+            for (p, a) in params.iter().zip(args.iter()) {
+                self.env.define(p, a.clone());
+            }
+            self.resume_value = None;
+            let mut result = Value::Void;
+            for stmt in &body {
+                result = self.exec_stmt(stmt)?;
+                if self.return_value.is_some() {
+                    result = self.return_value.take().unwrap();
+                    break;
+                }
+            }
+            self.env.pop_scope();
+            // resume(val) sets resume_value; use it if present
+            return Ok(self.resume_value.take().unwrap_or(result));
+        }
+        // No handler found — propagate as EffectRequest
+        Ok(Value::EffectRequest(effect.to_string(), op.to_string(), args))
+    }
+
+    /// Evaluate a handle-with expression: handle { body } with { handlers }
+    fn eval_handle_with(&mut self, body_expr: &Expr, handlers: &[crate::ast::EffectHandler]) -> Result<Value, HexaError> {
+        // Push handler frame
+        let mut handler_map: HashMap<String, (Vec<String>, Vec<crate::ast::Stmt>)> = HashMap::new();
+        for h in handlers {
+            let key = format!("{}.{}", h.effect, h.op);
+            handler_map.insert(key, (h.params.clone(), h.body.clone()));
+        }
+        self.effect_handler_stack.push(handler_map);
+        let result = self.eval_expr(body_expr);
+        self.effect_handler_stack.pop();
+        result
     }
 
     fn runtime_err(&self, message: String) -> HexaError {
@@ -5871,5 +6102,149 @@ len(hexa_tokens)
             "HEXA lexer produced {} tokens, Rust lexer produced {} tokens for hello.hexa",
             hexa_count, rust_count
         );
+    }
+
+    // ── Algebraic effects tests ─────────────────────────────
+
+    #[test]
+    fn test_effect_decl_and_handle() {
+        let src = r#"
+effect Ask {
+    fn question(prompt: str) -> str
+}
+let answer = handle {
+    Ask.question("name?")
+} with {
+    Ask.question(p) => {
+        resume("Alice")
+    }
+}
+answer
+"#;
+        assert!(matches!(eval(src), Value::Str(s) if s == "Alice"));
+    }
+
+    #[test]
+    fn test_effect_resume_value() {
+        let src = r#"
+effect Counter {
+    fn next() -> int
+}
+handle {
+    let a = Counter.next()
+    let b = Counter.next()
+    a + b
+} with {
+    Counter.next() => {
+        resume(5)
+    }
+}
+"#;
+        assert!(matches!(eval(src), Value::Int(10)));
+    }
+
+    #[test]
+    fn test_effect_handler_without_resume() {
+        let src = r#"
+effect Choice {
+    fn pick() -> int
+}
+handle {
+    Choice.pick()
+} with {
+    Choice.pick() => {
+        99
+    }
+}
+"#;
+        assert!(matches!(eval(src), Value::Int(99)));
+    }
+
+    #[test]
+    fn test_pure_fn_works() {
+        let src = r#"
+pure fn add(a: int, b: int) -> int {
+    a + b
+}
+add(3, 4)
+"#;
+        assert!(matches!(eval(src), Value::Int(7)));
+    }
+
+    #[test]
+    fn test_pure_fn_rejects_effects() {
+        let src = r#"
+effect Bad {
+    fn boom() -> int
+}
+pure fn should_fail() -> int {
+    Bad.boom()
+}
+should_fail()
+"#;
+        let tokens = Lexer::new(src).tokenize().unwrap();
+        let stmts = Parser::new(tokens).parse().unwrap();
+        let mut interp = Interpreter::new();
+        let result = interp.run(&stmts);
+        assert!(result.is_err(), "pure fn should reject effect calls");
+    }
+
+    #[test]
+    fn test_nested_handle() {
+        let src = r#"
+effect A {
+    fn get_a() -> int
+}
+effect B {
+    fn get_b() -> int
+}
+handle {
+    let a = A.get_a()
+    let b = handle {
+        B.get_b()
+    } with {
+        B.get_b() => { resume(20) }
+    }
+    a + b
+} with {
+    A.get_a() => { resume(10) }
+}
+"#;
+        assert!(matches!(eval(src), Value::Int(30)));
+    }
+
+    #[test]
+    fn test_effect_with_multiple_params() {
+        let src = r#"
+effect Math {
+    fn compute(a: int, b: int) -> int
+}
+handle {
+    Math.compute(3, 7)
+} with {
+    Math.compute(a, b) => {
+        resume(a * b)
+    }
+}
+"#;
+        assert!(matches!(eval(src), Value::Int(21)));
+    }
+
+    #[test]
+    fn test_effect_through_function_call() {
+        let src = r#"
+effect Greeting {
+    fn name() -> str
+}
+fn greet() -> str {
+    Greeting.name()
+}
+handle {
+    greet()
+} with {
+    Greeting.name() => { resume("World") }
+}
+"#;
+        assert!(matches!(eval(src), Value::Str(s) if s == "World"));
     }
 }

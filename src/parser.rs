@@ -165,6 +165,9 @@ impl Parser {
             Token::Derive => self.parse_derive_decl(),
             Token::Generate => self.parse_generate(),
             Token::Optimize => self.parse_optimize(),
+            Token::Comptime => self.parse_comptime_stmt(),
+            Token::Effect => self.parse_effect_decl(),
+            Token::Pure => self.parse_pure_fn(vis),
             _ => {
                 let expr = self.parse_expr()?;
                 // Check for assignment
@@ -334,6 +337,42 @@ impl Parser {
         Ok(Stmt::Spawn(body))
     }
 
+    fn parse_comptime_stmt(&mut self) -> Result<Stmt, HexaError> {
+        self.advance(); // consume 'comptime'
+        // comptime fn name(...) -> ret { ... } — compile-time function declaration
+        if matches!(self.peek(), Token::Fn) {
+            self.advance(); // consume 'fn'
+            let name = self.expect_ident()?;
+            let type_params = if matches!(self.peek(), Token::Lt) {
+                self.parse_type_params()?
+            } else {
+                vec![]
+            };
+            self.expect(&Token::LParen)?;
+            let params = self.parse_params()?;
+            self.expect(&Token::RParen)?;
+            let ret_type = if matches!(self.peek(), Token::Arrow) {
+                self.advance();
+                Some(self.expect_ident()?)
+            } else {
+                None
+            };
+            let where_clauses = if matches!(self.peek(), Token::Where) {
+                self.parse_where_clauses()?
+            } else {
+                vec![]
+            };
+            let body = self.parse_block()?;
+            return Ok(Stmt::ComptimeFn(FnDecl {
+                name, type_params, params, ret_type, where_clauses, body,
+                vis: Visibility::Private, is_pure: false,
+            }));
+        }
+        // comptime { ... } — compile-time block as expression statement
+        let block = self.parse_block()?;
+        Ok(Stmt::Expr(Expr::Comptime(Box::new(Expr::Block(block)))))
+    }
+
     fn parse_async_fn(&mut self, vis: Visibility) -> Result<Stmt, HexaError> {
         self.advance(); // consume 'async'
         // Expect 'fn' after 'async'
@@ -354,7 +393,7 @@ impl Parser {
             None
         };
         let body = self.parse_block()?;
-        Ok(Stmt::AsyncFnDecl(FnDecl { name, type_params, params, ret_type, where_clauses: vec![], body, vis }))
+        Ok(Stmt::AsyncFnDecl(FnDecl { name, type_params, params, ret_type, where_clauses: vec![], body, vis, is_pure: false }))
     }
 
     fn parse_select(&mut self) -> Result<Stmt, HexaError> {
@@ -480,6 +519,7 @@ impl Parser {
             where_clauses: vec![],
             body,
             vis: Visibility::Private,
+            is_pure: false,
         };
         Ok(Stmt::Optimize(decl))
     }
@@ -776,7 +816,7 @@ impl Parser {
             vec![]
         };
         let body = self.parse_block()?;
-        Ok(Stmt::FnDecl(FnDecl { name, type_params, params, ret_type, where_clauses, body, vis }))
+        Ok(Stmt::FnDecl(FnDecl { name, type_params, params, ret_type, where_clauses, body, vis, is_pure: false }))
     }
 
     /// Parse type parameters: `<T>`, `<T: Display>`, `<T, U>`, `<T: Display, U: Clone>`
@@ -930,7 +970,7 @@ impl Parser {
             } else {
                 vec![]
             };
-            methods.push(FnDecl { name: m_name, type_params: vec![], params: m_params, ret_type: m_ret, where_clauses: vec![], body: m_body, vis: m_vis });
+            methods.push(FnDecl { name: m_name, type_params: vec![], params: m_params, ret_type: m_ret, where_clauses: vec![], body: m_body, vis: m_vis, is_pure: false });
             self.skip_newlines();
         }
         self.expect(&Token::RBrace)?;
@@ -968,7 +1008,7 @@ impl Parser {
                 None
             };
             let m_body = self.parse_block()?;
-            methods.push(FnDecl { name: m_name, type_params: vec![], params: m_params, ret_type: m_ret, where_clauses: vec![], body: m_body, vis: m_vis });
+            methods.push(FnDecl { name: m_name, type_params: vec![], params: m_params, ret_type: m_ret, where_clauses: vec![], body: m_body, vis: m_vis, is_pure: false });
             self.skip_newlines();
         }
         self.expect(&Token::RBrace)?;
@@ -1406,8 +1446,148 @@ impl Parser {
                 let expr = self.parse_expr()?;
                 Ok(Expr::Borrow(Box::new(expr)))
             }
+            // Comptime block expression: comptime { ... }
+            Token::Comptime => {
+                self.advance();
+                let block = self.parse_block()?;
+                Ok(Expr::Comptime(Box::new(Expr::Block(block))))
+            }
+            // Algebraic effects: handle { ... } with { ... }
+            Token::Handle => self.parse_handle_with_expr(),
+            // Algebraic effects: resume(val)
+            Token::Resume => {
+                self.advance();
+                self.expect(&Token::LParen)?;
+                let val = self.parse_expr()?;
+                self.expect(&Token::RParen)?;
+                Ok(Expr::Resume(Box::new(val)))
+            }
             other => Err(self.error(format!("unexpected token in expression: {:?}", other))),
         }
+    }
+
+    // ── Algebraic effects parsing ────────────────────────────
+
+    /// Parse `effect Name { fn op(params) -> ret; ... }`
+    fn parse_effect_decl(&mut self) -> Result<Stmt, HexaError> {
+        self.advance(); // consume 'effect'
+        let name = self.expect_ident()?;
+        // Optional type params: effect State<T> { ... }
+        let type_params = if matches!(self.peek(), Token::Lt) {
+            self.advance(); // consume <
+            let mut params = Vec::new();
+            loop {
+                params.push(self.expect_ident()?);
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+            self.expect(&Token::Gt)?;
+            params
+        } else {
+            vec![]
+        };
+        self.skip_newlines();
+        self.expect(&Token::LBrace)?;
+        self.skip_newlines();
+        let mut operations = Vec::new();
+        while !matches!(self.peek(), Token::RBrace | Token::Eof) {
+            self.expect(&Token::Fn)?;
+            let op_name = self.expect_ident()?;
+            self.expect(&Token::LParen)?;
+            let params = self.parse_params()?;
+            self.expect(&Token::RParen)?;
+            let ret_type = if matches!(self.peek(), Token::Arrow) {
+                self.advance();
+                // Accept both identifier and () for void return
+                if matches!(self.peek(), Token::LParen) {
+                    self.advance();
+                    self.expect(&Token::RParen)?;
+                    None // () means void
+                } else {
+                    Some(self.expect_ident()?)
+                }
+            } else {
+                None
+            };
+            operations.push(EffectOp { name: op_name, params, return_type: ret_type });
+            self.skip_newlines();
+        }
+        self.expect(&Token::RBrace)?;
+        Ok(Stmt::EffectDecl(EffectDecl { name, type_params, operations }))
+    }
+
+    /// Parse `pure fn name(...) { ... }`
+    fn parse_pure_fn(&mut self, vis: Visibility) -> Result<Stmt, HexaError> {
+        self.advance(); // consume 'pure'
+        self.expect(&Token::Fn)?;
+        let name = self.expect_ident()?;
+        let type_params = if matches!(self.peek(), Token::Lt) {
+            self.parse_type_params()?
+        } else {
+            vec![]
+        };
+        self.expect(&Token::LParen)?;
+        let params = self.parse_params()?;
+        self.expect(&Token::RParen)?;
+        let ret_type = if matches!(self.peek(), Token::Arrow) {
+            self.advance();
+            Some(self.expect_ident()?)
+        } else {
+            None
+        };
+        let where_clauses = if matches!(self.peek(), Token::Where) {
+            self.parse_where_clauses()?
+        } else {
+            vec![]
+        };
+        let body = self.parse_block()?;
+        Ok(Stmt::FnDecl(FnDecl { name, type_params, params, ret_type, where_clauses, body, vis, is_pure: true }))
+    }
+
+    /// Parse `handle { body } with { Effect.op(params) => { handler }, ... }`
+    fn parse_handle_with_expr(&mut self) -> Result<Expr, HexaError> {
+        self.advance(); // consume 'handle'
+        let body_block = self.parse_block()?;
+        self.skip_newlines();
+        // Expect 'with' — it's an identifier, not a keyword
+        match self.peek().clone() {
+            Token::Ident(ref s) if s == "with" => { self.advance(); }
+            _ => return Err(self.error(format!("expected 'with' after handle block, got {:?}", self.peek()))),
+        }
+        self.skip_newlines();
+        self.expect(&Token::LBrace)?;
+        self.skip_newlines();
+        let mut handlers = Vec::new();
+        while !matches!(self.peek(), Token::RBrace | Token::Eof) {
+            // Parse: Effect.op(params) => { body }
+            let effect_name = self.expect_ident()?;
+            self.expect(&Token::Dot)?;
+            let op_name = self.expect_ident()?;
+            // Optional params
+            let mut params = Vec::new();
+            if matches!(self.peek(), Token::LParen) {
+                self.advance();
+                while !matches!(self.peek(), Token::RParen | Token::Eof) {
+                    params.push(self.expect_ident()?);
+                    if matches!(self.peek(), Token::Comma) {
+                        self.advance();
+                    }
+                }
+                self.expect(&Token::RParen)?;
+            }
+            self.expect(&Token::FatArrow)?;
+            let body = self.parse_block()?;
+            handlers.push(EffectHandler { effect: effect_name, op: op_name, params, body });
+            self.skip_newlines();
+        }
+        self.expect(&Token::RBrace)?;
+        Ok(Expr::HandleWith(
+            Box::new(Expr::Block(body_block)),
+            handlers,
+        ))
     }
 }
 
@@ -1467,5 +1647,63 @@ mod tests {
         } else {
             panic!("Expected Binary Add at top level");
         }
+    }
+
+    #[test]
+    fn test_parse_effect_decl() {
+        let stmts = parse_source("effect Console {\n  fn log(msg: str)\n  fn read() -> str\n}");
+        if let Stmt::EffectDecl(decl) = &stmts[0] {
+            assert_eq!(decl.name, "Console");
+            assert_eq!(decl.operations.len(), 2);
+            assert_eq!(decl.operations[0].name, "log");
+            assert_eq!(decl.operations[1].name, "read");
+            assert!(decl.operations[1].return_type.is_some());
+        } else {
+            panic!("Expected EffectDecl");
+        }
+    }
+
+    #[test]
+    fn test_parse_effect_decl_with_type_params() {
+        let stmts = parse_source("effect State<T> {\n  fn get() -> T\n  fn set(val: T)\n}");
+        if let Stmt::EffectDecl(decl) = &stmts[0] {
+            assert_eq!(decl.name, "State");
+            assert_eq!(decl.type_params, vec!["T".to_string()]);
+            assert_eq!(decl.operations.len(), 2);
+        } else {
+            panic!("Expected EffectDecl");
+        }
+    }
+
+    #[test]
+    fn test_parse_pure_fn() {
+        let stmts = parse_source("pure fn add(a: int, b: int) -> int {\n  a + b\n}");
+        if let Stmt::FnDecl(decl) = &stmts[0] {
+            assert_eq!(decl.name, "add");
+            assert!(decl.is_pure);
+            assert_eq!(decl.params.len(), 2);
+        } else {
+            panic!("Expected FnDecl");
+        }
+    }
+
+    #[test]
+    fn test_parse_handle_with() {
+        let stmts = parse_source("handle {\n  42\n} with {\n  E.op(x) => {\n    resume(x)\n  }\n}");
+        if let Stmt::Expr(Expr::HandleWith(body, handlers)) = &stmts[0] {
+            assert!(matches!(body.as_ref(), Expr::Block(_)));
+            assert_eq!(handlers.len(), 1);
+            assert_eq!(handlers[0].effect, "E");
+            assert_eq!(handlers[0].op, "op");
+            assert_eq!(handlers[0].params, vec!["x".to_string()]);
+        } else {
+            panic!("Expected HandleWith expr, got {:?}", &stmts[0]);
+        }
+    }
+
+    #[test]
+    fn test_parse_resume() {
+        let stmts = parse_source("resume(42)");
+        assert!(matches!(&stmts[0], Stmt::Expr(Expr::Resume(_))));
     }
 }

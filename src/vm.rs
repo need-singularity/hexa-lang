@@ -492,6 +492,7 @@ impl VM {
                     Value::Receiver(_) => "receiver",
                     Value::Future(_) => "future",
                     Value::Set(_) => "set",
+                    Value::EffectRequest(_, _, _) => "effect_request",
                 };
                 Ok(Value::Str(type_name.to_string()))
             }
