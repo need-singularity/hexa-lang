@@ -30,6 +30,8 @@ mod codegen_esp32;
 mod codegen_verilog;
 #[allow(dead_code)]
 mod codegen_wgsl;
+#[allow(dead_code)]
+mod nanbox;
 
 use std::io::{self, Write, BufRead};
 
@@ -346,6 +348,10 @@ fn run_file_native(path: &str) {
 fn run_benchmark() {
     use std::time::Instant;
 
+    println!("=== HEXA-LANG Performance Benchmark Suite ===");
+    println!("Phase 10: Performance Optimization\n");
+
+    // ---- Benchmark 1: fib(30) ----
     let fib_src = r#"
 fn fib(n) {
     if n <= 1 { return n }
@@ -354,43 +360,169 @@ fn fib(n) {
 fib(30)
 "#;
 
-    // Parse once
     let tokens = lexer::Lexer::new(fib_src).tokenize().unwrap();
     let stmts = parser::Parser::new(tokens).parse().unwrap();
 
     // Tree-walk interpreter
     let start = Instant::now();
     let mut interp = interpreter::Interpreter::new();
-    let tree_result = interp.run(&stmts).unwrap();
-    let tree_time = start.elapsed();
+    let tree_fib = interp.run(&stmts).unwrap();
+    let tree_fib_time = start.elapsed();
 
     // VM
     let mut comp = compiler::Compiler::new();
     let chunk = comp.compile(&stmts).unwrap();
     let start = Instant::now();
     let mut machine = vm::VM::new();
-    let vm_result = machine.execute(&chunk).unwrap();
-    let vm_time = start.elapsed();
+    let vm_fib = machine.execute(&chunk).unwrap();
+    let vm_fib_time = start.elapsed();
+
+    // VM + Optimized (DCE)
+    let mut comp2 = compiler::Compiler::new();
+    let chunk2 = comp2.compile(&stmts).unwrap();
+    let start = Instant::now();
+    let mut machine2 = vm::VM::new();
+    let vm_opt_fib = machine2.execute_optimized(&chunk2).unwrap();
+    let vm_opt_fib_time = start.elapsed();
 
     // Native (Cranelift JIT)
     let tokens2 = lexer::Lexer::new(fib_src).tokenize().unwrap();
     let stmts2 = parser::Parser::new(tokens2).parse().unwrap();
     let start = Instant::now();
     let mut jit_compiler = jit::JitCompiler::new().unwrap();
-    let native_result = jit_compiler.compile_and_run(&stmts2).unwrap();
-    let native_time = start.elapsed();
+    let native_fib = jit_compiler.compile_and_run(&stmts2).unwrap();
+    let native_fib_time = start.elapsed();
 
-    println!("=== HEXA-LANG Benchmark: fib(30) ===");
-    println!("Tree-walk:    {} = {:?}", tree_result, tree_time);
-    println!("Bytecode VM:  {} = {:?}", vm_result, vm_time);
-    println!("Native (JIT): {} = {:?}", native_result, native_time);
+    // ---- Benchmark 2: loop sum 1M ----
+    let loop_src = r#"
+let mut sum = 0
+let mut i = 0
+while i < 1000000 {
+    sum = sum + i
+    i = i + 1
+}
+sum
+"#;
+
+    let tokens_l = lexer::Lexer::new(loop_src).tokenize().unwrap();
+    let stmts_l = parser::Parser::new(tokens_l).parse().unwrap();
+
+    let start = Instant::now();
+    let mut interp2 = interpreter::Interpreter::new();
+    let tree_loop = interp2.run(&stmts_l).unwrap();
+    let tree_loop_time = start.elapsed();
+
+    let mut comp_l = compiler::Compiler::new();
+    let chunk_l = comp_l.compile(&stmts_l).unwrap();
+    let start = Instant::now();
+    let mut machine_l = vm::VM::new();
+    let vm_loop = machine_l.execute(&chunk_l).unwrap();
+    let vm_loop_time = start.elapsed();
+
+    let mut comp_l2 = compiler::Compiler::new();
+    let chunk_l2 = comp_l2.compile(&stmts_l).unwrap();
+    let start = Instant::now();
+    let mut machine_l2 = vm::VM::new();
+    let _vm_opt_loop = machine_l2.execute_optimized(&chunk_l2).unwrap();
+    let vm_opt_loop_time = start.elapsed();
+
+    // ---- Benchmark 3: nested function calls ----
+    let call_src = r#"
+fn square(x) { return x * x }
+fn sum_squares(n) {
+    let mut s = 0
+    let mut i = 1
+    while i <= n {
+        s = s + square(i)
+        i = i + 1
+    }
+    return s
+}
+sum_squares(10000)
+"#;
+
+    let tokens_a = lexer::Lexer::new(call_src).tokenize().unwrap();
+    let stmts_a = parser::Parser::new(tokens_a).parse().unwrap();
+
+    let start = Instant::now();
+    let mut interp3 = interpreter::Interpreter::new();
+    let tree_call = interp3.run(&stmts_a).unwrap();
+    let tree_call_time = start.elapsed();
+
+    let mut comp_a = compiler::Compiler::new();
+    let chunk_a = comp_a.compile(&stmts_a).unwrap();
+    let start = Instant::now();
+    let mut machine_a = vm::VM::new();
+    let vm_call = machine_a.execute(&chunk_a).unwrap();
+    let vm_call_time = start.elapsed();
+
+    let mut comp_a2 = compiler::Compiler::new();
+    let chunk_a2 = comp_a2.compile(&stmts_a).unwrap();
+    let start = Instant::now();
+    let mut machine_a2 = vm::VM::new();
+    let _vm_opt_call = machine_a2.execute_optimized(&chunk_a2).unwrap();
+    let vm_opt_call_time = start.elapsed();
+
+    // ---- Benchmark 4: const folding (compile-time math) ----
+    let fold_src = "3 + 4 * 5 - 2";
+    let tokens_f = lexer::Lexer::new(fold_src).tokenize().unwrap();
+    let stmts_f = parser::Parser::new(tokens_f).parse().unwrap();
+
+    let start = Instant::now();
+    for _ in 0..10000 {
+        let mut comp_f = compiler::Compiler::new();
+        let _ = comp_f.compile(&stmts_f).unwrap();
+    }
+    let compile_time = start.elapsed();
+
+    // ---- NaN-boxing size report ----
+    let value_size = std::mem::size_of::<env::Value>();
+    let nanbox_size = std::mem::size_of::<nanbox::NanBoxed>();
+
+    // ---- Print results ----
+    println!("Backend         fib(30)      loop(1M)     calls(10K)");
+    println!("{}", "-".repeat(58));
+    println!("Tree-walk       {:>8.3}s    {:>8.3}s    {:>8.3}s",
+        tree_fib_time.as_secs_f64(), tree_loop_time.as_secs_f64(), tree_call_time.as_secs_f64());
+    println!("VM              {:>8.3}s    {:>8.3}s    {:>8.3}s",
+        vm_fib_time.as_secs_f64(), vm_loop_time.as_secs_f64(), vm_call_time.as_secs_f64());
+    println!("VM+Optimized    {:>8.3}s    {:>8.3}s    {:>8.3}s",
+        vm_opt_fib_time.as_secs_f64(), vm_opt_loop_time.as_secs_f64(), vm_opt_call_time.as_secs_f64());
+    println!("Native (JIT)    {:>8.4}s    N/A          N/A",
+        native_fib_time.as_secs_f64());
+
     println!();
-    let vm_speedup = tree_time.as_secs_f64() / vm_time.as_secs_f64();
-    let native_speedup = tree_time.as_secs_f64() / native_time.as_secs_f64();
-    let native_vs_vm = vm_time.as_secs_f64() / native_time.as_secs_f64();
-    println!("VM vs Tree-walk:     {:.1}x", vm_speedup);
-    println!("Native vs Tree-walk: {:.1}x", native_speedup);
-    println!("Native vs VM:        {:.1}x", native_vs_vm);
+    println!("--- Speedups (vs Tree-walk) ---");
+    let vm_fib_sp = tree_fib_time.as_secs_f64() / vm_fib_time.as_secs_f64();
+    let vm_opt_fib_sp = tree_fib_time.as_secs_f64() / vm_opt_fib_time.as_secs_f64();
+    let native_fib_sp = tree_fib_time.as_secs_f64() / native_fib_time.as_secs_f64();
+    let vm_loop_sp = tree_loop_time.as_secs_f64() / vm_loop_time.as_secs_f64();
+    let vm_opt_loop_sp = tree_loop_time.as_secs_f64() / vm_opt_loop_time.as_secs_f64();
+    let vm_call_sp = tree_call_time.as_secs_f64() / vm_call_time.as_secs_f64();
+    let vm_opt_call_sp = tree_call_time.as_secs_f64() / vm_opt_call_time.as_secs_f64();
+    println!("VM:           fib {:.1}x, loop {:.1}x, calls {:.1}x", vm_fib_sp, vm_loop_sp, vm_call_sp);
+    println!("VM+Opt:       fib {:.1}x, loop {:.1}x, calls {:.1}x", vm_opt_fib_sp, vm_opt_loop_sp, vm_opt_call_sp);
+    println!("Native (JIT): fib {:.1}x", native_fib_sp);
+
+    println!();
+    println!("--- Memory Layout ---");
+    println!("Value enum size:  {} bytes", value_size);
+    println!("NanBoxed size:    {} bytes  ({:.0}x smaller)", nanbox_size, value_size as f64 / nanbox_size as f64);
+
+    println!();
+    println!("--- Constant Folding ---");
+    println!("10K compilations of '3+4*5-2': {:?} ({:.1}us/compile)",
+        compile_time, compile_time.as_micros() as f64 / 10000.0);
+
+    println!();
+    println!("--- Verification ---");
+    println!("fib(30):     tree={}, vm={}, vm_opt={}, native={}",
+        tree_fib, vm_fib, vm_opt_fib, native_fib);
+    println!("loop(1M):    tree={}, vm={}", tree_loop, vm_loop);
+    println!("calls(10K):  tree={}, vm={}", tree_call, vm_call);
+    assert_eq!(tree_fib.to_string(), "832040");
+    assert_eq!(vm_fib.to_string(), "832040");
+    assert_eq!(vm_opt_fib.to_string(), "832040");
 }
 
 fn run_repl() {

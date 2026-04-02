@@ -54,10 +54,28 @@ impl VM {
         self.constants = chunk.constants.clone();
         self.functions = chunk.functions.clone();
 
-        // Allocate locals for top-level
+        // Pre-allocate locals for top-level (avoid resizing during execution)
         self.locals.resize(chunk.local_count.max(256), Value::Void);
+        // Pre-allocate stack to avoid resizing
+        self.stack.reserve(256);
 
         self.run_code(&chunk.code)
+    }
+
+    /// Execute a compiled chunk with dead code elimination applied.
+    pub fn execute_optimized(&mut self, chunk: &Chunk) -> Result<Value, HexaError> {
+        self.constants = chunk.constants.clone();
+        self.functions = chunk.functions.clone();
+
+        // Apply dead code elimination
+        let mut optimized_code = chunk.code.clone();
+        crate::compiler::eliminate_dead_code(&mut optimized_code);
+
+        // Pre-allocate
+        self.locals.resize(chunk.local_count.max(256), Value::Void);
+        self.stack.reserve(256);
+
+        self.run_code(&optimized_code)
     }
 
     fn run_code(&mut self, code: &[OpCode]) -> Result<Value, HexaError> {
@@ -924,5 +942,94 @@ for i in 0..3 {
 arr[2]
 "#;
         assert!(matches!(vm_eval(src), Value::Int(20)));
+    }
+
+    // ---- Optimization tests ----
+
+    fn vm_eval_optimized(src: &str) -> Value {
+        let tokens = Lexer::new(src).tokenize().unwrap();
+        let stmts = Parser::new(tokens).parse().unwrap();
+        let mut compiler = Compiler::new();
+        let chunk = compiler.compile(&stmts).unwrap();
+        let mut vm = VM::new();
+        vm.execute_optimized(&chunk).unwrap()
+    }
+
+    #[test]
+    fn test_vm_optimized_fib() {
+        let src = r#"
+fn fib(n) {
+    if n <= 1 { return n }
+    return fib(n - 1) + fib(n - 2)
+}
+fib(10)
+"#;
+        assert!(matches!(vm_eval_optimized(src), Value::Int(55)));
+    }
+
+    #[test]
+    fn test_vm_const_folded_arithmetic() {
+        // Constant folding: 3 + 4 * 5 is parsed as 3 + (4*5)
+        // 4*5 = 20 (folded), then 3+20 = 23 (folded)
+        assert!(matches!(vm_eval("3 + 4 * 5"), Value::Int(23)));
+    }
+
+    #[test]
+    fn test_vm_const_folded_string() {
+        let result = vm_eval("\"hello\" + \" world\"");
+        assert!(matches!(result, Value::Str(s) if s == "hello world"));
+    }
+
+    #[test]
+    fn test_vm_const_folded_comparison() {
+        assert!(matches!(vm_eval("10 > 5"), Value::Bool(true)));
+        assert!(matches!(vm_eval("3 == 3"), Value::Bool(true)));
+    }
+
+    #[test]
+    fn test_vm_optimized_loop() {
+        let src = r#"
+let mut s = 0
+let mut i = 1
+while i <= 100 {
+    s = s + i
+    i = i + 1
+}
+s
+"#;
+        assert!(matches!(vm_eval_optimized(src), Value::Int(5050)));
+    }
+
+    #[test]
+    fn test_vm_nanbox_value_roundtrip() {
+        // Verify NaN-boxing roundtrip through Value conversion
+        use crate::nanbox::NanBoxed;
+
+        let values = vec![
+            Value::Int(42),
+            Value::Int(-100),
+            Value::Int(0),
+            Value::Float(3.14),
+            Value::Float(0.0),
+            Value::Bool(true),
+            Value::Bool(false),
+            Value::Void,
+            Value::Str("hello".into()),
+            Value::Array(vec![Value::Int(1), Value::Int(2)]),
+        ];
+
+        for val in &values {
+            let boxed = NanBoxed::from_value(val);
+            let recovered = boxed.to_value();
+            assert_eq!(val.to_string(), recovered.to_string(),
+                "roundtrip failed for {:?}", val);
+        }
+    }
+
+    #[test]
+    fn test_vm_stack_preallocation() {
+        // Verify VM pre-allocates stack capacity
+        let vm = VM::new();
+        assert!(vm.stack.capacity() >= 256);
     }
 }

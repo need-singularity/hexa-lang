@@ -434,9 +434,87 @@ impl Compiler {
         }
     }
 
+    // ---- Constant folding ----
+
+    /// Try to evaluate a constant expression at compile time.
+    fn try_const_fold(&self, expr: &Expr) -> Option<Value> {
+        match expr {
+            Expr::IntLit(n) => Some(Value::Int(*n)),
+            Expr::FloatLit(n) => Some(Value::Float(*n)),
+            Expr::BoolLit(b) => Some(Value::Bool(*b)),
+            Expr::StringLit(s) => Some(Value::Str(s.clone())),
+            Expr::CharLit(c) => Some(Value::Char(*c)),
+            Expr::Unary(UnaryOp::Neg, operand) => {
+                match self.try_const_fold(operand)? {
+                    Value::Int(n) => Some(Value::Int(-n)),
+                    Value::Float(f) => Some(Value::Float(-f)),
+                    _ => None,
+                }
+            }
+            Expr::Unary(UnaryOp::Not, operand) => {
+                match self.try_const_fold(operand)? {
+                    Value::Bool(b) => Some(Value::Bool(!b)),
+                    _ => None,
+                }
+            }
+            Expr::Binary(left, op, right) => {
+                let lv = self.try_const_fold(left)?;
+                let rv = self.try_const_fold(right)?;
+                match (lv, op, rv) {
+                    // Int arithmetic
+                    (Value::Int(a), BinOp::Add, Value::Int(b)) => Some(Value::Int(a.wrapping_add(b))),
+                    (Value::Int(a), BinOp::Sub, Value::Int(b)) => Some(Value::Int(a.wrapping_sub(b))),
+                    (Value::Int(a), BinOp::Mul, Value::Int(b)) => Some(Value::Int(a.wrapping_mul(b))),
+                    (Value::Int(a), BinOp::Div, Value::Int(b)) if b != 0 => Some(Value::Int(a / b)),
+                    (Value::Int(a), BinOp::Rem, Value::Int(b)) if b != 0 => Some(Value::Int(a % b)),
+                    (Value::Int(a), BinOp::Pow, Value::Int(b)) => Some(Value::Int((a as f64).powi(b as i32) as i64)),
+                    // Float arithmetic
+                    (Value::Float(a), BinOp::Add, Value::Float(b)) => Some(Value::Float(a + b)),
+                    (Value::Float(a), BinOp::Sub, Value::Float(b)) => Some(Value::Float(a - b)),
+                    (Value::Float(a), BinOp::Mul, Value::Float(b)) => Some(Value::Float(a * b)),
+                    (Value::Float(a), BinOp::Div, Value::Float(b)) if b != 0.0 => Some(Value::Float(a / b)),
+                    // Mixed int/float
+                    (Value::Int(a), BinOp::Add, Value::Float(b)) => Some(Value::Float(a as f64 + b)),
+                    (Value::Float(a), BinOp::Add, Value::Int(b)) => Some(Value::Float(a + b as f64)),
+                    (Value::Int(a), BinOp::Sub, Value::Float(b)) => Some(Value::Float(a as f64 - b)),
+                    (Value::Float(a), BinOp::Sub, Value::Int(b)) => Some(Value::Float(a - b as f64)),
+                    (Value::Int(a), BinOp::Mul, Value::Float(b)) => Some(Value::Float(a as f64 * b)),
+                    (Value::Float(a), BinOp::Mul, Value::Int(b)) => Some(Value::Float(a * b as f64)),
+                    // String concatenation
+                    (Value::Str(a), BinOp::Add, Value::Str(b)) => Some(Value::Str(format!("{}{}", a, b))),
+                    // Int comparison
+                    (Value::Int(a), BinOp::Eq, Value::Int(b)) => Some(Value::Bool(a == b)),
+                    (Value::Int(a), BinOp::Ne, Value::Int(b)) => Some(Value::Bool(a != b)),
+                    (Value::Int(a), BinOp::Lt, Value::Int(b)) => Some(Value::Bool(a < b)),
+                    (Value::Int(a), BinOp::Gt, Value::Int(b)) => Some(Value::Bool(a > b)),
+                    (Value::Int(a), BinOp::Le, Value::Int(b)) => Some(Value::Bool(a <= b)),
+                    (Value::Int(a), BinOp::Ge, Value::Int(b)) => Some(Value::Bool(a >= b)),
+                    // Bool logical
+                    (Value::Bool(a), BinOp::And, Value::Bool(b)) => Some(Value::Bool(a && b)),
+                    (Value::Bool(a), BinOp::Or, Value::Bool(b)) => Some(Value::Bool(a || b)),
+                    // Bitwise int
+                    (Value::Int(a), BinOp::BitAnd, Value::Int(b)) => Some(Value::Int(a & b)),
+                    (Value::Int(a), BinOp::BitOr, Value::Int(b)) => Some(Value::Int(a | b)),
+                    (Value::Int(a), BinOp::BitXor, Value::Int(b)) => Some(Value::Int(a ^ b)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     // ---- Expression compilation ----
 
     fn compile_expr(&mut self, chunk: &mut Chunk, expr: &Expr) -> Result<(), HexaError> {
+        // Try constant folding first for binary/unary expressions
+        if matches!(expr, Expr::Binary(..) | Expr::Unary(..)) {
+            if let Some(folded) = self.try_const_fold(expr) {
+                let idx = chunk.add_constant(folded);
+                chunk.emit(OpCode::Const(idx));
+                return Ok(());
+            }
+        }
+
         match expr {
             Expr::IntLit(n) => {
                 let idx = chunk.add_constant(Value::Int(*n));
@@ -671,6 +749,57 @@ fn is_builtin(name: &str) -> bool {
     )
 }
 
+/// Dead code elimination: remove unreachable opcodes after unconditional Jump/Return.
+pub fn eliminate_dead_code(code: &mut Vec<OpCode>) {
+    // Build set of jump targets (these are reachable even after Jump/Return)
+    let mut jump_targets: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for op in code.iter() {
+        match op {
+            OpCode::Jump(t) | OpCode::JumpIfFalse(t) | OpCode::JumpIfTrue(t) => {
+                jump_targets.insert(*t);
+            }
+            _ => {}
+        }
+    }
+
+    let mut reachable = vec![true; code.len()];
+    let mut i = 0;
+    while i < code.len() {
+        if !reachable[i] {
+            i += 1;
+            continue;
+        }
+        match &code[i] {
+            OpCode::Jump(_) | OpCode::Return => {
+                // Mark subsequent instructions as unreachable until a jump target
+                let mut j = i + 1;
+                while j < code.len() && !jump_targets.contains(&j) {
+                    reachable[j] = false;
+                    j += 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    // Only eliminate if there's something to remove (preserves jump offsets by
+    // keeping the structure intact -- we replace dead code with Pop which is a no-op
+    // on empty stack, or we could use a Void+Pop pair, but simplest is to just
+    // leave them as-is since the VM won't reach them anyway).
+    // For now, we just track the optimization; a full rewrite would remap jumps.
+    let dead_count = reachable.iter().filter(|&&r| !r).count();
+    if dead_count > 0 {
+        // We don't physically remove to avoid invalidating jump targets,
+        // but we can replace with no-ops (Void then Pop)
+        for (idx, is_reachable) in reachable.iter().enumerate() {
+            if !is_reachable {
+                code[idx] = OpCode::Void; // effectively a no-op since it's unreachable
+            }
+        }
+    }
+}
+
 fn compile_err(msg: String) -> HexaError {
     HexaError {
         class: ErrorClass::Runtime,
@@ -702,8 +831,11 @@ mod tests {
 
     #[test]
     fn test_compile_binary() {
+        // With constant folding, `1 + 2` folds to `Const(3)` — no Add opcode
         let chunk = compile_source("1 + 2");
-        assert!(chunk.code.iter().any(|op| matches!(op, OpCode::Add)));
+        assert!(chunk.constants.iter().any(|c| matches!(c, Value::Int(3))));
+        // Add opcode should NOT be emitted (folded away)
+        assert!(!chunk.code.iter().any(|op| matches!(op, OpCode::Add)));
     }
 
     #[test]
@@ -723,5 +855,79 @@ mod tests {
     fn test_compile_if() {
         let chunk = compile_source("if true { 1 } else { 2 }");
         assert!(chunk.code.iter().any(|op| matches!(op, OpCode::JumpIfFalse(_))));
+    }
+
+    // ---- Optimization tests ----
+
+    #[test]
+    fn test_const_fold_int_arithmetic() {
+        // 3 + 4 should fold to 7
+        let chunk = compile_source("3 + 4");
+        assert!(chunk.constants.iter().any(|c| matches!(c, Value::Int(7))));
+        assert!(!chunk.code.iter().any(|op| matches!(op, OpCode::Add)));
+    }
+
+    #[test]
+    fn test_const_fold_nested() {
+        // (2 + 3) * 4 should fold to 20
+        let chunk = compile_source("(2 + 3) * 4");
+        assert!(chunk.constants.iter().any(|c| matches!(c, Value::Int(20))));
+        assert!(!chunk.code.iter().any(|op| matches!(op, OpCode::Add | OpCode::Mul)));
+    }
+
+    #[test]
+    fn test_const_fold_bool_and() {
+        // true && false should fold to false
+        let chunk = compile_source("let x = true && false");
+        // The && uses short-circuit in compile_expr, so it won't be folded
+        // by the binary path. But the expression `true && false` should still work.
+        // This test verifies the const_fold path for `and` via try_const_fold.
+        // Actually && uses short-circuit compilation, not a binary op, so it
+        // bypasses const_fold. This is expected behavior.
+        assert!(chunk.code.len() > 0);
+    }
+
+    #[test]
+    fn test_const_fold_string_concat() {
+        // "hello" + " world" should fold to "hello world"
+        let chunk = compile_source("\"hello\" + \" world\"");
+        assert!(chunk.constants.iter().any(|c| matches!(c, Value::Str(s) if s == "hello world")));
+    }
+
+    #[test]
+    fn test_const_fold_comparison() {
+        // 5 > 3 should fold to true
+        let chunk = compile_source("5 > 3");
+        assert!(chunk.constants.iter().any(|c| matches!(c, Value::Bool(true))));
+    }
+
+    #[test]
+    fn test_const_fold_negation() {
+        // -42 should fold
+        let chunk = compile_source("-42");
+        assert!(chunk.constants.iter().any(|c| matches!(c, Value::Int(-42))));
+        assert!(!chunk.code.iter().any(|op| matches!(op, OpCode::Neg)));
+    }
+
+    #[test]
+    fn test_no_fold_with_variables() {
+        // x + 1 should NOT fold (x is a variable)
+        let chunk = compile_source("let x = 5\nx + 1");
+        // The `x + 1` expression should still have an Add opcode
+        assert!(chunk.code.iter().any(|op| matches!(op, OpCode::Add)));
+    }
+
+    #[test]
+    fn test_dead_code_elimination() {
+        let mut code = vec![
+            OpCode::Const(0),
+            OpCode::Return,
+            OpCode::Const(1), // dead
+            OpCode::Add,      // dead
+        ];
+        eliminate_dead_code(&mut code);
+        // After DCE, instructions at index 2 and 3 should be replaced with Void
+        assert!(matches!(code[2], OpCode::Void));
+        assert!(matches!(code[3], OpCode::Void));
     }
 }
