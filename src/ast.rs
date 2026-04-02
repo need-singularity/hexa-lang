@@ -23,6 +23,9 @@ pub enum Expr {
     MapLit(Vec<(Expr, Expr)>),  // { key: val, ... }
     EnumPath(String, String, Option<Box<Expr>>),  // EnumName::Variant(data)
     Wildcard,  // _ pattern (catch-all)
+    Own(Box<Expr>),     // own expr — create owned value
+    MoveExpr(Box<Expr>),  // move x — transfer ownership
+    Borrow(Box<Expr>),  // borrow x — read-only reference
 }
 
 #[allow(dead_code)]
@@ -49,6 +52,7 @@ pub enum Stmt {
     TryCatch(Block, String, Block),  // try { ... } catch e { ... }
     Throw(Expr),
     Spawn(Block),  // spawn { ... } — concurrent execution
+    DropStmt(String),  // drop x — explicit deallocation
 }
 
 // BinOp: 22 binary operators (24 total - 2 unary-only: ! ~)
@@ -81,10 +85,18 @@ pub struct Param {
 #[derive(Debug, Clone)]
 pub struct FnDecl {
     pub name: String,
+    pub type_params: Vec<TypeParam>,  // <T>, <T: Display>, <T, U>
     pub params: Vec<Param>,
     pub ret_type: Option<String>,
     pub body: Block,
     pub vis: Visibility,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct TypeParam {
+    pub name: String,
+    pub bound: Option<String>,  // trait bound: T: Display
 }
 
 #[allow(dead_code)]

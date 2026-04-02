@@ -78,13 +78,25 @@ impl std::fmt::Display for Value {
     }
 }
 
+/// Ownership state for a variable.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OwnershipState {
+    Normal,    // regular variable (no ownership tracking)
+    Owned,     // created with `own`
+    Moved,     // ownership transferred via `move`
+    Borrowed,  // borrowed via `borrow` (read-only)
+    Dropped,   // explicitly dropped via `drop`
+}
+
 pub struct Env {
     pub scopes: Vec<HashMap<String, Value>>,
+    /// Ownership state tracking per variable name (checked at runtime).
+    pub ownership: Vec<HashMap<String, OwnershipState>>,
 }
 
 impl Env {
     pub fn new() -> Self {
-        let mut env = Self { scopes: vec![HashMap::new()] };
+        let mut env = Self { scopes: vec![HashMap::new()], ownership: vec![HashMap::new()] };
         // Register builtins
         env.define("print", Value::BuiltinFn("print".into()));
         env.define("println", Value::BuiltinFn("println".into()));
@@ -163,8 +175,8 @@ impl Env {
 
     }
 
-    pub fn push_scope(&mut self) { self.scopes.push(HashMap::new()); }
-    pub fn pop_scope(&mut self) { self.scopes.pop(); }
+    pub fn push_scope(&mut self) { self.scopes.push(HashMap::new()); self.ownership.push(HashMap::new()); }
+    pub fn pop_scope(&mut self) { self.scopes.pop(); self.ownership.pop(); }
 
     pub fn define(&mut self, name: &str, val: Value) {
         self.scopes.last_mut().unwrap().insert(name.to_string(), val);
@@ -187,6 +199,23 @@ impl Env {
             }
         }
         false
+    }
+
+    /// Set ownership state for a variable.
+    pub fn set_ownership(&mut self, name: &str, state: OwnershipState) {
+        if let Some(scope) = self.ownership.last_mut() {
+            scope.insert(name.to_string(), state);
+        }
+    }
+
+    /// Get ownership state for a variable.
+    pub fn get_ownership(&self, name: &str) -> OwnershipState {
+        for scope in self.ownership.iter().rev() {
+            if let Some(state) = scope.get(name) {
+                return state.clone();
+            }
+        }
+        OwnershipState::Normal
     }
 }
 

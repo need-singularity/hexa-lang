@@ -22,6 +22,7 @@ pub enum CheckType {
     Enum(String),
     Map,
     Error,
+    Generic(String), // type parameter (e.g. T)
     Unknown, // inferred later or unresolvable
 }
 
@@ -64,6 +65,10 @@ impl CheckType {
         if matches!(self, CheckType::Unknown) || matches!(value_type, CheckType::Unknown) {
             return true;
         }
+        // Generic type parameters accept anything (erased at runtime)
+        if matches!(self, CheckType::Generic(_)) || matches!(value_type, CheckType::Generic(_)) {
+            return true;
+        }
         // int -> float implicit coercion
         if matches!(self, CheckType::Float) && matches!(value_type, CheckType::Int) {
             return true;
@@ -103,6 +108,7 @@ impl CheckType {
             CheckType::Enum(name) => name.clone(),
             CheckType::Map => "map".to_string(),
             CheckType::Error => "error".to_string(),
+            CheckType::Generic(name) => name.clone(),
             CheckType::Unknown => "unknown".to_string(),
         }
     }
@@ -115,14 +121,29 @@ struct FnSig {
     ret_type: Option<CheckType>,         // None = no annotation
 }
 
-/// Type checker that runs after parsing, before interpretation.
+/// Stored generic function signature for type checking call sites.
+#[derive(Debug, Clone)]
+struct GenericFnSig {
+    type_params: Vec<String>,  // type parameter names (T, U, etc.)
+    param_types: Vec<Option<CheckType>>,
+    ret_type: Option<CheckType>,
+}
+
 pub struct TypeChecker {
     /// Variable types in nested scopes.
     scopes: Vec<HashMap<String, CheckType>>,
     /// Known function signatures.
     fn_sigs: HashMap<String, FnSig>,
+    /// Known generic function signatures.
+    generic_fn_sigs: HashMap<String, GenericFnSig>,
     /// Known struct declarations.
     struct_defs: HashMap<String, Vec<(String, String)>>, // field name, field type
+    /// Known trait definitions: trait_name -> method names
+    trait_defs: HashMap<String, Vec<String>>,
+    /// Known trait implementations: (type_name, trait_name)
+    trait_impls: std::collections::HashSet<(String, String)>,
+    /// Currently active type parameters (in scope during generic function checking)
+    active_type_params: Vec<String>,
     /// Collected errors.
     errors: Vec<HexaError>,
 }
@@ -132,7 +153,11 @@ impl TypeChecker {
         Self {
             scopes: vec![HashMap::new()],
             fn_sigs: HashMap::new(),
+            generic_fn_sigs: HashMap::new(),
             struct_defs: HashMap::new(),
+            trait_defs: HashMap::new(),
+            trait_impls: std::collections::HashSet::new(),
+            active_type_params: Vec::new(),
             errors: Vec::new(),
         }
     }
@@ -140,23 +165,58 @@ impl TypeChecker {
     /// Run type checking on the parsed AST with span info.
     /// Returns Ok(()) if no type errors, or Err with the first type error.
     pub fn check(&mut self, stmts: &[Stmt], spans: &[(usize, usize)]) -> Result<(), HexaError> {
-        // First pass: collect function signatures and struct definitions
+        // First pass: collect function signatures, struct definitions, traits, impls
         for stmt in stmts {
             match stmt {
                 Stmt::FnDecl(decl) => {
-                    let sig = FnSig {
-                        param_types: decl.params.iter().map(|p| {
-                            p.typ.as_ref().map(|t| CheckType::from_annotation(t))
-                        }).collect(),
-                        ret_type: decl.ret_type.as_ref().map(|t| CheckType::from_annotation(t)),
-                    };
-                    self.fn_sigs.insert(decl.name.clone(), sig);
+                    if decl.type_params.is_empty() {
+                        let sig = FnSig {
+                            param_types: decl.params.iter().map(|p| {
+                                p.typ.as_ref().map(|t| CheckType::from_annotation(t))
+                            }).collect(),
+                            ret_type: decl.ret_type.as_ref().map(|t| CheckType::from_annotation(t)),
+                        };
+                        self.fn_sigs.insert(decl.name.clone(), sig);
+                    } else {
+                        // Generic function: store type params and resolve param types
+                        // with type params treated as Generic types
+                        let type_param_names: Vec<String> = decl.type_params.iter().map(|tp| tp.name.clone()).collect();
+                        let sig = GenericFnSig {
+                            type_params: type_param_names.clone(),
+                            param_types: decl.params.iter().map(|p| {
+                                p.typ.as_ref().map(|t| {
+                                    if type_param_names.contains(t) {
+                                        CheckType::Generic(t.clone())
+                                    } else {
+                                        CheckType::from_annotation(t)
+                                    }
+                                })
+                            }).collect(),
+                            ret_type: decl.ret_type.as_ref().map(|t| {
+                                if type_param_names.contains(t) {
+                                    CheckType::Generic(t.clone())
+                                } else {
+                                    CheckType::from_annotation(t)
+                                }
+                            }),
+                        };
+                        self.generic_fn_sigs.insert(decl.name.clone(), sig);
+                    }
                 }
                 Stmt::StructDecl(decl) => {
                     let fields: Vec<(String, String)> = decl.fields.iter()
                         .map(|(name, typ, _vis)| (name.clone(), typ.clone()))
                         .collect();
                     self.struct_defs.insert(decl.name.clone(), fields);
+                }
+                Stmt::TraitDecl(decl) => {
+                    let method_names: Vec<String> = decl.methods.iter().map(|m| m.name.clone()).collect();
+                    self.trait_defs.insert(decl.name.clone(), method_names);
+                }
+                Stmt::ImplBlock(impl_block) => {
+                    if let Some(trait_name) = &impl_block.trait_name {
+                        self.trait_impls.insert((impl_block.target.clone(), trait_name.clone()));
+                    }
                 }
                 _ => {}
             }
@@ -296,7 +356,7 @@ impl TypeChecker {
             }
             Stmt::StructDecl(_) | Stmt::EnumDecl(_) | Stmt::TraitDecl(_)
             | Stmt::ImplBlock(_) | Stmt::Intent(_, _) | Stmt::Verify(_, _)
-            | Stmt::Mod(_, _) | Stmt::Use(_) => {}
+            | Stmt::Mod(_, _) | Stmt::Use(_) | Stmt::DropStmt(_) => {}
             Stmt::Assert(expr) => {
                 self.check_expr(expr, line, col);
             }
@@ -578,6 +638,9 @@ impl TypeChecker {
             }
             Expr::Lambda(_, _) => CheckType::Unknown, // could be Fn(...) but complex
             Expr::Match(_, _) => CheckType::Unknown,
+            Expr::Own(inner) => self.infer_expr(inner),
+            Expr::MoveExpr(inner) => self.infer_expr(inner),
+            Expr::Borrow(inner) => self.infer_expr(inner),
             Expr::Wildcard => CheckType::Unknown,
         }
     }

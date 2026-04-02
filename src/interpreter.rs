@@ -27,6 +27,10 @@ pub struct Interpreter {
     enum_defs: HashMap<String, Vec<(String, Option<Vec<String>>)>>,
     /// Impl methods: type_name -> method_name -> (param_names, body)
     type_methods: HashMap<String, HashMap<String, (Vec<String>, Vec<Stmt>)>>,
+    /// Trait definitions: trait_name -> list of method names
+    trait_defs: HashMap<String, Vec<String>>,
+    /// Trait implementations: (type_name, trait_name) -> method_name -> (param_names, body)
+    trait_impls: HashMap<(String, String), HashMap<String, (Vec<String>, Vec<Stmt>)>>,
     /// Module scopes: module_name -> module data (public bindings, struct/enum defs)
     modules: HashMap<String, ModuleData>,
     /// When true, proof blocks are executed as tests
@@ -65,6 +69,8 @@ impl Interpreter {
             struct_defs: HashMap::new(),
             enum_defs: HashMap::new(),
             type_methods: HashMap::new(),
+            trait_defs: HashMap::new(),
+            trait_impls: HashMap::new(),
             modules: HashMap::new(),
             test_mode: false,
             current_line: 0,
@@ -132,17 +138,43 @@ impl Interpreter {
     fn exec_stmt(&mut self, stmt: &Stmt) -> Result<Value, HexaError> {
         match stmt {
             Stmt::Let(name, _typ, expr, _vis) => {
+                let is_own = matches!(expr, Some(Expr::Own(_)));
+                let is_borrow = matches!(expr, Some(Expr::Borrow(_)));
                 let val = match expr {
                     Some(e) => self.eval_expr(e)?,
                     None => Value::Void,
                 };
                 self.env.define(name, val);
+                if is_own {
+                    use crate::env::OwnershipState;
+                    self.env.set_ownership(name, OwnershipState::Owned);
+                } else if is_borrow {
+                    use crate::env::OwnershipState;
+                    self.env.set_ownership(name, OwnershipState::Borrowed);
+                }
                 Ok(Value::Void)
             }
             Stmt::Assign(lhs, rhs) => {
                 let val = self.eval_expr(rhs)?;
                 match lhs {
                     Expr::Ident(name) => {
+                        // Check ownership state: borrowed values cannot be mutated
+                        {
+                            use crate::env::OwnershipState;
+                            let state = self.env.get_ownership(name);
+                            match state {
+                                OwnershipState::Borrowed => {
+                                    return Err(self.runtime_err(format!("cannot mutate '{}': value is borrowed (read-only)", name)));
+                                }
+                                OwnershipState::Moved => {
+                                    return Err(self.runtime_err(format!("cannot assign to '{}': value has been moved", name)));
+                                }
+                                OwnershipState::Dropped => {
+                                    return Err(self.runtime_err(format!("cannot assign to '{}': value has been dropped", name)));
+                                }
+                                _ => {}
+                            }
+                        }
                         if !self.env.set(name, val) {
                             return Err(self.runtime_err(format!("undefined variable: {}", name)));
                         }
@@ -276,15 +308,26 @@ impl Interpreter {
                 self.enum_defs.insert(decl.name.clone(), decl.variants.clone());
                 Ok(Value::Void)
             }
-            Stmt::TraitDecl(_) => {
+            Stmt::TraitDecl(decl) => {
+                let method_names: Vec<String> = decl.methods.iter().map(|m| m.name.clone()).collect();
+                self.trait_defs.insert(decl.name.clone(), method_names);
                 Ok(Value::Void)
             }
             Stmt::ImplBlock(impl_block) => {
                 let target = impl_block.target.clone();
-                let methods_map = self.type_methods.entry(target).or_insert_with(HashMap::new);
+                let methods_map = self.type_methods.entry(target.clone()).or_insert_with(HashMap::new);
                 for method in &impl_block.methods {
                     let param_names: Vec<String> = method.params.iter().map(|p| p.name.clone()).collect();
-                    methods_map.insert(method.name.clone(), (param_names, method.body.clone()));
+                    methods_map.insert(method.name.clone(), (param_names.clone(), method.body.clone()));
+                }
+                // If this is a trait impl (impl Trait for Type), also store in trait_impls
+                if let Some(trait_name) = &impl_block.trait_name {
+                    let key = (target.clone(), trait_name.clone());
+                    let trait_methods = self.trait_impls.entry(key).or_insert_with(HashMap::new);
+                    for method in &impl_block.methods {
+                        let param_names: Vec<String> = method.params.iter().map(|p| p.name.clone()).collect();
+                        trait_methods.insert(method.name.clone(), (param_names, method.body.clone()));
+                    }
                 }
                 Ok(Value::Void)
             }
@@ -436,6 +479,22 @@ impl Interpreter {
                 self.spawn_handles.push(handle);
                 Ok(Value::Void)
             }
+            Stmt::DropStmt(name) => {
+                use crate::env::OwnershipState;
+                let state = self.env.get_ownership(name);
+                match state {
+                    OwnershipState::Moved => {
+                        return Err(self.runtime_err(format!("cannot drop '{}': value has been moved", name)));
+                    }
+                    OwnershipState::Dropped => {
+                        return Err(self.runtime_err(format!("cannot drop '{}': value has already been dropped", name)));
+                    }
+                    _ => {
+                        self.env.set_ownership(name, OwnershipState::Dropped);
+                        Ok(Value::Void)
+                    }
+                }
+            }
         }
     }
 
@@ -449,6 +508,20 @@ impl Interpreter {
             Expr::StringLit(s) => Ok(Value::Str(s.clone())),
             Expr::CharLit(c) => Ok(Value::Char(*c)),
             Expr::Ident(name) => {
+                // Check ownership state before access
+                {
+                    use crate::env::OwnershipState;
+                    let state = self.env.get_ownership(name);
+                    match state {
+                        OwnershipState::Moved => {
+                            return Err(self.runtime_err(format!("cannot access '{}': value has been moved", name)));
+                        }
+                        OwnershipState::Dropped => {
+                            return Err(self.runtime_err(format!("cannot access '{}': value has been dropped", name)));
+                        }
+                        _ => {}
+                    }
+                }
                 self.env.get(name).ok_or_else(|| {
                     // Collect known names for "did you mean" suggestion
                     let known_names: Vec<&str> = self.env.scopes.iter()
@@ -814,6 +887,69 @@ impl Interpreter {
                 }
                 Err(self.runtime_err(format!("undefined enum, type, or module: {}", enum_name)))
             }
+            Expr::Own(inner) => {
+                use crate::env::OwnershipState;
+                let val = self.eval_expr(inner)?;
+                // If the inner expr is an ident, mark it as Owned after defining
+                // But own is usually used in: let x = own [1,2,3]
+                // So we just return the value; the Let handler will store it.
+                // We record ownership state via a wrapper approach:
+                // The Let handler calls define, then we mark it Owned.
+                // But here we don't know the var name yet; we'll handle that in Let.
+                // For now, tag this as an "owned" value by wrapping -- but since
+                // Value doesn't have an Owned variant, we just return the value
+                // and set a flag.
+                // Actually, the simplest approach: evaluate, return value,
+                // and in Let handling, detect Own(...) in expr and set ownership.
+                Ok(val)
+            }
+            Expr::MoveExpr(inner) => {
+                use crate::env::OwnershipState;
+                // inner must be an identifier
+                if let Expr::Ident(name) = inner.as_ref() {
+                    let state = self.env.get_ownership(name);
+                    match state {
+                        OwnershipState::Moved => {
+                            return Err(self.runtime_err(format!("cannot move '{}': value has already been moved", name)));
+                        }
+                        OwnershipState::Dropped => {
+                            return Err(self.runtime_err(format!("cannot move '{}': value has been dropped", name)));
+                        }
+                        _ => {
+                            let val = self.env.get(name).ok_or_else(|| {
+                                self.runtime_err(format!("undefined variable: {}", name))
+                            })?;
+                            self.env.set_ownership(name, OwnershipState::Moved);
+                            Ok(val)
+                        }
+                    }
+                } else {
+                    Err(self.runtime_err("move requires a variable name".into()))
+                }
+            }
+            Expr::Borrow(inner) => {
+                use crate::env::OwnershipState;
+                // inner must be an identifier
+                if let Expr::Ident(name) = inner.as_ref() {
+                    let state = self.env.get_ownership(name);
+                    match state {
+                        OwnershipState::Moved => {
+                            return Err(self.runtime_err(format!("cannot borrow '{}': value has been moved", name)));
+                        }
+                        OwnershipState::Dropped => {
+                            return Err(self.runtime_err(format!("cannot borrow '{}': value has been dropped", name)));
+                        }
+                        _ => {
+                            let val = self.env.get(name).ok_or_else(|| {
+                                self.runtime_err(format!("undefined variable: {}", name))
+                            })?;
+                            Ok(val)
+                        }
+                    }
+                } else {
+                    Err(self.runtime_err("borrow requires a variable name".into()))
+                }
+            }
             Expr::Wildcard => {
                 // Wildcard should only appear in match patterns, not as a standalone expression
                 Err(self.runtime_err("wildcard '_' can only be used in match patterns".into()))
@@ -1022,7 +1158,44 @@ impl Interpreter {
                     self.env.pop_scope();
                     Ok(result)
                 } else {
-                    Err(self.runtime_err(format!("no method .{}() on struct {}", method, struct_name)))
+                    // Check trait implementations for this type
+                    let mut found = None;
+                    for ((type_name, _trait_name), methods) in &self.trait_impls {
+                        if type_name == &struct_name {
+                            if let Some(method_def) = methods.get(method) {
+                                found = Some(method_def.clone());
+                                break;
+                            }
+                        }
+                    }
+                    if let Some((params, body)) = found {
+                        if params.is_empty() || params[0] != "self" {
+                            return Err(self.runtime_err(format!("trait method {} is not an instance method (no self parameter)", method)));
+                        }
+                        if args.len() + 1 != params.len() {
+                            return Err(self.runtime_err(format!(
+                                "trait method {} expected {} arguments, got {}",
+                                method, params.len() - 1, args.len()
+                            )));
+                        }
+                        self.env.push_scope();
+                        self.env.define("self", obj);
+                        for (param, arg) in params[1..].iter().zip(args) {
+                            self.env.define(param, arg);
+                        }
+                        let mut result = Value::Void;
+                        for stmt in &body {
+                            result = self.exec_stmt(stmt)?;
+                            if self.return_value.is_some() {
+                                result = self.return_value.take().unwrap();
+                                break;
+                            }
+                        }
+                        self.env.pop_scope();
+                        Ok(result)
+                    } else {
+                        Err(self.runtime_err(format!("no method .{}() on struct {}", method, struct_name)))
+                    }
                 }
             }
             Value::Sender(tx) => {
@@ -4029,5 +4202,208 @@ consciousness::cells
         let stmts = Parser::new(tokens).parse().unwrap();
         let mut interp = Interpreter::new();
         interp.run(&stmts).unwrap();
+    }
+
+    // ── Generics tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_generic_identity_int() {
+        let src = r#"
+fn identity<T>(x: T) -> T {
+    return x
+}
+identity(42)
+"#;
+        assert!(matches!(eval(src), Value::Int(42)));
+    }
+
+    #[test]
+    fn test_generic_identity_string() {
+        let src = r#"
+fn identity<T>(x: T) -> T {
+    return x
+}
+identity("hello")
+"#;
+        assert!(matches!(eval(src), Value::Str(s) if s == "hello"));
+    }
+
+    #[test]
+    fn test_generic_first_element() {
+        let src = r#"
+fn first<T>(arr: T) -> T {
+    return arr[0]
+}
+first([10, 20, 30])
+"#;
+        assert!(matches!(eval(src), Value::Int(10)));
+    }
+
+    #[test]
+    fn test_generic_multi_type_params() {
+        let src = r#"
+fn pair_first<T, U>(a: T, b: U) -> T {
+    return a
+}
+pair_first(42, "hello")
+"#;
+        assert!(matches!(eval(src), Value::Int(42)));
+    }
+
+    // ── Trait dispatch tests ────────────────────────────────────
+
+    #[test]
+    fn test_trait_basic_dispatch() {
+        let src = r#"
+struct Point {
+    x: int,
+    y: int
+}
+trait Display {
+    fn to_string(self) -> string
+}
+impl Display for Point {
+    fn to_string(self) -> string {
+        return format("({}, {})", self.x, self.y)
+    }
+}
+let p = Point { x: 3, y: 4 }
+p.to_string()
+"#;
+        assert!(matches!(eval(src), Value::Str(s) if s == "(3, 4)"));
+    }
+
+    #[test]
+    fn test_trait_multiple_methods() {
+        let src = r#"
+struct Circle {
+    radius: int
+}
+trait Shape {
+    fn area(self) -> int
+    fn name(self) -> string
+}
+impl Shape for Circle {
+    fn area(self) -> int {
+        return self.radius * self.radius * 3
+    }
+    fn name(self) -> string {
+        return "circle"
+    }
+}
+let c = Circle { radius: 5 }
+c.area()
+"#;
+        assert!(matches!(eval(src), Value::Int(75)));
+    }
+
+    #[test]
+    fn test_trait_impl_coexists_with_direct_impl() {
+        let src = r#"
+struct Vec2 {
+    x: int,
+    y: int
+}
+impl Vec2 {
+    fn sum(self) -> int {
+        return self.x + self.y
+    }
+}
+trait Describable {
+    fn describe(self) -> string
+}
+impl Describable for Vec2 {
+    fn describe(self) -> string {
+        return "a 2d vector"
+    }
+}
+let v = Vec2 { x: 3, y: 4 }
+let s = v.sum()
+let d = v.describe()
+s
+"#;
+        assert!(matches!(eval(src), Value::Int(7)));
+    }
+
+    // ── Ownership tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_own_and_move() {
+        let src = r#"
+let x = own [1, 2, 3]
+let y = move x
+y[0]
+"#;
+        assert!(matches!(eval(src), Value::Int(1)));
+    }
+
+    #[test]
+    fn test_move_prevents_access() {
+        let src = r#"
+let x = own [1, 2, 3]
+let y = move x
+x
+"#;
+        let tokens = Lexer::new(src).tokenize().unwrap();
+        let stmts = Parser::new(tokens).parse().unwrap();
+        let mut interp = Interpreter::new();
+        let result = interp.run(&stmts);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("moved"));
+    }
+
+    #[test]
+    fn test_borrow_read_only() {
+        let src = r#"
+let z = own "hello"
+let r = borrow z
+r
+"#;
+        assert!(matches!(eval(src), Value::Str(s) if s == "hello"));
+    }
+
+    #[test]
+    fn test_borrow_prevents_mutation() {
+        let src = r#"
+let z = own "hello"
+let r = borrow z
+r = "world"
+"#;
+        let tokens = Lexer::new(src).tokenize().unwrap();
+        let stmts = Parser::new(tokens).parse().unwrap();
+        let mut interp = Interpreter::new();
+        let result = interp.run(&stmts);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("borrowed"));
+    }
+
+    #[test]
+    fn test_drop_prevents_access() {
+        let src = r#"
+let x = own "hello"
+drop x
+x
+"#;
+        let tokens = Lexer::new(src).tokenize().unwrap();
+        let stmts = Parser::new(tokens).parse().unwrap();
+        let mut interp = Interpreter::new();
+        let result = interp.run(&stmts);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("dropped"));
+    }
+
+    #[test]
+    fn test_double_drop_error() {
+        let src = r#"
+let x = own "hello"
+drop x
+drop x
+"#;
+        let tokens = Lexer::new(src).tokenize().unwrap();
+        let stmts = Parser::new(tokens).parse().unwrap();
+        let mut interp = Interpreter::new();
+        let result = interp.run(&stmts);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("dropped"));
     }
 }

@@ -156,6 +156,7 @@ impl Parser {
             Token::Try => self.parse_try_catch(),
             Token::Throw => self.parse_throw(),
             Token::Spawn => self.parse_spawn(),
+            Token::Drop => self.parse_drop_stmt(),
             _ => {
                 let expr = self.parse_expr()?;
                 // Check for assignment
@@ -287,6 +288,12 @@ impl Parser {
         Ok(Stmt::Spawn(body))
     }
 
+    fn parse_drop_stmt(&mut self) -> Result<Stmt, HexaError> {
+        self.advance(); // consume 'drop'
+        let name = self.expect_ident()?;
+        Ok(Stmt::DropStmt(name))
+    }
+
     fn parse_mod_decl(&mut self) -> Result<Stmt, HexaError> {
         self.advance(); // consume 'mod'
         let name = self.expect_ident()?;
@@ -309,6 +316,12 @@ impl Parser {
     fn parse_fn_decl(&mut self, vis: Visibility) -> Result<Stmt, HexaError> {
         self.advance(); // consume 'fn'
         let name = self.expect_ident()?;
+        // Parse optional type parameters: <T>, <T: Bound>, <T, U>
+        let type_params = if matches!(self.peek(), Token::Lt) {
+            self.parse_type_params()?
+        } else {
+            vec![]
+        };
         self.expect(&Token::LParen)?;
         let params = self.parse_params()?;
         self.expect(&Token::RParen)?;
@@ -319,7 +332,30 @@ impl Parser {
             None
         };
         let body = self.parse_block()?;
-        Ok(Stmt::FnDecl(FnDecl { name, params, ret_type, body, vis }))
+        Ok(Stmt::FnDecl(FnDecl { name, type_params, params, ret_type, body, vis }))
+    }
+
+    /// Parse type parameters: `<T>`, `<T: Display>`, `<T, U>`, `<T: Display, U: Clone>`
+    fn parse_type_params(&mut self) -> Result<Vec<TypeParam>, HexaError> {
+        self.expect(&Token::Lt)?; // consume <
+        let mut type_params = Vec::new();
+        loop {
+            let name = self.expect_ident()?;
+            let bound = if matches!(self.peek(), Token::Colon) {
+                self.advance(); // consume :
+                Some(self.expect_ident()?)
+            } else {
+                None
+            };
+            type_params.push(TypeParam { name, bound });
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        self.expect(&Token::Gt)?; // consume >
+        Ok(type_params)
     }
 
     fn parse_params(&mut self) -> Result<Vec<Param>, HexaError> {
@@ -428,7 +464,7 @@ impl Parser {
             } else {
                 vec![]
             };
-            methods.push(FnDecl { name: m_name, params: m_params, ret_type: m_ret, body: m_body, vis: m_vis });
+            methods.push(FnDecl { name: m_name, type_params: vec![], params: m_params, ret_type: m_ret, body: m_body, vis: m_vis });
             self.skip_newlines();
         }
         self.expect(&Token::RBrace)?;
@@ -466,7 +502,7 @@ impl Parser {
                 None
             };
             let m_body = self.parse_block()?;
-            methods.push(FnDecl { name: m_name, params: m_params, ret_type: m_ret, body: m_body, vis: m_vis });
+            methods.push(FnDecl { name: m_name, type_params: vec![], params: m_params, ret_type: m_ret, body: m_body, vis: m_vis });
             self.skip_newlines();
         }
         self.expect(&Token::RBrace)?;
@@ -858,6 +894,22 @@ impl Parser {
             Token::Channel => {
                 self.advance();
                 Ok(Expr::Ident("channel".into()))
+            }
+            // Ownership expressions
+            Token::Own => {
+                self.advance();
+                let expr = self.parse_expr()?;
+                Ok(Expr::Own(Box::new(expr)))
+            }
+            Token::Move => {
+                self.advance();
+                let expr = self.parse_expr()?;
+                Ok(Expr::MoveExpr(Box::new(expr)))
+            }
+            Token::Borrow => {
+                self.advance();
+                let expr = self.parse_expr()?;
+                Ok(Expr::Borrow(Box::new(expr)))
             }
             other => Err(self.error(format!("unexpected token in expression: {:?}", other))),
         }

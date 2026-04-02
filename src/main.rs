@@ -20,6 +20,7 @@ mod type_checker;
 mod compiler;
 #[allow(dead_code)]
 mod vm;
+// mod jit; // disabled: cranelift API version mismatch
 
 use std::io::{self, Write, BufRead};
 
@@ -41,6 +42,7 @@ fn main() {
                 }
                 run_file_vm(&args[2]);
             }
+            // "--native" disabled: cranelift API version mismatch
             "--bench" => run_benchmark(),
             "init" => {
                 if args.len() < 3 {
@@ -264,6 +266,8 @@ fn run_file_vm(path: &str) {
     }
 }
 
+// run_file_native disabled: cranelift API version mismatch
+
 fn run_benchmark() {
     use std::time::Instant;
 
@@ -294,10 +298,11 @@ fib(30)
     let vm_time = start.elapsed();
 
     println!("=== HEXA-LANG Benchmark: fib(30) ===");
-    println!("Tree-walk: {} = {:?}", tree_result, tree_time);
-    println!("Bytecode VM: {} = {:?}", vm_result, vm_time);
-    let speedup = tree_time.as_secs_f64() / vm_time.as_secs_f64();
-    println!("Speedup: {:.1}x", speedup);
+    println!("Tree-walk:    {} = {:?}", tree_result, tree_time);
+    println!("Bytecode VM:  {} = {:?}", vm_result, vm_time);
+    println!();
+    let vm_speedup = tree_time.as_secs_f64() / vm_time.as_secs_f64();
+    println!("VM vs Tree-walk:     {:.1}x", vm_speedup);
 }
 
 fn run_repl() {
