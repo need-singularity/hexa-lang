@@ -189,25 +189,32 @@ Source → Tokenize → Parse → Check → Optimize → Codegen → Execute
 **What works** (v0.1):
 
 - Variables, functions, control flow, recursion
-- Structs (instantiation + field access)
-- Closures / lambdas, higher-order functions
-- Arrays (push, map, filter, fold, sort, reverse)
-- Strings (split, trim, contains, replace, to_upper/lower, chars)
+- Structs (instantiation, field access, impl methods)
+- Enums (variants with data, pattern matching, destructuring, guards, wildcard)
+- Closures / lambdas, higher-order functions (map/filter/fold)
+- Arrays (push, map, filter, fold, sort, reverse, enumerate, sum, slice, flatten)
+- Strings (split, trim, contains, replace, to_upper/lower, chars, join, repeat)
 - HashMaps (literals, indexing, keys/values)
+- Result/Option (Some/None/Ok/Err, unwrap, is_some/is_ok)
 - Try/catch/throw error handling
 - File I/O (read_file, write_file, file_exists)
-- Pattern matching (literal values)
-- 94 tests passing, 3418 lines of Rust
+- JSON (json_parse, json_stringify)
+- Static type checking (enforced when annotations present)
+- Module system (mod/use/pub, file-based imports)
+- Concurrency (spawn/channel/send/recv)
+- Bytecode VM (--vm flag, 2.8x faster than tree-walk)
+- Consciousness DSL (intent blocks, verify blocks, 12 Psi-builtins)
+- Rust-quality error messages (source context, "did you mean?" suggestions)
+- Package commands (hexa init/run/test)
+- 239 tests passing, ~9500 lines of Rust
 
 **What doesn't work yet**:
 
-- Type system parsed but not enforced
-- Structs have no methods
-- Enums/traits parsed but not usable
-- No modules/imports (single-file only)
-- No concurrency (keywords exist, no runtime)
-- No ownership/borrow checking
-- Tree-walk interpreter (no compilation)
+- Generics (`<T>` syntax)
+- Trait dispatch (parsed, basic impl works)
+- LLVM native compilation (bytecode VM only)
+- Ownership/borrow checking
+- LSP server
 
 See [PLAN.md](PLAN.md) for the full gap analysis vs Go/Rust and roadmap.
 
@@ -216,27 +223,36 @@ See [PLAN.md](PLAN.md) for the full gap analysis vs Go/Rust and roadmap.
 ```
 hexa-lang/
 ├── src/
-│   ├── main.rs          118L   Entry point + REPL
-│   ├── token.rs         170L   53 keywords + 24 operators
-│   ├── lexer.rs         413L   Tokenizer
-│   ├── parser.rs        778L   Recursive descent parser
-│   ├── ast.rs           133L   AST node types
-│   ├── types.rs          73L   8 primitives + 4 type layers
-│   ├── env.rs           137L   Scoped environment
-│   ├── error.rs          48L   5 error classes
-│   └── interpreter.rs  1548L   Tree-walk evaluator + builtins
+│   ├── main.rs           554L   Entry point, REPL, hexa init/run/test
+│   ├── token.rs          196L   53 keywords + 24 operators
+│   ├── lexer.rs          430L   Tokenizer (Span tracking)
+│   ├── parser.rs         924L   Recursive descent parser
+│   ├── ast.rs            138L   AST node types
+│   ├── types.rs           73L   8 primitives + 4 type layers
+│   ├── type_checker.rs   691L   Static type checker
+│   ├── env.rs            216L   Scoped environment + builtins
+│   ├── error.rs          218L   Diagnostics + "did you mean?"
+│   ├── interpreter.rs   4033L   Tree-walk evaluator + 50+ builtins
+│   ├── compiler.rs       726L   AST → bytecode compiler
+│   └── vm.rs             928L   Stack-based bytecode VM
 ├── examples/
 │   ├── hello.hexa                n=6 constants demo
 │   ├── fibonacci.hexa            Recursive computation
 │   ├── sigma_phi.hexa            n=6 uniqueness proof
 │   ├── egyptian_fraction.hexa    Memory model demo
 │   ├── pattern_match.hexa        FizzBuzz with n=6
-│   └── photonic_chip_dse.hexa    Photonic chip DSE
+│   ├── photonic_chip_dse.hexa    Photonic chip DSE
+│   ├── concurrency.hexa          spawn + channel demo
+│   ├── test_builtins.hexa        Builtin proof tests
+│   ├── consciousness_laws.hexa   Law verification (8 proofs)
+│   ├── n6_consciousness.hexa     n=6 → architecture params
+│   └── intent_experiment.hexa    intent/verify workflow
 ├── docs/
 │   ├── spec.md                   Language specification
 │   ├── n6-constants.md           n=6 constant reference
 │   └── plans/                    Implementation plans
-├── build.sh             Build script (rustc, no cargo)
+├── Cargo.toml           Package config
+├── build.sh             Build script (cargo wrapper)
 ├── PLAN.md              Gap analysis + roadmap
 ├── CLAUDE.md            AI assistant instructions
 └── README.md
