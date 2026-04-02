@@ -1,5 +1,6 @@
 #!/bin/bash
 set -e
+export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:$PATH"
 
 if [ "$1" = "test" ]; then
     cargo test

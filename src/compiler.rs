@@ -158,11 +158,23 @@ impl Compiler {
         self.compile_functions_recursive(stmts, &mut chunk)?;
 
         // Second pass: compile top-level statements
-        for stmt in stmts {
-            if matches!(stmt, Stmt::FnDecl(_)) {
-                continue;
+        // For the last expression statement, keep the value on the stack
+        let non_fn_stmts: Vec<&Stmt> = stmts.iter()
+            .filter(|s| !matches!(s, Stmt::FnDecl(_)))
+            .collect();
+
+        for (i, stmt) in non_fn_stmts.iter().enumerate() {
+            let is_last = i == non_fn_stmts.len() - 1;
+            if is_last {
+                if let Stmt::Expr(e) = stmt {
+                    // Last expression: leave value on stack
+                    self.compile_expr(&mut chunk, e)?;
+                } else {
+                    self.compile_stmt(&mut chunk, stmt)?;
+                }
+            } else {
+                self.compile_stmt(&mut chunk, stmt)?;
             }
-            self.compile_stmt(&mut chunk, stmt)?;
         }
 
         chunk.local_count = self.next_slot;
@@ -200,7 +212,6 @@ impl Compiler {
         }
 
         // Use a temporary chunk for this function's code
-        let mut func_code: Vec<OpCode> = Vec::new();
         // We need to compile into a temp chunk, then extract code
         let mut temp = Chunk::new();
         // Share constants with parent
@@ -219,7 +230,7 @@ impl Compiler {
             temp.emit(OpCode::Return);
         }
 
-        func_code = temp.code;
+        let func_code = temp.code;
         // Merge constants back to parent
         parent_chunk.constants = temp.constants;
 
@@ -418,7 +429,7 @@ impl Compiler {
             Stmt::StructDecl(_) | Stmt::EnumDecl(_) | Stmt::TraitDecl(_)
             | Stmt::ImplBlock(_) | Stmt::Intent(_, _) | Stmt::Mod(_, _)
             | Stmt::Use(_) | Stmt::TryCatch(_, _, _) | Stmt::Throw(_)
-            | Stmt::Proof(_, _) => Ok(()),
+            | Stmt::Proof(_, _) | Stmt::Spawn(_) => Ok(()),
         }
     }
 

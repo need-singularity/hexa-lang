@@ -16,6 +16,10 @@ mod env;
 mod interpreter;
 #[allow(dead_code)]
 mod type_checker;
+#[allow(dead_code)]
+mod compiler;
+#[allow(dead_code)]
+mod vm;
 
 use std::io::{self, Write, BufRead};
 
@@ -28,6 +32,14 @@ fn main() {
                 std::process::exit(1);
             }
             run_test(&args[2]);
+        } else if args[1] == "--vm" {
+            if args.len() < 3 {
+                eprintln!("Usage: hexa --vm <file.hexa>");
+                std::process::exit(1);
+            }
+            run_file_vm(&args[2]);
+        } else if args[1] == "--bench" {
+            run_benchmark();
         } else {
             run_file(&args[1]);
         }
@@ -179,6 +191,82 @@ fn run_source_with_dir(source: &str, file_path: &str) {
             std::process::exit(1);
         }
     }
+}
+
+fn run_file_vm(path: &str) {
+    let source = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error reading {}: {}", path, e);
+            std::process::exit(1);
+        }
+    };
+    let tokens = match lexer::Lexer::new(&source).tokenize() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(1);
+        }
+    };
+    let stmts = match parser::Parser::new(tokens).parse() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(1);
+        }
+    };
+    let mut comp = compiler::Compiler::new();
+    let chunk = match comp.compile(&stmts) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(1);
+        }
+    };
+    let mut machine = vm::VM::new();
+    match machine.execute(&chunk) {
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn run_benchmark() {
+    use std::time::Instant;
+
+    let fib_src = r#"
+fn fib(n) {
+    if n <= 1 { return n }
+    return fib(n - 1) + fib(n - 2)
+}
+fib(30)
+"#;
+
+    // Parse once
+    let tokens = lexer::Lexer::new(fib_src).tokenize().unwrap();
+    let stmts = parser::Parser::new(tokens).parse().unwrap();
+
+    // Tree-walk interpreter
+    let start = Instant::now();
+    let mut interp = interpreter::Interpreter::new();
+    let tree_result = interp.run(&stmts).unwrap();
+    let tree_time = start.elapsed();
+
+    // VM
+    let mut comp = compiler::Compiler::new();
+    let chunk = comp.compile(&stmts).unwrap();
+    let start = Instant::now();
+    let mut machine = vm::VM::new();
+    let vm_result = machine.execute(&chunk).unwrap();
+    let vm_time = start.elapsed();
+
+    println!("=== HEXA-LANG Benchmark: fib(30) ===");
+    println!("Tree-walk: {} = {:?}", tree_result, tree_time);
+    println!("Bytecode VM: {} = {:?}", vm_result, vm_time);
+    let speedup = tree_time.as_secs_f64() / vm_time.as_secs_f64();
+    println!("Speedup: {:.1}x", speedup);
 }
 
 fn run_repl() {
