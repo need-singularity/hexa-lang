@@ -20,7 +20,6 @@ use std::io::{self, Write};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
-use crate::ast::Stmt;
 use crate::env::Value;
 use crate::interpreter::Interpreter;
 use crate::lexer::Lexer;
