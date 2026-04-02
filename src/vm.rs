@@ -490,6 +490,8 @@ impl VM {
                     Value::Intent(_) => "intent",
                     Value::Sender(_) => "sender",
                     Value::Receiver(_) => "receiver",
+                    Value::Future(_) => "future",
+                    Value::Set(_) => "set",
                 };
                 Ok(Value::Str(type_name.to_string()))
             }

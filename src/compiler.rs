@@ -430,7 +430,8 @@ impl Compiler {
             | Stmt::ImplBlock(_) | Stmt::Intent(_, _) | Stmt::Verify(_, _)
             | Stmt::Mod(_, _) | Stmt::Use(_) | Stmt::TryCatch(_, _, _)
             | Stmt::Throw(_) | Stmt::Proof(_, _) | Stmt::Spawn(_)
-            | Stmt::DropStmt(_) => Ok(()),
+            | Stmt::DropStmt(_) | Stmt::SpawnNamed(_, _)
+            | Stmt::AsyncFnDecl(_) | Stmt::Select(_) => Ok(()),
         }
     }
 
@@ -709,7 +710,8 @@ impl Compiler {
             // Not supported in VM
             Expr::Lambda(_, _) | Expr::Field(_, _) | Expr::Match(_, _)
             | Expr::StructInit(_, _) | Expr::MapLit(_) | Expr::EnumPath(_, _, _)
-            | Expr::Wildcard | Expr::Own(_) | Expr::MoveExpr(_) | Expr::Borrow(_) => {
+            | Expr::Wildcard | Expr::Own(_) | Expr::MoveExpr(_) | Expr::Borrow(_)
+            | Expr::Await(_) => {
                 chunk.emit(OpCode::Void);
                 Ok(())
             }

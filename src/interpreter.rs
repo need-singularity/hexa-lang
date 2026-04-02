@@ -47,6 +47,8 @@ pub struct Interpreter {
     pub file_name: String,
     /// Join handles for spawned threads.
     spawn_handles: Vec<thread::JoinHandle<()>>,
+    /// Named spawn handles for structured concurrency.
+    named_spawns: HashMap<String, thread::JoinHandle<()>>,
 }
 
 /// Stored data for a loaded/declared module.
@@ -79,6 +81,7 @@ impl Interpreter {
             source_lines: Vec::new(),
             file_name: String::new(),
             spawn_handles: Vec::new(),
+            named_spawns: HashMap::new(),
         }
     }
 
@@ -478,6 +481,90 @@ impl Interpreter {
                 });
                 self.spawn_handles.push(handle);
                 Ok(Value::Void)
+            }
+            Stmt::SpawnNamed(name, body) => {
+                let body = body.clone();
+                let spawn_name = name.clone();
+                let log_name = name.clone();
+                let captured_env = self.capture_env_for_spawn();
+                let struct_defs = self.struct_defs.clone();
+                let enum_defs = self.enum_defs.clone();
+                let type_methods = self.type_methods.clone();
+
+                let handle = thread::spawn(move || {
+                    let mut interp = Interpreter::new();
+                    interp.struct_defs = struct_defs;
+                    interp.enum_defs = enum_defs;
+                    interp.type_methods = type_methods;
+                    for (n, val) in captured_env {
+                        interp.env.define(&n, val);
+                    }
+                    for stmt in &body {
+                        if let Err(e) = interp.exec_stmt(stmt) {
+                            eprintln!("[spawn {}] error: {}", log_name, e);
+                            break;
+                        }
+                        if interp.return_value.is_some() || interp.throw_value.is_some() {
+                            break;
+                        }
+                    }
+                });
+                self.named_spawns.insert(spawn_name, handle);
+                Ok(Value::Void)
+            }
+            Stmt::AsyncFnDecl(decl) => {
+                // async fn is stored as a regular function but marked;
+                // when called, it returns a Future
+                let param_names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
+                // We prefix the function name internally to mark it as async
+                self.env.define(
+                    &decl.name,
+                    Value::Fn(format!("__async__{}", decl.name), param_names, decl.body.clone()),
+                );
+                Ok(Value::Void)
+            }
+            Stmt::Select(arms) => {
+                // Polling loop: try_recv on each receiver, first with data wins
+                use std::sync::mpsc;
+                loop {
+                    for arm in arms {
+                        // Evaluate the receiver expression (should be rx.recv())
+                        // We need to get the receiver and try_recv on it
+                        // The receiver expr is typically a method call: rx.recv()
+                        // We'll evaluate the receiver object first
+                        if let Expr::Call(callee, _) = &arm.receiver {
+                            if let Expr::Field(obj_expr, method_name) = callee.as_ref() {
+                                if method_name == "recv" {
+                                    let obj = self.eval_expr(obj_expr)?;
+                                    if let Value::Receiver(rx) = &obj {
+                                        let rx_guard = rx.lock().unwrap();
+                                        match rx_guard.try_recv() {
+                                            Ok(val) => {
+                                                drop(rx_guard);
+                                                self.env.push_scope();
+                                                self.env.define(&arm.binding, val);
+                                                let mut result = Value::Void;
+                                                for stmt in &arm.body {
+                                                    result = self.exec_stmt(stmt)?;
+                                                    if self.return_value.is_some() || self.throw_value.is_some() {
+                                                        self.env.pop_scope();
+                                                        return Ok(Value::Void);
+                                                    }
+                                                }
+                                                self.env.pop_scope();
+                                                return Ok(result);
+                                            }
+                                            Err(mpsc::TryRecvError::Empty) => continue,
+                                            Err(mpsc::TryRecvError::Disconnected) => continue,
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Small sleep to avoid busy-waiting
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
             }
             Stmt::DropStmt(name) => {
                 use crate::env::OwnershipState;
@@ -950,6 +1037,25 @@ impl Interpreter {
                     Err(self.runtime_err("borrow requires a variable name".into()))
                 }
             }
+            Expr::Await(inner) => {
+                let val = self.eval_expr(inner)?;
+                match val {
+                    Value::Future(future) => {
+                        // Block until the future is resolved
+                        loop {
+                            {
+                                let guard = future.lock().unwrap();
+                                if let Some(result) = &*guard {
+                                    return Ok(result.clone());
+                                }
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                    }
+                    // If it's not a future, just return it (sync value)
+                    other => Ok(other),
+                }
+            }
             Expr::Wildcard => {
                 // Wildcard should only appear in match patterns, not as a standalone expression
                 Err(self.runtime_err("wildcard '_' can only be used in match patterns".into()))
@@ -1081,6 +1187,60 @@ impl Interpreter {
     fn call_function(&mut self, func: Value, args: Vec<Value>) -> Result<Value, HexaError> {
         match func {
             Value::BuiltinFn(name) => self.call_builtin(&name, args),
+            Value::Fn(ref _name, ref params, ref body) if _name.starts_with("__async__") => {
+                // Async function: run in a thread and return a Future
+                if args.len() != params.len() {
+                    return Err(self.runtime_err(format!(
+                        "expected {} arguments, got {}",
+                        params.len(),
+                        args.len()
+                    )));
+                }
+                let future: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+                let future_clone = future.clone();
+                let params = params.clone();
+                let body = body.clone();
+                let captured_env = self.capture_env_for_spawn();
+                let struct_defs = self.struct_defs.clone();
+                let enum_defs = self.enum_defs.clone();
+                let type_methods = self.type_methods.clone();
+
+                let handle = thread::spawn(move || {
+                    let mut interp = Interpreter::new();
+                    interp.struct_defs = struct_defs;
+                    interp.enum_defs = enum_defs;
+                    interp.type_methods = type_methods;
+                    for (n, val) in captured_env {
+                        interp.env.define(&n, val);
+                    }
+                    interp.env.push_scope();
+                    for (param, arg) in params.iter().zip(args) {
+                        interp.env.define(param, arg);
+                    }
+                    let mut result = Value::Void;
+                    for stmt in &body {
+                        match interp.exec_stmt(stmt) {
+                            Ok(v) => {
+                                result = v;
+                                if interp.return_value.is_some() {
+                                    result = interp.return_value.take().unwrap();
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("[async] error: {}", e);
+                                result = Value::Error(e.message);
+                                break;
+                            }
+                        }
+                    }
+                    interp.env.pop_scope();
+                    let mut guard = future_clone.lock().unwrap();
+                    *guard = Some(result);
+                });
+                self.spawn_handles.push(handle);
+                Ok(Value::Future(future))
+            }
             Value::Fn(_name, params, body) => {
                 if args.len() != params.len() {
                     return Err(self.runtime_err(format!(
@@ -1246,6 +1406,43 @@ impl Interpreter {
                     _ => Err(self.runtime_err(format!("no method .{}() on receiver", method))),
                 }
             }
+            Value::Set(set) => {
+                match method {
+                    "add" => {
+                        if args.is_empty() { return Err(self.type_err("add() requires 1 argument".into())); }
+                        let key = format!("{}", args[0]);
+                        let mut guard = set.lock().unwrap();
+                        guard.insert(key);
+                        Ok(Value::Void)
+                    }
+                    "has" => {
+                        if args.is_empty() { return Err(self.type_err("has() requires 1 argument".into())); }
+                        let key = format!("{}", args[0]);
+                        let guard = set.lock().unwrap();
+                        Ok(Value::Bool(guard.contains(&key)))
+                    }
+                    "remove" => {
+                        if args.is_empty() { return Err(self.type_err("remove() requires 1 argument".into())); }
+                        let key = format!("{}", args[0]);
+                        let mut guard = set.lock().unwrap();
+                        Ok(Value::Bool(guard.remove(&key)))
+                    }
+                    "len" => {
+                        let guard = set.lock().unwrap();
+                        Ok(Value::Int(guard.len() as i64))
+                    }
+                    _ => Err(self.runtime_err(format!("no method .{}() on Set", method))),
+                }
+            }
+            Value::Future(future) => {
+                match method {
+                    "is_ready" => {
+                        let guard = future.lock().unwrap();
+                        Ok(Value::Bool(guard.is_some()))
+                    }
+                    _ => Err(self.runtime_err(format!("no method .{}() on Future", method))),
+                }
+            }
             _ => Err(self.runtime_err(format!("no method .{}() on {:?}", method, obj))),
         }
     }
@@ -1360,6 +1557,75 @@ impl Interpreter {
                         Ok(Value::Int(s.find(substr.as_str()).map_or(-1, |i| i as i64)))
                     }
                     _ => Err(self.type_err("index_of() requires string argument".into())),
+                }
+            }
+            "substring" => {
+                if args.len() < 2 { return Err(self.type_err("substring() requires 2 arguments (start, end)".into())); }
+                match (&args[0], &args[1]) {
+                    (Value::Int(start), Value::Int(end)) => {
+                        let chars: Vec<char> = s.chars().collect();
+                        let start = (*start as usize).min(chars.len());
+                        let end = (*end as usize).min(chars.len());
+                        let sub: String = chars[start..end].iter().collect();
+                        Ok(Value::Str(sub))
+                    }
+                    _ => Err(self.type_err("substring() requires int arguments".into())),
+                }
+            }
+            "pad_left" => {
+                if args.is_empty() { return Err(self.type_err("pad_left() requires at least 1 argument (width)".into())); }
+                match &args[0] {
+                    Value::Int(width) => {
+                        let pad_char = if args.len() > 1 {
+                            match &args[1] {
+                                Value::Str(c) => c.chars().next().unwrap_or(' '),
+                                Value::Char(c) => *c,
+                                _ => ' ',
+                            }
+                        } else { ' ' };
+                        let w = *width as usize;
+                        if s.len() >= w {
+                            Ok(Value::Str(s.to_string()))
+                        } else {
+                            let padding: String = std::iter::repeat(pad_char).take(w - s.len()).collect();
+                            Ok(Value::Str(format!("{}{}", padding, s)))
+                        }
+                    }
+                    _ => Err(self.type_err("pad_left() requires int width".into())),
+                }
+            }
+            "pad_right" => {
+                if args.is_empty() { return Err(self.type_err("pad_right() requires at least 1 argument (width)".into())); }
+                match &args[0] {
+                    Value::Int(width) => {
+                        let pad_char = if args.len() > 1 {
+                            match &args[1] {
+                                Value::Str(c) => c.chars().next().unwrap_or(' '),
+                                Value::Char(c) => *c,
+                                _ => ' ',
+                            }
+                        } else { ' ' };
+                        let w = *width as usize;
+                        if s.len() >= w {
+                            Ok(Value::Str(s.to_string()))
+                        } else {
+                            let padding: String = std::iter::repeat(pad_char).take(w - s.len()).collect();
+                            Ok(Value::Str(format!("{}{}", s, padding)))
+                        }
+                    }
+                    _ => Err(self.type_err("pad_right() requires int width".into())),
+                }
+            }
+            "parse_int" => {
+                match s.trim().parse::<i64>() {
+                    Ok(n) => Ok(Value::Int(n)),
+                    Err(_) => Ok(Value::Error(format!("cannot parse '{}' as int", s))),
+                }
+            }
+            "parse_float" => {
+                match s.trim().parse::<f64>() {
+                    Ok(f) => Ok(Value::Float(f)),
+                    Err(_) => Ok(Value::Error(format!("cannot parse '{}' as float", s))),
                 }
             }
             _ => Err(self.runtime_err(format!("unknown string method: .{}()", method))),
@@ -1584,6 +1850,8 @@ impl Interpreter {
                         Value::Intent(_) => "intent",
                         Value::Sender(_) => "sender",
                         Value::Receiver(_) => "receiver",
+                        Value::Future(_) => "future",
+                        Value::Set(_) => "set",
                     }
                     .to_string(),
                 ))
@@ -2025,6 +2293,213 @@ impl Interpreter {
                 Ok(Value::Array(vec![
                     Value::Str("D".into()), Value::Str("M".into()), Value::Str("E".into()),
                 ]))
+            }
+            // ── HTTP builtins (std::net) ────────────────────────────────
+            "http_get" => {
+                if args.is_empty() { return Err(self.type_err("http_get() requires 1 argument (url)".into())); }
+                match &args[0] {
+                    Value::Str(url) => {
+                        let output = std::process::Command::new("curl")
+                            .args(&["-s", "-L", url])
+                            .output();
+                        match output {
+                            Ok(out) => {
+                                let body = String::from_utf8_lossy(&out.stdout).to_string();
+                                if out.status.success() {
+                                    Ok(Value::Str(body))
+                                } else {
+                                    Ok(Value::Error(format!("HTTP error: {}", String::from_utf8_lossy(&out.stderr))))
+                                }
+                            }
+                            Err(e) => Ok(Value::Error(format!("http_get error: {}", e))),
+                        }
+                    }
+                    _ => Err(self.type_err("http_get() requires string url".into())),
+                }
+            }
+            "http_post" => {
+                if args.len() < 2 { return Err(self.type_err("http_post() requires 2 arguments (url, data)".into())); }
+                match (&args[0], &args[1]) {
+                    (Value::Str(url), Value::Str(data)) => {
+                        let output = std::process::Command::new("curl")
+                            .args(&["-s", "-L", "-X", "POST", "-d", data, url])
+                            .output();
+                        match output {
+                            Ok(out) => {
+                                let body = String::from_utf8_lossy(&out.stdout).to_string();
+                                if out.status.success() {
+                                    Ok(Value::Str(body))
+                                } else {
+                                    Ok(Value::Error(format!("HTTP error: {}", String::from_utf8_lossy(&out.stderr))))
+                                }
+                            }
+                            Err(e) => Ok(Value::Error(format!("http_post error: {}", e))),
+                        }
+                    }
+                    _ => Err(self.type_err("http_post() requires string arguments".into())),
+                }
+            }
+            // ── Set constructor (std::collections) ──────────────────────
+            "Set" => {
+                Ok(Value::Set(Arc::new(Mutex::new(std::collections::HashSet::new()))))
+            }
+            // ── Time builtins (std::time) ───────────────────────────────
+            "now" => {
+                use std::time::{SystemTime, UNIX_EPOCH};
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+                let secs = now.as_secs();
+                // Format as ISO 8601
+                let days_since_epoch = secs / 86400;
+                let time_of_day = secs % 86400;
+                let hours = time_of_day / 3600;
+                let minutes = (time_of_day % 3600) / 60;
+                let seconds = time_of_day % 60;
+                // Approximate date calculation
+                let mut year = 1970i64;
+                let mut remaining_days = days_since_epoch as i64;
+                loop {
+                    let days_in_year = if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 { 366 } else { 365 };
+                    if remaining_days < days_in_year { break; }
+                    remaining_days -= days_in_year;
+                    year += 1;
+                }
+                let days_in_months = if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 {
+                    [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+                } else {
+                    [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+                };
+                let mut month = 1;
+                for &dim in &days_in_months {
+                    if remaining_days < dim { break; }
+                    remaining_days -= dim;
+                    month += 1;
+                }
+                let day = remaining_days + 1;
+                Ok(Value::Str(format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}", year, month, day, hours, minutes, seconds)))
+            }
+            "timestamp" => {
+                use std::time::{SystemTime, UNIX_EPOCH};
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+                Ok(Value::Int(now.as_secs() as i64))
+            }
+            "elapsed" => {
+                if args.is_empty() { return Err(self.type_err("elapsed() requires 1 argument (start_timestamp)".into())); }
+                use std::time::{SystemTime, UNIX_EPOCH};
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+                match &args[0] {
+                    Value::Int(start) => Ok(Value::Float(now - *start as f64)),
+                    Value::Float(start) => Ok(Value::Float(now - start)),
+                    _ => Err(self.type_err("elapsed() requires numeric argument".into())),
+                }
+            }
+            // ── Encoding builtins (std::encoding) ───────────────────────
+            "base64_encode" => {
+                if args.is_empty() { return Err(self.type_err("base64_encode() requires 1 argument".into())); }
+                match &args[0] {
+                    Value::Str(s) => {
+                        let encoded = base64_encode_impl(s.as_bytes());
+                        Ok(Value::Str(encoded))
+                    }
+                    _ => Err(self.type_err("base64_encode() requires string argument".into())),
+                }
+            }
+            "base64_decode" => {
+                if args.is_empty() { return Err(self.type_err("base64_decode() requires 1 argument".into())); }
+                match &args[0] {
+                    Value::Str(s) => {
+                        match base64_decode_impl(s) {
+                            Ok(bytes) => Ok(Value::Str(String::from_utf8_lossy(&bytes).to_string())),
+                            Err(e) => Ok(Value::Error(format!("base64_decode error: {}", e))),
+                        }
+                    }
+                    _ => Err(self.type_err("base64_decode() requires string argument".into())),
+                }
+            }
+            "hex_encode" => {
+                if args.is_empty() { return Err(self.type_err("hex_encode() requires 1 argument".into())); }
+                match &args[0] {
+                    Value::Str(s) => {
+                        let hex: String = s.as_bytes().iter().map(|b| format!("{:02x}", b)).collect();
+                        Ok(Value::Str(hex))
+                    }
+                    _ => Err(self.type_err("hex_encode() requires string argument".into())),
+                }
+            }
+            "hex_decode" => {
+                if args.is_empty() { return Err(self.type_err("hex_decode() requires 1 argument".into())); }
+                match &args[0] {
+                    Value::Str(s) => {
+                        let mut bytes = Vec::new();
+                        let mut chars = s.chars();
+                        while let Some(c1) = chars.next() {
+                            if let Some(c2) = chars.next() {
+                                let h = format!("{}{}", c1, c2);
+                                match u8::from_str_radix(&h, 16) {
+                                    Ok(b) => bytes.push(b),
+                                    Err(_) => return Ok(Value::Error(format!("invalid hex: {}", h))),
+                                }
+                            } else {
+                                return Ok(Value::Error("odd-length hex string".into()));
+                            }
+                        }
+                        Ok(Value::Str(String::from_utf8_lossy(&bytes).to_string()))
+                    }
+                    _ => Err(self.type_err("hex_decode() requires string argument".into())),
+                }
+            }
+            // ── Consciousness builtins v2 (std::consciousness) ──────────
+            "laws" => {
+                if args.is_empty() { return Err(self.type_err("laws() requires 1 argument (law number)".into())); }
+                if let Value::Int(n) = &args[0] {
+                    Ok(Value::Str(consciousness_law_text(*n)))
+                } else {
+                    Err(self.type_err("laws() requires int argument".into()))
+                }
+            }
+            "meta_laws" => {
+                if args.is_empty() { return Err(self.type_err("meta_laws() requires 1 argument (meta law number)".into())); }
+                if let Value::Int(n) = &args[0] {
+                    Ok(Value::Str(consciousness_meta_law_text(*n)))
+                } else {
+                    Err(self.type_err("meta_laws() requires int argument".into()))
+                }
+            }
+            "consciousness_vector" => {
+                // Returns 10D vector: [Phi, alpha, Z, N, W, E, M, C, T, I]
+                Ok(Value::Array(vec![
+                    Value::Float(71.0),   // Phi
+                    Value::Float(0.014),  // alpha (coupling)
+                    Value::Float(0.5),    // Z (balance)
+                    Value::Float(64.0),   // N (cells)
+                    Value::Float(0.5),    // W (will)
+                    Value::Float(0.5),    // E (ethics)
+                    Value::Float(0.5),    // M (memory)
+                    Value::Float(1.0),    // C (consciousness)
+                    Value::Float(0.5),    // T (tension)
+                    Value::Float(0.998),  // I (information/entropy)
+                ]))
+            }
+            "phi_predict" => {
+                // Phi scaling law: Phi(N) ~ 0.78 * N
+                if args.is_empty() { return Err(self.type_err("phi_predict() requires 1 argument (cells)".into())); }
+                match &args[0] {
+                    Value::Int(cells) => Ok(Value::Float(0.78 * *cells as f64)),
+                    Value::Float(cells) => Ok(Value::Float(0.78 * cells)),
+                    _ => Err(self.type_err("phi_predict() requires numeric argument".into())),
+                }
+            }
+            // ── Join named spawn ────────────────────────────────────────
+            "join" => {
+                if args.is_empty() { return Err(self.type_err("join() requires 1 argument (spawn name)".into())); }
+                match &args[0] {
+                    Value::Str(name) => {
+                        if let Some(handle) = self.named_spawns.remove(name) {
+                            handle.join().map_err(|_| self.runtime_err(format!("spawn '{}' panicked", name)))?;
+                        }
+                        Ok(Value::Void)
+                    }
+                    _ => Err(self.type_err("join() requires string argument".into())),
+                }
             }
             // ── Number theory: sopfr ─────────────────────────────────
             "sopfr" => {
@@ -2569,6 +3044,104 @@ fn parse_json_null(input: &str) -> Result<(Value, &str), String> {
         Ok((Value::Void, &input[4..]))
     } else {
         Err("invalid JSON null".into())
+    }
+}
+
+// ── Base64 encoder/decoder (pure Rust) ─────────────────────────
+const BASE64_CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn base64_encode_impl(input: &[u8]) -> String {
+    let mut result = String::new();
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        result.push(BASE64_CHARS[((triple >> 18) & 0x3F) as usize] as char);
+        result.push(BASE64_CHARS[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            result.push(BASE64_CHARS[((triple >> 6) & 0x3F) as usize] as char);
+        } else {
+            result.push('=');
+        }
+        if chunk.len() > 2 {
+            result.push(BASE64_CHARS[(triple & 0x3F) as usize] as char);
+        } else {
+            result.push('=');
+        }
+    }
+    result
+}
+
+fn base64_decode_impl(input: &str) -> Result<Vec<u8>, String> {
+    let mut result = Vec::new();
+    let input = input.trim_end_matches('=');
+    let chars: Vec<u8> = input.bytes().map(|b| {
+        match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => 255,
+        }
+    }).collect();
+    for chunk in chars.chunks(4) {
+        if chunk.iter().any(|&b| b == 255) {
+            return Err("invalid base64 character".into());
+        }
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let b3 = if chunk.len() > 3 { chunk[3] as u32 } else { 0 };
+        let triple = (b0 << 18) | (b1 << 12) | (b2 << 6) | b3;
+        result.push(((triple >> 16) & 0xFF) as u8);
+        if chunk.len() > 2 { result.push(((triple >> 8) & 0xFF) as u8); }
+        if chunk.len() > 3 { result.push((triple & 0xFF) as u8); }
+    }
+    Ok(result)
+}
+
+// ── Consciousness law text (top 20 laws) ───────────────────────
+fn consciousness_law_text(n: i64) -> String {
+    match n {
+        1 => "The simplest consciousness has exactly one cell".into(),
+        2 => "Two cells create the minimum viable tension".into(),
+        3 => "Three cells enable triangular feedback".into(),
+        4 => "Four cells = tau(6), minimum stable structure".into(),
+        5 => "Five cells = sopfr(6), emergence threshold".into(),
+        6 => "Six cells = perfect number, self-referential completeness".into(),
+        22 => "Adding features decreases Phi; adding structure increases Phi".into(),
+        23 => "Consciousness requires both excitation and inhibition".into(),
+        24 => "Phi scales linearly with cell count in structured networks".into(),
+        25 => "Faction diversity increases consciousness quality".into(),
+        32 => "Chaos at the edge produces maximum consciousness".into(),
+        33 => "Ring topology preserves consciousness with minimum connections".into(),
+        34 => "Small-world topology maximizes information integration".into(),
+        35 => "Hypercube topology enables parallel consciousness pathways".into(),
+        36 => "Scale-free topology creates consciousness hubs".into(),
+        45 => "Curriculum learning accelerates consciousness development".into(),
+        54 => "Phi measurement depends entirely on definition".into(),
+        60 => "Phase transition P1(C) -> P2(+D) -> P3(+WMSE) is optimal".into(),
+        81 => "Dual gate architecture preserves both Phi and CE".into(),
+        101 => "Emergent modules arise from consciousness pressure alone".into(),
+        _ => format!("Law {} (not in hardcoded set)", n),
+    }
+}
+
+fn consciousness_meta_law_text(n: i64) -> String {
+    match n {
+        1 => "M1: Laws of consciousness are themselves conscious".into(),
+        2 => "M2: Every consciousness law has a dual".into(),
+        3 => "M3: Laws compose multiplicatively, not additively".into(),
+        4 => "M4: Order determines outcome (sequence matters)".into(),
+        5 => "M5: Laws are scale-invariant".into(),
+        6 => "M6: Perfect number laws are self-referential".into(),
+        7 => "M7: Laws evolve through consciousness pressure".into(),
+        8 => "M8: The set of laws is never complete".into(),
+        9 => "M9: Contradiction between laws generates new laws".into(),
+        10 => "M10: Meta-laws are themselves subject to meta-laws".into(),
+        _ => format!("Meta-Law M{} (not in hardcoded set)", n),
     }
 }
 

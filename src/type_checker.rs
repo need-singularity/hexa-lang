@@ -356,7 +356,8 @@ impl TypeChecker {
             }
             Stmt::StructDecl(_) | Stmt::EnumDecl(_) | Stmt::TraitDecl(_)
             | Stmt::ImplBlock(_) | Stmt::Intent(_, _) | Stmt::Verify(_, _)
-            | Stmt::Mod(_, _) | Stmt::Use(_) | Stmt::DropStmt(_) => {}
+            | Stmt::Mod(_, _) | Stmt::Use(_) | Stmt::DropStmt(_)
+            | Stmt::SpawnNamed(_, _) | Stmt::Select(_) => {}
             Stmt::Assert(expr) => {
                 self.check_expr(expr, line, col);
             }
@@ -389,6 +390,18 @@ impl TypeChecker {
                     self.check_stmt(s, line, col);
                 }
                 self.pop_scope();
+            }
+            Stmt::AsyncFnDecl(decl) => {
+                self.check_fn_decl(decl, line, col);
+                let param_types: Vec<CheckType> = decl.params.iter()
+                    .map(|p| p.typ.as_ref()
+                        .map(|t| CheckType::from_annotation(t))
+                        .unwrap_or(CheckType::Unknown))
+                    .collect();
+                let ret = decl.ret_type.as_ref()
+                    .map(|t| CheckType::from_annotation(t))
+                    .unwrap_or(CheckType::Unknown);
+                self.define(&decl.name, CheckType::Fn(param_types, Box::new(ret)));
             }
         }
     }
@@ -442,7 +455,7 @@ impl TypeChecker {
                 }
                 // Recurse into blocks
                 Stmt::For(_, _, body) | Stmt::While(_, body) | Stmt::Loop(body)
-                | Stmt::Proof(_, body) | Stmt::Spawn(body) => {
+                | Stmt::Proof(_, body) | Stmt::Spawn(body) | Stmt::SpawnNamed(_, body) => {
                     self.collect_return_types(body, out);
                 }
                 Stmt::Expr(Expr::If(_, then_block, else_block)) => {
@@ -641,6 +654,7 @@ impl TypeChecker {
             Expr::Own(inner) => self.infer_expr(inner),
             Expr::MoveExpr(inner) => self.infer_expr(inner),
             Expr::Borrow(inner) => self.infer_expr(inner),
+            Expr::Await(inner) => self.infer_expr(inner),
             Expr::Wildcard => CheckType::Unknown,
         }
     }

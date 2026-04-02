@@ -26,6 +26,15 @@ pub enum Expr {
     Own(Box<Expr>),     // own expr — create owned value
     MoveExpr(Box<Expr>),  // move x — transfer ownership
     Borrow(Box<Expr>),  // borrow x — read-only reference
+    Await(Box<Expr>),   // await expr — await a future value
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct SelectArm {
+    pub receiver: Expr,  // rx.recv() expression
+    pub binding: String, // as val
+    pub body: Block,
 }
 
 #[allow(dead_code)]
@@ -52,7 +61,10 @@ pub enum Stmt {
     TryCatch(Block, String, Block),  // try { ... } catch e { ... }
     Throw(Expr),
     Spawn(Block),  // spawn { ... } — concurrent execution
+    SpawnNamed(String, Block),  // spawn "name" { ... } — named concurrent execution
     DropStmt(String),  // drop x — explicit deallocation
+    AsyncFnDecl(FnDecl),  // async fn name(...) { ... }
+    Select(Vec<SelectArm>),  // select { rx.recv() as val => body, ... }
 }
 
 // BinOp: 22 binary operators (24 total - 2 unary-only: ! ~)

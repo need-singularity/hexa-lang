@@ -155,6 +155,8 @@ impl Parser {
             Token::Use => self.parse_use_decl(),
             Token::Try => self.parse_try_catch(),
             Token::Throw => self.parse_throw(),
+            Token::Async => self.parse_async_fn(vis),
+            Token::Select => self.parse_select(),
             Token::Spawn => self.parse_spawn(),
             Token::Drop => self.parse_drop_stmt(),
             _ => {
@@ -284,8 +286,68 @@ impl Parser {
 
     fn parse_spawn(&mut self) -> Result<Stmt, HexaError> {
         self.advance(); // consume 'spawn'
+        // Check for named spawn: spawn "name" { ... }
+        if let Token::StringLit(name) = self.peek().clone() {
+            self.advance(); // consume name
+            let body = self.parse_block()?;
+            return Ok(Stmt::SpawnNamed(name, body));
+        }
         let body = self.parse_block()?;
         Ok(Stmt::Spawn(body))
+    }
+
+    fn parse_async_fn(&mut self, vis: Visibility) -> Result<Stmt, HexaError> {
+        self.advance(); // consume 'async'
+        // Expect 'fn' after 'async'
+        self.expect(&Token::Fn)?;
+        let name = self.expect_ident()?;
+        let type_params = if matches!(self.peek(), Token::Lt) {
+            self.parse_type_params()?
+        } else {
+            vec![]
+        };
+        self.expect(&Token::LParen)?;
+        let params = self.parse_params()?;
+        self.expect(&Token::RParen)?;
+        let ret_type = if matches!(self.peek(), Token::Arrow) {
+            self.advance();
+            Some(self.expect_ident()?)
+        } else {
+            None
+        };
+        let body = self.parse_block()?;
+        Ok(Stmt::AsyncFnDecl(FnDecl { name, type_params, params, ret_type, body, vis }))
+    }
+
+    fn parse_select(&mut self) -> Result<Stmt, HexaError> {
+        self.advance(); // consume 'select'
+        self.expect(&Token::LBrace)?;
+        self.skip_newlines();
+        let mut arms = Vec::new();
+        while !matches!(self.peek(), Token::RBrace | Token::Eof) {
+            // Parse receiver expression: rx.recv()
+            let receiver = self.parse_expr()?;
+            // Expect 'as' keyword (parsed as ident)
+            match self.peek().clone() {
+                Token::Ident(ref s) if s == "as" => { self.advance(); }
+                _ => return Err(self.error(format!("expected 'as' in select arm, got {:?}", self.peek()))),
+            }
+            let binding = self.expect_ident()?;
+            self.expect(&Token::Arrow)?;
+            let body = if matches!(self.peek(), Token::LBrace) {
+                self.parse_block()?
+            } else {
+                let expr = self.parse_expr()?;
+                vec![Stmt::Expr(expr)]
+            };
+            arms.push(crate::ast::SelectArm { receiver, binding, body });
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+            }
+            self.skip_newlines();
+        }
+        self.expect(&Token::RBrace)?;
+        Ok(Stmt::Select(arms))
     }
 
     fn parse_drop_stmt(&mut self) -> Result<Stmt, HexaError> {
@@ -905,6 +967,12 @@ impl Parser {
             Token::Channel => {
                 self.advance();
                 Ok(Expr::Ident("channel".into()))
+            }
+            // Await expression
+            Token::Await => {
+                self.advance();
+                let expr = self.parse_expr()?;
+                Ok(Expr::Await(Box::new(expr)))
             }
             // Ownership expressions
             Token::Own => {

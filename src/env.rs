@@ -24,6 +24,8 @@ pub enum Value {
     Intent(HashMap<String, Value>),  // consciousness experiment declaration
     Sender(Arc<Mutex<mpsc::Sender<Value>>>),    // channel sender
     Receiver(Arc<Mutex<mpsc::Receiver<Value>>>), // channel receiver
+    Future(Arc<Mutex<Option<Value>>>),           // async future value
+    Set(Arc<Mutex<std::collections::HashSet<String>>>), // unique value set
 }
 
 impl std::fmt::Display for Value {
@@ -74,6 +76,18 @@ impl std::fmt::Display for Value {
             }
             Value::Sender(_) => write!(f, "<sender>"),
             Value::Receiver(_) => write!(f, "<receiver>"),
+            Value::Future(inner) => {
+                let guard = inner.lock().unwrap();
+                match &*guard {
+                    Some(v) => write!(f, "<future: {}>", v),
+                    None => write!(f, "<future: pending>"),
+                }
+            }
+            Value::Set(set) => {
+                let guard = set.lock().unwrap();
+                let items: Vec<String> = guard.iter().cloned().collect();
+                write!(f, "Set({{{}}})", items.join(", "))
+            }
         }
     }
 }
@@ -160,6 +174,27 @@ impl Env {
         // JSON builtins
         env.define("json_parse", Value::BuiltinFn("json_parse".into()));
         env.define("json_stringify", Value::BuiltinFn("json_stringify".into()));
+        // HTTP builtins (std::net)
+        env.define("http_get", Value::BuiltinFn("http_get".into()));
+        env.define("http_post", Value::BuiltinFn("http_post".into()));
+        // Set constructor (std::collections)
+        env.define("Set", Value::BuiltinFn("Set".into()));
+        // Time builtins (std::time)
+        env.define("now", Value::BuiltinFn("now".into()));
+        env.define("timestamp", Value::BuiltinFn("timestamp".into()));
+        env.define("elapsed", Value::BuiltinFn("elapsed".into()));
+        // Encoding builtins (std::encoding)
+        env.define("base64_encode", Value::BuiltinFn("base64_encode".into()));
+        env.define("base64_decode", Value::BuiltinFn("base64_decode".into()));
+        env.define("hex_encode", Value::BuiltinFn("hex_encode".into()));
+        env.define("hex_decode", Value::BuiltinFn("hex_decode".into()));
+        // Consciousness builtins v2 (std::consciousness)
+        env.define("laws", Value::BuiltinFn("laws".into()));
+        env.define("meta_laws", Value::BuiltinFn("meta_laws".into()));
+        env.define("consciousness_vector", Value::BuiltinFn("consciousness_vector".into()));
+        env.define("phi_predict", Value::BuiltinFn("phi_predict".into()));
+        // Spawn/join builtins
+        env.define("join", Value::BuiltinFn("join".into()));
         // Consciousness builtins (ANIMA Psi-Constants)
         env.define("psi_coupling", Value::BuiltinFn("psi_coupling".into()));
         env.define("psi_balance", Value::BuiltinFn("psi_balance".into()));
