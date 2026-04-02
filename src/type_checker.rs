@@ -211,6 +211,7 @@ impl TypeChecker {
             message,
             line,
             col,
+            hint: None,
         });
     }
 

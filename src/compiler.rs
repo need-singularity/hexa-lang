@@ -676,6 +676,7 @@ fn compile_err(msg: String) -> HexaError {
         message: format!("compile error: {}", msg),
         line: 0,
         col: 0,
+        hint: None,
     }
 }
 

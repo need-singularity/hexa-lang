@@ -437,6 +437,7 @@ impl VM {
                         message: "assertion failed".into(),
                         line: 0,
                         col: 0,
+                    hint: None,
                     });
                 }
                 Ok(Value::Void)
@@ -790,6 +791,7 @@ fn runtime_err(msg: String) -> HexaError {
         message: msg,
         line: 0,
         col: 0,
+    hint: None,
     }
 }
 

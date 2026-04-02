@@ -87,6 +87,7 @@ impl Parser {
             message,
             line: span.line,
             col: span.col,
+            hint: None,
         }
     }
 
@@ -96,6 +97,7 @@ impl Parser {
             message,
             line: span.line,
             col: span.col,
+            hint: None,
         }
     }
 

@@ -125,6 +125,15 @@ impl Env {
         env.define("Err", Value::BuiltinFn("Err".into()));
         // Concurrency builtins
         env.define("channel", Value::BuiltinFn("channel".into()));
+        // Random builtins
+        env.define("random", Value::BuiltinFn("random".into()));
+        env.define("random_int", Value::BuiltinFn("random_int".into()));
+        // System builtins
+        env.define("sleep", Value::BuiltinFn("sleep".into()));
+        env.define("print_err", Value::BuiltinFn("print_err".into()));
+        // JSON builtins
+        env.define("json_parse", Value::BuiltinFn("json_parse".into()));
+        env.define("json_stringify", Value::BuiltinFn("json_stringify".into()));
         env
 
     }

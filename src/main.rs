@@ -26,22 +26,32 @@ use std::io::{self, Write, BufRead};
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() > 1 {
-        if args[1] == "--test" {
-            if args.len() < 3 {
-                eprintln!("Usage: hexa --test <file.hexa>");
-                std::process::exit(1);
+        match args[1].as_str() {
+            "--test" => {
+                if args.len() < 3 {
+                    eprintln!("Usage: hexa --test <file.hexa>");
+                    std::process::exit(1);
+                }
+                run_test(&args[2]);
             }
-            run_test(&args[2]);
-        } else if args[1] == "--vm" {
-            if args.len() < 3 {
-                eprintln!("Usage: hexa --vm <file.hexa>");
-                std::process::exit(1);
+            "--vm" => {
+                if args.len() < 3 {
+                    eprintln!("Usage: hexa --vm <file.hexa>");
+                    std::process::exit(1);
+                }
+                run_file_vm(&args[2]);
             }
-            run_file_vm(&args[2]);
-        } else if args[1] == "--bench" {
-            run_benchmark();
-        } else {
-            run_file(&args[1]);
+            "--bench" => run_benchmark(),
+            "init" => {
+                if args.len() < 3 {
+                    eprintln!("Usage: hexa init <name>");
+                    std::process::exit(1);
+                }
+                cmd_init(&args[2]);
+            }
+            "run" => cmd_run(),
+            "test" => cmd_test(),
+            _ => run_file(&args[1]),
         }
     } else {
         run_repl();
@@ -67,6 +77,7 @@ fn run_test(path: &str) {
             std::process::exit(1);
         }
     };
+    let source_lines: Vec<String> = source.lines().map(String::from).collect();
     let tokens = match lexer::Lexer::new(&source).tokenize() {
         Ok(t) => t,
         Err(e) => {
@@ -77,7 +88,7 @@ fn run_test(path: &str) {
     let result = match parser::Parser::new(tokens).parse_with_spans() {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("{}", e);
+            eprint_diagnostic(&e, &source_lines, path);
             std::process::exit(1);
         }
     };
@@ -87,13 +98,15 @@ fn run_test(path: &str) {
     // Type checking pass (runs before execution)
     let mut checker = type_checker::TypeChecker::new();
     if let Err(e) = checker.check(&stmts, &spans) {
-        eprintln!("{}", e);
+        eprint_diagnostic(&e, &source_lines, path);
         std::process::exit(1);
     }
 
     // First pass: run non-proof statements to set up functions/variables
     let mut interp = interpreter::Interpreter::new();
     interp.test_mode = true;
+    interp.source_lines = source_lines.clone();
+    interp.file_name = path.to_string();
 
     // Collect proof blocks and execute everything
     let mut proof_names: Vec<String> = Vec::new();
@@ -137,7 +150,7 @@ fn run_test(path: &str) {
             }
             other => {
                 if let Err(e) = interp.run(&[other.clone()]) {
-                    eprintln!("Error: {}", e);
+                    eprint_diagnostic(&e, &source_lines, path);
                     std::process::exit(1);
                 }
             }
@@ -156,6 +169,8 @@ fn run_source(source: &str) {
 }
 
 fn run_source_with_dir(source: &str, file_path: &str) {
+    let source_lines: Vec<String> = source.lines().map(String::from).collect();
+    let file_name = if file_path.is_empty() { "<stdin>" } else { file_path };
     let tokens = match lexer::Lexer::new(source).tokenize() {
         Ok(t) => t,
         Err(e) => {
@@ -166,17 +181,19 @@ fn run_source_with_dir(source: &str, file_path: &str) {
     let result = match parser::Parser::new(tokens).parse_with_spans() {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("{}", e);
+            eprint_diagnostic(&e, &source_lines, file_name);
             std::process::exit(1);
         }
     };
     // Type checking pass (runs before execution)
     let mut checker = type_checker::TypeChecker::new();
     if let Err(e) = checker.check(&result.stmts, &result.spans) {
-        eprintln!("{}", e);
+        eprint_diagnostic(&e, &source_lines, file_name);
         std::process::exit(1);
     }
     let mut interp = interpreter::Interpreter::new();
+    interp.source_lines = source_lines.clone();
+    interp.file_name = file_name.to_string();
     // Set source directory for module resolution
     if !file_path.is_empty() {
         let path = std::path::Path::new(file_path);
@@ -187,9 +204,23 @@ fn run_source_with_dir(source: &str, file_path: &str) {
     match interp.run_with_spans(&result.stmts, &result.spans) {
         Ok(_) => {}
         Err(e) => {
-            eprintln!("{}", e);
+            eprint_diagnostic(&e, &source_lines, file_name);
             std::process::exit(1);
         }
+    }
+}
+
+/// Print a diagnostic error message with Rust-style source context.
+fn eprint_diagnostic(e: &error::HexaError, source_lines: &[String], file_name: &str) {
+    if e.line > 0 && !source_lines.is_empty() {
+        let diag = error::Diagnostic {
+            error: e,
+            source_lines,
+            file_name,
+        };
+        eprint!("{}", diag.format_with_source());
+    } else {
+        eprintln!("{}", e);
     }
 }
 
@@ -327,5 +358,197 @@ fn run_repl() {
             },
             Err(e) => eprintln!("{}", e),
         }
+    }
+}
+
+// ── Package commands (hexa init/run/test) ──────────────────
+
+fn cmd_init(name: &str) {
+    use std::fs;
+    use std::path::Path;
+
+    let base = Path::new(name);
+    if base.exists() {
+        eprintln!("Error: directory '{}' already exists", name);
+        std::process::exit(1);
+    }
+
+    // Create directories
+    fs::create_dir_all(base.join("src")).unwrap_or_else(|e| {
+        eprintln!("Error creating directories: {}", e);
+        std::process::exit(1);
+    });
+    fs::create_dir_all(base.join("tests")).unwrap_or_else(|e| {
+        eprintln!("Error creating directories: {}", e);
+        std::process::exit(1);
+    });
+
+    // hexa.toml
+    let toml_content = format!(
+        "[package]\nname = \"{}\"\nversion = \"0.1.0\"\n",
+        name
+    );
+    fs::write(base.join("hexa.toml"), toml_content).unwrap_or_else(|e| {
+        eprintln!("Error writing hexa.toml: {}", e);
+        std::process::exit(1);
+    });
+
+    // src/main.hexa
+    let main_content = format!("println(\"Hello from {}!\")\n", name);
+    fs::write(base.join("src").join("main.hexa"), main_content).unwrap_or_else(|e| {
+        eprintln!("Error writing src/main.hexa: {}", e);
+        std::process::exit(1);
+    });
+
+    // tests/test_main.hexa
+    let test_content = "proof test_hello {\n    assert 1 + 1 == 2\n}\n";
+    fs::write(base.join("tests").join("test_main.hexa"), test_content).unwrap_or_else(|e| {
+        eprintln!("Error writing tests/test_main.hexa: {}", e);
+        std::process::exit(1);
+    });
+
+    println!("Created project '{}'", name);
+    println!("  {}/hexa.toml", name);
+    println!("  {}/src/main.hexa", name);
+    println!("  {}/tests/test_main.hexa", name);
+}
+
+fn cmd_run() {
+    // Find hexa.toml in current directory
+    let toml_path = std::path::Path::new("hexa.toml");
+    if !toml_path.exists() {
+        eprintln!("Error: no hexa.toml found in current directory");
+        eprintln!("Run 'hexa init <name>' to create a new project");
+        std::process::exit(1);
+    }
+
+    let main_path = "src/main.hexa";
+    if !std::path::Path::new(main_path).exists() {
+        eprintln!("Error: src/main.hexa not found");
+        std::process::exit(1);
+    }
+
+    run_file(main_path);
+}
+
+fn cmd_test() {
+    // Find hexa.toml in current directory
+    let toml_path = std::path::Path::new("hexa.toml");
+    if !toml_path.exists() {
+        eprintln!("Error: no hexa.toml found in current directory");
+        eprintln!("Run 'hexa init <name>' to create a new project");
+        std::process::exit(1);
+    }
+
+    let tests_dir = std::path::Path::new("tests");
+    if !tests_dir.exists() {
+        eprintln!("Error: tests/ directory not found");
+        std::process::exit(1);
+    }
+
+    let mut test_files: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(tests_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().map_or(false, |e| e == "hexa") {
+                test_files.push(path);
+            }
+        }
+    }
+    test_files.sort();
+
+    if test_files.is_empty() {
+        println!("No test files found in tests/");
+        return;
+    }
+
+    let mut total_passed = 0usize;
+    let mut total_failed = 0usize;
+
+    for test_file in &test_files {
+        println!("\nRunning {}...", test_file.display());
+        let source = match std::fs::read_to_string(test_file) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Error reading {}: {}", test_file.display(), e);
+                total_failed += 1;
+                continue;
+            }
+        };
+        let source_lines: Vec<String> = source.lines().map(String::from).collect();
+        let file_name = test_file.to_string_lossy().to_string();
+
+        let tokens = match lexer::Lexer::new(&source).tokenize() {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("{}", e);
+                total_failed += 1;
+                continue;
+            }
+        };
+        let result = match parser::Parser::new(tokens).parse_with_spans() {
+            Ok(r) => r,
+            Err(e) => {
+                eprint_diagnostic(&e, &source_lines, &file_name);
+                total_failed += 1;
+                continue;
+            }
+        };
+        let stmts = result.stmts;
+        let spans = result.spans;
+
+        let mut checker = type_checker::TypeChecker::new();
+        if let Err(e) = checker.check(&stmts, &spans) {
+            eprint_diagnostic(&e, &source_lines, &file_name);
+            total_failed += 1;
+            continue;
+        }
+
+        let mut interp = interpreter::Interpreter::new();
+        interp.test_mode = true;
+        interp.source_lines = source_lines.clone();
+        interp.file_name = file_name.clone();
+
+        for (i, stmt) in stmts.iter().enumerate() {
+            if let Some(&(line, col)) = spans.get(i) {
+                interp.current_line = line;
+                interp.current_col = col;
+            }
+            match stmt {
+                ast::Stmt::Proof(name, body) => {
+                    interp.env.push_scope();
+                    let mut test_failed = false;
+                    for s in body {
+                        match interp.run(&[s.clone()]) {
+                            Ok(_) => {}
+                            Err(e) => {
+                                println!("  proof {} ... FAILED: {}", name, e.message);
+                                test_failed = true;
+                                total_failed += 1;
+                                break;
+                            }
+                        }
+                    }
+                    interp.env.pop_scope();
+                    if !test_failed {
+                        println!("  proof {} ... ok", name);
+                        total_passed += 1;
+                    }
+                }
+                other => {
+                    if let Err(e) = interp.run(&[other.clone()]) {
+                        eprint_diagnostic(&e, &source_lines, &file_name);
+                        total_failed += 1;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    println!("\ntest result: {} passed, {} failed (total {})",
+        total_passed, total_failed, total_passed + total_failed);
+    if total_failed > 0 {
+        std::process::exit(1);
     }
 }

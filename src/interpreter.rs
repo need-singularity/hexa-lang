@@ -37,6 +37,10 @@ pub struct Interpreter {
     pub current_col: usize,
     /// Directory of the currently executing file (for resolving `use` paths).
     pub source_dir: Option<String>,
+    /// Source lines for diagnostic error messages.
+    pub source_lines: Vec<String>,
+    /// File name for diagnostic error messages.
+    pub file_name: String,
     /// Join handles for spawned threads.
     spawn_handles: Vec<thread::JoinHandle<()>>,
 }
@@ -66,6 +70,8 @@ impl Interpreter {
             current_line: 0,
             current_col: 0,
             source_dir: None,
+            source_lines: Vec::new(),
+            file_name: String::new(),
             spawn_handles: Vec::new(),
         }
     }
@@ -257,6 +263,7 @@ impl Interpreter {
                         message: "assertion failed".into(),
                         line: self.current_line,
                         col: self.current_col,
+                    hint: None,
                     });
                 }
                 Ok(Value::Void)
@@ -391,11 +398,20 @@ impl Interpreter {
             Expr::StringLit(s) => Ok(Value::Str(s.clone())),
             Expr::CharLit(c) => Ok(Value::Char(*c)),
             Expr::Ident(name) => {
-                self.env.get(name).ok_or_else(|| HexaError {
-                    class: ErrorClass::Name,
-                    message: format!("undefined variable: {}", name),
-                    line: self.current_line,
-                    col: self.current_col,
+                self.env.get(name).ok_or_else(|| {
+                    // Collect known names for "did you mean" suggestion
+                    let known_names: Vec<&str> = self.env.scopes.iter()
+                        .flat_map(|s| s.keys().map(|k| k.as_str()))
+                        .collect();
+                    let hint = crate::error::suggest_name(name, &known_names)
+                        .map(|s| format!("did you mean '{}'?", s));
+                    HexaError {
+                        class: ErrorClass::Name,
+                        message: format!("undefined variable: {}", name),
+                        line: self.current_line,
+                        col: self.current_col,
+                        hint,
+                    }
                 })
             }
             Expr::Binary(left, op, right) => {
@@ -1067,6 +1083,40 @@ impl Interpreter {
                 let chars: Vec<Value> = s.chars().map(Value::Char).collect();
                 Ok(Value::Array(chars))
             }
+            "join" => {
+                if args.is_empty() { return Err(self.type_err("join() requires 1 argument (array)".into())); }
+                match &args[0] {
+                    Value::Array(arr) => {
+                        let parts: Vec<String> = arr.iter().map(|v| format!("{}", v)).collect();
+                        Ok(Value::Str(parts.join(s)))
+                    }
+                    _ => Err(self.type_err("join() requires array argument".into())),
+                }
+            }
+            "repeat" => {
+                if args.is_empty() { return Err(self.type_err("repeat() requires 1 argument".into())); }
+                match &args[0] {
+                    Value::Int(n) => Ok(Value::Str(s.repeat(*n as usize))),
+                    _ => Err(self.type_err("repeat() requires int argument".into())),
+                }
+            }
+            "ends_with" => {
+                if args.is_empty() { return Err(self.type_err("ends_with() requires 1 argument".into())); }
+                match &args[0] {
+                    Value::Str(suffix) => Ok(Value::Bool(s.ends_with(suffix.as_str()))),
+                    _ => Err(self.type_err("ends_with() requires string argument".into())),
+                }
+            }
+            "is_empty" => Ok(Value::Bool(s.is_empty())),
+            "index_of" => {
+                if args.is_empty() { return Err(self.type_err("index_of() requires 1 argument".into())); }
+                match &args[0] {
+                    Value::Str(substr) => {
+                        Ok(Value::Int(s.find(substr.as_str()).map_or(-1, |i| i as i64)))
+                    }
+                    _ => Err(self.type_err("index_of() requires string argument".into())),
+                }
+            }
             _ => Err(self.runtime_err(format!("unknown string method: .{}()", method))),
         }
     }
@@ -1134,6 +1184,84 @@ impl Interpreter {
                     acc = self.call_function(func.clone(), vec![acc, item.clone()])?;
                 }
                 Ok(acc)
+            }
+            "enumerate" => {
+                let result: Vec<Value> = arr.iter().enumerate()
+                    .map(|(i, v)| Value::Tuple(vec![Value::Int(i as i64), v.clone()]))
+                    .collect();
+                Ok(Value::Array(result))
+            }
+            "sum" => {
+                let mut int_sum = 0i64;
+                let mut float_sum = 0.0f64;
+                let mut has_float = false;
+                for item in arr {
+                    match item {
+                        Value::Int(n) => int_sum += n,
+                        Value::Float(f) => { float_sum += f; has_float = true; }
+                        _ => return Err(self.type_err("sum() requires numeric array".into())),
+                    }
+                }
+                if has_float {
+                    Ok(Value::Float(float_sum + int_sum as f64))
+                } else {
+                    Ok(Value::Int(int_sum))
+                }
+            }
+            "min" => {
+                if arr.is_empty() { return Err(self.runtime_err("min() on empty array".into())); }
+                let mut min_val = &arr[0];
+                for item in &arr[1..] {
+                    match (item, min_val) {
+                        (Value::Int(a), Value::Int(b)) => { if a < b { min_val = item; } }
+                        (Value::Float(a), Value::Float(b)) => { if a < b { min_val = item; } }
+                        _ => {}
+                    }
+                }
+                Ok(min_val.clone())
+            }
+            "max" => {
+                if arr.is_empty() { return Err(self.runtime_err("max() on empty array".into())); }
+                let mut max_val = &arr[0];
+                for item in &arr[1..] {
+                    match (item, max_val) {
+                        (Value::Int(a), Value::Int(b)) => { if a > b { max_val = item; } }
+                        (Value::Float(a), Value::Float(b)) => { if a > b { max_val = item; } }
+                        _ => {}
+                    }
+                }
+                Ok(max_val.clone())
+            }
+            "join" => {
+                if args.is_empty() { return Err(self.type_err("join() requires 1 argument (separator)".into())); }
+                match &args[0] {
+                    Value::Str(sep) => {
+                        let parts: Vec<String> = arr.iter().map(|v| format!("{}", v)).collect();
+                        Ok(Value::Str(parts.join(sep)))
+                    }
+                    _ => Err(self.type_err("join() requires string separator".into())),
+                }
+            }
+            "slice" => {
+                if args.len() < 2 { return Err(self.type_err("slice() requires 2 arguments (start, end)".into())); }
+                match (&args[0], &args[1]) {
+                    (Value::Int(start), Value::Int(end)) => {
+                        let s = (*start as usize).min(arr.len());
+                        let e = (*end as usize).min(arr.len());
+                        Ok(Value::Array(arr[s..e].to_vec()))
+                    }
+                    _ => Err(self.type_err("slice() requires int arguments".into())),
+                }
+            }
+            "flatten" => {
+                let mut result = Vec::new();
+                for item in arr {
+                    match item {
+                        Value::Array(inner) => result.extend(inner.iter().cloned()),
+                        other => result.push(other.clone()),
+                    }
+                }
+                Ok(Value::Array(result))
             }
             _ => Err(self.runtime_err(format!("unknown array method: .{}()", method))),
         }
@@ -1532,11 +1660,64 @@ impl Interpreter {
                 let receiver = Value::Receiver(Arc::new(Mutex::new(rx)));
                 Ok(Value::Tuple(vec![sender, receiver]))
             }
+            // ── Random builtins ──────────────────────────────────────
+            "random" => {
+                // Simple pseudo-random using system time
+                use std::time::{SystemTime, UNIX_EPOCH};
+                let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().subsec_nanos();
+                let val = ((nanos as u64).wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407)) as f64 / u64::MAX as f64;
+                Ok(Value::Float(val.abs()))
+            }
+            "random_int" => {
+                if args.len() < 2 { return Err(self.type_err("random_int() requires 2 arguments (min, max)".into())); }
+                match (&args[0], &args[1]) {
+                    (Value::Int(min_val), Value::Int(max_val)) => {
+                        use std::time::{SystemTime, UNIX_EPOCH};
+                        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().subsec_nanos();
+                        let range = (max_val - min_val + 1) as u32;
+                        if range == 0 { return Ok(Value::Int(*min_val)); }
+                        let val = min_val + (nanos % range) as i64;
+                        Ok(Value::Int(val))
+                    }
+                    _ => Err(self.type_err("random_int() requires int arguments".into())),
+                }
+            }
+            // ── System builtins ──────────────────────────────────────
+            "sleep" => {
+                if args.is_empty() { return Err(self.type_err("sleep() requires 1 argument (ms)".into())); }
+                match &args[0] {
+                    Value::Int(ms) => {
+                        std::thread::sleep(std::time::Duration::from_millis(*ms as u64));
+                        Ok(Value::Void)
+                    }
+                    _ => Err(self.type_err("sleep() requires int argument (milliseconds)".into())),
+                }
+            }
+            "print_err" => {
+                if args.is_empty() { return Err(self.type_err("print_err() requires 1 argument".into())); }
+                eprintln!("{}", args[0]);
+                Ok(Value::Void)
+            }
+            // ── JSON builtins ──────────────────────────────────────
+            "json_parse" => {
+                if args.is_empty() { return Err(self.type_err("json_parse() requires 1 argument".into())); }
+                match &args[0] {
+                    Value::Str(s) => {
+                        parse_json_value(s.trim()).map(|(v, _)| v).map_err(|e| self.runtime_err(format!("JSON parse error: {}", e)))
+                    }
+                    _ => Err(self.type_err("json_parse() requires string argument".into())),
+                }
+            }
+            "json_stringify" => {
+                if args.is_empty() { return Err(self.type_err("json_stringify() requires 1 argument".into())); }
+                Ok(Value::Str(stringify_json(&args[0])))
+            }
             _ => Err(HexaError {
                 class: ErrorClass::Name,
                 message: format!("unknown builtin: {}", name),
                 line: self.current_line,
                 col: self.current_col,
+                hint: None,
             }),
         }
     }
@@ -1767,6 +1948,7 @@ impl Interpreter {
                 message: format!("parse error in module '{}': {}", module_name, e.message),
                 line: e.line,
                 col: e.col,
+                hint: None,
             }
         })?;
 
@@ -1884,6 +2066,7 @@ impl Interpreter {
             message,
             line: self.current_line,
             col: self.current_col,
+            hint: None,
         }
     }
 
@@ -1893,6 +2076,7 @@ impl Interpreter {
             message,
             line: self.current_line,
             col: self.current_col,
+            hint: None,
         }
     }
 }
@@ -1905,6 +2089,189 @@ fn gcd(a: i64, b: i64) -> i64 {
         a = t;
     }
     a
+}
+
+// ── JSON Parser ──────────────────────────────────────────────
+
+fn parse_json_value(input: &str) -> Result<(Value, &str), String> {
+    let input = input.trim_start();
+    if input.is_empty() {
+        return Err("unexpected end of JSON input".into());
+    }
+    match input.as_bytes()[0] {
+        b'"' => parse_json_string(input),
+        b'{' => parse_json_object(input),
+        b'[' => parse_json_array(input),
+        b't' | b'f' => parse_json_bool(input),
+        b'n' => parse_json_null(input),
+        b'-' | b'0'..=b'9' => parse_json_number(input),
+        c => Err(format!("unexpected character '{}' in JSON", c as char)),
+    }
+}
+
+fn parse_json_string(input: &str) -> Result<(Value, &str), String> {
+    if !input.starts_with('"') {
+        return Err("expected '\"'".into());
+    }
+    let rest = &input[1..];
+    let mut result = String::new();
+    let mut chars = rest.char_indices();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '"' => return Ok((Value::Str(result), &rest[i+1..])),
+            '\\' => {
+                if let Some((_, esc)) = chars.next() {
+                    match esc {
+                        '"' => result.push('"'),
+                        '\\' => result.push('\\'),
+                        '/' => result.push('/'),
+                        'n' => result.push('\n'),
+                        't' => result.push('\t'),
+                        'r' => result.push('\r'),
+                        'b' => result.push('\u{0008}'),
+                        'f' => result.push('\u{000C}'),
+                        _ => { result.push('\\'); result.push(esc); }
+                    }
+                }
+            }
+            _ => result.push(c),
+        }
+    }
+    Err("unterminated JSON string".into())
+}
+
+fn parse_json_object(input: &str) -> Result<(Value, &str), String> {
+    let mut rest = input[1..].trim_start();
+    let mut map = std::collections::HashMap::new();
+    if rest.starts_with('}') {
+        return Ok((Value::Map(map), &rest[1..]));
+    }
+    loop {
+        rest = rest.trim_start();
+        let (key_val, after_key) = parse_json_string(rest)?;
+        let key = match key_val {
+            Value::Str(s) => s,
+            _ => return Err("expected string key in JSON object".into()),
+        };
+        rest = after_key.trim_start();
+        if !rest.starts_with(':') {
+            return Err("expected ':' in JSON object".into());
+        }
+        rest = rest[1..].trim_start();
+        let (val, after_val) = parse_json_value(rest)?;
+        map.insert(key, val);
+        rest = after_val.trim_start();
+        if rest.starts_with('}') {
+            return Ok((Value::Map(map), &rest[1..]));
+        }
+        if rest.starts_with(',') {
+            rest = &rest[1..];
+        } else {
+            return Err("expected ',' or '}' in JSON object".into());
+        }
+    }
+}
+
+fn parse_json_array(input: &str) -> Result<(Value, &str), String> {
+    let mut rest = input[1..].trim_start();
+    let mut items = Vec::new();
+    if rest.starts_with(']') {
+        return Ok((Value::Array(items), &rest[1..]));
+    }
+    loop {
+        rest = rest.trim_start();
+        let (val, after_val) = parse_json_value(rest)?;
+        items.push(val);
+        rest = after_val.trim_start();
+        if rest.starts_with(']') {
+            return Ok((Value::Array(items), &rest[1..]));
+        }
+        if rest.starts_with(',') {
+            rest = &rest[1..];
+        } else {
+            return Err("expected ',' or ']' in JSON array".into());
+        }
+    }
+}
+
+fn parse_json_number(input: &str) -> Result<(Value, &str), String> {
+    let mut end = 0;
+    let bytes = input.as_bytes();
+    let mut is_float = false;
+    if end < bytes.len() && bytes[end] == b'-' { end += 1; }
+    while end < bytes.len() && bytes[end].is_ascii_digit() { end += 1; }
+    if end < bytes.len() && bytes[end] == b'.' {
+        is_float = true;
+        end += 1;
+        while end < bytes.len() && bytes[end].is_ascii_digit() { end += 1; }
+    }
+    if end < bytes.len() && (bytes[end] == b'e' || bytes[end] == b'E') {
+        is_float = true;
+        end += 1;
+        if end < bytes.len() && (bytes[end] == b'+' || bytes[end] == b'-') { end += 1; }
+        while end < bytes.len() && bytes[end].is_ascii_digit() { end += 1; }
+    }
+    let num_str = &input[..end];
+    let rest = &input[end..];
+    if is_float {
+        num_str.parse::<f64>().map(|f| (Value::Float(f), rest)).map_err(|e| format!("invalid JSON number: {}", e))
+    } else {
+        num_str.parse::<i64>().map(|n| (Value::Int(n), rest)).map_err(|e| format!("invalid JSON number: {}", e))
+    }
+}
+
+fn parse_json_bool(input: &str) -> Result<(Value, &str), String> {
+    if input.starts_with("true") {
+        Ok((Value::Bool(true), &input[4..]))
+    } else if input.starts_with("false") {
+        Ok((Value::Bool(false), &input[5..]))
+    } else {
+        Err("invalid JSON boolean".into())
+    }
+}
+
+fn parse_json_null(input: &str) -> Result<(Value, &str), String> {
+    if input.starts_with("null") {
+        Ok((Value::Void, &input[4..]))
+    } else {
+        Err("invalid JSON null".into())
+    }
+}
+
+fn stringify_json(val: &Value) -> String {
+    match val {
+        Value::Int(n) => format!("{}", n),
+        Value::Float(f) => {
+            if f.fract() == 0.0 && f.is_finite() {
+                format!("{:.1}", f)
+            } else {
+                format!("{}", f)
+            }
+        }
+        Value::Bool(b) => format!("{}", b),
+        Value::Str(s) => {
+            let escaped = s.replace('\\', "\\\\").replace('"', "\\\"")
+                .replace('\n', "\\n").replace('\t', "\\t").replace('\r', "\\r");
+            format!("\"{}\"", escaped)
+        }
+        Value::Void => "null".into(),
+        Value::Array(arr) => {
+            let items: Vec<String> = arr.iter().map(|v| stringify_json(v)).collect();
+            format!("[{}]", items.join(", "))
+        }
+        Value::Map(map) => {
+            let mut pairs: Vec<String> = map.iter()
+                .map(|(k, v)| format!("\"{}\": {}", k, stringify_json(v)))
+                .collect();
+            pairs.sort(); // deterministic output
+            format!("{{{}}}", pairs.join(", "))
+        }
+        Value::Tuple(t) => {
+            let items: Vec<String> = t.iter().map(|v| stringify_json(v)).collect();
+            format!("[{}]", items.join(", "))
+        }
+        _ => format!("\"{}\"", val),
+    }
 }
 
 #[cfg(test)]
@@ -2765,6 +3132,7 @@ match x {
             message: "division by zero".into(),
             line: 15,
             col: 10,
+        hint: None,
         };
         let msg = format!("{}", err);
         assert!(msg.contains("line 15:10"), "error display should include line:col, got: {}", msg);
@@ -2778,6 +3146,7 @@ match x {
             message: "some error".into(),
             line: 0,
             col: 0,
+        hint: None,
         };
         let msg = format!("{}", err);
         assert!(!msg.contains("line 0"), "when line=0, should not show 'line 0', got: {}", msg);
@@ -3168,5 +3537,165 @@ spawn {
 rx.recv()
 "#;
         assert!(matches!(eval(src), Value::Int(42)));
+    }
+
+    // ── Feature 1: Rust-Quality Error Messages ──────────────────
+
+    #[test]
+    fn test_undefined_var_did_you_mean() {
+        let src = "let printer = 42\npriner";
+        let tokens = Lexer::new(src).tokenize().unwrap();
+        let stmts = Parser::new(tokens).parse().unwrap();
+        let mut interp = Interpreter::new();
+        let err = interp.run(&stmts).unwrap_err();
+        assert_eq!(err.class, ErrorClass::Name);
+        assert!(err.hint.is_some());
+        assert!(err.hint.unwrap().contains("printer"));
+    }
+
+    #[test]
+    fn test_error_has_hint_for_close_names() {
+        let src = "prnt(42)";
+        let tokens = Lexer::new(src).tokenize().unwrap();
+        let stmts = Parser::new(tokens).parse().unwrap();
+        let mut interp = Interpreter::new();
+        let err = interp.run(&stmts).unwrap_err();
+        // "prnt" should suggest "print"
+        assert!(err.hint.is_some(), "expected hint for 'prnt'");
+        assert!(err.hint.unwrap().contains("print"));
+    }
+
+    #[test]
+    fn test_diagnostic_format_with_source() {
+        let src = "let x = 42\nlet y = unknown_var";
+        let source_lines: Vec<String> = src.lines().map(String::from).collect();
+        let tokens = Lexer::new(src).tokenize().unwrap();
+        let result = Parser::new(tokens).parse_with_spans().unwrap();
+        let mut interp = Interpreter::new();
+        interp.source_lines = source_lines.clone();
+        interp.file_name = "test.hexa".to_string();
+        let err = interp.run_with_spans(&result.stmts, &result.spans).unwrap_err();
+        let diag = crate::error::Diagnostic {
+            error: &err,
+            source_lines: &source_lines,
+            file_name: "test.hexa",
+        };
+        let output = diag.format_with_source();
+        assert!(output.contains("error[Name]"));
+        assert!(output.contains("--> test.hexa:"));
+        assert!(output.contains("^"));
+    }
+
+    // ── Feature 2: Expanded Standard Library ──────────────────
+
+    #[test]
+    fn test_string_join() {
+        assert!(matches!(eval(r#"", ".join(["a", "b", "c"])"#), Value::Str(s) if s == "a, b, c"));
+    }
+
+    #[test]
+    fn test_string_repeat() {
+        assert!(matches!(eval(r#""ab".repeat(3)"#), Value::Str(s) if s == "ababab"));
+    }
+
+    #[test]
+    fn test_string_ends_with() {
+        assert!(matches!(eval(r#""hello".ends_with("llo")"#), Value::Bool(true)));
+        assert!(matches!(eval(r#""hello".ends_with("xyz")"#), Value::Bool(false)));
+    }
+
+    #[test]
+    fn test_string_is_empty() {
+        assert!(matches!(eval(r#""".is_empty()"#), Value::Bool(true)));
+        assert!(matches!(eval(r#""hello".is_empty()"#), Value::Bool(false)));
+    }
+
+    #[test]
+    fn test_string_index_of() {
+        assert!(matches!(eval(r#""hello world".index_of("world")"#), Value::Int(6)));
+        assert!(matches!(eval(r#""hello".index_of("xyz")"#), Value::Int(-1)));
+    }
+
+    #[test]
+    fn test_array_enumerate() {
+        let src = r#"let e = ["a", "b", "c"].enumerate()
+e[1][0]"#;
+        assert!(matches!(eval(src), Value::Int(1)));
+    }
+
+    #[test]
+    fn test_array_sum() {
+        assert!(matches!(eval("[1, 2, 3, 4].sum()"), Value::Int(10)));
+    }
+
+    #[test]
+    fn test_array_min_max() {
+        assert!(matches!(eval("[3, 1, 4, 1, 5].min()"), Value::Int(1)));
+        assert!(matches!(eval("[3, 1, 4, 1, 5].max()"), Value::Int(5)));
+    }
+
+    #[test]
+    fn test_array_join() {
+        assert!(matches!(eval(r#"[1, 2, 3].join(", ")"#), Value::Str(s) if s == "1, 2, 3"));
+    }
+
+    #[test]
+    fn test_array_slice() {
+        let src = "[10, 20, 30, 40, 50].slice(1, 4)[1]";
+        assert!(matches!(eval(src), Value::Int(30)));
+    }
+
+    #[test]
+    fn test_array_flatten() {
+        let src = "[[1, 2], [3, 4], [5]].flatten().len()";
+        assert!(matches!(eval(src), Value::Int(5)));
+    }
+
+    #[test]
+    fn test_json_parse_object() {
+        let src = r#"let obj = json_parse("{\"name\": \"hexa\", \"version\": 6}")
+obj["name"]"#;
+        assert!(matches!(eval(src), Value::Str(s) if s == "hexa"));
+    }
+
+    #[test]
+    fn test_json_parse_array() {
+        let src = r#"let arr = json_parse("[1, 2, 3]")
+arr[1]"#;
+        assert!(matches!(eval(src), Value::Int(2)));
+    }
+
+    #[test]
+    fn test_json_stringify() {
+        let src = r#"json_stringify([1, 2, 3])"#;
+        assert!(matches!(eval(src), Value::Str(s) if s == "[1, 2, 3]"));
+    }
+
+    #[test]
+    fn test_json_parse_nested() {
+        let src = r#"let data = json_parse("{\"a\": {\"b\": 42}}")
+data["a"]["b"]"#;
+        assert!(matches!(eval(src), Value::Int(42)));
+    }
+
+    #[test]
+    fn test_json_parse_booleans_null() {
+        assert!(matches!(eval(r#"json_parse("true")"#), Value::Bool(true)));
+        assert!(matches!(eval(r#"json_parse("false")"#), Value::Bool(false)));
+        assert!(matches!(eval(r#"json_parse("null")"#), Value::Void));
+    }
+
+    #[test]
+    fn test_print_err_returns_void() {
+        // Just test it doesn't crash; output goes to stderr
+        assert!(matches!(eval(r#"print_err("test")"#), Value::Void));
+    }
+
+    #[test]
+    fn test_random_returns_float() {
+        match eval("random()") {
+            Value::Float(f) => assert!(f >= 0.0 && f <= 1.0),
+            other => panic!("expected Float, got {:?}", other),
+        }
     }
 }
