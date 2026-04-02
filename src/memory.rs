@@ -580,6 +580,10 @@ pub fn estimate_value_size(val: &crate::env::Value) -> usize {
         Value::Receiver(_) => 32,
         Value::Future(_) => 32,
         Value::Set(_) => 48,
+        #[cfg(not(target_arch = "wasm32"))]
+        Value::TcpListener(_) => 32,
+        #[cfg(not(target_arch = "wasm32"))]
+        Value::TcpStream(_) => 32,
         Value::EffectRequest(_, _, args) => 48 + args.len() * 16,
         Value::TraitObject { value, .. } => 48 + estimate_value_size(value),
         #[cfg(not(target_arch = "wasm32"))]
@@ -602,6 +606,8 @@ pub fn classify_region(val: &crate::env::Value) -> MemRegion {
         Value::Future(_) => MemRegion::Heap,
         #[cfg(not(target_arch = "wasm32"))]
         Value::Sender(_) | Value::Receiver(_) => MemRegion::Heap,
+        #[cfg(not(target_arch = "wasm32"))]
+        Value::TcpListener(_) | Value::TcpStream(_) => MemRegion::Heap,
 
         // Small/temporary → Arena
         Value::Str(_) | Value::Tuple(_) | Value::BuiltinFn(_) |

@@ -32,6 +32,10 @@ pub enum Value {
     #[cfg(not(target_arch = "wasm32"))]
     AsyncFuture(crate::async_runtime::HexaFuture), // green-thread future (new runtime)
     Set(Arc<Mutex<std::collections::HashSet<String>>>), // unique value set
+    #[cfg(not(target_arch = "wasm32"))]
+    TcpListener(Arc<Mutex<std::net::TcpListener>>),    // TCP server listener
+    #[cfg(not(target_arch = "wasm32"))]
+    TcpStream(Arc<Mutex<std::net::TcpStream>>),        // TCP connection (client or accepted)
     /// Algebraic effect request — propagated up the call stack to be caught by a handler.
     EffectRequest(String, String, Vec<Value>),  // effect_name, op_name, args
     /// Trait object — wraps a value with its vtable key for dynamic dispatch.
@@ -111,6 +115,10 @@ impl std::fmt::Display for Value {
                 let items: Vec<String> = guard.iter().cloned().collect();
                 write!(f, "Set({{{}}})", items.join(", "))
             }
+            #[cfg(not(target_arch = "wasm32"))]
+            Value::TcpListener(_) => write!(f, "<tcp-listener>"),
+            #[cfg(not(target_arch = "wasm32"))]
+            Value::TcpStream(_) => write!(f, "<tcp-stream>"),
             Value::EffectRequest(effect, op, _) => write!(f, "<effect {}.{}>", effect, op),
             Value::TraitObject { value, trait_name, type_name } => {
                 write!(f, "<dyn {} ({}: {})>", trait_name, type_name, value)

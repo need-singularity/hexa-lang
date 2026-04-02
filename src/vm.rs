@@ -494,6 +494,10 @@ impl VM {
                     Value::Receiver(_) => "receiver",
                     Value::Future(_) => "future",
                     Value::Set(_) => "set",
+                    #[cfg(not(target_arch = "wasm32"))]
+                    Value::TcpListener(_) => "tcp_listener",
+                    #[cfg(not(target_arch = "wasm32"))]
+                    Value::TcpStream(_) => "tcp_stream",
                     Value::EffectRequest(_, _, _) => "effect_request",
                     Value::TraitObject { type_name, .. } => type_name.as_str(),
                     #[cfg(not(target_arch = "wasm32"))]
