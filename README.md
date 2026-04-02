@@ -1,4 +1,4 @@
-# HEXA-LANG — The Perfect Number Programming Language
+# 🔢 HEXA-LANG — The Perfect Number Programming Language
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.19365284.svg)](https://doi.org/10.5281/zenodo.19365284)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
