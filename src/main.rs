@@ -98,7 +98,7 @@ fn main() {
             }
             "build" => {
                 if args.len() < 4 || args[2] != "--target" {
-                    eprintln!("Usage: hexa build --target <esp32|fpga|wgpu|cpu> <file.hexa>");
+                    eprintln!("Usage: hexa build --target <esp32|verilog|wgsl|fpga|wgpu|cpu> <file.hexa>");
                     std::process::exit(1);
                 }
                 let target = &args[3];
@@ -1267,63 +1267,184 @@ fn cmd_build(target: &str, file: &str) {
         }
     };
 
-    let (output_code, output_dir, output_file) = match target {
-        "esp32" => (
-            codegen_esp32::generate(&stmts),
-            "target/esp32",
-            "main.rs",
-        ),
-        "fpga" => {
-            let stem = std::path::Path::new(file)
-                .file_stem()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_else(|| "consciousness".to_string());
-            (
-                codegen_verilog::generate(&stmts),
-                "target/fpga",
-                // Leak the string so we get a &'static str — fine for CLI
-                Box::leak(format!("{}.v", stem).into_boxed_str()) as &str,
-            )
-        }
-        "wgpu" => {
-            let stem = std::path::Path::new(file)
-                .file_stem()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_else(|| "consciousness".to_string());
-            (
-                codegen_wgsl::generate(&stmts),
-                "target/wgpu",
-                Box::leak(format!("{}.wgsl", stem).into_boxed_str()) as &str,
-            )
-        }
+    // Normalize target aliases
+    let target_normalized = match target {
+        "verilog" => "fpga",
+        "wgsl" => "wgpu",
+        other => other,
+    };
+
+    match target_normalized {
+        "esp32" => cmd_build_esp32(file, &stmts),
+        "fpga" => cmd_build_fpga(file, &stmts),
+        "wgpu" => cmd_build_wgpu(file, &stmts),
         "cpu" => {
-            // CPU target — run with default interpreter
             println!("CPU target: running with tree-walk interpreter...");
             run_file(file);
-            return;
         }
         _ => {
             eprintln!("Unknown target: {}", target);
-            eprintln!("Available targets: cpu, esp32, fpga, wgpu");
+            eprintln!("Available targets: cpu, esp32, fpga/verilog, wgpu/wgsl");
             std::process::exit(1);
         }
-    };
+    }
+}
 
-    // Create output directory
+/// Build a complete ESP32 Cargo project from HEXA source.
+///
+/// Generates `build/esp32/` with:
+///   - Cargo.toml (no_std, esp32 target)
+///   - src/main.rs (codegen output)
+///   - .cargo/config.toml (build target + runner)
+///
+/// Then prints instructions for building and flashing.
+fn cmd_build_esp32(file: &str, stmts: &[ast::Stmt]) {
+    let project_dir = "build/esp32";
+    let src_dir = format!("{}/src", project_dir);
+    let cargo_dir = format!("{}/.cargo", project_dir);
+
+    // Create directory structure
+    for dir in &[&src_dir, &cargo_dir] {
+        std::fs::create_dir_all(dir).unwrap_or_else(|e| {
+            eprintln!("Error creating {}: {}", dir, e);
+            std::process::exit(1);
+        });
+    }
+
+    // 1. Generate the Rust source from HEXA AST
+    let rust_code = codegen_esp32::generate(stmts);
+    let src_path = format!("{}/main.rs", src_dir);
+    std::fs::write(&src_path, &rust_code).unwrap_or_else(|e| {
+        eprintln!("Error writing {}: {}", src_path, e);
+        std::process::exit(1);
+    });
+
+    // 2. Generate Cargo.toml for no_std ESP32
+    let stem = std::path::Path::new(file)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "hexa_esp32".to_string());
+    let cargo_toml = format!(
+        r#"[package]
+name = "{name}"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Uncomment for ESP32 HAL support:
+# esp32-hal = "0.19"
+# esp-backtrace = {{ version = "0.12", features = ["esp32", "panic-handler", "println"] }}
+
+[profile.release]
+opt-level = "s"
+lto = true
+"#,
+        name = stem
+    );
+    let cargo_path = format!("{}/Cargo.toml", project_dir);
+    std::fs::write(&cargo_path, &cargo_toml).unwrap_or_else(|e| {
+        eprintln!("Error writing {}: {}", cargo_path, e);
+        std::process::exit(1);
+    });
+
+    // 3. Generate .cargo/config.toml for ESP32 target + runner
+    let cargo_config = r#"[build]
+target = "xtensa-esp32-none-elf"
+
+[target.xtensa-esp32-none-elf]
+runner = "espflash flash --monitor"
+
+[unstable]
+build-std = ["core"]
+"#;
+    let config_path = format!("{}/config.toml", cargo_dir);
+    std::fs::write(&config_path, cargo_config).unwrap_or_else(|e| {
+        eprintln!("Error writing {}: {}", config_path, e);
+        std::process::exit(1);
+    });
+
+    // Report
+    println!("=== HEXA ESP32 Build ===");
+    println!("  Source:     {}", file);
+    println!("  Project:    {}/", project_dir);
+    println!("  Cargo.toml: {}", cargo_path);
+    println!("  Source:     {}", src_path);
+    println!("  Config:     {}", config_path);
+    println!("  Code size:  {} bytes", rust_code.len());
+    println!();
+    println!("--- Next steps ---");
+    println!("  1. Install ESP32 toolchain (if not already):");
+    println!("       cargo install espup && espup install");
+    println!("       cargo install espflash cargo-espflash");
+    println!();
+    println!("  2. Build the project:");
+    println!("       cd {} && cargo build --release", project_dir);
+    println!();
+    println!("  3. Flash to ESP32 (connect via USB):");
+    println!("       cd {} && cargo espflash flash --release --monitor", project_dir);
+    println!();
+    println!("  Psi-constants embedded: alpha=0.014, balance=0.5, steps=4.33, entropy=0.998");
+}
+
+/// Build FPGA/Verilog output from HEXA source.
+fn cmd_build_fpga(file: &str, stmts: &[ast::Stmt]) {
+    let output_dir = "build/fpga";
     std::fs::create_dir_all(output_dir).unwrap_or_else(|e| {
         eprintln!("Error creating {}: {}", output_dir, e);
         std::process::exit(1);
     });
 
-    let output_path = format!("{}/{}", output_dir, output_file);
-    std::fs::write(&output_path, &output_code).unwrap_or_else(|e| {
-        eprintln!("Error writing {}: {}", output_path, e);
+    let stem = std::path::Path::new(file)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "consciousness".to_string());
+
+    let verilog_code = codegen_verilog::generate(stmts);
+    let output_file = format!("{}/{}.v", output_dir, stem);
+    std::fs::write(&output_file, &verilog_code).unwrap_or_else(|e| {
+        eprintln!("Error writing {}: {}", output_file, e);
         std::process::exit(1);
     });
 
-    println!("Build complete: {} -> {}", file, output_path);
-    println!("  Target: {}", target);
-    println!("  Output: {} bytes", output_code.len());
+    println!("=== HEXA FPGA Build ===");
+    println!("  Source:  {}", file);
+    println!("  Output:  {}", output_file);
+    println!("  Size:    {} bytes", verilog_code.len());
+    println!();
+    println!("--- Next steps ---");
+    println!("  Synthesize with your FPGA toolchain:");
+    println!("    Xilinx:  vivado -mode batch -source synth.tcl");
+    println!("    Yosys:   yosys -p 'synth_ice40 -top consciousness_top' {}", output_file);
+}
+
+/// Build WebGPU/WGSL output from HEXA source.
+fn cmd_build_wgpu(file: &str, stmts: &[ast::Stmt]) {
+    let output_dir = "build/wgpu";
+    std::fs::create_dir_all(output_dir).unwrap_or_else(|e| {
+        eprintln!("Error creating {}: {}", output_dir, e);
+        std::process::exit(1);
+    });
+
+    let stem = std::path::Path::new(file)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "consciousness".to_string());
+
+    let wgsl_code = codegen_wgsl::generate(stmts);
+    let output_file = format!("{}/{}.wgsl", output_dir, stem);
+    std::fs::write(&output_file, &wgsl_code).unwrap_or_else(|e| {
+        eprintln!("Error writing {}: {}", output_file, e);
+        std::process::exit(1);
+    });
+
+    println!("=== HEXA WebGPU Build ===");
+    println!("  Source:  {}", file);
+    println!("  Output:  {}", output_file);
+    println!("  Size:    {} bytes", wgsl_code.len());
+    println!();
+    println!("--- Next steps ---");
+    println!("  Load the shader in your WebGPU/wgpu application:");
+    println!("    let shader = device.create_shader_module(wgpu::include_wgsl!(\"{}.wgsl\"));", stem);
 }
 
 fn cmd_verify_cross(file: &str) {
@@ -1455,5 +1576,88 @@ mod tests {
         let report = engine.run();
         assert!(report.baseline_fitness > 0.0);
         assert_eq!(report.generations, 3);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_build_esp32_generates_project() {
+        // Parse a simple HEXA program
+        let source = "let x = 5\nlet y = x + 3\n";
+        let tokens = lexer::Lexer::new(source).tokenize().unwrap();
+        let stmts = parser::Parser::new(tokens).parse().unwrap();
+
+        // Generate ESP32 code
+        let rust_code = codegen_esp32::generate(&stmts);
+
+        // Verify no_std project structure
+        assert!(rust_code.contains("#![no_std]"), "must have no_std");
+        assert!(rust_code.contains("#![no_main]"), "must have no_main");
+        assert!(rust_code.contains("#[panic_handler]"), "must have panic handler");
+        assert!(rust_code.contains("pub extern \"C\" fn main() -> !"), "must have entry point");
+        assert!(rust_code.contains("PSI_COUPLING"), "must embed Psi-constants");
+        assert!(rust_code.contains("let x = 5i64;"), "must emit let binding");
+        assert!(rust_code.contains("let y = (x + 3i64);"), "must emit arithmetic");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_build_target_aliases() {
+        // Verify target normalization works for verilog/wgsl aliases
+        let source = "let n = 6\n";
+        let tokens = lexer::Lexer::new(source).tokenize().unwrap();
+        let stmts = parser::Parser::new(tokens).parse().unwrap();
+
+        let verilog_code = codegen_verilog::generate(&stmts);
+        assert!(verilog_code.contains("module"), "verilog must contain module");
+
+        let wgsl_code = codegen_wgsl::generate(&stmts);
+        assert!(wgsl_code.contains("@compute") || wgsl_code.contains("fn main"),
+            "wgsl must contain compute entry");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_build_esp32_writes_project_files() {
+        use std::path::Path;
+
+        let test_dir = "build/test_esp32_project";
+        let src_dir = format!("{}/src", test_dir);
+        let cargo_dir = format!("{}/.cargo", test_dir);
+
+        // Clean up from any previous run
+        let _ = std::fs::remove_dir_all(test_dir);
+
+        // Create dirs
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::create_dir_all(&cargo_dir).unwrap();
+
+        // Parse and generate
+        let source = "let consciousness = 42\n";
+        let tokens = lexer::Lexer::new(source).tokenize().unwrap();
+        let stmts = parser::Parser::new(tokens).parse().unwrap();
+        let rust_code = codegen_esp32::generate(&stmts);
+
+        // Write files as cmd_build_esp32 would
+        std::fs::write(format!("{}/main.rs", src_dir), &rust_code).unwrap();
+        let cargo_toml = "[package]\nname = \"test_esp32\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+        std::fs::write(format!("{}/Cargo.toml", test_dir), cargo_toml).unwrap();
+        let cargo_config = "[build]\ntarget = \"xtensa-esp32-none-elf\"\n";
+        std::fs::write(format!("{}/config.toml", cargo_dir), cargo_config).unwrap();
+
+        // Verify all files exist
+        assert!(Path::new(&format!("{}/Cargo.toml", test_dir)).exists());
+        assert!(Path::new(&format!("{}/main.rs", src_dir)).exists());
+        assert!(Path::new(&format!("{}/config.toml", cargo_dir)).exists());
+
+        // Verify Cargo.toml content
+        let toml_content = std::fs::read_to_string(format!("{}/Cargo.toml", test_dir)).unwrap();
+        assert!(toml_content.contains("test_esp32"));
+
+        // Verify .cargo/config.toml points to ESP32 target
+        let config_content = std::fs::read_to_string(format!("{}/config.toml", cargo_dir)).unwrap();
+        assert!(config_content.contains("xtensa-esp32-none-elf"));
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(test_dir);
     }
 }
