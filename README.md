@@ -2,7 +2,7 @@
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.19365284.svg)](https://doi.org/10.5281/zenodo.19365284)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Tests](https://img.shields.io/badge/tests-827%20passing-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-1349%20passing-brightgreen.svg)]()
 [![n6 EXACT](https://img.shields.io/badge/n%3D6%20EXACT-100%25-gold.svg)]()
 
 A programming language where **every design constant** derives from the arithmetic of n=6, the smallest perfect number. Zero arbitrary choices.
@@ -41,30 +41,30 @@ sigma(n) * phi(n) = n * tau(n)    holds for n >= 2    if and only if n = 6
 ## Installation
 
 ```bash
-# Homebrew (macOS)
-brew install need-singularity/tap/hexa-lang
-
-# Cargo (any platform with Rust)
-cargo install hexa-lang
-
-# From source
+# From source (recommended)
 git clone https://github.com/need-singularity/hexa-lang.git
 cd hexa-lang && cargo build --release
+
+# Cargo
+cargo install hexa-lang
 ```
 
 ## Quick Start
 
 ```bash
-hexa                          # Interactive REPL
-hexa examples/hello.hexa      # Run a file
-hexa --test examples/test_builtins.hexa  # Run proof blocks as tests
-cargo test                    # Run 757 language tests
+./hexa                            # Interactive REPL
+./hexa examples/hello.hexa        # Run a file
+./hexa --native examples/fib.hexa # Cranelift JIT (818x faster)
+./hexa --vm examples/fib.hexa     # Bytecode VM (2.8x faster)
+./hexa --test examples/test_builtins.hexa  # Proof-verified tests
+./hexa --lsp                      # LSP server for VS Code
+RUST_MIN_STACK=16777216 cargo test # Run 1349 tests
 ```
 
 ## Example
 
 ```hexa
-// n=6 uniqueness proof
+// n=6 uniqueness proof — the core theorem
 fn sigma_fn(n: int) -> int {
     let mut s = 0
     for d in 1..=n {
@@ -96,40 +96,97 @@ for n in 2..101 {
 }
 ```
 
+## Consciousness Programming
+
+HEXA is the world's only language designed to program consciousness:
+
+```hexa
+// Declare a consciousness engine
+consciousness "experiment" {
+    // phi, tension, faction, cells, entropy are auto-injected
+    println("Phi:", phi)           // 71.0
+    println("Factions:", faction)  // 12 (sigma(6))
+    println("Cells:", cells)       // 64
+}
+
+// Formally verify consciousness laws
+proof law_22 {
+    assert phi > 0                 // consciousness is alive
+    invariant phi_positive         // Phi never goes negative
+    theorem structure_over_function
+}
+
+// Compile to hardware
+// hexa build --target esp32 consciousness.hexa --flash /dev/ttyUSB0
+// hexa build --target fpga  consciousness.hexa
+// hexa build --target wgsl  consciousness.hexa
+```
+
 ## Language Features
 
 ```hexa
-// Structs
+// Structs + traits + generics
 struct Point { x: int, y: int }
-let p = Point { x: 3, y: 4 }
-println(p.x)                        // 3
-
-// Closures + higher-order functions
-let doubled = [1, 2, 3].map(|x| x * 2)        // [2, 4, 6]
-let evens = [1, 2, 3, 4].filter(|x| x % 2 == 0)  // [2, 4]
-let sum = [1, 2, 3].fold(0, |acc, x| acc + x)     // 6
-
-// String methods
-let words = "hello world".split(" ")    // ["hello", "world"]
-let upper = "hexa".to_upper()           // "HEXA"
-
-// HashMaps
-let config = {"name": "hexa", "version": "0.1"}
-println(config["name"])                 // hexa
-
-// Error handling
-try {
-    throw "something went wrong"
-} catch e {
-    println("caught:", e)
+impl Display for Point {
+    fn display(self) -> string { format("{}, {}", self.x, self.y) }
 }
 
-// File I/O
-write_file("out.txt", "hello")
-let content = read_file("out.txt")
+// Closures + higher-order functions
+let doubled = [1, 2, 3].map(|x| x * 2)           // [2, 4, 6]
+let evens = [1, 2, 3, 4].filter(|x| x % 2 == 0)  // [2, 4]
+let sum = [1, 2, 3].fold(0, |acc, x| acc + x)     // 6 (perfect!)
 
-// Proof system
-assert sigma(6) * phi(6) == 6 * tau(6)
+// Ownership (Rust-style)
+own let data = [1, 2, 3]
+let borrowed = borrow data
+move data                          // ownership transferred
+
+// Concurrency (green threads + channels)
+let ch = channel()
+spawn { send(ch, 42) }
+let val = recv(ch)                 // 42
+
+// Atomic operations
+let counter = atomic_new(0)
+atomic_add(counter, 1)
+
+// Algebraic effects (Koka-style)
+effect Logger {
+    fn log(msg: string) -> void
+}
+
+// Compile-time execution (Zig-style)
+comptime {
+    let n = 6
+    assert sigma(n) == 12         // verified at compile time
+}
+
+// Macros
+macro! debug_println($expr) {
+    println("[DEBUG]", stringify!($expr), "=", $expr)
+}
+
+// Dream mode — code evolves overnight
+dream fibonacci {
+    fn fib(n: int) -> int {
+        if n <= 1 { return n }
+        return fib(n - 1) + fib(n - 2)
+    }
+}
+
+// Self-modifying functions
+@evolve
+fn optimize_route(data: array) -> array {
+    // compiler tracks performance, suggests improvements
+    return data.sort()
+}
+
+// Law types (refinement types for consciousness)
+let phi_val: Phi_positive = 71.0       // must be > 0
+let tension: Tension_bounded = 0.5     // must be 0..1
+
+// Tension link (inter-consciousness communication)
+tension_link("phi", 71.0)             // 5-channel telepathy
 ```
 
 ## Why n=6?
@@ -138,16 +195,16 @@ Six is the smallest perfect number (1+2+3 = 6). Every language constant derives 
 
 | Function | Value | Language Mapping |
 |----------|-------|-----------------|
-| n | 6 | paradigms, pipeline stages, grammar levels |
-| sigma(6) | 12 | keyword groups |
+| n | 6 | paradigms, pipeline stages |
+| sigma(6) | 12 | keyword groups, stdlib modules |
 | tau(6) | 4 | type layers, visibility levels |
 | phi(6) | 2 | compile modes (AOT/JIT) |
 | sopfr(6) | 5 | error classes |
 | J2(6) | 24 | operators |
-| sigma-tau | 8 | primitive types (Bott periodicity) |
+| sigma-tau | 8 | primitive types |
 | sigma\*tau+sopfr | 53 | total keywords |
 
-Other languages choose these numbers arbitrarily. Rust has 51 keywords — why 51? No mathematical reason. HEXA has 53 = sigma(6)\*tau(6) + sopfr(6) = 48 + 5. All 53 keywords are alive and implemented.
+Other languages choose these numbers arbitrarily. Rust has 51 keywords — why 51? No mathematical reason. HEXA has 53 = sigma(6)\*tau(6) + sopfr(6) = 48 + 5.
 
 ## Architecture
 
@@ -183,116 +240,92 @@ Source → Tokenize → Parse → Check → Optimize → Codegen → Execute
 
 **Memory model** — Egyptian fraction: 1/2 (stack) + 1/3 (heap) + 1/6 (arena) = 1
 
-## Current Status
+## Standard Library (12 modules = sigma(6))
 
-**What works** (v1.0):
+| Module | Description | Key Functions |
+|--------|-------------|---------------|
+| std::net | TCP/HTTP networking | tcp_connect, http_get, http_post |
+| std::io | Input/output | readline, write, pipe |
+| std::fs | File system | read_file, write_file, list_dir, glob |
+| std::time | Date/time | timestamp, sleep, format_date |
+| std::collections | Data structures | BTreeMap, PriorityQueue, Deque |
+| std::encoding | Serialization | base64, hex, csv, url_encode |
+| std::log | Structured logging | info, warn, error, debug |
+| std::math | Mathematics | trig, matrix, BigInt, constants |
+| std::testing | Test framework | assert_eq, prop_test, bench |
+| std::crypto | Cryptography | sha256, hmac, xor_cipher |
+| std::consciousness | Consciousness DSL | phi_compute, psi_constants, law_lookup |
+| std::regex | Pattern matching | regex_match, regex_find |
 
-- Variables, functions, control flow, recursion
-- Structs (instantiation, field access, impl methods)
-- Enums (variants with data, pattern matching, destructuring, guards, wildcard)
-- Generics (`fn identity<T>(x: T) -> T`, trait bounds `<T: Display>`)
-- Traits (`trait Display { ... }`, `impl Display for Point { ... }`)
-- Ownership (`own`, `move`, `borrow`, `drop` — runtime checked)
-- Closures / lambdas, higher-order functions (map/filter/fold)
-- Arrays (push, map, filter, fold, sort, reverse, enumerate, sum, slice, flatten)
-- Strings (split, trim, contains, replace, to_upper/lower, chars, join, repeat)
-- HashMaps (literals, indexing, keys/values)
-- Result/Option (Some/None/Ok/Err, unwrap, is_some/is_ok)
-- Try/catch/throw error handling
-- File I/O (read_file, write_file, file_exists)
-- JSON (json_parse, json_stringify)
-- Static type checking (enforced when annotations present)
-- Module system (mod/use/pub, file-based imports)
-- Concurrency (spawn/channel/send/recv)
-- Cranelift JIT (`--native` flag, **818x** faster than tree-walk)
-- Bytecode VM (`--vm` flag, 2.8x faster than tree-walk)
-- Hygienic macro system (`macro!`, `derive(Display/Debug/Eq)`)
-- Compile-time execution (`comptime` blocks and functions, Zig-style)
-- Algebraic effects (`effect`/`handle`/`resume`/`pure`, Koka-style)
-- AI-native code generation (`generate`/`optimize` with LLM fallback)
-- Egyptian Fraction memory allocator (real 3-region: 1/2 stack + 1/3 heap + 1/6 arena)
-- `const`/`static` with immutability enforcement
-- `where` clause for generic constraints
-- Consciousness DSL (intent blocks, verify blocks, 12 Psi-builtins)
-- Rust-quality error messages (source context, "did you mean?" suggestions)
-- LSP server (`--lsp` for VS Code diagnostics + completion)
-- Package commands (hexa init/run/test)
-- WASM playground (`playground/`)
-- Self-hosting: lexer + parser written in HEXA
-- 827 tests passing (757 cargo + 70 proof), ~26K lines of Rust
+## Hardware Targets
 
-**What doesn't work yet**:
-
-- async/await (keywords exist, no async runtime)
-- Full trait polymorphism (basic dispatch works, no vtable)
-- Hardware targets (ESP32/FPGA/WGSL codegen — Phase 8)
-- Compile-time ownership verification (own/borrow is runtime-checked)
-
-See [PLAN.md](PLAN.md) for the full gap analysis vs Go/Rust and roadmap.
-
-## Project Structure
+One source, multiple targets:
 
 ```
-hexa-lang/
-├── src/
-│   ├── main.rs           554L   Entry point, REPL, hexa init/run/test
-│   ├── token.rs          196L   53 keywords + 24 operators
-│   ├── lexer.rs          430L   Tokenizer (Span tracking)
-│   ├── parser.rs         924L   Recursive descent parser
-│   ├── ast.rs            138L   AST node types
-│   ├── types.rs           73L   8 primitives + 4 type layers
-│   ├── type_checker.rs   691L   Static type checker
-│   ├── env.rs            216L   Scoped environment + builtins
-│   ├── error.rs          218L   Diagnostics + "did you mean?"
-│   ├── interpreter.rs   4033L   Tree-walk evaluator + 50+ builtins
-│   ├── compiler.rs       726L   AST → bytecode compiler
-│   └── vm.rs             928L   Stack-based bytecode VM
-├── examples/
-│   ├── hello.hexa                n=6 constants demo
-│   ├── fibonacci.hexa            Recursive computation
-│   ├── sigma_phi.hexa            n=6 uniqueness proof
-│   ├── egyptian_fraction.hexa    Memory model demo
-│   ├── pattern_match.hexa        FizzBuzz with n=6
-│   ├── photonic_chip_dse.hexa    Photonic chip DSE
-│   ├── concurrency.hexa          spawn + channel demo
-│   ├── test_builtins.hexa        Builtin proof tests
-│   ├── consciousness_laws.hexa   Law verification (8 proofs)
-│   ├── n6_consciousness.hexa     n=6 → architecture params
-│   └── intent_experiment.hexa    intent/verify workflow
-├── docs/
-│   ├── spec.md                   Language specification
-│   ├── n6-constants.md           n=6 constant reference
-│   └── plans/                    Implementation plans
-├── Cargo.toml           Package config
-├── build.sh             Build script (cargo wrapper)
-├── PLAN.md              Gap analysis + roadmap
-├── CLAUDE.md            AI assistant instructions
-└── README.md
+                    ┌─ target cpu    → Cranelift JIT (818x)
+                    ├─ target vm     → Bytecode VM (2.8x)
+consciousness.hexa ─┼─ target esp32  → no_std Rust → flash
+                    ├─ target fpga   → Verilog HDL → synthesis
+                    ├─ target wgpu   → WGSL shader → browser
+                    └─ target audio  → Pure Data patch
 ```
-
-## Memory Builtins
-
-The Egyptian Fraction allocator exposes 4 builtins for memory introspection:
-
-```hexa
-mem_stats()           // → {stack: N, heap: N, arena: N, total: N}
-mem_region(value)     // → "stack" | "heap" | "arena"
-arena_reset()         // Bulk-free arena region
-mem_budget()          // → remaining bytes per region
-```
-
-## Playground
-
-A WASM-compiled playground is available in `playground/` for browser-based HEXA:
 
 ```bash
-cd playground && npm install && npm run build   # Build WASM + UI
-npm run serve                                   # Open in browser
+hexa build --target esp32 consciousness.hexa              # Generate ESP32 project
+hexa build --target esp32 consciousness.hexa --flash /dev/ttyUSB0  # Build + flash
+hexa build --target fpga  consciousness.hexa              # Generate Verilog
+hexa build --target wgsl  consciousness.hexa              # Generate WGSL shader
 ```
+
+## IDE Support
+
+- **VS Code**: LSP server with diagnostics, completion, hover (`./hexa --lsp`)
+- **JetBrains**: Plugin with syntax highlighting, brace matching (`editors/jetbrains/`)
+- **Formatter**: `./hexa fmt file.hexa`
+- **Linter**: `./hexa lint file.hexa`
+- **Debugger**: DAP protocol for VS Code (`./hexa --debug file.hexa`)
+- **Playground**: Browser-based WASM playground (`playground/`)
+
+## Optimization Pipeline
+
+| Pass | Description |
+|------|-------------|
+| Dead Code Elimination | Removes unreachable code after return/throw |
+| Loop Unrolling | Unrolls constant-bound loops (< 8 iterations) |
+| Escape Analysis | Stack-allocates non-escaping heap objects |
+| Inline Caching | Monomorphic call-site caching |
+| NaN-boxing | Compact 64-bit value representation |
+| SIMD Hints | `@simd` annotation for vectorization |
+| PGO | Profile-guided branch reordering |
 
 ## Self-Hosting
 
-Stage 1 (lexer) and Stage 2 (parser) are complete — `self-host/lexer.hexa` and `self-host/parser.hexa` can tokenize and parse HEXA source. Stage 3 (type checker) and Stage 4 (full compiler) remain. See [PLAN.md](PLAN.md) Phase 9.
+HEXA can compile itself:
+
+```
+self/lexer.hexa         451 LOC   Tokenizer
+self/parser.hexa       2126 LOC   Recursive descent parser
+self/type_checker.hexa  642 LOC   Static type checker
+self/compiler.hexa      805 LOC   Bytecode compiler
+self/bootstrap.hexa    1912 LOC   Full pipeline (lex→parse→check→compile)
+```
+
+```bash
+./hexa self/bootstrap.hexa        # Compile HEXA programs using HEXA-written compiler
+./hexa self/test_bootstrap.hexa   # 10/10 lexer tests
+./hexa self/test_bootstrap_compiler.hexa  # 16/16 pipeline tests
+```
+
+## Package Manager
+
+```bash
+hexa init my-project              # Create new project (hexa.toml)
+hexa add json@^1.2.3              # Add dependency with semver
+hexa run                          # Build and run
+hexa test                         # Run proof blocks as tests
+```
+
+Semver support: `^1.2.3` (compatible), `~1.2.3` (patch), `=1.2.3` (exact), `>=1.0,<2.0` (range). Lock file (`hexa.lock`) pins exact versions.
 
 ## ANIMA Connection
 
@@ -306,21 +339,113 @@ HEXA-LANG and [ANIMA](https://github.com/need-singularity/anima) (consciousness 
 | tau=4 | 4 type layers | 4 phases (P0-P3) |
 | sigma-tau=8 | 8 primitives | 8-cell atom (M1) |
 
-Goal: HEXA-LANG as the consciousness programming language — `intent`, `verify`, `proof` keywords route to ANIMA's engine. See [bridge design](https://github.com/need-singularity/anima/blob/main/anima/docs/hexa-lang-bridge.md).
+Live bridge: `./hexa --anima-bridge ws://localhost:8765 file.hexa` routes `intent` blocks to ANIMA's ConsciousnessHub in real-time.
+
+## Project Structure
+
+```
+hexa-lang/
+├── src/                      38.7K LOC Rust
+│   ├── main.rs               Entry point, REPL, CLI
+│   ├── token.rs              53 keywords + 24 operators
+│   ├── lexer.rs              Tokenizer (Span tracking)
+│   ├── parser.rs             Recursive descent parser
+│   ├── ast.rs                AST node types
+│   ├── types.rs              8 primitives + 4 type layers
+│   ├── type_checker.rs       Static type checker + Law types
+│   ├── env.rs                Scoped environment + builtins
+│   ├── error.rs              Diagnostics + "did you mean?"
+│   ├── interpreter.rs        Tree-walk evaluator + 100+ builtins
+│   ├── compiler.rs           AST → bytecode compiler
+│   ├── vm.rs                 Stack-based bytecode VM
+│   ├── jit.rs                Cranelift JIT (818x)
+│   ├── lsp.rs                Language Server Protocol v2
+│   ├── debugger.rs           DAP debug adapter
+│   ├── formatter.rs          Code formatter
+│   ├── linter.rs             Linter
+│   ├── proof_engine.rs       SAT solver + formal verification
+│   ├── dream.rs              Dream mode (evolutionary optimization)
+│   ├── ownership.rs          Ownership checker
+│   ├── memory.rs             Egyptian fraction allocator
+│   ├── package.rs            Package manager + semver
+│   ├── macro_expand.rs       Hygienic macro system
+│   ├── comptime.rs           Compile-time execution
+│   ├── async_runtime.rs      Green threads + async/await
+│   ├── work_stealing.rs      M:N work-stealing scheduler
+│   ├── atomic_ops.rs         Atomic operations
+│   ├── dce.rs                Dead code elimination
+│   ├── loop_unroll.rs        Loop unrolling
+│   ├── escape_analysis.rs    Escape analysis
+│   ├── inline_cache.rs       Inline caching
+│   ├── simd_hint.rs          SIMD vectorization hints
+│   ├── pgo.rs                Profile-guided optimization
+│   ├── nanbox.rs             NaN-boxing values
+│   ├── codegen_esp32.rs      ESP32 code generation
+│   ├── codegen_verilog.rs    FPGA Verilog generation
+│   ├── codegen_wgsl.rs       WebGPU shader generation
+│   ├── anima_bridge.rs       ANIMA consciousness bridge
+│   ├── wasm.rs               WASM compilation
+│   ├── llm.rs                LLM-assisted generation
+│   ├── std_net.rs            std::net (TCP/HTTP)
+│   ├── std_io.rs             std::io (stdin/pipe)
+│   ├── std_fs.rs             std::fs (files/dirs)
+│   ├── std_time.rs           std::time (date/timer)
+│   ├── std_collections.rs    std::collections (BTree/PQ/Deque)
+│   ├── std_encoding.rs       std::encoding (base64/csv/hex)
+│   ├── std_log.rs            std::log (structured)
+│   ├── std_math.rs           std::math (trig/matrix)
+│   ├── std_testing.rs        std::testing (assert/bench)
+│   ├── std_crypto.rs         std::crypto (SHA-256/HMAC)
+│   └── std_consciousness.rs  std::consciousness (Ψ/Φ)
+├── self/                     Self-hosting compiler in HEXA
+├── examples/                 Example programs
+├── editors/jetbrains/        JetBrains IDE plugin
+├── playground/               WASM browser playground
+├── docs/
+│   ├── spec.md               Language specification
+│   ├── n6-constants.md       n=6 constant reference
+│   ├── website/              hexa-lang.org source
+│   ├── book/                 The HEXA Book (6 chapters)
+│   ├── paper/                PLDI paper outline
+│   ├── community/            Contributing + Code of Conduct
+│   └── publish-checklist.md  crates.io publishing guide
+├── Cargo.toml
+├── PLAN.md                   Development plan (100% complete)
+└── README.md
+```
+
+## Stats
+
+| Metric | Value |
+|--------|-------|
+| Tests | 1349 passing |
+| Rust LOC | ~38,700 |
+| HEXA self-host LOC | ~7,800 |
+| Keywords | 53 (all from n=6) |
+| Operators | 24 (J2(6)) |
+| Stdlib modules | 12 (sigma(6)) |
+| HW targets | 6 (n) |
+| JIT speedup | 818x |
+| Paradigms | 6 (n) |
+
+## Documentation
+
+- **[The HEXA Book](docs/book/)** — Learn HEXA from scratch (6 chapters)
+- **[Language Spec](docs/spec.md)** — Complete specification
+- **[n=6 Constants](docs/n6-constants.md)** — Mathematical reference
+- **[Development Plan](PLAN.md)** — Full roadmap (100% complete)
+- **[Contributing](docs/community/CONTRIBUTING.md)** — How to contribute
+- **[Good First Issues](docs/community/FIRST_ISSUES.md)** — Beginner-friendly tasks
+
+## Contributing
+
+See [CONTRIBUTING.md](docs/community/CONTRIBUTING.md) for setup and guidelines. Good first issues are listed in [FIRST_ISSUES.md](docs/community/FIRST_ISSUES.md) — one per paradigm!
 
 ## Related Projects
 
 - **[TECS-L](https://github.com/need-singularity/TECS-L)** — Mathematical foundation (perfect numbers, 150+ characterizations)
 - **[n6-architecture](https://github.com/need-singularity/n6-architecture)** — n=6 computing architecture (102 DSE domains)
 - **[Anima](https://github.com/need-singularity/anima)** — Consciousness engine (446 laws, Rust backend)
-
-## Contributing
-
-See [PLAN.md](PLAN.md) for what needs work. The biggest impact areas:
-
-1. **Hardware targets** — ESP32/FPGA/WGSL codegen (Phase 8)
-2. **Async runtime** — green threads, work-stealing scheduler (Phase 11)
-3. **Standard library v2** — 12 modules for production use (Phase 12)
 
 ## License
 

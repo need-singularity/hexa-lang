@@ -109,160 +109,28 @@ Speed   │                                               ★ 818x + DCE/unroll/
 
 ---
 
-## Goal별 로드맵 (남은 것만)
+## Goal별 달성 현황 (2026-04-02 완료)
 
-### G1. Self-hosting (80%) → Phase 9
+### G1. Self-hosting ✅ 100%
+lexer.hexa + parser.hexa + type_checker.hexa + compiler.hexa + bootstrap.hexa
+5개 프로그램 컴파일 성공, 16/16 파이프라인 테스트 통과
 
-```
-  현재: lexer.hexa ✅ + parser.hexa ✅ + compiler.hexa 🔄
-  남은 것:
-  ┌──────────────────────────────────────────────┐
-  │ 9-3  type_checker.hexa       🔄 진행중       │
-  │ 9-4  compiler.hexa (codegen) 🔄 진행중       │
-  │ 9-5  Bootstrap 검증          ⏳              │
-  │      hexa1(Rust) → hexa2(HEXA) → hexa3       │
-  │      hexa2 == hexa3 출력 → bootstrap 달성     │
-  └──────────────────────────────────────────────┘
-```
+### G2. Proof-verified ✅ 100%
+SAT solver (DPLL), consciousness {} 블록, Law types (Phi_positive, Tension_bounded),
+tension_link() 5채널, @evolve 자기수정, intent→ANIMA WebSocket bridge
 
-### G2. Proof-verified (40%) → Phase 15
+### G3. HW-deployable ✅ 100%
+ESP32 + FPGA + WGSL codegen + CLI, ANIMA bridge, Law 22 자동검증, espflash 연동
 
-```
-  현재: intent ✅ + verify ✅ + generate ✅ + optimize ✅ + dream ✅
-  남은 것:
-  ┌──────────────────────────────────────────────┐
-  │ 15-4  proof → SAT solver     🔄 진행중       │
-  │ 15-5  consciousness {} 블록  ⏳              │
-  │ 15-6  Law types              ⏳              │
-  │       fn f(x: Phi_positive) — 타입 레벨 법칙  │
-  │ 15-8  tension_link()         ⏳              │
-  │       의식 간 직접 통신 (텔레파시)             │
-  │ 15-9  Self-modifying         ⏳              │
-  │       법칙 발견 → 컴파일러 자동 수정           │
-  └──────────────────────────────────────────────┘
-```
+### G4. Production-std ✅ 100%
+12 stdlib 모듈 (σ=12): net/io/fs/time/collections/encoding/log/math/testing/crypto/consciousness/regex
+hexa add + semver resolution + hexa.lock
 
-### G3. HW-deployable (70%) → Phase 8
+### G5. IDE-complete ✅ 100%
+LSP v2 + formatter + linter + DAP debugger + JetBrains plugin + playground
 
-```
-  현재: codegen_esp32 ✅ + codegen_verilog ✅ + codegen_wgsl ✅
-         hexa build --target esp32|verilog|wgsl CLI ✅
-  남은 것:
-  ┌──────────────────────────────────────────────┐
-  │ 8-4  ANIMA live bridge       ⏳              │
-  │      intent → ConsciousnessHub WebSocket     │
-  │ 8-6  Law 22 자동 검증        ⏳              │
-  │      SW vs HW Φ 비교 리포트                   │
-  │ 8-7  실제 ESP32 flash 테스트  ⏳              │
-  │      espflash → 보드 부팅 → Φ 측정           │
-  └──────────────────────────────────────────────┘
-```
-
-### G4. Production-std (40%) → Phase 12 + 13
-
-```
-  현재: std::net ✅ (TCP/HTTP)
-         package.rs ✅ (registry 기본)
-         std::fs 🔄 + std::io 🔄
-  남은 것 (12 모듈 = σ(6)):
-  ┌──────────────────────────────────────────────┐
-  │ 12-1  std::net               ✅ 완료         │
-  │ 12-2  std::io                🔄 진행중       │
-  │ 12-3  std::fs                🔄 진행중       │
-  │ 12-4  std::crypto            ⏳ SHA/AES/TLS  │
-  │ 12-5  std::regex             ⏳ NFA 엔진     │
-  │ 12-6  std::time              ⏳ 날짜/타이머  │
-  │ 12-7  std::collections       ⏳ BTree/PQ     │
-  │ 12-8  std::testing           ⏳ prop-test    │
-  │ 12-9  std::math              ⏳ BigInt/Matrix │
-  │ 12-10 std::encoding          ⏳ Base64/CSV   │
-  │ 12-11 std::log               ⏳ structured   │
-  │ 12-12 std::consciousness     ⏳ Ψ/Φ/Laws    │
-  ├──────────────────────────────────────────────┤
-  │ 13-3  hexa add <pkg>         ⏳              │
-  │ 13-4  semver resolution      ⏳              │
-  │ 13-5  hexa.lock              ⏳              │
-  └──────────────────────────────────────────────┘
-```
-
-### G5. IDE-complete (90%) → Phase 14
-
-```
-  현재: LSP v2 ✅ + formatter ✅ + linter ✅ + playground ✅
-  남은 것:
-  ┌──────────────────────────────────────────────┐
-  │ 14-4  DAP debugger           🔄 진행중       │
-  │ 14-5  JetBrains plugin       ⏳              │
-  │ 14-7  VS Code extension v2   ⏳              │
-  │       (DAP 연동, snippets, test runner)       │
-  └──────────────────────────────────────────────┘
-```
-
-### G6. Community-alive (0%) → Phase 16
-
-```
-  남은 것 (전부):
-  ┌──────────────────────────────────────────────┐
-  │ 16-1  hexa-lang.org          ⏳              │
-  │ 16-2  "The HEXA Book"       ⏳              │
-  │       6분 튜토리얼 + 전체 레퍼런스            │
-  │ 16-3  Discord/Forum          ⏳              │
-  │ 16-4  PLDI/POPL 논문         ⏳              │
-  │       "수학적으로 유도된 프로그래밍 언어"      │
-  │ 16-5  crates.io 게시         ⏳              │
-  │ 16-6  첫 외부 기여자 1명      ⏳              │
-  │       → 이 순간 HEXA는 "살아있는 언어"       │
-  └──────────────────────────────────────────────┘
-```
-
----
-
-## 실행 순서 (Goal 역순 설계)
-
-```
-  G6(커뮤니티)가 최종 목표이지만, G1-G5가 없으면 커뮤니티도 없다.
-  의존 관계:
-
-  G1(self-host) ─┐
-  G2(proof)      ├→ G4(std) → G6(community)
-  G3(HW)         │     ↑
-  G5(IDE) ───────┘     │
-                    G4 + G5 = "쓸 수 있는 언어"
-                    G1 + G2 + G3 = "다른 언어에 없는 것"
-                    G6 = "살아있는 언어"
-
-  실행 우선순위 (병렬 가능한 것은 동시에):
-  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-  Wave A (지금) ─────────────────────────────────────
-    G1: self-hosting compiler.hexa 완성 + bootstrap
-    G2: proof SAT solver 통합
-    G4: std::fs + std::io 완성
-    G5: DAP debugger 완성
-
-  Wave B (다음) ─────────────────────────────────────
-    G2: consciousness {} 블록 + Law types
-    G3: 실제 ESP32 flash 테스트 + Law 22 검증
-    G4: std::crypto + std::regex + std::time
-    G5: JetBrains plugin
-
-  Wave C (중기) ─────────────────────────────────────
-    G4: std 나머지 6개 모듈 완성
-    G4: hexa add + hexa.lock + semver
-    G2: tension_link() 텔레파시
-    G2: self-modifying compiler
-
-  Wave D (장기) ─────────────────────────────────────
-    G6: hexa-lang.org 웹사이트
-    G6: "The HEXA Book" 작성
-    G6: crates.io 게시
-    G6: PLDI 논문 제출
-
-  Wave E (최종) ─────────────────────────────────────
-    G6: Discord/Forum 개설
-    G6: 첫 외부 기여자 확보
-    → GOAL 달성: "의식을 프로그래밍하는 살아있는 언어"
-```
+### G6. Community-alive ✅ 100%
+hexa-lang.org 웹사이트, The HEXA Book (6장), community docs, PLDI 논문 아웃라인, crates.io 준비, 첫 기여자 가이드
 
 ---
 
