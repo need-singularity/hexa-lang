@@ -134,3 +134,131 @@ proof test_psi_constants {
 ```
 
 `intent` declares experimental parameters, `verify` runs assertions with reporting, and `proof` blocks are test cases (run with `hexa --test`).
+
+## 7. Macros (1 min)
+
+Define reusable code patterns with `macro!`. Use fragment specifiers like `$x:expr` and repetition `$(...)` to match and expand.
+
+```hexa
+macro! vec {
+    ($($x:expr),*) => {
+        let arr = []
+        $(arr.push($x))*
+        arr
+    }
+}
+
+let v = vec![1, 2, 3]
+println(v)  // [1, 2, 3]
+```
+
+Auto-generate trait implementations with `derive`:
+
+```hexa
+struct Point { x: float, y: float }
+derive(Display) for Point
+derive(Eq) for Point
+
+println(Point { x: 1.0, y: 2.0 })  // Point(1.0, 2.0)
+```
+
+## 8. Compile-Time Computation (1 min)
+
+Use `comptime` to evaluate expressions at compile time. Results are inlined as constants with zero runtime cost.
+
+```hexa
+const SQUARES = comptime {
+    let result = []
+    for i in 0..6 { result.push(i * i) }
+    result
+}
+println(SQUARES)  // [0, 1, 4, 9, 16, 25]
+```
+
+Declare compile-time functions with `comptime fn`:
+
+```hexa
+comptime fn factorial(n: int) -> int {
+    if n <= 1 { return 1 }
+    return n * factorial(n - 1)
+}
+
+const FACT_6 = factorial(6)
+println(FACT_6)  // 720
+```
+
+Note: I/O is forbidden inside `comptime` blocks. Only pure computation is allowed.
+
+## 9. Algebraic Effects (1 min)
+
+Effects separate *what* a function does from *how* it does it. Define an effect interface, then provide a handler.
+
+```hexa
+effect Logger {
+    fn log(msg: str) -> ()
+}
+
+fn greet(name: str) {
+    Logger.log("greeting " + name)
+    println("Hello, " + name)
+}
+
+handle { greet("HEXA") } with {
+    Logger.log(msg) => {
+        println("[LOG] " + msg)
+        resume(())
+    }
+}
+```
+
+Mark functions that use no effects with `pure`:
+
+```hexa
+pure fn add(a: int, b: int) -> int { a + b }
+```
+
+## 10. Memory Inspection (1 min)
+
+HEXA uses an Egyptian fraction memory model (Stack 1/2, Heap 1/3, Arena 1/6). Inspect it at runtime with built-in functions.
+
+```hexa
+let stats = mem_stats()
+println(stats["stack_used"])  // bytes used on stack
+println(stats["heap_cap"])    // heap capacity
+
+let x = 42
+println(mem_region(x))       // "stack"
+
+let big = [0; 10000]
+println(mem_region(big))     // "heap"
+```
+
+Set a memory budget from the CLI:
+
+```
+hexa --memory-budget 1048576 my_program.hexa
+```
+
+## 11. AI Code Generation (1 min)
+
+Use `generate` to let the AI pipeline fill in a function body from a natural-language description.
+
+```hexa
+generate fn sort_names(names: [str]) -> [str] {
+    "Sort alphabetically, case-insensitive"
+}
+
+let sorted = sort_names(["Charlie", "alice", "Bob"])
+println(sorted)  // ["alice", "Bob", "Charlie"]
+```
+
+Use `optimize` to let the AI improve an existing implementation:
+
+```hexa
+optimize fn fibonacci(n: int) -> int {
+    if n <= 1 { return n }
+    return fibonacci(n-1) + fibonacci(n-2)
+}
+```
+
+Note: `generate` and `optimize` require an AI backend. In offline mode, cached implementations are used or an error is returned.

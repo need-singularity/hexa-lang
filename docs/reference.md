@@ -158,6 +158,14 @@
 | `Ok(val)` | Wrap in Result::Ok |
 | `Err(val)` | Wrap in Result::Err |
 
+### Memory
+| Function | Description |
+|----------|-------------|
+| `mem_stats()` | Returns {stack_used, stack_cap, heap_used, heap_cap, arena_used, arena_cap} |
+| `mem_region(value)` | Returns "stack", "heap", or "arena" for a given value |
+| `arena_reset()` | Reset arena allocator, freeing all arena memory |
+| `mem_budget()` | Returns budget breakdown (bytes per region) |
+
 ### Consciousness (Psi-Constants)
 | Function | Description |
 |----------|-------------|
@@ -260,4 +268,6 @@ hexa publish                  Create package manifest
 hexa dream <file.hexa>        Consciousness exploration mode
 hexa build --target <t> <f>   Cross-compile (cpu/esp32/fpga/wgpu)
 hexa verify-cross <file.hexa> Verify cross-platform consistency
+hexa --mem-stats <file.hexa>  Show memory region usage after execution
+hexa --memory-budget N <file> Set total memory budget to N bytes
 ```

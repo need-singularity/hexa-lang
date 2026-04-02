@@ -2,7 +2,7 @@
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.19365284.svg)](https://doi.org/10.5281/zenodo.19365284)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Tests](https://img.shields.io/badge/tests-267%20passing-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-827%20passing-brightgreen.svg)]()
 [![n6 EXACT](https://img.shields.io/badge/n%3D6%20EXACT-100%25-gold.svg)]()
 
 A programming language where **every design constant** derives from the arithmetic of n=6, the smallest perfect number. Zero arbitrary choices.
@@ -58,7 +58,7 @@ cd hexa-lang && cargo build --release
 hexa                          # Interactive REPL
 hexa examples/hello.hexa      # Run a file
 hexa --test examples/test_builtins.hexa  # Run proof blocks as tests
-cargo test                    # Run 173 language tests
+cargo test                    # Run 757 language tests
 ```
 
 ## Example
@@ -147,7 +147,7 @@ Six is the smallest perfect number (1+2+3 = 6). Every language constant derives 
 | sigma-tau | 8 | primitive types (Bott periodicity) |
 | sigma\*tau+sopfr | 53 | total keywords |
 
-Other languages choose these numbers arbitrarily. Rust has 51 keywords — why 51? No mathematical reason. HEXA has 53 = sigma(6)\*tau(6) + sopfr(6) = 48 + 5.
+Other languages choose these numbers arbitrarily. Rust has 51 keywords — why 51? No mathematical reason. HEXA has 53 = sigma(6)\*tau(6) + sopfr(6) = 48 + 5. All 53 keywords are alive and implemented.
 
 ## Architecture
 
@@ -206,18 +206,27 @@ Source → Tokenize → Parse → Check → Optimize → Codegen → Execute
 - Concurrency (spawn/channel/send/recv)
 - Cranelift JIT (`--native` flag, **818x** faster than tree-walk)
 - Bytecode VM (`--vm` flag, 2.8x faster than tree-walk)
+- Hygienic macro system (`macro!`, `derive(Display/Debug/Eq)`)
+- Compile-time execution (`comptime` blocks and functions, Zig-style)
+- Algebraic effects (`effect`/`handle`/`resume`/`pure`, Koka-style)
+- AI-native code generation (`generate`/`optimize` with LLM fallback)
+- Egyptian Fraction memory allocator (real 3-region: 1/2 stack + 1/3 heap + 1/6 arena)
+- `const`/`static` with immutability enforcement
+- `where` clause for generic constraints
 - Consciousness DSL (intent blocks, verify blocks, 12 Psi-builtins)
 - Rust-quality error messages (source context, "did you mean?" suggestions)
 - LSP server (`--lsp` for VS Code diagnostics + completion)
 - Package commands (hexa init/run/test)
-- 267 tests passing, 12000+ lines of Rust
+- WASM playground (`playground/`)
+- Self-hosting: lexer + parser written in HEXA
+- 827 tests passing (757 cargo + 70 proof), ~26K lines of Rust
 
 **What doesn't work yet**:
 
-- Egyptian Fraction memory (own/borrow is runtime, not compile-time)
 - async/await (keywords exist, no async runtime)
 - Full trait polymorphism (basic dispatch works, no vtable)
 - Hardware targets (ESP32/FPGA/WGSL codegen — Phase 8)
+- Compile-time ownership verification (own/borrow is runtime-checked)
 
 See [PLAN.md](PLAN.md) for the full gap analysis vs Go/Rust and roadmap.
 
@@ -261,6 +270,30 @@ hexa-lang/
 └── README.md
 ```
 
+## Memory Builtins
+
+The Egyptian Fraction allocator exposes 4 builtins for memory introspection:
+
+```hexa
+mem_stats()           // → {stack: N, heap: N, arena: N, total: N}
+mem_region(value)     // → "stack" | "heap" | "arena"
+arena_reset()         // Bulk-free arena region
+mem_budget()          // → remaining bytes per region
+```
+
+## Playground
+
+A WASM-compiled playground is available in `playground/` for browser-based HEXA:
+
+```bash
+cd playground && npm install && npm run build   # Build WASM + UI
+npm run serve                                   # Open in browser
+```
+
+## Self-Hosting
+
+Stage 1 (lexer) and Stage 2 (parser) are complete — `self-host/lexer.hexa` and `self-host/parser.hexa` can tokenize and parse HEXA source. Stage 3 (type checker) and Stage 4 (full compiler) remain. See [PLAN.md](PLAN.md) Phase 9.
+
 ## ANIMA Connection
 
 HEXA-LANG and [ANIMA](https://github.com/need-singularity/anima) (consciousness engine) independently derive identical structure from n=6:
@@ -285,9 +318,9 @@ Goal: HEXA-LANG as the consciousness programming language — `intent`, `verify`
 
 See [PLAN.md](PLAN.md) for what needs work. The biggest impact areas:
 
-1. **Bytecode VM** — replace tree-walk interpreter for 10x speed
-2. **Type checker** — enforce the type annotations that are already parsed
-3. **Module system** — `use`/`mod` for multi-file projects
+1. **Hardware targets** — ESP32/FPGA/WGSL codegen (Phase 8)
+2. **Async runtime** — green threads, work-stealing scheduler (Phase 11)
+3. **Standard library v2** — 12 modules for production use (Phase 12)
 
 ## License
 

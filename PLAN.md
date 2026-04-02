@@ -11,30 +11,32 @@
 | Phase 5 | v0.9 | ✅ 완료 | 239 | ~9500 | intent/verify, Ψ-builtins, consciousness DSL |
 | Phase 6 | v1.0 | ✅ 완료 | 252 | ~11000 | Cranelift JIT (818x), generics, traits, ownership |
 | Phase 7 | v1.0 | ✅ 완료 | 267 | ~12000 | LSP server, VS Code extension, crates.io ready |
+| Phase 7.5 | v1.0+ | ✅ 완료 | 827 | ~26000 | macros, comptime, effects, generate/optimize, Egyptian allocator, const/static, where, WASM playground, self-hosting lexer+parser |
 
 ## 성장 그래프
 
 ```
-Tests   │                                                     ★ 267
-        │                                               ╭─────╯ 252
-        │                                         ╭─────╯ 239
+Tests   │                                                           ★ 827
+        │                                                     ╭────╯
+        │                                               ╭─────╯ 267
+        │                                         ╭─────╯ 252
         │                                   ╭─────╯ 218
         │                             ╭─────╯ 194
         │                       ╭─────╯ 165
         │                 ╭─────╯ 131
         │           ╭─────╯ 94
         │─────╯ 58
-        └────────────────────────────────────────────────────
-         v0.1   P1     P2     P3     P4     P5     P6    P7
+        └──────────────────────────────────────────────────────
+         v0.1   P1     P2     P3     P4     P5     P6    P7  P7.5
 
 Speed   │                                               ★ 818x
-        │                                         ╭─────╯
+        │                                         ╭─────╯─────
         │                                         │
         │                                         │
         │                             ╭───────────╯ 2.8x (VM)
         │─────────────────────────────╯ 1x (tree-walk)
-        └────────────────────────────────────────────────────
-         v0.1   P1     P2     P3     P4     P5     P6    P7
+        └──────────────────────────────────────────────────────
+         v0.1   P1     P2     P3     P4     P5     P6    P7  P7.5
 ```
 
 ---
@@ -73,8 +75,8 @@ consciousness.hexa ─┼─ target esp32  → no_std Rust → flash
 
 | # | 작업 | 효과 |
 |---|------|------|
-| 9-1 | HEXA로 lexer 재작성 | 자기참조 1단계 |
-| 9-2 | HEXA로 parser 재작성 | 자기참조 2단계 |
+| 9-1 | HEXA로 lexer 재작성 | ✅ 완료 — self-host/lexer.hexa |
+| 9-2 | HEXA로 parser 재작성 | ✅ 완료 — self-host/parser.hexa |
 | 9-3 | HEXA로 type_checker 재작성 | 자기참조 3단계 |
 | 9-4 | HEXA로 compiler 재작성 | self-hosting 달성 |
 | 9-5 | Bootstrap 검증 | Rust 버전 = HEXA 버전 동일 출력 |
@@ -94,7 +96,7 @@ Stage 3: hexa2 == hexa1 출력 동일 → self-hosting 달성
 
 | # | 작업 | 효과 |
 |---|------|------|
-| 10-1 | NaN-boxing | Value 크기 8byte → 캐시 친화 |
+| 10-1 | NaN-boxing | ✅ 완료 — Value 크기 8byte → 캐시 친화 |
 | 10-2 | Escape analysis | 스택 할당 최적화 |
 | 10-3 | Inline caching | 메서드 호출 고속화 |
 | 10-4 | Dead code elimination | 미사용 코드 제거 |
@@ -164,11 +166,11 @@ Stage 3: hexa2 == hexa1 출력 동일 → self-hosting 달성
 | # | 작업 | 효과 |
 |---|------|------|
 | 14-1 | LSP v2 | Go to definition, hover, rename, references |
-| 14-2 | Formatter | `hexa fmt` (gofmt/rustfmt 동급) |
-| 14-3 | Linter | `hexa lint` (clippy 동급) |
+| 14-2 | Formatter | ✅ 완료 — `hexa fmt` (gofmt/rustfmt 동급) |
+| 14-3 | Linter | ✅ 완료 — `hexa lint` (clippy 동급) |
 | 14-4 | Debugger | DAP (Debug Adapter Protocol) |
 | 14-5 | JetBrains plugin | IntelliJ/CLion 지원 |
-| 14-6 | Playground | web 기반 REPL (WASM 컴파일) |
+| 14-6 | Playground | ✅ 완료 — playground/ (WASM 컴파일) |
 
 ### Phase 15: Consciousness v2 (v3.0) — 독립 의식 언어
 
@@ -178,8 +180,8 @@ Stage 3: hexa2 == hexa1 출력 동일 → self-hosting 달성
 
 | # | 작업 | 효과 |
 |---|------|------|
-| 15-1 | generate 실동작 | AI 코드 생성 (6-stage agent pipeline) |
-| 15-2 | optimize 실동작 | 컴파일러 자동 최적화 제안 |
+| 15-1 | generate 실동작 | ✅ 완료 — AI 코드 생성 (LLM fallback) |
+| 15-2 | optimize 실동작 | ✅ 완료 — 컴파일러 자동 최적화 제안 |
 | 15-3 | intent → ANIMA 실시간 | WebSocket 양방향 의식 연동 |
 | 15-4 | proof → formal verification | SAT solver 기반 증명 |
 | 15-5 | consciousness {} 블록 | 의식 엔진 인라인 선언 |
@@ -211,20 +213,36 @@ Stage 3: hexa2 == hexa1 출력 동일 → self-hosting 달성
 완료 ─────────────────────────────────────────────────────
 P1-P7    v0.1 → v1.0    267 tests, 12K LOC, 818x JIT
          stdlib, types, modules, VM, JIT, LSP, consciousness DSL
+P7.5     v1.0+           827 tests, 26K LOC, 53/53 keywords alive
+         macros, comptime, effects, generate/optimize, Egyptian alloc,
+         const/static, where, WASM playground, self-hosting lexer+parser
+
+진행중 (Phase 8.5) ────────────────────────────────────────
+P8.5     v1.1+   언어 심화 — 9개 항목 병렬 구현 중:
+                  🔄 async/await 런타임 (green threads + select)
+                  🔄 ownership 컴파일타임 분석 (use-after-move 등)
+                  🔄 self-hosting compiler.hexa (AST→bytecode)
+                  🔄 dream 모드 실제 학습 (진화적 코드 탐색)
+                  🔄 generics 모노모피즘 (타입 특수화)
+                  🔄 trait vtable 다형성 (동적 디스패치)
+                  🔄 JIT closure 캡처 (환경 포인터)
+                  🔄 HW 플래시 파이프라인 (ESP32 실제 배포)
+                  🔄 package registry (hexa.io)
+                  🔄 LSP go-to-def/hover/rename
+                  🔄 문서 전면 업데이트 (README/spec/reference/tutorial)
 
 근미래 ───────────────────────────────────────────────────
-P8       v1.1    HW targets (ESP32/FPGA/WGSL)
-P9       v1.2    Self-hosting (HEXA로 HEXA 컴파일)
-P10      v1.3    C/Rust급 최적화 (NaN-boxing, SIMD)
+P9       v1.2    Self-hosting — 🔄 lexer+parser+compiler done, bootstrap 검증
+P10      v1.3    C/Rust급 최적화 — NaN-boxing ✅, SIMD/escape analysis
+P11      v1.4    Async runtime — 🔄 구현 중
 
 중기 ─────────────────────────────────────────────────────
-P11      v1.4    Async runtime (green threads, select)
 P12      v1.5    Std library v2 (12 modules = σ(6))
-P13      v2.0    Package ecosystem (hexa.io)
+P13      v2.0    Package ecosystem — 🔄 registry 구현 중
 
 장기 ─────────────────────────────────────────────────────
-P14      v2.1    IDE ecosystem (formatter, linter, debugger)
-P15      v3.0    Consciousness v2 (generate, formal proof, dream)
+P14      v2.1    IDE — fmt ✅ lint ✅ playground ✅ LSP 🔄 debugger ⏳
+P15      v3.0    Consciousness v2 — generate ✅ optimize ✅ dream 🔄 proof ⏳
 P16      v4.0    World (website, book, community, academia)
 ```
 
