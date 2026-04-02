@@ -1,7 +1,10 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::mpsc;
+#[cfg(not(target_arch = "wasm32"))]
 use std::thread;
 use crate::ast::*;
 use crate::env::{Env, Value};
@@ -47,8 +50,10 @@ pub struct Interpreter {
     /// File name for diagnostic error messages.
     pub file_name: String,
     /// Join handles for spawned threads.
+    #[cfg(not(target_arch = "wasm32"))]
     spawn_handles: Vec<thread::JoinHandle<()>>,
     /// Named spawn handles for structured concurrency.
+    #[cfg(not(target_arch = "wasm32"))]
     named_spawns: HashMap<String, thread::JoinHandle<()>>,
     /// Macro definitions: name -> StoredMacro
     macro_defs: HashMap<String, crate::macro_expand::StoredMacro>,
@@ -68,6 +73,9 @@ pub struct Interpreter {
     in_pure_fn: bool,
     /// Egyptian Fraction memory manager (1/2 + 1/3 + 1/6 = 1, n=6).
     pub memory: EgyptianMemory,
+    /// Optional output capture buffer. When set, print/println write here
+    /// instead of stdout. Used by the WASM playground and library mode.
+    output_capture: Option<Arc<Mutex<String>>>,
 }
 
 /// Stored data for a loaded/declared module.
@@ -99,7 +107,9 @@ impl Interpreter {
             source_dir: None,
             source_lines: Vec::new(),
             file_name: String::new(),
+            #[cfg(not(target_arch = "wasm32"))]
             spawn_handles: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
             named_spawns: HashMap::new(),
             macro_defs: HashMap::new(),
             comptime_fns: HashMap::new(),
@@ -110,6 +120,7 @@ impl Interpreter {
             in_pure_fn: false,
             comptime_mode: false,
             memory: EgyptianMemory::with_default_budget(),
+            output_capture: None,
         }
     }
 
@@ -123,6 +134,35 @@ impl Interpreter {
     /// Get memory stats as a displayable report.
     pub fn memory_stats(&self) -> MemoryStats {
         self.memory.stats()
+    }
+
+    /// Set an output capture buffer. When set, print/println write to this
+    /// buffer instead of stdout. Pass `None` to restore normal stdout behavior.
+    pub fn set_output_capture(&mut self, buf: Option<Arc<Mutex<String>>>) {
+        self.output_capture = buf;
+    }
+
+    /// Write a string to the output (captured buffer or stdout).
+    fn write_output(&self, s: &str) {
+        if let Some(ref buf) = self.output_capture {
+            if let Ok(mut b) = buf.lock() {
+                b.push_str(s);
+            }
+        } else {
+            print!("{}", s);
+        }
+    }
+
+    /// Write a string followed by newline to the output.
+    fn writeln_output(&self, s: &str) {
+        if let Some(ref buf) = self.output_capture {
+            if let Ok(mut b) = buf.lock() {
+                b.push_str(s);
+                b.push('\n');
+            }
+        } else {
+            println!("{}", s);
+        }
     }
 
     /// Enable or disable comptime (sandboxed) mode.
@@ -181,8 +221,11 @@ impl Interpreter {
 
     /// Wait for all spawned threads to complete.
     pub fn join_spawned(&mut self) {
-        for handle in self.spawn_handles.drain(..) {
-            let _ = handle.join();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            for handle in self.spawn_handles.drain(..) {
+                let _ = handle.join();
+            }
         }
     }
 
@@ -425,10 +468,10 @@ impl Interpreter {
                     map.insert(key.clone(), val);
                 }
                 // Print structured experiment plan
-                println!("=== Intent: {} ===", description);
+                self.writeln_output(&format!("=== Intent: {} ===", description));
                 for (key, val) in &map {
                     if key != "description" {
-                        println!("  {}: {}", key, val);
+                        self.writeln_output(&format!("  {}: {}", key, val));
                     }
                 }
                 // Store as a variable named by the description (or __intent__)
@@ -449,7 +492,7 @@ impl Interpreter {
                             }
                         }
                         Err(e) => {
-                            println!("  FAIL {}: {}", name, e.message);
+                            self.writeln_output(&format!("  FAIL {}: {}", name, e.message));
                             failed = true;
                             break;
                         }
@@ -460,12 +503,12 @@ impl Interpreter {
                 }
                 self.env.pop_scope();
                 if failed {
-                    println!("VERIFY {}: FAILED ({}/{} assertions passed)", name, passed, total);
+                    self.writeln_output(&format!("VERIFY {}: FAILED ({}/{} assertions passed)", name, passed, total));
                     return Err(self.runtime_err(format!(
                         "verify '{}' failed: {}/{} assertions passed", name, passed, total
                     )));
                 } else {
-                    println!("VERIFY {}: OK ({}/{} assertions passed)", name, passed, total);
+                    self.writeln_output(&format!("VERIFY {}: OK ({}/{} assertions passed)", name, passed, total));
                 }
                 Ok(Value::Void)
             }
@@ -573,68 +616,82 @@ impl Interpreter {
                 self.throw_value = Some(err_val);
                 Ok(Value::Void)
             }
-            Stmt::Spawn(body) => {
-                // Clone the body statements for the thread
-                let body = body.clone();
-                // Capture current environment values for the spawned thread
-                let captured_env = self.capture_env_for_spawn();
-                // Clone struct/enum defs and type methods for the spawned thread
-                let struct_defs = self.struct_defs.clone();
-                let enum_defs = self.enum_defs.clone();
-                let type_methods = self.type_methods.clone();
+            Stmt::Spawn(_body) => {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    return Err(self.runtime_err("spawn is not supported in WASM mode".into()));
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    // Clone the body statements for the thread
+                    let body = _body.clone();
+                    // Capture current environment values for the spawned thread
+                    let captured_env = self.capture_env_for_spawn();
+                    // Clone struct/enum defs and type methods for the spawned thread
+                    let struct_defs = self.struct_defs.clone();
+                    let enum_defs = self.enum_defs.clone();
+                    let type_methods = self.type_methods.clone();
 
-                let handle = thread::spawn(move || {
-                    let mut interp = Interpreter::new();
-                    interp.struct_defs = struct_defs;
-                    interp.enum_defs = enum_defs;
-                    interp.type_methods = type_methods;
-                    // Restore captured environment
-                    for (name, val) in captured_env {
-                        interp.env.define(&name, val);
-                    }
-                    // Execute the body; ignore errors (thread panics are caught by join)
-                    for stmt in &body {
-                        if let Err(e) = interp.exec_stmt(stmt) {
-                            eprintln!("[spawn] error: {}", e);
-                            break;
+                    let handle = thread::spawn(move || {
+                        let mut interp = Interpreter::new();
+                        interp.struct_defs = struct_defs;
+                        interp.enum_defs = enum_defs;
+                        interp.type_methods = type_methods;
+                        // Restore captured environment
+                        for (name, val) in captured_env {
+                            interp.env.define(&name, val);
                         }
-                        if interp.return_value.is_some() || interp.throw_value.is_some() {
-                            break;
+                        // Execute the body; ignore errors (thread panics are caught by join)
+                        for stmt in &body {
+                            if let Err(e) = interp.exec_stmt(stmt) {
+                                eprintln!("[spawn] error: {}", e);
+                                break;
+                            }
+                            if interp.return_value.is_some() || interp.throw_value.is_some() {
+                                break;
+                            }
                         }
-                    }
-                });
-                self.spawn_handles.push(handle);
-                Ok(Value::Void)
+                    });
+                    self.spawn_handles.push(handle);
+                    Ok(Value::Void)
+                }
             }
-            Stmt::SpawnNamed(name, body) => {
-                let body = body.clone();
-                let spawn_name = name.clone();
-                let log_name = name.clone();
-                let captured_env = self.capture_env_for_spawn();
-                let struct_defs = self.struct_defs.clone();
-                let enum_defs = self.enum_defs.clone();
-                let type_methods = self.type_methods.clone();
+            Stmt::SpawnNamed(_name, _body) => {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    return Err(self.runtime_err("spawn is not supported in WASM mode".into()));
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let body = _body.clone();
+                    let spawn_name = _name.clone();
+                    let log_name = _name.clone();
+                    let captured_env = self.capture_env_for_spawn();
+                    let struct_defs = self.struct_defs.clone();
+                    let enum_defs = self.enum_defs.clone();
+                    let type_methods = self.type_methods.clone();
 
-                let handle = thread::spawn(move || {
-                    let mut interp = Interpreter::new();
-                    interp.struct_defs = struct_defs;
-                    interp.enum_defs = enum_defs;
-                    interp.type_methods = type_methods;
-                    for (n, val) in captured_env {
-                        interp.env.define(&n, val);
-                    }
-                    for stmt in &body {
-                        if let Err(e) = interp.exec_stmt(stmt) {
-                            eprintln!("[spawn {}] error: {}", log_name, e);
-                            break;
+                    let handle = thread::spawn(move || {
+                        let mut interp = Interpreter::new();
+                        interp.struct_defs = struct_defs;
+                        interp.enum_defs = enum_defs;
+                        interp.type_methods = type_methods;
+                        for (n, val) in captured_env {
+                            interp.env.define(&n, val);
                         }
-                        if interp.return_value.is_some() || interp.throw_value.is_some() {
-                            break;
+                        for stmt in &body {
+                            if let Err(e) = interp.exec_stmt(stmt) {
+                                eprintln!("[spawn {}] error: {}", log_name, e);
+                                break;
+                            }
+                            if interp.return_value.is_some() || interp.throw_value.is_some() {
+                                break;
+                            }
                         }
-                    }
-                });
-                self.named_spawns.insert(spawn_name, handle);
-                Ok(Value::Void)
+                    });
+                    self.named_spawns.insert(spawn_name, handle);
+                    Ok(Value::Void)
+                }
             }
             Stmt::AsyncFnDecl(decl) => {
                 // async fn is stored as a regular function but marked;
@@ -647,47 +704,48 @@ impl Interpreter {
                 );
                 Ok(Value::Void)
             }
-            Stmt::Select(arms) => {
-                // Polling loop: try_recv on each receiver, first with data wins
-                use std::sync::mpsc;
-                loop {
-                    for arm in arms {
-                        // Evaluate the receiver expression (should be rx.recv())
-                        // We need to get the receiver and try_recv on it
-                        // The receiver expr is typically a method call: rx.recv()
-                        // We'll evaluate the receiver object first
-                        if let Expr::Call(callee, _) = &arm.receiver {
-                            if let Expr::Field(obj_expr, method_name) = callee.as_ref() {
-                                if method_name == "recv" {
-                                    let obj = self.eval_expr(obj_expr)?;
-                                    if let Value::Receiver(rx) = &obj {
-                                        let rx_guard = rx.lock().unwrap();
-                                        match rx_guard.try_recv() {
-                                            Ok(val) => {
-                                                drop(rx_guard);
-                                                self.env.push_scope();
-                                                self.env.define(&arm.binding, val);
-                                                let mut result = Value::Void;
-                                                for stmt in &arm.body {
-                                                    result = self.exec_stmt(stmt)?;
-                                                    if self.return_value.is_some() || self.throw_value.is_some() {
-                                                        self.env.pop_scope();
-                                                        return Ok(Value::Void);
+            Stmt::Select(_arms) => {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    return Err(self.runtime_err("select is not supported in WASM mode".into()));
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    // Polling loop: try_recv on each receiver, first with data wins
+                    loop {
+                        for arm in _arms {
+                            if let Expr::Call(callee, _) = &arm.receiver {
+                                if let Expr::Field(obj_expr, method_name) = callee.as_ref() {
+                                    if method_name == "recv" {
+                                        let obj = self.eval_expr(obj_expr)?;
+                                        if let Value::Receiver(rx) = &obj {
+                                            let rx_guard = rx.lock().unwrap();
+                                            match rx_guard.try_recv() {
+                                                Ok(val) => {
+                                                    drop(rx_guard);
+                                                    self.env.push_scope();
+                                                    self.env.define(&arm.binding, val);
+                                                    let mut result = Value::Void;
+                                                    for stmt in &arm.body {
+                                                        result = self.exec_stmt(stmt)?;
+                                                        if self.return_value.is_some() || self.throw_value.is_some() {
+                                                            self.env.pop_scope();
+                                                            return Ok(Value::Void);
+                                                        }
                                                     }
+                                                    self.env.pop_scope();
+                                                    return Ok(result);
                                                 }
-                                                self.env.pop_scope();
-                                                return Ok(result);
+                                                Err(mpsc::TryRecvError::Empty) => continue,
+                                                Err(mpsc::TryRecvError::Disconnected) => continue,
                                             }
-                                            Err(mpsc::TryRecvError::Empty) => continue,
-                                            Err(mpsc::TryRecvError::Disconnected) => continue,
                                         }
                                     }
                                 }
                             }
                         }
+                        std::thread::sleep(std::time::Duration::from_millis(1));
                     }
-                    // Small sleep to avoid busy-waiting
-                    std::thread::sleep(std::time::Duration::from_millis(1));
                 }
             }
             Stmt::DropStmt(name) => {
@@ -1359,58 +1417,65 @@ impl Interpreter {
         match func {
             Value::BuiltinFn(name) => self.call_builtin(&name, args),
             Value::Fn(ref _name, ref params, ref body) if _name.starts_with("__async__") => {
-                // Async function: run in a thread and return a Future
-                if args.len() != params.len() {
-                    return Err(self.runtime_err(format!(
-                        "expected {} arguments, got {}",
-                        params.len(),
-                        args.len()
-                    )));
+                #[cfg(target_arch = "wasm32")]
+                {
+                    return Err(self.runtime_err("async functions are not supported in WASM mode".into()));
                 }
-                let future: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
-                let future_clone = future.clone();
-                let params = params.clone();
-                let body = body.clone();
-                let captured_env = self.capture_env_for_spawn();
-                let struct_defs = self.struct_defs.clone();
-                let enum_defs = self.enum_defs.clone();
-                let type_methods = self.type_methods.clone();
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    // Async function: run in a thread and return a Future
+                    if args.len() != params.len() {
+                        return Err(self.runtime_err(format!(
+                            "expected {} arguments, got {}",
+                            params.len(),
+                            args.len()
+                        )));
+                    }
+                    let future: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+                    let future_clone = future.clone();
+                    let params = params.clone();
+                    let body = body.clone();
+                    let captured_env = self.capture_env_for_spawn();
+                    let struct_defs = self.struct_defs.clone();
+                    let enum_defs = self.enum_defs.clone();
+                    let type_methods = self.type_methods.clone();
 
-                let handle = thread::spawn(move || {
-                    let mut interp = Interpreter::new();
-                    interp.struct_defs = struct_defs;
-                    interp.enum_defs = enum_defs;
-                    interp.type_methods = type_methods;
-                    for (n, val) in captured_env {
-                        interp.env.define(&n, val);
-                    }
-                    interp.env.push_scope();
-                    for (param, arg) in params.iter().zip(args) {
-                        interp.env.define(param, arg);
-                    }
-                    let mut result = Value::Void;
-                    for stmt in &body {
-                        match interp.exec_stmt(stmt) {
-                            Ok(v) => {
-                                result = v;
-                                if interp.return_value.is_some() {
-                                    result = interp.return_value.take().unwrap();
+                    let handle = thread::spawn(move || {
+                        let mut interp = Interpreter::new();
+                        interp.struct_defs = struct_defs;
+                        interp.enum_defs = enum_defs;
+                        interp.type_methods = type_methods;
+                        for (n, val) in captured_env {
+                            interp.env.define(&n, val);
+                        }
+                        interp.env.push_scope();
+                        for (param, arg) in params.iter().zip(args) {
+                            interp.env.define(param, arg);
+                        }
+                        let mut result = Value::Void;
+                        for stmt in &body {
+                            match interp.exec_stmt(stmt) {
+                                Ok(v) => {
+                                    result = v;
+                                    if interp.return_value.is_some() {
+                                        result = interp.return_value.take().unwrap();
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("[async] error: {}", e);
+                                    result = Value::Error(e.message);
                                     break;
                                 }
                             }
-                            Err(e) => {
-                                eprintln!("[async] error: {}", e);
-                                result = Value::Error(e.message);
-                                break;
-                            }
                         }
-                    }
-                    interp.env.pop_scope();
-                    let mut guard = future_clone.lock().unwrap();
-                    *guard = Some(result);
-                });
-                self.spawn_handles.push(handle);
-                Ok(Value::Future(future))
+                        interp.env.pop_scope();
+                        let mut guard = future_clone.lock().unwrap();
+                        *guard = Some(result);
+                    });
+                    self.spawn_handles.push(handle);
+                    Ok(Value::Future(future))
+                }
             }
             Value::Fn(_name, params, body) => {
                 if args.len() != params.len() {
@@ -1564,6 +1629,7 @@ impl Interpreter {
                     }
                 }
             }
+            #[cfg(not(target_arch = "wasm32"))]
             Value::Sender(tx) => {
                 match method {
                     "send" => {
@@ -1576,6 +1642,7 @@ impl Interpreter {
                     _ => Err(self.runtime_err(format!("no method .{}() on sender", method))),
                 }
             }
+            #[cfg(not(target_arch = "wasm32"))]
             Value::Receiver(rx) => {
                 match method {
                     "recv" => {
@@ -1992,22 +2059,25 @@ impl Interpreter {
         }
         match name {
             "print" => {
+                let mut out = String::new();
                 for (i, arg) in args.iter().enumerate() {
                     if i > 0 {
-                        print!(" ");
+                        out.push(' ');
                     }
-                    print!("{}", arg);
+                    out.push_str(&format!("{}", arg));
                 }
+                self.write_output(&out);
                 Ok(Value::Void)
             }
             "println" => {
+                let mut out = String::new();
                 for (i, arg) in args.iter().enumerate() {
                     if i > 0 {
-                        print!(" ");
+                        out.push(' ');
                     }
-                    print!("{}", arg);
+                    out.push_str(&format!("{}", arg));
                 }
-                println!();
+                self.writeln_output(&out);
                 Ok(Value::Void)
             }
             "len" => {
@@ -2044,7 +2114,9 @@ impl Interpreter {
                         Value::Error(_) => "error",
                         Value::EnumVariant(name, _, _) => name.as_str(),
                         Value::Intent(_) => "intent",
+                        #[cfg(not(target_arch = "wasm32"))]
                         Value::Sender(_) => "sender",
+                        #[cfg(not(target_arch = "wasm32"))]
                         Value::Receiver(_) => "receiver",
                         Value::Future(_) => "future",
                         Value::Set(_) => "set",
@@ -2112,34 +2184,49 @@ impl Interpreter {
                 }
             }
             "read_file" => {
-                if args.is_empty() { return Err(self.type_err("read_file() requires 1 argument".into())); }
-                match &args[0] {
-                    Value::Str(path) => {
-                        match std::fs::read_to_string(path) {
-                            Ok(contents) => Ok(Value::Str(contents)),
-                            Err(e) => Ok(Value::Error(format!("read_file error: {}", e))),
+                #[cfg(target_arch = "wasm32")]
+                { return Err(self.runtime_err("read_file is not supported in WASM mode".into())); }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    if args.is_empty() { return Err(self.type_err("read_file() requires 1 argument".into())); }
+                    match &args[0] {
+                        Value::Str(path) => {
+                            match std::fs::read_to_string(path) {
+                                Ok(contents) => Ok(Value::Str(contents)),
+                                Err(e) => Ok(Value::Error(format!("read_file error: {}", e))),
+                            }
                         }
+                        _ => Err(self.type_err("read_file() requires string path".into())),
                     }
-                    _ => Err(self.type_err("read_file() requires string path".into())),
                 }
             }
             "write_file" => {
-                if args.len() < 2 { return Err(self.type_err("write_file() requires 2 arguments".into())); }
-                match (&args[0], &args[1]) {
-                    (Value::Str(path), Value::Str(content)) => {
-                        match std::fs::write(path, content) {
-                            Ok(_) => Ok(Value::Void),
-                            Err(e) => Ok(Value::Error(format!("write_file error: {}", e))),
+                #[cfg(target_arch = "wasm32")]
+                { return Err(self.runtime_err("write_file is not supported in WASM mode".into())); }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    if args.len() < 2 { return Err(self.type_err("write_file() requires 2 arguments".into())); }
+                    match (&args[0], &args[1]) {
+                        (Value::Str(path), Value::Str(content)) => {
+                            match std::fs::write(path, content) {
+                                Ok(_) => Ok(Value::Void),
+                                Err(e) => Ok(Value::Error(format!("write_file error: {}", e))),
+                            }
                         }
+                        _ => Err(self.type_err("write_file() requires string arguments".into())),
                     }
-                    _ => Err(self.type_err("write_file() requires string arguments".into())),
                 }
             }
             "file_exists" => {
-                if args.is_empty() { return Err(self.type_err("file_exists() requires 1 argument".into())); }
-                match &args[0] {
-                    Value::Str(path) => Ok(Value::Bool(std::path::Path::new(path).exists())),
-                    _ => Err(self.type_err("file_exists() requires string path".into())),
+                #[cfg(target_arch = "wasm32")]
+                { return Err(self.runtime_err("file_exists is not supported in WASM mode".into())); }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    if args.is_empty() { return Err(self.type_err("file_exists() requires 1 argument".into())); }
+                    match &args[0] {
+                        Value::Str(path) => Ok(Value::Bool(std::path::Path::new(path).exists())),
+                        _ => Err(self.type_err("file_exists() requires string path".into())),
+                    }
                 }
             }
             "keys" => {
@@ -2338,18 +2425,32 @@ impl Interpreter {
                 }
             }
             "exit" => {
-                if args.is_empty() {
-                    std::process::exit(0);
+                #[cfg(target_arch = "wasm32")]
+                {
+                    return Err(self.runtime_err("exit is not supported in WASM mode".into()));
                 }
-                match &args[0] {
-                    Value::Int(code) => std::process::exit(*code as i32),
-                    _ => std::process::exit(0),
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    if args.is_empty() {
+                        std::process::exit(0);
+                    }
+                    match &args[0] {
+                        Value::Int(code) => std::process::exit(*code as i32),
+                        _ => std::process::exit(0),
+                    }
                 }
             }
             "clock" => {
-                use std::time::{SystemTime, UNIX_EPOCH};
-                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-                Ok(Value::Float(now.as_secs_f64()))
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    use std::time::{SystemTime, UNIX_EPOCH};
+                    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+                    Ok(Value::Float(now.as_secs_f64()))
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    Ok(Value::Float(0.0))
+                }
             }
             // ── Built-in Option/Result constructors ───────────────────
             "Some" => {
@@ -2366,10 +2467,17 @@ impl Interpreter {
             }
             // ── Concurrency builtins ──────────────────────────────────
             "channel" => {
-                let (tx, rx) = mpsc::channel::<Value>();
-                let sender = Value::Sender(Arc::new(Mutex::new(tx)));
-                let receiver = Value::Receiver(Arc::new(Mutex::new(rx)));
-                Ok(Value::Tuple(vec![sender, receiver]))
+                #[cfg(target_arch = "wasm32")]
+                {
+                    return Err(self.runtime_err("channel is not supported in WASM mode".into()));
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let (tx, rx) = mpsc::channel::<Value>();
+                    let sender = Value::Sender(Arc::new(Mutex::new(tx)));
+                    let receiver = Value::Receiver(Arc::new(Mutex::new(rx)));
+                    Ok(Value::Tuple(vec![sender, receiver]))
+                }
             }
             // ── Char utility builtins ────────────────────────────────
             "is_alpha" => {
@@ -3063,6 +3171,7 @@ impl Interpreter {
 
     /// Capture environment for spawn -- includes user-defined variables
     /// (builtins are already registered in the spawned Interpreter::new()).
+    #[cfg(not(target_arch = "wasm32"))]
     fn capture_env_for_spawn(&self) -> Vec<(String, Value)> {
         let mut captured = Vec::new();
         for scope in self.env.scopes.iter() {

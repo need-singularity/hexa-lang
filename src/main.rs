@@ -446,6 +446,21 @@ fn run_file_native(path: &str) {
             std::process::exit(1);
         }
     };
+
+    // Check if the program can be fully JIT-compiled; if not, fall back to interpreter.
+    if !jit::can_jit(&stmts) {
+        eprintln!("[native] Program uses constructs unsupported by JIT, falling back to interpreter.");
+        let mut interp = interpreter::Interpreter::new();
+        match interp.run(&stmts) {
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     let mut jit_compiler = match jit::JitCompiler::new() {
         Ok(j) => j,
         Err(e) => {
@@ -460,8 +475,16 @@ fn run_file_native(path: &str) {
             }
         }
         Err(e) => {
-            eprintln!("{}", e);
-            std::process::exit(1);
+            // Fall back to interpreter on JIT runtime errors too.
+            eprintln!("[native] JIT failed ({}), falling back to interpreter.", e.message);
+            let mut interp = interpreter::Interpreter::new();
+            match interp.run(&stmts) {
+                Ok(_) => {}
+                Err(e2) => {
+                    eprintln!("{}", e2);
+                    std::process::exit(1);
+                }
+            }
         }
     }
 }

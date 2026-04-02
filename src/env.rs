@@ -1,7 +1,9 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::mpsc;
 
 #[derive(Debug, Clone)]
 pub enum Value {
@@ -22,7 +24,9 @@ pub enum Value {
     Error(String),  // error value for try/catch
     EnumVariant(String, String, Option<Box<Value>>),  // enum_name, variant_name, data
     Intent(HashMap<String, Value>),  // consciousness experiment declaration
+    #[cfg(not(target_arch = "wasm32"))]
     Sender(Arc<Mutex<mpsc::Sender<Value>>>),    // channel sender
+    #[cfg(not(target_arch = "wasm32"))]
     Receiver(Arc<Mutex<mpsc::Receiver<Value>>>), // channel receiver
     Future(Arc<Mutex<Option<Value>>>),           // async future value
     Set(Arc<Mutex<std::collections::HashSet<String>>>), // unique value set
@@ -76,7 +80,9 @@ impl std::fmt::Display for Value {
                     None => write!(f, "{}::{}", enum_name, variant),
                 }
             }
+            #[cfg(not(target_arch = "wasm32"))]
             Value::Sender(_) => write!(f, "<sender>"),
+            #[cfg(not(target_arch = "wasm32"))]
             Value::Receiver(_) => write!(f, "<receiver>"),
             Value::Future(inner) => {
                 let guard = inner.lock().unwrap();
