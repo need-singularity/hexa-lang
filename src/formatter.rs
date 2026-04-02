@@ -246,6 +246,12 @@ fn format_stmt(stmt: &Stmt, indent: usize) -> String {
         Stmt::EffectDecl(_) => {
             format!("{}effect {{ ... }}", prefix)
         }
+        Stmt::Scope(body) => {
+            format!("{}scope {}", prefix, format_block(body, indent))
+        }
+        Stmt::ProofBlock(name, _) => {
+            format!("{}proof {} {{ ... }}", prefix, name)
+        }
     }
 }
 

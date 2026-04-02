@@ -43,6 +43,8 @@ pub mod ownership;
 pub mod dream;
 #[allow(dead_code)]
 pub mod inline_cache;
+#[allow(dead_code)]
+pub mod proof_engine;
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 pub mod escape_analysis;
@@ -61,6 +63,9 @@ pub mod jit;
 pub mod lsp;
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
+pub mod debugger;
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
 pub mod codegen_esp32;
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
@@ -74,6 +79,12 @@ pub mod llm;
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 pub mod std_net;
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+pub mod std_fs;
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+pub mod std_io;
 
 // WASM entry points
 #[cfg(target_arch = "wasm32")]

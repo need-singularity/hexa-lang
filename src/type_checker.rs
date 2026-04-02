@@ -406,7 +406,8 @@ impl TypeChecker {
             | Stmt::SpawnNamed(_, _) | Stmt::Select(_, _)
             | Stmt::Generate(_) | Stmt::Optimize(_)
             | Stmt::Const(..) | Stmt::Static(..)
-            | Stmt::MacroDef(_) | Stmt::DeriveDecl(..) => {}
+            | Stmt::MacroDef(_) | Stmt::DeriveDecl(..)
+            | Stmt::Scope(_) | Stmt::ProofBlock(..) => {}
             Stmt::Assert(expr) => {
                 self.check_expr(expr, line, col);
             }

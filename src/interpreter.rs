@@ -12,6 +12,7 @@ use crate::error::{HexaError, ErrorClass};
 use crate::lexer::Lexer;
 use crate::memory::{EgyptianMemory, MemRegion, MemoryStats, estimate_value_size, classify_region};
 use crate::parser::Parser;
+use crate::proof_engine;
 use crate::type_checker::SpecKey;
 use crate::inline_cache::{InlineCache, CallSiteId};
 
@@ -58,6 +59,9 @@ pub struct Interpreter {
     /// Named spawn handles for structured concurrency.
     #[cfg(not(target_arch = "wasm32"))]
     named_spawns: HashMap<String, thread::JoinHandle<()>>,
+    /// Stack of task groups for structured concurrency scopes.
+    #[cfg(not(target_arch = "wasm32"))]
+    scope_task_groups: Vec<crate::async_runtime::TaskGroup>,
     /// Macro definitions: name -> StoredMacro
     macro_defs: HashMap<String, crate::macro_expand::StoredMacro>,
     /// Compile-time function definitions: name -> (param_names, body)
@@ -85,6 +89,9 @@ pub struct Interpreter {
     spec_cache: HashMap<SpecKey, Value>,
     /// Inline cache for monomorphic method dispatch.
     pub inline_cache: InlineCache,
+    /// Optional debug hook for DAP debugger integration.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub debug_hook: Option<Arc<Mutex<crate::debugger::DebugHook>>>,
 }
 
 /// Stored data for a loaded/declared module.
@@ -133,6 +140,8 @@ impl Interpreter {
             generic_fn_decls: HashMap::new(),
             spec_cache: HashMap::new(),
             inline_cache: InlineCache::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            debug_hook: None,
         }
     }
 
@@ -187,6 +196,24 @@ impl Interpreter {
         self.eval_expr(expr)
     }
 
+    /// Set a debug hook for DAP debugger integration.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn set_debug_hook(&mut self, hook: Option<Arc<Mutex<crate::debugger::DebugHook>>>) {
+        self.debug_hook = hook;
+    }
+
+    /// Call the debug hook before executing a statement, if one is set.
+    /// Returns false if the debugger requests disconnection.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn invoke_debug_hook(&mut self) -> bool {
+        if let Some(ref hook) = self.debug_hook {
+            if let Ok(mut h) = hook.lock() {
+                return h.on_statement(self.current_line, &self.file_name, &self.env);
+            }
+        }
+        true
+    }
+
     // ── Public entry point ──────────────────────────────────
 
     pub fn run(&mut self, stmts: &[Stmt]) -> Result<Value, HexaError> {
@@ -215,6 +242,11 @@ impl Interpreter {
             if let Some(&(line, col)) = spans.get(i) {
                 self.current_line = line;
                 self.current_col = col;
+            }
+            // Invoke debug hook before each statement (DAP debugger)
+            #[cfg(not(target_arch = "wasm32"))]
+            if !self.invoke_debug_hook() {
+                return Err(self.runtime_err("debugger disconnected".to_string()));
             }
             last = self.exec_stmt(stmt)?;
             if self.return_value.is_some() {
@@ -3112,6 +3144,31 @@ impl Interpreter {
                 map.insert("identity".into(), Value::Str("1/2 + 1/3 + 1/6 = 1".into()));
                 Ok(Value::Map(map))
             }
+            // ── std::fs builtins ─────────────────────────────────
+            "fs_read" | "fs_write" | "fs_append" | "fs_exists" | "fs_remove"
+            | "fs_mkdir" | "fs_list" | "fs_copy" | "fs_move" | "fs_metadata"
+            | "fs_glob" | "fs_watch" => {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    return Err(self.runtime_err(format!("{} is not supported in WASM mode", name)));
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    crate::std_fs::call_fs_builtin(self, name, args)
+                }
+            }
+            // ── std::io builtins ─────────────────────────────────
+            "io_stdin" | "io_read_lines" | "io_write_bytes" | "io_pipe"
+            | "io_tempfile" | "io_buffered_reader" | "io_reader_next" => {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    return Err(self.runtime_err(format!("{} is not supported in WASM mode", name)));
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    crate::std_io::call_io_builtin(self, name, args)
+                }
+            }
             // ── std::net builtins ────────────────────────────────
             "net_listen" | "net_accept" | "net_connect" | "net_read" | "net_write" | "net_close"
             | "http_get" | "http_serve" => {
@@ -3937,6 +3994,82 @@ impl Interpreter {
             line: self.current_line,
             col: self.current_col,
             hint: None,
+        }
+    }
+
+    // ── Formal proof verification ────────────────────────────────
+
+    /// Convert a HEXA Expr to a proof_engine::ProofExpr for formal verification.
+    fn expr_to_proof_expr(&self, expr: &Expr) -> proof_engine::ProofExpr {
+        match expr {
+            Expr::Ident(name) => proof_engine::ProofExpr::Var(name.clone()),
+            Expr::BoolLit(b) => proof_engine::ProofExpr::BoolConst(*b),
+            Expr::IntLit(n) => proof_engine::ProofExpr::IntConst(*n),
+            Expr::Binary(left, op, right) => {
+                let l = Box::new(self.expr_to_proof_expr(left));
+                let r = Box::new(self.expr_to_proof_expr(right));
+                match op {
+                    BinOp::And => proof_engine::ProofExpr::And(l, r),
+                    BinOp::Or => proof_engine::ProofExpr::Or(l, r),
+                    BinOp::Eq => proof_engine::ProofExpr::Eq(l, r),
+                    BinOp::Lt => proof_engine::ProofExpr::Lt(l, r),
+                    BinOp::Gt => proof_engine::ProofExpr::Gt(l, r),
+                    BinOp::Le => proof_engine::ProofExpr::Le(l, r),
+                    BinOp::Ge => proof_engine::ProofExpr::Ge(l, r),
+                    BinOp::Add => proof_engine::ProofExpr::Add(l, r),
+                    BinOp::Arrow => proof_engine::ProofExpr::Implies(l, r),
+                    _ => proof_engine::ProofExpr::Var(format!("_binop_{:?}", op)),
+                }
+            }
+            Expr::Unary(UnaryOp::Not, inner) => {
+                proof_engine::ProofExpr::Not(Box::new(self.expr_to_proof_expr(inner)))
+            }
+            Expr::Call(func, args) => {
+                if let Expr::Ident(name) = func.as_ref() {
+                    let proof_args: Vec<proof_engine::ProofExpr> = args.iter()
+                        .map(|a| self.expr_to_proof_expr(a))
+                        .collect();
+                    proof_engine::ProofExpr::FnCall(name.clone(), proof_args)
+                } else {
+                    proof_engine::ProofExpr::Var("_unknown_call".into())
+                }
+            }
+            _ => proof_engine::ProofExpr::Var(format!("_expr_{:?}", std::mem::discriminant(expr))),
+        }
+    }
+
+    /// Execute a formal proof block statement via the SAT/SMT engine.
+    fn execute_proof_block_stmt(&self, stmt: &ProofBlockStmt) -> Result<proof_engine::ProofResult, HexaError> {
+        match stmt {
+            ProofBlockStmt::ForAll { var: _, typ: _, condition, conclusion } => {
+                let cond_pe = self.expr_to_proof_expr(condition);
+                let conc_pe = self.expr_to_proof_expr(conclusion);
+                let ps = proof_engine::ProofStmt::ForAll {
+                    var: String::new(),
+                    typ: String::new(),
+                    condition: cond_pe,
+                    conclusion: conc_pe,
+                };
+                Ok(proof_engine::execute_proof_stmt(&ps))
+            }
+            ProofBlockStmt::Exists { var: _, typ: _, condition } => {
+                let cond_pe = self.expr_to_proof_expr(condition);
+                let ps = proof_engine::ProofStmt::Exists {
+                    var: String::new(),
+                    typ: String::new(),
+                    condition: cond_pe,
+                };
+                Ok(proof_engine::execute_proof_stmt(&ps))
+            }
+            ProofBlockStmt::Assert(expr) => {
+                let pe = self.expr_to_proof_expr(expr);
+                let ps = proof_engine::ProofStmt::Assert(pe);
+                Ok(proof_engine::execute_proof_stmt(&ps))
+            }
+            ProofBlockStmt::CheckLaw(n) => {
+                let ps = proof_engine::ProofStmt::CheckLaw(*n);
+                Ok(proof_engine::execute_proof_stmt(&ps))
+            }
         }
     }
 }

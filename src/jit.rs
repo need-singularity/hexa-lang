@@ -146,7 +146,8 @@ fn can_jit_stmt(stmt: &Stmt) -> bool {
         Stmt::DropStmt(..) | Stmt::AsyncFnDecl(..) | Stmt::Select(..) |
         Stmt::MacroDef(..) | Stmt::DeriveDecl(..) | Stmt::Generate(..) |
         Stmt::Optimize(..) | Stmt::ComptimeFn(..) | Stmt::EffectDecl(..) |
-        Stmt::TraitDecl(..) | Stmt::Const(..) | Stmt::Static(..) => false,
+        Stmt::TraitDecl(..) | Stmt::Const(..) | Stmt::Static(..) |
+        Stmt::Scope(..) | Stmt::ProofBlock(..) => false,
     }
 }
 

@@ -435,7 +435,8 @@ impl Compiler {
             | Stmt::Const(_, _, _, _) | Stmt::Static(_, _, _, _)
             | Stmt::MacroDef(_) | Stmt::DeriveDecl(_, _)
             | Stmt::Generate(_) | Stmt::Optimize(_)
-            | Stmt::ComptimeFn(_) | Stmt::EffectDecl(_) => Ok(()),
+            | Stmt::ComptimeFn(_) | Stmt::EffectDecl(_)
+            | Stmt::Scope(_) | Stmt::ProofBlock(..) => Ok(()),
         }
     }
 

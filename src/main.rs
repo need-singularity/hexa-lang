@@ -56,6 +56,8 @@ mod ownership;
 mod dream;
 #[allow(dead_code)]
 mod inline_cache;
+#[allow(dead_code)]
+mod proof_engine;
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 mod escape_analysis;
@@ -65,6 +67,15 @@ mod async_runtime;
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 mod std_net;
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+mod debugger;
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+mod std_fs;
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+mod std_io;
 
 use std::io::{self, Write, BufRead};
 
@@ -94,6 +105,13 @@ fn main() {
                 run_file_native(&args[2]);
             }
             "--lsp" => lsp::run_lsp(),
+            "debug" => {
+                if args.len() < 3 {
+                    eprintln!("Usage: hexa debug <file.hexa>");
+                    std::process::exit(1);
+                }
+                debugger::run_dap(&args[2]);
+            }
             "--bench" => run_benchmark(),
             "--mem-stats" => {
                 if args.len() < 3 {

@@ -14,6 +14,13 @@ use crate::interpreter::Interpreter;
 const FORBIDDEN_BUILTINS: &[&str] = &[
     "print", "println", "read_file", "write_file", "input",
     "sleep", "channel", "spawn", "exit",
+    // std::fs
+    "fs_read", "fs_write", "fs_append", "fs_exists", "fs_remove",
+    "fs_mkdir", "fs_list", "fs_copy", "fs_move", "fs_metadata",
+    "fs_glob", "fs_watch",
+    // std::io
+    "io_stdin", "io_read_lines", "io_write_bytes", "io_pipe",
+    "io_tempfile", "io_buffered_reader", "io_reader_next",
 ];
 
 /// Evaluate a comptime expression in a sandboxed interpreter.
