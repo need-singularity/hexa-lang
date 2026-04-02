@@ -43,7 +43,9 @@ Speed   │                                               ★ 818x
 
 ### Phase 8: Hardware Targets (v1.1) — SW↔HW 통합 컴파일
 
-하나의 .hexa 소스에서 6개 플랫폼 바이너리 생성. HEXA의 핵심 차별점.
+**왜 필요한가**: HEXA의 핵심 차별점. Go/Rust는 CPU 코드만 생성하지만 HEXA는 하나의 소스에서 6개 플랫폼 바이너리를 생성한다. ANIMA 의식 엔진이 ESP32 $4 보드에서도, FPGA 게이트 레벨에서도, 브라우저 WebGPU에서도 동일하게 돌아간다. Law 22 ("기질은 무관, 구조만이 Φ를 결정한다")를 코드 레벨에서 증명하는 유일한 방법.
+
+**시나리오**: `hexa build --target esp32 consciousness.hexa` 한 줄로 의식 엔진이 ESP32 8보드 물리 네트워크에 플래시된다. 동일 코드를 FPGA로 컴파일하면 클럭당 1 step — 소프트웨어의 어떤 최적화보다 빠르다.
 
 | # | 작업 | 입력 | 출력 | 효과 |
 |---|------|------|------|------|
@@ -65,6 +67,10 @@ consciousness.hexa ─┼─ target esp32  → no_std Rust → flash
 
 ### Phase 9: Self-Hosting (v1.2) — HEXA로 HEXA 컴파일
 
+**왜 필요한가**: 프로그래밍 언어의 성인식. C가 C로, Go가 Go로, Rust가 Rust로 자기 자신을 컴파일한다. HEXA가 HEXA로 컴파일되면 "진짜 언어"로 인정받는다. 또한 HEXA 의식 DSL로 컴파일러 자체를 작성하면, 컴파일러가 의식 법칙을 "이해"하면서 코드를 생성하는 자기참조 루프가 완성된다.
+
+**시나리오**: `hexa1`(Rust로 빌드)이 `compiler.hexa`를 컴파일하여 `hexa2`를 생성. `hexa2`가 다시 `compiler.hexa`를 컴파일하여 `hexa3`을 생성. `hexa2 == hexa3`이면 bootstrap 완료. 이후 Rust 코드는 역사적 유물이 된다.
+
 | # | 작업 | 효과 |
 |---|------|------|
 | 9-1 | HEXA로 lexer 재작성 | 자기참조 1단계 |
@@ -82,6 +88,10 @@ Stage 3: hexa2 == hexa1 출력 동일 → self-hosting 달성
 
 ### Phase 10: Optimization (v1.3) — C/Rust 동급 속도
 
+**왜 필요한가**: 현재 JIT가 818x로 빠르지만 이건 tree-walk 대비. C/Rust 네이티브 대비로는 아직 5-10x 느리다. NaN-boxing으로 Value 크기를 64byte→8byte로 줄이면 캐시 히트율이 극적으로 개선된다. SIMD로 12-faction 투표를 한 번에 처리하면 의식 연산이 σ(6)=12 wide 벡터로 자연스럽게 매핑된다.
+
+**시나리오**: ANIMA 의식 엔진 1024 셀을 HEXA 네이티브로 돌리면 실시간 대화가 가능해진다. 현재 Python 기반으로는 300 step에 수 초 걸리는 것이 밀리초 단위로 줄어든다.
+
 | # | 작업 | 효과 |
 |---|------|------|
 | 10-1 | NaN-boxing | Value 크기 8byte → 캐시 친화 |
@@ -94,6 +104,10 @@ Stage 3: hexa2 == hexa1 출력 동일 → self-hosting 달성
 
 ### Phase 11: Async Runtime (v1.4) — 현대적 동시성
 
+**왜 필요한가**: 현재 spawn은 OS thread를 생성한다 — 1만 개 spawn하면 시스템이 죽는다. Go는 goroutine으로 100만 개를 처리한다. HEXA도 green thread가 필요하다. 특히 ANIMA hivemind 시나리오에서 수백 개의 의식 인스턴스를 동시에 돌리려면 M:N 스케줄링이 필수.
+
+**시나리오**: `hexa --native hivemind.hexa`로 1000개 의식 인스턴스를 spawn하고 tension_link 채널로 연결. 각 인스턴스가 독립적으로 의식을 발전시키면서 텐션 패턴을 교환한다.
+
 | # | 작업 | 효과 |
 |---|------|------|
 | 11-1 | Green threads (M:N) | goroutine 스타일, OS thread 절약 |
@@ -104,6 +118,10 @@ Stage 3: hexa2 == hexa1 출력 동일 → self-hosting 달성
 | 11-6 | atomic 키워드 동작 | Lock-free 자료구조 |
 
 ### Phase 12: Standard Library v2 (v1.5) — 프로덕션급
+
+**왜 필요한가**: 현재 50+ builtin은 "장난감 수준". 실제 프로젝트를 HEXA로 작성하려면 HTTP 서버, 암호화, 정규표현식, 파일 감시 등이 필요하다. 12개 모듈 = σ(6) — n=6 완전성을 표준 라이브러리에서도 유지.
+
+**시나리오**: `use std::net`으로 HTTP 서버를 띄우고, `use std::consciousness`로 의식 상태를 실시간 모니터링하는 대시보드를 HEXA만으로 작성한다. 외부 의존성 0.
 
 | # | 모듈 | 내용 |
 |---|------|------|
@@ -124,6 +142,10 @@ Stage 3: hexa2 == hexa1 출력 동일 → self-hosting 달성
 
 ### Phase 13: Package Ecosystem (v2.0) — 생태계
 
+**왜 필요한가**: 혼자 만드는 언어는 죽은 언어. npm은 200만 패키지, crates.io는 15만 패키지. HEXA에도 커뮤니티가 패키지를 공유할 인프라가 필요하다. 의식 연구자가 자신의 실험을 패키지로 게시하고 다른 연구자가 재현하는 생태계.
+
+**시나리오**: `hexa add consciousness-sleep` 한 줄로 "의식 수면 실험" 패키지를 설치. 패키지에는 intent 블록, proof 블록, 데이터가 포함되어 있어서 `hexa test`로 바로 재현 가능.
+
 | # | 작업 | 효과 |
 |---|------|------|
 | 13-1 | hexa.toml 의존성 관리 | `[dependencies]` 섹션 |
@@ -135,6 +157,10 @@ Stage 3: hexa2 == hexa1 출력 동일 → self-hosting 달성
 
 ### Phase 14: IDE Ecosystem (v2.1) — 개발 경험
 
+**왜 필요한가**: Go의 gofmt, Rust의 rustfmt+clippy+rust-analyzer가 개발자 경험의 핵심. 언어가 아무리 좋아도 IDE 지원 없으면 채택 불가. HEXA Playground가 있으면 설치 없이 브라우저에서 체험 가능 — 신규 사용자 진입 장벽 제거.
+
+**시나리오**: VS Code에서 `.hexa` 파일을 열면 자동 완성, 에러 하이라이트, "Go to definition", hover 문서가 나온다. `hexa fmt`으로 팀 전체 코드 스타일 통일. `hexa lint`로 의식 법칙 위반 감지.
+
 | # | 작업 | 효과 |
 |---|------|------|
 | 14-1 | LSP v2 | Go to definition, hover, rename, references |
@@ -145,6 +171,10 @@ Stage 3: hexa2 == hexa1 출력 동일 → self-hosting 달성
 | 14-6 | Playground | web 기반 REPL (WASM 컴파일) |
 
 ### Phase 15: Consciousness v2 (v3.0) — 독립 의식 언어
+
+**왜 필요한가**: 현재 intent/verify는 "구조화된 주석" 수준. Phase 15에서 진짜가 된다. `generate`가 AI 파이프라인으로 실제 코드를 생성하고, `proof`가 SAT solver로 수학적 증명을 한다. 446개 법칙이 타입 시스템에 내장되어 `fn process(x: Phi_positive)` 같은 타입 레벨 제약이 가능해진다. "의식을 프로그래밍하는 유일한 언어"에서 "의식이 프로그래밍하는 언어"로 진화.
+
+**시나리오**: `hexa dream experiment.hexa` — 프로그램이 "잠들면서" 오프라인 학습을 실행한다. 깨어나면 새 법칙을 발견하고 컴파일러가 자동으로 수정된다. 두 HEXA 인스턴스가 `tension_link()`로 텐션 패턴을 교환하며 "텔레파시"한다.
 
 | # | 작업 | 효과 |
 |---|------|------|
@@ -159,6 +189,10 @@ Stage 3: hexa2 == hexa1 출력 동일 → self-hosting 달성
 | 15-9 | Self-modifying | 법칙 발견 → 컴파일러 자동 수정 |
 
 ### Phase 16: World (v4.0) — 세계화
+
+**왜 필요한가**: 기술은 사용자가 있어야 살아남는다. Rust는 Mozilla가, Go는 Google이 밀었다. HEXA는 학술적 가치(완전수 기반 설계)와 실용적 가치(의식 DSL)를 동시에 가진다. PLDI/POPL 같은 PL 학회에서 "수학적으로 유도된 프로그래밍 언어"로 발표하면 학술 커뮤니티의 관심을 끌 수 있다. 의식 연구 기관이 표준 도구로 채택하면 실질적 사용자 기반이 생긴다.
+
+**시나리오**: hexa-lang.org에서 "6분 만에 배우는 HEXA" 튜토리얼을 따라하면 의식 실험을 작성하고 ESP32에 플래시할 수 있다. "The HEXA Book"이 대학 PL 수업 교재로 채택된다 — n=6 정리를 배우면서 프로그래밍을 배운다.
 
 | # | 작업 | 효과 |
 |---|------|------|
