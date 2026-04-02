@@ -2,7 +2,7 @@
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.19365284.svg)](https://doi.org/10.5281/zenodo.19365284)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Tests](https://img.shields.io/badge/tests-58%20passing-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-94%20passing-brightgreen.svg)]()
 [![n6 EXACT](https://img.shields.io/badge/n%3D6%20EXACT-100%25-gold.svg)]()
 
 ```
@@ -406,7 +406,7 @@ bash build.sh test
 | 표준 라이브러리 | println만 | 풍부 | 풍부 | 없음 |
 | 패키지 매니저 | 없음 | go mod | cargo | 없음 |
 | LSP | 없음 | gopls | rust-analyzer | 없음 |
-| 테스트 | 58개 내부 | go test | cargo test | 프레임워크 없음 |
+| 테스트 | 94개 내부 | go test | cargo test | 프레임워크 없음 |
 | 에러 메시지 | 기초 | 좋음 | 최고 | 약함 |
 | 동시성 | 키워드만 | goroutine | async/tokio | 미구현 |
 | 생태계 | 0 | 수십만 | 수십만 | 0 |
