@@ -488,7 +488,9 @@ impl VM {
                     Value::Error(_) => "error",
                     Value::EnumVariant(name, _, _) => name.as_str(),
                     Value::Intent(_) => "intent",
+                    #[cfg(not(target_arch = "wasm32"))]
                     Value::Sender(_) => "sender",
+                    #[cfg(not(target_arch = "wasm32"))]
                     Value::Receiver(_) => "receiver",
                     Value::Future(_) => "future",
                     Value::Set(_) => "set",

@@ -547,11 +547,27 @@ impl Interpreter {
                 }
                 Ok(Value::Void)
             }
-            Stmt::Generate(target) => {
-                self.exec_generate(target)
+            Stmt::Generate(_target) => {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    return self.exec_generate(_target);
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    return Err(self.runtime_err("generate is not supported in WASM mode (requires LLM network access)".into()));
+                }
             }
-            Stmt::Optimize(decl) => {
-                self.exec_optimize(decl)
+            Stmt::Optimize(_decl) => {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    return self.exec_optimize(_decl);
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    // In WASM mode, just register the function as-is without optimization
+                    self.register_fn_decl(_decl);
+                    return Ok(Value::Void);
+                }
             }
             Stmt::Mod(name, body) => {
                 self.exec_mod(name, body)?;
@@ -2797,11 +2813,18 @@ impl Interpreter {
             "join" => {
                 if args.is_empty() { return Err(self.type_err("join() requires 1 argument (spawn name)".into())); }
                 match &args[0] {
-                    Value::Str(name) => {
-                        if let Some(handle) = self.named_spawns.remove(name) {
-                            handle.join().map_err(|_| self.runtime_err(format!("spawn '{}' panicked", name)))?;
+                    Value::Str(_name) => {
+                        #[cfg(not(target_arch = "wasm32"))]
+                        {
+                            if let Some(handle) = self.named_spawns.remove(_name) {
+                                handle.join().map_err(|_| self.runtime_err(format!("spawn '{}' panicked", _name)))?;
+                            }
+                            Ok(Value::Void)
                         }
-                        Ok(Value::Void)
+                        #[cfg(target_arch = "wasm32")]
+                        {
+                            Err(self.runtime_err("join is not supported in WASM mode".into()))
+                        }
                     }
                     _ => Err(self.type_err("join() requires string argument".into())),
                 }
@@ -3218,6 +3241,7 @@ impl Interpreter {
 
     // ── Generate / Optimize (LLM integration) ────────────────
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn exec_generate(&mut self, target: &GenerateTarget) -> Result<Value, HexaError> {
         use crate::llm;
 
@@ -3295,6 +3319,7 @@ impl Interpreter {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn exec_optimize(&mut self, decl: &FnDecl) -> Result<Value, HexaError> {
         use crate::llm;
 

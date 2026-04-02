@@ -20,14 +20,19 @@ mod type_checker;
 mod compiler;
 #[allow(dead_code)]
 mod vm;
+#[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 mod jit;
+#[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 mod lsp;
+#[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 mod codegen_esp32;
+#[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 mod codegen_verilog;
+#[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 mod codegen_wgsl;
 #[allow(dead_code)]
@@ -40,6 +45,7 @@ mod linter;
 mod macro_expand;
 #[allow(dead_code)]
 mod comptime;
+#[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 mod llm;
 #[allow(dead_code)]

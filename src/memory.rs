@@ -574,7 +574,9 @@ pub fn estimate_value_size(val: &crate::env::Value) -> usize {
         Value::Error(msg) => 24 + msg.len(),
         Value::EnumVariant(_, _, data) => 48 + data.as_ref().map(|d| estimate_value_size(d)).unwrap_or(0),
         Value::Intent(fields) => 48 + fields.len() * 40,
+        #[cfg(not(target_arch = "wasm32"))]
         Value::Sender(_) => 32,
+        #[cfg(not(target_arch = "wasm32"))]
         Value::Receiver(_) => 32,
         Value::Future(_) => 32,
         Value::Set(_) => 48,
@@ -594,7 +596,9 @@ pub fn classify_region(val: &crate::env::Value) -> MemRegion {
         Value::Array(_) | Value::Struct(_, _) | Value::Map(_) |
         Value::Lambda(_, _, _) | Value::Fn(_, _, _) |
         Value::Set(_) | Value::Intent(_) |
-        Value::Sender(_) | Value::Receiver(_) | Value::Future(_) => MemRegion::Heap,
+        Value::Future(_) => MemRegion::Heap,
+        #[cfg(not(target_arch = "wasm32"))]
+        Value::Sender(_) | Value::Receiver(_) => MemRegion::Heap,
 
         // Small/temporary → Arena
         Value::Str(_) | Value::Tuple(_) | Value::BuiltinFn(_) |
