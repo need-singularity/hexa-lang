@@ -42,8 +42,7 @@ sigma(n) * phi(n) = n * tau(n)    holds for n >= 2    if and only if n = 6
 
 ```bash
 # Homebrew (macOS)
-brew tap need-singularity/tap
-brew install hexa-lang
+brew install need-singularity/tap/hexa-lang
 
 # Cargo (any platform with Rust)
 cargo install hexa-lang
