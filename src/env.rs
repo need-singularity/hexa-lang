@@ -106,11 +106,20 @@ pub struct Env {
     pub scopes: Vec<HashMap<String, Value>>,
     /// Ownership state tracking per variable name (checked at runtime).
     pub ownership: Vec<HashMap<String, OwnershipState>>,
+    /// Names of constant bindings (cannot be reassigned).
+    pub constants: std::collections::HashSet<String>,
+    /// Static (module-level global) variables.
+    pub statics: HashMap<String, Value>,
 }
 
 impl Env {
     pub fn new() -> Self {
-        let mut env = Self { scopes: vec![HashMap::new()], ownership: vec![HashMap::new()] };
+        let mut env = Self {
+            scopes: vec![HashMap::new()],
+            ownership: vec![HashMap::new()],
+            constants: std::collections::HashSet::new(),
+            statics: HashMap::new(),
+        };
         // Register builtins
         env.define("print", Value::BuiltinFn("print".into()));
         env.define("println", Value::BuiltinFn("println".into()));
@@ -228,6 +237,10 @@ impl Env {
                 return Some(val.clone());
             }
         }
+        // Fall back to static globals
+        if let Some(val) = self.statics.get(name) {
+            return Some(val.clone());
+        }
         None
     }
 
@@ -238,7 +251,33 @@ impl Env {
                 return true;
             }
         }
+        // Fall back to static globals
+        if self.statics.contains_key(name) {
+            self.statics.insert(name.to_string(), val);
+            return true;
+        }
         false
+    }
+
+    /// Define a constant (immutable binding).
+    pub fn define_const(&mut self, name: &str, val: Value) {
+        self.constants.insert(name.to_string());
+        self.scopes.last_mut().unwrap().insert(name.to_string(), val);
+    }
+
+    /// Check if a name is a constant.
+    pub fn is_constant(&self, name: &str) -> bool {
+        self.constants.contains(name)
+    }
+
+    /// Define a static (module-level global) variable.
+    pub fn define_static(&mut self, name: &str, val: Value) {
+        self.statics.insert(name.to_string(), val);
+    }
+
+    /// Check if a name is a static variable.
+    pub fn is_static(&self, name: &str) -> bool {
+        self.statics.contains_key(name)
     }
 
     /// Set ownership state for a variable.

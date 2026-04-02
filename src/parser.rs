@@ -138,6 +138,8 @@ impl Parser {
 
         match self.peek().clone() {
             Token::Let => self.parse_let(vis),
+            Token::Const => self.parse_const(vis),
+            Token::Static => self.parse_static(vis),
             Token::Fn => self.parse_fn_decl(vis),
             Token::Struct => self.parse_struct_decl(vis),
             Token::Enum => self.parse_enum_decl(vis),
@@ -159,6 +161,10 @@ impl Parser {
             Token::Select => self.parse_select(),
             Token::Spawn => self.parse_spawn(),
             Token::Drop => self.parse_drop_stmt(),
+            Token::Macro => self.parse_macro_def(),
+            Token::Derive => self.parse_derive_decl(),
+            Token::Generate => self.parse_generate(),
+            Token::Optimize => self.parse_optimize(),
             _ => {
                 let expr = self.parse_expr()?;
                 // Check for assignment
@@ -201,6 +207,38 @@ impl Parser {
         self.expect(&Token::Eq)?;
         let expr = self.parse_expr()?;
         Ok(Stmt::Let(name, typ, Some(expr), vis))
+    }
+
+    fn parse_const(&mut self, vis: Visibility) -> Result<Stmt, HexaError> {
+        self.advance(); // consume 'const'
+        let name = self.expect_ident()?;
+        // optional type annotation
+        let typ = if matches!(self.peek(), Token::Colon) {
+            self.advance();
+            Some(self.expect_ident()?)
+        } else {
+            None
+        };
+        // = expr (required for const)
+        self.expect(&Token::Eq)?;
+        let expr = self.parse_expr()?;
+        Ok(Stmt::Const(name, typ, expr, vis))
+    }
+
+    fn parse_static(&mut self, vis: Visibility) -> Result<Stmt, HexaError> {
+        self.advance(); // consume 'static'
+        let name = self.expect_ident()?;
+        // optional type annotation
+        let typ = if matches!(self.peek(), Token::Colon) {
+            self.advance();
+            Some(self.expect_ident()?)
+        } else {
+            None
+        };
+        // = expr (required for static)
+        self.expect(&Token::Eq)?;
+        let expr = self.parse_expr()?;
+        Ok(Stmt::Static(name, typ, expr, vis))
     }
 
     fn parse_return(&mut self) -> Result<Stmt, HexaError> {
@@ -316,7 +354,7 @@ impl Parser {
             None
         };
         let body = self.parse_block()?;
-        Ok(Stmt::AsyncFnDecl(FnDecl { name, type_params, params, ret_type, body, vis }))
+        Ok(Stmt::AsyncFnDecl(FnDecl { name, type_params, params, ret_type, where_clauses: vec![], body, vis }))
     }
 
     fn parse_select(&mut self) -> Result<Stmt, HexaError> {
@@ -356,6 +394,344 @@ impl Parser {
         Ok(Stmt::DropStmt(name))
     }
 
+    /// Parse `generate fn name(params) -> ret { "description" }`
+    /// or `generate type { "description" }` (as expression statement).
+    fn parse_generate(&mut self) -> Result<Stmt, HexaError> {
+        self.advance(); // consume 'generate'
+        if matches!(self.peek(), Token::Fn) {
+            // generate fn name(params) -> ret { "description" }
+            self.advance(); // consume 'fn'
+            let name = self.expect_ident()?;
+            self.expect(&Token::LParen)?;
+            let params = self.parse_params()?;
+            self.expect(&Token::RParen)?;
+            let ret_type = if matches!(self.peek(), Token::Arrow) {
+                self.advance();
+                Some(self.expect_ident()?)
+            } else {
+                None
+            };
+            self.expect(&Token::LBrace)?;
+            self.skip_newlines();
+            // Body must be a single string literal (the description)
+            let description = match self.peek().clone() {
+                Token::StringLit(s) => { self.advance(); s }
+                _ => return Err(self.error(format!(
+                    "generate fn body must be a string description, got {:?}", self.peek()
+                ))),
+            };
+            self.skip_newlines();
+            self.expect(&Token::RBrace)?;
+            Ok(Stmt::Generate(GenerateTarget::Fn {
+                name,
+                params,
+                ret_type,
+                description,
+            }))
+        } else {
+            // generate type { "description" } — expression form
+            let type_hint = if !matches!(self.peek(), Token::LBrace) {
+                Some(self.expect_ident()?)
+            } else {
+                None
+            };
+            self.expect(&Token::LBrace)?;
+            self.skip_newlines();
+            let description = match self.peek().clone() {
+                Token::StringLit(s) => { self.advance(); s }
+                _ => return Err(self.error(format!(
+                    "generate body must be a string description, got {:?}", self.peek()
+                ))),
+            };
+            self.skip_newlines();
+            self.expect(&Token::RBrace)?;
+            Ok(Stmt::Generate(GenerateTarget::Expr {
+                type_hint,
+                description,
+            }))
+        }
+    }
+
+    /// Parse `optimize fn name(params) -> ret { body }`.
+    fn parse_optimize(&mut self) -> Result<Stmt, HexaError> {
+        self.advance(); // consume 'optimize'
+        self.expect(&Token::Fn)?;
+        let name = self.expect_ident()?;
+        let type_params = if matches!(self.peek(), Token::Lt) {
+            self.parse_type_params()?
+        } else {
+            vec![]
+        };
+        self.expect(&Token::LParen)?;
+        let params = self.parse_params()?;
+        self.expect(&Token::RParen)?;
+        let ret_type = if matches!(self.peek(), Token::Arrow) {
+            self.advance();
+            Some(self.expect_ident()?)
+        } else {
+            None
+        };
+        let body = self.parse_block()?;
+        let decl = FnDecl {
+            name,
+            type_params,
+            params,
+            ret_type,
+            where_clauses: vec![],
+            body,
+            vis: Visibility::Private,
+        };
+        Ok(Stmt::Optimize(decl))
+    }
+
+    // ── Macros ──────────────────────────────────────────────
+
+    /// Parse: macro! name { (pattern) => { body } }
+    fn parse_macro_def(&mut self) -> Result<Stmt, HexaError> {
+        self.advance(); // consume 'macro'
+        self.expect(&Token::Not)?; // consume '!'
+        let name = self.expect_ident()?;
+        self.expect(&Token::LBrace)?;
+        self.skip_newlines();
+        let mut rules = Vec::new();
+        while !matches!(self.peek(), Token::RBrace | Token::Eof) {
+            let pattern = self.parse_macro_pattern()?;
+            self.expect(&Token::FatArrow)?;
+            let body = self.parse_macro_body()?;
+            rules.push(MacroRule { pattern, body });
+            if matches!(self.peek(), Token::Comma | Token::Semicolon) {
+                self.advance();
+            }
+            self.skip_newlines();
+        }
+        self.expect(&Token::RBrace)?;
+        Ok(Stmt::MacroDef(MacroDef { name, rules }))
+    }
+
+    fn parse_macro_pattern(&mut self) -> Result<Vec<MacroPatternToken>, HexaError> {
+        self.expect(&Token::LParen)?;
+        self.skip_newlines();
+        let mut tokens = Vec::new();
+        while !matches!(self.peek(), Token::RParen | Token::Eof) {
+            tokens.push(self.parse_macro_pattern_token()?);
+            self.skip_newlines();
+        }
+        self.expect(&Token::RParen)?;
+        Ok(tokens)
+    }
+
+    fn parse_macro_pattern_token(&mut self) -> Result<MacroPatternToken, HexaError> {
+        if let Token::Ident(ref s) = self.peek().clone() {
+            if s == "$" {
+                self.advance();
+                if matches!(self.peek(), Token::LParen) {
+                    self.advance();
+                    let mut inner = Vec::new();
+                    while !matches!(self.peek(), Token::RParen | Token::Eof) {
+                        inner.push(self.parse_macro_pattern_token()?);
+                    }
+                    self.expect(&Token::RParen)?;
+                    let sep = if matches!(self.peek(), Token::Comma) {
+                        self.advance();
+                        Some(MacroBodyToken::Literal(MacroLitToken::Comma))
+                    } else {
+                        None
+                    };
+                    let kind = if matches!(self.peek(), Token::Star) {
+                        self.advance(); RepeatKind::ZeroOrMore
+                    } else if matches!(self.peek(), Token::Plus) {
+                        self.advance(); RepeatKind::OneOrMore
+                    } else {
+                        return Err(self.error("expected * or + after macro repetition".into()));
+                    };
+                    return Ok(MacroPatternToken::Repetition(inner, sep, kind));
+                }
+                let cap_name = self.expect_ident()?;
+                self.expect(&Token::Colon)?;
+                let spec_name = self.expect_ident()?;
+                let spec = match spec_name.as_str() {
+                    "expr" => MacroFragSpec::Expr,
+                    "ident" => MacroFragSpec::Ident,
+                    "ty" => MacroFragSpec::Ty,
+                    "literal" => MacroFragSpec::Literal,
+                    "block" => MacroFragSpec::Block,
+                    _ => return Err(self.error(format!("unknown fragment specifier: {}", spec_name))),
+                };
+                return Ok(MacroPatternToken::Capture(cap_name, spec));
+            }
+        }
+        let lit = self.parse_macro_lit_token()?;
+        Ok(MacroPatternToken::Literal(lit))
+    }
+
+    fn parse_macro_body(&mut self) -> Result<Vec<MacroBodyToken>, HexaError> {
+        self.expect(&Token::LBrace)?;
+        self.skip_newlines();
+        let mut tokens = Vec::new();
+        while !matches!(self.peek(), Token::RBrace | Token::Eof) {
+            tokens.push(self.parse_macro_body_token()?);
+            self.skip_newlines();
+        }
+        self.expect(&Token::RBrace)?;
+        Ok(tokens)
+    }
+
+    fn parse_macro_body_token(&mut self) -> Result<MacroBodyToken, HexaError> {
+        if let Token::Ident(ref s) = self.peek().clone() {
+            if s == "$" {
+                self.advance();
+                if matches!(self.peek(), Token::LParen) {
+                    self.advance();
+                    let mut inner = Vec::new();
+                    while !matches!(self.peek(), Token::RParen | Token::Eof) {
+                        inner.push(self.parse_macro_body_token()?);
+                    }
+                    self.expect(&Token::RParen)?;
+                    let kind = if matches!(self.peek(), Token::Star) {
+                        self.advance(); RepeatKind::ZeroOrMore
+                    } else if matches!(self.peek(), Token::Plus) {
+                        self.advance(); RepeatKind::OneOrMore
+                    } else {
+                        return Err(self.error("expected * or + after macro repetition".into()));
+                    };
+                    return Ok(MacroBodyToken::Repetition(inner, kind));
+                }
+                let var_name = self.expect_ident()?;
+                return Ok(MacroBodyToken::Var(var_name));
+            }
+        }
+        let lit = self.parse_macro_lit_token()?;
+        Ok(MacroBodyToken::Literal(lit))
+    }
+
+    fn parse_macro_lit_token(&mut self) -> Result<MacroLitToken, HexaError> {
+        let tok = self.peek().clone();
+        let lit = match tok {
+            Token::Ident(ref s) => MacroLitToken::Ident(s.clone()),
+            Token::IntLit(n) => MacroLitToken::IntLit(n),
+            Token::FloatLit(n) => MacroLitToken::FloatLit(n),
+            Token::StringLit(ref s) => MacroLitToken::StringLit(s.clone()),
+            Token::BoolLit(b) => MacroLitToken::BoolLit(b),
+            Token::LParen => MacroLitToken::LParen,
+            Token::RParen => MacroLitToken::RParen,
+            Token::LBrace => MacroLitToken::LBrace,
+            Token::RBrace => MacroLitToken::RBrace,
+            Token::LBracket => MacroLitToken::LBracket,
+            Token::RBracket => MacroLitToken::RBracket,
+            Token::Comma => MacroLitToken::Comma,
+            Token::Colon => MacroLitToken::Colon,
+            Token::ColonColon => MacroLitToken::ColonColon,
+            Token::Semicolon => MacroLitToken::Semicolon,
+            Token::Dot => MacroLitToken::Dot,
+            Token::Plus => MacroLitToken::Plus,
+            Token::Minus => MacroLitToken::Minus,
+            Token::Star => MacroLitToken::Star,
+            Token::Slash => MacroLitToken::Slash,
+            Token::Percent => MacroLitToken::Percent,
+            Token::Power => MacroLitToken::Power,
+            Token::Eq => MacroLitToken::Eq,
+            Token::EqEq => MacroLitToken::EqEq,
+            Token::NotEq => MacroLitToken::NotEq,
+            Token::Lt => MacroLitToken::Lt,
+            Token::Gt => MacroLitToken::Gt,
+            Token::LtEq => MacroLitToken::LtEq,
+            Token::GtEq => MacroLitToken::GtEq,
+            Token::And => MacroLitToken::And,
+            Token::Or => MacroLitToken::Or,
+            Token::Not => MacroLitToken::Not,
+            Token::Arrow => MacroLitToken::Arrow,
+            Token::DotDot => MacroLitToken::DotDot,
+            Token::DotDotEq => MacroLitToken::DotDotEq,
+            Token::BitAnd => MacroLitToken::BitAnd,
+            Token::BitOr => MacroLitToken::BitOr,
+            Token::BitXor => MacroLitToken::BitXor,
+            Token::BitNot => MacroLitToken::BitNot,
+            Token::Let => MacroLitToken::Let,
+            Token::Mut => MacroLitToken::Mut,
+            Token::Fn => MacroLitToken::Fn,
+            Token::Return => MacroLitToken::Return,
+            Token::If => MacroLitToken::If,
+            Token::Else => MacroLitToken::Else,
+            Token::For => MacroLitToken::For,
+            Token::While => MacroLitToken::While,
+            Token::Loop => MacroLitToken::Loop,
+            Token::Struct => MacroLitToken::Struct,
+            Token::Enum => MacroLitToken::Enum,
+            Token::Trait => MacroLitToken::Trait,
+            Token::Impl => MacroLitToken::Impl,
+            Token::Match => MacroLitToken::Match,
+            Token::Newline => {
+                self.advance();
+                self.skip_newlines();
+                if matches!(self.peek(), Token::RBrace | Token::RParen | Token::Eof) {
+                    return Ok(MacroLitToken::Newline);
+                }
+                return self.parse_macro_lit_token();
+            }
+            _ => return Err(self.error(format!("unexpected token in macro: {:?}", tok))),
+        };
+        self.advance();
+        Ok(lit)
+    }
+
+    /// Parse macro invocation after name and ! have been consumed.
+    fn parse_macro_invocation(&mut self, name: String) -> Result<Expr, HexaError> {
+        let (open, close) = if matches!(self.peek(), Token::LParen) {
+            (Token::LParen, Token::RParen)
+        } else {
+            (Token::LBracket, Token::RBracket)
+        };
+        self.advance(); // consume opening delimiter
+        let mut tokens = Vec::new();
+        let mut depth = 1u32;
+        loop {
+            if self.at_end() {
+                return Err(self.error("unterminated macro invocation".into()));
+            }
+            if std::mem::discriminant(self.peek()) == std::mem::discriminant(&close) {
+                depth -= 1;
+                if depth == 0 {
+                    self.advance();
+                    break;
+                }
+            }
+            if std::mem::discriminant(self.peek()) == std::mem::discriminant(&open) {
+                depth += 1;
+            }
+            if matches!(self.peek(), Token::Newline) {
+                self.advance();
+                self.skip_newlines();
+                continue;
+            }
+            let lit = self.parse_macro_lit_token()?;
+            tokens.push(lit);
+        }
+        Ok(Expr::MacroInvoc(MacroInvocation { name, tokens }))
+    }
+
+    /// Parse derive declaration: derive(Trait1, Trait2) for TypeName
+    fn parse_derive_decl(&mut self) -> Result<Stmt, HexaError> {
+        self.advance(); // consume 'derive'
+        self.expect(&Token::LParen)?;
+        let mut traits = Vec::new();
+        loop {
+            traits.push(self.expect_ident()?);
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        self.expect(&Token::RParen)?;
+        match self.peek() {
+            Token::For => { self.advance(); }
+            Token::Ident(ref s) if s == "for" => { self.advance(); }
+            _ => return Err(self.error(format!("expected 'for' after derive traits, got {:?}", self.peek()))),
+        }
+        let type_name = self.expect_ident()?;
+        Ok(Stmt::DeriveDecl(type_name, traits))
+    }
+
     fn parse_mod_decl(&mut self) -> Result<Stmt, HexaError> {
         self.advance(); // consume 'mod'
         let name = self.expect_ident()?;
@@ -393,8 +769,14 @@ impl Parser {
         } else {
             None
         };
+        // Parse optional where clause: where T: Display, U: Clone
+        let where_clauses = if matches!(self.peek(), Token::Where) {
+            self.parse_where_clauses()?
+        } else {
+            vec![]
+        };
         let body = self.parse_block()?;
-        Ok(Stmt::FnDecl(FnDecl { name, type_params, params, ret_type, body, vis }))
+        Ok(Stmt::FnDecl(FnDecl { name, type_params, params, ret_type, where_clauses, body, vis }))
     }
 
     /// Parse type parameters: `<T>`, `<T: Display>`, `<T, U>`, `<T: Display, U: Clone>`
@@ -418,6 +800,28 @@ impl Parser {
         }
         self.expect(&Token::Gt)?; // consume >
         Ok(type_params)
+    }
+
+    /// Parse where clause: `where T: Display, U: Clone`
+    fn parse_where_clauses(&mut self) -> Result<Vec<WhereClause>, HexaError> {
+        self.advance(); // consume 'where'
+        let mut clauses = Vec::new();
+        loop {
+            let type_name = self.expect_ident()?;
+            self.expect(&Token::Colon)?;
+            let bound = self.expect_ident()?;
+            clauses.push(WhereClause { type_name, bound });
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+                // Stop if next token is '{' (start of body)
+                if matches!(self.peek(), Token::LBrace) {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        Ok(clauses)
     }
 
     fn parse_params(&mut self) -> Result<Vec<Param>, HexaError> {
@@ -526,7 +930,7 @@ impl Parser {
             } else {
                 vec![]
             };
-            methods.push(FnDecl { name: m_name, type_params: vec![], params: m_params, ret_type: m_ret, body: m_body, vis: m_vis });
+            methods.push(FnDecl { name: m_name, type_params: vec![], params: m_params, ret_type: m_ret, where_clauses: vec![], body: m_body, vis: m_vis });
             self.skip_newlines();
         }
         self.expect(&Token::RBrace)?;
@@ -564,7 +968,7 @@ impl Parser {
                 None
             };
             let m_body = self.parse_block()?;
-            methods.push(FnDecl { name: m_name, type_params: vec![], params: m_params, ret_type: m_ret, body: m_body, vis: m_vis });
+            methods.push(FnDecl { name: m_name, type_params: vec![], params: m_params, ret_type: m_ret, where_clauses: vec![], body: m_body, vis: m_vis });
             self.skip_newlines();
         }
         self.expect(&Token::RBrace)?;
@@ -898,6 +1302,18 @@ impl Parser {
             Token::CharLit(c) => { self.advance(); Ok(Expr::CharLit(c)) }
             Token::Ident(name) => {
                 self.advance();
+                // Check for macro invocation: name!(...) or name![...]
+                if matches!(self.peek(), Token::Not) {
+                    // Could be macro invocation — peek ahead for ( or [
+                    let saved = self.pos;
+                    self.advance(); // consume !
+                    if matches!(self.peek(), Token::LParen | Token::LBracket) {
+                        return self.parse_macro_invocation(name);
+                    } else {
+                        // Not a macro invocation, backtrack
+                        self.pos = saved;
+                    }
+                }
                 // Check for enum path: Name::Variant
                 // Parenthesized data is handled by postfix Call:
                 //   Name::Variant(data) → Call(EnumPath(Name, Variant, None), [data])

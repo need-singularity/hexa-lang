@@ -49,6 +49,8 @@ pub struct Interpreter {
     spawn_handles: Vec<thread::JoinHandle<()>>,
     /// Named spawn handles for structured concurrency.
     named_spawns: HashMap<String, thread::JoinHandle<()>>,
+    /// Macro definitions: name -> StoredMacro
+    macro_defs: HashMap<String, crate::macro_expand::StoredMacro>,
 }
 
 /// Stored data for a loaded/declared module.
@@ -82,6 +84,7 @@ impl Interpreter {
             file_name: String::new(),
             spawn_handles: Vec::new(),
             named_spawns: HashMap::new(),
+            macro_defs: HashMap::new(),
         }
     }
 
@@ -157,10 +160,30 @@ impl Interpreter {
                 }
                 Ok(Value::Void)
             }
+            Stmt::Const(name, _typ, expr, _vis) => {
+                let val = self.eval_expr(expr)?;
+                self.env.define_const(name, val);
+                Ok(Value::Void)
+            }
+            Stmt::Static(name, _typ, expr, _vis) => {
+                // Static variables must be at module level (scope depth == 1)
+                if self.env.scopes.len() > 1 {
+                    return Err(self.runtime_err(
+                        "static variables must be declared at module level".to_string()
+                    ));
+                }
+                let val = self.eval_expr(expr)?;
+                self.env.define_static(name, val);
+                Ok(Value::Void)
+            }
             Stmt::Assign(lhs, rhs) => {
                 let val = self.eval_expr(rhs)?;
                 match lhs {
                     Expr::Ident(name) => {
+                        // Check constant: constants cannot be reassigned
+                        if self.env.is_constant(name) {
+                            return Err(self.runtime_err(format!("cannot reassign to constant `{}`", name)));
+                        }
                         // Check ownership state: borrowed values cannot be mutated
                         {
                             use crate::env::OwnershipState;
@@ -386,6 +409,30 @@ impl Interpreter {
                 }
                 Ok(Value::Void)
             }
+            Stmt::MacroDef(mac_def) => {
+                self.macro_defs.insert(mac_def.name.clone(), crate::macro_expand::StoredMacro {
+                    rules: mac_def.rules.clone(),
+                });
+                Ok(Value::Void)
+            }
+            Stmt::DeriveDecl(type_name, traits) => {
+                // Look up struct fields for this type
+                let fields = self.struct_defs.get(type_name).cloned().unwrap_or_default();
+                let derive_stmts = crate::macro_expand::generate_derive(
+                    type_name, traits, &fields,
+                    self.current_line, self.current_col,
+                )?;
+                for s in &derive_stmts {
+                    self.exec_stmt(s)?;
+                }
+                Ok(Value::Void)
+            }
+            Stmt::Generate(target) => {
+                self.exec_generate(target)
+            }
+            Stmt::Optimize(decl) => {
+                self.exec_optimize(decl)
+            }
             Stmt::Mod(name, body) => {
                 self.exec_mod(name, body)?;
                 Ok(Value::Void)
@@ -582,6 +629,8 @@ impl Interpreter {
                     }
                 }
             }
+            // Macro/Derive/Const/Static — not yet implemented at runtime
+            _ => Ok(Value::Void),
         }
     }
 
@@ -1058,6 +1107,29 @@ impl Interpreter {
             Expr::Wildcard => {
                 // Wildcard should only appear in match patterns, not as a standalone expression
                 Err(self.runtime_err("wildcard '_' can only be used in match patterns".into()))
+            }
+            Expr::MacroInvoc(invoc) => {
+                // Look up the macro
+                let mac = self.macro_defs.get(&invoc.name).cloned().ok_or_else(|| {
+                    self.runtime_err(format!("undefined macro: {}!", invoc.name))
+                })?;
+                // Expand
+                let expanded_stmts = crate::macro_expand::expand_macro(
+                    &mac, &invoc.tokens,
+                    self.current_line, self.current_col,
+                )?;
+                // Execute expanded statements, return last value
+                let mut last = Value::Void;
+                self.env.push_scope();
+                for s in &expanded_stmts {
+                    last = self.exec_stmt(s)?;
+                    if self.return_value.is_some() {
+                        self.env.pop_scope();
+                        return Ok(self.return_value.take().unwrap());
+                    }
+                }
+                self.env.pop_scope();
+                Ok(last)
             }
         }
     }
@@ -2865,6 +2937,245 @@ impl Interpreter {
                 }
             }
             _ => false,
+        }
+    }
+
+    // ── Generate / Optimize (LLM integration) ────────────────
+
+    fn exec_generate(&mut self, target: &GenerateTarget) -> Result<Value, HexaError> {
+        use crate::llm;
+
+        match target {
+            GenerateTarget::Fn { name, params, ret_type, description } => {
+                // Build type hint string for the LLM prompt
+                let param_str = params.iter()
+                    .map(|p| {
+                        if let Some(t) = &p.typ {
+                            format!("{}: {}", p.name, t)
+                        } else {
+                            p.name.clone()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let type_hint = match ret_type {
+                    Some(ret) => format!("fn {}({}) -> {}", name, param_str, ret),
+                    None => format!("fn {}({})", name, param_str),
+                };
+
+                let code = llm::generate_code(description, &type_hint)
+                    .map_err(|e| self.runtime_err(format!("generate failed: {}", e)))?;
+
+                // Try to parse and register the generated code as a function body
+                let param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
+
+                // Attempt to parse the generated code as statements
+                match self.parse_hexa_source(&code) {
+                    Ok(body_stmts) => {
+                        let val = Value::Fn(name.clone(), param_names, body_stmts);
+                        self.env.define(name, val.clone());
+                        println!("[generate] fn {} — LLM code registered", name);
+                        Ok(val)
+                    }
+                    Err(_) => {
+                        // If parse fails, wrap the raw code as a panic call
+                        let fallback_body = vec![
+                            Stmt::Expr(Expr::Call(
+                                Box::new(Expr::Ident("panic".into())),
+                                vec![Expr::StringLit(format!("LLM not available: {}", description))],
+                            ))
+                        ];
+                        let val = Value::Fn(name.clone(), param_names, fallback_body);
+                        self.env.define(name, val.clone());
+                        println!("[generate] fn {} — offline fallback (LLM code failed to parse)", name);
+                        Ok(val)
+                    }
+                }
+            }
+            GenerateTarget::Expr { type_hint, description } => {
+                let hint = type_hint.as_deref().unwrap_or("");
+                let code = llm::generate_code(description, hint)
+                    .map_err(|e| self.runtime_err(format!("generate failed: {}", e)))?;
+
+                // Try to parse and evaluate the expression
+                match self.parse_hexa_source(&code) {
+                    Ok(stmts) => {
+                        self.env.push_scope();
+                        let mut result = Value::Void;
+                        for s in &stmts {
+                            result = self.exec_stmt(s)?;
+                        }
+                        self.env.pop_scope();
+                        println!("[generate] expr — LLM result: {}", result);
+                        Ok(result)
+                    }
+                    Err(_) => {
+                        // Return the raw code as a string value
+                        println!("[generate] expr — returning raw string (parse failed)");
+                        Ok(Value::Str(code))
+                    }
+                }
+            }
+        }
+    }
+
+    fn exec_optimize(&mut self, decl: &FnDecl) -> Result<Value, HexaError> {
+        use crate::llm;
+
+        // Serialize the function to a HEXA-like string for the LLM
+        let param_str = decl.params.iter()
+            .map(|p| {
+                if let Some(t) = &p.typ {
+                    format!("{}: {}", p.name, t)
+                } else {
+                    p.name.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sig = match &decl.ret_type {
+            Some(ret) => format!("fn {}({}) -> {}", decl.name, param_str, ret),
+            None => format!("fn {}({})", decl.name, param_str),
+        };
+        let body_str = self.stmts_to_string(&decl.body, 1);
+        let original_code = format!("{} {{\n{}}}", sig, body_str);
+
+        let optimized = llm::optimize_code(&original_code, &decl.name)
+            .map_err(|e| self.runtime_err(format!("optimize failed: {}", e)))?;
+
+        // Try to parse optimized result
+        match self.parse_hexa_source(&optimized) {
+            Ok(stmts) => {
+                // Look for a FnDecl in the parsed result
+                for s in &stmts {
+                    if let Stmt::FnDecl(opt_decl) = s {
+                        let param_names: Vec<String> = opt_decl.params.iter().map(|p| p.name.clone()).collect();
+                        let val = Value::Fn(opt_decl.name.clone(), param_names, opt_decl.body.clone());
+                        self.env.define(&opt_decl.name, val);
+                        println!("[optimize] fn {} — LLM optimization applied", opt_decl.name);
+                        return Ok(Value::Void);
+                    }
+                }
+                // No FnDecl found in optimized output — use original
+                self.register_fn_decl(decl);
+                println!("[optimize] fn {} — keeping original (no fn in LLM output)", decl.name);
+                Ok(Value::Void)
+            }
+            Err(_) => {
+                // Parse failed — register original function unchanged
+                self.register_fn_decl(decl);
+                println!("[optimize] fn {} — keeping original (offline mode)", decl.name);
+                Ok(Value::Void)
+            }
+        }
+    }
+
+    /// Register a FnDecl in the environment.
+    fn register_fn_decl(&mut self, decl: &FnDecl) {
+        let param_names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
+        self.env.define(
+            &decl.name,
+            Value::Fn(decl.name.clone(), param_names, decl.body.clone()),
+        );
+    }
+
+    /// Parse a string as HEXA source code, returning statements.
+    fn parse_hexa_source(&self, code: &str) -> Result<Vec<Stmt>, HexaError> {
+        let tokens = Lexer::new(code).tokenize().map_err(|e| HexaError {
+            class: ErrorClass::Syntax,
+            message: e,
+            line: 0, col: 0,
+            hint: None,
+        })?;
+        let stmts = Parser::new(tokens).parse()?;
+        Ok(stmts)
+    }
+
+    /// Simple pretty-print of statements (for sending to LLM).
+    fn stmts_to_string(&self, stmts: &[Stmt], indent: usize) -> String {
+        let prefix = "    ".repeat(indent);
+        let mut out = String::new();
+        for s in stmts {
+            out.push_str(&prefix);
+            match s {
+                Stmt::Return(Some(e)) => {
+                    out.push_str(&format!("return {}\n", self.expr_to_string(e)));
+                }
+                Stmt::Return(None) => {
+                    out.push_str("return\n");
+                }
+                Stmt::Expr(e) => {
+                    out.push_str(&format!("{}\n", self.expr_to_string(e)));
+                }
+                Stmt::Let(name, typ, expr, _) => {
+                    match (typ, expr) {
+                        (Some(t), Some(e)) => out.push_str(&format!("let {}: {} = {}\n", name, t, self.expr_to_string(e))),
+                        (None, Some(e)) => out.push_str(&format!("let {} = {}\n", name, self.expr_to_string(e))),
+                        _ => out.push_str(&format!("let {}\n", name)),
+                    }
+                }
+                Stmt::For(var, iter_e, body) => {
+                    out.push_str(&format!("for {} in {} {{\n", var, self.expr_to_string(iter_e)));
+                    out.push_str(&self.stmts_to_string(body, indent + 1));
+                    out.push_str(&prefix);
+                    out.push_str("}\n");
+                }
+                Stmt::While(cond, body) => {
+                    out.push_str(&format!("while {} {{\n", self.expr_to_string(cond)));
+                    out.push_str(&self.stmts_to_string(body, indent + 1));
+                    out.push_str(&prefix);
+                    out.push_str("}\n");
+                }
+                Stmt::FnDecl(d) => {
+                    let ps = d.params.iter()
+                        .map(|p| if let Some(t) = &p.typ { format!("{}: {}", p.name, t) } else { p.name.clone() })
+                        .collect::<Vec<_>>().join(", ");
+                    match &d.ret_type {
+                        Some(r) => out.push_str(&format!("fn {}({}) -> {} {{\n", d.name, ps, r)),
+                        None => out.push_str(&format!("fn {}({}) {{\n", d.name, ps)),
+                    }
+                    out.push_str(&self.stmts_to_string(&d.body, indent + 1));
+                    out.push_str(&prefix);
+                    out.push_str("}\n");
+                }
+                _ => {
+                    out.push_str("// ...\n");
+                }
+            }
+        }
+        out
+    }
+
+    /// Simple expression to string (for LLM prompts).
+    fn expr_to_string(&self, expr: &Expr) -> String {
+        match expr {
+            Expr::IntLit(n) => format!("{}", n),
+            Expr::FloatLit(n) => format!("{}", n),
+            Expr::BoolLit(b) => format!("{}", b),
+            Expr::StringLit(s) => format!("\"{}\"", s),
+            Expr::CharLit(c) => format!("'{}'", c),
+            Expr::Ident(name) => name.clone(),
+            Expr::Binary(l, op, r) => {
+                let op_str = match op {
+                    BinOp::Add => "+", BinOp::Sub => "-", BinOp::Mul => "*",
+                    BinOp::Div => "/", BinOp::Rem => "%", BinOp::Pow => "**",
+                    BinOp::Eq => "==", BinOp::Ne => "!=",
+                    BinOp::Lt => "<", BinOp::Gt => ">", BinOp::Le => "<=", BinOp::Ge => ">=",
+                    BinOp::And => "&&", BinOp::Or => "||",
+                    _ => "?",
+                };
+                format!("{} {} {}", self.expr_to_string(l), op_str, self.expr_to_string(r))
+            }
+            Expr::Call(f, args) => {
+                let args_str = args.iter().map(|a| self.expr_to_string(a)).collect::<Vec<_>>().join(", ");
+                format!("{}({})", self.expr_to_string(f), args_str)
+            }
+            Expr::If(cond, then_b, else_b) => {
+                let t: String = if then_b.is_empty() { "...".into() } else { "{ ... }".into() };
+                let e = if else_b.is_some() { " else { ... }" } else { "" };
+                format!("if {} {}{}", self.expr_to_string(cond), t, e)
+            }
+            _ => "...".into(),
         }
     }
 

@@ -92,6 +92,14 @@ fn format_stmt(stmt: &Stmt, indent: usize) -> String {
             let rhs = expr.as_ref().map(|e| format!(" = {}", format_expr(e))).unwrap_or_default();
             format!("{}let {}{}{}", prefix, name, ann, rhs)
         }
+        Stmt::Const(name, typ, expr, _vis) => {
+            let ann = typ.as_ref().map(|t| format!(": {}", t)).unwrap_or_default();
+            format!("{}const {}{} = {}", prefix, name, ann, format_expr(expr))
+        }
+        Stmt::Static(name, typ, expr, _vis) => {
+            let ann = typ.as_ref().map(|t| format!(": {}", t)).unwrap_or_default();
+            format!("{}static {}{} = {}", prefix, name, ann, format_expr(expr))
+        }
         Stmt::Assign(lhs, rhs) => {
             format!("{}{} = {}", prefix, format_expr(lhs), format_expr(rhs))
         }
@@ -214,6 +222,18 @@ fn format_stmt(stmt: &Stmt, indent: usize) -> String {
             s.push_str(&format!("{}}}", prefix));
             s
         }
+        Stmt::MacroDef(def) => {
+            format!("{}macro! {} {{ ... }}", prefix, def.name)
+        }
+        Stmt::DeriveDecl(target, traits) => {
+            format!("{}derive({}) for {}", prefix, traits.join(", "), target)
+        }
+        Stmt::Generate(_) => {
+            format!("{}generate {{ ... }}", prefix)
+        }
+        Stmt::Optimize(decl) => {
+            format!("{}optimize fn {}", prefix, decl.name)
+        }
     }
 }
 
@@ -332,6 +352,9 @@ fn format_expr(expr: &Expr) -> String {
         Expr::MoveExpr(inner) => format!("move {}", format_expr(inner)),
         Expr::Borrow(inner) => format!("borrow {}", format_expr(inner)),
         Expr::Await(inner) => format!("await {}", format_expr(inner)),
+        Expr::MacroInvoc(invoc) => {
+            format!("{}!(...)", invoc.name)
+        }
     }
 }
 

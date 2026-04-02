@@ -431,7 +431,10 @@ impl Compiler {
             | Stmt::Mod(_, _) | Stmt::Use(_) | Stmt::TryCatch(_, _, _)
             | Stmt::Throw(_) | Stmt::Proof(_, _) | Stmt::Spawn(_)
             | Stmt::DropStmt(_) | Stmt::SpawnNamed(_, _)
-            | Stmt::AsyncFnDecl(_) | Stmt::Select(_) => Ok(()),
+            | Stmt::AsyncFnDecl(_) | Stmt::Select(_)
+            | Stmt::Const(_, _, _, _) | Stmt::Static(_, _, _, _)
+            | Stmt::MacroDef(_) | Stmt::DeriveDecl(_, _)
+            | Stmt::Generate(_) | Stmt::Optimize(_) => Ok(()),
         }
     }
 
@@ -711,7 +714,7 @@ impl Compiler {
             Expr::Lambda(_, _) | Expr::Field(_, _) | Expr::Match(_, _)
             | Expr::StructInit(_, _) | Expr::MapLit(_) | Expr::EnumPath(_, _, _)
             | Expr::Wildcard | Expr::Own(_) | Expr::MoveExpr(_) | Expr::Borrow(_)
-            | Expr::Await(_) => {
+            | Expr::Await(_) | Expr::MacroInvoc(_) => {
                 chunk.emit(OpCode::Void);
                 Ok(())
             }

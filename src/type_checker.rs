@@ -357,7 +357,10 @@ impl TypeChecker {
             Stmt::StructDecl(_) | Stmt::EnumDecl(_) | Stmt::TraitDecl(_)
             | Stmt::ImplBlock(_) | Stmt::Intent(_, _) | Stmt::Verify(_, _)
             | Stmt::Mod(_, _) | Stmt::Use(_) | Stmt::DropStmt(_)
-            | Stmt::SpawnNamed(_, _) | Stmt::Select(_) => {}
+            | Stmt::SpawnNamed(_, _) | Stmt::Select(_)
+            | Stmt::Generate(_) | Stmt::Optimize(_)
+            | Stmt::Const(..) | Stmt::Static(..)
+            | Stmt::MacroDef(_) | Stmt::DeriveDecl(..) => {}
             Stmt::Assert(expr) => {
                 self.check_expr(expr, line, col);
             }
@@ -656,6 +659,7 @@ impl TypeChecker {
             Expr::Borrow(inner) => self.infer_expr(inner),
             Expr::Await(inner) => self.infer_expr(inner),
             Expr::Wildcard => CheckType::Unknown,
+            _ => CheckType::Unknown,  // MacroInvoc, etc.
         }
     }
 }

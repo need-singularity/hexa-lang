@@ -206,6 +206,12 @@ impl Lexer {
             return Ok(Token::Newline);
         }
 
+        // Dollar sign (used in macros): $ is its own token
+        if ch == '$' {
+            self.advance();
+            return Ok(Token::Ident("$".to_string()));
+        }
+
         // Identifiers and keywords
         if ch.is_alphabetic() || ch == '_' {
             let ident = self.read_ident();
@@ -258,6 +264,9 @@ impl Lexer {
                 if self.peek() == Some('=') {
                     self.advance();
                     Ok(Token::EqEq)
+                } else if self.peek() == Some('>') {
+                    self.advance();
+                    Ok(Token::FatArrow)
                 } else {
                     Ok(Token::Eq)
                 }

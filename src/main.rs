@@ -36,6 +36,10 @@ mod nanbox;
 mod formatter;
 #[allow(dead_code)]
 mod linter;
+#[allow(dead_code)]
+mod macro_expand;
+#[allow(dead_code)]
+mod llm;
 
 use std::io::{self, Write, BufRead};
 
