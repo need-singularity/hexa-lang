@@ -101,6 +101,8 @@ impl Parser {
             Token::Proof => self.parse_proof(),
             Token::Assert => self.parse_assert(),
             Token::Intent => self.parse_intent(),
+            Token::Try => self.parse_try_catch(),
+            Token::Throw => self.parse_throw(),
             _ => {
                 let expr = self.parse_expr()?;
                 // Check for assignment
@@ -183,6 +185,26 @@ impl Parser {
         }
         self.expect(&Token::RBrace)?;
         Ok(Stmt::Intent(name, strings))
+    }
+
+    fn parse_try_catch(&mut self) -> Result<Stmt, HexaError> {
+        self.advance(); // consume 'try'
+        let try_block = self.parse_block()?;
+        self.skip_newlines();
+        // Accept 'catch' or 'recover'
+        match self.peek() {
+            Token::Catch | Token::Recover => { self.advance(); }
+            _ => return Err(self.error(format!("expected 'catch' or 'recover' after try block, got {:?}", self.peek()))),
+        }
+        let err_name = self.expect_ident()?;
+        let catch_block = self.parse_block()?;
+        Ok(Stmt::TryCatch(try_block, err_name, catch_block))
+    }
+
+    fn parse_throw(&mut self) -> Result<Stmt, HexaError> {
+        self.advance(); // consume 'throw'
+        let expr = self.parse_expr()?;
+        Ok(Stmt::Throw(expr))
     }
 
     // ── Level 3: Declarations ───────────────────────────────
@@ -580,6 +602,33 @@ impl Parser {
         Ok(expr)
     }
 
+    fn parse_lambda(&mut self) -> Result<Expr, HexaError> {
+        self.advance(); // consume first |
+        let mut params = Vec::new();
+        // |x, y| body  OR  || body (no params)
+        if !matches!(self.peek(), Token::BitOr) {
+            loop {
+                let name = self.expect_ident()?;
+                params.push(Param { name, typ: None });
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+        }
+        self.expect(&Token::BitOr)?; // consume closing |
+        // Body can be a block or a single expression
+        let body_expr = if matches!(self.peek(), Token::LBrace) {
+            let block = self.parse_block()?;
+            // Return a Block expression
+            return Ok(Expr::Lambda(params, Box::new(Expr::Block(block))));
+        } else {
+            self.parse_expr()?
+        };
+        Ok(Expr::Lambda(params, Box::new(body_expr)))
+    }
+
     fn parse_args(&mut self) -> Result<Vec<Expr>, HexaError> {
         let mut args = Vec::new();
         if matches!(self.peek(), Token::RParen) {
@@ -607,7 +656,27 @@ impl Parser {
             Token::CharLit(c) => { self.advance(); Ok(Expr::CharLit(c)) }
             Token::Ident(name) => {
                 self.advance();
-                Ok(Expr::Ident(name))
+                // Check for struct instantiation: Name { field: val, ... }
+                // Only if name starts with uppercase (convention)
+                if matches!(self.peek(), Token::LBrace) && name.chars().next().map_or(false, |c| c.is_uppercase()) {
+                    self.advance(); // consume {
+                    self.skip_newlines();
+                    let mut fields = Vec::new();
+                    while !matches!(self.peek(), Token::RBrace | Token::Eof) {
+                        let field_name = self.expect_ident()?;
+                        self.expect(&Token::Colon)?;
+                        let field_val = self.parse_expr()?;
+                        fields.push((field_name, field_val));
+                        if matches!(self.peek(), Token::Comma) {
+                            self.advance();
+                        }
+                        self.skip_newlines();
+                    }
+                    self.expect(&Token::RBrace)?;
+                    Ok(Expr::StructInit(name, fields))
+                } else {
+                    Ok(Expr::Ident(name))
+                }
             }
             Token::LParen => {
                 self.advance();
@@ -643,6 +712,7 @@ impl Parser {
             }
             Token::If => self.parse_if_expr(),
             Token::Match => self.parse_match_expr(),
+            Token::BitOr => self.parse_lambda(),
             other => Err(self.error(format!("unexpected token in expression: {:?}", other))),
         }
     }

@@ -19,6 +19,8 @@ pub enum Expr {
     Match(Box<Expr>, Vec<MatchArm>),
     Block(Block),
     Range(Box<Expr>, Box<Expr>, bool), // start..end or start..=end
+    StructInit(String, Vec<(String, Expr)>),  // Name { field: val, ... }
+    MapLit(Vec<(Expr, Expr)>),  // { key: val, ... }
 }
 
 #[allow(dead_code)]
@@ -41,6 +43,8 @@ pub enum Stmt {
     Intent(String, Vec<String>),
     Mod(String, Vec<Stmt>),
     Use(Vec<String>),
+    TryCatch(Block, String, Block),  // try { ... } catch e { ... }
+    Throw(Expr),
 }
 
 // BinOp: 22 binary operators (24 total - 2 unary-only: ! ~)

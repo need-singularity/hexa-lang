@@ -15,6 +15,10 @@ pub enum Value {
     Tuple(Vec<Value>),
     Fn(String, Vec<String>, Vec<crate::ast::Stmt>), // name, param_names, body
     BuiltinFn(String),  // name of builtin
+    Struct(String, HashMap<String, Value>),  // name, fields
+    Lambda(Vec<String>, Vec<crate::ast::Stmt>, Vec<(String, Value)>), // params, body, captured env
+    Map(HashMap<String, Value>),  // key-value map
+    Error(String),  // error value for try/catch
 }
 
 impl std::fmt::Display for Value {
@@ -31,12 +35,30 @@ impl std::fmt::Display for Value {
             Value::Tuple(t) => write!(f, "({})", t.iter().map(|v| format!("{}", v)).collect::<Vec<_>>().join(", ")),
             Value::Fn(name, ..) => write!(f, "<fn {}>", name),
             Value::BuiltinFn(name) => write!(f, "<builtin {}>", name),
+            Value::Struct(name, fields) => {
+                write!(f, "{} {{ ", name)?;
+                for (i, (k, v)) in fields.iter().enumerate() {
+                    if i > 0 { write!(f, ", ")?; }
+                    write!(f, "{}: {}", k, v)?;
+                }
+                write!(f, " }}")
+            }
+            Value::Lambda(..) => write!(f, "<lambda>"),
+            Value::Map(map) => {
+                write!(f, "{{")?;
+                for (i, (k, v)) in map.iter().enumerate() {
+                    if i > 0 { write!(f, ", ")?; }
+                    write!(f, "{}: {}", k, v)?;
+                }
+                write!(f, "}}")
+            }
+            Value::Error(msg) => write!(f, "Error({})", msg),
         }
     }
 }
 
 pub struct Env {
-    scopes: Vec<HashMap<String, Value>>,
+    pub scopes: Vec<HashMap<String, Value>>,
 }
 
 impl Env {
@@ -51,6 +73,14 @@ impl Env {
         env.define("phi", Value::BuiltinFn("phi".into()));
         env.define("tau", Value::BuiltinFn("tau".into()));
         env.define("gcd", Value::BuiltinFn("gcd".into()));
+        env.define("read_file", Value::BuiltinFn("read_file".into()));
+        env.define("write_file", Value::BuiltinFn("write_file".into()));
+        env.define("file_exists", Value::BuiltinFn("file_exists".into()));
+        env.define("keys", Value::BuiltinFn("keys".into()));
+        env.define("values", Value::BuiltinFn("values".into()));
+        env.define("has_key", Value::BuiltinFn("has_key".into()));
+        env.define("to_string", Value::BuiltinFn("to_string".into()));
+        env.define("to_int", Value::BuiltinFn("to_int".into()));
         env
     }
 
