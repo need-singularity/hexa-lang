@@ -42,7 +42,8 @@ pub enum Stmt {
     Loop(Block),
     Proof(String, Block),
     Assert(Expr),
-    Intent(String, Vec<String>),
+    Intent(String, Vec<(String, Expr)>),  // description, key-value fields
+    Verify(String, Block),                // name, assertion block
     Mod(String, Vec<Stmt>),
     Use(Vec<String>),
     TryCatch(Block, String, Block),  // try { ... } catch e { ... }

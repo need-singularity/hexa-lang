@@ -469,6 +469,7 @@ impl VM {
                     Value::Map(_) => "map",
                     Value::Error(_) => "error",
                     Value::EnumVariant(name, _, _) => name.as_str(),
+                    Value::Intent(_) => "intent",
                     Value::Sender(_) => "sender",
                     Value::Receiver(_) => "receiver",
                 };

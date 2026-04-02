@@ -427,9 +427,9 @@ impl Compiler {
             }
             // Not supported in VM
             Stmt::StructDecl(_) | Stmt::EnumDecl(_) | Stmt::TraitDecl(_)
-            | Stmt::ImplBlock(_) | Stmt::Intent(_, _) | Stmt::Mod(_, _)
-            | Stmt::Use(_) | Stmt::TryCatch(_, _, _) | Stmt::Throw(_)
-            | Stmt::Proof(_, _) | Stmt::Spawn(_) => Ok(()),
+            | Stmt::ImplBlock(_) | Stmt::Intent(_, _) | Stmt::Verify(_, _)
+            | Stmt::Mod(_, _) | Stmt::Use(_) | Stmt::TryCatch(_, _, _)
+            | Stmt::Throw(_) | Stmt::Proof(_, _) | Stmt::Spawn(_) => Ok(()),
         }
     }
 

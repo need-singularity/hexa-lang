@@ -295,8 +295,8 @@ impl TypeChecker {
                 self.pop_scope();
             }
             Stmt::StructDecl(_) | Stmt::EnumDecl(_) | Stmt::TraitDecl(_)
-            | Stmt::ImplBlock(_) | Stmt::Intent(_, _) | Stmt::Mod(_, _)
-            | Stmt::Use(_) => {}
+            | Stmt::ImplBlock(_) | Stmt::Intent(_, _) | Stmt::Verify(_, _)
+            | Stmt::Mod(_, _) | Stmt::Use(_) => {}
             Stmt::Assert(expr) => {
                 self.check_expr(expr, line, col);
             }

@@ -288,7 +288,58 @@ impl Interpreter {
                 }
                 Ok(Value::Void)
             }
-            Stmt::Intent(_, _) => Ok(Value::Void),
+            Stmt::Intent(description, fields) => {
+                let mut map = HashMap::new();
+                map.insert("description".to_string(), Value::Str(description.clone()));
+                for (key, expr) in fields {
+                    let val = self.eval_expr(expr)?;
+                    map.insert(key.clone(), val);
+                }
+                // Print structured experiment plan
+                println!("=== Intent: {} ===", description);
+                for (key, val) in &map {
+                    if key != "description" {
+                        println!("  {}: {}", key, val);
+                    }
+                }
+                // Store as a variable named by the description (or __intent__)
+                let intent_val = Value::Intent(map);
+                self.env.define("__intent__", intent_val.clone());
+                Ok(intent_val)
+            }
+            Stmt::Verify(name, body) => {
+                let total = body.iter().filter(|s| matches!(s, Stmt::Assert(_))).count();
+                let mut passed = 0usize;
+                let mut failed = false;
+                self.env.push_scope();
+                for s in body {
+                    match self.exec_stmt(s) {
+                        Ok(_) => {
+                            if matches!(s, Stmt::Assert(_)) {
+                                passed += 1;
+                            }
+                        }
+                        Err(e) => {
+                            println!("  FAIL {}: {}", name, e.message);
+                            failed = true;
+                            break;
+                        }
+                    }
+                    if self.return_value.is_some() || self.throw_value.is_some() {
+                        break;
+                    }
+                }
+                self.env.pop_scope();
+                if failed {
+                    println!("VERIFY {}: FAILED ({}/{} assertions passed)", name, passed, total);
+                    return Err(self.runtime_err(format!(
+                        "verify '{}' failed: {}/{} assertions passed", name, passed, total
+                    )));
+                } else {
+                    println!("VERIFY {}: OK ({}/{} assertions passed)", name, passed, total);
+                }
+                Ok(Value::Void)
+            }
             Stmt::Mod(name, body) => {
                 self.exec_mod(name, body)?;
                 Ok(Value::Void)
@@ -591,6 +642,11 @@ impl Interpreter {
                     Value::Map(map) => {
                         map.get(field_name).cloned().ok_or_else(|| {
                             self.runtime_err(format!("map has no key '{}'", field_name))
+                        })
+                    }
+                    Value::Intent(fields) => {
+                        fields.get(field_name).cloned().ok_or_else(|| {
+                            self.runtime_err(format!("intent has no field '{}'", field_name))
                         })
                     }
                     _ => {
@@ -1336,6 +1392,7 @@ impl Interpreter {
                         Value::Map(_) => "map",
                         Value::Error(_) => "error",
                         Value::EnumVariant(name, _, _) => name.as_str(),
+                        Value::Intent(_) => "intent",
                         Value::Sender(_) => "sender",
                         Value::Receiver(_) => "receiver",
                     }
@@ -1711,6 +1768,65 @@ impl Interpreter {
             "json_stringify" => {
                 if args.is_empty() { return Err(self.type_err("json_stringify() requires 1 argument".into())); }
                 Ok(Value::Str(stringify_json(&args[0])))
+            }
+            // ── Consciousness builtins (ANIMA Psi-Constants) ────────
+            "psi_coupling" => Ok(Value::Float(0.014)),
+            "psi_balance" => Ok(Value::Float(0.5)),
+            "psi_steps" => Ok(Value::Float(4.33)),
+            "psi_entropy" => Ok(Value::Float(0.998)),
+            "psi_frustration" => Ok(Value::Float(0.10)),
+            // ── Consciousness architecture formulas ──────────────────
+            "consciousness_max_cells" => {
+                // 1024 = tau^sopfr = 4^5
+                Ok(Value::Int(1024))
+            }
+            "consciousness_decoder_dim" => {
+                // 384 = (tau+sigma)*J2 = (4+12)*24
+                Ok(Value::Int(384))
+            }
+            "consciousness_phi" => {
+                // 71 = n*sigma - mu = 6*12 - 1
+                Ok(Value::Int(71))
+            }
+            // ── Hexad module info ────────────────────────────────────
+            "hexad_modules" => {
+                Ok(Value::Array(vec![
+                    Value::Str("C".into()), Value::Str("D".into()),
+                    Value::Str("S".into()), Value::Str("M".into()),
+                    Value::Str("W".into()), Value::Str("E".into()),
+                ]))
+            }
+            "hexad_right" => {
+                // Right brain: gradient-free (C, S, W)
+                Ok(Value::Array(vec![
+                    Value::Str("C".into()), Value::Str("S".into()), Value::Str("W".into()),
+                ]))
+            }
+            "hexad_left" => {
+                // Left brain: CE-trained (D, M, E)
+                Ok(Value::Array(vec![
+                    Value::Str("D".into()), Value::Str("M".into()), Value::Str("E".into()),
+                ]))
+            }
+            // ── Number theory: sopfr ─────────────────────────────────
+            "sopfr" => {
+                if args.is_empty() { return Err(self.type_err("sopfr() requires 1 argument".into())); }
+                if let Value::Int(n) = &args[0] {
+                    let mut sum = 0i64;
+                    let mut val = n.abs();
+                    let mut d = 2i64;
+                    while d * d <= val {
+                        while val % d == 0 {
+                            sum += d;
+                            val /= d;
+                        }
+                        d += 1;
+                    }
+                    if val > 1 { sum += val; }
+                    Ok(Value::Int(sum))
+                } else {
+                    Err(self.type_err("sopfr() requires int".into()))
+                }
             }
             _ => Err(HexaError {
                 class: ErrorClass::Name,
@@ -3697,5 +3813,221 @@ data["a"]["b"]"#;
             Value::Float(f) => assert!(f >= 0.0 && f <= 1.0),
             other => panic!("expected Float, got {:?}", other),
         }
+    }
+
+    // ── Phase 5: ANIMA Consciousness DSL tests ──────────────
+
+    #[test]
+    fn test_psi_coupling() {
+        match eval("psi_coupling()") {
+            Value::Float(f) => assert!((f - 0.014).abs() < 1e-10),
+            other => panic!("expected Float(0.014), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_psi_balance() {
+        match eval("psi_balance()") {
+            Value::Float(f) => assert!((f - 0.5).abs() < 1e-10),
+            other => panic!("expected Float(0.5), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_psi_steps() {
+        match eval("psi_steps()") {
+            Value::Float(f) => assert!((f - 4.33).abs() < 1e-10),
+            other => panic!("expected Float(4.33), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_psi_entropy() {
+        match eval("psi_entropy()") {
+            Value::Float(f) => assert!((f - 0.998).abs() < 1e-10),
+            other => panic!("expected Float(0.998), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_consciousness_max_cells() {
+        assert!(matches!(eval("consciousness_max_cells()"), Value::Int(1024)));
+    }
+
+    #[test]
+    fn test_consciousness_decoder_dim() {
+        assert!(matches!(eval("consciousness_decoder_dim()"), Value::Int(384)));
+    }
+
+    #[test]
+    fn test_consciousness_phi() {
+        assert!(matches!(eval("consciousness_phi()"), Value::Int(71)));
+    }
+
+    #[test]
+    fn test_hexad_modules() {
+        match eval("hexad_modules()") {
+            Value::Array(arr) => {
+                assert_eq!(arr.len(), 6);
+                assert!(matches!(&arr[0], Value::Str(s) if s == "C"));
+                assert!(matches!(&arr[5], Value::Str(s) if s == "E"));
+            }
+            other => panic!("expected Array, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_hexad_right_brain() {
+        match eval("hexad_right()") {
+            Value::Array(arr) => {
+                assert_eq!(arr.len(), 3);
+                assert!(matches!(&arr[0], Value::Str(s) if s == "C"));
+                assert!(matches!(&arr[1], Value::Str(s) if s == "S"));
+                assert!(matches!(&arr[2], Value::Str(s) if s == "W"));
+            }
+            other => panic!("expected Array, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_hexad_left_brain() {
+        match eval("hexad_left()") {
+            Value::Array(arr) => {
+                assert_eq!(arr.len(), 3);
+                assert!(matches!(&arr[0], Value::Str(s) if s == "D"));
+            }
+            other => panic!("expected Array, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_sopfr_builtin() {
+        assert!(matches!(eval("sopfr(6)"), Value::Int(5)));   // 6 = 2*3, sopfr = 2+3 = 5
+        assert!(matches!(eval("sopfr(12)"), Value::Int(7)));  // 12 = 2^2*3, sopfr = 2+2+3 = 7
+        assert!(matches!(eval("sopfr(1024)"), Value::Int(20))); // 1024 = 2^10, sopfr = 20
+    }
+
+    #[test]
+    fn test_intent_block_parsing_and_execution() {
+        let src = r#"
+intent "test experiment" {
+    cells: 64
+    steps: 300
+    topology: "ring"
+}
+"#;
+        match eval(src) {
+            Value::Intent(fields) => {
+                assert!(matches!(fields.get("cells"), Some(Value::Int(64))));
+                assert!(matches!(fields.get("steps"), Some(Value::Int(300))));
+                assert!(matches!(fields.get("description"), Some(Value::Str(s)) if s == "test experiment"));
+            }
+            other => panic!("expected Intent, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_intent_field_access() {
+        let src = r#"
+intent "phi test" {
+    cells: 64
+    measure: "phi"
+}
+let i = __intent__
+i.cells
+"#;
+        assert!(matches!(eval(src), Value::Int(64)));
+    }
+
+    #[test]
+    fn test_verify_block_pass() {
+        let src = r#"
+verify "basic_math" {
+    assert 1 + 1 == 2
+    assert 6 * 7 == 42
+}
+"#;
+        // Should not error
+        eval(src);
+    }
+
+    #[test]
+    fn test_verify_block_fail() {
+        let src = r#"
+verify "bad_math" {
+    assert 1 + 1 == 3
+}
+"#;
+        let tokens = Lexer::new(src).tokenize().unwrap();
+        let stmts = Parser::new(tokens).parse().unwrap();
+        let mut interp = Interpreter::new();
+        let result = interp.run(&stmts);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_verify_with_consciousness_constants() {
+        let src = r#"
+verify "psi_constants" {
+    let alpha = psi_coupling()
+    assert alpha > 0.0
+    assert alpha < 1.0
+    let balance = psi_balance()
+    assert balance == 0.5
+}
+"#;
+        eval(src);
+    }
+
+    #[test]
+    fn test_n6_consciousness_formulas() {
+        // tau(6)^sopfr(6) = 4^5 = 1024 = consciousness_max_cells
+        let src = "pow(tau(6), sopfr(6))";
+        assert!(matches!(eval(src), Value::Int(1024)));
+
+        // (tau(6) + sigma(6)) * 24 = 16 * 24 = 384 = decoder_dim
+        let src2 = "(tau(6) + sigma(6)) * 24";
+        assert!(matches!(eval(src2), Value::Int(384)));
+    }
+
+    #[test]
+    fn test_consciousness_mod_pattern() {
+        let src = r#"
+mod consciousness {
+    pub let cells = 64
+    pub let factions = 12
+    pub let coupling = 0.014
+}
+consciousness::cells
+"#;
+        assert!(matches!(eval(src), Value::Int(64)));
+    }
+
+    #[test]
+    fn test_run_consciousness_laws_example() {
+        let source = std::fs::read_to_string("examples/consciousness_laws.hexa").unwrap();
+        let tokens = Lexer::new(&source).tokenize().unwrap();
+        let stmts = Parser::new(tokens).parse().unwrap();
+        let mut interp = Interpreter::new();
+        interp.test_mode = true;
+        interp.run(&stmts).unwrap();
+    }
+
+    #[test]
+    fn test_run_n6_consciousness_example() {
+        let source = std::fs::read_to_string("examples/n6_consciousness.hexa").unwrap();
+        let tokens = Lexer::new(&source).tokenize().unwrap();
+        let stmts = Parser::new(tokens).parse().unwrap();
+        let mut interp = Interpreter::new();
+        interp.run(&stmts).unwrap();
+    }
+
+    #[test]
+    fn test_run_intent_experiment_example() {
+        let source = std::fs::read_to_string("examples/intent_experiment.hexa").unwrap();
+        let tokens = Lexer::new(&source).tokenize().unwrap();
+        let stmts = Parser::new(tokens).parse().unwrap();
+        let mut interp = Interpreter::new();
+        interp.run(&stmts).unwrap();
     }
 }

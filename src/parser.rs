@@ -150,6 +150,7 @@ impl Parser {
             Token::Proof => self.parse_proof(),
             Token::Assert => self.parse_assert(),
             Token::Intent => self.parse_intent(),
+            Token::Verify => self.parse_verify(),
             Token::Mod => self.parse_mod_decl(),
             Token::Use => self.parse_use_decl(),
             Token::Try => self.parse_try_catch(),
@@ -224,19 +225,40 @@ impl Parser {
 
     fn parse_intent(&mut self) -> Result<Stmt, HexaError> {
         self.advance(); // consume 'intent'
-        let name = self.expect_ident()?;
+        // intent "description" { key: value, ... }
+        let description = match self.peek().clone() {
+            Token::StringLit(s) => { self.advance(); s }
+            Token::Ident(_) => { self.expect_ident()? }
+            _ => return Err(self.error(format!("expected string or identifier after 'intent', got {:?}", self.peek()))),
+        };
         self.expect(&Token::LBrace)?;
         self.skip_newlines();
-        let mut strings = Vec::new();
+        let mut fields = Vec::new();
         while !matches!(self.peek(), Token::RBrace | Token::Eof) {
-            match self.advance() {
-                Token::StringLit(s) => strings.push(s),
-                Token::Newline | Token::Comma => {}
-                other => return Err(self.error(format!("expected string in intent, got {:?}", other))),
+            let key = self.expect_ident()?;
+            self.expect(&Token::Colon)?;
+            let value = self.parse_expr()?;
+            fields.push((key, value));
+            // consume optional comma or newline
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
             }
+            self.skip_newlines();
         }
         self.expect(&Token::RBrace)?;
-        Ok(Stmt::Intent(name, strings))
+        Ok(Stmt::Intent(description, fields))
+    }
+
+    fn parse_verify(&mut self) -> Result<Stmt, HexaError> {
+        self.advance(); // consume 'verify'
+        // verify "name" { ... } or verify name { ... }
+        let name = match self.peek().clone() {
+            Token::StringLit(s) => { self.advance(); s }
+            Token::Ident(_) => { self.expect_ident()? }
+            _ => return Err(self.error(format!("expected string or identifier after 'verify', got {:?}", self.peek()))),
+        };
+        let body = self.parse_block()?;
+        Ok(Stmt::Verify(name, body))
     }
 
     fn parse_try_catch(&mut self) -> Result<Stmt, HexaError> {

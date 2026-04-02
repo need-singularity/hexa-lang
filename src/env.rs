@@ -21,6 +21,7 @@ pub enum Value {
     Map(HashMap<String, Value>),  // key-value map
     Error(String),  // error value for try/catch
     EnumVariant(String, String, Option<Box<Value>>),  // enum_name, variant_name, data
+    Intent(HashMap<String, Value>),  // consciousness experiment declaration
     Sender(Arc<Mutex<mpsc::Sender<Value>>>),    // channel sender
     Receiver(Arc<Mutex<mpsc::Receiver<Value>>>), // channel receiver
 }
@@ -48,6 +49,14 @@ impl std::fmt::Display for Value {
                 write!(f, " }}")
             }
             Value::Lambda(..) => write!(f, "<lambda>"),
+            Value::Intent(fields) => {
+                write!(f, "intent {{ ")?;
+                for (i, (k, v)) in fields.iter().enumerate() {
+                    if i > 0 { write!(f, ", ")?; }
+                    write!(f, "{}: {}", k, v)?;
+                }
+                write!(f, " }}")
+            }
             Value::Map(map) => {
                 write!(f, "{{")?;
                 for (i, (k, v)) in map.iter().enumerate() {
@@ -134,6 +143,22 @@ impl Env {
         // JSON builtins
         env.define("json_parse", Value::BuiltinFn("json_parse".into()));
         env.define("json_stringify", Value::BuiltinFn("json_stringify".into()));
+        // Consciousness builtins (ANIMA Psi-Constants)
+        env.define("psi_coupling", Value::BuiltinFn("psi_coupling".into()));
+        env.define("psi_balance", Value::BuiltinFn("psi_balance".into()));
+        env.define("psi_steps", Value::BuiltinFn("psi_steps".into()));
+        env.define("psi_entropy", Value::BuiltinFn("psi_entropy".into()));
+        env.define("psi_frustration", Value::BuiltinFn("psi_frustration".into()));
+        // Consciousness architecture formulas
+        env.define("consciousness_max_cells", Value::BuiltinFn("consciousness_max_cells".into()));
+        env.define("consciousness_decoder_dim", Value::BuiltinFn("consciousness_decoder_dim".into()));
+        env.define("consciousness_phi", Value::BuiltinFn("consciousness_phi".into()));
+        // Hexad module info
+        env.define("hexad_modules", Value::BuiltinFn("hexad_modules".into()));
+        env.define("hexad_right", Value::BuiltinFn("hexad_right".into()));
+        env.define("hexad_left", Value::BuiltinFn("hexad_left".into()));
+        // Number theory: sopfr (sum of prime factors with repetition)
+        env.define("sopfr", Value::BuiltinFn("sopfr".into()));
         env
 
     }
