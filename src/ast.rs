@@ -47,6 +47,7 @@ pub enum Stmt {
     Use(Vec<String>),
     TryCatch(Block, String, Block),  // try { ... } catch e { ... }
     Throw(Expr),
+    Spawn(Block),  // spawn { ... } — concurrent execution
 }
 
 // BinOp: 22 binary operators (24 total - 2 unary-only: ! ~)

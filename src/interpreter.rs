@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
 use crate::ast::*;
 use crate::env::{Env, Value};
 use crate::error::{HexaError, ErrorClass};
@@ -35,6 +37,8 @@ pub struct Interpreter {
     pub current_col: usize,
     /// Directory of the currently executing file (for resolving `use` paths).
     pub source_dir: Option<String>,
+    /// Join handles for spawned threads.
+    spawn_handles: Vec<thread::JoinHandle<()>>,
 }
 
 /// Stored data for a loaded/declared module.
@@ -62,6 +66,7 @@ impl Interpreter {
             current_line: 0,
             current_col: 0,
             source_dir: None,
+            spawn_handles: Vec::new(),
         }
     }
 
@@ -72,13 +77,16 @@ impl Interpreter {
         for stmt in stmts {
             last = self.exec_stmt(stmt)?;
             if self.return_value.is_some() {
+                self.join_spawned();
                 return Ok(self.return_value.take().unwrap());
             }
             if self.throw_value.is_some() {
+                self.join_spawned();
                 let err = self.throw_value.take().unwrap();
                 return Err(self.runtime_err(format!("uncaught error: {}", err)));
             }
         }
+        self.join_spawned();
         Ok(last)
     }
 
@@ -93,14 +101,24 @@ impl Interpreter {
             }
             last = self.exec_stmt(stmt)?;
             if self.return_value.is_some() {
+                self.join_spawned();
                 return Ok(self.return_value.take().unwrap());
             }
             if self.throw_value.is_some() {
+                self.join_spawned();
                 let err = self.throw_value.take().unwrap();
                 return Err(self.runtime_err(format!("uncaught error: {}", err)));
             }
         }
+        self.join_spawned();
         Ok(last)
+    }
+
+    /// Wait for all spawned threads to complete.
+    pub fn join_spawned(&mut self) {
+        for handle in self.spawn_handles.drain(..) {
+            let _ = handle.join();
+        }
     }
 
     // ── Statement execution ─────────────────────────────────
@@ -325,6 +343,39 @@ impl Interpreter {
                     other => Value::Error(format!("{}", other)),
                 };
                 self.throw_value = Some(err_val);
+                Ok(Value::Void)
+            }
+            Stmt::Spawn(body) => {
+                // Clone the body statements for the thread
+                let body = body.clone();
+                // Capture current environment values for the spawned thread
+                let captured_env = self.capture_env_for_spawn();
+                // Clone struct/enum defs and type methods for the spawned thread
+                let struct_defs = self.struct_defs.clone();
+                let enum_defs = self.enum_defs.clone();
+                let type_methods = self.type_methods.clone();
+
+                let handle = thread::spawn(move || {
+                    let mut interp = Interpreter::new();
+                    interp.struct_defs = struct_defs;
+                    interp.enum_defs = enum_defs;
+                    interp.type_methods = type_methods;
+                    // Restore captured environment
+                    for (name, val) in captured_env {
+                        interp.env.define(&name, val);
+                    }
+                    // Execute the body; ignore errors (thread panics are caught by join)
+                    for stmt in &body {
+                        if let Err(e) = interp.exec_stmt(stmt) {
+                            eprintln!("[spawn] error: {}", e);
+                            break;
+                        }
+                        if interp.return_value.is_some() || interp.throw_value.is_some() {
+                            break;
+                        }
+                    }
+                });
+                self.spawn_handles.push(handle);
                 Ok(Value::Void)
             }
         }
@@ -902,6 +953,38 @@ impl Interpreter {
                     Err(self.runtime_err(format!("no method .{}() on struct {}", method, struct_name)))
                 }
             }
+            Value::Sender(tx) => {
+                match method {
+                    "send" => {
+                        if args.is_empty() { return Err(self.type_err("send() requires 1 argument".into())); }
+                        let val = args.into_iter().next().unwrap();
+                        let tx = tx.lock().unwrap();
+                        tx.send(val).map_err(|_| self.runtime_err("channel closed".into()))?;
+                        Ok(Value::Void)
+                    }
+                    _ => Err(self.runtime_err(format!("no method .{}() on sender", method))),
+                }
+            }
+            Value::Receiver(rx) => {
+                match method {
+                    "recv" => {
+                        let rx = rx.lock().unwrap();
+                        match rx.recv() {
+                            Ok(val) => Ok(val),
+                            Err(_) => Err(self.runtime_err("channel closed".into())),
+                        }
+                    }
+                    "try_recv" => {
+                        let rx = rx.lock().unwrap();
+                        match rx.try_recv() {
+                            Ok(val) => Ok(Value::EnumVariant("Option".into(), "Some".into(), Some(Box::new(val)))),
+                            Err(mpsc::TryRecvError::Empty) => Ok(Value::EnumVariant("Option".into(), "None".into(), None)),
+                            Err(mpsc::TryRecvError::Disconnected) => Ok(Value::EnumVariant("Option".into(), "None".into(), None)),
+                        }
+                    }
+                    _ => Err(self.runtime_err(format!("no method .{}() on receiver", method))),
+                }
+            }
             _ => Err(self.runtime_err(format!("no method .{}() on {:?}", method, obj))),
         }
     }
@@ -1125,6 +1208,8 @@ impl Interpreter {
                         Value::Map(_) => "map",
                         Value::Error(_) => "error",
                         Value::EnumVariant(name, _, _) => name.as_str(),
+                        Value::Sender(_) => "sender",
+                        Value::Receiver(_) => "receiver",
                     }
                     .to_string(),
                 ))
@@ -1440,6 +1525,13 @@ impl Interpreter {
                 if args.len() != 1 { return Err(self.type_err("Err() requires 1 argument".into())); }
                 Ok(Value::EnumVariant("Result".into(), "Err".into(), Some(Box::new(args.into_iter().next().unwrap()))))
             }
+            // ── Concurrency builtins ──────────────────────────────────
+            "channel" => {
+                let (tx, rx) = mpsc::channel::<Value>();
+                let sender = Value::Sender(Arc::new(Mutex::new(tx)));
+                let receiver = Value::Receiver(Arc::new(Mutex::new(rx)));
+                Ok(Value::Tuple(vec![sender, receiver]))
+            }
             _ => Err(HexaError {
                 class: ErrorClass::Name,
                 message: format!("unknown builtin: {}", name),
@@ -1732,6 +1824,20 @@ impl Interpreter {
         for scope in self.env.scopes.iter() {
             for (k, v) in scope {
                 // Don't capture builtins
+                if !matches!(v, Value::BuiltinFn(_)) {
+                    captured.push((k.clone(), v.clone()));
+                }
+            }
+        }
+        captured
+    }
+
+    /// Capture environment for spawn -- includes user-defined variables
+    /// (builtins are already registered in the spawned Interpreter::new()).
+    fn capture_env_for_spawn(&self) -> Vec<(String, Value)> {
+        let mut captured = Vec::new();
+        for scope in self.env.scopes.iter() {
+            for (k, v) in scope {
                 if !matches!(v, Value::BuiltinFn(_)) {
                     captured.push((k.clone(), v.clone()));
                 }
@@ -2936,5 +3042,131 @@ mylib::double(6) + mylib::MAGIC
             Value::Float(f) => assert!((f - 5.0).abs() < 1e-10),
             other => panic!("expected Float(5.0), got {:?}", other),
         }
+    }
+
+    // ── Feature: Concurrency (spawn + channel) ──────────────
+
+    #[test]
+    fn test_spawn_basic() {
+        // spawn block should execute without error; main continues
+        let src = "let x = 1\nspawn {\n  let y = 2\n}\nx";
+        assert!(matches!(eval(src), Value::Int(1)));
+    }
+
+    #[test]
+    fn test_channel_send_recv() {
+        // channel() returns a tuple, send on tx, recv on rx
+        let src = r#"
+let pair = channel()
+let tx = pair[0]
+let rx = pair[1]
+spawn {
+    tx.send(42)
+}
+rx.recv()
+"#;
+        assert!(matches!(eval(src), Value::Int(42)));
+    }
+
+    #[test]
+    fn test_channel_multiple_values() {
+        // Send multiple values through channel
+        let src = r#"
+let pair = channel()
+let tx = pair[0]
+let rx = pair[1]
+spawn {
+    tx.send(10)
+    tx.send(20)
+    tx.send(30)
+}
+let a = rx.recv()
+let b = rx.recv()
+let c = rx.recv()
+a + b + c
+"#;
+        assert!(matches!(eval(src), Value::Int(60)));
+    }
+
+    #[test]
+    fn test_channel_string_values() {
+        // Channels can transmit any Value type
+        let src = r#"
+let pair = channel()
+let tx = pair[0]
+let rx = pair[1]
+spawn {
+    tx.send("hello from spawn")
+}
+rx.recv()
+"#;
+        assert!(matches!(eval(src), Value::Str(s) if s == "hello from spawn"));
+    }
+
+    #[test]
+    fn test_spawn_captures_env() {
+        // Spawned block should see variables from outer scope
+        let src = r#"
+let factor = 6
+let pair = channel()
+let tx = pair[0]
+let rx = pair[1]
+spawn {
+    tx.send(factor * 7)
+}
+rx.recv()
+"#;
+        assert!(matches!(eval(src), Value::Int(42)));
+    }
+
+    #[test]
+    fn test_channel_try_recv() {
+        // try_recv returns None when no value available
+        let src = r#"
+let pair = channel()
+let tx = pair[0]
+let rx = pair[1]
+let result = rx.try_recv()
+result.is_none()
+"#;
+        assert!(matches!(eval(src), Value::Bool(true)));
+    }
+
+    #[test]
+    fn test_multiple_spawns_with_channel() {
+        // Multiple spawned tasks can send to the same channel
+        let src = r#"
+let pair = channel()
+let tx = pair[0]
+let rx = pair[1]
+spawn {
+    tx.send(1)
+}
+spawn {
+    tx.send(2)
+}
+let a = rx.recv()
+let b = rx.recv()
+a + b
+"#;
+        assert!(matches!(eval(src), Value::Int(3)));
+    }
+
+    #[test]
+    fn test_spawn_with_function() {
+        // Spawned block can call user-defined functions
+        let src = r#"
+fn double(x) {
+    return x * 2
+}
+let pair = channel()
+let tx = pair[0]
+let rx = pair[1]
+spawn {
+    tx.send(double(21))
+}
+rx.recv()
+"#;
+        assert!(matches!(eval(src), Value::Int(42)));
     }
 }

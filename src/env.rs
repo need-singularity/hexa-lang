@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex, mpsc};
 
 #[derive(Debug, Clone)]
 pub enum Value {
@@ -20,6 +21,8 @@ pub enum Value {
     Map(HashMap<String, Value>),  // key-value map
     Error(String),  // error value for try/catch
     EnumVariant(String, String, Option<Box<Value>>),  // enum_name, variant_name, data
+    Sender(Arc<Mutex<mpsc::Sender<Value>>>),    // channel sender
+    Receiver(Arc<Mutex<mpsc::Receiver<Value>>>), // channel receiver
 }
 
 impl std::fmt::Display for Value {
@@ -60,6 +63,8 @@ impl std::fmt::Display for Value {
                     None => write!(f, "{}::{}", enum_name, variant),
                 }
             }
+            Value::Sender(_) => write!(f, "<sender>"),
+            Value::Receiver(_) => write!(f, "<receiver>"),
         }
     }
 }
@@ -118,7 +123,10 @@ impl Env {
         env.define("None", Value::EnumVariant("Option".into(), "None".into(), None));
         env.define("Ok", Value::BuiltinFn("Ok".into()));
         env.define("Err", Value::BuiltinFn("Err".into()));
+        // Concurrency builtins
+        env.define("channel", Value::BuiltinFn("channel".into()));
         env
+
     }
 
     pub fn push_scope(&mut self) { self.scopes.push(HashMap::new()); }

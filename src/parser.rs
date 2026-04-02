@@ -152,6 +152,7 @@ impl Parser {
             Token::Use => self.parse_use_decl(),
             Token::Try => self.parse_try_catch(),
             Token::Throw => self.parse_throw(),
+            Token::Spawn => self.parse_spawn(),
             _ => {
                 let expr = self.parse_expr()?;
                 // Check for assignment
@@ -254,6 +255,12 @@ impl Parser {
         self.advance(); // consume 'throw'
         let expr = self.parse_expr()?;
         Ok(Stmt::Throw(expr))
+    }
+
+    fn parse_spawn(&mut self) -> Result<Stmt, HexaError> {
+        self.advance(); // consume 'spawn'
+        let body = self.parse_block()?;
+        Ok(Stmt::Spawn(body))
     }
 
     fn parse_mod_decl(&mut self) -> Result<Stmt, HexaError> {
@@ -823,6 +830,11 @@ impl Parser {
             Token::If => self.parse_if_expr(),
             Token::Match => self.parse_match_expr(),
             Token::BitOr => self.parse_lambda(),
+            // Channel keyword used as expression resolves to the builtin function
+            Token::Channel => {
+                self.advance();
+                Ok(Expr::Ident("channel".into()))
+            }
             other => Err(self.error(format!("unexpected token in expression: {:?}", other))),
         }
     }

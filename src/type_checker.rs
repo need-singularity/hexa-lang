@@ -322,6 +322,13 @@ impl TypeChecker {
             Stmt::Throw(expr) => {
                 self.check_expr(expr, line, col);
             }
+            Stmt::Spawn(body) => {
+                self.push_scope();
+                for s in body {
+                    self.check_stmt(s, line, col);
+                }
+                self.pop_scope();
+            }
         }
     }
 
@@ -374,7 +381,7 @@ impl TypeChecker {
                 }
                 // Recurse into blocks
                 Stmt::For(_, _, body) | Stmt::While(_, body) | Stmt::Loop(body)
-                | Stmt::Proof(_, body) => {
+                | Stmt::Proof(_, body) | Stmt::Spawn(body) => {
                     self.collect_return_types(body, out);
                 }
                 Stmt::Expr(Expr::If(_, then_block, else_block)) => {
