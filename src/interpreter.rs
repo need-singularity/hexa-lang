@@ -975,7 +975,6 @@ impl Interpreter {
                 Err(self.runtime_err(format!("undefined enum, type, or module: {}", enum_name)))
             }
             Expr::Own(inner) => {
-                use crate::env::OwnershipState;
                 let val = self.eval_expr(inner)?;
                 // If the inner expr is an ident, mark it as Owned after defining
                 // But own is usually used in: let x = own [1,2,3]
