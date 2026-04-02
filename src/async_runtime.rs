@@ -389,6 +389,57 @@ impl Drop for Scheduler {
     }
 }
 
+// ── Task group (structured concurrency) ─────────────────────
+
+/// A group of tasks that must all complete before a scope exits.
+/// Implements structured concurrency: spawns inside a `scope` block
+/// are tracked, and the scope blocks until all complete or one fails.
+#[derive(Clone, Debug)]
+pub struct TaskGroup {
+    /// Futures for all tasks spawned within this scope.
+    pub futures: Vec<HexaFuture>,
+}
+
+impl TaskGroup {
+    /// Create a new empty task group.
+    pub fn new() -> Self {
+        Self { futures: Vec::new() }
+    }
+
+    /// Register a future (from a spawned task) with this group.
+    pub fn add(&mut self, future: HexaFuture) {
+        self.futures.push(future);
+    }
+
+    /// Wait for all tasks in the group to complete.
+    /// Returns the collected results in spawn order.
+    /// If any task returns an Error value, remaining tasks are cancelled
+    /// (their results are ignored) and the error is propagated.
+    pub fn wait_all(&self, timeout: Option<Duration>) -> Result<Vec<Value>, String> {
+        let mut results = Vec::with_capacity(self.futures.len());
+        for fut in &self.futures {
+            match fut.wait(timeout) {
+                Some(Value::Error(e)) => {
+                    return Err(e);
+                }
+                Some(val) => results.push(val),
+                None => {
+                    return Err("scope: task timed out".into());
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    /// Cancel all tasks in the group (best-effort).
+    /// Since green threads run to completion on worker threads, "cancel" means
+    /// we stop waiting and discard results.
+    pub fn cancel(&self) {
+        // In this cooperative scheduler, tasks run to completion.
+        // Cancellation means we don't wait for or use their results.
+    }
+}
+
 // ── Select events ───────────────────────────────────────────
 
 /// An event that a `select` statement can wait on.
