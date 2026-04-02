@@ -41,6 +41,11 @@ pub mod memory;
 pub mod ownership;
 #[allow(dead_code)]
 pub mod dream;
+#[allow(dead_code)]
+pub mod inline_cache;
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+pub mod escape_analysis;
 
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
@@ -66,6 +71,9 @@ pub mod codegen_wgsl;
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 pub mod llm;
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+pub mod std_net;
 
 // WASM entry points
 #[cfg(target_arch = "wasm32")]

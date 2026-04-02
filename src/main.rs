@@ -54,9 +54,17 @@ mod memory;
 mod ownership;
 #[allow(dead_code)]
 mod dream;
+#[allow(dead_code)]
+mod inline_cache;
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+mod escape_analysis;
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 mod async_runtime;
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+mod std_net;
 
 use std::io::{self, Write, BufRead};
 

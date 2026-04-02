@@ -15,6 +15,7 @@ use cranelift_module::{FuncId, Linkage, Module};
 
 use crate::ast::*;
 use crate::error::{ErrorClass, HexaError};
+use crate::escape_analysis::{self, Allocation, EscapeInfo};
 
 /// All values in JIT are 8 bytes (i64).
 const SLOT_SIZE: i64 = 8;
@@ -207,6 +208,8 @@ pub struct JitCompiler {
     impl_methods: HashMap<String, HashMap<String, FnDecl>>,
     /// Pre-compiled lambda infos (shared across all function translations).
     lambda_infos: Vec<LambdaInfo>,
+    /// Escape analysis results: fn_name -> EscapeInfo.
+    escape_info: HashMap<String, EscapeInfo>,
 }
 
 impl JitCompiler {
@@ -281,6 +284,7 @@ impl JitCompiler {
             enum_layouts: HashMap::new(),
             impl_methods: HashMap::new(),
             lambda_infos: Vec::new(),
+            escape_info: HashMap::new(),
         })
     }
 
@@ -306,6 +310,9 @@ impl JitCompiler {
                 _ => {}
             }
         }
+
+        // Pass 0b: run escape analysis on all functions.
+        self.escape_info = escape_analysis::analyze_program(stmts);
 
         // Pass 1: declare all functions (so recursive/mutual calls work).
         for stmt in stmts {
@@ -459,6 +466,11 @@ impl JitCompiler {
 
             // Pass pre-compiled lambda info to the translator.
             trans.lambdas = self.lambda_infos.clone();
+
+            // Attach escape analysis results for this function.
+            if let Some(ei) = self.escape_info.get(&decl.name) {
+                trans.escape_info = Some(ei.clone());
+            }
 
             // If this is an impl method, track `self` as the struct type.
             if let Some(ref st) = self_type {
@@ -626,6 +638,11 @@ impl JitCompiler {
             );
             trans.lambdas = self.lambda_infos.clone();
 
+            // Attach escape analysis for top-level statements.
+            if let Some(ei) = self.escape_info.get("__hexa_main__") {
+                trans.escape_info = Some(ei.clone());
+            }
+
             let mut last_val = None;
             for stmt in stmts {
                 last_val = trans.compile_stmt(&mut builder, stmt)?;
@@ -662,6 +679,11 @@ struct LambdaInfo {
     captures: Vec<String>,
     /// Number of lambda parameters (excluding env_ptr).
     param_count: usize,
+}
+
+/// Public wrapper for escape analysis: collect free variables in an expression.
+pub fn collect_free_vars_for_escape(expr: &Expr, params: &[String]) -> Vec<String> {
+    collect_free_vars(expr, params, &mut Vec::new())
 }
 
 /// Walk an expression AST to collect free variables (identifiers that are
@@ -906,6 +928,13 @@ struct FuncTranslator<'a> {
     /// Counter for matching lambdas during compilation (incremented each
     /// time we encounter a Lambda expression).
     lambda_counter: usize,
+    /// Escape analysis info for the current function.
+    escape_info: Option<EscapeInfo>,
+    /// Stack slots allocated for non-escaping aggregates: var_name -> (StackSlot, size).
+    stack_slots: HashMap<String, (cranelift_codegen::ir::StackSlot, i64)>,
+    /// When compiling a `let name = <aggregate>`, this holds `name` so the
+    /// aggregate expression can use `alloc_for_var` instead of `call_alloc`.
+    current_let_name: Option<String>,
 }
 
 impl<'a> FuncTranslator<'a> {
@@ -934,6 +963,9 @@ impl<'a> FuncTranslator<'a> {
             var_types: HashMap::new(),
             lambdas: Vec::new(),
             lambda_counter: 0,
+            escape_info: None,
+            stack_slots: HashMap::new(),
+            current_let_name: None,
         }
     }
 
@@ -970,6 +1002,35 @@ impl<'a> FuncTranslator<'a> {
         builder.inst_results(call)[0]
     }
 
+    /// Allocate storage for a named variable.  If escape analysis says the
+    /// variable is `Stack`, we use a Cranelift stack slot; otherwise we
+    /// fall back to the heap allocator.
+    fn alloc_for_var(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        var_name: &str,
+        size: i64,
+    ) -> cranelift::prelude::Value {
+        let use_stack = self
+            .escape_info
+            .as_ref()
+            .map(|ei| ei.get(var_name) == Allocation::Stack)
+            .unwrap_or(false);
+
+        if use_stack && size > 0 {
+            // Create a stack slot and return its address.
+            let slot = builder.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                size as u32,
+                0,
+            ));
+            self.stack_slots.insert(var_name.to_string(), (slot, size));
+            builder.ins().stack_addr(I64, slot, 0)
+        } else {
+            self.call_alloc(builder, size)
+        }
+    }
+
     /// Store an i64 value at ptr + offset.
     fn store_at_offset(
         &self,
@@ -1003,7 +1064,11 @@ impl<'a> FuncTranslator<'a> {
         match stmt {
             Stmt::Let(name, _typ, expr, _vis) => {
                 let val = if let Some(e) = expr {
-                    self.compile_expr(builder, e)?
+                    // Set context so aggregate allocs can use stack when safe.
+                    self.current_let_name = Some(name.clone());
+                    let v = self.compile_expr(builder, e)?;
+                    self.current_let_name = None;
+                    v
                 } else {
                     builder.ins().iconst(I64, 0)
                 };
@@ -1361,8 +1426,13 @@ impl<'a> FuncTranslator<'a> {
                     .ok_or_else(|| jit_err(format!("undefined struct '{}' in JIT", name)))?
                     .clone();
 
-                // Allocate memory for the struct.
-                let ptr = self.call_alloc(builder, layout.total_size);
+                // Allocate memory: stack if escape analysis says safe, heap otherwise.
+                let let_name = self.current_let_name.clone();
+                let ptr = if let Some(ref var_name) = let_name {
+                    self.alloc_for_var(builder, var_name, layout.total_size)
+                } else {
+                    self.call_alloc(builder, layout.total_size)
+                };
 
                 // Store each field value at its offset.
                 for (fname, fexpr) in field_exprs {
@@ -1411,7 +1481,12 @@ impl<'a> FuncTranslator<'a> {
                 let len = items.len() as i64;
                 // Layout: [length, elem0, elem1, ...]
                 let total_size = (len + 1) * SLOT_SIZE;
-                let ptr = self.call_alloc(builder, total_size);
+                let let_name = self.current_let_name.clone();
+                let ptr = if let Some(ref var_name) = let_name {
+                    self.alloc_for_var(builder, var_name, total_size)
+                } else {
+                    self.call_alloc(builder, total_size)
+                };
 
                 // Store length at offset 0.
                 let len_val = builder.ins().iconst(I64, len);
@@ -1459,8 +1534,13 @@ impl<'a> FuncTranslator<'a> {
                         "enum '{}' has no variant '{}'", enum_name, variant_name
                     )))?;
 
-                // Allocate: 8-byte tag + 8-byte payload = 16 bytes.
-                let ptr = self.call_alloc(builder, layout.total_size);
+                // Allocate: stack if safe, heap otherwise.
+                let let_name = self.current_let_name.clone();
+                let ptr = if let Some(ref var_name) = let_name {
+                    self.alloc_for_var(builder, var_name, layout.total_size)
+                } else {
+                    self.call_alloc(builder, layout.total_size)
+                };
 
                 // Store tag at offset 0.
                 let tag_val = builder.ins().iconst(I64, tag);

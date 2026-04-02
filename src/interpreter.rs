@@ -13,6 +13,7 @@ use crate::lexer::Lexer;
 use crate::memory::{EgyptianMemory, MemRegion, MemoryStats, estimate_value_size, classify_region};
 use crate::parser::Parser;
 use crate::type_checker::SpecKey;
+use crate::inline_cache::{InlineCache, CallSiteId};
 
 /// Sentinel error message used to propagate `return` across call frames.
 const RETURN_SENTINEL: &str = "__hexa_return__";
@@ -82,6 +83,8 @@ pub struct Interpreter {
     generic_fn_decls: HashMap<String, FnDecl>,
     /// Specialization cache: (fn_name, concrete_types) -> specialized Value::Fn
     spec_cache: HashMap<SpecKey, Value>,
+    /// Inline cache for monomorphic method dispatch.
+    pub inline_cache: InlineCache,
 }
 
 /// Stored data for a loaded/declared module.
@@ -129,6 +132,7 @@ impl Interpreter {
             output_capture: None,
             generic_fn_decls: HashMap::new(),
             spec_cache: HashMap::new(),
+            inline_cache: InlineCache::new(),
         }
     }
 
@@ -1517,7 +1521,7 @@ impl Interpreter {
 
     // ── Function calls ──────────────────────────────────────
 
-    fn call_function(&mut self, func: Value, args: Vec<Value>) -> Result<Value, HexaError> {
+    pub fn call_function(&mut self, func: Value, args: Vec<Value>) -> Result<Value, HexaError> {
         match func {
             Value::BuiltinFn(name) => self.call_builtin(&name, args),
             Value::Fn(ref _name, ref params, ref body) if _name.starts_with("__async__") => {
@@ -1734,10 +1738,27 @@ impl Interpreter {
                 self.call_enum_method(enum_name, variant, data.as_ref().map(|b| b.as_ref()), method, args)
             }
             Value::Struct(struct_name, _fields) => {
-                // Look up impl methods
+                // Look up impl methods — with inline cache acceleration.
                 let struct_name = struct_name.clone();
-                if let Some(method_def) = self.type_methods.get(&struct_name).and_then(|m| m.get(method)) {
-                    let (params, body) = method_def.clone();
+                let cache_site = CallSiteId::new(self.current_line, self.current_col, method);
+
+                // Try the inline cache first (monomorphic fast path).
+                let resolved = if let Some(cached) = self.inline_cache.probe(&cache_site, &struct_name) {
+                    Some(cached)
+                } else if let Some(method_def) = self.type_methods.get(&struct_name).and_then(|m| m.get(method)) {
+                    let resolved = method_def.clone();
+                    // Populate the cache for next time.
+                    self.inline_cache.update(
+                        cache_site.clone(),
+                        struct_name.clone(),
+                        resolved.clone(),
+                    );
+                    Some(resolved)
+                } else {
+                    None
+                };
+
+                if let Some((params, body)) = resolved {
                     if params.is_empty() || params[0] != "self" {
                         return Err(self.runtime_err(format!("method {} is not an instance method (no self parameter)", method)));
                     }
@@ -2330,6 +2351,10 @@ impl Interpreter {
                         Value::Receiver(_) => "receiver",
                         Value::Future(_) => "future",
                         Value::Set(_) => "set",
+                        #[cfg(not(target_arch = "wasm32"))]
+                        Value::TcpListener(_) => "tcp_listener",
+                        #[cfg(not(target_arch = "wasm32"))]
+                        Value::TcpStream(_) => "tcp_stream",
                         Value::EffectRequest(_, _, _) => "effect_request",
                         Value::TraitObject { trait_name, .. } => trait_name.as_str(),
                         #[cfg(not(target_arch = "wasm32"))]
@@ -3087,6 +3112,18 @@ impl Interpreter {
                 map.insert("identity".into(), Value::Str("1/2 + 1/3 + 1/6 = 1".into()));
                 Ok(Value::Map(map))
             }
+            // ── std::net builtins ────────────────────────────────
+            "net_listen" | "net_accept" | "net_connect" | "net_read" | "net_write" | "net_close"
+            | "http_get" | "http_serve" => {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    return Err(self.runtime_err(format!("{} is not supported in WASM mode", name)));
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    crate::std_net::call_net_builtin(self, name, args)
+                }
+            }
             _ => Err(HexaError {
                 class: ErrorClass::Name,
                 message: format!("unknown builtin: {}", name),
@@ -3687,6 +3724,10 @@ impl Interpreter {
             Value::Receiver(_) => "receiver".to_string(),
             Value::Future(_) => "future".to_string(),
             Value::Set(_) => "set".to_string(),
+            #[cfg(not(target_arch = "wasm32"))]
+            Value::TcpListener(_) => "tcp_listener".to_string(),
+            #[cfg(not(target_arch = "wasm32"))]
+            Value::TcpStream(_) => "tcp_stream".to_string(),
             Value::EffectRequest(..) => "effect".to_string(),
             Value::TraitObject { type_name, .. } => type_name.clone(),
             #[cfg(not(target_arch = "wasm32"))]
