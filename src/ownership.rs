@@ -398,7 +398,7 @@ impl OwnershipAnalyzer {
             | Stmt::Mod(_, _) | Stmt::Use(_) | Stmt::Select(_, _)
             | Stmt::Generate(_) | Stmt::Optimize(_) | Stmt::Const(..)
             | Stmt::Static(..) | Stmt::MacroDef(_) | Stmt::DeriveDecl(..)
-            | Stmt::ComptimeFn(_) | Stmt::EffectDecl(_)
+            | Stmt::ComptimeFn(_) | Stmt::EffectDecl(_) | Stmt::ConsciousnessBlock(_, _) | Stmt::EvolveFn(_)
             | Stmt::Scope(_) | Stmt::ProofBlock(..) => {}
         }
     }

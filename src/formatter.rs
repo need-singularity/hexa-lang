@@ -252,6 +252,12 @@ fn format_stmt(stmt: &Stmt, indent: usize) -> String {
         Stmt::ProofBlock(name, _) => {
             format!("{}proof {} {{ ... }}", prefix, name)
         }
+        Stmt::ConsciousnessBlock(name, _) => {
+            format!("{}consciousness \"{}\" {{ ... }}", prefix, name)
+        }
+        Stmt::EvolveFn(decl) => {
+            format!("{}@evolve fn {}", prefix, decl.name)
+        }
     }
 }
 

@@ -92,6 +92,9 @@ pub enum Stmt {
     ComptimeFn(FnDecl),        // comptime fn — function evaluated at compile time
     // Algebraic effects
     EffectDecl(EffectDecl),    // effect Name { fn op(...) -> ret }
+    // Phase 15: Consciousness v2
+    ConsciousnessBlock(String, Block),  // consciousness "name" { ... }
+    EvolveFn(FnDecl),                   // @evolve fn — self-modifying
 }
 
 /// Target for AI code generation.

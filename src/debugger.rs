@@ -272,6 +272,7 @@ fn value_type_name(val: &Value) -> String {
         Value::TcpStream(_) => "tcp_stream".into(),
         Value::EffectRequest(..) => "effect_request".into(),
         Value::TraitObject { trait_name, .. } => format!("dyn {}", trait_name),
+        Value::Atomic(_) => "atomic".into(),
     }
 }
 

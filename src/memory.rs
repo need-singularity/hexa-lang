@@ -588,6 +588,7 @@ pub fn estimate_value_size(val: &crate::env::Value) -> usize {
         Value::TraitObject { value, .. } => 48 + estimate_value_size(value),
         #[cfg(not(target_arch = "wasm32"))]
         Value::AsyncFuture(_) => 32,
+        Value::Atomic(_) => 16,
     }
 }
 
@@ -615,6 +616,7 @@ pub fn classify_region(val: &crate::env::Value) -> MemRegion {
         Value::EffectRequest(_, _, _) | Value::TraitObject { .. } => MemRegion::Arena,
         #[cfg(not(target_arch = "wasm32"))]
         Value::AsyncFuture(_) => MemRegion::Heap,
+        Value::Atomic(_) => MemRegion::Heap,
     }
 }
 

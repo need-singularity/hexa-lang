@@ -44,6 +44,8 @@ pub enum Value {
         trait_name: String,
         type_name: String,
     },
+    /// Atomic value for lock-free concurrent access across green threads.
+    Atomic(std::sync::Arc<crate::atomic_ops::AtomicValue>),
 }
 
 impl std::fmt::Display for Value {
@@ -123,6 +125,7 @@ impl std::fmt::Display for Value {
             Value::TraitObject { value, trait_name, type_name } => {
                 write!(f, "<dyn {} ({}: {})>", trait_name, type_name, value)
             }
+            Value::Atomic(av) => write!(f, "{}", av.load()),
         }
     }
 }
@@ -253,6 +256,8 @@ impl Env {
         env.define("hexad_modules", Value::BuiltinFn("hexad_modules".into()));
         env.define("hexad_right", Value::BuiltinFn("hexad_right".into()));
         env.define("hexad_left", Value::BuiltinFn("hexad_left".into()));
+        // Consciousness v2: tension_link builtin
+        env.define("tension_link", Value::BuiltinFn("tension_link".into()));
         // Number theory: sopfr (sum of prime factors with repetition)
         env.define("sopfr", Value::BuiltinFn("sopfr".into()));
         // Egyptian Fraction memory introspection (1/2 + 1/3 + 1/6 = 1)

@@ -299,10 +299,10 @@ impl LockFile {
     /// Parse a hexa.lock file.
     pub fn parse(content: &str) -> PkgResult<Self> {
         let mut entries = Vec::new();
-        let mut current_name = None;
-        let mut current_version = None;
-        let mut current_source = None;
-        let mut current_checksum = None;
+        let mut current_name: Option<String> = None;
+        let mut current_version: Option<String> = None;
+        let mut current_source: Option<String> = None;
+        let mut current_checksum: Option<String> = None;
 
         for line in content.lines() {
             let trimmed = line.trim();
@@ -378,10 +378,242 @@ impl LockFile {
     }
 }
 
-// ── Version matching ────────────────────────────────────────
+// ── Semver types ───────────────────────────────────────────
+
+/// A parsed semantic version: major.minor.patch
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SemVer {
+    pub major: u32,
+    pub minor: u32,
+    pub patch: u32,
+}
+
+impl SemVer {
+    pub fn new(major: u32, minor: u32, patch: u32) -> Self {
+        Self { major, minor, patch }
+    }
+
+    /// Parse a version string like "1.2.3", "1.2", or "1".
+    pub fn parse(s: &str) -> Option<Self> {
+        let parts: Vec<&str> = s.trim().split('.').collect();
+        let major = parts.first()?.parse().ok()?;
+        let minor = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(0);
+        let patch = parts.get(2).and_then(|p| p.parse().ok()).unwrap_or(0);
+        Some(Self { major, minor, patch })
+    }
+
+    /// Compare two versions. Returns Ordering.
+    pub fn cmp(&self, other: &SemVer) -> std::cmp::Ordering {
+        self.major
+            .cmp(&other.major)
+            .then(self.minor.cmp(&other.minor))
+            .then(self.patch.cmp(&other.patch))
+    }
+}
+
+impl PartialOrd for SemVer {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SemVer {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        SemVer::cmp(self, other)
+    }
+}
+
+impl fmt::Display for SemVer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
+// ── Version requirement ────────────────────────────────────
+
+/// A version requirement that can match against versions.
+#[derive(Debug, Clone)]
+pub enum VersionReq {
+    /// `*` or `latest` — matches any version
+    Any,
+    /// `=1.2.3` — exact match
+    Exact(SemVer),
+    /// `^1.2.3` — compatible (same major, >= minor.patch)
+    Caret(SemVer),
+    /// `~1.2.3` — patch-level (same major.minor, >= patch)
+    Tilde(SemVer),
+    /// `>=1.0,<2.0` — range with lower and upper bounds
+    Range {
+        lower: Option<(SemVer, bool)>, // (version, inclusive)
+        upper: Option<(SemVer, bool)>, // (version, inclusive)
+    },
+}
+
+impl VersionReq {
+    /// Parse a version requirement string.
+    /// Supports: `*`, `latest`, `=1.2.3`, `^1.2.3`, `~1.2.3`, `>=1.0,<2.0`, bare `1.2.3`
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim();
+
+        if s == "*" || s == "latest" {
+            return Some(VersionReq::Any);
+        }
+
+        // Range: ">=1.0,<2.0" or ">=1.0, <2.0"
+        if s.contains(',') {
+            return Self::parse_range(s);
+        }
+
+        // Exact: =1.2.3
+        if let Some(rest) = s.strip_prefix('=') {
+            let ver = SemVer::parse(rest.trim())?;
+            return Some(VersionReq::Exact(ver));
+        }
+
+        // Caret: ^1.2.3
+        if let Some(rest) = s.strip_prefix('^') {
+            let ver = SemVer::parse(rest.trim())?;
+            return Some(VersionReq::Caret(ver));
+        }
+
+        // Tilde: ~1.2.3
+        if let Some(rest) = s.strip_prefix('~') {
+            let ver = SemVer::parse(rest.trim())?;
+            return Some(VersionReq::Tilde(ver));
+        }
+
+        // Comparison operators without comma (single bound)
+        if s.starts_with(">=") || s.starts_with("<=") || s.starts_with('>') || s.starts_with('<') {
+            return Self::parse_range(s);
+        }
+
+        // Bare version: treat as exact
+        let ver = SemVer::parse(s)?;
+        Some(VersionReq::Exact(ver))
+    }
+
+    /// Parse a range requirement like ">=1.0,<2.0"
+    fn parse_range(s: &str) -> Option<Self> {
+        let mut lower: Option<(SemVer, bool)> = None;
+        let mut upper: Option<(SemVer, bool)> = None;
+
+        let parts: Vec<&str> = s.split(',').collect();
+        for part in parts {
+            let part = part.trim();
+            if let Some(rest) = part.strip_prefix(">=") {
+                lower = Some((SemVer::parse(rest.trim())?, true));
+            } else if let Some(rest) = part.strip_prefix('>') {
+                lower = Some((SemVer::parse(rest.trim())?, false));
+            } else if let Some(rest) = part.strip_prefix("<=") {
+                upper = Some((SemVer::parse(rest.trim())?, true));
+            } else if let Some(rest) = part.strip_prefix('<') {
+                upper = Some((SemVer::parse(rest.trim())?, false));
+            }
+        }
+
+        if lower.is_some() || upper.is_some() {
+            Some(VersionReq::Range { lower, upper })
+        } else {
+            None
+        }
+    }
+
+    /// Check if a version matches this requirement.
+    pub fn matches(&self, version: &SemVer) -> bool {
+        match self {
+            VersionReq::Any => true,
+            VersionReq::Exact(req) => version == req,
+            VersionReq::Caret(req) => {
+                if version.major != req.major {
+                    return false;
+                }
+                if version.minor < req.minor {
+                    return false;
+                }
+                if version.minor == req.minor && version.patch < req.patch {
+                    return false;
+                }
+                true
+            }
+            VersionReq::Tilde(req) => {
+                if version.major != req.major || version.minor != req.minor {
+                    return false;
+                }
+                version.patch >= req.patch
+            }
+            VersionReq::Range { lower, upper } => {
+                if let Some((lo, inclusive)) = lower {
+                    if *inclusive {
+                        if version.cmp(lo) == std::cmp::Ordering::Less {
+                            return false;
+                        }
+                    } else if version.cmp(lo) != std::cmp::Ordering::Greater {
+                        return false;
+                    }
+                }
+                if let Some((hi, inclusive)) = upper {
+                    if *inclusive {
+                        if version.cmp(hi) == std::cmp::Ordering::Greater {
+                            return false;
+                        }
+                    } else if version.cmp(hi) != std::cmp::Ordering::Less {
+                        return false;
+                    }
+                }
+                true
+            }
+        }
+    }
+}
+
+impl fmt::Display for VersionReq {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            VersionReq::Any => write!(f, "*"),
+            VersionReq::Exact(v) => write!(f, "={}", v),
+            VersionReq::Caret(v) => write!(f, "^{}", v),
+            VersionReq::Tilde(v) => write!(f, "~{}", v),
+            VersionReq::Range { lower, upper } => {
+                let mut parts = Vec::new();
+                if let Some((v, true)) = lower {
+                    parts.push(format!(">={}", v));
+                } else if let Some((v, false)) = lower {
+                    parts.push(format!(">{}", v));
+                }
+                if let Some((v, true)) = upper {
+                    parts.push(format!("<={}", v));
+                } else if let Some((v, false)) = upper {
+                    parts.push(format!("<{}", v));
+                }
+                write!(f, "{}", parts.join(","))
+            }
+        }
+    }
+}
+
+// ── Dependency conflict resolution ─────────────────────────
+
+/// Given multiple version requirements for the same package and a list of
+/// available versions, resolve to the highest compatible version.
+pub fn resolve_version_conflict(
+    requirements: &[VersionReq],
+    available: &[SemVer],
+) -> Option<SemVer> {
+    let mut candidates: Vec<SemVer> = available
+        .iter()
+        .filter(|v| requirements.iter().all(|req| req.matches(v)))
+        .copied()
+        .collect();
+
+    candidates.sort();
+    candidates.last().copied()
+}
+
+// ── Version matching (legacy compat) ───────────────────────
 
 /// Check if a version matches a version requirement.
-/// Supports exact match ("1.0.0") and caret ("^1.0").
+/// Supports exact match ("1.0.0"), caret ("^1.0"), tilde ("~1.0"),
+/// range (">=1.0,<2.0"), and wildcards ("*", "latest").
 pub fn version_matches(version: &str, requirement: &str) -> bool {
     let req = requirement.trim();
 
@@ -390,51 +622,19 @@ pub fn version_matches(version: &str, requirement: &str) -> bool {
         return true;
     }
 
-    // Caret requirement: ^1.0 means >=1.0.0, <2.0.0
-    if let Some(base) = req.strip_prefix('^') {
-        let ver_parts = parse_semver(version);
-        let req_parts = parse_semver(base);
-
-        if ver_parts.is_none() || req_parts.is_none() {
-            return version == base;
-        }
-
-        let (v_major, v_minor, v_patch) = ver_parts.unwrap();
-        let (r_major, r_minor, r_patch) = req_parts.unwrap();
-
-        // Major must match, version must be >= requirement
-        if v_major != r_major {
-            return false;
-        }
-        if v_minor < r_minor {
-            return false;
-        }
-        if v_minor == r_minor && v_patch < r_patch {
-            return false;
-        }
-        return true;
+    // Try the new semver parser
+    if let (Some(ver), Some(vreq)) = (SemVer::parse(version), VersionReq::parse(req)) {
+        return vreq.matches(&ver);
     }
 
-    // Exact match (with partial matching: "1.0" matches "1.0.0")
-    let ver_parts = parse_semver(version);
-    let req_parts = parse_semver(req);
-
-    match (ver_parts, req_parts) {
-        (Some((vm, vn, vp)), Some((rm, rn, rp))) => vm == rm && vn == rn && vp == rp,
-        _ => {
-            // Partial match: compare as prefix
-            version.starts_with(req) || version == req
-        }
-    }
+    // Fallback: prefix match
+    version.starts_with(req) || version == req
 }
 
 /// Parse "major.minor.patch" into (u32, u32, u32). Missing parts default to 0.
 fn parse_semver(s: &str) -> Option<(u32, u32, u32)> {
-    let parts: Vec<&str> = s.split('.').collect();
-    let major = parts.first()?.parse().ok()?;
-    let minor = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(0);
-    let patch = parts.get(2).and_then(|p| p.parse().ok()).unwrap_or(0);
-    Some((major, minor, patch))
+    let v = SemVer::parse(s)?;
+    Some((v.major, v.minor, v.patch))
 }
 
 // ── Dependency resolver ─────────────────────────────────────
@@ -796,7 +996,37 @@ pub fn cmd_add_pkg(
     fs::write(&toml_path, &new_content)
         .map_err(|e| PackageError::new(format!("cannot write hexa.toml: {}", e)))?;
 
+    // Write hexa.lock with resolved versions
+    let lock_path = project_dir.join("hexa.lock");
+    let mut lock = if lock_path.exists() {
+        let lock_content = fs::read_to_string(&lock_path).unwrap_or_default();
+        LockFile::parse(&lock_content).unwrap_or_else(|_| LockFile::new())
+    } else {
+        LockFile::new()
+    };
+
+    // Add lock entry for the new dependency
+    if !lock.entries.iter().any(|e| e.name == name) {
+        let resolved_version = match &manifest.dependencies.last().unwrap().source {
+            DepSource::Registry { version } => {
+                if version == "latest" { "0.0.0".to_string() } else { version.clone() }
+            }
+            DepSource::Git { version, .. } => version.clone(),
+            DepSource::Path { .. } => "0.0.0".to_string(),
+        };
+        lock.entries.push(LockEntry {
+            name: name.clone(),
+            version: resolved_version,
+            source: "registry".to_string(),
+            checksum: None,
+        });
+    }
+
+    fs::write(&lock_path, lock.serialize())
+        .map_err(|e| PackageError::new(format!("cannot write hexa.lock: {}", e)))?;
+
     println!("Added '{}' to [dependencies]", name);
+    println!("Updated hexa.lock");
     Ok(())
 }
 
@@ -1176,7 +1406,7 @@ dep-c = { version = "3.0", git = "https://example.com/repo" }
     #[test]
     fn test_version_matches_exact() {
         assert!(version_matches("1.0.0", "1.0.0"));
-        assert!(version_matches("1.0.0", "1.0"));
+        assert!(version_matches("1.0.0", "=1.0.0"));
         assert!(!version_matches("1.0.0", "2.0.0"));
         assert!(!version_matches("1.1.0", "1.0.0"));
     }
@@ -1191,10 +1421,159 @@ dep-c = { version = "3.0", git = "https://example.com/repo" }
     }
 
     #[test]
+    fn test_version_matches_tilde() {
+        assert!(version_matches("1.2.3", "~1.2.3"));
+        assert!(version_matches("1.2.5", "~1.2.3"));
+        assert!(!version_matches("1.3.0", "~1.2.3"));
+        assert!(!version_matches("2.0.0", "~1.2.3"));
+        assert!(!version_matches("1.2.2", "~1.2.3"));
+    }
+
+    #[test]
+    fn test_version_matches_range() {
+        assert!(version_matches("1.5.0", ">=1.0.0,<2.0.0"));
+        assert!(version_matches("1.0.0", ">=1.0.0,<2.0.0"));
+        assert!(!version_matches("2.0.0", ">=1.0.0,<2.0.0"));
+        assert!(!version_matches("0.9.0", ">=1.0.0,<2.0.0"));
+        assert!(version_matches("1.9.9", ">=1.0,<2.0"));
+    }
+
+    #[test]
     fn test_version_matches_latest() {
         assert!(version_matches("1.0.0", "latest"));
         assert!(version_matches("99.99.99", "latest"));
         assert!(version_matches("0.0.1", "*"));
+    }
+
+    // ── SemVer tests ──
+
+    #[test]
+    fn test_semver_parse() {
+        let v = SemVer::parse("1.2.3").unwrap();
+        assert_eq!(v.major, 1);
+        assert_eq!(v.minor, 2);
+        assert_eq!(v.patch, 3);
+
+        let v2 = SemVer::parse("1.0").unwrap();
+        assert_eq!(v2, SemVer::new(1, 0, 0));
+
+        let v3 = SemVer::parse("5").unwrap();
+        assert_eq!(v3, SemVer::new(5, 0, 0));
+
+        assert!(SemVer::parse("abc").is_none());
+    }
+
+    #[test]
+    fn test_semver_ordering() {
+        let v1 = SemVer::new(1, 0, 0);
+        let v2 = SemVer::new(1, 1, 0);
+        let v3 = SemVer::new(2, 0, 0);
+        assert!(v1 < v2);
+        assert!(v2 < v3);
+        assert!(v1 < v3);
+        assert_eq!(v1, SemVer::new(1, 0, 0));
+    }
+
+    #[test]
+    fn test_semver_display() {
+        let v = SemVer::new(1, 2, 3);
+        assert_eq!(format!("{}", v), "1.2.3");
+    }
+
+    // ── VersionReq tests ──
+
+    #[test]
+    fn test_version_req_parse_caret() {
+        let req = VersionReq::parse("^1.2.3").unwrap();
+        assert!(matches!(req, VersionReq::Caret(_)));
+        let v = SemVer::new(1, 2, 3);
+        assert!(req.matches(&v));
+        assert!(req.matches(&SemVer::new(1, 5, 0)));
+        assert!(!req.matches(&SemVer::new(2, 0, 0)));
+    }
+
+    #[test]
+    fn test_version_req_parse_tilde() {
+        let req = VersionReq::parse("~1.2.3").unwrap();
+        assert!(matches!(req, VersionReq::Tilde(_)));
+        assert!(req.matches(&SemVer::new(1, 2, 3)));
+        assert!(req.matches(&SemVer::new(1, 2, 9)));
+        assert!(!req.matches(&SemVer::new(1, 3, 0)));
+    }
+
+    #[test]
+    fn test_version_req_parse_exact() {
+        let req = VersionReq::parse("=1.2.3").unwrap();
+        assert!(req.matches(&SemVer::new(1, 2, 3)));
+        assert!(!req.matches(&SemVer::new(1, 2, 4)));
+    }
+
+    #[test]
+    fn test_version_req_parse_range() {
+        let req = VersionReq::parse(">=1.0.0,<2.0.0").unwrap();
+        assert!(req.matches(&SemVer::new(1, 0, 0)));
+        assert!(req.matches(&SemVer::new(1, 9, 9)));
+        assert!(!req.matches(&SemVer::new(2, 0, 0)));
+        assert!(!req.matches(&SemVer::new(0, 9, 0)));
+    }
+
+    #[test]
+    fn test_version_req_any() {
+        let req = VersionReq::parse("*").unwrap();
+        assert!(req.matches(&SemVer::new(0, 0, 1)));
+        assert!(req.matches(&SemVer::new(99, 99, 99)));
+
+        let req2 = VersionReq::parse("latest").unwrap();
+        assert!(req2.matches(&SemVer::new(1, 0, 0)));
+    }
+
+    #[test]
+    fn test_version_req_display() {
+        assert_eq!(format!("{}", VersionReq::parse("^1.2.3").unwrap()), "^1.2.3");
+        assert_eq!(format!("{}", VersionReq::parse("~1.2.3").unwrap()), "~1.2.3");
+        assert_eq!(format!("{}", VersionReq::parse("=1.2.3").unwrap()), "=1.2.3");
+        assert_eq!(format!("{}", VersionReq::parse("*").unwrap()), "*");
+    }
+
+    // ── Conflict resolution tests ──
+
+    #[test]
+    fn test_resolve_version_conflict() {
+        let available = vec![
+            SemVer::new(1, 0, 0),
+            SemVer::new(1, 2, 0),
+            SemVer::new(1, 5, 0),
+            SemVer::new(2, 0, 0),
+        ];
+        let reqs = vec![
+            VersionReq::parse("^1.0").unwrap(),
+            VersionReq::parse(">=1.2.0,<2.0.0").unwrap(),
+        ];
+        let resolved = resolve_version_conflict(&reqs, &available);
+        assert_eq!(resolved, Some(SemVer::new(1, 5, 0)));
+    }
+
+    #[test]
+    fn test_resolve_version_conflict_no_match() {
+        let available = vec![SemVer::new(1, 0, 0), SemVer::new(2, 0, 0)];
+        let reqs = vec![
+            VersionReq::parse("^1.0").unwrap(),
+            VersionReq::parse("^2.0").unwrap(),
+        ];
+        let resolved = resolve_version_conflict(&reqs, &available);
+        assert_eq!(resolved, None); // No version satisfies both
+    }
+
+    #[test]
+    fn test_resolve_picks_highest() {
+        let available = vec![
+            SemVer::new(1, 0, 0),
+            SemVer::new(1, 1, 0),
+            SemVer::new(1, 2, 0),
+        ];
+        let reqs = vec![VersionReq::parse("^1.0").unwrap()];
+        let resolved = resolve_version_conflict(&reqs, &available);
+        assert_eq!(resolved, Some(SemVer::new(1, 2, 0)));
     }
 
     #[test]

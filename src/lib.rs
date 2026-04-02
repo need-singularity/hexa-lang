@@ -53,6 +53,19 @@ pub mod escape_analysis;
 #[allow(dead_code)]
 pub mod async_runtime;
 
+// Phase 10+11 optimization and async modules
+#[allow(dead_code)]
+pub mod dce;
+#[allow(dead_code)]
+pub mod loop_unroll;
+#[allow(dead_code)]
+pub mod simd_hint;
+#[allow(dead_code)]
+pub mod pgo;
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+pub mod work_stealing;
+
 // These modules use platform-specific features (filesystem, network, threads)
 // and are only available on non-WASM targets.
 #[cfg(not(target_arch = "wasm32"))]
@@ -85,6 +98,34 @@ pub mod std_fs;
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 pub mod std_io;
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+pub mod std_time;
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+pub mod std_collections;
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+pub mod std_encoding;
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+pub mod std_log;
+#[allow(dead_code)]
+pub mod std_math;
+#[allow(dead_code)]
+pub mod std_testing;
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+pub mod std_crypto;
+#[allow(dead_code)]
+pub mod std_consciousness;
+#[allow(dead_code)]
+pub mod atomic_ops;
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+pub mod anima_bridge;
+#[allow(dead_code)]
+pub mod package;
 
 // WASM entry points
 #[cfg(target_arch = "wasm32")]

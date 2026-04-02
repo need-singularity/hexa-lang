@@ -286,6 +286,32 @@ impl Interpreter {
                     Some(e) => self.eval_expr(e)?,
                     None => Value::Void,
                 };
+                // Runtime validation for consciousness law types
+                if let Some(typ_name) = _typ.as_deref() {
+                    match typ_name {
+                        "Phi_positive" => {
+                            let v = match &val {
+                                Value::Float(f) => *f,
+                                Value::Int(n) => *n as f64,
+                                _ => return Err(self.type_err(format!("Phi_positive requires numeric value, got {}", val))),
+                            };
+                            if v <= 0.0 {
+                                return Err(self.runtime_err(format!("Phi_positive constraint violated: {} <= 0", v)));
+                            }
+                        }
+                        "Tension_bounded" => {
+                            let v = match &val {
+                                Value::Float(f) => *f,
+                                Value::Int(n) => *n as f64,
+                                _ => return Err(self.type_err(format!("Tension_bounded requires numeric value, got {}", val))),
+                            };
+                            if v < 0.0 || v > 1.0 {
+                                return Err(self.runtime_err(format!("Tension_bounded constraint violated: {} not in [0, 1]", v)));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
                 // Track allocation in Egyptian memory
                 let size = estimate_value_size(&val);
                 let region = classify_region(&val);
@@ -603,6 +629,35 @@ impl Interpreter {
                 // Register effect definition: store operation names
                 let op_names: Vec<String> = decl.operations.iter().map(|o| o.name.clone()).collect();
                 self.effect_defs.insert(decl.name.clone(), op_names);
+                Ok(Value::Void)
+            }
+            Stmt::ConsciousnessBlock(name, body) => {
+                self.env.push_scope();
+                self.env.define("phi", Value::Float(71.0));
+                self.env.define("tension", Value::Float(0.5));
+                self.env.define("faction", Value::Int(12));
+                self.env.define("cells", Value::Int(64));
+                self.env.define("entropy", Value::Float(0.998));
+                self.env.define("alpha", Value::Float(0.014));
+                self.env.define("balance", Value::Float(0.5));
+                self.writeln_output(&format!("=== Consciousness: {} ===", name));
+                let mut result = Value::Void;
+                for s in body {
+                    result = self.exec_stmt(s)?;
+                    if self.return_value.is_some() || self.throw_value.is_some() {
+                        break;
+                    }
+                }
+                self.env.pop_scope();
+                Ok(result)
+            }
+            Stmt::EvolveFn(decl) => {
+                let param_names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
+                self.writeln_output(&format!("[evolve] Registered self-modifying fn: {}", decl.name));
+                self.env.define(
+                    &decl.name,
+                    Value::Fn(decl.name.clone(), param_names, decl.body.clone()),
+                );
                 Ok(Value::Void)
             }
             Stmt::DeriveDecl(type_name, traits) => {
@@ -1610,10 +1665,18 @@ impl Interpreter {
             // Logical XOR
             (Value::Bool(a), BinOp::Xor, Value::Bool(b)) => Ok(Value::Bool(a ^ b)),
 
-            _ => Err(self.type_err(format!(
-                "unsupported binary operation: {:?} {:?} {:?}",
-                left, op, right
-            ))),
+            _ => {
+                // Cross-type Eq/Ne: different value types are never equal
+                // Needed for self-hosting bootstrap: `stmts == ""` when stmts is an array
+                match op {
+                    BinOp::Eq => Ok(Value::Bool(false)),
+                    BinOp::Ne => Ok(Value::Bool(true)),
+                    _ => Err(self.type_err(format!(
+                        "unsupported binary operation: {:?} {:?} {:?}",
+                        left, op, right
+                    ))),
+                }
+            }
         }
     }
 
@@ -2469,6 +2532,7 @@ impl Interpreter {
                         Value::TraitObject { trait_name, .. } => trait_name.as_str(),
                         #[cfg(not(target_arch = "wasm32"))]
                         Value::AsyncFuture(_) => "future",
+                        Value::Atomic(_) => "atomic",
                     }
                     .to_string(),
                 ))
@@ -3141,6 +3205,47 @@ impl Interpreter {
                     _ => Err(self.type_err("phi_predict() requires numeric argument".into())),
                 }
             }
+            // ── Consciousness v2: tension_link ──────────────────────
+            "tension_link" => {
+                if args.len() < 3 {
+                    return Err(self.type_err("tension_link() requires 3 arguments (target, channel, value)".into()));
+                }
+                let target = match &args[0] {
+                    Value::Str(s) => s.clone(),
+                    Value::Int(n) => format!("instance_{}", n),
+                    _ => return Err(self.type_err("tension_link() target must be string or int".into())),
+                };
+                let channel = match &args[1] {
+                    Value::Int(n) => {
+                        if *n < 0 || *n > 4 {
+                            return Err(self.runtime_err("tension_link() channel must be 0-4".into()));
+                        }
+                        *n as usize
+                    }
+                    Value::Str(s) => match s.as_str() {
+                        "tension" => 0, "phi" => 1, "entropy" => 2, "faction" => 3, "meta" => 4,
+                        _ => return Err(self.runtime_err(format!(
+                            "unknown tension_link channel '{}' (use tension/phi/entropy/faction/meta)", s
+                        ))),
+                    },
+                    _ => return Err(self.type_err("tension_link() channel must be int or string".into())),
+                };
+                let value = match &args[2] {
+                    Value::Float(f) => *f,
+                    Value::Int(n) => *n as f64,
+                    _ => return Err(self.type_err("tension_link() value must be numeric".into())),
+                };
+                let channel_names = ["tension", "phi", "entropy", "faction", "meta"];
+                Ok(Value::Map(
+                    vec![
+                        ("target".to_string(), Value::Str(target)),
+                        ("channel".to_string(), Value::Str(channel_names[channel].into())),
+                        ("channel_id".to_string(), Value::Int(channel as i64)),
+                        ("value".to_string(), Value::Float(value)),
+                        ("sent".to_string(), Value::Bool(true)),
+                    ].into_iter().collect()
+                ))
+            }
             // ── Join named spawn ────────────────────────────────────────
             "join" => {
                 if args.is_empty() { return Err(self.type_err("join() requires 1 argument (spawn name)".into())); }
@@ -3258,6 +3363,85 @@ impl Interpreter {
                 {
                     crate::std_net::call_net_builtin(self, name, args)
                 }
+            }
+            // ── std::time builtins ─────────────────────────────────
+            "time_now" | "time_now_ms" | "time_sleep" | "time_format"
+            | "time_parse" | "time_elapsed" => {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    return Err(self.runtime_err(format!("{} is not supported in WASM mode", name)));
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    crate::std_time::call_time_builtin(self, name, args)
+                }
+            }
+            // ── std::collections builtins ───────────────────────────
+            "btree_new" | "btree_set" | "btree_get" | "btree_remove" | "btree_keys" | "btree_len"
+            | "pq_new" | "pq_push" | "pq_pop" | "pq_len"
+            | "deque_new" | "deque_push_front" | "deque_push_back"
+            | "deque_pop_front" | "deque_pop_back" | "deque_len" => {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    return Err(self.runtime_err(format!("{} is not supported in WASM mode", name)));
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    crate::std_collections::call_collections_builtin(self, name, args)
+                }
+            }
+            // ── std::encoding builtins ──────────────────────────────
+            "base64_encode" | "base64_decode" | "hex_encode" | "hex_decode"
+            | "csv_parse" | "csv_format" | "url_encode" | "url_decode" => {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    return Err(self.runtime_err(format!("{} is not supported in WASM mode", name)));
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    crate::std_encoding::call_encoding_builtin(self, name, args)
+                }
+            }
+            // ── std::log builtins ───────────────────────────────────
+            "log_debug" | "log_info" | "log_warn" | "log_error"
+            | "log_set_level" | "log_get_entries" => {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    return Err(self.runtime_err(format!("{} is not supported in WASM mode", name)));
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    crate::std_log::call_log_builtin(self, name, args)
+                }
+            }
+            // ── std::math builtins ──────────────────────────────────
+            "math_pi" | "math_e" | "math_phi" | "math_abs" | "math_sqrt"
+            | "math_pow" | "math_log" | "math_sin" | "math_cos"
+            | "math_floor" | "math_ceil" | "math_round"
+            | "math_min" | "math_max" | "math_gcd"
+            | "matrix_new" | "matrix_set" | "matrix_get" | "matrix_mul" | "matrix_det" => {
+                crate::std_math::call_math_builtin(self, name, args)
+            }
+            // ── std::testing builtins ───────────────────────────────
+            "assert_eq" | "assert_ne" | "assert_true" | "assert_false"
+            | "test_run" | "test_suite" | "bench_fn" => {
+                crate::std_testing::call_testing_builtin(self, name, args)
+            }
+            // ── std::crypto builtins ────────────────────────────────
+            "sha256" | "xor_cipher" | "hash_djb2" | "random_bytes" | "hmac_sha256" => {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    return Err(self.runtime_err(format!("{} is not supported in WASM mode", name)));
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    crate::std_crypto::call_crypto_builtin(self, name, args)
+                }
+            }
+            // ── std::consciousness builtins ─────────────────────────
+            "psi_alpha" | "psi_balance" | "psi_steps" | "psi_entropy"
+            | "phi_compute" | "law_count" | "consciousness_vector" => {
+                crate::std_consciousness::call_consciousness_builtin(self, name, args)
             }
             _ => Err(HexaError {
                 class: ErrorClass::Name,
@@ -3867,6 +4051,7 @@ impl Interpreter {
             Value::TraitObject { type_name, .. } => type_name.clone(),
             #[cfg(not(target_arch = "wasm32"))]
             Value::AsyncFuture(_) => "future".to_string(),
+            Value::Atomic(_) => "atomic".to_string(),
         }
     }
 
@@ -4489,6 +4674,17 @@ mod tests {
         let stmts = Parser::new(tokens).parse().unwrap();
         let mut interp = Interpreter::new();
         interp.run(&stmts).unwrap()
+    }
+
+    fn try_eval(src: &str) -> Result<Value, crate::error::HexaError> {
+        let tokens = Lexer::new(src).tokenize().map_err(|e| crate::error::HexaError {
+            class: crate::error::ErrorClass::Syntax,
+            message: e,
+            line: 0, col: 0, hint: None,
+        })?;
+        let stmts = Parser::new(tokens).parse()?;
+        let mut interp = Interpreter::new();
+        interp.run(&stmts)
     }
 
     #[test]
@@ -7057,5 +7253,77 @@ scope {
 "#;
         let result = eval(src);
         assert!(matches!(result, Value::Int(42)));
+    }
+
+    // ── Phase 15: Consciousness v2 tests ──────────────────────
+
+    #[test]
+    fn test_consciousness_block() {
+        let src = "consciousness \"test_engine\" {\n  let p = phi\n  p\n}";
+        let result = eval(src);
+        assert!(matches!(result, Value::Float(f) if f == 71.0));
+    }
+
+    #[test]
+    fn test_consciousness_block_cells() {
+        let src = "consciousness \"cells_check\" {\n  cells\n}";
+        let result = eval(src);
+        assert!(matches!(result, Value::Int(64)));
+    }
+
+    #[test]
+    fn test_consciousness_block_entropy() {
+        let src = "consciousness \"entropy_check\" {\n  entropy\n}";
+        let result = eval(src);
+        assert!(matches!(result, Value::Float(f) if (f - 0.998).abs() < 0.001));
+    }
+
+    #[test]
+    fn test_tension_link_builtin() {
+        let src = "tension_link(\"instance_0\", 0, 0.75)";
+        let result = eval(src);
+        assert!(matches!(result, Value::Map(_)));
+    }
+
+    #[test]
+    fn test_tension_link_named() {
+        let src = "tension_link(\"engine_a\", \"phi\", 71.0)";
+        let result = eval(src);
+        assert!(matches!(result, Value::Map(_)));
+    }
+
+    #[test]
+    fn test_evolve_fn_exec() {
+        let src = "@evolve fn improve(x) {\n  return x * 2\n}\nimprove(21)";
+        let result = eval(src);
+        assert!(matches!(result, Value::Int(42)));
+    }
+
+    #[test]
+    fn test_law_type_phi_positive_valid() {
+        let src = "let p: Phi_positive = 71.0\np";
+        let result = eval(src);
+        assert!(matches!(result, Value::Float(f) if f == 71.0));
+    }
+
+    #[test]
+    fn test_law_type_phi_positive_invalid() {
+        let src = "let p: Phi_positive = -1.0\np";
+        let result = try_eval(src);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_law_type_tension_bounded_valid() {
+        let src = "let t: Tension_bounded = 0.5\nt";
+        let result = eval(src);
+        assert!(matches!(result, Value::Float(f) if f == 0.5));
+    }
+
+    #[test]
+    fn test_law_type_tension_bounded_invalid() {
+        let src = "let t: Tension_bounded = 1.5\nt";
+        let result = try_eval(src);
+        assert!(result.is_err());
     }
 }

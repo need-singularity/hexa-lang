@@ -23,6 +23,8 @@ pub enum CheckType {
     Map,
     Error,
     Generic(String), // type parameter (e.g. T)
+    PhiPositive,        // Phi_positive: float where value > 0
+    TensionBounded,     // Tension_bounded: float where 0 <= value <= 1
     Unknown, // inferred later or unresolvable
 }
 
@@ -40,6 +42,8 @@ impl CheckType {
             "any" => CheckType::Any,
             "array" => CheckType::Array(Box::new(CheckType::Unknown)),
             "map" => CheckType::Map,
+            "Phi_positive" => CheckType::PhiPositive,
+            "Tension_bounded" => CheckType::TensionBounded,
             other => {
                 // Could be a struct/enum name
                 if other.chars().next().map_or(false, |c| c.is_uppercase()) {
@@ -81,6 +85,11 @@ impl CheckType {
         if let (CheckType::Struct(a), CheckType::Struct(b)) = (self, value_type) {
             return a == b;
         }
+        // Law types accept numeric types
+        if matches!(self, CheckType::PhiPositive | CheckType::TensionBounded)
+            && matches!(value_type, CheckType::Float | CheckType::Int) {
+            return true;
+        }
         false
     }
 
@@ -109,6 +118,8 @@ impl CheckType {
             CheckType::Map => "map".to_string(),
             CheckType::Error => "error".to_string(),
             CheckType::Generic(name) => name.clone(),
+            CheckType::PhiPositive => "Phi_positive".to_string(),
+            CheckType::TensionBounded => "Tension_bounded".to_string(),
             CheckType::Unknown => "unknown".to_string(),
         }
     }
@@ -465,6 +476,30 @@ impl TypeChecker {
                 self.define(&decl.name, CheckType::Fn(param_types, Box::new(ret)));
             }
             Stmt::EffectDecl(_) => {}
+            Stmt::ConsciousnessBlock(_name, body) => {
+                self.push_scope();
+                self.define("phi", CheckType::Float);
+                self.define("tension", CheckType::Float);
+                self.define("faction", CheckType::Int);
+                self.define("cells", CheckType::Int);
+                self.define("entropy", CheckType::Float);
+                for s in body {
+                    self.check_stmt(s, line, col);
+                }
+                self.pop_scope();
+            }
+            Stmt::EvolveFn(decl) => {
+                self.check_fn_decl(decl, line, col);
+                let param_types: Vec<CheckType> = decl.params.iter()
+                    .map(|p| p.typ.as_ref()
+                        .map(|t| CheckType::from_annotation(t))
+                        .unwrap_or(CheckType::Unknown))
+                    .collect();
+                let ret = decl.ret_type.as_ref()
+                    .map(|t| CheckType::from_annotation(t))
+                    .unwrap_or(CheckType::Unknown);
+                self.define(&decl.name, CheckType::Fn(param_types, Box::new(ret)));
+            }
         }
     }
 
@@ -1005,5 +1040,39 @@ mod tests {
         // let x: int = [1, 2, 3] should fail (array vs int)
         let result = check_source("let x: int = [1, 2, 3]");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_phi_positive_annotation() {
+        assert_eq!(CheckType::from_annotation("Phi_positive"), CheckType::PhiPositive);
+    }
+
+    #[test]
+    fn test_tension_bounded_annotation() {
+        assert_eq!(CheckType::from_annotation("Tension_bounded"), CheckType::TensionBounded);
+    }
+
+    #[test]
+    fn test_law_types_accept_numeric() {
+        assert!(CheckType::PhiPositive.accepts(&CheckType::Float));
+        assert!(CheckType::PhiPositive.accepts(&CheckType::Int));
+        assert!(CheckType::TensionBounded.accepts(&CheckType::Float));
+        assert!(!CheckType::PhiPositive.accepts(&CheckType::Str));
+    }
+
+    #[test]
+    fn test_law_type_display() {
+        assert_eq!(CheckType::PhiPositive.display_name(), "Phi_positive");
+        assert_eq!(CheckType::TensionBounded.display_name(), "Tension_bounded");
+    }
+
+    #[test]
+    fn test_phi_positive_let_float() {
+        assert!(check_source("let x: Phi_positive = 1.0").is_ok());
+    }
+
+    #[test]
+    fn test_phi_positive_let_string_err() {
+        assert!(check_source("let x: Phi_positive = \"hello\"").is_err());
     }
 }

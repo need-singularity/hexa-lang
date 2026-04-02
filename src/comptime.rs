@@ -21,6 +21,16 @@ const FORBIDDEN_BUILTINS: &[&str] = &[
     // std::io
     "io_stdin", "io_read_lines", "io_write_bytes", "io_pipe",
     "io_tempfile", "io_buffered_reader", "io_reader_next",
+    // std::net
+    "net_listen", "net_accept", "net_connect", "net_read", "net_write", "net_close",
+    "http_get", "http_serve",
+    // std::time (sleep has side effects)
+    "time_sleep",
+    // std::log (I/O side effects)
+    "log_debug", "log_info", "log_warn", "log_error",
+    "log_set_level", "log_get_entries",
+    // std::crypto (random_bytes uses time seed)
+    "random_bytes",
 ];
 
 /// Evaluate a comptime expression in a sandboxed interpreter.

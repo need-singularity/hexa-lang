@@ -299,6 +299,7 @@ const BUILTINS: &[&str] = &[
     "psi_coupling", "psi_balance", "psi_steps", "psi_entropy", "psi_frustration",
     "consciousness_max_cells", "consciousness_decoder_dim", "consciousness_phi",
     "hexad_modules", "hexad_right", "hexad_left",
+    "tension_link",
 ];
 
 // ── Keyword/builtin documentation ─────────────────────────────
@@ -1558,6 +1559,7 @@ mod tests {
             "psi_coupling", "psi_balance", "psi_steps", "psi_entropy", "psi_frustration",
             "consciousness_max_cells", "consciousness_decoder_dim", "consciousness_phi",
             "hexad_modules", "hexad_right", "hexad_left", "channel",
+            "tension_link",
         ];
         for b in BUILTINS {
             if !special.contains(b) {

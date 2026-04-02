@@ -169,6 +169,40 @@ impl Parser {
             Token::Comptime => self.parse_comptime_stmt(),
             Token::Effect => self.parse_effect_decl(),
             Token::Pure => self.parse_pure_fn(vis),
+            Token::Ident(ref s) if s == "consciousness" && !matches!(self.peek_ahead(1), Token::ColonColon | Token::Dot | Token::Eq | Token::LParen) => {
+                self.advance(); // consume 'consciousness'
+                let name = match self.peek().clone() {
+                    Token::StringLit(s) => { self.advance(); s }
+                    Token::Ident(_) if !matches!(self.peek_ahead(1), Token::ColonColon) => self.expect_ident()?,
+                    Token::LBrace => "default".to_string(),
+                    _ => return Err(self.error(format!(
+                        "expected name after 'consciousness', got {:?}", self.peek()
+                    ))),
+                };
+                let body = self.parse_block()?;
+                Ok(Stmt::ConsciousnessBlock(name, body))
+            }
+            Token::Ident(ref s) if s == "@evolve" => {
+                self.advance(); // consume '@evolve'
+                self.expect(&Token::Fn)?;
+                let name = self.expect_ident()?;
+                let type_params = if matches!(self.peek(), Token::Lt) {
+                    self.parse_type_params()?
+                } else { vec![] };
+                self.expect(&Token::LParen)?;
+                let params = self.parse_params()?;
+                self.expect(&Token::RParen)?;
+                let ret_type = if matches!(self.peek(), Token::Arrow) {
+                    self.advance(); Some(self.expect_ident()?)
+                } else { None };
+                let where_clauses = if matches!(self.peek(), Token::Where) {
+                    self.parse_where_clauses()?
+                } else { vec![] };
+                let body = self.parse_block()?;
+                Ok(Stmt::EvolveFn(FnDecl {
+                    name, type_params, params, ret_type, where_clauses, body, vis, is_pure: false,
+                }))
+            }
             _ => {
                 let expr = self.parse_expr()?;
                 // Check for assignment
@@ -1817,4 +1851,38 @@ mod tests {
             assert!(matches!(&body[1], Stmt::Scope(_)));
         }
     }
+
+    #[test]
+    fn test_parse_consciousness_block_string_name() {
+        let src = "consciousness \"test\" {\n  let x = phi\n}";
+        let stmts = parse_source(src);
+        assert!(matches!(&stmts[0], Stmt::ConsciousnessBlock(name, _) if name == "test"));
+    }
+
+    #[test]
+    fn test_parse_consciousness_block_ident_name() {
+        let src = "consciousness engine {\n  let x = 1\n}";
+        let stmts = parse_source(src);
+        assert!(matches!(&stmts[0], Stmt::ConsciousnessBlock(name, _) if name == "engine"));
+    }
+
+    #[test]
+    fn test_parse_evolve_fn_basic() {
+        let src = "@evolve fn improve(x) {\n  x * 2\n}";
+        let stmts = parse_source(src);
+        assert!(matches!(&stmts[0], Stmt::EvolveFn(decl) if decl.name == "improve"));
+    }
+
+    #[test]
+    fn test_parse_evolve_fn_typed() {
+        let src = "@evolve fn compute(x: int) -> int {\n  x + 1\n}";
+        let stmts = parse_source(src);
+        if let Stmt::EvolveFn(decl) = &stmts[0] {
+            assert_eq!(decl.name, "compute");
+            assert_eq!(decl.ret_type.as_deref(), Some("int"));
+        } else {
+            panic!("expected EvolveFn");
+        }
+    }
+
 }

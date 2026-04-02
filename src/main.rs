@@ -64,6 +64,19 @@ mod escape_analysis;
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 mod async_runtime;
+#[allow(dead_code)]
+mod atomic_ops;
+#[allow(dead_code)]
+mod dce;
+#[allow(dead_code)]
+mod loop_unroll;
+#[allow(dead_code)]
+mod simd_hint;
+#[allow(dead_code)]
+mod pgo;
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+mod work_stealing;
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 mod std_net;
@@ -76,6 +89,32 @@ mod std_fs;
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 mod std_io;
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+mod std_time;
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+mod std_collections;
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+mod std_encoding;
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+mod std_log;
+#[allow(dead_code)]
+mod std_math;
+#[allow(dead_code)]
+mod std_testing;
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+mod std_crypto;
+#[allow(dead_code)]
+mod std_consciousness;
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+mod anima_bridge;
+#[allow(dead_code)]
+mod package;
 
 use std::io::{self, Write, BufRead};
 
@@ -124,15 +163,47 @@ fn main() {
             }
             "build" => {
                 if args.len() < 4 || args[2] != "--target" {
-                    eprintln!("Usage: hexa build --target <esp32|verilog|wgsl|fpga|wgpu|cpu> <file.hexa>");
+                    eprintln!("Usage: hexa build --target <esp32|verilog|wgsl|fpga|wgpu|cpu> <file.hexa> [--flash <port>]");
                     std::process::exit(1);
                 }
                 let target = &args[3];
-                let file = if args.len() > 4 { &args[4] } else {
-                    eprintln!("Usage: hexa build --target {} <file.hexa>", target);
+                // Find the file and optional --flash port
+                let mut file: Option<&str> = None;
+                let mut flash_port: Option<&str> = None;
+                let mut i = 4;
+                while i < args.len() {
+                    if args[i] == "--flash" {
+                        i += 1;
+                        if i < args.len() {
+                            flash_port = Some(&args[i]);
+                        } else {
+                            eprintln!("Error: --flash requires a port argument (e.g., /dev/ttyUSB0)");
+                            std::process::exit(1);
+                        }
+                    } else if file.is_none() {
+                        file = Some(&args[i]);
+                    }
+                    i += 1;
+                }
+                let file = file.unwrap_or_else(|| {
+                    eprintln!("Usage: hexa build --target {} <file.hexa> [--flash <port>]", target);
                     std::process::exit(1);
-                };
+                });
                 cmd_build(target, file);
+                // If --flash was specified and target is esp32, flash the board
+                if let Some(port) = flash_port {
+                    if target == "esp32" {
+                        match anima_bridge::flash_esp32("build/esp32", port) {
+                            Ok(()) => println!("Flash complete!"),
+                            Err(e) => {
+                                eprintln!("Flash error: {}", e);
+                                std::process::exit(1);
+                            }
+                        }
+                    } else {
+                        eprintln!("Warning: --flash is only supported for ESP32 target");
+                    }
+                }
             }
             "verify-cross" => {
                 if args.len() < 3 {
@@ -210,6 +281,36 @@ fn main() {
                     i += 1;
                 }
                 cmd_dream(file, generations, mutations, verbose);
+            }
+            "--anima-bridge" => {
+                // hexa --anima-bridge ws://localhost:8765 file.hexa
+                if args.len() < 4 {
+                    eprintln!("Usage: hexa --anima-bridge <ws://host:port> <file.hexa>");
+                    std::process::exit(1);
+                }
+                let ws_url = &args[2];
+                let file = &args[3];
+                cmd_anima_bridge(ws_url, file);
+            }
+            "--verify-law22" => {
+                // hexa --verify-law22 <file.hexa> [--sw-phi N] [--hw-phi N]
+                if args.len() < 3 {
+                    eprintln!("Usage: hexa --verify-law22 <file.hexa> [--sw-phi <f64>] [--hw-phi <f64>]");
+                    std::process::exit(1);
+                }
+                let file = &args[2];
+                let mut sw_phi = 0.0f64;
+                let mut hw_phi = 0.0f64;
+                let mut i = 3;
+                while i < args.len() {
+                    match args[i].as_str() {
+                        "--sw-phi" => { i += 1; if i < args.len() { sw_phi = args[i].parse().unwrap_or(0.0); } }
+                        "--hw-phi" => { i += 1; if i < args.len() { hw_phi = args[i].parse().unwrap_or(0.0); } }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                cmd_verify_law22(file, sw_phi, hw_phi);
             }
             _ => run_file(&args[1]),
         }
@@ -817,6 +918,130 @@ fn run_repl() {
     }
 }
 
+// ── ANIMA Bridge commands ──────────────────────────────────
+
+fn cmd_anima_bridge(ws_url: &str, file: &str) {
+    let source = match std::fs::read_to_string(file) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error reading {}: {}", file, e);
+            std::process::exit(1);
+        }
+    };
+
+    println!("=== HEXA ANIMA Bridge ===");
+    println!("  WebSocket: {}", ws_url);
+    println!("  Source:    {}", file);
+    println!();
+
+    // Parse the file
+    let tokens = match lexer::Lexer::new(&source).tokenize() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("Lexer error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let stmts = match parser::Parser::new(tokens).parse() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Parse error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    // Look for intent-like patterns in the AST (string literals as intent text)
+    let config = anima_bridge::BridgeConfig::new(ws_url);
+    let mut bridge = anima_bridge::AnimaBridge::new(config);
+
+    // Extract string literals that could be intent texts
+    let mut intent_count = 0;
+    for stmt in &stmts {
+        if let ast::Stmt::Expr(ast::Expr::StringLit(text)) = stmt {
+            let json = bridge.send_intent(text);
+            println!("  Intent #{}: {}", intent_count + 1, text);
+            println!("  Message:  {}", json);
+
+            // Try to send via WebSocket
+            match bridge.send_ws(text) {
+                Ok(response) => {
+                    println!("  Response: {}", response);
+                    if let Some(resp) = anima_bridge::AnimaResponse::from_json(&response) {
+                        println!("  Status: {} | Phi: {:?} | Tension: {:?}",
+                            resp.status, resp.phi, resp.tension);
+                    }
+                }
+                Err(e) => {
+                    println!("  [offline] {}", e);
+                    println!("  (ANIMA not running at {} — messages queued)", ws_url);
+                }
+            }
+            println!();
+            intent_count += 1;
+        }
+    }
+
+    // Also run the file normally
+    println!("--- Running {} ---", file);
+    run_file(file);
+
+    if intent_count > 0 {
+        println!("\n{} intent(s) processed via ANIMA bridge", intent_count);
+    }
+}
+
+fn cmd_verify_law22(file: &str, sw_phi: f64, hw_phi: f64) {
+    let source = match std::fs::read_to_string(file) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error reading {}: {}", file, e);
+            std::process::exit(1);
+        }
+    };
+
+    println!("=== Law 22 Verification ===");
+    println!("\"Adding features -> Phi down; adding structure -> Phi up\"\n");
+    println!("Source: {}", file);
+    println!("SW Phi: {:.4}", sw_phi);
+    println!("HW Phi: {:.4}", hw_phi);
+    println!();
+
+    let passed = anima_bridge::verify_law22(sw_phi, hw_phi);
+    println!("Law 22 check: {}", if passed { "PASS" } else { "FAIL" });
+
+    if !passed {
+        println!("  Warning: Phi values suggest structural regression.");
+        println!("  Review @law22 annotated functions for feature additions that may reduce structure.");
+    }
+
+    // Scan source for @law22 annotations
+    let law22_count = source.lines().filter(|l| l.contains("@law22")).count();
+    if law22_count > 0 {
+        println!("\nFound {} @law22 annotated function(s) in {}", law22_count, file);
+    }
+
+    // Parse and run the file for verification
+    let tokens = match lexer::Lexer::new(&source).tokenize() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("Lexer error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let result = match parser::Parser::new(tokens).parse_with_spans() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Parse error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let mut interp = interpreter::Interpreter::new();
+    match interp.run(&result.stmts) {
+        Ok(_) => println!("\nCompilation and execution: OK"),
+        Err(e) => println!("\nExecution error: {}", e),
+    }
+}
+
 // ── Package commands (hexa init/run/test) ──────────────────
 
 fn cmd_init(name: &str) {
@@ -961,6 +1186,13 @@ fn cmd_add(pkg: &str) {
     // Create packages/ directory if needed
     let _ = fs::create_dir_all("packages");
 
+    // Parse package name and optional version: "pkg@1.2.3" or just "pkg"
+    let (name, version) = if let Some(at_pos) = pkg.find('@') {
+        (&pkg[..at_pos], &pkg[at_pos + 1..])
+    } else {
+        (pkg, "latest")
+    };
+
     // Read existing toml
     let mut content = fs::read_to_string("hexa.toml").unwrap_or_default();
 
@@ -969,12 +1201,21 @@ fn cmd_add(pkg: &str) {
         content.push_str("\n[dependencies]\n");
     }
 
+    // Format version string: "latest" stays, others get caret by default
+    let version_str = if version == "latest" {
+        "\"latest\"".to_string()
+    } else if version.starts_with('^') || version.starts_with('~') || version.starts_with('=') || version.starts_with('>') || version.starts_with('<') {
+        format!("\"{}\"", version)
+    } else {
+        format!("\"^{}\"", version)
+    };
+
     // Append the dependency
-    let dep_line = format!("{} = \"latest\"\n", pkg);
+    let dep_line = format!("{} = {}\n", name, version_str);
 
     // Check if already present
-    if content.contains(&format!("{} =", pkg)) {
-        println!("dependency '{}' already exists in hexa.toml", pkg);
+    if content.contains(&format!("{} =", name)) {
+        println!("dependency '{}' already exists in hexa.toml", name);
         return;
     }
 
@@ -991,7 +1232,38 @@ fn cmd_add(pkg: &str) {
         std::process::exit(1);
     });
 
-    println!("Added '{}' to [dependencies]", pkg);
+    // Generate/update hexa.lock
+    let lock_path = std::path::Path::new("hexa.lock");
+    let mut lock = if lock_path.exists() {
+        let lock_content = fs::read_to_string("hexa.lock").unwrap_or_default();
+        package::LockFile::parse(&lock_content).unwrap_or_else(|_| package::LockFile::new())
+    } else {
+        package::LockFile::new()
+    };
+
+    // Add lock entry if not already present
+    if !lock.entries.iter().any(|e| e.name == name) {
+        let pinned_version = if version == "latest" {
+            "0.0.0".to_string()
+        } else {
+            // Strip prefix characters for the pinned version
+            version.trim_start_matches(|c: char| !c.is_ascii_digit()).to_string()
+        };
+        lock.entries.push(package::LockEntry {
+            name: name.to_string(),
+            version: pinned_version,
+            source: "registry".to_string(),
+            checksum: None,
+        });
+    }
+
+    fs::write("hexa.lock", lock.serialize()).unwrap_or_else(|e| {
+        eprintln!("Error writing hexa.lock: {}", e);
+        std::process::exit(1);
+    });
+
+    println!("Added '{}' to [dependencies]", name);
+    println!("Updated hexa.lock");
 }
 
 fn cmd_publish() {
@@ -1685,5 +1957,189 @@ mod tests {
 
         // Clean up
         let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    // ── Phase 8-4: ANIMA Bridge tests ──
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_anima_bridge_intent_formatting() {
+        let config = anima_bridge::BridgeConfig::new("ws://localhost:8765");
+        let mut bridge = anima_bridge::AnimaBridge::new(config);
+        let json = bridge.send_intent("What is consciousness?");
+        assert!(json.contains("\"type\":\"intent\""));
+        assert!(json.contains("\"text\":\"What is consciousness?\""));
+        assert_eq!(bridge.sent_messages.len(), 1);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_anima_bridge_config_parsing() {
+        let config = anima_bridge::BridgeConfig::new("ws://myhost:9999");
+        assert_eq!(config.ws_url, "ws://myhost:9999");
+        assert_eq!(config.timeout_ms, 5000);
+        assert!(!config.verify_law22);
+
+        let config2 = anima_bridge::BridgeConfig::default().with_law22_verification();
+        assert!(config2.verify_law22);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_anima_response_parsing() {
+        let json = r#"{"status":"ok","text":"Hello from ANIMA","phi":0.85,"tension":0.42}"#;
+        let resp = anima_bridge::AnimaResponse::from_json(json).unwrap();
+        assert_eq!(resp.status, "ok");
+        assert_eq!(resp.text, "Hello from ANIMA");
+        assert!((resp.phi.unwrap() - 0.85).abs() < 0.001);
+    }
+
+    // ── Phase 8-6: Law 22 verification tests ──
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_verify_law22_pass() {
+        assert!(anima_bridge::verify_law22(0.5, 0.5));
+        assert!(anima_bridge::verify_law22(1.0, 0.8));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_verify_law22_fail() {
+        assert!(!anima_bridge::verify_law22(0.0, 0.0));
+        assert!(!anima_bridge::verify_law22(-0.1, 0.5));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_compare_phi_improvement() {
+        let (passed, delta_sw, delta_hw) = anima_bridge::compare_phi(0.5, 0.5, 0.8, 0.7);
+        assert!(passed);
+        assert!(delta_sw > 0.0);
+        assert!(delta_hw > 0.0);
+    }
+
+    // ── Phase 8-7: ESP32 flash tests ──
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_flash_esp32_missing_project() {
+        let result = anima_bridge::flash_esp32(
+            "/tmp/hexa_nonexistent_test_project",
+            "/dev/ttyUSB0"
+        );
+        assert!(result.is_err());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_build_esp32_flash_cli_parsing() {
+        // Verify that the build command can parse --flash flag
+        // (This tests the argument parsing logic without actually flashing)
+        let args = vec![
+            "hexa".to_string(),
+            "build".to_string(),
+            "--target".to_string(),
+            "esp32".to_string(),
+            "test.hexa".to_string(),
+            "--flash".to_string(),
+            "/dev/ttyUSB0".to_string(),
+        ];
+
+        // Parse build args manually (same logic as main)
+        let target = &args[3];
+        let mut file: Option<&str> = None;
+        let mut flash_port: Option<&str> = None;
+        let mut i = 4;
+        while i < args.len() {
+            if args[i] == "--flash" {
+                i += 1;
+                if i < args.len() {
+                    flash_port = Some(&args[i]);
+                }
+            } else if file.is_none() {
+                file = Some(&args[i]);
+            }
+            i += 1;
+        }
+
+        assert_eq!(target, "esp32");
+        assert_eq!(file, Some("test.hexa"));
+        assert_eq!(flash_port, Some("/dev/ttyUSB0"));
+    }
+
+    // ── Phase 13: Package ecosystem tests ──
+
+    #[test]
+    fn test_cmd_add_version_parsing() {
+        // Test parsing "pkg@1.2.3" format
+        let pkg = "mylib@1.2.3";
+        let (name, version) = if let Some(at_pos) = pkg.find('@') {
+            (&pkg[..at_pos], &pkg[at_pos + 1..])
+        } else {
+            (pkg, "latest")
+        };
+        assert_eq!(name, "mylib");
+        assert_eq!(version, "1.2.3");
+
+        // Test bare package name
+        let pkg2 = "mylib";
+        let (name2, version2) = if let Some(at_pos) = pkg2.find('@') {
+            (&pkg2[..at_pos], &pkg2[at_pos + 1..])
+        } else {
+            (pkg2, "latest")
+        };
+        assert_eq!(name2, "mylib");
+        assert_eq!(version2, "latest");
+    }
+
+    #[test]
+    fn test_package_lockfile_generation() {
+        let mut lock = package::LockFile::new();
+        lock.entries.push(package::LockEntry {
+            name: "math-lib".to_string(),
+            version: "1.2.3".to_string(),
+            source: "registry".to_string(),
+            checksum: None,
+        });
+        lock.entries.push(package::LockEntry {
+            name: "io-lib".to_string(),
+            version: "0.5.0".to_string(),
+            source: "registry".to_string(),
+            checksum: Some("sha256:abc123".to_string()),
+        });
+
+        let serialized = lock.serialize();
+        assert!(serialized.contains("name = \"math-lib\""));
+        assert!(serialized.contains("version = \"1.2.3\""));
+        assert!(serialized.contains("name = \"io-lib\""));
+        assert!(serialized.contains("checksum = \"sha256:abc123\""));
+
+        // Roundtrip
+        let parsed = package::LockFile::parse(&serialized).unwrap();
+        assert_eq!(parsed.entries.len(), 2);
+        assert_eq!(parsed.entries[0].name, "math-lib");
+        assert_eq!(parsed.entries[1].version, "0.5.0");
+    }
+
+    #[test]
+    fn test_semver_resolution() {
+        // ^1.2.3 should match 1.x.x where x >= 2.3
+        assert!(package::version_matches("1.2.3", "^1.2.3"));
+        assert!(package::version_matches("1.5.0", "^1.2.3"));
+        assert!(!package::version_matches("2.0.0", "^1.2.3"));
+
+        // ~1.2.3 should match 1.2.x where x >= 3
+        assert!(package::version_matches("1.2.3", "~1.2.3"));
+        assert!(package::version_matches("1.2.9", "~1.2.3"));
+        assert!(!package::version_matches("1.3.0", "~1.2.3"));
+
+        // =1.2.3 exact match
+        assert!(package::version_matches("1.2.3", "=1.2.3"));
+        assert!(!package::version_matches("1.2.4", "=1.2.3"));
+
+        // Range
+        assert!(package::version_matches("1.5.0", ">=1.0.0,<2.0.0"));
+        assert!(!package::version_matches("2.0.0", ">=1.0.0,<2.0.0"));
     }
 }

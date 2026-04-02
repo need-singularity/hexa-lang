@@ -502,6 +502,7 @@ impl VM {
                     Value::TraitObject { type_name, .. } => type_name.as_str(),
                     #[cfg(not(target_arch = "wasm32"))]
                     Value::AsyncFuture(_) => "future",
+                    Value::Atomic(_) => "atomic",
                 };
                 Ok(Value::Str(type_name.to_string()))
             }

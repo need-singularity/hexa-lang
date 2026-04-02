@@ -212,6 +212,16 @@ impl Lexer {
             return Ok(Token::Ident("$".to_string()));
         }
 
+        // At-sign attributes: @evolve, etc.
+        if ch == '@' {
+            self.advance();
+            if self.peek().map_or(false, |c| c.is_alphabetic() || c == '_') {
+                let ident = self.read_ident();
+                return Ok(Token::Ident(format!("@{}", ident)));
+            }
+            return Ok(Token::Ident("@".to_string()));
+        }
+
         // Identifiers and keywords
         if ch.is_alphabetic() || ch == '_' {
             let ident = self.read_ident();
@@ -435,5 +445,21 @@ mod tests {
         let tokens = lexer.tokenize_plain().unwrap();
         assert_eq!(tokens[0], Token::BoolLit(true));
         assert_eq!(tokens[1], Token::BoolLit(false));
+    }
+
+    #[test]
+    fn test_lex_at_evolve_token() {
+        let mut lexer = Lexer::new("@evolve fn");
+        let tokens = lexer.tokenize_plain().unwrap();
+        assert_eq!(tokens[0], Token::Ident("@evolve".to_string()));
+        assert_eq!(tokens[1], Token::Fn);
+    }
+
+    #[test]
+    fn test_lex_consciousness_as_ident() {
+        let mut lexer = Lexer::new("consciousness \"test\"");
+        let tokens = lexer.tokenize_plain().unwrap();
+        assert_eq!(tokens[0], Token::Ident("consciousness".to_string()));
+        assert_eq!(tokens[1], Token::StringLit("test".to_string()));
     }
 }
