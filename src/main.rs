@@ -138,6 +138,7 @@ fn run_test(path: &str) {
     }
 }
 
+#[allow(dead_code)]
 fn run_source(source: &str) {
     run_source_with_dir(source, "");
 }

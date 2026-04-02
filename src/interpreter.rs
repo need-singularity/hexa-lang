@@ -2847,4 +2847,94 @@ mylib::double(6) + mylib::MAGIC
         // Clean up
         let _ = std::fs::remove_dir_all("/tmp/hexatest");
     }
+
+    // ── Built-in Option type ──────────────────────────────────
+
+    #[test]
+    fn test_option_some_none() {
+        let src = "let x = Some(42)\nmatch x {\n    Some(val) -> val\n    None -> 0\n}";
+        assert!(matches!(eval(src), Value::Int(42)));
+    }
+
+    #[test]
+    fn test_option_none_match() {
+        let src = "let x = None\nmatch x {\n    Some(val) -> val\n    None -> 99\n}";
+        assert!(matches!(eval(src), Value::Int(99)));
+    }
+
+    #[test]
+    fn test_option_is_some_is_none() {
+        assert!(matches!(eval("Some(42).is_some()"), Value::Bool(true)));
+        assert!(matches!(eval("Some(42).is_none()"), Value::Bool(false)));
+        assert!(matches!(eval("None.is_some()"), Value::Bool(false)));
+        assert!(matches!(eval("None.is_none()"), Value::Bool(true)));
+    }
+
+    #[test]
+    fn test_option_unwrap() {
+        assert!(matches!(eval("Some(42).unwrap()"), Value::Int(42)));
+    }
+
+    #[test]
+    fn test_option_unwrap_or() {
+        assert!(matches!(eval("Some(42).unwrap_or(0)"), Value::Int(42)));
+        assert!(matches!(eval("None.unwrap_or(0)"), Value::Int(0)));
+    }
+
+    // ── Built-in Result type ──────────────────────────────────
+
+    #[test]
+    fn test_result_ok_err_match() {
+        let src = "let r = Ok(42)\nmatch r {\n    Ok(val) -> val\n    Err(msg) -> 0\n}";
+        assert!(matches!(eval(src), Value::Int(42)));
+    }
+
+    #[test]
+    fn test_result_err_match() {
+        let src = "let r = Err(\"not found\")\nmatch r {\n    Ok(val) -> 0\n    Err(msg) -> msg\n}";
+        assert!(matches!(eval(src), Value::Str(s) if s == "not found"));
+    }
+
+    #[test]
+    fn test_result_is_ok_is_err() {
+        assert!(matches!(eval("Ok(1).is_ok()"), Value::Bool(true)));
+        assert!(matches!(eval("Ok(1).is_err()"), Value::Bool(false)));
+        assert!(matches!(eval("Err(\"e\").is_ok()"), Value::Bool(false)));
+        assert!(matches!(eval("Err(\"e\").is_err()"), Value::Bool(true)));
+    }
+
+    #[test]
+    fn test_result_unwrap_or() {
+        assert!(matches!(eval("Ok(42).unwrap_or(0)"), Value::Int(42)));
+        assert!(matches!(eval("Err(\"e\").unwrap_or(0)"), Value::Int(0)));
+    }
+
+    // ── Struct impl methods ───────────────────────────────────
+
+    #[test]
+    fn test_impl_static_method() {
+        let src = "struct Point { x: int, y: int }\nimpl Point {\n    fn new(x: int, y: int) -> Point {\n        return Point { x: x, y: y }\n    }\n}\nlet p = Point::new(3, 4)\np.x";
+        assert!(matches!(eval(src), Value::Int(3)));
+    }
+
+    #[test]
+    fn test_impl_instance_method() {
+        let src = "struct Point { x: int, y: int }\nimpl Point {\n    fn sum(self) -> int {\n        return self.x + self.y\n    }\n}\nlet p = Point { x: 3, y: 4 }\np.sum()";
+        assert!(matches!(eval(src), Value::Int(7)));
+    }
+
+    #[test]
+    fn test_impl_method_with_args() {
+        let src = "struct Counter { val: int }\nimpl Counter {\n    fn add(self, n: int) -> int {\n        return self.val + n\n    }\n}\nlet c = Counter { val: 10 }\nc.add(5)";
+        assert!(matches!(eval(src), Value::Int(15)));
+    }
+
+    #[test]
+    fn test_impl_distance_method() {
+        let src = "struct Point { x: int, y: int }\nimpl Point {\n    fn distance(self) -> float {\n        return sqrt(to_float(self.x * self.x + self.y * self.y))\n    }\n}\nlet p = Point { x: 3, y: 4 }\np.distance()";
+        match eval(src) {
+            Value::Float(f) => assert!((f - 5.0).abs() < 1e-10),
+            other => panic!("expected Float(5.0), got {:?}", other),
+        }
+    }
 }
