@@ -28,7 +28,7 @@ pub enum Expr {
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum Stmt {
-    Let(String, Option<String>, Option<Expr>),   // let name: type = expr
+    Let(String, Option<String>, Option<Expr>, Visibility),   // let name: type = expr, visibility
     Assign(Expr, Expr),
     Expr(Expr),
     Return(Option<Expr>),

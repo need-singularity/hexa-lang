@@ -135,7 +135,7 @@ impl Parser {
         let vis = self.parse_visibility();
 
         match self.peek().clone() {
-            Token::Let => self.parse_let(),
+            Token::Let => self.parse_let(vis),
             Token::Fn => self.parse_fn_decl(vis),
             Token::Struct => self.parse_struct_decl(vis),
             Token::Enum => self.parse_enum_decl(vis),
@@ -148,6 +148,8 @@ impl Parser {
             Token::Proof => self.parse_proof(),
             Token::Assert => self.parse_assert(),
             Token::Intent => self.parse_intent(),
+            Token::Mod => self.parse_mod_decl(),
+            Token::Use => self.parse_use_decl(),
             Token::Try => self.parse_try_catch(),
             Token::Throw => self.parse_throw(),
             _ => {
@@ -174,7 +176,7 @@ impl Parser {
         }
     }
 
-    fn parse_let(&mut self) -> Result<Stmt, HexaError> {
+    fn parse_let(&mut self, vis: Visibility) -> Result<Stmt, HexaError> {
         self.advance(); // consume 'let'
         // optional 'mut'
         if matches!(self.peek(), Token::Mut) {
@@ -191,7 +193,7 @@ impl Parser {
         // = expr
         self.expect(&Token::Eq)?;
         let expr = self.parse_expr()?;
-        Ok(Stmt::Let(name, typ, Some(expr)))
+        Ok(Stmt::Let(name, typ, Some(expr), vis))
     }
 
     fn parse_return(&mut self) -> Result<Stmt, HexaError> {
@@ -252,6 +254,23 @@ impl Parser {
         self.advance(); // consume 'throw'
         let expr = self.parse_expr()?;
         Ok(Stmt::Throw(expr))
+    }
+
+    fn parse_mod_decl(&mut self) -> Result<Stmt, HexaError> {
+        self.advance(); // consume 'mod'
+        let name = self.expect_ident()?;
+        let body = self.parse_block()?;
+        Ok(Stmt::Mod(name, body))
+    }
+
+    fn parse_use_decl(&mut self) -> Result<Stmt, HexaError> {
+        self.advance(); // consume 'use'
+        let mut path = vec![self.expect_ident()?];
+        while matches!(self.peek(), Token::ColonColon) {
+            self.advance(); // consume ::
+            path.push(self.expect_ident()?);
+        }
+        Ok(Stmt::Use(path))
     }
 
     // ── Level 3: Declarations ───────────────────────────────
@@ -739,19 +758,13 @@ impl Parser {
             Token::CharLit(c) => { self.advance(); Ok(Expr::CharLit(c)) }
             Token::Ident(name) => {
                 self.advance();
-                // Check for enum path: Name::Variant or Name::Variant(data)
+                // Check for enum path: Name::Variant
+                // Parenthesized data is handled by postfix Call:
+                //   Name::Variant(data) → Call(EnumPath(Name, Variant, None), [data])
                 if matches!(self.peek(), Token::ColonColon) {
                     self.advance(); // consume ::
                     let variant = self.expect_ident()?;
-                    let data = if matches!(self.peek(), Token::LParen) {
-                        self.advance(); // consume (
-                        let inner = self.parse_expr()?;
-                        self.expect(&Token::RParen)?;
-                        Some(Box::new(inner))
-                    } else {
-                        None
-                    };
-                    Ok(Expr::EnumPath(name, variant, data))
+                    Ok(Expr::EnumPath(name, variant, None))
                 }
                 // Check for struct instantiation: Name { field: val, ... }
                 // Only if name starts with uppercase (convention)

@@ -14,6 +14,8 @@ mod types;
 mod env;
 #[allow(dead_code)]
 mod interpreter;
+#[allow(dead_code)]
+mod type_checker;
 
 use std::io::{self, Write, BufRead};
 
@@ -42,7 +44,7 @@ fn run_file(path: &str) {
             std::process::exit(1);
         }
     };
-    run_source(&source);
+    run_source_with_dir(&source, path);
 }
 
 fn run_test(path: &str) {
@@ -69,6 +71,13 @@ fn run_test(path: &str) {
     };
     let stmts = result.stmts;
     let spans = result.spans;
+
+    // Type checking pass (runs before execution)
+    let mut checker = type_checker::TypeChecker::new();
+    if let Err(e) = checker.check(&stmts, &spans) {
+        eprintln!("{}", e);
+        std::process::exit(1);
+    }
 
     // First pass: run non-proof statements to set up functions/variables
     let mut interp = interpreter::Interpreter::new();
@@ -130,6 +139,10 @@ fn run_test(path: &str) {
 }
 
 fn run_source(source: &str) {
+    run_source_with_dir(source, "");
+}
+
+fn run_source_with_dir(source: &str, file_path: &str) {
     let tokens = match lexer::Lexer::new(source).tokenize() {
         Ok(t) => t,
         Err(e) => {
@@ -144,7 +157,20 @@ fn run_source(source: &str) {
             std::process::exit(1);
         }
     };
+    // Type checking pass (runs before execution)
+    let mut checker = type_checker::TypeChecker::new();
+    if let Err(e) = checker.check(&result.stmts, &result.spans) {
+        eprintln!("{}", e);
+        std::process::exit(1);
+    }
     let mut interp = interpreter::Interpreter::new();
+    // Set source directory for module resolution
+    if !file_path.is_empty() {
+        let path = std::path::Path::new(file_path);
+        if let Some(parent) = path.parent() {
+            interp.source_dir = Some(parent.to_string_lossy().to_string());
+        }
+    }
     match interp.run_with_spans(&result.stmts, &result.spans) {
         Ok(_) => {}
         Err(e) => {
@@ -199,6 +225,12 @@ fn run_repl() {
                 continue;
             }
         };
+        // Type checking pass
+        let mut checker = type_checker::TypeChecker::new();
+        if let Err(e) = checker.check(&result.stmts, &result.spans) {
+            eprintln!("{}", e);
+            continue;
+        }
         match interp.run_with_spans(&result.stmts, &result.spans) {
             Ok(val) => match &val {
                 env::Value::Void => {}

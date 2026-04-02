@@ -113,6 +113,11 @@ impl Env {
         env.define("env_var", Value::BuiltinFn("env_var".into()));
         env.define("exit", Value::BuiltinFn("exit".into()));
         env.define("clock", Value::BuiltinFn("clock".into()));
+        // Built-in Option/Result constructors
+        env.define("Some", Value::BuiltinFn("Some".into()));
+        env.define("None", Value::EnumVariant("Option".into(), "None".into(), None));
+        env.define("Ok", Value::BuiltinFn("Ok".into()));
+        env.define("Err", Value::BuiltinFn("Err".into()));
         env
     }
 

@@ -4,6 +4,8 @@ use std::collections::HashMap;
 use crate::ast::*;
 use crate::env::{Env, Value};
 use crate::error::{HexaError, ErrorClass};
+use crate::lexer::Lexer;
+use crate::parser::Parser;
 
 /// Sentinel error message used to propagate `return` across call frames.
 const RETURN_SENTINEL: &str = "__hexa_return__";
@@ -21,12 +23,29 @@ pub struct Interpreter {
     struct_defs: HashMap<String, Vec<(String, String, Visibility)>>,
     /// Enum declarations: name -> list of (variant_name, optional_data_types)
     enum_defs: HashMap<String, Vec<(String, Option<Vec<String>>)>>,
+    /// Impl methods: type_name -> method_name -> (param_names, body)
+    type_methods: HashMap<String, HashMap<String, (Vec<String>, Vec<Stmt>)>>,
+    /// Module scopes: module_name -> module data (public bindings, struct/enum defs)
+    modules: HashMap<String, ModuleData>,
     /// When true, proof blocks are executed as tests
     pub test_mode: bool,
     /// Current source line for error reporting (1-based, 0 = unknown).
     pub current_line: usize,
     /// Current source column for error reporting (1-based, 0 = unknown).
     pub current_col: usize,
+    /// Directory of the currently executing file (for resolving `use` paths).
+    pub source_dir: Option<String>,
+}
+
+/// Stored data for a loaded/declared module.
+#[derive(Clone)]
+struct ModuleData {
+    /// Public bindings (name -> value)
+    pub_bindings: HashMap<String, Value>,
+    /// Struct defs exported from module
+    struct_defs: HashMap<String, Vec<(String, String, Visibility)>>,
+    /// Enum defs exported from module
+    enum_defs: HashMap<String, Vec<(String, Option<Vec<String>>)>>,
 }
 
 impl Interpreter {
@@ -37,9 +56,12 @@ impl Interpreter {
             throw_value: None,
             struct_defs: HashMap::new(),
             enum_defs: HashMap::new(),
+            type_methods: HashMap::new(),
+            modules: HashMap::new(),
             test_mode: false,
             current_line: 0,
             current_col: 0,
+            source_dir: None,
         }
     }
 
@@ -85,7 +107,7 @@ impl Interpreter {
 
     fn exec_stmt(&mut self, stmt: &Stmt) -> Result<Value, HexaError> {
         match stmt {
-            Stmt::Let(name, _typ, expr) => {
+            Stmt::Let(name, _typ, expr, _vis) => {
                 let val = match expr {
                     Some(e) => self.eval_expr(e)?,
                     None => Value::Void,
@@ -229,11 +251,27 @@ impl Interpreter {
                 self.enum_defs.insert(decl.name.clone(), decl.variants.clone());
                 Ok(Value::Void)
             }
-            // Declarations we don't fully interpret yet
-            Stmt::TraitDecl(_) | Stmt::ImplBlock(_) => {
+            Stmt::TraitDecl(_) => {
                 Ok(Value::Void)
             }
-            Stmt::Intent(_, _) | Stmt::Mod(_, _) | Stmt::Use(_) => Ok(Value::Void),
+            Stmt::ImplBlock(impl_block) => {
+                let target = impl_block.target.clone();
+                let methods_map = self.type_methods.entry(target).or_insert_with(HashMap::new);
+                for method in &impl_block.methods {
+                    let param_names: Vec<String> = method.params.iter().map(|p| p.name.clone()).collect();
+                    methods_map.insert(method.name.clone(), (param_names, method.body.clone()));
+                }
+                Ok(Value::Void)
+            }
+            Stmt::Intent(_, _) => Ok(Value::Void),
+            Stmt::Mod(name, body) => {
+                self.exec_mod(name, body)?;
+                Ok(Value::Void)
+            }
+            Stmt::Use(path) => {
+                self.exec_use(path)?;
+                Ok(Value::Void)
+            }
             Stmt::TryCatch(try_block, err_name, catch_block) => {
                 // Save state
                 let had_throw = self.throw_value.take();
@@ -345,6 +383,66 @@ impl Interpreter {
                         arg_vals.push(self.eval_expr(a)?);
                     }
                     return self.call_method(obj_val, method_name, arg_vals);
+                }
+                // Check for path::member(args) pattern (module func or enum variant)
+                if let Expr::EnumPath(path_name, member_name, None) = callee.as_ref() {
+                    let mut arg_vals = Vec::new();
+                    for a in args {
+                        arg_vals.push(self.eval_expr(a)?);
+                    }
+                    // Try module function first
+                    if let Some(module) = self.modules.get(path_name) {
+                        if let Some(val) = module.pub_bindings.get(member_name).cloned() {
+                            return self.call_function(val, arg_vals);
+                        }
+                        return Err(self.runtime_err(format!(
+                            "'{}' is not public or does not exist in module '{}'",
+                            member_name, path_name
+                        )));
+                    }
+                    // Try enum variant with data
+                    if let Some(variants) = self.enum_defs.get(path_name).cloned() {
+                        if variants.iter().any(|(name, _)| name == member_name) {
+                            let data = if arg_vals.len() == 1 {
+                                Some(Box::new(arg_vals.into_iter().next().unwrap()))
+                            } else if arg_vals.is_empty() {
+                                None
+                            } else {
+                                return Err(self.runtime_err("enum variant takes 0 or 1 arguments".into()));
+                            };
+                            return Ok(Value::EnumVariant(path_name.clone(), member_name.clone(), data));
+                        }
+                    }
+                    // Try type methods (associated functions)
+                    if let Some(method_def) = self.type_methods.get(path_name).and_then(|m| m.get(member_name)).cloned() {
+                        let (params, body) = method_def;
+                        if !params.is_empty() && params[0] == "self" {
+                            return Err(self.runtime_err(format!(
+                                "{}::{} is an instance method", path_name, member_name
+                            )));
+                        }
+                        if arg_vals.len() != params.len() {
+                            return Err(self.runtime_err(format!(
+                                "{}::{} expected {} arguments, got {}",
+                                path_name, member_name, params.len(), arg_vals.len()
+                            )));
+                        }
+                        self.env.push_scope();
+                        for (param, arg) in params.iter().zip(arg_vals) {
+                            self.env.define(param, arg);
+                        }
+                        let mut result = Value::Void;
+                        for stmt in &body {
+                            result = self.exec_stmt(stmt)?;
+                            if self.return_value.is_some() {
+                                result = self.return_value.take().unwrap();
+                                break;
+                            }
+                        }
+                        self.env.pop_scope();
+                        return Ok(result);
+                    }
+                    return Err(self.runtime_err(format!("undefined enum, type, or module: {}", path_name)));
                 }
                 let func = self.eval_expr(callee)?;
                 let mut arg_vals = Vec::new();
@@ -522,22 +620,76 @@ impl Interpreter {
                 Ok(Value::Map(map))
             }
             Expr::EnumPath(enum_name, variant_name, data_expr) => {
-                // Verify enum is defined
-                let variants = self.enum_defs.get(enum_name).ok_or_else(|| {
-                    self.runtime_err(format!("undefined enum: {}", enum_name))
-                })?.clone();
-                // Verify variant exists
-                let variant_def = variants.iter().find(|(name, _)| name == variant_name);
-                if variant_def.is_none() {
+                // Check if it's an enum variant
+                if let Some(variants) = self.enum_defs.get(enum_name).cloned() {
+                    let variant_def = variants.iter().find(|(name, _)| name == variant_name);
+                    if variant_def.is_some() {
+                        let data = match data_expr {
+                            Some(expr) => Some(Box::new(self.eval_expr(expr)?)),
+                            None => None,
+                        };
+                        return Ok(Value::EnumVariant(enum_name.clone(), variant_name.clone(), data));
+                    }
+                }
+                // Check if it's a static/associated method call: Type::method(args)
+                if let Some(method_def) = self.type_methods.get(enum_name).and_then(|m| m.get(variant_name)).cloned() {
+                    let (params, body) = method_def;
+                    // Evaluate data_expr as arguments if present
+                    let mut arg_vals = Vec::new();
+                    if let Some(expr) = data_expr {
+                        arg_vals.push(self.eval_expr(expr)?);
+                    }
+                    // Check that it's not an instance method (no self)
+                    if !params.is_empty() && params[0] == "self" {
+                        return Err(self.runtime_err(format!(
+                            "{}::{} is an instance method, use value.{}() instead",
+                            enum_name, variant_name, variant_name
+                        )));
+                    }
+                    if arg_vals.len() != params.len() {
+                        return Err(self.runtime_err(format!(
+                            "{}::{} expected {} arguments, got {}",
+                            enum_name, variant_name, params.len(), arg_vals.len()
+                        )));
+                    }
+                    self.env.push_scope();
+                    for (param, arg) in params.iter().zip(arg_vals) {
+                        self.env.define(param, arg);
+                    }
+                    let mut result = Value::Void;
+                    for stmt in &body {
+                        result = self.exec_stmt(stmt)?;
+                        if self.return_value.is_some() {
+                            result = self.return_value.take().unwrap();
+                            break;
+                        }
+                    }
+                    self.env.pop_scope();
+                    return Ok(result);
+                }
+                // Check if it's a module member access: module::member
+                if let Some(module) = self.modules.get(enum_name) {
+                    // Check public bindings
+                    if let Some(val) = module.pub_bindings.get(variant_name).cloned() {
+                        // If data_expr provided, it's a function call: mod::func(args)
+                        if let Some(expr) = data_expr {
+                            let arg = self.eval_expr(expr)?;
+                            return self.call_function(val.clone(), vec![arg]);
+                        }
+                        return Ok(val);
+                    }
+                    // Check module enum defs
+                    if let Some(variants) = module.enum_defs.get(variant_name) {
+                        // This would be mod::EnumName which isn't quite right for our syntax
+                        // In practice users will do mod::func() or mod::VAR
+                        let _ = variants;
+                    }
                     return Err(self.runtime_err(format!(
-                        "enum {} has no variant {}", enum_name, variant_name
+                        "'{}' is not public or does not exist in module '{}'",
+                        variant_name, enum_name
                     )));
                 }
-                let data = match data_expr {
-                    Some(expr) => Some(Box::new(self.eval_expr(expr)?)),
-                    None => None,
-                };
-                Ok(Value::EnumVariant(enum_name.clone(), variant_name.clone(), data))
+                Err(self.runtime_err(format!("undefined enum, type, or module: {}", enum_name)))
             }
             Expr::Wildcard => {
                 // Wildcard should only appear in match patterns, not as a standalone expression
@@ -714,7 +866,80 @@ impl Interpreter {
             Value::Str(s) => self.call_string_method(s, method, args),
             Value::Array(a) => self.call_array_method(a, method, args),
             Value::Map(m) => self.call_map_method(m, method, args),
+            Value::EnumVariant(enum_name, variant, data) => {
+                self.call_enum_method(enum_name, variant, data.as_ref().map(|b| b.as_ref()), method, args)
+            }
+            Value::Struct(struct_name, _fields) => {
+                // Look up impl methods
+                let struct_name = struct_name.clone();
+                if let Some(method_def) = self.type_methods.get(&struct_name).and_then(|m| m.get(method)) {
+                    let (params, body) = method_def.clone();
+                    if params.is_empty() || params[0] != "self" {
+                        return Err(self.runtime_err(format!("method {} is not an instance method (no self parameter)", method)));
+                    }
+                    if args.len() + 1 != params.len() {
+                        return Err(self.runtime_err(format!(
+                            "method {} expected {} arguments, got {}",
+                            method, params.len() - 1, args.len()
+                        )));
+                    }
+                    self.env.push_scope();
+                    self.env.define("self", obj);
+                    for (param, arg) in params[1..].iter().zip(args) {
+                        self.env.define(param, arg);
+                    }
+                    let mut result = Value::Void;
+                    for stmt in &body {
+                        result = self.exec_stmt(stmt)?;
+                        if self.return_value.is_some() {
+                            result = self.return_value.take().unwrap();
+                            break;
+                        }
+                    }
+                    self.env.pop_scope();
+                    Ok(result)
+                } else {
+                    Err(self.runtime_err(format!("no method .{}() on struct {}", method, struct_name)))
+                }
+            }
             _ => Err(self.runtime_err(format!("no method .{}() on {:?}", method, obj))),
+        }
+    }
+
+    fn call_enum_method(&mut self, enum_name: &str, variant: &str, data: Option<&Value>, method: &str, args: Vec<Value>) -> Result<Value, HexaError> {
+        match (enum_name, method) {
+            ("Option", "is_some") => Ok(Value::Bool(variant == "Some")),
+            ("Option", "is_none") => Ok(Value::Bool(variant == "None")),
+            ("Option", "unwrap") => {
+                match (variant, data) {
+                    ("Some", Some(val)) => Ok(val.clone()),
+                    _ => Err(self.runtime_err("called unwrap() on None".into())),
+                }
+            }
+            ("Option", "unwrap_or") => {
+                if args.is_empty() { return Err(self.type_err("unwrap_or() requires 1 argument".into())); }
+                match (variant, data) {
+                    ("Some", Some(val)) => Ok(val.clone()),
+                    _ => Ok(args.into_iter().next().unwrap()),
+                }
+            }
+            ("Result", "is_ok") => Ok(Value::Bool(variant == "Ok")),
+            ("Result", "is_err") => Ok(Value::Bool(variant == "Err")),
+            ("Result", "unwrap") => {
+                match (variant, data) {
+                    ("Ok", Some(val)) => Ok(val.clone()),
+                    ("Err", Some(val)) => Err(self.runtime_err(format!("called unwrap() on Err({})", val))),
+                    _ => Err(self.runtime_err("called unwrap() on Err".into())),
+                }
+            }
+            ("Result", "unwrap_or") => {
+                if args.is_empty() { return Err(self.type_err("unwrap_or() requires 1 argument".into())); }
+                match (variant, data) {
+                    ("Ok", Some(val)) => Ok(val.clone()),
+                    _ => Ok(args.into_iter().next().unwrap()),
+                }
+            }
+            _ => Err(self.runtime_err(format!("no method .{}() on {}::{}", method, enum_name, variant))),
         }
     }
 
@@ -1202,6 +1427,19 @@ impl Interpreter {
                 let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
                 Ok(Value::Float(now.as_secs_f64()))
             }
+            // ── Built-in Option/Result constructors ───────────────────
+            "Some" => {
+                if args.len() != 1 { return Err(self.type_err("Some() requires 1 argument".into())); }
+                Ok(Value::EnumVariant("Option".into(), "Some".into(), Some(Box::new(args.into_iter().next().unwrap()))))
+            }
+            "Ok" => {
+                if args.len() != 1 { return Err(self.type_err("Ok() requires 1 argument".into())); }
+                Ok(Value::EnumVariant("Result".into(), "Ok".into(), Some(Box::new(args.into_iter().next().unwrap()))))
+            }
+            "Err" => {
+                if args.len() != 1 { return Err(self.type_err("Err() requires 1 argument".into())); }
+                Ok(Value::EnumVariant("Result".into(), "Err".into(), Some(Box::new(args.into_iter().next().unwrap()))))
+            }
             _ => Err(HexaError {
                 class: ErrorClass::Name,
                 message: format!("unknown builtin: {}", name),
@@ -1257,6 +1495,77 @@ impl Interpreter {
                 }
             }
 
+            // Built-in constructor patterns: Some(binding), Ok(binding), Err(binding)
+            Expr::Call(callee, call_args) => {
+                if let Expr::Ident(ctor_name) = callee.as_ref() {
+                    let maybe_ctor = match ctor_name.as_str() {
+                        "Some" => Some(("Option", "Some")),
+                        "Ok" => Some(("Result", "Ok")),
+                        "Err" => Some(("Result", "Err")),
+                        _ => None,
+                    };
+                    if let Some((enum_name, variant_name)) = maybe_ctor {
+                        match val {
+                            Value::EnumVariant(val_enum, val_variant, val_data) => {
+                                if val_enum != enum_name || val_variant != variant_name {
+                                    return Ok(None);
+                                }
+                                if call_args.len() == 1 {
+                                    if let Some(data) = val_data {
+                                        match &call_args[0] {
+                                            Expr::Ident(binding_name) => {
+                                                return Ok(Some(vec![(binding_name.clone(), data.as_ref().clone())]));
+                                            }
+                                            _ => {
+                                                let pattern_val = self.eval_expr(&call_args[0])?;
+                                                if Self::values_equal(data.as_ref(), &pattern_val) {
+                                                    return Ok(Some(vec![]));
+                                                } else {
+                                                    return Ok(None);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    return Ok(None);
+                                }
+                                if call_args.is_empty() && val_data.is_none() {
+                                    return Ok(Some(vec![]));
+                                }
+                                return Ok(None);
+                            }
+                            _ => return Ok(None),
+                        }
+                    }
+                }
+                // Not a known constructor pattern, evaluate as expression
+                let pattern_val = self.eval_expr(pattern)?;
+                if Self::values_equal(val, &pattern_val) {
+                    Ok(Some(vec![]))
+                } else {
+                    Ok(None)
+                }
+            }
+
+            // Ident pattern: check if it's a known enum constant (like None)
+            Expr::Ident(name) => {
+                if let Some(const_val) = self.env.get(name) {
+                    if matches!(&const_val, Value::EnumVariant(..)) {
+                        if Self::values_equal(val, &const_val) {
+                            return Ok(Some(vec![]));
+                        } else {
+                            return Ok(None);
+                        }
+                    }
+                }
+                // Otherwise evaluate normally
+                let pattern_val = self.eval_expr(pattern)?;
+                if Self::values_equal(val, &pattern_val) {
+                    Ok(Some(vec![]))
+                } else {
+                    Ok(None)
+                }
+            }
+
             // Literal/expression: evaluate and compare
             _ => {
                 let pattern_val = self.eval_expr(pattern)?;
@@ -1281,6 +1590,140 @@ impl Interpreter {
         }
         self.env.pop_scope();
         Ok(last)
+    }
+
+    // ── Module execution ─────────────────────────────────────
+
+    /// Execute an inline `mod name { ... }` block. Public declarations become
+    /// the module's exported bindings.
+    fn exec_mod(&mut self, name: &str, body: &[Stmt]) -> Result<(), HexaError> {
+        let mut mod_data = ModuleData {
+            pub_bindings: HashMap::new(),
+            struct_defs: HashMap::new(),
+            enum_defs: HashMap::new(),
+        };
+
+        // Execute each statement; collect public declarations
+        self.env.push_scope();
+        for stmt in body {
+            self.exec_stmt(stmt)?;
+            match stmt {
+                Stmt::FnDecl(decl) => {
+                    if decl.vis == Visibility::Public {
+                        let param_names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
+                        mod_data.pub_bindings.insert(
+                            decl.name.clone(),
+                            Value::Fn(decl.name.clone(), param_names, decl.body.clone()),
+                        );
+                    }
+                }
+                Stmt::Let(lname, _, _, vis) => {
+                    if *vis == Visibility::Public {
+                        if let Some(val) = self.env.get(lname) {
+                            mod_data.pub_bindings.insert(lname.clone(), val);
+                        }
+                    }
+                }
+                Stmt::StructDecl(decl) => {
+                    if decl.vis == Visibility::Public {
+                        mod_data.struct_defs.insert(decl.name.clone(), decl.fields.clone());
+                    }
+                }
+                Stmt::EnumDecl(decl) => {
+                    if decl.vis == Visibility::Public {
+                        mod_data.enum_defs.insert(decl.name.clone(), decl.variants.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.env.pop_scope();
+        self.modules.insert(name.to_string(), mod_data);
+        Ok(())
+    }
+
+    /// Execute a `use path` statement. Loads an external .hexa file and registers
+    /// it as a module.
+    fn exec_use(&mut self, path: &[String]) -> Result<(), HexaError> {
+        if path.is_empty() {
+            return Err(self.runtime_err("empty use path".into()));
+        }
+
+        let module_name = path.last().unwrap().clone();
+
+        // Already loaded?
+        if self.modules.contains_key(&module_name) {
+            return Ok(());
+        }
+
+        // Resolve file path
+        let base_dir = self.source_dir.clone().unwrap_or_else(|| ".".to_string());
+        let rel_path = path.join("/");
+        let file_path = format!("{}/{}.hexa", base_dir, rel_path);
+
+        let source = std::fs::read_to_string(&file_path).map_err(|e| {
+            self.runtime_err(format!("cannot load module '{}': {} (looked for {})", path.join("::"), e, file_path))
+        })?;
+
+        // Lex + parse
+        let tokens = Lexer::new(&source).tokenize().map_err(|e| {
+            self.runtime_err(format!("syntax error in module '{}': {}", module_name, e))
+        })?;
+        let stmts = Parser::new(tokens).parse().map_err(|e| {
+            HexaError {
+                class: ErrorClass::Syntax,
+                message: format!("parse error in module '{}': {}", module_name, e.message),
+                line: e.line,
+                col: e.col,
+            }
+        })?;
+
+        // Execute in isolated scope, collect public bindings
+        let mut mod_data = ModuleData {
+            pub_bindings: HashMap::new(),
+            struct_defs: HashMap::new(),
+            enum_defs: HashMap::new(),
+        };
+
+        self.env.push_scope();
+        for stmt in &stmts {
+            self.exec_stmt(stmt)?;
+            match stmt {
+                Stmt::FnDecl(decl) => {
+                    if decl.vis == Visibility::Public {
+                        let param_names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
+                        mod_data.pub_bindings.insert(
+                            decl.name.clone(),
+                            Value::Fn(decl.name.clone(), param_names, decl.body.clone()),
+                        );
+                    }
+                }
+                Stmt::Let(lname, _, _, vis) => {
+                    if *vis == Visibility::Public {
+                        if let Some(val) = self.env.get(lname) {
+                            mod_data.pub_bindings.insert(lname.clone(), val);
+                        }
+                    }
+                }
+                Stmt::StructDecl(decl) => {
+                    if decl.vis == Visibility::Public {
+                        mod_data.struct_defs.insert(decl.name.clone(), decl.fields.clone());
+                        // Also register in global struct_defs so struct init works
+                        self.struct_defs.insert(decl.name.clone(), decl.fields.clone());
+                    }
+                }
+                Stmt::EnumDecl(decl) => {
+                    if decl.vis == Visibility::Public {
+                        mod_data.enum_defs.insert(decl.name.clone(), decl.variants.clone());
+                        self.enum_defs.insert(decl.name.clone(), decl.variants.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.env.pop_scope();
+        self.modules.insert(module_name, mod_data);
+        Ok(())
     }
 
     fn capture_env(&self) -> Vec<(String, Value)> {
@@ -2240,5 +2683,168 @@ match x {
         let tokens = Lexer::new(src).tokenize().unwrap();
         let err = Parser::new(tokens).parse().unwrap_err();
         assert!(err.line > 0, "syntax error should have a line number, got: {}", err);
+    }
+
+    // ── Module system tests ──────────────────────────────────
+
+    #[test]
+    fn test_inline_mod_pub_fn() {
+        let src = r#"
+mod math {
+    pub fn add(a: int, b: int) -> int {
+        return a + b
+    }
+}
+math::add(3, 4)
+"#;
+        assert!(matches!(eval(src), Value::Int(7)));
+    }
+
+    #[test]
+    fn test_inline_mod_private_fn_rejected() {
+        let src = r#"
+mod math {
+    fn secret() -> int {
+        return 42
+    }
+}
+math::secret()
+"#;
+        let tokens = Lexer::new(src).tokenize().unwrap();
+        let stmts = Parser::new(tokens).parse().unwrap();
+        let mut interp = Interpreter::new();
+        let result = interp.run(&stmts);
+        assert!(result.is_err(), "accessing private function should fail");
+        assert!(result.unwrap_err().message.contains("not public"));
+    }
+
+    #[test]
+    fn test_inline_mod_pub_let() {
+        let src = r#"
+mod constants {
+    pub let PI = 3
+    let SECRET = 999
+}
+constants::PI
+"#;
+        assert!(matches!(eval(src), Value::Int(3)));
+    }
+
+    #[test]
+    fn test_inline_mod_private_let_rejected() {
+        let src = r#"
+mod constants {
+    pub let PI = 3
+    let SECRET = 999
+}
+constants::SECRET
+"#;
+        let tokens = Lexer::new(src).tokenize().unwrap();
+        let stmts = Parser::new(tokens).parse().unwrap();
+        let mut interp = Interpreter::new();
+        let result = interp.run(&stmts);
+        assert!(result.is_err(), "accessing private variable should fail");
+    }
+
+    #[test]
+    fn test_inline_mod_multiple_pub_fns() {
+        let src = r#"
+mod math {
+    pub fn add(a: int, b: int) -> int {
+        return a + b
+    }
+    pub fn mul(a: int, b: int) -> int {
+        return a * b
+    }
+}
+math::add(2, 3) + math::mul(4, 5)
+"#;
+        assert!(matches!(eval(src), Value::Int(25)));
+    }
+
+    #[test]
+    fn test_inline_mod_does_not_leak() {
+        // Variables defined inside a module should not leak to outer scope
+        let src = r#"
+mod mymod {
+    pub fn get() -> int {
+        return 42
+    }
+    let internal = 100
+}
+mymod::get()
+"#;
+        assert!(matches!(eval(src), Value::Int(42)));
+        // And `internal` should not be visible
+        let src2 = r#"
+mod mymod {
+    let internal = 100
+}
+internal
+"#;
+        let tokens = Lexer::new(src2).tokenize().unwrap();
+        let stmts = Parser::new(tokens).parse().unwrap();
+        let mut interp = Interpreter::new();
+        let result = interp.run(&stmts);
+        assert!(result.is_err(), "module internal variable should not leak");
+    }
+
+    #[test]
+    fn test_use_file_module() {
+        // Create a temporary module file and test loading it
+        let mod_src = "pub fn double(x: int) -> int {\n    return x * 2\n}\npub let MAGIC = 42\nfn internal() -> int {\n    return 0\n}\n";
+        std::fs::write("/tmp/mylib.hexa", mod_src).unwrap();
+
+        let src = r#"
+use mylib
+mylib::double(6) + mylib::MAGIC
+"#;
+        let tokens = Lexer::new(src).tokenize().unwrap();
+        let stmts = Parser::new(tokens).parse().unwrap();
+        let mut interp = Interpreter::new();
+        interp.source_dir = Some("/tmp".to_string());
+        match interp.run(&stmts) {
+            Ok(Value::Int(54)) => {} // 12 + 42
+            other => panic!("expected Int(54), got {:?}", other),
+        }
+
+        // Clean up
+        let _ = std::fs::remove_file("/tmp/mylib.hexa");
+    }
+
+    #[test]
+    fn test_use_file_private_rejected() {
+        let mod_src = "fn internal() -> int {\n    return 0\n}\n";
+        std::fs::write("/tmp/privmod.hexa", mod_src).unwrap();
+
+        let src = "use privmod\nprivmod::internal()";
+        let tokens = Lexer::new(src).tokenize().unwrap();
+        let stmts = Parser::new(tokens).parse().unwrap();
+        let mut interp = Interpreter::new();
+        interp.source_dir = Some("/tmp".to_string());
+        let result = interp.run(&stmts);
+        assert!(result.is_err(), "accessing private function in file module should fail");
+
+        let _ = std::fs::remove_file("/tmp/privmod.hexa");
+    }
+
+    #[test]
+    fn test_use_nested_path() {
+        // Create nested directory structure
+        let _ = std::fs::create_dir_all("/tmp/hexatest/utils");
+        std::fs::write("/tmp/hexatest/utils/helper.hexa", "pub fn greet() -> string {\n    return \"hello\"\n}\n").unwrap();
+
+        let src = "use utils::helper\nhelper::greet()";
+        let tokens = Lexer::new(src).tokenize().unwrap();
+        let stmts = Parser::new(tokens).parse().unwrap();
+        let mut interp = Interpreter::new();
+        interp.source_dir = Some("/tmp/hexatest".to_string());
+        match interp.run(&stmts) {
+            Ok(Value::Str(s)) if s == "hello" => {}
+            other => panic!("expected Str(hello), got {:?}", other),
+        }
+
+        // Clean up
+        let _ = std::fs::remove_dir_all("/tmp/hexatest");
     }
 }
