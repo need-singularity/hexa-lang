@@ -20,7 +20,15 @@ use std::io::{self, Write, BufRead};
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() > 1 {
-        run_file(&args[1]);
+        if args[1] == "--test" {
+            if args.len() < 3 {
+                eprintln!("Usage: hexa --test <file.hexa>");
+                std::process::exit(1);
+            }
+            run_test(&args[2]);
+        } else {
+            run_file(&args[1]);
+        }
     } else {
         run_repl();
     }
@@ -37,6 +45,90 @@ fn run_file(path: &str) {
     run_source(&source);
 }
 
+fn run_test(path: &str) {
+    let source = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error reading {}: {}", path, e);
+            std::process::exit(1);
+        }
+    };
+    let tokens = match lexer::Lexer::new(&source).tokenize() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(1);
+        }
+    };
+    let result = match parser::Parser::new(tokens).parse_with_spans() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(1);
+        }
+    };
+    let stmts = result.stmts;
+    let spans = result.spans;
+
+    // First pass: run non-proof statements to set up functions/variables
+    let mut interp = interpreter::Interpreter::new();
+    interp.test_mode = true;
+
+    // Collect proof blocks and execute everything
+    let mut proof_names: Vec<String> = Vec::new();
+    for stmt in &stmts {
+        if let ast::Stmt::Proof(name, _) = stmt {
+            proof_names.push(name.clone());
+        }
+    }
+
+    // Execute all statements (proof blocks will run in test mode)
+    let mut passed = 0usize;
+    let mut failed = 0usize;
+    let mut _current_proof = String::new();
+
+    for (i, stmt) in stmts.iter().enumerate() {
+        if let Some(&(line, col)) = spans.get(i) {
+            interp.current_line = line;
+            interp.current_col = col;
+        }
+        match stmt {
+            ast::Stmt::Proof(name, body) => {
+                _current_proof = name.clone();
+                interp.env.push_scope();
+                let mut test_failed = false;
+                for s in body {
+                    match interp.run(&[s.clone()]) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            println!("proof {} ... FAILED: {}", name, e.message);
+                            test_failed = true;
+                            failed += 1;
+                            break;
+                        }
+                    }
+                }
+                interp.env.pop_scope();
+                if !test_failed {
+                    println!("proof {} ... ok", name);
+                    passed += 1;
+                }
+            }
+            other => {
+                if let Err(e) = interp.run(&[other.clone()]) {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+
+    println!("\ntest result: {} passed, {} failed (total {})", passed, failed, passed + failed);
+    if failed > 0 {
+        std::process::exit(1);
+    }
+}
+
 fn run_source(source: &str) {
     let tokens = match lexer::Lexer::new(source).tokenize() {
         Ok(t) => t,
@@ -45,15 +137,15 @@ fn run_source(source: &str) {
             std::process::exit(1);
         }
     };
-    let stmts = match parser::Parser::new(tokens).parse() {
-        Ok(s) => s,
+    let result = match parser::Parser::new(tokens).parse_with_spans() {
+        Ok(r) => r,
         Err(e) => {
             eprintln!("{}", e);
             std::process::exit(1);
         }
     };
     let mut interp = interpreter::Interpreter::new();
-    match interp.run(&stmts) {
+    match interp.run_with_spans(&result.stmts, &result.spans) {
         Ok(_) => {}
         Err(e) => {
             eprintln!("{}", e);
@@ -100,14 +192,14 @@ fn run_repl() {
                 continue;
             }
         };
-        let stmts = match parser::Parser::new(tokens).parse() {
-            Ok(s) => s,
+        let result = match parser::Parser::new(tokens).parse_with_spans() {
+            Ok(r) => r,
             Err(e) => {
                 eprintln!("{}", e);
                 continue;
             }
         };
-        match interp.run(&stmts) {
+        match interp.run_with_spans(&result.stmts, &result.spans) {
             Ok(val) => match &val {
                 env::Value::Void => {}
                 _ => println!("{}", val),

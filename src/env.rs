@@ -19,6 +19,7 @@ pub enum Value {
     Lambda(Vec<String>, Vec<crate::ast::Stmt>, Vec<(String, Value)>), // params, body, captured env
     Map(HashMap<String, Value>),  // key-value map
     Error(String),  // error value for try/catch
+    EnumVariant(String, String, Option<Box<Value>>),  // enum_name, variant_name, data
 }
 
 impl std::fmt::Display for Value {
@@ -53,6 +54,12 @@ impl std::fmt::Display for Value {
                 write!(f, "}}")
             }
             Value::Error(msg) => write!(f, "Error({})", msg),
+            Value::EnumVariant(enum_name, variant, data) => {
+                match data {
+                    Some(d) => write!(f, "{}::{}({})", enum_name, variant, d),
+                    None => write!(f, "{}::{}", enum_name, variant),
+                }
+            }
         }
     }
 }
@@ -81,6 +88,31 @@ impl Env {
         env.define("has_key", Value::BuiltinFn("has_key".into()));
         env.define("to_string", Value::BuiltinFn("to_string".into()));
         env.define("to_int", Value::BuiltinFn("to_int".into()));
+        env.define("to_float", Value::BuiltinFn("to_float".into()));
+        // Math builtins
+        env.define("abs", Value::BuiltinFn("abs".into()));
+        env.define("min", Value::BuiltinFn("min".into()));
+        env.define("max", Value::BuiltinFn("max".into()));
+        env.define("floor", Value::BuiltinFn("floor".into()));
+        env.define("ceil", Value::BuiltinFn("ceil".into()));
+        env.define("round", Value::BuiltinFn("round".into()));
+        env.define("sqrt", Value::BuiltinFn("sqrt".into()));
+        env.define("pow", Value::BuiltinFn("pow".into()));
+        env.define("log", Value::BuiltinFn("log".into()));
+        env.define("log2", Value::BuiltinFn("log2".into()));
+        env.define("sin", Value::BuiltinFn("sin".into()));
+        env.define("cos", Value::BuiltinFn("cos".into()));
+        env.define("tan", Value::BuiltinFn("tan".into()));
+        // Math constants
+        env.define("PI", Value::Float(std::f64::consts::PI));
+        env.define("E", Value::Float(std::f64::consts::E));
+        // Format builtins
+        env.define("format", Value::BuiltinFn("format".into()));
+        // OS builtins
+        env.define("args", Value::BuiltinFn("args".into()));
+        env.define("env_var", Value::BuiltinFn("env_var".into()));
+        env.define("exit", Value::BuiltinFn("exit".into()));
+        env.define("clock", Value::BuiltinFn("clock".into()));
         env
     }
 

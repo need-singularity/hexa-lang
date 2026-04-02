@@ -19,6 +19,14 @@ pub struct Interpreter {
     throw_value: Option<Value>,
     /// Struct declarations: name -> field definitions (name, type, visibility)
     struct_defs: HashMap<String, Vec<(String, String, Visibility)>>,
+    /// Enum declarations: name -> list of (variant_name, optional_data_types)
+    enum_defs: HashMap<String, Vec<(String, Option<Vec<String>>)>>,
+    /// When true, proof blocks are executed as tests
+    pub test_mode: bool,
+    /// Current source line for error reporting (1-based, 0 = unknown).
+    pub current_line: usize,
+    /// Current source column for error reporting (1-based, 0 = unknown).
+    pub current_col: usize,
 }
 
 impl Interpreter {
@@ -28,6 +36,10 @@ impl Interpreter {
             return_value: None,
             throw_value: None,
             struct_defs: HashMap::new(),
+            enum_defs: HashMap::new(),
+            test_mode: false,
+            current_line: 0,
+            current_col: 0,
         }
     }
 
@@ -36,6 +48,27 @@ impl Interpreter {
     pub fn run(&mut self, stmts: &[Stmt]) -> Result<Value, HexaError> {
         let mut last = Value::Void;
         for stmt in stmts {
+            last = self.exec_stmt(stmt)?;
+            if self.return_value.is_some() {
+                return Ok(self.return_value.take().unwrap());
+            }
+            if self.throw_value.is_some() {
+                let err = self.throw_value.take().unwrap();
+                return Err(self.runtime_err(format!("uncaught error: {}", err)));
+            }
+        }
+        Ok(last)
+    }
+
+    /// Run with span information from the parser.
+    /// `spans` is a parallel array to `stmts` with (line, col) for each statement.
+    pub fn run_with_spans(&mut self, stmts: &[Stmt], spans: &[(usize, usize)]) -> Result<Value, HexaError> {
+        let mut last = Value::Void;
+        for (i, stmt) in stmts.iter().enumerate() {
+            if let Some(&(line, col)) = spans.get(i) {
+                self.current_line = line;
+                self.current_col = col;
+            }
             last = self.exec_stmt(stmt)?;
             if self.return_value.is_some() {
                 return Ok(self.return_value.take().unwrap());
@@ -164,7 +197,11 @@ impl Interpreter {
                 }
             }
             Stmt::Proof(_name, body) => {
-                // Execute proof block like a regular block
+                if !self.test_mode {
+                    // In normal mode, skip proof blocks
+                    return Ok(Value::Void);
+                }
+                // In test mode, execute proof block
                 self.env.push_scope();
                 for s in body {
                     self.exec_stmt(s)?;
@@ -178,8 +215,8 @@ impl Interpreter {
                     return Err(HexaError {
                         class: ErrorClass::Logic,
                         message: "assertion failed".into(),
-                        line: 0,
-                        col: 0,
+                        line: self.current_line,
+                        col: self.current_col,
                     });
                 }
                 Ok(Value::Void)
@@ -188,8 +225,12 @@ impl Interpreter {
                 self.struct_defs.insert(decl.name.clone(), decl.fields.clone());
                 Ok(Value::Void)
             }
+            Stmt::EnumDecl(decl) => {
+                self.enum_defs.insert(decl.name.clone(), decl.variants.clone());
+                Ok(Value::Void)
+            }
             // Declarations we don't fully interpret yet
-            Stmt::EnumDecl(_) | Stmt::TraitDecl(_) | Stmt::ImplBlock(_) => {
+            Stmt::TraitDecl(_) | Stmt::ImplBlock(_) => {
                 Ok(Value::Void)
             }
             Stmt::Intent(_, _) | Stmt::Mod(_, _) | Stmt::Use(_) => Ok(Value::Void),
@@ -264,8 +305,8 @@ impl Interpreter {
                 self.env.get(name).ok_or_else(|| HexaError {
                     class: ErrorClass::Name,
                     message: format!("undefined variable: {}", name),
-                    line: 0,
-                    col: 0,
+                    line: self.current_line,
+                    col: self.current_col,
                 })
             }
             Expr::Binary(left, op, right) => {
@@ -413,9 +454,35 @@ impl Interpreter {
             Expr::Match(scrutinee, arms) => {
                 let val = self.eval_expr(scrutinee)?;
                 for arm in arms {
-                    let pattern = self.eval_expr(&arm.pattern)?;
-                    if Self::values_equal(&val, &pattern) {
-                        return self.exec_block(&arm.body);
+                    // Try to match the pattern, collecting any bindings
+                    if let Some(bindings) = self.match_pattern(&val, &arm.pattern)? {
+                        // Check guard if present
+                        if let Some(guard_expr) = &arm.guard {
+                            self.env.push_scope();
+                            for (name, bval) in &bindings {
+                                self.env.define(name, bval.clone());
+                            }
+                            let guard_result = self.eval_expr(guard_expr)?;
+                            self.env.pop_scope();
+                            if !Self::is_truthy(&guard_result) {
+                                continue; // guard failed, try next arm
+                            }
+                        }
+                        // Pattern matched (and guard passed), execute body with bindings
+                        self.env.push_scope();
+                        for (name, bval) in bindings {
+                            self.env.define(&name, bval);
+                        }
+                        let mut result = Value::Void;
+                        for stmt in &arm.body {
+                            result = self.exec_stmt(stmt)?;
+                            if self.return_value.is_some() || self.throw_value.is_some() {
+                                self.env.pop_scope();
+                                return Ok(Value::Void);
+                            }
+                        }
+                        self.env.pop_scope();
+                        return Ok(result);
                     }
                 }
                 Ok(Value::Void)
@@ -453,6 +520,28 @@ impl Interpreter {
                     map.insert(key, val);
                 }
                 Ok(Value::Map(map))
+            }
+            Expr::EnumPath(enum_name, variant_name, data_expr) => {
+                // Verify enum is defined
+                let variants = self.enum_defs.get(enum_name).ok_or_else(|| {
+                    self.runtime_err(format!("undefined enum: {}", enum_name))
+                })?.clone();
+                // Verify variant exists
+                let variant_def = variants.iter().find(|(name, _)| name == variant_name);
+                if variant_def.is_none() {
+                    return Err(self.runtime_err(format!(
+                        "enum {} has no variant {}", enum_name, variant_name
+                    )));
+                }
+                let data = match data_expr {
+                    Some(expr) => Some(Box::new(self.eval_expr(expr)?)),
+                    None => None,
+                };
+                Ok(Value::EnumVariant(enum_name.clone(), variant_name.clone(), data))
+            }
+            Expr::Wildcard => {
+                // Wildcard should only appear in match patterns, not as a standalone expression
+                Err(self.runtime_err("wildcard '_' can only be used in match patterns".into()))
             }
         }
     }
@@ -810,6 +899,7 @@ impl Interpreter {
                         Value::Lambda(..) => "lambda",
                         Value::Map(_) => "map",
                         Value::Error(_) => "error",
+                        Value::EnumVariant(name, _, _) => name.as_str(),
                     }
                     .to_string(),
                 ))
@@ -944,16 +1034,240 @@ impl Interpreter {
                     _ => Err(self.type_err("to_int() cannot convert this type".into())),
                 }
             }
+            "to_float" => {
+                if args.is_empty() { return Err(self.type_err("to_float() requires 1 argument".into())); }
+                match &args[0] {
+                    Value::Float(f) => Ok(Value::Float(*f)),
+                    Value::Int(n) => Ok(Value::Float(*n as f64)),
+                    Value::Str(s) => s.parse::<f64>().map(Value::Float).map_err(|_| self.type_err(format!("cannot convert '{}' to float", s))),
+                    Value::Bool(b) => Ok(Value::Float(if *b { 1.0 } else { 0.0 })),
+                    _ => Err(self.type_err("to_float() cannot convert this type".into())),
+                }
+            }
+            // ── Math builtins ──────────────────────────────────────
+            "abs" => {
+                if args.is_empty() { return Err(self.type_err("abs() requires 1 argument".into())); }
+                match &args[0] {
+                    Value::Int(n) => Ok(Value::Int(n.abs())),
+                    Value::Float(f) => Ok(Value::Float(f.abs())),
+                    _ => Err(self.type_err("abs() requires int or float".into())),
+                }
+            }
+            "min" => {
+                if args.len() < 2 { return Err(self.type_err("min() requires 2 arguments".into())); }
+                match (&args[0], &args[1]) {
+                    (Value::Int(a), Value::Int(b)) => Ok(Value::Int(*a.min(b))),
+                    (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a.min(*b))),
+                    (Value::Int(a), Value::Float(b)) => Ok(Value::Float((*a as f64).min(*b))),
+                    (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a.min(*b as f64))),
+                    _ => Err(self.type_err("min() requires numeric arguments".into())),
+                }
+            }
+            "max" => {
+                if args.len() < 2 { return Err(self.type_err("max() requires 2 arguments".into())); }
+                match (&args[0], &args[1]) {
+                    (Value::Int(a), Value::Int(b)) => Ok(Value::Int(*a.max(b))),
+                    (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a.max(*b))),
+                    (Value::Int(a), Value::Float(b)) => Ok(Value::Float((*a as f64).max(*b))),
+                    (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a.max(*b as f64))),
+                    _ => Err(self.type_err("max() requires numeric arguments".into())),
+                }
+            }
+            "floor" => {
+                if args.is_empty() { return Err(self.type_err("floor() requires 1 argument".into())); }
+                match &args[0] {
+                    Value::Float(f) => Ok(Value::Int(f.floor() as i64)),
+                    Value::Int(n) => Ok(Value::Int(*n)),
+                    _ => Err(self.type_err("floor() requires float or int".into())),
+                }
+            }
+            "ceil" => {
+                if args.is_empty() { return Err(self.type_err("ceil() requires 1 argument".into())); }
+                match &args[0] {
+                    Value::Float(f) => Ok(Value::Int(f.ceil() as i64)),
+                    Value::Int(n) => Ok(Value::Int(*n)),
+                    _ => Err(self.type_err("ceil() requires float or int".into())),
+                }
+            }
+            "round" => {
+                if args.is_empty() { return Err(self.type_err("round() requires 1 argument".into())); }
+                match &args[0] {
+                    Value::Float(f) => Ok(Value::Int(f.round() as i64)),
+                    Value::Int(n) => Ok(Value::Int(*n)),
+                    _ => Err(self.type_err("round() requires float or int".into())),
+                }
+            }
+            "sqrt" => {
+                if args.is_empty() { return Err(self.type_err("sqrt() requires 1 argument".into())); }
+                match &args[0] {
+                    Value::Float(f) => Ok(Value::Float(f.sqrt())),
+                    Value::Int(n) => Ok(Value::Float((*n as f64).sqrt())),
+                    _ => Err(self.type_err("sqrt() requires numeric argument".into())),
+                }
+            }
+            "pow" => {
+                if args.len() < 2 { return Err(self.type_err("pow() requires 2 arguments".into())); }
+                match (&args[0], &args[1]) {
+                    (Value::Int(a), Value::Int(b)) => Ok(Value::Int((*a as f64).powi(*b as i32) as i64)),
+                    (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a.powf(*b))),
+                    (Value::Int(a), Value::Float(b)) => Ok(Value::Float((*a as f64).powf(*b))),
+                    (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a.powi(*b as i32))),
+                    _ => Err(self.type_err("pow() requires numeric arguments".into())),
+                }
+            }
+            "log" => {
+                if args.is_empty() { return Err(self.type_err("log() requires 1 argument".into())); }
+                match &args[0] {
+                    Value::Float(f) => Ok(Value::Float(f.ln())),
+                    Value::Int(n) => Ok(Value::Float((*n as f64).ln())),
+                    _ => Err(self.type_err("log() requires numeric argument".into())),
+                }
+            }
+            "log2" => {
+                if args.is_empty() { return Err(self.type_err("log2() requires 1 argument".into())); }
+                match &args[0] {
+                    Value::Float(f) => Ok(Value::Float(f.log2())),
+                    Value::Int(n) => Ok(Value::Float((*n as f64).log2())),
+                    _ => Err(self.type_err("log2() requires numeric argument".into())),
+                }
+            }
+            "sin" => {
+                if args.is_empty() { return Err(self.type_err("sin() requires 1 argument".into())); }
+                match &args[0] {
+                    Value::Float(f) => Ok(Value::Float(f.sin())),
+                    Value::Int(n) => Ok(Value::Float((*n as f64).sin())),
+                    _ => Err(self.type_err("sin() requires numeric argument".into())),
+                }
+            }
+            "cos" => {
+                if args.is_empty() { return Err(self.type_err("cos() requires 1 argument".into())); }
+                match &args[0] {
+                    Value::Float(f) => Ok(Value::Float(f.cos())),
+                    Value::Int(n) => Ok(Value::Float((*n as f64).cos())),
+                    _ => Err(self.type_err("cos() requires numeric argument".into())),
+                }
+            }
+            "tan" => {
+                if args.is_empty() { return Err(self.type_err("tan() requires 1 argument".into())); }
+                match &args[0] {
+                    Value::Float(f) => Ok(Value::Float(f.tan())),
+                    Value::Int(n) => Ok(Value::Float((*n as f64).tan())),
+                    _ => Err(self.type_err("tan() requires numeric argument".into())),
+                }
+            }
+            // ── Format builtins ────────────────────────────────────
+            "format" => {
+                if args.is_empty() { return Err(self.type_err("format() requires at least 1 argument".into())); }
+                match &args[0] {
+                    Value::Str(template) => {
+                        let mut result = template.clone();
+                        for arg in &args[1..] {
+                            if let Some(pos) = result.find("{}") {
+                                result = format!("{}{}{}", &result[..pos], arg, &result[pos+2..]);
+                            }
+                        }
+                        Ok(Value::Str(result))
+                    }
+                    _ => Err(self.type_err("format() first argument must be a string template".into())),
+                }
+            }
+            // ── OS builtins ────────────────────────────────────────
+            "args" => {
+                let os_args: Vec<Value> = std::env::args().map(|a| Value::Str(a)).collect();
+                Ok(Value::Array(os_args))
+            }
+            "env_var" => {
+                if args.is_empty() { return Err(self.type_err("env_var() requires 1 argument".into())); }
+                match &args[0] {
+                    Value::Str(name) => {
+                        match std::env::var(name) {
+                            Ok(val) => Ok(Value::Str(val)),
+                            Err(_) => Ok(Value::Void),
+                        }
+                    }
+                    _ => Err(self.type_err("env_var() requires string argument".into())),
+                }
+            }
+            "exit" => {
+                if args.is_empty() {
+                    std::process::exit(0);
+                }
+                match &args[0] {
+                    Value::Int(code) => std::process::exit(*code as i32),
+                    _ => std::process::exit(0),
+                }
+            }
+            "clock" => {
+                use std::time::{SystemTime, UNIX_EPOCH};
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+                Ok(Value::Float(now.as_secs_f64()))
+            }
             _ => Err(HexaError {
                 class: ErrorClass::Name,
                 message: format!("unknown builtin: {}", name),
-                line: 0,
-                col: 0,
+                line: self.current_line,
+                col: self.current_col,
             }),
         }
     }
 
     // ── Helpers ──────────────────────────────────────────────
+
+    /// Try to match a value against a pattern expression.
+    /// Returns Some(bindings) if matched, None if not.
+    /// Bindings are (variable_name, value) pairs from destructuring.
+    fn match_pattern(&mut self, val: &Value, pattern: &Expr) -> Result<Option<Vec<(String, Value)>>, HexaError> {
+        match pattern {
+            // Wildcard matches everything, no bindings
+            Expr::Wildcard => Ok(Some(vec![])),
+
+            // EnumPath: match enum variant, optionally destructure data
+            Expr::EnumPath(enum_name, variant_name, binding_expr) => {
+                match val {
+                    Value::EnumVariant(val_enum, val_variant, val_data) => {
+                        if val_enum != enum_name || val_variant != variant_name {
+                            return Ok(None); // different variant
+                        }
+                        // Variant matches. Handle destructuring binding.
+                        match (binding_expr, val_data) {
+                            // Pattern has binding, value has data: bind the variable
+                            (Some(bind_expr), Some(data)) => {
+                                match bind_expr.as_ref() {
+                                    Expr::Ident(binding_name) => {
+                                        Ok(Some(vec![(binding_name.clone(), data.as_ref().clone())]))
+                                    }
+                                    // Could be a literal for nested matching
+                                    _ => {
+                                        let pattern_val = self.eval_expr(bind_expr)?;
+                                        if Self::values_equal(data.as_ref(), &pattern_val) {
+                                            Ok(Some(vec![]))
+                                        } else {
+                                            Ok(None)
+                                        }
+                                    }
+                                }
+                            }
+                            // Neither has data: simple variant match
+                            (None, None) => Ok(Some(vec![])),
+                            // Pattern expects data but value has none, or vice versa
+                            _ => Ok(None),
+                        }
+                    }
+                    _ => Ok(None), // value is not an enum variant
+                }
+            }
+
+            // Literal/expression: evaluate and compare
+            _ => {
+                let pattern_val = self.eval_expr(pattern)?;
+                if Self::values_equal(val, &pattern_val) {
+                    Ok(Some(vec![]))
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+    }
 
     fn exec_block(&mut self, stmts: &[Stmt]) -> Result<Value, HexaError> {
         self.env.push_scope();
@@ -1004,6 +1318,13 @@ impl Interpreter {
             (Value::Char(x), Value::Char(y)) => x == y,
             (Value::Void, Value::Void) => true,
             (Value::Error(x), Value::Error(y)) => x == y,
+            (Value::EnumVariant(e1, v1, d1), Value::EnumVariant(e2, v2, d2)) => {
+                e1 == e2 && v1 == v2 && match (d1, d2) {
+                    (Some(a), Some(b)) => Self::values_equal(a, b),
+                    (None, None) => true,
+                    _ => false,
+                }
+            }
             _ => false,
         }
     }
@@ -1012,8 +1333,8 @@ impl Interpreter {
         HexaError {
             class: ErrorClass::Runtime,
             message,
-            line: 0,
-            col: 0,
+            line: self.current_line,
+            col: self.current_col,
         }
     }
 
@@ -1021,8 +1342,8 @@ impl Interpreter {
         HexaError {
             class: ErrorClass::Type,
             message,
-            line: 0,
-            col: 0,
+            line: self.current_line,
+            col: self.current_col,
         }
     }
 }
@@ -1544,5 +1865,380 @@ mod tests {
     fn test_array_map_filter_chain() {
         let src = "let result = [1, 2, 3, 4, 5, 6].filter(|x| x % 2 == 0).map(|x| x * x)\nresult[0]";
         assert!(matches!(eval(src), Value::Int(4)));
+    }
+
+    // ── Math builtins ──────────────────────────────────────────
+
+    #[test]
+    fn test_abs_int() {
+        assert!(matches!(eval("abs(-6)"), Value::Int(6)));
+        assert!(matches!(eval("abs(6)"), Value::Int(6)));
+    }
+
+    #[test]
+    fn test_abs_float() {
+        match eval("abs(-3.14)") {
+            Value::Float(f) => assert!((f - 3.14).abs() < 1e-10),
+            other => panic!("expected Float, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_min_max() {
+        assert!(matches!(eval("min(3, 7)"), Value::Int(3)));
+        assert!(matches!(eval("max(3, 7)"), Value::Int(7)));
+        match eval("min(2.5, 1.5)") {
+            Value::Float(f) => assert!((f - 1.5).abs() < 1e-10),
+            other => panic!("expected Float, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_floor_ceil_round() {
+        assert!(matches!(eval("floor(3.7)"), Value::Int(3)));
+        assert!(matches!(eval("ceil(3.2)"), Value::Int(4)));
+        assert!(matches!(eval("round(3.5)"), Value::Int(4)));
+        assert!(matches!(eval("round(3.4)"), Value::Int(3)));
+        assert!(matches!(eval("floor(5)"), Value::Int(5)));
+    }
+
+    #[test]
+    fn test_sqrt() {
+        match eval("sqrt(9.0)") {
+            Value::Float(f) => assert!((f - 3.0).abs() < 1e-10),
+            other => panic!("expected Float, got {:?}", other),
+        }
+        match eval("sqrt(16)") {
+            Value::Float(f) => assert!((f - 4.0).abs() < 1e-10),
+            other => panic!("expected Float, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_pow_builtin() {
+        assert!(matches!(eval("pow(2, 10)"), Value::Int(1024)));
+        match eval("pow(2.0, 0.5)") {
+            Value::Float(f) => assert!((f - std::f64::consts::SQRT_2).abs() < 1e-10),
+            other => panic!("expected Float, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_log_log2() {
+        match eval("log(E)") {
+            Value::Float(f) => assert!((f - 1.0).abs() < 1e-10),
+            other => panic!("expected Float(1.0), got {:?}", other),
+        }
+        match eval("log2(8)") {
+            Value::Float(f) => assert!((f - 3.0).abs() < 1e-10),
+            other => panic!("expected Float(3.0), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_sin_cos_tan() {
+        match eval("sin(0.0)") {
+            Value::Float(f) => assert!(f.abs() < 1e-10),
+            other => panic!("expected Float(0.0), got {:?}", other),
+        }
+        match eval("cos(0.0)") {
+            Value::Float(f) => assert!((f - 1.0).abs() < 1e-10),
+            other => panic!("expected Float(1.0), got {:?}", other),
+        }
+        match eval("tan(0.0)") {
+            Value::Float(f) => assert!(f.abs() < 1e-10),
+            other => panic!("expected Float(0.0), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_pi_e_constants() {
+        match eval("PI") {
+            Value::Float(f) => assert!((f - std::f64::consts::PI).abs() < 1e-10),
+            other => panic!("expected PI, got {:?}", other),
+        }
+        match eval("E") {
+            Value::Float(f) => assert!((f - std::f64::consts::E).abs() < 1e-10),
+            other => panic!("expected E, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_sin_pi_half() {
+        // sin(PI / 2) should be 1.0
+        match eval("sin(PI / 2.0)") {
+            Value::Float(f) => assert!((f - 1.0).abs() < 1e-10),
+            other => panic!("expected Float(1.0), got {:?}", other),
+        }
+    }
+
+    // ── Format builtins ────────────────────────────────────────
+
+    #[test]
+    fn test_format_basic() {
+        assert!(matches!(eval("format(\"x={}, y={}\", 1, 2)"), Value::Str(s) if s == "x=1, y=2"));
+    }
+
+    #[test]
+    fn test_format_no_placeholders() {
+        assert!(matches!(eval("format(\"hello\")"), Value::Str(s) if s == "hello"));
+    }
+
+    #[test]
+    fn test_format_mixed_types() {
+        assert!(matches!(eval("format(\"{} is {}\", \"pi\", 3.14)"), Value::Str(s) if s == "pi is 3.14"));
+    }
+
+    // ── Conversion builtins ────────────────────────────────────
+
+    #[test]
+    fn test_to_float() {
+        match eval("to_float(42)") {
+            Value::Float(f) => assert!((f - 42.0).abs() < 1e-10),
+            other => panic!("expected Float(42.0), got {:?}", other),
+        }
+        match eval("to_float(\"3.14\")") {
+            Value::Float(f) => assert!((f - 3.14).abs() < 1e-10),
+            other => panic!("expected Float(3.14), got {:?}", other),
+        }
+    }
+
+    // ── OS builtins ────────────────────────────────────────────
+
+    #[test]
+    fn test_args_returns_array() {
+        match eval("args()") {
+            Value::Array(_) => {} // just check it returns an array
+            other => panic!("expected Array, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_env_var_missing() {
+        assert!(matches!(eval("env_var(\"HEXA_NONEXISTENT_VAR_XYZ\")"), Value::Void));
+    }
+
+    #[test]
+    fn test_clock_returns_float() {
+        match eval("clock()") {
+            Value::Float(f) => assert!(f > 0.0),
+            other => panic!("expected Float, got {:?}", other),
+        }
+    }
+
+    // ── Proof/test mode ────────────────────────────────────────
+
+    #[test]
+    fn test_proof_skipped_in_normal_mode() {
+        // In normal mode, proof blocks are skipped -- no assertion error
+        let src = "proof should_skip {\n  assert 1 == 2\n}\n42";
+        assert!(matches!(eval(src), Value::Int(42)));
+    }
+
+    #[test]
+    fn test_proof_runs_in_test_mode() {
+        let tokens = Lexer::new("proof my_test {\n  assert 1 == 1\n}").tokenize().unwrap();
+        let stmts = Parser::new(tokens).parse().unwrap();
+        let mut interp = Interpreter::new();
+        interp.test_mode = true;
+        interp.run(&stmts).unwrap(); // should pass
+    }
+
+    #[test]
+    fn test_proof_fails_in_test_mode() {
+        let tokens = Lexer::new("proof bad_test {\n  assert 1 == 2\n}").tokenize().unwrap();
+        let stmts = Parser::new(tokens).parse().unwrap();
+        let mut interp = Interpreter::new();
+        interp.test_mode = true;
+        let result = interp.run(&stmts);
+        assert!(result.is_err());
+    }
+
+    // ── Mixed int/float for min/max ────────────────────────────
+
+    #[test]
+    fn test_min_max_mixed() {
+        match eval("min(3, 1.5)") {
+            Value::Float(f) => assert!((f - 1.5).abs() < 1e-10),
+            other => panic!("expected Float(1.5), got {:?}", other),
+        }
+        match eval("max(3, 7.5)") {
+            Value::Float(f) => assert!((f - 7.5).abs() < 1e-10),
+            other => panic!("expected Float(7.5), got {:?}", other),
+        }
+    }
+
+    // ── Enum Variants + Pattern Matching ───────────────────────
+
+    #[test]
+    fn test_enum_simple_variant() {
+        let src = "enum Color { Red, Green, Blue }\nlet c = Color::Red\ntype_of(c)";
+        assert!(matches!(eval(src), Value::Str(s) if s == "Color"));
+    }
+
+    #[test]
+    fn test_enum_variant_match() {
+        let src = r#"
+enum Color { Red, Green, Blue }
+let c = Color::Green
+match c {
+    Color::Red -> "red"
+    Color::Green -> "green"
+    Color::Blue -> "blue"
+}
+"#;
+        assert!(matches!(eval(src), Value::Str(s) if s == "green"));
+    }
+
+    #[test]
+    fn test_enum_variant_with_data() {
+        let src = r#"
+enum Shape { Circle(int), Rect(int) }
+let s = Shape::Circle(5)
+match s {
+    Shape::Circle(r) -> r * 2
+    Shape::Rect(w) -> w
+}
+"#;
+        assert!(matches!(eval(src), Value::Int(10)));
+    }
+
+    #[test]
+    fn test_enum_match_with_wildcard() {
+        let src = r#"
+enum Direction { North, South, East, West }
+let d = Direction::West
+match d {
+    Direction::North -> 1
+    _ -> 0
+}
+"#;
+        assert!(matches!(eval(src), Value::Int(0)));
+    }
+
+    #[test]
+    fn test_enum_match_with_guard() {
+        let src = r#"
+enum Wrapper { Val(int) }
+let w = Wrapper::Val(42)
+match w {
+    Wrapper::Val(n) if n > 100 -> "big"
+    Wrapper::Val(n) if n > 10 -> "medium"
+    Wrapper::Val(n) -> "small"
+    _ -> "unknown"
+}
+"#;
+        assert!(matches!(eval(src), Value::Str(s) if s == "medium"));
+    }
+
+    #[test]
+    fn test_enum_none_variant() {
+        let src = r#"
+enum Maybe { Some(int), None }
+let x = Maybe::None
+match x {
+    Maybe::Some(v) -> v
+    Maybe::None -> 0
+}
+"#;
+        assert!(matches!(eval(src), Value::Int(0)));
+    }
+
+    #[test]
+    fn test_wildcard_in_literal_match() {
+        let src = r#"
+let x = 99
+match x {
+    1 -> "one"
+    2 -> "two"
+    _ -> "other"
+}
+"#;
+        assert!(matches!(eval(src), Value::Str(s) if s == "other"));
+    }
+
+    #[test]
+    fn test_enum_display() {
+        let src = "enum Color { Red, Green, Blue }\nlet c = Color::Red\nto_string(c)";
+        assert!(matches!(eval(src), Value::Str(s) if s == "Color::Red"));
+    }
+
+    #[test]
+    fn test_enum_display_with_data() {
+        let src = "enum Opt { Some(int), None }\nlet x = Opt::Some(42)\nto_string(x)";
+        assert!(matches!(eval(src), Value::Str(s) if s == "Opt::Some(42)"));
+    }
+
+    // ── Error line reporting ──────────────────────────────────
+
+    fn eval_err_with_spans(src: &str) -> HexaError {
+        let tokens = Lexer::new(src).tokenize().unwrap();
+        let result = Parser::new(tokens).parse_with_spans().unwrap();
+        let mut interp = Interpreter::new();
+        interp.run_with_spans(&result.stmts, &result.spans).unwrap_err()
+    }
+
+    #[test]
+    fn test_error_line_division_by_zero() {
+        let src = "let a = 1\nlet b = 2\nlet c = 10 / 0";
+        let err = eval_err_with_spans(src);
+        assert_eq!(err.line, 3, "division by zero should report line 3");
+        assert!(err.message.contains("division by zero"));
+    }
+
+    #[test]
+    fn test_error_line_undefined_variable() {
+        let src = "let x = 1\nlet y = 2\nlet z = unknown_var";
+        let err = eval_err_with_spans(src);
+        assert_eq!(err.line, 3, "undefined variable should report line 3");
+        assert!(err.message.contains("undefined variable"));
+    }
+
+    #[test]
+    fn test_error_line_type_error() {
+        let src = "let a = 1\nlet b = \"hello\"\nlet c = a + b";
+        let err = eval_err_with_spans(src);
+        assert_eq!(err.line, 3, "type error should report line 3");
+    }
+
+    #[test]
+    fn test_error_line_assert_failure() {
+        let src = "let x = 6\nassert x == 6\nassert x == 7";
+        let err = eval_err_with_spans(src);
+        assert_eq!(err.line, 3, "assert failure should report line 3");
+        assert!(err.message.contains("assertion failed"));
+    }
+
+    #[test]
+    fn test_error_display_with_line() {
+        let err = HexaError {
+            class: ErrorClass::Runtime,
+            message: "division by zero".into(),
+            line: 15,
+            col: 10,
+        };
+        let msg = format!("{}", err);
+        assert!(msg.contains("line 15:10"), "error display should include line:col, got: {}", msg);
+        assert!(msg.contains("division by zero"));
+    }
+
+    #[test]
+    fn test_error_display_without_line() {
+        let err = HexaError {
+            class: ErrorClass::Runtime,
+            message: "some error".into(),
+            line: 0,
+            col: 0,
+        };
+        let msg = format!("{}", err);
+        assert!(!msg.contains("line 0"), "when line=0, should not show 'line 0', got: {}", msg);
+    }
+
+    #[test]
+    fn test_syntax_error_has_line() {
+        let src = "let x = 1\nlet y = 2\nlet z = +";
+        let tokens = Lexer::new(src).tokenize().unwrap();
+        let err = Parser::new(tokens).parse().unwrap_err();
+        assert!(err.line > 0, "syntax error should have a line number, got: {}", err);
     }
 }

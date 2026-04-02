@@ -1,4 +1,4 @@
-use crate::token::{Token, keyword_from_str};
+use crate::token::{Token, Spanned, keyword_from_str};
 
 pub struct Lexer {
     source: Vec<char>,
@@ -17,17 +17,22 @@ impl Lexer {
         }
     }
 
-    pub fn tokenize(&mut self) -> Result<Vec<Token>, String> {
+    pub fn tokenize(&mut self) -> Result<Vec<Spanned>, String> {
         let mut tokens = Vec::new();
         loop {
-            let tok = self.next_token()?;
+            let (tok, line, col) = self.next_token_spanned()?;
             let is_eof = tok == Token::Eof;
-            tokens.push(tok);
+            tokens.push(Spanned::new(tok, line, col));
             if is_eof {
                 break;
             }
         }
         Ok(tokens)
+    }
+
+    /// Tokenize into plain tokens (no span info). Used by existing tests.
+    pub fn tokenize_plain(&mut self) -> Result<Vec<Token>, String> {
+        self.tokenize().map(|v| v.into_iter().map(|s| s.token).collect())
     }
 
     fn peek(&self) -> Option<char> {
@@ -170,6 +175,15 @@ impl Lexer {
         }
     }
 
+    fn next_token_spanned(&mut self) -> Result<(Token, usize, usize), String> {
+        // Skip whitespace first, then record position for the actual token
+        self.skip_whitespace();
+        let line = self.line;
+        let col = self.col;
+        let tok = self.next_token()?;
+        Ok((tok, line, col))
+    }
+
     fn next_token(&mut self) -> Result<Token, String> {
         self.skip_whitespace();
 
@@ -301,6 +315,9 @@ impl Lexer {
                 if self.peek() == Some('=') {
                     self.advance();
                     Ok(Token::ColonEq)
+                } else if self.peek() == Some(':') {
+                    self.advance();
+                    Ok(Token::ColonColon)
                 } else {
                     Ok(Token::Colon)
                 }
@@ -339,7 +356,7 @@ mod tests {
     #[test]
     fn test_lex_let_binding() {
         let mut lexer = Lexer::new("let x = 42");
-        let tokens = lexer.tokenize().unwrap();
+        let tokens = lexer.tokenize_plain().unwrap();
         assert_eq!(tokens, vec![
             Token::Let, Token::Ident("x".into()), Token::Eq, Token::IntLit(42), Token::Eof
         ]);
@@ -348,7 +365,7 @@ mod tests {
     #[test]
     fn test_lex_fn_decl() {
         let mut lexer = Lexer::new("fn main() {}");
-        let tokens = lexer.tokenize().unwrap();
+        let tokens = lexer.tokenize_plain().unwrap();
         assert_eq!(tokens, vec![
             Token::Fn, Token::Ident("main".into()), Token::LParen, Token::RParen,
             Token::LBrace, Token::RBrace, Token::Eof
@@ -358,7 +375,7 @@ mod tests {
     #[test]
     fn test_lex_all_operators() {
         let mut lexer = Lexer::new("+ - * / % ** == != < > <= >= && || ! ^^ & | ^ ~ = := .. ->");
-        let tokens = lexer.tokenize().unwrap();
+        let tokens = lexer.tokenize_plain().unwrap();
         // Should have 24 operator tokens + Eof = 25
         assert_eq!(tokens.len(), 25);
     }
@@ -366,21 +383,21 @@ mod tests {
     #[test]
     fn test_lex_string_literal() {
         let mut lexer = Lexer::new("\"hello world\"");
-        let tokens = lexer.tokenize().unwrap();
+        let tokens = lexer.tokenize_plain().unwrap();
         assert_eq!(tokens[0], Token::StringLit("hello world".into()));
     }
 
     #[test]
     fn test_lex_egyptian_fraction() {
         let mut lexer = Lexer::new("1.0/2.0 + 1.0/3.0 + 1.0/6.0");
-        let tokens = lexer.tokenize().unwrap();
+        let tokens = lexer.tokenize_plain().unwrap();
         assert_eq!(tokens[0], Token::FloatLit(1.0));
     }
 
     #[test]
     fn test_lex_comments_skipped() {
         let mut lexer = Lexer::new("let x = 1 // comment\nlet y = 2");
-        let tokens = lexer.tokenize().unwrap();
+        let tokens = lexer.tokenize_plain().unwrap();
         assert_eq!(tokens, vec![
             Token::Let, Token::Ident("x".into()), Token::Eq, Token::IntLit(1),
             Token::Newline,
@@ -392,21 +409,21 @@ mod tests {
     #[test]
     fn test_lex_string_escapes() {
         let mut lexer = Lexer::new("\"hello\\nworld\"");
-        let tokens = lexer.tokenize().unwrap();
+        let tokens = lexer.tokenize_plain().unwrap();
         assert_eq!(tokens[0], Token::StringLit("hello\nworld".into()));
     }
 
     #[test]
     fn test_lex_char_literal() {
         let mut lexer = Lexer::new("'a'");
-        let tokens = lexer.tokenize().unwrap();
+        let tokens = lexer.tokenize_plain().unwrap();
         assert_eq!(tokens[0], Token::CharLit('a'));
     }
 
     #[test]
     fn test_lex_booleans() {
         let mut lexer = Lexer::new("true false");
-        let tokens = lexer.tokenize().unwrap();
+        let tokens = lexer.tokenize_plain().unwrap();
         assert_eq!(tokens[0], Token::BoolLit(true));
         assert_eq!(tokens[1], Token::BoolLit(false));
     }

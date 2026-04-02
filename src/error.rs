@@ -20,7 +20,11 @@ pub struct HexaError {
 
 impl std::fmt::Display for HexaError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "[{:?}] line {}:{}: {}", self.class, self.line, self.col, self.message)
+        if self.line > 0 {
+            write!(f, "[{:?}] line {}:{}: {}", self.class, self.line, self.col, self.message)
+        } else {
+            write!(f, "[{:?}] {}", self.class, self.message)
+        }
     }
 }
 

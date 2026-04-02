@@ -1,3 +1,29 @@
+/// Source location: line and column (1-based).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Span {
+    pub line: usize,
+    pub col: usize,
+}
+
+impl Span {
+    pub fn new(line: usize, col: usize) -> Self {
+        Self { line, col }
+    }
+}
+
+/// A token paired with its source location.
+#[derive(Debug, Clone)]
+pub struct Spanned {
+    pub token: Token,
+    pub span: Span,
+}
+
+impl Spanned {
+    pub fn new(token: Token, line: usize, col: usize) -> Self {
+        Self { token, span: Span::new(line, col) }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
     // === Literals ===
@@ -52,7 +78,7 @@ pub enum Token {
 
     // === Delimiters ===
     LParen, RParen, LBrace, RBrace, LBracket, RBracket,
-    Comma, Colon, Semicolon, Dot,
+    Comma, Colon, ColonColon, Semicolon, Dot,
 
     // === Special ===
     Newline,

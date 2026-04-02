@@ -1,27 +1,52 @@
 #![allow(dead_code)]
 
-use crate::token::Token;
+use crate::token::{Token, Spanned, Span};
 use crate::ast::*;
 use crate::error::{HexaError, ErrorClass};
 
+/// Parser output: statements + parallel span info for each statement.
+pub struct ParseResult {
+    pub stmts: Vec<Stmt>,
+    pub spans: Vec<(usize, usize)>,  // (line, col) for each stmt, parallel to stmts
+}
+
 pub struct Parser {
-    tokens: Vec<Token>,
+    tokens: Vec<Spanned>,
     pos: usize,
 }
 
 impl Parser {
-    pub fn new(tokens: Vec<Token>) -> Self {
+    pub fn new(tokens: Vec<Spanned>) -> Self {
         Parser { tokens, pos: 0 }
+    }
+
+    /// Construct from plain tokens (no span info). Convenience for tests.
+    pub fn from_plain(tokens: Vec<Token>) -> Self {
+        let spanned = tokens.into_iter()
+            .map(|t| Spanned::new(t, 0, 0))
+            .collect();
+        Parser { tokens: spanned, pos: 0 }
     }
 
     // ── Helpers ──────────────────────────────────────────────
 
     fn peek(&self) -> &Token {
-        self.tokens.get(self.pos).unwrap_or(&Token::Eof)
+        self.tokens.get(self.pos)
+            .map(|s| &s.token)
+            .unwrap_or(&Token::Eof)
     }
 
     fn peek_ahead(&self, offset: usize) -> &Token {
-        self.tokens.get(self.pos + offset).unwrap_or(&Token::Eof)
+        self.tokens.get(self.pos + offset)
+            .map(|s| &s.token)
+            .unwrap_or(&Token::Eof)
+    }
+
+    /// Get the span of the current token.
+    fn current_span(&self) -> Span {
+        self.tokens.get(self.pos)
+            .map(|s| s.span.clone())
+            .unwrap_or(Span::new(0, 0))
     }
 
     fn at_end(&self) -> bool {
@@ -29,7 +54,9 @@ impl Parser {
     }
 
     fn advance(&mut self) -> Token {
-        let tok = self.tokens.get(self.pos).cloned().unwrap_or(Token::Eof);
+        let tok = self.tokens.get(self.pos)
+            .map(|s| s.token.clone())
+            .unwrap_or(Token::Eof);
         self.pos += 1;
         tok
     }
@@ -42,7 +69,8 @@ impl Parser {
         if self.check(expected) {
             Ok(self.advance())
         } else {
-            Err(self.error(format!("expected {:?}, got {:?}", expected, self.peek())))
+            let span = self.current_span();
+            Err(self.error_at(span, format!("expected {:?}, got {:?}", expected, self.peek())))
         }
     }
 
@@ -53,31 +81,50 @@ impl Parser {
     }
 
     fn error(&self, message: String) -> HexaError {
+        let span = self.current_span();
         HexaError {
             class: ErrorClass::Syntax,
             message,
-            line: 0,
-            col: self.pos,
+            line: span.line,
+            col: span.col,
+        }
+    }
+
+    fn error_at(&self, span: Span, message: String) -> HexaError {
+        HexaError {
+            class: ErrorClass::Syntax,
+            message,
+            line: span.line,
+            col: span.col,
         }
     }
 
     fn expect_ident(&mut self) -> Result<String, HexaError> {
+        let span = self.current_span();
         match self.advance() {
             Token::Ident(name) => Ok(name),
-            other => Err(self.error(format!("expected identifier, got {:?}", other))),
+            other => Err(self.error_at(span, format!("expected identifier, got {:?}", other))),
         }
     }
 
     // ── Level 1: Program ────────────────────────────────────
 
     pub fn parse(&mut self) -> Result<Vec<Stmt>, HexaError> {
+        let result = self.parse_with_spans()?;
+        Ok(result.stmts)
+    }
+
+    pub fn parse_with_spans(&mut self) -> Result<ParseResult, HexaError> {
         let mut stmts = Vec::new();
+        let mut spans = Vec::new();
         self.skip_newlines();
         while !self.at_end() {
+            let span = self.current_span();
             stmts.push(self.parse_stmt()?);
+            spans.push((span.line, span.col));
             self.skip_newlines();
         }
-        Ok(stmts)
+        Ok(ParseResult { stmts, spans })
     }
 
     // ── Level 2: Statement ──────────────────────────────────
@@ -424,7 +471,14 @@ impl Parser {
         self.skip_newlines();
         let mut arms = Vec::new();
         while !matches!(self.peek(), Token::RBrace | Token::Eof) {
-            let pattern = self.parse_expr()?;
+            let pattern = self.parse_match_pattern()?;
+            // Optional guard: `if cond`
+            let guard = if matches!(self.peek(), Token::If) {
+                self.advance(); // consume 'if'
+                Some(self.parse_expr()?)
+            } else {
+                None
+            };
             self.expect(&Token::Arrow)?;
             let body = if matches!(self.peek(), Token::LBrace) {
                 self.parse_block()?
@@ -432,7 +486,7 @@ impl Parser {
                 let expr = self.parse_expr()?;
                 vec![Stmt::Expr(expr)]
             };
-            arms.push(MatchArm { pattern, body });
+            arms.push(MatchArm { pattern, guard, body });
             if matches!(self.peek(), Token::Comma) {
                 self.advance();
             }
@@ -440,6 +494,35 @@ impl Parser {
         }
         self.expect(&Token::RBrace)?;
         Ok(Expr::Match(Box::new(scrutinee), arms))
+    }
+
+    /// Parse a match pattern. Handles `_`, `EnumName::Variant(binding)`, and regular expressions.
+    fn parse_match_pattern(&mut self) -> Result<Expr, HexaError> {
+        // Check for wildcard `_`
+        if let Token::Ident(ref name) = self.peek().clone() {
+            if name == "_" {
+                self.advance();
+                return Ok(Expr::Wildcard);
+            }
+            // Check for EnumPath: `Ident :: Ident` or `Ident :: Ident ( expr )`
+            if matches!(self.peek_ahead(1), Token::ColonColon) {
+                let enum_name = name.clone();
+                self.advance(); // consume enum name
+                self.advance(); // consume ::
+                let variant = self.expect_ident()?;
+                let data = if matches!(self.peek(), Token::LParen) {
+                    self.advance(); // consume (
+                    let inner = self.parse_expr()?;
+                    self.expect(&Token::RParen)?;
+                    Some(Box::new(inner))
+                } else {
+                    None
+                };
+                return Ok(Expr::EnumPath(enum_name, variant, data));
+            }
+        }
+        // Fall through to regular expression parsing
+        self.parse_expr()
     }
 
     // ── Block ───────────────────────────────────────────────
@@ -656,9 +739,23 @@ impl Parser {
             Token::CharLit(c) => { self.advance(); Ok(Expr::CharLit(c)) }
             Token::Ident(name) => {
                 self.advance();
+                // Check for enum path: Name::Variant or Name::Variant(data)
+                if matches!(self.peek(), Token::ColonColon) {
+                    self.advance(); // consume ::
+                    let variant = self.expect_ident()?;
+                    let data = if matches!(self.peek(), Token::LParen) {
+                        self.advance(); // consume (
+                        let inner = self.parse_expr()?;
+                        self.expect(&Token::RParen)?;
+                        Some(Box::new(inner))
+                    } else {
+                        None
+                    };
+                    Ok(Expr::EnumPath(name, variant, data))
+                }
                 // Check for struct instantiation: Name { field: val, ... }
                 // Only if name starts with uppercase (convention)
-                if matches!(self.peek(), Token::LBrace) && name.chars().next().map_or(false, |c| c.is_uppercase()) {
+                else if matches!(self.peek(), Token::LBrace) && name.chars().next().map_or(false, |c| c.is_uppercase()) {
                     self.advance(); // consume {
                     self.skip_newlines();
                     let mut fields = Vec::new();

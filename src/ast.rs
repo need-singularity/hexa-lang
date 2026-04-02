@@ -21,6 +21,8 @@ pub enum Expr {
     Range(Box<Expr>, Box<Expr>, bool), // start..end or start..=end
     StructInit(String, Vec<(String, Expr)>),  // Name { field: val, ... }
     MapLit(Vec<(Expr, Expr)>),  // { key: val, ... }
+    EnumPath(String, String, Option<Box<Expr>>),  // EnumName::Variant(data)
+    Wildcard,  // _ pattern (catch-all)
 }
 
 #[allow(dead_code)]
@@ -119,6 +121,7 @@ pub struct ImplBlock {
 #[derive(Debug, Clone)]
 pub struct MatchArm {
     pub pattern: Expr,
+    pub guard: Option<Expr>,
     pub body: Block,
 }
 
