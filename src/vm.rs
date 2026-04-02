@@ -495,6 +495,9 @@ impl VM {
                     Value::Future(_) => "future",
                     Value::Set(_) => "set",
                     Value::EffectRequest(_, _, _) => "effect_request",
+                    Value::TraitObject { type_name, .. } => type_name.as_str(),
+                    #[cfg(not(target_arch = "wasm32"))]
+                    Value::AsyncFuture(_) => "future",
                 };
                 Ok(Value::Str(type_name.to_string()))
             }

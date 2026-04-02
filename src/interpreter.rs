@@ -12,6 +12,7 @@ use crate::error::{HexaError, ErrorClass};
 use crate::lexer::Lexer;
 use crate::memory::{EgyptianMemory, MemRegion, MemoryStats, estimate_value_size, classify_region};
 use crate::parser::Parser;
+use crate::type_checker::SpecKey;
 
 /// Sentinel error message used to propagate `return` across call frames.
 const RETURN_SENTINEL: &str = "__hexa_return__";
@@ -22,17 +23,18 @@ const THROW_SENTINEL: &str = "__hexa_throw__";
 pub struct Interpreter {
     pub env: Env,
     /// Holds the value carried by the most recent `return` statement.
-    return_value: Option<Value>,
+    pub return_value: Option<Value>,
     /// Holds the value carried by the most recent `throw` statement.
     throw_value: Option<Value>,
     /// Struct declarations: name -> field definitions (name, type, visibility)
-    struct_defs: HashMap<String, Vec<(String, String, Visibility)>>,
+    pub struct_defs: HashMap<String, Vec<(String, String, Visibility)>>,
     /// Enum declarations: name -> list of (variant_name, optional_data_types)
-    enum_defs: HashMap<String, Vec<(String, Option<Vec<String>>)>>,
+    pub enum_defs: HashMap<String, Vec<(String, Option<Vec<String>>)>>,
     /// Impl methods: type_name -> method_name -> (param_names, body)
-    type_methods: HashMap<String, HashMap<String, (Vec<String>, Vec<Stmt>)>>,
-    /// Trait definitions: trait_name -> list of method names
-    trait_defs: HashMap<String, Vec<String>>,
+    pub type_methods: HashMap<String, HashMap<String, (Vec<String>, Vec<Stmt>)>>,
+    /// Trait definitions: trait_name -> list of method signatures (name, params, body)
+    /// Methods with non-empty body are default implementations.
+    trait_defs: HashMap<String, Vec<(String, Vec<String>, Vec<Stmt>)>>,
     /// Trait implementations: (type_name, trait_name) -> method_name -> (param_names, body)
     trait_impls: HashMap<(String, String), HashMap<String, (Vec<String>, Vec<Stmt>)>>,
     /// Module scopes: module_name -> module data (public bindings, struct/enum defs)
@@ -76,6 +78,10 @@ pub struct Interpreter {
     /// Optional output capture buffer. When set, print/println write here
     /// instead of stdout. Used by the WASM playground and library mode.
     output_capture: Option<Arc<Mutex<String>>>,
+    /// Generic function declarations: fn_name -> FnDecl (for monomorphization)
+    generic_fn_decls: HashMap<String, FnDecl>,
+    /// Specialization cache: (fn_name, concrete_types) -> specialized Value::Fn
+    spec_cache: HashMap<SpecKey, Value>,
 }
 
 /// Stored data for a loaded/declared module.
@@ -121,6 +127,8 @@ impl Interpreter {
             comptime_mode: false,
             memory: EgyptianMemory::with_default_budget(),
             output_capture: None,
+            generic_fn_decls: HashMap::new(),
+            spec_cache: HashMap::new(),
         }
     }
 
@@ -231,7 +239,7 @@ impl Interpreter {
 
     // ── Statement execution ─────────────────────────────────
 
-    fn exec_stmt(&mut self, stmt: &Stmt) -> Result<Value, HexaError> {
+    pub fn exec_stmt(&mut self, stmt: &Stmt) -> Result<Value, HexaError> {
         match stmt {
             Stmt::Let(name, _typ, expr, _vis) => {
                 let is_own = matches!(expr, Some(Expr::Own(_)));
@@ -340,16 +348,27 @@ impl Interpreter {
                 Ok(Value::Void)
             }
             Stmt::FnDecl(decl) => {
-                let param_names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
-                let internal_name = if decl.is_pure {
-                    format!("__pure__{}", decl.name)
+                if !decl.type_params.is_empty() {
+                    // Generic function: store declaration for monomorphization at call site
+                    self.generic_fn_decls.insert(decl.name.clone(), decl.clone());
+                    // Also define a placeholder in env so lookups find the name
+                    let param_names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
+                    self.env.define(
+                        &decl.name,
+                        Value::Fn(format!("__generic__{}", decl.name), param_names, decl.body.clone()),
+                    );
                 } else {
-                    decl.name.clone()
-                };
-                self.env.define(
-                    &decl.name,
-                    Value::Fn(internal_name, param_names, decl.body.clone()),
-                );
+                    let param_names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
+                    let internal_name = if decl.is_pure {
+                        format!("__pure__{}", decl.name)
+                    } else {
+                        decl.name.clone()
+                    };
+                    self.env.define(
+                        &decl.name,
+                        Value::Fn(internal_name, param_names, decl.body.clone()),
+                    );
+                }
                 Ok(Value::Void)
             }
             Stmt::For(var, iter_expr, body) => {
@@ -438,8 +457,11 @@ impl Interpreter {
                 Ok(Value::Void)
             }
             Stmt::TraitDecl(decl) => {
-                let method_names: Vec<String> = decl.methods.iter().map(|m| m.name.clone()).collect();
-                self.trait_defs.insert(decl.name.clone(), method_names);
+                let methods: Vec<(String, Vec<String>, Vec<Stmt>)> = decl.methods.iter().map(|m| {
+                    let param_names: Vec<String> = m.params.iter().map(|p| p.name.clone()).collect();
+                    (m.name.clone(), param_names, m.body.clone())
+                }).collect();
+                self.trait_defs.insert(decl.name.clone(), methods);
                 Ok(Value::Void)
             }
             Stmt::ImplBlock(impl_block) => {
@@ -453,6 +475,16 @@ impl Interpreter {
                 if let Some(trait_name) = &impl_block.trait_name {
                     let key = (target.clone(), trait_name.clone());
                     let trait_methods = self.trait_impls.entry(key).or_insert_with(HashMap::new);
+                    // First, fill in default methods from the trait definition
+                    if let Some(trait_def) = self.trait_defs.get(trait_name) {
+                        for (m_name, m_params, m_body) in trait_def.clone() {
+                            if !m_body.is_empty() {
+                                trait_methods.entry(m_name.clone()).or_insert_with(|| (m_params.clone(), m_body.clone()));
+                                methods_map.entry(m_name).or_insert_with(|| (m_params, m_body));
+                            }
+                        }
+                    }
+                    // Then, insert explicitly implemented methods (overrides defaults)
                     for method in &impl_block.methods {
                         let param_names: Vec<String> = method.params.iter().map(|p| p.name.clone()).collect();
                         trait_methods.insert(method.name.clone(), (param_names, method.body.clone()));
@@ -711,7 +743,7 @@ impl Interpreter {
             }
             Stmt::AsyncFnDecl(decl) => {
                 // async fn is stored as a regular function but marked;
-                // when called, it returns a Future
+                // when called, it returns a Future via the green-thread runtime
                 let param_names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
                 // We prefix the function name internally to mark it as async
                 self.env.define(
@@ -720,44 +752,66 @@ impl Interpreter {
                 );
                 Ok(Value::Void)
             }
-            Stmt::Select(_arms) => {
+            Stmt::Select(_arms, _timeout_arm) => {
                 #[cfg(target_arch = "wasm32")]
                 {
                     return Err(self.runtime_err("select is not supported in WASM mode".into()));
                 }
                 #[cfg(not(target_arch = "wasm32"))]
                 {
+                    // Calculate timeout deadline
+                    let deadline = if let Some(ref ta) = _timeout_arm {
+                        let ms_val = self.eval_expr(&ta.duration_ms)?;
+                        let ms = match ms_val {
+                            Value::Int(n) => n as u64,
+                            Value::Float(f) => f as u64,
+                            _ => return Err(self.runtime_err("timeout duration must be a number".into())),
+                        };
+                        Some((std::time::Instant::now() + std::time::Duration::from_millis(ms), ms))
+                    } else {
+                        None
+                    };
+
                     // Polling loop: try_recv on each receiver, first with data wins
                     loop {
-                        for arm in _arms {
-                            if let Expr::Call(callee, _) = &arm.receiver {
-                                if let Expr::Field(obj_expr, method_name) = callee.as_ref() {
-                                    if method_name == "recv" {
-                                        let obj = self.eval_expr(obj_expr)?;
-                                        if let Value::Receiver(rx) = &obj {
-                                            let rx_guard = rx.lock().unwrap();
-                                            match rx_guard.try_recv() {
-                                                Ok(val) => {
-                                                    drop(rx_guard);
-                                                    self.env.push_scope();
-                                                    self.env.define(&arm.binding, val);
-                                                    let mut result = Value::Void;
-                                                    for stmt in &arm.body {
-                                                        result = self.exec_stmt(stmt)?;
-                                                        if self.return_value.is_some() || self.throw_value.is_some() {
-                                                            self.env.pop_scope();
-                                                            return Ok(Value::Void);
-                                                        }
-                                                    }
-                                                    self.env.pop_scope();
-                                                    return Ok(result);
-                                                }
-                                                Err(mpsc::TryRecvError::Empty) => continue,
-                                                Err(mpsc::TryRecvError::Disconnected) => continue,
-                                            }
+                        // Check timeout first
+                        if let Some((dl, _)) = deadline {
+                            if std::time::Instant::now() >= dl {
+                                // Timeout fired — execute timeout arm body
+                                if let Some(ref ta) = _timeout_arm {
+                                    self.env.push_scope();
+                                    let mut result = Value::Void;
+                                    for stmt in &ta.body {
+                                        result = self.exec_stmt(stmt)?;
+                                        if self.return_value.is_some() || self.throw_value.is_some() {
+                                            self.env.pop_scope();
+                                            return Ok(Value::Void);
                                         }
                                     }
+                                    self.env.pop_scope();
+                                    return Ok(result);
                                 }
+                            }
+                        }
+
+                        for arm in _arms {
+                            // Try to receive from channel — handles both syntaxes:
+                            // 1. Old: rx.recv() as val => { ... }
+                            // 2. New: val from rx => { ... } (receiver is an Ident)
+                            let try_result = self.try_select_recv(arm)?;
+                            if let Some(val) = try_result {
+                                self.env.push_scope();
+                                self.env.define(&arm.binding, val);
+                                let mut result = Value::Void;
+                                for stmt in &arm.body {
+                                    result = self.exec_stmt(stmt)?;
+                                    if self.return_value.is_some() || self.throw_value.is_some() {
+                                        self.env.pop_scope();
+                                        return Ok(Value::Void);
+                                    }
+                                }
+                                self.env.pop_scope();
+                                return Ok(result);
                             }
                         }
                         std::thread::sleep(std::time::Duration::from_millis(1));
@@ -1247,8 +1301,17 @@ impl Interpreter {
             Expr::Await(inner) => {
                 let val = self.eval_expr(inner)?;
                 match val {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    Value::AsyncFuture(future) => {
+                        // Use the green-thread runtime to await
+                        let scheduler = crate::async_runtime::global_scheduler();
+                        match scheduler.await_future(&future, Some(std::time::Duration::from_secs(30))) {
+                            Some(result) => Ok(result),
+                            None => Err(self.runtime_err("await timed out after 30 seconds".into())),
+                        }
+                    }
                     Value::Future(future) => {
-                        // Block until the future is resolved
+                        // Legacy: block until the future is resolved
                         loop {
                             {
                                 let guard = future.lock().unwrap();
@@ -1304,6 +1367,31 @@ impl Interpreter {
                 let val = self.eval_expr(val_expr)?;
                 self.resume_value = Some(val.clone());
                 Ok(val)
+            }
+            Expr::DynCast(trait_name, expr) => {
+                let val = self.eval_expr(expr)?;
+                let type_name = match &val {
+                    Value::Struct(name, _) => name.clone(),
+                    Value::Int(_) => "int".to_string(),
+                    Value::Float(_) => "float".to_string(),
+                    Value::Str(_) => "string".to_string(),
+                    Value::Bool(_) => "bool".to_string(),
+                    Value::Array(_) => "array".to_string(),
+                    other => return Err(self.runtime_err(format!(
+                        "cannot create dyn {} from {:?}", trait_name, other
+                    ))),
+                };
+                let key = (type_name.clone(), trait_name.clone());
+                if !self.trait_impls.contains_key(&key) {
+                    return Err(self.runtime_err(format!(
+                        "type {} does not implement trait {}", type_name, trait_name
+                    )));
+                }
+                Ok(Value::TraitObject {
+                    value: Box::new(val),
+                    trait_name: trait_name.clone(),
+                    type_name,
+                })
             }
         }
     }
@@ -1439,7 +1527,7 @@ impl Interpreter {
                 }
                 #[cfg(not(target_arch = "wasm32"))]
                 {
-                    // Async function: run in a thread and return a Future
+                    // Async function: spawn on the green-thread runtime
                     if args.len() != params.len() {
                         return Err(self.runtime_err(format!(
                             "expected {} arguments, got {}",
@@ -1447,51 +1535,121 @@ impl Interpreter {
                             args.len()
                         )));
                     }
-                    let future: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
-                    let future_clone = future.clone();
-                    let params = params.clone();
-                    let body = body.clone();
-                    let captured_env = self.capture_env_for_spawn();
-                    let struct_defs = self.struct_defs.clone();
-                    let enum_defs = self.enum_defs.clone();
-                    let type_methods = self.type_methods.clone();
+                    let bindings: Vec<(String, Value)> = params.iter()
+                        .zip(args.iter())
+                        .map(|(p, a)| (p.clone(), a.clone()))
+                        .collect();
 
-                    let handle = thread::spawn(move || {
-                        let mut interp = Interpreter::new();
-                        interp.struct_defs = struct_defs;
-                        interp.enum_defs = enum_defs;
-                        interp.type_methods = type_methods;
-                        for (n, val) in captured_env {
-                            interp.env.define(&n, val);
+                    let scheduler = crate::async_runtime::global_scheduler();
+                    let future = scheduler.spawn_task(
+                        _name.clone(),
+                        body.clone(),
+                        bindings,
+                        self.capture_env_for_spawn(),
+                        self.struct_defs.clone(),
+                        self.enum_defs.clone(),
+                        self.type_methods.clone(),
+                    );
+                    Ok(Value::AsyncFuture(future))
+                }
+            }
+            Value::Fn(ref _name, ref params, ref _body) if _name.starts_with("__generic__") => {
+                // Monomorphization: specialize the generic function for the concrete argument types
+                let base_name = &_name["__generic__".len()..];
+                let concrete_types: Vec<String> = args.iter().map(|v| self.value_type_string(v)).collect();
+                let key = SpecKey {
+                    fn_name: base_name.to_string(),
+                    concrete_types: concrete_types.clone(),
+                };
+
+                // Check cache first
+                if let Some(specialized) = self.spec_cache.get(&key).cloned() {
+                    return self.call_function(specialized, args);
+                }
+
+                // Create specialized function
+                if let Some(decl) = self.generic_fn_decls.get(base_name).cloned() {
+                    // Build type param -> concrete type mapping
+                    let mut type_map: HashMap<String, String> = HashMap::new();
+                    for (i, tp) in decl.type_params.iter().enumerate() {
+                        if let Some(ct) = concrete_types.get(i) {
+                            type_map.insert(tp.name.clone(), ct.clone());
                         }
-                        interp.env.push_scope();
-                        for (param, arg) in params.iter().zip(args) {
-                            interp.env.define(param, arg);
-                        }
-                        let mut result = Value::Void;
-                        for stmt in &body {
-                            match interp.exec_stmt(stmt) {
-                                Ok(v) => {
-                                    result = v;
-                                    if interp.return_value.is_some() {
-                                        result = interp.return_value.take().unwrap();
-                                        break;
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!("[async] error: {}", e);
-                                    result = Value::Error(e.message);
-                                    break;
+                    }
+
+                    // Also infer from parameter positions
+                    let tp_names: Vec<String> = decl.type_params.iter().map(|tp| tp.name.clone()).collect();
+                    for (i, param) in decl.params.iter().enumerate() {
+                        if let Some(t) = &param.typ {
+                            if tp_names.contains(t) {
+                                if let Some(arg) = args.get(i) {
+                                    type_map.insert(t.clone(), self.value_type_string(arg));
                                 }
                             }
                         }
-                        interp.env.pop_scope();
-                        let mut guard = future_clone.lock().unwrap();
-                        *guard = Some(result);
-                    });
-                    self.spawn_handles.push(handle);
-                    Ok(Value::Future(future))
+                    }
+
+                    // Check trait bounds at runtime
+                    for tp in &decl.type_params {
+                        if let Some(bound) = &tp.bound {
+                            if let Some(concrete) = type_map.get(&tp.name) {
+                                if !self.runtime_trait_check(concrete, bound) {
+                                    return Err(self.type_err(format!(
+                                        "type '{}' does not implement trait '{}' required by type parameter '{}' in '{}'",
+                                        concrete, bound, tp.name, base_name
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                    // Also check where clauses
+                    for wc in &decl.where_clauses {
+                        if let Some(concrete) = type_map.get(&wc.type_name) {
+                            if !self.runtime_trait_check(concrete, &wc.bound) {
+                                return Err(self.type_err(format!(
+                                    "type '{}' does not implement trait '{}' (where clause) in '{}'",
+                                    concrete, wc.bound, base_name
+                                )));
+                            }
+                        }
+                    }
+
+                    // Create specialized fn value with mangled name
+                    let mangled = format!("{}_{}", base_name, concrete_types.join("_"));
+                    let param_names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
+                    let specialized = Value::Fn(mangled, param_names, decl.body.clone());
+
+                    // Cache it
+                    self.spec_cache.insert(key, specialized.clone());
+
+                    // Call the specialized function
+                    return self.call_function(specialized, args);
                 }
+
+                // Fallback: call as regular function (shouldn't reach here)
+                let params = params.clone();
+                let body = _body.clone();
+                if args.len() != params.len() {
+                    return Err(self.runtime_err(format!(
+                        "expected {} arguments, got {}",
+                        params.len(),
+                        args.len()
+                    )));
+                }
+                self.env.push_scope();
+                for (param, arg) in params.iter().zip(args) {
+                    self.env.define(param, arg);
+                }
+                let mut result = Value::Void;
+                for stmt in &body {
+                    result = self.exec_stmt(stmt)?;
+                    if self.return_value.is_some() {
+                        result = self.return_value.take().unwrap();
+                        break;
+                    }
+                }
+                self.env.pop_scope();
+                Ok(result)
             }
             Value::Fn(_name, params, body) => {
                 if args.len() != params.len() {
@@ -1714,6 +1872,42 @@ impl Interpreter {
                         Ok(Value::Bool(guard.is_some()))
                     }
                     _ => Err(self.runtime_err(format!("no method .{}() on Future", method))),
+                }
+            }
+            Value::TraitObject { value, trait_name, type_name } => {
+                let key = (type_name.clone(), trait_name.clone());
+                let method_def = self.trait_impls.get(&key).and_then(|m| m.get(method)).cloned();
+                if let Some((params, body)) = method_def {
+                    if params.is_empty() || params[0] != "self" {
+                        return Err(self.runtime_err(format!(
+                            "trait method {} is not an instance method (no self parameter)", method
+                        )));
+                    }
+                    if args.len() + 1 != params.len() {
+                        return Err(self.runtime_err(format!(
+                            "trait method {} expected {} arguments, got {}",
+                            method, params.len() - 1, args.len()
+                        )));
+                    }
+                    self.env.push_scope();
+                    self.env.define("self", *value.clone());
+                    for (param, arg) in params[1..].iter().zip(args) {
+                        self.env.define(param, arg);
+                    }
+                    let mut result = Value::Void;
+                    for stmt in &body {
+                        result = self.exec_stmt(stmt)?;
+                        if self.return_value.is_some() {
+                            result = self.return_value.take().unwrap();
+                            break;
+                        }
+                    }
+                    self.env.pop_scope();
+                    Ok(result)
+                } else {
+                    Err(self.runtime_err(format!(
+                        "no method .{}() in trait {} for type {}", method, trait_name, type_name
+                    )))
                 }
             }
             _ => Err(self.runtime_err(format!("no method .{}() on {:?}", method, obj))),
@@ -2137,6 +2331,9 @@ impl Interpreter {
                         Value::Future(_) => "future",
                         Value::Set(_) => "set",
                         Value::EffectRequest(_, _, _) => "effect_request",
+                        Value::TraitObject { trait_name, .. } => trait_name.as_str(),
+                        #[cfg(not(target_arch = "wasm32"))]
+                        Value::AsyncFuture(_) => "future",
                     }
                     .to_string(),
                 ))
@@ -3207,6 +3404,80 @@ impl Interpreter {
         captured
     }
 
+    /// Try to receive a value for a select arm (non-blocking).
+    /// Handles both old syntax (rx.recv() as val) and new syntax (val from channel).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn try_select_recv(&mut self, arm: &SelectArm) -> Result<Option<Value>, HexaError> {
+        // Case 1: receiver is a direct channel/receiver identifier (new "from" syntax)
+        if let Expr::Ident(ref _name) = arm.receiver {
+            let obj = self.eval_expr(&arm.receiver)?;
+            match &obj {
+                Value::Receiver(rx) => {
+                    let rx_guard = rx.lock().unwrap();
+                    match rx_guard.try_recv() {
+                        Ok(val) => return Ok(Some(val)),
+                        Err(_) => return Ok(None),
+                    }
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                Value::AsyncFuture(fut) => {
+                    if let Some(val) = fut.poll() {
+                        return Ok(Some(val));
+                    }
+                    return Ok(None);
+                }
+                Value::Future(fut) => {
+                    let guard = fut.lock().unwrap();
+                    if let Some(val) = &*guard {
+                        return Ok(Some(val.clone()));
+                    }
+                    return Ok(None);
+                }
+                _ => {
+                    // Not a receiver or future — ignore for now
+                    return Ok(None);
+                }
+            }
+        }
+        // Case 2: old syntax — rx.recv() call expression
+        if let Expr::Call(callee, _) = &arm.receiver {
+            if let Expr::Field(obj_expr, method_name) = callee.as_ref() {
+                if method_name == "recv" {
+                    let obj = self.eval_expr(obj_expr)?;
+                    if let Value::Receiver(rx) = &obj {
+                        let rx_guard = rx.lock().unwrap();
+                        match rx_guard.try_recv() {
+                            Ok(val) => return Ok(Some(val)),
+                            Err(_) => return Ok(None),
+                        }
+                    }
+                }
+            }
+        }
+        // Case 3: await expression in select
+        if let Expr::Await(inner) = &arm.receiver {
+            let val = self.eval_expr(inner)?;
+            match &val {
+                #[cfg(not(target_arch = "wasm32"))]
+                Value::AsyncFuture(fut) => {
+                    if let Some(v) = fut.poll() {
+                        return Ok(Some(v));
+                    }
+                    return Ok(None);
+                }
+                Value::Future(fut) => {
+                    let guard = fut.lock().unwrap();
+                    if let Some(v) = &*guard {
+                        return Ok(Some(v.clone()));
+                    }
+                    return Ok(None);
+                }
+                _ => return Ok(Some(val)),
+            }
+        }
+        Ok(None)
+    }
+
     fn is_truthy(val: &Value) -> bool {
         match val {
             Value::Bool(b) => *b,
@@ -3373,11 +3644,75 @@ impl Interpreter {
 
     /// Register a FnDecl in the environment.
     fn register_fn_decl(&mut self, decl: &FnDecl) {
-        let param_names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
-        self.env.define(
-            &decl.name,
-            Value::Fn(decl.name.clone(), param_names, decl.body.clone()),
-        );
+        if !decl.type_params.is_empty() {
+            // Generic function: store for monomorphization
+            self.generic_fn_decls.insert(decl.name.clone(), decl.clone());
+            let param_names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
+            self.env.define(
+                &decl.name,
+                Value::Fn(format!("__generic__{}", decl.name), param_names, decl.body.clone()),
+            );
+        } else {
+            let param_names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
+            self.env.define(
+                &decl.name,
+                Value::Fn(decl.name.clone(), param_names, decl.body.clone()),
+            );
+        }
+    }
+
+    /// Get the type name of a runtime value (for monomorphization key).
+    fn value_type_string(&self, val: &Value) -> String {
+        match val {
+            Value::Int(_) => "int".to_string(),
+            Value::Float(_) => "float".to_string(),
+            Value::Bool(_) => "bool".to_string(),
+            Value::Char(_) => "char".to_string(),
+            Value::Str(_) => "string".to_string(),
+            Value::Byte(_) => "byte".to_string(),
+            Value::Void => "void".to_string(),
+            Value::Array(_) => "array".to_string(),
+            Value::Tuple(_) => "tuple".to_string(),
+            Value::Fn(..) => "fn".to_string(),
+            Value::BuiltinFn(_) => "builtin".to_string(),
+            Value::Struct(name, _) => name.clone(),
+            Value::Lambda(..) => "lambda".to_string(),
+            Value::Map(_) => "map".to_string(),
+            Value::Error(_) => "error".to_string(),
+            Value::EnumVariant(name, _, _) => name.clone(),
+            Value::Intent(_) => "intent".to_string(),
+            #[cfg(not(target_arch = "wasm32"))]
+            Value::Sender(_) => "sender".to_string(),
+            #[cfg(not(target_arch = "wasm32"))]
+            Value::Receiver(_) => "receiver".to_string(),
+            Value::Future(_) => "future".to_string(),
+            Value::Set(_) => "set".to_string(),
+            Value::EffectRequest(..) => "effect".to_string(),
+            Value::TraitObject { type_name, .. } => type_name.clone(),
+            #[cfg(not(target_arch = "wasm32"))]
+            Value::AsyncFuture(_) => "future".to_string(),
+        }
+    }
+
+    /// Check if a runtime type satisfies a trait bound.
+    fn runtime_trait_check(&self, type_name: &str, trait_name: &str) -> bool {
+        // Check explicit impl declarations
+        let key = (type_name.to_string(), trait_name.to_string());
+        if self.trait_impls.contains_key(&key) {
+            return true;
+        }
+        // Built-in trait satisfaction for primitive types
+        match trait_name {
+            "Display" => matches!(type_name, "int" | "float" | "bool" | "string" | "char" | "byte"),
+            "Debug" => matches!(type_name, "int" | "float" | "bool" | "string" | "char" | "byte" | "array" | "void"),
+            "Clone" | "Copy" => matches!(type_name, "int" | "float" | "bool" | "char" | "byte"),
+            "PartialEq" | "Eq" => matches!(type_name, "int" | "float" | "bool" | "string" | "char" | "byte"),
+            "PartialOrd" | "Ord" => matches!(type_name, "int" | "float" | "char" | "byte"),
+            "Add" => matches!(type_name, "int" | "float" | "string"),
+            "Numeric" => matches!(type_name, "int" | "float"),
+            "Hash" => matches!(type_name, "int" | "bool" | "string" | "char" | "byte"),
+            _ => false,
+        }
     }
 
     /// Parse a string as HEXA source code, returning statements.

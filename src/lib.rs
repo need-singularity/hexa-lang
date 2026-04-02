@@ -37,6 +37,14 @@ pub mod macro_expand;
 pub mod comptime;
 #[allow(dead_code)]
 pub mod memory;
+#[allow(dead_code)]
+pub mod ownership;
+#[allow(dead_code)]
+pub mod dream;
+
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+pub mod async_runtime;
 
 // These modules use platform-specific features (filesystem, network, threads)
 // and are only available on non-WASM targets.
@@ -97,6 +105,14 @@ pub fn run_source_with_budget(source: &str, budget: usize) -> (String, String) {
     let mut checker = type_checker::TypeChecker::new();
     if let Err(e) = checker.check(&result.stmts, &result.spans) {
         let msg = format_diagnostic(&e, &source_lines, "<playground>");
+        return (String::new(), msg);
+    }
+
+    // Ownership analysis (compile-time)
+    let ownership_errors = ownership::analyze_ownership(&result.stmts, &result.spans);
+    if !ownership_errors.is_empty() {
+        let first = ownership_errors[0].clone().into_hexa_error();
+        let msg = format_diagnostic(&first, &source_lines, "<playground>");
         return (String::new(), msg);
     }
 

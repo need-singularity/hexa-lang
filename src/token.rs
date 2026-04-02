@@ -40,7 +40,7 @@ pub enum Token {
     // Group 1: Control Flow (n=6)
     If, Else, Match, For, While, Loop,
     // Group 2: Type Decl (sopfr=5)
-    Type, Struct, Enum, Trait, Impl,
+    Type, Struct, Enum, Trait, Impl, Dyn,
     // Group 3: Functions (sopfr=5)
     Fn, Return, Yield, Async, Await,
     // Group 4: Variables (τ=4)
@@ -100,6 +100,7 @@ pub fn keyword_from_str(s: &str) -> Option<Token> {
         "enum" => Some(Token::Enum),
         "trait" => Some(Token::Trait),
         "impl" => Some(Token::Impl),
+        "dyn" => Some(Token::Dyn),
         // Group 3: Functions (sopfr=5)
         "fn" => Some(Token::Fn),
         "return" => Some(Token::Return),
@@ -168,7 +169,7 @@ mod tests {
         // σ·τ + sopfr = 48 + 5 = 53
         let keywords = vec![
             "if","else","match","for","while","loop",
-            "type","struct","enum","trait","impl",
+            "type","struct","enum","trait","impl","dyn",
             "fn","return","yield","async","await",
             "let","mut","const","static",
             "mod","use","pub","crate",
@@ -180,7 +181,7 @@ mod tests {
             "try","catch","throw","panic","recover",
             "intent","generate","verify","optimize",
         ];
-        assert_eq!(keywords.len(), 53);
+        assert_eq!(keywords.len(), 54);
         for kw in &keywords {
             assert!(keyword_from_str(kw).is_some(), "Missing keyword: {}", kw);
         }
@@ -189,8 +190,8 @@ mod tests {
     #[test]
     fn test_keyword_groups_is_12() {
         // σ(6) = 12 keyword groups
-        let group_sizes = [6, 5, 5, 4, 4, 4, 4, 4, 4, 4, 5, 4];
+        let group_sizes = [6, 6, 5, 4, 4, 4, 4, 4, 4, 4, 5, 4];
         assert_eq!(group_sizes.len(), 12); // σ(6)
-        assert_eq!(group_sizes.iter().sum::<usize>(), 53); // σ·τ + sopfr
+        assert_eq!(group_sizes.iter().sum::<usize>(), 54); // σ·τ + sopfr + 1 (dyn)
     }
 }

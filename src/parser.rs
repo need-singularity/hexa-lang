@@ -401,30 +401,97 @@ impl Parser {
         self.expect(&Token::LBrace)?;
         self.skip_newlines();
         let mut arms = Vec::new();
+        let mut timeout_arm = None;
         while !matches!(self.peek(), Token::RBrace | Token::Eof) {
-            // Parse receiver expression: rx.recv()
-            let receiver = self.parse_expr()?;
-            // Expect 'as' keyword (parsed as ident)
-            match self.peek().clone() {
-                Token::Ident(ref s) if s == "as" => { self.advance(); }
-                _ => return Err(self.error(format!("expected 'as' in select arm, got {:?}", self.peek()))),
+            // Check for timeout arm: timeout(ms) => { body }
+            if let Token::Ident(ref s) = self.peek().clone() {
+                if s == "timeout" {
+                    self.advance(); // consume 'timeout'
+                    self.expect(&Token::LParen)?;
+                    let duration_expr = self.parse_expr()?;
+                    self.expect(&Token::RParen)?;
+                    self.expect(&Token::FatArrow)?;
+                    let body = if matches!(self.peek(), Token::LBrace) {
+                        self.parse_block()?
+                    } else {
+                        let expr = self.parse_expr()?;
+                        vec![Stmt::Expr(expr)]
+                    };
+                    timeout_arm = Some(crate::ast::TimeoutArm { duration_ms: duration_expr, body });
+                    if matches!(self.peek(), Token::Comma) {
+                        self.advance();
+                    }
+                    self.skip_newlines();
+                    continue;
+                }
             }
-            let binding = self.expect_ident()?;
-            self.expect(&Token::Arrow)?;
-            let body = if matches!(self.peek(), Token::LBrace) {
-                self.parse_block()?
+            // Try new syntax: binding from channel_expr => { body }
+            // Or old syntax: receiver_expr as binding => { body }
+            //
+            // Detect "from" syntax: identifier followed by "from"
+            let is_from_syntax = if let Token::Ident(_) = self.peek() {
+                matches!(self.peek_ahead(1), Token::Ident(ref s) if s == "from")
             } else {
-                let expr = self.parse_expr()?;
-                vec![Stmt::Expr(expr)]
+                false
             };
-            arms.push(crate::ast::SelectArm { receiver, binding, body });
+
+            if is_from_syntax {
+                // New syntax: msg from channel => { body }
+                let binding = self.expect_ident()?;
+                // consume 'from'
+                self.advance();
+                let receiver = self.parse_expr()?;
+                self.expect(&Token::FatArrow)?;
+                let body = if matches!(self.peek(), Token::LBrace) {
+                    self.parse_block()?
+                } else {
+                    let expr = self.parse_expr()?;
+                    vec![Stmt::Expr(expr)]
+                };
+                arms.push(crate::ast::SelectArm { receiver, binding, body });
+            } else {
+                // Old syntax: rx.recv() as val => { body }
+                let receiver = self.parse_expr()?;
+                // Expect 'as' keyword (parsed as ident) or '=>' for futures
+                match self.peek().clone() {
+                    Token::Ident(ref s) if s == "as" => {
+                        self.advance();
+                        let binding = self.expect_ident()?;
+                        // Support both -> and => for backwards compat
+                        if matches!(self.peek(), Token::FatArrow) {
+                            self.advance();
+                        } else {
+                            self.expect(&Token::Arrow)?;
+                        }
+                        let body = if matches!(self.peek(), Token::LBrace) {
+                            self.parse_block()?
+                        } else {
+                            let expr = self.parse_expr()?;
+                            vec![Stmt::Expr(expr)]
+                        };
+                        arms.push(crate::ast::SelectArm { receiver, binding, body });
+                    }
+                    Token::FatArrow => {
+                        // Future without binding: await expr => { body }
+                        self.advance();
+                        let body = if matches!(self.peek(), Token::LBrace) {
+                            self.parse_block()?
+                        } else {
+                            let expr = self.parse_expr()?;
+                            vec![Stmt::Expr(expr)]
+                        };
+                        arms.push(crate::ast::SelectArm { receiver, binding: "_".into(), body });
+                    }
+                    _ => return Err(self.error(format!("expected 'as', 'from', or '=>' in select arm, got {:?}", self.peek()))),
+                }
+            }
             if matches!(self.peek(), Token::Comma) {
                 self.advance();
             }
             self.skip_newlines();
         }
         self.expect(&Token::RBrace)?;
-        Ok(Stmt::Select(arms))
+        Ok(Stmt::Select(arms, timeout_arm))
     }
 
     fn parse_drop_stmt(&mut self) -> Result<Stmt, HexaError> {
@@ -890,6 +957,12 @@ impl Parser {
     fn parse_struct_decl(&mut self, vis: Visibility) -> Result<Stmt, HexaError> {
         self.advance(); // consume 'struct'
         let name = self.expect_ident()?;
+        // Parse optional type parameters: struct Pair<T> { ... }
+        let type_params = if matches!(self.peek(), Token::Lt) {
+            self.parse_type_params()?
+        } else {
+            Vec::new()
+        };
         self.expect(&Token::LBrace)?;
         self.skip_newlines();
         let mut fields = Vec::new();
@@ -906,7 +979,7 @@ impl Parser {
             self.skip_newlines();
         }
         self.expect(&Token::RBrace)?;
-        Ok(Stmt::StructDecl(StructDecl { name, fields, vis }))
+        Ok(Stmt::StructDecl(StructDecl { name, type_params, fields, vis }))
     }
 
     fn parse_enum_decl(&mut self, vis: Visibility) -> Result<Stmt, HexaError> {
@@ -1415,6 +1488,14 @@ impl Parser {
                 }
                 self.expect(&Token::RBracket)?;
                 Ok(Expr::Array(items))
+            }
+            Token::Dyn => {
+                self.advance(); // consume 'dyn'
+                let trait_name = self.expect_ident()?;
+                self.expect(&Token::LParen)?;
+                let expr = self.parse_expr()?;
+                self.expect(&Token::RParen)?;
+                Ok(Expr::DynCast(trait_name, Box::new(expr)))
             }
             Token::If => self.parse_if_expr(),
             Token::Match => self.parse_match_expr(),

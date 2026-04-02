@@ -125,8 +125,27 @@ struct FnSig {
 #[derive(Debug, Clone)]
 struct GenericFnSig {
     type_params: Vec<String>,  // type parameter names (T, U, etc.)
+    trait_bounds: HashMap<String, Vec<String>>,  // type param -> required traits
     param_types: Vec<Option<CheckType>>,
     ret_type: Option<CheckType>,
+    body: Vec<crate::ast::Stmt>,  // AST body for monomorphized checking
+    params: Vec<crate::ast::Param>,  // original param declarations
+}
+
+/// Key for specialization cache: (function_name, concrete_types).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SpecKey {
+    pub fn_name: String,
+    pub concrete_types: Vec<String>,  // e.g. ["int", "string"]
+}
+
+/// A monomorphized (specialized) function signature with resolved types.
+#[derive(Debug, Clone)]
+pub struct SpecializedFn {
+    pub mangled_name: String,  // e.g. "identity_int"
+    pub param_types: Vec<CheckType>,
+    pub ret_type: CheckType,
+    pub type_map: HashMap<String, CheckType>,  // T -> int, U -> string, etc.
 }
 
 pub struct TypeChecker {
@@ -144,6 +163,10 @@ pub struct TypeChecker {
     trait_impls: std::collections::HashSet<(String, String)>,
     /// Currently active type parameters (in scope during generic function checking)
     active_type_params: Vec<String>,
+    /// Specialization cache: avoids re-checking the same generic instantiation.
+    spec_cache: HashMap<SpecKey, SpecializedFn>,
+    /// Generic struct definitions: struct_name -> (type_params, fields)
+    generic_struct_defs: HashMap<String, (Vec<String>, Vec<(String, String)>)>,
     /// Collected errors.
     errors: Vec<HexaError>,
 }
@@ -158,8 +181,15 @@ impl TypeChecker {
             trait_defs: HashMap::new(),
             trait_impls: std::collections::HashSet::new(),
             active_type_params: Vec::new(),
+            spec_cache: HashMap::new(),
+            generic_struct_defs: HashMap::new(),
             errors: Vec::new(),
         }
+    }
+
+    /// Get the specialization cache (for the interpreter to use).
+    pub fn specializations(&self) -> &HashMap<SpecKey, SpecializedFn> {
+        &self.spec_cache
     }
 
     /// Run type checking on the parsed AST with span info.
@@ -178,11 +208,21 @@ impl TypeChecker {
                         };
                         self.fn_sigs.insert(decl.name.clone(), sig);
                     } else {
-                        // Generic function: store type params and resolve param types
-                        // with type params treated as Generic types
+                        // Generic function: store type params, bounds, and body for monomorphization
                         let type_param_names: Vec<String> = decl.type_params.iter().map(|tp| tp.name.clone()).collect();
+                        // Collect trait bounds from type params and where clauses
+                        let mut trait_bounds: HashMap<String, Vec<String>> = HashMap::new();
+                        for tp in &decl.type_params {
+                            if let Some(bound) = &tp.bound {
+                                trait_bounds.entry(tp.name.clone()).or_default().push(bound.clone());
+                            }
+                        }
+                        for wc in &decl.where_clauses {
+                            trait_bounds.entry(wc.type_name.clone()).or_default().push(wc.bound.clone());
+                        }
                         let sig = GenericFnSig {
                             type_params: type_param_names.clone(),
+                            trait_bounds,
                             param_types: decl.params.iter().map(|p| {
                                 p.typ.as_ref().map(|t| {
                                     if type_param_names.contains(t) {
@@ -199,6 +239,8 @@ impl TypeChecker {
                                     CheckType::from_annotation(t)
                                 }
                             }),
+                            body: decl.body.clone(),
+                            params: decl.params.clone(),
                         };
                         self.generic_fn_sigs.insert(decl.name.clone(), sig);
                     }
@@ -207,6 +249,10 @@ impl TypeChecker {
                     let fields: Vec<(String, String)> = decl.fields.iter()
                         .map(|(name, typ, _vis)| (name.clone(), typ.clone()))
                         .collect();
+                    if !decl.type_params.is_empty() {
+                        let tp_names: Vec<String> = decl.type_params.iter().map(|tp| tp.name.clone()).collect();
+                        self.generic_struct_defs.insert(decl.name.clone(), (tp_names, fields.clone()));
+                    }
                     self.struct_defs.insert(decl.name.clone(), fields);
                 }
                 Stmt::TraitDecl(decl) => {
@@ -357,7 +403,7 @@ impl TypeChecker {
             Stmt::StructDecl(_) | Stmt::EnumDecl(_) | Stmt::TraitDecl(_)
             | Stmt::ImplBlock(_) | Stmt::Intent(_, _) | Stmt::Verify(_, _)
             | Stmt::Mod(_, _) | Stmt::Use(_) | Stmt::DropStmt(_)
-            | Stmt::SpawnNamed(_, _) | Stmt::Select(_)
+            | Stmt::SpawnNamed(_, _) | Stmt::Select(_, _)
             | Stmt::Generate(_) | Stmt::Optimize(_)
             | Stmt::Const(..) | Stmt::Static(..)
             | Stmt::MacroDef(_) | Stmt::DeriveDecl(..) => {}
@@ -496,7 +542,7 @@ impl TypeChecker {
                 // Check if calling a known function with type annotations
                 if let Expr::Ident(fn_name) = callee.as_ref() {
                     if let Some(sig) = self.fn_sigs.get(fn_name).cloned() {
-                        // Check argument types against parameter types
+                        // Non-generic function: check argument types against parameter types
                         for (i, (arg, param_type)) in args.iter().zip(sig.param_types.iter()).enumerate() {
                             if let Some(expected) = param_type {
                                 let actual = self.infer_expr(arg);
@@ -508,6 +554,9 @@ impl TypeChecker {
                                 }
                             }
                         }
+                    } else if let Some(gsig) = self.generic_fn_sigs.get(fn_name).cloned() {
+                        // Generic function: monomorphize -- infer concrete types from arguments
+                        self.monomorphize_call(fn_name, &gsig, args, line, col);
                     }
                 }
                 // Recurse into subexpressions
@@ -623,12 +672,19 @@ impl TypeChecker {
                 let types: Vec<CheckType> = items.iter().map(|e| self.infer_expr(e)).collect();
                 CheckType::Tuple(types)
             }
-            Expr::Call(callee, _args) => {
+            Expr::Call(callee, call_args) => {
                 // Try to get return type from function signature
                 if let Expr::Ident(fn_name) = callee.as_ref() {
                     if let Some(sig) = self.fn_sigs.get(fn_name) {
                         if let Some(ret) = &sig.ret_type {
                             return ret.clone();
+                        }
+                    }
+                    // For generic functions, infer return type via monomorphization
+                    if let Some(gsig) = self.generic_fn_sigs.get(fn_name).cloned() {
+                        let type_map = self.infer_type_params(&gsig, call_args);
+                        if let Some(ret) = &gsig.ret_type {
+                            return self.substitute_type(ret, &type_map);
                         }
                     }
                 }
@@ -672,6 +728,174 @@ impl TypeChecker {
             Expr::Await(inner) => self.infer_expr(inner),
             Expr::Wildcard => CheckType::Unknown,
             _ => CheckType::Unknown,  // MacroInvoc, etc.
+        }
+    }
+
+    // ── Monomorphization ───────────────────────────────────
+
+    /// Infer concrete types for type parameters from call arguments.
+    /// Returns a map: type_param_name -> concrete CheckType.
+    fn infer_type_params(&self, gsig: &GenericFnSig, args: &[Expr]) -> HashMap<String, CheckType> {
+        let mut type_map: HashMap<String, CheckType> = HashMap::new();
+        for (i, param_type) in gsig.param_types.iter().enumerate() {
+            if let Some(CheckType::Generic(tp_name)) = param_type {
+                if let Some(arg) = args.get(i) {
+                    let actual = self.infer_expr(arg);
+                    if !matches!(actual, CheckType::Unknown) {
+                        type_map.insert(tp_name.clone(), actual);
+                    }
+                }
+            }
+        }
+        type_map
+    }
+
+    /// Substitute generic type parameters with concrete types.
+    fn substitute_type(&self, typ: &CheckType, type_map: &HashMap<String, CheckType>) -> CheckType {
+        match typ {
+            CheckType::Generic(name) => {
+                type_map.get(name).cloned().unwrap_or(CheckType::Unknown)
+            }
+            CheckType::Array(inner) => {
+                CheckType::Array(Box::new(self.substitute_type(inner, type_map)))
+            }
+            CheckType::Tuple(items) => {
+                CheckType::Tuple(items.iter().map(|t| self.substitute_type(t, type_map)).collect())
+            }
+            CheckType::Fn(params, ret) => {
+                CheckType::Fn(
+                    params.iter().map(|t| self.substitute_type(t, type_map)).collect(),
+                    Box::new(self.substitute_type(ret, type_map)),
+                )
+            }
+            other => other.clone(),
+        }
+    }
+
+    /// Generate a mangled name for a specialization: "identity_int", "pair_first_int_string".
+    fn mangle_name(fn_name: &str, concrete_types: &[CheckType]) -> String {
+        let suffix: Vec<String> = concrete_types.iter()
+            .map(|t| t.display_name().replace('<', "_").replace('>', ""))
+            .collect();
+        format!("{}_{}", fn_name, suffix.join("_"))
+    }
+
+    /// Monomorphize a generic function call: infer types, check bounds, type-check body.
+    fn monomorphize_call(&mut self, fn_name: &str, gsig: &GenericFnSig, args: &[Expr], line: usize, col: usize) {
+        // Step 1: Infer concrete types from arguments
+        let type_map = self.infer_type_params(gsig, args);
+
+        // Step 2: Build concrete type list for cache key
+        let concrete_types: Vec<String> = gsig.type_params.iter()
+            .map(|tp| type_map.get(tp).map_or("unknown".to_string(), |t| t.display_name()))
+            .collect();
+
+        let key = SpecKey {
+            fn_name: fn_name.to_string(),
+            concrete_types: concrete_types.clone(),
+        };
+
+        // Already specialized? Skip.
+        if self.spec_cache.contains_key(&key) {
+            // Still check arguments against the specialized signature
+            if let Some(spec) = self.spec_cache.get(&key).cloned() {
+                for (i, (arg, expected)) in args.iter().zip(spec.param_types.iter()).enumerate() {
+                    let actual = self.infer_expr(arg);
+                    if !expected.accepts(&actual) {
+                        self.emit_error(line, col, format!(
+                            "type mismatch: argument {} of '{}' expected {} but got {} in {}",
+                            i + 1, fn_name, expected.display_name(), actual.display_name(),
+                            spec.mangled_name
+                        ));
+                    }
+                }
+            }
+            return;
+        }
+
+        // Step 3: Check trait bounds
+        for (tp_name, bounds) in &gsig.trait_bounds {
+            if let Some(concrete) = type_map.get(tp_name) {
+                let concrete_name = concrete.display_name();
+                for bound in bounds {
+                    if !self.type_satisfies_trait(&concrete_name, bound) {
+                        self.emit_error(line, col, format!(
+                            "type '{}' does not implement trait '{}' required by type parameter '{}' in '{}'",
+                            concrete_name, bound, tp_name, fn_name
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Step 4: Resolve specialized param/return types
+        let spec_param_types: Vec<CheckType> = gsig.param_types.iter()
+            .map(|pt| match pt {
+                Some(t) => self.substitute_type(t, &type_map),
+                None => CheckType::Unknown,
+            })
+            .collect();
+        let spec_ret_type = match &gsig.ret_type {
+            Some(t) => self.substitute_type(t, &type_map),
+            None => CheckType::Unknown,
+        };
+
+        let concrete_checks: Vec<CheckType> = gsig.type_params.iter()
+            .map(|tp| type_map.get(tp).cloned().unwrap_or(CheckType::Unknown))
+            .collect();
+        let mangled = Self::mangle_name(fn_name, &concrete_checks);
+
+        let spec = SpecializedFn {
+            mangled_name: mangled.clone(),
+            param_types: spec_param_types.clone(),
+            ret_type: spec_ret_type,
+            type_map: type_map.clone(),
+        };
+        self.spec_cache.insert(key, spec);
+
+        // Step 5: Check argument types against specialized parameter types
+        for (i, (arg, expected)) in args.iter().zip(spec_param_types.iter()).enumerate() {
+            let actual = self.infer_expr(arg);
+            if !expected.accepts(&actual) {
+                self.emit_error(line, col, format!(
+                    "type mismatch: argument {} of '{}' expected {} but got {} in {}",
+                    i + 1, fn_name, expected.display_name(), actual.display_name(),
+                    mangled
+                ));
+            }
+        }
+
+        // Step 6: Type-check function body with concrete types
+        self.push_scope();
+        for (param, ptype) in gsig.params.iter().zip(spec_param_types.iter()) {
+            self.define(&param.name, ptype.clone());
+        }
+        // Set active type params to none (they're resolved now)
+        let prev_type_params = std::mem::take(&mut self.active_type_params);
+        for s in &gsig.body {
+            self.check_stmt(s, line, col);
+        }
+        self.active_type_params = prev_type_params;
+        self.pop_scope();
+    }
+
+    /// Check if a concrete type satisfies a trait bound.
+    fn type_satisfies_trait(&self, type_name: &str, trait_name: &str) -> bool {
+        // Check explicit impl declarations
+        if self.trait_impls.contains(&(type_name.to_string(), trait_name.to_string())) {
+            return true;
+        }
+        // Built-in trait satisfaction for primitive types
+        match trait_name {
+            "Display" => matches!(type_name, "int" | "float" | "bool" | "string" | "char" | "byte"),
+            "Debug" => matches!(type_name, "int" | "float" | "bool" | "string" | "char" | "byte" | "array" | "void"),
+            "Clone" | "Copy" => matches!(type_name, "int" | "float" | "bool" | "char" | "byte"),
+            "PartialEq" | "Eq" => matches!(type_name, "int" | "float" | "bool" | "string" | "char" | "byte"),
+            "PartialOrd" | "Ord" => matches!(type_name, "int" | "float" | "char" | "byte"),
+            "Add" => matches!(type_name, "int" | "float" | "string"),
+            "Numeric" => matches!(type_name, "int" | "float"),
+            "Hash" => matches!(type_name, "int" | "bool" | "string" | "char" | "byte"),
+            _ => false,
         }
     }
 }

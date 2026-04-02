@@ -28,10 +28,18 @@ pub enum Value {
     Sender(Arc<Mutex<mpsc::Sender<Value>>>),    // channel sender
     #[cfg(not(target_arch = "wasm32"))]
     Receiver(Arc<Mutex<mpsc::Receiver<Value>>>), // channel receiver
-    Future(Arc<Mutex<Option<Value>>>),           // async future value
+    Future(Arc<Mutex<Option<Value>>>),           // async future value (legacy thread-based)
+    #[cfg(not(target_arch = "wasm32"))]
+    AsyncFuture(crate::async_runtime::HexaFuture), // green-thread future (new runtime)
     Set(Arc<Mutex<std::collections::HashSet<String>>>), // unique value set
     /// Algebraic effect request — propagated up the call stack to be caught by a handler.
     EffectRequest(String, String, Vec<Value>),  // effect_name, op_name, args
+    /// Trait object — wraps a value with its vtable key for dynamic dispatch.
+    TraitObject {
+        value: Box<Value>,
+        trait_name: String,
+        type_name: String,
+    },
 }
 
 impl std::fmt::Display for Value {
@@ -91,12 +99,22 @@ impl std::fmt::Display for Value {
                     None => write!(f, "<future: pending>"),
                 }
             }
+            #[cfg(not(target_arch = "wasm32"))]
+            Value::AsyncFuture(fut) => {
+                match fut.poll() {
+                    Some(v) => write!(f, "<async-future: {}>", v),
+                    None => write!(f, "<async-future: pending>"),
+                }
+            }
             Value::Set(set) => {
                 let guard = set.lock().unwrap();
                 let items: Vec<String> = guard.iter().cloned().collect();
                 write!(f, "Set({{{}}})", items.join(", "))
             }
             Value::EffectRequest(effect, op, _) => write!(f, "<effect {}.{}>", effect, op),
+            Value::TraitObject { value, trait_name, type_name } => {
+                write!(f, "<dyn {} ({}: {})>", trait_name, type_name, value)
+            }
         }
     }
 }

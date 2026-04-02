@@ -210,14 +210,20 @@ fn format_stmt(stmt: &Stmt, indent: usize) -> String {
         Stmt::DropStmt(name) => {
             format!("{}drop {}", prefix, name)
         }
-        Stmt::Select(arms) => {
+        Stmt::Select(arms, timeout_arm) => {
             let mut s = format!("{}select {{\n", prefix);
             for arm in arms {
-                s.push_str(&format!("{}    {} as {} -> {},\n",
+                s.push_str(&format!("{}    {} from {} => {},\n",
                     prefix,
-                    format_expr(&arm.receiver),
                     arm.binding,
+                    format_expr(&arm.receiver),
                     format_block(&arm.body, indent + 1)));
+            }
+            if let Some(ta) = timeout_arm {
+                s.push_str(&format!("{}    timeout({}) => {},\n",
+                    prefix,
+                    format_expr(&ta.duration_ms),
+                    format_block(&ta.body, indent + 1)));
             }
             s.push_str(&format!("{}}}", prefix));
             s
@@ -367,6 +373,7 @@ fn format_expr(expr: &Expr) -> String {
         Expr::HandleWith(_, _) => "handle { ... } with { ... }".to_string(),
         Expr::EffectCall(effect, op, _) => format!("{}.{}(...)", effect, op),
         Expr::Resume(inner) => format!("resume({})", format_expr(inner)),
+        Expr::DynCast(trait_name, expr) => format!("dyn {}({})", trait_name, format_expr(expr)),
     }
 }
 

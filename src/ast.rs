@@ -33,13 +33,23 @@ pub enum Expr {
     HandleWith(Box<Expr>, Vec<EffectHandler>),  // handle { body } with { handlers }
     EffectCall(String, String, Vec<Expr>),       // Effect.op(args)
     Resume(Box<Expr>),                           // resume(val)
+    // Trait objects
+    DynCast(String, Box<Expr>),                  // dyn TraitName(expr) — wrap value as trait object
 }
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct SelectArm {
-    pub receiver: Expr,  // rx.recv() expression
-    pub binding: String, // as val
+    pub receiver: Expr,  // rx.recv() expression or channel ident
+    pub binding: String, // as val or from binding
+    pub body: Block,
+}
+
+/// A timeout arm in a select statement: `timeout(ms) => { body }`
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct TimeoutArm {
+    pub duration_ms: Expr,  // timeout duration in milliseconds
     pub body: Block,
 }
 
@@ -72,7 +82,7 @@ pub enum Stmt {
     SpawnNamed(String, Block),  // spawn "name" { ... } — named concurrent execution
     DropStmt(String),  // drop x — explicit deallocation
     AsyncFnDecl(FnDecl),  // async fn name(...) { ... }
-    Select(Vec<SelectArm>),  // select { rx.recv() as val => body, ... }
+    Select(Vec<SelectArm>, Option<TimeoutArm>),  // select { rx.recv() as val => body, ... timeout(ms) => body }
     MacroDef(MacroDef),      // macro! name { pattern => body }
     DeriveDecl(String, Vec<String>),  // derive(Trait1, Trait2) for TypeName
     Generate(GenerateTarget),  // generate fn/expr with LLM
@@ -248,6 +258,7 @@ pub struct TypeParam {
 #[derive(Debug, Clone)]
 pub struct StructDecl {
     pub name: String,
+    pub type_params: Vec<TypeParam>,  // <T>, <T, U>, etc. for generic structs
     pub fields: Vec<(String, String, Visibility)>,
     pub vis: Visibility,
 }

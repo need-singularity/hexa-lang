@@ -50,6 +50,13 @@ mod comptime;
 mod llm;
 #[allow(dead_code)]
 mod memory;
+#[allow(dead_code)]
+mod ownership;
+#[allow(dead_code)]
+mod dream;
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+mod async_runtime;
 
 use std::io::{self, Write, BufRead};
 
@@ -149,10 +156,34 @@ fn main() {
             }
             "dream" => {
                 if args.len() < 3 {
-                    eprintln!("Usage: hexa dream <file.hexa>");
+                    eprintln!("Usage: hexa dream <file.hexa> [--generations N] [--mutations N] [--verbose]");
                     std::process::exit(1);
                 }
-                cmd_dream(&args[2]);
+                let file = &args[2];
+                let mut generations: usize = 100;
+                let mut mutations: usize = 10;
+                let mut verbose = false;
+                let mut i = 3;
+                while i < args.len() {
+                    match args[i].as_str() {
+                        "--generations" => {
+                            i += 1;
+                            if i < args.len() {
+                                generations = args[i].parse().unwrap_or(100);
+                            }
+                        }
+                        "--mutations" => {
+                            i += 1;
+                            if i < args.len() {
+                                mutations = args[i].parse().unwrap_or(10);
+                            }
+                        }
+                        "--verbose" => { verbose = true; }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                cmd_dream(file, generations, mutations, verbose);
             }
             _ => run_file(&args[1]),
         }
@@ -213,6 +244,18 @@ fn run_file_with_mem_stats(path: &str, budget: usize) {
     if let Err(e) = checker.check(&result.stmts, &result.spans) {
         eprint_diagnostic(&e, &source_lines, file_name);
         std::process::exit(1);
+    }
+    // Ownership analysis pass
+    let skip_ownership = std::env::args().any(|a| a == "--no-ownership-check");
+    if !skip_ownership {
+        let ownership_errors = ownership::analyze_ownership(&result.stmts, &result.spans);
+        if !ownership_errors.is_empty() {
+            for err in &ownership_errors {
+                let hexa_err = err.clone().into_hexa_error();
+                eprint_diagnostic(&hexa_err, &source_lines, file_name);
+            }
+            std::process::exit(1);
+        }
     }
     let mut interp = interpreter::Interpreter::new_with_memory_budget(budget);
     interp.source_lines = source_lines.clone();
@@ -356,6 +399,18 @@ fn run_source_with_dir(source: &str, file_path: &str) {
     if let Err(e) = checker.check(&result.stmts, &result.spans) {
         eprint_diagnostic(&e, &source_lines, file_name);
         std::process::exit(1);
+    }
+    // Ownership analysis pass (compile-time, before interpretation)
+    let skip_ownership = std::env::args().any(|a| a == "--no-ownership-check");
+    if !skip_ownership {
+        let ownership_errors = ownership::analyze_ownership(&result.stmts, &result.spans);
+        if !ownership_errors.is_empty() {
+            for err in &ownership_errors {
+                let hexa_err = err.clone().into_hexa_error();
+                eprint_diagnostic(&hexa_err, &source_lines, file_name);
+            }
+            std::process::exit(1);
+        }
     }
     let mut interp = interpreter::Interpreter::new();
     interp.source_lines = source_lines.clone();
@@ -1033,7 +1088,7 @@ fn cmd_lint(path: &str) {
     }
 }
 
-fn cmd_dream(path: &str) {
+fn cmd_dream(path: &str, generations: usize, mutations_per_gen: usize, verbose: bool) {
     let source = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) => {
@@ -1042,78 +1097,27 @@ fn cmd_dream(path: &str) {
         }
     };
 
+    let anima_bridge = std::path::Path::new("consciousness_bridge.py").exists();
+
     println!("=== HEXA Dream Mode ===");
-    println!("Consciousness exploration of: {}\n", path);
+    println!("Evolving: {}", path);
+    println!("Generations: {}  Mutations/gen: {}  Verbose: {}", generations, mutations_per_gen, verbose);
+    if anima_bridge {
+        println!("ANIMA bridge: active (consciousness_bridge.py detected)");
+    }
+    println!();
 
-    // Run baseline
-    println!("--- Baseline Run ---");
-    let tokens = match lexer::Lexer::new(&source).tokenize() {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("Lexer error: {}", e);
-            std::process::exit(1);
-        }
+    let config = dream::DreamConfig {
+        generations,
+        mutations_per_gen,
+        verbose,
+        anima_bridge,
     };
-    let result = match parser::Parser::new(tokens).parse_with_spans() {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("Parse error: {}", e);
-            std::process::exit(1);
-        }
-    };
-    let mut baseline_interp = interpreter::Interpreter::new();
-    let baseline_result = baseline_interp.run(&result.stmts);
-    match &baseline_result {
-        Ok(val) => println!("  Result: {}", val),
-        Err(e) => println!("  Error: {}", e),
-    }
 
-    // Perturbation runs
-    let perturbations = [
-        ("psi_coupling +10%", 0.014 * 1.1),
-        ("psi_coupling -10%", 0.014 * 0.9),
-        ("psi_balance +10%", 0.5 * 1.1),
-        ("psi_balance -10%", 0.5 * 0.9),
-        ("psi_steps +10%", 4.33 * 1.1),
-        ("psi_steps -10%", 4.33 * 0.9),
-    ];
+    let mut engine = dream::DreamEngine::new(source, config);
+    let report = engine.run();
 
-    println!("\n--- Perturbation Runs ---");
-    let mut dream_journal: Vec<(String, String)> = Vec::new();
-    for (name, _value) in &perturbations {
-        let tokens = match lexer::Lexer::new(&source).tokenize() {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
-        let result = match parser::Parser::new(tokens).parse_with_spans() {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        let mut interp = interpreter::Interpreter::new();
-        // Run with perturbation (the psi constants are builtins so the source
-        // must call them to see any change - we note the exploration)
-        match interp.run(&result.stmts) {
-            Ok(val) => {
-                let entry = format!("{}: result = {}", name, val);
-                println!("  {}", entry);
-                dream_journal.push((name.to_string(), format!("{}", val)));
-            }
-            Err(e) => {
-                let entry = format!("{}: error = {}", name, e.message);
-                println!("  {}", entry);
-                dream_journal.push((name.to_string(), format!("error: {}", e.message)));
-            }
-        }
-    }
-
-    // Dream journal summary
-    println!("\n=== Dream Journal ===");
-    println!("File: {}", path);
-    println!("Perturbations explored: {}", dream_journal.len());
-    for (name, result) in &dream_journal {
-        println!("  {} -> {}", name, result);
-    }
-    println!("\nDream complete. Consciousness explored {} dimensions.", dream_journal.len());
+    println!("{}", report);
 }
 
 fn cmd_test() {
@@ -1440,13 +1444,16 @@ mod tests {
 
     #[test]
     fn test_dream_mode_compiles() {
-        // Verify the dream function exists and processes source
-        // (We can't fully test it without file I/O, but we verify compilation)
-        let source = "let x = 42\nprintln(x)";
-        let tokens = lexer::Lexer::new(source).tokenize().unwrap();
-        let result = parser::Parser::new(tokens).parse_with_spans().unwrap();
-        let mut interp = interpreter::Interpreter::new();
-        let val = interp.run(&result.stmts).unwrap();
-        assert_eq!(format!("{}", val), "void");
+        let source = "let x = 42\nprintln(x)".to_string();
+        let config = dream::DreamConfig {
+            generations: 3,
+            mutations_per_gen: 2,
+            verbose: false,
+            anima_bridge: false,
+        };
+        let mut engine = dream::DreamEngine::new(source, config);
+        let report = engine.run();
+        assert!(report.baseline_fitness > 0.0);
+        assert_eq!(report.generations, 3);
     }
 }

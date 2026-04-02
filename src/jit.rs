@@ -180,7 +180,8 @@ fn can_jit_expr(expr: &Expr) -> bool {
         Expr::Tuple(..) | Expr::Range(..) | Expr::MapLit(..) |
         Expr::Own(..) | Expr::MoveExpr(..) | Expr::Borrow(..) |
         Expr::Await(..) | Expr::MacroInvoc(..) | Expr::Comptime(..) |
-        Expr::HandleWith(..) | Expr::EffectCall(..) | Expr::Resume(..) => false,
+        Expr::HandleWith(..) | Expr::EffectCall(..) | Expr::Resume(..) |
+        Expr::DynCast(..) => false,
     }
 }
 
@@ -204,6 +205,8 @@ pub struct JitCompiler {
     enum_layouts: HashMap<String, EnumLayout>,
     /// Impl methods: type_name -> method_name -> FnDecl.
     impl_methods: HashMap<String, HashMap<String, FnDecl>>,
+    /// Pre-compiled lambda infos (shared across all function translations).
+    lambda_infos: Vec<LambdaInfo>,
 }
 
 impl JitCompiler {
@@ -277,6 +280,7 @@ impl JitCompiler {
             struct_layouts: HashMap::new(),
             enum_layouts: HashMap::new(),
             impl_methods: HashMap::new(),
+            lambda_infos: Vec::new(),
         })
     }
 
@@ -332,7 +336,16 @@ impl JitCompiler {
             }
         }
 
-        // Pass 2: define (compile bodies of) all functions.
+        // Pass 2: scan for lambdas and pre-compile them as module-level functions.
+        // This must happen before Pass 3 (function body compilation) so that
+        // lambda_infos are available for all FuncTranslators.
+        let lambda_descs = scan_lambdas(stmts);
+        for (i, (param_names, captures, body)) in lambda_descs.iter().enumerate() {
+            let info = self.compile_lambda(i, param_names, captures, body)?;
+            self.lambda_infos.push(info);
+        }
+
+        // Pass 3: define (compile bodies of) all functions.
         for stmt in stmts {
             if let Stmt::FnDecl(decl) = stmt {
                 self.define_function(decl)?;
@@ -364,7 +377,7 @@ impl JitCompiler {
             .collect();
 
         // Compile the top-level as a special "__hexa_main__" function with no params.
-        let main_id = self.compile_main(&top_stmts)?;
+        let main_id = self.compile_main_with_lambdas(&top_stmts)?;
 
         // Finalize all function code.
         self.module
@@ -444,6 +457,9 @@ impl JitCompiler {
                 &self.impl_methods,
             );
 
+            // Pass pre-compiled lambda info to the translator.
+            trans.lambdas = self.lambda_infos.clone();
+
             // If this is an impl method, track `self` as the struct type.
             if let Some(ref st) = self_type {
                 trans.var_types.insert("self".to_string(), st.clone());
@@ -480,8 +496,103 @@ impl JitCompiler {
         Ok(())
     }
 
-    /// Compile top-level statements into a __hexa_main__ function.
-    fn compile_main(&mut self, stmts: &[&Stmt]) -> Result<FuncId, HexaError> {
+    /// Pre-compile a lambda as a module-level function.
+    /// The compiled function signature is: (env_ptr: i64, param0: i64, ...) -> i64.
+    /// Inside the function body, captured variables are loaded from env_ptr.
+    fn compile_lambda(
+        &mut self,
+        index: usize,
+        param_names: &[String],
+        captures: &[String],
+        body: &Expr,
+    ) -> Result<LambdaInfo, HexaError> {
+        let func_name = format!("__lambda_{}__", index);
+
+        // Signature: env_ptr + params -> i64
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(I64)); // env_ptr
+        for _ in param_names {
+            sig.params.push(AbiParam::new(I64));
+        }
+        sig.returns.push(AbiParam::new(I64));
+
+        let func_id = self.module
+            .declare_function(&func_name, Linkage::Local, &sig)
+            .map_err(|e| jit_err(format!("declare lambda '{}': {}", func_name, e)))?;
+
+        let mut ctx = self.module.make_context();
+        ctx.func.signature = sig;
+        ctx.func.name = UserFuncName::user(0, func_id.as_u32());
+
+        let mut func_ctx = FunctionBuilderContext::new();
+        {
+            let mut builder = FunctionBuilder::new(&mut ctx.func, &mut func_ctx);
+            let entry_block = builder.create_block();
+            builder.append_block_params_for_function_params(entry_block);
+            builder.switch_to_block(entry_block);
+
+            let mut trans = FuncTranslator::new(
+                &mut self.module,
+                &self.functions,
+                self.println_id,
+                self.print_id,
+                self.alloc_id,
+                self.bounds_check_id,
+                &self.struct_layouts,
+                &self.enum_layouts,
+                &self.impl_methods,
+            );
+
+            // Param 0 is env_ptr.
+            let env_ptr_val = builder.block_params(entry_block)[0];
+
+            // Load captured variables from environment.
+            for (i, cap_name) in captures.iter().enumerate() {
+                let var = trans.declare_var(cap_name, &mut builder);
+                let val = trans.load_from_offset(
+                    &mut builder,
+                    env_ptr_val,
+                    i as i64 * SLOT_SIZE,
+                );
+                builder.def_var(var, val);
+            }
+
+            // Bind lambda parameters (offset by 1 for env_ptr).
+            for (i, pname) in param_names.iter().enumerate() {
+                let val = builder.block_params(entry_block)[i + 1];
+                let var = trans.declare_var(pname, &mut builder);
+                builder.def_var(var, val);
+            }
+
+            // Compile the body.
+            let body_val = trans.compile_expr(&mut builder, body)?;
+
+            if !trans.is_block_terminated(&builder) {
+                builder.ins().return_(&[body_val]);
+            }
+
+            builder.seal_all_blocks();
+            builder.finalize();
+        }
+
+        self.module
+            .define_function(func_id, &mut ctx)
+            .map_err(|e| jit_err(format!("define lambda '{}': {}", func_name, e)))?;
+        self.module.clear_context(&mut ctx);
+
+        Ok(LambdaInfo {
+            func_name,
+            func_id,
+            captures: captures.to_vec(),
+            param_count: param_names.len(),
+        })
+    }
+
+    /// Compile top-level statements into a __hexa_main__ function, with lambda info.
+    fn compile_main_with_lambdas(
+        &mut self,
+        stmts: &[&Stmt],
+    ) -> Result<FuncId, HexaError> {
         let mut sig = self.module.make_signature();
         sig.returns.push(AbiParam::new(I64));
 
@@ -513,6 +624,7 @@ impl JitCompiler {
                 &self.enum_layouts,
                 &self.impl_methods,
             );
+            trans.lambdas = self.lambda_infos.clone();
 
             let mut last_val = None;
             for stmt in stmts {
@@ -539,6 +651,238 @@ impl JitCompiler {
 
 // ── FuncTranslator ─────────────────────────────────────────────────
 
+/// Information about a pre-compiled lambda (closure) function.
+#[derive(Debug, Clone)]
+struct LambdaInfo {
+    /// Unique function name for this lambda (e.g., "__lambda_0__").
+    func_name: String,
+    /// FuncId in the Cranelift module.
+    func_id: FuncId,
+    /// Names of captured (free) variables, in order.
+    captures: Vec<String>,
+    /// Number of lambda parameters (excluding env_ptr).
+    param_count: usize,
+}
+
+/// Walk an expression AST to collect free variables (identifiers that are
+/// not bound by lambda parameters or local let bindings in the body).
+fn collect_free_vars(expr: &Expr, params: &[String], bound: &mut Vec<String>) -> Vec<String> {
+    let mut free = Vec::new();
+    collect_free_vars_inner(expr, params, bound, &mut free);
+    // Deduplicate while preserving order.
+    let mut seen = std::collections::HashSet::new();
+    free.retain(|v| seen.insert(v.clone()));
+    free
+}
+
+fn collect_free_vars_inner(
+    expr: &Expr,
+    params: &[String],
+    bound: &[String],
+    free: &mut Vec<String>,
+) {
+    match expr {
+        Expr::Ident(name) => {
+            if !params.contains(name) && !bound.contains(name) && !is_builtin(name) {
+                free.push(name.clone());
+            }
+        }
+        Expr::Binary(l, _, r) => {
+            collect_free_vars_inner(l, params, bound, free);
+            collect_free_vars_inner(r, params, bound, free);
+        }
+        Expr::Unary(_, e) => collect_free_vars_inner(e, params, bound, free),
+        Expr::Call(callee, args) => {
+            collect_free_vars_inner(callee, params, bound, free);
+            for a in args {
+                collect_free_vars_inner(a, params, bound, free);
+            }
+        }
+        Expr::If(c, then_b, else_b) => {
+            collect_free_vars_inner(c, params, bound, free);
+            for s in then_b {
+                collect_free_vars_stmt(s, params, bound, free);
+            }
+            if let Some(eb) = else_b {
+                for s in eb {
+                    collect_free_vars_stmt(s, params, bound, free);
+                }
+            }
+        }
+        Expr::Block(stmts) => {
+            for s in stmts {
+                collect_free_vars_stmt(s, params, bound, free);
+            }
+        }
+        Expr::Array(items) => {
+            for item in items {
+                collect_free_vars_inner(item, params, bound, free);
+            }
+        }
+        Expr::Index(arr, idx) => {
+            collect_free_vars_inner(arr, params, bound, free);
+            collect_free_vars_inner(idx, params, bound, free);
+        }
+        Expr::Field(obj, _) => collect_free_vars_inner(obj, params, bound, free),
+        Expr::Lambda(inner_params, body) => {
+            // Inner lambda: its params are bound within its body, not free here
+            let inner_param_names: Vec<String> = inner_params.iter().map(|p| p.name.clone()).collect();
+            let mut combined = params.to_vec();
+            combined.extend(inner_param_names);
+            combined.extend(bound.to_vec());
+            collect_free_vars_inner(body, &combined, &[], free);
+        }
+        Expr::StructInit(_, fields) => {
+            for (_, e) in fields {
+                collect_free_vars_inner(e, params, bound, free);
+            }
+        }
+        Expr::Match(scrut, arms) => {
+            collect_free_vars_inner(scrut, params, bound, free);
+            for arm in arms {
+                collect_free_vars_inner(&arm.pattern, params, bound, free);
+                if let Some(g) = &arm.guard {
+                    collect_free_vars_inner(g, params, bound, free);
+                }
+                for s in &arm.body {
+                    collect_free_vars_stmt(s, params, bound, free);
+                }
+            }
+        }
+        _ => {} // Literals, etc.
+    }
+}
+
+fn collect_free_vars_stmt(
+    stmt: &Stmt,
+    params: &[String],
+    bound: &[String],
+    free: &mut Vec<String>,
+) {
+    match stmt {
+        Stmt::Let(_, _, Some(e), _) => collect_free_vars_inner(e, params, bound, free),
+        Stmt::Assign(l, r) => {
+            collect_free_vars_inner(l, params, bound, free);
+            collect_free_vars_inner(r, params, bound, free);
+        }
+        Stmt::Expr(e) => collect_free_vars_inner(e, params, bound, free),
+        Stmt::Return(Some(e)) => collect_free_vars_inner(e, params, bound, free),
+        Stmt::While(c, body) => {
+            collect_free_vars_inner(c, params, bound, free);
+            for s in body {
+                collect_free_vars_stmt(s, params, bound, free);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_builtin(name: &str) -> bool {
+    matches!(name, "println" | "print" | "len" | "true" | "false")
+}
+
+/// Scan an AST for all Lambda expressions and return info about each.
+/// Assigns sequential names __lambda_0__, __lambda_1__, etc.
+fn scan_lambdas(stmts: &[Stmt]) -> Vec<(Vec<String>, Vec<String>, Box<Expr>)> {
+    let mut lambdas = Vec::new();
+    for stmt in stmts {
+        scan_lambdas_stmt(stmt, &[], &mut lambdas);
+    }
+    lambdas
+}
+
+/// (param_names, captures, body) for each lambda found.
+fn scan_lambdas_stmt(
+    stmt: &Stmt,
+    scope_vars: &[String],
+    out: &mut Vec<(Vec<String>, Vec<String>, Box<Expr>)>,
+) {
+    match stmt {
+        Stmt::Let(name, _, Some(e), _) => {
+            scan_lambdas_expr(e, scope_vars, out);
+            // After this let, `name` is in scope for subsequent statements
+            // (but we handle this at the block level, not here)
+            let _ = name;
+        }
+        Stmt::Assign(l, r) => {
+            scan_lambdas_expr(l, scope_vars, out);
+            scan_lambdas_expr(r, scope_vars, out);
+        }
+        Stmt::Expr(e) => scan_lambdas_expr(e, scope_vars, out),
+        Stmt::Return(Some(e)) => scan_lambdas_expr(e, scope_vars, out),
+        Stmt::FnDecl(f) => {
+            let mut inner_scope: Vec<String> = scope_vars.to_vec();
+            for p in &f.params {
+                inner_scope.push(p.name.clone());
+            }
+            for s in &f.body {
+                scan_lambdas_stmt(s, &inner_scope, out);
+            }
+        }
+        Stmt::While(c, body) => {
+            scan_lambdas_expr(c, scope_vars, out);
+            for s in body {
+                scan_lambdas_stmt(s, scope_vars, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn scan_lambdas_expr(
+    expr: &Expr,
+    scope_vars: &[String],
+    out: &mut Vec<(Vec<String>, Vec<String>, Box<Expr>)>,
+) {
+    match expr {
+        Expr::Lambda(params, body) => {
+            let param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
+            let captures = collect_free_vars(body, &param_names, &mut scope_vars.to_vec());
+            out.push((param_names, captures, body.clone()));
+            // Also scan inside the lambda body for nested lambdas
+            scan_lambdas_expr(body, scope_vars, out);
+        }
+        Expr::Binary(l, _, r) => {
+            scan_lambdas_expr(l, scope_vars, out);
+            scan_lambdas_expr(r, scope_vars, out);
+        }
+        Expr::Unary(_, e) => scan_lambdas_expr(e, scope_vars, out),
+        Expr::Call(callee, args) => {
+            scan_lambdas_expr(callee, scope_vars, out);
+            for a in args {
+                scan_lambdas_expr(a, scope_vars, out);
+            }
+        }
+        Expr::If(c, then_b, else_b) => {
+            scan_lambdas_expr(c, scope_vars, out);
+            for s in then_b {
+                scan_lambdas_stmt(s, scope_vars, out);
+            }
+            if let Some(eb) = else_b {
+                for s in eb {
+                    scan_lambdas_stmt(s, scope_vars, out);
+                }
+            }
+        }
+        Expr::Block(stmts) => {
+            for s in stmts {
+                scan_lambdas_stmt(s, scope_vars, out);
+            }
+        }
+        Expr::Array(items) => {
+            for item in items {
+                scan_lambdas_expr(item, scope_vars, out);
+            }
+        }
+        Expr::Index(a, b) => {
+            scan_lambdas_expr(a, scope_vars, out);
+            scan_lambdas_expr(b, scope_vars, out);
+        }
+        Expr::Field(obj, _) => scan_lambdas_expr(obj, scope_vars, out),
+        _ => {}
+    }
+}
+
 /// Translates HEXA AST nodes into Cranelift IR within a single function.
 struct FuncTranslator<'a> {
     module: &'a mut JITModule,
@@ -557,6 +901,11 @@ struct FuncTranslator<'a> {
     impl_methods: &'a HashMap<String, HashMap<String, FnDecl>>,
     /// Track which variables hold struct pointers and their type name.
     var_types: HashMap<String, String>,
+    /// Pre-compiled lambda info, indexed to match scan order.
+    lambdas: Vec<LambdaInfo>,
+    /// Counter for matching lambdas during compilation (incremented each
+    /// time we encounter a Lambda expression).
+    lambda_counter: usize,
 }
 
 impl<'a> FuncTranslator<'a> {
@@ -583,6 +932,8 @@ impl<'a> FuncTranslator<'a> {
             enum_layouts,
             impl_methods,
             var_types: HashMap::new(),
+            lambdas: Vec::new(),
+            lambda_counter: 0,
         }
     }
 
@@ -1248,16 +1599,57 @@ impl<'a> FuncTranslator<'a> {
 
             // ── Lambda / closure ────────────────────────────────────
             Expr::Lambda(_params, _body) => {
-                // For now, lambdas that don't capture variables are compiled as
-                // regular functions with a dummy env pointer.
-                // Full closure support with captures would require more infrastructure.
-                //
-                // We create a stub that returns 0 for the closure pointer.
-                // Closures are the hardest part — stub for now, return a sentinel.
-                // The closure is represented as a heap-allocated [fn_ptr, env_ptr].
-                // Since we can't easily compile a lambda to a separate function in
-                // the current Cranelift context, we return a null closure sentinel.
-                Ok(builder.ins().iconst(I64, 0))
+                // Look up the pre-compiled lambda by counter index.
+                let idx = self.lambda_counter;
+                self.lambda_counter += 1;
+
+                if idx >= self.lambdas.len() {
+                    return Err(jit_err(format!(
+                        "lambda index {} out of range (only {} pre-compiled)",
+                        idx, self.lambdas.len()
+                    )));
+                }
+
+                let lambda_info = self.lambdas[idx].clone();
+
+                // Allocate closure struct: [fn_ptr (8 bytes), env_ptr (8 bytes)]
+                let closure_ptr = self.call_alloc(builder, 2 * SLOT_SIZE);
+
+                // Get function pointer for the lambda.
+                let func_ref = self.module.declare_func_in_func(
+                    lambda_info.func_id,
+                    &mut builder.func,
+                );
+                let fn_ptr = builder.ins().func_addr(I64, func_ref);
+                self.store_at_offset(builder, closure_ptr, 0, fn_ptr);
+
+                // Allocate environment: one i64 slot per captured variable.
+                let num_captures = lambda_info.captures.len() as i64;
+                if num_captures > 0 {
+                    let env_size = num_captures * SLOT_SIZE;
+                    let env_ptr = self.call_alloc(builder, env_size);
+
+                    // Store each captured variable's current value into the env.
+                    for (i, cap_name) in lambda_info.captures.iter().enumerate() {
+                        if let Some(&var) = self.vars.get(cap_name) {
+                            let val = builder.use_var(var);
+                            self.store_at_offset(builder, env_ptr, i as i64 * SLOT_SIZE, val);
+                        } else {
+                            // Variable not found -- store 0.
+                            let zero = builder.ins().iconst(I64, 0);
+                            self.store_at_offset(builder, env_ptr, i as i64 * SLOT_SIZE, zero);
+                        }
+                    }
+
+                    self.store_at_offset(builder, closure_ptr, SLOT_SIZE, env_ptr);
+                } else {
+                    // No captures -- env_ptr = 0.
+                    let null_env = builder.ins().iconst(I64, 0);
+                    self.store_at_offset(builder, closure_ptr, SLOT_SIZE, null_env);
+                }
+
+                // Return the closure pointer.
+                Ok(closure_ptr)
             }
 
             // Unsupported expressions return 0.
