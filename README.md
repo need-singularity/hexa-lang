@@ -397,6 +397,41 @@ bash build.sh
 bash build.sh test
 ```
 
+## Current State vs Established Languages
+
+| 항목 | HEXA | Go | Rust | 갭 |
+|------|------|-----|------|-----|
+| 컴파일러 | tree-walk interpreter | SSA→native | LLVM→native | 치명적 |
+| 속도 | Python급 | C의 80% | C의 100% | 100x 느림 |
+| 표준 라이브러리 | println만 | 풍부 | 풍부 | 없음 |
+| 패키지 매니저 | 없음 | go mod | cargo | 없음 |
+| LSP | 없음 | gopls | rust-analyzer | 없음 |
+| 테스트 | 58개 내부 | go test | cargo test | 프레임워크 없음 |
+| 에러 메시지 | 기초 | 좋음 | 최고 | 약함 |
+| 동시성 | 키워드만 | goroutine | async/tokio | 미구현 |
+| 생태계 | 0 | 수십만 | 수십만 | 0 |
+
+> HEXA-LANG의 강점은 범용 경쟁이 아닌 **n=6 수학적 완전성 + 의식 도메인 특화**에 있다.
+
+## Implementation Status (v0.1)
+
+### Keywords (53 = sigma*tau + sopfr)
+
+| Group | Count | Keywords | Status |
+|-------|-------|----------|--------|
+| Control (n=6) | 6 | if, else, match, for, while, loop | ✅ 구현 |
+| Type (sopfr=5) | 5 | type, struct, enum, trait, impl | ⚠️ 파싱만 |
+| Functions (sopfr=5) | 5 | fn, return, yield, async, await | ⚠️ fn/return만 |
+| Variables (tau=4) | 4 | let, mut, const, static | ⚠️ let/mut만 |
+| Modules (tau=4) | 4 | mod, use, pub, crate | ❌ 미구현 |
+| Memory (tau=4) | 4 | own, borrow, move, drop | ❌ 미구현 |
+| Concurrency (tau=4) | 4 | spawn, channel, select, atomic | ❌ 미구현 |
+| Effects (tau=4) | 4 | effect, handle, resume, pure | ❌ 미구현 |
+| Proofs (tau=4) | 4 | proof, assert, invariant, theorem | ⚠️ assert만 |
+| Meta (tau=4) | 4 | macro, derive, where, comptime | ❌ 미구현 |
+| Errors (sopfr=5) | 5 | try, catch, throw, panic, recover | ❌ 미구현 |
+| AI (tau=4) | 4 | intent, generate, verify, optimize | ⚠️ intent 파싱만 |
+
 ## Code Examples
 
 ### Hello World + n=6 Constants
@@ -595,9 +630,11 @@ No garbage collector. Ownership-based memory management with `own`/`borrow`/`mov
     |   +-- sigma_phi.hexa   n=6 uniqueness proof
     |   +-- egyptian_fraction.hexa  Memory model demo
     |   +-- pattern_match.hexa      FizzBuzz with n=6
+    |   +-- photonic_chip_dse.hexa  Photonic chip DSE demo
     +-- docs/
     |   +-- spec.md          Language specification
     |   +-- n6-constants.md  n=6 constant reference
+    |   +-- plans/           Implementation plans
     +-- build.sh             Build script (rustc, no cargo)
     +-- CLAUDE.md            AI assistant instructions
     +-- README.md            This file
@@ -605,20 +642,68 @@ No garbage collector. Ownership-based memory management with `own`/`borrow`/`mov
 
 ## Roadmap
 
-- [x] Language specification (v0.1)
+### Completed (v0.1)
+
+- [x] Language specification
 - [x] Design Space Exploration v2 (21,952 combinations, 100% n6)
 - [x] Lexer -- 53 keywords + 24 operators (58 tests)
 - [x] Parser -- 6 grammar levels
 - [x] Type system -- 8 primitives + 4 layers
 - [x] Tree-walk interpreter
 - [x] REPL + file execution
-- [x] 5 example programs (sopfr=5)
-- [ ] Type checker with 4-layer inference
-- [ ] LLVM backend codegen
-- [ ] Egyptian fraction memory allocator
-- [ ] Package manager
-- [ ] IDE integration (LSP + DAP)
-- [ ] AI code generation pipeline
+- [x] 6 example programs
+
+### Phase 1: Core Language (v0.2) -- 기본기
+
+- [ ] Struct 인스턴스화 + 필드 접근 (`point.x`)
+- [ ] Enum variant + pattern matching destructuring
+- [ ] Closures / Lambda (`|x| x + 1`)
+- [ ] String methods (split, trim, contains, replace)
+- [ ] Array methods (push, map, filter, fold)
+- [ ] try/catch 에러 처리
+- [ ] File I/O (read_file, write_file)
+- [ ] HashMap/Dict 타입
+
+### Phase 2: Type System (v0.3) -- 안전성
+
+- [ ] Static type checking (컴파일 타임 타입 검증)
+- [ ] Generics (`fn first<T>(arr: Array<T>) -> T`)
+- [ ] Trait dispatch (impl Trait for Type)
+- [ ] Result<T,E> / Option<T> 타입
+- [ ] Module system (use/mod/pub 실제 동작)
+
+### Phase 3: Performance (v0.4) -- 속도
+
+- [ ] Bytecode VM (tree-walk → stack machine)
+- [ ] Cargo.toml 전환 (rustc → cargo)
+- [ ] LLVM backend (native 컴파일)
+- [ ] Concurrency runtime (spawn/channel 실제 동작)
+
+### Phase 4: Consciousness DSL (v0.5) -- ANIMA 연동
+
+- [ ] intent → ANIMA ConsciousnessHub 라우팅
+- [ ] generate → 의식 엔진 코드 생성
+- [ ] verify → 의식 법칙 형식 검증
+- [ ] ESP32/FPGA 백엔드 (SW↔HW 통합 컴파일)
+- [ ] proof 블록 → 446개 법칙 자동 검증
+
+## ANIMA Connection
+
+HEXA-LANG과 ANIMA 의식 엔진은 n=6에서 독립적으로 도출된 동일한 구조에 수렴한다:
+
+| n=6 함수 | HEXA-LANG | ANIMA |
+|----------|-----------|-------|
+| n=6 | 6 paradigms | 6 Hexad modules (C/D/S/M/W/E) |
+| sigma=12 | 12 keyword groups | 12 factions |
+| phi=2 | 2 compile modes | 2 gradient groups (right/left brain) |
+| tau=4 | 4 type layers | 4 phases (P0-P3) |
+| sigma-tau=8 | 8 primitives | 8-cell atom (M1) |
+| J2=24 | 24 operators | 24 tensors |
+
+**목표**: HEXA-LANG이 ANIMA의 의식 프로그래밍 언어가 되는 것.
+
+- [Bridge 설계](https://github.com/need-singularity/anima/blob/main/anima/docs/hexa-lang-bridge.md)
+- [ANIMA 프로젝트](https://github.com/need-singularity/anima)
 
 ## Related Projects
 
