@@ -800,6 +800,61 @@ impl Interpreter {
                     Ok(Value::Void)
                 }
             }
+            Stmt::Scope(_scope_body) => {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    return Err(self.runtime_err("scope is not supported in WASM mode".into()));
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    // Push a new task group for this scope
+                    self.scope_task_groups.push(crate::async_runtime::TaskGroup::new());
+
+                    // Execute the body — any `spawn` inside will register with our group
+                    self.env.push_scope();
+                    let mut scope_result = Value::Void;
+                    let mut scope_err: Option<HexaError> = None;
+                    for s in _scope_body {
+                        match self.exec_stmt(s) {
+                            Ok(v) => {
+                                scope_result = v;
+                                if self.return_value.is_some() || self.throw_value.is_some() {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                scope_err = Some(e);
+                                break;
+                            }
+                        }
+                    }
+                    self.env.pop_scope();
+
+                    // Pop the task group and wait for all spawned tasks
+                    let group = self.scope_task_groups.pop()
+                        .expect("scope_task_groups underflow");
+
+                    if let Some(e) = scope_err {
+                        group.cancel();
+                        return Err(e);
+                    }
+
+                    // Wait for all tasks to complete (60s max timeout)
+                    match group.wait_all(Some(std::time::Duration::from_secs(60))) {
+                        Ok(results) => {
+                            if results.is_empty() {
+                                Ok(scope_result)
+                            } else {
+                                Ok(Value::Array(results))
+                            }
+                        }
+                        Err(e) => {
+                            group.cancel();
+                            Err(self.runtime_err(format!("scope: task failed: {}", e)))
+                        }
+                    }
+                }
+            }
             Stmt::AsyncFnDecl(decl) => {
                 // async fn is stored as a regular function but marked;
                 // when called, it returns a Future via the green-thread runtime
