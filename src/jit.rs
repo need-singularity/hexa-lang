@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 //! Cranelift JIT compiler for HEXA-LANG.
 //!
 //! Compiles a subset of the AST to native machine code via Cranelift IR.
@@ -185,8 +183,8 @@ impl JitCompiler {
             let mut builder = FunctionBuilder::new(&mut ctx.func, &mut func_ctx);
             let entry_block = builder.create_block();
             builder.append_block_params_for_function_params(entry_block);
+
             builder.switch_to_block(entry_block);
-            builder.seal_block(entry_block);
 
             let mut trans = FuncTranslator::new(
                 &mut self.module,
@@ -245,8 +243,8 @@ impl JitCompiler {
         {
             let mut builder = FunctionBuilder::new(&mut ctx.func, &mut func_ctx);
             let entry_block = builder.create_block();
+
             builder.switch_to_block(entry_block);
-            builder.seal_block(entry_block);
 
             let mut trans = FuncTranslator::new(
                 &mut self.module,
@@ -314,7 +312,13 @@ impl<'a> FuncTranslator<'a> {
     }
 
     fn is_block_terminated(&self, builder: &FunctionBuilder) -> bool {
-        builder.is_unreachable()
+        let block = builder.current_block().unwrap();
+        if let Some(last_inst) = builder.func.layout.last_inst(block) {
+            let opcode = builder.func.dfg.insts[last_inst].opcode();
+            opcode.is_branch() || opcode.is_return()
+        } else {
+            false
+        }
     }
 
     /// Compile a statement. Returns the last expression value (if any).
