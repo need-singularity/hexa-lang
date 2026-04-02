@@ -146,6 +146,11 @@ impl Env {
         env.define("Err", Value::BuiltinFn("Err".into()));
         // Concurrency builtins
         env.define("channel", Value::BuiltinFn("channel".into()));
+        // Char utility builtins
+        env.define("is_alpha", Value::BuiltinFn("is_alpha".into()));
+        env.define("is_digit", Value::BuiltinFn("is_digit".into()));
+        env.define("is_alphanumeric", Value::BuiltinFn("is_alphanumeric".into()));
+        env.define("is_whitespace", Value::BuiltinFn("is_whitespace".into()));
         // Random builtins
         env.define("random", Value::BuiltinFn("random".into()));
         env.define("random_int", Value::BuiltinFn("random_int".into()));

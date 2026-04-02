@@ -541,10 +541,21 @@ impl Parser {
         self.advance(); // consume 'if'
         let cond = self.parse_expr()?;
         let then_block = self.parse_block()?;
+        // Save position to allow backtracking if newlines precede else
+        let saved_pos = self.pos;
+        self.skip_newlines();
         let else_block = if matches!(self.peek(), Token::Else) {
             self.advance();
-            Some(self.parse_block()?)
+            if matches!(self.peek(), Token::If) {
+                // else if -> desugar to else { if ... }
+                let nested_if = self.parse_if_expr()?;
+                Some(vec![Stmt::Expr(nested_if)])
+            } else {
+                Some(self.parse_block()?)
+            }
         } else {
+            // No else — backtrack past any consumed newlines
+            self.pos = saved_pos;
             None
         };
         Ok(Expr::If(Box::new(cond), then_block, else_block))

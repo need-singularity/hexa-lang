@@ -1008,6 +1008,14 @@ impl Interpreter {
             (Value::Str(a), BinOp::Add, Value::Str(b)) => {
                 Ok(Value::Str(format!("{}{}", a, b)))
             }
+            // String + Char concatenation
+            (Value::Str(a), BinOp::Add, Value::Char(b)) => {
+                Ok(Value::Str(format!("{}{}", a, b)))
+            }
+            // Char + String concatenation
+            (Value::Char(a), BinOp::Add, Value::Str(b)) => {
+                Ok(Value::Str(format!("{}{}", a, b)))
+            }
 
             // Int comparisons
             (Value::Int(a), BinOp::Eq, Value::Int(b)) => Ok(Value::Bool(a == b)),
@@ -1032,6 +1040,14 @@ impl Interpreter {
             // String comparisons
             (Value::Str(a), BinOp::Eq, Value::Str(b)) => Ok(Value::Bool(a == b)),
             (Value::Str(a), BinOp::Ne, Value::Str(b)) => Ok(Value::Bool(a != b)),
+
+            // Char comparisons
+            (Value::Char(a), BinOp::Eq, Value::Char(b)) => Ok(Value::Bool(a == b)),
+            (Value::Char(a), BinOp::Ne, Value::Char(b)) => Ok(Value::Bool(a != b)),
+            (Value::Char(a), BinOp::Lt, Value::Char(b)) => Ok(Value::Bool(a < b)),
+            (Value::Char(a), BinOp::Gt, Value::Char(b)) => Ok(Value::Bool(a > b)),
+            (Value::Char(a), BinOp::Le, Value::Char(b)) => Ok(Value::Bool(a <= b)),
+            (Value::Char(a), BinOp::Ge, Value::Char(b)) => Ok(Value::Bool(a >= b)),
 
             // Bitwise operations
             (Value::Int(a), BinOp::BitAnd, Value::Int(b)) => Ok(Value::Int(a & b)),
@@ -1889,6 +1905,35 @@ impl Interpreter {
                 let sender = Value::Sender(Arc::new(Mutex::new(tx)));
                 let receiver = Value::Receiver(Arc::new(Mutex::new(rx)));
                 Ok(Value::Tuple(vec![sender, receiver]))
+            }
+            // ── Char utility builtins ────────────────────────────────
+            "is_alpha" => {
+                if args.is_empty() { return Err(self.type_err("is_alpha() requires 1 argument".into())); }
+                match &args[0] {
+                    Value::Char(c) => Ok(Value::Bool(c.is_alphabetic())),
+                    _ => Err(self.type_err("is_alpha() requires char argument".into())),
+                }
+            }
+            "is_digit" => {
+                if args.is_empty() { return Err(self.type_err("is_digit() requires 1 argument".into())); }
+                match &args[0] {
+                    Value::Char(c) => Ok(Value::Bool(c.is_ascii_digit())),
+                    _ => Err(self.type_err("is_digit() requires char argument".into())),
+                }
+            }
+            "is_alphanumeric" => {
+                if args.is_empty() { return Err(self.type_err("is_alphanumeric() requires 1 argument".into())); }
+                match &args[0] {
+                    Value::Char(c) => Ok(Value::Bool(c.is_alphanumeric())),
+                    _ => Err(self.type_err("is_alphanumeric() requires char argument".into())),
+                }
+            }
+            "is_whitespace" => {
+                if args.is_empty() { return Err(self.type_err("is_whitespace() requires 1 argument".into())); }
+                match &args[0] {
+                    Value::Char(c) => Ok(Value::Bool(c.is_whitespace())),
+                    _ => Err(self.type_err("is_whitespace() requires char argument".into())),
+                }
             }
             // ── Random builtins ──────────────────────────────────────
             "random" => {
@@ -4405,5 +4450,508 @@ drop x
         let result = interp.run(&stmts);
         assert!(result.is_err());
         assert!(result.unwrap_err().message.contains("dropped"));
+    }
+
+    // ── Bootstrap / Self-Hosting Tests ─────────────────────────
+
+    fn assert_bool(val: &Value, expected: bool) {
+        match val {
+            Value::Bool(b) => assert_eq!(*b, expected),
+            _ => panic!("expected Bool({}), got {:?}", expected, val),
+        }
+    }
+
+    fn assert_str(val: &Value, expected: &str) {
+        match val {
+            Value::Str(s) => assert_eq!(s.as_str(), expected),
+            _ => panic!("expected Str(\"{}\"), got {:?}", expected, val),
+        }
+    }
+
+    fn assert_int(val: &Value, expected: i64) {
+        match val {
+            Value::Int(n) => assert_eq!(*n, expected),
+            _ => panic!("expected Int({}), got {:?}", expected, val),
+        }
+    }
+
+    #[test]
+    fn test_char_comparison() {
+        assert_bool(&eval("'a' == 'a'"), true);
+        assert_bool(&eval("'a' == 'b'"), false);
+        assert_bool(&eval("'a' != 'b'"), true);
+        assert_bool(&eval("'a' < 'b'"), true);
+        assert_bool(&eval("'b' > 'a'"), true);
+        assert_bool(&eval("'a' <= 'a'"), true);
+        assert_bool(&eval("'z' >= 'a'"), true);
+    }
+
+    #[test]
+    fn test_char_string_concat() {
+        assert_str(&eval("\"hello\" + '!'"), "hello!");
+        assert_str(&eval("'H' + \"ello\""), "Hello");
+    }
+
+    #[test]
+    fn test_char_builtins() {
+        assert_bool(&eval("is_alpha('a')"), true);
+        assert_bool(&eval("is_alpha('1')"), false);
+        assert_bool(&eval("is_digit('5')"), true);
+        assert_bool(&eval("is_digit('x')"), false);
+        assert_bool(&eval("is_alphanumeric('a')"), true);
+        assert_bool(&eval("is_alphanumeric('5')"), true);
+        assert_bool(&eval("is_alphanumeric('!')"), false);
+        assert_bool(&eval("is_whitespace(' ')"), true);
+        assert_bool(&eval("is_whitespace('a')"), false);
+    }
+
+    #[test]
+    fn test_else_if_chain() {
+        let src = r#"
+let x = 3
+let mut result = "none"
+if x == 1 {
+    result = "one"
+} else if x == 2 {
+    result = "two"
+} else if x == 3 {
+    result = "three"
+} else {
+    result = "other"
+}
+result
+"#;
+        assert_str(&eval(src), "three");
+    }
+
+    #[test]
+    fn test_bootstrap_lexer_runs() {
+        // Read and run the bootstrap lexer test file
+        let lexer_src = std::fs::read_to_string("self/test_bootstrap.hexa")
+            .expect("self/test_bootstrap.hexa should exist");
+        let tokens = Lexer::new(&lexer_src).tokenize().unwrap();
+        let result = Parser::new(tokens).parse_with_spans().unwrap();
+        let mut checker = crate::type_checker::TypeChecker::new();
+        checker.check(&result.stmts, &result.spans).unwrap();
+        let mut interp = Interpreter::new();
+        interp.source_dir = Some("self".into());
+        // This should execute without errors
+        interp.run_with_spans(&result.stmts, &result.spans).unwrap();
+    }
+
+    #[test]
+    fn test_bootstrap_lexer_matches_rust_lexer() {
+        // Compare token counts from HEXA lexer vs Rust lexer on hello.hexa
+        let hello_source = std::fs::read_to_string("examples/hello.hexa")
+            .expect("examples/hello.hexa should exist");
+
+        // Rust lexer tokenization
+        let rust_tokens = Lexer::new(&hello_source).tokenize_plain().unwrap();
+        let rust_count = rust_tokens.len();
+
+        // HEXA lexer tokenization (via interpreter)
+        let hexa_lexer_src = r#"
+struct Token {
+    kind: string,
+    value: string,
+    line: int,
+    col: int
+}
+
+fn is_keyword(word) {
+    if word == "if" { return true }
+    if word == "else" { return true }
+    if word == "match" { return true }
+    if word == "for" { return true }
+    if word == "while" { return true }
+    if word == "loop" { return true }
+    if word == "type" { return true }
+    if word == "struct" { return true }
+    if word == "enum" { return true }
+    if word == "trait" { return true }
+    if word == "impl" { return true }
+    if word == "fn" { return true }
+    if word == "return" { return true }
+    if word == "yield" { return true }
+    if word == "async" { return true }
+    if word == "await" { return true }
+    if word == "let" { return true }
+    if word == "mut" { return true }
+    if word == "const" { return true }
+    if word == "static" { return true }
+    if word == "mod" { return true }
+    if word == "use" { return true }
+    if word == "pub" { return true }
+    if word == "crate" { return true }
+    if word == "own" { return true }
+    if word == "borrow" { return true }
+    if word == "move" { return true }
+    if word == "drop" { return true }
+    if word == "spawn" { return true }
+    if word == "channel" { return true }
+    if word == "select" { return true }
+    if word == "atomic" { return true }
+    if word == "effect" { return true }
+    if word == "handle" { return true }
+    if word == "resume" { return true }
+    if word == "pure" { return true }
+    if word == "proof" { return true }
+    if word == "assert" { return true }
+    if word == "invariant" { return true }
+    if word == "theorem" { return true }
+    if word == "macro" { return true }
+    if word == "derive" { return true }
+    if word == "where" { return true }
+    if word == "comptime" { return true }
+    if word == "try" { return true }
+    if word == "catch" { return true }
+    if word == "throw" { return true }
+    if word == "panic" { return true }
+    if word == "recover" { return true }
+    if word == "intent" { return true }
+    if word == "generate" { return true }
+    if word == "verify" { return true }
+    if word == "optimize" { return true }
+    return false
+}
+
+fn keyword_kind(word) {
+    if word == "true" { return "BoolLit" }
+    if word == "false" { return "BoolLit" }
+    if is_keyword(word) {
+        let first = to_string(word.chars()[0]).to_upper()
+        let rest = ""
+        let chars = word.chars()
+        let i = 1
+        while i < len(chars) {
+            rest = rest + to_string(chars[i])
+            i = i + 1
+        }
+        return first + rest
+    }
+    return "Ident"
+}
+
+fn is_ident_start(ch) {
+    if is_alpha(ch) { return true }
+    if ch == '_' { return true }
+    return false
+}
+
+fn is_ident_char(ch) {
+    if is_alphanumeric(ch) { return true }
+    if ch == '_' { return true }
+    return false
+}
+
+fn tokenize(source) {
+    let mut tokens = []
+    let chars = source.chars()
+    let mut pos = 0
+    let mut line = 1
+    let mut col = 1
+    let total = len(chars)
+
+    while pos < total {
+        let ch = chars[pos]
+        if ch == ' ' || ch == '\t' || ch == '\r' {
+            pos = pos + 1
+            col = col + 1
+        } else if ch == '\n' {
+            tokens = tokens.push(Token { kind: "Newline", value: "\n", line: line, col: col })
+            pos = pos + 1
+            line = line + 1
+            col = 1
+        } else if ch == '/' && pos + 1 < total && chars[pos + 1] == '/' {
+            pos = pos + 2
+            col = col + 2
+            while pos < total && chars[pos] != '\n' {
+                pos = pos + 1
+                col = col + 1
+            }
+        } else if is_ident_start(ch) {
+            let start_col = col
+            let mut word = ""
+            while pos < total && is_ident_char(chars[pos]) {
+                word = word + to_string(chars[pos])
+                pos = pos + 1
+                col = col + 1
+            }
+            let kind = keyword_kind(word)
+            tokens = tokens.push(Token { kind: kind, value: word, line: line, col: start_col })
+        } else if is_digit(ch) {
+            let start_col = col
+            let mut num_str = ""
+            let mut is_float = false
+            while pos < total && (is_digit(chars[pos]) || chars[pos] == '_') {
+                if chars[pos] == '_' {
+                    pos = pos + 1
+                    col = col + 1
+                } else {
+                    num_str = num_str + to_string(chars[pos])
+                    pos = pos + 1
+                    col = col + 1
+                }
+            }
+            if pos < total && chars[pos] == '.' {
+                if pos + 1 < total && is_digit(chars[pos + 1]) {
+                    is_float = true
+                    num_str = num_str + "."
+                    pos = pos + 1
+                    col = col + 1
+                    while pos < total && (is_digit(chars[pos]) || chars[pos] == '_') {
+                        if chars[pos] == '_' {
+                            pos = pos + 1
+                            col = col + 1
+                        } else {
+                            num_str = num_str + to_string(chars[pos])
+                            pos = pos + 1
+                            col = col + 1
+                        }
+                    }
+                }
+            }
+            if is_float {
+                tokens = tokens.push(Token { kind: "FloatLit", value: num_str, line: line, col: start_col })
+            } else {
+                tokens = tokens.push(Token { kind: "IntLit", value: num_str, line: line, col: start_col })
+            }
+        } else if ch == '"' {
+            let start_col = col
+            pos = pos + 1
+            col = col + 1
+            let mut s = ""
+            let mut done = false
+            while pos < total && !done {
+                let c = chars[pos]
+                if c == '"' {
+                    done = true
+                    pos = pos + 1
+                    col = col + 1
+                } else if c == '\\' {
+                    pos = pos + 1
+                    col = col + 1
+                    if pos < total {
+                        let esc = chars[pos]
+                        if esc == 'n' { s = s + "\n" }
+                        else if esc == 't' { s = s + "\t" }
+                        else if esc == '\\' { s = s + "\\" }
+                        else if esc == '"' { s = s + "\"" }
+                        else if esc == '0' { s = s + "\0" }
+                        else { s = s + to_string(esc) }
+                        pos = pos + 1
+                        col = col + 1
+                    }
+                } else {
+                    s = s + to_string(c)
+                    pos = pos + 1
+                    col = col + 1
+                }
+            }
+            tokens = tokens.push(Token { kind: "StringLit", value: s, line: line, col: start_col })
+        } else {
+            let start_col = col
+            if ch == '+' {
+                tokens = tokens.push(Token { kind: "Plus", value: "+", line: line, col: start_col })
+                pos = pos + 1
+                col = col + 1
+            } else if ch == '-' {
+                if pos + 1 < total && chars[pos + 1] == '>' {
+                    tokens = tokens.push(Token { kind: "Arrow", value: "->", line: line, col: start_col })
+                    pos = pos + 2
+                    col = col + 2
+                } else {
+                    tokens = tokens.push(Token { kind: "Minus", value: "-", line: line, col: start_col })
+                    pos = pos + 1
+                    col = col + 1
+                }
+            } else if ch == '*' {
+                if pos + 1 < total && chars[pos + 1] == '*' {
+                    tokens = tokens.push(Token { kind: "Power", value: "**", line: line, col: start_col })
+                    pos = pos + 2
+                    col = col + 2
+                } else {
+                    tokens = tokens.push(Token { kind: "Star", value: "*", line: line, col: start_col })
+                    pos = pos + 1
+                    col = col + 1
+                }
+            } else if ch == '/' {
+                tokens = tokens.push(Token { kind: "Slash", value: "/", line: line, col: start_col })
+                pos = pos + 1
+                col = col + 1
+            } else if ch == '%' {
+                tokens = tokens.push(Token { kind: "Percent", value: "%", line: line, col: start_col })
+                pos = pos + 1
+                col = col + 1
+            } else if ch == '=' {
+                if pos + 1 < total && chars[pos + 1] == '=' {
+                    tokens = tokens.push(Token { kind: "EqEq", value: "==", line: line, col: start_col })
+                    pos = pos + 2
+                    col = col + 2
+                } else {
+                    tokens = tokens.push(Token { kind: "Eq", value: "=", line: line, col: start_col })
+                    pos = pos + 1
+                    col = col + 1
+                }
+            } else if ch == '!' {
+                if pos + 1 < total && chars[pos + 1] == '=' {
+                    tokens = tokens.push(Token { kind: "NotEq", value: "!=", line: line, col: start_col })
+                    pos = pos + 2
+                    col = col + 2
+                } else {
+                    tokens = tokens.push(Token { kind: "Not", value: "!", line: line, col: start_col })
+                    pos = pos + 1
+                    col = col + 1
+                }
+            } else if ch == '<' {
+                if pos + 1 < total && chars[pos + 1] == '=' {
+                    tokens = tokens.push(Token { kind: "LtEq", value: "<=", line: line, col: start_col })
+                    pos = pos + 2
+                    col = col + 2
+                } else {
+                    tokens = tokens.push(Token { kind: "Lt", value: "<", line: line, col: start_col })
+                    pos = pos + 1
+                    col = col + 1
+                }
+            } else if ch == '>' {
+                if pos + 1 < total && chars[pos + 1] == '=' {
+                    tokens = tokens.push(Token { kind: "GtEq", value: ">=", line: line, col: start_col })
+                    pos = pos + 2
+                    col = col + 2
+                } else {
+                    tokens = tokens.push(Token { kind: "Gt", value: ">", line: line, col: start_col })
+                    pos = pos + 1
+                    col = col + 1
+                }
+            } else if ch == '&' {
+                if pos + 1 < total && chars[pos + 1] == '&' {
+                    tokens = tokens.push(Token { kind: "And", value: "&&", line: line, col: start_col })
+                    pos = pos + 2
+                    col = col + 2
+                } else {
+                    tokens = tokens.push(Token { kind: "BitAnd", value: "&", line: line, col: start_col })
+                    pos = pos + 1
+                    col = col + 1
+                }
+            } else if ch == '|' {
+                if pos + 1 < total && chars[pos + 1] == '|' {
+                    tokens = tokens.push(Token { kind: "Or", value: "||", line: line, col: start_col })
+                    pos = pos + 2
+                    col = col + 2
+                } else {
+                    tokens = tokens.push(Token { kind: "BitOr", value: "|", line: line, col: start_col })
+                    pos = pos + 1
+                    col = col + 1
+                }
+            } else if ch == '^' {
+                if pos + 1 < total && chars[pos + 1] == '^' {
+                    tokens = tokens.push(Token { kind: "Xor", value: "^^", line: line, col: start_col })
+                    pos = pos + 2
+                    col = col + 2
+                } else {
+                    tokens = tokens.push(Token { kind: "BitXor", value: "^", line: line, col: start_col })
+                    pos = pos + 1
+                    col = col + 1
+                }
+            } else if ch == '~' {
+                tokens = tokens.push(Token { kind: "BitNot", value: "~", line: line, col: start_col })
+                pos = pos + 1
+                col = col + 1
+            } else if ch == ':' {
+                if pos + 1 < total && chars[pos + 1] == '=' {
+                    tokens = tokens.push(Token { kind: "ColonEq", value: ":=", line: line, col: start_col })
+                    pos = pos + 2
+                    col = col + 2
+                } else if pos + 1 < total && chars[pos + 1] == ':' {
+                    tokens = tokens.push(Token { kind: "ColonColon", value: "::", line: line, col: start_col })
+                    pos = pos + 2
+                    col = col + 2
+                } else {
+                    tokens = tokens.push(Token { kind: "Colon", value: ":", line: line, col: start_col })
+                    pos = pos + 1
+                    col = col + 1
+                }
+            } else if ch == '.' {
+                if pos + 1 < total && chars[pos + 1] == '.' {
+                    if pos + 2 < total && chars[pos + 2] == '=' {
+                        tokens = tokens.push(Token { kind: "DotDotEq", value: "..=", line: line, col: start_col })
+                        pos = pos + 3
+                        col = col + 3
+                    } else {
+                        tokens = tokens.push(Token { kind: "DotDot", value: "..", line: line, col: start_col })
+                        pos = pos + 2
+                        col = col + 2
+                    }
+                } else {
+                    tokens = tokens.push(Token { kind: "Dot", value: ".", line: line, col: start_col })
+                    pos = pos + 1
+                    col = col + 1
+                }
+            } else if ch == '(' {
+                tokens = tokens.push(Token { kind: "LParen", value: "(", line: line, col: start_col })
+                pos = pos + 1
+                col = col + 1
+            } else if ch == ')' {
+                tokens = tokens.push(Token { kind: "RParen", value: ")", line: line, col: start_col })
+                pos = pos + 1
+                col = col + 1
+            } else if ch == '{' {
+                tokens = tokens.push(Token { kind: "LBrace", value: "{", line: line, col: start_col })
+                pos = pos + 1
+                col = col + 1
+            } else if ch == '}' {
+                tokens = tokens.push(Token { kind: "RBrace", value: "}", line: line, col: start_col })
+                pos = pos + 1
+                col = col + 1
+            } else if ch == '[' {
+                tokens = tokens.push(Token { kind: "LBracket", value: "[", line: line, col: start_col })
+                pos = pos + 1
+                col = col + 1
+            } else if ch == ']' {
+                tokens = tokens.push(Token { kind: "RBracket", value: "]", line: line, col: start_col })
+                pos = pos + 1
+                col = col + 1
+            } else if ch == ',' {
+                tokens = tokens.push(Token { kind: "Comma", value: ",", line: line, col: start_col })
+                pos = pos + 1
+                col = col + 1
+            } else if ch == ';' {
+                tokens = tokens.push(Token { kind: "Semicolon", value: ";", line: line, col: start_col })
+                pos = pos + 1
+                col = col + 1
+            } else {
+                pos = pos + 1
+                col = col + 1
+            }
+        }
+    }
+    tokens = tokens.push(Token { kind: "Eof", value: "", line: line, col: col })
+    return tokens
+}
+
+let source = read_file("examples/hello.hexa")
+let hexa_tokens = tokenize(source)
+len(hexa_tokens)
+"#;
+        let tokens = Lexer::new(hexa_lexer_src).tokenize().unwrap();
+        let result = Parser::new(tokens).parse_with_spans().unwrap();
+        let mut checker = crate::type_checker::TypeChecker::new();
+        checker.check(&result.stmts, &result.spans).unwrap();
+        let mut interp = Interpreter::new();
+        let val = interp.run_with_spans(&result.stmts, &result.spans).unwrap();
+
+        // HEXA lexer should produce the same number of tokens as Rust lexer
+        let hexa_count = match val {
+            Value::Int(n) => n as usize,
+            _ => panic!("Expected int token count from HEXA lexer, got {:?}", val),
+        };
+
+        // The HEXA lexer produces Token structs, so count should match Rust lexer
+        // (Rust lexer includes Eof, HEXA lexer includes Eof too)
+        assert!(
+            hexa_count == rust_count,
+            "HEXA lexer produced {} tokens, Rust lexer produced {} tokens for hello.hexa",
+            hexa_count, rust_count
+        );
     }
 }
