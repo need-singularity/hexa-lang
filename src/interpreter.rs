@@ -127,6 +127,8 @@ impl Interpreter {
             spawn_handles: Vec::new(),
             #[cfg(not(target_arch = "wasm32"))]
             named_spawns: HashMap::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            scope_task_groups: Vec::new(),
             macro_defs: HashMap::new(),
             comptime_fns: HashMap::new(),
             effect_defs: HashMap::new(),
@@ -707,11 +709,34 @@ impl Interpreter {
                 }
                 #[cfg(not(target_arch = "wasm32"))]
                 {
-                    // Clone the body statements for the thread
+                    // If inside a scope block, use the async runtime so the
+                    // scope can track and join the spawned task.
+                    if !self.scope_task_groups.is_empty() {
+                        let body = _body.clone();
+                        let captured_env = self.capture_env_for_spawn();
+                        let struct_defs = self.struct_defs.clone();
+                        let enum_defs = self.enum_defs.clone();
+                        let type_methods = self.type_methods.clone();
+
+                        let scheduler = crate::async_runtime::global_scheduler();
+                        let future = scheduler.spawn_task(
+                            "scope_spawn".into(),
+                            body,
+                            vec![],
+                            captured_env,
+                            struct_defs,
+                            enum_defs,
+                            type_methods,
+                        );
+                        if let Some(group) = self.scope_task_groups.last_mut() {
+                            group.add(future);
+                        }
+                        return Ok(Value::Void);
+                    }
+
+                    // Outside a scope — original fire-and-forget behavior
                     let body = _body.clone();
-                    // Capture current environment values for the spawned thread
                     let captured_env = self.capture_env_for_spawn();
-                    // Clone struct/enum defs and type methods for the spawned thread
                     let struct_defs = self.struct_defs.clone();
                     let enum_defs = self.enum_defs.clone();
                     let type_methods = self.type_methods.clone();
@@ -721,11 +746,9 @@ impl Interpreter {
                         interp.struct_defs = struct_defs;
                         interp.enum_defs = enum_defs;
                         interp.type_methods = type_methods;
-                        // Restore captured environment
                         for (name, val) in captured_env {
                             interp.env.define(&name, val);
                         }
-                        // Execute the body; ignore errors (thread panics are caught by join)
                         for stmt in &body {
                             if let Err(e) = interp.exec_stmt(stmt) {
                                 eprintln!("[spawn] error: {}", e);

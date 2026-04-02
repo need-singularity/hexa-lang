@@ -459,7 +459,7 @@ fn run_dap_loop(
 
         match command {
             "initialize" => {
-                initialized = true;
+                _initialized = true;
                 let capabilities = dap_object(&[
                     ("supportsConfigurationDoneRequest", JsonValue::Bool(true)),
                     ("supportsEvaluateForHovers", JsonValue::Bool(true)),
@@ -516,7 +516,7 @@ fn run_dap_loop(
             }
 
             "configurationDone" => {
-                configuration_done = true;
+                _configuration_done = true;
                 let resp = make_dap_response(&mut seq, request_seq, command, true, dap_object(&[]), None);
                 let _ = send_message(&mut writer, &resp.to_json());
 
@@ -577,7 +577,7 @@ fn run_dap_loop(
             }
 
             "scopes" => {
-                let frame_id = arguments.get("frameId").and_then(|f| f.as_i64()).unwrap_or(1);
+                let _frame_id = arguments.get("frameId").and_then(|f| f.as_i64()).unwrap_or(1);
                 let body = dap_object(&[
                     ("scopes", JsonValue::Array(vec![
                         dap_object(&[

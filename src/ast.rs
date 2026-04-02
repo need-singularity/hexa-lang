@@ -71,6 +71,7 @@ pub enum Stmt {
     While(Expr, Block),
     Loop(Block),
     Proof(String, Block),
+    ProofBlock(String, Vec<ProofBlockStmt>),  // formal verification with SAT/SMT solver
     Assert(Expr),
     Intent(String, Vec<(String, Expr)>),  // description, key-value fields
     Verify(String, Block),                // name, assertion block
@@ -80,6 +81,7 @@ pub enum Stmt {
     Throw(Expr),
     Spawn(Block),  // spawn { ... } — concurrent execution
     SpawnNamed(String, Block),  // spawn "name" { ... } — named concurrent execution
+    Scope(Block),  // scope { ... } — structured concurrency: all spawns within must complete before scope exits
     DropStmt(String),  // drop x — explicit deallocation
     AsyncFnDecl(FnDecl),  // async fn name(...) { ... }
     Select(Vec<SelectArm>, Option<TimeoutArm>),  // select { rx.recv() as val => body, ... timeout(ms) => body }
@@ -320,6 +322,31 @@ pub struct EffectHandler {
     pub op: String,
     pub params: Vec<String>,
     pub body: Block,
+}
+
+// ── Formal proof block statements ────────────────────────────
+
+/// A statement inside a `proof` formal verification block.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub enum ProofBlockStmt {
+    /// `forall x: type, condition => conclusion`
+    ForAll {
+        var: String,
+        typ: String,
+        condition: Expr,
+        conclusion: Expr,
+    },
+    /// `exists x: type, condition`
+    Exists {
+        var: String,
+        typ: String,
+        condition: Expr,
+    },
+    /// `assert condition`
+    Assert(Expr),
+    /// `check law(N)` -- verify a consciousness law by number
+    CheckLaw(i64),
 }
 
 // τ=4 visibility levels

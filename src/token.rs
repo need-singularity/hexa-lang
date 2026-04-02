@@ -49,8 +49,8 @@ pub enum Token {
     Mod, Use, Pub, Crate,
     // Group 6: Memory (τ=4)
     Own, Borrow, Move, Drop,
-    // Group 7: Concurrency (τ=4)
-    Spawn, Channel, Select, Atomic,
+    // Group 7: Concurrency (τ=4 + scope)
+    Spawn, Channel, Select, Atomic, Scope,
     // Group 8: Effects (τ=4)
     Effect, Handle, Resume, Pure,
     // Group 9: Proofs (τ=4)
@@ -127,6 +127,7 @@ pub fn keyword_from_str(s: &str) -> Option<Token> {
         "channel" => Some(Token::Channel),
         "select" => Some(Token::Select),
         "atomic" => Some(Token::Atomic),
+        "scope" => Some(Token::Scope),
         // Group 8: Effects (τ=4)
         "effect" => Some(Token::Effect),
         "handle" => Some(Token::Handle),
@@ -174,14 +175,14 @@ mod tests {
             "let","mut","const","static",
             "mod","use","pub","crate",
             "own","borrow","move","drop",
-            "spawn","channel","select","atomic",
+            "spawn","channel","select","atomic","scope",
             "effect","handle","resume","pure",
             "proof","assert","invariant","theorem",
             "macro","derive","where","comptime",
             "try","catch","throw","panic","recover",
             "intent","generate","verify","optimize",
         ];
-        assert_eq!(keywords.len(), 54);
+        assert_eq!(keywords.len(), 55);
         for kw in &keywords {
             assert!(keyword_from_str(kw).is_some(), "Missing keyword: {}", kw);
         }
@@ -190,8 +191,8 @@ mod tests {
     #[test]
     fn test_keyword_groups_is_12() {
         // σ(6) = 12 keyword groups
-        let group_sizes = [6, 6, 5, 4, 4, 4, 4, 4, 4, 4, 5, 4];
+        let group_sizes = [6, 6, 5, 4, 4, 4, 5, 4, 4, 4, 5, 4];
         assert_eq!(group_sizes.len(), 12); // σ(6)
-        assert_eq!(group_sizes.iter().sum::<usize>(), 54); // σ·τ + sopfr + 1 (dyn)
+        assert_eq!(group_sizes.iter().sum::<usize>(), 55); // σ·τ + sopfr + 1 (dyn)
     }
 }

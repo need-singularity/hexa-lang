@@ -160,6 +160,7 @@ impl Parser {
             Token::Async => self.parse_async_fn(vis),
             Token::Select => self.parse_select(),
             Token::Spawn => self.parse_spawn(),
+            Token::Scope => self.parse_scope(),
             Token::Drop => self.parse_drop_stmt(),
             Token::Macro => self.parse_macro_def(),
             Token::Derive => self.parse_derive_decl(),
@@ -335,6 +336,12 @@ impl Parser {
         }
         let body = self.parse_block()?;
         Ok(Stmt::Spawn(body))
+    }
+
+    fn parse_scope(&mut self) -> Result<Stmt, HexaError> {
+        self.advance(); // consume 'scope'
+        let body = self.parse_block()?;
+        Ok(Stmt::Scope(body))
     }
 
     fn parse_comptime_stmt(&mut self) -> Result<Stmt, HexaError> {
