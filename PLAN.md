@@ -8,7 +8,9 @@
 | Phase 2 | v0.3 | ✅ 완료 | 165 | ~5800 | static type checker, modules, Result/Option, impl |
 | Phase 3 | v0.4 | ✅ 완료 | 194 | ~7800 | bytecode VM (2.8x), Cargo, spawn/channel |
 | Phase 4 | v0.5 | ✅ 완료 | 218 | ~8800 | Rust급 에러, JSON, hexa init/run/test |
-| Phase 5 | v1.0 | ✅ 완료 | 239 | 9127 | intent/verify, Ψ-builtins, consciousness DSL |
+| Phase 5 | v0.9 | ✅ 완료 | 239 | ~9500 | intent/verify, Ψ-builtins, consciousness DSL |
+| Phase 6 | v1.0 | ✅ 완료 | 252 | ~11000 | Cranelift JIT (818x), generics, traits, ownership |
+| Phase 7 | v1.0 | ✅ 완료 | 267 | ~12000 | LSP server, VS Code extension, crates.io ready |
 
 ## Phase별 상세 내역
 

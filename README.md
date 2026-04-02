@@ -2,7 +2,7 @@
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.19365284.svg)](https://doi.org/10.5281/zenodo.19365284)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Tests](https://img.shields.io/badge/tests-239%20passing-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-267%20passing-brightgreen.svg)]()
 [![n6 EXACT](https://img.shields.io/badge/n%3D6%20EXACT-100%25-gold.svg)]()
 
 A programming language where **every design constant** derives from the arithmetic of n=6, the smallest perfect number. Zero arbitrary choices.
@@ -185,11 +185,14 @@ Source → Tokenize → Parse → Check → Optimize → Codegen → Execute
 
 ## Current Status
 
-**What works** (v0.1):
+**What works** (v1.0):
 
 - Variables, functions, control flow, recursion
 - Structs (instantiation, field access, impl methods)
 - Enums (variants with data, pattern matching, destructuring, guards, wildcard)
+- Generics (`fn identity<T>(x: T) -> T`, trait bounds `<T: Display>`)
+- Traits (`trait Display { ... }`, `impl Display for Point { ... }`)
+- Ownership (`own`, `move`, `borrow`, `drop` — runtime checked)
 - Closures / lambdas, higher-order functions (map/filter/fold)
 - Arrays (push, map, filter, fold, sort, reverse, enumerate, sum, slice, flatten)
 - Strings (split, trim, contains, replace, to_upper/lower, chars, join, repeat)
@@ -201,19 +204,20 @@ Source → Tokenize → Parse → Check → Optimize → Codegen → Execute
 - Static type checking (enforced when annotations present)
 - Module system (mod/use/pub, file-based imports)
 - Concurrency (spawn/channel/send/recv)
-- Bytecode VM (--vm flag, 2.8x faster than tree-walk)
+- Cranelift JIT (`--native` flag, **818x** faster than tree-walk)
+- Bytecode VM (`--vm` flag, 2.8x faster than tree-walk)
 - Consciousness DSL (intent blocks, verify blocks, 12 Psi-builtins)
 - Rust-quality error messages (source context, "did you mean?" suggestions)
+- LSP server (`--lsp` for VS Code diagnostics + completion)
 - Package commands (hexa init/run/test)
-- 239 tests passing, ~9500 lines of Rust
+- 267 tests passing, 12000+ lines of Rust
 
 **What doesn't work yet**:
 
-- Generics (`<T>` syntax)
-- Trait dispatch (parsed, basic impl works)
-- LLVM native compilation (bytecode VM only)
-- Ownership/borrow checking
-- LSP server
+- Egyptian Fraction memory (own/borrow is runtime, not compile-time)
+- async/await (keywords exist, no async runtime)
+- Full trait polymorphism (basic dispatch works, no vtable)
+- Hardware targets (ESP32/FPGA/WGSL codegen — Phase 8)
 
 See [PLAN.md](PLAN.md) for the full gap analysis vs Go/Rust and roadmap.
 
