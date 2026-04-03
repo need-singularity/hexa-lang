@@ -2,8 +2,10 @@
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.19365284.svg)](https://doi.org/10.5281/zenodo.19365284)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Tests](https://img.shields.io/badge/tests-1349%20passing-brightgreen.svg)]()
-[![n6 EXACT](https://img.shields.io/badge/n%3D6%20EXACT-100%25-gold.svg)]()
+<!-- AUTO:BADGE:START -->
+[![Keywords](https://img.shields.io/badge/Keywords-53-blue.svg)]()
+[![DSE](https://img.shields.io/badge/DSE-21,952%20combos-gold.svg)]()
+<!-- AUTO:BADGE:END -->
 
 A programming language where **every design constant** derives from the arithmetic of n=6, the smallest perfect number. Zero arbitrary choices.
 
@@ -416,17 +418,14 @@ hexa-lang/
 
 ## Stats
 
-| Metric | Value |
-|--------|-------|
-| Tests | 1349 passing |
-| Rust LOC | ~38,700 |
-| HEXA self-host LOC | ~7,800 |
-| Keywords | 53 (all from n=6) |
-| Operators | 24 (J2(6)) |
-| Stdlib modules | 12 (sigma(6)) |
-| HW targets | 6 (n) |
-| JIT speedup | 818x |
-| Paradigms | 6 (n) |
+<!-- AUTO:STATS:START -->
+```
+  Keywords:      53 (σ·τ+sopfr)
+  Operators:     24 (J₂)
+  Primitives:    8 (σ-τ)
+  DSE combos:    21,952
+```
+<!-- AUTO:STATS:END -->
 
 ## Documentation
 
