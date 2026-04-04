@@ -29,7 +29,7 @@ const N_SECT: u8 = 0x0e;
 
 /// Wrap machine code in a Mach-O relocatable object (.o) format.
 /// This produces a proper .o file that `cc` / `ld` can link.
-pub fn wrap(code: Vec<u8>, module: &IrModule) -> Vec<u8> {
+pub fn wrap(code: Vec<u8>, module: &IrModule, main_offset: usize) -> Vec<u8> {
     let mut out = Vec::new();
 
     let code_size = code.len();
@@ -155,8 +155,8 @@ pub fn wrap(code: Vec<u8>, module: &IrModule) -> Vec<u8> {
     out.push(1);
     // n_desc: 0
     out.extend_from_slice(&0u16.to_le_bytes());
-    // n_value: 0 (offset within section)
-    out.extend_from_slice(&0u64.to_le_bytes());
+    // n_value: offset of main function within __text section
+    out.extend_from_slice(&(main_offset as u64).to_le_bytes());
 
     // ── String table ──
     assert_eq!(out.len(), strtab_offset);

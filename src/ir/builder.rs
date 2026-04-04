@@ -35,6 +35,11 @@ impl<'a> IrBuilder<'a> {
         self.func.blocks.last().map_or(false, |b| b.is_terminated())
     }
 
+    /// Check if the CURRENT block is terminated.
+    pub fn is_current_block_terminated(&self) -> bool {
+        self.func.block(self.current_block).map_or(false, |b| b.is_terminated())
+    }
+
     /// Create a new basic block and return its ID.
     pub fn create_block(&mut self, name: impl Into<String>) -> BlockId {
         self.func.fresh_block(name)

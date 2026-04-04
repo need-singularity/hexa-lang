@@ -56,14 +56,14 @@ pub fn generate(module: &IrModule, target: Target, format: ObjFormat) -> Codegen
     let alloc_result = regalloc::allocate(module, target);
 
     // Generate machine code
-    let code = match target {
-        Target::Arm64 => arm64::emit(module, &alloc_result),
-        Target::X86_64 => x86_64::emit(module, &alloc_result),
+    let (code, main_offset) = match target {
+        Target::Arm64 => arm64::emit_with_main_offset(module, &alloc_result),
+        Target::X86_64 => (x86_64::emit(module, &alloc_result), 0),
     };
 
     // Wrap in object format
     let obj = match format {
-        ObjFormat::MachO => macho::wrap(code, module),
+        ObjFormat::MachO => macho::wrap(code, module, main_offset),
         ObjFormat::Elf => elf::wrap(code, module),
     };
 

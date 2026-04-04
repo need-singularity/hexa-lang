@@ -1,5 +1,14 @@
 # HEXA-LANG
 
+## ⚡ HEXA-IR 수렴진화 (config/hexa_ir_convergence.json)
+```
+수렴률: 83% (10/12) | AR: 6규칙 | 공격:
+  → TS-009: sigma(6) if+while 복합 함수 (codegen)
+  → TS-008: bench_suite E2E (위 해결 시 자동)
+✅ 산술 비교 분기 while alloca fn_call(1p,2p) macho
+❌ if+while 복합함수 → bench E2E
+```
+
 ## Build
 ```bash
 bash build.sh

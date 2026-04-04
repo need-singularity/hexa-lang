@@ -121,7 +121,7 @@ pub fn lower_program(stmts: &[ast::Stmt], module_name: &str) -> IrModule {
             }
 
             // Ensure main returns 0
-            if !builder.is_last_block_terminated() {
+            if !builder.is_current_block_terminated() {
                 let zero = builder.const_i64(0);
                 builder.ret(Some(zero));
             }
@@ -152,7 +152,7 @@ pub fn lower_program(stmts: &[ast::Stmt], module_name: &str) -> IrModule {
             for s in &decl.body {
                 last = stmt::lower_stmt_val(&mut ctx, &mut builder, s);
             }
-            if !builder.is_last_block_terminated() {
+            if !builder.is_current_block_terminated() {
                 builder.ret(Some(last));
             }
             ctx.pop_scope();

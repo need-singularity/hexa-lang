@@ -16,7 +16,8 @@ const TMP1: u8 = 16; // x16 scratch
 const TMP2: u8 = 17; // x17 scratch
 
 /// Emit ARM64 machine code for the entire module.
-pub fn emit(module: &IrModule, alloc: &AllocResult) -> Vec<u8> {
+/// Returns (code, main_offset) — main_offset is the byte offset of the `main` function.
+pub fn emit_with_main_offset(module: &IrModule, alloc: &AllocResult) -> (Vec<u8>, usize) {
     let mut code = Vec::new();
     let mut func_offsets: HashMap<String, usize> = HashMap::new();
     let mut call_fixups: Vec<(usize, String)> = Vec::new();
@@ -49,7 +50,13 @@ pub fn emit(module: &IrModule, alloc: &AllocResult) -> Vec<u8> {
         }
     }
 
-    code
+    let main_offset = func_offsets.get("main").copied().unwrap_or(0);
+    (code, main_offset)
+}
+
+/// Convenience wrapper that returns just the code (for tests).
+pub fn emit(module: &IrModule, alloc: &AllocResult) -> Vec<u8> {
+    emit_with_main_offset(module, alloc).0
 }
 
 fn emit_function(
