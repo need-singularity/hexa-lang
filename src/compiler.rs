@@ -437,7 +437,8 @@ impl Compiler {
             | Stmt::ConsciousnessBlock(_, _) | Stmt::EvolveFn(_)
             | Stmt::Generate(_) | Stmt::Optimize(_)
             | Stmt::ComptimeFn(_) | Stmt::EffectDecl(_)
-            | Stmt::Scope(_) | Stmt::ProofBlock(..) => Ok(()),
+            | Stmt::Scope(_) | Stmt::ProofBlock(..)
+            | Stmt::TypeAlias(..) | Stmt::AtomicLet(..) | Stmt::Panic(..) | Stmt::Theorem(..) => Ok(()),
         }
     }
 
@@ -719,7 +720,7 @@ impl Compiler {
             | Expr::Wildcard | Expr::Own(_) | Expr::MoveExpr(_) | Expr::Borrow(_)
             | Expr::Await(_) | Expr::MacroInvoc(_) | Expr::Comptime(_)
             | Expr::HandleWith(_, _) | Expr::EffectCall(_, _, _) | Expr::Resume(_)
-            | Expr::DynCast(_, _) => {
+            | Expr::DynCast(_, _) | Expr::Yield(_) => {
                 chunk.emit(OpCode::Void);
                 Ok(())
             }

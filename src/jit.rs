@@ -147,7 +147,8 @@ fn can_jit_stmt(stmt: &Stmt) -> bool {
         Stmt::MacroDef(..) | Stmt::DeriveDecl(..) | Stmt::Generate(..) |
         Stmt::Optimize(..) | Stmt::ComptimeFn(..) | Stmt::EffectDecl(..) | Stmt::ConsciousnessBlock(..) | Stmt::EvolveFn(..) |
         Stmt::TraitDecl(..) | Stmt::Const(..) | Stmt::Static(..) |
-        Stmt::Scope(..) | Stmt::ProofBlock(..) => false,
+        Stmt::Scope(..) | Stmt::ProofBlock(..)
+        | Stmt::TypeAlias(..) | Stmt::AtomicLet(..) | Stmt::Panic(..) | Stmt::Theorem(..) => false,
     }
 }
 
@@ -183,7 +184,7 @@ fn can_jit_expr(expr: &Expr) -> bool {
         Expr::Own(..) | Expr::MoveExpr(..) | Expr::Borrow(..) |
         Expr::Await(..) | Expr::MacroInvoc(..) | Expr::Comptime(..) |
         Expr::HandleWith(..) | Expr::EffectCall(..) | Expr::Resume(..) |
-        Expr::DynCast(..) => false,
+        Expr::DynCast(..) | Expr::Yield(..) => false,
     }
 }
 

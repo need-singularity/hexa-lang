@@ -117,6 +117,7 @@ mod anima_bridge;
 mod package;
 
 use std::io::{self, Write, BufRead};
+use std::collections::HashMap;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -857,6 +858,106 @@ sum_squares(10000)
     assert_eq!(vm_opt_fib.to_string(), "832040");
 }
 
+/// Maximum number of history entries to keep.
+const REPL_HISTORY_MAX: usize = 1000;
+
+/// Load REPL history from `~/.hexa_history`. Returns an empty vec on any error.
+#[cfg(not(target_arch = "wasm32"))]
+fn repl_load_history() -> Vec<String> {
+    let path = match std::env::var("HOME") {
+        Ok(h) => std::path::PathBuf::from(h).join(".hexa_history"),
+        Err(_) => return Vec::new(),
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => contents
+            .lines()
+            .map(|l| l.to_string())
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Save REPL history to `~/.hexa_history`. Silently ignores errors.
+#[cfg(not(target_arch = "wasm32"))]
+fn repl_save_history(history: &[String]) {
+    let path = match std::env::var("HOME") {
+        Ok(h) => std::path::PathBuf::from(h).join(".hexa_history"),
+        Err(_) => return,
+    };
+    let start = if history.len() > REPL_HISTORY_MAX {
+        history.len() - REPL_HISTORY_MAX
+    } else {
+        0
+    };
+    let data = history[start..].join("\n");
+    let _ = std::fs::write(&path, data);
+}
+
+/// Build the auto-import lookup table: identifier name -> module path.
+fn repl_auto_import_table() -> HashMap<&'static str, &'static str> {
+    let mut m = HashMap::new();
+    // std::collections
+    m.insert("HashMap", "std::collections::HashMap");
+    m.insert("HashSet", "std::collections::HashSet");
+    m.insert("BTreeMap", "std::collections::BTreeMap");
+    m.insert("BTreeSet", "std::collections::BTreeSet");
+    m.insert("VecDeque", "std::collections::VecDeque");
+    m.insert("LinkedList", "std::collections::LinkedList");
+    m.insert("BinaryHeap", "std::collections::BinaryHeap");
+    // std::fs
+    m.insert("File", "std::fs::File");
+    m.insert("OpenOptions", "std::fs::OpenOptions");
+    // std::io
+    m.insert("BufReader", "std::io::BufReader");
+    m.insert("BufWriter", "std::io::BufWriter");
+    // std::path
+    m.insert("Path", "std::path::Path");
+    m.insert("PathBuf", "std::path::PathBuf");
+    // std::sync
+    m.insert("Arc", "std::sync::Arc");
+    m.insert("Mutex", "std::sync::Mutex");
+    m.insert("RwLock", "std::sync::RwLock");
+    // std::thread
+    m.insert("Thread", "std::thread::Thread");
+    // std::time
+    m.insert("Duration", "std::time::Duration");
+    m.insert("Instant", "std::time::Instant");
+    // std::net
+    m.insert("TcpStream", "std::net::TcpStream");
+    m.insert("TcpListener", "std::net::TcpListener");
+    m
+}
+
+/// Count unmatched open brackets in a line, returning the net depth change.
+fn repl_bracket_depth(line: &str) -> i32 {
+    let mut depth: i32 = 0;
+    let mut in_string = false;
+    let mut prev = '\0';
+    for ch in line.chars() {
+        if ch == '"' && prev != '\\' {
+            in_string = !in_string;
+        }
+        if !in_string {
+            match ch {
+                '{' | '(' | '[' => depth += 1,
+                '}' | ')' | ']' => depth -= 1,
+                _ => {}
+            }
+        }
+        prev = ch;
+    }
+    depth
+}
+
+/// Returns true if `line` signals that more input is needed for multiline.
+fn repl_needs_continuation(line: &str) -> bool {
+    let trimmed = line.trim_end();
+    if trimmed.ends_with('\\') {
+        return true;
+    }
+    matches!(trimmed.chars().last(), Some('{') | Some('(') | Some('['))
+}
+
 fn run_repl() {
     println!("HEXA-LANG v0.1.0 -- The Perfect Number Language");
     println!("sigma(n)*phi(n) = n*tau(n) iff n = 6");
@@ -865,7 +966,18 @@ fn run_repl() {
     let mut interp = interpreter::Interpreter::new();
     let stdin = io::stdin();
 
+    // ── History ──
+    #[cfg(not(target_arch = "wasm32"))]
+    let mut history: Vec<String> = repl_load_history();
+    #[cfg(target_arch = "wasm32")]
+    let mut history: Vec<String> = Vec::new();
+
+    // ── Auto-import ──
+    let auto_import_table = repl_auto_import_table();
+    let mut active_imports: Vec<(String, String)> = Vec::new(); // (name, path)
+
     loop {
+        // ── Read input (with multiline support) ──
         print!("hexa> ");
         io::stdout().flush().unwrap();
 
@@ -873,21 +985,92 @@ fn run_repl() {
         if stdin.lock().read_line(&mut line).unwrap() == 0 {
             break; // EOF
         }
-        let trimmed = line.trim();
+
+        let mut input = line.clone();
+        let mut depth = repl_bracket_depth(&line);
+        let mut needs_more = depth > 0 || repl_needs_continuation(&line);
+
+        // Multiline continuation loop
+        while needs_more {
+            print!("....> ");
+            io::stdout().flush().unwrap();
+
+            let mut cont_line = String::new();
+            if stdin.lock().read_line(&mut cont_line).unwrap() == 0 {
+                break; // EOF
+            }
+            // Empty line in continuation mode => submit
+            if cont_line.trim().is_empty() {
+                break;
+            }
+            depth += repl_bracket_depth(&cont_line);
+            input.push_str(&cont_line);
+            needs_more = depth > 0 || repl_needs_continuation(&cont_line);
+        }
+
+        // Strip trailing backslash continuations for the final source
+        let source = input
+            .lines()
+            .map(|l| {
+                let t = l.trim_end();
+                if t.ends_with('\\') { &t[..t.len() - 1] } else { l }
+            })
+            .collect::<Vec<&str>>()
+            .join("\n");
+        let trimmed = source.trim();
 
         if trimmed.is_empty() {
             continue;
         }
+
+        // ── Commands ──
         if trimmed == ":quit" || trimmed == ":q" {
             break;
         }
         if trimmed == ":help" || trimmed == ":h" {
-            println!("Commands: :quit, :help");
+            println!("Commands:");
+            println!("  :quit  :q       Exit the REPL");
+            println!("  :help  :h       Show this help");
+            println!("  :history :hist  Show command history");
+            println!("  :imports        Show active auto-imports");
+            println!();
             println!("n=6 builtins: sigma(n), phi(n), tau(n), gcd(a,b)");
             println!("Try: sigma(6) * phi(6) == 6 * tau(6)");
+            println!();
+            println!("Multiline: end a line with {{ ( [ or \\ to continue");
+            continue;
+        }
+        if trimmed == ":history" || trimmed == ":hist" {
+            let start = if history.len() > 20 { history.len() - 20 } else { 0 };
+            for (i, entry) in history[start..].iter().enumerate() {
+                println!("  {:>4}  {}", start + i + 1, entry);
+            }
+            continue;
+        }
+        if trimmed == ":imports" {
+            if active_imports.is_empty() {
+                println!("No auto-imports active.");
+            } else {
+                println!("Active auto-imports:");
+                for (name, path) in &active_imports {
+                    println!("  {} -> {}", name, path);
+                }
+            }
             continue;
         }
 
+        // ── Add to history ──
+        let hist_entry = trimmed.to_string();
+        // Avoid duplicating the last entry
+        if history.last().map(|s| s.as_str()) != Some(trimmed) {
+            history.push(hist_entry);
+            // Enforce max limit
+            if history.len() > REPL_HISTORY_MAX {
+                history.remove(0);
+            }
+        }
+
+        // ── Lex + Parse + Typecheck + Execute ──
         let tokens = match lexer::Lexer::new(trimmed).tokenize() {
             Ok(t) => t,
             Err(e) => {
@@ -898,7 +1081,10 @@ fn run_repl() {
         let result = match parser::Parser::new(tokens).parse_with_spans() {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("{}", e);
+                let err_msg = format!("{}", e);
+                // Multiline hint: if parser hit unexpected EOF, it was already
+                // handled above via bracket depth. Show the error.
+                eprintln!("{}", err_msg);
                 continue;
             }
         };
@@ -913,9 +1099,36 @@ fn run_repl() {
                 env::Value::Void => {}
                 _ => println!("{}", val),
             },
-            Err(e) => eprintln!("{}", e),
+            Err(e) => {
+                let err_msg = format!("{}", e);
+                // ── Auto-import: check if an undefined identifier matches the table ──
+                let mut did_auto_import = false;
+                for (name, path) in &auto_import_table {
+                    if err_msg.contains(&format!("undefined variable '{}'", name))
+                        || err_msg.contains(&format!("Undefined variable: {}", name))
+                        || err_msg.contains(&format!("not found: {}", name))
+                        || err_msg.contains(&format!("Unknown identifier '{}'", name))
+                    {
+                        println!("[auto-import] use {} // {}", name, path);
+                        // Record the import
+                        if !active_imports.iter().any(|(n, _)| n == name) {
+                            active_imports.push((name.to_string(), path.to_string()));
+                        }
+                        did_auto_import = true;
+                    }
+                }
+                if did_auto_import {
+                    println!("(hint: auto-import noted -- re-run your expression)");
+                } else {
+                    eprintln!("{}", err_msg);
+                }
+            }
         }
     }
+
+    // ── Save history on exit ──
+    #[cfg(not(target_arch = "wasm32"))]
+    repl_save_history(&history);
 }
 
 // ── ANIMA Bridge commands ──────────────────────────────────

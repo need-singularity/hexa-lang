@@ -1,0 +1,1 @@
+../../../n6-architecture/scripts/lib/growth_common.sh

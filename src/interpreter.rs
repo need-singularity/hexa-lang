@@ -1537,6 +1537,11 @@ impl Interpreter {
                 self.resume_value = Some(val.clone());
                 Ok(val)
             }
+            Expr::Yield(expr) => {
+                // Yield currently evaluates the expression and returns its value
+                // Full generator support would require coroutine infrastructure
+                self.eval_expr(expr)
+            }
             Expr::DynCast(trait_name, expr) => {
                 let val = self.eval_expr(expr)?;
                 let type_name = match &val {
@@ -4331,6 +4336,12 @@ impl Interpreter {
             }
             ProofBlockStmt::CheckLaw(n) => {
                 let ps = proof_engine::ProofStmt::CheckLaw(*n);
+                Ok(proof_engine::execute_proof_stmt(&ps))
+            }
+            ProofBlockStmt::Invariant(expr) => {
+                // Invariant is treated like an assertion in the proof engine
+                let pe = self.expr_to_proof_expr(expr);
+                let ps = proof_engine::ProofStmt::Assert(pe);
                 Ok(proof_engine::execute_proof_stmt(&ps))
             }
         }

@@ -500,6 +500,8 @@ impl TypeChecker {
                     .unwrap_or(CheckType::Unknown);
                 self.define(&decl.name, CheckType::Fn(param_types, Box::new(ret)));
             }
+            // Part B token-only keywords: skip for now
+            Stmt::TypeAlias(..) | Stmt::AtomicLet(..) | Stmt::Panic(..) | Stmt::Theorem(..) => {}
         }
     }
 

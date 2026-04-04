@@ -35,6 +35,7 @@ pub enum Expr {
     Resume(Box<Expr>),                           // resume(val)
     // Trait objects
     DynCast(String, Box<Expr>),                  // dyn TraitName(expr) — wrap value as trait object
+    Yield(Box<Expr>),                            // yield expr — generator yield
 }
 
 #[allow(dead_code)]
@@ -95,6 +96,11 @@ pub enum Stmt {
     // Phase 15: Consciousness v2
     ConsciousnessBlock(String, Block),  // consciousness "name" { ... }
     EvolveFn(FnDecl),                   // @evolve fn — self-modifying
+    // Part B: token-only keywords
+    TypeAlias(String, String, Visibility),        // type Name = ExistingType
+    AtomicLet(String, Option<String>, Option<Expr>, Visibility),  // atomic let name: type = expr
+    Panic(Expr),                                  // panic expr
+    Theorem(String, Vec<ProofBlockStmt>),         // theorem name { ... }
 }
 
 /// Target for AI code generation.
@@ -350,6 +356,8 @@ pub enum ProofBlockStmt {
     Assert(Expr),
     /// `check law(N)` -- verify a consciousness law by number
     CheckLaw(i64),
+    /// `invariant expr` — loop/proof invariant
+    Invariant(Expr),
 }
 
 // τ=4 visibility levels

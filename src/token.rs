@@ -81,6 +81,7 @@ pub enum Token {
     Comma, Colon, ColonColon, Semicolon, Dot,
 
     // === Special ===
+    HashLBrace,  // #{ — map literal opener
     Newline,
     Eof,
 }

@@ -399,7 +399,8 @@ impl OwnershipAnalyzer {
             | Stmt::Generate(_) | Stmt::Optimize(_) | Stmt::Const(..)
             | Stmt::Static(..) | Stmt::MacroDef(_) | Stmt::DeriveDecl(..)
             | Stmt::ComptimeFn(_) | Stmt::EffectDecl(_) | Stmt::ConsciousnessBlock(_, _) | Stmt::EvolveFn(_)
-            | Stmt::Scope(_) | Stmt::ProofBlock(..) => {}
+            | Stmt::Scope(_) | Stmt::ProofBlock(..)
+            | Stmt::TypeAlias(..) | Stmt::AtomicLet(..) | Stmt::Panic(..) | Stmt::Theorem(..) => {}
         }
     }
 
@@ -780,7 +781,7 @@ impl OwnershipAnalyzer {
             | Expr::StringLit(_) | Expr::CharLit(_) | Expr::Wildcard
             | Expr::EnumPath(_, _, _) | Expr::MacroInvoc(_) | Expr::Comptime(_)
             | Expr::HandleWith(_, _) | Expr::EffectCall(_, _, _) | Expr::Resume(_) => {}
-            Expr::DynCast(_, inner) => {
+            Expr::DynCast(_, inner) | Expr::Yield(inner) => {
                 self.check_expr_use(inner, line, col);
             }
         }

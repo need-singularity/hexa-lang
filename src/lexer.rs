@@ -212,6 +212,15 @@ impl Lexer {
             return Ok(Token::Ident("$".to_string()));
         }
 
+        // Hash-brace: #{ for map literals
+        if ch == '#' {
+            if self.peek_ahead(1) == Some('{') {
+                self.advance(); // consume #
+                self.advance(); // consume {
+                return Ok(Token::HashLBrace);
+            }
+        }
+
         // At-sign attributes: @evolve, etc.
         if ch == '@' {
             self.advance();

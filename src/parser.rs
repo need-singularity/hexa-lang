@@ -149,7 +149,11 @@ impl Parser {
             Token::While => self.parse_while_stmt(),
             Token::Loop => self.parse_loop_stmt(),
             Token::Return => self.parse_return(),
-            Token::Proof => self.parse_proof(),
+            Token::Proof => self.parse_proof_or_proof_block(),
+            Token::Theorem => self.parse_theorem(),
+            Token::Panic => self.parse_panic(),
+            Token::Type => self.parse_type_alias(vis),
+            Token::Atomic => self.parse_atomic_let(vis),
             Token::Assert => self.parse_assert(),
             Token::Intent => self.parse_intent(),
             Token::Verify => self.parse_verify(),
@@ -223,6 +227,10 @@ impl Parser {
                 self.advance();
                 Visibility::Public
             }
+            Token::Crate => {
+                self.advance();
+                Visibility::Crate
+            }
             _ => Visibility::Private,
         }
     }
@@ -289,11 +297,145 @@ impl Parser {
         }
     }
 
-    fn parse_proof(&mut self) -> Result<Stmt, HexaError> {
+    fn parse_proof_or_proof_block(&mut self) -> Result<Stmt, HexaError> {
         self.advance(); // consume 'proof'
         let name = self.expect_ident()?;
+        // Look ahead: if block contains forall/exists/assert/check/invariant, parse as ProofBlock
+        // We use a simple heuristic: peek into the block for proof-specific keywords
+        let saved_pos = self.pos;
+        self.skip_newlines();
+        if matches!(self.peek(), Token::LBrace) {
+            // Peek inside the block to see if it contains proof-specific statements
+            let brace_pos = self.pos;
+            self.advance(); // consume {
+            self.skip_newlines();
+            let is_formal = matches!(self.peek(),
+                Token::Assert | Token::Invariant)
+                || matches!(self.peek(),
+                Token::Ident(ref s) if s == "forall" || s == "exists" || s == "check");
+            self.pos = brace_pos; // backtrack to before {
+            if is_formal {
+                return self.parse_proof_block_body(name);
+            }
+        }
+        self.pos = saved_pos; // backtrack
         let body = self.parse_block()?;
         Ok(Stmt::Proof(name, body))
+    }
+
+    fn parse_proof_block_body(&mut self, name: String) -> Result<Stmt, HexaError> {
+        self.expect(&Token::LBrace)?;
+        self.skip_newlines();
+        let mut stmts = Vec::new();
+        while !matches!(self.peek(), Token::RBrace | Token::Eof) {
+            stmts.push(self.parse_proof_block_stmt()?);
+            self.skip_newlines();
+        }
+        self.expect(&Token::RBrace)?;
+        Ok(Stmt::ProofBlock(name, stmts))
+    }
+
+    fn parse_proof_block_stmt(&mut self) -> Result<ProofBlockStmt, HexaError> {
+        match self.peek().clone() {
+            Token::Ident(ref s) if s == "forall" => {
+                self.advance(); // consume 'forall'
+                let var = self.expect_ident()?;
+                self.expect(&Token::Colon)?;
+                let typ = self.expect_ident()?;
+                self.expect(&Token::Comma)?;
+                let condition = self.parse_expr()?;
+                self.expect(&Token::FatArrow)?;
+                let conclusion = self.parse_expr()?;
+                Ok(ProofBlockStmt::ForAll { var, typ, condition, conclusion })
+            }
+            Token::Ident(ref s) if s == "exists" => {
+                self.advance(); // consume 'exists'
+                let var = self.expect_ident()?;
+                self.expect(&Token::Colon)?;
+                let typ = self.expect_ident()?;
+                self.expect(&Token::Comma)?;
+                let condition = self.parse_expr()?;
+                Ok(ProofBlockStmt::Exists { var, typ, condition })
+            }
+            Token::Ident(ref s) if s == "check" => {
+                self.advance(); // consume 'check'
+                // expect 'law' identifier
+                match self.peek().clone() {
+                    Token::Ident(ref s) if s == "law" => { self.advance(); }
+                    _ => return Err(self.error(format!("expected 'law' after 'check', got {:?}", self.peek()))),
+                }
+                self.expect(&Token::LParen)?;
+                let n = match self.advance() {
+                    Token::IntLit(n) => n,
+                    other => return Err(self.error(format!("expected integer in check law(), got {:?}", other))),
+                };
+                self.expect(&Token::RParen)?;
+                Ok(ProofBlockStmt::CheckLaw(n))
+            }
+            Token::Assert => {
+                self.advance(); // consume 'assert'
+                let expr = self.parse_expr()?;
+                Ok(ProofBlockStmt::Assert(expr))
+            }
+            Token::Invariant => {
+                self.advance(); // consume 'invariant'
+                let expr = self.parse_expr()?;
+                Ok(ProofBlockStmt::Invariant(expr))
+            }
+            _ => Err(self.error(format!("expected proof statement (forall/exists/assert/check/invariant), got {:?}", self.peek()))),
+        }
+    }
+
+    fn parse_theorem(&mut self) -> Result<Stmt, HexaError> {
+        self.advance(); // consume 'theorem'
+        let name = self.expect_ident()?;
+        let stmts = self.parse_proof_block_body_inner()?;
+        Ok(Stmt::Theorem(name, stmts))
+    }
+
+    fn parse_proof_block_body_inner(&mut self) -> Result<Vec<ProofBlockStmt>, HexaError> {
+        self.expect(&Token::LBrace)?;
+        self.skip_newlines();
+        let mut stmts = Vec::new();
+        while !matches!(self.peek(), Token::RBrace | Token::Eof) {
+            stmts.push(self.parse_proof_block_stmt()?);
+            self.skip_newlines();
+        }
+        self.expect(&Token::RBrace)?;
+        Ok(stmts)
+    }
+
+    fn parse_panic(&mut self) -> Result<Stmt, HexaError> {
+        self.advance(); // consume 'panic'
+        let expr = self.parse_expr()?;
+        Ok(Stmt::Panic(expr))
+    }
+
+    fn parse_type_alias(&mut self, vis: Visibility) -> Result<Stmt, HexaError> {
+        self.advance(); // consume 'type'
+        let name = self.expect_ident()?;
+        self.expect(&Token::Eq)?;
+        let target = self.expect_ident()?;
+        Ok(Stmt::TypeAlias(name, target, vis))
+    }
+
+    fn parse_atomic_let(&mut self, vis: Visibility) -> Result<Stmt, HexaError> {
+        self.advance(); // consume 'atomic'
+        self.expect(&Token::Let)?;
+        // optional 'mut'
+        if matches!(self.peek(), Token::Mut) {
+            self.advance();
+        }
+        let name = self.expect_ident()?;
+        let typ = if matches!(self.peek(), Token::Colon) {
+            self.advance();
+            Some(self.expect_ident()?)
+        } else {
+            None
+        };
+        self.expect(&Token::Eq)?;
+        let expr = self.parse_expr()?;
+        Ok(Stmt::AtomicLet(name, typ, Some(expr), vis))
     }
 
     fn parse_assert(&mut self) -> Result<Stmt, HexaError> {
@@ -1573,6 +1715,30 @@ impl Parser {
                 self.advance();
                 let block = self.parse_block()?;
                 Ok(Expr::Comptime(Box::new(Expr::Block(block))))
+            }
+            // Map literal: #{ key: val, ... }
+            Token::HashLBrace => {
+                self.advance(); // consume #{
+                self.skip_newlines();
+                let mut pairs = Vec::new();
+                while !matches!(self.peek(), Token::RBrace | Token::Eof) {
+                    let key = self.parse_expr()?;
+                    self.expect(&Token::Colon)?;
+                    let val = self.parse_expr()?;
+                    pairs.push((key, val));
+                    if matches!(self.peek(), Token::Comma) {
+                        self.advance();
+                    }
+                    self.skip_newlines();
+                }
+                self.expect(&Token::RBrace)?;
+                Ok(Expr::MapLit(pairs))
+            }
+            // Yield expression
+            Token::Yield => {
+                self.advance();
+                let expr = self.parse_expr()?;
+                Ok(Expr::Yield(Box::new(expr)))
             }
             // Algebraic effects: handle { ... } with { ... }
             Token::Handle => self.parse_handle_with_expr(),

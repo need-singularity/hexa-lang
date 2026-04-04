@@ -258,6 +258,20 @@ fn format_stmt(stmt: &Stmt, indent: usize) -> String {
         Stmt::EvolveFn(decl) => {
             format!("{}@evolve fn {}", prefix, decl.name)
         }
+        Stmt::TypeAlias(name, target, _) => {
+            format!("{}type {} = {}", prefix, name, target)
+        }
+        Stmt::AtomicLet(name, typ, expr, _) => {
+            let ann = typ.as_ref().map(|t| format!(": {}", t)).unwrap_or_default();
+            let rhs = expr.as_ref().map(|e| format!(" = {}", format_expr(e))).unwrap_or_default();
+            format!("{}atomic let {}{}{}", prefix, name, ann, rhs)
+        }
+        Stmt::Panic(expr) => {
+            format!("{}panic {}", prefix, format_expr(expr))
+        }
+        Stmt::Theorem(name, _) => {
+            format!("{}theorem {} {{ ... }}", prefix, name)
+        }
     }
 }
 
@@ -386,6 +400,7 @@ fn format_expr(expr: &Expr) -> String {
         Expr::EffectCall(effect, op, _) => format!("{}.{}(...)", effect, op),
         Expr::Resume(inner) => format!("resume({})", format_expr(inner)),
         Expr::DynCast(trait_name, expr) => format!("dyn {}({})", trait_name, format_expr(expr)),
+        Expr::Yield(inner) => format!("yield {}", format_expr(inner)),
     }
 }
 
