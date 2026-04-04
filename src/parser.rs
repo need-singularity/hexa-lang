@@ -309,8 +309,7 @@ impl Parser {
             let brace_pos = self.pos;
             self.advance(); // consume {
             self.skip_newlines();
-            let is_formal = matches!(self.peek(),
-                Token::Assert | Token::Invariant)
+            let is_formal = matches!(self.peek(), Token::Invariant)
                 || matches!(self.peek(),
                 Token::Ident(ref s) if s == "forall" || s == "exists" || s == "check");
             self.pos = brace_pos; // backtrack to before {
@@ -2048,6 +2047,275 @@ mod tests {
             assert_eq!(decl.ret_type.as_deref(), Some("int"));
         } else {
             panic!("expected EvolveFn");
+        }
+    }
+
+    // ── Part A: Parser gap tests ────────────────────────────────
+
+    #[test]
+    fn test_parse_proof_block_forall() {
+        let src = "proof commutativity {\n  forall x: int, x > 0 => x + 1 > 0\n}";
+        let stmts = parse_source(src);
+        if let Stmt::ProofBlock(name, proof_stmts) = &stmts[0] {
+            assert_eq!(name, "commutativity");
+            assert_eq!(proof_stmts.len(), 1);
+            assert!(matches!(&proof_stmts[0], ProofBlockStmt::ForAll { var, typ, .. } if var == "x" && typ == "int"));
+        } else {
+            panic!("expected ProofBlock, got {:?}", &stmts[0]);
+        }
+    }
+
+    #[test]
+    fn test_parse_proof_block_exists() {
+        let src = "proof existence {\n  exists x: int, x > 0\n}";
+        let stmts = parse_source(src);
+        if let Stmt::ProofBlock(name, proof_stmts) = &stmts[0] {
+            assert_eq!(name, "existence");
+            assert_eq!(proof_stmts.len(), 1);
+            assert!(matches!(&proof_stmts[0], ProofBlockStmt::Exists { var, typ, .. } if var == "x" && typ == "int"));
+        } else {
+            panic!("expected ProofBlock, got {:?}", &stmts[0]);
+        }
+    }
+
+    #[test]
+    fn test_parse_proof_block_check_law() {
+        let src = "proof laws {\n  check law(6)\n}";
+        let stmts = parse_source(src);
+        if let Stmt::ProofBlock(name, proof_stmts) = &stmts[0] {
+            assert_eq!(name, "laws");
+            assert!(matches!(&proof_stmts[0], ProofBlockStmt::CheckLaw(6)));
+        } else {
+            panic!("expected ProofBlock, got {:?}", &stmts[0]);
+        }
+    }
+
+    #[test]
+    fn test_parse_proof_block_invariant() {
+        let src = "proof inv_test {\n  invariant x > 0\n}";
+        let stmts = parse_source(src);
+        if let Stmt::ProofBlock(name, proof_stmts) = &stmts[0] {
+            assert_eq!(name, "inv_test");
+            assert!(matches!(&proof_stmts[0], ProofBlockStmt::Invariant(_)));
+        } else {
+            panic!("expected ProofBlock, got {:?}", &stmts[0]);
+        }
+    }
+
+    #[test]
+    fn test_parse_proof_block_mixed() {
+        let src = "proof mixed {\n  forall x: int, x > 0 => x > 0\n  exists y: int, y == 1\n  check law(3)\n}";
+        let stmts = parse_source(src);
+        if let Stmt::ProofBlock(name, proof_stmts) = &stmts[0] {
+            assert_eq!(name, "mixed");
+            assert_eq!(proof_stmts.len(), 3);
+        } else {
+            panic!("expected ProofBlock");
+        }
+    }
+
+    #[test]
+    fn test_parse_simple_proof_with_assert_still_works() {
+        // assert inside proof should still parse as simple Proof (not ProofBlock)
+        let src = "proof my_proof {\n  assert 1 == 1\n}";
+        let stmts = parse_source(src);
+        assert!(matches!(&stmts[0], Stmt::Proof(..)));
+    }
+
+    #[test]
+    fn test_parse_map_literal() {
+        let src = r#"#{ "a": 1, "b": 2 }"#;
+        let stmts = parse_source(src);
+        if let Stmt::Expr(Expr::MapLit(pairs)) = &stmts[0] {
+            assert_eq!(pairs.len(), 2);
+        } else {
+            panic!("expected MapLit, got {:?}", &stmts[0]);
+        }
+    }
+
+    #[test]
+    fn test_parse_map_literal_empty() {
+        let src = "#{}";
+        let stmts = parse_source(src);
+        if let Stmt::Expr(Expr::MapLit(pairs)) = &stmts[0] {
+            assert_eq!(pairs.len(), 0);
+        } else {
+            panic!("expected empty MapLit");
+        }
+    }
+
+    // ── Part B: Token-only keyword tests ────────────────────────
+
+    #[test]
+    fn test_parse_type_alias() {
+        let src = "type MyInt = int";
+        let stmts = parse_source(src);
+        if let Stmt::TypeAlias(name, target, vis) = &stmts[0] {
+            assert_eq!(name, "MyInt");
+            assert_eq!(target, "int");
+            assert_eq!(*vis, Visibility::Private);
+        } else {
+            panic!("expected TypeAlias, got {:?}", &stmts[0]);
+        }
+    }
+
+    #[test]
+    fn test_parse_pub_type_alias() {
+        let src = "pub type Alias = string";
+        let stmts = parse_source(src);
+        if let Stmt::TypeAlias(name, target, vis) = &stmts[0] {
+            assert_eq!(name, "Alias");
+            assert_eq!(target, "string");
+            assert_eq!(*vis, Visibility::Public);
+        } else {
+            panic!("expected TypeAlias with pub vis");
+        }
+    }
+
+    #[test]
+    fn test_parse_yield() {
+        let src = "yield 42";
+        let stmts = parse_source(src);
+        if let Stmt::Expr(Expr::Yield(inner)) = &stmts[0] {
+            assert!(matches!(inner.as_ref(), Expr::IntLit(42)));
+        } else {
+            panic!("expected Yield expr, got {:?}", &stmts[0]);
+        }
+    }
+
+    #[test]
+    fn test_parse_crate_visibility() {
+        let src = "crate let x = 10";
+        let stmts = parse_source(src);
+        if let Stmt::Let(name, _, _, vis) = &stmts[0] {
+            assert_eq!(name, "x");
+            assert_eq!(*vis, Visibility::Crate);
+        } else {
+            panic!("expected Let with Crate visibility, got {:?}", &stmts[0]);
+        }
+    }
+
+    #[test]
+    fn test_parse_crate_fn() {
+        let src = "crate fn helper() {\n  42\n}";
+        let stmts = parse_source(src);
+        if let Stmt::FnDecl(decl) = &stmts[0] {
+            assert_eq!(decl.name, "helper");
+            assert_eq!(decl.vis, Visibility::Crate);
+        } else {
+            panic!("expected FnDecl with Crate visibility");
+        }
+    }
+
+    #[test]
+    fn test_parse_atomic_let() {
+        let src = "atomic let counter = 0";
+        let stmts = parse_source(src);
+        if let Stmt::AtomicLet(name, _, expr, _) = &stmts[0] {
+            assert_eq!(name, "counter");
+            assert!(expr.is_some());
+        } else {
+            panic!("expected AtomicLet, got {:?}", &stmts[0]);
+        }
+    }
+
+    #[test]
+    fn test_parse_atomic_let_typed() {
+        let src = "atomic let x: int = 42";
+        let stmts = parse_source(src);
+        if let Stmt::AtomicLet(name, typ, _, _) = &stmts[0] {
+            assert_eq!(name, "x");
+            assert_eq!(typ.as_deref(), Some("int"));
+        } else {
+            panic!("expected typed AtomicLet");
+        }
+    }
+
+    #[test]
+    fn test_parse_theorem() {
+        let src = "theorem commutativity {\n  forall a: int, a > 0 => a > 0\n}";
+        let stmts = parse_source(src);
+        if let Stmt::Theorem(name, proof_stmts) = &stmts[0] {
+            assert_eq!(name, "commutativity");
+            assert_eq!(proof_stmts.len(), 1);
+        } else {
+            panic!("expected Theorem, got {:?}", &stmts[0]);
+        }
+    }
+
+    #[test]
+    fn test_parse_panic_string() {
+        let src = r#"panic "something went wrong""#;
+        let stmts = parse_source(src);
+        if let Stmt::Panic(expr) = &stmts[0] {
+            assert!(matches!(expr, Expr::StringLit(s) if s == "something went wrong"));
+        } else {
+            panic!("expected Panic stmt, got {:?}", &stmts[0]);
+        }
+    }
+
+    #[test]
+    fn test_parse_panic_expr() {
+        let src = "panic 42";
+        let stmts = parse_source(src);
+        assert!(matches!(&stmts[0], Stmt::Panic(Expr::IntLit(42))));
+    }
+
+    // ── Operator category coverage tests ────────────────────────
+
+    #[test]
+    fn test_arithmetic_operators() {
+        // + - * / % **
+        let stmts = parse_source("1 + 2 - 3 * 4 / 5 % 6 ** 7");
+        assert!(matches!(&stmts[0], Stmt::Expr(Expr::Binary(..))));
+    }
+
+    #[test]
+    fn test_bitwise_operators() {
+        // & | ^ ~
+        let stmts = parse_source("~x");
+        assert!(matches!(&stmts[0], Stmt::Expr(Expr::Unary(UnaryOp::BitNot, _))));
+    }
+
+    #[test]
+    fn test_logical_operators() {
+        // && || ! ^^
+        let stmts = parse_source("a && b || c ^^ d");
+        assert!(matches!(&stmts[0], Stmt::Expr(Expr::Binary(..))));
+        let stmts2 = parse_source("!x");
+        assert!(matches!(&stmts2[0], Stmt::Expr(Expr::Unary(UnaryOp::Not, _))));
+    }
+
+    #[test]
+    fn test_comparison_operators() {
+        let stmts = parse_source("a == b");
+        assert!(matches!(&stmts[0], Stmt::Expr(Expr::Binary(_, BinOp::Eq, _))));
+        let stmts2 = parse_source("a != b");
+        assert!(matches!(&stmts2[0], Stmt::Expr(Expr::Binary(_, BinOp::Ne, _))));
+        let stmts3 = parse_source("a <= b");
+        assert!(matches!(&stmts3[0], Stmt::Expr(Expr::Binary(_, BinOp::Le, _))));
+        let stmts4 = parse_source("a >= b");
+        assert!(matches!(&stmts4[0], Stmt::Expr(Expr::Binary(_, BinOp::Ge, _))));
+    }
+
+    #[test]
+    fn test_special_operators() {
+        // .. ..= ->
+        let stmts = parse_source("1..10");
+        assert!(matches!(&stmts[0], Stmt::Expr(Expr::Range(_, _, false))));
+        let stmts2 = parse_source("1..=10");
+        assert!(matches!(&stmts2[0], Stmt::Expr(Expr::Range(_, _, true))));
+    }
+
+    #[test]
+    fn test_trait_name_in_impl() {
+        let src = "impl Display for Point {\n  fn show(self) {\n    42\n  }\n}";
+        let stmts = parse_source(src);
+        if let Stmt::ImplBlock(impl_block) = &stmts[0] {
+            assert_eq!(impl_block.trait_name.as_deref(), Some("Display"));
+            assert_eq!(impl_block.target, "Point");
+        } else {
+            panic!("expected ImplBlock");
         }
     }
 

@@ -1003,6 +1003,57 @@ impl Interpreter {
                     }
                 }
             }
+            Stmt::ProofBlock(name, proof_stmts) => {
+                if !self.test_mode {
+                    return Ok(Value::Void);
+                }
+                self.writeln_output(&format!("[proof:formal] {}", name));
+                for ps in proof_stmts {
+                    let result = self.execute_proof_block_stmt(ps)?;
+                    if !result.valid {
+                        return Err(self.runtime_err(format!(
+                            "proof '{}' failed: {}", name, result.message
+                        )));
+                    }
+                }
+                Ok(Value::Void)
+            }
+            Stmt::Theorem(name, proof_stmts) => {
+                if !self.test_mode {
+                    return Ok(Value::Void);
+                }
+                self.writeln_output(&format!("[theorem] {}", name));
+                for ps in proof_stmts {
+                    let result = self.execute_proof_block_stmt(ps)?;
+                    if !result.valid {
+                        return Err(self.runtime_err(format!(
+                            "theorem '{}' failed: {}", name, result.message
+                        )));
+                    }
+                }
+                Ok(Value::Void)
+            }
+            Stmt::TypeAlias(_name, _target, _vis) => {
+                // Type alias is a compile-time construct, no runtime effect
+                Ok(Value::Void)
+            }
+            Stmt::AtomicLet(name, _typ, expr, _vis) => {
+                // At runtime, atomic let behaves like regular let
+                let val = match expr {
+                    Some(e) => self.eval_expr(e)?,
+                    None => Value::Void,
+                };
+                self.env.define(name, val);
+                Ok(Value::Void)
+            }
+            Stmt::Panic(expr) => {
+                let val = self.eval_expr(expr)?;
+                let msg = match &val {
+                    Value::Str(s) => s.clone(),
+                    other => format!("{}", other),
+                };
+                Err(self.runtime_err(format!("panic: {}", msg)))
+            }
             // Macro/Derive/Const/Static — not yet implemented at runtime
             _ => Ok(Value::Void),
         }
