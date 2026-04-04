@@ -110,9 +110,10 @@ fn emit_function(
     // First `num_params` allocas get parameter values from x0, x1, ...
     for (i, (_vid, slot_off)) in alloca_list.iter().take(num_params).enumerate() {
         let simm9 = (*slot_off as u32) & 0x1FF;
-        // stur x_i, [x29, #slot_off]
         emit32(code, 0xf8000000 | (simm9 << 12) | ((FP as u32) << 5) | (i as u32));
     }
+
+    let const_pins: HashMap<i64, u8> = HashMap::new(); // disabled for now
 
     // Label tracking for intra-function branches
     let mut block_offsets: HashMap<crate::ir::BlockId, usize> = HashMap::new();
@@ -142,7 +143,6 @@ fn emit_prologue(code: &mut Vec<u8>, alloc: &FuncAlloc) {
     emit32(code, 0xa9bf7bfd);
     // mov x29, sp
     emit32(code, 0x910003fd);
-    // sub sp, sp, #stack_size
     if alloc.stack_size > 0 {
         let imm = (alloc.stack_size as u32) & 0xFFF;
         emit32(code, 0xd10003ff | (imm << 10));
