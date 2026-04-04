@@ -118,11 +118,42 @@ fn emit_function(
     let mut block_offsets: HashMap<crate::ir::BlockId, usize> = HashMap::new();
     let mut branch_fixups: Vec<(usize, crate::ir::BlockId)> = Vec::new();
 
+    // Track last known register values for peephole optimization
+    let mut reg_known: HashMap<u8, i64> = HashMap::new(); // reg -> known const value
+
     for block in &func.blocks {
         block_offsets.insert(block.id, code.len());
+        // Invalidate known values at block entry (control flow merge)
+        if block.preds.len() > 1 || block.id != func.blocks[0].id {
+            reg_known.clear();
+        }
 
         for instr in &block.instructions {
+            let dst = reg_for(instr.result, &adjusted_alloc);
+
+            // Peephole: skip redundant const loads
+            if instr.op == OpCode::Load {
+                if let Some(Operand::ImmI64(n)) = instr.operands.first() {
+                    if reg_known.get(&dst) == Some(n) {
+                        continue; // Already has this value
+                    }
+                }
+            }
+
             emit_instruction(code, instr, &adjusted_alloc, &mut branch_fixups, call_fixups, id_to_name, &alloca_slots);
+
+            // Track what we put in dst
+            if instr.op == OpCode::Load {
+                if let Some(Operand::ImmI64(n)) = instr.operands.first() {
+                    reg_known.insert(dst, *n);
+                } else {
+                    reg_known.remove(&dst);
+                }
+            } else if instr.op == OpCode::Call {
+                reg_known.clear(); // Call clobbers everything
+            } else {
+                reg_known.remove(&dst); // Non-const result
+            }
         }
     }
 
@@ -236,15 +267,15 @@ fn emit_instruction(
                 Some(Operand::ImmF64(f)) => emit_mov_imm(code, dst, f.to_bits() as i64),
                 Some(Operand::ImmBool(b)) => emit_mov_imm(code, dst, if *b { 1 } else { 0 }),
                 Some(Operand::Value(ptr)) => {
-                    // Check if ptr is an alloca — use FP-relative load
                     if let Some(&slot_off) = alloca_slots.get(ptr) {
-                        let abs_off = slot_off.unsigned_abs();
-                        // ldur Xd, [x29, #-offset] (negative offset from FP)
                         let simm9 = (slot_off as u32) & 0x1FF;
                         emit32(code, 0xf8400000 | (simm9 << 12) | ((FP as u32) << 5) | (dst as u32));
                     } else {
                         let base = reg_for(*ptr, alloc);
-                        emit32(code, 0xf9400000 | ((base as u32) << 5) | (dst as u32));
+                        // Peephole: if base == dst, no need to load (value already there)
+                        if base != dst {
+                            emit32(code, 0xf9400000 | ((base as u32) << 5) | (dst as u32));
+                        }
                     }
                 }
                 Some(Operand::StringRef(_)) => emit_mov_imm(code, dst, 0),
@@ -282,19 +313,8 @@ fn emit_instruction(
             }
         }
         OpCode::Alloc => {
-            // Stack-frame alloca: compute address as FP + offset (negative)
-            if let Some(&slot_off) = alloca_slots.get(&instr.result) {
-                let abs_off = slot_off.unsigned_abs();
-                // sub Xdst, x29, #abs_off
-                if abs_off < 4096 {
-                    emit32(code, 0xd1000000 | ((abs_off as u32) << 10) | ((FP as u32) << 5) | (dst as u32));
-                } else {
-                    emit_mov_imm(code, TMP2, abs_off as i64);
-                    emit32(code, encode_rrr(0xcb000000, dst, FP, TMP2));
-                }
-            } else {
-                emit_mov_imm(code, dst, 0);
-            }
+            // NOP — alloca address is computed inline by Load/Store via alloca_slots.
+            // No need to materialize the pointer in a register.
         }
         OpCode::Free => {
             if let Some(Operand::Value(ptr)) = instr.operands.first() {
