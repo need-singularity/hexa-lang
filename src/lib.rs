@@ -130,6 +130,19 @@ pub mod anima_bridge;
 #[allow(dead_code)]
 pub mod package;
 
+// HEXA-IR: Self-designed IR backend (no LLVM, no Cranelift)
+#[allow(dead_code)]
+pub mod ir;
+#[allow(dead_code)]
+pub mod lower;
+#[allow(dead_code)]
+pub mod opt;
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+pub mod codegen;
+#[allow(dead_code)]
+pub mod alloc;
+
 // WASM entry points
 #[cfg(target_arch = "wasm32")]
 pub mod wasm;
