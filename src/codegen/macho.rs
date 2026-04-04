@@ -263,7 +263,7 @@ mod tests {
     fn test_macho_magic() {
         let module = crate::ir::IrModule::new("test");
         let code = vec![0xd6, 0x5f, 0x03, 0xc0]; // ret
-        let obj = wrap(code, &module);
+        let obj = wrap(code, &module, 0);
         // Check Mach-O magic
         assert_eq!(&obj[0..4], &MH_MAGIC_64.to_le_bytes());
         // Check it's an object file

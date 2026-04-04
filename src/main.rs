@@ -119,6 +119,8 @@ mod anima_bridge;
 #[allow(dead_code)]
 mod package;
 #[allow(dead_code)]
+mod singularity;
+#[allow(dead_code)]
 mod ir;
 #[allow(dead_code)]
 mod lower;

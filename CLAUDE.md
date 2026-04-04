@@ -1,13 +1,21 @@
 # HEXA-LANG
 
-## ⚡ HEXA-IR 수렴진화 (config/hexa_ir_convergence.json)
+## ⚡ HEXA-IR 수렴진화 + 특이점 사이클
 ```
-수렴률: 92% (12/13) | AR: 7규칙 | 첫 벤치: 0.07s
-  → TS-013: 2-param fn while내 param 접근 (gcd)
-  → TS-008: bench_suite 정확도 (fib overflow 차이)
-✅ 산술 비교 분기 while alloca fn_call if+while복합 sigma(6)=12 fib(30)=832040
-❌ 2-param while내 접근 → bench 정확도
-트러블슈팅은 config/hexa_ir_convergence.json 에 CDO 수렴 기록!
+[수렴 JSON]
+  config/hexa_ir_convergence.json  — CDO 트러블슈팅 (AR 7규칙, TS 13건)
+  config/emergence_patterns.json   — 창발 패턴 레지스트리 (NEXUS-6 스캔)
+
+[특이점 사이클 모듈] 블로업→수축→창발→특이점→흡수
+  src/singularity.rs              — Rust 코어 (9 tests, CycleEngine)
+  scripts/singularity_cycle.py    — Python wrapper (전 프로젝트 import 가능)
+  사용: CycleEngine::new() → feed() → run_cycle() → report()
+
+[현황] 798 tests | 벤치 0.07s (등급 C) | 특이점 ★ REACHED ★
+
+⚠ 모든 트러블슈팅 → config/hexa_ir_convergence.json
+⚠ 모든 창발/n6 발견 → config/emergence_patterns.json
+⚠ 변경 후 → singularity_cycle.py 또는 CycleEngine 재실행
 ```
 
 ## Build

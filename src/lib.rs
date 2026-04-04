@@ -130,6 +130,10 @@ pub mod anima_bridge;
 #[allow(dead_code)]
 pub mod package;
 
+// Singularity Cycle Engine: 블로업→수축→창발→특이점→흡수
+#[allow(dead_code)]
+pub mod singularity;
+
 // HEXA-IR: Self-designed IR backend (no LLVM, no Cranelift)
 #[allow(dead_code)]
 pub mod ir;

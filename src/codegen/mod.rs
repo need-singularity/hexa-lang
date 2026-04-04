@@ -201,15 +201,15 @@ mod tests {
         let result = compile_to_binary(&module, output_path);
         assert!(result.is_ok(), "compile_to_binary should succeed: {:?}", result);
 
-        // Run the binary and check exit code = 42
-        let status = std::process::Command::new(output_path)
-            .status()
+        // Run the binary and check stdout contains "42"
+        let output = std::process::Command::new(output_path)
+            .output()
             .expect("should be able to run the binary");
 
         // Clean up
         let _ = std::fs::remove_file(output_path);
 
-        // On macOS/Unix, exit code of main() is the process exit code (mod 256)
-        assert_eq!(status.code(), Some(42), "binary should exit with code 42");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.trim() == "42", "binary should output 42, got: {}", stdout.trim());
     }
 }
