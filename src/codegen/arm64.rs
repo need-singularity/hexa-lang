@@ -333,9 +333,9 @@ fn emit_instruction(
             }
         }
         OpCode::Call => {
-            // Move args to x0, x1, ...
-            let mut arg_idx = 0u8;
+            // Collect args and function target
             let mut target_func_name: Option<String> = None;
+            let mut arg_regs: Vec<u8> = Vec::new();
 
             for (i, op) in instr.operands.iter().enumerate() {
                 if i == 0 {
@@ -346,11 +346,31 @@ fn emit_instruction(
                     continue;
                 }
                 if let Operand::Value(v) = op {
-                    let src = reg_for(*v, alloc);
-                    if src != arg_idx {
-                        emit32(code, encode_mov(arg_idx, src));
-                    }
-                    arg_idx += 1;
+                    arg_regs.push(reg_for(*v, alloc));
+                }
+            }
+
+            // Move args to x0, x1, ... using temp stack to avoid clobber
+            // First push all arg values to stack, then pop into x0, x1, ...
+            let n_args = arg_regs.len();
+            if n_args > 1 {
+                // Save arg values to stack scratch area
+                let scratch = ((n_args * 8 + 15) & !15) as u32;
+                emit32(code, 0xd10003ff | (scratch << 10)); // sub sp, sp, #scratch
+                for (i, &r) in arg_regs.iter().enumerate() {
+                    let off = (i * 8) as u32;
+                    emit32(code, 0xf9000000 | ((off / 8) << 10) | (31u32 << 5) | (r as u32));
+                }
+                // Load from scratch into x0, x1, ...
+                for i in 0..n_args {
+                    let off = (i * 8) as u32;
+                    emit32(code, 0xf9400000 | ((off / 8) << 10) | (31u32 << 5) | (i as u32));
+                }
+                emit32(code, 0x910003ff | (scratch << 10)); // add sp, sp, #scratch
+            } else if n_args == 1 {
+                let src = arg_regs[0];
+                if src != 0 {
+                    emit32(code, encode_mov(0, src));
                 }
             }
 
