@@ -746,9 +746,19 @@ fn run_file_hexa_ir(path: &str) {
     // 4. Lower AST -> HEXA-IR
     let mut module = lower::lower_program(&stmts, path);
 
-    // 5. Optimize (sigma=12 pipeline)
-    let opt_result = opt::run_pipeline(&mut module);
+    // 5. Optimize (sigma=12 pipeline) — ESO policy via HEXA_ESO env var
+    let eso_mode = std::env::var("HEXA_ESO").unwrap_or_default();
+    let policy = match eso_mode.as_str() {
+        "adaptive" => opt::pass_policy::Policy::Adaptive,
+        "hybrid" => opt::pass_policy::Policy::Hybrid,
+        _ => opt::pass_policy::Policy::Fixed,
+    };
+    let eso_result = opt::run_pipeline_with_policy(&mut module, policy, &[]);
+    let opt_result = eso_result.pipeline;
     eprintln!("[hexa-ir] {}", opt_result.summary().trim());
+    if !eso_mode.is_empty() && eso_mode != "fixed" {
+        eprintln!("[eso] policy={} metrics={}", eso_mode, eso_result.metrics.len());
+    }
 
     // 6. Compile to native binary
     let output_path = path.trim_end_matches(".hexa");
