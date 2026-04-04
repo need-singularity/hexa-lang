@@ -803,10 +803,9 @@ fn run_eso_tune(args: &[String]) {
     let mut ed_history = opt::emergence_density::EdHistory::default();
     let mut round_summaries: Vec<(usize, i64, u128, f64)> = Vec::new(); // (round, changes, elapsed_ns, ed)
 
+    let mut module = lower::lower_program(&stmts, file);
     for round in 0..rounds {
-        // Re-lower from AST each round to get a fresh module
-        let mut module = lower::lower_program(&stmts, file);
-
+        // Reuse the optimized module from previous round (no re-lower)
         let eso_result = opt::run_pipeline_with_policy(&mut module, policy, round, &last_metrics);
         let metrics = &eso_result.metrics;
 
@@ -815,17 +814,14 @@ fn run_eso_tune(args: &[String]) {
         let total_elapsed_ns: u128 = metrics.iter().map(|m| m.elapsed_ns).sum();
         let total_elapsed_ms = total_elapsed_ns as f64 / 1_000_000.0;
 
-        // Compute emergence density
-        let baseline_ns = if round == 0 {
-            total_elapsed_ns.max(1)
-        } else {
-            round_summaries[0].2.max(1)
-        };
+        // Compute emergence density: ED = (1 - change_ratio) × speedup
+        let baseline_changes = if round == 0 { total_changes.max(1) } else { round_summaries[0].1.max(1) };
+        let baseline_ns = if round == 0 { total_elapsed_ns.max(1) } else { round_summaries[0].2.max(1) };
         let ed = opt::emergence_density::compute(opt::emergence_density::EdInput {
-            patterns_found: metrics.len(),
+            baseline_changes,
+            current_changes: total_changes,
             baseline_ns,
             current_ns: total_elapsed_ns.max(1),
-            cycles: round + 1,
         });
         ed_history.push(ed);
 
@@ -840,6 +836,11 @@ fn run_eso_tune(args: &[String]) {
 
         round_summaries.push((round + 1, total_changes, total_elapsed_ns, ed));
         last_metrics = metrics.clone();
+
+        if total_changes == 0 {
+            eprintln!("[eso-tune] ✓ converged at round {}", round + 1);
+            break;
+        }
     }
 
     // Final report

@@ -1,21 +1,25 @@
-//! Emergence Density (ED) — new convergence metric.
-//! ED = (patterns_found × speedup) / cycles
-//! where speedup = baseline_ns / current_ns (≥ 1.0 means improvement).
+//! Emergence Density (ED) — convergence quality metric.
+//! ED = (1 - change_ratio) × speedup
+//! where change_ratio = current_changes / baseline_changes (0.0 = fully converged),
+//! and speedup = baseline_ns / current_ns (≥ 1.0 = faster).
+//! ED increases monotonically as optimization converges and speed improves.
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EdInput {
-    pub patterns_found: usize,
+    pub baseline_changes: i64,
+    pub current_changes: i64,
     pub baseline_ns: u128,
     pub current_ns: u128,
-    pub cycles: usize,
 }
 
 pub fn compute(input: EdInput) -> f64 {
-    if input.cycles == 0 || input.current_ns == 0 {
+    if input.current_ns == 0 || input.baseline_changes == 0 {
         return 0.0;
     }
+    let change_ratio = input.current_changes as f64 / input.baseline_changes as f64;
+    let convergence = (1.0 - change_ratio).max(0.0);
     let speedup = input.baseline_ns as f64 / input.current_ns as f64;
-    (input.patterns_found as f64 * speedup) / input.cycles as f64
+    convergence * speedup
 }
 
 #[derive(Debug, Clone, Default)]
@@ -46,16 +50,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_ed_zero_cycles() {
-        let ed = compute(EdInput { patterns_found: 5, baseline_ns: 100, current_ns: 50, cycles: 0 });
+    fn test_ed_zero_baseline() {
+        let ed = compute(EdInput { baseline_changes: 0, current_changes: 0, baseline_ns: 100, current_ns: 50 });
         assert_eq!(ed, 0.0);
     }
 
     #[test]
-    fn test_ed_positive_speedup() {
-        // 2 patterns, 2x speedup, 1 cycle → 4.0
-        let ed = compute(EdInput { patterns_found: 2, baseline_ns: 100, current_ns: 50, cycles: 1 });
-        assert!((ed - 4.0).abs() < 1e-9);
+    fn test_ed_full_convergence() {
+        // 0/55 changes, 2x speedup → (1-0) × 2.0 = 2.0
+        let ed = compute(EdInput { baseline_changes: 55, current_changes: 0, baseline_ns: 100, current_ns: 50 });
+        assert!((ed - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_ed_no_convergence() {
+        // 55/55 changes, 1x speedup → (1-1) × 1.0 = 0.0
+        let ed = compute(EdInput { baseline_changes: 55, current_changes: 55, baseline_ns: 100, current_ns: 100 });
+        assert!((ed - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_ed_partial_convergence() {
+        // 30/55 changes, 1.5x speedup → (1-30/55) × 1.5 ≈ 0.6818
+        let ed = compute(EdInput { baseline_changes: 55, current_changes: 30, baseline_ns: 150, current_ns: 100 });
+        let expected = (1.0 - 30.0/55.0) * 1.5;
+        assert!((ed - expected).abs() < 1e-9);
     }
 
     #[test]
