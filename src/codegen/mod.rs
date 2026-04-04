@@ -93,8 +93,8 @@ pub fn compile_to_binary(module: &IrModule, output_path: &str) -> Result<(), Str
         .status()
         .map_err(|e| format!("linker failed: {}", e))?;
 
-    // Clean up object file
-    let _ = std::fs::remove_file(&obj_path);
+    // Keep object file for debugging
+    // let _ = std::fs::remove_file(&obj_path);
 
     if status.success() {
         Ok(())
