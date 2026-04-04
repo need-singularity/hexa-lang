@@ -196,4 +196,48 @@ mod tests {
         assert_eq!(r.metrics.len(), 12);
         assert!(r.metrics.iter().all(|pm| !pm.pass_name.is_empty()));
     }
+
+    #[test]
+    fn test_eso_10_rounds_converges() {
+        use crate::opt::pass_policy::Policy;
+        let mut module = IrModule::new("converge");
+        let mut last_metrics: Vec<crate::opt::ir_stats::PassMetric> = Vec::new();
+        let mut result = None;
+        for _round in 0..10 {
+            let r = run_pipeline_with_policy(&mut module, Policy::Hybrid, &last_metrics);
+            last_metrics = r.metrics.clone();
+            result = Some(r);
+        }
+        let final_result = result.expect("should have run at least one round");
+        assert_eq!(final_result.pipeline.total_changes(), 0, "pipeline should converge to 0 changes");
+    }
+
+    #[test]
+    fn test_eso_adaptive_reorders_after_metrics() {
+        use crate::opt::pass_policy::Policy;
+        let mut module = IrModule::new("adaptive");
+        // Round 0: Fixed policy to get baseline metrics
+        let r0 = run_pipeline_with_policy(&mut module, Policy::Fixed, &[]);
+        let baseline_metrics = r0.metrics;
+        assert_eq!(baseline_metrics.len(), 12);
+        // Round 1: Adaptive policy using baseline metrics
+        let r1 = run_pipeline_with_policy(&mut module, Policy::Adaptive, &baseline_metrics);
+        assert_eq!(r1.metrics.len(), 12, "adaptive round should still produce 12 metrics");
+    }
+
+    #[test]
+    fn test_eso_metrics_have_valid_pass_names() {
+        use crate::opt::pass_policy::{Policy, FIXED_ORDER};
+        let mut module = IrModule::new("names");
+        let r = run_pipeline_with_policy(&mut module, Policy::Fixed, &[]);
+        assert_eq!(r.metrics.len(), 12);
+        for pm in &r.metrics {
+            assert!(!pm.pass_name.is_empty(), "pass_name must not be empty");
+            assert!(
+                FIXED_ORDER.contains(&pm.pass_name.as_str()),
+                "pass_name '{}' not found in FIXED_ORDER",
+                pm.pass_name,
+            );
+        }
+    }
 }

@@ -187,6 +187,14 @@ fn main() {
                 debugger::run_dap(&args[2]);
             }
             "--bench" => run_benchmark(),
+            #[cfg(not(target_arch = "wasm32"))]
+            "--eso-tune" => {
+                if args.len() < 3 {
+                    eprintln!("Usage: hexa --eso-tune <file.hexa> [--rounds N] [--policy adaptive|hybrid]");
+                    std::process::exit(1);
+                }
+                run_eso_tune(&args);
+            }
             "--mem-stats" => {
                 if args.len() < 3 {
                     eprintln!("Usage: hexa --mem-stats <file.hexa> [--memory-budget <MB>]");
@@ -710,6 +718,140 @@ fn run_file_native(path: &str) {
             }
         }
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn run_eso_tune(args: &[String]) {
+    let file = &args[2];
+
+    // Parse optional --rounds N and --policy adaptive|hybrid
+    let mut rounds: usize = 10;
+    let mut policy = opt::pass_policy::Policy::Hybrid;
+    let mut i = 3;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--rounds" => {
+                i += 1;
+                if i < args.len() {
+                    rounds = args[i].parse().unwrap_or_else(|_| {
+                        eprintln!("[eso-tune] invalid --rounds value, using default 10");
+                        10
+                    });
+                }
+            }
+            "--policy" => {
+                i += 1;
+                if i < args.len() {
+                    policy = match args[i].as_str() {
+                        "fixed" => opt::pass_policy::Policy::Fixed,
+                        "adaptive" => opt::pass_policy::Policy::Adaptive,
+                        "hybrid" => opt::pass_policy::Policy::Hybrid,
+                        other => {
+                            eprintln!("[eso-tune] unknown policy '{}', using hybrid", other);
+                            opt::pass_policy::Policy::Hybrid
+                        }
+                    };
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    // Read source
+    let source = match std::fs::read_to_string(file) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error reading {}: {}", file, e);
+            std::process::exit(1);
+        }
+    };
+
+    // Lex
+    let tokens = match lexer::Lexer::new(&source).tokenize() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(1);
+        }
+    };
+
+    // Parse
+    let stmts = match parser::Parser::new(tokens).parse() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(1);
+        }
+    };
+
+    eprintln!("[eso-tune] file={} rounds={} policy={:?}", file, rounds, policy);
+
+    let mut last_metrics: Vec<opt::ir_stats::PassMetric> = Vec::new();
+    let mut ed_history = opt::emergence_density::EdHistory::default();
+    let mut round_summaries: Vec<(usize, i64, u128, f64)> = Vec::new(); // (round, changes, elapsed_ns, ed)
+
+    for round in 0..rounds {
+        // Re-lower from AST each round to get a fresh module
+        let mut module = lower::lower_program(&stmts, file);
+
+        let eso_result = opt::run_pipeline_with_policy(&mut module, policy, &last_metrics);
+        let metrics = &eso_result.metrics;
+
+        // Compute total changes (instruction deltas) and elapsed time
+        let total_changes: i64 = metrics.iter().map(|m| m.delta_instr().abs()).sum();
+        let total_elapsed_ns: u128 = metrics.iter().map(|m| m.elapsed_ns).sum();
+        let total_elapsed_ms = total_elapsed_ns as f64 / 1_000_000.0;
+
+        // Compute emergence density
+        let baseline_ns = if round == 0 {
+            total_elapsed_ns.max(1)
+        } else {
+            round_summaries[0].2.max(1)
+        };
+        let ed = opt::emergence_density::compute(opt::emergence_density::EdInput {
+            patterns_found: metrics.len(),
+            baseline_ns,
+            current_ns: total_elapsed_ns.max(1),
+            cycles: round + 1,
+        });
+        ed_history.push(ed);
+
+        eprintln!(
+            "[eso-tune] round {}/{}: {} changes, {:.2}ms, ED={:.4}",
+            round + 1,
+            rounds,
+            total_changes,
+            total_elapsed_ms,
+            ed,
+        );
+
+        round_summaries.push((round + 1, total_changes, total_elapsed_ns, ed));
+        last_metrics = metrics.clone();
+    }
+
+    // Final report
+    eprintln!("\n[eso-tune] === Final Report ({} rounds) ===", rounds);
+    eprintln!("{:<8} {:>10} {:>12} {:>10}", "Round", "Changes", "Time(ms)", "ED");
+    eprintln!("{}", "-".repeat(44));
+    for (r, changes, elapsed_ns, ed) in &round_summaries {
+        let ms = *elapsed_ns as f64 / 1_000_000.0;
+        eprintln!("{:<8} {:>10} {:>12.2} {:>10.4}", r, changes, ms, ed);
+    }
+
+    if round_summaries.len() >= 2 {
+        let first_ed = round_summaries[0].3;
+        let last_ed = round_summaries.last().unwrap().3;
+        let first_ns = round_summaries[0].2 as f64;
+        let last_ns = round_summaries.last().unwrap().2 as f64;
+        let speedup = if last_ns > 0.0 { first_ns / last_ns } else { 0.0 };
+        eprintln!("\n[eso-tune] ED: {:.4} -> {:.4} (delta={:+.4})", first_ed, last_ed, last_ed - first_ed);
+        eprintln!("[eso-tune] Speedup: {:.2}x (round 1 vs round {})", speedup, rounds);
+        if ed_history.is_monotone_up() {
+            eprintln!("[eso-tune] ED trend: monotonically improving");
+        }
+    }
+    eprintln!("[eso-tune] done.");
 }
 
 #[cfg(not(target_arch = "wasm32"))]
