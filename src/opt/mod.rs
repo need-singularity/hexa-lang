@@ -19,6 +19,7 @@ mod p12_verify;
 pub mod ir_stats;
 pub mod eso_bridge;
 pub mod pass_policy;
+pub mod emergence_density;
 
 use crate::ir::IrModule;
 
