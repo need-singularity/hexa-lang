@@ -141,11 +141,13 @@ pub fn lower_program(stmts: &[ast::Stmt], module_name: &str) -> IrModule {
             let mut builder = IrBuilder::new(func);
 
             ctx.push_scope();
-            // Bind parameters: alloca only (no store — codegen handles arg→alloca)
-            // Convention: first N allocas in entry block = parameter slots
-            for (_i, (pname, pty)) in params.iter().enumerate() {
+            // Bind parameters: alloca + explicit Store of param value.
+            // Load(Param(i)) materializes the i-th argument register as an SSA value.
+            // P2 mem2reg promotes Store→Load to Copy, eliminating stack round-trips.
+            for (i, (pname, pty)) in params.iter().enumerate() {
                 let ptr = builder.alloc(pty.clone());
-                // No store here — codegen's prologue stores x0,x1,... to these slots
+                let param_val = builder.load_param(i, pty.clone());
+                builder.store(ptr, param_val);
                 ctx.define_var(pname, ptr, IrType::Ptr(Box::new(pty.clone())));
             }
             let mut last = builder.const_i64(0);

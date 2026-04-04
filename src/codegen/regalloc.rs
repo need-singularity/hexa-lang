@@ -28,6 +28,8 @@ pub struct FuncAlloc {
     pub locations: HashMap<ValueId, Location>,
     pub stack_size: i32,
     pub used_regs: Vec<PhysReg>,
+    /// Callee-saved registers that this function uses (must be saved/restored).
+    pub callee_saved: Vec<PhysReg>,
 }
 
 /// Allocation result for entire module.
@@ -36,14 +38,25 @@ pub struct AllocResult {
 }
 
 /// Available general-purpose registers per target.
+/// Caller-saved registers listed first so the allocator prefers them.
 fn gp_regs(target: Target) -> Vec<PhysReg> {
     match target {
-        // ARM64: x0-x28 (x29=FP, x30=LR, x31=SP)
-        // Use x0-x15 for allocation (16 regs)
-        Target::Arm64 => (0..16).map(PhysReg).collect(),
-        // x86-64: rax,rcx,rdx,rbx,rsi,rdi,r8-r15 (14 regs)
-        // rbp=FP, rsp=SP reserved
+        // ARM64: caller-saved x0-x15 (16) + callee-saved x19-x28 (10) = 26 regs
+        Target::Arm64 => {
+            let mut regs: Vec<PhysReg> = (0..16).map(PhysReg).collect();
+            regs.extend((19..=28).map(PhysReg));
+            regs
+        }
+        // x86-64: unchanged for now
         Target::X86_64 => (0..14).map(PhysReg).collect(),
+    }
+}
+
+/// Check if a physical register is callee-saved.
+fn is_callee_saved(reg: PhysReg, target: Target) -> bool {
+    match target {
+        Target::Arm64 => reg.0 >= 19 && reg.0 <= 28,
+        Target::X86_64 => false, // not yet implemented for x86
     }
 }
 
@@ -337,6 +350,7 @@ fn allocate_function(func: &IrFunction, regs: &[PhysReg]) -> FuncAlloc {
             locations: HashMap::new(),
             stack_size: 0,
             used_regs: Vec::new(),
+            callee_saved: Vec::new(),
         };
     }
 
@@ -491,6 +505,13 @@ fn allocate_function(func: &IrFunction, regs: &[PhysReg]) -> FuncAlloc {
         }
     }
 
+    // Identify callee-saved registers that were used
+    let target = if regs.len() > 16 { Target::Arm64 } else { Target::X86_64 };
+    let callee_saved: Vec<PhysReg> = used_regs.iter()
+        .filter(|r| is_callee_saved(**r, target))
+        .copied()
+        .collect();
+
     // Align stack to 16 bytes
     let stack_size = if stack_offset == 0 { 0 } else { ((-stack_offset + 15) & !15) as i32 };
 
@@ -498,6 +519,7 @@ fn allocate_function(func: &IrFunction, regs: &[PhysReg]) -> FuncAlloc {
         locations,
         stack_size,
         used_regs,
+        callee_saved,
     }
 }
 

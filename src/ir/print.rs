@@ -138,6 +138,7 @@ fn print_operand(op: &Operand) -> String {
         Operand::PhiEntry(b, v) => format!("[{}: {}]", b, v),
         Operand::SwitchCase(val, b) => format!("case {} => {}", val, b),
         Operand::Cmp(kind) => format!("cmp.{}", kind),
+        Operand::Param(i) => format!("param.{}", i),
     }
 }
 

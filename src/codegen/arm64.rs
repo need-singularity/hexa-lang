@@ -86,32 +86,15 @@ fn emit_function(
         locations: alloc.locations.clone(),
         stack_size: (total_stack + 15) & !15, // 16-byte aligned
         used_regs: alloc.used_regs.clone(),
+        callee_saved: alloc.callee_saved.clone(),
     };
 
     // Prologue with adjusted stack
     emit_prologue(code, &adjusted_alloc);
 
-    // Store incoming parameters to their alloca slots
-    // Convention: first N allocas correspond to N parameters
-    let num_params = func.params.len();
-    let alloca_list: Vec<(ValueId, i32)> = {
-        let mut list = Vec::new();
-        for block in &func.blocks {
-            for instr in &block.instructions {
-                if instr.op == OpCode::Alloc {
-                    if let Some(&off) = alloca_slots.get(&instr.result) {
-                        list.push((instr.result, off));
-                    }
-                }
-            }
-        }
-        list
-    };
-    // First `num_params` allocas get parameter values from x0, x1, ...
-    for (i, (_vid, slot_off)) in alloca_list.iter().take(num_params).enumerate() {
-        let simm9 = (*slot_off as u32) & 0x1FF;
-        emit32(code, 0xf8000000 | (simm9 << 12) | ((FP as u32) << 5) | (i as u32));
-    }
+    // Parameter stores are now emitted explicitly in IR via Load(Param(i)) + Store.
+    // P2 mem2reg promotes same-block Store→Load to Copy, eliminating stack round-trips.
+    // Unpromoted params are stored via the IR Store instruction in emit_instruction.
 
     let const_pins: HashMap<i64, u8> = HashMap::new(); // disabled for now
 
@@ -193,6 +176,23 @@ fn emit_prologue(code: &mut Vec<u8>, alloc: &FuncAlloc) {
     emit32(code, 0xa9bf7bfd);
     // mov x29, sp
     emit32(code, 0x910003fd);
+
+    // Save callee-saved registers (x19-x28) in pairs via stp
+    let cs = &alloc.callee_saved;
+    let mut i = 0;
+    while i + 1 < cs.len() {
+        let rt = cs[i].0 as u32;
+        let rt2 = cs[i + 1].0 as u32;
+        // stp Xt1, Xt2, [sp, #-16]!
+        emit32(code, 0xa9bf0000 | (rt2 << 10) | ((SP as u32) << 5) | rt);
+        i += 2;
+    }
+    if i < cs.len() {
+        let rt = cs[i].0 as u32;
+        // str Xrt, [sp, #-16]!
+        emit32(code, 0xf81f0fe0 | rt);
+    }
+
     if alloc.stack_size > 0 {
         let imm = (alloc.stack_size as u32) & 0xFFF;
         emit32(code, 0xd10003ff | (imm << 10));
@@ -204,6 +204,24 @@ fn emit_epilogue(code: &mut Vec<u8>, alloc: &FuncAlloc) {
         let imm = (alloc.stack_size as u32) & 0xFFF;
         emit32(code, 0x910003ff | (imm << 10));
     }
+
+    // Restore callee-saved registers in reverse order
+    let cs = &alloc.callee_saved;
+    let n = cs.len();
+    let mut i = if n % 2 == 1 { n - 1 } else { n };
+    if n % 2 == 1 {
+        let rt = cs[n - 1].0 as u32;
+        // ldr Xrt, [sp], #16
+        emit32(code, 0xf8410fe0 | rt);
+    }
+    while i >= 2 {
+        i -= 2;
+        let rt = cs[i].0 as u32;
+        let rt2 = cs[i + 1].0 as u32;
+        // ldp Xt1, Xt2, [sp], #16
+        emit32(code, 0xa8c10000 | (rt2 << 10) | ((SP as u32) << 5) | rt);
+    }
+
     // ldp x29, x30, [sp], #16
     emit32(code, 0xa8c17bfd);
     // ret
@@ -282,6 +300,13 @@ fn emit_instruction(
         // ── Memory ──
         OpCode::Load => {
             match instr.operands.first() {
+                Some(Operand::Param(i)) => {
+                    // Materialize incoming argument register xi → dst
+                    let src = *i as u8;
+                    if dst != src {
+                        emit32(code, encode_mov(dst, src));
+                    }
+                }
                 Some(Operand::ImmI64(n)) => emit_mov_imm(code, dst, *n),
                 Some(Operand::ImmF64(f)) => emit_mov_imm(code, dst, f.to_bits() as i64),
                 Some(Operand::ImmBool(b)) => emit_mov_imm(code, dst, if *b { 1 } else { 0 }),

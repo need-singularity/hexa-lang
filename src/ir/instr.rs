@@ -100,6 +100,9 @@ pub enum Operand {
     SwitchCase(i64, BlockId),
     /// Comparison kind tag — attached to Sub instructions that represent comparisons.
     Cmp(CmpKind),
+    /// Incoming function parameter (index into param list).
+    /// Used by Load to materialize the value of the i-th argument register.
+    Param(usize),
 }
 
 /// A basic block — sequence of instructions ending with a terminator.

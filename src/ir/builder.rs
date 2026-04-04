@@ -198,6 +198,13 @@ impl<'a> IrBuilder<'a> {
         self.emit(OpCode::OwnershipTransfer, vec![Operand::Value(val)], ty)
     }
 
+    // ── Convenience: Parameter ──
+
+    /// Materialize the i-th incoming function argument as an SSA value.
+    pub fn load_param(&mut self, index: usize, ty: IrType) -> ValueId {
+        self.emit(OpCode::Load, vec![Operand::Param(index)], ty)
+    }
+
     // ── Convenience: Constants ──
 
     pub fn const_i64(&mut self, val: i64) -> ValueId {

@@ -113,6 +113,14 @@ fn emit_instruction(
 
         OpCode::Load => {
             match instr.operands.first() {
+                Some(Operand::Param(i)) => {
+                    // x86-64 SysV: rdi, rsi, rdx, rcx, r8, r9
+                    let param_regs: [u8; 6] = [7, 6, 2, 1, 8, 9];
+                    let src = if *i < 6 { param_regs[*i] } else { 0 };
+                    if dst != src {
+                        code.extend_from_slice(&[0x48, 0x89, 0xC0 | (src << 3) | dst]);
+                    }
+                }
                 Some(Operand::ImmI64(n)) => {
                     emit_mov_imm64(code, dst, *n);
                 }
