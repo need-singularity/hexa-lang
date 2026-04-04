@@ -17,8 +17,12 @@ pub fn lower_expr(ctx: &mut LowerCtx, builder: &mut IrBuilder, expr: &Expr) -> V
         Expr::CharLit(c) => builder.const_i64(*c as i64),
 
         Expr::Ident(name) => {
-            if let Some((val, _ty)) = ctx.lookup_var(name) {
-                val
+            if let Some((ptr, ty)) = ctx.lookup_var(name) {
+                if let IrType::Ptr(inner) = ty {
+                    builder.load(ptr, *inner)
+                } else {
+                    ptr
+                }
             } else {
                 builder.const_i64(0)
             }

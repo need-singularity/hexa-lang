@@ -54,26 +54,32 @@ pub fn lower_stmt_val(ctx: &mut LowerCtx, builder: &mut IrBuilder, stmt: &Stmt) 
     match stmt {
         Stmt::Let(name, typ, init, _vis) => {
             let ty = ctx.resolve_type_opt(typ);
+            // Allocate stack slot for mutable variable
+            let ptr = builder.alloc(ty.clone());
             let val = match init {
                 Some(e) => lower_expr(ctx, builder, e),
                 None => builder.const_i64(0),
             };
-            ctx.define_var(name, val, ty);
+            builder.store(ptr, val);
+            ctx.define_var(name, ptr, IrType::Ptr(Box::new(ty)));
             val
         }
 
         Stmt::Const(name, typ, init, _vis) | Stmt::Static(name, typ, init, _vis) => {
             let ty = ctx.resolve_type_opt(typ);
+            let ptr = builder.alloc(ty.clone());
             let val = lower_expr(ctx, builder, init);
-            ctx.define_var(name, val, ty);
+            builder.store(ptr, val);
+            ctx.define_var(name, ptr, IrType::Ptr(Box::new(ty)));
             val
         }
 
         Stmt::Assign(lhs, rhs) => {
             let val = lower_expr(ctx, builder, rhs);
             if let Expr::Ident(name) = lhs {
-                let ty = builder.func.value_types.get(&val).cloned().unwrap_or(IrType::I64);
-                ctx.define_var(name, val, ty);
+                if let Some((ptr, _)) = ctx.lookup_var(name) {
+                    builder.store(ptr, val);
+                }
             } else if let Expr::Field(obj, field) = lhs {
                 let obj_val = lower_expr(ctx, builder, obj);
                 let idx = super::expr::resolve_field_idx_pub(ctx, obj, field);

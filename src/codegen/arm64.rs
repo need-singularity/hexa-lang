@@ -16,17 +16,28 @@ const TMP1: u8 = 16; // x16 scratch
 const TMP2: u8 = 17; // x17 scratch
 
 /// Emit ARM64 machine code for the entire module.
-/// Returns (code, function_offsets) — offsets keyed by function name.
 pub fn emit(module: &IrModule, alloc: &AllocResult) -> Vec<u8> {
     let mut code = Vec::new();
     let mut func_offsets: HashMap<String, usize> = HashMap::new();
-    let mut call_fixups: Vec<(usize, String)> = Vec::new(); // (offset_in_code, target_func_name)
+    let mut call_fixups: Vec<(usize, String)> = Vec::new();
 
-    // Emit all functions
-    for func in &module.functions {
+    // Build FuncId → name map
+    let id_to_name: HashMap<u32, String> = module.functions.iter()
+        .map(|f| (f.id.0, f.name.clone()))
+        .collect();
+
+    // Emit all functions (main last for entry point)
+    let mut funcs_ordered: Vec<&IrFunction> = module.functions.iter()
+        .filter(|f| f.name != "main")
+        .collect();
+    if let Some(main_fn) = module.functions.iter().find(|f| f.name == "main") {
+        funcs_ordered.push(main_fn);
+    }
+
+    for func in &funcs_ordered {
         if let Some(func_alloc) = alloc.func_allocs.get(&func.name) {
             func_offsets.insert(func.name.clone(), code.len());
-            emit_function(&mut code, func, func_alloc, &mut call_fixups);
+            emit_function(&mut code, func, func_alloc, &mut call_fixups, &id_to_name);
         }
     }
 
@@ -46,11 +57,32 @@ fn emit_function(
     func: &IrFunction,
     alloc: &FuncAlloc,
     call_fixups: &mut Vec<(usize, String)>,
+    id_to_name: &HashMap<u32, String>,
 ) {
     let func_start = code.len();
 
-    // Prologue
-    emit_prologue(code, alloc);
+    // Pre-scan: count Alloc instructions to assign stack slots for local variables
+    let mut alloca_slots: HashMap<ValueId, i32> = HashMap::new();
+    let mut next_slot_offset: i32 = -(alloc.stack_size + 16); // below saved FP/LR
+    for block in &func.blocks {
+        for instr in &block.instructions {
+            if instr.op == OpCode::Alloc {
+                next_slot_offset -= 8; // each alloca gets 8 bytes
+                alloca_slots.insert(instr.result, next_slot_offset);
+            }
+        }
+    }
+
+    // Adjust stack size to include alloca slots
+    let total_stack = alloc.stack_size + (alloca_slots.len() as i32) * 8;
+    let adjusted_alloc = FuncAlloc {
+        locations: alloc.locations.clone(),
+        stack_size: (total_stack + 15) & !15, // 16-byte aligned
+        used_regs: alloc.used_regs.clone(),
+    };
+
+    // Prologue with adjusted stack
+    emit_prologue(code, &adjusted_alloc);
 
     // Label tracking for intra-function branches
     let mut block_offsets: HashMap<crate::ir::BlockId, usize> = HashMap::new();
@@ -60,7 +92,7 @@ fn emit_function(
         block_offsets.insert(block.id, code.len());
 
         for instr in &block.instructions {
-            emit_instruction(code, instr, alloc, &mut branch_fixups, call_fixups);
+            emit_instruction(code, instr, alloc, &mut branch_fixups, call_fixups, id_to_name, &alloca_slots);
         }
     }
 
@@ -72,9 +104,7 @@ fn emit_function(
         }
     }
 
-    // Epilogue (only if last block doesn't have explicit return)
-    // Always emit — Return instruction will jump here
-    emit_epilogue(code, alloc);
+    emit_epilogue(code, &adjusted_alloc);
 }
 
 fn emit_prologue(code: &mut Vec<u8>, alloc: &FuncAlloc) {
@@ -106,6 +136,8 @@ fn emit_instruction(
     alloc: &FuncAlloc,
     branch_fixups: &mut Vec<(usize, crate::ir::BlockId)>,
     call_fixups: &mut Vec<(usize, String)>,
+    id_to_name: &HashMap<u32, String>,
+    alloca_slots: &HashMap<ValueId, i32>,
 ) {
     let dst = reg_for(instr.result, alloc);
 
@@ -183,29 +215,28 @@ fn emit_instruction(
                 Some(Operand::ImmF64(f)) => emit_mov_imm(code, dst, f.to_bits() as i64),
                 Some(Operand::ImmBool(b)) => emit_mov_imm(code, dst, if *b { 1 } else { 0 }),
                 Some(Operand::Value(ptr)) => {
-                    let base = reg_for(*ptr, alloc);
-                    // ldr Xd, [Xn]
-                    emit32(code, 0xf9400000 | ((base as u32) << 5) | (dst as u32));
+                    // Check if ptr is an alloca — use FP-relative load
+                    if let Some(&slot_off) = alloca_slots.get(ptr) {
+                        let abs_off = slot_off.unsigned_abs();
+                        // ldur Xd, [x29, #-offset] (negative offset from FP)
+                        let simm9 = (slot_off as u32) & 0x1FF;
+                        emit32(code, 0xf8400000 | (simm9 << 12) | ((FP as u32) << 5) | (dst as u32));
+                    } else {
+                        let base = reg_for(*ptr, alloc);
+                        emit32(code, 0xf9400000 | ((base as u32) << 5) | (dst as u32));
+                    }
                 }
-                Some(Operand::StringRef(_idx)) => {
-                    // String literal — emit pointer to data section (placeholder)
-                    emit_mov_imm(code, dst, 0);
-                }
+                Some(Operand::StringRef(_)) => emit_mov_imm(code, dst, 0),
                 _ => emit_mov_imm(code, dst, 0),
             }
-            // Handle field index access: Load(obj, field_idx) or Load(arr, idx)
+            // Field index access (struct fields, arrays)
             if instr.operands.len() >= 2 {
                 if let Some(Operand::FieldIdx(idx)) = instr.operands.get(1) {
                     let base = one_reg(&instr.operands, alloc);
                     let offset = (*idx as i64) * 8;
-                    // ldr Xd, [Xbase, #offset]
                     if offset < 32760 && offset % 8 == 0 {
                         let imm12 = (offset / 8) as u32;
                         emit32(code, 0xf9400000 | (imm12 << 10) | ((base as u32) << 5) | (dst as u32));
-                    } else {
-                        emit_mov_imm(code, TMP2, offset);
-                        // ldr Xd, [Xbase, x17]
-                        emit32(code, 0xf8600000 | ((TMP2 as u32) << 16) | (0x6 << 13) | ((base as u32) << 5) | (dst as u32));
                     }
                 }
             }
@@ -213,44 +244,35 @@ fn emit_instruction(
         OpCode::Store => {
             let ops = &instr.operands;
             if ops.len() >= 2 {
-                let base = val_reg(&ops[0], alloc);
-                let src = val_reg(&ops[1], alloc);
-                if ops.len() >= 3 {
-                    if let Operand::FieldIdx(idx) = &ops[1] {
-                        // struct field store: Store(obj, field_idx, val)
-                        let val = val_reg(&ops[2], alloc);
-                        let offset = (*idx as i64) * 8;
-                        if offset < 32760 && offset % 8 == 0 {
-                            let imm12 = (offset / 8) as u32;
-                            emit32(code, 0xf9000000 | (imm12 << 10) | ((base as u32) << 5) | (val as u32));
-                        }
+                let ptr_op = &ops[0];
+                let val_r = val_reg(&ops[1], alloc);
+
+                // Check if storing to an alloca slot
+                if let Operand::Value(ptr_id) = ptr_op {
+                    if let Some(&slot_off) = alloca_slots.get(ptr_id) {
+                        // stur Xval, [x29, #-offset]
+                        let simm9 = (slot_off as u32) & 0x1FF;
+                        emit32(code, 0xf8000000 | (simm9 << 12) | ((FP as u32) << 5) | (val_r as u32));
                     } else {
-                        // array store: Store(arr, idx, val) — idx is a Value
-                        let idx_reg = val_reg(&ops[1], alloc);
-                        let val_r = val_reg(&ops[2], alloc);
-                        // str Xval, [Xarr, Xidx, lsl #3]
-                        emit32(code, 0xf8200000 | ((idx_reg as u32) << 16) | (0x7 << 13) | ((base as u32) << 5) | (val_r as u32));
+                        let base = reg_for(*ptr_id, alloc);
+                        emit32(code, 0xf9000000 | ((base as u32) << 5) | (val_r as u32));
                     }
-                } else {
-                    // simple store: str Xsrc, [Xbase]
-                    emit32(code, 0xf9000000 | ((base as u32) << 5) | (src as u32));
                 }
             }
         }
         OpCode::Alloc => {
-            let size = instr.ty.size_bytes().max(8);
-            // Use frame pointer relative allocation for small structs
-            // For now use mmap syscall
-            emit_mov_imm(code, 0, 0);
-            emit_mov_imm(code, 1, size as i64);
-            emit_mov_imm(code, 2, 3);        // PROT_READ|PROT_WRITE
-            emit_mov_imm(code, 3, 0x1002);   // MAP_ANON|MAP_PRIVATE
-            emit_mov_imm(code, 4, -1);
-            emit_mov_imm(code, 5, 0);
-            emit_mov_imm(code, TMP1, 197);   // SYS_mmap
-            emit32(code, 0xd4000001);        // svc #0
-            if dst != 0 {
-                emit32(code, encode_mov(dst, 0));
+            // Stack-frame alloca: compute address as FP + offset (negative)
+            if let Some(&slot_off) = alloca_slots.get(&instr.result) {
+                let abs_off = slot_off.unsigned_abs();
+                // sub Xdst, x29, #abs_off
+                if abs_off < 4096 {
+                    emit32(code, 0xd1000000 | ((abs_off as u32) << 10) | ((FP as u32) << 5) | (dst as u32));
+                } else {
+                    emit_mov_imm(code, TMP2, abs_off as i64);
+                    emit32(code, encode_rrr(0xcb000000, dst, FP, TMP2));
+                }
+            } else {
+                emit_mov_imm(code, dst, 0);
             }
         }
         OpCode::Free => {
@@ -298,9 +320,8 @@ fn emit_instruction(
                 if i == 0 {
                     // First operand is function reference
                     if let Operand::Func(fid) = op {
-                        // Find function name by ID
-                        // We don't have module here, so use func_id as offset hint
-                        target_func_name = Some(format!("__func_{}", fid.0));
+                        target_func_name = Some(id_to_name.get(&fid.0).cloned()
+                            .unwrap_or_else(|| format!("__func_{}", fid.0)));
                     }
                     continue;
                 }

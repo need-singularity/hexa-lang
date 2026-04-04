@@ -164,6 +164,18 @@ fn main() {
                 }
                 run_file_hexa_ir(&args[2]);
             }
+            #[cfg(not(target_arch = "wasm32"))]
+            "--dump-ir" => {
+                if args.len() < 3 {
+                    eprintln!("Usage: hexa --dump-ir <file.hexa>");
+                    std::process::exit(1);
+                }
+                let source = std::fs::read_to_string(&args[2]).unwrap();
+                let tokens = lexer::Lexer::new(&source).tokenize().unwrap();
+                let stmts = parser::Parser::new(tokens).parse().unwrap();
+                let module = lower::lower_program(&stmts, &args[2]);
+                println!("{}", ir::print_module(&module));
+            }
             "--lsp" => lsp::run_lsp(),
             "debug" => {
                 if args.len() < 3 {
