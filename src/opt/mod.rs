@@ -93,6 +93,67 @@ impl PipelineResult {
     }
 }
 
+use crate::opt::ir_stats::{capture, PassMetric};
+use crate::opt::pass_policy::Policy;
+
+pub struct EsoPipelineResult {
+    pub pipeline: PipelineResult,
+    pub metrics: Vec<PassMetric>,
+}
+
+fn passes_by_name() -> Vec<(&'static str, Box<dyn Pass>)> {
+    vec![
+        ("type_infer", Box::new(p01_type_infer::TypeInferPass)),
+        ("ownership_proof", Box::new(p02_ownership::OwnershipProofPass)),
+        ("dead_store", Box::new(p03_dead_store::DeadStoreElimPass)),
+        ("const_fold", Box::new(p04_const_fold::ConstFoldPass)),
+        ("inlining", Box::new(p05_inlining::InliningPass)),
+        ("licm", Box::new(p06_licm::LicmPass)),
+        ("cse", Box::new(p07_cse::CsePass)),
+        ("strength_reduction", Box::new(p08_strength::StrengthReductionPass)),
+        ("code_sinking", Box::new(p09_sinking::CodeSinkingPass)),
+        ("coalesce", Box::new(p10_coalesce::CoalescePass)),
+        ("final_dce", Box::new(p11_final_dce::FinalDcePass)),
+        ("verify", Box::new(p12_verify::VerifyPass)),
+    ]
+}
+
+pub fn run_pipeline_with_policy(
+    module: &mut IrModule,
+    policy: Policy,
+    last_metrics: &[PassMetric],
+) -> EsoPipelineResult {
+    let order = crate::opt::pass_policy::next_order(policy, 0, last_metrics);
+    let registry = passes_by_name();
+
+    let mut results = Vec::new();
+    let mut metrics = Vec::new();
+
+    for name in &order {
+        let entry = registry.iter().find(|(n, _)| *n == name.as_str());
+        if let Some((_, pass)) = entry {
+            let before = capture(module);
+            let start = std::time::Instant::now();
+            let result = pass.run(module);
+            let elapsed_ns = start.elapsed().as_nanos();
+            let after = capture(module);
+            let result_name = pass.name().to_string();
+            metrics.push(PassMetric {
+                pass_name: name.clone(),
+                before,
+                after,
+                elapsed_ns,
+            });
+            results.push((result_name, result));
+        }
+    }
+
+    EsoPipelineResult {
+        pipeline: PipelineResult { pass_results: results },
+        metrics,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,5 +174,26 @@ mod tests {
         assert_eq!(names[3], "const_fold");
         assert_eq!(names[7], "strength_reduction");
         assert_eq!(names[11], "verify");
+    }
+
+    #[test]
+    fn test_run_pipeline_with_policy_fixed_matches_default() {
+        use crate::opt::pass_policy::Policy;
+        let mut m1 = IrModule::new("t");
+        let mut m2 = IrModule::new("t");
+        let r1 = run_pipeline(&mut m1);
+        let r2 = run_pipeline_with_policy(&mut m2, Policy::Fixed, &[]);
+        let names1: Vec<&str> = r1.pass_results.iter().map(|(n,_)| n.as_str()).collect();
+        let names2: Vec<&str> = r2.pipeline.pass_results.iter().map(|(n,_)| n.as_str()).collect();
+        assert_eq!(names1, names2);
+    }
+
+    #[test]
+    fn test_run_pipeline_with_policy_returns_metrics() {
+        use crate::opt::pass_policy::Policy;
+        let mut m = IrModule::new("t");
+        let r = run_pipeline_with_policy(&mut m, Policy::Fixed, &[]);
+        assert_eq!(r.metrics.len(), 12);
+        assert!(r.metrics.iter().all(|pm| !pm.pass_name.is_empty()));
     }
 }
