@@ -16,6 +16,7 @@ mod p09_sinking;
 mod p10_coalesce;
 mod p11_final_dce;
 mod p12_verify;
+pub mod ir_stats;
 
 use crate::ir::IrModule;
 
