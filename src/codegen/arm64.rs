@@ -342,13 +342,33 @@ fn emit_instruction(
             }
         }
         OpCode::Call => {
+            // Save all caller-saved registers that are in use (x0-x15)
+            // Push used regs in pairs to maintain 16-byte alignment
+            let save_regs: Vec<u8> = alloc.used_regs.iter()
+                .filter(|r| r.0 < 16) // only caller-saved x0-x15
+                .map(|r| r.0)
+                .collect();
+            let save_count = save_regs.len();
+            let save_pairs = (save_count + 1) / 2;
+            if save_pairs > 0 {
+                // sub sp, sp, #(save_pairs * 16)
+                let sp_adj = (save_pairs * 16) as u32;
+                emit32(code, 0xd10003ff | (sp_adj << 10));
+                for (i, &r) in save_regs.iter().enumerate() {
+                    let offset = (i * 8) as u32;
+                    // str Xr, [sp, #offset]
+                    if offset % 8 == 0 && offset / 8 < 4096 {
+                        emit32(code, 0xf9000000 | ((offset / 8) << 10) | ((31u32) << 5) | (r as u32));
+                    }
+                }
+            }
+
             // Move args to x0, x1, ...
             let mut arg_idx = 0u8;
             let mut target_func_name: Option<String> = None;
 
             for (i, op) in instr.operands.iter().enumerate() {
                 if i == 0 {
-                    // First operand is function reference
                     if let Operand::Func(fid) = op {
                         target_func_name = Some(id_to_name.get(&fid.0).cloned()
                             .unwrap_or_else(|| format!("__func_{}", fid.0)));
@@ -364,16 +384,29 @@ fn emit_instruction(
                 }
             }
 
-            // bl <target> — will be patched
+            // bl <target>
             if let Some(name) = target_func_name {
                 call_fixups.push((code.len(), name));
             }
-            emit32(code, 0x94000000); // bl <offset>
+            emit32(code, 0x94000000);
 
-            // Move result from x0 to dst
-            if dst != 0 {
-                emit32(code, encode_mov(dst, 0));
+            // Always save return value (x0) to x17 before restoring
+            emit32(code, encode_mov(TMP2, 0)); // x17 = return value
+
+            // Restore caller-saved registers
+            if save_pairs > 0 {
+                for (i, &r) in save_regs.iter().enumerate() {
+                    let offset = (i * 8) as u32;
+                    if offset % 8 == 0 && offset / 8 < 4096 {
+                        emit32(code, 0xf9400000 | ((offset / 8) << 10) | ((31u32) << 5) | (r as u32));
+                    }
+                }
+                let sp_adj = (save_pairs * 16) as u32;
+                emit32(code, 0x910003ff | (sp_adj << 10));
             }
+
+            // Move return value from x17 to dst
+            emit32(code, encode_mov(dst, TMP2));
         }
         OpCode::Return => {
             if let Some(Operand::Value(v)) = instr.operands.first() {
