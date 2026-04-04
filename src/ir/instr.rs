@@ -163,6 +163,11 @@ impl IrFunction {
         }
     }
 
+    /// Get the next available ValueId number (without allocating).
+    pub fn next_value_id(&self) -> u32 {
+        self.next_value
+    }
+
     /// Allocate a fresh ValueId.
     pub fn fresh_value(&mut self, ty: IrType) -> ValueId {
         let id = ValueId(self.next_value);

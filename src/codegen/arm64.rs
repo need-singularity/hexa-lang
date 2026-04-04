@@ -118,42 +118,11 @@ fn emit_function(
     let mut block_offsets: HashMap<crate::ir::BlockId, usize> = HashMap::new();
     let mut branch_fixups: Vec<(usize, crate::ir::BlockId)> = Vec::new();
 
-    // Track last known register values for peephole optimization
-    let mut reg_known: HashMap<u8, i64> = HashMap::new(); // reg -> known const value
-
     for block in &func.blocks {
         block_offsets.insert(block.id, code.len());
-        // Invalidate known values at block entry (control flow merge)
-        if block.preds.len() > 1 || block.id != func.blocks[0].id {
-            reg_known.clear();
-        }
 
         for instr in &block.instructions {
-            let dst = reg_for(instr.result, &adjusted_alloc);
-
-            // Peephole: skip redundant const loads
-            if instr.op == OpCode::Load {
-                if let Some(Operand::ImmI64(n)) = instr.operands.first() {
-                    if reg_known.get(&dst) == Some(n) {
-                        continue; // Already has this value
-                    }
-                }
-            }
-
             emit_instruction(code, instr, &adjusted_alloc, &mut branch_fixups, call_fixups, id_to_name, &alloca_slots);
-
-            // Track what we put in dst
-            if instr.op == OpCode::Load {
-                if let Some(Operand::ImmI64(n)) = instr.operands.first() {
-                    reg_known.insert(dst, *n);
-                } else {
-                    reg_known.remove(&dst);
-                }
-            } else if instr.op == OpCode::Call {
-                reg_known.clear(); // Call clobbers everything
-            } else {
-                reg_known.remove(&dst); // Non-const result
-            }
         }
     }
 
@@ -343,13 +312,40 @@ fn emit_instruction(
             if let (Some(Operand::Value(cond)), Some(Operand::Block(then_bb)), Some(Operand::Block(else_bb))) =
                 (instr.operands.get(0), instr.operands.get(1), instr.operands.get(2))
             {
-                let cr = reg_for(*cond, alloc);
-                // cbnz Xcr, then_bb
-                branch_fixups.push((code.len(), *then_bb));
-                emit32(code, 0xb5000000 | (cr as u32));
-                // b else_bb
-                branch_fixups.push((code.len(), *else_bb));
-                emit32(code, 0x14000000);
+                // Peephole: if cond was produced by cmp (last emitted instruction),
+                // fuse into b.<cond> instead of cbnz.
+                // Check if the previous instruction is a cmp (Sub with CmpKind).
+                let fused = if code.len() >= 8 {
+                    // Previous 2 instructions: cmp + cset
+                    // cset is 4 bytes, cmp before it is 4 bytes
+                    let cset_word = u32::from_le_bytes([
+                        code[code.len()-4], code[code.len()-3],
+                        code[code.len()-2], code[code.len()-1],
+                    ]);
+                    // cset pattern: 0x9A9F07E0 | (inv_cond << 12) | rd
+                    if (cset_word & 0xFFFFF000) & 0x9A9F0000 == 0x9A9F0000 {
+                        // Extract the condition from cset
+                        let inv_cond = (cset_word >> 12) & 0xF;
+                        let cond_code = inv_cond ^ 1; // un-invert
+                        // Remove cset (we'll use b.<cond> directly)
+                        code.truncate(code.len() - 4);
+                        // b.<cond> then_bb
+                        branch_fixups.push((code.len(), *then_bb));
+                        emit32(code, 0x54000000 | cond_code); // b.<cond>
+                        // b else_bb
+                        branch_fixups.push((code.len(), *else_bb));
+                        emit32(code, 0x14000000);
+                        true
+                    } else { false }
+                } else { false };
+
+                if !fused {
+                    let cr = reg_for(*cond, alloc);
+                    branch_fixups.push((code.len(), *then_bb));
+                    emit32(code, 0xb5000000 | (cr as u32)); // cbnz
+                    branch_fixups.push((code.len(), *else_bb));
+                    emit32(code, 0x14000000); // b
+                }
             }
         }
         OpCode::Call => {
