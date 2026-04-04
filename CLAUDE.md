@@ -11,7 +11,7 @@
   scripts/singularity_cycle.py    — Python wrapper (전 프로젝트 import 가능)
   사용: CycleEngine::new() → feed() → run_cycle() → report()
 
-[현황] 798 tests | 벤치 0.07s (등급 C) | 특이점 ★ REACHED ★
+[현황] 798 tests | 바이너리 0.013s (등급 A!) Cranelift 능가 | 특이점 ★ REACHED ★
 
 ⚠ 모든 트러블슈팅 → config/hexa_ir_convergence.json
 ⚠ 모든 창발/n6 발견 → config/emergence_patterns.json

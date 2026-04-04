@@ -781,11 +781,11 @@ fn run_file_hexa_ir(path: &str) {
                     }
                 }
             }
-            let _ = std::fs::remove_file(&output_bin);
+            // let _ = std::fs::remove_file(&output_bin); // keep for benchmarking
         }
         Err(e) => {
             eprintln!("[hexa-ir] Failed to run binary: {}", e);
-            let _ = std::fs::remove_file(&output_bin);
+            // let _ = std::fs::remove_file(&output_bin); // keep for benchmarking
             std::process::exit(1);
         }
     }

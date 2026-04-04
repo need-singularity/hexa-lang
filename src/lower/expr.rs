@@ -52,7 +52,7 @@ pub fn lower_expr(ctx: &mut LowerCtx, builder: &mut IrBuilder, expr: &Expr) -> V
                 .map(|a| lower_expr(ctx, builder, a))
                 .collect();
 
-            match callee.as_ref() {
+            let call_result = match callee.as_ref() {
                 Expr::Ident(name) => {
                     if let Some(&fid) = ctx.func_map.get(name.as_str()) {
                         builder.call(fid, arg_vals, IrType::I64)
@@ -65,7 +65,8 @@ pub fn lower_expr(ctx: &mut LowerCtx, builder: &mut IrBuilder, expr: &Expr) -> V
                     let callee_val = lower_expr(ctx, builder, callee);
                     builder.call_indirect(callee_val, arg_vals, IrType::I64)
                 }
-            }
+            };
+            call_result
         }
 
         Expr::If(cond, then_body, else_body) => {
@@ -222,8 +223,20 @@ pub fn lower_expr(ctx: &mut LowerCtx, builder: &mut IrBuilder, expr: &Expr) -> V
 }
 
 fn lower_binary(ctx: &mut LowerCtx, builder: &mut IrBuilder, lhs: &Expr, op: &BinOp, rhs: &Expr) -> ValueId {
-    let l = lower_expr(ctx, builder, lhs);
-    let r = lower_expr(ctx, builder, rhs);
+    // If rhs contains a Call, evaluate rhs first and spill to alloca,
+    // then evaluate lhs. This prevents register clobber from bl.
+    let (l, r) = if contains_call(rhs) {
+        let rv = lower_expr(ctx, builder, rhs);
+        let tmp = builder.alloc(IrType::I64);
+        builder.store(tmp, rv);
+        let lv = lower_expr(ctx, builder, lhs);
+        let rv_reloaded = builder.load(tmp, IrType::I64);
+        (lv, rv_reloaded)
+    } else {
+        let lv = lower_expr(ctx, builder, lhs);
+        let rv = lower_expr(ctx, builder, rhs);
+        (lv, rv)
+    };
 
     match op {
         BinOp::Add => builder.add(l, r, IrType::I64),
@@ -289,6 +302,17 @@ fn lower_if_expr(
 
     builder.switch_to(merge_bb);
     builder.phi(vec![(then_exit, then_val), (else_exit, else_val)], IrType::I64)
+}
+
+/// Check if an expression contains a function call (which clobbers registers).
+fn contains_call(expr: &Expr) -> bool {
+    match expr {
+        Expr::Call(_, _) => true,
+        Expr::Binary(l, _, r) => contains_call(l) || contains_call(r),
+        Expr::Unary(_, e) => contains_call(e),
+        Expr::If(c, _, _) => contains_call(c),
+        _ => false,
+    }
 }
 
 fn resolve_field_idx_inner(ctx: &LowerCtx, field_name: &str) -> u32 {
