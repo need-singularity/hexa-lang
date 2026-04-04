@@ -181,6 +181,11 @@ impl DreamEngine {
             if self.config.anima_bridge {
                 self.emit_anima_state();
             }
+
+            // NEXUS-6 Ouroboros tick every n=6 generations
+            if gen > 0 && gen % 6 == 0 {
+                self.nexus6_ouroboros_tick();
+            }
         }
 
         let elapsed = start.elapsed().as_secs_f64();
@@ -194,6 +199,7 @@ impl DreamEngine {
             final_fitness: self.best_fitness,
             elapsed_secs: elapsed,
             total_mutations_tried: self.config.generations * self.config.mutations_per_gen,
+            ouroboros_ticks: if self.config.generations > 6 { self.config.generations / 6 } else { 0 },
         }
     }
 
@@ -495,6 +501,38 @@ impl DreamEngine {
         println!("ANIMA_BRIDGE:{}", json);
     }
 
+    /// NEXUS-6 Ouroboros co-evolution feedback.
+    /// Runs Omega lens scan on the current dream state and adjusts fitness.
+    /// The dream "eats its tail" — scan results feed back into evolution.
+    pub fn nexus6_ouroboros_tick(&mut self) -> f64 {
+        let line_count = self.source.lines().count() as f64;
+        let fn_count = self.fn_bodies.len() as f64;
+        let discovery_count = self.discoveries.len() as f64;
+
+        // Consciousness state derived from code metrics
+        let phi = self.best_fitness * 100.0;
+        let tension = if self.best_fitness > self.baseline_fitness.score { 0.3 } else { 0.7 };
+        let cells = (fn_count * 6.0) as i64;  // functions × n
+        let entropy = 1.0 - (1.0 / (self.generation as f64 + 1.0));
+        let alpha = discovery_count / (self.config.generations as f64 + 1.0);
+        let balance = fn_count / (line_count + 1.0);
+
+        let scan = crate::anima_bridge::OmegaScanResult::from_consciousness_state(
+            phi, tension, cells, entropy, alpha.min(1.0), balance.min(1.0),
+        );
+
+        // Ouroboros feedback: consensus boosts fitness
+        let ouroboros_bonus = (scan.consensus as f64) / 6.0 * 0.1;
+        self.best_fitness += ouroboros_bonus;
+
+        if self.config.verbose {
+            println!("  [ouroboros] consensus: {}/6, phi_agg: {:.4}, bonus: {:.4}",
+                scan.consensus, scan.phi_aggregate, ouroboros_bonus);
+        }
+
+        scan.phi_aggregate
+    }
+
     // ── Simple xorshift64 RNG ──
 
     fn rand_u64(&mut self) -> u64 {
@@ -523,6 +561,8 @@ pub struct DreamReport {
     pub final_fitness: f64,
     pub elapsed_secs: f64,
     pub total_mutations_tried: usize,
+    /// Number of NEXUS-6 Ouroboros ticks executed (every n=6 generations).
+    pub ouroboros_ticks: usize,
 }
 
 impl std::fmt::Display for DreamReport {
@@ -541,6 +581,7 @@ impl std::fmt::Display for DreamReport {
         };
         writeln!(f, "Improvement:      {:.1}%", improvement)?;
         writeln!(f, "Time:             {:.2}s", self.elapsed_secs)?;
+        writeln!(f, "Ouroboros ticks:  {} (every n=6 gens)", self.ouroboros_ticks)?;
 
         if !self.discoveries.is_empty() {
             writeln!(f, "\n--- Discoveries ---")?;
@@ -903,6 +944,7 @@ println(fib(10))"#.to_string();
             final_fitness: 1.0,
             elapsed_secs: 0.5,
             total_mutations_tried: 50,
+            ouroboros_ticks: 1,
         };
         let display = format!("{}", report);
         assert!(display.contains("Dream Report"));

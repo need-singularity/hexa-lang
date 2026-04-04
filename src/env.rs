@@ -265,6 +265,13 @@ impl Env {
         env.define("mem_region", Value::BuiltinFn("mem_region".into()));
         env.define("arena_reset", Value::BuiltinFn("arena_reset".into()));
         env.define("mem_budget", Value::BuiltinFn("mem_budget".into()));
+        // NEXUS-6 integration builtins (std::nexus6) — n=6 discovery engine
+        env.define("nexus6_scan", Value::BuiltinFn("nexus6_scan".into()));
+        env.define("nexus6_verify", Value::BuiltinFn("nexus6_verify".into()));
+        env.define("nexus6_omega", Value::BuiltinFn("nexus6_omega".into()));
+        env.define("nexus6_lenses", Value::BuiltinFn("nexus6_lenses".into()));
+        env.define("nexus6_consensus", Value::BuiltinFn("nexus6_consensus".into()));
+        env.define("nexus6_n6_check", Value::BuiltinFn("nexus6_n6_check".into()));
         env
 
     }

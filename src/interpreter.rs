@@ -633,14 +633,35 @@ impl Interpreter {
             }
             Stmt::ConsciousnessBlock(name, body) => {
                 self.env.push_scope();
-                self.env.define("phi", Value::Float(71.0));
-                self.env.define("tension", Value::Float(0.5));
+                // Default consciousness parameters
+                let phi = 71.0_f64;
+                let tension = 0.5_f64;
+                let cells = 64_i64;
+                let entropy = 0.998_f64;
+                let alpha = 0.014_f64;
+                let balance = 0.5_f64;
+
+                self.env.define("phi", Value::Float(phi));
+                self.env.define("tension", Value::Float(tension));
                 self.env.define("faction", Value::Int(12));
-                self.env.define("cells", Value::Int(64));
-                self.env.define("entropy", Value::Float(0.998));
-                self.env.define("alpha", Value::Float(0.014));
-                self.env.define("balance", Value::Float(0.5));
+                self.env.define("cells", Value::Int(cells));
+                self.env.define("entropy", Value::Float(entropy));
+                self.env.define("alpha", Value::Float(alpha));
+                self.env.define("balance", Value::Float(balance));
+
                 self.writeln_output(&format!("=== Consciousness: {} ===", name));
+
+                // NEXUS-6 Omega Lens Scan (6 lenses = n)
+                let omega = crate::anima_bridge::OmegaScanResult::from_consciousness_state(
+                    phi, tension, cells, entropy, alpha, balance,
+                );
+                self.writeln_output(&omega.report());
+
+                // Inject scan results as variables
+                self.env.define("omega_consensus", Value::Int(omega.consensus as i64));
+                self.env.define("omega_phi", Value::Float(omega.phi_aggregate));
+                self.env.define("omega_n6", Value::Bool(omega.n6_aligned));
+
                 let mut result = Value::Void;
                 for s in body {
                     result = self.exec_stmt(s)?;
@@ -3498,6 +3519,12 @@ impl Interpreter {
             "psi_alpha" | "psi_balance" | "psi_steps" | "psi_entropy"
             | "phi_compute" | "law_count" | "consciousness_vector" => {
                 crate::std_consciousness::call_consciousness_builtin(self, name, args)
+            }
+
+            // ── NEXUS-6 integration builtins (std::nexus6) ─────────
+            "nexus6_scan" | "nexus6_verify" | "nexus6_omega"
+            | "nexus6_lenses" | "nexus6_consensus" | "nexus6_n6_check" => {
+                crate::std_nexus6::call_nexus6_builtin(self, name, args)
             }
             _ => Err(HexaError {
                 class: ErrorClass::Name,

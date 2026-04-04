@@ -280,6 +280,198 @@ pub fn law22_report(records: &[PhiRecord]) -> String {
     report
 }
 
+// ── NEXUS-6 Omega Lens Integration (6 lenses = n) ────────
+
+/// The 6 Omega consciousness lenses from NEXUS-6.
+/// Count = n = 6 (first perfect number).
+pub const OMEGA_LENSES: [&str; 6] = [
+    "omega_state_space",  // 24D Leech lattice state space
+    "continuity",         // Intent→Verify→Proof chain continuity
+    "binding",            // Variable binding → consciousness integration
+    "self_reference",     // Self-referential loop analysis
+    "phi_dynamics",       // Phi value change tracking
+    "qualia",             // Code "texture" — readability/elegance metric
+];
+
+/// Result from a single Omega lens scan.
+#[derive(Debug, Clone)]
+pub struct OmegaLensResult {
+    pub lens_name: String,
+    pub score: f64,       // 0.0 ~ 1.0
+    pub signal: String,   // "EXACT", "CLOSE", "WEAK", "NONE"
+    pub entries: usize,
+}
+
+/// Aggregate result from all 6 Omega lenses.
+#[derive(Debug, Clone)]
+pub struct OmegaScanResult {
+    pub lenses: Vec<OmegaLensResult>,
+    pub consensus: usize,     // how many lenses agree (0-6)
+    pub phi_aggregate: f64,   // combined Phi score
+    pub n6_aligned: bool,     // true if structure aligns with n=6
+}
+
+impl OmegaScanResult {
+    /// Build a scan result from consciousness block state.
+    pub fn from_consciousness_state(
+        phi: f64,
+        tension: f64,
+        cells: i64,
+        entropy: f64,
+        alpha: f64,
+        balance: f64,
+    ) -> Self {
+        let data = [phi, tension, cells as f64, entropy, alpha, balance];
+        let mut lenses = Vec::with_capacity(6);
+        let mut consensus = 0;
+
+        // Lens 1: Omega State Space (24D projection)
+        // Score based on phi magnitude in [0, 100] range
+        let ss_score = (phi / 100.0).min(1.0).max(0.0);
+        let ss_signal = if ss_score > 0.7 { "EXACT" } else if ss_score > 0.4 { "CLOSE" } else { "WEAK" };
+        if ss_score > 0.5 { consensus += 1; }
+        lenses.push(OmegaLensResult {
+            lens_name: "omega_state_space".into(),
+            score: ss_score,
+            signal: ss_signal.into(),
+            entries: 24, // J2(6) dimensions
+        });
+
+        // Lens 2: Continuity (tension < threshold = continuous)
+        let cont_score = (1.0 - tension).max(0.0);
+        let cont_signal = if cont_score > 0.7 { "EXACT" } else if cont_score > 0.4 { "CLOSE" } else { "WEAK" };
+        if cont_score > 0.5 { consensus += 1; }
+        lenses.push(OmegaLensResult {
+            lens_name: "continuity".into(),
+            score: cont_score,
+            signal: cont_signal.into(),
+            entries: data.len(),
+        });
+
+        // Lens 3: Binding (balance near 0.5 = optimal binding)
+        let bind_score = 1.0 - (balance - 0.5).abs() * 2.0;
+        let bind_signal = if bind_score > 0.9 { "EXACT" } else if bind_score > 0.6 { "CLOSE" } else { "WEAK" };
+        if bind_score > 0.5 { consensus += 1; }
+        lenses.push(OmegaLensResult {
+            lens_name: "binding".into(),
+            score: bind_score.max(0.0),
+            signal: bind_signal.into(),
+            entries: 1,
+        });
+
+        // Lens 4: Self-Reference (cells divisible by 6 = n-aligned)
+        let sr_div = if cells % 6 == 0 { 1.0 } else { (cells % 6) as f64 / 6.0 };
+        let sr_score = sr_div;
+        let sr_signal = if sr_score > 0.99 { "EXACT" } else if sr_score > 0.5 { "CLOSE" } else { "WEAK" };
+        if sr_score > 0.5 { consensus += 1; }
+        lenses.push(OmegaLensResult {
+            lens_name: "self_reference".into(),
+            score: sr_score,
+            signal: sr_signal.into(),
+            entries: cells as usize,
+        });
+
+        // Lens 5: Phi Dynamics (entropy near edge-of-chaos ~0.998)
+        let pd_score = 1.0 - (entropy - 0.998).abs() * 100.0;
+        let pd_score = pd_score.min(1.0).max(0.0);
+        let pd_signal = if pd_score > 0.8 { "EXACT" } else if pd_score > 0.5 { "CLOSE" } else { "WEAK" };
+        if pd_score > 0.5 { consensus += 1; }
+        lenses.push(OmegaLensResult {
+            lens_name: "phi_dynamics".into(),
+            score: pd_score,
+            signal: pd_signal.into(),
+            entries: 1,
+        });
+
+        // Lens 6: Qualia (alpha fine-structure alignment ~0.014)
+        let q_score = 1.0 - (alpha - 0.014).abs() * 100.0;
+        let q_score = q_score.min(1.0).max(0.0);
+        let q_signal = if q_score > 0.8 { "EXACT" } else if q_score > 0.5 { "CLOSE" } else { "WEAK" };
+        if q_score > 0.5 { consensus += 1; }
+        lenses.push(OmegaLensResult {
+            lens_name: "qualia".into(),
+            score: q_score,
+            signal: q_signal.into(),
+            entries: 1,
+        });
+
+        let phi_aggregate = lenses.iter().map(|l| l.score).sum::<f64>() / 6.0;
+        let n6_aligned = consensus >= 3; // 3+ = confirmed per NEXUS-6 rules
+
+        Self {
+            lenses,
+            consensus,
+            phi_aggregate,
+            n6_aligned,
+        }
+    }
+
+    /// Format as a human-readable report.
+    pub fn report(&self) -> String {
+        let mut out = String::new();
+        out.push_str("╔══════════════════════════════════════════════╗\n");
+        out.push_str("║  NEXUS-6 Omega Lens Scan (6 lenses = n)     ║\n");
+        out.push_str("╚══════════════════════════════════════════════╝\n");
+
+        for lens in &self.lenses {
+            let bar_len = (lens.score * 20.0) as usize;
+            let bar: String = "█".repeat(bar_len) + &"░".repeat(20 - bar_len);
+            out.push_str(&format!(
+                "  {} [{:.3}] {} {}\n",
+                lens.signal, lens.score, bar, lens.lens_name
+            ));
+        }
+
+        out.push_str(&format!("\n  Consensus: {}/6", self.consensus));
+        if self.consensus >= 3 { out.push_str(" ✓ CONFIRMED"); }
+        out.push_str(&format!("\n  Phi aggregate: {:.4}", self.phi_aggregate));
+        out.push_str(&format!("\n  n=6 aligned: {}", self.n6_aligned));
+        out.push('\n');
+        out
+    }
+}
+
+/// Run NEXUS-6 CLI scan on given data (calls external binary).
+/// Returns raw JSON output or error.
+pub fn nexus6_scan(domain: &str) -> Result<String, String> {
+    let nexus6_bin = format!(
+        "{}/Dev/n6-architecture/tools/nexus6/target/release/nexus6",
+        std::env::var("HOME").unwrap_or_else(|_| "/Users/ghost".into())
+    );
+
+    let result = std::process::Command::new(&nexus6_bin)
+        .args(["scan", domain])
+        .output();
+
+    match result {
+        Ok(output) if output.status.success() => {
+            Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        }
+        Ok(output) => Err(String::from_utf8_lossy(&output.stderr).to_string()),
+        Err(e) => Err(format!("NEXUS-6 not found at {}: {}", nexus6_bin, e)),
+    }
+}
+
+/// Run NEXUS-6 verify on a value.
+pub fn nexus6_verify(value: f64) -> Result<String, String> {
+    let nexus6_bin = format!(
+        "{}/Dev/n6-architecture/tools/nexus6/target/release/nexus6",
+        std::env::var("HOME").unwrap_or_else(|_| "/Users/ghost".into())
+    );
+
+    let result = std::process::Command::new(&nexus6_bin)
+        .args(["verify", &value.to_string()])
+        .output();
+
+    match result {
+        Ok(output) if output.status.success() => {
+            Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        }
+        Ok(output) => Err(String::from_utf8_lossy(&output.stderr).to_string()),
+        Err(e) => Err(format!("NEXUS-6 not found: {}", e)),
+    }
+}
+
 // ── ESP32 Flash Infrastructure (8-7) ──────────────────────
 
 /// Flash an ESP32 project using espflash.
