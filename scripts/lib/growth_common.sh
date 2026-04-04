@@ -1,1 +1,1 @@
-../../../n6-architecture/scripts/lib/growth_common.sh
+/Users/ghost/Dev/nexus6/scripts/lib/growth_common.sh

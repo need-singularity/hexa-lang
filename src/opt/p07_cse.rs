@@ -35,6 +35,14 @@ impl Pass for CsePass {
                         continue;
                     }
 
+                    // Skip memory loads from pointers — they depend on stores
+                    // and must not be deduplicated across blocks
+                    if instr.op == OpCode::Load {
+                        if instr.operands.iter().any(|op| matches!(op, Operand::Value(_))) {
+                            continue;
+                        }
+                    }
+
                     let key = ExprKey {
                         op: instr.op,
                         operands: canonicalize_operands(instr.op, &instr.operands),

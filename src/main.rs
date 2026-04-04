@@ -761,18 +761,24 @@ fn run_file_hexa_ir(path: &str) {
         }
     }
 
-    // 7. Run the binary and print output
-    let status = std::process::Command::new(&output_bin)
-        .status();
-    match status {
-        Ok(s) => {
-            // On macOS/Unix, the exit code of main() is the process exit code
-            if let Some(code) = s.code() {
-                if code != 0 {
-                    println!("{}", code);
+    // 7. Run the binary and capture output
+    let output = std::process::Command::new(&output_bin)
+        .output();
+    match output {
+        Ok(o) => {
+            // Print stdout
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            if !stdout.is_empty() {
+                print!("{}", stdout);
+            }
+            // If no stdout but non-zero exit, print exit code as result
+            if stdout.trim().is_empty() {
+                if let Some(code) = o.status.code() {
+                    if code != 0 {
+                        println!("{}", code);
+                    }
                 }
             }
-            // Clean up
             let _ = std::fs::remove_file(&output_bin);
         }
         Err(e) => {

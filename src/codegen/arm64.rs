@@ -84,6 +84,29 @@ fn emit_function(
     // Prologue with adjusted stack
     emit_prologue(code, &adjusted_alloc);
 
+    // Store incoming parameters to their alloca slots
+    // Convention: first N allocas correspond to N parameters
+    let num_params = func.params.len();
+    let alloca_list: Vec<(ValueId, i32)> = {
+        let mut list = Vec::new();
+        for block in &func.blocks {
+            for instr in &block.instructions {
+                if instr.op == OpCode::Alloc {
+                    if let Some(&off) = alloca_slots.get(&instr.result) {
+                        list.push((instr.result, off));
+                    }
+                }
+            }
+        }
+        list
+    };
+    // First `num_params` allocas get parameter values from x0, x1, ...
+    for (i, (_vid, slot_off)) in alloca_list.iter().take(num_params).enumerate() {
+        let simm9 = (*slot_off as u32) & 0x1FF;
+        // stur x_i, [x29, #slot_off]
+        emit32(code, 0xf8000000 | (simm9 << 12) | ((FP as u32) << 5) | (i as u32));
+    }
+
     // Label tracking for intra-function branches
     let mut block_offsets: HashMap<crate::ir::BlockId, usize> = HashMap::new();
     let mut branch_fixups: Vec<(usize, crate::ir::BlockId)> = Vec::new();

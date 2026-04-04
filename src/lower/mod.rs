@@ -141,9 +141,12 @@ pub fn lower_program(stmts: &[ast::Stmt], module_name: &str) -> IrModule {
             let mut builder = IrBuilder::new(func);
 
             ctx.push_scope();
-            for (i, (pname, pty)) in params.iter().enumerate() {
-                let val = ir::ValueId(i as u32);
-                ctx.define_var(pname, val, pty.clone());
+            // Bind parameters: alloca only (no store — codegen handles arg→alloca)
+            // Convention: first N allocas in entry block = parameter slots
+            for (_i, (pname, pty)) in params.iter().enumerate() {
+                let ptr = builder.alloc(pty.clone());
+                // No store here — codegen's prologue stores x0,x1,... to these slots
+                ctx.define_var(pname, ptr, IrType::Ptr(Box::new(pty.clone())));
             }
             let mut last = builder.const_i64(0);
             for s in &decl.body {

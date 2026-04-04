@@ -34,8 +34,8 @@ pub fn wrap(code: Vec<u8>, module: &IrModule) -> Vec<u8> {
 
     let code_size = code.len();
 
-    // Symbol: _main
-    let symbol_name = b"_main\0";
+    // Symbol: _hexa_main (C wrapper provides _main)
+    let symbol_name = b"_hexa_main\0";
 
     // Layout calculation:
     // Mach-O header: 32 bytes

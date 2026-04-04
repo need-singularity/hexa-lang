@@ -79,13 +79,21 @@ pub fn compile_to_binary(module: &IrModule, output_path: &str) -> Result<(), Str
     let (target, format) = host_target();
     let result = generate(module, target, format);
 
-    // Write object file
+    // Write object file (hexa_main symbol)
     let obj_path = format!("{}.o", output_path);
     std::fs::write(&obj_path, &result.code)
         .map_err(|e| format!("failed to write object file: {}", e))?;
 
+    // Write C wrapper that calls hexa_main and prints result
+    let wrapper_path = format!("{}_wrapper.c", output_path);
+    std::fs::write(&wrapper_path,
+        "#include <stdio.h>\nextern long hexa_main(void);\nint main(void) { printf(\"%ld\\n\", hexa_main()); return 0; }\n"
+    ).map_err(|e| format!("failed to write wrapper: {}", e))?;
+
     // Link with system linker
     let status = std::process::Command::new("cc")
+        .arg("-O2")
+        .arg(&wrapper_path)
         .arg(&obj_path)
         .arg("-o")
         .arg(output_path)
@@ -93,8 +101,8 @@ pub fn compile_to_binary(module: &IrModule, output_path: &str) -> Result<(), Str
         .status()
         .map_err(|e| format!("linker failed: {}", e))?;
 
-    // Keep object file for debugging
-    // let _ = std::fs::remove_file(&obj_path);
+    let _ = std::fs::remove_file(&wrapper_path);
+    // Keep .o for debugging: let _ = std::fs::remove_file(&obj_path);
 
     if status.success() {
         Ok(())
