@@ -122,7 +122,7 @@ fn emit_function(
         block_offsets.insert(block.id, code.len());
 
         for instr in &block.instructions {
-            emit_instruction(code, instr, alloc, &mut branch_fixups, call_fixups, id_to_name, &alloca_slots);
+            emit_instruction(code, instr, &adjusted_alloc, &mut branch_fixups, call_fixups, id_to_name, &alloca_slots);
         }
     }
 
@@ -382,8 +382,8 @@ fn emit_instruction(
                     emit32(code, encode_mov(0, src));
                 }
             }
-            // Jump to epilogue — for now, just emit epilogue inline
-            // (simpler than calculating offset to function end)
+            // Inline epilogue at every return point
+            emit_epilogue(code, alloc);
         }
         OpCode::Phi => {
             // Phi resolved during SSA destruction or lowering — no codegen
