@@ -18,6 +18,7 @@ mod p11_final_dce;
 mod p12_verify;
 pub mod ir_stats;
 pub mod eso_bridge;
+pub mod pass_policy;
 
 use crate::ir::IrModule;
 
