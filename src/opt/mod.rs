@@ -121,9 +121,10 @@ fn passes_by_name() -> Vec<(&'static str, Box<dyn Pass>)> {
 pub fn run_pipeline_with_policy(
     module: &mut IrModule,
     policy: Policy,
+    round: usize,
     last_metrics: &[PassMetric],
 ) -> EsoPipelineResult {
-    let order = crate::opt::pass_policy::next_order(policy, 0, last_metrics);
+    let order = crate::opt::pass_policy::next_order(policy, round, last_metrics);
     let registry = passes_by_name();
 
     let mut results = Vec::new();
@@ -182,7 +183,7 @@ mod tests {
         let mut m1 = IrModule::new("t");
         let mut m2 = IrModule::new("t");
         let r1 = run_pipeline(&mut m1);
-        let r2 = run_pipeline_with_policy(&mut m2, Policy::Fixed, &[]);
+        let r2 = run_pipeline_with_policy(&mut m2, Policy::Fixed, 0, &[]);
         let names1: Vec<&str> = r1.pass_results.iter().map(|(n,_)| n.as_str()).collect();
         let names2: Vec<&str> = r2.pipeline.pass_results.iter().map(|(n,_)| n.as_str()).collect();
         assert_eq!(names1, names2);
@@ -192,7 +193,7 @@ mod tests {
     fn test_run_pipeline_with_policy_returns_metrics() {
         use crate::opt::pass_policy::Policy;
         let mut m = IrModule::new("t");
-        let r = run_pipeline_with_policy(&mut m, Policy::Fixed, &[]);
+        let r = run_pipeline_with_policy(&mut m, Policy::Fixed, 0, &[]);
         assert_eq!(r.metrics.len(), 12);
         assert!(r.metrics.iter().all(|pm| !pm.pass_name.is_empty()));
     }
@@ -203,8 +204,8 @@ mod tests {
         let mut module = IrModule::new("converge");
         let mut last_metrics: Vec<crate::opt::ir_stats::PassMetric> = Vec::new();
         let mut result = None;
-        for _round in 0..10 {
-            let r = run_pipeline_with_policy(&mut module, Policy::Hybrid, &last_metrics);
+        for round in 0..10 {
+            let r = run_pipeline_with_policy(&mut module, Policy::Hybrid, round, &last_metrics);
             last_metrics = r.metrics.clone();
             result = Some(r);
         }
@@ -214,22 +215,61 @@ mod tests {
 
     #[test]
     fn test_eso_adaptive_reorders_after_metrics() {
-        use crate::opt::pass_policy::Policy;
-        let mut module = IrModule::new("adaptive");
-        // Round 0: Fixed policy to get baseline metrics
-        let r0 = run_pipeline_with_policy(&mut module, Policy::Fixed, &[]);
-        let baseline_metrics = r0.metrics;
-        assert_eq!(baseline_metrics.len(), 12);
-        // Round 1: Adaptive policy using baseline metrics
-        let r1 = run_pipeline_with_policy(&mut module, Policy::Adaptive, &baseline_metrics);
-        assert_eq!(r1.metrics.len(), 12, "adaptive round should still produce 12 metrics");
+        use crate::opt::pass_policy::{Policy, FIXED_ORDER};
+        use crate::opt::ir_stats::{PassMetric, Stats};
+
+        // Build synthetic metrics with known deltas so adaptive reorders predictably.
+        // Give "cse" a large reduction and "const_fold" a small one — adaptive should
+        // move "cse" before "const_fold" (opposite of fixed order).
+        let synthetic: Vec<PassMetric> = FIXED_ORDER.iter().map(|&name| {
+            let delta: i64 = match name {
+                "cse"        => -50,  // high impact → should move earlier
+                "const_fold" => -1,   // low impact  → should move later
+                "verify"     =>  0,   // must stay last
+                _            => -5,
+            };
+            let before = 100usize;
+            let after = (before as i64 + delta).max(0) as usize;
+            PassMetric {
+                pass_name: name.into(),
+                before: Stats { instr_count: before, block_count: 1, func_count: 1 },
+                after:  Stats { instr_count: after,  block_count: 1, func_count: 1 },
+                elapsed_ns: 100,
+            }
+        }).collect();
+
+        // Fixed order
+        let mut m1 = IrModule::new("fixed");
+        let r_fixed = run_pipeline_with_policy(&mut m1, Policy::Fixed, 0, &synthetic);
+        let fixed_names: Vec<&str> = r_fixed.pipeline.pass_results.iter().map(|(n,_)| n.as_str()).collect();
+
+        // Adaptive order using synthetic metrics
+        let mut m2 = IrModule::new("adaptive");
+        let r_adaptive = run_pipeline_with_policy(&mut m2, Policy::Adaptive, 1, &synthetic);
+        let adaptive_names: Vec<&str> = r_adaptive.pipeline.pass_results.iter().map(|(n,_)| n.as_str()).collect();
+
+        // Both should have 12 passes
+        assert_eq!(fixed_names.len(), 12);
+        assert_eq!(adaptive_names.len(), 12);
+
+        // Adaptive must differ from fixed (cse should move ahead of const_fold)
+        assert_ne!(fixed_names, adaptive_names, "adaptive should reorder passes vs fixed");
+
+        // Verify always stays last in both
+        assert_eq!(fixed_names.last().unwrap(), &"verify");
+        assert_eq!(adaptive_names.last().unwrap(), &"verify");
+
+        // In adaptive order, cse (high impact) should appear before const_fold (low impact)
+        let cse_pos = adaptive_names.iter().position(|n| *n == "cse").unwrap();
+        let cf_pos  = adaptive_names.iter().position(|n| *n == "const_fold").unwrap();
+        assert!(cse_pos < cf_pos, "adaptive should place high-impact cse before const_fold");
     }
 
     #[test]
     fn test_eso_metrics_have_valid_pass_names() {
         use crate::opt::pass_policy::{Policy, FIXED_ORDER};
         let mut module = IrModule::new("names");
-        let r = run_pipeline_with_policy(&mut module, Policy::Fixed, &[]);
+        let r = run_pipeline_with_policy(&mut module, Policy::Fixed, 0, &[]);
         assert_eq!(r.metrics.len(), 12);
         for pm in &r.metrics {
             assert!(!pm.pass_name.is_empty(), "pass_name must not be empty");

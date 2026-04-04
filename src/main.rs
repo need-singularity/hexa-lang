@@ -725,7 +725,7 @@ fn run_eso_tune(args: &[String]) {
     let file = &args[2];
 
     // Parse optional --rounds N and --policy adaptive|hybrid
-    let mut rounds: usize = 10;
+    let mut rounds: usize = 12; // σ=12 (n=6 design constant)
     let mut policy = opt::pass_policy::Policy::Hybrid;
     let mut i = 3;
     while i < args.len() {
@@ -734,9 +734,16 @@ fn run_eso_tune(args: &[String]) {
                 i += 1;
                 if i < args.len() {
                     rounds = args[i].parse().unwrap_or_else(|_| {
-                        eprintln!("[eso-tune] invalid --rounds value, using default 10");
-                        10
+                        eprintln!("[eso-tune] invalid --rounds value, using default 12");
+                        12
                     });
+                    if rounds == 0 {
+                        eprintln!("[eso-tune] --rounds must be >= 1");
+                        std::process::exit(1);
+                    }
+                } else {
+                    eprintln!("[eso-tune] --rounds requires a value");
+                    std::process::exit(1);
                 }
             }
             "--policy" => {
@@ -751,9 +758,14 @@ fn run_eso_tune(args: &[String]) {
                             opt::pass_policy::Policy::Hybrid
                         }
                     };
+                } else {
+                    eprintln!("[eso-tune] --policy requires a value");
+                    std::process::exit(1);
                 }
             }
-            _ => {}
+            other => {
+                eprintln!("[eso-tune] warning: unknown flag '{}', ignoring", other);
+            }
         }
         i += 1;
     }
@@ -795,7 +807,7 @@ fn run_eso_tune(args: &[String]) {
         // Re-lower from AST each round to get a fresh module
         let mut module = lower::lower_program(&stmts, file);
 
-        let eso_result = opt::run_pipeline_with_policy(&mut module, policy, &last_metrics);
+        let eso_result = opt::run_pipeline_with_policy(&mut module, policy, round, &last_metrics);
         let metrics = &eso_result.metrics;
 
         // Compute total changes (instruction deltas) and elapsed time
@@ -895,7 +907,7 @@ fn run_file_hexa_ir(path: &str) {
         "hybrid" => opt::pass_policy::Policy::Hybrid,
         _ => opt::pass_policy::Policy::Fixed,
     };
-    let eso_result = opt::run_pipeline_with_policy(&mut module, policy, &[]);
+    let eso_result = opt::run_pipeline_with_policy(&mut module, policy, 0, &[]);
     let opt_result = eso_result.pipeline;
     eprintln!("[hexa-ir] {}", opt_result.summary().trim());
     if !eso_mode.is_empty() && eso_mode != "fixed" {
