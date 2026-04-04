@@ -115,7 +115,24 @@ fn emit_function(
 
     let const_pins: HashMap<i64, u8> = HashMap::new(); // disabled for now
 
-    // Label tracking for intra-function branches
+    // Collect phi moves: for each block that has successors with phi nodes,
+    // insert mov instructions before the terminator.
+    // phi_moves[block_id] = vec![(phi_dst_reg, src_reg)]
+    let mut phi_moves: HashMap<crate::ir::BlockId, Vec<(u8, u8)>> = HashMap::new();
+    for block in &func.blocks {
+        for instr in &block.instructions {
+            if instr.op == OpCode::Phi {
+                let phi_dst = reg_for(instr.result, &adjusted_alloc);
+                for op in &instr.operands {
+                    if let Operand::PhiEntry(pred_block, val) = op {
+                        let src = reg_for(*val, &adjusted_alloc);
+                        phi_moves.entry(*pred_block).or_default().push((phi_dst, src));
+                    }
+                }
+            }
+        }
+    }
+
     let mut block_offsets: HashMap<crate::ir::BlockId, usize> = HashMap::new();
     let mut branch_fixups: Vec<(usize, crate::ir::BlockId)> = Vec::new();
 
@@ -123,6 +140,39 @@ fn emit_function(
         block_offsets.insert(block.id, code.len());
 
         for instr in &block.instructions {
+            // Insert phi moves before unconditional Jump using parallel copy protocol
+            if instr.op == OpCode::Jump {
+                if let Some(moves) = phi_moves.get(&block.id) {
+                    // Parallel copy: first save all src values to temps, then assign
+                    // This prevents clobbering when dst of one move = src of another
+                    let need_temp = moves.iter().any(|&(dst, _)| {
+                        moves.iter().any(|&(_, src)| src == dst)
+                    });
+
+                    if need_temp && !moves.is_empty() {
+                        // Save all src values to stack
+                        let n = moves.len();
+                        let scratch = ((n * 8 + 15) & !15) as u32;
+                        emit32(code, 0xd10003ff | (scratch << 10)); // sub sp, sp, #scratch
+                        for (i, &(_, src)) in moves.iter().enumerate() {
+                            let off = (i * 8) as u32;
+                            emit32(code, 0xf9000000 | ((off / 8) << 10) | (31u32 << 5) | (src as u32));
+                        }
+                        // Load from stack to dst
+                        for (i, &(dst, _)) in moves.iter().enumerate() {
+                            let off = (i * 8) as u32;
+                            emit32(code, 0xf9400000 | ((off / 8) << 10) | (31u32 << 5) | (dst as u32));
+                        }
+                        emit32(code, 0x910003ff | (scratch << 10)); // add sp, sp, #scratch
+                    } else {
+                        for &(phi_dst, src) in moves {
+                            if phi_dst != src {
+                                emit32(code, encode_mov(phi_dst, src));
+                            }
+                        }
+                    }
+                }
+            }
             emit_instruction(code, instr, &adjusted_alloc, &mut branch_fixups, call_fixups, id_to_name, &alloca_slots);
         }
     }
@@ -416,14 +466,8 @@ fn emit_instruction(
             emit_epilogue(code, alloc);
         }
         OpCode::Phi => {
-            // Phi resolved during SSA destruction or lowering — no codegen
-            // If phi still exists, treat as copy from first operand
-            if let Some(Operand::PhiEntry(_, v)) = instr.operands.first() {
-                let src = reg_for(*v, alloc);
-                if dst != src {
-                    emit32(code, encode_mov(dst, src));
-                }
-            }
+            // Phi is handled by inserting moves in predecessors (see phi_moves below).
+            // NOP at the phi instruction itself.
         }
         OpCode::Switch => {
             if let Some(Operand::Value(v)) = instr.operands.first() {

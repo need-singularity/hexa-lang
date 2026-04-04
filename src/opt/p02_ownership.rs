@@ -104,7 +104,9 @@ fn promote_allocas(func: &mut IrFunction) -> usize {
         }
     }
 
-    // Phase 2: Cross-block phi insertion for loops
+    // Phase 2: Cross-block phi — disabled, needs parallel copy debugging
+    // See TS-017 in config/hexa_ir_convergence.json
+    return promoted;
     // Detect back-edges: B→H where H dominates B (heuristic: H.id < B.id)
     let mut back_edges: Vec<(BlockId, BlockId)> = Vec::new(); // (body_end, header)
     for block in &func.blocks {
@@ -116,6 +118,11 @@ fn promote_allocas(func: &mut IrFunction) -> usize {
     }
 
     for (body_end_id, header_id) in &back_edges {
+        // Skip loops containing function calls — phi+call interaction is complex
+        let has_call = func.blocks.iter()
+            .filter(|b| b.id.0 >= header_id.0 && b.id.0 <= body_end_id.0)
+            .any(|b| b.instructions.iter().any(|i| i.op == OpCode::Call));
+        if has_call { continue; }
         // For each promotable alloca, check if:
         // 1. There's a Store to it in some block that jumps to header (preheader or body)
         // 2. There's a Load from it in header or body
@@ -131,6 +138,21 @@ fn promote_allocas(func: &mut IrFunction) -> usize {
         let preheader_id = preheader_id.unwrap();
 
         for &alloca_id in &promotable {
+            // Only insert phi for allocas that are:
+            // 1. Stored BEFORE the loop (in preheader) — has an init value
+            // 2. Loaded in the header block — used in loop condition or body
+            // 3. NOT defined (alloc) inside the loop body — those are loop-local
+            let alloc_in_loop = func.blocks.iter()
+                .filter(|b| b.id.0 > header_id.0 && b.id.0 <= body_end_id.0)
+                .any(|b| b.instructions.iter().any(|i| i.op == OpCode::Alloc && i.result == alloca_id));
+            if alloc_in_loop { continue; }
+
+            let loaded_in_header_or_body = func.blocks.iter()
+                .filter(|b| b.id.0 >= header_id.0 && b.id.0 <= body_end_id.0)
+                .any(|b| b.instructions.iter().any(|i| {
+                    i.op == OpCode::Load && matches!(i.operands.first(), Some(Operand::Value(v)) if *v == alloca_id)
+                }));
+            if !loaded_in_header_or_body { continue; }
             // Find last store value in preheader path (entry→...→preheader)
             let init_val = find_last_store_in_block(func, preheader_id, alloca_id);
             // Find last store value in body_end
