@@ -1,9 +1,14 @@
 //! P2: mem2reg — promote alloca variables to SSA registers with phi insertion.
 //!
-//! Phase 1: Same-block store→load forwarding (simple)
-//! Phase 2: Cross-block phi insertion for while loops
-//!   Pattern: entry stores init → loop header loads → body stores update → back-edge
-//!   Transform: insert Phi(init_from_entry, update_from_body) at loop header
+//! Phase ordering (critical for correctness):
+//!   Phase 2 runs FIRST: Cross-block phi insertion for while loops
+//!     Pattern: entry stores init → loop header loads → body stores update → back-edge
+//!     Transform: insert Phi(init_from_entry, update_from_body) at loop header
+//!   Phase 1 runs SECOND: Same-block store→load forwarding (simple)
+//!
+//! Phase 2 must precede Phase 1 because same-block forwarding destroys the
+//! Load/Store pattern that phi placement analysis depends on, causing phi
+//! nodes to be missed and forcing extra optimizer iterations.
 
 use std::collections::{HashMap, HashSet};
 use crate::ir::{IrModule, IrFunction, OpCode, Operand, ValueId, IrType, BlockId};
@@ -72,41 +77,11 @@ fn promote_allocas(func: &mut IrFunction) -> usize {
 
     func.rebuild_cfg();
 
-    // Phase 1: Same-block forwarding
-    for block in &mut func.blocks {
-        let mut last_stored: HashMap<ValueId, ValueId> = HashMap::new();
-        let mut replacements: Vec<(usize, ValueId)> = Vec::new();
+    // Phase 2 must run BEFORE Phase 1: cross-block phi insertion needs to
+    // see the original Load/Store pattern before same-block forwarding
+    // rewrites loads. Running Phase 1 first would destroy the cross-block
+    // dataflow information that Phase 2 relies on for phi placement.
 
-        for (idx, instr) in block.instructions.iter().enumerate() {
-            if instr.op == OpCode::Store {
-                if let (Some(Operand::Value(ptr)), Some(Operand::Value(val))) =
-                    (instr.operands.get(0), instr.operands.get(1))
-                {
-                    if promotable.contains(ptr) { last_stored.insert(*ptr, *val); }
-                }
-            }
-            if instr.op == OpCode::Load {
-                if let Some(Operand::Value(ptr)) = instr.operands.first() {
-                    if promotable.contains(ptr) {
-                        if let Some(&val) = last_stored.get(ptr) {
-                            replacements.push((idx, val));
-                        }
-                    }
-                }
-            }
-            if instr.op == OpCode::Call { last_stored.clear(); }
-        }
-
-        for (idx, val) in replacements {
-            block.instructions[idx].op = OpCode::Copy;
-            block.instructions[idx].operands = vec![Operand::Value(val)];
-            promoted += 1;
-        }
-    }
-
-    // Phase 2: Cross-block phi — disabled, needs parallel copy debugging
-    // See TS-017 in config/hexa_ir_convergence.json
-    return promoted;
     // Detect back-edges: B→H where H dominates B (heuristic: H.id < B.id)
     let mut back_edges: Vec<(BlockId, BlockId)> = Vec::new(); // (body_end, header)
     for block in &func.blocks {
@@ -241,6 +216,44 @@ fn promote_allocas(func: &mut IrFunction) -> usize {
                     }
                 }
             }
+        }
+    }
+
+    // Rebuild CFG after Phase 2 modifications before running Phase 1
+    if promoted > 0 {
+        func.rebuild_cfg();
+    }
+
+    // Phase 1: Same-block forwarding (runs after Phase 2 so phi nodes are
+    // already placed and cross-block dataflow is captured)
+    for block in &mut func.blocks {
+        let mut last_stored: HashMap<ValueId, ValueId> = HashMap::new();
+        let mut replacements: Vec<(usize, ValueId)> = Vec::new();
+
+        for (idx, instr) in block.instructions.iter().enumerate() {
+            if instr.op == OpCode::Store {
+                if let (Some(Operand::Value(ptr)), Some(Operand::Value(val))) =
+                    (instr.operands.get(0), instr.operands.get(1))
+                {
+                    if promotable.contains(ptr) { last_stored.insert(*ptr, *val); }
+                }
+            }
+            if instr.op == OpCode::Load {
+                if let Some(Operand::Value(ptr)) = instr.operands.first() {
+                    if promotable.contains(ptr) {
+                        if let Some(&val) = last_stored.get(ptr) {
+                            replacements.push((idx, val));
+                        }
+                    }
+                }
+            }
+            if instr.op == OpCode::Call { last_stored.clear(); }
+        }
+
+        for (idx, val) in replacements {
+            block.instructions[idx].op = OpCode::Copy;
+            block.instructions[idx].operands = vec![Operand::Value(val)];
+            promoted += 1;
         }
     }
 
