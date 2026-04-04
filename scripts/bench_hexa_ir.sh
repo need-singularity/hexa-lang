@@ -158,6 +158,73 @@ else
 fi
 echo ""
 
+# =============================================
+# ESO (Emergent Self-Optimization) Benchmark
+# =============================================
+# Runs --eso-tune for each policy (fixed, adaptive, hybrid)
+# Captures: wall time, converge round, final ED
+
+ESO_ROUNDS=10
+eso_fixed_time="N/A"; eso_fixed_conv="N/A"; eso_fixed_ed="N/A"
+eso_adaptive_time="N/A"; eso_adaptive_conv="N/A"; eso_adaptive_ed="N/A"
+eso_hybrid_time="N/A"; eso_hybrid_conv="N/A"; eso_hybrid_ed="N/A"
+
+echo "==================================================="
+echo "  ESO Benchmark (${ESO_ROUNDS}-round tune per policy)"
+echo "==================================================="
+echo ""
+
+run_eso_bench() {
+    local policy="$1"
+    local out_file="$TMP_DIR/eso_${policy}.txt"
+
+    if [ ! -x "$PROJECT_DIR/hexa" ]; then
+        echo "N/A N/A N/A"
+        return
+    fi
+
+    local start end elapsed
+    start=$(python3 -c 'import time; print(time.time())')
+    "$PROJECT_DIR/hexa" --eso-tune "$BENCH_HEXA" --rounds "$ESO_ROUNDS" --policy "$policy" \
+        2>"$out_file" >/dev/null || true
+    end=$(python3 -c 'import time; print(time.time())')
+    elapsed=$(python3 -c "print(f'{$end - $start:.3f}')")
+
+    # Parse converge round: first round where changes==0
+    local conv_round="$ESO_ROUNDS"
+    local found_zero=false
+    while IFS= read -r line; do
+        if echo "$line" | grep -q '\[eso-tune\] round'; then
+            local rnum changes
+            rnum=$(echo "$line" | sed 's/.*round \([0-9]*\)\/.*/\1/')
+            changes=$(echo "$line" | sed 's/.*: \([0-9]*\) changes.*/\1/')
+            if [ "$changes" = "0" ] && [ "$found_zero" = "false" ]; then
+                conv_round="$rnum"
+                found_zero=true
+            fi
+        fi
+    done < "$out_file"
+
+    # Parse final ED from last round line
+    local final_ed="0.0000"
+    final_ed=$(grep '\[eso-tune\] round' "$out_file" | tail -1 | sed 's/.*ED=\([0-9.]*\).*/\1/')
+
+    echo "$elapsed $conv_round $final_ed"
+}
+
+for pol in fixed adaptive hybrid; do
+    echo "  [$pol] running ${ESO_ROUNDS} rounds..."
+    result=$(run_eso_bench "$pol")
+    t=$(echo "$result" | awk '{print $1}')
+    c=$(echo "$result" | awk '{print $2}')
+    e=$(echo "$result" | awk '{print $3}')
+    eval "eso_${pol}_time=$t"
+    eval "eso_${pol}_conv=$c"
+    eval "eso_${pol}_ed=$e"
+    echo "  -> ${t}s, converge@round ${c}, ED=${e}"
+done
+echo ""
+
 # --- Helper: calculate ratio vs C ceiling ---
 calc_ratio() {
     local t="$1"
@@ -186,6 +253,19 @@ for entry in "Rust -O:$t_rust:$s_rust" "C -O2:$t_c:$s_c" "Cranelift JIT:$t_crane
 done
 echo ""
 
+# --- ESO results table ---
+echo "==================================================="
+echo "  ESO Results (${ESO_ROUNDS}-round tune)"
+echo "==================================================="
+echo ""
+printf "| %-12s | %-10s | %-14s | %-10s |\n" "Policy" "Time (s)" "Converge@Rnd" "Final ED"
+printf "|%-14s|%-12s|%-16s|%-12s|\n" "--------------" "------------" "----------------" "------------"
+for pol in fixed adaptive hybrid; do
+    t_var="eso_${pol}_time"; c_var="eso_${pol}_conv"; e_var="eso_${pol}_ed"
+    printf "| %-12s | %-10s | %-14s | %-10s |\n" "$pol" "${!t_var}" "${!c_var}" "${!e_var}"
+done
+echo ""
+
 # --- Append to benchmark doc ---
 TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
 {
@@ -200,6 +280,15 @@ TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
         s=$(echo "$entry" | cut -d: -f3-)
         ratio=$(calc_ratio "$t" "$t_c")
         echo "| $label | $t | $ratio | $s |"
+    done
+    echo ""
+    echo "#### ESO Benchmark (${ESO_ROUNDS}-round tune)"
+    echo ""
+    echo "| Policy | Time (s) | Converge@Rnd | Final ED |"
+    echo "|--------|----------|--------------|----------|"
+    for pol in fixed adaptive hybrid; do
+        t_var="eso_${pol}_time"; c_var="eso_${pol}_conv"; e_var="eso_${pol}_ed"
+        echo "| $pol | ${!t_var} | ${!c_var} | ${!e_var} |"
     done
     echo ""
 } >> "$BENCH_DOC"

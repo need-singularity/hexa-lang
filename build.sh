@@ -7,6 +7,10 @@ if [ "$1" = "test" ]; then
 elif [ "$1" = "release" ]; then
     cargo build --release
     cp target/release/hexa .
+elif [ "$1" = "bench" ]; then
+    cargo build --release
+    cp target/release/hexa .
+    bash scripts/bench_hexa_ir.sh
 else
     cargo build
     cp target/debug/hexa .
