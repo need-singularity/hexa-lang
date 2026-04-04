@@ -17,6 +17,7 @@ mod p10_coalesce;
 mod p11_final_dce;
 mod p12_verify;
 pub mod ir_stats;
+pub mod eso_bridge;
 
 use crate::ir::IrModule;
 
