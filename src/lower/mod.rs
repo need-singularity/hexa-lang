@@ -108,19 +108,23 @@ pub fn lower_program(stmts: &[ast::Stmt], module_name: &str) -> IrModule {
     }
 
     // Second pass: lower top-level statements into a "main" function
-    let main_id = module.add_function("main".into(), vec![], IrType::I64);
-    {
-        let func = module.function_mut(main_id).unwrap();
-        let mut builder = IrBuilder::new(func);
+    // If an explicit fn main() was declared, skip auto-generating one
+    let has_explicit_main = ctx.func_map.contains_key("main");
+    if !has_explicit_main {
+        let main_id = module.add_function("main".into(), vec![], IrType::I64);
+        {
+            let func = module.function_mut(main_id).unwrap();
+            let mut builder = IrBuilder::new(func);
 
-        for s in stmts {
-            stmt::lower_stmt(&mut ctx, &mut builder, s);
-        }
+            for s in stmts {
+                stmt::lower_stmt(&mut ctx, &mut builder, s);
+            }
 
-        // Ensure main returns 0
-        if !builder.is_last_block_terminated() {
-            let zero = builder.const_i64(0);
-            builder.ret(Some(zero));
+            // Ensure main returns 0
+            if !builder.is_last_block_terminated() {
+                let zero = builder.const_i64(0);
+                builder.ret(Some(zero));
+            }
         }
     }
 

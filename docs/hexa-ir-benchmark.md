@@ -113,3 +113,14 @@ Time(s)│
        │
 Legend: ■ = HEXA-IR  ▪ = Cranelift  ● = C ceiling  ○ = Rust
 ```
+
+### Benchmark Run: 2026-04-04 20:39:50
+
+| Engine | Time (s) | vs C ceil | Status |
+|--------|----------|-----------|--------|
+| Rust -O | 0.473 | 1.0x | PASS |
+| C -O2 | 0.471 | 1.0x | PASS |
+| Cranelift JIT | 0.036 | 0.1x | PASS |
+| HEXA-IR | N/A | N/A | SKIP |
+| Interpreter | 5.033 | 10.7x | PASS |
+

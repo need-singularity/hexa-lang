@@ -17,7 +17,7 @@ pub mod print;
 pub use opcode::OpCode;
 pub use types::IrType;
 pub use instr::{
-    ValueId, BlockId, FuncId, Instruction, Operand,
+    ValueId, BlockId, FuncId, Instruction, Operand, CmpKind,
     BasicBlock, IrFunction, IrModule, Global,
 };
 pub use builder::IrBuilder;

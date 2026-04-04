@@ -106,6 +106,7 @@ pub fn compile_to_binary(module: &IrModule, output_path: &str) -> Result<(), Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir::{IrModule, IrType, IrBuilder};
 
     #[test]
     fn test_host_target() {
@@ -115,5 +116,92 @@ mod tests {
         assert_eq!(target, Target::Arm64);
         #[cfg(target_arch = "x86_64")]
         assert_eq!(target, Target::X86_64);
+    }
+
+    #[test]
+    fn test_codegen_simple_main() {
+        // Create a simple IR module: main() returns 42
+        let mut module = IrModule::new("test");
+        let fid = module.add_function("main".into(), vec![], IrType::I64);
+        {
+            let func = module.function_mut(fid).unwrap();
+            let mut b = IrBuilder::new(func);
+            let six = b.const_i64(6);
+            let seven = b.const_i64(7);
+            let result = b.mul(six, seven, IrType::I64);
+            b.ret(Some(result));
+        }
+
+        let (target, format) = host_target();
+        let result = generate(&module, target, format);
+
+        // Verify output is non-empty
+        assert!(!result.code.is_empty(), "generated code should not be empty");
+
+        // Verify Mach-O magic bytes (on macOS)
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(result.format, ObjFormat::MachO);
+            let magic = u32::from_le_bytes([
+                result.code[0], result.code[1], result.code[2], result.code[3],
+            ]);
+            assert_eq!(magic, 0xFEEDFACF, "output should start with Mach-O 64-bit magic");
+        }
+
+        // Verify ELF magic bytes (on Linux)
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(result.format, ObjFormat::Elf);
+            assert_eq!(&result.code[0..4], &[0x7f, b'E', b'L', b'F']);
+        }
+    }
+
+    #[test]
+    fn test_codegen_produces_arm64_instructions() {
+        let mut module = IrModule::new("test");
+        let fid = module.add_function("main".into(), vec![], IrType::I64);
+        {
+            let func = module.function_mut(fid).unwrap();
+            let mut b = IrBuilder::new(func);
+            let val = b.const_i64(42);
+            b.ret(Some(val));
+        }
+
+        // Generate raw ARM64 code (no object wrapper)
+        let alloc_result = regalloc::allocate(&module, Target::Arm64);
+        let code = arm64::emit(&module, &alloc_result);
+
+        // Should have instructions: prologue (2-3) + load_imm(1) + return_mov(0-1) + epilogue(2-3)
+        assert!(code.len() >= 16, "ARM64 code should have at least 4 instructions (16 bytes)");
+        // All ARM64 instructions are 4 bytes
+        assert_eq!(code.len() % 4, 0, "ARM64 code length should be multiple of 4");
+    }
+
+    #[test]
+    fn test_compile_to_binary_e2e() {
+        // Full E2E: IR -> regalloc -> ARM64 -> Mach-O .o -> link -> run
+        let mut module = IrModule::new("test");
+        let fid = module.add_function("main".into(), vec![], IrType::I64);
+        {
+            let func = module.function_mut(fid).unwrap();
+            let mut b = IrBuilder::new(func);
+            let val = b.const_i64(42);
+            b.ret(Some(val));
+        }
+
+        let output_path = "/tmp/hexa_ir_e2e_test";
+        let result = compile_to_binary(&module, output_path);
+        assert!(result.is_ok(), "compile_to_binary should succeed: {:?}", result);
+
+        // Run the binary and check exit code = 42
+        let status = std::process::Command::new(output_path)
+            .status()
+            .expect("should be able to run the binary");
+
+        // Clean up
+        let _ = std::fs::remove_file(output_path);
+
+        // On macOS/Unix, exit code of main() is the process exit code (mod 256)
+        assert_eq!(status.code(), Some(42), "binary should exit with code 42");
     }
 }

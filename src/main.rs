@@ -118,6 +118,15 @@ mod std_nexus6;
 mod anima_bridge;
 #[allow(dead_code)]
 mod package;
+#[allow(dead_code)]
+mod ir;
+#[allow(dead_code)]
+mod lower;
+#[allow(dead_code)]
+mod opt;
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+mod codegen;
 
 use std::io::{self, Write, BufRead};
 use std::collections::HashMap;
@@ -146,6 +155,14 @@ fn main() {
                     std::process::exit(1);
                 }
                 run_file_native(&args[2]);
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            "--hexa-ir" => {
+                if args.len() < 3 {
+                    eprintln!("Usage: hexa --hexa-ir <file.hexa>");
+                    std::process::exit(1);
+                }
+                run_file_hexa_ir(&args[2]);
             }
             "--lsp" => lsp::run_lsp(),
             "debug" => {
@@ -677,6 +694,79 @@ fn run_file_native(path: &str) {
                     std::process::exit(1);
                 }
             }
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn run_file_hexa_ir(path: &str) {
+    let source = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error reading {}: {}", path, e);
+            std::process::exit(1);
+        }
+    };
+
+    // 1. Lex
+    let tokens = match lexer::Lexer::new(&source).tokenize() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(1);
+        }
+    };
+
+    // 2. Parse
+    let stmts = match parser::Parser::new(tokens).parse() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(1);
+        }
+    };
+
+    // 3. Type check (optional — skip if spans unavailable)
+    // The HEXA-IR lowering does its own type resolution.
+
+    // 4. Lower AST -> HEXA-IR
+    let mut module = lower::lower_program(&stmts, path);
+
+    // 5. Optimize (sigma=12 pipeline)
+    let opt_result = opt::run_pipeline(&mut module);
+    eprintln!("[hexa-ir] {}", opt_result.summary().trim());
+
+    // 6. Compile to native binary
+    let output_path = path.trim_end_matches(".hexa");
+    let output_bin = format!("{}.bin", output_path);
+    match codegen::compile_to_binary(&module, &output_bin) {
+        Ok(()) => {
+            eprintln!("[hexa-ir] Compiled to {}", output_bin);
+        }
+        Err(e) => {
+            eprintln!("[hexa-ir] Compilation failed: {}", e);
+            std::process::exit(1);
+        }
+    }
+
+    // 7. Run the binary and print output
+    let status = std::process::Command::new(&output_bin)
+        .status();
+    match status {
+        Ok(s) => {
+            // On macOS/Unix, the exit code of main() is the process exit code
+            if let Some(code) = s.code() {
+                if code != 0 {
+                    println!("{}", code);
+                }
+            }
+            // Clean up
+            let _ = std::fs::remove_file(&output_bin);
+        }
+        Err(e) => {
+            eprintln!("[hexa-ir] Failed to run binary: {}", e);
+            let _ = std::fs::remove_file(&output_bin);
+            std::process::exit(1);
         }
     }
 }

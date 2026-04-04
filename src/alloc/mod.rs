@@ -7,4 +7,4 @@
 
 pub mod egyptian;
 
-pub use egyptian::EgyptianAllocator;
+pub use egyptian::{EgyptianAllocator, ZoneStats, DefragReport, AllocReport};

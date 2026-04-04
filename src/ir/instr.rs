@@ -50,6 +50,31 @@ pub struct Instruction {
     pub ty: IrType,
 }
 
+/// Comparison kind — encodes which comparison a Sub-based cmp performs.
+/// Keeps J₂=24 opcodes intact; comparisons reuse `Sub` with a CmpKind tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CmpKind {
+    Eq,  // ==
+    Ne,  // !=
+    Lt,  // <
+    Le,  // <=
+    Gt,  // >
+    Ge,  // >=
+}
+
+impl std::fmt::Display for CmpKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", match self {
+            CmpKind::Eq => "eq",
+            CmpKind::Ne => "ne",
+            CmpKind::Lt => "lt",
+            CmpKind::Le => "le",
+            CmpKind::Gt => "gt",
+            CmpKind::Ge => "ge",
+        })
+    }
+}
+
 /// An operand to an instruction.
 #[derive(Debug, Clone)]
 pub enum Operand {
@@ -73,6 +98,8 @@ pub enum Operand {
     PhiEntry(BlockId, ValueId),
     /// Switch case: (value, block) for dispatch.
     SwitchCase(i64, BlockId),
+    /// Comparison kind tag — attached to Sub instructions that represent comparisons.
+    Cmp(CmpKind),
 }
 
 /// A basic block — sequence of instructions ending with a terminator.

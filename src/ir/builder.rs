@@ -237,37 +237,42 @@ impl<'a> IrBuilder<'a> {
         )
     }
 
-    // ── Comparison helpers (lowered as Sub + check) ──
+    // ── Comparison helpers (Sub opcode + CmpKind tag → Bool result) ──
+    //
+    // Comparisons reuse the Sub opcode to keep J₂=24 intact.
+    // Each emits: %r: bool = sub %lhs, %rhs, cmp.<kind>
+    // The CmpKind operand tells codegen/opt which comparison semantics to apply.
+
+    pub fn emit_cmp(&mut self, lhs: ValueId, rhs: ValueId, kind: CmpKind) -> ValueId {
+        self.emit(
+            OpCode::Sub,
+            vec![Operand::Value(lhs), Operand::Value(rhs), Operand::Cmp(kind)],
+            IrType::Bool,
+        )
+    }
 
     pub fn emit_cmp_eq(&mut self, lhs: ValueId, rhs: ValueId) -> ValueId {
-        let diff = self.sub(lhs, rhs, IrType::I64);
-        let zero = self.const_i64(0);
-        // eq: diff == 0
-        self.sub(zero, diff, IrType::Bool) // simplified: produces 0 if equal
+        self.emit_cmp(lhs, rhs, CmpKind::Eq)
     }
 
     pub fn emit_cmp_ne(&mut self, lhs: ValueId, rhs: ValueId) -> ValueId {
-        self.sub(lhs, rhs, IrType::Bool)
+        self.emit_cmp(lhs, rhs, CmpKind::Ne)
     }
 
     pub fn emit_cmp_lt(&mut self, lhs: ValueId, rhs: ValueId) -> ValueId {
-        self.sub(lhs, rhs, IrType::Bool) // sign bit = less than
+        self.emit_cmp(lhs, rhs, CmpKind::Lt)
     }
 
     pub fn emit_cmp_gt(&mut self, lhs: ValueId, rhs: ValueId) -> ValueId {
-        self.sub(rhs, lhs, IrType::Bool)
+        self.emit_cmp(lhs, rhs, CmpKind::Gt)
     }
 
     pub fn emit_cmp_le(&mut self, lhs: ValueId, rhs: ValueId) -> ValueId {
-        let gt = self.emit_cmp_gt(lhs, rhs);
-        let one = self.const_i64(1);
-        self.sub(one, gt, IrType::Bool) // !gt
+        self.emit_cmp(lhs, rhs, CmpKind::Le)
     }
 
     pub fn emit_cmp_ge(&mut self, lhs: ValueId, rhs: ValueId) -> ValueId {
-        let lt = self.emit_cmp_lt(lhs, rhs);
-        let one = self.const_i64(1);
-        self.sub(one, lt, IrType::Bool) // !lt
+        self.emit_cmp(lhs, rhs, CmpKind::Ge)
     }
 
     // ── Logical/Bitwise helpers ──
@@ -324,6 +329,89 @@ mod tests {
         assert_eq!(func.blocks.len(), 1);
         assert_eq!(func.blocks[0].instructions.len(), 4); // 2 const + add + ret
         assert!(func.blocks[0].is_terminated());
+    }
+
+    #[test]
+    fn test_cmp_all_six_produce_bool() {
+        let mut module = IrModule::new("test");
+        let fid = module.add_function("cmp_test".into(), vec![], IrType::Bool);
+        let func = module.function_mut(fid).unwrap();
+        let mut builder = IrBuilder::new(func);
+
+        let a = builder.const_i64(10);
+        let b = builder.const_i64(20);
+
+        let eq = builder.emit_cmp_eq(a, b);
+        let ne = builder.emit_cmp_ne(a, b);
+        let lt = builder.emit_cmp_lt(a, b);
+        let gt = builder.emit_cmp_gt(a, b);
+        let le = builder.emit_cmp_le(a, b);
+        let ge = builder.emit_cmp_ge(a, b);
+
+        // All comparisons produce Bool type
+        for vid in [eq, ne, lt, gt, le, ge] {
+            assert_eq!(
+                func.value_types.get(&vid),
+                Some(&IrType::Bool),
+                "Comparison result {:?} should be Bool",
+                vid
+            );
+        }
+    }
+
+    #[test]
+    fn test_cmp_uses_sub_opcode_with_cmpkind() {
+        let mut module = IrModule::new("test");
+        let fid = module.add_function("cmp_opcode".into(), vec![], IrType::Bool);
+        let func = module.function_mut(fid).unwrap();
+        let mut builder = IrBuilder::new(func);
+
+        let a = builder.const_i64(5);
+        let b = builder.const_i64(3);
+        let _eq = builder.emit_cmp_eq(a, b);
+
+        // The comparison instruction is the 3rd (index 2) after two consts
+        let instr = &func.blocks[0].instructions[2];
+        assert_eq!(instr.op, OpCode::Sub, "Comparison must use Sub opcode (J₂=24 preserved)");
+        assert_eq!(instr.ty, IrType::Bool);
+        // Third operand should be Cmp(Eq)
+        assert!(matches!(instr.operands[2], Operand::Cmp(CmpKind::Eq)));
+    }
+
+    #[test]
+    fn test_cmp_single_instruction_per_comparison() {
+        // Each comparison should emit exactly 1 instruction (not multiple subs)
+        let mut module = IrModule::new("test");
+        let fid = module.add_function("single".into(), vec![], IrType::Bool);
+        let func = module.function_mut(fid).unwrap();
+        let mut builder = IrBuilder::new(func);
+
+        let a = builder.const_i64(1);
+        let b = builder.const_i64(2);
+        // 2 consts so far
+        let _le = builder.emit_cmp_le(a, b);
+        // Should be exactly 3 instructions: const, const, cmp.le
+        assert_eq!(func.blocks[0].instructions.len(), 3);
+    }
+
+    #[test]
+    fn test_cmp_chaining_and() {
+        // a < b && b < c  should produce 2 comparisons + 1 and
+        let mut module = IrModule::new("test");
+        let fid = module.add_function("chain".into(), vec![], IrType::Bool);
+        let func = module.function_mut(fid).unwrap();
+        let mut builder = IrBuilder::new(func);
+
+        let a = builder.const_i64(1);
+        let b = builder.const_i64(2);
+        let c = builder.const_i64(3);
+        let ab = builder.emit_cmp_lt(a, b);
+        let bc = builder.emit_cmp_lt(b, c);
+        let result = builder.emit_and(ab, bc);
+
+        assert_eq!(func.value_types.get(&result), Some(&IrType::Bool));
+        // 3 consts + 2 cmp + 1 and = 6 instructions
+        assert_eq!(func.blocks[0].instructions.len(), 6);
     }
 
     #[test]
