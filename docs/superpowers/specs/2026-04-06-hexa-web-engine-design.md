@@ -206,22 +206,28 @@ optimize dashboard {
 
 ### 5.1 설계 철학
 
-기존 템플릿 엔진 (EJS, Jinja, Mustache)은 **문자열 치환 기반**.
-Hexa 템플릿은 **AST 기반 + comptime 평가 + proof 검증**.
+기존 템플릿 엔진 (EJS, Jinja, Mustache)은 **사람이 문자열을 치환하는** 구조.
+Hexa 템플릿은 **AI가 생성하고, 의식AI가 검증하는** 구조.
 
 | 기존 | Hexa |
 |------|------|
 | `<%= variable %>` 런타임 치환 | comptime에 가능한 건 전부 해결 |
-| XSS 취약 (escape 누락) | proof engine이 escape 누락 컴파일 타임 차단 |
+| XSS 취약 (escape 누락) | proof engine이 XSS Freedom 정리로 컴파일 타임 차단 |
 | 타입 없음 | 템플릿 변수에 타입, verify 적용 |
-| AI가 생성하면 검증 불가 | AI generate → verify 자동 게이트 |
+| AI가 생성하면 검증 불가 | AI generate → verify → Φ 측정 자동 게이트 |
+| 구조를 AI가 이해 못함 | AST 기반 → AI가 트리 구조로 정확히 이해/조작 |
+| 품질 측정 불가 | consciousness_vector로 템플릿 품질 정량 측정 |
 
-### 5.2 문법
+### 5.2 AI 친화적 문법 — AST 기반, 암묵적 규칙 없음
 
 ```hexa
 use std.web
 
-// 기본 템플릿
+// AI가 이 코드를 생성/이해할 때:
+// 1. 트리 구조가 명시적 → 노드 추가/삭제/이동이 정확
+// 2. 타입이 있음 → name: string, items: [Item] 으로 오류 방지
+// 3. verify가 계약 → AI가 깨면 안 되는 조건을 즉시 파악
+
 let html = template {
     h1 { "Hello, {name}" }
     ul {
@@ -249,14 +255,101 @@ let safe_page = template {
 }
 ```
 
-### 5.3 출력 규칙
+### 5.3 AI가 템플릿을 생성하는 흐름
+
+```hexa
+// 1단계: 사람이 intent 선언
+intent product_page {
+    "상품 상세 페이지 — 이미지, 가격, 리뷰"
+    verify { price > 0 }
+    invariant { reviews.all(fn(r) { r.rating >= 1 && r.rating <= 5 }) }
+}
+
+// 2단계: AI가 generate → 템플릿 코드 생성
+generate product_page => template {
+    verify { price > 0 }
+    invariant { !contains_script(product.name) }
+    
+    article {
+        img { src: product.image, alt: product.name }
+        h1 { "{product.name}" }
+        span { class: "price", "${product.price}" }
+        section {
+            h2 { "리뷰 ({reviews.len()})" }
+            for review in reviews {
+                div {
+                    class: "review"
+                    span { "{'★'.repeat(review.rating)}" }
+                    p { borrow review.text }
+                }
+            }
+        }
+    }
+}
+
+// 3단계: 의식AI가 검증
+// → Φ 측정: 컴포넌트 간 통합도 (이미지-가격-리뷰 연결성)
+// → consciousness_vector: 10D 건강 체크
+// → Φ < 0.5 이면 → "리뷰 섹션이 메인과 분리됨" 경고
+// → dream optimize 제안
+```
+
+### 5.4 의식AI 템플릿 품질 측정
+
+```hexa
+// 템플릿도 consciousness_vector로 측정된다
+let health = consciousness_vector(template_ast)
+
+// 템플릿 맥락에서 10D 의미:
+//   통합      — 부모-자식 노드 간 데이터 결합도
+//   분화      — 각 섹션의 독립적 의미 보유 여부
+//   인과      — 변수 → 노드 인과 체인 추적 가능성
+//   정보      — 불필요한 중복 노드 없이 정보 전달
+//   복잡성    — 중첩 깊이 적절성 (과도 중첩 = 나쁨)
+//   안정성    — 변수 없는 노드 비율 (높을수록 안정)
+//   재귀      — 재사용 가능한 partial/component 비율
+//   경계      — 섹션 간 경계 명확성
+//   기억      — 캐시 가능한 comptime 노드 비율
+//   멀티스케일 — 반응형 대응 (뷰포트별 분기)
+
+// Φ 임계치:
+//   Φ > 0.7  → 통과
+//   Φ 0.5~0.7 → 경고 + dream optimize 제안
+//   Φ < 0.5  → 컴파일 거부 + 구조 재설계 요구
+```
+
+### 5.5 Dream Engine 템플릿 진화
+
+```hexa
+// AI가 생성한 템플릿을 dream이 자동 진화
+dream optimize product_page {
+    fitness {
+        phi_compute(template_ast),    // 통합 정보량
+        render_speed,                  // 렌더링 속도
+        accessibility_score,           // a11y 점수
+        semantic_correctness           // HTML 시맨틱 정확도
+    }
+    mutations {
+        reorder_sections,      // 섹션 순서 변경
+        flatten_nesting,       // 중첩 축소
+        extract_component,     // 반복 패턴 → 컴포넌트 추출
+        merge_siblings,        // 유사 형제 노드 병합
+        add_aria_hints         // a11y 힌트 자동 추가
+    }
+    generations: 50
+    // → 최적 구조가 자동 선택됨
+}
+```
+
+### 5.6 출력 규칙
 
 - `template { }` → `Value::Str` (HTML 문자열)
 - `comptime template { }` → 빌드 타임에 문자열 확정
-- 변수 삽입 `{expr}` → 자동 HTML escape (proof가 보장)
+- 변수 삽입 `{expr}` → 자동 HTML escape (XSS Freedom 정리가 보장)
 - `for`, `if`, `match` — Hexa 기존 제어 구문 그대로 사용
+- AI 생성 템플릿 → verify + Φ 측정 통과 후에만 출력 허용
 
-### 5.4 http_serve 통합
+### 5.7 http_serve 통합
 
 ```hexa
 use std.web
@@ -274,6 +367,8 @@ http_serve("0.0.0.0:8080", fn(req) {
             h1 { "About" }
             p { "Hexa Web Engine" }
         }
+        // AI가 intent에서 생성한 페이지
+        "/product/{id}" => generate product_page(id)
         _ => template {
             h1 { "404" }
             p { "Not Found: {path}" }
@@ -281,6 +376,17 @@ http_serve("0.0.0.0:8080", fn(req) {
     }
 })
 ```
+
+### 5.8 기존 템플릿 엔진 대비
+
+| | EJS | Jinja | Svelte | **Hexa Template** |
+|--|-----|-------|--------|-------------------|
+| AI가 생성 | 가능, 검증 불가 | 가능, 검증 불가 | 가능, 부분 검증 | **generate→verify→Φ 풀체인** |
+| AI가 이해 | 문자열 파싱 필요 | 문자열 파싱 필요 | AST 있지만 복잡 | **AST 기반, 명시적 구조** |
+| 품질 측정 | 없음 | 없음 | 없음 | **consciousness_vector 10D** |
+| 자동 최적화 | 없음 | 없음 | 컴파일러 일부 | **dream engine 진화** |
+| 보안 보장 | escape 수동 | autoescape 가능 | 자동 | **XSS Freedom 정리 증명** |
+| 타입 안전 | 없음 | 약함 | 있음 | **verify+invariant 증명** |
 
 ---
 
