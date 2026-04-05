@@ -114,6 +114,8 @@ impl VM {
     fn run_code(&mut self, code: &[OpCode]) -> Result<Value, HexaError> {
         let mut ip = 0;
         let code_len = code.len();
+        // Cache local_base once per frame (doesn't change within run_code)
+        let local_base = self.frames.last().map_or(0, |f| f.local_base);
 
         // Hot-path helpers: inline pop that avoids Option overhead when we
         // know the stack is non-empty (the compiler guarantees balanced pushes).
@@ -175,7 +177,7 @@ impl VM {
 
                 // Variables -- inlined local_base for speed
                 OpCode::GetLocal(slot) => {
-                    let base = self.frames.last().map_or(0, |f| f.local_base);
+                    let base = local_base;
                     let idx = base + slot;
                     let val = if idx < self.locals.len() {
                         // Fast-path: avoid clone for Int/Float/Bool
@@ -193,7 +195,7 @@ impl VM {
                 }
                 OpCode::SetLocal(slot) => {
                     let val = pop_fast!(self);
-                    let base = self.frames.last().map_or(0, |f| f.local_base);
+                    let base = local_base;
                     let idx = base + slot;
                     if idx >= self.locals.len() {
                         self.locals.resize(idx + 1, Value::Void);
