@@ -201,7 +201,7 @@ impl Pass for FinalDcePass {
 mod tests {
     use super::*;
     use crate::ir::{IrModule, IrType, Operand, OpCode, ValueId};
-    use crate::ir::instr::{FuncId, BlockId, Instruction};
+    use crate::ir::instr::{BlockId, Instruction};
 
     fn instr(result: u32, op: OpCode, operands: Vec<Operand>) -> Instruction {
         Instruction {
@@ -310,7 +310,7 @@ mod tests {
             instr(2, OpCode::Return, vec![]),
         ]);
         let pass = FinalDcePass;
-        let result = pass.run(&mut module);
+        let _result = pass.run(&mut module);
         // All 3 instructions should be kept (store is side-effecting)
         assert_eq!(module.functions[0].blocks[0].instructions.len(), 3);
     }

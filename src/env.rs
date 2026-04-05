@@ -226,6 +226,14 @@ impl Env {
         // HTTP builtins (std::net)
         env.define("http_get", Value::BuiltinFn("http_get".into()));
         env.define("http_post", Value::BuiltinFn("http_post".into()));
+        env.define("http_serve", Value::BuiltinFn("http_serve".into()));
+        // TCP builtins (std::net)
+        env.define("net_listen", Value::BuiltinFn("net_listen".into()));
+        env.define("net_accept", Value::BuiltinFn("net_accept".into()));
+        env.define("net_connect", Value::BuiltinFn("net_connect".into()));
+        env.define("net_read", Value::BuiltinFn("net_read".into()));
+        env.define("net_write", Value::BuiltinFn("net_write".into()));
+        env.define("net_close", Value::BuiltinFn("net_close".into()));
         // Set constructor (std::collections)
         env.define("Set", Value::BuiltinFn("Set".into()));
         // Time builtins (std::time)

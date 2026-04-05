@@ -755,7 +755,7 @@ mod tests {
 
         // The merge block should have v1 and v2 in its live_in (via phi)
         let merge_id = fc.blocks[3].id; // merge is the 4th block
-        let merge_live_in = liveness.live_in.get(&merge_id).unwrap();
+        let _merge_live_in = liveness.live_in.get(&merge_id).unwrap();
         // Phi uses values from predecessor blocks, so they should appear in live_in
         // of those predecessors, not necessarily merge's live_in
         // The then/else blocks should have their const values live_out

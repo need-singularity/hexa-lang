@@ -181,7 +181,7 @@ impl Pass for StrengthReductionPass {
 mod tests {
     use super::*;
     use crate::ir::{IrModule, IrType, Operand, OpCode, ValueId};
-    use crate::ir::instr::{FuncId, BlockId, Instruction};
+    use crate::ir::instr::Instruction;
 
     /// Helper: create a module with one function, one block, given instructions.
     fn make_module(instructions: Vec<Instruction>) -> IrModule {

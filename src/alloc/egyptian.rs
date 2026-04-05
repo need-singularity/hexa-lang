@@ -408,7 +408,7 @@ mod tests {
 
     #[test]
     fn test_alloc_and_report() {
-        let mut alloc = EgyptianAllocator::new(6000);
+        let alloc = EgyptianAllocator::new(6000);
         let report = alloc.report();
         assert_eq!(report.total, 6000);
         assert_eq!(report.fragmentation(), 0.0);

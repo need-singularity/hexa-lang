@@ -322,6 +322,7 @@ fn collect_escaping_names(expr: &Expr, escaped: &mut HashSet<String>, ctx: &Esca
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::ast::*;
 
     fn make_let_struct(name: &str, struct_name: &str) -> Stmt {

@@ -483,4 +483,54 @@ mod tests {
             other => panic!("expected empty body, got {:?}", other),
         }
     }
+
+    #[test]
+    fn test_http_serve_roundtrip() {
+        use std::thread;
+
+        // Bind to port 0 to get a random available port
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Server thread: accept one connection, parse request, send response
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let req = read_http_request(&mut stream).unwrap();
+
+            // Verify parsed request fields
+            match req.get("method") {
+                Some(Value::Str(s)) => assert_eq!(s, "GET"),
+                other => panic!("expected method=GET, got {:?}", other),
+            }
+            match req.get("path") {
+                Some(Value::Str(s)) => assert_eq!(s, "/hello"),
+                other => panic!("expected path=/hello, got {:?}", other),
+            }
+
+            // Write HTTP response
+            let body = "Hello from test!";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            let _ = stream.shutdown(Shutdown::Both);
+        });
+
+        // Client: send an HTTP GET request
+        let mut client = TcpStream::connect(addr).unwrap();
+        let request = "GET /hello HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+        client.write_all(request.as_bytes()).unwrap();
+        client.flush().unwrap();
+
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+
+        assert!(response.contains("200 OK"), "expected 200 OK in response");
+        assert!(response.contains("Hello from test!"), "expected body in response");
+
+        server.join().unwrap();
+    }
 }

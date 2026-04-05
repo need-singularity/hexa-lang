@@ -120,7 +120,7 @@ mod tests {
 
     #[test]
     fn test_host_target() {
-        let (target, format) = host_target();
+        let (target, _format) = host_target();
         // Should detect current platform
         #[cfg(target_arch = "aarch64")]
         assert_eq!(target, Target::Arm64);
