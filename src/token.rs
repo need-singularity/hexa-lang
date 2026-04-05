@@ -61,6 +61,8 @@ pub enum Token {
     Try, Catch, Throw, Panic, Recover,
     // Group 12: AI (τ=4)
     Intent, Generate, Verify, Optimize,
+    // Web (1)
+    Template,
 
     // === 24 Operators (J₂=24) ===
     // Arithmetic (n=6): + - * / % **
@@ -155,6 +157,8 @@ pub fn keyword_from_str(s: &str) -> Option<Token> {
         "generate" => Some(Token::Generate),
         "verify" => Some(Token::Verify),
         "optimize" => Some(Token::Optimize),
+        // Web
+        "template" => Some(Token::Template),
         // Booleans
         "true" => Some(Token::BoolLit(true)),
         "false" => Some(Token::BoolLit(false)),
