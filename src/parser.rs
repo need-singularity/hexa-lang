@@ -550,6 +550,37 @@ impl Parser {
                 vis: Visibility::Private, is_pure: false,
             }));
         }
+        // comptime const name = expr — compile-time constant
+        if matches!(self.peek(), Token::Const) {
+            self.advance(); // consume 'const'
+            let name = self.expect_ident()?;
+            let typ = if matches!(self.peek(), Token::Colon) {
+                self.advance();
+                Some(self.expect_ident()?)
+            } else {
+                None
+            };
+            self.expect(&Token::Eq)?;
+            let expr = self.parse_expr()?;
+            return Ok(Stmt::Const(name, typ, Expr::Comptime(Box::new(expr)), Visibility::Private));
+        }
+        // comptime let name = expr — compile-time variable
+        if matches!(self.peek(), Token::Let) {
+            self.advance(); // consume 'let'
+            if matches!(self.peek(), Token::Mut) {
+                self.advance();
+            }
+            let name = self.expect_ident()?;
+            let typ = if matches!(self.peek(), Token::Colon) {
+                self.advance();
+                Some(self.expect_ident()?)
+            } else {
+                None
+            };
+            self.expect(&Token::Eq)?;
+            let expr = self.parse_expr()?;
+            return Ok(Stmt::Let(name, typ, Some(Expr::Comptime(Box::new(expr))), Visibility::Private));
+        }
         // comptime { ... } — compile-time block as expression statement
         let block = self.parse_block()?;
         Ok(Stmt::Expr(Expr::Comptime(Box::new(Expr::Block(block)))))
