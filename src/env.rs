@@ -274,6 +274,11 @@ impl Env {
         env.define("nexus6_lenses", Value::BuiltinFn("nexus6_lenses".into()));
         env.define("nexus6_consensus", Value::BuiltinFn("nexus6_consensus".into()));
         env.define("nexus6_n6_check", Value::BuiltinFn("nexus6_n6_check".into()));
+        // Process/IO builtins (std::process, std::io)
+        env.define("exec", Value::BuiltinFn("exec".into()));
+        env.define("exec_with_status", Value::BuiltinFn("exec_with_status".into()));
+        env.define("input", Value::BuiltinFn("input".into()));
+        env.define("readline", Value::BuiltinFn("readline".into()));
         env
 
     }

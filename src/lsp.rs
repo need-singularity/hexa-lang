@@ -300,6 +300,7 @@ const BUILTINS: &[&str] = &[
     "consciousness_max_cells", "consciousness_decoder_dim", "consciousness_phi",
     "hexad_modules", "hexad_right", "hexad_left",
     "tension_link",
+    "exec", "exec_with_status", "input", "readline",
 ];
 
 // ── Keyword/builtin documentation ─────────────────────────────
@@ -412,6 +413,10 @@ fn builtin_doc(name: &str) -> Option<&'static str> {
         "print_err" => "fn print_err(value: any) — Print to stderr",
         "json_parse" => "fn json_parse(s: string) -> any — Parse JSON string",
         "json_stringify" => "fn json_stringify(value: any) -> string — Serialize to JSON",
+        "exec" => "fn exec(command: string) -> string — Execute shell command, return stdout",
+        "exec_with_status" => "fn exec_with_status(command: string) -> Map — Execute shell command, return {stdout, stderr, status}",
+        "input" => "fn input(prompt?: string) -> string — Read a line from stdin",
+        "readline" => "fn readline(prompt?: string) -> string — Read a line from stdin (alias for input)",
         _ => return None,
     })
 }

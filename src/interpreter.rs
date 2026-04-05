@@ -3570,6 +3570,65 @@ impl Interpreter {
             | "nexus6_lenses" | "nexus6_consensus" | "nexus6_n6_check" => {
                 crate::std_nexus6::call_nexus6_builtin(self, name, args)
             }
+            // ── Process/IO builtins (std::process, std::io) ──────────────
+            "exec" => {
+                if args.is_empty() { return Err(self.type_err("exec() requires 1 argument (command)".into())); }
+                match &args[0] {
+                    Value::Str(cmd) => {
+                        let output = std::process::Command::new("sh")
+                            .args(&["-c", cmd])
+                            .output();
+                        match output {
+                            Ok(out) => {
+                                let stdout = String::from_utf8_lossy(&out.stdout).trim_end_matches('\n').to_string();
+                                if out.status.success() {
+                                    Ok(Value::Str(stdout))
+                                } else {
+                                    Ok(Value::Error(format!("exec error (exit {}): {}", out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stderr))))
+                                }
+                            }
+                            Err(e) => Ok(Value::Error(format!("exec error: {}", e))),
+                        }
+                    }
+                    _ => Err(self.type_err("exec() requires string argument".into())),
+                }
+            }
+            "exec_with_status" => {
+                if args.is_empty() { return Err(self.type_err("exec_with_status() requires 1 argument (command)".into())); }
+                match &args[0] {
+                    Value::Str(cmd) => {
+                        let output = std::process::Command::new("sh")
+                            .args(&["-c", cmd])
+                            .output();
+                        match output {
+                            Ok(out) => {
+                                let mut map = std::collections::HashMap::new();
+                                map.insert("stdout".to_string(), Value::Str(String::from_utf8_lossy(&out.stdout).to_string()));
+                                map.insert("stderr".to_string(), Value::Str(String::from_utf8_lossy(&out.stderr).to_string()));
+                                map.insert("status".to_string(), Value::Int(out.status.code().unwrap_or(-1) as i64));
+                                Ok(Value::Map(map))
+                            }
+                            Err(e) => Ok(Value::Error(format!("exec_with_status error: {}", e))),
+                        }
+                    }
+                    _ => Err(self.type_err("exec_with_status() requires string argument".into())),
+                }
+            }
+            "input" | "readline" => {
+                // Optional prompt argument
+                if !args.is_empty() {
+                    if let Value::Str(prompt) = &args[0] {
+                        use std::io::Write;
+                        print!("{}", prompt);
+                        let _ = std::io::stdout().flush();
+                    }
+                }
+                let mut line = String::new();
+                match std::io::stdin().read_line(&mut line) {
+                    Ok(_) => Ok(Value::Str(line.trim_end_matches('\n').trim_end_matches('\r').to_string())),
+                    Err(e) => Ok(Value::Error(format!("input error: {}", e))),
+                }
+            }
             _ => Err(HexaError {
                 class: ErrorClass::Name,
                 message: format!("unknown builtin: {}", name),

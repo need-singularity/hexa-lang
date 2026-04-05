@@ -114,6 +114,18 @@ fn emit_function(
 
     let _const_pins: HashMap<i64, u8> = HashMap::new(); // disabled for now
 
+    // Pre-scan: build constant map (ValueId → i64) for strength-reduction
+    let mut const_map: HashMap<ValueId, i64> = HashMap::new();
+    for block in &func.blocks {
+        for instr in &block.instructions {
+            if instr.op == OpCode::Load {
+                if let Some(Operand::ImmI64(n)) = instr.operands.first() {
+                    const_map.insert(instr.result, *n);
+                }
+            }
+        }
+    }
+
     // Collect phi moves: for each block that has successors with phi nodes,
     // insert mov instructions before the terminator.
     // phi_moves[block_id] = vec![(phi_dst_reg, src_reg)]
@@ -172,7 +184,7 @@ fn emit_function(
                     }
                 }
             }
-            emit_instruction(code, instr, &adjusted_alloc, &mut branch_fixups, call_fixups, id_to_name, &alloca_slots);
+            emit_instruction(code, instr, &adjusted_alloc, &mut branch_fixups, call_fixups, id_to_name, &alloca_slots, &const_map);
         }
     }
 
@@ -252,6 +264,7 @@ fn emit_instruction(
     call_fixups: &mut Vec<(usize, String)>,
     id_to_name: &HashMap<u32, String>,
     alloca_slots: &HashMap<ValueId, i32>,
+    const_map: &HashMap<ValueId, i64>,
 ) {
     let dst = reg_for(instr.result, alloc);
 
@@ -296,12 +309,103 @@ fn emit_instruction(
             emit32(code, encode_rrr(0xcb000000, dst, r1, r2));
         }
         OpCode::Mul => {
-            let (r1, r2) = two_regs(&instr.operands, alloc);
-            emit32(code, encode_mul(dst, r1, r2));
+            // Strength-reduce: x * (power-of-2) → LSL, x * 3 → ADD+LSL, x * 5 → ADD+LSL
+            let vals: Vec<ValueId> = instr.operands.iter().filter_map(|op| {
+                if let Operand::Value(v) = op { Some(*v) } else { None }
+            }).collect();
+            let (c0, c1) = (
+                vals.get(0).and_then(|v| const_map.get(v).copied()),
+                vals.get(1).and_then(|v| const_map.get(v).copied()),
+            );
+            // Try to find a constant operand and the variable register
+            let strength = if let Some(n) = c1 {
+                Some((reg_for(vals[0], alloc), n))
+            } else if let Some(n) = c0 {
+                Some((reg_for(vals[1], alloc), n))
+            } else {
+                None
+            };
+            let mut reduced = false;
+            if let Some((var_r, n)) = strength {
+                if let Some(shift) = is_power_of_2(n) {
+                    if shift == 0 {
+                        // x * 1 = x
+                        if dst != var_r {
+                            emit32(code, encode_mov(dst, var_r));
+                        }
+                    } else {
+                        // x * 2^k → LSL Xd, Xvar, #k
+                        // LSL = UBFM Xd, Xn, #(64-shift)%64, #(63-shift)
+                        let immr = (64 - shift) & 0x3f;
+                        let imms = 63 - shift;
+                        emit32(code, 0xd3400000 | ((imms & 0x3f) << 10) | ((immr & 0x3f) << 16) | ((var_r as u32) << 5) | (dst as u32));
+                    }
+                    reduced = true;
+                } else if n == 3 {
+                    // x * 3 → ADD Xd, Xvar, Xvar, LSL #1
+                    emit32(code, 0x8b000000 | ((var_r as u32) << 16) | (1u32 << 10) | ((var_r as u32) << 5) | (dst as u32));
+                    reduced = true;
+                } else if n == 5 {
+                    // x * 5 → ADD Xd, Xvar, Xvar, LSL #2
+                    emit32(code, 0x8b000000 | ((var_r as u32) << 16) | (2u32 << 10) | ((var_r as u32) << 5) | (dst as u32));
+                    reduced = true;
+                } else if n == 7 {
+                    // x * 7 → (x << 3) - x: LSL tmp, Xvar, #3; SUB Xd, tmp, Xvar
+                    let immr = (64 - 3) & 0x3f;
+                    let imms = 63 - 3;
+                    emit32(code, 0xd3400000 | ((imms & 0x3f) << 10) | ((immr & 0x3f) << 16) | ((var_r as u32) << 5) | (TMP1 as u32));
+                    emit32(code, encode_rrr(0xcb000000, dst, TMP1, var_r));
+                    reduced = true;
+                }
+            }
+            if !reduced {
+                let (r1, r2) = two_regs(&instr.operands, alloc);
+                emit32(code, encode_mul(dst, r1, r2));
+            }
         }
         OpCode::Div => {
-            let (r1, r2) = two_regs(&instr.operands, alloc);
-            emit32(code, encode_div(dst, r1, r2));
+            // Strength-reduce: x / (power-of-2) → signed correction + ASR
+            let vals: Vec<ValueId> = instr.operands.iter().filter_map(|op| {
+                if let Operand::Value(v) = op { Some(*v) } else { None }
+            }).collect();
+            let divisor_const = vals.get(1).and_then(|v| const_map.get(v).copied());
+            let mut reduced = false;
+            if let Some(n) = divisor_const {
+                if let Some(shift) = is_power_of_2(n) {
+                    if shift > 0 {
+                        let dividend_r = reg_for(vals[0], alloc);
+                        // Signed division rounding: add (n-1) if negative
+                        // ADD tmp, Xn, Xn, LSR #63  (adds 1 if negative — only correct for /2)
+                        // General: ADD tmp, Xn, #(n-1) if negative
+                        // Correct signed rounding for power-of-2:
+                        //   tmp = Xn + ((Xn >> 63) & ((1 << shift) - 1))
+                        //   result = tmp >> shift (ASR)
+                        // Step 1: ASR tmp1, Xn, #63 → all-ones if negative, all-zeros if positive
+                        emit32(code, 0x9340fc00 | ((63u32 & 0x3f) << 10) | ((63u32 & 0x3f) << 16) | ((dividend_r as u32) << 5) | (TMP1 as u32));
+                        // Step 2: LSR tmp1, tmp1, #(64 - shift) → mask of (shift) ones if negative
+                        let lsr_immr = 64 - shift;
+                        let lsr_imms = 63u32;
+                        emit32(code, 0xd3400000 | ((lsr_imms & 0x3f) << 10) | ((lsr_immr & 0x3f) << 16) | ((TMP1 as u32) << 5) | (TMP1 as u32));
+                        // Step 3: ADD tmp2, Xn, tmp1
+                        emit32(code, encode_rrr(0x8b000000, TMP2, dividend_r, TMP1));
+                        // Step 4: ASR Xd, tmp2, #shift
+                        // ASR is SBFM Xd, Xn, #shift, #63
+                        emit32(code, 0x9340fc00 | ((63u32 & 0x3f) << 10) | ((shift & 0x3f) << 16) | ((TMP2 as u32) << 5) | (dst as u32));
+                        reduced = true;
+                    } else {
+                        // x / 1 = x
+                        let dividend_r = reg_for(vals[0], alloc);
+                        if dst != dividend_r {
+                            emit32(code, encode_mov(dst, dividend_r));
+                        }
+                        reduced = true;
+                    }
+                }
+            }
+            if !reduced {
+                let (r1, r2) = two_regs(&instr.operands, alloc);
+                emit32(code, encode_div(dst, r1, r2));
+            }
         }
         OpCode::Mod => {
             let (r1, r2) = two_regs(&instr.operands, alloc);
@@ -553,6 +657,13 @@ fn emit_instruction(
         OpCode::Assert | OpCode::Assume | OpCode::Invariant
         | OpCode::LifetimeStart | OpCode::LifetimeEnd => {}
     }
+}
+
+// ── Strength-reduction helper ──
+
+/// Return the shift amount if `n` is a positive power of two.
+fn is_power_of_2(n: i64) -> Option<u32> {
+    if n > 0 && (n & (n - 1)) == 0 { Some(n.trailing_zeros()) } else { None }
 }
 
 // ── Encoding helpers ──
