@@ -1749,8 +1749,171 @@ impl Parser {
                 self.expect(&Token::RParen)?;
                 Ok(Expr::Resume(Box::new(val)))
             }
+            // Template block expression: template { ... }
+            Token::Template => self.parse_template_expr(),
             other => Err(self.error(format!("unexpected token in expression: {:?}", other))),
         }
+    }
+
+    // ── Template parsing ─────────────────────────────────────
+
+    /// Parse `template { children... }` — top-level template expression.
+    fn parse_template_expr(&mut self) -> Result<Expr, HexaError> {
+        self.advance(); // consume 'template'
+        self.skip_newlines();
+        self.expect(&Token::LBrace)?;
+        self.skip_newlines();
+        let children = self.parse_template_children()?;
+        self.expect(&Token::RBrace)?;
+        Ok(Expr::Template(children))
+    }
+
+    /// Parse zero or more template nodes until `}` or EOF.
+    fn parse_template_children(&mut self) -> Result<Vec<TemplateNode>, HexaError> {
+        let mut nodes = Vec::new();
+        loop {
+            self.skip_newlines();
+            if matches!(self.peek(), Token::RBrace | Token::Eof) {
+                break;
+            }
+            nodes.push(self.parse_template_node()?);
+            // optional comma/semicolon separator
+            if matches!(self.peek(), Token::Comma | Token::Semicolon) {
+                self.advance();
+            }
+        }
+        Ok(nodes)
+    }
+
+    /// Parse a single template node.
+    fn parse_template_node(&mut self) -> Result<TemplateNode, HexaError> {
+        match self.peek().clone() {
+            // String literal → text node
+            Token::StringLit(s) => {
+                self.advance();
+                Ok(TemplateNode::Text(Expr::StringLit(s)))
+            }
+            // `for name in expr { children }`
+            Token::For => {
+                self.advance(); // consume 'for'
+                let var = self.expect_ident()?;
+                // 'in' is an ident, not a keyword token
+                match self.advance() {
+                    Token::Ident(ref s) if s == "in" => {}
+                    other => return Err(self.error(format!("expected 'in' in template for, got {:?}", other))),
+                }
+                let iter_expr = self.parse_expr()?;
+                self.skip_newlines();
+                self.expect(&Token::LBrace)?;
+                self.skip_newlines();
+                let children = self.parse_template_children()?;
+                self.expect(&Token::RBrace)?;
+                Ok(TemplateNode::For(var, iter_expr, children))
+            }
+            // `if expr { children } else { children }`
+            Token::If => {
+                self.advance(); // consume 'if'
+                let cond = self.parse_expr()?;
+                self.skip_newlines();
+                self.expect(&Token::LBrace)?;
+                self.skip_newlines();
+                let then_children = self.parse_template_children()?;
+                self.expect(&Token::RBrace)?;
+                self.skip_newlines();
+                let else_children = if matches!(self.peek(), Token::Else) {
+                    self.advance(); // consume 'else'
+                    self.skip_newlines();
+                    self.expect(&Token::LBrace)?;
+                    self.skip_newlines();
+                    let els = self.parse_template_children()?;
+                    self.expect(&Token::RBrace)?;
+                    Some(els)
+                } else {
+                    None
+                };
+                Ok(TemplateNode::If(cond, then_children, else_children))
+            }
+            // `verify { expr }`
+            Token::Verify => {
+                self.advance(); // consume 'verify'
+                self.skip_newlines();
+                self.expect(&Token::LBrace)?;
+                self.skip_newlines();
+                let expr = self.parse_expr()?;
+                self.skip_newlines();
+                self.expect(&Token::RBrace)?;
+                Ok(TemplateNode::Verify(expr))
+            }
+            // `invariant { expr }`
+            Token::Invariant => {
+                self.advance(); // consume 'invariant'
+                self.skip_newlines();
+                self.expect(&Token::LBrace)?;
+                self.skip_newlines();
+                let expr = self.parse_expr()?;
+                self.skip_newlines();
+                self.expect(&Token::RBrace)?;
+                Ok(TemplateNode::Invariant(expr))
+            }
+            // `ident { ... }` — element OR `ident : expr` — attribute (but attrs are parsed inside element bodies)
+            Token::Ident(_) => {
+                // Peek ahead: if next-next is LBrace → element; if next-next is Colon → treat as expr text
+                // We parse as an element only when ident is immediately followed by `{`
+                if matches!(self.peek_ahead(1), Token::LBrace) {
+                    self.parse_template_element()
+                } else if matches!(self.peek_ahead(1), Token::Colon) {
+                    // standalone `key: expr` at top level — treat as text expression (shouldn't normally occur)
+                    let expr = self.parse_expr()?;
+                    Ok(TemplateNode::Text(expr))
+                } else {
+                    // expression node (variable, call, etc.)
+                    let expr = self.parse_expr()?;
+                    Ok(TemplateNode::Text(expr))
+                }
+            }
+            // Any other expression → text node
+            _ => {
+                let expr = self.parse_expr()?;
+                Ok(TemplateNode::Text(expr))
+            }
+        }
+    }
+
+    /// Parse an HTML element: `tag_name { attrs_and_children... }`
+    fn parse_template_element(&mut self) -> Result<TemplateNode, HexaError> {
+        let tag = self.expect_ident()?;
+        self.skip_newlines();
+        self.expect(&Token::LBrace)?;
+        self.skip_newlines();
+
+        let mut attrs = Vec::new();
+        let mut children = Vec::new();
+
+        loop {
+            self.skip_newlines();
+            if matches!(self.peek(), Token::RBrace | Token::Eof) {
+                break;
+            }
+
+            // Distinguish `key: expr` (attribute) from child nodes
+            // `ident :` (with Colon next) → attribute
+            if matches!(self.peek(), Token::Ident(_)) && matches!(self.peek_ahead(1), Token::Colon) {
+                let key = self.expect_ident()?;
+                self.expect(&Token::Colon)?;
+                let value = self.parse_expr()?;
+                attrs.push(TemplateAttr { key, value });
+            } else {
+                // child node
+                children.push(self.parse_template_node()?);
+            }
+
+            if matches!(self.peek(), Token::Comma | Token::Semicolon) {
+                self.advance();
+            }
+        }
+
+        self.expect(&Token::RBrace)?;
+        Ok(TemplateNode::Element { tag, attrs, children })
     }
 
     // ── Algebraic effects parsing ────────────────────────────
