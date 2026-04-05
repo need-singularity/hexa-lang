@@ -11,13 +11,9 @@ pub struct LicmPass;
 impl Pass for LicmPass {
     fn name(&self) -> &'static str { "licm" }
 
-    #[allow(unused_variables, unused_mut, unreachable_code)]
     fn run(&self, module: &mut IrModule) -> PassResult {
         let mut changed = false;
         let mut hoisted = 0usize;
-        // Disabled: LICM+coalesce interaction causes value corruption.
-        // Using codegen-level const register pinning instead.
-        return PassResult { changed: false, stats: vec![("hoisted".into(), 0)] };
 
         for func in &mut module.functions {
             func.rebuild_cfg();
@@ -42,7 +38,7 @@ impl Pass for LicmPass {
             // For each loop, find hoistable instructions:
             // - Load(ImmI64/ImmF64/ImmBool) — constant loads
             // - Pure arithmetic where all operands are loop-invariant
-            for (header, body_blocks) in &loops {
+            for (_header, body_blocks) in &loops {
                 let mut to_hoist: Vec<(BlockId, usize)> = Vec::new(); // (block, instr_idx)
 
                 // Values defined outside the loop are invariant
@@ -86,38 +82,36 @@ impl Pass for LicmPass {
                 let mut new_entry_instrs: Vec<Instruction> = Vec::new();
                 let mut remap: HashMap<ValueId, ValueId> = HashMap::new();
 
-                // Allocate new ValueIds for hoisted instructions
-                let mut next_id = func.next_value_id();
-
-                for (bid, idx) in &to_hoist {
-                    if let Some(block) = func.blocks.iter().find(|b| b.id == *bid) {
+                // Snapshot instructions to avoid borrow conflict
+                let snapshots: Vec<(BlockId, usize, Instruction)> = to_hoist.iter().filter_map(|(bid, idx)| {
+                    func.blocks.iter().find(|b| b.id == *bid).and_then(|block| {
                         if *idx < block.instructions.len() {
-                            let orig = &block.instructions[*idx];
-                            let new_vid = ValueId(next_id);
-                            next_id += 1;
+                            Some((*bid, *idx, block.instructions[*idx].clone()))
+                        } else { None }
+                    })
+                }).collect();
 
-                            // Clone with new ValueId
-                            let mut cloned = orig.clone();
-                            cloned.result = new_vid;
-                            // Remap operands that reference previously hoisted values
-                            for op in &mut cloned.operands {
-                                if let Operand::Value(v) = op {
-                                    if let Some(&remapped) = remap.get(v) {
-                                        *v = remapped;
-                                    }
-                                }
+                for (_bid, _idx, orig) in &snapshots {
+                    let new_vid = func.fresh_value(orig.ty.clone());
+
+                    // Clone with new ValueId
+                    let mut cloned = orig.clone();
+                    cloned.result = new_vid;
+                    // Remap operands that reference previously hoisted values
+                    for op in &mut cloned.operands {
+                        if let Operand::Value(v) = op {
+                            if let Some(&remapped) = remap.get(v) {
+                                *v = remapped;
                             }
-
-                            new_entry_instrs.push(cloned);
-                            remap.insert(orig.result, new_vid);
-
-                            func.value_types.insert(new_vid, orig.ty.clone());
                         }
                     }
+
+                    new_entry_instrs.push(cloned);
+                    remap.insert(orig.result, new_vid);
                 }
 
                 // Replace originals in body with Copy(new_vid)
-                for (bid, idx) in &to_hoist {
+                for (bid, idx, _) in &snapshots {
                     if let Some(block) = func.blocks.iter_mut().find(|b| b.id == *bid) {
                         if *idx < block.instructions.len() {
                             let orig_vid = block.instructions[*idx].result;
