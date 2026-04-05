@@ -1452,7 +1452,7 @@ impl Interpreter {
                     let val = self.eval_expr(fexpr)?;
                     fields.insert(fname.clone(), val);
                 }
-                Ok(Value::Struct(name.clone(), fields))
+                Ok(Value::Struct(name.clone(), Box::new(fields)))
             }
             Expr::MapLit(pairs) => {
                 let mut map = HashMap::new();

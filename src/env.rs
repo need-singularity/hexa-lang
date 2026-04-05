@@ -18,7 +18,7 @@ pub enum Value {
     Tuple(Vec<Value>),
     Fn(String, Vec<String>, Arc<Vec<crate::ast::Stmt>>), // name, param_names, body
     BuiltinFn(String),  // name of builtin
-    Struct(String, HashMap<String, Value>),  // name, fields
+    Struct(String, Box<HashMap<String, Value>>),  // name, fields (boxed for size)
     Lambda(Vec<String>, Arc<Vec<crate::ast::Stmt>>, Vec<(String, Value)>), // params, body, captured env
     Map(HashMap<String, Value>),  // key-value map
     Error(String),  // error value for try/catch
