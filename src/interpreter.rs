@@ -89,6 +89,8 @@ pub struct Interpreter {
     spec_cache: HashMap<SpecKey, Value>,
     /// Inline cache for monomorphic method dispatch.
     pub inline_cache: InlineCache,
+    /// Function call cache: name -> Value::Fn for hot call sites.
+    fn_cache: HashMap<String, Value>,
     /// Optional debug hook for DAP debugger integration.
     #[cfg(not(target_arch = "wasm32"))]
     pub debug_hook: Option<Arc<Mutex<crate::debugger::DebugHook>>>,
@@ -142,6 +144,7 @@ impl Interpreter {
             generic_fn_decls: HashMap::new(),
             spec_cache: HashMap::new(),
             inline_cache: InlineCache::new(),
+            fn_cache: HashMap::new(),
             #[cfg(not(target_arch = "wasm32"))]
             debug_hook: None,
         }
@@ -419,10 +422,9 @@ impl Interpreter {
                     self.generic_fn_decls.insert(decl.name.clone(), decl.clone());
                     // Also define a placeholder in env so lookups find the name
                     let param_names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
-                    self.env.define(
-                        &decl.name,
-                        Value::Fn(format!("__generic__{}", decl.name), param_names, Arc::new(decl.body.clone())),
-                    );
+                    let fn_val = Value::Fn(format!("__generic__{}", decl.name), param_names, Arc::new(decl.body.clone()));
+                    self.fn_cache.insert(decl.name.clone(), fn_val.clone());
+                    self.env.define(&decl.name, fn_val);
                 } else {
                     let param_names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
                     let internal_name = if decl.is_pure {
@@ -430,10 +432,9 @@ impl Interpreter {
                     } else {
                         decl.name.clone()
                     };
-                    self.env.define(
-                        &decl.name,
-                        Value::Fn(internal_name, param_names, Arc::new(decl.body.clone())),
-                    );
+                    let fn_val = Value::Fn(internal_name, param_names, Arc::new(decl.body.clone()));
+                    self.fn_cache.insert(decl.name.clone(), fn_val.clone());
+                    self.env.define(&decl.name, fn_val);
                 }
                 Ok(Value::Void)
             }
@@ -1142,7 +1143,19 @@ impl Interpreter {
                     _ => {}
                 }
                 let r = self.eval_expr(right)?;
-                self.eval_binary(l, op, r)
+                // Inline fast path for Int operations (dominates fib-like workloads)
+                match (&l, op, &r) {
+                    (Value::Int(a), BinOp::Add, Value::Int(b)) => Ok(Value::Int(a + b)),
+                    (Value::Int(a), BinOp::Sub, Value::Int(b)) => Ok(Value::Int(a - b)),
+                    (Value::Int(a), BinOp::Mul, Value::Int(b)) => Ok(Value::Int(a * b)),
+                    (Value::Int(a), BinOp::Lt, Value::Int(b)) => Ok(Value::Bool(a < b)),
+                    (Value::Int(a), BinOp::Le, Value::Int(b)) => Ok(Value::Bool(a <= b)),
+                    (Value::Int(a), BinOp::Gt, Value::Int(b)) => Ok(Value::Bool(a > b)),
+                    (Value::Int(a), BinOp::Ge, Value::Int(b)) => Ok(Value::Bool(a >= b)),
+                    (Value::Int(a), BinOp::Eq, Value::Int(b)) => Ok(Value::Bool(a == b)),
+                    (Value::Int(a), BinOp::Ne, Value::Int(b)) => Ok(Value::Bool(a != b)),
+                    _ => self.eval_binary(l, op, r),
+                }
             }
             Expr::Unary(op, operand) => {
                 let val = self.eval_expr(operand)?;
@@ -1226,15 +1239,49 @@ impl Interpreter {
                     }
                     return Err(self.runtime_err(format!("undefined enum, type, or module: {}", path_name)));
                 }
-                // Fast path: direct Ident callee avoids eval_expr overhead
+                // Fast path: direct Ident callee with fn_cache + inline call
                 if let Expr::Ident(fn_name) = callee.as_ref() {
-                    // Look up the function value directly
-                    let func = self.env.get(fn_name).ok_or_else(|| {
-                        self.runtime_err(format!("undefined function: {}", fn_name))
-                    })?;
+                    // Try fn_cache first (avoids linear env.get scan)
+                    let func = if let Some(cached) = self.fn_cache.get(fn_name) {
+                        cached.clone()
+                    } else {
+                        let f = self.env.get(fn_name).ok_or_else(|| {
+                            self.runtime_err(format!("undefined function: {}", fn_name))
+                        })?;
+                        // Cache function values only (not mutable bindings)
+                        if matches!(f, Value::Fn(..) | Value::BuiltinFn(_)) {
+                            self.fn_cache.insert(fn_name.clone(), f.clone());
+                        }
+                        f
+                    };
                     let mut arg_vals = Vec::with_capacity(args.len());
                     for a in args {
                         arg_vals.push(self.eval_expr(a)?);
+                    }
+                    // Inline the common Value::Fn path to avoid call_function dispatch
+                    if let Value::Fn(ref _name, ref params, ref body) = func {
+                        if !_name.starts_with("__async__") && !_name.starts_with("__generic__") {
+                            if arg_vals.len() != params.len() {
+                                return Err(self.runtime_err(format!(
+                                    "expected {} arguments, got {}",
+                                    params.len(), arg_vals.len()
+                                )));
+                            }
+                            self.env.push_scope();
+                            for (param, arg) in params.iter().zip(arg_vals) {
+                                self.env.define(param, arg);
+                            }
+                            let mut result = Value::Void;
+                            for stmt in body.iter() {
+                                result = self.exec_stmt(stmt)?;
+                                if self.return_value.is_some() {
+                                    result = self.return_value.take().unwrap();
+                                    break;
+                                }
+                            }
+                            self.env.pop_scope();
+                            return Ok(result);
+                        }
                     }
                     self.call_function(func, arg_vals)
                 } else {
