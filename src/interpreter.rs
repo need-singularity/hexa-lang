@@ -1173,7 +1173,7 @@ impl Interpreter {
                 // Check for method call pattern: obj.method(args)
                 if let Expr::Field(obj_expr, method_name) = callee.as_ref() {
                     let obj_val = self.eval_expr(obj_expr)?;
-                    let mut arg_vals = Vec::new();
+                    let mut arg_vals = Vec::with_capacity(args.len());
                     for a in args {
                         arg_vals.push(self.eval_expr(a)?);
                     }
@@ -1181,7 +1181,7 @@ impl Interpreter {
                 }
                 // Check for path::member(args) pattern (module func or enum variant)
                 if let Expr::EnumPath(path_name, member_name, None) = callee.as_ref() {
-                    let mut arg_vals = Vec::new();
+                    let mut arg_vals = Vec::with_capacity(args.len());
                     for a in args {
                         arg_vals.push(self.eval_expr(a)?);
                     }
@@ -1304,14 +1304,14 @@ impl Interpreter {
                 }
             }
             Expr::Array(items) => {
-                let mut vals = Vec::new();
+                let mut vals = Vec::with_capacity(items.len());
                 for item in items {
                     vals.push(self.eval_expr(item)?);
                 }
                 Ok(Value::Array(vals))
             }
             Expr::Tuple(items) => {
-                let mut vals = Vec::new();
+                let mut vals = Vec::with_capacity(items.len());
                 for item in items {
                     vals.push(self.eval_expr(item)?);
                 }

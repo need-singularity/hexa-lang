@@ -176,7 +176,7 @@ impl Parser {
             Token::Ident(ref s) if s == "consciousness" && !matches!(self.peek_ahead(1), Token::ColonColon | Token::Dot | Token::Eq | Token::LParen) => {
                 self.advance(); // consume 'consciousness'
                 let name = match self.peek().clone() {
-                    Token::StringLit(s) => { self.advance(); s }
+                    Token::StringLit(s) => { self.advance(); s.to_string() }
                     Token::Ident(_) if !matches!(self.peek_ahead(1), Token::ColonColon) => self.expect_ident()?,
                     Token::LBrace => "default".to_string(),
                     _ => return Err(self.error(format!(
@@ -447,7 +447,7 @@ impl Parser {
         self.advance(); // consume 'intent'
         // intent "description" { key: value, ... }
         let description = match self.peek().clone() {
-            Token::StringLit(s) => { self.advance(); s }
+            Token::StringLit(s) => { self.advance(); s.to_string() }
             Token::Ident(_) => { self.expect_ident()? }
             _ => return Err(self.error(format!("expected string or identifier after 'intent', got {:?}", self.peek()))),
         };
@@ -473,7 +473,7 @@ impl Parser {
         self.advance(); // consume 'verify'
         // verify "name" { ... } or verify name { ... }
         let name = match self.peek().clone() {
-            Token::StringLit(s) => { self.advance(); s }
+            Token::StringLit(s) => { self.advance(); s.to_string() }
             Token::Ident(_) => { self.expect_ident()? }
             _ => return Err(self.error(format!("expected string or identifier after 'verify', got {:?}", self.peek()))),
         };
@@ -507,7 +507,7 @@ impl Parser {
         if let Token::StringLit(name) = self.peek().clone() {
             self.advance(); // consume name
             let body = self.parse_block()?;
-            return Ok(Stmt::SpawnNamed(name, body));
+            return Ok(Stmt::SpawnNamed(name.to_string(), body));
         }
         let body = self.parse_block()?;
         Ok(Stmt::Spawn(body))
@@ -624,7 +624,7 @@ impl Parser {
         while !matches!(self.peek(), Token::RBrace | Token::Eof) {
             // Check for timeout arm: timeout(ms) => { body }
             if let Token::Ident(ref s) = self.peek().clone() {
-                if s == "timeout" {
+                if &**s == "timeout" {
                     self.advance(); // consume 'timeout'
                     self.expect(&Token::LParen)?;
                     let duration_expr = self.parse_expr()?;
@@ -649,7 +649,7 @@ impl Parser {
             //
             // Detect "from" syntax: identifier followed by "from"
             let is_from_syntax = if let Token::Ident(_) = self.peek() {
-                matches!(self.peek_ahead(1), Token::Ident(ref s) if s == "from")
+                matches!(self.peek_ahead(1), Token::Ident(ref s) if &**s == "from")
             } else {
                 false
             };
@@ -740,7 +740,7 @@ impl Parser {
             self.skip_newlines();
             // Body must be a single string literal (the description)
             let description = match self.peek().clone() {
-                Token::StringLit(s) => { self.advance(); s }
+                Token::StringLit(s) => { self.advance(); s.to_string() }
                 _ => return Err(self.error(format!(
                     "generate fn body must be a string description, got {:?}", self.peek()
                 ))),
@@ -763,7 +763,7 @@ impl Parser {
             self.expect(&Token::LBrace)?;
             self.skip_newlines();
             let description = match self.peek().clone() {
-                Token::StringLit(s) => { self.advance(); s }
+                Token::StringLit(s) => { self.advance(); s.to_string() }
                 _ => return Err(self.error(format!(
                     "generate body must be a string description, got {:?}", self.peek()
                 ))),
@@ -850,7 +850,7 @@ impl Parser {
 
     fn parse_macro_pattern_token(&mut self) -> Result<MacroPatternToken, HexaError> {
         if let Token::Ident(ref s) = self.peek().clone() {
-            if s == "$" {
+            if &**s == "$" {
                 self.advance();
                 if matches!(self.peek(), Token::LParen) {
                     self.advance();
@@ -906,7 +906,7 @@ impl Parser {
 
     fn parse_macro_body_token(&mut self) -> Result<MacroBodyToken, HexaError> {
         if let Token::Ident(ref s) = self.peek().clone() {
-            if s == "$" {
+            if &**s == "$" {
                 self.advance();
                 if matches!(self.peek(), Token::LParen) {
                     self.advance();
@@ -935,10 +935,10 @@ impl Parser {
     fn parse_macro_lit_token(&mut self) -> Result<MacroLitToken, HexaError> {
         let tok = self.peek().clone();
         let lit = match tok {
-            Token::Ident(ref s) => MacroLitToken::Ident(s.clone()),
+            Token::Ident(ref s) => MacroLitToken::Ident(s.to_string()),
             Token::IntLit(n) => MacroLitToken::IntLit(n),
             Token::FloatLit(n) => MacroLitToken::FloatLit(n),
-            Token::StringLit(ref s) => MacroLitToken::StringLit(s.clone()),
+            Token::StringLit(ref s) => MacroLitToken::StringLit(s.to_string()),
             Token::BoolLit(b) => MacroLitToken::BoolLit(b),
             Token::LParen => MacroLitToken::LParen,
             Token::RParen => MacroLitToken::RParen,
@@ -1190,7 +1190,7 @@ impl Parser {
 
     /// Parse optional `ensures <expr>` clause (postcondition).
     fn parse_ensures_clause(&mut self) -> Result<Option<Expr>, HexaError> {
-        if matches!(self.peek(), Token::Ident(s) if s == "ensures") {
+        if matches!(self.peek(), Token::Ident(s) if &**s == "ensures") {
             self.advance(); // consume 'ensures'
             let expr = self.parse_expr()?;
             Ok(Some(expr))
@@ -1444,13 +1444,13 @@ impl Parser {
     fn parse_match_pattern(&mut self) -> Result<Expr, HexaError> {
         // Check for wildcard `_`
         if let Token::Ident(ref name) = self.peek().clone() {
-            if name == "_" {
+            if &**name == "_" {
                 self.advance();
                 return Ok(Expr::Wildcard);
             }
             // Check for EnumPath: `Ident :: Ident` or `Ident :: Ident ( expr )`
             if matches!(self.peek_ahead(1), Token::ColonColon) {
-                let enum_name = name.clone();
+                let enum_name = name.to_string();
                 self.advance(); // consume enum name
                 self.advance(); // consume ::
                 let variant = self.expect_ident()?;
@@ -1679,9 +1679,10 @@ impl Parser {
             Token::IntLit(n) => { self.advance(); Ok(Expr::IntLit(n)) }
             Token::FloatLit(n) => { self.advance(); Ok(Expr::FloatLit(n)) }
             Token::BoolLit(b) => { self.advance(); Ok(Expr::BoolLit(b)) }
-            Token::StringLit(s) => { self.advance(); Ok(Expr::StringLit(s)) }
+            Token::StringLit(s) => { self.advance(); Ok(Expr::StringLit(s.to_string())) }
             Token::CharLit(c) => { self.advance(); Ok(Expr::CharLit(c)) }
-            Token::Ident(name) => {
+            Token::Ident(ref rc_name) => {
+                let name = rc_name.to_string();
                 self.advance();
                 // Check for macro invocation: name!(...) or name![...]
                 if matches!(self.peek(), Token::Not) {

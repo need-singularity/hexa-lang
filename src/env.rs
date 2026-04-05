@@ -311,7 +311,12 @@ impl Env {
     #[inline]
     pub fn push_scope(&mut self) {
         self.scope_starts.push(self.vars.len());
-        self.ownership.push(HashMap::new());
+        // Only grow ownership stack if ownership tracking is active.
+        // For programs that never use own/borrow/move (e.g., fib), this avoids
+        // pushing a HashMap struct (~48 bytes) per scope.
+        if self.ownership_count > 0 {
+            self.ownership.push(HashMap::new());
+        }
     }
 
     #[inline]
@@ -319,7 +324,9 @@ impl Env {
         if let Some(start) = self.scope_starts.pop() {
             self.vars.truncate(start);
         }
-        self.ownership.pop();
+        if self.ownership_count > 0 && self.ownership.len() > self.scope_starts.len() {
+            self.ownership.pop();
+        }
     }
 
     #[inline]
@@ -420,6 +427,11 @@ impl Env {
 
     /// Set ownership state for a variable.
     pub fn set_ownership(&mut self, name: &str, state: OwnershipState) {
+        // Lazily inflate ownership stack to match scope depth when first used.
+        let scope_depth = self.scope_starts.len();
+        while self.ownership.len() < scope_depth {
+            self.ownership.push(HashMap::new());
+        }
         if let Some(scope) = self.ownership.last_mut() {
             scope.insert(name.to_string(), state);
             self.ownership_count += 1;

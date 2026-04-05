@@ -140,14 +140,16 @@ fn can_jit_stmt(stmt: &Stmt) -> bool {
         Stmt::ImplBlock(ib) => ib.methods.iter().all(|m| m.body.iter().all(|s| can_jit_stmt(s))),
         Stmt::While(cond, body) => can_jit_expr(cond) && body.iter().all(|s| can_jit_stmt(s)),
         Stmt::For(_, iter_expr, body) => can_jit_expr(iter_expr) && body.iter().all(|s| can_jit_stmt(s)),
+        Stmt::Const(_, _, expr, _) => can_jit_expr(expr),
+        Stmt::Loop(body) => body.iter().all(|s| can_jit_stmt(s)),
         // These are not yet supported in JIT:
-        Stmt::Loop(..) | Stmt::TryCatch(..) | Stmt::Throw(..) |
+        Stmt::TryCatch(..) | Stmt::Throw(..) |
         Stmt::Spawn(..) | Stmt::SpawnNamed(..) | Stmt::Mod(..) | Stmt::Use(..) |
         Stmt::Proof(..) | Stmt::Assert(..) | Stmt::Intent(..) | Stmt::Verify(..) |
         Stmt::DropStmt(..) | Stmt::AsyncFnDecl(..) | Stmt::Select(..) |
         Stmt::MacroDef(..) | Stmt::DeriveDecl(..) | Stmt::Generate(..) |
         Stmt::Optimize(..) | Stmt::ComptimeFn(..) | Stmt::EffectDecl(..) | Stmt::ConsciousnessBlock(..) | Stmt::EvolveFn(..) |
-        Stmt::TraitDecl(..) | Stmt::Const(..) | Stmt::Static(..) |
+        Stmt::TraitDecl(..) | Stmt::Static(..) |
         Stmt::Scope(..) | Stmt::ProofBlock(..)
         | Stmt::TypeAlias(..) | Stmt::AtomicLet(..) | Stmt::Panic(..) | Stmt::Theorem(..) => false,
     }

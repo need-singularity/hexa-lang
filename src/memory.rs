@@ -575,43 +575,92 @@ impl Tracker {
 /// The Egyptian Fraction memory manager.
 ///
 /// Splits total budget using 1/2 + 1/3 + 1/6 = 1 (n=6 perfect number identity).
+/// The Egyptian Fraction memory manager — **lazy initialization**.
+///
+/// Splits total budget using 1/2 + 1/3 + 1/6 = 1 (n=6 perfect number identity).
+///
+/// Regions are allocated on first use, not at construction. This saves ~64 MB RSS
+/// for simple programs (e.g. fib(30)) that only use value types and never trigger
+/// the memory tracker.
 pub struct EgyptianMemory {
     total_budget: usize,
-    stack: StackRegion,
-    heap: HeapRegion,
-    arena: ArenaRegion,
+    /// Lazy-initialized regions. `None` until first allocation in that region.
+    stack: Option<Box<StackRegion>>,
+    heap: Option<Box<HeapRegion>>,
+    arena: Option<Box<ArenaRegion>>,
     total_allocs: u64,
     tracker: Tracker,
 }
 
 impl EgyptianMemory {
     /// Create a new memory manager with the given total budget in bytes.
+    /// Regions are NOT allocated until first use (lazy init).
     pub fn new(total_budget: usize) -> Self {
-        let stack_cap = total_budget / EGYPTIAN_STACK;  // 1/2
-        let heap_cap = total_budget / EGYPTIAN_HEAP;    // 1/3
-        let arena_cap = total_budget / EGYPTIAN_ARENA;  // 1/6
-        debug_assert!((stack_cap + heap_cap + arena_cap) as i64 - total_budget as i64 <= 1);
-
         Self {
             total_budget,
-            stack: StackRegion::new(stack_cap),
-            heap: HeapRegion::new(heap_cap),
-            arena: ArenaRegion::new(arena_cap),
+            stack: None,
+            heap: None,
+            arena: None,
             total_allocs: 0,
             tracker: Tracker::new(),
         }
     }
 
-    /// Create with default 64 MB budget.
+    /// Create an eagerly-initialized memory manager (for tests that need immediate allocation).
+    pub fn new_eager(total_budget: usize) -> Self {
+        let stack_cap = total_budget / EGYPTIAN_STACK;
+        let heap_cap = total_budget / EGYPTIAN_HEAP;
+        let arena_cap = total_budget / EGYPTIAN_ARENA;
+        Self {
+            total_budget,
+            stack: Some(Box::new(StackRegion::new(stack_cap))),
+            heap: Some(Box::new(HeapRegion::new(heap_cap))),
+            arena: Some(Box::new(ArenaRegion::new(arena_cap))),
+            total_allocs: 0,
+            tracker: Tracker::new(),
+        }
+    }
+
+    /// Create with default 64 MB budget (lazy).
     pub fn with_default_budget() -> Self {
         Self::new(DEFAULT_BUDGET)
+    }
+
+    /// Ensure the stack region is initialized, returning a mutable reference.
+    #[inline]
+    fn ensure_stack(&mut self) -> &mut StackRegion {
+        if self.stack.is_none() {
+            let cap = self.total_budget / EGYPTIAN_STACK;
+            self.stack = Some(Box::new(StackRegion::new(cap)));
+        }
+        self.stack.as_mut().unwrap()
+    }
+
+    /// Ensure the heap region is initialized, returning a mutable reference.
+    #[inline]
+    fn ensure_heap(&mut self) -> &mut HeapRegion {
+        if self.heap.is_none() {
+            let cap = self.total_budget / EGYPTIAN_HEAP;
+            self.heap = Some(Box::new(HeapRegion::new(cap)));
+        }
+        self.heap.as_mut().unwrap()
+    }
+
+    /// Ensure the arena region is initialized, returning a mutable reference.
+    #[inline]
+    fn ensure_arena(&mut self) -> &mut ArenaRegion {
+        if self.arena.is_none() {
+            let cap = self.total_budget / EGYPTIAN_ARENA;
+            self.arena = Some(Box::new(ArenaRegion::new(cap)));
+        }
+        self.arena.as_mut().unwrap()
     }
 
     // ── Stack operations ────────────────────────────────────
 
     /// Allocate on the stack (for local value-type variables).
     pub fn stack_alloc(&mut self, name: &str, size: usize) -> Result<usize, MemoryError> {
-        let offset = self.stack.alloc(size)?;
+        let offset = self.ensure_stack().alloc(size)?;
         self.total_allocs += 1;
         self.tracker.record(name, MemRegion::Stack, offset, size);
         Ok(offset)
@@ -620,13 +669,15 @@ impl EgyptianMemory {
     /// Push a new call frame onto the stack.
     pub fn push_frame(&mut self, name: &str) {
         let name_id = self.tracker.intern(name);
-        self.stack.push_frame_id(name_id);
+        self.ensure_stack().push_frame_id(name_id);
     }
 
     /// Pop the top call frame, freeing stack space and removing tracked vars.
     pub fn pop_frame(&mut self) {
-        if let Some(frame) = self.stack.pop_frame() {
-            self.tracker.drop_stack_frame(frame.base);
+        if let Some(ref mut stack) = self.stack {
+            if let Some(frame) = stack.pop_frame() {
+                self.tracker.drop_stack_frame(frame.base);
+            }
         }
     }
 
@@ -634,15 +685,17 @@ impl EgyptianMemory {
 
     /// Allocate on the heap (for dynamic objects: structs, arrays, closures).
     pub fn heap_alloc(&mut self, name: &str, size: usize) -> Result<usize, MemoryError> {
-        match self.heap.alloc(size) {
+        match self.ensure_heap().alloc(size) {
             Ok(offset) => {
                 self.total_allocs += 1;
                 self.tracker.record(name, MemRegion::Heap, offset, size);
                 Ok(offset)
             }
             Err(e) => {
-                if self.arena.used() > 0 {
-                    self.arena.reset();
+                if let Some(ref mut arena) = self.arena {
+                    if arena.used() > 0 {
+                        arena.reset();
+                    }
                 }
                 Err(e)
             }
@@ -656,21 +709,21 @@ impl EgyptianMemory {
             _ => return Ok(()), // silently ignore non-heap / unknown
         };
         self.tracker.tombstone(idx);
-        self.heap.free(offset)
+        self.ensure_heap().free(offset)
     }
 
     // ── Arena operations ────────────────────────────────────
 
     /// Allocate in the arena (for temporaries, string ops, intermediate results).
     pub fn arena_alloc(&mut self, size: usize) -> Result<usize, MemoryError> {
-        match self.arena.alloc(size) {
+        match self.ensure_arena().alloc(size) {
             Ok(offset) => {
                 self.total_allocs += 1;
                 Ok(offset)
             }
             Err(_) => {
-                self.arena.reset();
-                let offset = self.arena.alloc(size)?;
+                self.ensure_arena().reset();
+                let offset = self.ensure_arena().alloc(size)?;
                 self.total_allocs += 1;
                 Ok(offset)
             }
@@ -679,7 +732,9 @@ impl EgyptianMemory {
 
     /// Manually reset the arena (advanced use).
     pub fn arena_reset(&mut self) {
-        self.arena.reset();
+        if let Some(ref mut arena) = self.arena {
+            arena.reset();
+        }
         self.tracker.drop_arena();
     }
 
@@ -694,17 +749,17 @@ impl EgyptianMemory {
 
     pub fn stats(&self) -> MemoryStats {
         MemoryStats {
-            stack_used: self.stack.used(),
-            stack_capacity: self.stack.capacity(),
-            heap_used: self.heap.used(),
-            heap_capacity: self.heap.capacity(),
-            heap_allocs: self.heap.alloc_count(),
-            arena_used: self.arena.used(),
-            arena_capacity: self.arena.capacity(),
-            arena_resets: self.arena.generation(),
+            stack_used: self.stack.as_ref().map_or(0, |s| s.used()),
+            stack_capacity: self.stack.as_ref().map_or(self.total_budget / EGYPTIAN_STACK, |s| s.capacity()),
+            heap_used: self.heap.as_ref().map_or(0, |h| h.used()),
+            heap_capacity: self.heap.as_ref().map_or(self.total_budget / EGYPTIAN_HEAP, |h| h.capacity()),
+            heap_allocs: self.heap.as_ref().map_or(0, |h| h.alloc_count()),
+            arena_used: self.arena.as_ref().map_or(0, |a| a.used()),
+            arena_capacity: self.arena.as_ref().map_or(self.total_budget / EGYPTIAN_ARENA, |a| a.capacity()),
+            arena_resets: self.arena.as_ref().map_or(0, |a| a.generation()),
             total_budget: self.total_budget,
             total_allocs: self.total_allocs,
-            stack_frame_depth: self.stack.frame_depth(),
+            stack_frame_depth: self.stack.as_ref().map_or(0, |s| s.frame_depth()),
         }
     }
 
@@ -715,18 +770,18 @@ impl EgyptianMemory {
     /// Write bytes to a region at a given offset.
     pub fn write(&mut self, region: MemRegion, offset: usize, bytes: &[u8]) {
         match region {
-            MemRegion::Stack => self.stack.write(offset, bytes),
-            MemRegion::Heap => self.heap.write(offset, bytes),
-            MemRegion::Arena => self.arena.write(offset, bytes),
+            MemRegion::Stack => self.ensure_stack().write(offset, bytes),
+            MemRegion::Heap => self.ensure_heap().write(offset, bytes),
+            MemRegion::Arena => self.ensure_arena().write(offset, bytes),
         }
     }
 
     /// Read bytes from a region at a given offset.
     pub fn read(&self, region: MemRegion, offset: usize, len: usize) -> &[u8] {
         match region {
-            MemRegion::Stack => self.stack.read(offset, len),
-            MemRegion::Heap => self.heap.read(offset, len),
-            MemRegion::Arena => self.arena.read(offset, len),
+            MemRegion::Stack => self.stack.as_ref().expect("stack not initialized").read(offset, len),
+            MemRegion::Heap => self.heap.as_ref().expect("heap not initialized").read(offset, len),
+            MemRegion::Arena => self.arena.as_ref().expect("arena not initialized").read(offset, len),
         }
     }
 }
@@ -812,7 +867,7 @@ mod tests {
     fn test_egyptian_fraction_identity() {
         // 1/2 + 1/3 + 1/6 = 1
         let total = 600; // divisible by 6 for clean math
-        let mem = EgyptianMemory::new(total);
+        let mem = EgyptianMemory::new_eager(total);
         let stats = mem.stats();
         assert_eq!(stats.stack_capacity, 300); // 1/2
         assert_eq!(stats.heap_capacity, 200);  // 1/3
@@ -822,7 +877,7 @@ mod tests {
 
     #[test]
     fn test_stack_alloc_and_frame() {
-        let mut mem = EgyptianMemory::new(600);
+        let mut mem = EgyptianMemory::new_eager(600);
         mem.push_frame("main");
         let off = mem.stack_alloc("x", 8).unwrap();
         assert_eq!(off, 0);
@@ -842,7 +897,7 @@ mod tests {
 
     #[test]
     fn test_heap_alloc_and_free() {
-        let mut mem = EgyptianMemory::new(600);
+        let mut mem = EgyptianMemory::new_eager(600);
         let off = mem.heap_alloc("arr", 32).unwrap();
         assert!(off < 200);
         assert!(mem.stats().heap_used > 0);
@@ -854,7 +909,7 @@ mod tests {
 
     #[test]
     fn test_arena_bump_and_reset() {
-        let mut mem = EgyptianMemory::new(600);
+        let mut mem = EgyptianMemory::new_eager(600);
         let off1 = mem.arena_alloc(16).unwrap();
         let off2 = mem.arena_alloc(16).unwrap();
         assert_eq!(off1, 0);
@@ -868,7 +923,7 @@ mod tests {
 
     #[test]
     fn test_stack_overflow_error() {
-        let mut mem = EgyptianMemory::new(600); // stack = 300
+        let mut mem = EgyptianMemory::new_eager(600); // stack = 300
         let result = mem.stack_alloc("big", 400);
         assert!(result.is_err());
         if let Err(MemoryError::StackOverflow { budget_fraction, .. }) = result {
@@ -878,7 +933,7 @@ mod tests {
 
     #[test]
     fn test_heap_exhaustion_error() {
-        let mut mem = EgyptianMemory::new(600); // heap = 200
+        let mut mem = EgyptianMemory::new_eager(600); // heap = 200
         let result = mem.heap_alloc("big", 300);
         assert!(result.is_err());
         if let Err(MemoryError::HeapExhausted { budget_fraction, .. }) = result {
@@ -888,7 +943,7 @@ mod tests {
 
     #[test]
     fn test_arena_auto_reset_on_overflow() {
-        let mut mem = EgyptianMemory::new(600); // arena = 100
+        let mut mem = EgyptianMemory::new_eager(600); // arena = 100
         // Fill arena
         mem.arena_alloc(90).unwrap();
         // This should auto-reset and succeed
@@ -899,7 +954,7 @@ mod tests {
 
     #[test]
     fn test_total_allocs_tracking() {
-        let mut mem = EgyptianMemory::new(600);
+        let mut mem = EgyptianMemory::new_eager(600);
         mem.stack_alloc("a", 8).unwrap();
         mem.heap_alloc("b", 16).unwrap();
         mem.arena_alloc(8).unwrap();
@@ -908,7 +963,7 @@ mod tests {
 
     #[test]
     fn test_write_and_read() {
-        let mut mem = EgyptianMemory::new(600);
+        let mut mem = EgyptianMemory::new_eager(600);
         let off = mem.stack_alloc("x", 8).unwrap();
         mem.write(MemRegion::Stack, off, &42i64.to_le_bytes());
         let bytes = mem.read(MemRegion::Stack, off, 8);
@@ -920,7 +975,7 @@ mod tests {
     fn test_heap_coalesce() {
         // With segregated free lists we no longer coalesce across the bump
         // arena, but freed blocks are reused within their size class.
-        let mut mem = EgyptianMemory::new(6000); // heap = 2000
+        let mut mem = EgyptianMemory::new_eager(6000); // heap = 2000
         let _off1 = mem.heap_alloc("a", 8).unwrap();
         let _off2 = mem.heap_alloc("b", 8).unwrap();
         let _off3 = mem.heap_alloc("c", 8).unwrap();
@@ -965,7 +1020,7 @@ mod tests {
 
     #[test]
     fn test_stats_display() {
-        let mem = EgyptianMemory::new(600);
+        let mem = EgyptianMemory::new_eager(600);
         let output = format!("{}", mem.stats());
         assert!(output.contains("Egyptian Fraction"));
         assert!(output.contains("1/2"));
@@ -990,7 +1045,7 @@ mod tests {
 
     #[test]
     fn test_heap_size_class_reuse() {
-        let mut mem = EgyptianMemory::new(60_000);
+        let mut mem = EgyptianMemory::new_eager(60_000);
         // Small (16B class)
         let o1 = mem.heap_alloc("s1", 10).unwrap();
         mem.heap_free("s1").unwrap();
@@ -1000,7 +1055,7 @@ mod tests {
 
     #[test]
     fn test_heap_stress_reuse() {
-        let mut mem = EgyptianMemory::new(600_000);
+        let mut mem = EgyptianMemory::new_eager(600_000);
         for i in 0..1000 {
             let name = format!("v{}", i % 8);
             let _ = mem.heap_alloc(&name, 64).unwrap();
@@ -1014,7 +1069,7 @@ mod tests {
 
     #[test]
     fn test_stack_frames_max_depth() {
-        let mut mem = EgyptianMemory::new(60_000);
+        let mut mem = EgyptianMemory::new_eager(60_000);
         for i in 0..MAX_FRAMES {
             mem.push_frame(&format!("f{}", i));
             mem.stack_alloc(&format!("x{}", i), 8).unwrap();
