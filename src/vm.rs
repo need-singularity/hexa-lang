@@ -467,23 +467,23 @@ impl VM {
             )));
         }
 
-        // Pop arguments from stack
-        let start = self.stack.len().saturating_sub(argc);
-        let args: Vec<Value> = self.stack.drain(start..).collect();
-
-        // Allocate local slots for this call
+        // Move arguments directly from stack to locals (no intermediate Vec)
         let local_base = self.locals.len();
         let needed = local_base + func.local_count;
         if needed > self.locals.len() {
             self.locals.resize(needed, Value::Void);
         }
 
-        // Place args into local slots
-        for (i, arg) in args.into_iter().enumerate() {
-            self.locals[local_base + i] = arg;
+        // Pop args from stack directly into local slots (reverse order)
+        let stack_start = self.stack.len().saturating_sub(argc);
+        for i in 0..argc {
+            self.locals[local_base + i] = std::mem::replace(
+                &mut self.stack[stack_start + i], Value::Void
+            );
         }
+        self.stack.truncate(stack_start);
 
-        // Push call frame
+        // Push call frame (reuse string from string_pool, avoid allocation)
         self.frames.push(CallFrame {
             func_name: name.to_string(),
             return_ip: 0,

@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use crate::ast::*;
 use crate::env::Value;
 use crate::error::{HexaError, ErrorClass};
@@ -75,7 +76,7 @@ pub struct CompiledFunction {
     pub name: String,
     pub arity: usize,
     pub param_names: Vec<String>,
-    pub code: Vec<OpCode>,
+    pub code: Arc<Vec<OpCode>>,
     /// Number of local slots needed (params + locals).
     pub local_count: usize,
 }
@@ -290,7 +291,7 @@ impl Compiler {
             name: decl.name.clone(),
             arity: decl.params.len(),
             param_names: decl.params.iter().map(|p| p.name.clone()).collect(),
-            code: func_code,
+            code: Arc::new(func_code),
             local_count,
         })
     }
