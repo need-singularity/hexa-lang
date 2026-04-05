@@ -1,7 +1,7 @@
 //! P9: Code Sinking — move computations closer to their use sites.
 
 use std::collections::{HashMap, HashSet};
-use crate::ir::{IrModule, OpCode, Operand, ValueId, BlockId};
+use crate::ir::{IrModule, Operand, ValueId, BlockId};
 use super::{Pass, PassResult};
 
 pub struct CodeSinkingPass;
@@ -10,7 +10,9 @@ impl Pass for CodeSinkingPass {
     fn name(&self) -> &'static str { "code_sinking" }
 
     fn run(&self, module: &mut IrModule) -> PassResult {
+        #[allow(unused_variables, unused_mut)]
         let mut changed = false;
+        #[allow(unused_variables, unused_mut)]
         let mut sunk = 0usize;
 
         // Code sinking moves instructions from a dominator block into a

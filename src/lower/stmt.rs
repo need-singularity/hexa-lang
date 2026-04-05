@@ -1,7 +1,7 @@
 //! Statement lowering — AST Stmt → HEXA-IR instructions.
 
-use crate::ast::{self, Stmt, Expr};
-use crate::ir::{self, IrBuilder, IrModule, IrType, ValueId, FuncId};
+use crate::ast::{Stmt, Expr};
+use crate::ir::{IrBuilder, IrModule, IrType, ValueId};
 use super::LowerCtx;
 use super::expr::lower_expr;
 
@@ -189,7 +189,7 @@ pub fn lower_stmt_val(ctx: &mut LowerCtx, builder: &mut IrBuilder, stmt: &Stmt) 
             builder.const_i64(0)
         }
 
-        Stmt::ImplBlock(ib) => {
+        Stmt::ImplBlock(_ib) => {
             // Methods registered in register_decl or third pass
             builder.const_i64(0)
         }

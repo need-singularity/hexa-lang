@@ -8,7 +8,7 @@ pub mod pattern;
 
 use std::collections::HashMap;
 use crate::ast;
-use crate::ir::{self, IrModule, IrFunction, IrBuilder, IrType, ValueId, BlockId, FuncId, Operand};
+use crate::ir::{self, IrModule, IrBuilder, IrType, ValueId, BlockId, FuncId};
 
 /// Single variable binding entry in the shadow stack.
 #[derive(Debug, Clone)]
@@ -155,14 +155,14 @@ pub fn lower_program(stmts: &[ast::Stmt], module_name: &str) -> IrModule {
             let func = module.function_mut(main_id).unwrap();
             let mut builder = IrBuilder::new(func);
 
+            let mut last = builder.const_i64(0);
             for s in stmts {
-                stmt::lower_stmt(&mut ctx, &mut builder, s);
+                last = stmt::lower_stmt_val(&mut ctx, &mut builder, s);
             }
 
-            // Ensure main returns 0
+            // Return last expression value (C wrapper prints it via printf)
             if !builder.is_current_block_terminated() {
-                let zero = builder.const_i64(0);
-                builder.ret(Some(zero));
+                builder.ret(Some(last));
             }
         }
     }

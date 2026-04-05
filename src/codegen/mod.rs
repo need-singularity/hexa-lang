@@ -214,4 +214,179 @@ mod tests {
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(stdout.trim() == "42", "binary should output 42, got: {}", stdout.trim());
     }
+
+    #[test]
+    fn test_e2e_arithmetic() {
+        // main returns 6*7 = 42
+        let mut module = IrModule::new("test");
+        let fid = module.add_function("main".into(), vec![], IrType::I64);
+        {
+            let func = module.function_mut(fid).unwrap();
+            let mut b = IrBuilder::new(func);
+            let a = b.const_i64(6);
+            let c = b.const_i64(7);
+            let r = b.mul(a, c, IrType::I64);
+            b.ret(Some(r));
+        }
+
+        let output_path = "/tmp/hexa_ir_e2e_arith";
+        let result = compile_to_binary(&module, output_path);
+        assert!(result.is_ok(), "compile failed: {:?}", result);
+
+        let output = std::process::Command::new(output_path).output().unwrap();
+        let _ = std::fs::remove_file(output_path);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(stdout.trim(), "42", "6*7 should be 42, got: {}", stdout.trim());
+    }
+
+    #[test]
+    fn test_e2e_direct_call() {
+        // fn add_one(x) -> x + 1
+        // main: add_one(41) -> 42
+        let mut module = IrModule::new("test");
+
+        let add_one_id = module.add_function(
+            "add_one".into(),
+            vec![("x".into(), IrType::I64)],
+            IrType::I64,
+        );
+        {
+            let func = module.function_mut(add_one_id).unwrap();
+            let mut b = IrBuilder::new(func);
+            let x = b.load_param(0, IrType::I64);
+            let one = b.const_i64(1);
+            let r = b.add(x, one, IrType::I64);
+            b.ret(Some(r));
+        }
+
+        let main_id = module.add_function("main".into(), vec![], IrType::I64);
+        {
+            let func = module.function_mut(main_id).unwrap();
+            let mut b = IrBuilder::new(func);
+            let arg = b.const_i64(41);
+            let r = b.call(add_one_id, vec![arg], IrType::I64);
+            b.ret(Some(r));
+        }
+
+        let output_path = "/tmp/hexa_ir_e2e_call";
+        let result = compile_to_binary(&module, output_path);
+        assert!(result.is_ok(), "compile failed: {:?}", result);
+
+        let output = std::process::Command::new(output_path).output().unwrap();
+        let _ = std::fs::remove_file(output_path);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(stdout.trim(), "42", "add_one(41) should be 42, got: {}", stdout.trim());
+    }
+
+    #[test]
+    fn test_e2e_recursive_factorial() {
+        // fn fact(n) -> if n <= 1 { 1 } else { n * fact(n-1) }
+        // main: fact(5) -> 120
+        let mut module = IrModule::new("test");
+
+        let fact_id = module.add_function(
+            "fact".into(),
+            vec![("n".into(), IrType::I64)],
+            IrType::I64,
+        );
+        {
+            let func = module.function_mut(fact_id).unwrap();
+            let mut b = IrBuilder::new(func);
+
+            // Save param to stack slot (survives across calls)
+            let n_ptr = b.alloc(IrType::I64);
+            let n_param = b.load_param(0, IrType::I64);
+            b.store(n_ptr, n_param);
+
+            // Load n from stack for the comparison
+            let n = b.load(n_ptr, IrType::I64);
+            let one = b.const_i64(1);
+            let cond = b.emit_cmp_le(n, one);
+
+            let then_bb = b.create_block("then");
+            let else_bb = b.create_block("else");
+            let merge_bb = b.create_block("merge");
+
+            b.branch(cond, then_bb, else_bb);
+
+            // then: return 1
+            b.switch_to(then_bb);
+            let then_val = b.const_i64(1);
+            b.jump(merge_bb);
+
+            // else: n * fact(n - 1)
+            // Reload n from stack slot each time -- registers get clobbered
+            // by the recursive call return value in x0.
+            b.switch_to(else_bb);
+            let n2 = b.load(n_ptr, IrType::I64);
+            let one2 = b.const_i64(1);
+            let nm1 = b.sub(n2, one2, IrType::I64);
+            let sub_result = b.call(fact_id, vec![nm1], IrType::I64);
+            let n3 = b.load(n_ptr, IrType::I64); // reload AFTER call
+            let else_val = b.mul(n3, sub_result, IrType::I64);
+            b.jump(merge_bb);
+
+            // merge: phi
+            b.switch_to(merge_bb);
+            let result = b.phi(vec![(then_bb, then_val), (else_bb, else_val)], IrType::I64);
+            b.ret(Some(result));
+        }
+
+        let main_id = module.add_function("main".into(), vec![], IrType::I64);
+        {
+            let func = module.function_mut(main_id).unwrap();
+            let mut b = IrBuilder::new(func);
+            let five = b.const_i64(5);
+            let r = b.call(fact_id, vec![five], IrType::I64);
+            b.ret(Some(r));
+        }
+
+        let output_path = "/tmp/hexa_ir_e2e_fact";
+        let result = compile_to_binary(&module, output_path);
+        assert!(result.is_ok(), "compile failed: {:?}", result);
+
+        let output = std::process::Command::new(output_path).output().unwrap();
+        let _ = std::fs::remove_file(output_path);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(stdout.trim(), "120", "fact(5) should be 120, got: {}", stdout.trim());
+    }
+
+    #[test]
+    fn test_e2e_if_else_expr() {
+        // main: if 1 { 42 } else { 99 } -> 42
+        let mut module = IrModule::new("test");
+        let fid = module.add_function("main".into(), vec![], IrType::I64);
+        {
+            let func = module.function_mut(fid).unwrap();
+            let mut b = IrBuilder::new(func);
+
+            let cond = b.const_i64(1);
+            let then_bb = b.create_block("then");
+            let else_bb = b.create_block("else");
+            let merge_bb = b.create_block("merge");
+
+            b.branch(cond, then_bb, else_bb);
+
+            b.switch_to(then_bb);
+            let v1 = b.const_i64(42);
+            b.jump(merge_bb);
+
+            b.switch_to(else_bb);
+            let v2 = b.const_i64(99);
+            b.jump(merge_bb);
+
+            b.switch_to(merge_bb);
+            let result = b.phi(vec![(then_bb, v1), (else_bb, v2)], IrType::I64);
+            b.ret(Some(result));
+        }
+
+        let output_path = "/tmp/hexa_ir_e2e_ifelse";
+        let result = compile_to_binary(&module, output_path);
+        assert!(result.is_ok(), "compile failed: {:?}", result);
+
+        let output = std::process::Command::new(output_path).output().unwrap();
+        let _ = std::fs::remove_file(output_path);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(stdout.trim(), "42", "if 1 {{42}} else {{99}} should be 42, got: {}", stdout.trim());
+    }
 }

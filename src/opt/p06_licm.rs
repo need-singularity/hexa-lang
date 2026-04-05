@@ -11,6 +11,7 @@ pub struct LicmPass;
 impl Pass for LicmPass {
     fn name(&self) -> &'static str { "licm" }
 
+    #[allow(unused_variables, unused_mut, unreachable_code)]
     fn run(&self, module: &mut IrModule) -> PassResult {
         let mut changed = false;
         let mut hoisted = 0usize;

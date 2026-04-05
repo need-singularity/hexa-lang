@@ -3,8 +3,8 @@
 //! Generates raw x86-64 instructions (variable width).
 
 use std::collections::HashMap;
-use crate::ir::{IrModule, IrFunction, OpCode, Operand, ValueId, IrType};
-use super::regalloc::{AllocResult, FuncAlloc, Location, PhysReg};
+use crate::ir::{IrModule, IrFunction, OpCode, Operand, ValueId};
+use super::regalloc::{AllocResult, FuncAlloc, Location};
 
 /// x86-64 register encoding (REX.W compatible).
 /// Order: rax=0, rcx=1, rdx=2, rbx=3, rsi=4, rdi=5, r8-r15=6-13
@@ -67,7 +67,7 @@ fn emit_prologue(code: &mut Vec<u8>, alloc: &FuncAlloc) {
     }
 }
 
-fn emit_epilogue(code: &mut Vec<u8>, alloc: &FuncAlloc) {
+fn emit_epilogue(code: &mut Vec<u8>, _alloc: &FuncAlloc) {
     // mov rsp, rbp
     code.extend_from_slice(&[0x48, 0x89, 0xec]);
     // pop rbp
@@ -81,7 +81,7 @@ fn emit_instruction(
     instr: &crate::ir::Instruction,
     alloc: &FuncAlloc,
     fixups: &mut Vec<(usize, crate::ir::BlockId)>,
-    module: &IrModule,
+    _module: &IrModule,
 ) {
     let dst = x86_reg(instr.result, alloc);
 

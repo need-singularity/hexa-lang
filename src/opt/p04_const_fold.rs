@@ -4,7 +4,7 @@
 //! float/boolean folding, and fixpoint iteration for cascading folds.
 
 use std::collections::HashMap;
-use crate::ir::{IrModule, OpCode, Operand, IrType, ValueId};
+use crate::ir::{IrModule, OpCode, Operand, ValueId};
 use super::{Pass, PassResult};
 
 pub struct ConstFoldPass;

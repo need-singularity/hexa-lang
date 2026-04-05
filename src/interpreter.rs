@@ -1075,7 +1075,8 @@ impl Interpreter {
                 };
                 Err(self.runtime_err(format!("panic: {}", msg)))
             }
-            // Macro/Derive/Const/Static — not yet implemented at runtime
+            // All Stmt variants are covered above; this arm is intentionally suppressed.
+            #[allow(unreachable_patterns)]
             _ => Ok(Value::Void),
         }
     }
@@ -3431,7 +3432,7 @@ impl Interpreter {
             }
             // ── std::net builtins ────────────────────────────────
             "net_listen" | "net_accept" | "net_connect" | "net_read" | "net_write" | "net_close"
-            | "http_get" | "http_serve" => {
+            | "http_serve" => {
                 #[cfg(target_arch = "wasm32")]
                 {
                     return Err(self.runtime_err(format!("{} is not supported in WASM mode", name)));
@@ -3468,8 +3469,7 @@ impl Interpreter {
                 }
             }
             // ── std::encoding builtins ──────────────────────────────
-            "base64_encode" | "base64_decode" | "hex_encode" | "hex_decode"
-            | "csv_parse" | "csv_format" | "url_encode" | "url_decode" => {
+            "csv_parse" | "csv_format" | "url_encode" | "url_decode" => {
                 #[cfg(target_arch = "wasm32")]
                 {
                     return Err(self.runtime_err(format!("{} is not supported in WASM mode", name)));
@@ -3516,8 +3516,8 @@ impl Interpreter {
                 }
             }
             // ── std::consciousness builtins ─────────────────────────
-            "psi_alpha" | "psi_balance" | "psi_steps" | "psi_entropy"
-            | "phi_compute" | "law_count" | "consciousness_vector" => {
+            "psi_alpha"
+            | "phi_compute" | "law_count" => {
                 crate::std_consciousness::call_consciousness_builtin(self, name, args)
             }
 
@@ -6681,21 +6681,29 @@ result
 
     #[test]
     fn test_bootstrap_lexer_runs() {
-        // Read and run the bootstrap lexer test file
-        let lexer_src = std::fs::read_to_string("self/test_bootstrap.hexa")
-            .expect("self/test_bootstrap.hexa should exist");
-        let tokens = Lexer::new(&lexer_src).tokenize().unwrap();
-        let result = Parser::new(tokens).parse_with_spans().unwrap();
-        let mut checker = crate::type_checker::TypeChecker::new();
-        checker.check(&result.stmts, &result.spans).unwrap();
-        let mut interp = Interpreter::new();
-        interp.source_dir = Some("self".into());
-        // This should execute without errors
-        interp.run_with_spans(&result.stmts, &result.spans).unwrap();
+        let builder = std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024); // 32 MB for 45+ nested if-conditions
+        let handler = builder.spawn(|| {
+            // Read and run the bootstrap lexer test file
+            let lexer_src = std::fs::read_to_string("self/test_bootstrap.hexa")
+                .expect("self/test_bootstrap.hexa should exist");
+            let tokens = Lexer::new(&lexer_src).tokenize().unwrap();
+            let result = Parser::new(tokens).parse_with_spans().unwrap();
+            let mut checker = crate::type_checker::TypeChecker::new();
+            checker.check(&result.stmts, &result.spans).unwrap();
+            let mut interp = Interpreter::new();
+            interp.source_dir = Some("self".into());
+            // This should execute without errors
+            interp.run_with_spans(&result.stmts, &result.spans).unwrap();
+        }).unwrap();
+        handler.join().unwrap();
     }
 
     #[test]
     fn test_bootstrap_lexer_matches_rust_lexer() {
+        let builder = std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024); // 32 MB for deep nested if-conditions
+        let handler = builder.spawn(|| {
         // Compare token counts from HEXA lexer vs Rust lexer on hello.hexa
         let hello_source = std::fs::read_to_string("examples/hello.hexa")
             .expect("examples/hello.hexa should exist");
@@ -7108,6 +7116,8 @@ len(hexa_tokens)
             "HEXA lexer produced {} tokens, Rust lexer produced {} tokens for hello.hexa",
             hexa_count, rust_count
         );
+        }).unwrap();
+        handler.join().unwrap();
     }
 
     // ── Algebraic effects tests ─────────────────────────────

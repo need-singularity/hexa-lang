@@ -1,6 +1,6 @@
 //! Pattern matching lowering — Match expressions → IR branch trees.
 
-use crate::ast::{self, Expr, MatchArm};
+use crate::ast::{Expr, MatchArm};
 use crate::ir::{IrBuilder, IrType, ValueId, BlockId};
 use super::LowerCtx;
 use super::expr::lower_expr;
@@ -100,7 +100,7 @@ fn lower_pattern_test(
         }
 
         // Enum variant: check tag
-        Expr::EnumPath(_, variant, _) => {
+        Expr::EnumPath(_, _variant, _) => {
             // Extract tag from scrutinee (field 0)
             let tag = builder.struct_field(scrut, 0, IrType::I64);
             // Find expected tag value

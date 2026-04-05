@@ -198,7 +198,7 @@ impl CycleEngine {
     /// Phase 1: Blowup — 모든 메트릭을 n=6 상수와 대조
     fn blowup(&self) -> Vec<N6Match> {
         let mut matches = Vec::new();
-        for (name, &value) in self.metrics.iter().map(|(n, v)| (n, v)) {
+        for (_name, &value) in self.metrics.iter().map(|(n, v)| (n, v)) {
             if let Some(m) = n6_check(value) {
                 matches.push(m);
             }

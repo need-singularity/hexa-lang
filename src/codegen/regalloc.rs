@@ -7,7 +7,7 @@
 //! 4. Simplify / spill / select (Chaitin-Briggs)
 
 use std::collections::{HashMap, HashSet, BTreeSet};
-use crate::ir::{IrFunction, IrModule, ValueId, BlockId, Operand, IrType};
+use crate::ir::{IrFunction, IrModule, ValueId, BlockId, Operand};
 use crate::ir::opcode::OpCode;
 use super::Target;
 
@@ -211,6 +211,49 @@ impl InterferenceGraph {
     }
 }
 
+/// Identify SSA values that are live across a Call instruction.
+///
+/// A value is "live across a call" if it is live after the call (i.e., in
+/// live_out of the block or used later in the same block after the call)
+/// and was defined before the call.  Such values must NOT reside in
+/// caller-saved registers (x0-x15 on ARM64), because the call clobbers them.
+pub fn values_live_across_calls(func: &IrFunction, liveness: &LiveInfo) -> HashSet<ValueId> {
+    let mut result = HashSet::new();
+
+    for block in &func.blocks {
+        let live_out: HashSet<ValueId> = liveness.live_out
+            .get(&block.id)
+            .cloned()
+            .unwrap_or_default();
+
+        // Walk instructions in reverse to build a "live after this instr" set.
+        let mut live_after: HashSet<ValueId> = live_out;
+        for instr in block.instructions.iter().rev() {
+            if instr.op == OpCode::Call {
+                // Everything currently live *after* the call (except the call
+                // result itself) is live across the call.
+                for &v in &live_after {
+                    if v != instr.result {
+                        result.insert(v);
+                    }
+                }
+            }
+            // Update live_after for the next (earlier) instruction:
+            // remove def, add uses.
+            live_after.remove(&instr.result);
+            for op in &instr.operands {
+                match op {
+                    Operand::Value(v) => { live_after.insert(*v); }
+                    Operand::PhiEntry(_, v) => { live_after.insert(*v); }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    result
+}
+
 /// Build the interference graph from liveness information.
 ///
 /// Two values interfere if one is defined at a point where the other is live.
@@ -377,6 +420,18 @@ fn allocate_function_chaitin(func: &IrFunction, regs: &[PhysReg]) -> FuncAlloc {
     // Step 2: Build interference graph
     let mut graph = build_interference_graph(&func_copy, &liveness);
 
+    // Step 2b: Identify values live across calls.
+    // These must be assigned to callee-saved registers (not caller-saved
+    // x0-x15 which are clobbered by the call).
+    let live_across_calls = values_live_across_calls(&func_copy, &liveness);
+
+    // Pre-compute the first callee-saved color index.
+    // In gp_regs(), caller-saved are listed first (indices 0..num_caller),
+    // then callee-saved (indices num_caller..k).
+    let first_callee_color: usize = regs.iter()
+        .position(|r| r.0 >= 19 && r.0 <= 28)
+        .unwrap_or(regs.len());
+
     // Step 3: Coalesce copies
     let alias = coalesce(&func_copy, &mut graph);
 
@@ -439,9 +494,17 @@ fn allocate_function_chaitin(func: &IrFunction, regs: &[PhysReg]) -> FuncAlloc {
             })
             .collect();
 
-        // Pick the lowest available color
+        // Pick the lowest available color.
+        // If this value is live across a call, only consider callee-saved
+        // register colors (indices first_callee_color..k) so the value
+        // survives the call without being clobbered.
+        let canon_v = alias.get(&v).copied().unwrap_or(v);
+        let must_callee_saved = live_across_calls.contains(&v)
+            || live_across_calls.contains(&canon_v);
+        let color_start = if must_callee_saved { first_callee_color } else { 0 };
+
         let mut chosen = None;
-        for c in 0..k {
+        for c in color_start..k {
             if !used_colors.contains(&c) {
                 chosen = Some(c);
                 break;

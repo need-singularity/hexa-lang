@@ -29,7 +29,7 @@ const N_SECT: u8 = 0x0e;
 
 /// Wrap machine code in a Mach-O relocatable object (.o) format.
 /// This produces a proper .o file that `cc` / `ld` can link.
-pub fn wrap(code: Vec<u8>, module: &IrModule, main_offset: usize) -> Vec<u8> {
+pub fn wrap(code: Vec<u8>, _module: &IrModule, main_offset: usize) -> Vec<u8> {
     let mut out = Vec::new();
 
     let code_size = code.len();

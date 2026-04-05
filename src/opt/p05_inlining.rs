@@ -1,7 +1,7 @@
 //! P5: Function Inlining — inline small functions at call sites.
 //! Threshold: σ-τ=8 instructions max.
 
-use crate::ir::{IrModule, OpCode, Operand};
+use crate::ir::{IrModule};
 use super::{Pass, PassResult};
 
 /// Inlining threshold = σ(6) - τ(6) = 8 instructions.
@@ -13,6 +13,7 @@ impl Pass for InliningPass {
     fn name(&self) -> &'static str { "inlining" }
 
     fn run(&self, module: &mut IrModule) -> PassResult {
+        #[allow(unused_variables, unused_mut)]
         let mut inlined = 0usize;
 
         // Collect inline candidates: functions with ≤ threshold instructions

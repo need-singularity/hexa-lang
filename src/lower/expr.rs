@@ -10,7 +10,7 @@ pub fn lower_expr(ctx: &mut LowerCtx, builder: &mut IrBuilder, expr: &Expr) -> V
         Expr::IntLit(n) => builder.const_i64(*n),
         Expr::FloatLit(f) => builder.const_f64(*f),
         Expr::BoolLit(b) => builder.const_bool(*b),
-        Expr::StringLit(s) => {
+        Expr::StringLit(_s) => {
             // String interning deferred — use index as placeholder
             builder.const_i64(0)
         }
@@ -57,8 +57,8 @@ pub fn lower_expr(ctx: &mut LowerCtx, builder: &mut IrBuilder, expr: &Expr) -> V
                     if let Some(&fid) = ctx.func_map.get(name.as_str()) {
                         builder.call(fid, arg_vals, IrType::I64)
                     } else {
-                        let callee_val = lower_expr(ctx, builder, callee);
-                        builder.call_indirect(callee_val, arg_vals, IrType::I64)
+                        // Unknown function (builtins like println) — no-op, return arg or 0
+                        if !arg_vals.is_empty() { arg_vals[0] } else { builder.const_i64(0) }
                     }
                 }
                 _ => {

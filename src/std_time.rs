@@ -10,7 +10,6 @@
 
 #![allow(dead_code)]
 
-use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH, Duration};
 
 use crate::env::Value;

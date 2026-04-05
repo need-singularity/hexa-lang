@@ -22,7 +22,7 @@
 
 use std::collections::{BTreeMap, BinaryHeap, VecDeque, HashMap};
 use std::cmp::Reverse;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use crate::env::Value;
 use crate::error::{HexaError, ErrorClass};

@@ -8,8 +8,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::ast::{BinOp, Expr, Stmt, FnDecl};
-use crate::env::Value;
 use crate::interpreter::Interpreter;
 use crate::lexer::Lexer;
 use crate::parser::Parser;

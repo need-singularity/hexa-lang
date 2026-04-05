@@ -6,9 +6,9 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use crate::ir::{IrModule, IrFunction, OpCode, Operand, ValueId, IrType};
+use crate::ir::{IrModule, IrFunction, OpCode, Operand, ValueId};
 use crate::ir::instr::CmpKind;
-use super::regalloc::{AllocResult, FuncAlloc, Location, PhysReg};
+use super::regalloc::{AllocResult, FuncAlloc, Location};
 use super::peephole::{run_peephole, PeepholeStats};
 
 static LAST_PEEPHOLE_STATS: Mutex<Option<PeepholeStats>> = Mutex::new(None);
@@ -82,7 +82,7 @@ fn emit_function(
     call_fixups: &mut Vec<(usize, String)>,
     id_to_name: &HashMap<u32, String>,
 ) {
-    let func_start = code.len();
+    let _func_start = code.len();
 
     // Pre-scan: count Alloc instructions to assign stack slots for local variables
     let mut alloca_slots: HashMap<ValueId, i32> = HashMap::new();
@@ -112,7 +112,7 @@ fn emit_function(
     // P2 mem2reg promotes same-block Store→Load to Copy, eliminating stack round-trips.
     // Unpromoted params are stored via the IR Store instruction in emit_instruction.
 
-    let const_pins: HashMap<i64, u8> = HashMap::new(); // disabled for now
+    let _const_pins: HashMap<i64, u8> = HashMap::new(); // disabled for now
 
     // Collect phi moves: for each block that has successors with phi nodes,
     // insert mov instructions before the terminator.
@@ -442,13 +442,21 @@ fn emit_instruction(
         OpCode::Call => {
             // Collect args and function target
             let mut target_func_name: Option<String> = None;
+            let mut indirect_callee_reg: Option<u8> = None;
             let mut arg_regs: Vec<u8> = Vec::new();
 
             for (i, op) in instr.operands.iter().enumerate() {
                 if i == 0 {
-                    if let Operand::Func(fid) = op {
-                        target_func_name = Some(id_to_name.get(&fid.0).cloned()
-                            .unwrap_or_else(|| format!("__func_{}", fid.0)));
+                    match op {
+                        Operand::Func(fid) => {
+                            target_func_name = Some(id_to_name.get(&fid.0).cloned()
+                                .unwrap_or_else(|| format!("__func_{}", fid.0)));
+                        }
+                        Operand::Value(v) => {
+                            // Indirect call — callee is a runtime value
+                            indirect_callee_reg = Some(reg_for(*v, alloc));
+                        }
+                        _ => {}
                     }
                     continue;
                 }
@@ -481,11 +489,19 @@ fn emit_instruction(
                 }
             }
 
-            // bl <target>
-            if let Some(name) = target_func_name {
-                call_fixups.push((code.len(), name));
+            if let Some(callee_r) = indirect_callee_reg {
+                // Indirect call: move callee to x16 (IP0), then blr x16
+                if callee_r != 16 {
+                    emit32(code, encode_mov(16, callee_r)); // mov x16, Xcallee
+                }
+                emit32(code, 0xd63f0200); // blr x16
+            } else {
+                // Direct call: bl <target>
+                if let Some(name) = target_func_name {
+                    call_fixups.push((code.len(), name));
+                }
+                emit32(code, 0x94000000);
             }
-            emit32(code, 0x94000000);
 
             // Return value in x0. Store to a call-return alloca slot
             // at a fixed location that doesn't conflict with other allocas.
@@ -608,8 +624,8 @@ fn reload_if_alloca(
     operands: &[Operand],
     idx: usize,
     alloc: &FuncAlloc,
-    alloca_slots: &HashMap<ValueId, i32>,
-    code: &mut Vec<u8>,
+    _alloca_slots: &HashMap<ValueId, i32>,
+    _code: &mut Vec<u8>,
 ) -> u8 {
     if let Some(Operand::Value(v)) = operands.get(idx) {
         let r = reg_for(*v, alloc);

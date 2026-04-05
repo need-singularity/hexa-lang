@@ -336,7 +336,7 @@ impl OwnershipAnalyzer {
             Stmt::AsyncFnDecl(decl) => {
                 self.analyze_fn_body(decl, line, col);
             }
-            Stmt::For(var, iter_expr, body) => {
+            Stmt::For(_var, iter_expr, body) => {
                 self.check_expr_use(iter_expr, line, col);
                 self.push_scope();
                 // Loop variable is not ownership-tracked.
@@ -451,7 +451,7 @@ impl OwnershipAnalyzer {
     }
 
     /// Analyze a `borrow` expression: `let y = borrow x`.
-    fn analyze_borrow(&mut self, inner: &Expr, target: &str, line: usize, col: usize) {
+    fn analyze_borrow(&mut self, inner: &Expr, _target: &str, line: usize, col: usize) {
         if let Expr::Ident(source) = inner {
             if let Some(state) = self.lookup_state(source).cloned() {
                 match state {

@@ -39,7 +39,7 @@ impl Pass for VerifyPass {
                                     errors += 1;
                                 }
                             }
-                            Operand::PhiEntry(_, v) => {
+                            Operand::PhiEntry(_, _v) => {
                                 // Phi entries may reference values from other blocks
                                 // (forward references are OK for phi)
                             }

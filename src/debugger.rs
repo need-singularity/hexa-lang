@@ -16,7 +16,7 @@
 //! pause execution and wait for a DAP command.
 
 use std::collections::HashMap;
-use std::io::{self, Write};
+use std::io::{self};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 

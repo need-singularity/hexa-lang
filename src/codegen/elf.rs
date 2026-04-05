@@ -11,12 +11,12 @@ const EM_X86_64: u16 = 62;
 const EM_AARCH64: u16 = 183;
 
 /// Wrap machine code in ELF64 format.
-pub fn wrap(code: Vec<u8>, module: &IrModule) -> Vec<u8> {
+pub fn wrap(code: Vec<u8>, _module: &IrModule) -> Vec<u8> {
     let mut out = Vec::new();
 
     let ehdr_size: u64 = 64;
     let phdr_size: u64 = 56;
-    let header_total = ehdr_size + phdr_size;
+    let _header_total = ehdr_size + phdr_size;
     let code_offset = 0x1000u64; // page-aligned
     let load_addr = 0x400000u64; // standard Linux load address
     let entry = load_addr + code_offset;
