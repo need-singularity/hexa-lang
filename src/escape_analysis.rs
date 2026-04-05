@@ -445,6 +445,8 @@ mod tests {
                 params: vec![],
                 ret_type: None,
                 where_clauses: vec![],
+                precondition: None,
+                postcondition: None,
                 body: vec![
                     make_let_struct("p", "Point"),
                     make_return("p"),

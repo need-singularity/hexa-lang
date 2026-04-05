@@ -246,6 +246,8 @@ pub struct FnDecl {
     pub params: Vec<Param>,
     pub ret_type: Option<String>,
     pub where_clauses: Vec<WhereClause>,  // where T: Display, U: Clone
+    pub precondition: Option<Expr>,       // where expr — contract precondition
+    pub postcondition: Option<Expr>,      // ensures expr — contract postcondition
     pub body: Block,
     pub vis: Visibility,
     pub is_pure: bool,  // pure fn — no effects allowed

@@ -204,7 +204,7 @@ impl Parser {
                 } else { vec![] };
                 let body = self.parse_block()?;
                 Ok(Stmt::EvolveFn(FnDecl {
-                    name, type_params, params, ret_type, where_clauses, body, vis, is_pure: false,
+                    name, type_params, params, ret_type, where_clauses, precondition: None, postcondition: None, body, vis, is_pure: false,
                 }))
             }
             _ => {
@@ -546,7 +546,7 @@ impl Parser {
             };
             let body = self.parse_block()?;
             return Ok(Stmt::ComptimeFn(FnDecl {
-                name, type_params, params, ret_type, where_clauses, body,
+                name, type_params, params, ret_type, where_clauses, precondition: None, postcondition: None, body,
                 vis: Visibility::Private, is_pure: false,
             }));
         }
@@ -575,7 +575,7 @@ impl Parser {
             None
         };
         let body = self.parse_block()?;
-        Ok(Stmt::AsyncFnDecl(FnDecl { name, type_params, params, ret_type, where_clauses: vec![], body, vis, is_pure: false }))
+        Ok(Stmt::AsyncFnDecl(FnDecl { name, type_params, params, ret_type, where_clauses: vec![], precondition: None, postcondition: None, body, vis, is_pure: false }))
     }
 
     fn parse_select(&mut self) -> Result<Stmt, HexaError> {
@@ -766,6 +766,8 @@ impl Parser {
             params,
             ret_type,
             where_clauses: vec![],
+            precondition: None,
+            postcondition: None,
             body,
             vis: Visibility::Private,
             is_pure: false,
@@ -1058,14 +1060,12 @@ impl Parser {
         } else {
             None
         };
-        // Parse optional where clause: where T: Display, U: Clone
-        let where_clauses = if matches!(self.peek(), Token::Where) {
-            self.parse_where_clauses()?
-        } else {
-            vec![]
-        };
+        // Parse optional where clause: type bounds or precondition expression
+        let (where_clauses, precondition) = self.parse_where_or_precondition()?;
+        // Parse optional ensures clause: postcondition expression
+        let postcondition = self.parse_ensures_clause()?;
         let body = self.parse_block()?;
-        Ok(Stmt::FnDecl(FnDecl { name, type_params, params, ret_type, where_clauses, body, vis, is_pure: false }))
+        Ok(Stmt::FnDecl(FnDecl { name, type_params, params, ret_type, where_clauses, precondition, postcondition, body, vis, is_pure: false }))
     }
 
     /// Parse type parameters: `<T>`, `<T: Display>`, `<T, U>`, `<T: Display, U: Clone>`
@@ -1111,6 +1111,35 @@ impl Parser {
             }
         }
         Ok(clauses)
+    }
+
+    /// Determine if `where` is a type-bound clause (where T: Bound) or a precondition expression (where x > 0).
+    /// Returns (where_clauses, precondition).
+    fn parse_where_or_precondition(&mut self) -> Result<(Vec<WhereClause>, Option<Expr>), HexaError> {
+        if !matches!(self.peek(), Token::Where) {
+            return Ok((vec![], None));
+        }
+        // Lookahead: if pattern is Ident Colon Ident, it's a type-bound where clause
+        if matches!(self.peek_ahead(1), Token::Ident(_)) && matches!(self.peek_ahead(2), Token::Colon) {
+            let clauses = self.parse_where_clauses()?;
+            Ok((clauses, None))
+        } else {
+            // It's a precondition expression: where <expr>
+            self.advance(); // consume 'where'
+            let expr = self.parse_expr()?;
+            Ok((vec![], Some(expr)))
+        }
+    }
+
+    /// Parse optional `ensures <expr>` clause (postcondition).
+    fn parse_ensures_clause(&mut self) -> Result<Option<Expr>, HexaError> {
+        if matches!(self.peek(), Token::Ident(s) if s == "ensures") {
+            self.advance(); // consume 'ensures'
+            let expr = self.parse_expr()?;
+            Ok(Some(expr))
+        } else {
+            Ok(None)
+        }
     }
 
     fn parse_params(&mut self) -> Result<Vec<Param>, HexaError> {
@@ -1225,7 +1254,7 @@ impl Parser {
             } else {
                 vec![]
             };
-            methods.push(FnDecl { name: m_name, type_params: vec![], params: m_params, ret_type: m_ret, where_clauses: vec![], body: m_body, vis: m_vis, is_pure: false });
+            methods.push(FnDecl { name: m_name, type_params: vec![], params: m_params, ret_type: m_ret, where_clauses: vec![], precondition: None, postcondition: None, body: m_body, vis: m_vis, is_pure: false });
             self.skip_newlines();
         }
         self.expect(&Token::RBrace)?;
@@ -1263,7 +1292,7 @@ impl Parser {
                 None
             };
             let m_body = self.parse_block()?;
-            methods.push(FnDecl { name: m_name, type_params: vec![], params: m_params, ret_type: m_ret, where_clauses: vec![], body: m_body, vis: m_vis, is_pure: false });
+            methods.push(FnDecl { name: m_name, type_params: vec![], params: m_params, ret_type: m_ret, where_clauses: vec![], precondition: None, postcondition: None, body: m_body, vis: m_vis, is_pure: false });
             self.skip_newlines();
         }
         self.expect(&Token::RBrace)?;
@@ -1831,7 +1860,7 @@ impl Parser {
             vec![]
         };
         let body = self.parse_block()?;
-        Ok(Stmt::FnDecl(FnDecl { name, type_params, params, ret_type, where_clauses, body, vis, is_pure: true }))
+        Ok(Stmt::FnDecl(FnDecl { name, type_params, params, ret_type, where_clauses, precondition: None, postcondition: None, body, vis, is_pure: true }))
     }
 
     /// Parse `handle { body } with { Effect.op(params) => { handler }, ... }`
