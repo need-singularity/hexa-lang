@@ -195,6 +195,9 @@ impl Env {
         env.define("to_string", Value::BuiltinFn("to_string".into()));
         env.define("to_int", Value::BuiltinFn("to_int".into()));
         env.define("to_float", Value::BuiltinFn("to_float".into()));
+        env.define("try_float", Value::BuiltinFn("try_float".into()));
+        env.define("is_numeric", Value::BuiltinFn("is_numeric".into()));
+        env.define("join", Value::BuiltinFn("join".into()));
         // Math builtins
         env.define("abs", Value::BuiltinFn("abs".into()));
         env.define("min", Value::BuiltinFn("min".into()));
@@ -304,6 +307,8 @@ impl Env {
         env.define("exec_with_status", Value::BuiltinFn("exec_with_status".into()));
         env.define("input", Value::BuiltinFn("input".into()));
         env.define("readline", Value::BuiltinFn("readline".into()));
+        env.define("read_stdin", Value::BuiltinFn("read_stdin".into()));
+        env.define("input_all", Value::BuiltinFn("input_all".into()));
         env
 
     }

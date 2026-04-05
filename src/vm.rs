@@ -841,6 +841,10 @@ impl VM {
             (Value::Int(x), Value::Float(y)) => Ok(Value::Float(x as f64 + y)),
             (Value::Float(x), Value::Int(y)) => Ok(Value::Float(x + y as f64)),
             (Value::Str(x), Value::Str(y)) => Ok(Value::Str(format!("{}{}", x, y))),
+            (Value::Array(mut x), Value::Array(y)) => {
+                x.extend(y.into_iter());
+                Ok(Value::Array(x))
+            }
             (a, b) => Err(runtime_err(format!("cannot add {:?} and {:?}", a, b))),
         }
     }

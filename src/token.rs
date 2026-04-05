@@ -1,3 +1,36 @@
+use std::rc::Rc;
+
+/// Cheaply cloneable string type for tokens. Avoids heap allocation on clone.
+#[derive(Clone, Debug, Eq, Hash)]
+pub struct RcStr(Rc<str>);
+
+impl PartialEq for RcStr {
+    fn eq(&self, other: &Self) -> bool { self.0 == other.0 }
+}
+
+impl PartialEq<str> for RcStr {
+    fn eq(&self, other: &str) -> bool { &*self.0 == other }
+}
+
+impl std::ops::Deref for RcStr {
+    type Target = str;
+    fn deref(&self) -> &str { &self.0 }
+}
+
+impl std::fmt::Display for RcStr {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl From<String> for RcStr {
+    fn from(s: String) -> Self { RcStr(Rc::from(s.as_str())) }
+}
+
+impl From<&str> for RcStr {
+    fn from(s: &str) -> Self { RcStr(Rc::from(s)) }
+}
+
 /// Source location: line and column (1-based).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Span {
@@ -29,12 +62,12 @@ pub enum Token {
     // === Literals ===
     IntLit(i64),
     FloatLit(f64),
-    StringLit(String),
+    StringLit(RcStr),
     CharLit(char),
     BoolLit(bool),
 
     // === Identifier ===
-    Ident(String),
+    Ident(RcStr),
 
     // === 53 Keywords (σ·τ + sopfr = 48 + 5) ===
     // Group 1: Control Flow (n=6)
