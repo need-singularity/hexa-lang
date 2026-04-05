@@ -709,7 +709,7 @@ impl VM {
 
     fn op_add(&self, a: Value, b: Value) -> Result<Value, HexaError> {
         match (a, b) {
-            (Value::Int(x), Value::Int(y)) => Ok(Value::Int(x + y)),
+            (Value::Int(x), Value::Int(y)) => Ok(Value::Int(x.wrapping_add(y))),
             (Value::Float(x), Value::Float(y)) => Ok(Value::Float(x + y)),
             (Value::Int(x), Value::Float(y)) => Ok(Value::Float(x as f64 + y)),
             (Value::Float(x), Value::Int(y)) => Ok(Value::Float(x + y as f64)),
@@ -720,7 +720,7 @@ impl VM {
 
     fn op_sub(&self, a: Value, b: Value) -> Result<Value, HexaError> {
         match (a, b) {
-            (Value::Int(x), Value::Int(y)) => Ok(Value::Int(x - y)),
+            (Value::Int(x), Value::Int(y)) => Ok(Value::Int(x.wrapping_sub(y))),
             (Value::Float(x), Value::Float(y)) => Ok(Value::Float(x - y)),
             (Value::Int(x), Value::Float(y)) => Ok(Value::Float(x as f64 - y)),
             (Value::Float(x), Value::Int(y)) => Ok(Value::Float(x - y as f64)),
@@ -730,7 +730,7 @@ impl VM {
 
     fn op_mul(&self, a: Value, b: Value) -> Result<Value, HexaError> {
         match (a, b) {
-            (Value::Int(x), Value::Int(y)) => Ok(Value::Int(x * y)),
+            (Value::Int(x), Value::Int(y)) => Ok(Value::Int(x.wrapping_mul(y))),
             (Value::Float(x), Value::Float(y)) => Ok(Value::Float(x * y)),
             (Value::Int(x), Value::Float(y)) => Ok(Value::Float(x as f64 * y)),
             (Value::Float(x), Value::Int(y)) => Ok(Value::Float(x * y as f64)),

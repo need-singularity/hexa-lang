@@ -5,6 +5,7 @@
 //! string ops, arrays, maps, control flow, and user-defined pure functions.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use crate::ast::*;
 use crate::env::Value;
 use crate::error::{HexaError, ErrorClass};
@@ -48,7 +49,7 @@ pub fn eval_comptime(
     for (name, (params, body)) in comptime_fns {
         interp.env.define(
             name,
-            Value::Fn(name.clone(), params.clone(), body.clone()),
+            Value::Fn(name.clone(), params.clone(), Arc::new(body.clone())),
         );
     }
 

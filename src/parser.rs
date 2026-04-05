@@ -581,6 +581,12 @@ impl Parser {
             let expr = self.parse_expr()?;
             return Ok(Stmt::Let(name, typ, Some(Expr::Comptime(Box::new(expr))), Visibility::Private));
         }
+        // comptime assert expr — compile-time assertion (evaluated eagerly)
+        if matches!(self.peek(), Token::Assert) {
+            self.advance(); // consume 'assert'
+            let expr = self.parse_expr()?;
+            return Ok(Stmt::Assert(expr));
+        }
         // comptime { ... } — compile-time block as expression statement
         let block = self.parse_block()?;
         Ok(Stmt::Expr(Expr::Comptime(Box::new(Expr::Block(block)))))
@@ -1063,12 +1069,32 @@ impl Parser {
 
     fn parse_use_decl(&mut self) -> Result<Stmt, HexaError> {
         self.advance(); // consume 'use'
-        let mut path = vec![self.expect_ident()?];
+        let mut prefix = vec![self.expect_ident()?];
         while matches!(self.peek(), Token::ColonColon) {
             self.advance(); // consume ::
-            path.push(self.expect_ident()?);
+            // Check for grouped import: use module::{a, b, c}
+            if matches!(self.peek(), Token::LBrace) {
+                self.advance(); // consume '{'
+                self.skip_newlines();
+                let mut uses = Vec::new();
+                while !matches!(self.peek(), Token::RBrace | Token::Eof) {
+                    let item = self.expect_ident()?;
+                    let mut full_path = prefix.clone();
+                    full_path.push(item);
+                    uses.push(Stmt::Use(full_path));
+                    self.skip_newlines();
+                    if matches!(self.peek(), Token::Comma) {
+                        self.advance();
+                        self.skip_newlines();
+                    }
+                }
+                self.expect(&Token::RBrace)?;
+                // Wrap multiple use stmts in a block expression
+                return Ok(Stmt::Expr(Expr::Block(uses)));
+            }
+            prefix.push(self.expect_ident()?);
         }
-        Ok(Stmt::Use(path))
+        Ok(Stmt::Use(prefix))
     }
 
     // ── Level 3: Declarations ───────────────────────────────

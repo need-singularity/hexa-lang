@@ -250,14 +250,25 @@ impl Compiler {
         temp.constants = parent_chunk.constants.clone();
         temp.string_pool = parent_chunk.string_pool.clone();
 
-        for stmt in &decl.body {
-            if matches!(stmt, Stmt::FnDecl(_)) {
-                continue;
+        // Compile body -- last expression is implicit return value
+        let body_stmts: Vec<&Stmt> = decl.body.iter()
+            .filter(|s| !matches!(s, Stmt::FnDecl(_)))
+            .collect();
+        for (i, stmt) in body_stmts.iter().enumerate() {
+            let is_last = i == body_stmts.len() - 1;
+            if is_last {
+                if let Stmt::Expr(e) = stmt {
+                    self.compile_expr(&mut temp, e)?;
+                    temp.emit(OpCode::Return);
+                } else {
+                    self.compile_stmt(&mut temp, stmt)?;
+                }
+            } else {
+                self.compile_stmt(&mut temp, stmt)?;
             }
-            self.compile_stmt(&mut temp, stmt)?;
         }
 
-        // Ensure return at the end
+        // Ensure return at the end (for functions ending in non-expr stmts)
         if !matches!(temp.code.last(), Some(OpCode::Return)) {
             temp.emit(OpCode::Void);
             temp.emit(OpCode::Return);

@@ -61,8 +61,12 @@ impl Pass for LicmPass {
                             if invariant.contains(&instr.result) { continue; }
 
                             let hoistable = match instr.op {
-                                // Only hoist constant loads (safe — no side effects)
+                                // Hoist constant loads (safe — no side effects)
                                 OpCode::Load if is_const_load(instr) => true,
+                                // Hoist pure arithmetic if all operands are invariant
+                                OpCode::Add | OpCode::Sub | OpCode::Mul | OpCode::Div
+                                | OpCode::Neg | OpCode::Copy | OpCode::Move
+                                    if all_operands_invariant(instr, &invariant) => true,
                                 _ => false,
                             };
 
@@ -144,6 +148,16 @@ impl Pass for LicmPass {
             stats: vec![("hoisted".into(), hoisted)],
         }
     }
+}
+
+fn all_operands_invariant(instr: &Instruction, invariant: &HashSet<ValueId>) -> bool {
+    instr.operands.iter().all(|op| {
+        match op {
+            Operand::Value(v) => invariant.contains(v),
+            Operand::ImmI64(_) | Operand::ImmF64(_) | Operand::ImmBool(_) => true,
+            _ => true, // non-value operands (CmpKind etc) are trivially invariant
+        }
+    })
 }
 
 fn is_const_load(instr: &Instruction) -> bool {

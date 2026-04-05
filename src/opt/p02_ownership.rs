@@ -93,11 +93,9 @@ fn promote_allocas(func: &mut IrFunction) -> usize {
     }
 
     for (body_end_id, header_id) in &back_edges {
-        // Skip loops containing function calls — phi+call interaction is complex
-        let has_call = func.blocks.iter()
-            .filter(|b| b.id.0 >= header_id.0 && b.id.0 <= body_end_id.0)
-            .any(|b| b.instructions.iter().any(|i| i.op == OpCode::Call));
-        if has_call { continue; }
+        // Loops with calls are now supported: the register allocator handles
+        // spilling around call sites. Phi promotion is still correct because
+        // we track the last store value which includes post-call stores.
         // For each promotable alloca, check if:
         // 1. There's a Store to it in some block that jumps to header (preheader or body)
         // 2. There's a Load from it in header or body

@@ -419,7 +419,7 @@ impl Interpreter {
                     let param_names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
                     self.env.define(
                         &decl.name,
-                        Value::Fn(format!("__generic__{}", decl.name), param_names, decl.body.clone()),
+                        Value::Fn(format!("__generic__{}", decl.name), param_names, Arc::new(decl.body.clone())),
                     );
                 } else {
                     let param_names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
@@ -430,7 +430,7 @@ impl Interpreter {
                     };
                     self.env.define(
                         &decl.name,
-                        Value::Fn(internal_name, param_names, decl.body.clone()),
+                        Value::Fn(internal_name, param_names, Arc::new(decl.body.clone())),
                     );
                 }
                 Ok(Value::Void)
@@ -621,7 +621,7 @@ impl Interpreter {
                 // Also make it callable as a regular function so `const X = factorial(10)` works
                 self.env.define(
                     &decl.name,
-                    Value::Fn(decl.name.clone(), param_names, decl.body.clone()),
+                    Value::Fn(decl.name.clone(), param_names, Arc::new(decl.body.clone())),
                 );
                 Ok(Value::Void)
             }
@@ -677,7 +677,7 @@ impl Interpreter {
                 self.writeln_output(&format!("[evolve] Registered self-modifying fn: {}", decl.name));
                 self.env.define(
                     &decl.name,
-                    Value::Fn(decl.name.clone(), param_names, decl.body.clone()),
+                    Value::Fn(decl.name.clone(), param_names, Arc::new(decl.body.clone())),
                 );
                 Ok(Value::Void)
             }
@@ -797,7 +797,7 @@ impl Interpreter {
                         let scheduler = crate::async_runtime::global_scheduler();
                         let future = scheduler.spawn_task(
                             "scope_spawn".into(),
-                            body,
+                            body.into(),
                             vec![],
                             captured_env,
                             struct_defs,
@@ -825,7 +825,7 @@ impl Interpreter {
                         for (name, val) in captured_env {
                             interp.env.define(&name, val);
                         }
-                        for stmt in &body {
+                        for stmt in body.iter() {
                             if let Err(e) = interp.exec_stmt(stmt) {
                                 eprintln!("[spawn] error: {}", e);
                                 break;
@@ -862,7 +862,7 @@ impl Interpreter {
                         for (n, val) in captured_env {
                             interp.env.define(&n, val);
                         }
-                        for stmt in &body {
+                        for stmt in body.iter() {
                             if let Err(e) = interp.exec_stmt(stmt) {
                                 eprintln!("[spawn {}] error: {}", log_name, e);
                                 break;
@@ -938,7 +938,7 @@ impl Interpreter {
                 // We prefix the function name internally to mark it as async
                 self.env.define(
                     &decl.name,
-                    Value::Fn(format!("__async__{}", decl.name), param_names, decl.body.clone()),
+                    Value::Fn(format!("__async__{}", decl.name), param_names, Arc::new(decl.body.clone())),
                 );
                 Ok(Value::Void)
             }
@@ -1214,7 +1214,7 @@ impl Interpreter {
                             self.env.define(param, arg);
                         }
                         let mut result = Value::Void;
-                        for stmt in &body {
+                        for stmt in body.iter() {
                             result = self.exec_stmt(stmt)?;
                             if self.return_value.is_some() {
                                 result = self.return_value.take().unwrap();
@@ -1380,7 +1380,7 @@ impl Interpreter {
                     Expr::Block(stmts) => stmts.clone(),
                     other => vec![Stmt::Return(Some(other.clone()))],
                 };
-                Ok(Value::Lambda(param_names, body_stmts, captured))
+                Ok(Value::Lambda(param_names, Arc::new(body_stmts), captured))
             }
             Expr::StructInit(name, field_exprs) => {
                 // Verify struct is defined
@@ -1444,7 +1444,7 @@ impl Interpreter {
                         self.env.define(param, arg);
                     }
                     let mut result = Value::Void;
-                    for stmt in &body {
+                    for stmt in body.iter() {
                         result = self.exec_stmt(stmt)?;
                         if self.return_value.is_some() {
                             result = self.return_value.take().unwrap();
@@ -1798,7 +1798,7 @@ impl Interpreter {
                     let scheduler = crate::async_runtime::global_scheduler();
                     let future = scheduler.spawn_task(
                         _name.clone(),
-                        body.clone(),
+                        body.clone().into(),
                         bindings,
                         self.capture_env_for_spawn(),
                         self.struct_defs.clone(),
@@ -1872,7 +1872,7 @@ impl Interpreter {
                     // Create specialized fn value with mangled name
                     let mangled = format!("{}_{}", base_name, concrete_types.join("_"));
                     let param_names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
-                    let specialized = Value::Fn(mangled, param_names, decl.body.clone());
+                    let specialized = Value::Fn(mangled, param_names, Arc::new(decl.body.clone()));
 
                     // Cache it
                     self.spec_cache.insert(key, specialized.clone());
@@ -1896,7 +1896,7 @@ impl Interpreter {
                     self.env.define(param, arg);
                 }
                 let mut result = Value::Void;
-                for stmt in &body {
+                for stmt in body.iter() {
                     result = self.exec_stmt(stmt)?;
                     if self.return_value.is_some() {
                         result = self.return_value.take().unwrap();
@@ -1917,22 +1917,12 @@ impl Interpreter {
                 let is_pure = _name.starts_with("__pure__");
                 let prev_pure = self.in_pure_fn;
                 if is_pure { self.in_pure_fn = true; }
-                // Track memory frame for Egyptian allocator
-                self.memory.push_frame(&_name);
                 self.env.push_scope();
                 for (param, arg) in params.iter().zip(args) {
-                    // Track parameter allocation in Egyptian memory
-                    let size = estimate_value_size(&arg);
-                    let region = classify_region(&arg);
-                    match region {
-                        MemRegion::Stack => { let _ = self.memory.stack_alloc(param, size); }
-                        MemRegion::Heap => { let _ = self.memory.heap_alloc(param, size); }
-                        MemRegion::Arena => { let _ = self.memory.arena_alloc(size); }
-                    }
                     self.env.define(param, arg);
                 }
                 let mut result = Value::Void;
-                for stmt in &body {
+                for stmt in body.iter() {
                     result = self.exec_stmt(stmt)?;
                     if self.return_value.is_some() {
                         result = self.return_value.take().unwrap();
@@ -1944,7 +1934,6 @@ impl Interpreter {
                     }
                 }
                 self.env.pop_scope();
-                self.memory.pop_frame();
                 self.in_pure_fn = prev_pure;
                 Ok(result)
             }
@@ -1966,7 +1955,7 @@ impl Interpreter {
                     self.env.define(param, arg);
                 }
                 let mut result = Value::Void;
-                for stmt in &body {
+                for stmt in body.iter() {
                     result = self.exec_stmt(stmt)?;
                     if self.return_value.is_some() {
                         result = self.return_value.take().unwrap();
@@ -2025,7 +2014,7 @@ impl Interpreter {
                         self.env.define(param, arg);
                     }
                     let mut result = Value::Void;
-                    for stmt in &body {
+                    for stmt in body.iter() {
                         result = self.exec_stmt(stmt)?;
                         if self.return_value.is_some() {
                             result = self.return_value.take().unwrap();
@@ -2061,7 +2050,7 @@ impl Interpreter {
                             self.env.define(param, arg);
                         }
                         let mut result = Value::Void;
-                        for stmt in &body {
+                        for stmt in body.iter() {
                             result = self.exec_stmt(stmt)?;
                             if self.return_value.is_some() {
                                 result = self.return_value.take().unwrap();
@@ -2167,7 +2156,7 @@ impl Interpreter {
                         self.env.define(param, arg);
                     }
                     let mut result = Value::Void;
-                    for stmt in &body {
+                    for stmt in body.iter() {
                         result = self.exec_stmt(stmt)?;
                         if self.return_value.is_some() {
                             result = self.return_value.take().unwrap();
@@ -3803,7 +3792,7 @@ impl Interpreter {
                         let param_names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
                         mod_data.pub_bindings.insert(
                             decl.name.clone(),
-                            Value::Fn(decl.name.clone(), param_names, decl.body.clone()),
+                            Value::Fn(decl.name.clone(), param_names, Arc::new(decl.body.clone())),
                         );
                     }
                 }
@@ -3885,7 +3874,7 @@ impl Interpreter {
                         let param_names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
                         mod_data.pub_bindings.insert(
                             decl.name.clone(),
-                            Value::Fn(decl.name.clone(), param_names, decl.body.clone()),
+                            Value::Fn(decl.name.clone(), param_names, Arc::new(decl.body.clone())),
                         );
                     }
                 }
@@ -4085,7 +4074,7 @@ impl Interpreter {
                 // Attempt to parse the generated code as statements
                 match self.parse_hexa_source(&code) {
                     Ok(body_stmts) => {
-                        let val = Value::Fn(name.clone(), param_names, body_stmts);
+                        let val = Value::Fn(name.clone(), param_names, Arc::new(body_stmts));
                         self.env.define(name, val.clone());
                         println!("[generate] fn {} — LLM code registered", name);
                         Ok(val)
@@ -4098,7 +4087,7 @@ impl Interpreter {
                                 vec![Expr::StringLit(format!("LLM not available: {}", description))],
                             ))
                         ];
-                        let val = Value::Fn(name.clone(), param_names, fallback_body);
+                        let val = Value::Fn(name.clone(), param_names, Arc::new(fallback_body));
                         self.env.define(name, val.clone());
                         println!("[generate] fn {} — offline fallback (LLM code failed to parse)", name);
                         Ok(val)
@@ -4164,7 +4153,7 @@ impl Interpreter {
                 for s in &stmts {
                     if let Stmt::FnDecl(opt_decl) = s {
                         let param_names: Vec<String> = opt_decl.params.iter().map(|p| p.name.clone()).collect();
-                        let val = Value::Fn(opt_decl.name.clone(), param_names, opt_decl.body.clone());
+                        let val = Value::Fn(opt_decl.name.clone(), param_names, Arc::new(opt_decl.body.clone()));
                         self.env.define(&opt_decl.name, val);
                         println!("[optimize] fn {} — LLM optimization applied", opt_decl.name);
                         return Ok(Value::Void);
@@ -4192,13 +4181,13 @@ impl Interpreter {
             let param_names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
             self.env.define(
                 &decl.name,
-                Value::Fn(format!("__generic__{}", decl.name), param_names, decl.body.clone()),
+                Value::Fn(format!("__generic__{}", decl.name), param_names, Arc::new(decl.body.clone())),
             );
         } else {
             let param_names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
             self.env.define(
                 &decl.name,
-                Value::Fn(decl.name.clone(), param_names, decl.body.clone()),
+                Value::Fn(decl.name.clone(), param_names, Arc::new(decl.body.clone())),
             );
         }
     }
@@ -4397,7 +4386,7 @@ impl Interpreter {
             }
             self.resume_value = None;
             let mut result = Value::Void;
-            for stmt in &body {
+            for stmt in body.iter() {
                 result = self.exec_stmt(stmt)?;
                 if self.return_value.is_some() {
                     result = self.return_value.take().unwrap();

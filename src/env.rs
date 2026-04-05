@@ -16,10 +16,10 @@ pub enum Value {
     Void,
     Array(Vec<Value>),
     Tuple(Vec<Value>),
-    Fn(String, Vec<String>, Vec<crate::ast::Stmt>), // name, param_names, body
+    Fn(String, Vec<String>, Arc<Vec<crate::ast::Stmt>>), // name, param_names, body
     BuiltinFn(String),  // name of builtin
     Struct(String, HashMap<String, Value>),  // name, fields
-    Lambda(Vec<String>, Vec<crate::ast::Stmt>, Vec<(String, Value)>), // params, body, captured env
+    Lambda(Vec<String>, Arc<Vec<crate::ast::Stmt>>, Vec<(String, Value)>), // params, body, captured env
     Map(HashMap<String, Value>),  // key-value map
     Error(String),  // error value for try/catch
     EnumVariant(String, String, Option<Box<Value>>),  // enum_name, variant_name, data
@@ -148,6 +148,9 @@ pub struct Env {
     pub constants: std::collections::HashSet<String>,
     /// Static (module-level global) variables.
     pub statics: HashMap<String, Value>,
+    /// Fast-path: counts how many ownership states have been set.
+    /// When 0, get_ownership() can skip the scope walk entirely.
+    ownership_count: usize,
 }
 
 impl Env {
@@ -157,6 +160,7 @@ impl Env {
             ownership: vec![HashMap::new()],
             constants: std::collections::HashSet::new(),
             statics: HashMap::new(),
+            ownership_count: 0,
         };
         // Register builtins
         env.define("print", Value::BuiltinFn("print".into()));
@@ -351,11 +355,17 @@ impl Env {
     pub fn set_ownership(&mut self, name: &str, state: OwnershipState) {
         if let Some(scope) = self.ownership.last_mut() {
             scope.insert(name.to_string(), state);
+            self.ownership_count += 1;
         }
     }
 
     /// Get ownership state for a variable.
+    /// Fast-path: if no ownership state has ever been set, skip the scope walk.
+    #[inline]
     pub fn get_ownership(&self, name: &str) -> OwnershipState {
+        if self.ownership_count == 0 {
+            return OwnershipState::Normal;
+        }
         for scope in self.ownership.iter().rev() {
             if let Some(state) = scope.get(name) {
                 return state.clone();

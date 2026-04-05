@@ -280,8 +280,23 @@ fn emit_instruction(
     // Handle comparison specially
     if let Some(kind) = cmp_kind {
         let (r1, r2) = two_value_regs(&instr.operands, alloc);
-        // cmp Xn, Xm
-        emit32(code, 0xeb000000 | ((r2 as u32) << 16) | ((r1 as u32) << 5) | 0x1f);
+        // Try CMP with immediate: cmp Xn, #imm12 (when RHS is a small constant)
+        let vals: Vec<ValueId> = instr.operands.iter().filter_map(|op| {
+            if let Operand::Value(v) = op { Some(*v) } else { None }
+        }).collect();
+        let rhs_const = vals.get(1).and_then(|v| const_map.get(v).copied());
+        if let Some(n) = rhs_const {
+            if n >= 0 && n < 4096 {
+                // CMP Xn, #imm12 = SUBS XZR, Xn, #imm12
+                emit32(code, 0xf100001f | (((n as u32) & 0xFFF) << 10) | ((r1 as u32) << 5));
+            } else {
+                // cmp Xn, Xm (register form)
+                emit32(code, 0xeb000000 | ((r2 as u32) << 16) | ((r1 as u32) << 5) | 0x1f);
+            }
+        } else {
+            // cmp Xn, Xm
+            emit32(code, 0xeb000000 | ((r2 as u32) << 16) | ((r1 as u32) << 5) | 0x1f);
+        }
         // cset Xd, <cond>
         let cond = match kind {
             CmpKind::Eq => 0x0, // eq
@@ -300,13 +315,51 @@ fn emit_instruction(
     match instr.op {
         // ── Arithmetic ──
         OpCode::Add => {
-            let (r1, r2) = two_regs(&instr.operands, alloc);
-            emit32(code, encode_rrr(0x8b000000, dst, r1, r2));
+            // Strength-reduce: add with small immediate → ADD Xd, Xn, #imm12
+            let vals: Vec<ValueId> = instr.operands.iter().filter_map(|op| {
+                if let Operand::Value(v) = op { Some(*v) } else { None }
+            }).collect();
+            let (c0, c1) = (
+                vals.get(0).and_then(|v| const_map.get(v).copied()),
+                vals.get(1).and_then(|v| const_map.get(v).copied()),
+            );
+            let imm_pair = if let Some(n) = c1 {
+                if n >= 0 && n < 4096 { Some((reg_for(vals[0], alloc), n as u32, false)) }
+                else if n < 0 && (-n) < 4096 { Some((reg_for(vals[0], alloc), (-n) as u32, true)) }
+                else { None }
+            } else if let Some(n) = c0 {
+                if n >= 0 && n < 4096 { Some((reg_for(vals[1], alloc), n as u32, false)) }
+                else if n < 0 && (-n) < 4096 { Some((reg_for(vals[1], alloc), (-n) as u32, true)) }
+                else { None }
+            } else { None };
+            if let Some((var_r, imm, negate)) = imm_pair {
+                if negate {
+                    // ADD Xd, Xn, #(-imm) → SUB Xd, Xn, #imm
+                    emit32(code, 0xd1000000 | (imm << 10) | ((var_r as u32) << 5) | (dst as u32));
+                } else {
+                    // ADD Xd, Xn, #imm12
+                    emit32(code, 0x91000000 | (imm << 10) | ((var_r as u32) << 5) | (dst as u32));
+                }
+            } else {
+                let (r1, r2) = two_regs(&instr.operands, alloc);
+                emit32(code, encode_rrr(0x8b000000, dst, r1, r2));
+            }
         }
         OpCode::Sub => {
             // Pure subtraction (no CmpKind — that case handled above)
-            let (r1, r2) = two_regs(&instr.operands, alloc);
-            emit32(code, encode_rrr(0xcb000000, dst, r1, r2));
+            // Strength-reduce: sub with small immediate → SUB Xd, Xn, #imm12
+            let vals: Vec<ValueId> = instr.operands.iter().filter_map(|op| {
+                if let Operand::Value(v) = op { Some(*v) } else { None }
+            }).collect();
+            let sub_imm = vals.get(1).and_then(|v| const_map.get(v).copied())
+                .and_then(|n| if n >= 0 && n < 4096 { Some((reg_for(vals[0], alloc), n as u32)) } else { None });
+            if let Some((var_r, imm)) = sub_imm {
+                // SUB Xd, Xn, #imm12
+                emit32(code, 0xd1000000 | (imm << 10) | ((var_r as u32) << 5) | (dst as u32));
+            } else {
+                let (r1, r2) = two_regs(&instr.operands, alloc);
+                emit32(code, encode_rrr(0xcb000000, dst, r1, r2));
+            }
         }
         OpCode::Mul => {
             // Strength-reduce: x * (power-of-2) → LSL, x * 3 → ADD+LSL, x * 5 → ADD+LSL
@@ -607,14 +660,11 @@ fn emit_instruction(
                 emit32(code, 0x94000000);
             }
 
-            // Return value in x0. Store to a call-return alloca slot
-            // at a fixed location that doesn't conflict with other allocas.
-            // Use [fp, #-16] — safe because stp only uses [sp] before fp is set,
-            // and our allocas start at -(stack_size + 16 + 8).
-            let call_ret_off = (-16i32 as u32) & 0x1FF;
-            emit32(code, 0xf8000000 | (call_ret_off << 12) | ((FP as u32) << 5) | 0); // stur x0, [fp, #-16]
-            // Load it back to dst (this is safe because ldur doesn't clobber other regs)
-            emit32(code, 0xf8400000 | (call_ret_off << 12) | ((FP as u32) << 5) | (dst as u32)); // ldur Xdst, [fp, #-16]
+            // Return value is in x0. Move to dst register if needed.
+            // Previous approach spilled x0 to stack then reloaded — eliminated.
+            if dst != 0 {
+                emit32(code, encode_mov(dst, 0)); // mov Xdst, x0
+            }
         }
         OpCode::Return => {
             if let Some(Operand::Value(v)) = instr.operands.first() {
