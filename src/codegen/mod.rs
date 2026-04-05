@@ -5,6 +5,8 @@
 pub mod arm64;
 pub mod x86_64;
 pub mod regalloc;
+pub mod regalloc_linear;
+pub mod peephole;
 pub mod elf;
 pub mod macho;
 

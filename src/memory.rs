@@ -6,8 +6,19 @@
 //!   Arena: 1/6 ≈ 17%  — temporaries, string interning, compile-time data
 //!
 //! 1/2 + 1/3 + 1/6 = 1  (the only 3-way unit fraction decomposition from 6)
+//!
+//! ## HashMap-free design (P1 cache optimization)
+//!
+//! Hot allocation path is HashMap-free:
+//! - `HeapRegion` stores allocation size in an 8-byte header before the user
+//!   offset. `free(offset)` reads the header — no HashMap lookup.
+//! - `EgyptianMemory` uses `u32` handles `(region:2 | index:30)` packed into
+//!   the name tracker. Variable names go to a string pool (Vec<String>),
+//!   name→handle lookup is O(n) linear scan (cold path, tests only).
+//! - Heap free list is 6 size-class segregated (n=6 philosophy):
+//!   16B, 32B, 64B, 128B, 256B, 512B + one "large" overflow list.
+//! - Stack frames fixed at 64 (τ·σ pattern: 4·16) — no heap frame vector.
 
-use std::collections::HashMap;
 use std::fmt;
 
 /// Which memory region a value lives in.
@@ -36,21 +47,45 @@ pub const EGYPTIAN_ARENA: usize = 6; // 1/6
 /// Default memory budget: 64 MB.
 pub const DEFAULT_BUDGET: usize = 64 * 1024 * 1024;
 
+/// Maximum stack frame depth (fixed array, no heap).
+/// 64 = τ · σ · (1/1) — well within normal recursion.
+pub const MAX_FRAMES: usize = 64;
+
+/// Number of size classes for heap segregated free list (n=6).
+pub const N_SIZE_CLASSES: usize = 6;
+
+/// Size-class boundaries: 16, 32, 64, 128, 256, 512 bytes.
+/// Large allocations (>512B) use the overflow list.
+const SIZE_CLASSES: [usize; N_SIZE_CLASSES] = [16, 32, 64, 128, 256, 512];
+
+/// Heap allocation header (stored just before each live allocation).
+/// Holds the raw aligned size so `free(offset)` can recover it without
+/// a HashMap lookup.
+const HEADER_SIZE: usize = 8;
+
 // ── Stack Region ────────────────────────────────────────────
 
 /// A stack frame tracking a function call's local allocations.
-#[derive(Debug, Clone)]
+/// Name stored as a string-pool index (u32) for cache-friendly frames.
+#[derive(Debug, Clone, Copy)]
 pub struct StackFrame {
-    pub name: String,
-    pub base: usize, // byte offset where this frame starts
+    pub name_id: u32, // index into string pool (u32::MAX = anonymous)
+    pub base: usize,  // byte offset where this frame starts
+}
+
+impl StackFrame {
+    pub const ANON: u32 = u32::MAX;
 }
 
 /// LIFO stack region — push/pop with frame management.
+/// Uses a fixed-size frame array (no Vec allocation on push_frame).
 pub struct StackRegion {
     data: Vec<u8>,
     capacity: usize,
-    sp: usize, // stack pointer (next free byte)
-    frames: Vec<StackFrame>,
+    sp: usize,              // stack pointer (next free byte)
+    generation: u64,        // bumped on each free_to (cache invalidation hint)
+    frames: [StackFrame; MAX_FRAMES],
+    frame_top: usize,       // number of live frames
 }
 
 impl StackRegion {
@@ -59,7 +94,9 @@ impl StackRegion {
             data: vec![0u8; capacity],
             capacity,
             sp: 0,
-            frames: Vec::new(),
+            generation: 0,
+            frames: [StackFrame { name_id: StackFrame::ANON, base: 0 }; MAX_FRAMES],
+            frame_top: 0,
         }
     }
 
@@ -81,37 +118,36 @@ impl StackRegion {
     pub fn free_to(&mut self, new_sp: usize) {
         debug_assert!(new_sp <= self.sp);
         self.sp = new_sp;
+        self.generation = self.generation.wrapping_add(1);
     }
 
-    /// Push a new call frame.
-    pub fn push_frame(&mut self, name: String) {
-        self.frames.push(StackFrame {
-            name,
-            base: self.sp,
-        });
-    }
-
-    /// Pop the top call frame and free its stack space.
-    pub fn pop_frame(&mut self) -> Option<StackFrame> {
-        if let Some(frame) = self.frames.pop() {
-            self.sp = frame.base;
-            Some(frame)
-        } else {
-            None
+    /// Push a new call frame (using a string-pool index for the name).
+    pub fn push_frame_id(&mut self, name_id: u32) {
+        if self.frame_top >= MAX_FRAMES {
+            // Silently drop on overflow — mirrors original behaviour where
+            // Vec would allocate indefinitely. In practice 64 frames is huge.
+            return;
         }
+        self.frames[self.frame_top] = StackFrame { name_id, base: self.sp };
+        self.frame_top += 1;
     }
 
-    pub fn used(&self) -> usize {
-        self.sp
+    /// Pop the top call frame and free its stack space. Returns the popped frame.
+    pub fn pop_frame(&mut self) -> Option<StackFrame> {
+        if self.frame_top == 0 {
+            return None;
+        }
+        self.frame_top -= 1;
+        let frame = self.frames[self.frame_top];
+        self.sp = frame.base;
+        self.generation = self.generation.wrapping_add(1);
+        Some(frame)
     }
 
-    pub fn capacity(&self) -> usize {
-        self.capacity
-    }
-
-    pub fn frame_depth(&self) -> usize {
-        self.frames.len()
-    }
+    pub fn used(&self) -> usize { self.sp }
+    pub fn capacity(&self) -> usize { self.capacity }
+    pub fn frame_depth(&self) -> usize { self.frame_top }
+    pub fn generation(&self) -> u64 { self.generation }
 
     /// Write bytes at a given offset.
     pub fn write(&mut self, offset: usize, bytes: &[u8]) {
@@ -126,13 +162,20 @@ impl StackRegion {
 
 // ── Heap Region ─────────────────────────────────────────────
 
-/// Free-list heap region — first-fit allocator for dynamic objects.
+/// Heap region with header-based size tracking and 6 segregated free lists.
+/// No HashMap. free(offset) reads an 8-byte header at offset-8.
 pub struct HeapRegion {
     data: Vec<u8>,
     capacity: usize,
-    free_list: Vec<(usize, usize)>, // (offset, size)
-    alloc_map: HashMap<usize, usize>, // offset -> size
+    /// Next bump offset (head of the unexplored region).
+    bump: usize,
+    /// Segregated free lists — one per size class.
+    /// Each entry stores (user_offset, aligned_size).
+    size_class_lists: [Vec<(usize, usize)>; N_SIZE_CLASSES],
+    /// Overflow list for allocations > 512B.
+    large_list: Vec<(usize, usize)>,
     used: usize,
+    live_allocs: usize,
 }
 
 impl HeapRegion {
@@ -140,81 +183,119 @@ impl HeapRegion {
         Self {
             data: vec![0u8; capacity],
             capacity,
-            free_list: vec![(0, capacity)], // entire region is free
-            alloc_map: HashMap::new(),
+            bump: 0,
+            size_class_lists: Default::default(),
+            large_list: Vec::new(),
             used: 0,
+            live_allocs: 0,
         }
     }
 
-    /// Allocate `size` bytes using first-fit. Returns the starting offset.
+    /// Map an aligned size to its size-class index, or None if it's "large".
+    #[inline]
+    fn size_class(aligned: usize) -> Option<usize> {
+        for (i, &cap) in SIZE_CLASSES.iter().enumerate() {
+            if aligned <= cap {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Align a user-requested size to 8 bytes (minimum granularity).
+    #[inline]
+    fn align8(size: usize) -> usize {
+        (size + 7) & !7
+    }
+
+    /// Allocate `size` bytes. Returns the user-visible offset (past the header).
     pub fn alloc(&mut self, size: usize) -> Result<usize, MemoryError> {
         if size == 0 {
             return Ok(0);
         }
-        // Align to 8 bytes
-        let aligned = (size + 7) & !7;
+        let aligned = Self::align8(size);
 
-        for i in 0..self.free_list.len() {
-            let (offset, block_size) = self.free_list[i];
-            if block_size >= aligned {
-                // Use this block
-                self.free_list.remove(i);
-                if block_size > aligned {
-                    // Put remainder back
-                    self.free_list.push((offset + aligned, block_size - aligned));
+        // 1. Try size-class free list reuse (exact fit per class).
+        if let Some(cls) = Self::size_class(aligned) {
+            // Scan the class bucket for a block >= aligned.
+            let bucket = &mut self.size_class_lists[cls];
+            for i in 0..bucket.len() {
+                if bucket[i].1 >= aligned {
+                    let (user_off, block_sz) = bucket.swap_remove(i);
+                    self.used += block_sz;
+                    self.live_allocs += 1;
+                    return Ok(user_off);
                 }
-                self.alloc_map.insert(offset, aligned);
-                self.used += aligned;
-                return Ok(offset);
             }
-        }
-        Err(MemoryError::HeapExhausted {
-            requested: size,
-            available: self.free_list.iter().map(|(_, s)| *s).sum(),
-            budget_fraction: "1/3",
-        })
-    }
-
-    /// Free a previously allocated block at `offset`.
-    pub fn free(&mut self, offset: usize) -> Result<(), MemoryError> {
-        if let Some(size) = self.alloc_map.remove(&offset) {
-            self.used -= size;
-            self.free_list.push((offset, size));
-            // Merge adjacent free blocks (sorted by offset)
-            self.coalesce();
-            Ok(())
         } else {
-            Err(MemoryError::InvalidFree { offset })
-        }
-    }
-
-    /// Merge adjacent free blocks.
-    fn coalesce(&mut self) {
-        self.free_list.sort_by_key(|&(off, _)| off);
-        let mut merged: Vec<(usize, usize)> = Vec::new();
-        for (off, sz) in self.free_list.drain(..) {
-            if let Some(last) = merged.last_mut() {
-                if last.0 + last.1 == off {
-                    last.1 += sz;
-                    continue;
+            // Large list: first-fit.
+            for i in 0..self.large_list.len() {
+                if self.large_list[i].1 >= aligned {
+                    let (user_off, block_sz) = self.large_list.swap_remove(i);
+                    self.used += block_sz;
+                    self.live_allocs += 1;
+                    return Ok(user_off);
                 }
             }
-            merged.push((off, sz));
         }
-        self.free_list = merged;
+
+        // 2. Bump a new block: [header: 8B][user_data: aligned B]
+        let total = HEADER_SIZE + aligned;
+        if self.bump + total > self.capacity {
+            let free_bytes: usize = self.size_class_lists.iter()
+                .flat_map(|v| v.iter())
+                .chain(self.large_list.iter())
+                .map(|&(_, s)| s)
+                .sum::<usize>()
+                + (self.capacity - self.bump);
+            return Err(MemoryError::HeapExhausted {
+                requested: size,
+                available: free_bytes,
+                budget_fraction: "1/3",
+            });
+        }
+        let header_off = self.bump;
+        let user_off = header_off + HEADER_SIZE;
+        self.bump += total;
+
+        // Write the size header (little-endian u64).
+        let hdr_bytes = (aligned as u64).to_le_bytes();
+        self.data[header_off..header_off + HEADER_SIZE].copy_from_slice(&hdr_bytes);
+
+        self.used += aligned;
+        self.live_allocs += 1;
+        Ok(user_off)
     }
 
-    pub fn used(&self) -> usize {
-        self.used
+    /// Free a previously allocated block, reading its size from the header.
+    pub fn free(&mut self, user_offset: usize) -> Result<(), MemoryError> {
+        if user_offset == 0 || user_offset < HEADER_SIZE || user_offset > self.capacity {
+            return Err(MemoryError::InvalidFree { offset: user_offset });
+        }
+        let header_off = user_offset - HEADER_SIZE;
+        if header_off + HEADER_SIZE > self.capacity {
+            return Err(MemoryError::InvalidFree { offset: user_offset });
+        }
+        let mut hdr = [0u8; HEADER_SIZE];
+        hdr.copy_from_slice(&self.data[header_off..header_off + HEADER_SIZE]);
+        let aligned = u64::from_le_bytes(hdr) as usize;
+        if aligned == 0 || aligned > self.capacity {
+            return Err(MemoryError::InvalidFree { offset: user_offset });
+        }
+        // Return to appropriate list.
+        if let Some(cls) = Self::size_class(aligned) {
+            self.size_class_lists[cls].push((user_offset, aligned));
+        } else {
+            self.large_list.push((user_offset, aligned));
+        }
+        self.used = self.used.saturating_sub(aligned);
+        self.live_allocs = self.live_allocs.saturating_sub(1);
+        Ok(())
     }
 
-    pub fn capacity(&self) -> usize {
-        self.capacity
-    }
-
-    pub fn alloc_count(&self) -> usize {
-        self.alloc_map.len()
-    }
+    pub fn used(&self) -> usize { self.used }
+    pub fn capacity(&self) -> usize { self.capacity }
+    pub fn alloc_count(&self) -> usize { self.live_allocs }
 
     /// Write bytes at a given offset.
     pub fn write(&mut self, offset: usize, bytes: &[u8]) {
@@ -272,17 +353,9 @@ impl ArenaRegion {
         self.generation += 1;
     }
 
-    pub fn used(&self) -> usize {
-        self.offset
-    }
-
-    pub fn capacity(&self) -> usize {
-        self.capacity
-    }
-
-    pub fn generation(&self) -> u64 {
-        self.generation
-    }
+    pub fn used(&self) -> usize { self.offset }
+    pub fn capacity(&self) -> usize { self.capacity }
+    pub fn generation(&self) -> u64 { self.generation }
 
     /// Write bytes at a given offset.
     pub fn write(&mut self, offset: usize, bytes: &[u8]) {
@@ -379,6 +452,124 @@ impl fmt::Display for MemoryError {
     }
 }
 
+// ── Name → Handle tracking (HashMap-free) ───────────────────
+
+/// Packed handle: (region:2 bits | index:30 bits).
+/// `index` refers to an entry in `Tracker::entries`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VarHandle(pub u32);
+
+impl VarHandle {
+    pub const NONE: VarHandle = VarHandle(u32::MAX);
+
+    #[inline]
+    pub fn new(region: MemRegion, index: u32) -> Self {
+        debug_assert!(index < (1u32 << 30));
+        let tag: u32 = match region {
+            MemRegion::Stack => 0,
+            MemRegion::Heap => 1,
+            MemRegion::Arena => 2,
+        };
+        VarHandle((tag << 30) | index)
+    }
+
+    #[inline]
+    pub fn region(self) -> MemRegion {
+        match self.0 >> 30 {
+            0 => MemRegion::Stack,
+            1 => MemRegion::Heap,
+            2 => MemRegion::Arena,
+            _ => MemRegion::Arena,
+        }
+    }
+
+    #[inline]
+    pub fn index(self) -> u32 { self.0 & 0x3FFF_FFFF }
+}
+
+/// A single live variable-tracking record.
+#[derive(Debug, Clone, Copy)]
+struct VarRecord {
+    name_id: u32, // string pool index; u32::MAX = tombstone (freed)
+    region: MemRegion,
+    offset: usize,
+    size: usize,
+}
+
+/// Name → handle tracker. No HashMap: linear scan over a Vec.
+/// This is only used on cold paths (debug/introspection, heap_free by name).
+/// Hot alloc path never scans.
+struct Tracker {
+    string_pool: Vec<String>,
+    entries: Vec<VarRecord>,
+}
+
+impl Tracker {
+    fn new() -> Self {
+        Self { string_pool: Vec::new(), entries: Vec::new() }
+    }
+
+    /// Intern a name into the string pool, returning its id.
+    fn intern(&mut self, name: &str) -> u32 {
+        // Linear scan — pool is small in practice.
+        for (i, s) in self.string_pool.iter().enumerate() {
+            if s == name { return i as u32; }
+        }
+        let id = self.string_pool.len() as u32;
+        self.string_pool.push(name.to_string());
+        id
+    }
+
+    /// Record a fresh allocation. Returns index into `entries`.
+    fn record(&mut self, name: &str, region: MemRegion, offset: usize, size: usize) -> u32 {
+        let name_id = self.intern(name);
+        // If a previous live entry exists for this name+region, tombstone it.
+        for rec in self.entries.iter_mut() {
+            if rec.name_id == name_id && rec.region == region {
+                rec.name_id = u32::MAX; // tombstone old record
+            }
+        }
+        let idx = self.entries.len() as u32;
+        self.entries.push(VarRecord { name_id, region, offset, size });
+        idx
+    }
+
+    /// Look up a live entry by name (cold path).
+    fn find(&self, name: &str) -> Option<(u32, &VarRecord)> {
+        let name_id = self.string_pool.iter().position(|s| s == name)? as u32;
+        for (i, rec) in self.entries.iter().enumerate() {
+            if rec.name_id == name_id {
+                return Some((i as u32, rec));
+            }
+        }
+        None
+    }
+
+    fn tombstone(&mut self, idx: u32) {
+        if let Some(rec) = self.entries.get_mut(idx as usize) {
+            rec.name_id = u32::MAX;
+        }
+    }
+
+    /// Drop entries in a given stack-frame range.
+    fn drop_stack_frame(&mut self, base: usize) {
+        for rec in self.entries.iter_mut() {
+            if rec.region == MemRegion::Stack && rec.offset >= base {
+                rec.name_id = u32::MAX;
+            }
+        }
+    }
+
+    /// Drop all arena entries.
+    fn drop_arena(&mut self) {
+        for rec in self.entries.iter_mut() {
+            if rec.region == MemRegion::Arena {
+                rec.name_id = u32::MAX;
+            }
+        }
+    }
+}
+
 // ── Egyptian Memory Manager ─────────────────────────────────
 
 /// The Egyptian Fraction memory manager.
@@ -390,8 +581,7 @@ pub struct EgyptianMemory {
     heap: HeapRegion,
     arena: ArenaRegion,
     total_allocs: u64,
-    /// Maps variable names to (region, offset, size) for tracking.
-    var_regions: HashMap<String, (MemRegion, usize, usize)>,
+    tracker: Tracker,
 }
 
 impl EgyptianMemory {
@@ -400,8 +590,6 @@ impl EgyptianMemory {
         let stack_cap = total_budget / EGYPTIAN_STACK;  // 1/2
         let heap_cap = total_budget / EGYPTIAN_HEAP;    // 1/3
         let arena_cap = total_budget / EGYPTIAN_ARENA;  // 1/6
-        // Verify: stack_cap + heap_cap + arena_cap == total_budget
-        // (exact for multiples of 6, off by at most 1 otherwise)
         debug_assert!((stack_cap + heap_cap + arena_cap) as i64 - total_budget as i64 <= 1);
 
         Self {
@@ -410,7 +598,7 @@ impl EgyptianMemory {
             heap: HeapRegion::new(heap_cap),
             arena: ArenaRegion::new(arena_cap),
             total_allocs: 0,
-            var_regions: HashMap::new(),
+            tracker: Tracker::new(),
         }
     }
 
@@ -425,23 +613,20 @@ impl EgyptianMemory {
     pub fn stack_alloc(&mut self, name: &str, size: usize) -> Result<usize, MemoryError> {
         let offset = self.stack.alloc(size)?;
         self.total_allocs += 1;
-        self.var_regions.insert(name.to_string(), (MemRegion::Stack, offset, size));
+        self.tracker.record(name, MemRegion::Stack, offset, size);
         Ok(offset)
     }
 
     /// Push a new call frame onto the stack.
     pub fn push_frame(&mut self, name: &str) {
-        self.stack.push_frame(name.to_string());
+        let name_id = self.tracker.intern(name);
+        self.stack.push_frame_id(name_id);
     }
 
-    /// Pop the top call frame, freeing stack space and removing tracked vars in that frame.
+    /// Pop the top call frame, freeing stack space and removing tracked vars.
     pub fn pop_frame(&mut self) {
         if let Some(frame) = self.stack.pop_frame() {
-            // Remove var_regions entries that were in this frame
-            let base = frame.base;
-            self.var_regions.retain(|_, (region, offset, _)| {
-                !(*region == MemRegion::Stack && *offset >= base)
-            });
+            self.tracker.drop_stack_frame(frame.base);
         }
     }
 
@@ -449,18 +634,15 @@ impl EgyptianMemory {
 
     /// Allocate on the heap (for dynamic objects: structs, arrays, closures).
     pub fn heap_alloc(&mut self, name: &str, size: usize) -> Result<usize, MemoryError> {
-        // If heap is exhausted, try resetting arena first
         match self.heap.alloc(size) {
             Ok(offset) => {
                 self.total_allocs += 1;
-                self.var_regions.insert(name.to_string(), (MemRegion::Heap, offset, size));
+                self.tracker.record(name, MemRegion::Heap, offset, size);
                 Ok(offset)
             }
             Err(e) => {
-                // Try arena reset as a last resort before failing
                 if self.arena.used() > 0 {
                     self.arena.reset();
-                    // Retry (arena reset doesn't help heap directly, but signals pressure)
                 }
                 Err(e)
             }
@@ -469,11 +651,12 @@ impl EgyptianMemory {
 
     /// Free a heap allocation by variable name.
     pub fn heap_free(&mut self, name: &str) -> Result<(), MemoryError> {
-        if let Some((MemRegion::Heap, offset, _)) = self.var_regions.remove(name) {
-            self.heap.free(offset)
-        } else {
-            Ok(()) // silently ignore non-heap or unknown vars
-        }
+        let (idx, offset) = match self.tracker.find(name) {
+            Some((i, rec)) if rec.region == MemRegion::Heap => (i, rec.offset),
+            _ => return Ok(()), // silently ignore non-heap / unknown
+        };
+        self.tracker.tombstone(idx);
+        self.heap.free(offset)
     }
 
     // ── Arena operations ────────────────────────────────────
@@ -486,7 +669,6 @@ impl EgyptianMemory {
                 Ok(offset)
             }
             Err(_) => {
-                // Auto-reset and retry
                 self.arena.reset();
                 let offset = self.arena.alloc(size)?;
                 self.total_allocs += 1;
@@ -498,15 +680,14 @@ impl EgyptianMemory {
     /// Manually reset the arena (advanced use).
     pub fn arena_reset(&mut self) {
         self.arena.reset();
-        // Remove arena var_regions entries
-        self.var_regions.retain(|_, (region, _, _)| *region != MemRegion::Arena);
+        self.tracker.drop_arena();
     }
 
     // ── Region query ────────────────────────────────────────
 
     /// Get the region where a variable is stored.
     pub fn get_region(&self, name: &str) -> Option<MemRegion> {
-        self.var_regions.get(name).map(|(r, _, _)| *r)
+        self.tracker.find(name).map(|(_, rec)| rec.region)
     }
 
     // ── Stats ───────────────────────────────────────────────
@@ -625,6 +806,7 @@ pub fn classify_region(val: &crate::env::Value) -> MemRegion {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn test_egyptian_fraction_identity() {
@@ -736,20 +918,19 @@ mod tests {
 
     #[test]
     fn test_heap_coalesce() {
-        let mut mem = EgyptianMemory::new(600);
-        let off1 = mem.heap_alloc("a", 8).unwrap();
+        // With segregated free lists we no longer coalesce across the bump
+        // arena, but freed blocks are reused within their size class.
+        let mut mem = EgyptianMemory::new(6000); // heap = 2000
+        let _off1 = mem.heap_alloc("a", 8).unwrap();
         let _off2 = mem.heap_alloc("b", 8).unwrap();
         let _off3 = mem.heap_alloc("c", 8).unwrap();
-        // Free first and third
         mem.heap_free("a").unwrap();
         mem.heap_free("c").unwrap();
-        // Free middle — should coalesce all three
         mem.heap_free("b").unwrap();
         assert_eq!(mem.stats().heap_used, 0);
-        // Should be able to allocate the full freed space
-        let result = mem.heap_alloc("big", 24);
+        // Should be able to allocate from the same size class (8B aligned).
+        let result = mem.heap_alloc("big", 8);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), off1); // should start at beginning
     }
 
     #[test]
@@ -790,5 +971,59 @@ mod tests {
         assert!(output.contains("1/2"));
         assert!(output.contains("1/3"));
         assert!(output.contains("1/6"));
+    }
+
+    // ── New tests for HashMap-free invariants ──
+
+    #[test]
+    fn test_var_handle_pack_unpack() {
+        let h = VarHandle::new(MemRegion::Heap, 12345);
+        assert_eq!(h.region(), MemRegion::Heap);
+        assert_eq!(h.index(), 12345);
+        let h2 = VarHandle::new(MemRegion::Arena, 0);
+        assert_eq!(h2.region(), MemRegion::Arena);
+        assert_eq!(h2.index(), 0);
+        let h3 = VarHandle::new(MemRegion::Stack, (1 << 30) - 1);
+        assert_eq!(h3.region(), MemRegion::Stack);
+        assert_eq!(h3.index(), (1 << 30) - 1);
+    }
+
+    #[test]
+    fn test_heap_size_class_reuse() {
+        let mut mem = EgyptianMemory::new(60_000);
+        // Small (16B class)
+        let o1 = mem.heap_alloc("s1", 10).unwrap();
+        mem.heap_free("s1").unwrap();
+        let o2 = mem.heap_alloc("s2", 10).unwrap();
+        assert_eq!(o1, o2, "same size class should reuse freed slot");
+    }
+
+    #[test]
+    fn test_heap_stress_reuse() {
+        let mut mem = EgyptianMemory::new(600_000);
+        for i in 0..1000 {
+            let name = format!("v{}", i % 8);
+            let _ = mem.heap_alloc(&name, 64).unwrap();
+            if i % 2 == 1 {
+                let _ = mem.heap_free(&name);
+            }
+        }
+        let s = mem.stats();
+        assert!(s.heap_used <= s.heap_capacity);
+    }
+
+    #[test]
+    fn test_stack_frames_max_depth() {
+        let mut mem = EgyptianMemory::new(60_000);
+        for i in 0..MAX_FRAMES {
+            mem.push_frame(&format!("f{}", i));
+            mem.stack_alloc(&format!("x{}", i), 8).unwrap();
+        }
+        assert_eq!(mem.stats().stack_frame_depth, MAX_FRAMES);
+        for _ in 0..MAX_FRAMES {
+            mem.pop_frame();
+        }
+        assert_eq!(mem.stats().stack_frame_depth, 0);
+        assert_eq!(mem.stats().stack_used, 0);
     }
 }

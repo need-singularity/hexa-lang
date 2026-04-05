@@ -28,6 +28,8 @@ pub struct VM {
     frames: Vec<CallFrame>,
     /// Constant pool (shared from chunk).
     constants: Vec<Value>,
+    /// Interned string pool (shared from chunk) for GetGlobal/SetGlobal/CallFn/CallBuiltin name lookup.
+    string_pool: Vec<String>,
     /// Compiled functions registry.
     functions: HashMap<String, CompiledFunction>,
     /// Global variables (for builtins like PI, E, etc.).
@@ -44,6 +46,7 @@ impl VM {
             locals: Vec::new(),
             frames: Vec::new(),
             constants: Vec::new(),
+            string_pool: Vec::new(),
             functions: HashMap::new(),
             globals,
         }
@@ -52,6 +55,7 @@ impl VM {
     /// Execute a compiled chunk. Returns the last value on the stack (or Void).
     pub fn execute(&mut self, chunk: &Chunk) -> Result<Value, HexaError> {
         self.constants = chunk.constants.clone();
+        self.string_pool = chunk.string_pool.clone();
         self.functions = chunk.functions.clone();
 
         // Pre-allocate locals for top-level (avoid resizing during execution)
@@ -65,6 +69,7 @@ impl VM {
     /// Execute a compiled chunk with dead code elimination applied.
     pub fn execute_optimized(&mut self, chunk: &Chunk) -> Result<Value, HexaError> {
         self.constants = chunk.constants.clone();
+        self.string_pool = chunk.string_pool.clone();
         self.functions = chunk.functions.clone();
 
         // Apply dead code elimination
@@ -127,16 +132,18 @@ impl VM {
                     }
                     self.locals[idx] = val;
                 }
-                OpCode::GetGlobal(name) => {
+                OpCode::GetGlobal(idx) => {
+                    let name = &self.string_pool[*idx as usize];
                     if let Some(val) = self.globals.get(name) {
                         self.stack.push(val.clone());
                     } else {
                         return Err(runtime_err(format!("undefined variable: {}", name)));
                     }
                 }
-                OpCode::SetGlobal(name) => {
+                OpCode::SetGlobal(idx) => {
                     let val = self.pop()?;
-                    self.globals.insert(name.clone(), val);
+                    let name = self.string_pool[*idx as usize].clone();
+                    self.globals.insert(name, val);
                 }
 
                 // Arithmetic
@@ -269,8 +276,9 @@ impl VM {
                         ip = *target;
                     }
                 }
-                OpCode::CallFn(name, argc) => {
-                    let result = self.call_function(name, *argc)?;
+                OpCode::CallFn(idx, argc) => {
+                    let name = self.string_pool[*idx as usize].clone();
+                    let result = self.call_function(&name, *argc as usize)?;
                     self.stack.push(result);
                 }
                 OpCode::Return => {
@@ -313,8 +321,9 @@ impl VM {
                 }
 
                 // Builtins
-                OpCode::CallBuiltin(name, argc) => {
-                    let result = self.call_builtin(name, *argc)?;
+                OpCode::CallBuiltin(idx, argc) => {
+                    let name = self.string_pool[*idx as usize].clone();
+                    let result = self.call_builtin(&name, *argc as usize)?;
                     self.stack.push(result);
                 }
 

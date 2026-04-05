@@ -77,7 +77,7 @@ pub fn lower_stmt_val(ctx: &mut LowerCtx, builder: &mut IrBuilder, stmt: &Stmt) 
         Stmt::Assign(lhs, rhs) => {
             let val = lower_expr(ctx, builder, rhs);
             if let Expr::Ident(name) = lhs {
-                if let Some((ptr, _)) = ctx.lookup_var(name) {
+                if let Some(ptr) = ctx.lookup_var_id(name) {
                     builder.store(ptr, val);
                 }
             } else if let Expr::Field(obj, field) = lhs {
@@ -137,7 +137,7 @@ pub fn lower_stmt_val(ctx: &mut LowerCtx, builder: &mut IrBuilder, stmt: &Stmt) 
             builder.jump(cond_bb);
 
             builder.switch_to(cond_bb);
-            let i = ctx.lookup_var(var).map(|(v, _)| v).unwrap_or(start);
+            let i = ctx.lookup_var_id(var).unwrap_or(start);
             let cond_val = builder.emit_cmp_lt(i, end);
             builder.branch(cond_val, body_bb, exit_bb);
 
@@ -152,7 +152,7 @@ pub fn lower_stmt_val(ctx: &mut LowerCtx, builder: &mut IrBuilder, stmt: &Stmt) 
             }
 
             builder.switch_to(inc_bb);
-            let cur = ctx.lookup_var(var).map(|(v, _)| v).unwrap_or(start);
+            let cur = ctx.lookup_var_id(var).unwrap_or(start);
             let one = builder.const_i64(1);
             let next = builder.add(cur, one, IrType::I64);
             ctx.define_var(var, next, IrType::I64);
@@ -249,7 +249,7 @@ pub fn lower_stmt_val(ctx: &mut LowerCtx, builder: &mut IrBuilder, stmt: &Stmt) 
         }
 
         Stmt::DropStmt(name) => {
-            if let Some((val, _)) = ctx.lookup_var(name) {
+            if let Some(val) = ctx.lookup_var_id(name) {
                 builder.free(val)
             } else {
                 builder.const_i64(0)

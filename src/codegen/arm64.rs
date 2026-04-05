@@ -5,9 +5,18 @@
 //! memory load/store, stack spill/reload.
 
 use std::collections::HashMap;
+use std::sync::Mutex;
 use crate::ir::{IrModule, IrFunction, OpCode, Operand, ValueId, IrType};
 use crate::ir::instr::CmpKind;
 use super::regalloc::{AllocResult, FuncAlloc, Location, PhysReg};
+use super::peephole::{run_peephole, PeepholeStats};
+
+static LAST_PEEPHOLE_STATS: Mutex<Option<PeepholeStats>> = Mutex::new(None);
+
+/// Fetch the stats from the most recent ARM64 emit (for diagnostics / tests).
+pub fn last_peephole_stats() -> Option<PeepholeStats> {
+    LAST_PEEPHOLE_STATS.lock().ok().and_then(|g| g.clone())
+}
 
 const FP: u8 = 29;
 const LR: u8 = 30;
@@ -51,6 +60,13 @@ pub fn emit_with_main_offset(module: &IrModule, alloc: &AllocResult) -> (Vec<u8>
     }
 
     let main_offset = func_offsets.get("main").copied().unwrap_or(0);
+
+    // Post-emit peephole pass (length-preserving; safe w.r.t. branch fixups).
+    // Fixed-point with ≤6 rounds; runs 6 rules (n=6 alignment).
+    let peephole_enabled = std::env::var("HEXA_NO_PEEPHOLE").is_err();
+    let stats = if peephole_enabled { run_peephole(&mut code) } else { PeepholeStats::default() };
+    if let Ok(mut slot) = LAST_PEEPHOLE_STATS.lock() { *slot = Some(stats); }
+
     (code, main_offset)
 }
 

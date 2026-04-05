@@ -10,11 +10,24 @@ use std::collections::HashMap;
 use crate::ast;
 use crate::ir::{self, IrModule, IrFunction, IrBuilder, IrType, ValueId, BlockId, FuncId, Operand};
 
+/// Single variable binding entry in the shadow stack.
+#[derive(Debug, Clone)]
+struct ScopeEntry {
+    val: ValueId,
+    ty: IrType,
+}
+
 /// Lowering context — tracks scope, types, and declarations.
 /// NOTE: module is kept separate to avoid borrow conflicts with IrBuilder.
+///
+/// Scope lookup is O(1) via a flat HashMap keyed by name. Each name maps
+/// to a shadow stack (Vec<ScopeEntry>); the top is the current binding.
+/// `scope_frames[d]` lists names defined at depth `d` for O(k) pop.
 pub struct LowerCtx {
-    /// Variable name → (ValueId, IrType) in current scope.
-    pub scopes: Vec<HashMap<String, (ValueId, IrType)>>,
+    /// Flat name → shadow stack. Top of each stack is the active binding.
+    flat_lookup: HashMap<String, Vec<ScopeEntry>>,
+    /// Per-scope list of names defined at that depth (for pop_scope unwind).
+    scope_frames: Vec<Vec<String>>,
     /// Function name → FuncId.
     pub func_map: HashMap<String, FuncId>,
     /// Struct name → field layout.
@@ -28,7 +41,8 @@ pub struct LowerCtx {
 impl LowerCtx {
     pub fn new() -> Self {
         Self {
-            scopes: vec![HashMap::new()],
+            flat_lookup: HashMap::new(),
+            scope_frames: vec![Vec::new()],
             func_map: HashMap::new(),
             struct_map: HashMap::new(),
             enum_map: HashMap::new(),
@@ -37,26 +51,51 @@ impl LowerCtx {
     }
 
     pub fn push_scope(&mut self) {
-        self.scopes.push(HashMap::new());
+        self.scope_frames.push(Vec::new());
     }
 
     pub fn pop_scope(&mut self) {
-        self.scopes.pop();
+        if let Some(names) = self.scope_frames.pop() {
+            for name in names {
+                if let Some(stack) = self.flat_lookup.get_mut(&name) {
+                    stack.pop();
+                    if stack.is_empty() {
+                        self.flat_lookup.remove(&name);
+                    }
+                }
+            }
+        }
     }
 
     pub fn define_var(&mut self, name: &str, val: ValueId, ty: IrType) {
-        if let Some(scope) = self.scopes.last_mut() {
-            scope.insert(name.to_string(), (val, ty));
+        // Track name in current frame so pop_scope can unwind it.
+        if let Some(frame) = self.scope_frames.last_mut() {
+            frame.push(name.to_string());
         }
+        self.flat_lookup
+            .entry(name.to_string())
+            .or_insert_with(Vec::new)
+            .push(ScopeEntry { val, ty });
     }
 
+    /// O(1) variable lookup. Returns owned (ValueId, IrType) for API
+    /// parity with the previous implementation; IrType clone is only
+    /// needed for callers that wrap the type (e.g. IrType::Ptr(Box::new(..))).
     pub fn lookup_var(&self, name: &str) -> Option<(ValueId, IrType)> {
-        for scope in self.scopes.iter().rev() {
-            if let Some(v) = scope.get(name) {
-                return Some(v.clone());
-            }
-        }
-        None
+        self.flat_lookup
+            .get(name)
+            .and_then(|stack| stack.last())
+            .map(|e| (e.val, e.ty.clone()))
+    }
+
+    /// O(1) lookup returning only the ValueId (no IrType clone).
+    /// Prefer this when the type isn't needed at the call site.
+    #[inline]
+    pub fn lookup_var_id(&self, name: &str) -> Option<ValueId> {
+        self.flat_lookup
+            .get(name)
+            .and_then(|stack| stack.last())
+            .map(|e| e.val)
     }
 
     pub fn resolve_type(&self, type_str: &str) -> IrType {
@@ -201,6 +240,32 @@ mod tests {
         ctx.pop_scope();
         assert!(ctx.lookup_var("x").is_some());
         assert!(ctx.lookup_var("y").is_none());
+    }
+
+    #[test]
+    fn test_scope_shadowing() {
+        let mut ctx = LowerCtx::new();
+        ctx.define_var("x", ir::ValueId(10), IrType::I64);
+        assert_eq!(ctx.lookup_var("x").unwrap().0, ir::ValueId(10));
+
+        ctx.push_scope();
+        ctx.define_var("x", ir::ValueId(20), IrType::I32);
+        // Inner shadows outer
+        assert_eq!(ctx.lookup_var("x").unwrap().0, ir::ValueId(20));
+        assert_eq!(ctx.lookup_var("x").unwrap().1, IrType::I32);
+
+        ctx.push_scope();
+        ctx.define_var("x", ir::ValueId(30), IrType::Bool);
+        assert_eq!(ctx.lookup_var("x").unwrap().0, ir::ValueId(30));
+
+        ctx.pop_scope();
+        // Restored to middle scope
+        assert_eq!(ctx.lookup_var("x").unwrap().0, ir::ValueId(20));
+
+        ctx.pop_scope();
+        // Restored to outer
+        assert_eq!(ctx.lookup_var("x").unwrap().0, ir::ValueId(10));
+        assert_eq!(ctx.lookup_var_id("x"), Some(ir::ValueId(10)));
     }
 
     #[test]

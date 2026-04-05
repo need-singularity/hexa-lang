@@ -52,6 +52,11 @@ fn gp_regs(target: Target) -> Vec<PhysReg> {
     }
 }
 
+/// Public wrapper for callee-saved check (used by linear scan allocator).
+pub fn is_callee_saved_pub(reg: PhysReg, target: Target) -> bool {
+    is_callee_saved(reg, target)
+}
+
 /// Check if a physical register is callee-saved.
 fn is_callee_saved(reg: PhysReg, target: Target) -> bool {
     match target {
@@ -340,8 +345,17 @@ fn count_uses(func: &IrFunction) -> HashMap<ValueId, usize> {
     counts
 }
 
-/// Chaitin-Briggs graph coloring register allocation for a single function.
+/// Register allocation dispatcher. Default: Chaitin-Briggs.
+/// Set HEXA_REGALLOC_LINEAR=1 to use Linear-Scan (experimental).
 fn allocate_function(func: &IrFunction, regs: &[PhysReg]) -> FuncAlloc {
+    if std::env::var("HEXA_REGALLOC_LINEAR").is_ok() {
+        return super::regalloc_linear::allocate_function_linear(func, regs);
+    }
+    allocate_function_chaitin(func, regs)
+}
+
+/// Chaitin-Briggs graph coloring register allocation for a single function.
+fn allocate_function_chaitin(func: &IrFunction, regs: &[PhysReg]) -> FuncAlloc {
     let k = regs.len(); // number of available registers
 
     // If function has no blocks, return empty allocation

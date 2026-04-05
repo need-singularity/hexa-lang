@@ -167,6 +167,29 @@ fn main() {
                 run_file_hexa_ir(&args[2]);
             }
             #[cfg(not(target_arch = "wasm32"))]
+            "--bench-lower" => {
+                if args.len() < 3 {
+                    eprintln!("Usage: hexa --bench-lower <file.hexa> [iters]");
+                    std::process::exit(1);
+                }
+                let iters: usize = if args.len() >= 4 {
+                    args[3].parse().unwrap_or(10000)
+                } else { 10000 };
+                let source = std::fs::read_to_string(&args[2]).unwrap();
+                let tokens = lexer::Lexer::new(&source).tokenize().unwrap();
+                let stmts = parser::Parser::new(tokens).parse().unwrap();
+                let t0 = std::time::Instant::now();
+                let mut sink: usize = 0;
+                for _ in 0..iters {
+                    let m = lower::lower_program(&stmts, &args[2]);
+                    sink = sink.wrapping_add(m.functions.len());
+                }
+                let dt = t0.elapsed();
+                let us_per = dt.as_secs_f64() * 1_000_000.0 / iters as f64;
+                println!("[bench-lower] iters={} total={:?} per-iter={:.3}us sink={}",
+                    iters, dt, us_per, sink);
+            }
+            #[cfg(not(target_arch = "wasm32"))]
             "--dump-ir" => {
                 if args.len() < 3 {
                     eprintln!("Usage: hexa --dump-ir <file.hexa>");
@@ -911,6 +934,9 @@ fn run_file_hexa_ir(path: &str) {
     let eso_result = opt::run_pipeline_with_policy(&mut module, policy, 0, &[]);
     let opt_result = eso_result.pipeline;
     eprintln!("[hexa-ir] {}", opt_result.summary().trim());
+    if std::env::var("HEXA_DUMP_POST_OPT").is_ok() {
+        eprintln!("{}", ir::print_module(&module));
+    }
     if !eso_mode.is_empty() && eso_mode != "fixed" {
         eprintln!("[eso] policy={} metrics={}", eso_mode, eso_result.metrics.len());
     }
@@ -921,6 +947,14 @@ fn run_file_hexa_ir(path: &str) {
     match codegen::compile_to_binary(&module, &output_bin) {
         Ok(()) => {
             eprintln!("[hexa-ir] Compiled to {}", output_bin);
+            if let Some(ps) = codegen::arm64::last_peephole_stats() {
+                eprintln!(
+                    "[hexa-ir] peephole: total={} rounds={} (id={} madd={} msub={} cmp0={} ldp={} shadd={})",
+                    ps.total(), ps.rounds,
+                    ps.identity_nop, ps.mul_add_to_madd, ps.mul_sub_to_msub,
+                    ps.cmp_zero_dead, ps.ldr_pair_to_ldp, ps.lsl_add_to_shifted_add
+                );
+            }
         }
         Err(e) => {
             eprintln!("[hexa-ir] Compilation failed: {}", e);

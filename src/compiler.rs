@@ -16,8 +16,8 @@ pub enum OpCode {
     // Variables
     GetLocal(usize),    // push local variable
     SetLocal(usize),    // pop into local variable
-    GetGlobal(String),  // push global variable
-    SetGlobal(String),  // pop into global variable
+    GetGlobal(u32),     // push global variable (string_pool index)
+    SetGlobal(u32),     // pop into global variable (string_pool index)
 
     // Arithmetic
     Add, Sub, Mul, Div, Mod, Pow,
@@ -36,13 +36,13 @@ pub enum OpCode {
     Jump(usize),        // unconditional jump
     JumpIfFalse(usize), // conditional jump
     JumpIfTrue(usize),  // short-circuit jump
-    CallFn(String, usize),  // call named function with N args
+    CallFn(u32, u16),       // call named function (string_pool idx, N args)
     Return,             // return from function
 
     // Built-ins
     Print(usize),       // print N values (no newline)
     Println(usize),     // print N values + newline
-    CallBuiltin(String, usize), // call builtin with N args
+    CallBuiltin(u32, u16),  // call builtin (string_pool idx, N args)
 
     // Data structures
     MakeArray(usize),   // create array from N stack values
@@ -58,6 +58,16 @@ pub enum OpCode {
     // Bool conversion for logical ops
     Truthy,             // convert TOS to bool
 }
+
+/// Compile-time assertion: OpCode must be <= 16 bytes for L1d cache density.
+/// Shrinking GetGlobal/SetGlobal/CallFn/CallBuiltin from String-bearing variants
+/// to u32 indices drops OpCode from 32B → 16B (2x stream density).
+const _: () = {
+    assert!(
+        std::mem::size_of::<OpCode>() <= 16,
+        "OpCode must be <= 16 bytes (L1d density target)"
+    );
+};
 
 /// A compiled function: its bytecode + metadata.
 #[derive(Debug, Clone)]
@@ -78,6 +88,8 @@ pub struct Chunk {
     pub functions: HashMap<String, CompiledFunction>,
     /// Number of local slots needed at top level.
     pub local_count: usize,
+    /// Interned strings (global/function/builtin names) referenced by OpCode u32 indices.
+    pub string_pool: Vec<String>,
 }
 
 impl Chunk {
@@ -87,7 +99,27 @@ impl Chunk {
             constants: Vec::new(),
             functions: HashMap::new(),
             local_count: 0,
+            string_pool: Vec::new(),
         }
+    }
+
+    /// Intern a name into the string pool, returning its u32 index.
+    /// Deduplicates on insertion.
+    pub fn intern(&mut self, name: &str) -> u32 {
+        for (i, existing) in self.string_pool.iter().enumerate() {
+            if existing == name {
+                return i as u32;
+            }
+        }
+        let idx = self.string_pool.len() as u32;
+        self.string_pool.push(name.to_string());
+        idx
+    }
+
+    /// Resolve a u32 index back to a name (for dispatch/debug).
+    #[inline]
+    pub fn name_at(&self, idx: u32) -> &str {
+        &self.string_pool[idx as usize]
     }
 
     pub fn add_constant(&mut self, val: Value) -> usize {
@@ -214,8 +246,9 @@ impl Compiler {
         // Use a temporary chunk for this function's code
         // We need to compile into a temp chunk, then extract code
         let mut temp = Chunk::new();
-        // Share constants with parent
+        // Share constants + string_pool with parent
         temp.constants = parent_chunk.constants.clone();
+        temp.string_pool = parent_chunk.string_pool.clone();
 
         for stmt in &decl.body {
             if matches!(stmt, Stmt::FnDecl(_)) {
@@ -231,8 +264,9 @@ impl Compiler {
         }
 
         let func_code = temp.code;
-        // Merge constants back to parent
+        // Merge constants + string_pool back to parent
         parent_chunk.constants = temp.constants;
+        parent_chunk.string_pool = temp.string_pool;
 
         let local_count = self.next_slot;
         self.pop_scope();
@@ -302,7 +336,8 @@ impl Compiler {
                         if let Some(slot) = self.resolve_local(name) {
                             chunk.emit(OpCode::SetLocal(slot));
                         } else {
-                            chunk.emit(OpCode::SetGlobal(name.clone()));
+                            let idx = chunk.intern(name);
+                            chunk.emit(OpCode::SetGlobal(idx));
                         }
                     }
                     Expr::Index(arr_expr, idx_expr) => {
@@ -310,7 +345,8 @@ impl Compiler {
                             if let Some(slot) = self.resolve_local(name) {
                                 chunk.emit(OpCode::GetLocal(slot));
                             } else {
-                                chunk.emit(OpCode::GetGlobal(name.clone()));
+                                let idx = chunk.intern(name);
+                                chunk.emit(OpCode::GetGlobal(idx));
                             }
                             self.compile_expr(chunk, idx_expr)?;
                             self.compile_expr(chunk, rhs)?;
@@ -318,7 +354,8 @@ impl Compiler {
                             if let Some(slot) = self.resolve_local(name) {
                                 chunk.emit(OpCode::SetLocal(slot));
                             } else {
-                                chunk.emit(OpCode::SetGlobal(name.clone()));
+                                let idx = chunk.intern(name);
+                                chunk.emit(OpCode::SetGlobal(idx));
                             }
                         } else {
                             return Err(compile_err("complex index assignment not supported in VM".into()));
@@ -364,7 +401,8 @@ impl Compiler {
                 // idx < len(arr)
                 chunk.emit(OpCode::GetLocal(idx_slot));
                 chunk.emit(OpCode::GetLocal(arr_slot));
-                chunk.emit(OpCode::CallBuiltin("len".into(), 1));
+                let len_idx = chunk.intern("len");
+                chunk.emit(OpCode::CallBuiltin(len_idx, 1));
                 chunk.emit(OpCode::Lt);
                 let exit_jump = chunk.emit(OpCode::JumpIfFalse(0));
 
@@ -421,7 +459,8 @@ impl Compiler {
             }
             Stmt::Assert(expr) => {
                 self.compile_expr(chunk, expr)?;
-                chunk.emit(OpCode::CallBuiltin("__assert__".into(), 1));
+                let assert_idx = chunk.intern("__assert__");
+                chunk.emit(OpCode::CallBuiltin(assert_idx, 1));
                 chunk.emit(OpCode::Pop);
                 Ok(())
             }
@@ -553,7 +592,8 @@ impl Compiler {
                 if let Some(slot) = self.resolve_local(name) {
                     chunk.emit(OpCode::GetLocal(slot));
                 } else {
-                    chunk.emit(OpCode::GetGlobal(name.clone()));
+                    let idx = chunk.intern(name);
+                    chunk.emit(OpCode::GetGlobal(idx));
                 }
                 Ok(())
             }
@@ -637,14 +677,16 @@ impl Compiler {
                         } else if name == "println" {
                             chunk.emit(OpCode::Println(args.len()));
                         } else {
-                            chunk.emit(OpCode::CallBuiltin(name.clone(), args.len()));
+                            let idx = chunk.intern(name);
+                            chunk.emit(OpCode::CallBuiltin(idx, args.len() as u16));
                         }
                     }
                     Expr::Ident(name) => {
                         for arg in args {
                             self.compile_expr(chunk, arg)?;
                         }
-                        chunk.emit(OpCode::CallFn(name.clone(), args.len()));
+                        let idx = chunk.intern(name);
+                        chunk.emit(OpCode::CallFn(idx, args.len() as u16));
                     }
                     _ => {
                         // Unsupported call target in VM
@@ -832,6 +874,13 @@ mod tests {
         let stmts = Parser::new(tokens).parse().unwrap();
         let mut compiler = Compiler::new();
         compiler.compile(&stmts).unwrap()
+    }
+
+    #[test]
+    fn test_opcode_size_16b() {
+        let sz = std::mem::size_of::<OpCode>();
+        println!("OpCode size = {} bytes", sz);
+        assert!(sz <= 16, "OpCode must be <= 16 bytes for L1d density, got {}", sz);
     }
 
     #[test]
