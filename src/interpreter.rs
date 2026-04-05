@@ -312,13 +312,15 @@ impl Interpreter {
                         _ => {}
                     }
                 }
-                // Track allocation in Egyptian memory
-                let size = estimate_value_size(&val);
-                let region = classify_region(&val);
-                match region {
-                    MemRegion::Stack => { let _ = self.memory.stack_alloc(name, size); }
-                    MemRegion::Heap => { let _ = self.memory.heap_alloc(name, size); }
-                    MemRegion::Arena => { let _ = self.memory.arena_alloc(size); }
+                // Track allocation in Egyptian memory (skip for value types — hot path)
+                if !val.is_value_type() {
+                    let size = estimate_value_size(&val);
+                    let region = classify_region(&val);
+                    match region {
+                        MemRegion::Stack => { let _ = self.memory.stack_alloc(name, size); }
+                        MemRegion::Heap => { let _ = self.memory.heap_alloc(name, size); }
+                        MemRegion::Arena => { let _ = self.memory.arena_alloc(size); }
+                    }
                 }
                 self.env.define(name, val);
                 if is_own {
@@ -337,7 +339,7 @@ impl Interpreter {
             }
             Stmt::Static(name, _typ, expr, _vis) => {
                 // Static variables must be at module level (scope depth == 1)
-                if self.env.scopes.len() > 1 {
+                if self.env.scope_depth() > 1 {
                     return Err(self.runtime_err(
                         "static variables must be declared at module level".to_string()
                     ));
@@ -1107,9 +1109,7 @@ impl Interpreter {
                 }
                 self.env.get(name).ok_or_else(|| {
                     // Collect known names for "did you mean" suggestion
-                    let known_names: Vec<&str> = self.env.scopes.iter()
-                        .flat_map(|s| s.keys().map(|k| k.as_str()))
-                        .collect();
+                    let known_names: Vec<&str> = self.env.known_names();
                     let hint = crate::error::suggest_name(name, &known_names)
                         .map(|s| format!("did you mean '{}'?", s));
                     HexaError {
@@ -1226,12 +1226,25 @@ impl Interpreter {
                     }
                     return Err(self.runtime_err(format!("undefined enum, type, or module: {}", path_name)));
                 }
-                let func = self.eval_expr(callee)?;
-                let mut arg_vals = Vec::new();
-                for a in args {
-                    arg_vals.push(self.eval_expr(a)?);
+                // Fast path: direct Ident callee avoids eval_expr overhead
+                if let Expr::Ident(fn_name) = callee.as_ref() {
+                    // Look up the function value directly
+                    let func = self.env.get(fn_name).ok_or_else(|| {
+                        self.runtime_err(format!("undefined function: {}", fn_name))
+                    })?;
+                    let mut arg_vals = Vec::with_capacity(args.len());
+                    for a in args {
+                        arg_vals.push(self.eval_expr(a)?);
+                    }
+                    self.call_function(func, arg_vals)
+                } else {
+                    let func = self.eval_expr(callee)?;
+                    let mut arg_vals = Vec::with_capacity(args.len());
+                    for a in args {
+                        arg_vals.push(self.eval_expr(a)?);
+                    }
+                    self.call_function(func, arg_vals)
                 }
-                self.call_function(func, arg_vals)
             }
             Expr::If(cond, then_block, else_block) => {
                 let c = self.eval_expr(cond)?;
@@ -1639,6 +1652,10 @@ impl Interpreter {
                     trait_name: trait_name.clone(),
                     type_name,
                 })
+            }
+            Expr::Template(nodes) => {
+                crate::std_web_template::render_template(self, nodes)
+                    .map(Value::Str)
             }
         }
     }
@@ -3907,32 +3924,15 @@ impl Interpreter {
     }
 
     fn capture_env(&self) -> Vec<(String, Value)> {
-        // Capture all variables in the current environment
-        let mut captured = Vec::new();
-        for scope in self.env.scopes.iter() {
-            for (k, v) in scope {
-                // Don't capture builtins
-                if !matches!(v, Value::BuiltinFn(_)) {
-                    captured.push((k.clone(), v.clone()));
-                }
-            }
-        }
-        captured
+        // Capture all variables in the current environment (skip builtins)
+        self.env.capture_non_builtins()
     }
 
     /// Capture environment for spawn -- includes user-defined variables
     /// (builtins are already registered in the spawned Interpreter::new()).
     #[cfg(not(target_arch = "wasm32"))]
     fn capture_env_for_spawn(&self) -> Vec<(String, Value)> {
-        let mut captured = Vec::new();
-        for scope in self.env.scopes.iter() {
-            for (k, v) in scope {
-                if !matches!(v, Value::BuiltinFn(_)) {
-                    captured.push((k.clone(), v.clone()));
-                }
-            }
-        }
-        captured
+        self.env.capture_non_builtins()
     }
 
     /// Try to receive a value for a select arm (non-blocking).

@@ -48,6 +48,14 @@ pub enum Value {
     Atomic(std::sync::Arc<crate::atomic_ops::AtomicValue>),
 }
 
+impl Value {
+    /// Returns true for simple value types that don't need memory tracking.
+    #[inline]
+    pub fn is_value_type(&self) -> bool {
+        matches!(self, Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Char(_) | Value::Byte(_) | Value::Void)
+    }
+}
+
 impl std::fmt::Display for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
@@ -141,7 +149,11 @@ pub enum OwnershipState {
 }
 
 pub struct Env {
-    pub scopes: Vec<HashMap<String, Value>>,
+    /// Flat variable stack: all bindings stored as (name, value) pairs.
+    /// Scope boundaries tracked by `scope_starts`.
+    vars: Vec<(String, Value)>,
+    /// Stack of indices into `vars` marking where each scope begins.
+    scope_starts: Vec<usize>,
     /// Ownership state tracking per variable name (checked at runtime).
     pub ownership: Vec<HashMap<String, OwnershipState>>,
     /// Names of constant bindings (cannot be reassigned).
@@ -156,7 +168,8 @@ pub struct Env {
 impl Env {
     pub fn new() -> Self {
         let mut env = Self {
-            scopes: vec![HashMap::new()],
+            vars: Vec::with_capacity(256),
+            scope_starts: vec![0],
             ownership: vec![HashMap::new()],
             constants: std::collections::HashSet::new(),
             statics: HashMap::new(),
@@ -295,17 +308,31 @@ impl Env {
 
     }
 
-    pub fn push_scope(&mut self) { self.scopes.push(HashMap::new()); self.ownership.push(HashMap::new()); }
-    pub fn pop_scope(&mut self) { self.scopes.pop(); self.ownership.pop(); }
-
-    pub fn define(&mut self, name: &str, val: Value) {
-        self.scopes.last_mut().unwrap().insert(name.to_string(), val);
+    #[inline]
+    pub fn push_scope(&mut self) {
+        self.scope_starts.push(self.vars.len());
+        self.ownership.push(HashMap::new());
     }
 
+    #[inline]
+    pub fn pop_scope(&mut self) {
+        if let Some(start) = self.scope_starts.pop() {
+            self.vars.truncate(start);
+        }
+        self.ownership.pop();
+    }
+
+    #[inline]
+    pub fn define(&mut self, name: &str, val: Value) {
+        self.vars.push((name.to_string(), val));
+    }
+
+    #[inline]
     pub fn get(&self, name: &str) -> Option<Value> {
-        for scope in self.scopes.iter().rev() {
-            if let Some(val) = scope.get(name) {
-                return Some(val.clone());
+        // Search flat stack in reverse (most recent first)
+        for i in (0..self.vars.len()).rev() {
+            if self.vars[i].0 == name {
+                return Some(self.vars[i].1.clone());
             }
         }
         // Fall back to static globals
@@ -315,10 +342,23 @@ impl Env {
         None
     }
 
+    /// Get a reference to a value without cloning.
+    #[inline]
+    pub fn get_ref(&self, name: &str) -> Option<&Value> {
+        for i in (0..self.vars.len()).rev() {
+            if self.vars[i].0 == name {
+                return Some(&self.vars[i].1);
+            }
+        }
+        self.statics.get(name)
+    }
+
+    #[inline]
     pub fn set(&mut self, name: &str, val: Value) -> bool {
-        for scope in self.scopes.iter_mut().rev() {
-            if scope.contains_key(name) {
-                scope.insert(name.to_string(), val);
+        // Search flat stack in reverse for existing binding
+        for i in (0..self.vars.len()).rev() {
+            if self.vars[i].0 == name {
+                self.vars[i].1 = val;
                 return true;
             }
         }
@@ -330,10 +370,37 @@ impl Env {
         false
     }
 
+    /// Return current scope depth (number of active scopes).
+    #[inline]
+    pub fn scope_depth(&self) -> usize {
+        self.scope_starts.len()
+    }
+
+    /// Collect all known variable names (for error suggestions).
+    pub fn known_names(&self) -> Vec<&str> {
+        self.vars.iter().map(|(k, _)| k.as_str()).collect()
+    }
+
+    /// Iterate all variable bindings (for debugger / introspection).
+    pub fn vars_iter(&self) -> std::slice::Iter<'_, (String, Value)> {
+        self.vars.iter()
+    }
+
+    /// Capture all non-builtin variables (for closures / spawn).
+    pub fn capture_non_builtins(&self) -> Vec<(String, Value)> {
+        let mut captured = Vec::new();
+        for (k, v) in &self.vars {
+            if !matches!(v, Value::BuiltinFn(_)) {
+                captured.push((k.clone(), v.clone()));
+            }
+        }
+        captured
+    }
+
     /// Define a constant (immutable binding).
     pub fn define_const(&mut self, name: &str, val: Value) {
         self.constants.insert(name.to_string());
-        self.scopes.last_mut().unwrap().insert(name.to_string(), val);
+        self.vars.push((name.to_string(), val));
     }
 
     /// Check if a name is a constant.

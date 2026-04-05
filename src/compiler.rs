@@ -773,7 +773,7 @@ impl Compiler {
             | Expr::Wildcard | Expr::Own(_) | Expr::MoveExpr(_) | Expr::Borrow(_)
             | Expr::Await(_) | Expr::MacroInvoc(_) | Expr::Comptime(_)
             | Expr::HandleWith(_, _) | Expr::EffectCall(_, _, _) | Expr::Resume(_)
-            | Expr::DynCast(_, _) | Expr::Yield(_) => {
+            | Expr::DynCast(_, _) | Expr::Yield(_) | Expr::Template(_) => {
                 chunk.emit(OpCode::Void);
                 Ok(())
             }

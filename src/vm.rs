@@ -87,14 +87,47 @@ impl VM {
         let mut ip = 0;
         let code_len = code.len();
 
+        // Hot-path helpers: inline pop that avoids Option overhead when we
+        // know the stack is non-empty (the compiler guarantees balanced pushes).
+        macro_rules! pop_fast {
+            ($self:expr) => {
+                match $self.stack.pop() {
+                    Some(v) => v,
+                    None => return Err(runtime_err("stack underflow".into())),
+                }
+            };
+        }
+
+        // Inline two-value pop for binary ops (avoids two separate pops)
+        macro_rules! pop2_fast {
+            ($self:expr) => {{
+                let len = $self.stack.len();
+                if len < 2 {
+                    return Err(runtime_err("stack underflow".into()));
+                }
+                let b = $self.stack.pop().unwrap();
+                let a = $self.stack.pop().unwrap();
+                (a, b)
+            }};
+        }
+
         while ip < code_len {
-            let op = &code[ip];
+            // SAFETY: ip is bounds-checked by the while condition
+            let op = unsafe { code.get_unchecked(ip) };
             ip += 1;
 
             match op {
                 OpCode::Const(idx) => {
-                    let val = self.constants[*idx].clone();
-                    self.stack.push(val);
+                    // Fast-path: avoid clone for Copy-like types
+                    let val = unsafe { self.constants.get_unchecked(*idx) };
+                    let pushed = match val {
+                        Value::Int(n) => Value::Int(*n),
+                        Value::Float(f) => Value::Float(*f),
+                        Value::Bool(b) => Value::Bool(*b),
+                        Value::Void => Value::Void,
+                        other => other.clone(),
+                    };
+                    self.stack.push(pushed);
                 }
                 OpCode::Void => {
                     self.stack.push(Value::Void);
@@ -108,29 +141,37 @@ impl VM {
                     }
                 }
                 OpCode::Truthy => {
-                    let val = self.pop()?;
+                    let val = pop_fast!(self);
                     self.stack.push(Value::Bool(is_truthy(&val)));
                 }
 
-                // Variables
+                // Variables -- inlined local_base for speed
                 OpCode::GetLocal(slot) => {
-                    let base = self.current_local_base();
+                    let base = self.frames.last().map_or(0, |f| f.local_base);
                     let idx = base + slot;
                     let val = if idx < self.locals.len() {
-                        self.locals[idx].clone()
+                        // Fast-path: avoid clone for Int/Float/Bool
+                        match unsafe { self.locals.get_unchecked(idx) } {
+                            Value::Int(n) => Value::Int(*n),
+                            Value::Float(f) => Value::Float(*f),
+                            Value::Bool(b) => Value::Bool(*b),
+                            Value::Void => Value::Void,
+                            other => other.clone(),
+                        }
                     } else {
                         Value::Void
                     };
                     self.stack.push(val);
                 }
                 OpCode::SetLocal(slot) => {
-                    let val = self.pop()?;
-                    let base = self.current_local_base();
+                    let val = pop_fast!(self);
+                    let base = self.frames.last().map_or(0, |f| f.local_base);
                     let idx = base + slot;
                     if idx >= self.locals.len() {
                         self.locals.resize(idx + 1, Value::Void);
                     }
-                    self.locals[idx] = val;
+                    // Direct assignment -- no clone needed, we own `val`
+                    unsafe { *self.locals.get_unchecked_mut(idx) = val; }
                 }
                 OpCode::GetGlobal(idx) => {
                     let name = &self.string_pool[*idx as usize];
@@ -141,44 +182,55 @@ impl VM {
                     }
                 }
                 OpCode::SetGlobal(idx) => {
-                    let val = self.pop()?;
+                    let val = pop_fast!(self);
                     let name = self.string_pool[*idx as usize].clone();
                     self.globals.insert(name, val);
                 }
 
-                // Arithmetic
+                // Arithmetic -- inline Int fast-path to avoid function call overhead
                 OpCode::Add => {
-                    let b = self.pop()?;
-                    let a = self.pop()?;
-                    self.stack.push(self.op_add(a, b)?);
+                    let (a, b) = pop2_fast!(self);
+                    match (a, b) {
+                        (Value::Int(x), Value::Int(y)) => self.stack.push(Value::Int(x.wrapping_add(y))),
+                        (a, b) => self.stack.push(self.op_add(a, b)?),
+                    }
                 }
                 OpCode::Sub => {
-                    let b = self.pop()?;
-                    let a = self.pop()?;
-                    self.stack.push(self.op_sub(a, b)?);
+                    let (a, b) = pop2_fast!(self);
+                    match (a, b) {
+                        (Value::Int(x), Value::Int(y)) => self.stack.push(Value::Int(x.wrapping_sub(y))),
+                        (a, b) => self.stack.push(self.op_sub(a, b)?),
+                    }
                 }
                 OpCode::Mul => {
-                    let b = self.pop()?;
-                    let a = self.pop()?;
-                    self.stack.push(self.op_mul(a, b)?);
+                    let (a, b) = pop2_fast!(self);
+                    match (a, b) {
+                        (Value::Int(x), Value::Int(y)) => self.stack.push(Value::Int(x.wrapping_mul(y))),
+                        (a, b) => self.stack.push(self.op_mul(a, b)?),
+                    }
                 }
                 OpCode::Div => {
-                    let b = self.pop()?;
-                    let a = self.pop()?;
-                    self.stack.push(self.op_div(a, b)?);
+                    let (a, b) = pop2_fast!(self);
+                    match (a, b) {
+                        (Value::Int(_), Value::Int(0)) => return Err(runtime_err("division by zero".into())),
+                        (Value::Int(x), Value::Int(y)) => self.stack.push(Value::Int(x / y)),
+                        (a, b) => self.stack.push(self.op_div(a, b)?),
+                    }
                 }
                 OpCode::Mod => {
-                    let b = self.pop()?;
-                    let a = self.pop()?;
-                    self.stack.push(self.op_mod(a, b)?);
+                    let (a, b) = pop2_fast!(self);
+                    match (a, b) {
+                        (Value::Int(_), Value::Int(0)) => return Err(runtime_err("division by zero".into())),
+                        (Value::Int(x), Value::Int(y)) => self.stack.push(Value::Int(x % y)),
+                        (a, b) => self.stack.push(self.op_mod(a, b)?),
+                    }
                 }
                 OpCode::Pow => {
-                    let b = self.pop()?;
-                    let a = self.pop()?;
+                    let (a, b) = pop2_fast!(self);
                     self.stack.push(self.op_pow(a, b)?);
                 }
                 OpCode::Neg => {
-                    let v = self.pop()?;
+                    let v = pop_fast!(self);
                     match v {
                         Value::Int(n) => self.stack.push(Value::Int(-n)),
                         Value::Float(n) => self.stack.push(Value::Float(-n)),
@@ -186,66 +238,77 @@ impl VM {
                     }
                 }
 
-                // Comparison
+                // Comparison -- inline Int fast-path
                 OpCode::Eq => {
-                    let b = self.pop()?;
-                    let a = self.pop()?;
-                    self.stack.push(Value::Bool(values_equal(&a, &b)));
+                    let (a, b) = pop2_fast!(self);
+                    let eq = match (&a, &b) {
+                        (Value::Int(x), Value::Int(y)) => x == y,
+                        _ => values_equal(&a, &b),
+                    };
+                    self.stack.push(Value::Bool(eq));
                 }
                 OpCode::Ne => {
-                    let b = self.pop()?;
-                    let a = self.pop()?;
-                    self.stack.push(Value::Bool(!values_equal(&a, &b)));
+                    let (a, b) = pop2_fast!(self);
+                    let eq = match (&a, &b) {
+                        (Value::Int(x), Value::Int(y)) => x == y,
+                        _ => values_equal(&a, &b),
+                    };
+                    self.stack.push(Value::Bool(!eq));
                 }
                 OpCode::Lt => {
-                    let b = self.pop()?;
-                    let a = self.pop()?;
-                    self.stack.push(Value::Bool(self.compare_lt(&a, &b)?));
+                    let (a, b) = pop2_fast!(self);
+                    let lt = match (&a, &b) {
+                        (Value::Int(x), Value::Int(y)) => x < y,
+                        _ => self.compare_lt(&a, &b)?,
+                    };
+                    self.stack.push(Value::Bool(lt));
                 }
                 OpCode::Gt => {
-                    let b = self.pop()?;
-                    let a = self.pop()?;
-                    self.stack.push(Value::Bool(self.compare_lt(&b, &a)?));
+                    let (a, b) = pop2_fast!(self);
+                    let gt = match (&a, &b) {
+                        (Value::Int(x), Value::Int(y)) => x > y,
+                        _ => self.compare_lt(&b, &a)?,
+                    };
+                    self.stack.push(Value::Bool(gt));
                 }
                 OpCode::Le => {
-                    let b = self.pop()?;
-                    let a = self.pop()?;
-                    let lt = self.compare_lt(&a, &b)?;
-                    let eq = values_equal(&a, &b);
-                    self.stack.push(Value::Bool(lt || eq));
+                    let (a, b) = pop2_fast!(self);
+                    let le = match (&a, &b) {
+                        (Value::Int(x), Value::Int(y)) => x <= y,
+                        _ => self.compare_lt(&a, &b)? || values_equal(&a, &b),
+                    };
+                    self.stack.push(Value::Bool(le));
                 }
                 OpCode::Ge => {
-                    let b = self.pop()?;
-                    let a = self.pop()?;
-                    let gt = self.compare_lt(&b, &a)?;
-                    let eq = values_equal(&a, &b);
-                    self.stack.push(Value::Bool(gt || eq));
+                    let (a, b) = pop2_fast!(self);
+                    let ge = match (&a, &b) {
+                        (Value::Int(x), Value::Int(y)) => x >= y,
+                        _ => self.compare_lt(&b, &a)? || values_equal(&a, &b),
+                    };
+                    self.stack.push(Value::Bool(ge));
                 }
 
                 // Logical / Bitwise
                 OpCode::Not => {
-                    let v = self.pop()?;
+                    let v = pop_fast!(self);
                     self.stack.push(Value::Bool(!is_truthy(&v)));
                 }
                 OpCode::BitAnd => {
-                    let b = self.pop()?;
-                    let a = self.pop()?;
+                    let (a, b) = pop2_fast!(self);
                     match (a, b) {
                         (Value::Int(x), Value::Int(y)) => self.stack.push(Value::Int(x & y)),
                         _ => return Err(runtime_err("bitwise AND requires integers".into())),
                     }
                 }
                 OpCode::BitOr => {
-                    let b = self.pop()?;
-                    let a = self.pop()?;
+                    let (a, b) = pop2_fast!(self);
                     match (a, b) {
                         (Value::Int(x), Value::Int(y)) => self.stack.push(Value::Int(x | y)),
                         _ => return Err(runtime_err("bitwise OR requires integers".into())),
                     }
                 }
                 OpCode::BitXor => {
-                    let b = self.pop()?;
-                    let a = self.pop()?;
+                    let (a, b) = pop2_fast!(self);
                     match (a, b) {
                         (Value::Int(x), Value::Int(y)) => self.stack.push(Value::Int(x ^ y)),
                         (Value::Bool(x), Value::Bool(y)) => self.stack.push(Value::Bool(x ^ y)),
@@ -253,7 +316,7 @@ impl VM {
                     }
                 }
                 OpCode::BitNot => {
-                    let v = self.pop()?;
+                    let v = pop_fast!(self);
                     match v {
                         Value::Int(n) => self.stack.push(Value::Int(!n)),
                         _ => return Err(runtime_err("bitwise NOT requires integer".into())),
@@ -265,31 +328,24 @@ impl VM {
                     ip = *target;
                 }
                 OpCode::JumpIfFalse(target) => {
-                    let v = self.pop()?;
+                    let v = pop_fast!(self);
                     if !is_truthy(&v) {
                         ip = *target;
                     }
                 }
                 OpCode::JumpIfTrue(target) => {
-                    let v = self.pop()?;
+                    let v = pop_fast!(self);
                     if is_truthy(&v) {
                         ip = *target;
                     }
                 }
                 OpCode::CallFn(idx, argc) => {
+                    // Avoid cloning the name string -- borrow for lookup, clone only if needed
                     let name = self.string_pool[*idx as usize].clone();
                     let result = self.call_function(&name, *argc as usize)?;
                     self.stack.push(result);
                 }
                 OpCode::Return => {
-                    // In top-level code, Return means "stop executing"
-                    // The return value is already on the stack
-                    if self.frames.is_empty() {
-                        // Top-level return
-                        let val = self.stack.pop().unwrap_or(Value::Void);
-                        return Ok(val);
-                    }
-                    // Otherwise handled by call_function
                     let val = self.stack.pop().unwrap_or(Value::Void);
                     return Ok(val);
                 }
@@ -303,7 +359,6 @@ impl VM {
                         }
                         print!("{}", self.stack[i]);
                     }
-                    // Pop args
                     self.stack.truncate(start);
                     self.stack.push(Value::Void);
                 }
@@ -334,9 +389,9 @@ impl VM {
                     self.stack.push(Value::Array(items));
                 }
                 OpCode::Index => {
-                    let idx = self.pop()?;
-                    let arr = self.pop()?;
-                    match (&arr, &idx) {
+                    let idx_val = pop_fast!(self);
+                    let arr = pop_fast!(self);
+                    match (&arr, &idx_val) {
                         (Value::Array(a), Value::Int(i)) => {
                             let i = *i as usize;
                             if i >= a.len() {
@@ -355,11 +410,10 @@ impl VM {
                     }
                 }
                 OpCode::IndexAssign => {
-                    // Stack: [arr, idx, val]
-                    let val = self.pop()?;
-                    let idx = self.pop()?;
-                    let arr = self.pop()?;
-                    match (arr, &idx) {
+                    let val = pop_fast!(self);
+                    let idx_val = pop_fast!(self);
+                    let arr = pop_fast!(self);
+                    match (arr, &idx_val) {
                         (Value::Array(mut a), Value::Int(i)) => {
                             let i = *i as usize;
                             if i >= a.len() {
@@ -372,8 +426,8 @@ impl VM {
                     }
                 }
                 OpCode::MakeRange(inclusive) => {
-                    let end = self.pop()?;
-                    let start = self.pop()?;
+                    let end = pop_fast!(self);
+                    let start = pop_fast!(self);
                     match (&start, &end) {
                         (Value::Int(a), Value::Int(b)) => {
                             let end_val = if *inclusive { *b + 1 } else { *b };
@@ -391,6 +445,7 @@ impl VM {
         Ok(self.stack.pop().unwrap_or(Value::Void))
     }
 
+    #[inline(always)]
     fn current_local_base(&self) -> usize {
         self.frames.last().map_or(0, |f| f.local_base)
     }

@@ -401,6 +401,7 @@ fn format_expr(expr: &Expr) -> String {
         Expr::Resume(inner) => format!("resume({})", format_expr(inner)),
         Expr::DynCast(trait_name, expr) => format!("dyn {}({})", trait_name, format_expr(expr)),
         Expr::Yield(inner) => format!("yield {}", format_expr(inner)),
+        Expr::Template(_) => "<template>".to_string(),
     }
 }
 

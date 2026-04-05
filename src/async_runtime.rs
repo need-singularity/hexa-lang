@@ -591,9 +591,9 @@ mod tests {
         let sched = Scheduler::new();
         sched.start(2);
 
-        let body = vec![
+        let body: std::sync::Arc<Vec<crate::ast::Stmt>> = vec![
             crate::ast::Stmt::Return(Some(crate::ast::Expr::IntLit(99))),
-        ];
+        ].into();
         let future = sched.spawn_task(
             "test".into(),
             body,

@@ -221,16 +221,14 @@ impl DebugHook {
     fn snapshot_variables(&mut self, env: &crate::env::Env) {
         self.variable_snapshot.clear();
         // Walk scopes from innermost to outermost, collecting variables
-        for scope in env.scopes.iter().rev() {
-            for (name, val) in scope {
-                // Skip builtins (functions defined in the global scope)
-                if matches!(val, Value::BuiltinFn(_)) {
-                    continue;
-                }
-                let type_str = value_type_name(val);
-                let val_str = format!("{}", val);
-                self.variable_snapshot.push((name.clone(), val_str, type_str));
+        for (name, val) in env.vars_iter().rev() {
+            // Skip builtins (functions defined in the global scope)
+            if matches!(val, Value::BuiltinFn(_)) {
+                continue;
             }
+            let type_str = value_type_name(val);
+            let val_str = format!("{}", val);
+            self.variable_snapshot.push((name.clone(), val_str, type_str));
         }
     }
 }

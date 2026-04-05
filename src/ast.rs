@@ -36,6 +36,40 @@ pub enum Expr {
     // Trait objects
     DynCast(String, Box<Expr>),                  // dyn TraitName(expr) — wrap value as trait object
     Yield(Box<Expr>),                            // yield expr — generator yield
+    /// template { ... } — HTML template block
+    Template(Vec<TemplateNode>),
+}
+
+/// A node in a template tree — represents an HTML element, text, or control flow.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub enum TemplateNode {
+    /// HTML element: tag { attrs..., children... }
+    Element {
+        tag: String,
+        attrs: Vec<TemplateAttr>,
+        children: Vec<TemplateNode>,
+    },
+    /// Text content — expression that evaluates to a string
+    Text(Expr),
+    /// Control flow: for name in expr { children }
+    For(String, Expr, Vec<TemplateNode>),
+    /// Conditional: if expr { children } else { children }
+    If(Expr, Vec<TemplateNode>, Option<Vec<TemplateNode>>),
+    /// Match expression
+    Match(Expr, Vec<(Expr, Vec<TemplateNode>)>),
+    /// Verify assertion inside template
+    Verify(Expr),
+    /// Invariant assertion inside template
+    Invariant(Expr),
+}
+
+/// An attribute on a template element: key: expr
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct TemplateAttr {
+    pub key: String,
+    pub value: Expr,
 }
 
 #[allow(dead_code)]

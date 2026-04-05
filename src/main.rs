@@ -129,6 +129,9 @@ mod opt;
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 mod codegen;
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+mod std_web_template;
 
 use std::io::{self, Write, BufRead};
 use std::collections::HashMap;

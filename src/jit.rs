@@ -139,8 +139,9 @@ fn can_jit_stmt(stmt: &Stmt) -> bool {
         Stmt::EnumDecl(_) => true,
         Stmt::ImplBlock(ib) => ib.methods.iter().all(|m| m.body.iter().all(|s| can_jit_stmt(s))),
         Stmt::While(cond, body) => can_jit_expr(cond) && body.iter().all(|s| can_jit_stmt(s)),
+        Stmt::For(_, iter_expr, body) => can_jit_expr(iter_expr) && body.iter().all(|s| can_jit_stmt(s)),
         // These are not yet supported in JIT:
-        Stmt::For(..) | Stmt::Loop(..) | Stmt::TryCatch(..) | Stmt::Throw(..) |
+        Stmt::Loop(..) | Stmt::TryCatch(..) | Stmt::Throw(..) |
         Stmt::Spawn(..) | Stmt::SpawnNamed(..) | Stmt::Mod(..) | Stmt::Use(..) |
         Stmt::Proof(..) | Stmt::Assert(..) | Stmt::Intent(..) | Stmt::Verify(..) |
         Stmt::DropStmt(..) | Stmt::AsyncFnDecl(..) | Stmt::Select(..) |
@@ -178,13 +179,14 @@ fn can_jit_expr(expr: &Expr) -> bool {
                 })
         }
         Expr::Lambda(_, body) => can_jit_expr(body),
+        Expr::Range(start, end, _) => can_jit_expr(start) && can_jit_expr(end),
         // Not supported in JIT:
         Expr::FloatLit(_) | Expr::StringLit(_) | Expr::CharLit(_) |
-        Expr::Tuple(..) | Expr::Range(..) | Expr::MapLit(..) |
+        Expr::Tuple(..) | Expr::MapLit(..) |
         Expr::Own(..) | Expr::MoveExpr(..) | Expr::Borrow(..) |
         Expr::Await(..) | Expr::MacroInvoc(..) | Expr::Comptime(..) |
         Expr::HandleWith(..) | Expr::EffectCall(..) | Expr::Resume(..) |
-        Expr::DynCast(..) | Expr::Yield(..) => false,
+        Expr::DynCast(..) | Expr::Yield(..) | Expr::Template(..) => false,
     }
 }
 
@@ -222,6 +224,21 @@ impl JitCompiler {
             .map_err(|e| jit_err(format!("setting flag: {}", e)))?;
         flag_builder
             .set("is_pic", "false")
+            .map_err(|e| jit_err(format!("setting flag: {}", e)))?;
+        // Cranelift optimization: enable speed-optimized codegen (regalloc, isel).
+        flag_builder
+            .set("opt_level", "speed")
+            .map_err(|e| jit_err(format!("setting flag: {}", e)))?;
+        // Disable verification overhead in JIT (correctness validated at dev time).
+        flag_builder
+            .set("enable_verifier", "false")
+            .map_err(|e| jit_err(format!("setting flag: {}", e)))?;
+        // Disable Spectre mitigations for JIT performance.
+        flag_builder
+            .set("enable_heap_access_spectre_mitigation", "false")
+            .map_err(|e| jit_err(format!("setting flag: {}", e)))?;
+        flag_builder
+            .set("enable_table_access_spectre_mitigation", "false")
             .map_err(|e| jit_err(format!("setting flag: {}", e)))?;
 
         let isa_builder = cranelift_native::builder()
@@ -484,10 +501,23 @@ impl JitCompiler {
             }
 
             // Bind params to variables.
+            let mut param_vars = Vec::new();
             for (i, param) in decl.params.iter().enumerate() {
                 let val = builder.block_params(entry_block)[i];
                 let var = trans.declare_var(&param.name, &mut builder);
                 builder.def_var(var, val);
+                param_vars.push(var);
+            }
+
+            // Tail call optimization: detect tail-recursive calls and convert to loops.
+            let use_tco = has_tail_recursion(&decl.name, &decl.body);
+            if use_tco {
+                let tco_header = builder.create_block();
+                builder.ins().jump(tco_header, &[]);
+                builder.switch_to_block(tco_header);
+                trans.current_fn_name = Some(decl.name.clone());
+                trans.tco_header = Some(tco_header);
+                trans.tco_param_vars = param_vars;
             }
 
             // Compile body.
@@ -911,6 +941,36 @@ fn scan_lambdas_expr(
     }
 }
 
+/// Check if a function body contains tail-recursive calls to itself.
+fn has_tail_recursion(fn_name: &str, body: &[Stmt]) -> bool {
+    body.iter().any(|s| contains_tail_call(fn_name, s))
+}
+
+/// Check if a statement contains a tail call to the named function.
+fn contains_tail_call(fn_name: &str, stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Return(Some(expr)) => is_self_call(fn_name, expr),
+        Stmt::Expr(Expr::If(_, then_b, else_b)) => {
+            let then_has = then_b.iter().any(|s| contains_tail_call(fn_name, s));
+            let else_has = else_b
+                .as_ref()
+                .map_or(false, |b| b.iter().any(|s| contains_tail_call(fn_name, s)));
+            then_has || else_has
+        }
+        _ => false,
+    }
+}
+
+/// Check if an expression is a direct call to `fn_name`.
+fn is_self_call(fn_name: &str, expr: &Expr) -> bool {
+    if let Expr::Call(callee, _) = expr {
+        if let Expr::Ident(name) = callee.as_ref() {
+            return name == fn_name;
+        }
+    }
+    false
+}
+
 /// Translates HEXA AST nodes into Cranelift IR within a single function.
 struct FuncTranslator<'a> {
     module: &'a mut JITModule,
@@ -941,6 +1001,12 @@ struct FuncTranslator<'a> {
     /// When compiling a `let name = <aggregate>`, this holds `name` so the
     /// aggregate expression can use `alloc_for_var` instead of `call_alloc`.
     current_let_name: Option<String>,
+    /// Name of the function currently being compiled (for TCO detection).
+    current_fn_name: Option<String>,
+    /// TCO loop header block to jump back to for tail-recursive calls.
+    tco_header: Option<cranelift::prelude::Block>,
+    /// TCO parameter variables (in order) to update before jumping back.
+    tco_param_vars: Vec<Variable>,
 }
 
 impl<'a> FuncTranslator<'a> {
@@ -972,6 +1038,9 @@ impl<'a> FuncTranslator<'a> {
             escape_info: None,
             stack_slots: HashMap::new(),
             current_let_name: None,
+            current_fn_name: None,
+            tco_header: None,
+            tco_param_vars: Vec::new(),
         }
     }
 
@@ -1152,6 +1221,32 @@ impl<'a> FuncTranslator<'a> {
                 Ok(Some(val))
             }
             Stmt::Return(expr) => {
+                // TCO: if returning a self-recursive call, jump back to loop header.
+                if let Some(e) = expr {
+                    if let (Some(ref fn_name), Some(tco_hdr)) =
+                        (&self.current_fn_name, self.tco_header)
+                    {
+                        if let Expr::Call(callee, args) = e {
+                            if let Expr::Ident(cname) = callee.as_ref() {
+                                if cname == fn_name {
+                                    // Evaluate all new arg values before updating any vars.
+                                    let mut arg_vals = Vec::new();
+                                    for arg in args {
+                                        arg_vals.push(self.compile_expr(builder, arg)?);
+                                    }
+                                    // Update parameter variables with new argument values.
+                                    let vars = self.tco_param_vars.clone();
+                                    for (var, val) in vars.iter().zip(arg_vals.iter()) {
+                                        builder.def_var(*var, *val);
+                                    }
+                                    // Jump back to TCO header (loop).
+                                    builder.ins().jump(tco_hdr, &[]);
+                                    return Ok(None);
+                                }
+                            }
+                        }
+                    }
+                }
                 let val = if let Some(e) = expr {
                     self.compile_expr(builder, e)?
                 } else {
@@ -1187,6 +1282,58 @@ impl<'a> FuncTranslator<'a> {
                 builder.switch_to_block(exit_block);
                 builder.seal_block(exit_block);
                 Ok(None)
+            }
+            Stmt::For(var_name, iter_expr, body) => {
+                // Support range iteration: for i in start..end / start..=end
+                if let Expr::Range(start_expr, end_expr, inclusive) = iter_expr {
+                    let start_val = self.compile_expr(builder, start_expr)?;
+                    let end_val = self.compile_expr(builder, end_expr)?;
+
+                    let loop_var = self.declare_var(var_name, builder);
+                    builder.def_var(loop_var, start_val);
+
+                    let header_block = builder.create_block();
+                    let body_block = builder.create_block();
+                    let exit_block = builder.create_block();
+
+                    builder.ins().jump(header_block, &[]);
+                    builder.switch_to_block(header_block);
+
+                    let cur = builder.use_var(loop_var);
+                    let cmp = if *inclusive {
+                        builder
+                            .ins()
+                            .icmp(IntCC::SignedLessThanOrEqual, cur, end_val)
+                    } else {
+                        builder.ins().icmp(IntCC::SignedLessThan, cur, end_val)
+                    };
+                    builder
+                        .ins()
+                        .brif(cmp, body_block, &[], exit_block, &[]);
+
+                    builder.seal_block(body_block);
+                    builder.switch_to_block(body_block);
+
+                    for s in body {
+                        self.compile_stmt(builder, s)?;
+                    }
+
+                    if !self.is_block_terminated(builder) {
+                        let cur = builder.use_var(loop_var);
+                        let one = builder.ins().iconst(I64, 1);
+                        let next = builder.ins().iadd(cur, one);
+                        builder.def_var(loop_var, next);
+                        builder.ins().jump(header_block, &[]);
+                    }
+
+                    builder.seal_block(header_block);
+                    builder.switch_to_block(exit_block);
+                    builder.seal_block(exit_block);
+                    Ok(None)
+                } else {
+                    // Non-range for loops not yet supported in JIT.
+                    Ok(None)
+                }
             }
             Stmt::FnDecl(_) | Stmt::StructDecl(_) | Stmt::EnumDecl(_) | Stmt::ImplBlock(_) => {
                 // Already handled at top level.
@@ -2081,5 +2228,63 @@ match d {
 }
 "#;
         assert_eq!(jit_run(src), 2);
+    }
+
+    // ── TCO tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_jit_tco_tail_recursive_fib() {
+        let src = r#"
+fn fib_tail(n, a, b) {
+    if n <= 0 { return a }
+    return fib_tail(n - 1, b, a + b)
+}
+fib_tail(40, 0, 1)
+"#;
+        assert_eq!(jit_run(src), 102334155);
+    }
+
+    #[test]
+    fn test_jit_tco_factorial() {
+        let src = r#"
+fn fact(n, acc) {
+    if n <= 1 { return acc }
+    return fact(n - 1, n * acc)
+}
+fact(10, 1)
+"#;
+        assert_eq!(jit_run(src), 3628800);
+    }
+
+    // ── For loop tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_jit_for_range() {
+        let src = r#"
+fn sum_range(n) {
+    let total = 0
+    for i in 0..n {
+        total = total + i
+    }
+    return total
+}
+sum_range(10)
+"#;
+        assert_eq!(jit_run(src), 45);
+    }
+
+    #[test]
+    fn test_jit_for_range_inclusive() {
+        let src = r#"
+fn sum_incl(n) {
+    let total = 0
+    for i in 1..=n {
+        total = total + i
+    }
+    return total
+}
+sum_incl(10)
+"#;
+        assert_eq!(jit_run(src), 55);
     }
 }

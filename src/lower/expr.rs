@@ -218,7 +218,7 @@ pub fn lower_expr(ctx: &mut LowerCtx, builder: &mut IrBuilder, expr: &Expr) -> V
         Expr::Resume(e) => lower_expr(ctx, builder, e),
         Expr::DynCast(_, e) => lower_expr(ctx, builder, e),
         Expr::Yield(e) => lower_expr(ctx, builder, e),
-        Expr::Wildcard => builder.const_i64(0),
+        Expr::Wildcard | Expr::Template(_) => builder.const_i64(0),
     }
 }
 

@@ -146,6 +146,9 @@ pub mod opt;
 pub mod codegen;
 #[allow(dead_code)]
 pub mod alloc;
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+pub mod std_web_template;
 
 // WASM entry points
 #[cfg(target_arch = "wasm32")]

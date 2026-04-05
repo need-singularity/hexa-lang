@@ -780,7 +780,8 @@ impl OwnershipAnalyzer {
             Expr::IntLit(_) | Expr::FloatLit(_) | Expr::BoolLit(_)
             | Expr::StringLit(_) | Expr::CharLit(_) | Expr::Wildcard
             | Expr::EnumPath(_, _, _) | Expr::MacroInvoc(_) | Expr::Comptime(_)
-            | Expr::HandleWith(_, _) | Expr::EffectCall(_, _, _) | Expr::Resume(_) => {}
+            | Expr::HandleWith(_, _) | Expr::EffectCall(_, _, _) | Expr::Resume(_)
+            | Expr::Template(_) => {}
             Expr::DynCast(_, inner) | Expr::Yield(inner) => {
                 self.check_expr_use(inner, line, col);
             }
