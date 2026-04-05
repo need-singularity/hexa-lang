@@ -10,6 +10,9 @@
 - No semicolons -- newline-separated statements
 - `let` is mutable by default, `const` is immutable
 - Explicit `return` required (no implicit last-expression return)
+- `comptime const NAME = expr` -- compile-time constant (evaluated at compile time)
+- `fn f(x) -> int where x > 0 { }` -- precondition contract
+- `fn f(x) -> int ensures result > 0 { }` -- postcondition contract
 - Match arms use `->` not `=>`
 - String concat with `+`, no interpolation -- use `format("{}", val)`
 - Arrays: `[1, 2, 3]`, Maps: `#{"key": val}`
@@ -361,7 +364,8 @@ proof my_test {
 **Collections:** `len(x)` `keys(map)` `values(map)` `has_key(map,key)` `Set()`
 **File I/O:** `read_file(path)` `write_file(path,data)` `append_file(path,data)` `file_exists(path)` `delete_file(path)`
 **Concurrency:** `channel()` -> `[tx, rx]`, `spawn { }`, `tx.send(val)`, `rx.recv()`, `join(future)`
-**System:** `clock()` `now()` `timestamp()` `elapsed()` `sleep(ms)` `args()` `env_var(name)` `exit(code)` `type_of(x)`
+**System:** `clock()` `now()` `timestamp()` `elapsed()` `sleep(ms)` `args()` `env_var(name)` `exit(code)` `type_of(x)` `exec(cmd)` `exec_with_status(cmd)`
+**User Input:** `input(prompt?)` `readline(prompt?)`
 **JSON:** `json_parse(str)` `json_stringify(val)`
 **Encoding:** `base64_encode(str)` `base64_decode(str)` `hex_encode(str)` `hex_decode(str)`
 **HTTP:** `http_get(url)` `http_post(url, body)`

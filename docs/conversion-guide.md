@@ -29,6 +29,7 @@ let name: string = "hexa"   // with type annotation
 x = 100                     // reassignment is allowed (let is NOT const)
 
 const PI_APPROX = 3.14159   // compile-time constant, cannot be reassigned
+comptime const N = 6        // compile-time evaluated constant
 static counter = 0          // module-level mutable global
 ```
 
@@ -1182,7 +1183,9 @@ double![7]   // 14
 |--------------------------------|---------------------------------|-------------------------------|
 | `read_file(path)`              | `(string) -> string\|error`     | Read file contents            |
 | `write_file(path, content)`    | `(string, string) -> void`      | Write string to file          |
+| `append_file(path, content)`   | `(string, string) -> void`      | Append string to file         |
 | `file_exists(path)`            | `(string) -> bool`              | Check if file exists          |
+| `delete_file(path)`            | `(string) -> bool`              | Delete a file                 |
 
 ### OS/System
 
@@ -1193,6 +1196,15 @@ double![7]   // 14
 | `exit(code?)`          | `(int?) -> never`              | Exit process                        |
 | `clock()`              | `() -> float`                  | Current unix timestamp (seconds)    |
 | `sleep(ms)`            | `(int) -> void`                | Sleep for milliseconds              |
+| `exec(cmd)`            | `(string) -> string`           | Execute shell command, return stdout|
+| `exec_with_status(cmd)`| `(string) -> Map`              | Execute command, return #{stdout, stderr, status}|
+
+### User Input
+
+| Function               | Signature                       | Description                        |
+|------------------------|--------------------------------|-------------------------------------|
+| `input(prompt?)`       | `(string?) -> string`          | Read line from stdin                |
+| `readline(prompt?)`    | `(string?) -> string`          | Alias for input                     |
 
 ### Random
 
