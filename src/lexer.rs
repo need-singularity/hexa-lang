@@ -209,7 +209,7 @@ impl Lexer {
         // Dollar sign (used in macros): $ is its own token
         if ch == '$' {
             self.advance();
-            return Ok(Token::Ident("$".to_string()));
+            return Ok(Token::Ident("$".into()));
         }
 
         // Hash-brace: #{ for map literals
@@ -226,9 +226,9 @@ impl Lexer {
             self.advance();
             if self.peek().map_or(false, |c| c.is_alphabetic() || c == '_') {
                 let ident = self.read_ident();
-                return Ok(Token::Ident(format!("@{}", ident)));
+                return Ok(Token::Ident(format!("@{}", ident).into()));
             }
-            return Ok(Token::Ident("@".to_string()));
+            return Ok(Token::Ident("@".into()));
         }
 
         // Identifiers and keywords
@@ -237,7 +237,7 @@ impl Lexer {
             if let Some(kw) = keyword_from_str(&ident) {
                 return Ok(kw);
             }
-            return Ok(Token::Ident(ident));
+            return Ok(Token::Ident(ident.into()));
         }
 
         // Numbers
@@ -248,7 +248,7 @@ impl Lexer {
         // String literal
         if ch == '"' {
             let s = self.read_string()?;
-            return Ok(Token::StringLit(s));
+            return Ok(Token::StringLit(s.into()));
         }
 
         // Char literal
@@ -460,7 +460,7 @@ mod tests {
     fn test_lex_at_evolve_token() {
         let mut lexer = Lexer::new("@evolve fn");
         let tokens = lexer.tokenize_plain().unwrap();
-        assert_eq!(tokens[0], Token::Ident("@evolve".to_string()));
+        assert_eq!(tokens[0], Token::Ident("@evolve".into()));
         assert_eq!(tokens[1], Token::Fn);
     }
 
@@ -468,7 +468,7 @@ mod tests {
     fn test_lex_consciousness_as_ident() {
         let mut lexer = Lexer::new("consciousness \"test\"");
         let tokens = lexer.tokenize_plain().unwrap();
-        assert_eq!(tokens[0], Token::Ident("consciousness".to_string()));
-        assert_eq!(tokens[1], Token::StringLit("test".to_string()));
+        assert_eq!(tokens[0], Token::Ident("consciousness".into()));
+        assert_eq!(tokens[1], Token::StringLit("test".into()));
     }
 }

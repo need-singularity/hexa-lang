@@ -1246,7 +1246,16 @@ impl Interpreter {
                         cached.clone()
                     } else {
                         let f = self.env.get(fn_name).ok_or_else(|| {
-                            self.runtime_err(format!("undefined function: {}", fn_name))
+                            let known_names: Vec<&str> = self.env.known_names();
+                            let hint = crate::error::suggest_name(fn_name, &known_names)
+                                .map(|s| format!("did you mean '{}'?", s));
+                            HexaError {
+                                class: ErrorClass::Name,
+                                message: format!("undefined function: {}", fn_name),
+                                line: self.current_line,
+                                col: self.current_col,
+                                hint,
+                            }
                         })?;
                         // Cache function values only (not mutable bindings)
                         if matches!(f, Value::Fn(..) | Value::BuiltinFn(_)) {
@@ -1267,6 +1276,9 @@ impl Interpreter {
                                     params.len(), arg_vals.len()
                                 )));
                             }
+                            let is_pure = _name.starts_with("__pure__");
+                            let prev_pure = self.in_pure_fn;
+                            if is_pure { self.in_pure_fn = true; }
                             self.env.push_scope();
                             for (param, arg) in params.iter().zip(arg_vals) {
                                 self.env.define(param, arg);
@@ -1280,6 +1292,7 @@ impl Interpreter {
                                 }
                             }
                             self.env.pop_scope();
+                            self.in_pure_fn = prev_pure;
                             return Ok(result);
                         }
                     }
@@ -1753,6 +1766,13 @@ impl Interpreter {
             }
             (Value::Float(a), BinOp::Rem, Value::Float(b)) => Ok(Value::Float(a % b)),
             (Value::Float(a), BinOp::Pow, Value::Float(b)) => Ok(Value::Float(a.powf(*b))),
+
+            // Array concatenation
+            (Value::Array(a), BinOp::Add, Value::Array(b)) => {
+                let mut result = a.clone();
+                result.extend(b.iter().cloned());
+                Ok(Value::Array(result))
+            }
 
             // String concatenation
             (Value::Str(a), BinOp::Add, Value::Str(b)) => {
@@ -2867,6 +2887,45 @@ impl Interpreter {
                     _ => Err(self.type_err("to_float() cannot convert this type".into())),
                 }
             }
+            "try_float" => {
+                if args.is_empty() { return Err(self.type_err("try_float() requires 1 argument".into())); }
+                match &args[0] {
+                    Value::Float(f) => Ok(Value::Float(*f)),
+                    Value::Int(n) => Ok(Value::Float(*n as f64)),
+                    Value::Str(s) => match s.parse::<f64>() {
+                        Ok(f) => Ok(Value::Float(f)),
+                        Err(_) => Ok(Value::EnumVariant("Option".into(), "None".into(), None)),
+                    },
+                    _ => Ok(Value::EnumVariant("Option".into(), "None".into(), None)),
+                }
+            }
+            "is_numeric" => {
+                if args.is_empty() { return Err(self.type_err("is_numeric() requires 1 argument".into())); }
+                match &args[0] {
+                    Value::Int(_) | Value::Float(_) => Ok(Value::Bool(true)),
+                    Value::Str(s) => Ok(Value::Bool(s.parse::<f64>().is_ok())),
+                    _ => Ok(Value::Bool(false)),
+                }
+            }
+            // ── String builtins ────────────────────────────────────
+            "join" => {
+                if args.is_empty() { return Err(self.type_err("join() requires at least 1 argument (array)".into())); }
+                match &args[0] {
+                    Value::Array(arr) => {
+                        let sep = if args.len() >= 2 {
+                            match &args[1] {
+                                Value::Str(s) => s.clone(),
+                                _ => return Err(self.type_err("join() separator must be a string".into())),
+                            }
+                        } else {
+                            String::new()
+                        };
+                        let parts: Vec<String> = arr.iter().map(|v| format!("{}", v)).collect();
+                        Ok(Value::Str(parts.join(&sep)))
+                    }
+                    _ => Err(self.type_err("join() first argument must be an array".into())),
+                }
+            }
             // ── Math builtins ──────────────────────────────────────
             "abs" => {
                 if args.is_empty() { return Err(self.type_err("abs() requires 1 argument".into())); }
@@ -3680,6 +3739,14 @@ impl Interpreter {
                 match std::io::stdin().read_line(&mut line) {
                     Ok(_) => Ok(Value::Str(line.trim_end_matches('\n').trim_end_matches('\r').to_string())),
                     Err(e) => Ok(Value::Error(format!("input error: {}", e))),
+                }
+            }
+            "read_stdin" | "input_all" => {
+                use std::io::Read;
+                let mut buf = String::new();
+                match std::io::stdin().read_to_string(&mut buf) {
+                    Ok(_) => Ok(Value::Str(buf)),
+                    Err(e) => Ok(Value::Error(format!("read_stdin error: {}", e))),
                 }
             }
             _ => Err(HexaError {

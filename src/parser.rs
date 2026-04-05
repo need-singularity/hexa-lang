@@ -104,8 +104,24 @@ impl Parser {
     fn expect_ident(&mut self) -> Result<String, HexaError> {
         let span = self.current_span();
         match self.advance() {
-            Token::Ident(name) => Ok(name),
+            Token::Ident(name) => Ok(name.to_string()),
             other => Err(self.error_at(span, format!("expected identifier, got {:?}", other))),
+        }
+    }
+
+    /// Parse a return type: either an identifier or `[type]` for array types.
+    fn parse_ret_type(&mut self) -> Result<String, HexaError> {
+        if matches!(self.peek(), Token::LBracket) {
+            self.advance(); // consume [
+            let inner = self.expect_ident()?;
+            self.expect(&Token::RBracket)?;
+            Ok(format!("[{}]", inner))
+        } else if matches!(self.peek(), Token::LParen) {
+            self.advance(); // consume (
+            self.expect(&Token::RParen)?;
+            return Ok("()".to_string());
+        } else {
+            self.expect_ident()
         }
     }
 
@@ -197,7 +213,7 @@ impl Parser {
                 let params = self.parse_params()?;
                 self.expect(&Token::RParen)?;
                 let ret_type = if matches!(self.peek(), Token::Arrow) {
-                    self.advance(); Some(self.expect_ident()?)
+                    self.advance(); Some(self.parse_ret_type()?)
                 } else { None };
                 let where_clauses = if matches!(self.peek(), Token::Where) {
                     self.parse_where_clauses()?
@@ -535,7 +551,7 @@ impl Parser {
             self.expect(&Token::RParen)?;
             let ret_type = if matches!(self.peek(), Token::Arrow) {
                 self.advance();
-                Some(self.expect_ident()?)
+                Some(self.parse_ret_type()?)
             } else {
                 None
             };
@@ -607,7 +623,7 @@ impl Parser {
         self.expect(&Token::RParen)?;
         let ret_type = if matches!(self.peek(), Token::Arrow) {
             self.advance();
-            Some(self.expect_ident()?)
+            Some(self.parse_ret_type()?)
         } else {
             None
         };
@@ -732,7 +748,7 @@ impl Parser {
             self.expect(&Token::RParen)?;
             let ret_type = if matches!(self.peek(), Token::Arrow) {
                 self.advance();
-                Some(self.expect_ident()?)
+                Some(self.parse_ret_type()?)
             } else {
                 None
             };
@@ -792,7 +808,7 @@ impl Parser {
         self.expect(&Token::RParen)?;
         let ret_type = if matches!(self.peek(), Token::Arrow) {
             self.advance();
-            Some(self.expect_ident()?)
+            Some(self.parse_ret_type()?)
         } else {
             None
         };
@@ -1113,7 +1129,7 @@ impl Parser {
         self.expect(&Token::RParen)?;
         let ret_type = if matches!(self.peek(), Token::Arrow) {
             self.advance();
-            Some(self.expect_ident()?)
+            Some(self.parse_ret_type()?)
         } else {
             None
         };
@@ -1301,7 +1317,7 @@ impl Parser {
             self.expect(&Token::RParen)?;
             let m_ret = if matches!(self.peek(), Token::Arrow) {
                 self.advance();
-                Some(self.expect_ident()?)
+                Some(self.parse_ret_type()?)
             } else {
                 None
             };
@@ -1344,7 +1360,7 @@ impl Parser {
             self.expect(&Token::RParen)?;
             let m_ret = if matches!(self.peek(), Token::Arrow) {
                 self.advance();
-                Some(self.expect_ident()?)
+                Some(self.parse_ret_type()?)
             } else {
                 None
             };
@@ -1875,14 +1891,8 @@ impl Parser {
             self.expect(&Token::RParen)?;
             let ret_type = if matches!(self.peek(), Token::Arrow) {
                 self.advance();
-                // Accept both identifier and () for void return
-                if matches!(self.peek(), Token::LParen) {
-                    self.advance();
-                    self.expect(&Token::RParen)?;
-                    None // () means void
-                } else {
-                    Some(self.expect_ident()?)
-                }
+                let t = self.parse_ret_type()?;
+                if t == "()" { None } else { Some(t) }
             } else {
                 None
             };
@@ -1908,7 +1918,7 @@ impl Parser {
         self.expect(&Token::RParen)?;
         let ret_type = if matches!(self.peek(), Token::Arrow) {
             self.advance();
-            Some(self.expect_ident()?)
+            Some(self.parse_ret_type()?)
         } else {
             None
         };
