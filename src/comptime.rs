@@ -12,7 +12,7 @@ use crate::interpreter::Interpreter;
 
 /// Names of built-in functions that are forbidden inside comptime contexts.
 const FORBIDDEN_BUILTINS: &[&str] = &[
-    "print", "println", "read_file", "write_file", "input",
+    "print", "println", "read_file", "write_file", "delete_file", "append_file", "input",
     "sleep", "channel", "spawn", "exit",
     // std::fs
     "fs_read", "fs_write", "fs_append", "fs_exists", "fs_remove",

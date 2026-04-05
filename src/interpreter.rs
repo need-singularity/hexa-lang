@@ -2719,6 +2719,50 @@ impl Interpreter {
                     }
                 }
             }
+            "delete_file" => {
+                #[cfg(target_arch = "wasm32")]
+                { return Err(self.runtime_err("delete_file is not supported in WASM mode".into())); }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    if args.is_empty() { return Err(self.type_err("delete_file() requires 1 argument".into())); }
+                    match &args[0] {
+                        Value::Str(path) => {
+                            match std::fs::remove_file(path) {
+                                Ok(_) => Ok(Value::Bool(true)),
+                                Err(e) => Ok(Value::Error(format!("delete_file error: {}", e))),
+                            }
+                        }
+                        _ => Err(self.type_err("delete_file() requires string path".into())),
+                    }
+                }
+            }
+            "append_file" => {
+                #[cfg(target_arch = "wasm32")]
+                { return Err(self.runtime_err("append_file is not supported in WASM mode".into())); }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    if args.len() < 2 { return Err(self.type_err("append_file() requires 2 arguments".into())); }
+                    match (&args[0], &args[1]) {
+                        (Value::Str(path), Value::Str(content)) => {
+                            use std::io::Write;
+                            let file = std::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(path);
+                            match file {
+                                Ok(mut f) => {
+                                    match f.write_all(content.as_bytes()) {
+                                        Ok(_) => Ok(Value::Void),
+                                        Err(e) => Ok(Value::Error(format!("append_file error: {}", e))),
+                                    }
+                                }
+                                Err(e) => Ok(Value::Error(format!("append_file error: {}", e))),
+                            }
+                        }
+                        _ => Err(self.type_err("append_file() requires string arguments".into())),
+                    }
+                }
+            }
             "keys" => {
                 if args.is_empty() { return Err(self.type_err("keys() requires 1 argument".into())); }
                 match &args[0] {

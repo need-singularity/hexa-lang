@@ -287,7 +287,7 @@ const KEYWORDS: &[&str] = &[
 const BUILTINS: &[&str] = &[
     "print", "println", "len", "type_of",
     "sigma", "phi", "tau", "gcd", "sopfr",
-    "read_file", "write_file", "file_exists",
+    "read_file", "write_file", "file_exists", "delete_file", "append_file",
     "keys", "values", "has_key",
     "to_string", "to_int", "to_float",
     "abs", "min", "max", "floor", "ceil", "round", "sqrt", "pow",
@@ -377,6 +377,8 @@ fn builtin_doc(name: &str) -> Option<&'static str> {
         "read_file" => "fn read_file(path: string) -> string — Read file contents",
         "write_file" => "fn write_file(path: string, content: string) — Write file",
         "file_exists" => "fn file_exists(path: string) -> bool — Check if file exists",
+        "delete_file" => "fn delete_file(path: string) -> bool — Delete a file",
+        "append_file" => "fn append_file(path: string, content: string) — Append to file",
         "keys" => "fn keys(map: Map) -> [string] — Get map keys",
         "values" => "fn values(map: Map) -> [any] — Get map values",
         "has_key" => "fn has_key(map: Map, key: string) -> bool — Check key existence",

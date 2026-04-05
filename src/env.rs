@@ -170,6 +170,8 @@ impl Env {
         env.define("read_file", Value::BuiltinFn("read_file".into()));
         env.define("write_file", Value::BuiltinFn("write_file".into()));
         env.define("file_exists", Value::BuiltinFn("file_exists".into()));
+        env.define("delete_file", Value::BuiltinFn("delete_file".into()));
+        env.define("append_file", Value::BuiltinFn("append_file".into()));
         env.define("keys", Value::BuiltinFn("keys".into()));
         env.define("values", Value::BuiltinFn("values".into()));
         env.define("has_key", Value::BuiltinFn("has_key".into()));

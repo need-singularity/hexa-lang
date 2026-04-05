@@ -137,7 +137,7 @@ fn try_fold(op: OpCode, operands: &[Operand]) -> Option<Operand> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{IrFunction, FuncId, BasicBlock, BlockId, Instruction};
+    use crate::ir::{IrFunction, FuncId, BasicBlock, BlockId, Instruction, IrType};
 
     // -- Unit tests for try_fold --
 
