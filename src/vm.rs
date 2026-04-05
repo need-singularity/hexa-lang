@@ -32,6 +32,10 @@ pub struct VM {
     string_pool: Vec<String>,
     /// Compiled functions registry.
     functions: HashMap<String, CompiledFunction>,
+    /// Indexed function table for O(1) lookup (built from functions HashMap).
+    fn_table: Vec<CompiledFunction>,
+    /// Mapping from string_pool index to fn_table index (u32::MAX = not a function).
+    fn_index: Vec<u32>,
     /// Global variables (for builtins like PI, E, etc.).
     globals: HashMap<String, Value>,
 }
@@ -48,6 +52,8 @@ impl VM {
             constants: Vec::new(),
             string_pool: Vec::new(),
             functions: HashMap::new(),
+            fn_table: Vec::new(),
+            fn_index: Vec::new(),
             globals,
         }
     }
@@ -57,6 +63,17 @@ impl VM {
         self.constants = chunk.constants.clone();
         self.string_pool = chunk.string_pool.clone();
         self.functions = chunk.functions.clone();
+
+        // Build indexed function table for O(1) call dispatch
+        self.fn_table = Vec::new();
+        self.fn_index = vec![u32::MAX; self.string_pool.len()];
+        for (i, name) in self.string_pool.iter().enumerate() {
+            if let Some(func) = self.functions.get(name) {
+                let idx = self.fn_table.len() as u32;
+                self.fn_table.push(func.clone());
+                self.fn_index[i] = idx;
+            }
+        }
 
         // Pre-allocate locals for top-level (avoid resizing during execution)
         self.locals.resize(chunk.local_count.max(256), Value::Void);
@@ -71,6 +88,17 @@ impl VM {
         self.constants = chunk.constants.clone();
         self.string_pool = chunk.string_pool.clone();
         self.functions = chunk.functions.clone();
+
+        // Build indexed function table
+        self.fn_table = Vec::new();
+        self.fn_index = vec![u32::MAX; self.string_pool.len()];
+        for (i, name) in self.string_pool.iter().enumerate() {
+            if let Some(func) = self.functions.get(name) {
+                let idx = self.fn_table.len() as u32;
+                self.fn_table.push(func.clone());
+                self.fn_index[i] = idx;
+            }
+        }
 
         // Apply dead code elimination
         let mut optimized_code = chunk.code.clone();
@@ -340,10 +368,52 @@ impl VM {
                     }
                 }
                 OpCode::CallFn(idx, argc) => {
-                    // Avoid cloning the name string -- borrow for lookup, clone only if needed
-                    let name = self.string_pool[*idx as usize].clone();
-                    let result = self.call_function(&name, *argc as usize)?;
-                    self.stack.push(result);
+                    let str_idx = *idx as usize;
+                    // Fast path: use pre-built fn_index for O(1) lookup
+                    let fn_idx = if str_idx < self.fn_index.len() {
+                        self.fn_index[str_idx]
+                    } else {
+                        u32::MAX
+                    };
+                    if fn_idx != u32::MAX {
+                        let func = &self.fn_table[fn_idx as usize];
+                        let argc = *argc as usize;
+                        if argc != func.arity {
+                            return Err(runtime_err(format!(
+                                "function expects {} arguments, got {}", func.arity, argc
+                            )));
+                        }
+                        // Clone the Arc<Vec<OpCode>> (O(1)) to release borrow
+                        let func_code = func.code.clone();
+                        let local_count = func.local_count;
+                        let local_base = self.locals.len();
+                        let needed = local_base + local_count;
+                        if needed > self.locals.len() {
+                            self.locals.resize(needed, Value::Void);
+                        }
+                        let stack_start = self.stack.len().saturating_sub(argc);
+                        for i in 0..argc {
+                            self.locals[local_base + i] = std::mem::replace(
+                                &mut self.stack[stack_start + i], Value::Void
+                            );
+                        }
+                        self.stack.truncate(stack_start);
+                        self.frames.push(CallFrame {
+                            func_name: String::new(), // skip alloc on hot path
+                            return_ip: 0,
+                            local_base,
+                            is_top_level: false,
+                        });
+                        let result = self.run_code(&func_code)?;
+                        self.frames.pop();
+                        self.locals.truncate(local_base);
+                        self.stack.push(result);
+                    } else {
+                        // Fallback: name-based lookup
+                        let name = self.string_pool[str_idx].clone();
+                        let result = self.call_function(&name, *argc as usize)?;
+                        self.stack.push(result);
+                    }
                 }
                 OpCode::Return => {
                     let val = self.stack.pop().unwrap_or(Value::Void);
