@@ -71,7 +71,7 @@ pub enum Token {
 
     // === 53 Keywords (σ·τ + sopfr = 48 + 5) ===
     // Group 1: Control Flow (n=6)
-    If, Else, Match, For, While, Loop,
+    If, Else, Match, For, While, Loop, Break, Continue,
     // Group 2: Type Decl (sopfr=5)
     Type, Struct, Enum, Trait, Impl, Dyn,
     // Group 3: Functions (sopfr=5)
@@ -128,6 +128,8 @@ pub fn keyword_from_str(s: &str) -> Option<Token> {
         "for" => Some(Token::For),
         "while" => Some(Token::While),
         "loop" => Some(Token::Loop),
+        "break" => Some(Token::Break),
+        "continue" => Some(Token::Continue),
         // Group 2: Type Decl (sopfr=5)
         "type" => Some(Token::Type),
         "struct" => Some(Token::Struct),

@@ -498,7 +498,8 @@ impl Compiler {
             | Stmt::Generate(_) | Stmt::Optimize(_)
             | Stmt::ComptimeFn(_) | Stmt::EffectDecl(_)
             | Stmt::Scope(_) | Stmt::ProofBlock(..)
-            | Stmt::AtomicLet(..) | Stmt::Panic(..) | Stmt::Theorem(..) => Ok(()),
+            | Stmt::AtomicLet(..) | Stmt::Panic(..) | Stmt::Theorem(..)
+            | Stmt::Break | Stmt::Continue => Ok(()),
         }
     }
 

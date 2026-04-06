@@ -400,7 +400,7 @@ impl OwnershipAnalyzer {
             | Stmt::Static(..) | Stmt::MacroDef(_) | Stmt::DeriveDecl(..)
             | Stmt::ComptimeFn(_) | Stmt::EffectDecl(_) | Stmt::ConsciousnessBlock(_, _) | Stmt::EvolveFn(_)
             | Stmt::Scope(_) | Stmt::ProofBlock(..)
-            | Stmt::TypeAlias(..) | Stmt::AtomicLet(..) | Stmt::Panic(..) | Stmt::Theorem(..) => {}
+            | Stmt::TypeAlias(..) | Stmt::AtomicLet(..) | Stmt::Panic(..) | Stmt::Theorem(..) | Stmt::Break | Stmt::Continue => {}
         }
     }
 
