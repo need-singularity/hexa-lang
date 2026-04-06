@@ -212,7 +212,7 @@ fn builtin_fs_metadata(interp: &mut Interpreter, args: Vec<Value>) -> Result<Val
         }
     }
 
-    Ok(Value::Map(map))
+    Ok(Value::Map(Box::new(map)))
 }
 
 // ── fs_glob(pattern: string) -> array ──
@@ -360,7 +360,7 @@ fn builtin_fs_watch(interp: &mut Interpreter, args: Vec<Value>) -> Result<Value,
     };
     let callback = args[1].clone();
     match &callback {
-        Value::Fn(..) | Value::Lambda(..) | Value::BuiltinFn(_) => {}
+        Value::Fn(_) | Value::Lambda(_) | Value::BuiltinFn(_) => {}
         _ => return Err(type_err(interp, "fs_watch() second argument must be a function".into())),
     }
 
@@ -395,7 +395,7 @@ fn builtin_fs_watch(interp: &mut Interpreter, args: Vec<Value>) -> Result<Value,
             event_map.insert("path".into(), Value::Str(event_path));
             event_map.insert("kind".into(), Value::Str(kind.to_string()));
 
-            let result = interp.call_function(callback.clone(), vec![Value::Map(event_map)])?;
+            let result = interp.call_function(callback.clone(), vec![Value::Map(Box::new(event_map))])?;
             if let Value::Str(s) = &result {
                 if s == "__stop__" {
                     return Ok(Value::Void);

@@ -248,13 +248,13 @@ fn value_type_name(val: &Value) -> String {
             format!("[{}; {}]", elem_type, a.len())
         }
         Value::Tuple(t) => format!("({})", t.iter().map(|v| value_type_name(v)).collect::<Vec<_>>().join(", ")),
-        Value::Fn(name, ..) => format!("fn {}", name),
+        Value::Fn(inner) => format!("fn {}", inner.0),
         Value::BuiltinFn(name) => format!("builtin {}", name),
         Value::Struct(name, _) => name.clone(),
-        Value::Lambda(..) => "lambda".into(),
+        Value::Lambda(_) => "lambda".into(),
         Value::Map(_) => "map".into(),
         Value::Error(_) => "error".into(),
-        Value::EnumVariant(name, variant, _) => format!("{}::{}", name, variant),
+        Value::EnumVariant(ev) => format!("{}::{}", ev.0, ev.1),
         Value::Intent(_) => "intent".into(),
         #[cfg(not(target_arch = "wasm32"))]
         Value::Sender(_) => "sender".into(),
@@ -268,8 +268,8 @@ fn value_type_name(val: &Value) -> String {
         Value::TcpListener(_) => "tcp_listener".into(),
         #[cfg(not(target_arch = "wasm32"))]
         Value::TcpStream(_) => "tcp_stream".into(),
-        Value::EffectRequest(..) => "effect_request".into(),
-        Value::TraitObject { trait_name, .. } => format!("dyn {}", trait_name),
+        Value::EffectRequest(_) => "effect_request".into(),
+        Value::TraitObject(to) => format!("dyn {}", to.trait_name),
         Value::Atomic(_) => "atomic".into(),
     }
 }

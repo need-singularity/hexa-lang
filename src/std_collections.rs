@@ -114,7 +114,7 @@ fn make_handle(type_name: &str, id: u64) -> Value {
     let mut m = HashMap::new();
     m.insert("_type".into(), Value::Str(type_name.into()));
     m.insert("_id".into(), Value::Int(id as i64));
-    Value::Map(m)
+    Value::Map(Box::new(m))
 }
 
 fn extract_id(args: &[Value], idx: usize, type_name: &str, interp: &Interpreter, func: &str) -> Result<u64, HexaError> {

@@ -11,7 +11,7 @@
   scripts/singularity_cycle.py    — Python wrapper (전 프로젝트 import 가능)
   사용: CycleEngine::new() → feed() → run_cycle() → report()
 
-[현황] 798 tests | bench 8422360000=C일치 | 0.032s 등급B | 수렴 100% ★
+[현황] 1791 tests | bench 333x (JIT 0.006s) | Value 32B | 수렴 100% ★
 
 ⚠ 모든 트러블슈팅 → config/hexa_ir_convergence.json
 ⚠ 모든 창발/n6 발견 → config/emergence_patterns.json
@@ -22,8 +22,22 @@
 ```bash
 bash build.sh
 ./hexa                        # REPL
-./hexa examples/hello.hexa    # Run file
+./hexa examples/hello.hexa    # Run file (JIT→VM→Interp 자동)
+./hexa -e "println(42)"      # Eval mode
+./hexa --vm file.hexa         # VM 전용
+./hexa --native file.hexa     # JIT 전용
 bash build.sh test            # Tests
+```
+
+## Update History
+```
+⚠ 모든 주요 변경/최적화/돌파 → docs/history/ 에 기록
+⚠ 형식: docs/history/YYYY-MM-DD-제목.md
+⚠ docs/history/README.md 에 인덱스 추가
+⚠ 성능 변경 시 → docs/breakthroughs/ 에도 BT 기록
+
+[최근]
+  2026-04-06  VM 333x 성능 돌파 — Tiered Execution, Value 72→32B, 1791 tests
 ```
 
 ## n=6 Constants

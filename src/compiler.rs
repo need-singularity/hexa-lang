@@ -58,6 +58,7 @@ pub enum OpCode {
 
     // Bool conversion for logical ops
     Truthy,             // convert TOS to bool
+
 }
 
 /// Compile-time assertion: OpCode must be <= 16 bytes for L1d cache density.
@@ -814,7 +815,6 @@ fn is_builtin(name: &str) -> bool {
     )
 }
 
-/// Dead code elimination: remove unreachable opcodes after unconditional Jump/Return.
 pub fn eliminate_dead_code(code: &mut Vec<OpCode>) {
     // Build set of jump targets (these are reachable even after Jump/Return)
     let mut jump_targets: std::collections::HashSet<usize> = std::collections::HashSet::new();

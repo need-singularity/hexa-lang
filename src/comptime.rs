@@ -49,7 +49,7 @@ pub fn eval_comptime(
     for (name, (params, body)) in comptime_fns {
         interp.env.define(
             name,
-            Value::Fn(name.clone(), params.clone(), Arc::new(body.clone())),
+            Value::Fn(Box::new((name.clone(), params.clone(), Arc::new(body.clone())))),
         );
     }
 

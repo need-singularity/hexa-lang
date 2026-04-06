@@ -381,6 +381,13 @@ fn main() {
                 }
                 cmd_verify_law22(file, sw_phi, hw_phi);
             }
+            "-e" | "--eval" => {
+                if args.len() < 3 {
+                    eprintln!("Usage: hexa -e <code>");
+                    std::process::exit(1);
+                }
+                run_source_with_dir(&args[2], "");
+            }
             _ => run_file(&args[1]),
         }
     } else {
@@ -590,13 +597,39 @@ fn run_source_with_dir(source: &str, file_path: &str) {
             std::process::exit(1);
         }
     };
-    // Type checking pass (runs before execution)
+    // Tiered execution: JIT → VM → Interpreter
+    // JIT and VM skip type/ownership checks (they have own error handling).
+    // Only the interpreter fallback runs full analysis.
+
+    // Tier 1: JIT (native code — fastest)
+    #[cfg(not(target_arch = "wasm32"))]
+    if jit::can_jit(&result.stmts) {
+        if let Ok(mut jit_compiler) = jit::JitCompiler::new() {
+            match jit_compiler.compile_and_run(&result.stmts) {
+                Ok(r) => { if r != 0 { println!("{}", r); } return; }
+                Err(_) => {} // fall through
+            }
+        }
+    }
+
+    // Tier 2: VM (bytecode — reuse already-parsed stmts)
+    {
+        let mut comp = compiler::Compiler::new();
+        if let Ok(chunk) = comp.compile(&result.stmts) {
+            let mut vm = vm::VM::new();
+            match vm.execute(&chunk) {
+                Ok(_) => return,
+                Err(_) => {} // fall through
+            }
+        }
+    }
+
+    // Tier 3: Interpreter (most compatible — run full analysis first)
     let mut checker = type_checker::TypeChecker::new();
     if let Err(e) = checker.check(&result.stmts, &result.spans) {
         eprint_diagnostic(&e, &source_lines, file_name);
         std::process::exit(1);
     }
-    // Ownership analysis pass (compile-time, before interpretation)
     let skip_ownership = std::env::args().any(|a| a == "--no-ownership-check");
     if !skip_ownership {
         let ownership_errors = ownership::analyze_ownership(&result.stmts, &result.spans);
@@ -608,6 +641,8 @@ fn run_source_with_dir(source: &str, file_path: &str) {
             std::process::exit(1);
         }
     }
+
+    // Fallback: tree-walking interpreter (most compatible)
     let mut interp = interpreter::Interpreter::new();
     interp.source_lines = source_lines.clone();
     interp.file_name = file_name.to_string();

@@ -5,27 +5,30 @@ use crate::compiler::{OpCode, Chunk, CompiledFunction};
 use crate::env::Value;
 use crate::error::{HexaError, ErrorClass};
 
-/// A call frame on the VM call stack.
+/// A call frame on the VM call stack (flat dispatch — no recursive run_code).
 #[derive(Debug)]
 struct CallFrame {
-    /// Function name (for error messages).
-    func_name: String,
     /// Return address: instruction pointer in the caller's code.
     return_ip: usize,
+    /// Index into code_segments for the caller's code.
+    return_code_idx: usize,
     /// Base index in the local slots for this frame.
     local_base: usize,
-    /// Whether this is a top-level frame (uses the chunk's code).
-    is_top_level: bool,
 }
 
 /// Stack-based bytecode virtual machine.
+/// Uses flat dispatch: function calls push/pop explicit frames instead of
+/// recursing into run_code(), eliminating Rust stack frame overhead per call.
 pub struct VM {
     /// Value stack.
     stack: Vec<Value>,
     /// Local variable slots (flat array, frames index into it).
     locals: Vec<Value>,
-    /// Call stack.
+    /// Call stack (flat — no recursion).
     frames: Vec<CallFrame>,
+    /// Code segments: index 0 = top-level code, 1+ = function bodies.
+    /// Avoids Arc::clone per call by storing all code centrally.
+    code_segments: Vec<Vec<OpCode>>,
     /// Constant pool (shared from chunk).
     constants: Vec<Value>,
     /// Interned string pool (shared from chunk) for GetGlobal/SetGlobal/CallFn/CallBuiltin name lookup.
@@ -36,8 +39,14 @@ pub struct VM {
     fn_table: Vec<CompiledFunction>,
     /// Mapping from string_pool index to fn_table index (u32::MAX = not a function).
     fn_index: Vec<u32>,
+    /// Mapping from fn_table index to code_segments index.
+    fn_code_idx: Vec<usize>,
     /// Global variables (for builtins like PI, E, etc.).
     globals: HashMap<String, Value>,
+    /// Flat global values indexed by string_pool index (O(1) dispatch).
+    global_values: Vec<Value>,
+    /// Tracks which global slots are defined.
+    global_set: Vec<bool>,
 }
 
 impl VM {
@@ -48,18 +57,22 @@ impl VM {
         Self {
             stack: Vec::with_capacity(256),
             locals: Vec::new(),
-            frames: Vec::new(),
+            frames: Vec::with_capacity(64),
+            code_segments: Vec::new(),
             constants: Vec::new(),
             string_pool: Vec::new(),
             functions: HashMap::new(),
             fn_table: Vec::new(),
             fn_index: Vec::new(),
+            fn_code_idx: Vec::new(),
             globals,
+            global_values: Vec::new(),
+            global_set: Vec::new(),
         }
     }
 
-    /// Execute a compiled chunk. Returns the last value on the stack (or Void).
-    pub fn execute(&mut self, chunk: &Chunk) -> Result<Value, HexaError> {
+    /// Setup function tables and code segments from a compiled chunk.
+    fn setup_from_chunk(&mut self, chunk: &Chunk) {
         self.constants = chunk.constants.clone();
         self.string_pool = chunk.string_pool.clone();
         self.functions = chunk.functions.clone();
@@ -67,58 +80,74 @@ impl VM {
         // Build indexed function table for O(1) call dispatch
         self.fn_table = Vec::new();
         self.fn_index = vec![u32::MAX; self.string_pool.len()];
+        // code_segments[0] = top-level code (placeholder, filled by caller)
+        self.code_segments = vec![Vec::new()];
+        self.fn_code_idx = Vec::new();
+
         for (i, name) in self.string_pool.iter().enumerate() {
             if let Some(func) = self.functions.get(name) {
-                let idx = self.fn_table.len() as u32;
+                let fn_idx = self.fn_table.len();
                 self.fn_table.push(func.clone());
-                self.fn_index[i] = idx;
+                self.fn_index[i] = fn_idx as u32;
+                // Store function code as a new segment (with Return sentinel)
+                let code_idx = self.code_segments.len();
+                let mut fn_code = (*func.code).clone();
+                Self::ensure_return_sentinel(&mut fn_code);
+                self.code_segments.push(fn_code);
+                self.fn_code_idx.push(code_idx);
             }
         }
 
-        // Pre-allocate locals for top-level (avoid resizing during execution)
-        self.locals.resize(chunk.local_count.max(256), Value::Void);
-        // Pre-allocate stack to avoid resizing
-        self.stack.reserve(256);
+        // Build flat global index for O(1) GetGlobal/SetGlobal dispatch
+        self.global_values = vec![Value::Void; self.string_pool.len()];
+        self.global_set = vec![false; self.string_pool.len()];
+        for (i, name) in self.string_pool.iter().enumerate() {
+            if let Some(val) = self.globals.get(name) {
+                self.global_values[i] = val.clone();
+                self.global_set[i] = true;
+            }
+        }
 
-        self.run_code(&chunk.code)
+        // Pre-allocate locals and stack
+        self.locals.resize(chunk.local_count.max(256), Value::Void);
+        self.stack.reserve(256);
+    }
+
+    /// Ensure a code segment ends with Return (sentinel for branchless dispatch).
+    fn ensure_return_sentinel(code: &mut Vec<OpCode>) {
+        if !matches!(code.last(), Some(OpCode::Return)) {
+            code.push(OpCode::Return);
+        }
+    }
+
+    /// Execute a compiled chunk. Returns the last value on the stack (or Void).
+    pub fn execute(&mut self, chunk: &Chunk) -> Result<Value, HexaError> {
+        self.setup_from_chunk(chunk);
+        let mut code = chunk.code.clone();
+        Self::ensure_return_sentinel(&mut code);
+        self.code_segments[0] = code;
+        self.run_flat(0)
     }
 
     /// Execute a compiled chunk with dead code elimination applied.
     pub fn execute_optimized(&mut self, chunk: &Chunk) -> Result<Value, HexaError> {
-        self.constants = chunk.constants.clone();
-        self.string_pool = chunk.string_pool.clone();
-        self.functions = chunk.functions.clone();
-
-        // Build indexed function table
-        self.fn_table = Vec::new();
-        self.fn_index = vec![u32::MAX; self.string_pool.len()];
-        for (i, name) in self.string_pool.iter().enumerate() {
-            if let Some(func) = self.functions.get(name) {
-                let idx = self.fn_table.len() as u32;
-                self.fn_table.push(func.clone());
-                self.fn_index[i] = idx;
-            }
-        }
-
-        // Apply dead code elimination
+        self.setup_from_chunk(chunk);
         let mut optimized_code = chunk.code.clone();
         crate::compiler::eliminate_dead_code(&mut optimized_code);
-
-        // Pre-allocate
-        self.locals.resize(chunk.local_count.max(256), Value::Void);
-        self.stack.reserve(256);
-
-        self.run_code(&optimized_code)
+        Self::ensure_return_sentinel(&mut optimized_code);
+        self.code_segments[0] = optimized_code;
+        self.run_flat(0)
     }
 
-    fn run_code(&mut self, code: &[OpCode]) -> Result<Value, HexaError> {
-        let mut ip = 0;
-        let code_len = code.len();
-        // Cache local_base once per frame (doesn't change within run_code)
-        let local_base = self.frames.last().map_or(0, |f| f.local_base);
+    /// Flat dispatch loop: ALL function calls handled via explicit frame stack.
+    /// No recursive run_code() — eliminates Rust stack frame overhead per HEXA call.
+    #[inline(always)]
+    fn run_flat(&mut self, start_code_idx: usize) -> Result<Value, HexaError> {
+        let mut ip: usize = 0;
+        let mut code_idx: usize = start_code_idx;
+        let mut local_base: usize = self.frames.last().map_or(0, |f| f.local_base);
 
-        // Hot-path helpers: inline pop that avoids Option overhead when we
-        // know the stack is non-empty (the compiler guarantees balanced pushes).
+        // Hot-path helpers
         macro_rules! pop_fast {
             ($self:expr) => {
                 match $self.stack.pop() {
@@ -127,8 +156,6 @@ impl VM {
                 }
             };
         }
-
-        // Inline two-value pop for binary ops (avoids two separate pops)
         macro_rules! pop2_fast {
             ($self:expr) => {{
                 let len = $self.stack.len();
@@ -140,34 +167,93 @@ impl VM {
                 (a, b)
             }};
         }
+        // In-place Int binary op: avoids pop+push, modifies stack top directly
+        macro_rules! int_binop_inplace {
+            ($self:expr, $op:ident, $fallback:ident) => {{
+                let len = $self.stack.len();
+                if len < 2 {
+                    return Err(runtime_err("stack underflow".into()));
+                }
+                let a_ref = unsafe { $self.stack.get_unchecked(len - 2) };
+                let b_ref = unsafe { $self.stack.get_unchecked(len - 1) };
+                if let (Value::Int(x), Value::Int(y)) = (a_ref, b_ref) {
+                    let result = Value::Int((*x).$op(*y));
+                    unsafe {
+                        $self.stack.set_len(len - 1);
+                        *$self.stack.get_unchecked_mut(len - 2) = result;
+                    }
+                } else {
+                    let b = $self.stack.pop().unwrap();
+                    let a = $self.stack.pop().unwrap();
+                    $self.stack.push($self.$fallback(a, b)?);
+                }
+            }};
+        }
+        // Inline truthy check for Bool/Int fast path (avoids function call)
+        macro_rules! is_truthy_fast {
+            ($val:expr) => {
+                match $val {
+                    Value::Bool(b) => *b,
+                    Value::Int(n) => *n != 0,
+                    _ => is_truthy($val),
+                }
+            };
+        }
 
-        while ip < code_len {
-            // SAFETY: ip is bounds-checked by the while condition
-            let op = unsafe { code.get_unchecked(ip) };
+        // Cache code pointer to avoid code_segments[code_idx] indexing per iteration.
+        // SAFETY: all code segments end with Return sentinel, so ip never exceeds bounds.
+        let mut code_ptr: *const OpCode = self.code_segments[code_idx].as_ptr();
+
+        macro_rules! reload_code {
+            ($self:expr, $ci:expr) => {{
+                code_ptr = $self.code_segments[$ci].as_ptr();
+            }};
+        }
+
+        loop {
+            // SAFETY: all code segments end with Return sentinel — ip is always in bounds
+            let op = unsafe { &*code_ptr.add(ip) };
             ip += 1;
 
             match op {
                 OpCode::Const(idx) => {
-                    // Fast-path: avoid clone for Copy-like types
                     let val = unsafe { self.constants.get_unchecked(*idx) };
-                    let pushed = match val {
-                        Value::Int(n) => Value::Int(*n),
-                        Value::Float(f) => Value::Float(*f),
-                        Value::Bool(b) => Value::Bool(*b),
-                        Value::Void => Value::Void,
-                        other => other.clone(),
-                    };
-                    self.stack.push(pushed);
+                    if let Value::Int(n) = val {
+                        self.stack.push(Value::Int(*n));
+                    } else {
+                        let pushed = match val {
+                            Value::Float(f) => Value::Float(*f),
+                            Value::Bool(b) => Value::Bool(*b),
+                            Value::Void => Value::Void,
+                            other => other.clone(),
+                        };
+                        self.stack.push(pushed);
+                    }
                 }
                 OpCode::Void => {
                     self.stack.push(Value::Void);
                 }
                 OpCode::Pop => {
-                    self.stack.pop();
+                    let len = self.stack.len();
+                    if len > 0 {
+                        let top = unsafe { self.stack.get_unchecked(len - 1) };
+                        if top.is_value_type() {
+                            unsafe { self.stack.set_len(len - 1); }
+                        } else {
+                            self.stack.pop();
+                        }
+                    }
                 }
                 OpCode::Dup => {
                     if let Some(top) = self.stack.last() {
-                        self.stack.push(top.clone());
+                        let pushed = match top {
+                            Value::Int(n) => Value::Int(*n),
+                            Value::Float(f) => Value::Float(*f),
+                            Value::Bool(b) => Value::Bool(*b),
+                            Value::Void => Value::Void,
+                            other => other.clone(),
+                        };
+                        self.stack.push(pushed);
                     }
                 }
                 OpCode::Truthy => {
@@ -175,182 +261,265 @@ impl VM {
                     self.stack.push(Value::Bool(is_truthy(&val)));
                 }
 
-                // Variables -- inlined local_base for speed
+                // Variables — Int-first for branch prediction (most locals are Int in loops)
                 OpCode::GetLocal(slot) => {
-                    let base = local_base;
-                    let idx = base + slot;
-                    let val = if idx < self.locals.len() {
-                        // Fast-path: avoid clone for Int/Float/Bool
-                        match unsafe { self.locals.get_unchecked(idx) } {
+                    let idx = local_base + *slot;
+                    let local = unsafe { self.locals.get_unchecked(idx) };
+                    if let Value::Int(n) = local {
+                        self.stack.push(Value::Int(*n));
+                    } else {
+                        let val = match local {
+                            Value::Float(f) => Value::Float(*f),
+                            Value::Bool(b) => Value::Bool(*b),
+                            Value::Void => Value::Void,
+                            other => other.clone(),
+                        };
+                        self.stack.push(val);
+                    }
+                }
+                OpCode::SetLocal(slot) => {
+                    let val = pop_fast!(self);
+                    let idx = local_base + *slot;
+                    if idx >= self.locals.len() { self.locals.resize(idx + 1, Value::Void); }
+                    unsafe { *self.locals.get_unchecked_mut(idx) = val; }
+                }
+                OpCode::GetGlobal(idx) => {
+                    let i = *idx as usize;
+                    if unsafe { *self.global_set.get_unchecked(i) } {
+                        let val = unsafe { self.global_values.get_unchecked(i) };
+                        let pushed = match val {
                             Value::Int(n) => Value::Int(*n),
                             Value::Float(f) => Value::Float(*f),
                             Value::Bool(b) => Value::Bool(*b),
                             Value::Void => Value::Void,
                             other => other.clone(),
-                        }
+                        };
+                        self.stack.push(pushed);
                     } else {
-                        Value::Void
-                    };
-                    self.stack.push(val);
-                }
-                OpCode::SetLocal(slot) => {
-                    let val = pop_fast!(self);
-                    let base = local_base;
-                    let idx = base + slot;
-                    if idx >= self.locals.len() {
-                        self.locals.resize(idx + 1, Value::Void);
-                    }
-                    // Direct assignment -- no clone needed, we own `val`
-                    unsafe { *self.locals.get_unchecked_mut(idx) = val; }
-                }
-                OpCode::GetGlobal(idx) => {
-                    let name = &self.string_pool[*idx as usize];
-                    if let Some(val) = self.globals.get(name) {
-                        self.stack.push(val.clone());
-                    } else {
-                        return Err(runtime_err(format!("undefined variable: {}", name)));
+                        return Err(runtime_err(format!("undefined variable: {}", self.string_pool[i])));
                     }
                 }
                 OpCode::SetGlobal(idx) => {
                     let val = pop_fast!(self);
-                    let name = self.string_pool[*idx as usize].clone();
-                    self.globals.insert(name, val);
+                    let i = *idx as usize;
+                    unsafe {
+                        *self.global_values.get_unchecked_mut(i) = val;
+                        *self.global_set.get_unchecked_mut(i) = true;
+                    }
                 }
 
-                // Arithmetic -- inline Int fast-path to avoid function call overhead
+                // Arithmetic -- in-place Int fast-path (no pop+push for Int+Int)
                 OpCode::Add => {
-                    let (a, b) = pop2_fast!(self);
-                    match (a, b) {
-                        (Value::Int(x), Value::Int(y)) => self.stack.push(Value::Int(x.wrapping_add(y))),
-                        (a, b) => self.stack.push(self.op_add(a, b)?),
-                    }
+                    int_binop_inplace!(self, wrapping_add, op_add);
                 }
                 OpCode::Sub => {
-                    let (a, b) = pop2_fast!(self);
-                    match (a, b) {
-                        (Value::Int(x), Value::Int(y)) => self.stack.push(Value::Int(x.wrapping_sub(y))),
-                        (a, b) => self.stack.push(self.op_sub(a, b)?),
-                    }
+                    int_binop_inplace!(self, wrapping_sub, op_sub);
                 }
                 OpCode::Mul => {
-                    let (a, b) = pop2_fast!(self);
-                    match (a, b) {
-                        (Value::Int(x), Value::Int(y)) => self.stack.push(Value::Int(x.wrapping_mul(y))),
-                        (a, b) => self.stack.push(self.op_mul(a, b)?),
-                    }
+                    int_binop_inplace!(self, wrapping_mul, op_mul);
                 }
                 OpCode::Div => {
-                    let (a, b) = pop2_fast!(self);
-                    match (a, b) {
-                        (Value::Int(_), Value::Int(0)) => return Err(runtime_err("division by zero".into())),
-                        (Value::Int(x), Value::Int(y)) => self.stack.push(Value::Int(x / y)),
-                        (a, b) => self.stack.push(self.op_div(a, b)?),
+                    let len = self.stack.len();
+                    if len < 2 {
+                        return Err(runtime_err("stack underflow".into()));
+                    }
+                    let a_ref = unsafe { self.stack.get_unchecked(len - 2) };
+                    let b_ref = unsafe { self.stack.get_unchecked(len - 1) };
+                    if let (Value::Int(x), Value::Int(y)) = (a_ref, b_ref) {
+                        if *y == 0 { return Err(runtime_err("division by zero".into())); }
+                        let result = Value::Int(*x / *y);
+                        unsafe {
+                            self.stack.set_len(len - 1);
+                            *self.stack.get_unchecked_mut(len - 2) = result;
+                        }
+                    } else {
+                        let b = self.stack.pop().unwrap();
+                        let a = self.stack.pop().unwrap();
+                        self.stack.push(self.op_div(a, b)?);
                     }
                 }
                 OpCode::Mod => {
-                    let (a, b) = pop2_fast!(self);
-                    match (a, b) {
-                        (Value::Int(_), Value::Int(0)) => return Err(runtime_err("division by zero".into())),
-                        (Value::Int(x), Value::Int(y)) => self.stack.push(Value::Int(x % y)),
-                        (a, b) => self.stack.push(self.op_mod(a, b)?),
+                    let len = self.stack.len();
+                    if len < 2 {
+                        return Err(runtime_err("stack underflow".into()));
+                    }
+                    let a_ref = unsafe { self.stack.get_unchecked(len - 2) };
+                    let b_ref = unsafe { self.stack.get_unchecked(len - 1) };
+                    if let (Value::Int(x), Value::Int(y)) = (a_ref, b_ref) {
+                        if *y == 0 { return Err(runtime_err("division by zero".into())); }
+                        let result = Value::Int(*x % *y);
+                        unsafe {
+                            self.stack.set_len(len - 1);
+                            *self.stack.get_unchecked_mut(len - 2) = result;
+                        }
+                    } else {
+                        let b = self.stack.pop().unwrap();
+                        let a = self.stack.pop().unwrap();
+                        self.stack.push(self.op_mod(a, b)?);
                     }
                 }
                 OpCode::Pow => {
-                    let (a, b) = pop2_fast!(self);
-                    self.stack.push(self.op_pow(a, b)?);
+                    let len = self.stack.len();
+                    if len < 2 { return Err(runtime_err("stack underflow".into())); }
+                    if let (Value::Int(x), Value::Int(y)) = unsafe {
+                        (self.stack.get_unchecked(len - 2), self.stack.get_unchecked(len - 1))
+                    } {
+                        let r = Value::Int((*x).wrapping_pow(*y as u32));
+                        unsafe { self.stack.set_len(len - 1); *self.stack.get_unchecked_mut(len - 2) = r; }
+                    } else {
+                        let b = self.stack.pop().unwrap();
+                        let a = self.stack.pop().unwrap();
+                        self.stack.push(self.op_pow(a, b)?);
+                    }
                 }
                 OpCode::Neg => {
-                    let v = pop_fast!(self);
-                    match v {
-                        Value::Int(n) => self.stack.push(Value::Int(-n)),
-                        Value::Float(n) => self.stack.push(Value::Float(-n)),
+                    let len = self.stack.len();
+                    if len == 0 { return Err(runtime_err("stack underflow".into())); }
+                    let top = unsafe { self.stack.get_unchecked_mut(len - 1) };
+                    match top {
+                        Value::Int(n) => *n = -*n,
+                        Value::Float(f) => *f = -*f,
                         _ => return Err(runtime_err("cannot negate non-numeric value".into())),
                     }
                 }
 
-                // Comparison -- inline Int fast-path
+                // Comparison -- in-place Int fast-path
                 OpCode::Eq => {
-                    let (a, b) = pop2_fast!(self);
-                    let eq = match (&a, &b) {
-                        (Value::Int(x), Value::Int(y)) => x == y,
-                        _ => values_equal(&a, &b),
+                    let len = self.stack.len();
+                    if len < 2 { return Err(runtime_err("stack underflow".into())); }
+                    let a_ref = unsafe { self.stack.get_unchecked(len - 2) };
+                    let b_ref = unsafe { self.stack.get_unchecked(len - 1) };
+                    let result = match (a_ref, b_ref) {
+                        (Value::Int(x), Value::Int(y)) => *x == *y,
+                        _ => values_equal(a_ref, b_ref),
                     };
-                    self.stack.push(Value::Bool(eq));
+                    unsafe {
+                        self.stack.set_len(len - 1);
+                        *self.stack.get_unchecked_mut(len - 2) = Value::Bool(result);
+                    }
                 }
                 OpCode::Ne => {
-                    let (a, b) = pop2_fast!(self);
-                    let eq = match (&a, &b) {
-                        (Value::Int(x), Value::Int(y)) => x == y,
-                        _ => values_equal(&a, &b),
+                    let len = self.stack.len();
+                    if len < 2 { return Err(runtime_err("stack underflow".into())); }
+                    let a_ref = unsafe { self.stack.get_unchecked(len - 2) };
+                    let b_ref = unsafe { self.stack.get_unchecked(len - 1) };
+                    let result = match (a_ref, b_ref) {
+                        (Value::Int(x), Value::Int(y)) => *x != *y,
+                        _ => !values_equal(a_ref, b_ref),
                     };
-                    self.stack.push(Value::Bool(!eq));
+                    unsafe {
+                        self.stack.set_len(len - 1);
+                        *self.stack.get_unchecked_mut(len - 2) = Value::Bool(result);
+                    }
                 }
                 OpCode::Lt => {
-                    let (a, b) = pop2_fast!(self);
-                    let lt = match (&a, &b) {
-                        (Value::Int(x), Value::Int(y)) => x < y,
-                        _ => self.compare_lt(&a, &b)?,
+                    let len = self.stack.len();
+                    if len < 2 { return Err(runtime_err("stack underflow".into())); }
+                    let a_ref = unsafe { self.stack.get_unchecked(len - 2) };
+                    let b_ref = unsafe { self.stack.get_unchecked(len - 1) };
+                    let result = match (a_ref, b_ref) {
+                        (Value::Int(x), Value::Int(y)) => *x < *y,
+                        _ => self.compare_lt(a_ref, b_ref)?,
                     };
-                    self.stack.push(Value::Bool(lt));
+                    unsafe {
+                        self.stack.set_len(len - 1);
+                        *self.stack.get_unchecked_mut(len - 2) = Value::Bool(result);
+                    }
                 }
                 OpCode::Gt => {
-                    let (a, b) = pop2_fast!(self);
-                    let gt = match (&a, &b) {
-                        (Value::Int(x), Value::Int(y)) => x > y,
-                        _ => self.compare_lt(&b, &a)?,
+                    let len = self.stack.len();
+                    if len < 2 { return Err(runtime_err("stack underflow".into())); }
+                    let a_ref = unsafe { self.stack.get_unchecked(len - 2) };
+                    let b_ref = unsafe { self.stack.get_unchecked(len - 1) };
+                    let result = match (a_ref, b_ref) {
+                        (Value::Int(x), Value::Int(y)) => *x > *y,
+                        _ => self.compare_lt(b_ref, a_ref)?,
                     };
-                    self.stack.push(Value::Bool(gt));
+                    unsafe {
+                        self.stack.set_len(len - 1);
+                        *self.stack.get_unchecked_mut(len - 2) = Value::Bool(result);
+                    }
                 }
                 OpCode::Le => {
-                    let (a, b) = pop2_fast!(self);
-                    let le = match (&a, &b) {
-                        (Value::Int(x), Value::Int(y)) => x <= y,
-                        _ => self.compare_lt(&a, &b)? || values_equal(&a, &b),
+                    let len = self.stack.len();
+                    if len < 2 { return Err(runtime_err("stack underflow".into())); }
+                    let a_ref = unsafe { self.stack.get_unchecked(len - 2) };
+                    let b_ref = unsafe { self.stack.get_unchecked(len - 1) };
+                    let result = match (a_ref, b_ref) {
+                        (Value::Int(x), Value::Int(y)) => *x <= *y,
+                        _ => self.compare_lt(a_ref, b_ref)? || values_equal(a_ref, b_ref),
                     };
-                    self.stack.push(Value::Bool(le));
+                    unsafe {
+                        self.stack.set_len(len - 1);
+                        *self.stack.get_unchecked_mut(len - 2) = Value::Bool(result);
+                    }
                 }
                 OpCode::Ge => {
-                    let (a, b) = pop2_fast!(self);
-                    let ge = match (&a, &b) {
-                        (Value::Int(x), Value::Int(y)) => x >= y,
-                        _ => self.compare_lt(&b, &a)? || values_equal(&a, &b),
+                    let len = self.stack.len();
+                    if len < 2 { return Err(runtime_err("stack underflow".into())); }
+                    let a_ref = unsafe { self.stack.get_unchecked(len - 2) };
+                    let b_ref = unsafe { self.stack.get_unchecked(len - 1) };
+                    let result = match (a_ref, b_ref) {
+                        (Value::Int(x), Value::Int(y)) => *x >= *y,
+                        _ => self.compare_lt(b_ref, a_ref)? || values_equal(a_ref, b_ref),
                     };
-                    self.stack.push(Value::Bool(ge));
+                    unsafe {
+                        self.stack.set_len(len - 1);
+                        *self.stack.get_unchecked_mut(len - 2) = Value::Bool(result);
+                    }
                 }
 
                 // Logical / Bitwise
                 OpCode::Not => {
-                    let v = pop_fast!(self);
-                    self.stack.push(Value::Bool(!is_truthy(&v)));
+                    let len = self.stack.len();
+                    if len == 0 { return Err(runtime_err("stack underflow".into())); }
+                    let top = unsafe { self.stack.get_unchecked(len - 1) };
+                    let result = !is_truthy_fast!(top);
+                    unsafe { *self.stack.get_unchecked_mut(len - 1) = Value::Bool(result); }
                 }
                 OpCode::BitAnd => {
-                    let (a, b) = pop2_fast!(self);
-                    match (a, b) {
-                        (Value::Int(x), Value::Int(y)) => self.stack.push(Value::Int(x & y)),
-                        _ => return Err(runtime_err("bitwise AND requires integers".into())),
+                    let len = self.stack.len();
+                    if len < 2 { return Err(runtime_err("stack underflow".into())); }
+                    if let (Value::Int(x), Value::Int(y)) = unsafe {
+                        (self.stack.get_unchecked(len - 2), self.stack.get_unchecked(len - 1))
+                    } {
+                        let r = Value::Int(*x & *y);
+                        unsafe { self.stack.set_len(len - 1); *self.stack.get_unchecked_mut(len - 2) = r; }
+                    } else {
+                        return Err(runtime_err("bitwise AND requires integers".into()));
                     }
                 }
                 OpCode::BitOr => {
-                    let (a, b) = pop2_fast!(self);
-                    match (a, b) {
-                        (Value::Int(x), Value::Int(y)) => self.stack.push(Value::Int(x | y)),
-                        _ => return Err(runtime_err("bitwise OR requires integers".into())),
+                    let len = self.stack.len();
+                    if len < 2 { return Err(runtime_err("stack underflow".into())); }
+                    if let (Value::Int(x), Value::Int(y)) = unsafe {
+                        (self.stack.get_unchecked(len - 2), self.stack.get_unchecked(len - 1))
+                    } {
+                        let r = Value::Int(*x | *y);
+                        unsafe { self.stack.set_len(len - 1); *self.stack.get_unchecked_mut(len - 2) = r; }
+                    } else {
+                        return Err(runtime_err("bitwise OR requires integers".into()));
                     }
                 }
                 OpCode::BitXor => {
-                    let (a, b) = pop2_fast!(self);
-                    match (a, b) {
-                        (Value::Int(x), Value::Int(y)) => self.stack.push(Value::Int(x ^ y)),
-                        (Value::Bool(x), Value::Bool(y)) => self.stack.push(Value::Bool(x ^ y)),
+                    let len = self.stack.len();
+                    if len < 2 { return Err(runtime_err("stack underflow".into())); }
+                    let (a, b) = unsafe {
+                        (self.stack.get_unchecked(len - 2), self.stack.get_unchecked(len - 1))
+                    };
+                    let r = match (a, b) {
+                        (Value::Int(x), Value::Int(y)) => Value::Int(*x ^ *y),
+                        (Value::Bool(x), Value::Bool(y)) => Value::Bool(*x ^ *y),
                         _ => return Err(runtime_err("bitwise XOR requires integers or booleans".into())),
-                    }
+                    };
+                    unsafe { self.stack.set_len(len - 1); *self.stack.get_unchecked_mut(len - 2) = r; }
                 }
                 OpCode::BitNot => {
-                    let v = pop_fast!(self);
-                    match v {
-                        Value::Int(n) => self.stack.push(Value::Int(!n)),
-                        _ => return Err(runtime_err("bitwise NOT requires integer".into())),
-                    }
+                    let len = self.stack.len();
+                    if len == 0 { return Err(runtime_err("stack underflow".into())); }
+                    let top = unsafe { self.stack.get_unchecked_mut(len - 1) };
+                    if let Value::Int(n) = top { *n = !*n; }
+                    else { return Err(runtime_err("bitwise NOT requires integer".into())); }
                 }
 
                 // Control flow
@@ -358,68 +527,91 @@ impl VM {
                     ip = *target;
                 }
                 OpCode::JumpIfFalse(target) => {
-                    let v = pop_fast!(self);
-                    if !is_truthy(&v) {
-                        ip = *target;
-                    }
+                    let len = self.stack.len();
+                    if len == 0 { return Err(runtime_err("stack underflow".into())); }
+                    let top = unsafe { self.stack.get_unchecked(len - 1) };
+                    let truthy = match top {
+                        Value::Bool(b) => *b,
+                        Value::Int(n) => *n != 0,
+                        _ => is_truthy(top),
+                    };
+                    unsafe { self.stack.set_len(len - 1); }
+                    if !truthy { ip = *target; }
                 }
                 OpCode::JumpIfTrue(target) => {
-                    let v = pop_fast!(self);
-                    if is_truthy(&v) {
-                        ip = *target;
-                    }
+                    let len = self.stack.len();
+                    if len == 0 { return Err(runtime_err("stack underflow".into())); }
+                    let top = unsafe { self.stack.get_unchecked(len - 1) };
+                    let truthy = match top {
+                        Value::Bool(b) => *b,
+                        Value::Int(n) => *n != 0,
+                        _ => is_truthy(top),
+                    };
+                    unsafe { self.stack.set_len(len - 1); }
+                    if truthy { ip = *target; }
                 }
                 OpCode::CallFn(idx, argc) => {
                     let str_idx = *idx as usize;
-                    // Fast path: use pre-built fn_index for O(1) lookup
-                    let fn_idx = if str_idx < self.fn_index.len() {
-                        self.fn_index[str_idx]
-                    } else {
-                        u32::MAX
-                    };
+                    let argc = *argc as usize;
+                    let fn_idx = unsafe { *self.fn_index.get_unchecked(str_idx) };
                     if fn_idx != u32::MAX {
-                        let func = &self.fn_table[fn_idx as usize];
-                        let argc = *argc as usize;
-                        if argc != func.arity {
+                        let fn_idx = fn_idx as usize;
+                        let func = unsafe { self.fn_table.get_unchecked(fn_idx) };
+                        let arity = func.arity;
+                        if argc != arity {
                             return Err(runtime_err(format!(
-                                "function expects {} arguments, got {}", func.arity, argc
+                                "function expects {} arguments, got {}", arity, argc
                             )));
                         }
-                        // Clone the Arc<Vec<OpCode>> (O(1)) to release borrow
-                        let func_code = func.code.clone();
                         let local_count = func.local_count;
-                        let local_base = self.locals.len();
-                        let needed = local_base + local_count;
+                        let new_local_base = self.locals.len();
+                        let needed = new_local_base + local_count;
                         if needed > self.locals.len() {
                             self.locals.resize(needed, Value::Void);
                         }
-                        let stack_start = self.stack.len().saturating_sub(argc);
-                        for i in 0..argc {
-                            self.locals[local_base + i] = std::mem::replace(
-                                &mut self.stack[stack_start + i], Value::Void
-                            );
+                        // Move args from stack to locals via unsafe ptr copy (avoids per-element bounds check)
+                        let stack_start = self.stack.len() - argc;
+                        unsafe {
+                            let src = self.stack.as_ptr().add(stack_start);
+                            let dst = self.locals.as_mut_ptr().add(new_local_base);
+                            std::ptr::copy_nonoverlapping(src, dst, argc);
+                            self.stack.set_len(stack_start);
                         }
-                        self.stack.truncate(stack_start);
+
+                        // FLAT DISPATCH: save return address, switch code segment
                         self.frames.push(CallFrame {
-                            func_name: String::new(), // skip alloc on hot path
-                            return_ip: 0,
-                            local_base,
-                            is_top_level: false,
+                            return_ip: ip,
+                            return_code_idx: code_idx,
+                            local_base: new_local_base,
                         });
-                        let result = self.run_code(&func_code)?;
-                        self.frames.pop();
-                        self.locals.truncate(local_base);
-                        self.stack.push(result);
+                        code_idx = unsafe { *self.fn_code_idx.get_unchecked(fn_idx) };
+                        reload_code!(self, code_idx);
+                        ip = 0;
+                        local_base = new_local_base;
+                        continue; // restart loop with new code segment
                     } else {
-                        // Fallback: name-based lookup
+                        // Fallback: name-based lookup (builtins, etc.)
                         let name = self.string_pool[str_idx].clone();
-                        let result = self.call_function(&name, *argc as usize)?;
+                        let result = self.call_function_legacy(&name, argc)?;
                         self.stack.push(result);
                     }
                 }
                 OpCode::Return => {
                     let val = self.stack.pop().unwrap_or(Value::Void);
-                    return Ok(val);
+                    if self.frames.is_empty() {
+                        return Ok(val);
+                    }
+                    // FLAT DISPATCH: restore caller's code segment and IP
+                    let frame = unsafe { self.frames.pop().unwrap_unchecked() };
+                    self.locals.truncate(frame.local_base);
+                    ip = frame.return_ip;
+                    code_idx = frame.return_code_idx;
+                    reload_code!(self, code_idx);
+                    local_base = match self.frames.last() {
+                        Some(f) => f.local_base,
+                        None => 0,
+                    };
+                    self.stack.push(val);
                 }
 
                 // Print
@@ -510,11 +702,9 @@ impl VM {
                     }
                 }
 
+
             }
         }
-
-        // Return last value on stack
-        Ok(self.stack.pop().unwrap_or(Value::Void))
     }
 
     #[inline(always)]
@@ -528,7 +718,7 @@ impl VM {
 
     // ---- Function calls ----
 
-    fn call_function(&mut self, name: &str, argc: usize) -> Result<Value, HexaError> {
+    fn call_function_legacy(&mut self, name: &str, argc: usize) -> Result<Value, HexaError> {
         let func = self.functions.get(name).cloned().ok_or_else(|| {
             runtime_err(format!("undefined function: {}", name))
         })?;
@@ -539,37 +729,36 @@ impl VM {
             )));
         }
 
-        // Move arguments directly from stack to locals (no intermediate Vec)
-        let local_base = self.locals.len();
-        let needed = local_base + func.local_count;
+        let new_local_base = self.locals.len();
+        let needed = new_local_base + func.local_count;
         if needed > self.locals.len() {
             self.locals.resize(needed, Value::Void);
         }
 
-        // Pop args from stack directly into local slots (reverse order)
         let stack_start = self.stack.len().saturating_sub(argc);
         for i in 0..argc {
-            self.locals[local_base + i] = std::mem::replace(
+            self.locals[new_local_base + i] = std::mem::replace(
                 &mut self.stack[stack_start + i], Value::Void
             );
         }
         self.stack.truncate(stack_start);
 
-        // Push call frame (reuse string from string_pool, avoid allocation)
+        // Add code as a temporary segment and run flat
+        let tmp_code_idx = self.code_segments.len();
+        self.code_segments.push((*func.code).clone());
+
         self.frames.push(CallFrame {
-            func_name: name.to_string(),
-            return_ip: 0,
-            local_base,
-            is_top_level: false,
+            return_ip: 0, // not used — run_flat returns when frames empty
+            return_code_idx: 0,
+            local_base: new_local_base,
         });
 
-        // Execute function code
-        let result = self.run_code(&func.code)?;
+        let result = self.run_flat(tmp_code_idx)?;
 
-        // Pop call frame
-        self.frames.pop();
-        // Shrink locals back
-        self.locals.truncate(local_base);
+        // Clean up temp segment
+        if self.code_segments.len() > tmp_code_idx {
+            self.code_segments.truncate(tmp_code_idx);
+        }
 
         Ok(result)
     }
@@ -616,13 +805,13 @@ impl VM {
                     Value::Void => "void",
                     Value::Array(_) => "array",
                     Value::Tuple(_) => "tuple",
-                    Value::Fn(..) => "fn",
+                    Value::Fn(_) => "fn",
                     Value::BuiltinFn(_) => "builtin",
                     Value::Struct(name, _) => name.as_str(),
-                    Value::Lambda(..) => "lambda",
+                    Value::Lambda(_) => "lambda",
                     Value::Map(_) => "map",
                     Value::Error(_) => "error",
-                    Value::EnumVariant(name, _, _) => name.as_str(),
+                    Value::EnumVariant(ev) => ev.0.as_str(),
                     Value::Intent(_) => "intent",
                     #[cfg(not(target_arch = "wasm32"))]
                     Value::Sender(_) => "sender",
@@ -634,8 +823,8 @@ impl VM {
                     Value::TcpListener(_) => "tcp_listener",
                     #[cfg(not(target_arch = "wasm32"))]
                     Value::TcpStream(_) => "tcp_stream",
-                    Value::EffectRequest(_, _, _) => "effect_request",
-                    Value::TraitObject { type_name, .. } => type_name.as_str(),
+                    Value::EffectRequest(_) => "effect_request",
+                    Value::TraitObject(to) => to.type_name.as_str(),
                     #[cfg(not(target_arch = "wasm32"))]
                     Value::AsyncFuture(_) => "future",
                     Value::Atomic(_) => "atomic",
@@ -832,8 +1021,9 @@ impl VM {
         }
     }
 
-    // ---- Arithmetic helpers ----
+    // ---- Arithmetic helpers (cold path — only hit for non-Int types) ----
 
+    #[cold]
     fn op_add(&self, a: Value, b: Value) -> Result<Value, HexaError> {
         match (a, b) {
             (Value::Int(x), Value::Int(y)) => Ok(Value::Int(x.wrapping_add(y))),
@@ -849,6 +1039,7 @@ impl VM {
         }
     }
 
+    #[cold]
     fn op_sub(&self, a: Value, b: Value) -> Result<Value, HexaError> {
         match (a, b) {
             (Value::Int(x), Value::Int(y)) => Ok(Value::Int(x.wrapping_sub(y))),
@@ -859,6 +1050,7 @@ impl VM {
         }
     }
 
+    #[cold]
     fn op_mul(&self, a: Value, b: Value) -> Result<Value, HexaError> {
         match (a, b) {
             (Value::Int(x), Value::Int(y)) => Ok(Value::Int(x.wrapping_mul(y))),
@@ -869,6 +1061,7 @@ impl VM {
         }
     }
 
+    #[cold]
     fn op_div(&self, a: Value, b: Value) -> Result<Value, HexaError> {
         match (a, b) {
             (Value::Int(_), Value::Int(0)) => Err(runtime_err("division by zero".into())),
@@ -887,6 +1080,7 @@ impl VM {
         }
     }
 
+    #[cold]
     fn op_mod(&self, a: Value, b: Value) -> Result<Value, HexaError> {
         match (a, b) {
             (Value::Int(_), Value::Int(0)) => Err(runtime_err("division by zero".into())),
@@ -898,6 +1092,7 @@ impl VM {
         }
     }
 
+    #[cold]
     fn op_pow(&self, a: Value, b: Value) -> Result<Value, HexaError> {
         match (a, b) {
             (Value::Int(x), Value::Int(y)) => Ok(Value::Int((x as f64).powi(y as i32) as i64)),
@@ -908,6 +1103,7 @@ impl VM {
         }
     }
 
+    #[cold]
     fn compare_lt(&self, a: &Value, b: &Value) -> Result<bool, HexaError> {
         match (a, b) {
             (Value::Int(x), Value::Int(y)) => Ok(x < y),
@@ -932,6 +1128,7 @@ fn is_truthy(val: &Value) -> bool {
     }
 }
 
+#[cold]
 fn values_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => x == y,
@@ -957,6 +1154,8 @@ fn gcd(a: i64, b: i64) -> i64 {
     a
 }
 
+#[cold]
+#[inline(never)]
 fn runtime_err(msg: String) -> HexaError {
     HexaError {
         class: ErrorClass::Runtime,
@@ -1185,4 +1384,10 @@ s
         let vm = VM::new();
         assert!(vm.stack.capacity() >= 256);
     }
+}
+
+#[test]
+fn _tmp_opcode_size() {
+    eprintln!("OpCode: {} bytes", std::mem::size_of::<crate::compiler::OpCode>());
+    eprintln!("Value: {} bytes", std::mem::size_of::<Value>());
 }

@@ -243,7 +243,7 @@ fn builtin_http_serve(interp: &mut Interpreter, args: Vec<Value>) -> Result<Valu
 
     // Verify callable
     match &handler {
-        Value::Fn(..) | Value::Lambda(..) | Value::BuiltinFn(_) => {}
+        Value::Fn(_) | Value::Lambda(_) | Value::BuiltinFn(_) => {}
         _ => return Err(type_err(interp, "http_serve() second argument must be a function".into())),
     }
 
@@ -267,7 +267,7 @@ fn builtin_http_serve(interp: &mut Interpreter, args: Vec<Value>) -> Result<Valu
         };
 
         // Call the handler
-        let request_val = Value::Map(request_map);
+        let request_val = Value::Map(Box::new(request_map));
         let response = interp.call_function(handler.clone(), vec![request_val])?;
 
         let response_str = match &response {
@@ -336,7 +336,7 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HashMap<String, Value>, s
     let mut map = HashMap::new();
     map.insert("method".into(), Value::Str(method));
     map.insert("path".into(), Value::Str(path));
-    map.insert("headers".into(), Value::Map(headers));
+    map.insert("headers".into(), Value::Map(Box::new(headers)));
     map.insert("body".into(), Value::Str(body));
     Ok(map)
 }
@@ -371,7 +371,7 @@ pub fn parse_http_request_string(raw: &str) -> HashMap<String, Value> {
     let mut map = HashMap::new();
     map.insert("method".into(), Value::Str(method));
     map.insert("path".into(), Value::Str(path));
-    map.insert("headers".into(), Value::Map(headers));
+    map.insert("headers".into(), Value::Map(Box::new(headers)));
     map.insert("body".into(), Value::Str(body_lines.join("\n")));
     map
 }
