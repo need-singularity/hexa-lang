@@ -1,0 +1,209 @@
+// token-forge — LLM token compression engine (hexa-lang)
+// Absorbed from token-forge repo: proxy + cache + forge + anvil + bench
+
+// ═══════════════════════════════════════════════════════════════════════
+//  CONSTANTS
+// ═══════════════════════════════════════════════════════════════════════
+
+let VERSION = "0.2.0"
+let MAX_CTX = comptime { 4000 }
+let KEEP_RECENT = comptime { 5 }
+let COMPRESS_THRESHOLD = comptime { 800 }
+let PROXY_PORT = 8080
+let UPSTREAM = "https://api.anthropic.com"
+
+// ═══════════════════════════════════════════════════════════════════════
+//  EFFECTS
+// ═══════════════════════════════════════════════════════════════════════
+
+effect LLMCall {
+    fn call(prompt: str) -> str
+    fn call_stream(prompt: str) -> str
+}
+
+effect FileSystem {
+    fn read(path: str) -> str
+    fn write(path: str, content: str) -> void
+    fn glob(pattern: str) -> [str]
+}
+
+effect HttpProxy {
+    fn listen(port: int) -> void
+    fn forward(url: str, body: str, headers: str) -> str
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  COMPRESSION ENGINE (forge)
+// ═══════════════════════════════════════════════════════════════════════
+
+fn compress_safe(text: str) -> str {
+    if len(text) < COMPRESS_THRESHOLD {
+        return text
+    }
+    let prompt = "Compress for LLM. PRESERVE ALL: filenames, functions, decisions, code. Remove only filler.\n---\n" + text.substring(0, MAX_CTX) + "\n---\nCompressed:"
+    return exec("claude -p '" + prompt.replace("'", "'\\''") + "' 2>/dev/null").trim()
+}
+
+fn compress_twostage(text: str) -> str {
+    let prompt = "Two-stage: 1) Dense summary (200w max) 2) KEY=value pairs.\n---\n" + text.substring(0, MAX_CTX) + "\n---\nSUMMARY: "
+    return exec("claude -p '" + prompt.replace("'", "'\\''") + "' 2>/dev/null").trim()
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  PROXY — message compression
+// ═══════════════════════════════════════════════════════════════════════
+
+fn compress_messages(messages: str, keep_recent: int, max_tool: int, max_asst: int) -> str {
+    // Parse JSON messages array, compress old turns
+    let cmd = "python3 -c \"" +
+        "import json,sys\n" +
+        "msgs=json.loads(sys.argv[1])\n" +
+        "n=len(msgs)\n" +
+        "keep=" + to_string(keep_recent) + "\n" +
+        "mt=" + to_string(max_tool) + "\n" +
+        "ma=" + to_string(max_asst) + "\n" +
+        "for i in range(max(0,n-keep)):\n" +
+        "  m=msgs[i]\n" +
+        "  if isinstance(m.get('content'),list):\n" +
+        "    for b in m['content']:\n" +
+        "      if isinstance(b,dict):\n" +
+        "        if b.get('type')=='tool_result' and len(str(b.get('content','')))>mt:\n" +
+        "          b['content']=str(b['content'])[:mt]+'...[truncated]'\n" +
+        "  if m.get('role')=='assistant' and isinstance(m.get('content'),str) and len(m['content'])>ma:\n" +
+        "    m['content']=m['content'][:ma]+'...[truncated]'\n" +
+        "print(json.dumps(msgs))\n" +
+        "\" '" + messages.replace("'", "'\\''") + "'"
+    return exec(cmd).trim()
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  CACHE ANALYZER
+// ═══════════════════════════════════════════════════════════════════════
+
+fn analyze_cache(session_path: str) -> str {
+    let cmd = "python3 -c \"" +
+        "import json\n" +
+        "turns=[]\n" +
+        "for l in open('" + session_path + "'):\n" +
+        "  try: d=json.loads(l)\n" +
+        "  except: continue\n" +
+        "  if d.get('type')=='assistant':\n" +
+        "    u=d.get('message',{}).get('usage',{})\n" +
+        "    if u: turns.append(u)\n" +
+        "if not turns: print('no data'); exit()\n" +
+        "total_in=sum(t.get('input_tokens',0) for t in turns)\n" +
+        "total_cache=sum(t.get('cache_read_input_tokens',0) for t in turns)\n" +
+        "total_create=sum(t.get('cache_creation_input_tokens',0) for t in turns)\n" +
+        "total_out=sum(t.get('output_tokens',0) for t in turns)\n" +
+        "hit=total_cache/(total_cache+total_create+total_in)*100 if (total_cache+total_create+total_in)>0 else 0\n" +
+        "print(f'turns={len(turns)} cache_hit={hit:.1f}% in={total_in} cache_read={total_cache} create={total_create} out={total_out}')\n" +
+        "\""
+    return exec(cmd).trim()
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  VERIFICATION (anvil)
+// ═══════════════════════════════════════════════════════════════════════
+
+fn verify_similarity(response_a: str, response_b: str) -> int {
+    let prompt = "Rate semantic similarity 0-100.\nA: " + response_a.substring(0, 600) + "\nB: " + response_b.substring(0, 600) + "\nOutput ONLY number:"
+    let result = exec("claude -p '" + prompt.replace("'", "'\\''") + "' 2>/dev/null").trim()
+    // extract first number
+    let parts = result.split(" ")
+    let i = 0
+    while i < len(parts) {
+        let n = to_int(parts[i])
+        if n >= 0 {
+            return n
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  BENCHMARK — DFS depth comparison
+// ═══════════════════════════════════════════════════════════════════════
+
+fn bench_dfs(session_path: str, max_depth: int) -> str {
+    println("⬡ token-forge DFS benchmark (hexa)")
+    println("  keep_recent=" + to_string(KEEP_RECENT) + " threshold=" + to_string(COMPRESS_THRESHOLD))
+    println("")
+
+    let cache_info = analyze_cache(session_path)
+    println("  cache: " + cache_info)
+    println("")
+
+    // parse user/assistant messages
+    let parse_cmd = "python3 -c \"" +
+        "import json\n" +
+        "msgs=[]\n" +
+        "for l in open('" + session_path + "'):\n" +
+        "  try: d=json.loads(l)\n" +
+        "  except: continue\n" +
+        "  r=d.get('type','')\n" +
+        "  if r not in('user','assistant'): continue\n" +
+        "  c=d.get('message',{}).get('content','')\n" +
+        "  if isinstance(c,list): c=' '.join(b.get('text','') if isinstance(b,dict) else str(b) for b in c)\n" +
+        "  if len(str(c))>10: msgs.append({'role':r,'text':str(c)[:500]})\n" +
+        "print(json.dumps(msgs[:50]))\n" +
+        "\""
+    let msgs_json = exec(parse_cmd).trim()
+    println("  parsed messages")
+
+    return "benchmark complete — see bench reports"
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  CLI ROUTER
+// ═══════════════════════════════════════════════════════════════════════
+
+fn print_help() -> str {
+    println("token-forge v" + VERSION + " — LLM token compression (hexa)")
+    println("")
+    println("Commands:")
+    println("  proxy     — start compression proxy (port " + to_string(PROXY_PORT) + ")")
+    println("  cache     — analyze session cache hit rate")
+    println("  compress  — compress a text file")
+    println("  bench     — run DFS benchmark")
+    println("  verify    — verify compression quality")
+    println("  help      — show this message")
+    return "ok"
+}
+
+consciousness TokenForgeRouter {
+    assert len(VERSION) > 0
+    assert MAX_CTX == 4000
+    assert KEEP_RECENT == 5
+    assert PROXY_PORT == 8080
+
+    let argv = args()
+    let cmd = "help"
+    if len(argv) > 3 {
+        cmd = argv[3]
+    }
+
+    if cmd == "proxy" {
+        println("⬡ starting compression proxy on :" + to_string(PROXY_PORT))
+        println("  ANTHROPIC_BASE_URL=http://localhost:" + to_string(PROXY_PORT) + "/v1 claude")
+        exec("python3 " + argv[2].replace("forge.hexa", "proxy/server.py"))
+    }
+    if cmd == "cache" {
+        if len(argv) > 4 {
+            let info = analyze_cache(argv[4])
+            println(info)
+        }
+        if len(argv) <= 4 {
+            println("usage: token-forge cache <session.jsonl>")
+        }
+    }
+    if cmd == "bench" {
+        if len(argv) > 4 {
+            bench_dfs(argv[4], 5)
+        }
+        if len(argv) <= 4 {
+            println("usage: token-forge bench <session.jsonl>")
+        }
+    }
+    if cmd == "help" { print_help() }
+}
