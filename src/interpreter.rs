@@ -7760,4 +7760,45 @@ scope {
         let result = try_eval(src);
         assert!(result.is_err());
     }
+
+    // ── break/continue tests ────────────────────────────────────
+
+    #[test]
+    fn test_break_in_while() {
+        let src = "let i = 0\nwhile true {\n  if i >= 5 { break }\n  i = i + 1\n}\ni";
+        assert!(matches!(eval(src), Value::Int(5)));
+    }
+
+    #[test]
+    fn test_break_in_for() {
+        let src = "let r = 0\nfor x in 0..100 {\n  if x > 5 { break }\n  r = x\n}\nr";
+        assert!(matches!(eval(src), Value::Int(5)));
+    }
+
+    #[test]
+    fn test_break_in_loop() {
+        let src = "let n = 0\nloop {\n  n = n + 1\n  if n == 10 { break }\n}\nn";
+        assert!(matches!(eval(src), Value::Int(10)));
+    }
+
+    #[test]
+    fn test_continue_in_while() {
+        let src = "let sum = 0\nlet i = 0\nwhile i < 10 {\n  i = i + 1\n  if i % 2 == 0 { continue }\n  sum = sum + i\n}\nsum";
+        // sum of odd numbers 1..9 = 1+3+5+7+9 = 25
+        assert!(matches!(eval(src), Value::Int(25)));
+    }
+
+    #[test]
+    fn test_continue_in_for() {
+        let src = "let sum = 0\nfor x in 0..10 {\n  if x % 3 == 0 { continue }\n  sum = sum + x\n}\nsum";
+        // 1+2+4+5+7+8 = 27
+        assert!(matches!(eval(src), Value::Int(27)));
+    }
+
+    #[test]
+    fn test_break_nested_loops() {
+        let src = "let count = 0\nfor i in 0..5 {\n  for j in 0..5 {\n    if j >= 3 { break }\n    count = count + 1\n  }\n}\ncount";
+        // 5 outer * 3 inner = 15
+        assert!(matches!(eval(src), Value::Int(15)));
+    }
 }
