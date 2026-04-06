@@ -19,6 +19,14 @@
 ⚠ 변경 후 → singularity_cycle.py 또는 CycleEngine 재실행
 ```
 
+## ⚠️ 필수 규칙
+
+### hexa-native 전용 (sh/py/rs 작성 금지)
+- **새 파일은 `.hexa`만 허용** — `.sh`, `.py`, `.rs` 등 다른 언어 파일 작성 금지
+- 모든 새 모듈은 `mk2_hexa/native/` 에 `.hexa` 파일로 생성
+- 기존 sh/py 스크립트는 참조만 허용, 신규 작성 불가
+- **예외**: 이 리포의 컴파일러 Rust 소스(`src/`) — 컴파일러 자체 코드이므로 제외
+
 ## Build
 ```bash
 bash build.sh
