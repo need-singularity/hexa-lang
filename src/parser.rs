@@ -1908,8 +1908,23 @@ impl Parser {
                 self.expect(&Token::RParen)?;
                 Ok(Expr::Resume(Box::new(val)))
             }
+            // try { ... } catch e { ... } as expression — returns last value of block
+            Token::Try => self.parse_try_expr(),
             other => Err(self.error(format!("unexpected token in expression: {:?}", other))),
         }
+    }
+
+    fn parse_try_expr(&mut self) -> Result<Expr, HexaError> {
+        self.advance(); // consume 'try'
+        let try_block = self.parse_block()?;
+        self.skip_newlines();
+        match self.peek() {
+            Token::Catch | Token::Recover => { self.advance(); }
+            _ => return Err(self.error(format!("expected 'catch' or 'recover' after try block, got {:?}", self.peek()))),
+        }
+        let err_name = self.expect_ident()?;
+        let catch_block = self.parse_block()?;
+        Ok(Expr::TryCatch(try_block, err_name, catch_block))
     }
 
     // ── Algebraic effects parsing ────────────────────────────

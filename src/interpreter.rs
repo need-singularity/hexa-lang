@@ -398,44 +398,73 @@ impl Interpreter {
                         }
                     }
                     Expr::Index(arr_expr, idx_expr) => {
+                        // Collect index chain: a[b][c][d] = val
+                        // => root_name, indices = [b_val, c_val, d_val]
+                        let mut indices = Vec::new();
+                        let mut current = &*arr_expr;
                         let idx_val = self.eval_expr(idx_expr)?;
-                        if let Expr::Ident(name) = arr_expr.as_ref() {
-                            match &idx_val {
-                                Value::Str(key) => {
-                                    // Map string-key assignment: m["key"] = val
-                                    if let Some(Value::Map(mut map)) = self.env.get(name) {
-                                        map.insert(key.clone(), val);
-                                        self.env.set(name, Value::Map(map));
-                                    } else {
-                                        return Err(self.type_err("string index assignment requires map".into()));
-                                    }
-                                }
-                                Value::Int(raw_idx) => {
-                                    let raw_idx = *raw_idx;
-                                    if let Some(Value::Array(mut arr)) = self.env.get(name) {
-                                        let idx = if raw_idx < 0 {
-                                            let pos = arr.len() as i64 + raw_idx;
-                                            if pos < 0 {
-                                                return Err(self.runtime_err(format!(
-                                                    "negative index {} out of bounds (len {})", raw_idx, arr.len()
-                                                )));
+                        indices.push(idx_val);
+
+                        while let Expr::Index(inner, inner_idx) = &**current {
+                            let iv = self.eval_expr(inner_idx)?;
+                            indices.push(iv);
+                            current = inner;
+                        }
+                        indices.reverse();
+
+                        if let Expr::Ident(name) = &**current {
+                            if let Some(mut root) = self.env.get(name) {
+                                // Navigate to the nested container and set the value
+                                fn set_nested(container: &mut Value, indices: &[Value], val: Value) -> Result<(), String> {
+                                    if indices.len() == 1 {
+                                        match (&mut *container, &indices[0]) {
+                                            (Value::Map(map), Value::Str(key)) => {
+                                                map.insert(key.clone(), val);
+                                                Ok(())
                                             }
-                                            pos as usize
-                                        } else {
-                                            raw_idx as usize
-                                        };
-                                        if idx >= arr.len() {
-                                            return Err(self.runtime_err(format!(
-                                                "index {} out of bounds (len {})", raw_idx, arr.len()
-                                            )));
+                                            (Value::Array(arr), Value::Int(idx)) => {
+                                                let i = if *idx < 0 {
+                                                    let pos = arr.len() as i64 + *idx;
+                                                    if pos < 0 { return Err(format!("index {} out of bounds (len {})", idx, arr.len())); }
+                                                    pos as usize
+                                                } else {
+                                                    *idx as usize
+                                                };
+                                                if i >= arr.len() {
+                                                    return Err(format!("index {} out of bounds (len {})", idx, arr.len()));
+                                                }
+                                                arr[i] = val;
+                                                Ok(())
+                                            }
+                                            _ => Err("invalid index type for assignment".into()),
                                         }
-                                        arr[idx] = val;
-                                        self.env.set(name, Value::Array(arr));
                                     } else {
-                                        return Err(self.type_err("integer index assignment requires array".into()));
+                                        let next = match (container, &indices[0]) {
+                                            (Value::Map(map), Value::Str(key)) => {
+                                                map.get_mut(key).ok_or_else(|| format!("key '{}' not found", key))?
+                                            }
+                                            (Value::Array(arr), Value::Int(idx)) => {
+                                                let i = if *idx < 0 {
+                                                    let pos = arr.len() as i64 + *idx;
+                                                    if pos < 0 { return Err(format!("index {} out of bounds (len {})", idx, arr.len())); }
+                                                    pos as usize
+                                                } else {
+                                                    *idx as usize
+                                                };
+                                                if i >= arr.len() {
+                                                    return Err(format!("index {} out of bounds (len {})", idx, arr.len()));
+                                                }
+                                                &mut arr[i]
+                                            }
+                                            _ => return Err("invalid index type for nested access".into()),
+                                        };
+                                        set_nested(next, &indices[1..], val)
                                     }
                                 }
-                                _ => return Err(self.type_err("index must be an integer or string".into())),
+                                set_nested(&mut root, &indices, val).map_err(|e| self.runtime_err(e))?;
+                                self.env.set(name, root);
+                            } else {
+                                return Err(self.runtime_err(format!("undefined variable: {}", name)));
                             }
                         } else {
                             return Err(self.runtime_err("complex index assignment not supported".into()));
@@ -1186,6 +1215,10 @@ impl Interpreter {
             Expr::StringLit(s) => Ok(Value::Str(s.clone())),
             Expr::CharLit(c) => Ok(Value::Char(*c)),
             Expr::Ident(name) => {
+                // Fast path: check fn_cache first (O(1) HashMap vs O(n) scope walk)
+                if let Some(val) = self.fn_cache.get(name) {
+                    return Ok(val.clone());
+                }
                 // Check ownership state before access
                 {
                     use crate::env::OwnershipState;
@@ -1819,6 +1852,50 @@ impl Interpreter {
             Expr::Template(nodes) => {
                 crate::std_web_template::render_template(self, nodes)
                     .map(Value::Str)
+            }
+            Expr::TryCatch(try_block, err_name, catch_block) => {
+                // try-expression: evaluate try block, on error evaluate catch block
+                let had_throw = self.throw_value.take();
+                self.env.push_scope();
+                let mut result = Value::Void;
+                let mut caught = false;
+                for s in try_block {
+                    match self.exec_stmt(s) {
+                        Ok(v) => {
+                            result = v;
+                            if self.throw_value.is_some() {
+                                caught = true;
+                                break;
+                            }
+                            if self.return_value.is_some() {
+                                self.env.pop_scope();
+                                return Ok(Value::Void);
+                            }
+                        }
+                        Err(e) => {
+                            self.throw_value = Some(Value::Error(e.message.clone()));
+                            caught = true;
+                            break;
+                        }
+                    }
+                }
+                self.env.pop_scope();
+                if caught {
+                    let err_val = self.throw_value.take().unwrap_or(Value::Error("unknown error".into()));
+                    self.env.push_scope();
+                    self.env.define(err_name, err_val);
+                    for s in catch_block {
+                        result = self.exec_stmt(s)?;
+                        if self.return_value.is_some() || self.throw_value.is_some() {
+                            self.env.pop_scope();
+                            return Ok(result);
+                        }
+                    }
+                    self.env.pop_scope();
+                } else if had_throw.is_some() {
+                    self.throw_value = had_throw;
+                }
+                Ok(result)
             }
         }
     }
@@ -4039,6 +4116,20 @@ impl Interpreter {
                         Ok(Value::Str(cstr.to_string_lossy().into_owned()))
                     }
                     _ => Err(self.type_err("from_cstring() requires pointer argument".into())),
+                }
+            }
+            "from_cstring_n" => {
+                // from_cstring_n(ptr, len) -> String (reads exactly len bytes from pointer)
+                if args.len() < 2 { return Err(self.type_err("from_cstring_n() requires (ptr, len)".into())); }
+                match (&args[0], &args[1]) {
+                    (Value::Pointer(addr), Value::Int(len)) => {
+                        if *addr == 0 || *len <= 0 {
+                            return Ok(Value::Str(String::new()));
+                        }
+                        let slice = unsafe { std::slice::from_raw_parts(*addr as *const u8, *len as usize) };
+                        Ok(Value::Str(String::from_utf8_lossy(slice).into_owned()))
+                    }
+                    _ => Err(self.type_err("from_cstring_n() requires (pointer, int)".into())),
                 }
             }
             "ptr_null" => {

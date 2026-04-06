@@ -92,6 +92,9 @@ pub struct Chunk {
     pub local_count: usize,
     /// Interned strings (global/function/builtin names) referenced by OpCode u32 indices.
     pub string_pool: Vec<String>,
+    /// Reverse map for O(1) intern lookup (name → string_pool index).
+    #[allow(dead_code)]
+    intern_map: HashMap<String, u32>,
 }
 
 impl Chunk {
@@ -102,19 +105,19 @@ impl Chunk {
             functions: HashMap::new(),
             local_count: 0,
             string_pool: Vec::new(),
+            intern_map: HashMap::new(),
         }
     }
 
     /// Intern a name into the string pool, returning its u32 index.
-    /// Deduplicates on insertion.
+    /// O(1) via HashMap reverse lookup (was O(n) linear scan).
     pub fn intern(&mut self, name: &str) -> u32 {
-        for (i, existing) in self.string_pool.iter().enumerate() {
-            if existing == name {
-                return i as u32;
-            }
+        if let Some(&idx) = self.intern_map.get(name) {
+            return idx;
         }
         let idx = self.string_pool.len() as u32;
         self.string_pool.push(name.to_string());
+        self.intern_map.insert(name.to_string(), idx);
         idx
     }
 
@@ -793,7 +796,8 @@ impl Compiler {
             | Expr::Wildcard | Expr::ArrayPattern(_, _) | Expr::Own(_) | Expr::MoveExpr(_) | Expr::Borrow(_)
             | Expr::Await(_) | Expr::MacroInvoc(_) | Expr::Comptime(_)
             | Expr::HandleWith(_, _) | Expr::EffectCall(_, _, _) | Expr::Resume(_)
-            | Expr::DynCast(_, _) | Expr::Yield(_) | Expr::Template(_) => {
+            | Expr::DynCast(_, _) | Expr::Yield(_) | Expr::Template(_)
+            | Expr::TryCatch(_, _, _) => {
                 chunk.emit(OpCode::Void);
                 Ok(())
             }
