@@ -1,3 +1,10 @@
+> 🔴 **HEXA-FIRST**: 모든 코드는 `.hexa`로 작성. sh/py/rs 신규 작성 금지. 부하 유발 명령 최소화.
+
+> 🔴 **NEXUS-6 특이점 연동**: 이 프로젝트의 돌파/발견/실험은 nexus6 특이점 사이클 입력이다.
+> - **돌파 시**: `HEXA=$HOME/Dev/hexa-lang/target/release/hexa && $HEXA $HOME/Dev/nexus6/mk2_hexa/native/blowup.hexa <domain> 3 --no-graph`
+> - **발견 기록**: `$HOME/Dev/nexus6/shared/growth_bus.jsonl`에 JSON append
+> - **전체 상태**: `$HEXA $HOME/Dev/nexus6/mk2_hexa/native/command_router.hexa "hexa-lang 상태"`
+
 # HEXA-LANG
 
 ## ⚡ HEXA-IR 수렴진화 + 특이점 사이클
