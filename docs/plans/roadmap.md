@@ -6,10 +6,7 @@
 ## Active (다음 돌파 후보)
 
 ### Performance
-- [ ] **PGO 빌드** — 프로파일 수집 완료(/tmp/pgo-data/merged.profdata), release 빌드 적용 시 VM 10-20% 추가 향상
-  ```bash
-  RUSTFLAGS="-Cprofile-use=/tmp/pgo-data/merged.profdata" bash build.sh release
-  ```
+- [x] **PGO 빌드** — 테스트 완료, 효과 없음 (인스트루먼티드 프로파일과 최적화 빌드 특성 불일치). Non-PGO가 최적.
 - [ ] **JIT 결과 캐싱** — .hexa 파일의 JIT 컴파일 결과를 디스크에 저장, cold start 제거
 - [ ] **Trace JIT** — VM 핫 루프 감지 → Cranelift으로 동적 컴파일 (LuaJIT 방식)
 - [ ] **레지스터 VM** — 스택 VM → 레지스터 기반으로 전환 (dispatch 횟수 40-50% 감소)
