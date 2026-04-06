@@ -500,6 +500,16 @@ impl TypeChecker {
                     .unwrap_or(CheckType::Unknown);
                 self.define(&decl.name, CheckType::Fn(param_types, Box::new(ret)));
             }
+            Stmt::Extern(decl) => {
+                // Register extern function in type scope so calls are recognized
+                let param_types: Vec<CheckType> = decl.params.iter()
+                    .map(|p| CheckType::from_annotation(&p.typ))
+                    .collect();
+                let ret = decl.ret_type.as_ref()
+                    .map(|t| CheckType::from_annotation(t))
+                    .unwrap_or(CheckType::Void);
+                self.define(&decl.name, CheckType::Fn(param_types, Box::new(ret)));
+            }
             // Part B token-only keywords: skip for now
             Stmt::TypeAlias(..) | Stmt::AtomicLet(..) | Stmt::Panic(..) | Stmt::Theorem(..) | Stmt::Break | Stmt::Continue => {}
         }

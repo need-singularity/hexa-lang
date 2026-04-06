@@ -855,6 +855,7 @@ impl VM {
                     #[cfg(not(target_arch = "wasm32"))]
                     Value::AsyncFuture(_) => "future",
                     Value::Atomic(_) => "atomic",
+                    Value::Pointer(_) => "pointer",
                 };
                 Ok(Value::Str(type_name.to_string()))
             }

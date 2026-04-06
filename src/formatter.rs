@@ -274,6 +274,14 @@ fn format_stmt(stmt: &Stmt, indent: usize) -> String {
         }
         Stmt::Break => format!("{}break", prefix),
         Stmt::Continue => format!("{}continue", prefix),
+        Stmt::Extern(decl) => {
+            let params: Vec<String> = decl.params.iter()
+                .map(|p| format!("{}: {}", p.name, p.typ))
+                .collect();
+            let ret = decl.ret_type.as_deref().map(|r| format!(" -> {}", r)).unwrap_or_default();
+            let link = decl.link_lib.as_deref().map(|l| format!("@link(\"{}\") ", l)).unwrap_or_default();
+            format!("{}{}extern fn {}({}){}", prefix, link, decl.name, params.join(", "), ret)
+        }
     }
 }
 

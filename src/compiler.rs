@@ -500,6 +500,15 @@ impl Compiler {
             | Stmt::Scope(_) | Stmt::ProofBlock(..)
             | Stmt::AtomicLet(..) | Stmt::Panic(..) | Stmt::Theorem(..)
             | Stmt::Break | Stmt::Continue => Ok(()),
+            Stmt::Extern(_) => {
+                // VM does not support extern FFI; signal compile failure so tiered
+                // execution falls through to the interpreter which handles FFI.
+                Err(crate::error::HexaError {
+                    class: crate::error::ErrorClass::Runtime,
+                    message: "extern FFI not supported in VM".into(),
+                    line: 0, col: 0, hint: None,
+                })
+            }
         }
     }
 

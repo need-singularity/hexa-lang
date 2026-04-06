@@ -67,6 +67,22 @@ fn jit_err(msg: String) -> HexaError {
     }
 }
 
+/// Collect all extern function declarations from a list of statements.
+pub fn collect_extern_decls(stmts: &[Stmt]) -> Vec<crate::ast::ExternFnDecl> {
+    stmts.iter().filter_map(|s| {
+        if let Stmt::Extern(decl) = s { Some(decl.clone()) } else { None }
+    }).collect()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+extern "C" {
+    fn dlopen(filename: *const std::ffi::c_char, flags: std::ffi::c_int) -> *mut std::ffi::c_void;
+    fn dlsym(handle: *mut std::ffi::c_void, symbol: *const std::ffi::c_char) -> *mut std::ffi::c_void;
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+const RTLD_LAZY: std::ffi::c_int = 0x1;
+
 /// Information about a JIT-compiled function.
 struct JitFuncInfo {
     id: FuncId,
@@ -152,6 +168,7 @@ fn can_jit_stmt(stmt: &Stmt) -> bool {
         Stmt::TraitDecl(..) | Stmt::Static(..) |
         Stmt::Scope(..) | Stmt::ProofBlock(..)
         | Stmt::TypeAlias(..) | Stmt::AtomicLet(..) | Stmt::Panic(..) | Stmt::Theorem(..) | Stmt::Break | Stmt::Continue => false,
+        Stmt::Extern(_) => true,
     }
 }
 
@@ -219,7 +236,7 @@ pub struct JitCompiler {
 }
 
 impl JitCompiler {
-    pub fn new() -> Result<Self, HexaError> {
+    pub fn new(extern_decls: &[crate::ast::ExternFnDecl]) -> Result<Self, HexaError> {
         let mut flag_builder = settings::builder();
         flag_builder
             .set("use_colocated_libcalls", "false")
@@ -261,6 +278,40 @@ impl JitCompiler {
         builder.symbol("hexa_alloc", hexa_alloc as *const u8);
         builder.symbol("hexa_free", hexa_free as *const u8);
         builder.symbol("hexa_bounds_check", hexa_bounds_check as *const u8);
+
+        // Register extern FFI symbols via dlopen/dlsym before builder is consumed.
+        #[cfg(not(target_arch = "wasm32"))]
+        for decl in extern_decls {
+            let handle = if matches!(decl.link_lib.as_deref(), None | Some("c") | Some("libc") | Some("System")) {
+                // RTLD_DEFAULT: search all loaded libraries (macOS: -2)
+                (-2isize) as *mut std::ffi::c_void
+            } else {
+                let lib_name = decl.link_lib.as_ref().unwrap();
+                let lib_cstr = std::ffi::CString::new(lib_name.as_str())
+                    .map_err(|_| jit_err(format!("invalid lib name: {}", lib_name)))?;
+                let h = unsafe { dlopen(lib_cstr.as_ptr(), RTLD_LAZY) };
+                if h.is_null() {
+                    // Try with lib prefix and .dylib/.so suffix
+                    let alt = format!("lib{}.dylib", lib_name);
+                    let alt_cstr = std::ffi::CString::new(alt.as_str())
+                        .map_err(|_| jit_err(format!("invalid lib name: {}", lib_name)))?;
+                    let h2 = unsafe { dlopen(alt_cstr.as_ptr(), RTLD_LAZY) };
+                    if h2.is_null() {
+                        return Err(jit_err(format!("cannot load library '{}'", lib_name)));
+                    }
+                    h2
+                } else {
+                    h
+                }
+            };
+            let sym_cstr = std::ffi::CString::new(decl.name.as_str())
+                .map_err(|_| jit_err(format!("invalid symbol name: {}", decl.name)))?;
+            let sym_ptr = unsafe { dlsym(handle, sym_cstr.as_ptr()) };
+            if sym_ptr.is_null() {
+                return Err(jit_err(format!("symbol '{}' not found", decl.name)));
+            }
+            builder.symbol(&decl.name, sym_ptr as *const u8);
+        }
 
         let mut module = JITModule::new(builder);
 
@@ -340,6 +391,19 @@ impl JitCompiler {
             if let Stmt::FnDecl(decl) = stmt {
                 self.declare_function(decl)?;
             }
+            if let Stmt::Extern(decl) = stmt {
+                // Declare extern function: all params as I64, optional I64 return.
+                let mut sig = self.module.make_signature();
+                for _ in &decl.params {
+                    sig.params.push(AbiParam::new(I64));
+                }
+                if decl.ret_type.is_some() {
+                    sig.returns.push(AbiParam::new(I64));
+                }
+                let func_id = self.module.declare_function(&decl.name, Linkage::Import, &sig)
+                    .map_err(|e| jit_err(format!("declare extern '{}': {}", decl.name, e)))?;
+                self.functions.insert(decl.name.clone(), JitFuncInfo { id: func_id, param_count: decl.params.len() });
+            }
         }
 
         // Declare impl methods as functions with mangled names: Type__method.
@@ -405,7 +469,7 @@ impl JitCompiler {
         // Collect top-level non-declaration statements.
         let top_stmts: Vec<&Stmt> = stmts
             .iter()
-            .filter(|s| !matches!(s, Stmt::FnDecl(_) | Stmt::StructDecl(_) | Stmt::EnumDecl(_) | Stmt::ImplBlock(_)))
+            .filter(|s| !matches!(s, Stmt::FnDecl(_) | Stmt::StructDecl(_) | Stmt::EnumDecl(_) | Stmt::ImplBlock(_) | Stmt::Extern(_)))
             .collect();
 
         // Compile the top-level as a special "__hexa_main__" function with no params.
@@ -1337,7 +1401,7 @@ impl<'a> FuncTranslator<'a> {
                     Ok(None)
                 }
             }
-            Stmt::FnDecl(_) | Stmt::StructDecl(_) | Stmt::EnumDecl(_) | Stmt::ImplBlock(_) => {
+            Stmt::FnDecl(_) | Stmt::StructDecl(_) | Stmt::EnumDecl(_) | Stmt::ImplBlock(_) | Stmt::Extern(_) => {
                 // Already handled at top level.
                 Ok(None)
             }
@@ -1971,7 +2035,7 @@ mod tests {
     fn jit_run(src: &str) -> i64 {
         let tokens = Lexer::new(src).tokenize().unwrap();
         let stmts = Parser::new(tokens).parse().unwrap();
-        let mut jit = JitCompiler::new().unwrap();
+        let mut jit = JitCompiler::new(&[]).unwrap();
         jit.compile_and_run(&stmts).unwrap()
     }
 

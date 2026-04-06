@@ -98,6 +98,14 @@ pub struct Interpreter {
     /// Optional debug hook for DAP debugger integration.
     #[cfg(not(target_arch = "wasm32"))]
     pub debug_hook: Option<Arc<Mutex<crate::debugger::DebugHook>>>,
+    /// Registered extern function declarations (name -> ExternFnDecl).
+    extern_fns: HashMap<String, crate::ast::ExternFnDecl>,
+    /// Loaded shared libraries: lib_path -> handle (dlopen result).
+    #[cfg(not(target_arch = "wasm32"))]
+    loaded_libs: HashMap<String, *mut std::ffi::c_void>,
+    /// Resolved extern symbols: fn_name -> symbol address.
+    #[cfg(not(target_arch = "wasm32"))]
+    extern_symbols: HashMap<String, *mut std::ffi::c_void>,
 }
 
 /// Stored data for a loaded/declared module.
@@ -151,6 +159,11 @@ impl Interpreter {
             fn_cache: HashMap::new(),
             #[cfg(not(target_arch = "wasm32"))]
             debug_hook: None,
+            extern_fns: HashMap::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            loaded_libs: HashMap::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            extern_symbols: HashMap::new(),
         }
     }
 
@@ -1127,6 +1140,14 @@ impl Interpreter {
             }
             Stmt::Continue => {
                 Err(self.runtime_err(CONTINUE_SENTINEL.into()))
+            }
+            Stmt::Extern(decl) => {
+                // Register the extern function and create a builtin binding
+                let fn_name = decl.name.clone();
+                let builtin_name = format!("__extern_{}", fn_name);
+                self.extern_fns.insert(fn_name.clone(), decl.clone());
+                self.env.define(&fn_name, Value::BuiltinFn(builtin_name));
+                Ok(Value::Void)
             }
             // All Stmt variants are covered above; this arm is intentionally suppressed.
             #[allow(unreachable_patterns)]
@@ -2740,6 +2761,7 @@ impl Interpreter {
                         #[cfg(not(target_arch = "wasm32"))]
                         Value::AsyncFuture(_) => "future",
                         Value::Atomic(_) => "atomic",
+                        Value::Pointer(_) => "pointer",
                     }
                     .to_string(),
                 ))
@@ -2919,7 +2941,7 @@ impl Interpreter {
                     _ => Err(self.type_err("has_key() requires (map, string)".into())),
                 }
             }
-            "to_string" => {
+            "to_string" | "str" => {
                 if args.is_empty() { return Err(self.type_err("to_string() requires 1 argument".into())); }
                 Ok(Value::Str(format!("{}", args[0])))
             }
@@ -3874,6 +3896,105 @@ impl Interpreter {
                     Err(e) => Ok(Value::Error(format!("read_stdin error: {}", e))),
                 }
             }
+            // ── Pointer/FFI helper builtins ────────────────────────
+            "cstring" => {
+                // cstring("hello") -> Pointer to a CString (leaked, caller must free)
+                if args.is_empty() { return Err(self.type_err("cstring() requires 1 string argument".into())); }
+                match &args[0] {
+                    Value::Str(s) => {
+                        let cs = std::ffi::CString::new(s.as_bytes())
+                            .map_err(|e| self.runtime_err(format!("cstring: {}", e)))?;
+                        let ptr = cs.into_raw() as u64;
+                        Ok(Value::Pointer(ptr))
+                    }
+                    _ => Err(self.type_err("cstring() requires string argument".into())),
+                }
+            }
+            "from_cstring" => {
+                // from_cstring(ptr) -> String (reads C string from pointer)
+                if args.is_empty() { return Err(self.type_err("from_cstring() requires 1 pointer argument".into())); }
+                match &args[0] {
+                    Value::Pointer(addr) => {
+                        if *addr == 0 {
+                            return Ok(Value::Str(String::new()));
+                        }
+                        let cstr = unsafe { std::ffi::CStr::from_ptr(*addr as *const std::ffi::c_char) };
+                        Ok(Value::Str(cstr.to_string_lossy().into_owned()))
+                    }
+                    _ => Err(self.type_err("from_cstring() requires pointer argument".into())),
+                }
+            }
+            "ptr_null" => {
+                Ok(Value::Pointer(0))
+            }
+            "ptr_addr" => {
+                // ptr_addr(ptr) -> Int (address as integer)
+                if args.is_empty() { return Err(self.type_err("ptr_addr() requires 1 argument".into())); }
+                match &args[0] {
+                    Value::Pointer(addr) => Ok(Value::Int(*addr as i64)),
+                    _ => Err(self.type_err("ptr_addr() requires pointer argument".into())),
+                }
+            }
+            "deref" => {
+                // deref(ptr) -> Int (reads i64 from pointer address)
+                if args.is_empty() { return Err(self.type_err("deref() requires 1 pointer argument".into())); }
+                match &args[0] {
+                    Value::Pointer(addr) => {
+                        if *addr == 0 {
+                            return Err(self.runtime_err("deref: null pointer dereference".into()));
+                        }
+                        let val = unsafe { *((*addr) as *const i64) };
+                        Ok(Value::Int(val))
+                    }
+                    _ => Err(self.type_err("deref() requires pointer argument".into())),
+                }
+            }
+            "alloc_raw" => {
+                // alloc_raw(size) -> Pointer (allocate raw memory)
+                if args.is_empty() { return Err(self.type_err("alloc_raw() requires 1 int argument".into())); }
+                match &args[0] {
+                    Value::Int(size) => {
+                        if *size <= 0 {
+                            return Err(self.runtime_err("alloc_raw: size must be positive".into()));
+                        }
+                        let layout = std::alloc::Layout::from_size_align(*size as usize, 8)
+                            .map_err(|e| self.runtime_err(format!("alloc_raw: {}", e)))?;
+                        let ptr = unsafe { std::alloc::alloc(layout) };
+                        if ptr.is_null() {
+                            Err(self.runtime_err("alloc_raw: allocation failed".into()))
+                        } else {
+                            Ok(Value::Pointer(ptr as u64))
+                        }
+                    }
+                    _ => Err(self.type_err("alloc_raw() requires int argument".into())),
+                }
+            }
+            "free_raw" => {
+                // free_raw(ptr, size) -> Void (free raw memory)
+                if args.len() < 2 { return Err(self.type_err("free_raw() requires 2 arguments (ptr, size)".into())); }
+                match (&args[0], &args[1]) {
+                    (Value::Pointer(addr), Value::Int(size)) => {
+                        if *addr == 0 {
+                            return Ok(Value::Void); // freeing null is a no-op
+                        }
+                        let layout = std::alloc::Layout::from_size_align(*size as usize, 8)
+                            .map_err(|e| self.runtime_err(format!("free_raw: {}", e)))?;
+                        unsafe { std::alloc::dealloc(*addr as *mut u8, layout); }
+                        Ok(Value::Void)
+                    }
+                    _ => Err(self.type_err("free_raw() requires (pointer, int) arguments".into())),
+                }
+            }
+            _ if name.starts_with("__extern_") => {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    return Err(self.runtime_err("extern FFI is not supported on WASM".into()));
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    self.call_extern_fn(name, args)
+                }
+            }
             _ => Err(HexaError {
                 class: ErrorClass::Name,
                 message: format!("unknown builtin: {}", name),
@@ -3882,6 +4003,183 @@ impl Interpreter {
                 hint: None,
             }),
         }
+    }
+
+    // ── Extern FFI (dlopen/dlsym) ────────────────────────────
+
+    /// Convert a hexa Value to an i64 for C ABI calling convention.
+    fn value_to_c_arg(val: &Value) -> i64 {
+        match val {
+            Value::Int(n) => *n,
+            Value::Float(f) => f.to_bits() as i64,
+            Value::Bool(b) => *b as i64,
+            Value::Char(c) => *c as i64,
+            Value::Byte(b) => *b as i64,
+            Value::Pointer(addr) => *addr as i64,
+            Value::Str(s) => {
+                // Auto-convert strings to CString pointers for convenience
+                let cs = std::ffi::CString::new(s.as_bytes()).unwrap_or_default();
+                cs.into_raw() as i64
+            }
+            _ => 0,
+        }
+    }
+
+    /// Convert a C return value (i64) back to a hexa Value based on declared return type.
+    fn c_ret_to_value(raw: i64, ret_type: &Option<String>) -> Value {
+        match ret_type.as_deref() {
+            Some("Int") | Some("int") => Value::Int(raw),
+            Some("Float") | Some("float") => Value::Float(f64::from_bits(raw as u64)),
+            Some("Bool") | Some("bool") => Value::Bool(raw != 0),
+            Some("Void") | Some("void") | None => Value::Void,
+            Some(t) if t.starts_with('*') => Value::Pointer(raw as u64),
+            _ => Value::Int(raw),
+        }
+    }
+
+    /// Resolve an extern symbol using dlopen/dlsym. Caches both lib handles and symbols.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn resolve_extern_symbol(&mut self, fn_name: &str) -> Result<*mut std::ffi::c_void, HexaError> {
+        // Check cache first
+        if let Some(sym) = self.extern_symbols.get(fn_name) {
+            return Ok(*sym);
+        }
+
+        let decl = self.extern_fns.get(fn_name)
+            .ok_or_else(|| self.runtime_err(format!("extern fn '{}' not registered", fn_name)))?
+            .clone();
+
+        extern "C" {
+            fn dlopen(filename: *const std::ffi::c_char, flags: std::ffi::c_int) -> *mut std::ffi::c_void;
+            fn dlsym(handle: *mut std::ffi::c_void, symbol: *const std::ffi::c_char) -> *mut std::ffi::c_void;
+            fn dlerror() -> *const std::ffi::c_char;
+        }
+
+        const RTLD_LAZY: std::ffi::c_int = 0x1;
+        const RTLD_DEFAULT: *mut std::ffi::c_void = std::ptr::null_mut();  // macOS: search default symbol table
+
+        // Determine library handle
+        let handle = if let Some(ref lib_name) = decl.link_lib {
+            if lib_name == "c" || lib_name == "libc" || lib_name == "System" {
+                // libc/System — use default handle (null on macOS = RTLD_DEFAULT)
+                RTLD_DEFAULT
+            } else {
+                // Check cache
+                if let Some(h) = self.loaded_libs.get(lib_name) {
+                    *h
+                } else {
+                    // Try multiple paths
+                    let paths = vec![
+                        lib_name.clone(),
+                        format!("lib{}.dylib", lib_name),
+                        format!("lib{}.so", lib_name),
+                        format!("/usr/lib/lib{}.dylib", lib_name),
+                        format!("/usr/local/lib/lib{}.dylib", lib_name),
+                        format!("/System/Library/Frameworks/{}.framework/{}", lib_name, lib_name),
+                    ];
+                    let mut loaded = std::ptr::null_mut();
+                    for path in &paths {
+                        let cpath = std::ffi::CString::new(path.as_bytes())
+                            .map_err(|e| self.runtime_err(format!("invalid lib path: {}", e)))?;
+                        let h = unsafe { dlopen(cpath.as_ptr(), RTLD_LAZY) };
+                        if !h.is_null() {
+                            loaded = h;
+                            break;
+                        }
+                    }
+                    if loaded.is_null() {
+                        let err = unsafe {
+                            let e = dlerror();
+                            if e.is_null() { "unknown error".to_string() }
+                            else { std::ffi::CStr::from_ptr(e).to_string_lossy().into_owned() }
+                        };
+                        return Err(self.runtime_err(format!("dlopen failed for '{}': {}", lib_name, err)));
+                    }
+                    self.loaded_libs.insert(lib_name.clone(), loaded);
+                    loaded
+                }
+            }
+        } else {
+            RTLD_DEFAULT
+        };
+
+        // Resolve symbol
+        let csym = std::ffi::CString::new(fn_name.as_bytes())
+            .map_err(|e| self.runtime_err(format!("invalid symbol name: {}", e)))?;
+
+        // Clear any previous error
+        unsafe { dlerror(); }
+
+        let sym = if handle == RTLD_DEFAULT {
+            // On macOS, RTLD_DEFAULT is defined differently. Use a special constant.
+            // macOS: RTLD_DEFAULT = -2isize as *mut c_void
+            let macos_rtld_default = -2isize as *mut std::ffi::c_void;
+            unsafe { dlsym(macos_rtld_default, csym.as_ptr()) }
+        } else {
+            unsafe { dlsym(handle, csym.as_ptr()) }
+        };
+
+        if sym.is_null() {
+            let err = unsafe {
+                let e = dlerror();
+                if e.is_null() { "symbol not found".to_string() }
+                else { std::ffi::CStr::from_ptr(e).to_string_lossy().into_owned() }
+            };
+            return Err(self.runtime_err(format!("dlsym failed for '{}': {}", fn_name, err)));
+        }
+
+        self.extern_symbols.insert(fn_name.to_string(), sym);
+        Ok(sym)
+    }
+
+    /// Call an extern function via FFI. Dispatches based on argument count (0-6).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn call_extern_fn(&mut self, builtin_name: &str, args: Vec<Value>) -> Result<Value, HexaError> {
+        let fn_name = &builtin_name["__extern_".len()..];
+
+        let ret_type = self.extern_fns.get(fn_name)
+            .map(|d| d.ret_type.clone())
+            .unwrap_or(None);
+
+        let sym = self.resolve_extern_symbol(fn_name)?;
+
+        // Convert args to i64 values for C ABI
+        let c_args: Vec<i64> = args.iter().map(Self::value_to_c_arg).collect();
+
+        // Call with appropriate arity using transmute
+        let raw_ret: i64 = match c_args.len() {
+            0 => {
+                let f: extern "C" fn() -> i64 = unsafe { std::mem::transmute(sym) };
+                f()
+            }
+            1 => {
+                let f: extern "C" fn(i64) -> i64 = unsafe { std::mem::transmute(sym) };
+                f(c_args[0])
+            }
+            2 => {
+                let f: extern "C" fn(i64, i64) -> i64 = unsafe { std::mem::transmute(sym) };
+                f(c_args[0], c_args[1])
+            }
+            3 => {
+                let f: extern "C" fn(i64, i64, i64) -> i64 = unsafe { std::mem::transmute(sym) };
+                f(c_args[0], c_args[1], c_args[2])
+            }
+            4 => {
+                let f: extern "C" fn(i64, i64, i64, i64) -> i64 = unsafe { std::mem::transmute(sym) };
+                f(c_args[0], c_args[1], c_args[2], c_args[3])
+            }
+            5 => {
+                let f: extern "C" fn(i64, i64, i64, i64, i64) -> i64 = unsafe { std::mem::transmute(sym) };
+                f(c_args[0], c_args[1], c_args[2], c_args[3], c_args[4])
+            }
+            6 => {
+                let f: extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64 = unsafe { std::mem::transmute(sym) };
+                f(c_args[0], c_args[1], c_args[2], c_args[3], c_args[4], c_args[5])
+            }
+            n => return Err(self.runtime_err(format!("extern fn '{}': too many arguments ({}, max 6)", fn_name, n))),
+        };
+
+        Ok(Self::c_ret_to_value(raw_ret, &ret_type))
     }
 
     // ── Helpers ──────────────────────────────────────────────
@@ -4470,6 +4768,7 @@ impl Interpreter {
             #[cfg(not(target_arch = "wasm32"))]
             Value::AsyncFuture(_) => "future".to_string(),
             Value::Atomic(_) => "atomic".to_string(),
+            Value::Pointer(_) => "pointer".to_string(),
         }
     }
 

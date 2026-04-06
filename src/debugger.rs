@@ -271,6 +271,7 @@ fn value_type_name(val: &Value) -> String {
         Value::EffectRequest(_) => "effect_request".into(),
         Value::TraitObject(to) => format!("dyn {}", to.trait_name),
         Value::Atomic(_) => "atomic".into(),
+        Value::Pointer(addr) => format!("<ptr 0x{:x}>", addr),
     }
 }
 

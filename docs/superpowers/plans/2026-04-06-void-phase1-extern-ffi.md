@@ -683,11 +683,17 @@ git commit -m "test: PTY management via pure hexa extern FFI"
 
 ---
 
-## Phase 1 Success Criteria
+## Phase 1 Success Criteria — ALL PASSED (2026-04-06)
 
-1. `extern fn` keyword parses correctly
-2. `@link("lib")` attribute resolves system libraries
-3. libc functions callable from hexa (getpid, strlen, malloc, free, etc.)
-4. PTY open/fork/read/write works via pure hexa extern FFI
-5. Both interpreter and JIT modes work
-6. No new Rust dependencies added to Cargo.toml
+1. ✅ `extern fn` keyword parses correctly
+2. ✅ `@link("lib")` attribute resolves system libraries
+3. ✅ libc functions callable from hexa (getpid, strlen, malloc, free, etc.)
+4. ✅ PTY open/fork/read/write works via pure hexa extern FFI
+5. ✅ Both interpreter and JIT modes work
+6. ✅ No new Rust dependencies added to Cargo.toml
+
+### 추가 수정 사항
+- `interpreter.rs`: `env.set()` → `env.define()` (신규 변수 등록 버그 수정)
+- `compiler.rs`: VM에서 extern 감지 시 컴파일 에러 → interpreter fallback
+- `env.rs`: `str`, `cstring`, `from_cstring`, `ptr_null`, `ptr_addr`, `deref` 빌트인 등록
+- `interpreter.rs`: `str` → `to_string` 별칭 추가

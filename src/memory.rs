@@ -825,6 +825,7 @@ pub fn estimate_value_size(val: &crate::env::Value) -> usize {
         #[cfg(not(target_arch = "wasm32"))]
         Value::AsyncFuture(_) => 32,
         Value::Atomic(_) => 16,
+        Value::Pointer(_) => 8,
     }
 }
 
@@ -853,6 +854,7 @@ pub fn classify_region(val: &crate::env::Value) -> MemRegion {
         #[cfg(not(target_arch = "wasm32"))]
         Value::AsyncFuture(_) => MemRegion::Heap,
         Value::Atomic(_) => MemRegion::Heap,
+        Value::Pointer(_) => MemRegion::Stack,
     }
 }
 

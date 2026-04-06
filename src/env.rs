@@ -321,6 +321,13 @@ impl Env {
         env.define("nexus6_lenses", Value::BuiltinFn("nexus6_lenses".into()));
         env.define("nexus6_consensus", Value::BuiltinFn("nexus6_consensus".into()));
         env.define("nexus6_n6_check", Value::BuiltinFn("nexus6_n6_check".into()));
+        // FFI helper builtins (extern fn support)
+        env.define("str", Value::BuiltinFn("str".into()));
+        env.define("cstring", Value::BuiltinFn("cstring".into()));
+        env.define("from_cstring", Value::BuiltinFn("from_cstring".into()));
+        env.define("ptr_null", Value::BuiltinFn("ptr_null".into()));
+        env.define("ptr_addr", Value::BuiltinFn("ptr_addr".into()));
+        env.define("deref", Value::BuiltinFn("deref".into()));
         // Process/IO builtins (std::process, std::io)
         env.define("exec", Value::BuiltinFn("exec".into()));
         env.define("exec_with_status", Value::BuiltinFn("exec_with_status".into()));
