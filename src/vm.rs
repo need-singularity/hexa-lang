@@ -156,17 +156,6 @@ impl VM {
                 }
             };
         }
-        macro_rules! pop2_fast {
-            ($self:expr) => {{
-                let len = $self.stack.len();
-                if len < 2 {
-                    return Err(runtime_err("stack underflow".into()));
-                }
-                let b = $self.stack.pop().unwrap();
-                let a = $self.stack.pop().unwrap();
-                (a, b)
-            }};
-        }
         // In-place Int binary op: avoids pop+push, modifies stack top directly
         macro_rules! int_binop_inplace {
             ($self:expr, $op:ident, $fallback:ident) => {{

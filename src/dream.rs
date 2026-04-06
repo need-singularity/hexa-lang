@@ -646,7 +646,6 @@ fn evaluate_fitness(source: &str, expected_output: &str) -> Fitness {
 
     // Run in a separate thread with limited stack to catch stack overflow safely
     let stmts = parsed.stmts.clone();
-    let spans = parsed.spans.clone();
     let output_buf = Arc::new(Mutex::new(String::new()));
     let output_buf2 = output_buf.clone();
 
