@@ -203,7 +203,7 @@ fn builtin_io_buffered_reader(interp: &mut Interpreter, args: Vec<Value>) -> Res
     handle.insert("_type".into(), Value::Str("buffered_reader".into()));
     handle.insert("_id".into(), Value::Int(id as i64));
     handle.insert("path".into(), Value::Str(path.to_string()));
-    Ok(Value::Map(handle))
+    Ok(Value::Map(Box::new(handle)))
 }
 
 // ── io_reader_next(reader: map) -> string | void ──

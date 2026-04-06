@@ -5,6 +5,14 @@ use std::sync::{Arc, Mutex};
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::mpsc;
 
+/// Inner data for TraitObject variant (boxed to reduce Value enum size).
+#[derive(Debug, Clone)]
+pub struct TraitObjectInner {
+    pub value: Box<Value>,
+    pub trait_name: String,
+    pub type_name: String,
+}
+
 #[derive(Debug, Clone)]
 pub enum Value {
     Int(i64),
@@ -16,14 +24,14 @@ pub enum Value {
     Void,
     Array(Vec<Value>),
     Tuple(Vec<Value>),
-    Fn(String, Vec<String>, Arc<Vec<crate::ast::Stmt>>), // name, param_names, body
+    Fn(Box<(String, Vec<String>, Arc<Vec<crate::ast::Stmt>>)>), // name, param_names, body
     BuiltinFn(String),  // name of builtin
     Struct(String, Box<HashMap<String, Value>>),  // name, fields (boxed for size)
-    Lambda(Vec<String>, Arc<Vec<crate::ast::Stmt>>, Vec<(String, Value)>), // params, body, captured env
-    Map(HashMap<String, Value>),  // key-value map
+    Lambda(Box<(Vec<String>, Arc<Vec<crate::ast::Stmt>>, Vec<(String, Value)>)>), // params, body, captured env
+    Map(Box<HashMap<String, Value>>),  // key-value map
     Error(String),  // error value for try/catch
-    EnumVariant(String, String, Option<Box<Value>>),  // enum_name, variant_name, data
-    Intent(HashMap<String, Value>),  // consciousness experiment declaration
+    EnumVariant(Box<(String, String, Option<Box<Value>>)>),  // enum_name, variant_name, data
+    Intent(Box<HashMap<String, Value>>),  // consciousness experiment declaration
     #[cfg(not(target_arch = "wasm32"))]
     Sender(Arc<Mutex<mpsc::Sender<Value>>>),    // channel sender
     #[cfg(not(target_arch = "wasm32"))]
@@ -37,13 +45,9 @@ pub enum Value {
     #[cfg(not(target_arch = "wasm32"))]
     TcpStream(Arc<Mutex<std::net::TcpStream>>),        // TCP connection (client or accepted)
     /// Algebraic effect request — propagated up the call stack to be caught by a handler.
-    EffectRequest(String, String, Vec<Value>),  // effect_name, op_name, args
+    EffectRequest(Box<(String, String, Vec<Value>)>),  // effect_name, op_name, args
     /// Trait object — wraps a value with its vtable key for dynamic dispatch.
-    TraitObject {
-        value: Box<Value>,
-        trait_name: String,
-        type_name: String,
-    },
+    TraitObject(Box<TraitObjectInner>),
     /// Atomic value for lock-free concurrent access across green threads.
     Atomic(std::sync::Arc<crate::atomic_ops::AtomicValue>),
 }
@@ -68,7 +72,7 @@ impl std::fmt::Display for Value {
             Value::Void => write!(f, "void"),
             Value::Array(a) => write!(f, "[{}]", a.iter().map(|v| format!("{}", v)).collect::<Vec<_>>().join(", ")),
             Value::Tuple(t) => write!(f, "({})", t.iter().map(|v| format!("{}", v)).collect::<Vec<_>>().join(", ")),
-            Value::Fn(name, ..) => write!(f, "<fn {}>", name),
+            Value::Fn(inner) => write!(f, "<fn {}>", inner.0),
             Value::BuiltinFn(name) => write!(f, "<builtin {}>", name),
             Value::Struct(name, fields) => {
                 write!(f, "{} {{ ", name)?;
@@ -96,7 +100,8 @@ impl std::fmt::Display for Value {
                 write!(f, "}}")
             }
             Value::Error(msg) => write!(f, "Error({})", msg),
-            Value::EnumVariant(enum_name, variant, data) => {
+            Value::EnumVariant(inner) => {
+                let (enum_name, variant, data) = inner.as_ref();
                 match data {
                     Some(d) => write!(f, "{}::{}({})", enum_name, variant, d),
                     None => write!(f, "{}::{}", enum_name, variant),
@@ -129,9 +134,9 @@ impl std::fmt::Display for Value {
             Value::TcpListener(_) => write!(f, "<tcp-listener>"),
             #[cfg(not(target_arch = "wasm32"))]
             Value::TcpStream(_) => write!(f, "<tcp-stream>"),
-            Value::EffectRequest(effect, op, _) => write!(f, "<effect {}.{}>", effect, op),
-            Value::TraitObject { value, trait_name, type_name } => {
-                write!(f, "<dyn {} ({}: {})>", trait_name, type_name, value)
+            Value::EffectRequest(inner) => write!(f, "<effect {}.{}>", inner.0, inner.1),
+            Value::TraitObject(inner) => {
+                write!(f, "<dyn {} ({}: {})>", inner.trait_name, inner.type_name, inner.value)
             }
             Value::Atomic(av) => write!(f, "{}", av.load()),
         }
@@ -224,7 +229,7 @@ impl Env {
         env.define("clock", Value::BuiltinFn("clock".into()));
         // Built-in Option/Result constructors
         env.define("Some", Value::BuiltinFn("Some".into()));
-        env.define("None", Value::EnumVariant("Option".into(), "None".into(), None));
+        env.define("None", Value::EnumVariant(Box::new(("Option".into(), "None".into(), None))));
         env.define("Ok", Value::BuiltinFn("Ok".into()));
         env.define("Err", Value::BuiltinFn("Err".into()));
         // Concurrency builtins

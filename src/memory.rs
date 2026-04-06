@@ -802,13 +802,13 @@ pub fn estimate_value_size(val: &crate::env::Value) -> usize {
         Value::Str(s) => 24 + s.len(), // String header + data
         Value::Array(a) => 24 + a.len() * 16, // Vec header + per-element estimate
         Value::Tuple(t) => 24 + t.len() * 16,
-        Value::Fn(..) => 64,
+        Value::Fn(_) => 64,
         Value::BuiltinFn(_) => 24,
         Value::Struct(_, fields) => 48 + fields.len() * 40,
-        Value::Lambda(_, _, captures) => 64 + captures.len() * 40,
+        Value::Lambda(lam) => 64 + lam.2.len() * 40,
         Value::Map(m) => 48 + m.len() * 40,
         Value::Error(msg) => 24 + msg.len(),
-        Value::EnumVariant(_, _, data) => 48 + data.as_ref().map(|d| estimate_value_size(d)).unwrap_or(0),
+        Value::EnumVariant(ev) => 48 + ev.2.as_ref().map(|d| estimate_value_size(d)).unwrap_or(0),
         Value::Intent(fields) => 48 + fields.len() * 40,
         #[cfg(not(target_arch = "wasm32"))]
         Value::Sender(_) => 32,
@@ -820,8 +820,8 @@ pub fn estimate_value_size(val: &crate::env::Value) -> usize {
         Value::TcpListener(_) => 32,
         #[cfg(not(target_arch = "wasm32"))]
         Value::TcpStream(_) => 32,
-        Value::EffectRequest(_, _, args) => 48 + args.len() * 16,
-        Value::TraitObject { value, .. } => 48 + estimate_value_size(value),
+        Value::EffectRequest(er) => 48 + er.2.len() * 16,
+        Value::TraitObject(to) => 48 + estimate_value_size(&to.value),
         #[cfg(not(target_arch = "wasm32"))]
         Value::AsyncFuture(_) => 32,
         Value::Atomic(_) => 16,
@@ -838,7 +838,7 @@ pub fn classify_region(val: &crate::env::Value) -> MemRegion {
 
         // Dynamic objects → Heap
         Value::Array(_) | Value::Struct(_, _) | Value::Map(_) |
-        Value::Lambda(_, _, _) | Value::Fn(_, _, _) |
+        Value::Lambda(_) | Value::Fn(_) |
         Value::Set(_) | Value::Intent(_) |
         Value::Future(_) => MemRegion::Heap,
         #[cfg(not(target_arch = "wasm32"))]
@@ -848,8 +848,8 @@ pub fn classify_region(val: &crate::env::Value) -> MemRegion {
 
         // Small/temporary → Arena
         Value::Str(_) | Value::Tuple(_) | Value::BuiltinFn(_) |
-        Value::Error(_) | Value::EnumVariant(_, _, _) |
-        Value::EffectRequest(_, _, _) | Value::TraitObject { .. } => MemRegion::Arena,
+        Value::Error(_) | Value::EnumVariant(_) |
+        Value::EffectRequest(_) | Value::TraitObject(_) => MemRegion::Arena,
         #[cfg(not(target_arch = "wasm32"))]
         Value::AsyncFuture(_) => MemRegion::Heap,
         Value::Atomic(_) => MemRegion::Heap,
@@ -995,7 +995,7 @@ mod tests {
         assert_eq!(classify_region(&Value::Float(3.14)), MemRegion::Stack);
         assert_eq!(classify_region(&Value::Bool(true)), MemRegion::Stack);
         assert_eq!(classify_region(&Value::Array(vec![])), MemRegion::Heap);
-        assert_eq!(classify_region(&Value::Map(HashMap::new())), MemRegion::Heap);
+        assert_eq!(classify_region(&Value::Map(Box::new(HashMap::new()))), MemRegion::Heap);
         assert_eq!(classify_region(&Value::Str("hello".into())), MemRegion::Arena);
     }
 

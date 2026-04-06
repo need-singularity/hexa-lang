@@ -644,14 +644,33 @@ fn evaluate_fitness(source: &str, expected_output: &str) -> Fitness {
         },
     };
 
-    // Capture output
+    // Run in a separate thread with limited stack to catch stack overflow safely
+    let stmts = parsed.stmts.clone();
+    let spans = parsed.spans.clone();
     let output_buf = Arc::new(Mutex::new(String::new()));
-    let mut interp = Interpreter::new();
-    interp.set_output_capture(Some(output_buf.clone()));
+    let output_buf2 = output_buf.clone();
 
     let start = Instant::now();
-    let result = interp.run(&parsed.stmts);
-    let elapsed = start.elapsed().as_secs_f64().max(0.0001); // avoid division by zero
+    let handle = std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024) // 2MB stack limit for mutations
+        .spawn(move || {
+            let mut interp = Interpreter::new();
+            interp.set_output_capture(Some(output_buf2));
+            interp.run(&stmts)
+        });
+    let result = match handle {
+        Ok(h) => h.join().unwrap_or(Err(crate::error::HexaError {
+            class: crate::error::ErrorClass::Runtime,
+            message: "stack overflow in dream mutation".into(),
+            line: 0, col: 0, hint: None,
+        })),
+        Err(_) => Err(crate::error::HexaError {
+            class: crate::error::ErrorClass::Runtime,
+            message: "failed to spawn dream thread".into(),
+            line: 0, col: 0, hint: None,
+        }),
+    };
+    let elapsed = start.elapsed().as_secs_f64().max(0.0001);
 
     let output = output_buf.lock().unwrap().clone();
 

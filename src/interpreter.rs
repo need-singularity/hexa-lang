@@ -422,7 +422,7 @@ impl Interpreter {
                     self.generic_fn_decls.insert(decl.name.clone(), decl.clone());
                     // Also define a placeholder in env so lookups find the name
                     let param_names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
-                    let fn_val = Value::Fn(format!("__generic__{}", decl.name), param_names, Arc::new(decl.body.clone()));
+                    let fn_val = Value::Fn(Box::new((format!("__generic__{}", decl.name), param_names, Arc::new(decl.body.clone()))));
                     self.fn_cache.insert(decl.name.clone(), fn_val.clone());
                     self.env.define(&decl.name, fn_val);
                 } else {
@@ -432,7 +432,7 @@ impl Interpreter {
                     } else {
                         decl.name.clone()
                     };
-                    let fn_val = Value::Fn(internal_name, param_names, Arc::new(decl.body.clone()));
+                    let fn_val = Value::Fn(Box::new((internal_name, param_names, Arc::new(decl.body.clone()))));
                     self.fn_cache.insert(decl.name.clone(), fn_val.clone());
                     self.env.define(&decl.name, fn_val);
                 }
@@ -574,7 +574,7 @@ impl Interpreter {
                     }
                 }
                 // Store as a variable named by the description (or __intent__)
-                let intent_val = Value::Intent(map);
+                let intent_val = Value::Intent(Box::new(map));
                 self.env.define("__intent__", intent_val.clone());
                 Ok(intent_val)
             }
@@ -624,7 +624,7 @@ impl Interpreter {
                 // Also make it callable as a regular function so `const X = factorial(10)` works
                 self.env.define(
                     &decl.name,
-                    Value::Fn(decl.name.clone(), param_names, Arc::new(decl.body.clone())),
+                    Value::Fn(Box::new((decl.name.clone(), param_names, Arc::new(decl.body.clone())))),
                 );
                 Ok(Value::Void)
             }
@@ -680,7 +680,7 @@ impl Interpreter {
                 self.writeln_output(&format!("[evolve] Registered self-modifying fn: {}", decl.name));
                 self.env.define(
                     &decl.name,
-                    Value::Fn(decl.name.clone(), param_names, Arc::new(decl.body.clone())),
+                    Value::Fn(Box::new((decl.name.clone(), param_names, Arc::new(decl.body.clone())))),
                 );
                 Ok(Value::Void)
             }
@@ -941,7 +941,7 @@ impl Interpreter {
                 // We prefix the function name internally to mark it as async
                 self.env.define(
                     &decl.name,
-                    Value::Fn(format!("__async__{}", decl.name), param_names, Arc::new(decl.body.clone())),
+                    Value::Fn(Box::new((format!("__async__{}", decl.name), param_names, Arc::new(decl.body.clone())))),
                 );
                 Ok(Value::Void)
             }
@@ -1205,7 +1205,7 @@ impl Interpreter {
                             } else {
                                 return Err(self.runtime_err("enum variant takes 0 or 1 arguments".into()));
                             };
-                            return Ok(Value::EnumVariant(path_name.clone(), member_name.clone(), data));
+                            return Ok(Value::EnumVariant(Box::new((path_name.clone(), member_name.clone(), data))));
                         }
                     }
                     // Try type methods (associated functions)
@@ -1258,7 +1258,7 @@ impl Interpreter {
                             }
                         })?;
                         // Cache function values only (not mutable bindings)
-                        if matches!(f, Value::Fn(..) | Value::BuiltinFn(_)) {
+                        if matches!(f, Value::Fn(_) | Value::BuiltinFn(_)) {
                             self.fn_cache.insert(fn_name.clone(), f.clone());
                         }
                         f
@@ -1268,7 +1268,8 @@ impl Interpreter {
                         arg_vals.push(self.eval_expr(a)?);
                     }
                     // Inline the common Value::Fn path to avoid call_function dispatch
-                    if let Value::Fn(ref _name, ref params, ref body) = func {
+                    if let Value::Fn(ref fn_inner) = func {
+                        let (ref _name, ref params, ref body) = **fn_inner;
                         if !_name.starts_with("__async__") && !_name.starts_with("__generic__") {
                             if arg_vals.len() != params.len() {
                                 return Err(self.runtime_err(format!(
@@ -1453,7 +1454,7 @@ impl Interpreter {
                     Expr::Block(stmts) => stmts.clone(),
                     other => vec![Stmt::Return(Some(other.clone()))],
                 };
-                Ok(Value::Lambda(param_names, Arc::new(body_stmts), captured))
+                Ok(Value::Lambda(Box::new((param_names, Arc::new(body_stmts), captured))))
             }
             Expr::StructInit(name, field_exprs) => {
                 // Verify struct is defined
@@ -1477,7 +1478,7 @@ impl Interpreter {
                     let val = self.eval_expr(val_expr)?;
                     map.insert(key, val);
                 }
-                Ok(Value::Map(map))
+                Ok(Value::Map(Box::new(map)))
             }
             Expr::EnumPath(enum_name, variant_name, data_expr) => {
                 // Check if it's an enum variant
@@ -1488,7 +1489,7 @@ impl Interpreter {
                             Some(expr) => Some(Box::new(self.eval_expr(expr)?)),
                             None => None,
                         };
-                        return Ok(Value::EnumVariant(enum_name.clone(), variant_name.clone(), data));
+                        return Ok(Value::EnumVariant(Box::new((enum_name.clone(), variant_name.clone(), data))));
                     }
                 }
                 // Check if it's a static/associated method call: Type::method(args)
@@ -1707,11 +1708,11 @@ impl Interpreter {
                         "type {} does not implement trait {}", type_name, trait_name
                     )));
                 }
-                Ok(Value::TraitObject {
+                Ok(Value::TraitObject(Box::new(crate::env::TraitObjectInner {
                     value: Box::new(val),
                     trait_name: trait_name.clone(),
                     type_name,
-                })
+                })))
             }
             Expr::Template(nodes) => {
                 crate::std_web_template::render_template(self, nodes)
@@ -1859,7 +1860,8 @@ impl Interpreter {
     pub fn call_function(&mut self, func: Value, args: Vec<Value>) -> Result<Value, HexaError> {
         match func {
             Value::BuiltinFn(name) => self.call_builtin(&name, args),
-            Value::Fn(ref _name, ref params, ref body) if _name.starts_with("__async__") => {
+            Value::Fn(ref fn_inner) if fn_inner.0.starts_with("__async__") => {
+                let (ref _name, ref params, ref body) = **fn_inner;
                 #[cfg(target_arch = "wasm32")]
                 {
                     return Err(self.runtime_err("async functions are not supported in WASM mode".into()));
@@ -1892,7 +1894,8 @@ impl Interpreter {
                     Ok(Value::AsyncFuture(future))
                 }
             }
-            Value::Fn(ref _name, ref params, ref _body) if _name.starts_with("__generic__") => {
+            Value::Fn(ref fn_inner) if fn_inner.0.starts_with("__generic__") => {
+                let (ref _name, ref params, ref _body) = **fn_inner;
                 // Monomorphization: specialize the generic function for the concrete argument types
                 let base_name = &_name["__generic__".len()..];
                 let concrete_types: Vec<String> = args.iter().map(|v| self.value_type_string(v)).collect();
@@ -1956,7 +1959,7 @@ impl Interpreter {
                     // Create specialized fn value with mangled name
                     let mangled = format!("{}_{}", base_name, concrete_types.join("_"));
                     let param_names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
-                    let specialized = Value::Fn(mangled, param_names, Arc::new(decl.body.clone()));
+                    let specialized = Value::Fn(Box::new((mangled, param_names, Arc::new(decl.body.clone()))));
 
                     // Cache it
                     self.spec_cache.insert(key, specialized.clone());
@@ -1990,7 +1993,8 @@ impl Interpreter {
                 self.env.pop_scope();
                 Ok(result)
             }
-            Value::Fn(_name, params, body) => {
+            Value::Fn(fn_inner) => {
+                let (_name, params, body) = *fn_inner;
                 if args.len() != params.len() {
                     return Err(self.runtime_err(format!(
                         "expected {} arguments, got {}",
@@ -2013,7 +2017,7 @@ impl Interpreter {
                         break;
                     }
                     // Propagate effect requests up the call stack
-                    if matches!(result, Value::EffectRequest(..)) {
+                    if matches!(result, Value::EffectRequest(_)) {
                         break;
                     }
                 }
@@ -2021,7 +2025,8 @@ impl Interpreter {
                 self.in_pure_fn = prev_pure;
                 Ok(result)
             }
-            Value::Lambda(params, body, captured) => {
+            Value::Lambda(lam_inner) => {
+                let (params, body, captured) = *lam_inner;
                 if args.len() != params.len() {
                     return Err(self.runtime_err(format!(
                         "lambda expected {} arguments, got {}",
@@ -2058,7 +2063,8 @@ impl Interpreter {
             Value::Str(s) => self.call_string_method(s, method, args),
             Value::Array(a) => self.call_array_method(a, method, args),
             Value::Map(m) => self.call_map_method(m, method, args),
-            Value::EnumVariant(enum_name, variant, data) => {
+            Value::EnumVariant(ref ev_inner) => {
+                let (ref enum_name, ref variant, ref data) = **ev_inner;
                 self.call_enum_method(enum_name, variant, data.as_ref().map(|b| b.as_ref()), method, args)
             }
             Value::Struct(struct_name, _fields) => {
@@ -2174,9 +2180,9 @@ impl Interpreter {
                     "try_recv" => {
                         let rx = rx.lock().unwrap();
                         match rx.try_recv() {
-                            Ok(val) => Ok(Value::EnumVariant("Option".into(), "Some".into(), Some(Box::new(val)))),
-                            Err(mpsc::TryRecvError::Empty) => Ok(Value::EnumVariant("Option".into(), "None".into(), None)),
-                            Err(mpsc::TryRecvError::Disconnected) => Ok(Value::EnumVariant("Option".into(), "None".into(), None)),
+                            Ok(val) => Ok(Value::EnumVariant(Box::new(("Option".into(), "Some".into(), Some(Box::new(val)))))),
+                            Err(mpsc::TryRecvError::Empty) => Ok(Value::EnumVariant(Box::new(("Option".into(), "None".into(), None)))),
+                            Err(mpsc::TryRecvError::Disconnected) => Ok(Value::EnumVariant(Box::new(("Option".into(), "None".into(), None)))),
                         }
                     }
                     _ => Err(self.runtime_err(format!("no method .{}() on receiver", method))),
@@ -2219,8 +2225,8 @@ impl Interpreter {
                     _ => Err(self.runtime_err(format!("no method .{}() on Future", method))),
                 }
             }
-            Value::TraitObject { value, trait_name, type_name } => {
-                let key = (type_name.clone(), trait_name.clone());
+            Value::TraitObject(ref to_inner) => {
+                let key = (to_inner.type_name.clone(), to_inner.trait_name.clone());
                 let method_def = self.trait_impls.get(&key).and_then(|m| m.get(method)).cloned();
                 if let Some((params, body)) = method_def {
                     if params.is_empty() || params[0] != "self" {
@@ -2235,7 +2241,7 @@ impl Interpreter {
                         )));
                     }
                     self.env.push_scope();
-                    self.env.define("self", *value.clone());
+                    self.env.define("self", *to_inner.value.clone());
                     for (param, arg) in params[1..].iter().zip(args) {
                         self.env.define(param, arg);
                     }
@@ -2251,7 +2257,7 @@ impl Interpreter {
                     Ok(result)
                 } else {
                     Err(self.runtime_err(format!(
-                        "no method .{}() in trait {} for type {}", method, trait_name, type_name
+                        "no method .{}() in trait {} for type {}", method, to_inner.trait_name, to_inner.type_name
                     )))
                 }
             }
@@ -2661,13 +2667,13 @@ impl Interpreter {
                         Value::Void => "void",
                         Value::Array(_) => "array",
                         Value::Tuple(_) => "tuple",
-                        Value::Fn(..) => "fn",
+                        Value::Fn(_) => "fn",
                         Value::BuiltinFn(_) => "builtin",
                         Value::Struct(name, _) => name.as_str(),
-                        Value::Lambda(..) => "lambda",
+                        Value::Lambda(_) => "lambda",
                         Value::Map(_) => "map",
                         Value::Error(_) => "error",
-                        Value::EnumVariant(name, _, _) => name.as_str(),
+                        Value::EnumVariant(ev) => ev.0.as_str(),
                         Value::Intent(_) => "intent",
                         #[cfg(not(target_arch = "wasm32"))]
                         Value::Sender(_) => "sender",
@@ -2679,8 +2685,8 @@ impl Interpreter {
                         Value::TcpListener(_) => "tcp_listener",
                         #[cfg(not(target_arch = "wasm32"))]
                         Value::TcpStream(_) => "tcp_stream",
-                        Value::EffectRequest(_, _, _) => "effect_request",
-                        Value::TraitObject { trait_name, .. } => trait_name.as_str(),
+                        Value::EffectRequest(_) => "effect_request",
+                        Value::TraitObject(to) => to.trait_name.as_str(),
                         #[cfg(not(target_arch = "wasm32"))]
                         Value::AsyncFuture(_) => "future",
                         Value::Atomic(_) => "atomic",
@@ -2894,9 +2900,9 @@ impl Interpreter {
                     Value::Int(n) => Ok(Value::Float(*n as f64)),
                     Value::Str(s) => match s.parse::<f64>() {
                         Ok(f) => Ok(Value::Float(f)),
-                        Err(_) => Ok(Value::EnumVariant("Option".into(), "None".into(), None)),
+                        Err(_) => Ok(Value::EnumVariant(Box::new(("Option".into(), "None".into(), None)))),
                     },
-                    _ => Ok(Value::EnumVariant("Option".into(), "None".into(), None)),
+                    _ => Ok(Value::EnumVariant(Box::new(("Option".into(), "None".into(), None)))),
                 }
             }
             "is_numeric" => {
@@ -3101,15 +3107,15 @@ impl Interpreter {
             // ── Built-in Option/Result constructors ───────────────────
             "Some" => {
                 if args.len() != 1 { return Err(self.type_err("Some() requires 1 argument".into())); }
-                Ok(Value::EnumVariant("Option".into(), "Some".into(), Some(Box::new(args.into_iter().next().unwrap()))))
+                Ok(Value::EnumVariant(Box::new(("Option".into(), "Some".into(), Some(Box::new(args.into_iter().next().unwrap()))))))
             }
             "Ok" => {
                 if args.len() != 1 { return Err(self.type_err("Ok() requires 1 argument".into())); }
-                Ok(Value::EnumVariant("Result".into(), "Ok".into(), Some(Box::new(args.into_iter().next().unwrap()))))
+                Ok(Value::EnumVariant(Box::new(("Result".into(), "Ok".into(), Some(Box::new(args.into_iter().next().unwrap()))))))
             }
             "Err" => {
                 if args.len() != 1 { return Err(self.type_err("Err() requires 1 argument".into())); }
-                Ok(Value::EnumVariant("Result".into(), "Err".into(), Some(Box::new(args.into_iter().next().unwrap()))))
+                Ok(Value::EnumVariant(Box::new(("Result".into(), "Err".into(), Some(Box::new(args.into_iter().next().unwrap()))))))
             }
             // ── Concurrency builtins ──────────────────────────────────
             "channel" => {
@@ -3470,7 +3476,7 @@ impl Interpreter {
                     _ => return Err(self.type_err("tension_link() value must be numeric".into())),
                 };
                 let channel_names = ["tension", "phi", "entropy", "faction", "meta"];
-                Ok(Value::Map(
+                Ok(Value::Map(Box::new(
                     vec![
                         ("target".to_string(), Value::Str(target)),
                         ("channel".to_string(), Value::Str(channel_names[channel].into())),
@@ -3478,7 +3484,7 @@ impl Interpreter {
                         ("value".to_string(), Value::Float(value)),
                         ("sent".to_string(), Value::Bool(true)),
                     ].into_iter().collect()
-                ))
+                )))
             }
             // ── Join named spawn ────────────────────────────────────────
             "join" => {
@@ -3535,7 +3541,7 @@ impl Interpreter {
                 map.insert("total_budget".into(), Value::Int(stats.total_budget as i64));
                 map.insert("total_allocs".into(), Value::Int(stats.total_allocs as i64));
                 map.insert("stack_frames".into(), Value::Int(stats.stack_frame_depth as i64));
-                Ok(Value::Map(map))
+                Ok(Value::Map(Box::new(map)))
             }
             "mem_region" => {
                 if args.is_empty() {
@@ -3559,7 +3565,7 @@ impl Interpreter {
                 map.insert("heap_fraction".into(), Value::Str("1/3".into()));
                 map.insert("arena_fraction".into(), Value::Str("1/6".into()));
                 map.insert("identity".into(), Value::Str("1/2 + 1/3 + 1/6 = 1".into()));
-                Ok(Value::Map(map))
+                Ok(Value::Map(Box::new(map)))
             }
             // ── std::fs builtins ─────────────────────────────────
             "fs_read" | "fs_write" | "fs_append" | "fs_exists" | "fs_remove"
@@ -3718,7 +3724,7 @@ impl Interpreter {
                                 map.insert("stdout".to_string(), Value::Str(String::from_utf8_lossy(&out.stdout).to_string()));
                                 map.insert("stderr".to_string(), Value::Str(String::from_utf8_lossy(&out.stderr).to_string()));
                                 map.insert("status".to_string(), Value::Int(out.status.code().unwrap_or(-1) as i64));
-                                Ok(Value::Map(map))
+                                Ok(Value::Map(Box::new(map)))
                             }
                             Err(e) => Ok(Value::Error(format!("exec_with_status error: {}", e))),
                         }
@@ -3772,7 +3778,8 @@ impl Interpreter {
             // EnumPath: match enum variant, optionally destructure data
             Expr::EnumPath(enum_name, variant_name, binding_expr) => {
                 match val {
-                    Value::EnumVariant(val_enum, val_variant, val_data) => {
+                    Value::EnumVariant(ev_inner) => {
+                        let (val_enum, val_variant, val_data) = ev_inner.as_ref();
                         if val_enum != enum_name || val_variant != variant_name {
                             return Ok(None); // different variant
                         }
@@ -3816,7 +3823,8 @@ impl Interpreter {
                     };
                     if let Some((enum_name, variant_name)) = maybe_ctor {
                         match val {
-                            Value::EnumVariant(val_enum, val_variant, val_data) => {
+                            Value::EnumVariant(ev_inner) => {
+                                let (val_enum, val_variant, val_data) = ev_inner.as_ref();
                                 if val_enum != enum_name || val_variant != variant_name {
                                     return Ok(None);
                                 }
@@ -3859,7 +3867,7 @@ impl Interpreter {
             // Ident pattern: check if it's a known enum constant (like None)
             Expr::Ident(name) => {
                 if let Some(const_val) = self.env.get(name) {
-                    if matches!(&const_val, Value::EnumVariant(..)) {
+                    if matches!(&const_val, Value::EnumVariant(_)) {
                         if Self::values_equal(val, &const_val) {
                             return Ok(Some(vec![]));
                         } else {
@@ -3923,7 +3931,7 @@ impl Interpreter {
                         let param_names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
                         mod_data.pub_bindings.insert(
                             decl.name.clone(),
-                            Value::Fn(decl.name.clone(), param_names, Arc::new(decl.body.clone())),
+                            Value::Fn(Box::new((decl.name.clone(), param_names, Arc::new(decl.body.clone())))),
                         );
                     }
                 }
@@ -4005,7 +4013,7 @@ impl Interpreter {
                         let param_names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
                         mod_data.pub_bindings.insert(
                             decl.name.clone(),
-                            Value::Fn(decl.name.clone(), param_names, Arc::new(decl.body.clone())),
+                            Value::Fn(Box::new((decl.name.clone(), param_names, Arc::new(decl.body.clone())))),
                         );
                     }
                 }
@@ -4144,7 +4152,9 @@ impl Interpreter {
             (Value::Char(x), Value::Char(y)) => x == y,
             (Value::Void, Value::Void) => true,
             (Value::Error(x), Value::Error(y)) => x == y,
-            (Value::EnumVariant(e1, v1, d1), Value::EnumVariant(e2, v2, d2)) => {
+            (Value::EnumVariant(ev1), Value::EnumVariant(ev2)) => {
+                let (e1, v1, d1) = ev1.as_ref();
+                let (e2, v2, d2) = ev2.as_ref();
                 e1 == e2 && v1 == v2 && match (d1, d2) {
                     (Some(a), Some(b)) => Self::values_equal(a, b),
                     (None, None) => true,
@@ -4188,7 +4198,7 @@ impl Interpreter {
                 // Attempt to parse the generated code as statements
                 match self.parse_hexa_source(&code) {
                     Ok(body_stmts) => {
-                        let val = Value::Fn(name.clone(), param_names, Arc::new(body_stmts));
+                        let val = Value::Fn(Box::new((name.clone(), param_names, Arc::new(body_stmts))));
                         self.env.define(name, val.clone());
                         println!("[generate] fn {} — LLM code registered", name);
                         Ok(val)
@@ -4201,7 +4211,7 @@ impl Interpreter {
                                 vec![Expr::StringLit(format!("LLM not available: {}", description))],
                             ))
                         ];
-                        let val = Value::Fn(name.clone(), param_names, Arc::new(fallback_body));
+                        let val = Value::Fn(Box::new((name.clone(), param_names, Arc::new(fallback_body))));
                         self.env.define(name, val.clone());
                         println!("[generate] fn {} — offline fallback (LLM code failed to parse)", name);
                         Ok(val)
@@ -4267,7 +4277,7 @@ impl Interpreter {
                 for s in &stmts {
                     if let Stmt::FnDecl(opt_decl) = s {
                         let param_names: Vec<String> = opt_decl.params.iter().map(|p| p.name.clone()).collect();
-                        let val = Value::Fn(opt_decl.name.clone(), param_names, Arc::new(opt_decl.body.clone()));
+                        let val = Value::Fn(Box::new((opt_decl.name.clone(), param_names, Arc::new(opt_decl.body.clone()))));
                         self.env.define(&opt_decl.name, val);
                         println!("[optimize] fn {} — LLM optimization applied", opt_decl.name);
                         return Ok(Value::Void);
@@ -4295,13 +4305,13 @@ impl Interpreter {
             let param_names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
             self.env.define(
                 &decl.name,
-                Value::Fn(format!("__generic__{}", decl.name), param_names, Arc::new(decl.body.clone())),
+                Value::Fn(Box::new((format!("__generic__{}", decl.name), param_names, Arc::new(decl.body.clone())))),
             );
         } else {
             let param_names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
             self.env.define(
                 &decl.name,
-                Value::Fn(decl.name.clone(), param_names, Arc::new(decl.body.clone())),
+                Value::Fn(Box::new((decl.name.clone(), param_names, Arc::new(decl.body.clone())))),
             );
         }
     }
@@ -4318,13 +4328,13 @@ impl Interpreter {
             Value::Void => "void".to_string(),
             Value::Array(_) => "array".to_string(),
             Value::Tuple(_) => "tuple".to_string(),
-            Value::Fn(..) => "fn".to_string(),
+            Value::Fn(_) => "fn".to_string(),
             Value::BuiltinFn(_) => "builtin".to_string(),
             Value::Struct(name, _) => name.clone(),
-            Value::Lambda(..) => "lambda".to_string(),
+            Value::Lambda(_) => "lambda".to_string(),
             Value::Map(_) => "map".to_string(),
             Value::Error(_) => "error".to_string(),
-            Value::EnumVariant(name, _, _) => name.clone(),
+            Value::EnumVariant(ev) => ev.0.clone(),
             Value::Intent(_) => "intent".to_string(),
             #[cfg(not(target_arch = "wasm32"))]
             Value::Sender(_) => "sender".to_string(),
@@ -4336,8 +4346,8 @@ impl Interpreter {
             Value::TcpListener(_) => "tcp_listener".to_string(),
             #[cfg(not(target_arch = "wasm32"))]
             Value::TcpStream(_) => "tcp_stream".to_string(),
-            Value::EffectRequest(..) => "effect".to_string(),
-            Value::TraitObject { type_name, .. } => type_name.clone(),
+            Value::EffectRequest(_) => "effect".to_string(),
+            Value::TraitObject(to) => to.type_name.clone(),
             #[cfg(not(target_arch = "wasm32"))]
             Value::AsyncFuture(_) => "future".to_string(),
             Value::Atomic(_) => "atomic".to_string(),
@@ -4512,7 +4522,7 @@ impl Interpreter {
             return Ok(self.resume_value.take().unwrap_or(result));
         }
         // No handler found — propagate as EffectRequest
-        Ok(Value::EffectRequest(effect.to_string(), op.to_string(), args))
+        Ok(Value::EffectRequest(Box::new((effect.to_string(), op.to_string(), args))))
     }
 
     /// Evaluate a handle-with expression: handle { body } with { handlers }
@@ -4695,7 +4705,7 @@ fn parse_json_object(input: &str) -> Result<(Value, &str), String> {
     let mut rest = input[1..].trim_start();
     let mut map = std::collections::HashMap::new();
     if rest.starts_with('}') {
-        return Ok((Value::Map(map), &rest[1..]));
+        return Ok((Value::Map(Box::new(map)), &rest[1..]));
     }
     loop {
         rest = rest.trim_start();
@@ -4713,7 +4723,7 @@ fn parse_json_object(input: &str) -> Result<(Value, &str), String> {
         map.insert(key, val);
         rest = after_val.trim_start();
         if rest.starts_with('}') {
-            return Ok((Value::Map(map), &rest[1..]));
+            return Ok((Value::Map(Box::new(map)), &rest[1..]));
         }
         if rest.starts_with(',') {
             rest = &rest[1..];
