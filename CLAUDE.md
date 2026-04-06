@@ -11,7 +11,8 @@
   scripts/singularity_cycle.py    — Python wrapper (전 프로젝트 import 가능)
   사용: CycleEngine::new() → feed() → run_cycle() → report()
 
-[현황] 1791 tests | bench 333x (JIT 0.006s) | Value 32B | 수렴 100% ★
+[현황] 1791 tests | 53.8K LOC | bench 333x (JIT 0.006s) | Value 32B | 수렴 100% ★
+[모듈] LSP 1.7K | JIT 2.3K | VM 1.4K | Package 1.7K | WASM 96 | Interp 7.7K
 
 ⚠ 모든 트러블슈팅 → config/hexa_ir_convergence.json
 ⚠ 모든 창발/n6 발견 → config/emergence_patterns.json

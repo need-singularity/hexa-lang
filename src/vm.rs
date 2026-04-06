@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use crate::compiler::{OpCode, Chunk, CompiledFunction};
 use crate::env::Value;
 use crate::error::{HexaError, ErrorClass};
@@ -47,6 +48,8 @@ pub struct VM {
     global_values: Vec<Value>,
     /// Tracks which global slots are defined.
     global_set: Vec<bool>,
+    /// Output capture buffer: when set, Print/Println write here instead of stdout.
+    output_capture: Option<Arc<Mutex<String>>>,
 }
 
 impl VM {
@@ -68,6 +71,38 @@ impl VM {
             globals,
             global_values: Vec::new(),
             global_set: Vec::new(),
+            output_capture: None,
+        }
+    }
+
+    /// Set an output capture buffer. When set, Print/Println write to this
+    /// buffer instead of stdout.
+    pub fn set_output_capture(&mut self, buf: Option<Arc<Mutex<String>>>) {
+        self.output_capture = buf;
+    }
+
+    /// Write a string to the output (captured buffer or stdout).
+    #[inline]
+    fn write_output(&self, s: &str) {
+        if let Some(ref buf) = self.output_capture {
+            if let Ok(mut b) = buf.lock() {
+                b.push_str(s);
+            }
+        } else {
+            print!("{}", s);
+        }
+    }
+
+    /// Write a string followed by newline to the output.
+    #[inline]
+    fn writeln_output(&self, s: &str) {
+        if let Some(ref buf) = self.output_capture {
+            if let Ok(mut b) = buf.lock() {
+                b.push_str(s);
+                b.push('\n');
+            }
+        } else {
+            println!("{}", s);
         }
     }
 
@@ -606,24 +641,27 @@ impl VM {
                 // Print
                 OpCode::Print(n) => {
                     let start = self.stack.len().saturating_sub(*n);
+                    let mut parts = String::new();
                     for i in start..self.stack.len() {
                         if i > start {
-                            print!(" ");
+                            parts.push(' ');
                         }
-                        print!("{}", self.stack[i]);
+                        parts.push_str(&self.stack[i].to_string());
                     }
+                    self.write_output(&parts);
                     self.stack.truncate(start);
                     self.stack.push(Value::Void);
                 }
                 OpCode::Println(n) => {
                     let start = self.stack.len().saturating_sub(*n);
+                    let mut parts = String::new();
                     for i in start..self.stack.len() {
                         if i > start {
-                            print!(" ");
+                            parts.push(' ');
                         }
-                        print!("{}", self.stack[i]);
+                        parts.push_str(&self.stack[i].to_string());
                     }
-                    println!();
+                    self.writeln_output(&parts);
                     self.stack.truncate(start);
                     self.stack.push(Value::Void);
                 }
