@@ -267,6 +267,18 @@ fn parse_json_array(chars: &[char], mut pos: usize) -> Result<(JsonValue, usize)
 
 // ── LSP Constants ──────────────────────────────────────────────
 
+/// n=6 constants for completion (name, value, description).
+const N6_CONSTANTS: &[(&str, &str, &str)] = &[
+    ("N6_N",    "6",  "n=6 — fundamental constant (base dimension)"),
+    ("N6_SIGMA","12", "σ=12 — sum of divisors of 6: keywords count"),
+    ("N6_TAU",  "4",  "τ=4  — number of divisors of 6: type layers / visibility levels"),
+    ("N6_PHI",  "2",  "φ=2  — Euler totient of 6: pipeline coupling"),
+    ("N6_SOPFR","5",  "sopfr=5 — sum of prime factors of 6 (2+3)"),
+    ("N6_J2",   "24", "J₂=24 — Jordan totient of 6: opcode count"),
+    ("N6_MU",   "1",  "μ=1  — Möbius function of 6"),
+    ("N6_LAMBDA","2", "λ=2  — Liouville function magnitude"),
+];
+
 /// All 53 keywords for completion.
 const KEYWORDS: &[&str] = &[
     "if", "else", "match", "for", "while", "loop",
@@ -362,6 +374,12 @@ fn keyword_doc(kw: &str) -> Option<&'static str> {
         "optimize" => "Optimize function with AI rewrite",
         _ => return None,
     })
+}
+
+fn n6_constant_doc(name: &str) -> Option<String> {
+    N6_CONSTANTS.iter()
+        .find(|(n, _, _)| *n == name)
+        .map(|(n, val, desc)| format!("**n=6 constant** `{} = {}`\n\n{}", n, val, desc))
 }
 
 fn builtin_doc(name: &str) -> Option<&'static str> {
@@ -932,6 +950,20 @@ fn completion_items() -> JsonValue {
         ]));
     }
 
+    // n=6 constants (kind=21 = Constant)
+    for (name, val, desc) in N6_CONSTANTS {
+        items.push(JsonValue::Object(vec![
+            ("label".into(), JsonValue::Str(name.to_string())),
+            ("kind".into(), JsonValue::Number(21.0)),
+            ("detail".into(), JsonValue::Str(format!("n=6 const = {}", val))),
+            ("documentation".into(), JsonValue::Object(vec![
+                ("kind".into(), JsonValue::Str("markdown".into())),
+                ("value".into(), JsonValue::Str(desc.to_string())),
+            ])),
+            ("insertText".into(), JsonValue::Str(val.to_string())),
+        ]));
+    }
+
     JsonValue::Array(items)
 }
 
@@ -997,7 +1029,12 @@ fn handle_hover(source: &str, line: usize, character: usize) -> JsonValue {
         None => return JsonValue::Null,
     };
 
-    // Check keywords first
+    // Check n=6 constants first
+    if let Some(doc) = n6_constant_doc(&word) {
+        return make_hover(&doc);
+    }
+
+    // Check keywords
     if let Some(doc) = keyword_doc(&word) {
         return make_hover(&format!("**keyword** `{}`\n\n{}", word, doc));
     }
@@ -1109,19 +1146,32 @@ fn handle_rename(uri: &str, source: &str, line: usize, character: usize, new_nam
 fn initialize_result() -> JsonValue {
     JsonValue::Object(vec![
         ("capabilities".into(), JsonValue::Object(vec![
-            ("textDocumentSync".into(), JsonValue::Number(1.0)), // Full sync
+            // Full sync (1) + save notifications
+            ("textDocumentSync".into(), JsonValue::Object(vec![
+                ("change".into(), JsonValue::Number(1.0)),  // Full
+                ("save".into(), JsonValue::Object(vec![
+                    ("includeText".into(), JsonValue::Bool(false)),
+                ])),
+                ("openClose".into(), JsonValue::Bool(true)),
+            ])),
             ("completionProvider".into(), JsonValue::Object(vec![
                 ("triggerCharacters".into(), JsonValue::Array(vec![
                     JsonValue::Str(".".into()),
+                    JsonValue::Str("N".into()), // trigger for N6_ prefix
                 ])),
             ])),
             ("definitionProvider".into(), JsonValue::Bool(true)),
             ("hoverProvider".into(), JsonValue::Bool(true)),
             ("renameProvider".into(), JsonValue::Bool(true)),
+            ("diagnosticProvider".into(), JsonValue::Object(vec![
+                ("identifier".into(), JsonValue::Str("hexa".into())),
+                ("interFileDependencies".into(), JsonValue::Bool(false)),
+                ("workspaceDiagnostics".into(), JsonValue::Bool(false)),
+            ])),
         ])),
         ("serverInfo".into(), JsonValue::Object(vec![
             ("name".into(), JsonValue::Str("hexa-lsp".into())),
-            ("version".into(), JsonValue::Str("2.0.0".into())),
+            ("version".into(), JsonValue::Str("2.1.0".into())),
         ])),
     ])
 }
@@ -1195,6 +1245,25 @@ pub fn run_lsp() {
                             let _ = send_message(&mut writer, &notif.to_json());
                         }
                     }
+                }
+            }
+            "textDocument/didSave" => {
+                // On save: re-diagnose using the cached source text and publish.
+                // The client sends the URI; text is already tracked in `docs`.
+                if let Some(td) = params.get("textDocument") {
+                    let uri = td.get("uri").and_then(|u| u.as_str()).unwrap_or("").to_string();
+                    // Some clients include `text` in didSave when includeText=true.
+                    // We accept it but fall back to cached version.
+                    let text_opt = params.get("text").and_then(|t| t.as_str()).map(|s| s.to_string());
+                    let source = if let Some(t) = text_opt {
+                        docs.insert(uri.clone(), t.clone());
+                        t
+                    } else {
+                        docs.get(&uri).cloned().unwrap_or_default()
+                    };
+                    let diags = diagnose(&source);
+                    let notif = diagnostics_to_json(&uri, &diags);
+                    let _ = send_message(&mut writer, &notif.to_json());
                 }
             }
             "textDocument/completion" => {
@@ -1332,12 +1401,50 @@ mod tests {
     fn test_completion_items_count() {
         let items = completion_items();
         if let JsonValue::Array(arr) = items {
-            // 53 keywords + all builtins
+            // 53 keywords + all builtins + n=6 constants
+            let expected = KEYWORDS.len() + BUILTINS.len() + N6_CONSTANTS.len();
             assert!(arr.len() >= 53, "should have at least 53 keyword completions");
-            assert_eq!(arr.len(), KEYWORDS.len() + BUILTINS.len());
+            assert_eq!(arr.len(), expected, "keywords + builtins + n6 constants");
         } else {
             panic!("completion_items should return an array");
         }
+    }
+
+    #[test]
+    fn test_n6_constants_in_completion() {
+        let items = completion_items();
+        if let JsonValue::Array(arr) = items {
+            // All 8 n=6 constants must appear
+            for (name, val, _) in N6_CONSTANTS {
+                let found = arr.iter().any(|item| {
+                    item.get("label").and_then(|l| l.as_str()) == Some(name)
+                    && item.get("insertText").and_then(|t| t.as_str()) == Some(val)
+                });
+                assert!(found, "n=6 constant '{}' should be in completion list", name);
+            }
+        } else {
+            panic!("completion_items should return an array");
+        }
+    }
+
+    #[test]
+    fn test_n6_constants_hover() {
+        // hover on N6_SIGMA should return markdown with sigma info
+        let doc = n6_constant_doc("N6_SIGMA");
+        assert!(doc.is_some(), "N6_SIGMA should have hover doc");
+        let doc_str = doc.unwrap();
+        assert!(doc_str.contains("12"), "sigma hover should mention value 12");
+        assert!(doc_str.contains("σ"), "sigma hover should mention σ");
+    }
+
+    #[test]
+    fn test_initialize_capabilities_save() {
+        let result = initialize_result();
+        let caps = result.get("capabilities").unwrap();
+        let sync = caps.get("textDocumentSync").unwrap();
+        // textDocumentSync is now an object with save field
+        assert!(sync.get("save").is_some(), "should advertise save notifications");
+        assert!(sync.get("change").is_some(), "should have change mode");
     }
 
     #[test]

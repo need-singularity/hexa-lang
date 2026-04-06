@@ -50,6 +50,8 @@ pub enum Value {
     TraitObject(Box<TraitObjectInner>),
     /// Atomic value for lock-free concurrent access across green threads.
     Atomic(std::sync::Arc<crate::atomic_ops::AtomicValue>),
+    /// Raw pointer for extern FFI (C interop).
+    Pointer(u64),
 }
 
 impl Value {
@@ -139,6 +141,7 @@ impl std::fmt::Display for Value {
                 write!(f, "<dyn {} ({}: {})>", inner.trait_name, inner.type_name, inner.value)
             }
             Value::Atomic(av) => write!(f, "{}", av.load()),
+            Value::Pointer(addr) => write!(f, "<ptr 0x{:x}>", addr),
         }
     }
 }
@@ -203,6 +206,17 @@ impl Env {
         env.define("try_float", Value::BuiltinFn("try_float".into()));
         env.define("is_numeric", Value::BuiltinFn("is_numeric".into()));
         env.define("join", Value::BuiltinFn("join".into()));
+        // String builtins (standalone functional form)
+        env.define("split", Value::BuiltinFn("split".into()));
+        env.define("trim", Value::BuiltinFn("trim".into()));
+        env.define("trim_start", Value::BuiltinFn("trim_start".into()));
+        env.define("trim_end", Value::BuiltinFn("trim_end".into()));
+        env.define("starts_with", Value::BuiltinFn("starts_with".into()));
+        env.define("ends_with", Value::BuiltinFn("ends_with".into()));
+        env.define("contains", Value::BuiltinFn("contains".into()));
+        env.define("replace", Value::BuiltinFn("replace".into()));
+        env.define("to_upper", Value::BuiltinFn("to_upper".into()));
+        env.define("to_lower", Value::BuiltinFn("to_lower".into()));
         // Math builtins
         env.define("abs", Value::BuiltinFn("abs".into()));
         env.define("min", Value::BuiltinFn("min".into()));

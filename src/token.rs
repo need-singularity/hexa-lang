@@ -94,6 +94,8 @@ pub enum Token {
     Try, Catch, Throw, Panic, Recover,
     // Group 12: AI (τ=4)
     Intent, Generate, Verify, Optimize,
+    // Group 13: FFI (μ=1)
+    Extern,
 
     // === 24 Operators (J₂=24) ===
     // Arithmetic (n=6): + - * / % **
@@ -190,6 +192,8 @@ pub fn keyword_from_str(s: &str) -> Option<Token> {
         "generate" => Some(Token::Generate),
         "verify" => Some(Token::Verify),
         "optimize" => Some(Token::Optimize),
+        // Group 13: FFI (μ=1)
+        "extern" => Some(Token::Extern),
         // Booleans
         "true" => Some(Token::BoolLit(true)),
         "false" => Some(Token::BoolLit(false)),
@@ -217,8 +221,9 @@ mod tests {
             "macro","derive","where","comptime",
             "try","catch","throw","panic","recover",
             "intent","generate","verify","optimize",
+            "extern",
         ];
-        assert_eq!(keywords.len(), 55);
+        assert_eq!(keywords.len(), 56);
         for kw in &keywords {
             assert!(keyword_from_str(kw).is_some(), "Missing keyword: {}", kw);
         }
@@ -227,8 +232,8 @@ mod tests {
     #[test]
     fn test_keyword_groups_is_12() {
         // σ(6) = 12 keyword groups
-        let group_sizes = [6, 6, 5, 4, 4, 4, 5, 4, 4, 4, 5, 4];
-        assert_eq!(group_sizes.len(), 12); // σ(6)
-        assert_eq!(group_sizes.iter().sum::<usize>(), 55); // σ·τ + sopfr + 1 (dyn)
+        let group_sizes = [6, 6, 5, 4, 4, 4, 5, 4, 4, 4, 5, 4, 1];
+        assert_eq!(group_sizes.len(), 13);
+        assert_eq!(group_sizes.iter().sum::<usize>(), 56);
     }
 }

@@ -156,57 +156,107 @@ pub mod wasm;
 
 /// Run Hexa source code and return (stdout_output, error_or_empty).
 ///
-/// Uses the tree-walk interpreter with a reduced memory budget suitable
-/// for embedded/WASM environments (8 MB).
+/// Uses tiered execution: VM (bytecode) first, falls back to interpreter.
 pub fn run_source(source: &str) -> (String, String) {
     run_source_with_budget(source, 8 * 1024 * 1024)
 }
 
-/// Run Hexa source code with a specific memory budget (in bytes).
-pub fn run_source_with_budget(source: &str, budget: usize) -> (String, String) {
-    // Capture stdout by temporarily replacing the print implementation
-    let output = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-
+/// Run Hexa source with tiered execution, returning (output, error, tier_name).
+/// `tier_name` is "vm" or "interpreter" depending on which tier executed.
+/// Used by the WASM playground to surface execution mode in the UI.
+pub fn run_source_tiered(source: &str, budget: usize) -> (String, String, &'static str) {
     let source_lines: Vec<String> = source.lines().map(String::from).collect();
 
-    // Lex
     let tokens = match lexer::Lexer::new(source).tokenize() {
         Ok(t) => t,
-        Err(e) => return (String::new(), format!("Lexer error: {}", e)),
+        Err(e) => return (String::new(), format!("Lexer error: {}", e), "vm"),
     };
 
-    // Parse
     let result = match parser::Parser::new(tokens).parse_with_spans() {
         Ok(r) => r,
         Err(e) => {
             let msg = format_diagnostic(&e, &source_lines, "<playground>");
-            return (String::new(), msg);
+            return (String::new(), msg, "vm");
         }
     };
 
-    // Type check
     let mut checker = type_checker::TypeChecker::new();
     if let Err(e) = checker.check(&result.stmts, &result.spans) {
         let msg = format_diagnostic(&e, &source_lines, "<playground>");
-        return (String::new(), msg);
+        return (String::new(), msg, "vm");
     }
 
-    // Ownership analysis (compile-time)
     let ownership_errors = ownership::analyze_ownership(&result.stmts, &result.spans);
     if !ownership_errors.is_empty() {
         let first = ownership_errors[0].clone().into_hexa_error();
         let msg = format_diagnostic(&first, &source_lines, "<playground>");
-        return (String::new(), msg);
+        return (String::new(), msg, "vm");
     }
 
-    // Interpret with output capture
+    // Tier 1: VM
+    if let Some((output, error)) = run_via_vm(&result.stmts, budget) {
+        return (output, error, "vm");
+    }
+
+    // Tier 2: Interpreter fallback
+    let (output, error) = run_via_interpreter(&result, source_lines, budget);
+    (output, error, "interpreter")
+}
+
+/// Run Hexa source code with a specific memory budget (in bytes).
+///
+/// Tiered execution strategy:
+///   Tier 1 — VM (bytecode): lex → parse → type check → ownership → compile → VM execute.
+///             Faster for numeric/loop-heavy code; no JIT on WASM.
+///   Tier 2 — Interpreter (tree-walk): fallback if VM compilation fails.
+///
+/// Both tiers capture stdout via an in-memory buffer so output is always returned.
+pub fn run_source_with_budget(source: &str, budget: usize) -> (String, String) {
+    let (output, error, _tier) = run_source_tiered(source, budget);
+    (output, error)
+}
+
+/// Attempt to compile and run via the bytecode VM.
+/// Returns Some((output, error)) if compilation succeeded (even if execution errored).
+/// Returns None if compilation itself failed (triggers Tier-2 fallback).
+fn run_via_vm(stmts: &[ast::Stmt], _budget: usize) -> Option<(String, String)> {
+    let output = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+
+    // Compile to bytecode
+    let mut compiler = compiler::Compiler::new();
+    let chunk = match compiler.compile(stmts) {
+        Ok(c) => c,
+        Err(_) => return None, // fall back to interpreter
+    };
+
+    // Execute on the VM with output capture
+    let mut vm = vm::VM::new();
+    vm.set_output_capture(Some(output.clone()));
+
+    match vm.execute(&chunk) {
+        Ok(_) => {
+            let captured = output.lock().unwrap().clone();
+            Some((captured, String::new()))
+        }
+        Err(e) => {
+            let captured = output.lock().unwrap().clone();
+            Some((captured, format!("Runtime error: {}", e.message)))
+        }
+    }
+}
+
+/// Run via the tree-walk interpreter (Tier-2 fallback).
+fn run_via_interpreter(
+    result: &parser::ParseResult,
+    source_lines: Vec<String>,
+    budget: usize,
+) -> (String, String) {
+    let output = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+
     let mut interp = interpreter::Interpreter::new_with_memory_budget(budget);
     interp.source_lines = source_lines;
     interp.file_name = "<playground>".to_string();
-
-    // Set the output capture buffer
-    let out_clone = output.clone();
-    interp.set_output_capture(Some(out_clone));
+    interp.set_output_capture(Some(output.clone()));
 
     match interp.run_with_spans(&result.stmts, &result.spans) {
         Ok(_) => {
