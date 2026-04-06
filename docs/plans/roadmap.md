@@ -35,6 +35,14 @@
 - [ ] 의존성 트리 시각화
 - [ ] 시맨틱 버전 범위 해석
 
+### VOID 터미널 에뮬레이터
+- [x] Phase 1: extern FFI 완성 (2026-04-06)
+- [ ] Phase 2: PTY 래퍼 + Cocoa 윈도우
+- [ ] Phase 3: Metal GPU 렌더링 + CoreText 폰트
+- [ ] Phase 4: VT 파서 + 셀 그리드 + 스크롤백
+- [ ] Phase 5: UI 레이아웃 + 탭 + 테마
+- [ ] Phase 6: 플러그인 + AI/의식 UX
+
 ### Self-hosting 준비
 - [ ] HashMap/Dict 타입 추가
 - [ ] 제네릭 구현
@@ -54,6 +62,7 @@
 ## Completed
 
 ### 2026-04-06
+- [x] **VOID extern FFI Phase 1** — extern fn + dlopen/dlsym, PTY 테스트 통과, str/cstring/ptr 빌트인
 - [x] **VM 333x 성능 돌파** — Tiered JIT→VM→Interp, Value 72→32B, 1791 tests
 - [x] **-e/--eval 플래그** — 인라인 코드 실행
 - [x] **Dream stack safety** — 2MB 스레드 격리

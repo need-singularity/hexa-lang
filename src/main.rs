@@ -604,7 +604,7 @@ fn run_source_with_dir(source: &str, file_path: &str) {
     // Tier 1: JIT (native code — fastest)
     #[cfg(not(target_arch = "wasm32"))]
     if jit::can_jit(&result.stmts) {
-        if let Ok(mut jit_compiler) = jit::JitCompiler::new() {
+        if let Ok(mut jit_compiler) = jit::JitCompiler::new(&jit::collect_extern_decls(&result.stmts)) {
             match jit_compiler.compile_and_run(&result.stmts) {
                 Ok(r) => { if r != 0 { println!("{}", r); } return; }
                 Err(_) => {} // fall through
@@ -753,7 +753,7 @@ fn run_file_native(path: &str) {
         return;
     }
 
-    let mut jit_compiler = match jit::JitCompiler::new() {
+    let mut jit_compiler = match jit::JitCompiler::new(&jit::collect_extern_decls(&stmts)) {
         Ok(j) => j,
         Err(e) => {
             eprintln!("{}", e);
@@ -1072,7 +1072,7 @@ fib(30)
     let tokens2 = lexer::Lexer::new(fib_src).tokenize().unwrap();
     let stmts2 = parser::Parser::new(tokens2).parse().unwrap();
     let start = Instant::now();
-    let mut jit_compiler = jit::JitCompiler::new().unwrap();
+    let mut jit_compiler = jit::JitCompiler::new(&jit::collect_extern_decls(&stmts2)).unwrap();
     let native_fib = jit_compiler.compile_and_run(&stmts2).unwrap();
     let native_fib_time = start.elapsed();
 

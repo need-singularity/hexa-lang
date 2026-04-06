@@ -13,11 +13,13 @@ pub struct ParseResult {
 pub struct Parser {
     tokens: Vec<Spanned>,
     pos: usize,
+    /// Pending @link("lib") attribute for the next extern fn declaration.
+    pending_link_attr: Option<String>,
 }
 
 impl Parser {
     pub fn new(tokens: Vec<Spanned>) -> Self {
-        Parser { tokens, pos: 0 }
+        Parser { tokens, pos: 0, pending_link_attr: None }
     }
 
     /// Construct from plain tokens (no span info). Convenience for tests.
@@ -25,7 +27,7 @@ impl Parser {
         let spanned = tokens.into_iter()
             .map(|t| Spanned::new(t, 0, 0))
             .collect();
-        Parser { tokens: spanned, pos: 0 }
+        Parser { tokens: spanned, pos: 0, pending_link_attr: None }
     }
 
     // ── Helpers ──────────────────────────────────────────────
@@ -190,6 +192,7 @@ impl Parser {
             Token::Optimize => self.parse_optimize(),
             Token::Comptime => self.parse_comptime_stmt(),
             Token::Effect => self.parse_effect_decl(),
+            Token::Extern => self.parse_extern_fn_decl(),
             Token::Pure => self.parse_pure_fn(vis),
             Token::Ident(ref s) if s == "consciousness" && !matches!(self.peek_ahead(1), Token::ColonColon | Token::Dot | Token::Eq | Token::LParen) => {
                 self.advance(); // consume 'consciousness'
@@ -203,6 +206,19 @@ impl Parser {
                 };
                 let body = self.parse_block()?;
                 Ok(Stmt::ConsciousnessBlock(name, body))
+            }
+            Token::Ident(ref s) if s == "@link" => {
+                self.advance(); // consume '@link'
+                self.expect(&Token::LParen)?;
+                let lib_name = match self.peek().clone() {
+                    Token::StringLit(s) => { self.advance(); s.to_string() }
+                    _ => return Err(self.error("expected string literal after @link(".to_string())),
+                };
+                self.expect(&Token::RParen)?;
+                self.pending_link_attr = Some(lib_name);
+                self.skip_newlines();
+                // Now parse the extern fn that follows
+                return self.parse_stmt();
             }
             Token::Ident(ref s) if s == "@evolve" => {
                 self.advance(); // consume '@evolve'
@@ -1903,6 +1919,57 @@ impl Parser {
         }
         self.expect(&Token::RBrace)?;
         Ok(Stmt::EffectDecl(EffectDecl { name, type_params, operations }))
+    }
+
+    /// Parse `extern fn name(param: Type, ...) -> RetType`
+    /// Optionally preceded by `@link("libname")` attribute.
+    fn parse_extern_fn_decl(&mut self) -> Result<Stmt, HexaError> {
+        self.advance(); // consume 'extern'
+        self.expect(&Token::Fn)?;
+        let name = self.expect_ident()?;
+        self.expect(&Token::LParen)?;
+
+        // Parse extern params with types
+        let mut params = Vec::new();
+        while !matches!(self.peek(), Token::RParen | Token::Eof) {
+            let param_name = self.expect_ident()?;
+            self.expect(&Token::Colon)?;
+            let typ = self.parse_extern_type()?;
+            params.push(crate::ast::ExternParam { name: param_name, typ });
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+            }
+        }
+        self.expect(&Token::RParen)?;
+
+        // Optional return type
+        let ret_type = if matches!(self.peek(), Token::Arrow) {
+            self.advance();
+            Some(self.parse_extern_type()?)
+        } else {
+            None
+        };
+
+        // Check if there's a pending @link attribute
+        let link_lib = self.pending_link_attr.take();
+
+        Ok(Stmt::Extern(crate::ast::ExternFnDecl {
+            name,
+            params,
+            ret_type,
+            link_lib,
+        }))
+    }
+
+    /// Parse a type for extern declarations (supports pointer types like *Void, *Byte, *Int)
+    fn parse_extern_type(&mut self) -> Result<String, HexaError> {
+        if matches!(self.peek(), Token::Star) {
+            self.advance(); // consume '*'
+            let inner = self.expect_ident()?;
+            Ok(format!("*{}", inner))
+        } else {
+            self.expect_ident()
+        }
     }
 
     /// Parse `pure fn name(...) { ... }`

@@ -288,6 +288,6 @@ pub fn lower_stmt_val(ctx: &mut LowerCtx, builder: &mut IrBuilder, stmt: &Stmt) 
             builder.const_i64(0)
         }
 
-        Stmt::Intent(_, _) | Stmt::Verify(_, _) => builder.const_i64(0),
+        Stmt::Intent(_, _) | Stmt::Verify(_, _) | Stmt::Extern(_) => builder.const_i64(0),
     }
 }
