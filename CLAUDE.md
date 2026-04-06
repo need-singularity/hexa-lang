@@ -29,12 +29,17 @@ bash build.sh
 bash build.sh test            # Tests
 ```
 
-## Update History
+## Update History & Roadmap
 ```
 ⚠ 모든 주요 변경/최적화/돌파 → docs/history/ 에 기록
 ⚠ 형식: docs/history/YYYY-MM-DD-제목.md
 ⚠ docs/history/README.md 에 인덱스 추가
 ⚠ 성능 변경 시 → docs/breakthroughs/ 에도 BT 기록
+
+★ 로드맵 자동 갱신 (docs/plans/roadmap.md)
+  - 돌파/개선 완료 시 → Completed 섹션에 [x] 체크 + 날짜
+  - 작업 중 발견한 다음 벡터 → Active 섹션에 [ ] 추가
+  - 명시적 요청 없어도 자동으로 갱신할 것!
 
 [최근]
   2026-04-06  VM 333x 성능 돌파 — Tiered Execution, Value 72→32B, 1791 tests
