@@ -57,5 +57,10 @@
 - [x] **VM 333x 성능 돌파** — Tiered JIT→VM→Interp, Value 72→32B, 1791 tests
 - [x] **-e/--eval 플래그** — 인라인 코드 실행
 - [x] **Dream stack safety** — 2MB 스레드 격리
+- [x] **break/continue** — 루프 제어문 추가 (self-hosting 차단 해제)
+- [x] **VS Code 확장 LSP 클라이언트** — extension.js + package.json 완성
+- [x] **WASM VM tiered** — 이미 구현됨 확인 (run_source_tiered)
+- [x] **제네릭** — 이미 구현됨 확인 (type erasure + monomorphization)
+- [x] **hexa install** — add의 별칭으로 추가
 - [x] **PGO 빌드 검증** — 효과 없음 확인, Non-PGO 최적
 - [x] **docs/history 체계 구축** — 자동 갱신 규칙

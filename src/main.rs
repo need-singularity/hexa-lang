@@ -290,7 +290,7 @@ fn main() {
             }
             "run" => cmd_run(&args),
             "test" => cmd_test(),
-            "add" => {
+            "add" | "install" => {
                 if args.len() < 3 {
                     eprintln!("Usage: hexa add <pkg>");
                     std::process::exit(1);
