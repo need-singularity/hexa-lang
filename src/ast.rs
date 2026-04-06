@@ -39,6 +39,8 @@ pub enum Expr {
     Yield(Box<Expr>),                            // yield expr — generator yield
     /// template { ... } — HTML template block
     Template(Vec<TemplateNode>),
+    /// try { expr } catch e { fallback } — try as expression (returns last value)
+    TryCatch(Block, String, Block),
 }
 
 /// A node in a template tree — represents an HTML element, text, or control flow.

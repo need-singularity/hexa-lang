@@ -419,6 +419,7 @@ fn format_expr(expr: &Expr) -> String {
         Expr::DynCast(trait_name, expr) => format!("dyn {}({})", trait_name, format_expr(expr)),
         Expr::Yield(inner) => format!("yield {}", format_expr(inner)),
         Expr::Template(_) => "<template>".to_string(),
+        Expr::TryCatch(_, var, _) => format!("try {{ ... }} catch {} {{ ... }}", var),
     }
 }
 
