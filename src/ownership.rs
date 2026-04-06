@@ -778,7 +778,7 @@ impl OwnershipAnalyzer {
             }
             // Literals and other terminal expressions: no variables to check.
             Expr::IntLit(_) | Expr::FloatLit(_) | Expr::BoolLit(_)
-            | Expr::StringLit(_) | Expr::CharLit(_) | Expr::Wildcard
+            | Expr::StringLit(_) | Expr::CharLit(_) | Expr::Wildcard | Expr::ArrayPattern(_, _)
             | Expr::EnumPath(_, _, _) | Expr::MacroInvoc(_) | Expr::Comptime(_)
             | Expr::HandleWith(_, _) | Expr::EffectCall(_, _, _) | Expr::Resume(_)
             | Expr::Template(_) => {}

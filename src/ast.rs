@@ -23,6 +23,7 @@ pub enum Expr {
     MapLit(Vec<(Expr, Expr)>),  // { key: val, ... }
     EnumPath(String, String, Option<Box<Expr>>),  // EnumName::Variant(data)
     Wildcard,  // _ pattern (catch-all)
+    ArrayPattern(Vec<Expr>, Option<String>),  // [a, b, ...rest] pattern for match
     Own(Box<Expr>),     // own expr — create owned value
     MoveExpr(Box<Expr>),  // move x — transfer ownership
     Borrow(Box<Expr>),  // borrow x — read-only reference

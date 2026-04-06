@@ -41,7 +41,7 @@ impl CheckType {
             "void" => CheckType::Void,
             "any" => CheckType::Any,
             "array" => CheckType::Array(Box::new(CheckType::Unknown)),
-            "map" => CheckType::Map,
+            "map" | "Map" => CheckType::Map,
             "Phi_positive" => CheckType::PhiPositive,
             "Tension_bounded" => CheckType::TensionBounded,
             other => {
@@ -337,6 +337,10 @@ impl TypeChecker {
     fn check_stmt(&mut self, stmt: &Stmt, line: usize, col: usize) {
         match stmt {
             Stmt::Let(name, typ_ann, expr, _vis) => {
+                // Check the expression for internal consistency (e.g., array homogeneity)
+                if let Some(ref e) = expr {
+                    self.check_expr(e, line, col);
+                }
                 let value_type = expr.as_ref()
                     .map(|e| self.infer_expr(e))
                     .unwrap_or(CheckType::Void);
@@ -632,6 +636,23 @@ impl TypeChecker {
                 }
             }
             Expr::Array(items) => {
+                if items.len() > 1 {
+                    let first_type = self.infer_expr(&items[0]);
+                    for (i, item) in items.iter().enumerate().skip(1) {
+                        self.check_expr(item, line, col);
+                        let item_type = self.infer_expr(item);
+                        // Allow int<->float coercion in arrays
+                        let compatible = first_type.accepts(&item_type)
+                            || (matches!((&first_type, &item_type), (CheckType::Int, CheckType::Float) | (CheckType::Float, CheckType::Int)));
+                        if !compatible {
+                            self.emit_error(line, col, format!(
+                                "array element type mismatch: element 0 is {} but element {} is {}",
+                                first_type.display_name(), i, item_type.display_name()
+                            ));
+                            return;
+                        }
+                    }
+                }
                 for item in items {
                     self.check_expr(item, line, col);
                 }
@@ -683,6 +704,16 @@ impl TypeChecker {
                     // Arithmetic: promote to float if either is float
                     BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div
                     | BinOp::Rem | BinOp::Pow => {
+                        // Array + Array = Array (concatenation)
+                        if let (CheckType::Array(inner), BinOp::Add) = (&l, op) {
+                            if matches!(&r, CheckType::Array(_)) {
+                                return CheckType::Array(inner.clone());
+                            }
+                        }
+                        // Array * Int = Array (repetition)
+                        if matches!((&l, op, &r), (CheckType::Array(_), BinOp::Mul, CheckType::Int)) {
+                            return l;
+                        }
                         // String + String = String
                         if matches!((&l, op), (CheckType::Str, BinOp::Add)) {
                             return CheckType::Str;
@@ -712,7 +743,14 @@ impl TypeChecker {
                 if items.is_empty() {
                     CheckType::Array(Box::new(CheckType::Unknown))
                 } else {
-                    let elem = self.infer_expr(&items[0]);
+                    let mut elem = self.infer_expr(&items[0]);
+                    // Promote to float if any element is float (int->float coercion)
+                    for item in items.iter().skip(1) {
+                        let t = self.infer_expr(item);
+                        if matches!((&elem, &t), (CheckType::Int, CheckType::Float)) {
+                            elem = CheckType::Float;
+                        }
+                    }
                     CheckType::Array(Box::new(elem))
                 }
             }
@@ -1086,5 +1124,36 @@ mod tests {
     #[test]
     fn test_phi_positive_let_string_err() {
         assert!(check_source("let x: Phi_positive = \"hello\"").is_err());
+    }
+
+    // ── Array type safety tests ───────────────────────────────
+
+    #[test]
+    fn test_heterogeneous_array_error() {
+        let result = check_source("let x = [1, \"two\", 3.0]");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.message.contains("array element type mismatch"));
+    }
+
+    #[test]
+    fn test_homogeneous_array_ok() {
+        assert!(check_source("let x = [1, 2, 3]").is_ok());
+        assert!(check_source("let x = [\"a\", \"b\"]").is_ok());
+    }
+
+    #[test]
+    fn test_empty_array_ok() {
+        assert!(check_source("let x = []").is_ok());
+    }
+
+    #[test]
+    fn test_int_float_coercion_array() {
+        assert!(check_source("let x = [1, 2.0]").is_ok());
+    }
+
+    #[test]
+    fn test_array_concat_type() {
+        assert!(check_source("let a = [1, 2]\nlet b = [3, 4]\nlet c = a + b").is_ok());
     }
 }
