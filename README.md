@@ -321,6 +321,24 @@ self/bootstrap.hexa    1912 LOC   Full pipeline (lex→parse→check→compile)
 
 ## Package Manager
 
+### hx — System Package Manager
+
+Install and run HEXA ecosystem packages with a single command. No brew, no cargo, no approval process.
+
+```bash
+# Install hx (one-liner)
+curl -sL https://raw.githubusercontent.com/need-singularity/hexa-lang/main/pkg/install.sh | bash
+
+# Use
+hx search                         # List available packages
+hx install airgenome              # Install a package
+hx run airgenome                  # Run it (or just: airgenome)
+hx list                           # Show installed
+hx remove airgenome               # Uninstall
+```
+
+### Project-level (hexa.toml)
+
 ```bash
 hexa init my-project              # Create new project (hexa.toml)
 hexa add json@^1.2.3              # Add dependency with semver
@@ -412,6 +430,10 @@ hexa-lang/
 │   ├── paper/                PLDI paper outline
 │   ├── community/            Contributing + Code of Conduct
 │   └── publish-checklist.md  crates.io publishing guide
+├── pkg/                      hx system package manager
+│   ├── hx                    CLI (pure shell, zero deps)
+│   ├── install.sh            One-liner installer
+│   └── registry.json         Package registry
 ├── Cargo.toml
 ├── PLAN.md                   Development plan (100% complete)
 └── README.md

@@ -137,6 +137,23 @@ pub enum Stmt {
     Theorem(String, Vec<ProofBlockStmt>),         // theorem name { ... }
     Break,                                        // break — exit loop
     Continue,                                     // continue — skip to next iteration
+    // Group 13: FFI
+    Extern(ExternFnDecl),                         // extern fn name(params) -> RetType
+}
+
+/// External function declaration — calls into C libraries via FFI.
+#[derive(Debug, Clone)]
+pub struct ExternFnDecl {
+    pub name: String,
+    pub params: Vec<ExternParam>,
+    pub ret_type: Option<String>,     // "Int", "*Void", etc.
+    pub link_lib: Option<String>,     // from @link("libname")
+}
+
+#[derive(Debug, Clone)]
+pub struct ExternParam {
+    pub name: String,
+    pub typ: String,                  // "Int", "*Void", "*Byte", etc.
 }
 
 /// Target for AI code generation.

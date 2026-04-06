@@ -10,16 +10,21 @@ const WASM_MEMORY_BUDGET: usize = 8 * 1024 * 1024;
 
 /// Run a Hexa source program and return its output.
 ///
-/// Returns a JSON string: `{"output": "...", "error": "..."}`.
-/// If execution succeeds, `error` is empty. If it fails, `output`
-/// contains any partial output produced before the error.
+/// Uses tiered execution:
+///   Tier 1 — VM (bytecode): compile → execute on the stack-based VM.
+///             Faster for numeric/loop-heavy code. JIT is skipped in WASM.
+///   Tier 2 — Interpreter (tree-walk): fallback if VM compilation fails.
+///
+/// Returns a JSON string: `{"output": "...", "error": "...", "tier": "vm"|"interpreter"}`.
+/// If execution succeeds, `error` is empty. If it fails, `output` contains
+/// any partial output produced before the error.
 #[wasm_bindgen]
 pub fn run_hexa(source: &str) -> String {
-    let (output, error) = crate::run_source_with_budget(source, WASM_MEMORY_BUDGET);
-    // Return as JSON for easy parsing on the JS side
+    let (output, error, tier) = crate::run_source_tiered(source, WASM_MEMORY_BUDGET);
     let result = serde_json::json!({
         "output": output,
         "error": error,
+        "tier": tier,
     });
     result.to_string()
 }
