@@ -477,20 +477,28 @@ impl Compiler {
                 chunk.emit(OpCode::Pop);
                 Ok(())
             }
-            // Not supported in VM
+            // Const/Static — treat like Let in VM
+            Stmt::Const(name, _typ, expr, _vis) | Stmt::Static(name, _typ, expr, _vis) => {
+                self.compile_expr(chunk, expr)?;
+                let slot = self.define_local(name);
+                chunk.emit(OpCode::SetLocal(slot));
+                Ok(())
+            }
+            // Struct/Enum/Trait/Impl — skip (no runtime effect in VM)
             Stmt::StructDecl(_) | Stmt::EnumDecl(_) | Stmt::TraitDecl(_)
-            | Stmt::ImplBlock(_) | Stmt::Intent(_, _) | Stmt::Verify(_, _)
+            | Stmt::ImplBlock(_) | Stmt::TypeAlias(..) | Stmt::DeriveDecl(_, _) => Ok(()),
+            // Not supported in VM — silently skip
+            Stmt::Intent(_, _) | Stmt::Verify(_, _)
             | Stmt::Mod(_, _) | Stmt::Use(_) | Stmt::TryCatch(_, _, _)
             | Stmt::Throw(_) | Stmt::Proof(_, _) | Stmt::Spawn(_)
             | Stmt::DropStmt(_) | Stmt::SpawnNamed(_, _)
             | Stmt::AsyncFnDecl(_) | Stmt::Select(_, _)
-            | Stmt::Const(_, _, _, _) | Stmt::Static(_, _, _, _)
-            | Stmt::MacroDef(_) | Stmt::DeriveDecl(_, _)
+            | Stmt::MacroDef(_)
             | Stmt::ConsciousnessBlock(_, _) | Stmt::EvolveFn(_)
             | Stmt::Generate(_) | Stmt::Optimize(_)
             | Stmt::ComptimeFn(_) | Stmt::EffectDecl(_)
             | Stmt::Scope(_) | Stmt::ProofBlock(..)
-            | Stmt::TypeAlias(..) | Stmt::AtomicLet(..) | Stmt::Panic(..) | Stmt::Theorem(..) => Ok(()),
+            | Stmt::AtomicLet(..) | Stmt::Panic(..) | Stmt::Theorem(..) => Ok(()),
         }
     }
 
