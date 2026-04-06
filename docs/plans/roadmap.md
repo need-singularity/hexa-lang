@@ -62,5 +62,10 @@
 - [x] **WASM VM tiered** — 이미 구현됨 확인 (run_source_tiered)
 - [x] **제네릭** — 이미 구현됨 확인 (type erasure + monomorphization)
 - [x] **hexa install** — add의 별칭으로 추가
+- [x] **LSP diagnostics** — 이미 구현됨 (didOpen/didChange → 파서/타입체커 에러)
+- [x] **플레이그라운드 예제** — 8개 (hello, fib, pattern, consciousness, egyptian, structs, loops, benchmark)
+- [x] **Self-host 파서** — examples/self_host_parser.hexa
+- [x] **시맨틱 버전** — 이미 구현됨 (SemVer, ^, ~, range)
+- [x] **ESP32 코드생성** — 이미 구현됨 (632줄)
 - [x] **PGO 빌드 검증** — 효과 없음 확인, Non-PGO 최적
 - [x] **docs/history 체계 구축** — 자동 갱신 규칙
