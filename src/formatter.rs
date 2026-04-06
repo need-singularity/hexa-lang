@@ -396,6 +396,13 @@ fn format_expr(expr: &Expr) -> String {
             }
         }
         Expr::Wildcard => "_".to_string(),
+        Expr::ArrayPattern(pats, rest) => {
+            let mut parts: Vec<String> = pats.iter().map(|p| format_expr(p)).collect();
+            if let Some(name) = rest {
+                parts.push(format!("...{}", name));
+            }
+            format!("[{}]", parts.join(", "))
+        }
         Expr::Own(inner) => format!("own {}", format_expr(inner)),
         Expr::MoveExpr(inner) => format!("move {}", format_expr(inner)),
         Expr::Borrow(inner) => format!("borrow {}", format_expr(inner)),

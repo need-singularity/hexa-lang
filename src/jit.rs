@@ -197,6 +197,7 @@ fn can_jit_expr(expr: &Expr) -> bool {
                         && arm.body.iter().all(|s| can_jit_stmt(s))
                 })
         }
+        Expr::ArrayPattern(pats, _) => pats.iter().all(|p| can_jit_expr(p)),
         Expr::Lambda(_, body) => can_jit_expr(body),
         Expr::Range(start, end, _) => can_jit_expr(start) && can_jit_expr(end),
         // Not supported in JIT:
@@ -871,6 +872,11 @@ fn collect_free_vars_inner(
                 for s in &arm.body {
                     collect_free_vars_stmt(s, params, bound, free);
                 }
+            }
+        }
+        Expr::ArrayPattern(pats, _) => {
+            for p in pats {
+                collect_free_vars_inner(p, params, bound, free);
             }
         }
         _ => {} // Literals, etc.

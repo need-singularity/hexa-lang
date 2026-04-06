@@ -80,7 +80,7 @@ fn lower_pattern_test(
 ) -> ValueId {
     match pattern {
         // Wildcard always matches
-        Expr::Wildcard => builder.const_bool(true),
+        Expr::Wildcard | Expr::ArrayPattern(_, _) => builder.const_bool(true),
 
         // Identifier binding always matches (binds in bind_pattern)
         Expr::Ident(_) => builder.const_bool(true),

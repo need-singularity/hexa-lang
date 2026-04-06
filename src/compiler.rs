@@ -790,7 +790,7 @@ impl Compiler {
             // Not supported in VM
             Expr::Lambda(_, _) | Expr::Field(_, _) | Expr::Match(_, _)
             | Expr::StructInit(_, _) | Expr::MapLit(_) | Expr::EnumPath(_, _, _)
-            | Expr::Wildcard | Expr::Own(_) | Expr::MoveExpr(_) | Expr::Borrow(_)
+            | Expr::Wildcard | Expr::ArrayPattern(_, _) | Expr::Own(_) | Expr::MoveExpr(_) | Expr::Borrow(_)
             | Expr::Await(_) | Expr::MacroInvoc(_) | Expr::Comptime(_)
             | Expr::HandleWith(_, _) | Expr::EffectCall(_, _, _) | Expr::Resume(_)
             | Expr::DynCast(_, _) | Expr::Yield(_) | Expr::Template(_) => {

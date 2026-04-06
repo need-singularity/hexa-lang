@@ -398,23 +398,44 @@ impl Interpreter {
                         }
                     }
                     Expr::Index(arr_expr, idx_expr) => {
-                        let idx = self.eval_expr(idx_expr)?;
-                        let idx = match idx {
-                            Value::Int(i) => i as usize,
-                            _ => return Err(self.type_err("index must be an integer".into())),
-                        };
-                        // Get the array name for simple cases
+                        let idx_val = self.eval_expr(idx_expr)?;
                         if let Expr::Ident(name) = arr_expr.as_ref() {
-                            if let Some(Value::Array(mut arr)) = self.env.get(name) {
-                                if idx >= arr.len() {
-                                    return Err(self.runtime_err(format!(
-                                        "index {} out of bounds (len {})", idx, arr.len()
-                                    )));
+                            match &idx_val {
+                                Value::Str(key) => {
+                                    // Map string-key assignment: m["key"] = val
+                                    if let Some(Value::Map(mut map)) = self.env.get(name) {
+                                        map.insert(key.clone(), val);
+                                        self.env.set(name, Value::Map(map));
+                                    } else {
+                                        return Err(self.type_err("string index assignment requires map".into()));
+                                    }
                                 }
-                                arr[idx] = val;
-                                self.env.set(name, Value::Array(arr));
-                            } else {
-                                return Err(self.type_err("index assignment requires array".into()));
+                                Value::Int(raw_idx) => {
+                                    let raw_idx = *raw_idx;
+                                    if let Some(Value::Array(mut arr)) = self.env.get(name) {
+                                        let idx = if raw_idx < 0 {
+                                            let pos = arr.len() as i64 + raw_idx;
+                                            if pos < 0 {
+                                                return Err(self.runtime_err(format!(
+                                                    "negative index {} out of bounds (len {})", raw_idx, arr.len()
+                                                )));
+                                            }
+                                            pos as usize
+                                        } else {
+                                            raw_idx as usize
+                                        };
+                                        if idx >= arr.len() {
+                                            return Err(self.runtime_err(format!(
+                                                "index {} out of bounds (len {})", raw_idx, arr.len()
+                                            )));
+                                        }
+                                        arr[idx] = val;
+                                        self.env.set(name, Value::Array(arr));
+                                    } else {
+                                        return Err(self.type_err("integer index assignment requires array".into()));
+                                    }
+                                }
+                                _ => return Err(self.type_err("index must be an integer or string".into())),
                             }
                         } else {
                             return Err(self.runtime_err("complex index assignment not supported".into()));
@@ -1407,13 +1428,23 @@ impl Interpreter {
                 let idx = self.eval_expr(idx_expr)?;
                 match (&arr, &idx) {
                     (Value::Array(a), Value::Int(i)) => {
-                        let i = *i as usize;
-                        if i >= a.len() {
+                        let idx = if *i < 0 {
+                            let pos = a.len() as i64 + *i;
+                            if pos < 0 {
+                                return Err(self.runtime_err(format!(
+                                    "negative index {} out of bounds (len {})", i, a.len()
+                                )));
+                            }
+                            pos as usize
+                        } else {
+                            *i as usize
+                        };
+                        if idx >= a.len() {
                             Err(self.runtime_err(format!(
                                 "index {} out of bounds (len {})", i, a.len()
                             )))
                         } else {
-                            Ok(a[i].clone())
+                            Ok(a[idx].clone())
                         }
                     }
                     (Value::Str(s), Value::Int(i)) => {
@@ -1713,9 +1744,9 @@ impl Interpreter {
                     other => Ok(other),
                 }
             }
-            Expr::Wildcard => {
-                // Wildcard should only appear in match patterns, not as a standalone expression
-                Err(self.runtime_err("wildcard '_' can only be used in match patterns".into()))
+            Expr::Wildcard | Expr::ArrayPattern(_, _) => {
+                // Wildcard/ArrayPattern should only appear in match patterns, not as standalone expressions
+                Err(self.runtime_err("pattern expression can only be used in match patterns".into()))
             }
             Expr::MacroInvoc(invoc) => {
                 // Look up the macro
@@ -1844,6 +1875,22 @@ impl Interpreter {
                 let mut result = a.clone();
                 result.extend(b.iter().cloned());
                 Ok(Value::Array(result))
+            }
+            // Array repetition
+            (Value::Array(a), BinOp::Mul, Value::Int(n)) => {
+                let n = *n as usize;
+                let mut result = Vec::with_capacity(a.len() * n);
+                for _ in 0..n {
+                    result.extend(a.iter().cloned());
+                }
+                Ok(Value::Array(result))
+            }
+            // Array equality
+            (Value::Array(a), BinOp::Eq, Value::Array(b)) => {
+                Ok(Value::Bool(a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| Self::values_equal(x, y))))
+            }
+            (Value::Array(a), BinOp::Ne, Value::Array(b)) => {
+                Ok(Value::Bool(a.len() != b.len() || !a.iter().zip(b.iter()).all(|(x, y)| Self::values_equal(x, y))))
             }
 
             // String concatenation
@@ -2663,6 +2710,75 @@ impl Interpreter {
                 }
                 Ok(Value::Array(result))
             }
+            "pop" => {
+                if arr.is_empty() { return Err(self.runtime_err("pop() on empty array".into())); }
+                Ok(Value::Array(arr[..arr.len()-1].to_vec()))
+            }
+            "find" => {
+                if args.is_empty() { return Err(self.type_err("find() requires 1 argument (function)".into())); }
+                let func = args.into_iter().next().unwrap();
+                for item in arr {
+                    let result = self.call_function(func.clone(), vec![item.clone()])?;
+                    if Self::is_truthy(&result) {
+                        return Ok(item.clone());
+                    }
+                }
+                Ok(Value::Void)
+            }
+            "find_index" => {
+                if args.is_empty() { return Err(self.type_err("find_index() requires 1 argument (function)".into())); }
+                let func = args.into_iter().next().unwrap();
+                for (i, item) in arr.iter().enumerate() {
+                    let result = self.call_function(func.clone(), vec![item.clone()])?;
+                    if Self::is_truthy(&result) {
+                        return Ok(Value::Int(i as i64));
+                    }
+                }
+                Ok(Value::Int(-1))
+            }
+            "any" => {
+                if args.is_empty() { return Err(self.type_err("any() requires 1 argument (function)".into())); }
+                let func = args.into_iter().next().unwrap();
+                for item in arr {
+                    let result = self.call_function(func.clone(), vec![item.clone()])?;
+                    if Self::is_truthy(&result) {
+                        return Ok(Value::Bool(true));
+                    }
+                }
+                Ok(Value::Bool(false))
+            }
+            "all" => {
+                if args.is_empty() { return Err(self.type_err("all() requires 1 argument (function)".into())); }
+                let func = args.into_iter().next().unwrap();
+                for item in arr {
+                    let result = self.call_function(func.clone(), vec![item.clone()])?;
+                    if !Self::is_truthy(&result) {
+                        return Ok(Value::Bool(false));
+                    }
+                }
+                Ok(Value::Bool(true))
+            }
+            "swap" => {
+                if args.len() < 2 { return Err(self.type_err("swap() requires 2 arguments (i, j)".into())); }
+                match (&args[0], &args[1]) {
+                    (Value::Int(i), Value::Int(j)) => {
+                        let mut new_arr = arr.to_vec();
+                        let i = *i as usize;
+                        let j = *j as usize;
+                        if i >= new_arr.len() || j >= new_arr.len() {
+                            return Err(self.runtime_err("swap index out of bounds".into()));
+                        }
+                        new_arr.swap(i, j);
+                        Ok(Value::Array(new_arr))
+                    }
+                    _ => Err(self.type_err("swap() requires int arguments".into())),
+                }
+            }
+            "fill" => {
+                if args.is_empty() { return Err(self.type_err("fill() requires 1 argument".into())); }
+                let fill_val = args.into_iter().next().unwrap();
+                Ok(Value::Array(vec![fill_val; arr.len()]))
+            }
             _ => Err(self.runtime_err(format!("unknown array method: .{}()", method))),
         }
     }
@@ -2952,6 +3068,7 @@ impl Interpreter {
                     Value::Float(f) => Ok(Value::Int(*f as i64)),
                     Value::Str(s) => s.parse::<i64>().map(Value::Int).map_err(|_| self.type_err(format!("cannot convert '{}' to int", s))),
                     Value::Bool(b) => Ok(Value::Int(if *b { 1 } else { 0 })),
+                    Value::Char(c) => Ok(Value::Int(*c as i64)),
                     _ => Err(self.type_err("to_int() cannot convert this type".into())),
                 }
             }
@@ -4192,6 +4309,37 @@ impl Interpreter {
             // Wildcard matches everything, no bindings
             Expr::Wildcard => Ok(Some(vec![])),
 
+            // Array pattern: [a, b, ...rest]
+            Expr::ArrayPattern(patterns, rest_name) => {
+                match val {
+                    Value::Array(arr) => {
+                        // Check minimum length
+                        if rest_name.is_some() {
+                            if arr.len() < patterns.len() {
+                                return Ok(None);
+                            }
+                        } else if arr.len() != patterns.len() {
+                            return Ok(None);
+                        }
+                        let mut bindings = Vec::new();
+                        // Match each element pattern
+                        for (i, pat) in patterns.iter().enumerate() {
+                            match self.match_pattern(&arr[i], pat)? {
+                                Some(sub_bindings) => bindings.extend(sub_bindings),
+                                None => return Ok(None),
+                            }
+                        }
+                        // Bind rest if present
+                        if let Some(rest) = rest_name {
+                            let rest_arr = arr[patterns.len()..].to_vec();
+                            bindings.push((rest.clone(), Value::Array(rest_arr)));
+                        }
+                        Ok(Some(bindings))
+                    }
+                    _ => Ok(None),
+                }
+            }
+
             // EnumPath: match enum variant, optionally destructure data
             Expr::EnumPath(enum_name, variant_name, binding_expr) => {
                 match val {
@@ -4281,8 +4429,9 @@ impl Interpreter {
                 }
             }
 
-            // Ident pattern: check if it's a known enum constant (like None)
+            // Ident pattern: check if it's a known enum constant (like None), otherwise bind as variable
             Expr::Ident(name) => {
+                // First check if it's an enum constant
                 if let Some(const_val) = self.env.get(name) {
                     if matches!(&const_val, Value::EnumVariant(_)) {
                         if Self::values_equal(val, &const_val) {
@@ -4292,13 +4441,8 @@ impl Interpreter {
                         }
                     }
                 }
-                // Otherwise evaluate normally
-                let pattern_val = self.eval_expr(pattern)?;
-                if Self::values_equal(val, &pattern_val) {
-                    Ok(Some(vec![]))
-                } else {
-                    Ok(None)
-                }
+                // If not a known constant, treat as variable binding
+                Ok(Some(vec![(name.clone(), val.clone())]))
             }
 
             // Literal/expression: evaluate and compare
@@ -4454,10 +4598,20 @@ impl Interpreter {
                         self.enum_defs.insert(decl.name.clone(), decl.variants.clone());
                     }
                 }
+                Stmt::Extern(decl) => {
+                    // extern fn is always exported from modules
+                    let fn_name = decl.name.clone();
+                    let builtin_name = format!("__extern_{}", fn_name);
+                    mod_data.pub_bindings.insert(fn_name, Value::BuiltinFn(builtin_name));
+                }
                 _ => {}
             }
         }
         self.env.pop_scope();
+        // Inject pub bindings into the current scope for direct access
+        for (name, val) in &mod_data.pub_bindings {
+            self.env.define(name, val.clone());
+        }
         self.modules.insert(module_name, mod_data);
         Ok(())
     }
@@ -4577,6 +4731,12 @@ impl Interpreter {
                     (None, None) => true,
                     _ => false,
                 }
+            }
+            (Value::Array(a), Value::Array(b)) => {
+                a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| Self::values_equal(x, y))
+            }
+            (Value::Tuple(a), Value::Tuple(b)) => {
+                a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| Self::values_equal(x, y))
             }
             _ => false,
         }
@@ -8099,5 +8259,114 @@ scope {
         let src = "let count = 0\nfor i in 0..5 {\n  for j in 0..5 {\n    if j >= 3 { break }\n    count = count + 1\n  }\n}\ncount";
         // 5 outer * 3 inner = 15
         assert!(matches!(eval(src), Value::Int(15)));
+    }
+
+    // ── Array breakthrough tests ──────────────────────────────
+
+    #[test]
+    fn test_array_pop() {
+        assert_eq!(eval("[1, 2, 3].pop()").to_string(), "[1, 2]");
+    }
+
+    #[test]
+    fn test_array_find() {
+        assert!(matches!(eval("[10, 20, 30].find(|x| x > 15)"), Value::Int(20)));
+    }
+
+    #[test]
+    fn test_array_find_index() {
+        assert!(matches!(eval("[10, 20, 30].find_index(|x| x > 15)"), Value::Int(1)));
+    }
+
+    #[test]
+    fn test_array_any() {
+        assert!(matches!(eval("[1, 2, 3].any(|x| x > 2)"), Value::Bool(true)));
+        assert!(matches!(eval("[1, 2, 3].any(|x| x > 5)"), Value::Bool(false)));
+    }
+
+    #[test]
+    fn test_array_all() {
+        assert!(matches!(eval("[1, 2, 3].all(|x| x > 0)"), Value::Bool(true)));
+        assert!(matches!(eval("[1, 2, 3].all(|x| x > 2)"), Value::Bool(false)));
+    }
+
+    #[test]
+    fn test_array_swap() {
+        assert_eq!(eval("[1, 2, 3].swap(0, 2)").to_string(), "[3, 2, 1]");
+    }
+
+    #[test]
+    fn test_array_fill() {
+        assert_eq!(eval("[0, 0, 0].fill(7)").to_string(), "[7, 7, 7]");
+    }
+
+    #[test]
+    fn test_negative_index() {
+        let src = "let a = [10, 20, 30]\na[-1]";
+        assert!(matches!(eval(src), Value::Int(30)));
+    }
+
+    #[test]
+    fn test_negative_index_assign() {
+        let src = "let mut a = [10, 20, 30]\na[-1] = 99\na[-1]";
+        assert!(matches!(eval(src), Value::Int(99)));
+    }
+
+    #[test]
+    fn test_array_repeat() {
+        assert_eq!(eval("[1, 2] * 3").to_string(), "[1, 2, 1, 2, 1, 2]");
+    }
+
+    #[test]
+    fn test_array_equality() {
+        assert!(matches!(eval("[1, 2] == [1, 2]"), Value::Bool(true)));
+        assert!(matches!(eval("[1, 2] == [1, 3]"), Value::Bool(false)));
+        assert!(matches!(eval("[1, 2] != [1, 3]"), Value::Bool(true)));
+    }
+
+    #[test]
+    fn test_match_array_literal() {
+        let src = "let x = [1, 2, 3]\nmatch x {\n  [1, 2, 3] -> \"exact\"\n  _ -> \"no\"\n}";
+        assert_eq!(eval(src).to_string(), "exact");
+    }
+
+    #[test]
+    fn test_match_array_destructure() {
+        let src = "let x = [10, 20, 30]\nmatch x {\n  [a, b, c] -> a + b + c\n  _ -> 0\n}";
+        assert!(matches!(eval(src), Value::Int(60)));
+    }
+
+    #[test]
+    fn test_match_array_rest() {
+        let src = "let x = [1, 2, 3, 4, 5]\nmatch x {\n  [head, ..tail] -> tail.len()\n  _ -> 0\n}";
+        assert!(matches!(eval(src), Value::Int(4)));
+    }
+
+    #[test]
+    fn test_match_array_empty() {
+        let src = "let x = []\nmatch x {\n  [] -> \"empty\"\n  _ -> \"not\"\n}";
+        assert_eq!(eval(src).to_string(), "empty");
+    }
+
+    #[test]
+    fn test_array_breakthrough_integration() {
+        let src = "let data = [1, 2, 3, 4, 5]\nlet doubled = data.map(|x| x * 2)\nlet big = doubled.filter(|x| x > 4)\nlet found = big.find(|x| x == 6)\nfound";
+        assert!(matches!(eval(src), Value::Int(6)));
+    }
+
+    #[test]
+    fn test_array_negative_index_chain() {
+        let src = "let a = [10, 20, 30, 40, 50]\na[-1] + a[-2]";
+        assert!(matches!(eval(src), Value::Int(90)));
+    }
+
+    #[test]
+    fn test_array_all_methods() {
+        assert!(matches!(eval("[1,2,3].pop().len()"), Value::Int(2)));
+        assert!(matches!(eval("[1,2,3].any(|x| x == 2)"), Value::Bool(true)));
+        assert!(matches!(eval("[1,2,3].all(|x| x > 0)"), Value::Bool(true)));
+        assert!(matches!(eval("[1,2,3].find_index(|x| x == 3)"), Value::Int(2)));
+        assert_eq!(eval("[0,0,0].fill(5)").to_string(), "[5, 5, 5]");
+        assert_eq!(eval("[3,1,2].swap(0, 2)").to_string(), "[2, 1, 3]");
     }
 }

@@ -1474,8 +1474,46 @@ impl Parser {
         Ok(Expr::Match(Box::new(scrutinee), arms))
     }
 
-    /// Parse a match pattern. Handles `_`, `EnumName::Variant(binding)`, and regular expressions.
+    /// Parse a match pattern. Handles `_`, `[a, b, ...rest]`, `EnumName::Variant(binding)`, and regular expressions.
     fn parse_match_pattern(&mut self) -> Result<Expr, HexaError> {
+        // Check for array pattern `[a, b, ...rest]`
+        if matches!(self.peek(), Token::LBracket) {
+            self.advance(); // consume [
+            self.skip_newlines();
+            let mut patterns = Vec::new();
+            let mut rest_name: Option<String> = None;
+            while !matches!(self.peek(), Token::RBracket | Token::Eof) {
+                // Check for ...rest spread pattern
+                if matches!(self.peek(), Token::DotDot) {
+                    self.advance(); // consume ..
+                    // Check for optional trailing dot (... = DotDot + Dot)
+                    if matches!(self.peek(), Token::Dot) {
+                        self.advance(); // consume the third dot
+                    }
+                    if let Token::Ident(ref name) = self.peek().clone() {
+                        rest_name = Some(name.to_string());
+                        self.advance();
+                    }
+                    // Skip trailing comma if present
+                    if matches!(self.peek(), Token::Comma) {
+                        self.advance();
+                    }
+                    self.skip_newlines();
+                    break;
+                }
+                let pat = self.parse_match_pattern()?;
+                patterns.push(pat);
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                    self.skip_newlines();
+                } else {
+                    break;
+                }
+            }
+            self.skip_newlines();
+            self.expect(&Token::RBracket)?;
+            return Ok(Expr::ArrayPattern(patterns, rest_name));
+        }
         // Check for wildcard `_`
         if let Token::Ident(ref name) = self.peek().clone() {
             if &**name == "_" {
