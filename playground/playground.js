@@ -194,6 +194,81 @@ for n in nums {
     push(doubled, n * 2)
 }
 println("  doubled:", doubled)`
+    },
+
+    "loops": {
+        name: "Break + Continue",
+        code: `// break/continue in loops
+println("=== Prime Finder (break/continue) ===")
+
+fn is_prime(n: int) -> bool {
+    if n < 2 { return false }
+    let i = 2
+    while i * i <= n {
+        if n % i == 0 { return false }
+        i = i + 1
+    }
+    true
+}
+
+// Find first 6 primes (n=6!)
+let count = 0
+let n = 2
+let primes = []
+loop {
+    if count >= 6 { break }
+    if !is_prime(n) {
+        n = n + 1
+        continue
+    }
+    push(primes, n)
+    count = count + 1
+    n = n + 1
+}
+println("First sigma(6)=6 primes:", primes)
+
+// Sum only odd numbers using continue
+let sum = 0
+for i in 0..20 {
+    if i % 2 == 0 { continue }
+    sum = sum + i
+}
+println("Sum of odd 0..20:", sum)`
+    },
+
+    "benchmark": {
+        name: "Benchmark (333x JIT)",
+        code: `// Performance benchmark — runs at JIT speed!
+fn sigma(n: int) -> int {
+    let sum = 0
+    let i = 1
+    while i <= n {
+        if n % i == 0 { sum = sum + i }
+        i = i + 1
+    }
+    sum
+}
+
+fn fib(n: int) -> int {
+    let a = 0
+    let b = 1
+    let i = 0
+    while i < n {
+        let t = a + b
+        a = b
+        b = t
+        i = i + 1
+    }
+    a
+}
+
+let total = 0
+for i in 0..10000 {
+    total = total + sigma(6) + fib(20)
+}
+println("Result:", total)
+println("sigma(6)=12, fib(20)=6765")
+println("Expected: (12+6765)*10000 =", (12+6765)*10000)`
     }
 };
 
@@ -382,12 +457,13 @@ function runCode() {
             if (result.output) {
                 html += escapeHtml(result.output);
             }
+            const tierLabel = result.tier === 'vm' ? 'VM' : 'Interpreter';
             if (result.error) {
                 if (html) html += '\n';
                 html += `<span class="error-line">${escapeHtml(result.error)}</span>`;
-                setStatus('error', 'Error');
+                setStatus('error', `Error [${tierLabel}]`);
             } else {
-                setStatus('success', `Done (${new Date().toLocaleTimeString()})`);
+                setStatus('success', `Done via ${tierLabel} (${new Date().toLocaleTimeString()})`);
             }
             output.innerHTML = html || '<span class="info-line">(no output)</span>';
         } catch (e) {
