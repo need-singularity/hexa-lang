@@ -164,6 +164,8 @@ impl Parser {
             Token::For => self.parse_for_stmt(),
             Token::While => self.parse_while_stmt(),
             Token::Loop => self.parse_loop_stmt(),
+            Token::Break => { self.advance(); Ok(Stmt::Break) }
+            Token::Continue => { self.advance(); Ok(Stmt::Continue) }
             Token::Return => self.parse_return(),
             Token::Proof => self.parse_proof_or_proof_block(),
             Token::Theorem => self.parse_theorem(),

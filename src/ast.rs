@@ -135,6 +135,8 @@ pub enum Stmt {
     AtomicLet(String, Option<String>, Option<Expr>, Visibility),  // atomic let name: type = expr
     Panic(Expr),                                  // panic expr
     Theorem(String, Vec<ProofBlockStmt>),         // theorem name { ... }
+    Break,                                        // break — exit loop
+    Continue,                                     // continue — skip to next iteration
 }
 
 /// Target for AI code generation.

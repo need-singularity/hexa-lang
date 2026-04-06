@@ -22,6 +22,10 @@ const RETURN_SENTINEL: &str = "__hexa_return__";
 /// Sentinel error message used to propagate `throw` across call frames.
 const THROW_SENTINEL: &str = "__hexa_throw__";
 
+/// Sentinel error messages for break/continue in loops.
+const BREAK_SENTINEL: &str = "__hexa_break__";
+const CONTINUE_SENTINEL: &str = "__hexa_continue__";
+
 pub struct Interpreter {
     pub env: Env,
     /// Holds the value carried by the most recent `return` statement.
@@ -444,11 +448,24 @@ impl Interpreter {
                     Value::Array(a) => a,
                     _ => return Err(self.type_err("for loop requires iterable".into())),
                 };
-                for item in items {
+                'for_loop: for item in items {
                     self.env.push_scope();
                     self.env.define(var, item);
                     for s in body {
-                        self.exec_stmt(s)?;
+                        match self.exec_stmt(s) {
+                            Ok(_) => {}
+                            Err(e) if e.message == BREAK_SENTINEL => {
+                                self.env.pop_scope();
+                                break 'for_loop;
+                            }
+                            Err(e) if e.message == CONTINUE_SENTINEL => {
+                                break; // break inner for, continue outer for_loop
+                            }
+                            Err(e) => {
+                                self.env.pop_scope();
+                                return Err(e);
+                            }
+                        }
                         if self.return_value.is_some() {
                             self.env.pop_scope();
                             return Ok(Value::Void);
@@ -459,14 +476,27 @@ impl Interpreter {
                 Ok(Value::Void)
             }
             Stmt::While(cond, body) => {
-                loop {
+                'while_loop: loop {
                     let c = self.eval_expr(cond)?;
                     if !Self::is_truthy(&c) {
                         break;
                     }
                     self.env.push_scope();
                     for s in body {
-                        self.exec_stmt(s)?;
+                        match self.exec_stmt(s) {
+                            Ok(_) => {}
+                            Err(e) if e.message == BREAK_SENTINEL => {
+                                self.env.pop_scope();
+                                break 'while_loop;
+                            }
+                            Err(e) if e.message == CONTINUE_SENTINEL => {
+                                break; // break inner for, continue outer while
+                            }
+                            Err(e) => {
+                                self.env.pop_scope();
+                                return Err(e);
+                            }
+                        }
                         if self.return_value.is_some() {
                             self.env.pop_scope();
                             return Ok(Value::Void);
@@ -477,10 +507,23 @@ impl Interpreter {
                 Ok(Value::Void)
             }
             Stmt::Loop(body) => {
-                loop {
+                'inf_loop: loop {
                     self.env.push_scope();
                     for s in body {
-                        self.exec_stmt(s)?;
+                        match self.exec_stmt(s) {
+                            Ok(_) => {}
+                            Err(e) if e.message == BREAK_SENTINEL => {
+                                self.env.pop_scope();
+                                break 'inf_loop;
+                            }
+                            Err(e) if e.message == CONTINUE_SENTINEL => {
+                                break;
+                            }
+                            Err(e) => {
+                                self.env.pop_scope();
+                                return Err(e);
+                            }
+                        }
                         if self.return_value.is_some() {
                             self.env.pop_scope();
                             return Ok(Value::Void);
@@ -488,6 +531,7 @@ impl Interpreter {
                     }
                     self.env.pop_scope();
                 }
+                Ok(Value::Void)
             }
             Stmt::Proof(_name, body) => {
                 if !self.test_mode {
@@ -1077,6 +1121,12 @@ impl Interpreter {
                     other => format!("{}", other),
                 };
                 Err(self.runtime_err(format!("panic: {}", msg)))
+            }
+            Stmt::Break => {
+                Err(self.runtime_err(BREAK_SENTINEL.into()))
+            }
+            Stmt::Continue => {
+                Err(self.runtime_err(CONTINUE_SENTINEL.into()))
             }
             // All Stmt variants are covered above; this arm is intentionally suppressed.
             #[allow(unreachable_patterns)]
@@ -2915,9 +2965,10 @@ impl Interpreter {
             }
             // ── String builtins ────────────────────────────────────
             "join" => {
-                if args.is_empty() { return Err(self.type_err("join() requires at least 1 argument (array)".into())); }
+                if args.is_empty() { return Err(self.type_err("join() requires at least 1 argument".into())); }
                 match &args[0] {
                     Value::Array(arr) => {
+                        // join(array) or join(array, sep) — array-to-string join
                         let sep = if args.len() >= 2 {
                             match &args[1] {
                                 Value::Str(s) => s.clone(),
@@ -2929,7 +2980,95 @@ impl Interpreter {
                         let parts: Vec<String> = arr.iter().map(|v| format!("{}", v)).collect();
                         Ok(Value::Str(parts.join(&sep)))
                     }
-                    _ => Err(self.type_err("join() first argument must be an array".into())),
+                    Value::Str(_name) => {
+                        // join(spawn_name) — wait for named spawn thread
+                        #[cfg(not(target_arch = "wasm32"))]
+                        {
+                            let name = _name.clone();
+                            if let Some(handle) = self.named_spawns.remove(&name) {
+                                handle.join().map_err(|_| self.runtime_err(format!("spawn '{}' panicked", name)))?;
+                            }
+                            Ok(Value::Void)
+                        }
+                        #[cfg(target_arch = "wasm32")]
+                        {
+                            Err(self.runtime_err("join is not supported in WASM mode".into()))
+                        }
+                    }
+                    _ => Err(self.type_err("join() first argument must be an array or spawn name string".into())),
+                }
+            }
+            "split" => {
+                if args.len() < 2 { return Err(self.type_err("split() requires 2 arguments (string, delimiter)".into())); }
+                match (&args[0], &args[1]) {
+                    (Value::Str(s), Value::Str(delim)) => {
+                        let parts: Vec<Value> = s.split(delim.as_str()).map(|p| Value::Str(p.to_string())).collect();
+                        Ok(Value::Array(parts))
+                    }
+                    _ => Err(self.type_err("split() requires string arguments".into())),
+                }
+            }
+            "trim" => {
+                if args.is_empty() { return Err(self.type_err("trim() requires 1 argument".into())); }
+                match &args[0] {
+                    Value::Str(s) => Ok(Value::Str(s.trim().to_string())),
+                    _ => Err(self.type_err("trim() requires string argument".into())),
+                }
+            }
+            "trim_start" => {
+                if args.is_empty() { return Err(self.type_err("trim_start() requires 1 argument".into())); }
+                match &args[0] {
+                    Value::Str(s) => Ok(Value::Str(s.trim_start().to_string())),
+                    _ => Err(self.type_err("trim_start() requires string argument".into())),
+                }
+            }
+            "trim_end" => {
+                if args.is_empty() { return Err(self.type_err("trim_end() requires 1 argument".into())); }
+                match &args[0] {
+                    Value::Str(s) => Ok(Value::Str(s.trim_end().to_string())),
+                    _ => Err(self.type_err("trim_end() requires string argument".into())),
+                }
+            }
+            "starts_with" => {
+                if args.len() < 2 { return Err(self.type_err("starts_with() requires 2 arguments (string, prefix)".into())); }
+                match (&args[0], &args[1]) {
+                    (Value::Str(s), Value::Str(prefix)) => Ok(Value::Bool(s.starts_with(prefix.as_str()))),
+                    _ => Err(self.type_err("starts_with() requires string arguments".into())),
+                }
+            }
+            "ends_with" => {
+                if args.len() < 2 { return Err(self.type_err("ends_with() requires 2 arguments (string, suffix)".into())); }
+                match (&args[0], &args[1]) {
+                    (Value::Str(s), Value::Str(suffix)) => Ok(Value::Bool(s.ends_with(suffix.as_str()))),
+                    _ => Err(self.type_err("ends_with() requires string arguments".into())),
+                }
+            }
+            "contains" => {
+                if args.len() < 2 { return Err(self.type_err("contains() requires 2 arguments (string, substring)".into())); }
+                match (&args[0], &args[1]) {
+                    (Value::Str(s), Value::Str(sub)) => Ok(Value::Bool(s.contains(sub.as_str()))),
+                    _ => Err(self.type_err("contains() requires string arguments".into())),
+                }
+            }
+            "replace" => {
+                if args.len() < 3 { return Err(self.type_err("replace() requires 3 arguments (string, old, new)".into())); }
+                match (&args[0], &args[1], &args[2]) {
+                    (Value::Str(s), Value::Str(old), Value::Str(new)) => Ok(Value::Str(s.replace(old.as_str(), new.as_str()))),
+                    _ => Err(self.type_err("replace() requires string arguments".into())),
+                }
+            }
+            "to_upper" => {
+                if args.is_empty() { return Err(self.type_err("to_upper() requires 1 argument".into())); }
+                match &args[0] {
+                    Value::Str(s) => Ok(Value::Str(s.to_uppercase())),
+                    _ => Err(self.type_err("to_upper() requires string argument".into())),
+                }
+            }
+            "to_lower" => {
+                if args.is_empty() { return Err(self.type_err("to_lower() requires 1 argument".into())); }
+                match &args[0] {
+                    Value::Str(s) => Ok(Value::Str(s.to_lowercase())),
+                    _ => Err(self.type_err("to_lower() requires string argument".into())),
                 }
             }
             // ── Math builtins ──────────────────────────────────────
@@ -3485,26 +3624,6 @@ impl Interpreter {
                         ("sent".to_string(), Value::Bool(true)),
                     ].into_iter().collect()
                 )))
-            }
-            // ── Join named spawn ────────────────────────────────────────
-            "join" => {
-                if args.is_empty() { return Err(self.type_err("join() requires 1 argument (spawn name)".into())); }
-                match &args[0] {
-                    Value::Str(_name) => {
-                        #[cfg(not(target_arch = "wasm32"))]
-                        {
-                            if let Some(handle) = self.named_spawns.remove(_name) {
-                                handle.join().map_err(|_| self.runtime_err(format!("spawn '{}' panicked", _name)))?;
-                            }
-                            Ok(Value::Void)
-                        }
-                        #[cfg(target_arch = "wasm32")]
-                        {
-                            Err(self.runtime_err("join is not supported in WASM mode".into()))
-                        }
-                    }
-                    _ => Err(self.type_err("join() requires string argument".into())),
-                }
             }
             // ── Number theory: sopfr ─────────────────────────────────
             "sopfr" => {

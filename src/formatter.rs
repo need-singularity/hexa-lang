@@ -272,6 +272,8 @@ fn format_stmt(stmt: &Stmt, indent: usize) -> String {
         Stmt::Theorem(name, _) => {
             format!("{}theorem {} {{ ... }}", prefix, name)
         }
+        Stmt::Break => format!("{}break", prefix),
+        Stmt::Continue => format!("{}continue", prefix),
     }
 }
 
