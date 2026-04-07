@@ -3742,6 +3742,30 @@ impl Interpreter {
                     _ => Err(self.type_err("log2() requires numeric argument".into())),
                 }
             }
+            "ln" => {
+                if args.is_empty() { return Err(self.type_err("ln() requires 1 argument".into())); }
+                match &args[0] {
+                    Value::Float(f) => Ok(Value::Float(f.ln())),
+                    Value::Int(n) => Ok(Value::Float((*n as f64).ln())),
+                    _ => Err(self.type_err("ln() requires numeric argument".into())),
+                }
+            }
+            "log10" => {
+                if args.is_empty() { return Err(self.type_err("log10() requires 1 argument".into())); }
+                match &args[0] {
+                    Value::Float(f) => Ok(Value::Float(f.log10())),
+                    Value::Int(n) => Ok(Value::Float((*n as f64).log10())),
+                    _ => Err(self.type_err("log10() requires numeric argument".into())),
+                }
+            }
+            "exp" => {
+                if args.is_empty() { return Err(self.type_err("exp() requires 1 argument".into())); }
+                match &args[0] {
+                    Value::Float(f) => Ok(Value::Float(f.exp())),
+                    Value::Int(n) => Ok(Value::Float((*n as f64).exp())),
+                    _ => Err(self.type_err("exp() requires numeric argument".into())),
+                }
+            }
             "sin" => {
                 if args.is_empty() { return Err(self.type_err("sin() requires 1 argument".into())); }
                 match &args[0] {
