@@ -205,7 +205,7 @@ static int p_pos = 0;
 HexaVal p_peek() { return p_pos < p_tokens.arr.len ? p_tokens.arr.items[p_pos] : make_token("Eof","",0,0); }
 const char* p_kind() { return hexa_map_get(p_peek(), "kind").s; }
 void p_advance() { if (p_pos < p_tokens.arr.len) p_pos++; }
-void p_skip_nl() { while (strcmp(p_kind(), "Newline") == 0) p_advance(); }
+void p_skip_nl() { while (strcmp(p_kind(), "Newline") == 0 || strcmp(p_kind(), "Semicolon") == 0) p_advance(); }
 
 int p_check(const char* k) { return strcmp(p_kind(), k) == 0; }
 void p_expect(const char* k) {
@@ -305,10 +305,12 @@ HexaVal parse_primary() {
     }
     if (p_check("LBracket")) {
         p_advance();
+        p_skip_nl();
         HexaVal items = hexa_array_new();
         while (!p_check("RBracket") && !p_check("Eof")) {
             items = hexa_array_push(items, parse_expr());
             if (p_check("Comma")) p_advance();
+            p_skip_nl();
         }
         p_expect("RBracket");
         HexaVal n = mk_node("Array"); n = hexa_map_set(n, "items", items); return n;
