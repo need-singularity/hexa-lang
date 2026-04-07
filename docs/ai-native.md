@@ -272,7 +272,23 @@ M1~M5에서 각 패턴 재작성기가 이 인프라 위에 올라감.
 
 **검증:** 17/17 PASS (기존 16 regression + Test 17 신규). 단일 attr, 다중 attr, attr 없음, 분류 테이블 4축 모두 통과.
 
-**다음:** M1 `@optimize` 버블→머지, M2 선형→이진, M3 Strassen, M4 꼬리재귀→루프, M5 DP→슬라이딩. 각 세션에서 `ai_native_pass`의 분류 디스패치 자리에 AST 재작성기 연결.
+## M1 — 셀프호스팅 @pure 순도 검증기 (2026-04-08)
+
+M0 인프라 위에 첫 실제 의미 분석 패스 추가.
+`@pure` 표시된 함수의 body 최상위 문을 스캔해 부작용 검출.
+
+**변경:**
+- `self/ai_native_pass.hexa` — `check_purity` 추가, `ai_native_pass`가 `@pure` 발견 시 body 검사, 모듈 카운터 `ai_pure_ok`/`ai_pure_violations` 노출
+- `self/test_bootstrap_compiler.hexa` — 인라인 사본 동일 패치 + Test 18 (4 케이스: 순수 OK, println 위반, let mut 위반, non-@pure 무시)
+
+**검출 규칙 (top-level 스캔):**
+- `AssignStmt` → "assignment"
+- `LetMutStmt` → "mutable binding"
+- `ExprStmt(Call(Ident "println"|"print"))` → "println/print call"
+
+**검증:** 18/18 PASS. 순수 1/0, impure-println 0/1, impure-mut 0/1, non-@pure 무시 0/0 전부 기대치 일치.
+
+**다음 (후속 세션):** M2 `@optimize` 버블→머지, M3 선형→이진, M4 Strassen, M5 꼬리재귀→루프, M6 DP→슬라이딩. 순도 검사기가 만든 body 순회 패턴을 재귀 AST 재작성으로 확장.
 
 ## 돌파 벡터 전체 로드맵
 
