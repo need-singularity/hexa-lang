@@ -1006,6 +1006,22 @@ impl VM {
         let args: Vec<Value> = self.stack.drain(start..).collect();
 
         match name {
+            "eprintln" => {
+                let mut out = String::new();
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 { out.push(' '); }
+                    out.push_str(&arg.to_string());
+                }
+                if let Some(ref buf) = self.output_capture {
+                    if let Ok(mut b) = buf.lock() {
+                        b.push_str(&out);
+                        b.push('\n');
+                    }
+                } else {
+                    eprintln!("{}", out);
+                }
+                Ok(Value::Void)
+            }
             "__assert__" => {
                 if args.is_empty() {
                     return Err(runtime_err("assert requires an expression".into()));
@@ -1238,11 +1254,39 @@ impl VM {
                 if args.is_empty() { return Err(runtime_err("format() requires at least 1 argument".into())); }
                 match &args[0] {
                     Value::Str(template) => {
-                        let mut result = template.clone();
-                        for arg in &args[1..] {
-                            if let Some(pos) = result.find("{}") {
-                                result = format!("{}{}{}", &result[..pos], arg, &result[pos+2..]);
+                        let mut result = String::new();
+                        let mut arg_idx = 0usize;
+                        let chars: Vec<char> = template.chars().collect();
+                        let mut i = 0;
+                        while i < chars.len() {
+                            if chars[i] == '{' {
+                                if let Some(close) = chars[i..].iter().position(|&c| c == '}') {
+                                    let spec: String = chars[i+1..i+close].iter().collect();
+                                    if arg_idx < args.len() - 1 {
+                                        let arg = &args[1 + arg_idx];
+                                        if spec.is_empty() {
+                                            result.push_str(&format!("{}", arg));
+                                        } else if spec.starts_with(":.") {
+                                            if let Ok(prec) = spec[2..].parse::<usize>() {
+                                                match arg {
+                                                    Value::Float(f) => result.push_str(&format!("{:.*}", prec, f)),
+                                                    Value::Int(n) => result.push_str(&format!("{:.*}", prec, *n as f64)),
+                                                    other => result.push_str(&format!("{}", other)),
+                                                }
+                                            } else {
+                                                result.push_str(&format!("{}", arg));
+                                            }
+                                        } else {
+                                            result.push_str(&format!("{}", arg));
+                                        }
+                                        arg_idx += 1;
+                                    }
+                                    i += close + 1;
+                                    continue;
+                                }
                             }
+                            result.push(chars[i]);
+                            i += 1;
                         }
                         Ok(Value::Str(result))
                     }

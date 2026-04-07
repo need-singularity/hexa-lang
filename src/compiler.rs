@@ -377,6 +377,20 @@ impl Compiler {
                 chunk.emit(OpCode::SetLocal(slot));
                 Ok(())
             }
+            Stmt::LetTuple(names, expr) => {
+                // Evaluate the RHS tuple/array, then extract each element
+                self.compile_expr(chunk, expr)?;
+                let tuple_slot = self.define_local("__td__");
+                chunk.emit(OpCode::SetLocal(tuple_slot));
+                for (i, name) in names.iter().enumerate() {
+                    chunk.emit(OpCode::GetLocal(tuple_slot));
+                    let idx_c = chunk.add_constant(Value::Int(i as i64)); chunk.emit(OpCode::Const(idx_c));
+                    chunk.emit(OpCode::Index);
+                    let slot = self.define_local(name);
+                    chunk.emit(OpCode::SetLocal(slot));
+                }
+                Ok(())
+            }
             Stmt::Assign(lhs, rhs) => {
                 match lhs {
                     Expr::Ident(name) => {
@@ -865,7 +879,7 @@ impl Compiler {
 
 fn is_builtin(name: &str) -> bool {
     matches!(name,
-        "print" | "println" | "len" | "type_of"
+        "print" | "println" | "eprintln" | "len" | "type_of"
         | "sigma" | "phi" | "tau" | "gcd"
         | "abs" | "min" | "max" | "floor" | "ceil" | "round"
         | "sqrt" | "pow" | "log" | "log2" | "sin" | "cos" | "tan"
