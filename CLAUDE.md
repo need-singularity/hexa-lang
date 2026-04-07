@@ -1,4 +1,4 @@
-> 🔴 **AI-NATIVE FIRST**: 성능/자원 개선은 저수준 마이크로 최적화가 아닌 **AI-native 알고리즘 교체**로 진행. docs/ai-native.md 로드맵 참조. O(n²)→O(n log n), O(n)→O(log n) 등 복잡도 자체를 바꾸는 돌파만 추구.
+> 🔴 **AI-NATIVE FIRST**: 성능/자원 개선은 저수준 마이크로 최적화 금지 — **AI-native 알고리즘 교체로 돌파**만 추구. docs/ai-native.md 24종 벡터 로드맵 참조. O(2^n)→O(n), O(n²)→O(n log n), O(n)→O(log n) 등 복잡도 자체를 바꾸는 돌파. @optimize/@memoize/@fuse/@parallel 등 attr 시스템으로 구현.
 
 > 🔴 **HEXA-FIRST**: 모든 코드는 `.hexa`로 작성. sh/py/rs 신규 작성 금지. 부하 유발 명령 최소화.
 
