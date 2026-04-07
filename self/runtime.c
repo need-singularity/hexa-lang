@@ -440,26 +440,35 @@ HexaVal hexa_str_join(HexaVal arr, HexaVal sep) {
     }
     return hexa_str_own(result);
 }
-
+static int utf8_cpcount(const char* s) {
+    int n = 0;
+    for (int i = 0; s[i]; i++) if ((s[i] & 0xC0) != 0x80) n++;
+    return n;
+}
 HexaVal hexa_pad_left(HexaVal s, HexaVal width) {
     HexaVal str = hexa_to_string(s);
     int w = width.i;
-    int slen = strlen(str.s);
-    if (slen >= w) return str;
-    char* result = malloc(w + 1);
-    memset(result, ' ', w - slen);
-    strcpy(result + (w - slen), str.s);
+    int cplen = utf8_cpcount(str.s);
+    int bytelen = strlen(str.s);
+    if (cplen >= w) return str;
+    int pad = w - cplen;
+    char* result = malloc(bytelen + pad + 1);
+    memset(result, ' ', pad);
+    strcpy(result + pad, str.s);
     return hexa_str_own(result);
 }
+
 
 HexaVal hexa_pad_right(HexaVal s, HexaVal width) {
     HexaVal str = hexa_to_string(s);
     int w = width.i;
-    int slen = strlen(str.s);
-    if (slen >= w) return str;
-    char* result = malloc(w + 1);
+    int cplen = utf8_cpcount(str.s);
+    int bytelen = strlen(str.s);
+    if (cplen >= w) return str;
+    int pad = w - cplen;
+    char* result = malloc(bytelen + pad + 1);
     strcpy(result, str.s);
-    memset(result + slen, ' ', w - slen);
-    result[w] = 0;
+    memset(result + bytelen, ' ', pad);
+    result[bytelen + pad] = 0;
     return hexa_str_own(result);
 }
