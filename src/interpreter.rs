@@ -4028,9 +4028,30 @@ impl Interpreter {
                 if args.is_empty() { return Err(self.type_err("exec() requires 1 argument (command)".into())); }
                 match &args[0] {
                     Value::Str(cmd) => {
-                        let output = std::process::Command::new("sh")
-                            .args(&["-c", cmd])
-                            .output();
+                        // exec("cmd", ["arg1", "arg2"]) — direct exec with args array
+                        let output = if args.len() >= 2 {
+                            let mut cmd_args: Vec<String> = Vec::new();
+                            match &args[1] {
+                                Value::Array(arr) => {
+                                    for v in arr.iter() {
+                                        match v {
+                                            Value::Str(s) => cmd_args.push(s.clone()),
+                                            other => cmd_args.push(format!("{}", other)),
+                                        }
+                                    }
+                                }
+                                Value::Str(s) => cmd_args.push(s.clone()),
+                                other => cmd_args.push(format!("{}", other)),
+                            }
+                            std::process::Command::new(cmd)
+                                .args(&cmd_args)
+                                .output()
+                        } else {
+                            // exec("shell command") — sh -c
+                            std::process::Command::new("sh")
+                                .args(&["-c", cmd])
+                                .output()
+                        };
                         match output {
                             Ok(out) => {
                                 let stdout = String::from_utf8_lossy(&out.stdout).trim_end_matches('\n').to_string();
