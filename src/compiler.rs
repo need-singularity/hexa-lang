@@ -87,11 +87,29 @@ pub struct CompiledFunction {
     pub is_memoize: bool,
 }
 
+/// Fast hash key for constant deduplication — O(1) instead of O(n) scan.
+fn const_hash_key(val: &Value) -> u64 {
+    use std::hash::Hasher;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    match val {
+        Value::Int(n) => { std::hash::Hash::hash(&0u8, &mut h); std::hash::Hash::hash(n, &mut h); }
+        Value::Float(f) => { std::hash::Hash::hash(&1u8, &mut h); std::hash::Hash::hash(&f.to_bits(), &mut h); }
+        Value::Bool(b) => { std::hash::Hash::hash(&2u8, &mut h); std::hash::Hash::hash(b, &mut h); }
+        Value::Str(s) => { std::hash::Hash::hash(&3u8, &mut h); std::hash::Hash::hash(s.as_str(), &mut h); }
+        Value::Void => { std::hash::Hash::hash(&4u8, &mut h); }
+        _ => { std::hash::Hash::hash(&99u8, &mut h); std::hash::Hash::hash(&format!("{:?}", val), &mut h); }
+    }
+    h.finish()
+}
+
 /// A compiled chunk: top-level bytecode + constant pool + functions.
 #[derive(Debug, Clone)]
 pub struct Chunk {
     pub code: Vec<OpCode>,
     pub constants: Vec<Value>,
+    /// O(1) constant deduplication map (hash → index).
+    #[allow(dead_code)]
+    pub const_dedup: std::collections::HashMap<u64, usize>,
     pub functions: HashMap<String, CompiledFunction>,
     /// Number of local slots needed at top level.
     pub local_count: usize,
@@ -107,6 +125,7 @@ impl Chunk {
         Self {
             code: Vec::new(),
             constants: Vec::new(),
+            const_dedup: std::collections::HashMap::new(),
             functions: HashMap::new(),
             local_count: 0,
             string_pool: Vec::new(),
@@ -133,13 +152,14 @@ impl Chunk {
     }
 
     pub fn add_constant(&mut self, val: Value) -> usize {
-        for (i, existing) in self.constants.iter().enumerate() {
-            if values_match(existing, &val) {
-                return i;
-            }
+        let key = const_hash_key(&val);
+        if let Some(idx) = self.const_dedup.get(&key) {
+            return *idx;
         }
+        let idx = self.constants.len();
         self.constants.push(val);
-        self.constants.len() - 1
+        self.const_dedup.insert(key, idx);
+        idx
     }
 
     pub fn emit(&mut self, op: OpCode) -> usize {

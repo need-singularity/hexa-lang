@@ -22,6 +22,26 @@ struct CallFrame {
 /// Stack-based bytecode virtual machine.
 /// Uses flat dispatch: function calls push/pop explicit frames instead of
 /// recursing into run_code(), eliminating Rust stack frame overhead per call.
+
+/// Fast structural hash for Value — avoids format!("{:?}") heap allocation.
+#[inline]
+fn hash_value_fast(val: &Value, h: &mut impl std::hash::Hasher) {
+    match val {
+        Value::Int(n) => { std::hash::Hash::hash(&0u8, h); std::hash::Hash::hash(n, h); }
+        Value::Float(f) => { std::hash::Hash::hash(&1u8, h); std::hash::Hash::hash(&f.to_bits(), h); }
+        Value::Bool(b) => { std::hash::Hash::hash(&2u8, h); std::hash::Hash::hash(b, h); }
+        Value::Str(s) => { std::hash::Hash::hash(&3u8, h); std::hash::Hash::hash(s.as_str(), h); }
+        Value::Void => { std::hash::Hash::hash(&4u8, h); }
+        Value::Char(c) => { std::hash::Hash::hash(&5u8, h); std::hash::Hash::hash(c, h); }
+        Value::Byte(b) => { std::hash::Hash::hash(&6u8, h); std::hash::Hash::hash(b, h); }
+        Value::Array(arr) => {
+            std::hash::Hash::hash(&7u8, h);
+            for item in arr { hash_value_fast(item, h); }
+        }
+        other => { std::hash::Hash::hash(&99u8, h); std::hash::Hash::hash(&format!("{:?}", other), h); }
+    }
+}
+
 pub struct VM {
     /// Value stack.
     stack: Vec<Value>,
@@ -597,10 +617,10 @@ impl VM {
                         if is_memo {
                             let stack_start = self.stack.len() - argc;
                             let args_hash = {
-                                use std::hash::{Hash, Hasher};
+                                use std::hash::Hasher;
                                 let mut h = std::collections::hash_map::DefaultHasher::new();
                                 for i in stack_start..self.stack.len() {
-                                    format!("{:?}", self.stack[i]).hash(&mut h);
+                                    hash_value_fast(&self.stack[i], &mut h);
                                 }
                                 h.finish()
                             };

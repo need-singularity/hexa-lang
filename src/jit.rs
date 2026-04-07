@@ -638,7 +638,7 @@ impl JitCompiler {
         // Pass 1c: @optimize — detect linear recurrence and replace with matrix exponentiation.
         // For @optimize fn fib(n), if pattern matches f(n) = c1*f(n-1) + c2*f(n-2):
         //   → Generate native matrix exponentiation code: O(log n) instead of O(2^n)
-        let mut optimize_fns: Vec<String> = Vec::new();
+        let mut optimize_fns: std::collections::HashSet<String> = std::collections::HashSet::new();
         for stmt in stmts {
             if let Stmt::FnDecl(decl) = stmt {
                 if decl.attrs.iter().any(|a| matches!(a.kind, crate::token::AttrKind::Optimize))
@@ -646,7 +646,7 @@ impl JitCompiler {
                     && !self.memo_data.contains_key(&decl.name)  // don't double-optimize with @memoize
                 {
                     if detect_linear_recurrence(decl).is_some() {
-                        optimize_fns.push(decl.name.clone());
+                        optimize_fns.insert(decl.name.clone());
                     }
                 }
             }
@@ -904,8 +904,8 @@ impl JitCompiler {
             let entry_ptr = builder.ins().iadd(cache_ptr, offset);
 
             // Load cached key and value
-            let cached_key = builder.ins().load(I64, MemFlags::new(), entry_ptr, 0);
-            let cached_val = builder.ins().load(I64, MemFlags::new(), entry_ptr, 8);
+            let cached_key = builder.ins().load(I64, MemFlags::trusted(), entry_ptr, 0);
+            let cached_val = builder.ins().load(I64, MemFlags::trusted(), entry_ptr, 8);
 
             // Compare: if cached_key == arg → cache hit
             let hit = builder.ins().icmp(IntCC::Equal, cached_key, arg);
@@ -922,8 +922,8 @@ impl JitCompiler {
             let result = builder.inst_results(call)[0];
 
             // Store key and value in cache (native store — no Rust runtime)
-            builder.ins().store(MemFlags::new(), arg, entry_ptr, 0);
-            builder.ins().store(MemFlags::new(), result, entry_ptr, 8);
+            builder.ins().store(MemFlags::trusted(), arg, entry_ptr, 0);
+            builder.ins().store(MemFlags::trusted(), result, entry_ptr, 8);
 
             builder.ins().return_(&[result]);
 
