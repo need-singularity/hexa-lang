@@ -142,6 +142,7 @@ HexaVal tokenize_c(const char* src) {
 
         // Multi-char operators
         if (c == '=' && pos+1 < len && src[pos+1] == '=') { tokens = hexa_array_push(tokens, make_token("EqEq", "==", line, col)); pos += 2; col += 2; continue; }
+        if (c == '=' && pos+1 < len && src[pos+1] == '>') { tokens = hexa_array_push(tokens, make_token("FatArrow", "=>", line, col)); pos += 2; col += 2; continue; }
         if (c == '!' && pos+1 < len && src[pos+1] == '=') { tokens = hexa_array_push(tokens, make_token("Ne", "!=", line, col)); pos += 2; col += 2; continue; }
         if (c == '<' && pos+1 < len && src[pos+1] == '=') { tokens = hexa_array_push(tokens, make_token("Le", "<=", line, col)); pos += 2; col += 2; continue; }
         if (c == '>' && pos+1 < len && src[pos+1] == '=') { tokens = hexa_array_push(tokens, make_token("Ge", ">=", line, col)); pos += 2; col += 2; continue; }
@@ -278,6 +279,26 @@ HexaVal parse_primary() {
         return n;
     }
     if (p_check("LParen")) { p_advance(); HexaVal e = parse_expr(); p_expect("RParen"); return e; }
+    if (p_check("HashLBrace")) {
+        // Map literal #{ "key": val, ... }
+        p_advance(); p_skip_nl();
+        HexaVal fields = hexa_array_new();
+        while (!p_check("RBrace") && !p_check("Eof")) {
+            HexaVal key = parse_expr(); // string key
+            p_expect("Colon");
+            HexaVal val = parse_expr();
+            HexaVal entry = mk_node("MapEntry");
+            entry = hexa_map_set(entry, "left", key);
+            entry = hexa_map_set(entry, "right", val);
+            fields = hexa_array_push(fields, entry);
+            if (p_check("Comma")) p_advance();
+            p_skip_nl();
+        }
+        p_expect("RBrace");
+        HexaVal m = mk_node("MapLit");
+        m = hexa_map_set(m, "items", fields);
+        return m;
+    }
     if (p_check("LBracket")) {
         p_advance();
         HexaVal items = hexa_array_new();
@@ -289,6 +310,31 @@ HexaVal parse_primary() {
         HexaVal n = mk_node("Array"); n = hexa_map_set(n, "items", items); return n;
     }
     if (p_check("If")) return parse_if();
+    if (p_check("Match")) {
+        // match expr { pattern => body, ... }
+        p_advance();
+        HexaVal scrutinee = parse_expr();
+        p_expect("LBrace"); p_skip_nl();
+        HexaVal arms = hexa_array_new();
+        while (!p_check("RBrace") && !p_check("Eof")) {
+            HexaVal pattern = parse_expr();
+            if (p_check("FatArrow")) p_advance(); else if (p_check("Arrow")) p_advance(); else p_expect("FatArrow");
+            HexaVal body;
+            if (p_check("LBrace")) body = parse_block();
+            else { body = hexa_array_new(); HexaVal es = mk_node("ExprStmt"); es = hexa_map_set(es,"left",parse_expr()); body = hexa_array_push(body, es); }
+            HexaVal arm = mk_node("MatchArm");
+            arm = hexa_map_set(arm, "left", pattern);
+            arm = hexa_map_set(arm, "body", body);
+            arms = hexa_array_push(arms, arm);
+            if (p_check("Comma")) p_advance();
+            p_skip_nl();
+        }
+        p_expect("RBrace");
+        HexaVal m = mk_node("MatchExpr");
+        m = hexa_map_set(m, "left", scrutinee);
+        m = hexa_map_set(m, "arms", arms);
+        return m;
+    }
     if (p_check("BitOr")) {
         // Lambda: |params| expr
         p_advance();
@@ -532,6 +578,14 @@ HexaVal parse_stmt() {
         n = hexa_map_set(n, "left", parse_if());
         return n;
     }
+    if (p_check("Use")) {
+        p_advance();
+        const char* mod = p_expect_ident();
+        while (p_check("ColonColon")) { p_advance(); mod = p_expect_ident(); }
+        HexaVal n = mk_node("UseStmt");
+        n = hexa_map_set(n, "name", hexa_str(mod));
+        return n;
+    }
     if (p_check("Struct")) {
         p_advance();
         const char* name = p_expect_ident();
@@ -540,6 +594,29 @@ HexaVal parse_stmt() {
         p_expect("RBrace");
         HexaVal n = mk_node("StructDecl");
         n = hexa_map_set(n, "name", hexa_str(name));
+        return n;
+    }
+    if (p_check("Try")) {
+        p_advance();
+        HexaVal try_body = parse_block();
+        p_skip_nl();
+        HexaVal catch_var = hexa_str("_e");
+        HexaVal catch_body = hexa_str("");
+        if (p_check("Catch")) {
+            p_advance();
+            if (p_check("LParen")) { p_advance(); catch_var = hexa_str(p_expect_ident()); p_expect("RParen"); }
+            catch_body = parse_block();
+        }
+        HexaVal n = mk_node("TryCatch");
+        n = hexa_map_set(n, "name", catch_var);
+        n = hexa_map_set(n, "left", try_body);
+        n = hexa_map_set(n, "right", catch_body);
+        return n;
+    }
+    if (p_check("Throw")) {
+        p_advance();
+        HexaVal n = mk_node("ThrowStmt");
+        n = hexa_map_set(n, "left", parse_expr());
         return n;
     }
     if (p_check("Break")) { p_advance(); return mk_node("BreakStmt"); }
@@ -668,6 +745,19 @@ void gen_expr(HexaVal node, char* buf) {
         }
         return;
     }
+    if (strcmp(k,"MapLit")==0) {
+        HexaVal items = hexa_map_get(node,"items");
+        int n = items.tag==TAG_ARRAY ? items.arr.len : 0;
+        for (int i=0; i<n; i++) strcat(buf, "hexa_map_set(");
+        strcat(buf, "hexa_map_new()");
+        for (int i=0; i<n; i++) {
+            HexaVal entry = items.arr.items[i];
+            strcat(buf, ", ("); gen_expr(hexa_map_get(entry,"left"),buf); strcat(buf, ").s, ");
+            gen_expr(hexa_map_get(entry,"right"),buf);
+            strcat(buf, ")");
+        }
+        return;
+    }
     if (strcmp(k,"Array")==0) {
         HexaVal items = hexa_map_get(node,"items");
         int n = items.tag==TAG_ARRAY ? items.arr.len : 0;
@@ -687,6 +777,35 @@ void gen_expr(HexaVal node, char* buf) {
         strcat(buf, "hexa_map_get(");
         gen_expr(hexa_map_get(node,"left"), buf);
         strcat(buf, ", \""); strcat(buf, hexa_map_get(node,"name").s); strcat(buf, "\")");
+        return;
+    }
+    if (strcmp(k,"MatchExpr")==0) {
+        // match as nested ternary: eq(_m,p1)?v1 : eq(_m,p2)?v2 : default
+        strcat(buf, "({HexaVal _m="); gen_expr(hexa_map_get(node,"left"),buf); strcat(buf,"; ");
+        HexaVal arms = hexa_map_get(node,"arms");
+        int n = arms.tag==TAG_ARRAY ? arms.arr.len : 0;
+        for (int i=0; i<n; i++) {
+            HexaVal arm = arms.arr.items[i];
+            HexaVal pat = hexa_map_get(arm,"left");
+            HexaVal body = hexa_map_get(arm,"body");
+            const char* pk = hexa_map_get(pat,"kind").s;
+            int is_wildcard = (strcmp(pk,"Ident")==0 && strcmp(hexa_map_get(pat,"name").s,"_")==0);
+            if (is_wildcard) {
+                // Default arm — just emit the value
+                if (body.tag==TAG_ARRAY && body.arr.len>0) gen_expr(hexa_map_get(body.arr.items[0],"left"),buf);
+                else strcat(buf, "hexa_void()");
+            } else {
+                strcat(buf, "hexa_truthy(hexa_eq(_m,");
+                gen_expr(pat, buf);
+                strcat(buf, ")) ? ");
+                if (body.tag==TAG_ARRAY && body.arr.len>0) gen_expr(hexa_map_get(body.arr.items[0],"left"),buf);
+                else strcat(buf, "hexa_void()");
+                strcat(buf, " : ");
+            }
+        }
+        if (n == 0 || (n > 0 && strcmp(hexa_map_get(hexa_map_get(arms.arr.items[n-1],"left"),"kind").s,"Ident")!=0))
+            strcat(buf, "hexa_void()");
+        strcat(buf, ";})");
         return;
     }
     if (strcmp(k,"Index")==0) {
@@ -810,6 +929,22 @@ void gen_stmt(HexaVal node, int depth, char* buf) {
         gen_indent(buf,depth); strcat(buf, "}");
         if (strcmp(hexa_map_get(iter,"kind").s,"Range")!=0) strcat(buf,"}");
         strcat(buf,"\n"); return;
+    }
+    if (strcmp(k,"TryCatch")==0) {
+        // Simplified: just execute try body, ignore catch (no real exceptions in C)
+        strcat(buf, "/* try */ {\n");
+        HexaVal tb = hexa_map_get(node,"left");
+        for (int i=0; tb.tag==TAG_ARRAY && i<tb.arr.len; i++) gen_stmt(tb.arr.items[i], depth+1, buf);
+        gen_indent(buf,depth); strcat(buf, "}\n");
+        return;
+    }
+    if (strcmp(k,"ThrowStmt")==0) {
+        strcat(buf, "/* throw */ fprintf(stderr, \"error\\n\"); exit(1);\n");
+        return;
+    }
+    if (strcmp(k,"UseStmt")==0) {
+        strcat(buf, "/* use "); strcat(buf, hexa_map_get(node,"name").s); strcat(buf, " */\n");
+        return;
     }
     if (strcmp(k,"BreakStmt")==0) { strcat(buf, "break;\n"); return; }
     if (strcmp(k,"ContinueStmt")==0) { strcat(buf, "continue;\n"); return; }
