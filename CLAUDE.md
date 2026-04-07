@@ -45,6 +45,36 @@ bash build.sh
 bash build.sh test            # Tests
 ```
 
+## ⚠️ Tiered Execution — 반드시 숙지
+```
+실행 순서: JIT(Cranelift→x86/ARM) → VM(바이트코드) → Interpreter(트리워킹)
+  - 성공하면 즉시 return, 다음 tier 실행 안 함
+  - JIT이 처리하면 VM/Interpreter 코드는 절대 실행 안 됨
+
+[핵심 규칙]
+  1. 런타임 기능 추가 시 → 3개 tier 모두 구현 or can_jit에서 제외
+  2. 성능 측정 시 → 어느 tier에서 실행되는지 먼저 확인
+     - 단순 코드(fn, if, for, call) → JIT이 잡음 (네이티브 머신코드)
+     - @evolve, async, effect 등 → JIT 불가 → VM으로 fallback
+  3. -e 모드도 동일한 tiered 실행 (JIT 우선)
+  4. eprintln 디버그 찍었는데 안 보이면 → 해당 tier 안 탄 것
+
+[파일 매핑]
+  JIT:         src/jit.rs (Cranelift, can_jit로 게이트)
+  VM:          src/vm.rs + src/compiler.rs (바이트코드)
+  Interpreter: src/interpreter.rs (트리워킹, 가장 호환성 높음)
+  라우터:      src/main.rs run_source_with_dir() (JIT→VM→Interp 순서)
+
+[AI-native @attr 시스템]
+  Token:       src/token.rs (Attribute 토큰 + AttrKind enum 13종)
+  AST:         src/ast.rs (Attribute struct, FnDecl.attrs, StructDecl.attrs)
+  Parser:      src/parser.rs (collect → pending_attrs → take_attrs)
+  VM memo:     src/vm.rs (CallFrame.memo_key, fn_is_memoize, memo_cache)
+  JIT gate:    src/jit.rs (can_jit_stmt에서 attr 체크)
+  지원 attr:   @pure @inline @hot @cold @simd @parallel @bounded(N)
+               @memoize @evolve @test @bench @deprecated @link
+```
+
 ## Update History & Roadmap
 ```
 ⚠ 모든 주요 변경/최적화/돌파 → docs/history/ 에 기록

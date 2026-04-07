@@ -83,6 +83,8 @@ pub struct CompiledFunction {
     pub code: Arc<Vec<OpCode>>,
     /// Number of local slots needed (params + locals).
     pub local_count: usize,
+    /// AI-native: @memoize attribute — cache results for same args.
+    pub is_memoize: bool,
 }
 
 /// A compiled chunk: top-level bytecode + constant pool + functions.
@@ -294,12 +296,14 @@ impl Compiler {
         self.scopes = old_scopes;
         self.next_slot = old_slot;
 
+        let is_memoize = decl.attrs.iter().any(|a| matches!(a.kind, crate::token::AttrKind::Memoize));
         Ok(CompiledFunction {
             name: decl.name.clone(),
             arity: decl.params.len(),
             param_names: decl.params.iter().map(|p| p.name.clone()).collect(),
             code: Arc::new(func_code),
             local_count,
+            is_memoize,
         })
     }
 
@@ -951,6 +955,19 @@ mod tests {
         let chunk = compile_source("fn add(a, b) { return a + b }");
         assert!(chunk.functions.contains_key("add"));
         assert_eq!(chunk.functions["add"].arity, 2);
+    }
+
+    #[test]
+    fn test_compile_memoize_flag() {
+        let chunk = compile_source("@memoize fn fib(n) { n }");
+        assert!(chunk.functions.contains_key("fib"), "fib should be compiled");
+        assert!(chunk.functions["fib"].is_memoize, "fib should have is_memoize=true");
+    }
+
+    #[test]
+    fn test_compile_no_memoize_by_default() {
+        let chunk = compile_source("fn add(a, b) { a + b }");
+        assert!(!chunk.functions["add"].is_memoize);
     }
 
     #[test]

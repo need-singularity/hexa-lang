@@ -115,10 +115,56 @@ pub enum Token {
     LParen, RParen, LBrace, RBrace, LBracket, RBracket,
     Comma, Colon, ColonColon, Semicolon, Dot,
 
+    // === AI-native Attribute ===
+    /// First-class attribute token: @name — no string comparison overhead.
+    Attribute(RcStr),
+
     // === Special ===
     HashLBrace,  // #{ — map literal opener
     Newline,
     Eof,
+}
+
+/// Known attribute kinds — compiler pattern-matches directly, no string parsing at IR level.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AttrKind {
+    // Optimization hints (compiler → IR → codegen)
+    Pure,               // @pure — no side effects
+    Inline,             // @inline — inline hint
+    Cold,               // @cold — unlikely path
+    Hot,                // @hot — hot path
+    Simd,               // @simd — vectorization hint
+    Parallel,           // @parallel — safe to parallelize
+    Bounded(i64),       // @bounded(N) — loop bound
+    Memoize,            // @memoize — cache results
+    // Semantics
+    Evolve,             // @evolve — self-modifying
+    Test,               // @test — test function
+    Bench,              // @bench — benchmark
+    Deprecated(Option<String>),  // @deprecated("msg")
+    // FFI
+    Link(String),       // @link("lib")
+    // Extensible
+    Custom(String),
+}
+
+impl AttrKind {
+    pub fn from_name(name: &str) -> AttrKind {
+        match name {
+            "pure" => AttrKind::Pure,
+            "inline" => AttrKind::Inline,
+            "cold" => AttrKind::Cold,
+            "hot" => AttrKind::Hot,
+            "simd" => AttrKind::Simd,
+            "parallel" => AttrKind::Parallel,
+            "memoize" => AttrKind::Memoize,
+            "evolve" => AttrKind::Evolve,
+            "test" => AttrKind::Test,
+            "bench" => AttrKind::Bench,
+            "deprecated" => AttrKind::Deprecated(None),
+            _ => AttrKind::Custom(name.to_string()),
+        }
+    }
 }
 
 pub fn keyword_from_str(s: &str) -> Option<Token> {

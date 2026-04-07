@@ -84,7 +84,7 @@ impl DceCtx {
                     postcondition: decl.postcondition.clone(),
                     body: optimized_body,
                     vis: decl.vis.clone(),
-                    is_pure: decl.is_pure,
+                    is_pure: decl.is_pure, attrs: decl.attrs.clone(),
                 })
             }
 
@@ -100,7 +100,7 @@ impl DceCtx {
                     postcondition: decl.postcondition.clone(),
                     body: optimized_body,
                     vis: decl.vis.clone(),
-                    is_pure: decl.is_pure,
+                    is_pure: decl.is_pure, attrs: decl.attrs.clone(),
                 })
             }
 
@@ -288,6 +288,7 @@ mod tests {
             ],
             vis: Visibility::Private,
             is_pure: false,
+            attrs: vec![],
         };
         let stmts = vec![Stmt::FnDecl(decl)];
         let result = eliminate_dead_code(&stmts);

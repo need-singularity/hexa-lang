@@ -315,15 +315,15 @@ impl Lexer {
             }
         }
 
-        // At-sign attributes
+        // At-sign → first-class Attribute token (AI-native)
         if b == b'@' {
             self.pos += 1;
             self.col += 1;
             if self.peek_byte().map_or(false, |b| b.is_ascii_alphabetic() || b == b'_' || b >= 128) {
                 let ident = self.read_ident();
-                return Ok(Token::Ident(format!("@{}", ident).into()));
+                return Ok(Token::Attribute(ident.into()));
             }
-            return Ok(Token::Ident("@".into()));
+            return Ok(Token::Attribute("".into()));
         }
 
         // Identifiers and keywords (ASCII fast path)
@@ -568,8 +568,18 @@ mod tests {
     fn test_lex_at_evolve_token() {
         let mut lexer = Lexer::new("@evolve fn");
         let tokens = lexer.tokenize_plain().unwrap();
-        assert_eq!(tokens[0], Token::Ident("@evolve".into()));
+        assert_eq!(tokens[0], Token::Attribute("evolve".into()));
         assert_eq!(tokens[1], Token::Fn);
+    }
+
+    #[test]
+    fn test_lex_ai_native_attrs() {
+        let mut lexer = Lexer::new("@pure @inline @parallel @hot @cold @memoize @simd @bounded");
+        let tokens = lexer.tokenize_plain().unwrap();
+        let names = ["pure","inline","parallel","hot","cold","memoize","simd","bounded"];
+        for (i, name) in names.iter().enumerate() {
+            assert_eq!(tokens[i], Token::Attribute((*name).into()));
+        }
     }
 
     #[test]

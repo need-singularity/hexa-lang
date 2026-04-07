@@ -1,3 +1,17 @@
+// ── AI-native Attribute ─────────────────────────────────
+#[derive(Debug, Clone)]
+pub struct Attribute {
+    pub kind: crate::token::AttrKind,
+}
+
+impl Attribute {
+    pub fn new(kind: crate::token::AttrKind) -> Self { Self { kind } }
+}
+
+pub fn has_attr(attrs: &[Attribute], check: fn(&crate::token::AttrKind) -> bool) -> bool {
+    attrs.iter().any(|a| check(&a.kind))
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum Expr {
@@ -307,6 +321,7 @@ pub struct FnDecl {
     pub body: Block,
     pub vis: Visibility,
     pub is_pure: bool,  // pure fn — no effects allowed
+    pub attrs: Vec<Attribute>,  // AI-native: @inline @hot @memoize @parallel etc.
 }
 
 #[allow(dead_code)]
@@ -330,6 +345,7 @@ pub struct StructDecl {
     pub type_params: Vec<TypeParam>,  // <T>, <T, U>, etc. for generic structs
     pub fields: Vec<(String, String, Visibility)>,
     pub vis: Visibility,
+    pub attrs: Vec<Attribute>,
 }
 
 #[allow(dead_code)]

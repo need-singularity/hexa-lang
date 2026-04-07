@@ -425,7 +425,7 @@ impl JitCompiler {
                     postcondition: decl.postcondition.clone(),
                     body: decl.body.clone(),
                     vis: decl.vis.clone(),
-                    is_pure: decl.is_pure,
+                    is_pure: decl.is_pure, attrs: decl.attrs.clone(),
                 };
                 self.declare_function(&modified)?;
             }
@@ -461,7 +461,7 @@ impl JitCompiler {
                     postcondition: decl.postcondition.clone(),
                     body: decl.body.clone(),
                     vis: decl.vis.clone(),
-                    is_pure: decl.is_pure,
+                    is_pure: decl.is_pure, attrs: decl.attrs.clone(),
                 };
                 self.define_function_with_self_type(&modified, type_name)?;
             }
