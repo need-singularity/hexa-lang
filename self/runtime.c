@@ -545,9 +545,19 @@ int hexa_array_contains(HexaVal arr, HexaVal item) {
 }
 
 HexaVal hexa_format_float(HexaVal f, HexaVal prec) {
+HexaVal hexa_format_float_sci(HexaVal f, HexaVal prec);
     double v = f.tag == TAG_FLOAT ? f.f : (double)f.i;
     int p = prec.i;
     char buf[64];
     snprintf(buf, 64, "%.*f", p, v);
+    return hexa_str(buf);
+}
+
+HexaVal hexa_format_float_sci(HexaVal f, HexaVal prec) {
+HexaVal hexa_format_float_sci(HexaVal f, HexaVal prec);
+    double v = f.tag == TAG_FLOAT ? f.f : (double)f.i;
+    int p = prec.i;
+    char buf[64];
+    snprintf(buf, 64, "%.*e", p, v);
     return hexa_str(buf);
 }
