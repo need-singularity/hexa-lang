@@ -43,15 +43,20 @@
 
 ---
 
-## Phase 0: 언어 인프라 보강 (선행 조건)
+## Phase 0: 언어 인프라 보강 ✅ 대부분 완료 (2026-04-08 재평가)
 > Hexa 자체에 셀프 호스팅을 위한 기능이 부족한 부분 보강
 
-- [ ] **P0-1** HashMap 리터럴 `{"key": value}` 또는 `Map::from([])` — 심볼 테이블 필수
-- [ ] **P0-2** 문자열 고급: `char_at(i)`, `contains()`, `starts_with()`, `replace()` — 렉서 필수
-- [ ] **P0-3** Result 타입 + `?` 연산자 또는 try/catch 기반 에러 전파
-- [ ] **P0-4** 멀티파일 모듈 시스템: `use parser::parse` 실제 파일 로드
-- [ ] **P0-5** enum 메서드 (impl for enum) — AST 노드에 메서드 필수
-- [ ] **P0-6** 제네릭 컨테이너: `Array<Token>`, `Map<String, Type>` — 타입 안전성
+- [x] **P0-1** HashMap 리터럴 `#{}` 문법 — ✅ parser.rs:1953, interpreter.rs:1725
+- [x] **P0-2** 문자열 고급 — ✅ contains/starts_with/ends_with/replace/split/trim/substring 구현
+  - char_at은 `str.chars()[i]` 워크어라운드 사용 가능
+- [x] **P0-3** Result/Option 타입 — ✅ enum 기반 (is_ok/is_err/unwrap/unwrap_or)
+  - `?` 연산자 미구현 → try/catch로 대체 가능
+- [x] **P0-4** 멀티파일 모듈 — ✅ `use path::module` → .hexa 파일 로드 (interpreter.rs:4800)
+- [x] **P0-5** enum 메서드 — ✅ call_enum_method (interpreter.rs:2412)
+- [x] **P0-6** 제네릭 — ✅ monomorphization (interpreter.rs:2213, parser.rs:1207)
+
+**남은 작업**: `?` 연산자 (선택), `char_at` 빌트인 (선택)
+**결론**: Phase 0 CLEAR → Phase 1로 즉시 진행 가능
 
 ## Phase 1: 코어 파이프라인 완성 (~5K LOC)
 > lexer → parser → type_checker → compiler → VM 바이트코드 실행
