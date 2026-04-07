@@ -3,7 +3,7 @@
 > 자동 갱신: 돌파/개선 작업 완료 시 다음 벡터를 여기에 추가.
 > 완료된 항목은 [x]로 체크하고 docs/history/에 기록.
 
-## Current State (2026-04-06)
+## Current State (2026-04-07)
 
 | 모듈 | 파일 | LOC | 상태 |
 |------|------|-----|------|
@@ -13,7 +13,8 @@
 | LSP Server | src/lsp.rs | 1,735 | ✅ 기본 구현 |
 | Package Manager | src/package.rs | 1,720 | ✅ 기본 구현 |
 | WASM | src/wasm.rs | 96 | ✅ 기본 구현 |
-| **Total** | **38 files** | **53,852** | |
+| Stdlib | stdlib/*.hexa | 3 modules | ✅ math/string/collections |
+| **Total** | **38+ files** | **54K+** | |
 
 ## Active (강화 필요)
 
@@ -43,12 +44,19 @@
 - [ ] Phase 5: UI 레이아웃 + 탭 + 테마
 - [ ] Phase 6: 플러그인 + AI/의식 UX
 
-### Self-hosting 준비
-- [ ] HashMap/Dict 타입 추가
-- [ ] 제네릭 구현
-- [ ] 모듈 시스템 (import/export)
-- [ ] else if 문법
-- [ ] 표준 라이브러리 분리
+### Self-hosting 완전 전환 (→ [상세 로드맵](self-hosting-roadmap.md))
+- [x] HashMap/Dict 타입 추가 (2026-04-07, `#{}` 문법)
+- [x] 제네릭 구현 (이미 구현 — type erasure + monomorphization)
+- [x] 모듈 시스템 import/export (2026-04-07, `use`/`import` + `pub`)
+- [x] else if 문법 (이미 구현)
+- [x] 표준 라이브러리 분리 (2026-04-07, stdlib/ — math, string, collections)
+- [ ] **Phase 0**: 언어 인프라 보강 (Result, 멀티파일 모듈, enum 메서드)
+- [ ] **Phase 1**: 코어 파이프라인 완성 (파서 42함수 갭, AST, 타입체커)
+- [ ] **Phase 2**: 인터프리터 포팅 (8.5K LOC → Hexa)
+- [ ] **Phase 3**: VM 포팅 (1.5K LOC → Hexa)
+- [ ] **Phase 4**: C 코드 생성 백엔드 (cranelift 대체)
+- [ ] **Phase 5**: 셀프 컴파일 달성 → Rust src/ 제거
+- [ ] **Phase 6**: 생태계 복원 (LSP, 패키지매니저, WASM)
 
 ### Performance (추가)
 - [ ] Trace JIT — VM 핫 루프 동적 컴파일
@@ -60,6 +68,18 @@
 - [ ] ESP32 최적화
 
 ## Completed
+
+### 2026-04-07
+- [x] **VM fallthrough 수정** — 미지원 기능에서 Void→Err, method call/map/match 정상 fallthrough
+- [x] **import 키워드** — `use`의 alias + 문자열 경로 `import "path"` 지원
+- [x] **stdlib 분리** — stdlib/math.hexa (n=6 수론), stdlib/string.hexa, stdlib/collections.hexa
+- [x] **stdlib 자동 검색** — source_dir → stdlib/ → cwd 순서로 모듈 탐색
+- [x] **Lexer 바이트 스캔** — Vec<char>→Vec<u8>, 메모리 75% 절감
+- [x] **Compiler intern O(1)** — HashMap 기반 string interning, O(n²)→O(n)
+- [x] **Env builtin 분리** — ~100 builtin O(1) HashMap lookup
+- [x] **fn_cache fast-path** — 함수 호출 시 scope walk 완전 회피
+- [x] **음수 인덱스 할당** — arr[-1] = val 지원
+- [x] **Dream engine 안정화** — 재귀→반복 fib, 세대 수 축소
 
 ### 2026-04-06
 - [x] **VOID extern FFI Phase 1** — extern fn + dlopen/dlsym, PTY 테스트 통과, str/cstring/ptr 빌트인

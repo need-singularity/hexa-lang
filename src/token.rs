@@ -153,6 +153,7 @@ pub fn keyword_from_str(s: &str) -> Option<Token> {
         // Group 5: Modules (τ=4)
         "mod" => Some(Token::Mod),
         "use" => Some(Token::Use),
+        "import" => Some(Token::Use),  // alias for use
         "pub" => Some(Token::Pub),
         "crate" => Some(Token::Crate),
         // Group 6: Memory (τ=4)

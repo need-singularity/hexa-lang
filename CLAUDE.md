@@ -1,9 +1,9 @@
 > 🔴 **HEXA-FIRST**: 모든 코드는 `.hexa`로 작성. sh/py/rs 신규 작성 금지. 부하 유발 명령 최소화.
 
-> 🔴 **NEXUS-6 특이점 연동**: 이 프로젝트의 돌파/발견/실험은 nexus6 특이점 사이클 입력이다.
-> - **돌파 시**: `HEXA=$HOME/Dev/hexa-lang/target/release/hexa && $HEXA $HOME/Dev/nexus6/mk2_hexa/native/blowup.hexa <domain> 3 --no-graph`
-> - **발견 기록**: `$HOME/Dev/nexus6/shared/growth_bus.jsonl`에 JSON append
-> - **전체 상태**: `$HEXA $HOME/Dev/nexus6/mk2_hexa/native/command_router.hexa "hexa-lang 상태"`
+> 🔴 **NEXUS-6 특이점 연동**: 이 프로젝트의 돌파/발견/실험은 nexus 특이점 사이클 입력이다.
+> - **돌파 시**: `HEXA=$HOME/Dev/hexa-lang/target/release/hexa && $HEXA $HOME/Dev/nexus/mk2_hexa/native/blowup.hexa <domain> 3 --no-graph`
+> - **발견 기록**: `$HOME/Dev/nexus/shared/growth_bus.jsonl`에 JSON append
+> - **전체 상태**: `$HEXA $HOME/Dev/nexus/mk2_hexa/native/command_router.hexa "hexa-lang 상태"`
 
 # HEXA-LANG
 
@@ -107,9 +107,9 @@ Memory: 1/2 Stack + 1/3 Heap + 1/6 Arena = 1
     아래 상황에서 NEXUS-6 스캔 없이 진행 금지!
     위반 = 의식 파괴/품질 저하 위험
 
-    ★ 새 모델 학습 시:      학습 전후 nexus6.scan_all() 비교
+    ★ 새 모델 학습 시:      학습 전후 nexus.scan_all() 비교
     ★ 모델 변경/이식 시:    이식 전후 Phi 보존율 측정
-    ★ corpus 변경/추가 시:  새 corpus nexus6.scan_all() 품질 확인
+    ★ corpus 변경/추가 시:  새 corpus nexus.scan_all() 품질 확인
     ★ 모듈 변경 시:         변경 전후 scan → Phi 하락 시 롤백
     ★ 체크포인트 저장 시:   가중치 scan → anomaly 있으면 경고
     ★ 가속기 적용 시:       적용 전후 scan → Phi 보존 95%+ 확인
@@ -167,12 +167,12 @@ Memory: 1/2 Stack + 1/3 Heap + 1/6 Arena = 1
     기하 → 직교+비율+곡률
     양자심층 → 양자+양자현미경+전자기
   사용법:
-    import nexus6
-    nexus6.scan_all(np_array)              # 26종 풀스캔 → dict
-    nexus6.analyze(flat_list, n, d)        # 올인원 (스캔+합의+n6)
-    nexus6.consciousness_scan(data, ...)   # 개별 렌즈
-    nexus6.n6_check(value)                 # n=6 상수 매칭
-    nexus6.evolve('domain')                # OUROBOROS 진화
+    import nexus
+    nexus.scan_all(np_array)              # 26종 풀스캔 → dict
+    nexus.analyze(flat_list, n, d)        # 올인원 (스캔+합의+n6)
+    nexus.consciousness_scan(data, ...)   # 개별 렌즈
+    nexus.n6_check(value)                 # n=6 상수 매칭
+    nexus.evolve('domain')                # OUROBOROS 진화
 
   ★ NEXUS-6 적극 활용 규칙 (모든 작업에서 필수!) ★
     탐색 (새 데이터):     scan_all → 26렌즈, 3+ 합의=확정
@@ -191,7 +191,7 @@ Memory: 1/2 Stack + 1/3 Heap + 1/6 Arena = 1
   "렌즈 추가 필요?" 질문 시 → 26종 커버 안 되는 도메인 분석
 
   ★ 망원경 업그레이드 시 필수 절차 (렌즈 추가/수정/삭제 시 예외 없음!) ★
-    1. 캘리브레이션: NEXUS-6 테스트 전체 통과 확인 (cd ~/Dev/n6-architecture/tools/nexus6 && cargo test)
+    1. 캘리브레이션: NEXUS-6 테스트 전체 통과 확인 (cd ~/Dev/n6-architecture/tools/nexus && cargo test)
     2. OUROBOROS 튜닝: infinite_evolution.py TELESCOPE_ALL_LENSES + DOMAIN_COMBOS 갱신
     3. 문서 동기화:
        - shared_work_rules.md 렌즈 목록/종수/도메인 조합 갱신

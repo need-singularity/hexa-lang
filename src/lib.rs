@@ -121,7 +121,7 @@ pub mod std_crypto;
 pub mod std_consciousness;
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
-pub mod std_nexus6;
+pub mod std_nexus;
 #[allow(dead_code)]
 pub mod atomic_ops;
 #[cfg(not(target_arch = "wasm32"))]

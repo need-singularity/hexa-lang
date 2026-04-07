@@ -4018,10 +4018,10 @@ impl Interpreter {
                 crate::std_consciousness::call_consciousness_builtin(self, name, args)
             }
 
-            // ── NEXUS-6 integration builtins (std::nexus6) ─────────
-            "nexus6_scan" | "nexus6_verify" | "nexus6_omega"
-            | "nexus6_lenses" | "nexus6_consensus" | "nexus6_n6_check" => {
-                crate::std_nexus6::call_nexus6_builtin(self, name, args)
+            // ── NEXUS-6 integration builtins (std::nexus) ─────────
+            "nexus_scan" | "nexus_verify" | "nexus_omega"
+            | "nexus_lenses" | "nexus_consensus" | "nexus_n6_check" => {
+                crate::std_nexus::call_nexus_builtin(self, name, args)
             }
             // ── Process/IO builtins (std::process, std::io) ──────────────
             "exec" => {
@@ -4647,14 +4647,25 @@ impl Interpreter {
             return Ok(());
         }
 
-        // Resolve file path
+        // Resolve file path: check source_dir first, then stdlib, then cwd
         let base_dir = self.source_dir.clone().unwrap_or_else(|| ".".to_string());
         let rel_path = path.join("/");
         let file_path = format!("{}/{}.hexa", base_dir, rel_path);
 
-        let source = std::fs::read_to_string(&file_path).map_err(|e| {
-            self.runtime_err(format!("cannot load module '{}': {} (looked for {})", path.join("::"), e, file_path))
-        })?;
+        let source = std::fs::read_to_string(&file_path)
+            .or_else(|_| {
+                // Try stdlib directory relative to executable
+                let exe = std::env::current_exe().unwrap_or_default();
+                let exe_dir = exe.parent().map(|p| p.parent().unwrap_or(p)).unwrap_or(std::path::Path::new("."));
+                std::fs::read_to_string(format!("{}/stdlib/{}.hexa", exe_dir.display(), rel_path))
+            })
+            .or_else(|_| {
+                // Try stdlib in source tree (development mode)
+                std::fs::read_to_string(format!("stdlib/{}.hexa", rel_path))
+            })
+            .map_err(|e| {
+                self.runtime_err(format!("cannot load module '{}': {} (looked in {}, stdlib/)", path.join("::"), e, file_path))
+            })?;
 
         // Lex + parse
         let tokens = Lexer::new(&source).tokenize().map_err(|e| {

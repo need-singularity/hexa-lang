@@ -729,8 +729,158 @@ impl VM {
                     }
                 }
 
+                OpCode::CallMethod(idx, argc) => {
+                    let method_name = self.string_pool[*idx as usize].clone();
+                    let argc = *argc as usize;
+                    // Stack: [obj, arg0, arg1, ...argN-1]
+                    let args_start = self.stack.len().saturating_sub(argc);
+                    let args: Vec<Value> = self.stack.drain(args_start..).collect();
+                    let obj = pop_fast!(self);
+                    let result = self.call_method(obj, &method_name, args)?;
+                    self.stack.push(result);
+                }
 
             }
+        }
+    }
+
+    // ---- Method calls ----
+
+    fn call_method(&mut self, obj: Value, method: &str, args: Vec<Value>) -> Result<Value, HexaError> {
+        match obj {
+            Value::Str(ref s) => self.call_string_method(s, method, args),
+            Value::Array(ref a) => self.call_array_method(a, method, args),
+            Value::Map(ref m) => self.call_map_method(m, method, args),
+            _ => Err(runtime_err(format!("no method .{}() on {:?}", method, obj))),
+        }
+    }
+
+    fn call_string_method(&self, s: &str, method: &str, args: Vec<Value>) -> Result<Value, HexaError> {
+        match method {
+            "len" => Ok(Value::Int(s.len() as i64)),
+            "contains" => {
+                match args.first() {
+                    Some(Value::Str(sub)) => Ok(Value::Bool(s.contains(sub.as_str()))),
+                    _ => Err(runtime_err("contains() requires string argument".into())),
+                }
+            }
+            "starts_with" => {
+                match args.first() {
+                    Some(Value::Str(prefix)) => Ok(Value::Bool(s.starts_with(prefix.as_str()))),
+                    _ => Err(runtime_err("starts_with() requires string argument".into())),
+                }
+            }
+            "ends_with" => {
+                match args.first() {
+                    Some(Value::Str(suffix)) => Ok(Value::Bool(s.ends_with(suffix.as_str()))),
+                    _ => Err(runtime_err("ends_with() requires string argument".into())),
+                }
+            }
+            "split" => {
+                match args.first() {
+                    Some(Value::Str(delim)) => {
+                        let parts: Vec<Value> = s.split(delim.as_str()).map(|p| Value::Str(p.to_string())).collect();
+                        Ok(Value::Array(parts))
+                    }
+                    _ => Err(runtime_err("split() requires string delimiter".into())),
+                }
+            }
+            "trim" => Ok(Value::Str(s.trim().to_string())),
+            "to_upper" => Ok(Value::Str(s.to_uppercase())),
+            "to_lower" => Ok(Value::Str(s.to_lowercase())),
+            "replace" => {
+                match (args.first(), args.get(1)) {
+                    (Some(Value::Str(old)), Some(Value::Str(new))) => Ok(Value::Str(s.replace(old.as_str(), new.as_str()))),
+                    _ => Err(runtime_err("replace() requires 2 string arguments".into())),
+                }
+            }
+            "chars" => {
+                let chars: Vec<Value> = s.chars().map(Value::Char).collect();
+                Ok(Value::Array(chars))
+            }
+            "substring" => {
+                match (args.first(), args.get(1)) {
+                    (Some(Value::Int(start)), Some(Value::Int(end))) => {
+                        let start = *start as usize;
+                        let end = (*end as usize).min(s.len());
+                        Ok(Value::Str(s.get(start..end).unwrap_or("").to_string()))
+                    }
+                    _ => Err(runtime_err("substring() requires 2 int arguments".into())),
+                }
+            }
+            _ => Err(runtime_err(format!("no method .{}() on string", method))),
+        }
+    }
+
+    fn call_array_method(&mut self, arr: &[Value], method: &str, args: Vec<Value>) -> Result<Value, HexaError> {
+        match method {
+            "len" => Ok(Value::Int(arr.len() as i64)),
+            "push" => {
+                let mut new_arr = arr.to_vec();
+                for a in args { new_arr.push(a); }
+                Ok(Value::Array(new_arr))
+            }
+            "pop" => {
+                let mut new_arr = arr.to_vec();
+                let val = new_arr.pop().unwrap_or(Value::Void);
+                // Return the popped value
+                Ok(val)
+            }
+            "contains" => {
+                match args.first() {
+                    Some(val) => {
+                        let found = arr.iter().any(|v| format!("{}", v) == format!("{}", val));
+                        Ok(Value::Bool(found))
+                    }
+                    None => Err(runtime_err("contains() requires 1 argument".into())),
+                }
+            }
+            "join" => {
+                match args.first() {
+                    Some(Value::Str(sep)) => {
+                        let parts: Vec<String> = arr.iter().map(|v| format!("{}", v)).collect();
+                        Ok(Value::Str(parts.join(sep)))
+                    }
+                    _ => Err(runtime_err("join() requires string separator".into())),
+                }
+            }
+            "reverse" => {
+                let mut new_arr = arr.to_vec();
+                new_arr.reverse();
+                Ok(Value::Array(new_arr))
+            }
+            "map" | "filter" | "for_each" => {
+                // These require closure execution — bail to runtime error for now
+                Err(runtime_err(format!("array.{}() not yet supported in VM", method)))
+            }
+            _ => Err(runtime_err(format!("no method .{}() on array", method))),
+        }
+    }
+
+    fn call_map_method(&self, map: &HashMap<String, Value>, method: &str, args: Vec<Value>) -> Result<Value, HexaError> {
+        match method {
+            "len" => Ok(Value::Int(map.len() as i64)),
+            "keys" => {
+                let keys: Vec<Value> = map.keys().map(|k| Value::Str(k.clone())).collect();
+                Ok(Value::Array(keys))
+            }
+            "values" => {
+                let values: Vec<Value> = map.values().cloned().collect();
+                Ok(Value::Array(values))
+            }
+            "contains_key" => {
+                match args.first() {
+                    Some(Value::Str(key)) => Ok(Value::Bool(map.contains_key(key))),
+                    _ => Err(runtime_err("contains_key() requires string argument".into())),
+                }
+            }
+            "get" => {
+                match args.first() {
+                    Some(Value::Str(key)) => Ok(map.get(key).cloned().unwrap_or(Value::Void)),
+                    _ => Err(runtime_err("get() requires string argument".into())),
+                }
+            }
+            _ => Err(runtime_err(format!("no method .{}() on map", method))),
         }
     }
 

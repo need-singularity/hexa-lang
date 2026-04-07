@@ -59,6 +59,9 @@ pub enum OpCode {
     // Bool conversion for logical ops
     Truthy,             // convert TOS to bool
 
+    // Method call: obj.method(args)
+    CallMethod(u32, u16), // (method name string_pool idx, N args) — obj is below args on stack
+
 }
 
 /// Compile-time assertion: OpCode must be <= 16 bytes for L1d cache density.
@@ -722,13 +725,19 @@ impl Compiler {
                         let idx = chunk.intern(name);
                         chunk.emit(OpCode::CallFn(idx, args.len() as u16));
                     }
-                    _ => {
-                        // Unsupported call target in VM
+                    Expr::Field(obj_expr, method_name) => {
+                        // Method call: obj.method(args)
+                        // Push obj first, then args, then CallMethod
+                        self.compile_expr(chunk, obj_expr)?;
                         for arg in args {
                             self.compile_expr(chunk, arg)?;
-                            chunk.emit(OpCode::Pop);
                         }
-                        chunk.emit(OpCode::Void);
+                        let idx = chunk.intern(method_name);
+                        chunk.emit(OpCode::CallMethod(idx, args.len() as u16));
+                    }
+                    _ => {
+                        // Unsupported call target (e.g. lambda calls) — bail to interpreter
+                        return Err(compile_err("unsupported call target in VM".into()));
                     }
                 }
                 Ok(())
@@ -790,7 +799,7 @@ impl Compiler {
                 chunk.emit(OpCode::MakeArray(items.len()));
                 Ok(())
             }
-            // Not supported in VM
+            // Not supported in VM — bail to interpreter
             Expr::Lambda(_, _) | Expr::Field(_, _) | Expr::Match(_, _)
             | Expr::StructInit(_, _) | Expr::MapLit(_) | Expr::EnumPath(_, _, _)
             | Expr::Wildcard | Expr::ArrayPattern(_, _) | Expr::Own(_) | Expr::MoveExpr(_) | Expr::Borrow(_)
@@ -798,8 +807,7 @@ impl Compiler {
             | Expr::HandleWith(_, _) | Expr::EffectCall(_, _, _) | Expr::Resume(_)
             | Expr::DynCast(_, _) | Expr::Yield(_) | Expr::Template(_)
             | Expr::TryCatch(_, _, _) => {
-                chunk.emit(OpCode::Void);
-                Ok(())
+                return Err(compile_err("unsupported expression in VM".into()));
             }
         }
     }

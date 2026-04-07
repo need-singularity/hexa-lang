@@ -438,7 +438,7 @@ fn builtin_env_set(interp: &mut Interpreter, args: Vec<Value>) -> Result<Value, 
 
 - [ ] **Step 2: Register std_sys module in src/lib.rs**
 
-Add after `pub mod std_nexus6;` line:
+Add after `pub mod std_nexus;` line:
 
 ```rust
 #[cfg(not(target_arch = "wasm32"))]

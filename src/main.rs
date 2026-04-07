@@ -112,7 +112,7 @@ mod std_crypto;
 mod std_consciousness;
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
-mod std_nexus6;
+mod std_nexus;
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 mod anima_bridge;

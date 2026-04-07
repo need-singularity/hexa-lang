@@ -171,6 +171,9 @@ pub struct Env {
     /// Fast-path: counts how many ownership states have been set.
     /// When 0, get_ownership() can skip the scope walk entirely.
     ownership_count: usize,
+    /// O(1) builtin lookup cache — ~100 builtins + constants separated from scope walk.
+    /// Avoids reverse-scanning the entire vars stack for every builtin call.
+    builtins: HashMap<String, Value>,
 }
 
 impl Env {
@@ -182,161 +185,141 @@ impl Env {
             constants: std::collections::HashSet::new(),
             statics: HashMap::new(),
             ownership_count: 0,
+            builtins: HashMap::with_capacity(128),
         };
-        // Register builtins
-        env.define("print", Value::BuiltinFn("print".into()));
-        env.define("println", Value::BuiltinFn("println".into()));
-        env.define("len", Value::BuiltinFn("len".into()));
-        env.define("type_of", Value::BuiltinFn("type_of".into()));
-        env.define("sigma", Value::BuiltinFn("sigma".into()));
-        env.define("phi", Value::BuiltinFn("phi".into()));
-        env.define("tau", Value::BuiltinFn("tau".into()));
-        env.define("gcd", Value::BuiltinFn("gcd".into()));
-        env.define("read_file", Value::BuiltinFn("read_file".into()));
-        env.define("write_file", Value::BuiltinFn("write_file".into()));
-        env.define("file_exists", Value::BuiltinFn("file_exists".into()));
-        env.define("delete_file", Value::BuiltinFn("delete_file".into()));
-        env.define("append_file", Value::BuiltinFn("append_file".into()));
-        env.define("keys", Value::BuiltinFn("keys".into()));
-        env.define("values", Value::BuiltinFn("values".into()));
-        env.define("has_key", Value::BuiltinFn("has_key".into()));
-        env.define("to_string", Value::BuiltinFn("to_string".into()));
-        env.define("to_int", Value::BuiltinFn("to_int".into()));
-        env.define("to_float", Value::BuiltinFn("to_float".into()));
-        env.define("try_float", Value::BuiltinFn("try_float".into()));
-        env.define("is_numeric", Value::BuiltinFn("is_numeric".into()));
-        env.define("join", Value::BuiltinFn("join".into()));
-        // String builtins (standalone functional form)
-        env.define("split", Value::BuiltinFn("split".into()));
-        env.define("trim", Value::BuiltinFn("trim".into()));
-        env.define("trim_start", Value::BuiltinFn("trim_start".into()));
-        env.define("trim_end", Value::BuiltinFn("trim_end".into()));
-        env.define("starts_with", Value::BuiltinFn("starts_with".into()));
-        env.define("ends_with", Value::BuiltinFn("ends_with".into()));
-        env.define("contains", Value::BuiltinFn("contains".into()));
-        env.define("replace", Value::BuiltinFn("replace".into()));
-        env.define("to_upper", Value::BuiltinFn("to_upper".into()));
-        env.define("to_lower", Value::BuiltinFn("to_lower".into()));
-        // Math builtins
-        env.define("abs", Value::BuiltinFn("abs".into()));
-        env.define("min", Value::BuiltinFn("min".into()));
-        env.define("max", Value::BuiltinFn("max".into()));
-        env.define("floor", Value::BuiltinFn("floor".into()));
-        env.define("ceil", Value::BuiltinFn("ceil".into()));
-        env.define("round", Value::BuiltinFn("round".into()));
-        env.define("sqrt", Value::BuiltinFn("sqrt".into()));
-        env.define("pow", Value::BuiltinFn("pow".into()));
-        env.define("log", Value::BuiltinFn("log".into()));
-        env.define("log2", Value::BuiltinFn("log2".into()));
-        env.define("sin", Value::BuiltinFn("sin".into()));
-        env.define("cos", Value::BuiltinFn("cos".into()));
-        env.define("tan", Value::BuiltinFn("tan".into()));
-        // Math constants
-        env.define("PI", Value::Float(std::f64::consts::PI));
-        env.define("E", Value::Float(std::f64::consts::E));
-        // Format builtins
-        env.define("format", Value::BuiltinFn("format".into()));
-        // OS builtins
-        env.define("args", Value::BuiltinFn("args".into()));
-        env.define("env_var", Value::BuiltinFn("env_var".into()));
-        env.define("exit", Value::BuiltinFn("exit".into()));
-        env.define("clock", Value::BuiltinFn("clock".into()));
-        // Built-in Option/Result constructors
-        env.define("Some", Value::BuiltinFn("Some".into()));
-        env.define("None", Value::EnumVariant(Box::new(("Option".into(), "None".into(), None))));
-        env.define("Ok", Value::BuiltinFn("Ok".into()));
-        env.define("Err", Value::BuiltinFn("Err".into()));
-        // Concurrency builtins
-        env.define("channel", Value::BuiltinFn("channel".into()));
-        // Char utility builtins
-        env.define("is_alpha", Value::BuiltinFn("is_alpha".into()));
-        env.define("is_digit", Value::BuiltinFn("is_digit".into()));
-        env.define("is_alphanumeric", Value::BuiltinFn("is_alphanumeric".into()));
-        env.define("is_whitespace", Value::BuiltinFn("is_whitespace".into()));
-        // Random builtins
-        env.define("random", Value::BuiltinFn("random".into()));
-        env.define("random_int", Value::BuiltinFn("random_int".into()));
-        // System builtins
-        env.define("sleep", Value::BuiltinFn("sleep".into()));
-        env.define("print_err", Value::BuiltinFn("print_err".into()));
-        // JSON builtins
-        env.define("json_parse", Value::BuiltinFn("json_parse".into()));
-        env.define("json_stringify", Value::BuiltinFn("json_stringify".into()));
-        // HTTP builtins (std::net)
-        env.define("http_get", Value::BuiltinFn("http_get".into()));
-        env.define("http_post", Value::BuiltinFn("http_post".into()));
-        env.define("http_serve", Value::BuiltinFn("http_serve".into()));
-        // TCP builtins (std::net)
-        env.define("net_listen", Value::BuiltinFn("net_listen".into()));
-        env.define("net_accept", Value::BuiltinFn("net_accept".into()));
-        env.define("net_connect", Value::BuiltinFn("net_connect".into()));
-        env.define("net_read", Value::BuiltinFn("net_read".into()));
-        env.define("net_write", Value::BuiltinFn("net_write".into()));
-        env.define("net_close", Value::BuiltinFn("net_close".into()));
-        // Set constructor (std::collections)
-        env.define("Set", Value::BuiltinFn("Set".into()));
-        // Time builtins (std::time)
-        env.define("now", Value::BuiltinFn("now".into()));
-        env.define("timestamp", Value::BuiltinFn("timestamp".into()));
-        env.define("elapsed", Value::BuiltinFn("elapsed".into()));
-        // Encoding builtins (std::encoding)
-        env.define("base64_encode", Value::BuiltinFn("base64_encode".into()));
-        env.define("base64_decode", Value::BuiltinFn("base64_decode".into()));
-        env.define("hex_encode", Value::BuiltinFn("hex_encode".into()));
-        env.define("hex_decode", Value::BuiltinFn("hex_decode".into()));
-        // Consciousness builtins v2 (std::consciousness)
-        env.define("laws", Value::BuiltinFn("laws".into()));
-        env.define("meta_laws", Value::BuiltinFn("meta_laws".into()));
-        env.define("consciousness_vector", Value::BuiltinFn("consciousness_vector".into()));
-        env.define("phi_predict", Value::BuiltinFn("phi_predict".into()));
-        // Spawn/join builtins
-        env.define("join", Value::BuiltinFn("join".into()));
-        // Consciousness builtins (ANIMA Psi-Constants)
-        env.define("psi_coupling", Value::BuiltinFn("psi_coupling".into()));
-        env.define("psi_balance", Value::BuiltinFn("psi_balance".into()));
-        env.define("psi_steps", Value::BuiltinFn("psi_steps".into()));
-        env.define("psi_entropy", Value::BuiltinFn("psi_entropy".into()));
-        env.define("psi_frustration", Value::BuiltinFn("psi_frustration".into()));
-        // Consciousness architecture formulas
-        env.define("consciousness_max_cells", Value::BuiltinFn("consciousness_max_cells".into()));
-        env.define("consciousness_decoder_dim", Value::BuiltinFn("consciousness_decoder_dim".into()));
-        env.define("consciousness_phi", Value::BuiltinFn("consciousness_phi".into()));
-        // Hexad module info
-        env.define("hexad_modules", Value::BuiltinFn("hexad_modules".into()));
-        env.define("hexad_right", Value::BuiltinFn("hexad_right".into()));
-        env.define("hexad_left", Value::BuiltinFn("hexad_left".into()));
-        // Consciousness v2: tension_link builtin
-        env.define("tension_link", Value::BuiltinFn("tension_link".into()));
-        // Number theory: sopfr (sum of prime factors with repetition)
-        env.define("sopfr", Value::BuiltinFn("sopfr".into()));
-        // Egyptian Fraction memory introspection (1/2 + 1/3 + 1/6 = 1)
-        env.define("mem_stats", Value::BuiltinFn("mem_stats".into()));
-        env.define("mem_region", Value::BuiltinFn("mem_region".into()));
-        env.define("arena_reset", Value::BuiltinFn("arena_reset".into()));
-        env.define("mem_budget", Value::BuiltinFn("mem_budget".into()));
-        // NEXUS-6 integration builtins (std::nexus6) — n=6 discovery engine
-        env.define("nexus6_scan", Value::BuiltinFn("nexus6_scan".into()));
-        env.define("nexus6_verify", Value::BuiltinFn("nexus6_verify".into()));
-        env.define("nexus6_omega", Value::BuiltinFn("nexus6_omega".into()));
-        env.define("nexus6_lenses", Value::BuiltinFn("nexus6_lenses".into()));
-        env.define("nexus6_consensus", Value::BuiltinFn("nexus6_consensus".into()));
-        env.define("nexus6_n6_check", Value::BuiltinFn("nexus6_n6_check".into()));
-        // FFI helper builtins (extern fn support)
-        env.define("str", Value::BuiltinFn("str".into()));
-        env.define("cstring", Value::BuiltinFn("cstring".into()));
-        env.define("from_cstring", Value::BuiltinFn("from_cstring".into()));
-        env.define("ptr_null", Value::BuiltinFn("ptr_null".into()));
-        env.define("ptr_addr", Value::BuiltinFn("ptr_addr".into()));
-        env.define("deref", Value::BuiltinFn("deref".into()));
-        // Process/IO builtins (std::process, std::io)
-        env.define("exec", Value::BuiltinFn("exec".into()));
-        env.define("exec_with_status", Value::BuiltinFn("exec_with_status".into()));
-        env.define("input", Value::BuiltinFn("input".into()));
-        env.define("readline", Value::BuiltinFn("readline".into()));
-        env.define("read_stdin", Value::BuiltinFn("read_stdin".into()));
-        env.define("input_all", Value::BuiltinFn("input_all".into()));
+        // Register builtins (stored in both vars and builtins cache)
+        env.define_builtin("print", Value::BuiltinFn("print".into()));
+        env.define_builtin("println", Value::BuiltinFn("println".into()));
+        env.define_builtin("len", Value::BuiltinFn("len".into()));
+        env.define_builtin("type_of", Value::BuiltinFn("type_of".into()));
+        env.define_builtin("sigma", Value::BuiltinFn("sigma".into()));
+        env.define_builtin("phi", Value::BuiltinFn("phi".into()));
+        env.define_builtin("tau", Value::BuiltinFn("tau".into()));
+        env.define_builtin("gcd", Value::BuiltinFn("gcd".into()));
+        env.define_builtin("read_file", Value::BuiltinFn("read_file".into()));
+        env.define_builtin("write_file", Value::BuiltinFn("write_file".into()));
+        env.define_builtin("file_exists", Value::BuiltinFn("file_exists".into()));
+        env.define_builtin("delete_file", Value::BuiltinFn("delete_file".into()));
+        env.define_builtin("append_file", Value::BuiltinFn("append_file".into()));
+        env.define_builtin("keys", Value::BuiltinFn("keys".into()));
+        env.define_builtin("values", Value::BuiltinFn("values".into()));
+        env.define_builtin("has_key", Value::BuiltinFn("has_key".into()));
+        env.define_builtin("to_string", Value::BuiltinFn("to_string".into()));
+        env.define_builtin("to_int", Value::BuiltinFn("to_int".into()));
+        env.define_builtin("to_float", Value::BuiltinFn("to_float".into()));
+        env.define_builtin("try_float", Value::BuiltinFn("try_float".into()));
+        env.define_builtin("is_numeric", Value::BuiltinFn("is_numeric".into()));
+        env.define_builtin("join", Value::BuiltinFn("join".into()));
+        env.define_builtin("split", Value::BuiltinFn("split".into()));
+        env.define_builtin("trim", Value::BuiltinFn("trim".into()));
+        env.define_builtin("trim_start", Value::BuiltinFn("trim_start".into()));
+        env.define_builtin("trim_end", Value::BuiltinFn("trim_end".into()));
+        env.define_builtin("starts_with", Value::BuiltinFn("starts_with".into()));
+        env.define_builtin("ends_with", Value::BuiltinFn("ends_with".into()));
+        env.define_builtin("contains", Value::BuiltinFn("contains".into()));
+        env.define_builtin("replace", Value::BuiltinFn("replace".into()));
+        env.define_builtin("to_upper", Value::BuiltinFn("to_upper".into()));
+        env.define_builtin("to_lower", Value::BuiltinFn("to_lower".into()));
+        env.define_builtin("abs", Value::BuiltinFn("abs".into()));
+        env.define_builtin("min", Value::BuiltinFn("min".into()));
+        env.define_builtin("max", Value::BuiltinFn("max".into()));
+        env.define_builtin("floor", Value::BuiltinFn("floor".into()));
+        env.define_builtin("ceil", Value::BuiltinFn("ceil".into()));
+        env.define_builtin("round", Value::BuiltinFn("round".into()));
+        env.define_builtin("sqrt", Value::BuiltinFn("sqrt".into()));
+        env.define_builtin("pow", Value::BuiltinFn("pow".into()));
+        env.define_builtin("log", Value::BuiltinFn("log".into()));
+        env.define_builtin("log2", Value::BuiltinFn("log2".into()));
+        env.define_builtin("sin", Value::BuiltinFn("sin".into()));
+        env.define_builtin("cos", Value::BuiltinFn("cos".into()));
+        env.define_builtin("tan", Value::BuiltinFn("tan".into()));
+        env.define_builtin("PI", Value::Float(std::f64::consts::PI));
+        env.define_builtin("E", Value::Float(std::f64::consts::E));
+        env.define_builtin("format", Value::BuiltinFn("format".into()));
+        env.define_builtin("args", Value::BuiltinFn("args".into()));
+        env.define_builtin("env_var", Value::BuiltinFn("env_var".into()));
+        env.define_builtin("exit", Value::BuiltinFn("exit".into()));
+        env.define_builtin("clock", Value::BuiltinFn("clock".into()));
+        env.define_builtin("Some", Value::BuiltinFn("Some".into()));
+        env.define_builtin("None", Value::EnumVariant(Box::new(("Option".into(), "None".into(), None))));
+        env.define_builtin("Ok", Value::BuiltinFn("Ok".into()));
+        env.define_builtin("Err", Value::BuiltinFn("Err".into()));
+        env.define_builtin("channel", Value::BuiltinFn("channel".into()));
+        env.define_builtin("is_alpha", Value::BuiltinFn("is_alpha".into()));
+        env.define_builtin("is_digit", Value::BuiltinFn("is_digit".into()));
+        env.define_builtin("is_alphanumeric", Value::BuiltinFn("is_alphanumeric".into()));
+        env.define_builtin("is_whitespace", Value::BuiltinFn("is_whitespace".into()));
+        env.define_builtin("random", Value::BuiltinFn("random".into()));
+        env.define_builtin("random_int", Value::BuiltinFn("random_int".into()));
+        env.define_builtin("sleep", Value::BuiltinFn("sleep".into()));
+        env.define_builtin("print_err", Value::BuiltinFn("print_err".into()));
+        env.define_builtin("json_parse", Value::BuiltinFn("json_parse".into()));
+        env.define_builtin("json_stringify", Value::BuiltinFn("json_stringify".into()));
+        env.define_builtin("http_get", Value::BuiltinFn("http_get".into()));
+        env.define_builtin("http_post", Value::BuiltinFn("http_post".into()));
+        env.define_builtin("http_serve", Value::BuiltinFn("http_serve".into()));
+        env.define_builtin("net_listen", Value::BuiltinFn("net_listen".into()));
+        env.define_builtin("net_accept", Value::BuiltinFn("net_accept".into()));
+        env.define_builtin("net_connect", Value::BuiltinFn("net_connect".into()));
+        env.define_builtin("net_read", Value::BuiltinFn("net_read".into()));
+        env.define_builtin("net_write", Value::BuiltinFn("net_write".into()));
+        env.define_builtin("net_close", Value::BuiltinFn("net_close".into()));
+        env.define_builtin("Set", Value::BuiltinFn("Set".into()));
+        env.define_builtin("now", Value::BuiltinFn("now".into()));
+        env.define_builtin("timestamp", Value::BuiltinFn("timestamp".into()));
+        env.define_builtin("elapsed", Value::BuiltinFn("elapsed".into()));
+        env.define_builtin("base64_encode", Value::BuiltinFn("base64_encode".into()));
+        env.define_builtin("base64_decode", Value::BuiltinFn("base64_decode".into()));
+        env.define_builtin("hex_encode", Value::BuiltinFn("hex_encode".into()));
+        env.define_builtin("hex_decode", Value::BuiltinFn("hex_decode".into()));
+        env.define_builtin("laws", Value::BuiltinFn("laws".into()));
+        env.define_builtin("meta_laws", Value::BuiltinFn("meta_laws".into()));
+        env.define_builtin("consciousness_vector", Value::BuiltinFn("consciousness_vector".into()));
+        env.define_builtin("phi_predict", Value::BuiltinFn("phi_predict".into()));
+        env.define_builtin("join", Value::BuiltinFn("join".into()));
+        env.define_builtin("psi_coupling", Value::BuiltinFn("psi_coupling".into()));
+        env.define_builtin("psi_balance", Value::BuiltinFn("psi_balance".into()));
+        env.define_builtin("psi_steps", Value::BuiltinFn("psi_steps".into()));
+        env.define_builtin("psi_entropy", Value::BuiltinFn("psi_entropy".into()));
+        env.define_builtin("psi_frustration", Value::BuiltinFn("psi_frustration".into()));
+        env.define_builtin("consciousness_max_cells", Value::BuiltinFn("consciousness_max_cells".into()));
+        env.define_builtin("consciousness_decoder_dim", Value::BuiltinFn("consciousness_decoder_dim".into()));
+        env.define_builtin("consciousness_phi", Value::BuiltinFn("consciousness_phi".into()));
+        env.define_builtin("hexad_modules", Value::BuiltinFn("hexad_modules".into()));
+        env.define_builtin("hexad_right", Value::BuiltinFn("hexad_right".into()));
+        env.define_builtin("hexad_left", Value::BuiltinFn("hexad_left".into()));
+        env.define_builtin("tension_link", Value::BuiltinFn("tension_link".into()));
+        env.define_builtin("sopfr", Value::BuiltinFn("sopfr".into()));
+        env.define_builtin("mem_stats", Value::BuiltinFn("mem_stats".into()));
+        env.define_builtin("mem_region", Value::BuiltinFn("mem_region".into()));
+        env.define_builtin("arena_reset", Value::BuiltinFn("arena_reset".into()));
+        env.define_builtin("mem_budget", Value::BuiltinFn("mem_budget".into()));
+        env.define_builtin("nexus_scan", Value::BuiltinFn("nexus_scan".into()));
+        env.define_builtin("nexus_verify", Value::BuiltinFn("nexus_verify".into()));
+        env.define_builtin("nexus_omega", Value::BuiltinFn("nexus_omega".into()));
+        env.define_builtin("nexus_lenses", Value::BuiltinFn("nexus_lenses".into()));
+        env.define_builtin("nexus_consensus", Value::BuiltinFn("nexus_consensus".into()));
+        env.define_builtin("nexus_n6_check", Value::BuiltinFn("nexus_n6_check".into()));
+        env.define_builtin("str", Value::BuiltinFn("str".into()));
+        env.define_builtin("cstring", Value::BuiltinFn("cstring".into()));
+        env.define_builtin("from_cstring", Value::BuiltinFn("from_cstring".into()));
+        env.define_builtin("ptr_null", Value::BuiltinFn("ptr_null".into()));
+        env.define_builtin("ptr_addr", Value::BuiltinFn("ptr_addr".into()));
+        env.define_builtin("deref", Value::BuiltinFn("deref".into()));
+        env.define_builtin("exec", Value::BuiltinFn("exec".into()));
+        env.define_builtin("exec_with_status", Value::BuiltinFn("exec_with_status".into()));
+        env.define_builtin("input", Value::BuiltinFn("input".into()));
+        env.define_builtin("readline", Value::BuiltinFn("readline".into()));
+        env.define_builtin("read_stdin", Value::BuiltinFn("read_stdin".into()));
+        env.define_builtin("input_all", Value::BuiltinFn("input_all".into()));
         env
 
+    }
+
+    /// Register a builtin: O(1) HashMap only (not in vars stack).
+    /// Eliminates ~100 entries from scope walk entirely.
+    fn define_builtin(&mut self, name: &str, val: Value) {
+        self.builtins.insert(name.to_string(), val);
     }
 
     #[inline]
@@ -367,11 +350,15 @@ impl Env {
 
     #[inline]
     pub fn get(&self, name: &str) -> Option<Value> {
-        // Search flat stack in reverse (most recent first)
+        // Search user vars (no builtins in stack — pure user bindings only)
         for i in (0..self.vars.len()).rev() {
             if self.vars[i].0 == name {
                 return Some(self.vars[i].1.clone());
             }
+        }
+        // O(1) builtin lookup (HashMap, ~100 entries)
+        if let Some(val) = self.builtins.get(name) {
+            return Some(val.clone());
         }
         // Fall back to static globals
         if let Some(val) = self.statics.get(name) {
@@ -387,6 +374,9 @@ impl Env {
             if self.vars[i].0 == name {
                 return Some(&self.vars[i].1);
             }
+        }
+        if let Some(val) = self.builtins.get(name) {
+            return Some(val);
         }
         self.statics.get(name)
     }
@@ -416,7 +406,11 @@ impl Env {
 
     /// Collect all known variable names (for error suggestions).
     pub fn known_names(&self) -> Vec<&str> {
-        self.vars.iter().map(|(k, _)| k.as_str()).collect()
+        let mut names: Vec<&str> = self.vars.iter().map(|(k, _)| k.as_str()).collect();
+        for k in self.builtins.keys() {
+            names.push(k.as_str());
+        }
+        names
     }
 
     /// Iterate all variable bindings (for debugger / introspection).
