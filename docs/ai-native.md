@@ -288,7 +288,21 @@ M0 인프라 위에 첫 실제 의미 분석 패스 추가.
 
 **검증:** 18/18 PASS. 순수 1/0, impure-println 0/1, impure-mut 0/1, non-@pure 무시 0/0 전부 기대치 일치.
 
-**다음 (후속 세션):** M2 `@optimize` 버블→머지, M3 선형→이진, M4 Strassen, M5 꼬리재귀→루프, M6 DP→슬라이딩. 순도 검사기가 만든 body 순회 패턴을 재귀 AST 재작성으로 확장.
+## M2 — @pure 재귀 순회 강화 (2026-04-08)
+
+M1 top-level 스캔을 재귀 AST 순회로 확장. 중첩 블록/return 표현식 내부 부작용 검출.
+
+**변경:**
+- `check_purity_expr(expr)` — 식 재귀 검사 (Call→println/print)
+- `check_purity(body)` — `WhileStmt.body` 재귀, `ReturnStmt.left`·`ExprStmt.left` 표현식 검사
+- 위반 메시지에 컨텍스트 prefix: `while:println call`
+- Test 19 신규 (3 케이스): while 내부 println 검출, 빈 while OK, return println 검출
+
+**검증:** 19/19 PASS. 재귀 없으면 Test 19a는 ""(pure) 오탐 → 강화 필요성 입증.
+
+**의미:** body 순회 패턴이 재귀형으로 성숙 — M3+ AST 재작성기가 동일 재귀 골격 재사용 가능.
+
+**다음 (후속):** M3 `@optimize` 버블→머지 AST 재작성 / M4 선형→이진 / M5 Strassen / M6 꼬리재귀→루프 / M7 DP→슬라이딩.
 
 ## 돌파 벡터 전체 로드맵
 
