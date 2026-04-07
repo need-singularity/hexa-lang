@@ -4093,6 +4093,19 @@ impl Interpreter {
             | "nexus_lenses" | "nexus_consensus" | "nexus_n6_check" => {
                 crate::std_nexus::call_nexus_builtin(self, name, args)
             }
+            // ── Environment variable ──────────────────────────────────────
+            "env" => {
+                if args.is_empty() { return Err(self.type_err("env() requires 1 argument (variable name)".into())); }
+                match &args[0] {
+                    Value::Str(name) => {
+                        match std::env::var(name) {
+                            Ok(val) => Ok(Value::Str(val)),
+                            Err(_) => Ok(Value::Str(String::new())),
+                        }
+                    }
+                    other => Err(self.type_err(format!("env() expected string, got {}", other))),
+                }
+            }
             // ── Process/IO builtins (std::process, std::io) ──────────────
             "exec" => {
                 if args.is_empty() { return Err(self.type_err("exec() requires 1 argument (command)".into())); }
