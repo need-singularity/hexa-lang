@@ -124,6 +124,10 @@ pub struct Interpreter {
     memo_cache: HashMap<String, HashMap<u64, Value>>,
     /// @optimize: pattern-detected optimized functions (coefficients, base_values)
     optimized_fns: HashMap<String, (Vec<i64>, Vec<i64>)>,
+    autograd_fns: HashMap<String, (Vec<String>, Arc<Vec<Stmt>>)>,
+    vectorize_fns: HashMap<String, (Vec<String>, Arc<Vec<Stmt>>)>,
+    fuse_fns: HashMap<String, (Vec<String>, Arc<Vec<Stmt>>)>,
+    lazy_fns: std::collections::HashSet<String>,
     /// Loaded shared libraries: lib_path -> handle (dlopen result).
     #[cfg(not(target_arch = "wasm32"))]
     loaded_libs: HashMap<String, *mut std::ffi::c_void>,
@@ -186,6 +190,10 @@ impl Interpreter {
             extern_fns: HashMap::new(),
             memo_cache: HashMap::new(),
             optimized_fns: HashMap::new(),
+            autograd_fns: HashMap::new(),
+            vectorize_fns: HashMap::new(),
+            fuse_fns: HashMap::new(),
+            lazy_fns: std::collections::HashSet::new(),
             #[cfg(not(target_arch = "wasm32"))]
             loaded_libs: HashMap::new(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -231,6 +239,18 @@ impl Interpreter {
             }
         } else {
             println!("{}", s);
+        }
+    }
+
+    /// Write a string followed by newline to stderr.
+    fn ewriteln_output(&self, s: &str) {
+        if let Some(ref buf) = self.output_capture {
+            if let Ok(mut b) = buf.lock() {
+                b.push_str(s);
+                b.push('\n');
+            }
+        } else {
+            eprintln!("{}", s);
         }
     }
 
@@ -378,6 +398,21 @@ impl Interpreter {
                 }
                 Ok(Value::Void)
             }
+            Stmt::LetTuple(names, expr) => {
+                let val = self.eval_expr(expr)?;
+                let items = match &val {
+                    Value::Tuple(t) => t.clone(),
+                    Value::Array(a) => a.clone(),
+                    _ => return Err(self.type_err(format!("cannot destructure non-tuple/array value: {}", val))),
+                };
+                if items.len() < names.len() {
+                    return Err(self.type_err(format!("not enough values to unpack: expected {}, got {}", names.len(), items.len())));
+                }
+                for (i, name) in names.iter().enumerate() {
+                    self.env.define(name, items[i].clone());
+                }
+                Ok(Value::Void)
+            }
             Stmt::Const(name, _typ, expr, _vis) => {
                 let val = self.eval_expr(expr)?;
                 self.env.define_const(name, val);
@@ -517,6 +552,29 @@ impl Interpreter {
                     { return self.exec_optimize(decl); }
                     #[cfg(target_arch = "wasm32")]
                     { self.register_fn_decl(decl); return Ok(Value::Void); }
+                }
+                // AI-native @autograd: register fn + _grad derivative
+                let has_autograd = decl.attrs.iter().any(|a| matches!(a.kind, crate::token::AttrKind::Autograd));
+                if has_autograd {
+                    let param_names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
+                    self.autograd_fns.insert(decl.name.clone(), (param_names.clone(), Arc::new(decl.body.clone())));
+                }
+                // AI-native @vectorize: register fn for auto array-lift
+                let has_vectorize = decl.attrs.iter().any(|a| matches!(a.kind, crate::token::AttrKind::Vectorize));
+                if has_vectorize {
+                    let param_names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
+                    self.vectorize_fns.insert(decl.name.clone(), (param_names.clone(), Arc::new(decl.body.clone())));
+                }
+                // AI-native @fuse: register fn for operation fusion (array single-pass)
+                let has_fuse = decl.attrs.iter().any(|a| matches!(a.kind, crate::token::AttrKind::Fuse));
+                if has_fuse {
+                    let param_names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
+                    self.fuse_fns.insert(decl.name.clone(), (param_names.clone(), Arc::new(decl.body.clone())));
+                }
+                // AI-native @lazy: mark fn for deferred evaluation (thunk)
+                let has_lazy = decl.attrs.iter().any(|a| matches!(a.kind, crate::token::AttrKind::Lazy));
+                if has_lazy {
+                    self.lazy_fns.insert(decl.name.clone());
                 }
                 if !decl.type_params.is_empty() {
                     // Generic function: store declaration for monomorphization at call site
@@ -1165,7 +1223,7 @@ impl Interpreter {
                     OwnershipState::Dropped => {
                         return Err(self.runtime_err(format!("cannot drop '{}': value has already been dropped", name)));
                     }
-                    _ => Err(self.type_err("invalid index operation".into())),
+                    _ => {
                         self.env.set_ownership(name, OwnershipState::Dropped);
                         Ok(Value::Void)
                     }
@@ -1411,7 +1469,65 @@ impl Interpreter {
                     let func = if let Some(cached) = self.fn_cache.get(fn_name) {
                         cached.clone()
                     } else {
-                        let f = self.env.get(fn_name).ok_or_else(|| {
+                        // AI-native @autograd: intercept _grad calls → numerical differentiation
+                    if fn_name.ends_with("_grad") {
+                        let base_name = &fn_name[..fn_name.len() - 5];
+                        if let Some((params, body)) = self.autograd_fns.get(base_name).cloned() {
+                            let mut arg_vals = Vec::with_capacity(args.len());
+                            for a in args {
+                                arg_vals.push(self.eval_expr(a)?);
+                            }
+                            let eps = 1e-7_f64;
+                            if params.len() == 1 {
+                                // Single-variable: return scalar gradient
+                                let x0 = match &arg_vals[0] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                                // f(x + eps)
+                                self.env.push_scope();
+                                self.env.define(&params[0], Value::Float(x0 + eps));
+                                let mut fplus = Value::Void;
+                                for s in body.iter() { fplus = self.exec_stmt(s)?; if self.return_value.is_some() { fplus = self.return_value.take().unwrap(); break; } }
+                                self.env.pop_scope();
+                                let fp = match fplus { Value::Float(f) => f, Value::Int(i) => i as f64, _ => 0.0 };
+                                // f(x - eps)
+                                self.env.push_scope();
+                                self.env.define(&params[0], Value::Float(x0 - eps));
+                                let mut fminus = Value::Void;
+                                for s in body.iter() { fminus = self.exec_stmt(s)?; if self.return_value.is_some() { fminus = self.return_value.take().unwrap(); break; } }
+                                self.env.pop_scope();
+                                let fm = match fminus { Value::Float(f) => f, Value::Int(i) => i as f64, _ => 0.0 };
+                                return Ok(Value::Float((fp - fm) / (2.0 * eps)));
+                            } else {
+                                // Multi-variable: return array of partial derivatives
+                                let arg_floats: Vec<f64> = arg_vals.iter().map(|v| match v { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 }).collect();
+                                let mut grads = Vec::with_capacity(params.len());
+                                for i in 0..params.len() {
+                                    // f(... xi+eps ...)
+                                    self.env.push_scope();
+                                    for (j, p) in params.iter().enumerate() {
+                                        let v = if j == i { arg_floats[j] + eps } else { arg_floats[j] };
+                                        self.env.define(p, Value::Float(v));
+                                    }
+                                    let mut fplus = Value::Void;
+                                    for s in body.iter() { fplus = self.exec_stmt(s)?; if self.return_value.is_some() { fplus = self.return_value.take().unwrap(); break; } }
+                                    self.env.pop_scope();
+                                    let fp = match fplus { Value::Float(f) => f, Value::Int(i) => i as f64, _ => 0.0 };
+                                    // f(... xi-eps ...)
+                                    self.env.push_scope();
+                                    for (j, p) in params.iter().enumerate() {
+                                        let v = if j == i { arg_floats[j] - eps } else { arg_floats[j] };
+                                        self.env.define(p, Value::Float(v));
+                                    }
+                                    let mut fminus = Value::Void;
+                                    for s in body.iter() { fminus = self.exec_stmt(s)?; if self.return_value.is_some() { fminus = self.return_value.take().unwrap(); break; } }
+                                    self.env.pop_scope();
+                                    let fm = match fminus { Value::Float(f) => f, Value::Int(i) => i as f64, _ => 0.0 };
+                                    grads.push(Value::Float((fp - fm) / (2.0 * eps)));
+                                }
+                                return Ok(Value::Array(grads));
+                            }
+                        }
+                    }
+                    let f = self.env.get(fn_name).ok_or_else(|| {
                             let known_names: Vec<&str> = self.env.known_names();
                             let hint = crate::error::suggest_name(fn_name, &known_names)
                                 .map(|s| format!("did you mean '{}'?", s));
@@ -1432,6 +1548,94 @@ impl Interpreter {
                     let mut arg_vals = Vec::with_capacity(args.len());
                     for a in args {
                         arg_vals.push(self.eval_expr(a)?);
+                    }
+                    // AI-native @fuse: single-pass array fusion
+                    if let Expr::Ident(ref ffn_name) = callee.as_ref() {
+                        if self.fuse_fns.contains_key(ffn_name.as_str()) {
+                            let has_array = arg_vals.iter().any(|v| matches!(v, Value::Array(_)));
+                            if has_array {
+                                let (params, body) = self.fuse_fns.get(ffn_name.as_str()).cloned().unwrap();
+                                let arr_len = arg_vals.iter().find_map(|v| if let Value::Array(a) = v { Some(a.len()) } else { None }).unwrap();
+                                let mut results = Vec::with_capacity(arr_len);
+                                for idx in 0..arr_len {
+                                    self.env.push_scope();
+                                    for (pi, p) in params.iter().enumerate() {
+                                        let v = match &arg_vals[pi] {
+                                            Value::Array(a) => a[idx].clone(),
+                                            other => other.clone(),
+                                        };
+                                        self.env.define(p, v);
+                                    }
+                                    let mut result = Value::Void;
+                                    for s in body.iter() {
+                                        result = self.exec_stmt(s)?;
+                                        if self.return_value.is_some() {
+                                            result = self.return_value.take().unwrap();
+                                            break;
+                                        }
+                                    }
+                                    self.env.pop_scope();
+                                    results.push(result);
+                                }
+                                return Ok(Value::Array(results));
+                            }
+                        }
+                    }
+                    // AI-native @lazy: return thunk (deferred computation)
+                    if let Expr::Ident(ref lfn_name) = callee.as_ref() {
+                        if self.lazy_fns.contains(lfn_name.as_str()) {
+                            if let Value::Fn(ref fn_inner) = func {
+                                let (ref _name, ref params, ref body) = **fn_inner;
+                                // Build thunk body: prepend let bindings for captured args
+                                let mut thunk_stmts: Vec<Stmt> = Vec::new();
+                                for (p, v) in params.iter().zip(arg_vals.iter()) {
+                                    let expr = match v {
+                                        Value::Int(i) => Expr::IntLit(*i),
+                                        Value::Float(f) => Expr::FloatLit(*f),
+                                        Value::Bool(b) => Expr::BoolLit(*b),
+                                        Value::Str(s) => Expr::StringLit(s.clone()),
+                                        _ => Expr::FloatLit(0.0),
+                                    };
+                                    thunk_stmts.push(Stmt::Let(p.clone(), None, Some(expr), crate::ast::Visibility::Private));
+                                }
+                                thunk_stmts.extend(body.iter().cloned());
+                                let thunk_name = format!("__lazy_thunk__{}", lfn_name);
+                                return Ok(Value::Fn(Box::new((thunk_name, vec![], Arc::new(thunk_stmts)))));
+                            }
+                        }
+                    }
+                    // AI-native @vectorize: auto array-lift when any arg is Array
+                    if let Expr::Ident(ref vfn_name) = callee.as_ref() {
+                        if self.vectorize_fns.contains_key(vfn_name.as_str()) {
+                            let has_array = arg_vals.iter().any(|v| matches!(v, Value::Array(_)));
+                            if has_array {
+                                let (params, body) = self.vectorize_fns.get(vfn_name.as_str()).cloned().unwrap();
+                                // Find the length from first array arg
+                                let arr_len = arg_vals.iter().find_map(|v| if let Value::Array(a) = v { Some(a.len()) } else { None }).unwrap();
+                                let mut results = Vec::with_capacity(arr_len);
+                                for idx in 0..arr_len {
+                                    self.env.push_scope();
+                                    for (pi, p) in params.iter().enumerate() {
+                                        let v = match &arg_vals[pi] {
+                                            Value::Array(a) => a[idx].clone(),
+                                            other => other.clone(), // broadcast scalar
+                                        };
+                                        self.env.define(p, v);
+                                    }
+                                    let mut result = Value::Void;
+                                    for s in body.iter() {
+                                        result = self.exec_stmt(s)?;
+                                        if self.return_value.is_some() {
+                                            result = self.return_value.take().unwrap();
+                                            break;
+                                        }
+                                    }
+                                    self.env.pop_scope();
+                                    results.push(result);
+                                }
+                                return Ok(Value::Array(results));
+                            }
+                        }
                     }
                     // Inline the common Value::Fn path to avoid call_function dispatch
                     if let Value::Fn(ref fn_inner) = func {
@@ -1620,7 +1824,7 @@ impl Interpreter {
                             self.runtime_err(format!("map key '{}' not found", k))
                         })
                     }
-                    _ => Err(self.type_err("invalid index operation".into())),
+                    _ => {
                         Err(self.type_err("invalid index operation".into()))
                     }
                 }
@@ -1643,7 +1847,7 @@ impl Interpreter {
                             self.runtime_err(format!("intent has no field '{}'", field_name))
                         })
                     }
-                    _ => Err(self.type_err("invalid index operation".into())),
+                    _ => {
                         // Store as a "method reference" -- will be called in Expr::Call
                         // We use a hack: return a BuiltinFn with a special name encoding
                         // But actually, Call(Field(obj, name), args) is the pattern
@@ -1835,7 +2039,7 @@ impl Interpreter {
                         OwnershipState::Dropped => {
                             return Err(self.runtime_err(format!("cannot move '{}': value has been dropped", name)));
                         }
-                        _ => Err(self.type_err("invalid index operation".into())),
+                        _ => {
                             let val = self.env.get(name).ok_or_else(|| {
                                 self.runtime_err(format!("undefined variable: {}", name))
                             })?;
@@ -1859,7 +2063,7 @@ impl Interpreter {
                         OwnershipState::Dropped => {
                             return Err(self.runtime_err(format!("cannot borrow '{}': value has been dropped", name)));
                         }
-                        _ => Err(self.type_err("invalid index operation".into())),
+                        _ => {
                             let val = self.env.get(name).ok_or_else(|| {
                                 self.runtime_err(format!("undefined variable: {}", name))
                             })?;
@@ -3058,6 +3262,17 @@ impl Interpreter {
                 self.writeln_output(&out);
                 Ok(Value::Void)
             }
+            "eprintln" => {
+                let mut out = String::new();
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 {
+                        out.push(' ');
+                    }
+                    out.push_str(&format!("{}", arg));
+                }
+                self.ewriteln_output(&out);
+                Ok(Value::Void)
+            }
             "len" => {
                 if args.is_empty() {
                     return Err(self.type_err("len() requires 1 argument".into()));
@@ -3556,11 +3771,39 @@ impl Interpreter {
                 if args.is_empty() { return Err(self.type_err("format() requires at least 1 argument".into())); }
                 match &args[0] {
                     Value::Str(template) => {
-                        let mut result = template.clone();
-                        for arg in &args[1..] {
-                            if let Some(pos) = result.find("{}") {
-                                result = format!("{}{}{}", &result[..pos], arg, &result[pos+2..]);
+                        let mut result = String::new();
+                        let mut arg_idx = 0usize;
+                        let chars: Vec<char> = template.chars().collect();
+                        let mut i = 0;
+                        while i < chars.len() {
+                            if chars[i] == '{' {
+                                if let Some(close) = chars[i..].iter().position(|&c| c == '}') {
+                                    let spec: String = chars[i+1..i+close].iter().collect();
+                                    if arg_idx < args.len() - 1 {
+                                        let arg = &args[1 + arg_idx];
+                                        if spec.is_empty() {
+                                            result.push_str(&format!("{}", arg));
+                                        } else if spec.starts_with(":.") {
+                                            if let Ok(prec) = spec[2..].parse::<usize>() {
+                                                match arg {
+                                                    Value::Float(f) => result.push_str(&format!("{:.*}", prec, f)),
+                                                    Value::Int(n) => result.push_str(&format!("{:.*}", prec, *n as f64)),
+                                                    other => result.push_str(&format!("{}", other)),
+                                                }
+                                            } else {
+                                                result.push_str(&format!("{}", arg));
+                                            }
+                                        } else {
+                                            result.push_str(&format!("{}", arg));
+                                        }
+                                        arg_idx += 1;
+                                    }
+                                    i += close + 1;
+                                    continue;
+                                }
                             }
+                            result.push(chars[i]);
+                            i += 1;
                         }
                         Ok(Value::Str(result))
                     }
@@ -4635,7 +4878,7 @@ impl Interpreter {
                                         Ok(Some(vec![(binding_name.clone(), data.as_ref().clone())]))
                                     }
                                     // Could be a literal for nested matching
-                                    _ => Err(self.type_err("invalid index operation".into())),
+                                    _ => {
                                         let pattern_val = self.eval_expr(bind_expr)?;
                                         if Self::values_equal(data.as_ref(), &pattern_val) {
                                             Ok(Some(vec![]))
@@ -4677,7 +4920,7 @@ impl Interpreter {
                                             Expr::Ident(binding_name) => {
                                                 return Ok(Some(vec![(binding_name.clone(), data.as_ref().clone())]));
                                             }
-                                            _ => Err(self.type_err("invalid index operation".into())),
+                                            _ => {
                                                 let pattern_val = self.eval_expr(&call_args[0])?;
                                                 if Self::values_equal(data.as_ref(), &pattern_val) {
                                                     return Ok(Some(vec![]));

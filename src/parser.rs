@@ -17,11 +17,13 @@ pub struct Parser {
     pending_link_attr: Option<String>,
     /// AI-native: pending attributes for next declaration.
     pending_attrs: Vec<Attribute>,
+    /// When true, parse_primary skips struct init (for while/if conditions)
+    no_struct_init: bool,
 }
 
 impl Parser {
     pub fn new(tokens: Vec<Spanned>) -> Self {
-        Parser { tokens, pos: 0, pending_link_attr: None, pending_attrs: vec![] }
+        Parser { tokens, pos: 0, pending_link_attr: None, pending_attrs: vec![], no_struct_init: false }
     }
 
     /// Construct from plain tokens (no span info). Convenience for tests.
@@ -29,7 +31,7 @@ impl Parser {
         let spanned = tokens.into_iter()
             .map(|t| Spanned::new(t, 0, 0))
             .collect();
-        Parser { tokens: spanned, pos: 0, pending_link_attr: None, pending_attrs: vec![] }
+        Parser { tokens: spanned, pos: 0, pending_link_attr: None, pending_attrs: vec![], no_struct_init: false }
     }
 
     /// Drain pending AI-native attributes.
@@ -331,6 +333,23 @@ impl Parser {
         // optional 'mut'
         if matches!(self.peek(), Token::Mut) {
             self.advance();
+        }
+        // tuple destructure: let (a, b) = expr
+        if matches!(self.peek(), Token::LParen) {
+            self.advance(); // consume '('
+            let mut names = Vec::new();
+            loop {
+                names.push(self.expect_ident()?);
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+            self.expect(&Token::RParen)?;
+            self.expect(&Token::Eq)?;
+            let expr = self.parse_expr()?;
+            return Ok(Stmt::LetTuple(names, expr));
         }
         let name = self.expect_ident()?;
         // optional type annotation
@@ -1483,7 +1502,7 @@ impl Parser {
 
     fn parse_while_stmt(&mut self) -> Result<Stmt, HexaError> {
         self.advance(); // consume 'while'
-        let cond = self.parse_expr()?;
+        self.no_struct_init = true; let cond = self.parse_expr()?; self.no_struct_init = false;
         let body = self.parse_block()?;
         Ok(Stmt::While(cond, body))
     }
@@ -1496,7 +1515,7 @@ impl Parser {
 
     fn parse_if_expr(&mut self) -> Result<Expr, HexaError> {
         self.advance(); // consume 'if'
-        let cond = self.parse_expr()?;
+        self.no_struct_init = true; let cond = self.parse_expr()?; self.no_struct_init = false;
         let then_block = self.parse_block()?;
         // Save position to allow backtracking if newlines precede else
         let saved_pos = self.pos;
@@ -1854,7 +1873,7 @@ impl Parser {
                 }
                 // Check for struct instantiation: Name { field: val, ... }
                 // Only if name starts with uppercase (convention)
-                else if matches!(self.peek(), Token::LBrace) && name.chars().next().map_or(false, |c| c.is_uppercase()) {
+                else if !self.no_struct_init && matches!(self.peek(), Token::LBrace) && name.chars().next().map_or(false, |c| c.is_uppercase()) {
                     self.advance(); // consume {
                     self.skip_newlines();
                     let mut fields = Vec::new();
