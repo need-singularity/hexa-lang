@@ -224,3 +224,54 @@ HexaVal hexa_type_of(HexaVal v) {
         default: return hexa_str("unknown");
     }
 }
+
+// ── Polymorphic add (int + or string concat) ─────────────
+
+HexaVal hexa_add(HexaVal a, HexaVal b) {
+    if (a.tag == TAG_INT && b.tag == TAG_INT) return hexa_int(a.i + b.i);
+    if (a.tag == TAG_FLOAT || b.tag == TAG_FLOAT) {
+        double fa = a.tag == TAG_FLOAT ? a.f : (double)a.i;
+        double fb = b.tag == TAG_FLOAT ? b.f : (double)b.i;
+        return hexa_float(fa + fb);
+    }
+    HexaVal sa = hexa_to_string(a);
+    HexaVal sb = hexa_to_string(b);
+    return hexa_str_concat(sa, sb);
+}
+
+// ── Polymorphic equality ─────────────────────────────────
+
+HexaVal hexa_eq(HexaVal a, HexaVal b) {
+    if (a.tag != b.tag) return hexa_bool(0);
+    switch (a.tag) {
+        case TAG_INT: return hexa_bool(a.i == b.i);
+        case TAG_FLOAT: return hexa_bool(a.f == b.f);
+        case TAG_BOOL: return hexa_bool(a.b == b.b);
+        case TAG_STR: return hexa_bool(strcmp(a.s, b.s) == 0);
+        case TAG_VOID: return hexa_bool(1);
+        default: return hexa_bool(0);
+    }
+}
+
+// ── File I/O ─────────────────────────────────────────────
+
+HexaVal hexa_read_file(HexaVal path) {
+    FILE* f = fopen(path.s, "r");
+    if (!f) return hexa_str("");
+    fseek(f, 0, SEEK_END);
+    long len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char* buf = malloc(len + 1);
+    fread(buf, 1, len, f);
+    buf[len] = 0;
+    fclose(f);
+    return hexa_str_own(buf);
+}
+
+HexaVal hexa_write_file(HexaVal path, HexaVal content) {
+    FILE* f = fopen(path.s, "w");
+    if (!f) return hexa_bool(0);
+    fputs(content.s, f);
+    fclose(f);
+    return hexa_bool(1);
+}
