@@ -143,6 +143,10 @@ HexaVal tokenize_c(const char* src) {
         // Multi-char operators
         if (c == '=' && pos+1 < len && src[pos+1] == '=') { tokens = hexa_array_push(tokens, make_token("EqEq", "==", line, col)); pos += 2; col += 2; continue; }
         if (c == '=' && pos+1 < len && src[pos+1] == '>') { tokens = hexa_array_push(tokens, make_token("FatArrow", "=>", line, col)); pos += 2; col += 2; continue; }
+        if (c == '+' && pos+1 < len && src[pos+1] == '=') { tokens = hexa_array_push(tokens, make_token("PlusEq", "+=", line, col)); pos += 2; col += 2; continue; }
+        if (c == '-' && pos+1 < len && src[pos+1] == '=') { tokens = hexa_array_push(tokens, make_token("MinusEq", "-=", line, col)); pos += 2; col += 2; continue; }
+        if (c == '*' && pos+1 < len && src[pos+1] == '=') { tokens = hexa_array_push(tokens, make_token("StarEq", "*=", line, col)); pos += 2; col += 2; continue; }
+        if (c == '/' && pos+1 < len && src[pos+1] == '=') { tokens = hexa_array_push(tokens, make_token("SlashEq", "/=", line, col)); pos += 2; col += 2; continue; }
         if (c == '!' && pos+1 < len && src[pos+1] == '=') { tokens = hexa_array_push(tokens, make_token("Ne", "!=", line, col)); pos += 2; col += 2; continue; }
         if (c == '<' && pos+1 < len && src[pos+1] == '=') { tokens = hexa_array_push(tokens, make_token("Le", "<=", line, col)); pos += 2; col += 2; continue; }
         if (c == '>' && pos+1 < len && src[pos+1] == '=') { tokens = hexa_array_push(tokens, make_token("Ge", ">=", line, col)); pos += 2; col += 2; continue; }
@@ -624,6 +628,23 @@ HexaVal parse_stmt() {
 
     // Expression or assignment
     HexaVal expr = parse_expr();
+    // Compound assignment: +=, -=, *=, /=
+    const char* compound_ops[] = {"PlusEq", "MinusEq", "StarEq", "SlashEq"};
+    const char* op_chars[] = {"+", "-", "*", "/"};
+    for (int _ci = 0; _ci < 4; _ci++) {
+        if (p_check(compound_ops[_ci])) {
+            p_advance();
+            HexaVal rhs = parse_expr();
+            HexaVal binop = mk_node("BinOp");
+            binop = hexa_map_set(binop, "op", hexa_str(op_chars[_ci]));
+            binop = hexa_map_set(binop, "left", expr);
+            binop = hexa_map_set(binop, "right", rhs);
+            HexaVal n = mk_node("AssignStmt");
+            n = hexa_map_set(n, "left", expr);
+            n = hexa_map_set(n, "right", binop);
+            return n;
+        }
+    }
     if (p_check("Eq")) {
         p_advance();
         HexaVal rhs = parse_expr();
