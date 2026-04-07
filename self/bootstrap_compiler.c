@@ -666,6 +666,7 @@ void gen_expr(HexaVal node, char* buf) {
 void gen_stmt(HexaVal node, int depth, char* buf) {
     const char* k = hexa_map_get(node, "kind").s;
     gen_indent(buf, depth);
+    char pad[64]; pad[0]=0; for(int _p=0;_p<depth;_p++) strcat(pad,"    ");
 
     if (strcmp(k,"LetStmt")==0||strcmp(k,"LetMutStmt")==0||strcmp(k,"ConstStmt")==0) {
         // Generate init expr into separate buffer to avoid corruption
@@ -690,6 +691,23 @@ void gen_stmt(HexaVal node, int depth, char* buf) {
         HexaVal expr = hexa_map_get(node,"left");
         if (expr.tag == TAG_STR && strlen(expr.s)==0) return;
         const char* ek = hexa_map_get(expr,"kind").s;
+        // Multi-arg println → separate print statements
+        if (strcmp(ek,"Call")==0) {
+            HexaVal cl = hexa_map_get(expr,"left");
+            if (cl.tag!=TAG_STR && strcmp(hexa_map_get(cl,"kind").s,"Ident")==0 &&
+                strcmp(hexa_map_get(cl,"name").s,"println")==0) {
+                HexaVal pa = hexa_map_get(expr,"args");
+                if (pa.tag==TAG_ARRAY) {
+                    for (int _i=0;_i<pa.arr.len;_i++) {
+                        if(_i>0) { gen_indent(buf,depth); strcat(buf,"printf(\" \");\n"); }
+                        gen_indent(buf,depth);
+                        strcat(buf,"hexa_print_val("); gen_expr(pa.arr.items[_i],buf); strcat(buf,");\n");
+                    }
+                    gen_indent(buf,depth); strcat(buf,"printf(\"\\n\");\n");
+                    return;
+                }
+            }
+        }
         if (strcmp(ek,"IfExpr")==0) {
             strcat(buf, "if (hexa_truthy("); gen_expr(hexa_map_get(expr,"cond"), buf); strcat(buf, ")) {\n");
             HexaVal tb = hexa_map_get(expr,"then_body");
@@ -1070,26 +1088,26 @@ int main(int argc, char** argv) {
     printf("[5a] Assembly: %d chars -> %s\n", (int)strlen(asm_code), asm_file);
     free(asm_code);
 
-    // Try as + ld (macOS built-in, zero install)
-    char obj_file[256]; sprintf(obj_file, "%s.o", output);
-    sprintf(cmd, "as %s -o %s 2>/dev/null", asm_file, obj_file);
-    if (system(cmd) == 0) {
-        char sdk[512] = "";
-        FILE* p = popen("xcrun --show-sdk-path 2>/dev/null", "r");
-        if (p) { fgets(sdk, sizeof(sdk), p); pclose(p); sdk[strcspn(sdk,"\n")] = 0; }
-        if (strlen(sdk) > 0)
-            sprintf(cmd, "ld %s -o %s -lSystem -L%s/usr/lib 2>/dev/null", obj_file, output, sdk);
-        else
-            sprintf(cmd, "ld %s -o %s -lSystem 2>/dev/null", obj_file, output);
-        ret = system(cmd);
-        if (ret == 0) printf("[5b] Linked with as+ld (zero install)\n");
-    }
+    // Try gcc first (best optimization + full feature support)
+    sprintf(cmd, "gcc -O2 -I ready/self %s -o %s 2>/dev/null", c_file, output);
+    ret = system(cmd);
+    if (ret == 0) printf("[5b] Compiled with gcc -O2\n");
 
-    // Fallback to gcc if as+ld failed
+    // Fallback to as+ld if gcc not available
     if (ret != 0) {
-        sprintf(cmd, "gcc -O2 -I ready/self %s -o %s 2>&1", c_file, output);
-        printf("[5c] %s\n", cmd);
-        ret = system(cmd);
+        char obj_file2[256]; sprintf(obj_file2, "%s.o", output);
+        sprintf(cmd, "as %s -o %s 2>/dev/null", asm_file, obj_file2);
+        if (system(cmd) == 0) {
+            char sdk2[512] = "";
+            FILE* p2 = popen("xcrun --show-sdk-path 2>/dev/null", "r");
+            if (p2) { fgets(sdk2, sizeof(sdk2), p2); pclose(p2); sdk2[strcspn(sdk2,"\n")] = 0; }
+            if (strlen(sdk2) > 0)
+                sprintf(cmd, "ld %s -o %s -lSystem -L%s/usr/lib 2>/dev/null", obj_file2, output, sdk2);
+            else
+                sprintf(cmd, "ld %s -o %s -lSystem 2>/dev/null", obj_file2, output);
+            ret = system(cmd);
+            if (ret == 0) printf("[5d] Linked with as+ld fallback\n");
+        }
     }
     if (ret == 0) {
         printf("\n=== BUILD SUCCESS: %s ===\n", output);
