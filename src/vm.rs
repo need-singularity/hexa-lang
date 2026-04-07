@@ -15,6 +15,8 @@ struct CallFrame {
     return_code_idx: usize,
     /// Base index in the local slots for this frame.
     local_base: usize,
+    /// @memoize: if Some((fn_idx, args_hash)), cache result on return.
+    memo_key: Option<(usize, u64)>,
 }
 
 /// Stack-based bytecode virtual machine.
@@ -50,6 +52,10 @@ pub struct VM {
     global_set: Vec<bool>,
     /// Output capture buffer: when set, Print/Println write here instead of stdout.
     output_capture: Option<Arc<Mutex<String>>>,
+    /// @memoize cache: fn_index -> (args_hash -> cached result).
+    memo_cache: HashMap<usize, HashMap<u64, Value>>,
+    /// Which fn_table entries are @memoize.
+    fn_is_memoize: Vec<bool>,
 }
 
 impl VM {
@@ -72,6 +78,8 @@ impl VM {
             global_values: Vec::new(),
             global_set: Vec::new(),
             output_capture: None,
+            memo_cache: HashMap::new(),
+            fn_is_memoize: Vec::new(),
         }
     }
 
@@ -119,9 +127,11 @@ impl VM {
         self.code_segments = vec![Vec::new()];
         self.fn_code_idx = Vec::new();
 
+        self.fn_is_memoize = Vec::new();
         for (i, name) in self.string_pool.iter().enumerate() {
             if let Some(func) = self.functions.get(name) {
                 let fn_idx = self.fn_table.len();
+                self.fn_is_memoize.push(func.is_memoize);
                 self.fn_table.push(func.clone());
                 self.fn_index[i] = fn_idx as u32;
                 // Store function code as a new segment (with Return sentinel)
@@ -580,6 +590,29 @@ impl VM {
                     let fn_idx = unsafe { *self.fn_index.get_unchecked(str_idx) };
                     if fn_idx != u32::MAX {
                         let fn_idx = fn_idx as usize;
+
+                        // @memoize: check cache before execution
+                        let is_memo = fn_idx < self.fn_is_memoize.len() && unsafe { *self.fn_is_memoize.get_unchecked(fn_idx) };
+                        let mut memo_key: Option<(usize, u64)> = None;
+                        if is_memo {
+                            let stack_start = self.stack.len() - argc;
+                            let args_hash = {
+                                use std::hash::{Hash, Hasher};
+                                let mut h = std::collections::hash_map::DefaultHasher::new();
+                                for i in stack_start..self.stack.len() {
+                                    format!("{:?}", self.stack[i]).hash(&mut h);
+                                }
+                                h.finish()
+                            };
+                            if let Some(cached) = self.memo_cache.get(&fn_idx).and_then(|m| m.get(&args_hash)) {
+                                // Cache hit — pop args, push cached result
+                                self.stack.truncate(stack_start);
+                                self.stack.push(cached.clone());
+                                continue;
+                            }
+                            memo_key = Some((fn_idx, args_hash));
+                        }
+
                         let func = unsafe { self.fn_table.get_unchecked(fn_idx) };
                         let arity = func.arity;
                         if argc != arity {
@@ -593,7 +626,7 @@ impl VM {
                         if needed > self.locals.len() {
                             self.locals.resize(needed, Value::Void);
                         }
-                        // Move args from stack to locals via unsafe ptr copy (avoids per-element bounds check)
+                        // Move args from stack to locals via unsafe ptr copy
                         let stack_start = self.stack.len() - argc;
                         unsafe {
                             let src = self.stack.as_ptr().add(stack_start);
@@ -607,6 +640,7 @@ impl VM {
                             return_ip: ip,
                             return_code_idx: code_idx,
                             local_base: new_local_base,
+                            memo_key,
                         });
                         code_idx = unsafe { *self.fn_code_idx.get_unchecked(fn_idx) };
                         reload_code!(self, code_idx);
@@ -627,6 +661,10 @@ impl VM {
                     }
                     // FLAT DISPATCH: restore caller's code segment and IP
                     let frame = unsafe { self.frames.pop().unwrap_unchecked() };
+                    // @memoize: cache result on return
+                    if let Some((fn_idx, args_hash)) = frame.memo_key {
+                        self.memo_cache.entry(fn_idx).or_default().insert(args_hash, val.clone());
+                    }
                     self.locals.truncate(frame.local_base);
                     ip = frame.return_ip;
                     code_idx = frame.return_code_idx;
@@ -928,6 +966,7 @@ impl VM {
             return_ip: 0, // not used — run_flat returns when frames empty
             return_code_idx: 0,
             local_base: new_local_base,
+            memo_key: None,
         });
 
         let result = self.run_flat(tmp_code_idx)?;

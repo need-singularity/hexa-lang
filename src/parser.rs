@@ -15,11 +15,13 @@ pub struct Parser {
     pos: usize,
     /// Pending @link("lib") attribute for the next extern fn declaration.
     pending_link_attr: Option<String>,
+    /// AI-native: pending attributes for next declaration.
+    pending_attrs: Vec<Attribute>,
 }
 
 impl Parser {
     pub fn new(tokens: Vec<Spanned>) -> Self {
-        Parser { tokens, pos: 0, pending_link_attr: None }
+        Parser { tokens, pos: 0, pending_link_attr: None, pending_attrs: vec![] }
     }
 
     /// Construct from plain tokens (no span info). Convenience for tests.
@@ -27,7 +29,12 @@ impl Parser {
         let spanned = tokens.into_iter()
             .map(|t| Spanned::new(t, 0, 0))
             .collect();
-        Parser { tokens: spanned, pos: 0, pending_link_attr: None }
+        Parser { tokens: spanned, pos: 0, pending_link_attr: None, pending_attrs: vec![] }
+    }
+
+    /// Drain pending AI-native attributes.
+    fn take_attrs(&mut self) -> Vec<Attribute> {
+        std::mem::take(&mut self.pending_attrs)
     }
 
     // ── Helpers ──────────────────────────────────────────────
@@ -207,8 +214,8 @@ impl Parser {
                 let body = self.parse_block()?;
                 Ok(Stmt::ConsciousnessBlock(name, body))
             }
-            Token::Ident(ref s) if s == "@link" => {
-                self.advance(); // consume '@link'
+            Token::Attribute(ref s) if &**s == "link" => {
+                self.advance(); // consume @link
                 self.expect(&Token::LParen)?;
                 let lib_name = match self.peek().clone() {
                     Token::StringLit(s) => { self.advance(); s.to_string() }
@@ -217,11 +224,10 @@ impl Parser {
                 self.expect(&Token::RParen)?;
                 self.pending_link_attr = Some(lib_name);
                 self.skip_newlines();
-                // Now parse the extern fn that follows
                 return self.parse_stmt();
             }
-            Token::Ident(ref s) if s == "@evolve" => {
-                self.advance(); // consume '@evolve'
+            Token::Attribute(ref s) if &**s == "evolve" => {
+                self.advance(); // consume @evolve
                 self.expect(&Token::Fn)?;
                 let name = self.expect_ident()?;
                 let type_params = if matches!(self.peek(), Token::Lt) {
@@ -239,7 +245,58 @@ impl Parser {
                 let body = self.parse_block()?;
                 Ok(Stmt::EvolveFn(FnDecl {
                     name, type_params, params, ret_type, where_clauses, precondition: None, postcondition: None, body, vis, is_pure: false,
+                    attrs: vec![Attribute::new(crate::token::AttrKind::Evolve)],
                 }))
+            }
+            // AI-native: any other @attr before a declaration
+            Token::Attribute(_) => {
+                // Collect all consecutive attributes
+                let mut attrs = Vec::new();
+                while let Token::Attribute(ref attr_name) = self.peek().clone() {
+                    let name_str = attr_name.to_string();
+                    self.advance();
+                    let kind = if matches!(self.peek(), Token::LParen) {
+                        self.advance(); // (
+                        match name_str.as_str() {
+                            "link" => {
+                                let lib = match self.peek().clone() {
+                                    Token::StringLit(s) => { self.advance(); s.to_string() }
+                                    _ => return Err(self.error("expected string after @link(".into())),
+                                };
+                                self.expect(&Token::RParen)?;
+                                crate::token::AttrKind::Link(lib)
+                            }
+                            "bounded" => {
+                                let n = match self.peek().clone() {
+                                    Token::IntLit(n) => { self.advance(); n }
+                                    _ => return Err(self.error("expected int after @bounded(".into())),
+                                };
+                                self.expect(&Token::RParen)?;
+                                crate::token::AttrKind::Bounded(n)
+                            }
+                            "deprecated" => {
+                                let msg = match self.peek().clone() {
+                                    Token::StringLit(s) => { self.advance(); Some(s.to_string()) }
+                                    _ => None,
+                                };
+                                self.expect(&Token::RParen)?;
+                                crate::token::AttrKind::Deprecated(msg)
+                            }
+                            _ => {
+                                while !matches!(self.peek(), Token::RParen | Token::Eof) { self.advance(); }
+                                self.expect(&Token::RParen)?;
+                                crate::token::AttrKind::Custom(name_str.clone())
+                            }
+                        }
+                    } else {
+                        crate::token::AttrKind::from_name(&name_str)
+                    };
+                    attrs.push(Attribute::new(kind));
+                    self.skip_newlines();
+                }
+                // Store attrs for next declaration to consume
+                self.pending_attrs = attrs;
+                self.parse_stmt()
             }
             _ => {
                 let expr = self.parse_expr()?;
@@ -581,7 +638,7 @@ impl Parser {
             let body = self.parse_block()?;
             return Ok(Stmt::ComptimeFn(FnDecl {
                 name, type_params, params, ret_type, where_clauses, precondition: None, postcondition: None, body,
-                vis: Visibility::Private, is_pure: false,
+                vis: Visibility::Private, is_pure: false, attrs: vec![],
             }));
         }
         // comptime const name = expr — compile-time constant
@@ -646,7 +703,7 @@ impl Parser {
             None
         };
         let body = self.parse_block()?;
-        Ok(Stmt::AsyncFnDecl(FnDecl { name, type_params, params, ret_type, where_clauses: vec![], precondition: None, postcondition: None, body, vis, is_pure: false }))
+        Ok(Stmt::AsyncFnDecl(FnDecl { name, type_params, params, ret_type, where_clauses: vec![], precondition: None, postcondition: None, body, vis, is_pure: false, attrs: vec![] }))
     }
 
     fn parse_select(&mut self) -> Result<Stmt, HexaError> {
@@ -842,6 +899,7 @@ impl Parser {
             body,
             vis: Visibility::Private,
             is_pure: false,
+            attrs: vec![],
         };
         Ok(Stmt::Optimize(decl))
     }
@@ -1165,7 +1223,15 @@ impl Parser {
         // Parse optional ensures clause: postcondition expression
         let postcondition = self.parse_ensures_clause()?;
         let body = self.parse_block()?;
-        Ok(Stmt::FnDecl(FnDecl { name, type_params, params, ret_type, where_clauses, precondition, postcondition, body, vis, is_pure: false }))
+        let attrs = self.take_attrs();
+        let is_evolve = attrs.iter().any(|a| matches!(a.kind, crate::token::AttrKind::Evolve));
+        let is_pure = attrs.iter().any(|a| matches!(a.kind, crate::token::AttrKind::Pure));
+        let decl = FnDecl { name, type_params, params, ret_type, where_clauses, precondition, postcondition, body, vis, is_pure, attrs };
+        if is_evolve {
+            Ok(Stmt::EvolveFn(decl))
+        } else {
+            Ok(Stmt::FnDecl(decl))
+        }
     }
 
     /// Parse type parameters: `<T>`, `<T: Display>`, `<T, U>`, `<T: Display, U: Clone>`
@@ -1290,7 +1356,8 @@ impl Parser {
             self.skip_newlines();
         }
         self.expect(&Token::RBrace)?;
-        Ok(Stmt::StructDecl(StructDecl { name, type_params, fields, vis }))
+        let attrs = self.take_attrs();
+        Ok(Stmt::StructDecl(StructDecl { name, type_params, fields, vis, attrs }))
     }
 
     fn parse_enum_decl(&mut self, vis: Visibility) -> Result<Stmt, HexaError> {
@@ -1354,7 +1421,7 @@ impl Parser {
             } else {
                 vec![]
             };
-            methods.push(FnDecl { name: m_name, type_params: vec![], params: m_params, ret_type: m_ret, where_clauses: vec![], precondition: None, postcondition: None, body: m_body, vis: m_vis, is_pure: false });
+            methods.push(FnDecl { name: m_name, type_params: vec![], params: m_params, ret_type: m_ret, where_clauses: vec![], precondition: None, postcondition: None, body: m_body, vis: m_vis, is_pure: false, attrs: vec![] });
             self.skip_newlines();
         }
         self.expect(&Token::RBrace)?;
@@ -1392,7 +1459,7 @@ impl Parser {
                 None
             };
             let m_body = self.parse_block()?;
-            methods.push(FnDecl { name: m_name, type_params: vec![], params: m_params, ret_type: m_ret, where_clauses: vec![], precondition: None, postcondition: None, body: m_body, vis: m_vis, is_pure: false });
+            methods.push(FnDecl { name: m_name, type_params: vec![], params: m_params, ret_type: m_ret, where_clauses: vec![], precondition: None, postcondition: None, body: m_body, vis: m_vis, is_pure: false, attrs: vec![] });
             self.skip_newlines();
         }
         self.expect(&Token::RBrace)?;
@@ -2059,7 +2126,7 @@ impl Parser {
             vec![]
         };
         let body = self.parse_block()?;
-        Ok(Stmt::FnDecl(FnDecl { name, type_params, params, ret_type, where_clauses, precondition: None, postcondition: None, body, vis, is_pure: true }))
+        Ok(Stmt::FnDecl(FnDecl { name, type_params, params, ret_type, where_clauses, precondition: None, postcondition: None, body, vis, is_pure: true, attrs: vec![] }))
     }
 
     /// Parse `handle { body } with { Effect.op(params) => { handler }, ... }`
@@ -2275,6 +2342,32 @@ mod tests {
             assert_eq!(decl.ret_type.as_deref(), Some("int"));
         } else {
             panic!("expected EvolveFn");
+        }
+    }
+
+    #[test]
+    fn test_parse_memoize_attr() {
+        let src = "@memoize fn fib(n) {\n  n\n}";
+        let stmts = parse_source(src);
+        if let Stmt::FnDecl(decl) = &stmts[0] {
+            assert_eq!(decl.name, "fib");
+            assert!(!decl.attrs.is_empty(), "attrs should not be empty");
+            assert!(matches!(decl.attrs[0].kind, crate::token::AttrKind::Memoize));
+        } else {
+            panic!("expected FnDecl, got {:?}", &stmts[0]);
+        }
+    }
+
+    #[test]
+    fn test_parse_multiple_attrs() {
+        let src = "@pure @inline fn add(a, b) {\n  a + b\n}";
+        let stmts = parse_source(src);
+        if let Stmt::FnDecl(decl) = &stmts[0] {
+            assert_eq!(decl.attrs.len(), 2);
+            assert!(matches!(decl.attrs[0].kind, crate::token::AttrKind::Pure));
+            assert!(matches!(decl.attrs[1].kind, crate::token::AttrKind::Inline));
+        } else {
+            panic!("expected FnDecl");
         }
     }
 

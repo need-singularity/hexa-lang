@@ -454,6 +454,7 @@ mod tests {
                 ],
                 vis: Visibility::Private,
                 is_pure: false,
+                attrs: vec![],
             }),
         ];
         let map = analyze_program(&stmts);

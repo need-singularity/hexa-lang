@@ -100,6 +100,8 @@ pub struct Interpreter {
     pub debug_hook: Option<Arc<Mutex<crate::debugger::DebugHook>>>,
     /// Registered extern function declarations (name -> ExternFnDecl).
     extern_fns: HashMap<String, crate::ast::ExternFnDecl>,
+    /// @memoize cache: fn_name -> (args_hash -> cached_result)
+    memo_cache: HashMap<String, HashMap<u64, Value>>,
     /// Loaded shared libraries: lib_path -> handle (dlopen result).
     #[cfg(not(target_arch = "wasm32"))]
     loaded_libs: HashMap<String, *mut std::ffi::c_void>,
@@ -160,6 +162,7 @@ impl Interpreter {
             #[cfg(not(target_arch = "wasm32"))]
             debug_hook: None,
             extern_fns: HashMap::new(),
+            memo_cache: HashMap::new(),
             #[cfg(not(target_arch = "wasm32"))]
             loaded_libs: HashMap::new(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -494,7 +497,10 @@ impl Interpreter {
                     self.env.define(&decl.name, fn_val);
                 } else {
                     let param_names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
-                    let internal_name = if decl.is_pure {
+                    let has_memoize = decl.attrs.iter().any(|a| matches!(a.kind, crate::token::AttrKind::Memoize));
+                    let internal_name = if has_memoize {
+                        format!("__memoize__{}", decl.name)
+                    } else if decl.is_pure {
                         format!("__pure__{}", decl.name)
                     } else {
                         decl.name.clone()
@@ -1402,7 +1408,39 @@ impl Interpreter {
                                     params.len(), arg_vals.len()
                                 )));
                             }
-                            let is_pure = _name.starts_with("__pure__");
+                            let is_memoize = _name.starts_with("__memoize__");
+                            let is_pure = _name.starts_with("__pure__") || is_memoize;
+                            // @memoize: check cache before execution
+                            if is_memoize {
+                                let fn_key = _name.clone();
+                                let args_hash = {
+                                    use std::hash::{Hash, Hasher};
+                                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                                    format!("{:?}", arg_vals).hash(&mut h);
+                                    h.finish()
+                                };
+                                if let Some(cached) = self.memo_cache.get(&fn_key).and_then(|m| m.get(&args_hash)) {
+                                    return Ok(cached.clone());
+                                }
+                                let prev_pure = self.in_pure_fn;
+                                self.in_pure_fn = true;
+                                self.env.push_scope();
+                                for (param, arg) in params.iter().zip(arg_vals.clone()) {
+                                    self.env.define(param, arg);
+                                }
+                                let mut result = Value::Void;
+                                for stmt in body.iter() {
+                                    result = self.exec_stmt(stmt)?;
+                                    if self.return_value.is_some() {
+                                        result = self.return_value.take().unwrap();
+                                        break;
+                                    }
+                                }
+                                self.env.pop_scope();
+                                self.in_pure_fn = prev_pure;
+                                self.memo_cache.entry(fn_key).or_default().insert(args_hash, result.clone());
+                                return Ok(result);
+                            }
                             let prev_pure = self.in_pure_fn;
                             if is_pure { self.in_pure_fn = true; }
                             self.env.push_scope();
@@ -2197,7 +2235,39 @@ impl Interpreter {
                         args.len()
                     )));
                 }
-                let is_pure = _name.starts_with("__pure__");
+                let is_memoize = _name.starts_with("__memoize__");
+                let is_pure = _name.starts_with("__pure__") || is_memoize;
+                // @memoize: check cache before execution
+                if is_memoize {
+                    let fn_key = _name.clone();
+                    let args_hash = {
+                        use std::hash::{Hash, Hasher};
+                        let mut h = std::collections::hash_map::DefaultHasher::new();
+                        format!("{:?}", args).hash(&mut h);
+                        h.finish()
+                    };
+                    if let Some(cached) = self.memo_cache.get(&fn_key).and_then(|m| m.get(&args_hash)) {
+                        return Ok(cached.clone());
+                    }
+                    let prev_pure = self.in_pure_fn;
+                    self.in_pure_fn = true;
+                    self.env.push_scope();
+                    for (param, arg) in params.iter().zip(args) {
+                        self.env.define(param, arg);
+                    }
+                    let mut result = Value::Void;
+                    for stmt in body.iter() {
+                        result = self.exec_stmt(stmt)?;
+                        if self.return_value.is_some() {
+                            result = self.return_value.take().unwrap();
+                            break;
+                        }
+                    }
+                    self.env.pop_scope();
+                    self.in_pure_fn = prev_pure;
+                    self.memo_cache.entry(fn_key).or_default().insert(args_hash, result.clone());
+                    return Ok(result);
+                }
                 let prev_pure = self.in_pure_fn;
                 if is_pure { self.in_pure_fn = true; }
                 self.env.push_scope();

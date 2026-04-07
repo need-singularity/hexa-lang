@@ -123,7 +123,7 @@ impl UnrollCtx {
                     postcondition: decl.postcondition.clone(),
                     body: optimized_body,
                     vis: decl.vis.clone(),
-                    is_pure: decl.is_pure,
+                    is_pure: decl.is_pure, attrs: decl.attrs.clone(),
                 })
             }
             Stmt::While(cond, body) => {
@@ -330,6 +330,7 @@ mod tests {
             ],
             vis: Visibility::Private,
             is_pure: false,
+            attrs: vec![],
         };
         let stmts = vec![Stmt::FnDecl(decl)];
         let result = unroll_loops(&stmts);
