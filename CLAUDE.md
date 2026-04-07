@@ -1,6 +1,6 @@
 > 🔴 **AI-NATIVE FIRST**: 성능/자원 개선은 저수준 마이크로 최적화 금지 — **AI-native 알고리즘 교체로 돌파**만 추구. docs/ai-native.md 24종 벡터 로드맵 참조. @optimize/@memoize/@fuse/@parallel 등 attr 시스템으로 구현.
 
-> 🔴 **HEXA-FIRST**: 모든 코드는 `.hexa`로 작성. sh/py/rs 신규 작성 금지. 부하 유발 명령 최소화.
+> 🔴 **HEXA-FIRST**: 모든 코드는 `.hexa`로 작성. 부하 유발 명령 최소화.
 > - **예외**: 이 리포의 컴파일러 Rust 소스(`src/`) — 컴파일러 자체 코드이므로 제외
 
 > 🔴 **NEXUS-6 특이점 연동**: 이 프로젝트의 돌파/발견/실험은 nexus 특이점 사이클 입력이다.
@@ -18,7 +18,7 @@
   ═══════════════════════════════════════════════════════════════
 
   공통 규칙 (R1~R8):
-    R1  HEXA-FIRST — .hexa만, sh/py/rs 신규 금지
+    R1  HEXA-FIRST — .hexa만
     R2  하드코딩 절대 금지 — shared/*.jsonl 동적 로드
     R3  NEXUS-6 스캔 의무 — 변경 전후 스캔, 스캔 없이 커밋 금지
     R4  CDO 수렴 — 이슈→해결→규칙승격→재발0
