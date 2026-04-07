@@ -265,7 +265,7 @@ Hexa @optimize fib(90):      <1 µs   (7 × 12 = ~84 정수 연산) ★
 | # | Attr | 설명 | 상태 |
 |---|------|------|------|
 | 1 | `@memoize` | O(2^n) → O(n) 자동 캐싱 | ✅ Rust 동급 |
-| 2 | `@optimize` | 점화식 → 행렬 거듭제곱 O(n)→O(log n) | 📋 |
+| 2 | `@optimize` | 점화식 → 행렬 거듭제곱 O(n)→O(log n) | ✅ 네이티브 JIT |
 | 3 | `@optimize` | 버블소트 → 머지소트 O(n²)→O(n log n) | 📋 |
 | 4 | `@optimize` | 선형탐색 → 이진탐색 O(n)→O(log n) | 📋 |
 | 5 | `@optimize` | 행렬곱 → Strassen O(n³)→O(n^2.37) | 📋 |
