@@ -189,33 +189,605 @@ HexaVal tokenize_c(const char* src) {
 // MAIN — read .hexa file, tokenize, report
 // ══════════════════════════════════════════════════════════
 
+
+// ══════════════════════════════════════════════════════════
+// PARSER — recursive descent, produces Map-based AST
+// ══════════════════════════════════════════════════════════
+
+static HexaVal p_tokens;
+static int p_pos = 0;
+
+HexaVal p_peek() { return p_pos < p_tokens.arr.len ? p_tokens.arr.items[p_pos] : make_token("Eof","",0,0); }
+const char* p_kind() { return hexa_map_get(p_peek(), "kind").s; }
+void p_advance() { if (p_pos < p_tokens.arr.len) p_pos++; }
+void p_skip_nl() { while (strcmp(p_kind(), "Newline") == 0) p_advance(); }
+
+int p_check(const char* k) { return strcmp(p_kind(), k) == 0; }
+void p_expect(const char* k) {
+    if (!p_check(k)) { fprintf(stderr, "Parse error: expected %s, got %s\n", k, p_kind()); }
+    p_advance();
+}
+const char* p_expect_ident() {
+    if (!p_check("Ident")) { fprintf(stderr, "Parse error: expected Ident, got %s\n", p_kind()); return ""; }
+    const char* v = hexa_map_get(p_peek(), "value").s;
+    p_advance();
+    return v;
+}
+
+// Forward declarations
+HexaVal parse_if();
+HexaVal parse_expr();
+HexaVal parse_stmt();
+HexaVal parse_block();
+
+HexaVal mk_node(const char* kind) {
+    HexaVal m = hexa_map_new();
+    m = hexa_map_set(m, "kind", hexa_str(kind));
+    m = hexa_map_set(m, "name", hexa_str(""));
+    m = hexa_map_set(m, "value", hexa_str(""));
+    m = hexa_map_set(m, "op", hexa_str(""));
+    m = hexa_map_set(m, "left", hexa_str(""));
+    m = hexa_map_set(m, "right", hexa_str(""));
+    m = hexa_map_set(m, "cond", hexa_str(""));
+    m = hexa_map_set(m, "then_body", hexa_str(""));
+    m = hexa_map_set(m, "else_body", hexa_str(""));
+    m = hexa_map_set(m, "params", hexa_str(""));
+    m = hexa_map_set(m, "body", hexa_str(""));
+    m = hexa_map_set(m, "args", hexa_str(""));
+    m = hexa_map_set(m, "items", hexa_str(""));
+    m = hexa_map_set(m, "iter_expr", hexa_str(""));
+    m = hexa_map_set(m, "ret_type", hexa_str(""));
+    return m;
+}
+
+// ── Expressions ──────────────────────────────────────────
+
+HexaVal parse_primary() {
+    const char* k = p_kind();
+    if (p_check("IntLit")) { HexaVal n = mk_node("IntLit"); n = hexa_map_set(n, "value", hexa_map_get(p_peek(), "value")); p_advance(); return n; }
+    if (p_check("FloatLit")) { HexaVal n = mk_node("FloatLit"); n = hexa_map_set(n, "value", hexa_map_get(p_peek(), "value")); p_advance(); return n; }
+    if (p_check("BoolLit")) { HexaVal n = mk_node("BoolLit"); n = hexa_map_set(n, "value", hexa_map_get(p_peek(), "value")); p_advance(); return n; }
+    if (p_check("StringLit")) { HexaVal n = mk_node("StringLit"); n = hexa_map_set(n, "value", hexa_map_get(p_peek(), "value")); p_advance(); return n; }
+    if (p_check("Ident")) {
+        HexaVal n = mk_node("Ident");
+        n = hexa_map_set(n, "name", hexa_map_get(p_peek(), "value"));
+        p_advance();
+        return n;
+    }
+    if (p_check("LParen")) { p_advance(); HexaVal e = parse_expr(); p_expect("RParen"); return e; }
+    if (p_check("LBracket")) {
+        p_advance();
+        HexaVal items = hexa_array_new();
+        while (!p_check("RBracket") && !p_check("Eof")) {
+            items = hexa_array_push(items, parse_expr());
+            if (p_check("Comma")) p_advance();
+        }
+        p_expect("RBracket");
+        HexaVal n = mk_node("Array"); n = hexa_map_set(n, "items", items); return n;
+    }
+    if (p_check("If")) return parse_if();
+    if (p_check("BitOr")) {
+        // Lambda: |params| expr
+        p_advance();
+        HexaVal params = hexa_array_new();
+        while (!p_check("BitOr") && !p_check("Eof")) {
+            const char* pn = p_expect_ident();
+            params = hexa_array_push(params, hexa_str(pn));
+            if (p_check("Comma")) p_advance();
+        }
+        p_expect("BitOr");
+        HexaVal body = p_check("LBrace") ? parse_block() : parse_expr();
+        HexaVal n = mk_node("Lambda");
+        n = hexa_map_set(n, "params", params);
+        n = hexa_map_set(n, "left", body);
+        return n;
+    }
+    if (p_check("Minus")) {
+        p_advance();
+        HexaVal n = mk_node("UnaryOp");
+        n = hexa_map_set(n, "op", hexa_str("-"));
+        n = hexa_map_set(n, "left", parse_primary());
+        return n;
+    }
+    if (p_check("Bang")) {
+        p_advance();
+        HexaVal n = mk_node("UnaryOp");
+        n = hexa_map_set(n, "op", hexa_str("!"));
+        n = hexa_map_set(n, "left", parse_primary());
+        return n;
+    }
+    fprintf(stderr, "Unexpected token: %s '%s'\n", p_kind(), hexa_map_get(p_peek(), "value").s);
+    p_advance();
+    return mk_node("Void");
+}
+
+HexaVal parse_postfix() {
+    HexaVal expr = parse_primary();
+    for (;;) {
+        if (p_check("LParen")) {
+            p_advance();
+            HexaVal args = hexa_array_new();
+            while (!p_check("RParen") && !p_check("Eof")) {
+                args = hexa_array_push(args, parse_expr());
+                if (p_check("Comma")) p_advance();
+            }
+            p_expect("RParen");
+            HexaVal call = mk_node("Call");
+            call = hexa_map_set(call, "left", expr);
+            call = hexa_map_set(call, "args", args);
+            expr = call;
+        } else if (p_check("Dot")) {
+            p_advance();
+            const char* field = p_expect_ident();
+            HexaVal f = mk_node("Field");
+            f = hexa_map_set(f, "left", expr);
+            f = hexa_map_set(f, "name", hexa_str(field));
+            expr = f;
+        } else if (p_check("LBracket")) {
+            p_advance();
+            HexaVal idx = parse_expr();
+            p_expect("RBracket");
+            HexaVal ix = mk_node("Index");
+            ix = hexa_map_set(ix, "left", expr);
+            ix = hexa_map_set(ix, "right", idx);
+            expr = ix;
+        } else break;
+    }
+    return expr;
+}
+
+int prec(const char* op) {
+    if (strcmp(op,"Or")==0) return 1;
+    if (strcmp(op,"And")==0) return 2;
+    if (strcmp(op,"EqEq")==0||strcmp(op,"Ne")==0) return 3;
+    if (strcmp(op,"Lt")==0||strcmp(op,"Gt")==0||strcmp(op,"Le")==0||strcmp(op,"Ge")==0) return 4;
+    if (strcmp(op,"Plus")==0||strcmp(op,"Minus")==0) return 5;
+    if (strcmp(op,"Star")==0||strcmp(op,"Slash")==0||strcmp(op,"Percent")==0) return 6;
+    if (strcmp(op,"Range")==0) return 0;
+    return -1;
+}
+
+const char* op_str(const char* k) {
+    if (strcmp(k,"Plus")==0) return "+"; if (strcmp(k,"Minus")==0) return "-";
+    if (strcmp(k,"Star")==0) return "*"; if (strcmp(k,"Slash")==0) return "/";
+    if (strcmp(k,"Percent")==0) return "%";
+    if (strcmp(k,"EqEq")==0) return "=="; if (strcmp(k,"Ne")==0) return "!=";
+    if (strcmp(k,"Lt")==0) return "<"; if (strcmp(k,"Gt")==0) return ">";
+    if (strcmp(k,"Le")==0) return "<="; if (strcmp(k,"Ge")==0) return ">=";
+    if (strcmp(k,"And")==0) return "&&"; if (strcmp(k,"Or")==0) return "||";
+    if (strcmp(k,"Range")==0) return "..";
+    return k;
+}
+
+HexaVal parse_binop(int min_prec) {
+    HexaVal left = parse_postfix();
+    for (;;) {
+        int p = prec(p_kind());
+        if (p < min_prec) break;
+        const char* ok = p_kind();
+        int is_range = strcmp(ok, "Range") == 0;
+        const char* os = op_str(ok);
+        p_advance();
+        HexaVal right = parse_binop(p + 1);
+        HexaVal node = mk_node(is_range ? "Range" : "BinOp");
+        node = hexa_map_set(node, "op", hexa_str(os));
+        node = hexa_map_set(node, "left", left);
+        node = hexa_map_set(node, "right", right);
+        left = node;
+    }
+    return left;
+}
+
+HexaVal parse_expr() { return parse_binop(0); }
+
+// ── If expression ────────────────────────────────────────
+
+HexaVal parse_if() {
+    p_advance(); // consume 'if'
+    HexaVal cond = parse_expr();
+    HexaVal then_b = parse_block();
+    HexaVal else_b = hexa_str("");
+    p_skip_nl();
+    if (p_check("Else")) {
+        p_advance();
+        if (p_check("If")) { else_b = hexa_array_new(); else_b = hexa_array_push(else_b, parse_if()); }
+        else else_b = parse_block();
+    }
+    HexaVal n = mk_node("IfExpr");
+    n = hexa_map_set(n, "cond", cond);
+    n = hexa_map_set(n, "then_body", then_b);
+    n = hexa_map_set(n, "else_body", else_b);
+    return n;
+}
+
+// ── Block ────────────────────────────────────────────────
+
+HexaVal parse_block() {
+    p_expect("LBrace");
+    p_skip_nl();
+    HexaVal stmts = hexa_array_new();
+    while (!p_check("RBrace") && !p_check("Eof")) {
+        stmts = hexa_array_push(stmts, parse_stmt());
+        p_skip_nl();
+    }
+    p_expect("RBrace");
+    return stmts;
+}
+
+// ── Statements ───────────────────────────────────────────
+
+HexaVal parse_params() {
+    HexaVal params = hexa_array_new();
+    if (p_check("RParen")) return params;
+    HexaVal pm = mk_node("Param");
+    pm = hexa_map_set(pm, "name", hexa_str(p_expect_ident()));
+    if (p_check("Colon")) { p_advance(); p_expect_ident(); } // skip type annotation
+    params = hexa_array_push(params, pm);
+    while (p_check("Comma")) {
+        p_advance();
+        HexaVal pm2 = mk_node("Param");
+        pm2 = hexa_map_set(pm2, "name", hexa_str(p_expect_ident()));
+        if (p_check("Colon")) { p_advance(); p_expect_ident(); }
+        params = hexa_array_push(params, pm2);
+    }
+    return params;
+}
+
+HexaVal parse_stmt() {
+    p_skip_nl();
+    const char* k = p_kind();
+
+    if (p_check("Let")) {
+        p_advance();
+        int is_mut = 0;
+        if (p_check("Mut")) { p_advance(); is_mut = 1; }
+        const char* name = p_expect_ident();
+        if (p_check("Colon")) { p_advance(); p_expect_ident(); }
+        HexaVal init = hexa_str("");
+        if (p_check("Eq")) { p_advance(); init = parse_expr(); }
+        HexaVal n = mk_node(is_mut ? "LetMutStmt" : "LetStmt");
+        n = hexa_map_set(n, "name", hexa_str(name));
+        n = hexa_map_set(n, "left", init);
+        return n;
+    }
+    if (p_check("Const")) {
+        p_advance();
+        const char* name = p_expect_ident();
+        if (p_check("Colon")) { p_advance(); p_expect_ident(); }
+        p_expect("Eq");
+        HexaVal n = mk_node("ConstStmt");
+        n = hexa_map_set(n, "name", hexa_str(name));
+        n = hexa_map_set(n, "left", parse_expr());
+        return n;
+    }
+    if (p_check("Return")) {
+        p_advance();
+        HexaVal n = mk_node("ReturnStmt");
+        if (!p_check("Newline") && !p_check("RBrace") && !p_check("Eof"))
+            n = hexa_map_set(n, "left", parse_expr());
+        return n;
+    }
+    if (p_check("Fn")) {
+        p_advance();
+        const char* name = p_expect_ident();
+        p_expect("LParen");
+        HexaVal params = parse_params();
+        p_expect("RParen");
+        HexaVal ret = hexa_str("");
+        if (p_check("Arrow")) { p_advance(); ret = hexa_str(p_expect_ident()); }
+        HexaVal body = parse_block();
+        HexaVal n = mk_node("FnDecl");
+        n = hexa_map_set(n, "name", hexa_str(name));
+        n = hexa_map_set(n, "params", params);
+        n = hexa_map_set(n, "body", body);
+        n = hexa_map_set(n, "ret_type", ret);
+        return n;
+    }
+    if (p_check("While")) {
+        p_advance();
+        HexaVal cond = parse_expr();
+        HexaVal body = parse_block();
+        HexaVal n = mk_node("WhileStmt");
+        n = hexa_map_set(n, "cond", cond);
+        n = hexa_map_set(n, "body", body);
+        return n;
+    }
+    if (p_check("For")) {
+        p_advance();
+        const char* var = p_expect_ident();
+        p_expect("In");
+        HexaVal iter = parse_expr();
+        HexaVal body = parse_block();
+        HexaVal n = mk_node("ForStmt");
+        n = hexa_map_set(n, "name", hexa_str(var));
+        n = hexa_map_set(n, "iter_expr", iter);
+        n = hexa_map_set(n, "body", body);
+        return n;
+    }
+    if (p_check("If")) {
+        HexaVal n = mk_node("ExprStmt");
+        n = hexa_map_set(n, "left", parse_if());
+        return n;
+    }
+    if (p_check("Struct")) {
+        p_advance();
+        const char* name = p_expect_ident();
+        p_expect("LBrace"); p_skip_nl();
+        while (!p_check("RBrace") && !p_check("Eof")) { p_advance(); } // skip fields
+        p_expect("RBrace");
+        HexaVal n = mk_node("StructDecl");
+        n = hexa_map_set(n, "name", hexa_str(name));
+        return n;
+    }
+    if (p_check("Break")) { p_advance(); return mk_node("BreakStmt"); }
+    if (p_check("Continue")) { p_advance(); return mk_node("ContinueStmt"); }
+
+    // Expression or assignment
+    HexaVal expr = parse_expr();
+    if (p_check("Eq")) {
+        p_advance();
+        HexaVal rhs = parse_expr();
+        HexaVal n = mk_node("AssignStmt");
+        n = hexa_map_set(n, "left", expr);
+        n = hexa_map_set(n, "right", rhs);
+        return n;
+    }
+    HexaVal n = mk_node("ExprStmt");
+    n = hexa_map_set(n, "left", expr);
+    return n;
+}
+
+HexaVal parse_c(HexaVal tokens) {
+    p_tokens = tokens;
+    p_pos = 0;
+    HexaVal stmts = hexa_array_new();
+    p_skip_nl();
+    while (!p_check("Eof")) {
+        stmts = hexa_array_push(stmts, parse_stmt());
+        p_skip_nl();
+    }
+    return stmts;
+}
+
+// ══════════════════════════════════════════════════════════
+// CODEGEN — AST → C source code (using runtime.c HexaVal)
+// ══════════════════════════════════════════════════════════
+
+void gen_indent(char* buf, int d) { for (int i=0;i<d;i++) strcat(buf, "    "); }
+
+void gen_expr(HexaVal node, char* buf) {
+    const char* k = hexa_map_get(node, "kind").s;
+    if (strcmp(k,"IntLit")==0) { strcat(buf, "hexa_int("); strcat(buf, hexa_map_get(node,"value").s); strcat(buf, ")"); return; }
+    if (strcmp(k,"FloatLit")==0) { strcat(buf, "hexa_float("); strcat(buf, hexa_map_get(node,"value").s); strcat(buf, ")"); return; }
+    if (strcmp(k,"BoolLit")==0) { strcat(buf, strcmp(hexa_map_get(node,"value").s,"true")==0 ? "hexa_bool(1)" : "hexa_bool(0)"); return; }
+    if (strcmp(k,"StringLit")==0) { strcat(buf, "hexa_str(\""); strcat(buf, hexa_map_get(node,"value").s); strcat(buf, "\")"); return; }
+    if (strcmp(k,"Ident")==0) { strcat(buf, hexa_map_get(node,"name").s); return; }
+    if (strcmp(k,"BinOp")==0) {
+        const char* op = hexa_map_get(node,"op").s;
+        if (strcmp(op,"+")==0) { strcat(buf,"hexa_add("); gen_expr(hexa_map_get(node,"left"),buf); strcat(buf,", "); gen_expr(hexa_map_get(node,"right"),buf); strcat(buf,")"); return; }
+        if (strcmp(op,"==")==0) { strcat(buf,"hexa_eq("); gen_expr(hexa_map_get(node,"left"),buf); strcat(buf,", "); gen_expr(hexa_map_get(node,"right"),buf); strcat(buf,")"); return; }
+        // Others: int operations
+        strcat(buf,"hexa_int(("); gen_expr(hexa_map_get(node,"left"),buf); strcat(buf,").i "); strcat(buf,op); strcat(buf," ("); gen_expr(hexa_map_get(node,"right"),buf); strcat(buf,").i)");
+        return;
+    }
+    if (strcmp(k,"UnaryOp")==0) {
+        const char* op = hexa_map_get(node,"op").s;
+        if (strcmp(op,"-")==0) { strcat(buf,"hexa_int(-("); gen_expr(hexa_map_get(node,"left"),buf); strcat(buf,").i)"); return; }
+        if (strcmp(op,"!")==0) { strcat(buf,"hexa_bool(!hexa_truthy("); gen_expr(hexa_map_get(node,"left"),buf); strcat(buf,"))"); return; }
+    }
+    if (strcmp(k,"Call")==0) {
+        HexaVal callee = hexa_map_get(node,"left");
+        const char* ck = hexa_map_get(callee,"kind").s;
+        if (strcmp(ck,"Ident")==0) {
+            const char* fn = hexa_map_get(callee,"name").s;
+            if (strcmp(fn,"println")==0) { strcat(buf,"(hexa_println("); HexaVal args=hexa_map_get(node,"args"); if(args.tag==TAG_ARRAY&&args.arr.len>0) gen_expr(args.arr.items[0],buf); else strcat(buf,"hexa_str(\"\")"); strcat(buf,"), hexa_void())"); return; }
+            if (strcmp(fn,"len")==0) { strcat(buf,"hexa_int(hexa_len("); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,"))"); return; }
+            if (strcmp(fn,"to_string")==0) { strcat(buf,"hexa_to_string("); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,")"); return; }
+            // User function
+            strcat(buf,fn); strcat(buf,"(");
+            HexaVal args = hexa_map_get(node,"args");
+            for (int i=0; args.tag==TAG_ARRAY && i<args.arr.len; i++) { if(i>0) strcat(buf,", "); gen_expr(args.arr.items[i],buf); }
+            strcat(buf,")");
+            return;
+        }
+        if (strcmp(ck,"Field")==0) {
+            const char* method = hexa_map_get(callee,"name").s;
+            if (strcmp(method,"push")==0) { strcat(buf,"hexa_array_push("); gen_expr(hexa_map_get(callee,"left"),buf); strcat(buf,", "); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,")"); return; }
+            if (strcmp(method,"len")==0) { strcat(buf,"hexa_int(hexa_len("); gen_expr(hexa_map_get(callee,"left"),buf); strcat(buf,"))"); return; }
+        }
+    }
+    if (strcmp(k,"Array")==0) {
+        strcat(buf,"hexa_array_new()");
+        HexaVal items = hexa_map_get(node,"items");
+        for (int i=0; items.tag==TAG_ARRAY && i<items.arr.len; i++) {
+            char tmp[4096]=""; gen_expr(items.arr.items[i],tmp);
+            char wrap[4200]; sprintf(wrap, "hexa_array_push(%s, %s)", buf, tmp);
+            buf[0]=0; strcat(buf,wrap); // This is hacky but works for small arrays
+        }
+        return;
+    }
+    if (strcmp(k,"Index")==0) {
+        strcat(buf,"hexa_array_get("); gen_expr(hexa_map_get(node,"left"),buf); strcat(buf,",("); gen_expr(hexa_map_get(node,"right"),buf); strcat(buf,").i)"); return;
+    }
+    if (strcmp(k,"IfExpr")==0) {
+        strcat(buf,"(hexa_truthy("); gen_expr(hexa_map_get(node,"cond"),buf); strcat(buf,") ? ");
+        HexaVal tb = hexa_map_get(node,"then_body");
+        if (tb.tag==TAG_ARRAY && tb.arr.len>0) {
+            HexaVal last = tb.arr.items[tb.arr.len-1];
+            if (strcmp(hexa_map_get(last,"kind").s,"ReturnStmt")==0) gen_expr(hexa_map_get(last,"left"),buf);
+            else gen_expr(hexa_map_get(last,"left"),buf);
+        } else strcat(buf,"hexa_void()");
+        strcat(buf," : hexa_void())");
+        return;
+    }
+    if (strcmp(k,"Range")==0) {
+        // Range used in for loops, shouldn't appear as standalone expr
+        strcat(buf,"/* range */");
+        return;
+    }
+    strcat(buf, "/* "); strcat(buf, k); strcat(buf, " */");
+}
+
+void gen_stmt(HexaVal node, int depth, char* buf) {
+    const char* k = hexa_map_get(node, "kind").s;
+    gen_indent(buf, depth);
+
+    if (strcmp(k,"LetStmt")==0||strcmp(k,"LetMutStmt")==0||strcmp(k,"ConstStmt")==0) {
+        strcat(buf, "HexaVal "); strcat(buf, hexa_map_get(node,"name").s); strcat(buf, " = ");
+        HexaVal init = hexa_map_get(node,"left");
+        if (init.tag == TAG_STR && strlen(init.s)==0) strcat(buf,"hexa_void()");
+        else gen_expr(init, buf);
+        strcat(buf, ";\n"); return;
+    }
+    if (strcmp(k,"AssignStmt")==0) {
+        gen_expr(hexa_map_get(node,"left"), buf); strcat(buf, " = "); gen_expr(hexa_map_get(node,"right"), buf); strcat(buf, ";\n"); return;
+    }
+    if (strcmp(k,"ReturnStmt")==0) {
+        strcat(buf, "return ");
+        HexaVal ret = hexa_map_get(node,"left");
+        if (ret.tag == TAG_STR && strlen(ret.s)==0) strcat(buf,"hexa_void()");
+        else gen_expr(ret, buf);
+        strcat(buf, ";\n"); return;
+    }
+    if (strcmp(k,"ExprStmt")==0) {
+        HexaVal expr = hexa_map_get(node,"left");
+        if (expr.tag == TAG_STR && strlen(expr.s)==0) return;
+        const char* ek = hexa_map_get(expr,"kind").s;
+        if (strcmp(ek,"IfExpr")==0) {
+            strcat(buf, "if (hexa_truthy("); gen_expr(hexa_map_get(expr,"cond"), buf); strcat(buf, ")) {\n");
+            HexaVal tb = hexa_map_get(expr,"then_body");
+            for (int i=0; tb.tag==TAG_ARRAY && i<tb.arr.len; i++) gen_stmt(tb.arr.items[i], depth+1, buf);
+            gen_indent(buf,depth); strcat(buf,"}");
+            HexaVal eb = hexa_map_get(expr,"else_body");
+            if (eb.tag==TAG_ARRAY && eb.arr.len>0) {
+                strcat(buf," else {\n");
+                for (int i=0; i<eb.arr.len; i++) gen_stmt(eb.arr.items[i], depth+1, buf);
+                gen_indent(buf,depth); strcat(buf,"}");
+            }
+            strcat(buf,"\n"); return;
+        }
+        gen_expr(expr, buf); strcat(buf, ";\n"); return;
+    }
+    if (strcmp(k,"WhileStmt")==0) {
+        strcat(buf, "while (hexa_truthy("); gen_expr(hexa_map_get(node,"cond"), buf); strcat(buf, ")) {\n");
+        HexaVal body = hexa_map_get(node,"body");
+        for (int i=0; body.tag==TAG_ARRAY && i<body.arr.len; i++) gen_stmt(body.arr.items[i], depth+1, buf);
+        gen_indent(buf,depth); strcat(buf, "}\n"); return;
+    }
+    if (strcmp(k,"ForStmt")==0) {
+        HexaVal iter = hexa_map_get(node,"iter_expr");
+        if (strcmp(hexa_map_get(iter,"kind").s,"Range")==0) {
+            strcat(buf,"for (HexaVal "); strcat(buf,hexa_map_get(node,"name").s); strcat(buf," = ");
+            gen_expr(hexa_map_get(iter,"left"),buf); strcat(buf,"; ");
+            strcat(buf,hexa_map_get(node,"name").s); strcat(buf,".i < (");
+            gen_expr(hexa_map_get(iter,"right"),buf); strcat(buf,").i; ");
+            strcat(buf,hexa_map_get(node,"name").s); strcat(buf,".i++) {\n");
+        } else {
+            strcat(buf,"{ HexaVal _arr="); gen_expr(iter,buf); strcat(buf,";\nfor(int _i=0;_i<_arr.arr.len;_i++){HexaVal ");
+            strcat(buf,hexa_map_get(node,"name").s); strcat(buf,"=_arr.arr.items[_i];\n");
+        }
+        HexaVal body = hexa_map_get(node,"body");
+        for (int i=0; body.tag==TAG_ARRAY && i<body.arr.len; i++) gen_stmt(body.arr.items[i], depth+1, buf);
+        gen_indent(buf,depth); strcat(buf, "}");
+        if (strcmp(hexa_map_get(iter,"kind").s,"Range")!=0) strcat(buf,"}");
+        strcat(buf,"\n"); return;
+    }
+    if (strcmp(k,"StructDecl")==0) { strcat(buf,"/* struct "); strcat(buf,hexa_map_get(node,"name").s); strcat(buf," */\n"); return; }
+    strcat(buf, "/* "); strcat(buf, k); strcat(buf, " */\n");
+}
+
+char* codegen_c_full(HexaVal ast) {
+    char* buf = calloc(1, 1024*1024); // 1MB buffer
+    strcat(buf, "// Generated by HEXA Bootstrap Compiler\n#include \"runtime.c\"\n\n");
+
+    // Forward declarations
+
+    char* fwd = calloc(1, 64*1024);
+    char* fns = calloc(1, 512*1024);
+    char* main_code = calloc(1, 256*1024);
+
+    for (int i = 0; i < ast.arr.len; i++) {
+        HexaVal s = ast.arr.items[i];
+        if (strcmp(hexa_map_get(s,"kind").s, "FnDecl") == 0) {
+            // Forward decl
+            strcat(fwd, "HexaVal "); strcat(fwd, hexa_map_get(s,"name").s); strcat(fwd, "(");
+            HexaVal params = hexa_map_get(s,"params");
+            for (int j=0; params.tag==TAG_ARRAY && j<params.arr.len; j++) {
+                if (j>0) strcat(fwd,", ");
+                strcat(fwd,"HexaVal "); strcat(fwd, hexa_map_get(params.arr.items[j],"name").s);
+            }
+            if (params.tag!=TAG_ARRAY||params.arr.len==0) strcat(fwd,"void");
+            strcat(fwd, ");\n");
+            // Function body
+            strcat(fns, "HexaVal "); strcat(fns, hexa_map_get(s,"name").s); strcat(fns, "(");
+            for (int j=0; params.tag==TAG_ARRAY && j<params.arr.len; j++) {
+                if (j>0) strcat(fns,", ");
+                strcat(fns,"HexaVal "); strcat(fns, hexa_map_get(params.arr.items[j],"name").s);
+            }
+            if (params.tag!=TAG_ARRAY||params.arr.len==0) strcat(fns,"void");
+            strcat(fns, ") {\n");
+            HexaVal body = hexa_map_get(s,"body");
+            for (int j=0; body.tag==TAG_ARRAY && j<body.arr.len; j++) gen_stmt(body.arr.items[j], 1, fns);
+            strcat(fns, "    return hexa_void();\n}\n\n");
+        } else {
+            gen_stmt(s, 1, main_code);
+        }
+    }
+
+    strcat(buf, fwd); strcat(buf, "\n"); strcat(buf, fns);
+    strcat(buf, "int main() {\n"); strcat(buf, main_code); strcat(buf, "    return 0;\n}\n");
+
+    free(fwd); free(fns); free(main_code);
+    return buf;
+}
+
+// ══════════════════════════════════════════════════════════
+// MAIN — full pipeline: read → tokenize → parse → codegen → gcc
+// ══════════════════════════════════════════════════════════
+
 int main(int argc, char** argv) {
     if (argc < 2) {
-        printf("Usage: hexa_bootstrap <file.hexa>\n");
+        printf("Usage: hexa_bootstrap <file.hexa> [-o output]\n");
+        printf("Compiles .hexa to native binary via C.\n");
         return 1;
     }
 
-    printf("=== HEXA Bootstrap Compiler (C) ===\n");
+    const char* input = argv[1];
+    const char* output = argc > 3 && strcmp(argv[2],"-o")==0 ? argv[3] : "/tmp/hexa_out";
 
-    // Read source file
-    HexaVal source = hexa_read_file(hexa_str(argv[1]));
-    printf("[1/4] Read: %d chars from %s\n", hexa_len(source), argv[1]);
+    printf("=== HEXA Bootstrap Compiler ===\n");
 
-    // Tokenize
+    // [1] Read
+    HexaVal source = hexa_read_file(hexa_str(input));
+    printf("[1/5] Read: %d chars\n", hexa_len(source));
+
+    // [2] Tokenize
     HexaVal tokens = tokenize_c(source.s);
-    printf("[2/4] Tokenized: %d tokens\n", tokens.arr.len);
+    printf("[2/5] Tokenized: %d tokens\n", tokens.arr.len);
 
-    // Print first 20 tokens as sample
-    int show = tokens.arr.len < 20 ? tokens.arr.len : 20;
-    for (int i = 0; i < show; i++) {
-        HexaVal tok = tokens.arr.items[i];
-        HexaVal kind = hexa_map_get(tok, "kind");
-        HexaVal val = hexa_map_get(tok, "value");
-        printf("  [%d] %s = '%s'\n", i, kind.s, val.s);
+    // [3] Parse
+    HexaVal ast = parse_c(tokens);
+    printf("[3/5] Parsed: %d statements\n", ast.arr.len);
+
+    // [4] Generate C
+    char* c_code = codegen_c_full(ast);
+    char c_file[256]; sprintf(c_file, "%s.c", output);
+    FILE* f = fopen(c_file, "w");
+    fputs(c_code, f);
+    fclose(f);
+    printf("[4/5] C generated: %d chars -> %s\n", (int)strlen(c_code), c_file);
+
+    // [5] Compile with gcc
+    char cmd[512];
+    sprintf(cmd, "gcc -O2 -I ready/self %s -o %s 2>&1", c_file, output);
+    printf("[5/5] %s\n", cmd);
+    int ret = system(cmd);
+    if (ret == 0) {
+        printf("\n=== BUILD SUCCESS: %s ===\n", output);
+    } else {
+        printf("\n=== BUILD FAILED ===\n");
     }
-    if (tokens.arr.len > 20) printf("  ... (%d more)\n", tokens.arr.len - 20);
 
-    printf("\nBootstrap lexer complete.\n");
-    printf("Next: add parser + codegen to this binary for full self-hosting.\n");
-    return 0;
+    free(c_code);
+    return ret;
 }
