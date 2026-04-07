@@ -259,6 +259,21 @@ Hexa @optimize fib(90):      <1 µs   (7 × 12 = ~84 정수 연산) ★
 | 꼬리재귀 | 루프 변환 | 스택 폭발 방지 |
 | DP 테이블 | 슬라이딩 윈도우 | 메모리 O(n) → O(1) |
 
+## M0 — 셀프호스팅 @attr 인프라 (2026-04-08)
+
+self/ 셀프호스팅 컴파일러에 AI-native @attr 파이프라인 뼈대 이식 완료.
+M1~M5에서 각 패턴 재작성기가 이 인프라 위에 올라감.
+
+**변경:**
+- `self/lexer.hexa` — `@` → `At` 토큰
+- `self/parser.hexa` — `p_pending_attrs` 모듈 변수, `parse_stmt`가 선행 `@name` 시퀀스 수집, `parse_fn_decl`이 소비해 `FnDecl.value`에 콤마 구분 문자열로 저장 (AstNode 구조체 필드 추가 없음 — `value` 재활용)
+- `self/ai_native_pass.hexa` — 신규. 13종 @attr을 G1~G4/meta로 분류, FnDecl 순회하며 진단 출력, AST pass-through
+- `self/test_bootstrap_compiler.hexa` — 인라인 사본에 동일 패치 + Test 17 (tokenize/parse/ai_native_pass end-to-end)
+
+**검증:** 17/17 PASS (기존 16 regression + Test 17 신규). 단일 attr, 다중 attr, attr 없음, 분류 테이블 4축 모두 통과.
+
+**다음:** M1 `@optimize` 버블→머지, M2 선형→이진, M3 Strassen, M4 꼬리재귀→루프, M5 DP→슬라이딩. 각 세션에서 `ai_native_pass`의 분류 디스패치 자리에 AST 재작성기 연결.
+
 ## 돌파 벡터 전체 로드맵
 
 ### Tier 1 — 알고리즘 교체 (LLVM 불가 영역)
