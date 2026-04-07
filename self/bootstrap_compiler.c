@@ -105,6 +105,13 @@ HexaVal tokenize_c(const char* src) {
                 if (src[pos] == '.') is_float = 1;
                 pos++; col++;
             }
+            // Scientific notation: 1.38e-23
+            if (pos < len && (src[pos] == 'e' || src[pos] == 'E')) {
+                is_float = 1;
+                pos++; col++;
+                if (pos < len && (src[pos] == '+' || src[pos] == '-')) { pos++; col++; }
+                while (pos < len && isdigit(src[pos])) { pos++; col++; }
+            }
             char* val = strndup(src + start, pos - start);
             tokens = hexa_array_push(tokens, make_token(is_float ? "FloatLit" : "IntLit", val, line, col));
             free(val);
@@ -731,6 +738,13 @@ void gen_expr(HexaVal node, char* buf) {
             if (strcmp(fn,"floor")==0) { strcat(buf,"hexa_floor("); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,")"); return; }
             if (strcmp(fn,"ceil")==0) { strcat(buf,"hexa_ceil("); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,")"); return; }
             if (strcmp(fn,"abs")==0) { strcat(buf,"hexa_abs("); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,")"); return; }
+            if (strcmp(fn,"ln")==0||strcmp(fn,"log")==0) { strcat(buf,"hexa_float(log("); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,".tag==TAG_FLOAT?"); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,".f:(double)"); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,".i))"); return; }
+            if (strcmp(fn,"log10")==0) { strcat(buf,"hexa_float(log10("); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,".tag==TAG_FLOAT?"); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,".f:(double)"); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,".i))"); return; }
+            if (strcmp(fn,"exp")==0) { strcat(buf,"hexa_float(exp("); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,".tag==TAG_FLOAT?"); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,".f:(double)"); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,".i))"); return; }
+            if (strcmp(fn,"sin")==0) { strcat(buf,"hexa_float(sin("); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,".tag==TAG_FLOAT?"); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,".f:(double)"); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,".i))"); return; }
+            if (strcmp(fn,"cos")==0) { strcat(buf,"hexa_float(cos("); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,".tag==TAG_FLOAT?"); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,".f:(double)"); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,".i))"); return; }
+            if (strcmp(fn,"to_float")==0) { strcat(buf,"hexa_float("); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,".tag==TAG_FLOAT?"); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,".f:(double)"); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,".i)"); return; }
+            if (strcmp(fn,"format_float")==0) { strcat(buf,"hexa_format_float("); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,", "); gen_expr(hexa_map_get(node,"args").arr.items[1],buf); strcat(buf,")"); return; }
             if (strcmp(fn,"args")==0) { strcat(buf,"hexa_args()"); return; }
             if (strcmp(fn,"pad_left")==0) { strcat(buf,"hexa_pad_left("); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,", "); gen_expr(hexa_map_get(node,"args").arr.items[1],buf); strcat(buf,")"); return; }
             if (strcmp(fn,"pad_right")==0) { strcat(buf,"hexa_pad_right("); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,", "); gen_expr(hexa_map_get(node,"args").arr.items[1],buf); strcat(buf,")"); return; }
@@ -765,7 +779,7 @@ void gen_expr(HexaVal node, char* buf) {
             const char* method = hexa_map_get(callee,"name").s;
             if (strcmp(method,"len")==0) { strcat(buf,"hexa_int(hexa_len("); gen_expr(hexa_map_get(callee,"left"),buf); strcat(buf,"))"); return; }
             if (strcmp(method,"chars")==0) { strcat(buf,"hexa_str_chars("); gen_expr(hexa_map_get(callee,"left"),buf); strcat(buf,")"); return; }
-            if (strcmp(method,"contains")==0) { strcat(buf,"hexa_bool(hexa_str_contains("); gen_expr(hexa_map_get(callee,"left"),buf); strcat(buf,", "); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,"))"); return; }
+            if (strcmp(method,"contains")==0) { strcat(buf,"(("); gen_expr(hexa_map_get(callee,"left"),buf); strcat(buf,").tag==TAG_ARRAY?hexa_bool(hexa_array_contains("); gen_expr(hexa_map_get(callee,"left"),buf); strcat(buf,","); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,")):hexa_bool(hexa_str_contains("); gen_expr(hexa_map_get(callee,"left"),buf); strcat(buf,","); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,")))"); return; }
             if (strcmp(method,"split")==0) { strcat(buf,"hexa_str_split("); gen_expr(hexa_map_get(callee,"left"),buf); strcat(buf,", "); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,")"); return; }
             if (strcmp(method,"trim")==0) { strcat(buf,"hexa_str_trim("); gen_expr(hexa_map_get(callee,"left"),buf); strcat(buf,")"); return; }
             if (strcmp(method,"replace")==0) { strcat(buf,"hexa_str_replace("); gen_expr(hexa_map_get(callee,"left"),buf); strcat(buf,", "); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,", "); gen_expr(hexa_map_get(node,"args").arr.items[1],buf); strcat(buf,")"); return; }
@@ -1350,7 +1364,7 @@ int main(int argc, char** argv) {
     free(asm_code);
 
     // Try gcc first (best optimization + full feature support)
-    sprintf(cmd, "gcc -O2 -I ready/self %s -o %s 2>/dev/null", c_file, output);
+    sprintf(cmd, "gcc -O2 -lm -I ready/self %s -o %s 2>/dev/null", c_file, output);
     ret = system(cmd);
     if (ret == 0) printf("[5b] Compiled with gcc -O2\n");
 

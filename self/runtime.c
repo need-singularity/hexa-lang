@@ -228,6 +228,8 @@ HexaVal hexa_type_of(HexaVal v) {
 // ── Polymorphic add (int + or string concat) ─────────────
 
 HexaVal hexa_add(HexaVal a, HexaVal b) {
+int hexa_array_contains(HexaVal arr, HexaVal item);
+HexaVal hexa_format_float(HexaVal f, HexaVal prec);
     if (a.tag == TAG_INT && b.tag == TAG_INT) return hexa_int(a.i + b.i);
     if (a.tag == TAG_FLOAT || b.tag == TAG_FLOAT) {
         double fa = a.tag == TAG_FLOAT ? a.f : (double)a.i;
@@ -507,4 +509,20 @@ HexaVal hexa_str_repeat(HexaVal s, HexaVal n) {
     result[0] = 0;
     for (int i = 0; i < count; i++) strcat(result, s.s);
     return hexa_str_own(result);
+}
+
+int hexa_array_contains(HexaVal arr, HexaVal item) {
+    if (arr.tag != TAG_ARRAY) return 0;
+    for (int i = 0; i < arr.arr.len; i++) {
+        if (hexa_truthy(hexa_eq(arr.arr.items[i], item))) return 1;
+    }
+    return 0;
+}
+
+HexaVal hexa_format_float(HexaVal f, HexaVal prec) {
+    double v = f.tag == TAG_FLOAT ? f.f : (double)f.i;
+    int p = prec.i;
+    char buf[64];
+    snprintf(buf, 64, "%.*f", p, v);
+    return hexa_str(buf);
 }
