@@ -7,6 +7,33 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <math.h>
+#include <ctype.h>
+
+// Forward declarations for all runtime functions
+typedef struct HexaVal HexaVal;
+HexaVal hexa_add(HexaVal a, HexaVal b);
+HexaVal hexa_sub(HexaVal a, HexaVal b);
+HexaVal hexa_mul(HexaVal a, HexaVal b);
+HexaVal hexa_div(HexaVal a, HexaVal b);
+HexaVal hexa_mod(HexaVal a, HexaVal b);
+HexaVal hexa_eq(HexaVal a, HexaVal b);
+HexaVal hexa_to_string(HexaVal v);
+HexaVal hexa_str_concat(HexaVal a, HexaVal b);
+HexaVal hexa_abs(HexaVal v);
+HexaVal hexa_pad_left(HexaVal s, HexaVal width);
+HexaVal hexa_pad_right(HexaVal s, HexaVal width);
+HexaVal hexa_str_repeat(HexaVal s, HexaVal n);
+HexaVal hexa_read_file(HexaVal path);
+HexaVal hexa_write_file(HexaVal path, HexaVal content);
+HexaVal hexa_str_split(HexaVal s, HexaVal delim);
+HexaVal hexa_str_trim(HexaVal s);
+HexaVal hexa_str_replace(HexaVal s, HexaVal old, HexaVal new_s);
+HexaVal hexa_str_join(HexaVal arr, HexaVal sep);
+HexaVal hexa_str_to_upper(HexaVal s);
+HexaVal hexa_str_to_lower(HexaVal s);
+HexaVal hexa_str_chars(HexaVal s);
+HexaVal hexa_format_n(HexaVal fmt, HexaVal args);
 
 // ── Tagged Value ─────────────────────────────────────────
 // All HEXA values are represented as tagged unions (NaN-boxing alternative)
@@ -228,8 +255,6 @@ HexaVal hexa_type_of(HexaVal v) {
 // ── Polymorphic add (int + or string concat) ─────────────
 
 HexaVal hexa_add(HexaVal a, HexaVal b) {
-int hexa_array_contains(HexaVal arr, HexaVal item);
-HexaVal hexa_format_float(HexaVal f, HexaVal prec);
     if (a.tag == TAG_INT && b.tag == TAG_INT) return hexa_int(a.i + b.i);
     if (a.tag == TAG_FLOAT || b.tag == TAG_FLOAT) {
         double fa = a.tag == TAG_FLOAT ? a.f : (double)a.i;

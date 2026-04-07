@@ -1064,6 +1064,25 @@ char* codegen_c_full(HexaVal ast) {
     char* fns = calloc(1, 512*1024);
     char* main_code = calloc(1, 256*1024);
 
+    // B-28: Extract top-level lets as global variables (fn-accessible)
+    char* globals = calloc(1, 64*1024);
+    for (int gi = 0; gi < ast.arr.len; gi++) {
+        HexaVal gs = ast.arr.items[gi];
+        const char* gk = hexa_map_get(gs,"kind").s;
+        if (strcmp(gk,"LetStmt")==0 || strcmp(gk,"LetMutStmt")==0 || strcmp(gk,"ConstStmt")==0) {
+            const char* gn = hexa_map_get(gs,"name").s;
+            if (strlen(gn) > 0) {
+                strcat(globals, "HexaVal "); strcat(globals, gn); strcat(globals, ";\n");
+            }
+        }
+        if (strcmp(gk,"TupleDestructure")==0) {
+            HexaVal tn = hexa_map_get(gs,"names");
+            for (int ti=0; tn.tag==TAG_ARRAY && ti<tn.arr.len; ti++) {
+                strcat(globals, "HexaVal "); strcat(globals, tn.arr.items[ti].s); strcat(globals, ";\n");
+            }
+        }
+    }
+
     for (int i = 0; i < ast.arr.len; i++) {
         HexaVal s = ast.arr.items[i];
         if (strcmp(hexa_map_get(s,"kind").s, "FnDecl") == 0) {
@@ -1088,14 +1107,27 @@ char* codegen_c_full(HexaVal ast) {
             for (int j=0; body.tag==TAG_ARRAY && j<body.arr.len; j++) gen_stmt(body.arr.items[j], 1, fns);
             strcat(fns, "    return hexa_void();\n}\n\n");
         } else {
-            gen_stmt(s, 1, main_code);
+        {
+            const char* mk=hexa_map_get(s,"kind").s;
+            if(strcmp(mk,"LetStmt")==0||strcmp(mk,"LetMutStmt")==0||strcmp(mk,"ConstStmt")==0){
+                const char* vn=hexa_map_get(s,"name").s;
+                if(strlen(vn)>0){
+                    strcat(main_code,"    "); strcat(main_code,vn); strcat(main_code," = ");
+                    char* ib=calloc(1,65536); HexaVal vi=hexa_map_get(s,"left");
+                    if(vi.tag==TAG_STR&&strlen(vi.s)==0) strcpy(ib,"hexa_void()"); else gen_expr(vi,ib);
+                    strcat(main_code,ib); strcat(main_code,";\n"); free(ib);
+                }
+            } else {
+                gen_stmt(s, 1, main_code);
+            }
+        }
         }
     }
 
-    strcat(buf, fwd); strcat(buf, "\n"); strcat(buf, fns);
+    strcat(buf, globals); strcat(buf, "\n"); strcat(buf, fwd); strcat(buf, "\n"); strcat(buf, fns);
     strcat(buf, "int main(int argc, char** argv) {\n    hexa_set_args(argc, argv);\n"); strcat(buf, main_code); strcat(buf, "    return 0;\n}\n");
 
-    free(fwd); free(fns); free(main_code);
+    free(globals); free(fwd); free(fns); free(main_code);
     return buf;
 }
 
