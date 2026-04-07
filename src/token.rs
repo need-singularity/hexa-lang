@@ -137,6 +137,7 @@ pub enum AttrKind {
     Parallel,           // @parallel — safe to parallelize
     Bounded(i64),       // @bounded(N) — loop bound
     Memoize,            // @memoize — cache results
+    Optimize,           // @optimize — algorithmic transformation (recurrence → matrix exp)
     // Semantics
     Evolve,             // @evolve — self-modifying
     Test,               // @test — test function
@@ -158,6 +159,7 @@ impl AttrKind {
             "simd" => AttrKind::Simd,
             "parallel" => AttrKind::Parallel,
             "memoize" => AttrKind::Memoize,
+            "optimize" => AttrKind::Optimize,
             "evolve" => AttrKind::Evolve,
             "test" => AttrKind::Test,
             "bench" => AttrKind::Bench,

@@ -8,7 +8,7 @@
 | 모듈 | 파일 | LOC | 상태 |
 |------|------|-----|------|
 | Interpreter | src/interpreter.rs | 7,713 | ✅ 완전 |
-| JIT (Cranelift) | src/jit.rs | 2,292 | ✅ 완전 |
+| JIT (Cranelift) | src/jit.rs | 2,988 | ✅ 완전 |
 | VM (Bytecode) | src/vm.rs | 1,420 | ✅ 최적화 완료 |
 | LSP Server | src/lsp.rs | 1,735 | ✅ 기본 구현 |
 | Package Manager | src/package.rs | 1,720 | ✅ 기본 구현 |
@@ -57,6 +57,18 @@
 - [ ] **Phase 4**: C 코드 생성 백엔드 (cranelift 대체)
 - [ ] **Phase 5**: 셀프 컴파일 달성 → Rust src/ 제거
 - [ ] **Phase 6**: 생태계 복원 (LSP, 패키지매니저, WASM)
+
+### AI-native @attr 돌파
+- [x] @memoize — JIT 네이티브 캐싱, Rust 동급 (2026-04-07)
+- [x] @optimize — 선형 점화식 → 행렬 거듭제곱 O(n)→O(log n) 네이티브 JIT (2026-04-07)
+- [ ] @optimize — 버블소트 → 머지소트 감지
+- [ ] @optimize — 선형탐색 → 이진탐색 감지
+- [ ] @optimize — 꼬리재귀 → 루프 변환
+- [ ] @parallel — 자동 멀티코어 분배
+- [ ] @simd — AVX2/NEON 벡터화
+- [ ] @fuse — map/filter 퓨전
+- [ ] @specialize — 런타임 타입 특화
+- [ ] @evolve — 자기진화 (특이점)
 
 ### Performance (추가)
 - [ ] Trace JIT — VM 핫 루프 동적 컴파일
