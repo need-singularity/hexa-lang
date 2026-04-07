@@ -1,3 +1,5 @@
+> 🔴 **AI-NATIVE FIRST**: 성능/자원 개선은 저수준 마이크로 최적화가 아닌 **AI-native 알고리즘 교체**로 진행. docs/ai-native.md 로드맵 참조. O(n²)→O(n log n), O(n)→O(log n) 등 복잡도 자체를 바꾸는 돌파만 추구.
+
 > 🔴 **HEXA-FIRST**: 모든 코드는 `.hexa`로 작성. sh/py/rs 신규 작성 금지. 부하 유발 명령 최소화.
 
 > 🔴 **NEXUS-6 특이점 연동**: 이 프로젝트의 돌파/발견/실험은 nexus 특이점 사이클 입력이다.

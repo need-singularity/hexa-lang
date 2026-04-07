@@ -97,7 +97,11 @@ fn const_hash_key(val: &Value) -> u64 {
         Value::Bool(b) => { std::hash::Hash::hash(&2u8, &mut h); std::hash::Hash::hash(b, &mut h); }
         Value::Str(s) => { std::hash::Hash::hash(&3u8, &mut h); std::hash::Hash::hash(s.as_str(), &mut h); }
         Value::Void => { std::hash::Hash::hash(&4u8, &mut h); }
-        _ => { std::hash::Hash::hash(&99u8, &mut h); std::hash::Hash::hash(&format!("{:?}", val), &mut h); }
+        Value::Char(c) => { std::hash::Hash::hash(&5u8, &mut h); std::hash::Hash::hash(c, &mut h); }
+        Value::Byte(b) => { std::hash::Hash::hash(&6u8, &mut h); std::hash::Hash::hash(b, &mut h); }
+        Value::Array(arr) => { std::hash::Hash::hash(&7u8, &mut h); for item in arr { std::hash::Hash::hash(&const_hash_key(item), &mut h); } }
+        Value::Tuple(t) => { std::hash::Hash::hash(&8u8, &mut h); for item in t { std::hash::Hash::hash(&const_hash_key(item), &mut h); } }
+        _ => { std::hash::Hash::hash(&99u8, &mut h); }
     }
     h.finish()
 }
@@ -140,8 +144,9 @@ impl Chunk {
             return idx;
         }
         let idx = self.string_pool.len() as u32;
-        self.string_pool.push(name.to_string());
-        self.intern_map.insert(name.to_string(), idx);
+        let s = name.to_string();
+        self.intern_map.insert(s.clone(), idx);
+        self.string_pool.push(s);
         idx
     }
 
