@@ -726,7 +726,26 @@ void gen_expr(HexaVal node, char* buf) {
             if (strcmp(fn,"ceil")==0) { strcat(buf,"hexa_ceil("); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,")"); return; }
             if (strcmp(fn,"abs")==0) { strcat(buf,"hexa_abs("); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,")"); return; }
             if (strcmp(fn,"args")==0) { strcat(buf,"hexa_args()"); return; }
-            if (strcmp(fn,"format")==0) { strcat(buf,"hexa_format("); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,", "); gen_expr(hexa_map_get(node,"args").arr.items[1],buf); strcat(buf,")"); return; }
+            if (strcmp(fn,"format")==0) {
+                HexaVal fargs = hexa_map_get(node,"args");
+                if (fargs.tag==TAG_ARRAY && fargs.arr.len == 2) {
+                    strcat(buf,"hexa_format("); gen_expr(fargs.arr.items[0],buf); strcat(buf,", "); gen_expr(fargs.arr.items[1],buf); strcat(buf,")");
+                } else if (fargs.tag==TAG_ARRAY && fargs.arr.len > 2) {
+                    // Multi-arg: format(fmt, a, b, c) → hexa_format_n(fmt, [a,b,c])
+                    strcat(buf,"hexa_format_n("); gen_expr(fargs.arr.items[0],buf);
+                    strcat(buf,", ");
+                    // Build args array
+                    for (int _fi=1; _fi<fargs.arr.len; _fi++) strcat(buf,"hexa_array_push(");
+                    strcat(buf,"hexa_array_new()");
+                    for (int _fi=1; _fi<fargs.arr.len; _fi++) {
+                        strcat(buf,", "); gen_expr(fargs.arr.items[_fi],buf); strcat(buf,")");
+                    }
+                    strcat(buf,")");
+                } else {
+                    strcat(buf,"hexa_to_string("); gen_expr(fargs.arr.items[0],buf); strcat(buf,")");
+                }
+                return;
+            }
             // User function
             strcat(buf,fn); strcat(buf,"(");
             HexaVal args = hexa_map_get(node,"args");

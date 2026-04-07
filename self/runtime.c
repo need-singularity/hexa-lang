@@ -324,8 +324,9 @@ HexaVal hexa_abs(HexaVal v) {
 
 // ── String format ────────────────────────────────────
 
+// Multi-arg format: hexa_format_n(fmt, args_array)
 HexaVal hexa_format(HexaVal fmt, HexaVal arg) {
-    // Simple: replace first {} with arg
+    // Single arg: replace first {} with arg
     if (fmt.tag != TAG_STR) return fmt;
     char* pos = strstr(fmt.s, "{}");
     if (!pos) return fmt;
@@ -337,6 +338,28 @@ HexaVal hexa_format(HexaVal fmt, HexaVal arg) {
     result[before] = 0;
     strcat(result, sarg.s);
     strcat(result, pos + 2);
+    return hexa_str_own(result);
+}
+
+HexaVal hexa_format_n(HexaVal fmt, HexaVal args) {
+    // Multi-arg: replace each {} with successive args
+    if (fmt.tag != TAG_STR || args.tag != TAG_ARRAY) return fmt;
+    char* result = malloc(strlen(fmt.s) * 2 + args.arr.len * 64);
+    result[0] = 0;
+    char* src = fmt.s;
+    int ai = 0;
+    while (*src) {
+        if (src[0] == '{' && src[1] == '}' && ai < args.arr.len) {
+            HexaVal sarg = hexa_to_string(args.arr.items[ai++]);
+            strcat(result, sarg.s);
+            src += 2;
+        } else {
+            int len = strlen(result);
+            result[len] = *src;
+            result[len+1] = 0;
+            src++;
+        }
+    }
     return hexa_str_own(result);
 }
 
