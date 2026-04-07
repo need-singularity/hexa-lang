@@ -26,6 +26,26 @@ const THROW_SENTINEL: &str = "__hexa_throw__";
 const BREAK_SENTINEL: &str = "__hexa_break__";
 const CONTINUE_SENTINEL: &str = "__hexa_continue__";
 
+
+/// Fast structural hash for Value — avoids format!("{:?}") heap allocation.
+#[inline]
+fn hash_value_interp(val: &Value, h: &mut impl std::hash::Hasher) {
+    match val {
+        Value::Int(n) => { std::hash::Hash::hash(&0u8, h); std::hash::Hash::hash(n, h); }
+        Value::Float(f) => { std::hash::Hash::hash(&1u8, h); std::hash::Hash::hash(&f.to_bits(), h); }
+        Value::Bool(b) => { std::hash::Hash::hash(&2u8, h); std::hash::Hash::hash(b, h); }
+        Value::Str(s) => { std::hash::Hash::hash(&3u8, h); std::hash::Hash::hash(s.as_str(), h); }
+        Value::Void => { std::hash::Hash::hash(&4u8, h); }
+        Value::Char(c) => { std::hash::Hash::hash(&5u8, h); std::hash::Hash::hash(c, h); }
+        Value::Byte(b) => { std::hash::Hash::hash(&6u8, h); std::hash::Hash::hash(b, h); }
+        Value::Array(arr) => {
+            std::hash::Hash::hash(&7u8, h);
+            for item in arr { hash_value_interp(item, h); }
+        }
+        other => { std::hash::Hash::hash(&99u8, h); std::hash::Hash::hash(&format!("{:?}", other), h); }
+    }
+}
+
 pub struct Interpreter {
     pub env: Env,
     /// Holds the value carried by the most recent `return` statement.
@@ -1414,9 +1434,9 @@ impl Interpreter {
                             if is_memoize {
                                 let fn_key = _name.clone();
                                 let args_hash = {
-                                    use std::hash::{Hash, Hasher};
+                                    use std::hash::Hasher;
                                     let mut h = std::collections::hash_map::DefaultHasher::new();
-                                    format!("{:?}", arg_vals).hash(&mut h);
+                                    for av in &arg_vals { hash_value_interp(av, &mut h); }
                                     h.finish()
                                 };
                                 if let Some(cached) = self.memo_cache.get(&fn_key).and_then(|m| m.get(&args_hash)) {
@@ -2241,9 +2261,9 @@ impl Interpreter {
                 if is_memoize {
                     let fn_key = _name.clone();
                     let args_hash = {
-                        use std::hash::{Hash, Hasher};
+                        use std::hash::Hasher;
                         let mut h = std::collections::hash_map::DefaultHasher::new();
-                        format!("{:?}", args).hash(&mut h);
+                        for av in &args { hash_value_interp(av, &mut h); }
                         h.finish()
                     };
                     if let Some(cached) = self.memo_cache.get(&fn_key).and_then(|m| m.get(&args_hash)) {

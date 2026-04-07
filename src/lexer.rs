@@ -271,12 +271,16 @@ impl Lexer {
         self.skip_whitespace();
         let line = self.line;
         let col = self.col;
-        let tok = self.next_token()?;
+        let tok = self.next_token_inner()?;
         Ok((tok, line, col))
     }
 
     fn next_token(&mut self) -> Result<Token, String> {
         self.skip_whitespace();
+        self.next_token_inner()
+    }
+
+    fn next_token_inner(&mut self) -> Result<Token, String> {
 
         let b = match self.peek_byte() {
             Some(b) => b,
@@ -287,7 +291,7 @@ impl Lexer {
         if b == b'/' {
             if self.peek_byte_ahead(1) == Some(b'/') {
                 self.skip_line_comment();
-                return self.next_token();
+                return self.next_token_inner();
             }
         }
 
