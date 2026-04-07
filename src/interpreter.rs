@@ -128,6 +128,8 @@ pub struct Interpreter {
     vectorize_fns: HashMap<String, (Vec<String>, Arc<Vec<Stmt>>)>,
     fuse_fns: HashMap<String, (Vec<String>, Arc<Vec<Stmt>>)>,
     lazy_fns: std::collections::HashSet<String>,
+    inline_fns: std::collections::HashSet<String>,
+    evolve_fns: HashMap<String, (Vec<String>, Arc<Vec<Stmt>>, u64)>,  // name -> (params, current_body, generation)
     /// Loaded shared libraries: lib_path -> handle (dlopen result).
     #[cfg(not(target_arch = "wasm32"))]
     loaded_libs: HashMap<String, *mut std::ffi::c_void>,
@@ -194,6 +196,8 @@ impl Interpreter {
             vectorize_fns: HashMap::new(),
             fuse_fns: HashMap::new(),
             lazy_fns: std::collections::HashSet::new(),
+            inline_fns: std::collections::HashSet::new(),
+            evolve_fns: HashMap::new(),
             #[cfg(not(target_arch = "wasm32"))]
             loaded_libs: HashMap::new(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -575,6 +579,18 @@ impl Interpreter {
                 let has_lazy = decl.attrs.iter().any(|a| matches!(a.kind, crate::token::AttrKind::Lazy));
                 if has_lazy {
                     self.lazy_fns.insert(decl.name.clone());
+                }
+                // AI-native @inline: mark fn for inline expansion at call site
+                let has_inline = decl.attrs.iter().any(|a| matches!(a.kind, crate::token::AttrKind::Inline));
+                if has_inline {
+                    self.inline_fns.insert(decl.name.clone());
+                }
+                // AI-native @evolve: self-modifying function (body replaceable at runtime)
+                let has_evolve = decl.attrs.iter().any(|a| matches!(a.kind, crate::token::AttrKind::Evolve));
+                if has_evolve {
+                    let param_names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
+                    let gen = self.evolve_fns.get(&decl.name).map(|e| e.2 + 1).unwrap_or(0);
+                    self.evolve_fns.insert(decl.name.clone(), (param_names, Arc::new(decl.body.clone()), gen));
                 }
                 if !decl.type_params.is_empty() {
                     // Generic function: store declaration for monomorphization at call site
@@ -1549,6 +1565,28 @@ impl Interpreter {
                     for a in args {
                         arg_vals.push(self.eval_expr(a)?);
                     }
+                    // AI-native @inline: expand function body at call site (no scope overhead)
+                    if let Expr::Ident(ref iln_name) = callee.as_ref() {
+                        if self.inline_fns.contains(iln_name.as_str()) {
+                            if let Value::Fn(ref fn_inner) = func {
+                                let (ref _iname, ref params, ref body) = **fn_inner;
+                                if arg_vals.len() == params.len() {
+                                    for (param, arg) in params.iter().zip(arg_vals) {
+                                        self.env.define(param, arg);
+                                    }
+                                    let mut result = Value::Void;
+                                    for stmt in body.iter() {
+                                        result = self.exec_stmt(stmt)?;
+                                        if self.return_value.is_some() {
+                                            result = self.return_value.take().unwrap();
+                                            break;
+                                        }
+                                    }
+                                    return Ok(result);
+                                }
+                            }
+                        }
+                    }
                     // AI-native @fuse: single-pass array fusion
                     if let Expr::Ident(ref ffn_name) = callee.as_ref() {
                         if self.fuse_fns.contains_key(ffn_name.as_str()) {
@@ -1594,6 +1632,16 @@ impl Interpreter {
                                         Value::Float(f) => Expr::FloatLit(*f),
                                         Value::Bool(b) => Expr::BoolLit(*b),
                                         Value::Str(s) => Expr::StringLit(s.clone()),
+                                        Value::Array(arr) => {
+                                            let elems: Vec<Expr> = arr.iter().map(|elem| match elem {
+                                                Value::Int(i) => Expr::IntLit(*i),
+                                                Value::Float(f) => Expr::FloatLit(*f),
+                                                Value::Bool(b) => Expr::BoolLit(*b),
+                                                Value::Str(s) => Expr::StringLit(s.clone()),
+                                                _ => Expr::FloatLit(0.0),
+                                            }).collect();
+                                            Expr::Array(elems)
+                                        }
                                         _ => Expr::FloatLit(0.0),
                                     };
                                     thunk_stmts.push(Stmt::Let(p.clone(), None, Some(expr), crate::ast::Visibility::Private));
@@ -1696,7 +1744,7 @@ impl Interpreter {
                             let is_memoize = _name.starts_with("__memoize__");
                             let is_pure = _name.starts_with("__pure__") || is_memoize;
                             // @memoize: check cache before execution
-                            if is_memoize {
+                            if is_memoize || is_pure {
                                 let fn_key = _name.clone();
                                 let args_hash = {
                                     use std::hash::Hasher;
@@ -3653,6 +3701,20 @@ impl Interpreter {
                 match &args[0] {
                     Value::Str(s) => Ok(Value::Str(s.to_lowercase())),
                     _ => Err(self.type_err("to_lower() requires string argument".into())),
+                }
+            }
+            // ── @evolve builtins ──────────────────────────────────
+            "evolve_gen" => {
+                // evolve_gen("fn_name") → current generation number
+                if args.is_empty() { return Err(self.type_err("evolve_gen() requires 1 argument".into())); }
+                if let Value::Str(name) = &args[0] {
+                    if let Some((_, _, gen)) = self.evolve_fns.get(name.as_str()) {
+                        Ok(Value::Int(*gen as i64))
+                    } else {
+                        Ok(Value::Int(-1))
+                    }
+                } else {
+                    Err(self.type_err("evolve_gen() requires string argument".into()))
                 }
             }
             // ── Math builtins ──────────────────────────────────────
