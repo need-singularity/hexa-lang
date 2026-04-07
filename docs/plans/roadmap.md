@@ -50,7 +50,7 @@
 - [x] 모듈 시스템 import/export (2026-04-07, `use`/`import` + `pub`)
 - [x] else if 문법 (이미 구현)
 - [x] 표준 라이브러리 분리 (2026-04-07, stdlib/ — math, string, collections)
-- [ ] **Phase 0**: 언어 인프라 보강 (Result, 멀티파일 모듈, enum 메서드)
+- [x] **Phase 0**: 언어 인프라 보강 — ✅ 대부분 완료 (HashMap, String, Result, 모듈, enum, 제네릭)
 - [ ] **Phase 1**: 코어 파이프라인 완성 (파서 42함수 갭, AST, 타입체커)
 - [ ] **Phase 2**: 인터프리터 포팅 (8.5K LOC → Hexa)
 - [ ] **Phase 3**: VM 포팅 (1.5K LOC → Hexa)
@@ -60,14 +60,19 @@
 
 ### AI-native @attr 돌파
 - [x] @memoize — JIT 네이티브 캐싱, Rust 동급 (2026-04-07)
-- [x] @optimize — 선형 점화식 → 행렬 거듭제곱 O(n)→O(log n) 네이티브 JIT (2026-04-07)
+- [x] @optimize — 선형 점화식 → 행렬 거듭제곱 O(n)→O(log n) JIT + Interp (2026-04-07/08)
+- [x] @optimize — Interp 패턴 감지 + O(n) 반복 변환, LLM 불필요 (2026-04-08)
+- [x] @fuse — map/filter/fold 자동 퓨전, 중간 배열 할당 제거 (2026-04-08)
+- [x] @parallel — par_map/par_filter/par_reduce 순수 .hexa 구현, 3x speedup (2026-04-08)
+- [x] @specialize — 타입 특화 라이브러리 순수 .hexa (2026-04-08)
+- [x] @symbolic — 수학적 강도 감소 순수 .hexa (2026-04-08)
+- [x] @lazy — 지연 평가 라이브러리 순수 .hexa (2026-04-08)
+- [x] @approximate — 빠른 근사 알고리즘 순수 .hexa (2026-04-08)
+- [x] @algebraic — 대수적 등가 변환 순수 .hexa (2026-04-08)
 - [ ] @optimize — 버블소트 → 머지소트 감지
 - [ ] @optimize — 선형탐색 → 이진탐색 감지
 - [ ] @optimize — 꼬리재귀 → 루프 변환
-- [ ] @parallel — 자동 멀티코어 분배
 - [ ] @simd — AVX2/NEON 벡터화
-- [ ] @fuse — map/filter 퓨전
-- [ ] @specialize — 런타임 타입 특화
 - [ ] @evolve — 자기진화 (특이점)
 
 ### Performance (추가)
