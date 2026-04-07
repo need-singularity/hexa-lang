@@ -289,7 +289,25 @@ HexaVal parse_primary() {
         }
         return n;
     }
-    if (p_check("LParen")) { p_advance(); HexaVal e = parse_expr(); p_expect("RParen"); return e; }
+    if (p_check("LParen")) {
+        p_advance();
+        HexaVal e = parse_expr();
+        if (p_check("Comma")) {
+            // Tuple: (a, b, c) → Array [a, b, c]
+            HexaVal items = hexa_array_new();
+            items = hexa_array_push(items, e);
+            while (p_check("Comma")) {
+                p_advance();
+                if (!p_check("RParen")) items = hexa_array_push(items, parse_expr());
+            }
+            p_expect("RParen");
+            HexaVal arr = mk_node("Array");
+            arr = hexa_map_set(arr, "items", items);
+            return arr;
+        }
+        p_expect("RParen");
+        return e;
+    }
     if (p_check("HashLBrace")) {
         // Map literal #{ "key": val, ... }
         p_advance(); p_skip_nl();
