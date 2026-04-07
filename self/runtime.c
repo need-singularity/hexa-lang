@@ -114,6 +114,20 @@ HexaVal hexa_array_get(HexaVal arr, int64_t idx) {
     return arr.arr.items[idx];
 }
 
+HexaVal hexa_array_set(HexaVal arr, int64_t idx, HexaVal val) {
+    if (idx < 0) idx += arr.arr.len;
+    if (idx < 0 || idx >= arr.arr.len) {
+        fprintf(stderr, "index %lld out of bounds (len %d)\n", (long long)idx, arr.arr.len);
+        exit(1);
+    }
+    // Copy-on-write: make a shallow copy
+    HexaVal result = arr;
+    result.arr.items = (HexaVal*)malloc(sizeof(HexaVal) * arr.arr.cap);
+    memcpy(result.arr.items, arr.arr.items, sizeof(HexaVal) * arr.arr.len);
+    result.arr.items[idx] = val;
+    return result;
+}
+
 int hexa_len(HexaVal v) {
     if (v.tag == TAG_STR) return strlen(v.s);
     if (v.tag == TAG_ARRAY) return v.arr.len;
