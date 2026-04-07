@@ -306,6 +306,7 @@ impl Env {
         env.define_builtin("ptr_null", Value::BuiltinFn("ptr_null".into()));
         env.define_builtin("ptr_addr", Value::BuiltinFn("ptr_addr".into()));
         env.define_builtin("deref", Value::BuiltinFn("deref".into()));
+        env.define_builtin("env", Value::BuiltinFn("env".into()));
         env.define_builtin("exec", Value::BuiltinFn("exec".into()));
         env.define_builtin("exec_with_status", Value::BuiltinFn("exec_with_status".into()));
         env.define_builtin("input", Value::BuiltinFn("input".into()));
