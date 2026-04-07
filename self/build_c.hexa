@@ -114,9 +114,19 @@ fn tokenize(src) {
             }
         } else if c == "\"" {
             i = i + 1
-            let start = i
-            while i < n && cs_at(cs, i) != "\"" { i = i + 1 }
-            let s = slice_str(cs, start, i)
+            let mut s = ""
+            while i < n && cs_at(cs, i) != "\"" {
+                let ch = cs_at(cs, i)
+                if ch == "\\" && i + 1 < n {
+                    // 이스케이프: 원본 \X를 C로 그대로 넘김 — C도 동일 시퀀스 이해
+                    let nx = cs_at(cs, i + 1)
+                    s = s + "\\" + nx
+                    i = i + 2
+                } else {
+                    s = s + ch
+                    i = i + 1
+                }
+            }
             if i < n { i = i + 1 }
             toks = toks.push(mk("Str", s))
         } else if c == "(" {
@@ -677,6 +687,22 @@ let mut env_lens = []  // 배열/struct length
 let mut struct_tab_names = []
 let mut struct_tab_fields = []  // 각 원소: 필드명 string 배열
 
+// fn 테이블: 이름 + 반환 타입 (Int/Str/Float/DynArr)
+let mut fn_tab_names = []
+let mut fn_tab_rets = []
+fn fn_register(name, ret_type) {
+    fn_tab_names = fn_tab_names.push(name)
+    fn_tab_rets = fn_tab_rets.push(ret_type)
+}
+fn fn_lookup_ret(name) {
+    let mut i = 0
+    while i < len(fn_tab_names) {
+        if fn_tab_names[i] == name { return fn_tab_rets[i] }
+        i = i + 1
+    }
+    return "Int"
+}
+
 fn struct_register(name, fields) {
     struct_tab_names = struct_tab_names.push(name)
     struct_tab_fields = struct_tab_fields.push(fields)
@@ -752,6 +778,8 @@ fn type_of(node) {
             if cl.value == "read_file" { return "Str" }
             if cl.value == "to_string" { return "Str" }
             if cl.value == "args" { return "DynArr" }
+            // 사용자 함수 lookup
+            return fn_lookup_ret(cl.value)
         }
         return "Int"
     }
@@ -1243,6 +1271,64 @@ fn find_len_call_on_param(node, pname) {
     return false
 }
 
+// 블록 내 로컬 Let 타입을 추적하며 return 타입 추론.
+// 반환된 Ident의 타입은 동일 블록 내 Let 초기화 값의 타입으로 간주.
+let mut local_env_names = []
+let mut local_env_types = []
+fn local_env_lookup(name) {
+    let mut i = 0
+    while i < len(local_env_names) {
+        if local_env_names[i] == name { return local_env_types[i] }
+        i = i + 1
+    }
+    return ""
+}
+fn local_env_set(name, t) {
+    local_env_names = local_env_names.push(name)
+    local_env_types = local_env_types.push(t)
+}
+fn resolve_expr_type(e) {
+    if e.kind == "Ident" {
+        let t = local_env_lookup(e.value)
+        if t != "" { return t }
+    }
+    if e.kind == "Bin" && e.op == "+" {
+        let lt = resolve_expr_type(e.left)
+        let rt = resolve_expr_type(e.right)
+        if lt == "Str" || rt == "Str" { return "Str" }
+    }
+    return type_of(e)
+}
+
+fn find_return_type(node) {
+    if node.kind == "Return" {
+        return resolve_expr_type(node.left)
+    }
+    if node.kind == "Let" {
+        // body 순회 중 Let을 만나면 로컬 env 갱신
+        local_env_set(node.value, resolve_expr_type(node.left))
+        return ""
+    }
+    if node.kind == "Block" {
+        let stmts = node.args
+        let mut i = 0
+        while i < len(stmts) {
+            let t = find_return_type(stmts[i])
+            if t != "" { return t }
+            i = i + 1
+        }
+    }
+    if node.kind == "If" {
+        let t = find_return_type(node.then_b)
+        if t != "" { return t }
+        return find_return_type(node.else_b)
+    }
+    if node.kind == "While" || node.kind == "ForRange" {
+        return find_return_type(node.then_b)
+    }
+    return ""
+}
+
 fn infer_param_c_type(body, pname) {
     // 우선순위: Struct > DynArr > Str > Int
     let sname = find_param_field(body, pname)
@@ -1256,8 +1342,16 @@ fn infer_param_c_type(body, pname) {
     return "int"
 }
 
+fn fn_c_ret_type(node) {
+    let rt = find_return_type(node.right)
+    if rt == "Str" { return "const char*" }
+    if rt == "Float" { return "double" }
+    if rt == "DynArr" { return "hexa_arr" }
+    return "long"
+}
+
 fn emit_fn_decl(node) {
-    let mut s = "long " + node.value + "("
+    let mut s = fn_c_ret_type(node) + " " + node.value + "("
     let params = node.args
     let mut i = 0
     while i < len(params) {
@@ -1288,7 +1382,7 @@ fn emit_fn_decl(node) {
 }
 
 fn emit_fn_proto(node) {
-    let mut s = "long " + node.value + "("
+    let mut s = fn_c_ret_type(node) + " " + node.value + "("
     let params = node.args
     let mut i = 0
     while i < len(params) {
@@ -1414,6 +1508,22 @@ fn emit_runtime() {
 }
 
 fn emit_program(stmts) {
+    // 0) fn 테이블 등록 — 반환 타입을 콜 사이트에서 알 수 있도록
+    let mut pi = 0
+    while pi < len(stmts) {
+        let s0 = stmts[pi]
+        if s0.kind == "Fn" {
+            local_env_names = []
+            local_env_types = []
+            let rt = find_return_type(s0.right)
+            if rt == "" {
+                fn_register(s0.value, "Int")
+            } else {
+                fn_register(s0.value, rt)
+            }
+        }
+        pi = pi + 1
+    }
     let mut out = emit_runtime()
     out = out + ""
     // 1) forward prototypes
