@@ -1200,6 +1200,30 @@ impl VM {
                     _ => Err(runtime_err("log2() requires numeric".into())),
                 }
             }
+            "log10" => {
+                if args.is_empty() { return Err(runtime_err("log10() requires 1 argument".into())); }
+                match &args[0] {
+                    Value::Float(f) => Ok(Value::Float(f.log10())),
+                    Value::Int(n) => Ok(Value::Float((*n as f64).log10())),
+                    _ => Err(runtime_err("log10() requires numeric".into())),
+                }
+            }
+            "ln" => {
+                if args.is_empty() { return Err(runtime_err("ln() requires 1 argument".into())); }
+                match &args[0] {
+                    Value::Float(f) => Ok(Value::Float(f.ln())),
+                    Value::Int(n) => Ok(Value::Float((*n as f64).ln())),
+                    _ => Err(runtime_err("ln() requires numeric".into())),
+                }
+            }
+            "exp" => {
+                if args.is_empty() { return Err(runtime_err("exp() requires 1 argument".into())); }
+                match &args[0] {
+                    Value::Float(f) => Ok(Value::Float(f.exp())),
+                    Value::Int(n) => Ok(Value::Float((*n as f64).exp())),
+                    _ => Err(runtime_err("exp() requires numeric".into())),
+                }
+            }
             "sin" => {
                 if args.is_empty() { return Err(runtime_err("sin() requires 1 argument".into())); }
                 match &args[0] {

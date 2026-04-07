@@ -230,6 +230,9 @@ impl Env {
         env.define_builtin("pow", Value::BuiltinFn("pow".into()));
         env.define_builtin("log", Value::BuiltinFn("log".into()));
         env.define_builtin("log2", Value::BuiltinFn("log2".into()));
+        env.define_builtin("log10", Value::BuiltinFn("log10".into()));
+        env.define_builtin("exp", Value::BuiltinFn("exp".into()));
+        env.define_builtin("ln", Value::BuiltinFn("ln".into()));
         env.define_builtin("sin", Value::BuiltinFn("sin".into()));
         env.define_builtin("cos", Value::BuiltinFn("cos".into()));
         env.define_builtin("tan", Value::BuiltinFn("tan".into()));
@@ -308,6 +311,11 @@ impl Env {
         env.define_builtin("deref", Value::BuiltinFn("deref".into()));
         env.define_builtin("env", Value::BuiltinFn("env".into()));
         env.define_builtin("exec", Value::BuiltinFn("exec".into()));
+        env.define_builtin("evolve_gen", Value::BuiltinFn("evolve_gen".into()));
+        env.define_builtin("dot", Value::BuiltinFn("dot".into()));
+        env.define_builtin("matvec", Value::BuiltinFn("matvec".into()));
+        env.define_builtin("mat_add", Value::BuiltinFn("mat_add".into()));
+        env.define_builtin("mat_scale", Value::BuiltinFn("mat_scale".into()));
         env.define_builtin("exec_with_status", Value::BuiltinFn("exec_with_status".into()));
         env.define_builtin("input", Value::BuiltinFn("input".into()));
         env.define_builtin("readline", Value::BuiltinFn("readline".into()));
