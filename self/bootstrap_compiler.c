@@ -690,13 +690,16 @@ void gen_expr(HexaVal node, char* buf) {
         const char* op = hexa_map_get(node,"op").s;
         if (strcmp(op,"+")==0) { strcat(buf,"hexa_add("); gen_expr(hexa_map_get(node,"left"),buf); strcat(buf,", "); gen_expr(hexa_map_get(node,"right"),buf); strcat(buf,")"); return; }
         if (strcmp(op,"==")==0) { strcat(buf,"hexa_eq("); gen_expr(hexa_map_get(node,"left"),buf); strcat(buf,", "); gen_expr(hexa_map_get(node,"right"),buf); strcat(buf,")"); return; }
-        // Others: int operations
+        if (strcmp(op,"-")==0) { strcat(buf,"hexa_sub("); gen_expr(hexa_map_get(node,"left"),buf); strcat(buf,", "); gen_expr(hexa_map_get(node,"right"),buf); strcat(buf,")"); return; }
+        if (strcmp(op,"*")==0) { strcat(buf,"hexa_mul("); gen_expr(hexa_map_get(node,"left"),buf); strcat(buf,", "); gen_expr(hexa_map_get(node,"right"),buf); strcat(buf,")"); return; }
+        if (strcmp(op,"/")==0) { strcat(buf,"hexa_div("); gen_expr(hexa_map_get(node,"left"),buf); strcat(buf,", "); gen_expr(hexa_map_get(node,"right"),buf); strcat(buf,")"); return; }
+        if (strcmp(op,"%")==0) { strcat(buf,"hexa_mod("); gen_expr(hexa_map_get(node,"left"),buf); strcat(buf,", "); gen_expr(hexa_map_get(node,"right"),buf); strcat(buf,")"); return; }
         strcat(buf,"hexa_int(("); gen_expr(hexa_map_get(node,"left"),buf); strcat(buf,").i "); strcat(buf,op); strcat(buf," ("); gen_expr(hexa_map_get(node,"right"),buf); strcat(buf,").i)");
         return;
     }
     if (strcmp(k,"UnaryOp")==0) {
         const char* op = hexa_map_get(node,"op").s;
-        if (strcmp(op,"-")==0) { strcat(buf,"hexa_int(-("); gen_expr(hexa_map_get(node,"left"),buf); strcat(buf,").i)"); return; }
+        if (strcmp(op,"-")==0) { strcat(buf,"hexa_sub(hexa_int(0), "); gen_expr(hexa_map_get(node,"left"),buf); strcat(buf,")"); return; }
         if (strcmp(op,"!")==0) { strcat(buf,"hexa_bool(!hexa_truthy("); gen_expr(hexa_map_get(node,"left"),buf); strcat(buf,"))"); return; }
     }
     if (strcmp(k,"Call")==0) {
@@ -772,6 +775,7 @@ void gen_expr(HexaVal node, char* buf) {
             if (strcmp(method,"map")==0) { strcat(buf,"/* .map() not in C codegen */hexa_array_new()"); return; }
             if (strcmp(method,"filter")==0) { strcat(buf,"/* .filter() not in C codegen */hexa_array_new()"); return; }
             if (strcmp(method,"join")==0) { strcat(buf,"hexa_str_join("); gen_expr(hexa_map_get(callee,"left"),buf); strcat(buf,", "); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,")"); return; }
+            if (strcmp(method,"repeat")==0) { strcat(buf,"hexa_str_repeat("); gen_expr(hexa_map_get(callee,"left"),buf); strcat(buf,", "); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,")"); return; }
             if (strcmp(method,"push")==0) { strcat(buf,"hexa_array_push("); gen_expr(hexa_map_get(callee,"left"),buf); strcat(buf,", "); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,")"); return; }
             if (strcmp(method,"len")==0) { strcat(buf,"hexa_int(hexa_len("); gen_expr(hexa_map_get(callee,"left"),buf); strcat(buf,"))"); return; }
         }

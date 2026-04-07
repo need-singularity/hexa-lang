@@ -472,3 +472,39 @@ HexaVal hexa_pad_right(HexaVal s, HexaVal width) {
     result[bytelen + pad] = 0;
     return hexa_str_own(result);
 }
+
+// B-19: Polymorphic arithmetic
+HexaVal hexa_sub(HexaVal a, HexaVal b) {
+    if (a.tag == TAG_INT && b.tag == TAG_INT) return hexa_int(a.i - b.i);
+    double fa = a.tag == TAG_FLOAT ? a.f : (double)a.i;
+    double fb = b.tag == TAG_FLOAT ? b.f : (double)b.i;
+    return hexa_float(fa - fb);
+}
+HexaVal hexa_mul(HexaVal a, HexaVal b) {
+    if (a.tag == TAG_INT && b.tag == TAG_INT) return hexa_int(a.i * b.i);
+    double fa = a.tag == TAG_FLOAT ? a.f : (double)a.i;
+    double fb = b.tag == TAG_FLOAT ? b.f : (double)b.i;
+    return hexa_float(fa * fb);
+}
+HexaVal hexa_div(HexaVal a, HexaVal b) {
+    if (a.tag == TAG_INT && b.tag == TAG_INT) {
+        if (b.i == 0) return hexa_int(0);
+        return hexa_int(a.i / b.i);
+    }
+    double fa = a.tag == TAG_FLOAT ? a.f : (double)a.i;
+    double fb = b.tag == TAG_FLOAT ? b.f : (double)b.i;
+    return hexa_float(fa / fb);
+}
+HexaVal hexa_mod(HexaVal a, HexaVal b) {
+    if (a.tag == TAG_INT && b.tag == TAG_INT) return hexa_int(b.i ? a.i % b.i : 0);
+    return hexa_int(0);
+}
+HexaVal hexa_str_repeat(HexaVal s, HexaVal n) {
+    if (s.tag != TAG_STR) return s;
+    int count = n.i;
+    int slen = strlen(s.s);
+    char* result = malloc(slen * count + 1);
+    result[0] = 0;
+    for (int i = 0; i < count; i++) strcat(result, s.s);
+    return hexa_str_own(result);
+}
