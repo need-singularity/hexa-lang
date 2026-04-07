@@ -339,3 +339,81 @@ HexaVal hexa_format(HexaVal fmt, HexaVal arg) {
     strcat(result, pos + 2);
     return hexa_str_own(result);
 }
+
+// ── String split ─────────────────────────────────────
+
+HexaVal hexa_str_split(HexaVal s, HexaVal delim) {
+    HexaVal arr = hexa_array_new();
+    if (s.tag != TAG_STR || delim.tag != TAG_STR) return arr;
+    char* src = strdup(s.s);
+    char* d = delim.s;
+    int dlen = strlen(d);
+    char* pos = src;
+    while (1) {
+        char* found = strstr(pos, d);
+        if (!found) { arr = hexa_array_push(arr, hexa_str(pos)); break; }
+        *found = 0;
+        arr = hexa_array_push(arr, hexa_str(pos));
+        pos = found + dlen;
+    }
+    free(src);
+    return arr;
+}
+
+HexaVal hexa_str_trim(HexaVal s) {
+    if (s.tag != TAG_STR) return s;
+    char* str = s.s;
+    while (*str == ' ' || *str == '\t' || *str == '\n' || *str == '\r') str++;
+    int len = strlen(str);
+    while (len > 0 && (str[len-1] == ' ' || str[len-1] == '\t' || str[len-1] == '\n' || str[len-1] == '\r')) len--;
+    char* result = strndup(str, len);
+    return hexa_str_own(result);
+}
+
+HexaVal hexa_str_replace(HexaVal s, HexaVal old, HexaVal new_s) {
+    if (s.tag != TAG_STR) return s;
+    char* result = malloc(strlen(s.s) * 2 + 1);
+    result[0] = 0;
+    char* pos = s.s;
+    int oldlen = strlen(old.s);
+    while (1) {
+        char* found = strstr(pos, old.s);
+        if (!found) { strcat(result, pos); break; }
+        strncat(result, pos, found - pos);
+        strcat(result, new_s.s);
+        pos = found + oldlen;
+    }
+    return hexa_str_own(result);
+}
+
+HexaVal hexa_str_to_upper(HexaVal s) {
+    if (s.tag != TAG_STR) return s;
+    char* r = strdup(s.s);
+    for (int i = 0; r[i]; i++) if (r[i] >= 'a' && r[i] <= 'z') r[i] -= 32;
+    return hexa_str_own(r);
+}
+
+HexaVal hexa_str_to_lower(HexaVal s) {
+    if (s.tag != TAG_STR) return s;
+    char* r = strdup(s.s);
+    for (int i = 0; r[i]; i++) if (r[i] >= 'A' && r[i] <= 'Z') r[i] += 32;
+    return hexa_str_own(r);
+}
+
+HexaVal hexa_str_join(HexaVal arr, HexaVal sep) {
+    if (arr.tag != TAG_ARRAY || arr.arr.len == 0) return hexa_str("");
+    int total = 0;
+    for (int i = 0; i < arr.arr.len; i++) {
+        HexaVal s = hexa_to_string(arr.arr.items[i]);
+        total += strlen(s.s);
+    }
+    total += (arr.arr.len - 1) * strlen(sep.s);
+    char* result = malloc(total + 1);
+    result[0] = 0;
+    for (int i = 0; i < arr.arr.len; i++) {
+        if (i > 0) strcat(result, sep.s);
+        HexaVal s = hexa_to_string(arr.arr.items[i]);
+        strcat(result, s.s);
+    }
+    return hexa_str_own(result);
+}

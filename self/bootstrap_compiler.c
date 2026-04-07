@@ -250,8 +250,31 @@ HexaVal parse_primary() {
     if (p_check("StringLit")) { HexaVal n = mk_node("StringLit"); n = hexa_map_set(n, "value", hexa_map_get(p_peek(), "value")); p_advance(); return n; }
     if (p_check("Ident")) {
         HexaVal n = mk_node("Ident");
-        n = hexa_map_set(n, "name", hexa_map_get(p_peek(), "value"));
+        const char* id_name = hexa_map_get(p_peek(), "value").s;
+        n = hexa_map_set(n, "name", hexa_str(id_name));
         p_advance();
+        // StructInit: Name { field: val, ... }
+        if (p_check("LBrace") && id_name[0] >= 'A' && id_name[0] <= 'Z') {
+            p_advance(); // {
+            HexaVal fields = hexa_array_new();
+            while (!p_check("RBrace") && !p_check("Eof")) {
+                p_skip_nl();
+                const char* fname = p_expect_ident();
+                p_expect("Colon");
+                HexaVal fval = parse_expr();
+                HexaVal field = mk_node("FieldInit");
+                field = hexa_map_set(field, "name", hexa_str(fname));
+                field = hexa_map_set(field, "left", fval);
+                fields = hexa_array_push(fields, field);
+                if (p_check("Comma")) p_advance();
+                p_skip_nl();
+            }
+            p_expect("RBrace");
+            HexaVal si = mk_node("StructInit");
+            si = hexa_map_set(si, "name", hexa_str(id_name));
+            si = hexa_map_set(si, "fields", fields);
+            return si;
+        }
         return n;
     }
     if (p_check("LParen")) { p_advance(); HexaVal e = parse_expr(); p_expect("RParen"); return e; }
@@ -615,15 +638,34 @@ void gen_expr(HexaVal node, char* buf) {
         }
         if (strcmp(ck,"Field")==0) {
             const char* method = hexa_map_get(callee,"name").s;
+            if (strcmp(method,"len")==0) { strcat(buf,"hexa_int(hexa_len("); gen_expr(hexa_map_get(callee,"left"),buf); strcat(buf,"))"); return; }
+            if (strcmp(method,"chars")==0) { strcat(buf,"hexa_str_chars("); gen_expr(hexa_map_get(callee,"left"),buf); strcat(buf,")"); return; }
+            if (strcmp(method,"contains")==0) { strcat(buf,"hexa_bool(hexa_str_contains("); gen_expr(hexa_map_get(callee,"left"),buf); strcat(buf,", "); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,"))"); return; }
+            if (strcmp(method,"split")==0) { strcat(buf,"hexa_str_split("); gen_expr(hexa_map_get(callee,"left"),buf); strcat(buf,", "); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,")"); return; }
+            if (strcmp(method,"trim")==0) { strcat(buf,"hexa_str_trim("); gen_expr(hexa_map_get(callee,"left"),buf); strcat(buf,")"); return; }
+            if (strcmp(method,"replace")==0) { strcat(buf,"hexa_str_replace("); gen_expr(hexa_map_get(callee,"left"),buf); strcat(buf,", "); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,", "); gen_expr(hexa_map_get(node,"args").arr.items[1],buf); strcat(buf,")"); return; }
+            if (strcmp(method,"to_upper")==0) { strcat(buf,"hexa_str_to_upper("); gen_expr(hexa_map_get(callee,"left"),buf); strcat(buf,")"); return; }
+            if (strcmp(method,"to_lower")==0) { strcat(buf,"hexa_str_to_lower("); gen_expr(hexa_map_get(callee,"left"),buf); strcat(buf,")"); return; }
+            if (strcmp(method,"starts_with")==0) { strcat(buf,"hexa_bool(strncmp(("); gen_expr(hexa_map_get(callee,"left"),buf); strcat(buf,").s, ("); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,").s, strlen(("); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,").s))==0)"); return; }
+            if (strcmp(method,"map")==0) { strcat(buf,"/* .map() not in C codegen */hexa_array_new()"); return; }
+            if (strcmp(method,"filter")==0) { strcat(buf,"/* .filter() not in C codegen */hexa_array_new()"); return; }
+            if (strcmp(method,"join")==0) { strcat(buf,"hexa_str_join("); gen_expr(hexa_map_get(callee,"left"),buf); strcat(buf,", "); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,")"); return; }
             if (strcmp(method,"push")==0) { strcat(buf,"hexa_array_push("); gen_expr(hexa_map_get(callee,"left"),buf); strcat(buf,", "); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,")"); return; }
             if (strcmp(method,"len")==0) { strcat(buf,"hexa_int(hexa_len("); gen_expr(hexa_map_get(callee,"left"),buf); strcat(buf,"))"); return; }
         }
     }
     if (strcmp(k,"StructInit")==0) {
-        // Struct as Map
-        strcat(buf, "hexa_map_new()");
         HexaVal fields = hexa_map_get(node, "fields");
-        // Note: struct init fields need special handling
+        int nf = fields.tag==TAG_ARRAY ? fields.arr.len : 0;
+        // Build nested hexa_map_set calls
+        for (int i=0; i<nf; i++) strcat(buf, "hexa_map_set(");
+        strcat(buf, "hexa_map_new()");
+        for (int i=0; i<nf; i++) {
+            HexaVal f = fields.arr.items[i];
+            strcat(buf, ", \""); strcat(buf, hexa_map_get(f,"name").s); strcat(buf, "\", ");
+            gen_expr(hexa_map_get(f,"left"), buf);
+            strcat(buf, ")");
+        }
         return;
     }
     if (strcmp(k,"Array")==0) {
@@ -639,6 +681,12 @@ void gen_expr(HexaVal node, char* buf) {
             gen_expr(items.arr.items[i], buf);
             strcat(buf, ")");
         }
+        return;
+    }
+    if (strcmp(k,"Field")==0) {
+        strcat(buf, "hexa_map_get(");
+        gen_expr(hexa_map_get(node,"left"), buf);
+        strcat(buf, ", \""); strcat(buf, hexa_map_get(node,"name").s); strcat(buf, "\")");
         return;
     }
     if (strcmp(k,"Index")==0) {
@@ -715,10 +763,26 @@ void gen_stmt(HexaVal node, int depth, char* buf) {
             gen_indent(buf,depth); strcat(buf,"}");
             HexaVal eb = hexa_map_get(expr,"else_body");
             if (eb.tag==TAG_ARRAY && eb.arr.len>0) {
+                // Check for else-if chain
+                // Check if first element is IfExpr (direct or wrapped in ExprStmt)
+                HexaVal first_eb = eb.arr.items[0];
+                const char* ebk = hexa_map_get(first_eb,"kind").s;
+                if (eb.arr.len==1 && (strcmp(ebk,"IfExpr")==0 || strcmp(ebk,"ExprStmt")==0)) {
+                    HexaVal inner = strcmp(ebk,"IfExpr")==0 ? first_eb : hexa_map_get(first_eb,"left");
+                    if (inner.tag!=TAG_STR && strcmp(hexa_map_get(inner,"kind").s,"IfExpr")==0) {
+                        strcat(buf," else ");
+                        // Recurse: generate the inner if as if it were a top-level if statement
+                        HexaVal wrapper = mk_node("ExprStmt");
+                        wrapper = hexa_map_set(wrapper, "left", inner);
+                        gen_stmt(wrapper, depth, buf);
+                        goto done_if;
+                    }
+                }
                 strcat(buf," else {\n");
                 for (int i=0; i<eb.arr.len; i++) gen_stmt(eb.arr.items[i], depth+1, buf);
                 gen_indent(buf,depth); strcat(buf,"}");
             }
+            done_if:
             strcat(buf,"\n"); return;
         }
         gen_expr(expr, buf); strcat(buf, ";\n"); return;
@@ -747,6 +811,8 @@ void gen_stmt(HexaVal node, int depth, char* buf) {
         if (strcmp(hexa_map_get(iter,"kind").s,"Range")!=0) strcat(buf,"}");
         strcat(buf,"\n"); return;
     }
+    if (strcmp(k,"BreakStmt")==0) { strcat(buf, "break;\n"); return; }
+    if (strcmp(k,"ContinueStmt")==0) { strcat(buf, "continue;\n"); return; }
     if (strcmp(k,"StructDecl")==0) { strcat(buf,"/* struct "); strcat(buf,hexa_map_get(node,"name").s); strcat(buf," */\n"); return; }
     strcat(buf, "/* "); strcat(buf, k); strcat(buf, " */\n");
 }
