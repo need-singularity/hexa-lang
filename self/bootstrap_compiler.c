@@ -580,9 +580,32 @@ void gen_expr(HexaVal node, char* buf) {
         const char* ck = hexa_map_get(callee,"kind").s;
         if (strcmp(ck,"Ident")==0) {
             const char* fn = hexa_map_get(callee,"name").s;
-            if (strcmp(fn,"println")==0) { strcat(buf,"(hexa_println("); HexaVal args=hexa_map_get(node,"args"); if(args.tag==TAG_ARRAY&&args.arr.len>0) gen_expr(args.arr.items[0],buf); else strcat(buf,"hexa_str(\"\")"); strcat(buf,"), hexa_void())"); return; }
+            if (strcmp(fn,"println")==0) {
+                HexaVal args=hexa_map_get(node,"args");
+                if(args.tag==TAG_ARRAY&&args.arr.len>1) {
+                    // Multi-arg: use hexa_println_multi helper
+                    strcat(buf,"(");
+                    for(int _pi=0;_pi<args.arr.len;_pi++) {
+                        if(_pi>0) strcat(buf,", printf(\" \"), ");
+                        strcat(buf,"hexa_print_val("); gen_expr(args.arr.items[_pi],buf); strcat(buf,")");
+                    }
+                    strcat(buf,", printf(\"\\n\"), hexa_void())");
+                } else if(args.tag==TAG_ARRAY&&args.arr.len==1) {
+                    strcat(buf,"(hexa_println("); gen_expr(args.arr.items[0],buf); strcat(buf,"), hexa_void())");
+                } else {
+                    strcat(buf,"(printf(\"\\n\"), hexa_void())");
+                }
+                return;
+            }
             if (strcmp(fn,"len")==0) { strcat(buf,"hexa_int(hexa_len("); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,"))"); return; }
             if (strcmp(fn,"to_string")==0) { strcat(buf,"hexa_to_string("); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,")"); return; }
+            if (strcmp(fn,"sqrt")==0) { strcat(buf,"hexa_sqrt("); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,")"); return; }
+            if (strcmp(fn,"pow")==0) { strcat(buf,"hexa_pow("); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,", "); gen_expr(hexa_map_get(node,"args").arr.items[1],buf); strcat(buf,")"); return; }
+            if (strcmp(fn,"floor")==0) { strcat(buf,"hexa_floor("); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,")"); return; }
+            if (strcmp(fn,"ceil")==0) { strcat(buf,"hexa_ceil("); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,")"); return; }
+            if (strcmp(fn,"abs")==0) { strcat(buf,"hexa_abs("); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,")"); return; }
+            if (strcmp(fn,"args")==0) { strcat(buf,"hexa_args()"); return; }
+            if (strcmp(fn,"format")==0) { strcat(buf,"hexa_format("); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,", "); gen_expr(hexa_map_get(node,"args").arr.items[1],buf); strcat(buf,")"); return; }
             // User function
             strcat(buf,fn); strcat(buf,"(");
             HexaVal args = hexa_map_get(node,"args");
@@ -596,13 +619,25 @@ void gen_expr(HexaVal node, char* buf) {
             if (strcmp(method,"len")==0) { strcat(buf,"hexa_int(hexa_len("); gen_expr(hexa_map_get(callee,"left"),buf); strcat(buf,"))"); return; }
         }
     }
+    if (strcmp(k,"StructInit")==0) {
+        // Struct as Map
+        strcat(buf, "hexa_map_new()");
+        HexaVal fields = hexa_map_get(node, "fields");
+        // Note: struct init fields need special handling
+        return;
+    }
     if (strcmp(k,"Array")==0) {
-        strcat(buf,"hexa_array_new()");
         HexaVal items = hexa_map_get(node,"items");
-        for (int i=0; items.tag==TAG_ARRAY && i<items.arr.len; i++) {
-            char tmp[4096]=""; gen_expr(items.arr.items[i],tmp);
-            char wrap[4200]; sprintf(wrap, "hexa_array_push(%s, %s)", buf, tmp);
-            buf[0]=0; strcat(buf,wrap); // This is hacky but works for small arrays
+        int n = items.tag==TAG_ARRAY ? items.arr.len : 0;
+        if (n == 0) { strcat(buf,"hexa_array_new()"); return; }
+        // Build nested hexa_array_push calls
+        // hexa_array_push(hexa_array_push(hexa_array_new(), item0), item1)
+        for (int i=0; i<n; i++) strcat(buf, "hexa_array_push(");
+        strcat(buf, "hexa_array_new()");
+        for (int i=0; i<n; i++) {
+            strcat(buf, ", ");
+            gen_expr(items.arr.items[i], buf);
+            strcat(buf, ")");
         }
         return;
     }
@@ -633,11 +668,13 @@ void gen_stmt(HexaVal node, int depth, char* buf) {
     gen_indent(buf, depth);
 
     if (strcmp(k,"LetStmt")==0||strcmp(k,"LetMutStmt")==0||strcmp(k,"ConstStmt")==0) {
-        strcat(buf, "HexaVal "); strcat(buf, hexa_map_get(node,"name").s); strcat(buf, " = ");
+        // Generate init expr into separate buffer to avoid corruption
+        char* init_buf = calloc(1, 65536);
         HexaVal init = hexa_map_get(node,"left");
-        if (init.tag == TAG_STR && strlen(init.s)==0) strcat(buf,"hexa_void()");
-        else gen_expr(init, buf);
-        strcat(buf, ";\n"); return;
+        if (init.tag == TAG_STR && strlen(init.s)==0) strcpy(init_buf,"hexa_void()");
+        else gen_expr(init, init_buf);
+        strcat(buf, "HexaVal "); strcat(buf, hexa_map_get(node,"name").s);
+        strcat(buf, " = "); strcat(buf, init_buf); strcat(buf, ";\n"); free(init_buf); return;
     }
     if (strcmp(k,"AssignStmt")==0) {
         gen_expr(hexa_map_get(node,"left"), buf); strcat(buf, " = "); gen_expr(hexa_map_get(node,"right"), buf); strcat(buf, ";\n"); return;
@@ -735,7 +772,7 @@ char* codegen_c_full(HexaVal ast) {
     }
 
     strcat(buf, fwd); strcat(buf, "\n"); strcat(buf, fns);
-    strcat(buf, "int main() {\n"); strcat(buf, main_code); strcat(buf, "    return 0;\n}\n");
+    strcat(buf, "int main(int argc, char** argv) {\n    hexa_set_args(argc, argv);\n"); strcat(buf, main_code); strcat(buf, "    return 0;\n}\n");
 
     free(fwd); free(fns); free(main_code);
     return buf;
@@ -749,6 +786,9 @@ char* codegen_c_full(HexaVal ast) {
 // ══════════════════════════════════════════════════════════
 // ASM CODEGEN — Generate ARM64 assembly (as+ld, no gcc)
 // ══════════════════════════════════════════════════════════
+
+void gen_asm_stmt_c(HexaVal, char*, int, int*, const char*);
+void gen_asm_expr_c(HexaVal, char*, int, int*, const char*);
 
 char* codegen_asm_full(HexaVal ast) {
     char* buf = calloc(1, 512*1024);
@@ -845,8 +885,7 @@ char* codegen_asm_full(HexaVal ast) {
     return buf;
 }
 
-void gen_asm_expr_c(HexaVal node, char* buf, int np, int* lc, const char* fn_name);
-void gen_asm_stmt_c(HexaVal node, char* buf, int np, int* lc, const char* fn_name);
+
 
 void gen_asm_stmt_c(HexaVal node, char* buf, int np, int* lc, const char* fn_name) {
     const char* k = hexa_map_get(node, "kind").s;

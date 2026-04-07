@@ -275,3 +275,67 @@ HexaVal hexa_write_file(HexaVal path, HexaVal content) {
     fclose(f);
     return hexa_bool(1);
 }
+
+// ── Command line arguments ───────────────────────────
+
+static int _hexa_argc = 0;
+static char** _hexa_argv = NULL;
+
+void hexa_set_args(int argc, char** argv) {
+    _hexa_argc = argc;
+    _hexa_argv = argv;
+}
+
+HexaVal hexa_args() {
+    HexaVal arr = hexa_array_new();
+    for (int i = 0; i < _hexa_argc; i++) {
+        arr = hexa_array_push(arr, hexa_str(_hexa_argv[i]));
+    }
+    return arr;
+}
+
+// ── Float operations ─────────────────────────────────
+
+#include <math.h>
+
+HexaVal hexa_sqrt(HexaVal v) {
+    double x = v.tag == TAG_FLOAT ? v.f : (double)v.i;
+    return hexa_float(sqrt(x));
+}
+
+HexaVal hexa_pow(HexaVal base, HexaVal exp) {
+    double b = base.tag == TAG_FLOAT ? base.f : (double)base.i;
+    double e = exp.tag == TAG_FLOAT ? exp.f : (double)exp.i;
+    return hexa_float(pow(b, e));
+}
+
+HexaVal hexa_floor(HexaVal v) {
+    return hexa_int((int64_t)floor(v.tag == TAG_FLOAT ? v.f : (double)v.i));
+}
+
+HexaVal hexa_ceil(HexaVal v) {
+    return hexa_int((int64_t)ceil(v.tag == TAG_FLOAT ? v.f : (double)v.i));
+}
+
+HexaVal hexa_abs(HexaVal v) {
+    if (v.tag == TAG_INT) return hexa_int(v.i < 0 ? -v.i : v.i);
+    return hexa_float(fabs(v.f));
+}
+
+// ── String format ────────────────────────────────────
+
+HexaVal hexa_format(HexaVal fmt, HexaVal arg) {
+    // Simple: replace first {} with arg
+    if (fmt.tag != TAG_STR) return fmt;
+    char* pos = strstr(fmt.s, "{}");
+    if (!pos) return fmt;
+    HexaVal sarg = hexa_to_string(arg);
+    int before = pos - fmt.s;
+    int after_len = strlen(pos + 2);
+    char* result = malloc(before + strlen(sarg.s) + after_len + 1);
+    strncpy(result, fmt.s, before);
+    result[before] = 0;
+    strcat(result, sarg.s);
+    strcat(result, pos + 2);
+    return hexa_str_own(result);
+}
