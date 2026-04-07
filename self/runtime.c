@@ -440,3 +440,26 @@ HexaVal hexa_str_join(HexaVal arr, HexaVal sep) {
     }
     return hexa_str_own(result);
 }
+
+HexaVal hexa_pad_left(HexaVal s, HexaVal width) {
+    HexaVal str = hexa_to_string(s);
+    int w = width.i;
+    int slen = strlen(str.s);
+    if (slen >= w) return str;
+    char* result = malloc(w + 1);
+    memset(result, ' ', w - slen);
+    strcpy(result + (w - slen), str.s);
+    return hexa_str_own(result);
+}
+
+HexaVal hexa_pad_right(HexaVal s, HexaVal width) {
+    HexaVal str = hexa_to_string(s);
+    int w = width.i;
+    int slen = strlen(str.s);
+    if (slen >= w) return str;
+    char* result = malloc(w + 1);
+    strcpy(result, str.s);
+    memset(result + slen, ' ', w - slen);
+    result[w] = 0;
+    return hexa_str_own(result);
+}

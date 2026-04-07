@@ -463,6 +463,7 @@ HexaVal parse_if() {
     HexaVal then_b = parse_block();
     HexaVal else_b = hexa_str("");
     p_skip_nl();
+    fprintf(stderr, "[parse_if] after then block, next token: %s '%s'\n", p_kind(), hexa_map_get(p_peek(),"value").s);
     if (p_check("Else")) {
         p_advance();
         if (p_check("If")) { else_b = hexa_array_new(); else_b = hexa_array_push(else_b, parse_if()); }
@@ -728,6 +729,8 @@ void gen_expr(HexaVal node, char* buf) {
             if (strcmp(fn,"ceil")==0) { strcat(buf,"hexa_ceil("); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,")"); return; }
             if (strcmp(fn,"abs")==0) { strcat(buf,"hexa_abs("); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,")"); return; }
             if (strcmp(fn,"args")==0) { strcat(buf,"hexa_args()"); return; }
+            if (strcmp(fn,"pad_left")==0) { strcat(buf,"hexa_pad_left("); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,", "); gen_expr(hexa_map_get(node,"args").arr.items[1],buf); strcat(buf,")"); return; }
+            if (strcmp(fn,"pad_right")==0) { strcat(buf,"hexa_pad_right("); gen_expr(hexa_map_get(node,"args").arr.items[0],buf); strcat(buf,", "); gen_expr(hexa_map_get(node,"args").arr.items[1],buf); strcat(buf,")"); return; }
             if (strcmp(fn,"format")==0) {
                 HexaVal fargs = hexa_map_get(node,"args");
                 if (fargs.tag==TAG_ARRAY && fargs.arr.len == 2) {
@@ -857,11 +860,22 @@ void gen_expr(HexaVal node, char* buf) {
         strcat(buf,"(hexa_truthy("); gen_expr(hexa_map_get(node,"cond"),buf); strcat(buf,") ? ");
         HexaVal tb = hexa_map_get(node,"then_body");
         if (tb.tag==TAG_ARRAY && tb.arr.len>0) {
-            HexaVal last = tb.arr.items[tb.arr.len-1];
-            if (strcmp(hexa_map_get(last,"kind").s,"ReturnStmt")==0) gen_expr(hexa_map_get(last,"left"),buf);
-            else gen_expr(hexa_map_get(last,"left"),buf);
+            HexaVal tl = tb.arr.items[tb.arr.len-1];
+            const char* tlk = hexa_map_get(tl,"kind").s;
+            if (strcmp(tlk,"ExprStmt")==0) gen_expr(hexa_map_get(tl,"left"),buf);
+            else if (strcmp(tlk,"ReturnStmt")==0) gen_expr(hexa_map_get(tl,"left"),buf);
+            else gen_expr(tl,buf);
         } else strcat(buf,"hexa_void()");
-        strcat(buf," : hexa_void())");
+        strcat(buf," : ");
+        HexaVal eb = hexa_map_get(node,"else_body");
+        if (eb.tag==TAG_ARRAY && eb.arr.len>0) {
+            HexaVal el = eb.arr.items[eb.arr.len-1];
+            const char* elk = hexa_map_get(el,"kind").s;
+            if (strcmp(elk,"ExprStmt")==0) gen_expr(hexa_map_get(el,"left"),buf);
+            else if (strcmp(elk,"ReturnStmt")==0) gen_expr(hexa_map_get(el,"left"),buf);
+            else gen_expr(el,buf);
+        } else strcat(buf,"hexa_void()");
+        strcat(buf,")");
         return;
     }
     if (strcmp(k,"Range")==0) {
