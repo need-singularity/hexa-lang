@@ -1334,6 +1334,10 @@ impl Interpreter {
                 }
                 // Check for method call pattern: obj.method(args)
                 if let Expr::Field(obj_expr, method_name) = callee.as_ref() {
+                    // AI-native @fuse: detect map/filter/fold chains → single pass fusion
+                    if let Some(result) = self.try_fuse_chain(obj_expr, method_name, args)? {
+                        return Ok(result);
+                    }
                     let obj_val = self.eval_expr(obj_expr)?;
                     let mut arg_vals = Vec::with_capacity(args.len());
                     for a in args {
@@ -5102,6 +5106,200 @@ impl Interpreter {
                     }
                 }
             }
+        }
+    }
+
+    /// AI-native @fuse: detect and fuse array method chains into single pass.
+    /// arr.map(f).filter(g) → single loop (no intermediate array)
+    /// arr.filter(g).map(f) → single loop
+    /// arr.map(f).map(g) → single loop with composed function
+    /// Returns Some(result) if fusion applied, None to fall back to normal execution.
+    fn try_fuse_chain(&mut self, obj_expr: &Expr, final_method: &str, final_args: &[Expr]) -> Result<Option<Value>, HexaError> {
+        // Only fuse map, filter, fold, sum, any, all
+        if !matches!(final_method, "map" | "filter" | "fold" | "sum" | "any" | "all" | "find" | "count") {
+            return Ok(None);
+        }
+        // Collect the chain: walk nested Call(Field(...)) to find the root array
+        let mut ops: Vec<(&str, &[Expr])> = vec![(final_method, final_args)];
+        let mut current = obj_expr;
+        loop {
+            match current {
+                Expr::Call(callee, args) => {
+                    if let Expr::Field(inner, method) = callee.as_ref() {
+                        if matches!(method.as_str(), "map" | "filter") {
+                            ops.push((method, args));
+                            current = inner;
+                            continue;
+                        }
+                    }
+                    break;
+                }
+                _ => break,
+            }
+        }
+        // Need at least 2 operations to fuse
+        if ops.len() < 2 {
+            return Ok(None);
+        }
+        // Reverse to get execution order (innermost first)
+        ops.reverse();
+        // Evaluate the root array
+        let root_val = self.eval_expr(current)?;
+        let arr = match &root_val {
+            Value::Array(a) => a,
+            _ => return Ok(None), // Not an array, can't fuse
+        };
+        // Evaluate all closure arguments
+        let mut closures: Vec<(&str, Value)> = Vec::with_capacity(ops.len());
+        for (method, args) in &ops {
+            if *method == "sum" || *method == "count" {
+                closures.push((method, Value::Void));
+            } else if args.is_empty() {
+                return Ok(None); // Can't fuse without closure
+            } else {
+                let func = self.eval_expr(&args[0])?;
+                closures.push((method, func));
+            }
+        }
+        // Execute fused single-pass loop
+        // Determine the terminal operation
+        let last = closures.last().unwrap().0;
+        match last {
+            "map" | "filter" => {
+                // Result is an array
+                let mut result = Vec::new();
+                for item in arr {
+                    let mut val = item.clone();
+                    let mut keep = true;
+                    for (method, func) in &closures {
+                        match *method {
+                            "map" => {
+                                val = self.call_function(func.clone(), vec![val])?;
+                            }
+                            "filter" => {
+                                let test = self.call_function(func.clone(), vec![val.clone()])?;
+                                if !Self::is_truthy(&test) {
+                                    keep = false;
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if keep {
+                        result.push(val);
+                    }
+                }
+                Ok(Some(Value::Array(result)))
+            }
+            "fold" => {
+                // fold needs init value
+                let fold_args_raw = ops.last().unwrap().1;
+                if fold_args_raw.len() < 2 { return Ok(None); }
+                let mut acc = self.eval_expr(&fold_args_raw[0])?;
+                let fold_func = self.eval_expr(&fold_args_raw[1])?;
+                // Replace last closure with fold func
+                let chain_len = closures.len();
+                for item in arr {
+                    let mut val = item.clone();
+                    let mut keep = true;
+                    for (i, (method, func)) in closures.iter().enumerate() {
+                        if i == chain_len - 1 { break; } // skip fold itself
+                        match *method {
+                            "map" => { val = self.call_function(func.clone(), vec![val])?; }
+                            "filter" => {
+                                let test = self.call_function(func.clone(), vec![val.clone()])?;
+                                if !Self::is_truthy(&test) { keep = false; break; }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if keep {
+                        acc = self.call_function(fold_func.clone(), vec![acc, val])?;
+                    }
+                }
+                Ok(Some(acc))
+            }
+            "sum" => {
+                let mut int_sum = 0i64;
+                let chain_len = closures.len();
+                for item in arr {
+                    let mut val = item.clone();
+                    let mut keep = true;
+                    for (i, (method, func)) in closures.iter().enumerate() {
+                        if i == chain_len - 1 { break; }
+                        match *method {
+                            "map" => { val = self.call_function(func.clone(), vec![val])?; }
+                            "filter" => {
+                                let test = self.call_function(func.clone(), vec![val.clone()])?;
+                                if !Self::is_truthy(&test) { keep = false; break; }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if keep {
+                        if let Value::Int(n) = val { int_sum += n; }
+                    }
+                }
+                Ok(Some(Value::Int(int_sum)))
+            }
+            "count" => {
+                let mut count = 0i64;
+                let chain_len = closures.len();
+                for item in arr {
+                    let mut val = item.clone();
+                    let mut keep = true;
+                    for (i, (method, func)) in closures.iter().enumerate() {
+                        if i == chain_len - 1 { break; }
+                        match *method {
+                            "map" => { val = self.call_function(func.clone(), vec![val])?; }
+                            "filter" => {
+                                let test = self.call_function(func.clone(), vec![val.clone()])?;
+                                if !Self::is_truthy(&test) { keep = false; break; }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if keep { count += 1; }
+                }
+                Ok(Some(Value::Int(count)))
+            }
+            "any" | "all" | "find" => {
+                // These use the last closure as predicate
+                let pred = &closures.last().unwrap().1;
+                let is_any = last == "any";
+                let is_find = last == "find";
+                let chain_len = closures.len();
+                for item in arr {
+                    let mut val = item.clone();
+                    let mut keep = true;
+                    for (i, (method, func)) in closures.iter().enumerate() {
+                        if i == chain_len - 1 { break; }
+                        match *method {
+                            "map" => { val = self.call_function(func.clone(), vec![val])?; }
+                            "filter" => {
+                                let test = self.call_function(func.clone(), vec![val.clone()])?;
+                                if !Self::is_truthy(&test) { keep = false; break; }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if keep {
+                        let test = self.call_function(pred.clone(), vec![val.clone()])?;
+                        if Self::is_truthy(&test) {
+                            if is_find { return Ok(Some(val)); }
+                            if is_any { return Ok(Some(Value::Bool(true))); }
+                        } else if !is_any && !is_find {
+                            // all: false on first failure
+                            return Ok(Some(Value::Bool(false)));
+                        }
+                    }
+                }
+                if is_any { Ok(Some(Value::Bool(false))) }
+                else if is_find { Ok(Some(Value::Void)) }
+                else { Ok(Some(Value::Bool(true))) } // all: passed
+            }
+            _ => Ok(None),
         }
     }
 
@@ -8973,5 +9171,47 @@ fib(0)";
 fib(1)";
         assert!(matches!(eval(src2), Value::Int(1)));
     }
+
+    #[test]
+    fn test_fuse_map_filter() {
+        // map.filter → single pass, no intermediate array
+        let src = "[1,2,3,4,5,6].map(|x| x * 2).filter(|x| x > 6)";
+        let result = eval(src);
+        assert_eq!(result.to_string(), "[8, 10, 12]");
+    }
+
+    #[test]
+    fn test_fuse_filter_map() {
+        let src = "[1,2,3,4,5,6].filter(|x| x > 3).map(|x| x * 10)";
+        assert_eq!(eval(src).to_string(), "[40, 50, 60]");
+    }
+
+    #[test]
+    fn test_fuse_map_map() {
+        // Two consecutive maps → composed in single pass
+        let src = "[1,2,3].map(|x| x + 1).map(|x| x * 2)";
+        assert_eq!(eval(src).to_string(), "[4, 6, 8]");
+    }
+
+    #[test]
+    fn test_fuse_map_filter_sum() {
+        // 3-way chain → single pass with terminal sum
+        let src = "[1,2,3,4,5].map(|x| x * x).filter(|x| x > 10).sum()";
+        assert!(matches!(eval(src), Value::Int(41))); // 16+25=41
+    }
+
+    #[test]
+    fn test_fuse_chain_any() {
+        let src = "[1,2,3,4,5].filter(|x| x > 3).map(|x| x * 2).any(|x| x > 9)";
+        assert!(matches!(eval(src), Value::Bool(true)));
+    }
+
+    #[test]
+    fn test_fuse_preserves_semantics() {
+        // Verify fusion produces same result as non-fused
+        let fused = eval("[1,2,3,4,5,6,7,8,9,10].map(|x| x * 2).filter(|x| x > 10)");
+        assert_eq!(fused.to_string(), "[12, 14, 16, 18, 20]");
+    }
+
 
 }
