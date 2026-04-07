@@ -1102,7 +1102,16 @@ impl Parser {
     }
 
     fn parse_use_decl(&mut self) -> Result<Stmt, HexaError> {
-        self.advance(); // consume 'use'
+        self.advance(); // consume 'use' / 'import'
+        // Support string path: import "path/to/module"
+        if let Token::StringLit(path) = self.peek().clone() {
+            self.advance();
+            // Convert "path/to/module" or "path/to/module.hexa" to path segments
+            let path_str: &str = &path;
+            let path_str = path_str.trim_end_matches(".hexa");
+            let segments: Vec<String> = path_str.split('/').map(String::from).collect();
+            return Ok(Stmt::Use(segments));
+        }
         let mut prefix = vec![self.expect_ident()?];
         while matches!(self.peek(), Token::ColonColon) {
             self.advance(); // consume ::

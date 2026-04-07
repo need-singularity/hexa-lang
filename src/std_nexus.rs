@@ -1,15 +1,15 @@
-//! std::nexus6 — NEXUS-6 integration for HEXA-LANG.
+//! std::nexus — NEXUS-6 integration for HEXA-LANG.
 //!
 //! Provides native access to the NEXUS-6 discovery engine from within HEXA code.
 //! This is the 13th stdlib module (sigma + mu = 12 + 1 = 13).
 //!
 //! Provides:
-//!   nexus6_scan(domain)      — Run NEXUS-6 full scan on a domain
-//!   nexus6_verify(value)     — Check if a value matches n=6 constants
-//!   nexus6_omega(phi, tension, cells, entropy, alpha, balance) — Run 6 Omega lenses
-//!   nexus6_lenses()          — List the 6 Omega lens names
-//!   nexus6_consensus(data)   — Compute consensus score across lenses
-//!   nexus6_n6_check(value)   — Quick n=6 constant check (returns matching formula)
+//!   nexus_scan(domain)      — Run NEXUS-6 full scan on a domain
+//!   nexus_verify(value)     — Check if a value matches n=6 constants
+//!   nexus_omega(phi, tension, cells, entropy, alpha, balance) — Run 6 Omega lenses
+//!   nexus_lenses()          — List the 6 Omega lens names
+//!   nexus_consensus(data)   — Compute consensus score across lenses
+//!   nexus_n6_check(value)   — Quick n=6 constant check (returns matching formula)
 
 #![allow(dead_code)]
 
@@ -34,43 +34,43 @@ const N6_CONSTANTS: [(f64, &str); 12] = [
     (11.0,  "sigma-mu"),
 ];
 
-/// Dispatch a nexus6 builtin by name.
-pub fn call_nexus6_builtin(
+/// Dispatch a nexus builtin by name.
+pub fn call_nexus_builtin(
     interp: &mut Interpreter,
     name: &str,
     args: Vec<Value>,
 ) -> Result<Value, HexaError> {
     match name {
-        "nexus6_scan" => {
+        "nexus_scan" => {
             let domain = match args.first() {
                 Some(Value::Str(s)) => s.clone(),
                 _ => "compiler".to_string(),
             };
-            match anima_bridge::nexus6_scan(&domain) {
+            match anima_bridge::nexus_scan(&domain) {
                 Ok(result) => Ok(Value::Str(result)),
-                Err(e) => Ok(Value::Str(format!("[nexus6 error] {}", e))),
+                Err(e) => Ok(Value::Str(format!("[nexus error] {}", e))),
             }
         }
 
-        "nexus6_verify" => {
+        "nexus_verify" => {
             let value = match args.first() {
                 Some(Value::Int(n)) => *n as f64,
                 Some(Value::Float(f)) => *f,
                 _ => return Err(HexaError {
                     class: ErrorClass::Runtime,
-                    message: "nexus6_verify requires a number".into(),
+                    message: "nexus_verify requires a number".into(),
                     line: interp.current_line,
                     col: interp.current_col,
                     hint: None,
                 }),
             };
-            match anima_bridge::nexus6_verify(value) {
+            match anima_bridge::nexus_verify(value) {
                 Ok(result) => Ok(Value::Str(result)),
-                Err(e) => Ok(Value::Str(format!("[nexus6 error] {}", e))),
+                Err(e) => Ok(Value::Str(format!("[nexus error] {}", e))),
             }
         }
 
-        "nexus6_omega" => {
+        "nexus_omega" => {
             let phi = match args.first() { Some(Value::Float(f)) => *f, Some(Value::Int(n)) => *n as f64, _ => 71.0 };
             let tension = match args.get(1) { Some(Value::Float(f)) => *f, _ => 0.5 };
             let cells = match args.get(2) { Some(Value::Int(n)) => *n, _ => 64 };
@@ -84,7 +84,7 @@ pub fn call_nexus6_builtin(
             Ok(Value::Str(result.report()))
         }
 
-        "nexus6_lenses" => {
+        "nexus_lenses" => {
             let lenses: Vec<Value> = anima_bridge::OMEGA_LENSES
                 .iter()
                 .map(|l| Value::Str(l.to_string()))
@@ -92,7 +92,7 @@ pub fn call_nexus6_builtin(
             Ok(Value::Array(lenses))
         }
 
-        "nexus6_consensus" => {
+        "nexus_consensus" => {
             // Take an array of numbers and compute n=6 consensus
             let data = match args.first() {
                 Some(Value::Array(arr)) => {
@@ -130,7 +130,7 @@ pub fn call_nexus6_builtin(
             Ok(Value::Str(report))
         }
 
-        "nexus6_n6_check" => {
+        "nexus_n6_check" => {
             let value = match args.first() {
                 Some(Value::Int(n)) => *n as f64,
                 Some(Value::Float(f)) => *f,
@@ -165,7 +165,7 @@ pub fn call_nexus6_builtin(
 
         _ => Err(HexaError {
             class: ErrorClass::Name,
-            message: format!("unknown nexus6 builtin: {}", name),
+            message: format!("unknown nexus builtin: {}", name),
             line: interp.current_line,
             col: interp.current_col,
             hint: None,

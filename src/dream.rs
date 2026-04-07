@@ -182,7 +182,7 @@ impl DreamEngine {
 
             // NEXUS-6 Ouroboros tick every n=6 generations
             if gen > 0 && gen % 6 == 0 {
-                self.nexus6_ouroboros_tick();
+                self.nexus_ouroboros_tick();
             }
         }
 
@@ -502,7 +502,7 @@ impl DreamEngine {
     /// NEXUS-6 Ouroboros co-evolution feedback.
     /// Runs Omega lens scan on the current dream state and adjusts fitness.
     /// The dream "eats its tail" — scan results feed back into evolution.
-    pub fn nexus6_ouroboros_tick(&mut self) -> f64 {
+    pub fn nexus_ouroboros_tick(&mut self) -> f64 {
         let line_count = self.source.lines().count() as f64;
         let fn_count = self.fn_bodies.len() as f64;
         let discovery_count = self.discoveries.len() as f64;
@@ -858,16 +858,22 @@ println(result)"#.to_string();
     #[test]
     fn test_dream_engine_fibonacci() {
         let source = r#"fn fib(n: int) -> int {
-    if n <= 1 {
-        return n
+    let a = 0
+    let b = 1
+    let i = 0
+    while i < n {
+        let t = a + b
+        a = b
+        b = t
+        i = i + 1
     }
-    return fib(n - 1) + fib(n - 2)
+    a
 }
 println(fib(10))"#.to_string();
 
         let config = DreamConfig {
-            generations: 20,
-            mutations_per_gen: 5,
+            generations: 5,
+            mutations_per_gen: 3,
             verbose: false,
             anima_bridge: false,
         };

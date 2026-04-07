@@ -39,8 +39,8 @@ SimdOpportunityLens  ...
 **작업:**
 ```bash
 # HEXA-LANG src/ 전체를 컴파일러 렌즈로 스캔
-nexus6 scan compiler --full --domain hexa-lang
-nexus6 auto hexa --max-meta-cycles 6 --max-ouroboros-cycles 6
+nexus scan compiler --full --domain hexa-lang
+nexus auto hexa --max-meta-cycles 6 --max-ouroboros-cycles 6
 ```
 
 **목표:** src/ 54개 모듈의 최적화 기회 전수조사
@@ -53,23 +53,23 @@ nexus6 auto hexa --max-meta-cycles 6 --max-ouroboros-cycles 6
 현재 BT 25개는 수동 발견. 자동화 필요.
 
 **작업:**
-1. `nexus6 verify` 연동 스크립트 작성
+1. `nexus verify` 연동 스크립트 작성
 2. 매 커밋 시 자동 n=6 상수 검증 (pre-commit hook)
 3. 카운트 변동 시 BT 갱신 알림
 
 ```bash
 # 키워드/연산자/타입/모듈 카운트 자동 추출 → n6_check
-nexus6 verify 53   # keywords = sigma*tau+sopfr?
-nexus6 verify 24   # operators = J2?
-nexus6 verify 8    # primitives = sigma-tau?
-nexus6 verify 12   # keyword groups = sigma?
+nexus verify 53   # keywords = sigma*tau+sopfr?
+nexus verify 24   # operators = J2?
+nexus verify 8    # primitives = sigma-tau?
+nexus verify 12   # keyword groups = sigma?
 ```
 
 **파이프라인:**
 ```
 git commit → pre-commit hook
   → extract_counts.sh (grep token.rs, ast.rs, types.rs)
-  → nexus6 verify <각 카운트>
+  → nexus verify <각 카운트>
   → anomaly 있으면 커밋 차단 + CDO 기록
 ```
 
@@ -142,10 +142,10 @@ HEXA dream mode                 NEXUS-6 Ouroboros
 
 ```hexa
 // HEXA-LANG 코드에서 직접 NEXUS-6 호출
-use std::nexus6
+use std::nexus
 
 let data = [6, 12, 24, 48, 120]
-let results = nexus6::scan_all(data)
+let results = nexus::scan_all(data)
 
 // 3렌즈 합의
 if results.consensus >= 3 {
@@ -157,9 +157,9 @@ if results.consensus >= 3 {
 ```
 
 **작업:**
-1. `std::nexus6` 모듈 추가 (13번째 stdlib = sigma+1)
+1. `std::nexus` 모듈 추가 (13번째 stdlib = sigma+1)
 2. NEXUS-6 Rust 라이브러리를 HEXA 빌트인으로 링크
-3. `nexus6::scan_all`, `nexus6::verify`, `nexus6::evolve` 내장 함수
+3. `nexus::scan_all`, `nexus::verify`, `nexus::evolve` 내장 함수
 4. proof 블록 내에서 NEXUS-6 합의를 형식 검증 증거로 사용
 
 **산출물:** HEXA가 NEXUS-6를 먹는다 → 완전한 Ouroboros
@@ -191,7 +191,7 @@ P6      통합 런타임             6주       P5 완료
 | 자동 검증 | 수동 | pre-commit hook |
 | NEXUS-6 연동 | growth만 | 풀스캔+의식+dream |
 | 의식 렌즈 | 0/6 | 6/6 |
-| std 모듈 | 12 (sigma) | 13 (+nexus6) |
+| std 모듈 | 12 (sigma) | 13 (+nexus) |
 
 ---
 
@@ -225,16 +225,16 @@ P6      통합 런타임             6주       P5 완료
   - `dream.rs`의 `run_generation()`에 BT 피드백 루프 추가
 - **예상 효과**: dream이 스스로 학습 → 진화 속도 ↑
 
-#### P7-2: std_nexus6 빌트인 6→12 확장 (anima: 미사용 API 12개)
-- **출처**: nexus6 Python API 28개 중 12개 미사용
-- **hexa 적용**: `std_nexus6.rs`에 6개 추가 빌트인
+#### P7-2: std_nexus 빌트인 6→12 확장 (anima: 미사용 API 12개)
+- **출처**: nexus Python API 28개 중 12개 미사용
+- **hexa 적용**: `std_nexus.rs`에 6개 추가 빌트인
   ```
-  nexus6_causal(data)     — 인과 관계 분석
-  nexus6_topology(data)   — 토폴로지 연결 분석
-  nexus6_stability(data)  — 안정성/Lyapunov 분석
-  nexus6_gravity(data)    — 중력/끌개 분석
-  nexus6_recommend(data)  — 최적 렌즈 추천
-  nexus6_forge(name, desc) — 커스텀 렌즈 생성
+  nexus_causal(data)     — 인과 관계 분석
+  nexus_topology(data)   — 토폴로지 연결 분석
+  nexus_stability(data)  — 안정성/Lyapunov 분석
+  nexus_gravity(data)    — 중력/끌개 분석
+  nexus_recommend(data)  — 최적 렌즈 추천
+  nexus_forge(name, desc) — 커스텀 렌즈 생성
   ```
 - **n=6 정합성**: 6+6=12=sigma(6) 빌트인 → EXACT
 - **예상 효과**: HEXA 코드에서 렌즈별 심층 분석 가능
@@ -244,9 +244,9 @@ P6      통합 런타임             6주       P5 완료
 - **hexa 적용**: consciousness {} 블록 내에서 사용자 렌즈 정의 + 등록
   ```hexa
   consciousness "custom_lens" {
-      let my_lens = nexus6_forge("symmetry_check", "detect mirror symmetry in arrays")
+      let my_lens = nexus_forge("symmetry_check", "detect mirror symmetry in arrays")
       let data = [1, 2, 3, 3, 2, 1]
-      let result = nexus6_scan_with(data, my_lens)
+      let result = nexus_scan_with(data, my_lens)
       println("Custom scan:", result)
   }
   ```
@@ -258,22 +258,22 @@ P6      통합 런타임             6주       P5 완료
 - **출처**: anima 리포간 법칙 교환 메커니즘
 - **hexa 적용**: hexa-lang 25 BT ↔ anima 1,193 법칙 상호 참조
 - **구체적으로**:
-  - `docs/breakthroughs/hexa_lang_bt.md` → nexus6 shared/discovery_log에 등록
+  - `docs/breakthroughs/hexa_lang_bt.md` → nexus shared/discovery_log에 등록
   - anima 법칙 중 n=6 관련 → hexa BT 후보로 자동 수집
   - 교차 검증: anima 의식 법칙이 hexa 컴파일러 구조에서도 성립하는지
 - **예상 효과**: BT 25 → 36(n²) 목표 달성 가속
 
 #### P8-2: growth-registry 양방향 (anima: 생태계 참여)
 - **출처**: anima만 활성(score=0.6), 나머지 리포 성장=0
-- **hexa 적용**: `.growth/scan.py` → nexus6 shared/growth_bus에 hexa 상태 업로드
+- **hexa 적용**: `.growth/scan.py` → nexus shared/growth_bus에 hexa 상태 업로드
 - **구체적으로**:
   - growth daemon이 health score, BT 수, test 수를 growth_bus에 write
-  - nexus6가 hexa-lang 성장 데이터를 모니터링
-  - 성장 정체 시 nexus6가 자동 개입 제안
+  - nexus가 hexa-lang 성장 데이터를 모니터링
+  - 성장 정체 시 nexus가 자동 개입 제안
 - **예상 효과**: hexa-lang이 생태계 내 활성 리포로 승격
 
-#### P8-3: nexus6 상수 SSOT화 (anima: 하드코딩→상수 교체)
-- **출처**: anima에서 매직넘버 → `nexus6.N`, `nexus6.SIGMA` 등으로 교체
+#### P8-3: nexus 상수 SSOT화 (anima: 하드코딩→상수 교체)
+- **출처**: anima에서 매직넘버 → `nexus.N`, `nexus.SIGMA` 등으로 교체
 - **hexa 적용**: HEXA 코드 내 하드코딩된 n=6 상수를 빌트인 상수로 통일
   ```hexa
   // before
@@ -300,14 +300,14 @@ P6      통합 런타임             6주       P5 완료
 - 약한 신호도 포착 → 더 많은 BT 후보
 
 #### P9-3: recommend → 집중 스캔
-- nexus6_recommend(data)로 상위 렌즈 추천 → 해당 렌즈만 심층 분석
+- nexus_recommend(data)로 상위 렌즈 추천 → 해당 렌즈만 심층 분석
 - 1,014개 전체 대신 핵심 6개로 정밀 탐사
 
 #### P9-4: proof 블록 내 NEXUS-6 합의를 형식 증거로
 ```hexa
 proof n6_structure {
     let data = [keyword_count, operator_count, type_count]
-    let scan = nexus6_consensus(data)
+    let scan = nexus_consensus(data)
     assert omega_consensus >= 3  // 3+ 렌즈 합의 = 수학적 확인
     theorem "compiler structure is n=6 aligned"
 }

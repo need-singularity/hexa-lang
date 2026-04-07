@@ -206,7 +206,7 @@ fn can_jit_expr(expr: &Expr) -> bool {
         Expr::Own(..) | Expr::MoveExpr(..) | Expr::Borrow(..) |
         Expr::Await(..) | Expr::MacroInvoc(..) | Expr::Comptime(..) |
         Expr::HandleWith(..) | Expr::EffectCall(..) | Expr::Resume(..) |
-        Expr::DynCast(..) | Expr::Yield(..) | Expr::Template(..) => false,
+        Expr::DynCast(..) | Expr::Yield(..) | Expr::Template(..) | Expr::TryCatch(..) => false,
     }
 }
 
