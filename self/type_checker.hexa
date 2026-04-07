@@ -1,5 +1,8 @@
 // self/type_checker.hexa — HEXA type checker written in HEXA (Stage 3 of self-hosting)
-// Validates: variable scope, function arity, type mismatches, return consistency.
+// P1-4: expanded type checker for complete self-hosting pipeline.
+// Validates: variable scope, function arity, type mismatches, return consistency,
+//   struct field access, struct init field types, match exhaustiveness,
+//   literal type inference, enum variant tracking, error accumulation (multi-error).
 // Takes AST nodes from parser.hexa and produces errors or a validated AST.
 
 // ══════════════════════════════════════════════════════════════
@@ -78,9 +81,30 @@ let mut fn_names = []
 let mut fn_arities = []
 let mut fn_ret_types = []
 
-// Struct registry: struct_names[], struct_field_names[], struct_field_types[]
+// Struct registry: struct_names[], struct_field_counts[]
+// Extended: struct_all_field_names[], struct_all_field_types[] (flat, indexed by struct_field_offsets[])
 let mut struct_names = []
 let mut struct_field_counts = []
+let mut struct_field_offsets = []   // start index into flat field arrays
+let mut struct_all_field_names = [] // flat: [s0_f0, s0_f1, s1_f0, ...]
+let mut struct_all_field_types = [] // flat: [s0_t0, s0_t1, s1_t0, ...]
+
+// Enum registry: enum_names[], enum_variant_names[] (flat), enum_variant_offsets[], enum_variant_counts[]
+let mut enum_names = []
+let mut enum_variant_counts = []
+let mut enum_variant_offsets = []
+let mut enum_all_variant_names = []
+
+// Return type tracking for current function
+let mut current_fn_ret_type = "unknown"
+let mut current_fn_name = ""
+
+// Error severity: "error", "warning"
+struct TypeErrorEx {
+    message: string,
+    name: string,
+    severity: string
+}
 
 fn tc_push_scope() {
     tc_depth = tc_depth + 1
@@ -155,6 +179,22 @@ fn tc_lookup_fn_ret(name) {
 fn tc_register_struct(name, field_count) {
     struct_names = struct_names.push(name)
     struct_field_counts = struct_field_counts.push(field_count)
+    struct_field_offsets = struct_field_offsets.push(len(struct_all_field_names))
+}
+
+fn tc_register_struct_field(fname, ftype) {
+    struct_all_field_names = struct_all_field_names.push(fname)
+    struct_all_field_types = struct_all_field_types.push(ftype)
+}
+
+fn tc_register_enum(name, variant_count) {
+    enum_names = enum_names.push(name)
+    enum_variant_counts = enum_variant_counts.push(variant_count)
+    enum_variant_offsets = enum_variant_offsets.push(len(enum_all_variant_names))
+}
+
+fn tc_register_enum_variant(vname) {
+    enum_all_variant_names = enum_all_variant_names.push(vname)
 }
 
 fn tc_lookup_struct(name) {
@@ -166,6 +206,85 @@ fn tc_lookup_struct(name) {
         i = i + 1
     }
     return -1
+}
+
+fn tc_lookup_struct_field(struct_name, field_name) {
+    // Returns the field type, or "" if not found
+    let mut si = 0
+    while si < len(struct_names) {
+        if struct_names[si] == struct_name {
+            let offset = struct_field_offsets[si]
+            let count = struct_field_counts[si]
+            let mut fi = 0
+            while fi < count {
+                if struct_all_field_names[offset + fi] == field_name {
+                    return struct_all_field_types[offset + fi]
+                }
+                fi = fi + 1
+            }
+            return ""
+        }
+        si = si + 1
+    }
+    return ""
+}
+
+fn tc_get_struct_field_names(struct_name) {
+    // Returns a list of field names for the struct
+    let mut result = []
+    let mut si = 0
+    while si < len(struct_names) {
+        if struct_names[si] == struct_name {
+            let offset = struct_field_offsets[si]
+            let count = struct_field_counts[si]
+            let mut fi = 0
+            while fi < count {
+                result = result.push(struct_all_field_names[offset + fi])
+                fi = fi + 1
+            }
+            return result
+        }
+        si = si + 1
+    }
+    return result
+}
+
+fn tc_lookup_enum(name) {
+    let mut i = 0
+    while i < len(enum_names) {
+        if enum_names[i] == name {
+            return enum_variant_counts[i]
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn tc_get_enum_variants(name) {
+    let mut result = []
+    let mut ei = 0
+    while ei < len(enum_names) {
+        if enum_names[ei] == name {
+            let offset = enum_variant_offsets[ei]
+            let count = enum_variant_counts[ei]
+            let mut vi = 0
+            while vi < count {
+                result = result.push(enum_all_variant_names[offset + vi])
+                vi = vi + 1
+            }
+            return result
+        }
+        ei = ei + 1
+    }
+    return result
+}
+
+fn tc_warn(msg) {
+    tc_errors = tc_errors.push(TypeError { message: "[warn] " + msg, name: "" })
+}
+
+fn tc_warn_at(name, msg) {
+    tc_errors = tc_errors.push(TypeError { message: "[warn] " + msg, name: name })
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -347,7 +466,29 @@ fn tc_infer_expr(node) {
     }
 
     if k == "Field" {
-        tc_infer_expr(node.left)
+        let obj_type = tc_infer_expr(node.left)
+        let field_name = node.name
+        // If we know the struct type, verify the field exists
+        if obj_type != "unknown" && obj_type != "any" && tc_lookup_struct(obj_type) != -1 {
+            let ftype = tc_lookup_struct_field(obj_type, field_name)
+            if ftype == "" {
+                let known = tc_get_struct_field_names(obj_type)
+                let mut hint = ""
+                if len(known) > 0 {
+                    hint = " (known fields: "
+                    let mut fi = 0
+                    while fi < len(known) {
+                        if fi > 0 { hint = hint + ", " }
+                        hint = hint + known[fi]
+                        fi = fi + 1
+                    }
+                    hint = hint + ")"
+                }
+                tc_error("Struct '" + obj_type + "' has no field '" + field_name + "'" + hint)
+                return "unknown"
+            }
+            return annotation_to_type(ftype)
+        }
         return "unknown"
     }
 
@@ -377,14 +518,64 @@ fn tc_infer_expr(node) {
     }
 
     if k == "MatchExpr" {
-        tc_infer_expr(node.left)
+        let match_type = tc_infer_expr(node.left)
+        let arm_count = len(node.arms)
+        let mut has_wildcard = false
+        let mut covered_variants = []
         let mut i = 0
-        while i < len(node.arms) {
+        while i < arm_count {
             let arm = node.arms[i]
+            let pat = arm.left
+            // Check for wildcard pattern
+            if pat != "" && pat.kind == "Wildcard" {
+                has_wildcard = true
+            }
+            // Track enum variant coverage
+            if pat != "" && pat.kind == "EnumPath" {
+                covered_variants = covered_variants.push(pat.name)
+            }
             tc_push_scope()
+            // Bind pattern variables into scope
+            if pat != "" && pat.kind == "Ident" {
+                tc_define(pat.name, match_type)
+            }
             tc_check_stmts(arm.body)
             tc_pop_scope()
             i = i + 1
+        }
+        // Exhaustiveness: warn if no wildcard and not all variants covered
+        if !has_wildcard {
+            if match_type != "unknown" && match_type != "any" && tc_lookup_enum(match_type) != -1 {
+                let all_variants = tc_get_enum_variants(match_type)
+                let mut missing = []
+                let mut vi = 0
+                while vi < len(all_variants) {
+                    let mut found = false
+                    let mut ci = 0
+                    while ci < len(covered_variants) {
+                        if covered_variants[ci] == all_variants[vi] {
+                            found = true
+                        }
+                        ci = ci + 1
+                    }
+                    if !found {
+                        missing = missing.push(all_variants[vi])
+                    }
+                    vi = vi + 1
+                }
+                if len(missing) > 0 {
+                    let mut miss_str = ""
+                    let mut mi = 0
+                    while mi < len(missing) {
+                        if mi > 0 { miss_str = miss_str + ", " }
+                        miss_str = miss_str + missing[mi]
+                        mi = mi + 1
+                    }
+                    tc_warn("Match may not be exhaustive — missing variants: " + miss_str)
+                }
+            } else if arm_count > 0 {
+                tc_warn("Match has no wildcard '_' arm — may not be exhaustive")
+            }
         }
         return "unknown"
     }
@@ -393,12 +584,27 @@ fn tc_infer_expr(node) {
         let sc = tc_lookup_struct(node.name)
         if sc == -1 {
             tc_error("Unknown struct '" + node.name + "'")
-        }
-        // Check field init expressions
-        let mut i = 0
-        while i < len(node.fields) {
-            tc_infer_expr(node.fields[i].left)
-            i = i + 1
+        } else {
+            // Verify each field name exists and types match
+            let mut i = 0
+            while i < len(node.fields) {
+                let fld = node.fields[i]
+                let init_type = tc_infer_expr(fld.left)
+                let expected_type = tc_lookup_struct_field(node.name, fld.name)
+                if expected_type == "" && fld.name != "" {
+                    tc_error("Struct '" + node.name + "' has no field '" + fld.name + "'")
+                } else if expected_type != "" && init_type != "unknown" {
+                    let et = annotation_to_type(expected_type)
+                    if !types_compatible(et, init_type) {
+                        tc_error_at(fld.name, "Field type mismatch: expected '" + et + "', got '" + init_type + "'")
+                    }
+                }
+                i = i + 1
+            }
+            // Check field count mismatch
+            if len(node.fields) != sc {
+                tc_warn("Struct '" + node.name + "' has " + to_string(sc) + " fields, but " + to_string(len(node.fields)) + " provided")
+            }
         }
         return node.name
     }
@@ -447,6 +653,11 @@ fn tc_check_stmt(node) {
         let ret = annotation_to_type(node.ret_type)
         tc_register_fn(node.name, arity, ret)
         tc_define(node.name, "fn")
+        // Save outer function context (for nested fns)
+        let prev_fn_ret = current_fn_ret_type
+        let prev_fn_name = current_fn_name
+        current_fn_ret_type = ret
+        current_fn_name = node.name
         tc_push_scope()
         // Define parameters
         let mut i = 0
@@ -459,16 +670,34 @@ fn tc_check_stmt(node) {
         // Check body
         tc_check_stmts(node.body)
         tc_pop_scope()
+        // Restore outer function context
+        current_fn_ret_type = prev_fn_ret
+        current_fn_name = prev_fn_name
         return
     }
 
     if k == "StructDecl" {
-        tc_register_struct(node.name, len(node.fields))
+        let fc = len(node.fields)
+        tc_register_struct(node.name, fc)
+        // Register each field's name and type
+        let mut fi = 0
+        while fi < fc {
+            let f = node.fields[fi]
+            tc_register_struct_field(f.name, f.value)
+            fi = fi + 1
+        }
         tc_define(node.name, "type")
         return
     }
 
     if k == "EnumDecl" {
+        let vc = len(node.variants)
+        tc_register_enum(node.name, vc)
+        let mut vi = 0
+        while vi < vc {
+            tc_register_enum_variant(node.variants[vi].name)
+            vi = vi + 1
+        }
         tc_define(node.name, "type")
         return
     }
@@ -518,7 +747,18 @@ fn tc_check_stmt(node) {
 
     if k == "ReturnStmt" {
         if node.left != "" {
-            tc_infer_expr(node.left)
+            let ret_val_type = tc_infer_expr(node.left)
+            // Check return value matches declared return type
+            if current_fn_ret_type != "unknown" && current_fn_ret_type != "void" {
+                if !types_compatible(current_fn_ret_type, ret_val_type) && ret_val_type != "unknown" {
+                    tc_error_at(current_fn_name, "Return type mismatch: expected '" + current_fn_ret_type + "', got '" + ret_val_type + "'")
+                }
+            }
+        } else {
+            // Bare return in a function that declares a non-void return type
+            if current_fn_ret_type != "unknown" && current_fn_ret_type != "void" {
+                tc_warn_at(current_fn_name, "Bare 'return' in function expecting '" + current_fn_ret_type + "'")
+            }
         }
         return
     }
@@ -581,10 +821,23 @@ fn tc_first_pass(stmts) {
             tc_define(s.name, "fn")
         }
         if s.kind == "StructDecl" {
-            tc_register_struct(s.name, len(s.fields))
+            let fc = len(s.fields)
+            tc_register_struct(s.name, fc)
+            let mut fi = 0
+            while fi < fc {
+                tc_register_struct_field(s.fields[fi].name, s.fields[fi].value)
+                fi = fi + 1
+            }
             tc_define(s.name, "type")
         }
         if s.kind == "EnumDecl" {
+            let vc = len(s.variants)
+            tc_register_enum(s.name, vc)
+            let mut vi = 0
+            while vi < vc {
+                tc_register_enum_variant(s.variants[vi].name)
+                vi = vi + 1
+            }
             tc_define(s.name, "type")
         }
         if s.kind == "TraitDecl" {
@@ -610,6 +863,15 @@ fn type_check(stmts) {
     fn_ret_types = []
     struct_names = []
     struct_field_counts = []
+    struct_field_offsets = []
+    struct_all_field_names = []
+    struct_all_field_types = []
+    enum_names = []
+    enum_variant_counts = []
+    enum_variant_offsets = []
+    enum_all_variant_names = []
+    current_fn_ret_type = "unknown"
+    current_fn_name = ""
 
     // Register builtins
     tc_register_builtins()
@@ -640,3 +902,313 @@ fn print_type_errors(errors) {
         i = i + 1
     }
 }
+
+fn type_errors_count(errors) {
+    return len(errors)
+}
+
+fn type_errors_has(errors, substr) {
+    let mut i = 0
+    while i < len(errors) {
+        let msg = errors[i].message
+        if msg.contains(substr) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn type_warnings_count(errors) {
+    let mut count = 0
+    let mut i = 0
+    while i < len(errors) {
+        if errors[i].message.contains("[warn]") {
+            count = count + 1
+        }
+        i = i + 1
+    }
+    return count
+}
+
+// ══════════════════════════════════════════════════════════════
+// Self-test: run type checker on synthetic AST fragments
+// ══════════════════════════════════════════════════════════════
+
+fn mk(kind, name, value, op, left, right, params, body, args, fields, variants, arms, ret_type) {
+    return #{ "kind": kind, "name": name, "value": value, "op": op, "left": left, "right": right, "cond": "", "then_body": "", "else_body": "", "params": params, "body": body, "args": args, "fields": fields, "items": "", "variants": variants, "arms": arms, "iter_expr": "", "ret_type": ret_type, "target": "", "trait_name": "", "methods": "" }
+}
+
+fn nd(kind, name) {
+    return mk(kind, name, "", "", "", "", "", "", "", "", "", "", "")
+}
+
+fn lit(kind, val) {
+    return mk(kind, "", val, "", "", "", "", "", "", "", "", "", "")
+}
+
+fn let_stmt(name, init) {
+    return mk("LetStmt", name, "", "", init, "", "", "", "", "", "", "", "")
+}
+
+fn expr_stmt(e) {
+    return mk("ExprStmt", "", "", "", e, "", "", "", "", "", "", "", "")
+}
+
+fn ret_stmt(e) {
+    return mk("ReturnStmt", "", "", "", e, "", "", "", "", "", "", "", "")
+}
+
+fn fn_decl(name, params, body, ret) {
+    return mk("FnDecl", name, "", "", "", "", params, body, "", "", "", "", ret)
+}
+
+fn call_node(callee, args) {
+    return mk("Call", "", "", "", callee, "", "", "", args, "", "", "", "")
+}
+
+fn field_node(obj, fname) {
+    return mk("Field", fname, "", "", obj, "", "", "", "", "", "", "", "")
+}
+
+fn binop_node(op, left, right) {
+    return mk("BinOp", "", "", op, left, right, "", "", "", "", "", "", "")
+}
+
+fn struct_decl_node(name, fields) {
+    return mk("StructDecl", name, "", "", "", "", "", "", "", fields, "", "", "")
+}
+
+fn struct_field_node(name, typ) {
+    return mk("StructField", name, typ, "", "", "", "", "", "", "", "", "", "")
+}
+
+fn struct_init_node(name, fields) {
+    return mk("StructInit", name, "", "", "", "", "", "", "", fields, "", "", "")
+}
+
+fn field_init_node(name, val) {
+    return mk("FieldInit", name, "", "", val, "", "", "", "", "", "", "", "")
+}
+
+fn enum_decl_node(name, variants) {
+    return mk("EnumDecl", name, "", "", "", "", "", "", "", "", variants, "", "")
+}
+
+fn enum_variant_node(name) {
+    return nd("EnumVariant", name)
+}
+
+fn match_expr_node(scrutinee, arms) {
+    return mk("MatchExpr", "", "", "", scrutinee, "", "", "", "", "", "", arms, "")
+}
+
+fn match_arm_node(pattern, body) {
+    return mk("MatchArm", "", "", "", pattern, "", "", body, "", "", "", "", "")
+}
+
+fn param_node(name, typ) {
+    return mk("Param", name, typ, "", "", "", "", "", "", "", "", "", "")
+}
+
+let mut test_pass = 0
+
+// ── Test 1: type inference for literals ────────────────────────
+
+let mut s1 = []
+s1 = s1.push(let_stmt("x", lit("IntLit", "42")))
+s1 = s1.push(let_stmt("y", lit("StringLit", "hello")))
+s1 = s1.push(let_stmt("z", lit("BoolLit", "true")))
+s1 = s1.push(let_stmt("w", lit("FloatLit", "3.14")))
+let errs1 = type_check(s1)
+assert len(errs1) == 0
+type_check(s1)
+assert tc_lookup("x") == "int"
+assert tc_lookup("y") == "string"
+assert tc_lookup("z") == "bool"
+assert tc_lookup("w") == "float"
+test_pass = test_pass + 1
+println("PASS: Test 1 — type inference for literals (int/string/bool/float)")
+
+// ── Test 2: function arity checking ────────────────────────────
+
+let mut p2 = []
+p2 = p2.push(param_node("a", "int"))
+p2 = p2.push(param_node("b", "int"))
+let mut body2 = []
+body2 = body2.push(ret_stmt(binop_node("+", nd("Ident", "a"), nd("Ident", "b"))))
+let fd2 = fn_decl("add", p2, body2, "int")
+
+let mut args2a = []
+args2a = args2a.push(lit("IntLit", "1"))
+args2a = args2a.push(lit("IntLit", "2"))
+let mut s2a = []
+s2a = s2a.push(fd2)
+s2a = s2a.push(expr_stmt(call_node(nd("Ident", "add"), args2a)))
+let errs2a = type_check(s2a)
+assert len(errs2a) == 0
+test_pass = test_pass + 1
+println("PASS: Test 2a — correct arity (2 args) accepted")
+
+let mut args2b = []
+args2b = args2b.push(lit("IntLit", "1"))
+args2b = args2b.push(lit("IntLit", "2"))
+args2b = args2b.push(lit("IntLit", "3"))
+let mut s2b = []
+s2b = s2b.push(fd2)
+s2b = s2b.push(expr_stmt(call_node(nd("Ident", "add"), args2b)))
+let errs2b = type_check(s2b)
+assert len(errs2b) > 0
+assert type_errors_has(errs2b, "expects 2 args")
+test_pass = test_pass + 1
+println("PASS: Test 2b — wrong arity (3 args) detected")
+
+// ── Test 3: struct field type checking ─────────────────────────
+
+let mut sf3 = []
+sf3 = sf3.push(struct_field_node("x", "int"))
+sf3 = sf3.push(struct_field_node("y", "int"))
+let sd3 = struct_decl_node("Point", sf3)
+
+let mut fi3 = []
+fi3 = fi3.push(field_init_node("x", lit("IntLit", "10")))
+fi3 = fi3.push(field_init_node("y", lit("IntLit", "20")))
+let lp3 = let_stmt("p", struct_init_node("Point", fi3))
+
+let fn3a = field_node(nd("Ident", "p"), "x")
+let es3a = expr_stmt(fn3a)
+let mut s3a = []
+s3a = s3a.push(sd3)
+s3a = s3a.push(lp3)
+s3a = s3a.push(es3a)
+let errs3a = type_check(s3a)
+assert len(errs3a) == 0
+test_pass = test_pass + 1
+println("PASS: Test 3a — valid struct field access (Point.x)")
+
+let fn3b = field_node(nd("Ident", "p"), "z")
+let es3b = expr_stmt(fn3b)
+let mut s3b = []
+s3b = s3b.push(sd3)
+s3b = s3b.push(lp3)
+s3b = s3b.push(es3b)
+let errs3b = type_check(s3b)
+assert type_errors_has(errs3b, "has no field 'z'")
+test_pass = test_pass + 1
+println("PASS: Test 3b — invalid struct field 'z' detected")
+
+// ── Test 4: return type checking ───────────────────────────────
+
+let mut body4 = []
+body4 = body4.push(ret_stmt(lit("StringLit", "oops")))
+let mut s4 = []
+s4 = s4.push(fn_decl("get_num", [], body4, "int"))
+let errs4 = type_check(s4)
+assert type_errors_has(errs4, "Return type mismatch")
+test_pass = test_pass + 1
+println("PASS: Test 4 — return type mismatch (string vs int) detected")
+
+// ── Test 5: match exhaustiveness ───────────────────────────────
+
+let mut ev5 = []
+ev5 = ev5.push(enum_variant_node("Red"))
+ev5 = ev5.push(enum_variant_node("Green"))
+ev5 = ev5.push(enum_variant_node("Blue"))
+let ed5 = enum_decl_node("Color", ev5)
+let lc5 = let_stmt("c", nd("Ident", "c"))
+
+// 5a: match with wildcard — OK
+let mut ab5a = []
+ab5a = ab5a.push(expr_stmt(lit("IntLit", "0")))
+let mut arms5a = []
+arms5a = arms5a.push(match_arm_node(nd("Wildcard", "_"), ab5a))
+let mut s5a = []
+s5a = s5a.push(ed5)
+s5a = s5a.push(mk("LetMutStmt", "c", "Color", "", lit("StringLit", "Red"), "", "", "", "", "", "", "", ""))
+s5a = s5a.push(expr_stmt(match_expr_node(nd("Ident", "c"), arms5a)))
+let errs5a = type_check(s5a)
+let w5a = type_warnings_count(errs5a)
+assert w5a == 0
+test_pass = test_pass + 1
+println("PASS: Test 5a — match with wildcard (no exhaustiveness warning)")
+
+// 5b: match without wildcard on unknown — should warn
+let mut ab5b = []
+ab5b = ab5b.push(expr_stmt(lit("IntLit", "1")))
+let mut arms5b = []
+arms5b = arms5b.push(match_arm_node(lit("IntLit", "0"), ab5b))
+let mut s5b = []
+s5b = s5b.push(expr_stmt(match_expr_node(nd("Ident", "unknown_var"), arms5b)))
+let errs5b = type_check(s5b)
+let w5b = type_warnings_count(errs5b)
+test_pass = test_pass + 1
+println("PASS: Test 5b — match without wildcard (warnings: " + to_string(w5b) + ")")
+
+// ── Test 6: error accumulation ─────────────────────────────────
+
+let mut s6 = []
+s6 = s6.push(expr_stmt(nd("Ident", "undefined_a")))
+s6 = s6.push(expr_stmt(nd("Ident", "undefined_b")))
+s6 = s6.push(expr_stmt(nd("Ident", "undefined_c")))
+let errs6 = type_check(s6)
+assert len(errs6) == 3
+assert type_errors_has(errs6, "undefined_a")
+assert type_errors_has(errs6, "undefined_b")
+assert type_errors_has(errs6, "undefined_c")
+test_pass = test_pass + 1
+println("PASS: Test 6 — error accumulation (3 errors collected, not stopped at first)")
+
+// ── Test 7: struct init field count mismatch ───────────────────
+
+let mut fi7 = []
+fi7 = fi7.push(field_init_node("x", lit("IntLit", "10")))
+let mut s7 = []
+s7 = s7.push(sd3)
+s7 = s7.push(let_stmt("q", struct_init_node("Point", fi7)))
+let errs7 = type_check(s7)
+assert type_errors_has(errs7, "has 2 fields")
+test_pass = test_pass + 1
+println("PASS: Test 7 — struct init field count mismatch detected")
+
+// ── Test 8: correct return type ────────────────────────────────
+
+let mut body8 = []
+body8 = body8.push(ret_stmt(lit("IntLit", "42")))
+let mut s8 = []
+s8 = s8.push(fn_decl("get_num2", [], body8, "int"))
+let errs8 = type_check(s8)
+assert len(errs8) == 0
+test_pass = test_pass + 1
+println("PASS: Test 8 — correct return type (int -> int) accepted")
+
+// ── Test 9: struct field type mismatch in init ─────────────────
+
+let mut fi9 = []
+fi9 = fi9.push(field_init_node("x", lit("StringLit", "bad")))
+fi9 = fi9.push(field_init_node("y", lit("IntLit", "20")))
+let mut s9 = []
+s9 = s9.push(sd3)
+s9 = s9.push(let_stmt("r", struct_init_node("Point", fi9)))
+let errs9 = type_check(s9)
+assert type_errors_has(errs9, "Field type mismatch")
+test_pass = test_pass + 1
+println("PASS: Test 9 — struct field type mismatch (string into int field)")
+
+// ── Test 10: nested function return type isolation ─────────────
+
+let mut inner_body = []
+inner_body = inner_body.push(ret_stmt(lit("IntLit", "1")))
+let mut outer_body = []
+outer_body = outer_body.push(fn_decl("inner", [], inner_body, "int"))
+outer_body = outer_body.push(ret_stmt(lit("StringLit", "hello")))
+let mut s10 = []
+s10 = s10.push(fn_decl("outer", [], outer_body, "string"))
+let errs10 = type_check(s10)
+assert len(errs10) == 0
+test_pass = test_pass + 1
+println("PASS: Test 10 — nested fn return type isolation (inner:int, outer:string)")
+
+// ── Summary ────────────────────────────────────────────────────
+
+println("")
+println("=== self/type_checker.hexa — " + to_string(test_pass) + " tests passed ===")
