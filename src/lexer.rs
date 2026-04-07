@@ -192,6 +192,27 @@ impl Lexer {
                 // Allow underscores in numbers (visual separator)
                 self.pos += 1;
                 self.col += 1;
+            } else if (b == b'e' || b == b'E') && !s.is_empty() {
+                // Scientific notation: 1e10, 1.5e-3, 2E+8
+                is_float = true;
+                s.push(b as char);
+                self.pos += 1;
+                self.col += 1;
+                // optional +/- after e
+                if let Some(&sign) = self.source.get(self.pos) {
+                    if sign == b'+' || sign == b'-' {
+                        s.push(sign as char);
+                        self.pos += 1;
+                        self.col += 1;
+                    }
+                }
+                // consume exponent digits
+                while self.pos < self.source.len() && self.source[self.pos].is_ascii_digit() {
+                    s.push(self.source[self.pos] as char);
+                    self.pos += 1;
+                    self.col += 1;
+                }
+                break;
             } else {
                 break;
             }

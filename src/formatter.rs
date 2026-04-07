@@ -274,7 +274,7 @@ fn format_stmt(stmt: &Stmt, indent: usize) -> String {
         }
         Stmt::Break => format!("{}break", prefix),
         Stmt::Continue => format!("{}continue", prefix),
-        Stmt::Extern(decl) => {
+        Stmt::LetTuple(names, expr) => format!("{}let ({}) = {}", prefix, names.join(", "), format_expr(expr)),        Stmt::Extern(decl) => {
             let params: Vec<String> = decl.params.iter()
                 .map(|p| format!("{}: {}", p.name, p.typ))
                 .collect();

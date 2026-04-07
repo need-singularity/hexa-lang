@@ -226,7 +226,7 @@ pub fn lower_stmt_val(ctx: &mut LowerCtx, builder: &mut IrBuilder, stmt: &Stmt) 
             builder.const_i64(0)
         }
         Stmt::ProofBlock(_, _) | Stmt::Theorem(_, _)
-        | Stmt::Break | Stmt::Continue => builder.const_i64(0),
+        | Stmt::Break | Stmt::Continue | Stmt::LetTuple(..) => builder.const_i64(0),
 
         Stmt::Mod(_name, body) => {
             for s in body { lower_stmt(ctx, builder, s); }

@@ -178,6 +178,8 @@ pub struct TypeChecker {
     spec_cache: HashMap<SpecKey, SpecializedFn>,
     /// Generic struct definitions: struct_name -> (type_params, fields)
     generic_struct_defs: HashMap<String, (Vec<String>, Vec<(String, String)>)>,
+    /// @vectorize function names — skip array→scalar type mismatch
+    vectorize_fns: std::collections::HashSet<String>,
     /// Collected errors.
     errors: Vec<HexaError>,
 }
@@ -194,6 +196,7 @@ impl TypeChecker {
             active_type_params: Vec::new(),
             spec_cache: HashMap::new(),
             generic_struct_defs: HashMap::new(),
+            vectorize_fns: std::collections::HashSet::new(),
             errors: Vec::new(),
         }
     }
@@ -218,6 +221,10 @@ impl TypeChecker {
                             ret_type: decl.ret_type.as_ref().map(|t| CheckType::from_annotation(t)),
                         };
                         self.fn_sigs.insert(decl.name.clone(), sig);
+                        if decl.attrs.iter().any(|a| matches!(a.kind, crate::token::AttrKind::Vectorize))
+                            || decl.attrs.iter().any(|a| matches!(a.kind, crate::token::AttrKind::Fuse)) {
+                            self.vectorize_fns.insert(decl.name.clone());
+                        }
                     } else {
                         // Generic function: store type params, bounds, and body for monomorphization
                         let type_param_names: Vec<String> = decl.type_params.iter().map(|tp| tp.name.clone()).collect();
@@ -515,7 +522,7 @@ impl TypeChecker {
                 self.define(&decl.name, CheckType::Fn(param_types, Box::new(ret)));
             }
             // Part B token-only keywords: skip for now
-            Stmt::TypeAlias(..) | Stmt::AtomicLet(..) | Stmt::Panic(..) | Stmt::Theorem(..) | Stmt::Break | Stmt::Continue => {}
+            Stmt::TypeAlias(..) | Stmt::AtomicLet(..) | Stmt::Panic(..) | Stmt::Theorem(..) | Stmt::Break | Stmt::Continue | Stmt::LetTuple(..) => {}
         }
     }
 
@@ -599,10 +606,15 @@ impl TypeChecker {
                             if let Some(expected) = param_type {
                                 let actual = self.infer_expr(arg);
                                 if !expected.accepts(&actual) {
-                                    self.emit_error(line, col, format!(
-                                        "type mismatch: argument {} of '{}' expected {} but got {}",
-                                        i + 1, fn_name, expected.display_name(), actual.display_name()
-                                    ));
+                                    // @vectorize: allow array<T> where T is expected
+                                    let is_vec_ok = self.vectorize_fns.contains(fn_name.as_str())
+                                        && matches!(actual, CheckType::Array(_));
+                                    if !is_vec_ok {
+                                        self.emit_error(line, col, format!(
+                                            "type mismatch: argument {} of '{}' expected {} but got {}",
+                                            i + 1, fn_name, expected.display_name(), actual.display_name()
+                                        ));
+                                    }
                                 }
                             }
                         }
