@@ -524,6 +524,21 @@ HexaVal parse_stmt() {
         p_advance();
         int is_mut = 0;
         if (p_check("Mut")) { p_advance(); is_mut = 1; }
+        // B-15: let (a, b) = expr
+        if (p_check("LParen")) {
+            p_advance();
+            HexaVal dnames = hexa_array_new();
+            dnames = hexa_array_push(dnames, hexa_str(p_expect_ident()));
+            while (p_check("Comma")) { p_advance(); dnames = hexa_array_push(dnames, hexa_str(p_expect_ident())); }
+            p_expect("RParen");
+            if (p_check("Colon")) { p_advance(); p_expect_ident(); }
+            p_expect("Eq");
+            HexaVal dinit = parse_expr();
+            HexaVal dn = mk_node("TupleDestructure");
+            dn = hexa_map_set(dn, "names", dnames);
+            dn = hexa_map_set(dn, "left", dinit);
+            return dn;
+        }
         const char* name = p_expect_ident();
         if (p_check("Colon")) { p_advance(); p_expect_ident(); }
         HexaVal init = hexa_str("");
@@ -909,6 +924,19 @@ void gen_stmt(HexaVal node, int depth, char* buf) {
     gen_indent(buf, depth);
     char pad[64]; pad[0]=0; for(int _p=0;_p<depth;_p++) strcat(pad,"    ");
 
+    if (strcmp(k,"TupleDestructure")==0) {
+        char* ibuf = calloc(1,65536);
+        gen_expr(hexa_map_get(node,"left"), ibuf);
+        strcat(buf, "HexaVal _td = "); strcat(buf, ibuf); strcat(buf, ";\n");
+        free(ibuf);
+        HexaVal tnames = hexa_map_get(node,"names");
+        for (int _ti=0; tnames.tag==TAG_ARRAY && _ti<tnames.arr.len; _ti++) {
+            gen_indent(buf,depth);
+            char idx[128]; sprintf(idx, "HexaVal %s = hexa_array_get(_td, %d);\n", tnames.arr.items[_ti].s, _ti);
+            strcat(buf, idx);
+        }
+        return;
+    }
     if (strcmp(k,"LetStmt")==0||strcmp(k,"LetMutStmt")==0||strcmp(k,"ConstStmt")==0) {
         // Generate init expr into separate buffer to avoid corruption
         char* init_buf = calloc(1, 65536);
@@ -1364,7 +1392,7 @@ int main(int argc, char** argv) {
     free(asm_code);
 
     // Try gcc first (best optimization + full feature support)
-    sprintf(cmd, "gcc -O2 -lm -I ready/self %s -o %s 2>/dev/null", c_file, output);
+    sprintf(cmd, "gcc -O2 -lm -I ready/self %s -o %s 2>&1", c_file, output);
     ret = system(cmd);
     if (ret == 0) printf("[5b] Compiled with gcc -O2\n");
 
