@@ -137,6 +137,10 @@ pub enum AttrKind {
     Parallel,           // @parallel — safe to parallelize
     Bounded(i64),       // @bounded(N) — loop bound
     Memoize,            // @memoize — cache results
+    Autograd,           // @autograd — automatic differentiation (forward-mode dual-number AD)
+    Vectorize,          // @vectorize — auto-lift scalar fn to array ops
+    Fuse,               // @fuse — operation fusion (chain of maps → single pass)
+    Lazy,               // @lazy — lazy evaluation (deferred compute pipeline)
     Optimize,           // @optimize — algorithmic transformation (recurrence → matrix exp)
     // Semantics
     Evolve,             // @evolve — self-modifying
@@ -159,6 +163,10 @@ impl AttrKind {
             "simd" => AttrKind::Simd,
             "parallel" => AttrKind::Parallel,
             "memoize" => AttrKind::Memoize,
+            "autograd" => AttrKind::Autograd,
+            "vectorize" => AttrKind::Vectorize,
+            "fuse" => AttrKind::Fuse,
+            "lazy" => AttrKind::Lazy,
             "optimize" => AttrKind::Optimize,
             "evolve" => AttrKind::Evolve,
             "test" => AttrKind::Test,

@@ -109,6 +109,7 @@ pub struct TimeoutArm {
 #[derive(Debug, Clone)]
 pub enum Stmt {
     Let(String, Option<String>, Option<Expr>, Visibility),   // let name: type = expr, visibility
+    LetTuple(Vec<String>, Expr),                              // let (a, b) = expr — tuple destructure
     Const(String, Option<String>, Expr, Visibility),         // const name: type = expr (immutable)
     Static(String, Option<String>, Expr, Visibility),        // static name: type = expr (module-level global)
     Assign(Expr, Expr),

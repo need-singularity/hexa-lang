@@ -167,7 +167,8 @@ fn can_jit_stmt(stmt: &Stmt) -> bool {
         Stmt::Optimize(..) | Stmt::ComptimeFn(..) | Stmt::EffectDecl(..) | Stmt::ConsciousnessBlock(..) | Stmt::EvolveFn(..) |
         Stmt::TraitDecl(..) | Stmt::Static(..) |
         Stmt::Scope(..) | Stmt::ProofBlock(..)
-        | Stmt::TypeAlias(..) | Stmt::AtomicLet(..) | Stmt::Panic(..) | Stmt::Theorem(..) | Stmt::Break | Stmt::Continue => false,
+        | Stmt::TypeAlias(..) | Stmt::AtomicLet(..) | Stmt::Panic(..) | Stmt::Theorem(..) | Stmt::Break | Stmt::Continue
+        | Stmt::LetTuple(..) => false,
         Stmt::Extern(_) => true,
     }
 }
