@@ -22,11 +22,11 @@
 로컬에서 통과하는 B-30(mut reassign), B-34(destructure), B-17(+=) 등이 원격에서 실패.
 → **gate 바이너리 재빌드 필요** (`ssh ubu "cd /tmp/hexa-build/hexa-lang && cargo build --release"`)
 
-### 2. codegen_c2 math 함수 누락
+### 2. ~~codegen_c2 math 함수 누락~~ ✅ RESOLVED (ready 226e337)
 
-`bootstrap_compiler.c` (775~777줄)에는 `ln/log10/exp` 있지만
-`codegen_c2.hexa`에 누락. 셀프호스팅 경로에서 이 함수들 사용 불가.
-→ **codegen_c2.hexa에 ln/log10/exp 추가 필요**
+`bootstrap_compiler.c` (775~777) 의 `ln/log10/exp`을 codegen_c2.hexa의
+gen2_expr() 분기에 포팅 완료. 보너스로 sqrt/floor/ceil/abs/round/sin/cos/pow,
+CompoundAssign(+= -= *= /= %=), BreakStmt/ContinueStmt, StructDecl 도 추가.
 
 ---
 
@@ -69,11 +69,10 @@
 - **미지원**: `{:<8}` `{:>2}` Rust 등가, 정수 폭 지정
 - **영향**: L2 계산기 표 출력 G3 byte-perfect 자동화
 
-### B-4: 부동소수 수학 함수
-- **동작**: sin, cos, tan, abs, sqrt, pow, floor, ceil, round (9종)
-- **미동작**: exp, ln, log10 (codegen_c2 누락)
-- **원인**: bootstrap_compiler.c에만 존재, codegen_c2.hexa에 미포팅
-- **영향**: Boltzmann/Shannon/Landauer 등 물리 계산
+### ~~B-4: 부동소수 수학 함수~~ ✅ RESOLVED (ready 226e337)
+- **동작 (12종)**: sin, cos, tan, abs, sqrt, pow, floor, ceil, round, **ln/log/log10/exp**
+- **해결**: codegen_c2.hexa gen2_expr() 분기 추가 (B-4 관련 OPEN 항목과 통합 해소)
+- **영향**: Boltzmann/Shannon/Landauer 등 물리 계산 가능
 
 ### B-7: 외부 명령 호출
 - **동작**: `exec("echo hello")` → stdout 캡처
@@ -121,9 +120,8 @@
 - **우회**: sentinel 값 (0.0, "", -1)
 - **영향**: 조건부 검증 패턴
 
-### codegen_c2 math 함수 누락 (B-4 관련)
-- bootstrap_compiler.c → codegen_c2.hexa 미포팅: `ln`, `log10`, `exp`
-- **1줄 변경이 아님** — gen2_expr에 함수 호출 분기 추가 필요
+### ~~codegen_c2 math 함수 누락 (B-4 관련)~~ ✅ RESOLVED (ready 226e337)
+- B-4와 통합 해소.
 
 ---
 
@@ -145,7 +143,7 @@
 | 단계 | 필요 조치 | 현재 상태 |
 |------|-----------|-----------|
 | L2 나머지 19개 커밋 | gate 바이너리 재빌드 | 코드 생성 완료, 커밋 대기 |
-| L2 G3 byte-perfect | B-3b 정수 폭 + codegen_c2 math | 부분 해소 |
+| L2 G3 byte-perfect | B-3b 정수 폭 (math 해소됨, ready 226e337) | 부분 해소 |
 | L1 .sh sweep | B-8 read_dir/glob | OPEN |
 | L3/L4 .py sweep | B-10 ML 스택 | 별도 결정 필요 |
 
