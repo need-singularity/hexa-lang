@@ -1,7 +1,7 @@
 > 🔴 **AI-NATIVE FIRST**: 성능/자원 개선은 저수준 마이크로 최적화 금지 — **AI-native 알고리즘 교체로 돌파**만 추구. docs/ai-native.md 24종 벡터 로드맵 참조. @optimize/@memoize/@fuse/@parallel 등 attr 시스템으로 구현.
 
 > 🔴 **HEXA-FIRST**: 모든 코드는 `.hexa`로 작성. 부하 유발 명령 최소화.
-> - **예외**: 이 리포의 컴파일러 Rust 소스(`src/`) — 컴파일러 자체 코드이므로 제외
+> - **`src/` Rust 인터프리터/컴파일러는 폐기됨** — 수정/빌드/테스트 금지. 검증·실험이 필요하면 `~/Dev/test`에서 `.hexa`로 진행.
 
 > 🔴 **NEXUS-6 특이점 연동**: 이 프로젝트의 돌파/발견/실험은 nexus 특이점 사이클 입력이다.
 > - **돌파 시**: `HEXA=$HOME/Dev/hexa-lang/target/release/hexa && $HEXA $HOME/Dev/nexus/mk2_hexa/native/blowup.hexa <domain> 3 --no-graph`
@@ -76,9 +76,8 @@
 self-hosting Phase1 완료 | LLVM 0% (의존 없음) | 1791 tests | 53.8K LOC | bench 333x
 
 ## 실행 모델
-Tiered Execution: JIT(Cranelift) → VM(바이트코드) → Interpreter(트리워킹). 성공 시 즉시 return.
-- JIT: `src/jit.rs` | VM: `src/vm.rs` + `src/compiler.rs` | Interp: `src/interpreter.rs`
-- 라우터: `src/main.rs` run_source_with_dir()
+**`src/` Rust 구현(JIT/VM/Interp) 폐기됨** — 더 이상 수정/빌드/참조 대상 아님.
+검증·실험은 `~/Dev/test`에서 `.hexa`로 진행.
 
 ## 빌드
 ```bash
