@@ -1165,7 +1165,7 @@ impl Interpreter {
                     OwnershipState::Dropped => {
                         return Err(self.runtime_err(format!("cannot drop '{}': value has already been dropped", name)));
                     }
-                    _ => {
+                    _ => Err(self.type_err("invalid index operation".into())),
                         self.env.set_ownership(name, OwnershipState::Dropped);
                         Ok(Value::Void)
                     }
@@ -1621,6 +1621,8 @@ impl Interpreter {
                         })
                     }
                     _ => Err(self.type_err("invalid index operation".into())),
+                        Err(self.type_err("invalid index operation".into()))
+                    }
                 }
             }
             Expr::Field(obj, field_name) => {
@@ -1641,7 +1643,7 @@ impl Interpreter {
                             self.runtime_err(format!("intent has no field '{}'", field_name))
                         })
                     }
-                    _ => {
+                    _ => Err(self.type_err("invalid index operation".into())),
                         // Store as a "method reference" -- will be called in Expr::Call
                         // We use a hack: return a BuiltinFn with a special name encoding
                         // But actually, Call(Field(obj, name), args) is the pattern
@@ -1833,7 +1835,7 @@ impl Interpreter {
                         OwnershipState::Dropped => {
                             return Err(self.runtime_err(format!("cannot move '{}': value has been dropped", name)));
                         }
-                        _ => {
+                        _ => Err(self.type_err("invalid index operation".into())),
                             let val = self.env.get(name).ok_or_else(|| {
                                 self.runtime_err(format!("undefined variable: {}", name))
                             })?;
@@ -1857,7 +1859,7 @@ impl Interpreter {
                         OwnershipState::Dropped => {
                             return Err(self.runtime_err(format!("cannot borrow '{}': value has been dropped", name)));
                         }
-                        _ => {
+                        _ => Err(self.type_err("invalid index operation".into())),
                             let val = self.env.get(name).ok_or_else(|| {
                                 self.runtime_err(format!("undefined variable: {}", name))
                             })?;
@@ -4633,7 +4635,7 @@ impl Interpreter {
                                         Ok(Some(vec![(binding_name.clone(), data.as_ref().clone())]))
                                     }
                                     // Could be a literal for nested matching
-                                    _ => {
+                                    _ => Err(self.type_err("invalid index operation".into())),
                                         let pattern_val = self.eval_expr(bind_expr)?;
                                         if Self::values_equal(data.as_ref(), &pattern_val) {
                                             Ok(Some(vec![]))
@@ -4675,7 +4677,7 @@ impl Interpreter {
                                             Expr::Ident(binding_name) => {
                                                 return Ok(Some(vec![(binding_name.clone(), data.as_ref().clone())]));
                                             }
-                                            _ => {
+                                            _ => Err(self.type_err("invalid index operation".into())),
                                                 let pattern_val = self.eval_expr(&call_args[0])?;
                                                 if Self::values_equal(data.as_ref(), &pattern_val) {
                                                     return Ok(Some(vec![]));
