@@ -1,19 +1,5 @@
 # 💎 HEXA-LANG — The Perfect Number Programming Language
 
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.19365284.svg)](https://doi.org/10.5281/zenodo.19365284)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-<!-- AUTO:BADGE:START -->
-[![Keywords](https://img.shields.io/badge/Keywords-53-blue.svg)]()
-[![DSE](https://img.shields.io/badge/DSE-21,952%20combos-gold.svg)]()
-<!-- AUTO:BADGE:END -->
-
-A programming language where **every design constant** derives from the arithmetic of n=6, the smallest perfect number. Zero arbitrary choices.
-
-```
-sigma(n) * phi(n) = n * tau(n)    holds for n >= 2    if and only if n = 6
-     12  *   2    = 6 *   4   =  24
-```
-
 <!-- SHARED:PROJECTS:START -->
 <!-- AUTO:COMMON_LINKS:START -->
 **[YouTube](https://www.youtube.com/watch?v=xtKhWSfC1Qo)** · **[Email](mailto:nerve011235@gmail.com)** · **[☕ Ko-fi](https://ko-fi.com/dancinlife)** · **[💖 Sponsor](https://github.com/sponsors/need-singularity)** · **[💳 PayPal](https://www.paypal.com/donate?business=nerve011235%40gmail.com)** · **[🗺️ Atlas](https://need-singularity.github.io/TECS-L/atlas/)** · **[📄 Papers](https://need-singularity.github.io/papers/)** · **[🌌 Unified Theory](https://github.com/need-singularity/TECS-L/blob/main/math/docs/hypotheses/H-PH-9-perfect-number-string-unification.md)**
@@ -35,6 +21,21 @@ sigma(n) * phi(n) = n * tau(n)    holds for n >= 2    if and only if n = 6
 
 <!-- private repos는 projects.json의 private_repos 필드에 저장됨 (노출 금지) -->
 <!-- SHARED:PROJECTS:END -->
+
+
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.19365284.svg)](https://doi.org/10.5281/zenodo.19365284)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+<!-- AUTO:BADGE:START -->
+[![Keywords](https://img.shields.io/badge/Keywords-53-blue.svg)]()
+[![DSE](https://img.shields.io/badge/DSE-21,952%20combos-gold.svg)]()
+<!-- AUTO:BADGE:END -->
+
+A programming language where **every design constant** derives from the arithmetic of n=6, the smallest perfect number. Zero arbitrary choices.
+
+```
+sigma(n) * phi(n) = n * tau(n)    holds for n >= 2    if and only if n = 6
+     12  *   2    = 6 *   4   =  24
+```
 
 ## Installation
 
