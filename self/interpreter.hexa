@@ -41,6 +41,36 @@ let mut continue_flag = false
 let mut throw_flag = false
 let mut throw_val = val_void()
 
+// ── Extern FFI storage ──────────────────────────────────
+// Each entry: [hexa_name, c_symbol, ret_type, link_lib]
+// c_symbol is from @symbol("name"); if empty, hexa_name is used for dlsym.
+let mut extern_fns = []
+
+// Look up the C symbol name for a hexa extern function.
+// Returns the @symbol alias if set, otherwise the hexa name itself.
+fn extern_c_symbol(hexa_name) {
+    let mut i = len(extern_fns) - 1
+    while i >= 0 {
+        if extern_fns[i][0] == hexa_name {
+            return extern_fns[i][1]
+        }
+        i = i - 1
+    }
+    return hexa_name
+}
+
+// Look up the link library for a hexa extern function.
+fn extern_link_lib(hexa_name) {
+    let mut i = len(extern_fns) - 1
+    while i >= 0 {
+        if extern_fns[i][0] == hexa_name {
+            return extern_fns[i][3]
+        }
+        i = i - 1
+    }
+    return ""
+}
+
 // ── Impl block storage (struct method dispatch) ─────────
 // Each entry: [target_name, methods_array]
 // methods_array: each is a FnDecl node with .name, .params, .body
@@ -49,6 +79,69 @@ let mut impl_store = []
 // ── Closure environment storage ─────────────────────────
 // Closures capture a snapshot of env_vars at creation time
 let mut closure_store = []
+
+// ── Callback trampoline storage (G4) ───────────────────
+// Pool of 16 callback slots for interpreter mode.
+// Each slot: [in_use (0/1), fn_val]
+let mut callback_slots = []
+let mut callback_inited = false
+
+fn callback_init() {
+    if callback_inited { return 0 }
+    callback_inited = true
+    let mut i = 0
+    while i < 16 {
+        callback_slots = callback_slots.push([0, val_void()])
+        i = i + 1
+    }
+    return 0
+}
+
+fn callback_slots_put(idx, entry) {
+    let mut new_slots = []
+    let mut i = 0
+    while i < 16 {
+        if i == idx {
+            new_slots = new_slots.push(entry)
+        } else {
+            new_slots = new_slots.push(callback_slots[i])
+        }
+        i = i + 1
+    }
+    callback_slots = new_slots
+}
+
+fn callback_alloc(fn_val) {
+    callback_init()
+    let mut i = 0
+    while i < 16 {
+        if callback_slots[i][0] == 0 {
+            callback_slots_put(i, [1, fn_val])
+            return i
+        }
+        i = i + 1
+    }
+    println("callback pool exhausted (16 slots)")
+    return -1
+}
+
+fn callback_release(slot) {
+    callback_init()
+    if slot >= 0 && slot < 16 {
+        callback_slots_put(slot, [0, val_void()])
+    }
+}
+
+fn callback_call(slot, args) {
+    callback_init()
+    if slot < 0 || slot >= 16 { return val_void() }
+    if callback_slots[slot][0] == 0 { return val_void() }
+    let fn_val = callback_slots[slot][1]
+    if fn_val.tag == "fn" {
+        return call_fn_val(fn_val, args)
+    }
+    return val_void()
+}
 
 fn env_push_scope() {
     env_scopes = env_scopes.push(len(env_vars))
@@ -471,6 +564,23 @@ fn exec_stmt_at(stmts, idx) {
         env_fns = env_fns.push([node.name, node.params, node.body])
         let fn_val = val_fn(node.name, node.params, node.body)
         env_define(node.name, fn_val)
+        return val_void()
+    }
+
+    if k == "ExternFnDecl" {
+        // Register extern function declaration.
+        // node.value = @symbol("c_name") alias (empty → use node.name)
+        // node.op    = @link("lib") library name (empty → default)
+        let c_symbol = node.value
+        if c_symbol == "" {
+            c_symbol = node.name
+        }
+        let ret = node.ret_type
+        let link = node.op
+        extern_fns = extern_fns.push([node.name, c_symbol, ret, link])
+        // Register as a builtin-style binding so calls route to FFI
+        let builtin_name = "__extern_" + node.name
+        env_define(node.name, val_str(builtin_name))
         return val_void()
     }
 
@@ -1020,6 +1130,218 @@ fn call_builtin(name, args) {
         return val_map([], [])
     }
 
+    // ── Callback trampoline builtins (G4) ────────────────
+    // In interpreter mode, callbacks are tracked as slot IDs.
+    // The actual C function pointer is only meaningful in compiled mode.
+    if name == "callback_create" {
+        if len(args) > 0 {
+            let fn_val = args[0]
+            // Store in callback_slots, return slot index as int
+            let slot = callback_alloc(fn_val)
+            return val_int(slot)
+        }
+        return val_int(-1)
+    }
+    if name == "callback_free" {
+        if len(args) > 0 {
+            callback_release(args[0].int_val)
+        }
+        return val_void()
+    }
+    if name == "callback_invoke" {
+        // For testing: invoke a callback by slot ID with args
+        if len(args) >= 1 {
+            let slot = args[0].int_val
+            let mut cb_args = []
+            let mut ai = 1
+            while ai < len(args) {
+                cb_args = cb_args.push(args[ai])
+                ai = ai + 1
+            }
+            return callback_call(slot, cb_args)
+        }
+        return val_void()
+    }
+
+    // ── G5: Pointer arithmetic builtins (interpreter-level) ──
+    if name == "ptr_alloc" {
+        if len(args) > 0 {
+            let size = args[0].int_val
+            let buf = ptr_alloc(size)
+            return val_int(ptr_addr(buf))
+        }
+        return val_int(0)
+    }
+    if name == "ptr_free" {
+        if len(args) >= 2 {
+            ptr_free(args[0].int_val, args[1].int_val)
+        }
+        return val_void()
+    }
+    if name == "ptr_write" {
+        if len(args) >= 3 {
+            let p = args[0].int_val
+            let off = args[1].int_val
+            let v = args[2]
+            if v.tag == "float" {
+                ptr_write(p, off, v.float_val)
+            } else {
+                ptr_write(p, off, v.int_val)
+            }
+        }
+        return val_void()
+    }
+    if name == "ptr_write_f32" {
+        if len(args) >= 3 {
+            ptr_write_f32(args[0].int_val, args[1].int_val, to_float_val(args[2]))
+        }
+        return val_void()
+    }
+    if name == "ptr_write_i32" {
+        if len(args) >= 3 {
+            ptr_write_i32(args[0].int_val, args[1].int_val, args[2].int_val)
+        }
+        return val_void()
+    }
+    if name == "ptr_read" {
+        if len(args) >= 2 {
+            return val_int(ptr_read(args[0].int_val, args[1].int_val))
+        }
+        return val_int(0)
+    }
+    if name == "ptr_read_f64" {
+        if len(args) >= 2 {
+            return val_float(ptr_read_f64(args[0].int_val, args[1].int_val))
+        }
+        return val_float(0.0)
+    }
+    if name == "ptr_read_f32" {
+        if len(args) >= 2 {
+            return val_float(ptr_read_f32(args[0].int_val, args[1].int_val))
+        }
+        return val_float(0.0)
+    }
+    if name == "ptr_read_i32" {
+        if len(args) >= 2 {
+            return val_int(ptr_read_i32(args[0].int_val, args[1].int_val))
+        }
+        return val_int(0)
+    }
+    if name == "ptr_offset" {
+        if len(args) >= 2 {
+            return val_int(args[0].int_val + args[1].int_val)
+        }
+        return val_int(0)
+    }
+    if name == "ptr_null" {
+        return val_int(0)
+    }
+    if name == "ptr_addr" {
+        if len(args) > 0 { return val_int(args[0].int_val) }
+        return val_int(0)
+    }
+    if name == "deref" {
+        if len(args) > 0 {
+            return val_int(deref(args[0].int_val))
+        }
+        return val_int(0)
+    }
+
+    // ── FFI string conversion builtins ────────────────────
+    if name == "cstring" {
+        if len(args) > 0 && args[0].tag == "str" {
+            return val_int(ptr_addr(args[0].str_val))
+        }
+        return val_int(0)
+    }
+    if name == "from_cstring" {
+        if len(args) > 0 {
+            return val_str(from_cstring(args[0].int_val))
+        }
+        return val_str("")
+    }
+
+    // ── G2: Struct packing builtins ──────────────────────
+    if name == "struct_pack" {
+        // Pack all args as f64 into a heap buffer, return pointer
+        let size = len(args) * 8
+        let buf = ptr_alloc(size)
+        let p = ptr_addr(buf)
+        let mut si = 0
+        while si < len(args) {
+            let v = to_float_val(args[si])
+            ptr_write(p, si * 8, v)
+            si = si + 1
+        }
+        return val_int(p)
+    }
+    if name == "struct_pack_f32" {
+        let size = len(args) * 4
+        let buf = ptr_alloc(size)
+        let p = ptr_addr(buf)
+        let mut si = 0
+        while si < len(args) {
+            let v = to_float_val(args[si])
+            ptr_write_f32(p, si * 4, v)
+            si = si + 1
+        }
+        return val_int(p)
+    }
+    if name == "struct_unpack" {
+        if len(args) >= 2 {
+            let p = args[0].int_val
+            let idx = args[1].int_val
+            return val_float(ptr_read_f64(p, idx * 8))
+        }
+        return val_float(0.0)
+    }
+    if name == "struct_unpack_f32" {
+        if len(args) >= 2 {
+            let p = args[0].int_val
+            let idx = args[1].int_val
+            return val_float(ptr_read_f32(p, idx * 4))
+        }
+        return val_float(0.0)
+    }
+    if name == "struct_rect" {
+        if len(args) >= 4 {
+            let buf = ptr_alloc(32)
+            let p = ptr_addr(buf)
+            ptr_write(p, 0, to_float_val(args[0]))
+            ptr_write(p, 8, to_float_val(args[1]))
+            ptr_write(p, 16, to_float_val(args[2]))
+            ptr_write(p, 24, to_float_val(args[3]))
+            return val_int(p)
+        }
+        return val_int(0)
+    }
+    if name == "struct_point" {
+        if len(args) >= 2 {
+            let buf = ptr_alloc(16)
+            let p = ptr_addr(buf)
+            ptr_write(p, 0, to_float_val(args[0]))
+            ptr_write(p, 8, to_float_val(args[1]))
+            return val_int(p)
+        }
+        return val_int(0)
+    }
+    if name == "struct_size" {
+        if len(args) >= 2 {
+            let buf = ptr_alloc(16)
+            let p = ptr_addr(buf)
+            ptr_write(p, 0, to_float_val(args[0]))
+            ptr_write(p, 8, to_float_val(args[1]))
+            return val_int(p)
+        }
+        return val_int(0)
+    }
+    if name == "struct_free" {
+        if len(args) > 0 {
+            ptr_free(args[0].int_val, 0)
+        }
+        return val_void()
+    }
+
     return not_builtin
 }
 
@@ -1465,6 +1787,7 @@ fn interpret(ast) {
     struct_store = []
     impl_store = []
     closure_store = []
+    extern_fns = []
 
     let mut result = val_void()
     let mut _si = 0

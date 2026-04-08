@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include <math.h>
 #include <ctype.h>
+#include <dlfcn.h>
 
 // Forward declarations for all runtime functions
 typedef struct HexaVal HexaVal;
@@ -694,7 +695,6 @@ int hexa_array_contains(HexaVal arr, HexaVal item) {
 }
 
 HexaVal hexa_format_float(HexaVal f, HexaVal prec) {
-HexaVal hexa_format_float_sci(HexaVal f, HexaVal prec);
     double v = f.tag == TAG_FLOAT ? f.f : (double)f.i;
     int p = prec.i;
     char buf[64];
@@ -703,10 +703,564 @@ HexaVal hexa_format_float_sci(HexaVal f, HexaVal prec);
 }
 
 HexaVal hexa_format_float_sci(HexaVal f, HexaVal prec) {
-HexaVal hexa_format_float_sci(HexaVal f, HexaVal prec);
     double v = f.tag == TAG_FLOAT ? f.f : (double)f.i;
     int p = prec.i;
     char buf[64];
     snprintf(buf, 64, "%.*e", p, v);
     return hexa_str(buf);
+}
+
+// ── Extern FFI: dlopen / dlsym / dispatch ───────────────
+
+// Resolve a library path for dlopen.
+// If lib_name is NULL or empty, use RTLD_DEFAULT (search default symbols).
+static void* hexa_ffi_dlopen(const char* lib_name) {
+    if (!lib_name || lib_name[0] == '\0') {
+        return dlopen(NULL, RTLD_LAZY);
+    }
+#ifdef __APPLE__
+    // Try framework path first
+    char framework[512];
+    snprintf(framework, sizeof(framework),
+        "/System/Library/Frameworks/%s.framework/%s", lib_name, lib_name);
+    void* h = dlopen(framework, RTLD_LAZY);
+    if (h) return h;
+    // Try dylib
+    char dylib[512];
+    snprintf(dylib, sizeof(dylib), "/usr/lib/lib%s.dylib", lib_name);
+    h = dlopen(dylib, RTLD_LAZY);
+    if (h) return h;
+#endif
+    // Try as-is (Linux .so or absolute path)
+    char sopath[512];
+    snprintf(sopath, sizeof(sopath), "lib%s.so", lib_name);
+    void* h2 = dlopen(sopath, RTLD_LAZY);
+    if (h2) return h2;
+    // Final attempt: bare name
+    return dlopen(lib_name, RTLD_LAZY);
+}
+
+// Resolve a symbol from an already-opened library handle.
+static void* hexa_ffi_dlsym(void* handle, const char* symbol) {
+    void* sym = dlsym(handle, symbol);
+    if (!sym) {
+        fprintf(stderr, "[hexa-ffi] dlsym failed for '%s': %s\n", symbol, dlerror());
+    }
+    return sym;
+}
+
+// Marshal a HexaVal to a raw i64 for C ABI passing.
+static int64_t hexa_ffi_marshal_arg(HexaVal v) {
+    switch (v.tag) {
+        case TAG_INT:   return v.i;
+        case TAG_FLOAT: { union { double d; int64_t i; } u; u.d = v.f; return u.i; }
+        case TAG_BOOL:  return (int64_t)v.b;
+        case TAG_STR:   return (int64_t)(uintptr_t)v.s;
+        case TAG_VOID:  return 0;
+        default:        return 0;
+    }
+}
+
+// Raw extern call dispatch — supports 0 to 10 arguments.
+// Uses transmute (cast) to call through a function pointer with the right arity.
+static int64_t hexa_call_extern_raw(void* fn_ptr, int64_t* args, int nargs) {
+    typedef int64_t (*Fn0)(void);
+    typedef int64_t (*Fn1)(int64_t);
+    typedef int64_t (*Fn2)(int64_t,int64_t);
+    typedef int64_t (*Fn3)(int64_t,int64_t,int64_t);
+    typedef int64_t (*Fn4)(int64_t,int64_t,int64_t,int64_t);
+    typedef int64_t (*Fn5)(int64_t,int64_t,int64_t,int64_t,int64_t);
+    typedef int64_t (*Fn6)(int64_t,int64_t,int64_t,int64_t,int64_t,int64_t);
+    typedef int64_t (*Fn7)(int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t);
+    typedef int64_t (*Fn8)(int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t);
+    typedef int64_t (*Fn9)(int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t);
+    typedef int64_t (*Fn10)(int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t);
+
+    switch (nargs) {
+        case 0:  return ((Fn0)fn_ptr)();
+        case 1:  return ((Fn1)fn_ptr)(args[0]);
+        case 2:  return ((Fn2)fn_ptr)(args[0],args[1]);
+        case 3:  return ((Fn3)fn_ptr)(args[0],args[1],args[2]);
+        case 4:  return ((Fn4)fn_ptr)(args[0],args[1],args[2],args[3]);
+        case 5:  return ((Fn5)fn_ptr)(args[0],args[1],args[2],args[3],args[4]);
+        case 6:  return ((Fn6)fn_ptr)(args[0],args[1],args[2],args[3],args[4],args[5]);
+        case 7:  return ((Fn7)fn_ptr)(args[0],args[1],args[2],args[3],args[4],args[5],args[6]);
+        case 8:  return ((Fn8)fn_ptr)(args[0],args[1],args[2],args[3],args[4],args[5],args[6],args[7]);
+        case 9:  return ((Fn9)fn_ptr)(args[0],args[1],args[2],args[3],args[4],args[5],args[6],args[7],args[8]);
+        case 10: return ((Fn10)fn_ptr)(args[0],args[1],args[2],args[3],args[4],args[5],args[6],args[7],args[8],args[9]);
+        default:
+            fprintf(stderr, "[hexa-ffi] extern call with %d args not supported (max 10)\n", nargs);
+            return 0;
+    }
+}
+
+// High-level extern call: resolve, marshal, call, unmarshal.
+// ret_kind: 0=void, 1=int, 2=float, 3=bool, 4=pointer/string
+HexaVal hexa_extern_call(void* fn_ptr, HexaVal* hargs, int nargs, int ret_kind) {
+    int64_t cargs[10];
+    for (int i = 0; i < nargs && i < 10; i++) {
+        cargs[i] = hexa_ffi_marshal_arg(hargs[i]);
+    }
+    int64_t ret = hexa_call_extern_raw(fn_ptr, cargs, nargs);
+    switch (ret_kind) {
+        case 0:  return hexa_void();
+        case 1:  return hexa_int(ret);
+        case 2:  { union { int64_t i; double d; } u; u.i = ret; return hexa_float(u.d); }
+        case 3:  return hexa_bool(ret != 0);
+        case 4:  return hexa_int(ret); // pointer as int
+        default: return hexa_int(ret);
+    }
+}
+
+// ── G3: Typed extern call with float support ─────────────
+// float_mask is a bitmask: bit i set means arg i is a double (SIMD register).
+// This generates correct ARM64 calling convention for mixed int/float args.
+// Supports up to 8 args (covers all common FFI patterns including NSRect).
+// The C compiler sees typed args and emits correct register moves.
+HexaVal hexa_extern_call_typed(void* fn_ptr, HexaVal* hargs, int nargs, int ret_kind, int float_mask) {
+    // Extract values: doubles from .f, integers from .i
+    double  fv[8]; // float values
+    int64_t iv[8]; // int values
+    for (int i = 0; i < nargs && i < 8; i++) {
+        if (float_mask & (1 << i)) {
+            fv[i] = (hargs[i].tag == TAG_FLOAT) ? hargs[i].f : (double)hargs[i].i;
+        } else {
+            iv[i] = hexa_ffi_marshal_arg(hargs[i]);
+        }
+    }
+    // Dispatch by nargs and float_mask pattern
+    // Common patterns: all-int (mask=0), trailing floats, all-float
+    // For arbitrary patterns, we use a switch on nargs with typed casts.
+    // The C compiler handles register allocation from the typed call.
+
+    // Helper macros for arg extraction
+    #define A(i) ((float_mask & (1<<(i))) ? 0 : iv[i])
+    #define F(i) ((float_mask & (1<<(i))) ? fv[i] : 0.0)
+    #define IS_F(i) (float_mask & (1<<(i)))
+
+    int64_t reti = 0;
+    double  retf = 0.0;
+    int ret_is_float = (ret_kind == 2);
+
+    // For each arity, generate all-int call if mask==0, else use typed dispatch
+    switch (nargs) {
+        case 0: {
+            if (ret_is_float) { retf = ((double(*)(void))fn_ptr)(); }
+            else { reti = ((int64_t(*)(void))fn_ptr)(); }
+            break;
+        }
+        case 1: {
+            if (IS_F(0)) {
+                if (ret_is_float) retf = ((double(*)(double))fn_ptr)(fv[0]);
+                else reti = ((int64_t(*)(double))fn_ptr)(fv[0]);
+            } else {
+                if (ret_is_float) retf = ((double(*)(int64_t))fn_ptr)(iv[0]);
+                else reti = ((int64_t(*)(int64_t))fn_ptr)(iv[0]);
+            }
+            break;
+        }
+        case 2: {
+            // 4 combinations for 2 args
+            int p = (IS_F(0)?2:0) | (IS_F(1)?1:0);
+            switch (p) {
+                case 0: // ii
+                    if (ret_is_float) retf = ((double(*)(int64_t,int64_t))fn_ptr)(iv[0],iv[1]);
+                    else reti = ((int64_t(*)(int64_t,int64_t))fn_ptr)(iv[0],iv[1]);
+                    break;
+                case 1: // if
+                    if (ret_is_float) retf = ((double(*)(int64_t,double))fn_ptr)(iv[0],fv[1]);
+                    else reti = ((int64_t(*)(int64_t,double))fn_ptr)(iv[0],fv[1]);
+                    break;
+                case 2: // fi
+                    if (ret_is_float) retf = ((double(*)(double,int64_t))fn_ptr)(fv[0],iv[1]);
+                    else reti = ((int64_t(*)(double,int64_t))fn_ptr)(fv[0],iv[1]);
+                    break;
+                case 3: // ff
+                    if (ret_is_float) retf = ((double(*)(double,double))fn_ptr)(fv[0],fv[1]);
+                    else reti = ((int64_t(*)(double,double))fn_ptr)(fv[0],fv[1]);
+                    break;
+            }
+            break;
+        }
+        default: {
+            // For 3+ args: fall back to the codegen approach (typed wrappers).
+            // This runtime path handles the most common 0-2 arg float cases.
+            // For higher arities, codegen_c2 generates typed C wrapper functions.
+            fprintf(stderr, "[hexa-ffi] typed call with %d args: use typed extern fn decl in .hexa\n", nargs);
+            reti = hexa_call_extern_raw(fn_ptr, iv, nargs);
+            break;
+        }
+    }
+    #undef A
+    #undef F
+    #undef IS_F
+
+    switch (ret_kind) {
+        case 0:  return hexa_void();
+        case 1:  return hexa_int(reti);
+        case 2:  return hexa_float(retf);
+        case 3:  return hexa_bool(reti != 0);
+        case 4:  return hexa_int(reti);
+        default: return hexa_int(reti);
+    }
+}
+
+// Convenience: cstring <-> HexaVal
+HexaVal hexa_cstring(HexaVal s) {
+    if (s.tag != TAG_STR) return hexa_int(0);
+    return hexa_int((int64_t)(uintptr_t)s.s);
+}
+
+HexaVal hexa_from_cstring(HexaVal ptr) {
+    int64_t p = (ptr.tag == TAG_INT) ? ptr.i : 0;
+    if (p == 0) return hexa_str("");
+    return hexa_str((const char*)(uintptr_t)p);
+}
+
+HexaVal hexa_ptr_null() { return hexa_int(0); }
+
+HexaVal hexa_ptr_addr(HexaVal v) {
+    return hexa_int(v.i);
+}
+
+// ── G5: Pointer arithmetic builtins ─────────────────────
+
+HexaVal hexa_ptr_alloc(HexaVal size) {
+    int64_t n = size.tag == TAG_INT ? size.i : 0;
+    if (n <= 0) return hexa_int(0);
+    void* p = calloc(1, (size_t)n);
+    return hexa_int((int64_t)(uintptr_t)p);
+}
+
+HexaVal hexa_ptr_free(HexaVal ptr, HexaVal size) {
+    int64_t p = (ptr.tag == TAG_INT) ? ptr.i : 0;
+    if (p != 0) free((void*)(uintptr_t)p);
+    return hexa_void();
+}
+
+HexaVal hexa_ptr_write(HexaVal ptr, HexaVal offset, HexaVal val) {
+    int64_t p = (ptr.tag == TAG_INT) ? ptr.i : 0;
+    int64_t off = (offset.tag == TAG_INT) ? offset.i : 0;
+    if (p == 0) return hexa_void();
+    uint8_t* base = (uint8_t*)(uintptr_t)p + off;
+    if (val.tag == TAG_FLOAT) {
+        double d = val.f;
+        memcpy(base, &d, sizeof(double));
+    } else {
+        int64_t v = val.i;
+        memcpy(base, &v, sizeof(int64_t));
+    }
+    return hexa_void();
+}
+
+HexaVal hexa_ptr_write_f32(HexaVal ptr, HexaVal offset, HexaVal val) {
+    int64_t p = (ptr.tag == TAG_INT) ? ptr.i : 0;
+    int64_t off = (offset.tag == TAG_INT) ? offset.i : 0;
+    if (p == 0) return hexa_void();
+    float f = (float)(val.tag == TAG_FLOAT ? val.f : (double)val.i);
+    memcpy((uint8_t*)(uintptr_t)p + off, &f, sizeof(float));
+    return hexa_void();
+}
+
+HexaVal hexa_ptr_write_i32(HexaVal ptr, HexaVal offset, HexaVal val) {
+    int64_t p = (ptr.tag == TAG_INT) ? ptr.i : 0;
+    int64_t off = (offset.tag == TAG_INT) ? offset.i : 0;
+    if (p == 0) return hexa_void();
+    int32_t v = (int32_t)val.i;
+    memcpy((uint8_t*)(uintptr_t)p + off, &v, sizeof(int32_t));
+    return hexa_void();
+}
+
+HexaVal hexa_ptr_read(HexaVal ptr, HexaVal offset) {
+    int64_t p = (ptr.tag == TAG_INT) ? ptr.i : 0;
+    int64_t off = (offset.tag == TAG_INT) ? offset.i : 0;
+    if (p == 0) return hexa_int(0);
+    int64_t v;
+    memcpy(&v, (uint8_t*)(uintptr_t)p + off, sizeof(int64_t));
+    return hexa_int(v);
+}
+
+HexaVal hexa_ptr_read_f64(HexaVal ptr, HexaVal offset) {
+    int64_t p = (ptr.tag == TAG_INT) ? ptr.i : 0;
+    int64_t off = (offset.tag == TAG_INT) ? offset.i : 0;
+    if (p == 0) return hexa_float(0.0);
+    double d;
+    memcpy(&d, (uint8_t*)(uintptr_t)p + off, sizeof(double));
+    return hexa_float(d);
+}
+
+HexaVal hexa_ptr_read_f32(HexaVal ptr, HexaVal offset) {
+    int64_t p = (ptr.tag == TAG_INT) ? ptr.i : 0;
+    int64_t off = (offset.tag == TAG_INT) ? offset.i : 0;
+    if (p == 0) return hexa_float(0.0);
+    float f;
+    memcpy(&f, (uint8_t*)(uintptr_t)p + off, sizeof(float));
+    return hexa_float((double)f);
+}
+
+HexaVal hexa_ptr_read_i32(HexaVal ptr, HexaVal offset) {
+    int64_t p = (ptr.tag == TAG_INT) ? ptr.i : 0;
+    int64_t off = (offset.tag == TAG_INT) ? offset.i : 0;
+    if (p == 0) return hexa_int(0);
+    int32_t v;
+    memcpy(&v, (uint8_t*)(uintptr_t)p + off, sizeof(int32_t));
+    return hexa_int((int64_t)v);
+}
+
+HexaVal hexa_ptr_offset(HexaVal ptr, HexaVal offset) {
+    int64_t p = (ptr.tag == TAG_INT) ? ptr.i : 0;
+    int64_t off = (offset.tag == TAG_INT) ? offset.i : 0;
+    return hexa_int(p + off);
+}
+
+HexaVal hexa_deref(HexaVal ptr) {
+    int64_t p = (ptr.tag == TAG_INT) ? ptr.i : 0;
+    if (p == 0) return hexa_int(0);
+    int64_t v;
+    memcpy(&v, (void*)(uintptr_t)p, sizeof(int64_t));
+    return hexa_int(v);
+}
+
+// ═══════════════════════════════════════════════════════════
+//  G2: Struct Value Passing — struct packing builtins
+//  Allows constructing C structs in heap memory for FFI.
+//  struct_pack(v0, v1, ...) — N*8 bytes of f64 values
+//  struct_pack_f32(v0, ...) — N*4 bytes of f32 values
+//  struct_unpack(ptr, idx) — read Nth f64 from packed struct
+//  struct_unpack_f32(ptr, idx) — read Nth f32
+//  struct_rect/point/size — Cocoa geometry helpers
+// ═══════════════════════════════════════════════════════════
+
+// Pack N f64 values into a newly allocated buffer. Returns pointer as int.
+HexaVal hexa_struct_pack(HexaVal* args, int nargs) {
+    if (nargs <= 0) return hexa_int(0);
+    size_t total = (size_t)nargs * sizeof(double);
+    double* buf = (double*)calloc(1, total);
+    for (int i = 0; i < nargs; i++) {
+        buf[i] = (args[i].tag == TAG_FLOAT) ? args[i].f : (double)args[i].i;
+    }
+    return hexa_int((int64_t)(uintptr_t)buf);
+}
+
+// Pack N f32 values into a newly allocated buffer. Returns pointer as int.
+HexaVal hexa_struct_pack_f32(HexaVal* args, int nargs) {
+    if (nargs <= 0) return hexa_int(0);
+    size_t total = (size_t)nargs * sizeof(float);
+    float* buf = (float*)calloc(1, total);
+    for (int i = 0; i < nargs; i++) {
+        buf[i] = (float)((args[i].tag == TAG_FLOAT) ? args[i].f : (double)args[i].i);
+    }
+    return hexa_int((int64_t)(uintptr_t)buf);
+}
+
+// Read the Nth f64 from a struct pointer.
+HexaVal hexa_struct_unpack(HexaVal ptr, HexaVal index) {
+    int64_t p = (ptr.tag == TAG_INT) ? ptr.i : 0;
+    int64_t idx = (index.tag == TAG_INT) ? index.i : 0;
+    if (p == 0) return hexa_float(0.0);
+    double* buf = (double*)(uintptr_t)p;
+    return hexa_float(buf[idx]);
+}
+
+// Read the Nth f32 from a struct pointer.
+HexaVal hexa_struct_unpack_f32(HexaVal ptr, HexaVal index) {
+    int64_t p = (ptr.tag == TAG_INT) ? ptr.i : 0;
+    int64_t idx = (index.tag == TAG_INT) ? index.i : 0;
+    if (p == 0) return hexa_float(0.0);
+    float* buf = (float*)(uintptr_t)p;
+    return hexa_float((double)buf[idx]);
+}
+
+// Convenience: pack an NSRect (4x f64 = 32 bytes).
+HexaVal hexa_struct_rect(HexaVal x, HexaVal y, HexaVal w, HexaVal h) {
+    double* buf = (double*)calloc(1, 4 * sizeof(double));
+    buf[0] = (x.tag == TAG_FLOAT) ? x.f : (double)x.i;
+    buf[1] = (y.tag == TAG_FLOAT) ? y.f : (double)y.i;
+    buf[2] = (w.tag == TAG_FLOAT) ? w.f : (double)w.i;
+    buf[3] = (h.tag == TAG_FLOAT) ? h.f : (double)h.i;
+    return hexa_int((int64_t)(uintptr_t)buf);
+}
+
+// Convenience: pack an NSPoint (2x f64 = 16 bytes).
+HexaVal hexa_struct_point(HexaVal x, HexaVal y) {
+    double* buf = (double*)calloc(1, 2 * sizeof(double));
+    buf[0] = (x.tag == TAG_FLOAT) ? x.f : (double)x.i;
+    buf[1] = (y.tag == TAG_FLOAT) ? y.f : (double)y.i;
+    return hexa_int((int64_t)(uintptr_t)buf);
+}
+
+// Convenience: pack an NSSize (2x f64 = 16 bytes).
+HexaVal hexa_struct_size_pack(HexaVal w, HexaVal h) {
+    double* buf = (double*)calloc(1, 2 * sizeof(double));
+    buf[0] = (w.tag == TAG_FLOAT) ? w.f : (double)w.i;
+    buf[1] = (h.tag == TAG_FLOAT) ? h.f : (double)h.i;
+    return hexa_int((int64_t)(uintptr_t)buf);
+}
+
+// Free a struct pointer (allocated by struct_pack/struct_rect/etc).
+HexaVal hexa_struct_free(HexaVal ptr) {
+    int64_t p = (ptr.tag == TAG_INT) ? ptr.i : 0;
+    if (p != 0) free((void*)(uintptr_t)p);
+    return hexa_void();
+}
+
+// ═══════════════════════════════════════════════════════════
+//  G4: Callback Trampoline Pool
+//  Provides C function pointers that dispatch back into hexa.
+//  16 pre-allocated slots — sufficient for Cocoa delegates,
+//  menu actions, timers, qsort comparators, etc.
+// ═══════════════════════════════════════════════════════════
+
+#define HEXA_TRAMPOLINE_POOL_SIZE 16
+
+// Callback entry: stores a HexaVal function reference (TAG_FN)
+// and metadata for the dispatch.
+typedef struct {
+    int in_use;
+    HexaVal hexa_fn;        // The hexa function value (TAG_FN)
+    void* fn_ptr;           // The C trampoline pointer for this slot
+    int expected_argc;      // How many C args the trampoline receives
+} HexaCallbackSlot;
+
+static HexaCallbackSlot __hexa_cb_slots[HEXA_TRAMPOLINE_POOL_SIZE];
+
+// User-supplied dispatch hook: the interpreter or compiled code sets this.
+// Signature: dispatch(slot_id, argc, args[]) -> HexaVal
+// For compiled code, this is wired at link time.
+// For interpreter, the interpreter sets this to its own dispatcher.
+typedef HexaVal (*hexa_cb_dispatch_fn)(int slot_id, int argc, int64_t* args);
+static hexa_cb_dispatch_fn __hexa_cb_dispatcher = NULL;
+
+void hexa_set_callback_dispatcher(hexa_cb_dispatch_fn fn) {
+    __hexa_cb_dispatcher = fn;
+}
+
+// Internal dispatch: called by every trampoline.
+// Converts raw C int64 args back to HexaVal and calls the registered function.
+static int64_t hexa_trampoline_dispatch(int slot_id, int argc, int64_t* args) {
+    if (slot_id < 0 || slot_id >= HEXA_TRAMPOLINE_POOL_SIZE) return 0;
+    if (!__hexa_cb_slots[slot_id].in_use) return 0;
+
+    // If a custom dispatcher is set (e.g. interpreter), use it
+    if (__hexa_cb_dispatcher) {
+        HexaVal result = __hexa_cb_dispatcher(slot_id, argc, args);
+        if (result.tag == TAG_INT) return result.i;
+        if (result.tag == TAG_FLOAT) { union { double d; int64_t i; } u; u.d = result.f; return u.i; }
+        return 0;
+    }
+
+    // For compiled code: call the fn_ptr stored in the slot directly.
+    // Compiled hexa functions take HexaVal args and return HexaVal.
+    // We wrap each raw int64 arg as hexa_int() before calling.
+    HexaCallbackSlot* slot = &__hexa_cb_slots[slot_id];
+    if (slot->hexa_fn.tag == TAG_FN && slot->hexa_fn.fn.fn_ptr) {
+        typedef HexaVal (*HFn0)(void);
+        typedef HexaVal (*HFn1)(HexaVal);
+        typedef HexaVal (*HFn2)(HexaVal, HexaVal);
+        typedef HexaVal (*HFn3)(HexaVal, HexaVal, HexaVal);
+        typedef HexaVal (*HFn4)(HexaVal, HexaVal, HexaVal, HexaVal);
+        void* fp = slot->hexa_fn.fn.fn_ptr;
+        HexaVal result;
+        switch (argc) {
+            case 0: result = ((HFn0)fp)(); break;
+            case 1: result = ((HFn1)fp)(hexa_int(args[0])); break;
+            case 2: result = ((HFn2)fp)(hexa_int(args[0]), hexa_int(args[1])); break;
+            case 3: result = ((HFn3)fp)(hexa_int(args[0]), hexa_int(args[1]), hexa_int(args[2])); break;
+            default: result = ((HFn4)fp)(hexa_int(args[0]), hexa_int(args[1]), hexa_int(args[2]), hexa_int(args[3])); break;
+        }
+        if (result.tag == TAG_INT) return result.i;
+        if (result.tag == TAG_FLOAT) { union { double d; int64_t i; } u; u.d = result.f; return u.i; }
+        return 0;
+    }
+    return 0;
+}
+
+// ── 16 static trampoline functions ──────────────────────
+// Each takes up to 4 int64_t args (covers qsort comparator, ObjC IMP,
+// NSTimer callback, etc.). Extra args beyond 4 are passed as 0.
+// For Cocoa IMP: (id self, SEL _cmd, ...) = 2-3 pointer-sized args.
+
+#define TRAMP_DEF(N) \
+static int64_t _hexa_tramp_##N(int64_t a0, int64_t a1, int64_t a2, int64_t a3) { \
+    int64_t args[4] = {a0, a1, a2, a3}; \
+    return hexa_trampoline_dispatch(N, 4, args); \
+}
+
+TRAMP_DEF(0)  TRAMP_DEF(1)  TRAMP_DEF(2)  TRAMP_DEF(3)
+TRAMP_DEF(4)  TRAMP_DEF(5)  TRAMP_DEF(6)  TRAMP_DEF(7)
+TRAMP_DEF(8)  TRAMP_DEF(9)  TRAMP_DEF(10) TRAMP_DEF(11)
+TRAMP_DEF(12) TRAMP_DEF(13) TRAMP_DEF(14) TRAMP_DEF(15)
+
+typedef int64_t (*tramp_fn_t)(int64_t, int64_t, int64_t, int64_t);
+
+static tramp_fn_t __hexa_tramp_table[HEXA_TRAMPOLINE_POOL_SIZE] = {
+    _hexa_tramp_0,  _hexa_tramp_1,  _hexa_tramp_2,  _hexa_tramp_3,
+    _hexa_tramp_4,  _hexa_tramp_5,  _hexa_tramp_6,  _hexa_tramp_7,
+    _hexa_tramp_8,  _hexa_tramp_9,  _hexa_tramp_10, _hexa_tramp_11,
+    _hexa_tramp_12, _hexa_tramp_13, _hexa_tramp_14, _hexa_tramp_15
+};
+
+// Initialize trampoline pool (call once at startup)
+static void hexa_trampoline_init(void) {
+    for (int i = 0; i < HEXA_TRAMPOLINE_POOL_SIZE; i++) {
+        __hexa_cb_slots[i].in_use = 0;
+        __hexa_cb_slots[i].fn_ptr = (void*)__hexa_tramp_table[i];
+        __hexa_cb_slots[i].hexa_fn = hexa_void();
+        __hexa_cb_slots[i].expected_argc = 0;
+    }
+}
+
+// ── Public API ──────────────────────────────────────────
+
+// callback_create(hexa_fn_val) -> int (C function pointer as integer)
+// Allocates a trampoline slot and returns the C function pointer.
+HexaVal hexa_callback_create(HexaVal fn_val) {
+    // Lazy init
+    static int inited = 0;
+    if (!inited) { hexa_trampoline_init(); inited = 1; }
+
+    for (int i = 0; i < HEXA_TRAMPOLINE_POOL_SIZE; i++) {
+        if (!__hexa_cb_slots[i].in_use) {
+            __hexa_cb_slots[i].in_use = 1;
+            __hexa_cb_slots[i].hexa_fn = fn_val;
+            return hexa_int((int64_t)(uintptr_t)__hexa_cb_slots[i].fn_ptr);
+        }
+    }
+    fprintf(stderr, "[hexa-callback] trampoline pool exhausted (%d slots)\n",
+            HEXA_TRAMPOLINE_POOL_SIZE);
+    return hexa_int(0);
+}
+
+// callback_free(ptr) -> void
+// Frees the trampoline slot associated with the given C function pointer.
+HexaVal hexa_callback_free(HexaVal ptr) {
+    int64_t p = (ptr.tag == TAG_INT) ? ptr.i : 0;
+    for (int i = 0; i < HEXA_TRAMPOLINE_POOL_SIZE; i++) {
+        if ((int64_t)(uintptr_t)__hexa_cb_slots[i].fn_ptr == p) {
+            __hexa_cb_slots[i].in_use = 0;
+            __hexa_cb_slots[i].hexa_fn = hexa_void();
+            return hexa_void();
+        }
+    }
+    return hexa_void();
+}
+
+// callback_slot_id(ptr) -> int
+// Returns the slot index for a given trampoline pointer (-1 if not found).
+HexaVal hexa_callback_slot_id(HexaVal ptr) {
+    int64_t p = (ptr.tag == TAG_INT) ? ptr.i : 0;
+    for (int i = 0; i < HEXA_TRAMPOLINE_POOL_SIZE; i++) {
+        if ((int64_t)(uintptr_t)__hexa_cb_slots[i].fn_ptr == p) {
+            return hexa_int(i);
+        }
+    }
+    return hexa_int(-1);
+}
+
+// callback_get_fn(slot_id) -> HexaVal
+// Returns the hexa function registered at the given slot.
+HexaVal hexa_callback_get_fn(int slot_id) {
+    if (slot_id < 0 || slot_id >= HEXA_TRAMPOLINE_POOL_SIZE) return hexa_void();
+    if (!__hexa_cb_slots[slot_id].in_use) return hexa_void();
+    return __hexa_cb_slots[slot_id].hexa_fn;
 }

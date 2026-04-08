@@ -15,12 +15,23 @@ fn codegen_c2(ast) {
     let mut fn_parts = []
     let mut main_parts = []
 
+    // Track extern fn declarations for call codegen
+    let mut extern_fns = []
+
     let mut i = 0
     while i < len(ast) {
         let k = ast[i].kind
         if k == "FnDecl" {
             fwd_parts = fwd_parts.push(gen2_fn_forward(ast[i]) + "\n")
             fn_parts = fn_parts.push(gen2_fn_decl(ast[i]) + "\n\n")
+        } else if k == "ExternFnDecl" {
+            // Generate extern FFI wrapper
+            extern_fns = extern_fns.push(ast[i].name)
+            let ew = gen2_extern_wrapper(ast[i])
+            global_parts = global_parts.push(ew.global)
+            fwd_parts = fwd_parts.push(ew.forward + "\n")
+            fn_parts = fn_parts.push(ew.fn_code + "\n\n")
+            main_parts = main_parts.push(ew.init)
         } else if k == "StructDecl" {
             fn_parts = fn_parts.push(gen2_struct_decl(ast[i]) + "\n\n")
         } else if k == "EnumDecl" {
@@ -81,6 +92,168 @@ fn gen2_fn_decl(node) {
     }
     out = out + "    return hexa_void();\n}\n"
     return out
+}
+
+// ── Extern FFI wrapper generation ────────────────────────
+// Returns a map with: global, forward, impl, init
+//
+// G3: Float argument support — when any param has type Float, generates a
+// typed C wrapper so the C compiler puts doubles in SIMD registers (d0-d7)
+// instead of integer registers (x0-x7) on ARM64.
+//
+// Example: extern fn foo(a: Int, b: Float) -> Int  generates:
+//   typedef int64_t (*__ffi_ftyp_foo)(int64_t, double);
+//   HexaVal foo(HexaVal a, HexaVal b) {
+//       int64_t __r = ((__ffi_ftyp_foo)__ffi_sym_foo)(a.i, b.f);
+//       return hexa_int(__r);
+//   }
+//
+// For Cocoa NSRect: @symbol("objc_msgSend") extern fn send_rect(obj, sel, x: Float, y: Float, w: Float, h: Float) -> *Void
+//   typedef int64_t (*__ffi_ftyp_send_rect)(int64_t, int64_t, double, double, double, double);
+//   — C compiler puts ptr args in x0-x1 and doubles in d0-d3 automatically.
+
+fn gen2_extern_ret_kind(ret_type) {
+    if ret_type == "Void" || ret_type == "void" || ret_type == "" { return "0" }
+    if ret_type == "Int" || ret_type == "int" { return "1" }
+    if ret_type == "Float" || ret_type == "float" { return "2" }
+    if ret_type == "Bool" || ret_type == "bool" { return "3" }
+    return "4" // pointer types
+}
+
+// Map a hexa param type to a C type for the typed FFI typedef
+fn gen2_ffi_c_type(typ) {
+    if typ == "Float" || typ == "float" { return "double" }
+    return "int64_t" // Int, Bool, pointers, *Void, untyped — all as int64_t
+}
+
+// Map a hexa return type to the C return type
+fn gen2_ffi_c_ret_type(ret_type) {
+    if ret_type == "Void" || ret_type == "void" || ret_type == "" { return "void" }
+    if ret_type == "Float" || ret_type == "float" { return "double" }
+    return "int64_t"
+}
+
+// Check if any param has Float type — determines if typed dispatch is needed
+fn gen2_has_float_param(params) {
+    let mut i = 0
+    while i < len(params) {
+        let t = params[i].value
+        if t == "Float" || t == "float" { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+// Marshal a HexaVal arg to the correct C type for typed FFI call
+fn gen2_ffi_marshal_arg(param_name, param_type) {
+    if param_type == "Float" || param_type == "float" {
+        return "(" + param_name + ".tag==TAG_FLOAT?" + param_name + ".f:(double)" + param_name + ".i)"
+    }
+    // For int/pointer/untyped: extract as int64_t
+    return "(" + param_name + ".tag==TAG_INT?" + param_name + ".i:(int64_t)" + param_name + ".f)"
+}
+
+// Wrap the raw C return value back into HexaVal
+fn gen2_ffi_wrap_ret(ret_type, var_name) {
+    if ret_type == "Void" || ret_type == "void" || ret_type == "" {
+        return "hexa_void()"
+    }
+    if ret_type == "Float" || ret_type == "float" {
+        return "hexa_float(" + var_name + ")"
+    }
+    if ret_type == "Bool" || ret_type == "bool" {
+        return "hexa_bool(" + var_name + " != 0)"
+    }
+    return "hexa_int(" + var_name + ")"
+}
+
+fn gen2_extern_wrapper(node) {
+    let name = node.name
+    let nargs = len(node.params)
+    let ret_type = node.ret_type
+
+    // Resolve @symbol("c_name") alias — use node.value if set, else node.name
+    let mut c_sym = node.value
+    if c_sym == "" { c_sym = name }
+
+    // Global: symbol pointer
+    let global = "static void* __ffi_sym_" + name + " = NULL;\n"
+
+    // Forward declaration (hexa wrapper takes HexaVal args)
+    let mut fwd_params = []
+    let mut fi = 0
+    while fi < nargs {
+        fwd_params = fwd_params.push("HexaVal " + node.params[fi].name)
+        fi = fi + 1
+    }
+    let fwd_p = fwd_params.join(", ")
+    let mut sig_p = fwd_p
+    if sig_p == "" { sig_p = "void" }
+    let forward = "HexaVal " + name + "(" + sig_p + ");"
+
+    let has_float = gen2_has_float_param(node.params)
+
+    let mut impl_code = ""
+
+    if has_float == 1 || nargs > 0 {
+        // ── G3: Typed dispatch — generate a typedef + direct typed call ──
+        // This ensures the C compiler puts float args in SIMD registers (d0-d7)
+        // and integer/pointer args in GPRs (x0-x7) on ARM64.
+
+        // Build typedef: e.g. typedef int64_t (*__ffi_ftyp_foo)(int64_t, double, double);
+        let c_ret = gen2_ffi_c_ret_type(ret_type)
+        let mut typedef_params = []
+        let mut ti = 0
+        while ti < nargs {
+            typedef_params = typedef_params.push(gen2_ffi_c_type(node.params[ti].value))
+            ti = ti + 1
+        }
+        let td_p = typedef_params.join(", ")
+        let mut td_sig = td_p
+        if td_sig == "" { td_sig = "void" }
+
+        impl_code = "typedef " + c_ret + " (*__ffi_ftyp_" + name + ")(" + td_sig + ");\n"
+        impl_code = impl_code + "HexaVal " + name + "(" + sig_p + ") {\n"
+
+        // Marshal each arg to its native C type
+        let mut call_args = []
+        let mut ci = 0
+        while ci < nargs {
+            call_args = call_args.push(gen2_ffi_marshal_arg(node.params[ci].name, node.params[ci].value))
+            ci = ci + 1
+        }
+        let call_str = call_args.join(", ")
+
+        if ret_type == "Void" || ret_type == "void" || ret_type == "" {
+            impl_code = impl_code + "    ((__ffi_ftyp_" + name + ")__ffi_sym_" + name + ")(" + call_str + ");\n"
+            impl_code = impl_code + "    return hexa_void();\n"
+        } else {
+            impl_code = impl_code + "    " + c_ret + " __r = ((__ffi_ftyp_" + name + ")__ffi_sym_" + name + ")(" + call_str + ");\n"
+            impl_code = impl_code + "    return " + gen2_ffi_wrap_ret(ret_type, "__r") + ";\n"
+        }
+        impl_code = impl_code + "}\n"
+    } else {
+        // 0-arg function — use simple hexa_extern_call
+        impl_code = "HexaVal " + name + "(" + sig_p + ") {\n"
+        impl_code = impl_code + "    return hexa_extern_call(__ffi_sym_" + name + ", NULL, 0, " + gen2_extern_ret_kind(ret_type) + ");\n"
+        impl_code = impl_code + "}\n"
+    }
+
+    // Init: dlopen + dlsym in main() — use @symbol C name and @link library
+    let mut lib_arg = "NULL"
+    if node.op != "" {
+        lib_arg = "\"" + node.op + "\""
+    }
+    let init = "    __ffi_sym_" + name + " = hexa_ffi_dlsym(hexa_ffi_dlopen(" + lib_arg + "), \"" + c_sym + "\");\n"
+
+    return #{
+        "global": global, "forward": forward, "fn_code": impl_code, "init": init,
+        "kind": "", "name": "", "value": "", "op": "",
+        "left": "", "right": "", "cond": "", "then_body": "", "else_body": "",
+        "params": "", "body": "", "args": "", "fields": "", "items": "",
+        "variants": "", "arms": "", "iter_expr": "", "ret_type": "",
+        "target": "", "trait_name": "", "methods": ""
+    }
 }
 
 fn gen2_indent(n) {
@@ -493,6 +666,110 @@ fn gen2_expr(node) {
             if name == "write_file" {
                 return "hexa_write_file(" + gen2_expr(node.args[0]) + ", " + gen2_expr(node.args[1]) + ")"
             }
+            // FFI helper builtins
+            if name == "cstring" {
+                return "hexa_cstring(" + gen2_expr(node.args[0]) + ")"
+            }
+            if name == "from_cstring" {
+                return "hexa_from_cstring(" + gen2_expr(node.args[0]) + ")"
+            }
+            if name == "ptr_null" {
+                return "hexa_ptr_null()"
+            }
+            if name == "ptr_addr" {
+                return "hexa_ptr_addr(" + gen2_expr(node.args[0]) + ")"
+            }
+            // G4: Callback trampoline builtins
+            if name == "callback_create" {
+                // The argument is a function name — wrap it as a TAG_FN HexaVal
+                // so runtime can call it back through the trampoline.
+                let arg = node.args[0]
+                if type_of(arg) != "string" && arg.kind == "Ident" {
+                    let fn_name = arg.name
+                    return "hexa_callback_create((HexaVal){.tag=TAG_FN, .fn={.fn_ptr=(void*)" + fn_name + ", .arity=0}})"
+                }
+                return "hexa_callback_create(" + gen2_expr(node.args[0]) + ")"
+            }
+            if name == "callback_free" {
+                return "hexa_callback_free(" + gen2_expr(node.args[0]) + ")"
+            }
+            if name == "callback_slot_id" {
+                return "hexa_callback_slot_id(" + gen2_expr(node.args[0]) + ")"
+            }
+            // G5: Pointer arithmetic builtins
+            if name == "ptr_alloc" {
+                return "hexa_ptr_alloc(" + gen2_expr(node.args[0]) + ")"
+            }
+            if name == "ptr_free" {
+                return "hexa_ptr_free(" + gen2_expr(node.args[0]) + ", " + gen2_expr(node.args[1]) + ")"
+            }
+            if name == "ptr_write" {
+                return "hexa_ptr_write(" + gen2_expr(node.args[0]) + ", " + gen2_expr(node.args[1]) + ", " + gen2_expr(node.args[2]) + ")"
+            }
+            if name == "ptr_write_f32" {
+                return "hexa_ptr_write_f32(" + gen2_expr(node.args[0]) + ", " + gen2_expr(node.args[1]) + ", " + gen2_expr(node.args[2]) + ")"
+            }
+            if name == "ptr_write_i32" {
+                return "hexa_ptr_write_i32(" + gen2_expr(node.args[0]) + ", " + gen2_expr(node.args[1]) + ", " + gen2_expr(node.args[2]) + ")"
+            }
+            if name == "ptr_read" {
+                return "hexa_ptr_read(" + gen2_expr(node.args[0]) + ", " + gen2_expr(node.args[1]) + ")"
+            }
+            if name == "ptr_read_f64" {
+                return "hexa_ptr_read_f64(" + gen2_expr(node.args[0]) + ", " + gen2_expr(node.args[1]) + ")"
+            }
+            if name == "ptr_read_f32" {
+                return "hexa_ptr_read_f32(" + gen2_expr(node.args[0]) + ", " + gen2_expr(node.args[1]) + ")"
+            }
+            if name == "ptr_read_i32" {
+                return "hexa_ptr_read_i32(" + gen2_expr(node.args[0]) + ", " + gen2_expr(node.args[1]) + ")"
+            }
+            if name == "ptr_offset" {
+                return "hexa_ptr_offset(" + gen2_expr(node.args[0]) + ", " + gen2_expr(node.args[1]) + ")"
+            }
+            if name == "deref" {
+                return "hexa_deref(" + gen2_expr(node.args[0]) + ")"
+            }
+            // G2: Struct packing builtins
+            if name == "struct_pack" {
+                // Variadic: pack all args as f64 into heap buffer
+                let mut a_strs = []
+                let mut si = 0
+                while si < len(node.args) {
+                    a_strs = a_strs.push(gen2_expr(node.args[si]))
+                    si = si + 1
+                }
+                let n = to_string(len(node.args))
+                return "hexa_struct_pack((HexaVal[]){" + a_strs.join(", ") + "}, " + n + ")"
+            }
+            if name == "struct_pack_f32" {
+                let mut a_strs = []
+                let mut si = 0
+                while si < len(node.args) {
+                    a_strs = a_strs.push(gen2_expr(node.args[si]))
+                    si = si + 1
+                }
+                let n = to_string(len(node.args))
+                return "hexa_struct_pack_f32((HexaVal[]){" + a_strs.join(", ") + "}, " + n + ")"
+            }
+            if name == "struct_unpack" {
+                return "hexa_struct_unpack(" + gen2_expr(node.args[0]) + ", " + gen2_expr(node.args[1]) + ")"
+            }
+            if name == "struct_unpack_f32" {
+                return "hexa_struct_unpack_f32(" + gen2_expr(node.args[0]) + ", " + gen2_expr(node.args[1]) + ")"
+            }
+            if name == "struct_rect" {
+                return "hexa_struct_rect(" + gen2_expr(node.args[0]) + ", " + gen2_expr(node.args[1]) + ", " + gen2_expr(node.args[2]) + ", " + gen2_expr(node.args[3]) + ")"
+            }
+            if name == "struct_point" {
+                return "hexa_struct_point(" + gen2_expr(node.args[0]) + ", " + gen2_expr(node.args[1]) + ")"
+            }
+            if name == "struct_size" {
+                return "hexa_struct_size_pack(" + gen2_expr(node.args[0]) + ", " + gen2_expr(node.args[1]) + ")"
+            }
+            if name == "struct_free" {
+                return "hexa_struct_free(" + gen2_expr(node.args[0]) + ")"
+            }
             // User function call
             let mut arg_strs = []
             let mut ai = 0
@@ -866,6 +1143,7 @@ fn codegen_c2_full(ast) {
 
     // Forward declarations
     let mut fwd = ""
+    let mut global_code = ""
     let mut fn_code = ""
     let mut main_code = ""
 
@@ -875,6 +1153,12 @@ fn codegen_c2_full(ast) {
         if k == "FnDecl" {
             fwd = fwd + gen2_fn_forward(ast[i]) + "\n"
             fn_code = fn_code + gen2_fn_decl(ast[i]) + "\n\n"
+        } else if k == "ExternFnDecl" {
+            let ew = gen2_extern_wrapper(ast[i])
+            global_code = global_code + ew.global
+            fwd = fwd + ew.forward + "\n"
+            fn_code = fn_code + ew.fn_code + "\n\n"
+            main_code = main_code + ew.init
         } else if k == "StructDecl" {
             fn_code = fn_code + gen2_struct_decl(ast[i]) + "\n\n"
         } else if k == "EnumDecl" {
@@ -888,6 +1172,7 @@ fn codegen_c2_full(ast) {
     }
 
     out = out + fwd + "\n"
+    out = out + global_code + "\n"
     // Insert lambda definitions before user functions
     out = out + _lambda_defs
     out = out + fn_code
