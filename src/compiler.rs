@@ -883,6 +883,7 @@ fn is_builtin(name: &str) -> bool {
         | "sigma" | "phi" | "tau" | "gcd"
         | "abs" | "min" | "max" | "floor" | "ceil" | "round"
         | "sqrt" | "pow" | "log" | "log2" | "log10" | "ln" | "exp" | "sin" | "cos" | "tan"
+        | "asin" | "acos" | "atan" | "atan2"
         | "to_string" | "to_int" | "to_float"
         | "format" | "clock"
     )
