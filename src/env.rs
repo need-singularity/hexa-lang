@@ -52,6 +52,8 @@ pub enum Value {
     Atomic(std::sync::Arc<crate::atomic_ops::AtomicValue>),
     /// Raw pointer for extern FFI (C interop).
     Pointer(u64),
+    /// Arbitrary-precision integer (I6 bigint support).
+    BigInt(Box<num_bigint::BigInt>),
 }
 
 impl Value {
@@ -142,6 +144,7 @@ impl std::fmt::Display for Value {
             }
             Value::Atomic(av) => write!(f, "{}", av.load()),
             Value::Pointer(addr) => write!(f, "<ptr 0x{:x}>", addr),
+            Value::BigInt(n) => write!(f, "{}", n),
         }
     }
 }
@@ -196,6 +199,7 @@ impl Env {
         env.define_builtin("phi", Value::BuiltinFn("phi".into()));
         env.define_builtin("tau", Value::BuiltinFn("tau".into()));
         env.define_builtin("gcd", Value::BuiltinFn("gcd".into()));
+        env.define_builtin("bigint", Value::BuiltinFn("bigint".into()));
         env.define_builtin("read_file", Value::BuiltinFn("read_file".into()));
         env.define_builtin("write_file", Value::BuiltinFn("write_file".into()));
         env.define_builtin("file_exists", Value::BuiltinFn("file_exists".into()));

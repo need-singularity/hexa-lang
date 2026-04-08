@@ -1412,9 +1412,18 @@ impl Interpreter {
                 let r = self.eval_expr(right)?;
                 // Inline fast path for Int operations (dominates fib-like workloads)
                 match (&l, op, &r) {
-                    (Value::Int(a), BinOp::Add, Value::Int(b)) => Ok(Value::Int(a + b)),
-                    (Value::Int(a), BinOp::Sub, Value::Int(b)) => Ok(Value::Int(a - b)),
-                    (Value::Int(a), BinOp::Mul, Value::Int(b)) => Ok(Value::Int(a * b)),
+                    (Value::Int(a), BinOp::Add, Value::Int(b)) => match a.checked_add(*b) {
+                        Some(v) => Ok(Value::Int(v)),
+                        None => Ok(Value::BigInt(Box::new(num_bigint::BigInt::from(*a) + num_bigint::BigInt::from(*b)))),
+                    },
+                    (Value::Int(a), BinOp::Sub, Value::Int(b)) => match a.checked_sub(*b) {
+                        Some(v) => Ok(Value::Int(v)),
+                        None => Ok(Value::BigInt(Box::new(num_bigint::BigInt::from(*a) - num_bigint::BigInt::from(*b)))),
+                    },
+                    (Value::Int(a), BinOp::Mul, Value::Int(b)) => match a.checked_mul(*b) {
+                        Some(v) => Ok(Value::Int(v)),
+                        None => Ok(Value::BigInt(Box::new(num_bigint::BigInt::from(*a) * num_bigint::BigInt::from(*b)))),
+                    },
                     (Value::Int(a), BinOp::Lt, Value::Int(b)) => Ok(Value::Bool(a < b)),
                     (Value::Int(a), BinOp::Le, Value::Int(b)) => Ok(Value::Bool(a <= b)),
                     (Value::Int(a), BinOp::Gt, Value::Int(b)) => Ok(Value::Bool(a > b)),
@@ -2320,11 +2329,62 @@ impl Interpreter {
             _ => (left, right),
         };
 
+        // BigInt promotion: if either side is BigInt (or Int+BigInt), do arbitrary-precision arithmetic.
+        {
+            use num_bigint::BigInt as BI;
+            let to_big = |v: &Value| -> Option<BI> {
+                match v {
+                    Value::BigInt(b) => Some((**b).clone()),
+                    Value::Int(i) => Some(BI::from(*i)),
+                    _ => None,
+                }
+            };
+            let either_big = matches!(&left, Value::BigInt(_)) || matches!(&right, Value::BigInt(_));
+            if either_big {
+                if let (Some(a), Some(b)) = (to_big(&left), to_big(&right)) {
+                    match op {
+                        BinOp::Add => return Ok(Value::BigInt(Box::new(a + b))),
+                        BinOp::Sub => return Ok(Value::BigInt(Box::new(a - b))),
+                        BinOp::Mul => return Ok(Value::BigInt(Box::new(a * b))),
+                        BinOp::Div => {
+                            if b == BI::from(0) { return Err(self.runtime_err("division by zero".into())); }
+                            return Ok(Value::BigInt(Box::new(a / b)));
+                        }
+                        BinOp::Rem => {
+                            if b == BI::from(0) { return Err(self.runtime_err("division by zero".into())); }
+                            return Ok(Value::BigInt(Box::new(a % b)));
+                        }
+                        BinOp::Pow => {
+                            use num_traits::ToPrimitive;
+                            let exp = b.to_u32().ok_or_else(|| self.runtime_err("bigint pow exponent out of range".into()))?;
+                            return Ok(Value::BigInt(Box::new(a.pow(exp))));
+                        }
+                        BinOp::Eq => return Ok(Value::Bool(a == b)),
+                        BinOp::Ne => return Ok(Value::Bool(a != b)),
+                        BinOp::Lt => return Ok(Value::Bool(a < b)),
+                        BinOp::Le => return Ok(Value::Bool(a <= b)),
+                        BinOp::Gt => return Ok(Value::Bool(a > b)),
+                        BinOp::Ge => return Ok(Value::Bool(a >= b)),
+                        _ => {}
+                    }
+                }
+            }
+        }
+
         match (&left, op, &right) {
-            // Int arithmetic
-            (Value::Int(a), BinOp::Add, Value::Int(b)) => Ok(Value::Int(a + b)),
-            (Value::Int(a), BinOp::Sub, Value::Int(b)) => Ok(Value::Int(a - b)),
-            (Value::Int(a), BinOp::Mul, Value::Int(b)) => Ok(Value::Int(a * b)),
+            // Int arithmetic (with overflow → BigInt promotion)
+            (Value::Int(a), BinOp::Add, Value::Int(b)) => match a.checked_add(*b) {
+                Some(v) => Ok(Value::Int(v)),
+                None => Ok(Value::BigInt(Box::new(num_bigint::BigInt::from(*a) + num_bigint::BigInt::from(*b)))),
+            },
+            (Value::Int(a), BinOp::Sub, Value::Int(b)) => match a.checked_sub(*b) {
+                Some(v) => Ok(Value::Int(v)),
+                None => Ok(Value::BigInt(Box::new(num_bigint::BigInt::from(*a) - num_bigint::BigInt::from(*b)))),
+            },
+            (Value::Int(a), BinOp::Mul, Value::Int(b)) => match a.checked_mul(*b) {
+                Some(v) => Ok(Value::Int(v)),
+                None => Ok(Value::BigInt(Box::new(num_bigint::BigInt::from(*a) * num_bigint::BigInt::from(*b)))),
+            },
             (Value::Int(a), BinOp::Div, Value::Int(b)) => {
                 if *b == 0 {
                     Err(self.runtime_err("division by zero".into()))
@@ -3433,6 +3493,7 @@ impl Interpreter {
                         Value::AsyncFuture(_) => "future",
                         Value::Atomic(_) => "atomic",
                         Value::Pointer(_) => "pointer",
+                        Value::BigInt(_) => "bigint",
                     }
                     .to_string(),
                 ))
@@ -3493,6 +3554,23 @@ impl Interpreter {
                     Ok(Value::Int(gcd(*a, *b)))
                 } else {
                     Err(self.type_err("gcd() requires two ints".into()))
+                }
+            }
+            "bigint" => {
+                if args.is_empty() {
+                    return Err(self.type_err("bigint() requires 1 argument".into()));
+                }
+                match &args[0] {
+                    Value::Int(n) => Ok(Value::BigInt(Box::new(num_bigint::BigInt::from(*n)))),
+                    Value::BigInt(b) => Ok(Value::BigInt(b.clone())),
+                    Value::Str(s) => {
+                        use std::str::FromStr;
+                        match num_bigint::BigInt::from_str(s.trim()) {
+                            Ok(b) => Ok(Value::BigInt(Box::new(b))),
+                            Err(_) => Err(self.type_err(format!("bigint() cannot parse '{}'", s))),
+                        }
+                    }
+                    _ => Err(self.type_err("bigint() requires int or string".into())),
                 }
             }
             "read_file" => {
@@ -8180,6 +8258,7 @@ impl Interpreter {
             Value::AsyncFuture(_) => "future".to_string(),
             Value::Atomic(_) => "atomic".to_string(),
             Value::Pointer(_) => "pointer".to_string(),
+            Value::BigInt(_) => "bigint".to_string(),
         }
     }
 

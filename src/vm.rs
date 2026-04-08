@@ -1081,6 +1081,7 @@ impl VM {
                     Value::AsyncFuture(_) => "future",
                     Value::Atomic(_) => "atomic",
                     Value::Pointer(_) => "pointer",
+                    Value::BigInt(_) => "bigint",
                 };
                 Ok(Value::Str(type_name.to_string()))
             }
