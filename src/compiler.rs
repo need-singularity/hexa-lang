@@ -880,7 +880,7 @@ impl Compiler {
 fn is_builtin(name: &str) -> bool {
     matches!(name,
         "print" | "println" | "eprintln" | "len" | "type_of"
-        | "sigma" | "phi" | "tau" | "gcd"
+        | "sigma" | "phi" | "tau" | "gcd" | "bigint"
         | "abs" | "min" | "max" | "floor" | "ceil" | "round"
         | "sqrt" | "pow" | "log" | "log2" | "log10" | "ln" | "exp" | "sin" | "cos" | "tan"
         | "asin" | "acos" | "atan" | "atan2"

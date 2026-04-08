@@ -826,6 +826,7 @@ pub fn estimate_value_size(val: &crate::env::Value) -> usize {
         Value::AsyncFuture(_) => 32,
         Value::Atomic(_) => 16,
         Value::Pointer(_) => 8,
+        Value::BigInt(b) => 32 + (b.bits() as usize / 8),
     }
 }
 
@@ -855,6 +856,7 @@ pub fn classify_region(val: &crate::env::Value) -> MemRegion {
         Value::AsyncFuture(_) => MemRegion::Heap,
         Value::Atomic(_) => MemRegion::Heap,
         Value::Pointer(_) => MemRegion::Stack,
+        Value::BigInt(_) => MemRegion::Heap,
     }
 }
 
