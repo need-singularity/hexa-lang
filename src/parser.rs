@@ -86,7 +86,7 @@ impl Parser {
     }
 
     fn skip_newlines(&mut self) {
-        while matches!(self.peek(), Token::Newline) {
+        while matches!(self.peek(), Token::Newline | Token::Semicolon) {
             self.advance();
         }
     }
@@ -1915,11 +1915,14 @@ impl Parser {
             }
             Token::LBracket => {
                 self.advance();
+                self.skip_newlines();
                 let mut items = Vec::new();
                 while !matches!(self.peek(), Token::RBracket | Token::Eof) {
                     items.push(self.parse_expr()?);
+                    self.skip_newlines();
                     if matches!(self.peek(), Token::Comma) {
                         self.advance();
+                        self.skip_newlines();
                     }
                 }
                 self.expect(&Token::RBracket)?;
