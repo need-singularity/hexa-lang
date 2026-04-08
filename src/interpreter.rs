@@ -6,6 +6,8 @@ use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
 #[cfg(not(target_arch = "wasm32"))]
 use std::thread;
+#[cfg(not(target_arch = "wasm32"))]
+use rayon::prelude::*;
 use crate::ast::*;
 use crate::env::{Env, Value};
 use crate::error::{HexaError, ErrorClass};
@@ -26,6 +28,46 @@ const THROW_SENTINEL: &str = "__hexa_throw__";
 const BREAK_SENTINEL: &str = "__hexa_break__";
 const CONTINUE_SENTINEL: &str = "__hexa_continue__";
 
+/// Zero-copy f64 slice extraction from Value::Tensor or Value::Array.
+/// Tensor path borrows directly; Array path extracts into an owned Vec.
+enum FloatSlice<'a> {
+    Borrowed(&'a [f64]),
+    Owned(Vec<f64>),
+}
+
+impl<'a> FloatSlice<'a> {
+    #[inline]
+    fn as_slice(&self) -> &[f64] {
+        match self {
+            FloatSlice::Borrowed(s) => s,
+            FloatSlice::Owned(v) => v.as_slice(),
+        }
+    }
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            FloatSlice::Borrowed(s) => s.len(),
+            FloatSlice::Owned(v) => v.len(),
+        }
+    }
+}
+
+/// Extract an f64 slice from a Value (Tensor → zero-copy borrow, Array → owned extract).
+fn to_f64_slice(val: &Value) -> Option<FloatSlice> {
+    match val {
+        Value::Tensor(t) => Some(FloatSlice::Borrowed(&t.data)),
+        Value::Array(a) => Some(FloatSlice::Owned(
+            a.iter()
+                .map(|v| match v {
+                    Value::Float(f) => *f,
+                    Value::Int(x) => *x as f64,
+                    _ => 0.0,
+                })
+                .collect(),
+        )),
+        _ => None,
+    }
+}
 
 /// Fast structural hash for Value — avoids format!("{:?}") heap allocation.
 #[inline]
@@ -3451,7 +3493,8 @@ impl Interpreter {
                     Value::Str(s) => Ok(Value::Int(s.len() as i64)),
                     Value::Array(a) => Ok(Value::Int(a.len() as i64)),
                     Value::Map(m) => Ok(Value::Int(m.len() as i64)),
-                    _ => Err(self.type_err("len() requires string, array, or map".into())),
+                    Value::Tensor(t) => Ok(Value::Int(t.data.len() as i64)),
+                    _ => Err(self.type_err("len() requires string, array, map, or tensor".into())),
                 }
             }
             "type_of" => {
@@ -3494,6 +3537,7 @@ impl Interpreter {
                         Value::Atomic(_) => "atomic",
                         Value::Pointer(_) => "pointer",
                         Value::BigInt(_) => "bigint",
+                        Value::Tensor(_) => "tensor",
                     }
                     .to_string(),
                 ))
@@ -3645,6 +3689,70 @@ impl Interpreter {
                             Ok(Value::Array(vec![Value::Array(names), Value::Array(tensors)]))
                         }
                         _ => Err(self.type_err("load_weights_bin() requires string path".into())),
+                    }
+                }
+            }
+            "mmap_weights" => {
+                // mmap_weights(path) → [names_array, tensors_array]
+                // Same HEXAW binary format as load_weights_bin, but uses memory-mapped I/O
+                // to avoid reading the entire file into a Vec<u8> — reduces RAM from ~1.7GB to ~50MB
+                #[cfg(target_arch = "wasm32")]
+                { return Err(self.runtime_err("mmap_weights not supported in WASM".into())); }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    if args.is_empty() { return Err(self.type_err("mmap_weights() requires 1 argument".into())); }
+                    match &args[0] {
+                        Value::Str(path) => {
+                            use memmap2::Mmap;
+                            let file = match std::fs::File::open(path) {
+                                Ok(f) => f,
+                                Err(e) => return Err(self.runtime_err(format!("mmap_weights: {}", e))),
+                            };
+                            let mmap = unsafe { Mmap::map(&file) }
+                                .map_err(|e| self.runtime_err(format!("mmap_weights mmap: {}", e)))?;
+                            let data = &mmap[..];
+                            if data.len() < 14 || &data[0..6] != b"HEXAW\0" {
+                                return Err(self.runtime_err("invalid HEXAW header".into()));
+                            }
+                            let mut pos = 6usize;
+                            let _version = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap());
+                            pos += 4;
+                            let n_tensors = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
+                            pos += 4;
+                            let mut names = Vec::with_capacity(n_tensors);
+                            let mut tensors = Vec::with_capacity(n_tensors);
+                            for _ in 0..n_tensors {
+                                if pos + 4 > data.len() { break; }
+                                let name_len = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
+                                pos += 4;
+                                if pos + name_len > data.len() { break; }
+                                let name = String::from_utf8_lossy(&data[pos..pos+name_len]).to_string();
+                                pos += name_len;
+                                if pos + 4 > data.len() { break; }
+                                let ndim = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
+                                pos += 4;
+                                let mut numel = 1usize;
+                                for _ in 0..ndim {
+                                    if pos + 4 > data.len() { break; }
+                                    let s = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
+                                    pos += 4;
+                                    numel *= s;
+                                }
+                                let byte_len = numel * 4;
+                                if pos + byte_len > data.len() { break; }
+                                let mut values = Vec::with_capacity(numel);
+                                for i in 0..numel {
+                                    let offset = pos + i * 4;
+                                    let f = f32::from_le_bytes(data[offset..offset+4].try_into().unwrap());
+                                    values.push(Value::Float(f as f64));
+                                }
+                                pos += byte_len;
+                                names.push(Value::Str(name));
+                                tensors.push(Value::Array(values));
+                            }
+                            Ok(Value::Array(vec![Value::Array(names), Value::Array(tensors)]))
+                        }
+                        _ => Err(self.type_err("mmap_weights() requires string path".into())),
                     }
                 }
             }
@@ -4112,16 +4220,40 @@ impl Interpreter {
                 if args.len() < 5 { return Err(self.type_err("matmul() requires (A, B, M, K, N)".into())); }
                 if let (Value::Array(a), Value::Array(b), Value::Int(m), Value::Int(k), Value::Int(n)) = (&args[0], &args[1], &args[2], &args[3], &args[4]) {
                     let (m, k, n) = (*m as usize, *k as usize, *n as usize);
+                    // Pre-extract to f64 slices for cache-friendly access
+                    let af: Vec<f64> = a.iter().map(|v| match v { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 }).collect();
+                    let bf: Vec<f64> = b.iter().map(|v| match v { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 }).collect();
                     let mut c = vec![0.0f64; m * n];
-                    for i in 0..m {
-                        for j in 0..n {
-                            let mut sum = 0.0f64;
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if m >= 64 {
+                        // Parallel by row using rayon for multi-core acceleration
+                        c.par_chunks_mut(n).enumerate().for_each(|(i, row)| {
                             for p in 0..k {
-                                let av = match &a[i * k + p] { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 };
-                                let bv = match &b[p * n + j] { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 };
-                                sum += av * bv;
+                                let a_val = af[i * k + p];
+                                for j in 0..n {
+                                    row[j] += a_val * bf[p * n + j];
+                                }
                             }
-                            c[i * n + j] = sum;
+                        });
+                    } else {
+                        for i in 0..m {
+                            for p in 0..k {
+                                let a_val = af[i * k + p];
+                                for j in 0..n {
+                                    c[i * n + j] += a_val * bf[p * n + j];
+                                }
+                            }
+                        }
+                    }
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        for i in 0..m {
+                            for p in 0..k {
+                                let a_val = af[i * k + p];
+                                for j in 0..n {
+                                    c[i * n + j] += a_val * bf[p * n + j];
+                                }
+                            }
                         }
                     }
                     Ok(Value::Array(c.into_iter().map(Value::Float).collect()))
@@ -4286,6 +4418,15 @@ impl Interpreter {
                 // hadamard(a, b) → element-wise multiply
                 if args.len() < 2 { return Err(self.type_err("hadamard() requires 2 arrays".into())); }
                 if let (Value::Array(a), Value::Array(b)) = (&args[0], &args[1]) {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if a.len() > 1000 {
+                        let result: Vec<Value> = a.par_iter().zip(b.par_iter()).map(|(x, y)| {
+                            let xf = match x { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                            let yf = match y { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                            Value::Float(xf * yf)
+                        }).collect();
+                        return Ok(Value::Array(result));
+                    }
                     let result: Vec<Value> = a.iter().zip(b.iter()).map(|(x, y)| {
                         let xf = match x { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
                         let yf = match y { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
@@ -4590,10 +4731,20 @@ impl Interpreter {
                 match &args[0] {
                     Value::Float(f) => Ok(Value::Float(compute(*f))),
                     Value::Int(n) => Ok(Value::Float(compute(*n as f64))),
-                    Value::Array(a) => Ok(Value::Array(a.iter().map(|v| {
-                        let x = match v { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
-                        Value::Float(compute(x))
-                    }).collect())),
+                    Value::Array(a) => {
+                        #[cfg(not(target_arch = "wasm32"))]
+                        if a.len() > 1000 {
+                            let result: Vec<Value> = a.par_iter().map(|v| {
+                                let x = match v { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                                Value::Float(compute(x))
+                            }).collect();
+                            return Ok(Value::Array(result));
+                        }
+                        Ok(Value::Array(a.iter().map(|v| {
+                            let x = match v { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                            Value::Float(compute(x))
+                        }).collect()))
+                    }
                     _ => Err(self.type_err("gelu() type error".into())),
                 }
             }
@@ -4604,10 +4755,20 @@ impl Interpreter {
                 match &args[0] {
                     Value::Float(f) => Ok(Value::Float(compute(*f))),
                     Value::Int(n) => Ok(Value::Float(compute(*n as f64))),
-                    Value::Array(a) => Ok(Value::Array(a.iter().map(|v| {
-                        let x = match v { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
-                        Value::Float(compute(x))
-                    }).collect())),
+                    Value::Array(a) => {
+                        #[cfg(not(target_arch = "wasm32"))]
+                        if a.len() > 1000 {
+                            let result: Vec<Value> = a.par_iter().map(|v| {
+                                let x = match v { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                                Value::Float(compute(x))
+                            }).collect();
+                            return Ok(Value::Array(result));
+                        }
+                        Ok(Value::Array(a.iter().map(|v| {
+                            let x = match v { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                            Value::Float(compute(x))
+                        }).collect()))
+                    }
                     _ => Err(self.type_err("silu() type error".into())),
                 }
             }
@@ -5313,6 +5474,22 @@ impl Interpreter {
                     let dim = *dim as usize;
                     let eps = if args.len() > 2 { match &args[2] { Value::Float(f) => *f, _ => 1e-6 } } else { 1e-6 };
                     let n_samples = x.len() / dim;
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if n_samples > 1 && x.len() > 1000 {
+                        let result: Vec<Value> = (0..n_samples).into_par_iter().flat_map(|s| {
+                            let mut sq_sum = 0.0f64;
+                            for d in 0..dim {
+                                let v = match &x[s * dim + d] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                                sq_sum += v * v;
+                            }
+                            let rms = (sq_sum / dim as f64 + eps).sqrt();
+                            (0..dim).map(move |d| {
+                                let v = match &x[s * dim + d] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                                Value::Float(v / rms)
+                            }).collect::<Vec<_>>()
+                        }).collect();
+                        return Ok(Value::Array(result));
+                    }
                     let mut result = Vec::with_capacity(x.len());
                     for s in 0..n_samples {
                         let mut sq_sum = 0.0f64;
@@ -8259,6 +8436,7 @@ impl Interpreter {
             Value::Atomic(_) => "atomic".to_string(),
             Value::Pointer(_) => "pointer".to_string(),
             Value::BigInt(_) => "bigint".to_string(),
+            Value::Tensor(_) => "tensor".to_string(),
         }
     }
 
