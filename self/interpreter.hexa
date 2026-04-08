@@ -1,0 +1,1816 @@
+// ═══════════════════════════════════════════════════════════
+//  self/interpreter.hexa — HEXA interpreter written in HEXA
+//  Phase 2 of self-hosting: execute AST directly
+//  Minimal core: variables, functions, arrays, strings, control flow
+// ═══════════════════════════════════════════════════════════
+
+// ── Value representation ─────────────────────────────────
+// Values are represented as structs with a "type" discriminator.
+// This avoids needing Rust's enum; instead we use tag + fields.
+
+struct Val {
+    tag: string,    // "int", "float", "bool", "str", "char", "void", "array", "fn", "struct", "builtin"
+    int_val: int,
+    float_val: float,
+    bool_val: bool,
+    str_val: string,
+    char_val: string,
+    array_val: string,  // stored as external ref
+    fn_name: string,
+    fn_params: string,
+    fn_body: string,
+    struct_name: string,
+    struct_fields: string
+}
+
+fn val_int(n) { return Val { tag: "int", int_val: n, float_val: 0.0, bool_val: false, str_val: "", char_val: "", array_val: "", fn_name: "", fn_params: "", fn_body: "", struct_name: "", struct_fields: "" } }
+fn val_float(f) { return Val { tag: "float", int_val: 0, float_val: f, bool_val: false, str_val: "", char_val: "", array_val: "", fn_name: "", fn_params: "", fn_body: "", struct_name: "", struct_fields: "" } }
+fn val_bool(b) { return Val { tag: "bool", int_val: 0, float_val: 0.0, bool_val: b, str_val: "", char_val: "", array_val: "", fn_name: "", fn_params: "", fn_body: "", struct_name: "", struct_fields: "" } }
+fn val_str(s) { return Val { tag: "str", int_val: 0, float_val: 0.0, bool_val: false, str_val: s, char_val: "", array_val: "", fn_name: "", fn_params: "", fn_body: "", struct_name: "", struct_fields: "" } }
+fn val_void() { return Val { tag: "void", int_val: 0, float_val: 0.0, bool_val: false, str_val: "", char_val: "", array_val: "", fn_name: "", fn_params: "", fn_body: "", struct_name: "", struct_fields: "" } }
+
+// ── Environment (scope-based variable storage) ───────────
+
+let mut env_vars = []      // array of {name, value} pairs
+let mut env_scopes = [0]   // scope boundary stack
+let mut env_fns = []      // function registry: name -> {params, body}
+let mut return_flag = false
+let mut return_val = val_void()
+let mut break_flag = false
+let mut continue_flag = false
+let mut throw_flag = false
+let mut throw_val = val_void()
+
+// ── Extern FFI storage ──────────────────────────────────
+// Each entry: [hexa_name, c_symbol, ret_type, link_lib]
+// c_symbol is from @symbol("name"); if empty, hexa_name is used for dlsym.
+let mut extern_fns = []
+
+// Look up the C symbol name for a hexa extern function.
+// Returns the @symbol alias if set, otherwise the hexa name itself.
+fn extern_c_symbol(hexa_name) {
+    let mut i = len(extern_fns) - 1
+    while i >= 0 {
+        if extern_fns[i][0] == hexa_name {
+            return extern_fns[i][1]
+        }
+        i = i - 1
+    }
+    return hexa_name
+}
+
+// Look up the link library for a hexa extern function.
+fn extern_link_lib(hexa_name) {
+    let mut i = len(extern_fns) - 1
+    while i >= 0 {
+        if extern_fns[i][0] == hexa_name {
+            return extern_fns[i][3]
+        }
+        i = i - 1
+    }
+    return ""
+}
+
+// ── Impl block storage (struct method dispatch) ─────────
+// Each entry: [target_name, methods_array]
+// methods_array: each is a FnDecl node with .name, .params, .body
+let mut impl_store = []
+
+// ── Closure environment storage ─────────────────────────
+// Closures capture a snapshot of env_vars at creation time
+let mut closure_store = []
+
+// ── Callback trampoline storage (G4) ───────────────────
+// Pool of 16 callback slots for interpreter mode.
+// Each slot: [in_use (0/1), fn_val]
+let mut callback_slots = []
+let mut callback_inited = false
+
+fn callback_init() {
+    if callback_inited { return 0 }
+    callback_inited = true
+    let mut i = 0
+    while i < 16 {
+        callback_slots = callback_slots.push([0, val_void()])
+        i = i + 1
+    }
+    return 0
+}
+
+fn callback_slots_put(idx, entry) {
+    let mut new_slots = []
+    let mut i = 0
+    while i < 16 {
+        if i == idx {
+            new_slots = new_slots.push(entry)
+        } else {
+            new_slots = new_slots.push(callback_slots[i])
+        }
+        i = i + 1
+    }
+    callback_slots = new_slots
+}
+
+fn callback_alloc(fn_val) {
+    callback_init()
+    let mut i = 0
+    while i < 16 {
+        if callback_slots[i][0] == 0 {
+            callback_slots_put(i, [1, fn_val])
+            return i
+        }
+        i = i + 1
+    }
+    println("callback pool exhausted (16 slots)")
+    return -1
+}
+
+fn callback_release(slot) {
+    callback_init()
+    if slot >= 0 && slot < 16 {
+        callback_slots_put(slot, [0, val_void()])
+    }
+}
+
+fn callback_call(slot, args) {
+    callback_init()
+    if slot < 0 || slot >= 16 { return val_void() }
+    if callback_slots[slot][0] == 0 { return val_void() }
+    let fn_val = callback_slots[slot][1]
+    if fn_val.tag == "fn" {
+        return call_fn_val(fn_val, args)
+    }
+    return val_void()
+}
+
+fn env_push_scope() {
+    env_scopes = env_scopes.push(len(env_vars))
+}
+
+fn env_pop_scope() {
+    let boundary = env_scopes[len(env_scopes) - 1]
+    // Remove the last scope marker
+    let mut new_scopes = []
+    for i in 0..len(env_scopes)-1 {
+        new_scopes = new_scopes.push(env_scopes[i])
+    }
+    env_scopes = new_scopes
+    // Truncate vars to boundary
+    let mut new_vars = []
+    for i in 0..boundary {
+        new_vars = new_vars.push(env_vars[i])
+    }
+    env_vars = new_vars
+}
+
+fn env_define(name, value) {
+    env_vars = env_vars.push([name, value])
+}
+
+fn env_lookup(name) {
+    // Walk backwards for lexical scoping
+    let i = len(env_vars) - 1
+    while i >= 0 {
+        if env_vars[i][0] == name {
+            return env_vars[i][1]
+        }
+        i = i - 1
+    }
+    return val_void()
+}
+
+fn env_set(name, value) {
+    let i = len(env_vars) - 1
+    while i >= 0 {
+        if env_vars[i][0] == name {
+            env_vars[i] = [name, value]
+            return true
+        }
+        i = i - 1
+    }
+    return false
+}
+
+// ── Core: eval_expr ──────────────────────────────────────
+
+fn eval_expr_at(arr, idx) {
+    let k = arr[idx].kind
+
+    if k == "IntLit" { return val_int(to_int(arr[idx].value)) }
+    if k == "FloatLit" { return val_float(to_float(arr[idx].value)) }
+    if k == "BoolLit" { return val_bool(arr[idx].value == "true") }
+    if k == "StringLit" { return val_str(arr[idx].value) }
+    if k == "CharLit" { return val_str(arr[idx].value) }
+    if k == "Ident" { return env_lookup(arr[idx].name) }
+    // For complex nodes, we need to extract children
+    // This is OK because arr[idx].left gives a reference, not a deep copy
+    return eval_expr_inner(arr[idx])
+}
+
+fn eval_expr(node) {
+    let _tmp_arr = [node]
+    return eval_expr_at(_tmp_arr, 0)
+}
+
+fn eval_expr_inner(node) {
+    let k = node.kind
+
+    if k == "IntLit" { return val_int(to_int(node.value)) }
+    if k == "FloatLit" { return val_float(to_float(node.value)) }
+    if k == "BoolLit" { return val_bool(node.value == "true") }
+    if k == "StringLit" { return val_str(node.value) }
+    if k == "CharLit" { return val_str(node.value) }
+    if k == "Ident" { return env_lookup(node.name) }
+
+    if k == "BinOp" {
+        let lv = eval_expr(node.left)
+        let rv = eval_expr(node.right)
+        return eval_binop(node.op, lv, rv)
+    }
+
+    if k == "UnaryOp" {
+        let v = eval_expr(node.left)
+        if node.op == "-" {
+            if v.tag == "int" { return val_int(-v.int_val) }
+            if v.tag == "float" { return val_float(-v.float_val) }
+        }
+        if node.op == "!" {
+            return val_bool(!is_truthy(v))
+        }
+        return v
+    }
+
+    if k == "Array" {
+        let mut items = []
+        for item in node.items {
+            items = items.push(eval_expr(item))
+        }
+        return val_array(items)
+    }
+
+    if k == "Index" {
+        let arr = eval_expr(node.left)
+        let idx = eval_expr(node.right)
+        if arr.tag == "array" {
+            let items = get_array(arr)
+            return items[idx.int_val]
+        }
+        if arr.tag == "str" {
+            let chars = arr.str_val.chars()
+            return val_str(to_string(chars[idx.int_val]))
+        }
+        return val_void()
+    }
+
+    if k == "Call" {
+        // Inline Call handling (avoid struct copy issue with eval_call)
+        let mut call_args = []
+        let raw_args = node.args
+        if type_of(raw_args) == "array" {
+            let mut _ai = 0
+            while _ai < len(raw_args) {
+                call_args = call_args.push(eval_expr_at(raw_args, _ai))
+                _ai = _ai + 1
+            }
+        }
+        let callee = node.left
+        if type_of(callee) != "string" && callee.kind == "Ident" {
+            let fname = callee.name
+            let br = call_builtin(fname, call_args)
+            if br.tag != "__not_builtin__" { return br }
+            return call_user_fn(fname, call_args)
+        }
+        if type_of(callee) != "string" && callee.kind == "Field" {
+            let obj = eval_expr(callee.left)
+            let method = callee.name
+            return call_method(obj, method, call_args)
+        }
+        let callee_val = eval_expr(callee)
+        if callee_val.tag == "fn" { return call_fn_val(callee_val, call_args) }
+        return val_void()
+    }
+
+    if k == "Field" {
+        let obj = eval_expr(node.left)
+        let field = node.name
+        // Method call is handled in eval_call
+        // Field access on struct
+        if obj.tag == "struct" {
+            let fields = get_struct_fields(obj)
+            return fields[field]
+        }
+        return val_void()
+    }
+
+    if k == "IfExpr" {
+        let cond = eval_expr(node.cond)
+        if is_truthy(cond) {
+            return eval_block(node.then_body)
+        }
+        if node.else_body != "" {
+            return eval_block(node.else_body)
+        }
+        return val_void()
+    }
+
+    if k == "Lambda" {
+        // Capture current environment for closure
+        let mut captured = []
+        let mut ci = 0
+        while ci < len(env_vars) {
+            captured = captured.push([env_vars[ci][0], env_vars[ci][1]])
+            ci = ci + 1
+        }
+        return val_closure("__lambda__", node.params, node.left, captured)
+    }
+
+    if k == "MapLit" {
+        let mut keys = []
+        let mut values = []
+        let entries = node.items
+        let mut mi = 0
+        while mi < len(entries) {
+            let entry = entries[mi]
+            keys = keys.push(eval_expr(entry.left))
+            values = values.push(eval_expr(entry.right))
+            mi = mi + 1
+        }
+        return val_map(keys, values)
+    }
+
+    if k == "Range" {
+        let start = eval_expr(node.left)
+        let end_val = eval_expr(node.right)
+        let mut items = []
+        let mut ri = start.int_val
+        while ri < end_val.int_val {
+            items = items.push(val_int(ri))
+            ri = ri + 1
+        }
+        return val_array(items)
+    }
+
+    if k == "Assign" {
+        let val = eval_expr(node.right)
+        if node.left.kind == "Ident" {
+            env_set(node.left.name, val)
+        }
+        if node.left.kind == "Index" {
+            let arr = eval_expr(node.left.left)
+            let idx = eval_expr(node.left.right)
+            if arr.tag == "array" {
+                let items = get_array(arr)
+                let mut new_items = []
+                let mut ai = 0
+                while ai < len(items) {
+                    if ai == idx.int_val {
+                        new_items = new_items.push(val)
+                    } else {
+                        new_items = new_items.push(items[ai])
+                    }
+                    ai = ai + 1
+                }
+                // Update array store in-place
+                array_store[arr.int_val] = new_items
+            }
+        }
+        return val
+    }
+
+    if k == "TupleLit" {
+        let mut items = []
+        for item in node.items {
+            items = items.push(eval_expr(item))
+        }
+        return val_array(items)
+    }
+
+    // ── StructInit: Name { field: val, ... } ────────────────
+    if k == "StructInit" {
+        let sname = node.name
+        let field_inits = node.fields
+        let mut field_map = #{}
+        let mut si = 0
+        while si < len(field_inits) {
+            let fi = field_inits[si]
+            let fname = fi.name
+            let fval = eval_expr(fi.left)
+            field_map[fname] = fval
+            si = si + 1
+        }
+        return val_struct(sname, field_map)
+    }
+
+    // ── MatchExpr: match expr { pattern -> body, ... } ──────
+    if k == "MatchExpr" {
+        let scrutinee = eval_expr(node.left)
+        let arms = node.arms
+        let mut mi = 0
+        while mi < len(arms) {
+            let arm = arms[mi]
+            let pattern = arm.left
+            let arm_body = arm.body
+            if match_pattern(pattern, scrutinee) {
+                env_push_scope()
+                let result = eval_body(arm_body)
+                env_pop_scope()
+                if return_flag {
+                    return return_val
+                }
+                return result
+            }
+            mi = mi + 1
+        }
+        return val_void()
+    }
+
+    return val_void()
+}
+
+// ── Binary operations ────────────────────────────────────
+
+fn eval_binop(op, a, b) {
+    // Int fast path
+    if a.tag == "int" && b.tag == "int" {
+        let x = a.int_val
+        let y = b.int_val
+        if op == "+" { return val_int(x + y) }
+        if op == "-" { return val_int(x - y) }
+        if op == "*" { return val_int(x * y) }
+        if op == "/" { return val_int(x / y) }
+        if op == "%" { return val_int(x % y) }
+        if op == "==" { return val_bool(x == y) }
+        if op == "!=" { return val_bool(x != y) }
+        if op == "<" { return val_bool(x < y) }
+        if op == ">" { return val_bool(x > y) }
+        if op == "<=" { return val_bool(x <= y) }
+        if op == ">=" { return val_bool(x >= y) }
+        if op == "&&" { return val_bool(x != 0 && y != 0) }
+        if op == "||" { return val_bool(x != 0 || y != 0) }
+    }
+    // String concatenation
+    if a.tag == "str" && op == "+" {
+        return val_str(a.str_val + val_to_string(b))
+    }
+    // Float arithmetic
+    if (a.tag == "float" || b.tag == "float") {
+        let x = to_float(a)
+        let y = to_float(b)
+        if op == "+" { return val_float(x + y) }
+        if op == "-" { return val_float(x - y) }
+        if op == "*" { return val_float(x * y) }
+        if op == "/" { return val_float(x / y) }
+        if op == "==" { return val_bool(x == y) }
+        if op == "!=" { return val_bool(x != y) }
+        if op == "<" { return val_bool(x < y) }
+        if op == ">" { return val_bool(x > y) }
+    }
+    // Bool equality
+    if a.tag == "bool" && b.tag == "bool" {
+        if op == "==" { return val_bool(a.bool_val == b.bool_val) }
+        if op == "!=" { return val_bool(a.bool_val != b.bool_val) }
+        if op == "&&" { return val_bool(a.bool_val && b.bool_val) }
+        if op == "||" { return val_bool(a.bool_val || b.bool_val) }
+    }
+    // String equality
+    if a.tag == "str" && b.tag == "str" {
+        if op == "==" { return val_bool(a.str_val == b.str_val) }
+        if op == "!=" { return val_bool(a.str_val != b.str_val) }
+    }
+    return val_void()
+}
+
+// ── Pattern matching ────────────────────────────────────
+
+fn match_pattern(pattern, value) {
+    let pk = pattern.kind
+    // Wildcard _ matches anything
+    if pk == "Wildcard" { return true }
+    // Integer literal pattern
+    if pk == "IntLit" {
+        if value.tag == "int" { return value.int_val == to_int(pattern.value) }
+        return false
+    }
+    // String literal pattern
+    if pk == "StringLit" {
+        if value.tag == "str" { return value.str_val == pattern.value }
+        return false
+    }
+    // Bool literal pattern
+    if pk == "BoolLit" {
+        if value.tag == "bool" { return value.bool_val == (pattern.value == "true") }
+        return false
+    }
+    // Float literal pattern
+    if pk == "FloatLit" {
+        if value.tag == "float" { return value.float_val == to_float(pattern.value) }
+        return false
+    }
+    // Identifier pattern (acts as variable binding or enum variant)
+    if pk == "Ident" {
+        // Treat as wildcard binding — bind name to value
+        env_define(pattern.name, value)
+        return true
+    }
+    return false
+}
+
+// ── Core: exec_stmt ──────────────────────────────────────
+
+fn exec_stmt(node) {
+    let _tmp = [node]
+    return exec_stmt_at(_tmp, 0)
+}
+
+fn exec_stmt_at(stmts, idx) {
+    let node = stmts[idx]
+    let k = node.kind
+
+    if k == "LetStmt" || k == "LetMutStmt" || k == "ConstStmt" || k == "StaticStmt" {
+        let val = val_void()
+        let init = node.left
+        if type_of(init) != "string" || init != "" {
+            val = eval_expr(init)
+        }
+        env_define(node.name, val)
+        return val_void()
+    }
+
+    if k == "AssignStmt" {
+        let val = eval_expr(node.right)
+        if node.left.kind == "Ident" {
+            env_set(node.left.name, val)
+        }
+        return val_void()
+    }
+
+    if k == "ExprStmt" {
+        let expr = node.left
+        if type_of(expr) == "string" { return val_void() }
+        return eval_expr(expr)
+    }
+
+    if k == "ReturnStmt" {
+        if node.left != "" {
+            return_val = eval_expr(node.left)
+        } else {
+            return_val = val_void()
+        }
+        return_flag = true
+        return val_void()
+    }
+
+    if k == "FnDecl" || k == "AsyncFnDecl" {
+        env_fns = env_fns.push([node.name, node.params, node.body])
+        let fn_val = val_fn(node.name, node.params, node.body)
+        env_define(node.name, fn_val)
+        return val_void()
+    }
+
+    if k == "ExternFnDecl" {
+        // Register extern function declaration.
+        // node.value = @symbol("c_name") alias (empty → use node.name)
+        // node.op    = @link("lib") library name (empty → default)
+        let c_symbol = node.value
+        if c_symbol == "" {
+            c_symbol = node.name
+        }
+        let ret = node.ret_type
+        let link = node.op
+        extern_fns = extern_fns.push([node.name, c_symbol, ret, link])
+        // Register as a builtin-style binding so calls route to FFI
+        let builtin_name = "__extern_" + node.name
+        env_define(node.name, val_str(builtin_name))
+        return val_void()
+    }
+
+    if k == "IfStmt" {
+        let cond = eval_expr(node.cond)
+        if is_truthy(cond) {
+            env_push_scope()
+            eval_body(node.then_body)
+            env_pop_scope()
+        } else if node.else_body != "" {
+            env_push_scope()
+            eval_body(node.else_body)
+            env_pop_scope()
+        }
+        return val_void()
+    }
+
+    if k == "CompoundAssign" {
+        let lv = eval_expr(node.left)
+        let rv = eval_expr(node.right)
+        let result = eval_binop(node.op, lv, rv)
+        if node.left.kind == "Ident" {
+            env_set(node.left.name, result)
+        }
+        return val_void()
+    }
+
+    if k == "BreakStmt" {
+        break_flag = true
+        return val_void()
+    }
+
+    if k == "ContinueStmt" {
+        continue_flag = true
+        return val_void()
+    }
+
+    if k == "StructDecl" || k == "EnumDecl" || k == "TraitDecl" {
+        // Type declarations — store for later use
+        return val_void()
+    }
+
+    if k == "ImplBlock" {
+        // Store impl block methods for struct method dispatch
+        let target = node.target
+        let methods = node.methods
+        impl_store = impl_store.push([target, methods])
+        // Also register methods as functions with mangled names: Type__method
+        let mut mi = 0
+        while mi < len(methods) {
+            let m = methods[mi]
+            let mangled = target + "__" + m.name
+            env_fns = env_fns.push([mangled, m.params, m.body])
+            mi = mi + 1
+        }
+        return val_void()
+    }
+
+    if k == "ThrowStmt" {
+        throw_val = eval_expr(node.left)
+        throw_flag = true
+        return val_void()
+    }
+
+    if k == "TryCatch" {
+        let try_body = node.left
+        let catch_body = node.right
+        let catch_var = node.name
+
+        // Save throw state
+        let saved_throw = throw_flag
+        throw_flag = false
+
+        // Execute try body
+        env_push_scope()
+        let mut ti = 0
+        while ti < len(try_body) {
+            if return_flag || throw_flag { ti = len(try_body) } else {
+                exec_stmt_at(try_body, ti)
+                ti = ti + 1
+            }
+        }
+        env_pop_scope()
+
+        if throw_flag {
+            // Error was thrown — execute catch body
+            let err = throw_val
+            throw_flag = false
+            throw_val = val_void()
+            env_push_scope()
+            env_define(catch_var, err)
+            let mut ci = 0
+            while ci < len(catch_body) {
+                if return_flag || throw_flag { ci = len(catch_body) } else {
+                    exec_stmt_at(catch_body, ci)
+                    ci = ci + 1
+                }
+            }
+            env_pop_scope()
+        } else {
+            throw_flag = saved_throw
+        }
+        return val_void()
+    }
+
+    if k == "WhileStmt" {
+        while !return_flag && !break_flag && !throw_flag {
+            let cond = eval_expr(node.cond)
+            if !is_truthy(cond) { return val_void() }
+            env_push_scope()
+            continue_flag = false
+            let mut _wi = 0
+            while _wi < len(node.body) {
+                if return_flag || break_flag || continue_flag || throw_flag { _wi = len(node.body) } else {
+                    exec_stmt_at(node.body, _wi)
+                    _wi = _wi + 1
+                }
+            }
+            env_pop_scope()
+            if continue_flag { continue_flag = false }
+        }
+        if break_flag { break_flag = false }
+        return val_void()
+    }
+
+    if k == "ForStmt" {
+        let iter_val = eval_expr(node.iter_expr)
+        if iter_val.tag == "array" {
+            let items = get_array(iter_val)
+            let mut _fi2 = 0
+            while _fi2 < len(items) {
+                if return_flag || break_flag || throw_flag { _fi2 = len(items) } else {
+                    env_push_scope()
+                    continue_flag = false
+                    env_define(node.name, items[_fi2])
+                    let mut _fbi = 0
+                    while _fbi < len(node.body) {
+                        if return_flag || break_flag || continue_flag || throw_flag { _fbi = len(node.body) } else {
+                            exec_stmt_at(node.body, _fbi)
+                            _fbi = _fbi + 1
+                        }
+                    }
+                    env_pop_scope()
+                    if continue_flag { continue_flag = false }
+                    _fi2 = _fi2 + 1
+                }
+            }
+        }
+        if break_flag { break_flag = false }
+        return val_void()
+    }
+
+    if k == "LoopStmt" {
+        while !return_flag {
+            env_push_scope()
+            eval_body(node.body)
+            env_pop_scope()
+        }
+        return val_void()
+    }
+
+    // Ignore unknown statement kinds
+    return val_void()
+}
+
+// ── Execute a block of statements ────────────────────────
+
+fn eval_body(stmts) {
+    let mut result = val_void()
+    let mut _bi = 0
+    while _bi < len(stmts) {
+        if return_flag || throw_flag { return result }
+        result = exec_stmt_at(stmts, _bi)
+        _bi = _bi + 1
+    }
+    return result
+}
+
+fn eval_block(stmts) {
+    env_push_scope()
+    let result = eval_body(stmts)
+    env_pop_scope()
+    return result
+}
+
+// ── Function call ────────────────────────────────────────
+
+fn eval_call(node) {
+    // Collect arguments
+    let mut args = []
+    let raw_args = node.args
+    if type_of(raw_args) == "array" {
+        for a in raw_args {
+            args = args.push(eval_expr(a))
+        }
+    }
+
+    // Method call: obj.method(args)
+    let callee = node.left
+    if type_of(callee) != "string" && callee.kind == "Field" {
+        let obj = eval_expr(callee.left)
+        let method = callee.name
+        return call_method(obj, method, args)
+    }
+
+    // Direct call: name(args)
+    if type_of(callee) != "string" && callee.kind == "Ident" {
+        let name = callee.name
+        // Builtins
+        let builtin_result = call_builtin(name, args)
+        if builtin_result.tag != "__not_builtin__" {
+            return builtin_result
+        }
+        // User functions
+        return call_user_fn(name, args)
+    }
+
+    // Indirect call (lambda etc)
+    let callee_val = eval_expr(callee)
+    if callee_val.tag == "fn" {
+        return call_fn_val(callee_val, args)
+    }
+
+    return val_void()
+}
+
+fn find_fn(name) {
+    let mut i = len(env_fns) - 1
+    while i >= 0 {
+        if env_fns[i][0] == name { return env_fns[i] }
+        i = i - 1
+    }
+    return ""
+}
+
+fn call_user_fn(name, args) {
+    let fn_info = find_fn(name)
+    if fn_info == "" {
+        // Try env lookup (for closures/passed functions)
+        let fn_val = env_lookup(name)
+        if fn_val.tag == "fn" {
+            return call_fn_val(fn_val, args)
+        }
+        println("Runtime error: undefined function: " + name)
+        return val_void()
+    }
+    let params = fn_info[1]
+    let body = fn_info[2]
+
+    env_push_scope()
+    let mut i = 0
+    while i < len(params) && i < len(args) {
+        if type_of(params[i]) == "string" {
+            env_define(params[i], args[i])
+        } else {
+            env_define(params[i].name, args[i])
+        }
+        i = i + 1
+    }
+
+    let saved_flag = return_flag
+    return_flag = false
+    // Inline body execution (avoid struct copy via eval_body)
+    let mut _cbi = 0
+    while _cbi < len(body) {
+        if return_flag { _cbi = len(body) } else {
+            exec_stmt_at(body, _cbi)
+            _cbi = _cbi + 1
+        }
+    }
+    let result = return_val
+    return_flag = saved_flag
+    return_val = val_void()
+    env_pop_scope()
+    return result
+}
+
+fn call_fn_val(fn_val, args) {
+    // fn_val has fn_params (array) and fn_body (AST array)
+    let params = fn_val.fn_params
+    let body = fn_val.fn_body
+    let is_closure = fn_val.str_val == "closure"
+
+    // For closures, save current env and restore captured env
+    let mut saved_vars = []
+    let mut saved_scopes = []
+    if is_closure {
+        saved_vars = env_vars
+        saved_scopes = env_scopes
+        let captured = closure_store[fn_val.int_val]
+        env_vars = captured
+        env_scopes = [0]
+    }
+
+    env_push_scope()
+    let mut i = 0
+    while i < len(params) && i < len(args) {
+        if type_of(params[i]) == "string" {
+            env_define(params[i], args[i])
+        } else {
+            env_define(params[i].name, args[i])
+        }
+        i = i + 1
+    }
+
+    let saved_flag = return_flag
+    return_flag = false
+    if type_of(body) == "array" {
+        eval_body(body)
+    } else {
+        // Single expression body (lambda)
+        return_val = eval_expr(body)
+        return_flag = true
+    }
+    let result = return_val
+    return_flag = saved_flag
+    return_val = val_void()
+    env_pop_scope()
+
+    // Restore env for closures
+    if is_closure {
+        env_vars = saved_vars
+        env_scopes = saved_scopes
+    }
+
+    return result
+}
+
+// ── Builtin functions ────────────────────────────────────
+
+fn call_builtin(name, args) {
+    let not_builtin = Val { tag: "__not_builtin__", int_val: 0, float_val: 0.0, bool_val: false, str_val: "", char_val: "", array_val: "", fn_name: "", fn_params: "", fn_body: "", struct_name: "", struct_fields: "" }
+
+    if name == "println" {
+        let mut out = ""
+        for a in args { out = out + val_to_string(a) }
+        println(out)
+        return val_void()
+    }
+    if name == "print" {
+        let mut out = ""
+        for a in args { out = out + val_to_string(a) }
+        print(out)
+        return val_void()
+    }
+    if name == "len" {
+        if len(args) > 0 {
+            let a = args[0]
+            if a.tag == "str" { return val_int(len(a.str_val)) }
+            if a.tag == "array" { return val_int(len(get_array(a))) }
+        }
+        return val_int(0)
+    }
+    if name == "to_string" {
+        if len(args) > 0 { return val_str(val_to_string(args[0])) }
+        return val_str("")
+    }
+    if name == "type_of" {
+        if len(args) > 0 { return val_str(args[0].tag) }
+        return val_str("void")
+    }
+    if name == "int" {
+        if len(args) > 0 { return val_int(to_int(val_to_string(args[0]))) }
+        return val_int(0)
+    }
+    if name == "float" {
+        if len(args) > 0 { return val_float(to_float(val_to_string(args[0]))) }
+        return val_float(0.0)
+    }
+    if name == "is_alpha" {
+        if len(args) > 0 { return val_bool(is_alpha(args[0].str_val)) }
+        return val_bool(false)
+    }
+    if name == "is_digit" {
+        if len(args) > 0 { return val_bool(is_digit(args[0].str_val)) }
+        return val_bool(false)
+    }
+    if name == "is_alphanumeric" {
+        if len(args) > 0 { return val_bool(is_alphanumeric(args[0].str_val)) }
+        return val_bool(false)
+    }
+    if name == "format" {
+        // format(template, arg0, arg1, ...) with {}, {0}, {:.2} support
+        if len(args) == 0 { return val_str("") }
+        let tmpl = args[0].str_val
+        let mut out = ""
+        let mut arg_idx = 1
+        let chars_arr = tmpl.chars()
+        let tlen = len(chars_arr)
+        let mut ci = 0
+        while ci < tlen {
+            let ch = to_string(chars_arr[ci])
+            if ch == "{" && ci + 1 < tlen {
+                // Look for closing }
+                let mut end = ci + 1
+                while end < tlen && to_string(chars_arr[end]) != "}" {
+                    end = end + 1
+                }
+                if end < tlen {
+                    // Extract format spec between { and }
+                    let mut spec = ""
+                    let mut si = ci + 1
+                    while si < end {
+                        spec = spec + to_string(chars_arr[si])
+                        si = si + 1
+                    }
+                    if spec == "" {
+                        // {} — positional arg
+                        if arg_idx < len(args) {
+                            out = out + val_to_string(args[arg_idx])
+                            arg_idx = arg_idx + 1
+                        }
+                    } else if spec.starts_with(":.") {
+                        // {:.N} — float precision
+                        let prec_str = spec.substring(2, len(spec))
+                        let prec = to_int(prec_str)
+                        if arg_idx < len(args) {
+                            let fv = to_float_val(args[arg_idx])
+                            out = out + to_string(round(fv, prec))
+                            arg_idx = arg_idx + 1
+                        }
+                    } else {
+                        // {N} — indexed arg
+                        let idx_val = to_int(spec)
+                        let actual = idx_val + 1
+                        if actual < len(args) {
+                            out = out + val_to_string(args[actual])
+                        }
+                    }
+                    ci = end + 1
+                } else {
+                    out = out + ch
+                    ci = ci + 1
+                }
+            } else {
+                out = out + ch
+                ci = ci + 1
+            }
+        }
+        return val_str(out)
+    }
+    if name == "read_file" {
+        if len(args) > 0 { return val_str(read_file(args[0].str_val)) }
+        return val_str("")
+    }
+    if name == "chars" {
+        if len(args) > 0 && args[0].tag == "str" {
+            let cs = args[0].str_val.chars()
+            let mut result = []
+            for c in cs { result = result.push(val_str(to_string(c))) }
+            return val_array(result)
+        }
+        return val_array([])
+    }
+    if name == "push" {
+        if len(args) >= 2 && args[0].tag == "array" {
+            let items = get_array(args[0])
+            let new_items = items.push(args[1])
+            return val_array(new_items)
+        }
+        return args[0]
+    }
+
+    // ── Math builtins ────────────────────────────────────
+    if name == "abs" {
+        if len(args) > 0 {
+            let a = args[0]
+            if a.tag == "int" { return val_int(abs(a.int_val)) }
+            if a.tag == "float" { return val_float(abs(a.float_val)) }
+        }
+        return val_int(0)
+    }
+    if name == "min" {
+        if len(args) >= 2 {
+            let a = args[0]
+            let b = args[1]
+            if a.tag == "int" && b.tag == "int" {
+                if a.int_val < b.int_val { return a } else { return b }
+            }
+            let fa = to_float_val(a)
+            let fb = to_float_val(b)
+            if fa < fb { return val_float(fa) } else { return val_float(fb) }
+        }
+        return val_int(0)
+    }
+    if name == "max" {
+        if len(args) >= 2 {
+            let a = args[0]
+            let b = args[1]
+            if a.tag == "int" && b.tag == "int" {
+                if a.int_val > b.int_val { return a } else { return b }
+            }
+            let fa = to_float_val(a)
+            let fb = to_float_val(b)
+            if fa > fb { return val_float(fa) } else { return val_float(fb) }
+        }
+        return val_int(0)
+    }
+    if name == "floor" {
+        if len(args) > 0 { return val_int(floor(to_float_val(args[0]))) }
+        return val_int(0)
+    }
+    if name == "ceil" {
+        if len(args) > 0 { return val_int(ceil(to_float_val(args[0]))) }
+        return val_int(0)
+    }
+    if name == "round" {
+        if len(args) > 0 {
+            if len(args) >= 2 {
+                return val_float(round(to_float_val(args[0]), args[1].int_val))
+            }
+            return val_float(round(to_float_val(args[0])))
+        }
+        return val_float(0.0)
+    }
+    if name == "sqrt" {
+        if len(args) > 0 { return val_float(sqrt(to_float_val(args[0]))) }
+        return val_float(0.0)
+    }
+    if name == "pow" {
+        if len(args) >= 2 { return val_float(pow(to_float_val(args[0]), to_float_val(args[1]))) }
+        return val_float(0.0)
+    }
+    if name == "sin" {
+        if len(args) > 0 { return val_float(sin(to_float_val(args[0]))) }
+        return val_float(0.0)
+    }
+    if name == "cos" {
+        if len(args) > 0 { return val_float(cos(to_float_val(args[0]))) }
+        return val_float(0.0)
+    }
+    if name == "ln" {
+        if len(args) > 0 { return val_float(ln(to_float_val(args[0]))) }
+        return val_float(0.0)
+    }
+    if name == "log10" {
+        if len(args) > 0 { return val_float(log10(to_float_val(args[0]))) }
+        return val_float(0.0)
+    }
+    if name == "exp" {
+        if len(args) > 0 { return val_float(exp(to_float_val(args[0]))) }
+        return val_float(0.0)
+    }
+
+    // ── Map constructor ──────────────────────────────────
+    if name == "Map" {
+        return val_map([], [])
+    }
+
+    // ── Callback trampoline builtins (G4) ────────────────
+    // In interpreter mode, callbacks are tracked as slot IDs.
+    // The actual C function pointer is only meaningful in compiled mode.
+    if name == "callback_create" {
+        if len(args) > 0 {
+            let fn_val = args[0]
+            // Store in callback_slots, return slot index as int
+            let slot = callback_alloc(fn_val)
+            return val_int(slot)
+        }
+        return val_int(-1)
+    }
+    if name == "callback_free" {
+        if len(args) > 0 {
+            callback_release(args[0].int_val)
+        }
+        return val_void()
+    }
+    if name == "callback_invoke" {
+        // For testing: invoke a callback by slot ID with args
+        if len(args) >= 1 {
+            let slot = args[0].int_val
+            let mut cb_args = []
+            let mut ai = 1
+            while ai < len(args) {
+                cb_args = cb_args.push(args[ai])
+                ai = ai + 1
+            }
+            return callback_call(slot, cb_args)
+        }
+        return val_void()
+    }
+
+    // ── G5: Pointer arithmetic builtins (interpreter-level) ──
+    if name == "ptr_alloc" {
+        if len(args) > 0 {
+            let size = args[0].int_val
+            let buf = ptr_alloc(size)
+            return val_int(ptr_addr(buf))
+        }
+        return val_int(0)
+    }
+    if name == "ptr_free" {
+        if len(args) >= 2 {
+            ptr_free(args[0].int_val, args[1].int_val)
+        }
+        return val_void()
+    }
+    if name == "ptr_write" {
+        if len(args) >= 3 {
+            let p = args[0].int_val
+            let off = args[1].int_val
+            let v = args[2]
+            if v.tag == "float" {
+                ptr_write(p, off, v.float_val)
+            } else {
+                ptr_write(p, off, v.int_val)
+            }
+        }
+        return val_void()
+    }
+    if name == "ptr_write_f32" {
+        if len(args) >= 3 {
+            ptr_write_f32(args[0].int_val, args[1].int_val, to_float_val(args[2]))
+        }
+        return val_void()
+    }
+    if name == "ptr_write_i32" {
+        if len(args) >= 3 {
+            ptr_write_i32(args[0].int_val, args[1].int_val, args[2].int_val)
+        }
+        return val_void()
+    }
+    if name == "ptr_read" {
+        if len(args) >= 2 {
+            return val_int(ptr_read(args[0].int_val, args[1].int_val))
+        }
+        return val_int(0)
+    }
+    if name == "ptr_read_f64" {
+        if len(args) >= 2 {
+            return val_float(ptr_read_f64(args[0].int_val, args[1].int_val))
+        }
+        return val_float(0.0)
+    }
+    if name == "ptr_read_f32" {
+        if len(args) >= 2 {
+            return val_float(ptr_read_f32(args[0].int_val, args[1].int_val))
+        }
+        return val_float(0.0)
+    }
+    if name == "ptr_read_i32" {
+        if len(args) >= 2 {
+            return val_int(ptr_read_i32(args[0].int_val, args[1].int_val))
+        }
+        return val_int(0)
+    }
+    if name == "ptr_offset" {
+        if len(args) >= 2 {
+            return val_int(args[0].int_val + args[1].int_val)
+        }
+        return val_int(0)
+    }
+    if name == "ptr_null" {
+        return val_int(0)
+    }
+    if name == "ptr_addr" {
+        if len(args) > 0 { return val_int(args[0].int_val) }
+        return val_int(0)
+    }
+    if name == "deref" {
+        if len(args) > 0 {
+            return val_int(deref(args[0].int_val))
+        }
+        return val_int(0)
+    }
+
+    // ── FFI string conversion builtins ────────────────────
+    if name == "cstring" {
+        if len(args) > 0 && args[0].tag == "str" {
+            return val_int(ptr_addr(args[0].str_val))
+        }
+        return val_int(0)
+    }
+    if name == "from_cstring" {
+        if len(args) > 0 {
+            return val_str(from_cstring(args[0].int_val))
+        }
+        return val_str("")
+    }
+
+    // ── G2: Struct packing builtins ──────────────────────
+    if name == "struct_pack" {
+        // Pack all args as f64 into a heap buffer, return pointer
+        let size = len(args) * 8
+        let buf = ptr_alloc(size)
+        let p = ptr_addr(buf)
+        let mut si = 0
+        while si < len(args) {
+            let v = to_float_val(args[si])
+            ptr_write(p, si * 8, v)
+            si = si + 1
+        }
+        return val_int(p)
+    }
+    if name == "struct_pack_f32" {
+        let size = len(args) * 4
+        let buf = ptr_alloc(size)
+        let p = ptr_addr(buf)
+        let mut si = 0
+        while si < len(args) {
+            let v = to_float_val(args[si])
+            ptr_write_f32(p, si * 4, v)
+            si = si + 1
+        }
+        return val_int(p)
+    }
+    if name == "struct_unpack" {
+        if len(args) >= 2 {
+            let p = args[0].int_val
+            let idx = args[1].int_val
+            return val_float(ptr_read_f64(p, idx * 8))
+        }
+        return val_float(0.0)
+    }
+    if name == "struct_unpack_f32" {
+        if len(args) >= 2 {
+            let p = args[0].int_val
+            let idx = args[1].int_val
+            return val_float(ptr_read_f32(p, idx * 4))
+        }
+        return val_float(0.0)
+    }
+    if name == "struct_rect" {
+        if len(args) >= 4 {
+            let buf = ptr_alloc(32)
+            let p = ptr_addr(buf)
+            ptr_write(p, 0, to_float_val(args[0]))
+            ptr_write(p, 8, to_float_val(args[1]))
+            ptr_write(p, 16, to_float_val(args[2]))
+            ptr_write(p, 24, to_float_val(args[3]))
+            return val_int(p)
+        }
+        return val_int(0)
+    }
+    if name == "struct_point" {
+        if len(args) >= 2 {
+            let buf = ptr_alloc(16)
+            let p = ptr_addr(buf)
+            ptr_write(p, 0, to_float_val(args[0]))
+            ptr_write(p, 8, to_float_val(args[1]))
+            return val_int(p)
+        }
+        return val_int(0)
+    }
+    if name == "struct_size" {
+        if len(args) >= 2 {
+            let buf = ptr_alloc(16)
+            let p = ptr_addr(buf)
+            ptr_write(p, 0, to_float_val(args[0]))
+            ptr_write(p, 8, to_float_val(args[1]))
+            return val_int(p)
+        }
+        return val_int(0)
+    }
+    if name == "struct_free" {
+        if len(args) > 0 {
+            ptr_free(args[0].int_val, 0)
+        }
+        return val_void()
+    }
+
+    return not_builtin
+}
+
+// ── Method dispatch ──────────────────────────────────────
+
+fn call_method(obj, method, args) {
+    // String methods
+    if obj.tag == "str" {
+        let s = obj.str_val
+        if method == "chars" {
+            let cs = s.chars()
+            let mut result = []
+            for c in cs { result = result.push(val_str(to_string(c))) }
+            return val_array(result)
+        }
+        if method == "len" { return val_int(len(s)) }
+        if method == "contains" { return val_bool(s.contains(args[0].str_val)) }
+        if method == "starts_with" { return val_bool(s.starts_with(args[0].str_val)) }
+        if method == "ends_with" { return val_bool(s.ends_with(args[0].str_val)) }
+        if method == "to_upper" { return val_str(s.to_upper()) }
+        if method == "to_lower" { return val_str(s.to_lower()) }
+        if method == "trim" { return val_str(s.trim()) }
+        if method == "split" {
+            let parts = s.split(args[0].str_val)
+            let mut result = []
+            for p in parts { result = result.push(val_str(p)) }
+            return val_array(result)
+        }
+        if method == "replace" { return val_str(s.replace(args[0].str_val, args[1].str_val)) }
+        if method == "substring" { return val_str(s.substring(args[0].int_val, args[1].int_val)) }
+        if method == "index_of" { return val_int(s.index_of(args[0].str_val)) }
+    }
+
+    // Array methods
+    if obj.tag == "array" {
+        let items = get_array(obj)
+        if method == "len" { return val_int(len(items)) }
+        if method == "push" { return val_array(items.push(args[0])) }
+        if method == "pop" {
+            if len(items) == 0 { return val_array([]) }
+            let mut result = []
+            let mut pi = 0
+            while pi < len(items) - 1 {
+                result = result.push(items[pi])
+                pi = pi + 1
+            }
+            return val_array(result)
+        }
+        if method == "contains" {
+            let target = args[0]
+            for item in items {
+                if val_eq(item, target) { return val_bool(true) }
+            }
+            return val_bool(false)
+        }
+        if method == "join" {
+            let sep = args[0].str_val
+            let mut out = ""
+            let mut ji = 0
+            for item in items {
+                if ji > 0 { out = out + sep }
+                out = out + val_to_string(item)
+                ji = ji + 1
+            }
+            return val_str(out)
+        }
+        if method == "index_of" {
+            let target = args[0]
+            let mut ii = 0
+            while ii < len(items) {
+                if val_eq(items[ii], target) { return val_int(ii) }
+                ii = ii + 1
+            }
+            return val_int(-1)
+        }
+        if method == "slice" {
+            let start = args[0].int_val
+            let end_idx = args[1].int_val
+            let mut result = []
+            let mut si = start
+            while si < end_idx && si < len(items) {
+                result = result.push(items[si])
+                si = si + 1
+            }
+            return val_array(result)
+        }
+        if method == "reverse" {
+            let mut result = []
+            let mut ri = len(items) - 1
+            while ri >= 0 {
+                result = result.push(items[ri])
+                ri = ri - 1
+            }
+            return val_array(result)
+        }
+        if method == "map" {
+            let mut result = []
+            for item in items {
+                result = result.push(call_fn_val(args[0], [item]))
+            }
+            return val_array(result)
+        }
+        if method == "filter" {
+            let mut result = []
+            for item in items {
+                let keep = call_fn_val(args[0], [item])
+                if is_truthy(keep) { result = result.push(item) }
+            }
+            return val_array(result)
+        }
+        if method == "fold" {
+            let mut acc = args[0]
+            let f = args[1]
+            for item in items {
+                acc = call_fn_val(f, [acc, item])
+            }
+            return acc
+        }
+        if method == "for_each" {
+            for item in items {
+                call_fn_val(args[0], [item])
+            }
+            return val_void()
+        }
+        if method == "any" {
+            for item in items {
+                let r = call_fn_val(args[0], [item])
+                if is_truthy(r) { return val_bool(true) }
+            }
+            return val_bool(false)
+        }
+        if method == "all" {
+            for item in items {
+                let r = call_fn_val(args[0], [item])
+                if !is_truthy(r) { return val_bool(false) }
+            }
+            return val_bool(true)
+        }
+        if method == "flat_map" {
+            let mut result = []
+            for item in items {
+                let sub = call_fn_val(args[0], [item])
+                if sub.tag == "array" {
+                    let sub_items = get_array(sub)
+                    for s in sub_items { result = result.push(s) }
+                } else {
+                    result = result.push(sub)
+                }
+            }
+            return val_array(result)
+        }
+    }
+
+    // Map methods
+    if obj.tag == "map" {
+        if method == "get" { return map_get(obj, args[0]) }
+        if method == "set" { return map_set(obj, args[0], args[1]) }
+        if method == "contains_key" { return val_bool(map_contains_key(obj, args[0])) }
+        if method == "keys" {
+            let ks = get_map_keys(obj)
+            return val_array(ks)
+        }
+        if method == "values" {
+            let vs = get_map_values(obj)
+            return val_array(vs)
+        }
+        if method == "len" { return val_int(len(get_map_keys(obj))) }
+        if method == "remove" { return map_remove(obj, args[0]) }
+        if method == "entries" {
+            let ks = get_map_keys(obj)
+            let vs = get_map_values(obj)
+            let mut result = []
+            let mut ei = 0
+            while ei < len(ks) {
+                let pair = val_array([ks[ei], vs[ei]])
+                result = result.push(pair)
+                ei = ei + 1
+            }
+            return val_array(result)
+        }
+    }
+
+    // Struct method dispatch via impl blocks
+    if obj.tag == "struct" {
+        let sname = obj.struct_name
+        // Look for impl block method
+        let mut ii = 0
+        while ii < len(impl_store) {
+            if impl_store[ii][0] == sname {
+                let methods = impl_store[ii][1]
+                let mut mi = 0
+                while mi < len(methods) {
+                    if methods[mi].name == method {
+                        let m = methods[mi]
+                        let mparams = m.params
+                        let mbody = m.body
+                        env_push_scope()
+                        // Bind self to the object
+                        env_define("self", obj)
+                        // Bind remaining params (skip 'self' if first param)
+                        let mut pi = 0
+                        let mut ai = 0
+                        while pi < len(mparams) {
+                            let pname = ""
+                            if type_of(mparams[pi]) == "string" {
+                                pname = mparams[pi]
+                            } else {
+                                pname = mparams[pi].name
+                            }
+                            if pname == "self" {
+                                // skip — already bound
+                            } else {
+                                if ai < len(args) {
+                                    env_define(pname, args[ai])
+                                    ai = ai + 1
+                                }
+                            }
+                            pi = pi + 1
+                        }
+                        let saved_flag = return_flag
+                        return_flag = false
+                        let mut bi = 0
+                        while bi < len(mbody) {
+                            if return_flag { bi = len(mbody) } else {
+                                exec_stmt_at(mbody, bi)
+                                bi = bi + 1
+                            }
+                        }
+                        let result = return_val
+                        return_flag = saved_flag
+                        return_val = val_void()
+                        env_pop_scope()
+                        return result
+                    }
+                    mi = mi + 1
+                }
+            }
+            ii = ii + 1
+        }
+        // Also try field access on struct as a fn val
+        let fields = get_struct_fields(obj)
+        if type_of(fields) != "string" {
+            // Try calling method as a stored function value in fields
+        }
+    }
+
+    println("Runtime error: unknown method ." + method + "() on " + obj.tag)
+    return val_void()
+}
+
+// ── Helpers ──────────────────────────────────────────────
+
+fn is_truthy(v) {
+    if v.tag == "bool" { return v.bool_val }
+    if v.tag == "int" { return v.int_val != 0 }
+    if v.tag == "str" { return v.str_val != "" }
+    if v.tag == "void" { return false }
+    return true
+}
+
+fn val_to_string(v) {
+    if v.tag == "int" { return to_string(v.int_val) }
+    if v.tag == "float" { return to_string(v.float_val) }
+    if v.tag == "bool" { return to_string(v.bool_val) }
+    if v.tag == "str" { return v.str_val }
+    if v.tag == "void" { return "void" }
+    if v.tag == "array" {
+        let items = get_array(v)
+        let mut parts = []
+        for item in items { parts = parts.push(val_to_string(item)) }
+        return "[" + parts.join(", ") + "]"
+    }
+    if v.tag == "map" {
+        let ks = get_map_keys(v)
+        let vs = get_map_values(v)
+        let mut parts = []
+        let mut mi = 0
+        while mi < len(ks) {
+            parts = parts.push(val_to_string(ks[mi]) + ": " + val_to_string(vs[mi]))
+            mi = mi + 1
+        }
+        return "{" + parts.join(", ") + "}"
+    }
+    if v.tag == "fn" { return "<fn " + v.fn_name + ">" }
+    return "<" + v.tag + ">"
+}
+
+fn to_float(v) {
+    if v.tag == "float" { return v.float_val }
+    if v.tag == "int" { return v.int_val * 1.0 }
+    return 0.0
+}
+
+fn to_float_val(v) {
+    if v.tag == "float" { return v.float_val }
+    if v.tag == "int" { return v.int_val * 1.0 }
+    return 0.0
+}
+
+// ── Array storage (using host arrays) ────────────────────
+// We store arrays as actual hexa arrays wrapped in Val
+
+let mut array_store = []
+
+fn val_array(items) {
+    let idx = len(array_store)
+    array_store = array_store.push(items)
+    return Val { tag: "array", int_val: idx, float_val: 0.0, bool_val: false, str_val: "", char_val: "", array_val: "", fn_name: "", fn_params: "", fn_body: "", struct_name: "", struct_fields: "" }
+}
+
+fn get_array(v) {
+    return array_store[v.int_val]
+}
+
+fn val_fn(name, params, body) {
+    return Val { tag: "fn", int_val: 0, float_val: 0.0, bool_val: false, str_val: "", char_val: "", array_val: "", fn_name: name, fn_params: params, fn_body: body, struct_name: "", struct_fields: "" }
+}
+
+fn val_closure(name, params, body, captured_env) {
+    // Store captured env in closure_store, reference via int_val
+    let idx = len(closure_store)
+    closure_store = closure_store.push(captured_env)
+    return Val { tag: "fn", int_val: idx, float_val: 0.0, bool_val: false, str_val: "closure", char_val: "", array_val: "", fn_name: name, fn_params: params, fn_body: body, struct_name: "", struct_fields: "" }
+}
+
+// ── Map storage ─────────────────────────────────────────
+// Maps stored as pairs of [keys_array, values_array]
+let mut map_store = []
+
+fn val_map(keys, values) {
+    let idx = len(map_store)
+    map_store = map_store.push([keys, values])
+    return Val { tag: "map", int_val: idx, float_val: 0.0, bool_val: false, str_val: "", char_val: "", array_val: "", fn_name: "", fn_params: "", fn_body: "", struct_name: "", struct_fields: "" }
+}
+
+fn get_map_keys(v) {
+    return map_store[v.int_val][0]
+}
+
+fn get_map_values(v) {
+    return map_store[v.int_val][1]
+}
+
+fn map_get(v, key) {
+    let keys = get_map_keys(v)
+    let values = get_map_values(v)
+    let mut i = 0
+    while i < len(keys) {
+        if val_eq(keys[i], key) { return values[i] }
+        i = i + 1
+    }
+    return val_void()
+}
+
+fn map_set(v, key, value) {
+    let keys = get_map_keys(v)
+    let values = get_map_values(v)
+    let mut new_keys = []
+    let mut new_values = []
+    let mut found = false
+    let mut i = 0
+    while i < len(keys) {
+        if val_eq(keys[i], key) {
+            new_keys = new_keys.push(keys[i])
+            new_values = new_values.push(value)
+            found = true
+        } else {
+            new_keys = new_keys.push(keys[i])
+            new_values = new_values.push(values[i])
+        }
+        i = i + 1
+    }
+    if !found {
+        new_keys = new_keys.push(key)
+        new_values = new_values.push(value)
+    }
+    return val_map(new_keys, new_values)
+}
+
+fn map_contains_key(v, key) {
+    let keys = get_map_keys(v)
+    let mut i = 0
+    while i < len(keys) {
+        if val_eq(keys[i], key) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn map_remove(v, key) {
+    let keys = get_map_keys(v)
+    let values = get_map_values(v)
+    let mut new_keys = []
+    let mut new_values = []
+    let mut i = 0
+    while i < len(keys) {
+        if !val_eq(keys[i], key) {
+            new_keys = new_keys.push(keys[i])
+            new_values = new_values.push(values[i])
+        }
+        i = i + 1
+    }
+    return val_map(new_keys, new_values)
+}
+
+fn val_eq(a, b) {
+    if a.tag != b.tag { return false }
+    if a.tag == "int" { return a.int_val == b.int_val }
+    if a.tag == "float" { return a.float_val == b.float_val }
+    if a.tag == "bool" { return a.bool_val == b.bool_val }
+    if a.tag == "str" { return a.str_val == b.str_val }
+    return false
+}
+
+// ── Struct storage ───────────────────────────────────────
+let mut struct_store = []
+
+fn val_struct(name, fields) {
+    let idx = len(struct_store)
+    struct_store = struct_store.push(fields)
+    return Val { tag: "struct", int_val: idx, float_val: 0.0, bool_val: false, str_val: "", char_val: "", array_val: "", fn_name: "", fn_params: "", fn_body: "", struct_name: name, struct_fields: "" }
+}
+
+fn get_struct_fields(v) {
+    return struct_store[v.int_val]
+}
+
+// ── Main entry: run AST ──────────────────────────────────
+
+fn interpret(ast) {
+    // Reset state
+    env_vars = []
+    env_scopes = [0]
+    env_fns = []
+    return_flag = false
+    return_val = val_void()
+    break_flag = false
+    continue_flag = false
+    throw_flag = false
+    throw_val = val_void()
+    array_store = []
+    map_store = []
+    struct_store = []
+    impl_store = []
+    closure_store = []
+    extern_fns = []
+
+    let mut result = val_void()
+    let mut _si = 0
+    while _si < len(ast) {
+        result = exec_stmt_at(ast, _si)
+        _si = _si + 1
+        if return_flag {
+            result = return_val
+            return_flag = false
+        }
+    }
+    return result
+}
+
+// ── Self-test ────────────────────────────────────────────
+
+println("=== HEXA Self-Host Interpreter ===")
+println("Core: eval_expr + exec_stmt + 30 builtins")
+println("String: contains starts_with ends_with replace split trim len substring index_of to_upper to_lower chars")
+println("Array: push pop len contains map filter fold join index_of slice reverse for_each any all flat_map")
+println("Map: get set keys values contains_key len remove entries")
+println("Math: abs min max floor ceil round sqrt pow sin cos ln log10 exp")
+println("Format: format() with {} {N} {:.N} precision")
+println("Control: if/else while for for-in loop break continue return match try/catch/throw")
+println("Advanced: closure/lambda struct-init struct-methods(impl) match-expr try/catch/throw")
+println("Ready for Phase 2 self-hosting pipeline")
