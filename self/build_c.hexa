@@ -839,13 +839,23 @@ fn parse_fn() {
         }
     }
     p_eat("RP")
+    let mut ret_annot = ""
     if p_kind() == "Minus" && p_toks[p_pos + 1].kind == "GT" {
         p_advance()
         p_advance()
-        if p_kind() == "Ident" { p_advance() }
+        if p_kind() == "Ident" {
+            ret_annot = p_advance().value
+        }
     }
     let raw_body = parse_block()
     let body = make_tail_return_block(raw_body)
+    // 등록된 struct 이름이면 fn 테이블에 미리 기록
+    if ret_annot != "" {
+        let fields = struct_lookup_fields(ret_annot)
+        if len(fields) > 0 {
+            fn_register_struct(name, "StructPtr", ret_annot)
+        }
+    }
     return n_fn(name, params, body)
 }
 
@@ -951,15 +961,22 @@ let mut env_lens = []  // 배열/struct length
 let mut struct_tab_names = []
 let mut struct_tab_fields = []  // 각 원소: 필드명 string 배열
 
-// fn 테이블: 이름 + 반환 타입 (Int/Str/Float/DynArr)
+// fn 테이블: 이름 + 반환 타입 (Int/Str/Float/DynArr/StructPtr)
 let mut fn_tab_names = []
 let mut fn_tab_rets = []
+let mut fn_tab_struct = []  // StructPtr일 때 실제 struct 이름 ("" = unknown)
 // 매개변수 Float/Str 힌트: 이름+인덱스 조합으로 추적 ("fnname/0" 등)
 let mut fn_float_params = []
 let mut fn_str_params = []
 fn fn_register(name, ret_type) {
     fn_tab_names = fn_tab_names.push(name)
     fn_tab_rets = fn_tab_rets.push(ret_type)
+    fn_tab_struct = fn_tab_struct.push("")
+}
+fn fn_register_struct(name, ret_type, struct_name) {
+    fn_tab_names = fn_tab_names.push(name)
+    fn_tab_rets = fn_tab_rets.push(ret_type)
+    fn_tab_struct = fn_tab_struct.push(struct_name)
 }
 fn fn_lookup_ret(name) {
     let mut i = 0
@@ -968,6 +985,14 @@ fn fn_lookup_ret(name) {
         i = i + 1
     }
     return "Int"
+}
+fn fn_lookup_struct(name) {
+    let mut i = 0
+    while i < len(fn_tab_names) {
+        if fn_tab_names[i] == name { return fn_tab_struct[i] }
+        i = i + 1
+    }
+    return ""
 }
 fn fn_mark_float_param(name, idx) {
     let key = name + "/" + to_string(idx)
@@ -1086,6 +1111,7 @@ fn type_of(node) {
         if cl.kind == "Ident" {
             if cl.value == "read_file" { return "Str" }
             if cl.value == "to_string" { return "Str" }
+            if cl.value == "to_float" { return "Float" }
             if cl.value == "args" { return "StrArr" }
             if cl.value == "arg" { return "Str" }
             if cl.value == "argc" { return "Int" }
@@ -1306,16 +1332,14 @@ fn emit_expr(node) {
         return emit_expr(obj) + "[" + to_string(idx) + "]"
     }
     if node.kind == "StructLit" {
-        // 컴파일된 형태: {v1, v2, ...} (initializer)
-        // 또는 표현식 컨텍스트에서: (long[]){v1, v2, ...}
-        let mut s = "(long[]){"
+        let mut s = "hexa_struct_alloc((long[]){"
         let mut i = 0
         while i < len(node.args) {
             if i > 0 { s = s + ", " }
-            s = s + emit_expr(node.args[i])
+            s = s + "(long)(" + emit_expr(node.args[i]) + ")"
             i = i + 1
         }
-        s = s + "}"
+        s = s + "}, " + to_string(len(node.args)) + ")"
         return s
     }
     if node.kind == "Call" {
@@ -1516,6 +1540,20 @@ fn emit_stmt(node) {
         }
         if t == "DynArr" {
             return pad() + "hexa_arr " + node.value + " = " + emit_expr(val) + ";\n"
+        }
+        if t == "StructPtr" {
+            // fn 호출 반환 구조체 → env에 struct로 등록
+            if val.kind == "Call" && val.left.kind == "Ident" {
+                let sn = fn_lookup_struct(val.left.value)
+                if sn != "" {
+                    env_set_struct(node.value, sn)
+                } else {
+                    env_set(node.value, "StructPtr")
+                }
+            } else {
+                env_set(node.value, "StructPtr")
+            }
+            return pad() + "long* " + node.value + " = " + emit_expr(val) + ";\n"
         }
         if t == "StrArr" {
             // env 타입 교정: env_set에서 StrArr로 저장되도록 마지막 entry 교체
@@ -1798,6 +1836,7 @@ fn resolve_expr_type(e) {
     if e.kind == "Float" { return "Float" }
     if e.kind == "Str" { return "Str" }
     if e.kind == "Bool" { return "Int" }
+    if e.kind == "StructLit" { return "StructPtr" }
     if e.kind == "Ident" {
         let t = local_env_lookup(e.value)
         if t != "" { return t }
@@ -1813,6 +1852,32 @@ fn resolve_expr_type(e) {
     if e.kind == "Unary" { return resolve_expr_type(e.left) }
     if e.kind == "Call" { return type_of(e) }
     return type_of(e)
+}
+
+fn find_returned_struct_name(node) {
+    if node.kind == "Return" {
+        let e = node.left
+        if e.kind == "StructLit" { return e.value }
+        return ""
+    }
+    if node.kind == "Block" {
+        let stmts = node.args
+        let mut i = 0
+        while i < len(stmts) {
+            let n = find_returned_struct_name(stmts[i])
+            if n != "" { return n }
+            i = i + 1
+        }
+    }
+    if node.kind == "If" {
+        let a = find_returned_struct_name(node.then_b)
+        if a != "" { return a }
+        return find_returned_struct_name(node.else_b)
+    }
+    if node.kind == "While" || node.kind == "ForRange" {
+        return find_returned_struct_name(node.then_b)
+    }
+    return ""
 }
 
 fn find_return_type(node) {
@@ -1952,6 +2017,7 @@ fn emit_fn_decl(node) {
     if rt2 == "Str" { ret_c = "const char*" }
     if rt2 == "Float" { ret_c = "double" }
     if rt2 == "DynArr" { ret_c = "hexa_arr" }
+    if rt2 == "StructPtr" { ret_c = "long*" }
     let mut s = ret_c + " " + user_fn_name(node.value) + "("
     let mut i = 0
     while i < len(params) {
@@ -2008,6 +2074,7 @@ fn emit_fn_proto(node) {
     if rt3 == "Str" { ret_c = "const char*" }
     if rt3 == "Float" { ret_c = "double" }
     if rt3 == "DynArr" { ret_c = "hexa_arr" }
+    if rt3 == "StructPtr" { ret_c = "long*" }
     let mut s = ret_c + " " + user_fn_name(node.value) + "("
     let mut i = 0
     while i < len(params) {
@@ -2132,6 +2199,11 @@ fn emit_runtime() {
     r = r + "}\n"
     r = r + "#include <stdlib.h>\n"
     r = r + "static double hexa_to_float(const char* s) { return strtod(s, NULL); }\n"
+    r = r + "static long* hexa_struct_alloc(const long* items, long n) {\n"
+    r = r + "    long* p = (long*)hexa_alloc(n * sizeof(long));\n"
+    r = r + "    memcpy(p, items, n * sizeof(long));\n"
+    r = r + "    return p;\n"
+    r = r + "}\n"
     r = r + "static const char* hexa_env(const char* name) {\n"
     r = r + "    const char* v = getenv(name); return v ? v : \"\";\n"
     r = r + "}\n"
@@ -2332,7 +2404,10 @@ fn emit_program(stmts) {
             local_env_names = []
             local_env_types = []
             let rt = find_return_type(s0.right)
-            if rt == "" {
+            if rt == "StructPtr" {
+                let sn = find_returned_struct_name(s0.right)
+                fn_register_struct(s0.value, "StructPtr", sn)
+            } else if rt == "" {
                 fn_register(s0.value, "Int")
             } else {
                 fn_register(s0.value, rt)
