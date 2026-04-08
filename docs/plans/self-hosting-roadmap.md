@@ -78,7 +78,17 @@
 - [x] **P2-3** 빌트인 함수: println, format, abs, sqrt, sin, cos, ln, exp 등 13종
 - [ ] **P2-4** 패턴 매칭 실행: match, destructuring, guard
 - [ ] **P2-5** 에러 처리: try/catch, 스택 트레이스
-- [ ] **P2-6** struct/enum 인스턴스화, 메서드 디스패치
+- [~] **P2-6** struct/enum 인스턴스화, 메서드 디스패치
+  - [x] struct 인스턴스화 (StructInit eval: interpreter.hexa:388)
+  - [x] field access (Field eval: interpreter.hexa:293)
+  - [x] impl 블록 메서드 디스패치 (impl_store + call_method: interpreter.hexa:1527)
+  - [x] `self` 암시 바인딩 + 인자 스킵 (interpreter.hexa:1543-1562)
+  - [x] 검증 테스트: self/test_p2_6_struct_method.hexa (host: println 25)
+  - [ ] enum variant 인스턴스화 (Color::Red 스타일) — 스텁만 존재
+  - [ ] enum match pattern — 후속 P2-4와 통합 예정
+  - **주의**: self/parser.hexa 의 trailing self-test 가 `AstNode` 런타임 에러로 실패 —
+    pipeline 포맷(lexer+parser+interpreter concat)으로는 P2-6 E2E 미검증. 파서 본체
+    함수(parse/tokenize)는 정상, test 블록만 문제. 별도 블로커로 트래킹 필요.
 - [ ] **P2-7** 셀프 테스트: Hexa 인터프리터로 examples/ 전체 실행
 
 ## Phase 3: VM 포팅 ✅ 초기 구현 완료 (2026-04-08)
