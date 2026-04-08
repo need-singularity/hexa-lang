@@ -77,7 +77,13 @@ impl std::fmt::Display for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             Value::Int(n) => write!(f, "{}", n),
-            Value::Float(n) => write!(f, "{}", n),
+            Value::Float(n) => {
+                if n.is_finite() && *n == n.trunc() && n.abs() < 1e16 {
+                    write!(f, "{:.1}", n)
+                } else {
+                    write!(f, "{}", n)
+                }
+            }
             Value::Bool(b) => write!(f, "{}", b),
             Value::Char(c) => write!(f, "{}", c),
             Value::Str(s) => write!(f, "{}", s),
@@ -453,6 +459,8 @@ impl Env {
         env.define_builtin("mmap_weights", Value::BuiltinFn("mmap_weights".into()));
         env.define_builtin("to_char", Value::BuiltinFn("to_char".into()));
         env.define_builtin("tensor", Value::BuiltinFn("tensor".into()));
+        env.define_builtin("tensor_zeros", Value::BuiltinFn("tensor_zeros".into()));
+        env.define_builtin("tensor_fill", Value::BuiltinFn("tensor_fill".into()));
         env.define_builtin("repeat_kv", Value::BuiltinFn("repeat_kv".into()));
         env.define_builtin("weight_dict", Value::BuiltinFn("weight_dict".into()));
         env
