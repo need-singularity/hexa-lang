@@ -453,6 +453,8 @@ impl Env {
         env.define_builtin("mmap_weights", Value::BuiltinFn("mmap_weights".into()));
         env.define_builtin("to_char", Value::BuiltinFn("to_char".into()));
         env.define_builtin("tensor", Value::BuiltinFn("tensor".into()));
+        env.define_builtin("repeat_kv", Value::BuiltinFn("repeat_kv".into()));
+        env.define_builtin("weight_dict", Value::BuiltinFn("weight_dict".into()));
         env
 
     }

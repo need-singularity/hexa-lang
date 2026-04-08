@@ -538,8 +538,8 @@ impl Compiler {
             | Stmt::ImplBlock(_) | Stmt::TypeAlias(..) | Stmt::DeriveDecl(_, _) => Ok(()),
             // Not supported in VM — silently skip
             Stmt::Intent(_, _) | Stmt::Verify(_, _)
-            | Stmt::Mod(_, _) | Stmt::Use(_) | Stmt::TryCatch(_, _, _)
-            | Stmt::Throw(_) | Stmt::Proof(_, _) | Stmt::Spawn(_)
+            | Stmt::Mod(_, _) | Stmt::Use(_)
+            | Stmt::Proof(_, _) | Stmt::Spawn(_)
             | Stmt::DropStmt(_) | Stmt::SpawnNamed(_, _)
             | Stmt::AsyncFnDecl(_) | Stmt::Select(_, _)
             | Stmt::MacroDef(_)
@@ -555,6 +555,15 @@ impl Compiler {
                 Err(crate::error::HexaError {
                     class: crate::error::ErrorClass::Runtime,
                     message: "extern FFI not supported in VM".into(),
+                    line: 0, col: 0, hint: None,
+                })
+            }
+            Stmt::TryCatch(..) | Stmt::Throw(_) => {
+                // VM does not support try/catch/throw; signal compile failure so
+                // tiered execution falls through to the interpreter which handles it.
+                Err(crate::error::HexaError {
+                    class: crate::error::ErrorClass::Runtime,
+                    message: "try/catch/throw not supported in VM".into(),
                     line: 0, col: 0, hint: None,
                 })
             }
