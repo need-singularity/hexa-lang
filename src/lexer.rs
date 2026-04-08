@@ -1,3 +1,4 @@
+// ⛔ CORE — L0 불변식 (렉서 토큰화. 수정 전 유저 승인 필수)
 use crate::token::{Token, Spanned, keyword_from_str};
 
 /// Byte-based lexer: operates on &[u8] directly instead of Vec<char>.

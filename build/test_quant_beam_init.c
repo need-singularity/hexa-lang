@@ -1,0 +1,379 @@
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <time.h>
+#include <math.h>
+#include <sys/wait.h>
+
+static const double PI = 3.14159265358979323846;
+static const double E = 2.71828182845904523536;
+static long hexa_time_unix(void) { return (long)time(NULL); }
+static double hexa_clock(void) { return (double)clock() / CLOCKS_PER_SEC; }
+static double hexa_sqrt(double x) { return sqrt(x); }
+static double hexa_pow(double b, double e) { return pow(b, e); }
+static double hexa_abs_f(double x) { return x < 0 ? -x : x; }
+static long hexa_abs_i(long x) { return x < 0 ? -x : x; }
+static double hexa_sin(double x) { return sin(x); }
+static double hexa_cos(double x) { return cos(x); }
+static double hexa_tan(double x) { return tan(x); }
+static double hexa_log(double x) { return log(x); }
+static double hexa_log10(double x) { return log10(x); }
+static double hexa_exp(double x) { return exp(x); }
+static double hexa_floor(double x) { return floor(x); }
+static double hexa_ceil(double x) { return ceil(x); }
+static double hexa_round(double x) { return (x >= 0) ? (long)(x + 0.5) : (long)(x - 0.5); }
+// hexa_alloc: 단순 malloc wrapper (무제한)
+static char* hexa_alloc(size_t n) {
+    char* p = (char*)malloc(n);
+    if (!p) { fprintf(stderr, "hexa_alloc oom (%zu)\n", n); exit(1); }
+    return p;
+}
+static const char* hexa_concat(const char* a, const char* b) {
+    size_t la = strlen(a), lb = strlen(b);
+    char* p = hexa_alloc(la + lb + 1);
+    memcpy(p, a, la); memcpy(p + la, b, lb); p[la + lb] = 0;
+    return p;
+}
+static const char* hexa_int_to_str(long v) {
+    char* p = hexa_alloc(24);
+    snprintf(p, 24, "%ld", v);
+    return p;
+}
+static const char* hexa_float_to_str(double v) {
+    char* p = hexa_alloc(32);
+    snprintf(p, 32, "%g", v);
+    return p;
+}
+static const char* hexa_substr(const char* s, long a, long b) {
+    long sl = (long)strlen(s);
+    if (a < 0) a = 0; if (b > sl) b = sl; if (a > b) a = b;
+    long n = b - a;
+    char* p = hexa_alloc(n + 1);
+    memcpy(p, s + a, n); p[n] = 0;
+    return p;
+}
+static long hexa_str_len(const char* s) { return (long)strlen(s); }
+static long hexa_contains(const char* h, const char* n) { return strstr(h, n) ? 1 : 0; }
+static long hexa_index_of(const char* h, const char* n) {
+    const char* p = strstr(h, n); if (!p) return -1;
+    return (long)(p - h);
+}
+static long hexa_starts_with(const char* h, const char* n) {
+    size_t ln = strlen(n); return strncmp(h, n, ln) == 0 ? 1 : 0;
+}
+static long hexa_ends_with(const char* h, const char* n) {
+    size_t lh = strlen(h), ln = strlen(n);
+    if (ln > lh) return 0; return strcmp(h + lh - ln, n) == 0 ? 1 : 0;
+}
+static const char* hexa_trim(const char* s) {
+    while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r') s++;
+    long n = (long)strlen(s);
+    while (n > 0 && (s[n-1]==' '||s[n-1]=='\t'||s[n-1]=='\n'||s[n-1]=='\r')) n--;
+    char* p = hexa_alloc(n + 1);
+    memcpy(p, s, n); p[n] = 0;
+    return p;
+}
+static const char* hexa_to_upper(const char* s) {
+    long n = (long)strlen(s); char* p = hexa_alloc(n + 1);
+    for (long i = 0; i < n; i++) { char c = s[i]; p[i] = (c>='a'&&c<='z') ? c - 32 : c; }
+    p[n] = 0; return p;
+}
+static const char* hexa_to_lower(const char* s) {
+    long n = (long)strlen(s); char* p = hexa_alloc(n + 1);
+    for (long i = 0; i < n; i++) { char c = s[i]; p[i] = (c>='A'&&c<='Z') ? c + 32 : c; }
+    p[n] = 0; return p;
+}
+static long hexa_parse_int(const char* s) {
+    while (*s == ' ' || *s == '\t') s++;
+    long sign = 1; if (*s == '-') { sign = -1; s++; } else if (*s == '+') s++;
+    long v = 0; while (*s >= '0' && *s <= '9') { v = v*10 + (*s - '0'); s++; }
+    return sign * v;
+}
+#include <stdlib.h>
+static double hexa_to_float(const char* s) { return strtod(s, NULL); }
+static long* hexa_struct_alloc(const long* items, long n) {
+    long* p = (long*)hexa_alloc(n * sizeof(long));
+    memcpy(p, items, n * sizeof(long));
+    return p;
+}
+static const char* hexa_env(const char* name) {
+    const char* v = getenv(name); return v ? v : "";
+}
+static const char* hexa_replace(const char* s, const char* old_, const char* new_) {
+    long oln = (long)strlen(old_); if (oln == 0) return s;
+    long sl = (long)strlen(s), nl = (long)strlen(new_);
+    // 결과 최대 길이 = s 길이 * (new/old 비율)
+    long cap = sl + 1; if (nl > oln) cap = sl * (nl / oln + 1) + 1;
+    char* out = hexa_alloc(cap + 64);
+    long oi = 0; const char* cur = s;
+    while (*cur) {
+        if (strncmp(cur, old_, oln) == 0) {
+            memcpy(out + oi, new_, nl); oi += nl; cur += oln;
+        } else { out[oi++] = *cur++; }
+    }
+    out[oi] = 0; return out;
+}
+static const char* hexa_read_file(const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return "";
+    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    char* p = hexa_alloc(sz + 1);
+    fread(p, 1, sz, f); p[sz] = 0; fclose(f);
+    return p;
+}
+static long hexa_write_file(const char* path, const char* content) {
+    FILE* f = fopen(path, "wb");
+    if (!f) return 0;
+    size_t n = strlen(content);
+    fwrite(content, 1, n, f); fclose(f);
+    return (long)n;
+}
+static long hexa_file_exists(const char* path) {
+    FILE* f = fopen(path, "rb"); if (!f) return 0; fclose(f); return 1;
+}
+static long hexa_to_int_str(const char* s) { return strtol(s, NULL, 10); }
+static long hexa_append_file(const char* path, const char* content) {
+    FILE* f = fopen(path, "ab");
+    if (!f) return 0;
+    size_t n = strlen(content);
+    fwrite(content, 1, n, f); fclose(f);
+    return (long)n;
+}
+static const char* hexa_read_stdin(void) {
+    char buf[8192]; size_t total = 0;
+    char* out = hexa_alloc(65536);
+    size_t r; while ((r = fread(buf, 1, sizeof(buf), stdin)) > 0) {
+        if (total + r >= 65535) break;
+        memcpy(out + total, buf, r); total += r;
+    }
+    out[total] = 0; return out;
+}
+static const char* hexa_exec_with_status(const char* cmd) {
+    FILE* f = popen(cmd, "r");
+    if (!f) return "-1|";
+    char buf[8192]; size_t total = 0;
+    char* out = hexa_alloc(16384);
+    size_t rd; while ((rd = fread(buf, 1, sizeof(buf), f)) > 0) {
+        if (total + rd >= 16000) break;
+        memcpy(out + total, buf, rd); total += rd;
+    }
+    out[total] = 0; int rc = pclose(f);
+    while (total > 0 && (out[total-1] == '\n' || out[total-1] == '\r')) { out[--total] = 0; }
+    char* formatted = hexa_alloc(total + 32);
+    snprintf(formatted, total + 32, "%d|%s", WEXITSTATUS(rc), out);
+    return formatted;
+}
+static const char* hexa_exec(const char* cmd) {
+    FILE* f = popen(cmd, "r");
+    if (!f) return "";
+    char buf[8192]; size_t total = 0;
+    char* out = hexa_alloc(8192);
+    size_t r; while ((r = fread(buf, 1, sizeof(buf), f)) > 0) {
+        if (total + r >= 8191) break;
+        memcpy(out + total, buf, r); total += r;
+    }
+    out[total] = 0; pclose(f);
+    while (total > 0 && (out[total-1] == '\n' || out[total-1] == '\r')) { out[--total] = 0; }
+    return out;
+}
+typedef struct { long* d; long n; long cap; } hexa_arr;
+static hexa_arr hexa_arr_new(void) { hexa_arr a = {NULL, 0, 0}; return a; }
+static hexa_arr hexa_arr_lit(const long* items, long n) {
+    hexa_arr a; a.d = (long*)malloc((n>0?n:1)*sizeof(long)); a.n = n; a.cap = (n>0?n:1);
+    if (n > 0) memcpy(a.d, items, n*sizeof(long));
+    return a;
+}
+static hexa_arr hexa_arr_push(hexa_arr a, long x) {
+    if (a.n >= a.cap) {
+        a.cap = a.cap ? a.cap * 2 : 4;
+        a.d = (long*)realloc(a.d, a.cap * sizeof(long));
+    }
+    a.d[a.n++] = x;
+    return a;
+}
+static long hexa_arr_len(hexa_arr a) { return a.n; }
+static long hexa_arr_get(hexa_arr a, long i) { return a.d[i]; }
+static hexa_arr hexa_arr_concat(hexa_arr a, hexa_arr b) {
+    hexa_arr r; r.n = a.n + b.n; r.cap = r.n > 0 ? r.n : 1;
+    r.d = (long*)malloc(r.cap * sizeof(long));
+    if (a.n > 0) memcpy(r.d, a.d, a.n * sizeof(long));
+    if (b.n > 0) memcpy(r.d + a.n, b.d, b.n * sizeof(long));
+    return r;
+}
+static hexa_arr hexa_chars(const char* s) {
+    long n = (long)strlen(s);
+    hexa_arr a; a.d = (long*)malloc((n>0?n:1)*sizeof(long)); a.n = n; a.cap = (n>0?n:1);
+    for (long i = 0; i < n; i++) a.d[i] = (long)(unsigned char)s[i];
+    return a;
+}
+#include <ctype.h>
+static long hexa_is_alpha(long c) { return (long)(isalpha((int)c) ? 1 : 0); }
+static long hexa_is_alnum(long c) { return (long)(isalnum((int)c) ? 1 : 0); }
+static int hexa_main_argc = 0;
+static char** hexa_main_argv = NULL;
+static hexa_arr hexa_args(void) {
+    hexa_arr a; a.n = hexa_main_argc; a.cap = hexa_main_argc;
+    a.d = (long*)malloc((hexa_main_argc>0?hexa_main_argc:1)*sizeof(long));
+    for (int i = 0; i < hexa_main_argc; i++) a.d[i] = (long)hexa_main_argv[i];
+    return a;
+}
+static const char* hexa_arg(long i) {
+    if (i < 0 || i >= hexa_main_argc) return "";
+    return hexa_main_argv[i];
+}
+static long hexa_argc(void) { return (long)hexa_main_argc; }
+static hexa_arr hexa_split(const char* s, const char* sep) {
+    hexa_arr a = hexa_arr_new();
+    long sl = (long)strlen(sep); if (sl == 0) { return hexa_arr_push(a, (long)s); }
+    const char* cur = s;
+    while (1) {
+        const char* hit = strstr(cur, sep);
+        if (!hit) {
+            long ln = (long)strlen(cur);
+            char* p = hexa_alloc(ln + 1);
+            memcpy(p, cur, ln); p[ln] = 0;
+            a = hexa_arr_push(a, (long)p);
+            break;
+        }
+        long ln = hit - cur;
+        char* p = hexa_alloc(ln + 1);
+        memcpy(p, cur, ln); p[ln] = 0;
+        a = hexa_arr_push(a, (long)p);
+        cur = hit + sl;
+    }
+    return a;
+}
+
+long test_quantize_roundtrip();
+long test_grad_clip_bounded();
+long test_xavier_size();
+long test_beam_expands();
+
+static hexa_arr weights;
+static long q_result;
+static long q_ints;
+static long scale;
+static long zp;
+static long recovered;
+static long err;
+static long bw = 3;
+static long vs = 4;
+static hexa_arr seqs;
+static hexa_arr scores;
+static hexa_arr logits;
+static long result;
+static long new_seqs;
+static long new_scores;
+static hexa_arr logits2;
+static long r2;
+static hexa_arr grads;
+static long clipped;
+static double clipped_norm;
+static hexa_arr small_grads;
+static long not_clipped;
+static long w_xavier;
+static long x_mean;
+static long w_kaiming;
+static long k_mean;
+static long W_train;
+static long q;
+static long loaded;
+
+long test_quantize_roundtrip() {
+    hexa_arr w = hexa_arr_lit((long[]){1.0, (-1.0), 0.5, (-0.5)}, 4);
+    long q = quantize_int8(w);
+    long r = dequantize_int8(q[0], q[1], q[2]);
+    long err = mse_loss(w, r);
+    if (!((err < 0.01))) { fprintf(stderr, "assertion failed\n"); exit(1); }
+    0;
+    "quantization error should be small";
+    return 0;
+}
+
+long test_grad_clip_bounded() {
+    long c = grad_clip_norm(hexa_arr_lit((long[]){(long)(100.0), (long)(200.0)}, 2), 1.0);
+    double n = hexa_sqrt((double)(dot(c, c)));
+    if (!((n < 1.01))) { fprintf(stderr, "assertion failed\n"); exit(1); }
+    0;
+    "clipped norm should be ≤ 1.0";
+    return 0;
+}
+
+long test_xavier_size() {
+    long w = xavier_init(3, 5);
+    if (!((hexa_str_len(w) == 15))) { fprintf(stderr, "assertion failed\n"); exit(1); }
+    0;
+    "xavier should produce fan_in*fan_out weights";
+    return 0;
+}
+
+long test_beam_expands() {
+    long r = beam_search_step(hexa_arr_lit((long[]){(long)(0)}, 1), hexa_arr_lit((long[]){(long)(0.0)}, 1), hexa_arr_lit((long[]){(long)(1.0), (long)(2.0), (long)(0.5)}, 3), 1, 3);
+    if (!((hexa_str_len(r[1]) == 1))) { fprintf(stderr, "assertion failed\n"); exit(1); }
+    0;
+    "beam width should stay 1";
+    return 0;
+}
+
+
+int main(int argc, char** argv) {
+    hexa_main_argc = argc; hexa_main_argv = argv;
+    weights = hexa_arr_lit((long[]){(long)(0.5), (long)((-0.3)), (long)(1.2), (long)((-0.8)), (long)(0.1), (long)(0.7), (long)((-1.0)), (long)(0.4)}, 8);
+    q_result = quantize_int8(weights);
+    q_ints = q_result[0];
+    scale = q_result[1];
+    zp = q_result[2];
+    printf("%s\n", "[1] Quantize INT8:");
+    printf("%s [arr len=%ld]\n", "    original:", (long)((weights).n));
+    printf("%s %ld %s %ld %s %ld\n", "    quantized:", (long)(q_ints), "scale:", (long)(scale), "zp:", (long)(zp));
+    recovered = dequantize_int8(q_ints, scale, zp);
+    printf("%s %ld\n", "    recovered:", (long)(recovered));
+    err = mse_loss(weights, recovered);
+    printf("%s %ld\n", "    quant error (MSE):", (long)(err));
+    printf("%s\n", "\n[2] Beam Search (width=3, vocab=4):");
+    seqs = hexa_arr_lit((long[]){(long)(0), (long)(0), (long)(0)}, 3);
+    scores = hexa_arr_lit((long[]){(long)(0.0), (long)(0.0), (long)(0.0)}, 3);
+    logits = hexa_arr_lit((long[]){(long)(2.0), (long)(0.1), (long)(1.0), (long)(0.5), (long)(0.3), (long)(2.5), (long)(0.8), (long)(0.1), (long)(1.5), (long)(0.2), (long)(0.1), (long)(2.0)}, 12);
+    result = beam_search_step(seqs, scores, logits, bw, vs);
+    new_seqs = result[0];
+    new_scores = result[1];
+    printf("%s %ld\n", "    top beams:", (long)(new_seqs));
+    printf("%s %ld\n", "    scores:", (long)(new_scores));
+    logits2 = hexa_arr_lit((long[]){(long)(1.0), (long)(2.0), (long)(0.5), (long)(0.3), (long)(0.1), (long)(0.3), (long)(2.5), (long)(1.0), (long)(2.0), (long)(0.1), (long)(0.5), (long)(1.5)}, 12);
+    r2 = beam_search_step(new_seqs, new_scores, logits2, bw, vs);
+    printf("%s %ld\n", "    step 2 beams:", (long)(r2[0]));
+    printf("%s\n", "\n[3] Gradient Clipping:");
+    grads = hexa_arr_lit((long[]){(long)(10.0), (long)((-20.0)), (long)(15.0), (long)((-5.0))}, 4);
+    clipped = grad_clip_norm(grads, 1.0);
+    printf("%s [arr len=%ld]\n", "    original grads:", (long)((grads).n));
+    printf("%s %ld\n", "    clipped (max_norm=1.0):", (long)(clipped));
+    clipped_norm = hexa_sqrt((double)(dot(clipped, clipped)));
+    printf("%s %g\n", "    clipped norm:", (double)((hexa_round((double)((clipped_norm * 10000))) / 10000)));
+    small_grads = hexa_arr_lit((long[]){(long)(0.1), (long)((-0.2)), (long)(0.15)}, 3);
+    not_clipped = grad_clip_norm(small_grads, 1.0);
+    printf("%s %ld\n", "    small grads (no clip):", (long)(not_clipped));
+    printf("%s\n", "\n[4] Xavier Init (fan_in=4, fan_out=8):");
+    w_xavier = xavier_init(4, 8);
+    printf("%s %ld\n", "    first 8:", (long)(slice(w_xavier, 0, 8)));
+    printf("%s %ld\n", "    size:", (long)(hexa_str_len(w_xavier)));
+    x_mean = mean(w_xavier);
+    printf("%s %g %s\n", "    mean:", (double)((hexa_round((double)((x_mean * 10000))) / 10000)), "(should be ~0)");
+    printf("%s\n", "\n[5] Kaiming/He Init (fan_in=4, fan_out=8):");
+    w_kaiming = kaiming_init(4, 8);
+    printf("%s %ld\n", "    first 8:", (long)(slice(w_kaiming, 0, 8)));
+    k_mean = mean(w_kaiming);
+    printf("%s %g %s\n", "    mean:", (double)((hexa_round((double)((k_mean * 10000))) / 10000)), "(should be ~0)");
+    printf("%s\n", "\n[6] Anima Deployment Pipeline:");
+    W_train = xavier_init(4, 4);
+    printf("%s\n", "    trained weights (16 params)");
+    q = quantize_int8(W_train);
+    printf("%s %ld %s\n", "    quantized:", (long)(hexa_str_len(q[0])), "int8 params");
+    save_array(W_train, "/tmp/hexa_model.json");
+    printf("%s\n", "    saved model");
+    loaded = load_array("/tmp/hexa_model.json");
+    printf("%s %ld %s\n", "    loaded:", (long)(hexa_str_len(loaded)), "params");
+    printf("%s\n", "    deploy ready!");
+    run_tests();
+    printf("%s\n", "\n--- quant+beam+clip+init PASS ---");
+    return 0;
+}
