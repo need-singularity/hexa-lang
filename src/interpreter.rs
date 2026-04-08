@@ -129,7 +129,10 @@ pub struct Interpreter {
     fuse_fns: HashMap<String, (Vec<String>, Arc<Vec<Stmt>>)>,
     lazy_fns: std::collections::HashSet<String>,
     inline_fns: std::collections::HashSet<String>,
-    evolve_fns: HashMap<String, (Vec<String>, Arc<Vec<Stmt>>, u64)>,  // name -> (params, current_body, generation)
+    evolve_fns: HashMap<String, (Vec<String>, Arc<Vec<Stmt>>, u64)>,
+    test_fns: Vec<(String, Vec<String>, Arc<Vec<Stmt>>)>,
+    bench_fns: Vec<(String, Vec<String>, Arc<Vec<Stmt>>)>,
+    deprecated_fns: HashMap<String, String>,  // fn_name -> deprecation message  // name -> (params, current_body, generation)
     /// Loaded shared libraries: lib_path -> handle (dlopen result).
     #[cfg(not(target_arch = "wasm32"))]
     loaded_libs: HashMap<String, *mut std::ffi::c_void>,
@@ -198,6 +201,9 @@ impl Interpreter {
             lazy_fns: std::collections::HashSet::new(),
             inline_fns: std::collections::HashSet::new(),
             evolve_fns: HashMap::new(),
+            test_fns: Vec::new(),
+            bench_fns: Vec::new(),
+            deprecated_fns: HashMap::new(),
             #[cfg(not(target_arch = "wasm32"))]
             loaded_libs: HashMap::new(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -585,6 +591,25 @@ impl Interpreter {
                 if has_inline {
                     self.inline_fns.insert(decl.name.clone());
                 }
+                // AI-native @deprecated: mark function with deprecation warning
+                for attr in &decl.attrs {
+                    if let crate::token::AttrKind::Deprecated(ref msg) = attr.kind {
+                        let warn_msg = msg.clone().unwrap_or_else(|| format!("'{}' is deprecated", decl.name));
+                        self.deprecated_fns.insert(decl.name.clone(), warn_msg);
+                    }
+                }
+                // AI-native @test: register test function
+                let has_test = decl.attrs.iter().any(|a| matches!(a.kind, crate::token::AttrKind::Test));
+                if has_test {
+                    let param_names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
+                    self.test_fns.push((decl.name.clone(), param_names, Arc::new(decl.body.clone())));
+                }
+                // AI-native @bench: register benchmark function
+                let has_bench = decl.attrs.iter().any(|a| matches!(a.kind, crate::token::AttrKind::Bench));
+                if has_bench {
+                    let param_names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
+                    self.bench_fns.push((decl.name.clone(), param_names, Arc::new(decl.body.clone())));
+                }
                 // AI-native @evolve: self-modifying function (body replaceable at runtime)
                 let has_evolve = decl.attrs.iter().any(|a| matches!(a.kind, crate::token::AttrKind::Evolve));
                 if has_evolve {
@@ -895,11 +920,13 @@ impl Interpreter {
             }
             Stmt::EvolveFn(decl) => {
                 let param_names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
-                self.writeln_output(&format!("[evolve] Registered self-modifying fn: {}", decl.name));
-                self.env.define(
-                    &decl.name,
-                    Value::Fn(Box::new((decl.name.clone(), param_names, Arc::new(decl.body.clone())))),
-                );
+                // Track generation in evolve_fns
+                let gen = self.evolve_fns.get(&decl.name).map(|e| e.2 + 1).unwrap_or(0);
+                self.evolve_fns.insert(decl.name.clone(), (param_names.clone(), Arc::new(decl.body.clone()), gen));
+                let fn_val = Value::Fn(Box::new((decl.name.clone(), param_names, Arc::new(decl.body.clone()))));
+                // Update both env and fn_cache so new version is used immediately
+                self.fn_cache.insert(decl.name.clone(), fn_val.clone());
+                self.env.define(&decl.name, fn_val);
                 Ok(Value::Void)
             }
             Stmt::DeriveDecl(type_name, traits) => {
@@ -1585,6 +1612,12 @@ impl Interpreter {
                                     return Ok(result);
                                 }
                             }
+                        }
+                    }
+                    // AI-native @deprecated: emit warning at call site
+                    if let Expr::Ident(ref dep_name) = callee.as_ref() {
+                        if let Some(msg) = self.deprecated_fns.get(dep_name.as_str()).cloned() {
+                            self.writeln_output(&format!("warning[deprecated]: {}", msg));
                         }
                     }
                     // AI-native @fuse: single-pass array fusion
@@ -3702,6 +3735,2266 @@ impl Interpreter {
                     Value::Str(s) => Ok(Value::Str(s.to_lowercase())),
                     _ => Err(self.type_err("to_lower() requires string argument".into())),
                 }
+            }
+            // ── Neural network primitives (Anima consciousness engine) ──
+            "sigmoid" => {
+                if args.is_empty() { return Err(self.type_err("sigmoid() requires 1 argument".into())); }
+                match &args[0] {
+                    Value::Float(f) => Ok(Value::Float(1.0 / (1.0 + (-f).exp()))),
+                    Value::Int(n) => Ok(Value::Float(1.0 / (1.0 + (-(*n as f64)).exp()))),
+                    Value::Array(a) => {
+                        let result: Vec<Value> = a.iter().map(|x| {
+                            let xf = match x { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                            Value::Float(1.0 / (1.0 + (-xf).exp()))
+                        }).collect();
+                        Ok(Value::Array(result))
+                    }
+                    _ => Err(self.type_err("sigmoid() requires numeric or array argument".into())),
+                }
+            }
+            "tanh_" => {
+                if args.is_empty() { return Err(self.type_err("tanh_() requires 1 argument".into())); }
+                match &args[0] {
+                    Value::Float(f) => Ok(Value::Float(f.tanh())),
+                    Value::Int(n) => Ok(Value::Float((*n as f64).tanh())),
+                    Value::Array(a) => {
+                        let result: Vec<Value> = a.iter().map(|x| {
+                            let xf = match x { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                            Value::Float(xf.tanh())
+                        }).collect();
+                        Ok(Value::Array(result))
+                    }
+                    _ => Err(self.type_err("tanh_() requires numeric or array argument".into())),
+                }
+            }
+            "relu" => {
+                if args.is_empty() { return Err(self.type_err("relu() requires 1 argument".into())); }
+                match &args[0] {
+                    Value::Float(f) => Ok(Value::Float(if *f > 0.0 { *f } else { 0.0 })),
+                    Value::Int(n) => Ok(Value::Int(if *n > 0 { *n } else { 0 })),
+                    Value::Array(a) => {
+                        let result: Vec<Value> = a.iter().map(|x| match x {
+                            Value::Float(f) => Value::Float(if *f > 0.0 { *f } else { 0.0 }),
+                            Value::Int(i) => Value::Int(if *i > 0 { *i } else { 0 }),
+                            _ => Value::Float(0.0),
+                        }).collect();
+                        Ok(Value::Array(result))
+                    }
+                    _ => Err(self.type_err("relu() requires numeric or array argument".into())),
+                }
+            }
+            "softmax" => {
+                if args.is_empty() { return Err(self.type_err("softmax() requires 1 array argument".into())); }
+                if let Value::Array(a) = &args[0] {
+                    let vals: Vec<f64> = a.iter().map(|x| match x { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 }).collect();
+                    let max_val = vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                    let exps: Vec<f64> = vals.iter().map(|x| (x - max_val).exp()).collect();
+                    let sum: f64 = exps.iter().sum();
+                    let result: Vec<Value> = exps.iter().map(|e| Value::Float(e / sum)).collect();
+                    Ok(Value::Array(result))
+                } else {
+                    Err(self.type_err("softmax() requires array argument".into()))
+                }
+            }
+            "cosine_sim" => {
+                if args.len() < 2 { return Err(self.type_err("cosine_sim() requires 2 array arguments".into())); }
+                if let (Value::Array(a), Value::Array(b)) = (&args[0], &args[1]) {
+                    let mut dot = 0.0f64;
+                    let mut na = 0.0f64;
+                    let mut nb = 0.0f64;
+                    for (x, y) in a.iter().zip(b.iter()) {
+                        let xf = match x { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                        let yf = match y { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                        dot += xf * yf;
+                        na += xf * xf;
+                        nb += yf * yf;
+                    }
+                    let denom = na.sqrt() * nb.sqrt();
+                    Ok(Value::Float(if denom < 1e-10 { 0.0 } else { dot / denom }))
+                } else {
+                    Err(self.type_err("cosine_sim() requires 2 array arguments".into()))
+                }
+            }
+            // ── @test/@bench runner builtins ──
+            "run_tests" => {
+                let tests = self.test_fns.clone();
+                let total = tests.len();
+                let mut passed = 0usize;
+                let mut failed = 0usize;
+                for (name, _params, body) in &tests {
+                    self.env.push_scope();
+                    let mut ok = true;
+                    for stmt in body.iter() {
+                        match self.exec_stmt(stmt) {
+                            Ok(_) => {
+                                if self.return_value.is_some() {
+                                    self.return_value.take();
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                self.writeln_output(&format!("  FAIL {}: {}", name, e.message));
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    self.env.pop_scope();
+                    if ok { passed += 1; self.writeln_output(&format!("  PASS {}", name)); }
+                    else { failed += 1; }
+                }
+                self.writeln_output(&format!("--- {}/{} tests passed ---", passed, total));
+                Ok(Value::Bool(failed == 0))
+            }
+            "run_benchmarks" => {
+                let benches = self.bench_fns.clone();
+                for (name, _params, body) in &benches {
+                    let start = std::time::Instant::now();
+                    self.env.push_scope();
+                    for stmt in body.iter() {
+                        match self.exec_stmt(stmt) {
+                            Ok(_) => { if self.return_value.is_some() { self.return_value.take(); break; } }
+                            Err(e) => { self.writeln_output(&format!("  BENCH ERR {}: {}", name, e.message)); break; }
+                        }
+                    }
+                    self.env.pop_scope();
+                    let elapsed = start.elapsed();
+                    self.writeln_output(&format!("  BENCH {} : {:.3}ms", name, elapsed.as_secs_f64() * 1000.0));
+                }
+                Ok(Value::Void)
+            }
+            // ── Matrix/Vector builtins (Anima GRU/Hebbian acceleration) ──
+            "dot" => {
+                // dot(a, b) → scalar dot product of two arrays
+                if args.len() < 2 { return Err(self.type_err("dot() requires 2 array arguments".into())); }
+                if let (Value::Array(a), Value::Array(b)) = (&args[0], &args[1]) {
+                    let mut sum = 0.0f64;
+                    for (x, y) in a.iter().zip(b.iter()) {
+                        let xf = match x { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                        let yf = match y { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                        sum += xf * yf;
+                    }
+                    Ok(Value::Float(sum))
+                } else {
+                    Err(self.type_err("dot() requires 2 array arguments".into()))
+                }
+            }
+            "matvec" => {
+                // matvec(mat_flat, vec, rows, cols) → result vector
+                // mat is row-major flat array [rows*cols], vec is [cols]
+                if args.len() < 4 { return Err(self.type_err("matvec() requires (mat, vec, rows, cols)".into())); }
+                if let (Value::Array(mat), Value::Array(v), Value::Int(rows), Value::Int(cols)) = (&args[0], &args[1], &args[2], &args[3]) {
+                    let rows = *rows as usize;
+                    let cols = *cols as usize;
+                    let mut result = Vec::with_capacity(rows);
+                    for r in 0..rows {
+                        let mut sum = 0.0f64;
+                        for c in 0..cols {
+                            let mval = match &mat[r * cols + c] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                            let vval = match &v[c] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                            sum += mval * vval;
+                        }
+                        result.push(Value::Float(sum));
+                    }
+                    Ok(Value::Array(result))
+                } else {
+                    Err(self.type_err("matvec() requires (array, array, int, int)".into()))
+                }
+            }
+            "mat_add" => {
+                // mat_add(a, b) → element-wise addition of arrays
+                if args.len() < 2 { return Err(self.type_err("mat_add() requires 2 arrays".into())); }
+                if let (Value::Array(a), Value::Array(b)) = (&args[0], &args[1]) {
+                    let result: Vec<Value> = a.iter().zip(b.iter()).map(|(x, y)| {
+                        let xf = match x { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                        let yf = match y { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                        Value::Float(xf + yf)
+                    }).collect();
+                    Ok(Value::Array(result))
+                } else {
+                    Err(self.type_err("mat_add() requires 2 arrays".into()))
+                }
+            }
+            "mat_scale" => {
+                // mat_scale(arr, scalar) → element-wise scaling
+                if args.len() < 2 { return Err(self.type_err("mat_scale() requires (array, scalar)".into())); }
+                if let Value::Array(a) = &args[0] {
+                    let s = match &args[1] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 1.0 };
+                    let result: Vec<Value> = a.iter().map(|x| {
+                        let xf = match x { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                        Value::Float(xf * s)
+                    }).collect();
+                    Ok(Value::Array(result))
+                } else {
+                    Err(self.type_err("mat_scale() requires (array, scalar)".into()))
+                }
+            }
+            "matmul" => {
+                // matmul(A, B, M, K, N) → C[M×N] = A[M×K] × B[K×N], all flat row-major
+                if args.len() < 5 { return Err(self.type_err("matmul() requires (A, B, M, K, N)".into())); }
+                if let (Value::Array(a), Value::Array(b), Value::Int(m), Value::Int(k), Value::Int(n)) = (&args[0], &args[1], &args[2], &args[3], &args[4]) {
+                    let (m, k, n) = (*m as usize, *k as usize, *n as usize);
+                    let mut c = vec![0.0f64; m * n];
+                    for i in 0..m {
+                        for j in 0..n {
+                            let mut sum = 0.0f64;
+                            for p in 0..k {
+                                let av = match &a[i * k + p] { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 };
+                                let bv = match &b[p * n + j] { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 };
+                                sum += av * bv;
+                            }
+                            c[i * n + j] = sum;
+                        }
+                    }
+                    Ok(Value::Array(c.into_iter().map(Value::Float).collect()))
+                } else {
+                    Err(self.type_err("matmul() requires (array, array, int, int, int)".into()))
+                }
+            }
+            "transpose" => {
+                // transpose(mat, rows, cols) → transposed [cols×rows]
+                if args.len() < 3 { return Err(self.type_err("transpose() requires (mat, rows, cols)".into())); }
+                if let (Value::Array(a), Value::Int(rows), Value::Int(cols)) = (&args[0], &args[1], &args[2]) {
+                    let (rows, cols) = (*rows as usize, *cols as usize);
+                    let mut result = Vec::with_capacity(rows * cols);
+                    for j in 0..cols {
+                        for i in 0..rows {
+                            result.push(a[i * cols + j].clone());
+                        }
+                    }
+                    Ok(Value::Array(result))
+                } else {
+                    Err(self.type_err("transpose() requires (array, int, int)".into()))
+                }
+            }
+            "normalize" => {
+                // normalize(vec) → L2 normalized vector
+                if args.is_empty() { return Err(self.type_err("normalize() requires 1 array argument".into())); }
+                if let Value::Array(a) = &args[0] {
+                    let mut norm_sq = 0.0f64;
+                    for x in a.iter() {
+                        let xf = match x { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                        norm_sq += xf * xf;
+                    }
+                    let norm = norm_sq.sqrt();
+                    if norm < 1e-10 {
+                        Ok(Value::Array(a.clone()))
+                    } else {
+                        let result: Vec<Value> = a.iter().map(|x| {
+                            let xf = match x { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                            Value::Float(xf / norm)
+                        }).collect();
+                        Ok(Value::Array(result))
+                    }
+                } else {
+                    Err(self.type_err("normalize() requires array argument".into()))
+                }
+            }
+            "cross_entropy" => {
+                // cross_entropy(logits_array, target_index) → scalar loss
+                if args.len() < 2 { return Err(self.type_err("cross_entropy() requires (logits, target)".into())); }
+                if let (Value::Array(logits), Value::Int(target)) = (&args[0], &args[1]) {
+                    let vals: Vec<f64> = logits.iter().map(|x| match x { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 }).collect();
+                    let max_val = vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                    let exps: Vec<f64> = vals.iter().map(|x| (x - max_val).exp()).collect();
+                    let sum: f64 = exps.iter().sum();
+                    let log_softmax = (exps[*target as usize] / sum).ln();
+                    Ok(Value::Float(-log_softmax))
+                } else {
+                    Err(self.type_err("cross_entropy() requires (array, int)".into()))
+                }
+            }
+            "argmax" => {
+                if args.is_empty() { return Err(self.type_err("argmax() requires 1 array argument".into())); }
+                if let Value::Array(a) = &args[0] {
+                    let mut best_idx = 0usize;
+                    let mut best_val = f64::NEG_INFINITY;
+                    for (i, x) in a.iter().enumerate() {
+                        let xf = match x { Value::Float(f) => *f, Value::Int(n) => *n as f64, _ => 0.0 };
+                        if xf > best_val { best_val = xf; best_idx = i; }
+                    }
+                    Ok(Value::Int(best_idx as i64))
+                } else {
+                    Err(self.type_err("argmax() requires array argument".into()))
+                }
+            }
+            // ── Tensor initialization builtins ──
+            "zeros" => {
+                // zeros(n) → array of n zeros
+                if args.is_empty() { return Err(self.type_err("zeros() requires 1 int argument".into())); }
+                if let Value::Int(n) = &args[0] {
+                    Ok(Value::Array(vec![Value::Float(0.0); *n as usize]))
+                } else { Err(self.type_err("zeros() requires int".into())) }
+            }
+            "ones" => {
+                if args.is_empty() { return Err(self.type_err("ones() requires 1 int argument".into())); }
+                if let Value::Int(n) = &args[0] {
+                    Ok(Value::Array(vec![Value::Float(1.0); *n as usize]))
+                } else { Err(self.type_err("ones() requires int".into())) }
+            }
+            "randn" => {
+                // randn(n) → array of n random normal (Box-Muller)
+                // randn(n, scale) → scaled
+                if args.is_empty() { return Err(self.type_err("randn() requires at least 1 argument".into())); }
+                if let Value::Int(n) = &args[0] {
+                    let scale = if args.len() > 1 {
+                        match &args[1] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 1.0 }
+                    } else { 1.0 };
+                    use std::f64::consts::PI;
+                    let count = *n as usize;
+                    let mut result = Vec::with_capacity(count);
+                    for i in 0..count {
+                        // Simple LCG + Box-Muller
+                        let u1 = ((i as f64 * 2654435761.0 + self.current_line as f64 * 1013904223.0) % 1000000.0) / 1000000.0;
+                        let u2 = ((i as f64 * 1103515245.0 + self.current_line as f64 * 12345.0 + 0.5) % 1000000.0) / 1000000.0;
+                        let u1 = u1.max(1e-10);
+                        let z = (-2.0 * u1.ln()).sqrt() * (2.0 * PI * u2).cos();
+                        result.push(Value::Float(z * scale));
+                    }
+                    Ok(Value::Array(result))
+                } else { Err(self.type_err("randn() requires int".into())) }
+            }
+            "arange" => {
+                // arange(n) → [0.0, 1.0, ..., n-1.0]
+                if args.is_empty() { return Err(self.type_err("arange() requires 1 int argument".into())); }
+                if let Value::Int(n) = &args[0] {
+                    let result: Vec<Value> = (0..*n).map(|i| Value::Float(i as f64)).collect();
+                    Ok(Value::Array(result))
+                } else { Err(self.type_err("arange() requires int".into())) }
+            }
+            // ── Learning utility builtins ──
+            "ema" => {
+                // ema(old_val, new_val, alpha) → old*(1-alpha) + new*alpha
+                if args.len() < 3 { return Err(self.type_err("ema() requires (old, new, alpha)".into())); }
+                let old_v = match &args[0] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                let new_v = match &args[1] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                let alpha = match &args[2] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.014 };
+                Ok(Value::Float(old_v * (1.0 - alpha) + new_v * alpha))
+            }
+            "clip" => {
+                // clip(val, lo, hi) — scalar or array
+                if args.len() < 3 { return Err(self.type_err("clip() requires (val, lo, hi)".into())); }
+                let lo = match &args[1] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => f64::NEG_INFINITY };
+                let hi = match &args[2] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => f64::INFINITY };
+                match &args[0] {
+                    Value::Float(f) => Ok(Value::Float(f.max(lo).min(hi))),
+                    Value::Int(i) => Ok(Value::Float((*i as f64).max(lo).min(hi))),
+                    Value::Array(a) => {
+                        let result: Vec<Value> = a.iter().map(|x| {
+                            let xf = match x { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                            Value::Float(xf.max(lo).min(hi))
+                        }).collect();
+                        Ok(Value::Array(result))
+                    }
+                    _ => Err(self.type_err("clip() requires numeric or array".into())),
+                }
+            }
+            "sum" => {
+                // sum(array) → scalar sum
+                if args.is_empty() { return Err(self.type_err("sum() requires 1 array argument".into())); }
+                if let Value::Array(a) = &args[0] {
+                    let total: f64 = a.iter().map(|x| match x { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 }).sum();
+                    Ok(Value::Float(total))
+                } else { Err(self.type_err("sum() requires array".into())) }
+            }
+            "mean" => {
+                if args.is_empty() { return Err(self.type_err("mean() requires 1 array argument".into())); }
+                if let Value::Array(a) = &args[0] {
+                    let total: f64 = a.iter().map(|x| match x { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 }).sum();
+                    Ok(Value::Float(total / a.len() as f64))
+                } else { Err(self.type_err("mean() requires array".into())) }
+            }
+            "hadamard" => {
+                // hadamard(a, b) → element-wise multiply
+                if args.len() < 2 { return Err(self.type_err("hadamard() requires 2 arrays".into())); }
+                if let (Value::Array(a), Value::Array(b)) = (&args[0], &args[1]) {
+                    let result: Vec<Value> = a.iter().zip(b.iter()).map(|(x, y)| {
+                        let xf = match x { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                        let yf = match y { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                        Value::Float(xf * yf)
+                    }).collect();
+                    Ok(Value::Array(result))
+                } else { Err(self.type_err("hadamard() requires 2 arrays".into())) }
+            }
+            // ── Consciousness topology builtins (Anima-native) ──
+            "ring_topology" => {
+                // ring_topology(n) → flat adjacency [n×n], each cell connected to ±1 neighbors
+                if args.is_empty() { return Err(self.type_err("ring_topology() requires 1 int".into())); }
+                if let Value::Int(n) = &args[0] {
+                    let n = *n as usize;
+                    let mut adj = vec![Value::Float(0.0); n * n];
+                    for i in 0..n {
+                        let left = (i + n - 1) % n;
+                        let right = (i + 1) % n;
+                        adj[i * n + left] = Value::Float(1.0);
+                        adj[i * n + right] = Value::Float(1.0);
+                    }
+                    Ok(Value::Array(adj))
+                } else { Err(self.type_err("ring_topology() requires int".into())) }
+            }
+            "small_world_topology" => {
+                // small_world_topology(n, k, p) → Watts-Strogatz: ring + random rewiring
+                // k=neighbors per side, p=rewire probability (deterministic seed)
+                if args.len() < 3 { return Err(self.type_err("small_world_topology() requires (n, k, p)".into())); }
+                if let (Value::Int(n), Value::Int(k), Value::Float(p)) = (&args[0], &args[1], &args[2]) {
+                    let n = *n as usize;
+                    let k = *k as usize;
+                    let p = *p;
+                    let mut adj = vec![Value::Float(0.0); n * n];
+                    // Base ring with k neighbors each side
+                    for i in 0..n {
+                        for d in 1..=k {
+                            let right = (i + d) % n;
+                            let left = (i + n - d) % n;
+                            adj[i * n + right] = Value::Float(1.0);
+                            adj[i * n + left] = Value::Float(1.0);
+                        }
+                    }
+                    // Deterministic "rewiring" based on position
+                    for i in 0..n {
+                        for d in 1..=k {
+                            let hash = ((i * 2654435761 + d * 1013904223) % 1000) as f64 / 1000.0;
+                            if hash < p {
+                                let old_target = (i + d) % n;
+                                let new_target = ((i * 1103515245 + d * 12345) % n) as usize;
+                                if new_target != i {
+                                    adj[i * n + old_target] = Value::Float(0.0);
+                                    adj[i * n + new_target] = Value::Float(1.0);
+                                }
+                            }
+                        }
+                    }
+                    Ok(Value::Array(adj))
+                } else { Err(self.type_err("small_world_topology() requires (int, int, float)".into())) }
+            }
+            "hypercube_topology" => {
+                // hypercube_topology(n) → n must be power of 2, connect nodes differing by 1 bit
+                if args.is_empty() { return Err(self.type_err("hypercube_topology() requires 1 int".into())); }
+                if let Value::Int(n) = &args[0] {
+                    let n = *n as usize;
+                    let mut adj = vec![Value::Float(0.0); n * n];
+                    for i in 0..n {
+                        for bit in 0..32 {
+                            let j = i ^ (1 << bit);
+                            if j < n {
+                                adj[i * n + j] = Value::Float(1.0);
+                            }
+                        }
+                    }
+                    Ok(Value::Array(adj))
+                } else { Err(self.type_err("hypercube_topology() requires int".into())) }
+            }
+            "auto_topology" => {
+                // auto_topology(n) → auto-select: ring(≤4), small_world(≤16), hypercube(≤64), scale_free(>64)
+                if args.is_empty() { return Err(self.type_err("auto_topology() requires 1 int".into())); }
+                if let Value::Int(n) = &args[0] {
+                    let n_val = *n as usize;
+                    if n_val <= 4 {
+                        // Ring
+                        return self.call_builtin("ring_topology", vec![Value::Int(*n)]);
+                    } else if n_val <= 16 {
+                        // Small-world
+                        return self.call_builtin("small_world_topology", vec![Value::Int(*n), Value::Int(2), Value::Float(0.3)]);
+                    } else {
+                        // Hypercube (round to nearest power of 2)
+                        let mut pow2 = 1;
+                        while pow2 < n_val { pow2 <<= 1; }
+                        return self.call_builtin("hypercube_topology", vec![Value::Int(pow2 as i64)]);
+                    }
+                } else { Err(self.type_err("auto_topology() requires int".into())) }
+            }
+            // ── Optimizer builtins (SGD/Adam) ──
+            "sgd_step" => {
+                // sgd_step(params, grads, lr) → updated params = params - lr * grads
+                if args.len() < 3 { return Err(self.type_err("sgd_step() requires (params, grads, lr)".into())); }
+                if let (Value::Array(p), Value::Array(g)) = (&args[0], &args[1]) {
+                    let lr = match &args[2] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.01 };
+                    let result: Vec<Value> = p.iter().zip(g.iter()).map(|(pv, gv)| {
+                        let pf = match pv { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                        let gf = match gv { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                        Value::Float(pf - lr * gf)
+                    }).collect();
+                    Ok(Value::Array(result))
+                } else { Err(self.type_err("sgd_step() requires (array, array, float)".into())) }
+            }
+            "adam_step" => {
+                // adam_step(params, grads, m, v, lr, beta1, beta2, eps, t) → [new_params, new_m, new_v]
+                // Returns flattened: first N = params, next N = m, next N = v
+                if args.len() < 9 { return Err(self.type_err("adam_step() requires 9 args".into())); }
+                if let (Value::Array(p), Value::Array(g), Value::Array(m), Value::Array(v)) = (&args[0], &args[1], &args[2], &args[3]) {
+                    let lr = match &args[4] { Value::Float(f) => *f, _ => 0.001 };
+                    let beta1 = match &args[5] { Value::Float(f) => *f, _ => 0.9 };
+                    let beta2 = match &args[6] { Value::Float(f) => *f, _ => 0.999 };
+                    let eps = match &args[7] { Value::Float(f) => *f, _ => 1e-8 };
+                    let t = match &args[8] { Value::Int(i) => *i as f64, Value::Float(f) => *f, _ => 1.0 };
+                    let n = p.len();
+                    let mut new_p = Vec::with_capacity(n);
+                    let mut new_m = Vec::with_capacity(n);
+                    let mut new_v = Vec::with_capacity(n);
+                    let bc1 = 1.0 - beta1.powf(t);
+                    let bc2 = 1.0 - beta2.powf(t);
+                    for i in 0..n {
+                        let pf = match &p[i] { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 };
+                        let gf = match &g[i] { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 };
+                        let mf = match &m[i] { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 };
+                        let vf = match &v[i] { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 };
+                        let mi = beta1 * mf + (1.0 - beta1) * gf;
+                        let vi = beta2 * vf + (1.0 - beta2) * gf * gf;
+                        let m_hat = mi / bc1;
+                        let v_hat = vi / bc2;
+                        let pi = pf - lr * m_hat / (v_hat.sqrt() + eps);
+                        new_p.push(Value::Float(pi));
+                        new_m.push(Value::Float(mi));
+                        new_v.push(Value::Float(vi));
+                    }
+                    // Return as flat array: [params..., m..., v...]
+                    let mut result = new_p;
+                    result.extend(new_m);
+                    result.extend(new_v);
+                    Ok(Value::Array(result))
+                } else { Err(self.type_err("adam_step() requires arrays".into())) }
+            }
+            // ── LR Scheduling builtins (Anima Phase Curriculum) ──
+            "warmup_lr" => {
+                // warmup_lr(base_lr, step, warmup_steps) → linearly ramp from 0 to base_lr
+                if args.len() < 3 { return Err(self.type_err("warmup_lr() requires (base_lr, step, warmup_steps)".into())); }
+                let base = match &args[0] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.001 };
+                let step = match &args[1] { Value::Int(i) => *i as f64, Value::Float(f) => *f, _ => 0.0 };
+                let warmup = match &args[2] { Value::Int(i) => *i as f64, Value::Float(f) => *f, _ => 1000.0 };
+                if step < warmup {
+                    Ok(Value::Float(base * step / warmup))
+                } else {
+                    Ok(Value::Float(base))
+                }
+            }
+            "cosine_lr" => {
+                // cosine_lr(base_lr, step, total_steps, min_lr) → cosine annealing
+                if args.len() < 3 { return Err(self.type_err("cosine_lr() requires (base_lr, step, total_steps)".into())); }
+                let base = match &args[0] { Value::Float(f) => *f, _ => 0.001 };
+                let step = match &args[1] { Value::Int(i) => *i as f64, Value::Float(f) => *f, _ => 0.0 };
+                let total = match &args[2] { Value::Int(i) => *i as f64, Value::Float(f) => *f, _ => 10000.0 };
+                let min_lr = if args.len() > 3 { match &args[3] { Value::Float(f) => *f, _ => 0.0 } } else { 0.0 };
+                let progress = (step / total).min(1.0);
+                let lr = min_lr + 0.5 * (base - min_lr) * (1.0 + (std::f64::consts::PI * progress).cos());
+                Ok(Value::Float(lr))
+            }
+            "phase_lr" => {
+                // phase_lr(base_lr, step, total_steps, n_phases) → Law 60 phase curriculum
+                // Each phase gets 1/n of total steps; lr decays per phase
+                if args.len() < 4 { return Err(self.type_err("phase_lr() requires (base_lr, step, total, n_phases)".into())); }
+                let base = match &args[0] { Value::Float(f) => *f, _ => 0.001 };
+                let step = match &args[1] { Value::Int(i) => *i as f64, Value::Float(f) => *f, _ => 0.0 };
+                let total = match &args[2] { Value::Int(i) => *i as f64, Value::Float(f) => *f, _ => 10000.0 };
+                let n_phases = match &args[3] { Value::Int(i) => *i as usize, _ => 3 };
+                let phase = ((step / total * n_phases as f64) as usize).min(n_phases - 1);
+                let decay = 0.5f64.powi(phase as i32);
+                Ok(Value::Float(base * decay))
+            }
+            // ── Transformer building blocks ──
+            "layer_norm" => {
+                // layer_norm(x, dim) → normalized vector (mean=0, var=1) per sample
+                if args.len() < 2 { return Err(self.type_err("layer_norm() requires (array, dim)".into())); }
+                if let (Value::Array(x), Value::Int(dim)) = (&args[0], &args[1]) {
+                    let dim = *dim as usize;
+                    let n_samples = x.len() / dim;
+                    let mut result = Vec::with_capacity(x.len());
+                    for s in 0..n_samples {
+                        let mut mean = 0.0f64;
+                        for d in 0..dim {
+                            mean += match &x[s * dim + d] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                        }
+                        mean /= dim as f64;
+                        let mut var = 0.0f64;
+                        for d in 0..dim {
+                            let v = match &x[s * dim + d] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                            var += (v - mean) * (v - mean);
+                        }
+                        var = (var / dim as f64 + 1e-5).sqrt();
+                        for d in 0..dim {
+                            let v = match &x[s * dim + d] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                            result.push(Value::Float((v - mean) / var));
+                        }
+                    }
+                    Ok(Value::Array(result))
+                } else { Err(self.type_err("layer_norm() type error".into())) }
+            }
+            "dropout" => {
+                // dropout(array, rate, training) → zero out elements with deterministic mask
+                if args.len() < 3 { return Err(self.type_err("dropout() requires (array, rate, training_bool)".into())); }
+                if let (Value::Array(x), Value::Float(rate)) = (&args[0], &args[1]) {
+                    let training = matches!(&args[2], Value::Bool(true));
+                    if !training {
+                        return Ok(Value::Array(x.clone())); // inference: passthrough
+                    }
+                    let scale = 1.0 / (1.0 - rate);
+                    let result: Vec<Value> = x.iter().enumerate().map(|(i, v)| {
+                        let hash = ((i * 2654435761 + self.current_line * 1013904223) % 1000) as f64 / 1000.0;
+                        if hash < *rate {
+                            Value::Float(0.0)
+                        } else {
+                            let vf = match v { Value::Float(f) => *f, Value::Int(n) => *n as f64, _ => 0.0 };
+                            Value::Float(vf * scale)
+                        }
+                    }).collect();
+                    Ok(Value::Array(result))
+                } else { Err(self.type_err("dropout() type error".into())) }
+            }
+            "embedding" => {
+                // embedding(tokens, weight, vocab_size, dim) → [batch × dim] embeddings
+                // tokens: array of int indices, weight: flat [vocab_size × dim]
+                if args.len() < 4 { return Err(self.type_err("embedding() requires (tokens, weight, vocab_size, dim)".into())); }
+                if let (Value::Array(tokens), Value::Array(w), Value::Int(_vs), Value::Int(dim)) = (&args[0], &args[1], &args[2], &args[3]) {
+                    let dim = *dim as usize;
+                    let mut result = Vec::with_capacity(tokens.len() * dim);
+                    for tok in tokens {
+                        let idx = match tok { Value::Int(i) => *i as usize, _ => 0 };
+                        for d in 0..dim {
+                            if idx * dim + d < w.len() {
+                                result.push(w[idx * dim + d].clone());
+                            } else {
+                                result.push(Value::Float(0.0));
+                            }
+                        }
+                    }
+                    Ok(Value::Array(result))
+                } else { Err(self.type_err("embedding() type error".into())) }
+            }
+            "attention" => {
+                // attention(Q, K, V, seq_len, dim, causal) → output [seq_len × dim]
+                // Scaled dot-product attention with optional causal mask
+                if args.len() < 5 { return Err(self.type_err("attention() requires (Q, K, V, seq_len, dim)".into())); }
+                if let (Value::Array(q), Value::Array(k), Value::Array(v), Value::Int(seq), Value::Int(dim)) = (&args[0], &args[1], &args[2], &args[3], &args[4]) {
+                    let (seq, dim) = (*seq as usize, *dim as usize);
+                    let causal = args.len() > 5 && matches!(&args[5], Value::Bool(true));
+                    let scale = 1.0 / (dim as f64).sqrt();
+                    let mut output = Vec::with_capacity(seq * dim);
+                    for i in 0..seq {
+                        // Compute attention scores for position i
+                        let mut scores = Vec::with_capacity(seq);
+                        for j in 0..seq {
+                            if causal && j > i {
+                                scores.push(f64::NEG_INFINITY);
+                            } else {
+                                let mut dot = 0.0f64;
+                                for d in 0..dim {
+                                    let qv = match &q[i * dim + d] { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 };
+                                    let kv = match &k[j * dim + d] { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 };
+                                    dot += qv * kv;
+                                }
+                                scores.push(dot * scale);
+                            }
+                        }
+                        // Softmax
+                        let max_s = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                        let exps: Vec<f64> = scores.iter().map(|s| (s - max_s).exp()).collect();
+                        let sum_e: f64 = exps.iter().sum();
+                        let weights: Vec<f64> = exps.iter().map(|e| e / sum_e).collect();
+                        // Weighted sum of V
+                        for d in 0..dim {
+                            let mut val = 0.0f64;
+                            for j in 0..seq {
+                                let vv = match &v[j * dim + d] { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 };
+                                val += weights[j] * vv;
+                            }
+                            output.push(Value::Float(val));
+                        }
+                    }
+                    Ok(Value::Array(output))
+                } else { Err(self.type_err("attention() type error".into())) }
+            }
+            // ── Extended activations ──
+            "gelu" => {
+                // GELU: x * Φ(x) ≈ 0.5*x*(1+tanh(sqrt(2/π)*(x+0.044715*x³)))
+                if args.is_empty() { return Err(self.type_err("gelu() requires 1 argument".into())); }
+                let compute = |x: f64| -> f64 {
+                    0.5 * x * (1.0 + (std::f64::consts::FRAC_2_PI.sqrt() * (x + 0.044715 * x * x * x)).tanh())
+                };
+                match &args[0] {
+                    Value::Float(f) => Ok(Value::Float(compute(*f))),
+                    Value::Int(n) => Ok(Value::Float(compute(*n as f64))),
+                    Value::Array(a) => Ok(Value::Array(a.iter().map(|v| {
+                        let x = match v { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                        Value::Float(compute(x))
+                    }).collect())),
+                    _ => Err(self.type_err("gelu() type error".into())),
+                }
+            }
+            "silu" => {
+                // SiLU/Swish: x * sigmoid(x)
+                if args.is_empty() { return Err(self.type_err("silu() requires 1 argument".into())); }
+                let compute = |x: f64| -> f64 { x / (1.0 + (-x).exp()) };
+                match &args[0] {
+                    Value::Float(f) => Ok(Value::Float(compute(*f))),
+                    Value::Int(n) => Ok(Value::Float(compute(*n as f64))),
+                    Value::Array(a) => Ok(Value::Array(a.iter().map(|v| {
+                        let x = match v { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                        Value::Float(compute(x))
+                    }).collect())),
+                    _ => Err(self.type_err("silu() type error".into())),
+                }
+            }
+            // ── Positional encoding ──
+            "sinusoidal_pe" => {
+                // sinusoidal_pe(seq_len, dim) → [seq_len × dim] positional encoding
+                if args.len() < 2 { return Err(self.type_err("sinusoidal_pe() requires (seq_len, dim)".into())); }
+                if let (Value::Int(seq), Value::Int(dim)) = (&args[0], &args[1]) {
+                    let (seq, dim) = (*seq as usize, *dim as usize);
+                    let mut pe = Vec::with_capacity(seq * dim);
+                    for pos in 0..seq {
+                        for d in 0..dim {
+                            let angle = pos as f64 / (10000.0f64).powf(2.0 * (d / 2) as f64 / dim as f64);
+                            pe.push(Value::Float(if d % 2 == 0 { angle.sin() } else { angle.cos() }));
+                        }
+                    }
+                    Ok(Value::Array(pe))
+                } else { Err(self.type_err("sinusoidal_pe() type error".into())) }
+            }
+            // ── Multi-Head Attention ──
+            "multi_head_attention" => {
+                // multi_head_attention(x, Wq, Wk, Wv, Wo, seq, dim, n_heads, causal)
+                // x: [seq×dim], W*: [dim×dim], Wo: [dim×dim]
+                if args.len() < 8 { return Err(self.type_err("multi_head_attention() requires 8+ args".into())); }
+                if let (Value::Array(x), Value::Array(wq), Value::Array(wk), Value::Array(wv)) = (&args[0], &args[1], &args[2], &args[3]) {
+                    let wo = if let Value::Array(a) = &args[4] { a } else { return Err(self.type_err("Wo must be array".into())); };
+                    let seq = match &args[5] { Value::Int(i) => *i as usize, _ => 0 };
+                    let dim = match &args[6] { Value::Int(i) => *i as usize, _ => 0 };
+                    let n_heads = match &args[7] { Value::Int(i) => *i as usize, _ => 1 };
+                    let causal = args.len() > 8 && matches!(&args[8], Value::Bool(true));
+                    let head_dim = dim / n_heads;
+                    let scale = 1.0 / (head_dim as f64).sqrt();
+                    // Project Q, K, V
+                    let project = |w: &[Value], inp: &[Value]| -> Vec<f64> {
+                        let mut out = vec![0.0f64; seq * dim];
+                        for s in 0..seq {
+                            for d in 0..dim {
+                                let mut sum = 0.0;
+                                for k in 0..dim {
+                                    let wv = match &w[d * dim + k] { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 };
+                                    let xv = match &inp[s * dim + k] { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 };
+                                    sum += wv * xv;
+                                }
+                                out[s * dim + d] = sum;
+                            }
+                        }
+                        out
+                    };
+                    let q = project(wq, x);
+                    let k = project(wk, x);
+                    let v = project(wv, x);
+                    // Per-head attention
+                    let mut concat = vec![0.0f64; seq * dim];
+                    for h in 0..n_heads {
+                        let offset = h * head_dim;
+                        for i in 0..seq {
+                            let mut scores = vec![0.0f64; seq];
+                            for j in 0..seq {
+                                if causal && j > i { scores[j] = f64::NEG_INFINITY; continue; }
+                                let mut dot = 0.0;
+                                for d in 0..head_dim {
+                                    dot += q[i * dim + offset + d] * k[j * dim + offset + d];
+                                }
+                                scores[j] = dot * scale;
+                            }
+                            let max_s = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                            let exps: Vec<f64> = scores.iter().map(|s| (s - max_s).exp()).collect();
+                            let sum_e: f64 = exps.iter().sum();
+                            for d in 0..head_dim {
+                                let mut val = 0.0;
+                                for j in 0..seq {
+                                    val += (exps[j] / sum_e) * v[j * dim + offset + d];
+                                }
+                                concat[i * dim + offset + d] = val;
+                            }
+                        }
+                    }
+                    // Output projection
+                    let mut output = Vec::with_capacity(seq * dim);
+                    for s in 0..seq {
+                        for d in 0..dim {
+                            let mut sum = 0.0;
+                            for k in 0..dim {
+                                let wv = match &wo[d * dim + k] { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 };
+                                sum += wv * concat[s * dim + k];
+                            }
+                            output.push(Value::Float(sum));
+                        }
+                    }
+                    Ok(Value::Array(output))
+                } else { Err(self.type_err("multi_head_attention() type error".into())) }
+            }
+            // ── Sampling / Generation ──
+            "topk" => {
+                // topk(array, k) → [top k values], indices available via argmax pattern
+                if args.len() < 2 { return Err(self.type_err("topk() requires (array, k)".into())); }
+                if let (Value::Array(a), Value::Int(k)) = (&args[0], &args[1]) {
+                    let k = (*k as usize).min(a.len());
+                    let mut indexed: Vec<(usize, f64)> = a.iter().enumerate().map(|(i, v)| {
+                        (i, match v { Value::Float(f) => *f, Value::Int(n) => *n as f64, _ => 0.0 })
+                    }).collect();
+                    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    let result: Vec<Value> = indexed[..k].iter().map(|(i, _)| Value::Int(*i as i64)).collect();
+                    Ok(Value::Array(result))
+                } else { Err(self.type_err("topk() type error".into())) }
+            }
+            "sample_token" => {
+                // sample_token(logits, temperature) → sampled token index (deterministic based on position)
+                if args.len() < 2 { return Err(self.type_err("sample_token() requires (logits, temperature)".into())); }
+                if let (Value::Array(logits), Value::Float(temp)) = (&args[0], &args[1]) {
+                    let vals: Vec<f64> = logits.iter().map(|v| match v { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 }).collect();
+                    let max_v = vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                    let temp = temp.max(0.01);
+                    let exps: Vec<f64> = vals.iter().map(|v| ((v - max_v) / temp).exp()).collect();
+                    let sum: f64 = exps.iter().sum();
+                    let probs: Vec<f64> = exps.iter().map(|e| e / sum).collect();
+                    // Deterministic sampling via hash of probabilities
+                    let hash = (probs.iter().enumerate().map(|(i, p)| (i as f64 + 1.0) * p * 1000.0).sum::<f64>() % 1.0).abs();
+                    let mut cumsum = 0.0;
+                    for (i, p) in probs.iter().enumerate() {
+                        cumsum += p;
+                        if cumsum > hash { return Ok(Value::Int(i as i64)); }
+                    }
+                    Ok(Value::Int((logits.len() - 1) as i64))
+                } else { Err(self.type_err("sample_token() type error".into())) }
+            }
+            // ── Conv1D + KV Cache + Serialization ──
+            "conv1d" => {
+                // conv1d(input, kernel, in_len, kernel_size, stride) → output array
+                // 1D convolution (valid padding)
+                if args.len() < 5 { return Err(self.type_err("conv1d() requires (input, kernel, len, k_size, stride)".into())); }
+                if let (Value::Array(input), Value::Array(kernel), Value::Int(in_len), Value::Int(k_size), Value::Int(stride)) = (&args[0], &args[1], &args[2], &args[3], &args[4]) {
+                    let (in_len, k_size, stride) = (*in_len as usize, *k_size as usize, *stride as usize);
+                    let out_len = (in_len - k_size) / stride + 1;
+                    let mut result = Vec::with_capacity(out_len);
+                    for i in 0..out_len {
+                        let start = i * stride;
+                        let mut sum = 0.0f64;
+                        for k in 0..k_size {
+                            let iv = match &input[start + k] { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 };
+                            let kv = match &kernel[k] { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 };
+                            sum += iv * kv;
+                        }
+                        result.push(Value::Float(sum));
+                    }
+                    Ok(Value::Array(result))
+                } else { Err(self.type_err("conv1d() type error".into())) }
+            }
+            "max_pool1d" => {
+                // max_pool1d(input, pool_size, stride) → pooled output
+                if args.len() < 3 { return Err(self.type_err("max_pool1d() requires (input, pool_size, stride)".into())); }
+                if let (Value::Array(input), Value::Int(pool), Value::Int(stride)) = (&args[0], &args[1], &args[2]) {
+                    let (pool, stride) = (*pool as usize, *stride as usize);
+                    let out_len = (input.len() - pool) / stride + 1;
+                    let mut result = Vec::with_capacity(out_len);
+                    for i in 0..out_len {
+                        let start = i * stride;
+                        let mut max_v = f64::NEG_INFINITY;
+                        for k in 0..pool {
+                            let v = match &input[start + k] { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 };
+                            if v > max_v { max_v = v; }
+                        }
+                        result.push(Value::Float(max_v));
+                    }
+                    Ok(Value::Array(result))
+                } else { Err(self.type_err("max_pool1d() type error".into())) }
+            }
+            "kv_cache_append" => {
+                // kv_cache_append(cache, new_kv, dim) → extended cache with new row appended
+                // cache: [n×dim] flat, new_kv: [dim]
+                if args.len() < 3 { return Err(self.type_err("kv_cache_append() requires (cache, new_kv, dim)".into())); }
+                if let (Value::Array(cache), Value::Array(new_kv), Value::Int(_dim)) = (&args[0], &args[1], &args[2]) {
+                    let mut result = cache.clone();
+                    result.extend(new_kv.iter().cloned());
+                    Ok(Value::Array(result))
+                } else { Err(self.type_err("kv_cache_append() type error".into())) }
+            }
+            "attention_cached" => {
+                // attention_cached(q_new, k_cache, v_cache, cache_len, dim) → output for single new query
+                // Uses full K/V cache for a single query position (incremental inference)
+                if args.len() < 5 { return Err(self.type_err("attention_cached() requires (q, k_cache, v_cache, cache_len, dim)".into())); }
+                if let (Value::Array(q), Value::Array(k_cache), Value::Array(v_cache), Value::Int(cache_len), Value::Int(dim)) = (&args[0], &args[1], &args[2], &args[3], &args[4]) {
+                    let (cl, dim) = (*cache_len as usize, *dim as usize);
+                    let scale = 1.0 / (dim as f64).sqrt();
+                    // Compute attention scores: q · k_j for all cached positions
+                    let mut scores = Vec::with_capacity(cl);
+                    for j in 0..cl {
+                        let mut dot = 0.0f64;
+                        for d in 0..dim {
+                            let qv = match &q[d] { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 };
+                            let kv = match &k_cache[j * dim + d] { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 };
+                            dot += qv * kv;
+                        }
+                        scores.push(dot * scale);
+                    }
+                    // Softmax
+                    let max_s = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                    let exps: Vec<f64> = scores.iter().map(|s| (s - max_s).exp()).collect();
+                    let sum_e: f64 = exps.iter().sum();
+                    // Weighted sum of V
+                    let mut output = Vec::with_capacity(dim);
+                    for d in 0..dim {
+                        let mut val = 0.0f64;
+                        for j in 0..cl {
+                            let vv = match &v_cache[j * dim + d] { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 };
+                            val += (exps[j] / sum_e) * vv;
+                        }
+                        output.push(Value::Float(val));
+                    }
+                    Ok(Value::Array(output))
+                } else { Err(self.type_err("attention_cached() type error".into())) }
+            }
+            "save_array" => {
+                // save_array(array, filename) → write array as JSON to file
+                if args.len() < 2 { return Err(self.type_err("save_array() requires (array, filename)".into())); }
+                if let (Value::Array(a), Value::Str(path)) = (&args[0], &args[1]) {
+                    let vals: Vec<String> = a.iter().map(|v| match v {
+                        Value::Float(f) => format!("{}", f),
+                        Value::Int(i) => format!("{}", i),
+                        _ => "0".to_string(),
+                    }).collect();
+                    let json = format!("[{}]", vals.join(","));
+                    std::fs::write(path, &json).map_err(|e| self.runtime_err(format!("save_array: {}", e)))?;
+                    Ok(Value::Bool(true))
+                } else { Err(self.type_err("save_array() requires (array, string)".into())) }
+            }
+            "load_array" => {
+                // load_array(filename) → array loaded from JSON file
+                if args.is_empty() { return Err(self.type_err("load_array() requires filename".into())); }
+                if let Value::Str(path) = &args[0] {
+                    let content = std::fs::read_to_string(path).map_err(|e| self.runtime_err(format!("load_array: {}", e)))?;
+                    let trimmed = content.trim().trim_start_matches('[').trim_end_matches(']');
+                    let vals: Vec<Value> = trimmed.split(',').map(|s| {
+                        let s = s.trim();
+                        if let Ok(f) = s.parse::<f64>() { Value::Float(f) }
+                        else if let Ok(i) = s.parse::<i64>() { Value::Int(i) }
+                        else { Value::Float(0.0) }
+                    }).collect();
+                    Ok(Value::Array(vals))
+                } else { Err(self.type_err("load_array() requires string".into())) }
+            }
+            // ── Quantization (model compression) ──
+            "quantize_int8" => {
+                // quantize_int8(array) → [quantized_ints, scale, zero_point]
+                // Maps float range to [-128, 127]
+                if args.is_empty() { return Err(self.type_err("quantize_int8() requires array".into())); }
+                if let Value::Array(a) = &args[0] {
+                    let vals: Vec<f64> = a.iter().map(|v| match v { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 }).collect();
+                    let min_v = vals.iter().cloned().fold(f64::INFINITY, f64::min);
+                    let max_v = vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                    let scale = (max_v - min_v) / 255.0;
+                    let zero_point = (-128.0 - min_v / scale).round().max(-128.0).min(127.0);
+                    let quantized: Vec<Value> = vals.iter().map(|v| {
+                        let q = (v / scale + zero_point).round().max(-128.0).min(127.0);
+                        Value::Int(q as i64)
+                    }).collect();
+                    // Return [quantized_array, scale, zero_point]
+                    Ok(Value::Array(vec![
+                        Value::Array(quantized),
+                        Value::Float(scale),
+                        Value::Float(zero_point),
+                    ]))
+                } else { Err(self.type_err("quantize_int8() requires array".into())) }
+            }
+            "dequantize_int8" => {
+                // dequantize_int8(quantized_ints, scale, zero_point) → float array
+                if args.len() < 3 { return Err(self.type_err("dequantize_int8() requires (ints, scale, zp)".into())); }
+                if let (Value::Array(q), Value::Float(scale), Value::Float(zp)) = (&args[0], &args[1], &args[2]) {
+                    let result: Vec<Value> = q.iter().map(|v| {
+                        let qi = match v { Value::Int(i) => *i as f64, Value::Float(f) => *f, _ => 0.0 };
+                        Value::Float((qi - zp) * scale)
+                    }).collect();
+                    Ok(Value::Array(result))
+                } else { Err(self.type_err("dequantize_int8() type error".into())) }
+            }
+            // ── Beam Search ──
+            "beam_search_step" => {
+                // beam_search_step(beam_seqs, beam_scores, logits_batch, beam_width, vocab_size)
+                // beam_seqs: [beam_width × seq_len] flat, beam_scores: [beam_width]
+                // logits_batch: [beam_width × vocab_size] flat
+                // Returns: [new_seqs, new_scores] — top beam_width candidates
+                if args.len() < 5 { return Err(self.type_err("beam_search_step() requires 5 args".into())); }
+                if let (Value::Array(seqs), Value::Array(scores), Value::Array(logits), Value::Int(bw), Value::Int(vs)) = (&args[0], &args[1], &args[2], &args[3], &args[4]) {
+                    let (bw, vs) = (*bw as usize, *vs as usize);
+                    let seq_len = if bw > 0 { seqs.len() / bw } else { 0 };
+                    // Compute log-softmax for each beam
+                    let mut candidates: Vec<(f64, Vec<Value>)> = Vec::new();
+                    for b in 0..bw {
+                        let base_score = match &scores[b] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                        // Log-softmax of logits for this beam
+                        let mut beam_logits: Vec<f64> = (0..vs).map(|v| {
+                            match &logits[b * vs + v] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 }
+                        }).collect();
+                        let max_l = beam_logits.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                        let log_sum_exp = max_l + beam_logits.iter().map(|l| (l - max_l).exp()).sum::<f64>().ln();
+                        for v in 0..vs {
+                            let log_prob = beam_logits[v] - log_sum_exp;
+                            let new_score = base_score + log_prob;
+                            let mut new_seq: Vec<Value> = seqs[b * seq_len..(b + 1) * seq_len].to_vec();
+                            new_seq.push(Value::Int(v as i64));
+                            candidates.push((new_score, new_seq));
+                        }
+                    }
+                    // Sort by score descending, take top beam_width
+                    candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                    candidates.truncate(bw);
+                    let new_seq_len = seq_len + 1;
+                    let mut new_seqs: Vec<Value> = Vec::with_capacity(bw * new_seq_len);
+                    let mut new_scores: Vec<Value> = Vec::with_capacity(bw);
+                    for (score, seq) in &candidates {
+                        new_seqs.extend(seq.iter().cloned());
+                        new_scores.push(Value::Float(*score));
+                    }
+                    Ok(Value::Array(vec![Value::Array(new_seqs), Value::Array(new_scores)]))
+                } else { Err(self.type_err("beam_search_step() type error".into())) }
+            }
+            // ── Gradient Clipping + Weight Init ──
+            "grad_clip_norm" => {
+                // grad_clip_norm(grads, max_norm) → clipped grads (scale if L2 norm exceeds max)
+                if args.len() < 2 { return Err(self.type_err("grad_clip_norm() requires (grads, max_norm)".into())); }
+                if let (Value::Array(g), Value::Float(max_norm)) = (&args[0], &args[1]) {
+                    let mut norm_sq = 0.0f64;
+                    for v in g.iter() {
+                        let gf = match v { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                        norm_sq += gf * gf;
+                    }
+                    let norm = norm_sq.sqrt();
+                    if norm > *max_norm {
+                        let scale = max_norm / norm;
+                        let clipped: Vec<Value> = g.iter().map(|v| {
+                            let gf = match v { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                            Value::Float(gf * scale)
+                        }).collect();
+                        Ok(Value::Array(clipped))
+                    } else {
+                        Ok(Value::Array(g.clone()))
+                    }
+                } else { Err(self.type_err("grad_clip_norm() type error".into())) }
+            }
+            "xavier_init" => {
+                // xavier_init(fan_in, fan_out) → array of fan_in*fan_out weights ~ U(-a, a), a=sqrt(6/(in+out))
+                if args.len() < 2 { return Err(self.type_err("xavier_init() requires (fan_in, fan_out)".into())); }
+                if let (Value::Int(fin), Value::Int(fout)) = (&args[0], &args[1]) {
+                    let (fin, fout) = (*fin as usize, *fout as usize);
+                    let a = (6.0 / (fin + fout) as f64).sqrt();
+                    let n = fin * fout;
+                    let mut result = Vec::with_capacity(n);
+                    for i in 0..n {
+                        let hash = ((i * 2654435761 + fin * 1013904223 + fout * 12345) % 10000) as f64 / 10000.0;
+                        result.push(Value::Float((hash * 2.0 - 1.0) * a));
+                    }
+                    Ok(Value::Array(result))
+                } else { Err(self.type_err("xavier_init() requires (int, int)".into())) }
+            }
+            "kaiming_init" => {
+                // kaiming_init(fan_in, fan_out) → He init ~ N(0, sqrt(2/fan_in))
+                if args.len() < 2 { return Err(self.type_err("kaiming_init() requires (fan_in, fan_out)".into())); }
+                if let (Value::Int(fin), Value::Int(fout)) = (&args[0], &args[1]) {
+                    let (fin, fout) = (*fin as usize, *fout as usize);
+                    let std = (2.0 / fin as f64).sqrt();
+                    let n = fin * fout;
+                    let mut result = Vec::with_capacity(n);
+                    for i in 0..n {
+                        let u1 = ((i * 2654435761 + fin * 1013904223) % 10000) as f64 / 10000.0;
+                        let u2 = ((i * 1103515245 + fout * 12345 + 1) % 10000) as f64 / 10000.0;
+                        let u1 = u1.max(1e-10);
+                        let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+                        result.push(Value::Float(z * std));
+                    }
+                    Ok(Value::Array(result))
+                } else { Err(self.type_err("kaiming_init() requires (int, int)".into())) }
+            }
+            // ── RL Reward builtins (Anima OnlineLearner) ──
+            "curiosity_reward" => {
+                // curiosity_reward(prediction_errors, window) → z-score normalized curiosity
+                if args.len() < 2 { return Err(self.type_err("curiosity_reward() requires (errors, window)".into())); }
+                if let (Value::Array(pe), Value::Int(window)) = (&args[0], &args[1]) {
+                    let w = (*window as usize).min(pe.len());
+                    let recent: Vec<f64> = pe[pe.len()-w..].iter().map(|v| match v { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 }).collect();
+                    let mean: f64 = recent.iter().sum::<f64>() / w as f64;
+                    let var: f64 = recent.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / w as f64;
+                    let std = (var + 1e-8).sqrt();
+                    let latest = recent[w - 1];
+                    let z_score = ((latest - mean) / std).max(-3.0).min(3.0);
+                    Ok(Value::Float(z_score / 3.0)) // normalize to [-1, 1]
+                } else { Err(self.type_err("curiosity_reward() type error".into())) }
+            }
+            "dialogue_reward" => {
+                // dialogue_reward(ce_losses, split_point) → improvement score [-1, 1]
+                // Compares first-half vs second-half mean CE (positive = improving)
+                if args.len() < 1 { return Err(self.type_err("dialogue_reward() requires (losses)".into())); }
+                if let Value::Array(losses) = &args[0] {
+                    let n = losses.len();
+                    if n < 2 { return Ok(Value::Float(0.0)); }
+                    let mid = n / 2;
+                    let first: f64 = losses[..mid].iter().map(|v| match v { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 }).sum::<f64>() / mid as f64;
+                    let second: f64 = losses[mid..].iter().map(|v| match v { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 }).sum::<f64>() / (n - mid) as f64;
+                    let improvement = (first - second).max(-1.0).min(1.0); // positive = loss decreased
+                    Ok(Value::Float(improvement))
+                } else { Err(self.type_err("dialogue_reward() type error".into())) }
+            }
+            "combined_reward" => {
+                // combined_reward(curiosity, dialogue, curiosity_weight) → weighted sum
+                if args.len() < 3 { return Err(self.type_err("combined_reward() requires (curiosity, dialogue, weight)".into())); }
+                let c = match &args[0] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                let d = match &args[1] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                let w = match &args[2] { Value::Float(f) => *f, _ => 0.7 };
+                Ok(Value::Float((w * c + (1.0 - w) * d).max(-1.0).min(1.0)))
+            }
+            // ── Model Pruning ──
+            "magnitude_prune" => {
+                // magnitude_prune(weights, sparsity) → pruned weights (small values → 0)
+                if args.len() < 2 { return Err(self.type_err("magnitude_prune() requires (weights, sparsity)".into())); }
+                if let (Value::Array(w), Value::Float(sparsity)) = (&args[0], &args[1]) {
+                    let mut magnitudes: Vec<f64> = w.iter().map(|v| match v { Value::Float(f) => f.abs(), Value::Int(i) => (*i as f64).abs(), _ => 0.0 }).collect();
+                    magnitudes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                    let threshold_idx = ((w.len() as f64 * sparsity) as usize).min(w.len() - 1);
+                    let threshold = magnitudes[threshold_idx];
+                    let pruned: Vec<Value> = w.iter().map(|v| {
+                        let vf = match v { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                        if vf.abs() <= threshold { Value::Float(0.0) } else { Value::Float(vf) }
+                    }).collect();
+                    Ok(Value::Array(pruned))
+                } else { Err(self.type_err("magnitude_prune() type error".into())) }
+            }
+            "sparsity" => {
+                // sparsity(weights) → fraction of zeros
+                if args.is_empty() { return Err(self.type_err("sparsity() requires array".into())); }
+                if let Value::Array(w) = &args[0] {
+                    let zeros = w.iter().filter(|v| match v { Value::Float(f) => *f == 0.0, Value::Int(i) => *i == 0, _ => false }).count();
+                    Ok(Value::Float(zeros as f64 / w.len() as f64))
+                } else { Err(self.type_err("sparsity() type error".into())) }
+            }
+            // ── Time Series Analysis (Φ tracking) ──
+            "autocorrelation" => {
+                // autocorrelation(series, lag) → correlation at given lag
+                if args.len() < 2 { return Err(self.type_err("autocorrelation() requires (series, lag)".into())); }
+                if let (Value::Array(s), Value::Int(lag)) = (&args[0], &args[1]) {
+                    let lag = *lag as usize;
+                    let n = s.len();
+                    if lag >= n { return Ok(Value::Float(0.0)); }
+                    let vals: Vec<f64> = s.iter().map(|v| match v { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 }).collect();
+                    let mean: f64 = vals.iter().sum::<f64>() / n as f64;
+                    let var: f64 = vals.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>();
+                    if var < 1e-10 { return Ok(Value::Float(0.0)); }
+                    let cov: f64 = (0..n-lag).map(|i| (vals[i] - mean) * (vals[i + lag] - mean)).sum::<f64>();
+                    Ok(Value::Float(cov / var))
+                } else { Err(self.type_err("autocorrelation() type error".into())) }
+            }
+            "trend_slope" => {
+                // trend_slope(series) → linear regression slope (positive = increasing)
+                if args.is_empty() { return Err(self.type_err("trend_slope() requires array".into())); }
+                if let Value::Array(s) = &args[0] {
+                    let n = s.len() as f64;
+                    let vals: Vec<f64> = s.iter().map(|v| match v { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 }).collect();
+                    let x_mean = (n - 1.0) / 2.0;
+                    let y_mean: f64 = vals.iter().sum::<f64>() / n;
+                    let mut num = 0.0f64;
+                    let mut den = 0.0f64;
+                    for (i, y) in vals.iter().enumerate() {
+                        let x = i as f64 - x_mean;
+                        num += x * (y - y_mean);
+                        den += x * x;
+                    }
+                    Ok(Value::Float(if den < 1e-10 { 0.0 } else { num / den }))
+                } else { Err(self.type_err("trend_slope() type error".into())) }
+            }
+            "running_stats" => {
+                // running_stats(series) → [mean, std, min, max, trend]
+                if args.is_empty() { return Err(self.type_err("running_stats() requires array".into())); }
+                if let Value::Array(s) = &args[0] {
+                    let vals: Vec<f64> = s.iter().map(|v| match v { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 }).collect();
+                    let n = vals.len() as f64;
+                    let mean = vals.iter().sum::<f64>() / n;
+                    let var = vals.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / n;
+                    let std = var.sqrt();
+                    let min = vals.iter().cloned().fold(f64::INFINITY, f64::min);
+                    let max = vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                    // Simple trend: last - first / n
+                    let trend = if vals.len() > 1 { (vals[vals.len()-1] - vals[0]) / (vals.len() - 1) as f64 } else { 0.0 };
+                    Ok(Value::Array(vec![Value::Float(mean), Value::Float(std), Value::Float(min), Value::Float(max), Value::Float(trend)]))
+                } else { Err(self.type_err("running_stats() type error".into())) }
+            }
+            // ── ASCII Visualization ──
+            "ascii_plot" => {
+                // ascii_plot(data, width, height, title) → prints ASCII line chart
+                if args.len() < 3 { return Err(self.type_err("ascii_plot() requires (data, width, height)".into())); }
+                if let (Value::Array(data), Value::Int(width), Value::Int(height)) = (&args[0], &args[1], &args[2]) {
+                    let (w, h) = (*width as usize, *height as usize);
+                    let title = if args.len() > 3 { if let Value::Str(s) = &args[3] { s.clone() } else { String::new() } } else { String::new() };
+                    let vals: Vec<f64> = data.iter().map(|v| match v { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 }).collect();
+                    if vals.is_empty() { return Ok(Value::Void); }
+                    let min_v = vals.iter().cloned().fold(f64::INFINITY, f64::min);
+                    let max_v = vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                    let range = (max_v - min_v).max(1e-10);
+                    // Title
+                    if !title.is_empty() {
+                        self.writeln_output(&format!("  {}", title));
+                    }
+                    self.writeln_output(&format!("  {:.3} ┤", max_v));
+                    // Build grid
+                    let mut grid = vec![vec![' '; w]; h];
+                    let step = vals.len() as f64 / w as f64;
+                    for x in 0..w {
+                        let idx = ((x as f64 * step) as usize).min(vals.len() - 1);
+                        let y = ((vals[idx] - min_v) / range * (h - 1) as f64) as usize;
+                        let y = y.min(h - 1);
+                        grid[h - 1 - y][x] = '*';
+                    }
+                    // Print rows
+                    for row in 0..h {
+                        let label = if row == h / 2 {
+                            format!("  {:.3} ┤", min_v + range * (h - 1 - row) as f64 / (h - 1) as f64)
+                        } else if row == h - 1 {
+                            format!("  {:.3} ┤", min_v)
+                        } else {
+                            "        │".to_string()
+                        };
+                        let line: String = grid[row].iter().collect();
+                        self.writeln_output(&format!("{}{}", label, line));
+                    }
+                    self.writeln_output(&format!("        └{}┘", "─".repeat(w)));
+                    self.writeln_output(&format!("         0{}{}",
+                        " ".repeat(w / 2 - 2), vals.len()));
+                    Ok(Value::Void)
+                } else { Err(self.type_err("ascii_plot() type error".into())) }
+            }
+            "ascii_bar" => {
+                // ascii_bar(labels, values, width) → prints horizontal bar chart
+                if args.len() < 3 { return Err(self.type_err("ascii_bar() requires (labels, values, width)".into())); }
+                if let (Value::Array(labels), Value::Array(values), Value::Int(width)) = (&args[0], &args[1], &args[2]) {
+                    let w = *width as usize;
+                    let vals: Vec<f64> = values.iter().map(|v| match v { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 }).collect();
+                    let max_v = vals.iter().cloned().fold(0.0f64, f64::max).max(1e-10);
+                    for (i, label) in labels.iter().enumerate() {
+                        let name = match label { Value::Str(s) => s.clone(), _ => format!("{}", i) };
+                        let v = if i < vals.len() { vals[i] } else { 0.0 };
+                        let bar_len = ((v / max_v) * w as f64) as usize;
+                        let bar = "█".repeat(bar_len);
+                        self.writeln_output(&format!("  {:>10} │{} {:.3}", name, bar, v));
+                    }
+                    Ok(Value::Void)
+                } else { Err(self.type_err("ascii_bar() type error".into())) }
+            }
+            // ── Data Utilities ──
+            "data_split" => {
+                // data_split(data, ratio) → [train, test] split
+                if args.len() < 2 { return Err(self.type_err("data_split() requires (array, ratio)".into())); }
+                if let (Value::Array(data), Value::Float(ratio)) = (&args[0], &args[1]) {
+                    let split = (data.len() as f64 * ratio) as usize;
+                    let train = data[..split].to_vec();
+                    let test = data[split..].to_vec();
+                    Ok(Value::Array(vec![Value::Array(train), Value::Array(test)]))
+                } else { Err(self.type_err("data_split() type error".into())) }
+            }
+            "shuffle" => {
+                // shuffle(array, seed) → deterministically shuffled array
+                if args.len() < 2 { return Err(self.type_err("shuffle() requires (array, seed)".into())); }
+                if let (Value::Array(data), Value::Int(seed)) = (&args[0], &args[1]) {
+                    let mut result = data.clone();
+                    let n = result.len();
+                    let seed = *seed as usize;
+                    for i in (1..n).rev() {
+                        let j = (i * 2654435761 + seed * 1013904223) % (i + 1);
+                        result.swap(i, j);
+                    }
+                    Ok(Value::Array(result))
+                } else { Err(self.type_err("shuffle() type error".into())) }
+            }
+            "one_hot" => {
+                // one_hot(index, num_classes) → [0, ..., 1, ..., 0]
+                if args.len() < 2 { return Err(self.type_err("one_hot() requires (index, num_classes)".into())); }
+                if let (Value::Int(idx), Value::Int(nc)) = (&args[0], &args[1]) {
+                    let mut result = vec![Value::Float(0.0); *nc as usize];
+                    if (*idx as usize) < result.len() {
+                        result[*idx as usize] = Value::Float(1.0);
+                    }
+                    Ok(Value::Array(result))
+                } else { Err(self.type_err("one_hot() type error".into())) }
+            }
+            // ── Model Summary ──
+            "param_count" => {
+                // param_count(arrays...) → total number of parameters
+                let total: usize = args.iter().map(|a| if let Value::Array(arr) = a { arr.len() } else { 0 }).sum();
+                Ok(Value::Int(total as i64))
+            }
+            "model_size_kb" => {
+                // model_size_kb(param_count) → estimated size in KB (float32)
+                if args.is_empty() { return Err(self.type_err("model_size_kb() requires param count".into())); }
+                let n = match &args[0] { Value::Int(i) => *i as f64, Value::Float(f) => *f, _ => 0.0 };
+                Ok(Value::Float(n * 4.0 / 1024.0)) // 4 bytes per float32
+            }
+            // ── Byte-level Tokenizer (Anima CLM) ──
+            "bytes_encode" => {
+                // bytes_encode(string) → array of byte values [0-255]
+                if args.is_empty() { return Err(self.type_err("bytes_encode() requires string".into())); }
+                if let Value::Str(s) = &args[0] {
+                    let bytes: Vec<Value> = s.as_bytes().iter().map(|b| Value::Int(*b as i64)).collect();
+                    Ok(Value::Array(bytes))
+                } else { Err(self.type_err("bytes_encode() requires string".into())) }
+            }
+            "bytes_decode" => {
+                // bytes_decode(byte_array) → string
+                if args.is_empty() { return Err(self.type_err("bytes_decode() requires array".into())); }
+                if let Value::Array(bytes) = &args[0] {
+                    let chars: Vec<u8> = bytes.iter().map(|v| match v { Value::Int(i) => *i as u8, _ => 0 }).collect();
+                    Ok(Value::Str(String::from_utf8_lossy(&chars).to_string()))
+                } else { Err(self.type_err("bytes_decode() requires array".into())) }
+            }
+            // ── Mixture of Experts (Anima golden-moe) ──
+            "moe_gate" => {
+                // moe_gate(input, gate_weights, n_experts, top_k) → [expert_indices, gate_values]
+                // Gate: softmax(input @ gate_W), then top-k selection
+                if args.len() < 4 { return Err(self.type_err("moe_gate() requires (input, gate_W, n_experts, top_k)".into())); }
+                if let (Value::Array(input), Value::Array(gw), Value::Int(ne), Value::Int(tk)) = (&args[0], &args[1], &args[2], &args[3]) {
+                    let (ne, tk) = (*ne as usize, *tk as usize);
+                    let in_dim = input.len();
+                    // Compute gate logits: gate_W @ input
+                    let mut logits = Vec::with_capacity(ne);
+                    for e in 0..ne {
+                        let mut s = 0.0f64;
+                        for d in 0..in_dim {
+                            let wv = match &gw[e * in_dim + d] { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 };
+                            let iv = match &input[d] { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 };
+                            s += wv * iv;
+                        }
+                        logits.push(s);
+                    }
+                    // Softmax
+                    let max_l = logits.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                    let exps: Vec<f64> = logits.iter().map(|l| (l - max_l).exp()).collect();
+                    let sum_e: f64 = exps.iter().sum();
+                    let probs: Vec<f64> = exps.iter().map(|e| e / sum_e).collect();
+                    // Top-k
+                    let mut indexed: Vec<(usize, f64)> = probs.iter().enumerate().map(|(i, p)| (i, *p)).collect();
+                    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    indexed.truncate(tk);
+                    // Renormalize top-k
+                    let top_sum: f64 = indexed.iter().map(|(_, p)| p).sum();
+                    let indices: Vec<Value> = indexed.iter().map(|(i, _)| Value::Int(*i as i64)).collect();
+                    let gates: Vec<Value> = indexed.iter().map(|(_, p)| Value::Float(p / top_sum)).collect();
+                    Ok(Value::Array(vec![Value::Array(indices), Value::Array(gates)]))
+                } else { Err(self.type_err("moe_gate() type error".into())) }
+            }
+            "moe_combine" => {
+                // moe_combine(expert_outputs, gate_values) → weighted combination
+                // expert_outputs: [top_k × dim] flat, gate_values: [top_k]
+                if args.len() < 2 { return Err(self.type_err("moe_combine() requires (outputs, gates)".into())); }
+                if let (Value::Array(outputs), Value::Array(gates)) = (&args[0], &args[1]) {
+                    let k = gates.len();
+                    let dim = if k > 0 { outputs.len() / k } else { 0 };
+                    let mut result = vec![0.0f64; dim];
+                    for i in 0..k {
+                        let g = match &gates[i] { Value::Float(f) => *f, _ => 0.0 };
+                        for d in 0..dim {
+                            let v = match &outputs[i * dim + d] { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 };
+                            result[d] += g * v;
+                        }
+                    }
+                    Ok(Value::Array(result.into_iter().map(Value::Float).collect()))
+                } else { Err(self.type_err("moe_combine() type error".into())) }
+            }
+            // ── Elastic Weight Consolidation (Continual Learning) ──
+            "ewc_penalty" => {
+                // ewc_penalty(current_weights, old_weights, fisher_diag, lambda) → scalar penalty
+                // EWC: λ/2 * Σ F_i * (θ_i - θ*_i)²
+                if args.len() < 4 { return Err(self.type_err("ewc_penalty() requires (current, old, fisher, lambda)".into())); }
+                if let (Value::Array(cur), Value::Array(old), Value::Array(fisher)) = (&args[0], &args[1], &args[2]) {
+                    let lambda = match &args[3] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 1.0 };
+                    let mut penalty = 0.0f64;
+                    for i in 0..cur.len().min(old.len()).min(fisher.len()) {
+                        let c = match &cur[i] { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 };
+                        let o = match &old[i] { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 };
+                        let f = match &fisher[i] { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 };
+                        penalty += f * (c - o) * (c - o);
+                    }
+                    Ok(Value::Float(lambda * 0.5 * penalty))
+                } else { Err(self.type_err("ewc_penalty() type error".into())) }
+            }
+            "fisher_diagonal" => {
+                // fisher_diagonal(grads_squared_history) → mean of squared gradients (Fisher approx)
+                // grads_history: [n_samples × n_params] flat
+                if args.len() < 3 { return Err(self.type_err("fisher_diagonal() requires (grads_sq, n_samples, n_params)".into())); }
+                if let (Value::Array(gsq), Value::Int(ns), Value::Int(np)) = (&args[0], &args[1], &args[2]) {
+                    let (ns, np) = (*ns as usize, *np as usize);
+                    let mut fisher = vec![0.0f64; np];
+                    for s in 0..ns {
+                        for p in 0..np {
+                            let v = match &gsq[s * np + p] { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 };
+                            fisher[p] += v;
+                        }
+                    }
+                    for p in 0..np { fisher[p] /= ns as f64; }
+                    Ok(Value::Array(fisher.into_iter().map(Value::Float).collect()))
+                } else { Err(self.type_err("fisher_diagonal() type error".into())) }
+            }
+            // ── Modern LLM Architecture (LLaMA/Mistral) ──
+            "rms_norm" => {
+                // rms_norm(x, dim, eps) → x / RMS(x), RMS = sqrt(mean(x²) + eps)
+                // Simpler than LayerNorm: no mean subtraction, just scale by RMS
+                if args.len() < 2 { return Err(self.type_err("rms_norm() requires (array, dim)".into())); }
+                if let (Value::Array(x), Value::Int(dim)) = (&args[0], &args[1]) {
+                    let dim = *dim as usize;
+                    let eps = if args.len() > 2 { match &args[2] { Value::Float(f) => *f, _ => 1e-6 } } else { 1e-6 };
+                    let n_samples = x.len() / dim;
+                    let mut result = Vec::with_capacity(x.len());
+                    for s in 0..n_samples {
+                        let mut sq_sum = 0.0f64;
+                        for d in 0..dim {
+                            let v = match &x[s * dim + d] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                            sq_sum += v * v;
+                        }
+                        let rms = (sq_sum / dim as f64 + eps).sqrt();
+                        for d in 0..dim {
+                            let v = match &x[s * dim + d] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                            result.push(Value::Float(v / rms));
+                        }
+                    }
+                    Ok(Value::Array(result))
+                } else { Err(self.type_err("rms_norm() type error".into())) }
+            }
+            "rope" => {
+                // rope(x, seq_len, dim, base) → apply Rotary Position Embedding
+                // Rotates pairs of dimensions by position-dependent angles
+                // x: [seq_len × dim], base: default 10000
+                if args.len() < 3 { return Err(self.type_err("rope() requires (x, seq_len, dim)".into())); }
+                if let (Value::Array(x), Value::Int(seq), Value::Int(dim)) = (&args[0], &args[1], &args[2]) {
+                    let (seq, dim) = (*seq as usize, *dim as usize);
+                    let base = if args.len() > 3 { match &args[3] { Value::Float(f) => *f, _ => 10000.0 } } else { 10000.0 };
+                    let half_dim = dim / 2;
+                    let mut result = Vec::with_capacity(seq * dim);
+                    for pos in 0..seq {
+                        for d in 0..half_dim {
+                            let freq = 1.0 / base.powf(2.0 * d as f64 / dim as f64);
+                            let angle = pos as f64 * freq;
+                            let cos_a = angle.cos();
+                            let sin_a = angle.sin();
+                            let x0 = match &x[pos * dim + 2 * d] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                            let x1 = match &x[pos * dim + 2 * d + 1] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                            result.push(Value::Float(x0 * cos_a - x1 * sin_a));
+                            result.push(Value::Float(x0 * sin_a + x1 * cos_a));
+                        }
+                        // Handle odd dim
+                        if dim % 2 == 1 {
+                            result.push(x[pos * dim + dim - 1].clone());
+                        }
+                    }
+                    Ok(Value::Array(result))
+                } else { Err(self.type_err("rope() type error".into())) }
+            }
+            "sliding_window_attention" => {
+                // sliding_window_attention(Q, K, V, seq_len, dim, window_size) → output
+                // Each position attends only to [pos-window..pos] (Mistral-style)
+                if args.len() < 6 { return Err(self.type_err("sliding_window_attention() requires 6 args".into())); }
+                if let (Value::Array(q), Value::Array(k), Value::Array(v), Value::Int(seq), Value::Int(dim), Value::Int(win)) = (&args[0], &args[1], &args[2], &args[3], &args[4], &args[5]) {
+                    let (seq, dim, win) = (*seq as usize, *dim as usize, *win as usize);
+                    let scale = 1.0 / (dim as f64).sqrt();
+                    let mut output = Vec::with_capacity(seq * dim);
+                    for i in 0..seq {
+                        let start = if i >= win { i - win } else { 0 };
+                        let window_len = i - start + 1;
+                        // Compute scores within window
+                        let mut scores = Vec::with_capacity(window_len);
+                        for j in start..=i {
+                            let mut dot = 0.0f64;
+                            for d in 0..dim {
+                                let qv = match &q[i * dim + d] { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 };
+                                let kv = match &k[j * dim + d] { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 };
+                                dot += qv * kv;
+                            }
+                            scores.push(dot * scale);
+                        }
+                        // Softmax
+                        let max_s = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                        let exps: Vec<f64> = scores.iter().map(|s| (s - max_s).exp()).collect();
+                        let sum_e: f64 = exps.iter().sum();
+                        // Weighted sum of V
+                        for d in 0..dim {
+                            let mut val = 0.0f64;
+                            for (idx, j) in (start..=i).enumerate() {
+                                let vv = match &v[j * dim + d] { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 };
+                                val += (exps[idx] / sum_e) * vv;
+                            }
+                            output.push(Value::Float(val));
+                        }
+                    }
+                    Ok(Value::Array(output))
+                } else { Err(self.type_err("sliding_window_attention() type error".into())) }
+            }
+            // ── Distribution Metrics (consciousness comparison) ──
+            "kl_divergence" => {
+                // kl_divergence(p, q) → KL(P || Q) = Σ p_i * ln(p_i / q_i)
+                if args.len() < 2 { return Err(self.type_err("kl_divergence() requires (P, Q)".into())); }
+                if let (Value::Array(p), Value::Array(q)) = (&args[0], &args[1]) {
+                    let mut kl = 0.0f64;
+                    for (pi, qi) in p.iter().zip(q.iter()) {
+                        let pv = match pi { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                        let qv = match qi { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                        if pv > 1e-10 && qv > 1e-10 { kl += pv * (pv / qv).ln(); }
+                    }
+                    Ok(Value::Float(kl))
+                } else { Err(self.type_err("kl_divergence() type error".into())) }
+            }
+            "js_divergence" => {
+                // js_divergence(p, q) → JS(P, Q) = 0.5*KL(P||M) + 0.5*KL(Q||M), M=(P+Q)/2
+                if args.len() < 2 { return Err(self.type_err("js_divergence() requires (P, Q)".into())); }
+                if let (Value::Array(p), Value::Array(q)) = (&args[0], &args[1]) {
+                    let mut js = 0.0f64;
+                    for (pi, qi) in p.iter().zip(q.iter()) {
+                        let pv = match pi { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                        let qv = match qi { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                        let m = (pv + qv) / 2.0;
+                        if pv > 1e-10 && m > 1e-10 { js += 0.5 * pv * (pv / m).ln(); }
+                        if qv > 1e-10 && m > 1e-10 { js += 0.5 * qv * (qv / m).ln(); }
+                    }
+                    Ok(Value::Float(js))
+                } else { Err(self.type_err("js_divergence() type error".into())) }
+            }
+            // ── Grouped Query Attention (LLaMA 2) ──
+            "grouped_query_attention" => {
+                // gqa(Q, K, V, seq, dim, n_q_heads, n_kv_heads) → output
+                // Q has n_q_heads, K/V have n_kv_heads (shared across groups)
+                if args.len() < 7 { return Err(self.type_err("grouped_query_attention() requires 7 args".into())); }
+                if let (Value::Array(q), Value::Array(k), Value::Array(v), Value::Int(seq), Value::Int(dim), Value::Int(nqh), Value::Int(nkvh)) = (&args[0], &args[1], &args[2], &args[3], &args[4], &args[5], &args[6]) {
+                    let (seq, dim, nqh, nkvh) = (*seq as usize, *dim as usize, *nqh as usize, *nkvh as usize);
+                    let head_dim = dim / nqh;
+                    let group_size = nqh / nkvh; // queries per KV head
+                    let scale = 1.0 / (head_dim as f64).sqrt();
+                    let mut output = vec![0.0f64; seq * dim];
+                    for qh in 0..nqh {
+                        let kvh = qh / group_size; // which KV head this Q head uses
+                        let q_off = qh * head_dim;
+                        let kv_off = kvh * head_dim;
+                        for i in 0..seq {
+                            let mut scores = Vec::with_capacity(seq);
+                            for j in 0..seq {
+                                if j > i { scores.push(f64::NEG_INFINITY); continue; }
+                                let mut dot = 0.0f64;
+                                for d in 0..head_dim {
+                                    let qv = match &q[i * dim + q_off + d] { Value::Float(f) => *f, _ => 0.0 };
+                                    let kv = match &k[j * (dim / group_size * nkvh / nkvh).max(dim / nqh * nkvh) + kv_off + d] {
+                                        Value::Float(f) => *f, _ => 0.0
+                                    };
+                                    dot += qv * kv;
+                                }
+                                scores.push(dot * scale);
+                            }
+                            let max_s = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                            let exps: Vec<f64> = scores.iter().map(|s| (s - max_s).exp()).collect();
+                            let sum_e: f64 = exps.iter().sum();
+                            for d in 0..head_dim {
+                                let mut val = 0.0f64;
+                                for j in 0..seq {
+                                    if j > i { continue; }
+                                    let vv = match &v[j * (dim / group_size * nkvh / nkvh).max(dim / nqh * nkvh) + kv_off + d] {
+                                        Value::Float(f) => *f, _ => 0.0
+                                    };
+                                    val += (exps[j] / sum_e) * vv;
+                                }
+                                output[i * dim + q_off + d] = val;
+                            }
+                        }
+                    }
+                    Ok(Value::Array(output.into_iter().map(Value::Float).collect()))
+                } else { Err(self.type_err("gqa() type error".into())) }
+            }
+            // ── Training Tricks ──
+            "label_smoothing" => {
+                // label_smoothing(target_idx, num_classes, smoothing) → smoothed distribution
+                if args.len() < 3 { return Err(self.type_err("label_smoothing() requires (target, n_classes, eps)".into())); }
+                if let (Value::Int(target), Value::Int(nc), Value::Float(eps)) = (&args[0], &args[1], &args[2]) {
+                    let nc = *nc as usize;
+                    let target = *target as usize;
+                    let smooth = eps / nc as f64;
+                    let confident = 1.0 - eps + smooth;
+                    let result: Vec<Value> = (0..nc).map(|i| {
+                        Value::Float(if i == target { confident } else { smooth })
+                    }).collect();
+                    Ok(Value::Array(result))
+                } else { Err(self.type_err("label_smoothing() type error".into())) }
+            }
+            "weight_decay" => {
+                // weight_decay(weights, decay_rate) → weights * (1 - decay_rate)
+                if args.len() < 2 { return Err(self.type_err("weight_decay() requires (weights, rate)".into())); }
+                if let (Value::Array(w), Value::Float(rate)) = (&args[0], &args[1]) {
+                    let factor = 1.0 - rate;
+                    let result: Vec<Value> = w.iter().map(|v| {
+                        let vf = match v { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                        Value::Float(vf * factor)
+                    }).collect();
+                    Ok(Value::Array(result))
+                } else { Err(self.type_err("weight_decay() type error".into())) }
+            }
+            "adamw_step" => {
+                // adamw_step(params, grads, m, v, lr, beta1, beta2, eps, t, weight_decay)
+                // AdamW: decoupled weight decay (not in gradient, applied directly to params)
+                if args.len() < 10 { return Err(self.type_err("adamw_step() requires 10 args".into())); }
+                if let (Value::Array(p), Value::Array(g), Value::Array(m), Value::Array(v)) = (&args[0], &args[1], &args[2], &args[3]) {
+                    let lr = match &args[4] { Value::Float(f) => *f, _ => 0.001 };
+                    let beta1 = match &args[5] { Value::Float(f) => *f, _ => 0.9 };
+                    let beta2 = match &args[6] { Value::Float(f) => *f, _ => 0.999 };
+                    let eps = match &args[7] { Value::Float(f) => *f, _ => 1e-8 };
+                    let t = match &args[8] { Value::Int(i) => *i as f64, Value::Float(f) => *f, _ => 1.0 };
+                    let wd = match &args[9] { Value::Float(f) => *f, _ => 0.01 };
+                    let n = p.len();
+                    let bc1 = 1.0 - beta1.powf(t);
+                    let bc2 = 1.0 - beta2.powf(t);
+                    let mut new_p = Vec::with_capacity(n);
+                    let mut new_m = Vec::with_capacity(n);
+                    let mut new_v = Vec::with_capacity(n);
+                    for i in 0..n {
+                        let pf = match &p[i] { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 };
+                        let gf = match &g[i] { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 };
+                        let mf = match &m[i] { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 };
+                        let vf = match &v[i] { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 };
+                        let mi = beta1 * mf + (1.0 - beta1) * gf;
+                        let vi = beta2 * vf + (1.0 - beta2) * gf * gf;
+                        let m_hat = mi / bc1;
+                        let v_hat = vi / bc2;
+                        // Decoupled weight decay: applied to params directly, not through gradient
+                        let pi = pf * (1.0 - lr * wd) - lr * m_hat / (v_hat.sqrt() + eps);
+                        new_p.push(Value::Float(pi));
+                        new_m.push(Value::Float(mi));
+                        new_v.push(Value::Float(vi));
+                    }
+                    let mut result = new_p;
+                    result.extend(new_m);
+                    result.extend(new_v);
+                    Ok(Value::Array(result))
+                } else { Err(self.type_err("adamw_step() type error".into())) }
+            }
+            "smooth_l1_loss" => {
+                // smooth_l1_loss(pred, target, beta) → Huber loss
+                if args.len() < 2 { return Err(self.type_err("smooth_l1_loss() requires (pred, target)".into())); }
+                if let (Value::Array(pred), Value::Array(target)) = (&args[0], &args[1]) {
+                    let beta = if args.len() > 2 { match &args[2] { Value::Float(f) => *f, _ => 1.0 } } else { 1.0 };
+                    let mut total = 0.0f64;
+                    for (p, t) in pred.iter().zip(target.iter()) {
+                        let pf = match p { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                        let tf = match t { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                        let diff = (pf - tf).abs();
+                        total += if diff < beta { 0.5 * diff * diff / beta } else { diff - 0.5 * beta };
+                    }
+                    Ok(Value::Float(total / pred.len() as f64))
+                } else { Err(self.type_err("smooth_l1_loss() type error".into())) }
+            }
+            // ── LoRA: Low-Rank Adaptation ──
+            "lora_init" => {
+                // lora_init(in_dim, out_dim, rank) → [A: rank×in, B: out×rank] (A random, B zeros)
+                if args.len() < 3 { return Err(self.type_err("lora_init() requires (in_dim, out_dim, rank)".into())); }
+                if let (Value::Int(ind), Value::Int(outd), Value::Int(rank)) = (&args[0], &args[1], &args[2]) {
+                    let (ind, outd, rank) = (*ind as usize, *outd as usize, *rank as usize);
+                    let std = (1.0 / rank as f64).sqrt();
+                    let mut a = Vec::with_capacity(rank * ind);
+                    for i in 0..(rank * ind) {
+                        let hash = ((i * 2654435761 + rank * 1013904223) % 10000) as f64 / 10000.0 - 0.5;
+                        a.push(Value::Float(hash * 2.0 * std));
+                    }
+                    let b = vec![Value::Float(0.0); outd * rank]; // B starts at zero → ΔW = BA = 0 initially
+                    Ok(Value::Array(vec![Value::Array(a), Value::Array(b)]))
+                } else { Err(self.type_err("lora_init() type error".into())) }
+            }
+            "lora_forward" => {
+                // lora_forward(x, W_frozen, A, B, in_dim, out_dim, rank, alpha) → W_frozen@x + alpha*(B@(A@x))
+                if args.len() < 8 { return Err(self.type_err("lora_forward() requires 8 args".into())); }
+                if let (Value::Array(x), Value::Array(w), Value::Array(a), Value::Array(b)) = (&args[0], &args[1], &args[2], &args[3]) {
+                    let ind = match &args[4] { Value::Int(i) => *i as usize, _ => 0 };
+                    let outd = match &args[5] { Value::Int(i) => *i as usize, _ => 0 };
+                    let rank = match &args[6] { Value::Int(i) => *i as usize, _ => 0 };
+                    let alpha = match &args[7] { Value::Float(f) => *f, _ => 1.0 };
+                    // W_frozen @ x
+                    let mut base = vec![0.0f64; outd];
+                    for r in 0..outd {
+                        for c in 0..ind {
+                            let wv = match &w[r * ind + c] { Value::Float(f) => *f, _ => 0.0 };
+                            let xv = match &x[c] { Value::Float(f) => *f, _ => 0.0 };
+                            base[r] += wv * xv;
+                        }
+                    }
+                    // A @ x → intermediate [rank]
+                    let mut ax = vec![0.0f64; rank];
+                    for r in 0..rank {
+                        for c in 0..ind {
+                            let av = match &a[r * ind + c] { Value::Float(f) => *f, _ => 0.0 };
+                            let xv = match &x[c] { Value::Float(f) => *f, _ => 0.0 };
+                            ax[r] += av * xv;
+                        }
+                    }
+                    // B @ ax → delta [outd]
+                    for r in 0..outd {
+                        for c in 0..rank {
+                            let bv = match &b[r * rank + c] { Value::Float(f) => *f, _ => 0.0 };
+                            base[r] += alpha * bv * ax[c];
+                        }
+                    }
+                    Ok(Value::Array(base.into_iter().map(Value::Float).collect()))
+                } else { Err(self.type_err("lora_forward() type error".into())) }
+            }
+            // ── Pairwise similarity matrix (Φ IIT) ──
+            "cosine_sim_matrix" => {
+                // cosine_sim_matrix(hiddens, n_cells, dim) → [n×n] pairwise cosine similarity
+                if args.len() < 3 { return Err(self.type_err("cosine_sim_matrix() requires (hiddens, n, dim)".into())); }
+                if let (Value::Array(h), Value::Int(n), Value::Int(dim)) = (&args[0], &args[1], &args[2]) {
+                    let (n, dim) = (*n as usize, *dim as usize);
+                    let mut matrix = Vec::with_capacity(n * n);
+                    for i in 0..n {
+                        for j in 0..n {
+                            let mut dot = 0.0f64;
+                            let mut ni = 0.0f64;
+                            let mut nj = 0.0f64;
+                            for d in 0..dim {
+                                let vi = match &h[i * dim + d] { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 };
+                                let vj = match &h[j * dim + d] { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 };
+                                dot += vi * vj;
+                                ni += vi * vi;
+                                nj += vj * vj;
+                            }
+                            let denom = ni.sqrt() * nj.sqrt();
+                            matrix.push(Value::Float(if denom < 1e-10 { 0.0 } else { dot / denom }));
+                        }
+                    }
+                    Ok(Value::Array(matrix))
+                } else { Err(self.type_err("cosine_sim_matrix() type error".into())) }
+            }
+            "mutual_information" => {
+                // mutual_information(x, y, n_bins) → MI via histogram binning
+                if args.len() < 3 { return Err(self.type_err("mutual_information() requires (x, y, n_bins)".into())); }
+                if let (Value::Array(x), Value::Array(y), Value::Int(nb)) = (&args[0], &args[1], &args[2]) {
+                    let nb = *nb as usize;
+                    let n = x.len().min(y.len());
+                    let xv: Vec<f64> = x.iter().map(|v| match v { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 }).collect();
+                    let yv: Vec<f64> = y.iter().map(|v| match v { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 }).collect();
+                    let x_min = xv.iter().cloned().fold(f64::INFINITY, f64::min);
+                    let x_max = xv.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                    let y_min = yv.iter().cloned().fold(f64::INFINITY, f64::min);
+                    let y_max = yv.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                    let x_range = (x_max - x_min).max(1e-10);
+                    let y_range = (y_max - y_min).max(1e-10);
+                    // Joint and marginal histograms
+                    let mut joint = vec![0.0f64; nb * nb];
+                    let mut px = vec![0.0f64; nb];
+                    let mut py = vec![0.0f64; nb];
+                    for i in 0..n {
+                        let bx = ((xv[i] - x_min) / x_range * (nb - 1) as f64).round() as usize;
+                        let by = ((yv[i] - y_min) / y_range * (nb - 1) as f64).round() as usize;
+                        let bx = bx.min(nb - 1);
+                        let by = by.min(nb - 1);
+                        joint[bx * nb + by] += 1.0;
+                        px[bx] += 1.0;
+                        py[by] += 1.0;
+                    }
+                    // Normalize
+                    let nf = n as f64;
+                    for v in joint.iter_mut() { *v /= nf; }
+                    for v in px.iter_mut() { *v /= nf; }
+                    for v in py.iter_mut() { *v /= nf; }
+                    // MI = Σ p(x,y) * log(p(x,y) / (p(x)*p(y)))
+                    let mut mi = 0.0f64;
+                    for i in 0..nb {
+                        for j in 0..nb {
+                            let pxy = joint[i * nb + j];
+                            if pxy > 1e-10 && px[i] > 1e-10 && py[j] > 1e-10 {
+                                mi += pxy * (pxy / (px[i] * py[j])).ln();
+                            }
+                        }
+                    }
+                    Ok(Value::Float(mi))
+                } else { Err(self.type_err("mutual_information() type error".into())) }
+            }
+            // ── Attention Variants ──
+            "linear_attention" => {
+                // linear_attention(Q, K, V, seq, dim) → O(n×d²) vs O(n²×d) for standard attention
+                // Uses kernel trick: φ(Q)×(φ(K)^T×V) instead of softmax(Q×K^T)×V
+                if args.len() < 5 { return Err(self.type_err("linear_attention() requires 5 args".into())); }
+                if let (Value::Array(q), Value::Array(k), Value::Array(v), Value::Int(seq), Value::Int(dim)) = (&args[0], &args[1], &args[2], &args[3], &args[4]) {
+                    let (seq, dim) = (*seq as usize, *dim as usize);
+                    // φ(x) = elu(x) + 1 (feature map)
+                    let phi = |x: f64| -> f64 { if x > 0.0 { x + 1.0 } else { x.exp() } };
+                    // Compute K^T × V: [dim × dim]
+                    let mut ktv = vec![0.0f64; dim * dim];
+                    let mut k_sum = vec![0.0f64; dim]; // for normalization
+                    for s in 0..seq {
+                        for d1 in 0..dim {
+                            let kv = phi(match &k[s * dim + d1] { Value::Float(f) => *f, _ => 0.0 });
+                            k_sum[d1] += kv;
+                            for d2 in 0..dim {
+                                let vv = match &v[s * dim + d2] { Value::Float(f) => *f, _ => 0.0 };
+                                ktv[d1 * dim + d2] += kv * vv;
+                            }
+                        }
+                    }
+                    // Output: φ(Q) × (K^T×V) / (φ(Q) × Σφ(K))
+                    let mut output = Vec::with_capacity(seq * dim);
+                    for s in 0..seq {
+                        let mut norm = 0.0f64;
+                        for d in 0..dim {
+                            norm += phi(match &q[s * dim + d] { Value::Float(f) => *f, _ => 0.0 }) * k_sum[d];
+                        }
+                        norm = norm.max(1e-10);
+                        for d2 in 0..dim {
+                            let mut val = 0.0f64;
+                            for d1 in 0..dim {
+                                let qv = phi(match &q[s * dim + d1] { Value::Float(f) => *f, _ => 0.0 });
+                                val += qv * ktv[d1 * dim + d2];
+                            }
+                            output.push(Value::Float(val / norm));
+                        }
+                    }
+                    Ok(Value::Array(output))
+                } else { Err(self.type_err("linear_attention() type error".into())) }
+            }
+            // ── Normalization Variants ──
+            "group_norm" => {
+                // group_norm(x, dim, n_groups, eps) → normalize within groups of channels
+                if args.len() < 3 { return Err(self.type_err("group_norm() requires (x, dim, n_groups)".into())); }
+                if let (Value::Array(x), Value::Int(dim), Value::Int(ng)) = (&args[0], &args[1], &args[2]) {
+                    let (dim, ng) = (*dim as usize, *ng as usize);
+                    let eps = if args.len() > 3 { match &args[3] { Value::Float(f) => *f, _ => 1e-5 } } else { 1e-5 };
+                    let n_samples = x.len() / dim;
+                    let group_size = dim / ng;
+                    let mut result = Vec::with_capacity(x.len());
+                    for s in 0..n_samples {
+                        for g in 0..ng {
+                            let start = g * group_size;
+                            let mut mean = 0.0f64;
+                            for d in start..start + group_size {
+                                mean += match &x[s * dim + d] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                            }
+                            mean /= group_size as f64;
+                            let mut var = 0.0f64;
+                            for d in start..start + group_size {
+                                let v = match &x[s * dim + d] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                                var += (v - mean) * (v - mean);
+                            }
+                            var = (var / group_size as f64 + eps).sqrt();
+                            for d in start..start + group_size {
+                                let v = match &x[s * dim + d] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                                result.push(Value::Float((v - mean) / var));
+                            }
+                        }
+                    }
+                    Ok(Value::Array(result))
+                } else { Err(self.type_err("group_norm() type error".into())) }
+            }
+            // ── Advanced Loss ──
+            "focal_loss" => {
+                // focal_loss(logits, target, gamma, alpha) → -α*(1-p_t)^γ * log(p_t)
+                // Addresses class imbalance by down-weighting easy examples
+                if args.len() < 2 { return Err(self.type_err("focal_loss() requires (logits, target)".into())); }
+                if let (Value::Array(logits), Value::Int(target)) = (&args[0], &args[1]) {
+                    let gamma = if args.len() > 2 { match &args[2] { Value::Float(f) => *f, _ => 2.0 } } else { 2.0 };
+                    let alpha = if args.len() > 3 { match &args[3] { Value::Float(f) => *f, _ => 0.25 } } else { 0.25 };
+                    let vals: Vec<f64> = logits.iter().map(|v| match v { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 }).collect();
+                    let max_v = vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                    let exps: Vec<f64> = vals.iter().map(|v| (v - max_v).exp()).collect();
+                    let sum: f64 = exps.iter().sum();
+                    let pt = exps[*target as usize] / sum;
+                    let focal = -alpha * (1.0 - pt).powf(gamma) * pt.ln();
+                    Ok(Value::Float(focal))
+                } else { Err(self.type_err("focal_loss() type error".into())) }
+            }
+            "contrastive_loss" => {
+                // contrastive_loss(anchor, positive, negative, margin) → max(0, d(a,p) - d(a,n) + margin)
+                // Triplet loss for consciousness state comparison
+                if args.len() < 3 { return Err(self.type_err("contrastive_loss() requires (anchor, positive, negative)".into())); }
+                if let (Value::Array(a), Value::Array(p), Value::Array(n)) = (&args[0], &args[1], &args[2]) {
+                    let margin = if args.len() > 3 { match &args[3] { Value::Float(f) => *f, _ => 1.0 } } else { 1.0 };
+                    let mut d_pos = 0.0f64;
+                    let mut d_neg = 0.0f64;
+                    for i in 0..a.len().min(p.len()).min(n.len()) {
+                        let av = match &a[i] { Value::Float(f) => *f, _ => 0.0 };
+                        let pv = match &p[i] { Value::Float(f) => *f, _ => 0.0 };
+                        let nv = match &n[i] { Value::Float(f) => *f, _ => 0.0 };
+                        d_pos += (av - pv) * (av - pv);
+                        d_neg += (av - nv) * (av - nv);
+                    }
+                    d_pos = d_pos.sqrt();
+                    d_neg = d_neg.sqrt();
+                    Ok(Value::Float((d_pos - d_neg + margin).max(0.0)))
+                } else { Err(self.type_err("contrastive_loss() type error".into())) }
+            }
+            "mse_loss" => {
+                // mse_loss(predicted, target) → mean squared error
+                if args.len() < 2 { return Err(self.type_err("mse_loss() requires (pred, target)".into())); }
+                if let (Value::Array(pred), Value::Array(target)) = (&args[0], &args[1]) {
+                    let mut total = 0.0f64;
+                    for (p, t) in pred.iter().zip(target.iter()) {
+                        let pf = match p { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                        let tf = match t { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                        total += (pf - tf) * (pf - tf);
+                    }
+                    Ok(Value::Float(total / pred.len() as f64))
+                } else { Err(self.type_err("mse_loss() type error".into())) }
+            }
+            "gru_cell" => {
+                // gru_cell(input, hidden, W_z, W_r, W_h, input_dim, hidden_dim) → new_hidden
+                // Full GRU: z=σ(W_z@[input,hidden]), r=σ(W_r@[input,hidden]), h=tanh(W_h@[input,r⊙hidden])
+                if args.len() < 7 { return Err(self.type_err("gru_cell() requires 7 args".into())); }
+                if let (Value::Array(input), Value::Array(hidden), Value::Array(wz), Value::Array(wr), Value::Array(wh)) = (&args[0], &args[1], &args[2], &args[3], &args[4]) {
+                    let input_dim = match &args[5] { Value::Int(i) => *i as usize, _ => 0 };
+                    let hidden_dim = match &args[6] { Value::Int(i) => *i as usize, _ => 0 };
+                    let combined_dim = input_dim + hidden_dim;
+                    // Concatenate [input, hidden]
+                    let mut combined = Vec::with_capacity(combined_dim);
+                    for i in 0..input_dim { combined.push(match &input[i] { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 }); }
+                    for i in 0..hidden_dim { combined.push(match &hidden[i] { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 }); }
+                    // z = sigmoid(W_z @ combined)
+                    let mut z = Vec::with_capacity(hidden_dim);
+                    for r in 0..hidden_dim {
+                        let mut s = 0.0f64;
+                        for c in 0..combined_dim {
+                            let w = match &wz[r * combined_dim + c] { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 };
+                            s += w * combined[c];
+                        }
+                        z.push(1.0 / (1.0 + (-s).exp()));
+                    }
+                    // r = sigmoid(W_r @ combined)
+                    let mut r_gate = Vec::with_capacity(hidden_dim);
+                    for r in 0..hidden_dim {
+                        let mut s = 0.0f64;
+                        for c in 0..combined_dim {
+                            let w = match &wr[r * combined_dim + c] { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 };
+                            s += w * combined[c];
+                        }
+                        r_gate.push(1.0 / (1.0 + (-s).exp()));
+                    }
+                    // h_cand = tanh(W_h @ [input, r ⊙ hidden])
+                    let mut combined2 = Vec::with_capacity(combined_dim);
+                    for i in 0..input_dim { combined2.push(combined[i]); }
+                    for i in 0..hidden_dim {
+                        let hv = match &hidden[i] { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 };
+                        combined2.push(r_gate[i] * hv);
+                    }
+                    let mut h_cand = Vec::with_capacity(hidden_dim);
+                    for r in 0..hidden_dim {
+                        let mut s = 0.0f64;
+                        for c in 0..combined_dim {
+                            let w = match &wh[r * combined_dim + c] { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 };
+                            s += w * combined2[c];
+                        }
+                        h_cand.push(s.tanh());
+                    }
+                    // new_hidden = (1-z) ⊙ h_cand + z ⊙ hidden
+                    let mut new_h = Vec::with_capacity(hidden_dim);
+                    for i in 0..hidden_dim {
+                        let hv = match &hidden[i] { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 };
+                        new_h.push(Value::Float((1.0 - z[i]) * h_cand[i] + z[i] * hv));
+                    }
+                    Ok(Value::Array(new_h))
+                } else { Err(self.type_err("gru_cell() type error".into())) }
+            }
+            // ── Batch operations ──
+            "batch_matvec" => {
+                // batch_matvec(mat, batch_vecs, rows, cols, batch_size) → [batch of result vectors]
+                // Applies same matrix to each vector in batch
+                if args.len() < 5 { return Err(self.type_err("batch_matvec() requires (mat, batch, rows, cols, batch_size)".into())); }
+                if let (Value::Array(mat), Value::Array(batch), Value::Int(rows), Value::Int(cols), Value::Int(bs)) = (&args[0], &args[1], &args[2], &args[3], &args[4]) {
+                    let (rows, cols, bs) = (*rows as usize, *cols as usize, *bs as usize);
+                    let mut results = Vec::with_capacity(bs * rows);
+                    for b in 0..bs {
+                        for r in 0..rows {
+                            let mut sum = 0.0f64;
+                            for c in 0..cols {
+                                let mv = match &mat[r * cols + c] { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 };
+                                let bv = match &batch[b * cols + c] { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 };
+                                sum += mv * bv;
+                            }
+                            results.push(Value::Float(sum));
+                        }
+                    }
+                    Ok(Value::Array(results))
+                } else { Err(self.type_err("batch_matvec() type error".into())) }
+            }
+            "batch_norm" => {
+                // batch_norm(batch, dim, batch_size) → normalized batch (zero mean, unit variance per dim)
+                if args.len() < 3 { return Err(self.type_err("batch_norm() requires (batch, dim, batch_size)".into())); }
+                if let (Value::Array(batch), Value::Int(dim), Value::Int(bs)) = (&args[0], &args[1], &args[2]) {
+                    let (dim, bs) = (*dim as usize, *bs as usize);
+                    // Compute mean and var per dimension
+                    let mut means = vec![0.0f64; dim];
+                    let mut vars = vec![0.0f64; dim];
+                    for d in 0..dim {
+                        for b in 0..bs {
+                            let v = match &batch[b * dim + d] { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 };
+                            means[d] += v;
+                        }
+                        means[d] /= bs as f64;
+                        for b in 0..bs {
+                            let v = match &batch[b * dim + d] { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 };
+                            vars[d] += (v - means[d]) * (v - means[d]);
+                        }
+                        vars[d] = (vars[d] / bs as f64 + 1e-5).sqrt();
+                    }
+                    // Normalize
+                    let mut result = Vec::with_capacity(bs * dim);
+                    for b in 0..bs {
+                        for d in 0..dim {
+                            let v = match &batch[b * dim + d] { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 };
+                            result.push(Value::Float((v - means[d]) / vars[d]));
+                        }
+                    }
+                    Ok(Value::Array(result))
+                } else { Err(self.type_err("batch_norm() type error".into())) }
+            }
+            "grad_accumulate" => {
+                // grad_accumulate(grad_buffer, new_grads, accum_steps) → accumulated, normalized grads
+                if args.len() < 3 { return Err(self.type_err("grad_accumulate() requires (buffer, grads, steps)".into())); }
+                if let (Value::Array(buf), Value::Array(grads), Value::Int(steps)) = (&args[0], &args[1], &args[2]) {
+                    let s = *steps as f64;
+                    let result: Vec<Value> = buf.iter().zip(grads.iter()).map(|(bv, gv)| {
+                        let bf = match bv { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 };
+                        let gf = match gv { Value::Float(f) => *f, Value::Int(x) => *x as f64, _ => 0.0 };
+                        Value::Float(bf + gf / s)
+                    }).collect();
+                    Ok(Value::Array(result))
+                } else { Err(self.type_err("grad_accumulate() type error".into())) }
+            }
+            "numerical_grad" => {
+                // numerical_grad(fn, args_array, param_idx, eps) → gradient at param_idx
+                // Computes central difference: (f(x+eps) - f(x-eps)) / (2*eps)
+                if args.len() < 3 { return Err(self.type_err("numerical_grad() requires (fn, args, param_idx)".into())); }
+                let func = args[0].clone();
+                if let (Value::Array(fn_args), Value::Int(idx)) = (&args[1], &args[2]) {
+                    let eps = if args.len() > 3 { match &args[3] { Value::Float(f) => *f, _ => 1e-7 } } else { 1e-7 };
+                    let idx = *idx as usize;
+                    // f(x + eps)
+                    let mut args_plus = fn_args.clone();
+                    let orig = match &fn_args[idx] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                    args_plus[idx] = Value::Float(orig + eps);
+                    let fp = self.call_function(func.clone(), args_plus)?;
+                    let fp_val = match fp { Value::Float(f) => f, Value::Int(i) => i as f64, _ => 0.0 };
+                    // f(x - eps)
+                    let mut args_minus = fn_args.clone();
+                    args_minus[idx] = Value::Float(orig - eps);
+                    let fm = self.call_function(func, args_minus)?;
+                    let fm_val = match fm { Value::Float(f) => f, Value::Int(i) => i as f64, _ => 0.0 };
+                    Ok(Value::Float((fp_val - fm_val) / (2.0 * eps)))
+                } else { Err(self.type_err("numerical_grad() requires (fn, array, int)".into())) }
+            }
+            // ── Cell dynamics builtins (Anima mitosis/merge/faction) ──
+            "cell_split" => {
+                // cell_split(hiddens, cell_idx, dim, noise_scale) → new_hiddens with cloned cell + noise
+                // Mimics ConsciousnessEngine mitosis: high-tension cell splits
+                if args.len() < 4 { return Err(self.type_err("cell_split() requires (hiddens, cell_idx, dim, noise_scale)".into())); }
+                if let (Value::Array(h), Value::Int(idx), Value::Int(dim), Value::Float(noise)) = (&args[0], &args[1], &args[2], &args[3]) {
+                    let idx = *idx as usize;
+                    let dim = *dim as usize;
+                    let mut result = h.clone();
+                    // Clone the cell's hidden state with noise perturbation
+                    let start = idx * dim;
+                    let mut new_cell = Vec::with_capacity(dim);
+                    for d in 0..dim {
+                        let val = match &h[start + d] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                        // Deterministic noise based on position
+                        let n = ((d * 2654435761 + idx * 1013904223) % 10000) as f64 / 10000.0 - 0.5;
+                        new_cell.push(Value::Float(val + n * noise));
+                    }
+                    result.extend(new_cell);
+                    Ok(Value::Array(result))
+                } else { Err(self.type_err("cell_split() requires (array, int, int, float)".into())) }
+            }
+            "cell_merge" => {
+                // cell_merge(hiddens, idx_a, idx_b, dim) → new_hiddens with averaged cell, one removed
+                if args.len() < 4 { return Err(self.type_err("cell_merge() requires (hiddens, idx_a, idx_b, dim)".into())); }
+                if let (Value::Array(h), Value::Int(a), Value::Int(b), Value::Int(dim)) = (&args[0], &args[1], &args[2], &args[3]) {
+                    let (a, b, dim) = (*a as usize, *b as usize, *dim as usize);
+                    let n_cells = h.len() / dim;
+                    let mut result = Vec::new();
+                    for c in 0..n_cells {
+                        if c == b { continue; } // skip cell b
+                        for d in 0..dim {
+                            let val = match &h[c * dim + d] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                            if c == a {
+                                let val_b = match &h[b * dim + d] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                                result.push(Value::Float((val + val_b) / 2.0)); // average
+                            } else {
+                                result.push(h[c * dim + d].clone());
+                            }
+                        }
+                    }
+                    Ok(Value::Array(result))
+                } else { Err(self.type_err("cell_merge() requires (array, int, int, int)".into())) }
+            }
+            "faction_consensus" => {
+                // faction_consensus(hiddens, n_cells, dim, n_factions) → [agreement_scores per faction]
+                // Each faction = cells assigned round-robin. Agreement = mean pairwise cosine_sim within faction
+                if args.len() < 4 { return Err(self.type_err("faction_consensus() requires (hiddens, n_cells, dim, n_factions)".into())); }
+                if let (Value::Array(h), Value::Int(nc), Value::Int(dim), Value::Int(nf)) = (&args[0], &args[1], &args[2], &args[3]) {
+                    let (nc, dim, nf) = (*nc as usize, *dim as usize, *nf as usize);
+                    let mut faction_scores = Vec::with_capacity(nf);
+                    for f in 0..nf {
+                        // Collect cells in this faction
+                        let mut members: Vec<usize> = Vec::new();
+                        for c in 0..nc {
+                            if c % nf == f { members.push(c); }
+                        }
+                        if members.len() < 2 {
+                            faction_scores.push(Value::Float(1.0)); // single cell = perfect agreement
+                            continue;
+                        }
+                        // Pairwise cosine similarity
+                        let mut total_sim = 0.0f64;
+                        let mut pairs = 0usize;
+                        for i in 0..members.len() {
+                            for j in (i+1)..members.len() {
+                                let mut dot = 0.0f64;
+                                let mut na = 0.0f64;
+                                let mut nb = 0.0f64;
+                                for d in 0..dim {
+                                    let va = match &h[members[i] * dim + d] { Value::Float(f) => *f, Value::Int(n) => *n as f64, _ => 0.0 };
+                                    let vb = match &h[members[j] * dim + d] { Value::Float(f) => *f, Value::Int(n) => *n as f64, _ => 0.0 };
+                                    dot += va * vb;
+                                    na += va * va;
+                                    nb += vb * vb;
+                                }
+                                let denom = na.sqrt() * nb.sqrt();
+                                total_sim += if denom < 1e-10 { 0.0 } else { dot / denom };
+                                pairs += 1;
+                            }
+                        }
+                        faction_scores.push(Value::Float(if pairs > 0 { total_sim / pairs as f64 } else { 0.0 }));
+                    }
+                    Ok(Value::Array(faction_scores))
+                } else { Err(self.type_err("faction_consensus() requires (array, int, int, int)".into())) }
+            }
+            "tension" => {
+                // tension(hiddens, n_cells, dim) → [tension per cell] = norm of hidden state
+                if args.len() < 3 { return Err(self.type_err("tension() requires (hiddens, n_cells, dim)".into())); }
+                if let (Value::Array(h), Value::Int(nc), Value::Int(dim)) = (&args[0], &args[1], &args[2]) {
+                    let (nc, dim) = (*nc as usize, *dim as usize);
+                    let mut tensions = Vec::with_capacity(nc);
+                    for c in 0..nc {
+                        let mut norm_sq = 0.0f64;
+                        for d in 0..dim {
+                            let v = match &h[c * dim + d] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                            norm_sq += v * v;
+                        }
+                        tensions.push(Value::Float(norm_sq.sqrt()));
+                    }
+                    Ok(Value::Array(tensions))
+                } else { Err(self.type_err("tension() requires (array, int, int)".into())) }
+            }
+            // ── Chaos injection builtins (Anima Laws 32-43) ──
+            "lorenz_step" => {
+                // lorenz_step(x, y, z, dt, sigma, rho, beta) → [new_x, new_y, new_z]
+                // Default: sigma=10, rho=28, beta=8/3
+                if args.len() < 3 { return Err(self.type_err("lorenz_step() requires at least (x, y, z)".into())); }
+                let x = match &args[0] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                let y = match &args[1] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                let z = match &args[2] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+                let dt = if args.len() > 3 { match &args[3] { Value::Float(f) => *f, _ => 0.01 } } else { 0.01 };
+                let sigma = if args.len() > 4 { match &args[4] { Value::Float(f) => *f, _ => 10.0 } } else { 10.0 };
+                let rho = if args.len() > 5 { match &args[5] { Value::Float(f) => *f, _ => 28.0 } } else { 28.0 };
+                let beta = if args.len() > 6 { match &args[6] { Value::Float(f) => *f, _ => 8.0/3.0 } } else { 8.0 / 3.0 };
+                let dx = sigma * (y - x);
+                let dy = x * (rho - z) - y;
+                let dz = x * y - beta * z;
+                Ok(Value::Array(vec![
+                    Value::Float(x + dx * dt),
+                    Value::Float(y + dy * dt),
+                    Value::Float(z + dz * dt),
+                ]))
+            }
+            "chaos_perturb" => {
+                // chaos_perturb(array, lorenz_state, scale) → inject chaos noise into array
+                if args.len() < 3 { return Err(self.type_err("chaos_perturb() requires (array, lorenz_state, scale)".into())); }
+                if let (Value::Array(arr), Value::Array(lorenz), Value::Float(scale)) = (&args[0], &args[1], &args[2]) {
+                    let lx = match &lorenz[0] { Value::Float(f) => *f, _ => 0.0 };
+                    let ly = match &lorenz[1] { Value::Float(f) => *f, _ => 0.0 };
+                    let lz = match &lorenz[2] { Value::Float(f) => *f, _ => 0.0 };
+                    let norm = (lx*lx + ly*ly + lz*lz).sqrt().max(1e-10);
+                    let result: Vec<Value> = arr.iter().enumerate().map(|(i, v)| {
+                        let vf = match v { Value::Float(f) => *f, Value::Int(n) => *n as f64, _ => 0.0 };
+                        // Rotate through lorenz components
+                        let noise = match i % 3 { 0 => lx/norm, 1 => ly/norm, _ => lz/norm };
+                        Value::Float(vf + noise * scale)
+                    }).collect();
+                    Ok(Value::Array(result))
+                } else {
+                    Err(self.type_err("chaos_perturb() requires (array, [x,y,z], float)".into()))
+                }
+            }
+            // ── Functional array builtins ──
+            "map_arr" => {
+                // map_arr(array, fn) → apply fn to each element
+                if args.len() < 2 { return Err(self.type_err("map_arr() requires (array, fn)".into())); }
+                if let Value::Array(a) = &args[0] {
+                    let func = args[1].clone();
+                    let mut result = Vec::with_capacity(a.len());
+                    for item in a {
+                        result.push(self.call_function(func.clone(), vec![item.clone()])?);
+                    }
+                    Ok(Value::Array(result))
+                } else { Err(self.type_err("map_arr() first arg must be array".into())) }
+            }
+            "filter_arr" => {
+                // filter_arr(array, fn) → keep elements where fn returns true
+                if args.len() < 2 { return Err(self.type_err("filter_arr() requires (array, fn)".into())); }
+                if let Value::Array(a) = &args[0] {
+                    let func = args[1].clone();
+                    let mut result = Vec::new();
+                    for item in a {
+                        let keep = self.call_function(func.clone(), vec![item.clone()])?;
+                        if matches!(keep, Value::Bool(true)) {
+                            result.push(item.clone());
+                        }
+                    }
+                    Ok(Value::Array(result))
+                } else { Err(self.type_err("filter_arr() first arg must be array".into())) }
+            }
+            "reduce" => {
+                // reduce(array, init, fn) → fold left: fn(acc, elem) for each elem
+                if args.len() < 3 { return Err(self.type_err("reduce() requires (array, init, fn)".into())); }
+                if let Value::Array(a) = &args[0] {
+                    let mut acc = args[1].clone();
+                    let func = args[2].clone();
+                    for item in a {
+                        acc = self.call_function(func.clone(), vec![acc, item.clone()])?;
+                    }
+                    Ok(acc)
+                } else { Err(self.type_err("reduce() first arg must be array".into())) }
+            }
+            "zip_arr" => {
+                // zip_arr(a, b) → [[a0,b0], [a1,b1], ...]
+                if args.len() < 2 { return Err(self.type_err("zip_arr() requires 2 arrays".into())); }
+                if let (Value::Array(a), Value::Array(b)) = (&args[0], &args[1]) {
+                    let result: Vec<Value> = a.iter().zip(b.iter()).map(|(x, y)| {
+                        Value::Array(vec![x.clone(), y.clone()])
+                    }).collect();
+                    Ok(Value::Array(result))
+                } else { Err(self.type_err("zip_arr() requires 2 arrays".into())) }
+            }
+            "enumerate_arr" => {
+                // enumerate_arr(array) → [[0,a0], [1,a1], ...]
+                if args.is_empty() { return Err(self.type_err("enumerate_arr() requires 1 array".into())); }
+                if let Value::Array(a) = &args[0] {
+                    let result: Vec<Value> = a.iter().enumerate().map(|(i, x)| {
+                        Value::Array(vec![Value::Int(i as i64), x.clone()])
+                    }).collect();
+                    Ok(Value::Array(result))
+                } else { Err(self.type_err("enumerate_arr() requires array".into())) }
+            }
+            "flatten" => {
+                // flatten(array_of_arrays) → flat array
+                if args.is_empty() { return Err(self.type_err("flatten() requires 1 array".into())); }
+                if let Value::Array(a) = &args[0] {
+                    let mut result = Vec::new();
+                    for item in a {
+                        if let Value::Array(inner) = item {
+                            result.extend(inner.iter().cloned());
+                        } else {
+                            result.push(item.clone());
+                        }
+                    }
+                    Ok(Value::Array(result))
+                } else { Err(self.type_err("flatten() requires array".into())) }
+            }
+            "slice" => {
+                // slice(array, start, end) → sub-array
+                if args.len() < 3 { return Err(self.type_err("slice() requires (array, start, end)".into())); }
+                if let (Value::Array(a), Value::Int(start), Value::Int(end)) = (&args[0], &args[1], &args[2]) {
+                    let s = *start as usize;
+                    let e = (*end as usize).min(a.len());
+                    Ok(Value::Array(a[s..e].to_vec()))
+                } else { Err(self.type_err("slice() requires (array, int, int)".into())) }
             }
             // ── @evolve builtins ──────────────────────────────────
             "evolve_gen" => {
