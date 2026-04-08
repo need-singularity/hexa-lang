@@ -130,7 +130,7 @@ pub struct Task {
     pub id: TaskId,
     pub state: TaskState,
     /// Function body (AST statements).
-    pub body: Vec<crate::ast::Stmt>,
+    pub body: std::sync::Arc<Vec<crate::ast::Stmt>>,
     /// Parameter bindings: (name, value).
     pub bindings: Vec<(String, Value)>,
     /// Captured environment from the spawning scope.
@@ -229,7 +229,7 @@ impl Scheduler {
     pub fn spawn_task(
         &self,
         name: String,
-        body: Vec<crate::ast::Stmt>,
+        body: std::sync::Arc<Vec<crate::ast::Stmt>>,
         bindings: Vec<(String, Value)>,
         captured_env: Vec<(String, Value)>,
         struct_defs: HashMap<String, Vec<(String, String, crate::ast::Visibility)>>,
@@ -514,7 +514,7 @@ fn execute_task(task: Task) {
     }
 
     let mut result = Value::Void;
-    for stmt in &task.body {
+    for stmt in task.body.iter() {
         match interp.exec_stmt(stmt) {
             Ok(v) => {
                 result = v;
@@ -591,9 +591,9 @@ mod tests {
         let sched = Scheduler::new();
         sched.start(2);
 
-        let body = vec![
+        let body: std::sync::Arc<Vec<crate::ast::Stmt>> = vec![
             crate::ast::Stmt::Return(Some(crate::ast::Expr::IntLit(99))),
-        ];
+        ].into();
         let future = sched.spawn_task(
             "test".into(),
             body,
@@ -626,17 +626,17 @@ mod tests {
 
         let f1 = sched.spawn_task(
             "t1".into(),
-            vec![crate::ast::Stmt::Return(Some(crate::ast::Expr::IntLit(1)))],
+            vec![crate::ast::Stmt::Return(Some(crate::ast::Expr::IntLit(1)))].into(),
             vec![], vec![], HashMap::new(), HashMap::new(), HashMap::new(),
         );
         let f2 = sched.spawn_task(
             "t2".into(),
-            vec![crate::ast::Stmt::Return(Some(crate::ast::Expr::IntLit(2)))],
+            vec![crate::ast::Stmt::Return(Some(crate::ast::Expr::IntLit(2)))].into(),
             vec![], vec![], HashMap::new(), HashMap::new(), HashMap::new(),
         );
         let f3 = sched.spawn_task(
             "t3".into(),
-            vec![crate::ast::Stmt::Return(Some(crate::ast::Expr::IntLit(3)))],
+            vec![crate::ast::Stmt::Return(Some(crate::ast::Expr::IntLit(3)))].into(),
             vec![], vec![], HashMap::new(), HashMap::new(), HashMap::new(),
         );
 
@@ -662,12 +662,12 @@ mod tests {
 
         let f1 = sched.spawn_task(
             "scope_a".into(),
-            vec![crate::ast::Stmt::Return(Some(crate::ast::Expr::IntLit(10)))],
+            vec![crate::ast::Stmt::Return(Some(crate::ast::Expr::IntLit(10)))].into(),
             vec![], vec![], HashMap::new(), HashMap::new(), HashMap::new(),
         );
         let f2 = sched.spawn_task(
             "scope_b".into(),
-            vec![crate::ast::Stmt::Return(Some(crate::ast::Expr::IntLit(20)))],
+            vec![crate::ast::Stmt::Return(Some(crate::ast::Expr::IntLit(20)))].into(),
             vec![], vec![], HashMap::new(), HashMap::new(), HashMap::new(),
         );
 
@@ -702,7 +702,7 @@ mod tests {
             vec![crate::ast::Stmt::Return(Some(crate::ast::Expr::Call(
                 Box::new(crate::ast::Expr::Ident("error_value_test".into())),
                 vec![],
-            )))],
+            )))].into(),
             vec![], vec![], HashMap::new(), HashMap::new(), HashMap::new(),
         );
         group.add(f1);
@@ -724,7 +724,7 @@ mod tests {
         let mut outer = TaskGroup::new();
         let f_outer = sched.spawn_task(
             "outer_task".into(),
-            vec![crate::ast::Stmt::Return(Some(crate::ast::Expr::IntLit(100)))],
+            vec![crate::ast::Stmt::Return(Some(crate::ast::Expr::IntLit(100)))].into(),
             vec![], vec![], HashMap::new(), HashMap::new(), HashMap::new(),
         );
         outer.add(f_outer);
@@ -733,7 +733,7 @@ mod tests {
         let mut inner = TaskGroup::new();
         let f_inner = sched.spawn_task(
             "inner_task".into(),
-            vec![crate::ast::Stmt::Return(Some(crate::ast::Expr::IntLit(42)))],
+            vec![crate::ast::Stmt::Return(Some(crate::ast::Expr::IntLit(42)))].into(),
             vec![], vec![], HashMap::new(), HashMap::new(), HashMap::new(),
         );
         inner.add(f_inner);
@@ -761,7 +761,7 @@ mod tests {
         for i in 0..5 {
             let f = sched.spawn_task(
                 format!("task_{}", i),
-                vec![crate::ast::Stmt::Return(Some(crate::ast::Expr::IntLit(i)))],
+                vec![crate::ast::Stmt::Return(Some(crate::ast::Expr::IntLit(i)))].into(),
                 vec![], vec![], HashMap::new(), HashMap::new(), HashMap::new(),
             );
             group.add(f);

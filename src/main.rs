@@ -112,12 +112,26 @@ mod std_crypto;
 mod std_consciousness;
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
-mod std_nexus6;
+mod std_nexus;
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 mod anima_bridge;
 #[allow(dead_code)]
 mod package;
+#[allow(dead_code)]
+mod singularity;
+#[allow(dead_code)]
+mod ir;
+#[allow(dead_code)]
+mod lower;
+#[allow(dead_code)]
+mod opt;
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+mod codegen;
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+mod std_web_template;
 
 use std::io::{self, Write, BufRead};
 use std::collections::HashMap;
@@ -147,6 +161,49 @@ fn main() {
                 }
                 run_file_native(&args[2]);
             }
+            #[cfg(not(target_arch = "wasm32"))]
+            "--hexa-ir" => {
+                if args.len() < 3 {
+                    eprintln!("Usage: hexa --hexa-ir <file.hexa>");
+                    std::process::exit(1);
+                }
+                run_file_hexa_ir(&args[2]);
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            "--bench-lower" => {
+                if args.len() < 3 {
+                    eprintln!("Usage: hexa --bench-lower <file.hexa> [iters]");
+                    std::process::exit(1);
+                }
+                let iters: usize = if args.len() >= 4 {
+                    args[3].parse().unwrap_or(10000)
+                } else { 10000 };
+                let source = std::fs::read_to_string(&args[2]).unwrap();
+                let tokens = lexer::Lexer::new(&source).tokenize().unwrap();
+                let stmts = parser::Parser::new(tokens).parse().unwrap();
+                let t0 = std::time::Instant::now();
+                let mut sink: usize = 0;
+                for _ in 0..iters {
+                    let m = lower::lower_program(&stmts, &args[2]);
+                    sink = sink.wrapping_add(m.functions.len());
+                }
+                let dt = t0.elapsed();
+                let us_per = dt.as_secs_f64() * 1_000_000.0 / iters as f64;
+                println!("[bench-lower] iters={} total={:?} per-iter={:.3}us sink={}",
+                    iters, dt, us_per, sink);
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            "--dump-ir" => {
+                if args.len() < 3 {
+                    eprintln!("Usage: hexa --dump-ir <file.hexa>");
+                    std::process::exit(1);
+                }
+                let source = std::fs::read_to_string(&args[2]).unwrap();
+                let tokens = lexer::Lexer::new(&source).tokenize().unwrap();
+                let stmts = parser::Parser::new(tokens).parse().unwrap();
+                let module = lower::lower_program(&stmts, &args[2]);
+                println!("{}", ir::print_module(&module));
+            }
             "--lsp" => lsp::run_lsp(),
             "debug" => {
                 if args.len() < 3 {
@@ -156,6 +213,14 @@ fn main() {
                 debugger::run_dap(&args[2]);
             }
             "--bench" => run_benchmark(),
+            #[cfg(not(target_arch = "wasm32"))]
+            "--eso-tune" => {
+                if args.len() < 3 {
+                    eprintln!("Usage: hexa --eso-tune <file.hexa> [--rounds N] [--policy adaptive|hybrid]");
+                    std::process::exit(1);
+                }
+                run_eso_tune(&args);
+            }
             "--mem-stats" => {
                 if args.len() < 3 {
                     eprintln!("Usage: hexa --mem-stats <file.hexa> [--memory-budget <MB>]");
@@ -225,7 +290,7 @@ fn main() {
             }
             "run" => cmd_run(&args),
             "test" => cmd_test(),
-            "add" => {
+            "add" | "install" => {
                 if args.len() < 3 {
                     eprintln!("Usage: hexa add <pkg>");
                     std::process::exit(1);
@@ -315,6 +380,13 @@ fn main() {
                     i += 1;
                 }
                 cmd_verify_law22(file, sw_phi, hw_phi);
+            }
+            "-e" | "--eval" => {
+                if args.len() < 3 {
+                    eprintln!("Usage: hexa -e <code>");
+                    std::process::exit(1);
+                }
+                run_source_with_dir(&args[2], "");
             }
             _ => run_file(&args[1]),
         }
@@ -525,13 +597,39 @@ fn run_source_with_dir(source: &str, file_path: &str) {
             std::process::exit(1);
         }
     };
-    // Type checking pass (runs before execution)
+    // Tiered execution: JIT → VM → Interpreter
+    // JIT and VM skip type/ownership checks (they have own error handling).
+    // Only the interpreter fallback runs full analysis.
+
+    // Tier 1: JIT (native code — fastest)
+    #[cfg(not(target_arch = "wasm32"))]
+    if jit::can_jit(&result.stmts) {
+        if let Ok(mut jit_compiler) = jit::JitCompiler::new(&jit::collect_extern_decls(&result.stmts)) {
+            match jit_compiler.compile_and_run(&result.stmts) {
+                Ok(r) => { if r != 0 { println!("{}", r); } return; }
+                Err(_) => {} // fall through
+            }
+        }
+    }
+
+    // Tier 2: VM (bytecode — reuse already-parsed stmts)
+    {
+        let mut comp = compiler::Compiler::new();
+        if let Ok(chunk) = comp.compile(&result.stmts) {
+            let mut vm = vm::VM::new();
+            match vm.execute(&chunk) {
+                Ok(_) => return,
+                Err(_) => {} // fall through
+            }
+        }
+    }
+
+    // Tier 3: Interpreter (most compatible — run full analysis first)
     let mut checker = type_checker::TypeChecker::new();
     if let Err(e) = checker.check(&result.stmts, &result.spans) {
         eprint_diagnostic(&e, &source_lines, file_name);
         std::process::exit(1);
     }
-    // Ownership analysis pass (compile-time, before interpretation)
     let skip_ownership = std::env::args().any(|a| a == "--no-ownership-check");
     if !skip_ownership {
         let ownership_errors = ownership::analyze_ownership(&result.stmts, &result.spans);
@@ -543,6 +641,8 @@ fn run_source_with_dir(source: &str, file_path: &str) {
             std::process::exit(1);
         }
     }
+
+    // Fallback: tree-walking interpreter (most compatible)
     let mut interp = interpreter::Interpreter::new();
     interp.source_lines = source_lines.clone();
     interp.file_name = file_name.to_string();
@@ -653,7 +753,7 @@ fn run_file_native(path: &str) {
         return;
     }
 
-    let mut jit_compiler = match jit::JitCompiler::new() {
+    let mut jit_compiler = match jit::JitCompiler::new(&jit::collect_extern_decls(&stmts)) {
         Ok(j) => j,
         Err(e) => {
             eprintln!("{}", e);
@@ -677,6 +777,253 @@ fn run_file_native(path: &str) {
                     std::process::exit(1);
                 }
             }
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn run_eso_tune(args: &[String]) {
+    let file = &args[2];
+
+    // Parse optional --rounds N and --policy adaptive|hybrid
+    let mut rounds: usize = 12; // σ=12 (n=6 design constant)
+    let mut policy = opt::pass_policy::Policy::Hybrid;
+    let mut i = 3;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--rounds" => {
+                i += 1;
+                if i < args.len() {
+                    rounds = args[i].parse().unwrap_or_else(|_| {
+                        eprintln!("[eso-tune] invalid --rounds value, using default 12");
+                        12
+                    });
+                    if rounds == 0 {
+                        eprintln!("[eso-tune] --rounds must be >= 1");
+                        std::process::exit(1);
+                    }
+                } else {
+                    eprintln!("[eso-tune] --rounds requires a value");
+                    std::process::exit(1);
+                }
+            }
+            "--policy" => {
+                i += 1;
+                if i < args.len() {
+                    policy = match args[i].as_str() {
+                        "fixed" => opt::pass_policy::Policy::Fixed,
+                        "adaptive" => opt::pass_policy::Policy::Adaptive,
+                        "hybrid" => opt::pass_policy::Policy::Hybrid,
+                        other => {
+                            eprintln!("[eso-tune] unknown policy '{}', using hybrid", other);
+                            opt::pass_policy::Policy::Hybrid
+                        }
+                    };
+                } else {
+                    eprintln!("[eso-tune] --policy requires a value");
+                    std::process::exit(1);
+                }
+            }
+            other => {
+                eprintln!("[eso-tune] warning: unknown flag '{}', ignoring", other);
+            }
+        }
+        i += 1;
+    }
+
+    // Read source
+    let source = match std::fs::read_to_string(file) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error reading {}: {}", file, e);
+            std::process::exit(1);
+        }
+    };
+
+    // Lex
+    let tokens = match lexer::Lexer::new(&source).tokenize() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(1);
+        }
+    };
+
+    // Parse
+    let stmts = match parser::Parser::new(tokens).parse() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(1);
+        }
+    };
+
+    eprintln!("[eso-tune] file={} rounds={} policy={:?}", file, rounds, policy);
+
+    let mut last_metrics: Vec<opt::ir_stats::PassMetric> = Vec::new();
+    let mut ed_history = opt::emergence_density::EdHistory::default();
+    let mut round_summaries: Vec<(usize, i64, u128, f64)> = Vec::new(); // (round, changes, elapsed_ns, ed)
+
+    let mut module = lower::lower_program(&stmts, file);
+    for round in 0..rounds {
+        // Reuse the optimized module from previous round (no re-lower)
+        let eso_result = opt::run_pipeline_with_policy(&mut module, policy, round, &last_metrics);
+        let metrics = &eso_result.metrics;
+
+        // Compute total changes (instruction deltas) and elapsed time
+        let total_changes: i64 = metrics.iter().map(|m| m.delta_instr().abs()).sum();
+        let total_elapsed_ns: u128 = metrics.iter().map(|m| m.elapsed_ns).sum();
+        let total_elapsed_ms = total_elapsed_ns as f64 / 1_000_000.0;
+
+        // Compute emergence density: ED = (1 - change_ratio) × speedup
+        let baseline_changes = if round == 0 { total_changes.max(1) } else { round_summaries[0].1.max(1) };
+        let baseline_ns = if round == 0 { total_elapsed_ns.max(1) } else { round_summaries[0].2.max(1) };
+        let ed = opt::emergence_density::compute(opt::emergence_density::EdInput {
+            baseline_changes,
+            current_changes: total_changes,
+            baseline_ns,
+            current_ns: total_elapsed_ns.max(1),
+        });
+        ed_history.push(ed);
+
+        eprintln!(
+            "[eso-tune] round {}/{}: {} changes, {:.2}ms, ED={:.4}",
+            round + 1,
+            rounds,
+            total_changes,
+            total_elapsed_ms,
+            ed,
+        );
+
+        round_summaries.push((round + 1, total_changes, total_elapsed_ns, ed));
+        last_metrics = metrics.clone();
+
+        if total_changes == 0 {
+            eprintln!("[eso-tune] ✓ converged at round {}", round + 1);
+            break;
+        }
+    }
+
+    // Final report
+    eprintln!("\n[eso-tune] === Final Report ({} rounds) ===", rounds);
+    eprintln!("{:<8} {:>10} {:>12} {:>10}", "Round", "Changes", "Time(ms)", "ED");
+    eprintln!("{}", "-".repeat(44));
+    for (r, changes, elapsed_ns, ed) in &round_summaries {
+        let ms = *elapsed_ns as f64 / 1_000_000.0;
+        eprintln!("{:<8} {:>10} {:>12.2} {:>10.4}", r, changes, ms, ed);
+    }
+
+    if round_summaries.len() >= 2 {
+        let first_ed = round_summaries[0].3;
+        let last_ed = round_summaries.last().unwrap().3;
+        let first_ns = round_summaries[0].2 as f64;
+        let last_ns = round_summaries.last().unwrap().2 as f64;
+        let speedup = if last_ns > 0.0 { first_ns / last_ns } else { 0.0 };
+        eprintln!("\n[eso-tune] ED: {:.4} -> {:.4} (delta={:+.4})", first_ed, last_ed, last_ed - first_ed);
+        eprintln!("[eso-tune] Speedup: {:.2}x (round 1 vs round {})", speedup, rounds);
+        if ed_history.is_monotone_up() {
+            eprintln!("[eso-tune] ED trend: monotonically improving");
+        }
+    }
+    eprintln!("[eso-tune] done.");
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn run_file_hexa_ir(path: &str) {
+    let source = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error reading {}: {}", path, e);
+            std::process::exit(1);
+        }
+    };
+
+    // 1. Lex
+    let tokens = match lexer::Lexer::new(&source).tokenize() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(1);
+        }
+    };
+
+    // 2. Parse
+    let stmts = match parser::Parser::new(tokens).parse() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(1);
+        }
+    };
+
+    // 3. Type check (optional — skip if spans unavailable)
+    // The HEXA-IR lowering does its own type resolution.
+
+    // 4. Lower AST -> HEXA-IR
+    let mut module = lower::lower_program(&stmts, path);
+
+    // 5. Optimize (sigma=12 pipeline) — ESO policy via HEXA_ESO env var
+    let eso_mode = std::env::var("HEXA_ESO").unwrap_or_default();
+    let policy = match eso_mode.as_str() {
+        "adaptive" => opt::pass_policy::Policy::Adaptive,
+        "hybrid" => opt::pass_policy::Policy::Hybrid,
+        _ => opt::pass_policy::Policy::Fixed,
+    };
+    let eso_result = opt::run_pipeline_with_policy(&mut module, policy, 0, &[]);
+    let opt_result = eso_result.pipeline;
+    eprintln!("[hexa-ir] {}", opt_result.summary().trim());
+    if std::env::var("HEXA_DUMP_POST_OPT").is_ok() {
+        eprintln!("{}", ir::print_module(&module));
+    }
+    if !eso_mode.is_empty() && eso_mode != "fixed" {
+        eprintln!("[eso] policy={} metrics={}", eso_mode, eso_result.metrics.len());
+    }
+
+    // 6. Compile to native binary
+    let output_path = path.trim_end_matches(".hexa");
+    let output_bin = format!("{}.bin", output_path);
+    match codegen::compile_to_binary(&module, &output_bin) {
+        Ok(()) => {
+            eprintln!("[hexa-ir] Compiled to {}", output_bin);
+            if let Some(ps) = codegen::arm64::last_peephole_stats() {
+                eprintln!(
+                    "[hexa-ir] peephole: total={} rounds={} (id={} madd={} msub={} cmp0={} ldp={} shadd={})",
+                    ps.total(), ps.rounds,
+                    ps.identity_nop, ps.mul_add_to_madd, ps.mul_sub_to_msub,
+                    ps.cmp_zero_dead, ps.ldr_pair_to_ldp, ps.lsl_add_to_shifted_add
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!("[hexa-ir] Compilation failed: {}", e);
+            std::process::exit(1);
+        }
+    }
+
+    // 7. Run the binary and capture output
+    let output = std::process::Command::new(&output_bin)
+        .output();
+    match output {
+        Ok(o) => {
+            // Print stdout
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            if !stdout.is_empty() {
+                print!("{}", stdout);
+            }
+            // If no stdout but non-zero exit, print exit code as result
+            if stdout.trim().is_empty() {
+                if let Some(code) = o.status.code() {
+                    if code != 0 {
+                        println!("{}", code);
+                    }
+                }
+            }
+            // let _ = std::fs::remove_file(&output_bin); // keep for benchmarking
+        }
+        Err(e) => {
+            eprintln!("[hexa-ir] Failed to run binary: {}", e);
+            // let _ = std::fs::remove_file(&output_bin); // keep for benchmarking
+            std::process::exit(1);
         }
     }
 }
@@ -725,7 +1072,7 @@ fib(30)
     let tokens2 = lexer::Lexer::new(fib_src).tokenize().unwrap();
     let stmts2 = parser::Parser::new(tokens2).parse().unwrap();
     let start = Instant::now();
-    let mut jit_compiler = jit::JitCompiler::new().unwrap();
+    let mut jit_compiler = jit::JitCompiler::new(&jit::collect_extern_decls(&stmts2)).unwrap();
     let native_fib = jit_compiler.compile_and_run(&stmts2).unwrap();
     let native_fib_time = start.elapsed();
 

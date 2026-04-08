@@ -75,24 +75,81 @@ impl Esp32Context {
         self.output.push_str("    loop {}\n");
         self.output.push_str("}\n\n");
 
-        // UART write stub
-        self.output.push_str("/// UART write stub — replace with actual ESP32 HAL UART.\n");
+        // UART setup and write functions using esp32-hal
+        // On xtensa targets: real UART via esp32-hal
+        // On other targets: no-op stubs for cross-compilation / testing
+        self.output.push_str("#[cfg(target_arch = \"xtensa\")]\n");
+        self.output.push_str("use esp32_hal::{clock::ClockControl, peripherals::Peripherals, prelude::*, uart::{Uart, config::Config as UartConfig}};\n\n");
+
+        self.output.push_str("#[cfg(target_arch = \"xtensa\")]\n");
+        self.output.push_str("static mut UART0: Option<Uart<'static, esp32_hal::peripherals::UART0>> = None;\n\n");
+
+        self.output.push_str("#[cfg(target_arch = \"xtensa\")]\n");
+        self.output.push_str("fn uart_init() {\n");
+        self.output.push_str("    let peripherals = Peripherals::take();\n");
+        self.output.push_str("    let system = peripherals.SYSTEM.split();\n");
+        self.output.push_str("    let clocks = ClockControl::max(system.clock_control).freeze();\n");
+        self.output.push_str("    let uart0 = Uart::new_with_default_pins(\n");
+        self.output.push_str("        peripherals.UART0,\n");
+        self.output.push_str("        &clocks,\n");
+        self.output.push_str("    );\n");
+        self.output.push_str("    unsafe { UART0 = Some(uart0); }\n");
+        self.output.push_str("}\n\n");
+
+        self.output.push_str("#[cfg(not(target_arch = \"xtensa\"))]\n");
+        self.output.push_str("fn uart_init() {}\n\n");
+
+        // uart_write: real HAL on xtensa, no-op stub otherwise
+        self.output.push_str("#[cfg(target_arch = \"xtensa\")]\n");
         self.output.push_str("fn uart_write(s: &str) {\n");
-        self.output.push_str("    // TODO: Replace with esp32-hal UART write\n");
-        self.output.push_str("    let _ = s;\n");
+        self.output.push_str("    unsafe {\n");
+        self.output.push_str("        if let Some(ref mut uart) = UART0 {\n");
+        self.output.push_str("            use core::fmt::Write;\n");
+        self.output.push_str("            let _ = uart.write_str(s);\n");
+        self.output.push_str("        }\n");
+        self.output.push_str("    }\n");
         self.output.push_str("}\n\n");
 
+        self.output.push_str("#[cfg(not(target_arch = \"xtensa\"))]\n");
+        self.output.push_str("fn uart_write(_s: &str) {}\n\n");
+
+        // uart_write_int: convert i64 to decimal string on stack, then write
         self.output.push_str("fn uart_write_int(n: i64) {\n");
-        self.output.push_str("    // TODO: Replace with actual int-to-string + UART\n");
-        self.output.push_str("    let _ = n;\n");
+        self.output.push_str("    let mut buf = [0u8; 20];\n");
+        self.output.push_str("    let mut pos = buf.len();\n");
+        self.output.push_str("    let negative = n < 0;\n");
+        self.output.push_str("    let mut val = if negative { (0i64.wrapping_sub(n)) as u64 } else { n as u64 };\n");
+        self.output.push_str("    if val == 0 {\n");
+        self.output.push_str("        uart_write(\"0\");\n");
+        self.output.push_str("        return;\n");
+        self.output.push_str("    }\n");
+        self.output.push_str("    while val > 0 {\n");
+        self.output.push_str("        pos -= 1;\n");
+        self.output.push_str("        buf[pos] = b'0' + (val % 10) as u8;\n");
+        self.output.push_str("        val /= 10;\n");
+        self.output.push_str("    }\n");
+        self.output.push_str("    if negative {\n");
+        self.output.push_str("        pos -= 1;\n");
+        self.output.push_str("        buf[pos] = b'-';\n");
+        self.output.push_str("    }\n");
+        self.output.push_str("    if let Ok(s) = core::str::from_utf8(&buf[pos..]) {\n");
+        self.output.push_str("        uart_write(s);\n");
+        self.output.push_str("    }\n");
         self.output.push_str("}\n\n");
 
+        // uart_write_float: simple fixed-point output (no_std compatible)
         self.output.push_str("fn uart_write_float(n: f64) {\n");
-        self.output.push_str("    let _ = n;\n");
+        self.output.push_str("    let int_part = n as i64;\n");
+        self.output.push_str("    uart_write_int(int_part);\n");
+        self.output.push_str("    uart_write(\".\");\n");
+        self.output.push_str("    let frac = if n < 0.0 { -n } else { n } - (if int_part < 0 { -int_part } else { int_part }) as f64;\n");
+        self.output.push_str("    let frac_digits = (frac * 1000000.0) as u64;\n");
+        self.output.push_str("    uart_write_int(frac_digits as i64);\n");
         self.output.push_str("}\n\n");
 
+        // uart_write_bool
         self.output.push_str("fn uart_write_bool(b: bool) {\n");
-        self.output.push_str("    let _ = b;\n");
+        self.output.push_str("    if b { uart_write(\"true\"); } else { uart_write(\"false\"); }\n");
         self.output.push_str("}\n\n");
 
         // First pass: emit function declarations
@@ -107,6 +164,7 @@ impl Esp32Context {
         self.output.push_str("#[no_mangle]\n");
         self.output.push_str("pub extern \"C\" fn main() -> ! {\n");
         self.push_indent();
+        self.writeln("uart_init();");
 
         // Second pass: emit non-function statements inside main
         for stmt in stmts {

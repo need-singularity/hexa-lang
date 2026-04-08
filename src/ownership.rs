@@ -1,3 +1,4 @@
+// ⛔ CORE — L0 불변식 (소유권 시스템. 수정 전 유저 승인 필수)
 //! Compile-time ownership analysis for Hexa.
 //!
 //! Walks the AST before interpretation to detect ownership violations
@@ -336,7 +337,7 @@ impl OwnershipAnalyzer {
             Stmt::AsyncFnDecl(decl) => {
                 self.analyze_fn_body(decl, line, col);
             }
-            Stmt::For(var, iter_expr, body) => {
+            Stmt::For(_var, iter_expr, body) => {
                 self.check_expr_use(iter_expr, line, col);
                 self.push_scope();
                 // Loop variable is not ownership-tracked.
@@ -400,7 +401,7 @@ impl OwnershipAnalyzer {
             | Stmt::Static(..) | Stmt::MacroDef(_) | Stmt::DeriveDecl(..)
             | Stmt::ComptimeFn(_) | Stmt::EffectDecl(_) | Stmt::ConsciousnessBlock(_, _) | Stmt::EvolveFn(_)
             | Stmt::Scope(_) | Stmt::ProofBlock(..)
-            | Stmt::TypeAlias(..) | Stmt::AtomicLet(..) | Stmt::Panic(..) | Stmt::Theorem(..) => {}
+            | Stmt::TypeAlias(..) | Stmt::AtomicLet(..) | Stmt::Panic(..) | Stmt::Theorem(..) | Stmt::Break | Stmt::Continue | Stmt::Extern(_) | Stmt::LetTuple(..) => {}
         }
     }
 
@@ -451,7 +452,7 @@ impl OwnershipAnalyzer {
     }
 
     /// Analyze a `borrow` expression: `let y = borrow x`.
-    fn analyze_borrow(&mut self, inner: &Expr, target: &str, line: usize, col: usize) {
+    fn analyze_borrow(&mut self, inner: &Expr, _target: &str, line: usize, col: usize) {
         if let Expr::Ident(source) = inner {
             if let Some(state) = self.lookup_state(source).cloned() {
                 match state {
@@ -778,9 +779,10 @@ impl OwnershipAnalyzer {
             }
             // Literals and other terminal expressions: no variables to check.
             Expr::IntLit(_) | Expr::FloatLit(_) | Expr::BoolLit(_)
-            | Expr::StringLit(_) | Expr::CharLit(_) | Expr::Wildcard
+            | Expr::StringLit(_) | Expr::CharLit(_) | Expr::Wildcard | Expr::ArrayPattern(_, _)
             | Expr::EnumPath(_, _, _) | Expr::MacroInvoc(_) | Expr::Comptime(_)
-            | Expr::HandleWith(_, _) | Expr::EffectCall(_, _, _) | Expr::Resume(_) => {}
+            | Expr::HandleWith(_, _) | Expr::EffectCall(_, _, _) | Expr::Resume(_)
+            | Expr::Template(_) | Expr::TryCatch(_, _, _) => {}
             Expr::DynCast(_, inner) | Expr::Yield(inner) => {
                 self.check_expr_use(inner, line, col);
             }

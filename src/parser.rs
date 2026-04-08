@@ -1,3 +1,4 @@
+// ⛔ CORE — L0 불변식 (파서 문법 정의. 수정 전 유저 승인 필수)
 #![allow(dead_code)]
 
 use crate::token::{Token, Spanned, Span};
@@ -13,11 +14,17 @@ pub struct ParseResult {
 pub struct Parser {
     tokens: Vec<Spanned>,
     pos: usize,
+    /// Pending @link("lib") attribute for the next extern fn declaration.
+    pending_link_attr: Option<String>,
+    /// AI-native: pending attributes for next declaration.
+    pending_attrs: Vec<Attribute>,
+    /// When true, parse_primary skips struct init (for while/if conditions)
+    no_struct_init: bool,
 }
 
 impl Parser {
     pub fn new(tokens: Vec<Spanned>) -> Self {
-        Parser { tokens, pos: 0 }
+        Parser { tokens, pos: 0, pending_link_attr: None, pending_attrs: vec![], no_struct_init: false }
     }
 
     /// Construct from plain tokens (no span info). Convenience for tests.
@@ -25,7 +32,12 @@ impl Parser {
         let spanned = tokens.into_iter()
             .map(|t| Spanned::new(t, 0, 0))
             .collect();
-        Parser { tokens: spanned, pos: 0 }
+        Parser { tokens: spanned, pos: 0, pending_link_attr: None, pending_attrs: vec![], no_struct_init: false }
+    }
+
+    /// Drain pending AI-native attributes.
+    fn take_attrs(&mut self) -> Vec<Attribute> {
+        std::mem::take(&mut self.pending_attrs)
     }
 
     // ── Helpers ──────────────────────────────────────────────
@@ -75,7 +87,7 @@ impl Parser {
     }
 
     fn skip_newlines(&mut self) {
-        while matches!(self.peek(), Token::Newline) {
+        while matches!(self.peek(), Token::Newline | Token::Semicolon) {
             self.advance();
         }
     }
@@ -104,8 +116,24 @@ impl Parser {
     fn expect_ident(&mut self) -> Result<String, HexaError> {
         let span = self.current_span();
         match self.advance() {
-            Token::Ident(name) => Ok(name),
+            Token::Ident(name) => Ok(name.to_string()),
             other => Err(self.error_at(span, format!("expected identifier, got {:?}", other))),
+        }
+    }
+
+    /// Parse a return type: either an identifier or `[type]` for array types.
+    fn parse_ret_type(&mut self) -> Result<String, HexaError> {
+        if matches!(self.peek(), Token::LBracket) {
+            self.advance(); // consume [
+            let inner = self.expect_ident()?;
+            self.expect(&Token::RBracket)?;
+            Ok(format!("[{}]", inner))
+        } else if matches!(self.peek(), Token::LParen) {
+            self.advance(); // consume (
+            self.expect(&Token::RParen)?;
+            return Ok("()".to_string());
+        } else {
+            self.expect_ident()
         }
     }
 
@@ -148,6 +176,8 @@ impl Parser {
             Token::For => self.parse_for_stmt(),
             Token::While => self.parse_while_stmt(),
             Token::Loop => self.parse_loop_stmt(),
+            Token::Break => { self.advance(); Ok(Stmt::Break) }
+            Token::Continue => { self.advance(); Ok(Stmt::Continue) }
             Token::Return => self.parse_return(),
             Token::Proof => self.parse_proof_or_proof_block(),
             Token::Theorem => self.parse_theorem(),
@@ -172,11 +202,12 @@ impl Parser {
             Token::Optimize => self.parse_optimize(),
             Token::Comptime => self.parse_comptime_stmt(),
             Token::Effect => self.parse_effect_decl(),
+            Token::Extern => self.parse_extern_fn_decl(),
             Token::Pure => self.parse_pure_fn(vis),
             Token::Ident(ref s) if s == "consciousness" && !matches!(self.peek_ahead(1), Token::ColonColon | Token::Dot | Token::Eq | Token::LParen) => {
                 self.advance(); // consume 'consciousness'
                 let name = match self.peek().clone() {
-                    Token::StringLit(s) => { self.advance(); s }
+                    Token::StringLit(s) => { self.advance(); s.to_string() }
                     Token::Ident(_) if !matches!(self.peek_ahead(1), Token::ColonColon) => self.expect_ident()?,
                     Token::LBrace => "default".to_string(),
                     _ => return Err(self.error(format!(
@@ -186,8 +217,20 @@ impl Parser {
                 let body = self.parse_block()?;
                 Ok(Stmt::ConsciousnessBlock(name, body))
             }
-            Token::Ident(ref s) if s == "@evolve" => {
-                self.advance(); // consume '@evolve'
+            Token::Attribute(ref s) if &**s == "link" => {
+                self.advance(); // consume @link
+                self.expect(&Token::LParen)?;
+                let lib_name = match self.peek().clone() {
+                    Token::StringLit(s) => { self.advance(); s.to_string() }
+                    _ => return Err(self.error("expected string literal after @link(".to_string())),
+                };
+                self.expect(&Token::RParen)?;
+                self.pending_link_attr = Some(lib_name);
+                self.skip_newlines();
+                return self.parse_stmt();
+            }
+            Token::Attribute(ref s) if &**s == "evolve" => {
+                self.advance(); // consume @evolve
                 self.expect(&Token::Fn)?;
                 let name = self.expect_ident()?;
                 let type_params = if matches!(self.peek(), Token::Lt) {
@@ -197,15 +240,66 @@ impl Parser {
                 let params = self.parse_params()?;
                 self.expect(&Token::RParen)?;
                 let ret_type = if matches!(self.peek(), Token::Arrow) {
-                    self.advance(); Some(self.expect_ident()?)
+                    self.advance(); Some(self.parse_ret_type()?)
                 } else { None };
                 let where_clauses = if matches!(self.peek(), Token::Where) {
                     self.parse_where_clauses()?
                 } else { vec![] };
                 let body = self.parse_block()?;
                 Ok(Stmt::EvolveFn(FnDecl {
-                    name, type_params, params, ret_type, where_clauses, body, vis, is_pure: false,
+                    name, type_params, params, ret_type, where_clauses, precondition: None, postcondition: None, body, vis, is_pure: false,
+                    attrs: vec![Attribute::new(crate::token::AttrKind::Evolve)],
                 }))
+            }
+            // AI-native: any other @attr before a declaration
+            Token::Attribute(_) => {
+                // Collect all consecutive attributes
+                let mut attrs = Vec::new();
+                while let Token::Attribute(ref attr_name) = self.peek().clone() {
+                    let name_str = attr_name.to_string();
+                    self.advance();
+                    let kind = if matches!(self.peek(), Token::LParen) {
+                        self.advance(); // (
+                        match name_str.as_str() {
+                            "link" => {
+                                let lib = match self.peek().clone() {
+                                    Token::StringLit(s) => { self.advance(); s.to_string() }
+                                    _ => return Err(self.error("expected string after @link(".into())),
+                                };
+                                self.expect(&Token::RParen)?;
+                                crate::token::AttrKind::Link(lib)
+                            }
+                            "bounded" => {
+                                let n = match self.peek().clone() {
+                                    Token::IntLit(n) => { self.advance(); n }
+                                    _ => return Err(self.error("expected int after @bounded(".into())),
+                                };
+                                self.expect(&Token::RParen)?;
+                                crate::token::AttrKind::Bounded(n)
+                            }
+                            "deprecated" => {
+                                let msg = match self.peek().clone() {
+                                    Token::StringLit(s) => { self.advance(); Some(s.to_string()) }
+                                    _ => None,
+                                };
+                                self.expect(&Token::RParen)?;
+                                crate::token::AttrKind::Deprecated(msg)
+                            }
+                            _ => {
+                                while !matches!(self.peek(), Token::RParen | Token::Eof) { self.advance(); }
+                                self.expect(&Token::RParen)?;
+                                crate::token::AttrKind::Custom(name_str.clone())
+                            }
+                        }
+                    } else {
+                        crate::token::AttrKind::from_name(&name_str)
+                    };
+                    attrs.push(Attribute::new(kind));
+                    self.skip_newlines();
+                }
+                // Store attrs for next declaration to consume
+                self.pending_attrs = attrs;
+                self.parse_stmt()
             }
             _ => {
                 let expr = self.parse_expr()?;
@@ -240,6 +334,23 @@ impl Parser {
         // optional 'mut'
         if matches!(self.peek(), Token::Mut) {
             self.advance();
+        }
+        // tuple destructure: let (a, b) = expr
+        if matches!(self.peek(), Token::LParen) {
+            self.advance(); // consume '('
+            let mut names = Vec::new();
+            loop {
+                names.push(self.expect_ident()?);
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+            self.expect(&Token::RParen)?;
+            self.expect(&Token::Eq)?;
+            let expr = self.parse_expr()?;
+            return Ok(Stmt::LetTuple(names, expr));
         }
         let name = self.expect_ident()?;
         // optional type annotation
@@ -447,7 +558,7 @@ impl Parser {
         self.advance(); // consume 'intent'
         // intent "description" { key: value, ... }
         let description = match self.peek().clone() {
-            Token::StringLit(s) => { self.advance(); s }
+            Token::StringLit(s) => { self.advance(); s.to_string() }
             Token::Ident(_) => { self.expect_ident()? }
             _ => return Err(self.error(format!("expected string or identifier after 'intent', got {:?}", self.peek()))),
         };
@@ -473,7 +584,7 @@ impl Parser {
         self.advance(); // consume 'verify'
         // verify "name" { ... } or verify name { ... }
         let name = match self.peek().clone() {
-            Token::StringLit(s) => { self.advance(); s }
+            Token::StringLit(s) => { self.advance(); s.to_string() }
             Token::Ident(_) => { self.expect_ident()? }
             _ => return Err(self.error(format!("expected string or identifier after 'verify', got {:?}", self.peek()))),
         };
@@ -507,7 +618,7 @@ impl Parser {
         if let Token::StringLit(name) = self.peek().clone() {
             self.advance(); // consume name
             let body = self.parse_block()?;
-            return Ok(Stmt::SpawnNamed(name, body));
+            return Ok(Stmt::SpawnNamed(name.to_string(), body));
         }
         let body = self.parse_block()?;
         Ok(Stmt::Spawn(body))
@@ -535,7 +646,7 @@ impl Parser {
             self.expect(&Token::RParen)?;
             let ret_type = if matches!(self.peek(), Token::Arrow) {
                 self.advance();
-                Some(self.expect_ident()?)
+                Some(self.parse_ret_type()?)
             } else {
                 None
             };
@@ -546,9 +657,46 @@ impl Parser {
             };
             let body = self.parse_block()?;
             return Ok(Stmt::ComptimeFn(FnDecl {
-                name, type_params, params, ret_type, where_clauses, body,
-                vis: Visibility::Private, is_pure: false,
+                name, type_params, params, ret_type, where_clauses, precondition: None, postcondition: None, body,
+                vis: Visibility::Private, is_pure: false, attrs: vec![],
             }));
+        }
+        // comptime const name = expr — compile-time constant
+        if matches!(self.peek(), Token::Const) {
+            self.advance(); // consume 'const'
+            let name = self.expect_ident()?;
+            let typ = if matches!(self.peek(), Token::Colon) {
+                self.advance();
+                Some(self.expect_ident()?)
+            } else {
+                None
+            };
+            self.expect(&Token::Eq)?;
+            let expr = self.parse_expr()?;
+            return Ok(Stmt::Const(name, typ, Expr::Comptime(Box::new(expr)), Visibility::Private));
+        }
+        // comptime let name = expr — compile-time variable
+        if matches!(self.peek(), Token::Let) {
+            self.advance(); // consume 'let'
+            if matches!(self.peek(), Token::Mut) {
+                self.advance();
+            }
+            let name = self.expect_ident()?;
+            let typ = if matches!(self.peek(), Token::Colon) {
+                self.advance();
+                Some(self.expect_ident()?)
+            } else {
+                None
+            };
+            self.expect(&Token::Eq)?;
+            let expr = self.parse_expr()?;
+            return Ok(Stmt::Let(name, typ, Some(Expr::Comptime(Box::new(expr))), Visibility::Private));
+        }
+        // comptime assert expr — compile-time assertion (evaluated eagerly)
+        if matches!(self.peek(), Token::Assert) {
+            self.advance(); // consume 'assert'
+            let expr = self.parse_expr()?;
+            return Ok(Stmt::Assert(expr));
         }
         // comptime { ... } — compile-time block as expression statement
         let block = self.parse_block()?;
@@ -570,12 +718,12 @@ impl Parser {
         self.expect(&Token::RParen)?;
         let ret_type = if matches!(self.peek(), Token::Arrow) {
             self.advance();
-            Some(self.expect_ident()?)
+            Some(self.parse_ret_type()?)
         } else {
             None
         };
         let body = self.parse_block()?;
-        Ok(Stmt::AsyncFnDecl(FnDecl { name, type_params, params, ret_type, where_clauses: vec![], body, vis, is_pure: false }))
+        Ok(Stmt::AsyncFnDecl(FnDecl { name, type_params, params, ret_type, where_clauses: vec![], precondition: None, postcondition: None, body, vis, is_pure: false, attrs: vec![] }))
     }
 
     fn parse_select(&mut self) -> Result<Stmt, HexaError> {
@@ -587,7 +735,7 @@ impl Parser {
         while !matches!(self.peek(), Token::RBrace | Token::Eof) {
             // Check for timeout arm: timeout(ms) => { body }
             if let Token::Ident(ref s) = self.peek().clone() {
-                if s == "timeout" {
+                if &**s == "timeout" {
                     self.advance(); // consume 'timeout'
                     self.expect(&Token::LParen)?;
                     let duration_expr = self.parse_expr()?;
@@ -612,7 +760,7 @@ impl Parser {
             //
             // Detect "from" syntax: identifier followed by "from"
             let is_from_syntax = if let Token::Ident(_) = self.peek() {
-                matches!(self.peek_ahead(1), Token::Ident(ref s) if s == "from")
+                matches!(self.peek_ahead(1), Token::Ident(ref s) if &**s == "from")
             } else {
                 false
             };
@@ -695,7 +843,7 @@ impl Parser {
             self.expect(&Token::RParen)?;
             let ret_type = if matches!(self.peek(), Token::Arrow) {
                 self.advance();
-                Some(self.expect_ident()?)
+                Some(self.parse_ret_type()?)
             } else {
                 None
             };
@@ -703,7 +851,7 @@ impl Parser {
             self.skip_newlines();
             // Body must be a single string literal (the description)
             let description = match self.peek().clone() {
-                Token::StringLit(s) => { self.advance(); s }
+                Token::StringLit(s) => { self.advance(); s.to_string() }
                 _ => return Err(self.error(format!(
                     "generate fn body must be a string description, got {:?}", self.peek()
                 ))),
@@ -726,7 +874,7 @@ impl Parser {
             self.expect(&Token::LBrace)?;
             self.skip_newlines();
             let description = match self.peek().clone() {
-                Token::StringLit(s) => { self.advance(); s }
+                Token::StringLit(s) => { self.advance(); s.to_string() }
                 _ => return Err(self.error(format!(
                     "generate body must be a string description, got {:?}", self.peek()
                 ))),
@@ -755,7 +903,7 @@ impl Parser {
         self.expect(&Token::RParen)?;
         let ret_type = if matches!(self.peek(), Token::Arrow) {
             self.advance();
-            Some(self.expect_ident()?)
+            Some(self.parse_ret_type()?)
         } else {
             None
         };
@@ -766,9 +914,12 @@ impl Parser {
             params,
             ret_type,
             where_clauses: vec![],
+            precondition: None,
+            postcondition: None,
             body,
             vis: Visibility::Private,
             is_pure: false,
+            attrs: vec![],
         };
         Ok(Stmt::Optimize(decl))
     }
@@ -811,7 +962,7 @@ impl Parser {
 
     fn parse_macro_pattern_token(&mut self) -> Result<MacroPatternToken, HexaError> {
         if let Token::Ident(ref s) = self.peek().clone() {
-            if s == "$" {
+            if &**s == "$" {
                 self.advance();
                 if matches!(self.peek(), Token::LParen) {
                     self.advance();
@@ -867,7 +1018,7 @@ impl Parser {
 
     fn parse_macro_body_token(&mut self) -> Result<MacroBodyToken, HexaError> {
         if let Token::Ident(ref s) = self.peek().clone() {
-            if s == "$" {
+            if &**s == "$" {
                 self.advance();
                 if matches!(self.peek(), Token::LParen) {
                     self.advance();
@@ -896,10 +1047,10 @@ impl Parser {
     fn parse_macro_lit_token(&mut self) -> Result<MacroLitToken, HexaError> {
         let tok = self.peek().clone();
         let lit = match tok {
-            Token::Ident(ref s) => MacroLitToken::Ident(s.clone()),
+            Token::Ident(ref s) => MacroLitToken::Ident(s.to_string()),
             Token::IntLit(n) => MacroLitToken::IntLit(n),
             Token::FloatLit(n) => MacroLitToken::FloatLit(n),
-            Token::StringLit(ref s) => MacroLitToken::StringLit(s.clone()),
+            Token::StringLit(ref s) => MacroLitToken::StringLit(s.to_string()),
             Token::BoolLit(b) => MacroLitToken::BoolLit(b),
             Token::LParen => MacroLitToken::LParen,
             Token::RParen => MacroLitToken::RParen,
@@ -1029,13 +1180,42 @@ impl Parser {
     }
 
     fn parse_use_decl(&mut self) -> Result<Stmt, HexaError> {
-        self.advance(); // consume 'use'
-        let mut path = vec![self.expect_ident()?];
+        self.advance(); // consume 'use' / 'import'
+        // Support string path: import "path/to/module"
+        if let Token::StringLit(path) = self.peek().clone() {
+            self.advance();
+            // Convert "path/to/module" or "path/to/module.hexa" to path segments
+            let path_str: &str = &path;
+            let path_str = path_str.trim_end_matches(".hexa");
+            let segments: Vec<String> = path_str.split('/').map(String::from).collect();
+            return Ok(Stmt::Use(segments));
+        }
+        let mut prefix = vec![self.expect_ident()?];
         while matches!(self.peek(), Token::ColonColon) {
             self.advance(); // consume ::
-            path.push(self.expect_ident()?);
+            // Check for grouped import: use module::{a, b, c}
+            if matches!(self.peek(), Token::LBrace) {
+                self.advance(); // consume '{'
+                self.skip_newlines();
+                let mut uses = Vec::new();
+                while !matches!(self.peek(), Token::RBrace | Token::Eof) {
+                    let item = self.expect_ident()?;
+                    let mut full_path = prefix.clone();
+                    full_path.push(item);
+                    uses.push(Stmt::Use(full_path));
+                    self.skip_newlines();
+                    if matches!(self.peek(), Token::Comma) {
+                        self.advance();
+                        self.skip_newlines();
+                    }
+                }
+                self.expect(&Token::RBrace)?;
+                // Wrap multiple use stmts in a block expression
+                return Ok(Stmt::Expr(Expr::Block(uses)));
+            }
+            prefix.push(self.expect_ident()?);
         }
-        Ok(Stmt::Use(path))
+        Ok(Stmt::Use(prefix))
     }
 
     // ── Level 3: Declarations ───────────────────────────────
@@ -1054,18 +1234,24 @@ impl Parser {
         self.expect(&Token::RParen)?;
         let ret_type = if matches!(self.peek(), Token::Arrow) {
             self.advance();
-            Some(self.expect_ident()?)
+            Some(self.parse_ret_type()?)
         } else {
             None
         };
-        // Parse optional where clause: where T: Display, U: Clone
-        let where_clauses = if matches!(self.peek(), Token::Where) {
-            self.parse_where_clauses()?
-        } else {
-            vec![]
-        };
+        // Parse optional where clause: type bounds or precondition expression
+        let (where_clauses, precondition) = self.parse_where_or_precondition()?;
+        // Parse optional ensures clause: postcondition expression
+        let postcondition = self.parse_ensures_clause()?;
         let body = self.parse_block()?;
-        Ok(Stmt::FnDecl(FnDecl { name, type_params, params, ret_type, where_clauses, body, vis, is_pure: false }))
+        let attrs = self.take_attrs();
+        let is_evolve = attrs.iter().any(|a| matches!(a.kind, crate::token::AttrKind::Evolve));
+        let is_pure = attrs.iter().any(|a| matches!(a.kind, crate::token::AttrKind::Pure));
+        let decl = FnDecl { name, type_params, params, ret_type, where_clauses, precondition, postcondition, body, vis, is_pure, attrs };
+        if is_evolve {
+            Ok(Stmt::EvolveFn(decl))
+        } else {
+            Ok(Stmt::FnDecl(decl))
+        }
     }
 
     /// Parse type parameters: `<T>`, `<T: Display>`, `<T, U>`, `<T: Display, U: Clone>`
@@ -1111,6 +1297,35 @@ impl Parser {
             }
         }
         Ok(clauses)
+    }
+
+    /// Determine if `where` is a type-bound clause (where T: Bound) or a precondition expression (where x > 0).
+    /// Returns (where_clauses, precondition).
+    fn parse_where_or_precondition(&mut self) -> Result<(Vec<WhereClause>, Option<Expr>), HexaError> {
+        if !matches!(self.peek(), Token::Where) {
+            return Ok((vec![], None));
+        }
+        // Lookahead: if pattern is Ident Colon Ident, it's a type-bound where clause
+        if matches!(self.peek_ahead(1), Token::Ident(_)) && matches!(self.peek_ahead(2), Token::Colon) {
+            let clauses = self.parse_where_clauses()?;
+            Ok((clauses, None))
+        } else {
+            // It's a precondition expression: where <expr>
+            self.advance(); // consume 'where'
+            let expr = self.parse_expr()?;
+            Ok((vec![], Some(expr)))
+        }
+    }
+
+    /// Parse optional `ensures <expr>` clause (postcondition).
+    fn parse_ensures_clause(&mut self) -> Result<Option<Expr>, HexaError> {
+        if matches!(self.peek(), Token::Ident(s) if &**s == "ensures") {
+            self.advance(); // consume 'ensures'
+            let expr = self.parse_expr()?;
+            Ok(Some(expr))
+        } else {
+            Ok(None)
+        }
     }
 
     fn parse_params(&mut self) -> Result<Vec<Param>, HexaError> {
@@ -1161,7 +1376,8 @@ impl Parser {
             self.skip_newlines();
         }
         self.expect(&Token::RBrace)?;
-        Ok(Stmt::StructDecl(StructDecl { name, type_params, fields, vis }))
+        let attrs = self.take_attrs();
+        Ok(Stmt::StructDecl(StructDecl { name, type_params, fields, vis, attrs }))
     }
 
     fn parse_enum_decl(&mut self, vis: Visibility) -> Result<Stmt, HexaError> {
@@ -1215,7 +1431,7 @@ impl Parser {
             self.expect(&Token::RParen)?;
             let m_ret = if matches!(self.peek(), Token::Arrow) {
                 self.advance();
-                Some(self.expect_ident()?)
+                Some(self.parse_ret_type()?)
             } else {
                 None
             };
@@ -1225,7 +1441,7 @@ impl Parser {
             } else {
                 vec![]
             };
-            methods.push(FnDecl { name: m_name, type_params: vec![], params: m_params, ret_type: m_ret, where_clauses: vec![], body: m_body, vis: m_vis, is_pure: false });
+            methods.push(FnDecl { name: m_name, type_params: vec![], params: m_params, ret_type: m_ret, where_clauses: vec![], precondition: None, postcondition: None, body: m_body, vis: m_vis, is_pure: false, attrs: vec![] });
             self.skip_newlines();
         }
         self.expect(&Token::RBrace)?;
@@ -1258,12 +1474,12 @@ impl Parser {
             self.expect(&Token::RParen)?;
             let m_ret = if matches!(self.peek(), Token::Arrow) {
                 self.advance();
-                Some(self.expect_ident()?)
+                Some(self.parse_ret_type()?)
             } else {
                 None
             };
             let m_body = self.parse_block()?;
-            methods.push(FnDecl { name: m_name, type_params: vec![], params: m_params, ret_type: m_ret, where_clauses: vec![], body: m_body, vis: m_vis, is_pure: false });
+            methods.push(FnDecl { name: m_name, type_params: vec![], params: m_params, ret_type: m_ret, where_clauses: vec![], precondition: None, postcondition: None, body: m_body, vis: m_vis, is_pure: false, attrs: vec![] });
             self.skip_newlines();
         }
         self.expect(&Token::RBrace)?;
@@ -1287,7 +1503,7 @@ impl Parser {
 
     fn parse_while_stmt(&mut self) -> Result<Stmt, HexaError> {
         self.advance(); // consume 'while'
-        let cond = self.parse_expr()?;
+        self.no_struct_init = true; let cond = self.parse_expr()?; self.no_struct_init = false;
         let body = self.parse_block()?;
         Ok(Stmt::While(cond, body))
     }
@@ -1300,7 +1516,7 @@ impl Parser {
 
     fn parse_if_expr(&mut self) -> Result<Expr, HexaError> {
         self.advance(); // consume 'if'
-        let cond = self.parse_expr()?;
+        self.no_struct_init = true; let cond = self.parse_expr()?; self.no_struct_init = false;
         let then_block = self.parse_block()?;
         // Save position to allow backtracking if newlines precede else
         let saved_pos = self.pos;
@@ -1354,17 +1570,55 @@ impl Parser {
         Ok(Expr::Match(Box::new(scrutinee), arms))
     }
 
-    /// Parse a match pattern. Handles `_`, `EnumName::Variant(binding)`, and regular expressions.
+    /// Parse a match pattern. Handles `_`, `[a, b, ...rest]`, `EnumName::Variant(binding)`, and regular expressions.
     fn parse_match_pattern(&mut self) -> Result<Expr, HexaError> {
+        // Check for array pattern `[a, b, ...rest]`
+        if matches!(self.peek(), Token::LBracket) {
+            self.advance(); // consume [
+            self.skip_newlines();
+            let mut patterns = Vec::new();
+            let mut rest_name: Option<String> = None;
+            while !matches!(self.peek(), Token::RBracket | Token::Eof) {
+                // Check for ...rest spread pattern
+                if matches!(self.peek(), Token::DotDot) {
+                    self.advance(); // consume ..
+                    // Check for optional trailing dot (... = DotDot + Dot)
+                    if matches!(self.peek(), Token::Dot) {
+                        self.advance(); // consume the third dot
+                    }
+                    if let Token::Ident(ref name) = self.peek().clone() {
+                        rest_name = Some(name.to_string());
+                        self.advance();
+                    }
+                    // Skip trailing comma if present
+                    if matches!(self.peek(), Token::Comma) {
+                        self.advance();
+                    }
+                    self.skip_newlines();
+                    break;
+                }
+                let pat = self.parse_match_pattern()?;
+                patterns.push(pat);
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                    self.skip_newlines();
+                } else {
+                    break;
+                }
+            }
+            self.skip_newlines();
+            self.expect(&Token::RBracket)?;
+            return Ok(Expr::ArrayPattern(patterns, rest_name));
+        }
         // Check for wildcard `_`
         if let Token::Ident(ref name) = self.peek().clone() {
-            if name == "_" {
+            if &**name == "_" {
                 self.advance();
                 return Ok(Expr::Wildcard);
             }
             // Check for EnumPath: `Ident :: Ident` or `Ident :: Ident ( expr )`
             if matches!(self.peek_ahead(1), Token::ColonColon) {
-                let enum_name = name.clone();
+                let enum_name = name.to_string();
                 self.advance(); // consume enum name
                 self.advance(); // consume ::
                 let variant = self.expect_ident()?;
@@ -1454,13 +1708,15 @@ impl Parser {
         Ok(left)
     }
 
-    // Level 5.4: + -
+    // Level 5.4: + - | ^ &  (bitwise mixed into additive for simplicity)
     fn parse_addition(&mut self) -> Result<Expr, HexaError> {
         let mut left = self.parse_multiplication()?;
         loop {
             let op = match self.peek() {
                 Token::Plus => BinOp::Add,
                 Token::Minus => BinOp::Sub,
+                Token::BitXor => BinOp::BitXor,
+                Token::BitAnd => BinOp::BitAnd,
                 _ => break,
             };
             self.advance();
@@ -1593,9 +1849,10 @@ impl Parser {
             Token::IntLit(n) => { self.advance(); Ok(Expr::IntLit(n)) }
             Token::FloatLit(n) => { self.advance(); Ok(Expr::FloatLit(n)) }
             Token::BoolLit(b) => { self.advance(); Ok(Expr::BoolLit(b)) }
-            Token::StringLit(s) => { self.advance(); Ok(Expr::StringLit(s)) }
+            Token::StringLit(s) => { self.advance(); Ok(Expr::StringLit(s.to_string())) }
             Token::CharLit(c) => { self.advance(); Ok(Expr::CharLit(c)) }
-            Token::Ident(name) => {
+            Token::Ident(ref rc_name) => {
+                let name = rc_name.to_string();
                 self.advance();
                 // Check for macro invocation: name!(...) or name![...]
                 if matches!(self.peek(), Token::Not) {
@@ -1619,7 +1876,7 @@ impl Parser {
                 }
                 // Check for struct instantiation: Name { field: val, ... }
                 // Only if name starts with uppercase (convention)
-                else if matches!(self.peek(), Token::LBrace) && name.chars().next().map_or(false, |c| c.is_uppercase()) {
+                else if !self.no_struct_init && matches!(self.peek(), Token::LBrace) && name.chars().next().map_or(false, |c| c.is_uppercase()) {
                     self.advance(); // consume {
                     self.skip_newlines();
                     let mut fields = Vec::new();
@@ -1661,11 +1918,14 @@ impl Parser {
             }
             Token::LBracket => {
                 self.advance();
+                self.skip_newlines();
                 let mut items = Vec::new();
                 while !matches!(self.peek(), Token::RBracket | Token::Eof) {
                     items.push(self.parse_expr()?);
+                    self.skip_newlines();
                     if matches!(self.peek(), Token::Comma) {
                         self.advance();
+                        self.skip_newlines();
                     }
                 }
                 self.expect(&Token::RBracket)?;
@@ -1749,171 +2009,23 @@ impl Parser {
                 self.expect(&Token::RParen)?;
                 Ok(Expr::Resume(Box::new(val)))
             }
-            // Template block expression: template { ... }
-            Token::Template => self.parse_template_expr(),
+            // try { ... } catch e { ... } as expression — returns last value of block
+            Token::Try => self.parse_try_expr(),
             other => Err(self.error(format!("unexpected token in expression: {:?}", other))),
         }
     }
 
-    // ── Template parsing ─────────────────────────────────────
-
-    /// Parse `template { children... }` — top-level template expression.
-    fn parse_template_expr(&mut self) -> Result<Expr, HexaError> {
-        self.advance(); // consume 'template'
+    fn parse_try_expr(&mut self) -> Result<Expr, HexaError> {
+        self.advance(); // consume 'try'
+        let try_block = self.parse_block()?;
         self.skip_newlines();
-        self.expect(&Token::LBrace)?;
-        self.skip_newlines();
-        let children = self.parse_template_children()?;
-        self.expect(&Token::RBrace)?;
-        Ok(Expr::Template(children))
-    }
-
-    /// Parse zero or more template nodes until `}` or EOF.
-    fn parse_template_children(&mut self) -> Result<Vec<TemplateNode>, HexaError> {
-        let mut nodes = Vec::new();
-        loop {
-            self.skip_newlines();
-            if matches!(self.peek(), Token::RBrace | Token::Eof) {
-                break;
-            }
-            nodes.push(self.parse_template_node()?);
-            // optional comma/semicolon separator
-            if matches!(self.peek(), Token::Comma | Token::Semicolon) {
-                self.advance();
-            }
+        match self.peek() {
+            Token::Catch | Token::Recover => { self.advance(); }
+            _ => return Err(self.error(format!("expected 'catch' or 'recover' after try block, got {:?}", self.peek()))),
         }
-        Ok(nodes)
-    }
-
-    /// Parse a single template node.
-    fn parse_template_node(&mut self) -> Result<TemplateNode, HexaError> {
-        match self.peek().clone() {
-            // String literal → text node
-            Token::StringLit(s) => {
-                self.advance();
-                Ok(TemplateNode::Text(Expr::StringLit(s)))
-            }
-            // `for name in expr { children }`
-            Token::For => {
-                self.advance(); // consume 'for'
-                let var = self.expect_ident()?;
-                // 'in' is an ident, not a keyword token
-                match self.advance() {
-                    Token::Ident(ref s) if s == "in" => {}
-                    other => return Err(self.error(format!("expected 'in' in template for, got {:?}", other))),
-                }
-                let iter_expr = self.parse_expr()?;
-                self.skip_newlines();
-                self.expect(&Token::LBrace)?;
-                self.skip_newlines();
-                let children = self.parse_template_children()?;
-                self.expect(&Token::RBrace)?;
-                Ok(TemplateNode::For(var, iter_expr, children))
-            }
-            // `if expr { children } else { children }`
-            Token::If => {
-                self.advance(); // consume 'if'
-                let cond = self.parse_expr()?;
-                self.skip_newlines();
-                self.expect(&Token::LBrace)?;
-                self.skip_newlines();
-                let then_children = self.parse_template_children()?;
-                self.expect(&Token::RBrace)?;
-                self.skip_newlines();
-                let else_children = if matches!(self.peek(), Token::Else) {
-                    self.advance(); // consume 'else'
-                    self.skip_newlines();
-                    self.expect(&Token::LBrace)?;
-                    self.skip_newlines();
-                    let els = self.parse_template_children()?;
-                    self.expect(&Token::RBrace)?;
-                    Some(els)
-                } else {
-                    None
-                };
-                Ok(TemplateNode::If(cond, then_children, else_children))
-            }
-            // `verify { expr }`
-            Token::Verify => {
-                self.advance(); // consume 'verify'
-                self.skip_newlines();
-                self.expect(&Token::LBrace)?;
-                self.skip_newlines();
-                let expr = self.parse_expr()?;
-                self.skip_newlines();
-                self.expect(&Token::RBrace)?;
-                Ok(TemplateNode::Verify(expr))
-            }
-            // `invariant { expr }`
-            Token::Invariant => {
-                self.advance(); // consume 'invariant'
-                self.skip_newlines();
-                self.expect(&Token::LBrace)?;
-                self.skip_newlines();
-                let expr = self.parse_expr()?;
-                self.skip_newlines();
-                self.expect(&Token::RBrace)?;
-                Ok(TemplateNode::Invariant(expr))
-            }
-            // `ident { ... }` — element OR `ident : expr` — attribute (but attrs are parsed inside element bodies)
-            Token::Ident(_) => {
-                // Peek ahead: if next-next is LBrace → element; if next-next is Colon → treat as expr text
-                // We parse as an element only when ident is immediately followed by `{`
-                if matches!(self.peek_ahead(1), Token::LBrace) {
-                    self.parse_template_element()
-                } else if matches!(self.peek_ahead(1), Token::Colon) {
-                    // standalone `key: expr` at top level — treat as text expression (shouldn't normally occur)
-                    let expr = self.parse_expr()?;
-                    Ok(TemplateNode::Text(expr))
-                } else {
-                    // expression node (variable, call, etc.)
-                    let expr = self.parse_expr()?;
-                    Ok(TemplateNode::Text(expr))
-                }
-            }
-            // Any other expression → text node
-            _ => {
-                let expr = self.parse_expr()?;
-                Ok(TemplateNode::Text(expr))
-            }
-        }
-    }
-
-    /// Parse an HTML element: `tag_name { attrs_and_children... }`
-    fn parse_template_element(&mut self) -> Result<TemplateNode, HexaError> {
-        let tag = self.expect_ident()?;
-        self.skip_newlines();
-        self.expect(&Token::LBrace)?;
-        self.skip_newlines();
-
-        let mut attrs = Vec::new();
-        let mut children = Vec::new();
-
-        loop {
-            self.skip_newlines();
-            if matches!(self.peek(), Token::RBrace | Token::Eof) {
-                break;
-            }
-
-            // Distinguish `key: expr` (attribute) from child nodes
-            // `ident :` (with Colon next) → attribute
-            if matches!(self.peek(), Token::Ident(_)) && matches!(self.peek_ahead(1), Token::Colon) {
-                let key = self.expect_ident()?;
-                self.expect(&Token::Colon)?;
-                let value = self.parse_expr()?;
-                attrs.push(TemplateAttr { key, value });
-            } else {
-                // child node
-                children.push(self.parse_template_node()?);
-            }
-
-            if matches!(self.peek(), Token::Comma | Token::Semicolon) {
-                self.advance();
-            }
-        }
-
-        self.expect(&Token::RBrace)?;
-        Ok(TemplateNode::Element { tag, attrs, children })
+        let err_name = self.expect_ident()?;
+        let catch_block = self.parse_block()?;
+        Ok(Expr::TryCatch(try_block, err_name, catch_block))
     }
 
     // ── Algebraic effects parsing ────────────────────────────
@@ -1951,14 +2063,8 @@ impl Parser {
             self.expect(&Token::RParen)?;
             let ret_type = if matches!(self.peek(), Token::Arrow) {
                 self.advance();
-                // Accept both identifier and () for void return
-                if matches!(self.peek(), Token::LParen) {
-                    self.advance();
-                    self.expect(&Token::RParen)?;
-                    None // () means void
-                } else {
-                    Some(self.expect_ident()?)
-                }
+                let t = self.parse_ret_type()?;
+                if t == "()" { None } else { Some(t) }
             } else {
                 None
             };
@@ -1967,6 +2073,57 @@ impl Parser {
         }
         self.expect(&Token::RBrace)?;
         Ok(Stmt::EffectDecl(EffectDecl { name, type_params, operations }))
+    }
+
+    /// Parse `extern fn name(param: Type, ...) -> RetType`
+    /// Optionally preceded by `@link("libname")` attribute.
+    fn parse_extern_fn_decl(&mut self) -> Result<Stmt, HexaError> {
+        self.advance(); // consume 'extern'
+        self.expect(&Token::Fn)?;
+        let name = self.expect_ident()?;
+        self.expect(&Token::LParen)?;
+
+        // Parse extern params with types
+        let mut params = Vec::new();
+        while !matches!(self.peek(), Token::RParen | Token::Eof) {
+            let param_name = self.expect_ident()?;
+            self.expect(&Token::Colon)?;
+            let typ = self.parse_extern_type()?;
+            params.push(crate::ast::ExternParam { name: param_name, typ });
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+            }
+        }
+        self.expect(&Token::RParen)?;
+
+        // Optional return type
+        let ret_type = if matches!(self.peek(), Token::Arrow) {
+            self.advance();
+            Some(self.parse_extern_type()?)
+        } else {
+            None
+        };
+
+        // Check if there's a pending @link attribute
+        let link_lib = self.pending_link_attr.take();
+
+        Ok(Stmt::Extern(crate::ast::ExternFnDecl {
+            name,
+            params,
+            ret_type,
+            link_lib,
+        }))
+    }
+
+    /// Parse a type for extern declarations (supports pointer types like *Void, *Byte, *Int)
+    fn parse_extern_type(&mut self) -> Result<String, HexaError> {
+        if matches!(self.peek(), Token::Star) {
+            self.advance(); // consume '*'
+            let inner = self.expect_ident()?;
+            Ok(format!("*{}", inner))
+        } else {
+            self.expect_ident()
+        }
     }
 
     /// Parse `pure fn name(...) { ... }`
@@ -1984,7 +2141,7 @@ impl Parser {
         self.expect(&Token::RParen)?;
         let ret_type = if matches!(self.peek(), Token::Arrow) {
             self.advance();
-            Some(self.expect_ident()?)
+            Some(self.parse_ret_type()?)
         } else {
             None
         };
@@ -1994,7 +2151,7 @@ impl Parser {
             vec![]
         };
         let body = self.parse_block()?;
-        Ok(Stmt::FnDecl(FnDecl { name, type_params, params, ret_type, where_clauses, body, vis, is_pure: true }))
+        Ok(Stmt::FnDecl(FnDecl { name, type_params, params, ret_type, where_clauses, precondition: None, postcondition: None, body, vis, is_pure: true, attrs: vec![] }))
     }
 
     /// Parse `handle { body } with { Effect.op(params) => { handler }, ... }`
@@ -2210,6 +2367,32 @@ mod tests {
             assert_eq!(decl.ret_type.as_deref(), Some("int"));
         } else {
             panic!("expected EvolveFn");
+        }
+    }
+
+    #[test]
+    fn test_parse_memoize_attr() {
+        let src = "@memoize fn fib(n) {\n  n\n}";
+        let stmts = parse_source(src);
+        if let Stmt::FnDecl(decl) = &stmts[0] {
+            assert_eq!(decl.name, "fib");
+            assert!(!decl.attrs.is_empty(), "attrs should not be empty");
+            assert!(matches!(decl.attrs[0].kind, crate::token::AttrKind::Memoize));
+        } else {
+            panic!("expected FnDecl, got {:?}", &stmts[0]);
+        }
+    }
+
+    #[test]
+    fn test_parse_multiple_attrs() {
+        let src = "@pure @inline fn add(a, b) {\n  a + b\n}";
+        let stmts = parse_source(src);
+        if let Stmt::FnDecl(decl) = &stmts[0] {
+            assert_eq!(decl.attrs.len(), 2);
+            assert!(matches!(decl.attrs[0].kind, crate::token::AttrKind::Pure));
+            assert!(matches!(decl.attrs[1].kind, crate::token::AttrKind::Inline));
+        } else {
+            panic!("expected FnDecl");
         }
     }
 

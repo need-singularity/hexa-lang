@@ -170,7 +170,7 @@ fn builtin_consciousness_vector(interp: &mut Interpreter, args: Vec<Value>) -> R
     map.insert("consciousness".into(), Value::Float(phi / n.max(1.0)));
     map.insert("tension".into(), Value::Float(tension));
     map.insert("information".into(), Value::Float(info));
-    Ok(Value::Map(map))
+    Ok(Value::Map(Box::new(map)))
 }
 
 // ── Tests ──

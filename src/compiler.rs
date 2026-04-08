@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use crate::ast::*;
 use crate::env::Value;
 use crate::error::{HexaError, ErrorClass};
@@ -16,8 +17,8 @@ pub enum OpCode {
     // Variables
     GetLocal(usize),    // push local variable
     SetLocal(usize),    // pop into local variable
-    GetGlobal(String),  // push global variable
-    SetGlobal(String),  // pop into global variable
+    GetGlobal(u32),     // push global variable (string_pool index)
+    SetGlobal(u32),     // pop into global variable (string_pool index)
 
     // Arithmetic
     Add, Sub, Mul, Div, Mod, Pow,
@@ -36,13 +37,13 @@ pub enum OpCode {
     Jump(usize),        // unconditional jump
     JumpIfFalse(usize), // conditional jump
     JumpIfTrue(usize),  // short-circuit jump
-    CallFn(String, usize),  // call named function with N args
+    CallFn(u32, u16),       // call named function (string_pool idx, N args)
     Return,             // return from function
 
     // Built-ins
     Print(usize),       // print N values (no newline)
     Println(usize),     // print N values + newline
-    CallBuiltin(String, usize), // call builtin with N args
+    CallBuiltin(u32, u16),  // call builtin (string_pool idx, N args)
 
     // Data structures
     MakeArray(usize),   // create array from N stack values
@@ -57,7 +58,21 @@ pub enum OpCode {
 
     // Bool conversion for logical ops
     Truthy,             // convert TOS to bool
+
+    // Method call: obj.method(args)
+    CallMethod(u32, u16), // (method name string_pool idx, N args) — obj is below args on stack
+
 }
+
+/// Compile-time assertion: OpCode must be <= 16 bytes for L1d cache density.
+/// Shrinking GetGlobal/SetGlobal/CallFn/CallBuiltin from String-bearing variants
+/// to u32 indices drops OpCode from 32B → 16B (2x stream density).
+const _: () = {
+    assert!(
+        std::mem::size_of::<OpCode>() <= 16,
+        "OpCode must be <= 16 bytes (L1d density target)"
+    );
+};
 
 /// A compiled function: its bytecode + metadata.
 #[derive(Debug, Clone)]
@@ -65,9 +80,30 @@ pub struct CompiledFunction {
     pub name: String,
     pub arity: usize,
     pub param_names: Vec<String>,
-    pub code: Vec<OpCode>,
+    pub code: Arc<Vec<OpCode>>,
     /// Number of local slots needed (params + locals).
     pub local_count: usize,
+    /// AI-native: @memoize attribute — cache results for same args.
+    pub is_memoize: bool,
+}
+
+/// Fast hash key for constant deduplication — O(1) instead of O(n) scan.
+fn const_hash_key(val: &Value) -> u64 {
+    use std::hash::Hasher;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    match val {
+        Value::Int(n) => { std::hash::Hash::hash(&0u8, &mut h); std::hash::Hash::hash(n, &mut h); }
+        Value::Float(f) => { std::hash::Hash::hash(&1u8, &mut h); std::hash::Hash::hash(&f.to_bits(), &mut h); }
+        Value::Bool(b) => { std::hash::Hash::hash(&2u8, &mut h); std::hash::Hash::hash(b, &mut h); }
+        Value::Str(s) => { std::hash::Hash::hash(&3u8, &mut h); std::hash::Hash::hash(s.as_str(), &mut h); }
+        Value::Void => { std::hash::Hash::hash(&4u8, &mut h); }
+        Value::Char(c) => { std::hash::Hash::hash(&5u8, &mut h); std::hash::Hash::hash(c, &mut h); }
+        Value::Byte(b) => { std::hash::Hash::hash(&6u8, &mut h); std::hash::Hash::hash(b, &mut h); }
+        Value::Array(arr) => { std::hash::Hash::hash(&7u8, &mut h); for item in arr { std::hash::Hash::hash(&const_hash_key(item), &mut h); } }
+        Value::Tuple(t) => { std::hash::Hash::hash(&8u8, &mut h); for item in t { std::hash::Hash::hash(&const_hash_key(item), &mut h); } }
+        _ => { std::hash::Hash::hash(&99u8, &mut h); }
+    }
+    h.finish()
 }
 
 /// A compiled chunk: top-level bytecode + constant pool + functions.
@@ -75,9 +111,17 @@ pub struct CompiledFunction {
 pub struct Chunk {
     pub code: Vec<OpCode>,
     pub constants: Vec<Value>,
+    /// O(1) constant deduplication map (hash → index).
+    #[allow(dead_code)]
+    pub const_dedup: std::collections::HashMap<u64, usize>,
     pub functions: HashMap<String, CompiledFunction>,
     /// Number of local slots needed at top level.
     pub local_count: usize,
+    /// Interned strings (global/function/builtin names) referenced by OpCode u32 indices.
+    pub string_pool: Vec<String>,
+    /// Reverse map for O(1) intern lookup (name → string_pool index).
+    #[allow(dead_code)]
+    intern_map: HashMap<String, u32>,
 }
 
 impl Chunk {
@@ -85,19 +129,42 @@ impl Chunk {
         Self {
             code: Vec::new(),
             constants: Vec::new(),
+            const_dedup: std::collections::HashMap::new(),
             functions: HashMap::new(),
             local_count: 0,
+            string_pool: Vec::new(),
+            intern_map: HashMap::new(),
         }
     }
 
-    pub fn add_constant(&mut self, val: Value) -> usize {
-        for (i, existing) in self.constants.iter().enumerate() {
-            if values_match(existing, &val) {
-                return i;
-            }
+    /// Intern a name into the string pool, returning its u32 index.
+    /// O(1) via HashMap reverse lookup (was O(n) linear scan).
+    pub fn intern(&mut self, name: &str) -> u32 {
+        if let Some(&idx) = self.intern_map.get(name) {
+            return idx;
         }
+        let idx = self.string_pool.len() as u32;
+        let s = name.to_string();
+        self.intern_map.insert(s.clone(), idx);
+        self.string_pool.push(s);
+        idx
+    }
+
+    /// Resolve a u32 index back to a name (for dispatch/debug).
+    #[inline]
+    pub fn name_at(&self, idx: u32) -> &str {
+        &self.string_pool[idx as usize]
+    }
+
+    pub fn add_constant(&mut self, val: Value) -> usize {
+        let key = const_hash_key(&val);
+        if let Some(idx) = self.const_dedup.get(&key) {
+            return *idx;
+        }
+        let idx = self.constants.len();
         self.constants.push(val);
-        self.constants.len() - 1
+        self.const_dedup.insert(key, idx);
+        idx
     }
 
     pub fn emit(&mut self, op: OpCode) -> usize {
@@ -214,25 +281,38 @@ impl Compiler {
         // Use a temporary chunk for this function's code
         // We need to compile into a temp chunk, then extract code
         let mut temp = Chunk::new();
-        // Share constants with parent
+        // Share constants + string_pool with parent
         temp.constants = parent_chunk.constants.clone();
+        temp.string_pool = parent_chunk.string_pool.clone();
 
-        for stmt in &decl.body {
-            if matches!(stmt, Stmt::FnDecl(_)) {
-                continue;
+        // Compile body -- last expression is implicit return value
+        let body_stmts: Vec<&Stmt> = decl.body.iter()
+            .filter(|s| !matches!(s, Stmt::FnDecl(_)))
+            .collect();
+        for (i, stmt) in body_stmts.iter().enumerate() {
+            let is_last = i == body_stmts.len() - 1;
+            if is_last {
+                if let Stmt::Expr(e) = stmt {
+                    self.compile_expr(&mut temp, e)?;
+                    temp.emit(OpCode::Return);
+                } else {
+                    self.compile_stmt(&mut temp, stmt)?;
+                }
+            } else {
+                self.compile_stmt(&mut temp, stmt)?;
             }
-            self.compile_stmt(&mut temp, stmt)?;
         }
 
-        // Ensure return at the end
+        // Ensure return at the end (for functions ending in non-expr stmts)
         if !matches!(temp.code.last(), Some(OpCode::Return)) {
             temp.emit(OpCode::Void);
             temp.emit(OpCode::Return);
         }
 
         let func_code = temp.code;
-        // Merge constants back to parent
+        // Merge constants + string_pool back to parent
         parent_chunk.constants = temp.constants;
+        parent_chunk.string_pool = temp.string_pool;
 
         let local_count = self.next_slot;
         self.pop_scope();
@@ -241,12 +321,14 @@ impl Compiler {
         self.scopes = old_scopes;
         self.next_slot = old_slot;
 
+        let is_memoize = decl.attrs.iter().any(|a| matches!(a.kind, crate::token::AttrKind::Memoize));
         Ok(CompiledFunction {
             name: decl.name.clone(),
             arity: decl.params.len(),
             param_names: decl.params.iter().map(|p| p.name.clone()).collect(),
-            code: func_code,
+            code: Arc::new(func_code),
             local_count,
+            is_memoize,
         })
     }
 
@@ -295,6 +377,20 @@ impl Compiler {
                 chunk.emit(OpCode::SetLocal(slot));
                 Ok(())
             }
+            Stmt::LetTuple(names, expr) => {
+                // Evaluate the RHS tuple/array, then extract each element
+                self.compile_expr(chunk, expr)?;
+                let tuple_slot = self.define_local("__td__");
+                chunk.emit(OpCode::SetLocal(tuple_slot));
+                for (i, name) in names.iter().enumerate() {
+                    chunk.emit(OpCode::GetLocal(tuple_slot));
+                    let idx_c = chunk.add_constant(Value::Int(i as i64)); chunk.emit(OpCode::Const(idx_c));
+                    chunk.emit(OpCode::Index);
+                    let slot = self.define_local(name);
+                    chunk.emit(OpCode::SetLocal(slot));
+                }
+                Ok(())
+            }
             Stmt::Assign(lhs, rhs) => {
                 match lhs {
                     Expr::Ident(name) => {
@@ -302,7 +398,8 @@ impl Compiler {
                         if let Some(slot) = self.resolve_local(name) {
                             chunk.emit(OpCode::SetLocal(slot));
                         } else {
-                            chunk.emit(OpCode::SetGlobal(name.clone()));
+                            let idx = chunk.intern(name);
+                            chunk.emit(OpCode::SetGlobal(idx));
                         }
                     }
                     Expr::Index(arr_expr, idx_expr) => {
@@ -310,7 +407,8 @@ impl Compiler {
                             if let Some(slot) = self.resolve_local(name) {
                                 chunk.emit(OpCode::GetLocal(slot));
                             } else {
-                                chunk.emit(OpCode::GetGlobal(name.clone()));
+                                let idx = chunk.intern(name);
+                                chunk.emit(OpCode::GetGlobal(idx));
                             }
                             self.compile_expr(chunk, idx_expr)?;
                             self.compile_expr(chunk, rhs)?;
@@ -318,7 +416,8 @@ impl Compiler {
                             if let Some(slot) = self.resolve_local(name) {
                                 chunk.emit(OpCode::SetLocal(slot));
                             } else {
-                                chunk.emit(OpCode::SetGlobal(name.clone()));
+                                let idx = chunk.intern(name);
+                                chunk.emit(OpCode::SetGlobal(idx));
                             }
                         } else {
                             return Err(compile_err("complex index assignment not supported in VM".into()));
@@ -364,7 +463,8 @@ impl Compiler {
                 // idx < len(arr)
                 chunk.emit(OpCode::GetLocal(idx_slot));
                 chunk.emit(OpCode::GetLocal(arr_slot));
-                chunk.emit(OpCode::CallBuiltin("len".into(), 1));
+                let len_idx = chunk.intern("len");
+                chunk.emit(OpCode::CallBuiltin(len_idx, 1));
                 chunk.emit(OpCode::Lt);
                 let exit_jump = chunk.emit(OpCode::JumpIfFalse(0));
 
@@ -421,24 +521,43 @@ impl Compiler {
             }
             Stmt::Assert(expr) => {
                 self.compile_expr(chunk, expr)?;
-                chunk.emit(OpCode::CallBuiltin("__assert__".into(), 1));
+                let assert_idx = chunk.intern("__assert__");
+                chunk.emit(OpCode::CallBuiltin(assert_idx, 1));
                 chunk.emit(OpCode::Pop);
                 Ok(())
             }
-            // Not supported in VM
+            // Const/Static — treat like Let in VM
+            Stmt::Const(name, _typ, expr, _vis) | Stmt::Static(name, _typ, expr, _vis) => {
+                self.compile_expr(chunk, expr)?;
+                let slot = self.define_local(name);
+                chunk.emit(OpCode::SetLocal(slot));
+                Ok(())
+            }
+            // Struct/Enum/Trait/Impl — skip (no runtime effect in VM)
             Stmt::StructDecl(_) | Stmt::EnumDecl(_) | Stmt::TraitDecl(_)
-            | Stmt::ImplBlock(_) | Stmt::Intent(_, _) | Stmt::Verify(_, _)
+            | Stmt::ImplBlock(_) | Stmt::TypeAlias(..) | Stmt::DeriveDecl(_, _) => Ok(()),
+            // Not supported in VM — silently skip
+            Stmt::Intent(_, _) | Stmt::Verify(_, _)
             | Stmt::Mod(_, _) | Stmt::Use(_) | Stmt::TryCatch(_, _, _)
             | Stmt::Throw(_) | Stmt::Proof(_, _) | Stmt::Spawn(_)
             | Stmt::DropStmt(_) | Stmt::SpawnNamed(_, _)
             | Stmt::AsyncFnDecl(_) | Stmt::Select(_, _)
-            | Stmt::Const(_, _, _, _) | Stmt::Static(_, _, _, _)
-            | Stmt::MacroDef(_) | Stmt::DeriveDecl(_, _)
+            | Stmt::MacroDef(_)
             | Stmt::ConsciousnessBlock(_, _) | Stmt::EvolveFn(_)
             | Stmt::Generate(_) | Stmt::Optimize(_)
             | Stmt::ComptimeFn(_) | Stmt::EffectDecl(_)
             | Stmt::Scope(_) | Stmt::ProofBlock(..)
-            | Stmt::TypeAlias(..) | Stmt::AtomicLet(..) | Stmt::Panic(..) | Stmt::Theorem(..) => Ok(()),
+            | Stmt::AtomicLet(..) | Stmt::Panic(..) | Stmt::Theorem(..)
+            | Stmt::Break | Stmt::Continue => Ok(()),
+            Stmt::Extern(_) => {
+                // VM does not support extern FFI; signal compile failure so tiered
+                // execution falls through to the interpreter which handles FFI.
+                Err(crate::error::HexaError {
+                    class: crate::error::ErrorClass::Runtime,
+                    message: "extern FFI not supported in VM".into(),
+                    line: 0, col: 0, hint: None,
+                })
+            }
         }
     }
 
@@ -553,7 +672,8 @@ impl Compiler {
                 if let Some(slot) = self.resolve_local(name) {
                     chunk.emit(OpCode::GetLocal(slot));
                 } else {
-                    chunk.emit(OpCode::GetGlobal(name.clone()));
+                    let idx = chunk.intern(name);
+                    chunk.emit(OpCode::GetGlobal(idx));
                 }
                 Ok(())
             }
@@ -637,22 +757,30 @@ impl Compiler {
                         } else if name == "println" {
                             chunk.emit(OpCode::Println(args.len()));
                         } else {
-                            chunk.emit(OpCode::CallBuiltin(name.clone(), args.len()));
+                            let idx = chunk.intern(name);
+                            chunk.emit(OpCode::CallBuiltin(idx, args.len() as u16));
                         }
                     }
                     Expr::Ident(name) => {
                         for arg in args {
                             self.compile_expr(chunk, arg)?;
                         }
-                        chunk.emit(OpCode::CallFn(name.clone(), args.len()));
+                        let idx = chunk.intern(name);
+                        chunk.emit(OpCode::CallFn(idx, args.len() as u16));
                     }
-                    _ => {
-                        // Unsupported call target in VM
+                    Expr::Field(obj_expr, method_name) => {
+                        // Method call: obj.method(args)
+                        // Push obj first, then args, then CallMethod
+                        self.compile_expr(chunk, obj_expr)?;
                         for arg in args {
                             self.compile_expr(chunk, arg)?;
-                            chunk.emit(OpCode::Pop);
                         }
-                        chunk.emit(OpCode::Void);
+                        let idx = chunk.intern(method_name);
+                        chunk.emit(OpCode::CallMethod(idx, args.len() as u16));
+                    }
+                    _ => {
+                        // Unsupported call target (e.g. lambda calls) — bail to interpreter
+                        return Err(compile_err("unsupported call target in VM".into()));
                     }
                 }
                 Ok(())
@@ -714,15 +842,15 @@ impl Compiler {
                 chunk.emit(OpCode::MakeArray(items.len()));
                 Ok(())
             }
-            // Not supported in VM
+            // Not supported in VM — bail to interpreter
             Expr::Lambda(_, _) | Expr::Field(_, _) | Expr::Match(_, _)
             | Expr::StructInit(_, _) | Expr::MapLit(_) | Expr::EnumPath(_, _, _)
-            | Expr::Wildcard | Expr::Own(_) | Expr::MoveExpr(_) | Expr::Borrow(_)
+            | Expr::Wildcard | Expr::ArrayPattern(_, _) | Expr::Own(_) | Expr::MoveExpr(_) | Expr::Borrow(_)
             | Expr::Await(_) | Expr::MacroInvoc(_) | Expr::Comptime(_)
             | Expr::HandleWith(_, _) | Expr::EffectCall(_, _, _) | Expr::Resume(_)
-            | Expr::DynCast(_, _) | Expr::Yield(_) => {
-                chunk.emit(OpCode::Void);
-                Ok(())
+            | Expr::DynCast(_, _) | Expr::Yield(_) | Expr::Template(_)
+            | Expr::TryCatch(_, _, _) => {
+                return Err(compile_err("unsupported expression in VM".into()));
             }
         }
     }
@@ -751,16 +879,16 @@ impl Compiler {
 
 fn is_builtin(name: &str) -> bool {
     matches!(name,
-        "print" | "println" | "len" | "type_of"
+        "print" | "println" | "eprintln" | "len" | "type_of"
         | "sigma" | "phi" | "tau" | "gcd"
         | "abs" | "min" | "max" | "floor" | "ceil" | "round"
-        | "sqrt" | "pow" | "log" | "log2" | "sin" | "cos" | "tan"
+        | "sqrt" | "pow" | "log" | "log2" | "log10" | "ln" | "exp" | "sin" | "cos" | "tan"
+        | "asin" | "acos" | "atan" | "atan2"
         | "to_string" | "to_int" | "to_float"
         | "format" | "clock"
     )
 }
 
-/// Dead code elimination: remove unreachable opcodes after unconditional Jump/Return.
 pub fn eliminate_dead_code(code: &mut Vec<OpCode>) {
     // Build set of jump targets (these are reachable even after Jump/Return)
     let mut jump_targets: std::collections::HashSet<usize> = std::collections::HashSet::new();
@@ -835,6 +963,13 @@ mod tests {
     }
 
     #[test]
+    fn test_opcode_size_16b() {
+        let sz = std::mem::size_of::<OpCode>();
+        println!("OpCode size = {} bytes", sz);
+        assert!(sz <= 16, "OpCode must be <= 16 bytes for L1d density, got {}", sz);
+    }
+
+    #[test]
     fn test_compile_constant() {
         let chunk = compile_source("42");
         assert!(chunk.constants.iter().any(|c| matches!(c, Value::Int(42))));
@@ -860,6 +995,19 @@ mod tests {
         let chunk = compile_source("fn add(a, b) { return a + b }");
         assert!(chunk.functions.contains_key("add"));
         assert_eq!(chunk.functions["add"].arity, 2);
+    }
+
+    #[test]
+    fn test_compile_memoize_flag() {
+        let chunk = compile_source("@memoize fn fib(n) { n }");
+        assert!(chunk.functions.contains_key("fib"), "fib should be compiled");
+        assert!(chunk.functions["fib"].is_memoize, "fib should have is_memoize=true");
+    }
+
+    #[test]
+    fn test_compile_no_memoize_by_default() {
+        let chunk = compile_source("fn add(a, b) { a + b }");
+        assert!(!chunk.functions["add"].is_memoize);
     }
 
     #[test]

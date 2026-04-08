@@ -142,7 +142,7 @@ fn builtin_test_run(interp: &mut Interpreter, args: Vec<Value>) -> Result<Value,
         _ => return Err(type_err(interp, "test_run() requires (name, fn)".into())),
     };
     let func = match args.get(1) {
-        Some(v @ (Value::Fn(..) | Value::Lambda(..) | Value::BuiltinFn(_))) => v.clone(),
+        Some(v @ (Value::Fn(_) | Value::Lambda(_) | Value::BuiltinFn(_))) => v.clone(),
         _ => return Err(type_err(interp, "test_run() second argument must be a function".into())),
     };
 
@@ -164,7 +164,7 @@ fn builtin_test_run(interp: &mut Interpreter, args: Vec<Value>) -> Result<Value,
             map.insert("error".into(), Value::Str(e.message));
         }
     }
-    Ok(Value::Map(map))
+    Ok(Value::Map(Box::new(map)))
 }
 
 // ── test_suite(tests: array) -> map ──
@@ -204,7 +204,7 @@ fn builtin_test_suite(interp: &mut Interpreter, args: Vec<Value>) -> Result<Valu
                         failed += 1;
                     }
                 }
-                results.push(Value::Map(map));
+                results.push(Value::Map(Box::new(map)));
             }
             _ => {}
         }
@@ -218,7 +218,7 @@ fn builtin_test_suite(interp: &mut Interpreter, args: Vec<Value>) -> Result<Valu
     summary.insert("failed".into(), Value::Int(failed));
     summary.insert("elapsed_ms".into(), Value::Float(total_ms));
     summary.insert("results".into(), Value::Array(results));
-    Ok(Value::Map(summary))
+    Ok(Value::Map(Box::new(summary)))
 }
 
 // ── bench_fn(name: string, fn, iterations: int) -> map ──
@@ -229,7 +229,7 @@ fn builtin_bench_fn(interp: &mut Interpreter, args: Vec<Value>) -> Result<Value,
         _ => return Err(type_err(interp, "bench_fn() requires (name, fn, iterations)".into())),
     };
     let func = match args.get(1) {
-        Some(v @ (Value::Fn(..) | Value::Lambda(..) | Value::BuiltinFn(_))) => v.clone(),
+        Some(v @ (Value::Fn(_) | Value::Lambda(_) | Value::BuiltinFn(_))) => v.clone(),
         _ => return Err(type_err(interp, "bench_fn() second argument must be a function".into())),
     };
     let iterations = match args.get(2) {
@@ -250,7 +250,7 @@ fn builtin_bench_fn(interp: &mut Interpreter, args: Vec<Value>) -> Result<Value,
     map.insert("total_us".into(), Value::Float(total_us));
     map.insert("avg_us".into(), Value::Float(avg_us));
     map.insert("ops_per_sec".into(), Value::Float(if avg_us > 0.0 { 1_000_000.0 / avg_us } else { 0.0 }));
-    Ok(Value::Map(map))
+    Ok(Value::Map(Box::new(map)))
 }
 
 // ── Tests ──

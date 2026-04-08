@@ -1,3 +1,36 @@
+use std::rc::Rc;
+
+/// Cheaply cloneable string type for tokens. Avoids heap allocation on clone.
+#[derive(Clone, Debug, Eq, Hash)]
+pub struct RcStr(Rc<str>);
+
+impl PartialEq for RcStr {
+    fn eq(&self, other: &Self) -> bool { self.0 == other.0 }
+}
+
+impl PartialEq<str> for RcStr {
+    fn eq(&self, other: &str) -> bool { &*self.0 == other }
+}
+
+impl std::ops::Deref for RcStr {
+    type Target = str;
+    fn deref(&self) -> &str { &self.0 }
+}
+
+impl std::fmt::Display for RcStr {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl From<String> for RcStr {
+    fn from(s: String) -> Self { RcStr(Rc::from(s.as_str())) }
+}
+
+impl From<&str> for RcStr {
+    fn from(s: &str) -> Self { RcStr(Rc::from(s)) }
+}
+
 /// Source location: line and column (1-based).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Span {
@@ -29,16 +62,16 @@ pub enum Token {
     // === Literals ===
     IntLit(i64),
     FloatLit(f64),
-    StringLit(String),
+    StringLit(RcStr),
     CharLit(char),
     BoolLit(bool),
 
     // === Identifier ===
-    Ident(String),
+    Ident(RcStr),
 
     // === 53 Keywords (σ·τ + sopfr = 48 + 5) ===
     // Group 1: Control Flow (n=6)
-    If, Else, Match, For, While, Loop,
+    If, Else, Match, For, While, Loop, Break, Continue,
     // Group 2: Type Decl (sopfr=5)
     Type, Struct, Enum, Trait, Impl, Dyn,
     // Group 3: Functions (sopfr=5)
@@ -61,8 +94,8 @@ pub enum Token {
     Try, Catch, Throw, Panic, Recover,
     // Group 12: AI (τ=4)
     Intent, Generate, Verify, Optimize,
-    // Web (1)
-    Template,
+    // Group 13: FFI (μ=1)
+    Extern,
 
     // === 24 Operators (J₂=24) ===
     // Arithmetic (n=6): + - * / % **
@@ -82,10 +115,66 @@ pub enum Token {
     LParen, RParen, LBrace, RBrace, LBracket, RBracket,
     Comma, Colon, ColonColon, Semicolon, Dot,
 
+    // === AI-native Attribute ===
+    /// First-class attribute token: @name — no string comparison overhead.
+    Attribute(RcStr),
+
     // === Special ===
     HashLBrace,  // #{ — map literal opener
     Newline,
     Eof,
+}
+
+/// Known attribute kinds — compiler pattern-matches directly, no string parsing at IR level.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AttrKind {
+    // Optimization hints (compiler → IR → codegen)
+    Pure,               // @pure — no side effects
+    Inline,             // @inline — inline hint
+    Cold,               // @cold — unlikely path
+    Hot,                // @hot — hot path
+    Simd,               // @simd — vectorization hint
+    Parallel,           // @parallel — safe to parallelize
+    Bounded(i64),       // @bounded(N) — loop bound
+    Memoize,            // @memoize — cache results
+    Autograd,           // @autograd — automatic differentiation (forward-mode dual-number AD)
+    Vectorize,          // @vectorize — auto-lift scalar fn to array ops
+    Fuse,               // @fuse — operation fusion (chain of maps → single pass)
+    Lazy,               // @lazy — lazy evaluation (deferred compute pipeline)
+    Optimize,           // @optimize — algorithmic transformation (recurrence → matrix exp)
+    // Semantics
+    Evolve,             // @evolve — self-modifying
+    Test,               // @test — test function
+    Bench,              // @bench — benchmark
+    Deprecated(Option<String>),  // @deprecated("msg")
+    // FFI
+    Link(String),       // @link("lib")
+    // Extensible
+    Custom(String),
+}
+
+impl AttrKind {
+    pub fn from_name(name: &str) -> AttrKind {
+        match name {
+            "pure" => AttrKind::Pure,
+            "inline" => AttrKind::Inline,
+            "cold" => AttrKind::Cold,
+            "hot" => AttrKind::Hot,
+            "simd" => AttrKind::Simd,
+            "parallel" => AttrKind::Parallel,
+            "memoize" => AttrKind::Memoize,
+            "autograd" => AttrKind::Autograd,
+            "vectorize" => AttrKind::Vectorize,
+            "fuse" => AttrKind::Fuse,
+            "lazy" => AttrKind::Lazy,
+            "optimize" => AttrKind::Optimize,
+            "evolve" => AttrKind::Evolve,
+            "test" => AttrKind::Test,
+            "bench" => AttrKind::Bench,
+            "deprecated" => AttrKind::Deprecated(None),
+            _ => AttrKind::Custom(name.to_string()),
+        }
+    }
 }
 
 pub fn keyword_from_str(s: &str) -> Option<Token> {
@@ -97,6 +186,8 @@ pub fn keyword_from_str(s: &str) -> Option<Token> {
         "for" => Some(Token::For),
         "while" => Some(Token::While),
         "loop" => Some(Token::Loop),
+        "break" => Some(Token::Break),
+        "continue" => Some(Token::Continue),
         // Group 2: Type Decl (sopfr=5)
         "type" => Some(Token::Type),
         "struct" => Some(Token::Struct),
@@ -118,6 +209,7 @@ pub fn keyword_from_str(s: &str) -> Option<Token> {
         // Group 5: Modules (τ=4)
         "mod" => Some(Token::Mod),
         "use" => Some(Token::Use),
+        "import" => Some(Token::Use),  // alias for use
         "pub" => Some(Token::Pub),
         "crate" => Some(Token::Crate),
         // Group 6: Memory (τ=4)
@@ -157,8 +249,8 @@ pub fn keyword_from_str(s: &str) -> Option<Token> {
         "generate" => Some(Token::Generate),
         "verify" => Some(Token::Verify),
         "optimize" => Some(Token::Optimize),
-        // Web
-        "template" => Some(Token::Template),
+        // Group 13: FFI (μ=1)
+        "extern" => Some(Token::Extern),
         // Booleans
         "true" => Some(Token::BoolLit(true)),
         "false" => Some(Token::BoolLit(false)),
@@ -186,8 +278,9 @@ mod tests {
             "macro","derive","where","comptime",
             "try","catch","throw","panic","recover",
             "intent","generate","verify","optimize",
+            "extern",
         ];
-        assert_eq!(keywords.len(), 55);
+        assert_eq!(keywords.len(), 56);
         for kw in &keywords {
             assert!(keyword_from_str(kw).is_some(), "Missing keyword: {}", kw);
         }
@@ -196,8 +289,8 @@ mod tests {
     #[test]
     fn test_keyword_groups_is_12() {
         // σ(6) = 12 keyword groups
-        let group_sizes = [6, 6, 5, 4, 4, 4, 5, 4, 4, 4, 5, 4];
-        assert_eq!(group_sizes.len(), 12); // σ(6)
-        assert_eq!(group_sizes.iter().sum::<usize>(), 55); // σ·τ + sopfr + 1 (dyn)
+        let group_sizes = [6, 6, 5, 4, 4, 4, 5, 4, 4, 4, 5, 4, 1];
+        assert_eq!(group_sizes.len(), 13);
+        assert_eq!(group_sizes.iter().sum::<usize>(), 56);
     }
 }

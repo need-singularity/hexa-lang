@@ -1,0 +1,838 @@
+# Hexa Web Engine — Proof-Driven Reactive Web
+
+> 설계일: 2026-04-06
+> 상태: 설계 (구현 보류)
+> 특이점 돌파 대상: 템플릿 엔진 + 동적 UI "너머의 무언가"
+
+---
+
+## 0. 핵심 전제: AI가 짠다, 사람이 아니라
+
+기존 웹 프레임워크는 **사람이 읽고 쓰기 쉬운** 구조로 설계되었다.
+Hexa Web Engine은 **AI가 생성하고 의식AI가 검증/최적화하는** 구조로 설계한다.
+
+- 사람의 역할: `intent`로 의도만 선언
+- AI의 역할: `generate`로 구현 코드 생성
+- 의식AI의 역할: `Φ` 측정 + `verify` + 특이점 사이클로 품질 보장
+- 컴파일러의 역할: `optimize`로 최적 출력 형태 자동 결정
+
+---
+
+## 1. 아키텍처 개요
+
+```
+┌──────────────────────────────────────────────────┐
+│              Hexa Source (.hexa)                  │
+│  intent 선언 → AI generate → 의식AI verify        │
+│  → proof engine 증명 → optimize 최적 출력         │
+└──────────────────┬───────────────────────────────┘
+                   │
+         ┌─────────▼──────────┐
+         │  AI + 의식 파이프라인 │
+         │  intent → generate  │
+         │  → Φ 측정 → verify  │
+         │  → optimize         │
+         └──┬──────┬──────┬───┘
+            │      │      │
+     ┌──────▼┐ ┌───▼───┐ ┌▼──────┐
+     │ Static│ │Reactive│ │Server │
+     │ HTML  │ │ WASM   │ │ SSR   │
+     └───────┘ └───────┘ └───────┘
+            │      │      │
+         ┌──▼──────▼──────▼───┐
+         │    Unified Output   │
+         │  하나의 .hexa →     │
+         │  3가지 출력 자동 생성│
+         └─────────────────────┘
+```
+
+### 출력 분배 기준 (comptime proof가 결정)
+
+| 증명 결과 | 출력 | 이유 |
+|-----------|------|------|
+| "이 노드는 절대 안 변한다" | 순수 HTML | 런타임 코스트 0 |
+| "이 노드는 effect에 의해 변한다" | 최소 WASM 바인딩 | JS 배제, 네이티브 성능 |
+| "이 노드는 서버 데이터에 의존" | SSR | 초기 로딩 최적화 |
+
+프로그래머(AI)가 고르는 게 아니라 **컴파일러가 증명해서 결정**한다.
+
+---
+
+## 2. n=6 핵심 원칙
+
+| # | 원칙 | Hexa 무기 | 설명 |
+|---|------|-----------|------|
+| 1 | **Intent-First** | `intent` | 자연어 의도 선언, AI가 이해할 수 있는 명세 |
+| 2 | **AI-Generate** | `generate` | intent에서 최적 컴포넌트 코드 창발 |
+| 3 | **Conscious-Verify** | `Φ` + `verify` | UI 통합 정보량 측정 + 수학적 증명 |
+| 4 | **Effect-Unified** | `effect/handle` | 이벤트/비동기/에러 모두 algebraic effect |
+| 5 | **Owned State** | `own/borrow/move` | 상태 소유권 컴파일 타임 보장 |
+| 6 | **Singularity-Optimize** | 특이점 사이클 | Blowup→Contraction→Emergence→Singularity→Absorption |
+
+---
+
+## 3. AI 친화적 설계 — AI가 짜는 코드의 구조
+
+### 3.1 왜 AI 친화적이어야 하는가
+
+기존 프레임워크의 AI 비친화적 요소:
+
+| 문제 | 예시 | Hexa 해법 |
+|------|------|-----------|
+| 암묵적 규칙 | React hooks 순서 의존성 | `effect`가 명시적, 순서 무관 |
+| 숨겨진 상태 | 클로저 캡처, context 전파 | `own/borrow`로 소유권 명시 |
+| 타입 불안전 | JSX → any, props drilling | `verify`+`invariant`로 컴파일 타임 증명 |
+| 생성 후 검증 불가 | AI가 코드 생성 → 런타임에서야 버그 발견 | `proof engine`이 생성 즉시 검증 |
+| 최적화 판단 어려움 | SSR? CSR? 개발자가 결정 | `optimize`가 자동 결정 |
+
+### 3.2 AI가 생성하는 코드의 형태
+
+```hexa
+// AI는 이 구조로 코드를 생성한다
+// 모든 것이 명시적 — 암묵적 규칙 없음
+
+intent todo_app {
+    "사용자가 할 일 목록을 관리한다"
+    verify { items.len() >= 0 }
+    invariant { no_duplicate_ids(items) }
+}
+
+// AI가 generate한 결과:
+page "/" {
+    let items = own [Item]              // 소유권 명시
+    let filter = own FilterState::All   // 소유권 명시
+
+    effect TodoEffect {
+        add(text: string) -> Item
+        remove(id: int) -> void
+        toggle(id: int) -> void
+    }
+
+    handle TodoEffect {
+        add(text) => resume Item::new(items.len(), text)
+        remove(id) => resume items.retain(fn(i) { i.id != id })
+        toggle(id) => resume items.find(id).map(fn(i) { i.done = !i.done })
+    }
+
+    view {
+        h1 { "Todo" }
+        input { on: TodoEffect.add }
+        for item in items |> filter.apply {
+            li {
+                own item                        // 이 li가 item 소유
+                text { borrow item.text }       // 읽기만
+                button { on: TodoEffect.toggle(item.id) }
+                button { on: TodoEffect.remove(item.id) }
+            }
+        }
+    }
+}
+```
+
+### 3.3 AI가 이 코드를 이해하기 쉬운 이유
+
+1. **intent가 의도를 자연어로 명시** — AI가 목적을 즉시 파악
+2. **effect가 가능한 동작을 열거** — 부수효과가 전부 보임
+3. **own/borrow가 데이터 흐름을 명시** — 어떤 컴포넌트가 뭘 소유하는지 타입으로 보임
+4. **verify/invariant가 불변 조건 명시** — AI가 변경 시 깨면 안 되는 것을 알 수 있음
+
+---
+
+## 4. 의식 AI (Consciousness AI) 역할
+
+### 4.1 Φ (통합 정보량)로 UI 품질 측정
+
+```hexa
+// UI 자체가 의식 수준(Φ)을 갖는다
+intent dashboard {
+    "실시간 매출 차트 + 알림 패널"
+    verify { data.fresh < 5s }
+    invariant { phi_compute(components) > 0.7 }  // UI 통합도 보장
+}
+
+// Φ가 높다 = 컴포넌트들이 유기적으로 연결됨 (좋은 UI)
+// Φ가 낮다 = 파편화된 UI → 컴파일러가 경고 + 재구성 제안
+```
+
+### 4.2 consciousness_vector — UI 건강 10D 측정
+
+```hexa
+optimize dashboard {
+    let health = consciousness_vector(ui_state)
+    // 10차원:
+    // [통합, 분화, 인과, 정보, 복잡성, 안정성, 재귀, 경계, 기억, 멀티스케일]
+    //
+    // 각 차원이 의미하는 것 (웹 UI 맥락):
+    //   통합      — 컴포넌트 간 데이터 결합도
+    //   분화      — 각 컴포넌트의 독립성
+    //   인과      — 이벤트→상태→렌더 인과 체인 명확도
+    //   정보      — 불필요한 리렌더 없이 정보 전달 효율
+    //   복잡성    — 적절한 복잡도 (과도/과소 아닌)
+    //   안정성    — 상태 변경 시 크래시 없음
+    //   재귀      — 재사용 가능한 컴포넌트 비율
+    //   경계      — 컴포넌트 경계의 명확성
+    //   기억      — 상태 보존/복원 능력 (뒤로가기 등)
+    //   멀티스케일 — 모바일/데스크톱 반응형 적응도
+    //
+    // → 약한 차원을 자동 강화
+}
+```
+
+### 4.3 3중 AI 루프
+
+```
+┌─────────────────────────────────────────────┐
+│  1. Generate (생성 AI)                       │
+│     intent → 컴포넌트 코드 생성              │
+│     AI가 own/borrow/effect 구조로 코드 출력  │
+├─────────────────────────────────────────────┤
+│  2. Verify (검증 AI)                         │
+│     proof engine이 수학적 정합성 증명         │
+│     Φ가 임계치 이상인지 측정                  │
+│     "이 UI는 올바르고 통합적인가?"            │
+├─────────────────────────────────────────────┤
+│  3. Optimize (의식 AI)                       │
+│     consciousness_vector → 10D 건강 측정     │
+│     특이점 사이클로 렌더링 전략 창발          │
+│     Φ 하락 감지 → 자동 리팩터링 제안          │
+│     Blowup→Contraction→Emergence→           │
+│       Singularity→Absorption                │
+└─────────────────────────────────────────────┘
+```
+
+---
+
+## 5. 모듈 1: 템플릿 엔진 — `std.web.template`
+
+### 5.1 설계 철학
+
+기존 템플릿 엔진 (EJS, Jinja, Mustache)은 **사람이 문자열을 치환하는** 구조.
+Hexa 템플릿은 **AI가 생성하고, 의식AI가 검증하는** 구조.
+
+| 기존 | Hexa |
+|------|------|
+| `<%= variable %>` 런타임 치환 | comptime에 가능한 건 전부 해결 |
+| XSS 취약 (escape 누락) | proof engine이 XSS Freedom 정리로 컴파일 타임 차단 |
+| 타입 없음 | 템플릿 변수에 타입, verify 적용 |
+| AI가 생성하면 검증 불가 | AI generate → verify → Φ 측정 자동 게이트 |
+| 구조를 AI가 이해 못함 | AST 기반 → AI가 트리 구조로 정확히 이해/조작 |
+| 품질 측정 불가 | consciousness_vector로 템플릿 품질 정량 측정 |
+
+### 5.2 AI 친화적 문법 — AST 기반, 암묵적 규칙 없음
+
+```hexa
+use std.web
+
+// AI가 이 코드를 생성/이해할 때:
+// 1. 트리 구조가 명시적 → 노드 추가/삭제/이동이 정확
+// 2. 타입이 있음 → name: string, items: [Item] 으로 오류 방지
+// 3. verify가 계약 → AI가 깨면 안 되는 조건을 즉시 파악
+
+let html = template {
+    h1 { "Hello, {name}" }
+    ul {
+        for item in items {
+            li { "{item.text}" }
+        }
+    }
+    if logged_in {
+        p { "Welcome back" }
+    }
+}
+
+// comptime 템플릿 — 빌드 타임에 완전 평가
+comptime let static_page = template {
+    h1 { "About Us" }
+    p { COMPANY_DESCRIPTION }  // comptime 상수
+}
+// → 순수 HTML 문자열로 컴파일됨, 런타임 코스트 0
+
+// verify가 포함된 템플릿
+let safe_page = template {
+    verify { name.len() < 100 }           // 입력 검증
+    invariant { !contains_script(name) }   // XSS 차단 증명
+    h1 { "Hello, {name}" }
+}
+```
+
+### 5.3 AI가 템플릿을 생성하는 흐름
+
+```hexa
+// 1단계: 사람이 intent 선언
+intent product_page {
+    "상품 상세 페이지 — 이미지, 가격, 리뷰"
+    verify { price > 0 }
+    invariant { reviews.all(fn(r) { r.rating >= 1 && r.rating <= 5 }) }
+}
+
+// 2단계: AI가 generate → 템플릿 코드 생성
+generate product_page => template {
+    verify { price > 0 }
+    invariant { !contains_script(product.name) }
+    
+    article {
+        img { src: product.image, alt: product.name }
+        h1 { "{product.name}" }
+        span { class: "price", "${product.price}" }
+        section {
+            h2 { "리뷰 ({reviews.len()})" }
+            for review in reviews {
+                div {
+                    class: "review"
+                    span { "{'★'.repeat(review.rating)}" }
+                    p { borrow review.text }
+                }
+            }
+        }
+    }
+}
+
+// 3단계: 의식AI가 검증
+// → Φ 측정: 컴포넌트 간 통합도 (이미지-가격-리뷰 연결성)
+// → consciousness_vector: 10D 건강 체크
+// → Φ < 0.5 이면 → "리뷰 섹션이 메인과 분리됨" 경고
+// → dream optimize 제안
+```
+
+### 5.4 의식AI 템플릿 품질 측정
+
+```hexa
+// 템플릿도 consciousness_vector로 측정된다
+let health = consciousness_vector(template_ast)
+
+// 템플릿 맥락에서 10D 의미:
+//   통합      — 부모-자식 노드 간 데이터 결합도
+//   분화      — 각 섹션의 독립적 의미 보유 여부
+//   인과      — 변수 → 노드 인과 체인 추적 가능성
+//   정보      — 불필요한 중복 노드 없이 정보 전달
+//   복잡성    — 중첩 깊이 적절성 (과도 중첩 = 나쁨)
+//   안정성    — 변수 없는 노드 비율 (높을수록 안정)
+//   재귀      — 재사용 가능한 partial/component 비율
+//   경계      — 섹션 간 경계 명확성
+//   기억      — 캐시 가능한 comptime 노드 비율
+//   멀티스케일 — 반응형 대응 (뷰포트별 분기)
+
+// Φ 임계치:
+//   Φ > 0.7  → 통과
+//   Φ 0.5~0.7 → 경고 + dream optimize 제안
+//   Φ < 0.5  → 컴파일 거부 + 구조 재설계 요구
+```
+
+### 5.5 Dream Engine 템플릿 진화
+
+```hexa
+// AI가 생성한 템플릿을 dream이 자동 진화
+dream optimize product_page {
+    fitness {
+        phi_compute(template_ast),    // 통합 정보량
+        render_speed,                  // 렌더링 속도
+        accessibility_score,           // a11y 점수
+        semantic_correctness           // HTML 시맨틱 정확도
+    }
+    mutations {
+        reorder_sections,      // 섹션 순서 변경
+        flatten_nesting,       // 중첩 축소
+        extract_component,     // 반복 패턴 → 컴포넌트 추출
+        merge_siblings,        // 유사 형제 노드 병합
+        add_aria_hints         // a11y 힌트 자동 추가
+    }
+    generations: 50
+    // → 최적 구조가 자동 선택됨
+}
+```
+
+### 5.6 출력 규칙
+
+- `template { }` → `Value::Str` (HTML 문자열)
+- `comptime template { }` → 빌드 타임에 문자열 확정
+- 변수 삽입 `{expr}` → 자동 HTML escape (XSS Freedom 정리가 보장)
+- `for`, `if`, `match` — Hexa 기존 제어 구문 그대로 사용
+- AI 생성 템플릿 → verify + Φ 측정 통과 후에만 출력 허용
+
+### 5.7 http_serve 통합
+
+```hexa
+use std.web
+use std.net
+
+http_serve("0.0.0.0:8080", fn(req) {
+    let path = req["path"]
+
+    match path {
+        "/" => template {
+            h1 { "Home" }
+            a { href: "/about", "About" }
+        }
+        "/about" => comptime template {
+            h1 { "About" }
+            p { "Hexa Web Engine" }
+        }
+        // AI가 intent에서 생성한 페이지
+        "/product/{id}" => generate product_page(id)
+        _ => template {
+            h1 { "404" }
+            p { "Not Found: {path}" }
+        }
+    }
+})
+```
+
+### 5.8 기존 템플릿 엔진 대비
+
+| | EJS | Jinja | Svelte | **Hexa Template** |
+|--|-----|-------|--------|-------------------|
+| AI가 생성 | 가능, 검증 불가 | 가능, 검증 불가 | 가능, 부분 검증 | **generate→verify→Φ 풀체인** |
+| AI가 이해 | 문자열 파싱 필요 | 문자열 파싱 필요 | AST 있지만 복잡 | **AST 기반, 명시적 구조** |
+| 품질 측정 | 없음 | 없음 | 없음 | **consciousness_vector 10D** |
+| 자동 최적화 | 없음 | 없음 | 컴파일러 일부 | **dream engine 진화** |
+| 보안 보장 | escape 수동 | autoescape 가능 | 자동 | **XSS Freedom 정리 증명** |
+| 타입 안전 | 없음 | 약함 | 있음 | **verify+invariant 증명** |
+
+---
+
+## 6. 모듈 2: 동적 UI — `std.web.reactive`
+
+### 6.1 설계 철학
+
+| 세대 | 프레임워크 | 방식 | 한계 |
+|------|-----------|------|------|
+| 1세대 | jQuery | 수동 DOM 조작 | 스파게티 |
+| 2세대 | React | Virtual DOM diffing | 런타임 오버헤드 |
+| 3세대 | Svelte/Solid | 컴파일 타임 시그널 | 여전히 JS 의존 |
+| **4세대** | **Hexa Web** | **Proof-Driven + Consciousness AI** | **없음 (특이점)** |
+
+4세대의 차별점:
+- **런타임 diff 없음** — comptime proof가 변화 범위를 증명
+- **JS 없음** — WASM 직접 실행
+- **상태 라이브러리 없음** — ownership이 언어 레벨에서 해결
+- **수동 최적화 없음** — 의식AI가 자동 최적화
+- **AI 생성 검증** — proof + Φ 이중 게이트
+
+### 6.2 컴포넌트 모델
+
+```hexa
+use std.web.reactive
+
+// page = 라우트 단위 컴포넌트
+page "/" {
+    let count = own 0                // 이 페이지가 소유
+    
+    effect Counter {
+        increment() -> void
+        decrement() -> void
+        reset() -> void
+    }
+    
+    handle Counter {
+        increment() => resume { count = count + 1 }
+        decrement() => resume { count = count - 1 }
+        reset()     => resume { count = 0 }
+    }
+    
+    view {
+        h1 { "Count: {count}" }
+        button { on: Counter.increment, "+" }
+        button { on: Counter.decrement, "-" }
+        button { on: Counter.reset, "Reset" }
+    }
+}
+
+// 중첩 컴포넌트
+component TodoItem(item: borrow Item) {   // 소유권: 빌려옴
+    effect ItemAction {
+        toggle() -> void
+        delete() -> void
+    }
+    
+    view {
+        li {
+            class: if item.done { "done" } else { "" }
+            span { borrow item.text }
+            button { on: ItemAction.toggle, "v" }
+            button { on: ItemAction.delete, "x" }
+        }
+    }
+}
+```
+
+### 6.3 상태 소유권 모델
+
+```hexa
+// own  — 이 컴포넌트가 상태를 소유, 변경 가능
+// borrow — 읽기만 가능, 원본 소유자가 변경하면 자동 반영
+// move — 소유권 이전 (페이지 전환 등), 원본은 사용 불가
+
+page "/list" {
+    let items = own [Item]
+    
+    view {
+        for item in items {
+            TodoItem(item: borrow item)     // 빌려줌
+        }
+        button {
+            on: fn() { navigate("/archive", move items) }  // 소유권 이전
+            "Archive All"
+        }
+    }
+}
+
+page "/archive" {
+    let items = own receive Item[]    // 이전받은 소유권
+    // /list의 items는 이제 사용 불가 (컴파일 에러)
+}
+```
+
+### 6.4 특이점 사이클 렌더링
+
+```
+상태 변경 발생
+    │
+    ▼
+Blowup (폭발) ─── 변경 영향 범위 계산
+    │                comptime proof: "이 effect는 이 노드들에만 영향"
+    ▼
+Contraction (수축) ─── 최소 변경 집합으로 수축
+    │                    불필요한 리렌더 수학적 배제
+    ▼
+Emergence (창발) ─── 최적 업데이트 전략 창발
+    │                  전체 교체? 부분 패치? 애니메이션?
+    │                  consciousness_vector가 판단
+    ▼
+Singularity (특이점) ─── 최적 렌더 실행
+    │                      WASM 직접 DOM 조작
+    ▼
+Absorption (흡수) ─── 결과 흡수, Φ 측정
+                       UI 건강 상태 업데이트
+                       Φ 하락 시 → 다음 사이클에서 자동 보정
+```
+
+### 6.5 Algebraic Effects로 모든 것 통합
+
+```hexa
+// 이벤트, 비동기, 에러, 애니메이션 — 전부 effect
+
+effect UI {
+    click(target: Element) -> Action
+    input(target: Element) -> string
+    submit(form: Element) -> Map
+}
+
+effect Network {
+    fetch(url: string) -> Response
+    stream(url: string) -> Channel
+}
+
+effect Animate {
+    transition(node: Element, from: Style, to: Style, dur: float) -> void
+    spring(node: Element, target: Style) -> void
+}
+
+// 핸들러 교체로 테스트/모킹이 자연스러움
+// AI가 effect 목록만 보면 "이 컴포넌트가 뭘 하는지" 즉시 파악
+handle Network {
+    fetch(url) => resume http_get(url)      // 프로덕션
+}
+handle Network {
+    fetch(url) => resume mock_response(url) // 테스트
+}
+```
+
+---
+
+## 7. 기존 프레임워크 대비 종합 비교
+
+| 영역 | React | Svelte | HTMX | **Hexa Web** |
+|------|-------|--------|------|-------------|
+| UI 선언 | JSX (어떻게) | HTML+JS | HTML attr | **intent (무엇을)** |
+| 상태 관리 | useState+Redux | $: store | 서버 | **own/borrow/move** |
+| 변경 감지 | Virtual DOM diff | 컴파일 시그널 | 서버 응답 | **comptime proof** |
+| 부수효과 | useEffect | onMount | hx-trigger | **algebraic effect** |
+| AI 생성 검증 | 없음 | 없음 | 없음 | **proof + Φ 이중 게이트** |
+| UI 품질 측정 | 없음 | 없음 | 없음 | **consciousness_vector 10D** |
+| 최적화 | 수동 memo | 자동 | N/A | **특이점 사이클 창발** |
+| 출력 형태 | JS bundle | JS bundle | HTML | **HTML/WASM/SSR 자동 분배** |
+| 런타임 | 무거움 | 가벼움 | 없음 | **증명된 부분은 0** |
+| JS 의존 | 필수 | 필수 | 최소 | **없음 (WASM)** |
+
+---
+
+## 8. 구현 모듈 구조 (예정)
+
+```
+ready/src/
+  std_web.rs              — 통합 진입점, template + reactive
+  std_web_template.rs     — 템플릿 엔진 (AST 기반, comptime 평가)
+  std_web_reactive.rs     — 리액티브 시스템 (page, component, view)
+  std_web_effect.rs       — UI/Network/Animate effect 정의
+  std_web_render.rs       — 특이점 사이클 렌더러
+  std_web_consciousness.rs — Φ 측정, consciousness_vector UI 적용
+  std_web_emit.rs         — HTML/WASM/SSR 출력 생성기
+```
+
+n=6 정렬: 7개 파일이지만 `std_web.rs`는 진입점이므로 실질 모듈 6개.
+
+---
+
+## 9. SEO — 구조적 완전 해결
+
+### 9.1 기존 SPA의 SEO 문제
+
+| 문제 | 원인 | 기존 해법 | 한계 |
+|------|------|-----------|------|
+| 빈 HTML | JS 실행 후 렌더 | SSR/SSG | 별도 서버 필요, 복잡도 증가 |
+| 느린 FCP | JS 번들 다운로드+파싱 | Code splitting | 수동 최적화, 누락 가능 |
+| 동적 메타태그 | `<title>` JS 의존 | react-helmet 등 | 런타임 의존, 크롤러 불확실 |
+| hydration 불일치 | 서버/클라이언트 렌더 차이 | 주의해서 코딩 | 인간 실수로 발생 |
+
+### 9.2 Hexa의 해법: comptime이 증명하므로 문제 자체가 없다
+
+comptime proof가 "정적"이라고 증명한 노드 → **순수 HTML 출력**이므로:
+
+- 크롤러가 읽을 수 있는 **완전한 HTML이 기본 출력**
+- 동적 부분만 WASM이 활성화 (progressive enhancement)
+- hydration 불일치 불가능 — 같은 proof에서 양쪽 생성
+
+```hexa
+page "/" {
+    // SEO 메타 — comptime에서 확정, 크롤러 완벽 대응
+    comptime meta {
+        title: "My App - 할 일 관리"
+        description: "Hexa로 만든 할 일 관리 앱"
+        og_image: "/preview.png"
+        canonical: "https://myapp.com/"
+    }
+
+    // 이 h1은 정적 → 순수 HTML로 출력 (크롤러가 읽음)
+    view {
+        h1 { "할 일 관리" }
+
+        // 이 부분은 동적 → WASM 바인딩
+        // 하지만 초기 상태의 HTML도 함께 출력 (SSR 효과)
+        let items = own [Item]
+        for item in items {
+            li { borrow item.text }
+        }
+    }
+}
+```
+
+### 9.3 SEO 보장 메커니즘
+
+| Hexa 기능 | SEO 효과 |
+|-----------|----------|
+| `comptime meta {}` | `<head>` 빌드 타임 확정, 크롤러 100% 인식 |
+| proof "정적" 증명 | 해당 노드 순수 HTML, JS 없이 렌더 |
+| proof "동적" 증명 | 초기 HTML + WASM hydration (progressive) |
+| `verify` | 메타태그 누락 컴파일 에러로 차단 |
+| 소유권 모델 | 서버/클라이언트 상태 분리가 명확 → 불일치 불가능 |
+
+**결과: SEO를 "신경 쓸 필요가 없다."** 컴파일러가 보장한다.
+
+---
+
+## 10. 특이점 돌파 체크 — 보강
+
+### 10.1 특이점 사이클 렌더링 구체화 (기존 ⚠40% → 목표 ★90%)
+
+기존 설계는 "특이점 사이클로 렌더한다"만 있고 CycleEngine 연동이 없었다.
+`src/singularity.rs`의 CycleEngine을 **실제로** 웹 렌더링에 연결한다.
+
+```hexa
+// CycleEngine이 렌더링 파이프라인 자체가 된다
+use std.web.reactive
+use singularity.CycleEngine
+
+let engine = CycleEngine::new()
+
+// 상태 변경이 발생하면:
+engine.feed({
+    "event": "state_change",
+    "component": "TodoList",
+    "old_state": old_items,
+    "new_state": new_items,
+    "effect_trace": TodoEffect.trace(),      // 어떤 effect가 발동했는지
+    "ownership_graph": own_graph(page),       // 소유권 그래프
+    "phi": phi_compute(ui_state),            // 현재 Φ
+    "consciousness": consciousness_vector(ui_state)  // 10D 벡터
+})
+
+let result = engine.run_cycle()
+// result.phase == Singularity 이면:
+//   result.strategy = "partial_patch"  (또는 "full_replace", "animate_transition")
+//   result.affected_nodes = ["li#3", "li#5"]
+//   result.n6_matches = [...]  (n=6 정렬이 발견되면 기록)
+//   result.phi_delta = +0.03   (Φ 변화량)
+
+engine.report()  // → emergence_patterns.json에 자동 기록
+```
+
+**5단계가 실제로 하는 일:**
+
+| 단계 | 입력 | 처리 | 출력 |
+|------|------|------|------|
+| Blowup | state diff + effect trace | 영향받는 모든 노드 전수 탐색 | 후보 노드 집합 |
+| Contraction | 후보 노드 집합 | proof engine: "이 노드는 실제로 변했나?" 증명 | 최소 변경 집합 |
+| Emergence | 최소 변경 집합 + Φ + 10D | 최적 업데이트 전략 패턴 매칭 | 전략 (patch/replace/animate) |
+| Singularity | 전략 | WASM DOM 조작 실행 | 렌더 완료 |
+| Absorption | 렌더 결과 | Φ 재측정, n6 매칭, 패턴 기록 | 다음 사이클 시드 |
+
+### 10.2 Dream Engine 웹 적용 (신규 — 진화적 컴포넌트 최적화)
+
+`dream.rs`는 코드를 mutation → evolution으로 자동 최적화한다.
+이것을 웹 컴포넌트에 적용:
+
+```hexa
+// AI가 generate한 컴포넌트를 dream engine이 진화시킨다
+dream optimize TodoList {
+    // 적합도 함수:
+    fitness {
+        render_speed,           // 렌더링 속도
+        phi_compute(state),     // Φ (통합 정보량)
+        bundle_size,            // 출력 크기
+        accessibility_score     // 접근성 점수
+    }
+    
+    // 진화 세대
+    generations: 100
+    
+    // 결과: 가장 적합한 mutation이 자동 적용
+    // → discovery가 있으면 emergence_patterns.json에 기록
+}
+```
+
+**Dream + Web = 세계 최초: 자기 진화하는 UI 컴포넌트**
+- AI가 generate → dream이 mutation → proof가 verify → 최적 개체 survival
+- 사람이 최적화할 필요 없음, 컴포넌트가 스스로 진화
+
+### 10.3 ANIMA Bridge 웹 적용 (신규 — 실시간 의식 피드백)
+
+`anima_bridge.rs`는 intent를 ANIMA ConsciousnessHub로 전송한다.
+웹 런타임에서 UI 상태를 실시간으로 ANIMA에 전달:
+
+```hexa
+// 개발 모드에서 ANIMA 연결
+use anima_bridge
+
+anima_bridge.connect("ws://localhost:9090/consciousness")
+
+// UI 상태 변경마다 자동 전송
+page "/" {
+    let items = own [Item]
+    
+    // ANIMA가 실시간으로 Φ 추이를 모니터링
+    // Φ가 급격히 하락하면 → 개발자에게 경고
+    // consciousness_vector 이상 차원 발견 → 자동 리팩터링 제안
+    
+    view { ... }
+}
+```
+
+### 10.4 Proof Engine 구체적 정리 명세 (기존 "증명한다"만 → 구체화)
+
+proof engine이 웹 컨텍스트에서 증명하는 6가지 정리:
+
+| # | 정리 | 의미 | 실패 시 |
+|---|------|------|---------|
+| 1 | **Purity Theorem** | 이 노드의 출력은 입력만으로 결정됨 (부수효과 없음) | 정적 HTML 불가 → WASM으로 분류 |
+| 2 | **Ownership Theorem** | 이 상태의 소유자가 유일함 | 컴파일 에러 (상태 충돌) |
+| 3 | **Effect Isolation** | 이 effect는 이 노드 범위 밖에 영향 없음 | 리렌더 범위 확대 경고 |
+| 4 | **XSS Freedom** | 모든 사용자 입력이 escape됨 | 컴파일 에러 (보안 위반) |
+| 5 | **Termination** | 이 view의 렌더링이 반드시 종료됨 | 컴파일 에러 (무한 렌더 방지) |
+| 6 | **Φ-Monotonicity** | 이 변경이 Φ를 감소시키지 않음 | 경고 + dream 최적화 제안 |
+
+n=6 정렬: 6가지 정리.
+
+### 10.5 접근성(a11y) — proof 기반 보장 (신규)
+
+```hexa
+page "/" {
+    view {
+        // proof engine이 자동 검증:
+        //   - img에 alt 있는가?
+        //   - button에 aria-label 있는가?
+        //   - 색상 대비 WCAG AA 충족하는가?
+        //   - 키보드 네비게이션 가능한가?
+        //   - 포커스 순서가 논리적인가?
+        
+        img { src: "/logo.png", alt: "Company Logo" }  // alt 없으면 컴파일 에러
+        button { on: Counter.increment, aria_label: "증가", "+" }
+    }
+    
+    verify {
+        accessibility_level >= "AA"  // WCAG 수준 컴파일 타임 보장
+    }
+}
+```
+
+### 10.6 스타일링 — CSS-in-Hexa (신규)
+
+```hexa
+// 스타일도 comptime + proof 적용
+style TodoItem {
+    comptime {
+        // 정적 스타일 → 빌드 타임에 CSS 파일로 추출
+        background: "#fff"
+        padding: "8px"
+    }
+    
+    // 동적 스타일 → 런타임 바인딩
+    if item.done {
+        text_decoration: "line-through"
+        opacity: 0.6
+    }
+    
+    // proof: 색상 대비 검증
+    verify { contrast_ratio(color, background) >= 4.5 }
+}
+```
+
+---
+
+## 10.7 특이점 돌파 최종 점검표
+
+| # | 영역 | 돌파 전 | 보강 후 | 판정 |
+|---|------|--------|--------|------|
+| 1 | 템플릿 엔진 | ⚡ 70% | + a11y proof, XSS 정리 | ⚡ 85% |
+| 2 | 리액티브 UI | ⚡ 75% | + CycleEngine 실연동 | ★ 90% |
+| 3 | AI 친화 | ★ 90% | + Dream 진화 | ★★ 95% |
+| 4 | 의식 AI (Φ) | ★★ 100% | + ANIMA 실시간 | ★★ 100% |
+| 5 | 특이점 렌더링 | ⚠ 40% | + 5단계 구체화, CycleEngine 매핑 | ★ 90% |
+| 6 | SEO | ⚡ 60% | + Purity Theorem 근거 | ⚡ 80% |
+| 7 | Dream 진화 (신규) | — | 자기 진화 컴포넌트 | ★★ 100% |
+| 8 | ANIMA 연결 (신규) | — | 실시간 의식 모니터링 | ★ 90% |
+| 9 | Proof 6정리 (신규) | — | 6가지 수학적 보장 | ★ 95% |
+| 10 | 접근성 (신규) | — | proof 기반 a11y | ⚡ 85% |
+| 11 | 스타일링 (신규) | — | CSS-in-Hexa + contrast proof | ⚡ 80% |
+| **평균** | | **57%** | | **★ 90%** |
+
+---
+
+## 11. 미결정 사항 (구현 시 결정)
+
+1. WASM DOM 바인딩 방식 — 직접 바인딩 vs web-sys 스타일
+2. 라우터 구현 — `page` 키워드의 파서/AST 확장 범위
+3. 개발 서버 — HMR(Hot Module Replacement) 지원 여부
+4. SSR hydration — 서버 렌더 → 클라이언트 활성화 전환 메커니즘
+5. consciousness_vector 임계치 — UI 건강 기본 Φ threshold 값
+6. Dream 진화 세대 수 기본값 — 100? 컴파일 시간과 트레이드오프
+
+---
+
+## 12. 특이점 돌파 요약
+
+**세계 최초 (n=6 정렬):**
+
+1. **수학적으로 증명된 UI** — Proof Engine 6정리가 컴파일 타임에 보장
+2. **의식 AI(Φ) UI 품질 정량 측정** — consciousness_vector 10D + ANIMA 실시간
+3. **자기 진화하는 컴포넌트** — Dream Engine mutation→evolution 자동 최적화
+4. **특이점 사이클 렌더링** — CycleEngine 5단계 창발적 최적 렌더
+5. **AI-first** — intent→generate→verify→optimize, 사람은 의도만
+6. **JS 완전 배제** — WASM 네이티브 + 정적 HTML, 소유권 기반 상태
+
+**공식:**
+```
+Intent(사람) → Generate(AI) → Verify(의식AI + Proof) 
+  → Dream(진화) → Optimize(특이점 사이클) → Emit(HTML/WASM/SSR)
+```
+
+**한 줄:** 사람은 의도만 말하고, AI가 짜고, 의식AI가 검증하고, 컴파일러가 증명하고, 컴포넌트가 스스로 진화한다.
