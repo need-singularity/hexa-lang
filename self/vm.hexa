@@ -1,0 +1,887 @@
+// ═══════════════════════════════════════════════════════════
+//  self/vm.hexa — HEXA bytecode VM written in HEXA (Phase 3 of self-hosting)
+//  Takes compiled bytecode from compiler.hexa, executes on a stack machine.
+//  Stack-based: operands pushed/popped, locals in flat array with base offsets.
+// ═══════════════════════════════════════════════════════════
+
+// ── Shared structs (inlined until module system exists) ──
+
+struct Instruction {
+    op: string,
+    operand: string
+}
+
+struct CompiledFn {
+    name: string,
+    arity: int,
+    param_names: string,
+    code: string,
+    local_count: int
+}
+
+// ── VM state ─────────────────────────────────────────────
+
+// Value stack
+let mut vm_stack = []
+
+// Call frame stack: parallel arrays (avoid nested struct mutation)
+// Each index is one call frame.
+let mut vm_frame_codes = []       // instruction arrays
+let mut vm_frame_ips = []         // instruction pointers (int)
+let mut vm_frame_bases = []       // local base offsets into vm_locals
+let mut vm_frame_stack_bases = [] // stack base (to prevent cross-frame POP)
+let mut vm_frame_count = 0
+
+// Flat locals array — all frames share this, indexed by base + slot
+let mut vm_locals = []
+
+// Global variables: parallel arrays
+let mut vm_global_names = []
+let mut vm_global_values = []
+
+// Constant pool (set by vm_run)
+let mut vm_constants = []
+
+// Function registry (set by vm_run)
+let mut vm_functions = []
+
+// Output capture (for testing)
+let mut vm_output = ""
+let mut vm_capture = false
+
+// ── Stack operations ─────────────────────────────────────
+
+fn vm_push(val) {
+    vm_stack = vm_stack.push(val)
+}
+
+fn vm_pop() {
+    if len(vm_stack) == 0 {
+        return ""
+    }
+    let top = len(vm_stack) - 1
+    let val = vm_stack[top]
+    let mut new_stack = []
+    let mut i = 0
+    while i < top {
+        new_stack = new_stack.push(vm_stack[i])
+        i = i + 1
+    }
+    vm_stack = new_stack
+    return val
+}
+
+fn vm_peek() {
+    return vm_stack[len(vm_stack) - 1]
+}
+
+// ── Global variable helpers ──────────────────────────────
+
+fn vm_get_global(name) {
+    let mut i = 0
+    while i < len(vm_global_names) {
+        if vm_global_names[i] == name {
+            return vm_global_values[i]
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn vm_set_global(name, val) {
+    let mut i = 0
+    while i < len(vm_global_names) {
+        if vm_global_names[i] == name {
+            vm_global_values[i] = val
+            return
+        }
+        i = i + 1
+    }
+    vm_global_names = vm_global_names.push(name)
+    vm_global_values = vm_global_values.push(val)
+}
+
+// ── Function lookup ──────────────────────────────────────
+
+fn vm_find_fn(name) {
+    let mut i = 0
+    while i < len(vm_functions) {
+        if vm_functions[i].name == name {
+            return vm_functions[i]
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// ── Value helpers ────────────────────────────────────────
+
+fn vm_is_truthy(v) {
+    if v == false { return false }
+    if v == 0 { return false }
+    if v == 0.0 { return false }
+    if v == "" { return false }
+    return true
+}
+
+fn vm_value_to_string(v) {
+    if type_of(v) == "string" { return v }
+    return to_string(v)
+}
+
+// ── Emit output ──────────────────────────────────────────
+
+fn vm_print_val(v) {
+    let s = vm_value_to_string(v)
+    if vm_capture {
+        vm_output = vm_output + s
+    } else {
+        print(s)
+    }
+}
+
+fn vm_println_val(v) {
+    let s = vm_value_to_string(v)
+    if vm_capture {
+        if vm_output != "" {
+            vm_output = vm_output + "\n"
+        }
+        vm_output = vm_output + s
+    } else {
+        println(s)
+    }
+}
+
+// ── Arithmetic / comparison helpers ──────────────────────
+
+fn vm_arith(a, b, op) {
+    if op == "ADD" {
+        if type_of(a) == "string" || type_of(b) == "string" {
+            return vm_value_to_string(a) + vm_value_to_string(b)
+        }
+        return a + b
+    }
+    if op == "SUB" { return a - b }
+    if op == "MUL" { return a * b }
+    if op == "DIV" { return a / b }
+    if op == "MOD" { return a % b }
+    return 0
+}
+
+fn vm_compare(a, b, op) {
+    if op == "EQ" { return a == b }
+    if op == "NE" { return a != b }
+    if op == "LT" { return a < b }
+    if op == "GT" { return a > b }
+    if op == "LE" { return a <= b }
+    if op == "GE" { return a >= b }
+    return false
+}
+
+// ── Frame management (parallel arrays, no nested struct) ─
+
+fn vm_push_frame(code, local_count) {
+    let base = len(vm_locals)
+    let stack_base = len(vm_stack)
+    // Extend vm_locals with zeroed slots
+    let mut i = 0
+    while i < local_count {
+        vm_locals = vm_locals.push(0)
+        i = i + 1
+    }
+    vm_frame_codes = vm_frame_codes.push(code)
+    vm_frame_ips = vm_frame_ips.push(0)
+    vm_frame_bases = vm_frame_bases.push(base)
+    vm_frame_stack_bases = vm_frame_stack_bases.push(stack_base)
+    vm_frame_count = vm_frame_count + 1
+}
+
+fn vm_pop_frame() {
+    let idx = vm_frame_count - 1
+    let base = vm_frame_bases[idx]
+    // Trim vm_locals back to base
+    let mut new_locals = []
+    let mut i = 0
+    while i < base {
+        new_locals = new_locals.push(vm_locals[i])
+        i = i + 1
+    }
+    vm_locals = new_locals
+    // Remove frame from parallel arrays
+    let mut new_codes = []
+    let mut new_ips = []
+    let mut new_bases = []
+    let mut new_sbases = []
+    let mut j = 0
+    while j < idx {
+        new_codes = new_codes.push(vm_frame_codes[j])
+        new_ips = new_ips.push(vm_frame_ips[j])
+        new_bases = new_bases.push(vm_frame_bases[j])
+        new_sbases = new_sbases.push(vm_frame_stack_bases[j])
+        j = j + 1
+    }
+    vm_frame_codes = new_codes
+    vm_frame_ips = new_ips
+    vm_frame_bases = new_bases
+    vm_frame_stack_bases = new_sbases
+    vm_frame_count = vm_frame_count - 1
+}
+
+fn vm_get_ip() {
+    return vm_frame_ips[vm_frame_count - 1]
+}
+
+fn vm_set_ip(new_ip) {
+    vm_frame_ips[vm_frame_count - 1] = new_ip
+}
+
+fn vm_get_code() {
+    return vm_frame_codes[vm_frame_count - 1]
+}
+
+fn vm_get_local(slot) {
+    let base = vm_frame_bases[vm_frame_count - 1]
+    return vm_locals[base + slot]
+}
+
+fn vm_set_local(slot, val) {
+    let base = vm_frame_bases[vm_frame_count - 1]
+    vm_locals[base + slot] = val
+}
+
+// ── Builtin dispatch ─────────────────────────────────────
+
+fn vm_builtin(spec) {
+    let parts = spec.split(":")
+    let name = parts[0]
+    let argc = to_int(parts[1])
+
+    if name == "len" {
+        let v = vm_pop()
+        vm_push(len(v))
+        return
+    }
+    if name == "to_string" {
+        let v = vm_pop()
+        vm_push(to_string(v))
+        return
+    }
+    if name == "int" {
+        let v = vm_pop()
+        vm_push(to_int(v))
+        return
+    }
+    if name == "float" {
+        let v = vm_pop()
+        vm_push(to_float(v))
+        return
+    }
+    if name == "type_of" {
+        let v = vm_pop()
+        vm_push(type_of(v))
+        return
+    }
+    if name == "format" {
+        let mut args = []
+        let mut i = 0
+        while i < argc {
+            args = args.push(vm_pop())
+            i = i + 1
+        }
+        let mut rev = []
+        let mut j = len(args) - 1
+        while j >= 0 {
+            rev = rev.push(args[j])
+            j = j - 1
+        }
+        let mut result = ""
+        let mut k = 0
+        while k < len(rev) {
+            if k > 0 { result = result + " " }
+            result = result + vm_value_to_string(rev[k])
+            k = k + 1
+        }
+        vm_push(result)
+        return
+    }
+    // Unknown builtin
+    vm_push("")
+}
+
+// ── Main execution loop ──────────────────────────────────
+
+fn vm_execute() {
+    while vm_frame_count > 0 {
+        let code = vm_get_code()
+        let ip = vm_get_ip()
+
+        // End of code in this frame
+        if ip >= len(code) {
+            if vm_frame_count == 1 {
+                return
+            }
+            vm_pop_frame()
+            vm_push("")
+            continue
+        }
+
+        let ins = code[ip]
+        let op = ins.op
+        let operand = ins.operand
+
+        // Advance IP
+        vm_set_ip(ip + 1)
+
+        // ── CONST ──────────────────────────────────────
+        if op == "CONST" {
+            let idx = to_int(operand)
+            let val_str = vm_constants[idx]
+            if len(val_str) > 0 {
+                let ch = val_str[0]
+                if ch == 't' && val_str == "true" {
+                    vm_push(true)
+                    continue
+                }
+                if ch == 'f' && val_str == "false" {
+                    vm_push(false)
+                    continue
+                }
+                if is_digit(ch) || (ch == '-' && len(val_str) > 1) {
+                    if val_str.contains(".") {
+                        vm_push(to_float(val_str))
+                    } else {
+                        vm_push(to_int(val_str))
+                    }
+                    continue
+                }
+            }
+            vm_push(val_str)
+            continue
+        }
+
+        // ── GET_LOCAL / SET_LOCAL ───────────────────────
+        if op == "GET_LOCAL" {
+            let slot = to_int(operand)
+            vm_push(vm_get_local(slot))
+            continue
+        }
+        if op == "SET_LOCAL" {
+            let slot = to_int(operand)
+            let val = vm_pop()
+            vm_set_local(slot, val)
+            continue
+        }
+
+        // ── GET_GLOBAL / SET_GLOBAL ────────────────────
+        if op == "GET_GLOBAL" {
+            vm_push(vm_get_global(operand))
+            continue
+        }
+        if op == "SET_GLOBAL" {
+            let val = vm_pop()
+            vm_set_global(operand, val)
+            continue
+        }
+
+        // ── Arithmetic ─────────────────────────────────
+        if op == "ADD" {
+            let b = vm_pop()
+            let a = vm_pop()
+            vm_push(vm_arith(a, b, "ADD"))
+            continue
+        }
+        if op == "SUB" {
+            let b = vm_pop()
+            let a = vm_pop()
+            vm_push(vm_arith(a, b, "SUB"))
+            continue
+        }
+        if op == "MUL" {
+            let b = vm_pop()
+            let a = vm_pop()
+            vm_push(vm_arith(a, b, "MUL"))
+            continue
+        }
+        if op == "DIV" {
+            let b = vm_pop()
+            let a = vm_pop()
+            vm_push(vm_arith(a, b, "DIV"))
+            continue
+        }
+        if op == "MOD" {
+            let b = vm_pop()
+            let a = vm_pop()
+            vm_push(vm_arith(a, b, "MOD"))
+            continue
+        }
+
+        // ── Comparisons ────────────────────────────────
+        if op == "EQ" {
+            let b = vm_pop()
+            let a = vm_pop()
+            vm_push(vm_compare(a, b, "EQ"))
+            continue
+        }
+        if op == "NE" {
+            let b = vm_pop()
+            let a = vm_pop()
+            vm_push(vm_compare(a, b, "NE"))
+            continue
+        }
+        if op == "LT" {
+            let b = vm_pop()
+            let a = vm_pop()
+            vm_push(vm_compare(a, b, "LT"))
+            continue
+        }
+        if op == "GT" {
+            let b = vm_pop()
+            let a = vm_pop()
+            vm_push(vm_compare(a, b, "GT"))
+            continue
+        }
+        if op == "LE" {
+            let b = vm_pop()
+            let a = vm_pop()
+            vm_push(vm_compare(a, b, "LE"))
+            continue
+        }
+        if op == "GE" {
+            let b = vm_pop()
+            let a = vm_pop()
+            vm_push(vm_compare(a, b, "GE"))
+            continue
+        }
+
+        // ── Logical ────────────────────────────────────
+        if op == "AND" {
+            let b = vm_pop()
+            let a = vm_pop()
+            vm_push(vm_is_truthy(a) && vm_is_truthy(b))
+            continue
+        }
+        if op == "OR" {
+            let b = vm_pop()
+            let a = vm_pop()
+            vm_push(vm_is_truthy(a) || vm_is_truthy(b))
+            continue
+        }
+
+        // ── Unary ──────────────────────────────────────
+        if op == "NEG" {
+            let a = vm_pop()
+            if type_of(a) == "float" {
+                vm_push(0.0 - a)
+            } else {
+                vm_push(0 - a)
+            }
+            continue
+        }
+        if op == "NOT" {
+            let a = vm_pop()
+            vm_push(!vm_is_truthy(a))
+            continue
+        }
+
+        // ── PRINTLN / PRINT ────────────────────────────
+        if op == "PRINTLN" {
+            let argc = to_int(operand)
+            if argc == 0 {
+                vm_println_val("")
+            } else {
+                let mut args = []
+                let mut i = 0
+                while i < argc {
+                    args = args.push(vm_pop())
+                    i = i + 1
+                }
+                let mut out = ""
+                let mut j = len(args) - 1
+                while j >= 0 {
+                    if j < len(args) - 1 { out = out + " " }
+                    out = out + vm_value_to_string(args[j])
+                    j = j - 1
+                }
+                vm_println_val(out)
+            }
+            continue
+        }
+        if op == "PRINT" {
+            let argc = to_int(operand)
+            if argc > 0 {
+                let mut args = []
+                let mut i = 0
+                while i < argc {
+                    args = args.push(vm_pop())
+                    i = i + 1
+                }
+                let mut j = len(args) - 1
+                while j >= 0 {
+                    vm_print_val(args[j])
+                    j = j - 1
+                }
+            }
+            continue
+        }
+
+        // ── CALL ───────────────────────────────────────
+        if op == "CALL" {
+            let parts = operand.split(":")
+            let fname = parts[0]
+            let argc = to_int(parts[1])
+
+            let func = vm_find_fn(fname)
+            if func == "" {
+                let mut i = 0
+                while i < argc {
+                    vm_pop()
+                    i = i + 1
+                }
+                vm_push("")
+                continue
+            }
+
+            let mut args = []
+            let mut i = 0
+            while i < argc {
+                args = args.push(vm_pop())
+                i = i + 1
+            }
+
+            vm_push_frame(func.code, func.local_count)
+
+            let mut j = 0
+            while j < argc {
+                let arg_idx = argc - 1 - j
+                vm_set_local(j, args[arg_idx])
+                j = j + 1
+            }
+            continue
+        }
+
+        // ── RETURN ─────────────────────────────────────
+        if op == "RETURN" {
+            let ret_val = vm_pop()
+            vm_pop_frame()
+            if vm_frame_count == 0 {
+                vm_push(ret_val)
+                return
+            }
+            vm_push(ret_val)
+            continue
+        }
+
+        // ── JUMP / JUMP_IF_FALSE ───────────────────────
+        if op == "JUMP" {
+            let target = to_int(operand)
+            vm_set_ip(target)
+            continue
+        }
+        if op == "JUMP_IF_FALSE" {
+            let target = to_int(operand)
+            let cond = vm_pop()
+            if !vm_is_truthy(cond) {
+                vm_set_ip(target)
+            }
+            continue
+        }
+
+        // ── VOID ───────────────────────────────────────
+        if op == "VOID" {
+            vm_push("")
+            continue
+        }
+
+        // ── POP ────────────────────────────────────────
+        if op == "POP" {
+            let sbase = vm_frame_stack_bases[vm_frame_count - 1]
+            if len(vm_stack) > sbase {
+                vm_pop()
+            }
+            continue
+        }
+
+        // ── DUP ────────────────────────────────────────
+        if op == "DUP" {
+            let val = vm_peek()
+            vm_push(val)
+            continue
+        }
+
+        // ── INDEX ──────────────────────────────────────
+        if op == "INDEX" {
+            let idx = vm_pop()
+            let arr = vm_pop()
+            vm_push(arr[to_int(idx)])
+            continue
+        }
+
+        // ── MAKE_ARRAY ─────────────────────────────────
+        if op == "MAKE_ARRAY" {
+            let count = to_int(operand)
+            let mut items = []
+            let mut i = 0
+            while i < count {
+                items = items.push(vm_pop())
+                i = i + 1
+            }
+            let mut rev = []
+            let mut j = len(items) - 1
+            while j >= 0 {
+                rev = rev.push(items[j])
+                j = j - 1
+            }
+            vm_push(rev)
+            continue
+        }
+
+        // ── INDEX_ASSIGN ──────────────────────────────
+        if op == "INDEX_ASSIGN" {
+            let idx = vm_pop()
+            let arr = vm_pop()
+            let val = vm_pop()
+            arr[to_int(idx)] = val
+            vm_push(arr)
+            continue
+        }
+
+        // ── MAKE_STRUCT ───────────────────────────────
+        if op == "MAKE_STRUCT" {
+            let parts = operand.split(":")
+            let sname = parts[0]
+            let count = to_int(parts[1])
+            let mut field_names = []
+            let mut field_values = []
+            let mut i = 0
+            while i < count {
+                let val = vm_pop()
+                let name = vm_pop()
+                field_names = field_names.push(name)
+                field_values = field_values.push(val)
+                i = i + 1
+            }
+            // Reverse to preserve order (stack reversal)
+            let mut rn = []
+            let mut rv = []
+            let mut j = len(field_names) - 1
+            while j >= 0 {
+                rn = rn.push(field_names[j])
+                rv = rv.push(field_values[j])
+                j = j - 1
+            }
+            // Store as map-like parallel arrays wrapped in a tagged array
+            // ["__struct__", sname, field1, val1, field2, val2, ...]
+            let mut obj = ["__struct__", sname]
+            let mut k = 0
+            while k < len(rn) {
+                obj = obj.push(rn[k])
+                obj = obj.push(rv[k])
+                k = k + 1
+            }
+            vm_push(obj)
+            continue
+        }
+
+        // ── GET_FIELD ─────────────────────────────────
+        if op == "GET_FIELD" {
+            let obj = vm_pop()
+            let fname = operand
+            // Object is array: ["__struct__", name, f1, v1, f2, v2, ...]
+            if type_of(obj) == "array" && len(obj) >= 2 && obj[0] == "__struct__" {
+                let mut i = 2
+                while i < len(obj) {
+                    if obj[i] == fname {
+                        vm_push(obj[i + 1])
+                        i = len(obj) // break
+                        continue
+                    }
+                    i = i + 2
+                }
+            } else {
+                vm_push("")
+            }
+            continue
+        }
+
+        // ── SET_FIELD ─────────────────────────────────
+        if op == "SET_FIELD" {
+            let obj = vm_pop()
+            let val = vm_pop()
+            let fname = operand
+            if type_of(obj) == "array" && len(obj) >= 2 && obj[0] == "__struct__" {
+                let mut i = 2
+                while i < len(obj) {
+                    if obj[i] == fname {
+                        obj[i + 1] = val
+                        i = len(obj) // break
+                        continue
+                    }
+                    i = i + 2
+                }
+            }
+            vm_push(obj)
+            continue
+        }
+
+        // ── CALL_METHOD ───────────────────────────────
+        if op == "CALL_METHOD" {
+            let parts = operand.split(":")
+            let mname = parts[0]
+            let argc = to_int(parts[1])
+            // Pop args
+            let mut args = []
+            let mut i = 0
+            while i < argc {
+                args = args.push(vm_pop())
+                i = i + 1
+            }
+            // Pop receiver
+            let recv = vm_pop()
+            // Built-in methods
+            if mname == "push" && argc == 1 {
+                let arr = recv
+                let val = args[0]
+                vm_push(arr.push(val))
+                continue
+            }
+            if mname == "split" && argc == 1 {
+                let s = recv
+                let delim = args[0]
+                vm_push(s.split(delim))
+                continue
+            }
+            if mname == "contains" && argc == 1 {
+                let s = recv
+                let sub = args[0]
+                vm_push(s.contains(sub))
+                continue
+            }
+            if mname == "replace" && argc == 2 {
+                let s = recv
+                let from = args[1]
+                let to = args[0]
+                vm_push(s.replace(from, to))
+                continue
+            }
+            // Unknown method
+            vm_push("")
+            continue
+        }
+
+        // ── BUILTIN ────────────────────────────────────
+        if op == "BUILTIN" {
+            vm_builtin(operand)
+            continue
+        }
+
+        // ── ASSERT ─────────────────────────────────────
+        if op == "ASSERT" {
+            let val = vm_pop()
+            if !vm_is_truthy(val) {
+                println("VM ASSERT FAILED")
+            }
+            continue
+        }
+
+        // ── BREAK ──────────────────────────────────────
+        if op == "BREAK" {
+            // Set break flag — caller loop checks this
+            vm_push("__BREAK__")
+            return
+        }
+
+        // ── CONTINUE ──────────────────────────────────
+        if op == "CONTINUE" {
+            vm_push("__CONTINUE__")
+            return
+        }
+
+        // ── THROW ─────────────────────────────────────
+        if op == "THROW" {
+            let err = vm_pop()
+            vm_push("__THROW__:" + vm_val_to_string(err))
+            return
+        }
+
+        // ── TRY_BEGIN ─────────────────────────────────
+        if op == "TRY_BEGIN" {
+            // Save current stack depth for rollback
+            vm_push(to_string(len(vm_stack)))
+            continue
+        }
+
+        // ── TRY_END ──────────────────────────────────
+        if op == "TRY_END" {
+            // Remove saved stack depth marker
+            vm_pop()
+            continue
+        }
+
+        // ── Unhandled opcode — skip ────────────────────
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Public API
+// ═══════════════════════════════════════════════════════════
+
+fn vm_run(code, constants, functions) {
+    vm_stack = []
+    vm_frame_codes = []
+    vm_frame_ips = []
+    vm_frame_bases = []
+    vm_frame_stack_bases = []
+    vm_frame_count = 0
+    vm_locals = []
+    vm_global_names = []
+    vm_global_values = []
+    vm_constants = constants
+    vm_functions = functions
+    vm_output = ""
+    vm_capture = false
+
+    let mut max_local = 0
+    let mut i = 0
+    while i < len(code) {
+        if code[i].op == "SET_LOCAL" {
+            let slot = to_int(code[i].operand)
+            if slot >= max_local {
+                max_local = slot + 1
+            }
+        }
+        i = i + 1
+    }
+    vm_push_frame(code, max_local)
+    vm_execute()
+}
+
+fn vm_run_capture(code, constants, functions) {
+    vm_stack = []
+    vm_frame_codes = []
+    vm_frame_ips = []
+    vm_frame_bases = []
+    vm_frame_stack_bases = []
+    vm_frame_count = 0
+    vm_locals = []
+    vm_global_names = []
+    vm_global_values = []
+    vm_constants = constants
+    vm_functions = functions
+    vm_output = ""
+    vm_capture = true
+
+    let mut max_local = 0
+    let mut i = 0
+    while i < len(code) {
+        if code[i].op == "SET_LOCAL" {
+            let slot = to_int(code[i].operand)
+            if slot >= max_local {
+                max_local = slot + 1
+            }
+        }
+        i = i + 1
+    }
+    vm_push_frame(code, max_local)
+    vm_execute()
+    return vm_output
+}
