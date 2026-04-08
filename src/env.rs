@@ -452,6 +452,7 @@ impl Env {
         env.define_builtin("load_weights_bin", Value::BuiltinFn("load_weights_bin".into()));
         env.define_builtin("mmap_weights", Value::BuiltinFn("mmap_weights".into()));
         env.define_builtin("to_char", Value::BuiltinFn("to_char".into()));
+        env.define_builtin("tensor", Value::BuiltinFn("tensor".into()));
         env
 
     }
