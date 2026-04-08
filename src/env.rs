@@ -54,6 +54,15 @@ pub enum Value {
     Pointer(u64),
     /// Arbitrary-precision integer (I6 bigint support).
     BigInt(Box<num_bigint::BigInt>),
+    /// Dense f64 tensor — zero-copy via Arc, no per-element Value wrapping.
+    Tensor(Arc<TensorData>),
+}
+
+/// Dense tensor storage for neural network weights and activations.
+#[derive(Debug, Clone)]
+pub struct TensorData {
+    pub shape: Vec<usize>,
+    pub data: Vec<f64>,
 }
 
 impl Value {
@@ -145,6 +154,7 @@ impl std::fmt::Display for Value {
             Value::Atomic(av) => write!(f, "{}", av.load()),
             Value::Pointer(addr) => write!(f, "<ptr 0x{:x}>", addr),
             Value::BigInt(n) => write!(f, "{}", n),
+            Value::Tensor(t) => write!(f, "<tensor {:?} len={}>", t.shape, t.data.len()),
         }
     }
 }
@@ -440,6 +450,7 @@ impl Env {
         env.define_builtin("read_stdin", Value::BuiltinFn("read_stdin".into()));
         env.define_builtin("input_all", Value::BuiltinFn("input_all".into()));
         env.define_builtin("load_weights_bin", Value::BuiltinFn("load_weights_bin".into()));
+        env.define_builtin("mmap_weights", Value::BuiltinFn("mmap_weights".into()));
         env.define_builtin("to_char", Value::BuiltinFn("to_char".into()));
         env
 

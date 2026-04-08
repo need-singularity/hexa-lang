@@ -1082,6 +1082,7 @@ impl VM {
                     Value::Atomic(_) => "atomic",
                     Value::Pointer(_) => "pointer",
                     Value::BigInt(_) => "bigint",
+                    Value::Tensor(_) => "tensor",
                 };
                 Ok(Value::Str(type_name.to_string()))
             }
