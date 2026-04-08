@@ -1,7 +1,11 @@
+// ⛔ CORE — L0 불변식 (렉서 토큰화. 수정 전 유저 승인 필수)
 use crate::token::{Token, Spanned, keyword_from_str};
 
+/// Byte-based lexer: operates on &[u8] directly instead of Vec<char>.
+/// ASCII-only hot paths (operators, digits, whitespace) avoid char conversion.
+/// ~4x less memory, better L1d cache utilization.
 pub struct Lexer {
-    source: Vec<char>,
+    source: Vec<u8>,
     pos: usize,
     line: usize,
     col: usize,
@@ -10,7 +14,7 @@ pub struct Lexer {
 impl Lexer {
     pub fn new(source: &str) -> Self {
         Lexer {
-            source: source.chars().collect(),
+            source: source.as_bytes().to_vec(),
             pos: 0,
             line: 1,
             col: 1,
@@ -35,32 +39,87 @@ impl Lexer {
         self.tokenize().map(|v| v.into_iter().map(|s| s.token).collect())
     }
 
-    fn peek(&self) -> Option<char> {
+    #[inline(always)]
+    fn peek_byte(&self) -> Option<u8> {
         self.source.get(self.pos).copied()
     }
 
-    fn peek_ahead(&self, offset: usize) -> Option<char> {
+    #[inline(always)]
+    fn peek_byte_ahead(&self, offset: usize) -> Option<u8> {
         self.source.get(self.pos + offset).copied()
     }
 
+    /// Peek as char (for non-ASCII compatibility).
+    fn peek(&self) -> Option<char> {
+        if self.pos >= self.source.len() { return None; }
+        let b = self.source[self.pos];
+        if b < 128 {
+            Some(b as char)
+        } else {
+            // Multi-byte UTF-8: decode from current position
+            let rest = &self.source[self.pos..];
+            std::str::from_utf8(rest).ok().and_then(|s| s.chars().next())
+        }
+    }
+
+    fn peek_ahead(&self, offset: usize) -> Option<char> {
+        // For ASCII fast path (used only in number/operator lookahead)
+        if let Some(b) = self.source.get(self.pos + offset) {
+            if *b < 128 { return Some(*b as char); }
+        }
+        None
+    }
+
+    #[inline(always)]
+    fn advance_byte(&mut self) -> Option<u8> {
+        if self.pos >= self.source.len() { return None; }
+        let b = self.source[self.pos];
+        self.pos += 1;
+        if b == b'\n' {
+            self.line += 1;
+            self.col = 1;
+        } else {
+            self.col += 1;
+        }
+        Some(b)
+    }
+
+    /// Advance one logical character (handles multi-byte UTF-8).
     fn advance(&mut self) -> Option<char> {
-        let ch = self.source.get(self.pos).copied();
-        if let Some(c) = ch {
+        if self.pos >= self.source.len() { return None; }
+        let b = self.source[self.pos];
+        if b < 128 {
             self.pos += 1;
-            if c == '\n' {
+            if b == b'\n' {
                 self.line += 1;
                 self.col = 1;
             } else {
                 self.col += 1;
             }
+            Some(b as char)
+        } else {
+            let rest = &self.source[self.pos..];
+            if let Ok(s) = std::str::from_utf8(rest) {
+                if let Some(c) = s.chars().next() {
+                    self.pos += c.len_utf8();
+                    self.col += 1;
+                    return Some(c);
+                }
+            }
+            // Invalid UTF-8: skip byte
+            self.pos += 1;
+            self.col += 1;
+            None
         }
-        ch
     }
 
+    #[inline(always)]
     fn skip_whitespace(&mut self) {
-        while let Some(c) = self.peek() {
-            if c == ' ' || c == '\t' || c == '\r' {
-                self.advance();
+        while self.pos < self.source.len() {
+            let b = self.source[self.pos];
+            if b == b' ' || b == b'\t' || b == b'\r' {
+                self.pos += 1;
+                self.col += 1;
             } else {
                 break;
             }
@@ -68,51 +127,93 @@ impl Lexer {
     }
 
     fn skip_line_comment(&mut self) {
-        while let Some(c) = self.peek() {
-            if c == '\n' {
+        while self.pos < self.source.len() {
+            if self.source[self.pos] == b'\n' {
                 break;
             }
-            self.advance();
+            self.pos += 1;
+            self.col += 1;
         }
     }
 
+    /// Read an identifier as bytes, convert to String at the end (one allocation).
     fn read_ident(&mut self) -> String {
-        let mut s = String::new();
-        while let Some(c) = self.peek() {
-            if c.is_alphanumeric() || c == '_' {
-                s.push(c);
-                self.advance();
+        let start = self.pos;
+        while self.pos < self.source.len() {
+            let b = self.source[self.pos];
+            if b.is_ascii_alphanumeric() || b == b'_' {
+                self.pos += 1;
+                self.col += 1;
+            } else if b >= 128 {
+                // Multi-byte UTF-8 char in identifier
+                let rest = &self.source[self.pos..];
+                if let Ok(s) = std::str::from_utf8(rest) {
+                    if let Some(c) = s.chars().next() {
+                        if c.is_alphanumeric() || c == '_' {
+                            self.pos += c.len_utf8();
+                            self.col += 1;
+                            continue;
+                        }
+                    }
+                }
+                break;
             } else {
                 break;
             }
         }
-        s
+        // SAFETY: source was valid UTF-8 originally, and we only advanced by valid char boundaries
+        String::from_utf8(self.source[start..self.pos].to_vec()).unwrap_or_default()
     }
 
     fn read_number(&mut self) -> Token {
         let mut s = String::new();
         let mut is_float = false;
 
-        while let Some(c) = self.peek() {
-            if c.is_ascii_digit() {
-                s.push(c);
-                self.advance();
-            } else if c == '.' && !is_float {
+        while self.pos < self.source.len() {
+            let b = self.source[self.pos];
+            if b.is_ascii_digit() {
+                s.push(b as char);
+                self.pos += 1;
+                self.col += 1;
+            } else if b == b'.' && !is_float {
                 // Check next char: if digit, it's a float; if '.', it's range operator
-                if let Some(next) = self.peek_ahead(1) {
+                if let Some(&next) = self.source.get(self.pos + 1) {
                     if next.is_ascii_digit() {
                         is_float = true;
-                        s.push(c);
-                        self.advance();
+                        s.push('.');
+                        self.pos += 1;
+                        self.col += 1;
                     } else {
                         break;
                     }
                 } else {
                     break;
                 }
-            } else if c == '_' {
+            } else if b == b'_' {
                 // Allow underscores in numbers (visual separator)
-                self.advance();
+                self.pos += 1;
+                self.col += 1;
+            } else if (b == b'e' || b == b'E') && !s.is_empty() {
+                // Scientific notation: 1e10, 1.5e-3, 2E+8
+                is_float = true;
+                s.push(b as char);
+                self.pos += 1;
+                self.col += 1;
+                // optional +/- after e
+                if let Some(&sign) = self.source.get(self.pos) {
+                    if sign == b'+' || sign == b'-' {
+                        s.push(sign as char);
+                        self.pos += 1;
+                        self.col += 1;
+                    }
+                }
+                // consume exponent digits
+                while self.pos < self.source.len() && self.source[self.pos].is_ascii_digit() {
+                    s.push(self.source[self.pos] as char);
+                    self.pos += 1;
+                    self.col += 1;
+                }
+                break;
             } else {
                 break;
             }
@@ -127,7 +228,7 @@ impl Lexer {
 
     fn read_string(&mut self) -> Result<String, String> {
         // Skip opening quote
-        self.advance();
+        self.advance_byte();
         let mut s = String::new();
         loop {
             match self.advance() {
@@ -140,6 +241,13 @@ impl Lexer {
                         Some('\\') => s.push('\\'),
                         Some('"') => s.push('"'),
                         Some('0') => s.push('\0'),
+                        Some('x') => {
+                            let h1 = self.advance().ok_or_else(|| format!("line {}:{}: incomplete \\x escape", self.line, self.col))?;
+                            let h2 = self.advance().ok_or_else(|| format!("line {}:{}: incomplete \\x escape", self.line, self.col))?;
+                            let hex_str = format!("{}{}", h1, h2);
+                            let code = u8::from_str_radix(&hex_str, 16).map_err(|_| format!("line {}:{}: invalid hex escape \\x{}", self.line, self.col, hex_str))?;
+                            s.push(code as char);
+                        }
                         Some(c) => return Err(format!("line {}:{}: unknown escape \\{}", self.line, self.col, c)),
                         None => return Err(format!("line {}:{}: unterminated string escape", self.line, self.col)),
                     }
@@ -152,7 +260,7 @@ impl Lexer {
 
     fn read_char_lit(&mut self) -> Result<char, String> {
         // Skip opening quote
-        self.advance();
+        self.advance_byte();
         let ch = match self.advance() {
             Some('\\') => {
                 match self.advance() {
@@ -162,6 +270,12 @@ impl Lexer {
                     Some('\\') => '\\',
                     Some('\'') => '\'',
                     Some('0') => '\0',
+                    Some('x') => {
+                        let h1 = self.advance().ok_or_else(|| format!("line {}:{}: incomplete \\x escape", self.line, self.col))?;
+                        let h2 = self.advance().ok_or_else(|| format!("line {}:{}: incomplete \\x escape", self.line, self.col))?;
+                        let hex_str = format!("{}{}", h1, h2);
+                        u8::from_str_radix(&hex_str, 16).map_err(|_| format!("line {}:{}: invalid hex escape \\x{}", self.line, self.col, hex_str))? as char
+                    }
                     Some(c) => return Err(format!("line {}:{}: unknown char escape \\{}", self.line, self.col, c)),
                     None => return Err(format!("line {}:{}: unterminated char literal", self.line, self.col)),
                 }
@@ -176,185 +290,205 @@ impl Lexer {
     }
 
     fn next_token_spanned(&mut self) -> Result<(Token, usize, usize), String> {
-        // Skip whitespace first, then record position for the actual token
         self.skip_whitespace();
         let line = self.line;
         let col = self.col;
-        let tok = self.next_token()?;
+        let tok = self.next_token_inner()?;
         Ok((tok, line, col))
     }
 
     fn next_token(&mut self) -> Result<Token, String> {
         self.skip_whitespace();
+        self.next_token_inner()
+    }
 
-        let ch = match self.peek() {
-            Some(c) => c,
+    fn next_token_inner(&mut self) -> Result<Token, String> {
+
+        let b = match self.peek_byte() {
+            Some(b) => b,
             None => return Ok(Token::Eof),
         };
 
-        // Comments
-        if ch == '/' {
-            if self.peek_ahead(1) == Some('/') {
+        // Comments (ASCII fast path)
+        if b == b'/' {
+            if self.peek_byte_ahead(1) == Some(b'/') {
                 self.skip_line_comment();
-                return self.next_token();
+                return self.next_token_inner();
             }
         }
 
         // Newline
-        if ch == '\n' {
-            self.advance();
+        if b == b'\n' {
+            self.pos += 1;
+            self.line += 1;
+            self.col = 1;
             return Ok(Token::Newline);
         }
 
-        // Dollar sign (used in macros): $ is its own token
-        if ch == '$' {
-            self.advance();
-            return Ok(Token::Ident("$".to_string()));
+        // Dollar sign
+        if b == b'$' {
+            self.pos += 1;
+            self.col += 1;
+            return Ok(Token::Ident("$".into()));
         }
 
         // Hash-brace: #{ for map literals
-        if ch == '#' {
-            if self.peek_ahead(1) == Some('{') {
-                self.advance(); // consume #
-                self.advance(); // consume {
+        if b == b'#' {
+            if self.peek_byte_ahead(1) == Some(b'{') {
+                self.pos += 2;
+                self.col += 2;
                 return Ok(Token::HashLBrace);
             }
         }
 
-        // At-sign attributes: @evolve, etc.
-        if ch == '@' {
-            self.advance();
-            if self.peek().map_or(false, |c| c.is_alphabetic() || c == '_') {
+        // At-sign → first-class Attribute token (AI-native)
+        if b == b'@' {
+            self.pos += 1;
+            self.col += 1;
+            if self.peek_byte().map_or(false, |b| b.is_ascii_alphabetic() || b == b'_' || b >= 128) {
                 let ident = self.read_ident();
-                return Ok(Token::Ident(format!("@{}", ident)));
+                return Ok(Token::Attribute(ident.into()));
             }
-            return Ok(Token::Ident("@".to_string()));
+            return Ok(Token::Attribute("".into()));
         }
 
-        // Identifiers and keywords
-        if ch.is_alphabetic() || ch == '_' {
+        // Identifiers and keywords (ASCII fast path)
+        if b.is_ascii_alphabetic() || b == b'_' {
             let ident = self.read_ident();
             if let Some(kw) = keyword_from_str(&ident) {
                 return Ok(kw);
             }
-            return Ok(Token::Ident(ident));
+            return Ok(Token::Ident(ident.into()));
+        }
+        // Non-ASCII identifier start
+        if b >= 128 {
+            if let Some(c) = self.peek() {
+                if c.is_alphabetic() {
+                    let ident = self.read_ident();
+                    if let Some(kw) = keyword_from_str(&ident) {
+                        return Ok(kw);
+                    }
+                    return Ok(Token::Ident(ident.into()));
+                }
+            }
         }
 
         // Numbers
-        if ch.is_ascii_digit() {
+        if b.is_ascii_digit() {
             return Ok(self.read_number());
         }
 
         // String literal
-        if ch == '"' {
+        if b == b'"' {
             let s = self.read_string()?;
-            return Ok(Token::StringLit(s));
+            return Ok(Token::StringLit(s.into()));
         }
 
         // Char literal
-        if ch == '\'' {
+        if b == b'\'' {
             let c = self.read_char_lit()?;
             return Ok(Token::CharLit(c));
         }
 
-        // Operators and delimiters
-        self.advance();
-        match ch {
-            '+' => Ok(Token::Plus),
-            '*' => {
-                if self.peek() == Some('*') {
-                    self.advance();
+        // Operators and delimiters (pure byte matching — no char conversion)
+        self.pos += 1;
+        self.col += 1;
+        match b {
+            b'+' => Ok(Token::Plus),
+            b'*' => {
+                if self.peek_byte() == Some(b'*') {
+                    self.pos += 1; self.col += 1;
                     Ok(Token::Power)
                 } else {
                     Ok(Token::Star)
                 }
             }
-            '%' => Ok(Token::Percent),
-            '-' => {
-                if self.peek() == Some('>') {
-                    self.advance();
+            b'%' => Ok(Token::Percent),
+            b'-' => {
+                if self.peek_byte() == Some(b'>') {
+                    self.pos += 1; self.col += 1;
                     Ok(Token::Arrow)
                 } else {
                     Ok(Token::Minus)
                 }
             }
-            '/' => Ok(Token::Slash),
-            '=' => {
-                if self.peek() == Some('=') {
-                    self.advance();
+            b'/' => Ok(Token::Slash),
+            b'=' => {
+                if self.peek_byte() == Some(b'=') {
+                    self.pos += 1; self.col += 1;
                     Ok(Token::EqEq)
-                } else if self.peek() == Some('>') {
-                    self.advance();
+                } else if self.peek_byte() == Some(b'>') {
+                    self.pos += 1; self.col += 1;
                     Ok(Token::FatArrow)
                 } else {
                     Ok(Token::Eq)
                 }
             }
-            '!' => {
-                if self.peek() == Some('=') {
-                    self.advance();
+            b'!' => {
+                if self.peek_byte() == Some(b'=') {
+                    self.pos += 1; self.col += 1;
                     Ok(Token::NotEq)
                 } else {
                     Ok(Token::Not)
                 }
             }
-            '<' => {
-                if self.peek() == Some('=') {
-                    self.advance();
+            b'<' => {
+                if self.peek_byte() == Some(b'=') {
+                    self.pos += 1; self.col += 1;
                     Ok(Token::LtEq)
                 } else {
                     Ok(Token::Lt)
                 }
             }
-            '>' => {
-                if self.peek() == Some('=') {
-                    self.advance();
+            b'>' => {
+                if self.peek_byte() == Some(b'=') {
+                    self.pos += 1; self.col += 1;
                     Ok(Token::GtEq)
                 } else {
                     Ok(Token::Gt)
                 }
             }
-            '&' => {
-                if self.peek() == Some('&') {
-                    self.advance();
+            b'&' => {
+                if self.peek_byte() == Some(b'&') {
+                    self.pos += 1; self.col += 1;
                     Ok(Token::And)
                 } else {
                     Ok(Token::BitAnd)
                 }
             }
-            '|' => {
-                if self.peek() == Some('|') {
-                    self.advance();
+            b'|' => {
+                if self.peek_byte() == Some(b'|') {
+                    self.pos += 1; self.col += 1;
                     Ok(Token::Or)
                 } else {
                     Ok(Token::BitOr)
                 }
             }
-            '^' => {
-                if self.peek() == Some('^') {
-                    self.advance();
+            b'^' => {
+                if self.peek_byte() == Some(b'^') {
+                    self.pos += 1; self.col += 1;
                     Ok(Token::Xor)
                 } else {
                     Ok(Token::BitXor)
                 }
             }
-            '~' => Ok(Token::BitNot),
-            ':' => {
-                if self.peek() == Some('=') {
-                    self.advance();
+            b'~' => Ok(Token::BitNot),
+            b':' => {
+                if self.peek_byte() == Some(b'=') {
+                    self.pos += 1; self.col += 1;
                     Ok(Token::ColonEq)
-                } else if self.peek() == Some(':') {
-                    self.advance();
+                } else if self.peek_byte() == Some(b':') {
+                    self.pos += 1; self.col += 1;
                     Ok(Token::ColonColon)
                 } else {
                     Ok(Token::Colon)
                 }
             }
-            '.' => {
-                if self.peek() == Some('.') {
-                    self.advance();
-                    if self.peek() == Some('=') {
-                        self.advance();
+            b'.' => {
+                if self.peek_byte() == Some(b'.') {
+                    self.pos += 1; self.col += 1;
+                    if self.peek_byte() == Some(b'=') {
+                        self.pos += 1; self.col += 1;
                         Ok(Token::DotDotEq)
                     } else {
                         Ok(Token::DotDot)
@@ -363,15 +497,15 @@ impl Lexer {
                     Ok(Token::Dot)
                 }
             }
-            '(' => Ok(Token::LParen),
-            ')' => Ok(Token::RParen),
-            '{' => Ok(Token::LBrace),
-            '}' => Ok(Token::RBrace),
-            '[' => Ok(Token::LBracket),
-            ']' => Ok(Token::RBracket),
-            ',' => Ok(Token::Comma),
-            ';' => Ok(Token::Semicolon),
-            _ => Err(format!("line {}:{}: unexpected character '{}'", self.line, self.col, ch)),
+            b'(' => Ok(Token::LParen),
+            b')' => Ok(Token::RParen),
+            b'{' => Ok(Token::LBrace),
+            b'}' => Ok(Token::RBrace),
+            b'[' => Ok(Token::LBracket),
+            b']' => Ok(Token::RBracket),
+            b',' => Ok(Token::Comma),
+            b';' => Ok(Token::Semicolon),
+            _ => Err(format!("line {}:{}: unexpected character '{}'", self.line, self.col, b as char)),
         }
     }
 }
@@ -460,15 +594,25 @@ mod tests {
     fn test_lex_at_evolve_token() {
         let mut lexer = Lexer::new("@evolve fn");
         let tokens = lexer.tokenize_plain().unwrap();
-        assert_eq!(tokens[0], Token::Ident("@evolve".to_string()));
+        assert_eq!(tokens[0], Token::Attribute("evolve".into()));
         assert_eq!(tokens[1], Token::Fn);
+    }
+
+    #[test]
+    fn test_lex_ai_native_attrs() {
+        let mut lexer = Lexer::new("@pure @inline @parallel @hot @cold @memoize @simd @bounded");
+        let tokens = lexer.tokenize_plain().unwrap();
+        let names = ["pure","inline","parallel","hot","cold","memoize","simd","bounded"];
+        for (i, name) in names.iter().enumerate() {
+            assert_eq!(tokens[i], Token::Attribute((*name).into()));
+        }
     }
 
     #[test]
     fn test_lex_consciousness_as_ident() {
         let mut lexer = Lexer::new("consciousness \"test\"");
         let tokens = lexer.tokenize_plain().unwrap();
-        assert_eq!(tokens[0], Token::Ident("consciousness".to_string()));
-        assert_eq!(tokens[1], Token::StringLit("test".to_string()));
+        assert_eq!(tokens[0], Token::Ident("consciousness".into()));
+        assert_eq!(tokens[1], Token::StringLit("test".into()));
     }
 }

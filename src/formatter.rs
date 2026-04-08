@@ -272,6 +272,16 @@ fn format_stmt(stmt: &Stmt, indent: usize) -> String {
         Stmt::Theorem(name, _) => {
             format!("{}theorem {} {{ ... }}", prefix, name)
         }
+        Stmt::Break => format!("{}break", prefix),
+        Stmt::Continue => format!("{}continue", prefix),
+        Stmt::LetTuple(names, expr) => format!("{}let ({}) = {}", prefix, names.join(", "), format_expr(expr)),        Stmt::Extern(decl) => {
+            let params: Vec<String> = decl.params.iter()
+                .map(|p| format!("{}: {}", p.name, p.typ))
+                .collect();
+            let ret = decl.ret_type.as_deref().map(|r| format!(" -> {}", r)).unwrap_or_default();
+            let link = decl.link_lib.as_deref().map(|l| format!("@link(\"{}\") ", l)).unwrap_or_default();
+            format!("{}{}extern fn {}({}){}", prefix, link, decl.name, params.join(", "), ret)
+        }
     }
 }
 
@@ -386,6 +396,13 @@ fn format_expr(expr: &Expr) -> String {
             }
         }
         Expr::Wildcard => "_".to_string(),
+        Expr::ArrayPattern(pats, rest) => {
+            let mut parts: Vec<String> = pats.iter().map(|p| format_expr(p)).collect();
+            if let Some(name) = rest {
+                parts.push(format!("...{}", name));
+            }
+            format!("[{}]", parts.join(", "))
+        }
         Expr::Own(inner) => format!("own {}", format_expr(inner)),
         Expr::MoveExpr(inner) => format!("move {}", format_expr(inner)),
         Expr::Borrow(inner) => format!("borrow {}", format_expr(inner)),
@@ -401,6 +418,8 @@ fn format_expr(expr: &Expr) -> String {
         Expr::Resume(inner) => format!("resume({})", format_expr(inner)),
         Expr::DynCast(trait_name, expr) => format!("dyn {}({})", trait_name, format_expr(expr)),
         Expr::Yield(inner) => format!("yield {}", format_expr(inner)),
+        Expr::Template(_) => "<template>".to_string(),
+        Expr::TryCatch(_, var, _) => format!("try {{ ... }} catch {} {{ ... }}", var),
     }
 }
 

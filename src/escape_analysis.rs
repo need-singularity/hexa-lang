@@ -322,6 +322,7 @@ fn collect_escaping_names(expr: &Expr, escaped: &mut HashSet<String>, ctx: &Esca
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::ast::*;
 
     fn make_let_struct(name: &str, struct_name: &str) -> Stmt {
@@ -445,12 +446,15 @@ mod tests {
                 params: vec![],
                 ret_type: None,
                 where_clauses: vec![],
+                precondition: None,
+                postcondition: None,
                 body: vec![
                     make_let_struct("p", "Point"),
                     make_return("p"),
                 ],
                 vis: Visibility::Private,
                 is_pure: false,
+                attrs: vec![],
             }),
         ];
         let map = analyze_program(&stmts);

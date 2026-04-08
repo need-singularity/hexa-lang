@@ -151,7 +151,7 @@ fn builtin_log_get_entries(_interp: &mut Interpreter, _args: Vec<Value>) -> Resu
         m.insert("level".into(), Value::Str(e.level.as_str().to_string()));
         m.insert("message".into(), Value::Str(e.message.clone()));
         m.insert("timestamp".into(), Value::Int(e.timestamp as i64));
-        Value::Map(m)
+        Value::Map(Box::new(m))
     }).collect();
     Ok(Value::Array(entries))
 }

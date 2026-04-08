@@ -242,9 +242,11 @@ impl<'a> PgoCtx<'a> {
                     params: decl.params.clone(),
                     ret_type: decl.ret_type.clone(),
                     where_clauses: decl.where_clauses.clone(),
+                    precondition: decl.precondition.clone(),
+                    postcondition: decl.postcondition.clone(),
                     body,
                     vis: decl.vis.clone(),
-                    is_pure: decl.is_pure,
+                    is_pure: decl.is_pure, attrs: decl.attrs.clone(),
                 })
             }
             Stmt::While(cond, body) => {

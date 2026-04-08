@@ -243,7 +243,7 @@ fn builtin_http_serve(interp: &mut Interpreter, args: Vec<Value>) -> Result<Valu
 
     // Verify callable
     match &handler {
-        Value::Fn(..) | Value::Lambda(..) | Value::BuiltinFn(_) => {}
+        Value::Fn(_) | Value::Lambda(_) | Value::BuiltinFn(_) => {}
         _ => return Err(type_err(interp, "http_serve() second argument must be a function".into())),
     }
 
@@ -267,7 +267,7 @@ fn builtin_http_serve(interp: &mut Interpreter, args: Vec<Value>) -> Result<Valu
         };
 
         // Call the handler
-        let request_val = Value::Map(request_map);
+        let request_val = Value::Map(Box::new(request_map));
         let response = interp.call_function(handler.clone(), vec![request_val])?;
 
         let response_str = match &response {
@@ -336,7 +336,7 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HashMap<String, Value>, s
     let mut map = HashMap::new();
     map.insert("method".into(), Value::Str(method));
     map.insert("path".into(), Value::Str(path));
-    map.insert("headers".into(), Value::Map(headers));
+    map.insert("headers".into(), Value::Map(Box::new(headers)));
     map.insert("body".into(), Value::Str(body));
     Ok(map)
 }
@@ -371,7 +371,7 @@ pub fn parse_http_request_string(raw: &str) -> HashMap<String, Value> {
     let mut map = HashMap::new();
     map.insert("method".into(), Value::Str(method));
     map.insert("path".into(), Value::Str(path));
-    map.insert("headers".into(), Value::Map(headers));
+    map.insert("headers".into(), Value::Map(Box::new(headers)));
     map.insert("body".into(), Value::Str(body_lines.join("\n")));
     map
 }
@@ -482,5 +482,55 @@ mod tests {
             Some(Value::Str(s)) => assert!(s.is_empty()),
             other => panic!("expected empty body, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_http_serve_roundtrip() {
+        use std::thread;
+
+        // Bind to port 0 to get a random available port
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Server thread: accept one connection, parse request, send response
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let req = read_http_request(&mut stream).unwrap();
+
+            // Verify parsed request fields
+            match req.get("method") {
+                Some(Value::Str(s)) => assert_eq!(s, "GET"),
+                other => panic!("expected method=GET, got {:?}", other),
+            }
+            match req.get("path") {
+                Some(Value::Str(s)) => assert_eq!(s, "/hello"),
+                other => panic!("expected path=/hello, got {:?}", other),
+            }
+
+            // Write HTTP response
+            let body = "Hello from test!";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            let _ = stream.shutdown(Shutdown::Both);
+        });
+
+        // Client: send an HTTP GET request
+        let mut client = TcpStream::connect(addr).unwrap();
+        let request = "GET /hello HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+        client.write_all(request.as_bytes()).unwrap();
+        client.flush().unwrap();
+
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+
+        assert!(response.contains("200 OK"), "expected 200 OK in response");
+        assert!(response.contains("Hello from test!"), "expected body in response");
+
+        server.join().unwrap();
     }
 }

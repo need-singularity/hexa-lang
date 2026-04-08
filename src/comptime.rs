@@ -5,6 +5,7 @@
 //! string ops, arrays, maps, control flow, and user-defined pure functions.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use crate::ast::*;
 use crate::env::Value;
 use crate::error::{HexaError, ErrorClass};
@@ -12,8 +13,8 @@ use crate::interpreter::Interpreter;
 
 /// Names of built-in functions that are forbidden inside comptime contexts.
 const FORBIDDEN_BUILTINS: &[&str] = &[
-    "print", "println", "read_file", "write_file", "input",
-    "sleep", "channel", "spawn", "exit",
+    "print", "println", "read_file", "write_file", "delete_file", "append_file", "input",
+    "sleep", "channel", "spawn", "exit", "exec", "exec_with_status", "readline",
     // std::fs
     "fs_read", "fs_write", "fs_append", "fs_exists", "fs_remove",
     "fs_mkdir", "fs_list", "fs_copy", "fs_move", "fs_metadata",
@@ -48,7 +49,7 @@ pub fn eval_comptime(
     for (name, (params, body)) in comptime_fns {
         interp.env.define(
             name,
-            Value::Fn(name.clone(), params.clone(), body.clone()),
+            Value::Fn(Box::new((name.clone(), params.clone(), Arc::new(body.clone())))),
         );
     }
 

@@ -16,7 +16,7 @@
 //! pause execution and wait for a DAP command.
 
 use std::collections::HashMap;
-use std::io::{self, Write};
+use std::io::{self};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
@@ -221,16 +221,14 @@ impl DebugHook {
     fn snapshot_variables(&mut self, env: &crate::env::Env) {
         self.variable_snapshot.clear();
         // Walk scopes from innermost to outermost, collecting variables
-        for scope in env.scopes.iter().rev() {
-            for (name, val) in scope {
-                // Skip builtins (functions defined in the global scope)
-                if matches!(val, Value::BuiltinFn(_)) {
-                    continue;
-                }
-                let type_str = value_type_name(val);
-                let val_str = format!("{}", val);
-                self.variable_snapshot.push((name.clone(), val_str, type_str));
+        for (name, val) in env.vars_iter().rev() {
+            // Skip builtins (functions defined in the global scope)
+            if matches!(val, Value::BuiltinFn(_)) {
+                continue;
             }
+            let type_str = value_type_name(val);
+            let val_str = format!("{}", val);
+            self.variable_snapshot.push((name.clone(), val_str, type_str));
         }
     }
 }
@@ -250,13 +248,13 @@ fn value_type_name(val: &Value) -> String {
             format!("[{}; {}]", elem_type, a.len())
         }
         Value::Tuple(t) => format!("({})", t.iter().map(|v| value_type_name(v)).collect::<Vec<_>>().join(", ")),
-        Value::Fn(name, ..) => format!("fn {}", name),
+        Value::Fn(inner) => format!("fn {}", inner.0),
         Value::BuiltinFn(name) => format!("builtin {}", name),
         Value::Struct(name, _) => name.clone(),
-        Value::Lambda(..) => "lambda".into(),
+        Value::Lambda(_) => "lambda".into(),
         Value::Map(_) => "map".into(),
         Value::Error(_) => "error".into(),
-        Value::EnumVariant(name, variant, _) => format!("{}::{}", name, variant),
+        Value::EnumVariant(ev) => format!("{}::{}", ev.0, ev.1),
         Value::Intent(_) => "intent".into(),
         #[cfg(not(target_arch = "wasm32"))]
         Value::Sender(_) => "sender".into(),
@@ -270,9 +268,10 @@ fn value_type_name(val: &Value) -> String {
         Value::TcpListener(_) => "tcp_listener".into(),
         #[cfg(not(target_arch = "wasm32"))]
         Value::TcpStream(_) => "tcp_stream".into(),
-        Value::EffectRequest(..) => "effect_request".into(),
-        Value::TraitObject { trait_name, .. } => format!("dyn {}", trait_name),
+        Value::EffectRequest(_) => "effect_request".into(),
+        Value::TraitObject(to) => format!("dyn {}", to.trait_name),
         Value::Atomic(_) => "atomic".into(),
+        Value::Pointer(addr) => format!("<ptr 0x{:x}>", addr),
     }
 }
 

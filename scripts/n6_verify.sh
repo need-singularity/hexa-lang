@@ -6,7 +6,7 @@
 set -e
 cd "$(dirname "$0")/.."
 
-N6="${HOME}/Dev/n6-architecture/tools/nexus6/target/release/nexus6"
+N6="${HOME}/Dev/n6-architecture/tools/nexus/target/release/nexus"
 STRICT="${1:-}"
 ERRORS=0
 WARNINGS=0
@@ -154,7 +154,7 @@ MODULES=$(count_modules)
 STDLIB=$(count_stdlib)
 
 verify "|Stmt-Expr|"      "$EXPR_STMT_DIFF" 8   "sigma-tau"
-# std_nexus6 추가로 12 = sigma(6) EXACT 승격!
+# std_nexus 추가로 12 = sigma(6) EXACT 승격!
 verify "Stdlib modules"   "$STDLIB"     12  "sigma(6)"
 
 echo ""
@@ -164,9 +164,9 @@ if [ -x "$N6" ]; then
     for val in 12 8 4 6 24; do
         RESULT=$($N6 verify "$val" 2>&1 | grep "Match:" | awk '{print $NF}')
         if [ "$RESULT" = "(EXACT)" ]; then
-            echo -e "  ${GREEN}✓${NC} nexus6 verify ${val}: EXACT"
+            echo -e "  ${GREEN}✓${NC} nexus verify ${val}: EXACT"
         else
-            echo -e "  ${YELLOW}⚠${NC} nexus6 verify ${val}: ${RESULT}"
+            echo -e "  ${YELLOW}⚠${NC} nexus verify ${val}: ${RESULT}"
         fi
     done
 else

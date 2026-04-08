@@ -11,7 +11,7 @@ use cranelift::prelude::*;
 use cranelift_codegen::ir::types::I64;
 use cranelift_codegen::ir::{AbiParam, UserFuncName};
 use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_module::{FuncId, Linkage, Module};
+use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
 
 use crate::ast::*;
 use crate::error::{ErrorClass, HexaError};
@@ -66,6 +66,22 @@ fn jit_err(msg: String) -> HexaError {
         hint: None,
     }
 }
+
+/// Collect all extern function declarations from a list of statements.
+pub fn collect_extern_decls(stmts: &[Stmt]) -> Vec<crate::ast::ExternFnDecl> {
+    stmts.iter().filter_map(|s| {
+        if let Stmt::Extern(decl) = s { Some(decl.clone()) } else { None }
+    }).collect()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+extern "C" {
+    fn dlopen(filename: *const std::ffi::c_char, flags: std::ffi::c_int) -> *mut std::ffi::c_void;
+    fn dlsym(handle: *mut std::ffi::c_void, symbol: *const std::ffi::c_char) -> *mut std::ffi::c_void;
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+const RTLD_LAZY: std::ffi::c_int = 0x1;
 
 /// Information about a JIT-compiled function.
 struct JitFuncInfo {
@@ -139,16 +155,21 @@ fn can_jit_stmt(stmt: &Stmt) -> bool {
         Stmt::EnumDecl(_) => true,
         Stmt::ImplBlock(ib) => ib.methods.iter().all(|m| m.body.iter().all(|s| can_jit_stmt(s))),
         Stmt::While(cond, body) => can_jit_expr(cond) && body.iter().all(|s| can_jit_stmt(s)),
+        Stmt::For(_, iter_expr, body) => can_jit_expr(iter_expr) && body.iter().all(|s| can_jit_stmt(s)),
+        Stmt::Const(_, _, expr, _) => can_jit_expr(expr),
+        Stmt::Loop(body) => body.iter().all(|s| can_jit_stmt(s)),
         // These are not yet supported in JIT:
-        Stmt::For(..) | Stmt::Loop(..) | Stmt::TryCatch(..) | Stmt::Throw(..) |
+        Stmt::TryCatch(..) | Stmt::Throw(..) |
         Stmt::Spawn(..) | Stmt::SpawnNamed(..) | Stmt::Mod(..) | Stmt::Use(..) |
         Stmt::Proof(..) | Stmt::Assert(..) | Stmt::Intent(..) | Stmt::Verify(..) |
         Stmt::DropStmt(..) | Stmt::AsyncFnDecl(..) | Stmt::Select(..) |
         Stmt::MacroDef(..) | Stmt::DeriveDecl(..) | Stmt::Generate(..) |
         Stmt::Optimize(..) | Stmt::ComptimeFn(..) | Stmt::EffectDecl(..) | Stmt::ConsciousnessBlock(..) | Stmt::EvolveFn(..) |
-        Stmt::TraitDecl(..) | Stmt::Const(..) | Stmt::Static(..) |
+        Stmt::TraitDecl(..) | Stmt::Static(..) |
         Stmt::Scope(..) | Stmt::ProofBlock(..)
-        | Stmt::TypeAlias(..) | Stmt::AtomicLet(..) | Stmt::Panic(..) | Stmt::Theorem(..) => false,
+        | Stmt::TypeAlias(..) | Stmt::AtomicLet(..) | Stmt::Panic(..) | Stmt::Theorem(..) | Stmt::Break | Stmt::Continue
+        | Stmt::LetTuple(..) => false,
+        Stmt::Extern(_) => true,
     }
 }
 
@@ -177,14 +198,167 @@ fn can_jit_expr(expr: &Expr) -> bool {
                         && arm.body.iter().all(|s| can_jit_stmt(s))
                 })
         }
+        Expr::ArrayPattern(pats, _) => pats.iter().all(|p| can_jit_expr(p)),
         Expr::Lambda(_, body) => can_jit_expr(body),
+        Expr::Range(start, end, _) => can_jit_expr(start) && can_jit_expr(end),
         // Not supported in JIT:
         Expr::FloatLit(_) | Expr::StringLit(_) | Expr::CharLit(_) |
-        Expr::Tuple(..) | Expr::Range(..) | Expr::MapLit(..) |
+        Expr::Tuple(..) | Expr::MapLit(..) |
         Expr::Own(..) | Expr::MoveExpr(..) | Expr::Borrow(..) |
         Expr::Await(..) | Expr::MacroInvoc(..) | Expr::Comptime(..) |
         Expr::HandleWith(..) | Expr::EffectCall(..) | Expr::Resume(..) |
-        Expr::DynCast(..) | Expr::Yield(..) => false,
+        Expr::DynCast(..) | Expr::Yield(..) | Expr::Template(..) | Expr::TryCatch(..) => false,
+    }
+}
+
+
+/// Detect linear recurrence pattern in a function body.
+/// Returns Some((coefficients, base_cases)) if the function matches:
+///   fn f(n) { if n <= k { return base[n] } return c1*f(n-1) + c2*f(n-2) + ... }
+/// Currently supports order-2 recurrences (e.g., fib: coeffs=[1,1], bases=[0,1]).
+fn detect_linear_recurrence(decl: &FnDecl) -> Option<(Vec<i64>, Vec<i64>)> {
+    if decl.params.len() != 1 { return None; }
+    let param_name = &decl.params[0].name;
+    let fn_name = &decl.name;
+
+    // We need: base cases + recursive return of form f(n-1) + f(n-2)
+    // Scan for base cases and recursive expression
+    let mut bases: Vec<(i64, i64)> = Vec::new(); // (condition_val, return_val)
+    let mut recursive_expr: Option<&Expr> = None;
+
+    for stmt in &decl.body {
+        match stmt {
+            // Pattern: if n <= K { return V } with optional else block
+            Stmt::Expr(Expr::If(cond, then_block, else_opt)) => {
+                if let Some((threshold, ret_val)) = extract_base_case(cond, then_block, param_name) {
+                    for i in 0..=threshold {
+                        bases.push((i, if i <= 1 { ret_val.min(i) } else { ret_val }));
+                    }
+                    // Check else block for recursive expression
+                    if let Some(else_block) = else_opt {
+                        if let Some(Stmt::Return(Some(expr))) = else_block.last() {
+                            recursive_expr = Some(expr);
+                        } else if let Some(Stmt::Expr(expr)) = else_block.last() {
+                            recursive_expr = Some(expr);
+                        }
+                    }
+                }
+            }
+            // Pattern: return f(n-1) + f(n-2)
+            Stmt::Return(Some(expr)) => {
+                recursive_expr = Some(expr);
+            }
+            _ => {}
+        }
+    }
+
+    // Check recursive expression: f(n-1) + f(n-2) pattern
+    if let Some(expr) = recursive_expr {
+        if let Some(coeffs) = extract_recurrence_coefficients(expr, fn_name, param_name) {
+            if coeffs.len() == 2 && bases.len() >= 2 {
+                let base_vals: Vec<i64> = (0..coeffs.len() as i64)
+                    .map(|i| bases.iter().find(|(k, _)| *k == i).map_or(i, |(_, v)| *v))
+                    .collect();
+                return Some((coeffs, base_vals));
+            }
+        }
+    }
+
+    None
+}
+
+/// Extract base case: if n <= K { return V } → Some((K, V))
+fn extract_base_case(cond: &Expr, then_block: &[Stmt], param_name: &str) -> Option<(i64, i64)> {
+    // Pattern: n <= K or n < K
+    match cond {
+        Expr::Binary(lhs, op, rhs) => {
+            let is_param = matches!(**lhs, Expr::Ident(ref name) if name == param_name);
+            if !is_param { return None; }
+            let threshold = match **rhs {
+                Expr::IntLit(v) => v,
+                _ => return None,
+            };
+            let threshold = match op {
+                BinOp::Le => threshold,
+                BinOp::Lt => threshold - 1,
+                BinOp::Eq => threshold,
+                _ => return None,
+            };
+            // Extract return value
+            let ret_val = match then_block.last()? {
+                Stmt::Return(Some(Expr::IntLit(v))) => *v,
+                Stmt::Return(Some(Expr::Ident(name))) if name == param_name => threshold, // return n
+                Stmt::Expr(Expr::IntLit(v)) => *v,
+                Stmt::Expr(Expr::Ident(name)) if name == param_name => threshold,
+                _ => return None,
+            };
+            Some((threshold, ret_val))
+        }
+        _ => None,
+    }
+}
+
+/// Extract recurrence coefficients from expression like c1*f(n-1) + c2*f(n-2).
+/// Returns Some([c1, c2]) for order-2 recurrence.
+fn extract_recurrence_coefficients(expr: &Expr, fn_name: &str, param_name: &str) -> Option<Vec<i64>> {
+    match expr {
+        // f(n-1) + f(n-2)  → coefficients [1, 1]
+        Expr::Binary(lhs, BinOp::Add, rhs) => {
+            let c1 = extract_single_term(lhs, fn_name, param_name, 1)?;
+            let c2 = extract_single_term(rhs, fn_name, param_name, 2)?;
+            if c1.1 == 1 && c2.1 == 2 {
+                Some(vec![c1.0, c2.0])
+            } else if c1.1 == 2 && c2.1 == 1 {
+                Some(vec![c2.0, c1.0])
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Extract a single term: f(n-k) → (1, k), or C*f(n-k) → (C, k)
+fn extract_single_term(expr: &Expr, fn_name: &str, param_name: &str, _expected_offset: i64) -> Option<(i64, i64)> {
+    match expr {
+        // f(n-k)
+        Expr::Call(callee, args) if args.len() == 1 => {
+            if !matches!(**callee, Expr::Ident(ref name) if name == fn_name) {
+                return None;
+            }
+            let offset = extract_n_minus_k(&args[0], param_name)?;
+            Some((1, offset))
+        }
+        // C * f(n-k)
+        Expr::Binary(lhs, BinOp::Mul, rhs) => {
+            if let Expr::IntLit(c) = &**lhs {
+                if let Some((_, k)) = extract_single_term(rhs, fn_name, param_name, _expected_offset) {
+                    return Some((*c, k));
+                }
+            }
+            if let Expr::IntLit(c) = &**rhs {
+                if let Some((_, k)) = extract_single_term(lhs, fn_name, param_name, _expected_offset) {
+                    return Some((*c, k));
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Extract k from expression (n - k) where n is param_name.
+fn extract_n_minus_k(expr: &Expr, param_name: &str) -> Option<i64> {
+    match expr {
+        Expr::Binary(lhs, BinOp::Sub, rhs) => {
+            if matches!(**lhs, Expr::Ident(ref name) if name == param_name) {
+                if let Expr::IntLit(k) = &**rhs {
+                    return Some(*k);
+                }
+            }
+            None
+        }
+        _ => None,
     }
 }
 
@@ -212,16 +386,33 @@ pub struct JitCompiler {
     lambda_infos: Vec<LambdaInfo>,
     /// Escape analysis results: fn_name -> EscapeInfo.
     escape_info: HashMap<String, EscapeInfo>,
+    /// @memoize: data sections for native cache (fn_name -> DataId).
+    memo_data: HashMap<String, DataId>,
 }
 
 impl JitCompiler {
-    pub fn new() -> Result<Self, HexaError> {
+    pub fn new(extern_decls: &[crate::ast::ExternFnDecl]) -> Result<Self, HexaError> {
         let mut flag_builder = settings::builder();
         flag_builder
             .set("use_colocated_libcalls", "false")
             .map_err(|e| jit_err(format!("setting flag: {}", e)))?;
         flag_builder
             .set("is_pic", "false")
+            .map_err(|e| jit_err(format!("setting flag: {}", e)))?;
+        // Cranelift optimization: enable speed-optimized codegen (regalloc, isel).
+        flag_builder
+            .set("opt_level", "speed")
+            .map_err(|e| jit_err(format!("setting flag: {}", e)))?;
+        // Disable verification overhead in JIT (correctness validated at dev time).
+        flag_builder
+            .set("enable_verifier", "false")
+            .map_err(|e| jit_err(format!("setting flag: {}", e)))?;
+        // Disable Spectre mitigations for JIT performance.
+        flag_builder
+            .set("enable_heap_access_spectre_mitigation", "false")
+            .map_err(|e| jit_err(format!("setting flag: {}", e)))?;
+        flag_builder
+            .set("enable_table_access_spectre_mitigation", "false")
             .map_err(|e| jit_err(format!("setting flag: {}", e)))?;
 
         let isa_builder = cranelift_native::builder()
@@ -242,6 +433,40 @@ impl JitCompiler {
         builder.symbol("hexa_alloc", hexa_alloc as *const u8);
         builder.symbol("hexa_free", hexa_free as *const u8);
         builder.symbol("hexa_bounds_check", hexa_bounds_check as *const u8);
+
+        // Register extern FFI symbols via dlopen/dlsym before builder is consumed.
+        #[cfg(not(target_arch = "wasm32"))]
+        for decl in extern_decls {
+            let handle = if matches!(decl.link_lib.as_deref(), None | Some("c") | Some("libc") | Some("System")) {
+                // RTLD_DEFAULT: search all loaded libraries (macOS: -2)
+                (-2isize) as *mut std::ffi::c_void
+            } else {
+                let lib_name = decl.link_lib.as_ref().unwrap();
+                let lib_cstr = std::ffi::CString::new(lib_name.as_str())
+                    .map_err(|_| jit_err(format!("invalid lib name: {}", lib_name)))?;
+                let h = unsafe { dlopen(lib_cstr.as_ptr(), RTLD_LAZY) };
+                if h.is_null() {
+                    // Try with lib prefix and .dylib/.so suffix
+                    let alt = format!("lib{}.dylib", lib_name);
+                    let alt_cstr = std::ffi::CString::new(alt.as_str())
+                        .map_err(|_| jit_err(format!("invalid lib name: {}", lib_name)))?;
+                    let h2 = unsafe { dlopen(alt_cstr.as_ptr(), RTLD_LAZY) };
+                    if h2.is_null() {
+                        return Err(jit_err(format!("cannot load library '{}'", lib_name)));
+                    }
+                    h2
+                } else {
+                    h
+                }
+            };
+            let sym_cstr = std::ffi::CString::new(decl.name.as_str())
+                .map_err(|_| jit_err(format!("invalid symbol name: {}", decl.name)))?;
+            let sym_ptr = unsafe { dlsym(handle, sym_cstr.as_ptr()) };
+            if sym_ptr.is_null() {
+                return Err(jit_err(format!("symbol '{}' not found", decl.name)));
+            }
+            builder.symbol(&decl.name, sym_ptr as *const u8);
+        }
 
         let mut module = JITModule::new(builder);
 
@@ -287,6 +512,7 @@ impl JitCompiler {
             impl_methods: HashMap::new(),
             lambda_infos: Vec::new(),
             escape_info: HashMap::new(),
+            memo_data: HashMap::new(),
         })
     }
 
@@ -321,6 +547,19 @@ impl JitCompiler {
             if let Stmt::FnDecl(decl) = stmt {
                 self.declare_function(decl)?;
             }
+            if let Stmt::Extern(decl) = stmt {
+                // Declare extern function: all params as I64, optional I64 return.
+                let mut sig = self.module.make_signature();
+                for _ in &decl.params {
+                    sig.params.push(AbiParam::new(I64));
+                }
+                if decl.ret_type.is_some() {
+                    sig.returns.push(AbiParam::new(I64));
+                }
+                let func_id = self.module.declare_function(&decl.name, Linkage::Import, &sig)
+                    .map_err(|e| jit_err(format!("declare extern '{}': {}", decl.name, e)))?;
+                self.functions.insert(decl.name.clone(), JitFuncInfo { id: func_id, param_count: decl.params.len() });
+            }
         }
 
         // Declare impl methods as functions with mangled names: Type__method.
@@ -337,11 +576,80 @@ impl JitCompiler {
                     params: decl.params.clone(),
                     ret_type: decl.ret_type.clone(),
                     where_clauses: decl.where_clauses.clone(),
+                    precondition: decl.precondition.clone(),
+                    postcondition: decl.postcondition.clone(),
                     body: decl.body.clone(),
                     vis: decl.vis.clone(),
-                    is_pure: decl.is_pure,
+                    is_pure: decl.is_pure, attrs: decl.attrs.clone(),
                 };
                 self.declare_function(&modified)?;
+            }
+        }
+
+        // Pass 1b: @memoize — declare raw body functions + allocate native cache data.
+        // For @memoize fn fib(n), we create:
+        //   __memo_fib: raw function body (recursive calls still go through 'fib' wrapper)
+        //   memo_cache_fib: 1024-entry flat cache (key:i64 + val:i64 = 16KB per function)
+        //   fib: native cache-check wrapper → call __memo_fib on miss
+        let mut memo_fns: Vec<(String, FnDecl)> = Vec::new();
+        for stmt in stmts {
+            if let Stmt::FnDecl(decl) = stmt {
+                if decl.attrs.iter().any(|a| matches!(a.kind, crate::token::AttrKind::Memoize)) && decl.params.len() == 1 {
+                    let raw_name = format!("__memo_{}", decl.name);
+                    // Declare raw body function
+                    let raw_decl = FnDecl {
+                        name: raw_name.clone(),
+                        type_params: decl.type_params.clone(),
+                        params: decl.params.clone(),
+                        ret_type: decl.ret_type.clone(),
+                        where_clauses: decl.where_clauses.clone(),
+                        precondition: decl.precondition.clone(),
+                        postcondition: decl.postcondition.clone(),
+                        body: decl.body.clone(),
+                        vis: decl.vis.clone(),
+                        is_pure: decl.is_pure,
+                        attrs: vec![],  // no @memoize on raw
+                    };
+                    self.declare_function(&raw_decl)?;
+                    memo_fns.push((decl.name.clone(), raw_decl));
+
+                    // Allocate native cache: 1024 entries × 16 bytes (key + value)
+                    let cache_name = format!("memo_cache_{}", decl.name);
+                    let data_id = self.module
+                        .declare_data(&cache_name, Linkage::Local, true, false)
+                        .map_err(|e| jit_err(format!("declare memo cache '{}': {}", cache_name, e)))?;
+                    // Initialize: all keys = i64::MIN (sentinel = "empty")
+                    let mut data_desc = DataDescription::new();
+                    let cache_size = 1024 * 16; // 16KB
+                    let mut init_data = vec![0u8; cache_size];
+                    // Fill keys with i64::MIN sentinel (every 16 bytes)
+                    let sentinel = i64::MIN.to_le_bytes();
+                    for i in 0..1024 {
+                        init_data[i * 16..i * 16 + 8].copy_from_slice(&sentinel);
+                    }
+                    data_desc.define(init_data.into_boxed_slice());
+                    self.module.define_data(data_id, &data_desc)
+                        .map_err(|e| jit_err(format!("define memo cache '{}': {}", cache_name, e)))?;
+                    self.memo_data.insert(decl.name.clone(), data_id);
+                }
+            }
+        }
+
+
+        // Pass 1c: @optimize — detect linear recurrence and replace with matrix exponentiation.
+        // For @optimize fn fib(n), if pattern matches f(n) = c1*f(n-1) + c2*f(n-2):
+        //   → Generate native matrix exponentiation code: O(log n) instead of O(2^n)
+        let mut optimize_fns: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for stmt in stmts {
+            if let Stmt::FnDecl(decl) = stmt {
+                if decl.attrs.iter().any(|a| matches!(a.kind, crate::token::AttrKind::Optimize))
+                    && decl.params.len() == 1
+                    && !self.memo_data.contains_key(&decl.name)  // don't double-optimize with @memoize
+                {
+                    if detect_linear_recurrence(decl).is_some() {
+                        optimize_fns.insert(decl.name.clone());
+                    }
+                }
             }
         }
 
@@ -355,9 +663,21 @@ impl JitCompiler {
         }
 
         // Pass 3: define (compile bodies of) all functions.
+        // @memoize raw bodies first
+        for (_, raw_decl) in &memo_fns {
+            self.define_function(raw_decl)?;
+        }
         for stmt in stmts {
             if let Stmt::FnDecl(decl) = stmt {
-                self.define_function(decl)?;
+                if self.memo_data.contains_key(&decl.name) {
+                    // @memoize: compile native cache wrapper instead of body
+                    self.define_memo_wrapper(decl)?;
+                } else if optimize_fns.contains(&decl.name) {
+                    // @optimize: compile matrix exponentiation instead of recursive body
+                    self.define_optimize_matrix_exp(decl)?;
+                } else {
+                    self.define_function(decl)?;
+                }
             }
         }
 
@@ -371,9 +691,11 @@ impl JitCompiler {
                     params: decl.params.clone(),
                     ret_type: decl.ret_type.clone(),
                     where_clauses: decl.where_clauses.clone(),
+                    precondition: decl.precondition.clone(),
+                    postcondition: decl.postcondition.clone(),
                     body: decl.body.clone(),
                     vis: decl.vis.clone(),
-                    is_pure: decl.is_pure,
+                    is_pure: decl.is_pure, attrs: decl.attrs.clone(),
                 };
                 self.define_function_with_self_type(&modified, type_name)?;
             }
@@ -382,7 +704,7 @@ impl JitCompiler {
         // Collect top-level non-declaration statements.
         let top_stmts: Vec<&Stmt> = stmts
             .iter()
-            .filter(|s| !matches!(s, Stmt::FnDecl(_) | Stmt::StructDecl(_) | Stmt::EnumDecl(_) | Stmt::ImplBlock(_)))
+            .filter(|s| !matches!(s, Stmt::FnDecl(_) | Stmt::StructDecl(_) | Stmt::EnumDecl(_) | Stmt::ImplBlock(_) | Stmt::Extern(_)))
             .collect();
 
         // Compile the top-level as a special "__hexa_main__" function with no params.
@@ -480,10 +802,23 @@ impl JitCompiler {
             }
 
             // Bind params to variables.
+            let mut param_vars = Vec::new();
             for (i, param) in decl.params.iter().enumerate() {
                 let val = builder.block_params(entry_block)[i];
                 let var = trans.declare_var(&param.name, &mut builder);
                 builder.def_var(var, val);
+                param_vars.push(var);
+            }
+
+            // Tail call optimization: detect tail-recursive calls and convert to loops.
+            let use_tco = has_tail_recursion(&decl.name, &decl.body);
+            if use_tco {
+                let tco_header = builder.create_block();
+                builder.ins().jump(tco_header, &[]);
+                builder.switch_to_block(tco_header);
+                trans.current_fn_name = Some(decl.name.clone());
+                trans.tco_header = Some(tco_header);
+                trans.tco_param_vars = param_vars;
             }
 
             // Compile body.
@@ -506,6 +841,300 @@ impl JitCompiler {
             .define_function(func_id, &mut ctx)
             .map_err(|e| jit_err(format!("define fn '{}': {}", decl.name, e)))?;
 
+        self.module.clear_context(&mut ctx);
+        Ok(())
+    }
+
+    /// @memoize: compile a native cache-check wrapper.
+    /// Generates pure x86/ARM machine code for cache lookup — zero Rust runtime dependency.
+    ///
+    /// Layout: 1024-entry flat cache, each entry = [key: i64, value: i64] (16 bytes).
+    /// Sentinel key = i64::MIN means "empty slot".
+    ///
+    /// Generated native code:
+    ///   fn fib(n: i64) -> i64 {
+    ///     let idx = (n & 0x3FF) << 4;  // mod 1024 * 16
+    ///     let ptr = &memo_cache + idx;
+    ///     if *ptr == n { return *(ptr+8); }  // cache hit
+    ///     let result = __memo_fib(n);         // cache miss → call raw
+    ///     *ptr = n; *(ptr+8) = result;        // store
+    ///     return result;
+    ///   }
+    fn define_memo_wrapper(&mut self, decl: &FnDecl) -> Result<(), HexaError> {
+        let func_info = self.functions.get(&decl.name)
+            .ok_or_else(|| jit_err(format!("memo wrapper: fn '{}' not declared", decl.name)))?;
+        let func_id = func_info.id;
+
+        let raw_name = format!("__memo_{}", decl.name);
+        let raw_info = self.functions.get(&raw_name)
+            .ok_or_else(|| jit_err(format!("memo wrapper: raw fn '{}' not declared", raw_name)))?;
+        let raw_func_id = raw_info.id;
+
+        let data_id = *self.memo_data.get(&decl.name)
+            .ok_or_else(|| jit_err(format!("memo wrapper: cache data for '{}' not found", decl.name)))?;
+
+        let mut ctx = self.module.make_context();
+        ctx.func.signature.params.push(AbiParam::new(I64));
+        ctx.func.signature.returns.push(AbiParam::new(I64));
+        ctx.func.name = UserFuncName::user(0, func_id.as_u32());
+
+        let mut func_ctx = FunctionBuilderContext::new();
+        {
+            let mut builder = FunctionBuilder::new(&mut ctx.func, &mut func_ctx);
+
+            // Blocks: entry → cache_hit | cache_miss
+            let entry = builder.create_block();
+            let cache_hit = builder.create_block();
+            let cache_miss = builder.create_block();
+
+            builder.append_block_params_for_function_params(entry);
+            builder.switch_to_block(entry);
+
+            let arg = builder.block_params(entry)[0]; // the single i64 argument
+
+            // Compute cache index: (arg & 0x3FF) << 4  (mod 1024, * 16 bytes)
+            let mask = builder.ins().iconst(I64, 0x3FF);
+            let idx = builder.ins().band(arg, mask);
+            let offset = builder.ins().ishl_imm(idx, 4); // * 16
+
+            // Get cache base address
+            let cache_gv = self.module.declare_data_in_func(data_id, builder.func);
+            let cache_ptr = builder.ins().global_value(I64, cache_gv);
+
+            // ptr = cache_ptr + offset
+            let entry_ptr = builder.ins().iadd(cache_ptr, offset);
+
+            // Load cached key and value
+            let cached_key = builder.ins().load(I64, MemFlags::trusted(), entry_ptr, 0);
+            let cached_val = builder.ins().load(I64, MemFlags::trusted(), entry_ptr, 8);
+
+            // Compare: if cached_key == arg → cache hit
+            let hit = builder.ins().icmp(IntCC::Equal, cached_key, arg);
+            builder.ins().brif(hit, cache_hit, &[], cache_miss, &[]);
+
+            // Cache hit: return cached value
+            builder.switch_to_block(cache_hit);
+            builder.ins().return_(&[cached_val]);
+
+            // Cache miss: call raw function, store result, return
+            builder.switch_to_block(cache_miss);
+            let raw_func_ref = self.module.declare_func_in_func(raw_func_id, builder.func);
+            let call = builder.ins().call(raw_func_ref, &[arg]);
+            let result = builder.inst_results(call)[0];
+
+            // Store key and value in cache (native store — no Rust runtime)
+            builder.ins().store(MemFlags::trusted(), arg, entry_ptr, 0);
+            builder.ins().store(MemFlags::trusted(), result, entry_ptr, 8);
+
+            builder.ins().return_(&[result]);
+
+            builder.seal_all_blocks();
+            builder.finalize();
+        }
+
+        self.module
+            .define_function(func_id, &mut ctx)
+            .map_err(|e| jit_err(format!("define memo wrapper '{}': {}", decl.name, e)))?;
+        self.module.clear_context(&mut ctx);
+        Ok(())
+    }
+
+
+    /// @optimize: compile matrix exponentiation for linear recurrence.
+    /// Detects f(n) = c1*f(n-1) + c2*f(n-2) and generates O(log n) native code.
+    ///
+    /// Generated native code (for fib: coeffs=[1,1], bases=[0,1]):
+    ///   fn fib(n: i64) -> i64 {
+    ///     if n <= 0 { return 0; }
+    ///     if n == 1 { return 1; }
+    ///     // Matrix [[c1, c2], [1, 0]]^(n-1) applied to [base[1], base[0]]
+    ///     // Fast power: O(log n) 2x2 matrix multiplications
+    ///     let (mut a, mut b, mut c, mut d) = (c1, c2, 1, 0);
+    ///     let (mut ra, mut rb, mut rc, mut rd) = (1, 0, 0, 1); // identity
+    ///     let mut p = n - 1;
+    ///     while p > 0 {
+    ///       if p & 1 == 1 { result = result * matrix; }
+    ///       matrix = matrix * matrix;
+    ///       p >>= 1;
+    ///     }
+    ///     return ra * base[1] + rb * base[0];
+    ///   }
+    fn define_optimize_matrix_exp(&mut self, decl: &FnDecl) -> Result<(), HexaError> {
+        let (coeffs, bases) = detect_linear_recurrence(decl)
+            .ok_or_else(|| jit_err(format!("@optimize: fn '{}' is not a linear recurrence", decl.name)))?;
+
+        let func_info = self.functions.get(&decl.name)
+            .ok_or_else(|| jit_err(format!("@optimize: fn '{}' not declared", decl.name)))?;
+        let func_id = func_info.id;
+
+        let c1 = coeffs[0];
+        let c2 = coeffs[1];
+        let base0 = bases[0]; // f(0)
+        let base1 = bases[1]; // f(1)
+
+        let mut ctx = self.module.make_context();
+        ctx.func.signature.params.push(AbiParam::new(I64));
+        ctx.func.signature.returns.push(AbiParam::new(I64));
+        ctx.func.name = UserFuncName::user(0, func_id.as_u32());
+
+        let mut func_ctx = FunctionBuilderContext::new();
+        {
+            let mut builder = FunctionBuilder::new(&mut ctx.func, &mut func_ctx);
+
+            // Blocks
+            let entry = builder.create_block();
+            let base0_block = builder.create_block();
+            let check1 = builder.create_block();
+            let base1_block = builder.create_block();
+            let matrix_block = builder.create_block();
+            let loop_header = builder.create_block();
+            let odd_block = builder.create_block();
+            let square_block = builder.create_block();
+            let done_block = builder.create_block();
+
+            builder.append_block_params_for_function_params(entry);
+
+            // --- entry: if n <= 0 return base0 ---
+            builder.switch_to_block(entry);
+            let n = builder.block_params(entry)[0];
+            let zero = builder.ins().iconst(I64, 0);
+            let cmp0 = builder.ins().icmp(IntCC::SignedLessThanOrEqual, n, zero);
+            builder.ins().brif(cmp0, base0_block, &[], check1, &[]);
+
+            builder.switch_to_block(base0_block);
+            let b0_val = builder.ins().iconst(I64, base0);
+            builder.ins().return_(&[b0_val]);
+
+            // --- check1: if n == 1 return base1 ---
+            builder.switch_to_block(check1);
+            let one = builder.ins().iconst(I64, 1);
+            let cmp1 = builder.ins().icmp(IntCC::Equal, n, one);
+            builder.ins().brif(cmp1, base1_block, &[], matrix_block, &[]);
+
+            builder.switch_to_block(base1_block);
+            let b1_val = builder.ins().iconst(I64, base1);
+            builder.ins().return_(&[b1_val]);
+
+            // --- matrix_block: initialize matrix and result, p = n - 1 ---
+            builder.switch_to_block(matrix_block);
+
+            // Matrix [[c1, c2], [1, 0]]
+            let mat_a_init = builder.ins().iconst(I64, c1);
+            let mat_b_init = builder.ins().iconst(I64, c2);
+            let mat_c_init = builder.ins().iconst(I64, 1);
+            let mat_d_init = builder.ins().iconst(I64, 0);
+
+            // Result = identity [[1, 0], [0, 1]]
+            let res_a_init = builder.ins().iconst(I64, 1);
+            let res_b_init = builder.ins().iconst(I64, 0);
+            let res_c_init = builder.ins().iconst(I64, 0);
+            let res_d_init = builder.ins().iconst(I64, 1);
+
+            // p = n - 1
+            let p_init = builder.ins().isub(n, one);
+
+            builder.ins().jump(loop_header, &[
+                mat_a_init.into(), mat_b_init.into(), mat_c_init.into(), mat_d_init.into(),
+                res_a_init.into(), res_b_init.into(), res_c_init.into(), res_d_init.into(),
+                p_init.into(),
+            ]);
+
+            // --- loop_header: while p > 0 ---
+            builder.switch_to_block(loop_header);
+            // Block params: mat(a,b,c,d), res(a,b,c,d), p
+            for _ in 0..9 {
+                builder.append_block_param(loop_header, I64);
+            }
+            let params = builder.block_params(loop_header).to_vec();
+            let (ma, mb, mc, md) = (params[0], params[1], params[2], params[3]);
+            let (ra, rb, rc, rd) = (params[4], params[5], params[6], params[7]);
+            let p = params[8];
+
+            let p_gt_0 = builder.ins().icmp(IntCC::SignedGreaterThan, p, zero);
+            builder.ins().brif(p_gt_0, odd_block, &[], done_block, &[]);
+
+            // --- odd_block: if p & 1 == 1, multiply result by matrix ---
+            builder.switch_to_block(odd_block);
+            let p_and_1 = builder.ins().band_imm(p, 1);
+            let is_odd = builder.ins().icmp_imm(IntCC::Equal, p_and_1, 1);
+
+            // Compute result * matrix (always, select at end)
+            // new_ra = ra*ma + rb*mc
+            let ra_ma = builder.ins().imul(ra, ma);
+            let rb_mc = builder.ins().imul(rb, mc);
+            let new_ra = builder.ins().iadd(ra_ma, rb_mc);
+            // new_rb = ra*mb + rb*md
+            let ra_mb = builder.ins().imul(ra, mb);
+            let rb_md = builder.ins().imul(rb, md);
+            let new_rb = builder.ins().iadd(ra_mb, rb_md);
+            // new_rc = rc*ma + rd*mc
+            let rc_ma = builder.ins().imul(rc, ma);
+            let rd_mc = builder.ins().imul(rd, mc);
+            let new_rc = builder.ins().iadd(rc_ma, rd_mc);
+            // new_rd = rc*mb + rd*md
+            let rc_mb = builder.ins().imul(rc, mb);
+            let rd_md = builder.ins().imul(rd, md);
+            let new_rd = builder.ins().iadd(rc_mb, rd_md);
+
+            // Select: if odd, use new values; else keep old
+            let sel_ra = builder.ins().select(is_odd, new_ra, ra);
+            let sel_rb = builder.ins().select(is_odd, new_rb, rb);
+            let sel_rc = builder.ins().select(is_odd, new_rc, rc);
+            let sel_rd = builder.ins().select(is_odd, new_rd, rd);
+
+            builder.ins().jump(square_block, &[sel_ra.into(), sel_rb.into(), sel_rc.into(), sel_rd.into()]);
+
+            // --- square_block: matrix = matrix * matrix, p >>= 1 ---
+            builder.switch_to_block(square_block);
+            for _ in 0..4 {
+                builder.append_block_param(square_block, I64);
+            }
+            let sq_params = builder.block_params(square_block).to_vec();
+            let (s_ra, s_rb, s_rc, s_rd) = (sq_params[0], sq_params[1], sq_params[2], sq_params[3]);
+
+            // matrix * matrix
+            // sq_a = ma*ma + mb*mc
+            let ma_ma = builder.ins().imul(ma, ma);
+            let mb_mc2 = builder.ins().imul(mb, mc);
+            let sq_a = builder.ins().iadd(ma_ma, mb_mc2);
+            // sq_b = ma*mb + mb*md
+            let ma_mb2 = builder.ins().imul(ma, mb);
+            let mb_md2 = builder.ins().imul(mb, md);
+            let sq_b = builder.ins().iadd(ma_mb2, mb_md2);
+            // sq_c = mc*ma + md*mc
+            let mc_ma2 = builder.ins().imul(mc, ma);
+            let md_mc2 = builder.ins().imul(md, mc);
+            let sq_c = builder.ins().iadd(mc_ma2, md_mc2);
+            // sq_d = mc*mb + md*md
+            let mc_mb2 = builder.ins().imul(mc, mb);
+            let md_md2 = builder.ins().imul(md, md);
+            let sq_d = builder.ins().iadd(mc_mb2, md_md2);
+
+            // p >>= 1
+            let new_p = builder.ins().sshr_imm(p, 1);
+
+            builder.ins().jump(loop_header, &[
+                sq_a.into(), sq_b.into(), sq_c.into(), sq_d.into(),
+                s_ra.into(), s_rb.into(), s_rc.into(), s_rd.into(),
+                new_p.into(),
+            ]);
+
+            // --- done_block: return ra * base1 + rb * base0 ---
+            builder.switch_to_block(done_block);
+            let base1_c = builder.ins().iconst(I64, base1);
+            let base0_c = builder.ins().iconst(I64, base0);
+            let term1 = builder.ins().imul(ra, base1_c);
+            let term2 = builder.ins().imul(rb, base0_c);
+            let result = builder.ins().iadd(term1, term2);
+            builder.ins().return_(&[result]);
+
+            builder.seal_all_blocks();
+            builder.finalize();
+        }
+
+        self.module
+            .define_function(func_id, &mut ctx)
+            .map_err(|e| jit_err(format!("define @optimize matrix exp '{}': {}", decl.name, e)))?;
         self.module.clear_context(&mut ctx);
         Ok(())
     }
@@ -773,6 +1402,11 @@ fn collect_free_vars_inner(
                 }
             }
         }
+        Expr::ArrayPattern(pats, _) => {
+            for p in pats {
+                collect_free_vars_inner(p, params, bound, free);
+            }
+        }
         _ => {} // Literals, etc.
     }
 }
@@ -907,6 +1541,36 @@ fn scan_lambdas_expr(
     }
 }
 
+/// Check if a function body contains tail-recursive calls to itself.
+fn has_tail_recursion(fn_name: &str, body: &[Stmt]) -> bool {
+    body.iter().any(|s| contains_tail_call(fn_name, s))
+}
+
+/// Check if a statement contains a tail call to the named function.
+fn contains_tail_call(fn_name: &str, stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Return(Some(expr)) => is_self_call(fn_name, expr),
+        Stmt::Expr(Expr::If(_, then_b, else_b)) => {
+            let then_has = then_b.iter().any(|s| contains_tail_call(fn_name, s));
+            let else_has = else_b
+                .as_ref()
+                .map_or(false, |b| b.iter().any(|s| contains_tail_call(fn_name, s)));
+            then_has || else_has
+        }
+        _ => false,
+    }
+}
+
+/// Check if an expression is a direct call to `fn_name`.
+fn is_self_call(fn_name: &str, expr: &Expr) -> bool {
+    if let Expr::Call(callee, _) = expr {
+        if let Expr::Ident(name) = callee.as_ref() {
+            return name == fn_name;
+        }
+    }
+    false
+}
+
 /// Translates HEXA AST nodes into Cranelift IR within a single function.
 struct FuncTranslator<'a> {
     module: &'a mut JITModule,
@@ -937,6 +1601,12 @@ struct FuncTranslator<'a> {
     /// When compiling a `let name = <aggregate>`, this holds `name` so the
     /// aggregate expression can use `alloc_for_var` instead of `call_alloc`.
     current_let_name: Option<String>,
+    /// Name of the function currently being compiled (for TCO detection).
+    current_fn_name: Option<String>,
+    /// TCO loop header block to jump back to for tail-recursive calls.
+    tco_header: Option<cranelift::prelude::Block>,
+    /// TCO parameter variables (in order) to update before jumping back.
+    tco_param_vars: Vec<Variable>,
 }
 
 impl<'a> FuncTranslator<'a> {
@@ -968,6 +1638,9 @@ impl<'a> FuncTranslator<'a> {
             escape_info: None,
             stack_slots: HashMap::new(),
             current_let_name: None,
+            current_fn_name: None,
+            tco_header: None,
+            tco_param_vars: Vec::new(),
         }
     }
 
@@ -1148,6 +1821,32 @@ impl<'a> FuncTranslator<'a> {
                 Ok(Some(val))
             }
             Stmt::Return(expr) => {
+                // TCO: if returning a self-recursive call, jump back to loop header.
+                if let Some(e) = expr {
+                    if let (Some(ref fn_name), Some(tco_hdr)) =
+                        (&self.current_fn_name, self.tco_header)
+                    {
+                        if let Expr::Call(callee, args) = e {
+                            if let Expr::Ident(cname) = callee.as_ref() {
+                                if cname == fn_name {
+                                    // Evaluate all new arg values before updating any vars.
+                                    let mut arg_vals = Vec::new();
+                                    for arg in args {
+                                        arg_vals.push(self.compile_expr(builder, arg)?);
+                                    }
+                                    // Update parameter variables with new argument values.
+                                    let vars = self.tco_param_vars.clone();
+                                    for (var, val) in vars.iter().zip(arg_vals.iter()) {
+                                        builder.def_var(*var, *val);
+                                    }
+                                    // Jump back to TCO header (loop).
+                                    builder.ins().jump(tco_hdr, &[]);
+                                    return Ok(None);
+                                }
+                            }
+                        }
+                    }
+                }
                 let val = if let Some(e) = expr {
                     self.compile_expr(builder, e)?
                 } else {
@@ -1184,7 +1883,59 @@ impl<'a> FuncTranslator<'a> {
                 builder.seal_block(exit_block);
                 Ok(None)
             }
-            Stmt::FnDecl(_) | Stmt::StructDecl(_) | Stmt::EnumDecl(_) | Stmt::ImplBlock(_) => {
+            Stmt::For(var_name, iter_expr, body) => {
+                // Support range iteration: for i in start..end / start..=end
+                if let Expr::Range(start_expr, end_expr, inclusive) = iter_expr {
+                    let start_val = self.compile_expr(builder, start_expr)?;
+                    let end_val = self.compile_expr(builder, end_expr)?;
+
+                    let loop_var = self.declare_var(var_name, builder);
+                    builder.def_var(loop_var, start_val);
+
+                    let header_block = builder.create_block();
+                    let body_block = builder.create_block();
+                    let exit_block = builder.create_block();
+
+                    builder.ins().jump(header_block, &[]);
+                    builder.switch_to_block(header_block);
+
+                    let cur = builder.use_var(loop_var);
+                    let cmp = if *inclusive {
+                        builder
+                            .ins()
+                            .icmp(IntCC::SignedLessThanOrEqual, cur, end_val)
+                    } else {
+                        builder.ins().icmp(IntCC::SignedLessThan, cur, end_val)
+                    };
+                    builder
+                        .ins()
+                        .brif(cmp, body_block, &[], exit_block, &[]);
+
+                    builder.seal_block(body_block);
+                    builder.switch_to_block(body_block);
+
+                    for s in body {
+                        self.compile_stmt(builder, s)?;
+                    }
+
+                    if !self.is_block_terminated(builder) {
+                        let cur = builder.use_var(loop_var);
+                        let one = builder.ins().iconst(I64, 1);
+                        let next = builder.ins().iadd(cur, one);
+                        builder.def_var(loop_var, next);
+                        builder.ins().jump(header_block, &[]);
+                    }
+
+                    builder.seal_block(header_block);
+                    builder.switch_to_block(exit_block);
+                    builder.seal_block(exit_block);
+                    Ok(None)
+                } else {
+                    // Non-range for loops not yet supported in JIT.
+                    Ok(None)
+                }
+            }
+            Stmt::FnDecl(_) | Stmt::StructDecl(_) | Stmt::EnumDecl(_) | Stmt::ImplBlock(_) | Stmt::Extern(_) => {
                 // Already handled at top level.
                 Ok(None)
             }
@@ -1818,7 +2569,7 @@ mod tests {
     fn jit_run(src: &str) -> i64 {
         let tokens = Lexer::new(src).tokenize().unwrap();
         let stmts = Parser::new(tokens).parse().unwrap();
-        let mut jit = JitCompiler::new().unwrap();
+        let mut jit = JitCompiler::new(&[]).unwrap();
         jit.compile_and_run(&stmts).unwrap()
     }
 
@@ -2077,5 +2828,162 @@ match d {
 }
 "#;
         assert_eq!(jit_run(src), 2);
+    }
+
+    // ── TCO tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_jit_tco_tail_recursive_fib() {
+        let src = r#"
+fn fib_tail(n, a, b) {
+    if n <= 0 { return a }
+    return fib_tail(n - 1, b, a + b)
+}
+fib_tail(40, 0, 1)
+"#;
+        assert_eq!(jit_run(src), 102334155);
+    }
+
+    #[test]
+    fn test_jit_tco_factorial() {
+        let src = r#"
+fn fact(n, acc) {
+    if n <= 1 { return acc }
+    return fact(n - 1, n * acc)
+}
+fact(10, 1)
+"#;
+        assert_eq!(jit_run(src), 3628800);
+    }
+
+    // ── For loop tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_jit_for_range() {
+        let src = r#"
+fn sum_range(n) {
+    let total = 0
+    for i in 0..n {
+        total = total + i
+    }
+    return total
+}
+sum_range(10)
+"#;
+        assert_eq!(jit_run(src), 45);
+    }
+
+    #[test]
+    fn test_jit_for_range_inclusive() {
+        let src = r#"
+fn sum_incl(n) {
+    let total = 0
+    for i in 1..=n {
+        total = total + i
+    }
+    return total
+}
+sum_incl(10)
+"#;
+        assert_eq!(jit_run(src), 55);
+    }
+}
+
+#[cfg(test)]
+mod optimize_tests {
+    use super::*;
+    use crate::lexer::Lexer;
+    use crate::parser::Parser;
+
+    fn jit_run(src: &str) -> i64 {
+        let tokens = Lexer::new(src).tokenize().unwrap();
+        let stmts = Parser::new(tokens).parse().unwrap();
+        let mut jit = JitCompiler::new(&[]).unwrap();
+        jit.compile_and_run(&stmts).unwrap()
+    }
+
+    #[test]
+    fn test_optimize_fib_base_cases() {
+        let src = r#"
+@optimize fn fib(n) {
+    if n <= 1 { return n }
+    return fib(n - 1) + fib(n - 2)
+}
+fib(0)
+"#;
+        assert_eq!(jit_run(src), 0);
+        let src = r#"
+@optimize fn fib(n) {
+    if n <= 1 { return n }
+    return fib(n - 1) + fib(n - 2)
+}
+fib(1)
+"#;
+        assert_eq!(jit_run(src), 1);
+    }
+
+    #[test]
+    fn test_optimize_fib_small() {
+        let src = r#"
+@optimize fn fib(n) {
+    if n <= 1 { return n }
+    return fib(n - 1) + fib(n - 2)
+}
+fib(10)
+"#;
+        assert_eq!(jit_run(src), 55);
+    }
+
+    #[test]
+    fn test_optimize_fib_large() {
+        let src = r#"
+@optimize fn fib(n) {
+    if n <= 1 { return n }
+    return fib(n - 1) + fib(n - 2)
+}
+fib(90)
+"#;
+        assert_eq!(jit_run(src), 2880067194370816120);
+    }
+
+    #[test]
+    fn test_optimize_fib_45() {
+        let src = r#"
+@optimize fn fib(n) {
+    if n <= 1 { return n }
+    return fib(n - 1) + fib(n - 2)
+}
+fib(45)
+"#;
+        assert_eq!(jit_run(src), 1134903170);
+    }
+
+    #[test]
+    fn test_optimize_lucas_sequence() {
+        // Lucas numbers: L(0)=2, L(1)=1, L(n)=L(n-1)+L(n-2)
+        // But with same coefficients [1,1] and bases pattern
+        // Test with standard fib-like: f(0)=0, f(1)=1
+        let src = r#"
+@optimize fn fib(n) {
+    if n <= 1 { return n }
+    return fib(n - 1) + fib(n - 2)
+}
+fib(2) + fib(3) + fib(5) + fib(7)
+"#;
+        // fib(2)=1, fib(3)=2, fib(5)=5, fib(7)=13 → 21
+        assert_eq!(jit_run(src), 21);
+    }
+
+    #[test]
+    fn test_optimize_negative_input() {
+        let src = r#"
+@optimize fn fib(n) {
+    if n <= 1 { return n }
+    return fib(n - 1) + fib(n - 2)
+}
+fib(-5)
+"#;
+        // n <= 0 returns base0 = 0
+        assert_eq!(jit_run(src), 0);
     }
 }

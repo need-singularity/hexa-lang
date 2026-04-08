@@ -119,9 +119,11 @@ impl UnrollCtx {
                     params: decl.params.clone(),
                     ret_type: decl.ret_type.clone(),
                     where_clauses: decl.where_clauses.clone(),
+                    precondition: decl.precondition.clone(),
+                    postcondition: decl.postcondition.clone(),
                     body: optimized_body,
                     vis: decl.vis.clone(),
-                    is_pure: decl.is_pure,
+                    is_pure: decl.is_pure, attrs: decl.attrs.clone(),
                 })
             }
             Stmt::While(cond, body) => {
@@ -313,6 +315,8 @@ mod tests {
             params: vec![],
             ret_type: None,
             where_clauses: vec![],
+            precondition: None,
+            postcondition: None,
             body: vec![
                 Stmt::For(
                     "i".into(),
@@ -326,6 +330,7 @@ mod tests {
             ],
             vis: Visibility::Private,
             is_pure: false,
+            attrs: vec![],
         };
         let stmts = vec![Stmt::FnDecl(decl)];
         let result = unroll_loops(&stmts);

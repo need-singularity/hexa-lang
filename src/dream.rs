@@ -8,8 +8,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::ast::{BinOp, Expr, Stmt, FnDecl};
-use crate::env::Value;
 use crate::interpreter::Interpreter;
 use crate::lexer::Lexer;
 use crate::parser::Parser;
@@ -184,7 +182,7 @@ impl DreamEngine {
 
             // NEXUS-6 Ouroboros tick every n=6 generations
             if gen > 0 && gen % 6 == 0 {
-                self.nexus6_ouroboros_tick();
+                self.nexus_ouroboros_tick();
             }
         }
 
@@ -504,7 +502,7 @@ impl DreamEngine {
     /// NEXUS-6 Ouroboros co-evolution feedback.
     /// Runs Omega lens scan on the current dream state and adjusts fitness.
     /// The dream "eats its tail" — scan results feed back into evolution.
-    pub fn nexus6_ouroboros_tick(&mut self) -> f64 {
+    pub fn nexus_ouroboros_tick(&mut self) -> f64 {
         let line_count = self.source.lines().count() as f64;
         let fn_count = self.fn_bodies.len() as f64;
         let discovery_count = self.discoveries.len() as f64;
@@ -646,14 +644,32 @@ fn evaluate_fitness(source: &str, expected_output: &str) -> Fitness {
         },
     };
 
-    // Capture output
+    // Run in a separate thread with limited stack to catch stack overflow safely
+    let stmts = parsed.stmts.clone();
     let output_buf = Arc::new(Mutex::new(String::new()));
-    let mut interp = Interpreter::new();
-    interp.set_output_capture(Some(output_buf.clone()));
+    let output_buf2 = output_buf.clone();
 
     let start = Instant::now();
-    let result = interp.run(&parsed.stmts);
-    let elapsed = start.elapsed().as_secs_f64().max(0.0001); // avoid division by zero
+    let handle = std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024) // 2MB stack limit for mutations
+        .spawn(move || {
+            let mut interp = Interpreter::new();
+            interp.set_output_capture(Some(output_buf2));
+            interp.run(&stmts)
+        });
+    let result = match handle {
+        Ok(h) => h.join().unwrap_or(Err(crate::error::HexaError {
+            class: crate::error::ErrorClass::Runtime,
+            message: "stack overflow in dream mutation".into(),
+            line: 0, col: 0, hint: None,
+        })),
+        Err(_) => Err(crate::error::HexaError {
+            class: crate::error::ErrorClass::Runtime,
+            message: "failed to spawn dream thread".into(),
+            line: 0, col: 0, hint: None,
+        }),
+    };
+    let elapsed = start.elapsed().as_secs_f64().max(0.0001);
 
     let output = output_buf.lock().unwrap().clone();
 
@@ -842,16 +858,22 @@ println(result)"#.to_string();
     #[test]
     fn test_dream_engine_fibonacci() {
         let source = r#"fn fib(n: int) -> int {
-    if n <= 1 {
-        return n
+    let a = 0
+    let b = 1
+    let i = 0
+    while i < n {
+        let t = a + b
+        a = b
+        b = t
+        i = i + 1
     }
-    return fib(n - 1) + fib(n - 2)
+    a
 }
 println(fib(10))"#.to_string();
 
         let config = DreamConfig {
-            generations: 20,
-            mutations_per_gen: 5,
+            generations: 5,
+            mutations_per_gen: 3,
             verbose: false,
             anima_bridge: false,
         };

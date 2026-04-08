@@ -1,3 +1,17 @@
+// ── AI-native Attribute ─────────────────────────────────
+#[derive(Debug, Clone)]
+pub struct Attribute {
+    pub kind: crate::token::AttrKind,
+}
+
+impl Attribute {
+    pub fn new(kind: crate::token::AttrKind) -> Self { Self { kind } }
+}
+
+pub fn has_attr(attrs: &[Attribute], check: fn(&crate::token::AttrKind) -> bool) -> bool {
+    attrs.iter().any(|a| check(&a.kind))
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum Expr {
@@ -23,6 +37,7 @@ pub enum Expr {
     MapLit(Vec<(Expr, Expr)>),  // { key: val, ... }
     EnumPath(String, String, Option<Box<Expr>>),  // EnumName::Variant(data)
     Wildcard,  // _ pattern (catch-all)
+    ArrayPattern(Vec<Expr>, Option<String>),  // [a, b, ...rest] pattern for match
     Own(Box<Expr>),     // own expr — create owned value
     MoveExpr(Box<Expr>),  // move x — transfer ownership
     Borrow(Box<Expr>),  // borrow x — read-only reference
@@ -38,6 +53,8 @@ pub enum Expr {
     Yield(Box<Expr>),                            // yield expr — generator yield
     /// template { ... } — HTML template block
     Template(Vec<TemplateNode>),
+    /// try { expr } catch e { fallback } — try as expression (returns last value)
+    TryCatch(Block, String, Block),
 }
 
 /// A node in a template tree — represents an HTML element, text, or control flow.
@@ -92,6 +109,7 @@ pub struct TimeoutArm {
 #[derive(Debug, Clone)]
 pub enum Stmt {
     Let(String, Option<String>, Option<Expr>, Visibility),   // let name: type = expr, visibility
+    LetTuple(Vec<String>, Expr),                              // let (a, b) = expr — tuple destructure
     Const(String, Option<String>, Expr, Visibility),         // const name: type = expr (immutable)
     Static(String, Option<String>, Expr, Visibility),        // static name: type = expr (module-level global)
     Assign(Expr, Expr),
@@ -135,6 +153,25 @@ pub enum Stmt {
     AtomicLet(String, Option<String>, Option<Expr>, Visibility),  // atomic let name: type = expr
     Panic(Expr),                                  // panic expr
     Theorem(String, Vec<ProofBlockStmt>),         // theorem name { ... }
+    Break,                                        // break — exit loop
+    Continue,                                     // continue — skip to next iteration
+    // Group 13: FFI
+    Extern(ExternFnDecl),                         // extern fn name(params) -> RetType
+}
+
+/// External function declaration — calls into C libraries via FFI.
+#[derive(Debug, Clone)]
+pub struct ExternFnDecl {
+    pub name: String,
+    pub params: Vec<ExternParam>,
+    pub ret_type: Option<String>,     // "Int", "*Void", etc.
+    pub link_lib: Option<String>,     // from @link("libname")
+}
+
+#[derive(Debug, Clone)]
+pub struct ExternParam {
+    pub name: String,
+    pub typ: String,                  // "Int", "*Void", "*Byte", etc.
 }
 
 /// Target for AI code generation.
@@ -280,9 +317,12 @@ pub struct FnDecl {
     pub params: Vec<Param>,
     pub ret_type: Option<String>,
     pub where_clauses: Vec<WhereClause>,  // where T: Display, U: Clone
+    pub precondition: Option<Expr>,       // where expr — contract precondition
+    pub postcondition: Option<Expr>,      // ensures expr — contract postcondition
     pub body: Block,
     pub vis: Visibility,
     pub is_pure: bool,  // pure fn — no effects allowed
+    pub attrs: Vec<Attribute>,  // AI-native: @inline @hot @memoize @parallel etc.
 }
 
 #[allow(dead_code)]
@@ -306,6 +346,7 @@ pub struct StructDecl {
     pub type_params: Vec<TypeParam>,  // <T>, <T, U>, etc. for generic structs
     pub fields: Vec<(String, String, Visibility)>,
     pub vis: Visibility,
+    pub attrs: Vec<Attribute>,
 }
 
 #[allow(dead_code)]

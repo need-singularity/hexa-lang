@@ -433,13 +433,13 @@ impl OmegaScanResult {
 
 /// Run NEXUS-6 CLI scan on given data (calls external binary).
 /// Returns raw JSON output or error.
-pub fn nexus6_scan(domain: &str) -> Result<String, String> {
-    let nexus6_bin = format!(
-        "{}/Dev/n6-architecture/tools/nexus6/target/release/nexus6",
+pub fn nexus_scan(domain: &str) -> Result<String, String> {
+    let nexus_bin = format!(
+        "{}/Dev/n6-architecture/tools/nexus/target/release/nexus",
         std::env::var("HOME").unwrap_or_else(|_| "/Users/ghost".into())
     );
 
-    let result = std::process::Command::new(&nexus6_bin)
+    let result = std::process::Command::new(&nexus_bin)
         .args(["scan", domain])
         .output();
 
@@ -448,18 +448,18 @@ pub fn nexus6_scan(domain: &str) -> Result<String, String> {
             Ok(String::from_utf8_lossy(&output.stdout).to_string())
         }
         Ok(output) => Err(String::from_utf8_lossy(&output.stderr).to_string()),
-        Err(e) => Err(format!("NEXUS-6 not found at {}: {}", nexus6_bin, e)),
+        Err(e) => Err(format!("NEXUS-6 not found at {}: {}", nexus_bin, e)),
     }
 }
 
 /// Run NEXUS-6 verify on a value.
-pub fn nexus6_verify(value: f64) -> Result<String, String> {
-    let nexus6_bin = format!(
-        "{}/Dev/n6-architecture/tools/nexus6/target/release/nexus6",
+pub fn nexus_verify(value: f64) -> Result<String, String> {
+    let nexus_bin = format!(
+        "{}/Dev/n6-architecture/tools/nexus/target/release/nexus",
         std::env::var("HOME").unwrap_or_else(|_| "/Users/ghost".into())
     );
 
-    let result = std::process::Command::new(&nexus6_bin)
+    let result = std::process::Command::new(&nexus_bin)
         .args(["verify", &value.to_string()])
         .output();
 
