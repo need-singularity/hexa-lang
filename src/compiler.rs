@@ -895,6 +895,7 @@ fn is_builtin(name: &str) -> bool {
         | "asin" | "acos" | "atan" | "atan2"
         | "to_string" | "to_int" | "to_float"
         | "format" | "clock"
+        | "tensor" | "tensor_zeros" | "tensor_fill"
     )
 }
 
