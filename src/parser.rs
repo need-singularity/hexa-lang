@@ -1707,13 +1707,15 @@ impl Parser {
         Ok(left)
     }
 
-    // Level 5.4: + -
+    // Level 5.4: + - | ^ &  (bitwise mixed into additive for simplicity)
     fn parse_addition(&mut self) -> Result<Expr, HexaError> {
         let mut left = self.parse_multiplication()?;
         loop {
             let op = match self.peek() {
                 Token::Plus => BinOp::Add,
                 Token::Minus => BinOp::Sub,
+                Token::BitXor => BinOp::BitXor,
+                Token::BitAnd => BinOp::BitAnd,
                 _ => break,
             };
             self.advance();
