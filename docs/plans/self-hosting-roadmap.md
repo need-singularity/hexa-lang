@@ -117,6 +117,13 @@
 
 ---
 
+## 알려진 이슈
+
+1. **parser.hexa 셀프컴파일**: codegen_c2가 C 코드를 문자열 결합(+=)으로 생성하므로 O(n²). 
+   parser 3,169줄 처리 시 80분+ 소요 후에도 미완료. 스트리밍 출력 또는 StringBuilder 패턴 필요.
+2. **interpreter.hexa**: `#{}` 빈 맵 리터럴이 self-host 파서에서 kind="" 생성 → codegen fallback.
+3. **-Wno-return-type**: type_checker의 일부 함수가 모든 경로에서 반환하지 않음.
+
 ## 핵심 원칙
 
 1. **점진적 전환**: Rust 컴파일러는 Phase 5 완료까지 유지 (빌드 가능 상태)
