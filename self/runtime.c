@@ -494,21 +494,45 @@ HexaVal hexa_format(HexaVal fmt, HexaVal arg) {
 }
 
 HexaVal hexa_format_n(HexaVal fmt, HexaVal args) {
-    // Multi-arg: replace each {} with successive args
+    // Multi-arg: replace {} and {:.N} with successive args
     if (fmt.tag != TAG_STR || args.tag != TAG_ARRAY) return fmt;
-    char* result = malloc(strlen(fmt.s) * 2 + args.arr.len * 64);
+    char* result = malloc(strlen(fmt.s) * 4 + args.arr.len * 64 + 256);
     result[0] = 0;
     char* src = fmt.s;
     int ai = 0;
     while (*src) {
-        if (src[0] == '{' && src[1] == '}' && ai < args.arr.len) {
-            HexaVal sarg = hexa_to_string(args.arr.items[ai++]);
-            strcat(result, sarg.s);
-            src += 2;
+        if (src[0] == '{' && ai < args.arr.len) {
+            // Find closing }
+            char* close = strchr(src, '}');
+            if (close) {
+                int speclen = (int)(close - src - 1);
+                char spec[32] = {0};
+                if (speclen > 0 && speclen < 31) memcpy(spec, src+1, speclen);
+                char buf[128];
+                HexaVal arg = args.arr.items[ai++];
+                if (spec[0] == ':' && spec[1] == '.') {
+                    // Precision format {:.N}
+                    int prec = atoi(spec + 2);
+                    double val = (arg.tag == TAG_FLOAT) ? arg.f : (double)arg.i;
+                    snprintf(buf, sizeof(buf), "%.*f", prec, val);
+                } else if (spec[0] == 0) {
+                    // Simple {}
+                    HexaVal s = hexa_to_string(arg);
+                    strncpy(buf, s.s, sizeof(buf)-1); buf[sizeof(buf)-1]=0;
+                } else {
+                    HexaVal s = hexa_to_string(arg);
+                    strncpy(buf, s.s, sizeof(buf)-1); buf[sizeof(buf)-1]=0;
+                }
+                strcat(result, buf);
+                src = close + 1;
+            } else {
+                int len = strlen(result);
+                result[len] = *src; result[len+1] = 0;
+                src++;
+            }
         } else {
             int len = strlen(result);
-            result[len] = *src;
-            result[len+1] = 0;
+            result[len] = *src; result[len+1] = 0;
             src++;
         }
     }
