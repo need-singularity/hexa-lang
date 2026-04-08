@@ -236,6 +236,83 @@ int64_t hexa_str_index_of(HexaVal s, HexaVal sub) {
     return (int64_t)(p - s.s);
 }
 
+// ── Array operations ─────────────────────────────────
+HexaVal hexa_array_pop(HexaVal arr) {
+    if (arr.tag != TAG_ARRAY || arr.arr.len == 0) return hexa_void();
+    return arr.arr.items[arr.arr.len - 1];
+}
+
+HexaVal hexa_array_reverse(HexaVal arr) {
+    if (arr.tag != TAG_ARRAY) return arr;
+    HexaVal result = hexa_array_new();
+    for (int i = arr.arr.len - 1; i >= 0; i--)
+        result = hexa_array_push(result, arr.arr.items[i]);
+    return result;
+}
+
+static int hexa_sort_cmp(const void* a, const void* b) {
+    HexaVal va = *(const HexaVal*)a, vb = *(const HexaVal*)b;
+    if (va.tag == TAG_INT && vb.tag == TAG_INT) return va.i < vb.i ? -1 : va.i > vb.i ? 1 : 0;
+    if (va.tag == TAG_FLOAT && vb.tag == TAG_FLOAT) return va.f < vb.f ? -1 : va.f > vb.f ? 1 : 0;
+    return 0;
+}
+
+HexaVal hexa_array_sort(HexaVal arr) {
+    if (arr.tag != TAG_ARRAY) return arr;
+    HexaVal result = arr;
+    result.arr.items = (HexaVal*)malloc(sizeof(HexaVal) * arr.arr.len);
+    memcpy(result.arr.items, arr.arr.items, sizeof(HexaVal) * arr.arr.len);
+    qsort(result.arr.items, result.arr.len, sizeof(HexaVal), hexa_sort_cmp);
+    return result;
+}
+
+// ── Exec ────────────────────────────────────────────
+HexaVal hexa_exec(HexaVal cmd) {
+    if (cmd.tag != TAG_STR) return hexa_str("");
+    FILE* fp = popen(cmd.s, "r");
+    if (!fp) return hexa_str("");
+    char buf[4096]; size_t total = 0;
+    char* result = (char*)malloc(4096); result[0] = '\0';
+    size_t cap = 4096;
+    while (fgets(buf, sizeof(buf), fp)) {
+        size_t len = strlen(buf);
+        if (total + len >= cap) { cap *= 2; result = (char*)realloc(result, cap); }
+        strcat(result, buf);
+        total += len;
+    }
+    pclose(fp);
+    return hexa_str_own(result);
+}
+
+// ── Stderr ──────────────────────────────────────────
+void hexa_eprint_val(HexaVal v) {
+    if (v.tag == TAG_STR) fprintf(stderr, "%s", v.s);
+    else if (v.tag == TAG_INT) fprintf(stderr, "%lld", (long long)v.i);
+    else if (v.tag == TAG_FLOAT) fprintf(stderr, "%g", v.f);
+    else if (v.tag == TAG_BOOL) fprintf(stderr, v.b ? "true" : "false");
+}
+
+// ── Try/catch (setjmp based) ────────────────────────
+#include <setjmp.h>
+#define HEXA_MAX_TRY 64
+static jmp_buf* __hexa_try_stack[HEXA_MAX_TRY];
+static int __hexa_try_top = 0;
+static HexaVal __hexa_error_val;
+
+void __hexa_try_push(jmp_buf* jb) { if (__hexa_try_top < HEXA_MAX_TRY) __hexa_try_stack[__hexa_try_top++] = jb; }
+void __hexa_try_pop(void) { if (__hexa_try_top > 0) __hexa_try_top--; }
+HexaVal __hexa_last_error(void) { return __hexa_error_val; }
+
+void hexa_throw(HexaVal err) {
+    __hexa_error_val = err;
+    if (__hexa_try_top > 0) {
+        __hexa_try_top--;
+        longjmp(*__hexa_try_stack[__hexa_try_top], 1);
+    }
+    fprintf(stderr, "Unhandled throw\n");
+    exit(1);
+}
+
 // ── Printing ─────────────────────────────────────────────
 
 void hexa_print_val(HexaVal v) {
