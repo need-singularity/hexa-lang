@@ -242,6 +242,7 @@ impl Interpreter {
 
     /// Write a string followed by newline to the output.
     fn writeln_output(&self, s: &str) {
+        use std::io::Write;
         if let Some(ref buf) = self.output_capture {
             if let Ok(mut b) = buf.lock() {
                 b.push_str(s);
@@ -249,11 +250,13 @@ impl Interpreter {
             }
         } else {
             println!("{}", s);
+            let _ = std::io::stdout().flush();
         }
     }
 
     /// Write a string followed by newline to stderr.
     fn ewriteln_output(&self, s: &str) {
+        use std::io::Write;
         if let Some(ref buf) = self.output_capture {
             if let Ok(mut b) = buf.lock() {
                 b.push_str(s);
@@ -261,6 +264,7 @@ impl Interpreter {
             }
         } else {
             eprintln!("{}", s);
+            let _ = std::io::stderr().flush();
         }
     }
 
@@ -3298,7 +3302,7 @@ impl Interpreter {
         }
     }
 
-    fn call_map_method(&mut self, map: &HashMap<String, Value>, method: &str, _args: Vec<Value>) -> Result<Value, HexaError> {
+    fn call_map_method(&mut self, map: &HashMap<String, Value>, method: &str, args: Vec<Value>) -> Result<Value, HexaError> {
         match method {
             "len" => Ok(Value::Int(map.len() as i64)),
             "keys" => {
@@ -3308,6 +3312,31 @@ impl Interpreter {
             "values" => {
                 let vals: Vec<Value> = map.values().cloned().collect();
                 Ok(Value::Array(vals))
+            }
+            "has" | "contains" | "contains_key" => {
+                if args.is_empty() {
+                    return Err(self.runtime_err(format!(".{}() requires 1 argument", method)));
+                }
+                match &args[0] {
+                    Value::Str(k) => Ok(Value::Bool(map.contains_key(k))),
+                    _ => Err(self.type_err(format!(".{}() requires string key", method))),
+                }
+            }
+            "get" => {
+                // .get(key) → Value or Void;  .get(key, default) → Value or default
+                if args.is_empty() {
+                    return Err(self.runtime_err(".get() requires at least 1 argument".into()));
+                }
+                let key = match &args[0] {
+                    Value::Str(k) => k.clone(),
+                    _ => return Err(self.type_err(".get() requires string key".into())),
+                };
+                match map.get(&key) {
+                    Some(v) => Ok(v.clone()),
+                    None => {
+                        if args.len() >= 2 { Ok(args[1].clone()) } else { Ok(Value::Void) }
+                    }
+                }
             }
             _ => Err(self.runtime_err(format!("unknown map method: .{}()", method))),
         }
@@ -6215,6 +6244,44 @@ impl Interpreter {
                     Value::Int(n) => Ok(Value::Float((*n as f64).tan())),
                     _ => Err(self.type_err("tan() requires numeric argument".into())),
                 }
+            }
+            "asin" => {
+                if args.is_empty() { return Err(self.type_err("asin() requires 1 argument".into())); }
+                match &args[0] {
+                    Value::Float(f) => Ok(Value::Float(f.asin())),
+                    Value::Int(n) => Ok(Value::Float((*n as f64).asin())),
+                    _ => Err(self.type_err("asin() requires numeric argument".into())),
+                }
+            }
+            "acos" => {
+                if args.is_empty() { return Err(self.type_err("acos() requires 1 argument".into())); }
+                match &args[0] {
+                    Value::Float(f) => Ok(Value::Float(f.acos())),
+                    Value::Int(n) => Ok(Value::Float((*n as f64).acos())),
+                    _ => Err(self.type_err("acos() requires numeric argument".into())),
+                }
+            }
+            "atan" => {
+                if args.is_empty() { return Err(self.type_err("atan() requires 1 argument".into())); }
+                match &args[0] {
+                    Value::Float(f) => Ok(Value::Float(f.atan())),
+                    Value::Int(n) => Ok(Value::Float((*n as f64).atan())),
+                    _ => Err(self.type_err("atan() requires numeric argument".into())),
+                }
+            }
+            "atan2" => {
+                if args.len() < 2 { return Err(self.type_err("atan2() requires 2 arguments".into())); }
+                let y = match &args[0] {
+                    Value::Float(f) => *f,
+                    Value::Int(n) => *n as f64,
+                    _ => return Err(self.type_err("atan2() requires numeric arguments".into())),
+                };
+                let x = match &args[1] {
+                    Value::Float(f) => *f,
+                    Value::Int(n) => *n as f64,
+                    _ => return Err(self.type_err("atan2() requires numeric arguments".into())),
+                };
+                Ok(Value::Float(y.atan2(x)))
             }
             // ── Format builtins ────────────────────────────────────
             "format" => {

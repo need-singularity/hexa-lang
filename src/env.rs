@@ -236,6 +236,10 @@ impl Env {
         env.define_builtin("sin", Value::BuiltinFn("sin".into()));
         env.define_builtin("cos", Value::BuiltinFn("cos".into()));
         env.define_builtin("tan", Value::BuiltinFn("tan".into()));
+        env.define_builtin("asin", Value::BuiltinFn("asin".into()));
+        env.define_builtin("acos", Value::BuiltinFn("acos".into()));
+        env.define_builtin("atan", Value::BuiltinFn("atan".into()));
+        env.define_builtin("atan2", Value::BuiltinFn("atan2".into()));
         env.define_builtin("PI", Value::Float(std::f64::consts::PI));
         env.define_builtin("E", Value::Float(std::f64::consts::E));
         env.define_builtin("format", Value::BuiltinFn("format".into()));
