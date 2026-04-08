@@ -3745,6 +3745,33 @@ impl Interpreter {
                 };
                 Ok(Value::Tensor(Arc::new(TensorData { shape, data })))
             }
+            "tensor_zeros" => {
+                if args.len() != 1 {
+                    return Err(self.type_err("tensor_zeros(n) requires 1 argument".into()));
+                }
+                let n = match &args[0] {
+                    Value::Int(i) if *i >= 0 => *i as usize,
+                    _ => return Err(self.type_err("tensor_zeros(n): n must be non-negative int".into())),
+                };
+                let data = vec![0.0f64; n];
+                Ok(Value::Tensor(Arc::new(TensorData { shape: vec![n], data })))
+            }
+            "tensor_fill" => {
+                if args.len() != 2 {
+                    return Err(self.type_err("tensor_fill(n, v) requires 2 arguments".into()));
+                }
+                let n = match &args[0] {
+                    Value::Int(i) if *i >= 0 => *i as usize,
+                    _ => return Err(self.type_err("tensor_fill(n, v): n must be non-negative int".into())),
+                };
+                let v = match &args[1] {
+                    Value::Float(f) => *f,
+                    Value::Int(i) => *i as f64,
+                    _ => return Err(self.type_err("tensor_fill(n, v): v must be numeric".into())),
+                };
+                let data = vec![v; n];
+                Ok(Value::Tensor(Arc::new(TensorData { shape: vec![n], data })))
+            }
             "mmap_weights" => {
                 // mmap_weights(path) → [names_array, tensors_array]
                 // Same HEXAW binary format as load_weights_bin, but uses memory-mapped I/O
@@ -4290,13 +4317,16 @@ impl Interpreter {
             "mat_add" => {
                 // mat_add(a, b) → element-wise addition of arrays/tensors
                 if args.len() < 2 { return Err(self.type_err("mat_add() requires 2 arrays".into())); }
+                let is_tensor = matches!(&args[0], Value::Tensor(_)) && matches!(&args[1], Value::Tensor(_));
                 if let (Some(a_s), Some(b_s)) = (to_f64_slice(&args[0]), to_f64_slice(&args[1])) {
                     let af = a_s.as_slice();
                     let bf = b_s.as_slice();
-                    let result: Vec<Value> = af.iter().zip(bf.iter()).map(|(x, y)| {
-                        Value::Float(x + y)
-                    }).collect();
-                    Ok(Value::Array(result))
+                    let result: Vec<f64> = af.iter().zip(bf.iter()).map(|(x, y)| x + y).collect();
+                    if is_tensor {
+                        Ok(Value::Tensor(Arc::new(TensorData { shape: vec![result.len()], data: result })))
+                    } else {
+                        Ok(Value::Array(result.into_iter().map(Value::Float).collect()))
+                    }
                 } else {
                     Err(self.type_err("mat_add() requires 2 arrays/tensors".into()))
                 }
@@ -4304,11 +4334,16 @@ impl Interpreter {
             "mat_scale" => {
                 // mat_scale(arr, scalar) → element-wise scaling
                 if args.len() < 2 { return Err(self.type_err("mat_scale() requires (array, scalar)".into())); }
+                let is_tensor = matches!(&args[0], Value::Tensor(_));
                 if let Some(a_s) = to_f64_slice(&args[0]) {
                     let s = match &args[1] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 1.0 };
                     let af = a_s.as_slice();
-                    let result: Vec<Value> = af.iter().map(|x| Value::Float(x * s)).collect();
-                    Ok(Value::Array(result))
+                    let result: Vec<f64> = af.iter().map(|x| x * s).collect();
+                    if is_tensor {
+                        Ok(Value::Tensor(Arc::new(TensorData { shape: vec![result.len()], data: result })))
+                    } else {
+                        Ok(Value::Array(result.into_iter().map(Value::Float).collect()))
+                    }
                 } else {
                     Err(self.type_err("mat_scale() requires (array/tensor, scalar)".into()))
                 }
@@ -4526,20 +4561,25 @@ impl Interpreter {
             "hadamard" => {
                 // hadamard(a, b) → element-wise multiply (array/tensor)
                 if args.len() < 2 { return Err(self.type_err("hadamard() requires 2 arrays".into())); }
+                let is_tensor = matches!(&args[0], Value::Tensor(_)) && matches!(&args[1], Value::Tensor(_));
                 if let (Some(a_s), Some(b_s)) = (to_f64_slice(&args[0]), to_f64_slice(&args[1])) {
                     let af = a_s.as_slice();
                     let bf = b_s.as_slice();
                     #[cfg(not(target_arch = "wasm32"))]
                     if af.len() > 1000 {
-                        let result: Vec<Value> = af.par_iter().zip(bf.par_iter()).map(|(x, y)| {
-                            Value::Float(x * y)
-                        }).collect();
-                        return Ok(Value::Array(result));
+                        let result: Vec<f64> = af.par_iter().zip(bf.par_iter()).map(|(x, y)| x * y).collect();
+                        if is_tensor {
+                            return Ok(Value::Tensor(Arc::new(TensorData { shape: vec![result.len()], data: result })));
+                        } else {
+                            return Ok(Value::Array(result.into_iter().map(Value::Float).collect()));
+                        }
                     }
-                    let result: Vec<Value> = af.iter().zip(bf.iter()).map(|(x, y)| {
-                        Value::Float(x * y)
-                    }).collect();
-                    Ok(Value::Array(result))
+                    let result: Vec<f64> = af.iter().zip(bf.iter()).map(|(x, y)| x * y).collect();
+                    if is_tensor {
+                        Ok(Value::Tensor(Arc::new(TensorData { shape: vec![result.len()], data: result })))
+                    } else {
+                        Ok(Value::Array(result.into_iter().map(Value::Float).collect()))
+                    }
                 } else { Err(self.type_err("hadamard() requires 2 arrays/tensors".into())) }
             }
             // ── Consciousness topology builtins (Anima-native) ──
@@ -4768,22 +4808,24 @@ impl Interpreter {
             "embedding" => {
                 // embedding(tokens, weight, vocab_size, dim) → [batch × dim] embeddings
                 // tokens: array of int indices, weight: flat [vocab_size × dim]
+                // Supports both Array and Tensor weights
                 if args.len() < 4 { return Err(self.type_err("embedding() requires (tokens, weight, vocab_size, dim)".into())); }
-                if let (Value::Array(tokens), Value::Array(w), Value::Int(_vs), Value::Int(dim)) = (&args[0], &args[1], &args[2], &args[3]) {
-                    let dim = *dim as usize;
-                    let mut result = Vec::with_capacity(tokens.len() * dim);
-                    for tok in tokens {
-                        let idx = match tok { Value::Int(i) => *i as usize, _ => 0 };
-                        for d in 0..dim {
-                            if idx * dim + d < w.len() {
-                                result.push(w[idx * dim + d].clone());
-                            } else {
-                                result.push(Value::Float(0.0));
-                            }
-                        }
+                let tokens = match &args[0] { Value::Array(a) => a, _ => return Err(self.type_err("embedding: tokens must be array".into())) };
+                let dim = match &args[3] { Value::Int(d) => *d as usize, _ => return Err(self.type_err("embedding: dim must be int".into())) };
+                let wf = match to_f64_slice(&args[1]) {
+                    Some(s) => s,
+                    None => return Err(self.type_err("embedding: weight must be array or tensor".into()))
+                };
+                let w = wf.as_slice();
+                let mut result = Vec::with_capacity(tokens.len() * dim);
+                for tok in tokens {
+                    let idx = match tok { Value::Int(i) => *i as usize, _ => 0 };
+                    for d in 0..dim {
+                        let pos = idx * dim + d;
+                        result.push(Value::Float(if pos < w.len() { w[pos] } else { 0.0 }));
                     }
-                    Ok(Value::Array(result))
-                } else { Err(self.type_err("embedding() type error".into())) }
+                }
+                Ok(Value::Array(result))
             }
             "attention" => {
                 // attention(Q, K, V, seq_len, dim, causal) → output [seq_len × dim]
@@ -4853,8 +4895,8 @@ impl Interpreter {
                         }).collect()))
                     }
                     Value::Tensor(t) => {
-                        let result: Vec<Value> = t.data.iter().map(|x| Value::Float(compute(*x))).collect();
-                        Ok(Value::Array(result))
+                        let result: Vec<f64> = t.data.iter().map(|x| compute(*x)).collect();
+                        Ok(Value::Tensor(Arc::new(TensorData { shape: vec![result.len()], data: result })))
                     }
                     _ => Err(self.type_err("gelu() type error".into())),
                 }
@@ -4881,8 +4923,8 @@ impl Interpreter {
                         }).collect()))
                     }
                     Value::Tensor(t) => {
-                        let result: Vec<Value> = t.data.iter().map(|x| Value::Float(compute(*x))).collect();
-                        Ok(Value::Array(result))
+                        let result: Vec<f64> = t.data.iter().map(|x| compute(*x)).collect();
+                        Ok(Value::Tensor(Arc::new(TensorData { shape: vec![result.len()], data: result })))
                     }
                     _ => Err(self.type_err("silu() type error".into())),
                 }
@@ -5586,13 +5628,14 @@ impl Interpreter {
                 // Simpler than LayerNorm: no mean subtraction, just scale by RMS
                 if args.len() < 2 { return Err(self.type_err("rms_norm() requires (array, dim)".into())); }
                 let dim = match &args[1] { Value::Int(d) => *d as usize, _ => return Err(self.type_err("rms_norm() type error".into())) };
+                let is_tensor = matches!(&args[0], Value::Tensor(_));
                 if let Some(x_s) = to_f64_slice(&args[0]) {
                     let xf = x_s.as_slice();
                     let eps = if args.len() > 2 { match &args[2] { Value::Float(f) => *f, _ => 1e-6 } } else { 1e-6 };
                     let n_samples = xf.len() / dim;
                     #[cfg(not(target_arch = "wasm32"))]
                     if n_samples > 1 && xf.len() > 1000 {
-                        let result: Vec<Value> = (0..n_samples).into_par_iter().flat_map(|s| {
+                        let result: Vec<f64> = (0..n_samples).into_par_iter().flat_map(|s| {
                             let mut sq_sum = 0.0f64;
                             for d in 0..dim {
                                 let v = xf[s * dim + d];
@@ -5600,12 +5643,16 @@ impl Interpreter {
                             }
                             let rms = (sq_sum / dim as f64 + eps).sqrt();
                             (0..dim).map(move |d| {
-                                Value::Float(xf[s * dim + d] / rms)
+                                xf[s * dim + d] / rms
                             }).collect::<Vec<_>>()
                         }).collect();
-                        return Ok(Value::Array(result));
+                        if is_tensor {
+                            return Ok(Value::Tensor(Arc::new(TensorData { shape: vec![result.len()], data: result })));
+                        } else {
+                            return Ok(Value::Array(result.into_iter().map(Value::Float).collect()));
+                        }
                     }
-                    let mut result = Vec::with_capacity(xf.len());
+                    let mut result: Vec<f64> = Vec::with_capacity(xf.len());
                     for s in 0..n_samples {
                         let mut sq_sum = 0.0f64;
                         for d in 0..dim {
@@ -5614,10 +5661,14 @@ impl Interpreter {
                         }
                         let rms = (sq_sum / dim as f64 + eps).sqrt();
                         for d in 0..dim {
-                            result.push(Value::Float(xf[s * dim + d] / rms));
+                            result.push(xf[s * dim + d] / rms);
                         }
                     }
-                    Ok(Value::Array(result))
+                    if is_tensor {
+                        Ok(Value::Tensor(Arc::new(TensorData { shape: vec![result.len()], data: result })))
+                    } else {
+                        Ok(Value::Array(result.into_iter().map(Value::Float).collect()))
+                    }
                 } else { Err(self.type_err("rms_norm() type error".into())) }
             }
             "rope" => {
