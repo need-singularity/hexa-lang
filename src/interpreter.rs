@@ -18,6 +18,19 @@ use crate::proof_engine;
 use crate::type_checker::SpecKey;
 use crate::inline_cache::{InlineCache, CallSiteId};
 
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn cblas_dgemm(order: i32, transA: i32, transB: i32,
+                   M: i32, N: i32, K: i32,
+                   alpha: f64, A: *const f64, lda: i32,
+                   B: *const f64, ldb: i32,
+                   beta: f64, C: *mut f64, ldc: i32);
+}
+#[cfg(target_os = "macos")]
+const CBLAS_ROW_MAJOR: i32 = 101;
+#[cfg(target_os = "macos")]
+const CBLAS_NO_TRANS: i32 = 111;
+
 /// Sentinel error message used to propagate `return` across call frames.
 const RETURN_SENTINEL: &str = "__hexa_return__";
 
@@ -4229,6 +4242,51 @@ impl Interpreter {
                     Err(self.type_err("matvec() requires (array/tensor, array/tensor, int, int)".into()))
                 }
             }
+            "repeat_kv" => {
+                // repeat_kv(kv, seq_len, n_kv, head_dim, n_q) → repeated [seq × n_q × head_dim]
+                if args.len() < 5 { return Err(self.type_err("repeat_kv() requires (kv, seq_len, n_kv, head_dim, n_q)".into())); }
+                let seq = match &args[1] { Value::Int(i) => *i as usize, _ => return Err(self.type_err("repeat_kv: seq must be int".into())) };
+                let n_kv = match &args[2] { Value::Int(i) => *i as usize, _ => return Err(self.type_err("repeat_kv: n_kv must be int".into())) };
+                let hd = match &args[3] { Value::Int(i) => *i as usize, _ => return Err(self.type_err("repeat_kv: hd must be int".into())) };
+                let n_q = match &args[4] { Value::Int(i) => *i as usize, _ => return Err(self.type_err("repeat_kv: n_q must be int".into())) };
+                let n_rep = n_q / n_kv;
+                let kv_dim = n_kv * hd;
+                let out_dim = n_q * hd;
+                let kvf = match to_f64_slice(&args[0]) {
+                    Some(s) => s,
+                    None => return Err(self.type_err("repeat_kv: first arg must be array or tensor".into()))
+                };
+                let kv = kvf.as_slice();
+                let mut out = Vec::with_capacity(seq * out_dim);
+                for si in 0..seq {
+                    for hi in 0..n_kv {
+                        for _ri in 0..n_rep {
+                            for di in 0..hd {
+                                out.push(Value::Float(kv[si * kv_dim + hi * hd + di]));
+                            }
+                        }
+                    }
+                }
+                Ok(Value::Array(out))
+            }
+            "weight_dict" => {
+                // weight_dict(names_array, tensors_array) → Map for O(1) weight lookup
+                if args.len() < 2 { return Err(self.type_err("weight_dict() requires (names, tensors)".into())); }
+                if let (Value::Array(names), Value::Array(tensors)) = (&args[0], &args[1]) {
+                    if names.len() != tensors.len() {
+                        return Err(self.type_err(format!("weight_dict: names({}) != tensors({})", names.len(), tensors.len())));
+                    }
+                    let mut map = HashMap::new();
+                    for (n, t) in names.iter().zip(tensors.iter()) {
+                        if let Value::Str(key) = n {
+                            map.insert(key.clone(), t.clone());
+                        }
+                    }
+                    Ok(Value::Map(Box::new(map)))
+                } else {
+                    Err(self.type_err("weight_dict() requires (array, array)".into()))
+                }
+            }
             "mat_add" => {
                 // mat_add(a, b) → element-wise addition of arrays/tensors
                 if args.len() < 2 { return Err(self.type_err("mat_add() requires 2 arrays".into())); }
@@ -4266,7 +4324,17 @@ impl Interpreter {
                     let af = a_s.as_slice();
                     let bf = b_s.as_slice();
                     let mut c = vec![0.0f64; m * n];
-                    #[cfg(not(target_arch = "wasm32"))]
+                    #[cfg(target_os = "macos")]
+                    unsafe {
+                        cblas_dgemm(
+                            CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                            m as i32, n as i32, k as i32,
+                            1.0, af.as_ptr(), k as i32,
+                            bf.as_ptr(), n as i32,
+                            0.0, c.as_mut_ptr(), n as i32,
+                        );
+                    }
+                    #[cfg(all(not(target_os = "macos"), not(target_arch = "wasm32")))]
                     if m >= 64 {
                         c.par_chunks_mut(n).enumerate().for_each(|(i, row)| {
                             for p in 0..k {
