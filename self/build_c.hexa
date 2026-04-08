@@ -226,9 +226,11 @@ fn tokenize(src) {
             toks = toks.push(mk("RSq", c))
             i = i + 1
         } else if c == "@" {
-            // @attr 또는 @attr(args) skip
+            // @attr 또는 @attr(args)
             i = i + 1
+            let astart = i
             while i < n && (is_alpha_at(cs, i) || is_digit_s(cs_at(cs, i))) { i = i + 1 }
+            let aname = slice_str(cs, astart, i)
             // 옵션 (args) 균형 skip
             if i < n && cs_at(cs, i) == "(" {
                 let mut depth = 1
@@ -239,6 +241,8 @@ fn tokenize(src) {
                     i = i + 1
                 }
             }
+            // Attr 토큰 — parser에서 다음 fn에 부착
+            toks = toks.push(mk("Attr", aname))
         } else if c == "%" {
             toks = toks.push(mk("Percent", c))
             i = i + 1
@@ -365,7 +369,16 @@ fn n_block(stmts) {
 }
 fn n_fn(name, params, body) {
     // params: 이름 문자열 배열, body: Block 노드
-    return Node { kind: "Fn", value: name, op: "", left: "", right: body, cond: "", then_b: "", else_b: "", args: params }
+    // op 필드에 attribute joined string 저장
+    let mut attrs_str = ""
+    let mut ai = 0
+    while ai < len(pending_attrs) {
+        if ai > 0 { attrs_str = attrs_str + "," }
+        attrs_str = attrs_str + pending_attrs[ai]
+        ai = ai + 1
+    }
+    pending_attrs = []
+    return Node { kind: "Fn", value: name, op: attrs_str, left: "", right: body, cond: "", then_b: "", else_b: "", args: params }
 }
 fn n_return(e) {
     return Node { kind: "Return", value: "", op: "", left: e, right: "", cond: "", then_b: "", else_b: "", args: [] }
@@ -397,6 +410,7 @@ fn n_if_expr(c, te, ee) {
 let mut p_toks = []
 let mut p_pos = 0
 let mut for_in_counter = 0
+let mut pending_attrs = []
 
 fn p_peek() { return p_toks[p_pos] }
 fn p_kind() { return p_toks[p_pos].kind }
@@ -954,6 +968,11 @@ fn parse_fn() {
 
 fn parse_stmt() {
     p_skip_nl()
+    // Attr 누적 (Pure/inline/memoize 등)
+    while p_kind() == "Attr" {
+        pending_attrs = pending_attrs.push(p_advance().value)
+        p_skip_nl()
+    }
     let k = p_kind()
     if k == "Let" {
         p_advance()
@@ -2648,7 +2667,91 @@ fn user_fn_name(name) {
     return name
 }
 
+fn fn_has_attr(node, name) {
+    let s = node.op
+    if s == "" { return false }
+    // s 안에 name이 있는지 검사 (간이: contains)
+    if s == name { return true }
+    let parts = s.split(",")
+    let mut k = 0
+    while k < len(parts) {
+        if parts[k] == name { return true }
+        k = k + 1
+    }
+    return false
+}
+
+fn emit_memoize_wrapper(node) {
+    // @memoize fn name(p) { body }
+    // → static long __memo_<name>_keys[1024], __memo_<name>_vals[1024], __memo_<name>_valid[1024]
+    // → long __memo_orig_<name>(p) { body }
+    // → long <name>(p) { 캐시 체크 → hit:return val / miss:compute+store }
+    let name = node.value
+    let params = node.args
+    let nparams = len(params)
+    // N-arg: 키 N개 모두 저장 (slot당 nparams long), 해시는 FNV-mix
+    let mut s = ""
+    s = s + "static long __memo_" + name + "_keys[4096 * " + to_string(nparams) + "];\n"
+    s = s + "static long __memo_" + name + "_vals[4096];\n"
+    s = s + "static char __memo_" + name + "_valid[4096];\n\n"
+    // 원본 fn
+    let orig_node = Node { kind: "Fn", value: "__memo_orig_" + name, op: "", left: "", right: node.right, cond: "", then_b: "", else_b: "", args: node.args }
+    s = s + emit_fn_decl(orig_node)
+    // wrapper
+    let mut sig = "long " + name + "("
+    let mut i = 0
+    while i < nparams {
+        if i > 0 { sig = sig + ", " }
+        sig = sig + "long " + params[i]
+        i = i + 1
+    }
+    sig = sig + ")"
+    s = s + sig + " {\n"
+    // 해시: FNV-style mix of all params
+    s = s + "    unsigned long __h = 1469598103934665603UL;\n"
+    let mut hi = 0
+    while hi < nparams {
+        s = s + "    __h = (__h ^ (unsigned long)(" + params[hi] + ")) * 1099511628211UL;\n"
+        hi = hi + 1
+    }
+    s = s + "    long __idx = (long)(__h & 4095);\n"
+    s = s + "    long __base = __idx * " + to_string(nparams) + ";\n"
+    // 모든 키 일치 확인
+    s = s + "    if (__memo_" + name + "_valid[__idx]"
+    let mut ki = 0
+    while ki < nparams {
+        s = s + " && __memo_" + name + "_keys[__base + " + to_string(ki) + "] == " + params[ki]
+        ki = ki + 1
+    }
+    s = s + ") {\n"
+    s = s + "        return __memo_" + name + "_vals[__idx];\n"
+    s = s + "    }\n"
+    s = s + "    long __r = __memo_orig_" + name + "("
+    let mut j = 0
+    while j < nparams {
+        if j > 0 { s = s + ", " }
+        s = s + params[j]
+        j = j + 1
+    }
+    s = s + ");\n"
+    let mut si = 0
+    while si < nparams {
+        s = s + "    __memo_" + name + "_keys[__base + " + to_string(si) + "] = " + params[si] + ";\n"
+        si = si + 1
+    }
+    s = s + "    __memo_" + name + "_vals[__idx] = __r;\n"
+    s = s + "    __memo_" + name + "_valid[__idx] = 1;\n"
+    s = s + "    return __r;\n"
+    s = s + "}\n\n"
+    return s
+}
+
 fn emit_fn_decl(node) {
+    // @memoize 처리
+    if fn_has_attr(node, "memoize") {
+        // 재귀 시 cache lookup 받도록 wrapper만 emit (orig은 wrapper가 호출)
+        return emit_memoize_wrapper(node)
+    }
     // 파라미터 타입을 미리 env에 넣어 find_return_type이 Float 전파 가능
     let params = node.args
     let mut pi3 = 0
