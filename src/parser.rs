@@ -1,3 +1,4 @@
+// ⛔ CORE — L0 불변식 (파서 문법 정의. 수정 전 유저 승인 필수)
 #![allow(dead_code)]
 
 use crate::token::{Token, Spanned, Span};

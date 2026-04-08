@@ -1,3 +1,4 @@
+// ⛔ CORE — L0 불변식 (소유권 시스템. 수정 전 유저 승인 필수)
 //! Compile-time ownership analysis for Hexa.
 //!
 //! Walks the AST before interpretation to detect ownership violations

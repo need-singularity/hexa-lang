@@ -1,3 +1,22 @@
+## ⛔ L0 CORE 보호 파일 (AI 수정 승인 필수)
+
+> 아래 파일은 수렴 완료된 코어 로직. 수정 시 반드시 유저에게 승인 질문.
+> 상세: `nexus/shared/core-lockdown.json`
+
+```
+🔴 L0 (불변식 — 코드 수정 전 유저 명시 승인 필수):
+  src/interpreter.rs    — 인터프리터 코어 12,164줄
+  src/parser.rs         — 파서 문법 정의
+  src/lexer.rs          — 렉서 토큰화
+  src/ownership.rs      — 소유권 시스템
+  src/ir/               — HEXA-IR self-hosting 코어
+
+🟡 L1 (보호 — 리뷰 필요):
+  src/escape_analysis.rs — 이스케이프 분석
+  src/codegen.rs         — 코드 생성
+  tests/                 — 테스트 스위트
+```
+
 > 🔴 **AI-NATIVE FIRST**: 성능/자원 개선은 저수준 마이크로 최적화 금지 — **AI-native 알고리즘 교체로 돌파**만 추구. docs/ai-native.md 24종 벡터 로드맵 참조. @optimize/@memoize/@fuse/@parallel 등 attr 시스템으로 구현.
 
 > 🔴 **HEXA-FIRST**: 모든 코드는 `.hexa`로 작성. 부하 유발 명령 최소화.
