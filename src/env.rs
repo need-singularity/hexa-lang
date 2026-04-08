@@ -431,6 +431,8 @@ impl Env {
         env.define_builtin("readline", Value::BuiltinFn("readline".into()));
         env.define_builtin("read_stdin", Value::BuiltinFn("read_stdin".into()));
         env.define_builtin("input_all", Value::BuiltinFn("input_all".into()));
+        env.define_builtin("load_weights_bin", Value::BuiltinFn("load_weights_bin".into()));
+        env.define_builtin("to_char", Value::BuiltinFn("to_char".into()));
         env
 
     }

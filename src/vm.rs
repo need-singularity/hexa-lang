@@ -1322,6 +1322,70 @@ impl VM {
                 let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
                 Ok(Value::Float(now.as_secs_f64()))
             }
+            "to_char" => {
+                if args.is_empty() { return Err(runtime_err("to_char() requires 1 int argument".into())); }
+                match &args[0] {
+                    Value::Int(n) => {
+                        if let Some(c) = char::from_u32(*n as u32) {
+                            Ok(Value::Str(c.to_string()))
+                        } else {
+                            Ok(Value::Str("?".to_string()))
+                        }
+                    }
+                    _ => Err(runtime_err("to_char() requires int".into())),
+                }
+            }
+            "load_weights_bin" => {
+                // load_weights_bin(path) → [names_array, tensors_array]
+                if args.is_empty() { return Err(runtime_err("load_weights_bin() requires 1 argument".into())); }
+                match &args[0] {
+                    Value::Str(path) => {
+                        use std::io::Read;
+                        let mut file = match std::fs::File::open(path) {
+                            Ok(f) => f,
+                            Err(e) => return Err(runtime_err(format!("load_weights_bin: {}", e))),
+                        };
+                        let mut buf = Vec::new();
+                        file.read_to_end(&mut buf).map_err(|e| runtime_err(format!("read error: {}", e)))?;
+                        if buf.len() < 14 || &buf[0..6] != b"HEXAW\0" {
+                            return Err(runtime_err("invalid HEXAW header".into()));
+                        }
+                        let mut pos = 6usize;
+                        let _version = u32::from_le_bytes([buf[pos], buf[pos+1], buf[pos+2], buf[pos+3]]);
+                        pos += 4;
+                        let n_tensors = u32::from_le_bytes([buf[pos], buf[pos+1], buf[pos+2], buf[pos+3]]) as usize;
+                        pos += 4;
+                        let mut names = Vec::with_capacity(n_tensors);
+                        let mut tensors = Vec::with_capacity(n_tensors);
+                        for _ in 0..n_tensors {
+                            if pos + 4 > buf.len() { break; }
+                            let name_len = u32::from_le_bytes([buf[pos], buf[pos+1], buf[pos+2], buf[pos+3]]) as usize;
+                            pos += 4;
+                            let name = String::from_utf8_lossy(&buf[pos..pos+name_len]).to_string();
+                            pos += name_len;
+                            let ndim = u32::from_le_bytes([buf[pos], buf[pos+1], buf[pos+2], buf[pos+3]]) as usize;
+                            pos += 4;
+                            let mut numel = 1usize;
+                            for _ in 0..ndim {
+                                let s = u32::from_le_bytes([buf[pos], buf[pos+1], buf[pos+2], buf[pos+3]]) as usize;
+                                pos += 4;
+                                numel *= s;
+                            }
+                            let mut values = Vec::with_capacity(numel);
+                            for _ in 0..numel {
+                                if pos + 4 > buf.len() { break; }
+                                let f = f32::from_le_bytes([buf[pos], buf[pos+1], buf[pos+2], buf[pos+3]]);
+                                pos += 4;
+                                values.push(Value::Float(f as f64));
+                            }
+                            names.push(Value::Str(name));
+                            tensors.push(Value::Array(values));
+                        }
+                        Ok(Value::Array(vec![Value::Array(names), Value::Array(tensors)]))
+                    }
+                    _ => Err(runtime_err("load_weights_bin() requires string path".into())),
+                }
+            }
             _ => Err(runtime_err(format!("unknown builtin: {}", name))),
         }
     }
