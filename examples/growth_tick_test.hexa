@@ -1,0 +1,188 @@
+// mk2_hexa/native/growth_tick.hexa — 성장 틱 처리 (Python 대체)
+// 사용: hexa growth_tick.hexa <source> <growth_json_path>
+// growth_state.json의 interaction_count 증가 + stage 승격
+
+// ─── Preflight Gates (리소스 가드) ───
+
+fn preflight_check() -> bool {
+    let home = exec("printenv HOME")
+    let shared_dir = home + "/Dev/nexus/shared"
+    let log_path = shared_dir + "/growth_tick_preflight.log"
+    let ts = exec("date +%Y-%m-%dT%H:%M:%S").trim()
+
+    // Gate 1: halt file 체크 — shared/.halt 존재 시 즉시 스킵
+    let halt_path = shared_dir + "/.halt"
+    let halt_check = exec("bash -c test -f " + halt_path + " && echo YES || echo NO").trim()
+    if halt_check == "YES" {
+        let msg = ts + " [SKIP] .halt file present — tick aborted\n"
+        try { append_file(log_path, msg) } catch e {}
+        return false
+    }
+
+    // Gate 2: 메모리 체크 — vm_stat → free pages × 4K → MB
+    let vm_raw = exec("vm_stat")
+    let mut free_mb = 9999
+    if vm_raw.contains("Pages free") {
+        let parts = vm_raw.split("Pages free:")
+        if parts.len() >= 2 {
+            let val_str = parts[1].split("\n")[0].trim().replace(".", "")
+            let pages = to_int(val_str.trim())
+            free_mb = (pages * 4) / 1024
+        }
+    }
+    if free_mb < 500 {
+        let msg = ts + " [SKIP] low memory: " + to_string(free_mb) + "MB free (threshold: 500MB)\n"
+        try { append_file(log_path, msg) } catch e {}
+        return false
+    }
+
+    // Gate 3: 로드 체크 — sysctl vm.loadavg → 1분 평균
+    let load_raw = exec("sysctl -n vm.loadavg").trim()
+    // 형식: "{ 2.34 1.56 1.23 }" — 1분 평균 추출
+    let mut loadavg_1m = 0.0
+    let clean_load = load_raw.replace("{", "").replace("}", "").trim()
+    let load_parts = clean_load.split(" ")
+    for lp in load_parts {
+        if lp.trim() != "" {
+            loadavg_1m = to_float(lp.trim())
+            break
+        }
+    }
+    if loadavg_1m > 12.0 {
+        let msg = ts + " [SKIP] high load: " + to_string(loadavg_1m) + " (threshold: 12.0)\n"
+        try { append_file(log_path, msg) } catch e {}
+        return false
+    }
+
+    // Gate 4: stale lock 정리 — 락 파일이 30분+ 오래되면 자동 삭제
+    let lock_path = shared_dir + "/growth_tick.lock"
+    let lock_exists = exec("bash -c test -f " + lock_path + " && echo YES || echo NO").trim()
+    if lock_exists == "YES" {
+        // find -mmin +30 로 stale 여부 확인
+        let stale = exec("bash -c find " + lock_path + " -mmin +30 2>/dev/null | head -1").trim()
+        if stale != "" {
+            exec("bash", ["-c", "rm -f " + lock_path])
+            let msg = ts + " [CLEAN] stale lock removed (>30min): " + lock_path + "\n"
+            try { append_file(log_path, msg) } catch e {}
+        } else {
+            // lock 이 최근 것이면 다른 tick 실행 중 — 스킵
+            let msg = ts + " [SKIP] active lock present: " + lock_path + "\n"
+            try { append_file(log_path, msg) } catch e {}
+            return false
+        }
+    }
+
+    // 모든 게이트 통과
+    let msg = ts + " [PASS] preflight ok (free=" + to_string(free_mb) + "MB, load=" + to_string(loadavg_1m) + ")\n"
+    try { append_file(log_path, msg) } catch e {}
+    true
+}
+
+// ─── 메인 로직 ───
+
+fn main() {
+    // Preflight gates — 실패 시 즉시 종료
+    if !preflight_check() {
+        println("[growth_tick] preflight failed — skipped")
+        return
+    }
+
+    let a = args()
+    let source = if a.len() >= 3 { a[2] } else { "unknown" }
+    let growth_json = if a.len() >= 4 { a[3] } else { exec("printenv HOME") + "/Dev/anima/anima/config/growth_state.json" }
+
+    let content = read_file(growth_json)
+    if content == "" { return }
+
+    // interaction_count 추출
+    let mut count = 0
+    if content.contains("interaction_count") {
+        let parts = content.split("interaction_count")
+        if parts.len() >= 2 {
+            let after = parts[1].split(":")[1].trim()
+            let mut clean = after
+            if clean.contains(",") { clean = clean.split(",")[0] }
+            if clean.contains("}") { clean = clean.split("}")[0] }
+            count = to_int(clean.trim())
+        }
+    }
+
+    count = count + 1
+
+    // stage_index 추출 + 승격 판정
+    let mut stage_index = 0
+    if content.contains("stage_index") {
+        let parts = content.split("stage_index")
+        if parts.len() >= 2 {
+            let after = parts[1].split(":")[1].trim()
+            let mut clean = after
+            if clean.contains(",") { clean = clean.split(",")[0] }
+            if clean.contains("}") { clean = clean.split("}")[0] }
+            stage_index = to_int(clean.trim())
+        }
+    }
+
+    // 임계값 기반 승격: adult(4,10000) child(3,2000) toddler(2,500) infant(1,100)
+    if count >= 10000 && stage_index < 4 {
+        stage_index = 4
+    } else if count >= 2000 && stage_index < 3 {
+        stage_index = 3
+    } else if count >= 500 && stage_index < 2 {
+        stage_index = 2
+    } else if count >= 100 && stage_index < 1 {
+        stage_index = 1
+    }
+
+    // interaction_count 갱신 (문자열 치환)
+    let mut updated = content
+    // interaction_count 치환
+    if updated.contains("interaction_count") {
+        let before = updated.split("\"interaction_count\"")[0]
+        let after_full = updated.split("\"interaction_count\"")[1]
+        // ": NNN," 또는 ": NNN}" 패턴
+        let colon_and_rest = after_full.split(":")[0]  // 빈 문자열 (콜론 바로 앞)
+        let value_and_rest = after_full.split(":")
+        if value_and_rest.len() >= 2 {
+            let rest_str = value_and_rest[1]
+            // 숫자 끝 찾기: 쉼표 또는 } 또는 줄바꿈
+            let mut end_char = ","
+            let mut after_value = ""
+            if rest_str.contains(",") {
+                after_value = rest_str.split(",")[1]
+                // 나머지 쉼표들 복원
+                let rest_parts = rest_str.split(",")
+                let mut ri = 2
+                while ri < rest_parts.len() {
+                    after_value = after_value + "," + rest_parts[ri]
+                    ri = ri + 1
+                }
+            }
+            updated = before + "\"interaction_count\": " + to_string(count) + "," + after_value
+        }
+    }
+
+    // stage_index 갱신
+    if updated.contains("stage_index") {
+        let before = updated.split("\"stage_index\"")[0]
+        let after_full = updated.split("\"stage_index\"")[1]
+        let value_and_rest = after_full.split(":")
+        if value_and_rest.len() >= 2 {
+            let rest_str = value_and_rest[1]
+            let mut after_value = ""
+            if rest_str.contains(",") {
+                let rest_parts = rest_str.split(",")
+                let mut ri = 1
+                while ri < rest_parts.len() {
+                    if ri > 1 { after_value = after_value + "," }
+                    after_value = after_value + rest_parts[ri]
+                    ri = ri + 1
+                }
+            }
+            updated = before + "\"stage_index\": " + to_string(stage_index) + "," + after_value
+        }
+    }
+
+    write_file(growth_json, updated)
+}
+
+main()
