@@ -202,6 +202,40 @@ int hexa_str_eq(HexaVal a, HexaVal b) {
     return strcmp(a.s, b.s) == 0;
 }
 
+int hexa_str_starts_with(HexaVal s, HexaVal prefix) {
+    if (s.tag != TAG_STR || prefix.tag != TAG_STR) return 0;
+    size_t plen = strlen(prefix.s);
+    return strncmp(s.s, prefix.s, plen) == 0;
+}
+
+int hexa_str_ends_with(HexaVal s, HexaVal suffix) {
+    if (s.tag != TAG_STR || suffix.tag != TAG_STR) return 0;
+    size_t slen = strlen(s.s);
+    size_t sfxlen = strlen(suffix.s);
+    if (sfxlen > slen) return 0;
+    return strcmp(s.s + slen - sfxlen, suffix.s) == 0;
+}
+
+HexaVal hexa_str_substring(HexaVal s, HexaVal start, HexaVal end) {
+    if (s.tag != TAG_STR) return hexa_str("");
+    int64_t slen = strlen(s.s);
+    int64_t a = start.i, b = end.i;
+    if (a < 0) a = 0;
+    if (b > slen) b = slen;
+    if (a >= b) return hexa_str("");
+    char* buf = (char*)malloc(b - a + 1);
+    memcpy(buf, s.s + a, b - a);
+    buf[b - a] = '\0';
+    return hexa_str_own(buf);
+}
+
+int64_t hexa_str_index_of(HexaVal s, HexaVal sub) {
+    if (s.tag != TAG_STR || sub.tag != TAG_STR) return -1;
+    char* p = strstr(s.s, sub.s);
+    if (!p) return -1;
+    return (int64_t)(p - s.s);
+}
+
 // ── Printing ─────────────────────────────────────────────
 
 void hexa_print_val(HexaVal v) {
