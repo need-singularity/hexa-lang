@@ -1,0 +1,313 @@
+// ═══════════════════════════════════════════════════════════
+//  phi_metric.hexa — IIT (Integrated Information Theory) Φ
+//  AI-native accelerated:
+//    @symbolic  — entropy algebra simplification (0·log0 → 0)
+//    @memoize   — sub-system EI cache across partitions
+//    @parallel  — partition search over 2^(N-1)-1 bipartitions
+//
+//  Model:
+//    * N binary nodes → 2^N global states
+//    * TPM: row-stochastic [state_cur][state_next]
+//    * Cause distribution: uniform over current states
+//    * EI(system) = Σ p(s_cur) · D_KL( p(s_next|s_cur) ‖ p(s_next) )
+//      (mutual information I(S_cur ; S_next))
+//    * MIP: bipartition (A,B) cutting feedback → EI_partitioned
+//      EI_part = I(A_cur;A_next) + I(B_cur;B_next)   (additive when cut)
+//    * Φ = EI(whole) − min_over_bipartitions EI_part
+//
+//  Known results encoded in tests:
+//    - disconnected system     → Φ ≈ 0
+//    - 2-node XOR feedback     → Φ > 0
+//    - 3-node integrated       → Φ > 0
+// ═══════════════════════════════════════════════════════════
+
+// ── math primitives (no libc) ────────────────────────────
+
+@pure @inline fn abs_f(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// ln(x) for x > 0 using argument reduction x = 2^k · m, m∈[1,2)
+// then ln(m) via series ln((1+y)/(1-y)) = 2(y + y^3/3 + y^5/5 + ...)
+// where y = (m-1)/(m+1), |y| < 1/3 → fast convergence.
+@pure fn ln_approx(x: float) -> float {
+    if x <= 0.0 { return 0.0 - 1000000.0 }  // −∞ guard
+    let mut m = x
+    let mut k = 0
+    while m >= 2.0 {
+        m = m / 2.0
+        k = k + 1
+    }
+    while m < 1.0 {
+        m = m * 2.0
+        k = k - 1
+    }
+    // series
+    let y = (m - 1.0) / (m + 1.0)
+    let y2 = y * y
+    let mut term = y
+    let mut sum = 0.0
+    let mut i = 0
+    while i < 20 {
+        sum = sum + term / (2.0 * i + 1.0)
+        term = term * y2
+        i = i + 1
+    }
+    let ln_m = 2.0 * sum
+    // ln(2) ≈ 0.6931471805599453
+    let ln2 = 0.6931471805599453
+    return ln_m + k * ln2
+}
+
+@pure @inline fn log2_approx(x: float) -> float {
+    let ln2 = 0.6931471805599453
+    return ln_approx(x) / ln2
+}
+
+// ── @symbolic entropy helpers ────────────────────────────
+//   p·log2(p) with convention 0·log2(0) = 0 (symbolic simplification)
+
+@symbolic @pure fn xlog2x(p: float) -> float {
+    if p <= 0.0 { return 0.0 }       // symbolic: 0·log0 → 0
+    if p >= 1.0 { return 0.0 }       // 1·log2(1) = 0
+    return p * log2_approx(p)
+}
+
+// Shannon entropy of a distribution (flat array).
+@pure fn entropy(dist: any, n: int) -> float {
+    let mut h = 0.0
+    let mut i = 0
+    while i < n {
+        h = h - xlog2x(dist[i])
+        i = i + 1
+    }
+    return h
+}
+
+// ── TPM helpers ──────────────────────────────────────────
+//   TPM is a flat array of size S·S where S = 2^num_nodes.
+//   tpm[s_cur * S + s_next] = P(next=s_next | cur=s_cur).
+//   cause distribution: uniform over S (max-entropy prior).
+
+@pure fn num_states(num_nodes: int) -> int {
+    let mut s = 1
+    let mut i = 0
+    while i < num_nodes {
+        s = s * 2
+        i = i + 1
+    }
+    return s
+}
+
+// marginal next-state distribution given uniform cause:
+//   p(next) = (1/S) · Σ_cur tpm[cur,next]
+@pure fn marginal_next(tpm: any, S: int) -> any {
+    let mut out = []
+    let inv = 1.0 / S
+    let mut n = 0
+    while n < S {
+        let mut acc = 0.0
+        let mut c = 0
+        while c < S {
+            acc = acc + tpm[c * S + n]
+            c = c + 1
+        }
+        out = out.push(acc * inv)
+        n = n + 1
+    }
+    return out
+}
+
+// Effective Information of whole system under uniform cause.
+//   EI = I(S_cur;S_next) = H(next) − H(next|cur)
+//                        = H(next) − (1/S) Σ_cur H(row_cur)
+// @memoize hint: pure in (tpm,S); kept as plain @pure for array-arg safety.
+@pure fn effective_information(tpm: any, S: int) -> float {
+    let p_next = marginal_next(tpm, S)
+    let h_next = entropy(p_next, S)
+    // conditional entropy
+    let mut h_cond = 0.0
+    let inv = 1.0 / S
+    let mut c = 0
+    while c < S {
+        // extract row
+        let mut row = []
+        let mut n = 0
+        while n < S {
+            row = row.push(tpm[c * S + n])
+            n = n + 1
+        }
+        h_cond = h_cond + inv * entropy(row, S)
+        c = c + 1
+    }
+    let ei = h_next - h_cond
+    if ei < 0.0 { return 0.0 }       // numeric cleanup (symbolic: I≥0)
+    return ei
+}
+
+// ── Partition (MIP) search ───────────────────────────────
+//   Bipartition encoded as bitmask over node indices (1..2^(N-1)-1).
+//   For each bitmask, we marginalise TPM onto each part independently
+//   (assuming cut: parts evolve independently of each other).
+//   Then EI_part = EI(part A, restricted TPM) + EI(part B).
+
+// Extract node-subset state index.
+//   full_state: int with N bits, subset_mask: which node bits to keep.
+//   Returns packed index over the selected nodes.
+@pure @inline fn project_state(full_state: int, subset_mask: int, num_nodes: int) -> int {
+    let mut out = 0
+    let mut bit = 0
+    let mut pos = 0
+    let mut i = 0
+    while i < num_nodes {
+        let node_bit = 1
+        // shift: test i-th bit of subset_mask
+        let m = subset_mask / pow2(i)
+        if m % 2 == 1 {
+            let f = full_state / pow2(i)
+            if f % 2 == 1 {
+                out = out + pow2(pos)
+            }
+            pos = pos + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+@pure @inline fn pow2(k: int) -> int {
+    let mut r = 1
+    let mut i = 0
+    while i < k {
+        r = r * 2
+        i = i + 1
+    }
+    return r
+}
+
+// Count bits in mask.
+@pure fn popcount(mask: int, num_nodes: int) -> int {
+    let mut m = mask
+    let mut c = 0
+    let mut i = 0
+    while i < num_nodes {
+        if m % 2 == 1 { c = c + 1 }
+        m = m / 2
+        i = i + 1
+    }
+    return c
+}
+
+// Build a reduced TPM for the subset of nodes given by subset_mask.
+//   Marginalise over the non-subset nodes under uniform cause.
+//   reduced[a_cur * Sa + a_next] =
+//       (1 / (S / Sa)) · Σ_{full_cur,full_next : proj(cur)=a_cur, proj(next)=a_next}
+//              (1/S_notA) · tpm[full_cur, full_next]
+//   (uniform over the "other" part's states).
+fn reduce_tpm(tpm: any, num_nodes: int, subset_mask: int) -> any {
+    let S = num_states(num_nodes)
+    let k = popcount(subset_mask, num_nodes)
+    let Sa = pow2(k)
+    let S_other = S / Sa
+
+    // Use flat array as mutable dense buffer (0..Sa*Sa-1).
+    let sz = Sa * Sa
+    let mut acc = []
+    let mut z = 0
+    while z < sz {
+        acc = acc.push(0.0)
+        z = z + 1
+    }
+
+    let inv_other = 1.0 / S_other
+
+    let mut fc = 0
+    while fc < S {
+        let a_cur = project_state(fc, subset_mask, num_nodes)
+        let mut fns = 0
+        while fns < S {
+            let a_next = project_state(fns, subset_mask, num_nodes)
+            let idx = a_cur * Sa + a_next
+            // Symbolic: (1/S_other)·(1/S_other) collapses cur+next marginals.
+            acc[idx] = acc[idx] + tpm[fc * S + fns] * inv_other * inv_other
+            fns = fns + 1
+        }
+        fc = fc + 1
+    }
+
+    // Row-renormalise (numerical safety; symbolic: should already be stochastic).
+    let mut r = 0
+    while r < Sa {
+        let mut sum = 0.0
+        let mut cc = 0
+        while cc < Sa {
+            sum = sum + acc[r * Sa + cc]
+            cc = cc + 1
+        }
+        if sum > 0.0 {
+            let mut cc2 = 0
+            while cc2 < Sa {
+                acc[r * Sa + cc2] = acc[r * Sa + cc2] / sum
+                cc2 = cc2 + 1
+            }
+        }
+        r = r + 1
+    }
+
+    // Flatten map → array in index order.
+    let mut out = []
+    let mut i = 0
+    while i < Sa * Sa {
+        out = out.push(acc[i])
+        i = i + 1
+    }
+    return out
+}
+
+// EI of one partition (subset).
+// @memoize hint: same (tpm, num_nodes, subset_mask) returns same EI.
+fn ei_of_subset(tpm: any, num_nodes: int, subset_mask: int) -> float {
+    let k = popcount(subset_mask, num_nodes)
+    if k == 0 { return 0.0 }
+    let Sa = pow2(k)
+    let red = reduce_tpm(tpm, num_nodes, subset_mask)
+    return effective_information(red, Sa)
+}
+
+// Partitioned EI for bipartition (A, complement(A)).
+@pure fn ei_partitioned(tpm: any, num_nodes: int, mask_a: int) -> float {
+    let full = pow2(num_nodes) - 1
+    let mask_b = full - mask_a
+    let ea = ei_of_subset(tpm, num_nodes, mask_a)
+    let eb = ei_of_subset(tpm, num_nodes, mask_b)
+    return ea + eb
+}
+
+// ── Main Phi computation ─────────────────────────────────
+//   Φ = EI_whole − min over non-trivial bipartitions of EI_part
+//   @parallel hint: independent partition evaluations.
+
+@parallel fn compute_phi(tpm: any, num_nodes: int) -> float {
+    let S = num_states(num_nodes)
+    let ei_whole = effective_information(tpm, S)
+
+    let full = pow2(num_nodes) - 1
+    // iterate mask_a in [1 .. full-1] ; avoid double counting by mask_a < mask_b
+    let mut min_part = 1000000.0
+    let mut mask = 1
+    while mask < full {
+        let comp = full - mask
+        if mask < comp {
+            let ep = ei_partitioned(tpm, num_nodes, mask)
+            if ep < min_part { min_part = ep }
+        }
+        mask = mask + 1
+    }
+    // edge case N=1: no bipartition → Φ = EI itself
+    if num_nodes <= 1 { return ei_whole }
+
+    let phi = ei_whole - min_part
+    if phi < 0.0 { return 0.0 }
+    return phi
+}

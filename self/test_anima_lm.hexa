@@ -1,0 +1,284 @@
+// ═══════════════════════════════════════════════════════════
+//  test_anima_lm.hexa — rank-4 tiny LoRA 수치 검증
+//
+//  검증:
+//    1. lora_forward 수식 일치 (수동 계산 대조)
+//    2. mse_grad 정확성
+//    3. lora_backward 해석적 gradient = 유한차분 gradient
+//    4. SGD 스텝으로 loss 단조 감소
+//    5. @memoize tokenize 캐시 일관성
+//    6. @parallel batch loss 평균 일치
+//
+//  실행: ./target/release/hexa self/test_anima_lm.hexa
+//  목표: 모든 check PASS — 제타 초월 14B→32B 하네스의 수학 코어 건전성
+// ═══════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ── LoRA 수학 (self-contained) ──────────────────────────
+
+@pure
+fn matvec(w, x, m, n) {
+    let mut y = []
+    for i in 0..m {
+        let mut s = 0.0
+        for j in 0..n { s = s + w[i][j] * x[j] }
+        y = y + [s]
+    }
+    return y
+}
+
+@memoize
+fn lora_scale(alpha, r) { return to_float(alpha) / to_float(r) }
+
+fn zeros1(n) {
+    let mut v = []
+    for i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn zeros2(m, n) {
+    let mut r = []
+    for i in 0..m { r = r + [zeros1(n)] }
+    return r
+}
+
+@pure
+fn lora_forward(w, a, b, x, m, n, r, alpha) {
+    let base = matvec(w, x, m, n)
+    let ax   = matvec(a, x, r, n)
+    let bax  = matvec(b, ax, m, r)
+    let s    = lora_scale(alpha, r)
+    let mut y = []
+    for i in 0..m { y = y + [base[i] + s * bax[i]] }
+    return y
+}
+
+@pure
+fn mse_loss(y, target, m) {
+    let mut s = 0.0
+    for i in 0..m {
+        let d = y[i] - target[i]
+        s = s + d * d
+    }
+    return s / to_float(m)
+}
+
+@pure
+fn mse_grad(y, target, m) {
+    let mut g = []
+    let inv = 2.0 / to_float(m)
+    for i in 0..m { g = g + [(y[i] - target[i]) * inv] }
+    return g
+}
+
+@pure
+fn lora_backward(a, b, x, dy, m, n, r, alpha) {
+    let s = lora_scale(alpha, r)
+    let ax = matvec(a, x, r, n)
+    let mut btdy = zeros1(r)
+    for p in 0..r {
+        let mut acc = 0.0
+        for i in 0..m { acc = acc + b[i][p] * dy[i] }
+        btdy[p] = acc
+    }
+    let mut db = zeros2(m, r)
+    for i in 0..m {
+        for p in 0..r { db[i][p] = s * dy[i] * ax[p] }
+    }
+    let mut da = zeros2(r, n)
+    for p in 0..r {
+        for j in 0..n { da[p][j] = s * btdy[p] * x[j] }
+    }
+    return [da, db]
+}
+
+@pure
+fn sgd_update2(w, g, lr, m, n) {
+    let mut r = []
+    for i in 0..m {
+        let mut row = []
+        for j in 0..n { row = row + [w[i][j] - lr * g[i][j]] }
+        r = r + [row]
+    }
+    return r
+}
+
+@memoize
+fn tokenize(word) {
+    let mut h = 0
+    let n = len(word)
+    for i in 0..n { h = (h * 131 + i + 1) % 50257 }
+    return h
+}
+
+@parallel
+fn parallel_batch_loss(ys, targets, m, bs) {
+    let mut total = 0.0
+    for b in 0..bs { total = total + mse_loss(ys[b], targets[b], m) }
+    return total / to_float(bs)
+}
+
+println("═══════════════════════════════════════════════════════")
+println("  AnimaLM LoRA rank-4 수치 검증")
+println("═══════════════════════════════════════════════════════")
+
+// ── 차원 설정: m=3 out, n=4 in, r=4 (rank-4 tiny LoRA) ──
+let m = 3
+let n = 4
+let r = 4
+let alpha = 8
+let eps = 0.00001
+
+// 결정적 가중치
+let w = [
+    [0.1, 0.2, -0.1, 0.05],
+    [-0.2, 0.15, 0.3, -0.05],
+    [0.05, -0.1, 0.2, 0.1]
+]
+let a = [
+    [0.1, -0.2, 0.05, 0.1],
+    [0.2, 0.1, -0.1, 0.05],
+    [-0.1, 0.15, 0.2, -0.05],
+    [0.05, 0.0, -0.15, 0.1]
+]
+let b = [
+    [0.1, 0.0, -0.05, 0.1],
+    [0.0, 0.2, 0.1, -0.1],
+    [-0.1, 0.05, 0.0, 0.2]
+]
+let x = [0.5, -0.3, 0.2, 0.1]
+let target = [0.2, -0.1, 0.15]
+
+// ── Test 1: lora_scale ─────────────────────────────────
+check("lora_scale(8,4) == 2.0", approx(lora_scale(alpha, r), 2.0, eps))
+
+// ── Test 2: forward 수동 계산 대조 ─────────────────────
+//  base[0] = 0.1*0.5 + 0.2*(-0.3) + (-0.1)*0.2 + 0.05*0.1
+//         = 0.05 - 0.06 - 0.02 + 0.005 = -0.025
+let y = lora_forward(w, a, b, x, m, n, r, alpha)
+let base0 = 0.1*0.5 + 0.2*(0.0-0.3) + (0.0-0.1)*0.2 + 0.05*0.1
+// A @ x:
+let ax0 = 0.1*0.5 + (0.0-0.2)*(0.0-0.3) + 0.05*0.2 + 0.1*0.1
+let ax1 = 0.2*0.5 + 0.1*(0.0-0.3) + (0.0-0.1)*0.2 + 0.05*0.1
+let ax2 = (0.0-0.1)*0.5 + 0.15*(0.0-0.3) + 0.2*0.2 + (0.0-0.05)*0.1
+let ax3 = 0.05*0.5 + 0.0*(0.0-0.3) + (0.0-0.15)*0.2 + 0.1*0.1
+// B[0] @ ax: 0.1*ax0 + 0*ax1 + (-0.05)*ax2 + 0.1*ax3
+let bax0 = 0.1*ax0 + 0.0*ax1 + (0.0-0.05)*ax2 + 0.1*ax3
+let expect_y0 = base0 + 2.0 * bax0
+check("lora_forward y[0] matches manual", approx(y[0], expect_y0, eps))
+
+// ── Test 3: mse_grad ─────────────────────────────────
+let dy = mse_grad(y, target, m)
+//  expected dy[i] = (2/m) * (y[i] - target[i])
+let exp_dy0 = (2.0 / 3.0) * (y[0] - target[0])
+check("mse_grad[0] matches", approx(dy[0], exp_dy0, eps))
+
+// ── Test 4: backward vs finite-difference ─────────────
+//  유한차분: dL/dA[p,j] ≈ (L(A+h) - L(A-h)) / (2h)
+let grads = lora_backward(a, b, x, dy, m, n, r, alpha)
+let da = grads[0]
+let db = grads[1]
+
+// 하나의 A[1,2] 원소 fd 비교
+let h = 0.0001
+
+fn loss_with_a_perturb(w, a, b, x, target, m, n, r, alpha, pi, pj, delta) {
+    let mut a2 = []
+    for i in 0..r {
+        let mut row = []
+        for j in 0..n {
+            if i == pi { if j == pj { row = row + [a[i][j] + delta] } else { row = row + [a[i][j]] } } else { row = row + [a[i][j]] }
+        }
+        a2 = a2 + [row]
+    }
+    let y2 = lora_forward(w, a2, b, x, m, n, r, alpha)
+    return mse_loss(y2, target, m)
+}
+
+let lp = loss_with_a_perturb(w, a, b, x, target, m, n, r, alpha, 1, 2,  h)
+let lm = loss_with_a_perturb(w, a, b, x, target, m, n, r, alpha, 1, 2, 0.0 - h)
+let fd_a12 = (lp - lm) / (2.0 * h)
+check("dA[1,2] analytic ≈ finite-diff", approx(da[1][2], fd_a12, 0.0001))
+
+// 동일하게 B[2,3]
+fn loss_with_b_perturb(w, a, b, x, target, m, n, r, alpha, pi, pj, delta) {
+    let mut b2 = []
+    for i in 0..m {
+        let mut row = []
+        for j in 0..r {
+            if i == pi { if j == pj { row = row + [b[i][j] + delta] } else { row = row + [b[i][j]] } } else { row = row + [b[i][j]] }
+        }
+        b2 = b2 + [row]
+    }
+    let y2 = lora_forward(w, a, b2, x, m, n, r, alpha)
+    return mse_loss(y2, target, m)
+}
+
+let lpb = loss_with_b_perturb(w, a, b, x, target, m, n, r, alpha, 2, 3,  h)
+let lmb = loss_with_b_perturb(w, a, b, x, target, m, n, r, alpha, 2, 3, 0.0 - h)
+let fd_b23 = (lpb - lmb) / (2.0 * h)
+check("dB[2,3] analytic ≈ finite-diff", approx(db[2][3], fd_b23, 0.0001))
+
+// ── Test 5: SGD step으로 loss 단조 감소 ────────────────
+let loss_before = mse_loss(y, target, m)
+let mut a_new = sgd_update2(a, da, 0.1, r, n)
+let mut b_new = sgd_update2(b, db, 0.1, m, r)
+let y_new = lora_forward(w, a_new, b_new, x, m, n, r, alpha)
+let loss_after = mse_loss(y_new, target, m)
+check("SGD step: loss decreases", loss_after < loss_before)
+
+// 20-step 수렴
+let mut ai = a
+let mut bi = b
+let mut last_loss = loss_before
+for step in 0..200 {
+    let yi = lora_forward(w, ai, bi, x, m, n, r, alpha)
+    let dyi = mse_grad(yi, target, m)
+    let gs = lora_backward(ai, bi, x, dyi, m, n, r, alpha)
+    ai = sgd_update2(ai, gs[0], 0.5, r, n)
+    bi = sgd_update2(bi, gs[1], 0.5, m, r)
+    last_loss = mse_loss(lora_forward(w, ai, bi, x, m, n, r, alpha), target, m)
+}
+check("200-step SGD: loss << initial", last_loss < loss_before * 0.5)
+
+// ── Test 6: @memoize tokenize 캐시 일관성 ─────────────
+let t1 = tokenize("anima")
+let t2 = tokenize("anima")
+let t3 = tokenize("lm")
+check("tokenize deterministic", t1 == t2)
+check("tokenize distinct tokens differ", t1 != t3)
+
+// ── Test 7: @parallel batch loss 평균 ─────────────────
+let y_a = [0.1, 0.2, 0.3]
+let y_b = [0.4, 0.5, 0.6]
+let t_a = [0.0, 0.0, 0.0]
+let t_b = [0.0, 0.0, 0.0]
+let bs = 2
+let avg = parallel_batch_loss([y_a, y_b], [t_a, t_b], m, bs)
+let expect = (mse_loss(y_a, t_a, m) + mse_loss(y_b, t_b, m)) / 2.0
+check("parallel_batch_loss == mean(loss_i)", approx(avg, expect, eps))
+
+// ── 결과 ───────────────────────────────────────────────
+println("")
+println("═══════════════════════════════════════════════════════")
+println("  PASS: " + to_string(pass_count) + "  FAIL: " + to_string(fail_count))
+println("═══════════════════════════════════════════════════════")
+if fail_count == 0 {
+    println("[OK] AnimaLM LoRA 하네스 수치 검증 통과 — 제타 초월 14B→32B 경로 건전")
+}

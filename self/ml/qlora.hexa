@@ -1,0 +1,221 @@
+// ═══════════════════════════════════════════════════════════
+//  qlora.hexa — 4bit Quantized LoRA (Phase 1 시뮬레이션)
+//
+//  base W : nf4 근사 16-level 코드북 + per-row scale  (저장: int 인덱스)
+//  adapter: LoRA rank-r float (A: [r,n], B: [m,r])
+//
+//  y = dequant(W_q, scale) @ x + (alpha/r) * B @ (A @ x)
+//
+//  AI-NATIVE:
+//    @memoize dequant_row → 반복 forward 시 per-row float 복원 캐시
+//    @symbolic lora_scale → alpha/r 상수 fold
+//    @pure     수학 커널
+//
+//  제약: 배열 인덱싱으로 4bit 시뮬 (저수준 비트 트위들 금지)
+//  참고: self/ml/lora.hexa 수정 금지 — 여기서는 독립 재구현
+// ═══════════════════════════════════════════════════════════
+
+// ── nf4 근사 코드북 (16 레벨, [-1, 1] 비선형 분포) ────────
+//    정확한 NF4는 정규분포 quantile; 여기는 근사치 (AI-native 시뮬)
+fn nf4_codebook() {
+    return [
+        -1.0, -0.6962, -0.5251, -0.3949,
+        -0.2844, -0.1848, -0.0911, 0.0,
+        0.0796, 0.1609, 0.2461, 0.3379,
+        0.4407, 0.5626, 0.7230, 1.0
+    ]
+}
+
+// ── 절댓값 최댓값 (per-row scale) ───────────────────────
+@pure
+fn row_absmax(row, n) {
+    let mut m = 0.0
+    for j in 0..n {
+        let v = row[j]
+        let a = if v < 0.0 { 0.0 - v } else { v }
+        if a > m { m = a }
+    }
+    if m < 0.000001 { m = 0.000001 }
+    return m
+}
+
+// ── 최근접 코드북 인덱스 찾기 (0..16) ─────────────────
+@pure
+fn nearest_code(x, book) {
+    let mut best = 0
+    let mut bestd = 1000000.0
+    for k in 0..16 {
+        let d = x - book[k]
+        let dd = if d < 0.0 { 0.0 - d } else { d }
+        if dd < bestd {
+            bestd = dd
+            best = k
+        }
+    }
+    return best
+}
+
+// ── 4bit Quantize: W_float → (W_idx int[][], scale float[]) ─
+//    반환: [w_idx, scales]
+fn quantize_4bit(w, m, n) {
+    let book = nf4_codebook()
+    let mut w_idx = []
+    let mut scales = []
+    for i in 0..m {
+        let s = row_absmax(w[i], n)
+        scales = scales + [s]
+        let mut row = []
+        for j in 0..n {
+            let norm = w[i][j] / s   // [-1, 1] 범위
+            let k = nearest_code(norm, book)
+            row = row + [k]
+        }
+        w_idx = w_idx + [row]
+    }
+    return [w_idx, scales]
+}
+
+// ── Dequantize per row (@memoize: 동일 (row, scale) 반복 호출 캐시) ─
+@memoize
+fn dequant_row(idx_row, scale, n) {
+    let book = nf4_codebook()
+    let mut out = []
+    for j in 0..n {
+        out = out + [book[idx_row[j]] * scale]
+    }
+    return out
+}
+
+// ── Dequantize 전체 행렬 ────────────────────────────────
+fn dequantize_4bit(w_idx, scales, m, n) {
+    let mut w = []
+    for i in 0..m {
+        w = w + [dequant_row(w_idx[i], scales[i], n)]
+    }
+    return w
+}
+
+// ── matvec: y[m] = W[m,n] @ x[n] ────────────────────────
+@pure
+fn q_matvec(w, x, m, n) {
+    let mut y = []
+    for i in 0..m {
+        let mut s = 0.0
+        for j in 0..n {
+            s = s + w[i][j] * x[j]
+        }
+        y = y + [s]
+    }
+    return y
+}
+
+// ── Quantized matvec: dequant_row 캐시를 활용한 직접 내적 ─
+@pure
+fn qmatvec_4bit(w_idx, scales, x, m, n) {
+    let mut y = []
+    for i in 0..m {
+        let row = dequant_row(w_idx[i], scales[i], n)
+        let mut s = 0.0
+        for j in 0..n {
+            s = s + row[j] * x[j]
+        }
+        y = y + [s]
+    }
+    return y
+}
+
+// ── LoRA scale: alpha/r — @symbolic 상수 fold ────────────
+@symbolic
+@memoize
+fn qlora_scale(alpha, r) {
+    return to_float(alpha) / to_float(r)
+}
+
+// ── QLoRA forward ───────────────────────────────────────
+//    y = dequant(W_q) @ x + (alpha/r) * B @ (A @ x)
+@pure
+fn qlora_forward(w_idx, scales, a, b, x, m, n, r, alpha) {
+    let base = qmatvec_4bit(w_idx, scales, x, m, n)
+    let ax   = q_matvec(a, x, r, n)
+    let bax  = q_matvec(b, ax, m, r)
+    let s    = qlora_scale(alpha, r)
+    let mut y = []
+    for i in 0..m {
+        y = y + [base[i] + s * bax[i]]
+    }
+    return y
+}
+
+// ── MSE ─────────────────────────────────────────────────
+@pure
+fn q_mse(y, t, m) {
+    let mut s = 0.0
+    for i in 0..m {
+        let d = y[i] - t[i]
+        s = s + d * d
+    }
+    return s / to_float(m)
+}
+
+@pure
+fn q_mse_grad(y, t, m) {
+    let mut g = []
+    let inv = 2.0 / to_float(m)
+    for i in 0..m {
+        g = g + [(y[i] - t[i]) * inv]
+    }
+    return g
+}
+
+// ── LoRA backward (W frozen) ────────────────────────────
+//    dL/dB = s * dy ⊗ (A @ x)
+//    dL/dA = s * (B^T @ dy) ⊗ x
+@pure
+fn qlora_backward(a, b, x, dy, m, n, r, alpha) {
+    let s = qlora_scale(alpha, r)
+    let ax = q_matvec(a, x, r, n)
+    let mut btdy = []
+    for p in 0..r {
+        let mut acc = 0.0
+        for i in 0..m { acc = acc + b[i][p] * dy[i] }
+        btdy = btdy + [acc]
+    }
+    let mut db = []
+    for i in 0..m {
+        let mut row = []
+        for p in 0..r { row = row + [s * dy[i] * ax[p]] }
+        db = db + [row]
+    }
+    let mut da = []
+    for p in 0..r {
+        let mut row = []
+        for j in 0..n { row = row + [s * btdy[p] * x[j]] }
+        da = da + [row]
+    }
+    return [da, db]
+}
+
+// ── SGD update 2D ───────────────────────────────────────
+@pure
+fn q_sgd2(w, g, lr, m, n) {
+    let mut out = []
+    for i in 0..m {
+        let mut row = []
+        for j in 0..n { row = row + [w[i][j] - lr * g[i][j]] }
+        out = out + [row]
+    }
+    return out
+}
+
+// ── MSE(quant, orig) per element 평균 ───────────────────
+@pure
+fn quant_mse(w_orig, w_deq, m, n) {
+    let mut s = 0.0
+    for i in 0..m {
+        for j in 0..n {
+            let d = w_orig[i][j] - w_deq[i][j]
+            s = s + d * d
+        }
+    }
+    return s / to_float(m * n)
+}
