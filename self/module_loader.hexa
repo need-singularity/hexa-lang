@@ -1,0 +1,218 @@
+// self/module_loader.hexa — concat-based HEXA module loader (Phase2 C1)
+//
+// 목적: bootstrap.hexa 1,945줄 모놀리스 해체.
+//   - 지시문 형태: 첫 non-space 토큰이 `import "path.hexa"` 인 라인
+//   - 재귀적으로 파일 내용을 인라인 병합 (concat).
+//   - 순환 import 감지 (visited list).
+//   - 경로는 현재 파일의 디렉토리 상대로 해석.
+//
+// 이 로더는 parser/lexer/interpreter 와 독립적인 소스 전처리기다.
+// 전처리된 문자열을 parser 에 넘기면 모듈 지원이 사실상 완성된다.
+//
+// API:
+//   load_module(path)                  -> string   (preprocessed source)
+//   resolve_imports(src, base_dir, vs) -> string   (internal helper)
+//
+// 의존: read_file 빌트인, 기본 string api.
+
+// ── 경로/문자열 헬퍼 ─────────────────────────────────────────
+
+fn ml_dirname(path) {
+    // 마지막 '/' 까지의 prefix.  "a/b/c.hexa" -> "a/b"
+    let n = len(path)
+    let mut i = n - 1
+    while i >= 0 {
+        if path[i] == '/' {
+            // slice 0..i
+            let mut parts = []
+            let mut k = 0
+            while k < i {
+                parts = parts.push(path[k])
+                k = k + 1
+            }
+            return parts.join("")
+        }
+        i = i - 1
+    }
+    return "."
+}
+
+fn ml_join_path(dir, rel) {
+    // 상대경로면 dir + "/" + rel, 절대경로면 rel 그대로.
+    if len(rel) > 0 {
+        if rel[0] == '/' { return rel }
+    }
+    if len(dir) == 0 { return rel }
+    return dir + "/" + rel
+}
+
+fn ml_trim_left(s) {
+    let n = len(s)
+    let mut i = 0
+    while i < n {
+        let c = s[i]
+        if c == ' ' || c == '\t' {
+            i = i + 1
+        } else {
+            // slice i..n
+            let mut parts = []
+            let mut k = i
+            while k < n {
+                parts = parts.push(s[k])
+                k = k + 1
+            }
+            return parts.join("")
+        }
+    }
+    return ""
+}
+
+fn ml_starts_with(s, prefix) {
+    let pn = len(prefix)
+    let sn = len(s)
+    if pn > sn { return false }
+    let mut i = 0
+    while i < pn {
+        if s[i] != prefix[i] { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn ml_split_lines(s) {
+    let mut out = []
+    let n = len(s)
+    let mut start = 0
+    let mut i = 0
+    while i < n {
+        if s[i] == '\n' {
+            // line = s[start..i]
+            let mut parts = []
+            let mut k = start
+            while k < i {
+                parts = parts.push(s[k])
+                k = k + 1
+            }
+            out = out.push(parts.join(""))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if start < n {
+        let mut parts = []
+        let mut k = start
+        while k < n {
+            parts = parts.push(s[k])
+            k = k + 1
+        }
+        out = out.push(parts.join(""))
+    }
+    return out
+}
+
+fn ml_contains(list, needle) {
+    let n = len(list)
+    let mut i = 0
+    while i < n {
+        if list[i] == needle { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ── import 지시문 파싱 ──────────────────────────────────────
+//
+// 유효 형식:   import "path/to/file.hexa"
+// 리딩 공백/탭 허용. 따옴표로 감싼 경로만 지원.
+// 반환: "" 이면 import 아님, 아니면 경로 문자열.
+
+fn ml_parse_import(line) {
+    let trimmed = ml_trim_left(line)
+    if !ml_starts_with(trimmed, "import ") { return "" }
+    // 'import ' 이후에서 첫 따옴표 찾기
+    let rest = ""
+    let n = len(trimmed)
+    let mut parts = []
+    let mut k = 7 // len("import ")
+    while k < n {
+        parts = parts.push(trimmed[k])
+        k = k + 1
+    }
+    rest = parts.join("")
+    rest = ml_trim_left(rest)
+    let rn = len(rest)
+    if rn < 2 { return "" }
+    if rest[0] != '"' { return "" }
+    // 두 번째 따옴표까지
+    let mut out = []
+    let mut i = 1
+    while i < rn {
+        if rest[i] == '"' {
+            return out.join("")
+        }
+        out = out.push(rest[i])
+        i = i + 1
+    }
+    return ""
+}
+
+// ── 핵심: 재귀 resolve ─────────────────────────────────────
+
+fn ml_resolve(src, base_dir, visited) {
+    let lines = ml_split_lines(src)
+    let mut out_parts = []
+    let n = len(lines)
+    let mut i = 0
+    while i < n {
+        let line = lines[i]
+        let imp = ml_parse_import(line)
+        if imp == "" {
+            out_parts = out_parts.push(line)
+            out_parts = out_parts.push("\n")
+        } else {
+            let full = ml_join_path(base_dir, imp)
+            if ml_contains(visited, full) {
+                // 순환 감지 — 주석으로 대체
+                out_parts = out_parts.push("// [module_loader] cycle skipped: " + full)
+                out_parts = out_parts.push("\n")
+            } else {
+                let vs2 = visited.push(full)
+                let child_src = read_file(full)
+                let child_dir = ml_dirname(full)
+                let expanded = ml_resolve(child_src, child_dir, vs2)
+                out_parts = out_parts.push("// [module_loader] begin: " + full)
+                out_parts = out_parts.push("\n")
+                out_parts = out_parts.push(expanded)
+                out_parts = out_parts.push("// [module_loader] end: " + full)
+                out_parts = out_parts.push("\n")
+            }
+        }
+        i = i + 1
+    }
+    return out_parts.join("")
+}
+
+fn load_module(path) {
+    let src = read_file(path)
+    let dir = ml_dirname(path)
+    let visited = [path]
+    return ml_resolve(src, dir, visited)
+}
+
+// ── 자체 스모크 테스트 (스크립트로 직접 실행 시) ──────────
+
+println("[module_loader] helpers ready")
+assert ml_dirname("a/b/c.hexa") == "a/b"
+assert ml_dirname("foo.hexa") == "."
+assert ml_join_path("a/b", "c.hexa") == "a/b/c.hexa"
+assert ml_join_path("a", "/abs/x.hexa") == "/abs/x.hexa"
+assert ml_starts_with("import \"x\"", "import ")
+assert ml_parse_import("import \"lexer.hexa\"") == "lexer.hexa"
+assert ml_parse_import("  import \"a/b.hexa\"") == "a/b.hexa"
+assert ml_parse_import("let x = 1") == ""
+assert ml_parse_import("// import \"x\"") == ""
+let ls = ml_split_lines("a\nb\nc")
+assert len(ls) == 3
+assert ls[0] == "a"
+assert ls[2] == "c"
+println("[module_loader] self-test PASS")
