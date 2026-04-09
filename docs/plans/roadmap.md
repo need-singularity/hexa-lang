@@ -37,10 +37,21 @@
 - [ ] `OMP_NUM_THREADS=32` 명시 + BLAS 스레딩 실효 확인
 - [ ] hexa matmul 호출 오버헤드 프로파일링
 
-### Phase 4 — T2 100M 학습 (대기)
-- [ ] Training loop (forward/backward/optimizer) in self/
-- [ ] @lowrank(32) LoRA + @sparse(0.3) + @memoize_grad 결합
-- [ ] 1B token 실학습 <8h 또는 vast 1.3h의 50% 이내
+### Phase 4 — T2 100M 학습 (실측 완료, 불가 판정)
+- [x] `self/ml/train_100m.hexa` (267→249줄) — GPT-2 small 100M 프로토타입
+- [x] htz 1-step 실측: **fwd 7.5s / bwd 6.0s / opt 2.6s = 16.1s/step**
+- [x] 1B token 환산 ≈ **4년** (목표 8h 대비 4340x)
+- [x] GPU vast 4×4090(1.3h) 대비 **26,700x** → fallback 50% 불충족
+- [x] 루프 종료 판정: **T1 + T2 모두 불가** (근본 원인: hexa 인터프리터 절대 속도)
+
+### 루프 종료 및 재설계 (1/3회차)
+두 경계선 모두 인터프리터 속도 천장에 막힘. AI-native @attr 프로토타입 6/6은 유효.
+다음 재설계 후보 (선택 대기):
+- (a) **VM 48% → 100% 완료** — 메모리 참조 333x 돌파 재현
+- (b) **Cranelift JIT 전체 경로** 연결 — 루프+matmul 혼합 경로 네이티브화
+- (c) **C codegen PT3** 본격 도입 — 최종 성능 경로
+
+재설계 후 동일 T1/T2 벤치로 재측정. @attr 프로토타입 그대로 재사용 가능.
 
 ### 발견된 .hexa 파서 제약 (feedback 후보)
 - leading/trailing `+` 줄분리 금지 → `let mut line` + 누적 패턴
