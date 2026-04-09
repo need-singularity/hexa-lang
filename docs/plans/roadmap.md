@@ -24,11 +24,18 @@
 - [x] `@moe_active(k,n)` — top-k expert 라우팅, 15/15 PASS
 - [x] `@speculative_decode` — draft+verify 루프, 8/8 PASS, accept 36.6%
 
-### Phase 3 — T1 실측 + 돌파 (진행 중)
-- [ ] htz에서 t1_bench.hexa baseline tok/s 측정
-- [ ] t1_bench_attr.hexa baseline vs @sparse vs @lowrank 3-mode 비교
-- [ ] T1 목표 달성 확인 (≥128 tok/s) 또는 GPU≥50% fallback
-- [ ] 돌파 기록 → `shared/growth_bus.jsonl` + nexus blowup 트리거
+### Phase 3 — T1 실측 (완료, 판정 불가)
+- [x] t1_micro.hexa 마이크로벤치 — 1024² 28.8 GFLOPS / 2048² 33.9 GFLOPS (htz 경합 중)
+- [x] t1_attr_inline.hexa — **dense 70.1ms vs lowrank 31.9ms, 실측 2.2x**
+- [x] T1 판정: **현 인프라 불가** (baseline 30 GFLOPS ≪ 1500 GFLOPS 물리한계)
+  - 7B 환산 <1 tok/s, GPU 대비 <1% → fallback 50% 불충족
+  - 선행 필요: htz 경합 제거 또는 BLAS/rayon 스레딩 진단
+- [x] `@lowrank` 최초 실측 AI-native 가속 확인 (2.2x 실측 / 이론 16x → 14% 효율)
+
+### Phase 3.1 — T1 재도전 조건 (보류)
+- [ ] htz idle 윈도우 확보 후 cold bench 재측정
+- [ ] `OMP_NUM_THREADS=32` 명시 + BLAS 스레딩 실효 확인
+- [ ] hexa matmul 호출 오버헤드 프로파일링
 
 ### Phase 4 — T2 100M 학습 (대기)
 - [ ] Training loop (forward/backward/optimizer) in self/
