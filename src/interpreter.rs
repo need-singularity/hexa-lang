@@ -4555,6 +4555,109 @@ impl Interpreter {
                     _ => Err(self.type_err("matmul_into() requires Tensor as `out` argument".into())),
                 }
             }
+            "qkv_fused_into" => {
+                // qkv_fused_into(X, Uqkv, M, K, R, out_q, out_k, out_v)
+                //   X:    [M × K]   row-major
+                //   Uqkv: [K × 3R]  row-major (concatenated Uq|Uk|Uv along columns)
+                //   Y:    [M × 3R] = X @ Uqkv   (single cblas_dgemm call)
+                //   Split Y columns → out_q[M×R], out_k[M×R], out_v[M×R]
+                // Returns [out_q, out_k, out_v].
+                if args.len() < 8 {
+                    return Err(self.type_err("qkv_fused_into() requires (X, Uqkv, M, K, R, out_q, out_k, out_v)".into()));
+                }
+                let (m, k, r) = match (&args[2], &args[3], &args[4]) {
+                    (Value::Int(m), Value::Int(k), Value::Int(r)) => (*m as usize, *k as usize, *r as usize),
+                    _ => return Err(self.type_err("qkv_fused_into() requires int (M, K, R)".into())),
+                };
+                let three_r = 3 * r;
+                let (x_vec, u_vec): (Vec<f64>, Vec<f64>) = match (to_f64_slice(&args[0]), to_f64_slice(&args[1])) {
+                    (Some(x_s), Some(u_s)) => (x_s.as_slice().to_vec(), u_s.as_slice().to_vec()),
+                    _ => return Err(self.type_err("qkv_fused_into() requires tensor/array (X, Uqkv)".into())),
+                };
+                if x_vec.len() < m * k || u_vec.len() < k * three_r {
+                    return Err(self.type_err("qkv_fused_into() input length < M*K or K*3R".into()));
+                }
+                // Single fused GEMM: Y[M × 3R] = X[M × K] @ Uqkv[K × 3R]
+                let mut y = vec![0.0f64; m * three_r];
+                #[cfg(target_os = "macos")]
+                unsafe {
+                    cblas_dgemm(
+                        CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                        m as i32, three_r as i32, k as i32,
+                        1.0, x_vec.as_ptr(), k as i32,
+                        u_vec.as_ptr(), three_r as i32,
+                        0.0, y.as_mut_ptr(), three_r as i32,
+                    );
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    for i in 0..m {
+                        for p in 0..k {
+                            let a_val = x_vec[i * k + p];
+                            let y_row = i * three_r;
+                            let u_row = p * three_r;
+                            for j in 0..three_r {
+                                y[y_row + j] += a_val * u_vec[u_row + j];
+                            }
+                        }
+                    }
+                }
+                // Helper: split column-range [col_off .. col_off+R] of Y into an out Tensor.
+                fn split_into(out: &mut Value, y: &[f64], m: usize, three_r: usize, r: usize, col_off: usize) -> Result<Value, String> {
+                    match out {
+                        Value::Tensor(arc) => {
+                            if arc.data.len() != m * r {
+                                return Err("qkv_fused_into() out.len() != M*R".into());
+                            }
+                            if Arc::get_mut(arc).is_some() {
+                                let td = Arc::get_mut(arc).unwrap();
+                                let dst = td.data.as_mut_slice();
+                                let mut i = 0;
+                                while i < m {
+                                    let y_row = i * three_r + col_off;
+                                    let d_row = i * r;
+                                    let mut j = 0;
+                                    while j < r {
+                                        dst[d_row + j] = y[y_row + j];
+                                        j += 1;
+                                    }
+                                    i += 1;
+                                }
+                                Ok(Value::Tensor(arc.clone()))
+                            } else {
+                                let shape = arc.shape.clone();
+                                let mut data = vec![0.0f64; m * r];
+                                let mut i = 0;
+                                while i < m {
+                                    let y_row = i * three_r + col_off;
+                                    let d_row = i * r;
+                                    let mut j = 0;
+                                    while j < r {
+                                        data[d_row + j] = y[y_row + j];
+                                        j += 1;
+                                    }
+                                    i += 1;
+                                }
+                                Ok(Value::Tensor(Arc::new(TensorData { shape, data })))
+                            }
+                        }
+                        _ => Err("qkv_fused_into() requires Tensor as out_q/out_k/out_v".into()),
+                    }
+                }
+                let q_out = match split_into(&mut args[5], &y, m, three_r, r, 0) {
+                    Ok(v) => v,
+                    Err(e) => return Err(self.type_err(e)),
+                };
+                let k_out = match split_into(&mut args[6], &y, m, three_r, r, r) {
+                    Ok(v) => v,
+                    Err(e) => return Err(self.type_err(e)),
+                };
+                let v_out = match split_into(&mut args[7], &y, m, three_r, r, 2 * r) {
+                    Ok(v) => v,
+                    Err(e) => return Err(self.type_err(e)),
+                };
+                Ok(Value::Array(vec![q_out, k_out, v_out]))
+            }
             "mat_scale" => {
                 // mat_scale(arr, scalar) → element-wise scaling
                 if args.len() < 2 { return Err(self.type_err("mat_scale() requires (array, scalar)".into())); }
