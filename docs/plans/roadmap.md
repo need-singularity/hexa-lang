@@ -3,6 +3,45 @@
 > 자동 갱신: 돌파/개선 작업 완료 시 다음 벡터를 여기에 추가.
 > 완료된 항목은 [x]로 체크하고 docs/history/에 기록.
 
+## 🚀 CPU AI-Native LLM 특이점 (2026-04-09 진행 중)
+
+> 설계: `docs/superpowers/specs/2026-04-09-cpu-ai-native-physical-limits-design.md`
+> 종료 조건: T1(7B 추론) + T2(100M 학습) 2개 달성. GPU≥50% fallback 허용.
+
+### Phase 1 — 기반 구축 ✅
+- [x] `self/ml/gguf_loader.hexa` — GGUF v3 파서 + Q4_0/Q4_K 디코드 (428 LOC)
+- [x] `self/ml/kv_cache.hexa` — immutable flat 1D KV-cache (172 LOC)
+- [x] `self/ml/t1_bench.hexa` — 7B-fake forward 벤치 하네스
+- [x] `scripts/bench/t1_run.sh` — htz SSH 실행 + JSONL 기록
+- [x] `src/interpreter.rs` — `read_file_bytes` / `file_size` 바이너리 I/O 빌트인 (빌드 대기)
+
+### Phase 2 — AI-native @attr 프로토타입 6/6 ✅
+모두 순수 `.hexa` 구현, Rust `src/` 무수정, 총 **69/69 PASS**:
+- [x] `@sparse(ratio)` — CSR × dense matmul, 15/15 PASS
+- [x] `@lowrank(r)` — rank-r 근사 (power iter), 5/5 PASS, 이론 16x @ 1024² r=32
+- [x] `@matmul_fused` — ReLU/SiLU/GELU 융합, 8/8 PASS
+- [x] `@memoize_grad` — gradient 캐시, 18/18 PASS, hit 2/2
+- [x] `@moe_active(k,n)` — top-k expert 라우팅, 15/15 PASS
+- [x] `@speculative_decode` — draft+verify 루프, 8/8 PASS, accept 36.6%
+
+### Phase 3 — T1 실측 + 돌파 (진행 중)
+- [ ] htz에서 t1_bench.hexa baseline tok/s 측정
+- [ ] t1_bench_attr.hexa baseline vs @sparse vs @lowrank 3-mode 비교
+- [ ] T1 목표 달성 확인 (≥128 tok/s) 또는 GPU≥50% fallback
+- [ ] 돌파 기록 → `shared/growth_bus.jsonl` + nexus blowup 트리거
+
+### Phase 4 — T2 100M 학습 (대기)
+- [ ] Training loop (forward/backward/optimizer) in self/
+- [ ] @lowrank(32) LoRA + @sparse(0.3) + @memoize_grad 결합
+- [ ] 1B token 실학습 <8h 또는 vast 1.3h의 50% 이내
+
+### 발견된 .hexa 파서 제약 (feedback 후보)
+- leading/trailing `+` 줄분리 금지 → `let mut line` + 누적 패턴
+- BigInt × Float 직접 연산 불가 → `to_float(str(x))` 우회
+- RHS dict literal `{k:v}` 불가 → 배열 tuple 또는 `#{...}`
+- 다중 라인 `check(...)` 인자 금지
+- `let mut` 모듈 전역이 import 경계 넘어 참조 불가 → threading 인자 패턴
+
 ## Current State (2026-04-09)
 
 | 모듈 | 파일 | LOC | 상태 |
