@@ -25,6 +25,9 @@ extern "C" {
                    alpha: f64, A: *const f64, lda: i32,
                    B: *const f64, ldb: i32,
                    beta: f64, C: *mut f64, ldc: i32);
+    fn cblas_daxpy(N: i32, alpha: f64,
+                   X: *const f64, incX: i32,
+                   Y: *mut f64, incY: i32);
 }
 #[cfg(target_os = "macos")]
 const CBLAS_ROW_MAJOR: i32 = 101;
@@ -4392,6 +4395,85 @@ impl Interpreter {
                         Ok(args[0].clone())
                     }
                     _ => Err(self.type_err("mat_add_inplace() requires tensor/array as first arg".into())),
+                }
+            }
+            "mat_scale_inplace" => {
+                // mat_scale_inplace(A, s) → A *= s, returns A (Tensor). Zero-alloc when A is uniquely owned.
+                if args.len() < 2 { return Err(self.type_err("mat_scale_inplace() requires (tensor, scalar)".into())); }
+                let s = match &args[1] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => return Err(self.type_err("mat_scale_inplace() requires numeric scalar".into())) };
+                match &mut args[0] {
+                    Value::Tensor(arc) => {
+                        if let Some(td) = Arc::get_mut(arc) {
+                            for x in td.data.iter_mut() { *x *= s; }
+                            Ok(Value::Tensor(arc.clone()))
+                        } else {
+                            let shape = arc.shape.clone();
+                            let mut data = arc.data.clone();
+                            for x in data.iter_mut() { *x *= s; }
+                            Ok(Value::Tensor(Arc::new(TensorData { shape, data })))
+                        }
+                    }
+                    Value::Array(a) => {
+                        for x in a.iter_mut() {
+                            if let Value::Float(f) = x { *f *= s; }
+                            else if let Value::Int(i) = x { *x = Value::Float(*i as f64 * s); }
+                        }
+                        Ok(args[0].clone())
+                    }
+                    _ => Err(self.type_err("mat_scale_inplace() requires tensor/array as first arg".into())),
+                }
+            }
+            "axpy" => {
+                // axpy(W, G, alpha) → W += alpha * G, returns W (Tensor). BLAS AXPY pattern, zero-alloc when W unique.
+                if args.len() < 3 { return Err(self.type_err("axpy() requires (W, G, alpha)".into())); }
+                let alpha = match &args[2] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => return Err(self.type_err("axpy() requires numeric alpha".into())) };
+                let g_vec: Vec<f64> = if let Some(g_s) = to_f64_slice(&args[1]) {
+                    g_s.as_slice().to_vec()
+                } else {
+                    return Err(self.type_err("axpy() requires tensor/array for G".into()));
+                };
+                let g_len = g_vec.len();
+                match &mut args[0] {
+                    Value::Tensor(arc) => {
+                        if arc.data.len() != g_len {
+                            return Err(self.type_err("axpy() length mismatch".into()));
+                        }
+                        if let Some(td) = Arc::get_mut(arc) {
+                            let w = td.data.as_mut_slice();
+                            #[cfg(target_os = "macos")]
+                            unsafe {
+                                cblas_daxpy(g_len as i32, alpha, g_vec.as_ptr(), 1, w.as_mut_ptr(), 1);
+                            }
+                            #[cfg(not(target_os = "macos"))]
+                            {
+                                for (x, y) in w.iter_mut().zip(g_vec.iter()) { *x += alpha * *y; }
+                            }
+                            Ok(Value::Tensor(arc.clone()))
+                        } else {
+                            let shape = arc.shape.clone();
+                            let mut data = arc.data.clone();
+                            #[cfg(target_os = "macos")]
+                            unsafe {
+                                cblas_daxpy(g_len as i32, alpha, g_vec.as_ptr(), 1, data.as_mut_ptr(), 1);
+                            }
+                            #[cfg(not(target_os = "macos"))]
+                            {
+                                for (x, y) in data.iter_mut().zip(g_vec.iter()) { *x += alpha * *y; }
+                            }
+                            Ok(Value::Tensor(Arc::new(TensorData { shape, data })))
+                        }
+                    }
+                    Value::Array(a) => {
+                        if a.len() != g_len {
+                            return Err(self.type_err("axpy() length mismatch".into()));
+                        }
+                        for (x, y) in a.iter_mut().zip(g_vec.iter()) {
+                            if let Value::Float(f) = x { *f += alpha * *y; }
+                            else if let Value::Int(i) = x { *x = Value::Float(*i as f64 + alpha * *y); }
+                        }
+                        Ok(args[0].clone())
+                    }
+                    _ => Err(self.type_err("axpy() requires tensor/array as W".into())),
                 }
             }
             "matmul_into" => {

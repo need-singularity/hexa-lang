@@ -452,6 +452,8 @@ impl Env {
         env.define_builtin("mat_add_inplace", Value::BuiltinFn("mat_add_inplace".into()));
         env.define_builtin("matmul_into", Value::BuiltinFn("matmul_into".into()));
         env.define_builtin("mat_scale", Value::BuiltinFn("mat_scale".into()));
+        env.define_builtin("mat_scale_inplace", Value::BuiltinFn("mat_scale_inplace".into()));
+        env.define_builtin("axpy", Value::BuiltinFn("axpy".into()));
         env.define_builtin("exec_with_status", Value::BuiltinFn("exec_with_status".into()));
         env.define_builtin("input", Value::BuiltinFn("input".into()));
         env.define_builtin("readline", Value::BuiltinFn("readline".into()));

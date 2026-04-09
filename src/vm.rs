@@ -3,8 +3,41 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use crate::compiler::{OpCode, Chunk, CompiledFunction};
-use crate::env::Value;
+use crate::env::{Value, TensorData};
 use crate::error::{HexaError, ErrorClass};
+
+// ---- Tensor BLAS FFI (macOS Accelerate) — mirrors interpreter.rs ----
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn cblas_dgemm(order: i32, transA: i32, transB: i32,
+                   M: i32, N: i32, K: i32,
+                   alpha: f64, A: *const f64, lda: i32,
+                   B: *const f64, ldb: i32,
+                   beta: f64, C: *mut f64, ldc: i32);
+}
+#[cfg(target_os = "macos")]
+const VM_CBLAS_ROW_MAJOR: i32 = 101;
+#[cfg(target_os = "macos")]
+const VM_CBLAS_NO_TRANS: i32 = 111;
+
+/// Extract an owned f64 Vec from a Value (Tensor or Array).
+/// VM-local mirror of interpreter's to_f64_slice — returns owned Vec to avoid
+/// lifetime coupling with the VM stack.
+fn vm_to_f64_vec(val: &Value) -> Option<Vec<f64>> {
+    match val {
+        Value::Tensor(t) => Some(t.data.clone()),
+        Value::Array(a) => Some(
+            a.iter()
+                .map(|v| match v {
+                    Value::Float(f) => *f,
+                    Value::Int(x) => *x as f64,
+                    _ => 0.0,
+                })
+                .collect(),
+        ),
+        _ => None,
+    }
+}
 
 /// A call frame on the VM call stack (flat dispatch — no recursive run_code).
 #[derive(Debug)]
@@ -1042,6 +1075,7 @@ impl VM {
                 match &args[0] {
                     Value::Str(s) => Ok(Value::Int(s.len() as i64)),
                     Value::Array(a) => Ok(Value::Int(a.len() as i64)),
+                    Value::Tensor(t) => Ok(Value::Int(t.data.len() as i64)),
                     _ => Err(runtime_err("len() requires string or array".into())),
                 }
             }
@@ -1386,6 +1420,243 @@ impl VM {
                         Ok(Value::Array(vec![Value::Array(names), Value::Array(tensors)]))
                     }
                     _ => Err(runtime_err("load_weights_bin() requires string path".into())),
+                }
+            }
+            // ==== Tensor builtins — parity with interpreter tier ====
+            "tensor_zeros" => {
+                if args.len() != 1 {
+                    return Err(runtime_err("tensor_zeros(n) requires 1 argument".into()));
+                }
+                let n = match &args[0] {
+                    Value::Int(i) if *i >= 0 => *i as usize,
+                    _ => return Err(runtime_err("tensor_zeros(n): n must be non-negative int".into())),
+                };
+                let data = vec![0.0f64; n];
+                Ok(Value::Tensor(Arc::new(TensorData { shape: vec![n], data })))
+            }
+            "tensor" => {
+                if args.is_empty() {
+                    return Err(runtime_err("tensor() requires at least 1 argument".into()));
+                }
+                let data: Vec<f64> = match &args[0] {
+                    Value::Array(a) => a.iter().map(|v| match v {
+                        Value::Float(f) => *f,
+                        Value::Int(x) => *x as f64,
+                        _ => 0.0,
+                    }).collect(),
+                    Value::Tensor(t) => return Ok(Value::Tensor(t.clone())),
+                    _ => return Err(runtime_err("tensor() requires array argument".into())),
+                };
+                let shape = if args.len() > 1 {
+                    match &args[1] {
+                        Value::Array(s) => s.iter().map(|v| match v {
+                            Value::Int(i) => *i as usize,
+                            _ => 0,
+                        }).collect(),
+                        _ => vec![data.len()],
+                    }
+                } else {
+                    vec![data.len()]
+                };
+                Ok(Value::Tensor(Arc::new(TensorData { shape, data })))
+            }
+            "mat_add" => {
+                if args.len() < 2 {
+                    return Err(runtime_err("mat_add() requires 2 arrays".into()));
+                }
+                let is_tensor = matches!(&args[0], Value::Tensor(_)) && matches!(&args[1], Value::Tensor(_));
+                let (a_vec, b_vec) = match (vm_to_f64_vec(&args[0]), vm_to_f64_vec(&args[1])) {
+                    (Some(a), Some(b)) => (a, b),
+                    _ => return Err(runtime_err("mat_add() requires 2 arrays/tensors".into())),
+                };
+                if a_vec.len() != b_vec.len() {
+                    return Err(runtime_err("mat_add() length mismatch".into()));
+                }
+                let result: Vec<f64> = a_vec.iter().zip(b_vec.iter()).map(|(x, y)| x + y).collect();
+                if is_tensor {
+                    Ok(Value::Tensor(Arc::new(TensorData { shape: vec![result.len()], data: result })))
+                } else {
+                    Ok(Value::Array(result.into_iter().map(Value::Float).collect()))
+                }
+            }
+            "mat_scale" => {
+                if args.len() < 2 {
+                    return Err(runtime_err("mat_scale() requires (array, scalar)".into()));
+                }
+                let is_tensor = matches!(&args[0], Value::Tensor(_));
+                let a_vec = match vm_to_f64_vec(&args[0]) {
+                    Some(v) => v,
+                    None => return Err(runtime_err("mat_scale() requires (array/tensor, scalar)".into())),
+                };
+                let s = match &args[1] {
+                    Value::Float(f) => *f,
+                    Value::Int(i) => *i as f64,
+                    _ => 1.0,
+                };
+                let result: Vec<f64> = a_vec.iter().map(|x| x * s).collect();
+                if is_tensor {
+                    Ok(Value::Tensor(Arc::new(TensorData { shape: vec![result.len()], data: result })))
+                } else {
+                    Ok(Value::Array(result.into_iter().map(Value::Float).collect()))
+                }
+            }
+            "matmul" => {
+                if args.len() < 5 {
+                    return Err(runtime_err("matmul() requires (A, B, M, K, N)".into()));
+                }
+                let (m, k, n) = match (&args[2], &args[3], &args[4]) {
+                    (Value::Int(m), Value::Int(k), Value::Int(n)) => (*m as usize, *k as usize, *n as usize),
+                    _ => return Err(runtime_err("matmul() requires int dimensions".into())),
+                };
+                let (a_vec, b_vec) = match (vm_to_f64_vec(&args[0]), vm_to_f64_vec(&args[1])) {
+                    (Some(a), Some(b)) => (a, b),
+                    _ => return Err(runtime_err("matmul() requires (array/tensor, array/tensor, int, int, int)".into())),
+                };
+                if a_vec.len() < m * k || b_vec.len() < k * n {
+                    return Err(runtime_err("matmul() input length < M*K or K*N".into()));
+                }
+                let mut c = vec![0.0f64; m * n];
+                #[cfg(target_os = "macos")]
+                unsafe {
+                    cblas_dgemm(
+                        VM_CBLAS_ROW_MAJOR, VM_CBLAS_NO_TRANS, VM_CBLAS_NO_TRANS,
+                        m as i32, n as i32, k as i32,
+                        1.0, a_vec.as_ptr(), k as i32,
+                        b_vec.as_ptr(), n as i32,
+                        0.0, c.as_mut_ptr(), n as i32,
+                    );
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    for i in 0..m {
+                        for p in 0..k {
+                            let a_val = a_vec[i * k + p];
+                            for j in 0..n {
+                                c[i * n + j] += a_val * b_vec[p * n + j];
+                            }
+                        }
+                    }
+                }
+                // Match interpreter: matmul returns Array<Float>.
+                Ok(Value::Array(c.into_iter().map(Value::Float).collect()))
+            }
+            "mat_add_inplace" => {
+                if args.len() < 2 {
+                    return Err(runtime_err("mat_add_inplace() requires 2 tensors".into()));
+                }
+                let b_vec = match vm_to_f64_vec(&args[1]) {
+                    Some(v) => v,
+                    None => return Err(runtime_err("mat_add_inplace() requires 2 arrays/tensors".into())),
+                };
+                let b_len = b_vec.len();
+                // args is owned Vec<Value> here — mutate in place.
+                let mut args = args;
+                match &mut args[0] {
+                    Value::Tensor(arc) => {
+                        if arc.data.len() != b_len {
+                            return Err(runtime_err("mat_add_inplace() length mismatch".into()));
+                        }
+                        if let Some(td) = Arc::get_mut(arc) {
+                            for (x, y) in td.data.iter_mut().zip(b_vec.iter()) { *x += *y; }
+                            Ok(Value::Tensor(arc.clone()))
+                        } else {
+                            let shape = arc.shape.clone();
+                            let mut data = arc.data.clone();
+                            for (x, y) in data.iter_mut().zip(b_vec.iter()) { *x += *y; }
+                            Ok(Value::Tensor(Arc::new(TensorData { shape, data })))
+                        }
+                    }
+                    Value::Array(a) => {
+                        if a.len() != b_len {
+                            return Err(runtime_err("mat_add_inplace() length mismatch".into()));
+                        }
+                        for (x, y) in a.iter_mut().zip(b_vec.iter()) {
+                            if let Value::Float(f) = x {
+                                *f += *y;
+                            } else if let Value::Int(i) = x {
+                                *x = Value::Float(*i as f64 + *y);
+                            }
+                        }
+                        Ok(args[0].clone())
+                    }
+                    _ => Err(runtime_err("mat_add_inplace() requires tensor/array as first arg".into())),
+                }
+            }
+            "matmul_into" => {
+                if args.len() < 6 {
+                    return Err(runtime_err("matmul_into() requires (A, B, M, K, N, out)".into()));
+                }
+                let (m, k, n) = match (&args[2], &args[3], &args[4]) {
+                    (Value::Int(m), Value::Int(k), Value::Int(n)) => (*m as usize, *k as usize, *n as usize),
+                    _ => return Err(runtime_err("matmul_into() requires int dimensions".into())),
+                };
+                let (a_vec, b_vec) = match (vm_to_f64_vec(&args[0]), vm_to_f64_vec(&args[1])) {
+                    (Some(a), Some(b)) => (a, b),
+                    _ => return Err(runtime_err("matmul_into() requires array/tensor inputs".into())),
+                };
+                if a_vec.len() < m * k || b_vec.len() < k * n {
+                    return Err(runtime_err("matmul_into() input length < M*K or K*N".into()));
+                }
+                let mut args = args;
+                match &mut args[5] {
+                    Value::Tensor(arc) => {
+                        if arc.data.len() != m * n {
+                            return Err(runtime_err("matmul_into() out.len() != M*N".into()));
+                        }
+                        if Arc::get_mut(arc).is_some() {
+                            let td = Arc::get_mut(arc).unwrap();
+                            let c = td.data.as_mut_slice();
+                            for v in c.iter_mut() { *v = 0.0; }
+                            #[cfg(target_os = "macos")]
+                            unsafe {
+                                cblas_dgemm(
+                                    VM_CBLAS_ROW_MAJOR, VM_CBLAS_NO_TRANS, VM_CBLAS_NO_TRANS,
+                                    m as i32, n as i32, k as i32,
+                                    1.0, a_vec.as_ptr(), k as i32,
+                                    b_vec.as_ptr(), n as i32,
+                                    0.0, c.as_mut_ptr(), n as i32,
+                                );
+                            }
+                            #[cfg(not(target_os = "macos"))]
+                            {
+                                for i in 0..m {
+                                    for p in 0..k {
+                                        let a_val = a_vec[i * k + p];
+                                        for j in 0..n {
+                                            c[i * n + j] += a_val * b_vec[p * n + j];
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(Value::Tensor(arc.clone()))
+                        } else {
+                            let shape = arc.shape.clone();
+                            let mut c = vec![0.0f64; m * n];
+                            #[cfg(target_os = "macos")]
+                            unsafe {
+                                cblas_dgemm(
+                                    VM_CBLAS_ROW_MAJOR, VM_CBLAS_NO_TRANS, VM_CBLAS_NO_TRANS,
+                                    m as i32, n as i32, k as i32,
+                                    1.0, a_vec.as_ptr(), k as i32,
+                                    b_vec.as_ptr(), n as i32,
+                                    0.0, c.as_mut_ptr(), n as i32,
+                                );
+                            }
+                            #[cfg(not(target_os = "macos"))]
+                            {
+                                for i in 0..m {
+                                    for p in 0..k {
+                                        let a_val = a_vec[i * k + p];
+                                        for j in 0..n {
+                                            c[i * n + j] += a_val * b_vec[p * n + j];
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(Value::Tensor(Arc::new(TensorData { shape, data: c })))
+                        }
+                    }
+                    _ => Err(runtime_err("matmul_into() requires Tensor as `out` argument".into())),
                 }
             }
             _ => Err(runtime_err(format!("unknown builtin: {}", name))),
