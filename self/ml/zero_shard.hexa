@@ -1,0 +1,96 @@
+// ═══════════════════════════════════════════════════════════
+//  zero_shard.hexa — ZeRO-style 파라미터/그래디언트 샤딩 시뮬
+//
+//  ZeRO (Zero Redundancy Optimizer) 핵심 아이디어:
+//    - 파라미터 P[0..D]를 N shards로 분할 (각 랭크가 D/N만 소유)
+//    - 로컬 그래디언트는 full D 크기로 계산
+//    - reduce-scatter: 각 shard 오너가 자기 구간 그래디언트 합산 수신
+//    - 오너가 optimizer step 수행 → 업데이트된 shard
+//    - all-gather: 전체 파라미터 복원
+//
+//  @parallel: shard 루프에 OpenMP 힌트
+//  수치 동치: 단일 샤드(N=1) == N-way 샤딩 후 all-reduce
+// ═══════════════════════════════════════════════════════════
+
+// ── 파라미터 D차원을 N shards로 쪼개는 경계 ──────────────
+@pure
+fn shard_begin(d, n, k) {
+    return (d * k) / n
+}
+
+@pure
+fn shard_end(d, n, k) {
+    return (d * (k + 1)) / n
+}
+
+// ── 단일 랭크: 전체 파라미터로 full gradient + SGD ───────
+//  loss = 0.5 * sum((p[i] - target[i])^2)
+//  grad[i] = p[i] - target[i]
+@pure
+fn single_rank_step(params, target, lr, d) {
+    let mut out = []
+    for i in 0..d {
+        let g = params[i] - target[i]
+        out = out + [params[i] - lr * g]
+    }
+    return out
+}
+
+// ── N-way ZeRO shard step ────────────────────────────────
+//  1) 각 "랭크"가 full grad를 계산 (여기선 동일 데이터 가정)
+//  2) reduce-scatter 시뮬: shard owner가 자기 구간 grad 합/N
+//     (모든 랭크가 동일한 grad이므로 합/N == grad)
+//  3) owner가 SGD step 수행
+//  4) all-gather 시뮬: 전체 파라미터 재조합
+@parallel
+fn zero_shard_step(params, target, lr, d, n) {
+    // (1) full gradient per rank (동일 데이터 → 동일 grad)
+    let mut full_grad = []
+    for i in 0..d {
+        full_grad = full_grad + [params[i] - target[i]]
+    }
+
+    // (2)+(3) shard owner별 로컬 업데이트 배열 생성
+    // sharded_params[k] = [ params[beg..end] 업데이트판 ]
+    let mut sharded = []
+    for k in 0..n {
+        let beg = shard_begin(d, n, k)
+        let end = shard_end(d, n, k)
+        let mut local = []
+        // reduce-scatter: 이 구간에 대해 N개 랭크의 grad를 합산
+        // (모두 동일 → sum/N == full_grad[i])
+        for i in beg..end {
+            let mut acc = 0.0
+            for _r in 0..n {
+                acc = acc + full_grad[i]
+            }
+            let g = acc / to_float(n)
+            local = local + [params[i] - lr * g]
+        }
+        sharded = sharded + [local]
+    }
+
+    // (4) all-gather: shards → full D 벡터
+    let mut out = []
+    for k in 0..n {
+        let local = sharded[k]
+        let beg = shard_begin(d, n, k)
+        let end = shard_end(d, n, k)
+        let len = end - beg
+        for j in 0..len {
+            out = out + [local[j]]
+        }
+    }
+    return out
+}
+
+// ── L2 거리 (동치 검증용) ────────────────────────────────
+@pure
+fn l2_diff(a, b, d) {
+    let mut s = 0.0
+    for i in 0..d {
+        let x = a[i] - b[i]
+        s = s + x * x
+    }
+    return s
+}

@@ -1,0 +1,158 @@
+// ═══════════════════════════════════════════════════════════
+//  lora.hexa — LoRA (Low-Rank Adaptation) rank-r adapter math
+//  AnimaLM 14B → 32B fine-tune 하네스용 수학 커널
+//
+//  W' = W + (alpha/r) * B @ A       where A: [r,in], B: [out,r]
+//  only A, B are trainable — frozen W stays intact (14B→32B 스케일).
+//
+//  AI-NATIVE: @pure 수학 커널 + @memoize 상수 스케일 계수
+//  제타 초월 목표: rank-r 선형 부분공간으로 파라미터 10^-4 배 축소,
+//                  14B frozen + rank-4 adapter = 32B capacity 투영.
+// ═══════════════════════════════════════════════════════════
+
+// ── matmul: C[m,n] = A[m,k] @ B[k,n] ─────────────────────
+@pure
+fn matmul(a, b, m, k, n) {
+    let mut c = []
+    for i in 0..m {
+        let mut row = []
+        for j in 0..n {
+            let mut s = 0.0
+            for p in 0..k {
+                s = s + a[i][p] * b[p][j]
+            }
+            row = row + [s]
+        }
+        c = c + [row]
+    }
+    return c
+}
+
+// ── matvec: y[m] = W[m,n] @ x[n] ─────────────────────────
+@pure
+fn matvec(w, x, m, n) {
+    let mut y = []
+    for i in 0..m {
+        let mut s = 0.0
+        for j in 0..n {
+            s = s + w[i][j] * x[j]
+        }
+        y = y + [s]
+    }
+    return y
+}
+
+// ── LoRA scale: alpha / r (memoize) ──────────────────────
+@memoize
+fn lora_scale(alpha, r) {
+    return to_float(alpha) / to_float(r)
+}
+
+// ── zeros helpers ────────────────────────────────────────
+fn zeros1(n) {
+    let mut v = []
+    for i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn zeros2(m, n) {
+    let mut r = []
+    for i in 0..m { r = r + [zeros1(n)] }
+    return r
+}
+
+// ── deterministic LCG init for small weight matrices ────
+fn lcg_init(m, n, seed) {
+    let mut s = seed
+    let mut r = []
+    for i in 0..m {
+        let mut row = []
+        for j in 0..n {
+            s = (s * 1103515245 + 12345) % 2147483647
+            let v = (to_float(s % 2000) - 1000.0) / 10000.0
+            row = row + [v]
+        }
+        r = r + [row]
+    }
+    return r
+}
+
+// ── LoRA forward: y = W @ x + (alpha/r) * B @ (A @ x) ────
+//  - W frozen (M x N), A (r x N), B (M x r)
+@pure
+fn lora_forward(w, a, b, x, m, n, r, alpha) {
+    let base = matvec(w, x, m, n)      // W @ x
+    let ax   = matvec(a, x, r, n)      // A @ x       (len r)
+    let bax  = matvec(b, ax, m, r)     // B @ (A @ x) (len m)
+    let s    = lora_scale(alpha, r)
+    let mut y = []
+    for i in 0..m {
+        y = y + [base[i] + s * bax[i]]
+    }
+    return y
+}
+
+// ── MSE loss + grad w.r.t. y ─────────────────────────────
+@pure
+fn mse_loss(y, target, m) {
+    let mut s = 0.0
+    for i in 0..m {
+        let d = y[i] - target[i]
+        s = s + d * d
+    }
+    return s / to_float(m)
+}
+
+@pure
+fn mse_grad(y, target, m) {
+    let mut g = []
+    let inv = 2.0 / to_float(m)
+    for i in 0..m {
+        g = g + [(y[i] - target[i]) * inv]
+    }
+    return g
+}
+
+// ── LoRA backward (chain rule) ──────────────────────────
+//  dL/dB[i,p] = scale * dy[i] * (A @ x)[p]
+//  dL/dA[p,j] = scale * (B^T @ dy)[p] * x[j]
+//  Returns [dA, dB]
+@pure
+fn lora_backward(a, b, x, dy, m, n, r, alpha) {
+    let s = lora_scale(alpha, r)
+    let ax = matvec(a, x, r, n)         // len r
+    // B^T @ dy
+    let mut btdy = zeros1(r)
+    for p in 0..r {
+        let mut acc = 0.0
+        for i in 0..m { acc = acc + b[i][p] * dy[i] }
+        btdy[p] = acc
+    }
+    // dB = s * dy ⊗ ax
+    let mut db = zeros2(m, r)
+    for i in 0..m {
+        for p in 0..r {
+            db[i][p] = s * dy[i] * ax[p]
+        }
+    }
+    // dA = s * btdy ⊗ x
+    let mut da = zeros2(r, n)
+    for p in 0..r {
+        for j in 0..n {
+            da[p][j] = s * btdy[p] * x[j]
+        }
+    }
+    return [da, db]
+}
+
+// ── SGD step (2D tensor) ────────────────────────────────
+@pure
+fn sgd_update2(w, g, lr, m, n) {
+    let mut r = []
+    for i in 0..m {
+        let mut row = []
+        for j in 0..n { row = row + [w[i][j] - lr * g[i][j]] }
+        r = r + [row]
+    }
+    return r
+}

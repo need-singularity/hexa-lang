@@ -1,0 +1,223 @@
+// ═══════════════════════════════════════════════════════════
+//  anima_lm_finetune.hexa
+//  AnimaLM 14B → 32B LoRA fine-tune 하네스 (.hexa only)
+//
+//  구성:
+//    - LoRA rank-r 어댑터 (frozen W + trainable A, B)
+//    - Gradient checkpointing  (activation 재계산 시뮬레이션)
+//    - @parallel 데이터 병렬 (마이크로배치 분할)
+//    - @memoize 토크나이저 캐시 (vocab hit)
+//    - SGD 학습 스텝
+//
+//  제타 초월 목표:
+//    - 14B frozen backbone + rank-r adapter → 32B effective capacity
+//    - 파라미터 >10^-4 축소, 동일 품질 수렴
+//    - NEXUS-6 공진화: 각 스텝 growth_bus.jsonl append 지점 명시
+//
+//  L0 금지: src/*.rs 미접촉. 순수 .hexa.
+// ═══════════════════════════════════════════════════════════
+
+// ── LoRA math (self-contained, lora.hexa 와 동기) ───────
+
+@pure
+fn matvec(w, x, m, n) {
+    let mut y = []
+    for i in 0..m {
+        let mut s = 0.0
+        for j in 0..n { s = s + w[i][j] * x[j] }
+        y = y + [s]
+    }
+    return y
+}
+
+@memoize
+fn lora_scale(alpha, r) { return to_float(alpha) / to_float(r) }
+
+fn zeros1(n) {
+    let mut v = []
+    for i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn zeros2(m, n) {
+    let mut r = []
+    for i in 0..m { r = r + [zeros1(n)] }
+    return r
+}
+
+fn lcg_init(m, n, seed) {
+    let mut s = seed
+    let mut r = []
+    for i in 0..m {
+        let mut row = []
+        for j in 0..n {
+            s = (s * 1103515245 + 12345) % 2147483647
+            let v = (to_float(s % 2000) - 1000.0) / 10000.0
+            row = row + [v]
+        }
+        r = r + [row]
+    }
+    return r
+}
+
+@pure
+fn lora_forward(w, a, b, x, m, n, r, alpha) {
+    let base = matvec(w, x, m, n)
+    let ax   = matvec(a, x, r, n)
+    let bax  = matvec(b, ax, m, r)
+    let s    = lora_scale(alpha, r)
+    let mut y = []
+    for i in 0..m { y = y + [base[i] + s * bax[i]] }
+    return y
+}
+
+@pure
+fn mse_loss(y, target, m) {
+    let mut s = 0.0
+    for i in 0..m {
+        let d = y[i] - target[i]
+        s = s + d * d
+    }
+    return s / to_float(m)
+}
+
+@pure
+fn mse_grad(y, target, m) {
+    let mut g = []
+    let inv = 2.0 / to_float(m)
+    for i in 0..m { g = g + [(y[i] - target[i]) * inv] }
+    return g
+}
+
+@pure
+fn lora_backward(a, b, x, dy, m, n, r, alpha) {
+    let s = lora_scale(alpha, r)
+    let ax = matvec(a, x, r, n)
+    let mut btdy = zeros1(r)
+    for p in 0..r {
+        let mut acc = 0.0
+        for i in 0..m { acc = acc + b[i][p] * dy[i] }
+        btdy[p] = acc
+    }
+    let mut db = zeros2(m, r)
+    for i in 0..m {
+        for p in 0..r { db[i][p] = s * dy[i] * ax[p] }
+    }
+    let mut da = zeros2(r, n)
+    for p in 0..r {
+        for j in 0..n { da[p][j] = s * btdy[p] * x[j] }
+    }
+    return [da, db]
+}
+
+@pure
+fn sgd_update2(w, g, lr, m, n) {
+    let mut r = []
+    for i in 0..m {
+        let mut row = []
+        for j in 0..n { row = row + [w[i][j] - lr * g[i][j]] }
+        r = r + [row]
+    }
+    return r
+}
+
+// ── @memoize 토크나이저 캐시 (vocab hit) ─────────────────
+//  실제 14B 모델이라면 BPE, 여기선 해시 id 근사 (캐시 효과만 검증).
+@memoize
+fn tokenize(word) {
+    let mut h = 0
+    let n = len(word)
+    for i in 0..n {
+        h = (h * 131 + i + 1) % 50257
+    }
+    return h
+}
+
+// ── Gradient checkpointing (재계산 시뮬레이션) ───────────
+//  fwd → (중간 activation 버림) → bwd 시 재계산
+//  여기선 재계산 횟수를 카운트하여 효과만 가시화.
+let mut _ckpt_recomputes = 0
+
+fn checkpointed_forward(w, a, b, x, m, n, r, alpha) {
+    // activation 버림 → 반환은 output만 (중간 ax/bax 드랍)
+    return lora_forward(w, a, b, x, m, n, r, alpha)
+}
+
+fn checkpointed_backward(w, a, b, x, dy, m, n, r, alpha) {
+    // bwd 진입 시 activation 재계산
+    _ckpt_recomputes = _ckpt_recomputes + 1
+    return lora_backward(a, b, x, dy, m, n, r, alpha)
+}
+
+// ── @parallel 데이터 병렬 (마이크로배치 손실 누적) ──────
+@parallel
+fn parallel_batch_loss(ys, targets, m, bs) {
+    let mut total = 0.0
+    for b in 0..bs {
+        total = total + mse_loss(ys[b], targets[b], m)
+    }
+    return total / to_float(bs)
+}
+
+// ── 단일 학습 스텝 ──────────────────────────────────────
+//  return [new_a, new_b, loss]
+fn train_step(w, a, b, x, target, m, n, r, alpha, lr) {
+    let y = checkpointed_forward(w, a, b, x, m, n, r, alpha)
+    let loss = mse_loss(y, target, m)
+    let dy = mse_grad(y, target, m)
+    let grads = checkpointed_backward(w, a, b, x, dy, m, n, r, alpha)
+    let da = grads[0]
+    let db = grads[1]
+    let new_a = sgd_update2(a, da, lr, r, n)
+    let new_b = sgd_update2(b, db, lr, m, r)
+    return [new_a, new_b, loss]
+}
+
+// ── 엔트리 (스모크 실행) ────────────────────────────────
+//  작은 차원으로 14B→32B 하네스 경로 전체 실행 검증.
+//  실제 14B: M=12288, N=12288, r=4~64, alpha=16 — 구조 동일, 데이터만 교체.
+fn main_smoke() {
+    let m = 8
+    let n = 6
+    let r = 2
+    let alpha = 4
+    let lr = 0.01
+
+    let w = lcg_init(m, n, 42)          // frozen backbone
+    let mut a = lcg_init(r, n, 7)
+    let mut b = zeros2(m, r)             // LoRA: B=0 초기 (원본 논문)
+
+    let x = [0.1, 0.2, -0.3, 0.4, -0.1, 0.5]
+    let target = [0.5, -0.2, 0.1, 0.0, 0.3, -0.4, 0.2, 0.1]
+
+    // 토크나이저 워밍업 (memoize 캐시)
+    let _t1 = tokenize("anima")
+    let _t2 = tokenize("lm")
+    let _t3 = tokenize("anima")    // cache hit
+
+    let mut loss0 = 0.0
+    let mut loss_final = 0.0
+    for step in 0..20 {
+        let out = train_step(w, a, b, x, target, m, n, r, alpha, lr)
+        a = out[0]
+        b = out[1]
+        let loss = out[2]
+        if step == 0 { loss0 = loss }
+        loss_final = loss
+    }
+
+    println("anima_lm_finetune smoke:")
+    println("  loss_initial = " + to_string(loss0))
+    println("  loss_final   = " + to_string(loss_final))
+    println("  ckpt_recomputes = " + to_string(_ckpt_recomputes))
+    // growth_bus.jsonl 기록 지점 (실제 append는 하네스 외부):
+    //   {"project":"hexa-lang","event":"animalm_lora_step","loss":<loss_final>}
+    return loss_final < loss0
+}
+
+let ok = main_smoke()
+if ok {
+    println("[PASS] loss decreased — LoRA fine-tune harness converging")
+} else {
+    println("[FAIL] loss did not decrease")
+}

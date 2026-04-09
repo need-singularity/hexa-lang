@@ -1,0 +1,148 @@
+// ═══════════════════════════════════════════════════════════
+//  moe_layer.hexa — Mixture of Experts (top-k gating)
+//
+//  y = sum_{e in topk(gate(x))} softmax(gate)[e] * expert_e(x)
+//
+//  AI-NATIVE:
+//    @fuse   — gate*expert 퓨전 (곱셈-누적 단일 루프)
+//    @lazy   — 선택되지 않은 expert 평가 skip
+//    @pure   — 수학 커널
+//
+//  expert_e(x) = W_e @ x + b_e  (dense linear, shape [d_out, d_in])
+// ═══════════════════════════════════════════════════════════
+
+// ── expert call counter (lazy 검증용) ────────────────────
+let mut EXPERT_CALLS = 0
+
+fn reset_expert_calls() { EXPERT_CALLS = 0 }
+fn get_expert_calls() { return EXPERT_CALLS }
+
+// ── matvec + bias (single expert forward) ────────────────
+@pure
+fn expert_forward(w, bias, x, d_out, d_in) {
+    EXPERT_CALLS = EXPERT_CALLS + 1
+    let mut y = []
+    for i in 0..d_out {
+        let mut s = bias[i]
+        for j in 0..d_in {
+            s = s + w[i][j] * x[j]
+        }
+        y = y + [s]
+    }
+    return y
+}
+
+// ── gate: score per expert = gate_w[e] . x ───────────────
+@pure
+fn gate_scores(gate_w, x, n_experts, d_in) {
+    let mut s = []
+    for e in 0..n_experts {
+        let mut acc = 0.0
+        for j in 0..d_in {
+            acc = acc + gate_w[e][j] * x[j]
+        }
+        s = s + [acc]
+    }
+    return s
+}
+
+// ── top-k indices (simple selection over small n_experts) ─
+fn topk_indices(scores, n_experts, k) {
+    let mut used = []
+    for i in 0..n_experts { used = used + [false] }
+    let mut picks = []
+    for r in 0..k {
+        let mut best = -1
+        let mut best_v = -1.0e30
+        for e in 0..n_experts {
+            if !used[e] {
+                if scores[e] > best_v {
+                    best_v = scores[e]
+                    best = e
+                }
+            }
+        }
+        used[best] = true
+        picks = picks + [best]
+    }
+    return picks
+}
+
+// ── softmax over picked subset ──────────────────────────
+@pure
+fn softmax_subset(scores, picks, k) {
+    let mut m = scores[picks[0]]
+    for r in 1..k {
+        if scores[picks[r]] > m { m = scores[picks[r]] }
+    }
+    let mut exps = []
+    let mut z = 0.0
+    for r in 0..k {
+        let v = exp(scores[picks[r]] - m)
+        exps = exps + [v]
+        z = z + v
+    }
+    let mut out = []
+    for r in 0..k {
+        out = out + [exps[r] / z]
+    }
+    return out
+}
+
+// ── MoE forward (top-k, lazy experts, fused gate*expert) ─
+//  experts_w:    [n_experts][d_out][d_in]
+//  experts_b:    [n_experts][d_out]
+//  gate_w:       [n_experts][d_in]
+@fuse
+@lazy
+fn moe_forward(experts_w, experts_b, gate_w, x, n_experts, d_out, d_in, k) {
+    let scores = gate_scores(gate_w, x, n_experts, d_in)
+    let picks  = topk_indices(scores, n_experts, k)
+    let probs  = softmax_subset(scores, picks, k)
+
+    // accumulate: y = sum_r probs[r] * expert_{picks[r]}(x)
+    let mut y = []
+    for i in 0..d_out { y = y + [0.0] }
+
+    for r in 0..k {
+        let e  = picks[r]
+        let p  = probs[r]
+        // @lazy: only selected experts are evaluated
+        let ye = expert_forward(experts_w[e], experts_b[e], x, d_out, d_in)
+        for i in 0..d_out {
+            y[i] = y[i] + p * ye[i]
+        }
+    }
+    return y
+}
+
+// ── Dense (non-sparse) reference: softmax over ALL experts ─
+@pure
+fn softmax_all(scores, n) {
+    let mut m = scores[0]
+    for i in 1..n { if scores[i] > m { m = scores[i] } }
+    let mut exps = []
+    let mut z = 0.0
+    for i in 0..n {
+        let v = exp(scores[i] - m)
+        exps = exps + [v]
+        z = z + v
+    }
+    let mut out = []
+    for i in 0..n { out = out + [exps[i] / z] }
+    return out
+}
+
+fn moe_forward_dense(experts_w, experts_b, gate_w, x, n_experts, d_out, d_in) {
+    let scores = gate_scores(gate_w, x, n_experts, d_in)
+    let probs  = softmax_all(scores, n_experts)
+    let mut y = []
+    for i in 0..d_out { y = y + [0.0] }
+    for e in 0..n_experts {
+        let ye = expert_forward(experts_w[e], experts_b[e], x, d_out, d_in)
+        for i in 0..d_out {
+            y[i] = y[i] + probs[e] * ye[i]
+        }
+    }
+    return y
+}
