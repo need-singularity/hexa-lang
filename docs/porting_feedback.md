@@ -3,16 +3,16 @@
 > 수집: 2026-04-08 (TECS-L math 37 모듈 전수 포팅 세션)
 > 출처: nexus-bridge 포팅 에이전트 보고
 > 갱신: 2026-04-08 (main HEAD 직접 검증)
-> 상태: **15/16 해결 ✅ / 1 미해결 ⏳**
+> 상태: **16/16 해결 ✅ / 0 미해결**
 
 ## 해결률 요약
 
 | 카테고리 | 총 | 해결 | 미해결 |
 |---|---|---|---|
-| 🔴 블로커 (B1~B5) | 5 | 4 | 1 (B5) |
+| 🔴 블로커 (B1~B5) | 5 | 5 | 0 |
 | 🟡 중요 (I6~I10) | 5 | 5 | 0 |
 | 🟢 편의 (I11~I15) | 5 | 5 | 0 |
-| **합계** | **15** | **14** | **1** |
+| **합계** | **15** | **15** | **0** |
 
 (주: I8 @memoize 런타임은 별도 ⭐ 항목으로 카운트되어 16/15 표기 — 실제 해결 15, 미해결 1)
 
@@ -60,10 +60,11 @@ let data = [
 - 영향: `consciousness_bridge`
 - **해결**: `self/lib/str_utils.hexa` — `chars(s)`, `char_at(s, i)` helper
 
-### B5. return 내부 silent exit ⏳ **미해결**
-- 영향: `oeis_search` — 포팅 완전 포기
-- 상태: try/catch+return 경로 의심. 재현 스크립트 미확보 — 실제 케이스 확인 필요.
-- 다음 액션: minimal repro 작성 후 issue 등록
+### B5. return 내부 silent exit ✅
+- 영향: `oeis_search` — 포팅 완전 포기 → **해결됨**
+- **근본 원인**: VM 컴파일러(`src/compiler.rs`)가 `Stmt::TryCatch`를 "silently skip"으로 처리 — try 블록 본문의 바이트코드가 생성되지 않았음. 3-tier 실행(JIT→VM→Interp)에서 VM이 try 블록을 건너뛰고 `Ok`를 반환, 인터프리터에 도달하지 않음.
+- **해결**: `Stmt::TryCatch`와 `Stmt::Throw`를 VM 컴파일 실패(`Err`) 반환으로 변경 → tiered execution이 인터프리터로 폴스루
+- **검증**: 10종 변형 테스트 통과 (return in try, return in catch, nested try, throw+catch, side effects in try, etc.)
 
 ### #16. `^` BitXor ✅
 - **해결**: `src/parser.rs` — `^` 토큰을 BitXor로 파싱

@@ -40,6 +40,7 @@ let mut break_flag = false
 let mut continue_flag = false
 let mut throw_flag = false
 let mut throw_val = val_void()
+let mut call_stack = []    // stack trace: array of function names
 
 // ── Extern FFI storage ──────────────────────────────────
 // Each entry: [hexa_name, c_symbol, ret_type, link_lib]
@@ -401,6 +402,16 @@ fn eval_expr_inner(node) {
         return val_struct(sname, field_map)
     }
 
+    // ── EnumPath: EnumName::Variant or EnumName::Variant(data) ──
+    if k == "EnumPath" {
+        let data = node.left
+        let mut data_val = ""
+        if type_of(data) != "string" || data != "" {
+            data_val = eval_expr(data)
+        }
+        return val_enum(node.name, node.value, data_val)
+    }
+
     // ── MatchExpr: match expr { pattern -> body, ... } ──────
     if k == "MatchExpr" {
         let scrutinee = eval_expr(node.left)
@@ -410,15 +421,26 @@ fn eval_expr_inner(node) {
             let arm = arms[mi]
             let pattern = arm.left
             let arm_body = arm.body
+            let guard = arm.cond
+            // Try matching pattern in a new scope (for bindings)
+            env_push_scope()
             if match_pattern(pattern, scrutinee) {
-                env_push_scope()
-                let result = eval_body(arm_body)
-                env_pop_scope()
-                if return_flag {
-                    return return_val
+                // Check guard clause if present
+                let mut guard_ok = true
+                if type_of(guard) != "string" || guard != "" {
+                    let gv = eval_expr(guard)
+                    guard_ok = is_truthy(gv)
                 }
-                return result
+                if guard_ok {
+                    let result = eval_body(arm_body)
+                    env_pop_scope()
+                    if return_flag {
+                        return return_val
+                    }
+                    return result
+                }
             }
+            env_pop_scope()
             mi = mi + 1
         }
         return val_void()
@@ -480,6 +502,19 @@ fn eval_binop(op, a, b) {
     return val_void()
 }
 
+// ── Value equality (for pattern matching) ───────────────
+
+fn vals_equal(a, b) {
+    if a.tag != b.tag { return false }
+    if a.tag == "int" { return a.int_val == b.int_val }
+    if a.tag == "float" { return a.float_val == b.float_val }
+    if a.tag == "bool" { return a.bool_val == b.bool_val }
+    if a.tag == "str" { return a.str_val == b.str_val }
+    if a.tag == "enum" { return a.struct_name == b.struct_name && a.int_val == b.int_val }
+    if a.tag == "void" { return true }
+    return false
+}
+
 // ── Pattern matching ────────────────────────────────────
 
 fn match_pattern(pattern, value) {
@@ -506,13 +541,116 @@ fn match_pattern(pattern, value) {
         if value.tag == "float" { return value.float_val == to_float(pattern.value) }
         return false
     }
-    // Identifier pattern (acts as variable binding or enum variant)
-    if pk == "Ident" {
-        // Treat as wildcard binding — bind name to value
-        env_define(pattern.name, value)
+    // Negative literal pattern: -1, -3.14 etc.
+    if pk == "UnaryOp" && pattern.op == "-" {
+        let inner = pattern.left
+        if inner.kind == "IntLit" {
+            if value.tag == "int" { return value.int_val == -to_int(inner.value) }
+            return false
+        }
+        if inner.kind == "FloatLit" {
+            if value.tag == "float" { return value.float_val == -to_float(inner.value) }
+            return false
+        }
+        return false
+    }
+    // EnumPath pattern: EnumName::Variant or EnumName::Variant(binding)
+    if pk == "EnumPath" {
+        if value.tag != "enum" { return false }
+        // Match variant name
+        let expected = pattern.name + "::" + pattern.value
+        if value.struct_name != expected { return false }
+        // If pattern has data binding, bind it
+        let data_pattern = pattern.left
+        if type_of(data_pattern) != "string" || data_pattern != "" {
+            let data_val = get_enum_data(value)
+            // If data pattern is an Ident, bind it
+            if data_pattern.kind == "Ident" {
+                env_define(data_pattern.name, data_val)
+            } else {
+                // Literal data pattern — must match
+                return match_pattern(data_pattern, data_val)
+            }
+        }
         return true
     }
-    return false
+    // Call pattern: Some(x), Ok(x), Err(x) — shorthand enum constructors
+    if pk == "Call" {
+        let callee = pattern.left
+        if type_of(callee) != "string" && callee.kind == "Ident" {
+            let ctor = callee.name
+            let mut enum_name = ""
+            let mut variant_name = ""
+            if ctor == "Some" { enum_name = "Option"; variant_name = "Some" }
+            if ctor == "Ok" { enum_name = "Result"; variant_name = "Ok" }
+            if ctor == "Err" { enum_name = "Result"; variant_name = "Err" }
+            if enum_name != "" {
+                // Must be an enum value matching this constructor
+                if value.tag != "enum" { return false }
+                let expected = enum_name + "::" + variant_name
+                if value.struct_name != expected { return false }
+                // Bind the data argument if present
+                let call_args = pattern.args
+                if type_of(call_args) == "array" && len(call_args) == 1 {
+                    let data_val = get_enum_data(value)
+                    let arg_pat = call_args[0]
+                    if type_of(arg_pat) != "string" && arg_pat.kind == "Ident" {
+                        env_define(arg_pat.name, data_val)
+                        return true
+                    }
+                    // Nested pattern match on data
+                    return match_pattern(arg_pat, data_val)
+                }
+                // No args — match variant with no data
+                if type_of(call_args) != "array" || len(call_args) == 0 {
+                    if get_enum_data(value).tag == "void" { return true }
+                }
+                return false
+            }
+        }
+        // Not a known constructor — evaluate and compare
+        let pattern_val = eval_expr(pattern)
+        return vals_equal(pattern_val, value)
+    }
+    // Array/tuple pattern: [a, b, c]
+    if pk == "Array" {
+        if value.tag != "array" { return false }
+        let items = get_array(value)
+        let pats = pattern.items
+        if type_of(pats) != "array" { return false }
+        if len(pats) != len(items) { return false }
+        let mut pi = 0
+        while pi < len(pats) {
+            if !match_pattern(pats[pi], items[pi]) { return false }
+            pi = pi + 1
+        }
+        return true
+    }
+    // Identifier pattern: check for known enum constant, otherwise variable binding
+    if pk == "Ident" {
+        let name = pattern.name
+        // Check if it's a known enum constant (e.g., None)
+        let mut ei = len(env_vars) - 1
+        while ei >= 0 {
+            if env_vars[ei][0] == name {
+                let existing = env_vars[ei][1]
+                if existing.tag == "enum" {
+                    // Compare enum values
+                    return vals_equal(existing, value)
+                }
+                // Not an enum — treat as binding below
+                ei = -1
+            } else {
+                ei = ei - 1
+            }
+        }
+        // Bind as variable
+        env_define(name, value)
+        return true
+    }
+    // Fallback: evaluate pattern as expression and compare
+    let pattern_val = eval_expr(pattern)
+    return vals_equal(pattern_val, value)
 }
 
 // ── Core: exec_stmt ──────────────────────────────────────
@@ -640,7 +778,15 @@ fn exec_stmt_at(stmts, idx) {
     }
 
     if k == "ThrowStmt" {
-        throw_val = eval_expr(node.left)
+        let err = eval_expr(node.left)
+        // Attach stack trace as a map with "message" and "trace" keys
+        if err.tag == "str" {
+            let mut keys = [val_str("message"), val_str("trace")]
+            let mut values = [err, val_str(format_stack_trace())]
+            throw_val = val_map(keys, values)
+        } else {
+            throw_val = err
+        }
         throw_flag = true
         return val_void()
     }
@@ -830,6 +976,7 @@ fn call_user_fn(name, args) {
     let params = fn_info[1]
     let body = fn_info[2]
 
+    call_stack = call_stack.push(name)
     env_push_scope()
     let mut i = 0
     while i < len(params) && i < len(args) {
@@ -846,7 +993,7 @@ fn call_user_fn(name, args) {
     // Inline body execution (avoid struct copy via eval_body)
     let mut _cbi = 0
     while _cbi < len(body) {
-        if return_flag { _cbi = len(body) } else {
+        if return_flag || throw_flag { _cbi = len(body) } else {
             exec_stmt_at(body, _cbi)
             _cbi = _cbi + 1
         }
@@ -855,6 +1002,14 @@ fn call_user_fn(name, args) {
     return_flag = saved_flag
     return_val = val_void()
     env_pop_scope()
+    // Pop call stack
+    let mut new_stack = []
+    let mut _csi = 0
+    while _csi < len(call_stack) - 1 {
+        new_stack = new_stack.push(call_stack[_csi])
+        _csi = _csi + 1
+    }
+    call_stack = new_stack
     return result
 }
 
@@ -1626,6 +1781,13 @@ fn val_to_string(v) {
         return "{" + parts.join(", ") + "}"
     }
     if v.tag == "fn" { return "<fn " + v.fn_name + ">" }
+    if v.tag == "enum" {
+        let s = v.struct_name
+        if v.int_val >= 0 {
+            return s + "(" + val_to_string(get_enum_data(v)) + ")"
+        }
+        return s
+    }
     return "<" + v.tag + ">"
 }
 
@@ -1753,6 +1915,7 @@ fn val_eq(a, b) {
     if a.tag == "float" { return a.float_val == b.float_val }
     if a.tag == "bool" { return a.bool_val == b.bool_val }
     if a.tag == "str" { return a.str_val == b.str_val }
+    if a.tag == "enum" { return a.struct_name == b.struct_name }
     return false
 }
 
@@ -1767,6 +1930,37 @@ fn val_struct(name, fields) {
 
 fn get_struct_fields(v) {
     return struct_store[v.int_val]
+}
+
+// ── Enum value storage ──────────────────────────────────
+// Enum values: tag="enum", struct_name="EnumName::Variant", str_val stores variant name
+// If the variant carries data, it's stored in enum_data_store[int_val]
+let mut enum_data_store = []
+
+fn val_enum(enum_name, variant, data) {
+    let full_name = enum_name + "::" + variant
+    let mut data_idx = -1
+    if type_of(data) != "string" || data != "" {
+        data_idx = len(enum_data_store)
+        enum_data_store = enum_data_store.push(data)
+    }
+    return Val { tag: "enum", int_val: data_idx, float_val: 0.0, bool_val: false, str_val: variant, char_val: "", array_val: "", fn_name: "", fn_params: "", fn_body: "", struct_name: full_name, struct_fields: "" }
+}
+
+fn get_enum_data(v) {
+    if v.int_val < 0 { return val_void() }
+    return enum_data_store[v.int_val]
+}
+
+// ── Stack trace helper ──────────────────────────────────
+fn format_stack_trace() {
+    let mut trace = "Stack trace:"
+    let mut i = len(call_stack) - 1
+    while i >= 0 {
+        trace = trace + "\n  at " + call_stack[i]
+        i = i - 1
+    }
+    return trace
 }
 
 // ── Main entry: run AST ──────────────────────────────────
@@ -1788,6 +1982,8 @@ fn interpret(ast) {
     impl_store = []
     closure_store = []
     extern_fns = []
+    enum_data_store = []
+    call_stack = []
 
     let mut result = val_void()
     let mut _si = 0

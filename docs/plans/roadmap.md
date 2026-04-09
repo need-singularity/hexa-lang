@@ -3,7 +3,7 @@
 > 자동 갱신: 돌파/개선 작업 완료 시 다음 벡터를 여기에 추가.
 > 완료된 항목은 [x]로 체크하고 docs/history/에 기록.
 
-## Current State (2026-04-07)
+## Current State (2026-04-09)
 
 | 모듈 | 파일 | LOC | 상태 |
 |------|------|-----|------|
@@ -14,7 +14,7 @@
 | Package Manager | src/package.rs | 1,720 | ✅ 기본 구현 |
 | WASM | src/wasm.rs | 96 | ✅ 기본 구현 |
 | Stdlib | stdlib/*.hexa | 3 modules | ✅ math/string/collections |
-| **Total** | **38+ files** | **54K+** | |
+| **Total** | **38+ files** | **53.8K+** | **415 tests** |
 
 ## Active (강화 필요)
 
@@ -51,8 +51,8 @@
 - [x] else if 문법 (이미 구현)
 - [x] 표준 라이브러리 분리 (2026-04-07, stdlib/ — math, string, collections)
 - [x] **Phase 0**: 언어 인프라 보강 — ✅ 대부분 완료 (HashMap, String, Result, 모듈, enum, 제네릭)
-- [ ] **Phase 1**: 코어 파이프라인 완성 (파서 42함수 갭, AST, 타입체커)
-- [ ] **Phase 2**: 인터프리터 포팅 (8.5K LOC → Hexa)
+- [x] **Phase 1**: 코어 파이프라인 완성 (파서 42함수 갭, AST, 타입체커) — ✅ 완료 (2026-04-09)
+- [ ] **Phase 2**: 인터프리터 포팅 (8.5K LOC → Hexa) — P2-6/P2-7 부분 진행중
 - [ ] **Phase 3**: VM 포팅 (1.5K LOC → Hexa)
 - [ ] **Phase 4**: C 코드 생성 백엔드 (cranelift 대체)
 - [ ] **Phase 5**: 셀프 컴파일 달성 → Rust src/ 제거
@@ -69,9 +69,9 @@
 - [x] @lazy — 지연 평가 라이브러리 순수 .hexa (2026-04-08)
 - [x] @approximate — 빠른 근사 알고리즘 순수 .hexa (2026-04-08)
 - [x] @algebraic — 대수적 등가 변환 순수 .hexa (2026-04-08)
-- [ ] @optimize — 버블소트 → 머지소트 감지
-- [ ] @optimize — 선형탐색 → 이진탐색 감지
-- [ ] @optimize — 꼬리재귀 → 루프 변환
+- [x] @optimize — 버블소트 → 머지소트 감지 (2026-04-09, M957-M959, 96d42eb)
+- [x] @optimize — 선형탐색 → 이진탐색 감지 (2026-04-09, M957-M959, 96d42eb)
+- [x] @optimize — 꼬리재귀 → 루프 변환 (2026-04-09, M957-M959, 96d42eb)
 - [ ] @simd — AVX2/NEON 벡터화
 - [ ] @evolve — 자기진화 (특이점)
 
