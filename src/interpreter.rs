@@ -4930,6 +4930,171 @@ impl Interpreter {
                     _ => Ok(Value::Tensor(Arc::new(TensorData { shape: vec![seq, d], data: x }))),
                 }
             }
+            "block_forward_chain" => {
+                // block_forward_chain(X, Uqkv, Vv, Uo, Vo, Uu, Vu, Ud, Vd, SEQ, D, R, FF, N_LAYER)
+                // Runs N_LAYER identical transformer blocks in Rust loop (tied weights).
+                // Single scratch alloc per forward (vs N_LAYER in block_forward_fused).
+                // Ideal for inference of tied-weight layers at large N_LAYER.
+                if args.len() < 14 {
+                    return Err(self.type_err("block_forward_chain() requires 14 args".into()));
+                }
+                let (seq, d, r, ff, n_layer) = match (&args[9], &args[10], &args[11], &args[12], &args[13]) {
+                    (Value::Int(s), Value::Int(d), Value::Int(r), Value::Int(f), Value::Int(nl)) => (*s as usize, *d as usize, *r as usize, *f as usize, *nl as usize),
+                    _ => return Err(self.type_err("block_forward_chain() requires int (SEQ, D, R, FF, N_LAYER)".into())),
+                };
+                let uqkv: Vec<f64> = to_f64_slice(&args[1]).map(|s| s.as_slice().to_vec()).ok_or_else(|| self.type_err("Uqkv must be tensor/array".into()))?;
+                let vv: Vec<f64> = to_f64_slice(&args[2]).map(|s| s.as_slice().to_vec()).ok_or_else(|| self.type_err("Vv must be tensor/array".into()))?;
+                let uo: Vec<f64> = to_f64_slice(&args[3]).map(|s| s.as_slice().to_vec()).ok_or_else(|| self.type_err("Uo must be tensor/array".into()))?;
+                let vo_: Vec<f64> = to_f64_slice(&args[4]).map(|s| s.as_slice().to_vec()).ok_or_else(|| self.type_err("Vo must be tensor/array".into()))?;
+                let uu: Vec<f64> = to_f64_slice(&args[5]).map(|s| s.as_slice().to_vec()).ok_or_else(|| self.type_err("Uu must be tensor/array".into()))?;
+                let vu: Vec<f64> = to_f64_slice(&args[6]).map(|s| s.as_slice().to_vec()).ok_or_else(|| self.type_err("Vu must be tensor/array".into()))?;
+                let ud: Vec<f64> = to_f64_slice(&args[7]).map(|s| s.as_slice().to_vec()).ok_or_else(|| self.type_err("Ud must be tensor/array".into()))?;
+                let vd: Vec<f64> = to_f64_slice(&args[8]).map(|s| s.as_slice().to_vec()).ok_or_else(|| self.type_err("Vd must be tensor/array".into()))?;
+                let mut x: Vec<f64> = to_f64_slice(&args[0]).map(|s| s.as_slice().to_vec()).ok_or_else(|| self.type_err("X must be tensor/array".into()))?;
+
+                let three_r = 3 * r;
+                // Pre-allocated scratch (single alloc, reused for all layers).
+                let mut y_qkv = vec![0.0f64; seq * three_r];
+                let mut q = vec![0.0f64; seq * r];
+                let mut k_ = vec![0.0f64; seq * r];
+                let mut v = vec![0.0f64; seq * r];
+                let mut scores = vec![0.0f64; seq * seq];
+                let mut ctx_r = vec![0.0f64; seq * r];
+                let mut ctx = vec![0.0f64; seq * d];
+                let mut o_t = vec![0.0f64; seq * r];
+                let mut o = vec![0.0f64; seq * d];
+                let mut t1 = vec![0.0f64; seq * r];
+                let mut y = vec![0.0f64; seq * ff];
+                let mut t2 = vec![0.0f64; seq * r];
+                let mut ffn_out = vec![0.0f64; seq * d];
+
+                for _layer in 0..n_layer {
+                    // zero-out scratch for safety (beta=0 semantics via cblas with beta=0)
+                    // (cblas_dgemm with beta=0.0 overwrites output, so zero fill is unnecessary except for attention accumulators)
+
+                    #[cfg(target_os = "macos")]
+                    unsafe {
+                        // 1. Y_qkv = X @ Uqkv
+                        cblas_dgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                            seq as i32, three_r as i32, d as i32,
+                            1.0, x.as_ptr(), d as i32,
+                            uqkv.as_ptr(), three_r as i32,
+                            0.0, y_qkv.as_mut_ptr(), three_r as i32);
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        for vv_ in y_qkv.iter_mut() { *vv_ = 0.0; }
+                        for i in 0..seq { for p in 0..d { let a = x[i*d+p]; for j in 0..three_r { y_qkv[i*three_r+j] += a * uqkv[p*three_r+j]; } } }
+                    }
+                    // split Q/K/V
+                    for i in 0..seq {
+                        for j in 0..r {
+                            q[i*r+j] = y_qkv[i*three_r+j];
+                            k_[i*r+j] = y_qkv[i*three_r+r+j];
+                            v[i*r+j] = y_qkv[i*three_r+2*r+j];
+                        }
+                    }
+                    #[cfg(target_os = "macos")]
+                    unsafe {
+                        // scores = Q @ K^T
+                        cblas_dgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_TRANS,
+                            seq as i32, seq as i32, r as i32,
+                            1.0, q.as_ptr(), r as i32,
+                            k_.as_ptr(), r as i32,
+                            0.0, scores.as_mut_ptr(), seq as i32);
+                        // ctx_r = scores @ V
+                        cblas_dgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                            seq as i32, r as i32, seq as i32,
+                            1.0, scores.as_ptr(), seq as i32,
+                            v.as_ptr(), r as i32,
+                            0.0, ctx_r.as_mut_ptr(), r as i32);
+                        // ctx = ctx_r @ Vv
+                        cblas_dgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                            seq as i32, d as i32, r as i32,
+                            1.0, ctx_r.as_ptr(), r as i32,
+                            vv.as_ptr(), d as i32,
+                            0.0, ctx.as_mut_ptr(), d as i32);
+                        // o_t = ctx @ Uo
+                        cblas_dgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                            seq as i32, r as i32, d as i32,
+                            1.0, ctx.as_ptr(), d as i32,
+                            uo.as_ptr(), r as i32,
+                            0.0, o_t.as_mut_ptr(), r as i32);
+                        // o = o_t @ Vo
+                        cblas_dgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                            seq as i32, d as i32, r as i32,
+                            1.0, o_t.as_ptr(), r as i32,
+                            vo_.as_ptr(), d as i32,
+                            0.0, o.as_mut_ptr(), d as i32);
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        for vv_ in scores.iter_mut() { *vv_ = 0.0; }
+                        for i in 0..seq { for j in 0..seq { let mut s=0.0; for p in 0..r { s += q[i*r+p] * k_[j*r+p]; } scores[i*seq+j] = s; } }
+                        for vv_ in ctx_r.iter_mut() { *vv_ = 0.0; }
+                        for i in 0..seq { for p in 0..seq { let a=scores[i*seq+p]; for j in 0..r { ctx_r[i*r+j] += a*v[p*r+j]; } } }
+                        for vv_ in ctx.iter_mut() { *vv_ = 0.0; }
+                        for i in 0..seq { for p in 0..r { let a=ctx_r[i*r+p]; for j in 0..d { ctx[i*d+j] += a*vv[p*d+j]; } } }
+                        for vv_ in o_t.iter_mut() { *vv_ = 0.0; }
+                        for i in 0..seq { for p in 0..d { let a=ctx[i*d+p]; for j in 0..r { o_t[i*r+j] += a*uo[p*r+j]; } } }
+                        for vv_ in o.iter_mut() { *vv_ = 0.0; }
+                        for i in 0..seq { for p in 0..r { let a=o_t[i*r+p]; for j in 0..d { o[i*d+j] += a*vo_[p*d+j]; } } }
+                    }
+                    // X += o
+                    for i in 0..(seq*d) { x[i] += o[i]; }
+                    // FFN
+                    #[cfg(target_os = "macos")]
+                    unsafe {
+                        cblas_dgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                            seq as i32, r as i32, d as i32,
+                            1.0, x.as_ptr(), d as i32,
+                            uu.as_ptr(), r as i32,
+                            0.0, t1.as_mut_ptr(), r as i32);
+                        cblas_dgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                            seq as i32, ff as i32, r as i32,
+                            1.0, t1.as_ptr(), r as i32,
+                            vu.as_ptr(), ff as i32,
+                            0.0, y.as_mut_ptr(), ff as i32);
+                        cblas_dgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                            seq as i32, r as i32, ff as i32,
+                            1.0, y.as_ptr(), ff as i32,
+                            ud.as_ptr(), r as i32,
+                            0.0, t2.as_mut_ptr(), r as i32);
+                        cblas_dgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                            seq as i32, d as i32, r as i32,
+                            1.0, t2.as_ptr(), r as i32,
+                            vd.as_ptr(), d as i32,
+                            0.0, ffn_out.as_mut_ptr(), d as i32);
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        for vv_ in t1.iter_mut() { *vv_ = 0.0; }
+                        for i in 0..seq { for p in 0..d { let a=x[i*d+p]; for j in 0..r { t1[i*r+j] += a*uu[p*r+j]; } } }
+                        for vv_ in y.iter_mut() { *vv_ = 0.0; }
+                        for i in 0..seq { for p in 0..r { let a=t1[i*r+p]; for j in 0..ff { y[i*ff+j] += a*vu[p*ff+j]; } } }
+                        for vv_ in t2.iter_mut() { *vv_ = 0.0; }
+                        for i in 0..seq { for p in 0..ff { let a=y[i*ff+p]; for j in 0..r { t2[i*r+j] += a*ud[p*r+j]; } } }
+                        for vv_ in ffn_out.iter_mut() { *vv_ = 0.0; }
+                        for i in 0..seq { for p in 0..r { let a=t2[i*r+p]; for j in 0..d { ffn_out[i*d+j] += a*vd[p*d+j]; } } }
+                    }
+                    // X += ffn_out
+                    for i in 0..(seq*d) { x[i] += ffn_out[i]; }
+                }
+                // Return X
+                match &mut args[0] {
+                    Value::Tensor(arc) => {
+                        if Arc::get_mut(arc).is_some() {
+                            let td = Arc::get_mut(arc).unwrap();
+                            td.data.copy_from_slice(&x);
+                            Ok(Value::Tensor(arc.clone()))
+                        } else {
+                            let shape = arc.shape.clone();
+                            Ok(Value::Tensor(Arc::new(TensorData { shape, data: x })))
+                        }
+                    }
+                    _ => Ok(Value::Tensor(Arc::new(TensorData { shape: vec![seq, d], data: x }))),
+                }
+            }
             "mat_scale" => {
                 // mat_scale(arr, scalar) → element-wise scaling
                 if args.len() < 2 { return Err(self.type_err("mat_scale() requires (array, scalar)".into())); }
