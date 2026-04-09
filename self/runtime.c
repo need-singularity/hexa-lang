@@ -258,6 +258,60 @@ HexaVal hexa_map_get(HexaVal m, const char* key) {
     return hexa_void();
 }
 
+HexaVal hexa_map_keys(HexaVal m) {
+    HexaVal arr = hexa_array_new();
+    for (int i = 0; i < m.map.len; i++) {
+        arr = hexa_array_push(arr, hexa_str(m.map.keys[i]));
+    }
+    return arr;
+}
+
+HexaVal hexa_map_values(HexaVal m) {
+    HexaVal arr = hexa_array_new();
+    for (int i = 0; i < m.map.len; i++) {
+        arr = hexa_array_push(arr, m.map.vals[i]);
+    }
+    return arr;
+}
+
+int hexa_map_contains_key(HexaVal m, const char* key) {
+    for (int i = 0; i < m.map.len; i++) {
+        if (strcmp(m.map.keys[i], key) == 0) return 1;
+    }
+    return 0;
+}
+
+HexaVal hexa_map_remove(HexaVal m, const char* key) {
+    for (int i = 0; i < m.map.len; i++) {
+        if (strcmp(m.map.keys[i], key) == 0) {
+            free(m.map.keys[i]);
+            for (int j = i; j < m.map.len - 1; j++) {
+                m.map.keys[j] = m.map.keys[j+1];
+                m.map.vals[j] = m.map.vals[j+1];
+            }
+            m.map.len--;
+            return m;
+        }
+    }
+    return m;
+}
+
+// Polymorphic index get: array[int] or map[string]
+HexaVal hexa_index_get(HexaVal container, HexaVal key) {
+    if (container.tag == TAG_MAP && key.tag == TAG_STR) {
+        return hexa_map_get(container, key.s);
+    }
+    return hexa_array_get(container, key.i);
+}
+
+// Polymorphic index set: array[int]=val or map[string]=val
+HexaVal hexa_index_set(HexaVal container, HexaVal key, HexaVal val) {
+    if (container.tag == TAG_MAP && key.tag == TAG_STR) {
+        return hexa_map_set(container, key.s, val);
+    }
+    return hexa_array_set(container, key.i, val);
+}
+
 // Silent type check for struct method dispatch (codegen_c2 ImplBlock support).
 // Returns 1 if v is a TAG_MAP carrying a "__type__" field equal to type_name.
 int hexa_is_type(HexaVal v, const char* type_name) {
