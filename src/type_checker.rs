@@ -31,6 +31,20 @@ pub enum CheckType {
 impl CheckType {
     /// Parse a type annotation string into a CheckType.
     pub fn from_annotation(s: &str) -> Self {
+        let s = s.trim();
+        // Array type: [inner]
+        if s.starts_with('[') && s.ends_with(']') {
+            let inner = &s[1..s.len()-1];
+            return CheckType::Array(Box::new(CheckType::from_annotation(inner)));
+        }
+        // Tuple type: (t1, t2, ...)
+        if s.starts_with('(') && s.ends_with(')') {
+            let inner = &s[1..s.len()-1];
+            let items: Vec<CheckType> = inner.split(", ")
+                .map(|part| CheckType::from_annotation(part.trim()))
+                .collect();
+            return CheckType::Tuple(items);
+        }
         match s {
             "int" => CheckType::Int,
             "float" => CheckType::Float,
@@ -80,6 +94,10 @@ impl CheckType {
         // Array with unknown element type accepts any array
         if let (CheckType::Array(a), CheckType::Array(b)) = (self, value_type) {
             return a.accepts(b);
+        }
+        // Tuple: same length, each element accepts
+        if let (CheckType::Tuple(a), CheckType::Tuple(b)) = (self, value_type) {
+            return a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.accepts(y));
         }
         // Struct names must match exactly
         if let (CheckType::Struct(a), CheckType::Struct(b)) = (self, value_type) {

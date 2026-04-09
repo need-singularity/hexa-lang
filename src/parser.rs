@@ -125,13 +125,26 @@ impl Parser {
     fn parse_ret_type(&mut self) -> Result<String, HexaError> {
         if matches!(self.peek(), Token::LBracket) {
             self.advance(); // consume [
-            let inner = self.expect_ident()?;
+            let inner = if matches!(self.peek(), Token::RBracket) {
+                String::new() // [] empty array
+            } else {
+                self.parse_ret_type()? // recursive: [T], [[T]], [(T,T)]
+            };
             self.expect(&Token::RBracket)?;
             Ok(format!("[{}]", inner))
         } else if matches!(self.peek(), Token::LParen) {
             self.advance(); // consume (
+            if matches!(self.peek(), Token::RParen) {
+                self.advance(); // consume )
+                return Ok("()".to_string());
+            }
+            let mut types = vec![self.parse_ret_type()?]; // recursive for nested types
+            while matches!(self.peek(), Token::Comma) {
+                self.advance(); // consume ,
+                types.push(self.parse_ret_type()?);
+            }
             self.expect(&Token::RParen)?;
-            return Ok("()".to_string());
+            Ok(format!("({})", types.join(", ")))
         } else {
             self.expect_ident()
         }
@@ -353,10 +366,10 @@ impl Parser {
             return Ok(Stmt::LetTuple(names, expr));
         }
         let name = self.expect_ident()?;
-        // optional type annotation
+        // optional type annotation (supports [T], (T1, T2), etc.)
         let typ = if matches!(self.peek(), Token::Colon) {
             self.advance();
-            Some(self.expect_ident()?)
+            Some(self.parse_ret_type()?)
         } else {
             None
         };
@@ -369,10 +382,10 @@ impl Parser {
     fn parse_const(&mut self, vis: Visibility) -> Result<Stmt, HexaError> {
         self.advance(); // consume 'const'
         let name = self.expect_ident()?;
-        // optional type annotation
+        // optional type annotation (supports [T], (T1, T2), etc.)
         let typ = if matches!(self.peek(), Token::Colon) {
             self.advance();
-            Some(self.expect_ident()?)
+            Some(self.parse_ret_type()?)
         } else {
             None
         };
@@ -400,7 +413,7 @@ impl Parser {
 
     fn parse_return(&mut self) -> Result<Stmt, HexaError> {
         self.advance(); // consume 'return'
-        if matches!(self.peek(), Token::Newline | Token::Eof | Token::RBrace) {
+        if matches!(self.peek(), Token::Newline | Token::Semicolon | Token::Eof | Token::RBrace) {
             Ok(Stmt::Return(None))
         } else {
             let expr = self.parse_expr()?;
@@ -539,7 +552,7 @@ impl Parser {
         let name = self.expect_ident()?;
         let typ = if matches!(self.peek(), Token::Colon) {
             self.advance();
-            Some(self.expect_ident()?)
+            Some(self.parse_ret_type()?)
         } else {
             None
         };
@@ -1100,7 +1113,7 @@ impl Parser {
             Token::Trait => MacroLitToken::Trait,
             Token::Impl => MacroLitToken::Impl,
             Token::Match => MacroLitToken::Match,
-            Token::Newline => {
+            Token::Newline | Token::Semicolon => {
                 self.advance();
                 self.skip_newlines();
                 if matches!(self.peek(), Token::RBrace | Token::RParen | Token::Eof) {
@@ -1138,7 +1151,7 @@ impl Parser {
             if std::mem::discriminant(self.peek()) == std::mem::discriminant(&open) {
                 depth += 1;
             }
-            if matches!(self.peek(), Token::Newline) {
+            if matches!(self.peek(), Token::Newline | Token::Semicolon) {
                 self.advance();
                 self.skip_newlines();
                 continue;
@@ -1337,7 +1350,7 @@ impl Parser {
             let name = self.expect_ident()?;
             let typ = if matches!(self.peek(), Token::Colon) {
                 self.advance();
-                Some(self.expect_ident()?)
+                Some(self.parse_ret_type()?)
             } else {
                 None
             };

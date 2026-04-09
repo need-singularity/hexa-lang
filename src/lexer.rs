@@ -315,6 +315,36 @@ impl Lexer {
                 self.skip_line_comment();
                 return self.next_token_inner();
             }
+            if self.peek_byte_ahead(1) == Some(b'*') {
+                // Block comment (supports nesting)
+                self.pos += 2;
+                self.col += 2;
+                let mut depth: u32 = 1;
+                while depth > 0 {
+                    match self.peek_byte() {
+                        None => return Err("unterminated block comment".into()),
+                        Some(b'/') if self.peek_byte_ahead(1) == Some(b'*') => {
+                            depth += 1;
+                            self.pos += 2;
+                            self.col += 2;
+                        }
+                        Some(b'*') if self.peek_byte_ahead(1) == Some(b'/') => {
+                            depth -= 1;
+                            self.pos += 2;
+                            self.col += 2;
+                        }
+                        Some(b'\n') => {
+                            self.pos += 1;
+                            self.line += 1;
+                            self.col = 1;
+                        }
+                        Some(_) => {
+                            self.advance();
+                        }
+                    }
+                }
+                return self.next_token_inner();
+            }
         }
 
         // Newline
