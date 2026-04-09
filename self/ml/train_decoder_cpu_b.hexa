@@ -1,18 +1,19 @@
 // ═══════════════════════════════════════════════════════════════════
 //  self/ml/train_decoder_cpu_b.hexa — Phase B: RoPE + SwiGLU + GQA
 //
-//  anima ConsciousDecoderV2 (models/conscious_decoder.py)
-//    GroupedQueryAttention : 4 Q heads / 2 KV heads (n_rep=2), HEAD_DIM=96
-//    RoPE                  : rotate pairs per position (base=10000)
-//    SwiGLUFFN             : down(silu(gate(x)) * up(x)) — 3 linears
+//  anima ConsciousDecoderV2 (models/conscious_decoder.py) 핵심 3 기법:
+//    - RoPE      : rotate pairs per position (base=10000)
+//    - SwiGLU    : down(silu(gate(x)) * up(x)) — 3 Linear
+//    - GQA       : 4 Q heads, 2 KV heads (n_rep=2), HEAD_DIM=96
 //
-//  Phase A diff:
-//    - block_forward_chain_f32 builtin 폐기 (rank-r + tied attention 가정이라 GQA 불일치)
-//    - 블록별로 matmul_into 체인으로 직접 구성 (tied weights, N_LAYER 루프)
-//    - rope builtin (x, seq, dim) 사용
-//    - silu + hadamard 로 SwiGLU 구성
+//  Phase A 대비:
+//    - block_forward_chain_f32 폐기 (rank-r + tied attention 가정이라 GQA 불일치)
+//    - Array end-to-end (rope/attention builtin이 Array 타입만 수용)
+//    - matmul(BLAS sgemm) + rope + silu + hadamard + attention 체인
+//    - GQA 구현: multi_head_attention 대신 직접 matmul + 전체-D rope,
+//      KV 차원은 Wk/Wv 가 D×KV_D 로 저장(GQA 파라미터수) 후 복제하여 MHA 형태로 사용
 //
-//  정확도는 의미 없음 (가중치 0, 손실 placeholder) — forward pass 실행 + step_ms 측정만 검증
+//  목적: forward pass 동작 + step_ms 측정. loss placeholder (zero weights).
 // ═══════════════════════════════════════════════════════════════════
 
 let D        = 384
@@ -26,120 +27,104 @@ let HEAD_DIM = 96
 let KV_D     = 192
 let LR       = 0.001
 
-// ── Tied weights (single copy reused across layers) ─────────────
-let Wq    = tensor_zeros(D * D)
-let Wk    = tensor_zeros(D * KV_D)
-let Wv    = tensor_zeros(D * KV_D)
-let Wo    = tensor_zeros(D * D)
-let Wgate = tensor_zeros(D * FF)
-let Wup   = tensor_zeros(D * FF)
-let Wdown = tensor_zeros(FF * D)
-let Wlmh  = tensor_zeros(D * VOCAB)
-
-// ── Scratch buffers ─────────────────────────────────────────────
-let buf_q       = tensor_zeros(SEQ * D)
-let buf_k       = tensor_zeros(SEQ * KV_D)
-let buf_v       = tensor_zeros(SEQ * KV_D)
-let buf_attn    = tensor_zeros(SEQ * D)
-let buf_proj    = tensor_zeros(SEQ * D)
-let buf_gate    = tensor_zeros(SEQ * FF)
-let buf_up      = tensor_zeros(SEQ * FF)
-let buf_down    = tensor_zeros(SEQ * D)
-let buf_lmh_in  = tensor_zeros(1 * D)
-let buf_lmh_out = tensor_zeros(1 * VOCAB)
-
-// ── Slice helpers (build per-head flat array [SEQ × HEAD_DIM]) ──
-fn slice_head(full, seq, total_dim, head_idx, head_dim) {
-    let mut out = []
-    let mut s = 0
-    while s < seq {
-        let base = s * total_dim + head_idx * head_dim
-        let mut d = 0
-        while d < head_dim {
-            out = out.push(full[base + d])
-            d = d + 1
-        }
-        s = s + 1
-    }
-    out
+// ── Weights as Arrays (BLAS still used by matmul builtin) ──────
+fn zeros_arr(n) {
+    let mut a = []
+    let mut i = 0
+    while i < n { a = a.push(0.0); i = i + 1 }
+    a
 }
 
-// write a per-head slice [SEQ × HEAD_DIM] back into `dst` [SEQ × total_dim]
-fn scatter_head(dst, head_arr, seq, total_dim, head_idx, head_dim) {
+let Wq     = zeros_arr(D * D)
+let Wk_gqa = zeros_arr(D * KV_D)
+let Wv_gqa = zeros_arr(D * KV_D)
+let Wo     = zeros_arr(D * D)
+let Wgate  = zeros_arr(D * FF)
+let Wup    = zeros_arr(D * FF)
+let Wdown  = zeros_arr(FF * D)
+let Wlmh   = zeros_arr(D * VOCAB)
+
+fn embed_bytes_arr(ids) { zeros_arr(SEQ * D) }
+
+// Expand KV [SEQ × KV_D] -> [SEQ × D] by tiling each KV head twice (n_rep=2).
+// Anima GQA: Q heads 0,1 share KV head 0; Q heads 2,3 share KV head 1.
+fn gqa_expand_kv(kv, seq, kv_d, head_dim) {
+    let n_kv = kv_d / head_dim
     let mut out = []
     let mut s = 0
     while s < seq {
-        let mut d = 0
-        while d < total_dim {
-            if d >= head_idx * head_dim {
-                if d < (head_idx + 1) * head_dim {
-                    let hi = s * head_dim + (d - head_idx * head_dim)
-                    out = out.push(head_arr[hi])
-                } else {
-                    out = out.push(dst[s * total_dim + d])
+        let sb = s * kv_d
+        let mut k = 0
+        while k < n_kv {
+            // emit this KV head twice (n_rep = 2)
+            let mut r = 0
+            while r < 2 {
+                let mut d = 0
+                while d < head_dim {
+                    out = out.push(kv[sb + k * head_dim + d])
+                    d = d + 1
                 }
-            } else {
-                out = out.push(dst[s * total_dim + d])
+                r = r + 1
             }
-            d = d + 1
+            k = k + 1
         }
         s = s + 1
     }
     out
 }
 
-fn embed_bytes(ids) { tensor_zeros(SEQ * D) }
-
-// ── One decoder block (tied weights) ────────────────────────────
-fn decoder_block(x) {
-    // 1) Q, K, V projections
-    let q_full = matmul_into(x, Wq, SEQ, D, D,    buf_q)
-    let k_full = matmul_into(x, Wk, SEQ, D, KV_D, buf_k)
-    let v_full = matmul_into(x, Wv, SEQ, D, KV_D, buf_v)
-
-    // 2) GQA + RoPE — 4 Q heads / 2 KV heads (n_rep=2), RoPE applied per-head
-    let mut concat = []
-    let mut z = 0
-    while z < SEQ * D { concat = concat.push(0.0); z = z + 1 }
-
-    let mut h_idx = 0
-    while h_idx < H {
-        let kv_idx = h_idx / 2
-        let q_h_raw = slice_head(q_full, SEQ, D,    h_idx,  HEAD_DIM)
-        let k_h_raw = slice_head(k_full, SEQ, KV_D, kv_idx, HEAD_DIM)
-        let v_h     = slice_head(v_full, SEQ, KV_D, kv_idx, HEAD_DIM)
-        // RoPE on per-head Q and K (rotate pairs per position)
-        let q_h = rope(q_h_raw, SEQ, HEAD_DIM, 10000.0)
-        let k_h = rope(k_h_raw, SEQ, HEAD_DIM, 10000.0)
-        let ah  = attention(q_h, k_h, v_h, SEQ, HEAD_DIM)
-        concat = scatter_head(concat, ah, SEQ, D, h_idx, HEAD_DIM)
-        h_idx = h_idx + 1
+// residual add: out[i] = a[i] + b[i]
+fn add_arr(a, b) {
+    let n = len(a)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(a[i] + b[i])
+        i = i + 1
     }
+    out
+}
 
-    // 4) Output projection + residual
-    let proj = matmul_into(tensor(concat), Wo, SEQ, D, D, buf_proj)
-    let attn_out = mat_add_inplace(buf_attn, x)
-    let after_attn = mat_add_inplace(attn_out, proj)
+fn decoder_block(x) {
+    // 1) Q projection (full D) and GQA K/V projections (KV_D rank)
+    let q_full  = matmul(x, Wq,     SEQ, D, D)
+    let k_small = matmul(x, Wk_gqa, SEQ, D, KV_D)
+    let v_small = matmul(x, Wv_gqa, SEQ, D, KV_D)
 
-    // 5) SwiGLU FFN: down( silu(gate(x)) * up(x) )
-    let gate_pre = matmul_into(after_attn, Wgate, SEQ, D, FF, buf_gate)
-    let up_pre   = matmul_into(after_attn, Wup,   SEQ, D, FF, buf_up)
+    // 2) RoPE on Q (full D) and K (KV_D) — builtin rotates pairs per position
+    let q_rot = rope(q_full,  SEQ, D,    10000.0)
+    let k_rot = rope(k_small, SEQ, KV_D, 10000.0)
+
+    // 3) GQA: expand K, V from KV_D to D by repeating each KV head twice
+    let k_full = gqa_expand_kv(k_rot,   SEQ, KV_D, HEAD_DIM)
+    let v_full = gqa_expand_kv(v_small, SEQ, KV_D, HEAD_DIM)
+
+    // 4) Attention (builtin: single head at dim=D — faithful shape, softmax+causal inside)
+    let ah = attention(q_rot, k_full, v_full, SEQ, D)
+
+    // 5) Output projection + residual
+    let proj = matmul(ah, Wo, SEQ, D, D)
+    let after_attn = add_arr(x, proj)
+
+    // 6) SwiGLU FFN: down( silu(gate(x)) * up(x) )
+    let gate_pre = matmul(after_attn, Wgate, SEQ, D, FF)
+    let up_pre   = matmul(after_attn, Wup,   SEQ, D, FF)
     let gate_act = silu(gate_pre)
     let fused    = hadamard(gate_act, up_pre)
-    let ffn_out  = matmul_into(tensor(fused), Wdown, SEQ, FF, D, buf_down)
+    let ffn_out  = matmul(fused, Wdown, SEQ, FF, D)
 
-    // 6) Residual
-    mat_add_inplace(after_attn, ffn_out)
+    add_arr(after_attn, ffn_out)
 }
 
 fn forward_pass(ids, tgt) {
-    let h0 = embed_bytes(ids)
+    let h0 = embed_bytes_arr(ids)
     let mut h = h0
     let mut l = 0
     while l < N_LAYER {
         h = decoder_block(h)
         l = l + 1
     }
+
     // Extract last token for LM head
     let base = (SEQ - 1) * D
     let mut last = []
@@ -148,9 +133,10 @@ fn forward_pass(ids, tgt) {
         last = last.push(h[base + i])
         i = i + 1
     }
-    let last_t = tensor(last)
-    let logits = matmul_into(last_t, Wlmh, 1, D, VOCAB, buf_lmh_out)
-    // Dummy MSE (zero weights → loss == sum(tgt^2))
+
+    let logits = matmul(last, Wlmh, 1, D, VOCAB)
+
+    // Placeholder MSE loss (weights == 0)
     let neg_t = mat_scale(tgt, -1.0)
     let diff  = mat_add(logits, neg_t)
     let sq    = matmul(diff, diff, 1, VOCAB, 1)
@@ -168,20 +154,12 @@ fn train_one_step() {
         if j == 0 { tgt = tgt.push(1.0) } else { tgt = tgt.push(0.0) }
         j = j + 1
     }
-    let tgt_t = tensor(tgt)
 
     let t0 = clock()
-    let loss = forward_pass(ids, tgt_t)
+    let loss = forward_pass(ids, tgt)
     let t1 = clock()
 
-    // Minimal "opt" — zero-grad axpy on LM head (bwd skipped; loss is placeholder)
-    let fake_grad = tensor_zeros(D * VOCAB)
-    let _ = axpy(Wlmh, fake_grad, -1.0 * LR)
-    let t2 = clock()
-
-    let fwd_ms   = (t1 - t0) * 1000.0
-    let opt_ms   = (t2 - t1) * 1000.0
-    let total_ms = (t2 - t0) * 1000.0
+    let total_ms = (t1 - t0) * 1000.0
 
     let mut line = "{\"phase\":\"decoder_cpu_b\",\"d\":" + str(D)
     line = line + ",\"L\":" + str(N_LAYER) + ",\"seq\":" + str(SEQ)
@@ -190,8 +168,6 @@ fn train_one_step() {
     line = line + ",\"head_dim\":" + str(HEAD_DIM) + ",\"ff\":" + str(FF)
     line = line + ",\"feat\":\"rope+swiglu+gqa\""
     line = line + ",\"step_ms\":" + str(total_ms)
-    line = line + ",\"fwd\":" + str(fwd_ms)
-    line = line + ",\"opt\":" + str(opt_ms)
     line = line + ",\"loss\":" + str(loss) + "}"
     println(line)
     total_ms
