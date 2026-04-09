@@ -89,7 +89,7 @@
 21,952 조합 전수 탐색 완료 — 100% n=6 EXACT. 문법/타입/메모리 전 레벨 수렴.
 
 ## 문법 요약
-53 keywords (sigma*tau+sopfr) | 24 operators (J2) | 8 primitives (sigma-tau)
+56 keywords (sigma*tau+sopfr+3 실측 추가) | 24 operators (J2) | 8 primitives (sigma-tau)
 
 ## IR 현황
 self-hosting Phase1 완료 | LLVM 0% (의존 없음) | 1791 tests | 53.8K LOC | bench 333x

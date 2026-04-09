@@ -168,6 +168,137 @@ fn gen2_ffi_wrap_ret(ret_type, var_name) {
     return "hexa_int(" + var_name + ")"
 }
 
+// ── P4-3: Static FFI — extern fn → C declaration (compile-time linking) ──
+// Instead of dlsym-based wrappers, generates direct C extern declarations.
+// Used when linking against C libraries at compile time.
+
+// Map Hexa type annotation to C type for static FFI declarations
+fn gen2_static_c_type(typ) {
+    if typ == "i64" || typ == "Int" || typ == "int" { return "long long" }
+    if typ == "i32" { return "int" }
+    if typ == "f64" || typ == "Float" || typ == "float" { return "double" }
+    if typ == "f32" { return "float" }
+    if typ == "str" || typ == "Str" || typ == "String" { return "char*" }
+    if typ == "bool" || typ == "Bool" { return "int" }
+    if typ == "void" || typ == "Void" || typ == "" { return "void" }
+    if typ == "*Void" || typ == "Ptr" { return "void*" }
+    // Unknown type — pass through as-is (user-defined C type)
+    return typ
+}
+
+// Generate a C extern function declaration for static linking
+// extern fn foo(x: Int, y: Float) -> Int
+//   → extern long long foo(long long x, double y);
+fn gen2_extern_static_decl(node) {
+    let name = node.name
+    let ret_type = node.ret_type
+
+    // Use @symbol alias if present, otherwise use the Hexa name
+    let mut c_name = node.value
+    if c_name == "" { c_name = name }
+
+    // Map return type
+    let c_ret = gen2_static_c_type(ret_type)
+
+    // Map parameter types
+    let mut c_params = []
+    let mut i = 0
+    while i < len(node.params) {
+        let p = node.params[i]
+        let c_typ = gen2_static_c_type(p.value)
+        if c_typ == "void" {
+            // Untyped param — default to long long
+            c_params = c_params.push("long long " + p.name)
+        } else {
+            c_params = c_params.push(c_typ + " " + p.name)
+        }
+        i = i + 1
+    }
+
+    let params_str = c_params.join(", ")
+    let mut sig = params_str
+    if sig == "" { sig = "void" }
+
+    // Build the declaration
+    let mut parts = []
+
+    // If @link("lib") is set, emit a comment noting the library
+    if node.op != "" {
+        parts = parts.push("// link: -l" + node.op + "\n")
+    }
+
+    parts = parts.push("extern " + c_ret + " " + c_name + "(" + sig + ");\n")
+    return parts.join("")
+}
+
+// Collect required #include headers based on extern fn types
+fn gen2_extern_includes(ast) {
+    let mut needs_stdio = 0
+    let mut needs_stdlib = 0
+    let mut needs_string = 0
+    let mut needs_math = 0
+    let mut has_extern = 0
+
+    let mut i = 0
+    while i < len(ast) {
+        if ast[i].kind == "ExternFnDecl" {
+            has_extern = 1
+            // Check @link for common libraries
+            if ast[i].op == "m" || ast[i].op == "libm" {
+                needs_math = 1
+            }
+            // Check param/return types for string usage
+            let mut j = 0
+            while j < len(ast[i].params) {
+                let t = ast[i].params[j].value
+                if t == "str" || t == "Str" || t == "String" {
+                    needs_string = 1
+                }
+                j = j + 1
+            }
+            let rt = ast[i].ret_type
+            if rt == "str" || rt == "Str" || rt == "String" {
+                needs_string = 1
+            }
+        }
+        i = i + 1
+    }
+
+    if has_extern == 0 { return "" }
+
+    let mut includes = []
+    includes = includes.push("#include <stdint.h>\n")
+    if needs_math == 1 {
+        includes = includes.push("#include <math.h>\n")
+    }
+    if needs_string == 1 {
+        includes = includes.push("#include <string.h>\n")
+    }
+    return includes.join("")
+}
+
+// Generate all static FFI declarations for an AST
+fn gen2_static_ffi_block(ast) {
+    let includes = gen2_extern_includes(ast)
+    let mut decls = []
+    let mut i = 0
+    while i < len(ast) {
+        if ast[i].kind == "ExternFnDecl" {
+            decls = decls.push(gen2_extern_static_decl(ast[i]))
+        }
+        i = i + 1
+    }
+    if len(decls) == 0 { return "" }
+    let mut parts = []
+    if includes != "" {
+        parts = parts.push(includes)
+    }
+    parts = parts.push("\n// ── FFI declarations ──\n")
+    parts = parts.push(decls.join(""))
+    parts = parts.push("\n")
+    return parts.join("")
+}
+
 fn gen2_extern_wrapper(node) {
     let name = node.name
     let nargs = len(node.params)
@@ -194,7 +325,8 @@ fn gen2_extern_wrapper(node) {
 
     let has_float = gen2_has_float_param(node.params)
 
-    let mut impl_code = ""
+    // perf: chunks.push + join — avoid O(n²) string concat
+    let mut impl_parts = []
 
     if has_float == 1 || nargs > 0 {
         // ── G3: Typed dispatch — generate a typedef + direct typed call ──
@@ -213,8 +345,8 @@ fn gen2_extern_wrapper(node) {
         let mut td_sig = td_p
         if td_sig == "" { td_sig = "void" }
 
-        impl_code = "typedef " + c_ret + " (*__ffi_ftyp_" + name + ")(" + td_sig + ");\n"
-        impl_code = impl_code + "HexaVal " + name + "(" + sig_p + ") {\n"
+        impl_parts = impl_parts.push("typedef " + c_ret + " (*__ffi_ftyp_" + name + ")(" + td_sig + ");\n")
+        impl_parts = impl_parts.push("HexaVal " + name + "(" + sig_p + ") {\n")
 
         // Marshal each arg to its native C type
         let mut call_args = []
@@ -226,19 +358,20 @@ fn gen2_extern_wrapper(node) {
         let call_str = call_args.join(", ")
 
         if ret_type == "Void" || ret_type == "void" || ret_type == "" {
-            impl_code = impl_code + "    ((__ffi_ftyp_" + name + ")__ffi_sym_" + name + ")(" + call_str + ");\n"
-            impl_code = impl_code + "    return hexa_void();\n"
+            impl_parts = impl_parts.push("    ((__ffi_ftyp_" + name + ")__ffi_sym_" + name + ")(" + call_str + ");\n")
+            impl_parts = impl_parts.push("    return hexa_void();\n")
         } else {
-            impl_code = impl_code + "    " + c_ret + " __r = ((__ffi_ftyp_" + name + ")__ffi_sym_" + name + ")(" + call_str + ");\n"
-            impl_code = impl_code + "    return " + gen2_ffi_wrap_ret(ret_type, "__r") + ";\n"
+            impl_parts = impl_parts.push("    " + c_ret + " __r = ((__ffi_ftyp_" + name + ")__ffi_sym_" + name + ")(" + call_str + ");\n")
+            impl_parts = impl_parts.push("    return " + gen2_ffi_wrap_ret(ret_type, "__r") + ";\n")
         }
-        impl_code = impl_code + "}\n"
+        impl_parts = impl_parts.push("}\n")
     } else {
         // 0-arg function — use simple hexa_extern_call
-        impl_code = "HexaVal " + name + "(" + sig_p + ") {\n"
-        impl_code = impl_code + "    return hexa_extern_call(__ffi_sym_" + name + ", NULL, 0, " + gen2_extern_ret_kind(ret_type) + ");\n"
-        impl_code = impl_code + "}\n"
+        impl_parts = impl_parts.push("HexaVal " + name + "(" + sig_p + ") {\n")
+        impl_parts = impl_parts.push("    return hexa_extern_call(__ffi_sym_" + name + ", NULL, 0, " + gen2_extern_ret_kind(ret_type) + ");\n")
+        impl_parts = impl_parts.push("}\n")
     }
+    let impl_code = impl_parts.join("")
 
     // Init: dlopen + dlsym in main() — use @symbol C name and @link library
     let mut lib_arg = "NULL"
@@ -258,13 +391,14 @@ fn gen2_extern_wrapper(node) {
 }
 
 fn gen2_indent(n) {
-    let mut s = ""
+    // perf: chunks.push + join — avoid O(n²) string concat
+    let mut parts = []
     let mut i = 0
     while i < n {
-        s = s + "    "
+        parts = parts.push("    ")
         i = i + 1
     }
-    return s
+    return parts.join("")
 }
 
 fn gen2_stmt(node, depth) {
@@ -928,17 +1062,19 @@ fn gen2_struct_decl(node) {
     // Generate a constructor function: StructName(field1, field2, ...) -> HexaVal map
     let name = node.name
     let mut params = []
-    let mut body = "    HexaVal __s = hexa_map_new();\n"
+    // perf: chunks.push + join — avoid O(n²) string concat
+    let mut body_parts = []
+    body_parts = body_parts.push("    HexaVal __s = hexa_map_new();\n")
     let mut i = 0
     while i < len(node.fields) {
         let f = node.fields[i]
         params = params.push("HexaVal " + f.name)
-        body = body + "    __s = hexa_map_set(__s, \"" + f.name + "\", " + f.name + ");\n"
+        body_parts = body_parts.push("    __s = hexa_map_set(__s, \"" + f.name + "\", " + f.name + ");\n")
         i = i + 1
     }
     let p = params.join(", ")
     if p == "" { p = "void" }
-    return "HexaVal " + name + "(" + p + ") {\n" + body + "    return __s;\n}\n"
+    return "HexaVal " + name + "(" + p + ") {\n" + body_parts.join("") + "    return __s;\n}\n"
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -947,14 +1083,16 @@ fn gen2_struct_decl(node) {
 
 fn gen2_enum_decl(node) {
     let name = node.name
-    let mut out = "// enum " + name + "\n"
+    // perf: chunks.push + join — avoid O(n²) string concat
+    let mut parts = []
+    parts = parts.push("// enum " + name + "\n")
     let mut i = 0
     while i < len(node.variants) {
         let v = node.variants[i]
-        out = out + "#define " + name + "_" + v.name + " hexa_int(" + to_string(i) + ")\n"
+        parts = parts.push("#define " + name + "_" + v.name + " hexa_int(" + to_string(i) + ")\n")
         i = i + 1
     }
-    return out
+    return parts.join("")
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -1098,7 +1236,8 @@ fn gen2_arm_value(body) {
 // ═══════════════════════════════════════════════════════════
 
 let mut _lambda_counter = 0
-let mut _lambda_defs = ""
+// perf: use array accumulator — avoid O(n²) string concat for lambda defs
+let mut _lambda_def_parts = []
 
 fn gen2_lambda_expr(node) {
     let id = _lambda_counter
@@ -1115,26 +1254,26 @@ fn gen2_lambda_expr(node) {
     let p = params.join(", ")
     if p == "" { p = "void" }
 
-    // Build function body
-    let mut body_c = ""
+    // Build function body — perf: chunks.push + join — avoid O(n²) string concat
+    let mut body_parts = []
     let lbody = node.left
     if type_of(lbody) != "string" {
         if type_of(lbody) == "array" {
             // Block body
             let mut bi = 0
             while bi < len(lbody) {
-                body_c = body_c + gen2_stmt(lbody[bi], 1)
+                body_parts = body_parts.push(gen2_stmt(lbody[bi], 1))
                 bi = bi + 1
             }
         } else {
             // Single expression body — return it
-            body_c = "    return " + gen2_expr(lbody) + ";\n"
+            body_parts = body_parts.push("    return " + gen2_expr(lbody) + ";\n")
         }
     }
 
     // Emit the function definition (will be placed before main)
-    let fn_def = "HexaVal " + fn_name + "(" + p + ") {\n" + body_c + "    return hexa_void();\n}\n\n"
-    _lambda_defs = _lambda_defs + fn_def
+    let fn_def = "HexaVal " + fn_name + "(" + p + ") {\n" + body_parts.join("") + "    return hexa_void();\n}\n\n"
+    _lambda_def_parts = _lambda_def_parts.push(fn_def)
 
     // Return a reference to the function
     // For now, lambdas are represented as function pointers cast to HexaVal
@@ -1145,7 +1284,7 @@ fn gen2_lambda_expr(node) {
 // Override codegen_c2 to include lambda definitions
 fn codegen_c2_full(ast) {
     _lambda_counter = 0
-    _lambda_defs = ""
+    _lambda_def_parts = []
 
     // Collect sections as arrays, join at end (avoid O(n²) concat)
     let mut fwd_parts = []
@@ -1185,7 +1324,7 @@ fn codegen_c2_full(ast) {
     out_parts = out_parts.push(global_parts.join(""))
     out_parts = out_parts.push("\n")
     // Insert lambda definitions before user functions
-    out_parts = out_parts.push(_lambda_defs)
+    out_parts = out_parts.push(_lambda_def_parts.join(""))
     out_parts = out_parts.push(fn_parts.join(""))
     out_parts = out_parts.push("int main() {\n")
     out_parts = out_parts.push(main_parts.join(""))

@@ -615,9 +615,7 @@ fn run_source_with_dir(source: &str, file_path: &str) {
     // Tier 2: VM (bytecode — reuse already-parsed stmts)
     {
         let mut comp = compiler::Compiler::new();
-        eprintln!("[DEBUG-B5] VM compile attempt...");
         if let Ok(chunk) = comp.compile(&result.stmts) {
-            eprintln!("[DEBUG-B5] VM compile succeeded, running VM...");
             let mut vm = vm::VM::new();
             match vm.execute(&chunk) {
                 Ok(_) => return,
