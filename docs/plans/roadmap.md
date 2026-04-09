@@ -14,7 +14,7 @@
 | Package Manager | src/package.rs | 1,720 | ✅ 기본 구현 |
 | WASM | src/wasm.rs | 96 | ✅ 기본 구현 |
 | Stdlib | stdlib/*.hexa | 3 modules | ✅ math/string/collections |
-| **Total** | **38+ files** | **53.8K+** | **415 tests** |
+| **Total** | **38+ files** | **53.8K+** | **902 tests** (+487) |
 
 ## Active (강화 필요)
 
@@ -85,6 +85,33 @@
 - [ ] ESP32 최적화
 
 ## Completed
+
+### 2026-04-09 (대세션 — 테스트 +487 / AI-native 감사)
+- [x] **테스트 대량 확충 +487** — 누계 415 → 902
+  - test_type_system.hexa — 128 tests (타입 추론/강제/제네릭/Result·Option)
+  - test_operators_edge.hexa — 162 tests (연산자 우선순위/오버로드/경계값)
+  - test_collections_deep.hexa — 108 tests (Array/Map/Dict 심층)
+  - test_ai_native_attrs.hexa — 89 tests (@memoize/@optimize/@fuse/@parallel/@symbolic/@algebraic/@contract)
+- [x] **test_lang_core.hexa 100/100** — 언어 코어 회귀 스위트 full-green
+- [x] **test_error_handling.hexa 29/29** — Result/try/throw/panic 경로 완전 커버
+- [x] **AI-native 24종 감사** — 4 완료 / 16 부분 구현 / 1 미시작
+  - 완료: @memoize · @optimize · @fuse · @parallel
+  - 부분: @specialize · @symbolic · @lazy · @approximate · @algebraic · @contract · @hot · @cold · @pure · @inline · @noinline · @vectorize · @tail · @unroll · @prefetch · @align · @const
+  - 미시작: @evolve (특이점 자기진화)
+- [x] **문서 동기화** — @contract / @symbolic / @algebraic 스펙을 docs/ai-native-attrs.md 에 반영, docs/ai-native.md 24종 벡터 최신화
+- [x] **P2-6 디스패치 107 tests** (6177ab4) — struct/enum 메서드 디스패치 최소 기능 확장
+- [x] **@fuse M960** (6177ab4) — map/filter/fold 퓨전 경로 추가 정리
+- [x] **StringBuilder O(n²) 해결** (747952d) — codegen 스트리밍
+- [x] **M957-M959** (96d42eb) — 버블→머지소트 / 선형→이진탐색 / 꼬리재귀→루프 감지
+- [x] **P2-7 블로커 해제** (0128c4d) — parser.hexa AstNode struct 정의
+- [x] **ai_native_pass 천장 돌파** (91d4427) — 모든 fn 분석 가드 제거
+- [x] **Tensor Float 출력 + tensor_zeros/tensor_fill** (e7c381e)
+- [x] **embedding() Tensor support** (6820a5f) — v14 real inference 활성
+- [x] **BLAS cblas_dgemm + repeat_kv + weight_dict** (8e0cc2c)
+- [x] **Tensor zero-copy 10 AI builtins** (77fb00a)
+- [x] **Value::Tensor + mmap_weights + rayon parallel** (595005a)
+- [x] **I6 bigint promotion** (73f0b01)
+- [x] **G1~G6 FFI 확장** (c613cb2) — symbol aliasing, struct pack, float ARM64, callbacks, 10-arg dispatch
 
 ### 2026-04-07
 - [x] **VM fallthrough 수정** — 미지원 기능에서 Void→Err, method call/map/match 정상 fallthrough

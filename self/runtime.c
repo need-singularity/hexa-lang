@@ -35,13 +35,16 @@ HexaVal hexa_str_to_upper(HexaVal s);
 HexaVal hexa_str_to_lower(HexaVal s);
 HexaVal hexa_str_chars(HexaVal s);
 HexaVal hexa_format_n(HexaVal fmt, HexaVal args);
+HexaVal hexa_array_new(void);
+HexaVal hexa_void(void);
+int hexa_is_type(HexaVal v, const char* type_name);
 
 // ── Tagged Value ─────────────────────────────────────────
 // All HEXA values are represented as tagged unions (NaN-boxing alternative)
 
 typedef enum {
     TAG_INT = 0, TAG_FLOAT, TAG_BOOL, TAG_STR, TAG_VOID,
-    TAG_ARRAY, TAG_MAP, TAG_FN, TAG_CHAR
+    TAG_ARRAY, TAG_MAP, TAG_FN, TAG_CHAR, TAG_CLOSURE
 } HexaTag;
 
 typedef struct HexaVal {
@@ -66,8 +69,89 @@ typedef struct HexaVal {
             void* fn_ptr;
             int arity;
         } fn;
+        // C3 closure: function pointer that takes (HexaVal env, ...args)
+        // env is a boxed TAG_ARRAY HexaVal (heap-allocated so it survives copies).
+        struct {
+            void* fn_ptr;           // signature: HexaVal (*)(HexaVal env, ...N args)
+            int arity;              // number of user params (excluding env)
+            struct HexaVal* env_box;// heap box holding a single TAG_ARRAY HexaVal
+        } clo;
     };
 } HexaVal;
+
+// ── C3 Closure helpers ───────────────────────────────────
+// Build a closure value. Captured values are provided as an already-built
+// TAG_ARRAY HexaVal; we heap-box it so the closure remains valid after copies.
+static inline HexaVal hexa_closure_new(void* fn_ptr, int arity, HexaVal env_arr) {
+    HexaVal v = {.tag=TAG_CLOSURE};
+    v.clo.fn_ptr = fn_ptr;
+    v.clo.arity = arity;
+    v.clo.env_box = (HexaVal*)malloc(sizeof(HexaVal));
+    *v.clo.env_box = env_arr;
+    return v;
+}
+
+static inline HexaVal hexa_closure_env(HexaVal c) {
+    if (c.tag != TAG_CLOSURE || !c.clo.env_box) return hexa_array_new();
+    return *c.clo.env_box;
+}
+
+// Dispatched call helpers — one per arity we support (0..4).
+static inline HexaVal hexa_call0(HexaVal f) {
+    if (f.tag == TAG_CLOSURE) {
+        HexaVal (*fp)(HexaVal) = (HexaVal(*)(HexaVal))f.clo.fn_ptr;
+        return fp(hexa_closure_env(f));
+    }
+    if (f.tag == TAG_FN) {
+        HexaVal (*fp)(void) = (HexaVal(*)(void))f.fn.fn_ptr;
+        return fp();
+    }
+    return hexa_void();
+}
+static inline HexaVal hexa_call1(HexaVal f, HexaVal a1) {
+    if (f.tag == TAG_CLOSURE) {
+        HexaVal (*fp)(HexaVal, HexaVal) = (HexaVal(*)(HexaVal, HexaVal))f.clo.fn_ptr;
+        return fp(hexa_closure_env(f), a1);
+    }
+    if (f.tag == TAG_FN) {
+        HexaVal (*fp)(HexaVal) = (HexaVal(*)(HexaVal))f.fn.fn_ptr;
+        return fp(a1);
+    }
+    return hexa_void();
+}
+static inline HexaVal hexa_call2(HexaVal f, HexaVal a1, HexaVal a2) {
+    if (f.tag == TAG_CLOSURE) {
+        HexaVal (*fp)(HexaVal, HexaVal, HexaVal) = (HexaVal(*)(HexaVal, HexaVal, HexaVal))f.clo.fn_ptr;
+        return fp(hexa_closure_env(f), a1, a2);
+    }
+    if (f.tag == TAG_FN) {
+        HexaVal (*fp)(HexaVal, HexaVal) = (HexaVal(*)(HexaVal, HexaVal))f.fn.fn_ptr;
+        return fp(a1, a2);
+    }
+    return hexa_void();
+}
+static inline HexaVal hexa_call3(HexaVal f, HexaVal a1, HexaVal a2, HexaVal a3) {
+    if (f.tag == TAG_CLOSURE) {
+        HexaVal (*fp)(HexaVal, HexaVal, HexaVal, HexaVal) = (HexaVal(*)(HexaVal, HexaVal, HexaVal, HexaVal))f.clo.fn_ptr;
+        return fp(hexa_closure_env(f), a1, a2, a3);
+    }
+    if (f.tag == TAG_FN) {
+        HexaVal (*fp)(HexaVal, HexaVal, HexaVal) = (HexaVal(*)(HexaVal, HexaVal, HexaVal))f.fn.fn_ptr;
+        return fp(a1, a2, a3);
+    }
+    return hexa_void();
+}
+static inline HexaVal hexa_call4(HexaVal f, HexaVal a1, HexaVal a2, HexaVal a3, HexaVal a4) {
+    if (f.tag == TAG_CLOSURE) {
+        HexaVal (*fp)(HexaVal, HexaVal, HexaVal, HexaVal, HexaVal) = (HexaVal(*)(HexaVal, HexaVal, HexaVal, HexaVal, HexaVal))f.clo.fn_ptr;
+        return fp(hexa_closure_env(f), a1, a2, a3, a4);
+    }
+    if (f.tag == TAG_FN) {
+        HexaVal (*fp)(HexaVal, HexaVal, HexaVal, HexaVal) = (HexaVal(*)(HexaVal, HexaVal, HexaVal, HexaVal))f.fn.fn_ptr;
+        return fp(a1, a2, a3, a4);
+    }
+    return hexa_void();
+}
 
 // ── Constructors ─────────────────────────────────────────
 
@@ -172,6 +256,19 @@ HexaVal hexa_map_get(HexaVal m, const char* key) {
     }
     fprintf(stderr, "map key '%s' not found\n", key);
     return hexa_void();
+}
+
+// Silent type check for struct method dispatch (codegen_c2 ImplBlock support).
+// Returns 1 if v is a TAG_MAP carrying a "__type__" field equal to type_name.
+int hexa_is_type(HexaVal v, const char* type_name) {
+    if (v.tag != TAG_MAP) return 0;
+    for (int i = 0; i < v.map.len; i++) {
+        if (strcmp(v.map.keys[i], "__type__") == 0) {
+            HexaVal t = v.map.vals[i];
+            return t.tag == TAG_STR && t.s && strcmp(t.s, type_name) == 0;
+        }
+    }
+    return 0;
 }
 
 // ── String operations ────────────────────────────────────
