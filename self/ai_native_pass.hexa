@@ -1136,6 +1136,22 @@ let mut m968_autograd_violations = 0
 let mut m969_quantize_ok = 0
 let mut m969_quantize_violations = 0
 
+// M970: @algebraic — commutative/associative reordering detection
+let mut m970_algebraic_ok = 0
+let mut m970_algebraic_violations = 0
+let mut m970_algebraic_candidates = 0
+// M971: @approximate — fast math approximation detection
+let mut m971_approx_ok = 0
+let mut m971_approx_violations = 0
+let mut m971_approx_candidates = 0
+// M972: @compact — SoA transform detection (struct-of-arrays)
+let mut m972_compact_ok = 0
+let mut m972_compact_violations = 0
+let mut m972_compact_candidates = 0
+// M973: @optimize sliding-window — DP→O(1) memory detection
+let mut m973_sliding_ok = 0
+let mut m973_sliding_candidates = 0
+
 fn body_is_effect_free(body) {
     if type_of(body) != "array" { return true }
     let n = len(body)
@@ -1374,6 +1390,238 @@ fn count_div_accumulators(body) {
             }
         }
         if stmt.kind == "WhileStmt" { c = c + count_div_accumulators(stmt.body) }
+        i = i + 1
+    }
+    return c
+}
+
+// ── M970: @algebraic — count commutative reordering opportunities ──
+// Detects: non-canonical commutative binops (IntLit on left of +/*),
+// associative chains that can be reordered for constant folding.
+fn count_commutative_sites(expr) {
+    if type_of(expr) == "string" { return 0 }
+    if expr.kind == "BinOp" {
+        let mut c = count_commutative_sites(expr.left) + count_commutative_sites(expr.right)
+        let op = expr.op
+        // Non-canonical: literal on left of commutative op
+        if op == "+" || op == "*" {
+            if type_of(expr.left) != "string" && type_of(expr.right) != "string" {
+                if expr.left.kind == "IntLit" && expr.right.kind != "IntLit" {
+                    c = c + 1
+                }
+            }
+        }
+        // Associative chain: (a + b) + c or (a * b) * c with constants that can merge
+        if op == "+" || op == "*" {
+            if type_of(expr.left) != "string" && expr.left.kind == "BinOp" && expr.left.op == op {
+                if type_of(expr.right) != "string" && expr.right.kind == "IntLit" {
+                    if type_of(expr.left.right) != "string" && expr.left.right.kind == "IntLit" {
+                        c = c + 1
+                    }
+                }
+            }
+        }
+        return c
+    }
+    if expr.kind == "UnaryOp" { return count_commutative_sites(expr.left) }
+    return 0
+}
+
+fn count_algebraic_body(body) {
+    if type_of(body) != "array" { return 0 }
+    let mut c = 0
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        let k = stmt.kind
+        if k == "ReturnStmt" { c = c + count_commutative_sites(stmt.left) }
+        if k == "LetStmt" || k == "LetMutStmt" { c = c + count_commutative_sites(stmt.left) }
+        if k == "AssignStmt" { c = c + count_commutative_sites(stmt.right) }
+        if k == "ExprStmt" { c = c + count_commutative_sites(stmt.left) }
+        if k == "WhileStmt" {
+            c = c + count_commutative_sites(stmt.cond)
+            c = c + count_algebraic_body(stmt.body)
+        }
+        if k == "IfStmt" {
+            c = c + count_commutative_sites(stmt.cond)
+            c = c + count_algebraic_body(stmt.then_body)
+            if type_of(stmt.else_body) == "array" { c = c + count_algebraic_body(stmt.else_body) }
+        }
+        i = i + 1
+    }
+    return c
+}
+
+// ── M971: @approximate — detect expensive math patterns ──
+// Detects: division in loops (potential multiply-by-reciprocal),
+// repeated same-denominator division, call to pow/sqrt/exp/log (approximable).
+fn count_div_in_expr(expr) {
+    if type_of(expr) == "string" { return 0 }
+    if expr.kind == "BinOp" {
+        let c = count_div_in_expr(expr.left) + count_div_in_expr(expr.right)
+        if expr.op == "/" { return c + 1 }
+        return c
+    }
+    if expr.kind == "UnaryOp" { return count_div_in_expr(expr.left) }
+    if expr.kind == "Call" {
+        if type_of(expr.left) != "string" && expr.left.kind == "Ident" {
+            let cn = expr.left.name
+            if cn == "sqrt" || cn == "pow" || cn == "exp" || cn == "log" || cn == "sin" || cn == "cos" || cn == "tan" {
+                return 1
+            }
+        }
+    }
+    return 0
+}
+
+fn count_approx_body(body) {
+    if type_of(body) != "array" { return 0 }
+    let mut c = 0
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        let k = stmt.kind
+        if k == "ReturnStmt" { c = c + count_div_in_expr(stmt.left) }
+        if k == "LetStmt" || k == "LetMutStmt" { c = c + count_div_in_expr(stmt.left) }
+        if k == "AssignStmt" { c = c + count_div_in_expr(stmt.right) }
+        if k == "ExprStmt" { c = c + count_div_in_expr(stmt.left) }
+        if k == "WhileStmt" {
+            c = c + count_div_in_expr(stmt.cond)
+            // Divisions inside loops are extra expensive → count double
+            c = c + count_approx_body(stmt.body) * 2
+        }
+        if k == "IfStmt" {
+            c = c + count_div_in_expr(stmt.cond)
+            c = c + count_approx_body(stmt.then_body)
+            if type_of(stmt.else_body) == "array" { c = c + count_approx_body(stmt.else_body) }
+        }
+        i = i + 1
+    }
+    return c
+}
+
+// ── M972: @compact — SoA detection ──
+// Detects: field access on array-indexed struct (arr[i].field pattern)
+// which indicates AoS that could be transformed to SoA.
+fn count_field_on_index(expr) {
+    if type_of(expr) == "string" { return 0 }
+    // Pattern: expr.kind == "FieldAccess" && expr.left.kind == "Index"
+    if expr.kind == "FieldAccess" {
+        if type_of(expr.left) != "string" && expr.left.kind == "Index" {
+            return 1
+        }
+        return count_field_on_index(expr.left)
+    }
+    if expr.kind == "BinOp" { return count_field_on_index(expr.left) + count_field_on_index(expr.right) }
+    if expr.kind == "UnaryOp" { return count_field_on_index(expr.left) }
+    if expr.kind == "Index" { return count_field_on_index(expr.left) + count_field_on_index(expr.right) }
+    if expr.kind == "Call" {
+        let mut c = 0
+        if type_of(expr.args) == "array" {
+            let an = len(expr.args)
+            let mut ai = 0
+            while ai < an {
+                c = c + count_field_on_index(expr.args[ai])
+                ai = ai + 1
+            }
+        }
+        return c
+    }
+    return 0
+}
+
+fn count_compact_body(body) {
+    if type_of(body) != "array" { return 0 }
+    let mut c = 0
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        let k = stmt.kind
+        if k == "ReturnStmt" { c = c + count_field_on_index(stmt.left) }
+        if k == "LetStmt" || k == "LetMutStmt" { c = c + count_field_on_index(stmt.left) }
+        if k == "AssignStmt" {
+            c = c + count_field_on_index(stmt.left)
+            c = c + count_field_on_index(stmt.right)
+        }
+        if k == "ExprStmt" { c = c + count_field_on_index(stmt.left) }
+        if k == "WhileStmt" { c = c + count_compact_body(stmt.body) }
+        if k == "IfStmt" {
+            c = c + count_compact_body(stmt.then_body)
+            if type_of(stmt.else_body) == "array" { c = c + count_compact_body(stmt.else_body) }
+        }
+        i = i + 1
+    }
+    return c
+}
+
+// ── M973: @optimize sliding-window — DP array lookback detection ──
+// Detects: dp[i] = f(dp[i-1], dp[i-2]) pattern inside while loops.
+// This means only the last K elements are needed → O(1) memory.
+fn detect_dp_lookback(expr, arr_name) {
+    // Checks if expr references arr_name[i - const]
+    if type_of(expr) == "string" { return 0 }
+    if expr.kind == "Index" {
+        if type_of(expr.left) != "string" && expr.left.kind == "Ident" && expr.left.name == arr_name {
+            if type_of(expr.right) != "string" && expr.right.kind == "BinOp" && expr.right.op == "-" {
+                if type_of(expr.right.right) != "string" && expr.right.right.kind == "IntLit" {
+                    return 1
+                }
+            }
+        }
+    }
+    if expr.kind == "BinOp" {
+        return detect_dp_lookback(expr.left, arr_name) + detect_dp_lookback(expr.right, arr_name)
+    }
+    if expr.kind == "UnaryOp" { return detect_dp_lookback(expr.left, arr_name) }
+    if expr.kind == "Call" {
+        let mut c = 0
+        if type_of(expr.args) == "array" {
+            let an = len(expr.args)
+            let mut ai = 0
+            while ai < an {
+                c = c + detect_dp_lookback(expr.args[ai], arr_name)
+                ai = ai + 1
+            }
+        }
+        return c
+    }
+    return 0
+}
+
+// Scan while-loop body for: arr[i] = ... arr[i-k] ... pattern
+fn count_sliding_window_body(body) {
+    if type_of(body) != "array" { return 0 }
+    let mut c = 0
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        if stmt.kind == "WhileStmt" {
+            // Look inside while for assignments to arr[i]
+            if type_of(stmt.body) == "array" {
+                let wn = len(stmt.body)
+                let mut wi = 0
+                while wi < wn {
+                    let ws = stmt.body[wi]
+                    if ws.kind == "AssignStmt" {
+                        let lhs = ws.left
+                        if type_of(lhs) != "string" && lhs.kind == "Index" {
+                            if type_of(lhs.left) != "string" && lhs.left.kind == "Ident" {
+                                let arr_nm = lhs.left.name
+                                let lookbacks = detect_dp_lookback(ws.right, arr_nm)
+                                if lookbacks > 0 {
+                                    c = c + lookbacks
+                                }
+                            }
+                        }
+                    }
+                    wi = wi + 1
+                }
+            }
+        }
         i = i + 1
     }
     return c
@@ -6194,6 +6442,17 @@ fn ai_native_pass(ast) {
     m968_autograd_violations = 0
     m969_quantize_ok = 0
     m969_quantize_violations = 0
+    m970_algebraic_ok = 0
+    m970_algebraic_violations = 0
+    m970_algebraic_candidates = 0
+    m971_approx_ok = 0
+    m971_approx_violations = 0
+    m971_approx_candidates = 0
+    m972_compact_ok = 0
+    m972_compact_violations = 0
+    m972_compact_candidates = 0
+    m973_sliding_ok = 0
+    m973_sliding_candidates = 0
     m252_contract_injects = 0
     m480_symbolic_rewrites = 0
     m481_fuse_chain_max = 0
@@ -7794,6 +8053,55 @@ fn ai_native_pass(ast) {
                     println("[ai-native] fn " + node.name + " WARN: @quantize requires >=1 param")
                 }
             }
+            // M970: @algebraic — commutative/associative reordering.
+            //   Scans body for non-canonical commutative and unfoldable associative chains.
+            if attr_has(attrs, "algebraic") {
+                let alg_sites = count_algebraic_body(node.body)
+                if alg_sites > 0 {
+                    m970_algebraic_ok = m970_algebraic_ok + 1
+                    m970_algebraic_candidates = m970_algebraic_candidates + alg_sites
+                    println("[ai-native] fn " + node.name + " CANDIDATE: @algebraic " + to_string(alg_sites) + " reorderable site(s)")
+                } else {
+                    m970_algebraic_ok = m970_algebraic_ok + 1
+                    println("[ai-native] fn " + node.name + " OK: @algebraic (already canonical)")
+                }
+            }
+            // M971: @approximate — fast math approximation detection.
+            //   Detects division, sqrt, pow, exp, log, trig calls.
+            if attr_has(attrs, "approximate") {
+                let apx_cnt = count_approx_body(node.body)
+                if apx_cnt > 0 {
+                    m971_approx_ok = m971_approx_ok + 1
+                    m971_approx_candidates = m971_approx_candidates + apx_cnt
+                    println("[ai-native] fn " + node.name + " CANDIDATE: @approximate " + to_string(apx_cnt) + " expensive math site(s)")
+                } else {
+                    m971_approx_violations = m971_approx_violations + 1
+                    println("[ai-native] fn " + node.name + " WARN: @approximate — no expensive math ops found")
+                }
+            }
+            // M972: @compact — SoA transform detection.
+            //   Detects arr[i].field patterns (AoS → SoA candidate).
+            if attr_has(attrs, "compact") {
+                let cpt_cnt = count_compact_body(node.body)
+                if cpt_cnt > 0 {
+                    m972_compact_ok = m972_compact_ok + 1
+                    m972_compact_candidates = m972_compact_candidates + cpt_cnt
+                    println("[ai-native] fn " + node.name + " CANDIDATE: @compact " + to_string(cpt_cnt) + " AoS access(es) → SoA transform")
+                } else {
+                    m972_compact_ok = m972_compact_ok + 1
+                    println("[ai-native] fn " + node.name + " OK: @compact (no AoS pattern detected)")
+                }
+            }
+            // M973: @optimize sliding-window — DP lookback detection.
+            //   Detects dp[i] = f(dp[i-1], dp[i-2]) patterns inside while loops.
+            if attr_has(attrs, "optimize") {
+                let sw_cnt = count_sliding_window_body(node.body)
+                if sw_cnt > 0 {
+                    m973_sliding_ok = m973_sliding_ok + 1
+                    m973_sliding_candidates = m973_sliding_candidates + sw_cnt
+                    println("[ai-native] fn " + node.name + " CANDIDATE: @optimize sliding-window " + to_string(sw_cnt) + " DP lookback(s) → O(1) memory")
+                }
+            }
             // M17/M23: recursive @optimize without @memoize → auto-inject
             if attr_has(attrs, "optimize") && is_rec && !attr_has(attrs, "memoize") {
                 println("[ai-native] fn " + node.name + " REWRITE: auto-added @memoize")
@@ -8216,6 +8524,18 @@ fn ai_native_pass(ast) {
     }
     if m969_quantize_ok + m969_quantize_violations > 0 {
         println("[ai-native] @quantize: " + to_string(m969_quantize_ok) + " ok, " + to_string(m969_quantize_violations) + " violation(s)")
+    }
+    if m970_algebraic_ok > 0 {
+        println("[ai-native] @algebraic: " + to_string(m970_algebraic_ok) + " fn(s), " + to_string(m970_algebraic_candidates) + " reorderable site(s)")
+    }
+    if m971_approx_ok + m971_approx_violations > 0 {
+        println("[ai-native] @approximate: " + to_string(m971_approx_ok) + " ok, " + to_string(m971_approx_violations) + " violation(s), " + to_string(m971_approx_candidates) + " candidate(s)")
+    }
+    if m972_compact_ok + m972_compact_violations > 0 {
+        println("[ai-native] @compact: " + to_string(m972_compact_ok) + " fn(s), " + to_string(m972_compact_candidates) + " AoS site(s)")
+    }
+    if m973_sliding_ok > 0 {
+        println("[ai-native] @optimize sliding-window: " + to_string(m973_sliding_ok) + " fn(s), " + to_string(m973_sliding_candidates) + " DP lookback(s)")
     }
     return out
 }
