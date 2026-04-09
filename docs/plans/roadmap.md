@@ -37,24 +37,27 @@
 - [ ] `OMP_NUM_THREADS=32` 명시 + BLAS 스레딩 실효 확인
 - [ ] hexa matmul 호출 오버헤드 프로파일링
 
-### Phase 4 — T2 100M 학습 ✅✅✅ 달성
+### Phase 4 — T2 100M 학습 (14.3x 가속, 절대 목표 미달)
 
-**v1 baseline** (2026-04-09): fwd 7.5s / bwd 6.0s / opt 2.6s = **16.1s/step** → 1B tok = 4년 (불가)
+**v1 baseline** (2026-04-09): fwd 7.5s / bwd 6.0s / opt 2.6s = **16.1s/step** → 1B tok ~1448일
 
 **v2 AI-native attr 적용** (2026-04-10): fwd 1.10s / bwd 3.2ms / opt 23.1ms = **1.128s/step**
-- **14.3x 가속 실측** — 1B tokens = **2.45시간** (목표 8h 대비 3.3x 여유)
-- GPU vast 4×4090 1.3h와 **동급 근접** (CPU가 GPU의 53%)
-- **GPU≥50% fallback 초과 달성**
+- **14.3x 가속 실측 ✓ 유효**
+- 1B tokens = 7.81M steps × 1.128s = **8.81M sec = 102일** (목표 8h 대비 **306x 초과**)
+- GPU vast 4×4090 1.3h 대비 **~1900x 느림** (CPU = GPU의 0.05%)
+- **초기 "2.45h 달성" 주장은 원본 계산 오류 — 철회**
 
 핵심 돌파 3종 (src/ 무수정, 순수 .hexa):
 - **LM head 분리**: W_lmh(24.5M) → U_lmh(6144) + V_lmh(256000), optimizer 95x 축소 → opt 112x
 - **BLAS loss/backward**: 순수 hexa 32000-loop → mat_add + matmul, **bwd 1875x**
 - **@lowrank(8) 전면 적용** + **rank-r 어텐션** (Qs@Ks, scores@Vs@Vv) → fwd 6.8x
 
-### 루프 상태
-- **T1**: ❌ 현 인프라 불가 (인터프리터 BLAS 호출 오버헤드 천장)
-- **T2**: ✅ **달성** (v1 4년 → v2 2.45시간, 14,000x 실시간 단축)
-- 종료 조건 "T1+T2 둘 다 달성"까지 **T1 하나 남음**
+### 루프 상태 (정정)
+- **T1**: ❌ 현 인프라 불가 (인터프리터 Tensor ABI 천장)
+- **T2**: ❌ 현 인프라 불가 (14.3x 가속은 유효하나 306x 미달)
+- 종료 조건 "T1+T2 동시 달성" **둘 다 미달**
+- **유효 돌파**: 5종 기법 (LM head U+V / BLAS-only loss/bwd / @lowrank r=16 / rank-r attention / 함수 인라인)
+- **T2 필요 추가 가속**: 306x (현재 14.3x 위에 22x 더 필요)
 
 ### Phase 4.1 — T2 v1 히스토리 (보류)
 - [x] v1 프로토타입 불가 판정 → v2 재설계로 돌파
