@@ -89,7 +89,7 @@
   - **주의**: self/parser.hexa 의 trailing self-test 가 `AstNode` 런타임 에러로 실패 —
     pipeline 포맷(lexer+parser+interpreter concat)으로는 P2-6 E2E 미검증. 파서 본체
     함수(parse/tokenize)는 정상, test 블록만 문제. 별도 블로커로 트래킹 필요.
-- [ ] **P2-7** 셀프 테스트: Hexa 인터프리터로 examples/ 전체 실행
+- [x] **P2-7** 셀프 테스트: Hexa 인터프리터로 examples/ 전체 실행 — ✅ 완료 (2026-04-09, 45 PASS E2E 파이프라인)
 
 ## Phase 3: VM 포팅 ✅ 초기 구현 완료 (2026-04-08)
 > 바이트코드 VM — 성능 경로
