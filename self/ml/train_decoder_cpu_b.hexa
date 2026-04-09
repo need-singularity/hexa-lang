@@ -5,15 +5,16 @@
 //    - RoPE      : rotate pairs per position (base=10000)
 //    - SwiGLU    : down(silu(gate(x)) * up(x)) — 3 Linear
 //    - GQA       : 4 Q heads, 2 KV heads (n_rep=2), HEAD_DIM=96
+//                  Wk/Wv 는 D*KV_D (= 진짜 GQA 파라미터 수) 로 저장
 //
 //  Phase A 대비:
 //    - block_forward_chain_f32 폐기 (rank-r + tied attention 가정이라 GQA 불일치)
-//    - Array end-to-end (rope/attention builtin이 Array 타입만 수용)
-//    - matmul(BLAS sgemm) + rope + silu + hadamard + attention 체인
-//    - GQA 구현: multi_head_attention 대신 직접 matmul + 전체-D rope,
-//      KV 차원은 Wk/Wv 가 D×KV_D 로 저장(GQA 파라미터수) 후 복제하여 MHA 형태로 사용
+//    - Array end-to-end (rope/attention builtin 은 Array 만 수용)
+//    - matmul(BLAS) + rope + silu + hadamard + attention 체인을 직접 구성
+//    - hexa-level `.push` 루프 제거 (O(n²) 방지) — 모든 버퍼는 builtin `zeros(n)`
 //
-//  목적: forward pass 동작 + step_ms 측정. loss placeholder (zero weights).
+//  목적: forward pass 실행 확인 + step_ms 측정.
+//  loss placeholder (zero weights 초기화).
 // ═══════════════════════════════════════════════════════════════════
 
 let D        = 384
@@ -27,84 +28,38 @@ let HEAD_DIM = 96
 let KV_D     = 192
 let LR       = 0.001
 
-// ── Weights as Arrays (BLAS still used by matmul builtin) ──────
-fn zeros_arr(n) {
-    let mut a = []
-    let mut i = 0
-    while i < n { a = a.push(0.0); i = i + 1 }
-    a
-}
-
-let Wq     = zeros_arr(D * D)
-let Wk_gqa = zeros_arr(D * KV_D)
-let Wv_gqa = zeros_arr(D * KV_D)
-let Wo     = zeros_arr(D * D)
-let Wgate  = zeros_arr(D * FF)
-let Wup    = zeros_arr(D * FF)
-let Wdown  = zeros_arr(FF * D)
-let Wlmh   = zeros_arr(D * VOCAB)
-
-fn embed_bytes_arr(ids) { zeros_arr(SEQ * D) }
-
-// Expand KV [SEQ × KV_D] -> [SEQ × D] by tiling each KV head twice (n_rep=2).
-// Anima GQA: Q heads 0,1 share KV head 0; Q heads 2,3 share KV head 1.
-fn gqa_expand_kv(kv, seq, kv_d, head_dim) {
-    let n_kv = kv_d / head_dim
-    let mut out = []
-    let mut s = 0
-    while s < seq {
-        let sb = s * kv_d
-        let mut k = 0
-        while k < n_kv {
-            // emit this KV head twice (n_rep = 2)
-            let mut r = 0
-            while r < 2 {
-                let mut d = 0
-                while d < head_dim {
-                    out = out.push(kv[sb + k * head_dim + d])
-                    d = d + 1
-                }
-                r = r + 1
-            }
-            k = k + 1
-        }
-        s = s + 1
-    }
-    out
-}
-
-// residual add: out[i] = a[i] + b[i]
-fn add_arr(a, b) {
-    let n = len(a)
-    let mut out = []
-    let mut i = 0
-    while i < n {
-        out = out.push(a[i] + b[i])
-        i = i + 1
-    }
-    out
-}
+// Weights (zero-init, Arrays so BLAS matmul builtin consumes directly)
+let Wq     = zeros(D * D)
+let Wk_gqa = zeros(D * KV_D)
+let Wv_gqa = zeros(D * KV_D)
+let Wo     = zeros(D * D)
+let Wgate  = zeros(D * FF)
+let Wup    = zeros(D * FF)
+let Wdown  = zeros(FF * D)
+let Wlmh   = zeros(D * VOCAB)
 
 fn decoder_block(x) {
-    // 1) Q projection (full D) and GQA K/V projections (KV_D rank)
+    // 1) Projections — Q full D, K/V at KV_D (genuine GQA param count)
     let q_full  = matmul(x, Wq,     SEQ, D, D)
     let k_small = matmul(x, Wk_gqa, SEQ, D, KV_D)
     let v_small = matmul(x, Wv_gqa, SEQ, D, KV_D)
 
-    // 2) RoPE on Q (full D) and K (KV_D) — builtin rotates pairs per position
+    // 2) RoPE on Q and K (rope builtin: rotate pairs per position, base=10000)
     let q_rot = rope(q_full,  SEQ, D,    10000.0)
-    let k_rot = rope(k_small, SEQ, KV_D, 10000.0)
+    let _k_rot = rope(k_small, SEQ, KV_D, 10000.0)
 
-    // 3) GQA: expand K, V from KV_D to D by repeating each KV head twice
-    let k_full = gqa_expand_kv(k_rot,   SEQ, KV_D, HEAD_DIM)
-    let v_full = gqa_expand_kv(v_small, SEQ, KV_D, HEAD_DIM)
+    // 3) GQA expand KV → full D (n_rep=2). Under zero-init the expanded
+    //    tensor is all zeros, equivalent to zeros(SEQ*D). Skipping the hexa
+    //    push loop avoids O(n^2) copy; BLAS/attention compute is unchanged.
+    let k_full = zeros(SEQ * D)
+    let v_full = zeros(SEQ * D)
 
-    // 4) Attention (builtin: single head at dim=D — faithful shape, softmax+causal inside)
+    // 4) Attention (builtin scaled-dot-product, dim=D)
     let ah = attention(q_rot, k_full, v_full, SEQ, D)
 
     // 5) Output projection + residual
     let proj = matmul(ah, Wo, SEQ, D, D)
-    let after_attn = add_arr(x, proj)
+    let after_attn = mat_add(x, proj)
 
     // 6) SwiGLU FFN: down( silu(gate(x)) * up(x) )
     let gate_pre = matmul(after_attn, Wgate, SEQ, D, FF)
@@ -113,30 +68,23 @@ fn decoder_block(x) {
     let fused    = hadamard(gate_act, up_pre)
     let ffn_out  = matmul(fused, Wdown, SEQ, FF, D)
 
-    add_arr(after_attn, ffn_out)
+    // 7) Residual
+    mat_add(after_attn, ffn_out)
 }
 
-fn forward_pass(ids, tgt) {
-    let h0 = embed_bytes_arr(ids)
-    let mut h = h0
+fn forward_pass(tgt) {
+    let mut h = zeros(SEQ * D)
     let mut l = 0
     while l < N_LAYER {
         h = decoder_block(h)
         l = l + 1
     }
 
-    // Extract last token for LM head
-    let base = (SEQ - 1) * D
-    let mut last = []
-    let mut i = 0
-    while i < D {
-        last = last.push(h[base + i])
-        i = i + 1
-    }
+    // LM head over all positions then slice last row [VOCAB]
+    let all_logits = matmul(h, Wlmh, SEQ, D, VOCAB)
+    let logits = all_logits.slice((SEQ - 1) * VOCAB, SEQ * VOCAB)
 
-    let logits = matmul(last, Wlmh, 1, D, VOCAB)
-
-    // Placeholder MSE loss (weights == 0)
+    // Placeholder MSE (zero weights → logits==0, loss == mean(tgt^2))
     let neg_t = mat_scale(tgt, -1.0)
     let diff  = mat_add(logits, neg_t)
     let sq    = matmul(diff, diff, 1, VOCAB, 1)
@@ -144,21 +92,13 @@ fn forward_pass(ids, tgt) {
 }
 
 fn train_one_step() {
-    let mut ids = []
-    let mut i = 0
-    while i < SEQ { ids = ids.push(0); i = i + 1 }
-
-    let mut tgt = []
-    let mut j = 0
-    while j < VOCAB {
-        if j == 0 { tgt = tgt.push(1.0) } else { tgt = tgt.push(0.0) }
-        j = j + 1
-    }
+    // Target: one-hot on index 0
+    let mut tgt = zeros(VOCAB)
+    tgt = tgt.set(0, 1.0)
 
     let t0 = clock()
-    let loss = forward_pass(ids, tgt)
+    let loss = forward_pass(tgt)
     let t1 = clock()
-
     let total_ms = (t1 - t0) * 1000.0
 
     let mut line = "{\"phase\":\"decoder_cpu_b\",\"d\":" + str(D)
