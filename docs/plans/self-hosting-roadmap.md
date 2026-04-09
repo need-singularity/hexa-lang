@@ -91,14 +91,16 @@
     함수(parse/tokenize)는 정상, test 블록만 문제. 별도 블로커로 트래킹 필요.
 - [x] **P2-7** 셀프 테스트: Hexa 인터프리터로 examples/ 전체 실행 — ✅ 완료 (2026-04-09, 45 PASS E2E 파이프라인)
 
-## Phase 3: VM 포팅 ✅ 초기 구현 완료 (2026-04-08)
+## Phase 3: VM 포팅 ✅ 확장 완료 (2026-04-09)
 > 바이트코드 VM — 성능 경로
 
-- [x] **P3-1** 명령어 세트: 25+ opcodes (CONST/GET/SET/산술/비교/논리/JUMP/CALL/RETURN 등)
+- [x] **P3-1** 명령어 세트: 40+ opcodes (CONST/GET/SET/산술/비교/논리/JUMP/CALL/RETURN + POW/BitOps/JumpIfTrue/Truthy/MAKE_RANGE/CLOSURE/CALL_INDIRECT 등)
 - [x] **P3-2** 스택 머신 루프: fetch-decode-execute, 병렬 배열 call frame
-- [ ] **P3-3** 가비지 컬렉션 또는 RC 기반 메모리 관리
+- [x] **P3-3** RC 기반 메모리 관리: rc_alloc/rc_retain/rc_release/rc_deref 구현
 - [ ] **P3-4** VM 벤치마크: Rust VM 대비 성능 측정
-- vm.hexa 720줄, 10/10 E2E PASS (fact(6)=720 재귀 포함)
+- [x] **P3-5** 확장 빌트인: abs/min/max/floor/ceil/round/sqrt/pow/log/sin/cos/tan/exp/clock + is_alpha/is_digit/read_file
+- [x] **P3-6** 확장 메서드: string(starts_with/ends_with/trim/to_upper/to_lower/substring/chars/len) + array(pop/reverse/join)
+- vm.hexa 1261줄, 25/25 E2E PASS (fib(10)=55, power(2,10)=1024, for-in range 포함)
 
 ## Phase 4: C 코드 생성 백엔드 ✅ N1.3 완료 (2026-04-08)
 > JIT/cranelift 대신 C 코드 출력 → gcc/clang 컴파일
@@ -149,7 +151,7 @@
 | P0 (인프라) | ~500 | ✅ 완료 | 100% |
 | P1 (코어) | ~5,000 | ~5,700 | ✅ 100% |
 | P2 (인터프리터) | ~8,000 | ~1,493 | ⏳ 19% |
-| P3 (VM) | ~1,500 | ~853 | ⏳ 57% |
+| P3 (VM) | ~1,500 | ~1,261 | ⏳ 84% |
 | P4 (C 백엔드) | ~3,000 | ~890 | ⏳ 30% |
 | P5 (셀프컴파일) | ~1,000 | 0 | 0% |
 | P6 (생태계) | ~10,000 | 0 | 0% |
