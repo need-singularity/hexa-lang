@@ -4658,6 +4658,88 @@ impl Interpreter {
                 };
                 Ok(Value::Array(vec![q_out, k_out, v_out]))
             }
+            "ffn_fused_into" => {
+                // ffn_fused_into(X, Uu, Vu, Ud, Vd, M, D, R, FF, out_t1, out_y, out_t2, out)
+                // LoRA FFN: out = ((X@Uu)@Vu)@Ud)@Vd
+                //   t1 = X[M×D] @ Uu[D×R]   → [M×R]  (cblas 1)
+                //   y  = t1[M×R] @ Vu[R×FF] → [M×FF] (cblas 2)
+                //   t2 = y[M×FF] @ Ud[FF×R] → [M×R]  (cblas 3)
+                //   out = t2[M×R] @ Vd[R×D] → [M×D]  (cblas 4)
+                // Four pre-allocated scratch Tensors + out. Single builtin dispatch.
+                if args.len() < 13 {
+                    return Err(self.type_err("ffn_fused_into() requires 13 args (X,Uu,Vu,Ud,Vd,M,D,R,FF,out_t1,out_y,out_t2,out)".into()));
+                }
+                let (m, d, r, ff) = match (&args[5], &args[6], &args[7], &args[8]) {
+                    (Value::Int(m), Value::Int(d), Value::Int(r), Value::Int(ff)) => (*m as usize, *d as usize, *r as usize, *ff as usize),
+                    _ => return Err(self.type_err("ffn_fused_into() requires int (M,D,R,FF)".into())),
+                };
+                // Snapshot input buffers (drop borrows before mutating scratch).
+                let x_vec: Vec<f64> = match to_f64_slice(&args[0]) { Some(s) => s.as_slice().to_vec(), _ => return Err(self.type_err("ffn_fused_into() X must be tensor/array".into())) };
+                let uu_vec: Vec<f64> = match to_f64_slice(&args[1]) { Some(s) => s.as_slice().to_vec(), _ => return Err(self.type_err("ffn_fused_into() Uu must be tensor/array".into())) };
+                let vu_vec: Vec<f64> = match to_f64_slice(&args[2]) { Some(s) => s.as_slice().to_vec(), _ => return Err(self.type_err("ffn_fused_into() Vu must be tensor/array".into())) };
+                let ud_vec: Vec<f64> = match to_f64_slice(&args[3]) { Some(s) => s.as_slice().to_vec(), _ => return Err(self.type_err("ffn_fused_into() Ud must be tensor/array".into())) };
+                let vd_vec: Vec<f64> = match to_f64_slice(&args[4]) { Some(s) => s.as_slice().to_vec(), _ => return Err(self.type_err("ffn_fused_into() Vd must be tensor/array".into())) };
+                if x_vec.len() < m * d || uu_vec.len() < d * r || vu_vec.len() < r * ff || ud_vec.len() < ff * r || vd_vec.len() < r * d {
+                    return Err(self.type_err("ffn_fused_into() input length insufficient".into()));
+                }
+                // Internal scratch buffers (owned) — avoid Arc mutation dance across 4 stages.
+                let mut t1 = vec![0.0f64; m * r];
+                let mut y = vec![0.0f64; m * ff];
+                let mut t2 = vec![0.0f64; m * r];
+                let mut out_vec = vec![0.0f64; m * d];
+                #[cfg(target_os = "macos")]
+                unsafe {
+                    // t1 = X @ Uu
+                    cblas_dgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                        m as i32, r as i32, d as i32,
+                        1.0, x_vec.as_ptr(), d as i32,
+                        uu_vec.as_ptr(), r as i32,
+                        0.0, t1.as_mut_ptr(), r as i32);
+                    // y = t1 @ Vu
+                    cblas_dgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                        m as i32, ff as i32, r as i32,
+                        1.0, t1.as_ptr(), r as i32,
+                        vu_vec.as_ptr(), ff as i32,
+                        0.0, y.as_mut_ptr(), ff as i32);
+                    // t2 = y @ Ud
+                    cblas_dgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                        m as i32, r as i32, ff as i32,
+                        1.0, y.as_ptr(), ff as i32,
+                        ud_vec.as_ptr(), r as i32,
+                        0.0, t2.as_mut_ptr(), r as i32);
+                    // out = t2 @ Vd
+                    cblas_dgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                        m as i32, d as i32, r as i32,
+                        1.0, t2.as_ptr(), r as i32,
+                        vd_vec.as_ptr(), d as i32,
+                        0.0, out_vec.as_mut_ptr(), d as i32);
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    // scalar fallback
+                    for i in 0..m { for p in 0..d { let a = x_vec[i*d+p]; for j in 0..r { t1[i*r+j] += a * uu_vec[p*r+j]; } } }
+                    for i in 0..m { for p in 0..r { let a = t1[i*r+p]; for j in 0..ff { y[i*ff+j] += a * vu_vec[p*ff+j]; } } }
+                    for i in 0..m { for p in 0..ff { let a = y[i*ff+p]; for j in 0..r { t2[i*r+j] += a * ud_vec[p*r+j]; } } }
+                    for i in 0..m { for p in 0..r { let a = t2[i*r+p]; for j in 0..d { out_vec[i*d+j] += a * vd_vec[p*d+j]; } } }
+                }
+                // Write result into out Tensor (args[12]). Reuse Arc in-place if unique.
+                match &mut args[12] {
+                    Value::Tensor(arc) => {
+                        if arc.data.len() != m * d {
+                            return Err(self.type_err("ffn_fused_into() out.len() != M*D".into()));
+                        }
+                        if Arc::get_mut(arc).is_some() {
+                            let td = Arc::get_mut(arc).unwrap();
+                            td.data.copy_from_slice(&out_vec);
+                            Ok(Value::Tensor(arc.clone()))
+                        } else {
+                            let shape = arc.shape.clone();
+                            Ok(Value::Tensor(Arc::new(TensorData { shape, data: out_vec })))
+                        }
+                    }
+                    _ => Err(self.type_err("ffn_fused_into() requires Tensor as out".into())),
+                }
+            }
             "mat_scale" => {
                 // mat_scale(arr, scalar) → element-wise scaling
                 if args.len() < 2 { return Err(self.type_err("mat_scale() requires (array, scalar)".into())); }
