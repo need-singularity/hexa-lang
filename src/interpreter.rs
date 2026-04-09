@@ -285,27 +285,41 @@ impl Interpreter {
     }
 
     /// Write a string to the output (captured buffer or stdout).
+    /// R19: BrokenPipe(EPIPE)를 감지해 graceful exit(0)로 전환.
+    /// | head, | tail 등으로 consumer가 조기 종료해도 silent exit 1 발생 금지.
     fn write_output(&self, s: &str) {
+        use std::io::{Write, ErrorKind};
         if let Some(ref buf) = self.output_capture {
             if let Ok(mut b) = buf.lock() {
                 b.push_str(s);
             }
         } else {
-            print!("{}", s);
+            let stdout = std::io::stdout();
+            let mut h = stdout.lock();
+            if let Err(e) = h.write_all(s.as_bytes()) {
+                if e.kind() == ErrorKind::BrokenPipe {
+                    std::process::exit(0);
+                }
+            }
         }
     }
 
     /// Write a string followed by newline to the output.
+    /// R19: BrokenPipe 시 exit(0) graceful.
     fn writeln_output(&self, s: &str) {
-        use std::io::Write;
+        use std::io::{Write, ErrorKind};
         if let Some(ref buf) = self.output_capture {
             if let Ok(mut b) = buf.lock() {
                 b.push_str(s);
                 b.push('\n');
             }
         } else {
-            println!("{}", s);
-            let _ = std::io::stdout().flush();
+            let stdout = std::io::stdout();
+            let mut h = stdout.lock();
+            match writeln!(h, "{}", s).and_then(|_| h.flush()) {
+                Err(e) if e.kind() == ErrorKind::BrokenPipe => std::process::exit(0),
+                _ => {}
+            }
         }
     }
 

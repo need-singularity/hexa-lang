@@ -137,6 +137,22 @@ use std::io::{self, Write, BufRead};
 use std::collections::HashMap;
 
 fn main() {
+    // R19 보호: SIGPIPE 무시 — 파이프 조기 종료(| head, | tail 등) 시
+    // BrokenPipe 에러를 syscall 레벨에서 swallow해 엔진이 silent exit 1 되지 않도록.
+    // Rust는 SIGPIPE를 기본 SIG_DFL로 두어 프로세스 즉시 종료 → nexus blowup 등
+    // 긴 출력 엔진에서 오진 발생. SIG_IGN으로 전환하면 write가 EPIPE 반환.
+    // 이후 io.rs 헬퍼가 BrokenPipe를 감지하면 graceful exit(0)으로 전환.
+    #[cfg(unix)]
+    unsafe {
+        // libc 의존성 없이 raw extern. SIG_IGN = 1, SIGPIPE = 13 (POSIX 공통).
+        extern "C" {
+            fn signal(signum: i32, handler: usize) -> usize;
+        }
+        const SIGPIPE: i32 = 13;
+        const SIG_IGN: usize = 1;
+        signal(SIGPIPE, SIG_IGN);
+    }
+
     let args: Vec<String> = std::env::args().collect();
     if args.len() > 1 {
         match args[1].as_str() {
