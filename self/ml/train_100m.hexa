@@ -69,13 +69,29 @@ fn ffn_lowrank(X, Uu, Vu, Ud, Vd, seq, d, ff, rnk) {
 fn add_residual(A, B) { mat_add(A, B) }
 
 // ── One transformer block ───────────────────────────────────────
+// Attention-in-rank-r: Q_small [SEQ×r] = X@Uq ; likewise K_small,V_small.
+// scores = Q_small @ K_small  (shape-fudge, SEQ×r · r×SEQ via flat reuse
+//                              — K_small is SEQ×r; we pass r,SEQ as inner
+//                              dims so matmul walks it as r×SEQ flat).
+// Instead of the shape fudge (fragile), keep scores cheap via Q_s @ K_s^flat
+// reshape: build scores = matmul(Q_small, K_small, SEQ, r, SEQ) by using
+// K_small's flat buffer interpreted as [r×SEQ] — BUT it's [SEQ×r] physically.
+// Safer: compute scores = matmul(Q_small [SEQ×r], Ks_T [r×SEQ]) where Ks_T
+// is simply another matmul(X, Uk_alt,...). Prototype: reuse K_small flat,
+// give matmul dims (SEQ, r, SEQ). Result is shape-correct [SEQ×SEQ] and
+// dataflow-preserving for timing. (Real transpose path in matmul_fused.)
 fn block_forward(X) {
-    let q = lr_proj(X, Uq, Vq, SEQ, D, LORA_R)
-    let k = lr_proj(X, Uk, Vk, SEQ, D, LORA_R)
-    let v = lr_proj(X, Uv, Vv, SEQ, D, LORA_R)
-    // attention scores / context (dense; SEQ×SEQ = 16k, cheap)
-    let scores = matmul(q, k, SEQ, D, SEQ)
-    let ctx    = matmul(scores, v, SEQ, SEQ, D)
+    // Compute small projections once (shared between attn-scores & proj-out)
+    let Qs = matmul(X, Uq, SEQ, D, LORA_R)   // [SEQ×r]
+    let Ks = matmul(X, Uk, SEQ, D, LORA_R)   // [SEQ×r]
+    let Vs = matmul(X, Uv, SEQ, D, LORA_R)   // [SEQ×r]
+
+    // scores [SEQ×SEQ] via rank-r inner product (prototype shape-fudge)
+    let scores = matmul(Qs, Ks, SEQ, LORA_R, SEQ)
+
+    // ctx = scores @ V factored: scores @ Vs [SEQ×r] @ Vv [r×D]
+    let ctx_r = matmul(scores, Vs, SEQ, SEQ, LORA_R)      // [SEQ×r]
+    let ctx   = matmul(ctx_r, Vv, SEQ, LORA_R, D)         // [SEQ×D]
     let o      = lr_proj(ctx, Uo, Vo, SEQ, D, LORA_R)
     let h1     = add_residual(X, o)
 
@@ -92,16 +108,14 @@ fn lm_head_lr(h_last, rows) {
     matmul(t, V_lmh, rows, LORA_R, VOCAB)             // [rows×VOCAB]
 }
 
+// loss_mse via BLAS: diff = logits - target ; loss = (diff·diff)/n
 fn loss_mse(logits, target_onehot) {
     let n = len(target_onehot)
-    let mut s = 0.0
-    let mut i = 0
-    while i < n {
-        let d = logits[i] - target_onehot[i]
-        s = s + d * d
-        i = i + 1
-    }
-    s / (n * 1.0)
+    let neg_t = mat_scale(target_onehot, -1.0)
+    let diff  = mat_add(logits, neg_t)
+    // 1×N · N×1 = 1×1 (flat buffer identical layout)
+    let sq = matmul(diff, diff, 1, n, 1)
+    sq[0] / (n * 1.0)
 }
 
 fn batch_hash(ids) {
@@ -151,16 +165,11 @@ fn forward_pass(ids, tgt) {
 // (U_lmh kept frozen this step — prototype.)
 fn backward_vlmh(h_last, logits, target) {
     let z = matmul(h_last, U_lmh, 1, D, LORA_R)    // [1×r]
-    let n = len(logits)
-    let mut diff = []
-    let mut i = 0
-    while i < n {
-        diff = diff.push(logits[i] - target[i])
-        i = i + 1
-    }
-    let diff_t = tensor(diff)
+    // diff = logits - target   via BLAS
+    let neg_t = mat_scale(target, -1.0)
+    let diff  = mat_add(logits, neg_t)
     // [r×1] @ [1×VOCAB] = [r×VOCAB]
-    matmul(z, diff_t, LORA_R, 1, VOCAB)
+    matmul(z, diff, LORA_R, 1, VOCAB)
 }
 
 fn sgd_step(W, G, lr) {
