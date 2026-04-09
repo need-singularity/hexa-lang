@@ -57,6 +57,159 @@ extern "C" fn hexa_bounds_check(index: i64, length: i64) {
     }
 }
 
+// ────────────────────────────────────────────────────────────────
+// Tensor runtime helpers (Option A: JIT → external runtime FFI)
+// ────────────────────────────────────────────────────────────────
+//
+// ABI:
+//   All tensor values are passed as i64 containing an Arc::into_raw(Arc<TensorData>)
+//   pointer. Helpers take ownership of the caller's strong-count slot via
+//   Arc::from_raw, perform the op, and return a fresh Arc::into_raw for the
+//   result. Input Arcs are then re-leaked (into_raw) so the caller retains
+//   its reference — matching the JIT's "no drop" value semantics.
+//
+// Scalar ABI:
+//   hexa_mat_scale takes its scalar as raw f64 bits in an i64 (use
+//   f64::to_bits on the producer side). This lets us keep the uniform i64 ABI
+//   even for float scalars.
+
+use crate::env::TensorData;
+use std::sync::Arc;
+
+/// Reconstruct an Arc<TensorData> from a raw i64 pointer WITHOUT decrementing
+/// the refcount (the caller still holds the reference).
+#[inline]
+unsafe fn tensor_borrow(ptr: i64) -> Arc<TensorData> {
+    let arc = Arc::from_raw(ptr as *const TensorData);
+    // Clone to bump the refcount, then forget the original so caller's slot
+    // stays valid.
+    let out = arc.clone();
+    let _ = Arc::into_raw(arc);
+    out
+}
+
+/// Leak an Arc<TensorData> as a raw i64 pointer (transfers ownership to JIT).
+#[inline]
+fn tensor_leak(arc: Arc<TensorData>) -> i64 {
+    Arc::into_raw(arc) as i64
+}
+
+/// Extern helper: allocate a zero-initialized 1-D tensor of length `n`.
+/// Returns Arc<TensorData> raw pointer as i64.
+extern "C" fn hexa_tensor_zeros(n: i64) -> i64 {
+    if n < 0 {
+        eprintln!("JIT runtime error: tensor_zeros length {} < 0", n);
+        std::process::exit(1);
+    }
+    let n = n as usize;
+    let td = TensorData { shape: vec![n], data: vec![0.0f64; n] };
+    tensor_leak(Arc::new(td))
+}
+
+/// Extern helper: build a 1-D tensor from a JIT array pointer.
+/// JIT array layout: [length:i64, elem0:i64, elem1:i64, ...]
+/// Elements are interpreted as i64 and cast to f64. (JIT currently has no
+/// float literal support; callers producing float data should go through the
+/// other constructors or fill after creation.)
+extern "C" fn hexa_tensor_new(arr_ptr: i64) -> i64 {
+    if arr_ptr == 0 {
+        eprintln!("JIT runtime error: hexa_tensor_new(null)");
+        std::process::exit(1);
+    }
+    unsafe {
+        let len = *(arr_ptr as *const i64);
+        if len < 0 {
+            eprintln!("JIT runtime error: hexa_tensor_new length {} < 0", len);
+            std::process::exit(1);
+        }
+        let len = len as usize;
+        let base = (arr_ptr as *const i64).add(1);
+        let mut data = Vec::with_capacity(len);
+        for i in 0..len {
+            let slot = *base.add(i);
+            data.push(slot as f64);
+        }
+        let td = TensorData { shape: vec![len], data };
+        tensor_leak(Arc::new(td))
+    }
+}
+
+/// Extern helper: return the flat length of a tensor.
+extern "C" fn hexa_tensor_len(t: i64) -> i64 {
+    if t == 0 { return 0; }
+    unsafe {
+        let arc = tensor_borrow(t);
+        arc.data.len() as i64
+    }
+}
+
+/// Extern helper: matrix multiply C = A[M×K] × B[K×N], row-major dense.
+/// Returns a new tensor of shape [M, N]. Arc refcounts of A and B unchanged.
+extern "C" fn hexa_matmul(a: i64, b: i64, m: i64, k: i64, n: i64) -> i64 {
+    if a == 0 || b == 0 || m < 0 || k < 0 || n < 0 {
+        eprintln!("JIT runtime error: hexa_matmul invalid args");
+        std::process::exit(1);
+    }
+    let (m_u, k_u, n_u) = (m as usize, k as usize, n as usize);
+    unsafe {
+        let a_arc = tensor_borrow(a);
+        let b_arc = tensor_borrow(b);
+        let af = a_arc.data.as_slice();
+        let bf = b_arc.data.as_slice();
+        if af.len() < m_u * k_u || bf.len() < k_u * n_u {
+            eprintln!("JIT runtime error: hexa_matmul shape mismatch");
+            std::process::exit(1);
+        }
+        let mut c = vec![0.0f64; m_u * n_u];
+        for i in 0..m_u {
+            for p in 0..k_u {
+                let av = af[i * k_u + p];
+                for j in 0..n_u {
+                    c[i * n_u + j] += av * bf[p * n_u + j];
+                }
+            }
+        }
+        let td = TensorData { shape: vec![m_u, n_u], data: c };
+        tensor_leak(Arc::new(td))
+    }
+}
+
+/// Extern helper: elementwise add of two tensors. Returns a fresh tensor.
+extern "C" fn hexa_mat_add(a: i64, b: i64) -> i64 {
+    if a == 0 || b == 0 {
+        eprintln!("JIT runtime error: hexa_mat_add null");
+        std::process::exit(1);
+    }
+    unsafe {
+        let a_arc = tensor_borrow(a);
+        let b_arc = tensor_borrow(b);
+        if a_arc.data.len() != b_arc.data.len() {
+            eprintln!("JIT runtime error: hexa_mat_add length mismatch");
+            std::process::exit(1);
+        }
+        let data: Vec<f64> = a_arc.data.iter().zip(b_arc.data.iter())
+            .map(|(x, y)| x + y).collect();
+        let shape = a_arc.shape.clone();
+        tensor_leak(Arc::new(TensorData { shape, data }))
+    }
+}
+
+/// Extern helper: elementwise scale by f64. Scalar is passed as raw f64 bits
+/// stored in an i64 (use f64::to_bits to produce).
+extern "C" fn hexa_mat_scale(a: i64, s_bits: i64) -> i64 {
+    if a == 0 {
+        eprintln!("JIT runtime error: hexa_mat_scale null");
+        std::process::exit(1);
+    }
+    let s = f64::from_bits(s_bits as u64);
+    unsafe {
+        let a_arc = tensor_borrow(a);
+        let data: Vec<f64> = a_arc.data.iter().map(|x| x * s).collect();
+        let shape = a_arc.shape.clone();
+        tensor_leak(Arc::new(TensorData { shape, data }))
+    }
+}
+
 fn jit_err(msg: String) -> HexaError {
     HexaError {
         class: ErrorClass::Runtime,
@@ -376,6 +529,13 @@ pub struct JitCompiler {
     alloc_id: FuncId,
     /// FuncId for bounds check.
     bounds_check_id: FuncId,
+    /// FuncIds for Tensor runtime helpers (Option A extern FFI).
+    tensor_zeros_id: FuncId,
+    tensor_new_id: FuncId,
+    tensor_len_id: FuncId,
+    matmul_id: FuncId,
+    mat_add_id: FuncId,
+    mat_scale_id: FuncId,
     /// Struct type layouts.
     struct_layouts: HashMap<String, StructLayout>,
     /// Enum type layouts.
@@ -433,6 +593,14 @@ impl JitCompiler {
         builder.symbol("hexa_alloc", hexa_alloc as *const u8);
         builder.symbol("hexa_free", hexa_free as *const u8);
         builder.symbol("hexa_bounds_check", hexa_bounds_check as *const u8);
+
+        // Tensor runtime helpers (Option A).
+        builder.symbol("hexa_tensor_zeros", hexa_tensor_zeros as *const u8);
+        builder.symbol("hexa_tensor_new", hexa_tensor_new as *const u8);
+        builder.symbol("hexa_tensor_len", hexa_tensor_len as *const u8);
+        builder.symbol("hexa_matmul", hexa_matmul as *const u8);
+        builder.symbol("hexa_mat_add", hexa_mat_add as *const u8);
+        builder.symbol("hexa_mat_scale", hexa_mat_scale as *const u8);
 
         // Register extern FFI symbols via dlopen/dlsym before builder is consumed.
         #[cfg(not(target_arch = "wasm32"))]
@@ -500,6 +668,57 @@ impl JitCompiler {
             .declare_function("hexa_bounds_check", Linkage::Import, &bc_sig)
             .map_err(|e| jit_err(format!("declare bounds_check: {}", e)))?;
 
+        // ── Tensor runtime helper signatures ──────────────────────
+        // hexa_tensor_zeros(n: i64) -> i64
+        let mut tz_sig = module.make_signature();
+        tz_sig.params.push(AbiParam::new(I64));
+        tz_sig.returns.push(AbiParam::new(I64));
+        let tensor_zeros_id = module
+            .declare_function("hexa_tensor_zeros", Linkage::Import, &tz_sig)
+            .map_err(|e| jit_err(format!("declare tensor_zeros: {}", e)))?;
+
+        // hexa_tensor_new(arr_ptr: i64) -> i64
+        let mut tn_sig = module.make_signature();
+        tn_sig.params.push(AbiParam::new(I64));
+        tn_sig.returns.push(AbiParam::new(I64));
+        let tensor_new_id = module
+            .declare_function("hexa_tensor_new", Linkage::Import, &tn_sig)
+            .map_err(|e| jit_err(format!("declare tensor_new: {}", e)))?;
+
+        // hexa_tensor_len(t: i64) -> i64
+        let mut tl_sig = module.make_signature();
+        tl_sig.params.push(AbiParam::new(I64));
+        tl_sig.returns.push(AbiParam::new(I64));
+        let tensor_len_id = module
+            .declare_function("hexa_tensor_len", Linkage::Import, &tl_sig)
+            .map_err(|e| jit_err(format!("declare tensor_len: {}", e)))?;
+
+        // hexa_matmul(a, b, m, k, n) -> i64
+        let mut mm_sig = module.make_signature();
+        for _ in 0..5 { mm_sig.params.push(AbiParam::new(I64)); }
+        mm_sig.returns.push(AbiParam::new(I64));
+        let matmul_id = module
+            .declare_function("hexa_matmul", Linkage::Import, &mm_sig)
+            .map_err(|e| jit_err(format!("declare matmul: {}", e)))?;
+
+        // hexa_mat_add(a, b) -> i64
+        let mut ma_sig = module.make_signature();
+        ma_sig.params.push(AbiParam::new(I64));
+        ma_sig.params.push(AbiParam::new(I64));
+        ma_sig.returns.push(AbiParam::new(I64));
+        let mat_add_id = module
+            .declare_function("hexa_mat_add", Linkage::Import, &ma_sig)
+            .map_err(|e| jit_err(format!("declare mat_add: {}", e)))?;
+
+        // hexa_mat_scale(a, s_bits) -> i64
+        let mut ms_sig = module.make_signature();
+        ms_sig.params.push(AbiParam::new(I64));
+        ms_sig.params.push(AbiParam::new(I64));
+        ms_sig.returns.push(AbiParam::new(I64));
+        let mat_scale_id = module
+            .declare_function("hexa_mat_scale", Linkage::Import, &ms_sig)
+            .map_err(|e| jit_err(format!("declare mat_scale: {}", e)))?;
+
         Ok(Self {
             module,
             functions: HashMap::new(),
@@ -507,6 +726,12 @@ impl JitCompiler {
             print_id,
             alloc_id,
             bounds_check_id,
+            tensor_zeros_id,
+            tensor_new_id,
+            tensor_len_id,
+            matmul_id,
+            mat_add_id,
+            mat_scale_id,
             struct_layouts: HashMap::new(),
             enum_layouts: HashMap::new(),
             impl_methods: HashMap::new(),
@@ -783,6 +1008,12 @@ impl JitCompiler {
                 self.print_id,
                 self.alloc_id,
                 self.bounds_check_id,
+                self.tensor_zeros_id,
+                self.tensor_new_id,
+                self.tensor_len_id,
+                self.matmul_id,
+                self.mat_add_id,
+                self.mat_scale_id,
                 &self.struct_layouts,
                 &self.enum_layouts,
                 &self.impl_methods,
@@ -1181,6 +1412,12 @@ impl JitCompiler {
                 self.print_id,
                 self.alloc_id,
                 self.bounds_check_id,
+                self.tensor_zeros_id,
+                self.tensor_new_id,
+                self.tensor_len_id,
+                self.matmul_id,
+                self.mat_add_id,
+                self.mat_scale_id,
                 &self.struct_layouts,
                 &self.enum_layouts,
                 &self.impl_methods,
@@ -1263,6 +1500,12 @@ impl JitCompiler {
                 self.print_id,
                 self.alloc_id,
                 self.bounds_check_id,
+                self.tensor_zeros_id,
+                self.tensor_new_id,
+                self.tensor_len_id,
+                self.matmul_id,
+                self.mat_add_id,
+                self.mat_scale_id,
                 &self.struct_layouts,
                 &self.enum_layouts,
                 &self.impl_methods,
@@ -1436,7 +1679,12 @@ fn collect_free_vars_stmt(
 }
 
 fn is_builtin(name: &str) -> bool {
-    matches!(name, "println" | "print" | "len" | "true" | "false")
+    matches!(
+        name,
+        "println" | "print" | "len" | "true" | "false"
+        | "tensor_zeros" | "tensor_new" | "tensor_len"
+        | "matmul" | "mat_add" | "mat_scale"
+    )
 }
 
 /// Scan an AST for all Lambda expressions and return info about each.
@@ -1579,6 +1827,12 @@ struct FuncTranslator<'a> {
     print_id: FuncId,
     alloc_id: FuncId,
     bounds_check_id: FuncId,
+    tensor_zeros_id: FuncId,
+    tensor_new_id: FuncId,
+    tensor_len_id: FuncId,
+    matmul_id: FuncId,
+    mat_add_id: FuncId,
+    mat_scale_id: FuncId,
     /// Variable map: name -> Cranelift Variable.
     vars: HashMap<String, Variable>,
     /// Struct layouts for field offset computation.
@@ -1617,6 +1871,12 @@ impl<'a> FuncTranslator<'a> {
         print_id: FuncId,
         alloc_id: FuncId,
         bounds_check_id: FuncId,
+        tensor_zeros_id: FuncId,
+        tensor_new_id: FuncId,
+        tensor_len_id: FuncId,
+        matmul_id: FuncId,
+        mat_add_id: FuncId,
+        mat_scale_id: FuncId,
         struct_layouts: &'a HashMap<String, StructLayout>,
         enum_layouts: &'a HashMap<String, EnumLayout>,
         impl_methods: &'a HashMap<String, HashMap<String, FnDecl>>,
@@ -1628,6 +1888,12 @@ impl<'a> FuncTranslator<'a> {
             print_id,
             alloc_id,
             bounds_check_id,
+            tensor_zeros_id,
+            tensor_new_id,
+            tensor_len_id,
+            matmul_id,
+            mat_add_id,
+            mat_scale_id,
             vars: HashMap::new(),
             struct_layouts,
             enum_layouts,
@@ -2088,6 +2354,38 @@ impl<'a> FuncTranslator<'a> {
                         let arr_ptr = self.compile_expr(builder, &args[0])?;
                         // Array layout: first slot is length.
                         return Ok(self.load_from_offset(builder, arr_ptr, 0));
+                    }
+
+                    // ── Tensor runtime helpers (Option A) ──────────
+                    // These forward to extern "C" functions whose Arc<TensorData>
+                    // raw pointers travel through the uniform i64 ABI.
+                    {
+                        let tensor_helper: Option<(FuncId, usize, &'static str)> = match name.as_str() {
+                            "tensor_zeros" => Some((self.tensor_zeros_id, 1, "tensor_zeros")),
+                            "tensor_new"   => Some((self.tensor_new_id,   1, "tensor_new")),
+                            "tensor_len"   => Some((self.tensor_len_id,   1, "tensor_len")),
+                            "mat_add"      => Some((self.mat_add_id,      2, "mat_add")),
+                            "mat_scale"    => Some((self.mat_scale_id,    2, "mat_scale")),
+                            "matmul"       => Some((self.matmul_id,       5, "matmul")),
+                            _ => None,
+                        };
+                        if let Some((helper_id, arity, hname)) = tensor_helper {
+                            if args.len() != arity {
+                                return Err(jit_err(format!(
+                                    "{} expects {} arg(s), got {}", hname, arity, args.len()
+                                )));
+                            }
+                            let mut arg_vals = Vec::with_capacity(arity);
+                            for arg in args {
+                                arg_vals.push(self.compile_expr(builder, arg)?);
+                            }
+                            let func_ref = self
+                                .module
+                                .declare_func_in_func(helper_id, &mut builder.func);
+                            let call = builder.ins().call(func_ref, &arg_vals);
+                            let results = builder.inst_results(call);
+                            return Ok(results[0]);
+                        }
                     }
 
                     // User-defined function call.
