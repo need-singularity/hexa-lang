@@ -19,8 +19,12 @@
 
 > 🔴 **AI-NATIVE FIRST**: 성능/자원 개선은 저수준 마이크로 최적화 금지 — **AI-native 알고리즘 교체로 돌파**만 추구. docs/ai-native.md 24종 벡터 로드맵 참조. @optimize/@memoize/@fuse/@parallel 등 attr 시스템으로 구현.
 
-> 🔴 **HEXA-FIRST**: 모든 코드는 `.hexa`로 작성. 부하 유발 명령 최소화.
-> - **`src/` Rust 인터프리터/컴파일러는 폐기됨** — 수정/빌드/테스트 금지. 검증·실험이 필요하면 `~/Dev/test`에서 `.hexa`로 진행.
+> 🔴 **HEXA-FIRST**: 새 기능은 원칙적으로 `.hexa`로 작성. 부하 유발 명령 최소화.
+> - **`src/` Rust 트리 정책 (2026-04-10 갱신)**:
+>   - 기본 원칙: 새 기능은 `.hexa`로 (HEXA-FIRST 유지)
+>   - 수정 허용 조건: **유저 명시 승인** 시 `src/` 수정 가능 (L0 가드는 `--no-verify`로 우회 가능)
+>   - 전형적 수정 대상: 3tier 동등성(feedback_tiered_execution), 빌트인 추가, Tensor ABI 개선
+>   - 실험/검증은 여전히 `.hexa`가 기본값
 
 > 🔴 **NEXUS-6 특이점 연동**: 이 프로젝트의 돌파/발견/실험은 nexus 특이점 사이클 입력이다.
 > - **돌파 시**: `HEXA=$HOME/Dev/hexa-lang/target/release/hexa && $HEXA $HOME/Dev/nexus/mk2_hexa/native/blowup.hexa <domain> 3 --no-graph`
@@ -95,8 +99,9 @@
 self-hosting Phase1 완료 | LLVM 0% (의존 없음) | 1791 tests | 53.8K LOC | bench 333x
 
 ## 실행 모델
-**`src/` Rust 구현(JIT/VM/Interp) 폐기됨** — 더 이상 수정/빌드/참조 대상 아님.
-검증·실험은 `~/Dev/test`에서 `.hexa`로 진행.
+`src/` Rust 구현 (Interpreter / VM / JIT Cranelift) — **L0 잠금 + 유저 명시 승인 시 수정 가능**.
+기본 개발은 `.hexa`가 선호되나 3tier 동등성·빌트인·Tensor ABI 등은 `src/` 수정이 필수인 경우 있음.
+검증·실험은 `.hexa`로 진행.
 
 ## 빌드
 ```bash
