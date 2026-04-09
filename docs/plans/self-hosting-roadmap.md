@@ -76,8 +76,8 @@
 - [x] **P2-1** Value 타입 시스템: 762→1243줄 (+63%), String/Array/Map/Math 빌트인
 - [x] **P2-2** 스코프/환경 관리: push/pop scope, local resolution 구현
 - [x] **P2-3** 빌트인 함수: println, format, abs, sqrt, sin, cos, ln, exp 등 13종
-- [ ] **P2-4** 패턴 매칭 실행: match, destructuring, guard
-- [ ] **P2-5** 에러 처리: try/catch, 스택 트레이스
+- [x] **P2-4** 패턴 매칭 실행: match, destructuring, guard — ✅ 이미 구현 (interpreter.hexa:490-758)
+- [x] **P2-5** 에러 처리: try/catch, 스택 트레이스 — ✅ 완료 (2026-04-09, exec_throw/exec_try_catch + 35 PASS)
 - [~] **P2-6** struct/enum 인스턴스화, 메서드 디스패치
   - [x] struct 인스턴스화 (StructInit eval: interpreter.hexa:388)
   - [x] field access (Field eval: interpreter.hexa:293)
