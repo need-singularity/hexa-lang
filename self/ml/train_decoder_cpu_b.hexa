@@ -1,0 +1,202 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/train_decoder_cpu_b.hexa — Phase B: RoPE + SwiGLU + GQA
+//
+//  anima ConsciousDecoderV2 (models/conscious_decoder.py)
+//    GroupedQueryAttention : 4 Q heads / 2 KV heads (n_rep=2), HEAD_DIM=96
+//    RoPE                  : rotate pairs per position (base=10000)
+//    SwiGLUFFN             : down(silu(gate(x)) * up(x)) — 3 linears
+//
+//  Phase A diff:
+//    - block_forward_chain_f32 builtin 폐기 (rank-r + tied attention 가정이라 GQA 불일치)
+//    - 블록별로 matmul_into 체인으로 직접 구성 (tied weights, N_LAYER 루프)
+//    - rope builtin (x, seq, dim) 사용
+//    - silu + hadamard 로 SwiGLU 구성
+//
+//  정확도는 의미 없음 (가중치 0, 손실 placeholder) — forward pass 실행 + step_ms 측정만 검증
+// ═══════════════════════════════════════════════════════════════════
+
+let D        = 384
+let N_LAYER  = 6
+let VOCAB    = 256
+let SEQ      = 256
+let FF       = 1536
+let H        = 4
+let H_KV     = 2
+let HEAD_DIM = 96
+let KV_D     = 192
+let LR       = 0.001
+
+// ── Tied weights (single copy reused across layers) ─────────────
+let Wq    = tensor_zeros(D * D)
+let Wk    = tensor_zeros(D * KV_D)
+let Wv    = tensor_zeros(D * KV_D)
+let Wo    = tensor_zeros(D * D)
+let Wgate = tensor_zeros(D * FF)
+let Wup   = tensor_zeros(D * FF)
+let Wdown = tensor_zeros(FF * D)
+let Wlmh  = tensor_zeros(D * VOCAB)
+
+// ── Scratch buffers ─────────────────────────────────────────────
+let buf_q       = tensor_zeros(SEQ * D)
+let buf_k       = tensor_zeros(SEQ * KV_D)
+let buf_v       = tensor_zeros(SEQ * KV_D)
+let buf_attn    = tensor_zeros(SEQ * D)
+let buf_proj    = tensor_zeros(SEQ * D)
+let buf_gate    = tensor_zeros(SEQ * FF)
+let buf_up      = tensor_zeros(SEQ * FF)
+let buf_down    = tensor_zeros(SEQ * D)
+let buf_lmh_in  = tensor_zeros(1 * D)
+let buf_lmh_out = tensor_zeros(1 * VOCAB)
+
+// ── Slice helpers (build per-head flat array [SEQ × HEAD_DIM]) ──
+fn slice_head(full, seq, total_dim, head_idx, head_dim) {
+    let mut out = []
+    let mut s = 0
+    while s < seq {
+        let base = s * total_dim + head_idx * head_dim
+        let mut d = 0
+        while d < head_dim {
+            out = out.push(full[base + d])
+            d = d + 1
+        }
+        s = s + 1
+    }
+    out
+}
+
+// write a per-head slice [SEQ × HEAD_DIM] back into `dst` [SEQ × total_dim]
+fn scatter_head(dst, head_arr, seq, total_dim, head_idx, head_dim) {
+    let mut out = []
+    let mut s = 0
+    while s < seq {
+        let mut d = 0
+        while d < total_dim {
+            if d >= head_idx * head_dim {
+                if d < (head_idx + 1) * head_dim {
+                    let hi = s * head_dim + (d - head_idx * head_dim)
+                    out = out.push(head_arr[hi])
+                } else {
+                    out = out.push(dst[s * total_dim + d])
+                }
+            } else {
+                out = out.push(dst[s * total_dim + d])
+            }
+            d = d + 1
+        }
+        s = s + 1
+    }
+    out
+}
+
+fn embed_bytes(ids) { tensor_zeros(SEQ * D) }
+
+// ── One decoder block (tied weights) ────────────────────────────
+fn decoder_block(x) {
+    // 1) Q, K, V projections
+    let q_full = matmul_into(x, Wq, SEQ, D, D,    buf_q)
+    let k_full = matmul_into(x, Wk, SEQ, D, KV_D, buf_k)
+    let v_full = matmul_into(x, Wv, SEQ, D, KV_D, buf_v)
+
+    // 2) RoPE on Q and K (builtin rotates pairs on last dim)
+    let q_rot = rope(q_full, SEQ, D, 10000.0)
+    let k_rot = rope(k_full, SEQ, KV_D, 10000.0)
+
+    // 3) GQA — 4 query heads share 2 KV heads (n_rep = 2)
+    let mut concat = []
+    let mut z = 0
+    while z < SEQ * D { concat = concat.push(0.0); z = z + 1 }
+
+    let mut h_idx = 0
+    while h_idx < H {
+        let kv_idx = h_idx / 2
+        let q_h = slice_head(q_rot, SEQ, D,    h_idx,  HEAD_DIM)
+        let k_h = slice_head(k_rot, SEQ, KV_D, kv_idx, HEAD_DIM)
+        let v_h = slice_head(v_full, SEQ, KV_D, kv_idx, HEAD_DIM)
+        let ah  = attention(q_h, k_h, v_h, SEQ, HEAD_DIM)
+        concat = scatter_head(concat, ah, SEQ, D, h_idx, HEAD_DIM)
+        h_idx = h_idx + 1
+    }
+
+    // 4) Output projection + residual
+    let proj = matmul_into(tensor(concat), Wo, SEQ, D, D, buf_proj)
+    let attn_out = mat_add_inplace(buf_attn, x)
+    let after_attn = mat_add_inplace(attn_out, proj)
+
+    // 5) SwiGLU FFN: down( silu(gate(x)) * up(x) )
+    let gate_pre = matmul_into(after_attn, Wgate, SEQ, D, FF, buf_gate)
+    let up_pre   = matmul_into(after_attn, Wup,   SEQ, D, FF, buf_up)
+    let gate_act = silu(gate_pre)
+    let fused    = hadamard(gate_act, up_pre)
+    let ffn_out  = matmul_into(tensor(fused), Wdown, SEQ, FF, D, buf_down)
+
+    // 6) Residual
+    mat_add_inplace(after_attn, ffn_out)
+}
+
+fn forward_pass(ids, tgt) {
+    let h0 = embed_bytes(ids)
+    let mut h = h0
+    let mut l = 0
+    while l < N_LAYER {
+        h = decoder_block(h)
+        l = l + 1
+    }
+    // Extract last token for LM head
+    let base = (SEQ - 1) * D
+    let mut last = []
+    let mut i = 0
+    while i < D {
+        last = last.push(h[base + i])
+        i = i + 1
+    }
+    let last_t = tensor(last)
+    let logits = matmul_into(last_t, Wlmh, 1, D, VOCAB, buf_lmh_out)
+    // Dummy MSE (zero weights → loss == sum(tgt^2))
+    let neg_t = mat_scale(tgt, -1.0)
+    let diff  = mat_add(logits, neg_t)
+    let sq    = matmul(diff, diff, 1, VOCAB, 1)
+    sq[0] / (VOCAB * 1.0)
+}
+
+fn train_one_step() {
+    let mut ids = []
+    let mut i = 0
+    while i < SEQ { ids = ids.push(0); i = i + 1 }
+
+    let mut tgt = []
+    let mut j = 0
+    while j < VOCAB {
+        if j == 0 { tgt = tgt.push(1.0) } else { tgt = tgt.push(0.0) }
+        j = j + 1
+    }
+    let tgt_t = tensor(tgt)
+
+    let t0 = clock()
+    let loss = forward_pass(ids, tgt_t)
+    let t1 = clock()
+
+    // Minimal "opt" — zero-grad axpy on LM head (bwd skipped; loss is placeholder)
+    let fake_grad = tensor_zeros(D * VOCAB)
+    let _ = axpy(Wlmh, fake_grad, -1.0 * LR)
+    let t2 = clock()
+
+    let fwd_ms   = (t1 - t0) * 1000.0
+    let opt_ms   = (t2 - t1) * 1000.0
+    let total_ms = (t2 - t0) * 1000.0
+
+    let mut line = "{\"phase\":\"decoder_cpu_b\",\"d\":" + str(D)
+    line = line + ",\"L\":" + str(N_LAYER) + ",\"seq\":" + str(SEQ)
+    line = line + ",\"vocab\":" + str(VOCAB)
+    line = line + ",\"H\":" + str(H) + ",\"H_kv\":" + str(H_KV)
+    line = line + ",\"head_dim\":" + str(HEAD_DIM) + ",\"ff\":" + str(FF)
+    line = line + ",\"feat\":\"rope+swiglu+gqa\""
+    line = line + ",\"step_ms\":" + str(total_ms)
+    line = line + ",\"fwd\":" + str(fwd_ms)
+    line = line + ",\"opt\":" + str(opt_ms)
+    line = line + ",\"loss\":" + str(loss) + "}"
+    println(line)
+    total_ms
+}
+
+println("[train_decoder_cpu_b hexa] Phase B: RoPE+SwiGLU+GQA, D=384 L=6 H=4/2 HD=96 seq=256")
+let _ = train_one_step()
