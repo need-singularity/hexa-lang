@@ -1,0 +1,134 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/t1_v4_combined.hexa — 7B T1 v4
+//
+//  v3 = 7.94s fwd (386 matmul). Planned QKV-combine (3 matmul -> 1)
+//  requires a sub-tensor/slice-copy builtin that hexa does NOT expose
+//  (src/ is L0-locked, no new builtin allowed without user approval).
+//  Without slicing, a combined [SEQ × 3R] matmul cannot be split into
+//  Qs/Ks/Vs for the downstream shape-specific matmul calls.
+//
+//  Therefore v4 tests the *other* documented hypothesis: the
+//  residual mat_add(X, o) / mat_add(h1, fdn2) overhead. Two mat_add
+//  calls per layer * 32 layers = 64 Tensor-Arc allocations.
+//  RESIDUAL_ON flag does A/B measurement in one run.
+//
+//  NOTE: disabling residual is a correctness lie (prototype timing
+//  only). Still BLAS-correct matmul counts.
+// ═══════════════════════════════════════════════════════════════════
+
+let D       = 4096
+let N_LAYER = 32
+let FF      = 16384
+let SEQ     = 128
+let VOCAB   = 32000
+let LORA_R  = 16
+let VOCAB_R = 16
+
+let Uq = tensor_zeros(D * LORA_R)
+let Vq = tensor_zeros(LORA_R * D)
+let Uk = tensor_zeros(D * LORA_R)
+let Vk = tensor_zeros(LORA_R * D)
+let Uv = tensor_zeros(D * LORA_R)
+let Vv = tensor_zeros(LORA_R * D)
+let Uo = tensor_zeros(D * LORA_R)
+let Vo = tensor_zeros(LORA_R * D)
+
+let U_up = tensor_zeros(D  * LORA_R)
+let V_up = tensor_zeros(LORA_R * FF)
+let U_dn = tensor_zeros(FF * LORA_R)
+let V_dn = tensor_zeros(LORA_R * D)
+
+let U_lmh = tensor_zeros(D * VOCAB_R)
+let V_lmh = tensor_zeros(VOCAB_R * VOCAB)
+
+let MM_PER_LAYER = 12
+
+// ───────────── Pass A : residual ON (baseline v3 topology) ─────────────
+let H0_a = tensor_zeros(SEQ * D)
+let tA0  = clock()
+let mut Xa = H0_a
+let mut la = 0
+while la < N_LAYER {
+    let Qs     = matmul(Xa,    Uq, SEQ, D,      LORA_R)
+    let Ks     = matmul(Xa,    Uk, SEQ, D,      LORA_R)
+    let Vs     = matmul(Xa,    Uv, SEQ, D,      LORA_R)
+    let scores = matmul(Qs,    Ks, SEQ, LORA_R, SEQ)
+    let ctx_r  = matmul(scores,Vs, SEQ, SEQ,    LORA_R)
+    let ctx    = matmul(ctx_r, Vv, SEQ, LORA_R, D)
+    let o_t    = matmul(ctx,   Uo, SEQ, D,      LORA_R)
+    let o      = matmul(o_t,   Vo, SEQ, LORA_R, D)
+    let h1     = mat_add(Xa, o)
+
+    let fup1 = matmul(h1,   U_up, SEQ, D,      LORA_R)
+    let fup2 = matmul(fup1, V_up, SEQ, LORA_R, FF)
+    let fdn1 = matmul(fup2, U_dn, SEQ, FF,     LORA_R)
+    let fdn2 = matmul(fdn1, V_dn, SEQ, LORA_R, D)
+    let h2   = mat_add(h1, fdn2)
+
+    Xa = h2
+    la = la + 1
+}
+let lmh_tA   = matmul(Xa,    U_lmh, SEQ, D,       VOCAB_R)
+let _logitsA = matmul(lmh_tA, V_lmh, SEQ, VOCAB_R, VOCAB)
+let tA1 = clock()
+let fwdA_ms = (tA1 - tA0) * 1000.0
+
+// ───────────── Pass B : residual OFF (skip mat_add, prototype-only) ─────────────
+let H0_b = tensor_zeros(SEQ * D)
+let tB0  = clock()
+let mut Xb = H0_b
+let mut lb = 0
+while lb < N_LAYER {
+    let Qs     = matmul(Xb,    Uq, SEQ, D,      LORA_R)
+    let Ks     = matmul(Xb,    Uk, SEQ, D,      LORA_R)
+    let Vs     = matmul(Xb,    Uv, SEQ, D,      LORA_R)
+    let scores = matmul(Qs,    Ks, SEQ, LORA_R, SEQ)
+    let ctx_r  = matmul(scores,Vs, SEQ, SEQ,    LORA_R)
+    let ctx    = matmul(ctx_r, Vv, SEQ, LORA_R, D)
+    let o_t    = matmul(ctx,   Uo, SEQ, D,      LORA_R)
+    let o      = matmul(o_t,   Vo, SEQ, LORA_R, D)
+    // residual skipped: h1 := o (lie, timing only)
+
+    let fup1 = matmul(o,    U_up, SEQ, D,      LORA_R)
+    let fup2 = matmul(fup1, V_up, SEQ, LORA_R, FF)
+    let fdn1 = matmul(fup2, U_dn, SEQ, FF,     LORA_R)
+    let fdn2 = matmul(fdn1, V_dn, SEQ, LORA_R, D)
+    // residual skipped: h2 := fdn2
+
+    Xb = fdn2
+    lb = lb + 1
+}
+let lmh_tB   = matmul(Xb,    U_lmh, SEQ, D,       VOCAB_R)
+let _logitsB = matmul(lmh_tB, V_lmh, SEQ, VOCAB_R, VOCAB)
+let tB1 = clock()
+let fwdB_ms = (tB1 - tB0) * 1000.0
+
+// ───────────── Report ─────────────
+let tok_sA = 1000.0 / fwdA_ms
+let tok_sB = 1000.0 / fwdB_ms
+let mm_count    = N_LAYER * MM_PER_LAYER + 2
+let matadd_saved = N_LAYER * 2
+let v3_ms       = 7940.0
+let speedupA    = v3_ms / fwdA_ms
+let speedupB    = v3_ms / fwdB_ms
+let residual_ms = fwdA_ms - fwdB_ms
+
+let mut line = "{"
+line = line + "\"phase\":\"t1_v4_residual_ab\""
+line = line + ",\"D\":" + str(D)
+line = line + ",\"n_layer\":" + str(N_LAYER)
+line = line + ",\"seq\":" + str(SEQ)
+line = line + ",\"lora_r\":" + str(LORA_R)
+line = line + ",\"matmul_count\":" + str(mm_count)
+line = line + ",\"matadd_saved_B\":" + str(matadd_saved)
+line = line + ",\"fwdA_ms\":" + str(fwdA_ms)
+line = line + ",\"fwdB_ms\":" + str(fwdB_ms)
+line = line + ",\"residual_cost_ms\":" + str(residual_ms)
+line = line + ",\"tok_sA\":" + str(tok_sA)
+line = line + ",\"tok_sB\":" + str(tok_sB)
+line = line + ",\"v3_baseline_ms\":" + str(v3_ms)
+line = line + ",\"speedupA_vs_v3\":" + str(speedupA)
+line = line + ",\"speedupB_vs_v3\":" + str(speedupB)
+line = line + "}"
+println(line)
+println("[t1_v4] OK")
