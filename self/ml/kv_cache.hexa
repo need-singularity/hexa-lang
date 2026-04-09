@@ -1,27 +1,13 @@
 // ═══════════════════════════════════════════════════════════════
-//  self/ml/kv_cache.hexa — Transformer KV-cache (incremental)
+//  self/ml/kv_cache.hexa — Transformer KV-cache (flat 1D, immutable)
 //
-//  목적:
-//    7B decoder-only 추론에서 매 token 마다 과거 K/V 재계산을 0 으로.
-//    - pre-allocate [n_layers][max_len][n_heads*head_dim]
-//    - append: 현재 seq_len 슬롯에 k_new, v_new 기록 → seq_len += 1
-//    - get:    layer 의 0..seq_len 유효 영역(view) 반환
-//    - reset:  seq_len = 0 (메모리 재사용)
+//  Layout:
+//    keys / values : flat 1D Tensor, size = n_layers * max_len * n_heads * head_dim
+//    index(layer, pos, h, d) = ((layer*max_len + pos)*n_heads + h)*head_dim + d
 //
-//  AI-NATIVE attr:
-//    @hot       — append/get 은 매 토큰 호출
-//    @pure      — kv_pos_key / rope_pos_encoding 보조
-//    @memoize   — 순수 불변 보조함수(position key, sinusoidal PE)
-//                 KV-cache 자체는 가변 상태 → @memoize 불가. 대신
-//                 incremental cache 패턴으로 재계산 0 을 달성.
-//
-//  shape:
-//    keys   : [n_layers][max_len][n_heads * head_dim]
-//    values : [n_layers][max_len][n_heads * head_dim]
-//
-//  주의:
-//    - Tensor 는 self/ml 스타일대로 nested list. slice 는 새 list 복사.
-//    - 구조체 필드 변경(state.seq_len = ...) 지원 확인됨 (train_loop.hexa).
+//  Pattern: immutable — append returns a NEW KVCache (new flat arrays copied).
+//  Rationale: complex index assignment (t[i][j][k] = v) 미지원 회피.
+//  flat 1D + per-append full copy 로 파서 안전 + slab 단위만 덮어씀.
 // ═══════════════════════════════════════════════════════════════
 
 struct KVCache {
@@ -34,30 +20,16 @@ struct KVCache {
     head_dim: int
 }
 
-// ── allocation helpers ────────────────────────────────────────
-fn kvc_zeros_1d(n) {
-    let mut v = []
-    for _i in 0..n { v = v + [0.0] }
-    return v
+// ── flat index helper ─────────────────────────────────────────
+fn kv_cache_idx(layer, pos, h, d, max_len, n_heads, head_dim) {
+    return ((layer * max_len + pos) * n_heads + h) * head_dim + d
 }
 
-fn kvc_zeros_2d(r, c) {
-    let mut m = []
-    for _i in 0..r { m = m + [kvc_zeros_1d(c)] }
-    return m
-}
-
-fn kvc_zeros_3d(a, b, c) {
-    let mut t = []
-    for _i in 0..a { t = t + [kvc_zeros_2d(b, c)] }
-    return t
-}
-
-// ── constructor: pre-allocate full [L][T][D] tensor ───────────
+// ── constructor: allocate zero-filled flat tensors ────────────
 fn kv_cache_new(n_layers, max_len, n_heads, head_dim) {
-    let d_model = n_heads * head_dim
-    let keys   = kvc_zeros_3d(n_layers, max_len, d_model)
-    let values = kvc_zeros_3d(n_layers, max_len, d_model)
+    let total = n_layers * max_len * n_heads * head_dim
+    let keys   = tensor_zeros(total)
+    let values = tensor_zeros(total)
     return KVCache {
         keys: keys,
         values: values,
@@ -69,111 +41,110 @@ fn kv_cache_new(n_layers, max_len, n_heads, head_dim) {
     }
 }
 
-// ── append: write k_new/v_new into slot `seq_len` of layer ────
-//    layer == 0 에서만 seq_len 이 전진. 나머지 layer 는 같은 슬롯에 기록.
+// ── append: returns NEW KVCache with slab (layer,pos) overwritten ──
+//    k_flat / v_flat length == n_heads * head_dim
 @hot
-fn kv_cache_append(cache: KVCache, layer, k_new, v_new) {
-    let pos = cache.seq_len
-    if pos >= cache.max_len {
-        return cache   // full, skip (caller 가 rollover 결정)
+fn kv_cache_append(cache: KVCache, layer, pos, k_flat, v_flat) {
+    let max_len  = cache.max_len
+    let n_heads  = cache.n_heads
+    let head_dim = cache.head_dim
+    let slab     = n_heads * head_dim
+    let total    = cache.n_layers * max_len * slab
+    let base     = ((layer * max_len + pos) * n_heads) * head_dim
+
+    // Copy keys/values into fresh arrays; overwrite the slab region.
+    let mut new_k = []
+    let mut new_v = []
+    let mut i = 0
+    while i < total {
+        let offset = i - base
+        if offset >= 0 {
+            if offset < slab {
+                new_k = new_k.push(k_flat[offset])
+                new_v = new_v.push(v_flat[offset])
+            } else {
+                new_k = new_k.push(cache.keys[i])
+                new_v = new_v.push(cache.values[i])
+            }
+        } else {
+            new_k = new_k.push(cache.keys[i])
+            new_v = new_v.push(cache.values[i])
+        }
+        i = i + 1
     }
-    let d_model = cache.n_heads * cache.head_dim
-    for o in 0..d_model {
-        cache.keys[layer][pos][o]   = k_new[o]
-        cache.values[layer][pos][o] = v_new[o]
+
+    let advance_seq = pos + 1
+    let mut new_seq = cache.seq_len
+    if advance_seq > new_seq { new_seq = advance_seq }
+
+    return KVCache {
+        keys: tensor(new_k),
+        values: tensor(new_v),
+        seq_len: new_seq,
+        max_len: max_len,
+        n_layers: cache.n_layers,
+        n_heads: n_heads,
+        head_dim: head_dim
     }
-    // seq_len 은 마지막 layer 기록 직후에만 전진
-    if layer == cache.n_layers - 1 {
-        cache.seq_len = pos + 1
-    }
-    return cache
 }
 
-// ── get: return (K_view, V_view) for layer, rows 0..seq_len ───
-//    slice 는 새 list (hexa 는 view 없음 → copy). 호출 측은 읽기 전용 사용.
-@hot
-fn kv_cache_get(cache: KVCache, layer) {
-    let s = cache.seq_len
-    let mut k_view = []
-    let mut v_view = []
-    for i in 0..s {
-        k_view = k_view + [cache.keys[layer][i]]
-        v_view = v_view + [cache.values[layer][i]]
-    }
-    return [k_view, v_view]
-}
-
-// ── reset: re-use allocation ──────────────────────────────────
+// ── reset: fresh zero-filled cache, same shape ────────────────
 fn kv_cache_reset(cache: KVCache) {
-    cache.seq_len = 0
-    return cache
+    return kv_cache_new(cache.n_layers, cache.max_len, cache.n_heads, cache.head_dim)
 }
 
-// ── @memoize 불변 보조: position hash key ─────────────────────
-//    KV-cache 는 mutable → @memoize 적용 불가. 대신 position/layer
-//    hash 같은 순수 함수에만 @memoize 를 붙여 재계산 0 을 달성.
-@memoize fn kv_pos_key(layer: int, seq_pos: int) -> int {
-    return layer * 1000003 + seq_pos
+// ── read helper: single element ───────────────────────────────
+fn kv_cache_get_key(cache: KVCache, layer, pos, h, d) {
+    let idx = kv_cache_idx(layer, pos, h, d, cache.max_len, cache.n_heads, cache.head_dim)
+    return cache.keys[idx]
 }
 
-// sinusoidal position encoding scalar (불변) — 안전하게 memoize 가능
-// 정수 키 기반 (scaled by 1e6) — @memoize 키/값 안정화
-@memoize fn kv_pe_scalar_i(pos: int, dim_idx: int, d_model: int) -> int {
-    let exponent = (0.0 - 2.0) * (dim_idx * 1.0) / (d_model * 1.0)
-    let inv_freq = exp(exponent * 9.2103403719761836)
-    let angle = (pos * 1.0) * inv_freq
-    let a2 = angle * angle
-    let a4 = a2 * a2
-    let s_val = angle - (angle * a2) / 6.0 + (angle * a4) / 120.0
-    let scaled = s_val * 1000000.0
-    let mut rounded = 0
-    if scaled >= 0.0 {
-        rounded = int(scaled + 0.5)
-    } else {
-        rounded = int(scaled - 0.5)
-    }
-    return rounded
+fn kv_cache_get_val(cache: KVCache, layer, pos, h, d) {
+    let idx = kv_cache_idx(layer, pos, h, d, cache.max_len, cache.n_heads, cache.head_dim)
+    return cache.values[idx]
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  @test: unit tests
+//  @test
 // ═══════════════════════════════════════════════════════════════
 
 @test fn test_kv_cache_append() {
     let n_layers = 2
     let max_len  = 4
     let n_heads  = 2
-    let head_dim = 3
-    let d_model  = n_heads * head_dim  // 6
+    let head_dim = 2
+    let slab     = n_heads * head_dim  // 4
 
     let mut cache = kv_cache_new(n_layers, max_len, n_heads, head_dim)
 
-    // t=0 : append to all layers
-    let k0 = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
-    let v0 = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0]
-    cache = kv_cache_append(cache, 0, k0, v0)
-    cache = kv_cache_append(cache, 1, k0, v0)
+    // t=0, layer 0,1
+    let k0 = [1.0, 2.0, 3.0, 4.0]
+    let v0 = [10.0, 20.0, 30.0, 40.0]
+    cache = kv_cache_append(cache, 0, 0, k0, v0)
+    cache = kv_cache_append(cache, 1, 0, k0, v0)
 
-    // seq_len must advance exactly once per token (after last layer)
-    if cache.seq_len != 1 { return false }
-
-    // t=1 : different token
-    let k1 = [7.0, 8.0, 9.0, 10.0, 11.0, 12.0]
-    let v1 = [70.0, 80.0, 90.0, 100.0, 110.0, 120.0]
-    cache = kv_cache_append(cache, 0, k1, v1)
-    cache = kv_cache_append(cache, 1, k1, v1)
+    // t=1, layer 0,1
+    let k1 = [5.0, 6.0, 7.0, 8.0]
+    let v1 = [50.0, 60.0, 70.0, 80.0]
+    cache = kv_cache_append(cache, 0, 1, k1, v1)
+    cache = kv_cache_append(cache, 1, 1, k1, v1)
 
     if cache.seq_len != 2 { return false }
 
-    // get layer 0 view → must be 2 rows, row 0 == k0, row 1 == k1
-    let view0 = kv_cache_get(cache, 0)
-    let k_view = view0[0]
-    let v_view = view0[1]
-    if len(k_view) != 2 { return false }
-    if k_view[0][0] != 1.0 { return false }
-    if k_view[1][5] != 12.0 { return false }
-    if v_view[0][2] != 30.0 { return false }
-    if v_view[1][0] != 70.0 { return false }
+    // layer 0 pos 0 head 0 dim 0 == 1.0
+    if kv_cache_get_key(cache, 0, 0, 0, 0) != 1.0 { return false }
+    // layer 0 pos 0 head 1 dim 1 == 4.0
+    if kv_cache_get_key(cache, 0, 0, 1, 1) != 4.0 { return false }
+    // layer 1 pos 1 head 1 dim 1 == 8.0
+    if kv_cache_get_key(cache, 1, 1, 1, 1) != 8.0 { return false }
+    // values: layer 1 pos 0 head 0 dim 2? dim is 0..1 — use dim 0 == 10.0
+    if kv_cache_get_val(cache, 1, 0, 0, 0) != 10.0 { return false }
+    // layer 0 pos 1 head 0 dim 1 == 60.0
+    if kv_cache_get_val(cache, 0, 1, 0, 1) != 60.0 { return false }
+
+    // untouched slot (layer 0 pos 2) must still be zero
+    if kv_cache_get_key(cache, 0, 2, 0, 0) != 0.0 { return false }
+    if kv_cache_get_val(cache, 1, 3, 1, 1) != 0.0 { return false }
 
     return true
 }
@@ -182,18 +153,19 @@ fn kv_cache_reset(cache: KVCache) {
     let mut cache = kv_cache_new(1, 4, 1, 2)
     let k = [1.0, 2.0]
     let v = [3.0, 4.0]
-    cache = kv_cache_append(cache, 0, k, v)
+    cache = kv_cache_append(cache, 0, 0, k, v)
     if cache.seq_len != 1 { return false }
     cache = kv_cache_reset(cache)
     if cache.seq_len != 0 { return false }
+    if kv_cache_get_key(cache, 0, 0, 0, 0) != 0.0 { return false }
 
-    // reuse after reset
-    cache = kv_cache_append(cache, 0, k, v)
+    cache = kv_cache_append(cache, 0, 0, k, v)
     if cache.seq_len != 1 { return false }
+    if kv_cache_get_key(cache, 0, 0, 0, 1) != 2.0 { return false }
     return true
 }
 
-// Smoke driver (file 단독 실행 시 즉시 확인 — test runner 독립)
+// Smoke driver
 let _r1 = test_kv_cache_append()
 let _r2 = test_kv_cache_reset()
 println("kv_cache append: " + to_string(_r1))
