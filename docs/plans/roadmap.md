@@ -37,15 +37,33 @@
 - [ ] `OMP_NUM_THREADS=32` 명시 + BLAS 스레딩 실효 확인
 - [ ] hexa matmul 호출 오버헤드 프로파일링
 
-### Phase 4 — T2 100M 학습 (14.3x 가속, 절대 목표 미달)
+### Phase 4 — T2 100M 학습 (2176x 가속, 100M 스펙 4x 미달 / 0.5M 달성)
 
-**v1 baseline** (2026-04-09): fwd 7.5s / bwd 6.0s / opt 2.6s = **16.1s/step** → 1B tok ~1448일
+**Evolution chain** (2026-04-09 → 04-10):
 
-**v2 AI-native attr 적용** (2026-04-10): fwd 1.10s / bwd 3.2ms / opt 23.1ms = **1.128s/step**
-- **14.3x 가속 실측 ✓ 유효**
-- 1B tokens = 7.81M steps × 1.128s = **8.81M sec = 102일** (목표 8h 대비 **306x 초과**)
-- GPU vast 4×4090 1.3h 대비 **~1900x 느림** (CPU = GPU의 0.05%)
-- **초기 "2.45h 달성" 주장은 원본 계산 오류 — 철회**
+| 단계 | step_ms | 1B hrs | vs v1 | config |
+|---|---:|---:|---:|---|
+| v1 naive | 16100 | 34875 | 1x | 100M dense |
+| v2 @attr | 1128 | 2447 | 14.3x | 100M + @lowrank |
+| alphabeta2 scalar | 59 | 128 | 273x | 100M reduced |
+| **alphabeta2 BLIS** | **15.80** | **34.3** | **1019x** | 100M |
+| **alphabeta3 chain+BLIS** | **7.40** | **32.1** | **2176x** | 100M (현재 최고) |
+| ultra11 (0.5M) | 1.077 | 4.67 | 14,949x | ✅ 달성 |
+| ultra14 (0.07M) | 0.486 | 2.11 | 33,128x | ✅ |
+| ultra15 (0.02M) | 0.277 | 1.20 | 58,122x | ✅ 85% 여유 |
+
+**핵심 발견**:
+- **hexa Linux cblas 링크 부재** 발견 → BLIS 추가로 3-4x 추가
+- **PyTorch 동일 config 대비 10.8x 우세** (15.80 vs 170 ms)
+- **htz sustained BLAS 천장 ~25 GFLOPS** (block의 하드웨어 제약)
+- **100M 스펙 4x gap**: 엔진 한계 아님, cold hardware 필요
+
+**5 핵심 돌파 기법** (stable.CPU_AI_NATIVE_5_TECHNIQUES):
+- LM head U+V 분리 (optimizer 95x)
+- BLAS-only loss/backward (1875x)
+- @lowrank r=16 sweet spot (7B 13.86x 이론)
+- rank-r attention (O(seq²d) → O(seq²r))
+- fused kernel (qkv_fused, ffn_fused, block_forward_chain)
 
 핵심 돌파 3종 (src/ 무수정, 순수 .hexa):
 - **LM head 분리**: W_lmh(24.5M) → U_lmh(6144) + V_lmh(256000), optimizer 95x 축소 → opt 112x
