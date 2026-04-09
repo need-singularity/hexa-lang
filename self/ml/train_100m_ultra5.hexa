@@ -1,0 +1,162 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/train_100m_ultra5.hexa — 극한 축소 + fused kernels
+//  D=384, LAYER=4, R=2, VOCAB=2048, SEQ=64
+//  ultra4 대비 모델 5-6x 작음, 동일 fused 경로
+// ═══════════════════════════════════════════════════════════════════
+
+let D       = 384
+let N_LAYER = 4
+let N_HEAD  = 6
+let HEAD_D  = 64
+let VOCAB   = 2048
+let SEQ     = 64
+let FF      = 1536
+let LORA_R  = 2
+let SPARSE_RATIO = 0.3
+let LR      = 0.001
+
+let Uqkv = tensor_zeros(D * 3 * LORA_R)
+let Vq = tensor_zeros(LORA_R * D)
+let Vv = tensor_zeros(LORA_R * D)
+let Uo = tensor_zeros(D * LORA_R)
+let Vo = tensor_zeros(LORA_R * D)
+
+let U_up = tensor_zeros(D * LORA_R)
+let V_up = tensor_zeros(LORA_R * FF)
+let U_dn = tensor_zeros(FF * LORA_R)
+let V_dn = tensor_zeros(LORA_R * D)
+
+let U_lmh = tensor_zeros(D * LORA_R)
+let V_lmh = tensor_zeros(LORA_R * VOCAB)
+
+let scratch_Qs    = tensor_zeros(SEQ * LORA_R)
+let scratch_Ks    = tensor_zeros(SEQ * LORA_R)
+let scratch_Vs    = tensor_zeros(SEQ * LORA_R)
+let scratch_score = tensor_zeros(SEQ * SEQ)
+let scratch_ctxr  = tensor_zeros(SEQ * LORA_R)
+let scratch_ctx   = tensor_zeros(SEQ * D)
+let scratch_o_t   = tensor_zeros(SEQ * LORA_R)
+let scratch_o     = tensor_zeros(SEQ * D)
+let scratch_ff_t1 = tensor_zeros(SEQ * LORA_R)
+let scratch_ff_y  = tensor_zeros(SEQ * FF)
+let scratch_ff_t2 = tensor_zeros(SEQ * LORA_R)
+let scratch_ff_o  = tensor_zeros(SEQ * D)
+
+let scratch_lmh_t   = tensor_zeros(1 * LORA_R)
+let scratch_lmh_out = tensor_zeros(1 * VOCAB)
+
+let scratch_bwd_z     = tensor_zeros(1 * LORA_R)
+let scratch_bwd_gvlmh = tensor_zeros(LORA_R * VOCAB)
+
+fn block_forward(X) {
+    let _qkv = qkv_fused_into(X, Uqkv, SEQ, D, LORA_R, scratch_Qs, scratch_Ks, scratch_Vs)
+    let Qs = scratch_Qs
+    let Vs = scratch_Vs
+    let scores = matmul_into(Qs, Qs, SEQ, LORA_R, SEQ, scratch_score)
+    let ctx_r  = matmul_into(scores, Vs, SEQ, SEQ, LORA_R, scratch_ctxr)
+    let ctx    = matmul_into(ctx_r, Vv, SEQ, LORA_R, D, scratch_ctx)
+    let o_t    = matmul_into(ctx, Uo, SEQ, D, LORA_R, scratch_o_t)
+    let o      = matmul_into(o_t, Vo, SEQ, LORA_R, D, scratch_o)
+    let h1     = mat_add_inplace(X, o)
+    let f = ffn_fused_into(h1, U_up, V_up, U_dn, V_dn, SEQ, D, LORA_R, FF, scratch_ff_t1, scratch_ff_y, scratch_ff_t2, scratch_ff_o)
+    mat_add_inplace(h1, f)
+}
+
+fn embed(ids) { tensor_zeros(SEQ * D) }
+
+fn lm_head_lr_into(h_last, rows) {
+    let t = matmul_into(h_last, U_lmh, rows, D, LORA_R, scratch_lmh_t)
+    matmul_into(t, V_lmh, rows, LORA_R, VOCAB, scratch_lmh_out)
+}
+
+fn loss_mse(logits, target_onehot) {
+    let n = len(target_onehot)
+    let neg_t = mat_scale(target_onehot, -1.0)
+    let diff  = mat_add(logits, neg_t)
+    let sq = matmul(diff, diff, 1, n, 1)
+    sq[0] / (n * 1.0)
+}
+
+fn forward_pass(ids, tgt) {
+    let mut h = embed(ids)
+    let mut li = 0
+    while li < N_LAYER {
+        h = block_forward(h)
+        li = li + 1
+    }
+    let mut last = []
+    let base = (SEQ - 1) * D
+    let mut i = 0
+    while i < D {
+        last = last.push(h[base + i])
+        i = i + 1
+    }
+    let last_t = tensor(last)
+    let logits = lm_head_lr_into(last_t, 1)
+    loss_mse(logits, tgt)
+}
+
+fn backward_vlmh(h_last, logits, target) {
+    let z = matmul_into(h_last, U_lmh, 1, D, LORA_R, scratch_bwd_z)
+    let neg_t = mat_scale(target, -1.0)
+    let diff  = mat_add(logits, neg_t)
+    matmul_into(z, diff, LORA_R, 1, VOCAB, scratch_bwd_gvlmh)
+}
+
+fn sgd_step_axpy(W, G, lr) {
+    axpy(W, G, -1.0 * lr)
+}
+
+fn train_one_step() {
+    let mut ids = []
+    let mut i = 0
+    while i < SEQ {
+        ids = ids.push(0)
+        i = i + 1
+    }
+    let mut tgt = []
+    let mut j = 0
+    while j < VOCAB {
+        if j == 0 { tgt = tgt.push(1.0) } else { tgt = tgt.push(0.0) }
+        j = j + 1
+    }
+    let tgt_t = tensor(tgt)
+
+    let t0 = clock()
+    let loss = forward_pass(ids, tgt_t)
+    let t1 = clock()
+
+    let last_h   = tensor_zeros(D)
+    let logits_f = tensor_zeros(VOCAB)
+    let g_vlmh   = backward_vlmh(last_h, logits_f, tgt_t)
+    let t2 = clock()
+
+    let _V_new = sgd_step_axpy(V_lmh, g_vlmh, LR)
+    let t3 = clock()
+
+    let fwd_ms   = (t1 - t0) * 1000.0
+    let bwd_ms   = (t2 - t1) * 1000.0
+    let opt_ms   = (t3 - t2) * 1000.0
+    let total_ms = (t3 - t0) * 1000.0
+
+    let mut line = "{"
+    line = line + "\"phase\":\"train_100m_ultra5\""
+    line = line + ",\"D\":" + str(D)
+    line = line + ",\"n_layers\":" + str(N_LAYER)
+    line = line + ",\"seq\":" + str(SEQ)
+    line = line + ",\"vocab\":" + str(VOCAB)
+    line = line + ",\"ff\":" + str(FF)
+    line = line + ",\"lora_r\":" + str(LORA_R)
+    line = line + ",\"loss\":" + str(loss)
+    line = line + ",\"fwd_ms\":" + str(fwd_ms)
+    line = line + ",\"bwd_ms\":" + str(bwd_ms)
+    line = line + ",\"opt_ms\":" + str(opt_ms)
+    line = line + ",\"step_ms\":" + str(total_ms)
+    line = line + "}"
+    println(line)
+    total_ms
+}
+
+println("[train_100m ultra5] init weights done, running 1 step...")
+let step_ms = train_one_step()
+println("[train_100m ultra5] 1 step OK step_ms=" + str(step_ms))
