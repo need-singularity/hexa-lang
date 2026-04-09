@@ -18,7 +18,7 @@ use crate::proof_engine;
 use crate::type_checker::SpecKey;
 use crate::inline_cache::{InlineCache, CallSiteId};
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 extern "C" {
     fn cblas_dgemm(order: i32, transA: i32, transB: i32,
                    M: i32, N: i32, K: i32,
@@ -29,10 +29,11 @@ extern "C" {
                    X: *const f64, incX: i32,
                    Y: *mut f64, incY: i32);
 }
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const CBLAS_ROW_MAJOR: i32 = 101;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const CBLAS_NO_TRANS: i32 = 111;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const CBLAS_TRANS: i32 = 112;
 
 /// Sentinel error message used to propagate `return` across call frames.
@@ -4441,11 +4442,11 @@ impl Interpreter {
                         }
                         if let Some(td) = Arc::get_mut(arc) {
                             let w = td.data.as_mut_slice();
-                            #[cfg(target_os = "macos")]
+                            #[cfg(any(target_os = "macos", target_os = "linux"))]
                             unsafe {
                                 cblas_daxpy(g_len as i32, alpha, g_vec.as_ptr(), 1, w.as_mut_ptr(), 1);
                             }
-                            #[cfg(not(target_os = "macos"))]
+                            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
                             {
                                 for (x, y) in w.iter_mut().zip(g_vec.iter()) { *x += alpha * *y; }
                             }
@@ -4453,11 +4454,11 @@ impl Interpreter {
                         } else {
                             let shape = arc.shape.clone();
                             let mut data = arc.data.clone();
-                            #[cfg(target_os = "macos")]
+                            #[cfg(any(target_os = "macos", target_os = "linux"))]
                             unsafe {
                                 cblas_daxpy(g_len as i32, alpha, g_vec.as_ptr(), 1, data.as_mut_ptr(), 1);
                             }
-                            #[cfg(not(target_os = "macos"))]
+                            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
                             {
                                 for (x, y) in data.iter_mut().zip(g_vec.iter()) { *x += alpha * *y; }
                             }
@@ -4503,7 +4504,7 @@ impl Interpreter {
                             let c = td.data.as_mut_slice();
                             // zero it (beta=0 semantics)
                             for v in c.iter_mut() { *v = 0.0; }
-                            #[cfg(target_os = "macos")]
+                            #[cfg(any(target_os = "macos", target_os = "linux"))]
                             unsafe {
                                 cblas_dgemm(
                                     CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
@@ -4513,7 +4514,7 @@ impl Interpreter {
                                     0.0, c.as_mut_ptr(), n as i32,
                                 );
                             }
-                            #[cfg(not(target_os = "macos"))]
+                            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
                             {
                                 for i in 0..m {
                                     for p in 0..k {
@@ -4529,7 +4530,7 @@ impl Interpreter {
                             // shared: fallback to new buffer
                             let shape = arc.shape.clone();
                             let mut c = vec![0.0f64; m * n];
-                            #[cfg(target_os = "macos")]
+                            #[cfg(any(target_os = "macos", target_os = "linux"))]
                             unsafe {
                                 cblas_dgemm(
                                     CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
@@ -4539,7 +4540,7 @@ impl Interpreter {
                                     0.0, c.as_mut_ptr(), n as i32,
                                 );
                             }
-                            #[cfg(not(target_os = "macos"))]
+                            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
                             {
                                 for i in 0..m {
                                     for p in 0..k {
@@ -4580,7 +4581,7 @@ impl Interpreter {
                 }
                 // Single fused GEMM: Y[M × 3R] = X[M × K] @ Uqkv[K × 3R]
                 let mut y = vec![0.0f64; m * three_r];
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
                 unsafe {
                     cblas_dgemm(
                         CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
@@ -4590,7 +4591,7 @@ impl Interpreter {
                         0.0, y.as_mut_ptr(), three_r as i32,
                     );
                 }
-                #[cfg(not(target_os = "macos"))]
+                #[cfg(not(any(target_os = "macos", target_os = "linux")))]
                 {
                     for i in 0..m {
                         for p in 0..k {
@@ -4688,7 +4689,7 @@ impl Interpreter {
                 let mut y = vec![0.0f64; m * ff];
                 let mut t2 = vec![0.0f64; m * r];
                 let mut out_vec = vec![0.0f64; m * d];
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
                 unsafe {
                     // t1 = X @ Uu
                     cblas_dgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
@@ -4715,7 +4716,7 @@ impl Interpreter {
                         vd_vec.as_ptr(), d as i32,
                         0.0, out_vec.as_mut_ptr(), d as i32);
                 }
-                #[cfg(not(target_os = "macos"))]
+                #[cfg(not(any(target_os = "macos", target_os = "linux")))]
                 {
                     // scalar fallback
                     for i in 0..m { for p in 0..d { let a = x_vec[i*d+p]; for j in 0..r { t1[i*r+j] += a * uu_vec[p*r+j]; } } }
@@ -4775,7 +4776,7 @@ impl Interpreter {
                 let mut x = x_init;
                 // 1. Y_qkv = X @ Uqkv → [SEQ × 3R]
                 let mut y_qkv = vec![0.0f64; seq * three_r];
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
                 unsafe {
                     cblas_dgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
                         seq as i32, three_r as i32, d as i32,
@@ -4783,7 +4784,7 @@ impl Interpreter {
                         uqkv.as_ptr(), three_r as i32,
                         0.0, y_qkv.as_mut_ptr(), three_r as i32);
                 }
-                #[cfg(not(target_os = "macos"))]
+                #[cfg(not(any(target_os = "macos", target_os = "linux")))]
                 {
                     for i in 0..seq { for p in 0..d { let a = x[i*d+p]; for j in 0..three_r { y_qkv[i*three_r+j] += a * uqkv[p*three_r+j]; } } }
                 }
@@ -4803,7 +4804,7 @@ impl Interpreter {
                 // K is stored row-major [seq×r], so its transpose is [r×seq] with stride r.
                 // Use NO_TRANS for Q, TRANS for K to achieve Q @ K^T.
                 let mut scores = vec![0.0f64; seq * seq];
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
                 unsafe {
                     cblas_dgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_TRANS,
                         seq as i32, seq as i32, r as i32,
@@ -4811,13 +4812,13 @@ impl Interpreter {
                         k_.as_ptr(), r as i32,
                         0.0, scores.as_mut_ptr(), seq as i32);
                 }
-                #[cfg(not(target_os = "macos"))]
+                #[cfg(not(any(target_os = "macos", target_os = "linux")))]
                 {
                     for i in 0..seq { for j in 0..seq { let mut s=0.0; for p in 0..r { s += q[i*r+p] * k_[j*r+p]; } scores[i*seq+j] = s; } }
                 }
                 // 4. ctx_r = scores @ V → [SEQ × r]
                 let mut ctx_r = vec![0.0f64; seq * r];
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
                 unsafe {
                     cblas_dgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
                         seq as i32, r as i32, seq as i32,
@@ -4825,11 +4826,11 @@ impl Interpreter {
                         v.as_ptr(), r as i32,
                         0.0, ctx_r.as_mut_ptr(), r as i32);
                 }
-                #[cfg(not(target_os = "macos"))]
+                #[cfg(not(any(target_os = "macos", target_os = "linux")))]
                 { for i in 0..seq { for p in 0..seq { let a=scores[i*seq+p]; for j in 0..r { ctx_r[i*r+j] += a*v[p*r+j]; } } } }
                 // 5. ctx = ctx_r @ Vv → [SEQ × D]
                 let mut ctx = vec![0.0f64; seq * d];
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
                 unsafe {
                     cblas_dgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
                         seq as i32, d as i32, r as i32,
@@ -4837,11 +4838,11 @@ impl Interpreter {
                         vv.as_ptr(), d as i32,
                         0.0, ctx.as_mut_ptr(), d as i32);
                 }
-                #[cfg(not(target_os = "macos"))]
+                #[cfg(not(any(target_os = "macos", target_os = "linux")))]
                 { for i in 0..seq { for p in 0..r { let a=ctx_r[i*r+p]; for j in 0..d { ctx[i*d+j] += a*vv[p*d+j]; } } } }
                 // 6. o_t = ctx @ Uo → [SEQ × r]
                 let mut o_t = vec![0.0f64; seq * r];
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
                 unsafe {
                     cblas_dgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
                         seq as i32, r as i32, d as i32,
@@ -4849,11 +4850,11 @@ impl Interpreter {
                         uo.as_ptr(), r as i32,
                         0.0, o_t.as_mut_ptr(), r as i32);
                 }
-                #[cfg(not(target_os = "macos"))]
+                #[cfg(not(any(target_os = "macos", target_os = "linux")))]
                 { for i in 0..seq { for p in 0..d { let a=ctx[i*d+p]; for j in 0..r { o_t[i*r+j] += a*uo[p*r+j]; } } } }
                 // 7. o = o_t @ Vo → [SEQ × D]
                 let mut o = vec![0.0f64; seq * d];
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
                 unsafe {
                     cblas_dgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
                         seq as i32, d as i32, r as i32,
@@ -4861,13 +4862,13 @@ impl Interpreter {
                         vo_.as_ptr(), d as i32,
                         0.0, o.as_mut_ptr(), d as i32);
                 }
-                #[cfg(not(target_os = "macos"))]
+                #[cfg(not(any(target_os = "macos", target_os = "linux")))]
                 { for i in 0..seq { for p in 0..r { let a=o_t[i*r+p]; for j in 0..d { o[i*d+j] += a*vo_[p*d+j]; } } } }
                 // 8. X += o (in-place)
                 for i in 0..(seq*d) { x[i] += o[i]; }
                 // 9. FFN: t1 = X @ Uu → [SEQ × r]
                 let mut t1 = vec![0.0f64; seq * r];
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
                 unsafe {
                     cblas_dgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
                         seq as i32, r as i32, d as i32,
@@ -4875,11 +4876,11 @@ impl Interpreter {
                         uu.as_ptr(), r as i32,
                         0.0, t1.as_mut_ptr(), r as i32);
                 }
-                #[cfg(not(target_os = "macos"))]
+                #[cfg(not(any(target_os = "macos", target_os = "linux")))]
                 { for i in 0..seq { for p in 0..d { let a=x[i*d+p]; for j in 0..r { t1[i*r+j] += a*uu[p*r+j]; } } } }
                 // 10. y = t1 @ Vu → [SEQ × FF]
                 let mut y = vec![0.0f64; seq * ff];
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
                 unsafe {
                     cblas_dgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
                         seq as i32, ff as i32, r as i32,
@@ -4887,11 +4888,11 @@ impl Interpreter {
                         vu.as_ptr(), ff as i32,
                         0.0, y.as_mut_ptr(), ff as i32);
                 }
-                #[cfg(not(target_os = "macos"))]
+                #[cfg(not(any(target_os = "macos", target_os = "linux")))]
                 { for i in 0..seq { for p in 0..r { let a=t1[i*r+p]; for j in 0..ff { y[i*ff+j] += a*vu[p*ff+j]; } } } }
                 // 11. t2 = y @ Ud → [SEQ × r]
                 let mut t2 = vec![0.0f64; seq * r];
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
                 unsafe {
                     cblas_dgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
                         seq as i32, r as i32, ff as i32,
@@ -4899,11 +4900,11 @@ impl Interpreter {
                         ud.as_ptr(), r as i32,
                         0.0, t2.as_mut_ptr(), r as i32);
                 }
-                #[cfg(not(target_os = "macos"))]
+                #[cfg(not(any(target_os = "macos", target_os = "linux")))]
                 { for i in 0..seq { for p in 0..ff { let a=y[i*ff+p]; for j in 0..r { t2[i*r+j] += a*ud[p*r+j]; } } } }
                 // 12. ffn_out = t2 @ Vd → [SEQ × D]
                 let mut ffn_out = vec![0.0f64; seq * d];
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
                 unsafe {
                     cblas_dgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
                         seq as i32, d as i32, r as i32,
@@ -4911,7 +4912,7 @@ impl Interpreter {
                         vd.as_ptr(), d as i32,
                         0.0, ffn_out.as_mut_ptr(), d as i32);
                 }
-                #[cfg(not(target_os = "macos"))]
+                #[cfg(not(any(target_os = "macos", target_os = "linux")))]
                 { for i in 0..seq { for p in 0..r { let a=t2[i*r+p]; for j in 0..d { ffn_out[i*d+j] += a*vd[p*d+j]; } } } }
                 // 13. X += ffn_out
                 for i in 0..(seq*d) { x[i] += ffn_out[i]; }
@@ -4972,7 +4973,7 @@ impl Interpreter {
                     // zero-out scratch for safety (beta=0 semantics via cblas with beta=0)
                     // (cblas_dgemm with beta=0.0 overwrites output, so zero fill is unnecessary except for attention accumulators)
 
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "linux"))]
                     unsafe {
                         // 1. Y_qkv = X @ Uqkv
                         cblas_dgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
@@ -4981,7 +4982,7 @@ impl Interpreter {
                             uqkv.as_ptr(), three_r as i32,
                             0.0, y_qkv.as_mut_ptr(), three_r as i32);
                     }
-                    #[cfg(not(target_os = "macos"))]
+                    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
                     {
                         for vv_ in y_qkv.iter_mut() { *vv_ = 0.0; }
                         for i in 0..seq { for p in 0..d { let a = x[i*d+p]; for j in 0..three_r { y_qkv[i*three_r+j] += a * uqkv[p*three_r+j]; } } }
@@ -4994,7 +4995,7 @@ impl Interpreter {
                             v[i*r+j] = y_qkv[i*three_r+2*r+j];
                         }
                     }
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "linux"))]
                     unsafe {
                         // scores = Q @ K^T
                         cblas_dgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_TRANS,
@@ -5027,7 +5028,7 @@ impl Interpreter {
                             vo_.as_ptr(), d as i32,
                             0.0, o.as_mut_ptr(), d as i32);
                     }
-                    #[cfg(not(target_os = "macos"))]
+                    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
                     {
                         for vv_ in scores.iter_mut() { *vv_ = 0.0; }
                         for i in 0..seq { for j in 0..seq { let mut s=0.0; for p in 0..r { s += q[i*r+p] * k_[j*r+p]; } scores[i*seq+j] = s; } }
@@ -5043,7 +5044,7 @@ impl Interpreter {
                     // X += o
                     for i in 0..(seq*d) { x[i] += o[i]; }
                     // FFN
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "linux"))]
                     unsafe {
                         cblas_dgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
                             seq as i32, r as i32, d as i32,
@@ -5066,7 +5067,7 @@ impl Interpreter {
                             vd.as_ptr(), d as i32,
                             0.0, ffn_out.as_mut_ptr(), d as i32);
                     }
-                    #[cfg(not(target_os = "macos"))]
+                    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
                     {
                         for vv_ in t1.iter_mut() { *vv_ = 0.0; }
                         for i in 0..seq { for p in 0..d { let a=x[i*d+p]; for j in 0..r { t1[i*r+j] += a*uu[p*r+j]; } } }
@@ -5123,7 +5124,7 @@ impl Interpreter {
                     let af = a_s.as_slice();
                     let bf = b_s.as_slice();
                     let mut c = vec![0.0f64; m * n];
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "linux"))]
                     unsafe {
                         cblas_dgemm(
                             CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
