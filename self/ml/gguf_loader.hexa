@@ -1,0 +1,498 @@
+// ═══════════════════════════════════════════════════════════
+//  gguf_loader.hexa — GGUF v3 파일 파서 (Llama-7B Q4_K_M 로더)
+//
+//  목표: Llama-7B int4 (Q4_K_M) gguf 파일을 읽어 Tensor로 로드.
+//        전체 파일을 메모리에 올리지 않는 lazy/seek 기반 로더.
+//
+//  GGUF v3 바이너리 레이아웃 요약:
+//      magic   : "GGUF"  (u32 LE, 0x46554747)
+//      version : u32 LE  (== 3)
+//      n_tensors : u64 LE
+//      n_kv      : u64 LE
+//      [kv metadata]*   key(string) + type(u32) + value
+//      [tensor_info]*   name(string) + n_dims(u32) + shape(u64*ndim)
+//                        + ggml_type(u32) + offset(u64)
+//      alignment padding (기본 32, metadata "general.alignment"로 override)
+//      [tensor data blob]  offset 기준 seek+read
+//
+//  문자열: u64 len + utf8 bytes
+//  GGUF_TYPE: 0=u8 1=i8 2=u16 3=i16 4=u32 5=i32 6=f32 7=bool
+//             8=string 9=array 10=u64 11=i64 12=f64
+//
+//  GGML 양자화 (tensor 데이터 ggml_type):
+//      0=F32 1=F16 2=Q4_0 3=Q4_1 8=Q8_0 12=Q4_K 14=Q5_K 15=Q6_K ...
+//      Q4_0 block: 32 weights → 18 bytes (f16 scale + 16 nibble bytes)
+//      Q4_K  super-block: 256 weights → 144 bytes
+//                         (f16 d, f16 dmin, 12 scales bytes, 128 qs bytes)
+//
+// ─── 필요 빌트인 (TODO — L0 interpreter.rs 추가 필요) ───────
+//   read_file_bytes(path, offset, length) -> [int]
+//       // 지정 오프셋에서 length 바이트 read. mmap 기반 추천.
+//       // length == -1 이면 파일 끝까지.
+//   file_size(path) -> int
+//   bytes_to_u32_le(bytes, offset) -> int
+//   bytes_to_u64_le(bytes, offset) -> int
+//   bytes_to_f32_le(bytes, offset) -> float
+//   bytes_to_f16_le(bytes, offset) -> float
+//   // 순수 hexa 폴백 구현은 아래 le_u32/le_u64/le_f32 로 제공.
+//
+//  위 빌트인이 준비되면 gguf_open() 은 seek 기반으로 헤더만
+//  읽고 tensor_info 만 수집 → gguf_load_tensor(name) 호출 시
+//  offset+len 만 read 하여 lazy load.
+//
+//  현재 상태: 순수 hexa 폴백 구현 — 작은 gguf 파일(헤더만 테스트)용.
+//            Llama-7B 4GB 파일은 read_file_bytes 빌트인 추가 후 활성.
+// ═══════════════════════════════════════════════════════════
+
+// ── GGUF / GGML 상수 ──────────────────────────────────────
+@pure fn gguf_magic() { return 0x46554747 }  // "GGUF" LE
+@pure fn gguf_version_v3() { return 3 }
+
+// gguf metadata value type ids
+@pure fn ggufv_u8()     { return 0 }
+@pure fn ggufv_i8()     { return 1 }
+@pure fn ggufv_u16()    { return 2 }
+@pure fn ggufv_i16()    { return 3 }
+@pure fn ggufv_u32()    { return 4 }
+@pure fn ggufv_i32()    { return 5 }
+@pure fn ggufv_f32()    { return 6 }
+@pure fn ggufv_bool()   { return 7 }
+@pure fn ggufv_string() { return 8 }
+@pure fn ggufv_array()  { return 9 }
+@pure fn ggufv_u64()    { return 10 }
+@pure fn ggufv_i64()    { return 11 }
+@pure fn ggufv_f64()    { return 12 }
+
+// ggml tensor type ids (필요한 것만)
+@pure fn ggml_f32()  { return 0 }
+@pure fn ggml_f16()  { return 1 }
+@pure fn ggml_q4_0() { return 2 }
+@pure fn ggml_q4_1() { return 3 }
+@pure fn ggml_q8_0() { return 8 }
+@pure fn ggml_q4_k() { return 12 }
+@pure fn ggml_q6_k() { return 14 }
+
+// ── Little-endian byte → int / float helpers (순수 hexa) ──
+// bytes 는 [int] 배열(0..255). offset 부터 n 바이트 읽음.
+@pure
+fn le_u32(bytes, off) {
+    let b0 = bytes[off]
+    let b1 = bytes[off + 1]
+    let b2 = bytes[off + 2]
+    let b3 = bytes[off + 3]
+    return b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
+}
+
+@pure
+fn le_u64(bytes, off) {
+    // 하위 32 + 상위 32 * 2^32 (hexa int 는 i64 → 충분)
+    let lo = le_u32(bytes, off)
+    let hi = le_u32(bytes, off + 4)
+    return lo + hi * 4294967296
+}
+
+// IEEE754 f32 decode (순수 hexa)
+@pure
+fn le_f32(bytes, off) {
+    let bits = le_u32(bytes, off)
+    let sign = (bits / 2147483648) % 2
+    let exp = (bits / 8388608) % 256
+    let mant = bits % 8388608
+    if exp == 0 {
+        if mant == 0 { return 0.0 }
+        // denormal
+        let m = mant / 8388608.0
+        let v = m * pow(2.0, -126.0)
+        if sign == 1 { return 0.0 - v }
+        return v
+    }
+    if exp == 255 {
+        // inf/nan — 근사: 큰 값 반환
+        if sign == 1 { return -1.0e38 }
+        return 1.0e38
+    }
+    let m = 1.0 + mant / 8388608.0
+    let v = m * pow(2.0, to_float(exp - 127))
+    if sign == 1 { return 0.0 - v }
+    return v
+}
+
+// IEEE754 f16 decode → float
+@pure
+fn le_f16(bytes, off) {
+    let b0 = bytes[off]
+    let b1 = bytes[off + 1]
+    let bits = b0 + b1 * 256
+    let sign = (bits / 32768) % 2
+    let exp = (bits / 1024) % 32
+    let mant = bits % 1024
+    if exp == 0 {
+        if mant == 0 { return 0.0 }
+        let m = mant / 1024.0
+        let v = m * pow(2.0, -14.0)
+        if sign == 1 { return 0.0 - v }
+        return v
+    }
+    if exp == 31 {
+        if sign == 1 { return -1.0e38 }
+        return 1.0e38
+    }
+    let m = 1.0 + mant / 1024.0
+    let v = m * pow(2.0, to_float(exp - 15))
+    if sign == 1 { return 0.0 - v }
+    return v
+}
+
+// ── GGUF 문자열 읽기 : u64 len + utf8 bytes ──────────────
+// returns [new_offset, string]
+fn gguf_read_string(bytes, off) {
+    let slen = le_u64(bytes, off)
+    let mut p = off + 8
+    let mut s = ""
+    let mut i = 0
+    while i < slen {
+        // ASCII만 재조립 (metadata key 는 ASCII)
+        let ch = bytes[p + i]
+        s = s + to_string(ch)  // placeholder — byte_to_char 빌트인 필요
+        i = i + 1
+    }
+    return [p + slen, s]
+}
+
+// ── GGUF 메타데이터 단일 값 스킵 (타입별 길이 계산) ──────
+// 메타데이터 전체를 돌며 kv 테이블 구축할 때 사용.
+// returns new_offset. array/string 중첩 지원.
+fn gguf_skip_value(bytes, off, vtype) {
+    if vtype == ggufv_u8() || vtype == ggufv_i8() || vtype == ggufv_bool() {
+        return off + 1
+    }
+    if vtype == ggufv_u16() || vtype == ggufv_i16() {
+        return off + 2
+    }
+    if vtype == ggufv_u32() || vtype == ggufv_i32() || vtype == ggufv_f32() {
+        return off + 4
+    }
+    if vtype == ggufv_u64() || vtype == ggufv_i64() || vtype == ggufv_f64() {
+        return off + 8
+    }
+    if vtype == ggufv_string() {
+        let slen = le_u64(bytes, off)
+        return off + 8 + slen
+    }
+    if vtype == ggufv_array() {
+        let inner = le_u32(bytes, off)
+        let n = le_u64(bytes, off + 4)
+        let mut p = off + 12
+        let mut i = 0
+        while i < n {
+            p = gguf_skip_value(bytes, p, inner)
+            i = i + 1
+        }
+        return p
+    }
+    return off  // unknown — stop
+}
+
+// ── GgufHeader 레코드 ─────────────────────────────────────
+struct GgufHeader {
+    path: string,
+    version: int,
+    n_tensors: int,
+    n_kv: int,
+    tensor_names: array,
+    tensor_shapes: array,
+    tensor_types: array,
+    tensor_offsets: array,
+    data_origin: int,   // 절대 파일 오프셋: tensor 데이터 블록 시작
+    alignment: int
+}
+
+// ── 헤더 파싱 : bytes(메타 + tensor_info 영역) → GgufHeader ─
+// bytes 는 파일 앞부분 충분히 큰 슬라이스(예: 1~4MB)로 가정.
+// Llama-7B 의 경우 메타+tensor_info 합계가 ~수백 KB.
+fn gguf_parse_header(path, bytes) {
+    let magic = le_u32(bytes, 0)
+    if magic != gguf_magic() {
+        println("[gguf] ERROR: bad magic " + to_string(magic))
+        return GgufHeader {
+            path: path, version: 0, n_tensors: 0, n_kv: 0,
+            tensor_names: [], tensor_shapes: [], tensor_types: [],
+            tensor_offsets: [], data_origin: 0, alignment: 32
+        }
+    }
+    let version = le_u32(bytes, 4)
+    let n_tensors = le_u64(bytes, 8)
+    let n_kv = le_u64(bytes, 16)
+    let mut p = 24
+
+    // metadata kv — 현재는 alignment 만 찾고 나머지 스킵
+    let mut alignment = 32
+    let mut i = 0
+    while i < n_kv {
+        let kr = gguf_read_string(bytes, p)
+        p = kr[0]
+        let key = kr[1]
+        let vtype = le_u32(bytes, p)
+        p = p + 4
+        // alignment 는 u32
+        if key == "general.alignment" && vtype == ggufv_u32() {
+            alignment = le_u32(bytes, p)
+        }
+        p = gguf_skip_value(bytes, p, vtype)
+        i = i + 1
+    }
+
+    // tensor_info 테이블
+    let mut names = []
+    let mut shapes = []
+    let mut types = []
+    let mut offsets = []
+    let mut t = 0
+    while t < n_tensors {
+        let nr = gguf_read_string(bytes, p)
+        p = nr[0]
+        let name = nr[1]
+        let ndim = le_u32(bytes, p); p = p + 4
+        let mut shape = []
+        let mut d = 0
+        while d < ndim {
+            shape = shape + [le_u64(bytes, p)]
+            p = p + 8
+            d = d + 1
+        }
+        let ggml_t = le_u32(bytes, p); p = p + 4
+        let t_off = le_u64(bytes, p); p = p + 8
+
+        names = names + [name]
+        shapes = shapes + [shape]
+        types = types + [ggml_t]
+        offsets = offsets + [t_off]
+        t = t + 1
+    }
+
+    // data_origin = p 를 alignment 경계로 올림
+    let rem = p % alignment
+    let mut origin = p
+    if rem != 0 { origin = p + (alignment - rem) }
+
+    return GgufHeader {
+        path: path,
+        version: version,
+        n_tensors: n_tensors,
+        n_kv: n_kv,
+        tensor_names: names,
+        tensor_shapes: shapes,
+        tensor_types: types,
+        tensor_offsets: offsets,
+        data_origin: origin,
+        alignment: alignment
+    }
+}
+
+// ── Q4_0 디코드 (블록 32) ─────────────────────────────────
+// 블록 레이아웃: [f16 scale d][16 bytes qs]  총 18 bytes → 32 weights
+// weight_i = d * (q_i - 8)    q_i ∈ [0,15] (nibble)
+@pure
+fn q4_0_decode_block(bytes, off) {
+    let d = le_f16(bytes, off)
+    let mut out = []
+    let mut i = 0
+    while i < 16 {
+        let b = bytes[off + 2 + i]
+        let lo = b % 16
+        let hi = b / 16
+        out = out + [d * to_float(lo - 8)]
+        out = out + [d * to_float(hi - 8)]
+        i = i + 1
+    }
+    return out   // len == 32
+}
+
+// ── Q4_K 디코드 (super-block 256) ─────────────────────────
+// 레이아웃 (144 bytes / 256 weights):
+//   f16 d           (2)    — super-block scale
+//   f16 dmin        (2)    — super-block min
+//   u8  scales[12]  (12)   — 8개 서브블록 scale/min 6bit 패킹
+//   u8  qs[128]     (128)  — 256 nibble
+// 각 서브블록(32 weights) i ∈ 0..7:
+//   scale_i, min_i  를 scales[12] 에서 unpack
+//   w = d * scale_i * q - dmin * min_i
+// 여기서는 단순화: scales unpack 의 공식 구현.
+@pure
+fn q4_k_unpack_scale_min(scales, i) {
+    // llama.cpp 참조 (get_scale_min_k4)
+    // 결과 [scale_6bit, min_6bit]
+    if i < 4 {
+        let s = scales[i] % 64
+        let m = scales[i + 4] % 64
+        return [s, m]
+    }
+    // i ∈ 4..7
+    let j = i - 4
+    let s = (scales[j + 8] % 16) + ((scales[j] / 64) % 4) * 16
+    let m = (scales[j + 8] / 16) + ((scales[j + 4] / 64) % 4) * 16
+    return [s, m]
+}
+
+@pure
+fn q4_k_decode_block(bytes, off) {
+    let d = le_f16(bytes, off)
+    let dmin = le_f16(bytes, off + 2)
+    // scales 12 bytes
+    let mut scales = []
+    let mut si = 0
+    while si < 12 {
+        scales = scales + [bytes[off + 4 + si]]
+        si = si + 1
+    }
+    let qs_off = off + 16
+    let mut out = []
+    let mut sub = 0
+    while sub < 8 {
+        let sm = q4_k_unpack_scale_min(scales, sub)
+        let sc = sm[0]
+        let mn = sm[1]
+        let dl = d * to_float(sc)
+        let ml = dmin * to_float(mn)
+        // 32 weights — 각 서브블록은 qs 의 16 nibble-byte (= 32 nibble)
+        let base = qs_off + sub * 16
+        let mut k = 0
+        while k < 16 {
+            let b = bytes[base + k]
+            let lo = b % 16
+            let hi = b / 16
+            out = out + [dl * to_float(lo) - ml]
+            out = out + [dl * to_float(hi) - ml]
+            k = k + 1
+        }
+        sub = sub + 1
+    }
+    return out  // len == 256
+}
+
+// ── 전체 텐서 디코드 : raw bytes + ggml_type → flat float array ──
+fn gguf_decode_tensor(bytes, off, numel, ggml_t) {
+    if ggml_t == ggml_f32() {
+        let mut out = []
+        let mut i = 0
+        while i < numel {
+            out = out + [le_f32(bytes, off + i * 4)]
+            i = i + 1
+        }
+        return out
+    }
+    if ggml_t == ggml_f16() {
+        let mut out = []
+        let mut i = 0
+        while i < numel {
+            out = out + [le_f16(bytes, off + i * 2)]
+            i = i + 1
+        }
+        return out
+    }
+    if ggml_t == ggml_q4_0() {
+        let nblocks = numel / 32
+        let mut out = []
+        let mut b = 0
+        while b < nblocks {
+            out = out + q4_0_decode_block(bytes, off + b * 18)
+            b = b + 1
+        }
+        return out
+    }
+    if ggml_t == ggml_q4_k() {
+        let nblocks = numel / 256
+        let mut out = []
+        let mut b = 0
+        while b < nblocks {
+            out = out + q4_k_decode_block(bytes, off + b * 144)
+            b = b + 1
+        }
+        return out
+    }
+    println("[gguf] WARN: unsupported ggml_type " + to_string(ggml_t))
+    return []
+}
+
+// ── Public API ───────────────────────────────────────────
+// 헤더만 로드 (lazy). 실제 텐서는 gguf_load_tensor 호출 시.
+// 현재는 read_file_bytes 빌트인 부재로 TODO 경로.
+@lazy
+fn gguf_open(path) {
+    // TODO: read_file_bytes(path, 0, header_probe_size) 필요.
+    //       header_probe_size 는 4MB 정도면 Llama-7B 충분.
+    // 임시: read_file 은 텍스트 전용이라 gguf 바이너리에 사용 불가.
+    println("[gguf] gguf_open: TODO — needs read_file_bytes builtin")
+    return GgufHeader {
+        path: path, version: 0, n_tensors: 0, n_kv: 0,
+        tensor_names: [], tensor_shapes: [], tensor_types: [],
+        tensor_offsets: [], data_origin: 0, alignment: 32
+    }
+}
+
+// 특정 텐서 lazy 로드 → Tensor
+fn gguf_load_tensor(hdr, name) {
+    let n = len(hdr.tensor_names)
+    let mut i = 0
+    while i < n {
+        if hdr.tensor_names[i] == name {
+            let shape = hdr.tensor_shapes[i]
+            let ggml_t = hdr.tensor_types[i]
+            let off = hdr.data_origin + hdr.tensor_offsets[i]
+            let mut numel = 1
+            let nd = len(shape)
+            let mut d = 0
+            while d < nd { numel = numel * shape[d]; d = d + 1 }
+            // TODO: 필요한 byte 구간만 read_file_bytes(path, off, bytelen)
+            println("[gguf] load_tensor '" + name + "' TODO — needs read_file_bytes")
+            return tensor([], shape)
+        }
+        i = i + 1
+    }
+    println("[gguf] tensor not found: " + name)
+    return tensor([], [0])
+}
+
+// ═══════════════════════════════════════════════════════════
+//  테스트
+// ═══════════════════════════════════════════════════════════
+
+// 합성 GGUF v3 최소 헤더 bytes 생성 — 0 tensors / 0 kv
+fn _mk_min_header_bytes() {
+    // magic "GGUF" LE
+    let mut b = [0x47, 0x47, 0x55, 0x46]
+    // version 3
+    b = b + [3, 0, 0, 0]
+    // n_tensors u64 = 0
+    b = b + [0, 0, 0, 0, 0, 0, 0, 0]
+    // n_kv u64 = 0
+    b = b + [0, 0, 0, 0, 0, 0, 0, 0]
+    return b
+}
+
+@test
+fn test_gguf_magic_le_u32() {
+    let b = _mk_min_header_bytes()
+    let m = le_u32(b, 0)
+    // "GGUF" LE == 0x46554747
+    assert(m == gguf_magic())
+}
+
+@test
+fn test_gguf_header_parse() {
+    let b = _mk_min_header_bytes()
+    let hdr = gguf_parse_header("synthetic", b)
+    assert(hdr.version == 3)
+    assert(hdr.n_tensors == 0)
+    assert(hdr.n_kv == 0)
+    assert(len(hdr.tensor_names) == 0)
+    assert(hdr.alignment == 32)
+}
+
+@test
+fn test_le_u64_roundtrip() {
+    // value = 0x0102030405060708 ≈ 72623859790382856
+    let b = [0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]
+    let v = le_u64(b, 0)
+    assert(v == 72623859790382856)
+}
