@@ -25,6 +25,11 @@ extern "C" {
                    alpha: f64, A: *const f64, lda: i32,
                    B: *const f64, ldb: i32,
                    beta: f64, C: *mut f64, ldc: i32);
+    fn cblas_sgemm(order: i32, transA: i32, transB: i32,
+                   M: i32, N: i32, K: i32,
+                   alpha: f32, A: *const f32, lda: i32,
+                   B: *const f32, ldb: i32,
+                   beta: f32, C: *mut f32, ldc: i32);
     fn cblas_daxpy(N: i32, alpha: f64,
                    X: *const f64, incX: i32,
                    Y: *mut f64, incY: i32);
@@ -1657,23 +1662,24 @@ impl Interpreter {
                             }
                         }
                     }
-                    let f = self.env.get(fn_name).ok_or_else(|| {
-                            let known_names: Vec<&str> = self.env.known_names();
-                            let hint = crate::error::suggest_name(fn_name, &known_names)
-                                .map(|s| format!("did you mean '{}'?", s));
-                            HexaError {
-                                class: ErrorClass::Name,
-                                message: format!("undefined function: {}", fn_name),
-                                line: self.current_line,
-                                col: self.current_col,
-                                hint,
+                    match self.env.get(fn_name) {
+                        Some(f) => {
+                            // Cache function values only (not mutable bindings)
+                            if matches!(f, Value::Fn(_) | Value::BuiltinFn(_)) {
+                                self.fn_cache.insert(fn_name.clone(), f.clone());
                             }
-                        })?;
-                        // Cache function values only (not mutable bindings)
-                        if matches!(f, Value::Fn(_) | Value::BuiltinFn(_)) {
-                            self.fn_cache.insert(fn_name.clone(), f.clone());
+                            f
                         }
-                        f
+                        None => {
+                            // Fallback: try call_builtin for native builtins not in env
+                            eprintln!("[DEBUG] env.get failed for '{}', trying call_builtin", fn_name);
+                            let mut arg_vals = Vec::with_capacity(args.len());
+                            for a in args {
+                                arg_vals.push(self.eval_expr(a)?);
+                            }
+                            return self.call_builtin(fn_name, arg_vals);
+                        }
+                    }
                     };
                     let mut arg_vals = Vec::with_capacity(args.len());
                     for a in args {
@@ -5094,6 +5100,132 @@ impl Interpreter {
                         }
                     }
                     _ => Ok(Value::Tensor(Arc::new(TensorData { shape: vec![seq, d], data: x }))),
+                }
+            }
+            "block_forward_chain_f32" => {
+                // f32 variant: cblas_sgemm 경로. BLIS 실측 sgemm 88 GF vs dgemm 33 GF (2.67x).
+                // Args identical to block_forward_chain (f64 Tensor input/output).
+                // Internal: convert f64→f32 once, loop N_LAYER with sgemm, convert back.
+                if args.len() < 14 {
+                    return Err(self.type_err("block_forward_chain_f32() requires 14 args".into()));
+                }
+                let (seq, d, r, ff, n_layer) = match (&args[9], &args[10], &args[11], &args[12], &args[13]) {
+                    (Value::Int(s), Value::Int(d), Value::Int(r), Value::Int(f), Value::Int(nl)) => (*s as usize, *d as usize, *r as usize, *f as usize, *nl as usize),
+                    _ => return Err(self.type_err("int (SEQ, D, R, FF, N_LAYER)".into())),
+                };
+                // Helper: Tensor/Array → Vec<f32>
+                fn to_f32(val: &Value) -> Option<Vec<f32>> {
+                    to_f64_slice(val).map(|s| s.as_slice().iter().map(|&v| v as f32).collect())
+                }
+                let uqkv: Vec<f32> = to_f32(&args[1]).ok_or_else(|| self.type_err("Uqkv".into()))?;
+                let vv: Vec<f32> = to_f32(&args[2]).ok_or_else(|| self.type_err("Vv".into()))?;
+                let uo: Vec<f32> = to_f32(&args[3]).ok_or_else(|| self.type_err("Uo".into()))?;
+                let vo_: Vec<f32> = to_f32(&args[4]).ok_or_else(|| self.type_err("Vo".into()))?;
+                let uu: Vec<f32> = to_f32(&args[5]).ok_or_else(|| self.type_err("Uu".into()))?;
+                let vu: Vec<f32> = to_f32(&args[6]).ok_or_else(|| self.type_err("Vu".into()))?;
+                let ud: Vec<f32> = to_f32(&args[7]).ok_or_else(|| self.type_err("Ud".into()))?;
+                let vd: Vec<f32> = to_f32(&args[8]).ok_or_else(|| self.type_err("Vd".into()))?;
+                let mut x: Vec<f32> = to_f32(&args[0]).ok_or_else(|| self.type_err("X".into()))?;
+
+                let three_r = 3 * r;
+                let mut y_qkv = vec![0.0f32; seq * three_r];
+                let mut q = vec![0.0f32; seq * r];
+                let mut k_ = vec![0.0f32; seq * r];
+                let mut v = vec![0.0f32; seq * r];
+                let mut scores = vec![0.0f32; seq * seq];
+                let mut ctx_r = vec![0.0f32; seq * r];
+                let mut ctx = vec![0.0f32; seq * d];
+                let mut o_t = vec![0.0f32; seq * r];
+                let mut o = vec![0.0f32; seq * d];
+                let mut t1 = vec![0.0f32; seq * r];
+                let mut y = vec![0.0f32; seq * ff];
+                let mut t2 = vec![0.0f32; seq * r];
+                let mut ffn_out = vec![0.0f32; seq * d];
+
+                for _layer in 0..n_layer {
+                    #[cfg(any(target_os = "macos", target_os = "linux"))]
+                    unsafe {
+                        cblas_sgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                            seq as i32, three_r as i32, d as i32,
+                            1.0, x.as_ptr(), d as i32,
+                            uqkv.as_ptr(), three_r as i32,
+                            0.0, y_qkv.as_mut_ptr(), three_r as i32);
+                    }
+                    for i in 0..seq {
+                        for j in 0..r {
+                            q[i*r+j] = y_qkv[i*three_r+j];
+                            k_[i*r+j] = y_qkv[i*three_r+r+j];
+                            v[i*r+j] = y_qkv[i*three_r+2*r+j];
+                        }
+                    }
+                    #[cfg(any(target_os = "macos", target_os = "linux"))]
+                    unsafe {
+                        cblas_sgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_TRANS,
+                            seq as i32, seq as i32, r as i32,
+                            1.0, q.as_ptr(), r as i32,
+                            k_.as_ptr(), r as i32,
+                            0.0, scores.as_mut_ptr(), seq as i32);
+                        cblas_sgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                            seq as i32, r as i32, seq as i32,
+                            1.0, scores.as_ptr(), seq as i32,
+                            v.as_ptr(), r as i32,
+                            0.0, ctx_r.as_mut_ptr(), r as i32);
+                        cblas_sgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                            seq as i32, d as i32, r as i32,
+                            1.0, ctx_r.as_ptr(), r as i32,
+                            vv.as_ptr(), d as i32,
+                            0.0, ctx.as_mut_ptr(), d as i32);
+                        cblas_sgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                            seq as i32, r as i32, d as i32,
+                            1.0, ctx.as_ptr(), d as i32,
+                            uo.as_ptr(), r as i32,
+                            0.0, o_t.as_mut_ptr(), r as i32);
+                        cblas_sgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                            seq as i32, d as i32, r as i32,
+                            1.0, o_t.as_ptr(), r as i32,
+                            vo_.as_ptr(), d as i32,
+                            0.0, o.as_mut_ptr(), d as i32);
+                    }
+                    for i in 0..(seq*d) { x[i] += o[i]; }
+                    #[cfg(any(target_os = "macos", target_os = "linux"))]
+                    unsafe {
+                        cblas_sgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                            seq as i32, r as i32, d as i32,
+                            1.0, x.as_ptr(), d as i32,
+                            uu.as_ptr(), r as i32,
+                            0.0, t1.as_mut_ptr(), r as i32);
+                        cblas_sgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                            seq as i32, ff as i32, r as i32,
+                            1.0, t1.as_ptr(), r as i32,
+                            vu.as_ptr(), ff as i32,
+                            0.0, y.as_mut_ptr(), ff as i32);
+                        cblas_sgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                            seq as i32, r as i32, ff as i32,
+                            1.0, y.as_ptr(), ff as i32,
+                            ud.as_ptr(), r as i32,
+                            0.0, t2.as_mut_ptr(), r as i32);
+                        cblas_sgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                            seq as i32, d as i32, r as i32,
+                            1.0, t2.as_ptr(), r as i32,
+                            vd.as_ptr(), d as i32,
+                            0.0, ffn_out.as_mut_ptr(), d as i32);
+                    }
+                    for i in 0..(seq*d) { x[i] += ffn_out[i]; }
+                }
+                // Convert back to f64 for return
+                let x_f64: Vec<f64> = x.iter().map(|&v| v as f64).collect();
+                match &mut args[0] {
+                    Value::Tensor(arc) => {
+                        if Arc::get_mut(arc).is_some() {
+                            let td = Arc::get_mut(arc).unwrap();
+                            td.data.copy_from_slice(&x_f64);
+                            Ok(Value::Tensor(arc.clone()))
+                        } else {
+                            let shape = arc.shape.clone();
+                            Ok(Value::Tensor(Arc::new(TensorData { shape, data: x_f64 })))
+                        }
+                    }
+                    _ => Ok(Value::Tensor(Arc::new(TensorData { shape: vec![seq, d], data: x_f64 }))),
                 }
             }
             "mat_scale" => {
