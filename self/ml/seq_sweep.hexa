@@ -1,0 +1,182 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/seq_sweep.hexa — SEQ throughput sweep (alphabeta base)
+//
+//  Hypothesis: larger SEQ amortizes per-call overhead.
+//  If 2x SEQ < 2x step_ms, throughput (tokens/sec) improves.
+//
+//  Base config: D=768, N_LAYER=8, VOCAB=8192, LORA_R=8, tied QKV, in-place.
+//  Sweep: SEQ ∈ {32, 64, 128, 256, 512}
+// ═══════════════════════════════════════════════════════════════════
+
+let D       = 768
+let N_LAYER = 8
+let VOCAB   = 8192
+let FF      = 3072
+let LORA_R  = 8
+let LR      = 0.001
+
+// Shared weights (SEQ-independent)
+let Uq = tensor_zeros(D * LORA_R)
+let Vq = tensor_zeros(LORA_R * D)
+let Uv = tensor_zeros(D * LORA_R)
+let Vv = tensor_zeros(LORA_R * D)
+let Uo = tensor_zeros(D * LORA_R)
+let Vo = tensor_zeros(LORA_R * D)
+let U_up = tensor_zeros(D * LORA_R)
+let V_up = tensor_zeros(LORA_R * FF)
+let U_dn = tensor_zeros(FF * LORA_R)
+let V_dn = tensor_zeros(LORA_R * D)
+let U_lmh = tensor_zeros(D * LORA_R)
+let V_lmh = tensor_zeros(LORA_R * VOCAB)
+
+@lowrank(8)
+fn lr_proj_into(X, U, V, seq, d, rnk, sT, sY) {
+    let t = matmul_into(X, U, seq, d, rnk, sT)
+    matmul_into(t, V, seq, rnk, d, sY)
+}
+
+@lowrank(8)
+fn ffn_lowrank_into(X, Uu, Vu, Ud, Vd, seq, d, ff, rnk, sT1, sY, sT2, sO) {
+    let t1 = matmul_into(X,  Uu, seq, d,  rnk, sT1)
+    let y  = matmul_into(t1, Vu, seq, rnk, ff,  sY)
+    let t2 = matmul_into(y,  Ud, seq, ff,  rnk, sT2)
+    matmul_into(t2, Vd, seq, rnk, d, sO)
+}
+
+fn add_residual(A, B) { mat_add_inplace(A, B) }
+
+fn block_forward(X, seq, sQs, sVs, sScore, sCtxr, sCtx, sOt, sO, sFt1, sFy, sFt2, sFo) {
+    let Qs = matmul_into(X, Uq, seq, D, LORA_R, sQs)
+    let Vs = matmul_into(X, Uv, seq, D, LORA_R, sVs)
+    let scores = matmul_into(Qs, Qs, seq, LORA_R, seq, sScore)
+    let ctx_r = matmul_into(scores, Vs, seq, seq, LORA_R, sCtxr)
+    let ctx   = matmul_into(ctx_r, Vv, seq, LORA_R, D, sCtx)
+    let o     = lr_proj_into(ctx, Uo, Vo, seq, D, LORA_R, sOt, sO)
+    let h1    = add_residual(X, o)
+    let f = ffn_lowrank_into(h1, U_up, V_up, U_dn, V_dn, seq, D, FF, LORA_R, sFt1, sFy, sFt2, sFo)
+    add_residual(h1, f)
+}
+
+@lowrank(8)
+fn lm_head_lr(h_last, rows) {
+    let t = matmul(h_last, U_lmh, rows, D, LORA_R)
+    matmul(t, V_lmh, rows, LORA_R, VOCAB)
+}
+
+fn loss_mse(logits, target_onehot) {
+    let n = len(target_onehot)
+    let neg_t = mat_scale(target_onehot, -1.0)
+    let diff  = mat_add(logits, neg_t)
+    let sq = matmul(diff, diff, 1, n, 1)
+    sq[0] / (n * 1.0)
+}
+
+fn run_seq(seq) {
+    // Per-SEQ scratch allocation
+    let sQs    = tensor_zeros(seq * LORA_R)
+    let sVs    = tensor_zeros(seq * LORA_R)
+    let sScore = tensor_zeros(seq * seq)
+    let sCtxr  = tensor_zeros(seq * LORA_R)
+    let sCtx   = tensor_zeros(seq * D)
+    let sOt    = tensor_zeros(seq * LORA_R)
+    let sO     = tensor_zeros(seq * D)
+    let sFt1   = tensor_zeros(seq * LORA_R)
+    let sFy    = tensor_zeros(seq * FF)
+    let sFt2   = tensor_zeros(seq * LORA_R)
+    let sFo    = tensor_zeros(seq * D)
+
+    // Build target one-hot
+    let mut tgt = []
+    let mut j = 0
+    while j < VOCAB {
+        if j == 0 { tgt = tgt.push(1.0) } else { tgt = tgt.push(0.0) }
+        j = j + 1
+    }
+    let tgt_t = tensor(tgt)
+
+    let t0 = clock()
+    // forward: N_LAYER blocks
+    let mut h = tensor_zeros(seq * D)
+    let mut li = 0
+    while li < N_LAYER {
+        block_forward(h, seq, sQs, sVs, sScore, sCtxr, sCtx, sOt, sO, sFt1, sFy, sFt2, sFo)
+        li = li + 1
+    }
+    // extract last row
+    let mut last = []
+    let base = (seq - 1) * D
+    let mut i = 0
+    while i < D {
+        last = last.push(h[base + i])
+        i = i + 1
+    }
+    let last_t = tensor(last)
+    let logits = lm_head_lr(last_t, 1)
+    let _loss  = loss_mse(logits, tgt_t)
+    let t1 = clock()
+
+    let step_ms = (t1 - t0) * 1000.0
+    let tokens  = seq
+    let tok_s   = (tokens * 1000.0) / step_ms
+    // 1B tokens: seconds = 1e9 / tok_s ; days = seconds / 86400
+    let secs_1B = 1000000000.0 / tok_s
+    let days_1B = secs_1B / 86400.0
+
+    let mut line = "{"
+    line = line + "\"seq\":" + str(seq)
+    line = line + ",\"step_ms\":" + str(step_ms)
+    line = line + ",\"tokens\":" + str(tokens)
+    line = line + ",\"tok_s\":" + str(tok_s)
+    line = line + ",\"1B_days\":" + str(days_1B)
+    line = line + "}"
+    println(line)
+
+    // return [step_ms, tok_s, days_1B]
+    let mut r = []
+    r = r.push(step_ms)
+    r = r.push(tok_s)
+    r = r.push(days_1B)
+    r
+}
+
+println("[seq_sweep] start — D=768 L=8 vocab=8192 r=8 tied_qkv inplace")
+
+let r32  = run_seq(32)
+let r64  = run_seq(64)
+let r128 = run_seq(128)
+let r256 = run_seq(256)
+let r512 = run_seq(512)
+
+// Find best tok_s
+let mut best_seq = 32
+let mut best_tok = r32[1]
+let mut best_days = r32[2]
+
+if r64[1] > best_tok {
+    best_seq = 64
+    best_tok = r64[1]
+    best_days = r64[2]
+}
+if r128[1] > best_tok {
+    best_seq = 128
+    best_tok = r128[1]
+    best_days = r128[2]
+}
+if r256[1] > best_tok {
+    best_seq = 256
+    best_tok = r256[1]
+    best_days = r256[2]
+}
+if r512[1] > best_tok {
+    best_seq = 512
+    best_tok = r512[1]
+    best_days = r512[2]
+}
+
+let mut sline = "{"
+sline = sline + "\"summary\":\"seq_sweep\""
+sline = sline + ",\"best_seq\":" + str(best_seq)
+sline = sline + ",\"best_tok_s\":" + str(best_tok)
+sline = sline + ",\"best_1B_days\":" + str(best_days)
+sline = sline + "}"
+println(sline)
