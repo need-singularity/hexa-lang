@@ -3491,7 +3491,7 @@ impl Interpreter {
         }
     }
 
-    fn call_builtin(&mut self, name: &str, args: Vec<Value>) -> Result<Value, HexaError> {
+    fn call_builtin(&mut self, name: &str, mut args: Vec<Value>) -> Result<Value, HexaError> {
         // Block I/O and side-effectful builtins in comptime mode
         if self.comptime_mode && crate::comptime::is_forbidden_builtin(name) {
             return Err(self.runtime_err(format!(
@@ -4343,6 +4343,134 @@ impl Interpreter {
                     }
                 } else {
                     Err(self.type_err("mat_add() requires 2 arrays/tensors".into()))
+                }
+            }
+            "mat_add_inplace" => {
+                // mat_add_inplace(A, B) → A += B, returns A (Tensor). Avoids copy when A is uniquely owned.
+                if args.len() < 2 { return Err(self.type_err("mat_add_inplace() requires 2 tensors".into())); }
+                // Borrow B as slice first (immutable), then mutate A.
+                let b_len;
+                let b_vec: Vec<f64> = if let Some(b_s) = to_f64_slice(&args[1]) {
+                    let bf = b_s.as_slice();
+                    b_len = bf.len();
+                    bf.to_vec()
+                } else {
+                    return Err(self.type_err("mat_add_inplace() requires 2 arrays/tensors".into()));
+                };
+                match &mut args[0] {
+                    Value::Tensor(arc) => {
+                        if arc.data.len() != b_len {
+                            return Err(self.type_err("mat_add_inplace() length mismatch".into()));
+                        }
+                        if let Some(td) = Arc::get_mut(arc) {
+                            // unique owner: true in-place
+                            for (x, y) in td.data.iter_mut().zip(b_vec.iter()) {
+                                *x += *y;
+                            }
+                            Ok(Value::Tensor(arc.clone()))
+                        } else {
+                            // shared: fallback — clone data, mutate, wrap new Arc
+                            let shape = arc.shape.clone();
+                            let mut data = arc.data.clone();
+                            for (x, y) in data.iter_mut().zip(b_vec.iter()) {
+                                *x += *y;
+                            }
+                            Ok(Value::Tensor(Arc::new(TensorData { shape, data })))
+                        }
+                    }
+                    Value::Array(a) => {
+                        if a.len() != b_len {
+                            return Err(self.type_err("mat_add_inplace() length mismatch".into()));
+                        }
+                        for (x, y) in a.iter_mut().zip(b_vec.iter()) {
+                            if let Value::Float(f) = x {
+                                *f += *y;
+                            } else if let Value::Int(i) = x {
+                                *x = Value::Float(*i as f64 + *y);
+                            }
+                        }
+                        Ok(args[0].clone())
+                    }
+                    _ => Err(self.type_err("mat_add_inplace() requires tensor/array as first arg".into())),
+                }
+            }
+            "matmul_into" => {
+                // matmul_into(A, B, M, K, N, out) → writes C[M×N] into pre-allocated `out` Tensor, returns out.
+                if args.len() < 6 { return Err(self.type_err("matmul_into() requires (A, B, M, K, N, out)".into())); }
+                let (m, k, n) = match (&args[2], &args[3], &args[4]) {
+                    (Value::Int(m), Value::Int(k), Value::Int(n)) => (*m as usize, *k as usize, *n as usize),
+                    _ => return Err(self.type_err("matmul_into() requires int dimensions".into())),
+                };
+                // Read A, B as owned vecs to drop borrows before mutating out.
+                let (a_vec, b_vec): (Vec<f64>, Vec<f64>) = match (to_f64_slice(&args[0]), to_f64_slice(&args[1])) {
+                    (Some(a_s), Some(b_s)) => (a_s.as_slice().to_vec(), b_s.as_slice().to_vec()),
+                    _ => return Err(self.type_err("matmul_into() requires (array/tensor, array/tensor, int, int, int, tensor)".into())),
+                };
+                if a_vec.len() < m * k || b_vec.len() < k * n {
+                    return Err(self.type_err("matmul_into() input length < M*K or K*N".into()));
+                }
+                match &mut args[5] {
+                    Value::Tensor(arc) => {
+                        if arc.data.len() != m * n {
+                            return Err(self.type_err("matmul_into() out.len() != M*N".into()));
+                        }
+                        // Ensure unique ownership; fallback: clone then wrap new Arc.
+                        if Arc::get_mut(arc).is_some() {
+                            let td = Arc::get_mut(arc).unwrap();
+                            let c = td.data.as_mut_slice();
+                            // zero it (beta=0 semantics)
+                            for v in c.iter_mut() { *v = 0.0; }
+                            #[cfg(target_os = "macos")]
+                            unsafe {
+                                cblas_dgemm(
+                                    CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                                    m as i32, n as i32, k as i32,
+                                    1.0, a_vec.as_ptr(), k as i32,
+                                    b_vec.as_ptr(), n as i32,
+                                    0.0, c.as_mut_ptr(), n as i32,
+                                );
+                            }
+                            #[cfg(not(target_os = "macos"))]
+                            {
+                                for i in 0..m {
+                                    for p in 0..k {
+                                        let a_val = a_vec[i * k + p];
+                                        for j in 0..n {
+                                            c[i * n + j] += a_val * b_vec[p * n + j];
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(Value::Tensor(arc.clone()))
+                        } else {
+                            // shared: fallback to new buffer
+                            let shape = arc.shape.clone();
+                            let mut c = vec![0.0f64; m * n];
+                            #[cfg(target_os = "macos")]
+                            unsafe {
+                                cblas_dgemm(
+                                    CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                                    m as i32, n as i32, k as i32,
+                                    1.0, a_vec.as_ptr(), k as i32,
+                                    b_vec.as_ptr(), n as i32,
+                                    0.0, c.as_mut_ptr(), n as i32,
+                                );
+                            }
+                            #[cfg(not(target_os = "macos"))]
+                            {
+                                for i in 0..m {
+                                    for p in 0..k {
+                                        let a_val = a_vec[i * k + p];
+                                        for j in 0..n {
+                                            c[i * n + j] += a_val * b_vec[p * n + j];
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(Value::Tensor(Arc::new(TensorData { shape, data: c })))
+                        }
+                    }
+                    _ => Err(self.type_err("matmul_into() requires Tensor as `out` argument".into())),
                 }
             }
             "mat_scale" => {
