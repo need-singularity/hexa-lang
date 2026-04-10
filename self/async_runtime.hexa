@@ -1,18 +1,55 @@
-// self/async_runtime.hexa — HEXA async runtime ported from src/async_runtime.rs
+// self/async_runtime.hexa — HEXA ASYNC RUNTIME ported from src/async_runtime.rs
+//
 // Cooperative green-thread scheduler.
 // Provides a task-based concurrency model where async fn returns a Future,
 // await suspends the current task, and select waits for the first of N events.
 
-// ── Task state machine ─────────────────────────────────────────
+// ── Task State ─────────────────────────────────────────────
 
-// TaskState: "Ready", "Running", "Waiting", "Complete", "Failed"
+struct TaskState {
+    kind: string,    // "ready" | "running" | "waiting" | "complete" | "failed"
+    detail: string   // wait reason or error message
+}
 
-// WaitReason: "Future:ID", "Channel", "Timer:MS"
+fn task_state_ready() -> TaskState {
+    return TaskState { kind: "ready", detail: "" }
+}
 
-// ── Future ─────────────────────────────────────────────────────
+fn task_state_running() -> TaskState {
+    return TaskState { kind: "running", detail: "" }
+}
+
+fn task_state_waiting(reason: string) -> TaskState {
+    return TaskState { kind: "waiting", detail: reason }
+}
+
+fn task_state_complete() -> TaskState {
+    return TaskState { kind: "complete", detail: "" }
+}
+
+fn task_state_failed(msg: string) -> TaskState {
+    return TaskState { kind: "failed", detail: msg }
+}
+
+// ── Wait Reason helpers ────────────────────────────────────
+
+fn wait_future(task_id: int) -> string {
+    return "future:" + str(task_id)
+}
+
+fn wait_channel() -> string {
+    return "channel"
+}
+
+fn wait_timer(ms: int) -> string {
+    return "timer:" + str(ms)
+}
+
+// ── HexaFuture ─────────────────────────────────────────────
+// A future: a shared slot filled when a task completes.
 
 struct HexaFuture {
-    value: string,
+    value: string,         // "" while pending, serialized value when resolved
     resolved: bool,
     producer_task: int
 }
@@ -21,53 +58,63 @@ fn hexa_future_new(producer: int) -> HexaFuture {
     return HexaFuture { value: "", resolved: false, producer_task: producer }
 }
 
-fn hexa_future_resolve(self: HexaFuture, val: string) {
-    self.value = val
-    self.resolved = true
+fn hexa_future_resolve(fut: HexaFuture, val: string) -> HexaFuture {
+    return HexaFuture {
+        value: val,
+        resolved: true,
+        producer_task: fut.producer_task
+    }
 }
 
-fn hexa_future_poll(self: HexaFuture) -> string {
-    if self.resolved {
-        return self.value
+fn hexa_future_poll(fut: HexaFuture) -> string {
+    if fut.resolved {
+        return fut.value
     }
     return ""
 }
 
-fn hexa_future_is_resolved(self: HexaFuture) -> bool {
-    return self.resolved
+fn hexa_future_is_resolved(fut: HexaFuture) -> bool {
+    return fut.resolved
 }
 
-// ── Task ───────────────────────────────────────────────────────
+fn hexa_future_debug(fut: HexaFuture) -> string {
+    return "HexaFuture(task=" + str(fut.producer_task) + ", resolved=" + str(fut.resolved) + ")"
+}
+
+// ── Task ───────────────────────────────────────────────────
+// A green thread task: holds the function name, parameters, and state.
 
 struct Task {
     id: int,
-    state: string,
-    body: [string],
-    bindings: [TaskBinding],
-    captured_env: [TaskBinding],
-    future: HexaFuture,
+    state: TaskState,
+    func_name: string,
+    bindings: [string],     // flattened key-value pairs: [k1, v1, k2, v2, ...]
+    captured_env: [string], // flattened key-value pairs
     name: string
 }
 
-struct TaskBinding {
-    name: string,
-    value: string
+fn task_new(id: int, func_name: string, name: string) -> Task {
+    return Task {
+        id: id,
+        state: task_state_ready(),
+        func_name: func_name,
+        bindings: [],
+        captured_env: [],
+        name: name
+    }
 }
 
-// ── Scheduler ──────────────────────────────────────────────────
+// ── Scheduler ──────────────────────────────────────────────
+// Cooperative round-robin scheduler for green threads.
 
 struct Scheduler {
     next_id: int,
     ready_queue: [Task],
-    futures: [FutureEntry],
+    futures: [HexaFuture],      // indexed by task id
     started: bool,
-    shutdown: bool,
-    start_time: int
-}
-
-struct FutureEntry {
-    task_id: int,
-    future: HexaFuture
+    shutdown_flag: bool,
+    n_workers: int,
+    elapsed: int                // simulated elapsed ms
 }
 
 fn scheduler_new() -> Scheduler {
@@ -76,156 +123,227 @@ fn scheduler_new() -> Scheduler {
         ready_queue: [],
         futures: [],
         started: false,
-        shutdown: false,
-        start_time: 0
+        shutdown_flag: false,
+        n_workers: 0,
+        elapsed: 0
     }
 }
 
-fn scheduler_start(self: Scheduler, n_workers: int) {
-    if self.started { return }
-    self.started = true
-    // In full impl, spawn OS worker threads
-}
-
-fn scheduler_next_task_id(self: Scheduler) -> int {
-    let id = self.next_id
-    self.next_id = self.next_id + 1
-    return id
-}
-
-fn scheduler_spawn_task(self: Scheduler, name: string, body: [string], bindings: [TaskBinding], captured_env: [TaskBinding]) -> HexaFuture {
-    if self.started == false {
-        scheduler_start(self, 4)
+fn scheduler_start(sched: Scheduler, n_workers: int) -> Scheduler {
+    if sched.started {
+        return sched
     }
-
-    let id = scheduler_next_task_id(self)
-    let future = hexa_future_new(id)
-
-    // Register future
-    self.futures.push(FutureEntry { task_id: id, future: future })
-
-    let task = Task {
-        id: id,
-        state: "Ready",
-        body: body,
-        bindings: bindings,
-        captured_env: captured_env,
-        future: future,
-        name: name
+    return Scheduler {
+        next_id: sched.next_id,
+        ready_queue: sched.ready_queue,
+        futures: sched.futures,
+        started: true,
+        shutdown_flag: false,
+        n_workers: n_workers,
+        elapsed: sched.elapsed
     }
-
-    self.ready_queue.push(task)
-    return future
 }
 
-fn scheduler_await_future(self: Scheduler, future: HexaFuture, timeout_ms: int) -> string {
-    // In full impl, block until future is resolved or timeout
-    if future.resolved {
-        return future.value
+fn scheduler_next_id(sched: Scheduler) -> int {
+    return sched.next_id
+}
+
+fn scheduler_spawn_task(sched: Scheduler, name: string, func_name: string) -> Scheduler {
+    let id = sched.next_id
+    let fut = hexa_future_new(id)
+    let task = task_new(id, func_name, name)
+    // Append to queue and futures
+    let new_queue = sched.ready_queue
+    let new_futures = sched.futures
+    return Scheduler {
+        next_id: id + 1,
+        ready_queue: new_queue + [task],
+        futures: new_futures + [fut],
+        started: sched.started,
+        shutdown_flag: sched.shutdown_flag,
+        n_workers: sched.n_workers,
+        elapsed: sched.elapsed
     }
-    return ""
 }
 
-fn scheduler_poll_future(self: Scheduler, future: HexaFuture) -> string {
-    return hexa_future_poll(future)
+fn scheduler_get_future(sched: Scheduler, task_id: int) -> HexaFuture {
+    // Futures are stored at index (task_id - 1)
+    let idx = task_id - 1
+    if idx >= 0 && idx < len(sched.futures) {
+        return sched.futures[idx]
+    }
+    return hexa_future_new(0)
 }
 
-fn scheduler_shutdown(self: Scheduler) {
-    self.shutdown = true
-    // In full impl, join worker threads
+fn scheduler_poll_future(sched: Scheduler, task_id: int) -> string {
+    let fut = scheduler_get_future(sched, task_id)
+    return hexa_future_poll(fut)
 }
 
-fn scheduler_elapsed_ms(self: Scheduler) -> int {
-    // In full impl, compute from start_time
-    return 0
+fn scheduler_shutdown(sched: Scheduler) -> Scheduler {
+    return Scheduler {
+        next_id: sched.next_id,
+        ready_queue: [],
+        futures: sched.futures,
+        started: false,
+        shutdown_flag: true,
+        n_workers: 0,
+        elapsed: sched.elapsed
+    }
 }
 
-// ── Task Group (structured concurrency) ────────────────────────
+fn scheduler_elapsed_ms(sched: Scheduler) -> int {
+    return sched.elapsed
+}
+
+// ── TaskGroup (structured concurrency) ─────────────────────
+// A group of tasks that must all complete before a scope exits.
 
 struct TaskGroup {
-    futures: [HexaFuture]
+    task_ids: [int]
 }
 
 fn task_group_new() -> TaskGroup {
-    return TaskGroup { futures: [] }
+    return TaskGroup { task_ids: [] }
 }
 
-fn task_group_add(self: TaskGroup, future: HexaFuture) {
-    self.futures.push(future)
+fn task_group_add(group: TaskGroup, task_id: int) -> TaskGroup {
+    return TaskGroup { task_ids: group.task_ids + [task_id] }
 }
 
-struct TaskGroupResult {
-    values: [string],
-    error: string,
-    ok: bool
-}
-
-fn task_group_wait_all(self: TaskGroup, timeout_ms: int) -> TaskGroupResult {
-    let results = []
-    for fut in self.futures {
-        if fut.resolved == false {
-            // In full impl, block with timeout
-            return TaskGroupResult { values: [], error: "scope: task timed out", ok: false }
-        }
-        if fut.value == "Error" {
-            return TaskGroupResult { values: [], error: fut.value, ok: false }
-        }
-        results.push(fut.value)
-    }
-    return TaskGroupResult { values: results, error: "", ok: true }
-}
-
-fn task_group_cancel(self: TaskGroup) {
-    // In cooperative scheduler, tasks run to completion.
-    // Cancellation means we stop waiting for results.
-}
-
-// ── Select events ──────────────────────────────────────────────
-
-struct SelectEvent {
-    kind: string,
-    future: HexaFuture,
-    timeout_ms: int
-}
-
-struct SelectResult {
-    index: int,
-    value: string
-}
-
-fn scheduler_select(self: Scheduler, events: [SelectEvent]) -> SelectResult {
-    // Poll all events, return first that fires
+fn task_group_wait_all(group: TaskGroup, sched: Scheduler) -> [string] {
+    let results: [string] = []
     let i = 0
-    for event in events {
-        if event.kind == "Future" {
-            if event.future.resolved {
-                return SelectResult { index: i, value: event.future.value }
-            }
-        }
-        if event.kind == "Timeout" {
-            // In full impl, check elapsed time
-        }
+    while i < len(group.task_ids) {
+        let tid = group.task_ids[i]
+        let val = scheduler_poll_future(sched, tid)
+        results = results + [val]
         i = i + 1
     }
-    return SelectResult { index: 0, value: "" }
+    return results
 }
 
-// ── Timer ──────────────────────────────────────────────────────
-
-fn scheduler_timer(self: Scheduler, ms: int) -> HexaFuture {
-    let id = scheduler_next_task_id(self)
-    let future = hexa_future_new(id)
-    // In full impl, spawn a thread that sleeps then resolves
-    return future
+fn task_group_cancel(group: TaskGroup) {
+    // In cooperative scheduler, cancel means stop waiting
 }
 
-// ── Global scheduler ───────────────────────────────────────────
-
-let global_scheduler = scheduler_new()
-
-fn get_global_scheduler() -> Scheduler {
-    if global_scheduler.started == false {
-        scheduler_start(global_scheduler, 4)
-    }
-    return global_scheduler
+fn task_group_size(group: TaskGroup) -> int {
+    return len(group.task_ids)
 }
+
+// ── Select Event ───────────────────────────────────────────
+
+struct SelectEvent {
+    kind: string,    // "channel" | "future" | "timeout"
+    task_id: int,    // for future events
+    timeout_ms: int  // for timeout events
+}
+
+fn select_event_future(task_id: int) -> SelectEvent {
+    return SelectEvent { kind: "future", task_id: task_id, timeout_ms: 0 }
+}
+
+fn select_event_timeout(ms: int) -> SelectEvent {
+    return SelectEvent { kind: "timeout", task_id: 0, timeout_ms: ms }
+}
+
+fn select_event_channel() -> SelectEvent {
+    return SelectEvent { kind: "channel", task_id: 0, timeout_ms: 0 }
+}
+
+// ── Global scheduler singleton ─────────────────────────────
+
+let _global_scheduler = scheduler_new()
+
+fn global_scheduler() -> Scheduler {
+    return _global_scheduler
+}
+
+// ── Tests ──────────────────────────────────────────────────
+
+fn test_future_resolve_and_poll() {
+    let fut = hexa_future_new(1)
+    assert(hexa_future_poll(fut) == "")
+    let fut2 = hexa_future_resolve(fut, "42")
+    assert(hexa_future_poll(fut2) == "42")
+    assert(hexa_future_is_resolved(fut2) == true)
+    print("  PASS: future_resolve_and_poll")
+}
+
+fn test_task_state_transitions() {
+    let s = task_state_ready()
+    assert(s.kind == "ready")
+    let s2 = task_state_running()
+    assert(s2.kind == "running")
+    let s3 = task_state_waiting("future:1")
+    assert(s3.kind == "waiting")
+    assert(s3.detail == "future:1")
+    let s4 = task_state_complete()
+    assert(s4.kind == "complete")
+    let s5 = task_state_failed("oops")
+    assert(s5.kind == "failed")
+    assert(s5.detail == "oops")
+    print("  PASS: task_state_transitions")
+}
+
+fn test_scheduler_spawn() {
+    let sched = scheduler_new()
+    let sched2 = scheduler_start(sched, 4)
+    assert(sched2.started == true)
+    assert(sched2.n_workers == 4)
+    let sched3 = scheduler_spawn_task(sched2, "t1", "my_func")
+    assert(sched3.next_id == 2)
+    assert(len(sched3.ready_queue) == 1)
+    assert(len(sched3.futures) == 1)
+    print("  PASS: scheduler_spawn")
+}
+
+fn test_task_group() {
+    let group = task_group_new()
+    assert(task_group_size(group) == 0)
+    let group2 = task_group_add(group, 1)
+    let group3 = task_group_add(group2, 2)
+    assert(task_group_size(group3) == 2)
+    print("  PASS: task_group")
+}
+
+fn test_select_events() {
+    let e1 = select_event_future(5)
+    assert(e1.kind == "future")
+    assert(e1.task_id == 5)
+    let e2 = select_event_timeout(1000)
+    assert(e2.kind == "timeout")
+    assert(e2.timeout_ms == 1000)
+    let e3 = select_event_channel()
+    assert(e3.kind == "channel")
+    print("  PASS: select_events")
+}
+
+fn test_scheduler_shutdown() {
+    let sched = scheduler_start(scheduler_new(), 2)
+    let sched2 = scheduler_spawn_task(sched, "t1", "fn1")
+    let sched3 = scheduler_shutdown(sched2)
+    assert(sched3.shutdown_flag == true)
+    assert(sched3.started == false)
+    assert(len(sched3.ready_queue) == 0)
+    print("  PASS: scheduler_shutdown")
+}
+
+fn test_future_debug() {
+    let fut = hexa_future_new(42)
+    let s = hexa_future_debug(fut)
+    assert(s == "HexaFuture(task=42, resolved=false)")
+    print("  PASS: future_debug")
+}
+
+// ── Main ───────────────────────────────────────────────────
+
+print("=== async_runtime.hexa tests ===")
+test_future_resolve_and_poll()
+test_task_state_transitions()
+test_scheduler_spawn()
+test_task_group()
+test_select_events()
+test_scheduler_shutdown()
+test_future_debug()
+print("All async_runtime tests passed.")

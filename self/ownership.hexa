@@ -1,4 +1,5 @@
-// self/ownership.hexa — HEXA ownership analysis ported from src/ownership.rs
+// self/ownership.hexa — HEXA OWNERSHIP ported from src/ownership.rs
+//
 // Compile-time ownership analysis for Hexa.
 // Walks the AST before interpretation to detect ownership violations:
 //   - Use after move
@@ -7,13 +8,54 @@
 //   - Double drop
 //   - Borrow outliving owner scope
 
-// ── Ownership state ────────────────────────────────────────────
-// "Owned"       - fully owned
-// "Moved"       - ownership transferred away via move
-// "Borrowed:N"  - currently borrowed N times
-// "Dropped"     - explicitly dropped
+// ── Owner State ────────────────────────────────────────────
+// "owned" | "moved" | "borrowed:N" | "dropped"
 
-// ── Ownership error ────────────────────────────────────────────
+fn owner_state_owned() -> string {
+    return "owned"
+}
+
+fn owner_state_moved() -> string {
+    return "moved"
+}
+
+fn owner_state_borrowed(count: int) -> string {
+    return "borrowed:" + str(count)
+}
+
+fn owner_state_dropped() -> string {
+    return "dropped"
+}
+
+fn owner_state_is_owned(state: string) -> bool {
+    return state == "owned"
+}
+
+fn owner_state_is_moved(state: string) -> bool {
+    return state == "moved"
+}
+
+fn owner_state_is_dropped(state: string) -> bool {
+    return state == "dropped"
+}
+
+fn owner_state_is_borrowed(state: string) -> bool {
+    return len(state) > 9 && state[0] == "b"
+}
+
+fn owner_state_borrow_count(state: string) -> int {
+    if !owner_state_is_borrowed(state) {
+        return 0
+    }
+    // Parse the number after "borrowed:"
+    let parts = split(state, ":")
+    if len(parts) == 2 {
+        return int(parts[1])
+    }
+    return 0
+}
+
+// ── OwnershipError ─────────────────────────────────────────
 
 struct OwnershipError {
     message: string,
@@ -26,378 +68,417 @@ fn ownership_error_new(line: int, col: int, message: string) -> OwnershipError {
     return OwnershipError { message: message, line: line, col: col, hint: "" }
 }
 
-fn ownership_error_with_hint(self: OwnershipError, hint: string) -> OwnershipError {
-    self.hint = hint
-    return self
+fn ownership_error_with_hint(err: OwnershipError, hint: string) -> OwnershipError {
+    return OwnershipError {
+        message: err.message,
+        line: err.line,
+        col: err.col,
+        hint: hint
+    }
 }
 
-// ── Borrow info ────────────────────────────────────────────────
+fn ownership_error_display(err: OwnershipError) -> string {
+    let out = "ownership error at " + str(err.line) + ":" + str(err.col) + ": " + err.message
+    if err.hint != "" {
+        out = out + " (hint: " + err.hint + ")"
+    }
+    return out
+}
+
+// ── BorrowInfo ─────────────────────────────────────────────
 
 struct BorrowInfo {
     source: string,
     scope_depth: int
 }
 
-// ── Scope frame ────────────────────────────────────────────────
+// ── ScopeFrame ─────────────────────────────────────────────
+// Tracks variable ownership in a single scope.
 
 struct ScopeFrame {
-    vars: [VarState],
+    var_names: [string],
+    var_states: [string],
     borrows: [BorrowInfo]
 }
 
-struct VarState {
-    name: string,
-    state: string,
-    borrow_count: int
-}
-
 fn scope_frame_new() -> ScopeFrame {
-    return ScopeFrame { vars: [], borrows: [] }
+    return ScopeFrame {
+        var_names: [],
+        var_states: [],
+        borrows: []
+    }
 }
 
-// ── Ownership Analyzer ─────────────────────────────────────────
+fn scope_frame_define(frame: ScopeFrame, name: string, state: string) -> ScopeFrame {
+    return ScopeFrame {
+        var_names: frame.var_names + [name],
+        var_states: frame.var_states + [state],
+        borrows: frame.borrows
+    }
+}
+
+fn scope_frame_lookup(frame: ScopeFrame, name: string) -> string {
+    let i = len(frame.var_names) - 1
+    while i >= 0 {
+        if frame.var_names[i] == name {
+            return frame.var_states[i]
+        }
+        i = i - 1
+    }
+    return ""
+}
+
+fn scope_frame_set_state(frame: ScopeFrame, name: string, state: string) -> ScopeFrame {
+    let new_names: [string] = []
+    let new_states: [string] = []
+    let i = 0
+    while i < len(frame.var_names) {
+        new_names = new_names + [frame.var_names[i]]
+        if frame.var_names[i] == name {
+            new_states = new_states + [state]
+        } else {
+            new_states = new_states + [frame.var_states[i]]
+        }
+        i = i + 1
+    }
+    return ScopeFrame {
+        var_names: new_names,
+        var_states: new_states,
+        borrows: frame.borrows
+    }
+}
+
+fn scope_frame_add_borrow(frame: ScopeFrame, source: string, depth: int) -> ScopeFrame {
+    return ScopeFrame {
+        var_names: frame.var_names,
+        var_states: frame.var_states,
+        borrows: frame.borrows + [BorrowInfo { source: source, scope_depth: depth }]
+    }
+}
+
+// ── OwnershipAnalyzer ──────────────────────────────────────
 
 struct OwnershipAnalyzer {
     scopes: [ScopeFrame],
-    fn_decls: [string],
     errors: [OwnershipError]
 }
 
-fn ownership_analyzer_new() -> OwnershipAnalyzer {
-    let initial_scope = scope_frame_new()
+fn analyzer_new() -> OwnershipAnalyzer {
     return OwnershipAnalyzer {
-        scopes: [initial_scope],
-        fn_decls: [],
+        scopes: [scope_frame_new()],
         errors: []
     }
 }
 
-// ── Scope management ───────────────────────────────────────────
-
-fn analyzer_push_scope(self: OwnershipAnalyzer) {
-    self.scopes.push(scope_frame_new())
+fn analyzer_push_scope(a: OwnershipAnalyzer) -> OwnershipAnalyzer {
+    return OwnershipAnalyzer {
+        scopes: a.scopes + [scope_frame_new()],
+        errors: a.errors
+    }
 }
 
-fn analyzer_pop_scope(self: OwnershipAnalyzer, line: int, col: int) {
-    if self.scopes.length() == 0 { return }
-    let frame = self.scopes[self.scopes.length() - 1]
-
-    // Check for variables still borrowed when scope ends
-    for vs in frame.vars {
-        if vs.state == "Borrowed" && vs.borrow_count > 0 {
-            self.errors.push(ownership_error_with_hint(
-                ownership_error_new(line, col,
-                    "variable `" + vs.name + "` still has " + str(vs.borrow_count) + " active borrow(s) when scope ends"),
-                "borrows must be returned before the owner goes out of scope"
-            ))
-        }
+fn analyzer_pop_scope(a: OwnershipAnalyzer, line: int, col: int) -> OwnershipAnalyzer {
+    let n = len(a.scopes)
+    if n <= 1 {
+        return a
     }
+    let top = a.scopes[n - 1]
+    let new_errors = a.errors
 
-    // Release borrows from this scope
-    for bi in frame.borrows {
-        analyzer_release_borrow(self, bi.source)
-    }
-
-    // Pop the scope
-    let new_scopes = []
+    // Check for still-borrowed variables
     let i = 0
-    while i < self.scopes.length() - 1 {
-        new_scopes.push(self.scopes[i])
+    while i < len(top.var_names) {
+        let state = top.var_states[i]
+        if owner_state_is_borrowed(state) {
+            let count = owner_state_borrow_count(state)
+            if count > 0 {
+                let err = ownership_error_new(line, col,
+                    "variable `" + top.var_names[i] + "` still has " + str(count) + " active borrow(s) when scope ends")
+                new_errors = new_errors + [ownership_error_with_hint(err,
+                    "borrows must be returned before the owner goes out of scope")]
+            }
+        }
         i = i + 1
     }
-    self.scopes = new_scopes
+
+    // Remove top scope
+    let new_scopes: [ScopeFrame] = []
+    let j = 0
+    while j < n - 1 {
+        new_scopes = new_scopes + [a.scopes[j]]
+        j = j + 1
+    }
+    return OwnershipAnalyzer { scopes: new_scopes, errors: new_errors }
 }
 
-fn analyzer_scope_depth(self: OwnershipAnalyzer) -> int {
-    return self.scopes.length()
+fn analyzer_define_var(a: OwnershipAnalyzer, name: string, state: string) -> OwnershipAnalyzer {
+    let n = len(a.scopes)
+    if n == 0 { return a }
+    let new_scopes: [ScopeFrame] = []
+    let i = 0
+    while i < n - 1 {
+        new_scopes = new_scopes + [a.scopes[i]]
+        i = i + 1
+    }
+    new_scopes = new_scopes + [scope_frame_define(a.scopes[n - 1], name, state)]
+    return OwnershipAnalyzer { scopes: new_scopes, errors: a.errors }
 }
 
-// ── Variable state management ──────────────────────────────────
-
-fn analyzer_define_var(self: OwnershipAnalyzer, name: string, state: string) {
-    if self.scopes.length() == 0 { return }
-    let frame = self.scopes[self.scopes.length() - 1]
-    frame.vars.push(VarState { name: name, state: state, borrow_count: 0 })
-}
-
-fn analyzer_lookup_state(self: OwnershipAnalyzer, name: string) -> VarState {
-    let i = self.scopes.length() - 1
+fn analyzer_lookup_state(a: OwnershipAnalyzer, name: string) -> string {
+    let i = len(a.scopes) - 1
     while i >= 0 {
-        for vs in self.scopes[i].vars {
-            if vs.name == name {
-                return vs
-            }
+        let result = scope_frame_lookup(a.scopes[i], name)
+        if result != "" {
+            return result
         }
         i = i - 1
     }
-    return VarState { name: "", state: "", borrow_count: 0 }
+    return ""
 }
 
-fn analyzer_set_state(self: OwnershipAnalyzer, name: string, state: string) {
-    let i = self.scopes.length() - 1
+fn analyzer_set_state(a: OwnershipAnalyzer, name: string, state: string) -> OwnershipAnalyzer {
+    let new_scopes: [ScopeFrame] = []
+    let found = false
+    let i = len(a.scopes) - 1
+    // Find which scope has the var and update it
     while i >= 0 {
-        for vs in self.scopes[i].vars {
-            if vs.name == name {
-                vs.state = state
-                return
-            }
-        }
-        i = i - 1
-    }
-}
-
-fn analyzer_is_tracked(self: OwnershipAnalyzer, name: string) -> bool {
-    let vs = analyzer_lookup_state(self, name)
-    return vs.name != ""
-}
-
-// ── Borrow management ──────────────────────────────────────────
-
-fn analyzer_add_borrow(self: OwnershipAnalyzer, source: string) {
-    let i = self.scopes.length() - 1
-    while i >= 0 {
-        for vs in self.scopes[i].vars {
-            if vs.name == source {
-                if vs.state == "Owned" {
-                    vs.state = "Borrowed"
-                    vs.borrow_count = 1
-                } else {
-                    if vs.state == "Borrowed" {
-                        vs.borrow_count = vs.borrow_count + 1
-                    }
-                }
-                return
-            }
-        }
-        i = i - 1
-    }
-}
-
-fn analyzer_record_borrow(self: OwnershipAnalyzer, source: string) {
-    let depth = analyzer_scope_depth(self)
-    if self.scopes.length() == 0 { return }
-    let frame = self.scopes[self.scopes.length() - 1]
-    frame.borrows.push(BorrowInfo { source: source, scope_depth: depth })
-}
-
-fn analyzer_release_borrow(self: OwnershipAnalyzer, source: string) {
-    let i = self.scopes.length() - 1
-    while i >= 0 {
-        for vs in self.scopes[i].vars {
-            if vs.name == source {
-                if vs.state == "Borrowed" {
-                    if vs.borrow_count > 1 {
-                        vs.borrow_count = vs.borrow_count - 1
-                    } else {
-                        vs.state = "Owned"
-                        vs.borrow_count = 0
-                    }
-                }
-                return
-            }
-        }
-        i = i - 1
-    }
-}
-
-// ── Move analysis ──────────────────────────────────────────────
-
-fn analyzer_analyze_move(self: OwnershipAnalyzer, source: string, target: string, line: int, col: int) {
-    let vs = analyzer_lookup_state(self, source)
-    if vs.name == "" {
-        analyzer_define_var(self, target, "Owned")
-        return
-    }
-
-    if vs.state == "Moved" {
-        self.errors.push(ownership_error_with_hint(
-            ownership_error_new(line, col, "cannot use `" + source + "` after move"),
-            "value was previously moved out of `" + source + "`"
-        ))
-        return
-    }
-    if vs.state == "Dropped" {
-        self.errors.push(ownership_error_with_hint(
-            ownership_error_new(line, col, "cannot use `" + source + "` after drop"),
-            "`" + source + "` was explicitly dropped"
-        ))
-        return
-    }
-    if vs.state == "Borrowed" && vs.borrow_count > 0 {
-        self.errors.push(ownership_error_with_hint(
-            ownership_error_new(line, col, "cannot move `" + source + "` while borrowed"),
-            "`" + source + "` has " + str(vs.borrow_count) + " active borrow(s)"
-        ))
-        return
-    }
-
-    // Valid move
-    analyzer_set_state(self, source, "Moved")
-    analyzer_define_var(self, target, "Owned")
-}
-
-// ── Borrow analysis ────────────────────────────────────────────
-
-fn analyzer_analyze_borrow(self: OwnershipAnalyzer, source: string, target: string, line: int, col: int) {
-    let vs = analyzer_lookup_state(self, source)
-    if vs.name == "" { return }
-
-    if vs.state == "Moved" {
-        self.errors.push(
-            ownership_error_new(line, col, "cannot borrow `" + source + "`: value has been moved")
-        )
-        return
-    }
-    if vs.state == "Dropped" {
-        self.errors.push(
-            ownership_error_new(line, col, "cannot borrow `" + source + "`: value has been dropped")
-        )
-        return
-    }
-
-    analyzer_add_borrow(self, source)
-    analyzer_record_borrow(self, source)
-}
-
-// ── Drop analysis ──────────────────────────────────────────────
-
-fn analyzer_analyze_drop(self: OwnershipAnalyzer, name: string, line: int, col: int) {
-    let vs = analyzer_lookup_state(self, name)
-    if vs.name == "" {
-        analyzer_define_var(self, name, "Dropped")
-        return
-    }
-
-    if vs.state == "Moved" {
-        self.errors.push(ownership_error_with_hint(
-            ownership_error_new(line, col, "cannot drop `" + name + "`: value has been moved"),
-            "`" + name + "` was previously moved"
-        ))
-        return
-    }
-    if vs.state == "Dropped" {
-        self.errors.push(ownership_error_with_hint(
-            ownership_error_new(line, col, "cannot drop `" + name + "` -- already dropped"),
-            "each value can only be dropped once"
-        ))
-        return
-    }
-    if vs.state == "Borrowed" && vs.borrow_count > 0 {
-        self.errors.push(ownership_error_with_hint(
-            ownership_error_new(line, col,
-                "cannot drop `" + name + "` while it has " + str(vs.borrow_count) + " active borrow(s)"),
-            "release all borrows before dropping"
-        ))
-        return
-    }
-
-    analyzer_set_state(self, name, "Dropped")
-}
-
-// ── Check expression use ───────────────────────────────────────
-
-fn analyzer_check_expr_use(self: OwnershipAnalyzer, name: string, line: int, col: int) {
-    let vs = analyzer_lookup_state(self, name)
-    if vs.name == "" { return }
-
-    if vs.state == "Moved" {
-        self.errors.push(ownership_error_with_hint(
-            ownership_error_new(line, col, "cannot use `" + name + "` after move"),
-            "value was moved out of `" + name + "`"
-        ))
-    }
-    if vs.state == "Dropped" {
-        self.errors.push(ownership_error_with_hint(
-            ownership_error_new(line, col, "cannot use `" + name + "` after drop"),
-            "`" + name + "` was explicitly dropped"
-        ))
-    }
-}
-
-// ── Assign check ───────────────────────────────────────────────
-
-fn analyzer_check_assign(self: OwnershipAnalyzer, name: string, line: int, col: int) {
-    let vs = analyzer_lookup_state(self, name)
-    if vs.name == "" { return }
-
-    if vs.state == "Moved" {
-        self.errors.push(ownership_error_with_hint(
-            ownership_error_new(line, col, "cannot assign to `" + name + "`: value has been moved"),
-            "consider creating a new binding instead"
-        ))
-    }
-    if vs.state == "Dropped" {
-        self.errors.push(
-            ownership_error_new(line, col, "cannot assign to `" + name + "`: value has been dropped")
-        )
-    }
-    if vs.state == "Borrowed" && vs.borrow_count > 0 {
-        self.errors.push(ownership_error_with_hint(
-            ownership_error_new(line, col, "cannot mutate `" + name + "`: value is borrowed (read-only)"),
-            "wait for all borrows to be released before mutating"
-        ))
-    }
-}
-
-// ── Full analysis entry point ──────────────────────────────────
-
-fn analyzer_analyze(self: OwnershipAnalyzer, stmt_kinds: [StmtOwnerInfo]) -> [OwnershipError] {
-    // First pass: collect function declarations
-    for info in stmt_kinds {
-        if info.kind == "FnDecl" {
-            self.fn_decls.push(info.name)
-        }
-    }
-
-    // Second pass: analyze statements
-    for info in stmt_kinds {
-        analyzer_analyze_stmt_info(self, info)
-    }
-
-    return self.errors
-}
-
-struct StmtOwnerInfo {
-    kind: string,
-    name: string,
-    line: int,
-    col: int,
-    source: string,
-    is_own: bool,
-    is_move: bool,
-    is_borrow: bool
-}
-
-fn analyzer_analyze_stmt_info(self: OwnershipAnalyzer, info: StmtOwnerInfo) {
-    if info.kind == "Let" {
-        if info.is_own {
-            analyzer_define_var(self, info.name, "Owned")
+        let result = scope_frame_lookup(a.scopes[i], name)
+        if result != "" && !found {
+            new_scopes = [scope_frame_set_state(a.scopes[i], name, state)] + new_scopes
+            found = true
         } else {
-            if info.is_move {
-                analyzer_analyze_move(self, info.source, info.name, info.line, info.col)
-            } else {
-                if info.is_borrow {
-                    analyzer_analyze_borrow(self, info.source, info.name, info.line, info.col)
-                }
-            }
+            new_scopes = [a.scopes[i]] + new_scopes
         }
-        return
+        i = i - 1
     }
-
-    if info.kind == "Assign" {
-        analyzer_check_assign(self, info.name, info.line, info.col)
-        return
+    if !found {
+        return a
     }
+    return OwnershipAnalyzer { scopes: new_scopes, errors: a.errors }
+}
 
-    if info.kind == "Drop" {
-        analyzer_analyze_drop(self, info.name, info.line, info.col)
-        return
-    }
-
-    if info.kind == "Return" {
-        if info.source != "" {
-            analyzer_check_expr_use(self, info.source, info.line, info.col)
-        }
-        return
+fn analyzer_add_error(a: OwnershipAnalyzer, err: OwnershipError) -> OwnershipAnalyzer {
+    return OwnershipAnalyzer {
+        scopes: a.scopes,
+        errors: a.errors + [err]
     }
 }
+
+// ── High-level analysis functions ──────────────────────────
+
+fn analyze_use_after_move(a: OwnershipAnalyzer, name: string, line: int, col: int) -> OwnershipAnalyzer {
+    let state = analyzer_lookup_state(a, name)
+    if state == "moved" {
+        let err = ownership_error_new(line, col, "cannot use `" + name + "` after move")
+        return analyzer_add_error(a, ownership_error_with_hint(err, "value was moved out of `" + name + "`"))
+    }
+    if state == "dropped" {
+        let err = ownership_error_new(line, col, "cannot use `" + name + "` after drop")
+        return analyzer_add_error(a, ownership_error_with_hint(err, "`" + name + "` was explicitly dropped"))
+    }
+    return a
+}
+
+fn analyze_move(a: OwnershipAnalyzer, source: string, target: string, line: int, col: int) -> OwnershipAnalyzer {
+    let state = analyzer_lookup_state(a, source)
+    if state == "moved" {
+        let err = ownership_error_new(line, col, "cannot use `" + source + "` after move")
+        return analyzer_add_error(a, ownership_error_with_hint(err, "value was previously moved out of `" + source + "`"))
+    }
+    if state == "dropped" {
+        let err = ownership_error_new(line, col, "cannot use `" + source + "` after drop")
+        return analyzer_add_error(a, ownership_error_with_hint(err, "`" + source + "` was explicitly dropped"))
+    }
+    if owner_state_is_borrowed(state) {
+        let count = owner_state_borrow_count(state)
+        if count > 0 {
+            let err = ownership_error_new(line, col, "cannot move `" + source + "` while borrowed")
+            return analyzer_add_error(a, ownership_error_with_hint(err, "`" + source + "` has " + str(count) + " active borrow(s)"))
+        }
+    }
+    // Valid move
+    let a2 = analyzer_set_state(a, source, "moved")
+    return analyzer_define_var(a2, target, "owned")
+}
+
+fn analyze_borrow(a: OwnershipAnalyzer, source: string, line: int, col: int) -> OwnershipAnalyzer {
+    let state = analyzer_lookup_state(a, source)
+    if state == "moved" {
+        let err = ownership_error_new(line, col, "cannot borrow `" + source + "`: value has been moved")
+        return analyzer_add_error(a, err)
+    }
+    if state == "dropped" {
+        let err = ownership_error_new(line, col, "cannot borrow `" + source + "`: value has been dropped")
+        return analyzer_add_error(a, err)
+    }
+    // Increment borrow count
+    if state == "owned" {
+        return analyzer_set_state(a, source, owner_state_borrowed(1))
+    }
+    if owner_state_is_borrowed(state) {
+        let count = owner_state_borrow_count(state)
+        return analyzer_set_state(a, source, owner_state_borrowed(count + 1))
+    }
+    return a
+}
+
+fn analyze_drop(a: OwnershipAnalyzer, name: string, line: int, col: int) -> OwnershipAnalyzer {
+    let state = analyzer_lookup_state(a, name)
+    if state == "moved" {
+        let err = ownership_error_new(line, col, "cannot drop `" + name + "`: value has been moved")
+        return analyzer_add_error(a, ownership_error_with_hint(err, "`" + name + "` was previously moved"))
+    }
+    if state == "dropped" {
+        let err = ownership_error_new(line, col, "cannot drop `" + name + "` -- already dropped")
+        return analyzer_add_error(a, ownership_error_with_hint(err, "each value can only be dropped once"))
+    }
+    if owner_state_is_borrowed(state) {
+        let count = owner_state_borrow_count(state)
+        if count > 0 {
+            let err = ownership_error_new(line, col, "cannot drop `" + name + "` while it has " + str(count) + " active borrow(s)")
+            return analyzer_add_error(a, ownership_error_with_hint(err, "release all borrows before dropping"))
+        }
+    }
+    if state != "" {
+        return analyzer_set_state(a, name, "dropped")
+    }
+    return analyzer_define_var(a, name, "dropped")
+}
+
+fn analyze_assign_to_moved(a: OwnershipAnalyzer, name: string, line: int, col: int) -> OwnershipAnalyzer {
+    let state = analyzer_lookup_state(a, name)
+    if state == "moved" {
+        let err = ownership_error_new(line, col, "cannot assign to `" + name + "`: value has been moved")
+        return analyzer_add_error(a, ownership_error_with_hint(err, "consider creating a new binding instead"))
+    }
+    if state == "dropped" {
+        let err = ownership_error_new(line, col, "cannot assign to `" + name + "`: value has been dropped")
+        return analyzer_add_error(a, err)
+    }
+    if owner_state_is_borrowed(state) {
+        let err = ownership_error_new(line, col, "cannot mutate `" + name + "`: value is borrowed (read-only)")
+        return analyzer_add_error(a, ownership_error_with_hint(err, "wait for all borrows to be released before mutating"))
+    }
+    return a
+}
+
+// ── Public API ─────────────────────────────────────────────
+
+fn analyze_ownership(operations: [string]) -> [OwnershipError] {
+    // operations is a flattened list: [op, name, ...]
+    // ops: "own:NAME", "move:SRC:TGT", "borrow:SRC", "drop:NAME", "use:NAME"
+    let a = analyzer_new()
+    let i = 0
+    while i < len(operations) {
+        let op = operations[i]
+        let parts = split(op, ":")
+        let cmd = parts[0]
+        if cmd == "own" && len(parts) >= 2 {
+            a = analyzer_define_var(a, parts[1], "owned")
+        } else if cmd == "move" && len(parts) >= 3 {
+            a = analyze_move(a, parts[1], parts[2], i, 0)
+        } else if cmd == "borrow" && len(parts) >= 2 {
+            a = analyze_borrow(a, parts[1], i, 0)
+        } else if cmd == "drop" && len(parts) >= 2 {
+            a = analyze_drop(a, parts[1], i, 0)
+        } else if cmd == "use" && len(parts) >= 2 {
+            a = analyze_use_after_move(a, parts[1], i, 0)
+        }
+        i = i + 1
+    }
+    return a.errors
+}
+
+fn analyzer_error_count(a: OwnershipAnalyzer) -> int {
+    return len(a.errors)
+}
+
+// ── Tests ──────────────────────────────────────────────────
+
+fn test_basic_own_and_use() {
+    let a = analyzer_new()
+    let a2 = analyzer_define_var(a, "x", "owned")
+    assert(analyzer_lookup_state(a2, "x") == "owned")
+    let a3 = analyze_use_after_move(a2, "x", 1, 0)
+    assert(len(a3.errors) == 0)
+    print("  PASS: basic_own_and_use")
+}
+
+fn test_use_after_move() {
+    let errors = analyze_ownership(["own:x", "move:x:y", "use:x"])
+    assert(len(errors) == 1)
+    assert(errors[0].message == "cannot use `x` after move")
+    print("  PASS: use_after_move")
+}
+
+fn test_use_after_drop() {
+    let errors = analyze_ownership(["own:x", "drop:x", "use:x"])
+    assert(len(errors) == 1)
+    assert(errors[0].message == "cannot use `x` after drop")
+    print("  PASS: use_after_drop")
+}
+
+fn test_double_drop() {
+    let errors = analyze_ownership(["own:x", "drop:x", "drop:x"])
+    assert(len(errors) == 1)
+    assert(errors[0].message == "cannot drop `x` -- already dropped")
+    print("  PASS: double_drop")
+}
+
+fn test_move_while_borrowed() {
+    let errors = analyze_ownership(["own:x", "borrow:x", "move:x:y"])
+    assert(len(errors) == 1)
+    assert(errors[0].message == "cannot move `x` while borrowed")
+    print("  PASS: move_while_borrowed")
+}
+
+fn test_borrow_after_move() {
+    let errors = analyze_ownership(["own:x", "move:x:y", "borrow:x"])
+    assert(len(errors) == 1)
+    assert(errors[0].message == "cannot borrow `x`: value has been moved")
+    print("  PASS: borrow_after_move")
+}
+
+fn test_valid_move_chain() {
+    let errors = analyze_ownership(["own:x", "move:x:y", "use:y"])
+    assert(len(errors) == 0)
+    print("  PASS: valid_move_chain")
+}
+
+fn test_no_errors_for_clean_code() {
+    let errors = analyze_ownership(["own:a", "use:a", "own:b", "use:b", "drop:a", "drop:b"])
+    assert(len(errors) == 0)
+    print("  PASS: no_errors_for_clean_code")
+}
+
+fn test_scope_push_pop() {
+    let a = analyzer_new()
+    let a2 = analyzer_push_scope(a)
+    assert(len(a2.scopes) == 2)
+    let a3 = analyzer_pop_scope(a2, 0, 0)
+    assert(len(a3.scopes) == 1)
+    print("  PASS: scope_push_pop")
+}
+
+fn test_ownership_error_display() {
+    let err = ownership_error_new(10, 5, "test error")
+    let err2 = ownership_error_with_hint(err, "try this")
+    let s = ownership_error_display(err2)
+    assert(len(s) > 0)
+    print("  PASS: ownership_error_display")
+}
+
+// ── Main ───────────────────────────────────────────────────
+
+print("=== ownership.hexa tests ===")
+test_basic_own_and_use()
+test_use_after_move()
+test_use_after_drop()
+test_double_drop()
+test_move_while_borrowed()
+test_borrow_after_move()
+test_valid_move_chain()
+test_no_errors_for_clean_code()
+test_scope_push_pop()
+test_ownership_error_display()
+print("All ownership tests passed.")
