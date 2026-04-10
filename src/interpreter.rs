@@ -18,6 +18,70 @@ use crate::proof_engine;
 use crate::type_checker::SpecKey;
 use crate::inline_cache::{InlineCache, CallSiteId};
 
+// ---------------------------------------------------------------------------
+// @symbolic PoC (Phase 1): algebraic rewrite on function bodies.
+// Single rule: Binary(x, Mul, IntLit(2)) -> Binary(x, Add, x)
+// ---------------------------------------------------------------------------
+pub(crate) fn symbolic_rewrite_expr(e: &mut Expr) {
+    // Post-order: recurse into children first, then apply the rule at this node.
+    match e {
+        Expr::Binary(l, _op, r) => {
+            symbolic_rewrite_expr(l);
+            symbolic_rewrite_expr(r);
+        }
+        Expr::Unary(_, x) => symbolic_rewrite_expr(x),
+        Expr::Call(f, args) => {
+            symbolic_rewrite_expr(f);
+            for a in args.iter_mut() { symbolic_rewrite_expr(a); }
+        }
+        Expr::Lambda(_, body) => symbolic_rewrite_expr(body),
+        Expr::Array(xs) | Expr::Tuple(xs) => {
+            for x in xs.iter_mut() { symbolic_rewrite_expr(x); }
+        }
+        Expr::Field(x, _) => symbolic_rewrite_expr(x),
+        Expr::Index(a, i) => { symbolic_rewrite_expr(a); symbolic_rewrite_expr(i); }
+        Expr::If(c, t, el) => {
+            symbolic_rewrite_expr(c);
+            for s in t.iter_mut() { symbolic_rewrite_stmt(s); }
+            if let Some(eb) = el { for s in eb.iter_mut() { symbolic_rewrite_stmt(s); } }
+        }
+        Expr::Block(b) => { for s in b.iter_mut() { symbolic_rewrite_stmt(s); } }
+        Expr::Range(a, b, _) => { symbolic_rewrite_expr(a); symbolic_rewrite_expr(b); }
+        _ => {}
+    }
+    // Apply the single Phase-1 rule at this node.
+    if let Expr::Binary(lhs, BinOp::Mul, rhs) = e {
+        if let Expr::IntLit(2) = **rhs {
+            let x = (**lhs).clone();
+            *e = Expr::Binary(Box::new(x.clone()), BinOp::Add, Box::new(x));
+        }
+    }
+}
+
+pub(crate) fn symbolic_rewrite_stmt(s: &mut Stmt) {
+    match s {
+        Stmt::Let(_, _, Some(e), _) => symbolic_rewrite_expr(e),
+        Stmt::LetTuple(_, e) => symbolic_rewrite_expr(e),
+        Stmt::Const(_, _, e, _) => symbolic_rewrite_expr(e),
+        Stmt::Static(_, _, e, _) => symbolic_rewrite_expr(e),
+        Stmt::Assign(l, r) => { symbolic_rewrite_expr(l); symbolic_rewrite_expr(r); }
+        Stmt::Expr(e) => symbolic_rewrite_expr(e),
+        Stmt::Return(Some(e)) => symbolic_rewrite_expr(e),
+        Stmt::For(_, iter, body) => {
+            symbolic_rewrite_expr(iter);
+            for st in body.iter_mut() { symbolic_rewrite_stmt(st); }
+        }
+        Stmt::While(c, body) => {
+            symbolic_rewrite_expr(c);
+            for st in body.iter_mut() { symbolic_rewrite_stmt(st); }
+        }
+        Stmt::Loop(body) => {
+            for st in body.iter_mut() { symbolic_rewrite_stmt(st); }
+        }
+        _ => {}
+    }
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 extern "C" {
     fn cblas_dgemm(order: i32, transA: i32, transB: i32,
@@ -717,6 +781,21 @@ impl Interpreter {
                 Ok(Value::Void)
             }
             Stmt::FnDecl(decl) => {
+                // AI-native @symbolic: algebraic simplification PoC (Phase 1, single rule)
+                // Rule: Binary(x, Mul, IntLit(2)) => Binary(x, Add, x)
+                // Apply transform to a clone of the body before any downstream registration.
+                let has_symbolic = decl.attrs.iter().any(|a| matches!(a.kind, crate::token::AttrKind::Symbolic));
+                let __sym_decl_owned;
+                let decl: &crate::ast::FnDecl = if has_symbolic {
+                    let mut cloned = decl.clone();
+                    for stmt in cloned.body.iter_mut() {
+                        crate::interpreter::symbolic_rewrite_stmt(stmt);
+                    }
+                    __sym_decl_owned = cloned;
+                    &__sym_decl_owned
+                } else {
+                    decl
+                };
                 // AI-native @optimize: detect and replace algorithm
                 let has_optimize = decl.attrs.iter().any(|a| matches!(a.kind, crate::token::AttrKind::Optimize));
                 if has_optimize {
@@ -9658,7 +9737,7 @@ impl Interpreter {
                         unsafe {
                             cblas_sgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_TRANS,
                                 1, seq_len as i32, r as i32,
-                                (1.0 / (r as f32).sqrt()), q_buf.as_ptr(), r as i32,
+                                1.0 / (r as f32).sqrt(), q_buf.as_ptr(), r as i32,
                                 state.k_cache[l].as_ptr(), r as i32,
                                 0.0, scores.as_mut_ptr(), seq_len as i32);
                         }

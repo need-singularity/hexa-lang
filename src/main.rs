@@ -9,8 +9,6 @@ mod error;
 #[allow(dead_code)]
 mod parser;
 #[allow(dead_code)]
-mod types;
-#[allow(dead_code)]
 mod env;
 #[allow(dead_code)]
 mod interpreter;

@@ -148,6 +148,11 @@ pub enum AttrKind {
     Prefetch,           // @prefetch — memory prefetch hint
     Align,              // @align — data alignment (tag only; parameter TBD)
     Const,              // @const — compile-time evaluation
+    Contract,           // @contract — pre/postcondition verification (bounds elim 3x)
+    Symbolic,           // @symbolic — algebraic optimization (stub)
+    Approximate,        // @approximate — Newton/Taylor approximation (stub)
+    Specialize,         // @specialize — V8-style monomorphism IC (stub)
+    SpeculativeDecode,  // @speculative_decode — LLM speculative decoding (stub)
     // Semantics
     Evolve,             // @evolve — self-modifying
     Test,               // @test — test function
@@ -180,6 +185,11 @@ impl AttrKind {
             "prefetch" => AttrKind::Prefetch,
             "align" => AttrKind::Align,
             "const" => AttrKind::Const,
+            "contract" => AttrKind::Contract,
+            "symbolic" => AttrKind::Symbolic,
+            "approximate" => AttrKind::Approximate,
+            "specialize" => AttrKind::Specialize,
+            "speculative_decode" => AttrKind::SpeculativeDecode,
             "evolve" => AttrKind::Evolve,
             "test" => AttrKind::Test,
             "bench" => AttrKind::Bench,

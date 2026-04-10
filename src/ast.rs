@@ -2,10 +2,13 @@
 #[derive(Debug, Clone)]
 pub struct Attribute {
     pub kind: crate::token::AttrKind,
+    /// key:expr pairs from @attr(key1: expr1, key2: expr2) form (e.g. @contract(requires: x>0))
+    pub args: Vec<(String, Expr)>,
 }
 
 impl Attribute {
-    pub fn new(kind: crate::token::AttrKind) -> Self { Self { kind } }
+    pub fn new(kind: crate::token::AttrKind) -> Self { Self { kind, args: Vec::new() } }
+    pub fn with_args(kind: crate::token::AttrKind, args: Vec<(String, Expr)>) -> Self { Self { kind, args } }
 }
 
 pub fn has_attr(attrs: &[Attribute], check: fn(&crate::token::AttrKind) -> bool) -> bool {

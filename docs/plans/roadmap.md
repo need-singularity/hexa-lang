@@ -3,6 +3,35 @@
 > 자동 갱신: 돌파/개선 작업 완료 시 다음 벡터를 여기에 추가.
 > 완료된 항목은 [x]로 체크하고 docs/history/에 기록.
 
+## 2026-04-10 통합 사이클 (SSOT + AI-native gap 해제)
+
+단일 진실 디렉토리 정비 + CLAUDE.md 압축 + AI-native 24 attrs 토큰 레벨 완전 등록 + P6-2 탈-Rust 분석.
+
+- [x] **INT-1 shared/hexa-lang/ SSOT** — state.json + ai-native.json + grammar.jsonl 단일 진실 디렉토리 신설
+- [x] **INT-2 CLAUDE.md 압축** — 17→12줄, ref 9→3+api, AI-native 1급 시민 명시 (R14 참조만)
+- [x] **INT-3 grammar.jsonl 통합** — 311줄 / 454KB, 문법+pitfalls P1~P5 단일화
+- [x] **INT-4 AI-native 24 gap 감사** — 실제 19/24 발견, 미구현 5종 모두 stub_registered 처리
+- [x] **INT-5 @contract 토큰 enum + parser 매핑** — cargo check OK, 의미론은 stub
+- [x] **INT-6 레거시 정리** — broken symlink/grammar_issues 즉삭, 4 파일 archive, shared/convergence/ 제거
+- [x] **5 attrs token.rs enum 등록** — @contract @symbolic @approximate @specialize @speculative_decode 전부 파서 도달 가능
+- [x] **P6-2 Rust src/ 제거 분석** — Stage 1~5 계획 수립, Stage 1-3 권장 (~70% 제거 가능)
+- [x] **@contract 의미론 PoC 설계** — Option A (parser desugar) 권장, ~300 LOC 범위 산출
+- [x] **.hx/bin shim 가짜 success 이슈 발견** — feedback 메모리 저장 (회귀 방지)
+
+### P6-2 Rust src/ 제거 스테이지
+
+| Stage | 범위 | 난이도 | 제거율 | 권장 |
+|---|---|---|---:|---|
+| 1 | stdlib·AI-native attrs 순수 .hexa 이관 | 낮음 | ~20% | ✅ |
+| 2 | Parser/AST 셀프호스팅 라인 교체 | 중 | ~40% | ✅ |
+| 3 | Interpreter 코어 포팅 (Value/Env/dispatch) | 중상 | ~70% | ✅ |
+| 4 | VM/JIT 백엔드 .hexa 이관 | 높음 | ~90% | ⏸ 후속 |
+| 5 | FFI/OS 부트스트랩 최소 shim까지 축소 | 매우 높음 | ~98% | ⏸ 후속 |
+
+### 다음 마일스톤
+- [ ] **@contract Option A (parser desugar)** — ~300 LOC, require/ensures → runtime check 삽입, 의미론 활성화
+- [ ] P6-2 Stage 1 착수 — stdlib/ai-native attrs .hexa 이관
+
 ## 🚀 CPU AI-Native LLM 특이점 (2026-04-09 진행 중)
 
 > 설계: `docs/superpowers/specs/2026-04-09-cpu-ai-native-physical-limits-design.md`

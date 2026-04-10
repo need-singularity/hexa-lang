@@ -271,6 +271,7 @@ impl Parser {
                 while let Token::Attribute(ref attr_name) = self.peek().clone() {
                     let name_str = attr_name.to_string();
                     self.advance();
+                    let mut attr_args: Vec<(String, crate::ast::Expr)> = Vec::new();
                     let kind = if matches!(self.peek(), Token::LParen) {
                         self.advance(); // (
                         match name_str.as_str() {
@@ -299,15 +300,33 @@ impl Parser {
                                 crate::token::AttrKind::Deprecated(msg)
                             }
                             _ => {
-                                while !matches!(self.peek(), Token::RParen | Token::Eof) { self.advance(); }
-                                self.expect(&Token::RParen)?;
-                                crate::token::AttrKind::Custom(name_str.clone())
+                                // Try key:expr, key:expr, ... form (e.g. @contract(requires: x>0, ensures: r>0))
+                                if matches!(self.peek(), Token::Ident(_))
+                                    && matches!(self.peek_ahead(1), Token::Colon)
+                                {
+                                    loop {
+                                        let key = self.expect_ident()?;
+                                        self.expect(&Token::Colon)?;
+                                        let val = self.parse_expr()?;
+                                        attr_args.push((key, val));
+                                        if matches!(self.peek(), Token::Comma) {
+                                            self.advance();
+                                            continue;
+                                        }
+                                        break;
+                                    }
+                                    self.expect(&Token::RParen)?;
+                                } else {
+                                    while !matches!(self.peek(), Token::RParen | Token::Eof) { self.advance(); }
+                                    self.expect(&Token::RParen)?;
+                                }
+                                crate::token::AttrKind::from_name(&name_str)
                             }
                         }
                     } else {
                         crate::token::AttrKind::from_name(&name_str)
                     };
-                    attrs.push(Attribute::new(kind));
+                    attrs.push(Attribute::with_args(kind, attr_args));
                     self.skip_newlines();
                 }
                 // Store attrs for next declaration to consume
@@ -1261,10 +1280,33 @@ impl Parser {
         let (where_clauses, precondition) = self.parse_where_or_precondition()?;
         // Parse optional ensures clause: postcondition expression
         let postcondition = self.parse_ensures_clause()?;
-        let body = self.parse_block()?;
+        let mut body = self.parse_block()?;
         let attrs = self.take_attrs();
         let is_evolve = attrs.iter().any(|a| matches!(a.kind, crate::token::AttrKind::Evolve));
         let is_pure = attrs.iter().any(|a| matches!(a.kind, crate::token::AttrKind::Pure));
+        // @contract Option A — parser desugar (phase 1):
+        //  - requires: prepend `assert(expr)` at function entry
+        //  - ensures:  append `assert(expr)` at function body end
+        //  NOTE phase 1 단순화: ensures는 body 끝에만 삽입되므로 이른 return 경로에서는 검사 누락.
+        //  phase 2에서 return 재작성 + result 바인딩 처리 예정.
+        for a in attrs.iter() {
+            if !matches!(a.kind, crate::token::AttrKind::Contract) { continue; }
+            let mut prepend: Vec<Stmt> = Vec::new();
+            let mut append: Vec<Stmt> = Vec::new();
+            for (key, expr) in a.args.iter() {
+                match key.as_str() {
+                    "requires" => prepend.push(Stmt::Assert(expr.clone())),
+                    "ensures"  => append.push(Stmt::Assert(expr.clone())),
+                    _ => {}
+                }
+            }
+            if !prepend.is_empty() {
+                let mut new_body = prepend;
+                new_body.extend(body.drain(..));
+                body = new_body;
+            }
+            body.extend(append);
+        }
         let decl = FnDecl { name, type_params, params, ret_type, where_clauses, precondition, postcondition, body, vis, is_pure, attrs };
         if is_evolve {
             Ok(Stmt::EvolveFn(decl))

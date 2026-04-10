@@ -14,8 +14,6 @@ pub mod error;
 #[allow(dead_code)]
 pub mod parser;
 #[allow(dead_code)]
-pub mod types;
-#[allow(dead_code)]
 pub mod env;
 #[allow(dead_code)]
 pub mod interpreter;
