@@ -410,6 +410,9 @@ pub struct Interpreter {
     gen_buffer: Vec<Value>,
     /// Whether we are inside a generator collection context (gen { } or collect_gen)
     gen_active: bool,
+    /// P13 골화: Value::Error에 string method 호출 시 1회만 경고.
+    /// 키 포맷: "{method}::{msg prefix}" — 중복 경고 억제.
+    error_fallback_warned: std::collections::HashSet<String>,
 }
 
 /// Stored data for a loaded/declared module.
@@ -493,6 +496,7 @@ impl Interpreter {
             kv_cache: None,
             gen_buffer: Vec::new(),
             gen_active: false,
+            error_fallback_warned: std::collections::HashSet::new(),
         }
     }
 
@@ -3715,6 +3719,28 @@ impl Interpreter {
                         "no method .{}() in trait {} for type {}", method, to_inner.trait_name, to_inner.type_name
                     )))
                 }
+            }
+            // P13 골화: builtin(read_file/http_get/parse_int/exec 등)이 Error 를
+            //           반환하는데 호출자가 .trim()/.contains()/.split() 체이닝을
+            //           할 때 크래시를 막기 위해 "" 로 fallback 후 call_string_method
+            //           동일 dispatch. 원본 메시지는 .to_string() 으로 조회 가능.
+            //           silent degradation 방지 위해 (method, msg-prefix) 당 1회 eprintln 경고.
+            //           HEXA_EXEC_SILENT 환경변수 설정 시 경고 억제.
+            Value::Error(ref msg) => {
+                if method == "to_string" {
+                    return Ok(Value::Str(msg.clone()));
+                }
+                let msg_prefix: String = msg.chars().take(40).collect();
+                let key = format!("{}::{}", method, msg_prefix);
+                if self.error_fallback_warned.insert(key)
+                    && std::env::var("HEXA_EXEC_SILENT").is_err()
+                {
+                    eprintln!(
+                        "[warn] .{}() called on Error, fallback to \"\": {}",
+                        method, msg
+                    );
+                }
+                self.call_string_method("", method, args)
             }
             _ => Err(self.runtime_err(format!("no method .{}() on {:?}", method, obj))),
         }
@@ -9909,16 +9935,31 @@ impl Interpreter {
                                 .args(&["-c", cmd])
                                 .output()
                         };
+                        // 2026-04-11 patch: exec() 항상 string 반환 (Value::Error 폐지).
+                        // 이전: exit non-zero → Value::Error → .trim() 등 string method 호출 시
+                        //       'no method on Error' 런타임 에러로 사용자 코드 폭주.
+                        // 신: stdout 그대로 반환 + stderr 는 hexa stderr 로 forward (silent fail 방지).
+                        // 정확한 status 가 필요하면 exec_with_status() 사용.
+                        // HEXA_EXEC_SILENT 환경변수 설정 시 stderr forward 억제 (opt-out).
+                        let silent = std::env::var("HEXA_EXEC_SILENT").is_ok();
                         match output {
                             Ok(out) => {
                                 let stdout = String::from_utf8_lossy(&out.stdout).trim_end_matches('\n').to_string();
-                                if out.status.success() {
-                                    Ok(Value::Str(stdout))
-                                } else {
-                                    Ok(Value::Error(format!("exec error (exit {}): {}", out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stderr))))
+                                if !out.status.success() && !silent {
+                                    let stderr = String::from_utf8_lossy(&out.stderr);
+                                    let trimmed = stderr.trim_end();
+                                    if !trimmed.is_empty() {
+                                        eprintln!("[exec exit {}] {}", out.status.code().unwrap_or(-1), trimmed);
+                                    }
                                 }
+                                Ok(Value::Str(stdout))
                             }
-                            Err(e) => Ok(Value::Error(format!("exec error: {}", e))),
+                            Err(e) => {
+                                if !silent {
+                                    eprintln!("[exec error] {}", e);
+                                }
+                                Ok(Value::Str(String::new()))
+                            }
                         }
                     }
                     _ => Err(self.type_err("exec() requires string argument".into())),
@@ -11150,6 +11191,26 @@ impl Interpreter {
         };
 
         self.env.push_scope();
+        let module_scope_start = self.env.vars_len();
+
+        // ─── FIX 9#1: Pre-registration pass ───
+        // Top-level run() pre-registers all FnDecls so functions in the same
+        // module can reference each other without forward-declaration. Module
+        // loading was missing this pass, causing O(N²) behavior on use chains
+        // (each fn registration walked the full vars stack). With pre-reg,
+        // train_gpu.hexa's 5-module chain (~200 fns) loads in <30s instead of 150s+.
+        for stmt in &stmts {
+            if let Stmt::FnDecl(decl) = stmt {
+                let param_names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
+                let fn_val = Value::Fn(Box::new((
+                    decl.name.clone(),
+                    param_names,
+                    Arc::new(decl.body.clone()),
+                )));
+                self.env.define(&decl.name, fn_val);
+            }
+        }
+
         for stmt in &stmts {
             self.exec_stmt(stmt)?;
             match stmt {
@@ -11191,6 +11252,19 @@ impl Interpreter {
                 _ => {}
             }
         }
+
+        // ─── FIX 8C: Promote module-level vars to statics before pop_scope ───
+        // Without this, mut globals declared at module top-level disappear when
+        // pop_scope() truncates vars. Functions called later (from caller scope)
+        // then read None / 0 instead of the mutated value. Discovered when
+        // cuda_ffi's G_CUBLAS_HANDLE was 0 inside gpu_sgemm despite cuda_init
+        // having set it. Promotion to statics gives module-level state a stable
+        // home that survives scope teardown.
+        let module_vars = self.env.drain_scope_vars(module_scope_start);
+        for (name, val) in module_vars {
+            self.env.define_static(&name, val);
+        }
+
         self.env.pop_scope();
         // Inject pub bindings into the current scope for direct access
         for (name, val) in &mod_data.pub_bindings {

@@ -611,6 +611,33 @@ impl Env {
         self.statics.insert(name.to_string(), val);
     }
 
+    /// Current length of the user vars stack (for marking module scope start).
+    #[inline]
+    pub fn vars_len(&self) -> usize {
+        self.vars.len()
+    }
+
+    /// Drain vars defined since `start_idx`, returning them as (name, value) pairs.
+    /// Used by exec_use to promote module-level bindings to statics so they
+    /// survive pop_scope teardown. Skips function values (those are handled via
+    /// pub_bindings injection — promoting them too would shadow the cleaner path).
+    pub fn drain_scope_vars(&mut self, start_idx: usize) -> Vec<(String, Value)> {
+        if start_idx >= self.vars.len() {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(self.vars.len() - start_idx);
+        for (name, val) in self.vars.iter().skip(start_idx) {
+            // Skip Fn values: pub fns are exported via pub_bindings,
+            // private fns are intentionally module-local. Promoting them
+            // to statics would leak private fns to the global namespace.
+            if matches!(val, Value::Fn(_) | Value::BuiltinFn(_)) {
+                continue;
+            }
+            out.push((name.clone(), val.clone()));
+        }
+        out
+    }
+
     /// Check if a name is a static variable.
     pub fn is_static(&self, name: &str) -> bool {
         self.statics.contains_key(name)
