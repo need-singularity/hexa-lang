@@ -6,13 +6,19 @@ set -e
 HX_HOME="${HX_HOME:-$HOME/.hx}"
 HX_BIN="$HX_HOME/bin"
 HX_PKG="$HX_HOME/packages"
+HX_CACHE="$HX_HOME/cache/resolve.json"
 REGISTRY_REMOTE="https://raw.githubusercontent.com/dancinlife/hexa-lang/main/pkg/registry.json"
 HX_SCRIPT="$(readlink "$0" 2>/dev/null || echo "$0")"
 HX_DIR="$(cd "$(dirname "$HX_SCRIPT")" && pwd)"
 REGISTRY_LOCAL="${HX_DIR}/registry.json"
 [ ! -f "$REGISTRY_LOCAL" ] && REGISTRY_LOCAL="${HX_DIR}/../pkg/registry.json"
 
-mkdir -p "$HX_BIN" "$HX_PKG"
+# AI-native convention: probe these orgs in order. No central list.
+# Override with HX_ORGS="org1 org2 ..." env var.
+HX_ORGS_DEFAULT="hexa-pkg need-singularity dancinlife"
+HX_ORGS="${HX_ORGS:-$HX_ORGS_DEFAULT}"
+
+mkdir -p "$HX_BIN" "$HX_PKG" "$(dirname "$HX_CACHE")"
 
 red()   { printf '\033[31m%s\033[0m\n' "$*"; }
 green() { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -21,11 +27,29 @@ dim()   { printf '\033[2m%s\033[0m\n' "$*"; }
 usage() {
   echo "hx — hexa package manager"
   echo ""
-  echo "  hx install <pkg>   Install a package"
-  echo "  hx run <pkg>       Run installed package"
-  echo "  hx list            List installed packages"
-  echo "  hx remove <pkg>    Remove a package"
-  echo "  hx search          Show available packages"
+  echo "  hx install <target>      Install a package (brew-style)"
+  echo "                             <target> can be:"
+  echo "                               name              registry package"
+  echo "                               user/repo         GitHub shortform"
+  echo "                               https://...       full git URL"
+  echo "                               git@host:...      ssh git URL"
+  echo "                               ./path | /path    local directory"
+  echo "  hx run <pkg> [args...]   Run installed package"
+  echo "  hx list                  List installed packages"
+  echo "  hx remove <pkg>          Remove a package"
+  echo "  hx search                Show available packages"
+  echo "  hx info <pkg>            Show package detail"
+  echo "  hx where <name>          Resolve a name to a repo URL (no install)"
+  echo "  hx orgs                  List/manage probe orgs (HX_ORGS env)"
+  echo ""
+  echo "options:"
+  echo "  --entry <path>           Override entry script (relative to pkg root)"
+  echo "  --as <name>              Override installed name"
+  echo "  --no-cache               Skip resolve cache (force re-probe)"
+  echo ""
+  echo "AI-native resolution: bare names (e.g. 'hx install airgenome') are"
+  echo "resolved by probing github.com/<org>/<name> for orgs in HX_ORGS."
+  echo "No central list — successful resolutions are cached at $HX_CACHE."
   echo ""
 }
 
@@ -54,42 +78,239 @@ else: sys.exit(1)
 " 2>/dev/null
 }
 
+# AI-native name resolution: probe convention orgs, learn from successes
+cache_get() {
+  local name="$1"
+  [ -f "$HX_CACHE" ] || return 1
+  python3 -c "
+import sys,json
+try:
+    d=json.load(open('$HX_CACHE'))
+    v=d.get('$name')
+    if v: print(v)
+    else: sys.exit(1)
+except: sys.exit(1)
+" 2>/dev/null
+}
+
+cache_put() {
+  local name="$1" url="$2"
+  python3 -c "
+import json,os
+p='$HX_CACHE'
+d={}
+if os.path.exists(p):
+    try: d=json.load(open(p))
+    except: pass
+d['$name']='$url'
+json.dump(d, open(p,'w'), indent=2)
+" 2>/dev/null
+}
+
+resolve_name() {
+  local name="$1" no_cache="$2"
+  if [ -z "$no_cache" ]; then
+    local cached
+    if cached=$(cache_get "$name"); then
+      echo "$cached"
+      return 0
+    fi
+  fi
+  for org in $HX_ORGS; do
+    local url="https://github.com/$org/$name"
+    if git ls-remote --exit-code "$url" >/dev/null 2>&1; then
+      cache_put "$name" "$url"
+      echo "$url"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# detect entry script in a directory (brew-like auto-detect)
+detect_entry() {
+  local dir="$1" name="$2"
+  local candidates=(
+    "run.sh" "start.sh" "main.sh" "$name.sh"
+    "bin/$name" "bin/run" "$name"
+    "main.hexa" "$name.hexa"
+    "run" "main" "start"
+  )
+  for c in "${candidates[@]}"; do
+    if [ -f "$dir/$c" ]; then
+      echo "$c"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# classify install target
+classify_target() {
+  local t="$1"
+  case "$t" in
+    https://*|http://*|git@*|ssh://*|*.git) echo "url" ;;
+    ./*|/*|~*) echo "path" ;;
+    */*)
+      # github shortform user/repo (single slash, no spaces)
+      if [[ "$t" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+        echo "github"
+      else
+        echo "name"
+      fi
+      ;;
+    *) echo "name" ;;
+  esac
+}
+
 cmd_install() {
-  local pkg="$1"
-  [ -z "$pkg" ] && { red "usage: hx install <pkg>"; exit 1; }
+  local target="" entry_override="" name_override="" no_cache=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --entry)    entry_override="$2"; shift 2 ;;
+      --as)       name_override="$2"; shift 2 ;;
+      --no-cache) no_cache="1"; shift ;;
+      -*)         red "unknown option: $1"; exit 1 ;;
+      *)          target="$1"; shift ;;
+    esac
+  done
+  [ -z "$target" ] && { red "usage: hx install <target>"; exit 1; }
 
-  green "⬡ fetching registry..."
-  local reg
-  reg=$(fetch_registry)
+  local kind
+  kind=$(classify_target "$target")
 
-  local repo entry desc
-  repo=$(pkg_field "$pkg" "repo" "$reg") || { red "package '$pkg' not found"; exit 1; }
-  entry=$(pkg_field "$pkg" "entry" "$reg")
-  desc=$(pkg_field "$pkg" "desc" "$reg")
+  local pkg="" repo="" entry="" desc="" src_path=""
+  case "$kind" in
+    name)
+      green "⬡ fetching registry..."
+      local reg
+      reg=$(fetch_registry)
+      pkg="$target"
+      repo=$(pkg_field "$pkg" "repo" "$reg") || true
+      local local_field
+      local_field=$(pkg_field "$pkg" "local" "$reg") || true
+      entry=$(pkg_field "$pkg" "entry" "$reg") || true
+      desc=$(pkg_field "$pkg" "desc" "$reg") || true
+      if [ -z "$repo" ] && [ -z "$local_field" ]; then
+        # AI-native fallback: probe convention orgs (no central list needed)
+        green "⬡ resolving '$pkg' via convention orgs..."
+        if repo=$(resolve_name "$pkg" "$no_cache"); then
+          dim "  ↳ $repo"
+        else
+          red "package '$pkg' not found"
+          dim "  probed orgs: $HX_ORGS"
+          dim "  hint: hx install <user>/$pkg  or  HX_ORGS=\"myorg $HX_ORGS\" hx install $pkg"
+          exit 1
+        fi
+      fi
+      if [ -n "$local_field" ]; then
+        # registry-local: relative to registry directory
+        if [ "${local_field#/}" = "$local_field" ]; then
+          src_path="$(cd "$(dirname "$REGISTRY_LOCAL")" && pwd)/$local_field"
+        else
+          src_path="$local_field"
+        fi
+      fi
+      ;;
+    github)
+      pkg="${target##*/}"
+      repo="https://github.com/$target"
+      ;;
+    url)
+      pkg="${target##*/}"
+      pkg="${pkg%.git}"
+      repo="$target"
+      ;;
+    path)
+      # expand ~
+      local p="${target/#\~/$HOME}"
+      [ -d "$p" ] || { red "path not found: $p"; exit 1; }
+      src_path="$(cd "$p" && pwd)"
+      pkg="$(basename "$src_path")"
+      ;;
+  esac
 
-  dim "  $desc"
-  # local path override: check ~/Dev/<pkg> first
-  local local_path="$HOME/Dev/$pkg"
+  [ -n "$name_override" ] && pkg="$name_override"
+  [ -n "$desc" ] && dim "  $desc"
+
   local dest="$HX_PKG/$pkg"
   rm -rf "$dest"
 
-  if [ -d "$local_path" ]; then
-    green "⬡ linking $pkg (local: $local_path)..."
-    ln -s "$local_path" "$dest"
-  else
-    green "⬡ cloning $pkg..."
-    git clone --depth 1 --quiet "$repo" "$dest"
+  # ~/Dev/<name> override (legacy convenience for github/name kinds)
+  if [ -z "$src_path" ] && [ -d "$HOME/Dev/$pkg" ] && [ "$kind" != "url" ]; then
+    src_path="$HOME/Dev/$pkg"
+    dim "  found local: $src_path"
   fi
 
-  # symlink entry to bin
+  if [ -n "$src_path" ]; then
+    green "⬡ linking $pkg ($src_path)..."
+    ln -s "$src_path" "$dest"
+  else
+    green "⬡ cloning $pkg ($repo)..."
+    git clone --depth 1 --quiet "$repo" "$dest" || { red "git clone failed"; exit 1; }
+  fi
+
+  # entry resolution: --entry > registry > auto-detect
+  [ -n "$entry_override" ] && entry="$entry_override"
+  if [ -z "$entry" ] || [ ! -f "$dest/$entry" ]; then
+    local detected
+    if detected=$(detect_entry "$dest" "$pkg"); then
+      [ -n "$entry" ] && [ ! -f "$dest/$entry" ] && dim "  registry entry '$entry' missing, auto-detected '$detected'"
+      entry="$detected"
+    fi
+  fi
+
   if [ -n "$entry" ] && [ -f "$dest/$entry" ]; then
-    chmod +x "$dest/$entry"
-    ln -sf "$dest/$entry" "$HX_BIN/$pkg"
+    chmod +x "$dest/$entry" 2>/dev/null || true
+    rm -f "$HX_BIN/$pkg"
+    case "$entry" in
+      *.hexa)
+        # .hexa entry: generate a wrapper shim that invokes the hexa interpreter
+        cat > "$HX_BIN/$pkg" <<EOF
+#!/bin/bash
+# hx-generated shim for $pkg ($entry)
+HEXA="\${HEXA:-}"
+if [ -z "\$HEXA" ]; then
+  for c in "\$HOME/Dev/airgenome/nexus/shared/bin/hexa" "\$HOME/.hx/bin/hexa" "\$(command -v hexa 2>/dev/null)"; do
+    if [ -n "\$c" ] && [ -x "\$c" ]; then HEXA="\$c"; break; fi
+  done
+fi
+if [ -z "\$HEXA" ]; then
+  echo "⬡ FATAL: hexa interpreter not found" >&2
+  exit 1
+fi
+exec "\$HEXA" "$dest/$entry" "\$@"
+EOF
+        chmod +x "$HX_BIN/$pkg"
+        ;;
+      *)
+        ln -sf "$dest/$entry" "$HX_BIN/$pkg"
+        ;;
+    esac
     green "⬡ installed: $pkg"
+    dim "  entry: $entry"
     dim "  run with: hx run $pkg  (or: $pkg)"
   else
-    red "warning: entry '$entry' not found in repo"
+    red "warning: no entry script found in $dest"
+    dim "  re-install with --entry <path> to specify"
   fi
+}
+
+cmd_info() {
+  local pkg="$1"
+  [ -z "$pkg" ] && { red "usage: hx info <pkg>"; exit 1; }
+  local dest="$HX_PKG/$pkg" bin="$HX_BIN/$pkg"
+  if [ ! -e "$dest" ]; then
+    red "'$pkg' not installed"
+    exit 1
+  fi
+  green "⬡ $pkg"
+  if [ -L "$dest" ]; then
+    dim "  source: $(readlink "$dest") (linked)"
+  else
+    dim "  source: $dest (cloned)"
+  fi
+  [ -L "$bin" ] && dim "  entry:  $(readlink "$bin")"
 }
 
 cmd_run() {
@@ -121,6 +342,44 @@ cmd_remove() {
   green "⬡ removed: $pkg"
 }
 
+cmd_where() {
+  local name="$1"
+  [ -z "$name" ] && { red "usage: hx where <name>"; exit 1; }
+  green "⬡ resolving '$name'..."
+  local cached
+  if cached=$(cache_get "$name"); then
+    dim "  cache: $cached"
+  fi
+  local url
+  if url=$(resolve_name "$name" "1"); then
+    green "  found: $url"
+  else
+    red "  not found in: $HX_ORGS"
+    exit 1
+  fi
+}
+
+cmd_orgs() {
+  green "⬡ probe orgs (in order):"
+  for org in $HX_ORGS; do
+    echo "  $org"
+  done
+  dim ""
+  dim "  override: HX_ORGS=\"org1 org2 ...\" hx install <name>"
+  dim "  cache:    $HX_CACHE"
+  if [ -f "$HX_CACHE" ]; then
+    dim ""
+    green "⬡ resolved cache:"
+    python3 -c "
+import json
+try:
+    d=json.load(open('$HX_CACHE'))
+    for k,v in d.items(): print(f'  {k} → {v}')
+except: pass
+"
+  fi
+}
+
 cmd_search() {
   green "⬡ available packages:"
   local reg
@@ -134,10 +393,13 @@ for k,v in d.get('packages',{}).items():
 }
 
 case "${1:-}" in
-  install) cmd_install "$2" ;;
+  install) shift; cmd_install "$@" ;;
   run)     shift; cmd_run "$@" ;;
   list)    cmd_list ;;
   remove)  cmd_remove "$2" ;;
   search)  cmd_search ;;
+  info)    cmd_info "$2" ;;
+  where)   cmd_where "$2" ;;
+  orgs)    cmd_orgs ;;
   *)       usage ;;
 esac
