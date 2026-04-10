@@ -4321,6 +4321,57 @@ impl Interpreter {
                 }
                 Ok(Value::Array(out))
             }
+            "gqa_expand_kv_into" => {
+                // gqa_expand_kv_into(kv, SEQ, N_KV, HEAD_D, N_Q, out)
+                // kv: [SEQ × (N_KV*HEAD_D)] → out: [SEQ × (N_Q*HEAD_D)]
+                // Each KV head is repeated (N_Q / N_KV) times. Tensor in/out for speed.
+                if args.len() < 6 {
+                    return Err(self.type_err("gqa_expand_kv_into(kv, SEQ, N_KV, HEAD_D, N_Q, out)".into()));
+                }
+                let seq = match &args[1] { Value::Int(i) => *i as usize, _ => return Err(self.type_err("gqa_expand_kv_into: SEQ int".into())) };
+                let n_kv = match &args[2] { Value::Int(i) => *i as usize, _ => return Err(self.type_err("gqa_expand_kv_into: N_KV int".into())) };
+                let hd = match &args[3] { Value::Int(i) => *i as usize, _ => return Err(self.type_err("gqa_expand_kv_into: HEAD_D int".into())) };
+                let n_q = match &args[4] { Value::Int(i) => *i as usize, _ => return Err(self.type_err("gqa_expand_kv_into: N_Q int".into())) };
+                if n_kv == 0 || n_q % n_kv != 0 {
+                    return Err(self.type_err("gqa_expand_kv_into: N_Q must be multiple of N_KV".into()));
+                }
+                let n_rep = n_q / n_kv;
+                let kv_dim = n_kv * hd;
+                let out_dim = n_q * hd;
+                let kv_vec: Vec<f64> = to_f64_slice(&args[0]).map(|s| s.as_slice().to_vec())
+                    .ok_or_else(|| self.type_err("gqa_expand_kv_into: kv must be tensor/array".into()))?;
+                if kv_vec.len() < seq * kv_dim {
+                    return Err(self.type_err("gqa_expand_kv_into: kv too small".into()));
+                }
+                let mut out_data = vec![0.0f64; seq * out_dim];
+                for si in 0..seq {
+                    let in_row = si * kv_dim;
+                    let out_row = si * out_dim;
+                    for hi in 0..n_kv {
+                        let src = in_row + hi * hd;
+                        for ri in 0..n_rep {
+                            let dst = out_row + (hi * n_rep + ri) * hd;
+                            out_data[dst..dst + hd].copy_from_slice(&kv_vec[src..src + hd]);
+                        }
+                    }
+                }
+                match &mut args[5] {
+                    Value::Tensor(arc) => {
+                        if arc.data.len() != seq * out_dim {
+                            return Err(self.type_err("gqa_expand_kv_into: out.len != SEQ*N_Q*HEAD_D".into()));
+                        }
+                        if Arc::get_mut(arc).is_some() {
+                            let td = Arc::get_mut(arc).unwrap();
+                            td.data.copy_from_slice(&out_data);
+                            Ok(Value::Tensor(arc.clone()))
+                        } else {
+                            let shape = arc.shape.clone();
+                            Ok(Value::Tensor(Arc::new(TensorData { shape, data: out_data })))
+                        }
+                    }
+                    _ => Ok(Value::Tensor(Arc::new(TensorData { shape: vec![seq, out_dim], data: out_data }))),
+                }
+            }
             "weight_dict" => {
                 // weight_dict(names_array, tensors_array) → Map for O(1) weight lookup
                 if args.len() < 2 { return Err(self.type_err("weight_dict() requires (names, tensors)".into())); }

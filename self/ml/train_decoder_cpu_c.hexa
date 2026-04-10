@@ -1,0 +1,160 @@
+// Phase C — full GQA + Wo + residual 복원
+// Phase B v2 (56ms) 단순화 복원:
+//   - 완전한 GQA: N_HEAD=4, N_KV=2, KV 그룹 expand (gqa_expand_kv_into)
+//   - Wo: attention 출력 D→D projection
+//   - attention residual: h = X + Wo(attn(X))
+//   - FFN residual: h = h + W_down(SwiGLU(h))
+// 목표: <100ms
+
+let D       = 384
+let N_LAYER = 6
+let VOCAB   = 256
+let SEQ     = 256
+let FF      = 1536
+let N_HEAD  = 4
+let HEAD_D  = 96
+let N_KV    = 2
+let KV_D    = 192
+let LORA_R  = 16
+let LR      = 0.001
+let ROPE_BASE = 10000.0
+
+// Weights (full GQA: Wk/Wv are D×KV_D, 2x parameter savings vs Wq)
+let Wq = tensor_zeros(D * D)
+let Wk = tensor_zeros(D * KV_D)
+let Wv = tensor_zeros(D * KV_D)
+let Wo = tensor_zeros(D * D)
+let W_gate = tensor_zeros(D * FF)
+let W_up   = tensor_zeros(D * FF)
+let W_down = tensor_zeros(FF * D)
+let U_lmh = tensor_zeros(D * LORA_R)
+let V_lmh = tensor_zeros(LORA_R * VOCAB)
+
+// Scratch
+let s_q = tensor_zeros(SEQ * D)
+let s_k = tensor_zeros(SEQ * KV_D)
+let s_v = tensor_zeros(SEQ * KV_D)
+let s_k_exp = tensor_zeros(SEQ * D)
+let s_v_exp = tensor_zeros(SEQ * D)
+let s_attn = tensor_zeros(SEQ * D)
+let s_o = tensor_zeros(SEQ * D)
+let s_gate = tensor_zeros(SEQ * FF)
+let s_up   = tensor_zeros(SEQ * FF)
+let s_down = tensor_zeros(SEQ * D)
+let s_lmh_t = tensor_zeros(1 * LORA_R)
+let s_lmh_out = tensor_zeros(1 * VOCAB)
+let scratch_bwd_z = tensor_zeros(1 * LORA_R)
+let scratch_bwd_gvlmh = tensor_zeros(LORA_R * VOCAB)
+
+fn block_forward(X) {
+    // QKV projection (dense Wq; reduced Wk/Wv for GQA)
+    let q = matmul_into(X, Wq, SEQ, D, D, s_q)
+    let k = matmul_into(X, Wk, SEQ, D, KV_D, s_k)
+    let v = matmul_into(X, Wv, SEQ, D, KV_D, s_v)
+
+    // RoPE (in-place, BLAS-optimized)
+    let q_r = rope_inplace(q, SEQ, D, ROPE_BASE)
+    let k_r = rope_inplace(k, SEQ, KV_D, ROPE_BASE)
+
+    // GQA expand: KV heads repeated (N_KV=2 → N_HEAD=4, n_rep=2)
+    let k_exp = gqa_expand_kv_into(k_r, SEQ, N_KV, HEAD_D, N_HEAD, s_k_exp)
+    let v_exp = gqa_expand_kv_into(v,   SEQ, N_KV, HEAD_D, N_HEAD, s_v_exp)
+
+    // Fused attention (full D, Q/K/V all SEQ×D)
+    let attn = attention_fused_into(q_r, k_exp, v_exp, SEQ, D, s_attn)
+
+    // Wo projection
+    let o = matmul_into(attn, Wo, SEQ, D, D, s_o)
+
+    // Attention residual: X += Wo(attn)
+    mat_add_inplace(X, o)
+
+    // SwiGLU FFN
+    let gate = matmul_into(X, W_gate, SEQ, D, FF, s_gate)
+    let up   = matmul_into(X, W_up,   SEQ, D, FF, s_up)
+    let gate_act = silu(gate)
+    let fused_t = hadamard(gate_act, up)
+    let ffn_out = matmul_into(fused_t, W_down, SEQ, FF, D, s_down)
+
+    // FFN residual: X += ffn_out
+    mat_add_inplace(X, ffn_out)
+}
+
+fn embed(ids) { tensor_zeros(SEQ * D) }
+
+fn lm_head_lr(h_last) {
+    let t = matmul_into(h_last, U_lmh, 1, D, LORA_R, s_lmh_t)
+    matmul_into(t, V_lmh, 1, LORA_R, VOCAB, s_lmh_out)
+}
+
+fn loss_mse(logits, tgt) {
+    let n = len(tgt)
+    let neg_t = mat_scale(tgt, -1.0)
+    let diff  = mat_add(logits, neg_t)
+    let sq = matmul(diff, diff, 1, n, 1)
+    sq[0] / (n * 1.0)
+}
+
+fn forward_pass(ids, tgt) {
+    let mut h = embed(ids)
+    let mut li = 0
+    while li < N_LAYER {
+        h = block_forward(h)
+        li = li + 1
+    }
+    let mut last = []
+    let base = (SEQ - 1) * D
+    let mut i = 0
+    while i < D { last = last.push(h[base + i]); i = i + 1 }
+    let last_t = tensor(last)
+    let logits = lm_head_lr(last_t)
+    loss_mse(logits, tgt)
+}
+
+fn backward_vlmh(h_last, logits, target) {
+    let z = matmul_into(h_last, U_lmh, 1, D, LORA_R, scratch_bwd_z)
+    let neg_t = mat_scale(target, -1.0)
+    let diff  = mat_add(logits, neg_t)
+    matmul_into(z, diff, LORA_R, 1, VOCAB, scratch_bwd_gvlmh)
+}
+
+fn train_one_step() {
+    let mut ids = []
+    let mut i = 0
+    while i < SEQ { ids = ids.push(0); i = i + 1 }
+    let mut tgt = []
+    let mut j = 0
+    while j < VOCAB {
+        if j == 0 { tgt = tgt.push(1.0) } else { tgt = tgt.push(0.0) }
+        j = j + 1
+    }
+    let tgt_t = tensor(tgt)
+
+    let t0 = clock()
+    let loss = forward_pass(ids, tgt_t)
+    let t1 = clock()
+
+    let last_h = tensor_zeros(D)
+    let logits_f = tensor_zeros(VOCAB)
+    let g_vlmh = backward_vlmh(last_h, logits_f, tgt_t)
+    let t2 = clock()
+
+    let _V = axpy(V_lmh, g_vlmh, -1.0 * LR)
+    let t3 = clock()
+
+    let fwd_ms = (t1 - t0) * 1000.0
+    let bwd_ms = (t2 - t1) * 1000.0
+    let opt_ms = (t3 - t2) * 1000.0
+    let total_ms = (t3 - t0) * 1000.0
+
+    let mut line = "{\"phase\":\"decoder_c\",\"n_head\":" + str(N_HEAD)
+    line = line + ",\"n_kv\":" + str(N_KV) + ",\"head_d\":" + str(HEAD_D)
+    line = line + ",\"step_ms\":" + str(total_ms)
+    line = line + ",\"fwd\":" + str(fwd_ms) + ",\"bwd\":" + str(bwd_ms) + ",\"opt\":" + str(opt_ms)
+    line = line + ",\"loss\":" + str(loss) + "}"
+    println(line)
+    total_ms
+}
+
+println("[decoder_c] Phase C — full GQA (N_HEAD=4, N_KV=2) + Wo + residual")
+let _ = train_one_step()
