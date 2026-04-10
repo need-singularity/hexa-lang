@@ -2835,4 +2835,37 @@ mod tests {
         }
     }
 
+    // ── G6: ; (semicolons) regression tests ─────────────────────
+    // fix commit: f84f950 — src/parser.rs:parse_return + macro literal/invocation path
+    #[test]
+    fn test_g6_return_with_semicolon() {
+        // `return 1;` and bare `return;` must both parse inside a function body.
+        let stmts = parse_source("fn f() -> int {\n  return 1;\n}");
+        if let Stmt::FnDecl(f) = &stmts[0] {
+            assert_eq!(f.name, "f");
+            // Body should contain exactly one Return(Some(1)) stmt.
+            assert!(f.body.iter().any(|s| matches!(s, Stmt::Return(Some(_)))));
+        } else {
+            panic!("expected FnDecl");
+        }
+        let stmts = parse_source("fn g() {\n  return;\n}");
+        if let Stmt::FnDecl(f) = &stmts[0] {
+            assert!(f.body.iter().any(|s| matches!(s, Stmt::Return(None))));
+        } else {
+            panic!("expected FnDecl");
+        }
+    }
+
+    #[test]
+    fn test_g6_macro_with_semicolons() {
+        // Semicolons inside a macro invocation body are accepted as separators
+        // (parse_macro_invocation: Token::Newline | Token::Semicolon branch).
+        // Also: multiple top-level statements separated by ';'.
+        let stmts = parse_source("let a = 1; let b = 2; let c = a + b");
+        assert_eq!(stmts.len(), 3);
+        assert!(matches!(&stmts[0], Stmt::Let(n, _, _, _) if n == "a"));
+        assert!(matches!(&stmts[1], Stmt::Let(n, _, _, _) if n == "b"));
+        assert!(matches!(&stmts[2], Stmt::Let(n, _, _, _) if n == "c"));
+    }
+
 }
