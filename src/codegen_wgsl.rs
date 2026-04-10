@@ -230,7 +230,7 @@ impl WgslContext {
                 self.pop_indent();
                 self.writeln("}");
             }
-            Stmt::Assert(expr) => {
+            Stmt::Assert(expr) | Stmt::ContractAssert(_, _, expr) => {
                 self.write_indent();
                 self.output.push_str("// assert: ");
                 self.emit_expr(expr);

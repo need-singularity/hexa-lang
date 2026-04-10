@@ -216,7 +216,7 @@ pub fn lower_stmt_val(ctx: &mut LowerCtx, builder: &mut IrBuilder, stmt: &Stmt) 
             builder.const_i64(0)
         }
 
-        Stmt::Assert(e) => {
+        Stmt::Assert(e) | Stmt::ContractAssert(_, _, e) => {
             let val = lower_expr(ctx, builder, e);
             builder.ir_assert(val)
         }

@@ -144,6 +144,8 @@ pub mod opt;
 pub mod codegen;
 #[allow(dead_code)]
 pub mod alloc;
+#[allow(dead_code)]
+pub mod trace_jit;
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 pub mod std_web_template;
@@ -212,6 +214,78 @@ pub fn run_source_tiered(source: &str, budget: usize) -> (String, String, &'stat
 pub fn run_source_with_budget(source: &str, budget: usize) -> (String, String) {
     let (output, error, _tier) = run_source_tiered(source, budget);
     (output, error)
+}
+
+/// Run Hexa source using **only** the bytecode VM (no interpreter fallback).
+/// Returns (output, error). If VM compilation fails, returns an error instead
+/// of falling back to the interpreter.
+pub fn run_source_vm_only(source: &str, budget: usize) -> (String, String) {
+    let source_lines: Vec<String> = source.lines().map(String::from).collect();
+
+    let tokens = match lexer::Lexer::new(source).tokenize() {
+        Ok(t) => t,
+        Err(e) => return (String::new(), format!("Lexer error: {}", e)),
+    };
+
+    let result = match parser::Parser::new(tokens).parse_with_spans() {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = format_diagnostic(&e, &source_lines, "<playground>");
+            return (String::new(), msg);
+        }
+    };
+
+    let mut checker = type_checker::TypeChecker::new();
+    if let Err(e) = checker.check(&result.stmts, &result.spans) {
+        let msg = format_diagnostic(&e, &source_lines, "<playground>");
+        return (String::new(), msg);
+    }
+
+    let ownership_errors = ownership::analyze_ownership(&result.stmts, &result.spans);
+    if !ownership_errors.is_empty() {
+        let first = ownership_errors[0].clone().into_hexa_error();
+        let msg = format_diagnostic(&first, &source_lines, "<playground>");
+        return (String::new(), msg);
+    }
+
+    match run_via_vm(&result.stmts, budget) {
+        Some((output, error)) => (output, error),
+        None => (String::new(), "VM compilation failed: unsupported construct".to_string()),
+    }
+}
+
+/// Run Hexa source using **only** the tree-walk interpreter (skip VM).
+/// Returns (output, error).
+pub fn run_source_interpreter_only(source: &str, budget: usize) -> (String, String) {
+    let source_lines: Vec<String> = source.lines().map(String::from).collect();
+
+    let tokens = match lexer::Lexer::new(source).tokenize() {
+        Ok(t) => t,
+        Err(e) => return (String::new(), format!("Lexer error: {}", e)),
+    };
+
+    let result = match parser::Parser::new(tokens).parse_with_spans() {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = format_diagnostic(&e, &source_lines, "<playground>");
+            return (String::new(), msg);
+        }
+    };
+
+    let mut checker = type_checker::TypeChecker::new();
+    if let Err(e) = checker.check(&result.stmts, &result.spans) {
+        let msg = format_diagnostic(&e, &source_lines, "<playground>");
+        return (String::new(), msg);
+    }
+
+    let ownership_errors = ownership::analyze_ownership(&result.stmts, &result.spans);
+    if !ownership_errors.is_empty() {
+        let first = ownership_errors[0].clone().into_hexa_error();
+        let msg = format_diagnostic(&first, &source_lines, "<playground>");
+        return (String::new(), msg);
+    }
+
+    run_via_interpreter(&result, source_lines, budget)
 }
 
 /// Attempt to compile and run via the bytecode VM.

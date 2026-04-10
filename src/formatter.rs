@@ -171,6 +171,13 @@ fn format_stmt(stmt: &Stmt, indent: usize) -> String {
         Stmt::Assert(expr) => {
             format!("{}assert {}", prefix, format_expr(expr))
         }
+        Stmt::ContractAssert(kind, fn_name, expr) => {
+            let kind_str = match kind {
+                ContractKind::Requires => "requires",
+                ContractKind::Ensures => "ensures",
+            };
+            format!("{}// @contract({}: {}) in {}", prefix, kind_str, format_expr(expr), fn_name)
+        }
         Stmt::Intent(desc, fields) => {
             let mut s = format!("{}intent \"{}\" {{\n", prefix, desc);
             for (k, v) in fields {
@@ -280,7 +287,8 @@ fn format_stmt(stmt: &Stmt, indent: usize) -> String {
         }
         Stmt::Break => format!("{}break", prefix),
         Stmt::Continue => format!("{}continue", prefix),
-        Stmt::LetTuple(names, expr) => format!("{}let ({}) = {}", prefix, names.join(", "), format_expr(expr)),        Stmt::Extern(decl) => {
+        Stmt::LetTuple(names, expr) => format!("{}let ({}) = {}", prefix, names.join(", "), format_expr(expr)),
+        Stmt::Extern(decl) => {
             let params: Vec<String> = decl.params.iter()
                 .map(|p| format!("{}: {}", p.name, p.typ))
                 .collect();

@@ -160,6 +160,15 @@ pub enum Stmt {
     Continue,                                     // continue — skip to next iteration
     // Group 13: FFI
     Extern(ExternFnDecl),                         // extern fn name(params) -> RetType
+    // @contract desugar: runtime pre/postcondition checks with descriptive error messages
+    ContractAssert(ContractKind, String, Expr),    // kind, fn_name, condition expr
+}
+
+/// Contract assertion kind — distinguishes requires (precondition) from ensures (postcondition).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ContractKind {
+    Requires,  // precondition checked at function entry
+    Ensures,   // postcondition checked at function exit (or before return)
 }
 
 /// External function declaration — calls into C libraries via FFI.

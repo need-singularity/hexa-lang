@@ -314,7 +314,7 @@ fn can_jit_stmt(stmt: &Stmt) -> bool {
         // These are not yet supported in JIT:
         Stmt::TryCatch(..) | Stmt::Throw(..) |
         Stmt::Spawn(..) | Stmt::SpawnNamed(..) | Stmt::Mod(..) | Stmt::Use(..) |
-        Stmt::Proof(..) | Stmt::Assert(..) | Stmt::Intent(..) | Stmt::Verify(..) |
+        Stmt::Proof(..) | Stmt::Assert(..) | Stmt::ContractAssert(..) | Stmt::Intent(..) | Stmt::Verify(..) |
         Stmt::DropStmt(..) | Stmt::AsyncFnDecl(..) | Stmt::Select(..) |
         Stmt::MacroDef(..) | Stmt::DeriveDecl(..) | Stmt::Generate(..) |
         Stmt::Optimize(..) | Stmt::ComptimeFn(..) | Stmt::EffectDecl(..) | Stmt::ConsciousnessBlock(..) | Stmt::EvolveFn(..) |

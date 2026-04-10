@@ -263,7 +263,7 @@ impl VerilogContext {
                     self.writeln(&format!("// unsupported for-loop over {}", var));
                 }
             }
-            Stmt::Assert(expr) => {
+            Stmt::Assert(expr) | Stmt::ContractAssert(_, _, expr) => {
                 self.write_indent();
                 self.output.push_str("// assert: ");
                 self.emit_expr(expr);

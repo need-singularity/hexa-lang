@@ -1284,20 +1284,21 @@ impl Parser {
         let attrs = self.take_attrs();
         let is_evolve = attrs.iter().any(|a| matches!(a.kind, crate::token::AttrKind::Evolve));
         let is_pure = attrs.iter().any(|a| matches!(a.kind, crate::token::AttrKind::Pure));
-        // @contract Option A — parser desugar (phase 1):
-        //  - requires: prepend `assert(expr)` at function entry
-        //  - ensures:  append `assert(expr)` at function body end
-        //  NOTE phase 1 단순화: ensures는 body 끝에만 삽입되므로 이른 return 경로에서는 검사 누락.
-        //  phase 2에서 return 재작성 + result 바인딩 처리 예정.
+        // @contract Option A — parser desugar (phase 2):
+        //  - requires: prepend ContractAssert(Requires, fn_name, expr) at entry
+        //  - ensures:  rewrite every `return val` →
+        //      let __contract_result = val; ContractAssert(Ensures, fn_name, ensures[result→__contract_result]); return __contract_result
         for a in attrs.iter() {
             if !matches!(a.kind, crate::token::AttrKind::Contract) { continue; }
+            // Collect requires guards (prepend at function entry)
             let mut prepend: Vec<Stmt> = Vec::new();
-            let mut append: Vec<Stmt> = Vec::new();
             for (key, expr) in a.args.iter() {
-                match key.as_str() {
-                    "requires" => prepend.push(Stmt::Assert(expr.clone())),
-                    "ensures"  => append.push(Stmt::Assert(expr.clone())),
-                    _ => {}
+                if key == "requires" {
+                    prepend.push(Stmt::ContractAssert(
+                        ContractKind::Requires,
+                        name.clone(),
+                        expr.clone(),
+                    ));
                 }
             }
             if !prepend.is_empty() {
@@ -1305,7 +1306,12 @@ impl Parser {
                 new_body.extend(body.drain(..));
                 body = new_body;
             }
-            body.extend(append);
+            // Rewrite returns for each ensures clause
+            for (key, expr) in a.args.iter() {
+                if key == "ensures" {
+                    rewrite_returns_for_ensures(&mut body, expr, &name);
+                }
+            }
         }
         let decl = FnDecl { name, type_params, params, ret_type, where_clauses, precondition, postcondition, body, vis, is_pure, attrs };
         if is_evolve {
@@ -2343,6 +2349,162 @@ impl Parser {
             Box::new(Expr::Block(body_block)),
             handlers,
         ))
+    }
+}
+
+// ── @contract desugar helpers ──────────────────────────────────────
+
+/// Pretty-print an AST expression for contract violation messages.
+fn contract_expr_display(expr: &Expr) -> String {
+    match expr {
+        Expr::IntLit(n) => format!("{}", n),
+        Expr::FloatLit(n) => format!("{}", n),
+        Expr::BoolLit(b) => format!("{}", b),
+        Expr::StringLit(s) => format!("\"{}\"", s),
+        Expr::Ident(name) => name.clone(),
+        Expr::Binary(l, op, r) => {
+            let op_str = match op {
+                BinOp::Add => "+", BinOp::Sub => "-", BinOp::Mul => "*",
+                BinOp::Div => "/", BinOp::Rem => "%", BinOp::Pow => "**",
+                BinOp::Eq => "==", BinOp::Ne => "!=",
+                BinOp::Lt => "<", BinOp::Gt => ">", BinOp::Le => "<=", BinOp::Ge => ">=",
+                BinOp::And => "&&", BinOp::Or => "||",
+                _ => "?",
+            };
+            format!("{} {} {}", contract_expr_display(l), op_str, contract_expr_display(r))
+        }
+        Expr::Unary(op, inner) => {
+            let op_str = match op {
+                UnaryOp::Neg => "-",
+                UnaryOp::Not => "!",
+                UnaryOp::BitNot => "~",
+            };
+            format!("{}{}", op_str, contract_expr_display(inner))
+        }
+        Expr::Call(f, args) => {
+            let args_str = args.iter().map(|a| contract_expr_display(a)).collect::<Vec<_>>().join(", ");
+            format!("{}({})", contract_expr_display(f), args_str)
+        }
+        Expr::Field(obj, field) => format!("{}.{}", contract_expr_display(obj), field),
+        Expr::Index(obj, idx) => format!("{}[{}]", contract_expr_display(obj), contract_expr_display(idx)),
+        _ => "...".into(),
+    }
+}
+
+/// Build: `if !(cond_expr) { panic "msg" }`
+/// Desugared as Stmt::Expr(Expr::If(...))
+fn make_contract_guard(cond: &Expr, msg: &str) -> Stmt {
+    let negated = Expr::Unary(UnaryOp::Not, Box::new(cond.clone()));
+    let panic_stmt = Stmt::Panic(Expr::StringLit(msg.to_string()));
+    Stmt::Expr(Expr::If(Box::new(negated), vec![panic_stmt], None))
+}
+
+/// Rewrite all `return expr` in `body` so that:
+///   return val  →  let __contract_result = val
+///                  ContractAssert(Ensures, fn_name, ensures[result→__contract_result])
+///                  return __contract_result
+///
+/// Also substitutes `result` → `__contract_result` in ensures_expr.
+fn rewrite_returns_for_ensures(body: &mut Vec<Stmt>, ensures_expr: &Expr, fn_name: &str) {
+    let result_name = "__contract_result".to_string();
+    let substituted = substitute_ident(ensures_expr, "result", &result_name);
+    let mut i = 0;
+    while i < body.len() {
+        match &body[i] {
+            Stmt::Return(Some(_)) => {
+                // Extract the return expression
+                let ret_expr = if let Stmt::Return(Some(e)) = body.remove(i) { e } else { unreachable!() };
+                // let __contract_result = <ret_expr>
+                let let_stmt = Stmt::Let(
+                    result_name.clone(),
+                    None,
+                    Some(ret_expr),
+                    Visibility::Private,
+                );
+                // ContractAssert(Ensures, fn_name, substituted_ensures)
+                let guard = Stmt::ContractAssert(
+                    ContractKind::Ensures,
+                    fn_name.to_string(),
+                    substituted.clone(),
+                );
+                // return __contract_result
+                let ret_stmt = Stmt::Return(Some(Expr::Ident(result_name.clone())));
+                body.insert(i, let_stmt);
+                body.insert(i + 1, guard);
+                body.insert(i + 2, ret_stmt);
+                i += 3; // skip past inserted stmts
+            }
+            // Recurse into blocks that may contain returns
+            Stmt::For(_, _, _inner_body) => {
+                let inner = if let Stmt::For(pat, iter, body) = body.remove(i) {
+                    let mut b = body;
+                    rewrite_returns_for_ensures(&mut b, ensures_expr, fn_name);
+                    Stmt::For(pat, iter, b)
+                } else { unreachable!() };
+                body.insert(i, inner);
+                i += 1;
+            }
+            Stmt::While(_, _) => {
+                let inner = if let Stmt::While(cond, wbody) = body.remove(i) {
+                    let mut b = wbody;
+                    rewrite_returns_for_ensures(&mut b, ensures_expr, fn_name);
+                    Stmt::While(cond, b)
+                } else { unreachable!() };
+                body.insert(i, inner);
+                i += 1;
+            }
+            Stmt::Expr(Expr::If(_, _, _)) => {
+                let inner = if let Stmt::Expr(Expr::If(cond, then_b, else_b)) = body.remove(i) {
+                    let mut tb = then_b;
+                    rewrite_returns_for_ensures(&mut tb, ensures_expr, fn_name);
+                    let eb = else_b.map(|mut eb| {
+                        rewrite_returns_for_ensures(&mut eb, ensures_expr, fn_name);
+                        eb
+                    });
+                    Stmt::Expr(Expr::If(cond, tb, eb))
+                } else { unreachable!() };
+                body.insert(i, inner);
+                i += 1;
+            }
+            Stmt::Expr(Expr::Block(_)) => {
+                let inner = if let Stmt::Expr(Expr::Block(blk)) = body.remove(i) {
+                    let mut b = blk;
+                    rewrite_returns_for_ensures(&mut b, ensures_expr, fn_name);
+                    Stmt::Expr(Expr::Block(b))
+                } else { unreachable!() };
+                body.insert(i, inner);
+                i += 1;
+            }
+            _ => { i += 1; }
+        }
+    }
+}
+
+/// Substitute all occurrences of `Ident(from)` with `Ident(to)` in an expression.
+fn substitute_ident(expr: &Expr, from: &str, to: &str) -> Expr {
+    match expr {
+        Expr::Ident(name) if name == from => Expr::Ident(to.to_string()),
+        Expr::Binary(l, op, r) => Expr::Binary(
+            Box::new(substitute_ident(l, from, to)),
+            op.clone(),
+            Box::new(substitute_ident(r, from, to)),
+        ),
+        Expr::Unary(op, inner) => Expr::Unary(op.clone(), Box::new(substitute_ident(inner, from, to))),
+        Expr::Call(f, args) => Expr::Call(
+            Box::new(substitute_ident(f, from, to)),
+            args.iter().map(|a| substitute_ident(a, from, to)).collect(),
+        ),
+        Expr::Field(obj, field) => Expr::Field(Box::new(substitute_ident(obj, from, to)), field.clone()),
+        Expr::Index(obj, idx) => Expr::Index(
+            Box::new(substitute_ident(obj, from, to)),
+            Box::new(substitute_ident(idx, from, to)),
+        ),
+        Expr::If(cond, then_b, else_b) => Expr::If(
+            Box::new(substitute_ident(cond, from, to)),
+            then_b.clone(),
+            else_b.clone(),
+        ),
+        other => other.clone(),
     }
 }
 

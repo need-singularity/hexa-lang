@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use crate::compiler::{OpCode, Chunk, CompiledFunction};
 use crate::env::{Value, TensorData};
 use crate::error::{HexaError, ErrorClass};
+use crate::trace_jit::TraceJit;
 
 // ---- Tensor BLAS FFI (macOS Accelerate) — mirrors interpreter.rs ----
 #[cfg(target_os = "macos")]
@@ -109,6 +110,8 @@ pub struct VM {
     memo_cache: HashMap<usize, HashMap<u64, Value>>,
     /// Which fn_table entries are @memoize.
     fn_is_memoize: Vec<bool>,
+    /// Trace JIT engine: hot loop detection and trace recording.
+    trace_jit: TraceJit,
 }
 
 impl VM {
@@ -133,6 +136,7 @@ impl VM {
             output_capture: None,
             memo_cache: HashMap::new(),
             fn_is_memoize: Vec::new(),
+            trace_jit: TraceJit::new(),
         }
     }
 
@@ -140,6 +144,16 @@ impl VM {
     /// buffer instead of stdout.
     pub fn set_output_capture(&mut self, buf: Option<Arc<Mutex<String>>>) {
         self.output_capture = buf;
+    }
+
+    /// Access the trace JIT engine (for diagnostics / testing).
+    pub fn trace_jit(&self) -> &TraceJit {
+        &self.trace_jit
+    }
+
+    /// Access the trace JIT engine mutably.
+    pub fn trace_jit_mut(&mut self) -> &mut TraceJit {
+        &mut self.trace_jit
     }
 
     /// Write a string to the output (captured buffer or stdout).
@@ -301,6 +315,11 @@ impl VM {
             // SAFETY: all code segments end with Return sentinel — ip is always in bounds
             let op = unsafe { &*code_ptr.add(ip) };
             ip += 1;
+
+            // Trace JIT: record opcode if we are in a recording session.
+            if self.trace_jit.is_recording() {
+                self.trace_jit.record_opcode(ip - 1, op);
+            }
 
             match op {
                 OpCode::Const(idx) => {
@@ -611,6 +630,13 @@ impl VM {
 
                 // Control flow
                 OpCode::Jump(target) => {
+                    // Trace JIT: backward jump = loop — consult the engine.
+                    if *target <= ip.wrapping_sub(1) {
+                        let _action = self.trace_jit.on_backward_jump(code_idx, *target);
+                        // Future: match _action for ExecuteNative to run
+                        // compiled traces.  For now, always fall through to
+                        // interpretation.
+                    }
                     ip = *target;
                 }
                 OpCode::JumpIfFalse(target) => {
@@ -2025,6 +2051,85 @@ s
         // Verify VM pre-allocates stack capacity
         let vm = VM::new();
         assert!(vm.stack.capacity() >= 256);
+    }
+
+    // ── Trace JIT integration tests ────────────────────────────────
+
+    #[test]
+    fn test_trace_jit_hot_loop_detection() {
+        // A while loop with 200 iterations should trigger hot loop detection.
+        let src = r#"
+let mut s = 0
+let mut i = 0
+while i < 200 {
+    s = s + i
+    i = i + 1
+}
+s
+"#;
+        let tokens = Lexer::new(src).tokenize().unwrap();
+        let stmts = Parser::new(tokens).parse().unwrap();
+        let mut compiler = Compiler::new();
+        let chunk = compiler.compile(&stmts).unwrap();
+        let mut vm = VM::new();
+        let result = vm.execute(&chunk).unwrap();
+        assert!(matches!(result, Value::Int(19900)));
+
+        // The trace JIT should have detected and traced the hot loop.
+        let traced = vm.trace_jit().traced_loops();
+        assert!(!traced.is_empty(), "trace JIT should have recorded at least one hot loop");
+
+        // Verify the trace has recorded opcodes.
+        let trace = vm.trace_jit().get_trace(&traced[0]).unwrap();
+        assert!(!trace.entries.is_empty(), "trace should contain recorded opcodes");
+        assert!(trace.exec_count > 0, "trace should have been hit multiple times after recording");
+    }
+
+    #[test]
+    fn test_trace_jit_cold_loop_no_trace() {
+        // A loop with only 10 iterations should NOT trigger trace recording.
+        let src = r#"
+let mut s = 0
+let mut i = 0
+while i < 10 {
+    s = s + i
+    i = i + 1
+}
+s
+"#;
+        let tokens = Lexer::new(src).tokenize().unwrap();
+        let stmts = Parser::new(tokens).parse().unwrap();
+        let mut compiler = Compiler::new();
+        let chunk = compiler.compile(&stmts).unwrap();
+        let mut vm = VM::new();
+        let result = vm.execute(&chunk).unwrap();
+        assert!(matches!(result, Value::Int(45)));
+
+        // No traces should be recorded for a cold loop.
+        let traced = vm.trace_jit().traced_loops();
+        assert!(traced.is_empty(), "cold loop should not be traced");
+    }
+
+    #[test]
+    fn test_trace_jit_for_loop_hot() {
+        // for-in over a range also uses backward jumps.
+        let src = r#"
+let mut s = 0
+for i in 0..200 {
+    s = s + i
+}
+s
+"#;
+        let tokens = Lexer::new(src).tokenize().unwrap();
+        let stmts = Parser::new(tokens).parse().unwrap();
+        let mut compiler = Compiler::new();
+        let chunk = compiler.compile(&stmts).unwrap();
+        let mut vm = VM::new();
+        let result = vm.execute(&chunk).unwrap();
+        assert!(matches!(result, Value::Int(19900)));
+
+        let traced = vm.trace_jit().traced_loops();
+        assert!(!traced.is_empty(), "hot for-loop should be traced");
     }
 }
 

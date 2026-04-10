@@ -519,7 +519,7 @@ impl Compiler {
                 chunk.emit(OpCode::Jump(loop_start));
                 Ok(())
             }
-            Stmt::Assert(expr) => {
+            Stmt::Assert(expr) | Stmt::ContractAssert(_, _, expr) => {
                 self.compile_expr(chunk, expr)?;
                 let assert_idx = chunk.intern("__assert__");
                 chunk.emit(OpCode::CallBuiltin(assert_idx, 1));

@@ -163,7 +163,7 @@ fn collect_definitions(
                 collect_stmt_refs(s, referenced);
             }
         }
-        Stmt::Assert(e) | Stmt::Throw(e) => {
+        Stmt::Assert(e) | Stmt::ContractAssert(_, _, e) | Stmt::Throw(e) => {
             collect_expr_refs(e, referenced);
         }
         Stmt::Intent(_, fields) => {
@@ -191,7 +191,7 @@ fn collect_stmt_refs(stmt: &Stmt, refs: &mut HashSet<String>) {
             collect_expr_refs(lhs, refs);
             collect_expr_refs(rhs, refs);
         }
-        Stmt::Expr(e) | Stmt::Return(Some(e)) | Stmt::Assert(e) | Stmt::Throw(e) => {
+        Stmt::Expr(e) | Stmt::Return(Some(e)) | Stmt::Assert(e) | Stmt::ContractAssert(_, _, e) | Stmt::Throw(e) => {
             collect_expr_refs(e, refs);
         }
         Stmt::For(_, iter, body) => {

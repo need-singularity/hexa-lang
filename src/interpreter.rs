@@ -1068,6 +1068,27 @@ impl Interpreter {
                 }
                 Ok(Value::Void)
             }
+            Stmt::ContractAssert(kind, fn_name, expr) => {
+                let val = self.eval_expr(expr)?;
+                if !Self::is_truthy(&val) {
+                    let kind_str = match kind {
+                        ContractKind::Requires => "requires",
+                        ContractKind::Ensures => "ensures",
+                    };
+                    let msg = format!(
+                        "contract violation in '{}': {} condition failed",
+                        fn_name, kind_str
+                    );
+                    return Err(HexaError {
+                        class: ErrorClass::Logic,
+                        message: msg,
+                        line: self.current_line,
+                        col: self.current_col,
+                        hint: Some(format!("@contract {} clause was not satisfied", kind_str)),
+                    });
+                }
+                Ok(Value::Void)
+            }
             Stmt::StructDecl(decl) => {
                 self.struct_defs.insert(decl.name.clone(), decl.fields.clone());
                 Ok(Value::Void)
@@ -1132,14 +1153,14 @@ impl Interpreter {
                 Ok(intent_val)
             }
             Stmt::Verify(name, body) => {
-                let total = body.iter().filter(|s| matches!(s, Stmt::Assert(_))).count();
+                let total = body.iter().filter(|s| matches!(s, Stmt::Assert(_) | Stmt::ContractAssert(..))).count();
                 let mut passed = 0usize;
                 let mut failed = false;
                 self.env.push_scope();
                 for s in body {
                     match self.exec_stmt(s) {
                         Ok(_) => {
-                            if matches!(s, Stmt::Assert(_)) {
+                            if matches!(s, Stmt::Assert(_) | Stmt::ContractAssert(..)) {
                                 passed += 1;
                             }
                         }
@@ -4235,6 +4256,353 @@ impl Interpreter {
                         _ => Err(self.type_err("read_file() requires string path".into())),
                     }
                 }
+            }
+            "read_file_bytes" => {
+                // read_file_bytes(path, offset, length) → Tensor of u8 values as f64
+                // If length == -1, reads to end of file.
+                #[cfg(target_arch = "wasm32")]
+                { return Err(self.runtime_err("read_file_bytes not supported in WASM".into())); }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    if args.len() < 3 { return Err(self.type_err("read_file_bytes(path, offset, length) requires 3 args".into())); }
+                    match (&args[0], &args[1], &args[2]) {
+                        (Value::Str(path), Value::Int(offset), Value::Int(length)) => {
+                            use std::io::{Read, Seek, SeekFrom};
+                            let mut file = match std::fs::File::open(path) {
+                                Ok(f) => f,
+                                Err(e) => return Err(self.runtime_err(format!("read_file_bytes: {}", e))),
+                            };
+                            let off = *offset as u64;
+                            file.seek(SeekFrom::Start(off))
+                                .map_err(|e| self.runtime_err(format!("read_file_bytes seek: {}", e)))?;
+                            let len = *length;
+                            let buf = if len < 0 {
+                                let mut b = Vec::new();
+                                file.read_to_end(&mut b)
+                                    .map_err(|e| self.runtime_err(format!("read_file_bytes read: {}", e)))?;
+                                b
+                            } else {
+                                let mut b = vec![0u8; len as usize];
+                                file.read_exact(&mut b)
+                                    .map_err(|e| self.runtime_err(format!("read_file_bytes read: {}", e)))?;
+                                b
+                            };
+                            let data: Vec<f64> = buf.iter().map(|&b| b as f64).collect();
+                            Ok(Value::Tensor(Arc::new(TensorData { shape: vec![data.len()], data })))
+                        }
+                        _ => Err(self.type_err("read_file_bytes(path, offset, length) type error".into())),
+                    }
+                }
+            }
+            "file_size" => {
+                // file_size(path) → Int (file size in bytes)
+                #[cfg(target_arch = "wasm32")]
+                { return Err(self.runtime_err("file_size not supported in WASM".into())); }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    if args.is_empty() { return Err(self.type_err("file_size() requires 1 argument".into())); }
+                    match &args[0] {
+                        Value::Str(path) => {
+                            match std::fs::metadata(path) {
+                                Ok(m) => Ok(Value::Int(m.len() as i64)),
+                                Err(e) => Err(self.runtime_err(format!("file_size: {}", e))),
+                            }
+                        }
+                        _ => Err(self.type_err("file_size() requires string path".into())),
+                    }
+                }
+            }
+            "mmap_gguf" => {
+                // mmap_gguf(path) → [metadata_dict, tensor_info_array]
+                // Parses GGUF v3 header, returns metadata and tensor index for lazy loading.
+                // metadata_dict: array of [key, value] pairs
+                // tensor_info: array of [name, [shape], ggml_type, data_offset_in_file]
+                #[cfg(target_arch = "wasm32")]
+                { return Err(self.runtime_err("mmap_gguf not supported in WASM".into())); }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    if args.is_empty() { return Err(self.type_err("mmap_gguf(path) requires 1 argument".into())); }
+                    match &args[0] {
+                        Value::Str(path) => {
+                            use memmap2::Mmap;
+                            let file = match std::fs::File::open(path) {
+                                Ok(f) => f,
+                                Err(e) => return Err(self.runtime_err(format!("mmap_gguf: {}", e))),
+                            };
+                            let mmap = unsafe { Mmap::map(&file) }
+                                .map_err(|e| self.runtime_err(format!("mmap_gguf mmap: {}", e)))?;
+                            let data = &mmap[..];
+                            if data.len() < 24 {
+                                return Err(self.runtime_err("mmap_gguf: file too small".into()));
+                            }
+                            // Check magic "GGUF" LE = 0x46554747
+                            let magic = u32::from_le_bytes(data[0..4].try_into().unwrap());
+                            if magic != 0x46554747 {
+                                return Err(self.runtime_err(format!("mmap_gguf: bad magic {:08x}", magic)));
+                            }
+                            let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
+                            if version < 2 || version > 3 {
+                                return Err(self.runtime_err(format!("mmap_gguf: unsupported version {}", version)));
+                            }
+                            let n_tensors = u64::from_le_bytes(data[8..16].try_into().unwrap()) as usize;
+                            let n_kv = u64::from_le_bytes(data[16..24].try_into().unwrap()) as usize;
+                            let mut pos = 24usize;
+
+                            // Helper closures
+                            fn read_gguf_string(data: &[u8], pos: &mut usize) -> Option<String> {
+                                if *pos + 8 > data.len() { return None; }
+                                let slen = u64::from_le_bytes(data[*pos..*pos+8].try_into().unwrap()) as usize;
+                                *pos += 8;
+                                if *pos + slen > data.len() { return None; }
+                                let s = String::from_utf8_lossy(&data[*pos..*pos+slen]).to_string();
+                                *pos += slen;
+                                Some(s)
+                            }
+
+                            fn read_gguf_value(data: &[u8], pos: &mut usize, vtype: u32) -> Value {
+                                match vtype {
+                                    0 => { let v = data[*pos] as i64; *pos += 1; Value::Int(v) }
+                                    1 => { let v = data[*pos] as i8 as i64; *pos += 1; Value::Int(v) }
+                                    2 => { let v = u16::from_le_bytes(data[*pos..*pos+2].try_into().unwrap()) as i64; *pos += 2; Value::Int(v) }
+                                    3 => { let v = i16::from_le_bytes(data[*pos..*pos+2].try_into().unwrap()) as i64; *pos += 2; Value::Int(v) }
+                                    4 => { let v = u32::from_le_bytes(data[*pos..*pos+4].try_into().unwrap()) as i64; *pos += 4; Value::Int(v) }
+                                    5 => { let v = i32::from_le_bytes(data[*pos..*pos+4].try_into().unwrap()) as i64; *pos += 4; Value::Int(v) }
+                                    6 => { let v = f32::from_le_bytes(data[*pos..*pos+4].try_into().unwrap()) as f64; *pos += 4; Value::Float(v) }
+                                    7 => { let v = data[*pos] != 0; *pos += 1; Value::Bool(v) }
+                                    8 => {
+                                        match read_gguf_string(data, pos) {
+                                            Some(s) => Value::Str(s),
+                                            None => Value::Void,
+                                        }
+                                    }
+                                    9 => {
+                                        // array
+                                        if *pos + 12 > data.len() { return Value::Void; }
+                                        let inner_type = u32::from_le_bytes(data[*pos..*pos+4].try_into().unwrap());
+                                        *pos += 4;
+                                        let n = u64::from_le_bytes(data[*pos..*pos+8].try_into().unwrap()) as usize;
+                                        *pos += 8;
+                                        let mut arr = Vec::with_capacity(n.min(10000));
+                                        for _ in 0..n {
+                                            arr.push(read_gguf_value(data, pos, inner_type));
+                                        }
+                                        Value::Array(arr)
+                                    }
+                                    10 => { let v = u64::from_le_bytes(data[*pos..*pos+8].try_into().unwrap()) as i64; *pos += 8; Value::Int(v) }
+                                    11 => { let v = i64::from_le_bytes(data[*pos..*pos+8].try_into().unwrap()); *pos += 8; Value::Int(v) }
+                                    12 => { let v = f64::from_le_bytes(data[*pos..*pos+8].try_into().unwrap()); *pos += 8; Value::Float(v) }
+                                    _ => { Value::Void }
+                                }
+                            }
+
+                            // Parse KV metadata
+                            let mut metadata = Vec::with_capacity(n_kv);
+                            let mut alignment = 32u64;
+                            for _ in 0..n_kv {
+                                let key = match read_gguf_string(data, &mut pos) {
+                                    Some(k) => k,
+                                    None => break,
+                                };
+                                if pos + 4 > data.len() { break; }
+                                let vtype = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap());
+                                pos += 4;
+                                let val = read_gguf_value(data, &mut pos, vtype);
+                                if key == "general.alignment" {
+                                    if let Value::Int(a) = &val { alignment = *a as u64; }
+                                }
+                                metadata.push(Value::Array(vec![Value::Str(key), val]));
+                            }
+
+                            // Parse tensor info
+                            let mut tensor_info = Vec::with_capacity(n_tensors);
+                            for _ in 0..n_tensors {
+                                let name = match read_gguf_string(data, &mut pos) {
+                                    Some(n) => n,
+                                    None => break,
+                                };
+                                if pos + 4 > data.len() { break; }
+                                let ndim = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
+                                pos += 4;
+                                let mut shape = Vec::with_capacity(ndim);
+                                for _ in 0..ndim {
+                                    if pos + 8 > data.len() { break; }
+                                    let d = u64::from_le_bytes(data[pos..pos+8].try_into().unwrap()) as i64;
+                                    pos += 8;
+                                    shape.push(Value::Int(d));
+                                }
+                                if pos + 12 > data.len() { break; }
+                                let ggml_type = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap());
+                                pos += 4;
+                                let tensor_offset = u64::from_le_bytes(data[pos..pos+8].try_into().unwrap());
+                                pos += 8;
+                                tensor_info.push(Value::Array(vec![
+                                    Value::Str(name),
+                                    Value::Array(shape),
+                                    Value::Int(ggml_type as i64),
+                                    Value::Int(tensor_offset as i64),
+                                ]));
+                            }
+
+                            // Compute data_origin (aligned)
+                            let rem = pos as u64 % alignment;
+                            let data_origin = if rem != 0 { pos as u64 + (alignment - rem) } else { pos as u64 };
+
+                            // Return [metadata, tensor_info, data_origin, path]
+                            Ok(Value::Array(vec![
+                                Value::Array(metadata),
+                                Value::Array(tensor_info),
+                                Value::Int(data_origin as i64),
+                                Value::Str(path.clone()),
+                            ]))
+                        }
+                        _ => Err(self.type_err("mmap_gguf(path) requires string path".into())),
+                    }
+                }
+            }
+            "q4_0_matvec" => {
+                // q4_0_matvec(raw_bytes_tensor, x_vec, rows, cols) → Tensor[rows]
+                // Performs dequantize-on-the-fly matrix-vector multiply for Q4_0 quantized weights.
+                // raw_bytes_tensor: Tensor of u8 values (from read_file_bytes)
+                // x_vec: Tensor/Array of f64, length == cols
+                // Weight matrix is [rows x cols], stored row-major in Q4_0 blocks.
+                // Q4_0 block: 32 weights → 18 bytes (f16 scale + 16 nibble bytes)
+                if args.len() < 4 { return Err(self.type_err("q4_0_matvec(bytes, x, rows, cols) requires 4 args".into())); }
+                let rows = match &args[2] { Value::Int(r) => *r as usize, _ => return Err(self.type_err("q4_0_matvec: rows must be int".into())) };
+                let cols = match &args[3] { Value::Int(c) => *c as usize, _ => return Err(self.type_err("q4_0_matvec: cols must be int".into())) };
+                let raw = to_f64_slice(&args[0]).ok_or_else(|| self.type_err("q4_0_matvec: bytes must be tensor/array".into()))?;
+                let x = to_f64_slice(&args[1]).ok_or_else(|| self.type_err("q4_0_matvec: x must be tensor/array".into()))?;
+                let raw_s = raw.as_slice();
+                let x_s = x.as_slice();
+                if x_s.len() < cols {
+                    return Err(self.type_err(format!("q4_0_matvec: x.len()={} < cols={}", x_s.len(), cols)));
+                }
+                let blocks_per_row = cols / 32;
+                let bytes_per_row = blocks_per_row * 18;
+                if raw_s.len() < rows * bytes_per_row {
+                    return Err(self.type_err(format!("q4_0_matvec: raw bytes {} < needed {}", raw_s.len(), rows * bytes_per_row)));
+                }
+
+                // Parallel over rows
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let result: Vec<f64> = (0..rows).into_par_iter().map(|row| {
+                        let row_off = row * bytes_per_row;
+                        let mut acc = 0.0f64;
+                        for blk in 0..blocks_per_row {
+                            let boff = row_off + blk * 18;
+                            // Decode f16 scale
+                            let b0 = raw_s[boff] as u16;
+                            let b1 = raw_s[boff + 1] as u16;
+                            let bits = b0 | (b1 << 8);
+                            let sign = (bits >> 15) & 1;
+                            let exp = (bits >> 10) & 0x1f;
+                            let mant = bits & 0x3ff;
+                            let scale: f64 = if exp == 0 {
+                                if mant == 0 { 0.0 } else {
+                                    let m = mant as f64 / 1024.0;
+                                    let v = m * 2.0f64.powi(-14);
+                                    if sign == 1 { -v } else { v }
+                                }
+                            } else if exp == 31 {
+                                if sign == 1 { f64::NEG_INFINITY } else { f64::INFINITY }
+                            } else {
+                                let m = 1.0 + mant as f64 / 1024.0;
+                                let v = m * 2.0f64.powi(exp as i32 - 15);
+                                if sign == 1 { -v } else { v }
+                            };
+                            let x_base = blk * 32;
+                            for i in 0..16 {
+                                let byte_val = raw_s[boff + 2 + i] as u8;
+                                let lo = (byte_val & 0x0f) as i32 - 8;
+                                let hi = (byte_val >> 4) as i32 - 8;
+                                acc += scale * lo as f64 * x_s[x_base + i * 2];
+                                acc += scale * hi as f64 * x_s[x_base + i * 2 + 1];
+                            }
+                        }
+                        acc
+                    }).collect();
+                    Ok(Value::Tensor(Arc::new(TensorData { shape: vec![rows], data: result })))
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let mut result = Vec::with_capacity(rows);
+                    for row in 0..rows {
+                        let row_off = row * bytes_per_row;
+                        let mut acc = 0.0f64;
+                        for blk in 0..blocks_per_row {
+                            let boff = row_off + blk * 18;
+                            let b0 = raw_s[boff] as u16;
+                            let b1 = raw_s[boff + 1] as u16;
+                            let bits = b0 | (b1 << 8);
+                            let sign_bit = (bits >> 15) & 1;
+                            let exp = (bits >> 10) & 0x1f;
+                            let mant = bits & 0x3ff;
+                            let scale: f64 = if exp == 0 {
+                                if mant == 0 { 0.0 } else {
+                                    let m = mant as f64 / 1024.0;
+                                    let v = m * 2.0f64.powi(-14);
+                                    if sign_bit == 1 { -v } else { v }
+                                }
+                            } else if exp == 31 {
+                                if sign_bit == 1 { f64::NEG_INFINITY } else { f64::INFINITY }
+                            } else {
+                                let m = 1.0 + mant as f64 / 1024.0;
+                                let v = m * 2.0f64.powi(exp as i32 - 15);
+                                if sign_bit == 1 { -v } else { v }
+                            };
+                            let x_base = blk * 32;
+                            for i in 0..16 {
+                                let byte_val = raw_s[boff + 2 + i] as u8;
+                                let lo = (byte_val & 0x0f) as i32 - 8;
+                                let hi = (byte_val >> 4) as i32 - 8;
+                                acc += scale * lo as f64 * x_s[x_base + i * 2];
+                                acc += scale * hi as f64 * x_s[x_base + i * 2 + 1];
+                            }
+                        }
+                        result.push(acc);
+                    }
+                    Ok(Value::Tensor(Arc::new(TensorData { shape: vec![rows], data: result })))
+                }
+            }
+            "q4_0_dequantize" => {
+                // q4_0_dequantize(raw_bytes_tensor, numel) → Tensor[numel]
+                // Dequantizes Q4_0 blocks to f64 values.
+                if args.len() < 2 { return Err(self.type_err("q4_0_dequantize(bytes, numel) requires 2 args".into())); }
+                let numel = match &args[1] { Value::Int(n) => *n as usize, _ => return Err(self.type_err("q4_0_dequantize: numel must be int".into())) };
+                let raw = to_f64_slice(&args[0]).ok_or_else(|| self.type_err("q4_0_dequantize: bytes must be tensor/array".into()))?;
+                let raw_s = raw.as_slice();
+                let nblocks = numel / 32;
+                let mut result = Vec::with_capacity(numel);
+                for blk in 0..nblocks {
+                    let boff = blk * 18;
+                    let b0 = raw_s[boff] as u16;
+                    let b1 = raw_s[boff + 1] as u16;
+                    let bits = b0 | (b1 << 8);
+                    let sign = (bits >> 15) & 1;
+                    let exp = (bits >> 10) & 0x1f;
+                    let mant = bits & 0x3ff;
+                    let scale: f64 = if exp == 0 {
+                        if mant == 0 { 0.0 } else {
+                            let m = mant as f64 / 1024.0;
+                            let v = m * 2.0f64.powi(-14);
+                            if sign == 1 { -v } else { v }
+                        }
+                    } else if exp == 31 {
+                        if sign == 1 { f64::NEG_INFINITY } else { f64::INFINITY }
+                    } else {
+                        let m = 1.0 + mant as f64 / 1024.0;
+                        let v = m * 2.0f64.powi(exp as i32 - 15);
+                        if sign == 1 { -v } else { v }
+                    };
+                    for i in 0..16 {
+                        let byte_val = raw_s[boff + 2 + i] as u8;
+                        let lo = (byte_val & 0x0f) as i32 - 8;
+                        let hi = (byte_val >> 4) as i32 - 8;
+                        result.push(scale * lo as f64);
+                        result.push(scale * hi as f64);
+                    }
+                }
+                Ok(Value::Tensor(Arc::new(TensorData { shape: vec![result.len()], data: result })))
             }
             "load_weights_bin" => {
                 // load_weights_bin(path) → [names_array, tensors_array]
@@ -9556,6 +9924,161 @@ impl Interpreter {
                     _ => Err(self.type_err("free_raw() requires (pointer, int) arguments".into())),
                 }
             }
+            // ── GPU FFI helper builtins ───────────────────────────────
+            "ptr_from_int" => {
+                // ptr_from_int(n) -> Pointer (cast integer to pointer)
+                if args.is_empty() { return Err(self.type_err("ptr_from_int() requires 1 int argument".into())); }
+                match &args[0] {
+                    Value::Int(n) => Ok(Value::Pointer(*n as u64)),
+                    _ => Err(self.type_err("ptr_from_int() requires int argument".into())),
+                }
+            }
+            "deref_f32" => {
+                // deref_f32(ptr, idx) -> Float (read f32 at ptr[idx])
+                if args.len() < 2 { return Err(self.type_err("deref_f32() requires (ptr, idx)".into())); }
+                match (&args[0], &args[1]) {
+                    (Value::Pointer(addr), Value::Int(idx)) => {
+                        if *addr == 0 { return Err(self.runtime_err("deref_f32: null pointer".into())); }
+                        let val = unsafe { *(((*addr) as *const f32).add(*idx as usize)) };
+                        Ok(Value::Float(val as f64))
+                    }
+                    _ => Err(self.type_err("deref_f32() requires (pointer, int)".into())),
+                }
+            }
+            "write_f32" => {
+                // write_f32(ptr, idx, val) -> Void (write f32 at ptr[idx])
+                if args.len() < 3 { return Err(self.type_err("write_f32() requires (ptr, idx, val)".into())); }
+                match (&args[0], &args[1], &args[2]) {
+                    (Value::Pointer(addr), Value::Int(idx), val) => {
+                        if *addr == 0 { return Err(self.runtime_err("write_f32: null pointer".into())); }
+                        let f = match val {
+                            Value::Float(f) => *f as f32,
+                            Value::Int(n) => *n as f32,
+                            _ => return Err(self.type_err("write_f32: val must be numeric".into())),
+                        };
+                        unsafe { *(((*addr) as *mut f32).add(*idx as usize)) = f; }
+                        Ok(Value::Void)
+                    }
+                    _ => Err(self.type_err("write_f32() requires (pointer, int, numeric)".into())),
+                }
+            }
+            "deref_i32" => {
+                // deref_i32(ptr, idx) -> Int (read i32 at ptr[idx])
+                if args.len() < 2 { return Err(self.type_err("deref_i32() requires (ptr, idx)".into())); }
+                match (&args[0], &args[1]) {
+                    (Value::Pointer(addr), Value::Int(idx)) => {
+                        if *addr == 0 { return Err(self.runtime_err("deref_i32: null pointer".into())); }
+                        let val = unsafe { *(((*addr) as *const i32).add(*idx as usize)) };
+                        Ok(Value::Int(val as i64))
+                    }
+                    _ => Err(self.type_err("deref_i32() requires (pointer, int)".into())),
+                }
+            }
+            "write_i32" => {
+                // write_i32(ptr, idx, val) -> Void (write i32 at ptr[idx])
+                if args.len() < 3 { return Err(self.type_err("write_i32() requires (ptr, idx, val)".into())); }
+                match (&args[0], &args[1], &args[2]) {
+                    (Value::Pointer(addr), Value::Int(idx), Value::Int(val)) => {
+                        if *addr == 0 { return Err(self.runtime_err("write_i32: null pointer".into())); }
+                        unsafe { *(((*addr) as *mut i32).add(*idx as usize)) = *val as i32; }
+                        Ok(Value::Void)
+                    }
+                    _ => Err(self.type_err("write_i32() requires (pointer, int, int)".into())),
+                }
+            }
+            "tensor_data_f32_ptr" => {
+                // tensor_data_f32_ptr(tensor) -> Pointer
+                // Converts tensor f64 data to f32 and returns pointer to allocated f32 buffer.
+                // Caller is responsible for freeing via free_raw(ptr, n*4).
+                if args.is_empty() { return Err(self.type_err("tensor_data_f32_ptr() requires 1 tensor argument".into())); }
+                let fs = to_f64_slice(&args[0])
+                    .ok_or_else(|| self.type_err("tensor_data_f32_ptr: arg must be tensor/array".into()))?;
+                let data = fs.as_slice();
+                let n = data.len();
+                let layout = std::alloc::Layout::from_size_align(n * 4, 4)
+                    .map_err(|e| self.runtime_err(format!("tensor_data_f32_ptr: {}", e)))?;
+                let ptr = unsafe { std::alloc::alloc(layout) };
+                if ptr.is_null() {
+                    return Err(self.runtime_err("tensor_data_f32_ptr: allocation failed".into()));
+                }
+                let f32_ptr = ptr as *mut f32;
+                for i in 0..n {
+                    unsafe { *f32_ptr.add(i) = data[i] as f32; }
+                }
+                Ok(Value::Pointer(ptr as u64))
+            }
+            "tensor_from_f32_ptr" => {
+                // tensor_from_f32_ptr(ptr, n) -> Tensor
+                // Reads n f32 values from pointer and creates a new tensor (f64).
+                if args.len() < 2 { return Err(self.type_err("tensor_from_f32_ptr() requires (ptr, n)".into())); }
+                match (&args[0], &args[1]) {
+                    (Value::Pointer(addr), Value::Int(n)) => {
+                        if *addr == 0 { return Err(self.runtime_err("tensor_from_f32_ptr: null pointer".into())); }
+                        let n = *n as usize;
+                        let mut data = Vec::with_capacity(n);
+                        let f32_ptr = *addr as *const f32;
+                        for i in 0..n {
+                            data.push(unsafe { *f32_ptr.add(i) } as f64);
+                        }
+                        Ok(Value::Tensor(std::sync::Arc::new(crate::env::TensorData {
+                            shape: vec![n],
+                            data,
+                        })))
+                    }
+                    _ => Err(self.type_err("tensor_from_f32_ptr() requires (pointer, int)".into())),
+                }
+            }
+            "f32_bits" => {
+                // f32_bits(float_val) -> Int (IEEE754 bits of f32)
+                if args.is_empty() { return Err(self.type_err("f32_bits() requires 1 argument".into())); }
+                match &args[0] {
+                    Value::Float(f) => Ok(Value::Int((*f as f32).to_bits() as i64)),
+                    Value::Int(n) => Ok(Value::Int((*n as f32).to_bits() as i64)),
+                    _ => Err(self.type_err("f32_bits() requires numeric argument".into())),
+                }
+            }
+            "f32_from_bits" => {
+                // f32_from_bits(int_bits) -> Float
+                if args.is_empty() { return Err(self.type_err("f32_from_bits() requires 1 argument".into())); }
+                match &args[0] {
+                    Value::Int(n) => Ok(Value::Float(f32::from_bits(*n as u32) as f64)),
+                    _ => Err(self.type_err("f32_from_bits() requires int argument".into())),
+                }
+            }
+            "write_i64" => {
+                // write_i64(ptr, idx, val) -> Void (write i64 at ptr[idx])
+                if args.len() < 3 { return Err(self.type_err("write_i64() requires (ptr, idx, val)".into())); }
+                match (&args[0], &args[1], &args[2]) {
+                    (Value::Pointer(addr), Value::Int(idx), Value::Int(val)) => {
+                        if *addr == 0 { return Err(self.runtime_err("write_i64: null pointer".into())); }
+                        unsafe { *(((*addr) as *mut i64).add(*idx as usize)) = *val; }
+                        Ok(Value::Void)
+                    }
+                    (Value::Pointer(addr), Value::Int(idx), Value::Pointer(val)) => {
+                        if *addr == 0 { return Err(self.runtime_err("write_i64: null pointer".into())); }
+                        unsafe { *(((*addr) as *mut i64).add(*idx as usize)) = *val as i64; }
+                        Ok(Value::Void)
+                    }
+                    _ => Err(self.type_err("write_i64() requires (pointer, int, int|pointer)".into())),
+                }
+            }
+            "memcpy_host" => {
+                // memcpy_host(dst, src, nbytes) -> Void
+                // Host-side memcpy between two pointers
+                if args.len() < 3 { return Err(self.type_err("memcpy_host() requires (dst, src, nbytes)".into())); }
+                match (&args[0], &args[1], &args[2]) {
+                    (Value::Pointer(dst), Value::Pointer(src), Value::Int(n)) => {
+                        if *dst == 0 || *src == 0 { return Err(self.runtime_err("memcpy_host: null pointer".into())); }
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                *src as *const u8, *dst as *mut u8, *n as usize
+                            );
+                        }
+                        Ok(Value::Void)
+                    }
+                    _ => Err(self.type_err("memcpy_host() requires (pointer, pointer, int)".into())),
+                }
+            }
             // ── KV Cache Autoregressive Inference ─────────────────────
             // kv_cache_init(weights_array, D, R, FF, N_LAYER, MAX_SEQ, VOCAB, U_lmh, V_lmh)
             // Converts all weights to f32, allocates KV cache. Call once.
@@ -10152,7 +10675,31 @@ impl Interpreter {
                 let f: extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64 = unsafe { std::mem::transmute(sym) };
                 f(c_args[0], c_args[1], c_args[2], c_args[3], c_args[4], c_args[5])
             }
-            n => return Err(self.runtime_err(format!("extern fn '{}': too many arguments ({}, max 6)", fn_name, n))),
+            7 => {
+                let f: extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i64 = unsafe { std::mem::transmute(sym) };
+                f(c_args[0], c_args[1], c_args[2], c_args[3], c_args[4], c_args[5], c_args[6])
+            }
+            8 => {
+                let f: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64 = unsafe { std::mem::transmute(sym) };
+                f(c_args[0], c_args[1], c_args[2], c_args[3], c_args[4], c_args[5], c_args[6], c_args[7])
+            }
+            9 => {
+                let f: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64 = unsafe { std::mem::transmute(sym) };
+                f(c_args[0], c_args[1], c_args[2], c_args[3], c_args[4], c_args[5], c_args[6], c_args[7], c_args[8])
+            }
+            10 => {
+                let f: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64 = unsafe { std::mem::transmute(sym) };
+                f(c_args[0], c_args[1], c_args[2], c_args[3], c_args[4], c_args[5], c_args[6], c_args[7], c_args[8], c_args[9])
+            }
+            11 => {
+                let f: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64 = unsafe { std::mem::transmute(sym) };
+                f(c_args[0], c_args[1], c_args[2], c_args[3], c_args[4], c_args[5], c_args[6], c_args[7], c_args[8], c_args[9], c_args[10])
+            }
+            12 => {
+                let f: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64 = unsafe { std::mem::transmute(sym) };
+                f(c_args[0], c_args[1], c_args[2], c_args[3], c_args[4], c_args[5], c_args[6], c_args[7], c_args[8], c_args[9], c_args[10], c_args[11])
+            }
+            n => return Err(self.runtime_err(format!("extern fn '{}': too many arguments ({}, max 12)", fn_name, n))),
         };
 
         Ok(Self::c_ret_to_value(raw_ret, &ret_type))

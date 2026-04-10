@@ -390,7 +390,7 @@ impl OwnershipAnalyzer {
             Stmt::Throw(expr) => {
                 self.check_expr_use(expr, line, col);
             }
-            Stmt::Assert(expr) => {
+            Stmt::Assert(expr) | Stmt::ContractAssert(_, _, expr) => {
                 self.check_expr_use(expr, line, col);
             }
             // Declarations that don't affect ownership.

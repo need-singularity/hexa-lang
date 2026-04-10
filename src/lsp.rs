@@ -10,12 +10,14 @@
 //!   - textDocument/definition                        (go-to-definition)
 //!   - textDocument/hover                             (type/signature info)
 //!   - textDocument/rename                            (rename symbol)
+//!   - textDocument/semanticTokens/full               (syntax highlighting)
 
 use std::io::{self, BufRead, Write};
 use std::collections::HashMap;
 
 use crate::ast::*;
 use crate::lexer::Lexer;
+use crate::token::Token;
 use crate::parser::Parser;
 use crate::type_checker::TypeChecker;
 use crate::error::HexaError;
@@ -1146,6 +1148,219 @@ fn handle_rename(uri: &str, source: &str, line: usize, character: usize, new_nam
     ])
 }
 
+// ── Semantic Tokens ───────────────────────────────────────────
+
+/// LSP semantic token type indices (order must match the legend).
+const SEMTOK_KEYWORD: u32    = 0;
+const SEMTOK_FUNCTION: u32   = 1;
+const SEMTOK_VARIABLE: u32   = 2;
+const SEMTOK_STRING: u32     = 3;
+const SEMTOK_NUMBER: u32     = 4;
+const SEMTOK_COMMENT: u32    = 5;
+const SEMTOK_TYPE: u32       = 6;
+const SEMTOK_OPERATOR: u32   = 7;
+const SEMTOK_PARAMETER: u32  = 8;
+const SEMTOK_PROPERTY: u32   = 9;
+const SEMTOK_ENUM_MEMBER: u32 = 10;
+const SEMTOK_DECORATOR: u32  = 11;
+const SEMTOK_NAMESPACE: u32  = 12;
+
+/// Token type legend — order matches the SEMTOK_* constants.
+const SEMANTIC_TOKEN_TYPES: &[&str] = &[
+    "keyword", "function", "variable", "string", "number",
+    "comment", "type", "operator", "parameter", "property",
+    "enumMember", "decorator", "namespace",
+];
+
+/// Token modifier legend (bit flags).
+const SEMANTIC_TOKEN_MODIFIERS: &[&str] = &[
+    "declaration", "definition", "readonly", "static", "defaultLibrary",
+];
+
+/// Build the semantic tokens legend JSON for server capabilities.
+fn semantic_tokens_legend() -> JsonValue {
+    let types: Vec<JsonValue> = SEMANTIC_TOKEN_TYPES.iter()
+        .map(|t| JsonValue::Str(t.to_string()))
+        .collect();
+    let modifiers: Vec<JsonValue> = SEMANTIC_TOKEN_MODIFIERS.iter()
+        .map(|m| JsonValue::Str(m.to_string()))
+        .collect();
+    JsonValue::Object(vec![
+        ("tokenTypes".into(), JsonValue::Array(types)),
+        ("tokenModifiers".into(), JsonValue::Array(modifiers)),
+    ])
+}
+
+/// Compute the length of a token in characters.
+fn token_length(tok: &Token) -> u32 {
+    match tok {
+        // Literals
+        Token::IntLit(n) => {
+            if *n < 0 {
+                format!("{}", n).len() as u32
+            } else {
+                format!("{}", n).len() as u32
+            }
+        }
+        Token::FloatLit(f) => format!("{}", f).len() as u32,
+        Token::StringLit(s) => (s.len() + 2) as u32, // include quotes
+        Token::CharLit(_) => 3, // 'c'
+        Token::BoolLit(b) => if *b { 4 } else { 5 },
+
+        // Identifiers
+        Token::Ident(s) => s.len() as u32,
+
+        // Keywords — just their text length
+        Token::If => 2, Token::Else => 4, Token::Match => 5,
+        Token::For => 3, Token::While => 5, Token::Loop => 4,
+        Token::Break => 5, Token::Continue => 8,
+        Token::Type => 4, Token::Struct => 6, Token::Enum => 4,
+        Token::Trait => 5, Token::Impl => 4, Token::Dyn => 3,
+        Token::Fn => 2, Token::Return => 6, Token::Yield => 5,
+        Token::Async => 5, Token::Await => 5,
+        Token::Let => 3, Token::Mut => 3, Token::Const => 5, Token::Static => 6,
+        Token::Mod => 3, Token::Use => 3, Token::Pub => 3, Token::Crate => 5,
+        Token::Own => 3, Token::Borrow => 6, Token::Move => 4, Token::Drop => 4,
+        Token::Spawn => 5, Token::Channel => 7, Token::Select => 6,
+        Token::Atomic => 6, Token::Scope => 5,
+        Token::Effect => 6, Token::Handle => 6, Token::Resume => 6, Token::Pure => 4,
+        Token::Proof => 5, Token::Assert => 6, Token::Invariant => 9, Token::Theorem => 7,
+        Token::Macro => 5, Token::Derive => 6, Token::Where => 5, Token::Comptime => 8,
+        Token::Try => 3, Token::Catch => 5, Token::Throw => 5,
+        Token::Panic => 5, Token::Recover => 7,
+        Token::Intent => 6, Token::Generate => 8, Token::Verify => 6, Token::Optimize => 8,
+        Token::Extern => 6,
+
+        // Operators
+        Token::Plus | Token::Minus | Token::Star | Token::Slash |
+        Token::Percent | Token::Lt | Token::Gt | Token::Not |
+        Token::BitAnd | Token::BitOr | Token::BitXor | Token::BitNot |
+        Token::Eq | Token::Dot => 1,
+        Token::Power | Token::EqEq | Token::NotEq | Token::LtEq | Token::GtEq |
+        Token::And | Token::Or | Token::Xor | Token::ColonEq |
+        Token::DotDot | Token::Arrow | Token::FatArrow |
+        Token::ColonColon => 2,
+        Token::DotDotEq => 3,
+
+        // Delimiters
+        Token::LParen | Token::RParen | Token::LBrace | Token::RBrace |
+        Token::LBracket | Token::RBracket |
+        Token::Comma | Token::Colon | Token::Semicolon => 1,
+
+        // Attribute: @name
+        Token::Attribute(name) => (name.len() + 1) as u32, // +1 for '@'
+
+        // Special
+        Token::HashLBrace => 2,
+        Token::Newline | Token::Eof => 0,
+    }
+}
+
+/// Map a hexa Token to an LSP semantic token type index.
+/// Returns None for tokens that shouldn't be highlighted (newlines, delimiters, etc.).
+fn semantic_token_type(tok: &Token) -> Option<u32> {
+    match tok {
+        // Keywords
+        Token::If | Token::Else | Token::Match | Token::For | Token::While |
+        Token::Loop | Token::Break | Token::Continue |
+        Token::Type | Token::Struct | Token::Enum | Token::Trait | Token::Impl | Token::Dyn |
+        Token::Fn | Token::Return | Token::Yield | Token::Async | Token::Await |
+        Token::Let | Token::Mut | Token::Const | Token::Static |
+        Token::Mod | Token::Use | Token::Pub | Token::Crate |
+        Token::Own | Token::Borrow | Token::Move | Token::Drop |
+        Token::Spawn | Token::Channel | Token::Select | Token::Atomic | Token::Scope |
+        Token::Effect | Token::Handle | Token::Resume | Token::Pure |
+        Token::Proof | Token::Assert | Token::Invariant | Token::Theorem |
+        Token::Macro | Token::Derive | Token::Where | Token::Comptime |
+        Token::Try | Token::Catch | Token::Throw | Token::Panic | Token::Recover |
+        Token::Intent | Token::Generate | Token::Verify | Token::Optimize |
+        Token::Extern => Some(SEMTOK_KEYWORD),
+
+        Token::BoolLit(_) => Some(SEMTOK_KEYWORD), // true/false as keywords
+
+        // Literals
+        Token::StringLit(_) | Token::CharLit(_) => Some(SEMTOK_STRING),
+        Token::IntLit(_) | Token::FloatLit(_) => Some(SEMTOK_NUMBER),
+
+        // Identifiers — heuristic: uppercase initial = type, else variable
+        Token::Ident(name) => {
+            if name.len() > 0 && name.as_bytes()[0].is_ascii_uppercase() {
+                Some(SEMTOK_TYPE)
+            } else {
+                Some(SEMTOK_VARIABLE)
+            }
+        }
+
+        // Operators
+        Token::Plus | Token::Minus | Token::Star | Token::Slash | Token::Percent |
+        Token::Power | Token::EqEq | Token::NotEq | Token::Lt | Token::Gt |
+        Token::LtEq | Token::GtEq | Token::And | Token::Or | Token::Not |
+        Token::Xor | Token::BitAnd | Token::BitOr | Token::BitXor | Token::BitNot |
+        Token::Eq | Token::ColonEq | Token::DotDot | Token::DotDotEq |
+        Token::Arrow | Token::FatArrow => Some(SEMTOK_OPERATOR),
+
+        // Attributes => decorator
+        Token::Attribute(_) => Some(SEMTOK_DECORATOR),
+
+        // Delimiters, newlines, EOF — not highlighted
+        _ => None,
+    }
+}
+
+/// Handle textDocument/semanticTokens/full.
+/// Returns the LSP SemanticTokens response with encoded `data` array.
+///
+/// The encoding uses relative positions per LSP spec:
+///   [deltaLine, deltaStartChar, length, tokenType, tokenModifiers]
+fn handle_semantic_tokens(source: &str) -> JsonValue {
+    let mut lexer = Lexer::new(source);
+    let tokens = match lexer.tokenize() {
+        Ok(t) => t,
+        Err(_) => return JsonValue::Object(vec![
+            ("data".into(), JsonValue::Array(vec![])),
+        ]),
+    };
+
+    let mut data: Vec<JsonValue> = Vec::new();
+    let mut prev_line: u32 = 0;
+    let mut prev_col: u32 = 0;
+
+    for spanned in &tokens {
+        let tok_type = match semantic_token_type(&spanned.token) {
+            Some(t) => t,
+            None => continue,
+        };
+        let length = token_length(&spanned.token);
+        if length == 0 {
+            continue;
+        }
+
+        // LSP lines/cols are 0-based; Spanned.span.line/col are 1-based
+        let line = (spanned.span.line as u32).saturating_sub(1);
+        let col = (spanned.span.col as u32).saturating_sub(1);
+
+        let delta_line = line - prev_line;
+        let delta_col = if delta_line == 0 {
+            col - prev_col
+        } else {
+            col
+        };
+
+        data.push(JsonValue::Number(delta_line as f64));
+        data.push(JsonValue::Number(delta_col as f64));
+        data.push(JsonValue::Number(length as f64));
+        data.push(JsonValue::Number(tok_type as f64));
+        data.push(JsonValue::Number(0.0)); // no modifiers
+
+        prev_line = line;
+        prev_col = col;
+    }
+
+    JsonValue::Object(vec![
+        ("data".into(), JsonValue::Array(data)),
+    ])
+}
+
 fn initialize_result() -> JsonValue {
     JsonValue::Object(vec![
         ("capabilities".into(), JsonValue::Object(vec![
@@ -1166,6 +1381,10 @@ fn initialize_result() -> JsonValue {
             ("definitionProvider".into(), JsonValue::Bool(true)),
             ("hoverProvider".into(), JsonValue::Bool(true)),
             ("renameProvider".into(), JsonValue::Bool(true)),
+            ("semanticTokensProvider".into(), JsonValue::Object(vec![
+                ("legend".into(), semantic_tokens_legend()),
+                ("full".into(), JsonValue::Bool(true)),
+            ])),
             ("diagnosticProvider".into(), JsonValue::Object(vec![
                 ("identifier".into(), JsonValue::Str("hexa".into())),
                 ("interFileDependencies".into(), JsonValue::Bool(false)),
@@ -1311,6 +1530,18 @@ pub fn run_lsp() {
                         .unwrap_or(0) as usize;
                     let source = docs.get(uri).map(|s| s.as_str()).unwrap_or("");
                     let result = handle_hover(source, line, character);
+                    let resp = make_response(id, result);
+                    let _ = send_message(&mut writer, &resp.to_json());
+                }
+            }
+            "textDocument/semanticTokens/full" => {
+                if let Some(ref id) = id {
+                    let uri = params.get("textDocument")
+                        .and_then(|td| td.get("uri"))
+                        .and_then(|u| u.as_str())
+                        .unwrap_or("");
+                    let source = docs.get(uri).map(|s| s.as_str()).unwrap_or("");
+                    let result = handle_semantic_tokens(source);
                     let resp = make_response(id, result);
                     let _ = send_message(&mut writer, &resp.to_json());
                 }
@@ -1734,5 +1965,150 @@ mod tests {
         // Count occurrences of "num" in the output (at least 3: def + 2 uses)
         let count = json.matches("\"num\"").count();
         assert!(count >= 3, "expected at least 3 edit entries for 'val', got {}", count);
+    }
+
+    // ── Semantic Tokens tests ─────────────────────────────────
+
+    #[test]
+    fn test_semantic_tokens_legend() {
+        let legend = semantic_tokens_legend();
+        let types = legend.get("tokenTypes").unwrap();
+        let mods = legend.get("tokenModifiers").unwrap();
+        if let JsonValue::Array(arr) = types {
+            assert_eq!(arr.len(), SEMANTIC_TOKEN_TYPES.len());
+            // First entry should be "keyword"
+            assert_eq!(arr[0].as_str().unwrap(), "keyword");
+        } else {
+            panic!("tokenTypes should be array");
+        }
+        if let JsonValue::Array(arr) = mods {
+            assert_eq!(arr.len(), SEMANTIC_TOKEN_MODIFIERS.len());
+        } else {
+            panic!("tokenModifiers should be array");
+        }
+    }
+
+    #[test]
+    fn test_semantic_tokens_basic() {
+        let result = handle_semantic_tokens("let x = 42");
+        let data = result.get("data").unwrap();
+        if let JsonValue::Array(arr) = data {
+            // Should have tokens: let(keyword), x(variable), =(operator), 42(number)
+            // Each token is 5 entries
+            assert_eq!(arr.len() % 5, 0, "data length must be multiple of 5");
+            assert!(arr.len() >= 20, "should have at least 4 tokens (20 entries), got {}", arr.len());
+
+            // First token: "let" at line 0, col 0, length 3, type keyword
+            assert_eq!(arr[0].as_i64().unwrap(), 0); // deltaLine
+            assert_eq!(arr[1].as_i64().unwrap(), 0); // deltaStartChar
+            assert_eq!(arr[2].as_i64().unwrap(), 3); // length
+            assert_eq!(arr[3].as_i64().unwrap(), SEMTOK_KEYWORD as i64); // tokenType
+        } else {
+            panic!("data should be array");
+        }
+    }
+
+    #[test]
+    fn test_semantic_tokens_multiline() {
+        let source = "let x = 1\nlet y = 2";
+        let result = handle_semantic_tokens(source);
+        let data = result.get("data").unwrap();
+        if let JsonValue::Array(arr) = data {
+            assert!(arr.len() >= 40, "should have tokens on both lines");
+            // Find the second "let" — it should have deltaLine=1
+            // First 5 entries are first "let", next 5 are "x", next 5 are "=", next 5 are "1"
+            // Then 5 entries for second "let" at index 20
+            let second_let_delta_line = arr[20].as_i64().unwrap();
+            assert_eq!(second_let_delta_line, 1, "second let should be on next line");
+        } else {
+            panic!("data should be array");
+        }
+    }
+
+    #[test]
+    fn test_semantic_tokens_empty() {
+        let result = handle_semantic_tokens("");
+        let data = result.get("data").unwrap();
+        if let JsonValue::Array(arr) = data {
+            assert!(arr.is_empty(), "empty source should produce no tokens");
+        } else {
+            panic!("data should be array");
+        }
+    }
+
+    #[test]
+    fn test_semantic_tokens_string_lit() {
+        let result = handle_semantic_tokens("\"hello\"");
+        let data = result.get("data").unwrap();
+        if let JsonValue::Array(arr) = data {
+            assert!(arr.len() >= 5, "should have at least one token");
+            assert_eq!(arr[3].as_i64().unwrap(), SEMTOK_STRING as i64);
+        } else {
+            panic!("data should be array");
+        }
+    }
+
+    #[test]
+    fn test_semantic_tokens_type_ident() {
+        // Uppercase ident should be classified as type
+        let result = handle_semantic_tokens("let p: Point = x");
+        let data = result.get("data").unwrap();
+        if let JsonValue::Array(arr) = data {
+            // Find "Point" token — should have type SEMTOK_TYPE
+            let token_count = arr.len() / 5;
+            let mut found_type = false;
+            for i in 0..token_count {
+                let tok_type = arr[i * 5 + 3].as_i64().unwrap();
+                if tok_type == SEMTOK_TYPE as i64 {
+                    found_type = true;
+                    break;
+                }
+            }
+            assert!(found_type, "uppercase ident 'Point' should be classified as type");
+        } else {
+            panic!("data should be array");
+        }
+    }
+
+    #[test]
+    fn test_semantic_tokens_attribute() {
+        let result = handle_semantic_tokens("@pure");
+        let data = result.get("data").unwrap();
+        if let JsonValue::Array(arr) = data {
+            assert!(arr.len() >= 5, "should have at least one token for @pure");
+            assert_eq!(arr[3].as_i64().unwrap(), SEMTOK_DECORATOR as i64);
+        } else {
+            panic!("data should be array");
+        }
+    }
+
+    #[test]
+    fn test_semantic_tokens_capability_registered() {
+        let result = initialize_result();
+        let caps = result.get("capabilities").unwrap();
+        let stp = caps.get("semanticTokensProvider");
+        assert!(stp.is_some(), "should advertise semanticTokensProvider");
+        let stp = stp.unwrap();
+        assert!(stp.get("legend").is_some(), "should have legend");
+        assert!(stp.get("full").is_some(), "should have full support");
+    }
+
+    #[test]
+    fn test_semantic_tokens_invalid_source() {
+        // Should not panic on invalid source
+        let result = handle_semantic_tokens("{{{{");
+        let data = result.get("data").unwrap();
+        // May or may not have tokens, but should not crash
+        if let JsonValue::Array(_) = data { /* ok */ } else {
+            panic!("data should be array even for invalid source");
+        }
+    }
+
+    #[test]
+    fn test_token_length_keywords() {
+        assert_eq!(token_length(&Token::Let), 3);
+        assert_eq!(token_length(&Token::Fn), 2);
+        assert_eq!(token_length(&Token::Continue), 8);
+        assert_eq!(token_length(&Token::Struct), 6);
     }
 }

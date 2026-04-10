@@ -119,6 +119,8 @@ mod package;
 #[allow(dead_code)]
 mod singularity;
 #[allow(dead_code)]
+mod trace_jit;
+#[allow(dead_code)]
 mod ir;
 #[allow(dead_code)]
 mod lower;
@@ -2718,5 +2720,180 @@ mod tests {
         // Range
         assert!(package::version_matches("1.5.0", ">=1.0.0,<2.0.0"));
         assert!(!package::version_matches("2.0.0", ">=1.0.0,<2.0.0"));
+    }
+
+    // ── @contract Option A tests ──────────────────────────────────────
+
+    /// Helper: parse + interpret a hexa source string, return Ok(()) or the error.
+    fn run_hexa(source: &str) -> Result<env::Value, crate::error::HexaError> {
+        let tokens = lexer::Lexer::new(source).tokenize().unwrap();
+        let stmts = parser::Parser::new(tokens).parse().unwrap();
+        let mut interp = interpreter::Interpreter::new();
+        interp.run(&stmts)
+    }
+
+    #[test]
+    fn test_contract_requires_pass() {
+        // requires: x > 0 should pass when called with x=5
+        let src = r#"
+@contract(requires: x > 0)
+fn positive(x) {
+    return x * 2
+}
+positive(5)
+"#;
+        let result = run_hexa(src);
+        assert!(result.is_ok(), "requires should pass for x=5");
+        assert_eq!(format!("{}", result.unwrap()), "10");
+    }
+
+    #[test]
+    fn test_contract_requires_violation() {
+        // requires: x > 0 should fail when called with x=-1
+        let src = r#"
+@contract(requires: x > 0)
+fn positive(x) {
+    return x * 2
+}
+positive(-1)
+"#;
+        let result = run_hexa(src);
+        assert!(result.is_err(), "requires should fail for x=-1");
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("contract violation") && err.message.contains("requires"),
+            "error should mention contract violation and requires, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_contract_ensures_pass() {
+        // ensures: result > 0 should pass when function returns 6
+        let src = r#"
+@contract(ensures: result > 0)
+fn double(x) {
+    return x * 2
+}
+double(3)
+"#;
+        let result = run_hexa(src);
+        assert!(result.is_ok(), "ensures should pass when result=6");
+        assert_eq!(format!("{}", result.unwrap()), "6");
+    }
+
+    #[test]
+    fn test_contract_ensures_violation() {
+        // ensures: result > 10 should fail when function returns 4
+        let src = r#"
+@contract(ensures: result > 10)
+fn small(x) {
+    return x + 1
+}
+small(3)
+"#;
+        let result = run_hexa(src);
+        assert!(result.is_err(), "ensures should fail when result=4 < 10");
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("contract violation") && err.message.contains("ensures"),
+            "error should mention contract violation and ensures, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_contract_requires_and_ensures_combined() {
+        // Both requires and ensures: x > 0, result > x
+        let src = r#"
+@contract(requires: x > 0, ensures: result > x)
+fn inc(x) {
+    return x + 1
+}
+inc(5)
+"#;
+        let result = run_hexa(src);
+        assert!(result.is_ok(), "both requires and ensures should pass");
+        assert_eq!(format!("{}", result.unwrap()), "6");
+    }
+
+    #[test]
+    fn test_contract_combined_requires_violation() {
+        // Combined contract, requires fails
+        let src = r#"
+@contract(requires: x > 0, ensures: result > x)
+fn inc(x) {
+    return x + 1
+}
+inc(-5)
+"#;
+        let result = run_hexa(src);
+        assert!(result.is_err(), "requires should fail for x=-5");
+        assert!(result.unwrap_err().message.contains("requires"));
+    }
+
+    #[test]
+    fn test_contract_combined_ensures_violation() {
+        // Combined contract, requires passes but ensures fails
+        let src = r#"
+@contract(requires: x > 0, ensures: result > 100)
+fn inc(x) {
+    return x + 1
+}
+inc(5)
+"#;
+        let result = run_hexa(src);
+        assert!(result.is_err(), "ensures should fail when result=6 < 100");
+        assert!(result.unwrap_err().message.contains("ensures"));
+    }
+
+    #[test]
+    fn test_contract_ensures_with_early_return() {
+        // ensures should be checked even on early return paths
+        let src = r#"
+@contract(ensures: result > 0)
+fn abs_val(x) {
+    if x >= 0 {
+        return x
+    }
+    return 0 - x
+}
+abs_val(-7)
+"#;
+        let result = run_hexa(src);
+        assert!(result.is_ok(), "ensures should pass: abs(-7) = 7 > 0");
+        assert_eq!(format!("{}", result.unwrap()), "7");
+    }
+
+    #[test]
+    fn test_contract_ensures_early_return_violation() {
+        // ensures violation on early return path
+        let src = r#"
+@contract(ensures: result > 5)
+fn maybe_small(x) {
+    if x < 0 {
+        return 1
+    }
+    return x + 10
+}
+maybe_small(-1)
+"#;
+        let result = run_hexa(src);
+        assert!(result.is_err(), "ensures should fail: early return 1 < 5");
+        assert!(result.unwrap_err().message.contains("ensures"));
+    }
+
+    #[test]
+    fn test_contract_multiple_requires() {
+        // Multiple requires conditions via combined expression
+        let src = r#"
+@contract(requires: x > 0, requires: x < 100)
+fn bounded(x) {
+    return x
+}
+bounded(50)
+"#;
+        let result = run_hexa(src);
+        assert!(result.is_ok(), "both requires should pass for x=50");
     }
 }
