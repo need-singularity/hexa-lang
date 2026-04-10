@@ -1,5 +1,7 @@
 # AI-Native Grammar System
 
+> **SoT 포인터 (R14)**: @attr 상태/수치 값의 단일 진실은 `shared/hexa-lang/ai-native.json` — 본 문서는 **narrative companion** (배경/유도/M0~M99 돌파 이력). 상태 불일치 시 JSON을 신뢰.
+
 > 2026-04-07 — Hexa-lang AI-native @attr 시스템 돌파
 
 ## 개요
