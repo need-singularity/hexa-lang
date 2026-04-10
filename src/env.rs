@@ -627,10 +627,12 @@ impl Env {
         }
         let mut out = Vec::with_capacity(self.vars.len() - start_idx);
         for (name, val) in self.vars.iter().skip(start_idx) {
-            // Skip Fn values: pub fns are exported via pub_bindings,
-            // private fns are intentionally module-local. Promoting them
-            // to statics would leak private fns to the global namespace.
-            if matches!(val, Value::Fn(_) | Value::BuiltinFn(_)) {
+            // Skip function-like values: pub fns are exported via pub_bindings,
+            // private fns are intentionally module-local. Promoting them to
+            // statics would leak private fns to the global namespace AND, in
+            // the case of Lambdas, freeze a captured snapshot of the surrounding
+            // env (defeating the very purpose of this promotion).
+            if matches!(val, Value::Fn(_) | Value::BuiltinFn(_) | Value::Lambda(_)) {
                 continue;
             }
             out.push((name.clone(), val.clone()));

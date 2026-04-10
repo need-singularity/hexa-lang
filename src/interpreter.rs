@@ -450,6 +450,12 @@ pub struct Interpreter {
     /// P13 골화: Value::Error에 string method 호출 시 1회만 경고.
     /// 키 포맷: "{method}::{msg prefix}" — 중복 경고 억제.
     error_fallback_warned: std::collections::HashSet<String>,
+    /// FIX-8C-followup: true while exec_use is loading a module. Forces FnDecl
+    /// to be stored as Value::Fn (no closure capture) so module-level mut
+    /// globals can flow through statics rather than being captured at fn
+    /// definition time. Without this, fns inside a `use`d module became
+    /// Lambdas with a frozen snapshot of initial values, defeating FIX-8C.
+    in_module_load: bool,
 }
 
 /// Stored data for a loaded/declared module.
@@ -534,6 +540,7 @@ impl Interpreter {
             gen_buffer: Vec::new(),
             gen_active: false,
             error_fallback_warned: std::collections::HashSet::new(),
+            in_module_load: false,
         }
     }
 
@@ -1079,7 +1086,11 @@ impl Interpreter {
                     let body_arc = Arc::new(decl.body.clone());
                     // When defining a function inside a nested scope (depth > 1),
                     // capture the environment so closures across 3+ scope levels work.
-                    let fn_val = if self.env.scope_depth() > 1 {
+                    // EXCEPTION: when loading a module via exec_use, the module's
+                    // own scope is depth>1 but the fns there are NOT closures —
+                    // they should resolve module-level mut globals through statics
+                    // (FIX-8C). Capturing here would freeze the initial values.
+                    let fn_val = if self.env.scope_depth() > 1 && !self.in_module_load {
                         let captured = self.capture_env();
                         Value::Lambda(Box::new((param_names, body_arc, captured)))
                     } else {
@@ -11234,6 +11245,8 @@ impl Interpreter {
         let load_start = std::time::Instant::now();
         crate::hexa_log!(info, "exec_use START module={} stmts={}", module_name, stmts.len());
 
+        let prev_in_module_load = self.in_module_load;
+        self.in_module_load = true;
         self.env.push_scope();
         let module_scope_start = self.env.vars_len();
 
@@ -11324,6 +11337,7 @@ impl Interpreter {
         let pub_count = mod_data.pub_bindings.len();
         let elapsed_ms = load_start.elapsed().as_millis();
         self.modules.insert(module_name.clone(), mod_data);
+        self.in_module_load = prev_in_module_load;
         crate::hexa_log!(info, "exec_use DONE module={} elapsed={}ms pubs={}",
             module_name, elapsed_ms, pub_count);
         Ok(())
