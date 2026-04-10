@@ -6311,13 +6311,65 @@ impl Interpreter {
                     Ok(Value::Array(result))
                 } else { Err(self.type_err("randn() requires int".into())) }
             }
-            "arange" | "range" => {
-                // arange(n) → [0.0, 1.0, ..., n-1.0]
+            "arange" => {
+                // arange(n) → [0.0, 1.0, ..., n-1.0] (float variant)
                 if args.is_empty() { return Err(self.type_err("arange() requires 1 int argument".into())); }
                 if let Value::Int(n) = &args[0] {
                     let result: Vec<Value> = (0..*n).map(|i| Value::Float(i as f64)).collect();
                     Ok(Value::Array(result))
                 } else { Err(self.type_err("arange() requires int".into())) }
+            }
+            "range" => {
+                // range(n) → [0, 1, ..., n-1]
+                // range(start, stop) → [start, start+1, ..., stop-1]
+                // range(start, stop, step) → same with step
+                // Int-preserving (returns Value::Int, not Float).
+                match args.len() {
+                    1 => {
+                        if let Value::Int(n) = &args[0] {
+                            let result: Vec<Value> = (0..*n).map(Value::Int).collect();
+                            Ok(Value::Array(result))
+                        } else { Err(self.type_err("range(n): n must be int".into())) }
+                    }
+                    2 => {
+                        if let (Value::Int(s), Value::Int(e)) = (&args[0], &args[1]) {
+                            let result: Vec<Value> = (*s..*e).map(Value::Int).collect();
+                            Ok(Value::Array(result))
+                        } else { Err(self.type_err("range(start, stop): both must be int".into())) }
+                    }
+                    3 => {
+                        if let (Value::Int(s), Value::Int(e), Value::Int(st)) = (&args[0], &args[1], &args[2]) {
+                            if *st == 0 { return Err(self.runtime_err("range(): step cannot be 0".into())); }
+                            let mut result = Vec::new();
+                            let mut i = *s;
+                            if *st > 0 {
+                                while i < *e { result.push(Value::Int(i)); i += *st; }
+                            } else {
+                                while i > *e { result.push(Value::Int(i)); i += *st; }
+                            }
+                            Ok(Value::Array(result))
+                        } else { Err(self.type_err("range(start, stop, step): all must be int".into())) }
+                    }
+                    _ => Err(self.type_err("range() takes 1, 2, or 3 int arguments".into())),
+                }
+            }
+            "sort" => {
+                // Free-function form: sort([...]) → sorted copy.
+                // Array method form is handled in the array-method dispatch.
+                if args.len() != 1 { return Err(self.type_err("sort(array) requires 1 argument".into())); }
+                match &args[0] {
+                    Value::Array(arr) => {
+                        let mut new_arr = arr.to_vec();
+                        new_arr.sort_by(|a, b| match (a, b) {
+                            (Value::Int(x), Value::Int(y)) => x.cmp(y),
+                            (Value::Float(x), Value::Float(y)) => x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal),
+                            (Value::Str(x), Value::Str(y)) => x.cmp(y),
+                            _ => format!("{}", a).cmp(&format!("{}", b)),
+                        });
+                        Ok(Value::Array(new_arr))
+                    }
+                    _ => Err(self.type_err("sort() requires an array".into())),
+                }
             }
             // ── Learning utility builtins ──
             "ema" => {
