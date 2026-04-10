@@ -179,15 +179,17 @@ HexaVal hexa_array_new() {
 }
 
 HexaVal hexa_array_push(HexaVal arr, HexaVal item) {
-    HexaVal result = {.tag=TAG_ARRAY};
     int new_len = arr.arr.len + 1;
-    int new_cap = new_len > arr.arr.cap ? (new_len * 2) : arr.arr.cap;
-    result.arr.items = malloc(sizeof(HexaVal) * new_cap);
-    if (arr.arr.len > 0) memcpy(result.arr.items, arr.arr.items, sizeof(HexaVal) * arr.arr.len);
-    result.arr.items[arr.arr.len] = item;
-    result.arr.len = new_len;
-    result.arr.cap = new_cap;
-    return result;
+    if (new_len > arr.arr.cap) {
+        int new_cap = new_len < 8 ? 8 : new_len * 2;
+        HexaVal* new_items = realloc(arr.arr.items, sizeof(HexaVal) * new_cap);
+        if (!new_items) { fprintf(stderr, "OOM in array_push\n"); exit(1); }
+        arr.arr.items = new_items;
+        arr.arr.cap = new_cap;
+    }
+    arr.arr.items[arr.arr.len] = item;
+    arr.arr.len = new_len;
+    return arr;
 }
 
 HexaVal hexa_array_get(HexaVal arr, int64_t idx) {
@@ -205,12 +207,9 @@ HexaVal hexa_array_set(HexaVal arr, int64_t idx, HexaVal val) {
         fprintf(stderr, "index %lld out of bounds (len %d)\n", (long long)idx, arr.arr.len);
         exit(1);
     }
-    // Copy-on-write: make a shallow copy
-    HexaVal result = arr;
-    result.arr.items = (HexaVal*)malloc(sizeof(HexaVal) * arr.arr.cap);
-    memcpy(result.arr.items, arr.arr.items, sizeof(HexaVal) * arr.arr.len);
-    result.arr.items[idx] = val;
-    return result;
+    // In-place mutate (no copy — caller reassigns)
+    arr.arr.items[idx] = val;
+    return arr;
 }
 
 int hexa_len(HexaVal v) {

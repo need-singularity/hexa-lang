@@ -363,7 +363,7 @@ HexaVal tokenize(HexaVal source) {
                                                                     s = hexa_add(s, hexa_str("\""));
                                                                 } else {
                                                                     if (hexa_truthy(hexa_eq(esc, hexa_str("0")))) {
-                                                                        s = hexa_add(s, hexa_str(" "));
+                                                                        s = hexa_add(s, hexa_str(""));
                                                                     } else {
                                                                         s = hexa_add(s, hexa_to_string(esc));
                                                                     }
@@ -415,7 +415,7 @@ HexaVal tokenize(HexaVal source) {
                                                                 ch_val = hexa_str("'");
                                                             } else {
                                                                 if (hexa_truthy(hexa_eq(esc, hexa_str("0")))) {
-                                                                    ch_val = hexa_str(" ");
+                                                                    ch_val = hexa_str("");
                                                                 } else {
                                                                     ch_val = hexa_to_string(esc);
                                                                 }
