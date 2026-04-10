@@ -10117,10 +10117,29 @@ impl Interpreter {
             }
             "ptr_addr" => {
                 // ptr_addr(ptr) -> Int (address as integer)
+                // Permissive: Int passes through (already an address). Null/Void → 0.
+                // This unblocks scripts that store pointer-as-int (e.g. grad_table key)
+                // and pass it back to ptr_addr later.
                 if args.is_empty() { return Err(self.type_err("ptr_addr() requires 1 argument".into())); }
                 match &args[0] {
                     Value::Pointer(addr) => Ok(Value::Int(*addr as i64)),
-                    _ => Err(self.type_err("ptr_addr() requires pointer argument".into())),
+                    Value::Int(n) => Ok(Value::Int(*n)),
+                    Value::Void => Ok(Value::Int(0)),
+                    other => {
+                        crate::hexa_log!(info, "ptr_addr called on non-pointer: {:?}", other);
+                        Err(self.type_err(format!(
+                            "ptr_addr() requires pointer argument, got {}",
+                            match other {
+                                Value::Float(_) => "float",
+                                Value::Bool(_) => "bool",
+                                Value::Str(_) => "string",
+                                Value::Array(_) => "array",
+                                Value::Map(_) => "map",
+                                Value::Fn(_) | Value::Lambda(_) | Value::BuiltinFn(_) => "function",
+                                _ => "other",
+                            }
+                        )))
+                    }
                 }
             }
             "deref" => {
