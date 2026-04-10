@@ -6,8 +6,9 @@
 
 | 항목 | 파일 | 내용 |
 |------|------|------|
-| 절대 규칙 | `shared/absolute_rules.json` | 공통 R1~R21 + HX1~HX6 |
 | 보호 체계 | `shared/core-lockdown.json` | L0/L1/L2 잠금 (src/ L0) |
+| 절대 규칙 | `shared/absolute_rules.json` | 공통 R1~R21 + HX1~HX6 |
+| 프로젝트 레지스트리 | `shared/projects.json` | 7개 프로젝트 정의 + 번들/검증 스키마 |
 | 프로젝트 설정 | `shared/project_config.json` | CLI/빌드/DSE 수렴/문법 요약/실행 모델 |
 | 시스템 코어 | `shared/core.json` | 시스템맵 + 14종 명령어 |
 | 수렴 | `shared/convergence/hexa-lang.json` | CDO 수렴 상태 |
