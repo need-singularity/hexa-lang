@@ -1705,6 +1705,7 @@ impl Parser {
                 _ => break,
             };
             self.advance();
+            self.skip_newlines();
             let right = self.parse_and()?;
             left = Expr::Binary(Box::new(left), op, Box::new(right));
         }
@@ -1719,6 +1720,7 @@ impl Parser {
                 break;
             }
             self.advance();
+            self.skip_newlines();
             let right = self.parse_comparison()?;
             left = Expr::Binary(Box::new(left), BinOp::And, Box::new(right));
         }
@@ -1739,6 +1741,7 @@ impl Parser {
                 _ => break,
             };
             self.advance();
+            self.skip_newlines();
             let right = self.parse_addition()?;
             left = Expr::Binary(Box::new(left), op, Box::new(right));
         }
@@ -1757,6 +1760,7 @@ impl Parser {
                 _ => break,
             };
             self.advance();
+            self.skip_newlines();
             let right = self.parse_multiplication()?;
             left = Expr::Binary(Box::new(left), op, Box::new(right));
         }
@@ -1775,6 +1779,7 @@ impl Parser {
                 _ => break,
             };
             self.advance();
+            self.skip_newlines();
             let right = self.parse_unary()?;
             left = Expr::Binary(Box::new(left), op, Box::new(right));
         }
@@ -1814,8 +1819,15 @@ impl Parser {
                 }
                 Token::Dot => {
                     self.advance();
-                    let field = self.expect_ident()?;
-                    expr = Expr::Field(Box::new(expr), field);
+                    // Tuple field access: expr.0, expr.1, ...
+                    if let Token::IntLit(n) = self.peek() {
+                        let idx = *n;
+                        self.advance();
+                        expr = Expr::Index(Box::new(expr), Box::new(Expr::IntLit(idx)));
+                    } else {
+                        let field = self.expect_ident()?;
+                        expr = Expr::Field(Box::new(expr), field);
+                    }
                 }
                 Token::LBracket => {
                     self.advance();
