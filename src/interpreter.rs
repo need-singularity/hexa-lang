@@ -3167,6 +3167,15 @@ impl Interpreter {
                 }
                 Ok(Value::Array(result))
             }
+            // String repetition: "=" * 60 → "===...==="
+            (Value::Str(s), BinOp::Mul, Value::Int(n)) => {
+                if *n < 0 { return Ok(Value::Str(String::new())); }
+                Ok(Value::Str(s.repeat(*n as usize)))
+            }
+            (Value::Int(n), BinOp::Mul, Value::Str(s)) => {
+                if *n < 0 { return Ok(Value::Str(String::new())); }
+                Ok(Value::Str(s.repeat(*n as usize)))
+            }
             // Array equality
             (Value::Array(a), BinOp::Eq, Value::Array(b)) => {
                 Ok(Value::Bool(a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| Self::values_equal(x, y))))

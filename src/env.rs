@@ -226,6 +226,9 @@ impl Env {
         env.define_builtin("has_key", Value::BuiltinFn("has_key".into()));
         env.define_builtin("to_string", Value::BuiltinFn("to_string".into()));
         env.define_builtin("to_int", Value::BuiltinFn("to_int".into()));
+        // Common aliases for to_int / to_float — users naturally write int(x), float(x).
+        env.define_builtin("int", Value::BuiltinFn("to_int".into()));
+        env.define_builtin("float", Value::BuiltinFn("to_float".into()));
         env.define_builtin("to_float", Value::BuiltinFn("to_float".into()));
         env.define_builtin("try_float", Value::BuiltinFn("try_float".into()));
         env.define_builtin("is_numeric", Value::BuiltinFn("is_numeric".into()));
