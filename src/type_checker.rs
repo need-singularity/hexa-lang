@@ -1186,4 +1186,36 @@ mod tests {
     fn test_array_concat_type() {
         assert!(check_source("let a = [1, 2]\nlet b = [3, 4]\nlet c = a + b").is_ok());
     }
+
+    // ── G4: type_checker accepts [T] and (T, T) annotations ────
+    // fix commit: f84f950 — src/type_checker.rs:from_annotation + accepts
+    #[test]
+    fn test_g4_array_type_annotation() {
+        // [int] annotation must round-trip through the type checker.
+        assert_eq!(
+            CheckType::from_annotation("[int]"),
+            CheckType::Array(Box::new(CheckType::Int))
+        );
+        assert!(check_source("let xs: [int] = [1, 2, 3]").is_ok());
+        // Mismatched element type must still fail.
+        assert!(check_source("let xs: [int] = [\"a\", \"b\"]").is_err());
+    }
+
+    #[test]
+    fn test_g4_tuple_type_annotation() {
+        // (int, int) annotation must parse into a Tuple CheckType.
+        assert_eq!(
+            CheckType::from_annotation("(int, int)"),
+            CheckType::Tuple(vec![CheckType::Int, CheckType::Int])
+        );
+        // Tuple accepts must match by length and element-wise acceptance.
+        let t_ii = CheckType::Tuple(vec![CheckType::Int, CheckType::Int]);
+        let t_if = CheckType::Tuple(vec![CheckType::Int, CheckType::Float]);
+        let t_iii = CheckType::Tuple(vec![CheckType::Int, CheckType::Int, CheckType::Int]);
+        assert!(t_ii.accepts(&t_ii));
+        assert!(t_if.accepts(&CheckType::Tuple(vec![CheckType::Int, CheckType::Int])));
+        assert!(!t_ii.accepts(&t_iii));
+        // fn with tuple return type + tuple literal body type-checks.
+        assert!(check_source("fn f() -> (int, int) {\n  return (1, 2)\n}").is_ok());
+    }
 }
