@@ -1158,7 +1158,7 @@ mod tests {
 
     #[test]
     fn test_compile_if() {
-        let chunk = compile_source("if true { 1 } else { 2 }");
+        let chunk = compile_source("let c = true\nif c { 1 } else { 2 }");
         assert!(chunk.code.iter().any(|op| matches!(op, OpCode::JumpIfFalse(_))));
     }
 

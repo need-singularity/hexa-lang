@@ -2289,6 +2289,8 @@ impl Interpreter {
                             }
                             let prev_pure = self.in_pure_fn;
                             if is_pure { self.in_pure_fn = true; }
+                            let is_evolve = self.evolve_fns.contains_key(_name);
+                            let evolve_start = if is_evolve { Some(std::time::Instant::now()) } else { None };
                             self.env.push_scope();
                             for (param, arg) in params.iter().zip(arg_vals) {
                                 self.env.define(param, arg);
@@ -2303,6 +2305,12 @@ impl Interpreter {
                             }
                             self.env.pop_scope();
                             self.in_pure_fn = prev_pure;
+                            if let Some(start) = evolve_start {
+                                let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+                                let entry = self.evolve_stats.entry(_name.clone()).or_insert((0, 0.0));
+                                entry.0 += 1;
+                                entry.1 += elapsed_ms;
+                            }
                             return Ok(result);
                         }
                     }

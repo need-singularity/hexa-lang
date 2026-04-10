@@ -1903,6 +1903,17 @@ impl Parser {
     }
 
     fn parse_lambda(&mut self) -> Result<Expr, HexaError> {
+        if matches!(self.peek(), Token::Or) {
+            self.advance();
+            // zero-param lambda `||`
+            let body_expr = if matches!(self.peek(), Token::LBrace) {
+                let block = self.parse_block()?;
+                return Ok(Expr::Lambda(Vec::new(), Box::new(Expr::Block(block))));
+            } else {
+                self.parse_expr()?
+            };
+            return Ok(Expr::Lambda(Vec::new(), Box::new(body_expr)));
+        }
         self.advance(); // consume first |
         let mut params = Vec::new();
         // |x, y| body  OR  || body (no params)
@@ -2060,7 +2071,7 @@ impl Parser {
             }
             Token::If => self.parse_if_expr(),
             Token::Match => self.parse_match_expr(),
-            Token::BitOr => self.parse_lambda(),
+            Token::BitOr | Token::Or => self.parse_lambda(),
             // Channel keyword: `channel()` calls builtin, bare `channel` also creates one
             Token::Channel => {
                 self.advance();
