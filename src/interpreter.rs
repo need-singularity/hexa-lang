@@ -10714,13 +10714,17 @@ impl Interpreter {
                 if let Some(h) = self.loaded_libs.get(lib_name) {
                     *h
                 } else {
-                    // Try multiple paths
+                    // Try multiple paths (macOS + Linux + CUDA)
                     let paths = vec![
                         lib_name.clone(),
                         format!("lib{}.dylib", lib_name),
                         format!("lib{}.so", lib_name),
                         format!("/usr/lib/lib{}.dylib", lib_name),
                         format!("/usr/local/lib/lib{}.dylib", lib_name),
+                        format!("/usr/lib/x86_64-linux-gnu/lib{}.so", lib_name),
+                        format!("/usr/local/cuda/lib64/lib{}.so", lib_name),
+                        format!("/usr/local/cuda/lib64/lib{}.so.12", lib_name),
+                        format!("/usr/local/cuda/lib64/lib{}.so.11", lib_name),
                         format!("/System/Library/Frameworks/{}.framework/{}", lib_name, lib_name),
                     ];
                     let mut loaded = std::ptr::null_mut();

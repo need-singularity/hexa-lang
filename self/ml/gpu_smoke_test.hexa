@@ -1,0 +1,174 @@
+// ═══════════════════════════════════════════════════════════════
+//  gpu_smoke_test.hexa — H100 CUDA 동작 스모크 테스트
+//
+//  순서:
+//    1. CUDA init (cudaSetDevice, cublasCreate)
+//    2. GPU 메모리 확인
+//    3. H2D → D2D → D2H 라운드트립
+//    4. cuBLAS SGEMM 4×4 검증
+//    5. 결과 출력
+//
+//  실행: hexa self/ml/gpu_smoke_test.hexa
+//  요구: libcudart.so + libcublas.so (CUDA toolkit)
+// ═══════════════════════════════════════════════════════════════
+
+use "self/ml/cuda_ffi"
+
+fn main() {
+    println("═══ GPU Smoke Test ═══")
+
+    // 1. CUDA init
+    let err = cuda_init()
+    if err != 0 {
+        println("[FAIL] cuda_init returned " + str(err))
+        println("  → CUDA toolkit이 설치되어 있는지 확인")
+        println("  → LD_LIBRARY_PATH에 /usr/local/cuda/lib64 포함 확인")
+        return
+    }
+    println("[PASS] cuda_init OK")
+
+    // 2. GPU memory
+    let free_bytes = cuda_mem_info()
+    if free_bytes < 1024 * 1024 {
+        println("[FAIL] GPU memory < 1MB")
+        cuda_shutdown()
+        return
+    }
+    println("[PASS] GPU memory OK")
+
+    // 3. H2D → D2H roundtrip (4 floats)
+    let n = 4
+    let host_src = alloc_raw(n * 4)
+    write_f32(host_src, 0, 1.0)
+    write_f32(host_src, 1, 2.0)
+    write_f32(host_src, 2, 3.0)
+    write_f32(host_src, 3, 4.0)
+
+    let dev = cuda_malloc(n * 4)
+    let _ = cuda_memcpy_h2d(dev, host_src, n * 4)
+    cuda_sync()
+
+    let host_dst = alloc_raw(n * 4)
+    let _ = cuda_memcpy_d2h(host_dst, dev, n * 4)
+    cuda_sync()
+
+    let v0 = deref_f32(host_dst, 0)
+    let v1 = deref_f32(host_dst, 1)
+    let v2 = deref_f32(host_dst, 2)
+    let v3 = deref_f32(host_dst, 3)
+
+    if abs(v0 - 1.0) > 0.001 || abs(v1 - 2.0) > 0.001 || abs(v2 - 3.0) > 0.001 || abs(v3 - 4.0) > 0.001 {
+        println("[FAIL] H2D→D2H roundtrip: got " + str(v0) + " " + str(v1) + " " + str(v2) + " " + str(v3))
+        cuda_free(dev)
+        free_raw(host_src, n * 4)
+        free_raw(host_dst, n * 4)
+        cuda_shutdown()
+        return
+    }
+    println("[PASS] H2D→D2H roundtrip: [1,2,3,4] OK")
+
+    cuda_free(dev)
+    free_raw(host_src, n * 4)
+    free_raw(host_dst, n * 4)
+
+    // 4. cuBLAS SGEMM 2×2: C = A * B
+    //    A = [[1,2],[3,4]]  B = [[5,6],[7,8]]
+    //    C = [[19,22],[43,50]]
+    let M = 2
+    let N = 2
+    let K = 2
+
+    let ha = alloc_raw(4 * 4)
+    write_f32(ha, 0, 1.0); write_f32(ha, 1, 2.0)
+    write_f32(ha, 2, 3.0); write_f32(ha, 3, 4.0)
+
+    let hb = alloc_raw(4 * 4)
+    write_f32(hb, 0, 5.0); write_f32(hb, 1, 6.0)
+    write_f32(hb, 2, 7.0); write_f32(hb, 3, 8.0)
+
+    let da = cuda_malloc(4 * 4)
+    let db = cuda_malloc(4 * 4)
+    let dc = cuda_malloc(4 * 4)
+
+    let _ = cuda_memcpy_h2d(da, ha, 4 * 4)
+    let _ = cuda_memcpy_h2d(db, hb, 4 * 4)
+    let _ = cuda_memset_zero(dc, 4 * 4)
+
+    let st = gpu_sgemm(da, db, dc, M, N, K)
+    cuda_sync()
+
+    if st != 0 {
+        println("[FAIL] cublasSgemm returned " + str(st))
+        cuda_free(da); cuda_free(db); cuda_free(dc)
+        free_raw(ha, 4 * 4); free_raw(hb, 4 * 4)
+        cuda_shutdown()
+        return
+    }
+
+    let hc = alloc_raw(4 * 4)
+    let _ = cuda_memcpy_d2h(hc, dc, 4 * 4)
+    cuda_sync()
+
+    let c00 = deref_f32(hc, 0)
+    let c01 = deref_f32(hc, 1)
+    let c10 = deref_f32(hc, 2)
+    let c11 = deref_f32(hc, 3)
+
+    let sgemm_ok = abs(c00 - 19.0) < 0.1 && abs(c01 - 22.0) < 0.1 && abs(c10 - 43.0) < 0.1 && abs(c11 - 50.0) < 0.1
+
+    if sgemm_ok {
+        println("[PASS] cuBLAS SGEMM 2×2: [[19,22],[43,50]] OK")
+    } else {
+        println("[FAIL] cuBLAS SGEMM 2×2: got [[" + str(c00) + "," + str(c01) + "],[" + str(c10) + "," + str(c11) + "]]")
+    }
+
+    cuda_free(da); cuda_free(db); cuda_free(dc)
+    free_raw(ha, 4 * 4); free_raw(hb, 4 * 4); free_raw(hc, 4 * 4)
+
+    // 5. TFLOPS quick probe (1024×1024 SGEMM)
+    let probe_n = 1024
+    let probe_bytes = probe_n * probe_n * 4
+    let pa = cuda_malloc(probe_bytes)
+    let pb = cuda_malloc(probe_bytes)
+    let pc = cuda_malloc(probe_bytes)
+    let _ = cuda_memset_zero(pa, probe_bytes)
+    let _ = cuda_memset_zero(pb, probe_bytes)
+    let _ = cuda_memset_zero(pc, probe_bytes)
+    cuda_sync()
+
+    // warmup
+    let _ = gpu_sgemm(pa, pb, pc, probe_n, probe_n, probe_n)
+    cuda_sync()
+
+    let t0 = clock()
+    let runs = 10
+    let mut r = 0
+    while r < runs {
+        let _ = gpu_sgemm(pa, pb, pc, probe_n, probe_n, probe_n)
+        r = r + 1
+    }
+    cuda_sync()
+    let t1 = clock()
+
+    let elapsed_s = (t1 - t0)
+    let flops_per_run = 2.0 * to_float(probe_n) * to_float(probe_n) * to_float(probe_n)
+    let total_flops = flops_per_run * to_float(runs)
+    let tflops = total_flops / elapsed_s / 1.0e12
+
+    println("[INFO] SGEMM 1024×1024 × " + str(runs) + " runs: " + str(tflops) + " TFLOPS")
+    println("[INFO] H100 FP32 ceiling: 67 TFLOPS → utilization " + str(tflops / 67.0 * 100.0) + "%")
+
+    cuda_free(pa); cuda_free(pb); cuda_free(pc)
+
+    // cleanup
+    cuda_shutdown()
+
+    println("═══ GPU Smoke Test DONE ═══")
+    if sgemm_ok {
+        println("STATUS: ALL PASS — H100 ready for ML workloads")
+    } else {
+        println("STATUS: SGEMM FAIL — check cuBLAS version")
+    }
+}
+
+main()
