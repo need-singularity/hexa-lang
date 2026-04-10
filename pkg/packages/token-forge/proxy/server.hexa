@@ -1,0 +1,321 @@
+// server.hexa — ported from server.py
+// token-forge compression proxy for Claude Code CLI.
+//
+// Usage:
+//     ANTHROPIC_BASE_URL=http://localhost:8080/v1 claude
+//
+// Intercepts /v1/messages, compresses old conversation turns (keeping the
+// last 3 verbatim), and forwards to the real Anthropic API. Streams the
+// response back unchanged.
+
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
+
+let LISTEN_HOST = "127.0.0.1"
+let LISTEN_PORT = to_int(env("TF_PORT", "8080"))
+let UPSTREAM_URL = env("TF_UPSTREAM", "https://api.anthropic.com")
+let CHAR_THRESHOLD = to_int(env("TF_THRESHOLD", "50000"))
+let KEEP_RECENT = to_int(env("TF_KEEP_RECENT", "3"))
+let MAX_TOOL_RESULT_CHARS = to_int(env("TF_MAX_TOOL_RESULT", "300"))
+let MAX_ASSISTANT_CHARS = to_int(env("TF_MAX_ASSISTANT", "800"))
+let LOG_FILE = env("TF_LOG", home() + "/.token-forge/proxy.log")
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn char_count(messages: [str]) -> int {
+    // Rough char-count of the entire messages array (as JSON).
+    return len(json_encode(messages))
+}
+
+fn summarise_text(text: str, limit: int) -> str {
+    // Truncate with an ellipsis marker.
+    if len(text) <= limit {
+        return text
+    }
+    let remaining = len(text) - limit
+    return substr(text, 0, limit) + "\n... [truncated " + str(remaining) + " chars]"
+}
+
+struct ContentBlock {
+    block_type: str
+    text: str
+    tool_use_id: str
+    content: str
+}
+
+fn compress_content_block(block: ContentBlock) -> ContentBlock {
+    // Compress a single content block inside a message.
+    if block.block_type == "tool_result" {
+        return ContentBlock {
+            block_type: "tool_result",
+            text: "",
+            tool_use_id: block.tool_use_id,
+            content: summarise_text(block.content, MAX_TOOL_RESULT_CHARS)
+        }
+    }
+
+    if block.block_type == "text" {
+        return ContentBlock {
+            block_type: "text",
+            text: summarise_text(block.text, MAX_ASSISTANT_CHARS),
+            tool_use_id: "",
+            content: ""
+        }
+    }
+
+    // tool_use — keep as-is (small)
+    return block
+}
+
+struct ProxyMessage {
+    role: str
+    content: str
+    blocks: [ContentBlock]
+    is_block_content: bool
+}
+
+fn compress_message(msg: ProxyMessage) -> ProxyMessage {
+    // Return a compressed copy of a single message.
+    if !msg.is_block_content {
+        // Simple string content
+        return ProxyMessage {
+            role: msg.role,
+            content: summarise_text(msg.content, MAX_ASSISTANT_CHARS),
+            blocks: [],
+            is_block_content: false
+        }
+    }
+
+    // List of content blocks
+    let mut compressed_blocks = []
+    for block in msg.blocks {
+        compressed_blocks = append(compressed_blocks, compress_content_block(block))
+    }
+    return ProxyMessage {
+        role: msg.role,
+        content: "",
+        blocks: compressed_blocks,
+        is_block_content: true
+    }
+}
+
+fn compress_messages(messages: [ProxyMessage]) -> [ProxyMessage] {
+    // Compress the message array:
+    //   - Keep the last KEEP_RECENT messages verbatim.
+    //   - Compress everything before that.
+    let total = 0
+    for m in messages {
+        total = total + len(m.content)
+        for b in m.blocks {
+            total = total + len(b.text) + len(b.content)
+        }
+    }
+
+    if total < CHAR_THRESHOLD {
+        return messages
+    }
+    if len(messages) <= KEEP_RECENT {
+        return messages
+    }
+
+    let boundary = len(messages) - KEEP_RECENT
+    let old = slice(messages, 0, boundary)
+    let recent = slice(messages, boundary, len(messages))
+
+    let mut compressed_old = []
+    for m in old {
+        compressed_old = append(compressed_old, compress_message(m))
+    }
+
+    let mut result = []
+    for m in compressed_old {
+        result = append(result, m)
+    }
+    for m in recent {
+        result = append(result, m)
+    }
+    return result
+}
+
+fn log_entry(original_chars: int, compressed_chars: int, model: str) {
+    // Append one line to the log file.
+    mkdir_p(dirname(LOG_FILE))
+    let mut ratio = "0%"
+    if original_chars > 0 {
+        let saved = (1.0 - to_float(compressed_chars) / to_float(original_chars)) * 100.0
+        ratio = format_float(saved, 1) + "%"
+    }
+    let ts = now_formatted("%Y-%m-%d %H:%M:%S")
+    let line = ts + "  model=" + model + "  original=" + str(original_chars) +
+               "  compressed=" + str(compressed_chars) + "  saved=" + ratio
+    try {
+        file_append(LOG_FILE, line + "\n")
+    } catch e {
+        // silently ignore
+    }
+    // Also print to stderr for immediate feedback
+    eprint("[token-forge] " + line)
+}
+
+// ---------------------------------------------------------------------------
+// HTTP handler
+// ---------------------------------------------------------------------------
+
+struct Request {
+    method: str
+    path: str
+    headers: [str]
+    body: str
+}
+
+struct Response {
+    status: int
+    headers: [str]
+    body: str
+}
+
+fn forward_headers(req: Request) -> [str] {
+    // Build headers to send upstream (pass through auth, content-type, etc.)
+    let forward_keys = [
+        "authorization", "anthropic-version", "anthropic-beta",
+        "content-type", "x-api-key"
+    ]
+    let mut result = []
+    for key in forward_keys {
+        let val = header_get(req.headers, key)
+        if len(val) > 0 {
+            result = append(result, key + ": " + val)
+        }
+    }
+    return result
+}
+
+fn handle_post_messages(req: Request) -> Response {
+    // Handle POST /v1/messages — compress and forward.
+    let body = json_parse(req.body)
+    let messages_raw = json_get(body, "messages", "[]")
+    let original_chars = len(messages_raw)
+
+    // Parse and compress messages
+    let mut messages = parse_proxy_messages(messages_raw)
+    let compressed = compress_messages(messages)
+    let compressed_json = encode_proxy_messages(compressed)
+    let compressed_chars = len(compressed_json)
+
+    let model = json_get(body, "model", "unknown")
+    log_entry(original_chars, compressed_chars, model)
+
+    // Rebuild body with compressed messages
+    let new_body = json_set(body, "messages", compressed)
+    let payload = json_encode(new_body)
+
+    // Forward to upstream
+    let upstream = UPSTREAM_URL + "/v1/messages"
+    let headers = forward_headers(req)
+
+    try {
+        let resp = http_post(upstream, payload, headers)
+        return resp
+    } catch e {
+        eprint("[token-forge] upstream error: " + str(e))
+        return Response { status: 502, headers: [], body: "Upstream error: " + str(e) }
+    }
+}
+
+fn handle_get_health() -> Response {
+    return Response {
+        status: 200,
+        headers: ["Content-Type: application/json"],
+        body: "{\"status\":\"ok\",\"proxy\":\"token-forge\"}"
+    }
+}
+
+fn handle_request(req: Request) -> Response {
+    if req.method == "GET" {
+        if req.path == "/health" || req.path == "/v1/health" {
+            return handle_get_health()
+        }
+        return Response { status: 404, headers: [], body: "Not Found" }
+    }
+
+    if req.method == "POST" {
+        if starts_with(req.path, "/v1/messages") {
+            return handle_post_messages(req)
+        }
+        // Pass through other endpoints
+        let upstream = UPSTREAM_URL + req.path
+        let headers = forward_headers(req)
+        try {
+            return http_post(upstream, req.body, headers)
+        } catch e {
+            return Response { status: 502, headers: [], body: "Upstream error: " + str(e) }
+        }
+    }
+
+    return Response { status: 405, headers: [], body: "Method Not Allowed" }
+}
+
+fn parse_proxy_messages(raw: str) -> [ProxyMessage] {
+    // Parse JSON array of messages into ProxyMessage structs
+    let arr = json_parse_array(raw)
+    let mut result = []
+    for item in arr {
+        let role = json_get(item, "role", "")
+        let content = json_get(item, "content", "")
+        if is_string(content) {
+            result = append(result, ProxyMessage {
+                role: role,
+                content: content,
+                blocks: [],
+                is_block_content: false
+            })
+        } else {
+            let blocks_raw = to_array(content)
+            let mut blocks = []
+            for b in blocks_raw {
+                blocks = append(blocks, ContentBlock {
+                    block_type: json_get(b, "type", ""),
+                    text: json_get(b, "text", ""),
+                    tool_use_id: json_get(b, "tool_use_id", ""),
+                    content: json_get(b, "content", "")
+                })
+            }
+            result = append(result, ProxyMessage {
+                role: role,
+                content: "",
+                blocks: blocks,
+                is_block_content: true
+            })
+        }
+    }
+    return result
+}
+
+fn encode_proxy_messages(messages: [ProxyMessage]) -> str {
+    // Encode ProxyMessage list back to JSON string
+    return json_encode(messages)
+}
+
+// ---------------------------------------------------------------------------
+// Server
+// ---------------------------------------------------------------------------
+
+fn main() {
+    eprint("[token-forge] proxy listening on " + LISTEN_HOST + ":" + str(LISTEN_PORT))
+    eprint("[token-forge] upstream: " + UPSTREAM_URL)
+    eprint("[token-forge] threshold: " + str(CHAR_THRESHOLD) + " chars, keep last " +
+           str(KEEP_RECENT) + " turns")
+    eprint("[token-forge] log: " + LOG_FILE)
+    eprint("[token-forge] usage: ANTHROPIC_BASE_URL=http://localhost:" +
+           str(LISTEN_PORT) + "/v1 claude")
+
+    // Start HTTP server (builtin)
+    try {
+        http_serve(LISTEN_HOST, LISTEN_PORT, handle_request)
+    } catch e {
+        eprint("[token-forge] shutting down: " + str(e))
+    }
+}

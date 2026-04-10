@@ -1,0 +1,372 @@
+// dfs_breakthrough.hexa — ported from dfs_breakthrough.py
+// DFS Breakthrough — 4-strategy compression benchmark (rebuilt 2026-04-10).
+//
+// Strategies:
+//   A_hybrid        : last 3 turns raw + older turns compressed
+//   B_code_protect  : aggressive whole-history compression, code blocks fenced
+//   C_twostage      : summarise -> then compress the summary
+//   D_combined      : A_hybrid over B_code_protect output (two-level)
+
+// -- Tunables --
+let KEEP_RECENT = 3
+let COMPRESS_THRESHOLD = 2000
+let MAX_CTX = 4000
+let MAX_TURN_CHARS = 300
+
+struct Message {
+    role: str
+    text: str
+}
+
+struct DepthResult {
+    depth: int
+    sim: int
+    reduction: float
+    verdict: str
+}
+
+struct BenchReport {
+    timestamp: str
+    session: str
+    depth: int
+    results_A: [DepthResult]
+    results_B: [DepthResult]
+    results_C: [DepthResult]
+    results_D: [DepthResult]
+}
+
+// ---------------------------------------------------------------------------
+// Session loading
+// ---------------------------------------------------------------------------
+
+fn parse_session(path: str) -> [Message] {
+    let mut msgs = []
+    let content = file_read(path)
+    let lines = split(content, "\n")
+    for line in lines {
+        try {
+            let d = json_parse(line)
+            let role = json_get(d, "type", "")
+            if role == "user" || role == "assistant" {
+                let msg_obj = json_get(d, "message", "")
+                let mut text_content = json_get(msg_obj, "content", "")
+                // Handle list content (simplified: join text parts)
+                if is_array(text_content) {
+                    let mut parts = []
+                    let arr = to_array(text_content)
+                    for item in arr {
+                        if is_object(item) {
+                            let item_type = json_get(item, "type", "")
+                            if item_type == "text" {
+                                parts = append(parts, json_get(item, "text", ""))
+                            }
+                        } else {
+                            if is_string(item) {
+                                parts = append(parts, to_string(item))
+                            }
+                        }
+                    }
+                    text_content = join(parts, "\n")
+                }
+                if is_string(text_content) && len(trim(text_content)) > 10 {
+                    msgs = append(msgs, Message {
+                        role: role,
+                        text: substr(text_content, 0, 1000)
+                    })
+                }
+            }
+        } catch e {
+            // skip malformed lines
+        }
+    }
+    return msgs
+}
+
+fn find_session() -> str {
+    let mut best_size = 0
+    let mut best_path = ""
+    let paths = glob(home() + "/.claude*/projects/**/*.jsonl")
+    for p in paths {
+        try {
+            let s = file_size(p)
+            if s > 10000 && s < 50000000 && s > best_size {
+                best_size = s
+                best_path = p
+            }
+        } catch e {
+            // skip
+        }
+    }
+    return best_path
+}
+
+fn render(history: [Message]) -> str {
+    let mut parts = []
+    for m in history {
+        let tag = to_upper(m.role)
+        parts = append(parts, "[" + tag + "] " + substr(m.text, 0, MAX_TURN_CHARS))
+    }
+    return join(parts, "\n")
+}
+
+// ---------------------------------------------------------------------------
+// Compression primitives
+// ---------------------------------------------------------------------------
+
+fn compress_block(text: str) -> str {
+    // Single LLM compression pass, preserves decisions/filenames/code tokens.
+    if len(text) < COMPRESS_THRESHOLD {
+        return text
+    }
+    let prompt = "Compress for LLM. CRITICAL: preserve ALL filenames, functions, " +
+                 "decisions, code, errors, paths. Only remove filler/greetings. " +
+                 "Keep [USER]/[ASST] markers.\n---\n" +
+                 substr(text, 0, MAX_CTX) + "\n---\nCompressed:"
+    return llm_call(prompt, "claude-cli")
+}
+
+fn fence_code(text: str) -> str {
+    // Mark code-like lines so the compressor leaves them alone (B strategy).
+    let lines = split(text, "\n")
+    let mut out = []
+    for line in lines {
+        let stripped = trim(line)
+        if starts_with(stripped, "def ") || starts_with(stripped, "class ") ||
+           starts_with(stripped, "import ") || starts_with(stripped, "from ") ||
+           ends_with(stripped, ":") || ends_with(stripped, "{") ||
+           ends_with(stripped, "}") || contains(stripped, "```") {
+            out = append(out, "<CODE>" + line + "</CODE>")
+        } else {
+            out = append(out, line)
+        }
+    }
+    return join(out, "\n")
+}
+
+// ---------------------------------------------------------------------------
+// Strategies
+// ---------------------------------------------------------------------------
+
+fn strategy_A_hybrid(history: [Message]) -> [Message] {
+    // Last 3 turns raw + older turns compressed. Best overall: avg sim 70%, PASS 3/5.
+    if len(history) <= KEEP_RECENT {
+        return history
+    }
+    let old = slice(history, 0, len(history) - KEEP_RECENT)
+    let recent = slice(history, len(history) - KEEP_RECENT, len(history))
+    let compressed = compress_block(render(old))
+    let mut result = [Message { role: "system", text: "[PRIOR -- compressed]\n" + compressed }]
+    for m in recent {
+        result = append(result, m)
+    }
+    return result
+}
+
+fn strategy_B_code_protect(history: [Message]) -> [Message] {
+    // Code blocks preserved, entire history aggressively compressed.
+    // Cached result: avg sim ~37%, PASS 0/5 -- most aggressive, high loss.
+    let fenced = fence_code(render(history))
+    let compressed = compress_block(fenced)
+    return [Message { role: "system", text: "[COMPRESSED+CODE]\n" + compressed }]
+}
+
+fn strategy_C_twostage(history: [Message]) -> [Message] {
+    // Two-stage: 1) summarise -> 2) compress the summary.
+    let raw = render(history)
+    let summary_prompt = "Summarise this conversation into bullet decisions (max 30 lines).\n" +
+                         "---\n" + substr(raw, 0, MAX_CTX) + "\n---"
+    let summary = llm_call(summary_prompt, "claude-cli")
+    let compressed = compress_block(summary)
+    return [Message { role: "system", text: "[TWO-STAGE]\n" + compressed }]
+}
+
+fn strategy_D_combined(history: [Message]) -> [Message] {
+    // A_hybrid skeleton + code_protect on older block.
+    if len(history) <= KEEP_RECENT {
+        return history
+    }
+    let old = slice(history, 0, len(history) - KEEP_RECENT)
+    let recent = slice(history, len(history) - KEEP_RECENT, len(history))
+    let fenced = fence_code(render(old))
+    let compressed = compress_block(fenced)
+    let mut result = [Message { role: "system", text: "[PRIOR -- code-protect]\n" + compressed }]
+    for m in recent {
+        result = append(result, m)
+    }
+    return result
+}
+
+// ---------------------------------------------------------------------------
+// Evaluation helpers
+// ---------------------------------------------------------------------------
+
+fn ask(ctx: str, query: str) -> str {
+    return llm_call(
+        "Context:\n" + substr(ctx, 0, MAX_CTX) + "\n\nRequest: " +
+        substr(query, 0, 500) + "\n\nRespond concisely.",
+        "claude-cli"
+    )
+}
+
+fn similarity(a: str, b: str) -> int {
+    let r = trim(llm_call(
+        "Rate similarity 0-100:\nA: " + substr(a, 0, 600) +
+        "\nB: " + substr(b, 0, 600) + "\nOutput ONLY number:",
+        "claude-cli"
+    ))
+    let tokens = split(r, " ")
+    for t in tokens {
+        try {
+            return to_int(t)
+        } catch e {
+            // skip
+        }
+    }
+    return -1
+}
+
+fn token_overlap(a: str, b: str) -> float {
+    // Cheap fallback similarity (0-1) when no LLM judge is available.
+    let ta = to_set(split(to_lower(a), " "))
+    let tb = to_set(split(to_lower(b), " "))
+    if len(ta) == 0 || len(tb) == 0 {
+        return 0.0
+    }
+    return to_float(len(set_intersect(ta, tb))) / to_float(len(set_union(ta, tb)))
+}
+
+// ---------------------------------------------------------------------------
+// Benchmark driver
+// ---------------------------------------------------------------------------
+
+fn run_strategy(name: str, strategy_fn: str, msgs: [Message], depth: int) -> [DepthResult] {
+    let users = filter(msgs, fn(m: Message) -> bool { return m.role == "user" })
+    let assts = filter(msgs, fn(m: Message) -> bool { return m.role == "assistant" })
+    let mut results = []
+    let mut history = []
+
+    for d in range(0, depth) {
+        let mut query = ""
+        if d + 1 < len(users) {
+            query = users[d + 1].text
+        } else {
+            query = users[len(users) - 1].text
+        }
+        history = append(history, Message { role: "user", text: users[d].text })
+        if d < len(assts) {
+            history = append(history, Message { role: "assistant", text: assts[d].text })
+        }
+
+        let base_ctx = render(history)
+        let mut sim = -1
+        let mut reduction = 0.0
+        let mut verdict = "ERR"
+
+        try {
+            let comp_msgs = call_strategy(strategy_fn, history)
+            let comp_ctx = render(comp_msgs)
+            reduction = 1.0 - to_float(len(comp_ctx)) / to_float(max(len(base_ctx), 1))
+
+            let base_resp = ask(base_ctx, query)
+            let comp_resp = ask(comp_ctx, query)
+            sim = similarity(base_resp, comp_resp)
+            if sim >= 70 {
+                verdict = "PASS"
+            } else {
+                verdict = "FAIL"
+            }
+        } catch e {
+            verdict = "ERR:" + str(e)
+        }
+
+        results = append(results, DepthResult {
+            depth: d + 1,
+            sim: sim,
+            reduction: reduction,
+            verdict: verdict
+        })
+        print("  [" + name + "] depth=" + str(d + 1) + " sim=" + str(sim) +
+              " red=" + format_float(reduction, 2) + " " + verdict)
+    }
+    return results
+}
+
+fn call_strategy(name: str, history: [Message]) -> [Message] {
+    if name == "A_hybrid" { return strategy_A_hybrid(history) }
+    if name == "B_code_protect" { return strategy_B_code_protect(history) }
+    if name == "C_twostage" { return strategy_C_twostage(history) }
+    if name == "D_combined" { return strategy_D_combined(history) }
+    return history
+}
+
+fn run(depth: int) {
+    let path = find_session()
+    if len(path) == 0 {
+        print("No session found -- aborting.")
+        return
+    }
+    let msgs = parse_session(path)
+    print("session: " + basename(path) + " (" + str(len(msgs)) + " msgs, depth=" + str(depth) + ")")
+    print("")
+
+    let strategy_names = ["A_hybrid", "B_code_protect", "C_twostage", "D_combined"]
+    let mut all_results = []
+
+    for name in strategy_names {
+        print("")
+        print(">>> " + name)
+        let sr = run_strategy(name, name, msgs, depth)
+        all_results = append(all_results, sr)
+    }
+
+    // Save report
+    let ts = str(time_unix())
+    let rp = dirname(dirname(argv_0())) + "/reports/dfs_breakthrough_" + ts + ".json"
+    mkdir_p(dirname(rp))
+    let report_json = json_encode(all_results)
+    file_write(rp, report_json)
+    print("")
+    print("report: " + rp)
+}
+
+// ---------------------------------------------------------------------------
+// Dry-run / CLI
+// ---------------------------------------------------------------------------
+
+fn dry_run() {
+    print("DFS Breakthrough -- strategy catalog (dry-run)")
+    print("keep_recent        : " + str(KEEP_RECENT))
+    print("compress_threshold : " + str(COMPRESS_THRESHOLD))
+    print("")
+    print("  A_hybrid         -> strategy_A_hybrid  // last 3 turns raw + older compressed")
+    print("  B_code_protect   -> strategy_B_code_protect  // aggressive compression, code fenced")
+    print("  C_twostage       -> strategy_C_twostage  // summarise then compress")
+    print("  D_combined       -> strategy_D_combined  // A_hybrid + B_code_protect")
+    print("")
+    print("Cached baseline (reports/breakthrough_1775473383.json):")
+    print("  A_hybrid       : avg sim 70%, PASS 3/5  <- best")
+    print("  B_code_protect : avg sim 37%, PASS 0/5")
+    print("  C_twostage     : avg sim 65%, PASS 3/5")
+    print("  D_combined     : avg sim 64%, PASS 3/5")
+}
+
+fn main() {
+    let args = argv()
+    let mut dry = false
+    let mut depth = 5
+
+    for arg in args {
+        if arg == "--dry-run" {
+            dry = true
+        }
+        if starts_with(arg, "--depth=") {
+            depth = to_int(substr(arg, 8, len(arg)))
+        }
+    }
+
+    if dry {
+        dry_run()
+        return
+    }
+    run(depth)
+}

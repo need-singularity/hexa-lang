@@ -1,0 +1,314 @@
+// dfs_100pass_v2.hexa — ported from dfs_100pass_v2.py
+// 100% PASS v2 — adaptive fallback + verification loop.
+// Strategy: compress then self-verify -> similarity < 75% -> fallback to original
+// - keep_recent: 7 turns
+// - threshold: 2000 chars (skip compression below)
+// - compress then self-QA verify -> fail = keep original
+
+let KEEP_RECENT = 7
+let COMPRESS_THRESHOLD = 2000
+let MAX_CTX = 4000
+
+struct Message {
+    role: str
+    text: str
+}
+
+struct RunResult {
+    depth: int
+    compressed: bool
+    sim: int
+    reduction: float
+    verdict: str
+}
+
+fn parse_session(path: str) -> [Message] {
+    let mut msgs = []
+    let content = file_read(path)
+    let lines = split(content, "\n")
+    for line in lines {
+        try {
+            let d = json_parse(line)
+            let role = json_get(d, "type", "")
+            if role == "user" || role == "assistant" {
+                let msg_obj = json_get(d, "message", "")
+                let mut text_content = json_get(msg_obj, "content", "")
+                if is_array(text_content) {
+                    let mut parts = []
+                    let arr = to_array(text_content)
+                    for item in arr {
+                        if is_object(item) && json_get(item, "type", "") == "text" {
+                            parts = append(parts, json_get(item, "text", ""))
+                        } else {
+                            if is_string(item) {
+                                parts = append(parts, to_string(item))
+                            }
+                        }
+                    }
+                    text_content = join(parts, "\n")
+                }
+                if is_string(text_content) && len(trim(text_content)) > 10 {
+                    msgs = append(msgs, Message {
+                        role: role,
+                        text: substr(text_content, 0, 1000)
+                    })
+                }
+            }
+        } catch e {
+            // skip
+        }
+    }
+    return msgs
+}
+
+fn compress_verified(text: str) -> (str, bool) {
+    // Compress + self-verify. On failure, return original.
+    if len(text) < COMPRESS_THRESHOLD {
+        return (text, false)
+    }
+
+    let prompt = "Compress for LLM. CRITICAL: preserve ALL filenames, functions, " +
+                 "decisions, code, errors, paths.\nOnly remove filler/greetings. " +
+                 "Keep [USER]/[ASST] markers.\n---\n" +
+                 substr(text, 0, MAX_CTX) + "\n---\nCompressed:"
+    let compressed = llm_call(prompt, "claude-cli")
+
+    // Self-verify: check that key words from original appear in compressed
+    let mut keywords = []
+    let words = split(text, " ")
+    for word in words {
+        if len(word) > 6 {
+            let first_char = substr(word, 0, 1)
+            if is_upper(first_char) || contains(word, ".") ||
+               contains(word, "/") || contains(word, "_") {
+                keywords = append(keywords, to_lower(trim_chars(word, ".,;:()")))
+            }
+        }
+    }
+
+    if len(keywords) == 0 {
+        return (compressed, true)
+    }
+
+    let compressed_lower = to_lower(compressed)
+    let mut preserved = 0
+    for k in keywords {
+        if contains(compressed_lower, k) {
+            preserved = preserved + 1
+        }
+    }
+    let coverage = to_float(preserved) / to_float(len(keywords))
+
+    if coverage < 0.5 {
+        // Keyword coverage insufficient -> keep original
+        return (text, false)
+    }
+
+    return (compressed, true)
+}
+
+fn render_history(history: [Message]) -> str {
+    let mut parts = []
+    for m in history {
+        parts = append(parts, "[" + to_upper(m.role) + "] " + substr(m.text, 0, 300))
+    }
+    return join(parts, "\n")
+}
+
+fn build_context(history: [Message]) -> (str, bool) {
+    if len(history) <= KEEP_RECENT {
+        return (render_history(history), false)
+    }
+
+    let old = slice(history, 0, len(history) - KEEP_RECENT)
+    let recent = slice(history, len(history) - KEEP_RECENT, len(history))
+
+    let old_text = render_history(old)
+    let (compressed, did_compress) = compress_verified(old_text)
+    let recent_text = render_history(recent)
+
+    if did_compress {
+        return ("[PRIOR -- compressed]\n" + compressed + "\n\n[RECENT]\n" + recent_text, true)
+    } else {
+        return (render_history(history), false)
+    }
+}
+
+fn ask(ctx: str, query: str) -> str {
+    return llm_call(
+        "Context:\n" + substr(ctx, 0, MAX_CTX) + "\n\nRequest: " +
+        substr(query, 0, 500) + "\n\nRespond concisely.",
+        "claude-cli"
+    )
+}
+
+fn similarity(a: str, b: str) -> int {
+    let r = trim(llm_call(
+        "Rate similarity 0-100:\nA: " + substr(a, 0, 600) +
+        "\nB: " + substr(b, 0, 600) + "\nOutput ONLY number:",
+        "claude-cli"
+    ))
+    let tokens = split(r, " ")
+    for t in tokens {
+        try {
+            return to_int(t)
+        } catch e {
+            // skip
+        }
+    }
+    return -1
+}
+
+fn find_session() -> str {
+    let mut best_size = 0
+    let mut best_path = ""
+    let paths = glob(home() + "/.claude*/projects/**/*.jsonl")
+    for p in paths {
+        try {
+            let s = file_size(p)
+            if s > 10000 && s < 50000000 && s > best_size {
+                best_size = s
+                best_path = p
+            }
+        } catch e {
+            // skip
+        }
+    }
+    return best_path
+}
+
+fn run(max_depth: int) {
+    print("100% PASS v2 -- adaptive fallback + keyword verification")
+    print("  keep_recent=" + str(KEEP_RECENT) + ", threshold=" + str(COMPRESS_THRESHOLD))
+    print("")
+
+    let path = find_session()
+    let msgs = parse_session(path)
+    let users = filter(msgs, fn(m: Message) -> bool { return m.role == "user" })
+    let assts = filter(msgs, fn(m: Message) -> bool { return m.role == "assistant" })
+    let depth = min(max_depth, len(users) - 2)
+
+    print("session: " + basename(path) + " (" + str(len(msgs)) + " msgs, depth=" + str(depth) + ")")
+    print("")
+    print("Depth |  Comp |   Save |    Sim | Verdict")
+    print("================================================")
+
+    let mut results = []
+    let mut history = []
+
+    for d in range(0, depth) {
+        let query = users[d + 1].text
+        history = append(history, Message { role: "user", text: users[d].text })
+        if d < len(assts) {
+            history = append(history, Message { role: "assistant", text: assts[d].text })
+        }
+
+        let base_ctx = render_history(history)
+        let (comp_ctx_init, did_compress_init) = build_context(history)
+        let mut comp_ctx = comp_ctx_init
+        let mut did_compress = did_compress_init
+        let mut sim = -1
+        let mut reduction = 0.0
+        let mut verdict = "ERR"
+
+        try {
+            let base_resp = ask(base_ctx, query)
+            let mut comp_resp = ask(comp_ctx, query)
+            sim = similarity(base_resp, comp_resp)
+
+            // similarity < 70% -> fallback to original and retry
+            if sim >= 0 && sim < 70 && did_compress {
+                comp_resp = ask(base_ctx, query)
+                sim = similarity(base_resp, comp_resp)
+                did_compress = false
+                comp_ctx = base_ctx
+            }
+
+            if did_compress {
+                reduction = 1.0 - to_float(len(comp_ctx)) / to_float(max(len(base_ctx), 1))
+            } else {
+                reduction = 0.0
+            }
+            if sim >= 70 {
+                verdict = "PASS"
+            } else {
+                verdict = "FAIL"
+            }
+        } catch e {
+            sim = -1
+            reduction = 0.0
+            verdict = "ERR"
+            did_compress = false
+        }
+
+        let tag = ""
+        if did_compress { tag = "Y" } else { tag = "N" }
+        print(pad_left(str(d + 1), 5) + " | " + pad_left(tag, 5) + " | " +
+              pad_left(format_percent(reduction), 6) + " | " +
+              pad_left(str(sim) + "%", 6) + " | " + pad_left(verdict, 6))
+        results = append(results, RunResult {
+            depth: d + 1,
+            compressed: did_compress,
+            sim: sim,
+            reduction: reduction,
+            verdict: verdict
+        })
+    }
+
+    // Summary
+    print("")
+    print("================================================")
+    let mut valid_sum = 0
+    let mut valid_count = 0
+    let mut passes = 0
+    let mut compressed_count = 0
+    for r in results {
+        if r.sim >= 0 {
+            valid_sum = valid_sum + r.sim
+            valid_count = valid_count + 1
+        }
+        if r.verdict == "PASS" {
+            passes = passes + 1
+        }
+        if r.compressed {
+            compressed_count = compressed_count + 1
+        }
+    }
+    let avg_sim = 0.0
+    if valid_count > 0 {
+        avg_sim = to_float(valid_sum) / to_float(valid_count)
+    }
+
+    print("Result: " + str(passes) + "/" + str(len(results)) + " PASS | avg sim: " +
+          format_float(avg_sim, 0) + "% | compressed: " + str(compressed_count) +
+          "/" + str(len(results)))
+
+    if passes == len(results) {
+        print("  *** 100% PASS achieved! ***")
+    } else {
+        if passes >= len(results) - 1 {
+            print("  Almost there -- 1 more fix needed")
+        }
+    }
+
+    // Save report
+    let ts = str(time_unix())
+    let rp = dirname(argv_0()) + "/reports/pass100v2_" + ts + ".json"
+    mkdir_p(dirname(rp))
+    let report_data = json_encode(results)
+    file_write(rp, report_data)
+    print("  report: " + rp)
+}
+
+fn main() {
+    let args = argv()
+    let mut max_depth = 7
+    if len(args) > 1 {
+        try {
+            max_depth = to_int(args[1])
+        } catch e {
+            // use default
+        }
+    }
+    run(max_depth)
+}
