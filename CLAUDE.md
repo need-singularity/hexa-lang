@@ -30,3 +30,6 @@ hexa shared/blowup/core/blowup.hexa <domain> 3 --seeds "$(hexa shared/blowup/see
 | 로드맵 | `shared/roadmaps/anima_hexa_common.json` | anima x hexa P0~P5 |
 | 문법 | `shared/hexa-lang/grammar.jsonl` | 전체 문법 + pitfalls |
 | AI-native | `docs/ai-native.md` | 24종 벡터 로드맵 |
+| ML 파이프라인 | `shared/hexa-lang/ml-pipeline.json` | CPU/GPU/Hybrid 12단계 |
+| ML 성능추적 | `shared/hexa-lang/ml-perf-tracker.json` | T1/T2 실측 히스토리 + H100 체크리스트 |
+| T1/T2 로드맵 | `shared/roadmaps/t1_t2.json` | 물리천장 + 45항목 고급 ML |
