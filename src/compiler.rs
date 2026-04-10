@@ -920,6 +920,7 @@ fn is_builtin(name: &str) -> bool {
         // ── tensor & matrix ──
         | "tensor" | "tensor_zeros" | "tensor_fill"
         | "dot" | "matvec" | "matmul" | "matmul_into" | "transpose" | "normalize"
+        | "matmul_transpose_a_into" | "matmul_transpose_b_into" | "matmul_into_accumulate"
         | "mat_add" | "mat_add_inplace" | "mat_scale" | "mat_scale_inplace"
         | "axpy" | "hadamard" | "argmax" | "zeros" | "ones" | "randn" | "arange"
         | "qkv_fused_into" | "ffn_fused_into" | "block_forward_fused" | "block_forward_chain"

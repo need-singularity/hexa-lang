@@ -4614,6 +4614,246 @@ impl Interpreter {
                     _ => Err(self.type_err("matmul_into() requires Tensor as `out` argument".into())),
                 }
             }
+            "matmul_transpose_a_into" => {
+                // matmul_transpose_a_into(A, B, M, K, N, out)
+                //   Semantic: out[M×N] := A^T @ B   where A is stored as [K × M] row-major.
+                //   cblas: cblas_dgemm(RowMajor, Trans, NoTrans, M, N, K, 1, A, lda=M, B, ldb=N, 0, out, ldc=N)
+                if args.len() < 6 {
+                    return Err(self.type_err("matmul_transpose_a_into() requires (A, B, M, K, N, out)".into()));
+                }
+                let (m, k, n) = match (&args[2], &args[3], &args[4]) {
+                    (Value::Int(m), Value::Int(k), Value::Int(n)) => (*m as usize, *k as usize, *n as usize),
+                    _ => return Err(self.type_err("matmul_transpose_a_into() requires int dimensions".into())),
+                };
+                let (a_vec, b_vec): (Vec<f64>, Vec<f64>) = match (to_f64_slice(&args[0]), to_f64_slice(&args[1])) {
+                    (Some(a_s), Some(b_s)) => (a_s.as_slice().to_vec(), b_s.as_slice().to_vec()),
+                    _ => return Err(self.type_err("matmul_transpose_a_into() requires (array/tensor, array/tensor, int, int, int, tensor)".into())),
+                };
+                if a_vec.len() < k * m || b_vec.len() < k * n {
+                    return Err(self.type_err("matmul_transpose_a_into() input length < K*M or K*N".into()));
+                }
+                match &mut args[5] {
+                    Value::Tensor(arc) => {
+                        if arc.data.len() != m * n {
+                            return Err(self.type_err("matmul_transpose_a_into() out.len() != M*N".into()));
+                        }
+                        if Arc::get_mut(arc).is_some() {
+                            let td = Arc::get_mut(arc).unwrap();
+                            let c = td.data.as_mut_slice();
+                            for v in c.iter_mut() { *v = 0.0; }
+                            #[cfg(any(target_os = "macos", target_os = "linux"))]
+                            unsafe {
+                                cblas_dgemm(
+                                    CBLAS_ROW_MAJOR, CBLAS_TRANS, CBLAS_NO_TRANS,
+                                    m as i32, n as i32, k as i32,
+                                    1.0, a_vec.as_ptr(), m as i32,
+                                    b_vec.as_ptr(), n as i32,
+                                    0.0, c.as_mut_ptr(), n as i32,
+                                );
+                            }
+                            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+                            {
+                                for i in 0..m {
+                                    for p in 0..k {
+                                        let a_val = a_vec[p * m + i];
+                                        for j in 0..n {
+                                            c[i * n + j] += a_val * b_vec[p * n + j];
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(Value::Tensor(arc.clone()))
+                        } else {
+                            let shape = arc.shape.clone();
+                            let mut c = vec![0.0f64; m * n];
+                            #[cfg(any(target_os = "macos", target_os = "linux"))]
+                            unsafe {
+                                cblas_dgemm(
+                                    CBLAS_ROW_MAJOR, CBLAS_TRANS, CBLAS_NO_TRANS,
+                                    m as i32, n as i32, k as i32,
+                                    1.0, a_vec.as_ptr(), m as i32,
+                                    b_vec.as_ptr(), n as i32,
+                                    0.0, c.as_mut_ptr(), n as i32,
+                                );
+                            }
+                            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+                            {
+                                for i in 0..m {
+                                    for p in 0..k {
+                                        let a_val = a_vec[p * m + i];
+                                        for j in 0..n {
+                                            c[i * n + j] += a_val * b_vec[p * n + j];
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(Value::Tensor(Arc::new(TensorData { shape, data: c })))
+                        }
+                    }
+                    _ => Err(self.type_err("matmul_transpose_a_into() requires Tensor as `out`".into())),
+                }
+            }
+            "matmul_transpose_b_into" => {
+                // matmul_transpose_b_into(A, B, M, K, N, out)
+                //   Semantic: out[M×N] := A @ B^T   where B is stored as [N × K] row-major.
+                //   cblas: cblas_dgemm(RowMajor, NoTrans, Trans, M, N, K, 1, A, lda=K, B, ldb=K, 0, out, ldc=N)
+                if args.len() < 6 {
+                    return Err(self.type_err("matmul_transpose_b_into() requires (A, B, M, K, N, out)".into()));
+                }
+                let (m, k, n) = match (&args[2], &args[3], &args[4]) {
+                    (Value::Int(m), Value::Int(k), Value::Int(n)) => (*m as usize, *k as usize, *n as usize),
+                    _ => return Err(self.type_err("matmul_transpose_b_into() requires int dimensions".into())),
+                };
+                let (a_vec, b_vec): (Vec<f64>, Vec<f64>) = match (to_f64_slice(&args[0]), to_f64_slice(&args[1])) {
+                    (Some(a_s), Some(b_s)) => (a_s.as_slice().to_vec(), b_s.as_slice().to_vec()),
+                    _ => return Err(self.type_err("matmul_transpose_b_into() requires (array/tensor, array/tensor, int, int, int, tensor)".into())),
+                };
+                if a_vec.len() < m * k || b_vec.len() < n * k {
+                    return Err(self.type_err("matmul_transpose_b_into() input length < M*K or N*K".into()));
+                }
+                match &mut args[5] {
+                    Value::Tensor(arc) => {
+                        if arc.data.len() != m * n {
+                            return Err(self.type_err("matmul_transpose_b_into() out.len() != M*N".into()));
+                        }
+                        if Arc::get_mut(arc).is_some() {
+                            let td = Arc::get_mut(arc).unwrap();
+                            let c = td.data.as_mut_slice();
+                            for v in c.iter_mut() { *v = 0.0; }
+                            #[cfg(any(target_os = "macos", target_os = "linux"))]
+                            unsafe {
+                                cblas_dgemm(
+                                    CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_TRANS,
+                                    m as i32, n as i32, k as i32,
+                                    1.0, a_vec.as_ptr(), k as i32,
+                                    b_vec.as_ptr(), k as i32,
+                                    0.0, c.as_mut_ptr(), n as i32,
+                                );
+                            }
+                            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+                            {
+                                for i in 0..m {
+                                    for j in 0..n {
+                                        let mut s = 0.0;
+                                        for p in 0..k { s += a_vec[i * k + p] * b_vec[j * k + p]; }
+                                        c[i * n + j] = s;
+                                    }
+                                }
+                            }
+                            Ok(Value::Tensor(arc.clone()))
+                        } else {
+                            let shape = arc.shape.clone();
+                            let mut c = vec![0.0f64; m * n];
+                            #[cfg(any(target_os = "macos", target_os = "linux"))]
+                            unsafe {
+                                cblas_dgemm(
+                                    CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_TRANS,
+                                    m as i32, n as i32, k as i32,
+                                    1.0, a_vec.as_ptr(), k as i32,
+                                    b_vec.as_ptr(), k as i32,
+                                    0.0, c.as_mut_ptr(), n as i32,
+                                );
+                            }
+                            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+                            {
+                                for i in 0..m {
+                                    for j in 0..n {
+                                        let mut s = 0.0;
+                                        for p in 0..k { s += a_vec[i * k + p] * b_vec[j * k + p]; }
+                                        c[i * n + j] = s;
+                                    }
+                                }
+                            }
+                            Ok(Value::Tensor(Arc::new(TensorData { shape, data: c })))
+                        }
+                    }
+                    _ => Err(self.type_err("matmul_transpose_b_into() requires Tensor as `out`".into())),
+                }
+            }
+            "matmul_into_accumulate" => {
+                // matmul_into_accumulate(A, B, M, K, N, out, beta)
+                //   Semantic: out := A@B + beta*out   (direct BLAS beta pass-through)
+                if args.len() < 7 {
+                    return Err(self.type_err("matmul_into_accumulate() requires (A, B, M, K, N, out, beta)".into()));
+                }
+                let (m, k, n) = match (&args[2], &args[3], &args[4]) {
+                    (Value::Int(m), Value::Int(k), Value::Int(n)) => (*m as usize, *k as usize, *n as usize),
+                    _ => return Err(self.type_err("matmul_into_accumulate() requires int dimensions".into())),
+                };
+                let beta = match &args[6] {
+                    Value::Float(f) => *f,
+                    Value::Int(i) => *i as f64,
+                    _ => return Err(self.type_err("matmul_into_accumulate() beta must be float/int".into())),
+                };
+                let (a_vec, b_vec): (Vec<f64>, Vec<f64>) = match (to_f64_slice(&args[0]), to_f64_slice(&args[1])) {
+                    (Some(a_s), Some(b_s)) => (a_s.as_slice().to_vec(), b_s.as_slice().to_vec()),
+                    _ => return Err(self.type_err("matmul_into_accumulate() requires (array/tensor, array/tensor, ...)".into())),
+                };
+                if a_vec.len() < m * k || b_vec.len() < k * n {
+                    return Err(self.type_err("matmul_into_accumulate() input length < M*K or K*N".into()));
+                }
+                match &mut args[5] {
+                    Value::Tensor(arc) => {
+                        if arc.data.len() != m * n {
+                            return Err(self.type_err("matmul_into_accumulate() out.len() != M*N".into()));
+                        }
+                        if Arc::get_mut(arc).is_some() {
+                            let td = Arc::get_mut(arc).unwrap();
+                            let c = td.data.as_mut_slice();
+                            #[cfg(any(target_os = "macos", target_os = "linux"))]
+                            unsafe {
+                                cblas_dgemm(
+                                    CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                                    m as i32, n as i32, k as i32,
+                                    1.0, a_vec.as_ptr(), k as i32,
+                                    b_vec.as_ptr(), n as i32,
+                                    beta, c.as_mut_ptr(), n as i32,
+                                );
+                            }
+                            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+                            {
+                                for v in c.iter_mut() { *v *= beta; }
+                                for i in 0..m {
+                                    for p in 0..k {
+                                        let a_val = a_vec[i * k + p];
+                                        for j in 0..n {
+                                            c[i * n + j] += a_val * b_vec[p * n + j];
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(Value::Tensor(arc.clone()))
+                        } else {
+                            let shape = arc.shape.clone();
+                            let mut c = arc.data.clone();
+                            #[cfg(any(target_os = "macos", target_os = "linux"))]
+                            unsafe {
+                                cblas_dgemm(
+                                    CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                                    m as i32, n as i32, k as i32,
+                                    1.0, a_vec.as_ptr(), k as i32,
+                                    b_vec.as_ptr(), n as i32,
+                                    beta, c.as_mut_ptr(), n as i32,
+                                );
+                            }
+                            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+                            {
+                                for v in c.iter_mut() { *v *= beta; }
+                                for i in 0..m {
+                                    for p in 0..k {
+                                        let a_val = a_vec[i * k + p];
+                                        for j in 0..n {
+                                            c[i * n + j] += a_val * b_vec[p * n + j];
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(Value::Tensor(Arc::new(TensorData { shape, data: c })))
+                        }
+                    }
+                    _ => Err(self.type_err("matmul_into_accumulate() requires Tensor as `out`".into())),
+                }
+            }
             "qkv_fused_into" => {
                 // qkv_fused_into(X, Uqkv, M, K, R, out_q, out_k, out_v)
                 //   X:    [M × K]   row-major
