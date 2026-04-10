@@ -1,3 +1,4 @@
+<!-- L0 CORE — 수정 금지 -->
 # CLAUDE.md — HEXA-LANG
 
 > 모든 규칙/설정은 shared/ JSON이 단일 진실 (R14). 이 파일은 참조 링크만 유지.
@@ -14,7 +15,6 @@
 | 수렴 | `shared/convergence/hexa-lang.json` | CDO 수렴 상태 |
 | 공통 로드맵 | `shared/roadmaps/anima_hexa_common.json` | anima × hexa-lang 공통 진화 (P0~P5) |
 | 돌파(학습/추론/서빙) | `shared/hexa-lang_breakthroughs.json` | T2 2176x, T1 FAIL, BLIS serving |
-| 할일 | `shared/todo/hexa-lang.json` | 우선순위별 TODO |
 | 문법 | `shared/hexa_grammar.jsonl` | 전체 문법 + pitfalls P1~P5 |
 | AI-native | `docs/ai-native.md` | 24종 벡터 로드맵 |
 | API | `shared/CLAUDE.md` | NEXUS-6 상세 사용법 |
