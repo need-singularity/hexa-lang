@@ -3768,8 +3768,9 @@ impl Interpreter {
                 Ok(acc)
             }
             "enumerate" => {
+                // Match self-hosted SSOT (self/interpreter.hexa:2910): array of [index, item] arrays.
                 let result: Vec<Value> = arr.iter().enumerate()
-                    .map(|(i, v)| Value::Tuple(vec![Value::Int(i as i64), v.clone()]))
+                    .map(|(i, v)| Value::Array(vec![Value::Int(i as i64), v.clone()]))
                     .collect();
                 Ok(Value::Array(result))
             }
@@ -8665,6 +8666,19 @@ impl Interpreter {
                 #[cfg(target_arch = "wasm32")]
                 {
                     Ok(Value::Float(0.0))
+                }
+            }
+            "time" => {
+                // time() → Unix timestamp (seconds) as Int. Integer variant of clock().
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    use std::time::{SystemTime, UNIX_EPOCH};
+                    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+                    Ok(Value::Int(now.as_secs() as i64))
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    Ok(Value::Int(0))
                 }
             }
             // ── Built-in Option/Result constructors ───────────────────
