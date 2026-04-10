@@ -73,4 +73,4 @@ println(set_size(s2))  // unique aliquot values
 - **I13**: stdout flush / --no-gate (런타임)
 - **I14**: Dict `.get(key, default)` (VM map)
 
-이 항목들은 `shared/blowup/todo.hexa`(자연창발) + `shared/blowup/core/blowup.hexa` 코어엔진으로 돌파.
+이 항목들은 `shared/blowup/todo.hexa`(자연창발) + `shared/blowup/core/blowup.hexa` 코어엔진으로 돌파. 또는 `shared/todo/hexa-lang.json`에 별도 등록 후 전용 세션에서 돌파 가능.

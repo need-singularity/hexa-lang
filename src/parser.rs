@@ -1138,7 +1138,7 @@ impl Parser {
             Token::Trait => MacroLitToken::Trait,
             Token::Impl => MacroLitToken::Impl,
             Token::Match => MacroLitToken::Match,
-            Token::Newline => {
+            Token::Newline | Token::Semicolon => {
                 self.advance();
                 self.skip_newlines();
                 if matches!(self.peek(), Token::RBrace | Token::RParen | Token::Eof) {
