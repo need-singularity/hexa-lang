@@ -179,6 +179,12 @@ pub struct Env {
     /// Flat variable stack: all bindings stored as (name, value) pairs.
     /// Scope boundaries tracked by `scope_starts`.
     vars: Vec<(String, Value)>,
+    /// O(1) lookup index: maps name → stack of vars indices (most recent last).
+    /// Mirrors `vars` writes; rebuilt incrementally on pop_scope.
+    /// Eliminates the O(N) reverse scan that was the dominant cost during
+    /// hot loops (every ident lookup walked the full vars stack — for a
+    /// 100M-fn module load this was tens of thousands of comparisons each).
+    var_index: HashMap<String, Vec<usize>>,
     /// Stack of indices into `vars` marking where each scope begins.
     scope_starts: Vec<usize>,
     /// Ownership state tracking per variable name (checked at runtime).
@@ -199,6 +205,7 @@ impl Env {
     pub fn new() -> Self {
         let mut env = Self {
             vars: Vec::with_capacity(256),
+            var_index: HashMap::with_capacity(256),
             scope_starts: vec![0],
             ownership: vec![HashMap::new()],
             constants: std::collections::HashSet::new(),
@@ -505,6 +512,17 @@ impl Env {
     #[inline]
     pub fn pop_scope(&mut self) {
         if let Some(start) = self.scope_starts.pop() {
+            // Walk dropped entries in reverse, removing the matching index
+            // entry from var_index (the most recent push for that name).
+            for i in (start..self.vars.len()).rev() {
+                let name = &self.vars[i].0;
+                if let Some(stack) = self.var_index.get_mut(name) {
+                    stack.pop();
+                    if stack.is_empty() {
+                        self.var_index.remove(name);
+                    }
+                }
+            }
             self.vars.truncate(start);
         }
         if self.ownership_count > 0 && self.ownership.len() > self.scope_starts.len() {
@@ -514,14 +532,16 @@ impl Env {
 
     #[inline]
     pub fn define(&mut self, name: &str, val: Value) {
+        let idx = self.vars.len();
         self.vars.push((name.to_string(), val));
+        self.var_index.entry(name.to_string()).or_insert_with(Vec::new).push(idx);
     }
 
     #[inline]
     pub fn get(&self, name: &str) -> Option<Value> {
-        // Search user vars (no builtins in stack — pure user bindings only)
-        for i in (0..self.vars.len()).rev() {
-            if self.vars[i].0 == name {
+        // O(1) lookup via var_index (most recent shadowing binding)
+        if let Some(stack) = self.var_index.get(name) {
+            if let Some(&i) = stack.last() {
                 return Some(self.vars[i].1.clone());
             }
         }
@@ -539,8 +559,8 @@ impl Env {
     /// Get a reference to a value without cloning.
     #[inline]
     pub fn get_ref(&self, name: &str) -> Option<&Value> {
-        for i in (0..self.vars.len()).rev() {
-            if self.vars[i].0 == name {
+        if let Some(stack) = self.var_index.get(name) {
+            if let Some(&i) = stack.last() {
                 return Some(&self.vars[i].1);
             }
         }
@@ -552,9 +572,9 @@ impl Env {
 
     #[inline]
     pub fn set(&mut self, name: &str, val: Value) -> bool {
-        // Search flat stack in reverse for existing binding
-        for i in (0..self.vars.len()).rev() {
-            if self.vars[i].0 == name {
+        // O(1) lookup via var_index
+        if let Some(stack) = self.var_index.get(name) {
+            if let Some(&i) = stack.last() {
                 self.vars[i].1 = val;
                 return true;
             }
@@ -601,7 +621,9 @@ impl Env {
     /// Define a constant (immutable binding).
     pub fn define_const(&mut self, name: &str, val: Value) {
         self.constants.insert(name.to_string());
+        let idx = self.vars.len();
         self.vars.push((name.to_string(), val));
+        self.var_index.entry(name.to_string()).or_insert_with(Vec::new).push(idx);
     }
 
     /// Check if a name is a constant.
