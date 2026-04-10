@@ -41,6 +41,29 @@ const CBLAS_NO_TRANS: i32 = 111;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 const CBLAS_TRANS: i32 = 112;
 
+/// KV cache inference state — pre-converted f32 weights + KV caches.
+/// Single-token autoregressive decode: O(L×D²/r) per token instead of O(L×seq×D²).
+struct KvCacheState {
+    /// Per-layer weights in f32: [Uqkv, Vv, Uo, Vo, Uu, Vu, Ud, Vd] concatenated
+    layer_weights: Vec<Vec<f32>>,
+    /// Per-layer weight offsets within each layer_weights[i]:
+    /// [uqkv_end, vv_end, uo_end, vo_end, uu_end, vu_end, ud_end, vd_end]
+    offsets: [usize; 8],
+    /// KV cache: [n_layer][max_seq * r] flat, filled up to `pos`
+    k_cache: Vec<Vec<f32>>,
+    v_cache: Vec<Vec<f32>>,
+    /// LM head weights (optional)
+    u_lmh: Vec<f32>,
+    v_lmh: Vec<f32>,
+    /// Dimensions
+    d: usize,
+    r: usize,
+    ff: usize,
+    n_layer: usize,
+    max_seq: usize,
+    vocab: usize,
+}
+
 /// Sentinel error message used to propagate `return` across call frames.
 const RETURN_SENTINEL: &str = "__hexa_return__";
 
@@ -191,10 +214,29 @@ pub struct Interpreter {
     optimized_fns: HashMap<String, (Vec<i64>, Vec<i64>)>,
     autograd_fns: HashMap<String, (Vec<String>, Arc<Vec<Stmt>>)>,
     vectorize_fns: HashMap<String, (Vec<String>, Arc<Vec<Stmt>>)>,
+    simd_fns: HashMap<String, (Vec<String>, Arc<Vec<Stmt>>)>,
     fuse_fns: HashMap<String, (Vec<String>, Arc<Vec<Stmt>>)>,
     lazy_fns: std::collections::HashSet<String>,
     inline_fns: std::collections::HashSet<String>,
+    noinline_fns: std::collections::HashSet<String>,
+    hot_fns: std::collections::HashSet<String>,
+    /// @tail: tail-call optimized functions — recursive calls use trampoline
+    tail_call_fns: std::collections::HashSet<String>,
+    /// When inside a @tail trampoline, holds the original function name being optimized.
+    /// Recursive calls to this name are intercepted and turned into tail-call markers.
+    in_tail_call: Option<String>,
+    /// @unroll: loop unrolling hint — tracked for codegen passes
+    unroll_fns: std::collections::HashSet<String>,
+    /// @prefetch: memory prefetch hint — tracked, no-op in interpreter
+    prefetch_fns: std::collections::HashSet<String>,
+    /// @align: data alignment hint — tracked for native codegen
+    align_fns: std::collections::HashSet<String>,
+    /// @const: compile-time evaluation — results cached permanently
+    const_fns: std::collections::HashSet<String>,
+    /// @const cache: fn_name -> (args_hash -> cached_result), never evicted
+    const_cache: HashMap<String, HashMap<u64, Value>>,
     evolve_fns: HashMap<String, (Vec<String>, Arc<Vec<Stmt>>, u64)>,
+    evolve_stats: HashMap<String, (u64, f64)>,  // fn_name -> (call_count, total_time_ms)
     test_fns: Vec<(String, Vec<String>, Arc<Vec<Stmt>>)>,
     bench_fns: Vec<(String, Vec<String>, Arc<Vec<Stmt>>)>,
     deprecated_fns: HashMap<String, String>,  // fn_name -> deprecation message  // name -> (params, current_body, generation)
@@ -204,6 +246,12 @@ pub struct Interpreter {
     /// Resolved extern symbols: fn_name -> symbol address.
     #[cfg(not(target_arch = "wasm32"))]
     extern_symbols: HashMap<String, *mut std::ffi::c_void>,
+    /// KV cache inference state for autoregressive decode
+    kv_cache: Option<KvCacheState>,
+    /// Generator buffer: yield pushes values here when gen_active is true
+    gen_buffer: Vec<Value>,
+    /// Whether we are inside a generator collection context (gen { } or collect_gen)
+    gen_active: bool,
 }
 
 /// Stored data for a loaded/declared module.
@@ -262,10 +310,21 @@ impl Interpreter {
             optimized_fns: HashMap::new(),
             autograd_fns: HashMap::new(),
             vectorize_fns: HashMap::new(),
+            simd_fns: HashMap::new(),
             fuse_fns: HashMap::new(),
             lazy_fns: std::collections::HashSet::new(),
             inline_fns: std::collections::HashSet::new(),
+            noinline_fns: std::collections::HashSet::new(),
+            hot_fns: std::collections::HashSet::new(),
+            tail_call_fns: std::collections::HashSet::new(),
+            in_tail_call: None,
+            unroll_fns: std::collections::HashSet::new(),
+            prefetch_fns: std::collections::HashSet::new(),
+            align_fns: std::collections::HashSet::new(),
+            const_fns: std::collections::HashSet::new(),
+            const_cache: HashMap::new(),
             evolve_fns: HashMap::new(),
+            evolve_stats: HashMap::new(),
             test_fns: Vec::new(),
             bench_fns: Vec::new(),
             deprecated_fns: HashMap::new(),
@@ -273,6 +332,9 @@ impl Interpreter {
             loaded_libs: HashMap::new(),
             #[cfg(not(target_arch = "wasm32"))]
             extern_symbols: HashMap::new(),
+            kv_cache: None,
+            gen_buffer: Vec::new(),
+            gen_active: false,
         }
     }
 
@@ -378,6 +440,15 @@ impl Interpreter {
     // ── Public entry point ──────────────────────────────────
 
     pub fn run(&mut self, stmts: &[Stmt]) -> Result<Value, HexaError> {
+        // Pre-register all top-level function declarations so that mutual
+        // recursion (forward references between functions) works correctly.
+        for stmt in stmts {
+            if let Stmt::FnDecl(decl) = stmt {
+                let param_names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
+                let fn_val = Value::Fn(Box::new((decl.name.clone(), param_names, Arc::new(decl.body.clone()))));
+                self.env.define(&decl.name, fn_val);
+            }
+        }
         let mut last = Value::Void;
         for stmt in stmts {
             last = self.exec_stmt(stmt)?;
@@ -398,6 +469,14 @@ impl Interpreter {
     /// Run with span information from the parser.
     /// `spans` is a parallel array to `stmts` with (line, col) for each statement.
     pub fn run_with_spans(&mut self, stmts: &[Stmt], spans: &[(usize, usize)]) -> Result<Value, HexaError> {
+        // Pre-register all top-level function declarations for mutual recursion support.
+        for stmt in stmts {
+            if let Stmt::FnDecl(decl) = stmt {
+                let param_names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
+                let fn_val = Value::Fn(Box::new((decl.name.clone(), param_names, Arc::new(decl.body.clone()))));
+                self.env.define(&decl.name, fn_val);
+            }
+        }
         let mut last = Value::Void;
         for (i, stmt) in stmts.iter().enumerate() {
             if let Some(&(line, col)) = spans.get(i) {
@@ -658,6 +737,12 @@ impl Interpreter {
                     let param_names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
                     self.vectorize_fns.insert(decl.name.clone(), (param_names.clone(), Arc::new(decl.body.clone())));
                 }
+                // AI-native @simd: register fn for SIMD-style parallel array ops (numeric)
+                let has_simd = decl.attrs.iter().any(|a| matches!(a.kind, crate::token::AttrKind::Simd));
+                if has_simd {
+                    let param_names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
+                    self.simd_fns.insert(decl.name.clone(), (param_names.clone(), Arc::new(decl.body.clone())));
+                }
                 // AI-native @fuse: register fn for operation fusion (array single-pass)
                 let has_fuse = decl.attrs.iter().any(|a| matches!(a.kind, crate::token::AttrKind::Fuse));
                 if has_fuse {
@@ -673,6 +758,57 @@ impl Interpreter {
                 let has_inline = decl.attrs.iter().any(|a| matches!(a.kind, crate::token::AttrKind::Inline));
                 if has_inline {
                     self.inline_fns.insert(decl.name.clone());
+                }
+                // AI-native @noinline: prevent inline expansion even if heuristics suggest it
+                let has_noinline = decl.attrs.iter().any(|a| matches!(a.kind, crate::token::AttrKind::Noinline));
+                if has_noinline {
+                    self.noinline_fns.insert(decl.name.clone());
+                }
+                // AI-native @hot: aggressive optimization — treat as inline + JIT hint
+                let has_hot = decl.attrs.iter().any(|a| matches!(a.kind, crate::token::AttrKind::Hot));
+                // AI-native @cold: de-prioritize — never inline, skip optimizations
+                let has_cold = decl.attrs.iter().any(|a| matches!(a.kind, crate::token::AttrKind::Cold));
+                if has_hot && has_cold {
+                    // Conflict: @hot and @cold on same function — prefer @cold, emit warning
+                    self.writeln_output(&format!(
+                        "warning[attr-conflict]: '{}' has both @hot and @cold; @cold takes precedence",
+                        decl.name
+                    ));
+                    self.noinline_fns.insert(decl.name.clone());
+                } else if has_cold {
+                    // @cold: add to noinline set to prevent inlining
+                    self.noinline_fns.insert(decl.name.clone());
+                } else if has_hot {
+                    // @hot: add to hot set + inline set for aggressive optimization
+                    self.hot_fns.insert(decl.name.clone());
+                    if !has_noinline {
+                        self.inline_fns.insert(decl.name.clone());
+                    }
+                }
+                // AI-native @tail: tail-call optimization — trampoline for self-recursive calls
+                let has_tail = decl.attrs.iter().any(|a| matches!(a.kind, crate::token::AttrKind::Tail));
+                if has_tail {
+                    self.tail_call_fns.insert(decl.name.clone());
+                }
+                // AI-native @unroll: loop unrolling hint — tracked for native codegen passes
+                let has_unroll = decl.attrs.iter().any(|a| matches!(a.kind, crate::token::AttrKind::Unroll));
+                if has_unroll {
+                    self.unroll_fns.insert(decl.name.clone());
+                }
+                // AI-native @prefetch: memory prefetch hint — tracked, no-op in interpreter
+                let has_prefetch = decl.attrs.iter().any(|a| matches!(a.kind, crate::token::AttrKind::Prefetch));
+                if has_prefetch {
+                    self.prefetch_fns.insert(decl.name.clone());
+                }
+                // AI-native @align: data alignment hint — tracked for native codegen
+                let has_align = decl.attrs.iter().any(|a| matches!(a.kind, crate::token::AttrKind::Align));
+                if has_align {
+                    self.align_fns.insert(decl.name.clone());
+                }
+                // AI-native @const: compile-time evaluation — permanently cached results
+                let has_const = decl.attrs.iter().any(|a| matches!(a.kind, crate::token::AttrKind::Const));
+                if has_const {
+                    self.const_fns.insert(decl.name.clone());
                 }
                 // AI-native @deprecated: mark function with deprecation warning
                 for attr in &decl.attrs {
@@ -711,14 +847,26 @@ impl Interpreter {
                 } else {
                     let param_names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
                     let has_memoize = decl.attrs.iter().any(|a| matches!(a.kind, crate::token::AttrKind::Memoize));
-                    let internal_name = if has_memoize {
+                    let internal_name = if has_const {
+                        format!("__const__{}", decl.name)
+                    } else if has_memoize {
                         format!("__memoize__{}", decl.name)
+                    } else if has_tail {
+                        format!("__tail__{}", decl.name)
                     } else if decl.is_pure {
                         format!("__pure__{}", decl.name)
                     } else {
                         decl.name.clone()
                     };
-                    let fn_val = Value::Fn(Box::new((internal_name, param_names, Arc::new(decl.body.clone()))));
+                    let body_arc = Arc::new(decl.body.clone());
+                    // When defining a function inside a nested scope (depth > 1),
+                    // capture the environment so closures across 3+ scope levels work.
+                    let fn_val = if self.env.scope_depth() > 1 {
+                        let captured = self.capture_env();
+                        Value::Lambda(Box::new((param_names, body_arc, captured)))
+                    } else {
+                        Value::Fn(Box::new((internal_name, param_names, body_arc)))
+                    };
                     self.fn_cache.insert(decl.name.clone(), fn_val.clone());
                     self.env.define(&decl.name, fn_val);
                 }
@@ -1060,9 +1208,11 @@ impl Interpreter {
                 self.env.push_scope();
                 let mut result = Value::Void;
                 let mut caught = false;
+                let mut partial_state = Value::Void;
                 for s in try_block {
                     match self.exec_stmt(s) {
                         Ok(v) => {
+                            partial_state = v.clone();
                             result = v;
                             if self.throw_value.is_some() {
                                 caught = true;
@@ -1084,8 +1234,31 @@ impl Interpreter {
                 self.env.pop_scope();
                 if caught {
                     let err_val = self.throw_value.take().unwrap_or(Value::Error("unknown error".into()));
+                    // Detect recover mode (parser tags with __recover__ prefix)
+                    let (real_name, bind_val) = if err_name.starts_with("__recover__") {
+                        let real = err_name.strip_prefix("__recover__").unwrap().to_string();
+                        // Build a rich recovery context map
+                        let err_str = match &err_val {
+                            Value::Error(s) => s.clone(),
+                            other => format!("{}", other),
+                        };
+                        let err_type = match &err_val {
+                            Value::Error(_) => "error".to_string(),
+                            _ => "unknown".to_string(),
+                        };
+                        let mut ctx = HashMap::new();
+                        ctx.insert("error".to_string(), err_val);
+                        ctx.insert("message".to_string(), Value::Str(err_str));
+                        ctx.insert("type".to_string(), Value::Str(err_type));
+                        ctx.insert("line".to_string(), Value::Int(self.current_line as i64));
+                        ctx.insert("recovered".to_string(), Value::Bool(true));
+                        ctx.insert("partial".to_string(), partial_state);
+                        (real, Value::Map(Box::new(ctx)))
+                    } else {
+                        (err_name.clone(), err_val)
+                    };
                     self.env.push_scope();
-                    self.env.define(err_name, err_val);
+                    self.env.define(&real_name, bind_val);
                     for s in catch_block {
                         result = self.exec_stmt(s)?;
                         if self.return_value.is_some() || self.throw_value.is_some() {
@@ -1600,6 +1773,17 @@ impl Interpreter {
                 }
                 // Fast path: direct Ident callee with fn_cache + inline call
                 if let Expr::Ident(fn_name) = callee.as_ref() {
+                    // @tail: intercept recursive self-call inside trampoline → return marker
+                    if let Some(ref tail_fn) = self.in_tail_call {
+                        if fn_name == tail_fn {
+                            let mut marker = Vec::with_capacity(args.len() + 1);
+                            marker.push(Value::Str("__tail_call__".to_string()));
+                            for a in args {
+                                marker.push(self.eval_expr(a)?);
+                            }
+                            return Ok(Value::Array(marker));
+                        }
+                    }
                     // Try fn_cache first (avoids linear env.get scan)
                     let func = if let Some(cached) = self.fn_cache.get(fn_name) {
                         cached.clone()
@@ -1672,7 +1856,6 @@ impl Interpreter {
                         }
                         None => {
                             // Fallback: try call_builtin for native builtins not in env
-                            eprintln!("[DEBUG] env.get failed for '{}', trying call_builtin", fn_name);
                             let mut arg_vals = Vec::with_capacity(args.len());
                             for a in args {
                                 arg_vals.push(self.eval_expr(a)?);
@@ -1686,8 +1869,9 @@ impl Interpreter {
                         arg_vals.push(self.eval_expr(a)?);
                     }
                     // AI-native @inline: expand function body at call site (no scope overhead)
+                    // @noinline takes precedence — skip inline expansion if marked
                     if let Expr::Ident(ref iln_name) = callee.as_ref() {
-                        if self.inline_fns.contains(iln_name.as_str()) {
+                        if self.inline_fns.contains(iln_name.as_str()) && !self.noinline_fns.contains(iln_name.as_str()) {
                             if let Value::Fn(ref fn_inner) = func {
                                 let (ref _iname, ref params, ref body) = **fn_inner;
                                 if arg_vals.len() == params.len() {
@@ -1811,6 +1995,56 @@ impl Interpreter {
                             }
                         }
                     }
+                    // AI-native @simd: SIMD-style parallel element-wise on numeric arrays
+                    if let Expr::Ident(ref sfn_name) = callee.as_ref() {
+                        if self.simd_fns.contains_key(sfn_name.as_str()) {
+                            let has_array = arg_vals.iter().any(|v| matches!(v, Value::Array(_)));
+                            if has_array {
+                                let (params, body) = self.simd_fns.get(sfn_name.as_str()).cloned().unwrap();
+                                // Validate: all array args must have equal length and contain numeric values
+                                let arr_len = arg_vals.iter().find_map(|v| if let Value::Array(a) = v { Some(a.len()) } else { None }).unwrap();
+                                for (ai, av) in arg_vals.iter().enumerate() {
+                                    match av {
+                                        Value::Array(a) => {
+                                            if a.len() != arr_len {
+                                                return Err(self.runtime_err(format!("@simd: array argument {} has length {} but expected {}", ai, a.len(), arr_len)));
+                                            }
+                                            for (ei, elem) in a.iter().enumerate() {
+                                                match elem {
+                                                    Value::Int(_) | Value::Float(_) => {},
+                                                    _ => return Err(self.type_err(format!("@simd: array argument {} element {} is not numeric", ai, ei))),
+                                                }
+                                            }
+                                        }
+                                        Value::Int(_) | Value::Float(_) => {},
+                                        _ => return Err(self.type_err(format!("@simd: argument {} must be a numeric array or scalar", ai))),
+                                    }
+                                }
+                                let mut results = Vec::with_capacity(arr_len);
+                                for idx in 0..arr_len {
+                                    self.env.push_scope();
+                                    for (pi, p) in params.iter().enumerate() {
+                                        let v = match &arg_vals[pi] {
+                                            Value::Array(a) => a[idx].clone(),
+                                            other => other.clone(),
+                                        };
+                                        self.env.define(p, v);
+                                    }
+                                    let mut result = Value::Void;
+                                    for s in body.iter() {
+                                        result = self.exec_stmt(s)?;
+                                        if self.return_value.is_some() {
+                                            result = self.return_value.take().unwrap();
+                                            break;
+                                        }
+                                    }
+                                    self.env.pop_scope();
+                                    results.push(result);
+                                }
+                                return Ok(Value::Array(results));
+                            }
+                        }
+                    }
                     // Inline the common Value::Fn path to avoid call_function dispatch
                     if let Value::Fn(ref fn_inner) = func {
                         let (ref _name, ref params, ref body) = **fn_inner;
@@ -1860,12 +2094,86 @@ impl Interpreter {
                                 }
                             }
                         }
+                        // AI-native @tail: tail-call optimization — trampoline loop
+                        if _name.starts_with("__tail__") {
+                            let real_name = &_name["__tail__".len()..];
+                            if arg_vals.len() != params.len() {
+                                return Err(self.runtime_err(format!(
+                                    "@tail '{}': expected {} arguments, got {}",
+                                    real_name, params.len(), arg_vals.len()
+                                )));
+                            }
+                            let prev_tail = self.in_tail_call.take();
+                            self.in_tail_call = Some(real_name.to_string());
+                            let mut current_args = arg_vals;
+                            let result = loop {
+                                self.env.push_scope();
+                                for (param, arg) in params.iter().zip(current_args.iter().cloned()) {
+                                    self.env.define(param, arg);
+                                }
+                                let mut result = Value::Void;
+                                for stmt in body.iter() {
+                                    result = self.exec_stmt(stmt)?;
+                                    if self.return_value.is_some() {
+                                        result = self.return_value.take().unwrap();
+                                        break;
+                                    }
+                                }
+                                self.env.pop_scope();
+                                // Check if result is a tail-call marker
+                                if let Value::Array(ref arr) = result {
+                                    if arr.len() > 0 {
+                                        if let Value::Str(ref s) = arr[0] {
+                                            if s == "__tail_call__" {
+                                                current_args = arr[1..].to_vec();
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                }
+                                break result;
+                            };
+                            self.in_tail_call = prev_tail;
+                            return Ok(result);
+                        }
                         if !_name.starts_with("__async__") && !_name.starts_with("__generic__") {
                             if arg_vals.len() != params.len() {
                                 return Err(self.runtime_err(format!(
                                     "expected {} arguments, got {}",
                                     params.len(), arg_vals.len()
                                 )));
+                            }
+                            // @const: permanently cached compile-time evaluation (never evicted)
+                            let is_const_fn = _name.starts_with("__const__");
+                            if is_const_fn {
+                                let fn_key = _name.clone();
+                                let args_hash = {
+                                    use std::hash::Hasher;
+                                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                                    for av in &arg_vals { hash_value_interp(av, &mut h); }
+                                    h.finish()
+                                };
+                                if let Some(cached) = self.const_cache.get(&fn_key).and_then(|m| m.get(&args_hash)) {
+                                    return Ok(cached.clone());
+                                }
+                                let prev_pure = self.in_pure_fn;
+                                self.in_pure_fn = true;
+                                self.env.push_scope();
+                                for (param, arg) in params.iter().zip(arg_vals) {
+                                    self.env.define(param, arg);
+                                }
+                                let mut result = Value::Void;
+                                for stmt in body.iter() {
+                                    result = self.exec_stmt(stmt)?;
+                                    if self.return_value.is_some() {
+                                        result = self.return_value.take().unwrap();
+                                        break;
+                                    }
+                                }
+                                self.env.pop_scope();
+                                self.in_pure_fn = prev_pure;
+                                self.const_cache.entry(fn_key).or_default().insert(args_hash, result.clone());
+                                return Ok(result);
                             }
                             let is_memoize = _name.starts_with("__memoize__");
                             let is_pure = _name.starts_with("__pure__") || is_memoize;
@@ -1954,6 +2262,28 @@ impl Interpreter {
                 Ok(Value::Tuple(vals))
             }
             Expr::Index(arr_expr, idx_expr) => {
+                // Array/String slice: arr[start..end]
+                if let Expr::Range(start, end, inclusive) = idx_expr.as_ref() {
+                    let arr = self.eval_expr(arr_expr)?;
+                    let s = match self.eval_expr(start)? { Value::Int(v) => v as usize, _ => return Err(self.type_err("slice start must be int".into())) };
+                    let e_raw = match self.eval_expr(end)? { Value::Int(v) => v, _ => return Err(self.type_err("slice end must be int".into())) };
+                    match arr {
+                        Value::Array(a) => {
+                            let e = if *inclusive { (e_raw + 1) as usize } else { e_raw as usize };
+                            let e = e.min(a.len());
+                            if s > e { return Ok(Value::Array(vec![])); }
+                            return Ok(Value::Array(a[s..e].to_vec()));
+                        }
+                        Value::Str(ref st) => {
+                            let e = if *inclusive { (e_raw + 1) as usize } else { e_raw as usize };
+                            let chars: Vec<char> = st.chars().collect();
+                            let e = e.min(chars.len());
+                            if s > e { return Ok(Value::Str(String::new())); }
+                            return Ok(Value::Str(chars[s..e].iter().collect()));
+                        }
+                        _ => return Err(self.type_err("slice requires array or string".into())),
+                    }
+                }
                 let arr = self.eval_expr(arr_expr)?;
                 let idx = self.eval_expr(idx_expr)?;
                 match (&arr, &idx) {
@@ -2019,7 +2349,8 @@ impl Interpreter {
                         }
                     }
                     _ => {
-                        Err(self.type_err("invalid index operation".into()))
+                        Err(self.type_err(format!("invalid index operation: {}[{}]",
+                            self.value_type_string(&arr), self.value_type_string(&idx))))
                     }
                 }
             }
@@ -2336,12 +2667,21 @@ impl Interpreter {
             Expr::Resume(val_expr) => {
                 let val = self.eval_expr(val_expr)?;
                 self.resume_value = Some(val.clone());
+                // If there's an active throw (suspended error state), clear it
+                // so execution can resume with the provided value
+                if self.throw_value.is_some() {
+                    self.throw_value = None;
+                }
                 Ok(val)
             }
             Expr::Yield(expr) => {
-                // Yield currently evaluates the expression and returns its value
-                // Full generator support would require coroutine infrastructure
-                self.eval_expr(expr)
+                let val = self.eval_expr(expr)?;
+                if self.gen_active {
+                    // Inside a generator context: push yielded value to buffer
+                    self.gen_buffer.push(val.clone());
+                }
+                // Always return the yielded value (for single-yield or non-gen context)
+                Ok(val)
             }
             Expr::DynCast(trait_name, expr) => {
                 let val = self.eval_expr(expr)?;
@@ -2362,6 +2702,19 @@ impl Interpreter {
                         "type {} does not implement trait {}", type_name, trait_name
                     )));
                 }
+                // Verify all required trait methods are implemented (runtime conformance check)
+                if let Some(trait_def) = self.trait_defs.get(trait_name) {
+                    let impl_methods = self.trait_impls.get(&key).unwrap();
+                    for (method_name, _params, default_body) in trait_def {
+                        // Only require methods that have no default implementation
+                        if default_body.is_empty() && !impl_methods.contains_key(method_name) {
+                            return Err(self.runtime_err(format!(
+                                "dyn {}: type {} is missing required method '{}'",
+                                trait_name, type_name, method_name
+                            )));
+                        }
+                    }
+                }
                 Ok(Value::TraitObject(Box::new(crate::env::TraitObjectInner {
                     value: Box::new(val),
                     trait_name: trait_name.clone(),
@@ -2378,9 +2731,11 @@ impl Interpreter {
                 self.env.push_scope();
                 let mut result = Value::Void;
                 let mut caught = false;
+                let mut partial_state = Value::Void;
                 for s in try_block {
                     match self.exec_stmt(s) {
                         Ok(v) => {
+                            partial_state = v.clone();
                             result = v;
                             if self.throw_value.is_some() {
                                 caught = true;
@@ -2401,8 +2756,30 @@ impl Interpreter {
                 self.env.pop_scope();
                 if caught {
                     let err_val = self.throw_value.take().unwrap_or(Value::Error("unknown error".into()));
+                    // Detect recover mode (parser tags with __recover__ prefix)
+                    let (real_name, bind_val) = if err_name.starts_with("__recover__") {
+                        let real = err_name.strip_prefix("__recover__").unwrap().to_string();
+                        let err_str = match &err_val {
+                            Value::Error(s) => s.clone(),
+                            other => format!("{}", other),
+                        };
+                        let err_type = match &err_val {
+                            Value::Error(_) => "error".to_string(),
+                            _ => "unknown".to_string(),
+                        };
+                        let mut ctx = HashMap::new();
+                        ctx.insert("error".to_string(), err_val);
+                        ctx.insert("message".to_string(), Value::Str(err_str));
+                        ctx.insert("type".to_string(), Value::Str(err_type));
+                        ctx.insert("line".to_string(), Value::Int(self.current_line as i64));
+                        ctx.insert("recovered".to_string(), Value::Bool(true));
+                        ctx.insert("partial".to_string(), partial_state);
+                        (real, Value::Map(Box::new(ctx)))
+                    } else {
+                        (err_name.clone(), err_val)
+                    };
                     self.env.push_scope();
-                    self.env.define(err_name, err_val);
+                    self.env.define(&real_name, bind_val);
                     for s in catch_block {
                         result = self.exec_stmt(s)?;
                         if self.return_value.is_some() || self.throw_value.is_some() {
@@ -2767,10 +3144,78 @@ impl Interpreter {
                         args.len()
                     )));
                 }
+                // @tail: tail-call optimization trampoline
+                if _name.starts_with("__tail__") {
+                    let real_name = &_name["__tail__".len()..];
+                    let prev_tail = self.in_tail_call.take();
+                    self.in_tail_call = Some(real_name.to_string());
+                    let mut current_args = args;
+                    let result = loop {
+                        self.env.push_scope();
+                        for (param, arg) in params.iter().zip(current_args.iter().cloned()) {
+                            self.env.define(param, arg);
+                        }
+                        let mut result = Value::Void;
+                        for stmt in body.iter() {
+                            result = self.exec_stmt(stmt)?;
+                            if self.return_value.is_some() {
+                                result = self.return_value.take().unwrap();
+                                break;
+                            }
+                        }
+                        self.env.pop_scope();
+                        // Check if result is a tail-call marker
+                        if let Value::Array(ref arr) = result {
+                            if arr.len() > 0 {
+                                if let Value::Str(ref s) = arr[0] {
+                                    if s == "__tail_call__" {
+                                        current_args = arr[1..].to_vec();
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                        break result;
+                    };
+                    self.in_tail_call = prev_tail;
+                    return Ok(result);
+                }
+                // @const: permanently cached compile-time evaluation (never evicted)
+                let is_const_fn = _name.starts_with("__const__");
+                if is_const_fn {
+                    let fn_key = _name.clone();
+                    let args_hash = {
+                        use std::hash::Hasher;
+                        let mut h = std::collections::hash_map::DefaultHasher::new();
+                        for av in &args { hash_value_interp(av, &mut h); }
+                        h.finish()
+                    };
+                    if let Some(cached) = self.const_cache.get(&fn_key).and_then(|m| m.get(&args_hash)) {
+                        return Ok(cached.clone());
+                    }
+                    let prev_pure = self.in_pure_fn;
+                    self.in_pure_fn = true;
+                    self.env.push_scope();
+                    for (param, arg) in params.iter().zip(args) {
+                        self.env.define(param, arg);
+                    }
+                    let mut result = Value::Void;
+                    for stmt in body.iter() {
+                        result = self.exec_stmt(stmt)?;
+                        if self.return_value.is_some() {
+                            result = self.return_value.take().unwrap();
+                            break;
+                        }
+                    }
+                    self.env.pop_scope();
+                    self.in_pure_fn = prev_pure;
+                    self.const_cache.entry(fn_key).or_default().insert(args_hash, result.clone());
+                    return Ok(result);
+                }
                 let is_memoize = _name.starts_with("__memoize__");
                 let is_pure = _name.starts_with("__pure__") || is_memoize;
-                // @memoize: check cache before execution
-                if is_memoize {
+                // @memoize / @pure: check cache before execution
+                if is_memoize || is_pure {
                     let fn_key = _name.clone();
                     let args_hash = {
                         use std::hash::Hasher;
@@ -2800,8 +3245,13 @@ impl Interpreter {
                     self.memo_cache.entry(fn_key).or_default().insert(args_hash, result.clone());
                     return Ok(result);
                 }
-                let prev_pure = self.in_pure_fn;
-                if is_pure { self.in_pure_fn = true; }
+                // @evolve: track call count and execution time
+                let is_evolve = self.evolve_fns.contains_key(&_name);
+                let evolve_start = if is_evolve {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
                 self.env.push_scope();
                 for (param, arg) in params.iter().zip(args) {
                     self.env.define(param, arg);
@@ -2819,7 +3269,13 @@ impl Interpreter {
                     }
                 }
                 self.env.pop_scope();
-                self.in_pure_fn = prev_pure;
+                // @evolve: record stats
+                if let Some(start) = evolve_start {
+                    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+                    let entry = self.evolve_stats.entry(_name).or_insert((0, 0.0));
+                    entry.0 += 1;
+                    entry.1 += elapsed_ms;
+                }
                 Ok(result)
             }
             Value::Lambda(lam_inner) => {
@@ -3781,6 +4237,32 @@ impl Interpreter {
                 let data = vec![0.0f64; n];
                 Ok(Value::Tensor(Arc::new(TensorData { shape: vec![n], data })))
             }
+            "tensor_last_row" => {
+                // tensor_last_row(t, rows, cols) → Tensor of shape [cols] copied from last row.
+                // Eliminates hexa-level `last.push(h[base+j])` loops (T1 v8 slice 143ms → O(cols)).
+                if args.len() != 3 {
+                    return Err(self.type_err("tensor_last_row(t, rows, cols) requires 3 args".into()));
+                }
+                let rows = match &args[1] {
+                    Value::Int(i) if *i > 0 => *i as usize,
+                    _ => return Err(self.type_err("tensor_last_row: rows must be positive int".into())),
+                };
+                let cols = match &args[2] {
+                    Value::Int(i) if *i > 0 => *i as usize,
+                    _ => return Err(self.type_err("tensor_last_row: cols must be positive int".into())),
+                };
+                let src = to_f64_slice(&args[0])
+                    .ok_or_else(|| self.type_err("tensor_last_row: t must be tensor/array".into()))?;
+                if src.as_slice().len() < rows * cols {
+                    return Err(self.runtime_err(format!(
+                        "tensor_last_row: len {} < rows*cols {}",
+                        src.as_slice().len(), rows * cols
+                    )));
+                }
+                let base = (rows - 1) * cols;
+                let data: Vec<f64> = src.as_slice()[base..base + cols].to_vec();
+                Ok(Value::Tensor(Arc::new(TensorData { shape: vec![cols], data })))
+            }
             "tensor_fill" => {
                 if args.len() != 2 {
                     return Err(self.type_err("tensor_fill(n, v) requires 2 arguments".into()));
@@ -4542,12 +5024,13 @@ impl Interpreter {
                     (Value::Int(m), Value::Int(k), Value::Int(n)) => (*m as usize, *k as usize, *n as usize),
                     _ => return Err(self.type_err("matmul_into() requires int dimensions".into())),
                 };
-                // Read A, B as owned vecs to drop borrows before mutating out.
-                let (a_vec, b_vec): (Vec<f64>, Vec<f64>) = match (to_f64_slice(&args[0]), to_f64_slice(&args[1])) {
-                    (Some(a_s), Some(b_s)) => (a_s.as_slice().to_vec(), b_s.as_slice().to_vec()),
-                    _ => return Err(self.type_err("matmul_into() requires (array/tensor, array/tensor, int, int, int, tensor)".into())),
-                };
-                if a_vec.len() < m * k || b_vec.len() < k * n {
+                // PERF: swap A,B out of args — zero-copy for Tensor (moves Arc, no data copy).
+                let arg0 = std::mem::replace(&mut args[0], Value::Void);
+                let arg1 = std::mem::replace(&mut args[1], Value::Void);
+                let a_fs = to_f64_slice(&arg0).ok_or_else(|| self.type_err("matmul_into() A must be tensor/array".into()))?;
+                let b_fs = to_f64_slice(&arg1).ok_or_else(|| self.type_err("matmul_into() B must be tensor/array".into()))?;
+                let (a_sl, b_sl) = (a_fs.as_slice(), b_fs.as_slice());
+                if a_sl.len() < m * k || b_sl.len() < k * n {
                     return Err(self.type_err("matmul_into() input length < M*K or K*N".into()));
                 }
                 match &mut args[5] {
@@ -4555,36 +5038,33 @@ impl Interpreter {
                         if arc.data.len() != m * n {
                             return Err(self.type_err("matmul_into() out.len() != M*N".into()));
                         }
-                        // Ensure unique ownership; fallback: clone then wrap new Arc.
                         if Arc::get_mut(arc).is_some() {
                             let td = Arc::get_mut(arc).unwrap();
                             let c = td.data.as_mut_slice();
-                            // zero it (beta=0 semantics)
-                            for v in c.iter_mut() { *v = 0.0; }
                             #[cfg(any(target_os = "macos", target_os = "linux"))]
                             unsafe {
                                 cblas_dgemm(
                                     CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
                                     m as i32, n as i32, k as i32,
-                                    1.0, a_vec.as_ptr(), k as i32,
-                                    b_vec.as_ptr(), n as i32,
+                                    1.0, a_sl.as_ptr(), k as i32,
+                                    b_sl.as_ptr(), n as i32,
                                     0.0, c.as_mut_ptr(), n as i32,
                                 );
                             }
                             #[cfg(not(any(target_os = "macos", target_os = "linux")))]
                             {
+                                for v in c.iter_mut() { *v = 0.0; }
                                 for i in 0..m {
                                     for p in 0..k {
-                                        let a_val = a_vec[i * k + p];
+                                        let a_val = a_sl[i * k + p];
                                         for j in 0..n {
-                                            c[i * n + j] += a_val * b_vec[p * n + j];
+                                            c[i * n + j] += a_val * b_sl[p * n + j];
                                         }
                                     }
                                 }
                             }
                             Ok(Value::Tensor(arc.clone()))
                         } else {
-                            // shared: fallback to new buffer
                             let shape = arc.shape.clone();
                             let mut c = vec![0.0f64; m * n];
                             #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -4592,8 +5072,8 @@ impl Interpreter {
                                 cblas_dgemm(
                                     CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
                                     m as i32, n as i32, k as i32,
-                                    1.0, a_vec.as_ptr(), k as i32,
-                                    b_vec.as_ptr(), n as i32,
+                                    1.0, a_sl.as_ptr(), k as i32,
+                                    b_sl.as_ptr(), n as i32,
                                     0.0, c.as_mut_ptr(), n as i32,
                                 );
                             }
@@ -4601,9 +5081,9 @@ impl Interpreter {
                             {
                                 for i in 0..m {
                                     for p in 0..k {
-                                        let a_val = a_vec[i * k + p];
+                                        let a_val = a_sl[i * k + p];
                                         for j in 0..n {
-                                            c[i * n + j] += a_val * b_vec[p * n + j];
+                                            c[i * n + j] += a_val * b_sl[p * n + j];
                                         }
                                     }
                                 }
@@ -4625,11 +5105,12 @@ impl Interpreter {
                     (Value::Int(m), Value::Int(k), Value::Int(n)) => (*m as usize, *k as usize, *n as usize),
                     _ => return Err(self.type_err("matmul_transpose_a_into() requires int dimensions".into())),
                 };
-                let (a_vec, b_vec): (Vec<f64>, Vec<f64>) = match (to_f64_slice(&args[0]), to_f64_slice(&args[1])) {
-                    (Some(a_s), Some(b_s)) => (a_s.as_slice().to_vec(), b_s.as_slice().to_vec()),
-                    _ => return Err(self.type_err("matmul_transpose_a_into() requires (array/tensor, array/tensor, int, int, int, tensor)".into())),
-                };
-                if a_vec.len() < k * m || b_vec.len() < k * n {
+                let arg0 = std::mem::replace(&mut args[0], Value::Void);
+                let arg1 = std::mem::replace(&mut args[1], Value::Void);
+                let a_fs = to_f64_slice(&arg0).ok_or_else(|| self.type_err("matmul_transpose_a_into() A must be tensor/array".into()))?;
+                let b_fs = to_f64_slice(&arg1).ok_or_else(|| self.type_err("matmul_transpose_a_into() B must be tensor/array".into()))?;
+                let (a_sl, b_sl) = (a_fs.as_slice(), b_fs.as_slice());
+                if a_sl.len() < k * m || b_sl.len() < k * n {
                     return Err(self.type_err("matmul_transpose_a_into() input length < K*M or K*N".into()));
                 }
                 match &mut args[5] {
@@ -4640,24 +5121,24 @@ impl Interpreter {
                         if Arc::get_mut(arc).is_some() {
                             let td = Arc::get_mut(arc).unwrap();
                             let c = td.data.as_mut_slice();
-                            for v in c.iter_mut() { *v = 0.0; }
                             #[cfg(any(target_os = "macos", target_os = "linux"))]
                             unsafe {
                                 cblas_dgemm(
                                     CBLAS_ROW_MAJOR, CBLAS_TRANS, CBLAS_NO_TRANS,
                                     m as i32, n as i32, k as i32,
-                                    1.0, a_vec.as_ptr(), m as i32,
-                                    b_vec.as_ptr(), n as i32,
+                                    1.0, a_sl.as_ptr(), m as i32,
+                                    b_sl.as_ptr(), n as i32,
                                     0.0, c.as_mut_ptr(), n as i32,
                                 );
                             }
                             #[cfg(not(any(target_os = "macos", target_os = "linux")))]
                             {
+                                for v in c.iter_mut() { *v = 0.0; }
                                 for i in 0..m {
                                     for p in 0..k {
-                                        let a_val = a_vec[p * m + i];
+                                        let a_val = a_sl[p * m + i];
                                         for j in 0..n {
-                                            c[i * n + j] += a_val * b_vec[p * n + j];
+                                            c[i * n + j] += a_val * b_sl[p * n + j];
                                         }
                                     }
                                 }
@@ -4671,8 +5152,8 @@ impl Interpreter {
                                 cblas_dgemm(
                                     CBLAS_ROW_MAJOR, CBLAS_TRANS, CBLAS_NO_TRANS,
                                     m as i32, n as i32, k as i32,
-                                    1.0, a_vec.as_ptr(), m as i32,
-                                    b_vec.as_ptr(), n as i32,
+                                    1.0, a_sl.as_ptr(), m as i32,
+                                    b_sl.as_ptr(), n as i32,
                                     0.0, c.as_mut_ptr(), n as i32,
                                 );
                             }
@@ -4680,9 +5161,9 @@ impl Interpreter {
                             {
                                 for i in 0..m {
                                     for p in 0..k {
-                                        let a_val = a_vec[p * m + i];
+                                        let a_val = a_sl[p * m + i];
                                         for j in 0..n {
-                                            c[i * n + j] += a_val * b_vec[p * n + j];
+                                            c[i * n + j] += a_val * b_sl[p * n + j];
                                         }
                                     }
                                 }
@@ -4704,11 +5185,12 @@ impl Interpreter {
                     (Value::Int(m), Value::Int(k), Value::Int(n)) => (*m as usize, *k as usize, *n as usize),
                     _ => return Err(self.type_err("matmul_transpose_b_into() requires int dimensions".into())),
                 };
-                let (a_vec, b_vec): (Vec<f64>, Vec<f64>) = match (to_f64_slice(&args[0]), to_f64_slice(&args[1])) {
-                    (Some(a_s), Some(b_s)) => (a_s.as_slice().to_vec(), b_s.as_slice().to_vec()),
-                    _ => return Err(self.type_err("matmul_transpose_b_into() requires (array/tensor, array/tensor, int, int, int, tensor)".into())),
-                };
-                if a_vec.len() < m * k || b_vec.len() < n * k {
+                let arg0 = std::mem::replace(&mut args[0], Value::Void);
+                let arg1 = std::mem::replace(&mut args[1], Value::Void);
+                let a_fs = to_f64_slice(&arg0).ok_or_else(|| self.type_err("matmul_transpose_b_into() A must be tensor/array".into()))?;
+                let b_fs = to_f64_slice(&arg1).ok_or_else(|| self.type_err("matmul_transpose_b_into() B must be tensor/array".into()))?;
+                let (a_sl, b_sl) = (a_fs.as_slice(), b_fs.as_slice());
+                if a_sl.len() < m * k || b_sl.len() < n * k {
                     return Err(self.type_err("matmul_transpose_b_into() input length < M*K or N*K".into()));
                 }
                 match &mut args[5] {
@@ -4719,14 +5201,13 @@ impl Interpreter {
                         if Arc::get_mut(arc).is_some() {
                             let td = Arc::get_mut(arc).unwrap();
                             let c = td.data.as_mut_slice();
-                            for v in c.iter_mut() { *v = 0.0; }
                             #[cfg(any(target_os = "macos", target_os = "linux"))]
                             unsafe {
                                 cblas_dgemm(
                                     CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_TRANS,
                                     m as i32, n as i32, k as i32,
-                                    1.0, a_vec.as_ptr(), k as i32,
-                                    b_vec.as_ptr(), k as i32,
+                                    1.0, a_sl.as_ptr(), k as i32,
+                                    b_sl.as_ptr(), k as i32,
                                     0.0, c.as_mut_ptr(), n as i32,
                                 );
                             }
@@ -4735,7 +5216,7 @@ impl Interpreter {
                                 for i in 0..m {
                                     for j in 0..n {
                                         let mut s = 0.0;
-                                        for p in 0..k { s += a_vec[i * k + p] * b_vec[j * k + p]; }
+                                        for p in 0..k { s += a_sl[i * k + p] * b_sl[j * k + p]; }
                                         c[i * n + j] = s;
                                     }
                                 }
@@ -4749,8 +5230,8 @@ impl Interpreter {
                                 cblas_dgemm(
                                     CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_TRANS,
                                     m as i32, n as i32, k as i32,
-                                    1.0, a_vec.as_ptr(), k as i32,
-                                    b_vec.as_ptr(), k as i32,
+                                    1.0, a_sl.as_ptr(), k as i32,
+                                    b_sl.as_ptr(), k as i32,
                                     0.0, c.as_mut_ptr(), n as i32,
                                 );
                             }
@@ -4759,7 +5240,7 @@ impl Interpreter {
                                 for i in 0..m {
                                     for j in 0..n {
                                         let mut s = 0.0;
-                                        for p in 0..k { s += a_vec[i * k + p] * b_vec[j * k + p]; }
+                                        for p in 0..k { s += a_sl[i * k + p] * b_sl[j * k + p]; }
                                         c[i * n + j] = s;
                                     }
                                 }
@@ -4785,11 +5266,12 @@ impl Interpreter {
                     Value::Int(i) => *i as f64,
                     _ => return Err(self.type_err("matmul_into_accumulate() beta must be float/int".into())),
                 };
-                let (a_vec, b_vec): (Vec<f64>, Vec<f64>) = match (to_f64_slice(&args[0]), to_f64_slice(&args[1])) {
-                    (Some(a_s), Some(b_s)) => (a_s.as_slice().to_vec(), b_s.as_slice().to_vec()),
-                    _ => return Err(self.type_err("matmul_into_accumulate() requires (array/tensor, array/tensor, ...)".into())),
-                };
-                if a_vec.len() < m * k || b_vec.len() < k * n {
+                let arg0 = std::mem::replace(&mut args[0], Value::Void);
+                let arg1 = std::mem::replace(&mut args[1], Value::Void);
+                let a_fs = to_f64_slice(&arg0).ok_or_else(|| self.type_err("matmul_into_accumulate() A must be tensor/array".into()))?;
+                let b_fs = to_f64_slice(&arg1).ok_or_else(|| self.type_err("matmul_into_accumulate() B must be tensor/array".into()))?;
+                let (a_sl, b_sl) = (a_fs.as_slice(), b_fs.as_slice());
+                if a_sl.len() < m * k || b_sl.len() < k * n {
                     return Err(self.type_err("matmul_into_accumulate() input length < M*K or K*N".into()));
                 }
                 match &mut args[5] {
@@ -4805,8 +5287,8 @@ impl Interpreter {
                                 cblas_dgemm(
                                     CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
                                     m as i32, n as i32, k as i32,
-                                    1.0, a_vec.as_ptr(), k as i32,
-                                    b_vec.as_ptr(), n as i32,
+                                    1.0, a_sl.as_ptr(), k as i32,
+                                    b_sl.as_ptr(), n as i32,
                                     beta, c.as_mut_ptr(), n as i32,
                                 );
                             }
@@ -4815,9 +5297,9 @@ impl Interpreter {
                                 for v in c.iter_mut() { *v *= beta; }
                                 for i in 0..m {
                                     for p in 0..k {
-                                        let a_val = a_vec[i * k + p];
+                                        let a_val = a_sl[i * k + p];
                                         for j in 0..n {
-                                            c[i * n + j] += a_val * b_vec[p * n + j];
+                                            c[i * n + j] += a_val * b_sl[p * n + j];
                                         }
                                     }
                                 }
@@ -4831,8 +5313,8 @@ impl Interpreter {
                                 cblas_dgemm(
                                     CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
                                     m as i32, n as i32, k as i32,
-                                    1.0, a_vec.as_ptr(), k as i32,
-                                    b_vec.as_ptr(), n as i32,
+                                    1.0, a_sl.as_ptr(), k as i32,
+                                    b_sl.as_ptr(), n as i32,
                                     beta, c.as_mut_ptr(), n as i32,
                                 );
                             }
@@ -4841,9 +5323,9 @@ impl Interpreter {
                                 for v in c.iter_mut() { *v *= beta; }
                                 for i in 0..m {
                                     for p in 0..k {
-                                        let a_val = a_vec[i * k + p];
+                                        let a_val = a_sl[i * k + p];
                                         for j in 0..n {
-                                            c[i * n + j] += a_val * b_vec[p * n + j];
+                                            c[i * n + j] += a_val * b_sl[p * n + j];
                                         }
                                     }
                                 }
@@ -5240,15 +5722,33 @@ impl Interpreter {
                     (Value::Int(s), Value::Int(d), Value::Int(r), Value::Int(f), Value::Int(nl)) => (*s as usize, *d as usize, *r as usize, *f as usize, *nl as usize),
                     _ => return Err(self.type_err("block_forward_chain() requires int (SEQ, D, R, FF, N_LAYER)".into())),
                 };
-                let uqkv: Vec<f64> = to_f64_slice(&args[1]).map(|s| s.as_slice().to_vec()).ok_or_else(|| self.type_err("Uqkv must be tensor/array".into()))?;
-                let vv: Vec<f64> = to_f64_slice(&args[2]).map(|s| s.as_slice().to_vec()).ok_or_else(|| self.type_err("Vv must be tensor/array".into()))?;
-                let uo: Vec<f64> = to_f64_slice(&args[3]).map(|s| s.as_slice().to_vec()).ok_or_else(|| self.type_err("Uo must be tensor/array".into()))?;
-                let vo_: Vec<f64> = to_f64_slice(&args[4]).map(|s| s.as_slice().to_vec()).ok_or_else(|| self.type_err("Vo must be tensor/array".into()))?;
-                let uu: Vec<f64> = to_f64_slice(&args[5]).map(|s| s.as_slice().to_vec()).ok_or_else(|| self.type_err("Uu must be tensor/array".into()))?;
-                let vu: Vec<f64> = to_f64_slice(&args[6]).map(|s| s.as_slice().to_vec()).ok_or_else(|| self.type_err("Vu must be tensor/array".into()))?;
-                let ud: Vec<f64> = to_f64_slice(&args[7]).map(|s| s.as_slice().to_vec()).ok_or_else(|| self.type_err("Ud must be tensor/array".into()))?;
-                let vd: Vec<f64> = to_f64_slice(&args[8]).map(|s| s.as_slice().to_vec()).ok_or_else(|| self.type_err("Vd must be tensor/array".into()))?;
-                let mut x: Vec<f64> = to_f64_slice(&args[0]).map(|s| s.as_slice().to_vec()).ok_or_else(|| self.type_err("X must be tensor/array".into()))?;
+                // PERF: swap weights out of args — zero-copy borrow for Tensor path.
+                let arg_x = std::mem::replace(&mut args[0], Value::Void);
+                let arg_uqkv = std::mem::replace(&mut args[1], Value::Void);
+                let arg_vv = std::mem::replace(&mut args[2], Value::Void);
+                let arg_uo = std::mem::replace(&mut args[3], Value::Void);
+                let arg_vo = std::mem::replace(&mut args[4], Value::Void);
+                let arg_uu = std::mem::replace(&mut args[5], Value::Void);
+                let arg_vu = std::mem::replace(&mut args[6], Value::Void);
+                let arg_ud = std::mem::replace(&mut args[7], Value::Void);
+                let arg_vd = std::mem::replace(&mut args[8], Value::Void);
+                let fs_uqkv = to_f64_slice(&arg_uqkv).ok_or_else(|| self.type_err("Uqkv must be tensor/array".into()))?;
+                let fs_vv = to_f64_slice(&arg_vv).ok_or_else(|| self.type_err("Vv must be tensor/array".into()))?;
+                let fs_uo = to_f64_slice(&arg_uo).ok_or_else(|| self.type_err("Uo must be tensor/array".into()))?;
+                let fs_vo = to_f64_slice(&arg_vo).ok_or_else(|| self.type_err("Vo must be tensor/array".into()))?;
+                let fs_uu = to_f64_slice(&arg_uu).ok_or_else(|| self.type_err("Uu must be tensor/array".into()))?;
+                let fs_vu = to_f64_slice(&arg_vu).ok_or_else(|| self.type_err("Vu must be tensor/array".into()))?;
+                let fs_ud = to_f64_slice(&arg_ud).ok_or_else(|| self.type_err("Ud must be tensor/array".into()))?;
+                let fs_vd = to_f64_slice(&arg_vd).ok_or_else(|| self.type_err("Vd must be tensor/array".into()))?;
+                let uqkv = fs_uqkv.as_slice();
+                let vv = fs_vv.as_slice();
+                let uo = fs_uo.as_slice();
+                let vo_ = fs_vo.as_slice();
+                let uu = fs_uu.as_slice();
+                let vu = fs_vu.as_slice();
+                let ud = fs_ud.as_slice();
+                let vd = fs_vd.as_slice();
+                let mut x: Vec<f64> = to_f64_slice(&arg_x).map(|s| s.as_slice().to_vec()).ok_or_else(|| self.type_err("X must be tensor/array".into()))?;
 
                 let three_r = 3 * r;
                 // Pre-allocated scratch (single alloc, reused for all layers).
@@ -5378,20 +5878,8 @@ impl Interpreter {
                     // X += ffn_out
                     for i in 0..(seq*d) { x[i] += ffn_out[i]; }
                 }
-                // Return X
-                match &mut args[0] {
-                    Value::Tensor(arc) => {
-                        if Arc::get_mut(arc).is_some() {
-                            let td = Arc::get_mut(arc).unwrap();
-                            td.data.copy_from_slice(&x);
-                            Ok(Value::Tensor(arc.clone()))
-                        } else {
-                            let shape = arc.shape.clone();
-                            Ok(Value::Tensor(Arc::new(TensorData { shape, data: x })))
-                        }
-                    }
-                    _ => Ok(Value::Tensor(Arc::new(TensorData { shape: vec![seq, d], data: x }))),
-                }
+                // Return X as new Tensor (arg_x was swapped out for zero-copy weights)
+                Ok(Value::Tensor(Arc::new(TensorData { shape: vec![seq, d], data: x })))
             }
             "block_forward_chain_f32" => {
                 // f32 variant: cblas_sgemm 경로. BLIS 실측 sgemm 88 GF vs dgemm 33 GF (2.67x).
@@ -5404,19 +5892,28 @@ impl Interpreter {
                     (Value::Int(s), Value::Int(d), Value::Int(r), Value::Int(f), Value::Int(nl)) => (*s as usize, *d as usize, *r as usize, *f as usize, *nl as usize),
                     _ => return Err(self.type_err("int (SEQ, D, R, FF, N_LAYER)".into())),
                 };
-                // Helper: Tensor/Array → Vec<f32>
+                // PERF: swap out of args first, then convert to f32 once (no double copy).
                 fn to_f32(val: &Value) -> Option<Vec<f32>> {
                     to_f64_slice(val).map(|s| s.as_slice().iter().map(|&v| v as f32).collect())
                 }
-                let uqkv: Vec<f32> = to_f32(&args[1]).ok_or_else(|| self.type_err("Uqkv".into()))?;
-                let vv: Vec<f32> = to_f32(&args[2]).ok_or_else(|| self.type_err("Vv".into()))?;
-                let uo: Vec<f32> = to_f32(&args[3]).ok_or_else(|| self.type_err("Uo".into()))?;
-                let vo_: Vec<f32> = to_f32(&args[4]).ok_or_else(|| self.type_err("Vo".into()))?;
-                let uu: Vec<f32> = to_f32(&args[5]).ok_or_else(|| self.type_err("Uu".into()))?;
-                let vu: Vec<f32> = to_f32(&args[6]).ok_or_else(|| self.type_err("Vu".into()))?;
-                let ud: Vec<f32> = to_f32(&args[7]).ok_or_else(|| self.type_err("Ud".into()))?;
-                let vd: Vec<f32> = to_f32(&args[8]).ok_or_else(|| self.type_err("Vd".into()))?;
-                let mut x: Vec<f32> = to_f32(&args[0]).ok_or_else(|| self.type_err("X".into()))?;
+                let arg_x = std::mem::replace(&mut args[0], Value::Void);
+                let arg1 = std::mem::replace(&mut args[1], Value::Void);
+                let arg2 = std::mem::replace(&mut args[2], Value::Void);
+                let arg3 = std::mem::replace(&mut args[3], Value::Void);
+                let arg4 = std::mem::replace(&mut args[4], Value::Void);
+                let arg5 = std::mem::replace(&mut args[5], Value::Void);
+                let arg6 = std::mem::replace(&mut args[6], Value::Void);
+                let arg7 = std::mem::replace(&mut args[7], Value::Void);
+                let arg8 = std::mem::replace(&mut args[8], Value::Void);
+                let uqkv: Vec<f32> = to_f32(&arg1).ok_or_else(|| self.type_err("Uqkv".into()))?;
+                let vv: Vec<f32> = to_f32(&arg2).ok_or_else(|| self.type_err("Vv".into()))?;
+                let uo: Vec<f32> = to_f32(&arg3).ok_or_else(|| self.type_err("Uo".into()))?;
+                let vo_: Vec<f32> = to_f32(&arg4).ok_or_else(|| self.type_err("Vo".into()))?;
+                let uu: Vec<f32> = to_f32(&arg5).ok_or_else(|| self.type_err("Uu".into()))?;
+                let vu: Vec<f32> = to_f32(&arg6).ok_or_else(|| self.type_err("Vu".into()))?;
+                let ud: Vec<f32> = to_f32(&arg7).ok_or_else(|| self.type_err("Ud".into()))?;
+                let vd: Vec<f32> = to_f32(&arg8).ok_or_else(|| self.type_err("Vd".into()))?;
+                let mut x: Vec<f32> = to_f32(&arg_x).ok_or_else(|| self.type_err("X".into()))?;
 
                 let three_r = 3 * r;
                 let mut y_qkv = vec![0.0f32; seq * three_r];
@@ -5505,19 +6002,7 @@ impl Interpreter {
                 }
                 // Convert back to f64 for return
                 let x_f64: Vec<f64> = x.iter().map(|&v| v as f64).collect();
-                match &mut args[0] {
-                    Value::Tensor(arc) => {
-                        if Arc::get_mut(arc).is_some() {
-                            let td = Arc::get_mut(arc).unwrap();
-                            td.data.copy_from_slice(&x_f64);
-                            Ok(Value::Tensor(arc.clone()))
-                        } else {
-                            let shape = arc.shape.clone();
-                            Ok(Value::Tensor(Arc::new(TensorData { shape, data: x_f64 })))
-                        }
-                    }
-                    _ => Ok(Value::Tensor(Arc::new(TensorData { shape: vec![seq, d], data: x_f64 }))),
-                }
+                Ok(Value::Tensor(Arc::new(TensorData { shape: vec![seq, d], data: x_f64 })))
             }
             "rope_inplace" => {
                 // rope_inplace(X, SEQ, D, BASE) → in-place RoPE on X[SEQ×D]
@@ -5826,7 +6311,7 @@ impl Interpreter {
                     Ok(Value::Array(result))
                 } else { Err(self.type_err("randn() requires int".into())) }
             }
-            "arange" => {
+            "arange" | "range" => {
                 // arange(n) → [0.0, 1.0, ..., n-1.0]
                 if args.is_empty() { return Err(self.type_err("arange() requires 1 int argument".into())); }
                 if let Value::Int(n) = &args[0] {
@@ -7851,6 +8336,23 @@ impl Interpreter {
                     Err(self.type_err("evolve_gen() requires string argument".into()))
                 }
             }
+            "evolve_stats" => {
+                // evolve_stats("fn_name") → [call_count, total_time_ms]
+                if args.is_empty() { return Err(self.type_err("evolve_stats() requires 1 argument".into())); }
+                if let Value::Str(name) = &args[0] {
+                    if let Some((count, total_ms)) = self.evolve_stats.get(name.as_str()) {
+                        Ok(Value::Array(vec![
+                            Value::Int(*count as i64),
+                            Value::Float(*total_ms),
+                        ]))
+                    } else {
+                        // Function exists but never called, or not an evolve fn
+                        Ok(Value::Array(vec![Value::Int(0), Value::Float(0.0)]))
+                    }
+                } else {
+                    Err(self.type_err("evolve_stats() requires string argument".into()))
+                }
+            }
             // ── Math builtins ──────────────────────────────────────
             "abs" => {
                 if args.is_empty() { return Err(self.type_err("abs() requires 1 argument".into())); }
@@ -8139,6 +8641,26 @@ impl Interpreter {
                     let receiver = Value::Receiver(Arc::new(Mutex::new(rx)));
                     Ok(Value::Tuple(vec![sender, receiver]))
                 }
+            }
+            // ── Generator collection builtin ─────────────────────────
+            "gen" => {
+                // gen(fn) — run a function/lambda in generator mode, collect all yield-ed values
+                if args.len() != 1 {
+                    return Err(self.type_err("gen() requires 1 argument (a function/lambda)".into()));
+                }
+                let func = args.into_iter().next().unwrap();
+                let prev_active = self.gen_active;
+                let prev_buf = std::mem::take(&mut self.gen_buffer);
+                self.gen_active = true;
+                // Run the generator body; errors after yielding still return partial results
+                let run_result = self.call_function(func, vec![]);
+                let collected = std::mem::replace(&mut self.gen_buffer, prev_buf);
+                self.gen_active = prev_active;
+                // If nothing was yielded and there was an error, propagate it
+                if collected.is_empty() {
+                    run_result?;
+                }
+                Ok(Value::Array(collected))
             }
             // ── Char utility builtins ────────────────────────────────
             "is_alpha" => {
@@ -8881,6 +9403,406 @@ impl Interpreter {
                     _ => Err(self.type_err("free_raw() requires (pointer, int) arguments".into())),
                 }
             }
+            // ── KV Cache Autoregressive Inference ─────────────────────
+            // kv_cache_init(weights_array, D, R, FF, N_LAYER, MAX_SEQ, VOCAB, U_lmh, V_lmh)
+            // Converts all weights to f32, allocates KV cache. Call once.
+            "kv_cache_init" => {
+                if args.len() < 9 {
+                    return Err(self.type_err("kv_cache_init requires 9 args".into()));
+                }
+                let weights_arr = match &args[0] {
+                    Value::Array(a) => a.clone(),
+                    _ => return Err(self.type_err("kv_cache_init: arg0 must be array of tensors".into())),
+                };
+                let d = match &args[1] { Value::Int(v) => *v as usize, _ => return Err(self.type_err("D must be int".into())) };
+                let r = match &args[2] { Value::Int(v) => *v as usize, _ => return Err(self.type_err("R must be int".into())) };
+                let ff = match &args[3] { Value::Int(v) => *v as usize, _ => return Err(self.type_err("FF must be int".into())) };
+                let n_layer = match &args[4] { Value::Int(v) => *v as usize, _ => return Err(self.type_err("N_LAYER must be int".into())) };
+                let max_seq = match &args[5] { Value::Int(v) => *v as usize, _ => return Err(self.type_err("MAX_SEQ must be int".into())) };
+                let vocab = match &args[6] { Value::Int(v) => *v as usize, _ => return Err(self.type_err("VOCAB must be int".into())) };
+
+                // Weight sizes per layer: Uqkv[D×3R], Vv[R×D], Uo[D×R], Vo[R×D], Uu[D×R], Vu[R×FF], Ud[FF×R], Vd[R×D]
+                let three_r = 3 * r;
+                let sizes = [d*three_r, r*d, d*r, r*d, d*r, r*ff, ff*r, r*d];
+                let total_per_layer: usize = sizes.iter().sum();
+                let mut offsets = [0usize; 8];
+                let mut acc = 0;
+                for i in 0..8 {
+                    acc += sizes[i];
+                    offsets[i] = acc;
+                }
+
+                // Expect weights_arr to have n_layer * 8 tensors (8 per layer)
+                if weights_arr.len() != n_layer * 8 {
+                    return Err(self.runtime_err(format!(
+                        "kv_cache_init: expected {} weight tensors ({}×8), got {}",
+                        n_layer * 8, n_layer, weights_arr.len()
+                    )));
+                }
+
+                let mut layer_weights = Vec::with_capacity(n_layer);
+                for l in 0..n_layer {
+                    let mut lw = vec![0.0f32; total_per_layer];
+                    let mut offset = 0;
+                    for w in 0..8 {
+                        let idx = l * 8 + w;
+                        let slice = to_f64_slice(&weights_arr[idx]).unwrap();
+                        let data = slice.as_slice();
+                        if data.len() != sizes[w] {
+                            return Err(self.runtime_err(format!(
+                                "kv_cache_init: layer {} weight {} size mismatch: expected {}, got {}",
+                                l, w, sizes[w], data.len()
+                            )));
+                        }
+                        for (i, &v) in data.iter().enumerate() {
+                            lw[offset + i] = v as f32;
+                        }
+                        offset += sizes[w];
+                    }
+                    layer_weights.push(lw);
+                }
+
+                // LM head weights
+                let u_lmh_slice = to_f64_slice(&args[7])
+                    .ok_or_else(|| self.type_err("kv_cache_init: U_lmh (arg7) must be tensor or array".into()))?;
+                let v_lmh_slice = to_f64_slice(&args[8])
+                    .ok_or_else(|| self.type_err("kv_cache_init: V_lmh (arg8) must be tensor or array".into()))?;
+                let u_lmh: Vec<f32> = u_lmh_slice.as_slice().iter().map(|&v| v as f32).collect();
+                let v_lmh: Vec<f32> = v_lmh_slice.as_slice().iter().map(|&v| v as f32).collect();
+                if u_lmh.len() != d * r {
+                    return Err(self.runtime_err(format!(
+                        "kv_cache_init: U_lmh size mismatch: expected {}(D×R), got {}", d * r, u_lmh.len()
+                    )));
+                }
+                if v_lmh.len() != r * vocab {
+                    return Err(self.runtime_err(format!(
+                        "kv_cache_init: V_lmh size mismatch: expected {}(R×VOCAB), got {}", r * vocab, v_lmh.len()
+                    )));
+                }
+
+                // Allocate KV caches (zeroed)
+                let k_cache: Vec<Vec<f32>> = (0..n_layer).map(|_| vec![0.0f32; max_seq * r]).collect();
+                let v_cache: Vec<Vec<f32>> = (0..n_layer).map(|_| vec![0.0f32; max_seq * r]).collect();
+
+                self.kv_cache = Some(KvCacheState {
+                    layer_weights,
+                    offsets,
+                    k_cache,
+                    v_cache,
+                    u_lmh,
+                    v_lmh,
+                    d, r, ff, n_layer, max_seq, vocab,
+                });
+
+                Ok(Value::Void)
+            }
+
+            // kv_cache_decode(x_embed_tensor, pos) -> Int (next token id)
+            // Single-token decode step with KV cache. O(L×D) per token.
+            "kv_cache_decode" => {
+                if args.len() < 2 {
+                    return Err(self.type_err("kv_cache_decode requires 2 args (x_embed, pos)".into()));
+                }
+                let x_slice = to_f64_slice(&args[0]).ok_or_else(|| self.type_err("x_embed must be tensor or array".into()))?;
+                let pos = match &args[1] { Value::Int(v) => *v as usize, _ => return Err(self.type_err("pos must be int".into())) };
+
+                if self.kv_cache.is_none() {
+                    return Err(self.runtime_err("kv_cache_decode: call kv_cache_init first".into()));
+                }
+                let state = self.kv_cache.as_mut().unwrap();
+
+                let d = state.d;
+                let r = state.r;
+                let ff = state.ff;
+                let three_r = 3 * r;
+                let n_layer = state.n_layer;
+                let max_seq = state.max_seq;
+                let seq_len = pos + 1; // how many tokens in cache after this step
+
+                if pos >= max_seq {
+                    return Err(self.runtime_err(format!("kv_cache_decode: pos {} >= max_seq {}", pos, max_seq)));
+                }
+
+                // Convert input to f32
+                let x_data = x_slice.as_slice();
+                if x_data.len() != d {
+                    return Err(self.runtime_err(format!("kv_cache_decode: x_embed must have {} elements, got {}", d, x_data.len())));
+                }
+                let mut x: Vec<f32> = x_data.iter().map(|&v| v as f32).collect();
+
+                // Scratch buffers (all small — fits in L1/L2 cache)
+                let mut qkv = vec![0.0f32; three_r];
+                let mut scores = vec![0.0f32; seq_len];
+                let mut ctx_r = vec![0.0f32; r];
+                let mut tmp_d = vec![0.0f32; d];
+                let mut tmp_r = vec![0.0f32; r];
+                let mut tmp_ff = vec![0.0f32; ff];
+
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                {
+                    for l in 0..n_layer {
+                        let w = &state.layer_weights[l];
+                        let o = &state.offsets;
+                        // Weight slices (zero-copy from cached f32)
+                        let uqkv = &w[0..o[0]];           // [D × 3R]
+                        let vv   = &w[o[0]..o[1]];        // [R × D]
+                        let uo   = &w[o[1]..o[2]];        // [D × R]
+                        let vo   = &w[o[2]..o[3]];        // [R × D]
+                        let uu   = &w[o[3]..o[4]];        // [D × R]
+                        let vu   = &w[o[4]..o[5]];        // [R × FF]
+                        let ud   = &w[o[5]..o[6]];        // [FF × R]
+                        let vd   = &w[o[6]..o[7]];        // [R × D]
+
+                        // 1. QKV projection: qkv[3R] = x[D] @ Uqkv[D×3R]
+                        unsafe {
+                            cblas_sgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                                1, three_r as i32, d as i32,
+                                1.0, x.as_ptr(), d as i32,
+                                uqkv.as_ptr(), three_r as i32,
+                                0.0, qkv.as_mut_ptr(), three_r as i32);
+                        }
+
+                        // 2. Split Q, K_new, V_new into separate buffers + apply RoPE
+                        let mut q_buf = vec![0.0f32; r];
+                        let mut k_buf = vec![0.0f32; r];
+                        let mut v_buf = vec![0.0f32; r];
+                        q_buf.copy_from_slice(&qkv[0..r]);
+                        k_buf.copy_from_slice(&qkv[r..2*r]);
+                        v_buf.copy_from_slice(&qkv[2*r..3*r]);
+
+                        // RoPE on Q and K
+                        for i in 0..r/2 {
+                            let theta = (pos as f32) / (10000.0f32).powf(2.0 * i as f32 / r as f32);
+                            let cos_t = theta.cos();
+                            let sin_t = theta.sin();
+                            let q0 = q_buf[2*i]; let q1 = q_buf[2*i+1];
+                            q_buf[2*i] = q0 * cos_t - q1 * sin_t;
+                            q_buf[2*i+1] = q0 * sin_t + q1 * cos_t;
+                            let k0 = k_buf[2*i]; let k1 = k_buf[2*i+1];
+                            k_buf[2*i] = k0 * cos_t - k1 * sin_t;
+                            k_buf[2*i+1] = k0 * sin_t + k1 * cos_t;
+                        }
+
+                        // 3. Store K_new, V_new in cache at position `pos`
+                        let cache_offset = pos * r;
+                        state.k_cache[l][cache_offset..cache_offset+r].copy_from_slice(&k_buf);
+                        state.v_cache[l][cache_offset..cache_offset+r].copy_from_slice(&v_buf);
+
+                        // 4. Attention: scores[seq_len] = Q[1×R] @ K_cache[seq_len×R]^T
+                        unsafe {
+                            cblas_sgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_TRANS,
+                                1, seq_len as i32, r as i32,
+                                (1.0 / (r as f32).sqrt()), q_buf.as_ptr(), r as i32,
+                                state.k_cache[l].as_ptr(), r as i32,
+                                0.0, scores.as_mut_ptr(), seq_len as i32);
+                        }
+
+                        // 5. Softmax
+                        let max_s = scores[..seq_len].iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                        let mut sum = 0.0f32;
+                        for i in 0..seq_len {
+                            scores[i] = (scores[i] - max_s).exp();
+                            sum += scores[i];
+                        }
+                        let inv_sum = 1.0 / sum;
+                        for i in 0..seq_len {
+                            scores[i] *= inv_sum;
+                        }
+
+                        // 6. Context: ctx_r[R] = scores[1×seq_len] @ V_cache[seq_len×R]
+                        unsafe {
+                            cblas_sgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                                1, r as i32, seq_len as i32,
+                                1.0, scores.as_ptr(), seq_len as i32,
+                                state.v_cache[l].as_ptr(), r as i32,
+                                0.0, ctx_r.as_mut_ptr(), r as i32);
+                        }
+
+                        // 7. ctx_d[D] = ctx_r[R] @ Vv[R×D]
+                        unsafe {
+                            cblas_sgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                                1, d as i32, r as i32,
+                                1.0, ctx_r.as_ptr(), r as i32,
+                                vv.as_ptr(), d as i32,
+                                0.0, tmp_d.as_mut_ptr(), d as i32);
+                        }
+
+                        // 8. o_r[R] = ctx_d[D] @ Uo[D×R]
+                        unsafe {
+                            cblas_sgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                                1, r as i32, d as i32,
+                                1.0, tmp_d.as_ptr(), d as i32,
+                                uo.as_ptr(), r as i32,
+                                0.0, tmp_r.as_mut_ptr(), r as i32);
+                        }
+
+                        // 9. o_d[D] = o_r[R] @ Vo[R×D]
+                        unsafe {
+                            cblas_sgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                                1, d as i32, r as i32,
+                                1.0, tmp_r.as_ptr(), r as i32,
+                                vo.as_ptr(), d as i32,
+                                0.0, tmp_d.as_mut_ptr(), d as i32);
+                        }
+
+                        // 10. Residual: x += o_d
+                        for i in 0..d { x[i] += tmp_d[i]; }
+
+                        // 11. FFN: t_r[R] = x[D] @ Uu[D×R]
+                        unsafe {
+                            cblas_sgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                                1, r as i32, d as i32,
+                                1.0, x.as_ptr(), d as i32,
+                                uu.as_ptr(), r as i32,
+                                0.0, tmp_r.as_mut_ptr(), r as i32);
+                        }
+
+                        // 12. y_ff[FF] = t_r[R] @ Vu[R×FF]
+                        unsafe {
+                            cblas_sgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                                1, ff as i32, r as i32,
+                                1.0, tmp_r.as_ptr(), r as i32,
+                                vu.as_ptr(), ff as i32,
+                                0.0, tmp_ff.as_mut_ptr(), ff as i32);
+                        }
+
+                        // 13. SiLU activation
+                        for i in 0..ff {
+                            tmp_ff[i] = tmp_ff[i] / (1.0 + (-tmp_ff[i]).exp());
+                        }
+
+                        // 14. t2_r[R] = y_ff[FF] @ Ud[FF×R]
+                        unsafe {
+                            cblas_sgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                                1, r as i32, ff as i32,
+                                1.0, tmp_ff.as_ptr(), ff as i32,
+                                ud.as_ptr(), r as i32,
+                                0.0, tmp_r.as_mut_ptr(), r as i32);
+                        }
+
+                        // 15. ffn_d[D] = t2_r[R] @ Vd[R×D]
+                        unsafe {
+                            cblas_sgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                                1, d as i32, r as i32,
+                                1.0, tmp_r.as_ptr(), r as i32,
+                                vd.as_ptr(), d as i32,
+                                0.0, tmp_d.as_mut_ptr(), d as i32);
+                        }
+
+                        // 16. Residual: x += ffn_d
+                        for i in 0..d { x[i] += tmp_d[i]; }
+                    }
+
+                    // LM head: logit_r[R] = x[D] @ U_lmh[D×R], logits[V] = logit_r[R] @ V_lmh[R×V]
+                    let lmh_r = state.r;
+                    let vocab = state.vocab;
+                    let mut logit_r = vec![0.0f32; lmh_r];
+                    let mut logits = vec![0.0f32; vocab];
+
+                    unsafe {
+                        cblas_sgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                            1, lmh_r as i32, d as i32,
+                            1.0, x.as_ptr(), d as i32,
+                            state.u_lmh.as_ptr(), lmh_r as i32,
+                            0.0, logit_r.as_mut_ptr(), lmh_r as i32);
+
+                        cblas_sgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                            1, vocab as i32, lmh_r as i32,
+                            1.0, logit_r.as_ptr(), lmh_r as i32,
+                            state.v_lmh.as_ptr(), vocab as i32,
+                            0.0, logits.as_mut_ptr(), vocab as i32);
+                    }
+
+                    // Argmax
+                    let mut best_id = 0usize;
+                    let mut best_val = f32::NEG_INFINITY;
+                    for (i, &v) in logits.iter().enumerate() {
+                        if v > best_val { best_val = v; best_id = i; }
+                    }
+
+                    Ok(Value::Int(best_id as i64))
+                }
+
+                #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+                {
+                    Err(self.runtime_err("kv_cache_decode requires BLAS (macOS/Linux)".into()))
+                }
+            }
+
+            // kv_cache_reset() -> Void — reset KV cache for new sequence
+            "kv_cache_reset" => {
+                if let Some(ref mut state) = self.kv_cache {
+                    for l in 0..state.n_layer {
+                        state.k_cache[l].fill(0.0);
+                        state.v_cache[l].fill(0.0);
+                    }
+                }
+                Ok(Value::Void)
+            }
+
+            // kv_cache_decode_bench(D, R, FF, N_LAYER, SEQ_LEN) -> Float (ms per token)
+            // Benchmark-only: measures decode throughput with random weights
+            "kv_cache_decode_bench" => {
+                if args.len() < 5 {
+                    return Err(self.type_err("kv_cache_decode_bench requires 5 args".into()));
+                }
+                let d = match &args[0] { Value::Int(v) => *v as usize, _ => return Err(self.type_err("D".into())) };
+                let r = match &args[1] { Value::Int(v) => *v as usize, _ => return Err(self.type_err("R".into())) };
+                let ff = match &args[2] { Value::Int(v) => *v as usize, _ => return Err(self.type_err("FF".into())) };
+                let n_layer = match &args[3] { Value::Int(v) => *v as usize, _ => return Err(self.type_err("N_LAYER".into())) };
+                let seq_len = match &args[4] { Value::Int(v) => *v as usize, _ => return Err(self.type_err("SEQ_LEN".into())) };
+
+                let three_r = 3 * r;
+                let sizes = [d*three_r, r*d, d*r, r*d, d*r, r*ff, ff*r, r*d];
+                let total_per_layer: usize = sizes.iter().sum();
+                let mut offsets = [0usize; 8];
+                let mut acc = 0;
+                for i in 0..8 { acc += sizes[i]; offsets[i] = acc; }
+
+                // Random weights (small values)
+                let layer_weights: Vec<Vec<f32>> = (0..n_layer).map(|l| {
+                    (0..total_per_layer).map(|i| ((i * 7 + l * 13) % 1000) as f32 * 0.001 - 0.5).collect()
+                }).collect();
+                let k_cache: Vec<Vec<f32>> = (0..n_layer).map(|_| vec![0.0f32; seq_len * r]).collect();
+                let v_cache: Vec<Vec<f32>> = (0..n_layer).map(|_| vec![0.0f32; seq_len * r]).collect();
+                let vocab = 32000;
+                let u_lmh: Vec<f32> = (0..d*r).map(|i| (i % 1000) as f32 * 0.001 - 0.5).collect();
+                let v_lmh: Vec<f32> = (0..r*vocab).map(|i| (i % 1000) as f32 * 0.001 - 0.5).collect();
+
+                self.kv_cache = Some(KvCacheState {
+                    layer_weights, offsets, k_cache, v_cache,
+                    u_lmh, v_lmh, d, r, ff, n_layer, max_seq: seq_len, vocab,
+                });
+
+                // Warmup + bench
+                let x_data: Vec<f64> = (0..d).map(|i| (i % 100) as f64 * 0.01).collect();
+                let x_val = Value::Tensor(std::sync::Arc::new(TensorData { shape: vec![d], data: x_data.clone() }));
+
+                // Warmup + timed run using kv_cache_decode
+                let warmup = 3.min(seq_len);
+                for p in 0..warmup {
+                    let args = vec![x_val.clone(), Value::Int(p as i64)];
+                    let _ = self.call_builtin("kv_cache_decode", args);
+                }
+                // Reset cache
+                if let Some(ref mut st) = self.kv_cache {
+                    st.k_cache.iter_mut().for_each(|c| c.fill(0.0));
+                    st.v_cache.iter_mut().for_each(|c| c.fill(0.0));
+                }
+
+                let n_tokens = seq_len.min(64);
+                let start = std::time::Instant::now();
+                for p in 0..n_tokens {
+                    let args = vec![x_val.clone(), Value::Int(p as i64)];
+                    let _ = self.call_builtin("kv_cache_decode", args);
+                }
+                let elapsed = start.elapsed();
+                let ms_per_tok = elapsed.as_secs_f64() * 1000.0 / n_tokens as f64;
+
+                self.kv_cache = None;
+                Ok(Value::Float(ms_per_tok))
+            }
+
             _ if name.starts_with("__extern_") => {
                 #[cfg(target_arch = "wasm32")]
                 {
@@ -8891,13 +9813,18 @@ impl Interpreter {
                     self.call_extern_fn(name, args)
                 }
             }
-            _ => Err(HexaError {
-                class: ErrorClass::Name,
-                message: format!("unknown builtin: {}", name),
-                line: self.current_line,
-                col: self.current_col,
-                hint: None,
-            }),
+            _ => {
+                let known_names: Vec<&str> = self.env.known_names();
+                let hint = crate::error::suggest_name(name, &known_names)
+                    .map(|s| format!("did you mean '{}'?", s));
+                Err(HexaError {
+                    class: ErrorClass::Name,
+                    message: format!("unknown builtin: {}", name),
+                    line: self.current_line,
+                    col: self.current_col,
+                    hint,
+                })
+            }
         }
     }
 
@@ -12187,6 +13114,63 @@ e[1][0]"#;
         assert!(matches!(eval(src), Value::Int(30)));
     }
 
+    // ── G13: array / string slicing via arr[start..end] ─────────
+    #[test]
+    fn test_g13_array_slice_exclusive() {
+        // [1..4] → elements at index 1, 2, 3
+        let src = "let xs = [10, 20, 30, 40, 50]\nxs[1..4]";
+        match eval(src) {
+            Value::Array(v) => {
+                assert_eq!(v.len(), 3);
+                assert!(matches!(&v[0], Value::Int(20)));
+                assert!(matches!(&v[2], Value::Int(40)));
+            }
+            other => panic!("expected Array, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_g13_array_slice_inclusive() {
+        // [1..=3] → elements at index 1, 2, 3
+        let src = "let xs = [10, 20, 30, 40, 50]\nxs[1..=3]";
+        match eval(src) {
+            Value::Array(v) => {
+                assert_eq!(v.len(), 3);
+                assert!(matches!(&v[0], Value::Int(20)));
+                assert!(matches!(&v[2], Value::Int(40)));
+            }
+            other => panic!("expected Array, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_g13_string_slice_exclusive() {
+        let src = "\"hello\"[1..4]";
+        match eval(src) {
+            Value::Str(s) => assert_eq!(s, "ell"),
+            other => panic!("expected Str, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_g13_string_slice_inclusive() {
+        let src = "\"hello\"[1..=3]";
+        match eval(src) {
+            Value::Str(s) => assert_eq!(s, "ell"),
+            other => panic!("expected Str, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_g13_array_slice_clamped_end() {
+        // End beyond length should clamp to len, not panic.
+        let src = "[1, 2, 3][0..100]";
+        match eval(src) {
+            Value::Array(v) => assert_eq!(v.len(), 3),
+            other => panic!("expected Array, got {:?}", other),
+        }
+    }
+
     #[test]
     fn test_array_flatten() {
         let src = "[[1, 2], [3, 4], [5]].flatten().len()";
@@ -13452,6 +14436,37 @@ scope {
     }
 
     #[test]
+    fn test_evolve_stats_tracking() {
+        let src = "@evolve fn calc(x) {\n  return x + 1\n}\ncalc(1)\ncalc(2)\ncalc(3)\nevolve_stats(\"calc\")";
+        let result = eval(src);
+        // evolve_stats returns [call_count, total_time_ms]
+        if let Value::Array(arr) = result {
+            assert_eq!(arr.len(), 2);
+            assert!(matches!(arr[0], Value::Int(3))); // 3 calls
+            if let Value::Float(ms) = arr[1] {
+                assert!(ms >= 0.0); // total_time_ms is non-negative
+            } else {
+                panic!("expected Float for total_time_ms");
+            }
+        } else {
+            panic!("expected Array from evolve_stats");
+        }
+    }
+
+    #[test]
+    fn test_evolve_stats_unknown_fn() {
+        let src = "evolve_stats(\"nonexistent\")";
+        let result = eval(src);
+        if let Value::Array(arr) = result {
+            assert_eq!(arr.len(), 2);
+            assert!(matches!(arr[0], Value::Int(0)));
+            assert!(matches!(arr[1], Value::Float(f) if f == 0.0));
+        } else {
+            panic!("expected Array from evolve_stats");
+        }
+    }
+
+    #[test]
     fn test_law_type_phi_positive_valid() {
         let src = "let p: Phi_positive = 71.0\np";
         let result = eval(src);
@@ -13716,6 +14731,103 @@ fib(1)";
         // Verify fusion produces same result as non-fused
         let fused = eval("[1,2,3,4,5,6,7,8,9,10].map(|x| x * 2).filter(|x| x > 10)");
         assert_eq!(fused.to_string(), "[12, 14, 16, 18, 20]");
+    }
+
+    // ── Keywords 48→53: yield, recover, resume, channel, dyn ──
+
+    #[test]
+    fn test_yield_gen_buffer() {
+        // gen() collects all yielded values into an array
+        let src = r#"
+let items = gen(|| {
+    yield 10
+    yield 20
+    yield 30
+})
+items
+"#;
+        match eval(src) {
+            Value::Array(a) => {
+                assert_eq!(a.len(), 3);
+                assert!(matches!(a[0], Value::Int(10)));
+                assert!(matches!(a[1], Value::Int(20)));
+                assert!(matches!(a[2], Value::Int(30)));
+            }
+            other => panic!("expected Array, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_yield_outside_gen() {
+        // yield outside gen context still returns the value
+        let src = "yield 42";
+        assert!(matches!(eval(src), Value::Int(42)));
+    }
+
+    #[test]
+    fn test_recover_provides_context() {
+        // recover binds a map with error context, not just the raw error
+        let src = r#"
+let mut msg = ""
+let mut is_recovered = false
+try {
+    throw "oops"
+} recover ctx {
+    msg = ctx["message"]
+    is_recovered = ctx["recovered"]
+}
+is_recovered
+"#;
+        assert!(matches!(eval(src), Value::Bool(true)));
+    }
+
+    #[test]
+    fn test_recover_has_error_field() {
+        let src = r#"
+let mut err_msg = ""
+try {
+    throw "bad input"
+} recover ctx {
+    err_msg = ctx["message"]
+}
+err_msg
+"#;
+        assert!(matches!(eval(src), Value::Str(s) if s.contains("bad input")));
+    }
+
+    #[test]
+    fn test_channel_bare_keyword() {
+        // bare `channel` (without parens) should create a channel tuple
+        let src = r#"
+let pair = channel
+let tx = pair[0]
+let rx = pair[1]
+spawn {
+    tx.send(99)
+}
+rx.recv()
+"#;
+        assert!(matches!(eval(src), Value::Int(99)));
+    }
+
+    #[test]
+    fn test_dyn_cast_trait_conformance() {
+        // dyn cast checks all required trait methods are implemented
+        let src = r#"
+trait Greetable {
+    fn greet(self) -> string
+}
+struct Person { name: string }
+impl Greetable for Person {
+    fn greet(self) -> string {
+        return "hello " + self.name
+    }
+}
+let p = Person { name: "world" }
+let g = dyn Greetable(p)
+g.greet()
+"#;
+        assert!(matches!(eval(src), Value::Str(s) if s == "hello world"));
     }
 
 

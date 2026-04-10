@@ -238,7 +238,13 @@ impl Lexer {
         if is_float {
             Token::FloatLit(s.parse::<f64>().unwrap())
         } else {
-            Token::IntLit(s.parse::<i64>().unwrap())
+            // Try i64 first; on overflow fall back to f64 representation
+            // so the value survives lexing. At runtime, arithmetic on large
+            // values promotes to BigInt via checked_* ops.
+            match s.parse::<i64>() {
+                Ok(n) => Token::IntLit(n),
+                Err(_) => Token::FloatLit(s.parse::<f64>().unwrap_or(f64::INFINITY)),
+            }
         }
     }
 
@@ -722,5 +728,29 @@ mod tests {
         let tokens = lexer.tokenize_plain().unwrap();
         assert_eq!(tokens[0], Token::Ident("consciousness".into()));
         assert_eq!(tokens[1], Token::StringLit("test".into()));
+    }
+
+    // ── G9: triple-quoted multiline string ─────────────────────
+    #[test]
+    fn test_g9_triple_quoted_single_line() {
+        let mut lexer = Lexer::new("\"\"\"hello world\"\"\"");
+        let tokens = lexer.tokenize_plain().unwrap();
+        assert_eq!(tokens[0], Token::StringLit("hello world".into()));
+    }
+
+    #[test]
+    fn test_g9_triple_quoted_multiline() {
+        // Opening """ followed by newline → leading newline skipped.
+        let mut lexer = Lexer::new("\"\"\"\nline1\nline2\n\"\"\"");
+        let tokens = lexer.tokenize_plain().unwrap();
+        assert_eq!(tokens[0], Token::StringLit("line1\nline2\n".into()));
+    }
+
+    #[test]
+    fn test_g9_triple_quoted_preserves_quotes() {
+        // Single " and "" inside a """..."""  block are preserved literally.
+        let mut lexer = Lexer::new("\"\"\"a \"b\" c\"\"\"");
+        let tokens = lexer.tokenize_plain().unwrap();
+        assert_eq!(tokens[0], Token::StringLit("a \"b\" c".into()));
     }
 }

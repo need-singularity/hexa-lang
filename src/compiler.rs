@@ -593,14 +593,35 @@ impl Compiler {
                     _ => None,
                 }
             }
+            Expr::If(cond, then_block, else_block) => {
+                // Fold deeply nested ternary/if-else chains when the condition is constant.
+                let cv = self.try_const_fold(cond)?;
+                let branch = match cv {
+                    Value::Bool(true) => Some(then_block.as_slice()),
+                    Value::Bool(false) => else_block.as_deref(),
+                    Value::Int(n) => if n != 0 { Some(then_block.as_slice()) } else { else_block.as_deref() },
+                    _ => None,
+                };
+                if let Some(stmts) = branch {
+                    if let Some(last) = stmts.last() {
+                        if let crate::ast::Stmt::Expr(e) = last {
+                            return self.try_const_fold(e);
+                        }
+                        if let crate::ast::Stmt::Return(Some(e)) = last {
+                            return self.try_const_fold(e);
+                        }
+                    }
+                }
+                None
+            }
             Expr::Binary(left, op, right) => {
                 let lv = self.try_const_fold(left)?;
                 let rv = self.try_const_fold(right)?;
                 match (lv, op, rv) {
-                    // Int arithmetic
-                    (Value::Int(a), BinOp::Add, Value::Int(b)) => Some(Value::Int(a.wrapping_add(b))),
-                    (Value::Int(a), BinOp::Sub, Value::Int(b)) => Some(Value::Int(a.wrapping_sub(b))),
-                    (Value::Int(a), BinOp::Mul, Value::Int(b)) => Some(Value::Int(a.wrapping_mul(b))),
+                    // Int arithmetic — use checked ops to match interpreter semantics
+                    (Value::Int(a), BinOp::Add, Value::Int(b)) => a.checked_add(b).map(Value::Int),
+                    (Value::Int(a), BinOp::Sub, Value::Int(b)) => a.checked_sub(b).map(Value::Int),
+                    (Value::Int(a), BinOp::Mul, Value::Int(b)) => a.checked_mul(b).map(Value::Int),
                     (Value::Int(a), BinOp::Div, Value::Int(b)) if b != 0 => Some(Value::Int(a / b)),
                     (Value::Int(a), BinOp::Rem, Value::Int(b)) if b != 0 => Some(Value::Int(a % b)),
                     (Value::Int(a), BinOp::Pow, Value::Int(b)) => Some(Value::Int((a as f64).powi(b as i32) as i64)),
@@ -635,6 +656,10 @@ impl Compiler {
                     _ => None,
                 }
             }
+            // Empty array literal — fold to constant to avoid type ambiguity in IR
+            Expr::Array(items) if items.is_empty() => {
+                Some(Value::Array(vec![]))
+            }
             _ => None,
         }
     }
@@ -642,8 +667,10 @@ impl Compiler {
     // ---- Expression compilation ----
 
     fn compile_expr(&mut self, chunk: &mut Chunk, expr: &Expr) -> Result<(), HexaError> {
-        // Try constant folding first for binary/unary expressions
-        if matches!(expr, Expr::Binary(..) | Expr::Unary(..)) {
+        // Try constant folding first for binary/unary/if expressions and empty arrays
+        if matches!(expr, Expr::Binary(..) | Expr::Unary(..) | Expr::If(..))
+            || matches!(expr, Expr::Array(ref items) if items.is_empty())
+        {
             if let Some(folded) = self.try_const_fold(expr) {
                 let idx = chunk.add_constant(folded);
                 chunk.emit(OpCode::Const(idx));
@@ -926,6 +953,8 @@ fn is_builtin(name: &str) -> bool {
         | "qkv_fused_into" | "ffn_fused_into" | "block_forward_fused" | "block_forward_chain"
         | "batch_matvec" | "repeat_kv" | "gqa_expand_kv_into" | "weight_dict"
         | "rope_inplace" | "attention_fused_into"
+        | "block_forward_chain_f32"
+        | "kv_cache_init" | "kv_cache_decode" | "kv_cache_decode_step" | "kv_cache_reset"
         | "load_weights_bin" | "mmap_weights" | "save_array" | "load_array"
         // ── neural / activations ──
         | "sigmoid" | "tanh_" | "relu" | "softmax" | "gelu" | "silu"

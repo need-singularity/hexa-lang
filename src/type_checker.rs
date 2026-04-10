@@ -240,7 +240,8 @@ impl TypeChecker {
                         };
                         self.fn_sigs.insert(decl.name.clone(), sig);
                         if decl.attrs.iter().any(|a| matches!(a.kind, crate::token::AttrKind::Vectorize))
-                            || decl.attrs.iter().any(|a| matches!(a.kind, crate::token::AttrKind::Fuse)) {
+                            || decl.attrs.iter().any(|a| matches!(a.kind, crate::token::AttrKind::Fuse))
+                            || decl.attrs.iter().any(|a| matches!(a.kind, crate::token::AttrKind::Simd)) {
                             self.vectorize_fns.insert(decl.name.clone());
                         }
                     } else {

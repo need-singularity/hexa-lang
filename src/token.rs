@@ -142,6 +142,12 @@ pub enum AttrKind {
     Fuse,               // @fuse — operation fusion (chain of maps → single pass)
     Lazy,               // @lazy — lazy evaluation (deferred compute pipeline)
     Optimize,           // @optimize — algorithmic transformation (recurrence → matrix exp)
+    Noinline,           // @noinline — prevent inlining
+    Tail,               // @tail — tail-call optimization hint
+    Unroll,             // @unroll — loop unrolling hint
+    Prefetch,           // @prefetch — memory prefetch hint
+    Align,              // @align — data alignment (tag only; parameter TBD)
+    Const,              // @const — compile-time evaluation
     // Semantics
     Evolve,             // @evolve — self-modifying
     Test,               // @test — test function
@@ -168,6 +174,12 @@ impl AttrKind {
             "fuse" => AttrKind::Fuse,
             "lazy" => AttrKind::Lazy,
             "optimize" => AttrKind::Optimize,
+            "noinline" => AttrKind::Noinline,
+            "tail" => AttrKind::Tail,
+            "unroll" => AttrKind::Unroll,
+            "prefetch" => AttrKind::Prefetch,
+            "align" => AttrKind::Align,
+            "const" => AttrKind::Const,
             "evolve" => AttrKind::Evolve,
             "test" => AttrKind::Test,
             "bench" => AttrKind::Bench,

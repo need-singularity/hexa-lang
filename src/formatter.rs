@@ -192,10 +192,16 @@ fn format_stmt(stmt: &Stmt, indent: usize) -> String {
             format!("{}use {}", prefix, path.join("::"))
         }
         Stmt::TryCatch(try_block, err_name, catch_block) => {
-            format!("{}try {} catch {} {}",
+            let (keyword, name) = if err_name.starts_with("__recover__") {
+                ("recover", err_name.strip_prefix("__recover__").unwrap_or(err_name))
+            } else {
+                ("catch", err_name.as_str())
+            };
+            format!("{}try {} {} {} {}",
                 prefix,
                 format_block(try_block, indent),
-                err_name,
+                keyword,
+                name,
                 format_block(catch_block, indent))
         }
         Stmt::Throw(expr) => {
@@ -419,7 +425,14 @@ fn format_expr(expr: &Expr) -> String {
         Expr::DynCast(trait_name, expr) => format!("dyn {}({})", trait_name, format_expr(expr)),
         Expr::Yield(inner) => format!("yield {}", format_expr(inner)),
         Expr::Template(_) => "<template>".to_string(),
-        Expr::TryCatch(_, var, _) => format!("try {{ ... }} catch {} {{ ... }}", var),
+        Expr::TryCatch(_, var, _) => {
+            let (keyword, name) = if var.starts_with("__recover__") {
+                ("recover", var.strip_prefix("__recover__").unwrap_or(var))
+            } else {
+                ("catch", var.as_str())
+            };
+            format!("try {{ ... }} {} {} {{ ... }}", keyword, name)
+        }
     }
 }
 

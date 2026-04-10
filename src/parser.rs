@@ -610,13 +610,19 @@ impl Parser {
         let try_block = self.parse_block()?;
         self.skip_newlines();
         // Accept 'catch' or 'recover'
+        let is_recover = matches!(self.peek(), Token::Recover);
         match self.peek() {
             Token::Catch | Token::Recover => { self.advance(); }
             _ => return Err(self.error(format!("expected 'catch' or 'recover' after try block, got {:?}", self.peek()))),
         }
         let err_name = self.expect_ident()?;
+        let tagged_name = if is_recover {
+            format!("__recover__{}", err_name)
+        } else {
+            err_name
+        };
         let catch_block = self.parse_block()?;
-        Ok(Stmt::TryCatch(try_block, err_name, catch_block))
+        Ok(Stmt::TryCatch(try_block, tagged_name, catch_block))
     }
 
     fn parse_throw(&mut self) -> Result<Stmt, HexaError> {
@@ -1883,17 +1889,21 @@ impl Parser {
 
     fn parse_args(&mut self) -> Result<Vec<Expr>, HexaError> {
         let mut args = Vec::new();
+        self.skip_newlines();
         if matches!(self.peek(), Token::RParen) {
             return Ok(args);
         }
         loop {
+            self.skip_newlines();
             args.push(self.parse_expr()?);
+            self.skip_newlines();
             if matches!(self.peek(), Token::Comma) {
                 self.advance();
             } else {
                 break;
             }
         }
+        self.skip_newlines();
         Ok(args)
     }
 
@@ -2009,10 +2019,22 @@ impl Parser {
             Token::If => self.parse_if_expr(),
             Token::Match => self.parse_match_expr(),
             Token::BitOr => self.parse_lambda(),
-            // Channel keyword used as expression resolves to the builtin function
+            // Channel keyword: `channel()` calls builtin, bare `channel` also creates one
             Token::Channel => {
                 self.advance();
-                Ok(Expr::Ident("channel".into()))
+                // If followed by '(', parse as function call (channel() or channel(cap))
+                if matches!(self.peek(), Token::LParen) {
+                    self.advance(); // consume '('
+                    let mut args = Vec::new();
+                    if !matches!(self.peek(), Token::RParen) {
+                        args.push(self.parse_expr()?);
+                    }
+                    self.expect(&Token::RParen)?;
+                    Ok(Expr::Call(Box::new(Expr::Ident("channel".into())), args))
+                } else {
+                    // Bare `channel` — create a channel with no args
+                    Ok(Expr::Call(Box::new(Expr::Ident("channel".into())), vec![]))
+                }
             }
             // Await expression
             Token::Await => {
@@ -2086,13 +2108,19 @@ impl Parser {
         self.advance(); // consume 'try'
         let try_block = self.parse_block()?;
         self.skip_newlines();
+        let is_recover = matches!(self.peek(), Token::Recover);
         match self.peek() {
             Token::Catch | Token::Recover => { self.advance(); }
             _ => return Err(self.error(format!("expected 'catch' or 'recover' after try block, got {:?}", self.peek()))),
         }
         let err_name = self.expect_ident()?;
+        let tagged_name = if is_recover {
+            format!("__recover__{}", err_name)
+        } else {
+            err_name
+        };
         let catch_block = self.parse_block()?;
-        Ok(Expr::TryCatch(try_block, err_name, catch_block))
+        Ok(Expr::TryCatch(try_block, tagged_name, catch_block))
     }
 
     // ── Algebraic effects parsing ────────────────────────────
@@ -2878,6 +2906,115 @@ mod tests {
         assert!(matches!(&stmts[0], Stmt::Let(n, _, _, _) if n == "a"));
         assert!(matches!(&stmts[1], Stmt::Let(n, _, _, _) if n == "b"));
         assert!(matches!(&stmts[2], Stmt::Let(n, _, _, _) if n == "c"));
+    }
+
+    // ── G8: multiline binop continuation ────────────────────────
+    // Operator at end of line must allow the RHS to appear on the next line.
+    #[test]
+    fn test_g8_multiline_binop_plus() {
+        let stmts = parse_source("let s = \"a\" +\n  \"b\"");
+        if let Stmt::Let(n, _, Some(rhs), _) = &stmts[0] {
+            assert_eq!(n, "s");
+            assert!(matches!(rhs, Expr::Binary(_, BinOp::Add, _)),
+                "expected Binary(Add), got {:?}", rhs);
+        } else {
+            panic!("expected Let, got {:?}", &stmts[0]);
+        }
+    }
+
+    #[test]
+    fn test_g8_multiline_binop_chain() {
+        // Chain of binops across multiple lines must collapse into a single expression.
+        let stmts = parse_source("let x = 1 +\n  2 +\n  3");
+        assert_eq!(stmts.len(), 1);
+        if let Stmt::Let(n, _, Some(rhs), _) = &stmts[0] {
+            assert_eq!(n, "x");
+            assert!(matches!(rhs, Expr::Binary(_, BinOp::Add, _)));
+        } else {
+            panic!("expected Let, got {:?}", &stmts[0]);
+        }
+    }
+
+    #[test]
+    fn test_g8_multiline_logical_and() {
+        let stmts = parse_source("let b = a &&\n  c");
+        assert_eq!(stmts.len(), 1);
+    }
+
+    // ── G10: tuple field access via .0 / .1 ─────────────────────
+    // `tup.0` must parse as Expr::Index(tup, IntLit(0)).
+    #[test]
+    fn test_g10_tuple_field_access_zero() {
+        let stmts = parse_source("let t = (1, 2, 3)\nt.0");
+        // Second stmt must be an Index expression with an IntLit index.
+        if let Stmt::Expr(Expr::Index(_, idx)) = &stmts[1] {
+            assert!(matches!(idx.as_ref(), Expr::IntLit(0)),
+                "expected IntLit(0), got {:?}", idx);
+        } else {
+            panic!("expected Index expression, got {:?}", &stmts[1]);
+        }
+    }
+
+    #[test]
+    fn test_g10_tuple_field_access_higher() {
+        let stmts = parse_source("t.7");
+        if let Stmt::Expr(Expr::Index(_, idx)) = &stmts[0] {
+            assert!(matches!(idx.as_ref(), Expr::IntLit(7)));
+        } else {
+            panic!("expected Index expression, got {:?}", &stmts[0]);
+        }
+    }
+
+    // ── G11: paren/bracket newline suppression ──────────────────
+    // Newlines inside () or [] must not terminate expressions.
+    #[test]
+    fn test_g11_paren_newline_suppressed() {
+        let stmts = parse_source("let x = (\n  1 + 2\n)");
+        assert_eq!(stmts.len(), 1);
+        if let Stmt::Let(n, _, Some(rhs), _) = &stmts[0] {
+            assert_eq!(n, "x");
+            assert!(matches!(rhs, Expr::Binary(_, BinOp::Add, _)));
+        } else {
+            panic!("expected Let");
+        }
+    }
+
+    #[test]
+    fn test_g11_bracket_newline_suppressed() {
+        // Array literal across multiple lines must parse as a single Array expr.
+        let stmts = parse_source("let xs = [\n  1,\n  2,\n  3\n]");
+        assert_eq!(stmts.len(), 1);
+        if let Stmt::Let(n, _, Some(rhs), _) = &stmts[0] {
+            assert_eq!(n, "xs");
+            assert!(matches!(rhs, Expr::Array(v) if v.len() == 3),
+                "expected 3-element Array, got {:?}", rhs);
+        } else {
+            panic!("expected Let");
+        }
+    }
+
+    // ── G12: multiline function call arguments ──────────────────
+    #[test]
+    fn test_g12_multiline_call_args() {
+        let stmts = parse_source("f(\n  1,\n  2,\n  3\n)");
+        if let Stmt::Expr(Expr::Call(_, args)) = &stmts[0] {
+            assert_eq!(args.len(), 3);
+        } else {
+            panic!("expected Call expression, got {:?}", &stmts[0]);
+        }
+    }
+
+    #[test]
+    fn test_g12_multiline_call_nested() {
+        // Multiline args containing a nested expression.
+        let stmts = parse_source("f(\n  1 + 2,\n  g(3)\n)");
+        if let Stmt::Expr(Expr::Call(_, args)) = &stmts[0] {
+            assert_eq!(args.len(), 2);
+            assert!(matches!(&args[0], Expr::Binary(_, BinOp::Add, _)));
+            assert!(matches!(&args[1], Expr::Call(..)));
+        } else {
+            panic!("expected Call expression, got {:?}", &stmts[0]);
+        }
     }
 
 }
