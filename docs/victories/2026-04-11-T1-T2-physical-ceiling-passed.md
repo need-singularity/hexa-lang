@@ -99,3 +99,20 @@ alphabeta7:     1.62 ms  (7.02 h)        9938x  ✅
 - load avg 17 sustained (blowup 경합)
 - hexa @ 8be14eb + scp(token.rs, parser.rs, ast.rs, main.rs, lib.rs, interpreter.rs)
 - 측정 시각: 2026-04-11 15:21-15:26 CEST
+
+## 확장 — rank sweep 사이클 (2026-04-11T1)
+
+Continue breakthrough 루프에서 rank 1까지 스윕하여 속도 상한 증명:
+
+| rank | best tok/s | avg tok/s | margin | reruns | 실용성 |
+|-----:|------:|------:|------:|:----:|:---|
+|  16  |  330.70 |  257 |  2.58x | 5 | ✅ 보수적 |
+|   4  |  463.35 |  359 |  **3.62x** | 10 | ✅ **honest lora baseline** |
+|   2  |  626.99 |  592 |  4.90x | 15 | ⚠️ 품질 검증 필요 |
+|   1  | **2649.16** | 2175 | **20.70x** | 15 | 🚀 속도 상한 증명 전용 |
+
+**총 40/40 PASS** (T1 전체 rank 범위). r=2→r=1 은 4.19x non-linear 점프 — BLAS 오버헤드 특이영역 진입 (아주 작은 matmul에서 dispatch가 dominant).
+
+**권장 운용점**: 실서비스 r=4 (463 tok/s, 3.62x margin, LoRA r=4 는 문헌 표준). r=1은 벤치용.
+
+T2 alphabeta7 재측정: 5 추가 runs (load 15-16) 모두 7.21-7.97 h/1B PASS. 누계 15/15.
