@@ -888,14 +888,120 @@ impl Compiler {
 
 fn is_builtin(name: &str) -> bool {
     matches!(name,
-        "print" | "println" | "eprintln" | "len" | "type_of"
-        | "sigma" | "phi" | "tau" | "gcd" | "bigint"
+        // ── I/O & print ──
+        "print" | "println" | "eprintln" | "print_err"
+        // ── core ──
+        | "len" | "type_of" | "format" | "clock" | "args" | "env_var" | "exit" | "env"
+        | "input" | "readline" | "read_stdin" | "input_all"
+        // ── math ──
+        | "sigma" | "phi" | "tau" | "gcd" | "bigint" | "sopfr"
         | "abs" | "min" | "max" | "floor" | "ceil" | "round"
-        | "sqrt" | "pow" | "log" | "log2" | "log10" | "ln" | "exp" | "sin" | "cos" | "tan"
-        | "asin" | "acos" | "atan" | "atan2"
-        | "to_string" | "to_int" | "to_float"
-        | "format" | "clock"
+        | "sqrt" | "pow" | "log" | "log2" | "log10" | "ln" | "exp"
+        | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "atan2"
+        // ── conversion ──
+        | "to_string" | "str" | "to_int" | "to_float" | "to_char"
+        | "try_float" | "is_numeric" | "parse_int" | "parse_float"
+        // ── string ──
+        | "split" | "trim" | "trim_start" | "trim_end" | "join"
+        | "starts_with" | "ends_with" | "contains" | "replace"
+        | "to_upper" | "to_lower" | "chars" | "repeat"
+        | "index_of" | "substring" | "pad_left" | "pad_right"
+        | "hex_encode" | "hex_decode"
+        | "is_alpha" | "is_digit" | "is_alphanumeric" | "is_whitespace"
+        // ── array/functional ──
+        | "push" | "pop" | "reverse" | "sort" | "swap" | "fill"
+        | "map" | "filter" | "fold" | "reduce" | "enumerate" | "sum"
+        | "find" | "find_index" | "any" | "all" | "flatten" | "slice"
+        | "map_arr" | "filter_arr" | "zip_arr" | "enumerate_arr"
+        // ── map ──
+        | "keys" | "values" | "has" | "has_key" | "contains_key" | "get"
+        // ── file I/O ──
+        | "read_file" | "write_file" | "append_file" | "file_exists" | "delete_file"
+        // ── tensor & matrix ──
         | "tensor" | "tensor_zeros" | "tensor_fill"
+        | "dot" | "matvec" | "matmul" | "matmul_into" | "transpose" | "normalize"
+        | "mat_add" | "mat_add_inplace" | "mat_scale" | "mat_scale_inplace"
+        | "axpy" | "hadamard" | "argmax" | "zeros" | "ones" | "randn" | "arange"
+        | "qkv_fused_into" | "ffn_fused_into" | "block_forward_fused" | "block_forward_chain"
+        | "batch_matvec" | "repeat_kv" | "gqa_expand_kv_into" | "weight_dict"
+        | "rope_inplace" | "attention_fused_into"
+        | "load_weights_bin" | "mmap_weights" | "save_array" | "load_array"
+        // ── neural / activations ──
+        | "sigmoid" | "tanh_" | "relu" | "softmax" | "gelu" | "silu"
+        | "layer_norm" | "rms_norm" | "group_norm" | "batch_norm"
+        | "dropout" | "embedding" | "rope" | "sinusoidal_pe"
+        | "attention" | "attention_cached" | "multi_head_attention"
+        | "sliding_window_attention" | "grouped_query_attention" | "linear_attention"
+        | "kv_cache_append" | "topk" | "sample_token"
+        // ── optimization ──
+        | "sgd_step" | "adam_step" | "adamw_step" | "ema" | "clip"
+        | "warmup_lr" | "cosine_lr" | "phase_lr"
+        | "xavier_init" | "kaiming_init" | "weight_decay"
+        | "grad_clip_norm" | "grad_accumulate" | "numerical_grad"
+        | "lora_init" | "lora_forward" | "magnitude_prune"
+        // ── loss & metrics ──
+        | "cross_entropy" | "mse_loss" | "focal_loss" | "contrastive_loss"
+        | "cosine_sim" | "cosine_sim_matrix" | "kl_divergence" | "js_divergence"
+        | "mutual_information" | "label_smoothing"
+        | "curiosity_reward" | "dialogue_reward" | "combined_reward"
+        // ── data & stats ──
+        | "mean" | "running_stats" | "autocorrelation" | "trend_slope" | "sparsity"
+        | "data_split" | "shuffle" | "one_hot" | "param_count" | "model_size_kb"
+        | "ascii_plot" | "ascii_bar" | "beam_search_step"
+        // ── random ──
+        | "random" | "random_int"
+        // ── topology ──
+        | "ring_topology" | "small_world_topology" | "hypercube_topology" | "auto_topology"
+        // ── MoE ──
+        | "moe_gate" | "moe_combine" | "ewc_penalty" | "fisher_diagonal"
+        // ── concurrency ──
+        | "channel" | "send" | "recv" | "try_recv" | "is_ready"
+        // ── JSON ──
+        | "json_parse" | "json_stringify" | "bytes_encode" | "bytes_decode"
+        // ── HTTP ──
+        | "http_get" | "http_post"
+        // ── time ──
+        | "now" | "timestamp" | "elapsed" | "sleep"
+        // ── memory / FFI ──
+        | "cstring" | "from_cstring" | "from_cstring_n"
+        | "ptr_null" | "ptr_addr" | "deref" | "alloc_raw" | "free_raw"
+        | "mem_stats" | "mem_region" | "arena_reset" | "mem_budget"
+        // ── system exec ──
+        | "exec" | "exec_with_status"
+        // ── test ──
+        | "run_tests" | "run_benchmarks"
+        // ── cell ──
+        | "cell_split" | "cell_merge" | "evolve_gen"
+        // ── consciousness ──
+        | "consciousness_max_cells" | "consciousness_decoder_dim" | "consciousness_phi"
+        | "consciousness_vector" | "phi_predict" | "tension" | "tension_link"
+        | "hexad_modules" | "hexad_right" | "hexad_left"
+        | "faction_consensus" | "lorenz_step" | "chaos_perturb"
+        | "laws" | "meta_laws"
+        | "psi_coupling" | "psi_balance" | "psi_steps" | "psi_entropy" | "psi_frustration" | "psi_alpha"
+        // ── std::fs ──
+        | "fs_read" | "fs_write" | "fs_append" | "fs_exists" | "fs_remove"
+        // ── std::io ──
+        | "io_stdin" | "io_read_lines" | "io_write_bytes" | "io_pipe"
+        // ── std::net ──
+        | "net_listen" | "net_accept" | "net_connect" | "net_read" | "net_write" | "net_close"
+        // ── std::time ──
+        | "time_now" | "time_now_ms" | "time_sleep" | "time_format"
+        // ── std::collections ──
+        | "btree_new" | "btree_set" | "btree_get" | "btree_remove" | "btree_keys" | "btree_len"
+        | "pq_new" | "pq_push" | "pq_pop" | "pq_len"
+        | "deque_new" | "deque_push_front" | "deque_push_back"
+        | "deque_pop_front" | "deque_pop_back" | "deque_len"
+        // ── std::encoding ──
+        | "csv_parse" | "csv_format" | "url_encode" | "url_decode"
+        // ── std::log ──
+        | "log_debug" | "log_info" | "log_warn" | "log_error"
+        // ── std::math extended ──
+        | "math_pi" | "math_e" | "math_phi" | "math_abs" | "math_sqrt"
+        // ── std::test ──
+        | "assert_eq" | "assert_ne" | "assert_true" | "assert_false"
+        // ── nexus ──
+        | "nexus_scan" | "nexus_verify" | "nexus_omega"
     )
 }
 

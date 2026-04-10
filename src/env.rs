@@ -473,6 +473,7 @@ impl Env {
         env.define_builtin("tensor_zeros", Value::BuiltinFn("tensor_zeros".into()));
         env.define_builtin("tensor_fill", Value::BuiltinFn("tensor_fill".into()));
         env.define_builtin("repeat_kv", Value::BuiltinFn("repeat_kv".into()));
+        env.define_builtin("gqa_expand_kv_into", Value::BuiltinFn("gqa_expand_kv_into".into()));
         env.define_builtin("weight_dict", Value::BuiltinFn("weight_dict".into()));
         env
 
