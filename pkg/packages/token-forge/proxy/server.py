@@ -111,6 +111,40 @@ def compress_message(msg: dict) -> dict:
     return msg
 
 
+# ---------------------------------------------------------------------------
+# DESIGN NOTE (2026-04-10) — A_hybrid integration hook
+# ---------------------------------------------------------------------------
+# The bench/dfs_breakthrough.py experiment rebuilt from
+# reports/breakthrough_1775473383.json confirms that the A_hybrid strategy
+# ("last 3 turns verbatim + older turns LLM-compressed into a single prior
+# block") is the strongest performer: avg similarity 70 %, PASS 3/5.
+#
+# Planned integration (DO NOT IMPLEMENT YET — PoC is the next step):
+#
+#   1. Gate on total char_count >= CHAR_THRESHOLD (already in place).
+#   2. Split messages into `old = messages[:-KEEP_RECENT]` and `recent`.
+#   3. Render `old` into "[USER]/[ASST] text" form, call tf.utils.llm_call
+#      with the same compression prompt used in dfs_100pass_v2.compress_verified
+#      (keywords-preserving, <=MAX_CTX chars).
+#   4. Self-verify the compressed block via keyword coverage (>=0.5).
+#      If verification fails, fall back to the current char-limit summariser
+#      (compress_message) so we never regress below the current baseline.
+#   5. Emit a single synthetic user message
+#         {"role": "user", "content": "[PRIOR — compressed]\n" + compressed}
+#      followed by the verbatim `recent` messages.
+#   6. Log the A_hybrid verdict (sim/reduction) alongside original/compressed
+#      char counts in log_entry for observability.
+#
+# Known open questions:
+#   - llm_call backend choice inside a proxy (claude-cli would re-enter the
+#     proxy → infinite recursion). Need a direct Anthropic API call using the
+#     forwarded Authorization header, or an out-of-band summariser model.
+#   - Latency budget: one extra round-trip per large request.
+#   - Streaming: compression must happen before the upstream POST, so it is
+#     synchronous — acceptable since compress_messages is already synchronous.
+# ---------------------------------------------------------------------------
+
+
 def compress_messages(messages: list[dict]) -> list[dict]:
     """
     Compress the message array:
