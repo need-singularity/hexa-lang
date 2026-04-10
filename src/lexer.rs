@@ -22,10 +22,26 @@ impl Lexer {
     }
 
     pub fn tokenize(&mut self) -> Result<Vec<Spanned>, String> {
-        let mut tokens = Vec::new();
+        let mut tokens: Vec<Spanned> = Vec::new();
+        // Paren/bracket depth: suppress Newline tokens while depth > 0
+        // (not brace — blocks still need statement separators).
+        // Enables multi-line fn params, multi-line call args, multi-line collection
+        // literals, and leading-operator line continuation inside (...) / [...].
+        let mut paren_depth: i32 = 0;
         loop {
             let (tok, line, col) = self.next_token_spanned()?;
             let is_eof = tok == Token::Eof;
+            match &tok {
+                Token::LParen | Token::LBracket => paren_depth += 1,
+                Token::RParen | Token::RBracket => {
+                    if paren_depth > 0 { paren_depth -= 1; }
+                }
+                Token::Newline if paren_depth > 0 => {
+                    // Drop newline inside grouping — treat as whitespace.
+                    continue;
+                }
+                _ => {}
+            }
             tokens.push(Spanned::new(tok, line, col));
             if is_eof {
                 break;
@@ -258,6 +274,36 @@ impl Lexer {
         }
     }
 
+    fn read_triple_string(&mut self) -> Result<String, String> {
+        // Skip opening """
+        self.advance_byte(); // "
+        self.advance_byte(); // "
+        self.advance_byte(); // "
+        // Skip optional leading newline
+        if self.peek_byte() == Some(b'\n') {
+            self.advance_byte();
+        } else if self.peek_byte() == Some(b'\r') && self.peek_byte_ahead(1) == Some(b'\n') {
+            self.advance_byte();
+            self.advance_byte();
+        }
+        let mut s = String::new();
+        loop {
+            if self.peek_byte() == Some(b'"')
+                && self.peek_byte_ahead(1) == Some(b'"')
+                && self.peek_byte_ahead(2) == Some(b'"')
+            {
+                self.advance_byte(); // "
+                self.advance_byte(); // "
+                self.advance_byte(); // "
+                return Ok(s);
+            }
+            match self.advance() {
+                Some(c) => s.push(c),
+                None => return Err(format!("line {}:{}: unterminated triple-quoted string", self.line, self.col)),
+            }
+        }
+    }
+
     fn read_char_lit(&mut self) -> Result<char, String> {
         // Skip opening quote
         self.advance_byte();
@@ -313,7 +359,7 @@ impl Lexer {
         if b == b'/' {
             if self.peek_byte_ahead(1) == Some(b'/') {
                 self.skip_line_comment();
-                return self.next_token_inner();
+                return self.next_token();
             }
             if self.peek_byte_ahead(1) == Some(b'*') {
                 // Block comment (supports nesting)
@@ -343,7 +389,7 @@ impl Lexer {
                         }
                     }
                 }
-                return self.next_token_inner();
+                return self.next_token();
             }
         }
 
@@ -408,8 +454,12 @@ impl Lexer {
             return Ok(self.read_number());
         }
 
-        // String literal
+        // String literal (triple-quote """ for multiline, or regular "")
         if b == b'"' {
+            if self.peek_byte_ahead(1) == Some(b'"') && self.peek_byte_ahead(2) == Some(b'"') {
+                let s = self.read_triple_string()?;
+                return Ok(Token::StringLit(s.into()));
+            }
             let s = self.read_string()?;
             return Ok(Token::StringLit(s.into()));
         }
@@ -584,6 +634,34 @@ mod tests {
         let mut lexer = Lexer::new("1.0/2.0 + 1.0/3.0 + 1.0/6.0");
         let tokens = lexer.tokenize_plain().unwrap();
         assert_eq!(tokens[0], Token::FloatLit(1.0));
+    }
+
+    // ── G3: block comments (with whitespace after */) ──────────
+    #[test]
+    fn test_g3_block_comment_basic() {
+        let mut lexer = Lexer::new("let x = /* skip me */ 5");
+        let tokens = lexer.tokenize_plain().unwrap();
+        assert_eq!(tokens, vec![
+            Token::Let, Token::Ident("x".into()), Token::Eq, Token::IntLit(5), Token::Eof
+        ]);
+    }
+
+    #[test]
+    fn test_g3_block_comment_multiline() {
+        let mut lexer = Lexer::new("let x = /* line1\nline2\nline3 */ 7");
+        let tokens = lexer.tokenize_plain().unwrap();
+        assert_eq!(tokens, vec![
+            Token::Let, Token::Ident("x".into()), Token::Eq, Token::IntLit(7), Token::Eof
+        ]);
+    }
+
+    #[test]
+    fn test_g3_block_comment_nested() {
+        let mut lexer = Lexer::new("let x = /* outer /* inner */ outer */ 9");
+        let tokens = lexer.tokenize_plain().unwrap();
+        assert_eq!(tokens, vec![
+            Token::Let, Token::Ident("x".into()), Token::Eq, Token::IntLit(9), Token::Eof
+        ]);
     }
 
     #[test]
