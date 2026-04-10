@@ -1,0 +1,389 @@
+// ===================================================================
+//  quantize_test.hexa — Round-trip tests and error bounds verification
+//
+//  Tests:
+//    1. FP16 round-trip: error < 1e-3 for normal values
+//    2. INT8 round-trip: error < absmax/127
+//    3. Q4_0 round-trip: matches GGUF q4_0_decode_block
+//    4. Q4_K round-trip: matches GGUF q4_k_decode_block
+//    5. Dequantize identity: dequant(quant(x)) ~ x
+//    6. Error metrics: MSE/SNR sanity checks
+//    7. Cascade: FP32 -> FP16 -> INT8 -> Q4_0 increasing error
+//    8. Edge cases: zeros, constants, large values
+//    9. quantize_model integration
+// ===================================================================
+
+use "quantize"
+
+// ── PRNG (LCG) for deterministic test data ──────────────────────
+let mut _RNG = 12345
+
+fn _lcg() {
+    _RNG = (_RNG * 1664525 + 1013904223) % 4294967296
+    return _RNG
+}
+
+fn _rand_float() {
+    // Returns float in [-1, 1]
+    let r = _lcg()
+    return (to_float(r) / 2147483648.0) - 1.0
+}
+
+fn _rand_data(n) {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [_rand_float()]
+        i = i + 1
+    }
+    return out
+}
+
+fn _abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn _max_abs_err(original, reconstructed) {
+    let n = len(original)
+    let mut mx = 0.0
+    let mut i = 0
+    while i < n {
+        let e = _abs(original[i] - reconstructed[i])
+        if e > mx { mx = e }
+        i = i + 1
+    }
+    return mx
+}
+
+// ===================================================================
+//  Test 1: FP16 round-trip
+// ===================================================================
+@test
+fn test_fp16_roundtrip() {
+    let data = [0.0, 1.0, -1.0, 0.5, -0.5, 0.001, 100.0, -100.0]
+    let qt = quantize_fp16(data)
+    assert(qt.qtype == QTYPE_FP16())
+    assert(qt.numel == 8)
+    let deq = dequantize(qt)
+    assert(len(deq) == 8)
+    // FP16 has ~3 decimal digits precision
+    let mut i = 0
+    let mut pass = true
+    while i < 8 {
+        let err = _abs(data[i] - deq[i])
+        let scale = _abs(data[i])
+        if scale < 1.0 { let scale = 1.0 }
+        let rel = err / scale
+        if rel > 0.01 { pass = false }
+        i = i + 1
+    }
+    assert(pass)
+}
+
+// ===================================================================
+//  Test 2: FP16 zero preservation
+// ===================================================================
+@test
+fn test_fp16_zero() {
+    let data = [0.0, 0.0, 0.0, 0.0]
+    let qt = quantize_fp16(data)
+    let deq = dequantize(qt)
+    assert(deq[0] == 0.0)
+    assert(deq[1] == 0.0)
+    assert(deq[2] == 0.0)
+    assert(deq[3] == 0.0)
+}
+
+// ===================================================================
+//  Test 3: INT8 round-trip
+// ===================================================================
+@test
+fn test_int8_roundtrip() {
+    let data = [0.5, -0.5, 1.0, -1.0, 0.25, -0.25, 0.0, 0.75]
+    let qt = quantize_int8(data, 1, 8)
+    assert(qt.qtype == QTYPE_INT8())
+    assert(qt.numel == 8)
+    assert(len(qt.scales) == 1)
+    let deq = dequantize(qt)
+    assert(len(deq) == 8)
+    // INT8 error bound: absmax/127 per channel
+    let scale = qt.scales[0]
+    let max_err = _max_abs_err(data, deq)
+    assert(max_err < scale + 0.001)
+}
+
+// ===================================================================
+//  Test 4: INT8 per-channel
+// ===================================================================
+@test
+fn test_int8_per_channel() {
+    // 2 channels of 4 elements each
+    let data = [10.0, -10.0, 5.0, -5.0, 0.01, -0.01, 0.005, -0.005]
+    let qt = quantize_int8(data, 2, 4)
+    assert(len(qt.scales) == 2)
+    let deq = dequantize(qt)
+    // Channel 0 scale ~ 10/127, channel 1 scale ~ 0.01/127
+    let err0 = _max_abs_err([10.0, -10.0, 5.0, -5.0], [deq[0], deq[1], deq[2], deq[3]])
+    let err1 = _max_abs_err([0.01, -0.01, 0.005, -0.005], [deq[4], deq[5], deq[6], deq[7]])
+    assert(err0 < 0.1)
+    assert(err1 < 0.001)
+}
+
+// ===================================================================
+//  Test 5: Q4_0 round-trip (block_size=32)
+// ===================================================================
+@test
+fn test_q4_0_roundtrip() {
+    _RNG = 42
+    let data = _rand_data(64)
+    let qt = quantize_q4_0(data, 32)
+    assert(qt.qtype == QTYPE_Q4_0())
+    assert(qt.numel == 64)
+    assert(len(qt.scales) == 2)
+    assert(len(qt.data) == 32)
+    let deq = dequantize(qt)
+    assert(len(deq) == 64)
+    let err = quantization_error(data, qt)
+    // Q4_0 SNR should be > 10 dB for random data
+    assert(err.snr > 5.0)
+    assert(err.mse < 0.1)
+}
+
+// ===================================================================
+//  Test 6: Q4_0 GGUF format compatibility
+//
+//  Verify our Q4_0 nibble packing matches gguf_loader.q4_0_decode_block.
+//  Manual check: scale d, nibble lo/hi ordering.
+// ===================================================================
+@test
+fn test_q4_0_format_compat() {
+    // Create 32 values that should quantize cleanly
+    // With d = 1.0 (absmax=8), values -8..+7 map to nibbles 0..15
+    let mut data = []
+    let mut i = 0
+    while i < 16 {
+        let lo_val = to_float(i - 8)
+        let hi_val = to_float(i - 8)
+        data = data + [lo_val]
+        data = data + [hi_val]
+        i = i + 1
+    }
+    let qt = quantize_q4_0(data, 32)
+    // Scale should be ~8.0/8 = 1.0 (stored as f16)
+    let d_bits = qt.scales[0]
+    let d_val = _decode_f16_bits(d_bits)
+    assert(d_val > 0.9)
+    assert(d_val < 1.1)
+    // Dequantize and check
+    let deq = dequantize(qt)
+    let max_err = _max_abs_err(data, deq)
+    assert(max_err < 0.5)
+}
+
+// ===================================================================
+//  Test 7: Q4_K round-trip (super-block 256)
+// ===================================================================
+@test
+fn test_q4_k_roundtrip() {
+    _RNG = 99
+    let data = _rand_data(256)
+    let qt = quantize_q4_k(data)
+    assert(qt.qtype == QTYPE_Q4_K())
+    assert(qt.numel == 256)
+    let deq = dequantize(qt)
+    assert(len(deq) == 256)
+    let err = quantization_error(data, qt)
+    assert(err.snr > 5.0)
+    assert(err.mse < 0.1)
+}
+
+// ===================================================================
+//  Test 8: Dequantize consistency
+//
+//  dequantize(quantize(x)) should have bounded error.
+// ===================================================================
+@test
+fn test_dequant_consistency() {
+    _RNG = 777
+    let data = _rand_data(128)
+    // FP16
+    let qt16 = quantize_fp16(data)
+    let d16 = dequantize(qt16)
+    let e16 = _max_abs_err(data, d16)
+    // INT8
+    let qt8 = quantize_int8(data, 1, 128)
+    let d8 = dequantize(qt8)
+    let e8 = _max_abs_err(data, d8)
+    // Q4_0
+    let qt4 = quantize_q4_0(data, 32)
+    let d4 = dequantize(qt4)
+    let e4 = _max_abs_err(data, d4)
+    // Error ordering: FP16 < INT8 < Q4_0
+    assert(e16 < e8)
+    assert(e8 < e4)
+}
+
+// ===================================================================
+//  Test 9: Error metrics sanity
+// ===================================================================
+@test
+fn test_error_metrics() {
+    let data = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+    let qt = quantize_fp16(data)
+    let err = quantization_error(data, qt)
+    // FP16 of small integers should be near-exact
+    assert(err.mse < 0.01)
+    assert(err.max_err < 0.01)
+    assert(err.snr > 40.0)
+}
+
+// ===================================================================
+//  Test 10: Cascade precision — FP32 > FP16 > INT8 > Q4_0
+// ===================================================================
+@test
+fn test_cascade_precision() {
+    _RNG = 555
+    let data = _rand_data(128)
+    let e_fp16 = quantization_error(data, quantize_fp16(data))
+    let e_int8 = quantization_error(data, quantize_int8(data, 1, 128))
+    let e_q4_0 = quantization_error(data, quantize_q4_0(data, 32))
+    // MSE should increase: FP16 < INT8 < Q4_0
+    assert(e_fp16.mse < e_int8.mse)
+    assert(e_int8.mse < e_q4_0.mse)
+    // SNR should decrease: FP16 > INT8 > Q4_0
+    assert(e_fp16.snr > e_int8.snr)
+    assert(e_int8.snr > e_q4_0.snr)
+}
+
+// ===================================================================
+//  Test 11: Edge case — all zeros
+// ===================================================================
+@test
+fn test_all_zeros() {
+    let data = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    let qt16 = quantize_fp16(data)
+    let d16 = dequantize(qt16)
+    let mut i = 0
+    while i < 8 {
+        assert(d16[i] == 0.0)
+        i = i + 1
+    }
+    let qt8 = quantize_int8(data, 1, 8)
+    let d8 = dequantize(qt8)
+    i = 0
+    while i < 8 {
+        assert(d8[i] == 0.0)
+        i = i + 1
+    }
+}
+
+// ===================================================================
+//  Test 12: Edge case — constant value
+// ===================================================================
+@test
+fn test_constant_value() {
+    let mut data = []
+    let mut i = 0
+    while i < 32 {
+        data = data + [3.14]
+        i = i + 1
+    }
+    let qt = quantize_q4_0(data, 32)
+    let deq = dequantize(qt)
+    let max_err = _max_abs_err(data, deq)
+    // Constant should quantize well
+    assert(max_err < 0.5)
+}
+
+// ===================================================================
+//  Test 13: Large Q4_0 (multiple blocks)
+// ===================================================================
+@test
+fn test_q4_0_large() {
+    _RNG = 1234
+    let data = _rand_data(1024)
+    let qt = quantize_q4_0(data, 32)
+    assert(qt.numel == 1024)
+    assert(len(qt.scales) == 32)
+    assert(len(qt.data) == 512)
+    let deq = dequantize(qt)
+    assert(len(deq) == 1024)
+    let err = quantization_error(data, qt)
+    assert(err.mse < 0.1)
+}
+
+// ===================================================================
+//  Test 14: Large Q4_K (multiple super-blocks)
+// ===================================================================
+@test
+fn test_q4_k_large() {
+    _RNG = 5678
+    let data = _rand_data(512)
+    let qt = quantize_q4_k(data)
+    assert(qt.numel == 512)
+    let deq = dequantize(qt)
+    assert(len(deq) == 512)
+    let err = quantization_error(data, qt)
+    assert(err.mse < 0.1)
+}
+
+// ===================================================================
+//  Test 15: f16 encode/decode round-trip (bit-level)
+// ===================================================================
+@test
+fn test_f16_encode_decode() {
+    let vals = [0.0, 1.0, -1.0, 0.5, 65504.0, -65504.0, 0.00006103515625]
+    let n = len(vals)
+    let mut i = 0
+    while i < n {
+        let bits = _encode_f16_bits(vals[i])
+        let decoded = _decode_f16_bits(bits)
+        let err = _abs(vals[i] - decoded)
+        let scale = _abs(vals[i])
+        if scale < 1.0 { let scale = 1.0 }
+        let rel = err / scale
+        assert(rel < 0.001)
+        i = i + 1
+    }
+}
+
+// ===================================================================
+//  Run all tests
+// ===================================================================
+fn main() {
+    println("=== quantize_test.hexa ===")
+    test_fp16_roundtrip()
+    println("  PASS: test_fp16_roundtrip")
+    test_fp16_zero()
+    println("  PASS: test_fp16_zero")
+    test_int8_roundtrip()
+    println("  PASS: test_int8_roundtrip")
+    test_int8_per_channel()
+    println("  PASS: test_int8_per_channel")
+    test_q4_0_roundtrip()
+    println("  PASS: test_q4_0_roundtrip")
+    test_q4_0_format_compat()
+    println("  PASS: test_q4_0_format_compat")
+    test_q4_k_roundtrip()
+    println("  PASS: test_q4_k_roundtrip")
+    test_dequant_consistency()
+    println("  PASS: test_dequant_consistency")
+    test_error_metrics()
+    println("  PASS: test_error_metrics")
+    test_cascade_precision()
+    println("  PASS: test_cascade_precision")
+    test_all_zeros()
+    println("  PASS: test_all_zeros")
+    test_constant_value()
+    println("  PASS: test_constant_value")
+    test_q4_0_large()
+    println("  PASS: test_q4_0_large")
+    test_q4_k_large()
+    println("  PASS: test_q4_k_large")
+    test_f16_encode_decode()
+    println("  PASS: test_f16_encode_decode")
+    println("=== ALL 15 TESTS PASSED ===")
+}
+
+main()

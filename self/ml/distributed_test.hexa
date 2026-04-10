@@ -1,0 +1,401 @@
+// ═══════════════════════════════════════════════════════════════
+//  distributed_test.hexa — Tests for distributed training primitives
+//
+//  Single-GPU simulation of the multi-GPU protocol.
+//  Verifies correctness of scatter, gather, allreduce, pipeline
+//  scheduling, and gradient accumulation logic.
+// ═══════════════════════════════════════════════════════════════
+
+// ── Test helpers ─────────────────────────────────────────────
+let mut TESTS_PASSED = 0
+let mut TESTS_FAILED = 0
+
+fn assert_eq(name, got, expected) {
+    if got == expected {
+        TESTS_PASSED = TESTS_PASSED + 1
+    } else {
+        TESTS_FAILED = TESTS_FAILED + 1
+        println("[FAIL] " + name + ": got=" + str(got) + " expected=" + str(expected))
+    }
+}
+
+fn assert_near(name, got, expected, tol) {
+    let diff = got - expected
+    let abs_diff = if diff < 0.0 { 0.0 - diff } else { diff }
+    if abs_diff < tol {
+        TESTS_PASSED = TESTS_PASSED + 1
+    } else {
+        TESTS_FAILED = TESTS_FAILED + 1
+        println("[FAIL] " + name + ": got=" + str(got) + " expected=" + str(expected) + " diff=" + str(abs_diff))
+    }
+}
+
+fn assert_true(name, cond) {
+    if cond {
+        TESTS_PASSED = TESTS_PASSED + 1
+    } else {
+        TESTS_FAILED = TESTS_FAILED + 1
+        println("[FAIL] " + name)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Test: scatter_batch splits evenly
+// ═══════════════════════════════════════════════════════════════
+fn test_scatter_batch() {
+    println("[test] scatter_batch...")
+    let data = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+    let scattered = scatter_batch(data, 4)
+
+    assert_eq("scatter_batch len", len(scattered), 4)
+    assert_eq("scatter_batch[0] len", len(scattered[0]), 2)
+    assert_eq("scatter_batch[0][0]", scattered[0][0], 1.0)
+    assert_eq("scatter_batch[0][1]", scattered[0][1], 2.0)
+    assert_eq("scatter_batch[1][0]", scattered[1][0], 3.0)
+    assert_eq("scatter_batch[1][1]", scattered[1][1], 4.0)
+    assert_eq("scatter_batch[2][0]", scattered[2][0], 5.0)
+    assert_eq("scatter_batch[3][1]", scattered[3][1], 8.0)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Test: scatter_batch_tokens splits tokens and targets
+// ═══════════════════════════════════════════════════════════════
+fn test_scatter_batch_tokens() {
+    println("[test] scatter_batch_tokens...")
+    let tokens = [10, 20, 30, 40, 50, 60]
+    let targets = [20, 30, 40, 50, 60, 70]
+    let scattered = scatter_batch_tokens(tokens, targets, 3)
+
+    assert_eq("scatter_tokens len", len(scattered), 3)
+    assert_eq("scatter_tokens[0] tok len", len(scattered[0][0]), 2)
+    assert_eq("scatter_tokens[0] tgt len", len(scattered[0][1]), 2)
+    assert_eq("scatter_tokens[0] tok[0]", scattered[0][0][0], 10)
+    assert_eq("scatter_tokens[0] tok[1]", scattered[0][0][1], 20)
+    assert_eq("scatter_tokens[0] tgt[0]", scattered[0][1][0], 20)
+    assert_eq("scatter_tokens[1] tok[0]", scattered[1][0][0], 30)
+    assert_eq("scatter_tokens[2] tok[0]", scattered[2][0][0], 50)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Test: gather_results concatenates
+// ═══════════════════════════════════════════════════════════════
+fn test_gather_results() {
+    println("[test] gather_results...")
+    let parts = [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]
+    let gathered = gather_results(parts)
+
+    assert_eq("gather len", len(gathered), 6)
+    assert_eq("gather[0]", gathered[0], 1.0)
+    assert_eq("gather[2]", gathered[2], 3.0)
+    assert_eq("gather[5]", gathered[5], 6.0)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Test: gather_losses averages
+// ═══════════════════════════════════════════════════════════════
+fn test_gather_losses() {
+    println("[test] gather_losses...")
+    let losses = [2.0, 4.0, 6.0, 8.0]
+    let avg = gather_losses(losses)
+
+    assert_near("gather_losses avg", avg, 5.0, 1.0e-10)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Test: scatter then gather = identity
+// ═══════════════════════════════════════════════════════════════
+fn test_scatter_gather_roundtrip() {
+    println("[test] scatter_gather_roundtrip...")
+    let original = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0]
+    let scattered = scatter_batch(original, 4)
+    let gathered = gather_results(scattered)
+
+    assert_eq("roundtrip len", len(gathered), 8)
+    let mut i = 0
+    while i < 8 {
+        assert_eq("roundtrip[" + str(i) + "]", gathered[i], original[i])
+        i = i + 1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Test: ring chunk boundaries
+// ═══════════════════════════════════════════════════════════════
+fn test_ring_chunks() {
+    println("[test] ring_chunks...")
+    // 100 elements, 4 GPUs
+    let total = 100
+    let n = 4
+
+    let b0 = ring_chunk_begin(total, n, 0)
+    let e0 = ring_chunk_end(total, n, 0)
+    let b1 = ring_chunk_begin(total, n, 1)
+    let e1 = ring_chunk_end(total, n, 1)
+    let b3 = ring_chunk_begin(total, n, 3)
+    let e3 = ring_chunk_end(total, n, 3)
+
+    assert_eq("chunk0 begin", b0, 0)
+    assert_eq("chunk0 end", e0, 25)
+    assert_eq("chunk1 begin", b1, 25)
+    assert_eq("chunk1 end", e1, 50)
+    assert_eq("chunk3 begin", b3, 75)
+    assert_eq("chunk3 end", e3, 100)
+
+    // Total coverage
+    let mut total_covered = 0
+    let mut c = 0
+    while c < n {
+        total_covered = total_covered + ring_chunk_size(total, n, c)
+        c = c + 1
+    }
+    assert_eq("chunks cover all", total_covered, total)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Test: pipeline stage assignment
+// ═══════════════════════════════════════════════════════════════
+fn test_pipeline_stages() {
+    println("[test] pipeline_stages...")
+
+    // 8 layers, 4 stages
+    let stages = compute_stage_layers(8, 4)
+    assert_eq("num_stages", len(stages), 4)
+    assert_eq("stage0 begin", stages[0][0], 0)
+    assert_eq("stage0 end", stages[0][1], 2)
+    assert_eq("stage1 begin", stages[1][0], 2)
+    assert_eq("stage1 end", stages[1][1], 4)
+    assert_eq("stage2 begin", stages[2][0], 4)
+    assert_eq("stage2 end", stages[2][1], 6)
+    assert_eq("stage3 begin", stages[3][0], 6)
+    assert_eq("stage3 end", stages[3][1], 8)
+
+    // 12 layers, 3 stages
+    let stages2 = compute_stage_layers(12, 3)
+    assert_eq("12L/3S stage0", stages2[0][0], 0)
+    assert_eq("12L/3S stage0 end", stages2[0][1], 4)
+    assert_eq("12L/3S stage1", stages2[1][0], 4)
+    assert_eq("12L/3S stage2 end", stages2[2][1], 12)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Test: pipeline bubble ratio
+// ═══════════════════════════════════════════════════════════════
+fn test_pipeline_bubble() {
+    println("[test] pipeline_bubble...")
+
+    // 4 stages, 4 micro-batches: bubble = 3/7 ≈ 0.4286
+    let b1 = pipeline_bubble_ratio(4, 4)
+    assert_near("bubble 4s/4m", b1, 3.0 / 7.0, 1.0e-10)
+
+    // 4 stages, 16 micro-batches: bubble = 3/19 ≈ 0.1579
+    let b2 = pipeline_bubble_ratio(4, 16)
+    assert_near("bubble 4s/16m", b2, 3.0 / 19.0, 1.0e-10)
+
+    // 2 stages, 8 micro-batches: bubble = 1/9 ≈ 0.1111
+    let b3 = pipeline_bubble_ratio(2, 8)
+    assert_near("bubble 2s/8m", b3, 1.0 / 9.0, 1.0e-10)
+
+    // Efficiency = 1 - bubble
+    let e1 = pipeline_efficiency(4, 16)
+    assert_near("efficiency 4s/16m", e1, 16.0 / 19.0, 1.0e-10)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Test: pipeline_init config
+// ═══════════════════════════════════════════════════════════════
+fn test_pipeline_init() {
+    println("[test] pipeline_init...")
+    let cfg = pipeline_init(4, 8, 8)
+
+    assert_eq("cfg.num_stages", cfg.num_stages, 4)
+    assert_eq("cfg.num_layers", cfg.num_layers, 8)
+    assert_eq("cfg.num_micro_batches", cfg.num_micro_batches, 8)
+    assert_eq("cfg.stage_layers len", len(cfg.stage_layers), 4)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Test: LR cosine schedule
+// ═══════════════════════════════════════════════════════════════
+fn test_lr_schedule() {
+    println("[test] lr_schedule...")
+
+    // At step 0: should be near min_lr
+    let lr0 = dist_lr_cosine(1, 10, 100, 3.0e-4, 3.0e-5)
+    assert_true("lr warmup start > min", lr0 > 3.0e-5)
+    assert_true("lr warmup start < peak", lr0 < 3.0e-4)
+
+    // At warmup end: should be peak
+    let lr_w = dist_lr_cosine(10, 10, 100, 3.0e-4, 3.0e-5)
+    assert_near("lr at warmup end", lr_w, 3.0e-4, 1.0e-5)
+
+    // At end: should be near min
+    let lr_end = dist_lr_cosine(100, 10, 100, 3.0e-4, 3.0e-5)
+    assert_near("lr at end", lr_end, 3.0e-5, 1.0e-5)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Test: simulated allreduce on CPU arrays
+// ═══════════════════════════════════════════════════════════════
+fn test_simulated_allreduce() {
+    println("[test] simulated_allreduce (CPU)...")
+
+    // Simulate 4 GPUs each with gradients [1,2,3,4]
+    // After allreduce-sum, each should have [4,8,12,16]
+    let grads_g0 = [1.0, 2.0, 3.0, 4.0]
+    let grads_g1 = [1.0, 2.0, 3.0, 4.0]
+    let grads_g2 = [1.0, 2.0, 3.0, 4.0]
+    let grads_g3 = [1.0, 2.0, 3.0, 4.0]
+
+    // Manual CPU allreduce
+    let n = 4
+    let num_gpus = 4
+    let mut result = []
+    let mut i = 0
+    while i < n {
+        let sum = grads_g0[i] + grads_g1[i] + grads_g2[i] + grads_g3[i]
+        result = result.push(sum)
+        i = i + 1
+    }
+
+    assert_near("allreduce[0]", result[0], 4.0, 1.0e-10)
+    assert_near("allreduce[1]", result[1], 8.0, 1.0e-10)
+    assert_near("allreduce[2]", result[2], 12.0, 1.0e-10)
+    assert_near("allreduce[3]", result[3], 16.0, 1.0e-10)
+
+    // Mean: divide by num_gpus
+    let mut mean_result = []
+    i = 0
+    while i < n {
+        mean_result = mean_result.push(result[i] / (num_gpus * 1.0))
+        i = i + 1
+    }
+    assert_near("allreduce_mean[0]", mean_result[0], 1.0, 1.0e-10)
+    assert_near("allreduce_mean[3]", mean_result[3], 4.0, 1.0e-10)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Test: gradient accumulation (CPU simulation)
+// ═══════════════════════════════════════════════════════════════
+fn test_grad_accumulation() {
+    println("[test] gradient_accumulation...")
+
+    // Simulate 3 accumulation steps
+    let grad1 = [1.0, 2.0, 3.0]
+    let grad2 = [0.5, 1.0, 1.5]
+    let grad3 = [0.3, 0.6, 0.9]
+
+    // Accumulate
+    let n = 3
+    let mut acc = [0.0, 0.0, 0.0]
+    let mut i = 0
+    while i < n {
+        acc[i] = acc[i] + grad1[i]
+        i = i + 1
+    }
+    i = 0
+    while i < n {
+        acc[i] = acc[i] + grad2[i]
+        i = i + 1
+    }
+    i = 0
+    while i < n {
+        acc[i] = acc[i] + grad3[i]
+        i = i + 1
+    }
+
+    // Scale by 1/accum_steps
+    let accum_steps = 3
+    i = 0
+    while i < n {
+        acc[i] = acc[i] / (accum_steps * 1.0)
+        i = i + 1
+    }
+
+    assert_near("grad_accum[0]", acc[0], 0.6, 1.0e-10)
+    assert_near("grad_accum[1]", acc[1], 1.2, 1.0e-10)
+    assert_near("grad_accum[2]", acc[2], 1.8, 1.0e-10)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Test: uneven scatter (last GPU gets remainder)
+// ═══════════════════════════════════════════════════════════════
+fn test_uneven_scatter() {
+    println("[test] uneven_scatter...")
+    let data = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
+    let scattered = scatter_batch(data, 3)
+
+    // per_gpu = 7/3 = 2, last gets remainder
+    assert_eq("uneven[0] len", len(scattered[0]), 2)
+    assert_eq("uneven[1] len", len(scattered[1]), 2)
+    assert_eq("uneven[2] len", len(scattered[2]), 3)
+    assert_eq("uneven[2][2]", scattered[2][2], 7.0)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Test: ring chunk coverage for odd sizes
+// ═══════════════════════════════════════════════════════════════
+fn test_ring_chunks_odd() {
+    println("[test] ring_chunks_odd...")
+
+    // 17 elements, 3 GPUs
+    let total = 17
+    let n = 3
+    let mut covered = 0
+    let mut c = 0
+    while c < n {
+        covered = covered + ring_chunk_size(total, n, c)
+        c = c + 1
+    }
+    assert_eq("odd chunks cover all", covered, total)
+
+    // Chunks should be contiguous
+    let mut prev_end = 0
+    c = 0
+    while c < n {
+        let beg = ring_chunk_begin(total, n, c)
+        assert_eq("chunk" + str(c) + " contiguous", beg, prev_end)
+        prev_end = ring_chunk_end(total, n, c)
+        c = c + 1
+    }
+    assert_eq("last chunk ends at total", prev_end, total)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Run all tests
+// ═══════════════════════════════════════════════════════════════
+fn run_distributed_tests() {
+    println("=" * 60)
+    println("  Distributed Training Tests")
+    println("=" * 60)
+
+    test_scatter_batch()
+    test_scatter_batch_tokens()
+    test_gather_results()
+    test_gather_losses()
+    test_scatter_gather_roundtrip()
+    test_ring_chunks()
+    test_ring_chunks_odd()
+    test_pipeline_stages()
+    test_pipeline_bubble()
+    test_pipeline_init()
+    test_lr_schedule()
+    test_simulated_allreduce()
+    test_grad_accumulation()
+    test_uneven_scatter()
+
+    println("")
+    println("=" * 60)
+    let total = TESTS_PASSED + TESTS_FAILED
+    println("  Results: " + str(TESTS_PASSED) + "/" + str(total) + " passed")
+    if TESTS_FAILED > 0 {
+        println("  FAILED: " + str(TESTS_FAILED) + " tests")
+    } else {
+        println("  ALL PASSED")
+    }
+    println("=" * 60)
+
+    TESTS_FAILED
+}
+
+// ── Entry point ──────────────────────────────────────────────
+let _ = run_distributed_tests()

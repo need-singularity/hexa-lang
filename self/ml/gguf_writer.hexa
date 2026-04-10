@@ -1,0 +1,740 @@
+// ===================================================================
+//  gguf_writer.hexa -- GGUF v3 format writer (export model weights)
+//
+//  Writes GGUF v3 binary files compatible with llama.cpp / ollama.
+//  Supports FP32, FP16, Q4_0, Q4_K tensor types.
+//
+//  GGUF v3 layout:
+//      magic     : u32 LE  0x46554747 ("GGUF")
+//      version   : u32 LE  (== 3)
+//      n_tensors : u64 LE
+//      n_kv      : u64 LE
+//      [kv metadata]*
+//      [tensor info entries]*
+//      [alignment padding]
+//      [tensor data blob]
+//
+//  Public API:
+//      export_gguf(model_weights, metadata, output_path, quant_type)
+//
+//  Uses builtins: write_file_bytes
+// ===================================================================
+
+// -- Constants --
+@pure fn GGUF_MAGIC()   { return 1179993927 }
+@pure fn GGUF_VERSION() { return 3 }
+
+// GGUF metadata value type ids
+@pure fn GGUF_TYPE_U8()     { return 0 }
+@pure fn GGUF_TYPE_I8()     { return 1 }
+@pure fn GGUF_TYPE_U16()    { return 2 }
+@pure fn GGUF_TYPE_I16()    { return 3 }
+@pure fn GGUF_TYPE_U32()    { return 4 }
+@pure fn GGUF_TYPE_I32()    { return 5 }
+@pure fn GGUF_TYPE_F32()    { return 6 }
+@pure fn GGUF_TYPE_BOOL()   { return 7 }
+@pure fn GGUF_TYPE_STRING() { return 8 }
+@pure fn GGUF_TYPE_ARRAY()  { return 9 }
+@pure fn GGUF_TYPE_U64()    { return 10 }
+@pure fn GGUF_TYPE_I64()    { return 11 }
+@pure fn GGUF_TYPE_F64()    { return 12 }
+
+// GGML tensor type ids
+@pure fn GGML_F32()  { return 0 }
+@pure fn GGML_F16()  { return 1 }
+@pure fn GGML_Q4_0() { return 2 }
+@pure fn GGML_Q4_K() { return 12 }
+
+@pure fn DEFAULT_ALIGNMENT() { return 32 }
+
+// ===================================================================
+//  Little-endian encoding helpers
+// ===================================================================
+
+@pure
+fn w_u32_le(val) {
+    let b0 = val % 256
+    let b1 = (val / 256) % 256
+    let b2 = (val / 65536) % 256
+    let b3 = (val / 16777216) % 256
+    return [b0, b1, b2, b3]
+}
+
+@pure
+fn w_u64_le(val) {
+    let lo = val % 4294967296
+    let hi = val / 4294967296
+    return w_u32_le(lo) + w_u32_le(hi)
+}
+
+@pure
+fn w_f32_le(val) {
+    if val == 0.0 { return [0, 0, 0, 0] }
+    let mut v = val
+    let mut sign = 0
+    if v < 0.0 {
+        sign = 1
+        v = 0.0 - v
+    }
+    let mut exp = 0
+    let mut m = v
+    if m >= 2.0 {
+        while m >= 2.0 {
+            m = m / 2.0
+            exp = exp + 1
+        }
+    } else {
+        while m < 1.0 {
+            m = m * 2.0
+            exp = exp - 1
+        }
+    }
+    let biased = exp + 127
+    if biased >= 255 {
+        let bits = sign * 2147483648 + 255 * 8388608
+        return w_u32_le(bits)
+    }
+    if biased <= 0 {
+        if sign == 1 { return [0, 0, 0, 128] }
+        return [0, 0, 0, 0]
+    }
+    let frac = m - 1.0
+    let mant = to_int(frac * 8388608.0 + 0.5)
+    let mut mant_c = mant
+    if mant_c > 8388607 { mant_c = 8388607 }
+    let bits = sign * 2147483648 + biased * 8388608 + mant_c
+    return w_u32_le(bits)
+}
+
+@pure
+fn w_f16_le(val) {
+    if val == 0.0 { return [0, 0] }
+    let mut v = val
+    let mut sign = 0
+    if v < 0.0 {
+        sign = 1
+        v = 0.0 - v
+    }
+    let mut exp = 0
+    let mut m = v
+    if m >= 2.0 {
+        while m >= 2.0 {
+            m = m / 2.0
+            exp = exp + 1
+        }
+    } else {
+        while m < 1.0 {
+            m = m * 2.0
+            exp = exp - 1
+        }
+    }
+    let biased = exp + 15
+    if biased >= 31 {
+        let bits = sign * 32768 + 31 * 1024
+        return [bits % 256, bits / 256]
+    }
+    if biased <= 0 {
+        if sign == 1 { return [0, 128] }
+        return [0, 0]
+    }
+    let mant = to_int((m - 1.0) * 1024.0 + 0.5)
+    let mut mant_c = mant
+    if mant_c > 1023 { mant_c = 1023 }
+    let bits = sign * 32768 + biased * 1024 + mant_c
+    return [bits % 256, bits / 256]
+}
+
+// ===================================================================
+//  GGUF string encoding: u64 len + utf8 bytes
+// ===================================================================
+
+fn gguf_encode_string(s) {
+    let n = len(s)
+    let mut out = w_u64_le(n)
+    let mut i = 0
+    while i < n {
+        out = out + [char_code(s, i)]
+        i = i + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  GGUF KV metadata encoders
+// ===================================================================
+
+fn gguf_kv_u32(key, val) {
+    return gguf_encode_string(key) + w_u32_le(GGUF_TYPE_U32()) + w_u32_le(val)
+}
+
+fn gguf_kv_i32(key, val) {
+    return gguf_encode_string(key) + w_u32_le(GGUF_TYPE_I32()) + w_u32_le(val)
+}
+
+fn gguf_kv_f32(key, val) {
+    return gguf_encode_string(key) + w_u32_le(GGUF_TYPE_F32()) + w_f32_le(val)
+}
+
+fn gguf_kv_u64(key, val) {
+    return gguf_encode_string(key) + w_u32_le(GGUF_TYPE_U64()) + w_u64_le(val)
+}
+
+fn gguf_kv_string(key, val) {
+    return gguf_encode_string(key) + w_u32_le(GGUF_TYPE_STRING()) + gguf_encode_string(val)
+}
+
+fn gguf_kv_bool(key, val) {
+    let mut b = 0
+    if val { b = 1 }
+    return gguf_encode_string(key) + w_u32_le(GGUF_TYPE_BOOL()) + [b]
+}
+
+fn gguf_kv_u32_array(key, arr) {
+    let n = len(arr)
+    let mut out = gguf_encode_string(key) + w_u32_le(GGUF_TYPE_ARRAY())
+    out = out + w_u32_le(GGUF_TYPE_U32()) + w_u64_le(n)
+    let mut i = 0
+    while i < n {
+        out = out + w_u32_le(arr[i])
+        i = i + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  Alignment helpers
+// ===================================================================
+
+fn align_up(val, alignment) {
+    let rem = val % alignment
+    if rem == 0 { return val }
+    return val + (alignment - rem)
+}
+
+fn pad_zeros(n) {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [0]
+        i = i + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  Tensor data size calculator (bytes per numel for given ggml type)
+// ===================================================================
+
+fn ggml_tensor_data_size(numel, ggml_type) {
+    if ggml_type == GGML_F32() { return numel * 4 }
+    if ggml_type == GGML_F16() { return numel * 2 }
+    if ggml_type == GGML_Q4_0() { return (numel / 32) * 18 }
+    if ggml_type == GGML_Q4_K() { return (numel / 256) * 144 }
+    // fallback: assume f32
+    return numel * 4
+}
+
+// ===================================================================
+//  FP32 float array -> quantized byte arrays
+// ===================================================================
+
+// Encode float array as raw F32 LE bytes
+fn encode_tensor_f32(data) {
+    let n = len(data)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + w_f32_le(data[i])
+        i = i + 1
+    }
+    return out
+}
+
+// Encode float array as F16 LE bytes
+fn encode_tensor_f16(data) {
+    let n = len(data)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + w_f16_le(data[i])
+        i = i + 1
+    }
+    return out
+}
+
+// Quantize float array to Q4_0 blocks
+// Each block: 32 weights -> f16 scale + 16 nibble bytes = 18 bytes
+// q_i = clamp(round(w_i / scale) + 8, 0, 15)
+fn encode_tensor_q4_0(data) {
+    let n = len(data)
+    let nblocks = n / 32
+    let mut out = []
+    let mut b = 0
+    while b < nblocks {
+        let base = b * 32
+        // Find max absolute value for scale
+        let mut amax = 0.0
+        let mut j = 0
+        while j < 32 {
+            let v = data[base + j]
+            let mut av = v
+            if av < 0.0 { av = 0.0 - av }
+            if av > amax { amax = av }
+            j = j + 1
+        }
+        let mut scale = amax / 7.0
+        if scale < 1.0e-30 { scale = 1.0e-30 }
+        let inv_scale = 1.0 / scale
+        // Write f16 scale
+        out = out + w_f16_le(scale)
+        // Pack 32 weights as 16 nibble-pair bytes
+        let mut k = 0
+        while k < 16 {
+            let idx = base + k * 2
+            let v0 = data[idx]
+            let v1 = data[idx + 1]
+            let mut q0 = to_int(v0 * inv_scale + 8.5)
+            let mut q1 = to_int(v1 * inv_scale + 8.5)
+            if q0 < 0 { q0 = 0 }
+            if q0 > 15 { q0 = 15 }
+            if q1 < 0 { q1 = 0 }
+            if q1 > 15 { q1 = 15 }
+            out = out + [q0 + q1 * 16]
+            k = k + 1
+        }
+        b = b + 1
+    }
+    return out
+}
+
+// Quantize float array to Q4_K super-blocks
+// Each super-block: 256 weights -> 144 bytes
+//   f16 d (2) + f16 dmin (2) + scales[12] + qs[128]
+fn encode_tensor_q4_k(data) {
+    let n = len(data)
+    let nblocks = n / 256
+    let mut out = []
+    let mut b = 0
+    while b < nblocks {
+        let base = b * 256
+        // Find global max/min for super-block
+        let mut gmax = 0.0
+        let mut gmin = 0.0
+        let mut j = 0
+        while j < 256 {
+            let v = data[base + j]
+            if v > gmax { gmax = v }
+            if v < gmin { gmin = v }
+            j = j + 1
+        }
+        // d and dmin: scale for positive and negative range
+        let mut d = gmax / 63.0
+        if d < 1.0e-30 { d = 1.0e-30 }
+        let mut dmin = 0.0
+        if gmin < 0.0 { dmin = (0.0 - gmin) / 63.0 }
+        if dmin < 1.0e-30 { dmin = 1.0e-30 }
+
+        out = out + w_f16_le(d)
+        out = out + w_f16_le(dmin)
+
+        // Compute per-sub-block scale and min (8 sub-blocks of 32)
+        let mut sc_arr = []
+        let mut mn_arr = []
+        let mut sub = 0
+        while sub < 8 {
+            let sb = base + sub * 32
+            let mut smax = 0.0
+            let mut smin = 0.0
+            let mut si = 0
+            while si < 32 {
+                let v = data[sb + si]
+                if v > smax { smax = v }
+                if v < smin { smin = v }
+                si = si + 1
+            }
+            let mut sc = 0
+            if d > 1.0e-30 { sc = to_int(smax / d + 0.5) }
+            if sc > 63 { sc = 63 }
+            if sc < 0 { sc = 0 }
+            let mut mn = 0
+            if dmin > 1.0e-30 { mn = to_int((0.0 - smin) / dmin + 0.5) }
+            if mn > 63 { mn = 63 }
+            if mn < 0 { mn = 0 }
+            sc_arr = sc_arr + [sc]
+            mn_arr = mn_arr + [mn]
+            sub = sub + 1
+        }
+
+        // Pack scales into 12 bytes (llama.cpp format)
+        // Bytes 0-3: lower 6 bits of sc[0..3]
+        // Bytes 4-7: lower 6 bits of mn[0..3]
+        // Bytes 8-11: lower 4 bits of sc[4..7] + upper 2 bits of sc[0..3]
+        let mut scales_bytes = []
+        let mut si2 = 0
+        while si2 < 4 {
+            scales_bytes = scales_bytes + [sc_arr[si2] % 64]
+            si2 = si2 + 1
+        }
+        si2 = 0
+        while si2 < 4 {
+            scales_bytes = scales_bytes + [mn_arr[si2] % 64]
+            si2 = si2 + 1
+        }
+        si2 = 0
+        while si2 < 4 {
+            let lo = sc_arr[si2 + 4] % 16
+            let hi = mn_arr[si2 + 4] % 16
+            scales_bytes = scales_bytes + [lo + hi * 16]
+            si2 = si2 + 1
+        }
+        out = out + scales_bytes
+
+        // Quantize weights to nibbles
+        sub = 0
+        while sub < 8 {
+            let sb = base + sub * 32
+            let dl = d * to_float(sc_arr[sub])
+            let ml = dmin * to_float(mn_arr[sub])
+            let mut inv_dl = 0.0
+            if dl > 1.0e-30 { inv_dl = 1.0 / dl }
+            let mut k = 0
+            while k < 16 {
+                let idx = sb + k * 2
+                let v0 = data[idx] + ml
+                let v1 = data[idx + 1] + ml
+                let mut q0 = to_int(v0 * inv_dl + 0.5)
+                let mut q1 = to_int(v1 * inv_dl + 0.5)
+                if q0 < 0 { q0 = 0 }
+                if q0 > 15 { q0 = 15 }
+                if q1 < 0 { q1 = 0 }
+                if q1 > 15 { q1 = 15 }
+                out = out + [q0 + q1 * 16]
+                k = k + 1
+            }
+            sub = sub + 1
+        }
+        b = b + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  Encode tensor data based on ggml type
+// ===================================================================
+
+fn encode_tensor_data(data, ggml_type) {
+    if ggml_type == GGML_F32() { return encode_tensor_f32(data) }
+    if ggml_type == GGML_F16() { return encode_tensor_f16(data) }
+    if ggml_type == GGML_Q4_0() { return encode_tensor_q4_0(data) }
+    if ggml_type == GGML_Q4_K() { return encode_tensor_q4_k(data) }
+    println("[gguf_writer] WARN: unknown ggml_type " + str(ggml_type) + ", using F32")
+    return encode_tensor_f32(data)
+}
+
+// ===================================================================
+//  GgufTensorDef -- describes one tensor to export
+// ===================================================================
+struct GgufTensorDef {
+    name: string,
+    shape: array,
+    data: array,
+    ggml_type: int
+}
+
+// ===================================================================
+//  Metadata builder: accumulate KV pairs as pre-encoded bytes
+//
+//  Usage:
+//      let mut meta = gguf_meta_new()
+//      meta = gguf_meta_add_string(meta, "general.architecture", "llama")
+//      meta = gguf_meta_add_u32(meta, "llama.context_length", 2048)
+//      let n_kv = meta[0]
+//      let kv_bytes = meta[1]
+//      export_gguf(tdefs, n_kv, kv_bytes, output_path, quant_type)
+// ===================================================================
+
+fn gguf_meta_new() {
+    return [0, []]
+}
+
+fn gguf_meta_add_u32(meta, key, val) {
+    let n = meta[0] + 1
+    let bytes = meta[1] + gguf_kv_u32(key, val)
+    return [n, bytes]
+}
+
+fn gguf_meta_add_i32(meta, key, val) {
+    let n = meta[0] + 1
+    let bytes = meta[1] + gguf_kv_i32(key, val)
+    return [n, bytes]
+}
+
+fn gguf_meta_add_f32(meta, key, val) {
+    let n = meta[0] + 1
+    let bytes = meta[1] + gguf_kv_f32(key, val)
+    return [n, bytes]
+}
+
+fn gguf_meta_add_u64(meta, key, val) {
+    let n = meta[0] + 1
+    let bytes = meta[1] + gguf_kv_u64(key, val)
+    return [n, bytes]
+}
+
+fn gguf_meta_add_string(meta, key, val) {
+    let n = meta[0] + 1
+    let bytes = meta[1] + gguf_kv_string(key, val)
+    return [n, bytes]
+}
+
+fn gguf_meta_add_bool(meta, key, val) {
+    let n = meta[0] + 1
+    let bytes = meta[1] + gguf_kv_bool(key, val)
+    return [n, bytes]
+}
+
+// ===================================================================
+//  export_gguf(model_weights, n_kv, kv_bytes, output_path, quant_type)
+//
+//  model_weights : [GgufTensorDef] -- tensor definitions
+//  n_kv          : int -- number of metadata KV pairs
+//  kv_bytes      : [int] -- pre-encoded metadata bytes (use gguf_meta_* builders)
+//  output_path   : string -- file path
+//  quant_type    : int -- default ggml type for tensors with ggml_type == -1
+//
+//  Returns total bytes written.
+// ===================================================================
+
+fn export_gguf(model_weights, n_kv, kv_bytes, output_path, quant_type) {
+    let n_tensors = len(model_weights)
+
+    println("[gguf_writer] Exporting GGUF v3: " + str(n_tensors) + " tensors, " + str(n_kv) + " metadata KVs")
+
+    // -- Determine effective ggml types and compute data sizes/offsets --
+    let mut eff_types = []
+    let mut numels = []
+    let mut data_sizes = []
+    let mut ti = 0
+    while ti < n_tensors {
+        let tdef = model_weights[ti]
+        let mut gt = tdef.ggml_type
+        if gt < 0 { gt = quant_type }
+        eff_types = eff_types + [gt]
+        let shape = tdef.shape
+        let mut numel = 1
+        let nd = len(shape)
+        let mut d = 0
+        while d < nd {
+            numel = numel * shape[d]
+            d = d + 1
+        }
+        numels = numels + [numel]
+        data_sizes = data_sizes + [ggml_tensor_data_size(numel, gt)]
+        ti = ti + 1
+    }
+
+    // -- Compute data offsets (relative to data section start) --
+    let alignment = DEFAULT_ALIGNMENT()
+    let mut data_offsets = []
+    let mut cur_off = 0
+    ti = 0
+    while ti < n_tensors {
+        let aligned = align_up(cur_off, alignment)
+        data_offsets = data_offsets + [aligned]
+        cur_off = aligned + data_sizes[ti]
+        ti = ti + 1
+    }
+
+    // -- Build tensor info entries --
+    let mut tinfo_bytes = []
+    ti = 0
+    while ti < n_tensors {
+        let tdef = model_weights[ti]
+        let shape = tdef.shape
+        let ndim = len(shape)
+        // name (gguf string)
+        tinfo_bytes = tinfo_bytes + gguf_encode_string(tdef.name)
+        // n_dims (u32)
+        tinfo_bytes = tinfo_bytes + w_u32_le(ndim)
+        // shape[i] (u64 each)
+        let mut d = 0
+        while d < ndim {
+            tinfo_bytes = tinfo_bytes + w_u64_le(shape[d])
+            d = d + 1
+        }
+        // ggml_type (u32)
+        tinfo_bytes = tinfo_bytes + w_u32_le(eff_types[ti])
+        // offset (u64, relative to data section)
+        tinfo_bytes = tinfo_bytes + w_u64_le(data_offsets[ti])
+        ti = ti + 1
+    }
+
+    // -- Assemble header --
+    let mut header = []
+    header = header + w_u32_le(GGUF_MAGIC())
+    header = header + w_u32_le(GGUF_VERSION())
+    header = header + w_u64_le(n_tensors)
+    header = header + w_u64_le(n_kv)
+    header = header + kv_bytes
+    header = header + tinfo_bytes
+
+    // Pad header to alignment boundary
+    let hdr_len = len(header)
+    let aligned_hdr = align_up(hdr_len, alignment)
+    let pad_needed = aligned_hdr - hdr_len
+    if pad_needed > 0 {
+        header = header + pad_zeros(pad_needed)
+    }
+
+    println("[gguf_writer] Header: " + str(len(header)) + " bytes")
+
+    // -- Encode tensor data --
+    let mut all_data = []
+    ti = 0
+    while ti < n_tensors {
+        let tdef = model_weights[ti]
+        // Pad to target offset
+        let target = data_offsets[ti]
+        let cur_len = len(all_data)
+        if target > cur_len {
+            all_data = all_data + pad_zeros(target - cur_len)
+        }
+        let encoded = encode_tensor_data(tdef.data, eff_types[ti])
+        all_data = all_data + encoded
+        ti = ti + 1
+    }
+
+    // -- Write to file --
+    let total = header + all_data
+    let total_len = len(total)
+    write_file_bytes(output_path, total)
+
+    println("[gguf_writer] Written " + str(total_len) + " bytes to " + output_path)
+    return total_len
+}
+
+// ===================================================================
+//  Convenience: export_gguf_simple
+//
+//  Takes parallel arrays (names, shapes, data_arrays) plus metadata
+//  dict-like pairs. All tensors use given quant_type.
+// ===================================================================
+
+fn export_gguf_simple(names, shapes, data_arrays, n_kv, kv_bytes, output_path, quant_type) {
+    let n = len(names)
+    let mut tdefs = []
+    let mut i = 0
+    while i < n {
+        tdefs = tdefs + [GgufTensorDef {
+            name: names[i],
+            shape: shapes[i],
+            data: data_arrays[i],
+            ggml_type: quant_type
+        }]
+        i = i + 1
+    }
+    return export_gguf(tdefs, n_kv, kv_bytes, output_path, quant_type)
+}
+
+// ===================================================================
+//  Tests
+// ===================================================================
+
+@test
+fn test_w_u32_le_roundtrip() {
+    let b = w_u32_le(305419896)
+    // 0x12345678 -> [120, 86, 52, 18]
+    assert(b[0] == 120)
+    assert(b[1] == 86)
+    assert(b[2] == 52)
+    assert(b[3] == 18)
+}
+
+@test
+fn test_w_u64_le() {
+    let b = w_u64_le(1)
+    assert(b[0] == 1)
+    assert(b[1] == 0)
+    assert(len(b) == 8)
+}
+
+@test
+fn test_gguf_magic_encoding() {
+    let b = w_u32_le(GGUF_MAGIC())
+    // GGUF magic 0x46554747 -> LE: [71, 71, 85, 70]
+    assert(b[0] == 71)
+    assert(b[1] == 71)
+    assert(b[2] == 85)
+    assert(b[3] == 70)
+}
+
+@test
+fn test_f32_encode_decode_roundtrip() {
+    let v = 3.14
+    let bytes = w_f32_le(v)
+    assert(len(bytes) == 4)
+    // Decode using same logic as gguf_loader
+    let bits = bytes[0] + bytes[1] * 256 + bytes[2] * 65536 + bytes[3] * 16777216
+    let sign = (bits / 2147483648) % 2
+    let exp = (bits / 8388608) % 256
+    let mant = bits % 8388608
+    let m = 1.0 + mant / 8388608.0
+    let decoded = m * pow(2.0, to_float(exp - 127))
+    // Should be close to 3.14 (f32 precision)
+    let diff = decoded - 3.14
+    let mut adiff = diff
+    if adiff < 0.0 { adiff = 0.0 - adiff }
+    assert(adiff < 0.001)
+}
+
+@test
+fn test_f16_encode_zero() {
+    let b = w_f16_le(0.0)
+    assert(b[0] == 0)
+    assert(b[1] == 0)
+}
+
+@test
+fn test_gguf_encode_string() {
+    let b = gguf_encode_string("hi")
+    // u64 len=2, then 'h'=104, 'i'=105
+    assert(len(b) == 10)
+    assert(b[0] == 2)
+    assert(b[8] == 104)
+    assert(b[9] == 105)
+}
+
+@test
+fn test_tensor_data_size() {
+    assert(ggml_tensor_data_size(32, GGML_F32()) == 128)
+    assert(ggml_tensor_data_size(32, GGML_F16()) == 64)
+    assert(ggml_tensor_data_size(32, GGML_Q4_0()) == 18)
+    assert(ggml_tensor_data_size(256, GGML_Q4_K()) == 144)
+}
+
+@test
+fn test_q4_0_encode_zeros() {
+    // 32 zeros -> one Q4_0 block
+    let mut data = []
+    let mut i = 0
+    while i < 32 {
+        data = data + [0.0]
+        i = i + 1
+    }
+    let encoded = encode_tensor_q4_0(data)
+    // 18 bytes per block
+    assert(len(encoded) == 18)
+    // All zeros -> all nibbles should be 8 (0 / tiny_scale + 8 = 8)
+    // nibble byte = 8 + 8*16 = 136 = 0x88
+    assert(encoded[2] == 136)
+}
+
+@test
+fn test_align_up() {
+    assert(align_up(0, 32) == 0)
+    assert(align_up(1, 32) == 32)
+    assert(align_up(32, 32) == 32)
+    assert(align_up(33, 32) == 64)
+}
+
+run_tests()

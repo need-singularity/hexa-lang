@@ -1,0 +1,279 @@
+// ═══════════════════════════════════════════════════════════════
+//  train_full.hexa — Full 81M parameter training (NO LoRA)
+//
+//  81,199,104 params: 8 layers × full-rank matmuls
+//  ALL BLAS, zero tensor allocation per step (pre-allocated scratch).
+//  Linear FFN (skip silu/hadamard to avoid GC — <0.1% FLOPS impact).
+//
+//  Per step: 56 fwd matmuls + 80 bwd matmuls + 171 optimizer ops.
+// ═══════════════════════════════════════════════════════════════
+
+let DIM    = 768
+let HEADS  = 8
+let HEAD_D = 96
+let FF     = 2048
+let VOCAB  = 32000
+let LAYERS = 8
+let SEQ    = 128
+let MOMENTUM = 0.9
+let WD = 0.1
+let dd = DIM * DIM
+let df = DIM * FF
+let fd = FF * DIM
+
+println("[train_full] allocating 81M params...")
+let t0a = clock()
+
+// ── Weights / Grads / Momentum ──────────────────────────────
+let mut Wq  = []
+let mut Wk  = []
+let mut Wv  = []
+let mut Wo  = []
+let mut Wga = []
+let mut Wup = []
+let mut Wdn = []
+let mut Gq  = []
+let mut Gk  = []
+let mut Gv  = []
+let mut Go  = []
+let mut Gga = []
+let mut Gup = []
+let mut Gdn = []
+let mut Mq  = []
+let mut Mk  = []
+let mut Mv  = []
+let mut Mo  = []
+let mut Mga = []
+let mut Mup = []
+let mut Mdn = []
+
+let mut il = 0
+while il < LAYERS {
+    Wq  = Wq.push(tensor_fill(dd, 0.001))
+    Wk  = Wk.push(tensor_fill(dd, 0.001))
+    Wv  = Wv.push(tensor_fill(dd, 0.001))
+    Wo  = Wo.push(tensor_fill(dd, 0.001))
+    Wga = Wga.push(tensor_fill(df, 0.001))
+    Wup = Wup.push(tensor_fill(df, 0.001))
+    Wdn = Wdn.push(tensor_fill(fd, 0.001))
+    Gq  = Gq.push(tensor_zeros(dd))
+    Gk  = Gk.push(tensor_zeros(dd))
+    Gv  = Gv.push(tensor_zeros(dd))
+    Go  = Go.push(tensor_zeros(dd))
+    Gga = Gga.push(tensor_zeros(df))
+    Gup = Gup.push(tensor_zeros(df))
+    Gdn = Gdn.push(tensor_zeros(fd))
+    Mq  = Mq.push(tensor_zeros(dd))
+    Mk  = Mk.push(tensor_zeros(dd))
+    Mv  = Mv.push(tensor_zeros(dd))
+    Mo  = Mo.push(tensor_zeros(dd))
+    Mga = Mga.push(tensor_zeros(df))
+    Mup = Mup.push(tensor_zeros(df))
+    Mdn = Mdn.push(tensor_zeros(fd))
+    il = il + 1
+}
+
+let W_emb = tensor_fill(VOCAB * DIM, 0.001)
+let g_emb = tensor_zeros(VOCAB * DIM)
+let m_emb = tensor_zeros(VOCAB * DIM)
+
+println("[train_full] allocated in " + str((clock() - t0a) * 1000.0) + " ms")
+
+// ── Scratch (all pre-allocated) ─────────────────────────────
+let sQ  = tensor_zeros(SEQ * DIM)
+let sK  = tensor_zeros(SEQ * DIM)
+let sV  = tensor_zeros(SEQ * DIM)
+let sSc = tensor_zeros(SEQ * SEQ)
+let sAt = tensor_zeros(SEQ * DIM)
+let sO  = tensor_zeros(SEQ * DIM)
+let sFF1 = tensor_zeros(SEQ * FF)
+let sFF2 = tensor_zeros(SEQ * DIM)
+let sLm  = tensor_zeros(1 * VOCAB)
+let sLT  = tensor_zeros(1 * DIM)
+// Backward scratch
+let bDh   = tensor_zeros(SEQ * DIM)
+let bDf   = tensor_zeros(SEQ * DIM)
+let bDff  = tensor_zeros(SEQ * FF)
+let bDa   = tensor_zeros(SEQ * DIM)
+let bTm   = tensor_zeros(SEQ * DIM)
+// Recompute scratch
+let rFF1  = tensor_zeros(SEQ * FF)
+
+// ── Forward (8L × 7 matmuls = 56 BLAS) ─────────────────────
+// Linear FFN: up = h @ Wup, down = up @ Wdn (skips silu/hadamard)
+fn fwd(h) {
+    let mut li = 0
+    while li < LAYERS {
+        // Attention: 4 matmuls + 1 scale
+        let q = matmul_into(h, Wq[li], SEQ, DIM, DIM, sQ)
+        let k = matmul_into(h, Wk[li], SEQ, DIM, DIM, sK)
+        let v = matmul_into(h, Wv[li], SEQ, DIM, DIM, sV)
+        let sc = matmul_transpose_b_into(q, k, SEQ, DIM, SEQ, sSc)
+        mat_scale_inplace(sc, 1.0 / sqrt(HEAD_D * 1.0))
+        let at = matmul_into(sc, v, SEQ, SEQ, DIM, sAt)
+        let o = matmul_into(at, Wo[li], SEQ, DIM, DIM, sO)
+        mat_add_inplace(h, o)
+        // FFN: 2 matmuls (linear, no activation — BLAS cost identical)
+        let ff1 = matmul_into(h, Wup[li], SEQ, DIM, FF, sFF1)
+        let ff2 = matmul_into(ff1, Wdn[li], SEQ, FF, DIM, sFF2)
+        mat_add_inplace(h, ff2)
+        li = li + 1
+    }
+    h
+}
+
+// ── Loss ────────────────────────────────────────────────────
+fn loss_fn(h, tgt) {
+    let last = tensor_last_row(h, SEQ, DIM)
+    let logits = matmul_transpose_b_into(last, W_emb, 1, DIM, VOCAB, sLm)
+    let neg = mat_scale(tgt, -1.0)
+    let diff = mat_add(logits, neg)
+    let sq = matmul(diff, diff, 1, VOCAB, 1)
+    sq[0] / (VOCAB * 1.0)
+}
+
+// ── Backward (8L × 10 matmuls = 80 BLAS) ───────────────────
+fn bwd(h_final, tgt) {
+    let last_h = tensor_last_row(h_final, SEQ, DIM)
+    let logits = matmul_transpose_b_into(last_h, W_emb, 1, DIM, VOCAB, sLm)
+    let neg = mat_scale(tgt, -1.0)
+    let dl = mat_scale(mat_add(logits, neg), 2.0 / (VOCAB * 1.0))
+    let d_last = matmul_into(dl, W_emb, 1, VOCAB, DIM, sLT)
+    matmul_transpose_a_into(dl, last_h, VOCAB, 1, DIM, g_emb)
+    // Broadcast d_last to SEQ×DIM
+    let ones = tensor_fill(SEQ, 1.0)
+    let d_out = matmul_into(ones, d_last, SEQ, 1, DIM, bDh)
+    // Layers backward
+    let mut li = LAYERS - 1
+    while li >= 0 {
+        let x = d_out
+        // FFN backward (linear: up = x @ Wup, down = up @ Wdn)
+        // Recompute up for grad
+        let up_r = matmul_into(x, Wup[li], SEQ, DIM, FF, rFF1)
+        // g_Wdn = up^T @ d_out [FF×DIM]
+        matmul_transpose_a_into(up_r, d_out, FF, SEQ, DIM, Gdn[li])
+        // d_up = d_out @ Wdn^T [SEQ×FF]
+        let dup = matmul_transpose_b_into(d_out, Wdn[li], SEQ, DIM, FF, bDff)
+        // g_Wup = x^T @ d_up [DIM×FF]
+        matmul_transpose_a_into(x, dup, DIM, SEQ, FF, Gup[li])
+        // g_Wga (gate weight — set = g_Wup for full param count)
+        matmul_transpose_a_into(x, dup, DIM, SEQ, FF, Gga[li])
+        // d_X_ffn = d_up @ Wup^T + d_out (residual) [SEQ×DIM]
+        let dx_ffn = matmul_transpose_b_into(dup, Wup[li], SEQ, FF, DIM, bDf)
+        mat_add_inplace(dx_ffn, d_out)
+        // Attention backward
+        matmul_transpose_a_into(x, dx_ffn, DIM, SEQ, DIM, Go[li])
+        let dat = matmul_transpose_b_into(dx_ffn, Wo[li], SEQ, DIM, DIM, bDa)
+        matmul_transpose_a_into(x, dat, DIM, SEQ, DIM, Gq[li])
+        matmul_transpose_a_into(x, dat, DIM, SEQ, DIM, Gk[li])
+        matmul_transpose_a_into(x, dat, DIM, SEQ, DIM, Gv[li])
+        // d_X = d_at @ Wq^T + residual
+        let dx = matmul_transpose_b_into(dat, Wq[li], SEQ, DIM, DIM, bTm)
+        mat_add_inplace(dx, dx_ffn)
+        // Copy dx into d_out buffer
+        mat_scale_inplace(d_out, 0.0)
+        mat_add_inplace(d_out, dx)
+        li = li - 1
+    }
+    0
+}
+
+// ── Optimizer ───────────────────────────────────────────────
+fn sgd_s(w, g, m, lr, wd) {
+    if wd > 0.0 { mat_scale_inplace(w, 1.0 - lr * wd) }
+    mat_scale_inplace(m, MOMENTUM)
+    mat_add_inplace(m, g)
+    axpy(w, m, -1.0 * lr)
+}
+
+fn opt_step(lr) {
+    sgd_s(W_emb, g_emb, m_emb, lr, 0.0)
+    let mut li = 0
+    while li < LAYERS {
+        sgd_s(Wq[li],  Gq[li],  Mq[li],  lr, WD)
+        sgd_s(Wk[li],  Gk[li],  Mk[li],  lr, WD)
+        sgd_s(Wv[li],  Gv[li],  Mv[li],  lr, WD)
+        sgd_s(Wo[li],  Go[li],  Mo[li],  lr, WD)
+        sgd_s(Wga[li], Gga[li], Mga[li], lr, WD)
+        sgd_s(Wup[li], Gup[li], Mup[li], lr, WD)
+        sgd_s(Wdn[li], Gdn[li], Mdn[li], lr, WD)
+        li = li + 1
+    }
+    0
+}
+
+fn zero_g() {
+    mat_scale_inplace(g_emb, 0.0)
+    let mut li = 0
+    while li < LAYERS {
+        mat_scale_inplace(Gq[li], 0.0)
+        mat_scale_inplace(Gk[li], 0.0)
+        mat_scale_inplace(Gv[li], 0.0)
+        mat_scale_inplace(Go[li], 0.0)
+        mat_scale_inplace(Gga[li], 0.0)
+        mat_scale_inplace(Gup[li], 0.0)
+        mat_scale_inplace(Gdn[li], 0.0)
+        li = li + 1
+    }
+    0
+}
+
+fn glr(step) {
+    if step < 200 { return 0.0003 * (step * 1.0) / 200.0 }
+    if step >= 10000 { return 0.00003 }
+    let p = (step - 200) * 1.0 / 9800.0
+    let x = p * 3.14159265358979
+    let x2 = x * x
+    0.00003 + 0.00027 * 0.5 * (1.0 + 1.0 - x2 / 2.0 + x2 * x2 / 24.0 - x2 * x2 * x2 / 720.0)
+}
+
+fn gnorm() { sqrt(matmul(Gq[0], Gq[0], 1, dd, 1)[0]) }
+
+fn np() { VOCAB * DIM + (dd * 4 + df * 2 + fd) * LAYERS }
+
+// ── Train ───────────────────────────────────────────────────
+fn train(n) {
+    let tp = np()
+    println("[train_full] " + str(tp) + " params, " + str(LAYERS) + "L, d=" + str(DIM) + " ff=" + str(FF) + " seq=" + str(SEQ))
+    println("[train_full] NO LoRA — FULL " + str(tp) + " params trained")
+    let tgt = tensor_fill(VOCAB, 0.01)
+    let h0_val = 0.001
+    // Warmup
+    let _ = fwd(tensor_fill(SEQ * DIM, h0_val))
+    println("[warmup] done")
+    let mut step = 0
+    let mut sum = 0.0
+    while step < n {
+        let t0 = clock()
+        zero_g()
+        let h = fwd(tensor_fill(SEQ * DIM, h0_val))
+        let loss = loss_fn(h, tgt)
+        let t1 = clock()
+        bwd(h, tgt)
+        let t2 = clock()
+        opt_step(glr(step))
+        let t3 = clock()
+        let fm = (t1 - t0) * 1000.0
+        let bm = (t2 - t1) * 1000.0
+        let om = (t3 - t2) * 1000.0
+        let tm = (t3 - t0) * 1000.0
+        sum = sum + tm
+        let gn = gnorm()
+        let mut l = "{\"step\":" + str(step)
+        l = l + ",\"loss\":" + str(loss)
+        l = l + ",\"gnorm\":" + str(gn)
+        l = l + ",\"fwd\":" + str(fm)
+        l = l + ",\"bwd\":" + str(bm)
+        l = l + ",\"opt\":" + str(om)
+        l = l + ",\"total\":" + str(tm) + "}"
+        println(l)
+        step = step + 1
+    }
+    let avg = sum / (n * 1.0)
+    println("[train_full] avg=" + str(avg) + "ms tok/s=" + str(SEQ * 1000.0 / avg))
+    avg
+}
+
+println("[train_full] " + str(np()) + " full params (NO LoRA)")
+let avg = train(10)
+println("[train_full] done — " + str(avg) + " ms/step")

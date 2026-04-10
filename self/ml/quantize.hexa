@@ -1,0 +1,652 @@
+// ===================================================================
+//  quantize.hexa — Post-training quantization engine
+//
+//  FP32 -> FP16 -> INT8 -> Q4_0 -> Q4_K  quantization + dequantize
+//
+//  Functions:
+//    quantize_fp16(data)              -> QuantizedTensor (FP16)
+//    quantize_int8(data, channels, ch_size) -> QuantizedTensor (INT8)
+//    quantize_q4_0(data, block_size)  -> QuantizedTensor (Q4_0)
+//    quantize_q4_k(data)             -> QuantizedTensor (Q4_K)
+//    dequantize(qt)                  -> [float] (FP32 round-trip)
+//    quantization_error(original, qt) -> ErrorStats {mse, max_err, snr}
+//
+//  Format compatibility:
+//    Q4_0 matches GGUF Q4_0 exactly (f16 scale + 32 nibbles per block)
+//    Q4_K matches GGUF Q4_K (f16 d/dmin + 12 scale bytes + 128 qs)
+//
+//  Uses no external imports -- pure hexa.
+// ===================================================================
+
+// ── Quantization type constants ──────────────────────────────────
+@pure fn QTYPE_FP16() { return 1 }
+@pure fn QTYPE_INT8() { return 2 }
+@pure fn QTYPE_Q4_0() { return 3 }
+@pure fn QTYPE_Q4_K() { return 4 }
+
+// ── Result struct ────────────────────────────────────────────────
+struct QuantizedTensor {
+    qtype: int,
+    data: array,
+    scales: array,
+    mins: array,
+    block_size: int,
+    numel: int
+}
+
+struct ErrorStats {
+    mse: float,
+    max_err: float,
+    snr: float
+}
+
+// ── Math helpers ─────────────────────────────────────────────────
+fn _abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn _max(a, b) {
+    if a >= b { return a }
+    return b
+}
+
+fn _min(a, b) {
+    if a <= b { return a }
+    return b
+}
+
+fn _clamp(v, lo, hi) {
+    if v < lo { return lo }
+    if v > hi { return hi }
+    return v
+}
+
+fn _round(x) {
+    if x >= 0.0 { return int(x + 0.5) }
+    return int(x - 0.5)
+}
+
+// ── IEEE 754 FP16 encode/decode (pure hexa) ──────────────────────
+// Truncate FP32 mantissa to 10 bits (FP16 precision).
+// Returns the FP32 value that FP16 would represent (no actual f16 storage).
+@pure
+fn _fp32_to_fp16_value(val) {
+    if val == 0.0 { return 0.0 }
+    let mut v = val
+    let mut sign_neg = false
+    if v < 0.0 {
+        sign_neg = true
+        v = 0.0 - v
+    }
+    // Find exponent: v = m * 2^exp, 1.0 <= m < 2.0
+    let mut exp = 0
+    let mut m = v
+    if m >= 2.0 {
+        while m >= 2.0 {
+            m = m / 2.0
+            exp = exp + 1
+        }
+    } else {
+        while m < 1.0 {
+            m = m * 2.0
+            exp = exp - 1
+        }
+    }
+    // FP16 biased exponent range: -14..15
+    if exp > 15 {
+        // Overflow -> max fp16
+        if sign_neg { return -65504.0 }
+        return 65504.0
+    }
+    if exp < -14 {
+        // Underflow -> zero (flush denormals)
+        return 0.0
+    }
+    // Truncate mantissa to 10 bits
+    let frac = m - 1.0
+    let mant10 = int(frac * 1024.0 + 0.5)
+    let mut mant_clamped = mant10
+    if mant_clamped > 1023 { mant_clamped = 1023 }
+    let result = (1.0 + mant_clamped / 1024.0) * pow(2.0, to_float(exp))
+    if sign_neg { return 0.0 - result }
+    return result
+}
+
+// Encode float -> f16 as 2-byte integer (for GGUF binary compat)
+@pure
+fn _encode_f16_bits(val) {
+    if val == 0.0 { return 0 }
+    let mut v = val
+    let mut sign = 0
+    if v < 0.0 {
+        sign = 1
+        v = 0.0 - v
+    }
+    let mut exp = 0
+    let mut m = v
+    if m >= 2.0 {
+        while m >= 2.0 {
+            m = m / 2.0
+            exp = exp + 1
+        }
+    } else {
+        while m < 1.0 {
+            m = m * 2.0
+            exp = exp - 1
+        }
+    }
+    if exp > 15 {
+        return sign * 32768 + 31 * 1024
+    }
+    if exp < -14 {
+        return sign * 32768
+    }
+    let biased = exp + 15
+    let frac = m - 1.0
+    let mant = int(frac * 1024.0 + 0.5)
+    let mut mc = mant
+    if mc > 1023 { mc = 1023 }
+    return sign * 32768 + biased * 1024 + mc
+}
+
+// Decode f16 bits -> float
+@pure
+fn _decode_f16_bits(bits) {
+    let sign = (bits / 32768) % 2
+    let exp = (bits / 1024) % 32
+    let mant = bits % 1024
+    if exp == 0 {
+        if mant == 0 { return 0.0 }
+        let m = mant / 1024.0
+        let v = m * pow(2.0, -14.0)
+        if sign == 1 { return 0.0 - v }
+        return v
+    }
+    if exp == 31 {
+        if sign == 1 { return -65504.0 }
+        return 65504.0
+    }
+    let m = 1.0 + mant / 1024.0
+    let v = m * pow(2.0, to_float(exp - 15))
+    if sign == 1 { return 0.0 - v }
+    return v
+}
+
+// ===================================================================
+//  quantize_fp16(data) -> QuantizedTensor
+//
+//  Truncate each FP32 value to FP16 precision.
+//  Stores the FP16 bit representation in data[].
+// ===================================================================
+fn quantize_fp16(data) {
+    let n = len(data)
+    let mut qdata = []
+    let mut i = 0
+    while i < n {
+        qdata = qdata + [_encode_f16_bits(data[i])]
+        i = i + 1
+    }
+    return QuantizedTensor {
+        qtype: QTYPE_FP16(),
+        data: qdata,
+        scales: [],
+        mins: [],
+        block_size: 1,
+        numel: n
+    }
+}
+
+// ===================================================================
+//  quantize_int8(data, channels, ch_size) -> QuantizedTensor
+//
+//  Per-channel symmetric INT8 quantization.
+//  For each channel: find absmax, scale = absmax/127.
+//  q = clamp(round(val/scale), -128, 127)
+//
+//  channels * ch_size must equal len(data).
+//  If channels==1, ch_size==len(data) => per-tensor quantization.
+// ===================================================================
+fn quantize_int8(data, channels, ch_size) {
+    let n = len(data)
+    let mut qdata = []
+    let mut scales = []
+    let mut ch = 0
+    while ch < channels {
+        let base = ch * ch_size
+        // Find absmax for this channel
+        let mut amax = 0.0
+        let mut j = 0
+        while j < ch_size {
+            let av = _abs(data[base + j])
+            if av > amax { amax = av }
+            j = j + 1
+        }
+        let mut scale = 1.0
+        if amax > 0.0 { scale = amax / 127.0 }
+        scales = scales + [scale]
+        // Quantize
+        j = 0
+        while j < ch_size {
+            let q = _clamp(_round(data[base + j] / scale), -128, 127)
+            qdata = qdata + [q]
+            j = j + 1
+        }
+        ch = ch + 1
+    }
+    return QuantizedTensor {
+        qtype: QTYPE_INT8(),
+        data: qdata,
+        scales: scales,
+        mins: [],
+        block_size: ch_size,
+        numel: n
+    }
+}
+
+// ===================================================================
+//  quantize_q4_0(data, block_size) -> QuantizedTensor
+//
+//  GGUF Q4_0 compatible block quantization.
+//  Each block of `block_size` (default 32) elements:
+//    - Compute absmax -> scale d = absmax / 8.0
+//    - Quantize: q = clamp(round(val/d) + 8, 0, 15)
+//    - Store as 4-bit nibbles (two per byte)
+//    - Scale stored as FP16 bits
+//
+//  Block layout (GGUF compat): [f16 d][block_size/2 nibble bytes]
+//  Total: 2 + block_size/2 bytes per block of block_size weights.
+// ===================================================================
+fn quantize_q4_0(data, block_size) {
+    let n = len(data)
+    let nblocks = n / block_size
+    let mut scales = []
+    let mut qdata = []
+    let mut b = 0
+    while b < nblocks {
+        let base = b * block_size
+        // Find absmax in block
+        let mut amax = 0.0
+        let mut j = 0
+        while j < block_size {
+            let av = _abs(data[base + j])
+            if av > amax { amax = av }
+            j = j + 1
+        }
+        // d = absmax / 8 (maps [-absmax, absmax] to [-8, 7] centered)
+        let mut d = amax / 8.0
+        if d == 0.0 { d = 1.0 }
+        let d_f16 = _encode_f16_bits(d)
+        let d_dequant = _decode_f16_bits(d_f16)
+        scales = scales + [d_f16]
+        // Quantize pairs into nibble bytes
+        let half = block_size / 2
+        j = 0
+        while j < half {
+            let idx0 = base + j * 2
+            let idx1 = base + j * 2 + 1
+            let mut inv_d = 1.0 / d_dequant
+            if d_dequant == 0.0 { inv_d = 0.0 }
+            let q0 = _clamp(_round(data[idx0] * inv_d) + 8, 0, 15)
+            let q1 = _clamp(_round(data[idx1] * inv_d) + 8, 0, 15)
+            // Pack: lo nibble = q0, hi nibble = q1 (GGUF Q4_0 order)
+            qdata = qdata + [q0 + q1 * 16]
+            j = j + 1
+        }
+        b = b + 1
+    }
+    return QuantizedTensor {
+        qtype: QTYPE_Q4_0(),
+        data: qdata,
+        scales: scales,
+        mins: [],
+        block_size: block_size,
+        numel: n
+    }
+}
+
+// ===================================================================
+//  quantize_q4_k(data) -> QuantizedTensor
+//
+//  GGUF Q4_K compatible super-block quantization.
+//  Super-block = 256 weights = 8 sub-blocks of 32 each.
+//  Layout (144 bytes per 256 weights):
+//    f16 d         (2)  — super-block scale
+//    f16 dmin      (2)  — super-block min
+//    u8 scales[12] (12) — 8 sub-block scale/min, 6-bit packed
+//    u8 qs[128]    (128) — 256 nibbles (4-bit each)
+//
+//  Per sub-block: min/max -> asymmetric [0,15] mapping.
+//    val ≈ d * sub_scale * q - dmin * sub_min
+// ===================================================================
+fn quantize_q4_k(data) {
+    let n = len(data)
+    let sb_size = 256
+    let nblocks = n / sb_size
+    let mut all_d = []
+    let mut all_dmin = []
+    let mut all_scales_packed = []
+    let mut all_qs = []
+
+    let mut b = 0
+    while b < nblocks {
+        let bbase = b * sb_size
+        // Per sub-block: compute raw scale and min
+        let mut sub_scales = []
+        let mut sub_mins = []
+        let mut sub = 0
+        while sub < 8 {
+            let sbase = bbase + sub * 32
+            let mut vmin = data[sbase]
+            let mut vmax = data[sbase]
+            let mut k = 1
+            while k < 32 {
+                let v = data[sbase + k]
+                if v < vmin { vmin = v }
+                if v > vmax { vmax = v }
+                k = k + 1
+            }
+            sub_scales = sub_scales + [vmax - vmin]
+            sub_mins = sub_mins + [vmin]
+            sub = sub + 1
+        }
+        // Super-block d = max(sub_scales) / 63
+        let mut max_sc = 0.0
+        let mut max_mn = 0.0
+        sub = 0
+        while sub < 8 {
+            if sub_scales[sub] > max_sc { max_sc = sub_scales[sub] }
+            let amn = _abs(sub_mins[sub])
+            if amn > max_mn { max_mn = amn }
+            sub = sub + 1
+        }
+        let mut d_val = max_sc / 63.0
+        if d_val == 0.0 { d_val = 1.0 }
+        let mut dmin_val = max_mn / 63.0
+        if dmin_val == 0.0 { dmin_val = 1.0 }
+        let d_bits = _encode_f16_bits(d_val)
+        let dmin_bits = _encode_f16_bits(dmin_val)
+        all_d = all_d + [d_bits]
+        all_dmin = all_dmin + [dmin_bits]
+        // Quantize sub-block scales/mins to 6-bit
+        let d_f = _decode_f16_bits(d_bits)
+        let dmin_f = _decode_f16_bits(dmin_bits)
+        let mut iscales = []
+        let mut imins = []
+        sub = 0
+        while sub < 8 {
+            let mut inv_d = 1.0 / d_f
+            if d_f == 0.0 { inv_d = 0.0 }
+            let mut inv_dm = 1.0 / dmin_f
+            if dmin_f == 0.0 { inv_dm = 0.0 }
+            let isc = _clamp(_round(sub_scales[sub] * inv_d), 0, 63)
+            let imn = _clamp(_round(_abs(sub_mins[sub]) * inv_dm), 0, 63)
+            iscales = iscales + [isc]
+            imins = imins + [imn]
+            sub = sub + 1
+        }
+        // Pack 8 scales + 8 mins into 12 bytes (llama.cpp packing)
+        // bytes 0-3: scales[0..3] low 6 bits + high 2 bits from scales[4..7]
+        // bytes 4-7: mins[0..3] low 6 bits + high 2 bits from mins[4..7]
+        // bytes 8-11: scales[4..7] low 4 bits, mins[4..7] low 4 bits
+        let mut packed = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        let mut si = 0
+        while si < 4 {
+            let s_lo = iscales[si] % 64
+            let s_hi = iscales[si + 4] / 16
+            packed[si] = s_lo + s_hi * 64
+            let m_lo = imins[si] % 64
+            let m_hi = imins[si + 4] / 16
+            packed[si + 4] = m_lo + m_hi * 64
+            si = si + 1
+        }
+        si = 0
+        while si < 4 {
+            let s4 = iscales[si + 4] % 16
+            let m4 = imins[si + 4] % 16
+            packed[si + 8] = s4 + m4 * 16
+            si = si + 1
+        }
+        all_scales_packed = all_scales_packed + [packed]
+        // Quantize weights to 4-bit nibbles
+        sub = 0
+        while sub < 8 {
+            let sbase = bbase + sub * 32
+            let sc = iscales[sub]
+            let mn = imins[sub]
+            let dl = d_f * to_float(sc)
+            let ml = dmin_f * to_float(mn)
+            let mut inv_dl = 0.0
+            if dl > 0.0 { inv_dl = 1.0 / dl }
+            let mut k = 0
+            while k < 16 {
+                let idx0 = sbase + k * 2
+                let idx1 = sbase + k * 2 + 1
+                let q0 = _clamp(_round((data[idx0] + ml) * inv_dl), 0, 15)
+                let q1 = _clamp(_round((data[idx1] + ml) * inv_dl), 0, 15)
+                all_qs = all_qs + [q0 + q1 * 16]
+                k = k + 1
+            }
+            sub = sub + 1
+        }
+        b = b + 1
+    }
+    return QuantizedTensor {
+        qtype: QTYPE_Q4_K(),
+        data: all_qs,
+        scales: all_d + all_dmin + all_scales_packed,
+        mins: [],
+        block_size: sb_size,
+        numel: n
+    }
+}
+
+// ===================================================================
+//  dequantize(qt) -> [float]
+//
+//  Reconstruct FP32 values from any QuantizedTensor.
+// ===================================================================
+fn dequantize(qt) {
+    if qt.qtype == QTYPE_FP16() { return _dequant_fp16(qt) }
+    if qt.qtype == QTYPE_INT8() { return _dequant_int8(qt) }
+    if qt.qtype == QTYPE_Q4_0() { return _dequant_q4_0(qt) }
+    if qt.qtype == QTYPE_Q4_K() { return _dequant_q4_k(qt) }
+    println("[quantize] ERROR: unknown qtype " + str(qt.qtype))
+    return []
+}
+
+fn _dequant_fp16(qt) {
+    let n = qt.numel
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [_decode_f16_bits(qt.data[i])]
+        i = i + 1
+    }
+    return out
+}
+
+fn _dequant_int8(qt) {
+    let n = qt.numel
+    let ch_size = qt.block_size
+    let channels = n / ch_size
+    let mut out = []
+    let mut ch = 0
+    while ch < channels {
+        let scale = qt.scales[ch]
+        let base = ch * ch_size
+        let mut j = 0
+        while j < ch_size {
+            out = out + [to_float(qt.data[base + j]) * scale]
+            j = j + 1
+        }
+        ch = ch + 1
+    }
+    return out
+}
+
+fn _dequant_q4_0(qt) {
+    let bs = qt.block_size
+    let nblocks = qt.numel / bs
+    let half = bs / 2
+    let mut out = []
+    let mut b = 0
+    while b < nblocks {
+        let d = _decode_f16_bits(qt.scales[b])
+        let qbase = b * half
+        let mut j = 0
+        while j < half {
+            let byte = qt.data[qbase + j]
+            let lo = byte % 16
+            let hi = byte / 16
+            out = out + [d * to_float(lo - 8)]
+            out = out + [d * to_float(hi - 8)]
+            j = j + 1
+        }
+        b = b + 1
+    }
+    return out
+}
+
+fn _dequant_q4_k(qt) {
+    let sb_size = 256
+    let nblocks = qt.numel / sb_size
+    // scales layout: [nblocks d_bits] + [nblocks dmin_bits] + [nblocks packed_12]
+    let mut out = []
+    let mut b = 0
+    while b < nblocks {
+        let d = _decode_f16_bits(qt.scales[b])
+        let dmin = _decode_f16_bits(qt.scales[nblocks + b])
+        let packed = qt.scales[2 * nblocks + b]
+        // Unpack 8 sub-block scales and mins from 12 bytes
+        let mut iscales = []
+        let mut imins = []
+        let mut si = 0
+        while si < 4 {
+            iscales = iscales + [packed[si] % 64]
+            imins = imins + [packed[si + 4] % 64]
+            si = si + 1
+        }
+        si = 0
+        while si < 4 {
+            let s_lo = packed[si + 8] % 16
+            let s_hi = (packed[si] / 64) % 4
+            iscales = iscales + [s_lo + s_hi * 16]
+            let m_lo = packed[si + 8] / 16
+            let m_hi = (packed[si + 4] / 64) % 4
+            imins = imins + [m_lo + m_hi * 16]
+            si = si + 1
+        }
+        // Dequantize 8 sub-blocks
+        let qs_base = b * 128
+        let mut sub = 0
+        while sub < 8 {
+            let sc = iscales[sub]
+            let mn = imins[sub]
+            let dl = d * to_float(sc)
+            let ml = dmin * to_float(mn)
+            let sq_base = qs_base + sub * 16
+            let mut k = 0
+            while k < 16 {
+                let byte = qt.data[sq_base + k]
+                let lo = byte % 16
+                let hi = byte / 16
+                out = out + [dl * to_float(lo) - ml]
+                out = out + [dl * to_float(hi) - ml]
+                k = k + 1
+            }
+            sub = sub + 1
+        }
+        b = b + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  quantization_error(original, qt) -> ErrorStats
+//
+//  Compute MSE, max absolute error, and signal-to-noise ratio (dB).
+// ===================================================================
+fn quantization_error(original, qt) {
+    let deq = dequantize(qt)
+    let n = len(original)
+    let mut sum_sq_err = 0.0
+    let mut max_err = 0.0
+    let mut sum_sq_sig = 0.0
+    let mut i = 0
+    while i < n {
+        let err = _abs(original[i] - deq[i])
+        sum_sq_err = sum_sq_err + err * err
+        if err > max_err { max_err = err }
+        sum_sq_sig = sum_sq_sig + original[i] * original[i]
+        i = i + 1
+    }
+    let mse = sum_sq_err / to_float(n)
+    // SNR in dB: 10 * log10(signal_power / noise_power)
+    // Pure hexa approximation of log10
+    let mut snr = 0.0
+    if sum_sq_err > 0.0 {
+        let ratio = sum_sq_sig / sum_sq_err
+        snr = 10.0 * _log10_approx(ratio)
+    } else {
+        snr = 999.0
+    }
+    return ErrorStats {
+        mse: mse,
+        max_err: max_err,
+        snr: snr
+    }
+}
+
+// log10 approximation via repeated division (pure hexa, no builtins)
+fn _log10_approx(x) {
+    if x <= 0.0 { return -999.0 }
+    let mut v = x
+    let mut result = 0.0
+    // Integer part: count powers of 10
+    while v >= 10.0 {
+        v = v / 10.0
+        result = result + 1.0
+    }
+    while v < 1.0 {
+        v = v * 10.0
+        result = result - 1.0
+    }
+    // v is in [1.0, 10.0) -- fractional part via Newton-like
+    // log10(v) ~= (v-1)/(v+1) * 2 / ln(10) * correction
+    // Simpler: use ln(v)/ln(10), ln ≈ series
+    let t = (v - 1.0) / (v + 1.0)
+    let t2 = t * t
+    // ln(v) = 2*(t + t^3/3 + t^5/5 + t^7/7 + ...)
+    let ln_v = 2.0 * (t + t * t2 / 3.0 + t * t2 * t2 / 5.0 + t * t2 * t2 * t2 / 7.0 + t * t2 * t2 * t2 * t2 / 9.0)
+    // ln(10) = 2.302585...
+    result = result + ln_v / 2.302585
+    return result
+}
+
+// ===================================================================
+//  Utility: print quantization summary
+// ===================================================================
+fn quantize_summary(name, original, qt) {
+    let err = quantization_error(original, qt)
+    let n = qt.numel
+    let mut bytes_est = 0
+    if qt.qtype == QTYPE_FP16() { bytes_est = n * 2 }
+    if qt.qtype == QTYPE_INT8() { bytes_est = n + len(qt.scales) * 4 }
+    if qt.qtype == QTYPE_Q4_0() { bytes_est = len(qt.data) + len(qt.scales) * 2 }
+    if qt.qtype == QTYPE_Q4_K() { bytes_est = len(qt.data) + (qt.numel / 256) * 16 }
+    let orig_bytes = n * 4
+    let ratio = to_float(orig_bytes) / to_float(_max(bytes_est, 1))
+    let type_name = _qtype_name(qt.qtype)
+    println("[quantize] " + name + " " + type_name + ": " + str(n) + " params, " + str(bytes_est) + "B (ratio " + str(ratio) + "x)")
+    println("  MSE=" + str(err.mse) + " max_err=" + str(err.max_err) + " SNR=" + str(err.snr) + "dB")
+    return err
+}
+
+fn _qtype_name(qt) {
+    if qt == QTYPE_FP16() { return "FP16" }
+    if qt == QTYPE_INT8() { return "INT8" }
+    if qt == QTYPE_Q4_0() { return "Q4_0" }
+    if qt == QTYPE_Q4_K() { return "Q4_K" }
+    return "UNKNOWN"
+}

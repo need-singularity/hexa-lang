@@ -1,0 +1,216 @@
+// ===================================================================
+//  self/ml/generate.hexa — Full LLM Generation Loop
+//
+//  Pipeline: Load GGUF -> Tokenize prompt -> Prefill -> Decode loop
+//
+//  Usage:
+//    hexa self/ml/generate.hexa <gguf_path> [prompt] [max_tokens] [temperature]
+//
+//  This is REAL 7B Q4_0 inference, not a benchmark stub.
+//  Memory-bandwidth bound: DDR4 ~50GB/s, 7B Q4 = 3.5GB -> ~14 tok/s
+// ===================================================================
+
+// ===================================================================
+//  Minimal BPE tokenizer (byte-fallback for Llama)
+//  Real tokenizers use sentencepiece. This is a byte-level fallback
+//  that encodes each byte as token_id = byte + 3 (Llama offset).
+//  Good enough for benchmarking throughput. For quality, use
+//  the vocab from GGUF metadata.
+// ===================================================================
+fn byte_tokenize(text) {
+    // Llama byte tokens: token_id = byte_value + 3
+    // BOS = 1, EOS = 2
+    let mut tokens = [1]  // BOS
+    let n = len(text)
+    let mut i = 0
+    while i < n {
+        let ch = char_code(text, i)
+        tokens = tokens + [ch + 3]
+        i = i + 1
+    }
+    return tokens
+}
+
+// ===================================================================
+//  Token to string (byte fallback)
+// ===================================================================
+fn token_to_str(token_id) {
+    if token_id <= 2 { return "" }  // BOS/EOS/PAD
+    let byte_val = token_id - 3
+    if byte_val >= 32 {
+        if byte_val < 127 {
+            return chr(byte_val)
+        }
+    }
+    return "?"
+}
+
+// ===================================================================
+//  Generation loop
+// ===================================================================
+fn generate(model_path, prompt, max_tokens, temperature) {
+    // Load model
+    let model = llama_load(model_path)
+    let cfg = model.config
+    let vocab_size = cfg.vocab_size
+    let dim = cfg.dim
+
+    // Setup sampler
+    let sampler = SamplerConfig {
+        temperature: temperature,
+        top_p: 0.9,
+        top_k: 40,
+        seed: 42
+    }
+    sampler_set_seed(42)
+
+    // Initialize KV cache
+    let kv_init = init_kv_cache(cfg)
+    let mut kv_keys = kv_init[0]
+    let mut kv_vals = kv_init[1]
+
+    // Tokenize prompt
+    let tokens = byte_tokenize(prompt)
+    let prompt_len = len(tokens)
+    println("[generate] Prompt tokens: " + str(prompt_len))
+    println("[generate] Max new tokens: " + str(max_tokens))
+    println("[generate] Temperature: " + str(temperature))
+
+    // === Prefill phase ===
+    println("[generate] Prefilling...")
+    let t_prefill_start = clock()
+
+    let mut pos = 0
+    while pos < prompt_len {
+        let tok = tokens[pos]
+        let emb = load_embedding(model, tok)
+        let result = transformer_forward(model, emb, pos, kv_keys, kv_vals)
+        kv_keys = result[1]
+        kv_vals = result[2]
+        // Only keep logits from last position
+        if pos == prompt_len - 1 {
+            let logits = result[0]
+            let next_tok = sample_token(logits, vocab_size, sampler)
+            print(token_to_str(next_tok))
+        }
+        pos = pos + 1
+    }
+
+    let t_prefill_end = clock()
+    let prefill_ms = (t_prefill_end - t_prefill_start) * 1000.0
+    println("")
+    println("[generate] Prefill: " + str(prompt_len) + " tokens in " + str(prefill_ms) + " ms (" + str(to_float(prompt_len) / (prefill_ms / 1000.0)) + " tok/s)")
+
+    // === Decode phase ===
+    println("[generate] Decoding...")
+    let t_decode_start = clock()
+
+    let mut generated = 0
+    let mut last_logits = []
+    // Re-run last position to get logits for first new token
+    let last_emb = load_embedding(model, tokens[prompt_len - 1])
+    let last_result = transformer_forward(model, last_emb, prompt_len - 1, kv_keys, kv_vals)
+    last_logits = last_result[0]
+    kv_keys = last_result[1]
+    kv_vals = last_result[2]
+
+    let mut cur_tok = sample_token(last_logits, vocab_size, sampler)
+    let mut decode_pos = prompt_len
+
+    let mut tok_times = []
+
+    while generated < max_tokens {
+        if cur_tok == 2 { generated = max_tokens }  // EOS
+        else {
+            let t0 = clock()
+
+            let emb = load_embedding(model, cur_tok)
+            let result = transformer_forward(model, emb, decode_pos, kv_keys, kv_vals)
+            let logits = result[0]
+            kv_keys = result[1]
+            kv_vals = result[2]
+
+            let next_tok = sample_token(logits, vocab_size, sampler)
+
+            let t1 = clock()
+            let ms = (t1 - t0) * 1000.0
+            tok_times = tok_times + [ms]
+
+            let tok_str = token_to_str(next_tok)
+            print(tok_str)
+
+            cur_tok = next_tok
+            decode_pos = decode_pos + 1
+            generated = generated + 1
+        }
+    }
+
+    let t_decode_end = clock()
+    let decode_ms = (t_decode_end - t_decode_start) * 1000.0
+
+    println("")
+    println("---")
+
+    // Stats
+    let n_gen = len(tok_times)
+    if n_gen > 0 {
+        let mut sum_ms = 0.0
+        let mut best_ms = tok_times[0]
+        let mut worst_ms = tok_times[0]
+        let mut i = 0
+        while i < n_gen {
+            sum_ms = sum_ms + tok_times[i]
+            if tok_times[i] < best_ms { best_ms = tok_times[i] }
+            if tok_times[i] > worst_ms { worst_ms = tok_times[i] }
+            i = i + 1
+        }
+        let avg_ms = sum_ms / to_float(n_gen)
+        let tok_s = 1000.0 / avg_ms
+        let bw_gbs = 3500000000.0 / (avg_ms / 1000.0) / 1000000000.0
+
+        println("[generate] Decode: " + str(n_gen) + " tokens in " + str(decode_ms) + " ms")
+        println("[generate] Avg: " + str(avg_ms) + " ms/tok = " + str(tok_s) + " tok/s")
+        println("[generate] Best: " + str(best_ms) + " ms/tok = " + str(1000.0 / best_ms) + " tok/s")
+        println("[generate] Worst: " + str(worst_ms) + " ms/tok")
+        println("[generate] Bandwidth: " + str(bw_gbs) + " GB/s (theoretical max ~50 GB/s)")
+
+        // JSON output
+        let mut line = "{\"mode\":\"real_7b_q4\""
+        line = line + ",\"tokens\":" + str(n_gen)
+        line = line + ",\"avg_ms\":" + str(avg_ms)
+        line = line + ",\"tok_s\":" + str(tok_s)
+        line = line + ",\"best_ms\":" + str(best_ms)
+        line = line + ",\"worst_ms\":" + str(worst_ms)
+        line = line + ",\"bw_gbs\":" + str(bw_gbs)
+        line = line + ",\"prefill_ms\":" + str(prefill_ms)
+        line = line + ",\"decode_ms\":" + str(decode_ms)
+        line = line + "}"
+        println(line)
+    }
+}
+
+// ===================================================================
+//  CLI entry point
+// ===================================================================
+let args = argv()
+let n_args = len(args)
+
+if n_args < 2 {
+    println("Usage: hexa self/ml/generate.hexa <gguf_path> [prompt] [max_tokens] [temperature]")
+    println("")
+    println("  gguf_path:    Path to Llama GGUF Q4_0 model file")
+    println("  prompt:       Input prompt (default: \"Hello\")")
+    println("  max_tokens:   Max tokens to generate (default: 32)")
+    println("  temperature:  Sampling temperature (default: 0.0 = greedy)")
+} else {
+    let model_path = args[1]
+    let mut prompt = "Hello"
+    let mut max_tokens = 32
+    let mut temperature = 0.0
+
+    if n_args > 2 { prompt = args[2] }
+    if n_args > 3 { max_tokens = to_int(args[3]) }
+    if n_args > 4 { temperature = to_float(args[4]) }
+
+    generate(model_path, prompt, max_tokens, temperature)
+}

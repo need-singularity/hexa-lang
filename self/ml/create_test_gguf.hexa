@@ -1,0 +1,314 @@
+// ===================================================================
+//  create_test_gguf.hexa — Generate a tiny synthetic GGUF v3 file
+//  for testing the transformer pipeline end-to-end.
+//
+//  Architecture: dim=64, layers=2, heads=4, kv_heads=2, vocab=256, hidden=128
+//  All linear weights are Q4_0, norm/embedding are F32.
+//  Output: self/ml/test_tiny.gguf
+// ===================================================================
+
+let DIM = 64
+let HIDDEN = 128
+let N_LAYERS = 2
+let N_HEADS = 4
+let N_KV_HEADS = 2
+let VOCAB = 256
+let HEAD_DIM = DIM / N_HEADS
+let KV_DIM = N_KV_HEADS * HEAD_DIM
+let MAX_SEQ = 256
+let ALIGNMENT = 32
+
+let mut RNG_STATE = 42
+
+fn lcg_next() {
+    RNG_STATE = (RNG_STATE * 1664525 + 1013904223) % 4294967296
+    return RNG_STATE
+}
+
+fn lcg_byte() { return lcg_next() % 256 }
+
+fn u32_le(val) {
+    let b0 = val % 256
+    let b1 = (val / 256) % 256
+    let b2 = (val / 65536) % 256
+    let b3 = (val / 16777216) % 256
+    return [b0, b1, b2, b3]
+}
+
+fn u64_le(val) {
+    let lo = val % 4294967296
+    let hi = val / 4294967296
+    return u32_le(lo) + u32_le(hi)
+}
+
+fn f32_le(val) {
+    if val == 0.0 { return [0, 0, 0, 0] }
+    let mut v = val
+    let mut sign = 0
+    if v < 0.0 { sign = 1; v = 0.0 - v }
+    let mut e = 0
+    let mut tmp = v
+    if tmp >= 2.0 {
+        while tmp >= 2.0 { tmp = tmp / 2.0; e = e + 1 }
+    } else {
+        if tmp < 1.0 {
+            while tmp < 1.0 { tmp = tmp * 2.0; e = e - 1 }
+        }
+    }
+    let biased_exp = e + 127
+    let mantissa = to_int((tmp - 1.0) * 8388608.0)
+    let bits = sign * 2147483648 + biased_exp * 8388608 + mantissa
+    return u32_le(bits)
+}
+
+fn f16_le(val) {
+    if val == 0.0 { return [0, 0] }
+    let mut v = val
+    let mut sign = 0
+    if v < 0.0 { sign = 1; v = 0.0 - v }
+    let mut e = 0
+    let mut tmp = v
+    if tmp >= 2.0 {
+        while tmp >= 2.0 { tmp = tmp / 2.0; e = e + 1 }
+    } else {
+        if tmp < 1.0 {
+            while tmp < 1.0 { tmp = tmp * 2.0; e = e - 1 }
+        }
+    }
+    let biased_exp = e + 15
+    let mantissa = to_int((tmp - 1.0) * 1024.0)
+    let bits = sign * 32768 + biased_exp * 1024 + mantissa
+    return [bits % 256, bits / 256]
+}
+
+fn gguf_string_bytes(s) {
+    let n = len(s)
+    let mut out = u64_le(n)
+    let mut i = 0
+    while i < n {
+        out = out + [char_code(s, i)]
+        i = i + 1
+    }
+    return out
+}
+
+fn gguf_kv_u32(key, val) {
+    return gguf_string_bytes(key) + u32_le(4) + u32_le(val)
+}
+
+fn gguf_kv_f32(key, val) {
+    return gguf_string_bytes(key) + u32_le(6) + f32_le(val)
+}
+
+fn make_q4_0_data(rows, cols) {
+    let blocks_per_row = cols / 32
+    let mut data = []
+    let mut r = 0
+    while r < rows {
+        let mut b = 0
+        while b < blocks_per_row {
+            data = data + f16_le(0.01)
+            let mut i = 0
+            while i < 16 {
+                data = data + [lcg_byte()]
+                i = i + 1
+            }
+            b = b + 1
+        }
+        r = r + 1
+    }
+    return data
+}
+
+fn make_f32_data(numel) {
+    let mut data = []
+    let mut i = 0
+    while i < numel {
+        let r = lcg_next() % 10000
+        let v = (to_float(r) / 10000.0 - 0.5) * 0.02
+        data = data + f32_le(v)
+        i = i + 1
+    }
+    return data
+}
+
+fn align_up(val, alignment) {
+    let rem = val % alignment
+    if rem == 0 { return val }
+    return val + (alignment - rem)
+}
+
+fn pad_bytes(n) {
+    let mut out = []
+    let mut i = 0
+    while i < n { out = out + [0]; i = i + 1 }
+    return out
+}
+
+// ===================================================================
+//  Build GGUF using parallel arrays for tensor definitions
+// ===================================================================
+fn build_gguf() {
+    println("[create_test_gguf] Building synthetic GGUF...")
+
+    // Tensor definitions using parallel arrays
+    let mut t_names = []
+    let mut t_ndims = []
+    let mut t_dim0 = []
+    let mut t_dim1 = []
+    let mut t_types = []
+
+    // Helper: add 1D tensor (norm weights)
+    fn add_1d(names, ndims, d0, d1, types, name, dim, gtype) {
+        return [names + [name], ndims + [1], d0 + [dim], d1 + [0], types + [gtype]]
+    }
+
+    // Helper: add 2D tensor
+    fn add_2d(names, ndims, d0, d1, types, name, dim_0, dim_1, gtype) {
+        return [names + [name], ndims + [2], d0 + [dim_0], d1 + [dim_1], types + [gtype]]
+    }
+
+    // Embeddings (F32)
+    let r = add_2d(t_names, t_ndims, t_dim0, t_dim1, t_types, "token_embd.weight", DIM, VOCAB, 0)
+    t_names = r[0]; t_ndims = r[1]; t_dim0 = r[2]; t_dim1 = r[3]; t_types = r[4]
+
+    // Output
+    let r2 = add_2d(t_names, t_ndims, t_dim0, t_dim1, t_types, "output.weight", DIM, VOCAB, 2)
+    t_names = r2[0]; t_ndims = r2[1]; t_dim0 = r2[2]; t_dim1 = r2[3]; t_types = r2[4]
+
+    let r3 = add_1d(t_names, t_ndims, t_dim0, t_dim1, t_types, "output_norm.weight", DIM, 0)
+    t_names = r3[0]; t_ndims = r3[1]; t_dim0 = r3[2]; t_dim1 = r3[3]; t_types = r3[4]
+
+    let mut l = 0
+    while l < N_LAYERS {
+        let p = "blk." + str(l) + "."
+
+        let a = add_1d(t_names, t_ndims, t_dim0, t_dim1, t_types, p + "attn_norm.weight", DIM, 0)
+        t_names = a[0]; t_ndims = a[1]; t_dim0 = a[2]; t_dim1 = a[3]; t_types = a[4]
+
+        let b = add_2d(t_names, t_ndims, t_dim0, t_dim1, t_types, p + "attn_q.weight", DIM, DIM, 2)
+        t_names = b[0]; t_ndims = b[1]; t_dim0 = b[2]; t_dim1 = b[3]; t_types = b[4]
+
+        let c = add_2d(t_names, t_ndims, t_dim0, t_dim1, t_types, p + "attn_k.weight", DIM, KV_DIM, 2)
+        t_names = c[0]; t_ndims = c[1]; t_dim0 = c[2]; t_dim1 = c[3]; t_types = c[4]
+
+        let d = add_2d(t_names, t_ndims, t_dim0, t_dim1, t_types, p + "attn_v.weight", DIM, KV_DIM, 2)
+        t_names = d[0]; t_ndims = d[1]; t_dim0 = d[2]; t_dim1 = d[3]; t_types = d[4]
+
+        let e = add_2d(t_names, t_ndims, t_dim0, t_dim1, t_types, p + "attn_output.weight", DIM, DIM, 2)
+        t_names = e[0]; t_ndims = e[1]; t_dim0 = e[2]; t_dim1 = e[3]; t_types = e[4]
+
+        let f = add_1d(t_names, t_ndims, t_dim0, t_dim1, t_types, p + "ffn_norm.weight", DIM, 0)
+        t_names = f[0]; t_ndims = f[1]; t_dim0 = f[2]; t_dim1 = f[3]; t_types = f[4]
+
+        let g = add_2d(t_names, t_ndims, t_dim0, t_dim1, t_types, p + "ffn_gate.weight", DIM, HIDDEN, 2)
+        t_names = g[0]; t_ndims = g[1]; t_dim0 = g[2]; t_dim1 = g[3]; t_types = g[4]
+
+        let h = add_2d(t_names, t_ndims, t_dim0, t_dim1, t_types, p + "ffn_up.weight", DIM, HIDDEN, 2)
+        t_names = h[0]; t_ndims = h[1]; t_dim0 = h[2]; t_dim1 = h[3]; t_types = h[4]
+
+        let j = add_2d(t_names, t_ndims, t_dim0, t_dim1, t_types, p + "ffn_down.weight", HIDDEN, DIM, 2)
+        t_names = j[0]; t_ndims = j[1]; t_dim0 = j[2]; t_dim1 = j[3]; t_types = j[4]
+
+        l = l + 1
+    }
+
+    let n_tensors = len(t_names)
+    println("[create_test_gguf] Tensors: " + str(n_tensors))
+
+    // -- Header --
+    let mut hdr = []
+    hdr = hdr + u32_le(1179993927)  // GGUF magic
+    hdr = hdr + u32_le(3)           // version
+    hdr = hdr + u64_le(n_tensors)
+    hdr = hdr + u64_le(8)           // n_kv = 8
+
+    // Metadata
+    hdr = hdr + gguf_kv_u32("llama.embedding_length", DIM)
+    hdr = hdr + gguf_kv_u32("llama.feed_forward_length", HIDDEN)
+    hdr = hdr + gguf_kv_u32("llama.block_count", N_LAYERS)
+    hdr = hdr + gguf_kv_u32("llama.attention.head_count", N_HEADS)
+    hdr = hdr + gguf_kv_u32("llama.attention.head_count_kv", N_KV_HEADS)
+    hdr = hdr + gguf_kv_u32("llama.context_length", MAX_SEQ)
+    hdr = hdr + gguf_kv_f32("llama.rope.freq_base", 10000.0)
+    hdr = hdr + gguf_kv_f32("llama.attention.layer_norm_rms_epsilon", 0.00001)
+
+    // -- Compute data offsets --
+    let mut data_offsets = []
+    let mut cur_off = 0
+    let mut ti = 0
+    while ti < n_tensors {
+        let aligned_off = align_up(cur_off, ALIGNMENT)
+        data_offsets = data_offsets + [aligned_off]
+        let mut numel = t_dim0[ti]
+        if t_ndims[ti] == 2 { numel = numel * t_dim1[ti] }
+        let mut blen = numel * 4
+        if t_types[ti] == 2 { blen = (numel / 32) * 18 }
+        cur_off = aligned_off + blen
+        ti = ti + 1
+    }
+
+    // -- Tensor info entries --
+    ti = 0
+    while ti < n_tensors {
+        hdr = hdr + gguf_string_bytes(t_names[ti])
+        hdr = hdr + u32_le(t_ndims[ti])
+        hdr = hdr + u64_le(t_dim0[ti])
+        if t_ndims[ti] == 2 { hdr = hdr + u64_le(t_dim1[ti]) }
+        hdr = hdr + u32_le(t_types[ti])
+        hdr = hdr + u64_le(data_offsets[ti])
+        ti = ti + 1
+    }
+
+    // Align header
+    let hdr_len = len(hdr)
+    let aligned_hdr = align_up(hdr_len, ALIGNMENT)
+    hdr = hdr + pad_bytes(aligned_hdr - hdr_len)
+
+    println("[create_test_gguf] Header: " + str(len(hdr)) + " bytes")
+
+    // -- Generate tensor data --
+    let mut all_data = []
+    ti = 0
+    while ti < n_tensors {
+        // Pad to offset
+        let target = data_offsets[ti]
+        let cur_len = len(all_data)
+        if target > cur_len {
+            all_data = all_data + pad_bytes(target - cur_len)
+        }
+
+        let mut numel = t_dim0[ti]
+        if t_ndims[ti] == 2 { numel = numel * t_dim1[ti] }
+
+        if t_types[ti] == 0 {
+            all_data = all_data + make_f32_data(numel)
+        } else {
+            // Q4_0: for 2D shape [d0, d1], rows=d1 cols=d0
+            let mut rows = 1
+            let mut cols = numel
+            if t_ndims[ti] == 2 {
+                cols = t_dim0[ti]
+                rows = t_dim1[ti]
+            }
+            all_data = all_data + make_q4_0_data(rows, cols)
+        }
+
+        println("[create_test_gguf]   " + t_names[ti] + " type=" + str(t_types[ti]) + " off=" + str(data_offsets[ti]))
+        ti = ti + 1
+    }
+
+    // -- Write file --
+    let total = hdr + all_data
+    let total_len = len(total)
+    println("[create_test_gguf] Total: " + str(total_len) + " bytes")
+
+    let path = "self/ml/test_tiny.gguf"
+    write_file_bytes(path, total)
+
+    println("[create_test_gguf] Written: " + path)
+    return path
+}
+
+let gguf_path = build_gguf()
+println("[create_test_gguf] DONE")

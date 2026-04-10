@@ -29,6 +29,38 @@ pub fn run_hexa(source: &str) -> String {
     result.to_string()
 }
 
+/// Run Hexa source using **only** the bytecode VM (no interpreter fallback).
+///
+/// Returns a JSON string: `{"output": "...", "error": "..."}`.
+/// If the VM cannot compile the input (e.g. unsupported constructs),
+/// `error` contains the reason instead of silently falling back.
+#[wasm_bindgen]
+pub fn run_vm(source: &str) -> String {
+    let (output, error) = crate::run_source_vm_only(source, WASM_MEMORY_BUDGET);
+    let result = serde_json::json!({
+        "output": output,
+        "error": error,
+        "tier": "vm",
+    });
+    result.to_string()
+}
+
+/// Run Hexa source using **only** the tree-walk interpreter (skip VM).
+///
+/// Returns a JSON string: `{"output": "...", "error": "..."}`.
+/// Useful for debugging or when the caller wants deterministic
+/// interpreter semantics without VM optimizations.
+#[wasm_bindgen]
+pub fn run_interpreter(source: &str) -> String {
+    let (output, error) = crate::run_source_interpreter_only(source, WASM_MEMORY_BUDGET);
+    let result = serde_json::json!({
+        "output": output,
+        "error": error,
+        "tier": "interpreter",
+    });
+    result.to_string()
+}
+
 /// Format Hexa source code and return the formatted version.
 ///
 /// Returns a JSON string: `{"formatted": "...", "error": "..."}`.

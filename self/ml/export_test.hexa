@@ -1,0 +1,405 @@
+// ===================================================================
+//  export_test.hexa -- GGUF & ONNX export -> re-import -> verify
+//
+//  Tests:
+//   1. GGUF F32 export -> parse header -> verify structure
+//   2. GGUF F32 export -> re-read bytes -> decode -> verify weights
+//   3. GGUF Q4_0 export -> verify quantized size
+//   4. ONNX export -> verify protobuf structure
+//   5. ONNX feedforward builder -> export -> verify
+//   6. GGUF multi-tensor with metadata
+//   7. GGUF simple API convenience
+// ===================================================================
+
+use "gguf_writer"
+use "onnx_writer"
+
+// -- Decode helpers for re-import verification --
+
+@pure
+fn t_le_u32(bytes, off) {
+    let b0 = bytes[off]
+    let b1 = bytes[off + 1]
+    let b2 = bytes[off + 2]
+    let b3 = bytes[off + 3]
+    return b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
+}
+
+@pure
+fn t_le_u64(bytes, off) {
+    let lo = t_le_u32(bytes, off)
+    let hi = t_le_u32(bytes, off + 4)
+    return lo + hi * 4294967296
+}
+
+@pure
+fn t_le_f32(bytes, off) {
+    let bits = t_le_u32(bytes, off)
+    let sign = (bits / 2147483648) % 2
+    let exp = (bits / 8388608) % 256
+    let mant = bits % 8388608
+    if exp == 0 {
+        if mant == 0 { return 0.0 }
+        let m = mant / 8388608.0
+        let v = m * pow(2.0, -126.0)
+        if sign == 1 { return 0.0 - v }
+        return v
+    }
+    if exp == 255 {
+        if sign == 1 { return -1.0e38 }
+        return 1.0e38
+    }
+    let m = 1.0 + mant / 8388608.0
+    let v = m * pow(2.0, to_float(exp - 127))
+    if sign == 1 { return 0.0 - v }
+    return v
+}
+
+fn t_gguf_read_string(bytes, off) {
+    let slen = t_le_u64(bytes, off)
+    let mut p = off + 8
+    let mut s = ""
+    let mut i = 0
+    while i < slen {
+        s = s + chr(to_int(bytes[p + i]))
+        i = i + 1
+    }
+    return [p + slen, s]
+}
+
+fn approx_eq(a, b) {
+    let d = a - b
+    let mut ad = d
+    if ad < 0.0 { ad = 0.0 - ad }
+    return ad < 0.01
+}
+
+// ===================================================================
+//  Test 1: GGUF F32 header structure
+// ===================================================================
+
+@test
+fn test_gguf_f32_header() {
+    let data_a = [1.0, 2.0, 3.0, 4.0]
+    let data_b = [5.0, 6.0]
+
+    let tdefs = [
+        GgufTensorDef {
+            name: "weight_a",
+            shape: [2, 2],
+            data: data_a,
+            ggml_type: 0
+        },
+        GgufTensorDef {
+            name: "weight_b",
+            shape: [2],
+            data: data_b,
+            ggml_type: 0
+        }
+    ]
+
+    let mut meta = gguf_meta_new()
+    meta = gguf_meta_add_string(meta, "general.architecture", "test")
+    meta = gguf_meta_add_u32(meta, "test.dim", 2)
+
+    let path = "/tmp/hexa_test_gguf_f32.gguf"
+    let nbytes = export_gguf(tdefs, meta[0], meta[1], path, 0)
+    assert(nbytes > 0)
+
+    let fsize = file_size(path)
+    assert(fsize == nbytes)
+
+    let bytes = read_file_bytes(path, 0, fsize)
+
+    // Check magic: GGUF = 1179993927
+    let magic = t_le_u32(bytes, 0)
+    assert(magic == 1179993927)
+
+    // Check version = 3
+    let version = t_le_u32(bytes, 4)
+    assert(version == 3)
+
+    // Check tensor count = 2
+    let n_tensors = t_le_u64(bytes, 8)
+    assert(n_tensors == 2)
+
+    // Check kv count = 2
+    let n_kv = t_le_u64(bytes, 16)
+    assert(n_kv == 2)
+
+    println("[export_test] GGUF F32 header: PASS")
+}
+
+// ===================================================================
+//  Test 2: GGUF F32 weight round-trip
+// ===================================================================
+
+@test
+fn test_gguf_f32_roundtrip() {
+    let data_a = [1.5, -2.5, 3.25, 0.0]
+
+    let tdefs = [
+        GgufTensorDef {
+            name: "w",
+            shape: [4],
+            data: data_a,
+            ggml_type: 0
+        }
+    ]
+
+    let mut meta = gguf_meta_new()
+    meta = gguf_meta_add_string(meta, "general.architecture", "roundtrip")
+
+    let path = "/tmp/hexa_test_gguf_rt.gguf"
+    let nbytes = export_gguf(tdefs, meta[0], meta[1], path, 0)
+    let bytes = read_file_bytes(path, 0, nbytes)
+
+    // Parse past header to find data section
+    // Skip magic(4) + version(4) + n_tensors(8) + n_kv(8) = 24
+    let mut p = 24
+
+    // Skip 1 KV: key string + type(u32) + value string
+    let kr = t_gguf_read_string(bytes, p)
+    p = kr[0]
+    let vtype = t_le_u32(bytes, p)
+    p = p + 4
+    let vr = t_gguf_read_string(bytes, p)
+    p = vr[0]
+
+    // Skip tensor info: name + ndim(u32) + shape(u64*ndim) + type(u32) + offset(u64)
+    let nr = t_gguf_read_string(bytes, p)
+    p = nr[0]
+    let ndim = t_le_u32(bytes, p)
+    p = p + 4
+    let mut di = 0
+    while di < ndim {
+        p = p + 8
+        di = di + 1
+    }
+    p = p + 4
+    let t_off = t_le_u64(bytes, p)
+    p = p + 8
+
+    // Align to 32
+    let rem = p % 32
+    let mut origin = p
+    if rem != 0 { origin = p + (32 - rem) }
+
+    // Read tensor data at origin + t_off
+    let ds = origin + t_off
+    let v0 = t_le_f32(bytes, ds)
+    let v1 = t_le_f32(bytes, ds + 4)
+    let v2 = t_le_f32(bytes, ds + 8)
+    let v3 = t_le_f32(bytes, ds + 12)
+
+    assert(approx_eq(v0, 1.5))
+    assert(approx_eq(v1, -2.5))
+    assert(approx_eq(v2, 3.25))
+    assert(approx_eq(v3, 0.0))
+
+    println("[export_test] GGUF F32 round-trip: PASS")
+}
+
+// ===================================================================
+//  Test 3: GGUF Q4_0 size check
+// ===================================================================
+
+@test
+fn test_gguf_q4_0_size() {
+    let mut data = []
+    let mut i = 0
+    while i < 64 {
+        data = data + [to_float(i) * 0.1 - 3.2]
+        i = i + 1
+    }
+
+    let tdefs = [
+        GgufTensorDef {
+            name: "q4_tensor",
+            shape: [64],
+            data: data,
+            ggml_type: 2
+        }
+    ]
+
+    let mut meta = gguf_meta_new()
+    meta = gguf_meta_add_string(meta, "general.architecture", "q4test")
+
+    let path = "/tmp/hexa_test_gguf_q4.gguf"
+    let nbytes = export_gguf(tdefs, meta[0], meta[1], path, 2)
+    assert(nbytes > 0)
+
+    let fsize = file_size(path)
+    assert(fsize == nbytes)
+
+    println("[export_test] GGUF Q4_0 size: PASS")
+}
+
+// ===================================================================
+//  Test 4: ONNX export basic structure
+// ===================================================================
+
+@test
+fn test_onnx_basic_export() {
+    let w_data = [1.0, 0.0, 0.0, 1.0]
+    let b_data = [0.5, 0.5]
+
+    let weights = [
+        OnnxWeightDef {
+            name: "W",
+            shape: [2, 2],
+            data: w_data
+        },
+        OnnxWeightDef {
+            name: "b",
+            shape: [2],
+            data: b_data
+        }
+    ]
+
+    let nodes = [
+        OnnxNodeDef {
+            inputs: ["input", "W"],
+            outputs: ["mm_out"],
+            name: "matmul_0",
+            op_type: "MatMul",
+            attributes: []
+        },
+        OnnxNodeDef {
+            inputs: ["mm_out", "b"],
+            outputs: ["output"],
+            name: "add_0",
+            op_type: "Add",
+            attributes: []
+        }
+    ]
+
+    let inputs = [
+        OnnxIODef {
+            name: "input",
+            shape: [1, 2],
+            elem_type: 1
+        }
+    ]
+
+    let outputs = [
+        OnnxIODef {
+            name: "output",
+            shape: [1, 2],
+            elem_type: 1
+        }
+    ]
+
+    let path = "/tmp/hexa_test_onnx.onnx"
+    let nbytes = export_onnx(weights, nodes, inputs, outputs, "test_graph", path)
+
+    assert(nbytes > 0)
+    let fsize = file_size(path)
+    assert(fsize == nbytes)
+
+    // Verify protobuf field 1 (ir_version) tag = 8
+    let bytes = read_file_bytes(path, 0, 4)
+    assert(bytes[0] == 8)
+
+    println("[export_test] ONNX basic export: PASS")
+}
+
+// ===================================================================
+//  Test 5: ONNX feedforward builder
+// ===================================================================
+
+@test
+fn test_onnx_feedforward() {
+    let in_dims = [4, 3]
+    let out_dims = [3, 2]
+    let activations = ["relu", "none"]
+
+    let w0 = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2]
+    let w1 = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
+    let b0 = [0.01, 0.02, 0.03]
+    let b1 = [0.01, 0.02]
+
+    let path = "/tmp/hexa_test_onnx_ff.onnx"
+    let nbytes = build_and_export_feedforward(in_dims, out_dims, activations, [w0, w1], [b0, b1], path)
+    assert(nbytes > 0)
+
+    println("[export_test] ONNX feedforward: PASS")
+}
+
+// ===================================================================
+//  Test 6: GGUF multi-tensor with metadata
+// ===================================================================
+
+@test
+fn test_gguf_multi_tensor_metadata() {
+    let d0 = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+    let d1 = [0.1, 0.2, 0.3, 0.4]
+    let d2 = [10.0, 20.0]
+
+    let tdefs = [
+        GgufTensorDef {
+            name: "embed.weight",
+            shape: [4, 2],
+            data: d0,
+            ggml_type: 0
+        },
+        GgufTensorDef {
+            name: "norm.weight",
+            shape: [4],
+            data: d1,
+            ggml_type: 0
+        },
+        GgufTensorDef {
+            name: "head.bias",
+            shape: [2],
+            data: d2,
+            ggml_type: 0
+        }
+    ]
+
+    let mut meta = gguf_meta_new()
+    meta = gguf_meta_add_string(meta, "general.architecture", "llama")
+    meta = gguf_meta_add_string(meta, "general.name", "test-model")
+    meta = gguf_meta_add_u32(meta, "llama.context_length", 512)
+    meta = gguf_meta_add_u32(meta, "llama.embedding_length", 4)
+    meta = gguf_meta_add_u32(meta, "llama.block_count", 1)
+
+    let path = "/tmp/hexa_test_gguf_multi.gguf"
+    let nbytes = export_gguf(tdefs, meta[0], meta[1], path, 0)
+    assert(nbytes > 0)
+
+    let bytes = read_file_bytes(path, 0, nbytes)
+
+    // Verify n_tensors = 3
+    let n_tensors = t_le_u64(bytes, 8)
+    assert(n_tensors == 3)
+
+    // Verify n_kv = 5
+    let n_kv = t_le_u64(bytes, 16)
+    assert(n_kv == 5)
+
+    println("[export_test] GGUF multi-tensor metadata: PASS")
+}
+
+// ===================================================================
+//  Test 7: GGUF export_gguf_simple convenience
+// ===================================================================
+
+@test
+fn test_gguf_simple_api() {
+    let names = ["a", "b"]
+    let shapes = [[4], [2, 2]]
+    let datas = [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]]
+
+    let mut meta = gguf_meta_new()
+    meta = gguf_meta_add_string(meta, "general.architecture", "simple")
+
+    let path = "/tmp/hexa_test_gguf_simple.gguf"
+    let nbytes = export_gguf_simple(names, shapes, datas, meta[0], meta[1], path, 0)
+    assert(nbytes > 0)
+
+    println("[export_test] GGUF simple API: PASS")
+}
+
+run_tests()
+println("[export_test] All export tests passed")

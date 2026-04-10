@@ -1,0 +1,164 @@
+// ===================================================================
+//  self/ml/gpu_kv_cache.hexa — KV-cache on GPU memory
+//
+//  Pre-allocated key/value buffers per layer on GPU.
+//  Append new K,V each decode step (no recompute).
+//
+//  Layout per layer:
+//    K buffer: [max_seq_len x dim]  (f32 on GPU)
+//    V buffer: [max_seq_len x dim]  (f32 on GPU)
+//
+//  Index: layer L, position P, element D
+//    offset = P * dim + D
+//    Each layer has its own contiguous dev_ptr.
+//
+//  Total GPU memory:
+//    2 * n_layers * max_seq_len * dim * 4 bytes
+//    e.g. 8 layers, 2048 seq, 512 dim = 2*8*2048*512*4 = 64 MB
+// ===================================================================
+
+use "cuda_ffi"
+use "gpu_tensor"
+
+// -- GpuKVCache: arrays of per-layer GPU pointers --
+// k_ptrs[layer] = device pointer to [max_seq x dim] f32 buffer
+// v_ptrs[layer] = device pointer to [max_seq x dim] f32 buffer
+struct GpuKVCache {
+    k_ptrs: array,
+    v_ptrs: array,
+    seq_len: int,
+    max_seq: int,
+    n_layers: int,
+    dim: int
+}
+
+// -- Allocate a new GPU KV cache (all zeros) --
+fn gpu_kv_cache_new(n_layers, max_seq, dim) {
+    let buf_size = max_seq * dim * 4
+    let mut k_ptrs = []
+    let mut v_ptrs = []
+    let mut i = 0
+    while i < n_layers {
+        let k_dev = cuda_malloc(buf_size)
+        let _ = cuda_memset_zero(k_dev, buf_size)
+        let v_dev = cuda_malloc(buf_size)
+        let _ = cuda_memset_zero(v_dev, buf_size)
+        k_ptrs = k_ptrs.push(k_dev)
+        v_ptrs = v_ptrs.push(v_dev)
+        i = i + 1
+    }
+    println("[gpu_kv_cache] allocated: " + str(n_layers) + " layers, max_seq=" + str(max_seq) + ", dim=" + str(dim) + " (" + str(2 * n_layers * buf_size / 1024 / 1024) + " MB)")
+    GpuKVCache {
+        k_ptrs: k_ptrs,
+        v_ptrs: v_ptrs,
+        seq_len: 0,
+        max_seq: max_seq,
+        n_layers: n_layers,
+        dim: dim
+    }
+}
+
+// -- Free all GPU memory --
+fn gpu_kv_cache_free(cache: GpuKVCache) {
+    let mut i = 0
+    while i < cache.n_layers {
+        let _ = cuda_free(cache.k_ptrs[i])
+        let _ = cuda_free(cache.v_ptrs[i])
+        i = i + 1
+    }
+    0
+}
+
+// -- Reset cache (zero fill, reset seq_len) --
+fn gpu_kv_cache_reset(cache: GpuKVCache) {
+    let buf_size = cache.max_seq * cache.dim * 4
+    let mut i = 0
+    while i < cache.n_layers {
+        let _ = cuda_memset_zero(cache.k_ptrs[i], buf_size)
+        let _ = cuda_memset_zero(cache.v_ptrs[i], buf_size)
+        i = i + 1
+    }
+    GpuKVCache {
+        k_ptrs: cache.k_ptrs,
+        v_ptrs: cache.v_ptrs,
+        seq_len: 0,
+        max_seq: cache.max_seq,
+        n_layers: cache.n_layers,
+        dim: cache.dim
+    }
+}
+
+// -- Append K,V for a single position at a given layer --
+// k_gt, v_gt: GpuTensor [1 x dim] (single token's K, V projection)
+// pos: the sequence position to write to
+// Copies k_gt data into k_ptrs[layer] at offset pos*dim
+fn gpu_kv_cache_append(cache: GpuKVCache, layer, pos, k_gt, v_gt) {
+    let dim = cache.dim
+    let byte_offset = pos * dim * 4
+    let nbytes = dim * 4
+    // D2D copy from k_gt device ptr into the layer's K buffer at offset
+    let k_dst = ptr_offset(cache.k_ptrs[layer], byte_offset)
+    let v_dst = ptr_offset(cache.v_ptrs[layer], byte_offset)
+    let _ = cuda_memcpy_d2d(k_dst, gt_ptr(k_gt), nbytes)
+    let _ = cuda_memcpy_d2d(v_dst, gt_ptr(v_gt), nbytes)
+    // Update seq_len
+    let new_seq = pos + 1
+    if new_seq > cache.seq_len {
+        return GpuKVCache {
+            k_ptrs: cache.k_ptrs,
+            v_ptrs: cache.v_ptrs,
+            seq_len: new_seq,
+            max_seq: cache.max_seq,
+            n_layers: cache.n_layers,
+            dim: cache.dim
+        }
+    }
+    cache
+}
+
+// -- Append K,V for a batch of positions (prefill) --
+// k_gt, v_gt: GpuTensor [seq_len x dim]
+// start_pos: position of the first token
+fn gpu_kv_cache_append_batch(cache: GpuKVCache, layer, start_pos, seq_len, k_gt, v_gt) {
+    let dim = cache.dim
+    let byte_offset = start_pos * dim * 4
+    let nbytes = seq_len * dim * 4
+    let k_dst = ptr_offset(cache.k_ptrs[layer], byte_offset)
+    let v_dst = ptr_offset(cache.v_ptrs[layer], byte_offset)
+    let _ = cuda_memcpy_d2d(k_dst, gt_ptr(k_gt), nbytes)
+    let _ = cuda_memcpy_d2d(v_dst, gt_ptr(v_gt), nbytes)
+    let new_seq = start_pos + seq_len
+    if new_seq > cache.seq_len {
+        return GpuKVCache {
+            k_ptrs: cache.k_ptrs,
+            v_ptrs: cache.v_ptrs,
+            seq_len: new_seq,
+            max_seq: cache.max_seq,
+            n_layers: cache.n_layers,
+            dim: cache.dim
+        }
+    }
+    cache
+}
+
+// -- Get cached K as GpuTensor [cur_seq x dim] for a layer --
+// Returns a GpuTensor wrapping the existing buffer (no copy).
+// Only valid for positions 0..cache.seq_len-1.
+fn gpu_kv_cache_get_k(cache: GpuKVCache, layer) {
+    gpu_tensor_make(cache.k_ptrs[layer], cache.seq_len, cache.dim, DTYPE_F32)
+}
+
+fn gpu_kv_cache_get_v(cache: GpuKVCache, layer) {
+    gpu_tensor_make(cache.v_ptrs[layer], cache.seq_len, cache.dim, DTYPE_F32)
+}
+
+// -- Get K/V up to a specific length (for decode step attention) --
+fn gpu_kv_cache_get_k_len(cache: GpuKVCache, layer, seq_len) {
+    gpu_tensor_make(cache.k_ptrs[layer], seq_len, cache.dim, DTYPE_F32)
+}
+
+fn gpu_kv_cache_get_v_len(cache: GpuKVCache, layer, seq_len) {
+    gpu_tensor_make(cache.v_ptrs[layer], seq_len, cache.dim, DTYPE_F32)
+}
+
+println("[gpu_kv_cache] module loaded — GPU KV-cache with pre-allocated per-layer buffers")

@@ -1,0 +1,170 @@
+// ═══════════════════════════════════════════════════════════════
+//  train_gpu.hexa — GPU training loop for 100M transformer
+//
+//  Full pipeline:
+//    1. Initialize CUDA + cuBLAS
+//    2. Create model weights on GPU
+//    3. Create optimizer state (AdamW with m1/m2 on GPU)
+//    4. Training loop:
+//       a. Generate random tokens (synthetic data)
+//       b. H2D: upload tokens
+//       c. Forward pass (all on GPU)
+//       d. Cross-entropy loss
+//       e. Backward pass (all on GPU)
+//       f. Gradient clipping
+//       g. AdamW step (on GPU)
+//       h. D2H: loss scalar only
+//
+//  Only two transfers per step: tokens H2D + loss D2H.
+// ═══════════════════════════════════════════════════════════════
+
+use "cuda_ffi"
+use "gpu_tensor"
+use "gpu_grad_engine"
+use "gpu_optimizer"
+use "model_100m_gpu"
+
+// ── Training config ──────────────────────────────────────────
+let TRAIN_STEPS   = 100
+let WARMUP_STEPS  = 10
+let PEAK_LR       = 3.0e-4
+let MIN_LR        = 3.0e-5
+let MAX_GRAD_NORM = 1.0
+let LOG_INTERVAL  = 1
+
+// ── Synthetic data generator ─────────────────────────────────
+// Generates random token sequences for training
+fn make_batch(seq_len, vocab_size) {
+    let mut tokens = []
+    let mut targets = []
+    let mut i = 0
+    while i < seq_len {
+        let tok = int(random() * vocab_size) % vocab_size
+        tokens = tokens.push(tok)
+        i = i + 1
+    }
+    // Targets: shifted by 1 (next-token prediction)
+    i = 0
+    while i < seq_len {
+        if i < seq_len - 1 {
+            targets = targets.push(tokens[i + 1])
+        } else {
+            targets = targets.push(int(random() * vocab_size) % vocab_size)
+        }
+        i = i + 1
+    }
+    [tokens, targets]
+}
+
+// ── Main training function ───────────────────────────────────
+fn train() {
+    println("=" * 60)
+    println("  GPU Training: 100M Transformer")
+    println("  Pure hexa + CUDA FFI")
+    println("=" * 60)
+
+    // Initialize CUDA
+    let cuda_err = cuda_init()
+    if cuda_err != 0 {
+        println("[FATAL] CUDA initialization failed: " + str(cuda_err))
+        return -1
+    }
+    let _ = cuda_mem_info()
+
+    // Initialize model weights on GPU
+    let weights = init_model_weights()
+    let _ = cuda_mem_info()
+
+    // Create optimizer state for all parameters
+    let all_params = model_params(weights)
+    let n_params = len(all_params)
+    println("[train] creating AdamW state for " + str(n_params) + " parameter tensors...")
+
+    let mut opt_states = []
+    let mut i = 0
+    while i < n_params {
+        opt_states = opt_states.push(adam_state_create(all_params[i]))
+        i = i + 1
+    }
+    println("[train] optimizer ready")
+    let _ = cuda_mem_info()
+
+    // Training loop
+    println("")
+    println("[train] starting training for " + str(TRAIN_STEPS) + " steps")
+    println("-" * 60)
+
+    let mut total_time = 0.0
+    let mut total_loss = 0.0
+    let seq = GPU_SEQ
+
+    let mut step = 1
+    while step <= TRAIN_STEPS {
+        let t0 = clock()
+
+        // Generate batch
+        let batch = make_batch(seq, GPU_VOCAB)
+        let tokens = batch[0]
+        let targets = batch[1]
+
+        // Forward + backward
+        tape_clear()
+        grad_table_clear()
+
+        let logits = model_forward(weights, tokens, seq)
+        let ce_result = gpu_cross_entropy_loss(logits, targets)
+        let loss = ce_result[0]
+
+        // Backward pass
+        let _ = backward(ce_result[1])
+        let _ = cuda_sync()
+
+        // Get gradients
+        let grads = model_grads(weights)
+
+        // Gradient clipping
+        let grad_norm = gpu_clip_grad_norm(grads, MAX_GRAD_NORM)
+
+        // Learning rate
+        let lr = lr_cosine(step, WARMUP_STEPS, TRAIN_STEPS, PEAK_LR, MIN_LR)
+
+        // AdamW update
+        i = 0
+        while i < n_params {
+            let _ = adam_step(opt_states[i], grads[i], lr, step)
+            i = i + 1
+        }
+        let _ = cuda_sync()
+
+        let t1 = clock()
+        let ms = (t1 - t0) * 1000.0
+        total_time = total_time + ms
+        total_loss = total_loss + loss
+
+        // Log
+        if step % LOG_INTERVAL == 0 {
+            let avg_loss = total_loss / (step * 1.0)
+            println("step=" + str(step) + " loss=" + str(loss) + " lr=" + str(lr) + " gnorm=" + str(grad_norm) + " ms=" + str(ms) + " avg_loss=" + str(avg_loss))
+        }
+
+        step = step + 1
+    }
+
+    // Summary
+    println("")
+    println("=" * 60)
+    println("  Training complete!")
+    println("  Steps:     " + str(TRAIN_STEPS))
+    println("  Avg loss:  " + str(total_loss / (TRAIN_STEPS * 1.0)))
+    println("  Total time:" + str(total_time) + " ms")
+    println("  Avg ms/step:" + str(total_time / (TRAIN_STEPS * 1.0)))
+    println("  Params:    " + str(model_param_count()))
+    println("=" * 60)
+
+    // Cleanup
+    let _ = cuda_shutdown()
+    0
+}
+
+// ── Entry point ──────────────────────────────────────────────
+let _ = train()

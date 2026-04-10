@@ -1,0 +1,266 @@
+// ===================================================================
+//  self/ml/gpu_generate.hexa — GPU Generation Loop
+//
+//  End-to-end pipeline:
+//    1. Initialize CUDA + cuBLAS
+//    2. Load/init model weights on GPU
+//    3. Prefill prompt tokens (fill KV-cache)
+//    4. Decode loop (single-token, stream output)
+//    5. Print tok/s stats
+//
+//  Usage:
+//    hexa self/ml/gpu_generate.hexa [prompt] [max_tokens] [temperature]
+//
+//  Default: random weights (103M), greedy, 64 tokens.
+//  For real models: load GGUF -> upload to GPU -> run.
+// ===================================================================
+
+use "cuda_ffi"
+use "gpu_tensor"
+use "gpu_kv_cache"
+use "gpu_inference"
+use "gpu_sampler"
+
+// ===================================================================
+//  Minimal byte-level tokenizer (same as generate.hexa)
+//  Llama byte tokens: token_id = byte_value + 3, BOS=1, EOS=2
+// ===================================================================
+fn gpu_byte_tokenize(text) {
+    let mut tokens = [1]
+    let n = len(text)
+    let mut i = 0
+    while i < n {
+        let ch = char_code(text, i)
+        tokens = tokens.push(ch + 3)
+        i = i + 1
+    }
+    tokens
+}
+
+fn gpu_token_to_str(token_id) {
+    if token_id <= 2 { return "" }
+    let byte_val = token_id - 3
+    if byte_val >= 32 {
+        if byte_val < 127 {
+            return chr(byte_val)
+        }
+    }
+    "?"
+}
+
+// ===================================================================
+//  Xavier random weight initialization (CPU then upload)
+// ===================================================================
+fn xinit_inference(fan_in, fan_out) {
+    let n = fan_in * fan_out
+    let scale = sqrt(2.0 / (fan_in * 1.0))
+    let cpu_t = tensor(randn(n, scale))
+    gpu_tensor_from_cpu(cpu_t, fan_in, fan_out)
+}
+
+fn init_random_model(cfg: GpuModelConfig) {
+    println("[gpu_generate] initializing " + str(cfg.n_layers) + "-layer random model on GPU...")
+    let t0 = clock()
+
+    let W_emb = xinit_inference(cfg.vocab_size, cfg.dim)
+
+    let mut Wq = []
+    let mut Wk = []
+    let mut Wv = []
+    let mut Wo = []
+    let mut Wg = []
+    let mut Wu = []
+    let mut Wd = []
+    let mut i = 0
+    while i < cfg.n_layers {
+        Wq = Wq.push(xinit_inference(cfg.dim, cfg.dim))
+        Wk = Wk.push(xinit_inference(cfg.dim, cfg.dim))
+        Wv = Wv.push(xinit_inference(cfg.dim, cfg.dim))
+        Wo = Wo.push(xinit_inference(cfg.dim, cfg.dim))
+        Wg = Wg.push(xinit_inference(cfg.dim, cfg.ff_dim))
+        Wu = Wu.push(xinit_inference(cfg.dim, cfg.ff_dim))
+        Wd = Wd.push(xinit_inference(cfg.ff_dim, cfg.dim))
+        i = i + 1
+    }
+
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+
+    let emb_p = cfg.vocab_size * cfg.dim
+    let layer_p = 4 * cfg.dim * cfg.dim + 3 * cfg.dim * cfg.ff_dim
+    let total_p = emb_p + cfg.n_layers * layer_p
+    println("[gpu_generate] " + str(total_p) + " params initialized in " + str(ms) + " ms")
+
+    let weights = [W_emb, Wq, Wk, Wv, Wo, Wg, Wu, Wd]
+    gpu_model_from_weights(weights, cfg)
+}
+
+// ===================================================================
+//  Main generation function
+// ===================================================================
+fn gpu_generate(prompt, max_tokens, temperature) {
+    println("===== GPU Inference Engine =====")
+
+    // Initialize CUDA
+    let cuda_err = cuda_init()
+    if cuda_err != 0 {
+        println("[gpu_generate] CUDA init failed: " + str(cuda_err))
+        return -1
+    }
+    let _ = cuda_mem_info()
+
+    // Model config
+    let cfg = default_model_config()
+
+    // Init random model
+    let mut model = init_random_model(cfg)
+
+    // Setup sampler
+    let sampler = GpuSamplerConfig {
+        temperature: temperature,
+        top_k: 40,
+        top_p: 0.9,
+        seed: 42
+    }
+    gpu_sampler_set_seed(42)
+
+    // Tokenize prompt
+    let tokens = gpu_byte_tokenize(prompt)
+    let prompt_len = len(tokens)
+    println("[gpu_generate] prompt: \"" + prompt + "\" (" + str(prompt_len) + " tokens)")
+    println("[gpu_generate] max_tokens: " + str(max_tokens) + ", temperature: " + str(temperature))
+
+    // ========== PREFILL ==========
+    println("[gpu_generate] prefilling...")
+    let t_prefill_start = clock()
+
+    let prefill_result = gpu_prefill(model, tokens, prompt_len)
+    let prefill_logits = prefill_result[0]
+    model = prefill_result[1]
+
+    let _ = cuda_sync()
+    let t_prefill_end = clock()
+    let prefill_ms = (t_prefill_end - t_prefill_start) * 1000.0
+    let prefill_tok_s = to_float(prompt_len) / (prefill_ms / 1000.0)
+    println("[gpu_generate] prefill: " + str(prompt_len) + " tokens in " + str(prefill_ms) + " ms (" + str(prefill_tok_s) + " tok/s)")
+
+    // Sample first generated token from prefill logits
+    let mut cur_tok = gpu_sample_last_token(prefill_logits, prompt_len, cfg.vocab_size, sampler)
+    gpu_tensor_free(prefill_logits)
+
+    // Print prompt echo
+    print("[output] ")
+    let mut pi = 0
+    while pi < prompt_len {
+        print(gpu_token_to_str(tokens[pi]))
+        pi = pi + 1
+    }
+
+    // Print first generated token
+    print(gpu_token_to_str(cur_tok))
+
+    // ========== DECODE LOOP ==========
+    let t_decode_start = clock()
+    let mut decode_pos = prompt_len
+    let mut generated = 1
+    let mut tok_times = []
+
+    while generated < max_tokens {
+        if cur_tok == 2 {
+            // EOS
+            generated = max_tokens
+        } else {
+            let t0 = clock()
+
+            let decode_result = gpu_decode(model, cur_tok, decode_pos)
+            let logits = decode_result[0]
+            model = decode_result[1]
+
+            let _ = cuda_sync()
+
+            let next_tok = gpu_sample_token(logits, cfg.vocab_size, sampler)
+            gpu_tensor_free(logits)
+
+            let t1 = clock()
+            let ms = (t1 - t0) * 1000.0
+            tok_times = tok_times.push(ms)
+
+            // Stream output
+            print(gpu_token_to_str(next_tok))
+
+            cur_tok = next_tok
+            decode_pos = decode_pos + 1
+            generated = generated + 1
+        }
+    }
+
+    let t_decode_end = clock()
+    let decode_ms = (t_decode_end - t_decode_start) * 1000.0
+
+    println("")
+    println("===== Generation Complete =====")
+
+    // ========== STATS ==========
+    let n_gen = len(tok_times)
+    if n_gen > 0 {
+        let mut sum_ms = 0.0
+        let mut best_ms = tok_times[0]
+        let mut worst_ms = tok_times[0]
+        let mut i = 0
+        while i < n_gen {
+            sum_ms = sum_ms + tok_times[i]
+            if tok_times[i] < best_ms { best_ms = tok_times[i] }
+            if tok_times[i] > worst_ms { worst_ms = tok_times[i] }
+            i = i + 1
+        }
+        let avg_ms = sum_ms / to_float(n_gen)
+        let tok_s = 1000.0 / avg_ms
+
+        println("[gpu_generate] Decode stats:")
+        println("  tokens:   " + str(n_gen))
+        println("  total:    " + str(decode_ms) + " ms")
+        println("  avg:      " + str(avg_ms) + " ms/tok")
+        println("  tok/s:    " + str(tok_s))
+        println("  best:     " + str(best_ms) + " ms/tok (" + str(1000.0 / best_ms) + " tok/s)")
+        println("  worst:    " + str(worst_ms) + " ms/tok")
+        println("  prefill:  " + str(prefill_ms) + " ms (" + str(prefill_tok_s) + " tok/s)")
+
+        // GPU memory after generation
+        let _ = cuda_mem_info()
+
+        // JSON summary
+        let mut line = "{\"engine\":\"gpu_hexa\""
+        line = line + ",\"params\":" + str(cfg.n_layers * (4 * cfg.dim * cfg.dim + 3 * cfg.dim * cfg.ff_dim) + cfg.vocab_size * cfg.dim)
+        line = line + ",\"decode_tokens\":" + str(n_gen)
+        line = line + ",\"decode_avg_ms\":" + str(avg_ms)
+        line = line + ",\"decode_tok_s\":" + str(tok_s)
+        line = line + ",\"prefill_tokens\":" + str(prompt_len)
+        line = line + ",\"prefill_ms\":" + str(prefill_ms)
+        line = line + ",\"prefill_tok_s\":" + str(prefill_tok_s)
+        line = line + "}"
+        println(line)
+    } else {
+        println("[gpu_generate] no tokens decoded")
+    }
+
+    // Cleanup
+    let _ = gpu_model_free(model)
+    let _ = cuda_shutdown()
+    0
+}
+
+// ===================================================================
+//  CLI entry point
+// ===================================================================
+let args = argv()
+let n_args = len(args)
+
+let mut prompt = "The future of programming is"
+let mut max_tokens = 64
+let mut temperature = 0.0
+
+if n_args > 1 { prompt = args[1] }
+if n_args > 2 { max_tokens = to_int(args[2]) }
+if n_args > 3 { temperature = to_float(args[3]) }
+
+gpu_generate(prompt, max_tokens, temperature)

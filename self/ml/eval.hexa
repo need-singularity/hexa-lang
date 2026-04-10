@@ -1,0 +1,492 @@
+// ===================================================================
+//  self/ml/eval.hexa — ML Evaluation Metrics in pure Hexa
+//
+//  Metrics:
+//    perplexity(logits_seq, targets)   — cross-entropy based perplexity
+//    accuracy(predictions, labels)     — top-1 accuracy
+//    top_k_accuracy(predictions, labels, k) — top-k accuracy
+//    bleu_score(hypothesis, reference) — BLEU-4 score
+//    rouge_l_score(hypothesis, reference) — ROUGE-L (F1)
+//    f1_score(predictions, labels, num_classes) — micro/macro F1
+//    confusion_matrix(predictions, labels, num_classes)
+//
+//  All functions are pure Hexa — no FFI, no libc.
+//  Math: exp(), ln_eval(), sqrt() are builtins or defined here.
+// ===================================================================
+
+// ── math helpers ────────────────────────────────────────────────
+
+@pure fn abs_val(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// ln(x) via argument reduction + series
+@pure fn ln_eval(x: float) -> float {
+    if x <= 0.0 { return 0.0 - 1000000.0 }
+    let mut m = x
+    let mut k = 0
+    while m >= 2.0 {
+        m = m / 2.0
+        k = k + 1
+    }
+    while m < 1.0 {
+        m = m * 2.0
+        k = k - 1
+    }
+    let y = (m - 1.0) / (m + 1.0)
+    let y2 = y * y
+    let mut term = y
+    let mut sum = 0.0
+    let mut i = 0
+    while i < 20 {
+        sum = sum + term / (2.0 * to_float(i) * 2.0 + 1.0)
+        term = term * y2
+        i = i + 1
+    }
+    let ln2 = 0.6931471805599453
+    return 2.0 * sum + to_float(k) * ln2
+}
+
+// ── softmax (numerically stable) ────────────────────────────────
+
+fn eval_softmax(logits, n: int) {
+    let mut mx = logits[0]
+    let mut i = 1
+    while i < n {
+        if logits[i] > mx { mx = logits[i] }
+        i = i + 1
+    }
+    let mut probs = []
+    let mut sum_e = 0.0
+    i = 0
+    while i < n {
+        let e = exp(logits[i] - mx)
+        probs = probs + [e]
+        sum_e = sum_e + e
+        i = i + 1
+    }
+    let inv = 1.0 / sum_e
+    i = 0
+    while i < n {
+        probs[i] = probs[i] * inv
+        i = i + 1
+    }
+    return probs
+}
+
+// ── argmax helper ───────────────────────────────────────────────
+
+fn eval_argmax(arr, n: int) -> int {
+    let mut best_i = 0
+    let mut best_v = arr[0]
+    let mut i = 1
+    while i < n {
+        if arr[i] > best_v {
+            best_v = arr[i]
+            best_i = i
+        }
+        i = i + 1
+    }
+    return best_i
+}
+
+// ===================================================================
+//  Perplexity — exp(mean cross-entropy)
+//
+//  logits_seq: array of logit arrays (one per timestep)
+//  targets:    array of target token IDs
+//  vocab_size: vocabulary size
+//
+//  PPL = exp( -(1/T) * sum_t log P(target_t) )
+// ===================================================================
+
+fn perplexity(logits_seq, targets, vocab_size: int) -> float {
+    let T = len(targets)
+    if T == 0 { return 1.0 }
+    let mut sum_log_prob = 0.0
+    let mut t = 0
+    while t < T {
+        let logits = logits_seq[t]
+        let probs = eval_softmax(logits, vocab_size)
+        let target_id = targets[t]
+        let p = probs[target_id]
+        let lp = ln_eval(p)
+        sum_log_prob = sum_log_prob + lp
+        t = t + 1
+    }
+    let mean_nll = 0.0 - sum_log_prob / to_float(T)
+    return exp(mean_nll)
+}
+
+// ===================================================================
+//  Accuracy — top-1
+//
+//  predictions: array of predicted class IDs
+//  labels:      array of true class IDs
+// ===================================================================
+
+fn accuracy(predictions, labels) -> float {
+    let n = len(predictions)
+    if n == 0 { return 0.0 }
+    let mut correct = 0
+    let mut i = 0
+    while i < n {
+        if predictions[i] == labels[i] {
+            correct = correct + 1
+        }
+        i = i + 1
+    }
+    return to_float(correct) / to_float(n)
+}
+
+// ===================================================================
+//  Top-k Accuracy
+//
+//  logits_list: array of logit arrays (one per sample)
+//  labels:      array of true class IDs
+//  k:           how many top predictions to consider
+//  vocab_size:  size of each logit array
+// ===================================================================
+
+fn top_k_accuracy(logits_list, labels, k: int, vocab_size: int) -> float {
+    let n = len(labels)
+    if n == 0 { return 0.0 }
+    let mut correct = 0
+    let mut i = 0
+    while i < n {
+        let logits = logits_list[i]
+        // find top-k indices by repeated argmax with masking
+        let mut top_ids = []
+        let mut masked = []
+        let mut j = 0
+        while j < vocab_size {
+            masked = masked + [logits[j]]
+            j = j + 1
+        }
+        let mut ki = 0
+        while ki < k {
+            let best = eval_argmax(masked, vocab_size)
+            top_ids = top_ids + [best]
+            masked[best] = 0.0 - 1000000.0
+            ki = ki + 1
+        }
+        // check if true label in top-k
+        let mut found = false
+        let mut ti = 0
+        while ti < k {
+            if top_ids[ti] == labels[i] {
+                found = true
+            }
+            ti = ti + 1
+        }
+        if found { correct = correct + 1 }
+        i = i + 1
+    }
+    return to_float(correct) / to_float(n)
+}
+
+// ===================================================================
+//  BLEU-4 Score
+//
+//  hypothesis: array of token strings (or IDs)
+//  reference:  array of token strings (or IDs)
+//
+//  BLEU = BP * exp( (1/4) * sum_{n=1}^{4} ln(p_n) )
+//  BP = min(1, exp(1 - ref_len/hyp_len))
+// ===================================================================
+
+// count matching n-grams between hypothesis and reference
+fn count_ngram_matches(hyp, ref, n: int) -> int {
+    let hyp_len = len(hyp)
+    let ref_len = len(ref)
+    if hyp_len < n { return 0 }
+    if ref_len < n { return 0 }
+
+    // brute-force: for each hyp n-gram, check if any ref n-gram matches
+    // track which ref n-grams are already used (clipped count)
+    let ref_count = ref_len - n + 1
+    let mut used = []
+    let mut ri = 0
+    while ri < ref_count {
+        used = used + [false]
+        ri = ri + 1
+    }
+
+    let mut matches = 0
+    let mut hi = 0
+    let hyp_count = hyp_len - n + 1
+    while hi < hyp_count {
+        // extract hyp n-gram
+        let mut rj = 0
+        let mut found = false
+        while rj < ref_count {
+            if used[rj] == false {
+                // compare n tokens
+                let mut eq = true
+                let mut k = 0
+                while k < n {
+                    if hyp[hi + k] != ref[rj + k] {
+                        eq = false
+                    }
+                    k = k + 1
+                }
+                if eq {
+                    matches = matches + 1
+                    used[rj] = true
+                    found = true
+                    rj = ref_count  // break
+                }
+            }
+            rj = rj + 1
+        }
+        hi = hi + 1
+    }
+    return matches
+}
+
+fn bleu_score(hypothesis, reference) -> float {
+    let hyp_len = len(hypothesis)
+    let ref_len = len(reference)
+    if hyp_len == 0 { return 0.0 }
+    if ref_len == 0 { return 0.0 }
+
+    // Brevity penalty
+    let mut bp = 1.0
+    if hyp_len < ref_len {
+        bp = exp(1.0 - to_float(ref_len) / to_float(hyp_len))
+    }
+
+    // Compute precision for n=1..4
+    let mut log_sum = 0.0
+    let mut valid_n = 0
+    let mut n = 1
+    while n <= 4 {
+        let total = hyp_len - n + 1
+        if total <= 0 {
+            n = n + 1
+            // skip: not enough tokens for this n-gram order
+        } else {
+            let matches = count_ngram_matches(hypothesis, reference, n)
+            if matches > 0 {
+                let precision = to_float(matches) / to_float(total)
+                log_sum = log_sum + ln_eval(precision)
+                valid_n = valid_n + 1
+            } else {
+                // smoothing: use small epsilon to avoid ln(0)
+                log_sum = log_sum + ln_eval(0.0001)
+                valid_n = valid_n + 1
+            }
+            n = n + 1
+        }
+    }
+
+    if valid_n == 0 { return 0.0 }
+    return bp * exp(log_sum / to_float(valid_n))
+}
+
+// ===================================================================
+//  ROUGE-L Score (Longest Common Subsequence based)
+//
+//  hypothesis: array of tokens
+//  reference:  array of tokens
+//
+//  ROUGE-L F1 = (2 * P * R) / (P + R)
+//  P = LCS / hyp_len, R = LCS / ref_len
+// ===================================================================
+
+fn lcs_length(a, b) -> int {
+    let m = len(a)
+    let n = len(b)
+    if m == 0 { return 0 }
+    if n == 0 { return 0 }
+
+    // DP table: (m+1) * (n+1) flattened
+    let total = (m + 1) * (n + 1)
+    let mut dp = []
+    let mut idx = 0
+    while idx < total {
+        dp = dp + [0]
+        idx = idx + 1
+    }
+
+    let mut i = 1
+    while i <= m {
+        let mut j = 1
+        while j <= n {
+            if a[i - 1] == b[j - 1] {
+                dp[i * (n + 1) + j] = dp[(i - 1) * (n + 1) + (j - 1)] + 1
+            } else {
+                let up = dp[(i - 1) * (n + 1) + j]
+                let left = dp[i * (n + 1) + (j - 1)]
+                if up > left {
+                    dp[i * (n + 1) + j] = up
+                } else {
+                    dp[i * (n + 1) + j] = left
+                }
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return dp[m * (n + 1) + n]
+}
+
+fn rouge_l_score(hypothesis, reference) -> float {
+    let hyp_len = len(hypothesis)
+    let ref_len = len(reference)
+    if hyp_len == 0 { return 0.0 }
+    if ref_len == 0 { return 0.0 }
+
+    let lcs = lcs_length(hypothesis, reference)
+    if lcs == 0 { return 0.0 }
+
+    let precision = to_float(lcs) / to_float(hyp_len)
+    let recall = to_float(lcs) / to_float(ref_len)
+    return 2.0 * precision * recall / (precision + recall)
+}
+
+// ===================================================================
+//  F1 Score — Micro and Macro
+//
+//  predictions: array of predicted class IDs
+//  labels:      array of true class IDs
+//  num_classes: number of distinct classes
+//
+//  Returns [micro_f1, macro_f1]
+// ===================================================================
+
+fn f1_score(predictions, labels, num_classes: int) {
+    let n = len(predictions)
+
+    // per-class TP, FP, FN
+    let mut tp = []
+    let mut fp = []
+    let mut fn_arr = []
+    let mut c = 0
+    while c < num_classes {
+        tp = tp + [0]
+        fp = fp + [0]
+        fn_arr = fn_arr + [0]
+        c = c + 1
+    }
+
+    let mut i = 0
+    while i < n {
+        let pred = predictions[i]
+        let true_label = labels[i]
+        if pred == true_label {
+            tp[pred] = tp[pred] + 1
+        } else {
+            fp[pred] = fp[pred] + 1
+            fn_arr[true_label] = fn_arr[true_label] + 1
+        }
+        i = i + 1
+    }
+
+    // Micro F1: aggregate TP, FP, FN across all classes
+    let mut total_tp = 0
+    let mut total_fp = 0
+    let mut total_fn = 0
+    c = 0
+    while c < num_classes {
+        total_tp = total_tp + tp[c]
+        total_fp = total_fp + fp[c]
+        total_fn = total_fn + fn_arr[c]
+        c = c + 1
+    }
+
+    let mut micro_f1 = 0.0
+    if total_tp > 0 {
+        let micro_p = to_float(total_tp) / to_float(total_tp + total_fp)
+        let micro_r = to_float(total_tp) / to_float(total_tp + total_fn)
+        micro_f1 = 2.0 * micro_p * micro_r / (micro_p + micro_r)
+    }
+
+    // Macro F1: average per-class F1
+    let mut sum_f1 = 0.0
+    let mut active_classes = 0
+    c = 0
+    while c < num_classes {
+        let support = tp[c] + fn_arr[c]
+        if support > 0 {
+            let denom_p = tp[c] + fp[c]
+            let denom_r = tp[c] + fn_arr[c]
+            if tp[c] > 0 {
+                let p_c = to_float(tp[c]) / to_float(denom_p)
+                let r_c = to_float(tp[c]) / to_float(denom_r)
+                sum_f1 = sum_f1 + 2.0 * p_c * r_c / (p_c + r_c)
+            }
+            active_classes = active_classes + 1
+        }
+        c = c + 1
+    }
+
+    let mut macro_f1 = 0.0
+    if active_classes > 0 {
+        macro_f1 = sum_f1 / to_float(active_classes)
+    }
+
+    return [micro_f1, macro_f1]
+}
+
+// ===================================================================
+//  Confusion Matrix
+//
+//  predictions: array of predicted class IDs
+//  labels:      array of true class IDs
+//  num_classes: number of distinct classes
+//
+//  Returns flat array of size num_classes * num_classes
+//  cm[true * num_classes + pred] = count
+// ===================================================================
+
+fn confusion_matrix(predictions, labels, num_classes: int) {
+    let total = num_classes * num_classes
+    let mut cm = []
+    let mut idx = 0
+    while idx < total {
+        cm = cm + [0]
+        idx = idx + 1
+    }
+
+    let n = len(predictions)
+    let mut i = 0
+    while i < n {
+        let true_c = labels[i]
+        let pred_c = predictions[i]
+        cm[true_c * num_classes + pred_c] = cm[true_c * num_classes + pred_c] + 1
+        i = i + 1
+    }
+    return cm
+}
+
+// ===================================================================
+//  Print confusion matrix
+// ===================================================================
+
+fn print_confusion_matrix(cm, num_classes: int) {
+    println("Confusion Matrix (" + str(num_classes) + " classes):")
+    let mut header = "     "
+    let mut c = 0
+    while c < num_classes {
+        header = header + "  P" + str(c)
+        c = c + 1
+    }
+    println(header)
+
+    let mut r = 0
+    while r < num_classes {
+        let mut row_str = "T" + str(r) + "   "
+        let mut c2 = 0
+        while c2 < num_classes {
+            let val = cm[r * num_classes + c2]
+            row_str = row_str + "  " + str(val)
+            c2 = c2 + 1
+        }
+        println(row_str)
+        r = r + 1
+    }
+}
+
+println("[eval] loaded — perplexity, accuracy, top_k_accuracy, bleu, rouge_l, f1, confusion_matrix")

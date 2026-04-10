@@ -1,0 +1,217 @@
+// ===================================================================
+//  self/ml/t1_real_bench.hexa — REAL 7B Q4 Inference Benchmark
+//
+//  This is NOT a fake benchmark. It loads a real GGUF model file
+//  and runs actual transformer inference with Q4_0 dequantize-on-the-fly.
+//
+//  Usage:
+//    hexa self/ml/t1_real_bench.hexa <gguf_path> [n_tokens] [n_warmup]
+//
+//  Physical ceiling:
+//    DDR4 ~50 GB/s, 7B Q4_0 = 3.5 GB -> max ~14 tok/s (71 ms/tok)
+//    M1 Max ~400 GB/s -> max ~114 tok/s
+//    Ryzen 7950X DDR5 ~75 GB/s -> max ~21 tok/s
+//
+//  Output: JSON one-liner with real timing data.
+// ===================================================================
+
+// ===================================================================
+//  Benchmark harness
+// ===================================================================
+fn run_bench(model_path, n_tokens, n_warmup) {
+    println("[t1_real_bench] Loading model: " + model_path)
+    let t_load_start = clock()
+    let model = llama_load(model_path)
+    let t_load_end = clock()
+    let load_ms = (t_load_end - t_load_start) * 1000.0
+    println("[t1_real_bench] Model loaded in " + str(load_ms) + " ms")
+
+    let cfg = model.config
+    let dim = cfg.dim
+    let vocab_size = cfg.vocab_size
+    let n_layers = cfg.n_layers
+
+    // Compute model size in bytes (Q4_0)
+    // Each weight matrix row: (cols/32) * 18 bytes
+    // Per layer: ~7 matrices of various sizes
+    // Rough: 7B params * 0.5 bytes/param = 3.5 GB
+    let model_bytes = 3500000000.0
+    println("[t1_real_bench] Estimated model size: " + str(model_bytes / 1000000000.0) + " GB (Q4_0)")
+
+    // Setup greedy sampler
+    let sampler = greedy_sampler()
+    sampler_set_seed(12345)
+
+    // Initialize KV cache
+    let kv_init = init_kv_cache(cfg)
+    let mut kv_keys = kv_init[0]
+    let mut kv_vals = kv_init[1]
+
+    // Use BOS token as starting point
+    let start_token = 1  // BOS
+
+    println("[t1_real_bench] Warming up (" + str(n_warmup) + " tokens)...")
+
+    // === Warmup ===
+    let mut cur_tok = start_token
+    let mut pos = 0
+
+    let mut w = 0
+    while w < n_warmup {
+        let emb = load_embedding(model, cur_tok)
+        let result = transformer_forward(model, emb, pos, kv_keys, kv_vals)
+        let logits = result[0]
+        kv_keys = result[1]
+        kv_vals = result[2]
+        cur_tok = sample_token(logits, vocab_size, sampler)
+        pos = pos + 1
+        w = w + 1
+    }
+
+    println("[t1_real_bench] Benchmarking " + str(n_tokens) + " tokens...")
+
+    // === Timed decode ===
+    let mut tok_times = []
+    let mut generated_tokens = []
+
+    let mut it = 0
+    while it < n_tokens {
+        let t0 = clock()
+
+        let emb = load_embedding(model, cur_tok)
+        let result = transformer_forward(model, emb, pos, kv_keys, kv_vals)
+        let logits = result[0]
+        kv_keys = result[1]
+        kv_vals = result[2]
+        let next_tok = sample_token(logits, vocab_size, sampler)
+
+        let t1 = clock()
+        let ms = (t1 - t0) * 1000.0
+        tok_times = tok_times + [ms]
+        generated_tokens = generated_tokens + [next_tok]
+
+        cur_tok = next_tok
+        pos = pos + 1
+        it = it + 1
+
+        // Progress
+        if it % 4 == 0 {
+            println("[t1_real_bench] Token " + str(it) + "/" + str(n_tokens) + " : " + str(ms) + " ms")
+        }
+    }
+
+    // === Statistics ===
+    let n = len(tok_times)
+    let mut sum_ms = 0.0
+    let mut best_ms = tok_times[0]
+    let mut worst_ms = tok_times[0]
+    let mut i = 0
+    while i < n {
+        sum_ms = sum_ms + tok_times[i]
+        if tok_times[i] < best_ms { best_ms = tok_times[i] }
+        if tok_times[i] > worst_ms { worst_ms = tok_times[i] }
+        i = i + 1
+    }
+    let avg_ms = sum_ms / to_float(n)
+
+    // Sort for percentiles
+    let mut sorted = []
+    i = 0
+    while i < n {
+        sorted = sorted + [tok_times[i]]
+        i = i + 1
+    }
+    // Insertion sort
+    let mut ii = 1
+    while ii < n {
+        let key = sorted[ii]
+        let mut jj = ii - 1
+        while jj >= 0 {
+            if sorted[jj] > key {
+                sorted[jj + 1] = sorted[jj]
+                jj = jj - 1
+            } else {
+                jj = -1
+            }
+        }
+        sorted[jj + 1] = key
+        ii = ii + 1
+    }
+
+    let p50_idx = n / 2
+    let p95_idx = n * 95 / 100
+    let p50_ms = sorted[p50_idx]
+    let mut p95_ms = sorted[p95_idx]
+    if p95_idx >= n { p95_ms = sorted[n - 1] }
+
+    let tok_s_avg = 1000.0 / avg_ms
+    let tok_s_best = 1000.0 / best_ms
+    let tok_s_p50 = 1000.0 / p50_ms
+
+    // Bandwidth calculation
+    let bw_avg = model_bytes / (avg_ms / 1000.0) / 1000000000.0
+    let bw_best = model_bytes / (best_ms / 1000.0) / 1000000000.0
+
+    println("")
+    println("=== t1_real_bench RESULTS ===")
+    println("Model:       " + model_path)
+    println("Config:      dim=" + str(dim) + " layers=" + str(n_layers) + " vocab=" + str(vocab_size))
+    println("Tokens:      " + str(n) + " (+ " + str(n_warmup) + " warmup)")
+    println("Avg:         " + str(avg_ms) + " ms/tok = " + str(tok_s_avg) + " tok/s")
+    println("Best:        " + str(best_ms) + " ms/tok = " + str(tok_s_best) + " tok/s")
+    println("P50:         " + str(p50_ms) + " ms/tok = " + str(tok_s_p50) + " tok/s")
+    println("P95:         " + str(p95_ms) + " ms/tok")
+    println("Worst:       " + str(worst_ms) + " ms/tok")
+    println("BW (avg):    " + str(bw_avg) + " GB/s")
+    println("BW (best):   " + str(bw_best) + " GB/s")
+    println("Ceiling:     ~14 tok/s (DDR4 50 GB/s) / ~21 tok/s (DDR5 75 GB/s)")
+
+    // JSON output
+    let ts = clock()
+    let mut line = "{\"bench\":\"t1_real_7b_q4\""
+    line = line + ",\"ts\":" + str(ts)
+    line = line + ",\"model\":\"" + model_path + "\""
+    line = line + ",\"dim\":" + str(dim)
+    line = line + ",\"n_layers\":" + str(n_layers)
+    line = line + ",\"vocab_size\":" + str(vocab_size)
+    line = line + ",\"tokens\":" + str(n)
+    line = line + ",\"warmup\":" + str(n_warmup)
+    line = line + ",\"avg_ms\":" + str(avg_ms)
+    line = line + ",\"best_ms\":" + str(best_ms)
+    line = line + ",\"p50_ms\":" + str(p50_ms)
+    line = line + ",\"p95_ms\":" + str(p95_ms)
+    line = line + ",\"worst_ms\":" + str(worst_ms)
+    line = line + ",\"tok_s_avg\":" + str(tok_s_avg)
+    line = line + ",\"tok_s_best\":" + str(tok_s_best)
+    line = line + ",\"tok_s_p50\":" + str(tok_s_p50)
+    line = line + ",\"bw_avg_gbs\":" + str(bw_avg)
+    line = line + ",\"bw_best_gbs\":" + str(bw_best)
+    line = line + ",\"load_ms\":" + str(load_ms)
+    line = line + "}"
+    println(line)
+}
+
+// ===================================================================
+//  CLI entry point
+// ===================================================================
+let args = argv()
+let n_args = len(args)
+
+if n_args < 2 {
+    println("Usage: hexa self/ml/t1_real_bench.hexa <gguf_path> [n_tokens] [n_warmup]")
+    println("")
+    println("  gguf_path:  Path to Llama GGUF Q4_0 model file")
+    println("  n_tokens:   Number of tokens to benchmark (default: 16)")
+    println("  n_warmup:   Number of warmup tokens (default: 2)")
+    println("")
+    println("Physical ceiling: DDR4 ~50 GB/s -> ~14 tok/s for 7B Q4_0 (3.5 GB)")
+} else {
+    let model_path = args[1]
+    let mut n_tokens = 16
+    let mut n_warmup = 2
+
+    if n_args > 2 { n_tokens = to_int(args[2]) }
+    if n_args > 3 { n_warmup = to_int(args[3]) }
+
+    run_bench(model_path, n_tokens, n_warmup)
+}

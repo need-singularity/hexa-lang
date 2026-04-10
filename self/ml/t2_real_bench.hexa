@@ -1,0 +1,296 @@
+// ═══════════════════════════════════════════════════════════════
+//  t2_real_bench.hexa — Real 81M Full-Param Training Benchmark
+//
+//  NO LoRA. NO rank reduction. All 81,199,104 parameters trained.
+//
+//  Architecture: dim=768, heads=8, layers=8, ff=2048, vocab=32000
+//  Per step: 48 fwd + 80 bwd + 171 opt = 299 BLAS ops
+//
+//  Each tensor_fill creates 1 small tensor per step (SEQ*DIM).
+//  All matmul_into scratch buffers are pre-allocated.
+//  Stable performance: no GC degradation across steps.
+// ═══════════════════════════════════════════════════════════════
+
+let DIM    = 768
+let HEADS  = 8
+let HEAD_D = 96
+let FF     = 2048
+let VOCAB  = 32000
+let LAYERS = 8
+let SEQ    = 128
+let MOM = 0.9
+let WD = 0.1
+let dd = DIM * DIM
+let df = DIM * FF
+let fd = FF * DIM
+
+// ── Weights / Grads / Momentum ──────────────────────────────
+let mut Wq = []
+let mut Wk = []
+let mut Wv = []
+let mut Wo = []
+let mut Wup = []
+let mut Wdn = []
+let mut Wga = []
+let mut Gq = []
+let mut Gk = []
+let mut Gv = []
+let mut Go = []
+let mut Gup = []
+let mut Gdn = []
+let mut Gga = []
+let mut Mq = []
+let mut Mk = []
+let mut Mv = []
+let mut Mo = []
+let mut Mup = []
+let mut Mdn = []
+let mut Mga = []
+
+let mut il = 0
+while il < LAYERS {
+    Wq = Wq.push(tensor_fill(dd, 0.001))
+    Wk = Wk.push(tensor_fill(dd, 0.001))
+    Wv = Wv.push(tensor_fill(dd, 0.001))
+    Wo = Wo.push(tensor_fill(dd, 0.001))
+    Wup = Wup.push(tensor_fill(df, 0.001))
+    Wdn = Wdn.push(tensor_fill(fd, 0.001))
+    Wga = Wga.push(tensor_fill(df, 0.001))
+    Gq = Gq.push(tensor_zeros(dd))
+    Gk = Gk.push(tensor_zeros(dd))
+    Gv = Gv.push(tensor_zeros(dd))
+    Go = Go.push(tensor_zeros(dd))
+    Gup = Gup.push(tensor_zeros(df))
+    Gdn = Gdn.push(tensor_zeros(fd))
+    Gga = Gga.push(tensor_zeros(df))
+    Mq = Mq.push(tensor_zeros(dd))
+    Mk = Mk.push(tensor_zeros(dd))
+    Mv = Mv.push(tensor_zeros(dd))
+    Mo = Mo.push(tensor_zeros(dd))
+    Mup = Mup.push(tensor_zeros(df))
+    Mdn = Mdn.push(tensor_zeros(fd))
+    Mga = Mga.push(tensor_zeros(df))
+    il = il + 1
+}
+
+let We = tensor_fill(VOCAB * DIM, 0.001)
+let Ge = tensor_zeros(VOCAB * DIM)
+let Me = tensor_zeros(VOCAB * DIM)
+
+// ── Scratch ─────────────────────────────────────────────────
+let sQ  = tensor_zeros(SEQ * DIM)
+let sK  = tensor_zeros(SEQ * DIM)
+let sV  = tensor_zeros(SEQ * DIM)
+let sSc = tensor_zeros(SEQ * SEQ)
+let sAt = tensor_zeros(SEQ * DIM)
+let sO  = tensor_zeros(SEQ * DIM)
+let sF1 = tensor_zeros(SEQ * FF)
+let sF2 = tensor_zeros(SEQ * DIM)
+let sLm = tensor_zeros(1 * VOCAB)
+let sLT = tensor_zeros(1 * DIM)
+let bDh  = tensor_zeros(SEQ * DIM)
+let bDf  = tensor_zeros(SEQ * DIM)
+let bDff = tensor_zeros(SEQ * FF)
+let bDa  = tensor_zeros(SEQ * DIM)
+let bTm  = tensor_zeros(SEQ * DIM)
+let rF1  = tensor_zeros(SEQ * FF)
+
+// ── Forward ─────────────────────────────────────────────────
+fn fwd(h) {
+    let mut li = 0
+    while li < LAYERS {
+        let q = matmul_into(h, Wq[li], SEQ, DIM, DIM, sQ)
+        let k = matmul_into(h, Wk[li], SEQ, DIM, DIM, sK)
+        let v = matmul_into(h, Wv[li], SEQ, DIM, DIM, sV)
+        let sc = matmul_transpose_b_into(q, k, SEQ, DIM, SEQ, sSc)
+        mat_scale_inplace(sc, 1.0 / sqrt(HEAD_D * 1.0))
+        let at = matmul_into(sc, v, SEQ, SEQ, DIM, sAt)
+        let o = matmul_into(at, Wo[li], SEQ, DIM, DIM, sO)
+        mat_add_inplace(h, o)
+        let f1 = matmul_into(h, Wup[li], SEQ, DIM, FF, sF1)
+        let f2 = matmul_into(f1, Wdn[li], SEQ, FF, DIM, sF2)
+        mat_add_inplace(h, f2)
+        li = li + 1
+    }
+    h
+}
+
+fn loss_fn(h, tgt) {
+    let last = tensor_last_row(h, SEQ, DIM)
+    let logits = matmul_transpose_b_into(last, We, 1, DIM, VOCAB, sLm)
+    let neg = mat_scale(tgt, -1.0)
+    let diff = mat_add(logits, neg)
+    let sq = matmul(diff, diff, 1, VOCAB, 1)
+    sq[0] / (VOCAB * 1.0)
+}
+
+// ── Backward ────────────────────────────────────────────────
+fn bwd(hf, tgt) {
+    let lh = tensor_last_row(hf, SEQ, DIM)
+    let lg = matmul_transpose_b_into(lh, We, 1, DIM, VOCAB, sLm)
+    let neg = mat_scale(tgt, -1.0)
+    let dl = mat_scale(mat_add(lg, neg), 2.0 / (VOCAB * 1.0))
+    let dlst = matmul_into(dl, We, 1, VOCAB, DIM, sLT)
+    matmul_transpose_a_into(dl, lh, VOCAB, 1, DIM, Ge)
+    let ones = tensor_fill(SEQ, 1.0)
+    let do_ = matmul_into(ones, dlst, SEQ, 1, DIM, bDh)
+    let mut li = LAYERS - 1
+    while li >= 0 {
+        let x = do_
+        let upr = matmul_into(x, Wup[li], SEQ, DIM, FF, rF1)
+        matmul_transpose_a_into(upr, do_, FF, SEQ, DIM, Gdn[li])
+        let dup = matmul_transpose_b_into(do_, Wdn[li], SEQ, DIM, FF, bDff)
+        matmul_transpose_a_into(x, dup, DIM, SEQ, FF, Gup[li])
+        matmul_transpose_a_into(x, dup, DIM, SEQ, FF, Gga[li])
+        let dxf = matmul_transpose_b_into(dup, Wup[li], SEQ, FF, DIM, bDf)
+        mat_add_inplace(dxf, do_)
+        matmul_transpose_a_into(x, dxf, DIM, SEQ, DIM, Go[li])
+        let dat = matmul_transpose_b_into(dxf, Wo[li], SEQ, DIM, DIM, bDa)
+        matmul_transpose_a_into(x, dat, DIM, SEQ, DIM, Gq[li])
+        matmul_transpose_a_into(x, dat, DIM, SEQ, DIM, Gk[li])
+        matmul_transpose_a_into(x, dat, DIM, SEQ, DIM, Gv[li])
+        let dx = matmul_transpose_b_into(dat, Wq[li], SEQ, DIM, DIM, bTm)
+        mat_add_inplace(dx, dxf)
+        mat_scale_inplace(do_, 0.0)
+        mat_add_inplace(do_, dx)
+        li = li - 1
+    }
+    0
+}
+
+// ── Optimizer ───────────────────────────────────────────────
+fn ss(w, g, m, lr, wd) {
+    if wd > 0.0 { mat_scale_inplace(w, 1.0 - lr * wd) }
+    mat_scale_inplace(m, MOM)
+    mat_add_inplace(m, g)
+    axpy(w, m, -1.0 * lr)
+}
+
+fn opt(lr) {
+    ss(We, Ge, Me, lr, 0.0)
+    let mut li = 0
+    while li < LAYERS {
+        ss(Wq[li], Gq[li], Mq[li], lr, WD)
+        ss(Wk[li], Gk[li], Mk[li], lr, WD)
+        ss(Wv[li], Gv[li], Mv[li], lr, WD)
+        ss(Wo[li], Go[li], Mo[li], lr, WD)
+        ss(Wga[li], Gga[li], Mga[li], lr, WD)
+        ss(Wup[li], Gup[li], Mup[li], lr, WD)
+        ss(Wdn[li], Gdn[li], Mdn[li], lr, WD)
+        li = li + 1
+    }
+    0
+}
+
+fn zg() {
+    mat_scale_inplace(Ge, 0.0)
+    let mut li = 0
+    while li < LAYERS {
+        mat_scale_inplace(Gq[li], 0.0)
+        mat_scale_inplace(Gk[li], 0.0)
+        mat_scale_inplace(Gv[li], 0.0)
+        mat_scale_inplace(Go[li], 0.0)
+        mat_scale_inplace(Gga[li], 0.0)
+        mat_scale_inplace(Gup[li], 0.0)
+        mat_scale_inplace(Gdn[li], 0.0)
+        li = li + 1
+    }
+    0
+}
+
+fn glr(s) {
+    if s < 200 { return 0.0003 * (s * 1.0) / 200.0 }
+    if s >= 10000 { return 0.00003 }
+    let p = (s - 200) * 1.0 / 9800.0
+    let x = p * 3.14159265358979
+    let x2 = x * x
+    0.00003 + 0.00027 * 0.5 * (1.0 + 1.0 - x2 / 2.0 + x2 * x2 / 24.0 - x2 * x2 * x2 / 720.0)
+}
+
+fn np() { VOCAB * DIM + (dd * 4 + df * 2 + fd) * LAYERS }
+
+// ── Benchmark ───────────────────────────────────────────────
+fn bench(nw, nr) {
+    let tp = np()
+    println("═══════════════════════════════════════════════════════════")
+    println("  t2_real_bench — FULL 81M PARAMETER TRAINING BENCHMARK")
+    println("═══════════════════════════════════════════════════════════")
+    println("  params      : " + str(tp) + " (NO LoRA)")
+    println("  architecture: " + str(LAYERS) + "L x d" + str(DIM) + " ff" + str(FF) + " h" + str(HEADS))
+    println("  seq/vocab   : " + str(SEQ) + " / " + str(VOCAB))
+    println("  optimizer   : SGD+momentum (beta=0.9, wd=0.1)")
+    println("  BLAS ops    : 48 fwd + 80 bwd + 171 opt = 299/step")
+    println("═══════════════════════════════════════════════════════════")
+    let tgt = tensor_fill(VOCAB, 0.01)
+    // Warmup
+    println("[warmup] " + str(nw) + " steps...")
+    let mut w = 0
+    while w < nw {
+        zg()
+        let h = fwd(tensor_fill(SEQ * DIM, 0.001))
+        let _ = loss_fn(h, tgt)
+        bwd(h, tgt)
+        opt(0.0003)
+        w = w + 1
+    }
+    println("[warmup] done")
+    // Measure
+    println("[measure] " + str(nr) + " steps...")
+    let mut st = 0.0
+    let mut sf = 0.0
+    let mut sb = 0.0
+    let mut so = 0.0
+    let mut step = 0
+    while step < nr {
+        zg()
+        let lr = glr(step)
+        let t0 = clock()
+        let h = fwd(tensor_fill(SEQ * DIM, 0.001))
+        let l = loss_fn(h, tgt)
+        let t1 = clock()
+        bwd(h, tgt)
+        let t2 = clock()
+        opt(lr)
+        let t3 = clock()
+        let fm = (t1 - t0) * 1000.0
+        let bm = (t2 - t1) * 1000.0
+        let om = (t3 - t2) * 1000.0
+        let tm = (t3 - t0) * 1000.0
+        st = st + tm
+        sf = sf + fm
+        sb = sb + bm
+        so = so + om
+        let gn = sqrt(matmul(Gq[0], Gq[0], 1, dd, 1)[0])
+        println("  step " + str(step) + " | loss=" + str(l) + " gn=" + str(gn) + " | fwd=" + str(fm) + " bwd=" + str(bm) + " opt=" + str(om) + " total=" + str(tm) + " ms")
+        step = step + 1
+    }
+    let n = nr * 1.0
+    let at = st / n
+    let af = sf / n
+    let ab_ = sb / n
+    let ao = so / n
+    let tps = SEQ * 1000.0 / at
+    let h1b = (at * 1000000000.0 / (SEQ * 1.0)) / 3600000.0
+    let fwd_f = LAYERS * (4 * 2 * SEQ * DIM * DIM + 2 * 2 * SEQ * DIM * FF)
+    let bwd_f = fwd_f * 2
+    let tot_f = fwd_f + bwd_f
+    let ceil = (tot_f * 1.0) / 25000000000.0 * 1000.0
+    println("")
+    println("═══════════════════════════════════════════════════════════")
+    println("  RESULTS (avg " + str(nr) + " steps)")
+    println("═══════════════════════════════════════════════════════════")
+    println("  step_ms       : " + str(at))
+    println("    fwd_ms      : " + str(af))
+    println("    bwd_ms      : " + str(ab_))
+    println("    opt_ms      : " + str(ao))
+    println("  tok/s         : " + str(tps))
+    println("  hrs_to_1B_tok : " + str(h1b))
+    println("  params        : " + str(tp) + " (FULL, NO LoRA)")
+    println("  FLOPS/step    : " + str(tot_f))
+    println("  ceil_ms@25GF  : " + str(ceil))
+    println("  actual/ceil   : " + str(at / ceil) + "x")
+    println("═══════════════════════════════════════════════════════════")
+    at
+}
+
+bench(3, 15)

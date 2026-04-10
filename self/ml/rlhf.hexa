@@ -1,0 +1,773 @@
+// ═══════════════════════════════════════════════════════════════
+//  rlhf.hexa — PPO-based RLHF in pure Hexa
+//
+//  Full RLHF pipeline:
+//    1. Generate responses from policy model
+//    2. Score responses with reward model
+//    3. Compute advantages using GAE (Generalized Advantage Estimation)
+//    4. PPO clipped objective with value function baseline
+//    5. KL penalty against reference model
+//
+//  Architecture:
+//    Policy:   8L transformer → LM head (generates tokens)
+//    Value fn: 8L transformer → scalar head (predicts return)
+//    Reward:   frozen reward_model.hexa (scores responses)
+//    Reference: frozen copy of initial policy (for KL penalty)
+//
+//  All operations use Accelerate BLAS via hexa builtins.
+// ═══════════════════════════════════════════════════════════════
+
+let PPO_DIM    = 768
+let PPO_HEADS  = 8
+let PPO_HEAD_D = 96
+let PPO_FF     = 2048
+let PPO_VOCAB  = 256
+let PPO_LAYERS = 8
+let PPO_SEQ    = 128
+let PPO_dd     = PPO_DIM * PPO_DIM
+let PPO_df     = PPO_DIM * PPO_FF
+let PPO_fd     = PPO_FF * PPO_DIM
+
+// ── PPO hyperparameters ─────────────────────────────────────
+let PPO_CLIP_EPS   = 0.2
+let PPO_GAMMA      = 0.99
+let PPO_LAMBDA     = 0.95
+let PPO_KL_COEFF   = 0.1
+let PPO_VF_COEFF   = 0.5
+let PPO_ENTROPY_COEFF = 0.01
+let PPO_MAX_GEN    = 32
+
+// ── Xorshift RNG ────────────────────────────────────────────
+let mut PPO_RNG = 314159265
+
+fn ppo_rand_float() {
+    let mut x = PPO_RNG
+    x = x ^ (x * 8192)
+    x = x ^ (x / 131072)
+    x = x ^ (x * 32)
+    if x < 0 { x = 0 - x }
+    PPO_RNG = x
+    (x % 1000000) * 1.0 / 1000000.0
+}
+
+// ── Model creation (policy with LM head + value head) ───────
+pub fn ppo_create_policy() {
+    let scale = 0.02 / sqrt(PPO_DIM * 1.0)
+    let mut Wq  = []
+    let mut Wk  = []
+    let mut Wv  = []
+    let mut Wo  = []
+    let mut Wup = []
+    let mut Wdn = []
+    let mut il = 0
+    while il < PPO_LAYERS {
+        Wq  = Wq.push(tensor_fill(PPO_dd, scale))
+        Wk  = Wk.push(tensor_fill(PPO_dd, scale))
+        Wv  = Wv.push(tensor_fill(PPO_dd, scale))
+        Wo  = Wo.push(tensor_fill(PPO_dd, scale))
+        Wup = Wup.push(tensor_fill(PPO_df, scale))
+        Wdn = Wdn.push(tensor_fill(PPO_fd, scale))
+        il = il + 1
+    }
+    let W_emb = tensor_fill(PPO_VOCAB * PPO_DIM, scale)
+    let W_lmh = tensor_fill(PPO_DIM * PPO_VOCAB, scale)
+    // Value head: DIM → 1
+    let W_val = tensor_fill(PPO_DIM, scale)
+    [Wq, Wk, Wv, Wo, Wup, Wdn, W_emb, W_lmh, W_val]
+}
+
+// ── Deep copy for reference model ───────────────────────────
+pub fn ppo_copy_weights(src) {
+    let mut Wq  = []
+    let mut Wk  = []
+    let mut Wv  = []
+    let mut Wo  = []
+    let mut Wup = []
+    let mut Wdn = []
+    let mut il = 0
+    while il < PPO_LAYERS {
+        let cq = tensor_zeros(PPO_dd)
+        mat_add_inplace(cq, src[0][il])
+        Wq = Wq.push(cq)
+        let ck = tensor_zeros(PPO_dd)
+        mat_add_inplace(ck, src[1][il])
+        Wk = Wk.push(ck)
+        let cv = tensor_zeros(PPO_dd)
+        mat_add_inplace(cv, src[2][il])
+        Wv = Wv.push(cv)
+        let co = tensor_zeros(PPO_dd)
+        mat_add_inplace(co, src[3][il])
+        Wo = Wo.push(co)
+        let cu = tensor_zeros(PPO_df)
+        mat_add_inplace(cu, src[4][il])
+        Wup = Wup.push(cu)
+        let cd = tensor_zeros(PPO_fd)
+        mat_add_inplace(cd, src[5][il])
+        Wdn = Wdn.push(cd)
+        il = il + 1
+    }
+    let c_emb = tensor_zeros(PPO_VOCAB * PPO_DIM)
+    mat_add_inplace(c_emb, src[6])
+    let c_lmh = tensor_zeros(PPO_DIM * PPO_VOCAB)
+    mat_add_inplace(c_lmh, src[7])
+    let c_val = tensor_zeros(PPO_DIM)
+    mat_add_inplace(c_val, src[8])
+    [Wq, Wk, Wv, Wo, Wup, Wdn, c_emb, c_lmh, c_val]
+}
+
+// ── Gradient storage ────────────────────────────────────────
+pub fn ppo_create_grads() {
+    let mut Gq  = []
+    let mut Gk  = []
+    let mut Gv  = []
+    let mut Go  = []
+    let mut Gup = []
+    let mut Gdn = []
+    let mut il = 0
+    while il < PPO_LAYERS {
+        Gq  = Gq.push(tensor_zeros(PPO_dd))
+        Gk  = Gk.push(tensor_zeros(PPO_dd))
+        Gv  = Gv.push(tensor_zeros(PPO_dd))
+        Go  = Go.push(tensor_zeros(PPO_dd))
+        Gup = Gup.push(tensor_zeros(PPO_df))
+        Gdn = Gdn.push(tensor_zeros(PPO_fd))
+        il = il + 1
+    }
+    let g_emb = tensor_zeros(PPO_VOCAB * PPO_DIM)
+    let g_lmh = tensor_zeros(PPO_DIM * PPO_VOCAB)
+    let g_val = tensor_zeros(PPO_DIM)
+    [Gq, Gk, Gv, Go, Gup, Gdn, g_emb, g_lmh, g_val]
+}
+
+pub fn ppo_create_momentum() {
+    let mut Mq  = []
+    let mut Mk  = []
+    let mut Mv  = []
+    let mut Mo  = []
+    let mut Mup = []
+    let mut Mdn = []
+    let mut il = 0
+    while il < PPO_LAYERS {
+        Mq  = Mq.push(tensor_zeros(PPO_dd))
+        Mk  = Mk.push(tensor_zeros(PPO_dd))
+        Mv  = Mv.push(tensor_zeros(PPO_dd))
+        Mo  = Mo.push(tensor_zeros(PPO_dd))
+        Mup = Mup.push(tensor_zeros(PPO_df))
+        Mdn = Mdn.push(tensor_zeros(PPO_fd))
+        il = il + 1
+    }
+    let m_emb = tensor_zeros(PPO_VOCAB * PPO_DIM)
+    let m_lmh = tensor_zeros(PPO_DIM * PPO_VOCAB)
+    let m_val = tensor_zeros(PPO_DIM)
+    [Mq, Mk, Mv, Mo, Mup, Mdn, m_emb, m_lmh, m_val]
+}
+
+// ── Scratch buffers ─────────────────────────────────────────
+pub fn ppo_create_scratch() {
+    let sQ   = tensor_zeros(PPO_SEQ * PPO_DIM)
+    let sK   = tensor_zeros(PPO_SEQ * PPO_DIM)
+    let sV   = tensor_zeros(PPO_SEQ * PPO_DIM)
+    let sSc  = tensor_zeros(PPO_SEQ * PPO_SEQ)
+    let sAt  = tensor_zeros(PPO_SEQ * PPO_DIM)
+    let sO   = tensor_zeros(PPO_SEQ * PPO_DIM)
+    let sFF1 = tensor_zeros(PPO_SEQ * PPO_FF)
+    let sFF2 = tensor_zeros(PPO_SEQ * PPO_DIM)
+    let sLm  = tensor_zeros(1 * PPO_VOCAB)
+    [sQ, sK, sV, sSc, sAt, sO, sFF1, sFF2, sLm]
+}
+
+// ── Embedding ───────────────────────────────────────────────
+fn ppo_embed(W_emb, ids) {
+    let n = len(ids)
+    let mut h = tensor_zeros(n * PPO_DIM)
+    let mut i = 0
+    while i < n {
+        let tok = ids[i]
+        let base_src = tok * PPO_DIM
+        let base_dst = i * PPO_DIM
+        let mut d = 0
+        while d < PPO_DIM {
+            h[base_dst + d] = W_emb[base_src + d]
+            d = d + 1
+        }
+        i = i + 1
+    }
+    h
+}
+
+// ── Transformer forward ────────────────────────────────────
+fn ppo_transformer_fwd(weights, h, scratch) {
+    let Wq  = weights[0]
+    let Wk  = weights[1]
+    let Wv  = weights[2]
+    let Wo  = weights[3]
+    let Wup = weights[4]
+    let Wdn = weights[5]
+    let sQ   = scratch[0]
+    let sK   = scratch[1]
+    let sV   = scratch[2]
+    let sSc  = scratch[3]
+    let sAt  = scratch[4]
+    let sO   = scratch[5]
+    let sFF1 = scratch[6]
+    let sFF2 = scratch[7]
+    let mut li = 0
+    while li < PPO_LAYERS {
+        let q = matmul_into(h, Wq[li], PPO_SEQ, PPO_DIM, PPO_DIM, sQ)
+        let k = matmul_into(h, Wk[li], PPO_SEQ, PPO_DIM, PPO_DIM, sK)
+        let v = matmul_into(h, Wv[li], PPO_SEQ, PPO_DIM, PPO_DIM, sV)
+        let sc = matmul_transpose_b_into(q, k, PPO_SEQ, PPO_DIM, PPO_SEQ, sSc)
+        mat_scale_inplace(sc, 1.0 / sqrt(PPO_HEAD_D * 1.0))
+        let at = matmul_into(sc, v, PPO_SEQ, PPO_SEQ, PPO_DIM, sAt)
+        let o = matmul_into(at, Wo[li], PPO_SEQ, PPO_DIM, PPO_DIM, sO)
+        mat_add_inplace(h, o)
+        let ff1 = matmul_into(h, Wup[li], PPO_SEQ, PPO_DIM, PPO_FF, sFF1)
+        let ff2 = matmul_into(ff1, Wdn[li], PPO_SEQ, PPO_FF, PPO_DIM, sFF2)
+        mat_add_inplace(h, ff2)
+        li = li + 1
+    }
+    h
+}
+
+// ── Get hidden state at a position ──────────────────────────
+fn ppo_hidden_at(h_out, pos) {
+    let base = pos * PPO_DIM
+    let mut hv = tensor_zeros(PPO_DIM)
+    let mut d = 0
+    while d < PPO_DIM {
+        hv[d] = h_out[base + d]
+        d = d + 1
+    }
+    hv
+}
+
+// ── Log-softmax at a position → log P(next_token) ──────────
+fn ppo_logits_at(weights, h_out, pos, scratch) {
+    let W_lmh = weights[7]
+    let sLm = scratch[8]
+    let hv = ppo_hidden_at(h_out, pos)
+    matmul_into(hv, W_lmh, 1, PPO_DIM, PPO_VOCAB, sLm)
+}
+
+fn ppo_log_prob_token(logits, token) {
+    let mut mx = logits[0]
+    let mut i = 1
+    while i < PPO_VOCAB {
+        if logits[i] > mx { mx = logits[i] }
+        i = i + 1
+    }
+    let mut sum_exp = 0.0
+    i = 0
+    while i < PPO_VOCAB {
+        sum_exp = sum_exp + exp(logits[i] - mx)
+        i = i + 1
+    }
+    logits[token] - mx - log(sum_exp)
+}
+
+// ── Value function: hidden → scalar ─────────────────────────
+fn ppo_value_at(weights, h_out, pos) {
+    let W_val = weights[8]
+    let hv = ppo_hidden_at(h_out, pos)
+    let dot = matmul(hv, W_val, 1, PPO_DIM, 1)
+    dot[0]
+}
+
+// ── Sample a token from logits ──────────────────────────────
+fn ppo_sample_token(logits, temperature) {
+    if temperature <= 0.0 {
+        // Greedy
+        let mut best_i = 0
+        let mut best_v = logits[0]
+        let mut i = 1
+        while i < PPO_VOCAB {
+            if logits[i] > best_v {
+                best_v = logits[i]
+                best_i = i
+            }
+            i = i + 1
+        }
+        return best_i
+    }
+    // Temperature-scaled softmax sampling
+    let inv_t = 1.0 / temperature
+    let mut mx = logits[0]
+    let mut i = 1
+    while i < PPO_VOCAB {
+        if logits[i] > mx { mx = logits[i] }
+        i = i + 1
+    }
+    let mut probs = []
+    let mut sum_p = 0.0
+    i = 0
+    while i < PPO_VOCAB {
+        let p = exp((logits[i] - mx) * inv_t)
+        probs = probs.push(p)
+        sum_p = sum_p + p
+        i = i + 1
+    }
+    let r = ppo_rand_float() * sum_p
+    let mut cum = 0.0
+    i = 0
+    while i < PPO_VOCAB {
+        cum = cum + probs[i]
+        if cum > r { return i }
+        i = i + 1
+    }
+    PPO_VOCAB - 1
+}
+
+// ── Generate response from policy ───────────────────────────
+// Takes a prompt (array of token ids), generates up to max_gen tokens
+// Returns [full_sequence, log_probs_per_token]
+pub fn ppo_generate(weights, prompt, max_gen, temperature, scratch) {
+    let W_emb = weights[6]
+    let prompt_len = len(prompt)
+    // Build full input: prompt padded to SEQ
+    let mut ids = []
+    let mut i = 0
+    while i < prompt_len {
+        ids = ids.push(prompt[i])
+        i = i + 1
+    }
+    let mut log_probs = []
+    let mut gen_count = 0
+    while gen_count < max_gen {
+        let cur_len = len(ids)
+        if cur_len >= PPO_SEQ { gen_count = max_gen }
+        if gen_count < max_gen {
+            // Pad ids to PPO_SEQ for fixed-size matmul
+            let mut padded = []
+            i = 0
+            while i < cur_len {
+                padded = padded.push(ids[i])
+                i = i + 1
+            }
+            while i < PPO_SEQ {
+                padded = padded.push(0)
+                i = i + 1
+            }
+            let h = ppo_embed(W_emb, padded)
+            let h_out = ppo_transformer_fwd(weights, h, scratch)
+            let logits = ppo_logits_at(weights, h_out, cur_len - 1, scratch)
+            let next_tok = ppo_sample_token(logits, temperature)
+            let lp = ppo_log_prob_token(logits, next_tok)
+            ids = ids.push(next_tok)
+            log_probs = log_probs.push(lp)
+            gen_count = gen_count + 1
+        }
+    }
+    [ids, log_probs]
+}
+
+// ── Compute KL divergence per token ─────────────────────────
+// KL(pi || ref) = sum_v pi(v) * (log pi(v) - log ref(v))
+pub fn ppo_kl_at(policy_logits, ref_logits) {
+    // Softmax both
+    let mut mx_p = policy_logits[0]
+    let mut mx_r = ref_logits[0]
+    let mut i = 1
+    while i < PPO_VOCAB {
+        if policy_logits[i] > mx_p { mx_p = policy_logits[i] }
+        if ref_logits[i] > mx_r { mx_r = ref_logits[i] }
+        i = i + 1
+    }
+    let mut sum_p = 0.0
+    let mut sum_r = 0.0
+    i = 0
+    while i < PPO_VOCAB {
+        sum_p = sum_p + exp(policy_logits[i] - mx_p)
+        sum_r = sum_r + exp(ref_logits[i] - mx_r)
+        i = i + 1
+    }
+    let log_z_p = mx_p + log(sum_p)
+    let log_z_r = mx_r + log(sum_r)
+    let mut kl = 0.0
+    i = 0
+    while i < PPO_VOCAB {
+        let log_pi = policy_logits[i] - log_z_p
+        let log_ref = ref_logits[i] - log_z_r
+        let pi = exp(log_pi)
+        kl = kl + pi * (log_pi - log_ref)
+        i = i + 1
+    }
+    kl
+}
+
+// ── Compute rewards with KL penalty ─────────────────────────
+// reward_model_scores: array of scalar rewards per response
+// This function adds per-token KL penalty
+fn ppo_compute_rewards(rm_score, kl_penalties, n_gen) {
+    let mut rewards = []
+    let mut i = 0
+    while i < n_gen {
+        let mut r = 0.0 - PPO_KL_COEFF * kl_penalties[i]
+        // Add RM reward only at last token
+        if i == n_gen - 1 {
+            r = r + rm_score
+        }
+        rewards = rewards.push(r)
+        i = i + 1
+    }
+    rewards
+}
+
+// ── Generalized Advantage Estimation (GAE) ──────────────────
+pub fn ppo_gae(rewards, values, n_gen) {
+    let mut advantages = []
+    let mut i = 0
+    while i < n_gen {
+        advantages = advantages.push(0.0)
+        i = i + 1
+    }
+    let mut gae = 0.0
+    let mut t = n_gen - 1
+    while t >= 0 {
+        let next_val = 0.0
+        if t < n_gen - 1 {
+            let nv = values[t + 1]
+            let delta = rewards[t] + PPO_GAMMA * nv - values[t]
+            gae = delta + PPO_GAMMA * PPO_LAMBDA * gae
+        } else {
+            gae = rewards[t] - values[t]
+        }
+        advantages[t] = gae
+        t = t - 1
+    }
+    // Returns (in separate arrays computed here)
+    let mut returns = []
+    i = 0
+    while i < n_gen {
+        returns = returns.push(advantages[i] + values[i])
+        i = i + 1
+    }
+    [advantages, returns]
+}
+
+// ── PPO clipped objective (per-token) ───────────────────────
+// ratio = exp(log_pi_new - log_pi_old)
+// L_clip = min(ratio * A, clip(ratio, 1-eps, 1+eps) * A)
+pub fn ppo_clipped_loss(log_pi_new, log_pi_old, advantage) {
+    let ratio = exp(log_pi_new - log_pi_old)
+    let unclipped = ratio * advantage
+    let mut clipped_ratio = ratio
+    if clipped_ratio > 1.0 + PPO_CLIP_EPS {
+        clipped_ratio = 1.0 + PPO_CLIP_EPS
+    }
+    if clipped_ratio < 1.0 - PPO_CLIP_EPS {
+        clipped_ratio = 1.0 - PPO_CLIP_EPS
+    }
+    let clipped = clipped_ratio * advantage
+    // min(unclipped, clipped) — but we negate for gradient ascent
+    let mut obj = unclipped
+    if clipped < unclipped { obj = clipped }
+    0.0 - obj
+}
+
+// ── Value function loss (MSE) ───────────────────────────────
+fn ppo_value_loss(v_pred, v_target) {
+    let d = v_pred - v_target
+    PPO_VF_COEFF * d * d
+}
+
+// ── Entropy bonus ───────────────────────────────────────────
+pub fn ppo_entropy(logits) {
+    let mut mx = logits[0]
+    let mut i = 1
+    while i < PPO_VOCAB {
+        if logits[i] > mx { mx = logits[i] }
+        i = i + 1
+    }
+    let mut sum_e = 0.0
+    i = 0
+    while i < PPO_VOCAB {
+        sum_e = sum_e + exp(logits[i] - mx)
+        i = i + 1
+    }
+    let log_z = mx + log(sum_e)
+    let mut ent = 0.0
+    i = 0
+    while i < PPO_VOCAB {
+        let log_p = logits[i] - log_z
+        let p = exp(log_p)
+        ent = ent - p * log_p
+        i = i + 1
+    }
+    ent
+}
+
+// ── SGD step ────────────────────────────────────────────────
+let PPO_SGD_MOMENTUM = 0.9
+let PPO_SGD_WD = 0.01
+
+fn ppo_sgd(w, g, m, lr) {
+    mat_scale_inplace(w, 1.0 - lr * PPO_SGD_WD)
+    mat_scale_inplace(m, PPO_SGD_MOMENTUM)
+    mat_add_inplace(m, g)
+    axpy(w, m, -1.0 * lr)
+}
+
+fn ppo_zero_grad(grads) {
+    let mut li = 0
+    while li < PPO_LAYERS {
+        mat_scale_inplace(grads[0][li], 0.0)
+        mat_scale_inplace(grads[1][li], 0.0)
+        mat_scale_inplace(grads[2][li], 0.0)
+        mat_scale_inplace(grads[3][li], 0.0)
+        mat_scale_inplace(grads[4][li], 0.0)
+        mat_scale_inplace(grads[5][li], 0.0)
+        li = li + 1
+    }
+    mat_scale_inplace(grads[6], 0.0)
+    mat_scale_inplace(grads[7], 0.0)
+    mat_scale_inplace(grads[8], 0.0)
+    0
+}
+
+fn ppo_opt_step(weights, grads, momenta, lr) {
+    let mut li = 0
+    while li < PPO_LAYERS {
+        ppo_sgd(weights[0][li], grads[0][li], momenta[0][li], lr)
+        ppo_sgd(weights[1][li], grads[1][li], momenta[1][li], lr)
+        ppo_sgd(weights[2][li], grads[2][li], momenta[2][li], lr)
+        ppo_sgd(weights[3][li], grads[3][li], momenta[3][li], lr)
+        ppo_sgd(weights[4][li], grads[4][li], momenta[4][li], lr)
+        ppo_sgd(weights[5][li], grads[5][li], momenta[5][li], lr)
+        li = li + 1
+    }
+    ppo_sgd(weights[6], grads[6], momenta[6], lr)
+    ppo_sgd(weights[7], grads[7], momenta[7], lr)
+    ppo_sgd(weights[8], grads[8], momenta[8], lr)
+    0
+}
+
+// ── PPO step: single rollout + update ───────────────────────
+// reward_fn: takes (response_ids) → scalar reward
+// For integration with reward_model.hexa, caller provides the scoring fn
+pub fn ppo_step(policy, ref_model, grads, momenta, prompt, reward_fn_weights, reward_fn_scratch, scratch, lr) {
+    let temperature = 0.8
+    // 1. Generate response from policy
+    let gen_result = ppo_generate(policy, prompt, PPO_MAX_GEN, temperature, scratch)
+    let full_ids = gen_result[0]
+    let old_log_probs = gen_result[1]
+    let n_gen = len(old_log_probs)
+    if n_gen == 0 { return 0.0 }
+    // 2. Score with reward model (using reward_forward from reward_model.hexa pattern)
+    // We compute reward as dot product of last hidden with reward head
+    let rm_weights = reward_fn_weights
+    let rm_scratch = reward_fn_scratch
+    let rm_W_emb = rm_weights[6]
+    let rm_W_head = rm_weights[7]
+    // Simple reward: use the response portion
+    let mut response_ids = []
+    let prompt_len = len(prompt)
+    let mut i = prompt_len
+    while i < len(full_ids) {
+        response_ids = response_ids.push(full_ids[i])
+        i = i + 1
+    }
+    // Pad response to RM_SEQ if needed
+    while len(response_ids) < 128 {
+        response_ids = response_ids.push(0)
+    }
+    // Compute reward score (simplified: just embed + dot with head)
+    let rm_h = tensor_zeros(128 * PPO_DIM)
+    i = 0
+    while i < 128 {
+        let tok = response_ids[i]
+        if tok < PPO_VOCAB {
+            let base_src = tok * PPO_DIM
+            let base_dst = i * PPO_DIM
+            let mut d = 0
+            while d < PPO_DIM {
+                rm_h[base_dst + d] = rm_W_emb[base_src + d]
+                d = d + 1
+            }
+        }
+        i = i + 1
+    }
+    let rm_last_base = 127 * PPO_DIM
+    let mut rm_last = tensor_zeros(PPO_DIM)
+    let mut d = 0
+    while d < PPO_DIM {
+        rm_last[d] = rm_h[rm_last_base + d]
+        d = d + 1
+    }
+    let rm_dot = matmul(rm_last, rm_W_head, 1, PPO_DIM, 1)
+    let rm_score = rm_dot[0]
+    // 3. Compute values and KL for each generated token
+    let mut values = []
+    let mut kl_penalties = []
+    // Pad full_ids to PPO_SEQ
+    let mut padded = []
+    i = 0
+    while i < len(full_ids) {
+        padded = padded.push(full_ids[i])
+        i = i + 1
+    }
+    while len(padded) < PPO_SEQ {
+        padded = padded.push(0)
+    }
+    let pol_h = ppo_embed(policy[6], padded)
+    let pol_h_out = ppo_transformer_fwd(policy, pol_h, scratch)
+    let ref_h = ppo_embed(ref_model[6], padded)
+    let ref_h_out = ppo_transformer_fwd(ref_model, ref_h, scratch)
+    let mut gi = 0
+    while gi < n_gen {
+        let pos = prompt_len + gi - 1
+        let v = ppo_value_at(policy, pol_h_out, pos)
+        values = values.push(v)
+        let pol_logits = ppo_logits_at(policy, pol_h_out, pos, scratch)
+        let ref_logits = ppo_logits_at(ref_model, ref_h_out, pos, scratch)
+        let kl = ppo_kl_at(pol_logits, ref_logits)
+        kl_penalties = kl_penalties.push(kl)
+        gi = gi + 1
+    }
+    // 4. Compute rewards with KL penalty
+    let rewards = ppo_compute_rewards(rm_score, kl_penalties, n_gen)
+    // 5. GAE
+    let gae_result = ppo_gae(rewards, values, n_gen)
+    let advantages = gae_result[0]
+    let returns = gae_result[1]
+    // Normalize advantages
+    let mut adv_mean = 0.0
+    let mut adv_var = 0.0
+    gi = 0
+    while gi < n_gen {
+        adv_mean = adv_mean + advantages[gi]
+        gi = gi + 1
+    }
+    adv_mean = adv_mean / (n_gen * 1.0)
+    gi = 0
+    while gi < n_gen {
+        let diff = advantages[gi] - adv_mean
+        adv_var = adv_var + diff * diff
+        gi = gi + 1
+    }
+    let adv_std = sqrt(adv_var / (n_gen * 1.0) + 1.0e-8)
+    let mut norm_adv = []
+    gi = 0
+    while gi < n_gen {
+        norm_adv = norm_adv.push((advantages[gi] - adv_mean) / adv_std)
+        gi = gi + 1
+    }
+    // 6. PPO update (numerical gradient on LM head for correctness)
+    ppo_zero_grad(grads)
+    let eps = 1.0e-4
+    let W_lmh = policy[7]
+    let n_lmh = PPO_DIM * PPO_VOCAB
+    let g_lmh = grads[7]
+    // Compute total PPO loss
+    let mut total_loss = 0.0
+    gi = 0
+    while gi < n_gen {
+        let pos = prompt_len + gi - 1
+        let logits = ppo_logits_at(policy, pol_h_out, pos, scratch)
+        let tok = full_ids[prompt_len + gi]
+        let new_lp = ppo_log_prob_token(logits, tok)
+        let clip_loss = ppo_clipped_loss(new_lp, old_log_probs[gi], norm_adv[gi])
+        let vf_loss = ppo_value_loss(values[gi], returns[gi])
+        let ent = ppo_entropy(logits)
+        total_loss = total_loss + clip_loss + vf_loss - PPO_ENTROPY_COEFF * ent
+        gi = gi + 1
+    }
+    total_loss = total_loss / (n_gen * 1.0)
+    // Numerical gradient on LM head (sparse: every 128th element)
+    let stride = n_lmh / 64
+    i = 0
+    while i < n_lmh {
+        let orig = W_lmh[i]
+        W_lmh[i] = orig + eps
+        // Recompute loss
+        let h2 = ppo_embed(policy[6], padded)
+        let h2_out = ppo_transformer_fwd(policy, h2, scratch)
+        let mut loss_plus = 0.0
+        gi = 0
+        while gi < n_gen {
+            let pos = prompt_len + gi - 1
+            let logits2 = ppo_logits_at(policy, h2_out, pos, scratch)
+            let tok = full_ids[prompt_len + gi]
+            let lp2 = ppo_log_prob_token(logits2, tok)
+            loss_plus = loss_plus + ppo_clipped_loss(lp2, old_log_probs[gi], norm_adv[gi])
+            gi = gi + 1
+        }
+        loss_plus = loss_plus / (n_gen * 1.0)
+        W_lmh[i] = orig
+        g_lmh[i] = g_lmh[i] + (loss_plus - total_loss) / eps
+        i = i + stride
+    }
+    // Value head gradient
+    let W_val = policy[8]
+    let g_val = grads[8]
+    d = 0
+    while d < PPO_DIM {
+        let orig = W_val[d]
+        W_val[d] = orig + eps
+        let mut vf_loss2 = 0.0
+        gi = 0
+        while gi < n_gen {
+            let pos = prompt_len + gi - 1
+            let hv2 = ppo_hidden_at(pol_h_out, pos)
+            let dot2 = matmul(hv2, W_val, 1, PPO_DIM, 1)
+            vf_loss2 = vf_loss2 + ppo_value_loss(dot2[0], returns[gi])
+            gi = gi + 1
+        }
+        vf_loss2 = vf_loss2 / (n_gen * 1.0)
+        W_val[d] = orig
+        let mut vf_loss_base = 0.0
+        gi = 0
+        while gi < n_gen {
+            vf_loss_base = vf_loss_base + ppo_value_loss(values[gi], returns[gi])
+            gi = gi + 1
+        }
+        vf_loss_base = vf_loss_base / (n_gen * 1.0)
+        g_val[d] = g_val[d] + (vf_loss2 - vf_loss_base) / eps
+        d = d + 1
+    }
+    ppo_opt_step(policy, grads, momenta, lr)
+    // Return metrics
+    let avg_kl = 0.0
+    let mut kl_sum = 0.0
+    gi = 0
+    while gi < n_gen {
+        kl_sum = kl_sum + kl_penalties[gi]
+        gi = gi + 1
+    }
+    let avg_kl_val = kl_sum / (n_gen * 1.0)
+    println("{\"rm_score\":" + str(rm_score) + ",\"ppo_loss\":" + str(total_loss) + ",\"avg_kl\":" + str(avg_kl_val) + ",\"n_gen\":" + str(n_gen) + "}")
+    total_loss
+}
+
+// ── Full PPO training loop ──────────────────────────────────
+pub fn ppo_train(policy, ref_model, grads, momenta, rm_weights, rm_scratch, scratch, prompts, n_steps, lr) {
+    let n_prompts = len(prompts)
+    println("[rlhf] PPO training: " + str(n_prompts) + " prompts, " + str(n_steps) + " steps")
+    let mut step = 0
+    while step < n_steps {
+        let t0 = clock()
+        let mut total_loss = 0.0
+        let mut pi = 0
+        while pi < n_prompts {
+            let loss = ppo_step(policy, ref_model, grads, momenta, prompts[pi], rm_weights, rm_scratch, scratch, lr)
+            total_loss = total_loss + loss
+            pi = pi + 1
+        }
+        let t1 = clock()
+        let avg_loss = total_loss / (n_prompts * 1.0)
+        let ms = (t1 - t0) * 1000.0
+        println("{\"ppo_step\":" + str(step) + ",\"avg_loss\":" + str(avg_loss) + ",\"ms\":" + str(ms) + "}")
+        step = step + 1
+    }
+    0
+}
+
+// ── Param count ─────────────────────────────────────────────
+pub fn ppo_param_count() {
+    let embed = PPO_VOCAB * PPO_DIM
+    let per_layer = PPO_dd * 4 + PPO_df + PPO_fd
+    let lmh = PPO_DIM * PPO_VOCAB
+    let val_head = PPO_DIM
+    embed + per_layer * PPO_LAYERS + lmh + val_head
+}
+
+println("[rlhf] loaded — PPO with GAE, KL penalty, clipped objective, " + str(ppo_param_count()) + " params")

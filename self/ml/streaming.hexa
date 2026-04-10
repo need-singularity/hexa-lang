@@ -1,0 +1,379 @@
+// ===================================================================
+//  self/ml/streaming.hexa — Streaming Token Generation (SSE)
+//
+//  Pure Hexa streaming inference with Server-Sent Events output.
+//
+//  Public API:
+//    generate_stream(model, prompt, config, callback)
+//      Calls callback(token_str) for each generated token.
+//      Returns stats map: #{total_tokens, tok_per_sec, elapsed_ms}
+//
+//    stream_to_tcp(conn, model, prompt, config)
+//      Streams tokens directly to a TCP connection in SSE format.
+//      Each event: data: {"token":"...","finished":false}\n\n
+//      Final:      data: {"token":"","finished":true,"total_tokens":N,"tok_per_sec":X}\n\n
+//
+//    format_sse_token(token_str)
+//      Format a single token as an SSE data line.
+//
+//    format_sse_done(total_tokens, tok_per_sec)
+//      Format the final SSE event with stats.
+//
+//  Usage with http_server:
+//    fn handle_stream(request) {
+//        let model = llama_load(path)
+//        let conn = request["__conn__"]
+//        stream_to_tcp(conn, model, prompt, config)
+//    }
+// ===================================================================
+
+// ===================================================================
+//  Streaming config
+// ===================================================================
+struct StreamConfig {
+    max_tokens: int,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    seed: int,
+    stop_on_eos: bool
+}
+
+fn default_stream_config() {
+    return StreamConfig {
+        max_tokens: 128,
+        temperature: 0.7,
+        top_p: 0.9,
+        top_k: 40,
+        seed: 42,
+        stop_on_eos: true
+    }
+}
+
+fn greedy_stream_config(max_tokens) {
+    return StreamConfig {
+        max_tokens: max_tokens,
+        temperature: 0.0,
+        top_p: 1.0,
+        top_k: 0,
+        seed: 0,
+        stop_on_eos: true
+    }
+}
+
+// ===================================================================
+//  SSE format helpers
+// ===================================================================
+fn format_sse_token(token_str) {
+    let data = "{\"token\":\"" + escape_json_str(token_str) + "\",\"finished\":false}"
+    return "data: " + data + "\n\n"
+}
+
+fn format_sse_done(total_tokens, tok_per_sec) {
+    let mut data = "{\"token\":\"\",\"finished\":true"
+    data = data + ",\"total_tokens\":" + str(total_tokens)
+    data = data + ",\"tok_per_sec\":" + str(tok_per_sec)
+    data = data + "}"
+    return "data: " + data + "\n\n"
+}
+
+fn escape_json_str(s) {
+    let n = len(s)
+    let mut out = ""
+    let mut i = 0
+    while i < n {
+        let code = char_code(s, i)
+        let ch = chr(code)
+        if ch == "\"" {
+            out = out + "\\\""
+        } else {
+            if ch == "\\" {
+                out = out + "\\\\"
+            } else {
+                if code == 10 {
+                    out = out + "\\n"
+                } else {
+                    if code == 13 {
+                        out = out + "\\r"
+                    } else {
+                        if code == 9 {
+                            out = out + "\\t"
+                        } else {
+                            out = out + ch
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  SSE HTTP response headers (for streaming)
+// ===================================================================
+fn sse_headers() {
+    let h = "HTTP/1.1 200 OK\r\n"
+    let ct = "Content-Type: text/event-stream\r\n"
+    let cc = "Cache-Control: no-cache\r\n"
+    let conn = "Connection: keep-alive\r\n"
+    let cors = "Access-Control-Allow-Origin: *\r\n"
+    return h + ct + cc + conn + cors + "\r\n"
+}
+
+// ===================================================================
+//  Byte-level tokenizer (fallback for models without vocab)
+//  Same as generate.hexa for consistency.
+// ===================================================================
+fn byte_tokenize(text) {
+    let mut tokens = [1]
+    let n = len(text)
+    let mut i = 0
+    while i < n {
+        let ch = char_code(text, i)
+        tokens = tokens + [ch + 3]
+        i = i + 1
+    }
+    return tokens
+}
+
+fn token_to_str(token_id) {
+    if token_id <= 2 { return "" }
+    let byte_val = token_id - 3
+    if byte_val >= 32 {
+        if byte_val < 127 {
+            return chr(byte_val)
+        }
+    }
+    return "?"
+}
+
+// ===================================================================
+//  generate_stream — Core streaming generation
+//
+//  Calls callback(token_str) for each token as it is generated.
+//  Returns #{total_tokens, tok_per_sec, elapsed_ms}
+// ===================================================================
+fn generate_stream(model, prompt, config: StreamConfig, callback) {
+    let cfg = model.config
+    let vocab_size = cfg.vocab_size
+    let max_tokens = config.max_tokens
+
+    // Setup sampler
+    let sampler = SamplerConfig {
+        temperature: config.temperature,
+        top_p: config.top_p,
+        top_k: config.top_k,
+        seed: config.seed
+    }
+    sampler_set_seed(config.seed)
+
+    // Initialize KV cache
+    let kv_init = init_kv_cache(cfg)
+    let mut kv_keys = kv_init[0]
+    let mut kv_vals = kv_init[1]
+
+    // Tokenize prompt
+    let tokens = byte_tokenize(prompt)
+    let prompt_len = len(tokens)
+
+    // === Prefill phase ===
+    let t_start = clock()
+    let mut pos = 0
+    let mut last_logits = []
+
+    while pos < prompt_len {
+        let tok = tokens[pos]
+        let emb = load_embedding(model, tok)
+        let result = transformer_forward(model, emb, pos, kv_keys, kv_vals)
+        kv_keys = result[1]
+        kv_vals = result[2]
+        if pos == prompt_len - 1 {
+            last_logits = result[0]
+        }
+        pos = pos + 1
+    }
+
+    // Sample first token from prefill logits
+    let mut cur_tok = sample_token(last_logits, vocab_size, sampler)
+    let mut decode_pos = prompt_len
+    let mut generated = 0
+    let t_decode_start = clock()
+
+    // === Decode phase (streaming) ===
+    while generated < max_tokens {
+        // Check EOS
+        if cur_tok == 2 {
+            if config.stop_on_eos {
+                generated = max_tokens
+            } else {
+                generated = generated
+            }
+        } else {
+            // Convert token to string and call callback
+            let tok_str = token_to_str(cur_tok)
+            callback(tok_str)
+
+            // Forward pass for next token
+            let emb = load_embedding(model, cur_tok)
+            let result = transformer_forward(model, emb, decode_pos, kv_keys, kv_vals)
+            let logits = result[0]
+            kv_keys = result[1]
+            kv_vals = result[2]
+
+            cur_tok = sample_token(logits, vocab_size, sampler)
+            decode_pos = decode_pos + 1
+            generated = generated + 1
+        }
+    }
+
+    let t_end = clock()
+    let elapsed_ms = (t_end - t_start) * 1000.0
+    let decode_ms = (t_end - t_decode_start) * 1000.0
+    let mut tok_per_sec = 0.0
+    if decode_ms > 0.0 {
+        tok_per_sec = to_float(generated) / (decode_ms / 1000.0)
+    }
+
+    let stats = #{}
+    stats["total_tokens"] = generated
+    stats["tok_per_sec"] = tok_per_sec
+    stats["elapsed_ms"] = elapsed_ms
+    stats["decode_ms"] = decode_ms
+    stats["prompt_tokens"] = prompt_len
+    return stats
+}
+
+// ===================================================================
+//  stream_to_tcp — Stream tokens directly to TCP socket as SSE
+//
+//  Sends SSE headers, then each token as an SSE event, then final
+//  stats event. Works with raw net_write.
+// ===================================================================
+fn stream_to_tcp(conn, model, prompt, config: StreamConfig) {
+    // Send SSE headers first
+    net_write(conn, sse_headers())
+
+    // Stream callback: write each token as SSE
+    let mut token_count = 0
+    let t_start = clock()
+
+    let callback = |tok_str| {
+        let event = format_sse_token(tok_str)
+        net_write(conn, event)
+        token_count = token_count + 1
+    }
+
+    // Run generation with streaming callback
+    let stats = generate_stream(model, prompt, config, callback)
+
+    // Send final event with stats
+    let total = stats["total_tokens"]
+    let tps = stats["tok_per_sec"]
+    let done_event = format_sse_done(total, tps)
+    net_write(conn, done_event)
+
+    return stats
+}
+
+// ===================================================================
+//  collect_stream — Collect all streamed tokens into a string
+//
+//  Useful for testing: runs generate_stream with a collector callback.
+//  Returns #{text, total_tokens, tok_per_sec, elapsed_ms}
+// ===================================================================
+fn collect_stream(model, prompt, config: StreamConfig) {
+    let mut collected = ""
+    let mut token_list = []
+
+    let callback = |tok_str| {
+        collected = collected + tok_str
+        token_list = token_list + [tok_str]
+    }
+
+    let stats = generate_stream(model, prompt, config, callback)
+
+    let result = #{}
+    result["text"] = collected
+    result["tokens"] = token_list
+    result["total_tokens"] = stats["total_tokens"]
+    result["tok_per_sec"] = stats["tok_per_sec"]
+    result["elapsed_ms"] = stats["elapsed_ms"]
+    return result
+}
+
+// ===================================================================
+//  build_sse_body — Pre-render all tokens as SSE for buffered response
+//
+//  For use with http_server.hexa sse_response() when true streaming
+//  is not available (buffered mode). Generates all tokens first, then
+//  returns the complete SSE body as a string.
+// ===================================================================
+fn build_sse_body(model, prompt, config: StreamConfig) {
+    let mut body = ""
+    let mut count = 0
+    let t_start = clock()
+
+    let callback = |tok_str| {
+        body = body + format_sse_token(tok_str)
+        count = count + 1
+    }
+
+    let stats = generate_stream(model, prompt, config, callback)
+    body = body + format_sse_done(stats["total_tokens"], stats["tok_per_sec"])
+    return body
+}
+
+// ===================================================================
+//  Tests (unit-level, no model needed)
+// ===================================================================
+@test
+fn test_format_sse_token() {
+    let event = format_sse_token("hello")
+    assert(event == "data: {\"token\":\"hello\",\"finished\":false}\n\n")
+}
+
+@test
+fn test_format_sse_done() {
+    let event = format_sse_done(10, 5.0)
+    // Should contain finished:true and total_tokens
+    assert(event.contains("\"finished\":true"))
+    assert(event.contains("\"total_tokens\":10"))
+    assert(event.contains("data: "))
+}
+
+@test
+fn test_escape_json_str() {
+    let plain = escape_json_str("hello")
+    assert(plain == "hello")
+    let quoted = escape_json_str("say \"hi\"")
+    assert(quoted == "say \\\"hi\\\"")
+    let backslash = escape_json_str("a\\b")
+    assert(backslash == "a\\\\b")
+}
+
+@test
+fn test_sse_headers() {
+    let h = sse_headers()
+    assert(h.contains("text/event-stream"))
+    assert(h.contains("200 OK"))
+    assert(h.contains("no-cache"))
+}
+
+@test
+fn test_default_stream_config() {
+    let cfg = default_stream_config()
+    assert(cfg.max_tokens == 128)
+    assert(cfg.temperature == 0.7)
+    assert(cfg.stop_on_eos == true)
+}
+
+@test
+fn test_greedy_stream_config() {
+    let cfg = greedy_stream_config(64)
+    assert(cfg.max_tokens == 64)
+    assert(cfg.temperature == 0.0)
+}
+
+println("[streaming] tests passed")

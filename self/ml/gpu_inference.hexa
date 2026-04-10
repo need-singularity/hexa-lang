@@ -1,0 +1,438 @@
+// ===================================================================
+//  self/ml/gpu_inference.hexa — GPU inference engine
+//
+//  Loads trained model weights to GPU, runs forward passes for
+//  both prefill (full sequence) and decode (single token with KV-cache).
+//
+//  Architecture matches model_100m_gpu.hexa:
+//    dim=512, heads=8, head_d=64, ff=1536, vocab=32000, layers=8
+//
+//  Forward pass:
+//    1. Token embedding lookup
+//    2. For each layer:
+//       a. LayerNorm (pre-norm)
+//       b. Self-attention (Q, K, V projections + scaled dot-product)
+//       c. Residual add
+//       d. LayerNorm (pre-norm)
+//       e. SwiGLU FFN (gate, up, down projections)
+//       f. Residual add
+//    3. Final LayerNorm
+//    4. LM head (tied embedding) -> logits
+//
+//  Two modes:
+//    prefill(tokens, len) — process full sequence, populate KV-cache
+//    decode(token)        — single token using KV-cache
+// ===================================================================
+
+use "cuda_ffi"
+use "gpu_tensor"
+use "gpu_kv_cache"
+
+// -- Inference model config --
+struct GpuModelConfig {
+    dim: int,
+    n_heads: int,
+    head_dim: int,
+    ff_dim: int,
+    vocab_size: int,
+    n_layers: int,
+    max_seq_len: int
+}
+
+fn default_model_config() {
+    GpuModelConfig {
+        dim: 512,
+        n_heads: 8,
+        head_dim: 64,
+        ff_dim: 1536,
+        vocab_size: 32000,
+        n_layers: 8,
+        max_seq_len: 2048
+    }
+}
+
+// -- Inference model: config + weights on GPU + KV-cache --
+struct GpuModel {
+    config: GpuModelConfig,
+    W_emb: array,
+    Wq: array,
+    Wk: array,
+    Wv: array,
+    Wo: array,
+    Wg: array,
+    Wu: array,
+    Wd: array,
+    kv_cache: GpuKVCache
+}
+
+// ===================================================================
+//  Weight loading: from training weights array to inference model
+// ===================================================================
+
+// Load weights from model_100m_gpu format: [W_emb, [Wq], [Wk], [Wv], [Wo], [Wg], [Wu], [Wd]]
+fn gpu_model_from_weights(weights, cfg: GpuModelConfig) {
+    let kv = gpu_kv_cache_new(cfg.n_layers, cfg.max_seq_len, cfg.dim)
+    println("[gpu_inference] model loaded: " + str(cfg.n_layers) + " layers, dim=" + str(cfg.dim) + ", vocab=" + str(cfg.vocab_size))
+    GpuModel {
+        config: cfg,
+        W_emb: weights[0],
+        Wq: weights[1],
+        Wk: weights[2],
+        Wv: weights[3],
+        Wo: weights[4],
+        Wg: weights[5],
+        Wu: weights[6],
+        Wd: weights[7],
+        kv_cache: kv
+    }
+}
+
+// Load weights from CPU tensors (array of flat tensors per param)
+// cpu_weights: same layout as model_100m_gpu init_model_weights() output
+fn gpu_model_from_cpu(cpu_weights, cfg: GpuModelConfig) {
+    // cpu_weights[0] = W_emb CPU tensor
+    let W_emb = gpu_tensor_from_cpu(cpu_weights[0], cfg.vocab_size, cfg.dim)
+    let mut Wq = []
+    let mut Wk = []
+    let mut Wv = []
+    let mut Wo = []
+    let mut Wg = []
+    let mut Wu = []
+    let mut Wd = []
+    let mut i = 0
+    while i < cfg.n_layers {
+        Wq = Wq.push(gpu_tensor_from_cpu(cpu_weights[1][i], cfg.dim, cfg.dim))
+        Wk = Wk.push(gpu_tensor_from_cpu(cpu_weights[2][i], cfg.dim, cfg.dim))
+        Wv = Wv.push(gpu_tensor_from_cpu(cpu_weights[3][i], cfg.dim, cfg.dim))
+        Wo = Wo.push(gpu_tensor_from_cpu(cpu_weights[4][i], cfg.dim, cfg.dim))
+        Wg = Wg.push(gpu_tensor_from_cpu(cpu_weights[5][i], cfg.dim, cfg.ff_dim))
+        Wu = Wu.push(gpu_tensor_from_cpu(cpu_weights[6][i], cfg.dim, cfg.ff_dim))
+        Wd = Wd.push(gpu_tensor_from_cpu(cpu_weights[7][i], cfg.ff_dim, cfg.dim))
+        i = i + 1
+    }
+    let weights = [W_emb, Wq, Wk, Wv, Wo, Wg, Wu, Wd]
+    gpu_model_from_weights(weights, cfg)
+}
+
+// ===================================================================
+//  Element-wise SwiGLU multiply (host fallback)
+//  hidden = GELU(gate) * up
+// ===================================================================
+fn gpu_elemwise_mul_host(a_gt, b_gt) {
+    let n = gt_numel(a_gt)
+    let a_host = alloc_raw(n * 4)
+    let b_host = alloc_raw(n * 4)
+    let _ = cuda_memcpy_d2h(a_host, gt_ptr(a_gt), n * 4)
+    let _ = cuda_memcpy_d2h(b_host, gt_ptr(b_gt), n * 4)
+    let out_host = alloc_raw(n * 4)
+    let mut i = 0
+    while i < n {
+        let av = deref_f32(a_host, i)
+        let bv = deref_f32(b_host, i)
+        write_f32(out_host, i, av * bv)
+        i = i + 1
+    }
+    let out_gt = gpu_tensor_zeros(gt_rows(a_gt), gt_cols(a_gt))
+    let _ = cuda_memcpy_h2d(gt_ptr(out_gt), out_host, n * 4)
+    free_raw(a_host, n * 4)
+    free_raw(b_host, n * 4)
+    free_raw(out_host, n * 4)
+    out_gt
+}
+
+// ===================================================================
+//  Causal mask for decode: mask future positions in [1 x kv_len]
+//  For decode, query_pos is the current position.
+//  attn_gt: [1 x kv_len] — mask positions > query_pos
+// ===================================================================
+fn gpu_causal_mask_decode_host(attn_gt, query_pos, kv_len) {
+    let n = kv_len
+    let host = alloc_raw(n * 4)
+    let _ = cuda_memcpy_d2h(host, gt_ptr(attn_gt), n * 4)
+    let neg_inf = -1.0e9
+    let mut j = query_pos + 1
+    while j < kv_len {
+        write_f32(host, j, neg_inf)
+        j = j + 1
+    }
+    let _ = cuda_memcpy_h2d(gt_ptr(attn_gt), host, n * 4)
+    free_raw(host, n * 4)
+    0
+}
+
+// ===================================================================
+//  Prefill forward: full sequence through all layers
+//  tokens: array of token ids, seq_len: number of tokens
+//  Returns logits GpuTensor [seq_len x vocab_size] (last row = next token)
+// ===================================================================
+fn gpu_prefill(model: GpuModel, tokens, seq_len) {
+    let cfg = model.config
+    let dim = cfg.dim
+    let n_heads = cfg.n_heads
+    let head_dim = cfg.head_dim
+    let ff = cfg.ff_dim
+    let vocab = cfg.vocab_size
+
+    // Embedding lookup -> X [seq_len x dim]
+    let mut X = gpu_embedding_host(model.W_emb, tokens, seq_len)
+
+    let mut cache = model.kv_cache
+
+    // Transformer layers
+    let mut layer = 0
+    while layer < cfg.n_layers {
+        // Pre-norm
+        let X_norm = gpu_layernorm_host(X, 1.0e-5)
+
+        // Q, K, V projections: [seq_len x dim] @ [dim x dim] -> [seq_len x dim]
+        let Q = gpu_matmul(X_norm, model.Wq[layer])
+        let K = gpu_matmul(X_norm, model.Wk[layer])
+        let V = gpu_matmul(X_norm, model.Wv[layer])
+
+        // Store K,V in cache for this layer
+        cache = gpu_kv_cache_append_batch(cache, layer, 0, seq_len, K, V)
+
+        // Attention: scores = Q @ K^T / sqrt(head_dim)
+        let attn = gpu_matmul_nt(Q, K)
+        let scale = 1.0 / sqrt(head_dim * 1.0)
+        let _ = gpu_sscal(gt_ptr(attn), seq_len * seq_len, scale)
+
+        // Causal mask
+        let _ = gpu_causal_mask_host(attn)
+
+        // Softmax per row
+        let probs = gpu_softmax_host(attn)
+
+        // Attention output: probs @ V -> [seq_len x dim]
+        let attn_out = gpu_matmul(probs, V)
+
+        // Output projection
+        let proj = gpu_matmul(attn_out, model.Wo[layer])
+
+        // Residual
+        let _ = gpu_add_inplace(X, proj)
+
+        // FFN pre-norm
+        let X_norm2 = gpu_layernorm_host(X, 1.0e-5)
+
+        // SwiGLU FFN
+        let gate_pre = gpu_matmul(X_norm2, model.Wg[layer])
+        let gate = gpu_gelu_host(gate_pre)
+        let up = gpu_matmul(X_norm2, model.Wu[layer])
+        let hidden = gpu_elemwise_mul_host(gate, up)
+        let ffn_out = gpu_matmul(hidden, model.Wd[layer])
+
+        // Residual
+        let _ = gpu_add_inplace(X, ffn_out)
+
+        // Free intermediates
+        gpu_tensor_free(X_norm)
+        gpu_tensor_free(Q)
+        gpu_tensor_free(attn)
+        gpu_tensor_free(probs)
+        gpu_tensor_free(attn_out)
+        gpu_tensor_free(proj)
+        gpu_tensor_free(X_norm2)
+        gpu_tensor_free(gate_pre)
+        gpu_tensor_free(gate)
+        gpu_tensor_free(up)
+        gpu_tensor_free(hidden)
+        gpu_tensor_free(ffn_out)
+
+        layer = layer + 1
+    }
+
+    // Final layernorm
+    let X_final = gpu_layernorm_host(X, 1.0e-5)
+
+    // LM head: logits = X_final @ W_emb^T -> [seq_len x vocab]
+    let logits = gpu_matmul_nt(X_final, model.W_emb)
+
+    gpu_tensor_free(X)
+    gpu_tensor_free(X_final)
+
+    // Return updated model with populated cache + logits
+    let updated_model = GpuModel {
+        config: cfg,
+        W_emb: model.W_emb,
+        Wq: model.Wq,
+        Wk: model.Wk,
+        Wv: model.Wv,
+        Wo: model.Wo,
+        Wg: model.Wg,
+        Wu: model.Wu,
+        Wd: model.Wd,
+        kv_cache: cache
+    }
+    [logits, updated_model]
+}
+
+// ===================================================================
+//  Decode forward: single token using KV-cache
+//  token_id: int, pos: current sequence position
+//  Returns logits GpuTensor [1 x vocab_size]
+// ===================================================================
+fn gpu_decode(model: GpuModel, token_id, pos) {
+    let cfg = model.config
+    let dim = cfg.dim
+    let n_heads = cfg.n_heads
+    let head_dim = cfg.head_dim
+    let ff = cfg.ff_dim
+    let vocab = cfg.vocab_size
+    let kv_len = pos + 1
+
+    // Embedding lookup -> X [1 x dim]
+    let tok_arr = [token_id]
+    let mut X = gpu_embedding_host(model.W_emb, tok_arr, 1)
+
+    let mut cache = model.kv_cache
+
+    // Transformer layers
+    let mut layer = 0
+    while layer < cfg.n_layers {
+        // Pre-norm
+        let X_norm = gpu_layernorm_host(X, 1.0e-5)
+
+        // Q, K, V for single token: [1 x dim]
+        let Q = gpu_matmul(X_norm, model.Wq[layer])
+        let K_new = gpu_matmul(X_norm, model.Wk[layer])
+        let V_new = gpu_matmul(X_norm, model.Wv[layer])
+
+        // Append new K, V to cache at position pos
+        cache = gpu_kv_cache_append(cache, layer, pos, K_new, V_new)
+
+        // Get full K, V from cache: [kv_len x dim]
+        let K_full = gpu_kv_cache_get_k_len(cache, layer, kv_len)
+        let V_full = gpu_kv_cache_get_v_len(cache, layer, kv_len)
+
+        // Attention: Q[1 x dim] @ K_full^T[dim x kv_len] -> scores[1 x kv_len]
+        let attn = gpu_matmul_nt(Q, K_full)
+        let scale = 1.0 / sqrt(head_dim * 1.0)
+        let _ = gpu_sscal(gt_ptr(attn), kv_len, scale)
+
+        // Causal mask (for decode, mask positions > pos)
+        let _ = gpu_causal_mask_decode_host(attn, pos, kv_len)
+
+        // Softmax
+        let probs = gpu_softmax_host(attn)
+
+        // Attention output: probs[1 x kv_len] @ V_full[kv_len x dim] -> [1 x dim]
+        let attn_out = gpu_matmul(probs, V_full)
+
+        // Output projection
+        let proj = gpu_matmul(attn_out, model.Wo[layer])
+
+        // Residual
+        let _ = gpu_add_inplace(X, proj)
+
+        // FFN pre-norm
+        let X_norm2 = gpu_layernorm_host(X, 1.0e-5)
+
+        // SwiGLU FFN
+        let gate_pre = gpu_matmul(X_norm2, model.Wg[layer])
+        let gate = gpu_gelu_host(gate_pre)
+        let up = gpu_matmul(X_norm2, model.Wu[layer])
+        let hidden = gpu_elemwise_mul_host(gate, up)
+        let ffn_out = gpu_matmul(hidden, model.Wd[layer])
+
+        // Residual
+        let _ = gpu_add_inplace(X, ffn_out)
+
+        // Free intermediates (K_full/V_full are views into cache, don't free)
+        gpu_tensor_free(X_norm)
+        gpu_tensor_free(Q)
+        gpu_tensor_free(K_new)
+        gpu_tensor_free(V_new)
+        gpu_tensor_free(attn)
+        gpu_tensor_free(probs)
+        gpu_tensor_free(attn_out)
+        gpu_tensor_free(proj)
+        gpu_tensor_free(X_norm2)
+        gpu_tensor_free(gate_pre)
+        gpu_tensor_free(gate)
+        gpu_tensor_free(up)
+        gpu_tensor_free(hidden)
+        gpu_tensor_free(ffn_out)
+
+        layer = layer + 1
+    }
+
+    // Final layernorm
+    let X_final = gpu_layernorm_host(X, 1.0e-5)
+
+    // LM head: logits = X_final @ W_emb^T -> [1 x vocab]
+    let logits = gpu_matmul_nt(X_final, model.W_emb)
+
+    gpu_tensor_free(X)
+    gpu_tensor_free(X_final)
+
+    // Return updated model + logits
+    let updated_model = GpuModel {
+        config: cfg,
+        W_emb: model.W_emb,
+        Wq: model.Wq,
+        Wk: model.Wk,
+        Wv: model.Wv,
+        Wo: model.Wo,
+        Wg: model.Wg,
+        Wu: model.Wu,
+        Wd: model.Wd,
+        kv_cache: cache
+    }
+    [logits, updated_model]
+}
+
+// ===================================================================
+//  Reset KV-cache for new generation
+// ===================================================================
+fn gpu_model_reset_cache(model: GpuModel) {
+    let cache = gpu_kv_cache_reset(model.kv_cache)
+    GpuModel {
+        config: model.config,
+        W_emb: model.W_emb,
+        Wq: model.Wq,
+        Wk: model.Wk,
+        Wv: model.Wv,
+        Wo: model.Wo,
+        Wg: model.Wg,
+        Wu: model.Wu,
+        Wd: model.Wd,
+        kv_cache: cache
+    }
+}
+
+// ===================================================================
+//  Free all model GPU memory
+// ===================================================================
+fn gpu_model_free(model: GpuModel) {
+    let cfg = model.config
+    gpu_tensor_free(model.W_emb)
+    let mut i = 0
+    while i < cfg.n_layers {
+        gpu_tensor_free(model.Wq[i])
+        gpu_tensor_free(model.Wk[i])
+        gpu_tensor_free(model.Wv[i])
+        gpu_tensor_free(model.Wo[i])
+        gpu_tensor_free(model.Wg[i])
+        gpu_tensor_free(model.Wu[i])
+        gpu_tensor_free(model.Wd[i])
+        i = i + 1
+    }
+    let _ = gpu_kv_cache_free(model.kv_cache)
+    println("[gpu_inference] model freed")
+    0
+}
+
+// ===================================================================
+//  Extract last-row logits from prefill output
+//  logits_gt: [seq_len x vocab] -> returns [1 x vocab]
+// ===================================================================
+fn gpu_extract_last_logits(logits_gt, seq_len, vocab) {
+    let byte_offset = (seq_len - 1) * vocab * 4
+    let src = ptr_offset(gt_ptr(logits_gt), byte_offset)
+    let dst = gpu_tensor_zeros(1, vocab)
+    let _ = cuda_memcpy_d2d(gt_ptr(dst), src, vocab * 4)
+    dst
+}
+
+println("[gpu_inference] module loaded — GPU inference engine (prefill + decode)")

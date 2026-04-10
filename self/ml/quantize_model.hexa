@@ -1,0 +1,548 @@
+// ===================================================================
+//  quantize_model.hexa — Full model post-training quantization
+//
+//  Quantize a loaded model (names + tensors) layer by layer.
+//  Features:
+//    - Per-layer configurable precision (FP16/INT8/Q4_0/Q4_K)
+//    - Sensitivity analysis (per-layer MSE ranking)
+//    - Mixed-precision: embed/norm stay FP16, linear layers Q4
+//    - Export quantized model in GGUF v3 format
+//
+//  Uses: quantize.hexa, checkpoint.hexa
+// ===================================================================
+
+use "quantize"
+use "checkpoint"
+
+// ── Quantization config ──────────────────────────────────────────
+struct QuantConfig {
+    default_qtype: int,
+    embed_qtype: int,
+    norm_qtype: int,
+    output_qtype: int
+}
+
+fn default_quant_config() {
+    return QuantConfig {
+        default_qtype: QTYPE_Q4_0(),
+        embed_qtype: QTYPE_FP16(),
+        norm_qtype: QTYPE_FP16(),
+        output_qtype: QTYPE_Q4_0()
+    }
+}
+
+fn q4_k_quant_config() {
+    return QuantConfig {
+        default_qtype: QTYPE_Q4_K(),
+        embed_qtype: QTYPE_FP16(),
+        norm_qtype: QTYPE_FP16(),
+        output_qtype: QTYPE_Q4_K()
+    }
+}
+
+fn int8_quant_config() {
+    return QuantConfig {
+        default_qtype: QTYPE_INT8(),
+        embed_qtype: QTYPE_FP16(),
+        norm_qtype: QTYPE_FP16(),
+        output_qtype: QTYPE_INT8()
+    }
+}
+
+fn fp16_quant_config() {
+    return QuantConfig {
+        default_qtype: QTYPE_FP16(),
+        embed_qtype: QTYPE_FP16(),
+        norm_qtype: QTYPE_FP16(),
+        output_qtype: QTYPE_FP16()
+    }
+}
+
+// ── Layer type detection ─────────────────────────────────────────
+fn _is_norm_layer(name) {
+    let n = len(name)
+    if n >= 4 {
+        let tail = slice(name, n - 4, n)
+        if tail == "norm" { return true }
+    }
+    if n >= 6 {
+        let tail6 = slice(name, n - 6, n)
+        if tail6 == "rms_wt" { return true }
+    }
+    // Check contains "norm" or "ln"
+    let mut i = 0
+    while i < n - 3 {
+        let s4 = slice(name, i, i + 4)
+        if s4 == "norm" { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _is_embed_layer(name) {
+    let n = len(name)
+    let mut i = 0
+    while i < n - 4 {
+        let s5 = slice(name, i, i + 5)
+        if s5 == "embed" { return true }
+        if s5 == "token" { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _is_output_layer(name) {
+    let n = len(name)
+    if n >= 6 {
+        let tail = slice(name, n - 6, n)
+        if tail == "output" { return true }
+    }
+    if n >= 7 {
+        let s = slice(name, 0, 7)
+        if s == "lm_head" { return true }
+    }
+    return false
+}
+
+fn _select_qtype(name, config) {
+    if _is_norm_layer(name) { return config.norm_qtype }
+    if _is_embed_layer(name) { return config.embed_qtype }
+    if _is_output_layer(name) { return config.output_qtype }
+    return config.default_qtype
+}
+
+// ===================================================================
+//  quantize_tensor_by_type(data, qtype) -> QuantizedTensor
+//
+//  Dispatch to the correct quantizer based on qtype.
+//  For INT8, uses per-tensor (1 channel) quantization.
+//  For Q4_0, uses default block_size=32.
+//  For Q4_K, requires len(data) % 256 == 0.
+// ===================================================================
+fn quantize_tensor_by_type(data, qtype) {
+    if qtype == QTYPE_FP16() { return quantize_fp16(data) }
+    if qtype == QTYPE_INT8() { return quantize_int8(data, 1, len(data)) }
+    if qtype == QTYPE_Q4_0() { return quantize_q4_0(data, 32) }
+    if qtype == QTYPE_Q4_K() {
+        let n = len(data)
+        if n % 256 != 0 {
+            // Fall back to Q4_0 if not aligned to 256
+            println("[quantize_model] WARN: " + str(n) + " not aligned to 256, falling back to Q4_0")
+            return quantize_q4_0(data, 32)
+        }
+        return quantize_q4_k(data)
+    }
+    // Default: FP16
+    return quantize_fp16(data)
+}
+
+// ===================================================================
+//  quantize_model(names, tensors, config) -> [names, qtensors, errors]
+//
+//  Quantize all tensors according to config.
+//  Returns: [names, [QuantizedTensor], [ErrorStats]]
+// ===================================================================
+fn quantize_model(names, tensors, config) {
+    let n = len(names)
+    let mut qtensors = []
+    let mut errors = []
+    println("[quantize_model] quantizing " + str(n) + " tensors...")
+    let mut i = 0
+    while i < n {
+        let name = names[i]
+        let data = tensors[i]
+        let numel = len(data)
+        let qtype = _select_qtype(name, config)
+        let type_name = _qtype_name(qtype)
+        // Skip tiny tensors (bias, etc.) -- keep as FP16
+        let mut actual_qtype = qtype
+        if numel < 32 { actual_qtype = QTYPE_FP16() }
+        if actual_qtype == QTYPE_Q4_0() && numel % 32 != 0 {
+            actual_qtype = QTYPE_FP16()
+        }
+        let qt = quantize_tensor_by_type(data, actual_qtype)
+        let err = quantization_error(data, qt)
+        qtensors = qtensors + [qt]
+        errors = errors + [err]
+        println("  [" + str(i) + "] " + name + " (" + str(numel) + ") -> " + _qtype_name(actual_qtype) + " MSE=" + str(err.mse))
+        i = i + 1
+    }
+    println("[quantize_model] done: " + str(n) + " tensors quantized")
+    return [names, qtensors, errors]
+}
+
+// ===================================================================
+//  sensitivity_analysis(names, tensors) -> sorted list by MSE
+//
+//  Quantize each layer to Q4_0 and rank by quantization error.
+//  Layers with highest MSE are most sensitive to quantization.
+//  Returns [[name, mse, snr], ...] sorted by MSE descending.
+// ===================================================================
+fn sensitivity_analysis(names, tensors) {
+    let n = len(names)
+    let mut results = []
+    println("[sensitivity] analyzing " + str(n) + " tensors...")
+    let mut i = 0
+    while i < n {
+        let name = names[i]
+        let data = tensors[i]
+        let numel = len(data)
+        if numel < 32 {
+            results = results + [[name, 0.0, 999.0]]
+            i = i + 1
+            while false { i = i }
+            i = i + 1 - 1
+        } else {
+            let mut qtype = QTYPE_Q4_0()
+            if numel % 32 != 0 { qtype = QTYPE_FP16() }
+            let qt = quantize_tensor_by_type(data, qtype)
+            let err = quantization_error(data, qt)
+            results = results + [[name, err.mse, err.snr]]
+        }
+        i = i + 1
+    }
+    // Sort by MSE descending (simple insertion sort)
+    let nr = len(results)
+    let mut si = 1
+    while si < nr {
+        let key = results[si]
+        let mut j = si - 1
+        let mut done = false
+        while j >= 0 && !done {
+            if results[j][1] < key[1] {
+                results[j + 1] = results[j]
+                j = j - 1
+            } else {
+                done = true
+            }
+        }
+        results[j + 1] = key
+        si = si + 1
+    }
+    println("[sensitivity] ranking (most sensitive first):")
+    let mut k = 0
+    while k < nr {
+        println("  " + str(k + 1) + ". " + results[k][0] + " MSE=" + str(results[k][1]) + " SNR=" + str(results[k][2]) + "dB")
+        k = k + 1
+    }
+    return results
+}
+
+// ===================================================================
+//  export_gguf(names, qtensors, path, metadata)
+//
+//  Write quantized model in GGUF v3 format.
+//  metadata: [[key, type_id, value], ...]
+//
+//  GGUF v3 layout:
+//    magic(u32) + version(u32) + n_tensors(u64) + n_kv(u64)
+//    [kv metadata]*
+//    [tensor_info]*
+//    alignment padding
+//    [tensor data blob]
+// ===================================================================
+fn export_gguf(names, qtensors, path, metadata) {
+    let n = len(names)
+    let alignment = 32
+    let mut buf = []
+
+    // ── Header ─────────────────────────────────────
+    // magic "GGUF" LE
+    buf = buf + [0x47, 0x47, 0x55, 0x46]
+    // version = 3
+    buf = buf + _u32_le(3)
+    // n_tensors
+    buf = buf + _u64_le(n)
+    // n_kv
+    let n_kv = len(metadata)
+    buf = buf + _u64_le(n_kv)
+
+    // ── KV metadata ────────────────────────────────
+    let mut mi = 0
+    while mi < n_kv {
+        let entry = metadata[mi]
+        let key = entry[0]
+        let vtype = entry[1]
+        let val = entry[2]
+        // string key
+        buf = buf + _gguf_encode_string(key)
+        // type
+        buf = buf + _u32_le(vtype)
+        // value (simplified: u32 or string)
+        if vtype == 4 {
+            // u32
+            buf = buf + _u32_le(val)
+        }
+        if vtype == 8 {
+            // string
+            buf = buf + _gguf_encode_string(val)
+        }
+        mi = mi + 1
+    }
+
+    // ── Tensor info ────────────────────────────────
+    // Pre-compute data offsets
+    let mut data_sizes = []
+    let mut ti = 0
+    while ti < n {
+        let qt = qtensors[ti]
+        let sz = _gguf_tensor_data_size(qt)
+        data_sizes = data_sizes + [sz]
+        ti = ti + 1
+    }
+
+    let mut cum_offset = 0
+    ti = 0
+    while ti < n {
+        let qt = qtensors[ti]
+        // name
+        buf = buf + _gguf_encode_string(names[ti])
+        // n_dims = 1
+        buf = buf + _u32_le(1)
+        // shape[0] = numel
+        buf = buf + _u64_le(qt.numel)
+        // ggml_type
+        let ggml_t = _qtype_to_ggml(qt.qtype)
+        buf = buf + _u32_le(ggml_t)
+        // offset (relative to data blob start)
+        buf = buf + _u64_le(cum_offset)
+        cum_offset = cum_offset + data_sizes[ti]
+        // align cumulative offset
+        let rem = cum_offset % alignment
+        if rem != 0 { cum_offset = cum_offset + (alignment - rem) }
+        ti = ti + 1
+    }
+
+    // ── Alignment padding ──────────────────────────
+    let hdr_rem = len(buf) % alignment
+    if hdr_rem != 0 {
+        let pad = alignment - hdr_rem
+        let mut pi = 0
+        while pi < pad {
+            buf = buf + [0]
+            pi = pi + 1
+        }
+    }
+
+    // ── Tensor data blob ───────────────────────────
+    ti = 0
+    while ti < n {
+        let qt = qtensors[ti]
+        buf = buf + _gguf_encode_tensor_data(qt)
+        // Alignment padding
+        let rem2 = len(buf) % alignment
+        if rem2 != 0 {
+            let pad2 = alignment - rem2
+            let mut pi2 = 0
+            while pi2 < pad2 {
+                buf = buf + [0]
+                pi2 = pi2 + 1
+            }
+        }
+        ti = ti + 1
+    }
+
+    write_file_bytes(path, buf)
+    println("[export_gguf] wrote " + str(len(buf)) + " bytes to " + path + " (" + str(n) + " tensors)")
+    return len(buf)
+}
+
+// ── GGUF encoding helpers ────────────────────────────────────────
+fn _u32_le(v) {
+    let b0 = v % 256
+    let b1 = (v / 256) % 256
+    let b2 = (v / 65536) % 256
+    let b3 = (v / 16777216) % 256
+    return [b0, b1, b2, b3]
+}
+
+fn _u64_le(v) {
+    let lo = v % 4294967296
+    let hi = v / 4294967296
+    return _u32_le(lo) + _u32_le(hi)
+}
+
+fn _f16_le(bits) {
+    let b0 = bits % 256
+    let b1 = (bits / 256) % 256
+    return [b0, b1]
+}
+
+fn _gguf_encode_string(s) {
+    let n = len(s)
+    let mut out = _u64_le(n)
+    let mut i = 0
+    while i < n {
+        out = out + [char_code_at(s, i)]
+        i = i + 1
+    }
+    return out
+}
+
+fn _qtype_to_ggml(qtype) {
+    if qtype == QTYPE_FP16() { return 1 }
+    if qtype == QTYPE_INT8() { return 8 }
+    if qtype == QTYPE_Q4_0() { return 2 }
+    if qtype == QTYPE_Q4_K() { return 12 }
+    return 0
+}
+
+fn _gguf_tensor_data_size(qt) {
+    if qt.qtype == QTYPE_FP16() { return qt.numel * 2 }
+    if qt.qtype == QTYPE_INT8() {
+        // data bytes + per-channel f32 scale
+        let n_ch = len(qt.scales)
+        return qt.numel + n_ch * 4
+    }
+    if qt.qtype == QTYPE_Q4_0() {
+        // per block: 2 bytes (f16 scale) + block_size/2 nibble bytes
+        let nblocks = qt.numel / qt.block_size
+        return nblocks * (2 + qt.block_size / 2)
+    }
+    if qt.qtype == QTYPE_Q4_K() {
+        // per super-block (256): 2+2+12+128 = 144 bytes
+        let nblocks = qt.numel / 256
+        return nblocks * 144
+    }
+    return qt.numel * 4
+}
+
+fn _gguf_encode_tensor_data(qt) {
+    let mut out = []
+    if qt.qtype == QTYPE_FP16() {
+        let mut i = 0
+        while i < qt.numel {
+            out = out + _f16_le(qt.data[i])
+            i = i + 1
+        }
+        return out
+    }
+    if qt.qtype == QTYPE_INT8() {
+        // Interleave: for each channel, write scale(f32) + data
+        // Simplified: write all scales first, then all data bytes
+        let n_ch = len(qt.scales)
+        let mut c = 0
+        while c < n_ch {
+            out = out + _encode_f32_le_export(qt.scales[c])
+            c = c + 1
+        }
+        let mut i = 0
+        while i < qt.numel {
+            // INT8 stored as signed byte: map [-128,127] -> [0,255]
+            let mut v = qt.data[i]
+            if v < 0 { v = v + 256 }
+            out = out + [v]
+            i = i + 1
+        }
+        return out
+    }
+    if qt.qtype == QTYPE_Q4_0() {
+        let bs = qt.block_size
+        let nblocks = qt.numel / bs
+        let half = bs / 2
+        let mut b = 0
+        while b < nblocks {
+            // f16 scale
+            out = out + _f16_le(qt.scales[b])
+            // nibble bytes
+            let qbase = b * half
+            let mut j = 0
+            while j < half {
+                out = out + [qt.data[qbase + j]]
+                j = j + 1
+            }
+            b = b + 1
+        }
+        return out
+    }
+    if qt.qtype == QTYPE_Q4_K() {
+        let nblocks = qt.numel / 256
+        let mut b = 0
+        while b < nblocks {
+            // d (f16)
+            out = out + _f16_le(qt.scales[b])
+            // dmin (f16)
+            out = out + _f16_le(qt.scales[nblocks + b])
+            // scales[12] packed
+            let packed = qt.scales[2 * nblocks + b]
+            let mut si = 0
+            while si < 12 {
+                out = out + [packed[si]]
+                si = si + 1
+            }
+            // qs[128]
+            let qbase = b * 128
+            let mut j = 0
+            while j < 128 {
+                out = out + [qt.data[qbase + j]]
+                j = j + 1
+            }
+            b = b + 1
+        }
+        return out
+    }
+    return out
+}
+
+// f32 encode for export (reuse checkpoint logic)
+fn _encode_f32_le_export(val) {
+    if val == 0.0 { return [0, 0, 0, 0] }
+    let mut v = val
+    let mut sign = 0
+    if v < 0.0 {
+        sign = 1
+        v = 0.0 - v
+    }
+    let mut exp = 0
+    let mut m = v
+    if m >= 2.0 {
+        while m >= 2.0 {
+            m = m / 2.0
+            exp = exp + 1
+        }
+    } else {
+        while m < 1.0 {
+            m = m * 2.0
+            exp = exp - 1
+        }
+    }
+    let biased = exp + 127
+    if biased >= 255 {
+        let bits = sign * 2147483648 + 255 * 8388608
+        return _u32_le(bits)
+    }
+    if biased <= 0 { return [0, 0, 0, 0] }
+    let frac = m - 1.0
+    let mant = int(frac * 8388608.0 + 0.5)
+    let mut mc = mant
+    if mc > 8388607 { mc = 8388607 }
+    let bits = sign * 2147483648 + biased * 8388608 + mc
+    return _u32_le(bits)
+}
+
+// ===================================================================
+//  Convenience: quantize a checkpoint file
+//
+//  quantize_checkpoint(input_path, output_path, config)
+//  Loads .hxck, quantizes, exports as GGUF.
+// ===================================================================
+fn quantize_checkpoint(input_path, output_path, config) {
+    println("[quantize_checkpoint] loading " + input_path + "...")
+    let loaded = load_checkpoint(input_path)
+    let names = loaded[0]
+    let tensors = loaded[1]
+    if len(names) == 0 {
+        println("[quantize_checkpoint] ERROR: no tensors loaded")
+        return 0
+    }
+    let result = quantize_model(names, tensors, config)
+    let qnames = result[0]
+    let qtensors = result[1]
+    let meta = [
+        ["general.architecture", 8, "llama"],
+        ["general.quantization_version", 4, 2]
+    ]
+    let sz = export_gguf(qnames, qtensors, output_path, meta)
+    println("[quantize_checkpoint] done: " + str(sz) + " bytes -> " + output_path)
+    return sz
+}

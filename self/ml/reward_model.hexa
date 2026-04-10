@@ -1,0 +1,316 @@
+// ═══════════════════════════════════════════════════════════════
+//  reward_model.hexa — Reward model for RLHF alignment
+//
+//  Architecture: same transformer backbone (8L, d=768, ff=2048)
+//  but with a scalar output head instead of LM head.
+//
+//  Forward:  input_ids → embedding → 8L transformer → last_token → Whead → scalar
+//  Training: preference pairs (chosen, rejected) → reward margin loss
+//            L = -log(sigmoid(r_chosen - r_rejected))
+//
+//  All operations use Accelerate BLAS via hexa builtins.
+// ═══════════════════════════════════════════════════════════════
+
+let RM_DIM    = 768
+let RM_HEADS  = 8
+let RM_HEAD_D = 96
+let RM_FF     = 2048
+let RM_VOCAB  = 256
+let RM_LAYERS = 8
+let RM_SEQ    = 128
+let RM_dd     = RM_DIM * RM_DIM
+let RM_df     = RM_DIM * RM_FF
+let RM_fd     = RM_FF * RM_DIM
+
+// ── Weight initialization ───────────────────────────────────
+fn rm_init_scale(n) { 0.02 / sqrt(n * 1.0) }
+
+pub fn rm_create_weights() {
+    let scale = rm_init_scale(RM_DIM)
+    let mut Wq  = []
+    let mut Wk  = []
+    let mut Wv  = []
+    let mut Wo  = []
+    let mut Wup = []
+    let mut Wdn = []
+    let mut il = 0
+    while il < RM_LAYERS {
+        Wq  = Wq.push(tensor_fill(RM_dd, scale))
+        Wk  = Wk.push(tensor_fill(RM_dd, scale))
+        Wv  = Wv.push(tensor_fill(RM_dd, scale))
+        Wo  = Wo.push(tensor_fill(RM_dd, scale))
+        Wup = Wup.push(tensor_fill(RM_df, scale))
+        Wdn = Wdn.push(tensor_fill(RM_fd, scale))
+        il = il + 1
+    }
+    let W_emb = tensor_fill(RM_VOCAB * RM_DIM, scale)
+    // Scalar reward head: projects DIM → 1
+    let W_head = tensor_fill(RM_DIM, scale)
+    [Wq, Wk, Wv, Wo, Wup, Wdn, W_emb, W_head]
+}
+
+// ── Gradient storage ────────────────────────────────────────
+pub fn rm_create_grads() {
+    let mut Gq  = []
+    let mut Gk  = []
+    let mut Gv  = []
+    let mut Go  = []
+    let mut Gup = []
+    let mut Gdn = []
+    let mut il = 0
+    while il < RM_LAYERS {
+        Gq  = Gq.push(tensor_zeros(RM_dd))
+        Gk  = Gk.push(tensor_zeros(RM_dd))
+        Gv  = Gv.push(tensor_zeros(RM_dd))
+        Go  = Go.push(tensor_zeros(RM_dd))
+        Gup = Gup.push(tensor_zeros(RM_df))
+        Gdn = Gdn.push(tensor_zeros(RM_fd))
+        il = il + 1
+    }
+    let g_emb = tensor_zeros(RM_VOCAB * RM_DIM)
+    let g_head = tensor_zeros(RM_DIM)
+    [Gq, Gk, Gv, Go, Gup, Gdn, g_emb, g_head]
+}
+
+// ── Momentum storage ────────────────────────────────────────
+pub fn rm_create_momentum() {
+    let mut Mq  = []
+    let mut Mk  = []
+    let mut Mv  = []
+    let mut Mo  = []
+    let mut Mup = []
+    let mut Mdn = []
+    let mut il = 0
+    while il < RM_LAYERS {
+        Mq  = Mq.push(tensor_zeros(RM_dd))
+        Mk  = Mk.push(tensor_zeros(RM_dd))
+        Mv  = Mv.push(tensor_zeros(RM_dd))
+        Mo  = Mo.push(tensor_zeros(RM_dd))
+        Mup = Mup.push(tensor_zeros(RM_df))
+        Mdn = Mdn.push(tensor_zeros(RM_fd))
+        il = il + 1
+    }
+    let m_emb = tensor_zeros(RM_VOCAB * RM_DIM)
+    let m_head = tensor_zeros(RM_DIM)
+    [Mq, Mk, Mv, Mo, Mup, Mdn, m_emb, m_head]
+}
+
+// ── Scratch buffers ─────────────────────────────────────────
+pub fn rm_create_scratch() {
+    let sQ   = tensor_zeros(RM_SEQ * RM_DIM)
+    let sK   = tensor_zeros(RM_SEQ * RM_DIM)
+    let sV   = tensor_zeros(RM_SEQ * RM_DIM)
+    let sSc  = tensor_zeros(RM_SEQ * RM_SEQ)
+    let sAt  = tensor_zeros(RM_SEQ * RM_DIM)
+    let sO   = tensor_zeros(RM_SEQ * RM_DIM)
+    let sFF1 = tensor_zeros(RM_SEQ * RM_FF)
+    let sFF2 = tensor_zeros(RM_SEQ * RM_DIM)
+    [sQ, sK, sV, sSc, sAt, sO, sFF1, sFF2]
+}
+
+// ── Embedding lookup ────────────────────────────────────────
+fn rm_embed(W_emb, ids) {
+    let n = len(ids)
+    let mut h = tensor_zeros(n * RM_DIM)
+    let mut i = 0
+    while i < n {
+        let tok = ids[i]
+        let base_src = tok * RM_DIM
+        let base_dst = i * RM_DIM
+        let mut d = 0
+        while d < RM_DIM {
+            h[base_dst + d] = W_emb[base_src + d]
+            d = d + 1
+        }
+        i = i + 1
+    }
+    h
+}
+
+// ── Forward pass through transformer layers ─────────────────
+fn rm_transformer_fwd(weights, h, scratch) {
+    let Wq  = weights[0]
+    let Wk  = weights[1]
+    let Wv  = weights[2]
+    let Wo  = weights[3]
+    let Wup = weights[4]
+    let Wdn = weights[5]
+    let sQ   = scratch[0]
+    let sK   = scratch[1]
+    let sV   = scratch[2]
+    let sSc  = scratch[3]
+    let sAt  = scratch[4]
+    let sO   = scratch[5]
+    let sFF1 = scratch[6]
+    let sFF2 = scratch[7]
+    let mut li = 0
+    while li < RM_LAYERS {
+        let q = matmul_into(h, Wq[li], RM_SEQ, RM_DIM, RM_DIM, sQ)
+        let k = matmul_into(h, Wk[li], RM_SEQ, RM_DIM, RM_DIM, sK)
+        let v = matmul_into(h, Wv[li], RM_SEQ, RM_DIM, RM_DIM, sV)
+        let sc = matmul_transpose_b_into(q, k, RM_SEQ, RM_DIM, RM_SEQ, sSc)
+        mat_scale_inplace(sc, 1.0 / sqrt(RM_HEAD_D * 1.0))
+        let at = matmul_into(sc, v, RM_SEQ, RM_SEQ, RM_DIM, sAt)
+        let o = matmul_into(at, Wo[li], RM_SEQ, RM_DIM, RM_DIM, sO)
+        mat_add_inplace(h, o)
+        let ff1 = matmul_into(h, Wup[li], RM_SEQ, RM_DIM, RM_FF, sFF1)
+        let ff2 = matmul_into(ff1, Wdn[li], RM_SEQ, RM_FF, RM_DIM, sFF2)
+        mat_add_inplace(h, ff2)
+        li = li + 1
+    }
+    h
+}
+
+// ── Extract last token hidden state ─────────────────────────
+fn rm_last_hidden(h, seq_len) {
+    let base = (seq_len - 1) * RM_DIM
+    let mut last = tensor_zeros(RM_DIM)
+    let mut d = 0
+    while d < RM_DIM {
+        last[d] = h[base + d]
+        d = d + 1
+    }
+    last
+}
+
+// ── Reward forward: input_ids → scalar reward ───────────────
+pub fn reward_forward(weights, ids, scratch) {
+    let W_emb = weights[6]
+    let W_head = weights[7]
+    let h = rm_embed(W_emb, ids)
+    let h_out = rm_transformer_fwd(weights, h, scratch)
+    let last = rm_last_hidden(h_out, len(ids))
+    // Scalar output: dot(last, W_head)
+    let dot = matmul(last, W_head, 1, RM_DIM, 1)
+    dot[0]
+}
+
+// ── Reward margin loss ──────────────────────────────────────
+// L = -log(sigmoid(r_chosen - r_rejected))
+// sigmoid(x) = 1/(1+exp(-x))
+// -log(sigmoid(x)) = log(1+exp(-x)) = softplus(-x)
+pub fn reward_margin_loss(r_chosen, r_rejected) {
+    let margin = r_chosen - r_rejected
+    // softplus(-margin) = log(1 + exp(-margin))
+    // numerically stable: max(0, -margin) + log(1 + exp(-|margin|))
+    let neg_m = 0.0 - margin
+    let abs_m = margin
+    let mut stable = 0.0
+    if neg_m > 0.0 {
+        stable = neg_m + log(1.0 + exp(0.0 - neg_m))
+    } else {
+        stable = log(1.0 + exp(neg_m))
+    }
+    stable
+}
+
+// ── Reward backward (simplified, last-token head only) ──────
+// d_Whead = last_h * d_loss
+// d_last  = W_head * d_loss
+fn rm_backward_head(W_head, last_h, d_loss, g_head) {
+    let mut d = 0
+    while d < RM_DIM {
+        g_head[d] = g_head[d] + last_h[d] * d_loss
+        d = d + 1
+    }
+    // Return d_last for chain rule into transformer
+    let d_last = mat_scale(W_head, d_loss)
+    d_last
+}
+
+// ── SGD step for single param ───────────────────────────────
+let RM_MOMENTUM = 0.9
+let RM_WD = 0.01
+
+fn rm_sgd(w, g, m, lr) {
+    mat_scale_inplace(w, 1.0 - lr * RM_WD)
+    mat_scale_inplace(m, RM_MOMENTUM)
+    mat_add_inplace(m, g)
+    axpy(w, m, -1.0 * lr)
+}
+
+// ── Optimizer step (all params) ─────────────────────────────
+fn rm_opt_step(weights, grads, momenta, lr) {
+    let mut li = 0
+    while li < RM_LAYERS {
+        rm_sgd(weights[0][li], grads[0][li], momenta[0][li], lr)
+        rm_sgd(weights[1][li], grads[1][li], momenta[1][li], lr)
+        rm_sgd(weights[2][li], grads[2][li], momenta[2][li], lr)
+        rm_sgd(weights[3][li], grads[3][li], momenta[3][li], lr)
+        rm_sgd(weights[4][li], grads[4][li], momenta[4][li], lr)
+        rm_sgd(weights[5][li], grads[5][li], momenta[5][li], lr)
+        li = li + 1
+    }
+    rm_sgd(weights[6], grads[6], momenta[6], lr)
+    rm_sgd(weights[7], grads[7], momenta[7], lr)
+    0
+}
+
+// ── Zero gradients ──────────────────────────────────────────
+fn rm_zero_grad(grads) {
+    let mut li = 0
+    while li < RM_LAYERS {
+        mat_scale_inplace(grads[0][li], 0.0)
+        mat_scale_inplace(grads[1][li], 0.0)
+        mat_scale_inplace(grads[2][li], 0.0)
+        mat_scale_inplace(grads[3][li], 0.0)
+        mat_scale_inplace(grads[4][li], 0.0)
+        mat_scale_inplace(grads[5][li], 0.0)
+        li = li + 1
+    }
+    mat_scale_inplace(grads[6], 0.0)
+    mat_scale_inplace(grads[7], 0.0)
+    0
+}
+
+// ── Train reward model on preference pairs ──────────────────
+// pairs: array of [chosen_ids, rejected_ids]
+pub fn rm_train(weights, grads, momenta, scratch, pairs, n_steps, lr) {
+    let n_pairs = len(pairs)
+    println("[reward_model] training on " + str(n_pairs) + " preference pairs for " + str(n_steps) + " steps")
+    let mut step = 0
+    while step < n_steps {
+        let t0 = clock()
+        let mut total_loss = 0.0
+        let mut pi = 0
+        while pi < n_pairs {
+            rm_zero_grad(grads)
+            let pair = pairs[pi]
+            let chosen_ids = pair[0]
+            let rejected_ids = pair[1]
+            let r_chosen = reward_forward(weights, chosen_ids, scratch)
+            let r_rejected = reward_forward(weights, rejected_ids, scratch)
+            let loss = reward_margin_loss(r_chosen, r_rejected)
+            total_loss = total_loss + loss
+            // Gradient of margin loss w.r.t. margin
+            // d/d_margin softplus(-margin) = -sigmoid(-margin) = -(1/(1+exp(margin)))
+            let margin = r_chosen - r_rejected
+            let d_margin = -1.0 / (1.0 + exp(margin))
+            // d_r_chosen  = d_margin, d_r_rejected = -d_margin
+            let last_c = rm_last_hidden(rm_embed(weights[6], chosen_ids), len(chosen_ids))
+            let last_r = rm_last_hidden(rm_embed(weights[6], rejected_ids), len(rejected_ids))
+            // Backprop through head for chosen
+            let _ = rm_backward_head(weights[7], last_c, d_margin, grads[7])
+            // Backprop through head for rejected
+            let _ = rm_backward_head(weights[7], last_r, 0.0 - d_margin, grads[7])
+            rm_opt_step(weights, grads, momenta, lr)
+            pi = pi + 1
+        }
+        let t1 = clock()
+        let avg_loss = total_loss / (n_pairs * 1.0)
+        let ms = (t1 - t0) * 1000.0
+        println("{\"step\":" + str(step) + ",\"avg_loss\":" + str(avg_loss) + ",\"ms\":" + str(ms) + "}")
+        step = step + 1
+    }
+    0
+}
+
+// ── Param count ─────────────────────────────────────────────
+pub fn rm_param_count() {
+    let embed = RM_VOCAB * RM_DIM
+    let per_layer = RM_dd * 4 + RM_df + RM_fd
+    let head = RM_DIM
+    embed + per_layer * RM_LAYERS + head
+}
+
+println("[reward_model] loaded — " + str(rm_param_count()) + " params, " + str(RM_LAYERS) + "L d=" + str(RM_DIM))

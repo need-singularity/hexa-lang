@@ -1,0 +1,312 @@
+// ═══════════════════════════════════════════════════════════════
+//  finetune_test.hexa — Tests for fine-tuning engine
+//
+//  Tests:
+//    1. LoRA forward correctness (B=0 matches base)
+//    2. LoRA backward gradient check (finite difference)
+//    3. LoRA fine-tune convergence (loss decreases)
+//    4. Full fine-tune convergence
+//    5. LoRA merge correctness (merged == lora forward)
+//    6. Config presets load correctly
+//    7. Gradient clipping
+//    8. LR cosine schedule
+//    9. Full vs LoRA comparison
+// ═══════════════════════════════════════════════════════════════
+
+use "finetune"
+use "finetune_config"
+
+let mut _pass = 0
+let mut _fail = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        _pass = _pass + 1
+    } else {
+        println("[FAIL] " + name)
+        _fail = _fail + 1
+    }
+}
+
+fn approx_eq(a, b, eps) {
+    let d = a - b
+    let ad = if d < 0.0 { 0.0 - d } else { d }
+    ad < eps
+}
+
+// ── Helper: make a test layer ───────────────────────────────
+fn make_layer(out_dim, in_dim, seed) {
+    FTLayer {
+        w: ft_kaiming_init(out_dim, in_dim, seed),
+        out_dim: out_dim,
+        in_dim: in_dim
+    }
+}
+
+// ── Test 1: LoRA forward correctness ────────────────────────
+fn test_lora_forward() {
+    let m = 4
+    let n = 3
+    let r = 2
+    let alpha = 4
+
+    let layer = make_layer(m, n, 42)
+    let adapter = make_lora_adapter(m, n, r, 7)
+    let x = [1.0, 0.5, -0.3]
+
+    // With B=0, LoRA forward should equal base forward
+    let y_lora = lora_layer_forward(layer.w, adapter.a, adapter.b, x, m, n, r, alpha)
+    let y_base = full_layer_forward(layer.w, x, m, n)
+
+    let mut match_ok = true
+    for i in 0..m {
+        if !approx_eq(y_lora[i], y_base[i], 1.0e-6) {
+            match_ok = false
+        }
+    }
+    check("lora_forward B=0 matches base", match_ok)
+
+    // With non-zero B, output should differ
+    let b2 = ft_kaiming_init(m, r, 99)
+    let y_lora2 = lora_layer_forward(layer.w, adapter.a, b2, x, m, n, r, alpha)
+    let mut differ = false
+    for i in 0..m {
+        if !approx_eq(y_lora2[i], y_base[i], 1.0e-6) {
+            differ = true
+        }
+    }
+    check("lora_forward B!=0 differs from base", differ)
+}
+
+// ── Test 2: LoRA backward gradient check ────────────────────
+fn test_lora_backward_gradcheck() {
+    let m = 3
+    let n = 4
+    let r = 2
+    let alpha = 4
+    let eps = 1.0e-4
+
+    let w = ft_kaiming_init(m, n, 10)
+    let mut a = ft_kaiming_init(r, n, 20)
+    let b = ft_kaiming_init(m, r, 30)
+    let x = [0.5, -0.3, 0.8, 0.1]
+    let target = [1.0, -0.5, 0.2]
+
+    // Analytic gradient
+    let y = lora_layer_forward(w, a, b, x, m, n, r, alpha)
+    let dy = ft_mse_grad(y, target, m)
+    let grads = lora_layer_backward(a, b, x, dy, m, n, r, alpha)
+    let da_analytic = grads[0]
+
+    // Finite difference for A[0][0]
+    let a_orig = a[0][0]
+    a[0][0] = a_orig + eps
+    let y_plus = lora_layer_forward(w, a, b, x, m, n, r, alpha)
+    let l_plus = ft_mse_loss(y_plus, target, m)
+    a[0][0] = a_orig - eps
+    let y_minus = lora_layer_forward(w, a, b, x, m, n, r, alpha)
+    let l_minus = ft_mse_loss(y_minus, target, m)
+    a[0][0] = a_orig
+
+    let fd_grad = (l_plus - l_minus) / (2.0 * eps)
+    let analytic = da_analytic[0][0]
+    check("lora_backward gradcheck A[0][0]", approx_eq(fd_grad, analytic, 1.0e-3))
+}
+
+// ── Test 3: LoRA fine-tune convergence ──────────────────────
+fn test_lora_finetune_convergence() {
+    let model = [
+        make_layer(6, 4, 42),
+        make_layer(3, 6, 99)
+    ]
+
+    let dataset = [
+        [[0.5, -0.3, 0.8, 0.1], [1.0, -0.5, 0.2]],
+        [[0.1, 0.9, -0.2, 0.4], [0.3, 0.7, -0.1]],
+        [[-0.4, 0.2, 0.6, -0.8], [-0.2, 0.4, 0.9]]
+    ]
+
+    let cfg = config_custom(0.01, 100, 2, 4)
+
+    let result = lora_finetune(model, dataset, cfg)
+    let final_loss = result[1]
+    let log = result[2]
+
+    let first_loss = log[0]
+    check("lora_finetune loss decreased", final_loss < first_loss)
+    check("lora_finetune loss < 0.5", final_loss < 0.5)
+}
+
+// ── Test 4: Full fine-tune convergence ──────────────────────
+fn test_full_finetune_convergence() {
+    let model = [
+        make_layer(6, 4, 42),
+        make_layer(3, 6, 99)
+    ]
+
+    let dataset = [
+        [[0.5, -0.3, 0.8, 0.1], [1.0, -0.5, 0.2]],
+        [[0.1, 0.9, -0.2, 0.4], [0.3, 0.7, -0.1]],
+        [[-0.4, 0.2, 0.6, -0.8], [-0.2, 0.4, 0.9]]
+    ]
+
+    let cfg = config_custom(0.005, 100, 2, 4)
+
+    let result = full_finetune(model, dataset, cfg)
+    let final_loss = result[1]
+    let log = result[2]
+
+    let first_loss = log[0]
+    check("full_finetune loss decreased", final_loss < first_loss)
+    check("full_finetune loss < 0.3", final_loss < 0.3)
+}
+
+// ── Test 5: LoRA merge correctness ──────────────────────────
+fn test_lora_merge() {
+    let m = 4
+    let n = 3
+    let r = 2
+    let alpha = 4
+
+    let layer = make_layer(m, n, 42)
+    let a = ft_kaiming_init(r, n, 7)
+    let b = ft_kaiming_init(m, r, 13)
+    let x = [1.0, 0.5, -0.3]
+
+    // LoRA forward
+    let y_lora = lora_layer_forward(layer.w, a, b, x, m, n, r, alpha)
+
+    // Merge and base forward
+    let base_model = [layer]
+    let adapter = LoraAdapter {
+        a: a,
+        b: b,
+        out_dim: m,
+        in_dim: n,
+        rank: r
+    }
+    let adapters = [adapter]
+    let merged = merge_lora(base_model, adapters, alpha)
+    let w_merged = merged[0].w
+    let y_merged = ft_matvec(w_merged, x, m, n)
+
+    let mut ok = true
+    for i in 0..m {
+        if !approx_eq(y_lora[i], y_merged[i], 1.0e-6) {
+            ok = false
+        }
+    }
+    check("merge_lora output matches lora_forward", ok)
+}
+
+// ── Test 6: Config presets ──────────────────────────────────
+fn test_config_presets() {
+    let c1 = config_instruction()
+    check("instruction preset lr", approx_eq(c1.lr, 2.0e-5, 1.0e-10))
+    check("instruction preset rank", c1.lora_rank == 8)
+
+    let c2 = config_domain_adaptation()
+    check("domain preset lr", approx_eq(c2.lr, 1.0e-4, 1.0e-10))
+    check("domain preset rank", c2.lora_rank == 16)
+
+    let c3 = config_chat()
+    check("chat preset lr", approx_eq(c3.lr, 5.0e-5, 1.0e-10))
+    check("chat preset rank", c3.lora_rank == 4)
+
+    let c4 = config_custom(0.001, 500, 8, 16)
+    check("custom preset lr", approx_eq(c4.lr, 0.001, 1.0e-10))
+    check("custom preset total_steps", c4.total_steps == 500)
+}
+
+// ── Test 7: Gradient clipping ───────────────────────────────
+fn test_grad_clipping() {
+    let g = [[10.0, 20.0], [30.0, 40.0]]
+    let norm_before = grad_norm_2d(g, 2, 2)
+    let clipped = clip_grad_2d(g, 1.0, 2, 2)
+    let norm_after = grad_norm_2d(clipped, 2, 2)
+    check("grad_clip reduces norm", norm_after < norm_before)
+    check("grad_clip norm <= max", approx_eq(norm_after, 1.0, 1.0e-6))
+
+    // Already small gradient should not be clipped
+    let g_small = [[0.01, 0.02], [0.03, 0.04]]
+    let clipped_small = clip_grad_2d(g_small, 1.0, 2, 2)
+    let mut unchanged = true
+    for i in 0..2 {
+        for j in 0..2 {
+            if !approx_eq(g_small[i][j], clipped_small[i][j], 1.0e-10) {
+                unchanged = false
+            }
+        }
+    }
+    check("grad_clip no-op for small grad", unchanged)
+}
+
+// ── Test 8: LR cosine schedule ──────────────────────────────
+fn test_lr_schedule() {
+    let peak = 0.001
+    let minimum = 0.0001
+    let warmup = 10
+    let total = 100
+
+    let lr0 = lr_cosine(0, warmup, total, peak, minimum)
+    check("lr_cosine step=0 is 0", approx_eq(lr0, 0.0, 1.0e-10))
+
+    let lr_w = lr_cosine(warmup, warmup, total, peak, minimum)
+    check("lr_cosine step=warmup is peak", approx_eq(lr_w, peak, 1.0e-6))
+
+    let lr_end = lr_cosine(total, warmup, total, peak, minimum)
+    check("lr_cosine step=total is min", approx_eq(lr_end, minimum, 1.0e-6))
+
+    let lr_mid = lr_cosine(55, warmup, total, peak, minimum)
+    check("lr_cosine mid > min", lr_mid > minimum)
+    check("lr_cosine mid <= peak", lr_mid <= peak)
+}
+
+// ── Test 9: Full vs LoRA comparison ─────────────────────────
+fn test_full_vs_lora() {
+    let model = [
+        make_layer(4, 3, 42),
+        make_layer(2, 4, 99)
+    ]
+    let dataset = [
+        [[1.0, 0.5, -0.3], [0.8, -0.2]],
+        [[0.2, -0.7, 0.4], [-0.3, 0.9]]
+    ]
+
+    let cfg_full = config_custom(0.005, 200, 2, 4)
+    let cfg_lora = config_custom(0.01, 200, 2, 4)
+
+    let res_full = full_finetune(model, dataset, cfg_full)
+    let res_lora = lora_finetune(model, dataset, cfg_lora)
+
+    println("[comparison] full_loss=" + str(res_full[1]) + " lora_loss=" + str(res_lora[1]))
+    check("both converge (full)", res_full[1] < 0.5)
+    check("both converge (lora)", res_lora[1] < 0.5)
+}
+
+// ── Run all tests ───────────────────────────────────────────
+println("=" * 60)
+println("  finetune_test.hexa — Fine-tuning Engine Tests")
+println("=" * 60)
+
+test_lora_forward()
+test_lora_backward_gradcheck()
+test_lora_finetune_convergence()
+test_full_finetune_convergence()
+test_lora_merge()
+test_config_presets()
+test_grad_clipping()
+test_lr_schedule()
+test_full_vs_lora()
+
+println("")
+println("=" * 60)
+println("  Results: " + str(_pass) + " PASS, " + str(_fail) + " FAIL")
+println("=" * 60)
+
+if _fail > 0 {
+    println("[FAIL] " + str(_fail) + " tests failed")
+} else {
+    println("[ALL PASS] fine-tuning engine verified")
+}

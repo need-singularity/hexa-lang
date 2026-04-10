@@ -1,0 +1,426 @@
+// ===================================================================
+//  self/ml/tokenizer.hexa — BPE Tokenizer (GPT-2 style)
+//
+//  Pure Hexa implementation of Byte-Pair Encoding tokenizer.
+//
+//  Public API:
+//    load_vocab(path)             → vocab array (id → token string)
+//    load_merges(path)            → merges array of [a, b] pairs
+//    bpe_encode(text, vocab, merges) → array of token IDs
+//    bpe_decode(ids, vocab)       → string
+//
+//  Supports:
+//    - GPT-2 style pre-tokenization (split on whitespace/punctuation)
+//    - Iterative BPE merge (highest priority = lowest index)
+//    - Special tokens: BOS, EOS, PAD, UNK
+//    - Byte-level fallback for unknown bytes
+// ===================================================================
+
+// -- Special token IDs (exposed as functions for cross-module access) --
+fn BOS_ID() { return 0 }
+fn EOS_ID() { return 1 }
+fn PAD_ID() { return 2 }
+fn UNK_ID() { return 3 }
+
+fn BOS_TOK() { return "<bos>" }
+fn EOS_TOK() { return "<eos>" }
+fn PAD_TOK() { return "<pad>" }
+fn UNK_TOK() { return "<unk>" }
+
+// ===================================================================
+//  Vocab loading: one token per line, line number = token ID
+//  Lines 0-3 are special tokens: <bos>, <eos>, <pad>, <unk>
+// ===================================================================
+fn load_vocab(path) {
+    let content = read_file(path)
+    let lines = content.split("\n")
+    let mut vocab = []
+    let n = len(lines)
+    let mut i = 0
+    while i < n {
+        let line = lines[i].trim()
+        if len(line) > 0 {
+            vocab = vocab + [line]
+        }
+        i = i + 1
+    }
+    return vocab
+}
+
+// ===================================================================
+//  Merges loading: one merge per line, format "token_a token_b"
+//  Priority = line index (lower = higher priority = merged first)
+// ===================================================================
+fn load_merges(path) {
+    let content = read_file(path)
+    let lines = content.split("\n")
+    let mut merges = []
+    let n = len(lines)
+    let mut i = 0
+    while i < n {
+        let line = lines[i].trim()
+        if len(line) > 0 {
+            if line.starts_with("#") == false {
+                let parts = line.split(" ")
+                if len(parts) >= 2 {
+                    merges = merges + [[parts[0], parts[1]]]
+                }
+            }
+        }
+        i = i + 1
+    }
+    return merges
+}
+
+// ===================================================================
+//  Build vocab lookup: token_string → token_id
+// ===================================================================
+fn build_vocab_map(vocab) {
+    let mut m = #{}
+    let n = len(vocab)
+    let mut i = 0
+    while i < n {
+        m[vocab[i]] = i
+        i = i + 1
+    }
+    return m
+}
+
+// ===================================================================
+//  Build merge rank map: "a b" → priority (lower = merge first)
+// ===================================================================
+fn build_merge_ranks(merges) {
+    let mut m = #{}
+    let n = len(merges)
+    let mut i = 0
+    while i < n {
+        let key = merges[i][0] + " " + merges[i][1]
+        m[key] = i
+        i = i + 1
+    }
+    return m
+}
+
+// ===================================================================
+//  Character classification helpers
+// ===================================================================
+fn is_letter(code) {
+    if code >= 65 {
+        if code <= 90 { return true }
+    }
+    if code >= 97 {
+        if code <= 122 { return true }
+    }
+    return false
+}
+
+fn is_digit(code) {
+    if code >= 48 {
+        if code <= 57 { return true }
+    }
+    return false
+}
+
+fn is_whitespace(code) {
+    if code == 32 { return true }
+    if code == 9 { return true }
+    if code == 10 { return true }
+    if code == 13 { return true }
+    return false
+}
+
+fn is_punctuation(code) {
+    if is_letter(code) { return false }
+    if is_digit(code) { return false }
+    if is_whitespace(code) { return false }
+    return true
+}
+
+// ===================================================================
+//  GPT-2 style pre-tokenization
+//  Split text into words: whitespace-separated chunks, where
+//  leading space is attached to the following word (as "Ġ" prefix).
+//  Punctuation gets its own token.
+// ===================================================================
+fn pre_tokenize(text) {
+    let n = len(text)
+    if n == 0 { return [] }
+
+    let mut words = []
+    let mut current = ""
+    let mut i = 0
+
+    while i < n {
+        let code = char_code(text, i)
+        let ch = chr(code)
+
+        if is_whitespace(code) {
+            // Flush current word
+            if len(current) > 0 {
+                words = words + [current]
+                current = ""
+            }
+            // Attach space as prefix to next word (GPT-2 "Ġ" convention)
+            // We use a literal space prefix instead of Ġ for simplicity
+            current = " "
+        } else {
+            if is_punctuation(code) {
+                // Flush current word
+                if len(current) > 0 {
+                    words = words + [current]
+                    current = ""
+                }
+                words = words + [ch]
+            } else {
+                current = current + ch
+            }
+        }
+        i = i + 1
+    }
+
+    if len(current) > 0 {
+        words = words + [current]
+    }
+
+    return words
+}
+
+// ===================================================================
+//  Split a word into individual characters (as strings)
+// ===================================================================
+fn word_to_chars(word) {
+    let n = len(word)
+    let mut chars = []
+    let mut i = 0
+    while i < n {
+        let code = char_code(word, i)
+        chars = chars + [chr(code)]
+        i = i + 1
+    }
+    return chars
+}
+
+// ===================================================================
+//  Apply BPE merges to a single word (array of token strings)
+//  merge_ranks: "a b" → priority index
+//  Iteratively merge the pair with lowest rank (highest priority)
+// ===================================================================
+fn apply_bpe(symbols, merge_ranks) {
+    let mut syms = symbols
+
+    let mut changed = true
+    while changed {
+        changed = false
+        let n = len(syms)
+        if n < 2 { return syms }
+
+        // Find the best (lowest rank) pair
+        let mut best_rank = 999999999
+        let mut best_idx = -1
+        let mut i = 0
+        while i < n - 1 {
+            let key = syms[i] + " " + syms[i + 1]
+            if merge_ranks.has(key) {
+                let rank = merge_ranks[key]
+                if rank < best_rank {
+                    best_rank = rank
+                    best_idx = i
+                }
+            }
+            i = i + 1
+        }
+
+        if best_idx >= 0 {
+            // Merge the pair at best_idx
+            let merged = syms[best_idx] + syms[best_idx + 1]
+            let mut new_syms = []
+            let mut j = 0
+            while j < n {
+                if j == best_idx {
+                    new_syms = new_syms + [merged]
+                    j = j + 2
+                } else {
+                    new_syms = new_syms + [syms[j]]
+                    j = j + 1
+                }
+            }
+            syms = new_syms
+            changed = true
+        }
+    }
+
+    return syms
+}
+
+// ===================================================================
+//  Encode: text → array of token IDs
+//
+//  Steps:
+//    1. Pre-tokenize into words
+//    2. For each word, split into chars, apply BPE merges
+//    3. Map BPE tokens to vocab IDs
+// ===================================================================
+fn bpe_encode(text, vocab, merges) {
+    let vocab_map = build_vocab_map(vocab)
+    let merge_ranks = build_merge_ranks(merges)
+
+    let words = pre_tokenize(text)
+    let mut token_ids = []
+    let n_words = len(words)
+    let mut wi = 0
+
+    while wi < n_words {
+        let word = words[wi]
+        let chars = word_to_chars(word)
+        let bpe_tokens = apply_bpe(chars, merge_ranks)
+
+        let n_toks = len(bpe_tokens)
+        let mut ti = 0
+        while ti < n_toks {
+            let tok = bpe_tokens[ti]
+            if vocab_map.has(tok) {
+                token_ids = token_ids + [vocab_map[tok]]
+            } else {
+                // Byte-level fallback: encode each byte as UNK
+                token_ids = token_ids + [UNK_ID()]
+            }
+            ti = ti + 1
+        }
+        wi = wi + 1
+    }
+
+    return token_ids
+}
+
+// ===================================================================
+//  Encode with special tokens: [BOS] + encode(text) + [EOS]
+// ===================================================================
+fn bpe_encode_special(text, vocab, merges) {
+    let ids = bpe_encode(text, vocab, merges)
+    return [BOS_ID()] + ids + [EOS_ID()]
+}
+
+// ===================================================================
+//  Decode: array of token IDs → string
+//  Maps IDs back to token strings and concatenates.
+// ===================================================================
+fn bpe_decode(ids, vocab) {
+    let n = len(ids)
+    let vocab_size = len(vocab)
+    let mut result = ""
+    let mut i = 0
+
+    while i < n {
+        let id = ids[i]
+        if id == BOS_ID() {
+            // skip BOS
+        } else {
+            if id == EOS_ID() {
+                // stop at EOS
+                return result
+            } else {
+                if id == PAD_ID() {
+                    // skip PAD
+                } else {
+                    if id >= 0 {
+                        if id < vocab_size {
+                            result = result + vocab[id]
+                        } else {
+                            result = result + UNK_TOK()
+                        }
+                    } else {
+                        result = result + UNK_TOK()
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+
+    return result
+}
+
+// ===================================================================
+//  Convenience: create a minimal test vocab + merges for testing
+// ===================================================================
+fn make_test_vocab() {
+    // IDs 0-3: special tokens
+    // IDs 4+: individual ASCII chars + common merges
+    let mut vocab = [BOS_TOK(), EOS_TOK(), PAD_TOK(), UNK_TOK()]
+
+    // Single ASCII printable chars (32-126) → IDs 4..98
+    let mut code = 32
+    while code <= 126 {
+        vocab = vocab + [chr(code)]
+        code = code + 1
+    }
+
+    // Common merged tokens
+    vocab = vocab + ["he"]       // 99
+    vocab = vocab + ["ll"]       // 100
+    vocab = vocab + ["lo"]       // 101
+    vocab = vocab + [" w"]       // 102
+    vocab = vocab + ["or"]       // 103
+    vocab = vocab + ["ld"]       // 104
+    vocab = vocab + ["hel"]      // 105
+    vocab = vocab + ["hell"]     // 106
+    vocab = vocab + ["hello"]    // 107
+    vocab = vocab + [" wo"]      // 108
+    vocab = vocab + ["orl"]      // 109
+    vocab = vocab + ["orld"]     // 110
+    vocab = vocab + [" world"]   // 111
+
+    return vocab
+}
+
+fn make_test_merges() {
+    // Merge rules in priority order (index 0 = highest priority)
+    let merges = [
+        ["h", "e"],        // 0: h+e → he
+        ["l", "l"],        // 1: l+l → ll
+        ["l", "o"],        // 2: l+o → lo
+        [" ", "w"],        // 3: _+w → _w
+        ["o", "r"],        // 4: o+r → or
+        ["l", "d"],        // 5: l+d → ld
+        ["he", "l"],       // 6: he+l → hel
+        ["hel", "l"],      // 7: hel+l → hell
+        ["hell", "o"],     // 8: hell+o → hello
+        [" w", "o"],       // 9: _w+o → _wo
+        ["or", "l"],       // 10: or+l → orl
+        ["orl", "d"],      // 11: orl+d → orld
+        [" wo", "rld"]     // 12: _wo+rld → _world
+    ]
+    return merges
+}
+
+// ===================================================================
+//  Utility: get vocab size
+// ===================================================================
+fn vocab_size(vocab) {
+    return len(vocab)
+}
+
+// ===================================================================
+//  Utility: token ID to string
+// ===================================================================
+fn id_to_token(id, vocab) {
+    if id >= 0 {
+        if id < len(vocab) {
+            return vocab[id]
+        }
+    }
+    return UNK_TOK()
+}
+
+// ===================================================================
+//  Utility: token string to ID
+// ===================================================================
+fn token_to_id(token, vocab) {
+    let m = build_vocab_map(vocab)
+    if m.has(token) {
+        return m[token]
+    }
+    return UNK_ID()
+}
+
+println("[tokenizer] BPE tokenizer loaded")

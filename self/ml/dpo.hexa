@@ -1,0 +1,408 @@
+// ═══════════════════════════════════════════════════════════════
+//  dpo.hexa — Direct Preference Optimization in pure Hexa
+//
+//  DPO eliminates the reward model entirely. Instead, it directly
+//  optimizes the policy from preference data using the closed-form
+//  reward derived from the optimal policy.
+//
+//  DPO loss:
+//    L = -log sigma(beta * (log pi(y_w|x)/pi(y_l|x)
+//                          - log pi_ref(y_w|x)/pi_ref(y_l|x)))
+//
+//  Where:
+//    pi     = policy model (being trained)
+//    pi_ref = reference model (frozen copy)
+//    y_w    = chosen (winning) response
+//    y_l    = rejected (losing) response
+//    beta   = KL constraint strength
+//
+//  All operations use Accelerate BLAS via hexa builtins.
+// ═══════════════════════════════════════════════════════════════
+
+let DPO_DIM    = 768
+let DPO_HEADS  = 8
+let DPO_HEAD_D = 96
+let DPO_FF     = 2048
+let DPO_VOCAB  = 256
+let DPO_LAYERS = 8
+let DPO_SEQ    = 128
+let DPO_dd     = DPO_DIM * DPO_DIM
+let DPO_df     = DPO_DIM * DPO_FF
+let DPO_fd     = DPO_FF * DPO_DIM
+
+// ── Model weight creation ───────────────────────────────────
+pub fn dpo_create_weights() {
+    let scale = 0.02 / sqrt(DPO_DIM * 1.0)
+    let mut Wq  = []
+    let mut Wk  = []
+    let mut Wv  = []
+    let mut Wo  = []
+    let mut Wup = []
+    let mut Wdn = []
+    let mut il = 0
+    while il < DPO_LAYERS {
+        Wq  = Wq.push(tensor_fill(DPO_dd, scale))
+        Wk  = Wk.push(tensor_fill(DPO_dd, scale))
+        Wv  = Wv.push(tensor_fill(DPO_dd, scale))
+        Wo  = Wo.push(tensor_fill(DPO_dd, scale))
+        Wup = Wup.push(tensor_fill(DPO_df, scale))
+        Wdn = Wdn.push(tensor_fill(DPO_fd, scale))
+        il = il + 1
+    }
+    let W_emb = tensor_fill(DPO_VOCAB * DPO_DIM, scale)
+    // LM head (tied with embedding conceptually, separate for clarity)
+    let W_lmh = tensor_fill(DPO_DIM * DPO_VOCAB, scale)
+    [Wq, Wk, Wv, Wo, Wup, Wdn, W_emb, W_lmh]
+}
+
+// ── Deep copy weights for reference model ───────────────────
+pub fn dpo_copy_weights(src) {
+    let mut Wq  = []
+    let mut Wk  = []
+    let mut Wv  = []
+    let mut Wo  = []
+    let mut Wup = []
+    let mut Wdn = []
+    let mut il = 0
+    while il < DPO_LAYERS {
+        let cq = tensor_zeros(DPO_dd)
+        mat_add_inplace(cq, src[0][il])
+        Wq = Wq.push(cq)
+        let ck = tensor_zeros(DPO_dd)
+        mat_add_inplace(ck, src[1][il])
+        Wk = Wk.push(ck)
+        let cv = tensor_zeros(DPO_dd)
+        mat_add_inplace(cv, src[2][il])
+        Wv = Wv.push(cv)
+        let co = tensor_zeros(DPO_dd)
+        mat_add_inplace(co, src[3][il])
+        Wo = Wo.push(co)
+        let cu = tensor_zeros(DPO_df)
+        mat_add_inplace(cu, src[4][il])
+        Wup = Wup.push(cu)
+        let cd = tensor_zeros(DPO_fd)
+        mat_add_inplace(cd, src[5][il])
+        Wdn = Wdn.push(cd)
+        il = il + 1
+    }
+    let c_emb = tensor_zeros(DPO_VOCAB * DPO_DIM)
+    mat_add_inplace(c_emb, src[6])
+    let c_lmh = tensor_zeros(DPO_DIM * DPO_VOCAB)
+    mat_add_inplace(c_lmh, src[7])
+    [Wq, Wk, Wv, Wo, Wup, Wdn, c_emb, c_lmh]
+}
+
+// ── Gradient/momentum storage ───────────────────────────────
+pub fn dpo_create_grads() {
+    let mut Gq  = []
+    let mut Gk  = []
+    let mut Gv  = []
+    let mut Go  = []
+    let mut Gup = []
+    let mut Gdn = []
+    let mut il = 0
+    while il < DPO_LAYERS {
+        Gq  = Gq.push(tensor_zeros(DPO_dd))
+        Gk  = Gk.push(tensor_zeros(DPO_dd))
+        Gv  = Gv.push(tensor_zeros(DPO_dd))
+        Go  = Go.push(tensor_zeros(DPO_dd))
+        Gup = Gup.push(tensor_zeros(DPO_df))
+        Gdn = Gdn.push(tensor_zeros(DPO_fd))
+        il = il + 1
+    }
+    let g_emb = tensor_zeros(DPO_VOCAB * DPO_DIM)
+    let g_lmh = tensor_zeros(DPO_DIM * DPO_VOCAB)
+    [Gq, Gk, Gv, Go, Gup, Gdn, g_emb, g_lmh]
+}
+
+pub fn dpo_create_momentum() {
+    let mut Mq  = []
+    let mut Mk  = []
+    let mut Mv  = []
+    let mut Mo  = []
+    let mut Mup = []
+    let mut Mdn = []
+    let mut il = 0
+    while il < DPO_LAYERS {
+        Mq  = Mq.push(tensor_zeros(DPO_dd))
+        Mk  = Mk.push(tensor_zeros(DPO_dd))
+        Mv  = Mv.push(tensor_zeros(DPO_dd))
+        Mo  = Mo.push(tensor_zeros(DPO_dd))
+        Mup = Mup.push(tensor_zeros(DPO_df))
+        Mdn = Mdn.push(tensor_zeros(DPO_fd))
+        il = il + 1
+    }
+    let m_emb = tensor_zeros(DPO_VOCAB * DPO_DIM)
+    let m_lmh = tensor_zeros(DPO_DIM * DPO_VOCAB)
+    [Mq, Mk, Mv, Mo, Mup, Mdn, m_emb, m_lmh]
+}
+
+// ── Scratch buffers ─────────────────────────────────────────
+pub fn dpo_create_scratch() {
+    let sQ   = tensor_zeros(DPO_SEQ * DPO_DIM)
+    let sK   = tensor_zeros(DPO_SEQ * DPO_DIM)
+    let sV   = tensor_zeros(DPO_SEQ * DPO_DIM)
+    let sSc  = tensor_zeros(DPO_SEQ * DPO_SEQ)
+    let sAt  = tensor_zeros(DPO_SEQ * DPO_DIM)
+    let sO   = tensor_zeros(DPO_SEQ * DPO_DIM)
+    let sFF1 = tensor_zeros(DPO_SEQ * DPO_FF)
+    let sFF2 = tensor_zeros(DPO_SEQ * DPO_DIM)
+    let sLm  = tensor_zeros(1 * DPO_VOCAB)
+    [sQ, sK, sV, sSc, sAt, sO, sFF1, sFF2, sLm]
+}
+
+// ── Embedding lookup ────────────────────────────────────────
+fn dpo_embed(W_emb, ids) {
+    let n = len(ids)
+    let mut h = tensor_zeros(n * DPO_DIM)
+    let mut i = 0
+    while i < n {
+        let tok = ids[i]
+        let base_src = tok * DPO_DIM
+        let base_dst = i * DPO_DIM
+        let mut d = 0
+        while d < DPO_DIM {
+            h[base_dst + d] = W_emb[base_src + d]
+            d = d + 1
+        }
+        i = i + 1
+    }
+    h
+}
+
+// ── Transformer forward ────────────────────────────────────
+fn dpo_transformer_fwd(weights, h, scratch) {
+    let Wq  = weights[0]
+    let Wk  = weights[1]
+    let Wv  = weights[2]
+    let Wo  = weights[3]
+    let Wup = weights[4]
+    let Wdn = weights[5]
+    let sQ   = scratch[0]
+    let sK   = scratch[1]
+    let sV   = scratch[2]
+    let sSc  = scratch[3]
+    let sAt  = scratch[4]
+    let sO   = scratch[5]
+    let sFF1 = scratch[6]
+    let sFF2 = scratch[7]
+    let mut li = 0
+    while li < DPO_LAYERS {
+        let q = matmul_into(h, Wq[li], DPO_SEQ, DPO_DIM, DPO_DIM, sQ)
+        let k = matmul_into(h, Wk[li], DPO_SEQ, DPO_DIM, DPO_DIM, sK)
+        let v = matmul_into(h, Wv[li], DPO_SEQ, DPO_DIM, DPO_DIM, sV)
+        let sc = matmul_transpose_b_into(q, k, DPO_SEQ, DPO_DIM, DPO_SEQ, sSc)
+        mat_scale_inplace(sc, 1.0 / sqrt(DPO_HEAD_D * 1.0))
+        let at = matmul_into(sc, v, DPO_SEQ, DPO_SEQ, DPO_DIM, sAt)
+        let o = matmul_into(at, Wo[li], DPO_SEQ, DPO_DIM, DPO_DIM, sO)
+        mat_add_inplace(h, o)
+        let ff1 = matmul_into(h, Wup[li], DPO_SEQ, DPO_DIM, DPO_FF, sFF1)
+        let ff2 = matmul_into(ff1, Wdn[li], DPO_SEQ, DPO_FF, DPO_DIM, sFF2)
+        mat_add_inplace(h, ff2)
+        li = li + 1
+    }
+    h
+}
+
+// ── Log-probability of a sequence ───────────────────────────
+// Given input_ids, compute sum of log P(token_t | token_<t)
+// for t = 1..len(ids)-1 (autoregressive next-token prediction)
+pub fn dpo_log_prob(weights, ids, scratch) {
+    let W_emb = weights[6]
+    let W_lmh = weights[7]
+    let n = len(ids)
+    let h = dpo_embed(W_emb, ids)
+    let h_out = dpo_transformer_fwd(weights, h, scratch)
+    let sLm = scratch[8]
+    // Sum log probabilities for each position
+    let mut total_log_p = 0.0
+    let mut pos = 0
+    while pos < n - 1 {
+        // Extract hidden at position pos
+        let base = pos * DPO_DIM
+        let mut h_pos = tensor_zeros(DPO_DIM)
+        let mut d = 0
+        while d < DPO_DIM {
+            h_pos[d] = h_out[base + d]
+            d = d + 1
+        }
+        // Compute logits: h_pos @ W_lmh → [1 x VOCAB]
+        let logits = matmul_into(h_pos, W_lmh, 1, DPO_DIM, DPO_VOCAB, sLm)
+        // Log-softmax for target token at pos+1
+        let target = ids[pos + 1]
+        // Find max for numerical stability
+        let mut mx = logits[0]
+        let mut vi = 1
+        while vi < DPO_VOCAB {
+            if logits[vi] > mx { mx = logits[vi] }
+            vi = vi + 1
+        }
+        // Compute log-sum-exp
+        let mut sum_exp = 0.0
+        vi = 0
+        while vi < DPO_VOCAB {
+            sum_exp = sum_exp + exp(logits[vi] - mx)
+            vi = vi + 1
+        }
+        let log_sum_exp = mx + log(sum_exp)
+        let log_p = logits[target] - log_sum_exp
+        total_log_p = total_log_p + log_p
+        pos = pos + 1
+    }
+    total_log_p
+}
+
+// ── DPO loss computation ────────────────────────────────────
+// L = -log sigmoid(beta * (log_pi_w - log_pi_l - log_ref_w + log_ref_l))
+// Returns [loss, implicit_reward_chosen, implicit_reward_rejected]
+pub fn dpo_loss(policy_weights, ref_weights, chosen_ids, rejected_ids, beta, scratch) {
+    // Policy log-probs
+    let log_pi_w = dpo_log_prob(policy_weights, chosen_ids, scratch)
+    let log_pi_l = dpo_log_prob(policy_weights, rejected_ids, scratch)
+    // Reference log-probs (frozen, no gradient)
+    let log_ref_w = dpo_log_prob(ref_weights, chosen_ids, scratch)
+    let log_ref_l = dpo_log_prob(ref_weights, rejected_ids, scratch)
+    // Log-ratio differences
+    let log_ratio_w = log_pi_w - log_ref_w
+    let log_ratio_l = log_pi_l - log_ref_l
+    // Implicit rewards (for monitoring)
+    let implicit_rw = beta * log_ratio_w
+    let implicit_rl = beta * log_ratio_l
+    // DPO objective
+    let logit = beta * (log_ratio_w - log_ratio_l)
+    // -log sigmoid(logit) = softplus(-logit)
+    let neg_logit = 0.0 - logit
+    let mut loss = 0.0
+    if neg_logit > 0.0 {
+        loss = neg_logit + log(1.0 + exp(0.0 - neg_logit))
+    } else {
+        loss = log(1.0 + exp(neg_logit))
+    }
+    [loss, implicit_rw, implicit_rl]
+}
+
+// ── Numerical gradient for DPO (finite differences) ─────────
+// For each weight element, perturb and recompute loss
+// This is the simplest correct gradient — works with any architecture
+fn dpo_numerical_grad_head(policy_weights, ref_weights, chosen_ids, rejected_ids, beta, scratch, eps) {
+    let W_lmh = policy_weights[7]
+    let n = DPO_DIM * DPO_VOCAB
+    let g_lmh = tensor_zeros(n)
+    // Only do a random subset for speed
+    let stride = n / 64
+    let mut i = 0
+    while i < n {
+        let orig = W_lmh[i]
+        W_lmh[i] = orig + eps
+        let loss_plus = dpo_loss(policy_weights, ref_weights, chosen_ids, rejected_ids, beta, scratch)
+        W_lmh[i] = orig - eps
+        let loss_minus = dpo_loss(policy_weights, ref_weights, chosen_ids, rejected_ids, beta, scratch)
+        W_lmh[i] = orig
+        g_lmh[i] = (loss_plus[0] - loss_minus[0]) / (2.0 * eps)
+        i = i + stride
+    }
+    g_lmh
+}
+
+// ── SGD step for DPO ────────────────────────────────────────
+let DPO_MOMENTUM = 0.9
+let DPO_WD = 0.01
+
+fn dpo_sgd(w, g, m, lr) {
+    mat_scale_inplace(w, 1.0 - lr * DPO_WD)
+    mat_scale_inplace(m, DPO_MOMENTUM)
+    mat_add_inplace(m, g)
+    axpy(w, m, -1.0 * lr)
+}
+
+// ── Zero gradients ──────────────────────────────────────────
+fn dpo_zero_grad(grads) {
+    let mut li = 0
+    while li < DPO_LAYERS {
+        mat_scale_inplace(grads[0][li], 0.0)
+        mat_scale_inplace(grads[1][li], 0.0)
+        mat_scale_inplace(grads[2][li], 0.0)
+        mat_scale_inplace(grads[3][li], 0.0)
+        mat_scale_inplace(grads[4][li], 0.0)
+        mat_scale_inplace(grads[5][li], 0.0)
+        li = li + 1
+    }
+    mat_scale_inplace(grads[6], 0.0)
+    mat_scale_inplace(grads[7], 0.0)
+    0
+}
+
+// ── Optimizer step (all params) ─────────────────────────────
+fn dpo_opt_step(weights, grads, momenta, lr) {
+    let mut li = 0
+    while li < DPO_LAYERS {
+        dpo_sgd(weights[0][li], grads[0][li], momenta[0][li], lr)
+        dpo_sgd(weights[1][li], grads[1][li], momenta[1][li], lr)
+        dpo_sgd(weights[2][li], grads[2][li], momenta[2][li], lr)
+        dpo_sgd(weights[3][li], grads[3][li], momenta[3][li], lr)
+        dpo_sgd(weights[4][li], grads[4][li], momenta[4][li], lr)
+        dpo_sgd(weights[5][li], grads[5][li], momenta[5][li], lr)
+        li = li + 1
+    }
+    dpo_sgd(weights[6], grads[6], momenta[6], lr)
+    dpo_sgd(weights[7], grads[7], momenta[7], lr)
+    0
+}
+
+// ── DPO training loop ───────────────────────────────────────
+// pairs: array of [chosen_ids, rejected_ids]
+pub fn dpo_train(policy_weights, ref_weights, grads, momenta, scratch, pairs, n_steps, lr, beta) {
+    let n_pairs = len(pairs)
+    println("[dpo] training on " + str(n_pairs) + " pairs, beta=" + str(beta) + ", lr=" + str(lr))
+    let eps = 1.0e-4
+    let mut step = 0
+    while step < n_steps {
+        let t0 = clock()
+        let mut total_loss = 0.0
+        let mut total_rw = 0.0
+        let mut total_rl = 0.0
+        let mut pi = 0
+        while pi < n_pairs {
+            dpo_zero_grad(grads)
+            let pair = pairs[pi]
+            let chosen_ids = pair[0]
+            let rejected_ids = pair[1]
+            let result = dpo_loss(policy_weights, ref_weights, chosen_ids, rejected_ids, beta, scratch)
+            let loss = result[0]
+            let rw = result[1]
+            let rl = result[2]
+            total_loss = total_loss + loss
+            total_rw = total_rw + rw
+            total_rl = total_rl + rl
+            // Numerical gradient on LM head (most impactful param)
+            let g_lmh = dpo_numerical_grad_head(policy_weights, ref_weights, chosen_ids, rejected_ids, beta, scratch, eps)
+            mat_add_inplace(grads[7], g_lmh)
+            dpo_opt_step(policy_weights, grads, momenta, lr)
+            pi = pi + 1
+        }
+        let t1 = clock()
+        let avg_loss = total_loss / (n_pairs * 1.0)
+        let avg_rw = total_rw / (n_pairs * 1.0)
+        let avg_rl = total_rl / (n_pairs * 1.0)
+        let ms = (t1 - t0) * 1000.0
+        let mut l = "{\"step\":" + str(step)
+        l = l + ",\"loss\":" + str(avg_loss)
+        l = l + ",\"reward_chosen\":" + str(avg_rw)
+        l = l + ",\"reward_rejected\":" + str(avg_rl)
+        l = l + ",\"margin\":" + str(avg_rw - avg_rl)
+        l = l + ",\"ms\":" + str(ms) + "}"
+        println(l)
+        step = step + 1
+    }
+    0
+}
+
+// ── Param count ─────────────────────────────────────────────
+pub fn dpo_param_count() {
+    let embed = DPO_VOCAB * DPO_DIM
+    let per_layer = DPO_dd * 4 + DPO_df + DPO_fd
+    let lmh = DPO_DIM * DPO_VOCAB
+    embed + per_layer * DPO_LAYERS + lmh
+}
+
+println("[dpo] loaded — " + str(dpo_param_count()) + " params, beta-controlled KL constraint")

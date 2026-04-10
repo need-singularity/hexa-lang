@@ -1,0 +1,604 @@
+// ===================================================================
+//  onnx_writer.hexa -- ONNX format writer (protobuf binary)
+//
+//  Writes ONNX model files compatible with ONNX Runtime.
+//  Generates a complete ONNX graph with:
+//      - Nodes: MatMul, Add, Relu, Softmax, LayerNorm, Reshape, Transpose
+//      - Initializers: weight tensors (FP32)
+//      - Input/output value_info specifications
+//
+//  ONNX uses Protocol Buffers wire format:
+//      field = (field_number << 3) | wire_type
+//      wire_type 0 = varint, 1 = 64-bit, 2 = length-delimited, 5 = 32-bit
+//
+//  ONNX proto structure (simplified):
+//      ModelProto {
+//          ir_version: 8 (field 1, varint)
+//          opset_import: OpsetProto (field 8, LEN)
+//          graph: GraphProto (field 7, LEN)
+//      }
+//      GraphProto {
+//          node: NodeProto[] (field 1, LEN)
+//          name: string (field 2, LEN)
+//          initializer: TensorProto[] (field 5, LEN)
+//          input: ValueInfoProto[] (field 11, LEN)
+//          output: ValueInfoProto[] (field 12, LEN)
+//      }
+//      NodeProto {
+//          input: string[] (field 1, LEN)
+//          output: string[] (field 2, LEN)
+//          name: string (field 3, LEN)
+//          op_type: string (field 4, LEN)
+//      }
+//
+//  Public API:
+//      export_onnx(model_weights, model_config, output_path)
+//
+//  Uses builtins: write_file_bytes
+// ===================================================================
+
+// -- ONNX constants --
+@pure fn ONNX_IR_VERSION() { return 8 }
+@pure fn ONNX_OPSET()      { return 17 }
+
+// -- Protobuf wire types --
+@pure fn PB_VARINT() { return 0 }
+@pure fn PB_LEN()    { return 2 }
+@pure fn PB_32()     { return 5 }
+
+// -- ONNX TensorProto.DataType --
+@pure fn ONNX_FLOAT()  { return 1 }
+@pure fn ONNX_INT64()  { return 7 }
+
+// ===================================================================
+//  Protobuf encoding primitives
+// ===================================================================
+
+// Encode unsigned varint (LEB128)
+fn pb_varint(val) {
+    let mut v = val
+    let mut out = []
+    if v == 0 { return [0] }
+    while v > 0 {
+        let mut byte = v % 128
+        v = v / 128
+        if v > 0 { byte = byte + 128 }
+        out = out + [byte]
+    }
+    return out
+}
+
+// Encode signed varint using zigzag
+fn pb_svarint(val) {
+    let mut zz = val * 2
+    if val < 0 { zz = (0 - val) * 2 - 1 }
+    return pb_varint(zz)
+}
+
+// Encode field tag
+fn pb_tag(field_num, wire_type) {
+    return pb_varint(field_num * 8 + wire_type)
+}
+
+// Encode a varint field
+fn pb_field_varint(field_num, val) {
+    return pb_tag(field_num, PB_VARINT()) + pb_varint(val)
+}
+
+// Encode a length-delimited field (raw bytes)
+fn pb_field_bytes(field_num, data) {
+    return pb_tag(field_num, PB_LEN()) + pb_varint(len(data)) + data
+}
+
+// Encode a string field
+fn pb_field_string(field_num, s) {
+    let n = len(s)
+    let mut bytes = []
+    let mut i = 0
+    while i < n {
+        bytes = bytes + [char_code(s, i)]
+        i = i + 1
+    }
+    return pb_field_bytes(field_num, bytes)
+}
+
+// Encode f32 as 4 bytes LE
+fn pb_f32_le(val) {
+    if val == 0.0 { return [0, 0, 0, 0] }
+    let mut v = val
+    let mut sign = 0
+    if v < 0.0 {
+        sign = 1
+        v = 0.0 - v
+    }
+    let mut exp = 0
+    let mut m = v
+    if m >= 2.0 {
+        while m >= 2.0 {
+            m = m / 2.0
+            exp = exp + 1
+        }
+    } else {
+        while m < 1.0 {
+            m = m * 2.0
+            exp = exp - 1
+        }
+    }
+    let biased = exp + 127
+    if biased >= 255 {
+        let bits = sign * 2147483648 + 255 * 8388608
+        return pb_u32_le(bits)
+    }
+    if biased <= 0 {
+        if sign == 1 { return [0, 0, 0, 128] }
+        return [0, 0, 0, 0]
+    }
+    let frac = m - 1.0
+    let mant = to_int(frac * 8388608.0 + 0.5)
+    let mut mant_c = mant
+    if mant_c > 8388607 { mant_c = 8388607 }
+    let bits = sign * 2147483648 + biased * 8388608 + mant_c
+    return pb_u32_le(bits)
+}
+
+fn pb_u32_le(val) {
+    let b0 = val % 256
+    let b1 = (val / 256) % 256
+    let b2 = (val / 65536) % 256
+    let b3 = (val / 16777216) % 256
+    return [b0, b1, b2, b3]
+}
+
+// ===================================================================
+//  ONNX TensorProto encoding (float data)
+// ===================================================================
+
+// Encode a TensorProto message
+//   name: string, shape: [int], data: [float]
+fn encode_tensor_proto(name, shape, data) {
+    let mut msg = []
+
+    // dims (field 1, repeated int64 as varint)
+    let nd = len(shape)
+    let mut di = 0
+    while di < nd {
+        msg = msg + pb_field_varint(1, shape[di])
+        di = di + 1
+    }
+
+    // data_type (field 2, varint) = FLOAT
+    msg = msg + pb_field_varint(2, ONNX_FLOAT())
+
+    // name (field 8, string)
+    msg = msg + pb_field_string(8, name)
+
+    // float_data (field 4, packed repeated float) -- raw_data (field 13) is more compact
+    let n = len(data)
+    let mut raw = []
+    let mut i = 0
+    while i < n {
+        raw = raw + pb_f32_le(data[i])
+        i = i + 1
+    }
+    // Use raw_data field 13 (bytes)
+    msg = msg + pb_field_bytes(13, raw)
+
+    return msg
+}
+
+// ===================================================================
+//  ONNX NodeProto encoding
+// ===================================================================
+
+// Encode a NodeProto
+//   inputs: [string], outputs: [string], name: string, op_type: string
+//   attributes: [[attr_name, attr_type, attr_value], ...]
+//     attr_type: "int", "float", "ints"
+fn encode_node_proto(inputs, outputs, name, op_type, attributes) {
+    let mut msg = []
+
+    // input (field 1, repeated string)
+    let ni = len(inputs)
+    let mut i = 0
+    while i < ni {
+        msg = msg + pb_field_string(1, inputs[i])
+        i = i + 1
+    }
+
+    // output (field 2, repeated string)
+    let no = len(outputs)
+    i = 0
+    while i < no {
+        msg = msg + pb_field_string(2, outputs[i])
+        i = i + 1
+    }
+
+    // name (field 3, string)
+    msg = msg + pb_field_string(3, name)
+
+    // op_type (field 4, string)
+    msg = msg + pb_field_string(4, op_type)
+
+    // attributes (field 5, repeated AttributeProto)
+    let na = len(attributes)
+    i = 0
+    while i < na {
+        let attr = attributes[i]
+        let attr_msg = encode_attribute_proto(attr[0], attr[1], attr[2])
+        msg = msg + pb_field_bytes(5, attr_msg)
+        i = i + 1
+    }
+
+    return msg
+}
+
+// Encode an AttributeProto
+fn encode_attribute_proto(name, atype, val) {
+    let mut msg = []
+    // name (field 1, string)
+    msg = msg + pb_field_string(1, name)
+
+    if atype == "int" {
+        // type (field 20, varint) = INT = 2
+        msg = msg + pb_field_varint(20, 2)
+        // i (field 3, int64)
+        msg = msg + pb_field_varint(3, val)
+    }
+    if atype == "float" {
+        // type (field 20, varint) = FLOAT = 1
+        msg = msg + pb_field_varint(20, 1)
+        // f (field 4, float) -- use fixed32 wire type
+        msg = msg + pb_tag(4, PB_32()) + pb_f32_le(val)
+    }
+    if atype == "ints" {
+        // type (field 20, varint) = INTS = 7
+        msg = msg + pb_field_varint(20, 7)
+        // ints (field 8, repeated int64)
+        let n = len(val)
+        let mut j = 0
+        while j < n {
+            msg = msg + pb_field_varint(8, val[j])
+            j = j + 1
+        }
+    }
+
+    return msg
+}
+
+// ===================================================================
+//  ONNX ValueInfoProto encoding
+// ===================================================================
+
+// shape: [int], elem_type: int (ONNX_FLOAT etc)
+fn encode_value_info(name, shape, elem_type) {
+    // TypeProto.tensor_type
+    let mut tensor_type = []
+    // elem_type (field 1, varint)
+    tensor_type = tensor_type + pb_field_varint(1, elem_type)
+
+    // TensorShapeProto (field 2, LEN)
+    let mut shape_msg = []
+    let nd = len(shape)
+    let mut di = 0
+    while di < nd {
+        // Dimension (field 1, LEN) with dim_value (field 1, varint)
+        let dim_msg = pb_field_varint(1, shape[di])
+        shape_msg = shape_msg + pb_field_bytes(1, dim_msg)
+        di = di + 1
+    }
+    tensor_type = tensor_type + pb_field_bytes(2, shape_msg)
+
+    // TypeProto: tensor_type is field 1 (LEN)
+    let type_msg = pb_field_bytes(1, tensor_type)
+
+    // ValueInfoProto
+    let mut msg = []
+    // name (field 1, string)
+    msg = msg + pb_field_string(1, name)
+    // type (field 2, LEN)
+    msg = msg + pb_field_bytes(2, type_msg)
+
+    return msg
+}
+
+// ===================================================================
+//  ONNX OpsetImportProto encoding
+// ===================================================================
+
+fn encode_opset_import(domain, version) {
+    let mut msg = []
+    if len(domain) > 0 {
+        msg = msg + pb_field_string(1, domain)
+    }
+    msg = msg + pb_field_varint(2, version)
+    return msg
+}
+
+// ===================================================================
+//  OnnxNodeDef -- describes one ONNX node to build
+// ===================================================================
+struct OnnxNodeDef {
+    inputs: array,
+    outputs: array,
+    name: string,
+    op_type: string,
+    attributes: array
+}
+
+// ===================================================================
+//  OnnxWeightDef -- describes one initializer weight
+// ===================================================================
+struct OnnxWeightDef {
+    name: string,
+    shape: array,
+    data: array
+}
+
+// ===================================================================
+//  OnnxIODef -- describes graph input/output
+// ===================================================================
+struct OnnxIODef {
+    name: string,
+    shape: array,
+    elem_type: int
+}
+
+// ===================================================================
+//  export_onnx(model_weights, nodes, graph_inputs, graph_outputs,
+//              graph_name, output_path)
+//
+//  model_weights : [OnnxWeightDef]  -- weight tensors (initializers)
+//  nodes         : [OnnxNodeDef]    -- computation graph nodes
+//  graph_inputs  : [OnnxIODef]      -- graph input specifications
+//  graph_outputs : [OnnxIODef]      -- graph output specifications
+//  graph_name    : string           -- name for the ONNX graph
+//  output_path   : string           -- file path
+//
+//  Returns total bytes written.
+// ===================================================================
+
+fn export_onnx(model_weights, nodes, graph_inputs, graph_outputs, graph_name, output_path) {
+    let n_weights = len(model_weights)
+    let n_nodes = len(nodes)
+    let n_inputs = len(graph_inputs)
+    let n_outputs = len(graph_outputs)
+
+    println("[onnx_writer] Exporting ONNX: " + str(n_nodes) + " nodes, " + str(n_weights) + " initializers")
+
+    // -- Build GraphProto --
+    let mut graph_msg = []
+
+    // nodes (field 1, repeated NodeProto)
+    let mut ni = 0
+    while ni < n_nodes {
+        let nd = nodes[ni]
+        let node_bytes = encode_node_proto(nd.inputs, nd.outputs, nd.name, nd.op_type, nd.attributes)
+        graph_msg = graph_msg + pb_field_bytes(1, node_bytes)
+        ni = ni + 1
+    }
+
+    // name (field 2, string)
+    graph_msg = graph_msg + pb_field_string(2, graph_name)
+
+    // initializer (field 5, repeated TensorProto)
+    let mut wi = 0
+    while wi < n_weights {
+        let w = model_weights[wi]
+        let tp = encode_tensor_proto(w.name, w.shape, w.data)
+        graph_msg = graph_msg + pb_field_bytes(5, tp)
+        wi = wi + 1
+    }
+
+    // input (field 11, repeated ValueInfoProto)
+    let mut ii = 0
+    while ii < n_inputs {
+        let inp = graph_inputs[ii]
+        let vi = encode_value_info(inp.name, inp.shape, inp.elem_type)
+        graph_msg = graph_msg + pb_field_bytes(11, vi)
+        ii = ii + 1
+    }
+
+    // output (field 12, repeated ValueInfoProto)
+    let mut oi = 0
+    while oi < n_outputs {
+        let outp = graph_outputs[oi]
+        let vo = encode_value_info(outp.name, outp.shape, outp.elem_type)
+        graph_msg = graph_msg + pb_field_bytes(12, vo)
+        oi = oi + 1
+    }
+
+    // -- Build ModelProto --
+    let mut model_msg = []
+    // ir_version (field 1, varint)
+    model_msg = model_msg + pb_field_varint(1, ONNX_IR_VERSION())
+
+    // opset_import (field 8, LEN)
+    let opset = encode_opset_import("", ONNX_OPSET())
+    model_msg = model_msg + pb_field_bytes(8, opset)
+
+    // graph (field 7, LEN)
+    model_msg = model_msg + pb_field_bytes(7, graph_msg)
+
+    // -- Write to file --
+    write_file_bytes(output_path, model_msg)
+    let total_len = len(model_msg)
+    println("[onnx_writer] Written " + str(total_len) + " bytes to " + output_path)
+    return total_len
+}
+
+// ===================================================================
+//  Convenience builder: build a simple feedforward ONNX model
+//
+//  in_dims     : [int]      -- input dim per layer
+//  out_dims    : [int]      -- output dim per layer
+//  activations : [string]   -- "relu", "softmax", "none" per layer
+//  weight_data : [[float]]  -- W data per layer
+//  bias_data   : [[float]]  -- b data per layer
+//  output_path : string     -- file to write
+//
+//  Returns total bytes written (calls export_onnx internally).
+// ===================================================================
+
+fn build_and_export_feedforward(in_dims, out_dims, activations, weight_data, bias_data, output_path) {
+    let n_layers = len(in_dims)
+    let mut nodes = []
+    let mut weights = []
+    let mut prev_output = "input"
+
+    let mut i = 0
+    while i < n_layers {
+        let in_dim = in_dims[i]
+        let out_dim = out_dims[i]
+        let act = activations[i]
+        let w_name = "W_" + str(i)
+        let b_name = "b_" + str(i)
+        let mm_out = "matmul_" + str(i)
+        let add_out = "add_" + str(i)
+        let act_out = "act_" + str(i)
+
+        // Weight initializer
+        weights = weights + [OnnxWeightDef {
+            name: w_name,
+            shape: [in_dim, out_dim],
+            data: weight_data[i]
+        }]
+        weights = weights + [OnnxWeightDef {
+            name: b_name,
+            shape: [out_dim],
+            data: bias_data[i]
+        }]
+
+        // MatMul node
+        nodes = nodes + [OnnxNodeDef {
+            inputs: [prev_output, w_name],
+            outputs: [mm_out],
+            name: "matmul_" + str(i),
+            op_type: "MatMul",
+            attributes: []
+        }]
+
+        // Add node (bias)
+        nodes = nodes + [OnnxNodeDef {
+            inputs: [mm_out, b_name],
+            outputs: [add_out],
+            name: "add_" + str(i),
+            op_type: "Add",
+            attributes: []
+        }]
+
+        // Activation
+        if act == "relu" {
+            nodes = nodes + [OnnxNodeDef {
+                inputs: [add_out],
+                outputs: [act_out],
+                name: "relu_" + str(i),
+                op_type: "Relu",
+                attributes: []
+            }]
+            prev_output = act_out
+        }
+        if act == "softmax" {
+            nodes = nodes + [OnnxNodeDef {
+                inputs: [add_out],
+                outputs: [act_out],
+                name: "softmax_" + str(i),
+                op_type: "Softmax",
+                attributes: [["axis", "int", 1]]
+            }]
+            prev_output = act_out
+        }
+        if act == "none" {
+            prev_output = add_out
+        }
+        i = i + 1
+    }
+
+    let batch = 1
+    let first_in = in_dims[0]
+    let last_out = out_dims[n_layers - 1]
+
+    let inputs = [OnnxIODef {
+        name: "input",
+        shape: [batch, first_in],
+        elem_type: ONNX_FLOAT()
+    }]
+    let outputs = [OnnxIODef {
+        name: prev_output,
+        shape: [batch, last_out],
+        elem_type: ONNX_FLOAT()
+    }]
+
+    return export_onnx(weights, nodes, inputs, outputs, "feedforward", output_path)
+}
+
+// ===================================================================
+//  Tests
+// ===================================================================
+
+@test
+fn test_pb_varint_zero() {
+    let b = pb_varint(0)
+    assert(len(b) == 1)
+    assert(b[0] == 0)
+}
+
+@test
+fn test_pb_varint_small() {
+    let b = pb_varint(42)
+    assert(len(b) == 1)
+    assert(b[0] == 42)
+}
+
+@test
+fn test_pb_varint_multi_byte() {
+    // 300 = 0x012C -> LEB128: [0xAC, 0x02]
+    let b = pb_varint(300)
+    assert(len(b) == 2)
+    assert(b[0] == 172)
+    assert(b[1] == 2)
+}
+
+@test
+fn test_pb_tag() {
+    // field 1, varint -> (1 << 3) | 0 = 8
+    let t = pb_tag(1, PB_VARINT())
+    assert(len(t) == 1)
+    assert(t[0] == 8)
+}
+
+@test
+fn test_pb_field_string() {
+    let b = pb_field_string(1, "AB")
+    // tag: 0x0A (field 1, LEN), len: 2, 'A'=65, 'B'=66
+    assert(b[0] == 10)
+    assert(b[1] == 2)
+    assert(b[2] == 65)
+    assert(b[3] == 66)
+}
+
+@test
+fn test_encode_tensor_proto_basic() {
+    let tp = encode_tensor_proto("w", [2], [1.0, 2.0])
+    // Should produce valid protobuf bytes
+    assert(len(tp) > 0)
+}
+
+@test
+fn test_encode_value_info() {
+    let vi = encode_value_info("x", [1, 4], ONNX_FLOAT())
+    assert(len(vi) > 0)
+}
+
+@test
+fn test_encode_node_proto_matmul() {
+    let np = encode_node_proto(["a", "b"], ["c"], "mm0", "MatMul", [])
+    assert(len(np) > 0)
+}
+
+@test
+fn test_encode_attribute_int() {
+    let a = encode_attribute_proto("axis", "int", 1)
+    assert(len(a) > 0)
+}
+
+run_tests()

@@ -1,0 +1,222 @@
+// ═══════════════════════════════════════════════════════════════
+//  offload.hexa — GPU↔CPU weight transfer & layer-by-layer offloading
+//
+//  For models larger than GPU memory:
+//    1. Keep all weights on CPU (hexa tensors)
+//    2. Upload layer-by-layer to GPU for forward/backward
+//    3. Download results back to CPU
+//
+//  Usage:
+//    let gpu_w = weights_to_gpu(cpu_weights)
+//    let cpu_w = weights_to_cpu(gpu_weights, n)
+//    offload_forward(model, input, gpu_scratch)
+// ═══════════════════════════════════════════════════════════════
+
+use "cuda_ffi"
+use "device"
+
+// ── Weight container ─────────────────────────────────────────
+// Tracks where weights live and their metadata
+struct WeightHandle {
+    data: any,
+    device: int,
+    numel: int,
+    name: string
+}
+
+fn cpu_weight(tensor, n, name) {
+    WeightHandle {
+        data: tensor,
+        device: DEV_CPU,
+        numel: n,
+        name: name
+    }
+}
+
+fn gpu_weight(dev_ptr, n, name) {
+    WeightHandle {
+        data: dev_ptr,
+        device: DEV_GPU,
+        numel: n,
+        name: name
+    }
+}
+
+// ── Bulk CPU → GPU transfer ──────────────────────────────────
+// Takes a hexa tensor (CPU), returns a GPU device pointer.
+// Caller must cuda_free the result when done.
+fn weights_to_gpu(cpu_tensor) {
+    let n = len(cpu_tensor)
+    let dev_ptr = tensor_to_gpu(cpu_tensor)
+    return dev_ptr
+}
+
+// ── Bulk GPU → CPU transfer ──────────────────────────────────
+// Takes a GPU device pointer + element count, returns hexa tensor.
+fn weights_to_cpu(gpu_ptr, numel) {
+    let cpu_tensor = tensor_from_gpu(gpu_ptr, numel)
+    return cpu_tensor
+}
+
+// ── Layer-by-layer offloading engine ─────────────────────────
+// For models that don't fit in GPU memory.
+// Processes one transformer layer at a time:
+//   1. Upload layer weights to GPU
+//   2. Run forward on GPU
+//   3. Free GPU weights (keep activations if needed)
+//   4. Move to next layer
+
+struct OffloadScratch {
+    gpu_buf_a: any,
+    gpu_buf_b: any,
+    buf_size: int
+}
+
+// Pre-allocate GPU scratch buffers for offloading
+fn offload_scratch_create(max_layer_bytes) {
+    let buf_a = cuda_malloc(max_layer_bytes)
+    let buf_b = cuda_malloc(max_layer_bytes)
+    OffloadScratch {
+        gpu_buf_a: buf_a,
+        gpu_buf_b: buf_b,
+        buf_size: max_layer_bytes
+    }
+}
+
+fn offload_scratch_free(scratch: OffloadScratch) {
+    let _ = cuda_free(scratch.gpu_buf_a)
+    let _ = cuda_free(scratch.gpu_buf_b)
+    0
+}
+
+// ── Layer weight set (7 weight matrices per transformer layer) ──
+struct LayerWeights {
+    wq: any,
+    wk: any,
+    wv: any,
+    wo: any,
+    w_gate: any,
+    w_up: any,
+    w_down: any
+}
+
+// Upload one layer's weights to GPU
+fn layer_weights_to_gpu(lw: LayerWeights) {
+    let gq = weights_to_gpu(lw.wq)
+    let gk = weights_to_gpu(lw.wk)
+    let gv = weights_to_gpu(lw.wv)
+    let go = weights_to_gpu(lw.wo)
+    let gg = weights_to_gpu(lw.w_gate)
+    let gu = weights_to_gpu(lw.w_up)
+    let gd = weights_to_gpu(lw.w_down)
+    LayerWeights {
+        wq: gq,
+        wk: gk,
+        wv: gv,
+        wo: go,
+        w_gate: gg,
+        w_up: gu,
+        w_down: gd
+    }
+}
+
+// Free one layer's GPU weight pointers
+fn layer_weights_gpu_free(lw: LayerWeights) {
+    let _ = cuda_free(lw.wq)
+    let _ = cuda_free(lw.wk)
+    let _ = cuda_free(lw.wv)
+    let _ = cuda_free(lw.wo)
+    let _ = cuda_free(lw.w_gate)
+    let _ = cuda_free(lw.w_up)
+    let _ = cuda_free(lw.w_down)
+    0
+}
+
+// ── Offload forward pass ─────────────────────────────────────
+// Runs a full transformer forward with layer-by-layer GPU offloading.
+// cpu_layers: array of LayerWeights (on CPU)
+// input_gpu: input activations already on GPU (SEQ * DIM floats)
+// Returns: output activations on GPU
+fn offload_forward(cpu_layers, input_gpu, dim, seq, ff) {
+    let n_layers = len(cpu_layers)
+    let mut h_gpu = input_gpu
+
+    let mut li = 0
+    while li < n_layers {
+        // 1. Upload this layer to GPU
+        let gpu_lw = layer_weights_to_gpu(cpu_layers[li])
+
+        // 2. Allocate output buffers
+        let out_size = seq * dim * 4
+        let sQ  = cuda_malloc(out_size)
+        let sK  = cuda_malloc(out_size)
+        let sV  = cuda_malloc(out_size)
+        let sSc = cuda_malloc(seq * seq * 4)
+        let sAt = cuda_malloc(out_size)
+        let sO  = cuda_malloc(out_size)
+        let sFF = cuda_malloc(seq * ff * 4)
+        let sFF2 = cuda_malloc(out_size)
+
+        // 3. Attention: Q,K,V projections
+        let _ = gpu_sgemm(h_gpu, gpu_lw.wq, sQ, seq, dim, dim)
+        let _ = gpu_sgemm(h_gpu, gpu_lw.wk, sK, seq, dim, dim)
+        let _ = gpu_sgemm(h_gpu, gpu_lw.wv, sV, seq, dim, dim)
+
+        // scores = Q @ K^T / sqrt(dim)
+        let _ = gpu_sgemm_nt(sQ, sK, sSc, seq, seq, dim)
+        let scale = 1.0 / sqrt(dim * 1.0)
+        let _ = gpu_sscal(sSc, seq * seq, scale)
+
+        // attn = scores @ V
+        let _ = gpu_sgemm(sSc, sV, sAt, seq, dim, seq)
+
+        // output projection
+        let _ = gpu_sgemm(sAt, gpu_lw.wo, sO, seq, dim, dim)
+
+        // residual
+        let _ = gpu_saxpy(sO, h_gpu, seq * dim, 1.0)
+
+        // 4. FFN: up projection -> down projection (linear)
+        let _ = gpu_sgemm(h_gpu, gpu_lw.w_up, sFF, seq, ff, dim)
+        let _ = gpu_sgemm(sFF, gpu_lw.w_down, sFF2, seq, dim, ff)
+
+        // residual
+        let _ = gpu_saxpy(sFF2, h_gpu, seq * dim, 1.0)
+
+        // 5. Free layer weights from GPU
+        let _ = layer_weights_gpu_free(gpu_lw)
+
+        // 6. Free scratch
+        let _ = cuda_free(sQ)
+        let _ = cuda_free(sK)
+        let _ = cuda_free(sV)
+        let _ = cuda_free(sSc)
+        let _ = cuda_free(sAt)
+        let _ = cuda_free(sO)
+        let _ = cuda_free(sFF)
+        let _ = cuda_free(sFF2)
+
+        let _ = cuda_sync()
+
+        li = li + 1
+    }
+
+    h_gpu
+}
+
+// ── Estimate if model fits on GPU ────────────────────────────
+// Given param count and available GPU memory, decide strategy.
+fn should_offload(n_params, gpu_free_bytes) {
+    // Each f32 param = 4 bytes. Training needs ~12x (weights + grads + optimizer)
+    let train_bytes = n_params * 12
+    let infer_bytes = n_params * 4
+    if train_bytes < gpu_free_bytes {
+        return "full_gpu"
+    }
+    if infer_bytes < gpu_free_bytes {
+        return "infer_gpu_train_offload"
+    }
+    return "layer_offload"
+}
+
+println("[offload] module loaded — GPU↔CPU weight transfer ready")

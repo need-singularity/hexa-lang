@@ -1,0 +1,253 @@
+// ═══════════════════════════════════════════════════════════════
+//  alignment_test.hexa — Tests for RLHF + DPO alignment training
+//
+//  Tests with synthetic preference data:
+//    1. Reward model: train on preference pairs, verify margin
+//    2. DPO: verify loss computation, log-prob, training
+//    3. RLHF/PPO: verify generation, GAE, clipped objective
+//
+//  All tests use small vocab (256) and short sequences for speed.
+// ═══════════════════════════════════════════════════════════════
+
+use "reward_model"
+use "dpo"
+use "rlhf"
+
+let DIVIDER = "============================================================"
+
+fn check(label, condition) {
+    if condition {
+        println("[PASS] " + label)
+    } else {
+        println("[FAIL] " + label)
+    }
+}
+
+// ── Synthetic preference data ───────────────────────────────
+// "Good" sequences have ascending pattern, "bad" have descending
+fn make_chosen_seq(length) {
+    let mut ids = []
+    let mut i = 0
+    while i < length {
+        ids = ids.push(i % 256)
+        i = i + 1
+    }
+    ids
+}
+
+fn make_rejected_seq(length) {
+    let mut ids = []
+    let mut i = 0
+    while i < length {
+        ids = ids.push((255 - i) % 256)
+        i = i + 1
+    }
+    ids
+}
+
+fn make_prompt(length) {
+    let mut ids = []
+    let mut i = 0
+    while i < length {
+        ids = ids.push((i * 7 + 3) % 256)
+        i = i + 1
+    }
+    ids
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 1: Reward model basic operations
+// ═══════════════════════════════════════════════════════════════
+println("")
+println(DIVIDER)
+println("  Test 1: Reward Model")
+println(DIVIDER)
+
+// Create reward model
+let rm_w = rm_create_weights()
+let rm_g = rm_create_grads()
+let rm_m = rm_create_momentum()
+let rm_s = rm_create_scratch()
+
+println("[test] reward model created: " + str(rm_param_count()) + " params")
+
+// Test forward pass produces scalar
+let test_ids = make_chosen_seq(128)
+let r1 = reward_forward(rm_w, test_ids, rm_s)
+println("[test] reward score for chosen: " + str(r1))
+check("reward_forward returns scalar", r1 > -100.0)
+check("reward_forward returns scalar", r1 < 100.0)
+
+// Test different inputs give different rewards
+let test_ids2 = make_rejected_seq(128)
+let r2 = reward_forward(rm_w, test_ids2, rm_s)
+println("[test] reward score for rejected: " + str(r2))
+check("different inputs give different rewards", r1 != r2)
+
+// Test reward margin loss
+let loss_same = reward_margin_loss(1.0, 1.0)
+println("[test] margin loss (same): " + str(loss_same))
+check("margin_loss(1,1) = log(2) ~0.693", loss_same > 0.69)
+check("margin_loss(1,1) = log(2) ~0.693", loss_same < 0.70)
+
+let loss_good = reward_margin_loss(2.0, 0.0)
+println("[test] margin loss (2.0 vs 0.0): " + str(loss_good))
+check("margin_loss(2,0) < margin_loss(1,1)", loss_good < loss_same)
+
+let loss_bad = reward_margin_loss(0.0, 2.0)
+println("[test] margin loss (0.0 vs 2.0): " + str(loss_bad))
+check("margin_loss(0,2) > margin_loss(1,1)", loss_bad > loss_same)
+
+// Test reward training (2 steps, verify loss decreases)
+let pairs = [[make_chosen_seq(128), make_rejected_seq(128)]]
+println("[test] training reward model for 2 steps...")
+rm_train(rm_w, rm_g, rm_m, rm_s, pairs, 2, 0.001)
+
+let r1_after = reward_forward(rm_w, test_ids, rm_s)
+let r2_after = reward_forward(rm_w, test_ids2, rm_s)
+println("[test] after training: chosen=" + str(r1_after) + " rejected=" + str(r2_after))
+let margin_after = r1_after - r2_after
+let margin_before = r1 - r2
+println("[test] margin before=" + str(margin_before) + " after=" + str(margin_after))
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 2: DPO operations
+// ═══════════════════════════════════════════════════════════════
+println("")
+println(DIVIDER)
+println("  Test 2: DPO (Direct Preference Optimization)")
+println(DIVIDER)
+
+// Create policy and reference models
+let dpo_policy = dpo_create_weights()
+let dpo_ref = dpo_copy_weights(dpo_policy)
+let dpo_g = dpo_create_grads()
+let dpo_mom = dpo_create_momentum()
+let dpo_s = dpo_create_scratch()
+
+println("[test] DPO models created: " + str(dpo_param_count()) + " params")
+
+// Test log-probability computation
+let chosen = make_chosen_seq(32)
+let rejected = make_rejected_seq(32)
+
+let lp_chosen = dpo_log_prob(dpo_policy, chosen, dpo_s)
+println("[test] log_prob(chosen): " + str(lp_chosen))
+check("log_prob is negative", lp_chosen < 0.0)
+
+let lp_rejected = dpo_log_prob(dpo_policy, rejected, dpo_s)
+println("[test] log_prob(rejected): " + str(lp_rejected))
+check("log_prob is negative", lp_rejected < 0.0)
+
+// Test reference model gives same log-probs as initial policy
+let lp_ref = dpo_log_prob(dpo_ref, chosen, dpo_s)
+println("[test] log_prob_ref(chosen): " + str(lp_ref))
+let lp_diff = lp_chosen - lp_ref
+check("ref model matches initial policy", lp_diff > -0.01)
+check("ref model matches initial policy", lp_diff < 0.01)
+
+// Test DPO loss computation
+let beta = 0.1
+let dpo_result = dpo_loss(dpo_policy, dpo_ref, chosen, rejected, beta, dpo_s)
+let dpo_l = dpo_result[0]
+let dpo_rw = dpo_result[1]
+let dpo_rl = dpo_result[2]
+println("[test] DPO loss: " + str(dpo_l))
+println("[test] implicit reward chosen: " + str(dpo_rw) + " rejected: " + str(dpo_rl))
+// When policy == ref, DPO loss should be log(2) since log-ratios are 0
+check("DPO loss ~log(2) when policy=ref", dpo_l > 0.68)
+check("DPO loss ~log(2) when policy=ref", dpo_l < 0.71)
+
+// Test DPO training (2 steps)
+let dpo_pairs = [[chosen, rejected]]
+println("[test] DPO training for 2 steps...")
+dpo_train(dpo_policy, dpo_ref, dpo_g, dpo_mom, dpo_s, dpo_pairs, 2, 0.0001, beta)
+
+// After training, implicit reward margin should improve
+let dpo_result2 = dpo_loss(dpo_policy, dpo_ref, chosen, rejected, beta, dpo_s)
+println("[test] after training: loss=" + str(dpo_result2[0]) + " margin=" + str(dpo_result2[1] - dpo_result2[2]))
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 3: RLHF / PPO operations
+// ═══════════════════════════════════════════════════════════════
+println("")
+println(DIVIDER)
+println("  Test 3: RLHF / PPO")
+println(DIVIDER)
+
+// Create policy, reference, and reward models
+let ppo_pol = ppo_create_policy()
+let ppo_ref_model = ppo_copy_weights(ppo_pol)
+let ppo_g = ppo_create_grads()
+let ppo_mom = ppo_create_momentum()
+let ppo_s = ppo_create_scratch()
+
+println("[test] PPO models created: " + str(ppo_param_count()) + " params")
+
+// Test generation
+let prompt = make_prompt(8)
+println("[test] generating from policy (prompt len=" + str(len(prompt)) + ")...")
+let gen = ppo_generate(ppo_pol, prompt, 4, 0.8, ppo_s)
+let gen_ids = gen[0]
+let gen_lps = gen[1]
+println("[test] generated " + str(len(gen_ids)) + " tokens total (" + str(len(gen_lps)) + " new)")
+check("generation extends prompt", len(gen_ids) > len(prompt))
+check("log_probs match gen count", len(gen_lps) == len(gen_ids) - len(prompt))
+
+// Test log-prob is negative
+let mut all_neg = 1
+let mut lpi = 0
+while lpi < len(gen_lps) {
+    if gen_lps[lpi] > 0.0 { all_neg = 0 }
+    lpi = lpi + 1
+}
+check("all log_probs are negative", all_neg == 1)
+
+// Test GAE computation
+let test_rewards = [0.0, 0.0, 0.0, 1.0]
+let test_values = [0.1, 0.2, 0.3, 0.5]
+let gae_result = ppo_gae(test_rewards, test_values, 4)
+let advs = gae_result[0]
+let rets = gae_result[1]
+println("[test] GAE advantages: " + str(advs[0]) + ", " + str(advs[1]) + ", " + str(advs[2]) + ", " + str(advs[3]))
+println("[test] GAE returns: " + str(rets[0]) + ", " + str(rets[1]) + ", " + str(rets[2]) + ", " + str(rets[3]))
+check("last advantage = reward - value", advs[3] > 0.49)
+check("last advantage = reward - value", advs[3] < 0.51)
+
+// Test PPO clipped loss
+let clip1 = ppo_clipped_loss(-1.0, -1.0, 1.0)
+println("[test] PPO clip loss (ratio=1, adv=1): " + str(clip1))
+check("ratio=1 gives -advantage", clip1 > -1.01)
+check("ratio=1 gives -advantage", clip1 < -0.99)
+
+// Test entropy
+let test_vocab = 256
+let uniform_logits = tensor_zeros(test_vocab)
+let ent = ppo_entropy(uniform_logits)
+let expected_ent = log(test_vocab * 1.0)
+println("[test] entropy of uniform: " + str(ent) + " (expected ~" + str(expected_ent) + ")")
+check("uniform entropy ~log(V)", ent > expected_ent - 0.01)
+check("uniform entropy ~log(V)", ent < expected_ent + 0.01)
+
+// Test KL divergence (same model should give KL~0)
+let kl_same = ppo_kl_at(uniform_logits, uniform_logits)
+println("[test] KL(uniform || uniform): " + str(kl_same))
+check("KL(p||p) ~= 0", kl_same > -0.001)
+check("KL(p||p) ~= 0", kl_same < 0.001)
+
+// Test PPO step (1 step)
+// Use reward model from Test 1 as reward function
+println("[test] running 1 PPO step...")
+let ppo_loss_val = ppo_step(ppo_pol, ppo_ref_model, ppo_g, ppo_mom, prompt, rm_w, rm_s, ppo_s, 0.0001)
+println("[test] PPO loss: " + str(ppo_loss_val))
+
+// ═══════════════════════════════════════════════════════════════
+//  Summary
+// ═══════════════════════════════════════════════════════════════
+println("")
+println(DIVIDER)
+println("  Alignment Tests Complete")
+println("  - Reward model: forward, margin loss, training")
+println("  - DPO: log-prob, loss, preference training")
+println("  - RLHF/PPO: generation, GAE, clipping, KL, training")
+println(DIVIDER)

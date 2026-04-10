@@ -1,0 +1,1089 @@
+// ===================================================================
+//  self/serve/serve.hexa — HTTP Inference Server in Pure HEXA
+//
+//  Self-contained: HTTP server + transformer + sampling + GGUF loading.
+//  No imports needed — uses only HEXA builtins.
+//
+//  Usage:
+//    hexa self/serve/serve.hexa <gguf_path> [host] [port]
+//
+//  Endpoints:
+//    GET  /health              → {"status":"ok","model":"..."}
+//    GET  /v1/models           → {"model":"...","dim":N,...}
+//    POST /v1/completions      → {"text":"...","tokens":N,"tok_per_sec":X}
+//    POST /v1/tokenize         → {"tokens":[...],"count":N}
+//
+//  Request body (POST /v1/completions):
+//    {"prompt":"Hello","max_tokens":32,"temperature":0.7}
+//
+//  Physical limits: DDR4 ~50 GB/s, 7B Q4 = 3.5GB -> ~14 tok/s max.
+// ===================================================================
+
+// ===================================================================
+//  PART 1: Transformer Core (from self/ml/transformer.hexa)
+// ===================================================================
+
+fn zeros(n) {
+    let mut arr = []
+    let mut i = 0
+    while i < n {
+        arr = arr + [0.0]
+        i = i + 1
+    }
+    return arr
+}
+
+fn find_tensor(model, name) {
+    let info = model["tensor_info"]
+    let n = len(info)
+    let mut i = 0
+    while i < n {
+        let entry = info[i]
+        if entry[0] == name { return entry }
+        i = i + 1
+    }
+    return []
+}
+
+fn find_tensor_from_info(tensor_info, name) {
+    let n = len(tensor_info)
+    let mut i = 0
+    while i < n {
+        let entry = tensor_info[i]
+        if entry[0] == name { return entry }
+        i = i + 1
+    }
+    return []
+}
+
+fn q4_0_byte_size(rows, cols) {
+    let blocks_per_row = cols / 32
+    let bytes_per_row = blocks_per_row * 18
+    return rows * bytes_per_row
+}
+
+fn load_q4_bytes(model, name, rows, cols) {
+    let entry = find_tensor(model, name)
+    if len(entry) == 0 { return tensor_zeros(1) }
+    let offset_in_data = entry[3]
+    let abs_offset = model["data_origin"] + offset_in_data
+    let total_bytes = q4_0_byte_size(rows, cols)
+    return read_file_bytes(model["gguf_path"], abs_offset, total_bytes)
+}
+
+fn load_f32_vec(model, name, numel) {
+    let entry = find_tensor(model, name)
+    if len(entry) == 0 { return tensor_zeros(numel) }
+    let offset_in_data = entry[3]
+    let abs_offset = model["data_origin"] + offset_in_data
+    let raw = read_file_bytes(model["gguf_path"], abs_offset, numel * 4)
+    let mut out = []
+    let mut i = 0
+    while i < numel {
+        let off = i * 4
+        let b0 = to_int(raw[off])
+        let b1 = to_int(raw[off + 1])
+        let b2 = to_int(raw[off + 2])
+        let b3 = to_int(raw[off + 3])
+        let bits = b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
+        let sign = (bits / 2147483648) % 2
+        let exp_f = (bits / 8388608) % 256
+        let mant = bits % 8388608
+        let mut v = 0.0
+        if exp_f != 0 {
+            if exp_f != 255 {
+                let m = 1.0 + to_float(mant) / 8388608.0
+                v = m * pow(2.0, to_float(exp_f - 127))
+                if sign == 1 { v = 0.0 - v }
+            }
+        }
+        out = out + [v]
+        i = i + 1
+    }
+    return out
+}
+
+fn llama_rms_norm(x, w, dim, eps) {
+    let mut ss = 0.0
+    let mut i = 0
+    while i < dim {
+        let v = x[i]
+        ss = ss + v * v
+        i = i + 1
+    }
+    let rms = sqrt(ss / to_float(dim) + eps)
+    let inv_rms = 1.0 / rms
+    let mut out = []
+    i = 0
+    while i < dim {
+        out = out + [x[i] * inv_rms * w[i]]
+        i = i + 1
+    }
+    return out
+}
+
+fn apply_rope_vec(vec, pos, head_dim, base) {
+    let half = head_dim / 2
+    let mut out = []
+    let mut p = 0
+    while p < half {
+        let freq = 1.0 / pow(base, 2.0 * to_float(p) / to_float(head_dim))
+        let angle = to_float(pos) * freq
+        let cos_a = cos(angle)
+        let sin_a = sin(angle)
+        let x0 = vec[2 * p]
+        let x1 = vec[2 * p + 1]
+        out = out + [x0 * cos_a - x1 * sin_a]
+        out = out + [x0 * sin_a + x1 * cos_a]
+        p = p + 1
+    }
+    return out
+}
+
+fn vec_softmax(scores, n) {
+    let mut mx = scores[0]
+    let mut i = 1
+    while i < n {
+        if scores[i] > mx { mx = scores[i] }
+        i = i + 1
+    }
+    let mut out = []
+    let mut sum_e = 0.0
+    i = 0
+    while i < n {
+        let e = exp(scores[i] - mx)
+        out = out + [e]
+        sum_e = sum_e + e
+        i = i + 1
+    }
+    let inv = 1.0 / sum_e
+    let mut result = []
+    i = 0
+    while i < n {
+        result = result + [out[i] * inv]
+        i = i + 1
+    }
+    return result
+}
+
+fn silu_scalar(x) {
+    return x / (1.0 + exp(0.0 - x))
+}
+
+fn tensor_to_array(t, n) {
+    let mut arr = []
+    let mut i = 0
+    while i < n {
+        arr = arr + [t[i]]
+        i = i + 1
+    }
+    return arr
+}
+
+fn transformer_layer(model, layer_idx, x, pos, kv_k, kv_v) {
+    let cfg = model["config"]
+    let dim = cfg["dim"]
+    let n_heads = cfg["n_heads"]
+    let n_kv_heads = cfg["n_kv_heads"]
+    let head_dim = cfg["head_dim"]
+    let hidden_dim = cfg["hidden_dim"]
+    let eps = cfg["rms_eps"]
+    let rope_base = cfg["rope_base"]
+    let gqa_ratio = n_heads / n_kv_heads
+
+    let li = str(layer_idx)
+
+    let w_attn_norm = load_f32_vec(model, "blk." + li + ".attn_norm.weight", dim)
+    let xn = llama_rms_norm(x, w_attn_norm, dim, eps)
+
+    let wq_bytes = load_q4_bytes(model, "blk." + li + ".attn_q.weight", dim, dim)
+    let q_full = q4_0_matvec(wq_bytes, xn, dim, dim)
+
+    let kv_dim = n_kv_heads * head_dim
+    let wk_bytes = load_q4_bytes(model, "blk." + li + ".attn_k.weight", kv_dim, dim)
+    let k_vec = q4_0_matvec(wk_bytes, xn, kv_dim, dim)
+
+    let wv_bytes = load_q4_bytes(model, "blk." + li + ".attn_v.weight", kv_dim, dim)
+    let v_vec = q4_0_matvec(wv_bytes, xn, kv_dim, dim)
+
+    let mut q_rope = []
+    let mut h = 0
+    while h < n_heads {
+        let base_q = h * head_dim
+        let mut q_head = []
+        let mut d = 0
+        while d < head_dim {
+            q_head = q_head + [q_full[base_q + d]]
+            d = d + 1
+        }
+        let q_rot = apply_rope_vec(q_head, pos, head_dim, rope_base)
+        q_rope = q_rope + q_rot
+        h = h + 1
+    }
+
+    let mut k_rope = []
+    h = 0
+    while h < n_kv_heads {
+        let base_k = h * head_dim
+        let mut k_head = []
+        let mut d = 0
+        while d < head_dim {
+            k_head = k_head + [k_vec[base_k + d]]
+            d = d + 1
+        }
+        let k_rot = apply_rope_vec(k_head, pos, head_dim, rope_base)
+        k_rope = k_rope + k_rot
+        h = h + 1
+    }
+
+    let slab = n_kv_heads * head_dim
+    let cache_base = pos * slab
+    let mut i = 0
+    while i < slab {
+        kv_k[cache_base + i] = k_rope[i]
+        kv_v[cache_base + i] = v_vec[i]
+        i = i + 1
+    }
+
+    let scale = 1.0 / sqrt(to_float(head_dim))
+    let ctx_len = pos + 1
+    let mut attn_out = []
+
+    h = 0
+    while h < n_heads {
+        let kv_h = h / gqa_ratio
+        let q_base = h * head_dim
+
+        let mut scores = []
+        let mut t = 0
+        while t < ctx_len {
+            let k_base = t * slab + kv_h * head_dim
+            let mut dot = 0.0
+            let mut d = 0
+            while d < head_dim {
+                dot = dot + q_rope[q_base + d] * kv_k[k_base + d]
+                d = d + 1
+            }
+            scores = scores + [dot * scale]
+            t = t + 1
+        }
+
+        let attn_weights = vec_softmax(scores, ctx_len)
+
+        let mut d = 0
+        while d < head_dim {
+            let mut acc = 0.0
+            t = 0
+            while t < ctx_len {
+                let v_base = t * slab + kv_h * head_dim
+                acc = acc + attn_weights[t] * kv_v[v_base + d]
+                t = t + 1
+            }
+            attn_out = attn_out + [acc]
+            d = d + 1
+        }
+        h = h + 1
+    }
+
+    let wo_bytes = load_q4_bytes(model, "blk." + li + ".attn_output.weight", dim, dim)
+    let attn_proj = q4_0_matvec(wo_bytes, attn_out, dim, dim)
+
+    let mut x2 = []
+    i = 0
+    while i < dim {
+        x2 = x2 + [x[i] + attn_proj[i]]
+        i = i + 1
+    }
+
+    let w_ffn_norm = load_f32_vec(model, "blk." + li + ".ffn_norm.weight", dim)
+    let xn2 = llama_rms_norm(x2, w_ffn_norm, dim, eps)
+
+    let wg_bytes = load_q4_bytes(model, "blk." + li + ".ffn_gate.weight", hidden_dim, dim)
+    let gate = q4_0_matvec(wg_bytes, xn2, hidden_dim, dim)
+
+    let wu_bytes = load_q4_bytes(model, "blk." + li + ".ffn_up.weight", hidden_dim, dim)
+    let up = q4_0_matvec(wu_bytes, xn2, hidden_dim, dim)
+
+    let mut ffn_hidden = []
+    i = 0
+    while i < hidden_dim {
+        ffn_hidden = ffn_hidden + [silu_scalar(gate[i]) * up[i]]
+        i = i + 1
+    }
+
+    let wd_bytes = load_q4_bytes(model, "blk." + li + ".ffn_down.weight", dim, hidden_dim)
+    let ffn_out = q4_0_matvec(wd_bytes, ffn_hidden, dim, hidden_dim)
+
+    let mut out = []
+    i = 0
+    while i < dim {
+        out = out + [x2[i] + ffn_out[i]]
+        i = i + 1
+    }
+
+    return [out, kv_k, kv_v]
+}
+
+fn transformer_forward(model, x, pos, kv_keys, kv_vals) {
+    let cfg = model["config"]
+    let n_layers = cfg["n_layers"]
+    let dim = cfg["dim"]
+    let vocab_size = cfg["vocab_size"]
+
+    let mut h = x
+    let mut layer = 0
+    while layer < n_layers {
+        let result = transformer_layer(model, layer, h, pos, kv_keys[layer], kv_vals[layer])
+        h = result[0]
+        kv_keys[layer] = result[1]
+        kv_vals[layer] = result[2]
+        layer = layer + 1
+    }
+
+    let w_final_norm = load_f32_vec(model, "output_norm.weight", dim)
+    let h_norm = llama_rms_norm(h, w_final_norm, dim, cfg["rms_eps"])
+
+    let wo_bytes = load_q4_bytes(model, "output.weight", vocab_size, dim)
+    let logits = q4_0_matvec(wo_bytes, h_norm, vocab_size, dim)
+
+    return [logits, kv_keys, kv_vals]
+}
+
+fn load_embedding(model, token_id) {
+    let cfg = model["config"]
+    let dim = cfg["dim"]
+    let entry = find_tensor(model, "token_embd.weight")
+    if len(entry) == 0 { return zeros(dim) }
+    let ggml_type = entry[2]
+    let offset_in_data = entry[3]
+    let abs_offset = model["data_origin"] + offset_in_data
+
+    if ggml_type == 0 {
+        let row_offset = abs_offset + token_id * dim * 4
+        let raw = read_file_bytes(model["gguf_path"], row_offset, dim * 4)
+        let mut out = []
+        let mut i = 0
+        while i < dim {
+            let off = i * 4
+            let b0 = to_int(raw[off])
+            let b1 = to_int(raw[off + 1])
+            let b2 = to_int(raw[off + 2])
+            let b3 = to_int(raw[off + 3])
+            let bits = b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
+            let sign = (bits / 2147483648) % 2
+            let exp_f = (bits / 8388608) % 256
+            let mant = bits % 8388608
+            let mut v = 0.0
+            if exp_f != 0 {
+                if exp_f != 255 {
+                    let m = 1.0 + to_float(mant) / 8388608.0
+                    v = m * pow(2.0, to_float(exp_f - 127))
+                    if sign == 1 { v = 0.0 - v }
+                }
+            }
+            out = out + [v]
+            i = i + 1
+        }
+        return out
+    }
+
+    let blocks_per_row = dim / 32
+    let bytes_per_row = blocks_per_row * 18
+    let row_offset = abs_offset + token_id * bytes_per_row
+    let raw = read_file_bytes(model["gguf_path"], row_offset, bytes_per_row)
+    let t = q4_0_dequantize(raw, dim)
+    return tensor_to_array(t, dim)
+}
+
+// ===================================================================
+//  PART 2: Tokenizer
+// ===================================================================
+
+fn byte_tokenize(text) {
+    let mut tokens = [1]
+    let n = len(text)
+    let mut i = 0
+    while i < n {
+        let ch = char_code(text, i)
+        tokens = tokens + [ch + 3]
+        i = i + 1
+    }
+    return tokens
+}
+
+fn token_to_str(token_id) {
+    if token_id <= 2 { return "" }
+    let byte_val = token_id - 3
+    if byte_val >= 32 {
+        if byte_val < 127 {
+            return chr(byte_val)
+        }
+    }
+    return "?"
+}
+
+// ===================================================================
+//  PART 3: Sampling
+// ===================================================================
+
+let mut SAMPLER_RNG = 2463534242
+
+fn sampler_set_seed(s) {
+    SAMPLER_RNG = s
+}
+
+fn sampler_rand_float() {
+    let mut x = SAMPLER_RNG
+    x = x ^ (x * 8192)
+    x = x ^ (x / 131072)
+    x = x ^ (x * 32)
+    if x < 0 { x = 0 - x }
+    SAMPLER_RNG = x
+    return to_float(x % 1000000) / 1000000.0
+}
+
+fn argmax(logits, n) {
+    let mut best_i = 0
+    let mut best_v = logits[0]
+    let mut i = 1
+    while i < n {
+        if logits[i] > best_v {
+            best_v = logits[i]
+            best_i = i
+        }
+        i = i + 1
+    }
+    return best_i
+}
+
+fn apply_temperature(logits, n, temp) {
+    if temp <= 0.0 { return logits }
+    let inv_t = 1.0 / temp
+    let mut out = tensor_zeros(n)
+    let mut i = 0
+    while i < n {
+        out[i] = logits[i] * inv_t
+        i = i + 1
+    }
+    return out
+}
+
+fn softmax_logits(logits, n) {
+    let mut mx = logits[0]
+    let mut i = 1
+    while i < n {
+        if logits[i] > mx { mx = logits[i] }
+        i = i + 1
+    }
+    let mut probs = tensor_zeros(n)
+    let mut sum_e = 0.0
+    i = 0
+    while i < n {
+        let e = exp(logits[i] - mx)
+        probs[i] = e
+        sum_e = sum_e + e
+        i = i + 1
+    }
+    let inv = 1.0 / sum_e
+    i = 0
+    while i < n {
+        probs[i] = probs[i] * inv
+        i = i + 1
+    }
+    return probs
+}
+
+fn apply_top_k(probs, n, k) {
+    if k <= 0 { return probs }
+    if k >= n { return probs }
+    let mut sorted_p = []
+    let mut i = 0
+    while i < n {
+        sorted_p = sorted_p + [probs[i]]
+        i = i + 1
+    }
+    let mut j = 0
+    while j < k {
+        let mut best = j
+        let mut m = j + 1
+        while m < n {
+            if sorted_p[m] > sorted_p[best] { best = m }
+            m = m + 1
+        }
+        if best != j {
+            let tmp = sorted_p[j]
+            sorted_p[j] = sorted_p[best]
+            sorted_p[best] = tmp
+        }
+        j = j + 1
+    }
+    let threshold = sorted_p[k - 1]
+    let mut out = tensor_zeros(n)
+    let mut sum_p = 0.0
+    i = 0
+    while i < n {
+        if probs[i] >= threshold {
+            out[i] = probs[i]
+            sum_p = sum_p + probs[i]
+        }
+        i = i + 1
+    }
+    if sum_p > 0.0 {
+        let inv = 1.0 / sum_p
+        i = 0
+        while i < n {
+            out[i] = out[i] * inv
+            i = i + 1
+        }
+    }
+    return out
+}
+
+fn apply_top_p(probs, n, p) {
+    if p >= 1.0 { return probs }
+    if p <= 0.0 { return probs }
+    let mut indices = []
+    let mut vals = []
+    let mut i = 0
+    while i < n {
+        if probs[i] > 0.0 {
+            indices = indices + [i]
+            vals = vals + [probs[i]]
+        }
+        i = i + 1
+    }
+    let nn = len(indices)
+    let mut ii = 0
+    while ii < nn {
+        let mut best = ii
+        let mut jj = ii + 1
+        while jj < nn {
+            if vals[jj] > vals[best] { best = jj }
+            jj = jj + 1
+        }
+        if best != ii {
+            let ti = indices[ii]
+            indices[ii] = indices[best]
+            indices[best] = ti
+            let tv = vals[ii]
+            vals[ii] = vals[best]
+            vals[best] = tv
+        }
+        ii = ii + 1
+    }
+    let mut out = tensor_zeros(n)
+    let mut cum = 0.0
+    let mut sum_p = 0.0
+    i = 0
+    while i < nn {
+        let idx = indices[i]
+        let prob = vals[i]
+        out[idx] = prob
+        sum_p = sum_p + prob
+        cum = cum + prob
+        if cum >= p { i = nn }
+        i = i + 1
+    }
+    if sum_p > 0.0 {
+        let inv = 1.0 / sum_p
+        i = 0
+        while i < n {
+            out[i] = out[i] * inv
+            i = i + 1
+        }
+    }
+    return out
+}
+
+fn sample_from_probs(probs, n) {
+    let r = sampler_rand_float()
+    let mut cum = 0.0
+    let mut i = 0
+    while i < n {
+        cum = cum + probs[i]
+        if cum > r { return i }
+        i = i + 1
+    }
+    return n - 1
+}
+
+fn do_sample_token(logits, vocab_size, temperature, top_k, top_p) {
+    if temperature <= 0.0 {
+        return argmax(logits, vocab_size)
+    }
+    let scaled = apply_temperature(logits, vocab_size, temperature)
+    let probs = softmax_logits(scaled, vocab_size)
+    let kp = apply_top_k(probs, vocab_size, top_k)
+    let pp = apply_top_p(kp, vocab_size, top_p)
+    return sample_from_probs(pp, vocab_size)
+}
+
+// ===================================================================
+//  PART 4: Model Loading
+// ===================================================================
+
+let mut SERVER_MODEL = nil
+let mut SERVER_MODEL_PATH = ""
+let mut SERVER_REQUEST_COUNT = 0
+
+fn load_model(model_path) {
+    println("[serve] Loading model: " + model_path)
+    let t0 = clock()
+
+    let gguf = mmap_gguf(model_path)
+    let metadata = gguf[0]
+    let tensor_info = gguf[1]
+    let data_origin = gguf[2]
+    let gguf_path = gguf[3]
+
+    let mut dim = 4096
+    let mut hidden_dim = 11008
+    let mut n_layers = 32
+    let mut n_heads = 32
+    let mut n_kv_heads = 32
+    let mut vocab_size = 32000
+    let mut max_seq_len = 2048
+    let mut rope_base = 10000.0
+    let mut rms_eps = 0.00001
+
+    let n_meta = len(metadata)
+    let mut i = 0
+    while i < n_meta {
+        let kv = metadata[i]
+        let key = kv[0]
+        let val = kv[1]
+        if key == "llama.embedding_length" { dim = val }
+        if key == "llama.feed_forward_length" { hidden_dim = val }
+        if key == "llama.block_count" { n_layers = val }
+        if key == "llama.attention.head_count" { n_heads = val }
+        if key == "llama.attention.head_count_kv" { n_kv_heads = val }
+        if key == "llama.context_length" { max_seq_len = val }
+        if key == "llama.rope.freq_base" { rope_base = to_float(val) }
+        if key == "llama.attention.layer_norm_rms_epsilon" { rms_eps = to_float(val) }
+        i = i + 1
+    }
+
+    let emb_entry = find_tensor_from_info(tensor_info, "token_embd.weight")
+    if len(emb_entry) > 0 {
+        let shape = emb_entry[1]
+        if len(shape) >= 2 { vocab_size = shape[1] }
+        if len(shape) >= 1 {
+            if vocab_size == 32000 { vocab_size = shape[0] }
+        }
+    }
+
+    let head_dim = dim / n_heads
+
+    let cfg = #{}
+    cfg["dim"] = dim
+    cfg["hidden_dim"] = hidden_dim
+    cfg["n_layers"] = n_layers
+    cfg["n_heads"] = n_heads
+    cfg["n_kv_heads"] = n_kv_heads
+    cfg["vocab_size"] = vocab_size
+    cfg["max_seq_len"] = max_seq_len
+    cfg["head_dim"] = head_dim
+    cfg["rope_base"] = rope_base
+    cfg["rms_eps"] = rms_eps
+
+    let model = #{}
+    model["config"] = cfg
+    model["tensor_info"] = tensor_info
+    model["data_origin"] = data_origin
+    model["gguf_path"] = gguf_path
+
+    SERVER_MODEL = model
+    SERVER_MODEL_PATH = model_path
+
+    let t1 = clock()
+    let load_ms = (t1 - t0) * 1000.0
+    println("[serve] Model loaded in " + str(load_ms) + " ms")
+    println("[serve] Config: dim=" + str(dim) + " layers=" + str(n_layers) + " heads=" + str(n_heads) + " vocab=" + str(vocab_size))
+}
+
+// ===================================================================
+//  PART 5: Completion Engine
+// ===================================================================
+
+fn run_completion(prompt, max_tokens, temperature, top_k, top_p, seed) {
+    if SERVER_MODEL == nil {
+        let err = #{}
+        err["error"] = "model not loaded"
+        return err
+    }
+
+    let model = SERVER_MODEL
+    let cfg = model["config"]
+    let vocab_size = cfg["vocab_size"]
+    let dim = cfg["dim"]
+    let n_layers = cfg["n_layers"]
+    let head_dim = cfg["head_dim"]
+    let n_kv_heads = cfg["n_kv_heads"]
+    let max_seq_len = cfg["max_seq_len"]
+
+    sampler_set_seed(seed)
+
+    let tokens = byte_tokenize(prompt)
+    let prompt_len = len(tokens)
+
+    // Fresh KV cache per request
+    let mut kv_keys = []
+    let mut kv_vals = []
+    let mut li = 0
+    while li < n_layers {
+        kv_keys = kv_keys + [tensor_zeros(max_seq_len * n_kv_heads * head_dim)]
+        kv_vals = kv_vals + [tensor_zeros(max_seq_len * n_kv_heads * head_dim)]
+        li = li + 1
+    }
+
+    // Prefill
+    let t_start = clock()
+    let mut pos = 0
+    let mut last_logits = []
+
+    while pos < prompt_len {
+        let tok = tokens[pos]
+        let emb = load_embedding(model, tok)
+        let result = transformer_forward(model, emb, pos, kv_keys, kv_vals)
+        kv_keys = result[1]
+        kv_vals = result[2]
+        if pos == prompt_len - 1 {
+            last_logits = result[0]
+        }
+        pos = pos + 1
+    }
+
+    // Decode
+    let t_decode_start = clock()
+    let mut generated_text = ""
+    let mut generated_count = 0
+    let mut cur_tok = do_sample_token(last_logits, vocab_size, temperature, top_k, top_p)
+
+    while generated_count < max_tokens {
+        if cur_tok == 2 { generated_count = max_tokens }
+        else {
+            let tok_str = token_to_str(cur_tok)
+            generated_text = generated_text + tok_str
+
+            let emb = load_embedding(model, cur_tok)
+            let result = transformer_forward(model, emb, prompt_len + generated_count, kv_keys, kv_vals)
+            let logits = result[0]
+            kv_keys = result[1]
+            kv_vals = result[2]
+
+            cur_tok = do_sample_token(logits, vocab_size, temperature, top_k, top_p)
+            generated_count = generated_count + 1
+        }
+    }
+
+    let t_end = clock()
+    let total_s = t_end - t_start
+    let decode_s = t_end - t_decode_start
+    let mut tok_per_sec = 0.0
+    if decode_s > 0.0 {
+        tok_per_sec = to_float(generated_count) / decode_s
+    }
+
+    let out = #{}
+    out["text"] = generated_text
+    out["tokens"] = generated_count
+    out["prompt_tokens"] = prompt_len
+    out["tok_per_sec"] = tok_per_sec
+    out["total_ms"] = total_s * 1000.0
+    out["decode_ms"] = decode_s * 1000.0
+    return out
+}
+
+// ===================================================================
+//  PART 6: HTTP Server (raw net_* builtins)
+// ===================================================================
+
+fn parse_http_request(raw) {
+    let mut method = "GET"
+    let mut path = "/"
+    let mut query = ""
+    let mut body = ""
+    let mut headers = #{}
+
+    let parts = raw.split("\r\n\r\n")
+    let header_block = parts[0]
+    if len(parts) > 1 {
+        body = parts[1]
+    }
+
+    let lines = header_block.split("\r\n")
+    if len(lines) > 0 {
+        let req_parts = lines[0].split(" ")
+        if len(req_parts) >= 2 {
+            method = req_parts[0]
+            let full_path = req_parts[1]
+            let qidx = full_path.index_of("?")
+            if qidx >= 0 {
+                path = full_path.substring(0, qidx)
+                query = full_path.substring(qidx + 1, len(full_path))
+            } else {
+                path = full_path
+            }
+        }
+    }
+
+    let mut i = 1
+    while i < len(lines) {
+        let line = lines[i]
+        let colon = line.index_of(":")
+        if colon > 0 {
+            let key = line.substring(0, colon).trim().to_lower()
+            let val = line.substring(colon + 1, len(line)).trim()
+            headers[key] = val
+        }
+        i = i + 1
+    }
+
+    let req = #{}
+    req["method"] = method
+    req["path"] = path
+    req["query"] = query
+    req["body"] = body
+    req["headers"] = headers
+    return req
+}
+
+fn send_http_response(conn, status_code, content_type, body) {
+    let mut status_text = "OK"
+    if status_code == 200 { status_text = "OK" }
+    if status_code == 201 { status_text = "Created" }
+    if status_code == 204 { status_text = "No Content" }
+    if status_code == 400 { status_text = "Bad Request" }
+    if status_code == 404 { status_text = "Not Found" }
+    if status_code == 405 { status_text = "Method Not Allowed" }
+    if status_code == 500 { status_text = "Internal Server Error" }
+
+    let mut resp = "HTTP/1.1 " + str(status_code) + " " + status_text + "\r\n"
+    resp = resp + "Content-Type: " + content_type + "\r\n"
+    resp = resp + "Content-Length: " + str(len(body)) + "\r\n"
+    resp = resp + "Connection: close\r\n"
+    resp = resp + "Access-Control-Allow-Origin: *\r\n"
+    resp = resp + "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+    resp = resp + "Access-Control-Allow-Headers: Content-Type\r\n"
+    resp = resp + "\r\n"
+    resp = resp + body
+    net_write(conn, resp)
+}
+
+fn send_json(conn, status_code, data) {
+    send_http_response(conn, status_code, "application/json", json_stringify(data))
+}
+
+fn send_json_error(conn, status_code, message) {
+    let err = #{}
+    err["error"] = message
+    send_json(conn, status_code, err)
+}
+
+fn send_sse(conn, body) {
+    send_http_response(conn, 200, "text/event-stream", body)
+}
+
+// ===================================================================
+//  PART 7: API Router
+// ===================================================================
+
+fn handle_request(conn, req) {
+    let method = req["method"]
+    let path = req["path"]
+    let body = req["body"]
+    let query = req["query"]
+
+    SERVER_REQUEST_COUNT = SERVER_REQUEST_COUNT + 1
+
+    // OPTIONS preflight
+    if method == "OPTIONS" {
+        send_http_response(conn, 204, "text/plain", "")
+        return true
+    }
+
+    // GET /health
+    if path == "/health" {
+        let data = #{}
+        data["status"] = "ok"
+        data["model"] = SERVER_MODEL_PATH
+        data["requests_served"] = SERVER_REQUEST_COUNT
+        send_json(conn, 200, data)
+        return true
+    }
+
+    // GET /v1/models
+    if path == "/v1/models" {
+        let ready = SERVER_MODEL != nil
+        let data = #{}
+        data["model"] = SERVER_MODEL_PATH
+        data["ready"] = ready
+        if SERVER_MODEL != nil {
+            let cfg = SERVER_MODEL["config"]
+            data["dim"] = cfg["dim"]
+            data["n_layers"] = cfg["n_layers"]
+            data["n_heads"] = cfg["n_heads"]
+            data["vocab_size"] = cfg["vocab_size"]
+        }
+        send_json(conn, 200, data)
+        return true
+    }
+
+    // POST /v1/completions
+    if path == "/v1/completions" {
+        if method != "POST" {
+            send_json_error(conn, 405, "Use POST for /v1/completions")
+            return true
+        }
+
+        let params = json_parse(body)
+        let mut prompt = "Hello"
+        let mut max_tokens = 32
+        let mut temperature = 0.7
+        let mut top_k = 40
+        let mut top_p = 0.9
+        let mut seed = 42
+        let mut stream = false
+
+        if params["prompt"] != nil { prompt = params["prompt"] }
+        if params["max_tokens"] != nil { max_tokens = params["max_tokens"] }
+        if params["temperature"] != nil { temperature = to_float(params["temperature"]) }
+        if params["top_k"] != nil { top_k = params["top_k"] }
+        if params["top_p"] != nil { top_p = to_float(params["top_p"]) }
+        if params["seed"] != nil { seed = params["seed"] }
+        if params["stream"] != nil { stream = params["stream"] }
+        if query.contains("stream=true") { stream = true }
+
+        println("[serve] req #" + str(SERVER_REQUEST_COUNT) + " prompt_len=" + str(len(prompt)) + " max_tokens=" + str(max_tokens) + " temp=" + str(temperature))
+
+        let result = run_completion(prompt, max_tokens, temperature, top_k, top_p, seed)
+
+        if result["error"] != nil {
+            send_json_error(conn, 500, result["error"])
+            return true
+        }
+
+        if stream {
+            let event = #{}
+            event["text"] = result["text"]
+            event["tokens"] = result["tokens"]
+            event["tok_per_sec"] = result["tok_per_sec"]
+            let sse_body = "data: " + json_stringify(event) + "\n\ndata: [DONE]\n\n"
+            send_sse(conn, sse_body)
+            return true
+        }
+
+        let resp = #{}
+        resp["text"] = result["text"]
+        resp["tokens"] = result["tokens"]
+        resp["prompt_tokens"] = result["prompt_tokens"]
+        resp["tok_per_sec"] = result["tok_per_sec"]
+        resp["total_ms"] = result["total_ms"]
+        resp["decode_ms"] = result["decode_ms"]
+        resp["model"] = SERVER_MODEL_PATH
+        send_json(conn, 200, resp)
+        return true
+    }
+
+    // POST /v1/tokenize
+    if path == "/v1/tokenize" {
+        if method != "POST" {
+            send_json_error(conn, 405, "Use POST for /v1/tokenize")
+            return true
+        }
+        let params = json_parse(body)
+        let mut text = ""
+        if params["text"] != nil { text = params["text"] }
+        let tokens = byte_tokenize(text)
+        let data = #{}
+        data["tokens"] = tokens
+        data["count"] = len(tokens)
+        send_json(conn, 200, data)
+        return true
+    }
+
+    // 404
+    send_json_error(conn, 404, "Not found: " + path)
+    return true
+}
+
+// ===================================================================
+//  PART 8: Server Loop
+// ===================================================================
+
+fn start_server(host, port) {
+    let addr = host + ":" + str(port)
+    println("[serve] Binding to " + addr)
+    let listener = net_listen(addr)
+    println("[serve] Listening on http://" + addr)
+    println("[serve] Press Ctrl+C to stop")
+    println("")
+
+    while true {
+        let conn = net_accept(listener)
+        let raw = net_read(conn)
+        if len(raw) > 0 {
+            let req = parse_http_request(raw)
+            handle_request(conn, req)
+        }
+        net_close(conn)
+    }
+}
+
+// ===================================================================
+//  PART 9: CLI Entry Point
+// ===================================================================
+
+let args = argv()
+let n_args = len(args)
+
+if n_args < 2 {
+    println("HEXA Inference Server")
+    println("=====================")
+    println("")
+    println("Usage: hexa self/serve/serve.hexa <gguf_path> [host] [port]")
+    println("")
+    println("  gguf_path:  Path to GGUF model file (Q4_0)")
+    println("  host:       Bind address (default: 0.0.0.0)")
+    println("  port:       Listen port (default: 8080)")
+    println("")
+    println("Endpoints:")
+    println("  GET  /health           Health check")
+    println("  GET  /v1/models        Model info")
+    println("  POST /v1/completions   Generate completions")
+    println("  POST /v1/tokenize      Tokenize text")
+    println("")
+    println("Example:")
+    println("  hexa self/serve/serve.hexa model.gguf 0.0.0.0 8080")
+    println("")
+    println("  curl http://localhost:8080/health")
+    println("")
+    println("  curl -X POST http://localhost:8080/v1/completions \\")
+    println("    -H 'Content-Type: application/json' \\")
+    println("    -d '{\"prompt\":\"Once upon a time\",\"max_tokens\":64,\"temperature\":0.7}'")
+} else {
+    let model_path = args[1]
+    let mut host = "0.0.0.0"
+    let mut port = 8080
+
+    if n_args > 2 { host = args[2] }
+    if n_args > 3 { port = to_int(args[3]) }
+
+    load_model(model_path)
+
+    println("")
+    println("[serve] ========================================")
+    println("[serve]  HEXA Inference Server")
+    println("[serve]  Model: " + model_path)
+    println("[serve]  Listen: http://" + host + ":" + str(port))
+    println("[serve] ========================================")
+    println("[serve] Endpoints:")
+    println("[serve]   GET  /health")
+    println("[serve]   GET  /v1/models")
+    println("[serve]   POST /v1/completions")
+    println("[serve]   POST /v1/tokenize")
+    println("[serve] ========================================")
+    println("")
+
+    start_server(host, port)
+}

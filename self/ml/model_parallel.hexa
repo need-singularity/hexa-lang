@@ -1,0 +1,434 @@
+// ═══════════════════════════════════════════════════════════════
+//  model_parallel.hexa — Model parallelism for large models
+//
+//  Pipeline parallelism: splits transformer layers across GPUs.
+//  Micro-batch pipelining to reduce pipeline bubble.
+//
+//  For a model with L layers on P GPUs:
+//    GPU 0: layers 0..L/P-1
+//    GPU 1: layers L/P..2L/P-1
+//    ...
+//    GPU P-1: layers (P-1)*L/P..L-1
+//
+//  Micro-batch schedule (GPipe-style):
+//    Split batch into M micro-batches.
+//    Forward micro-batch m on stage s, then pass activation to stage s+1.
+//    Backward in reverse order.
+//    Bubble ratio = (P-1) / (P-1+M) — larger M → less bubble.
+//
+//  Usage:
+//    use "model_parallel"
+//    let pp = pipeline_init(4, 8)  // 4 GPUs, 8 layers
+//    let out = pipeline_forward(pp, input_tokens, ...)
+// ═══════════════════════════════════════════════════════════════
+
+use "cuda_ffi"
+use "gpu_tensor"
+
+// ── Pipeline stage assignment ────────────────────────────────
+
+struct PipelineConfig {
+    num_stages: int,
+    num_layers: int,
+    num_micro_batches: int,
+    stage_layers: array
+}
+
+// Compute which layers go on which GPU stage
+fn compute_stage_layers(num_layers, num_stages) {
+    let mut stages = []
+    let mut s = 0
+    while s < num_stages {
+        let begin = (num_layers * s) / num_stages
+        let end = (num_layers * (s + 1)) / num_stages
+        stages = stages.push([begin, end])
+        s = s + 1
+    }
+    stages
+}
+
+fn pipeline_init(num_stages, num_layers, num_micro_batches) {
+    let stage_layers = compute_stage_layers(num_layers, num_stages)
+
+    println("[model_par] pipeline config:")
+    let mut s = 0
+    while s < num_stages {
+        let sl = stage_layers[s]
+        println("  stage " + str(s) + " (GPU " + str(s) + "): layers " + str(sl[0]) + ".." + str(sl[1] - 1))
+        s = s + 1
+    }
+    println("  micro-batches: " + str(num_micro_batches))
+    let bubble = (num_stages - 1) * 1.0 / ((num_stages - 1 + num_micro_batches) * 1.0)
+    println("  bubble ratio: " + str(bubble * 100.0) + "%")
+
+    let cfg = PipelineConfig {
+        num_stages: num_stages,
+        num_layers: num_layers,
+        num_micro_batches: num_micro_batches,
+        stage_layers: stage_layers
+    }
+    cfg
+}
+
+// ── Activation buffer management ─────────────────────────────
+// Inter-stage activations stored on host as transfer buffer
+
+struct ActivationBuffer {
+    data_ptr: *Void,
+    rows: int,
+    cols: int,
+    nbytes: int
+}
+
+fn actbuf_create(rows, cols) {
+    let nbytes = rows * cols * 4
+    let p = alloc_raw(nbytes)
+    let buf = ActivationBuffer {
+        data_ptr: p,
+        rows: rows,
+        cols: cols,
+        nbytes: nbytes
+    }
+    buf
+}
+
+fn actbuf_free(buf: ActivationBuffer) {
+    free_raw(buf.data_ptr, buf.nbytes)
+    0
+}
+
+// Download GPU tensor to activation buffer
+fn actbuf_from_gpu(gt) {
+    let rows = gt_rows(gt)
+    let cols = gt_cols(gt)
+    let nbytes = rows * cols * 4
+    let p = alloc_raw(nbytes)
+    let _ = cuda_memcpy_d2h(p, gt_ptr(gt), nbytes)
+    let buf = ActivationBuffer {
+        data_ptr: p,
+        rows: rows,
+        cols: cols,
+        nbytes: nbytes
+    }
+    buf
+}
+
+// Upload activation buffer to GPU tensor on target device
+fn actbuf_to_gpu(buf: ActivationBuffer, target_gpu) {
+    let _ = cudaSetDevice(target_gpu)
+    let dev = cuda_malloc(buf.nbytes)
+    let _ = cuda_memcpy_h2d(dev, buf.data_ptr, buf.nbytes)
+    gpu_tensor_make(dev, buf.rows, buf.cols, DTYPE_F32)
+}
+
+// ── Micro-batch splitting ────────────────────────────────────
+
+// Split a GpuTensor [batch_size x dim] into M micro-batches
+// Returns array of GpuTensors, each [micro_batch_size x dim]
+fn split_micro_batches(input_gt, num_micro) {
+    let total_rows = gt_rows(input_gt)
+    let cols = gt_cols(input_gt)
+    let micro_rows = total_rows / num_micro
+
+    let mut result = []
+    let mut m = 0
+    while m < num_micro {
+        let start_row = m * micro_rows
+        let actual_rows = if m == num_micro - 1 {
+            total_rows - start_row
+        } else {
+            micro_rows
+        }
+        // Copy sub-block from input to new tensor
+        let sub_gt = gpu_tensor_zeros(actual_rows, cols)
+        let src_offset = ptr_offset(gt_ptr(input_gt), start_row * cols * 4)
+        let _ = cuda_memcpy_d2d(gt_ptr(sub_gt), src_offset, actual_rows * cols * 4)
+        result = result.push(sub_gt)
+        m = m + 1
+    }
+    result
+}
+
+// Concatenate micro-batch results back into single tensor
+fn concat_micro_batches(micro_results, cols) {
+    let num_micro = len(micro_results)
+    let mut total_rows = 0
+    let mut m = 0
+    while m < num_micro {
+        total_rows = total_rows + gt_rows(micro_results[m])
+        m = m + 1
+    }
+
+    let out_gt = gpu_tensor_zeros(total_rows, cols)
+    let mut offset = 0
+    m = 0
+    while m < num_micro {
+        let mr = micro_results[m]
+        let nbytes = gt_rows(mr) * cols * 4
+        let dst_offset = ptr_offset(gt_ptr(out_gt), offset)
+        let _ = cuda_memcpy_d2d(dst_offset, gt_ptr(mr), nbytes)
+        offset = offset + nbytes
+        m = m + 1
+    }
+    out_gt
+}
+
+// ── GPipe-style forward schedule ─────────────────────────────
+// Processes micro-batches through stages in pipeline fashion.
+//
+// Schedule for P stages, M micro-batches:
+//   Time step t: stage s processes micro-batch (t - s) if valid
+//
+// stage_forward_fn(stage_id, layer_begin, layer_end, input_gt) -> output_gt
+// is provided by the caller (model-specific).
+
+fn pipeline_forward(cfg: PipelineConfig, input_gt, stage_forward_fn) {
+    let P = cfg.num_stages
+    let M = cfg.num_micro_batches
+    let total_steps = P + M - 1
+
+    // Split input into micro-batches
+    let micros = split_micro_batches(input_gt, M)
+
+    // inter_act[m][s] = activation buffer between stage s-1 and s for micro-batch m
+    // We use a flat array indexed as m * P + s
+    let mut inter_act = []
+    let mut i = 0
+    while i < M * P {
+        inter_act = inter_act.push(ptr_null())
+        i = i + 1
+    }
+
+    // Store initial micro-batch inputs as activation buffers
+    let mut m = 0
+    while m < M {
+        let abuf = actbuf_from_gpu(micros[m])
+        inter_act[m * P + 0] = abuf
+        m = m + 1
+    }
+
+    // Forward pipeline schedule
+    let mut t = 0
+    while t < total_steps {
+        // Process stages in order
+        let mut s = 0
+        while s < P {
+            let micro_id = t - s
+            if micro_id >= 0 {
+                if micro_id < M {
+                    let sl = cfg.stage_layers[s]
+                    let layer_begin = sl[0]
+                    let layer_end = sl[1]
+
+                    // Get input activation for this stage
+                    let _ = cudaSetDevice(s)
+                    let in_buf = inter_act[micro_id * P + s]
+                    let in_gt = actbuf_to_gpu(in_buf, s)
+
+                    // Run stage forward
+                    let out_gt = stage_forward_fn(s, layer_begin, layer_end, in_gt)
+
+                    // Store output for next stage (or final output)
+                    if s < P - 1 {
+                        let out_buf = actbuf_from_gpu(out_gt)
+                        inter_act[micro_id * P + s + 1] = out_buf
+                    } else {
+                        // Last stage — store as activation buffer too
+                        let out_buf = actbuf_from_gpu(out_gt)
+                        inter_act[micro_id * P + s] = out_buf
+                    }
+
+                    // Free input GPU tensor (it was uploaded from host)
+                    gpu_tensor_free(in_gt)
+                }
+            }
+            s = s + 1
+        }
+        t = t + 1
+    }
+
+    // Collect final outputs from last stage
+    let cols = gt_cols(input_gt)
+    let mut final_results = []
+    m = 0
+    while m < M {
+        let last_buf = inter_act[m * P + P - 1]
+        let _ = cudaSetDevice(0)
+        let result_gt = actbuf_to_gpu(last_buf, 0)
+        final_results = final_results.push(result_gt)
+        m = m + 1
+    }
+
+    // Concatenate micro-batch results
+    let _ = cudaSetDevice(0)
+    let output = concat_micro_batches(final_results, cols)
+
+    // Cleanup activation buffers
+    i = 0
+    while i < M * P {
+        let buf = inter_act[i]
+        if ptr_addr(buf) != 0 {
+            actbuf_free(buf)
+        }
+        i = i + 1
+    }
+    m = 0
+    while m < M {
+        gpu_tensor_free(final_results[m])
+        m = m + 1
+    }
+
+    output
+}
+
+// ── GPipe backward schedule ──────────────────────────────────
+// Backward pass in reverse pipeline order.
+// stage_backward_fn(stage_id, layer_begin, layer_end, grad_gt) -> input_grad_gt
+
+fn pipeline_backward(cfg: PipelineConfig, output_grad_gt, stage_backward_fn) {
+    let P = cfg.num_stages
+    let M = cfg.num_micro_batches
+    let total_steps = P + M - 1
+
+    // Split output grad into micro-batches
+    let grad_micros = split_micro_batches(output_grad_gt, M)
+
+    // Gradient buffers: grad_act[m * P + s]
+    let mut grad_act = []
+    let mut i = 0
+    while i < M * P {
+        grad_act = grad_act.push(ptr_null())
+        i = i + 1
+    }
+
+    // Store output gradients at last stage
+    let mut m = 0
+    while m < M {
+        let gbuf = actbuf_from_gpu(grad_micros[m])
+        grad_act[m * P + P - 1] = gbuf
+        m = m + 1
+    }
+
+    // Backward pipeline schedule (reverse order)
+    let mut t = 0
+    while t < total_steps {
+        // Process stages in reverse
+        let mut s = P - 1
+        while s >= 0 {
+            let micro_id = t - (P - 1 - s)
+            if micro_id >= 0 {
+                if micro_id < M {
+                    let sl = cfg.stage_layers[s]
+                    let layer_begin = sl[0]
+                    let layer_end = sl[1]
+
+                    let _ = cudaSetDevice(s)
+                    let g_buf = grad_act[micro_id * P + s]
+                    let g_gt = actbuf_to_gpu(g_buf, s)
+
+                    let input_grad = stage_backward_fn(s, layer_begin, layer_end, g_gt)
+
+                    if s > 0 {
+                        let ig_buf = actbuf_from_gpu(input_grad)
+                        grad_act[micro_id * P + s - 1] = ig_buf
+                    }
+
+                    gpu_tensor_free(g_gt)
+                }
+            }
+            s = s - 1
+        }
+        t = t + 1
+    }
+
+    // Cleanup
+    i = 0
+    while i < M * P {
+        let buf = grad_act[i]
+        if ptr_addr(buf) != 0 {
+            actbuf_free(buf)
+        }
+        i = i + 1
+    }
+    m = 0
+    while m < M {
+        gpu_tensor_free(grad_micros[m])
+        m = m + 1
+    }
+    0
+}
+
+// ── Tensor parallelism (column/row split) ────────────────────
+// For very wide layers: split weight matrix columns across GPUs
+
+struct TensorParallelConfig {
+    num_gpus: int,
+    split_dim: int
+}
+
+// Column-parallel linear: W[K x N] split into W0[K x N/P], W1[K x N/P], ...
+// Each GPU computes partial output, then allgather
+fn tp_column_parallel_forward(input_gt, weight_shards, num_gpus) {
+    let mut partial_outputs = []
+    let mut g = 0
+    while g < num_gpus {
+        let _ = cudaSetDevice(g)
+        let in_gt = input_gt  // broadcast input (same on all GPUs)
+        let w_shard = weight_shards[g]
+        let partial = gpu_matmul(in_gt, w_shard)
+        partial_outputs = partial_outputs.push(partial)
+        g = g + 1
+    }
+    // All-gather: concatenate partial outputs along column dim
+    let _ = cudaSetDevice(0)
+    let cols_per_gpu = gt_cols(partial_outputs[0])
+    let total_cols = cols_per_gpu * num_gpus
+    let rows = gt_rows(partial_outputs[0])
+    let out_gt = gpu_tensor_zeros(rows, total_cols)
+
+    g = 0
+    while g < num_gpus {
+        let nbytes = rows * cols_per_gpu * 4
+        let dst_offset = ptr_offset(gt_ptr(out_gt), g * nbytes)
+        // D2H from source GPU, H2D to GPU 0
+        let tmp = alloc_raw(nbytes)
+        let _ = cudaSetDevice(g)
+        let _ = cuda_memcpy_d2h(tmp, gt_ptr(partial_outputs[g]), nbytes)
+        let _ = cudaSetDevice(0)
+        let _ = cuda_memcpy_h2d(dst_offset, tmp, nbytes)
+        free_raw(tmp, nbytes)
+        g = g + 1
+    }
+    let _ = cudaSetDevice(0)
+    out_gt
+}
+
+// Row-parallel linear: W[K x N] split by rows → W0[K/P x N], ...
+// Each GPU has partial input, computes partial output, then allreduce-sum
+fn tp_row_parallel_forward(input_shards, weight_shards, num_gpus, ctx) {
+    let mut partial_outputs = []
+    let mut g = 0
+    while g < num_gpus {
+        let _ = cudaSetDevice(g)
+        let partial = gpu_matmul(input_shards[g], weight_shards[g])
+        partial_outputs = partial_outputs.push(partial)
+        g = g + 1
+    }
+    // AllReduce-sum partial outputs
+    let _ = allreduce_sum(ctx, partial_outputs)
+    let _ = cudaSetDevice(0)
+    partial_outputs[0]
+}
+
+// ── Utility: compute pipeline bubble overhead ────────────────
+fn pipeline_bubble_ratio(num_stages, num_micro_batches) {
+    let bubble = (num_stages - 1) * 1.0
+    let total = (num_stages - 1 + num_micro_batches) * 1.0
+    bubble / total
+}
+
+fn pipeline_efficiency(num_stages, num_micro_batches) {
+    1.0 - pipeline_bubble_ratio(num_stages, num_micro_batches)
+}
+
+println("[model_parallel] module loaded — pipeline + tensor parallelism ready")

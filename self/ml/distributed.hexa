@@ -1,0 +1,443 @@
+// ═══════════════════════════════════════════════════════════════
+//  distributed.hexa — Multi-GPU data parallel primitives
+//
+//  Pure hexa distributed training communication layer.
+//  Provides ring-allreduce, broadcast, scatter, gather for
+//  multi-GPU gradient synchronization.
+//
+//  Two backends:
+//    1. NCCL FFI (if available) — fast RDMA-aware collectives
+//    2. Manual ring-allreduce via cudaMemcpy P2P — fallback
+//
+//  Usage:
+//    use "distributed"
+//    let ctx = init_distributed(4)
+//    let synced = allreduce_sum(ctx, gpu_tensors)
+//    ...
+// ═══════════════════════════════════════════════════════════════
+
+use "cuda_ffi"
+use "gpu_tensor"
+
+// ── NCCL FFI bindings (optional) ─────────────────────────────
+
+@link("nccl")
+extern fn ncclCommInitAll(comms_ptr: *Void, n: int, devs: *Void) -> int
+
+@link("nccl")
+extern fn ncclAllReduce(sendbuf: *Void, recvbuf: *Void, count: int,
+    dtype: int, op: int, comm: *Void, stream: *Void) -> int
+
+@link("nccl")
+extern fn ncclBroadcast(sendbuf: *Void, recvbuf: *Void, count: int,
+    dtype: int, root: int, comm: *Void, stream: *Void) -> int
+
+@link("nccl")
+extern fn ncclCommDestroy(comm: *Void) -> int
+
+// NCCL constants
+let NCCL_FLOAT32 = 7
+let NCCL_SUM     = 0
+
+// ── Distributed context ──────────────────────────────────────
+// [num_gpus, backend, nccl_comms_ptr, streams_per_gpu]
+// backend: 0=ring (manual), 1=nccl
+
+struct DistContext {
+    num_gpus: int,
+    backend: int,
+    comms_ptr: *Void,
+    streams: array
+}
+
+let BACKEND_RING = 0
+let BACKEND_NCCL = 1
+
+// ── Initialization ───────────────────────────────────────────
+
+fn init_distributed(num_gpus) {
+    println("[dist] initializing distributed context for " + str(num_gpus) + " GPUs")
+
+    // Try NCCL first
+    let nccl_ok = dlopen_probe("libnccl.so")
+    let nccl_ok2 = if nccl_ok { true } else { dlopen_probe("libnccl.dylib") }
+
+    // Create per-GPU streams
+    let mut streams = []
+    let mut g = 0
+    while g < num_gpus {
+        let _ = cudaSetDevice(g)
+        let sbuf = alloc_raw(8)
+        let serr = cudaStreamCreate(sbuf)
+        if serr != 0 {
+            println("[dist] WARNING: stream create failed for GPU " + str(g))
+        }
+        let s = ptr_from_int(deref(sbuf))
+        free_raw(sbuf, 8)
+        streams = streams.push(s)
+        g = g + 1
+    }
+    // Reset to device 0
+    let _ = cudaSetDevice(0)
+
+    if nccl_ok2 {
+        println("[dist] NCCL detected — using NCCL backend")
+        let comms_buf = alloc_raw(num_gpus * 8)
+        let devs_buf = alloc_raw(num_gpus * 4)
+        let mut i = 0
+        while i < num_gpus {
+            write_i32(devs_buf, i, i)
+            i = i + 1
+        }
+        let err = ncclCommInitAll(comms_buf, num_gpus, devs_buf)
+        free_raw(devs_buf, num_gpus * 4)
+        if err != 0 {
+            println("[dist] NCCL init failed (" + str(err) + "), falling back to ring")
+            free_raw(comms_buf, num_gpus * 8)
+            let ctx = DistContext {
+                num_gpus: num_gpus,
+                backend: BACKEND_RING,
+                comms_ptr: ptr_null(),
+                streams: streams
+            }
+            return ctx
+        }
+        let ctx = DistContext {
+            num_gpus: num_gpus,
+            backend: BACKEND_NCCL,
+            comms_ptr: comms_buf,
+            streams: streams
+        }
+        println("[dist] NCCL initialized for " + str(num_gpus) + " GPUs")
+        return ctx
+    }
+
+    println("[dist] NCCL not found — using ring-allreduce backend")
+    let ctx = DistContext {
+        num_gpus: num_gpus,
+        backend: BACKEND_RING,
+        comms_ptr: ptr_null(),
+        streams: streams
+    }
+    ctx
+}
+
+fn dist_shutdown(ctx: DistContext) {
+    if ctx.backend == BACKEND_NCCL {
+        let mut i = 0
+        while i < ctx.num_gpus {
+            // Read comm handle from comms_ptr array
+            let comm_addr = deref_i64(ctx.comms_ptr, i)
+            let comm = ptr_from_int(comm_addr)
+            let _ = ncclCommDestroy(comm)
+            i = i + 1
+        }
+        free_raw(ctx.comms_ptr, ctx.num_gpus * 8)
+    }
+    // Destroy streams
+    let mut g = 0
+    while g < ctx.num_gpus {
+        let _ = cudaStreamDestroy(ctx.streams[g])
+        g = g + 1
+    }
+    println("[dist] shutdown complete")
+    0
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Ring AllReduce — manual implementation
+//
+//  Two phases for N GPUs, data split into N chunks:
+//    Phase 1 (reduce-scatter): N-1 rounds
+//      Each GPU sends chunk[i] to next GPU, next GPU adds it
+//      After N-1 rounds, GPU k has the fully reduced chunk k
+//    Phase 2 (all-gather): N-1 rounds
+//      Each GPU sends its reduced chunk to next GPU
+//      After N-1 rounds, all GPUs have the full reduced result
+// ═══════════════════════════════════════════════════════════════
+
+// Compute chunk boundaries for ring allreduce
+fn ring_chunk_begin(total_n, num_gpus, chunk_id) {
+    (total_n * chunk_id) / num_gpus
+}
+
+fn ring_chunk_end(total_n, num_gpus, chunk_id) {
+    (total_n * (chunk_id + 1)) / num_gpus
+}
+
+fn ring_chunk_size(total_n, num_gpus, chunk_id) {
+    ring_chunk_end(total_n, num_gpus, chunk_id) - ring_chunk_begin(total_n, num_gpus, chunk_id)
+}
+
+// ── Ring reduce-scatter phase ────────────────────────────────
+// gpu_bufs: array of device pointers, one per GPU, each size total_n f32
+// After this phase, GPU k has the sum of chunk k across all GPUs
+fn ring_reduce_scatter(gpu_bufs, total_n, num_gpus) {
+    let n = num_gpus
+    // Temp buffer for receiving data
+    let tmp_buf = cuda_malloc(total_n * 4)
+
+    let mut round = 0
+    while round < n - 1 {
+        let mut g = 0
+        while g < n {
+            // In round r, GPU g sends chunk (g - r) mod n to GPU (g+1) mod n
+            let send_chunk = (g - round + n * 100) % n
+            let recv_gpu = (g + 1) % n
+
+            let chunk_beg = ring_chunk_begin(total_n, n, send_chunk)
+            let chunk_sz = ring_chunk_size(total_n, n, send_chunk)
+
+            if chunk_sz > 0 {
+                // Copy chunk from gpu_bufs[g] to tmp
+                let src_offset = ptr_offset(gpu_bufs[g], chunk_beg * 4)
+                let _ = cuda_memcpy_d2d(tmp_buf, src_offset, chunk_sz * 4)
+
+                // Add tmp into gpu_bufs[recv_gpu] at chunk offset
+                // D2H tmp, D2H recv, add on host, H2D back
+                let h_tmp = alloc_raw(chunk_sz * 4)
+                let h_recv = alloc_raw(chunk_sz * 4)
+                let recv_offset = ptr_offset(gpu_bufs[recv_gpu], chunk_beg * 4)
+                let _ = cuda_memcpy_d2h(h_tmp, tmp_buf, chunk_sz * 4)
+                let _ = cuda_memcpy_d2h(h_recv, recv_offset, chunk_sz * 4)
+
+                let mut i = 0
+                while i < chunk_sz {
+                    let a = deref_f32(h_tmp, i)
+                    let b = deref_f32(h_recv, i)
+                    write_f32(h_recv, i, a + b)
+                    i = i + 1
+                }
+                let _ = cuda_memcpy_h2d(recv_offset, h_recv, chunk_sz * 4)
+                free_raw(h_tmp, chunk_sz * 4)
+                free_raw(h_recv, chunk_sz * 4)
+            }
+            g = g + 1
+        }
+        round = round + 1
+    }
+    cuda_free(tmp_buf)
+    0
+}
+
+// ── Ring all-gather phase ────────────────────────────────────
+// After reduce-scatter, GPU k has the reduced chunk k.
+// All-gather propagates each GPU's chunk to all other GPUs.
+fn ring_all_gather(gpu_bufs, total_n, num_gpus) {
+    let n = num_gpus
+
+    let mut round = 0
+    while round < n - 1 {
+        let mut g = 0
+        while g < n {
+            // In round r, GPU g sends chunk (g - r + 1) mod n to GPU (g+1) mod n
+            let send_chunk = (g - round + 1 + n * 100) % n
+            let recv_gpu = (g + 1) % n
+
+            let chunk_beg = ring_chunk_begin(total_n, n, send_chunk)
+            let chunk_sz = ring_chunk_size(total_n, n, send_chunk)
+
+            if chunk_sz > 0 {
+                let src_offset = ptr_offset(gpu_bufs[g], chunk_beg * 4)
+                let dst_offset = ptr_offset(gpu_bufs[recv_gpu], chunk_beg * 4)
+                let _ = cuda_memcpy_d2d(dst_offset, src_offset, chunk_sz * 4)
+            }
+            g = g + 1
+        }
+        round = round + 1
+    }
+    0
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Public API
+// ═══════════════════════════════════════════════════════════════
+
+// allreduce_sum(ctx, gpu_tensors) → gpu_tensors (in-place sum)
+// gpu_tensors: array of GpuTensor, one per GPU, all same shape
+// After call, all tensors contain the element-wise sum.
+fn allreduce_sum(ctx: DistContext, gpu_tensors) {
+    let n = ctx.num_gpus
+    let total_n = gt_numel(gpu_tensors[0])
+
+    if ctx.backend == BACKEND_NCCL {
+        // NCCL path: one allreduce per GPU
+        let mut g = 0
+        while g < n {
+            let _ = cudaSetDevice(g)
+            let comm_addr = deref_i64(ctx.comms_ptr, g)
+            let comm = ptr_from_int(comm_addr)
+            let _ = ncclAllReduce(
+                gt_ptr(gpu_tensors[g]),
+                gt_ptr(gpu_tensors[g]),
+                total_n,
+                NCCL_FLOAT32,
+                NCCL_SUM,
+                comm,
+                ctx.streams[g]
+            )
+            g = g + 1
+        }
+        // Sync all streams
+        g = 0
+        while g < n {
+            let _ = cudaSetDevice(g)
+            let _ = cudaStreamSynchronize(ctx.streams[g])
+            g = g + 1
+        }
+        let _ = cudaSetDevice(0)
+        return gpu_tensors
+    }
+
+    // Ring allreduce fallback
+    let mut bufs = []
+    let mut g = 0
+    while g < n {
+        bufs = bufs.push(gt_ptr(gpu_tensors[g]))
+        g = g + 1
+    }
+    let _ = ring_reduce_scatter(bufs, total_n, n)
+    let _ = ring_all_gather(bufs, total_n, n)
+    gpu_tensors
+}
+
+// allreduce_mean(ctx, gpu_tensors) → in-place mean across GPUs
+fn allreduce_mean(ctx: DistContext, gpu_tensors) {
+    let _ = allreduce_sum(ctx, gpu_tensors)
+    let n = ctx.num_gpus
+    let total_n = gt_numel(gpu_tensors[0])
+    let scale = 1.0 / (n * 1.0)
+    let mut g = 0
+    while g < n {
+        let _ = gpu_sscal(gt_ptr(gpu_tensors[g]), total_n, scale)
+        g = g + 1
+    }
+    gpu_tensors
+}
+
+// broadcast(ctx, tensor, src_gpu, dst_gpus) → copies tensor from src to dsts
+fn broadcast(ctx: DistContext, tensor, src_gpu, dst_gpus) {
+    let nbytes = gt_numel(tensor) * 4
+
+    if ctx.backend == BACKEND_NCCL {
+        // NCCL broadcast
+        let mut g = 0
+        let num_dst = len(dst_gpus)
+        while g < num_dst {
+            let dst = dst_gpus[g]
+            let _ = cudaSetDevice(dst)
+            let comm_addr = deref_i64(ctx.comms_ptr, dst)
+            let comm = ptr_from_int(comm_addr)
+            let dst_t = gpu_tensor_zeros(gt_rows(tensor), gt_cols(tensor))
+            let _ = ncclBroadcast(
+                gt_ptr(tensor),
+                gt_ptr(dst_t),
+                gt_numel(tensor),
+                NCCL_FLOAT32,
+                src_gpu,
+                comm,
+                ctx.streams[dst]
+            )
+            g = g + 1
+        }
+        let _ = cudaSetDevice(0)
+        return 0
+    }
+
+    // Manual broadcast: D2H from src, H2D to each dst
+    let host_buf = alloc_raw(nbytes)
+    let _ = cudaSetDevice(src_gpu)
+    let _ = cuda_memcpy_d2h(host_buf, gt_ptr(tensor), nbytes)
+
+    let mut i = 0
+    let num_dst = len(dst_gpus)
+    while i < num_dst {
+        let dst = dst_gpus[i]
+        let _ = cudaSetDevice(dst)
+        let dst_dev = cuda_malloc(nbytes)
+        let _ = cuda_memcpy_h2d(dst_dev, host_buf, nbytes)
+        i = i + 1
+    }
+    free_raw(host_buf, nbytes)
+    let _ = cudaSetDevice(0)
+    0
+}
+
+// scatter_batch(batch_data, num_gpus) → array of sub-batches
+// batch_data: flat array of floats (batch_size * feature_dim)
+// Returns array of arrays, one per GPU
+fn scatter_batch(batch_data, num_gpus) {
+    let total = len(batch_data)
+    let per_gpu = total / num_gpus
+    let mut result = []
+    let mut g = 0
+    while g < num_gpus {
+        let start = g * per_gpu
+        let end = if g == num_gpus - 1 { total } else { (g + 1) * per_gpu }
+        let mut sub = []
+        let mut i = start
+        while i < end {
+            sub = sub.push(batch_data[i])
+            i = i + 1
+        }
+        result = result.push(sub)
+        g = g + 1
+    }
+    result
+}
+
+// scatter_batch_tokens(tokens, targets, num_gpus) → [[tokens_g, targets_g], ...]
+// Splits token+target pairs evenly across GPUs
+fn scatter_batch_tokens(tokens, targets, num_gpus) {
+    let seq_len = len(tokens)
+    let per_gpu = seq_len / num_gpus
+    let mut result = []
+    let mut g = 0
+    while g < num_gpus {
+        let start = g * per_gpu
+        let end = if g == num_gpus - 1 { seq_len } else { (g + 1) * per_gpu }
+        let mut tok_sub = []
+        let mut tgt_sub = []
+        let mut i = start
+        while i < end {
+            tok_sub = tok_sub.push(tokens[i])
+            tgt_sub = tgt_sub.push(targets[i])
+            i = i + 1
+        }
+        result = result.push([tok_sub, tgt_sub])
+        g = g + 1
+    }
+    result
+}
+
+// gather_results(per_gpu_results) → concatenated array
+fn gather_results(per_gpu_results) {
+    let mut out = []
+    let n = len(per_gpu_results)
+    let mut g = 0
+    while g < n {
+        let sub = per_gpu_results[g]
+        let sub_len = len(sub)
+        let mut i = 0
+        while i < sub_len {
+            out = out.push(sub[i])
+            i = i + 1
+        }
+        g = g + 1
+    }
+    out
+}
+
+// gather_losses(per_gpu_losses) → average loss
+fn gather_losses(per_gpu_losses) {
+    let n = len(per_gpu_losses)
+    let mut total = 0.0
+    let mut i = 0
+    while i < n {
+        total = total + per_gpu_losses[i]
+        i = i + 1
+    }
+    total / (n * 1.0)
+}
+
+println("[distributed] module loaded — multi-GPU primitives ready")

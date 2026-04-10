@@ -449,7 +449,7 @@ impl TypeChecker {
             | Stmt::Const(..) | Stmt::Static(..)
             | Stmt::MacroDef(_) | Stmt::DeriveDecl(..)
             | Stmt::Scope(_) | Stmt::ProofBlock(..) => {}
-            Stmt::Assert(expr) => {
+            Stmt::Assert(expr) | Stmt::ContractAssert(_, _, expr) => {
                 self.check_expr(expr, line, col);
             }
             Stmt::Proof(_name, body) => {

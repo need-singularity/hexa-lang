@@ -94,3 +94,153 @@ fn l2_diff(a, b, d) {
     }
     return s
 }
+
+// ── ZeRO Stage 1: Optimizer State Sharding ──────────────
+// 각 랭크가 자기 shard의 optimizer state(m1, m2)만 유지
+// AdamW step은 shard owner만 수행
+fn zero_adamw_shard_step(params, grads, m1, m2, lr, beta1, beta2, eps, wd, d, n, step_t) {
+    let b1_corr = 1.0 - pow(beta1, to_float(step_t))
+    let b2_corr = 1.0 - pow(beta2, to_float(step_t))
+
+    let mut new_params = []
+    let mut new_m1 = []
+    let mut new_m2 = []
+
+    for k in 0..n {
+        let beg = shard_begin(d, n, k)
+        let end = shard_end(d, n, k)
+
+        // reduce-scatter: 이 구간의 grad를 N 랭크에서 합산 평균
+        for i in beg..end {
+            let mut g_acc = 0.0
+            for _r in 0..n {
+                g_acc = g_acc + grads[i]
+            }
+            let g = g_acc / to_float(n)
+
+            // AdamW update
+            let m1_new = beta1 * m1[i] + (1.0 - beta1) * g
+            let m2_new = beta2 * m2[i] + (1.0 - beta2) * g * g
+            let m1_hat = m1_new / b1_corr
+            let m2_hat = m2_new / b2_corr
+            let update = m1_hat / (sqrt(m2_hat) + eps)
+            let p_new = params[i] * (1.0 - lr * wd) - lr * update
+
+            new_params = new_params + [p_new]
+            new_m1 = new_m1 + [m1_new]
+            new_m2 = new_m2 + [m2_new]
+        }
+    }
+
+    return [new_params, new_m1, new_m2]
+}
+
+// ── ZeRO Stage 2: Gradient Sharding ─────────────────────
+// full grad 계산 후 즉시 reduce-scatter, 각 shard만 유지
+fn zero_grad_shard(full_grad, d, n, rank) {
+    let beg = shard_begin(d, n, rank)
+    let end = shard_end(d, n, rank)
+    let mut local_grad = []
+    for i in beg..end {
+        // reduce: sum across ranks / N (시뮬에선 동일)
+        let mut acc = 0.0
+        for _r in 0..n {
+            acc = acc + full_grad[i]
+        }
+        local_grad = local_grad + [acc / to_float(n)]
+    }
+    return local_grad
+}
+
+// ── ZeRO Stage 3: Parameter + Gradient + Optimizer 전부 샤딩 ─
+// forward/backward 시 필요한 파라미터를 all-gather로 복원
+fn zero3_gather_params(sharded_params, d, n) {
+    let mut full = []
+    for k in 0..n {
+        let shard = sharded_params[k]
+        let shard_len = len(shard)
+        for j in 0..shard_len {
+            full = full + [shard[j]]
+        }
+    }
+    return full
+}
+
+fn zero3_scatter_params(full_params, d, n) {
+    let mut shards = []
+    for k in 0..n {
+        let beg = shard_begin(d, n, k)
+        let end = shard_end(d, n, k)
+        let mut shard = []
+        for i in beg..end {
+            shard = shard + [full_params[i]]
+        }
+        shards = shards + [shard]
+    }
+    return shards
+}
+
+// ── 메모리 절감 계산 ────────────────────────────────────
+@pure
+fn zero_memory_savings(d, n, stage) {
+    // Stage 1: optimizer 1/N
+    // Stage 2: optimizer + grad 1/N
+    // Stage 3: 전부 1/N
+    if stage == 1 { return to_float(n) }        // optimizer만
+    if stage == 2 { return to_float(n) * 1.5 }  // optimizer + grad
+    if stage == 3 { return to_float(n) * 3.0 }  // 전부
+    return 1.0
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Tests
+// ═══════════════════════════════════════════════════════════
+
+@test
+fn test_shard_boundaries() {
+    // D=8, N=2: shard 0=[0,4), shard 1=[4,8)
+    assert(shard_begin(8, 2, 0) == 0)
+    assert(shard_end(8, 2, 0) == 4)
+    assert(shard_begin(8, 2, 1) == 4)
+    assert(shard_end(8, 2, 1) == 8)
+}
+
+@test
+fn test_zero_vs_single_equivalence() {
+    // ZeRO N-way 와 단일 랭크가 수치 동치
+    let d = 8
+    let lr = 0.1
+    let params = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+    let target = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+    let single = single_rank_step(params, target, lr, d)
+    let sharded2 = zero_shard_step(params, target, lr, d, 2)
+    let sharded4 = zero_shard_step(params, target, lr, d, 4)
+
+    let diff2 = l2_diff(single, sharded2, d)
+    let diff4 = l2_diff(single, sharded4, d)
+    assert(diff2 < 1.0e-10)
+    assert(diff4 < 1.0e-10)
+}
+
+@test
+fn test_zero3_scatter_gather_roundtrip() {
+    let d = 6
+    let n = 3
+    let params = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    let shards = zero3_scatter_params(params, d, n)
+    assert(len(shards) == 3)
+    let restored = zero3_gather_params(shards, d, n)
+    let diff = l2_diff(params, restored, d)
+    assert(diff < 1.0e-10)
+}
+
+@test
+fn test_memory_savings() {
+    let s1 = zero_memory_savings(1024, 8, 1)
+    assert(s1 == 8.0)
+    let s3 = zero_memory_savings(1024, 8, 3)
+    assert(s3 == 24.0)
+}
+
+run_tests()

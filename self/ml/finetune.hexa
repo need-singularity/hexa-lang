@@ -1,0 +1,713 @@
+// ═══════════════════════════════════════════════════════════════
+//  finetune.hexa — Fine-tuning engine (LoRA + full fine-tuning)
+//
+//  Public API:
+//    full_finetune(model, dataset, config)  — update ALL parameters
+//    lora_finetune(model, dataset, config)  — freeze base, train LoRA A,B
+//    merge_lora(base_model, lora_adapters, alpha) — merge adapters into base
+//
+//  Supports CPU (array math) and GPU (BLAS tensor ops) paths.
+//
+//  AI-NATIVE:
+//    @pure    — math kernels (matmul, backward, loss)
+//    @memoize — lora_scale, lr_cosine cached
+//    @hot     — train_step inner loop
+//
+//  LoRA math: W' = W + (alpha/r) * B @ A
+//    A: [r, in_dim]  (Kaiming init)
+//    B: [out_dim, r]  (zero init — LoRA paper convention)
+//    Only A, B tracked by optimizer. Base W frozen.
+//
+//  L0 금지: src/*.rs 미접촉. 순수 .hexa.
+// ═══════════════════════════════════════════════════════════════
+
+use "finetune_config"
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 1: Core math (self-contained, no external deps)
+// ═══════════════════════════════════════════════════════════════
+
+// ── zeros helpers ────────────────────────────────────────────
+fn ft_zeros1(n) {
+    let mut v = []
+    for i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn ft_zeros2(rows, cols) {
+    let mut r = []
+    for i in 0..rows { r = r + [ft_zeros1(cols)] }
+    return r
+}
+
+// ── deterministic LCG init (Kaiming-like small init) ────────
+fn ft_kaiming_init(rows, cols, seed) {
+    let mut s = seed
+    let scale = 1.0 / sqrt(to_float(cols))
+    let mut r = []
+    for i in 0..rows {
+        let mut row = []
+        for j in 0..cols {
+            s = (s * 1103515245 + 12345) % 2147483647
+            let v = (to_float(s % 2000) - 1000.0) / 1000.0 * scale
+            row = row + [v]
+        }
+        r = r + [row]
+    }
+    return r
+}
+
+// ── matvec: y[m] = W[m,n] @ x[n] ───────────────────────────
+@pure
+fn ft_matvec(w, x, m, n) {
+    let mut y = []
+    for i in 0..m {
+        let mut s = 0.0
+        for j in 0..n { s = s + w[i][j] * x[j] }
+        y = y + [s]
+    }
+    return y
+}
+
+// ── matmul: C[m,n] = A[m,k] @ B[k,n] ───────────────────────
+@pure
+fn ft_matmul(a, b, m, k, n) {
+    let mut c = []
+    for i in 0..m {
+        let mut row = []
+        for j in 0..n {
+            let mut s = 0.0
+            for p in 0..k { s = s + a[i][p] * b[p][j] }
+            row = row + [s]
+        }
+        c = c + [row]
+    }
+    return c
+}
+
+// ── LoRA scale: alpha / r ───────────────────────────────────
+@memoize
+fn ft_lora_scale(alpha, r) {
+    return to_float(alpha) / to_float(r)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 2: Model / Adapter structs
+// ═══════════════════════════════════════════════════════════════
+
+// A layer in the fine-tune model
+struct FTLayer {
+    w: array,
+    out_dim: int,
+    in_dim: int
+}
+
+// LoRA adapter for one layer
+struct LoraAdapter {
+    a: array,
+    b: array,
+    out_dim: int,
+    in_dim: int,
+    rank: int
+}
+
+// ── Create LoRA adapter pair for one layer ──────────────────
+// A: [r, in_dim]  — Kaiming init
+// B: [out_dim, r] — zero init (LoRA paper: output starts at identity)
+fn make_lora_adapter(out_dim, in_dim, rank, seed) {
+    let a = ft_kaiming_init(rank, in_dim, seed)
+    let b = ft_zeros2(out_dim, rank)
+    LoraAdapter {
+        a: a,
+        b: b,
+        out_dim: out_dim,
+        in_dim: in_dim,
+        rank: rank
+    }
+}
+
+// ── Create LoRA adapters for all layers ─────────────────────
+fn create_lora_adapters(model, rank, base_seed) {
+    let n_layers = len(model)
+    let mut adapters = []
+    let mut i = 0
+    while i < n_layers {
+        let layer = model[i]
+        let seed = base_seed + i * 1337
+        let adapter = make_lora_adapter(layer.out_dim, layer.in_dim, rank, seed)
+        adapters = adapters + [adapter]
+        i = i + 1
+    }
+    return adapters
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 3: LoRA layer forward / backward
+// ═══════════════════════════════════════════════════════════════
+
+// ── LoRA forward for one layer ──────────────────────────────
+// y = W @ x + (alpha/r) * B @ (A @ x)
+@pure
+fn lora_layer_forward(w, a, b, x, m, n, r, alpha) {
+    let base = ft_matvec(w, x, m, n)
+    let ax = ft_matvec(a, x, r, n)
+    let bax = ft_matvec(b, ax, m, r)
+    let s = ft_lora_scale(alpha, r)
+    let mut y = []
+    for i in 0..m {
+        y = y + [base[i] + s * bax[i]]
+    }
+    return y
+}
+
+// ── LoRA backward for one layer ─────────────────────────────
+// Returns [dA, dB] — gradients for adapter matrices only.
+@pure
+fn lora_layer_backward(a, b, x, dy, m, n, r, alpha) {
+    let s = ft_lora_scale(alpha, r)
+    let ax = ft_matvec(a, x, r, n)
+    // B^T @ dy
+    let mut btdy = ft_zeros1(r)
+    for p in 0..r {
+        let mut acc = 0.0
+        for i in 0..m { acc = acc + b[i][p] * dy[i] }
+        btdy[p] = acc
+    }
+    // dB = s * dy (x) ax^T
+    let mut db = ft_zeros2(m, r)
+    for i in 0..m {
+        for p in 0..r {
+            db[i][p] = s * dy[i] * ax[p]
+        }
+    }
+    // dA = s * btdy (x) x^T
+    let mut da = ft_zeros2(r, n)
+    for p in 0..r {
+        for j in 0..n {
+            da[p][j] = s * btdy[p] * x[j]
+        }
+    }
+    return [da, db]
+}
+
+// ── Full-model forward for one layer (no LoRA) ──────────────
+@pure
+fn full_layer_forward(w, x, m, n) {
+    ft_matvec(w, x, m, n)
+}
+
+// ── Full backward for one layer ─────────────────────────────
+// Returns [dW, dX]
+@pure
+fn full_layer_backward(w, x, dy, m, n) {
+    // dW = dy (x) x^T
+    let mut dw = ft_zeros2(m, n)
+    for i in 0..m {
+        for j in 0..n {
+            dw[i][j] = dy[i] * x[j]
+        }
+    }
+    // dX = W^T @ dy
+    let mut dx = ft_zeros1(n)
+    for j in 0..n {
+        let mut acc = 0.0
+        for i in 0..m { acc = acc + w[i][j] * dy[i] }
+        dx[j] = acc
+    }
+    return [dw, dx]
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 4: Loss functions
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn ft_mse_loss(y, target, m) {
+    let mut s = 0.0
+    for i in 0..m {
+        let d = y[i] - target[i]
+        s = s + d * d
+    }
+    return s / to_float(m)
+}
+
+@pure
+fn ft_mse_grad(y, target, m) {
+    let mut g = []
+    let inv = 2.0 / to_float(m)
+    for i in 0..m {
+        g = g + [(y[i] - target[i]) * inv]
+    }
+    return g
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 5: AdamW optimizer (2D matrix variant)
+// ═══════════════════════════════════════════════════════════════
+
+struct AdamState {
+    m1: array,
+    m2: array,
+    t: int
+}
+
+fn make_adam_state(rows, cols) {
+    AdamState {
+        m1: ft_zeros2(rows, cols),
+        m2: ft_zeros2(rows, cols),
+        t: 0
+    }
+}
+
+@pure fn ft_pow_int(base, exp_n) {
+    let mut r = 1.0
+    let mut i = 0
+    while i < exp_n { r = r * base; i = i + 1 }
+    return r
+}
+
+// AdamW step — returns new param matrix
+@hot
+fn adamw_step_2d(param, grad, state: AdamState, lr, wd, rows, cols) {
+    let b1 = 0.9
+    let b2 = 0.999
+    let eps = 1.0e-8
+    let t = state.t + 1
+    state.t = t
+    let bc1 = 1.0 - ft_pow_int(b1, t)
+    let bc2 = 1.0 - ft_pow_int(b2, t)
+    let mut new_param = []
+    let mut i = 0
+    while i < rows {
+        let mut row = []
+        let mut j = 0
+        while j < cols {
+            let g = grad[i][j]
+            let new_m = b1 * state.m1[i][j] + (1.0 - b1) * g
+            let new_v = b2 * state.m2[i][j] + (1.0 - b2) * g * g
+            state.m1[i][j] = new_m
+            state.m2[i][j] = new_v
+            let m_hat = new_m / bc1
+            let v_hat = new_v / bc2
+            let update = m_hat / (sqrt(v_hat) + eps) + wd * param[i][j]
+            row = row + [param[i][j] - lr * update]
+            j = j + 1
+        }
+        new_param = new_param + [row]
+        i = i + 1
+    }
+    return new_param
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 6: Gradient clipping
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn grad_norm_2d(g, rows, cols) {
+    let mut s = 0.0
+    for i in 0..rows {
+        for j in 0..cols {
+            s = s + g[i][j] * g[i][j]
+        }
+    }
+    return sqrt(s)
+}
+
+@pure
+fn clip_grad_2d(g, max_norm, rows, cols) {
+    let norm = grad_norm_2d(g, rows, cols)
+    if norm <= max_norm { return g }
+    let scale = max_norm / norm
+    let mut r = []
+    for i in 0..rows {
+        let mut row = []
+        for j in 0..cols {
+            row = row + [g[i][j] * scale]
+        }
+        r = r + [row]
+    }
+    return r
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 7: Multi-layer forward/backward with input caching
+// ═══════════════════════════════════════════════════════════════
+
+// ── Collect per-layer inputs + final output (LoRA) ──────────
+fn collect_inputs_lora(model, adapters, x, alpha) {
+    let n = len(model)
+    let mut inputs = []
+    let mut h = x
+    let mut i = 0
+    while i < n {
+        inputs = inputs + [h]
+        let layer = model[i]
+        let ad = adapters[i]
+        h = lora_layer_forward(layer.w, ad.a, ad.b, h, layer.out_dim, layer.in_dim, ad.rank, alpha)
+        i = i + 1
+    }
+    return [inputs, h]
+}
+
+// ── Multi-layer LoRA backward ───────────────────────────────
+// Returns list of [dA, dB] per layer
+fn model_lora_backward(model, adapters, inputs, dy, alpha) {
+    let n = len(model)
+    let mut all_grads = []
+    let mut idx = 0
+    while idx < n {
+        all_grads = all_grads + [0]
+        idx = idx + 1
+    }
+    let mut d = dy
+    let mut i = n - 1
+    while i >= 0 {
+        let layer = model[i]
+        let ad = adapters[i]
+        let x = inputs[i]
+        let m_dim = layer.out_dim
+        let n_dim = layer.in_dim
+        let r = ad.rank
+        // LoRA backward: get dA, dB
+        let ab_grads = lora_layer_backward(ad.a, ad.b, x, d, m_dim, n_dim, r, alpha)
+        all_grads[i] = ab_grads
+        // Propagate gradient through base W + LoRA for chain rule
+        let s = ft_lora_scale(alpha, r)
+        // dX = W^T @ d
+        let mut dx = ft_zeros1(n_dim)
+        for j in 0..n_dim {
+            let mut acc = 0.0
+            for k in 0..m_dim { acc = acc + layer.w[k][j] * d[k] }
+            dx[j] = acc
+        }
+        // + (alpha/r) * A^T @ (B^T @ d)
+        let mut btd = ft_zeros1(r)
+        for p in 0..r {
+            let mut acc = 0.0
+            for k in 0..m_dim { acc = acc + ad.b[k][p] * d[k] }
+            btd[p] = acc
+        }
+        for j in 0..n_dim {
+            let mut acc = 0.0
+            for p in 0..r { acc = acc + ad.a[p][j] * btd[p] }
+            dx[j] = dx[j] + s * acc
+        }
+        d = dx
+        i = i - 1
+    }
+    return all_grads
+}
+
+// ── Collect per-layer inputs + final output (full) ──────────
+fn collect_inputs_full(model, x) {
+    let n = len(model)
+    let mut inputs = []
+    let mut h = x
+    let mut i = 0
+    while i < n {
+        inputs = inputs + [h]
+        let layer = model[i]
+        h = full_layer_forward(layer.w, h, layer.out_dim, layer.in_dim)
+        i = i + 1
+    }
+    return [inputs, h]
+}
+
+// ── Multi-layer full backward ───────────────────────────────
+fn model_full_backward(model, inputs, dy) {
+    let n = len(model)
+    let mut all_grads = []
+    let mut idx = 0
+    while idx < n {
+        all_grads = all_grads + [0]
+        idx = idx + 1
+    }
+    let mut d = dy
+    let mut i = n - 1
+    while i >= 0 {
+        let layer = model[i]
+        let x = inputs[i]
+        let result = full_layer_backward(layer.w, x, d, layer.out_dim, layer.in_dim)
+        all_grads[i] = result[0]
+        d = result[1]
+        i = i - 1
+    }
+    return all_grads
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 8: LoRA fine-tuning
+// ═══════════════════════════════════════════════════════════════
+
+// lora_finetune(model, dataset, config)
+//   model:   [FTLayer, ...]
+//   dataset: [[input_vec, target_vec], ...]
+//   config:  FinetuneConfig
+//
+// Returns: [trained_adapters, final_loss, train_log]
+fn lora_finetune(model, dataset, config: FinetuneConfig) {
+    let rank = config.lora_rank
+    let alpha = config.lora_alpha
+    let n_layers = len(model)
+    let n_data = len(dataset)
+
+    println("[lora_finetune] starting — " + str(n_layers) + " layers, rank=" + str(rank) + " alpha=" + str(alpha))
+    println(config_str(config))
+
+    // Create LoRA adapters
+    let mut adapters = create_lora_adapters(model, rank, 42)
+
+    // Count trainable params
+    let mut trainable = 0
+    let mut frozen = 0
+    let mut i = 0
+    while i < n_layers {
+        let layer = model[i]
+        frozen = frozen + layer.out_dim * layer.in_dim
+        trainable = trainable + rank * layer.in_dim + layer.out_dim * rank
+        i = i + 1
+    }
+    println("[lora_finetune] frozen=" + str(frozen) + " trainable=" + str(trainable) + " ratio=" + str(to_float(trainable) / to_float(frozen)))
+
+    // Create AdamW state for each adapter (A and B)
+    let mut adam_a = []
+    let mut adam_b = []
+    i = 0
+    while i < n_layers {
+        let ad = adapters[i]
+        adam_a = adam_a + [make_adam_state(rank, ad.in_dim)]
+        adam_b = adam_b + [make_adam_state(ad.out_dim, rank)]
+        i = i + 1
+    }
+
+    // Training loop
+    let mut train_log = []
+    let mut step = 0
+    let total = config.total_steps
+    let out_dim = model[n_layers - 1].out_dim
+
+    while step < total {
+        let lr = lr_cosine(step, config.warmup_steps, total, config.lr, config.min_lr)
+        let sample_idx = step % n_data
+        let sample = dataset[sample_idx]
+        let x = sample[0]
+        let target = sample[1]
+
+        // Forward with input collection
+        let fwd_result = collect_inputs_lora(model, adapters, x, alpha)
+        let inputs = fwd_result[0]
+        let y = fwd_result[1]
+
+        // Loss
+        let loss = ft_mse_loss(y, target, out_dim)
+
+        // Backward
+        let dy = ft_mse_grad(y, target, out_dim)
+        let all_grads = model_lora_backward(model, adapters, inputs, dy, alpha)
+
+        // Update adapters (A and B) with AdamW
+        i = 0
+        while i < n_layers {
+            let grads = all_grads[i]
+            let da = grads[0]
+            let db = grads[1]
+            let ad = adapters[i]
+            let r = ad.rank
+
+            // Clip gradients
+            let da_clipped = clip_grad_2d(da, config.grad_clip, r, ad.in_dim)
+            let db_clipped = clip_grad_2d(db, config.grad_clip, ad.out_dim, r)
+
+            // AdamW update
+            let new_a = adamw_step_2d(ad.a, da_clipped, adam_a[i], lr, 0.0, r, ad.in_dim)
+            let new_b = adamw_step_2d(ad.b, db_clipped, adam_b[i], lr, 0.0, ad.out_dim, r)
+
+            adapters[i] = LoraAdapter {
+                a: new_a,
+                b: new_b,
+                out_dim: ad.out_dim,
+                in_dim: ad.in_dim,
+                rank: r
+            }
+            i = i + 1
+        }
+
+        // Logging
+        if step % config.log_interval == 0 {
+            println("[lora] step=" + str(step) + " loss=" + str(loss) + " lr=" + str(lr))
+            train_log = train_log + [loss]
+        }
+
+        step = step + 1
+    }
+
+    // Final loss
+    let final_sample = dataset[0]
+    let final_fwd = collect_inputs_lora(model, adapters, final_sample[0], alpha)
+    let final_loss = ft_mse_loss(final_fwd[1], final_sample[1], out_dim)
+    println("[lora_finetune] done — final_loss=" + str(final_loss))
+
+    return [adapters, final_loss, train_log]
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 9: Full fine-tuning
+// ═══════════════════════════════════════════════════════════════
+
+// full_finetune(model, dataset, config)
+//   Updates ALL parameters with lower LR.
+//
+// Returns: [updated_model, final_loss, train_log]
+fn full_finetune(model, dataset, config: FinetuneConfig) {
+    let n_layers = len(model)
+    let n_data = len(dataset)
+
+    // Count total params
+    let mut total_params = 0
+    let mut i = 0
+    while i < n_layers {
+        let layer = model[i]
+        total_params = total_params + layer.out_dim * layer.in_dim
+        i = i + 1
+    }
+    println("[full_finetune] starting — " + str(n_layers) + " layers, " + str(total_params) + " params (ALL trainable)")
+    println(config_str(config))
+
+    // Deep-copy model weights (we mutate them)
+    let mut weights = []
+    i = 0
+    while i < n_layers {
+        let layer = model[i]
+        let m = layer.out_dim
+        let n_dim = layer.in_dim
+        let mut w_copy = []
+        for ii in 0..m {
+            let mut row = []
+            for jj in 0..n_dim {
+                row = row + [layer.w[ii][jj]]
+            }
+            w_copy = w_copy + [row]
+        }
+        weights = weights + [FTLayer { w: w_copy, out_dim: m, in_dim: n_dim }]
+        i = i + 1
+    }
+
+    // Create AdamW state for each layer
+    let mut adam_states = []
+    i = 0
+    while i < n_layers {
+        let layer = weights[i]
+        adam_states = adam_states + [make_adam_state(layer.out_dim, layer.in_dim)]
+        i = i + 1
+    }
+
+    // Training loop
+    let mut train_log = []
+    let mut step = 0
+    let total = config.total_steps
+    let out_dim = weights[n_layers - 1].out_dim
+
+    while step < total {
+        let lr = lr_cosine(step, config.warmup_steps, total, config.lr, config.min_lr)
+        let sample_idx = step % n_data
+        let sample = dataset[sample_idx]
+        let x = sample[0]
+        let target = sample[1]
+
+        // Forward with input collection
+        let fwd_result = collect_inputs_full(weights, x)
+        let inputs = fwd_result[0]
+        let y = fwd_result[1]
+
+        // Loss
+        let loss = ft_mse_loss(y, target, out_dim)
+
+        // Backward
+        let dy = ft_mse_grad(y, target, out_dim)
+        let all_grads = model_full_backward(weights, inputs, dy)
+
+        // Update all weights with AdamW
+        i = 0
+        while i < n_layers {
+            let layer = weights[i]
+            let m_dim = layer.out_dim
+            let n_dim = layer.in_dim
+            let g = all_grads[i]
+
+            // Clip gradients
+            let g_clipped = clip_grad_2d(g, config.grad_clip, m_dim, n_dim)
+
+            // AdamW update
+            let new_w = adamw_step_2d(layer.w, g_clipped, adam_states[i], lr, config.weight_decay, m_dim, n_dim)
+            weights[i] = FTLayer { w: new_w, out_dim: m_dim, in_dim: n_dim }
+            i = i + 1
+        }
+
+        // Logging
+        if step % config.log_interval == 0 {
+            println("[full] step=" + str(step) + " loss=" + str(loss) + " lr=" + str(lr))
+            train_log = train_log + [loss]
+        }
+
+        step = step + 1
+    }
+
+    // Final loss
+    let final_sample = dataset[0]
+    let final_fwd = collect_inputs_full(weights, final_sample[0])
+    let final_loss = ft_mse_loss(final_fwd[1], final_sample[1], out_dim)
+    println("[full_finetune] done — final_loss=" + str(final_loss))
+
+    return [weights, final_loss, train_log]
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 10: LoRA merge
+// ═══════════════════════════════════════════════════════════════
+
+// merge_lora(base_model, lora_adapters, alpha)
+//   base_model:    [FTLayer, ...]       (original frozen model)
+//   lora_adapters: [LoraAdapter, ...]   (trained adapters)
+//   alpha:         int                  (LoRA alpha scaling)
+//
+//   Returns: [FTLayer, ...] where W' = W + (alpha/r) * B @ A
+fn merge_lora(base_model, lora_adapters, alpha) {
+    let n = len(base_model)
+    if len(lora_adapters) != n {
+        println("[merge_lora] ERROR: layer count mismatch base=" + str(n) + " lora=" + str(len(lora_adapters)))
+        return base_model
+    }
+
+    let mut merged = []
+    let mut i = 0
+    while i < n {
+        let layer = base_model[i]
+        let ad = lora_adapters[i]
+        let m = layer.out_dim
+        let n_dim = layer.in_dim
+        let r = ad.rank
+        let s = ft_lora_scale(alpha, r)
+
+        // W' = W + s * B @ A
+        // B: [m, r], A: [r, n_dim] => B@A: [m, n_dim]
+        let ba = ft_matmul(ad.b, ad.a, m, r, n_dim)
+
+        let mut w_merged = []
+        for ii in 0..m {
+            let mut row = []
+            for jj in 0..n_dim {
+                row = row + [layer.w[ii][jj] + s * ba[ii][jj]]
+            }
+            w_merged = w_merged + [row]
+        }
+
+        merged = merged + [FTLayer { w: w_merged, out_dim: m, in_dim: n_dim }]
+        i = i + 1
+    }
+
+    println("[merge_lora] merged " + str(n) + " layers with alpha=" + str(alpha))
+    return merged
+}
+
+println("[finetune] module loaded — full_finetune + lora_finetune + merge_lora")

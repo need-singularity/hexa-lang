@@ -1,0 +1,317 @@
+// ===================================================================
+//  self/ml/sampler.hexa — Token Sampling for LLM Generation
+//
+//  Implements:
+//    - Greedy (argmax)
+//    - Temperature scaling
+//    - Top-p (nucleus) sampling
+//    - Top-k sampling
+//    - Combined: temperature -> top-k -> top-p -> sample
+// ===================================================================
+
+// -- Sampler config --
+struct SamplerConfig {
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    seed: int
+}
+
+fn default_sampler() {
+    return SamplerConfig {
+        temperature: 0.7,
+        top_p: 0.9,
+        top_k: 40,
+        seed: 42
+    }
+}
+
+fn greedy_sampler() {
+    return SamplerConfig {
+        temperature: 0.0,
+        top_p: 1.0,
+        top_k: 0,
+        seed: 0
+    }
+}
+
+// -- LCG random number generator state --
+let mut SAMPLER_RNG = 2463534242
+
+fn sampler_set_seed(s) {
+    SAMPLER_RNG = s
+}
+
+fn sampler_rand_float() {
+    // Xorshift32
+    let mut x = SAMPLER_RNG
+    x = x ^ (x * 8192)       // x ^= x << 13 (approx)
+    x = x ^ (x / 131072)     // x ^= x >> 17
+    x = x ^ (x * 32)         // x ^= x << 5
+    if x < 0 { x = 0 - x }
+    SAMPLER_RNG = x
+    return to_float(x % 1000000) / 1000000.0
+}
+
+// ===================================================================
+//  Argmax: return index of maximum value
+// ===================================================================
+fn argmax(logits, n) {
+    let mut best_i = 0
+    let mut best_v = logits[0]
+    let mut i = 1
+    while i < n {
+        if logits[i] > best_v {
+            best_v = logits[i]
+            best_i = i
+        }
+        i = i + 1
+    }
+    return best_i
+}
+
+// ===================================================================
+//  Temperature scaling: logits / temperature
+// ===================================================================
+fn apply_temperature(logits, n, temp) {
+    if temp <= 0.0 { return logits }
+    let inv_t = 1.0 / temp
+    let mut out = tensor_zeros(n)
+    let mut i = 0
+    while i < n {
+        out[i] = logits[i] * inv_t
+        i = i + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  Softmax over logits
+// ===================================================================
+fn softmax_logits(logits, n) {
+    let mut mx = logits[0]
+    let mut i = 1
+    while i < n {
+        if logits[i] > mx { mx = logits[i] }
+        i = i + 1
+    }
+    let mut probs = tensor_zeros(n)
+    let mut sum_e = 0.0
+    i = 0
+    while i < n {
+        let e = exp(logits[i] - mx)
+        probs[i] = e
+        sum_e = sum_e + e
+        i = i + 1
+    }
+    let inv = 1.0 / sum_e
+    i = 0
+    while i < n {
+        probs[i] = probs[i] * inv
+        i = i + 1
+    }
+    return probs
+}
+
+// ===================================================================
+//  Top-k: zero out all but top-k probability entries
+//  (Simple O(n*k) approach — fine for vocab 32K)
+// ===================================================================
+fn apply_top_k(probs, n, k) {
+    if k <= 0 { return probs }
+    if k >= n { return probs }
+
+    // Find the k-th largest probability
+    // Use partial selection: find threshold
+    let mut indices = []
+    let mut i = 0
+    while i < n {
+        indices = indices + [i]
+        i = i + 1
+    }
+
+    // Simple: find top-k threshold by sorting a copy of probs
+    let mut sorted_p = []
+    i = 0
+    while i < n {
+        sorted_p = sorted_p + [probs[i]]
+        i = i + 1
+    }
+    // Partial sort: bubble top-k to front
+    let mut j = 0
+    while j < k {
+        let mut best = j
+        let mut m = j + 1
+        while m < n {
+            if sorted_p[m] > sorted_p[best] { best = m }
+            m = m + 1
+        }
+        if best != j {
+            let tmp = sorted_p[j]
+            sorted_p[j] = sorted_p[best]
+            sorted_p[best] = tmp
+        }
+        j = j + 1
+    }
+    let threshold = sorted_p[k - 1]
+
+    // Zero out entries below threshold
+    let mut out = tensor_zeros(n)
+    let mut sum_p = 0.0
+    i = 0
+    while i < n {
+        if probs[i] >= threshold {
+            out[i] = probs[i]
+            sum_p = sum_p + probs[i]
+        }
+        i = i + 1
+    }
+    // Renormalize
+    if sum_p > 0.0 {
+        let inv = 1.0 / sum_p
+        i = 0
+        while i < n {
+            out[i] = out[i] * inv
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// ===================================================================
+//  Top-p (nucleus): keep smallest set of tokens whose cumulative
+//  probability exceeds p. Sort by descending prob, accumulate.
+// ===================================================================
+fn apply_top_p(probs, n, p) {
+    if p >= 1.0 { return probs }
+    if p <= 0.0 { return probs }
+
+    // Build index-prob pairs and sort descending by prob
+    // Using selection sort (O(n^2) but n is filtered by top-k first)
+    let mut indices = []
+    let mut vals = []
+    let mut i = 0
+    while i < n {
+        if probs[i] > 0.0 {
+            indices = indices + [i]
+            vals = vals + [probs[i]]
+        }
+        i = i + 1
+    }
+
+    let nn = len(indices)
+    // Sort descending
+    let mut ii = 0
+    while ii < nn {
+        let mut best = ii
+        let mut jj = ii + 1
+        while jj < nn {
+            if vals[jj] > vals[best] { best = jj }
+            jj = jj + 1
+        }
+        if best != ii {
+            let ti = indices[ii]
+            indices[ii] = indices[best]
+            indices[best] = ti
+            let tv = vals[ii]
+            vals[ii] = vals[best]
+            vals[best] = tv
+        }
+        ii = ii + 1
+    }
+
+    // Accumulate until >= p
+    let mut out = tensor_zeros(n)
+    let mut cum = 0.0
+    let mut sum_p = 0.0
+    i = 0
+    while i < nn {
+        let idx = indices[i]
+        let prob = vals[i]
+        out[idx] = prob
+        sum_p = sum_p + prob
+        cum = cum + prob
+        if cum >= p { i = nn }
+        i = i + 1
+    }
+
+    // Renormalize
+    if sum_p > 0.0 {
+        let inv = 1.0 / sum_p
+        i = 0
+        while i < n {
+            out[i] = out[i] * inv
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// ===================================================================
+//  Sample from probability distribution
+// ===================================================================
+fn sample_from_probs(probs, n) {
+    let r = sampler_rand_float()
+    let mut cum = 0.0
+    let mut i = 0
+    while i < n {
+        cum = cum + probs[i]
+        if cum > r { return i }
+        i = i + 1
+    }
+    return n - 1
+}
+
+// ===================================================================
+//  Main sampling function: logits -> token_id
+// ===================================================================
+fn sample_token(logits, vocab_size, cfg: SamplerConfig) {
+    // Greedy
+    if cfg.temperature <= 0.0 {
+        return argmax(logits, vocab_size)
+    }
+
+    // Temperature
+    let scaled = apply_temperature(logits, vocab_size, cfg.temperature)
+
+    // Softmax
+    let probs = softmax_logits(scaled, vocab_size)
+
+    // Top-k
+    let top_k_probs = apply_top_k(probs, vocab_size, cfg.top_k)
+
+    // Top-p
+    let top_p_probs = apply_top_p(top_k_probs, vocab_size, cfg.top_p)
+
+    // Sample
+    return sample_from_probs(top_p_probs, vocab_size)
+}
+
+// ===================================================================
+//  Tests
+// ===================================================================
+@test
+fn test_argmax_basic() {
+    let v = [1.0, 5.0, 3.0, 2.0]
+    assert(argmax(v, 4) == 1)
+}
+
+@test
+fn test_softmax_sums_to_one() {
+    let v = [1.0, 2.0, 3.0]
+    let p = softmax_logits(v, 3)
+    let s = p[0] + p[1] + p[2]
+    // Should be ~1.0
+    assert(s > 0.99)
+    assert(s < 1.01)
+}
+
+@test
+fn test_greedy_sample() {
+    let logits = [0.1, 0.5, 10.0, 0.3]
+    let cfg = greedy_sampler()
+    let tok = sample_token(logits, 4, cfg)
+    assert(tok == 2)
+}
+
+println("[sampler] tests passed")

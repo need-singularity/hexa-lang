@@ -1,0 +1,337 @@
+// ═══════════════════════════════════════════════════════════════
+//  monitor.hexa — Training monitor with JSONL logging
+//
+//  Pure hexa. No external dependencies.
+//
+//  API:
+//    create_logger(log_path) -> logger
+//    log_step(logger, step, keys, vals) -> logger
+//    log_eval(logger, step, keys, vals) -> logger
+//    get_eta(logger, total_steps) -> string
+//    get_smooth_loss(logger) -> float
+//    print_progress(logger, step, total_steps, keys, vals) -> logger
+//
+//  keys/vals are parallel arrays: keys=["loss","lr"], vals=[2.5,0.0003]
+// ═══════════════════════════════════════════════════════════════
+
+// ── JSON helpers (no RHS {} — use string concat) ─────────────
+
+fn _mon_json_num(k, v) {
+    "\"" + k + "\":" + str(v)
+}
+
+fn _mon_json_str(k, v) {
+    "\"" + k + "\":\"" + v + "\""
+}
+
+// ── Logger creation ──────────────────────────────────────────
+
+fn create_logger(log_path) {
+    // logger = [log_path, step_times, loss_history, window_size, start_time]
+    let start = clock()
+    [log_path, [], [], 20, start]
+}
+
+// ── Internal: append one JSONL line ──────────────────────────
+
+fn _mon_append(log_path, line) {
+    let mut prev = ""
+    prev = read_file(log_path)
+    if len(prev) < 0 { prev = "" }
+    write_file(log_path, prev + line + "\n")
+}
+
+// ── Lookup by key in parallel arrays ─────────────────────────
+
+fn _mon_lookup(keys, vals, target, fallback) {
+    let mut i = 0
+    while i < len(keys) {
+        if keys[i] == target { return vals[i] }
+        i = i + 1
+    }
+    fallback
+}
+
+// ── log_step ─────────────────────────────────────────────────
+// keys: [string], vals: [float] — parallel arrays
+// Must include "loss" and "lr". Optional: "grad_norm", "tok_per_sec", "step_ms"
+// Automatically adds: type, step, timestamp, elapsed_ms
+
+fn log_step(logger, step, keys, vals) {
+    let log_path = logger[0]
+    let step_times = logger[1]
+    let loss_hist = logger[2]
+    let window = logger[3]
+    let start_time = logger[4]
+
+    let now = clock()
+    let elapsed = (now - start_time) * 1000.0
+
+    // Build JSONL line
+    let mut line = "{" + _mon_json_str("type", "step")
+    line = line + "," + _mon_json_num("step", step)
+    line = line + "," + _mon_json_num("timestamp", now)
+    line = line + "," + _mon_json_num("elapsed_ms", elapsed)
+
+    let mut i = 0
+    while i < len(keys) {
+        line = line + "," + _mon_json_num(keys[i], vals[i])
+        i = i + 1
+    }
+    line = line + "}"
+
+    _mon_append(log_path, line)
+
+    // Extract loss and step_ms for rolling buffers
+    let loss_val = _mon_lookup(keys, vals, "loss", 0.0)
+    let step_ms = _mon_lookup(keys, vals, "step_ms", 0.0)
+
+    // Update rolling buffers
+    let mut new_times = step_times
+    new_times = new_times.push(step_ms)
+
+    let mut new_loss = loss_hist
+    new_loss = new_loss.push(loss_val)
+    // Keep only last `window` entries
+    if len(new_loss) > window {
+        let mut trimmed = []
+        let start_idx = len(new_loss) - window
+        let mut j = start_idx
+        while j < len(new_loss) {
+            trimmed = trimmed.push(new_loss[j])
+            j = j + 1
+        }
+        new_loss = trimmed
+    }
+
+    [log_path, new_times, new_loss, window, start_time]
+}
+
+// ── log_eval ─────────────────────────────────────────────────
+// keys/vals: parallel arrays, e.g. ["eval_loss","perplexity"], [1.8, 6.05]
+
+fn log_eval(logger, step, keys, vals) {
+    let log_path = logger[0]
+    let now = clock()
+    let elapsed = (now - logger[4]) * 1000.0
+
+    let mut line = "{" + _mon_json_str("type", "eval")
+    line = line + "," + _mon_json_num("step", step)
+    line = line + "," + _mon_json_num("timestamp", now)
+    line = line + "," + _mon_json_num("elapsed_ms", elapsed)
+
+    let mut i = 0
+    while i < len(keys) {
+        line = line + "," + _mon_json_num(keys[i], vals[i])
+        i = i + 1
+    }
+    line = line + "}"
+
+    _mon_append(log_path, line)
+    logger
+}
+
+// ── Moving average loss ──────────────────────────────────────
+
+fn get_smooth_loss(logger) {
+    let loss_hist = logger[2]
+    let n = len(loss_hist)
+    if n == 0 { return 0.0 }
+    let mut sum = 0.0
+    let mut i = 0
+    while i < n {
+        sum = sum + loss_hist[i]
+        i = i + 1
+    }
+    sum / (n * 1.0)
+}
+
+// ── ETA calculation ──────────────────────────────────────────
+
+fn get_eta(logger, current_step, total_steps) {
+    let step_times = logger[1]
+    let n = len(step_times)
+    if n == 0 { return "N/A" }
+
+    // Average ms per step (use last 50 for stability)
+    let win = 50
+    let start_idx = n - win
+    let mut lo = start_idx
+    if lo < 0 { lo = 0 }
+    let mut sum = 0.0
+    let mut count = 0
+    let mut i = lo
+    while i < n {
+        sum = sum + step_times[i]
+        count = count + 1
+        i = i + 1
+    }
+    let avg_ms = sum / (count * 1.0)
+    let remaining = total_steps - current_step
+    let eta_ms = avg_ms * (remaining * 1.0)
+
+    _format_duration(eta_ms)
+}
+
+fn _format_duration(ms) {
+    let total_s = to_int(ms / 1000.0)
+    let hours = total_s / 3600
+    let mins = (total_s % 3600) / 60
+    let secs = total_s % 60
+    if hours > 0 {
+        return str(hours) + "h " + str(mins) + "m " + str(secs) + "s"
+    }
+    if mins > 0 {
+        return str(mins) + "m " + str(secs) + "s"
+    }
+    str(secs) + "s"
+}
+
+// ── Progress bar + live metrics ──────────────────────────────
+
+fn _repeat_char(ch, n) {
+    let mut s = ""
+    let mut i = 0
+    while i < n {
+        s = s + ch
+        i = i + 1
+    }
+    s
+}
+
+fn print_progress(logger, step, total_steps, keys, vals) {
+    let bar_width = 30
+    let pct = (step * 100) / total_steps
+    let filled = (step * bar_width) / total_steps
+    let empty = bar_width - filled
+
+    let bar = "[" + _repeat_char("=", filled) + _repeat_char(" ", empty) + "]"
+
+    let smooth = get_smooth_loss(logger)
+    let eta = get_eta(logger, step, total_steps)
+
+    let lr = _mon_lookup(keys, vals, "lr", 0.0)
+    let tok_s = _mon_lookup(keys, vals, "tok_per_sec", 0.0)
+    let grad_norm = _mon_lookup(keys, vals, "grad_norm", 0.0)
+
+    let mut line = bar + " " + str(pct) + "% "
+    line = line + "step=" + str(step) + "/" + str(total_steps)
+    line = line + " loss=" + str(smooth)
+    line = line + " lr=" + str(lr)
+    if grad_norm > 0.0 { line = line + " gnorm=" + str(grad_norm) }
+    if tok_s > 0.0 { line = line + " tok/s=" + str(tok_s) }
+    line = line + " ETA=" + eta
+
+    println(line)
+    logger
+}
+
+// ── Read log for visualization ───────────────────────────────
+// Returns [string] — raw JSONL lines filtered by type
+
+fn read_log(log_path, record_type) {
+    let content = read_file(log_path)
+    if len(content) == 0 { return [] }
+    let lines = content.split("\n")
+    let mut records = []
+    let mut i = 0
+    while i < len(lines) {
+        let line = lines[i].trim()
+        if len(line) > 2 {
+            let mut is_match = false
+            if record_type == "step" {
+                if _str_contains(line, "\"type\":\"step\"") { is_match = true }
+            }
+            if record_type == "eval" {
+                if _str_contains(line, "\"type\":\"eval\"") { is_match = true }
+            }
+            if is_match {
+                records = records.push(line)
+            }
+        }
+        i = i + 1
+    }
+    records
+}
+
+fn _str_contains(haystack, needle) {
+    let hn = len(haystack)
+    let nn = len(needle)
+    if nn > hn { return false }
+    let mut i = 0
+    while i <= hn - nn {
+        let mut ok = true
+        let mut j = 0
+        while j < nn {
+            if haystack[i + j] != needle[j] {
+                ok = false
+                j = nn
+            }
+            j = j + 1
+        }
+        if ok { return true }
+        i = i + 1
+    }
+    false
+}
+
+// ── Extract a numeric field from a JSONL line ────────────────
+
+fn extract_field(line, field_name) {
+    let key = "\"" + field_name + "\":"
+    let klen = len(key)
+    let n = len(line)
+    let mut i = 0
+    while i <= n - klen {
+        let mut ok = true
+        let mut j = 0
+        while j < klen {
+            if line[i + j] != key[j] {
+                ok = false
+                j = klen
+            }
+            j = j + 1
+        }
+        if ok {
+            // Value starts at i + klen
+            let val_start = i + klen
+            // Read until , or } or end
+            let mut val_end = val_start
+            let mut found_delim = false
+            while val_end < n {
+                if !found_delim {
+                    if line[val_end] == ',' { found_delim = true }
+                    if line[val_end] == '}' { found_delim = true }
+                    if !found_delim { val_end = val_end + 1 }
+                }
+                if found_delim { val_end = n }
+            }
+            if !found_delim { val_end = n }
+            // Build substring from val_start to val_end-1
+            let mut s = ""
+            let mut actual_end = val_end
+            if found_delim {
+                // val_end was set to n after finding delim, recompute
+                let mut ve2 = val_start
+                while ve2 < n {
+                    if line[ve2] == ',' { return _parse_val(line, val_start, ve2) }
+                    if line[ve2] == '}' { return _parse_val(line, val_start, ve2) }
+                    ve2 = ve2 + 1
+                }
+            }
+            return _parse_val(line, val_start, n)
+        }
+        i = i + 1
+    }
+    0.0
+}
+
+fn _parse_val(line, start, end_idx) {
+    let mut s = ""
+    let mut k = start
+    while k < end_idx {
+        s = s + str(line[k])
+        k = k + 1
+    }
+    to_float(s)
+}

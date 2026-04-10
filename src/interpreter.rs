@@ -82,28 +82,122 @@ pub(crate) fn symbolic_rewrite_stmt(s: &mut Stmt) {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-extern "C" {
-    fn cblas_dgemm(order: i32, transA: i32, transB: i32,
-                   M: i32, N: i32, K: i32,
-                   alpha: f64, A: *const f64, lda: i32,
-                   B: *const f64, ldb: i32,
-                   beta: f64, C: *mut f64, ldc: i32);
-    fn cblas_sgemm(order: i32, transA: i32, transB: i32,
-                   M: i32, N: i32, K: i32,
-                   alpha: f32, A: *const f32, lda: i32,
-                   B: *const f32, ldb: i32,
-                   beta: f32, C: *mut f32, ldc: i32);
-    fn cblas_daxpy(N: i32, alpha: f64,
-                   X: *const f64, incX: i32,
-                   Y: *mut f64, incY: i32);
+// ── BLAS abstraction: native CBLAS when `blas` feature enabled, pure-Rust fallback otherwise ──
+
+#[cfg(feature = "blas")]
+mod blas_ffi {
+    extern "C" {
+        pub fn cblas_dgemm(order: i32, transA: i32, transB: i32,
+                       M: i32, N: i32, K: i32,
+                       alpha: f64, A: *const f64, lda: i32,
+                       B: *const f64, ldb: i32,
+                       beta: f64, C: *mut f64, ldc: i32);
+        pub fn cblas_sgemm(order: i32, transA: i32, transB: i32,
+                       M: i32, N: i32, K: i32,
+                       alpha: f32, A: *const f32, lda: i32,
+                       B: *const f32, ldb: i32,
+                       beta: f32, C: *mut f32, ldc: i32);
+        pub fn cblas_daxpy(N: i32, alpha: f64,
+                       X: *const f64, incX: i32,
+                       Y: *mut f64, incY: i32);
+    }
 }
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+
 const CBLAS_ROW_MAJOR: i32 = 101;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
 const CBLAS_NO_TRANS: i32 = 111;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
 const CBLAS_TRANS: i32 = 112;
+
+#[cfg(feature = "blas")]
+#[allow(non_snake_case)]
+unsafe fn cblas_dgemm(order: i32, transA: i32, transB: i32,
+                      M: i32, N: i32, K: i32,
+                      alpha: f64, A: *const f64, lda: i32,
+                      B: *const f64, ldb: i32,
+                      beta: f64, C: *mut f64, ldc: i32) {
+    blas_ffi::cblas_dgemm(order, transA, transB, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
+}
+
+#[cfg(feature = "blas")]
+#[allow(non_snake_case)]
+unsafe fn cblas_sgemm(order: i32, transA: i32, transB: i32,
+                      M: i32, N: i32, K: i32,
+                      alpha: f32, A: *const f32, lda: i32,
+                      B: *const f32, ldb: i32,
+                      beta: f32, C: *mut f32, ldc: i32) {
+    blas_ffi::cblas_sgemm(order, transA, transB, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
+}
+
+#[cfg(feature = "blas")]
+#[allow(non_snake_case)]
+unsafe fn cblas_daxpy(N: i32, alpha: f64,
+                      X: *const f64, incX: i32,
+                      Y: *mut f64, incY: i32) {
+    blas_ffi::cblas_daxpy(N, alpha, X, incX, Y, incY);
+}
+
+// ── Pure-Rust fallback (no BLAS) ──
+
+#[cfg(not(feature = "blas"))]
+#[allow(non_snake_case)]
+unsafe fn cblas_dgemm(_order: i32, transA: i32, transB: i32,
+                      M: i32, N: i32, K: i32,
+                      alpha: f64, A: *const f64, lda: i32,
+                      B: *const f64, ldb: i32,
+                      beta: f64, C: *mut f64, ldc: i32) {
+    // Row-major DGEMM: C = alpha * op(A) * op(B) + beta * C
+    let (m, n, k) = (M as usize, N as usize, K as usize);
+    let (lda, ldb, ldc) = (lda as usize, ldb as usize, ldc as usize);
+    let trans_a = transA == CBLAS_TRANS;
+    let trans_b = transB == CBLAS_TRANS;
+    for i in 0..m {
+        for j in 0..n {
+            let mut sum = 0.0f64;
+            for p in 0..k {
+                let a_val = if trans_a { *A.add(p * lda + i) } else { *A.add(i * lda + p) };
+                let b_val = if trans_b { *B.add(j * ldb + p) } else { *B.add(p * ldb + j) };
+                sum += a_val * b_val;
+            }
+            let c_ptr = C.add(i * ldc + j);
+            *c_ptr = alpha * sum + beta * *c_ptr;
+        }
+    }
+}
+
+#[cfg(not(feature = "blas"))]
+#[allow(non_snake_case)]
+unsafe fn cblas_sgemm(_order: i32, transA: i32, transB: i32,
+                      M: i32, N: i32, K: i32,
+                      alpha: f32, A: *const f32, lda: i32,
+                      B: *const f32, ldb: i32,
+                      beta: f32, C: *mut f32, ldc: i32) {
+    let (m, n, k) = (M as usize, N as usize, K as usize);
+    let (lda, ldb, ldc) = (lda as usize, ldb as usize, ldc as usize);
+    let trans_a = transA == CBLAS_TRANS;
+    let trans_b = transB == CBLAS_TRANS;
+    for i in 0..m {
+        for j in 0..n {
+            let mut sum = 0.0f32;
+            for p in 0..k {
+                let a_val = if trans_a { *A.add(p * lda + i) } else { *A.add(i * lda + p) };
+                let b_val = if trans_b { *B.add(j * ldb + p) } else { *B.add(p * ldb + j) };
+                sum += a_val * b_val;
+            }
+            let c_ptr = C.add(i * ldc + j);
+            *c_ptr = alpha * sum + beta * *c_ptr;
+        }
+    }
+}
+
+#[cfg(not(feature = "blas"))]
+#[allow(non_snake_case)]
+unsafe fn cblas_daxpy(N: i32, alpha: f64,
+                      X: *const f64, incX: i32,
+                      Y: *mut f64, incY: i32) {
+    let (n, inc_x, inc_y) = (N as usize, incX as usize, incY as usize);
+    for i in 0..n {
+        *Y.add(i * inc_y) += alpha * *X.add(i * inc_x);
+    }
+}
 
 /// KV cache inference state — pre-converted f32 weights + KV caches.
 /// Single-token autoregressive decode: O(L×D²/r) per token instead of O(L×seq×D²).
@@ -4818,6 +4912,27 @@ impl Interpreter {
                     }
                 }
             }
+            "write_file_bytes" => {
+                // write_file_bytes(path, byte_array_or_tensor) → Void
+                // Writes raw bytes (array/tensor of 0..255 values) to file.
+                #[cfg(target_arch = "wasm32")]
+                { return Err(self.runtime_err("write_file_bytes not supported in WASM".into())); }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    if args.len() < 2 { return Err(self.type_err("write_file_bytes(path, bytes) requires 2 args".into())); }
+                    match &args[0] {
+                        Value::Str(path) => {
+                            let data = to_f64_slice(&args[1]).ok_or_else(|| self.type_err("write_file_bytes: bytes must be array/tensor".into()))?;
+                            let bytes: Vec<u8> = data.as_slice().iter().map(|&v| v as u8).collect();
+                            match std::fs::write(path, &bytes) {
+                                Ok(_) => Ok(Value::Void),
+                                Err(e) => Err(self.runtime_err(format!("write_file_bytes: {}", e))),
+                            }
+                        }
+                        _ => Err(self.type_err("write_file_bytes(path, bytes) requires string path".into())),
+                    }
+                }
+            }
             "file_exists" => {
                 #[cfg(target_arch = "wasm32")]
                 { return Err(self.runtime_err("file_exists is not supported in WASM mode".into())); }
@@ -8862,6 +8977,38 @@ impl Interpreter {
                 }
             }
             // ── Math builtins ──────────────────────────────────────
+            "char_code" => {
+                // char_code(string, index) → Int (Unicode code point / byte value)
+                if args.len() < 2 { return Err(self.type_err("char_code(str, idx) requires 2 args".into())); }
+                match (&args[0], &args[1]) {
+                    (Value::Str(s), Value::Int(idx)) => {
+                        let i = *idx as usize;
+                        match s.chars().nth(i) {
+                            Some(c) => Ok(Value::Int(c as i64)),
+                            None => Ok(Value::Int(-1)),
+                        }
+                    }
+                    _ => Err(self.type_err("char_code() requires (string, int)".into())),
+                }
+            }
+            "chr" => {
+                // chr(int) → String (single character from code point)
+                if args.is_empty() { return Err(self.type_err("chr() requires 1 argument".into())); }
+                match &args[0] {
+                    Value::Int(code) => {
+                        match char::from_u32(*code as u32) {
+                            Some(c) => Ok(Value::Str(c.to_string())),
+                            None => Ok(Value::Str("?".to_string())),
+                        }
+                    }
+                    _ => Err(self.type_err("chr() requires int".into())),
+                }
+            }
+            "argv" => {
+                // argv() → Array of command-line arguments (same as args() but more standard name)
+                let os_args: Vec<Value> = std::env::args().map(|a| Value::Str(a)).collect();
+                Ok(Value::Array(os_args))
+            }
             "abs" => {
                 if args.is_empty() { return Err(self.type_err("abs() requires 1 argument".into())); }
                 match &args[0] {
@@ -10699,7 +10846,23 @@ impl Interpreter {
                 let f: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64 = unsafe { std::mem::transmute(sym) };
                 f(c_args[0], c_args[1], c_args[2], c_args[3], c_args[4], c_args[5], c_args[6], c_args[7], c_args[8], c_args[9], c_args[10], c_args[11])
             }
-            n => return Err(self.runtime_err(format!("extern fn '{}': too many arguments ({}, max 12)", fn_name, n))),
+            13 => {
+                let f: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64 = unsafe { std::mem::transmute(sym) };
+                f(c_args[0], c_args[1], c_args[2], c_args[3], c_args[4], c_args[5], c_args[6], c_args[7], c_args[8], c_args[9], c_args[10], c_args[11], c_args[12])
+            }
+            14 => {
+                let f: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64 = unsafe { std::mem::transmute(sym) };
+                f(c_args[0], c_args[1], c_args[2], c_args[3], c_args[4], c_args[5], c_args[6], c_args[7], c_args[8], c_args[9], c_args[10], c_args[11], c_args[12], c_args[13])
+            }
+            15 => {
+                let f: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64 = unsafe { std::mem::transmute(sym) };
+                f(c_args[0], c_args[1], c_args[2], c_args[3], c_args[4], c_args[5], c_args[6], c_args[7], c_args[8], c_args[9], c_args[10], c_args[11], c_args[12], c_args[13], c_args[14])
+            }
+            16 => {
+                let f: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64 = unsafe { std::mem::transmute(sym) };
+                f(c_args[0], c_args[1], c_args[2], c_args[3], c_args[4], c_args[5], c_args[6], c_args[7], c_args[8], c_args[9], c_args[10], c_args[11], c_args[12], c_args[13], c_args[14], c_args[15])
+            }
+            n => return Err(self.runtime_err(format!("extern fn '{}': too many arguments ({}, max 16)", fn_name, n))),
         };
 
         Ok(Self::c_ret_to_value(raw_ret, &ret_type))

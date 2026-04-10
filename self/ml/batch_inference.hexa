@@ -1,0 +1,638 @@
+// ===================================================================
+//  self/ml/batch_inference.hexa — Batch Inference Engine
+//
+//  Pure Hexa batch processing for LLM inference.
+//
+//  Public API:
+//    infer_batch(model, prompts, config)
+//      Process multiple prompts, return array of completions.
+//      Returns array of #{text, tokens, tok_per_sec, elapsed_ms}
+//
+//    infer_batch_continuous(model, prompts, config)
+//      Continuous batching: sequences finish independently,
+//      new prompts fill vacated slots for maximum throughput.
+//
+//    infer_batch_shared_prefix(model, system_prompt, user_prompts, config)
+//      Shared KV-cache prefix: prefill system prompt once,
+//      then decode each user prompt with cloned KV state.
+//      Key optimization for chat/API serving.
+//
+//    BatchRequest / BatchResult — data structures
+// ===================================================================
+
+// ===================================================================
+//  Batch request/result structs
+// ===================================================================
+struct BatchConfig {
+    max_tokens: int,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    seed: int,
+    batch_size: int
+}
+
+struct BatchResult {
+    text: string,
+    tokens: array,
+    total_tokens: int,
+    tok_per_sec: float,
+    elapsed_ms: float,
+    prompt_idx: int
+}
+
+fn default_batch_config() {
+    return BatchConfig {
+        max_tokens: 128,
+        temperature: 0.7,
+        top_p: 0.9,
+        top_k: 40,
+        seed: 42,
+        batch_size: 4
+    }
+}
+
+fn greedy_batch_config(max_tokens) {
+    return BatchConfig {
+        max_tokens: max_tokens,
+        temperature: 0.0,
+        top_p: 1.0,
+        top_k: 0,
+        seed: 0,
+        batch_size: 4
+    }
+}
+
+// ===================================================================
+//  Byte tokenizer (shared with generate.hexa / streaming.hexa)
+// ===================================================================
+fn byte_tokenize(text) {
+    let mut tokens = [1]
+    let n = len(text)
+    let mut i = 0
+    while i < n {
+        let ch = char_code(text, i)
+        tokens = tokens + [ch + 3]
+        i = i + 1
+    }
+    return tokens
+}
+
+fn token_to_str(token_id) {
+    if token_id <= 2 { return "" }
+    let byte_val = token_id - 3
+    if byte_val >= 32 {
+        if byte_val < 127 {
+            return chr(byte_val)
+        }
+    }
+    return "?"
+}
+
+// ===================================================================
+//  Single-prompt inference (internal helper)
+//  Runs full prefill + decode for one prompt.
+//  Returns BatchResult.
+// ===================================================================
+fn infer_single(model, prompt, config: BatchConfig, prompt_idx) {
+    let cfg = model.config
+    let vocab_size = cfg.vocab_size
+
+    let sampler = SamplerConfig {
+        temperature: config.temperature,
+        top_p: config.top_p,
+        top_k: config.top_k,
+        seed: config.seed + prompt_idx
+    }
+    sampler_set_seed(config.seed + prompt_idx)
+
+    // Init KV cache
+    let kv_init = init_kv_cache(cfg)
+    let mut kv_keys = kv_init[0]
+    let mut kv_vals = kv_init[1]
+
+    // Tokenize
+    let tokens = byte_tokenize(prompt)
+    let prompt_len = len(tokens)
+    let t_start = clock()
+
+    // Prefill
+    let mut pos = 0
+    let mut last_logits = []
+    while pos < prompt_len {
+        let tok = tokens[pos]
+        let emb = load_embedding(model, tok)
+        let result = transformer_forward(model, emb, pos, kv_keys, kv_vals)
+        kv_keys = result[1]
+        kv_vals = result[2]
+        if pos == prompt_len - 1 {
+            last_logits = result[0]
+        }
+        pos = pos + 1
+    }
+
+    // Decode
+    let mut cur_tok = sample_token(last_logits, vocab_size, sampler)
+    let mut decode_pos = prompt_len
+    let mut generated = 0
+    let mut gen_tokens = []
+    let mut gen_text = ""
+
+    while generated < config.max_tokens {
+        if cur_tok == 2 {
+            generated = config.max_tokens
+        } else {
+            let tok_str = token_to_str(cur_tok)
+            gen_text = gen_text + tok_str
+            gen_tokens = gen_tokens + [cur_tok]
+
+            let emb = load_embedding(model, cur_tok)
+            let result = transformer_forward(model, emb, decode_pos, kv_keys, kv_vals)
+            let logits = result[0]
+            kv_keys = result[1]
+            kv_vals = result[2]
+
+            cur_tok = sample_token(logits, vocab_size, sampler)
+            decode_pos = decode_pos + 1
+            generated = generated + 1
+        }
+    }
+
+    let t_end = clock()
+    let elapsed_ms = (t_end - t_start) * 1000.0
+    let mut tps = 0.0
+    if elapsed_ms > 0.0 {
+        tps = to_float(generated) / (elapsed_ms / 1000.0)
+    }
+
+    return BatchResult {
+        text: gen_text,
+        tokens: gen_tokens,
+        total_tokens: generated,
+        tok_per_sec: tps,
+        elapsed_ms: elapsed_ms,
+        prompt_idx: prompt_idx
+    }
+}
+
+// ===================================================================
+//  infer_batch — Simple batch: process prompts sequentially
+//
+//  Returns array of BatchResult, one per prompt.
+//  Each prompt gets its own KV cache (no sharing).
+// ===================================================================
+fn infer_batch(model, prompts, config: BatchConfig) {
+    let n = len(prompts)
+    let mut results = []
+    let t_batch_start = clock()
+
+    println("[batch] Processing " + str(n) + " prompts")
+
+    let mut i = 0
+    while i < n {
+        println("[batch] Prompt " + str(i + 1) + "/" + str(n))
+        let result = infer_single(model, prompts[i], config, i)
+        results = results + [result]
+        i = i + 1
+    }
+
+    let t_batch_end = clock()
+    let total_ms = (t_batch_end - t_batch_start) * 1000.0
+    let mut total_toks = 0
+    let mut j = 0
+    while j < n {
+        total_toks = total_toks + results[j].total_tokens
+        j = j + 1
+    }
+    let mut batch_tps = 0.0
+    if total_ms > 0.0 {
+        batch_tps = to_float(total_toks) / (total_ms / 1000.0)
+    }
+
+    println("[batch] Done: " + str(total_toks) + " tokens in " + str(total_ms) + " ms (" + str(batch_tps) + " tok/s)")
+    return results
+}
+
+// ===================================================================
+//  Slot state for continuous batching
+// ===================================================================
+struct BatchSlot {
+    active: bool,
+    prompt_idx: int,
+    kv_keys: array,
+    kv_vals: array,
+    cur_tok: int,
+    decode_pos: int,
+    generated: int,
+    max_tokens: int,
+    gen_text: string,
+    gen_tokens: array,
+    t_start: float,
+    sampler: SamplerConfig
+}
+
+fn make_empty_slot() {
+    return BatchSlot {
+        active: false,
+        prompt_idx: -1,
+        kv_keys: [],
+        kv_vals: [],
+        cur_tok: 0,
+        decode_pos: 0,
+        generated: 0,
+        max_tokens: 0,
+        gen_text: "",
+        gen_tokens: [],
+        t_start: 0.0,
+        sampler: SamplerConfig {
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            seed: 0
+        }
+    }
+}
+
+// ===================================================================
+//  infer_batch_continuous — Continuous batching
+//
+//  Maintains a fixed number of decode slots. When a sequence finishes
+//  (EOS or max_tokens), its slot is immediately filled with the next
+//  pending prompt. This maximizes GPU/CPU utilization.
+//
+//  Implementation: round-robin decode steps across active slots.
+//  Each step decodes one token per active slot.
+// ===================================================================
+fn infer_batch_continuous(model, prompts, config: BatchConfig) {
+    let cfg = model.config
+    let vocab_size = cfg.vocab_size
+    let n_prompts = len(prompts)
+    let batch_size = config.batch_size
+    let t_batch_start = clock()
+
+    println("[batch-continuous] " + str(n_prompts) + " prompts, batch_size=" + str(batch_size))
+
+    // Initialize slots
+    let mut slots = []
+    let mut s = 0
+    while s < batch_size {
+        slots = slots + [make_empty_slot()]
+        s = s + 1
+    }
+
+    let mut results = []
+    let mut r = 0
+    while r < n_prompts {
+        results = results + [nil]
+        r = r + 1
+    }
+
+    let mut next_prompt = 0
+    let mut completed = 0
+
+    // Fill initial slots
+    let mut si = 0
+    while si < batch_size {
+        if next_prompt < n_prompts {
+            let slot = prefill_slot(model, prompts[next_prompt], config, next_prompt, cfg)
+            slots[si] = slot
+            next_prompt = next_prompt + 1
+        }
+        si = si + 1
+    }
+
+    // Decode loop: round-robin one token per active slot
+    while completed < n_prompts {
+        let mut di = 0
+        while di < batch_size {
+            let slot = slots[di]
+            if slot.active {
+                // Check EOS or max
+                if slot.cur_tok == 2 {
+                    // Finish this slot
+                    let result = finish_slot(slot)
+                    results[slot.prompt_idx] = result
+                    completed = completed + 1
+
+                    // Refill with next prompt
+                    if next_prompt < n_prompts {
+                        slots[di] = prefill_slot(model, prompts[next_prompt], config, next_prompt, cfg)
+                        next_prompt = next_prompt + 1
+                    } else {
+                        slots[di] = make_empty_slot()
+                    }
+                } else {
+                    if slot.generated >= slot.max_tokens {
+                        let result = finish_slot(slot)
+                        results[slot.prompt_idx] = result
+                        completed = completed + 1
+
+                        if next_prompt < n_prompts {
+                            slots[di] = prefill_slot(model, prompts[next_prompt], config, next_prompt, cfg)
+                            next_prompt = next_prompt + 1
+                        } else {
+                            slots[di] = make_empty_slot()
+                        }
+                    } else {
+                        // Decode one token
+                        slots[di] = decode_slot_step(model, slot, cfg)
+                    }
+                }
+            }
+            di = di + 1
+        }
+    }
+
+    let t_batch_end = clock()
+    let total_ms = (t_batch_end - t_batch_start) * 1000.0
+    println("[batch-continuous] Done in " + str(total_ms) + " ms, " + str(completed) + " sequences")
+    return results
+}
+
+// ===================================================================
+//  Prefill a slot: tokenize, run prefill, return initialized slot
+// ===================================================================
+fn prefill_slot(model, prompt, config: BatchConfig, prompt_idx, cfg) {
+    let vocab_size = cfg.vocab_size
+
+    let sampler = SamplerConfig {
+        temperature: config.temperature,
+        top_p: config.top_p,
+        top_k: config.top_k,
+        seed: config.seed + prompt_idx
+    }
+    sampler_set_seed(config.seed + prompt_idx)
+
+    let kv_init = init_kv_cache(cfg)
+    let mut kv_keys = kv_init[0]
+    let mut kv_vals = kv_init[1]
+
+    let tokens = byte_tokenize(prompt)
+    let prompt_len = len(tokens)
+    let t_start = clock()
+
+    // Prefill all prompt tokens
+    let mut pos = 0
+    let mut last_logits = []
+    while pos < prompt_len {
+        let tok = tokens[pos]
+        let emb = load_embedding(model, tok)
+        let result = transformer_forward(model, emb, pos, kv_keys, kv_vals)
+        kv_keys = result[1]
+        kv_vals = result[2]
+        if pos == prompt_len - 1 {
+            last_logits = result[0]
+        }
+        pos = pos + 1
+    }
+
+    let first_tok = sample_token(last_logits, vocab_size, sampler)
+
+    return BatchSlot {
+        active: true,
+        prompt_idx: prompt_idx,
+        kv_keys: kv_keys,
+        kv_vals: kv_vals,
+        cur_tok: first_tok,
+        decode_pos: prompt_len,
+        generated: 0,
+        max_tokens: config.max_tokens,
+        gen_text: "",
+        gen_tokens: [],
+        t_start: t_start,
+        sampler: sampler
+    }
+}
+
+// ===================================================================
+//  Decode one token step for a slot
+// ===================================================================
+fn decode_slot_step(model, slot: BatchSlot, cfg) {
+    let vocab_size = cfg.vocab_size
+    let tok_str = token_to_str(slot.cur_tok)
+
+    let emb = load_embedding(model, slot.cur_tok)
+    let result = transformer_forward(model, emb, slot.decode_pos, slot.kv_keys, slot.kv_vals)
+    let logits = result[0]
+    let new_keys = result[1]
+    let new_vals = result[2]
+
+    let next_tok = sample_token(logits, vocab_size, slot.sampler)
+
+    return BatchSlot {
+        active: true,
+        prompt_idx: slot.prompt_idx,
+        kv_keys: new_keys,
+        kv_vals: new_vals,
+        cur_tok: next_tok,
+        decode_pos: slot.decode_pos + 1,
+        generated: slot.generated + 1,
+        max_tokens: slot.max_tokens,
+        gen_text: slot.gen_text + tok_str,
+        gen_tokens: slot.gen_tokens + [slot.cur_tok],
+        t_start: slot.t_start,
+        sampler: slot.sampler
+    }
+}
+
+// ===================================================================
+//  Finish a slot: compute stats, return BatchResult
+// ===================================================================
+fn finish_slot(slot: BatchSlot) {
+    let t_end = clock()
+    let elapsed_ms = (t_end - slot.t_start) * 1000.0
+    let mut tps = 0.0
+    if elapsed_ms > 0.0 {
+        tps = to_float(slot.generated) / (elapsed_ms / 1000.0)
+    }
+
+    return BatchResult {
+        text: slot.gen_text,
+        tokens: slot.gen_tokens,
+        total_tokens: slot.generated,
+        tok_per_sec: tps,
+        elapsed_ms: elapsed_ms,
+        prompt_idx: slot.prompt_idx
+    }
+}
+
+// ===================================================================
+//  infer_batch_shared_prefix — Shared KV-cache prefix optimization
+//
+//  For chat/API: all requests share a system prompt. Prefill the
+//  system prompt ONCE, then clone the KV state for each user prompt.
+//  Saves O(n * system_len) forward passes.
+//
+//  Returns array of BatchResult.
+// ===================================================================
+fn infer_batch_shared_prefix(model, system_prompt, user_prompts, config: BatchConfig) {
+    let cfg = model.config
+    let vocab_size = cfg.vocab_size
+    let n = len(user_prompts)
+    let t_batch_start = clock()
+
+    println("[batch-prefix] Shared prefix: " + str(len(system_prompt)) + " chars, " + str(n) + " user prompts")
+
+    // Step 1: Prefill system prompt once
+    let sys_tokens = byte_tokenize(system_prompt)
+    let sys_len = len(sys_tokens)
+
+    let kv_init = init_kv_cache(cfg)
+    let mut sys_kv_keys = kv_init[0]
+    let mut sys_kv_vals = kv_init[1]
+
+    let t_prefill_start = clock()
+    let mut pos = 0
+    while pos < sys_len {
+        let tok = sys_tokens[pos]
+        let emb = load_embedding(model, tok)
+        let result = transformer_forward(model, emb, pos, sys_kv_keys, sys_kv_vals)
+        sys_kv_keys = result[1]
+        sys_kv_vals = result[2]
+        pos = pos + 1
+    }
+    let t_prefill_end = clock()
+    let prefill_ms = (t_prefill_end - t_prefill_start) * 1000.0
+    println("[batch-prefix] System prefill: " + str(sys_len) + " tokens in " + str(prefill_ms) + " ms")
+
+    // Step 2: For each user prompt, clone KV state and continue
+    let mut results = []
+    let mut i = 0
+    while i < n {
+        println("[batch-prefix] User prompt " + str(i + 1) + "/" + str(n))
+
+        let sampler = SamplerConfig {
+            temperature: config.temperature,
+            top_p: config.top_p,
+            top_k: config.top_k,
+            seed: config.seed + i
+        }
+        sampler_set_seed(config.seed + i)
+
+        // Clone system KV state (immutable values, safe to reuse)
+        let mut kv_keys = sys_kv_keys
+        let mut kv_vals = sys_kv_vals
+
+        // Continue prefill with user tokens
+        let user_tokens = byte_tokenize(user_prompts[i])
+        let user_len = len(user_tokens)
+        let mut upos = 0
+        let mut last_logits = []
+        let mut cur_pos = sys_len
+
+        while upos < user_len {
+            let tok = user_tokens[upos]
+            let emb = load_embedding(model, tok)
+            let result = transformer_forward(model, emb, cur_pos, kv_keys, kv_vals)
+            kv_keys = result[1]
+            kv_vals = result[2]
+            if upos == user_len - 1 {
+                last_logits = result[0]
+            }
+            upos = upos + 1
+            cur_pos = cur_pos + 1
+        }
+
+        // Decode
+        let t_start = clock()
+        let mut cur_tok = sample_token(last_logits, vocab_size, sampler)
+        let mut decode_pos = cur_pos
+        let mut generated = 0
+        let mut gen_text = ""
+        let mut gen_tokens = []
+
+        while generated < config.max_tokens {
+            if cur_tok == 2 {
+                generated = config.max_tokens
+            } else {
+                let tok_str = token_to_str(cur_tok)
+                gen_text = gen_text + tok_str
+                gen_tokens = gen_tokens + [cur_tok]
+
+                let emb = load_embedding(model, cur_tok)
+                let result = transformer_forward(model, emb, decode_pos, kv_keys, kv_vals)
+                let logits = result[0]
+                kv_keys = result[1]
+                kv_vals = result[2]
+
+                cur_tok = sample_token(logits, vocab_size, sampler)
+                decode_pos = decode_pos + 1
+                generated = generated + 1
+            }
+        }
+
+        let t_end = clock()
+        let elapsed_ms = (t_end - t_start) * 1000.0
+        let mut tps = 0.0
+        if elapsed_ms > 0.0 {
+            tps = to_float(generated) / (elapsed_ms / 1000.0)
+        }
+
+        let result = BatchResult {
+            text: gen_text,
+            tokens: gen_tokens,
+            total_tokens: generated,
+            tok_per_sec: tps,
+            elapsed_ms: elapsed_ms,
+            prompt_idx: i
+        }
+        results = results + [result]
+        i = i + 1
+    }
+
+    let t_batch_end = clock()
+    let total_ms = (t_batch_end - t_batch_start) * 1000.0
+    println("[batch-prefix] Done in " + str(total_ms) + " ms")
+    return results
+}
+
+// ===================================================================
+//  Tests (unit-level, no model needed)
+// ===================================================================
+@test
+fn test_byte_tokenize() {
+    let tokens = byte_tokenize("Hi")
+    // [BOS=1, H=72+3=75, i=105+3=108]
+    assert(len(tokens) == 3)
+    assert(tokens[0] == 1)
+    assert(tokens[1] == 75)
+    assert(tokens[2] == 108)
+}
+
+@test
+fn test_token_to_str_basic() {
+    // H = 72, token_id = 72 + 3 = 75
+    let s = token_to_str(75)
+    assert(s == "H")
+    // EOS
+    let eos = token_to_str(2)
+    assert(eos == "")
+    // BOS
+    let bos = token_to_str(1)
+    assert(bos == "")
+}
+
+@test
+fn test_default_batch_config() {
+    let cfg = default_batch_config()
+    assert(cfg.max_tokens == 128)
+    assert(cfg.batch_size == 4)
+    assert(cfg.temperature == 0.7)
+}
+
+@test
+fn test_greedy_batch_config() {
+    let cfg = greedy_batch_config(64)
+    assert(cfg.max_tokens == 64)
+    assert(cfg.temperature == 0.0)
+}
+
+@test
+fn test_make_empty_slot() {
+    let slot = make_empty_slot()
+    assert(slot.active == false)
+    assert(slot.prompt_idx == -1)
+    assert(slot.generated == 0)
+}
+
+println("[batch_inference] tests passed")

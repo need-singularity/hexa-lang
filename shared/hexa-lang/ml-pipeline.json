@@ -1,0 +1,418 @@
+{
+  "id": "hexa-ml-pipeline",
+  "version": "1.0.0",
+  "date": "2026-04-11",
+  "description": "HEXA ML 풀 파이프라인 — CPU/GPU/Hybrid, 학습→추론→서빙 전체 경로",
+
+  "devices": {
+    "cpu": {
+      "target_hw": "x86_64 / ARM64 (DDR4/DDR5)",
+      "blas": "Accelerate (macOS) / OpenBLAS (Linux) / pure-Rust fallback (musl)",
+      "memory_bandwidth": {"ddr4_dual": "50 GB/s", "ddr5_dual": "90 GB/s"},
+      "compute_ceiling": {"blas_sustained": "25-50 GFLOPS (FP64)", "avx2_fp32": "~200 GFLOPS"},
+      "strengths": ["배포 비용 0", "어디서나 실행", "의존성 0", "저전력"],
+      "weaknesses": ["대규모 학습 불가", "7B 추론 ~10-14 tok/s 한계"]
+    },
+    "gpu": {
+      "target_hw": "H100 SXM (NVIDIA CUDA)",
+      "blas": "cuBLAS (SGEMM/HGEMM)",
+      "ffi": "hexa extern fn → dlopen libcudart.so + libcublas.so",
+      "pytorch_dependency": 0,
+      "compute_ceiling": {"fp32": "67 TFLOPS", "fp16": "990 TFLOPS", "int8": "1979 TOPS"},
+      "memory": {"hbm3": "80 GB", "bandwidth": "3.35 TB/s"},
+      "strengths": ["대규모 학습 가능", "추론 수천 tok/s", "배치 처리"],
+      "weaknesses": ["임대 비용", "CUDA 종속", "전력 소모"]
+    },
+    "hybrid": {
+      "description": "GPU 학습 → CPU 서빙 (또는 반대)",
+      "use_cases": [
+        "GPU로 학습 후 양자화 → CPU 서빙 (비용 절감)",
+        "GPU 추론 + CPU 전처리/후처리",
+        "GPU 메모리 부족 시 CPU 오프로드"
+      ],
+      "weight_transfer": "checkpoint.hexa save/load → device.hexa auto-select"
+    }
+  },
+
+  "pipeline_stages": {
+    "1_data_preprocessing": {
+      "file": "self/ml/dataloader.hexa + data_pipeline.hexa",
+      "device": "CPU",
+      "operations": ["load_text_dataset", "load_jsonl", "create_batches", "shuffle", "train_val_test_split", "chunking", "padding"],
+      "status": "done"
+    },
+    "2_tokenization": {
+      "file": "self/ml/tokenizer.hexa",
+      "device": "CPU",
+      "operations": ["load_vocab", "load_merges", "bpe_encode", "bpe_decode", "special_tokens"],
+      "status": "done"
+    },
+    "3_training": {
+      "cpu": {
+        "file": "self/ml/train_full.hexa",
+        "model": "81M full-rank (NO LoRA)",
+        "optimizer": "SGD+momentum (BLAS-only)",
+        "measured_perf": {
+          "step_ms": 500,
+          "tok_per_sec": 250,
+          "ceiling_ratio": "2.2x (vs 225ms theoretical)",
+          "hours_to_1B": "~556 h"
+        },
+        "status": "done"
+      },
+      "gpu": {
+        "file": "self/ml/train_gpu.hexa",
+        "model": "103.2M full-rank transformer (SwiGLU, 8 layers)",
+        "optimizer": "AdamW + cosine LR + gradient clipping",
+        "ffi": "cuBLAS cublasSgemm_v2 (14-arg)",
+        "theoretical_perf": {
+          "step_ms": "<1",
+          "target_tflops_utilization": ">50%",
+          "hours_to_1B": "<0.01 h"
+        },
+        "status": "code_done_needs_h100_measurement"
+      },
+      "distributed": {
+        "file": "self/ml/distributed.hexa + distributed_train.hexa",
+        "method": "data parallel + ring-allreduce",
+        "status": "done"
+      }
+    },
+    "4_fine_tuning": {
+      "file": "self/ml/finetune.hexa",
+      "methods": ["full_finetune", "lora_finetune (r configurable)", "merge_lora"],
+      "device": "CPU or GPU (auto-detect)",
+      "status": "done"
+    },
+    "5_alignment": {
+      "file": "self/ml/dpo.hexa + rlhf.hexa",
+      "methods": ["DPO (no reward model needed)", "PPO-based RLHF (reward model + value fn)"],
+      "device": "GPU recommended",
+      "status": "done"
+    },
+    "6_quantization": {
+      "file": "self/ml/quantize.hexa",
+      "formats": ["FP32", "FP16", "INT8 (per-channel)", "Q4_0 (block)", "Q4_K (super-block)"],
+      "gguf_compatible": true,
+      "status": "done"
+    },
+    "7_export": {
+      "file": "self/ml/gguf_writer.hexa + onnx_writer.hexa",
+      "formats": ["GGUF v3 (llama.cpp compatible)", "ONNX"],
+      "status": "done"
+    },
+    "8_inference": {
+      "cpu": {
+        "file": "self/ml/transformer.hexa + generate.hexa + sampler.hexa",
+        "model": "7B Q4 (GGUF, mmap)",
+        "kv_cache": "self/ml/kv_cache.hexa",
+        "physical_ceiling": {
+          "ddr4_50gbps": {"max_tok_s": 14, "latency_first_token_ms": 71},
+          "ddr5_90gbps": {"max_tok_s": 25, "latency_first_token_ms": 40}
+        },
+        "status": "done"
+      },
+      "gpu": {
+        "file": "self/ml/gpu_inference.hexa + gpu_generate.hexa + gpu_sampler.hexa",
+        "kv_cache": "self/ml/gpu_kv_cache.hexa (GPU memory)",
+        "physical_ceiling": {
+          "h100_7b_fp16": {"max_tok_s": 4000, "latency_first_token_ms": 5},
+          "h100_7b_q4": {"max_tok_s": 8000, "latency_first_token_ms": 3},
+          "h100_100m_fp32": {"max_tok_s": 50000, "latency_first_token_ms": 0.5}
+        },
+        "status": "done"
+      }
+    },
+    "9_serving": {
+      "file": "self/ml/http_server.hexa + serve.hexa",
+      "protocol": "HTTP REST + SSE streaming",
+      "endpoints": {
+        "POST /v1/completions": "generate text",
+        "GET /health": "health check"
+      },
+      "streaming": "self/ml/streaming.hexa (token-by-token SSE)",
+      "batch": "self/ml/batch_inference.hexa (continuous batching)",
+      "status": "done"
+    },
+    "10_evaluation": {
+      "file": "self/ml/eval.hexa + eval_runner.hexa",
+      "metrics": ["perplexity", "accuracy", "top_k_accuracy", "BLEU-4", "ROUGE-L", "F1", "confusion_matrix"],
+      "status": "done"
+    },
+    "11_embedding_rag": {
+      "file": "self/ml/embedding.hexa + vector_store.hexa + rag.hexa",
+      "operations": ["embed", "cosine_similarity", "vector_search", "rag_generate"],
+      "status": "done"
+    },
+    "12_monitoring": {
+      "file": "self/ml/monitor.hexa + visualize.hexa + profiler.hexa",
+      "features": ["JSONL logging", "ASCII loss curves", "ETA", "profiling breakdown"],
+      "status": "done"
+    }
+  },
+
+  "serving_latency_by_model_size": {
+    "_description": "모델 사이즈 × 디바이스별 서빙 딜레이 즉답표",
+    "_formula": "CPU: memory_bandwidth / model_size, GPU: hbm_bandwidth / model_size, first_token ≈ 1/tok_s",
+
+    "100m": {
+      "model_bytes": {"fp32": "400 MB", "fp16": "200 MB", "q4": "50 MB"},
+      "cpu": {
+        "first_token_ms": 2,
+        "tok_per_sec": "500-2000",
+        "100_token_sec": "0.05-0.2",
+        "bottleneck": "compute-bound (모델이 L3 캐시에 적중)",
+        "verdict": "CPU 서빙 충분 — 실시간 대화 가능"
+      },
+      "gpu_h100": {
+        "first_token_ms": 0.5,
+        "tok_per_sec": "30000-50000",
+        "100_token_sec": "0.002-0.003",
+        "bottleneck": "kernel launch overhead",
+        "verdict": "과잉 — CPU로 충분"
+      },
+      "hybrid": {
+        "strategy": "CPU 서빙 only (GPU 불필요)",
+        "reason": "100M은 CPU에서 충분히 빠름, GPU 비용 낭비"
+      }
+    },
+
+    "1b": {
+      "model_bytes": {"fp32": "4 GB", "fp16": "2 GB", "q4": "500 MB"},
+      "cpu": {
+        "first_token_ms": 20,
+        "tok_per_sec": "50-100",
+        "100_token_sec": "1-2",
+        "bottleneck": "memory-bandwidth (모델 > L3 캐시)",
+        "verdict": "CPU 서빙 가능 — 약간의 딜레이"
+      },
+      "gpu_h100": {
+        "first_token_ms": 1,
+        "tok_per_sec": "5000-10000",
+        "100_token_sec": "0.01-0.02",
+        "bottleneck": "compute/memory 혼합",
+        "verdict": "빠름 — 대량 트래픽 시 권장"
+      },
+      "hybrid": {
+        "strategy": "저트래픽 CPU, 고트래픽 GPU",
+        "reason": "1-2초 응답이 허용되면 CPU, 실시간 필요 시 GPU"
+      }
+    },
+
+    "7b": {
+      "model_bytes": {"fp32": "28 GB", "fp16": "14 GB", "q4": "3.5 GB"},
+      "cpu": {
+        "first_token_ms": 71,
+        "tok_per_sec": "10-14",
+        "100_token_sec": "7-10",
+        "bottleneck": "memory-bandwidth 한계 (DDR4 50GB/s ÷ 3.5GB)",
+        "verdict": "CPU 서빙 가능하나 느림 — 오프라인/배치 전용"
+      },
+      "gpu_h100": {
+        "first_token_ms": 3,
+        "tok_per_sec": "2000-8000",
+        "100_token_sec": "0.012-0.05",
+        "bottleneck": "HBM bandwidth (Q4) or compute (FP16)",
+        "verdict": "실시간 대화 가능 — 권장"
+      },
+      "hybrid": {
+        "strategy": "GPU 추론 + CPU 전처리/토크나이저",
+        "reason": "7B CPU-only는 10초/응답, 사용자 경험 나쁨"
+      }
+    },
+
+    "13b": {
+      "model_bytes": {"fp32": "52 GB", "fp16": "26 GB", "q4": "6.5 GB"},
+      "cpu": {
+        "first_token_ms": 130,
+        "tok_per_sec": "5-8",
+        "100_token_sec": "12-20",
+        "bottleneck": "memory-bandwidth (DDR4 50GB/s ÷ 6.5GB)",
+        "verdict": "CPU 서빙 비추천 — 배치 전용"
+      },
+      "gpu_h100": {
+        "first_token_ms": 5,
+        "tok_per_sec": "1500-4000",
+        "100_token_sec": "0.025-0.07",
+        "bottleneck": "HBM bandwidth",
+        "verdict": "실시간 대화 가능"
+      },
+      "hybrid": {
+        "strategy": "GPU 필수, CPU는 오프로드 보조",
+        "reason": "13B는 CPU-only 실용성 없음"
+      }
+    },
+
+    "70b": {
+      "model_bytes": {"fp32": "280 GB", "fp16": "140 GB", "q4": "35 GB"},
+      "cpu": {
+        "first_token_ms": 700,
+        "tok_per_sec": "1-2",
+        "100_token_sec": "50-100",
+        "bottleneck": "모델이 RAM에 겨우 적재, swap 위험",
+        "verdict": "CPU 불가"
+      },
+      "gpu_h100": {
+        "first_token_ms": 15,
+        "tok_per_sec": "200-800",
+        "100_token_sec": "0.12-0.5",
+        "bottleneck": "HBM 80GB에 Q4만 적재 가능, FP16은 2x GPU 필요",
+        "verdict": "GPU 필수, 대형은 멀티GPU"
+      },
+      "hybrid": {
+        "strategy": "멀티GPU 필수 (FP16) 또는 단일 GPU Q4",
+        "reason": "70B Q4=35GB → H100 80GB에 적재 가능"
+      }
+    }
+  },
+
+  "serving_latency_summary": {
+    "_quick_answer_table": "모델 크기별 '서빙 얼마나 걸려?' 즉답",
+    "100m_cpu": "0.05초 (충분)",
+    "1b_cpu": "1-2초 (가능)",
+    "7b_cpu": "7-10초 (느림)",
+    "7b_gpu": "0.025초 (빠름)",
+    "13b_gpu": "0.05초 (빠름)",
+    "70b_gpu": "0.3초 (가능)",
+    "recommendation": "7B 이상은 GPU, 1B 이하는 CPU, 100M은 어디서든"
+  },
+
+  "cpu_vs_gpu_comparison": {
+    "training": {
+      "cpu_81m_step_ms": 500,
+      "gpu_103m_step_ms": "<1 (theoretical)",
+      "speedup": ">500x",
+      "recommendation": "학습은 GPU 필수 (100M+ 파라미터)"
+    },
+    "inference_7b": {
+      "cpu_tok_s": "10-14",
+      "gpu_tok_s": "2000-8000",
+      "speedup": "200-800x",
+      "recommendation": "대화형은 GPU, 배치/오프라인은 CPU 가능"
+    },
+    "inference_100m": {
+      "cpu_tok_s": "500-2000",
+      "gpu_tok_s": "30000-50000",
+      "speedup": "25-100x",
+      "recommendation": "소형 모델은 CPU 서빙 충분 (비용 효율)"
+    },
+    "cost": {
+      "cpu_server": "$0 (자체 서버) ~ $50/mo (VPS)",
+      "gpu_h100": "$2-3/hr (클라우드)",
+      "breakeven": "일 1000 요청 이하면 CPU가 경제적"
+    }
+  },
+
+  "files_map": {
+    "core_training": [
+      "self/ml/train_full.hexa (CPU 81M)",
+      "self/ml/train_gpu.hexa (GPU 103M)",
+      "self/ml/grad_engine.hexa (CPU AD)",
+      "self/ml/gpu_grad_engine.hexa (GPU AD)",
+      "self/ml/optimizer.hexa (CPU SGD+momentum)",
+      "self/ml/gpu_optimizer.hexa (GPU AdamW)"
+    ],
+    "core_inference": [
+      "self/ml/transformer.hexa (CPU 7B Q4)",
+      "self/ml/generate.hexa (CPU generation)",
+      "self/ml/sampler.hexa (CPU sampling)",
+      "self/ml/gpu_inference.hexa (GPU inference)",
+      "self/ml/gpu_generate.hexa (GPU generation)",
+      "self/ml/gpu_sampler.hexa (GPU sampling)"
+    ],
+    "data": [
+      "self/ml/tokenizer.hexa (BPE)",
+      "self/ml/dataloader.hexa",
+      "self/ml/data_pipeline.hexa"
+    ],
+    "io": [
+      "self/ml/gguf_loader.hexa (GGUF read)",
+      "self/ml/gguf_writer.hexa (GGUF write)",
+      "self/ml/onnx_writer.hexa (ONNX export)",
+      "self/ml/checkpoint.hexa (save/load)"
+    ],
+    "serving": [
+      "self/ml/http_server.hexa",
+      "self/ml/serve.hexa",
+      "self/ml/streaming.hexa (SSE)",
+      "self/ml/batch_inference.hexa"
+    ],
+    "advanced": [
+      "self/ml/finetune.hexa (LoRA/full)",
+      "self/ml/dpo.hexa (DPO alignment)",
+      "self/ml/rlhf.hexa (PPO RLHF)",
+      "self/ml/quantize.hexa (FP16/INT8/Q4)",
+      "self/ml/distributed.hexa (multi-GPU)",
+      "self/ml/embedding.hexa + vector_store.hexa + rag.hexa"
+    ],
+    "infra": [
+      "self/ml/cuda_ffi.hexa (CUDA bindings)",
+      "self/ml/gpu_tensor.hexa (GPU tensor)",
+      "self/ml/gpu_kv_cache.hexa",
+      "self/ml/kv_cache.hexa (CPU)",
+      "self/ml/device.hexa (CPU/GPU auto-detect)",
+      "self/ml/pipeline.hexa (unified orchestration)",
+      "self/ml/offload.hexa (GPU↔CPU transfer)",
+      "self/ml/monitor.hexa + visualize.hexa + profiler.hexa"
+    ]
+  },
+
+  "pytorch_comparison": {
+    "_description": "PyTorch vs HEXA 직접 비교 — 즉답용",
+    "training_100m_cpu": {
+      "pytorch": {"step_ms": 170, "framework_overhead": "Python GIL + autograd graph + dispatch", "dependencies": "torch, numpy, ~2GB install"},
+      "hexa": {"step_ms": 500, "overhead": "interpreter dispatch (no JIT yet)", "dependencies": "single 8.9MB binary"},
+      "hexa_vs_pytorch": "0.34x (hexa 느림 — interpreter 한계, JIT 적용 시 동등 예상)",
+      "note": "PyTorch 170ms는 동일 r=4 config 기준 이전 측정. 풀 81M에서는 PyTorch ~800ms 예상 → hexa 0.6x"
+    },
+    "training_100m_gpu_h100": {
+      "pytorch": {"step_ms": 0.8, "tflops_util": "~40%", "overhead": "CUDA graph, Python dispatch, autograd"},
+      "hexa": {"step_ms": "<1 (theoretical)", "tflops_util": "target >50%", "overhead": "zero — direct cuBLAS call"},
+      "hexa_vs_pytorch": "~1.0-1.5x (hexa 동등 or 우세 — Python/autograd 오버헤드 제거)",
+      "key_advantage": "hexa는 cublasSgemm 직호출, PyTorch는 aten::mm → cublas wrapper → cublas 3단 dispatch"
+    },
+    "inference_7b_cpu_q4": {
+      "pytorch": {"tok_s": "N/A (PyTorch Q4 미지원, llama.cpp 기준 ~10-15)"},
+      "llama_cpp": {"tok_s": "10-15", "note": "C++ 최적화, GGML, 수년간 튜닝"},
+      "hexa": {"tok_s": "10-14 (theoretical ceiling)", "note": "mmap + Q4 dequant + cblas_dgemm"},
+      "hexa_vs_llamacpp": "~0.7-1.0x (llama.cpp급 도달 가능, 같은 BLAS 경로)"
+    },
+    "inference_7b_gpu_h100": {
+      "pytorch_transformers": {"tok_s": 800, "note": "HuggingFace generate, FP16"},
+      "vllm": {"tok_s": "2000-4000", "note": "PagedAttention, continuous batching"},
+      "hexa": {"tok_s": "2000-4000 (theoretical)", "note": "direct cuBLAS, custom KV-cache"},
+      "hexa_vs_vllm": "~1.0x (같은 cuBLAS 경로, PagedAttention 미구현 시 0.5x)"
+    },
+    "startup_time": {
+      "pytorch": {"cold_start_sec": 5, "note": "Python import torch + model load"},
+      "hexa": {"cold_start_sec": 0.01, "note": "native binary, mmap weights"},
+      "speedup": "500x",
+      "impact": "서버리스/edge 배포에서 결정적 차이"
+    },
+    "memory_footprint": {
+      "pytorch_7b_fp16": "14 GB + ~2 GB runtime",
+      "hexa_7b_q4": "3.5 GB + ~50 MB runtime",
+      "reduction": "4.5x",
+      "impact": "저사양 서버/엣지 배포 가능"
+    },
+    "binary_size": {
+      "pytorch": "~2 GB (torch + deps)",
+      "hexa": "8.9 MB (static musl)",
+      "reduction": "224x"
+    },
+    "ecosystem_maturity": {
+      "pytorch": "10/10 — 수만 개 모델, HuggingFace 생태계, 수년간 최적화",
+      "hexa": "3/10 — 코어 파이프라인 구현됨, 프리트레인 모델 생태계 없음",
+      "gap": "모델 허브, 커뮤니티, 프리트레인 체크포인트"
+    }
+  },
+
+  "zero_dependencies": {
+    "python": false,
+    "pytorch": false,
+    "tensorflow": false,
+    "onnxruntime": false,
+    "required": ["CUDA toolkit (GPU only)", "BLAS library (CPU, optional — pure-Rust fallback)"],
+    "binary": "single static ELF (musl, 8.9MB)"
+  }
+}

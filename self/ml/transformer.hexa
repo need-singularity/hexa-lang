@@ -1,0 +1,596 @@
+// ===================================================================
+//  self/ml/transformer.hexa — Full Llama-2/3 Transformer in pure Hexa
+//
+//  Architecture: RMSNorm -> QKV Attention (GQA) -> RMSNorm -> FFN (SwiGLU)
+//  Quantization: Q4_0 dequantize-on-the-fly matmul (never pre-dequantize)
+//  Positional:   RoPE (Rotary Position Embedding)
+//  KV-Cache:     Flat 1D for autoregressive decode
+//
+//  Key insight: 7B Q4_0 = 3.5GB weights. DDR4 ~50 GB/s -> ~14 tok/s max.
+//  We stream weights through cache via read_file_bytes + q4_0_matvec.
+// ===================================================================
+
+// -- Llama config struct --
+struct LlamaConfig {
+    dim: int,
+    hidden_dim: int,
+    n_layers: int,
+    n_heads: int,
+    n_kv_heads: int,
+    vocab_size: int,
+    max_seq_len: int,
+    head_dim: int,
+    rope_base: float,
+    rms_eps: float
+}
+
+// -- Model handle: GGUF index + file path for lazy weight loading --
+struct LlamaModel {
+    config: LlamaConfig,
+    path: string,
+    data_origin: int,
+    tensor_info: array,
+    metadata: array
+}
+
+// ===================================================================
+//  Array helper: create mutable zero-filled array
+// ===================================================================
+fn zeros(n) {
+    let mut arr = []
+    let mut i = 0
+    while i < n {
+        arr = arr + [0.0]
+        i = i + 1
+    }
+    return arr
+}
+
+// ===================================================================
+//  GGUF tensor lookup — find offset + shape by name
+// ===================================================================
+fn find_tensor(model, name) {
+    let info = model.tensor_info
+    let n = len(info)
+    let mut i = 0
+    while i < n {
+        let entry = info[i]
+        if entry[0] == name {
+            return entry
+        }
+        i = i + 1
+    }
+    println("[transformer] WARN: tensor not found: " + name)
+    return []
+}
+
+// ===================================================================
+//  Compute byte size for Q4_0 tensor data
+//  Q4_0: 32 weights -> 18 bytes (f16 scale + 16 nibble bytes)
+// ===================================================================
+fn q4_0_byte_size(rows, cols) {
+    let blocks_per_row = cols / 32
+    let bytes_per_row = blocks_per_row * 18
+    return rows * bytes_per_row
+}
+
+// ===================================================================
+//  Load raw Q4_0 bytes for a tensor from GGUF file
+//  Returns raw byte tensor for q4_0_matvec
+// ===================================================================
+fn load_q4_bytes(model, name, rows, cols) {
+    let entry = find_tensor(model, name)
+    if len(entry) == 0 { return tensor_zeros(1) }
+    let offset_in_data = entry[3]
+    let abs_offset = model.data_origin + offset_in_data
+    let total_bytes = q4_0_byte_size(rows, cols)
+    return read_file_bytes(model.path, abs_offset, total_bytes)
+}
+
+// ===================================================================
+//  Load f32 tensor (for norm weights, token embeddings)
+//  Returns a Tensor (immutable, read-only indexing)
+// ===================================================================
+fn load_f32_vec(model, name, numel) {
+    let entry = find_tensor(model, name)
+    if len(entry) == 0 { return tensor_zeros(numel) }
+    let offset_in_data = entry[3]
+    let abs_offset = model.data_origin + offset_in_data
+    let raw = read_file_bytes(model.path, abs_offset, numel * 4)
+    // Decode f32 LE bytes to Tensor using pure byte math
+    // Each f32 = 4 bytes LE
+    let mut out = []
+    let mut i = 0
+    while i < numel {
+        let off = i * 4
+        let b0 = to_int(raw[off])
+        let b1 = to_int(raw[off + 1])
+        let b2 = to_int(raw[off + 2])
+        let b3 = to_int(raw[off + 3])
+        let bits = b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
+        let sign = (bits / 2147483648) % 2
+        let exp_f = (bits / 8388608) % 256
+        let mant = bits % 8388608
+        let mut v = 0.0
+        if exp_f != 0 {
+            if exp_f != 255 {
+                let m = 1.0 + to_float(mant) / 8388608.0
+                v = m * pow(2.0, to_float(exp_f - 127))
+                if sign == 1 { v = 0.0 - v }
+            }
+        }
+        out = out + [v]
+        i = i + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  RMSNorm: x * w / sqrt(mean(x^2) + eps)
+//  x: array [dim], w: array [dim]
+//  Returns: array [dim]
+// ===================================================================
+@hot
+fn llama_rms_norm(x, w, dim, eps) {
+    let mut ss = 0.0
+    let mut i = 0
+    while i < dim {
+        let v = x[i]
+        ss = ss + v * v
+        i = i + 1
+    }
+    let rms = sqrt(ss / to_float(dim) + eps)
+    let inv_rms = 1.0 / rms
+    let mut out = []
+    i = 0
+    while i < dim {
+        out = out + [x[i] * inv_rms * w[i]]
+        i = i + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  RoPE: Rotary Position Embedding
+//  Rotates pairs (vec[2i], vec[2i+1]) by angle = pos * theta_i
+//  vec: array [head_dim], returns array [head_dim]
+// ===================================================================
+@hot
+fn apply_rope_vec(vec, pos, head_dim, base) {
+    let half = head_dim / 2
+    let mut out = []
+    let mut p = 0
+    while p < half {
+        let freq = 1.0 / pow(base, 2.0 * to_float(p) / to_float(head_dim))
+        let angle = to_float(pos) * freq
+        let cos_a = cos(angle)
+        let sin_a = sin(angle)
+        let x0 = vec[2 * p]
+        let x1 = vec[2 * p + 1]
+        out = out + [x0 * cos_a - x1 * sin_a]
+        out = out + [x0 * sin_a + x1 * cos_a]
+        p = p + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  Softmax over array of length n
+// ===================================================================
+@pure
+fn vec_softmax(scores, n) {
+    let mut mx = scores[0]
+    let mut i = 1
+    while i < n {
+        if scores[i] > mx { mx = scores[i] }
+        i = i + 1
+    }
+    let mut out = []
+    let mut sum_e = 0.0
+    i = 0
+    while i < n {
+        let e = exp(scores[i] - mx)
+        out = out + [e]
+        sum_e = sum_e + e
+        i = i + 1
+    }
+    let inv = 1.0 / sum_e
+    let mut result = []
+    i = 0
+    while i < n {
+        result = result + [out[i] * inv]
+        i = i + 1
+    }
+    return result
+}
+
+// ===================================================================
+//  SiLU activation: x * sigmoid(x)
+// ===================================================================
+@pure
+fn silu_scalar(x) {
+    return x / (1.0 + exp(0.0 - x))
+}
+
+// ===================================================================
+//  Convert Tensor to mutable array (for accumulation)
+// ===================================================================
+fn tensor_to_array(t, n) {
+    let mut arr = []
+    let mut i = 0
+    while i < n {
+        arr = arr + [t[i]]
+        i = i + 1
+    }
+    return arr
+}
+
+// ===================================================================
+//  Single Transformer Layer (decode: 1 token at position `pos`)
+//
+//  x:         input activation array [dim]
+//  pos:       current sequence position (for RoPE and KV cache write)
+//  kv_k:      flat kv-cache keys array [max_seq * n_kv_heads * head_dim]
+//  kv_v:      flat kv-cache values array [max_seq * n_kv_heads * head_dim]
+//
+//  Returns: [output_x, kv_k, kv_v]  (kv arrays are mutated in-place)
+// ===================================================================
+@hot
+fn transformer_layer(model, layer_idx, x, pos, kv_k, kv_v) {
+    let cfg = model.config
+    let dim = cfg.dim
+    let n_heads = cfg.n_heads
+    let n_kv_heads = cfg.n_kv_heads
+    let head_dim = cfg.head_dim
+    let hidden_dim = cfg.hidden_dim
+    let eps = cfg.rms_eps
+    let rope_base = cfg.rope_base
+    let gqa_ratio = n_heads / n_kv_heads
+
+    let li = str(layer_idx)
+
+    // -- Load norm weights --
+    let w_attn_norm = load_f32_vec(model, "blk." + li + ".attn_norm.weight", dim)
+
+    // -- RMSNorm (attention) --
+    let xn = llama_rms_norm(x, w_attn_norm, dim, eps)
+
+    // -- QKV projection via Q4_0 matvec (Tensor result, read-only) --
+    let wq_bytes = load_q4_bytes(model, "blk." + li + ".attn_q.weight", dim, dim)
+    let q_full = q4_0_matvec(wq_bytes, xn, dim, dim)
+
+    let kv_dim = n_kv_heads * head_dim
+    let wk_bytes = load_q4_bytes(model, "blk." + li + ".attn_k.weight", kv_dim, dim)
+    let k_vec = q4_0_matvec(wk_bytes, xn, kv_dim, dim)
+
+    let wv_bytes = load_q4_bytes(model, "blk." + li + ".attn_v.weight", kv_dim, dim)
+    let v_vec = q4_0_matvec(wv_bytes, xn, kv_dim, dim)
+
+    // -- Apply RoPE to Q (per head) --
+    let mut q_rope = []
+    let mut h = 0
+    while h < n_heads {
+        let base_q = h * head_dim
+        let mut q_head = []
+        let mut d = 0
+        while d < head_dim {
+            q_head = q_head + [q_full[base_q + d]]
+            d = d + 1
+        }
+        let q_rot = apply_rope_vec(q_head, pos, head_dim, rope_base)
+        q_rope = q_rope + q_rot
+        h = h + 1
+    }
+
+    // -- Apply RoPE to K (per kv_head) --
+    let mut k_rope = []
+    h = 0
+    while h < n_kv_heads {
+        let base_k = h * head_dim
+        let mut k_head = []
+        let mut d = 0
+        while d < head_dim {
+            k_head = k_head + [k_vec[base_k + d]]
+            d = d + 1
+        }
+        let k_rot = apply_rope_vec(k_head, pos, head_dim, rope_base)
+        k_rope = k_rope + k_rot
+        h = h + 1
+    }
+
+    // -- Write K,V to cache at position `pos` --
+    // Cache layout: flat [max_seq * n_kv_heads * head_dim]
+    let slab = n_kv_heads * head_dim
+    let cache_base = pos * slab
+    let mut i = 0
+    while i < slab {
+        kv_k[cache_base + i] = k_rope[i]
+        kv_v[cache_base + i] = v_vec[i]
+        i = i + 1
+    }
+
+    // -- Grouped Query Attention --
+    let scale = 1.0 / sqrt(to_float(head_dim))
+    let ctx_len = pos + 1
+    let mut attn_out = []
+
+    h = 0
+    while h < n_heads {
+        let kv_h = h / gqa_ratio
+        let q_base = h * head_dim
+
+        // Compute scores: Q[h] . K[kv_h, t] for t in 0..ctx_len
+        let mut scores = []
+        let mut t = 0
+        while t < ctx_len {
+            let k_base = t * slab + kv_h * head_dim
+            let mut dot = 0.0
+            let mut d = 0
+            while d < head_dim {
+                dot = dot + q_rope[q_base + d] * kv_k[k_base + d]
+                d = d + 1
+            }
+            scores = scores + [dot * scale]
+            t = t + 1
+        }
+
+        // Softmax
+        let attn_weights = vec_softmax(scores, ctx_len)
+
+        // Weighted sum of values
+        let mut d = 0
+        while d < head_dim {
+            let mut acc = 0.0
+            t = 0
+            while t < ctx_len {
+                let v_base = t * slab + kv_h * head_dim
+                acc = acc + attn_weights[t] * kv_v[v_base + d]
+                t = t + 1
+            }
+            attn_out = attn_out + [acc]
+            d = d + 1
+        }
+        h = h + 1
+    }
+
+    // -- Output projection --
+    let wo_bytes = load_q4_bytes(model, "blk." + li + ".attn_output.weight", dim, dim)
+    let attn_proj = q4_0_matvec(wo_bytes, attn_out, dim, dim)
+
+    // -- Residual connection --
+    let mut x2 = []
+    i = 0
+    while i < dim {
+        x2 = x2 + [x[i] + attn_proj[i]]
+        i = i + 1
+    }
+
+    // -- FFN: RMSNorm -> gate(SwiGLU) -> down --
+    let w_ffn_norm = load_f32_vec(model, "blk." + li + ".ffn_norm.weight", dim)
+    let xn2 = llama_rms_norm(x2, w_ffn_norm, dim, eps)
+
+    // gate and up projections
+    let wg_bytes = load_q4_bytes(model, "blk." + li + ".ffn_gate.weight", hidden_dim, dim)
+    let gate = q4_0_matvec(wg_bytes, xn2, hidden_dim, dim)
+
+    let wu_bytes = load_q4_bytes(model, "blk." + li + ".ffn_up.weight", hidden_dim, dim)
+    let up = q4_0_matvec(wu_bytes, xn2, hidden_dim, dim)
+
+    // SwiGLU: silu(gate) * up
+    let mut ffn_hidden = []
+    i = 0
+    while i < hidden_dim {
+        ffn_hidden = ffn_hidden + [silu_scalar(gate[i]) * up[i]]
+        i = i + 1
+    }
+
+    // down projection
+    let wd_bytes = load_q4_bytes(model, "blk." + li + ".ffn_down.weight", dim, hidden_dim)
+    let ffn_out = q4_0_matvec(wd_bytes, ffn_hidden, dim, hidden_dim)
+
+    // -- Residual connection --
+    let mut out = []
+    i = 0
+    while i < dim {
+        out = out + [x2[i] + ffn_out[i]]
+        i = i + 1
+    }
+
+    return [out, kv_k, kv_v]
+}
+
+// ===================================================================
+//  Full forward pass: all layers + final norm + logits
+//  x: input embedding array [dim]
+//  pos: sequence position
+//  kv_keys/kv_vals: array of per-layer kv caches (each is flat array)
+//  Returns: [logits_tensor, kv_keys, kv_vals]
+// ===================================================================
+@hot
+fn transformer_forward(model, x, pos, kv_keys, kv_vals) {
+    let cfg = model.config
+    let n_layers = cfg.n_layers
+    let dim = cfg.dim
+    let vocab_size = cfg.vocab_size
+
+    let mut h = x
+    let mut layer = 0
+    while layer < n_layers {
+        let result = transformer_layer(model, layer, h, pos, kv_keys[layer], kv_vals[layer])
+        h = result[0]
+        kv_keys[layer] = result[1]
+        kv_vals[layer] = result[2]
+        layer = layer + 1
+    }
+
+    // Final RMSNorm
+    let w_final_norm = load_f32_vec(model, "output_norm.weight", dim)
+    let h_norm = llama_rms_norm(h, w_final_norm, dim, cfg.rms_eps)
+
+    // Output projection (vocab_size x dim) -> logits (Tensor)
+    let wo_bytes = load_q4_bytes(model, "output.weight", vocab_size, dim)
+    let logits = q4_0_matvec(wo_bytes, h_norm, vocab_size, dim)
+
+    return [logits, kv_keys, kv_vals]
+}
+
+// ===================================================================
+//  Load embedding for a single token
+//  Looks up one row from the embedding matrix.
+//  F32 embeddings: read dim*4 bytes at row offset.
+//  Q4_0 embeddings: read and dequantize one row.
+// ===================================================================
+fn load_embedding(model, token_id) {
+    let cfg = model.config
+    let dim = cfg.dim
+    let entry = find_tensor(model, "token_embd.weight")
+    if len(entry) == 0 { return zeros(dim) }
+    let ggml_type = entry[2]
+    let offset_in_data = entry[3]
+    let abs_offset = model.data_origin + offset_in_data
+
+    if ggml_type == 0 {
+        // F32: each row = dim * 4 bytes
+        let row_offset = abs_offset + token_id * dim * 4
+        let raw = read_file_bytes(model.path, row_offset, dim * 4)
+        let mut out = []
+        let mut i = 0
+        while i < dim {
+            let off = i * 4
+            let b0 = to_int(raw[off])
+            let b1 = to_int(raw[off + 1])
+            let b2 = to_int(raw[off + 2])
+            let b3 = to_int(raw[off + 3])
+            let bits = b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
+            let sign = (bits / 2147483648) % 2
+            let exp_f = (bits / 8388608) % 256
+            let mant = bits % 8388608
+            let mut v = 0.0
+            if exp_f != 0 {
+                if exp_f != 255 {
+                    let m = 1.0 + to_float(mant) / 8388608.0
+                    v = m * pow(2.0, to_float(exp_f - 127))
+                    if sign == 1 { v = 0.0 - v }
+                }
+            }
+            out = out + [v]
+            i = i + 1
+        }
+        return out
+    }
+
+    // Q4_0: each row = (dim/32) * 18 bytes
+    let blocks_per_row = dim / 32
+    let bytes_per_row = blocks_per_row * 18
+    let row_offset = abs_offset + token_id * bytes_per_row
+    let raw = read_file_bytes(model.path, row_offset, bytes_per_row)
+    let t = q4_0_dequantize(raw, dim)
+    return tensor_to_array(t, dim)
+}
+
+// ===================================================================
+//  Initialize model from GGUF file
+// ===================================================================
+fn llama_load(path) {
+    println("[transformer] Loading GGUF: " + path)
+    let gguf = mmap_gguf(path)
+    let metadata = gguf[0]
+    let tensor_info = gguf[1]
+    let data_origin = gguf[2]
+    let gguf_path = gguf[3]
+
+    // Extract config from metadata
+    let mut dim = 4096
+    let mut hidden_dim = 11008
+    let mut n_layers = 32
+    let mut n_heads = 32
+    let mut n_kv_heads = 32
+    let mut vocab_size = 32000
+    let mut max_seq_len = 2048
+    let mut rope_base = 10000.0
+    let mut rms_eps = 0.00001
+
+    let n_meta = len(metadata)
+    let mut i = 0
+    while i < n_meta {
+        let kv = metadata[i]
+        let key = kv[0]
+        let val = kv[1]
+        if key == "llama.embedding_length" { dim = val }
+        if key == "llama.feed_forward_length" { hidden_dim = val }
+        if key == "llama.block_count" { n_layers = val }
+        if key == "llama.attention.head_count" { n_heads = val }
+        if key == "llama.attention.head_count_kv" { n_kv_heads = val }
+        if key == "llama.context_length" { max_seq_len = val }
+        if key == "llama.rope.freq_base" { rope_base = to_float(val) }
+        if key == "llama.attention.layer_norm_rms_epsilon" { rms_eps = to_float(val) }
+        i = i + 1
+    }
+
+    // Find vocab size from token_embd shape
+    let emb_entry = find_tensor_from_info(tensor_info, "token_embd.weight")
+    if len(emb_entry) > 0 {
+        let shape = emb_entry[1]
+        if len(shape) >= 2 { vocab_size = shape[1] }
+        if len(shape) >= 1 {
+            if vocab_size == 32000 { vocab_size = shape[0] }
+        }
+    }
+
+    let head_dim = dim / n_heads
+
+    let cfg = LlamaConfig {
+        dim: dim,
+        hidden_dim: hidden_dim,
+        n_layers: n_layers,
+        n_heads: n_heads,
+        n_kv_heads: n_kv_heads,
+        vocab_size: vocab_size,
+        max_seq_len: max_seq_len,
+        head_dim: head_dim,
+        rope_base: rope_base,
+        rms_eps: rms_eps
+    }
+
+    println("[transformer] Config: dim=" + str(dim) + " layers=" + str(n_layers) + " heads=" + str(n_heads) + " kv_heads=" + str(n_kv_heads) + " vocab=" + str(vocab_size) + " hidden=" + str(hidden_dim))
+    println("[transformer] Tensors: " + str(len(tensor_info)) + " data_origin=" + str(data_origin))
+
+    return LlamaModel {
+        config: cfg,
+        path: gguf_path,
+        data_origin: data_origin,
+        tensor_info: tensor_info,
+        metadata: metadata
+    }
+}
+
+// Helper to search tensor_info array directly (before model is constructed)
+fn find_tensor_from_info(tensor_info, name) {
+    let n = len(tensor_info)
+    let mut i = 0
+    while i < n {
+        let entry = tensor_info[i]
+        if entry[0] == name { return entry }
+        i = i + 1
+    }
+    return []
+}
+
+// ===================================================================
+//  Initialize KV-cache arrays (one per layer)
+//  Returns [kv_keys_array, kv_vals_array] where each element is
+//  a mutable array of length max_seq * n_kv_heads * head_dim
+// ===================================================================
+fn init_kv_cache(cfg) {
+    let slab = cfg.n_kv_heads * cfg.head_dim
+    let cache_size = cfg.max_seq_len * slab
+    let mut kv_keys = []
+    let mut kv_vals = []
+    let mut l = 0
+    while l < cfg.n_layers {
+        kv_keys = kv_keys + [zeros(cache_size)]
+        kv_vals = kv_vals + [zeros(cache_size)]
+        l = l + 1
+    }
+    return [kv_keys, kv_vals]
+}

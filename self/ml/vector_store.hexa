@@ -1,0 +1,470 @@
+// ===================================================================
+//  self/ml/vector_store.hexa — Simple Vector Database (pure Hexa)
+//
+//  In-memory vector store with brute-force exact search.
+//  Optional IVF (Inverted File) index for larger datasets.
+//
+//  Public API:
+//    create_store(dim)                          → store
+//    store_add(store, id, vector, metadata)     → updated store
+//    store_search(store, query_vector, top_k)   → array of [id, score, metadata]
+//    store_size(store)                          → int
+//    store_get(store, id)                       → [vector, metadata] or nil
+//
+//  IVF API:
+//    create_ivf_store(dim, n_clusters)          → ivf_store
+//    ivf_add(store, id, vector, metadata)       → updated store
+//    ivf_build_index(store)                     → store with index built
+//    ivf_search(store, query_vector, top_k, n_probe) → results
+// ===================================================================
+
+// ===================================================================
+//  Brute-force vector store
+//
+//  Stores: ids[], vectors[], metadatas[] (parallel arrays)
+//  Search: linear scan, compute cosine sim for each, return top_k
+// ===================================================================
+
+struct VectorStore {
+    dim: int,
+    ids: array,
+    vectors: array,
+    metadatas: array
+}
+
+fn create_store(dim) {
+    return VectorStore {
+        dim: dim,
+        ids: [],
+        vectors: [],
+        metadatas: []
+    }
+}
+
+fn store_add(store, id, vector, metadata) {
+    return VectorStore {
+        dim: store.dim,
+        ids: store.ids + [id],
+        vectors: store.vectors + [vector],
+        metadatas: store.metadatas + [metadata]
+    }
+}
+
+fn store_size(store) {
+    return len(store.ids)
+}
+
+fn store_get(store, id) {
+    let n = len(store.ids)
+    let mut i = 0
+    while i < n {
+        if store.ids[i] == id {
+            return [store.vectors[i], store.metadatas[i]]
+        }
+        i = i + 1
+    }
+    return []
+}
+
+// ===================================================================
+//  Cosine similarity (local, avoids circular dependency)
+// ===================================================================
+fn vs_dot(a, b) {
+    let n = len(a)
+    let mut sum = 0.0
+    let mut i = 0
+    while i < n {
+        sum = sum + a[i] * b[i]
+        i = i + 1
+    }
+    return sum
+}
+
+fn vs_norm(v) {
+    let mut sum = 0.0
+    let n = len(v)
+    let mut i = 0
+    while i < n {
+        sum = sum + v[i] * v[i]
+        i = i + 1
+    }
+    return sqrt(sum)
+}
+
+fn vs_cosine(a, b) {
+    let d = vs_dot(a, b)
+    let na = vs_norm(a)
+    let nb = vs_norm(b)
+    let denom = na * nb
+    if denom < 0.000001 { return 0.0 }
+    return d / denom
+}
+
+// ===================================================================
+//  Brute-force search: compute similarity for all docs, return top_k
+//  Returns array of [id, score, metadata], sorted by score descending
+// ===================================================================
+fn store_search(store, query_vector, top_k) {
+    let n = len(store.ids)
+    if n == 0 { return [] }
+
+    // Compute all similarities
+    let mut scores = []
+    let mut i = 0
+    while i < n {
+        let sim = vs_cosine(query_vector, store.vectors[i])
+        scores = scores + [[store.ids[i], sim, store.metadatas[i]]]
+        i = i + 1
+    }
+
+    // Selection sort for top_k (efficient for small top_k)
+    let mut results = []
+    let mut selected = 0
+    while selected < top_k {
+        if selected >= n { return results }
+        let mut best_idx = -1
+        let mut best_score = -2.0
+        let mut j = 0
+        while j < n {
+            // Check if already selected
+            let mut already = false
+            let mut s = 0
+            while s < len(results) {
+                if results[s][0] == scores[j][0] { already = true }
+                s = s + 1
+            }
+            if already == false {
+                if scores[j][1] > best_score {
+                    best_score = scores[j][1]
+                    best_idx = j
+                }
+            }
+            j = j + 1
+        }
+        if best_idx >= 0 {
+            results = results + [scores[best_idx]]
+        }
+        selected = selected + 1
+    }
+    return results
+}
+
+// ===================================================================
+//  IVF (Inverted File) Index for larger datasets
+//
+//  Idea: partition vectors into n_clusters via k-means,
+//  then search only the closest n_probe clusters.
+// ===================================================================
+
+struct IVFStore {
+    dim: int,
+    n_clusters: int,
+    ids: array,
+    vectors: array,
+    metadatas: array,
+    centroids: array,
+    assignments: array,
+    built: bool
+}
+
+fn create_ivf_store(dim, n_clusters) {
+    return IVFStore {
+        dim: dim,
+        n_clusters: n_clusters,
+        ids: [],
+        vectors: [],
+        metadatas: [],
+        centroids: [],
+        assignments: [],
+        built: false
+    }
+}
+
+fn ivf_add(store, id, vector, metadata) {
+    return IVFStore {
+        dim: store.dim,
+        n_clusters: store.n_clusters,
+        ids: store.ids + [id],
+        vectors: store.vectors + [vector],
+        metadatas: store.metadatas + [metadata],
+        centroids: store.centroids,
+        assignments: store.assignments,
+        built: false
+    }
+}
+
+// ===================================================================
+//  Simple k-means clustering (Lloyd's algorithm)
+//  Returns array of centroid vectors
+// ===================================================================
+fn ivf_kmeans(vectors, dim, n_clusters, max_iter) {
+    let n = len(vectors)
+    if n == 0 { return [] }
+    if n <= n_clusters {
+        // Fewer vectors than clusters: each vector is its own centroid
+        let mut centroids = []
+        let mut i = 0
+        while i < n {
+            centroids = centroids + [vectors[i]]
+            i = i + 1
+        }
+        return centroids
+    }
+
+    // Initialize centroids: pick evenly spaced vectors
+    let mut centroids = []
+    let mut c = 0
+    while c < n_clusters {
+        let idx = (c * n) / n_clusters
+        centroids = centroids + [vectors[idx]]
+        c = c + 1
+    }
+
+    // Lloyd's iterations
+    let mut iter = 0
+    while iter < max_iter {
+        // Assign each vector to nearest centroid
+        let mut cluster_sums = []
+        let mut cluster_counts = []
+        let mut ci = 0
+        while ci < n_clusters {
+            let mut z = []
+            let mut d = 0
+            while d < dim {
+                z = z + [0.0]
+                d = d + 1
+            }
+            cluster_sums = cluster_sums + [z]
+            cluster_counts = cluster_counts + [0]
+            ci = ci + 1
+        }
+
+        let mut i = 0
+        while i < n {
+            // Find nearest centroid
+            let mut best_c = 0
+            let mut best_sim = -2.0
+            let mut j = 0
+            while j < n_clusters {
+                let sim = vs_cosine(vectors[i], centroids[j])
+                if sim > best_sim {
+                    best_sim = sim
+                    best_c = j
+                }
+                j = j + 1
+            }
+
+            // Accumulate
+            let old_sum = cluster_sums[best_c]
+            let mut new_sum = []
+            let mut d = 0
+            while d < dim {
+                new_sum = new_sum + [old_sum[d] + vectors[i][d]]
+                d = d + 1
+            }
+
+            // Rebuild cluster_sums with update
+            let mut new_sums = []
+            let mut k = 0
+            while k < n_clusters {
+                if k == best_c {
+                    new_sums = new_sums + [new_sum]
+                } else {
+                    new_sums = new_sums + [cluster_sums[k]]
+                }
+                k = k + 1
+            }
+            cluster_sums = new_sums
+
+            let mut new_counts = []
+            k = 0
+            while k < n_clusters {
+                if k == best_c {
+                    new_counts = new_counts + [cluster_counts[k] + 1]
+                } else {
+                    new_counts = new_counts + [cluster_counts[k]]
+                }
+                k = k + 1
+            }
+            cluster_counts = new_counts
+
+            i = i + 1
+        }
+
+        // Update centroids
+        let mut new_centroids = []
+        ci = 0
+        while ci < n_clusters {
+            if cluster_counts[ci] > 0 {
+                let inv = 1.0 / to_float(cluster_counts[ci])
+                let mut cv = []
+                let mut d = 0
+                while d < dim {
+                    cv = cv + [cluster_sums[ci][d] * inv]
+                    d = d + 1
+                }
+                new_centroids = new_centroids + [cv]
+            } else {
+                new_centroids = new_centroids + [centroids[ci]]
+            }
+            ci = ci + 1
+        }
+        centroids = new_centroids
+
+        iter = iter + 1
+    }
+
+    return centroids
+}
+
+// ===================================================================
+//  Build IVF index: run k-means, assign each vector to a cluster
+// ===================================================================
+fn ivf_build_index(store) {
+    let n = len(store.ids)
+    let dim = store.dim
+    let nc = store.n_clusters
+    let max_iter = 10
+
+    let centroids = ivf_kmeans(store.vectors, dim, nc, max_iter)
+    let actual_nc = len(centroids)
+
+    // Assign each vector to nearest centroid
+    let mut assignments = []
+    let mut i = 0
+    while i < n {
+        let mut best_c = 0
+        let mut best_sim = -2.0
+        let mut j = 0
+        while j < actual_nc {
+            let sim = vs_cosine(store.vectors[i], centroids[j])
+            if sim > best_sim {
+                best_sim = sim
+                best_c = j
+            }
+            j = j + 1
+        }
+        assignments = assignments + [best_c]
+        i = i + 1
+    }
+
+    return IVFStore {
+        dim: dim,
+        n_clusters: actual_nc,
+        ids: store.ids,
+        vectors: store.vectors,
+        metadatas: store.metadatas,
+        centroids: centroids,
+        assignments: assignments,
+        built: true
+    }
+}
+
+// ===================================================================
+//  IVF search: find top n_probe clusters, then brute-force within
+// ===================================================================
+fn ivf_search(store, query_vector, top_k, n_probe) {
+    if store.built == false {
+        // Fallback to brute-force
+        let flat = VectorStore {
+            dim: store.dim,
+            ids: store.ids,
+            vectors: store.vectors,
+            metadatas: store.metadatas
+        }
+        return store_search(flat, query_vector, top_k)
+    }
+
+    let nc = len(store.centroids)
+    let actual_probe = n_probe
+    // Use min of n_probe and nc
+    let mut probe_limit = actual_probe
+    if probe_limit > nc { probe_limit = nc }
+
+    // Find top n_probe closest centroids
+    let mut centroid_scores = []
+    let mut ci = 0
+    while ci < nc {
+        let sim = vs_cosine(query_vector, store.centroids[ci])
+        centroid_scores = centroid_scores + [[ci, sim]]
+        ci = ci + 1
+    }
+
+    // Select top probe_limit centroids by score
+    let mut probe_clusters = []
+    let mut selected = 0
+    while selected < probe_limit {
+        let mut best_idx = -1
+        let mut best_score = -2.0
+        let mut j = 0
+        while j < nc {
+            let mut already = false
+            let mut s = 0
+            while s < len(probe_clusters) {
+                if probe_clusters[s] == centroid_scores[j][0] { already = true }
+                s = s + 1
+            }
+            if already == false {
+                if centroid_scores[j][1] > best_score {
+                    best_score = centroid_scores[j][1]
+                    best_idx = j
+                }
+            }
+            j = j + 1
+        }
+        if best_idx >= 0 {
+            probe_clusters = probe_clusters + [centroid_scores[best_idx][0]]
+        }
+        selected = selected + 1
+    }
+
+    // Collect candidates from probe clusters
+    let n = len(store.ids)
+    let mut candidates = []
+    let mut i = 0
+    while i < n {
+        let cluster = store.assignments[i]
+        let mut in_probe = false
+        let mut p = 0
+        while p < len(probe_clusters) {
+            if probe_clusters[p] == cluster { in_probe = true }
+            p = p + 1
+        }
+        if in_probe {
+            let sim = vs_cosine(query_vector, store.vectors[i])
+            candidates = candidates + [[store.ids[i], sim, store.metadatas[i]]]
+        }
+        i = i + 1
+    }
+
+    // Sort and return top_k
+    let mut results = []
+    let nc2 = len(candidates)
+    let mut sel = 0
+    while sel < top_k {
+        if sel >= nc2 { return results }
+        let mut best_idx = -1
+        let mut best_score = -2.0
+        let mut j = 0
+        while j < nc2 {
+            let mut already = false
+            let mut s = 0
+            while s < len(results) {
+                if results[s][0] == candidates[j][0] { already = true }
+                s = s + 1
+            }
+            if already == false {
+                if candidates[j][1] > best_score {
+                    best_score = candidates[j][1]
+                    best_idx = j
+                }
+            }
+            j = j + 1
+        }
+        if best_idx >= 0 {
+            results = results + [candidates[best_idx]]
+        }
+        sel = sel + 1
+    }
+    return results
+}
