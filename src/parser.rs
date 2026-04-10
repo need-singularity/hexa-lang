@@ -1509,14 +1509,21 @@ impl Parser {
             Token::Ident(ref s) if s == "in" => {}
             other => return Err(self.error(format!("expected 'in' after for variable, got {:?}", other))),
         }
+        // G5: disable struct literal in iter-expression position so that the `{`
+        // following the iter expr is parsed as the for-body, not a struct init.
+        let saved = self.no_struct_init; self.no_struct_init = true;
         let iter_expr = self.parse_expr()?;
+        self.no_struct_init = saved;
         let body = self.parse_block()?;
         Ok(Stmt::For(var, iter_expr, body))
     }
 
     fn parse_while_stmt(&mut self) -> Result<Stmt, HexaError> {
         self.advance(); // consume 'while'
-        self.no_struct_init = true; let cond = self.parse_expr()?; self.no_struct_init = false;
+        // G5: save/restore to keep correct behaviour under nesting.
+        let saved = self.no_struct_init; self.no_struct_init = true;
+        let cond = self.parse_expr()?;
+        self.no_struct_init = saved;
         let body = self.parse_block()?;
         Ok(Stmt::While(cond, body))
     }
@@ -1529,7 +1536,12 @@ impl Parser {
 
     fn parse_if_expr(&mut self) -> Result<Expr, HexaError> {
         self.advance(); // consume 'if'
-        self.no_struct_init = true; let cond = self.parse_expr()?; self.no_struct_init = false;
+        // G5: disable struct literal in the condition position so that
+        // `if Foo { ... }` parses as `if Foo` + body, not `if (Foo{...})`.
+        // Use save/restore for correct behaviour under nesting.
+        let saved = self.no_struct_init; self.no_struct_init = true;
+        let cond = self.parse_expr()?;
+        self.no_struct_init = saved;
         let then_block = self.parse_block()?;
         // Save position to allow backtracking if newlines precede else
         let saved_pos = self.pos;
@@ -1553,16 +1565,27 @@ impl Parser {
 
     fn parse_match_expr(&mut self) -> Result<Expr, HexaError> {
         self.advance(); // consume 'match'
+        // G5: disable struct literal in scrutinee position so `match Foo { ... }`
+        // treats the `{` as the arms brace, not a struct init.
+        let saved = self.no_struct_init; self.no_struct_init = true;
         let scrutinee = self.parse_expr()?;
+        self.no_struct_init = saved;
         self.expect(&Token::LBrace)?;
         self.skip_newlines();
+        // G5: inside match arms body we are past the `{`, so struct
+        // literals are unambiguous again for arm bodies and guards.
+        let g5_arms_saved = self.no_struct_init; self.no_struct_init = false;
         let mut arms = Vec::new();
         while !matches!(self.peek(), Token::RBrace | Token::Eof) {
             let pattern = self.parse_match_pattern()?;
             // Optional guard: `if cond`
             let guard = if matches!(self.peek(), Token::If) {
                 self.advance(); // consume 'if'
-                Some(self.parse_expr()?)
+                // Guard is `if <expr>` — same restriction as a normal if head.
+                let gsaved = self.no_struct_init; self.no_struct_init = true;
+                let g = self.parse_expr()?;
+                self.no_struct_init = gsaved;
+                Some(g)
             } else {
                 None
             };
@@ -1579,6 +1602,7 @@ impl Parser {
             }
             self.skip_newlines();
         }
+        self.no_struct_init = g5_arms_saved;
         self.expect(&Token::RBrace)?;
         Ok(Expr::Match(Box::new(scrutinee), arms))
     }
@@ -1781,7 +1805,10 @@ impl Parser {
             match self.peek() {
                 Token::LParen => {
                     self.advance();
+                    // G5: inside call args, struct literals are unambiguous.
+                    let g5_saved = self.no_struct_init; self.no_struct_init = false;
                     let args = self.parse_args()?;
+                    self.no_struct_init = g5_saved;
                     self.expect(&Token::RParen)?;
                     expr = Expr::Call(Box::new(expr), args);
                 }
@@ -1792,7 +1819,10 @@ impl Parser {
                 }
                 Token::LBracket => {
                     self.advance();
+                    // G5: inside index, struct literals are unambiguous.
+                    let g5_saved = self.no_struct_init; self.no_struct_init = false;
                     let index = self.parse_expr()?;
+                    self.no_struct_init = g5_saved;
                     self.expect(&Token::RBracket)?;
                     expr = Expr::Index(Box::new(expr), Box::new(index));
                 }
@@ -1892,6 +1922,9 @@ impl Parser {
                 else if !self.no_struct_init && matches!(self.peek(), Token::LBrace) && name.chars().next().map_or(false, |c| c.is_uppercase()) {
                     self.advance(); // consume {
                     self.skip_newlines();
+                    // G5: inside a struct literal body, we are past the `{`, so
+                    // nested struct literals are unambiguous again.
+                    let g5_saved = self.no_struct_init; self.no_struct_init = false;
                     let mut fields = Vec::new();
                     while !matches!(self.peek(), Token::RBrace | Token::Eof) {
                         let field_name = self.expect_ident()?;
@@ -1903,6 +1936,7 @@ impl Parser {
                         }
                         self.skip_newlines();
                     }
+                    self.no_struct_init = g5_saved;
                     self.expect(&Token::RBrace)?;
                     Ok(Expr::StructInit(name, fields))
                 } else {
@@ -1911,9 +1945,12 @@ impl Parser {
             }
             Token::LParen => {
                 self.advance();
+                // G5: inside parentheses, struct literals are unambiguously allowed
+                // (they cannot be confused with a control-flow body). Save/restore.
+                let saved_nsi = self.no_struct_init; self.no_struct_init = false;
                 let expr = self.parse_expr()?;
                 // Tuple or grouped
-                if matches!(self.peek(), Token::Comma) {
+                let result = if matches!(self.peek(), Token::Comma) {
                     let mut items = vec![expr];
                     while matches!(self.peek(), Token::Comma) {
                         self.advance();
@@ -1923,15 +1960,19 @@ impl Parser {
                         items.push(self.parse_expr()?);
                     }
                     self.expect(&Token::RParen)?;
-                    Ok(Expr::Tuple(items))
+                    Expr::Tuple(items)
                 } else {
                     self.expect(&Token::RParen)?;
-                    Ok(expr) // grouped expression
-                }
+                    expr // grouped expression
+                };
+                self.no_struct_init = saved_nsi;
+                Ok(result)
             }
             Token::LBracket => {
                 self.advance();
                 self.skip_newlines();
+                // G5: inside brackets, struct literals are unambiguously allowed.
+                let saved_nsi = self.no_struct_init; self.no_struct_init = false;
                 let mut items = Vec::new();
                 while !matches!(self.peek(), Token::RBracket | Token::Eof) {
                     items.push(self.parse_expr()?);
@@ -1942,6 +1983,7 @@ impl Parser {
                     }
                 }
                 self.expect(&Token::RBracket)?;
+                self.no_struct_init = saved_nsi;
                 Ok(Expr::Array(items))
             }
             Token::Dyn => {
@@ -2720,6 +2762,65 @@ mod tests {
         assert!(matches!(&stmts[0], Stmt::Expr(Expr::Range(_, _, false))));
         let stmts2 = parse_source("1..=10");
         assert!(matches!(&stmts2[0], Stmt::Expr(Expr::Range(_, _, true))));
+    }
+
+    // ── G5: if/while/for/match condition struct-literal ambiguity ────
+    #[test]
+    fn test_g5_if_with_following_struct_literal_block() {
+        // The struct literal is INSIDE the then-block, not part of the condition.
+        let stmts = parse_source("if x > 0 { Point { x: 1, y: 2 } }");
+        if let Stmt::Expr(Expr::If(cond, then_block, _)) = &stmts[0] {
+            // Condition must be `x > 0`, not a struct init.
+            assert!(matches!(cond.as_ref(), Expr::Binary(_, BinOp::Gt, _)), "cond was {:?}", cond);
+            // Then-block must contain a StructInit expression.
+            assert_eq!(then_block.len(), 1);
+            assert!(matches!(&then_block[0], Stmt::Expr(Expr::StructInit(n, _)) if n == "Point"));
+        } else {
+            panic!("expected If expression, got {:?}", &stmts[0]);
+        }
+    }
+
+    #[test]
+    fn test_g5_if_no_struct_literal_in_cond() {
+        // `if Y { ... }` — Y is an uppercase ident; must be parsed as the condition
+        // (plain ident), and `{ ... }` must be the then-block.
+        let stmts = parse_source("if Y {\n  1\n}");
+        if let Stmt::Expr(Expr::If(cond, then_block, _)) = &stmts[0] {
+            assert!(matches!(cond.as_ref(), Expr::Ident(n) if n == "Y"),
+                "expected Ident(Y) as cond, got {:?}", cond);
+            assert_eq!(then_block.len(), 1);
+        } else {
+            panic!("expected If expression, got {:?}", &stmts[0]);
+        }
+    }
+
+    #[test]
+    fn test_g5_struct_literal_allowed_in_parens_cond() {
+        // Parenthesized cond re-enables struct literals.
+        let stmts = parse_source("if (Point { x: 1, y: 2 } == p) { 1 }");
+        if let Stmt::Expr(Expr::If(cond, _, _)) = &stmts[0] {
+            // cond should be a binary eq whose LHS is a StructInit.
+            if let Expr::Binary(lhs, BinOp::Eq, _) = cond.as_ref() {
+                assert!(matches!(lhs.as_ref(), Expr::StructInit(n, _) if n == "Point"),
+                    "expected StructInit LHS, got {:?}", lhs);
+            } else {
+                panic!("expected Binary Eq cond, got {:?}", cond);
+            }
+        } else {
+            panic!("expected If expression");
+        }
+    }
+
+    #[test]
+    fn test_g5_while_with_following_struct_literal_block() {
+        let stmts = parse_source("while x < 10 { Point { x: 1, y: 2 } }");
+        if let Stmt::While(cond, body) = &stmts[0] {
+            assert!(matches!(cond, Expr::Binary(_, BinOp::Lt, _)));
+            assert_eq!(body.len(), 1);
+            assert!(matches!(&body[0], Stmt::Expr(Expr::StructInit(n, _)) if n == "Point"));
+        } else {
+            panic!("expected While, got {:?}", &stmts[0]);
+        }
     }
 
     #[test]
