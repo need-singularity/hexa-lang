@@ -456,6 +456,8 @@ impl Env {
         env.define_builtin("block_forward_fused", Value::BuiltinFn("block_forward_fused".into()));
         env.define_builtin("block_forward_chain", Value::BuiltinFn("block_forward_chain".into()));
         env.define_builtin("block_forward_chain_f32", Value::BuiltinFn("block_forward_chain_f32".into()));
+        env.define_builtin("rope_inplace", Value::BuiltinFn("rope_inplace".into()));
+        env.define_builtin("attention_fused_into", Value::BuiltinFn("attention_fused_into".into()));
         env.define_builtin("mat_scale", Value::BuiltinFn("mat_scale".into()));
         env.define_builtin("mat_scale_inplace", Value::BuiltinFn("mat_scale_inplace".into()));
         env.define_builtin("axpy", Value::BuiltinFn("axpy".into()));

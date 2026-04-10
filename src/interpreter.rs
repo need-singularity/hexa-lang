@@ -5228,6 +5228,136 @@ impl Interpreter {
                     _ => Ok(Value::Tensor(Arc::new(TensorData { shape: vec![seq, d], data: x_f64 }))),
                 }
             }
+            "rope_inplace" => {
+                // rope_inplace(X, SEQ, D, BASE) → in-place RoPE on X[SEQ×D]
+                // Pairs (2i, 2i+1) rotated by theta = pos / base^(2i/D).
+                // Returns X mutated.
+                if args.len() < 4 {
+                    return Err(self.type_err("rope_inplace(X, SEQ, D, BASE)".into()));
+                }
+                let (seq, d) = match (&args[1], &args[2]) {
+                    (Value::Int(s), Value::Int(d)) => (*s as usize, *d as usize),
+                    _ => return Err(self.type_err("int (SEQ, D)".into())),
+                };
+                let base = match &args[3] {
+                    Value::Float(f) => *f,
+                    Value::Int(i) => *i as f64,
+                    _ => 10000.0,
+                };
+                let half_d = d / 2;
+                match &mut args[0] {
+                    Value::Tensor(arc) => {
+                        if arc.data.len() < seq * d {
+                            return Err(self.type_err("rope_inplace: X.len < SEQ*D".into()));
+                        }
+                        let data = if let Some(td) = Arc::get_mut(arc) {
+                            &mut td.data
+                        } else {
+                            // clone fallback
+                            let mut new_data = arc.data.clone();
+                            for pos in 0..seq {
+                                for i in 0..half_d {
+                                    let theta = (pos as f64) / base.powf((2 * i) as f64 / d as f64);
+                                    let cos_t = theta.cos();
+                                    let sin_t = theta.sin();
+                                    let idx0 = pos * d + 2 * i;
+                                    let idx1 = idx0 + 1;
+                                    let x0 = new_data[idx0];
+                                    let x1 = new_data[idx1];
+                                    new_data[idx0] = x0 * cos_t - x1 * sin_t;
+                                    new_data[idx1] = x0 * sin_t + x1 * cos_t;
+                                }
+                            }
+                            let shape = arc.shape.clone();
+                            return Ok(Value::Tensor(Arc::new(TensorData { shape, data: new_data })));
+                        };
+                        for pos in 0..seq {
+                            for i in 0..half_d {
+                                let theta = (pos as f64) / base.powf((2 * i) as f64 / d as f64);
+                                let cos_t = theta.cos();
+                                let sin_t = theta.sin();
+                                let idx0 = pos * d + 2 * i;
+                                let idx1 = idx0 + 1;
+                                let x0 = data[idx0];
+                                let x1 = data[idx1];
+                                data[idx0] = x0 * cos_t - x1 * sin_t;
+                                data[idx1] = x0 * sin_t + x1 * cos_t;
+                            }
+                        }
+                        Ok(Value::Tensor(arc.clone()))
+                    }
+                    _ => Err(self.type_err("rope_inplace requires Tensor".into())),
+                }
+            }
+            "attention_fused_into" => {
+                // attention_fused_into(Q, K, V, SEQ, D, out) → out = softmax(Q@K^T / sqrt(D)) @ V
+                // Q[SEQ×D], K[SEQ×D], V[SEQ×D], out[SEQ×D]
+                // Uses cblas for matmul, scalar for softmax.
+                if args.len() < 6 {
+                    return Err(self.type_err("attention_fused_into(Q, K, V, SEQ, D, out)".into()));
+                }
+                let (seq, d) = match (&args[3], &args[4]) {
+                    (Value::Int(s), Value::Int(d)) => (*s as usize, *d as usize),
+                    _ => return Err(self.type_err("int (SEQ, D)".into())),
+                };
+                let q: Vec<f64> = to_f64_slice(&args[0]).map(|s| s.as_slice().to_vec()).ok_or_else(|| self.type_err("Q".into()))?;
+                let k: Vec<f64> = to_f64_slice(&args[1]).map(|s| s.as_slice().to_vec()).ok_or_else(|| self.type_err("K".into()))?;
+                let v: Vec<f64> = to_f64_slice(&args[2]).map(|s| s.as_slice().to_vec()).ok_or_else(|| self.type_err("V".into()))?;
+
+                let scale = 1.0 / (d as f64).sqrt();
+                // scores = Q @ K^T [SEQ × SEQ]
+                let mut scores = vec![0.0f64; seq * seq];
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                unsafe {
+                    cblas_dgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_TRANS,
+                        seq as i32, seq as i32, d as i32,
+                        scale, q.as_ptr(), d as i32,
+                        k.as_ptr(), d as i32,
+                        0.0, scores.as_mut_ptr(), seq as i32);
+                }
+                #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+                {
+                    for i in 0..seq { for j in 0..seq { let mut s = 0.0; for p in 0..d { s += q[i*d+p] * k[j*d+p]; } scores[i*seq+j] = s * scale; } }
+                }
+                // Softmax per row
+                for i in 0..seq {
+                    let row = i * seq;
+                    let mut max_val = scores[row];
+                    for j in 1..seq { if scores[row+j] > max_val { max_val = scores[row+j]; } }
+                    let mut sum = 0.0f64;
+                    for j in 0..seq { scores[row+j] = (scores[row+j] - max_val).exp(); sum += scores[row+j]; }
+                    if sum > 0.0 { for j in 0..seq { scores[row+j] /= sum; } }
+                }
+                // out = scores @ V [SEQ × D]
+                let mut out_vec = vec![0.0f64; seq * d];
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                unsafe {
+                    cblas_dgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                        seq as i32, d as i32, seq as i32,
+                        1.0, scores.as_ptr(), seq as i32,
+                        v.as_ptr(), d as i32,
+                        0.0, out_vec.as_mut_ptr(), d as i32);
+                }
+                #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+                { for i in 0..seq { for p in 0..seq { let a = scores[i*seq+p]; for j in 0..d { out_vec[i*d+j] += a * v[p*d+j]; } } } }
+                // Write to out tensor
+                match &mut args[5] {
+                    Value::Tensor(arc) => {
+                        if arc.data.len() != seq * d {
+                            return Err(self.type_err("attention_fused_into: out.len != SEQ*D".into()));
+                        }
+                        if Arc::get_mut(arc).is_some() {
+                            let td = Arc::get_mut(arc).unwrap();
+                            td.data.copy_from_slice(&out_vec);
+                            Ok(Value::Tensor(arc.clone()))
+                        } else {
+                            let shape = arc.shape.clone();
+                            Ok(Value::Tensor(Arc::new(TensorData { shape, data: out_vec })))
+                        }
+                    }
+                    _ => Ok(Value::Tensor(Arc::new(TensorData { shape: vec![seq, d], data: out_vec }))),
+                }
+            }
             "mat_scale" => {
                 // mat_scale(arr, scalar) → element-wise scaling
                 if args.len() < 2 { return Err(self.type_err("mat_scale() requires (array, scalar)".into())); }
