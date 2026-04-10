@@ -11321,9 +11321,11 @@ impl Interpreter {
         for (name, val) in &mod_data.pub_bindings {
             self.env.define(name, val.clone());
         }
-        self.modules.insert(module_name, mod_data);
+        let pub_count = mod_data.pub_bindings.len();
+        let elapsed_ms = load_start.elapsed().as_millis();
+        self.modules.insert(module_name.clone(), mod_data);
         crate::hexa_log!(info, "exec_use DONE module={} elapsed={}ms pubs={}",
-            module_name, load_start.elapsed().as_millis(), mod_data.pub_bindings.len());
+            module_name, elapsed_ms, pub_count);
         Ok(())
     }
 
