@@ -509,17 +509,25 @@ impl Env {
         }
     }
 
+    /// Threshold above which var_index HashMap pays off vs linear scan.
+    /// Round 5 H100 measurement (2026-04-11): pure HashMap was 24% slower
+    /// than linear for hot training loops where vars.len() ~10-30. Above
+    /// ~64 entries hash overhead is amortized by the avoided scan cost.
+    const VAR_INDEX_THRESHOLD: usize = 64;
+
     #[inline]
     pub fn pop_scope(&mut self) {
         if let Some(start) = self.scope_starts.pop() {
-            // Walk dropped entries in reverse, removing the matching index
-            // entry from var_index (the most recent push for that name).
-            for i in (start..self.vars.len()).rev() {
-                let name = &self.vars[i].0;
-                if let Some(stack) = self.var_index.get_mut(name) {
-                    stack.pop();
-                    if stack.is_empty() {
-                        self.var_index.remove(name);
+            // Only touch var_index if it's populated. The cleanup walks
+            // dropped entries in reverse and pops the matching index entry.
+            if !self.var_index.is_empty() {
+                for i in (start..self.vars.len()).rev() {
+                    let name = &self.vars[i].0;
+                    if let Some(stack) = self.var_index.get_mut(name) {
+                        stack.pop();
+                        if stack.is_empty() {
+                            self.var_index.remove(name);
+                        }
                     }
                 }
             }
@@ -530,19 +538,47 @@ impl Env {
         }
     }
 
+    /// Lazily build var_index from current vars when crossing the threshold.
+    /// Called from define() exactly once when vars.len() first reaches
+    /// VAR_INDEX_THRESHOLD. After that the index is maintained incrementally.
+    #[cold]
+    fn build_var_index(&mut self) {
+        self.var_index.reserve(self.vars.len());
+        for (i, (name, _)) in self.vars.iter().enumerate() {
+            self.var_index.entry(name.clone()).or_insert_with(Vec::new).push(i);
+        }
+    }
+
     #[inline]
     pub fn define(&mut self, name: &str, val: Value) {
         let idx = self.vars.len();
         self.vars.push((name.to_string(), val));
-        self.var_index.entry(name.to_string()).or_insert_with(Vec::new).push(idx);
+        // Lazy threshold: index only kicks in for large stacks where the
+        // linear scan would dominate.
+        if !self.var_index.is_empty() {
+            // Index already active — keep it in sync.
+            self.var_index.entry(name.to_string()).or_insert_with(Vec::new).push(idx);
+        } else if self.vars.len() == Self::VAR_INDEX_THRESHOLD {
+            // Crossed the threshold for the first time — build index now.
+            self.build_var_index();
+        }
     }
 
     #[inline]
     pub fn get(&self, name: &str) -> Option<Value> {
-        // O(1) lookup via var_index (most recent shadowing binding)
-        if let Some(stack) = self.var_index.get(name) {
-            if let Some(&i) = stack.last() {
-                return Some(self.vars[i].1.clone());
+        // Fast path 1: index active → O(1) HashMap lookup
+        if !self.var_index.is_empty() {
+            if let Some(stack) = self.var_index.get(name) {
+                if let Some(&i) = stack.last() {
+                    return Some(self.vars[i].1.clone());
+                }
+            }
+        } else {
+            // Fast path 2: small vars stack → linear reverse scan beats hashing
+            for i in (0..self.vars.len()).rev() {
+                if self.vars[i].0 == name {
+                    return Some(self.vars[i].1.clone());
+                }
             }
         }
         // O(1) builtin lookup (HashMap, ~100 entries)
@@ -559,9 +595,17 @@ impl Env {
     /// Get a reference to a value without cloning.
     #[inline]
     pub fn get_ref(&self, name: &str) -> Option<&Value> {
-        if let Some(stack) = self.var_index.get(name) {
-            if let Some(&i) = stack.last() {
-                return Some(&self.vars[i].1);
+        if !self.var_index.is_empty() {
+            if let Some(stack) = self.var_index.get(name) {
+                if let Some(&i) = stack.last() {
+                    return Some(&self.vars[i].1);
+                }
+            }
+        } else {
+            for i in (0..self.vars.len()).rev() {
+                if self.vars[i].0 == name {
+                    return Some(&self.vars[i].1);
+                }
             }
         }
         if let Some(val) = self.builtins.get(name) {
@@ -572,11 +616,19 @@ impl Env {
 
     #[inline]
     pub fn set(&mut self, name: &str, val: Value) -> bool {
-        // O(1) lookup via var_index
-        if let Some(stack) = self.var_index.get(name) {
-            if let Some(&i) = stack.last() {
-                self.vars[i].1 = val;
-                return true;
+        if !self.var_index.is_empty() {
+            if let Some(stack) = self.var_index.get(name) {
+                if let Some(&i) = stack.last() {
+                    self.vars[i].1 = val;
+                    return true;
+                }
+            }
+        } else {
+            for i in (0..self.vars.len()).rev() {
+                if self.vars[i].0 == name {
+                    self.vars[i].1 = val;
+                    return true;
+                }
             }
         }
         // Fall back to static globals
@@ -623,7 +675,11 @@ impl Env {
         self.constants.insert(name.to_string());
         let idx = self.vars.len();
         self.vars.push((name.to_string(), val));
-        self.var_index.entry(name.to_string()).or_insert_with(Vec::new).push(idx);
+        if !self.var_index.is_empty() {
+            self.var_index.entry(name.to_string()).or_insert_with(Vec::new).push(idx);
+        } else if self.vars.len() == Self::VAR_INDEX_THRESHOLD {
+            self.build_var_index();
+        }
     }
 
     /// Check if a name is a constant.
