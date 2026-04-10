@@ -1,0 +1,530 @@
+// self/memory.hexa — HEXA Egyptian Fraction memory allocator ported from src/memory.rs
+// Memory is split into 3 regions using Egyptian fractions of n=6:
+//   Stack: 1/2 = 50%  -- local variables, function frames, value types
+//   Heap:  1/3 = 33%  -- dynamically allocated objects (structs, arrays, closures)
+//   Arena: 1/6 = 17%  -- temporaries, string interning, compile-time data
+//
+// 1/2 + 1/3 + 1/6 = 1  (the only 3-way unit fraction decomposition from 6)
+
+// ── Constants ──────────────────────────────────────────────────
+
+let EGYPTIAN_STACK = 2
+let EGYPTIAN_HEAP = 3
+let EGYPTIAN_ARENA = 6
+let DEFAULT_BUDGET = 67108864
+let MAX_FRAMES = 64
+let N_SIZE_CLASSES = 6
+let HEADER_SIZE = 8
+
+// Size-class boundaries: 16, 32, 64, 128, 256, 512 bytes
+let SIZE_CLASSES = [16, 32, 64, 128, 256, 512]
+
+// ── Memory Region enum ─────────────────────────────────────────
+// "Stack", "Heap", "Arena"
+
+// ── Stack Frame ────────────────────────────────────────────────
+
+struct StackFrame {
+    name: string,
+    base: int
+}
+
+// ── Stack Region ───────────────────────────────────────────────
+
+struct StackRegion {
+    capacity: int,
+    sp: int,
+    generation: int,
+    frames: [StackFrame],
+    frame_top: int
+}
+
+fn stack_region_new(capacity: int) -> StackRegion {
+    return StackRegion {
+        capacity: capacity,
+        sp: 0,
+        generation: 0,
+        frames: [],
+        frame_top: 0
+    }
+}
+
+fn stack_region_alloc(self: StackRegion, size: int) -> int {
+    if self.sp + size > self.capacity {
+        return -1
+    }
+    let offset = self.sp
+    self.sp = self.sp + size
+    return offset
+}
+
+fn stack_region_free_to(self: StackRegion, new_sp: int) {
+    self.sp = new_sp
+    self.generation = self.generation + 1
+}
+
+fn stack_region_push_frame(self: StackRegion, name: string) {
+    if self.frame_top >= MAX_FRAMES { return }
+    self.frames.push(StackFrame { name: name, base: self.sp })
+    self.frame_top = self.frame_top + 1
+}
+
+fn stack_region_pop_frame(self: StackRegion) -> StackFrame {
+    if self.frame_top == 0 {
+        return StackFrame { name: "", base: 0 }
+    }
+    self.frame_top = self.frame_top - 1
+    let frame = self.frames[self.frame_top]
+    self.sp = frame.base
+    self.generation = self.generation + 1
+    return frame
+}
+
+fn stack_region_used(self: StackRegion) -> int { return self.sp }
+fn stack_region_capacity(self: StackRegion) -> int { return self.capacity }
+fn stack_region_frame_depth(self: StackRegion) -> int { return self.frame_top }
+fn stack_region_generation(self: StackRegion) -> int { return self.generation }
+
+// ── Heap Region ────────────────────────────────────────────────
+
+struct HeapRegion {
+    capacity: int,
+    bump: int,
+    free_lists: [FreeEntry],
+    used: int,
+    live_allocs: int
+}
+
+struct FreeEntry {
+    offset: int,
+    size: int,
+    size_class: int
+}
+
+fn heap_region_new(capacity: int) -> HeapRegion {
+    return HeapRegion {
+        capacity: capacity,
+        bump: 0,
+        free_lists: [],
+        used: 0,
+        live_allocs: 0
+    }
+}
+
+fn heap_align8(size: int) -> int {
+    return (size + 7) & (~7)
+}
+
+fn heap_size_class(aligned: int) -> int {
+    let i = 0
+    while i < N_SIZE_CLASSES {
+        if aligned <= SIZE_CLASSES[i] {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn heap_region_alloc(self: HeapRegion, size: int) -> int {
+    if size == 0 { return 0 }
+    let aligned = heap_align8(size)
+
+    // Try free list reuse
+    let cls = heap_size_class(aligned)
+    let i = 0
+    while i < self.free_lists.length() {
+        let entry = self.free_lists[i]
+        if cls >= 0 && entry.size_class == cls && entry.size >= aligned {
+            // Reuse this block
+            let offset = entry.offset
+            // Remove from free list
+            let new_list = []
+            let j = 0
+            while j < self.free_lists.length() {
+                if j != i { new_list.push(self.free_lists[j]) }
+                j = j + 1
+            }
+            self.free_lists = new_list
+            self.used = self.used + entry.size
+            self.live_allocs = self.live_allocs + 1
+            return offset
+        }
+        i = i + 1
+    }
+
+    // Bump allocate: [header: 8B][user_data: aligned B]
+    let total = HEADER_SIZE + aligned
+    if self.bump + total > self.capacity {
+        return -1
+    }
+    let user_off = self.bump + HEADER_SIZE
+    self.bump = self.bump + total
+    self.used = self.used + aligned
+    self.live_allocs = self.live_allocs + 1
+    return user_off
+}
+
+fn heap_region_free(self: HeapRegion, user_offset: int, aligned_size: int) {
+    if user_offset == 0 { return }
+    let cls = heap_size_class(aligned_size)
+    self.free_lists.push(FreeEntry {
+        offset: user_offset,
+        size: aligned_size,
+        size_class: cls
+    })
+    self.used = self.used - aligned_size
+    if self.used < 0 { self.used = 0 }
+    self.live_allocs = self.live_allocs - 1
+    if self.live_allocs < 0 { self.live_allocs = 0 }
+}
+
+fn heap_region_used(self: HeapRegion) -> int { return self.used }
+fn heap_region_capacity(self: HeapRegion) -> int { return self.capacity }
+fn heap_region_alloc_count(self: HeapRegion) -> int { return self.live_allocs }
+
+// ── Arena Region ───────────────────────────────────────────────
+
+struct ArenaRegion {
+    capacity: int,
+    offset: int,
+    generation: int
+}
+
+fn arena_region_new(capacity: int) -> ArenaRegion {
+    return ArenaRegion { capacity: capacity, offset: 0, generation: 0 }
+}
+
+fn arena_region_alloc(self: ArenaRegion, size: int) -> int {
+    if size == 0 { return 0 }
+    let aligned = (size + 7) & (~7)
+    if self.offset + aligned > self.capacity {
+        return -1
+    }
+    let off = self.offset
+    self.offset = self.offset + aligned
+    return off
+}
+
+fn arena_region_reset(self: ArenaRegion) {
+    self.offset = 0
+    self.generation = self.generation + 1
+}
+
+fn arena_region_used(self: ArenaRegion) -> int { return self.offset }
+fn arena_region_capacity(self: ArenaRegion) -> int { return self.capacity }
+fn arena_region_generation(self: ArenaRegion) -> int { return self.generation }
+
+// ── Memory Stats ───────────────────────────────────────────────
+
+struct MemoryStats {
+    stack_used: int,
+    stack_capacity: int,
+    heap_used: int,
+    heap_capacity: int,
+    heap_allocs: int,
+    arena_used: int,
+    arena_capacity: int,
+    arena_resets: int,
+    total_budget: int,
+    total_allocs: int,
+    stack_frame_depth: int
+}
+
+fn memory_stats_display(self: MemoryStats) -> string {
+    let s = "=== Egyptian Fraction Memory Report ===\n"
+    s = s + "Budget: " + str(self.total_budget) + " bytes\n"
+    s = s + "Identity: 1/2 + 1/3 + 1/6 = 1 (n=6)\n"
+    s = s + "---\n"
+    s = s + "Stack (1/2): " + str(self.stack_used) + " / " + str(self.stack_capacity) + "\n"
+    s = s + "  Frames: " + str(self.stack_frame_depth) + "\n"
+    s = s + "Heap  (1/3): " + str(self.heap_used) + " / " + str(self.heap_capacity) + "\n"
+    s = s + "  Live objects: " + str(self.heap_allocs) + "\n"
+    s = s + "Arena (1/6): " + str(self.arena_used) + " / " + str(self.arena_capacity) + "\n"
+    s = s + "  Resets: " + str(self.arena_resets) + "\n"
+    return s
+}
+
+// ── Memory Errors ──────────────────────────────────────────────
+// Represented as strings:
+// "StackOverflow: requested N, available M (1/2 budget)"
+// "HeapExhausted: requested N, available M (1/3 budget)"
+// "ArenaOverflow: requested N, available M (1/6 budget)"
+// "InvalidFree: offset N"
+
+// ── VarHandle (packed region:2 | index:30) ─────────────────────
+
+struct VarHandle {
+    value: int
+}
+
+let VAR_HANDLE_NONE = VarHandle { value: 4294967295 }
+
+fn var_handle_new(region: string, index: int) -> VarHandle {
+    let tag = 0
+    if region == "Heap" { tag = 1 }
+    if region == "Arena" { tag = 2 }
+    return VarHandle { value: (tag << 30) | index }
+}
+
+fn var_handle_region(self: VarHandle) -> string {
+    let tag = self.value >> 30
+    if tag == 0 { return "Stack" }
+    if tag == 1 { return "Heap" }
+    return "Arena"
+}
+
+fn var_handle_index(self: VarHandle) -> int {
+    return self.value & 0x3FFFFFFF
+}
+
+// ── Tracker (name -> handle, HashMap-free) ─────────────────────
+
+struct VarRecord {
+    name: string,
+    region: string,
+    offset: int,
+    size: int,
+    live: bool
+}
+
+struct Tracker {
+    entries: [VarRecord]
+}
+
+fn tracker_new() -> Tracker {
+    return Tracker { entries: [] }
+}
+
+fn tracker_record(self: Tracker, name: string, region: string, offset: int, size: int) -> int {
+    // Tombstone old entries with same name+region
+    for rec in self.entries {
+        if rec.name == name && rec.region == region {
+            rec.live = false
+        }
+    }
+    let idx = self.entries.length()
+    self.entries.push(VarRecord { name: name, region: region, offset: offset, size: size, live: true })
+    return idx
+}
+
+fn tracker_find(self: Tracker, name: string) -> VarRecord {
+    for rec in self.entries {
+        if rec.name == name && rec.live {
+            return rec
+        }
+    }
+    return VarRecord { name: "", region: "", offset: -1, size: 0, live: false }
+}
+
+fn tracker_tombstone(self: Tracker, idx: int) {
+    if idx >= 0 && idx < self.entries.length() {
+        self.entries[idx].live = false
+    }
+}
+
+fn tracker_drop_stack_frame(self: Tracker, base: int) {
+    for rec in self.entries {
+        if rec.region == "Stack" && rec.offset >= base {
+            rec.live = false
+        }
+    }
+}
+
+fn tracker_drop_arena(self: Tracker) {
+    for rec in self.entries {
+        if rec.region == "Arena" {
+            rec.live = false
+        }
+    }
+}
+
+// ── Egyptian Memory Manager ────────────────────────────────────
+
+struct EgyptianMemory {
+    total_budget: int,
+    stack: StackRegion,
+    heap: HeapRegion,
+    arena: ArenaRegion,
+    stack_init: bool,
+    heap_init: bool,
+    arena_init: bool,
+    total_allocs: int,
+    tracker: Tracker
+}
+
+fn egyptian_memory_new(total_budget: int) -> EgyptianMemory {
+    return EgyptianMemory {
+        total_budget: total_budget,
+        stack: stack_region_new(0),
+        heap: heap_region_new(0),
+        arena: arena_region_new(0),
+        stack_init: false,
+        heap_init: false,
+        arena_init: false,
+        total_allocs: 0,
+        tracker: tracker_new()
+    }
+}
+
+fn egyptian_memory_new_eager(total_budget: int) -> EgyptianMemory {
+    return EgyptianMemory {
+        total_budget: total_budget,
+        stack: stack_region_new(total_budget / EGYPTIAN_STACK),
+        heap: heap_region_new(total_budget / EGYPTIAN_HEAP),
+        arena: arena_region_new(total_budget / EGYPTIAN_ARENA),
+        stack_init: true,
+        heap_init: true,
+        arena_init: true,
+        total_allocs: 0,
+        tracker: tracker_new()
+    }
+}
+
+fn egyptian_memory_with_default_budget() -> EgyptianMemory {
+    return egyptian_memory_new(DEFAULT_BUDGET)
+}
+
+fn egyptian_memory_ensure_stack(self: EgyptianMemory) {
+    if self.stack_init == false {
+        self.stack = stack_region_new(self.total_budget / EGYPTIAN_STACK)
+        self.stack_init = true
+    }
+}
+
+fn egyptian_memory_ensure_heap(self: EgyptianMemory) {
+    if self.heap_init == false {
+        self.heap = heap_region_new(self.total_budget / EGYPTIAN_HEAP)
+        self.heap_init = true
+    }
+}
+
+fn egyptian_memory_ensure_arena(self: EgyptianMemory) {
+    if self.arena_init == false {
+        self.arena = arena_region_new(self.total_budget / EGYPTIAN_ARENA)
+        self.arena_init = true
+    }
+}
+
+// ── Stack operations ───────────────────────────────────────────
+
+fn egyptian_memory_stack_alloc(self: EgyptianMemory, name: string, size: int) -> int {
+    egyptian_memory_ensure_stack(self)
+    let offset = stack_region_alloc(self.stack, size)
+    if offset < 0 { return -1 }
+    self.total_allocs = self.total_allocs + 1
+    tracker_record(self.tracker, name, "Stack", offset, size)
+    return offset
+}
+
+fn egyptian_memory_push_frame(self: EgyptianMemory, name: string) {
+    egyptian_memory_ensure_stack(self)
+    stack_region_push_frame(self.stack, name)
+}
+
+fn egyptian_memory_pop_frame(self: EgyptianMemory) {
+    if self.stack_init {
+        let frame = stack_region_pop_frame(self.stack)
+        if frame.name != "" {
+            tracker_drop_stack_frame(self.tracker, frame.base)
+        }
+    }
+}
+
+// ── Heap operations ────────────────────────────────────────────
+
+fn egyptian_memory_heap_alloc(self: EgyptianMemory, name: string, size: int) -> int {
+    egyptian_memory_ensure_heap(self)
+    let offset = heap_region_alloc(self.heap, size)
+    if offset < 0 { return -1 }
+    self.total_allocs = self.total_allocs + 1
+    tracker_record(self.tracker, name, "Heap", offset, size)
+    return offset
+}
+
+fn egyptian_memory_heap_free(self: EgyptianMemory, name: string) {
+    let rec = tracker_find(self.tracker, name)
+    if rec.region != "Heap" { return }
+    if rec.offset < 0 { return }
+    // Find and tombstone the entry
+    let i = 0
+    for entry in self.tracker.entries {
+        if entry.name == name && entry.region == "Heap" && entry.live {
+            tracker_tombstone(self.tracker, i)
+        }
+        i = i + 1
+    }
+    heap_region_free(self.heap, rec.offset, rec.size)
+}
+
+// ── Arena operations ───────────────────────────────────────────
+
+fn egyptian_memory_arena_alloc(self: EgyptianMemory, size: int) -> int {
+    egyptian_memory_ensure_arena(self)
+    let offset = arena_region_alloc(self.arena, size)
+    if offset < 0 {
+        arena_region_reset(self.arena)
+        offset = arena_region_alloc(self.arena, size)
+    }
+    if offset >= 0 {
+        self.total_allocs = self.total_allocs + 1
+    }
+    return offset
+}
+
+fn egyptian_memory_arena_reset(self: EgyptianMemory) {
+    if self.arena_init {
+        arena_region_reset(self.arena)
+    }
+    tracker_drop_arena(self.tracker)
+}
+
+// ── Region query ───────────────────────────────────────────────
+
+fn egyptian_memory_get_region(self: EgyptianMemory, name: string) -> string {
+    let rec = tracker_find(self.tracker, name)
+    if rec.live { return rec.region }
+    return ""
+}
+
+// ── Stats ──────────────────────────────────────────────────────
+
+fn egyptian_memory_stats(self: EgyptianMemory) -> MemoryStats {
+    let su = 0
+    let sc = self.total_budget / EGYPTIAN_STACK
+    let hu = 0
+    let hc = self.total_budget / EGYPTIAN_HEAP
+    let ha = 0
+    let au = 0
+    let ac = self.total_budget / EGYPTIAN_ARENA
+    let ar = 0
+    let sfd = 0
+    if self.stack_init {
+        su = stack_region_used(self.stack)
+        sc = stack_region_capacity(self.stack)
+        sfd = stack_region_frame_depth(self.stack)
+    }
+    if self.heap_init {
+        hu = heap_region_used(self.heap)
+        hc = heap_region_capacity(self.heap)
+        ha = heap_region_alloc_count(self.heap)
+    }
+    if self.arena_init {
+        au = arena_region_used(self.arena)
+        ac = arena_region_capacity(self.arena)
+        ar = arena_region_generation(self.arena)
+    }
+    return MemoryStats {
+        stack_used: su,
+        stack_capacity: sc,
+        heap_used: hu,
+        heap_capacity: hc,
+        heap_allocs: ha,
+        arena_used: au,
+        arena_capacity: ac,
+        arena_resets: ar,
+        total_budget: self.total_budget,
+        total_allocs: self.total_allocs,
+        stack_frame_depth: sfd
+    }
+}
