@@ -1,37 +1,261 @@
 // self/opt/p05_inlining.hexa — ported from src/opt/p05_inlining.rs
 // P5: Function Inlining — inline small functions at call sites.
-// Threshold: sigma-tau = 8 instructions max.
+// Threshold: sigma - tau = 8 instructions max.
 
-fn inline_threshold() -> int { return 8 }
-fn max_inlines_per_func() -> int { return 3 }
+let INLINE_THRESHOLD = 8
+let MAX_INLINES_PER_FUNC = 3
 
-// Check if a function is inlinable: not main, <= 8 instructions.
-fn is_inlinable(func_name: string, instr_count: int) -> bool {
-    if func_name == "main" { return false }
-    return instr_count <= inline_threshold()
+fn pass_inlining_name() -> string { return "inlining" }
+
+struct CalleeSnapshot {
+    blocks: [BasicBlock],
+    params: [ParamDef],
+    ret_type: string
 }
 
-// Inline a single call site (conceptual).
-// Steps:
-// 1. Allocate fresh ValueIds and BlockIds for cloned callee
-// 2. Clone callee blocks with remapped operands
-// 3. Replace Return with Jump to merge block
-// 4. Split caller block at call site
-// 5. Add Jump from caller to callee entry
-// 6. Rewrite post-call instructions to use inlined return value
-fn inline_call_site_conceptual() -> bool {
-    return true
+struct ParamDef { name: string, ty: string }
+
+struct InlineSite {
+    block_idx: int,
+    instr_idx: int,
+    callee_fid: int,
+    call_result: int,
+    call_ty: string,
+    args: [Operand]
 }
 
-fn run_inlining_conceptual() -> PassResult {
+struct SnapEntry { fid: int, snap: CalleeSnapshot }
+
+fn pass_inlining_run(module: IrModule) -> PassResult {
     let mut inlined = 0
-    let mut candidates = 0
-    // Phase 1: Collect snapshots of inlinable callees
-    // Phase 2: For each caller, find Call sites and inline (max 3 per func)
-    // Process sites in reverse order so indices remain stable
+    let mut candidates_count = 0
+
+    // Phase 1: Collect snapshots
+    let mut snaps: [SnapEntry] = []
+    let mut fi = 0
+    while fi < len(module.functions) {
+        let func = module.functions[fi]
+        if func.name != "main" && func_instr_count(func) <= INLINE_THRESHOLD {
+            candidates_count = candidates_count + 1
+            snaps = snaps.push(SnapEntry {
+                fid: func.id,
+                snap: CalleeSnapshot { blocks: func.blocks, params: func.params, ret_type: func.ret_type }
+            })
+        }
+        fi = fi + 1
+    }
+
+    // Phase 2: Find and inline
+    fi = 0
+    while fi < len(module.functions) {
+        let caller_id = module.functions[fi].id
+        let mut inlines_this = 0
+        let mut sites: [InlineSite] = []
+
+        let mut bi = 0
+        while bi < len(module.functions[fi].blocks) && inlines_this < MAX_INLINES_PER_FUNC {
+            let block = module.functions[fi].blocks[bi]
+            let mut ii = 0
+            while ii < len(block.instructions) && inlines_this < MAX_INLINES_PER_FUNC {
+                let instr = block.instructions[ii]
+                if instr.op == "call" && len(instr.operands) > 0 && instr.operands[0].kind == "func" {
+                    let callee_fid = instr.operands[0].func_id
+                    if callee_fid != caller_id && snap_exists(snaps, callee_fid) {
+                        let mut args: [Operand] = []
+                        let mut ai = 1
+                        while ai < len(instr.operands) {
+                            args = args.push(instr.operands[ai])
+                            ai = ai + 1
+                        }
+                        sites = sites.push(InlineSite {
+                            block_idx: bi, instr_idx: ii, callee_fid: callee_fid,
+                            call_result: instr.result, call_ty: instr.ty, args: args
+                        })
+                        inlines_this = inlines_this + 1
+                    }
+                }
+                ii = ii + 1
+            }
+            bi = bi + 1
+        }
+
+        // Process in reverse
+        let mut si = len(sites) - 1
+        while si >= 0 {
+            let snap = snap_get(snaps, sites[si].callee_fid)
+            inline_at(module.functions[fi], sites[si], snap)
+            inlined = inlined + 1
+            si = si - 1
+        }
+        if inlines_this > 0 { module.functions[fi].rebuild_cfg() }
+        fi = fi + 1
+    }
+
     return PassResult {
         changed: inlined > 0,
-        stat_keys: ["candidates", "inlined", "threshold"],
-        stat_vals: [candidates, inlined, inline_threshold()]
+        stats: [
+            StatEntry { key: "candidates", value: candidates_count },
+            StatEntry { key: "inlined", value: inlined },
+            StatEntry { key: "threshold", value: INLINE_THRESHOLD }
+        ]
     }
+}
+
+fn inline_at(caller: IrFunction, site: InlineSite, callee: CalleeSnapshot) {
+    if len(callee.blocks) == 0 { return }
+
+    // Allocate fresh blocks and values
+    let mut value_map: [KvPair] = []
+    let mut block_map: [KvPair] = []
+    let mut new_block_indices: [int] = []
+
+    let mut ci = 0
+    while ci < len(callee.blocks) {
+        let new_bid = caller.fresh_block("inline_" + to_string(ci))
+        new_block_indices = new_block_indices.push(len(caller.blocks) - 1)
+        block_map = kv_set(block_map, callee.blocks[ci].id, new_bid)
+        ci = ci + 1
+    }
+    ci = 0
+    while ci < len(callee.blocks) {
+        let mut ii = 0
+        while ii < len(callee.blocks[ci].instructions) {
+            let instr = callee.blocks[ci].instructions[ii]
+            let new_vid = caller.fresh_value(instr.ty)
+            value_map = kv_set(value_map, instr.result, new_vid)
+            ii = ii + 1
+        }
+        ci = ci + 1
+    }
+
+    let merge_bid = caller.fresh_block("inline_merge")
+    let merge_idx = len(caller.blocks) - 1
+
+    // Clone callee blocks
+    let mut return_values: [int] = []
+    ci = 0
+    while ci < len(callee.blocks) {
+        let bidx = new_block_indices[ci]
+        let mut instrs: [IrInstr] = []
+        let mut ii = 0
+        while ii < len(callee.blocks[ci].instructions) {
+            let instr = callee.blocks[ci].instructions[ii]
+            if instr.op == "return" {
+                if len(instr.operands) > 0 {
+                    let remapped = remap_op(instr.operands[0], value_map, block_map, site.args)
+                    if remapped.kind == "value" { return_values = return_values.push(remapped.value_id) }
+                }
+                let jv = caller.fresh_value("void")
+                instrs = instrs.push(IrInstr { result: jv, op: "jump", operands: [Operand { kind: "block", block_id: merge_bid }], ty: "void" })
+            } else {
+                let nr = kv_get(value_map, instr.result)
+                let mut new_ops: [Operand] = []
+                let mut oi = 0
+                while oi < len(instr.operands) {
+                    new_ops = new_ops.push(remap_op(instr.operands[oi], value_map, block_map, site.args))
+                    oi = oi + 1
+                }
+                instrs = instrs.push(IrInstr { result: nr, op: instr.op, operands: new_ops, ty: instr.ty })
+            }
+            ii = ii + 1
+        }
+        caller.blocks[bidx].instructions = instrs
+        ci = ci + 1
+    }
+
+    let callee_entry = kv_get(block_map, callee.blocks[0].id)
+
+    // Split caller block
+    let mut after: [IrInstr] = []
+    let mut ai = site.instr_idx + 1
+    while ai < len(caller.blocks[site.block_idx].instructions) {
+        after = after.push(caller.blocks[site.block_idx].instructions[ai])
+        ai = ai + 1
+    }
+    // Truncate and remove call
+    let mut kept: [IrInstr] = []
+    let mut ki = 0
+    while ki < site.instr_idx {
+        kept = kept.push(caller.blocks[site.block_idx].instructions[ki])
+        ki = ki + 1
+    }
+    let jv = caller.fresh_value("void")
+    kept = kept.push(IrInstr { result: jv, op: "jump", operands: [Operand { kind: "block", block_id: callee_entry }], ty: "void" })
+    caller.blocks[site.block_idx].instructions = kept
+
+    // Rewrite after-call with return value
+    let mut repl_val = -1
+    if len(return_values) > 0 { repl_val = return_values[len(return_values) - 1] }
+    let mut rewritten: [IrInstr] = []
+    let mut ri = 0
+    while ri < len(after) {
+        let instr = after[ri]
+        if repl_val != -1 {
+            let mut oi = 0
+            while oi < len(instr.operands) {
+                if instr.operands[oi].kind == "value" && instr.operands[oi].value_id == site.call_result {
+                    instr.operands[oi].value_id = repl_val
+                }
+                oi = oi + 1
+            }
+        }
+        rewritten = rewritten.push(instr)
+        ri = ri + 1
+    }
+    caller.blocks[merge_idx].instructions = rewritten
+}
+
+fn remap_op(op: Operand, vmap: [KvPair], bmap: [KvPair], args: [Operand]) -> Operand {
+    if op.kind == "value" {
+        let nv = kv_get(vmap, op.value_id)
+        if nv != -1 { return Operand { kind: "value", value_id: nv } }
+        return op
+    }
+    if op.kind == "block" {
+        let nb = kv_get(bmap, op.block_id)
+        if nb != -1 { return Operand { kind: "block", block_id: nb } }
+        return op
+    }
+    if op.kind == "param" && op.param_idx < len(args) { return args[op.param_idx] }
+    if op.kind == "phi_entry" {
+        let mut nb = kv_get(bmap, op.block_id)
+        let mut nv = kv_get(vmap, op.value_id)
+        if nb == -1 { nb = op.block_id }
+        if nv == -1 { nv = op.value_id }
+        return Operand { kind: "phi_entry", block_id: nb, value_id: nv }
+    }
+    if op.kind == "switch_case" {
+        let mut nb = kv_get(bmap, op.block_id)
+        if nb == -1 { nb = op.block_id }
+        return Operand { kind: "switch_case", int_val: op.int_val, block_id: nb }
+    }
+    return op
+}
+
+fn func_instr_count(func: IrFunction) -> int {
+    let mut count = 0
+    let mut bi = 0
+    while bi < len(func.blocks) {
+        count = count + len(func.blocks[bi].instructions)
+        bi = bi + 1
+    }
+    return count
+}
+
+fn snap_exists(snaps: [SnapEntry], fid: int) -> bool {
+    let mut i = 0
+    while i < len(snaps) {
+        if snaps[i].fid == fid { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn snap_get(snaps: [SnapEntry], fid: int) -> CalleeSnapshot {
+    let mut i = 0
+    while i < len(snaps) {
+        if snaps[i].fid == fid { return snaps[i].snap }
+        i = i + 1
+    }
+    return CalleeSnapshot { blocks: [], params: [], ret_type: "" }
 }

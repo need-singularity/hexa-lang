@@ -1,52 +1,131 @@
 // self/opt/p07_cse.hexa — ported from src/opt/p07_cse.rs
 // P7: Common Subexpression Elimination — deduplicate identical computations.
-// Enhanced with cross-block CSE, operand canonicalization for commutative ops.
+//
+// Cross-block CSE, operand canonicalization for commutative ops, dead removal.
 
-// Check if opcode is commutative (a op b == b op a).
-fn is_commutative(op: int) -> bool {
-    return op == 0 || op == 2   // Add or Mul
-}
+fn pass_cse_name() -> string { return "cse" }
 
-// Canonicalize operands: for commutative ops, sort operand keys
-// so (a+b) and (b+a) produce the same expression key.
-fn canonicalize_pair(op: int, a: int, b: int) -> [int] {
-    if is_commutative(op) {
-        if a > b { return [b, a] }
-    }
-    return [a, b]
-}
+struct ExprEntry { key: string, vid: int }
 
-// Expression key for CSE lookup: [opcode, operand1, operand2, ...]
-// Two instructions with the same key are identical computations.
-fn expr_key(op: int, operands: [int]) -> [int] {
-    let mut key = [op]
-    if len(operands) == 2 && is_commutative(op) {
-        let pair = canonicalize_pair(op, operands[0], operands[1])
-        key = key.push(pair[0]).push(pair[1])
-    } else {
-        let mut i = 0
-        while i < len(operands) {
-            key = key.push(operands[i])
-            i = i + 1
-        }
-    }
-    return key
-}
-
-fn run_cse_conceptual() -> PassResult {
+fn pass_cse_run(module: IrModule) -> PassResult {
+    let mut changed = false
     let mut eliminated = 0
-    // Global (cross-block) expression table: ExprKey -> first result ValueId
-    // For each function:
-    //   For each block, for each instruction:
-    //     Skip side-effecting, terminator, proof, Phi, Load
-    //     Build ExprKey, check if seen
-    //     If seen: mark for replacement
-    //     Else: record in table
-    //   Apply replacements: rewrite operand references
-    //   Convert replaced instructions to Load(replacement_value)
-    return PassResult {
-        changed: eliminated > 0,
-        stat_keys: ["eliminated"],
-        stat_vals: [eliminated]
+
+    let mut fi = 0
+    while fi < len(module.functions) {
+        let func = module.functions[fi]
+        let mut seen: [ExprEntry] = []
+        let mut replacements: [KvPair] = []
+
+        let mut bi = 0
+        while bi < len(func.blocks) {
+            let block = func.blocks[bi]
+            let mut ii = 0
+            while ii < len(block.instructions) {
+                let instr = block.instructions[ii]
+
+                if has_side_effect_op(instr.op) || is_terminator_op(instr.op) || is_proof_op(instr.op) || instr.op == "phi" || instr.op == "load" {
+                    ii = ii + 1
+                    continue
+                }
+
+                let key = make_expr_key(instr.op, instr.operands)
+                let existing = expr_lookup(seen, key)
+                if existing != -1 {
+                    replacements = kv_set(replacements, instr.result, existing)
+                    changed = true
+                    eliminated = eliminated + 1
+                } else {
+                    seen = seen.push(ExprEntry { key: key, vid: instr.result })
+                }
+                ii = ii + 1
+            }
+            bi = bi + 1
+        }
+
+        if len(replacements) > 0 {
+            // Rewrite operand references
+            bi = 0
+            while bi < len(func.blocks) {
+                let block = func.blocks[bi]
+                let mut ii = 0
+                while ii < len(block.instructions) {
+                    let mut oi = 0
+                    while oi < len(block.instructions[ii].operands) {
+                        if block.instructions[ii].operands[oi].kind == "value" {
+                            let r = kv_get(replacements, block.instructions[ii].operands[oi].value_id)
+                            if r != -1 { block.instructions[ii].operands[oi].value_id = r }
+                        }
+                        oi = oi + 1
+                    }
+                    ii = ii + 1
+                }
+                bi = bi + 1
+            }
+            // Convert replaced instructions to Load
+            bi = 0
+            while bi < len(func.blocks) {
+                let block = func.blocks[bi]
+                let mut ii = 0
+                while ii < len(block.instructions) {
+                    let r = kv_get(replacements, block.instructions[ii].result)
+                    if r != -1 {
+                        block.instructions[ii].op = "load"
+                        block.instructions[ii].operands = [Operand { kind: "value", value_id: r }]
+                    }
+                    ii = ii + 1
+                }
+                bi = bi + 1
+            }
+        }
+        fi = fi + 1
     }
+
+    return PassResult {
+        changed: changed,
+        stats: [StatEntry { key: "eliminated", value: eliminated }]
+    }
+}
+
+fn is_commutative_op(op: string) -> bool {
+    return op == "add" || op == "mul"
+}
+
+fn make_expr_key(op: string, operands: [Operand]) -> string {
+    let mut keys: [string] = []
+    let mut i = 0
+    while i < len(operands) {
+        keys = keys.push(op_key(operands[i]))
+        i = i + 1
+    }
+    if is_commutative_op(op) && len(keys) == 2 && keys[0] > keys[1] {
+        let tmp = keys[0]
+        keys[0] = keys[1]
+        keys[1] = tmp
+    }
+    let mut result = op
+    i = 0
+    while i < len(keys) {
+        result = result + "|" + keys[i]
+        i = i + 1
+    }
+    return result
+}
+
+fn op_key(op: Operand) -> string {
+    if op.kind == "value" { return "v" + to_string(op.value_id) }
+    if op.kind == "imm_i64" { return "i" + to_string(op.int_val) }
+    if op.kind == "imm_f64" { return "f" + to_string(op.float_val) }
+    if op.kind == "imm_bool" { return "b" + to_string(op.bool_val) }
+    if op.kind == "block" { return "B" + to_string(op.block_id) }
+    return "?"
+}
+
+fn expr_lookup(seen: [ExprEntry], key: string) -> int {
+    let mut i = 0
+    while i < len(seen) {
+        if seen[i].key == key { return seen[i].vid }
+        i = i + 1
+    }
+    return -1
 }

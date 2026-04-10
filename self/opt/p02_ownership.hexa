@@ -5,52 +5,326 @@
 //   Phase 2 runs FIRST: Cross-block phi insertion for while loops
 //   Phase 1 runs SECOND: Same-block store->load forwarding (simple)
 
-// Find the last Store(alloca_id, val) in a block.
-// block_instrs: array of instructions [result, op, operand1, operand2, ...]
-// alloca_id: the ValueId of the alloca to search for.
-// Returns the stored ValueId or -1 if not found.
-fn find_last_store_val(block_instrs: [[int]], alloca_id: int) -> int {
-    let mut last = -1
-    let mut i = 0
-    while i < len(block_instrs) {
-        let instr = block_instrs[i]
-        // instr[1] == STORE opcode (assume opcode tag for Store)
-        // instr[2] == ptr operand, instr[3] == val operand
-        if len(instr) >= 4 {
-            if instr[1] == 5 {  // Store opcode tag
-                if instr[2] == alloca_id {
-                    last = instr[3]
+fn pass_ownership_proof_name() -> string {
+    return "ownership_proof"
+}
+
+fn pass_ownership_proof_run(module: IrModule) -> PassResult {
+    let mut changed = false
+    let mut promoted = 0
+
+    let mut fi = 0
+    while fi < len(module.functions) {
+        let r = promote_allocas(module.functions[fi])
+        if r > 0 { changed = true }
+        promoted = promoted + r
+        fi = fi + 1
+    }
+
+    return PassResult {
+        changed: changed,
+        stats: [StatEntry { key: "promoted", value: promoted }]
+    }
+}
+
+fn promote_allocas(func: IrFunction) -> int {
+    let mut promoted = 0
+
+    // Find alloca ValueIds
+    let mut allocas: [int] = []
+    let mut bi = 0
+    while bi < len(func.blocks) {
+        let block = func.blocks[bi]
+        let mut ii = 0
+        while ii < len(block.instructions) {
+            if block.instructions[ii].op == "alloc" {
+                allocas = allocas.push(block.instructions[ii].result)
+            }
+            ii = ii + 1
+        }
+        bi = bi + 1
+    }
+    if len(allocas) == 0 { return 0 }
+
+    // Check promotability: only used in Store(ptr,val) as ptr, and Load(ptr)
+    let mut promotable = allocas
+    bi = 0
+    while bi < len(func.blocks) {
+        let block = func.blocks[bi]
+        let mut ii = 0
+        while ii < len(block.instructions) {
+            let instr = block.instructions[ii]
+            if instr.op == "store" {
+                if len(instr.operands) > 1 && instr.operands[1].kind == "value" {
+                    if int_list_contains(allocas, instr.operands[1].value_id) {
+                        promotable = int_list_remove(promotable, instr.operands[1].value_id)
+                    }
+                }
+            } else if instr.op != "load" && instr.op != "alloc" {
+                let mut oi = 0
+                while oi < len(instr.operands) {
+                    if instr.operands[oi].kind == "value" {
+                        if int_list_contains(allocas, instr.operands[oi].value_id) {
+                            promotable = int_list_remove(promotable, instr.operands[oi].value_id)
+                        }
+                    }
+                    oi = oi + 1
                 }
             }
+            ii = ii + 1
         }
-        i = i + 1
+        bi = bi + 1
+    }
+    if len(promotable) == 0 { return 0 }
+
+    func.rebuild_cfg()
+
+    // Detect back edges: B->H where H.id < B.id
+    let mut back_edges: [BlockEdge] = []
+    bi = 0
+    while bi < len(func.blocks) {
+        let block = func.blocks[bi]
+        let mut si = 0
+        while si < len(block.succs) {
+            if block.succs[si] < block.id {
+                back_edges = back_edges.push(BlockEdge { src: block.id, dst: block.succs[si] })
+            }
+            si = si + 1
+        }
+        bi = bi + 1
+    }
+
+    // Phase 2: Cross-block phi insertion
+    let mut ei = 0
+    while ei < len(back_edges) {
+        let body_end_id = back_edges[ei].src
+        let header_id = back_edges[ei].dst
+
+        // Find preheader
+        let header_preds = block_preds(func, header_id)
+        let mut preheader_id = -1
+        let mut pi = 0
+        while pi < len(header_preds) {
+            if header_preds[pi] != body_end_id { preheader_id = header_preds[pi] }
+            pi = pi + 1
+        }
+        if preheader_id == -1 { ei = ei + 1; continue }
+
+        let mut ai = 0
+        while ai < len(promotable) {
+            let alloca_id = promotable[ai]
+
+            // Skip if alloc inside loop
+            let mut alloc_in_loop = false
+            let mut bk = 0
+            while bk < len(func.blocks) {
+                let b = func.blocks[bk]
+                if b.id > header_id && b.id <= body_end_id {
+                    let mut ik = 0
+                    while ik < len(b.instructions) {
+                        if b.instructions[ik].op == "alloc" && b.instructions[ik].result == alloca_id {
+                            alloc_in_loop = true
+                        }
+                        ik = ik + 1
+                    }
+                }
+                bk = bk + 1
+            }
+            if alloc_in_loop { ai = ai + 1; continue }
+
+            // Check loaded in header/body
+            let mut loaded = false
+            bk = 0
+            while bk < len(func.blocks) {
+                let b = func.blocks[bk]
+                if b.id >= header_id && b.id <= body_end_id {
+                    let mut ik = 0
+                    while ik < len(b.instructions) {
+                        let ins = b.instructions[ik]
+                        if ins.op == "load" && len(ins.operands) > 0 && ins.operands[0].kind == "value" && ins.operands[0].value_id == alloca_id {
+                            loaded = true
+                        }
+                        ik = ik + 1
+                    }
+                }
+                bk = bk + 1
+            }
+            if !loaded { ai = ai + 1; continue }
+
+            let init_val = find_last_store_in_block(func, preheader_id, alloca_id)
+            let mut update_val = find_last_store_in_block(func, body_end_id, alloca_id)
+            if update_val == -1 {
+                bk = 0
+                while bk < len(func.blocks) {
+                    let b = func.blocks[bk]
+                    if b.id > header_id && b.id <= body_end_id {
+                        let v = find_last_store_val(b, alloca_id)
+                        if v != -1 { update_val = v }
+                    }
+                    bk = bk + 1
+                }
+            }
+            if init_val == -1 || update_val == -1 { ai = ai + 1; continue }
+
+            // Create phi at header
+            let phi_vid = func.fresh_value("i64")
+            let phi_instr = IrInstr {
+                result: phi_vid, op: "phi",
+                operands: [
+                    Operand { kind: "phi_entry", block_id: preheader_id, value_id: init_val },
+                    Operand { kind: "phi_entry", block_id: body_end_id, value_id: update_val }
+                ],
+                ty: "i64"
+            }
+            func.insert_at(header_id, 0, phi_instr)
+
+            // Replace loads in header..body with Copy(phi/current)
+            bk = 0
+            while bk < len(func.blocks) {
+                let b = func.blocks[bk]
+                if b.id >= header_id && b.id <= body_end_id {
+                    let mut current_val = phi_vid
+                    let mut ik = 0
+                    while ik < len(b.instructions) {
+                        let ins = b.instructions[ik]
+                        if ins.op == "store" && len(ins.operands) > 1 && ins.operands[0].kind == "value" && ins.operands[0].value_id == alloca_id && ins.operands[1].kind == "value" {
+                            current_val = ins.operands[1].value_id
+                        }
+                        if ins.op == "load" && len(ins.operands) > 0 && ins.operands[0].kind == "value" && ins.operands[0].value_id == alloca_id {
+                            b.instructions[ik].op = "copy"
+                            b.instructions[ik].operands = [Operand { kind: "value", value_id: current_val }]
+                            promoted = promoted + 1
+                        }
+                        ik = ik + 1
+                    }
+                }
+                if b.id > body_end_id {
+                    let mut ik = 0
+                    while ik < len(b.instructions) {
+                        let ins = b.instructions[ik]
+                        if ins.op == "load" && len(ins.operands) > 0 && ins.operands[0].kind == "value" && ins.operands[0].value_id == alloca_id {
+                            b.instructions[ik].op = "copy"
+                            b.instructions[ik].operands = [Operand { kind: "value", value_id: update_val }]
+                            promoted = promoted + 1
+                        }
+                        ik = ik + 1
+                    }
+                }
+                bk = bk + 1
+            }
+            ai = ai + 1
+        }
+        ei = ei + 1
+    }
+
+    if promoted > 0 { func.rebuild_cfg() }
+
+    // Phase 1: Same-block store->load forwarding
+    bi = 0
+    while bi < len(func.blocks) {
+        let block = func.blocks[bi]
+        let mut last_stored: [KvPair] = []
+        let mut replacements: [KvPair] = []
+
+        let mut ii = 0
+        while ii < len(block.instructions) {
+            let instr = block.instructions[ii]
+            if instr.op == "store" && len(instr.operands) >= 2 && instr.operands[0].kind == "value" && instr.operands[1].kind == "value" {
+                if int_list_contains(promotable, instr.operands[0].value_id) {
+                    last_stored = kv_set(last_stored, instr.operands[0].value_id, instr.operands[1].value_id)
+                }
+            }
+            if instr.op == "load" && len(instr.operands) > 0 && instr.operands[0].kind == "value" {
+                if int_list_contains(promotable, instr.operands[0].value_id) {
+                    let val = kv_get(last_stored, instr.operands[0].value_id)
+                    if val != -1 { replacements = kv_set(replacements, ii, val) }
+                }
+            }
+            if instr.op == "call" { last_stored = [] }
+            ii = ii + 1
+        }
+
+        let mut ri = 0
+        while ri < len(replacements) {
+            let idx = replacements[ri].key
+            let val = replacements[ri].val
+            block.instructions[idx].op = "copy"
+            block.instructions[idx].operands = [Operand { kind: "value", value_id: val }]
+            promoted = promoted + 1
+            ri = ri + 1
+        }
+        bi = bi + 1
+    }
+    return promoted
+}
+
+fn find_last_store_in_block(func: IrFunction, block_id: int, alloca_id: int) -> int {
+    let mut bi = 0
+    while bi < len(func.blocks) {
+        if func.blocks[bi].id == block_id { return find_last_store_val(func.blocks[bi], alloca_id) }
+        bi = bi + 1
+    }
+    return -1
+}
+
+fn find_last_store_val(block: BasicBlock, alloca_id: int) -> int {
+    let mut last = -1
+    let mut ii = 0
+    while ii < len(block.instructions) {
+        let instr = block.instructions[ii]
+        if instr.op == "store" && len(instr.operands) >= 2 && instr.operands[0].kind == "value" && instr.operands[0].value_id == alloca_id && instr.operands[1].kind == "value" {
+            last = instr.operands[1].value_id
+        }
+        ii = ii + 1
     }
     return last
 }
 
-// Promote allocas to SSA registers.
-// Returns count of promoted operations.
-fn promote_allocas_conceptual(num_blocks: int) -> int {
-    // Phase 2: Cross-block phi insertion
-    // 1. Find alloca ValueIds
-    // 2. Check promotability (only used in Store as ptr, and Load as ptr)
-    // 3. Detect back-edges for loops
-    // 4. For each loop: find preheader init value and body update value
-    // 5. Insert Phi at header block
-    // 6. Replace Load(alloca) with Copy(phi_vid) in loop body
-    //
-    // Phase 1: Same-block store->load forwarding
-    // 1. Walk block instructions sequentially
-    // 2. Track last stored value per alloca pointer
-    // 3. When Load(ptr) seen and last_stored[ptr] known, replace with Copy(val)
-    return 0
+fn block_preds(func: IrFunction, block_id: int) -> [int] {
+    let mut bi = 0
+    while bi < len(func.blocks) {
+        if func.blocks[bi].id == block_id { return func.blocks[bi].preds }
+        bi = bi + 1
+    }
+    return []
 }
 
-fn run_ownership_proof() -> PassResult {
-    let promoted = promote_allocas_conceptual(0)
-    return PassResult {
-        changed: promoted > 0,
-        stat_keys: ["promoted"],
-        stat_vals: [promoted]
+struct BlockEdge { src: int, dst: int }
+struct KvPair { key: int, val: int }
+
+fn kv_set(pairs: [KvPair], key: int, val: int) -> [KvPair] {
+    let mut i = 0
+    while i < len(pairs) {
+        if pairs[i].key == key { pairs[i].val = val; return pairs }
+        i = i + 1
     }
+    return pairs.push(KvPair { key: key, val: val })
+}
+
+fn kv_get(pairs: [KvPair], key: int) -> int {
+    let mut i = 0
+    while i < len(pairs) {
+        if pairs[i].key == key { return pairs[i].val }
+        i = i + 1
+    }
+    return -1
+}
+
+fn int_list_contains(list: [int], val: int) -> bool {
+    let mut i = 0
+    while i < len(list) {
+        if list[i] == val { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn int_list_remove(list: [int], val: int) -> [int] {
+    let mut result: [int] = []
+    let mut i = 0
+    while i < len(list) {
+        if list[i] != val { result = result.push(list[i]) }
+        i = i + 1
+    }
+    return result
 }

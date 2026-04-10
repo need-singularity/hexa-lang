@@ -1,47 +1,210 @@
 // self/opt/p09_sinking.hexa — ported from src/opt/p09_sinking.rs
 // P9: Code Sinking — move computations closer to their use sites.
-// Sinks instructions from a dominator block into the single successor
-// that uses the result, reducing register pressure.
+// Iterates to a fixpoint.
 
-// Check if an instruction can safely be moved (sinkable).
-fn is_sinkable(op: int) -> bool {
-    // Not side-effecting, not terminator, not proof, not phi
-    // In the Hexa port, we check against known non-sinkable opcode tags.
-    // Terminators: Jump, Branch, Return, Switch
-    // Side-effecting: Store, Call, Free
-    // Proof: Assert, Assume, Invariant
-    // Phi: must stay at block start
-    let non_sinkable = [20, 21, 22, 23, 5, 6, 7, 30, 31, 32, 33]
-    let mut i = 0
-    while i < len(non_sinkable) {
-        if op == non_sinkable[i] { return false }
-        i = i + 1
+fn pass_code_sinking_name() -> string { return "code_sinking" }
+
+struct IntListEntry { key: int, values: [int] }
+
+fn pass_code_sinking_run(module: IrModule) -> PassResult {
+    let mut changed = false
+    let mut sunk = 0
+
+    let mut fi = 0
+    while fi < len(module.functions) {
+        let func = module.functions[fi]
+        func.rebuild_cfg()
+
+        let mut keep_going = true
+        while keep_going {
+            let mut round_changed = false
+
+            // Build pred/succ maps
+            let mut pred_map: [IntListEntry] = []
+            let mut succ_map: [IntListEntry] = []
+            let mut bi = 0
+            while bi < len(func.blocks) {
+                let b = func.blocks[bi]
+                pred_map = pred_map.push(IntListEntry { key: b.id, values: b.preds })
+                succ_map = succ_map.push(IntListEntry { key: b.id, values: b.succs })
+                bi = bi + 1
+            }
+
+            // Build use-site map
+            let mut use_sites: [IntListEntry] = []
+            bi = 0
+            while bi < len(func.blocks) {
+                let b = func.blocks[bi]
+                let mut ii = 0
+                while ii < len(b.instructions) {
+                    let mut oi = 0
+                    while oi < len(b.instructions[ii].operands) {
+                        let op = b.instructions[ii].operands[oi]
+                        if op.kind == "value" { use_sites = il_add(use_sites, op.value_id, b.id) }
+                        if op.kind == "phi_entry" { use_sites = il_add(use_sites, op.value_id, b.id) }
+                        oi = oi + 1
+                    }
+                    ii = ii + 1
+                }
+                bi = bi + 1
+            }
+
+            // Build def-site map
+            let mut def_site: [KvPair] = []
+            bi = 0
+            while bi < len(func.blocks) {
+                let b = func.blocks[bi]
+                let mut ii = 0
+                while ii < len(b.instructions) {
+                    def_site = kv_set(def_site, b.instructions[ii].result, b.id)
+                    ii = ii + 1
+                }
+                bi = bi + 1
+            }
+
+            // Find one sink candidate
+            let mut found_src = -1
+            let mut found_idx = -1
+            let mut found_tgt = -1
+
+            bi = 0
+            while bi < len(func.blocks) && found_src == -1 {
+                let block = func.blocks[bi]
+                let succs = il_get(succ_map, block.id)
+                if len(succs) == 0 { bi = bi + 1; continue }
+
+                let ic = len(block.instructions)
+                let mut rev = 0
+                while rev < ic && found_src == -1 {
+                    let idx = ic - 1 - rev
+                    let instr = block.instructions[idx]
+                    if !is_sinkable_op(instr.op) { rev = rev + 1; continue }
+
+                    let sites = int_list_unique(il_get(use_sites, instr.result))
+                    if len(sites) != 1 { rev = rev + 1; continue }
+                    let target = sites[0]
+                    if target == block.id { rev = rev + 1; continue }
+                    if !int_list_contains(succs, target) { rev = rev + 1; continue }
+
+                    // Dominance check
+                    let tgt_preds = il_get(pred_map, target)
+                    if len(tgt_preds) != 1 || tgt_preds[0] != block.id { rev = rev + 1; continue }
+
+                    // Operand availability
+                    let mut ok = true
+                    let mut oi = 0
+                    while oi < len(instr.operands) {
+                        if instr.operands[oi].kind == "value" {
+                            let db = kv_get(def_site, instr.operands[oi].value_id)
+                            if db == block.id {
+                                let di = block_find(block, instr.operands[oi].value_id)
+                                if di >= idx { ok = false }
+                            }
+                        }
+                        oi = oi + 1
+                    }
+                    if !ok { rev = rev + 1; continue }
+
+                    found_src = block.id
+                    found_idx = idx
+                    found_tgt = target
+                    rev = rev + 1
+                }
+                bi = bi + 1
+            }
+
+            if found_src != -1 {
+                let instr = remove_instr(func, found_src, found_idx)
+                // Insert after phis in target
+                let tgt = get_block(func, found_tgt)
+                let mut pos = 0
+                while pos < len(tgt.instructions) && tgt.instructions[pos].op == "phi" { pos = pos + 1 }
+                func.insert_at(found_tgt, pos, instr)
+                round_changed = true
+                sunk = sunk + 1
+                changed = true
+                func.rebuild_cfg()
+            }
+            if !round_changed { keep_going = false }
+        }
+        fi = fi + 1
     }
+
+    return PassResult {
+        changed: changed,
+        stats: [StatEntry { key: "sunk", value: sunk }]
+    }
+}
+
+fn is_sinkable_op(op: string) -> bool {
+    if has_side_effect_op(op) || is_terminator_op(op) || is_proof_op(op) || op == "phi" { return false }
     return true
 }
 
-// Simple dominator check: B dominates S if B is S's only predecessor.
-fn dominates_simple(block_b: int, block_s: int, pred_map: [[int]]) -> bool {
-    if block_s < len(pred_map) {
-        let preds = pred_map[block_s]
-        return len(preds) == 1 && preds[0] == block_b
+fn il_get(entries: [IntListEntry], key: int) -> [int] {
+    let mut i = 0
+    while i < len(entries) {
+        if entries[i].key == key { return entries[i].values }
+        i = i + 1
     }
-    return false
+    return []
 }
 
-fn run_code_sinking_conceptual() -> PassResult {
-    let mut sunk = 0
-    // For each function:
-    //   Rebuild CFG
-    //   Loop (fixpoint):
-    //     Build pred_map, succ_map, use_sites, def_site maps
-    //     Find one sink candidate: instruction used in exactly one successor block
-    //     Check: target is successor, B dominates target, operands available
-    //     Move instruction from source to target (insert after phis)
-    //   Until no more candidates
-    return PassResult {
-        changed: sunk > 0,
-        stat_keys: ["sunk"],
-        stat_vals: [sunk]
+fn il_add(entries: [IntListEntry], key: int, val: int) -> [IntListEntry] {
+    let mut i = 0
+    while i < len(entries) {
+        if entries[i].key == key {
+            entries[i].values = entries[i].values.push(val)
+            return entries
+        }
+        i = i + 1
     }
+    return entries.push(IntListEntry { key: key, values: [val] })
+}
+
+fn int_list_unique(arr: [int]) -> [int] {
+    let mut result: [int] = []
+    let mut i = 0
+    while i < len(arr) {
+        if !int_list_contains(result, arr[i]) { result = result.push(arr[i]) }
+        i = i + 1
+    }
+    return result
+}
+
+fn block_find(block: BasicBlock, vid: int) -> int {
+    let mut i = 0
+    while i < len(block.instructions) {
+        if block.instructions[i].result == vid { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn remove_instr(func: IrFunction, block_id: int, idx: int) -> IrInstr {
+    let mut bi = 0
+    while bi < len(func.blocks) {
+        if func.blocks[bi].id == block_id {
+            let instr = func.blocks[bi].instructions[idx]
+            let mut new_list: [IrInstr] = []
+            let mut ii = 0
+            while ii < len(func.blocks[bi].instructions) {
+                if ii != idx { new_list = new_list.push(func.blocks[bi].instructions[ii]) }
+                ii = ii + 1
+            }
+            func.blocks[bi].instructions = new_list
+            return instr
+        }
+        bi = bi + 1
+    }
+    return IrInstr { result: -1, op: "nop", operands: [], ty: "void" }
+}
+
+fn get_block(func: IrFunction, block_id: int) -> BasicBlock {
+    let mut bi = 0
+    while bi < len(func.blocks) {
+        if func.blocks[bi].id == block_id { return func.blocks[bi] }
+        bi = bi + 1
+    }
+    return BasicBlock { id: -1, instructions: [], preds: [], succs: [] }
 }
