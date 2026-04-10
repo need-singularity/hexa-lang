@@ -398,10 +398,10 @@ impl Parser {
     fn parse_static(&mut self, vis: Visibility) -> Result<Stmt, HexaError> {
         self.advance(); // consume 'static'
         let name = self.expect_ident()?;
-        // optional type annotation
+        // optional type annotation (supports [T], (T1, T2), etc.)
         let typ = if matches!(self.peek(), Token::Colon) {
             self.advance();
-            Some(self.expect_ident()?)
+            Some(self.parse_ret_type()?)
         } else {
             None
         };
@@ -680,7 +680,7 @@ impl Parser {
             let name = self.expect_ident()?;
             let typ = if matches!(self.peek(), Token::Colon) {
                 self.advance();
-                Some(self.expect_ident()?)
+                Some(self.parse_ret_type()?)
             } else {
                 None
             };
@@ -697,7 +697,7 @@ impl Parser {
             let name = self.expect_ident()?;
             let typ = if matches!(self.peek(), Token::Colon) {
                 self.advance();
-                Some(self.expect_ident()?)
+                Some(self.parse_ret_type()?)
             } else {
                 None
             };
@@ -1380,7 +1380,7 @@ impl Parser {
             let field_vis = self.parse_visibility();
             let field_name = self.expect_ident()?;
             self.expect(&Token::Colon)?;
-            let field_type = self.expect_ident()?;
+            let field_type = self.parse_ret_type()?;
             fields.push((field_name, field_type, field_vis));
             // consume comma or newline
             if matches!(self.peek(), Token::Comma) {
@@ -2254,6 +2254,62 @@ mod tests {
         let tokens = Lexer::new("for i in 0..10 {\n  print(i)\n}").tokenize().unwrap();
         let stmts = Parser::new(tokens).parse().unwrap();
         assert!(matches!(&stmts[0], Stmt::For(..)));
+    }
+
+    // ── G1: tuple return type ────────────────────────────────
+    #[test]
+    fn test_g1_tuple_return_type() {
+        let stmts = parse_source("fn pair() -> (int, int) {\n  return (1, 2)\n}");
+        if let Stmt::FnDecl(f) = &stmts[0] {
+            assert_eq!(f.ret_type.as_deref(), Some("(int, int)"));
+        } else {
+            panic!("Expected FnDecl");
+        }
+    }
+
+    // ── G2: array type annotation on let/const/static/struct field ────
+    #[test]
+    fn test_g2_let_array_annotation() {
+        let stmts = parse_source("let xs: [int] = [1, 2, 3]");
+        if let Stmt::Let(name, typ, _, _) = &stmts[0] {
+            assert_eq!(name, "xs");
+            assert_eq!(typ.as_deref(), Some("[int]"));
+        } else {
+            panic!("Expected Let");
+        }
+    }
+
+    #[test]
+    fn test_g2_nested_array_annotation() {
+        let stmts = parse_source("let m: [[int]] = [[1, 2], [3, 4]]");
+        if let Stmt::Let(_, typ, _, _) = &stmts[0] {
+            assert_eq!(typ.as_deref(), Some("[[int]]"));
+        } else {
+            panic!("Expected Let");
+        }
+    }
+
+    #[test]
+    fn test_g2_static_array_annotation() {
+        let stmts = parse_source("static G: [int] = [1, 2, 3]");
+        if let Stmt::Static(name, typ, _, _) = &stmts[0] {
+            assert_eq!(name, "G");
+            assert_eq!(typ.as_deref(), Some("[int]"));
+        } else {
+            panic!("Expected Static");
+        }
+    }
+
+    #[test]
+    fn test_g2_struct_field_array_type() {
+        let stmts = parse_source("struct Bag {\n  items: [int]\n}");
+        if let Stmt::StructDecl(s) = &stmts[0] {
+            assert_eq!(s.fields.len(), 1);
+            assert_eq!(s.fields[0].0, "items");
+            assert_eq!(s.fields[0].1, "[int]");
+        } else {
+            panic!("Expected StructDecl");
+        }
     }
 
     #[test]
