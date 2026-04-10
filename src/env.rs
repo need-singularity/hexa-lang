@@ -451,6 +451,9 @@ impl Env {
         env.define_builtin("mat_add", Value::BuiltinFn("mat_add".into()));
         env.define_builtin("mat_add_inplace", Value::BuiltinFn("mat_add_inplace".into()));
         env.define_builtin("matmul_into", Value::BuiltinFn("matmul_into".into()));
+        env.define_builtin("matmul_transpose_a_into", Value::BuiltinFn("matmul_transpose_a_into".into()));
+        env.define_builtin("matmul_transpose_b_into", Value::BuiltinFn("matmul_transpose_b_into".into()));
+        env.define_builtin("matmul_into_accumulate", Value::BuiltinFn("matmul_into_accumulate".into()));
         env.define_builtin("qkv_fused_into", Value::BuiltinFn("qkv_fused_into".into()));
         env.define_builtin("ffn_fused_into", Value::BuiltinFn("ffn_fused_into".into()));
         env.define_builtin("block_forward_fused", Value::BuiltinFn("block_forward_fused".into()));
