@@ -1,5 +1,42 @@
 #![allow(dead_code)]
 
+// ─── HEXA_LOG instrumentation ───
+// Set HEXA_LOG=info|debug|trace to enable progressive verbosity to stderr.
+// `info`  — module load start/end, fn pre-reg counts, statics promotion counts
+// `debug` — info + per-fn registration, env.set/get for promoted statics
+// `trace` — debug + every stmt/call (very noisy)
+//
+// Each level subsumes the lower levels. Cached at first read for speed.
+// Used as `hexa_log!(info, "msg {}", arg)` — stub macro emits eprintln when active.
+pub(crate) fn hexa_log_level() -> u8 {
+    use std::sync::OnceLock;
+    static LEVEL: OnceLock<u8> = OnceLock::new();
+    *LEVEL.get_or_init(|| match std::env::var("HEXA_LOG").ok().as_deref() {
+        Some("trace") => 3,
+        Some("debug") => 2,
+        Some("info")  => 1,
+        _             => 0,
+    })
+}
+#[macro_export]
+macro_rules! hexa_log {
+    (info, $($arg:tt)*) => {
+        if $crate::interpreter::hexa_log_level() >= 1 {
+            eprintln!("[hexa info] {}", format!($($arg)*));
+        }
+    };
+    (debug, $($arg:tt)*) => {
+        if $crate::interpreter::hexa_log_level() >= 2 {
+            eprintln!("[hexa debug] {}", format!($($arg)*));
+        }
+    };
+    (trace, $($arg:tt)*) => {
+        if $crate::interpreter::hexa_log_level() >= 3 {
+            eprintln!("[hexa trace] {}", format!($($arg)*));
+        }
+    };
+}
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 #[cfg(not(target_arch = "wasm32"))]
@@ -788,9 +825,13 @@ impl Interpreter {
                                 _ => {}
                             }
                         }
+                        crate::hexa_log!(trace, "assign {} (statics? {})", name, self.env.is_static(name));
                         if !self.env.set(name, val) {
+                            crate::hexa_log!(info, "assign FAILED — undefined: {} (vars_len={}, statics_has={})",
+                                name, self.env.vars_len(), self.env.is_static(name));
                             return Err(self.runtime_err(format!("undefined variable: {}", name)));
                         }
+                        crate::hexa_log!(trace, "  assign OK {} → {:?}", name, self.env.get(name));
                     }
                     Expr::Index(arr_expr, idx_expr) => {
                         // Collect index chain: a[b][c][d] = val
@@ -11190,6 +11231,9 @@ impl Interpreter {
             enum_defs: HashMap::new(),
         };
 
+        let load_start = std::time::Instant::now();
+        crate::hexa_log!(info, "exec_use START module={} stmts={}", module_name, stmts.len());
+
         self.env.push_scope();
         let module_scope_start = self.env.vars_len();
 
@@ -11199,6 +11243,7 @@ impl Interpreter {
         // loading was missing this pass, causing O(N²) behavior on use chains
         // (each fn registration walked the full vars stack). With pre-reg,
         // train_gpu.hexa's 5-module chain (~200 fns) loads in <30s instead of 150s+.
+        let mut prereg_count: usize = 0;
         for stmt in &stmts {
             if let Stmt::FnDecl(decl) = stmt {
                 let param_names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
@@ -11208,8 +11253,11 @@ impl Interpreter {
                     Arc::new(decl.body.clone()),
                 )));
                 self.env.define(&decl.name, fn_val);
+                prereg_count += 1;
+                crate::hexa_log!(debug, "  prereg fn {}::{}", module_name, decl.name);
             }
         }
+        crate::hexa_log!(info, "  pre-reg {} fns in {}", prereg_count, module_name);
 
         for stmt in &stmts {
             self.exec_stmt(stmt)?;
@@ -11261,9 +11309,12 @@ impl Interpreter {
         // having set it. Promotion to statics gives module-level state a stable
         // home that survives scope teardown.
         let module_vars = self.env.drain_scope_vars(module_scope_start);
+        let promoted_count = module_vars.len();
         for (name, val) in module_vars {
+            crate::hexa_log!(debug, "  promote static {}::{} = {:?}", module_name, name, val);
             self.env.define_static(&name, val);
         }
+        crate::hexa_log!(info, "  promoted {} vars to statics in {}", promoted_count, module_name);
 
         self.env.pop_scope();
         // Inject pub bindings into the current scope for direct access
@@ -11271,6 +11322,8 @@ impl Interpreter {
             self.env.define(name, val.clone());
         }
         self.modules.insert(module_name, mod_data);
+        crate::hexa_log!(info, "exec_use DONE module={} elapsed={}ms pubs={}",
+            module_name, load_start.elapsed().as_millis(), mod_data.pub_bindings.len());
         Ok(())
     }
 
