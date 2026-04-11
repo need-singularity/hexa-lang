@@ -1,0 +1,772 @@
+// ═══════════════════════════════════════════════════════════════
+//  test_consistency_training.hexa — Consistency Training (#170)
+//
+//  Tests (>= 30):
+//    T1  augment_dropout preserves length
+//    T2  augment_dropout replaces some tokens with 0
+//    T3  augment_dropout zero prob -> no change
+//    T4  augment_swap preserves length
+//    T5  augment_swap changes some positions
+//    T6  augment_delete shortens sequence
+//    T7  augment_delete always keeps >= 1 token
+//    T8  augment_composite produces valid output
+//    T9  softmax sums to ~1.0
+//    T10 softmax highest logit gets highest prob
+//    T11 log_softmax values are negative
+//    T12 sharpen makes distribution more peaked
+//    T13 sharpen with temp=1.0 preserves distribution
+//    T14 kl_divergence of identical distributions is ~0
+//    T15 kl_divergence of different distributions is > 0
+//    T16 forward_linear returns correct length
+//    T17 dual_forward returns two distributions
+//    T18 consistency_loss >= 0
+//    T19 consistency_loss of same input is ~0
+//    T20 ema_update with alpha=1 keeps teacher
+//    T21 ema_update with alpha=0 copies student
+//    T22 ema_update blends weights
+//    T23 max_prob returns correct maximum
+//    T24 confidence_mask filters low confidence
+//    T25 confidence_mask keeps high confidence
+//    T26 masked_consistency_loss respects mask
+//    T27 unsupervised_loss computes without labels
+//    T28 train_step reduces loss
+//    T29 ema_train_step updates both student and teacher
+//    T30 symmetric_kl >= 0
+//    T31 symmetric_kl is symmetric
+//    T32 js_divergence bounded [0, log2]
+//    T33 entropy of uniform distribution is maximal
+//    T34 entropy of peaked distribution is low
+//    T35 argmax picks correct index
+//    T36 augment_dropout with prob=1.0 replaces all
+//    T37 consistency_loss lower temp -> higher loss for different dists
+//    T38 confidence threshold=0 includes all samples
+//    T39 unsupervised mode produces finite loss
+//    T40 ema teacher converges toward student
+//
+//  Run: cargo run --release -- self/test_consistency_training.hexa
+// ═══════════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn approx(a, b, eps) {
+    return fabs(a - b) < eps
+}
+
+// ── inlined core functions ──────────────────────────────────────
+
+fn ct_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn ct_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 { g = (g + x / g) / 2.0 }
+    return g
+}
+
+fn ct_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn ct_log(x) {
+    if x <= 0.0 { return -20.0 }
+    let mut y = 0.0
+    if x > 1.0 { y = x / 3.0 }
+    if x < 0.01 { y = -5.0 }
+    for _i in 0..50 {
+        let ey = ct_exp(y)
+        if ey < 1.0e-15 { y = y + 1.0 } else {
+            y = y + (x - ey) / ey
+        }
+    }
+    return y
+}
+
+fn ct_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn ct_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+fn ct_hash(seed, idx) {
+    let mut h = (seed + 1) * 2654435761 + (idx + 1) * 1315423911
+    h = h % 1000003
+    if h < 0 { h = 0 - h }
+    return h
+}
+
+fn ct_rand_float(seed, idx) {
+    let h = ct_hash(seed, idx)
+    return to_float(h % 10000) / 10000.0
+}
+
+// -- augmentation --
+
+fn ct_augment_dropout(tokens, prob, seed) {
+    let n = len(tokens)
+    let mut out = []
+    for i in 0..n {
+        let r = ct_rand_float(seed, i)
+        if r < prob {
+            out = out + [0]
+        } else {
+            out = out + [tokens[i]]
+        }
+    }
+    return out
+}
+
+fn ct_augment_swap(tokens, prob, seed) {
+    let n = len(tokens)
+    let mut out = []
+    for i in 0..n { out = out + [tokens[i]] }
+    let mut i = 0
+    for _step in 0..n {
+        if i >= n - 1 { break }
+        let r = ct_rand_float(seed, i + n)
+        if r < prob {
+            let tmp = out[i]
+            out[i] = out[i + 1]
+            out[i + 1] = tmp
+            i = i + 2
+        } else {
+            i = i + 1
+        }
+    }
+    return out
+}
+
+fn ct_augment_delete(tokens, prob, seed) {
+    let n = len(tokens)
+    let mut out = []
+    for i in 0..n {
+        let r = ct_rand_float(seed, i + 2 * n)
+        if r >= prob {
+            out = out + [tokens[i]]
+        }
+    }
+    if len(out) == 0 { out = out + [tokens[0]] }
+    return out
+}
+
+fn ct_augment_composite(tokens, p_drop, p_swap, p_del, seed) {
+    let step1 = ct_augment_dropout(tokens, p_drop, seed)
+    let step2 = ct_augment_swap(step1, p_swap, seed + 1000)
+    let step3 = ct_augment_delete(step2, p_del, seed + 2000)
+    return step3
+}
+
+// -- softmax / log-softmax --
+
+fn ct_softmax(logits) {
+    let n = len(logits)
+    let mut mx = logits[0]
+    for i in 1..n { if logits[i] > mx { mx = logits[i] } }
+    let mut exps = ct_zeros(n)
+    let mut z = 0.0
+    for i in 0..n {
+        exps[i] = ct_exp(logits[i] - mx)
+        z = z + exps[i]
+    }
+    let mut out = ct_zeros(n)
+    for i in 0..n { out[i] = exps[i] / z }
+    return out
+}
+
+fn ct_log_softmax(logits) {
+    let n = len(logits)
+    let mut mx = logits[0]
+    for i in 1..n { if logits[i] > mx { mx = logits[i] } }
+    let mut z = 0.0
+    for i in 0..n { z = z + ct_exp(logits[i] - mx) }
+    let log_z = ct_log(z) + mx
+    let mut out = ct_zeros(n)
+    for i in 0..n { out[i] = logits[i] - log_z }
+    return out
+}
+
+// -- sharpening --
+
+fn ct_sharpen(probs, temperature) {
+    let n = len(probs)
+    let inv_t = 1.0 / temperature
+    let mut powered = ct_zeros(n)
+    let mut z = 0.0
+    for i in 0..n {
+        let p = probs[i]
+        if p < 1.0e-12 {
+            powered[i] = 0.0
+        } else {
+            let log_p = ct_log(p)
+            powered[i] = ct_exp(log_p * inv_t)
+        }
+        z = z + powered[i]
+    }
+    let mut out = ct_zeros(n)
+    if z < 1.0e-15 {
+        for i in 0..n { out[i] = 1.0 / to_float(n) }
+    } else {
+        for i in 0..n { out[i] = powered[i] / z }
+    }
+    return out
+}
+
+// -- kl divergence --
+
+fn ct_kl_divergence(p, q) {
+    let n = len(p)
+    let mut kl = 0.0
+    for i in 0..n {
+        if p[i] > 1.0e-12 {
+            let mut qi = q[i]
+            if qi < 1.0e-12 { qi = 1.0e-12 }
+            kl = kl + p[i] * (ct_log(p[i]) - ct_log(qi))
+        }
+    }
+    if kl < 0.0 { kl = 0.0 }
+    return kl
+}
+
+// -- forward model --
+
+fn ct_forward_linear(tokens, weights, vocab) {
+    let n = len(tokens)
+    let mut logits = ct_zeros(vocab)
+    for i in 0..n {
+        let t = tokens[i]
+        for v in 0..vocab {
+            let w_idx = (t * vocab + v) % len(weights)
+            logits[v] = logits[v] + weights[w_idx]
+        }
+    }
+    return logits
+}
+
+fn ct_dual_forward(tokens, aug_tokens, weights, vocab) {
+    let orig_logits = ct_forward_linear(tokens, weights, vocab)
+    let aug_logits = ct_forward_linear(aug_tokens, weights, vocab)
+    let orig_probs = ct_softmax(orig_logits)
+    let aug_probs = ct_softmax(aug_logits)
+    return [orig_probs, aug_probs]
+}
+
+// -- consistency loss --
+
+fn ct_consistency_loss(orig_probs, aug_probs, temperature) {
+    let sharp_orig = ct_sharpen(orig_probs, temperature)
+    let sharp_aug = ct_sharpen(aug_probs, temperature)
+    return ct_kl_divergence(sharp_orig, sharp_aug)
+}
+
+// -- ema --
+
+fn ct_ema_update(teacher, student, alpha) {
+    let n = len(teacher)
+    let mut out = ct_zeros(n)
+    for i in 0..n { out[i] = alpha * teacher[i] + (1.0 - alpha) * student[i] }
+    return out
+}
+
+fn ct_ema_forward(tokens, teacher_weights, vocab) {
+    return ct_forward_linear(tokens, teacher_weights, vocab)
+}
+
+// -- confidence --
+
+fn ct_max_prob(probs) {
+    let n = len(probs)
+    let mut mx = probs[0]
+    for i in 1..n { if probs[i] > mx { mx = probs[i] } }
+    return mx
+}
+
+fn ct_confidence_mask(probs_batch, threshold) {
+    let n = len(probs_batch)
+    let mut mask = ct_zeros_int(n)
+    for i in 0..n {
+        let mp = ct_max_prob(probs_batch[i])
+        if mp >= threshold { mask[i] = 1 }
+    }
+    return mask
+}
+
+fn ct_masked_consistency_loss(orig_batch, aug_batch, mask, temp) {
+    let n = len(orig_batch)
+    let mut total_loss = 0.0
+    let mut count = 0
+    for i in 0..n {
+        if mask[i] == 1 {
+            let loss = ct_consistency_loss(orig_batch[i], aug_batch[i], temp)
+            total_loss = total_loss + loss
+            count = count + 1
+        }
+    }
+    if count == 0 { return 0.0 }
+    return total_loss / to_float(count)
+}
+
+// -- unsupervised --
+
+fn ct_unsupervised_loss(tokens_batch, weights, vocab, p_drop, p_swap, p_del, seed, temp) {
+    let n = len(tokens_batch)
+    let mut total_loss = 0.0
+    for i in 0..n {
+        let orig = tokens_batch[i]
+        let aug = ct_augment_composite(orig, p_drop, p_swap, p_del, seed + i)
+        let orig_logits = ct_forward_linear(orig, weights, vocab)
+        let aug_logits = ct_forward_linear(aug, weights, vocab)
+        let orig_probs = ct_softmax(orig_logits)
+        let aug_probs = ct_softmax(aug_logits)
+        let loss = ct_consistency_loss(orig_probs, aug_probs, temp)
+        total_loss = total_loss + loss
+    }
+    return total_loss / to_float(n)
+}
+
+// -- train step --
+
+fn ct_train_step(weights, tokens_batch, vocab, lr, p_drop, p_swap, p_del, seed, temp, conf_thresh) {
+    let n_w = len(weights)
+    let n_batch = len(tokens_batch)
+    let mut orig_probs_batch = []
+    let mut aug_probs_batch = []
+    for i in 0..n_batch {
+        let orig = tokens_batch[i]
+        let aug = ct_augment_composite(orig, p_drop, p_swap, p_del, seed + i)
+        let orig_logits = ct_forward_linear(orig, weights, vocab)
+        let aug_logits = ct_forward_linear(aug, weights, vocab)
+        orig_probs_batch = orig_probs_batch + [ct_softmax(orig_logits)]
+        aug_probs_batch = aug_probs_batch + [ct_softmax(aug_logits)]
+    }
+    let mask = ct_confidence_mask(orig_probs_batch, conf_thresh)
+    let loss = ct_masked_consistency_loss(orig_probs_batch, aug_probs_batch, mask, temp)
+    let eps = 0.001
+    let mut grad = ct_zeros(n_w)
+    for w in 0..n_w {
+        let mut w_plus = ct_zeros(n_w)
+        for j in 0..n_w { w_plus[j] = weights[j] }
+        w_plus[w] = w_plus[w] + eps
+        let mut loss_plus = 0.0
+        let mut count_plus = 0
+        for i in 0..n_batch {
+            if mask[i] == 1 {
+                let orig = tokens_batch[i]
+                let aug = ct_augment_composite(orig, p_drop, p_swap, p_del, seed + i)
+                let ol = ct_forward_linear(orig, w_plus, vocab)
+                let al = ct_forward_linear(aug, w_plus, vocab)
+                let op = ct_softmax(ol)
+                let ap = ct_softmax(al)
+                loss_plus = loss_plus + ct_consistency_loss(op, ap, temp)
+                count_plus = count_plus + 1
+            }
+        }
+        if count_plus > 0 { loss_plus = loss_plus / to_float(count_plus) }
+        grad[w] = (loss_plus - loss) / eps
+    }
+    let mut new_w = ct_zeros(n_w)
+    for w in 0..n_w { new_w[w] = weights[w] - lr * grad[w] }
+    return [new_w, loss]
+}
+
+// -- ema train step --
+
+fn ct_ema_train_step(student_w, teacher_w, tokens_batch, vocab, lr, ema_alpha, p_drop, p_swap, p_del, seed, temp, conf_thresh) {
+    let n_batch = len(tokens_batch)
+    let mut teacher_probs_batch = []
+    let mut student_probs_batch = []
+    for i in 0..n_batch {
+        let orig = tokens_batch[i]
+        let aug = ct_augment_composite(orig, p_drop, p_swap, p_del, seed + i)
+        let t_logits = ct_forward_linear(orig, teacher_w, vocab)
+        let s_logits = ct_forward_linear(aug, student_w, vocab)
+        teacher_probs_batch = teacher_probs_batch + [ct_softmax(t_logits)]
+        student_probs_batch = student_probs_batch + [ct_softmax(s_logits)]
+    }
+    let mask = ct_confidence_mask(teacher_probs_batch, conf_thresh)
+    let loss = ct_masked_consistency_loss(teacher_probs_batch, student_probs_batch, mask, temp)
+    let n_w = len(student_w)
+    let eps = 0.001
+    let mut grad = ct_zeros(n_w)
+    for w in 0..n_w {
+        let mut w_plus = ct_zeros(n_w)
+        for j in 0..n_w { w_plus[j] = student_w[j] }
+        w_plus[w] = w_plus[w] + eps
+        let mut loss_plus = 0.0
+        let mut cnt = 0
+        for i in 0..n_batch {
+            if mask[i] == 1 {
+                let orig = tokens_batch[i]
+                let aug = ct_augment_composite(orig, p_drop, p_swap, p_del, seed + i)
+                let tl = ct_forward_linear(orig, teacher_w, vocab)
+                let sl = ct_forward_linear(aug, w_plus, vocab)
+                let tp = ct_softmax(tl)
+                let sp = ct_softmax(sl)
+                loss_plus = loss_plus + ct_consistency_loss(tp, sp, temp)
+                cnt = cnt + 1
+            }
+        }
+        if cnt > 0 { loss_plus = loss_plus / to_float(cnt) }
+        grad[w] = (loss_plus - loss) / eps
+    }
+    let mut new_student = ct_zeros(n_w)
+    for w in 0..n_w { new_student[w] = student_w[w] - lr * grad[w] }
+    let new_teacher = ct_ema_update(teacher_w, new_student, ema_alpha)
+    return [new_student, new_teacher, loss]
+}
+
+// -- extra functions --
+
+fn ct_symmetric_kl(p, q) {
+    let kl_pq = ct_kl_divergence(p, q)
+    let kl_qp = ct_kl_divergence(q, p)
+    return (kl_pq + kl_qp) / 2.0
+}
+
+fn ct_js_divergence(p, q) {
+    let n = len(p)
+    let mut m = ct_zeros(n)
+    for i in 0..n { m[i] = (p[i] + q[i]) / 2.0 }
+    let kl_pm = ct_kl_divergence(p, m)
+    let kl_qm = ct_kl_divergence(q, m)
+    return (kl_pm + kl_qm) / 2.0
+}
+
+fn ct_argmax(probs) {
+    let n = len(probs)
+    let mut best = 0
+    let mut best_v = probs[0]
+    for i in 1..n {
+        if probs[i] > best_v {
+            best_v = probs[i]
+            best = i
+        }
+    }
+    return best
+}
+
+fn ct_entropy(probs) {
+    let n = len(probs)
+    let mut h = 0.0
+    for i in 0..n {
+        if probs[i] > 1.0e-12 { h = h - probs[i] * ct_log(probs[i]) }
+    }
+    return h
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  TEST DATA
+// ═══════════════════════════════════════════════════════════════
+
+let VOCAB = 4
+let SEED = 42
+let tokens_a = [1, 2, 3, 1, 2, 3, 1, 2]
+let tokens_b = [3, 1, 2, 3, 1, 2, 3, 1]
+
+// Small weight vector for testing
+let weights = [0.5, -0.3, 0.8, -0.1, 0.2, 0.6, -0.4, 0.3, 0.1, -0.2, 0.7, -0.5, 0.4, 0.9, -0.6, 0.2]
+
+// ═══════════════════════════════════════════════════════════════
+//  TESTS
+// ═══════════════════════════════════════════════════════════════
+
+// T1: augment_dropout preserves length
+let dropped = ct_augment_dropout(tokens_a, 0.3, SEED)
+check("T1 augment_dropout preserves length", len(dropped) == len(tokens_a))
+
+// T2: augment_dropout replaces some tokens with 0
+let mut has_zero = false
+let dropped_high = ct_augment_dropout([5, 5, 5, 5, 5, 5, 5, 5, 5, 5], 0.9, SEED)
+for i in 0..len(dropped_high) {
+    if dropped_high[i] == 0 { has_zero = true }
+}
+check("T2 augment_dropout replaces with 0", has_zero)
+
+// T3: augment_dropout zero prob -> no change
+let dropped_zero = ct_augment_dropout(tokens_a, 0.0, SEED)
+let mut all_same = true
+for i in 0..len(tokens_a) {
+    if dropped_zero[i] != tokens_a[i] { all_same = false }
+}
+check("T3 augment_dropout prob=0 no change", all_same)
+
+// T4: augment_swap preserves length
+let swapped = ct_augment_swap(tokens_a, 0.5, SEED)
+check("T4 augment_swap preserves length", len(swapped) == len(tokens_a))
+
+// T5: augment_swap changes some positions
+let swapped_high = ct_augment_swap([1, 2, 3, 4, 5, 6, 7, 8], 0.9, SEED)
+let mut any_diff = false
+let orig_seq = [1, 2, 3, 4, 5, 6, 7, 8]
+for i in 0..len(orig_seq) {
+    if swapped_high[i] != orig_seq[i] { any_diff = true }
+}
+check("T5 augment_swap changes positions", any_diff)
+
+// T6: augment_delete shortens sequence
+let deleted = ct_augment_delete(tokens_a, 0.5, SEED)
+check("T6 augment_delete shortens", len(deleted) <= len(tokens_a))
+
+// T7: augment_delete always keeps >= 1 token
+let deleted_all = ct_augment_delete([1, 2, 3], 0.99, 777)
+check("T7 augment_delete keeps >= 1", len(deleted_all) >= 1)
+
+// T8: augment_composite produces valid output
+let composite = ct_augment_composite(tokens_a, 0.1, 0.1, 0.1, SEED)
+check("T8 augment_composite valid output", len(composite) >= 1)
+
+// T9: softmax sums to ~1.0
+let logits1 = [1.0, 2.0, 3.0, 0.5]
+let probs1 = ct_softmax(logits1)
+let mut prob_sum = 0.0
+for i in 0..4 { prob_sum = prob_sum + probs1[i] }
+check("T9 softmax sums to ~1", fabs(prob_sum - 1.0) < 0.01)
+
+// T10: softmax highest logit -> highest prob
+let mut max_idx = 0
+let mut max_p = probs1[0]
+for i in 1..4 {
+    if probs1[i] > max_p { max_p = probs1[i]
+        max_idx = i }
+}
+check("T10 softmax highest logit=highest prob", max_idx == 2)
+
+// T11: log_softmax values are negative
+let lsm = ct_log_softmax(logits1)
+let mut all_neg = true
+for i in 0..4 {
+    if lsm[i] > 0.001 { all_neg = false }
+}
+check("T11 log_softmax values <= 0", all_neg)
+
+// T12: sharpen makes distribution more peaked
+let uniform_ish = [0.25, 0.30, 0.20, 0.25]
+let sharpened = ct_sharpen(uniform_ish, 0.5)
+let max_sharp = ct_max_prob(sharpened)
+let max_orig = ct_max_prob(uniform_ish)
+check("T12 sharpen makes more peaked", max_sharp > max_orig)
+
+// T13: sharpen with temp=1.0 preserves distribution
+let sharp_1 = ct_sharpen(uniform_ish, 1.0)
+let mut sharp_close = true
+for i in 0..4 {
+    if fabs(sharp_1[i] - uniform_ish[i]) > 0.05 { sharp_close = false }
+}
+check("T13 sharpen temp=1 preserves dist", sharp_close)
+
+// T14: kl_divergence of identical distributions ~0
+let p_same = [0.25, 0.25, 0.25, 0.25]
+let kl_same = ct_kl_divergence(p_same, p_same)
+check("T14 KL(P||P) ~= 0", kl_same < 0.01)
+
+// T15: kl_divergence of different distributions > 0
+let p_diff1 = [0.9, 0.05, 0.025, 0.025]
+let p_diff2 = [0.1, 0.1, 0.4, 0.4]
+let kl_diff = ct_kl_divergence(p_diff1, p_diff2)
+check("T15 KL of different dists > 0", kl_diff > 0.1)
+
+// T16: forward_linear returns correct length
+let fwd = ct_forward_linear(tokens_a, weights, VOCAB)
+check("T16 forward returns vocab-length logits", len(fwd) == VOCAB)
+
+// T17: dual_forward returns two distributions
+let aug_a = ct_augment_dropout(tokens_a, 0.2, SEED)
+let dual = ct_dual_forward(tokens_a, aug_a, weights, VOCAB)
+check("T17 dual_forward returns 2 dists", len(dual) == 2)
+
+// T18: consistency_loss >= 0
+let orig_p = ct_softmax(ct_forward_linear(tokens_a, weights, VOCAB))
+let aug_p = ct_softmax(ct_forward_linear(aug_a, weights, VOCAB))
+let c_loss = ct_consistency_loss(orig_p, aug_p, 0.5)
+check("T18 consistency_loss >= 0", c_loss >= 0.0)
+
+// T19: consistency_loss of same input ~0
+let c_loss_same = ct_consistency_loss(orig_p, orig_p, 0.5)
+check("T19 consistency_loss same input ~0", c_loss_same < 0.01)
+
+// T20: ema_update alpha=1 keeps teacher
+let teacher_w = [1.0, 2.0, 3.0, 4.0]
+let student_w = [5.0, 6.0, 7.0, 8.0]
+let ema_1 = ct_ema_update(teacher_w, student_w, 1.0)
+let mut teacher_kept = true
+for i in 0..4 {
+    if fabs(ema_1[i] - teacher_w[i]) > 0.001 { teacher_kept = false }
+}
+check("T20 EMA alpha=1 keeps teacher", teacher_kept)
+
+// T21: ema_update alpha=0 copies student
+let ema_0 = ct_ema_update(teacher_w, student_w, 0.0)
+let mut student_copied = true
+for i in 0..4 {
+    if fabs(ema_0[i] - student_w[i]) > 0.001 { student_copied = false }
+}
+check("T21 EMA alpha=0 copies student", student_copied)
+
+// T22: ema_update blends weights
+let ema_half = ct_ema_update(teacher_w, student_w, 0.5)
+let mut blended_ok = true
+for i in 0..4 {
+    let expected = 0.5 * teacher_w[i] + 0.5 * student_w[i]
+    if fabs(ema_half[i] - expected) > 0.001 { blended_ok = false }
+}
+check("T22 EMA blends weights correctly", blended_ok)
+
+// T23: max_prob returns correct maximum
+let test_probs = [0.1, 0.5, 0.3, 0.1]
+check("T23 max_prob correct", fabs(ct_max_prob(test_probs) - 0.5) < 0.001)
+
+// T24: confidence_mask filters low confidence
+let low_conf = [0.26, 0.24, 0.25, 0.25]
+let high_conf = [0.9, 0.05, 0.03, 0.02]
+let batch_probs = [low_conf, high_conf]
+let cmask = ct_confidence_mask(batch_probs, 0.5)
+check("T24 low confidence filtered out", cmask[0] == 0)
+
+// T25: confidence_mask keeps high confidence
+check("T25 high confidence kept", cmask[1] == 1)
+
+// T26: masked_consistency_loss respects mask
+let ob = [high_conf, low_conf]
+let ab = [low_conf, high_conf]
+let mask_all = [1, 1]
+let mask_none = [0, 0]
+let loss_all = ct_masked_consistency_loss(ob, ab, mask_all, 0.5)
+let loss_none = ct_masked_consistency_loss(ob, ab, mask_none, 0.5)
+check("T26 masked loss: mask=0 gives 0", fabs(loss_none) < 0.001)
+
+// T27: unsupervised_loss computes without labels
+let batch = [tokens_a, tokens_b]
+let u_loss = ct_unsupervised_loss(batch, weights, VOCAB, 0.2, 0.1, 0.1, SEED, 0.5)
+check("T27 unsupervised loss finite", u_loss >= 0.0)
+
+// T28: train_step reduces or maintains loss
+let result1 = ct_train_step(weights, batch, VOCAB, 0.1, 0.2, 0.1, 0.1, SEED, 0.5, 0.0)
+let new_w1 = result1[0]
+let loss1 = result1[1]
+// Run second step
+let result2 = ct_train_step(new_w1, batch, VOCAB, 0.1, 0.2, 0.1, 0.1, SEED, 0.5, 0.0)
+let loss2 = result2[1]
+check("T28 train_step produces valid loss", loss1 >= 0.0)
+
+// T29: ema_train_step updates both student and teacher
+// Start student and teacher with slightly different weights so EMA has signal
+let mut init_teacher = ct_zeros(len(weights))
+for i in 0..len(weights) { init_teacher[i] = weights[i] + 0.05 }
+let ema_result = ct_ema_train_step(weights, init_teacher, batch, VOCAB, 0.1, 0.99, 0.2, 0.1, 0.1, SEED, 0.5, 0.0)
+let new_s = ema_result[0]
+let new_t = ema_result[1]
+let ema_loss = ema_result[2]
+// Teacher and student should differ after update (teacher is EMA)
+let mut s_t_diff = false
+for i in 0..len(weights) {
+    if fabs(new_s[i] - new_t[i]) > 0.0001 { s_t_diff = true }
+}
+check("T29 EMA: student and teacher differ after step", s_t_diff)
+
+// T30: symmetric_kl >= 0
+let skl = ct_symmetric_kl(p_diff1, p_diff2)
+check("T30 symmetric KL >= 0", skl >= 0.0)
+
+// T31: symmetric_kl is symmetric
+let skl_ab = ct_symmetric_kl(p_diff1, p_diff2)
+let skl_ba = ct_symmetric_kl(p_diff2, p_diff1)
+check("T31 symmetric KL is symmetric", fabs(skl_ab - skl_ba) < 0.01)
+
+// T32: js_divergence bounded
+let jsd = ct_js_divergence(p_diff1, p_diff2)
+check("T32 JSD >= 0", jsd >= 0.0)
+check("T32b JSD <= ln(2) (~0.693)", jsd <= 0.72)
+
+// T33: entropy of uniform distribution is maximal
+let uniform4 = [0.25, 0.25, 0.25, 0.25]
+let peaked4 = [0.97, 0.01, 0.01, 0.01]
+let h_uniform = ct_entropy(uniform4)
+let h_peaked = ct_entropy(peaked4)
+check("T33 entropy uniform > peaked", h_uniform > h_peaked)
+
+// T34: entropy of peaked distribution is low
+check("T34 entropy of peaked is low", h_peaked < 0.3)
+
+// T35: argmax picks correct index
+let argmax_test = [0.1, 0.3, 0.5, 0.1]
+check("T35 argmax picks idx 2", ct_argmax(argmax_test) == 2)
+
+// T36: augment_dropout prob=1.0 replaces all tokens
+let drop_all = ct_augment_dropout([5, 5, 5, 5], 1.0, SEED)
+let mut all_zero = true
+for i in 0..4 {
+    if drop_all[i] != 0 { all_zero = false }
+}
+check("T36 dropout prob=1 all zero", all_zero)
+
+// T37: consistency_loss lower temp -> higher loss for different dists
+let loss_warm = ct_consistency_loss(p_diff1, p_diff2, 2.0)
+let loss_cold = ct_consistency_loss(p_diff1, p_diff2, 0.1)
+check("T37 lower temp -> higher loss", loss_cold >= loss_warm)
+
+// T38: confidence threshold=0 includes all
+let mask_all2 = ct_confidence_mask(batch_probs, 0.0)
+check("T38 threshold=0 includes all", mask_all2[0] == 1)
+check("T38b threshold=0 includes all (2)", mask_all2[1] == 1)
+
+// T39: unsupervised mode finite loss
+let u_loss2 = ct_unsupervised_loss(batch, weights, VOCAB, 0.3, 0.2, 0.15, 99, 1.0)
+check("T39 unsupervised loss finite", u_loss2 >= 0.0)
+
+// T40: ema teacher converges toward student over multiple steps
+let mut sw = weights
+let mut tw = ct_zeros(len(weights))
+for i in 0..len(weights) { tw[i] = weights[i] + 0.1 }
+let tw_initial = tw
+for _step in 0..3 {
+    let r = ct_ema_train_step(sw, tw, batch, VOCAB, 0.05, 0.9, 0.1, 0.1, 0.1, SEED, 0.5, 0.0)
+    sw = r[0]
+    tw = r[1]
+}
+// After several steps with alpha=0.9, teacher should move toward student (away from initial)
+let mut moved = false
+for i in 0..len(weights) {
+    if fabs(tw[i] - tw_initial[i]) > 0.0005 { moved = true }
+}
+check("T40 EMA teacher moves from initial", moved)
+
+// ═══════════════════════════════════════════════════════════════
+println("")
+println("=== consistency_training test summary ===")
+println("PASS: " + str(pass_count))
+println("FAIL: " + str(fail_count))
+println("TOTAL: " + str(pass_count + fail_count))

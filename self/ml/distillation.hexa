@@ -1,36 +1,48 @@
 // ═══════════════════════════════════════════════════════════════════
-//  self/ml/distillation.hexa — Knowledge Distillation
+//  self/ml/distillation.hexa — Distillation (#163)
 //
-//  Implements:
-//    1. Teacher forward    — extract soft logits from large model
-//    2. KL divergence loss — student vs teacher distribution comparison
-//    3. Temperature scaling — softmax temperature for distribution smoothing
-//    4. Combined loss      — alpha * KL + (1-alpha) * CE
-//    5. Distill train step — single gradient update step
+//  Full teacher→student knowledge distillation pipeline:
+//    1. Soft label generation  — teacher logits with temperature
+//    2. KL divergence loss     — student vs teacher distributions
+//    3. Temperature scaling    — soften/sharpen distributions
+//    4. Feature distillation   — match intermediate hidden states
+//    5. Attention transfer     — align student attention to teacher
+//    6. Progressive distill    — gradually increase difficulty
+//    7. Layer mapping          — map teacher layers to student layers
+//    8. Combined loss          — alpha*hard + (1-alpha)*soft + beta*feature
 //
-//  API (pure):
-//    soft_targets(logits, temp)                               -> [float]
-//    distill_loss(student_logits, teacher_logits, temp, alpha) -> float
-//    distill_train_step(student, teacher, input, temp, alpha, lr) -> student'
-//    kl_divergence(p, q)                                      -> float
-//    cross_entropy_loss(logits, target_idx)                    -> float
-//    softmax_with_temp(logits, temp)                           -> [float]
-//    teacher_forward(weights, input)                           -> [float]
-//    student_forward(weights, input)                           -> [float]
+//  API:
+//    dst_softmax(logits, temp)               -> [float]
+//    dst_soft_labels(logits, temp)            -> [float]
+//    dst_kl_div(p, q)                        -> float
+//    dst_cross_entropy(logits, target)        -> float
+//    dst_feature_loss(s_feats, t_feats)       -> float
+//    dst_attn_transfer_loss(s_attn, t_attn)   -> float
+//    dst_layer_map(t_layers, s_layers)        -> [int]
+//    dst_progressive_temp(base, epoch, max_e) -> float
+//    dst_progressive_alpha(base, epoch, max_e)-> float
+//    dst_combined_loss(s_log, t_log, s_feat, t_feat, s_attn, t_attn,
+//                      temp, alpha, beta)     -> float
+//    dst_forward(weights, input)              -> [float]
+//    dst_multi_layer_forward(layers, input)   -> {logits, feats, attns}
+//    dst_train_step(student, teacher, input, temp, alpha, lr)
+//    dst_feature_project(feats, proj)         -> [float]
+//    dst_progressive_schedule(epoch, max_epochs) -> {temp, alpha, beta}
+//    dst_eval_accuracy(student, teacher, inputs) -> float
 //
 //  AI-NATIVE attrs:
-//    @pure     — no side effects
-//    @hot      — called every training step
+//    @pure  — no side effects
+//    @hot   — called every training step
 // ═══════════════════════════════════════════════════════════════════
 
 // ── helpers ──────────────────────────────────────────────────────
 
-fn kd_abs(x) {
+fn dst_abs(x) {
     if x < 0.0 { return 0.0 - x }
     return x
 }
 
-fn kd_exp(x) {
+fn dst_exp(x) {
     let mut v = x
     if v > 20.0 { v = 20.0 }
     if v < -20.0 { v = -20.0 }
@@ -44,7 +56,7 @@ fn kd_exp(x) {
     return result
 }
 
-fn kd_log(x) {
+fn dst_log(x) {
     if x <= 0.0 { return -30.0 }
     let mut v = x
     let mut count = 0
@@ -61,98 +73,346 @@ fn kd_log(x) {
     return to_float(count) + ln_v
 }
 
-fn kd_zeros(n) {
+fn dst_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn dst_zeros(n) {
     let mut v = []
     for _i in 0..n { v = v + [0.0] }
     return v
 }
 
-fn kd_hash(seed, i, j) {
+fn dst_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+fn dst_hash(seed, i, j) {
     let h = ((seed * 2654435761 + i * 1315423911 + j * 731) % 10007)
     return to_float(h) / 10007.0 - 0.5
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  Softmax with Temperature
+//  (1) Softmax with Temperature + Soft Label Generation
 //
-//  softmax(x/T) — higher T produces softer distribution
+//  softmax(x/T): higher T -> softer distribution, lower T -> sharper
+//  Soft labels: apply temperature-scaled softmax to teacher logits
 // ═══════════════════════════════════════════════════════════════════
 @pure
-fn softmax_with_temp(logits, temp) {
+fn dst_softmax(logits, temp) {
     let n = len(logits)
-    let mut scaled = kd_zeros(n)
+    let mut scaled = dst_zeros(n)
+    let mut t = temp
+    if t < 0.01 { t = 0.01 }
     for i in 0..n {
-        scaled[i] = logits[i] / temp
+        scaled[i] = logits[i] / t
     }
-    // max for numerical stability
     let mut m = scaled[0]
     for i in 1..n {
         if scaled[i] > m { m = scaled[i] }
     }
-    let mut exps = kd_zeros(n)
+    let mut exps = dst_zeros(n)
     let mut z = 0.0
     for i in 0..n {
-        exps[i] = kd_exp(scaled[i] - m)
+        exps[i] = dst_exp(scaled[i] - m)
         z = z + exps[i]
     }
-    let mut out = kd_zeros(n)
+    let mut out = dst_zeros(n)
     for i in 0..n {
         out[i] = exps[i] / z
     }
     return out
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Soft Targets — temperature-scaled softmax of logits
-// ═══════════════════════════════════════════════════════════════════
 @pure
-fn soft_targets(logits, temp) {
-    return softmax_with_temp(logits, temp)
+fn dst_soft_labels(teacher_logits, temp) {
+    return dst_softmax(teacher_logits, temp)
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  KL Divergence — KL(P || Q) = sum(P * log(P/Q))
+//  (2) KL Divergence Loss
 //
-//  P = teacher distribution, Q = student distribution
+//  KL(P || Q) = sum(P * log(P/Q))
+//  P = teacher soft labels, Q = student soft labels
+//  Returns >= 0 (0 when P == Q)
 // ═══════════════════════════════════════════════════════════════════
-@pure
-fn kl_divergence(p, q) {
+@pure @hot
+fn dst_kl_div(p, q) {
     let n = len(p)
     let mut kl = 0.0
     for i in 0..n {
         if p[i] > 1.0e-10 {
             let ratio = p[i] / (q[i] + 1.0e-10)
-            kl = kl + p[i] * kd_log(ratio)
+            kl = kl + p[i] * dst_log(ratio)
         }
     }
+    if kl < 0.0 { return 0.0 }
     return kl
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (3) Temperature Scaling
+//
+//  Scale logits by temperature before softmax:
+//  - T > 1: softer (more uniform) — reveals dark knowledge
+//  - T < 1: sharper (more peaked) — focuses on top class
+//  - T = 1: standard softmax
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn dst_temp_scale(logits, temp) {
+    let n = len(logits)
+    let mut out = dst_zeros(n)
+    let mut t = temp
+    if t < 0.01 { t = 0.01 }
+    for i in 0..n {
+        out[i] = logits[i] / t
+    }
+    return out
+}
+
+// Entropy of a probability distribution: -sum(p * log(p))
+@pure
+fn dst_entropy(probs) {
+    let n = len(probs)
+    let mut h = 0.0
+    for i in 0..n {
+        if probs[i] > 1.0e-10 {
+            h = h - probs[i] * dst_log(probs[i])
+        }
+    }
+    return h
 }
 
 // ═══════════════════════════════════════════════════════════════════
 //  Cross Entropy Loss — CE = -log(softmax(logits)[target])
 // ═══════════════════════════════════════════════════════════════════
 @pure
-fn cross_entropy_loss(logits, target_idx) {
-    let probs = softmax_with_temp(logits, 1.0)
+fn dst_cross_entropy(logits, target_idx) {
+    let probs = dst_softmax(logits, 1.0)
     let p = probs[target_idx]
     if p > 1.0e-10 {
-        return 0.0 - kd_log(p)
+        return 0.0 - dst_log(p)
     }
     return 30.0
 }
 
+// Argmax helper
+@pure
+fn dst_argmax(vals) {
+    let n = len(vals)
+    let mut best = 0
+    let mut best_v = vals[0]
+    for i in 1..n {
+        if vals[i] > best_v {
+            best_v = vals[i]
+            best = i
+        }
+    }
+    return best
+}
+
 // ═══════════════════════════════════════════════════════════════════
-//  Teacher / Student Forward — mock linear models
+//  (4) Feature Distillation — match intermediate hidden states
 //
-//  weights: [out_dim, in_dim]
-//  input:   [in_dim]
-//  returns: [out_dim] logits
+//  MSE between student and teacher feature vectors.
+//  If dimensions differ, use a projection first (dst_feature_project).
+//
+//  feature_loss = (1/n) * sum((s_feat[i] - t_feat[i])^2)
 // ═══════════════════════════════════════════════════════════════════
 @pure
-fn teacher_forward(weights, input) {
+fn dst_feature_loss(s_feats, t_feats) {
+    let n = len(s_feats)
+    let mut mse = 0.0
+    for i in 0..n {
+        let diff = s_feats[i] - t_feats[i]
+        mse = mse + diff * diff
+    }
+    return mse / to_float(n)
+}
+
+// Project student features to teacher dimension: out = proj * feats
+// proj: [t_dim, s_dim], feats: [s_dim] -> [t_dim]
+@pure
+fn dst_feature_project(feats, proj) {
+    let t_dim = len(proj)
+    let s_dim = len(feats)
+    let mut out = dst_zeros(t_dim)
+    for i in 0..t_dim {
+        let mut s = 0.0
+        for j in 0..s_dim {
+            s = s + proj[i][j] * feats[j]
+        }
+        out[i] = s
+    }
+    return out
+}
+
+// Multi-layer feature loss: average MSE across matched layer pairs
+@pure
+fn dst_multi_feature_loss(s_feat_list, t_feat_list) {
+    let n_layers = len(s_feat_list)
+    if n_layers == 0 { return 0.0 }
+    let mut total = 0.0
+    for l in 0..n_layers {
+        total = total + dst_feature_loss(s_feat_list[l], t_feat_list[l])
+    }
+    return total / to_float(n_layers)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (5) Attention Transfer — align student attention maps to teacher
+//
+//  Attention map: [seq_len, seq_len] or flattened [seq_len^2].
+//  We use L2 norm of the difference between attention maps
+//  normalized by number of elements.
+//
+//  attn_loss = (1/n) * sum((s_attn[i] - t_attn[i])^2)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn dst_attn_transfer_loss(s_attn, t_attn) {
+    let n = len(s_attn)
+    if n == 0 { return 0.0 }
+    let mut mse = 0.0
+    for i in 0..n {
+        let diff = s_attn[i] - t_attn[i]
+        mse = mse + diff * diff
+    }
+    return mse / to_float(n)
+}
+
+// Multi-head attention transfer: average across heads
+@pure
+fn dst_multi_attn_loss(s_attn_list, t_attn_list) {
+    let n_heads = len(s_attn_list)
+    if n_heads == 0 { return 0.0 }
+    let mut total = 0.0
+    for h in 0..n_heads {
+        total = total + dst_attn_transfer_loss(s_attn_list[h], t_attn_list[h])
+    }
+    return total / to_float(n_heads)
+}
+
+// Normalize attention map to sum-to-1 per row (re-normalize)
+@pure
+fn dst_normalize_attn(attn, seq_len) {
+    let n = len(attn)
+    let mut out = dst_zeros(n)
+    for row in 0..seq_len {
+        let base = row * seq_len
+        let mut row_sum = 0.0
+        for col in 0..seq_len {
+            row_sum = row_sum + dst_abs(attn[base + col])
+        }
+        if row_sum < 1.0e-10 { row_sum = 1.0e-10 }
+        for col in 0..seq_len {
+            out[base + col] = attn[base + col] / row_sum
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (6) Progressive Distillation — gradually increase difficulty
+//
+//  As training progresses:
+//  - Temperature decreases (harder targets)
+//  - Alpha shifts toward hard loss
+//  - Beta (feature loss weight) may increase
+//
+//  Schedule functions parameterized by epoch / max_epochs.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn dst_progressive_temp(base_temp, epoch, max_epochs) {
+    // Temperature decreases linearly from base_temp to 1.0
+    if max_epochs <= 1 { return base_temp }
+    let progress = to_float(epoch) / to_float(max_epochs - 1)
+    let mut t = base_temp - (base_temp - 1.0) * progress
+    if t < 1.0 { t = 1.0 }
+    return t
+}
+
+@pure
+fn dst_progressive_alpha(base_alpha, epoch, max_epochs) {
+    // Alpha increases linearly: more hard loss as training progresses
+    if max_epochs <= 1 { return base_alpha }
+    let progress = to_float(epoch) / to_float(max_epochs - 1)
+    let mut a = base_alpha + (1.0 - base_alpha) * progress * 0.5
+    if a > 1.0 { a = 1.0 }
+    return a
+}
+
+@pure
+fn dst_progressive_beta(base_beta, epoch, max_epochs) {
+    // Beta increases from 0 to base_beta (feature loss ramps up)
+    if max_epochs <= 1 { return base_beta }
+    let progress = to_float(epoch) / to_float(max_epochs - 1)
+    return base_beta * progress
+}
+
+// Full progressive schedule: returns [temp, alpha, beta]
+@pure
+fn dst_progressive_schedule(base_temp, base_alpha, base_beta, epoch, max_epochs) {
+    let t = dst_progressive_temp(base_temp, epoch, max_epochs)
+    let a = dst_progressive_alpha(base_alpha, epoch, max_epochs)
+    let b = dst_progressive_beta(base_beta, epoch, max_epochs)
+    return [t, a, b]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (7) Layer Mapping — map teacher layers to student layers
+//
+//  Teacher has more layers than student. We select evenly spaced
+//  teacher layers to match each student layer.
+//
+//  Example: teacher=12, student=4 -> [2, 5, 8, 11]
+//  (uniform spacing, last teacher layer always included)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn dst_layer_map(t_num_layers, s_num_layers) {
+    let mut mapping = dst_zeros_int(s_num_layers)
+    if s_num_layers <= 0 { return mapping }
+    if s_num_layers == 1 {
+        mapping[0] = t_num_layers - 1
+        return mapping
+    }
+    for i in 0..s_num_layers {
+        let frac = to_float(i) / to_float(s_num_layers - 1)
+        let mut idx = to_int(frac * to_float(t_num_layers - 1))
+        if idx >= t_num_layers { idx = t_num_layers - 1 }
+        if idx < 0 { idx = 0 }
+        mapping[i] = idx
+    }
+    return mapping
+}
+
+// Verify mapping is monotonically increasing
+@pure
+fn dst_layer_map_valid(mapping) {
+    let n = len(mapping)
+    if n <= 1 { return true }
+    for i in 1..n {
+        if mapping[i] < mapping[i - 1] { return false }
+    }
+    return true
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Forward Pass — linear layer: out = W * input
+//  weights: [out_dim][in_dim], input: [in_dim] -> [out_dim]
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn dst_forward(weights, input) {
     let out_dim = len(weights)
     let in_dim = len(input)
-    let mut logits = kd_zeros(out_dim)
+    let mut logits = dst_zeros(out_dim)
     for i in 0..out_dim {
         let mut s = 0.0
         for j in 0..in_dim {
@@ -163,92 +423,120 @@ fn teacher_forward(weights, input) {
     return logits
 }
 
+// Multi-layer forward: returns [final_logits, [layer_feats], [layer_attns]]
+// layers: [[out_dim][in_dim], ...], input: [in_dim]
+// For attention simulation, we compute outer-product attention from hidden states
 @pure
-fn student_forward(weights, input) {
-    let out_dim = len(weights)
-    let in_dim = len(input)
-    let mut logits = kd_zeros(out_dim)
-    for i in 0..out_dim {
-        let mut s = 0.0
-        for j in 0..in_dim {
-            s = s + weights[i][j] * input[j]
+fn dst_multi_layer_forward(layers, input) {
+    let n_layers = len(layers)
+    let mut feats = []
+    let mut attns = []
+    let mut h = input
+    for l in 0..n_layers {
+        let out_dim = len(layers[l])
+        let in_dim = len(h)
+        let mut next_h = dst_zeros(out_dim)
+        for i in 0..out_dim {
+            let mut s = 0.0
+            for j in 0..in_dim {
+                s = s + layers[l][i][j] * h[j]
+            }
+            next_h[i] = s
         }
-        logits[i] = s
+        // Store features (hidden state after this layer)
+        feats = feats + [next_h]
+        // Simulate attention: softmax of dot products between hidden dims
+        let hdim = len(next_h)
+        let mut attn = dst_zeros(hdim * hdim)
+        for r in 0..hdim {
+            let mut row_scores = dst_zeros(hdim)
+            for c in 0..hdim {
+                row_scores[c] = next_h[r] * next_h[c]
+            }
+            let row_probs = dst_softmax(row_scores, 1.0)
+            for c in 0..hdim {
+                attn[r * hdim + c] = row_probs[c]
+            }
+        }
+        attns = attns + [attn]
+        h = next_h
     }
-    return logits
+    return [h, feats, attns]
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  Distillation Loss — combined KL + CE
+//  (8) Combined Loss
 //
-//  loss = alpha * T^2 * KL(teacher_soft || student_soft) + (1-alpha) * CE
+//  loss = alpha * hard_loss + (1 - alpha) * soft_loss + beta * feature_loss
 //
-//  T^2 scaling compensates for the gradient magnitude reduction
-//  when using temperature-scaled softmax.
+//  hard_loss:    cross-entropy with hard (argmax) teacher label
+//  soft_loss:    T^2 * KL(teacher_soft || student_soft)
+//  feature_loss: MSE between matched hidden states
+//  attn_loss:    MSE between attention maps (added to feature_loss scaled by gamma)
 // ═══════════════════════════════════════════════════════════════════
 @pure @hot
-fn distill_loss(student_logits, teacher_logits, temp, alpha) {
-    // Soft probability distributions
-    let teacher_soft = soft_targets(teacher_logits, temp)
-    let student_soft = soft_targets(student_logits, temp)
+fn dst_combined_loss(s_logits, t_logits, s_feats, t_feats, s_attn, t_attn, temp, alpha, beta) {
+    // Hard loss: CE with teacher's argmax label
+    let target = dst_argmax(t_logits)
+    let hard_loss = dst_cross_entropy(s_logits, target)
 
-    // KL divergence loss (scaled by T^2)
-    let kl = kl_divergence(teacher_soft, student_soft)
-    let kl_loss = alpha * temp * temp * kl
+    // Soft loss: T^2 * KL(teacher_soft || student_soft)
+    let t_soft = dst_softmax(t_logits, temp)
+    let s_soft = dst_softmax(s_logits, temp)
+    let kl = dst_kl_div(t_soft, s_soft)
+    let soft_loss = temp * temp * kl
 
-    // Hard target CE loss (temp=1, assume target is argmax of teacher)
-    let mut target_idx = 0
-    let mut max_val = teacher_logits[0]
-    for i in 1..len(teacher_logits) {
-        if teacher_logits[i] > max_val {
-            max_val = teacher_logits[i]
-            target_idx = i
-        }
-    }
-    let ce = cross_entropy_loss(student_logits, target_idx)
-    let ce_loss = (1.0 - alpha) * ce
+    // Feature loss: MSE between hidden states
+    let feat_loss = dst_feature_loss(s_feats, t_feats)
 
-    return kl_loss + ce_loss
+    // Attention transfer loss
+    let attn_loss = dst_attn_transfer_loss(s_attn, t_attn)
+
+    // Combined: alpha * hard + (1-alpha) * soft + beta * (feat + attn)
+    let total = alpha * hard_loss + (1.0 - alpha) * soft_loss + beta * (feat_loss + attn_loss)
+    return total
+}
+
+// Simpler combined loss without attention (backward compat)
+@pure @hot
+fn dst_combined_loss_simple(s_logits, t_logits, temp, alpha) {
+    let target = dst_argmax(t_logits)
+    let hard_loss = dst_cross_entropy(s_logits, target)
+    let t_soft = dst_softmax(t_logits, temp)
+    let s_soft = dst_softmax(s_logits, temp)
+    let kl = dst_kl_div(t_soft, s_soft)
+    let soft_loss = temp * temp * kl
+    return alpha * hard_loss + (1.0 - alpha) * soft_loss
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  Distillation Train Step
+//  Training Step — single gradient descent update on student
 //
-//  Single gradient descent step on the student model:
-//    1. Forward both teacher and student
-//    2. Compute distillation loss
-//    3. Numerical gradient (finite differences)
-//    4. Update student weights
-//
-//  student: [out_dim, in_dim]
-//  teacher: [out_dim, in_dim]
-//  input:   [in_dim]
+//  Uses finite-difference gradients (numerical).
+//  student/teacher: [out_dim][in_dim]
 //  Returns: updated student weights
 // ═══════════════════════════════════════════════════════════════════
 @hot
-fn distill_train_step(student, teacher, input, temp, alpha, lr) {
+fn dst_train_step(student, teacher, input, temp, alpha, lr) {
     let out_dim = len(student)
     let in_dim = len(student[0])
     let eps = 1.0e-4
 
-    // Teacher logits (fixed)
-    let teacher_logits = teacher_forward(teacher, input)
+    let teacher_logits = dst_forward(teacher, input)
+    let student_logits = dst_forward(student, input)
+    let loss0 = dst_combined_loss_simple(student_logits, teacher_logits, temp, alpha)
 
-    // Current loss
-    let student_logits = student_forward(student, input)
-    let loss0 = distill_loss(student_logits, teacher_logits, temp, alpha)
-
-    // Compute all gradients first, then apply (batch update)
+    // Compute gradients
     let mut grads = []
     for i in 0..out_dim {
-        let mut grow = kd_zeros(in_dim)
+        let mut grow = dst_zeros(in_dim)
         grads = grads + [grow]
     }
 
     // Copy student for perturbation
     let mut tmp = []
     for i in 0..out_dim {
-        let mut row = kd_zeros(in_dim)
+        let mut row = dst_zeros(in_dim)
         for j in 0..in_dim { row[j] = student[i][j] }
         tmp = tmp + [row]
     }
@@ -257,22 +545,63 @@ fn distill_train_step(student, teacher, input, temp, alpha, lr) {
         for j in 0..in_dim {
             let orig = tmp[i][j]
             tmp[i][j] = orig + eps
-            let logits_p = student_forward(tmp, input)
-            let loss_p = distill_loss(logits_p, teacher_logits, temp, alpha)
+            let logits_p = dst_forward(tmp, input)
+            let loss_p = dst_combined_loss_simple(logits_p, teacher_logits, temp, alpha)
             grads[i][j] = (loss_p - loss0) / eps
-            tmp[i][j] = orig  // restore
+            tmp[i][j] = orig
         }
     }
 
     // Apply gradients
     let mut new_student = []
     for i in 0..out_dim {
-        let mut row = kd_zeros(in_dim)
+        let mut row = dst_zeros(in_dim)
         for j in 0..in_dim {
             row[j] = student[i][j] - lr * grads[i][j]
         }
         new_student = new_student + [row]
     }
-
     return new_student
 }
+
+// ═══════════════════════════════════════════════════════════════════
+//  Evaluation — accuracy of student vs teacher predictions
+//
+//  For each input, compare argmax(student(input)) to argmax(teacher(input))
+//  Returns: fraction of matching predictions [0.0, 1.0]
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn dst_eval_accuracy(student_w, teacher_w, inputs) {
+    let n = len(inputs)
+    if n == 0 { return 0.0 }
+    let mut matches = 0
+    for i in 0..n {
+        let s_out = dst_forward(student_w, inputs[i])
+        let t_out = dst_forward(teacher_w, inputs[i])
+        if dst_argmax(s_out) == dst_argmax(t_out) {
+            matches = matches + 1
+        }
+    }
+    return to_float(matches) / to_float(n)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Cosine Similarity — used for feature alignment quality
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn dst_cosine_sim(a, b) {
+    let n = len(a)
+    let mut dot = 0.0
+    let mut na = 0.0
+    let mut nb = 0.0
+    for i in 0..n {
+        dot = dot + a[i] * b[i]
+        na = na + a[i] * a[i]
+        nb = nb + b[i] * b[i]
+    }
+    let denom = dst_sqrt(na) * dst_sqrt(nb)
+    if denom < 1.0e-10 { return 0.0 }
+    return dot / denom
+}
+
+println("[distillation] loaded — soft labels + KL div + temp scaling + feature distill + attn transfer + progressive + layer map + combined loss")

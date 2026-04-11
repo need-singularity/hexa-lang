@@ -1,0 +1,667 @@
+// ===================================================================
+//  self/ml/mixture_of_agents.hexa — Mixture of Agents (ML #162)
+//
+//  Paper: "Mixture-of-Agents Enhances Large Language Model
+//          Capabilities", Wang et al. 2024
+//
+//  Core idea: multiple LLM "proposer" agents generate diverse
+//  responses in parallel, then an "aggregator" agent synthesizes
+//  them into a single refined output.  This propose-aggregate
+//  loop can repeat for multiple rounds, iteratively improving
+//  quality.
+//
+//  Components:
+//    1. Proposer layer  - N models generate parallel responses
+//    2. Aggregator layer - merge/synthesize proposals
+//    3. Multi-round     - iterative propose -> aggregate refinement
+//    4. Scoring         - quality score per proposal
+//    5. Selection       - pick best or weighted merge
+//    6. Diversity bonus - reward diverse proposals
+//    7. Config          - num_proposers, num_rounds, agg strategy
+//
+//  Data structures (all #{} maps):
+//    Proposal = { id, text, source, score, round }
+//    Round    = { round_idx, proposals: [Proposal], aggregate, scores }
+//    Config   = { num_proposers, num_rounds, aggregation_strategy,
+//                 diversity_weight, temperature, top_k }
+//    Session  = { query, rounds: [Round], config, final_answer, status }
+//
+//  Public API:
+//    moa_default_config()                          -> Config
+//    moa_config(n_prop, n_round, strategy)         -> Config
+//    moa_config_set(cfg, key, val)                 -> Config
+//    moa_new_proposal(id, text, source, round)     -> Proposal
+//    moa_score_proposal(proposal, score)           -> Proposal
+//    moa_new_round(round_idx)                      -> Round
+//    moa_round_add_proposal(round, proposal)       -> Round
+//    moa_round_set_aggregate(round, text)          -> Round
+//    moa_round_best(round)                         -> Proposal
+//    moa_round_scores(round)                       -> [float]
+//    moa_new_session(query, config)                -> Session
+//    moa_session_add_round(session, round)         -> Session
+//    moa_session_set_answer(session, answer)       -> Session
+//    moa_propose(query, context, proposer_fns)     -> [Proposal]
+//    moa_aggregate_best(proposals)                 -> string
+//    moa_aggregate_concat(proposals)               -> string
+//    moa_aggregate_weighted(proposals)             -> string
+//    moa_aggregate(proposals, strategy)            -> string
+//    moa_diversity_scores(proposals)               -> [float]
+//    moa_apply_diversity_bonus(proposals, weight)  -> [Proposal]
+//    moa_run_round(query, context, proposer_fns,
+//                  scorer_fn, strategy, round_idx,
+//                  diversity_weight)               -> Round
+//    moa_run(query, proposer_fns, scorer_fn, cfg)  -> Session
+//    moa_session_summary(session)                  -> string
+//    moa_session_stats(session)                    -> map
+//
+//  Conventions:
+//    - Uses #{} map literals, no {k:v} inside if blocks (HX3)
+//    - No semicolons (P1)
+//    - Flag-variable break pattern (no break inside if)
+//    - Prefixed _moa_ for internal helpers
+// ===================================================================
+
+// ===================================================================
+//  Math / string helpers (prefixed _moa_ to avoid collision)
+// ===================================================================
+
+fn _moa_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn _moa_max_f(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn _moa_min_f(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn _moa_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..20 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn _moa_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn _moa_hash(seed, i) {
+    let h = ((seed * 2654435761 + i * 1315423911 + 7919) % 100003)
+    if h < 0 { return 0 - h }
+    return h
+}
+
+// Jaccard-like token overlap between two strings (split on space)
+fn _moa_token_overlap(a, b) {
+    let ta = a.split(" ")
+    let tb = b.split(" ")
+    let na = len(ta)
+    let nb = len(tb)
+    if na == 0 { return 0.0 }
+    if nb == 0 { return 0.0 }
+    // count shared tokens using a hashmap
+    let set_b = #{}
+    for i in 0..nb {
+        set_b[tb[i]] = true
+    }
+    let mut shared = 0
+    for i in 0..na {
+        if has_key(set_b, ta[i]) {
+            shared = shared + 1
+        }
+    }
+    let union_size = na + nb - shared
+    if union_size == 0 { return 0.0 }
+    return to_float(shared) / to_float(union_size)
+}
+
+// ===================================================================
+//  Config — tunable hyperparameters
+// ===================================================================
+
+fn moa_default_config() {
+    let cfg = #{}
+    cfg["num_proposers"] = 3
+    cfg["num_rounds"] = 2
+    cfg["aggregation_strategy"] = "best"
+    cfg["diversity_weight"] = 0.1
+    cfg["temperature"] = 0.7
+    cfg["top_k"] = 3
+    return cfg
+}
+
+fn moa_config(num_proposers, num_rounds, strategy) {
+    let cfg = moa_default_config()
+    cfg["num_proposers"] = num_proposers
+    cfg["num_rounds"] = num_rounds
+    cfg["aggregation_strategy"] = strategy
+    return cfg
+}
+
+fn moa_config_set(cfg, key, val) {
+    cfg[key] = val
+    return cfg
+}
+
+fn moa_config_get(cfg, key) {
+    return cfg[key]
+}
+
+// ===================================================================
+//  Proposal — a single agent's response
+// ===================================================================
+
+fn moa_new_proposal(id, text, source, round) {
+    let p = #{}
+    p["id"] = id
+    p["text"] = text
+    p["source"] = source
+    p["score"] = 0.0
+    p["round"] = round
+    return p
+}
+
+fn moa_score_proposal(proposal, score) {
+    proposal["score"] = score
+    return proposal
+}
+
+fn moa_proposal_text(p) { return p["text"] }
+fn moa_proposal_score(p) { return p["score"] }
+fn moa_proposal_source(p) { return p["source"] }
+fn moa_proposal_id(p) { return p["id"] }
+
+// ===================================================================
+//  Round — one propose-aggregate cycle
+// ===================================================================
+
+fn moa_new_round(round_idx) {
+    let r = #{}
+    r["round_idx"] = round_idx
+    r["proposals"] = []
+    r["aggregate"] = ""
+    r["scores"] = []
+    r["n_proposals"] = 0
+    return r
+}
+
+fn moa_round_add_proposal(round, proposal) {
+    let mut props = round["proposals"]
+    props = props + [proposal]
+    round["proposals"] = props
+    round["n_proposals"] = len(props)
+    let mut scores = round["scores"]
+    scores = scores + [proposal["score"]]
+    round["scores"] = scores
+    return round
+}
+
+fn moa_round_set_aggregate(round, text) {
+    round["aggregate"] = text
+    return round
+}
+
+fn moa_round_num_proposals(round) {
+    return round["n_proposals"]
+}
+
+fn moa_round_get_aggregate(round) {
+    return round["aggregate"]
+}
+
+fn moa_round_scores(round) {
+    let props = round["proposals"]
+    let n = len(props)
+    let mut out = _moa_zeros(n)
+    for i in 0..n {
+        out[i] = props[i]["score"]
+    }
+    return out
+}
+
+// Return the proposal with the highest score
+fn moa_round_best(round) {
+    let props = round["proposals"]
+    let n = len(props)
+    if n == 0 {
+        return moa_new_proposal(0, "", "none", 0)
+    }
+    let mut best_idx = 0
+    let mut best_score = props[0]["score"]
+    let mut i = 1
+    while i < n {
+        if props[i]["score"] > best_score {
+            best_score = props[i]["score"]
+            best_idx = i
+        }
+        i = i + 1
+    }
+    return props[best_idx]
+}
+
+// ===================================================================
+//  Session — full multi-round orchestration state
+// ===================================================================
+
+fn moa_new_session(query, config) {
+    let s = #{}
+    s["query"] = query
+    s["rounds"] = []
+    s["config"] = config
+    s["final_answer"] = ""
+    s["status"] = "pending"
+    s["n_rounds"] = 0
+    return s
+}
+
+fn moa_session_add_round(session, round) {
+    let mut rounds = session["rounds"]
+    rounds = rounds + [round]
+    session["rounds"] = rounds
+    session["n_rounds"] = len(rounds)
+    session["status"] = "running"
+    return session
+}
+
+fn moa_session_set_answer(session, answer) {
+    session["final_answer"] = answer
+    session["status"] = "done"
+    return session
+}
+
+fn moa_session_query(session) { return session["query"] }
+fn moa_session_status(session) { return session["status"] }
+fn moa_session_answer(session) { return session["final_answer"] }
+fn moa_session_num_rounds(session) { return session["n_rounds"] }
+
+fn moa_session_last_round(session) {
+    let rounds = session["rounds"]
+    let n = len(rounds)
+    if n == 0 { return moa_new_round(0) }
+    return rounds[n - 1]
+}
+
+// ===================================================================
+//  Proposer layer — call N proposer functions in parallel (simulated)
+//
+//  Each proposer_fn: fn(query, context) -> string
+//  Returns [Proposal]
+// ===================================================================
+
+fn moa_propose(query, context, proposer_fns, round_idx) {
+    let n = len(proposer_fns)
+    let mut proposals = []
+    for i in 0..n {
+        let pfn = proposer_fns[i]
+        let text = pfn(query, context)
+        let p = moa_new_proposal(i, text, "proposer_" + to_string(i), round_idx)
+        proposals = proposals + [p]
+    }
+    return proposals
+}
+
+// ===================================================================
+//  Scoring — apply scorer_fn to each proposal
+//
+//  scorer_fn: fn(query, text) -> float
+// ===================================================================
+
+fn moa_score_all(proposals, scorer_fn, query) {
+    let n = len(proposals)
+    let mut scored = []
+    for i in 0..n {
+        let s = scorer_fn(query, proposals[i]["text"])
+        let mut p = proposals[i]
+        p["score"] = s
+        scored = scored + [p]
+    }
+    return scored
+}
+
+// ===================================================================
+//  Diversity scoring
+//
+//  For each proposal, compute average dissimilarity to all others.
+//  Dissimilarity = 1 - token_overlap.
+//  Higher diversity = more unique.
+// ===================================================================
+
+fn moa_diversity_scores(proposals) {
+    let n = len(proposals)
+    let mut divs = _moa_zeros(n)
+    if n <= 1 { return divs }
+    for i in 0..n {
+        let mut total_dissim = 0.0
+        let mut count = 0
+        for j in 0..n {
+            if i != j {
+                let overlap = _moa_token_overlap(proposals[i]["text"],
+                                                  proposals[j]["text"])
+                total_dissim = total_dissim + (1.0 - overlap)
+                count = count + 1
+            }
+        }
+        if count > 0 {
+            divs[i] = total_dissim / to_float(count)
+        }
+    }
+    return divs
+}
+
+// Apply diversity bonus: score += diversity_weight * diversity
+fn moa_apply_diversity_bonus(proposals, diversity_weight) {
+    let divs = moa_diversity_scores(proposals)
+    let n = len(proposals)
+    let mut out = []
+    for i in 0..n {
+        let mut p = proposals[i]
+        p["score"] = p["score"] + diversity_weight * divs[i]
+        out = out + [p]
+    }
+    return out
+}
+
+// ===================================================================
+//  Aggregation strategies
+// ===================================================================
+
+// Strategy: "best" — pick the highest-scored proposal text
+fn moa_aggregate_best(proposals) {
+    let n = len(proposals)
+    if n == 0 { return "" }
+    let mut best_idx = 0
+    let mut best_score = proposals[0]["score"]
+    let mut i = 1
+    while i < n {
+        if proposals[i]["score"] > best_score {
+            best_score = proposals[i]["score"]
+            best_idx = i
+        }
+        i = i + 1
+    }
+    return proposals[best_idx]["text"]
+}
+
+// Strategy: "concat" — concatenate all proposals (simple merge)
+fn moa_aggregate_concat(proposals) {
+    let n = len(proposals)
+    let mut parts = []
+    for i in 0..n {
+        parts = parts + [proposals[i]["text"]]
+    }
+    return parts.join(" | ")
+}
+
+// Strategy: "weighted" — weighted combination by normalized scores
+//   Picks text from highest-scored but annotates with score info
+fn moa_aggregate_weighted(proposals) {
+    let n = len(proposals)
+    if n == 0 { return "" }
+    // Normalize scores
+    let mut total_score = 0.0
+    for i in 0..n {
+        total_score = total_score + _moa_max_f(proposals[i]["score"], 0.0)
+    }
+    if total_score <= 0.0 { return moa_aggregate_best(proposals) }
+    // Find highest weight
+    let mut best_idx = 0
+    let mut best_w = 0.0
+    for i in 0..n {
+        let w = _moa_max_f(proposals[i]["score"], 0.0) / total_score
+        if w > best_w {
+            best_w = w
+            best_idx = i
+        }
+    }
+    return proposals[best_idx]["text"]
+}
+
+// Strategy: "rank_merge" — sort by score, concatenate top-k
+fn moa_aggregate_rank_merge(proposals, top_k) {
+    let n = len(proposals)
+    if n == 0 { return "" }
+    // Simple selection sort by score descending
+    let mut indices = []
+    for i in 0..n { indices = indices + [i] }
+    for i in 0..n {
+        let mut max_j = i
+        let mut j = i + 1
+        while j < n {
+            if proposals[indices[j]]["score"] > proposals[indices[max_j]]["score"] {
+                max_j = j
+            }
+            j = j + 1
+        }
+        if max_j != i {
+            let tmp = indices[i]
+            indices[i] = indices[max_j]
+            indices[max_j] = tmp
+        }
+    }
+    let k = _moa_min_f(to_float(top_k), to_float(n))
+    let ki = to_int(k)
+    let mut parts = []
+    for i in 0..ki {
+        parts = parts + [proposals[indices[i]]["text"]]
+    }
+    return parts.join(" | ")
+}
+
+// Dispatch to aggregation strategy
+fn moa_aggregate(proposals, strategy) {
+    if strategy == "best" { return moa_aggregate_best(proposals) }
+    if strategy == "concat" { return moa_aggregate_concat(proposals) }
+    if strategy == "weighted" { return moa_aggregate_weighted(proposals) }
+    if strategy == "rank_merge" { return moa_aggregate_rank_merge(proposals, 3) }
+    // default: best
+    return moa_aggregate_best(proposals)
+}
+
+// ===================================================================
+//  Selection helpers
+// ===================================================================
+
+// Top-k proposals by score
+fn moa_top_k(proposals, k) {
+    let n = len(proposals)
+    let mut indices = []
+    for i in 0..n { indices = indices + [i] }
+    // selection sort descending
+    for i in 0..n {
+        let mut max_j = i
+        let mut j = i + 1
+        while j < n {
+            if proposals[indices[j]]["score"] > proposals[indices[max_j]]["score"] {
+                max_j = j
+            }
+            j = j + 1
+        }
+        if max_j != i {
+            let tmp = indices[i]
+            indices[i] = indices[max_j]
+            indices[max_j] = tmp
+        }
+    }
+    let limit = to_int(_moa_min_f(to_float(k), to_float(n)))
+    let mut out = []
+    for i in 0..limit {
+        out = out + [proposals[indices[i]]]
+    }
+    return out
+}
+
+// Average score of proposals
+fn moa_avg_score(proposals) {
+    let n = len(proposals)
+    if n == 0 { return 0.0 }
+    let mut total = 0.0
+    for i in 0..n {
+        total = total + proposals[i]["score"]
+    }
+    return total / to_float(n)
+}
+
+// Max score among proposals
+fn moa_max_score(proposals) {
+    let n = len(proposals)
+    if n == 0 { return 0.0 }
+    let mut mx = proposals[0]["score"]
+    for i in 1..n {
+        if proposals[i]["score"] > mx {
+            mx = proposals[i]["score"]
+        }
+    }
+    return mx
+}
+
+// Score variance
+fn moa_score_variance(proposals) {
+    let n = len(proposals)
+    if n <= 1 { return 0.0 }
+    let avg = moa_avg_score(proposals)
+    let mut ss = 0.0
+    for i in 0..n {
+        let d = proposals[i]["score"] - avg
+        ss = ss + d * d
+    }
+    return ss / to_float(n)
+}
+
+// ===================================================================
+//  Single round execution
+//
+//  1. Call proposers to get proposals
+//  2. Score proposals
+//  3. Apply diversity bonus
+//  4. Aggregate
+// ===================================================================
+
+fn moa_run_round(query, context, proposer_fns, scorer_fn, strategy,
+                 round_idx, diversity_weight) {
+    // 1. Propose
+    let mut proposals = moa_propose(query, context, proposer_fns, round_idx)
+
+    // 2. Score
+    proposals = moa_score_all(proposals, scorer_fn, query)
+
+    // 3. Diversity bonus
+    if diversity_weight > 0.0 {
+        proposals = moa_apply_diversity_bonus(proposals, diversity_weight)
+    }
+
+    // 4. Build round and aggregate
+    let mut round = moa_new_round(round_idx)
+    let np = len(proposals)
+    for i in 0..np {
+        round = moa_round_add_proposal(round, proposals[i])
+    }
+    let agg_text = moa_aggregate(proposals, strategy)
+    round = moa_round_set_aggregate(round, agg_text)
+
+    return round
+}
+
+// ===================================================================
+//  Full multi-round orchestration
+//
+//  proposer_fns: [fn(query, context) -> string]
+//  scorer_fn:    fn(query, text) -> float
+//  config:       Config map
+//
+//  Each round's aggregate becomes the context for the next round.
+// ===================================================================
+
+fn moa_run(query, proposer_fns, scorer_fn, config) {
+    let num_rounds = config["num_rounds"]
+    let strategy = config["aggregation_strategy"]
+    let diversity_weight = config["diversity_weight"]
+
+    let mut session = moa_new_session(query, config)
+    let mut context = ""
+
+    let mut r = 0
+    while r < num_rounds {
+        let round = moa_run_round(query, context, proposer_fns, scorer_fn,
+                                  strategy, r, diversity_weight)
+        session = moa_session_add_round(session, round)
+        // aggregate becomes context for next round
+        context = moa_round_get_aggregate(round)
+        r = r + 1
+    }
+
+    session = moa_session_set_answer(session, context)
+    return session
+}
+
+// ===================================================================
+//  Session summary — human-readable trace
+// ===================================================================
+
+fn moa_session_summary(session) {
+    let mut out = "Query: " + session["query"] + "\n"
+    let rounds = session["rounds"]
+    let n = len(rounds)
+    for i in 0..n {
+        let r = rounds[i]
+        out = out + "--- Round " + to_string(r["round_idx"]) + " ---\n"
+        let props = r["proposals"]
+        let np = len(props)
+        for j in 0..np {
+            let p = props[j]
+            out = out + "  [" + p["source"] + "] score="
+            out = out + to_string(p["score"]) + ": " + p["text"] + "\n"
+        }
+        out = out + "  Aggregate: " + r["aggregate"] + "\n"
+    }
+    out = out + "Final: " + session["final_answer"] + "\n"
+    out = out + "Status: " + session["status"] + "\n"
+    return out
+}
+
+// ===================================================================
+//  Session statistics
+// ===================================================================
+
+fn moa_session_stats(session) {
+    let stats = #{}
+    stats["n_rounds"] = session["n_rounds"]
+    stats["status"] = session["status"]
+    stats["has_answer"] = len(session["final_answer"]) > 0
+
+    let rounds = session["rounds"]
+    let nr = len(rounds)
+    let mut total_proposals = 0
+    let mut total_score = 0.0
+    let mut best_score = 0.0
+    for i in 0..nr {
+        let props = rounds[i]["proposals"]
+        let np = len(props)
+        total_proposals = total_proposals + np
+        for j in 0..np {
+            let s = props[j]["score"]
+            total_score = total_score + s
+            if s > best_score { best_score = s }
+        }
+    }
+    stats["total_proposals"] = total_proposals
+    stats["best_score"] = best_score
+    if total_proposals > 0 {
+        stats["avg_score"] = total_score / to_float(total_proposals)
+    } else {
+        stats["avg_score"] = 0.0
+    }
+    return stats
+}
+
+println("[mixture_of_agents] module loaded")

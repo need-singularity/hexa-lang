@@ -1,0 +1,574 @@
+// ===================================================================
+//  self/ml/ring_buffer_kv.hexa — Ring Buffer KV Cache (#168)
+//
+//  Fixed-capacity circular buffer for K and V in attention inference.
+//  Enables infinite generation with bounded memory.
+//
+//  Implements:
+//    1. Circular buffer with fixed capacity for K and V
+//    2. Write pointer advancing with wrap-around
+//    3. Read with wrap: attention over ring buffer considering wrap
+//    4. Eviction policy: oldest-first automatic eviction
+//    5. Attention mask for ring: handle discontinuity at wrap point
+//    6. Streaming mode: continuous token-by-token append
+//    7. Memory bound guarantee: never exceed capacity
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+//    @hot   — performance-critical path
+// ===================================================================
+
+// ===================================================================
+//  Utility helpers
+// ===================================================================
+
+fn rbkv_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn rbkv_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn rbkv_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn rbkv_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+fn rbkv_fill_float(n, val) {
+    let mut v = []
+    for _i in 0..n { v = v + [val] }
+    return v
+}
+
+fn rbkv_max_f(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn rbkv_min_f(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn rbkv_min_i(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn rbkv_max_i(a, b) {
+    if a > b { return a }
+    return b
+}
+
+// Dot product
+@pure
+fn rbkv_dot(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    for i in 0..n {
+        s = s + a[i] * b[i]
+    }
+    return s
+}
+
+// L2 norm
+@pure
+fn rbkv_norm(v) {
+    return rbkv_sqrt(rbkv_dot(v, v))
+}
+
+// Softmax over a float array
+@pure
+fn rbkv_softmax(logits) {
+    let n = len(logits)
+    // Find max for numerical stability
+    let mut mx = logits[0]
+    for i in 1..n {
+        if logits[i] > mx { mx = logits[i] }
+    }
+    let mut exps = rbkv_zeros(n)
+    let mut total = 0.0
+    for i in 0..n {
+        let e = rbkv_exp_approx(logits[i] - mx)
+        exps[i] = e
+        total = total + e
+    }
+    if total < 1.0e-30 { total = 1.0e-30 }
+    let mut out = rbkv_zeros(n)
+    for i in 0..n {
+        out[i] = exps[i] / total
+    }
+    return out
+}
+
+// Fast exp approximation via Taylor series (good enough for softmax)
+@pure
+fn rbkv_exp_approx(x) {
+    // Clamp to avoid overflow
+    let mut cx = x
+    if cx > 20.0 { cx = 20.0 }
+    if cx < -20.0 { cx = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..20 {
+        term = term * cx / to_float(i)
+        result = result + term
+    }
+    if result < 1.0e-30 { result = 1.0e-30 }
+    return result
+}
+
+// ===================================================================
+//  1. Ring Buffer KV data structure
+//
+//  A ring buffer cache is represented as a map:
+//    #{
+//      "keys":       [[dim floats], ...],   // pre-allocated key slots
+//      "values":     [[dim floats], ...],   // pre-allocated value slots
+//      "capacity":   int,                   // fixed maximum size
+//      "count":      int,                   // current number of valid entries
+//      "write_ptr":  int,                   // next write position
+//      "step":       int,                   // total tokens written (monotonic)
+//      "ages":       [int, ...],            // insertion step per slot
+//      "valid":      [int, ...],            // 1 if slot has data, 0 otherwise
+//      "dim":        int                    // vector dimension
+//    }
+// ===================================================================
+
+// Create a ring buffer with given capacity and dimension
+fn rbkv_create(capacity, dim) {
+    let zero_vec = rbkv_zeros(dim)
+    let mut keys = []
+    let mut vals = []
+    let mut ages = []
+    let mut valid = []
+    for _i in 0..capacity {
+        keys = keys + [zero_vec]
+        vals = vals + [zero_vec]
+        ages = ages + [0]
+        valid = valid + [0]
+    }
+    return #{
+        "keys": keys,
+        "values": vals,
+        "capacity": capacity,
+        "count": 0,
+        "write_ptr": 0,
+        "step": 0,
+        "ages": ages,
+        "valid": valid,
+        "dim": dim
+    }
+}
+
+// Get current number of valid entries
+@pure
+fn rbkv_size(ring) {
+    return ring["count"]
+}
+
+// Get capacity
+@pure
+fn rbkv_capacity(ring) {
+    return ring["capacity"]
+}
+
+// Check if buffer is full
+@pure
+fn rbkv_is_full(ring) {
+    return ring["count"] >= ring["capacity"]
+}
+
+// ===================================================================
+//  2. Write pointer advancing with wrap-around
+//     Append a KV pair. When full, overwrites the oldest entry.
+// ===================================================================
+fn rbkv_append(ring, key_vec, val_vec) {
+    let mut r = ring
+    let cap = r["capacity"]
+    let wp = r["write_ptr"]
+
+    // Write into the current write_ptr slot
+    let mut ks = r["keys"]
+    ks[wp] = key_vec
+    r["keys"] = ks
+
+    let mut vs = r["values"]
+    vs[wp] = val_vec
+    r["values"] = vs
+
+    let mut ag = r["ages"]
+    ag[wp] = r["step"]
+    r["ages"] = ag
+
+    let mut vl = r["valid"]
+    vl[wp] = 1
+    r["valid"] = vl
+
+    // Advance write pointer with wrap
+    let next_wp = (wp + 1) % cap
+    r["write_ptr"] = next_wp
+
+    // Update count (capped at capacity)
+    let cur_count = r["count"]
+    if cur_count < cap {
+        r["count"] = cur_count + 1
+    }
+
+    // Step always increments
+    r["step"] = r["step"] + 1
+
+    return r
+}
+
+// ===================================================================
+//  3. Read with wrap: get all valid entries in insertion order
+//     Returns keys and values ordered from oldest to newest,
+//     handling the wrap-around discontinuity.
+// ===================================================================
+@pure
+fn rbkv_read_ordered(ring) {
+    let cap = ring["capacity"]
+    let count = ring["count"]
+    let wp = ring["write_ptr"]
+    let keys = ring["keys"]
+    let vals = ring["values"]
+    let valid = ring["valid"]
+
+    let mut out_keys = []
+    let mut out_vals = []
+
+    if count < cap {
+        // Buffer not yet full: entries are at indices 0..count
+        for i in 0..count {
+            out_keys = out_keys + [keys[i]]
+            out_vals = out_vals + [vals[i]]
+        }
+    } else {
+        // Buffer full: oldest is at write_ptr, wraps around
+        for i in 0..cap {
+            let idx = (wp + i) % cap
+            out_keys = out_keys + [keys[idx]]
+            out_vals = out_vals + [vals[idx]]
+        }
+    }
+
+    return #{"keys": out_keys, "values": out_vals}
+}
+
+// Read keys only in insertion order
+@pure
+fn rbkv_read_keys(ring) {
+    let ordered = rbkv_read_ordered(ring)
+    return ordered["keys"]
+}
+
+// Read values only in insertion order
+@pure
+fn rbkv_read_values(ring) {
+    let ordered = rbkv_read_ordered(ring)
+    return ordered["values"]
+}
+
+// Get the physical slot index for the i-th oldest valid entry
+@pure
+fn rbkv_logical_to_physical(ring, logical_idx) {
+    let cap = ring["capacity"]
+    let count = ring["count"]
+    let wp = ring["write_ptr"]
+
+    if count < cap {
+        return logical_idx
+    }
+    return (wp + logical_idx) % cap
+}
+
+// ===================================================================
+//  4. Eviction policy: oldest-first automatic eviction
+//     In a ring buffer, eviction is implicit -- the write pointer
+//     overwrites the oldest entry. This function explicitly finds
+//     the oldest entry's slot index.
+// ===================================================================
+@pure
+fn rbkv_oldest_slot(ring) {
+    let cap = ring["capacity"]
+    let count = ring["count"]
+    let wp = ring["write_ptr"]
+
+    if count < cap {
+        // Oldest is always slot 0 when not full
+        return 0
+    }
+    // When full, oldest is at write_ptr (about to be overwritten next)
+    return wp
+}
+
+// Get the age (step) of the oldest entry
+@pure
+fn rbkv_oldest_age(ring) {
+    let slot = rbkv_oldest_slot(ring)
+    let ages = ring["ages"]
+    return ages[slot]
+}
+
+// Get the age of the newest entry
+@pure
+fn rbkv_newest_age(ring) {
+    let cap = ring["capacity"]
+    let wp = ring["write_ptr"]
+    let count = ring["count"]
+    if count == 0 { return -1 }
+    // Newest is at write_ptr - 1 (with wrap)
+    let newest_slot = (wp + cap - 1) % cap
+    let ages = ring["ages"]
+    return ages[newest_slot]
+}
+
+// ===================================================================
+//  5. Attention mask for ring: handle discontinuity at wrap point
+//     Creates a causal attention mask that respects the ring order.
+//     For position i in the ordered sequence, it can attend to
+//     positions 0..i (inclusive) -- i.e., older and same-age entries.
+// ===================================================================
+@pure
+fn rbkv_causal_mask(ring) {
+    let count = ring["count"]
+    // mask[i][j] = 1.0 if query position i can attend to key position j
+    // In ordered (oldest-to-newest) space: position i attends to 0..i
+    let mut mask = []
+    for i in 0..count {
+        let mut row = rbkv_zeros(count)
+        for j in 0..count {
+            if j <= i {
+                row[j] = 1.0
+            }
+        }
+        mask = mask + [row]
+    }
+    return mask
+}
+
+// Full attention mask (all positions can attend to all valid entries)
+@pure
+fn rbkv_full_mask(ring) {
+    let count = ring["count"]
+    let mut mask = []
+    for i in 0..count {
+        let mut row = rbkv_fill_float(count, 1.0)
+        mask = mask + [row]
+    }
+    return mask
+}
+
+// Apply mask to attention logits: set masked positions to large negative
+@pure
+fn rbkv_apply_mask(logits, mask_row) {
+    let n = len(logits)
+    let mut out = rbkv_zeros(n)
+    for i in 0..n {
+        if mask_row[i] > 0.5 {
+            out[i] = logits[i]
+        } else {
+            out[i] = -1.0e9
+        }
+    }
+    return out
+}
+
+// ===================================================================
+//  6. Attention over ring buffer
+//     Compute attention output for a single query against the ring.
+//     Returns the weighted sum of values.
+// ===================================================================
+@hot
+fn rbkv_attend(ring, query, use_causal_mask) {
+    let count = ring["count"]
+    if count == 0 { return rbkv_zeros(ring["dim"]) }
+
+    let ordered = rbkv_read_ordered(ring)
+    let ok = ordered["keys"]
+    let ov = ordered["values"]
+
+    // Compute raw attention logits: dot(query, key_i)
+    let mut logits = rbkv_zeros(count)
+    for i in 0..count {
+        logits[i] = rbkv_dot(query, ok[i])
+    }
+
+    // Apply causal mask if requested (query attends to all by default)
+    if use_causal_mask {
+        // Last position (newest query) can attend to everything
+        let mut mask_row = rbkv_fill_float(count, 1.0)
+        logits = rbkv_apply_mask(logits, mask_row)
+    }
+
+    // Softmax
+    let weights = rbkv_softmax(logits)
+
+    // Weighted sum of values
+    let dim = ring["dim"]
+    let mut out = rbkv_zeros(dim)
+    for i in 0..count {
+        for d in 0..dim {
+            out[d] = out[d] + weights[i] * ov[i][d]
+        }
+    }
+    return out
+}
+
+// Compute raw attention scores (no softmax) for diagnostics
+@pure
+fn rbkv_raw_scores(ring, query) {
+    let count = ring["count"]
+    let ordered = rbkv_read_ordered(ring)
+    let ok = ordered["keys"]
+    let mut scores = rbkv_zeros(count)
+    for i in 0..count {
+        scores[i] = rbkv_dot(query, ok[i])
+    }
+    return scores
+}
+
+// ===================================================================
+//  7. Streaming mode: continuous token-by-token append
+//     A convenience wrapper that appends a token's KV and returns
+//     the attention output in one step.
+// ===================================================================
+fn rbkv_stream_step(ring, key_vec, val_vec, query) {
+    let r = rbkv_append(ring, key_vec, val_vec)
+    let output = rbkv_attend(r, query, false)
+    return #{"ring": r, "output": output}
+}
+
+// Stream multiple tokens at once, returning final ring and all outputs
+fn rbkv_stream_batch(ring, key_list, val_list, query_list) {
+    let n = len(key_list)
+    let mut r = ring
+    let mut outputs = []
+    for i in 0..n {
+        let result = rbkv_stream_step(r, key_list[i], val_list[i], query_list[i])
+        r = result["ring"]
+        outputs = outputs + [result["output"]]
+    }
+    return #{"ring": r, "outputs": outputs}
+}
+
+// ===================================================================
+//  8. Memory bound guarantee
+//     Verify that ring buffer never exceeds capacity.
+// ===================================================================
+@pure
+fn rbkv_check_bound(ring) {
+    let count = ring["count"]
+    let cap = ring["capacity"]
+    if count > cap { return false }
+    let wp = ring["write_ptr"]
+    if wp < 0 { return false }
+    if wp >= cap { return false }
+    return true
+}
+
+// Memory usage stats
+@pure
+fn rbkv_stats(ring) {
+    let count = ring["count"]
+    let cap = ring["capacity"]
+    let dim = ring["dim"]
+    let total_tokens = ring["step"]
+    let mem_entries = cap * dim * 2
+    let mut utilization = 0.0
+    if cap > 0 {
+        utilization = to_float(count) / to_float(cap) * 100.0
+    }
+    let mut evicted = 0
+    if total_tokens > cap {
+        evicted = total_tokens - cap
+    }
+    return #{
+        "count": count,
+        "capacity": cap,
+        "dim": dim,
+        "total_tokens_seen": total_tokens,
+        "evicted": evicted,
+        "utilization_pct": utilization,
+        "mem_entries": mem_entries,
+        "write_ptr": ring["write_ptr"]
+    }
+}
+
+// ===================================================================
+//  9. Multi-head ring buffer
+//     Create a set of ring buffers, one per attention head.
+// ===================================================================
+fn rbkv_multi_head_create(n_heads, capacity, dim) {
+    let mut heads = []
+    for _h in 0..n_heads {
+        heads = heads + [rbkv_create(capacity, dim)]
+    }
+    return #{"heads": heads, "n_heads": n_heads, "capacity": capacity, "dim": dim}
+}
+
+// Append KV to a specific head
+fn rbkv_multi_head_append(mh, head_idx, key_vec, val_vec) {
+    let mut heads = mh["heads"]
+    heads[head_idx] = rbkv_append(heads[head_idx], key_vec, val_vec)
+    let mut m = mh
+    m["heads"] = heads
+    return m
+}
+
+// Attend from a specific head
+@hot
+fn rbkv_multi_head_attend(mh, head_idx, query) {
+    let heads = mh["heads"]
+    return rbkv_attend(heads[head_idx], query, false)
+}
+
+// ===================================================================
+//  10. Ring buffer copy (deep clone)
+// ===================================================================
+fn rbkv_copy(ring) {
+    let cap = ring["capacity"]
+    let keys = ring["keys"]
+    let vals = ring["values"]
+    let ages = ring["ages"]
+    let valid = ring["valid"]
+    let mut new_keys = []
+    let mut new_vals = []
+    let mut new_ages = []
+    let mut new_valid = []
+    for i in 0..cap {
+        new_keys = new_keys + [keys[i]]
+        new_vals = new_vals + [vals[i]]
+        new_ages = new_ages + [ages[i]]
+        new_valid = new_valid + [valid[i]]
+    }
+    return #{
+        "keys": new_keys,
+        "values": new_vals,
+        "capacity": cap,
+        "count": ring["count"],
+        "write_ptr": ring["write_ptr"],
+        "step": ring["step"],
+        "ages": new_ages,
+        "valid": new_valid,
+        "dim": ring["dim"]
+    }
+}
+
+println("[ring_buffer_kv] loaded — circular KV cache + wrap attention + streaming + memory-bounded")

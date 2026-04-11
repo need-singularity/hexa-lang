@@ -1,0 +1,390 @@
+// ===================================================================
+//  self/ml/sparse_attention.hexa — Sparse Attention (#164)
+//
+//  BigBird/Longformer-style sparse attention patterns that reduce
+//  full O(N^2) attention to O(N*sqrt(N)) for long documents.
+//
+//  Implements:
+//    1. Random attention      — each token attends to r random positions
+//    2. Window attention      — local sliding window of size W
+//    3. Global attention      — designated tokens attend everywhere
+//    4. Combined sparse mask  — union of random + window + global
+//    5. Block sparse          — attention in fixed-size blocks
+//    6. Strided pattern       — attend every s-th position
+//    7. Sparse softmax        — efficient attention over sparse mask
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+//    @hot   — inner-loop performance-critical
+// ===================================================================
+
+// ── helpers ─────────────────────────────────────────────────────
+
+fn sa_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn sa_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+fn sa_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn sa_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 { g = (g + x / g) / 2.0 }
+    return g
+}
+
+fn sa_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn sa_min_int(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn sa_max_int(a, b) {
+    if a > b { return a }
+    return b
+}
+
+// Simple LCG-based pseudo-random number generator
+// Returns next seed and a value in [0, bound)
+@pure
+fn sa_lcg_next(seed, bound) {
+    let next_seed = (seed * 1103515245 + 12345) % 2147483647
+    let mut s = next_seed
+    if s < 0 { s = 0 - s }
+    let val = s % bound
+    return [next_seed, val]
+}
+
+// ===================================================================
+//  1. Random Attention
+//
+//  Each token at position i attends to r random positions in [0, i]
+//  (causal). Uses deterministic pseudo-random for reproducibility.
+//
+//  Returns: [seq_len][seq_len] mask (0.0 / 1.0)
+// ===================================================================
+@pure
+fn sa_build_random_mask(seq_len, num_random, seed) {
+    let mut mask = []
+    let mut cur_seed = seed
+    for i in 0..seq_len {
+        let mut row = sa_zeros(seq_len)
+        // always attend to self
+        row[i] = 1.0
+        // pick r random positions in [0, i]
+        let pool_size = i + 1
+        let mut picks = 0
+        let max_attempts = num_random * 3 + 1
+        // Bounded for-loop replaces while+break (hexa while-break short-circuit pitfall)
+        for _a in 0..max_attempts {
+            if picks < num_random {
+                let result = sa_lcg_next(cur_seed, pool_size)
+                cur_seed = result[0]
+                let j = result[1]
+                if row[j] < 0.5 {
+                    row[j] = 1.0
+                    picks = picks + 1
+                }
+            }
+        }
+        mask = mask + [row]
+    }
+    return mask
+}
+
+// ===================================================================
+//  2. Window Attention
+//
+//  Local sliding window: token i attends to [max(0, i-W+1), i].
+//  Causal constraint enforced (no future tokens).
+//
+//  Returns: [seq_len][seq_len] mask
+// ===================================================================
+@pure
+fn sa_build_window_mask(seq_len, window_size) {
+    let mut mask = []
+    for i in 0..seq_len {
+        let mut row = sa_zeros(seq_len)
+        let start = sa_max_int(0, i - window_size + 1)
+        for j in start..(i + 1) {
+            row[j] = 1.0
+        }
+        mask = mask + [row]
+    }
+    return mask
+}
+
+// ===================================================================
+//  3. Global Attention
+//
+//  Designated global tokens attend to ALL causal positions, and
+//  ALL tokens can attend to global tokens (within causal constraint).
+//
+//  global_indices: array of positions that are global
+//  Returns: [seq_len][seq_len] mask
+// ===================================================================
+@pure
+fn sa_build_global_mask(seq_len, global_indices) {
+    let mut is_global = sa_zeros_int(seq_len)
+    let ng = len(global_indices)
+    for gi in 0..ng {
+        let idx = global_indices[gi]
+        if idx >= 0 {
+            if idx < seq_len {
+                is_global[idx] = 1
+            }
+        }
+    }
+
+    let mut mask = []
+    for i in 0..seq_len {
+        let mut row = sa_zeros(seq_len)
+        if is_global[i] == 1 {
+            // global token attends to all causal positions
+            for j in 0..(i + 1) {
+                row[j] = 1.0
+            }
+        } else {
+            // non-global can attend to global tokens that are causal
+            for j in 0..(i + 1) {
+                if is_global[j] == 1 {
+                    row[j] = 1.0
+                }
+            }
+        }
+        mask = mask + [row]
+    }
+    return mask
+}
+
+// ===================================================================
+//  4. Combined Sparse Mask
+//
+//  Union of random + window + global masks via element-wise OR.
+//  This is the BigBird/Longformer combined pattern.
+//
+//  Returns: [seq_len][seq_len] mask
+// ===================================================================
+@pure
+fn sa_combine_two_masks(mask_a, mask_b) {
+    let seq_len = len(mask_a)
+    let mut combined = []
+    for i in 0..seq_len {
+        let mut row = sa_zeros(seq_len)
+        for j in 0..seq_len {
+            if mask_a[i][j] > 0.5 {
+                row[j] = 1.0
+            } else {
+                if mask_b[i][j] > 0.5 {
+                    row[j] = 1.0
+                }
+            }
+        }
+        combined = combined + [row]
+    }
+    return combined
+}
+
+@pure
+fn sa_build_combined_mask(seq_len, window_size, num_random, global_indices, seed) {
+    let win_mask = sa_build_window_mask(seq_len, window_size)
+    let rand_mask = sa_build_random_mask(seq_len, num_random, seed)
+    let glob_mask = sa_build_global_mask(seq_len, global_indices)
+    let wr = sa_combine_two_masks(win_mask, rand_mask)
+    return sa_combine_two_masks(wr, glob_mask)
+}
+
+// ===================================================================
+//  5. Block Sparse
+//
+//  Divide the sequence into blocks of size B. Each block attends
+//  only within itself (causal). Diagonal block attention pattern.
+//
+//  Returns: [seq_len][seq_len] mask
+// ===================================================================
+@pure
+fn sa_build_block_sparse_mask(seq_len, block_size) {
+    let mut mask = []
+    for i in 0..seq_len {
+        let mut row = sa_zeros(seq_len)
+        let block_id = i / block_size
+        let block_start = block_id * block_size
+        // attend within same block, causal
+        for j in block_start..(i + 1) {
+            row[j] = 1.0
+        }
+        mask = mask + [row]
+    }
+    return mask
+}
+
+// Block sparse attention computation
+@pure @hot
+fn sa_block_sparse_attention(queries, keys, values, block_size) {
+    let mask = sa_build_block_sparse_mask(len(queries), block_size)
+    return sa_sparse_softmax_attention(queries, keys, values, mask)
+}
+
+// ===================================================================
+//  6. Strided Pattern
+//
+//  Each token attends to every s-th position (causal).
+//  Token i attends to { j : j <= i, j % stride == 0 } plus self.
+//
+//  Returns: [seq_len][seq_len] mask
+// ===================================================================
+@pure
+fn sa_build_strided_mask(seq_len, stride) {
+    let mut mask = []
+    for i in 0..seq_len {
+        let mut row = sa_zeros(seq_len)
+        // always attend to self
+        row[i] = 1.0
+        // attend to every stride-th position (causal)
+        let mut j = 0
+        while j <= i {
+            row[j] = 1.0
+            j = j + stride
+        }
+        mask = mask + [row]
+    }
+    return mask
+}
+
+// Strided attention computation
+@pure @hot
+fn sa_strided_attention(queries, keys, values, stride) {
+    let mask = sa_build_strided_mask(len(queries), stride)
+    return sa_sparse_softmax_attention(queries, keys, values, mask)
+}
+
+// ===================================================================
+//  7. Sparse Softmax
+//
+//  Efficient attention computation that only computes scores for
+//  positions where mask[i][j] == 1.0. Masked positions get -inf.
+//
+//  Returns: [seq_len][dim] output
+// ===================================================================
+@pure @hot
+fn sa_sparse_softmax_attention(queries, keys, values, mask) {
+    let seq_len = len(queries)
+    if seq_len == 0 { return [] }
+    let dim = len(queries[0])
+    let scale = 1.0 / sa_sqrt(to_float(dim))
+    let neg_inf = -1.0e9
+    let mut output = []
+
+    for i in 0..seq_len {
+        // collect active positions from mask
+        let mut active = []
+        for j in 0..seq_len {
+            if mask[i][j] > 0.5 {
+                active = active + [j]
+            }
+        }
+
+        let n_active = len(active)
+        if n_active == 0 {
+            output = output + [sa_zeros(dim)]
+        } else {
+            // compute scores only for active positions
+            let mut scores = sa_zeros(n_active)
+            for aidx in 0..n_active {
+                let j = active[aidx]
+                let mut dot = 0.0
+                for d in 0..dim {
+                    dot = dot + queries[i][d] * keys[j][d]
+                }
+                scores[aidx] = dot * scale
+            }
+
+            // softmax over active scores
+            let mut mx = scores[0]
+            for aidx in 1..n_active {
+                if scores[aidx] > mx { mx = scores[aidx] }
+            }
+            let mut exps = sa_zeros(n_active)
+            let mut z = 0.0
+            for aidx in 0..n_active {
+                exps[aidx] = sa_exp(scores[aidx] - mx)
+                z = z + exps[aidx]
+            }
+            if z < 1.0e-12 { z = 1.0e-12 }
+
+            // weighted sum of values at active positions
+            let mut out_vec = sa_zeros(dim)
+            for aidx in 0..n_active {
+                let w = exps[aidx] / z
+                let j = active[aidx]
+                for d in 0..dim {
+                    out_vec[d] = out_vec[d] + w * values[j][d]
+                }
+            }
+            output = output + [out_vec]
+        }
+    }
+    return output
+}
+
+// ===================================================================
+//  Utility: count nonzero entries in a mask
+// ===================================================================
+@pure
+fn sa_mask_row_count(mask, row_idx) {
+    let row = mask[row_idx]
+    let n = len(row)
+    let mut count = 0
+    for j in 0..n {
+        if row[j] > 0.5 { count = count + 1 }
+    }
+    return count
+}
+
+@pure
+fn sa_mask_total_nonzero(mask) {
+    let seq_len = len(mask)
+    let mut total = 0
+    for i in 0..seq_len {
+        total = total + sa_mask_row_count(mask, i)
+    }
+    return total
+}
+
+// Compute sparsity ratio: 1 - (nonzero / total_possible_causal)
+// Total possible causal entries for seq_len = seq_len*(seq_len+1)/2
+@pure
+fn sa_sparsity_ratio(mask) {
+    let seq_len = len(mask)
+    let total_causal = seq_len * (seq_len + 1) / 2
+    let nonzero = sa_mask_total_nonzero(mask)
+    if total_causal == 0 { return 0.0 }
+    return 1.0 - to_float(nonzero) / to_float(total_causal)
+}
+
+println("[sparse_attention] loaded — random + window + global + combined + block sparse + strided + sparse softmax")

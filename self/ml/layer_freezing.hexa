@@ -1,0 +1,480 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/layer_freezing.hexa — Layer Freezing (#172)
+//
+//  Progressive layer freezing for training acceleration.
+//
+//  Implements:
+//    1. Freeze schedule         — define when each layer freezes (by step/epoch)
+//    2. Gradual freeze bottom-up — freeze lowest layers first, progressively
+//    3. Discriminative LR       — different learning rates per layer
+//    4. Freeze by gradient norm — auto-freeze when grad norm < threshold
+//    5. Thaw policy             — unfreeze layers on loss plateau
+//    6. Memory savings tracker  — compute memory saved from frozen layers
+//
+//  API (pure):
+//    lf_make_schedule(n_layers, total_steps)             -> [int]
+//    lf_is_frozen(layer_idx, step, schedule)             -> int
+//    lf_frozen_mask(step, schedule)                      -> [int]
+//    lf_count_frozen(step, schedule)                     -> int
+//    lf_count_active(step, schedule)                     -> int
+//    lf_gradual_bottom_up(n_layers, step, total_steps)   -> [int]
+//    lf_disc_lr(base_lr, n_layers, decay)                -> [float]
+//    lf_disc_lr_with_freeze(base_lr, n_layers, decay, frozen_mask) -> [float]
+//    lf_grad_norms(grads)                                -> [float]
+//    lf_freeze_by_grad(grad_norms, threshold)            -> [int]
+//    lf_should_thaw(loss_history, window, min_improve)   -> int
+//    lf_thaw_layers(frozen_mask, n_thaw)                 -> [int]
+//    lf_thaw_policy(frozen_mask, loss_history, window, min_improve, n_thaw) -> [int]
+//    lf_mem_per_layer(param_counts, bytes_per_param)     -> [float]
+//    lf_mem_saved(param_counts, frozen_mask, bytes_per_param) -> float
+//    lf_mem_total(param_counts, bytes_per_param)         -> float
+//    lf_mem_fraction_saved(param_counts, frozen_mask, bytes_per_param) -> float
+//    lf_train_step(weights, grads, lr_per_layer, frozen_mask) -> [float]
+//    lf_make_schedule_epochs(n_layers, total_epochs)     -> [int]
+//    lf_adaptive_freeze(grad_norms, threshold, prev_mask) -> [int]
+//    lf_warmup_schedule(n_layers, warmup_steps, total_steps) -> [int]
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+//    @hot   — called every training step
+// ═══════════════════════════════════════════════════════════════════
+
+// ── helpers ──────────────────────────────────────────────────────
+
+fn lf_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn lf_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn lf_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn lf_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+fn lf_ones_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [1] }
+    return v
+}
+
+fn lf_max_f(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn lf_min_f(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn lf_min_i(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn lf_max_i(a, b) {
+    if a > b { return a }
+    return b
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  1. Freeze Schedule — define when each layer freezes by step
+//
+//  Bottom layers freeze early, top layers freeze late (or never).
+//  schedule[i] = step at which layer i becomes frozen.
+//  Evenly spaced across total_steps. Top layer never freezes
+//  (schedule[n-1] = total_steps + 1).
+//
+//  Returns: [int] of length n_layers
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn lf_make_schedule(n_layers, total_steps) {
+    let mut sched = lf_zeros_int(n_layers)
+    if n_layers <= 1 {
+        sched[0] = total_steps + 1
+        return sched
+    }
+    for i in 0..n_layers {
+        if i == n_layers - 1 {
+            // top layer never freezes
+            sched[i] = total_steps + 1
+        } else {
+            // layer i freezes at step proportional to its position
+            let frac = to_float(i + 1) / to_float(n_layers)
+            sched[i] = to_int(frac * to_float(total_steps))
+        }
+    }
+    return sched
+}
+
+// Epoch-based schedule variant
+@pure
+fn lf_make_schedule_epochs(n_layers, total_epochs) {
+    return lf_make_schedule(n_layers, total_epochs)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Check if a specific layer is frozen at a given step
+//  Returns: 1 if frozen, 0 if active
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn lf_is_frozen(layer_idx, step, schedule) {
+    if step >= schedule[layer_idx] { return 1 }
+    return 0
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Full frozen mask at a given step
+//  Returns: [int] where 1 = frozen, 0 = active
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn lf_frozen_mask(step, schedule) {
+    let n = len(schedule)
+    let mut mask = lf_zeros_int(n)
+    for i in 0..n {
+        if step >= schedule[i] {
+            mask[i] = 1
+        }
+    }
+    return mask
+}
+
+// Count frozen layers at step
+@pure
+fn lf_count_frozen(step, schedule) {
+    let n = len(schedule)
+    let mut cnt = 0
+    for i in 0..n {
+        if step >= schedule[i] { cnt = cnt + 1 }
+    }
+    return cnt
+}
+
+// Count active (non-frozen) layers at step
+@pure
+fn lf_count_active(step, schedule) {
+    let n = len(schedule)
+    return n - lf_count_frozen(step, schedule)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  2. Gradual Freeze Bottom-Up
+//
+//  At each step, compute how many layers should be frozen (bottom-up).
+//  fraction_done = step / total_steps
+//  n_frozen = floor(fraction_done * (n_layers - 1))
+//  (top layer always stays active)
+//
+//  Returns: [int] frozen mask
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn lf_gradual_bottom_up(n_layers, step, total_steps) {
+    let mut mask = lf_zeros_int(n_layers)
+    if total_steps <= 0 { return mask }
+    let frac = to_float(step) / to_float(total_steps)
+    let clamped = lf_min_f(frac, 1.0)
+    // freeze up to n_layers - 1 (keep top active)
+    let n_freeze = to_int(clamped * to_float(n_layers - 1))
+    for i in 0..n_freeze {
+        mask[i] = 1
+    }
+    return mask
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  3. Discriminative Learning Rate
+//
+//  Assign different LR per layer. Lower layers get smaller LR.
+//  lr[i] = base_lr * decay^(n_layers - 1 - i)
+//  So top layer gets base_lr, bottom layer gets base_lr * decay^(n-1)
+//
+//  Returns: [float] of learning rates
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn lf_disc_lr(base_lr, n_layers, decay) {
+    let mut lrs = lf_zeros(n_layers)
+    for i in 0..n_layers {
+        let exp = n_layers - 1 - i
+        let mut factor = 1.0
+        for _j in 0..exp {
+            factor = factor * decay
+        }
+        lrs[i] = base_lr * factor
+    }
+    return lrs
+}
+
+// Discriminative LR with frozen layers zeroed out
+@pure
+fn lf_disc_lr_with_freeze(base_lr, n_layers, decay, frozen_mask) {
+    let mut lrs = lf_disc_lr(base_lr, n_layers, decay)
+    for i in 0..n_layers {
+        if frozen_mask[i] == 1 {
+            lrs[i] = 0.0
+        }
+    }
+    return lrs
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  4. Freeze by Gradient Norm
+//
+//  Compute L2 norm of gradients per layer, freeze if below threshold.
+//  grads: array of arrays (one per layer), each is gradient vector.
+//
+//  Returns grad norms per layer.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn lf_grad_norm(grad_vec) {
+    let n = len(grad_vec)
+    let mut sum_sq = 0.0
+    for i in 0..n {
+        sum_sq = sum_sq + grad_vec[i] * grad_vec[i]
+    }
+    return lf_sqrt(sum_sq)
+}
+
+@pure
+fn lf_grad_norms(grads) {
+    let n = len(grads)
+    let mut norms = lf_zeros(n)
+    for i in 0..n {
+        norms[i] = lf_grad_norm(grads[i])
+    }
+    return norms
+}
+
+// Freeze layers whose gradient norm is below threshold
+// Returns: [int] frozen mask (1 = freeze, 0 = active)
+@pure
+fn lf_freeze_by_grad(grad_norms, threshold) {
+    let n = len(grad_norms)
+    let mut mask = lf_zeros_int(n)
+    for i in 0..n {
+        if grad_norms[i] < threshold {
+            mask[i] = 1
+        }
+    }
+    return mask
+}
+
+// Adaptive freeze: combine previous mask with grad norm check
+// Once frozen, stays frozen unless explicitly thawed
+@pure
+fn lf_adaptive_freeze(grad_norms, threshold, prev_mask) {
+    let n = len(grad_norms)
+    let mut mask = lf_zeros_int(n)
+    for i in 0..n {
+        if prev_mask[i] == 1 {
+            mask[i] = 1
+        } else {
+            if grad_norms[i] < threshold {
+                mask[i] = 1
+            }
+        }
+    }
+    return mask
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  5. Thaw Policy — conditions to unfreeze layers
+//
+//  Detect loss plateau: if average loss over recent window hasn't
+//  improved by min_improve compared to the previous window,
+//  we should thaw some layers to allow more capacity.
+//
+//  Returns: 1 if should thaw, 0 otherwise
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn lf_avg_window(loss_history, start, wlen) {
+    let mut s = 0.0
+    let n = len(loss_history)
+    let end = lf_min_i(start + wlen, n)
+    let actual = end - start
+    if actual <= 0 { return 0.0 }
+    for i in start..end {
+        s = s + loss_history[i]
+    }
+    return s / to_float(actual)
+}
+
+@pure
+fn lf_should_thaw(loss_history, window, min_improve) {
+    let n = len(loss_history)
+    if n < window * 2 { return 0 }
+    // compare last window vs previous window
+    let prev_avg = lf_avg_window(loss_history, n - window * 2, window)
+    let curr_avg = lf_avg_window(loss_history, n - window, window)
+    let improvement = prev_avg - curr_avg
+    if improvement < min_improve { return 1 }
+    return 0
+}
+
+// Thaw n_thaw layers from top of frozen set
+// Returns new mask with some layers unfrozen
+@pure
+fn lf_thaw_layers(frozen_mask, n_thaw) {
+    let n = len(frozen_mask)
+    let mut mask = lf_zeros_int(n)
+    for i in 0..n {
+        mask[i] = frozen_mask[i]
+    }
+    // unfreeze highest-index frozen layers first
+    let mut thawed = 0
+    let mut i = n - 1
+    for _iter in 0..n {
+        if thawed >= n_thaw { break }
+        if i < 0 { break }
+        if mask[i] == 1 {
+            mask[i] = 0
+            thawed = thawed + 1
+        }
+        i = i - 1
+    }
+    return mask
+}
+
+// Combined thaw policy: check loss plateau, thaw if needed
+@pure
+fn lf_thaw_policy(frozen_mask, loss_history, window, min_improve, n_thaw) {
+    let should = lf_should_thaw(loss_history, window, min_improve)
+    if should == 1 {
+        return lf_thaw_layers(frozen_mask, n_thaw)
+    }
+    // no thaw needed, return mask unchanged
+    let n = len(frozen_mask)
+    let mut out = lf_zeros_int(n)
+    for i in 0..n {
+        out[i] = frozen_mask[i]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  6. Memory Savings Tracker
+//
+//  Compute memory saved from frozen layers. Frozen layers don't
+//  need optimizer states (momentum, variance for Adam = 2x params)
+//  or gradient buffers.
+//
+//  Total trainable memory per layer ≈ param_count * bytes_per_param * 3
+//  (weights + grads + optimizer states ~3x)
+//  Frozen layers only need weights: param_count * bytes_per_param * 1
+//  Savings per frozen layer = param_count * bytes_per_param * 2
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn lf_mem_per_layer(param_counts, bytes_per_param) {
+    let n = len(param_counts)
+    let mut mem = lf_zeros(n)
+    for i in 0..n {
+        mem[i] = to_float(param_counts[i]) * bytes_per_param * 3.0
+    }
+    return mem
+}
+
+// Memory saved from frozen layers (optimizer + grad savings)
+@pure
+fn lf_mem_saved(param_counts, frozen_mask, bytes_per_param) {
+    let n = len(param_counts)
+    let mut saved = 0.0
+    for i in 0..n {
+        if frozen_mask[i] == 1 {
+            // save optimizer states + gradient buffer = 2x param memory
+            saved = saved + to_float(param_counts[i]) * bytes_per_param * 2.0
+        }
+    }
+    return saved
+}
+
+// Total training memory (all layers active)
+@pure
+fn lf_mem_total(param_counts, bytes_per_param) {
+    let n = len(param_counts)
+    let mut total = 0.0
+    for i in 0..n {
+        total = total + to_float(param_counts[i]) * bytes_per_param * 3.0
+    }
+    return total
+}
+
+// Fraction of memory saved
+@pure
+fn lf_mem_fraction_saved(param_counts, frozen_mask, bytes_per_param) {
+    let total = lf_mem_total(param_counts, bytes_per_param)
+    if total < 1.0e-10 { return 0.0 }
+    let saved = lf_mem_saved(param_counts, frozen_mask, bytes_per_param)
+    return saved / total
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Training Step — apply gradients with per-layer LR and freeze mask
+//
+//  weights: flat array of weights (one value per layer for simplicity)
+//  grads:   flat array of gradient values per layer
+//  lr_per_layer: learning rate per layer (from disc_lr)
+//  frozen_mask: 1 = frozen (skip), 0 = active
+//
+//  Returns: updated weights
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn lf_train_step(weights, grads, lr_per_layer, frozen_mask) {
+    let n = len(weights)
+    let mut out = lf_zeros(n)
+    for i in 0..n {
+        if frozen_mask[i] == 1 {
+            out[i] = weights[i]
+        } else {
+            out[i] = weights[i] - lr_per_layer[i] * grads[i]
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Warmup Schedule — no freezing during warmup, then gradual freeze
+//
+//  During warmup_steps, all layers are active.
+//  After warmup, layers freeze progressively bottom-up.
+//
+//  Returns: [int] schedule (freeze step per layer)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn lf_warmup_schedule(n_layers, warmup_steps, total_steps) {
+    let mut sched = lf_zeros_int(n_layers)
+    let remaining = total_steps - warmup_steps
+    if remaining <= 0 {
+        // no freezing if warmup >= total
+        for i in 0..n_layers {
+            sched[i] = total_steps + 1
+        }
+        return sched
+    }
+    for i in 0..n_layers {
+        if i == n_layers - 1 {
+            sched[i] = total_steps + 1
+        } else {
+            let frac = to_float(i + 1) / to_float(n_layers)
+            sched[i] = warmup_steps + to_int(frac * to_float(remaining))
+        }
+    }
+    return sched
+}
+
+println("[layer_freezing] loaded — freeze schedule + bottom-up + disc LR + grad norm + thaw + memory tracker")

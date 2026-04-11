@@ -1,0 +1,833 @@
+// ===================================================================
+//  self/ml/byte_latent_transformer.hexa — Byte Latent Transformer (#161)
+//
+//  Tokenizer-free model operating directly on bytes.
+//  Uses dynamic patching to group bytes into variable-length patches,
+//  then runs a latent transformer on patch representations.
+//
+//  Components:
+//    1. Byte embedding (vocab=256)
+//    2. Local encoder: small transformer over byte windows -> patches
+//    3. Patch boundary detector: entropy-based dynamic boundaries
+//    4. Latent transformer: full transformer on patch sequence
+//    5. Local decoder: expand patches back to byte predictions
+//    6. Byte-level prediction head
+//    7. Dynamic patching: variable-length patches based on complexity
+//
+//  Public API:
+//    blt_create_byte_embedding(dim)            -> embedding table
+//    blt_embed_bytes(emb, bytes)               -> [vectors]
+//    blt_create_local_encoder(dim, n_heads)     -> encoder
+//    blt_local_encode(enc, byte_vecs, win)      -> [patch_vecs]
+//    blt_compute_byte_entropy(byte_seq)         -> [float]
+//    blt_detect_boundaries(entropies, thr)      -> [int]
+//    blt_dynamic_patch(byte_vecs, boundaries)   -> [patch_vec]
+//    blt_create_latent_transformer(dim, n_heads, n_layers, ff_dim)
+//    blt_latent_forward(lt, patches)            -> [vectors]
+//    blt_create_local_decoder(dim, max_patch)   -> decoder
+//    blt_decode_patches(dec, patch_vecs, lens)  -> [byte_vecs]
+//    blt_create_prediction_head(dim)            -> head
+//    blt_predict_bytes(head, byte_vecs)         -> [logits_256]
+//    blt_full_forward(model, byte_seq)          -> [logits_256]
+//    blt_create_model(dim, n_heads, n_layers, ff_dim, max_patch)
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+//    @hot   — inner-loop encode/decode
+// ===================================================================
+
+// ===================================================================
+//  Math / Vector helpers
+// ===================================================================
+
+fn blt_vec_zeros(dim) {
+    let mut out = []
+    let mut i = 0
+    while i < dim {
+        out = out + [0.0]
+        i = i + 1
+    }
+    return out
+}
+
+fn blt_vec_add(a, b) {
+    let n = len(a)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [a[i] + b[i]]
+        i = i + 1
+    }
+    return out
+}
+
+fn blt_vec_scale(v, s) {
+    let n = len(v)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [v[i] * s]
+        i = i + 1
+    }
+    return out
+}
+
+fn blt_dot(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + a[i] * b[i]
+        i = i + 1
+    }
+    return s
+}
+
+fn blt_fabs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn blt_sigmoid(x) {
+    if x > 20.0 { return 1.0 }
+    if x < -20.0 { return 0.0 }
+    return 1.0 / (1.0 + exp(0.0 - x))
+}
+
+fn blt_relu(x) {
+    if x < 0.0 { return 0.0 }
+    return x
+}
+
+fn blt_softmax(logits) {
+    let n = len(logits)
+    let mut mx = logits[0]
+    let mut i = 1
+    while i < n {
+        if logits[i] > mx { mx = logits[i] }
+        i = i + 1
+    }
+    let mut exps = []
+    let mut s = 0.0
+    i = 0
+    while i < n {
+        let e = exp(logits[i] - mx)
+        exps = exps + [e]
+        s = s + e
+        i = i + 1
+    }
+    if s < 1.0e-30 { s = 1.0e-30 }
+    let mut out = []
+    i = 0
+    while i < n {
+        out = out + [exps[i] / s]
+        i = i + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  Matrix helpers
+// ===================================================================
+
+fn blt_matvec(mat, vec) {
+    let rows = len(mat)
+    let mut out = []
+    let mut i = 0
+    while i < rows {
+        out = out + [blt_dot(mat[i], vec)]
+        i = i + 1
+    }
+    return out
+}
+
+fn blt_init_matrix(rows, cols, seed) {
+    let scale = 0.02
+    let mut mat = []
+    let mut i = 0
+    while i < rows {
+        let mut row = []
+        let mut j = 0
+        while j < cols {
+            let val = sin(to_float(i * 137 + j * 31 + seed)) * scale
+            row = row + [val]
+            j = j + 1
+        }
+        mat = mat + [row]
+        i = i + 1
+    }
+    return mat
+}
+
+// ===================================================================
+//  1. Byte Embedding (vocab=256)
+//
+//  256 byte values, each mapped to a dim-dimensional vector.
+// ===================================================================
+
+struct ByteEmbedding {
+    dim: int,
+    table: array
+}
+
+fn blt_create_byte_embedding(dim) {
+    let scale = 1.0 / sqrt(to_float(dim))
+    let mut table = []
+    let mut b = 0
+    while b < 256 {
+        let mut vec = []
+        let mut d = 0
+        while d < dim {
+            let val = sin(to_float(b * 97 + d * 53 + 11)) * scale
+            vec = vec + [val]
+            d = d + 1
+        }
+        table = table + [vec]
+        b = b + 1
+    }
+    return ByteEmbedding { dim: dim, table: table }
+}
+
+@pure @hot
+fn blt_embed_bytes(emb, byte_seq) {
+    let n = len(byte_seq)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let b = byte_seq[i]
+        let mut idx = b
+        if idx < 0 { idx = 0 }
+        if idx > 255 { idx = 255 }
+        out = out + [emb.table[idx]]
+        i = i + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  2. Local Encoder: small transformer over byte windows
+//
+//  Takes byte embeddings within a window, produces a single patch
+//  representation via self-attention + pooling.
+// ===================================================================
+
+struct LocalEncoder {
+    dim: int,
+    n_heads: int,
+    head_dim: int,
+    Wq: array,
+    Wk: array,
+    Wv: array,
+    Wo: array,
+    W_ff1: array,
+    W_ff2: array
+}
+
+fn blt_create_local_encoder(dim, n_heads) {
+    let head_dim = dim / n_heads
+    let Wq = blt_init_matrix(dim, dim, 7)
+    let Wk = blt_init_matrix(dim, dim, 13)
+    let Wv = blt_init_matrix(dim, dim, 19)
+    let Wo = blt_init_matrix(dim, dim, 29)
+    let ff_dim = dim * 2
+    let W_ff1 = blt_init_matrix(ff_dim, dim, 37)
+    let W_ff2 = blt_init_matrix(dim, ff_dim, 43)
+    return LocalEncoder {
+        dim: dim,
+        n_heads: n_heads,
+        head_dim: head_dim,
+        Wq: Wq,
+        Wk: Wk,
+        Wv: Wv,
+        Wo: Wo,
+        W_ff1: W_ff1,
+        W_ff2: W_ff2
+    }
+}
+
+// Single-head attention over a window of byte vectors -> weighted sum
+@hot
+fn blt_window_attention(enc, byte_vecs) {
+    let n = len(byte_vecs)
+    let dim = enc.dim
+    if n == 0 { return blt_vec_zeros(dim) }
+    if n == 1 { return byte_vecs[0] }
+
+    // Compute Q, K, V for each position
+    let mut qs = []
+    let mut ks = []
+    let mut vs = []
+    let mut i = 0
+    while i < n {
+        qs = qs + [blt_matvec(enc.Wq, byte_vecs[i])]
+        ks = ks + [blt_matvec(enc.Wk, byte_vecs[i])]
+        vs = vs + [blt_matvec(enc.Wv, byte_vecs[i])]
+        i = i + 1
+    }
+
+    // Use last position as query (causal pooling)
+    let q = qs[n - 1]
+    let scale = 1.0 / sqrt(to_float(dim))
+
+    // Attention scores
+    let mut scores = []
+    i = 0
+    while i < n {
+        let s = blt_dot(q, ks[i]) * scale
+        scores = scores + [s]
+        i = i + 1
+    }
+
+    // Softmax
+    let probs = blt_softmax(scores)
+
+    // Weighted sum of values
+    let mut out = blt_vec_zeros(dim)
+    i = 0
+    while i < n {
+        let weighted = blt_vec_scale(vs[i], probs[i])
+        out = blt_vec_add(out, weighted)
+        i = i + 1
+    }
+
+    // Output projection
+    let projected = blt_matvec(enc.Wo, out)
+    return projected
+}
+
+// Encode byte vectors within fixed windows into patch representations
+@hot
+fn blt_local_encode(enc, byte_vecs, window_size) {
+    let n = len(byte_vecs)
+    if n == 0 { return [] }
+    let dim = enc.dim
+    let mut patches = []
+    let mut start = 0
+    while start < n {
+        let mut end = start + window_size
+        if end > n { end = n }
+        // Extract window
+        let mut win = []
+        let mut i = start
+        while i < end {
+            win = win + [byte_vecs[i]]
+            i = i + 1
+        }
+        // Attention pooling
+        let attn_out = blt_window_attention(enc, win)
+        // FFN: ReLU(x @ W_ff1) @ W_ff2 + residual
+        let h = blt_matvec(enc.W_ff1, attn_out)
+        let mut h_relu = []
+        let mut ri = 0
+        while ri < len(h) {
+            h_relu = h_relu + [blt_relu(h[ri])]
+            ri = ri + 1
+        }
+        let ff_out = blt_matvec(enc.W_ff2, h_relu)
+        let patch = blt_vec_add(attn_out, ff_out)
+        patches = patches + [patch]
+        start = end
+    }
+    return patches
+}
+
+// ===================================================================
+//  3. Patch Boundary Detector: entropy-based dynamic boundaries
+//
+//  Computes local byte entropy over a sliding window.
+//  High entropy = complex content = shorter patches.
+//  Low entropy = repetitive content = longer patches.
+// ===================================================================
+
+@pure
+fn blt_compute_byte_entropy(byte_seq) {
+    let n = len(byte_seq)
+    if n == 0 { return [] }
+    let window = 8
+    let mut entropies = []
+    let mut i = 0
+    while i < n {
+        // Count byte frequencies in window around position i
+        let mut start = i - window / 2
+        if start < 0 { start = 0 }
+        let mut end = i + window / 2
+        if end > n { end = n }
+        let win_len = end - start
+
+        let mut counts = #{}
+        let mut j = start
+        while j < end {
+            let b = byte_seq[j]
+            let key = to_string(b)
+            if has_key(counts, key) {
+                counts[key] = counts[key] + 1
+            } else {
+                counts[key] = 1
+            }
+            j = j + 1
+        }
+
+        // Compute Shannon entropy
+        let ks = keys(counts)
+        let nk = len(ks)
+        let mut h = 0.0
+        let mut ki = 0
+        while ki < nk {
+            let c = counts[ks[ki]]
+            let p = to_float(c) / to_float(win_len)
+            if p > 0.0 {
+                h = h - p * log(p)
+            }
+            ki = ki + 1
+        }
+        entropies = entropies + [h]
+        i = i + 1
+    }
+    return entropies
+}
+
+// Detect patch boundaries: position where entropy exceeds threshold
+// Always includes position 0 and n as implicit boundaries.
+// Returns boundary start indices (patches go from boundaries[i] to boundaries[i+1]).
+@pure
+fn blt_detect_boundaries(entropies, threshold) {
+    let n = len(entropies)
+    let mut boundaries = [0]
+    let mut i = 1
+    while i < n {
+        if entropies[i] > threshold {
+            // Check that we don't create zero-length patches
+            let last_b = boundaries[len(boundaries) - 1]
+            if i > last_b {
+                boundaries = boundaries + [i]
+            }
+        }
+        i = i + 1
+    }
+    // Add final boundary if not already there
+    let last = boundaries[len(boundaries) - 1]
+    if last < n {
+        boundaries = boundaries + [n]
+    }
+    return boundaries
+}
+
+// Get patch lengths from boundary indices
+@pure
+fn blt_patch_lengths(boundaries) {
+    let nb = len(boundaries)
+    let mut lens = []
+    let mut i = 0
+    while i < nb - 1 {
+        lens = lens + [boundaries[i + 1] - boundaries[i]]
+        i = i + 1
+    }
+    return lens
+}
+
+// ===================================================================
+//  7. Dynamic Patching: variable-length patches based on complexity
+//
+//  Groups byte vectors into variable-length patches using
+//  entropy-based boundaries.  Each patch is mean-pooled.
+// ===================================================================
+
+@hot
+fn blt_dynamic_patch(byte_vecs, boundaries) {
+    let nb = len(boundaries)
+    let n = len(byte_vecs)
+    if n == 0 { return [] }
+    let dim = len(byte_vecs[0])
+    let mut patches = []
+    let mut bi = 0
+    while bi < nb - 1 {
+        let start = boundaries[bi]
+        let mut end = boundaries[bi + 1]
+        if end > n { end = n }
+        let patch_len = end - start
+        if patch_len <= 0 {
+            bi = bi + 1
+            continue
+        }
+        // Mean pool
+        let mut acc = blt_vec_zeros(dim)
+        let mut j = start
+        while j < end {
+            acc = blt_vec_add(acc, byte_vecs[j])
+            j = j + 1
+        }
+        let inv = 1.0 / to_float(patch_len)
+        let patch = blt_vec_scale(acc, inv)
+        patches = patches + [patch]
+        bi = bi + 1
+    }
+    return patches
+}
+
+// ===================================================================
+//  4. Latent Transformer: full transformer on patch sequence
+//
+//  Standard multi-head self-attention + FFN, operating on patches.
+// ===================================================================
+
+struct LatentTransformerLayer {
+    dim: int,
+    n_heads: int,
+    head_dim: int,
+    Wq: array,
+    Wk: array,
+    Wv: array,
+    Wo: array,
+    W_ff1: array,
+    W_ff2: array,
+    ff_dim: int
+}
+
+struct LatentTransformer {
+    dim: int,
+    n_heads: int,
+    n_layers: int,
+    ff_dim: int,
+    layers: array
+}
+
+fn blt_create_latent_layer(dim, n_heads, ff_dim, seed) {
+    let head_dim = dim / n_heads
+    return LatentTransformerLayer {
+        dim: dim,
+        n_heads: n_heads,
+        head_dim: head_dim,
+        Wq: blt_init_matrix(dim, dim, seed),
+        Wk: blt_init_matrix(dim, dim, seed + 7),
+        Wv: blt_init_matrix(dim, dim, seed + 13),
+        Wo: blt_init_matrix(dim, dim, seed + 19),
+        W_ff1: blt_init_matrix(ff_dim, dim, seed + 29),
+        W_ff2: blt_init_matrix(dim, ff_dim, seed + 37),
+        ff_dim: ff_dim
+    }
+}
+
+fn blt_create_latent_transformer(dim, n_heads, n_layers, ff_dim) {
+    let mut layers = []
+    let mut i = 0
+    while i < n_layers {
+        let layer = blt_create_latent_layer(dim, n_heads, ff_dim, i * 100 + 1)
+        layers = layers + [layer]
+        i = i + 1
+    }
+    return LatentTransformer {
+        dim: dim,
+        n_heads: n_heads,
+        n_layers: n_layers,
+        ff_dim: ff_dim,
+        layers: layers
+    }
+}
+
+// Self-attention over full patch sequence (one layer)
+@hot
+fn blt_latent_layer_forward(layer, patches) {
+    let n = len(patches)
+    let dim = layer.dim
+    if n == 0 { return [] }
+
+    // Compute Q, K, V
+    let mut qs = []
+    let mut ks = []
+    let mut vs = []
+    let mut i = 0
+    while i < n {
+        qs = qs + [blt_matvec(layer.Wq, patches[i])]
+        ks = ks + [blt_matvec(layer.Wk, patches[i])]
+        vs = vs + [blt_matvec(layer.Wv, patches[i])]
+        i = i + 1
+    }
+
+    let scale = 1.0 / sqrt(to_float(dim))
+
+    // For each patch, attend to all patches
+    let mut attn_out = []
+    i = 0
+    while i < n {
+        let mut scores = []
+        let mut j = 0
+        while j < n {
+            scores = scores + [blt_dot(qs[i], ks[j]) * scale]
+            j = j + 1
+        }
+        let probs = blt_softmax(scores)
+        let mut weighted = blt_vec_zeros(dim)
+        j = 0
+        while j < n {
+            weighted = blt_vec_add(weighted, blt_vec_scale(vs[j], probs[j]))
+            j = j + 1
+        }
+        let projected = blt_matvec(layer.Wo, weighted)
+        // Residual
+        let after_attn = blt_vec_add(patches[i], projected)
+        attn_out = attn_out + [after_attn]
+        i = i + 1
+    }
+
+    // FFN with residual
+    let mut out = []
+    i = 0
+    while i < n {
+        let h = blt_matvec(layer.W_ff1, attn_out[i])
+        let mut h_relu = []
+        let mut ri = 0
+        while ri < len(h) {
+            h_relu = h_relu + [blt_relu(h[ri])]
+            ri = ri + 1
+        }
+        let ff_out = blt_matvec(layer.W_ff2, h_relu)
+        let result = blt_vec_add(attn_out[i], ff_out)
+        out = out + [result]
+        i = i + 1
+    }
+    return out
+}
+
+// Full latent transformer forward (all layers)
+@hot
+fn blt_latent_forward(lt, patches) {
+    let mut h = patches
+    let mut i = 0
+    while i < lt.n_layers {
+        h = blt_latent_layer_forward(lt.layers[i], h)
+        i = i + 1
+    }
+    return h
+}
+
+// ===================================================================
+//  5. Local Decoder: expand patches back to byte predictions
+//
+//  Each patch vector is projected to produce max_patch byte vectors.
+//  Only the first patch_len positions are used.
+// ===================================================================
+
+struct LocalDecoder {
+    dim: int,
+    max_patch_len: int,
+    W_expand: array
+}
+
+fn blt_create_local_decoder(dim, max_patch_len) {
+    // W_expand: [max_patch_len * dim, dim] to expand patch -> multiple byte vecs
+    let out_dim = max_patch_len * dim
+    let W_expand = blt_init_matrix(out_dim, dim, 59)
+    return LocalDecoder {
+        dim: dim,
+        max_patch_len: max_patch_len,
+        W_expand: W_expand
+    }
+}
+
+// Decode patch vectors back to byte-level vectors
+// patch_vecs: array of patch representations
+// patch_lens: array of how many bytes each patch covers
+@hot
+fn blt_decode_patches(dec, patch_vecs, patch_lens) {
+    let n_patches = len(patch_vecs)
+    let dim = dec.dim
+    let mut byte_vecs = []
+    let mut pi = 0
+    while pi < n_patches {
+        let expanded = blt_matvec(dec.W_expand, patch_vecs[pi])
+        // Extract patch_lens[pi] byte vectors from the expanded output
+        let plen = patch_lens[pi]
+        let mut bi = 0
+        while bi < plen {
+            let offset = bi * dim
+            let mut vec = []
+            let mut d = 0
+            while d < dim {
+                vec = vec + [expanded[offset + d]]
+                d = d + 1
+            }
+            byte_vecs = byte_vecs + [vec]
+            bi = bi + 1
+        }
+        pi = pi + 1
+    }
+    return byte_vecs
+}
+
+// ===================================================================
+//  6. Byte-level Prediction Head
+//
+//  Projects byte-level vectors to 256 logits (one per byte value).
+// ===================================================================
+
+struct PredictionHead {
+    dim: int,
+    W_out: array,
+    bias: array
+}
+
+fn blt_create_prediction_head(dim) {
+    let W_out = blt_init_matrix(256, dim, 67)
+    let bias = blt_vec_zeros(256)
+    return PredictionHead {
+        dim: dim,
+        W_out: W_out,
+        bias: bias
+    }
+}
+
+@hot
+fn blt_predict_bytes(head, byte_vecs) {
+    let n = len(byte_vecs)
+    let mut all_logits = []
+    let mut i = 0
+    while i < n {
+        let raw = blt_matvec(head.W_out, byte_vecs[i])
+        let logits = blt_vec_add(raw, head.bias)
+        all_logits = all_logits + [logits]
+        i = i + 1
+    }
+    return all_logits
+}
+
+// Predict byte probabilities (softmax)
+@hot
+fn blt_predict_byte_probs(head, byte_vecs) {
+    let logits = blt_predict_bytes(head, byte_vecs)
+    let n = len(logits)
+    let mut probs = []
+    let mut i = 0
+    while i < n {
+        probs = probs + [blt_softmax(logits[i])]
+        i = i + 1
+    }
+    return probs
+}
+
+// ===================================================================
+//  Full Model: combines all components
+// ===================================================================
+
+struct BLTModel {
+    dim: int,
+    embedding: array,
+    local_encoder: array,
+    latent_transformer: array,
+    local_decoder: array,
+    prediction_head: array,
+    entropy_threshold: float,
+    max_patch_len: int
+}
+
+fn blt_create_model(dim, n_heads, n_layers, ff_dim, max_patch_len) {
+    let emb = blt_create_byte_embedding(dim)
+    let enc = blt_create_local_encoder(dim, n_heads)
+    let lt = blt_create_latent_transformer(dim, n_heads, n_layers, ff_dim)
+    let dec = blt_create_local_decoder(dim, max_patch_len)
+    let head = blt_create_prediction_head(dim)
+    return BLTModel {
+        dim: dim,
+        embedding: [emb],
+        local_encoder: [enc],
+        latent_transformer: [lt],
+        local_decoder: [dec],
+        prediction_head: [head],
+        entropy_threshold: 1.5,
+        max_patch_len: max_patch_len
+    }
+}
+
+// Full forward pass: bytes -> logits
+@hot
+fn blt_full_forward(model, byte_seq) {
+    let dim = model.dim
+    let emb = model.embedding[0]
+    let enc = model.local_encoder[0]
+    let lt = model.latent_transformer[0]
+    let dec = model.local_decoder[0]
+    let head = model.prediction_head[0]
+    let threshold = model.entropy_threshold
+
+    // 1. Embed bytes
+    let byte_vecs = blt_embed_bytes(emb, byte_seq)
+    let n = len(byte_vecs)
+    if n == 0 { return [] }
+
+    // 2. Compute entropy for dynamic patching
+    let entropies = blt_compute_byte_entropy(byte_seq)
+
+    // 3. Detect boundaries
+    let boundaries = blt_detect_boundaries(entropies, threshold)
+
+    // 4. Dynamic patching (mean pool byte vecs within each patch)
+    let patches = blt_dynamic_patch(byte_vecs, boundaries)
+
+    // 5. Latent transformer on patches
+    let latent_out = blt_latent_forward(lt, patches)
+
+    // 6. Compute patch lengths for decoding
+    let patch_lens = blt_patch_lengths(boundaries)
+
+    // 7. Decode back to byte level
+    let decoded = blt_decode_patches(dec, latent_out, patch_lens)
+
+    // 8. Prediction head
+    let logits = blt_predict_bytes(head, decoded)
+    return logits
+}
+
+// Compute cross-entropy loss for byte prediction
+@pure
+fn blt_cross_entropy_loss(logits, targets) {
+    let n = len(logits)
+    if n == 0 { return 0.0 }
+    let mut total = 0.0
+    let mut i = 0
+    while i < n {
+        let probs = blt_softmax(logits[i])
+        let target = targets[i]
+        let mut idx = target
+        if idx < 0 { idx = 0 }
+        if idx > 255 { idx = 255 }
+        let p = probs[idx]
+        let eps = 1.0e-10
+        if p > eps {
+            total = total - log(p)
+        } else {
+            total = total - log(eps)
+        }
+        i = i + 1
+    }
+    return total / to_float(n)
+}
+
+// Argmax: get predicted byte from logits
+@pure
+fn blt_argmax(logits) {
+    let n = len(logits)
+    let mut best = 0
+    let mut best_v = logits[0]
+    let mut i = 1
+    while i < n {
+        if logits[i] > best_v {
+            best_v = logits[i]
+            best = i
+        }
+        i = i + 1
+    }
+    return best
+}
+
+// Get compression ratio: n_patches / n_bytes
+@pure
+fn blt_compression_ratio(byte_seq, threshold) {
+    let n = len(byte_seq)
+    if n == 0 { return 1.0 }
+    let entropies = blt_compute_byte_entropy(byte_seq)
+    let boundaries = blt_detect_boundaries(entropies, threshold)
+    let n_patches = len(boundaries) - 1
+    if n_patches <= 0 { return 1.0 }
+    return to_float(n_patches) / to_float(n)
+}
+
+println("[byte_latent_transformer] Byte Latent Transformer loaded (#161)")

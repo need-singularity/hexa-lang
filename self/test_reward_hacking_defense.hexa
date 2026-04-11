@@ -1,0 +1,848 @@
+// ═══════════════════════════════════════════════════════════════
+//  test_reward_hacking_defense.hexa — Reward Hacking Defense (#165)
+//
+//  Tests (35):
+//    1.  overopt_score positive when proxy > gold
+//    2.  overopt_score zero when equal
+//    3.  overopt_gap tracks divergence
+//    4.  overopt_detect fires on large gap
+//    5.  overopt_detect no fire when aligned
+//    6.  overopt_detect fires on declining gold + rising proxy
+//    7.  overopt_trend positive when diverging
+//    8.  kl_divergence zero for identical distributions
+//    9.  kl_divergence positive for different distributions
+//   10.  kl_hard_check passes within limit
+//   11.  kl_hard_check fails beyond limit
+//   12.  kl_soft_penalty scales with beta
+//   13.  kl_adaptive_beta increases when KL too high
+//   14.  kl_adaptive_beta decreases when KL too low
+//   15.  kl_adaptive_beta stable when KL near target
+//   16.  kl_constrained_reward hard limit rejection
+//   17.  ensemble_reward averages two models
+//   18.  ensemble_reward single model passthrough
+//   19.  ensemble_weighted respects weights
+//   20.  ensemble_median odd number of models
+//   21.  ensemble_median even number of models
+//   22.  ensemble_conservative takes minimum
+//   23.  uncertainty_mean_var correct stats
+//   24.  uncertainty_threshold flags high variance
+//   25.  epistemic_disagreement measures spread
+//   26.  uncertainty_penalized_reward subtracts penalty
+//   27.  approx_grad_norm finite and positive
+//   28.  grad_penalty zero for identical pairs
+//   29.  reward_with_grad_penalty reduces reward
+//   30.  spectral_norm_approx identity matrix
+//   31.  periodic_reset at period boundary
+//   32.  periodic_reset no change off-period
+//   33.  partial_reset interpolation
+//   34.  gold_eval MAE correct
+//   35.  gold_proxy_correlation perfect alignment
+//   36.  gold_ranking_accuracy correct ordering
+//   37.  gold_trend positive for increasing sequence
+//   38.  defense_pipeline smoke test
+//   39.  conditional_reset triggers above threshold
+//   40.  ema_toward_ref decays correctly
+//
+//  run: cargo run --release -- self/test_reward_hacking_defense.hexa
+// ═══════════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ── inlined helpers ─────────────────────────────────────────────
+
+let RHD_EPS = 1.0e-8
+
+@pure
+fn rhd_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+@pure
+fn rhd_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+@pure
+fn rhd_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+@pure
+fn rhd_log(x) {
+    if x <= 0.0 { return -20.0 }
+    let mut v = x
+    let mut shift = 0.0
+    for _i in 0..20 {
+        if v > 2.0 {
+            v = v / 2.718281828
+            shift = shift + 1.0
+        }
+    }
+    for _i in 0..20 {
+        if v < 0.5 {
+            v = v * 2.718281828
+            shift = shift - 1.0
+        }
+    }
+    let y = (v - 1.0) / (v + 1.0)
+    let y2 = y * y
+    let mut s = y
+    let mut t = y
+    for k in 1..15 {
+        t = t * y2
+        s = s + t / to_float(2 * k + 1)
+    }
+    return 2.0 * s + shift
+}
+
+@pure
+fn rhd_min(a, b) {
+    if a < b { return a }
+    return b
+}
+
+@pure
+fn rhd_max(a, b) {
+    if a > b { return a }
+    return b
+}
+
+@pure
+fn rhd_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+@pure
+fn rhd_mean(arr) {
+    let n = len(arr)
+    if n == 0 { return 0.0 }
+    let mut s = 0.0
+    for i in 0..n { s = s + arr[i] }
+    return s / to_float(n)
+}
+
+@pure
+fn rhd_var(arr) {
+    let n = len(arr)
+    if n < 2 { return 0.0 }
+    let m = rhd_mean(arr)
+    let mut ss = 0.0
+    for i in 0..n {
+        let d = arr[i] - m
+        ss = ss + d * d
+    }
+    return ss / to_float(n)
+}
+
+@pure
+fn rhd_std(arr) {
+    return rhd_sqrt(rhd_var(arr))
+}
+
+@pure
+fn rhd_sum(arr) {
+    let mut s = 0.0
+    for i in 0..len(arr) { s = s + arr[i] }
+    return s
+}
+
+@pure
+fn rhd_dot(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    for i in 0..n { s = s + a[i] * b[i] }
+    return s
+}
+
+// ── inlined core functions ──────────────────────────────────────
+
+@pure @hot
+fn rhd_overopt_score(proxy, gold) {
+    return proxy - gold
+}
+
+@pure
+fn rhd_overopt_gap(proxy_hist, gold_hist) {
+    let n = len(proxy_hist)
+    let mut gaps = rhd_zeros(n)
+    for i in 0..n {
+        gaps[i] = proxy_hist[i] - gold_hist[i]
+    }
+    return gaps
+}
+
+@pure
+fn rhd_overopt_detect(proxy_hist, gold_hist, thresh) {
+    let n = len(proxy_hist)
+    if n < 2 { return false }
+    let gaps = rhd_overopt_gap(proxy_hist, gold_hist)
+    let latest_gap = gaps[n - 1]
+    if latest_gap > thresh {
+        return true
+    }
+    let gold_delta = gold_hist[n - 1] - gold_hist[n - 2]
+    let proxy_delta = proxy_hist[n - 1] - proxy_hist[n - 2]
+    if gold_delta < 0.0 && proxy_delta > 0.0 {
+        if latest_gap > thresh / 2.0 {
+            return true
+        }
+    }
+    return false
+}
+
+@pure
+fn rhd_overopt_trend(proxy_hist, gold_hist, window) {
+    let n = len(proxy_hist)
+    let gaps = rhd_overopt_gap(proxy_hist, gold_hist)
+    let w = rhd_min(window, n)
+    if w < 2 { return 0.0 }
+    let start = n - to_int(w)
+    let mut slope_sum = 0.0
+    let count = to_int(w) - 1
+    for i in 0..count {
+        let idx = start + i
+        slope_sum = slope_sum + (gaps[idx + 1] - gaps[idx])
+    }
+    return slope_sum / to_float(count)
+}
+
+@pure @hot
+fn rhd_kl_divergence(p_logprobs, q_logprobs) {
+    let n = len(p_logprobs)
+    if n == 0 { return 0.0 }
+    let mut total = 0.0
+    for i in 0..n {
+        let d = p_logprobs[i] - q_logprobs[i]
+        let kl_i = rhd_exp(0.0 - d) + d - 1.0
+        total = total + kl_i
+    }
+    return total / to_float(n)
+}
+
+@pure @hot
+fn rhd_kl_hard_check(p_lp, q_lp, limit) {
+    let kl = rhd_kl_divergence(p_lp, q_lp)
+    return kl <= limit
+}
+
+@pure @hot
+fn rhd_kl_soft_penalty(p_lp, q_lp, beta) {
+    let kl = rhd_kl_divergence(p_lp, q_lp)
+    return beta * kl
+}
+
+@pure
+fn rhd_kl_adaptive_beta(beta, kl, target) {
+    if kl > 1.5 * target {
+        return beta * 2.0
+    }
+    if kl < target / 1.5 {
+        return beta / 2.0
+    }
+    return beta
+}
+
+@pure
+fn rhd_kl_constrained_reward(reward, p_lp, q_lp, beta, hard_limit) {
+    let kl = rhd_kl_divergence(p_lp, q_lp)
+    if kl > hard_limit {
+        return 0.0 - 1000.0
+    }
+    return reward - beta * kl
+}
+
+@pure @hot
+fn rhd_ensemble_reward(reward_lists) {
+    let k = len(reward_lists)
+    if k == 0 { return [] }
+    let n = len(reward_lists[0])
+    let mut out = rhd_zeros(n)
+    for m in 0..k {
+        for i in 0..n {
+            out[i] = out[i] + reward_lists[m][i]
+        }
+    }
+    for i in 0..n {
+        out[i] = out[i] / to_float(k)
+    }
+    return out
+}
+
+@pure
+fn rhd_ensemble_weighted(reward_lists, weights) {
+    let k = len(reward_lists)
+    if k == 0 { return [] }
+    let n = len(reward_lists[0])
+    let mut out = rhd_zeros(n)
+    let mut w_sum = 0.0
+    for m in 0..k {
+        w_sum = w_sum + weights[m]
+        for i in 0..n {
+            out[i] = out[i] + weights[m] * reward_lists[m][i]
+        }
+    }
+    if w_sum > RHD_EPS {
+        for i in 0..n {
+            out[i] = out[i] / w_sum
+        }
+    }
+    return out
+}
+
+@pure
+fn rhd_ensemble_median(reward_lists) {
+    let k = len(reward_lists)
+    if k == 0 { return [] }
+    let n = len(reward_lists[0])
+    let mut out = rhd_zeros(n)
+    for i in 0..n {
+        let mut scores = rhd_zeros(k)
+        for m in 0..k { scores[m] = reward_lists[m][i] }
+        for a in 0..k {
+            for b in 0..(k - 1) {
+                if scores[b] > scores[b + 1] {
+                    let tmp = scores[b]
+                    scores[b] = scores[b + 1]
+                    scores[b + 1] = tmp
+                }
+            }
+        }
+        if k % 2 == 1 {
+            out[i] = scores[k / 2]
+        } else {
+            out[i] = (scores[k / 2 - 1] + scores[k / 2]) / 2.0
+        }
+    }
+    return out
+}
+
+@pure
+fn rhd_ensemble_conservative(reward_lists) {
+    let k = len(reward_lists)
+    if k == 0 { return [] }
+    let n = len(reward_lists[0])
+    let mut out = rhd_zeros(n)
+    for i in 0..n {
+        let mut min_r = reward_lists[0][i]
+        for m in 1..k {
+            if reward_lists[m][i] < min_r {
+                min_r = reward_lists[m][i]
+            }
+        }
+        out[i] = min_r
+    }
+    return out
+}
+
+@pure
+fn rhd_uncertainty_mean_var(reward_lists) {
+    let k = len(reward_lists)
+    if k == 0 {
+        return #{ "means": [], "vars": [] }
+    }
+    let n = len(reward_lists[0])
+    let mut means = rhd_zeros(n)
+    let mut vars = rhd_zeros(n)
+    for i in 0..n {
+        let mut s = 0.0
+        for m in 0..k { s = s + reward_lists[m][i] }
+        means[i] = s / to_float(k)
+    }
+    for i in 0..n {
+        let mut ss = 0.0
+        for m in 0..k {
+            let d = reward_lists[m][i] - means[i]
+            ss = ss + d * d
+        }
+        vars[i] = ss / to_float(k)
+    }
+    return #{ "means": means, "vars": vars }
+}
+
+@pure
+fn rhd_uncertainty_threshold(vars, thresh) {
+    let n = len(vars)
+    let mut flags = []
+    for i in 0..n {
+        if vars[i] > thresh {
+            flags = flags + [true]
+        } else {
+            flags = flags + [false]
+        }
+    }
+    return flags
+}
+
+@pure
+fn rhd_epistemic_disagreement(reward_lists) {
+    let k = len(reward_lists)
+    if k == 0 { return [] }
+    let n = len(reward_lists[0])
+    let mut out = rhd_zeros(n)
+    for i in 0..n {
+        let mut scores = rhd_zeros(k)
+        for m in 0..k { scores[m] = reward_lists[m][i] }
+        out[i] = rhd_std(scores)
+    }
+    return out
+}
+
+@pure
+fn rhd_uncertainty_penalized_reward(rewards, uncertainties, lam) {
+    let n = len(rewards)
+    let mut out = rhd_zeros(n)
+    for i in 0..n {
+        out[i] = rewards[i] - lam * uncertainties[i]
+    }
+    return out
+}
+
+@pure
+fn rhd_approx_grad_norm(reward_a, reward_b, input_a, input_b) {
+    let reward_diff = rhd_abs(reward_a - reward_b)
+    let n = len(input_a)
+    let mut dist_sq = 0.0
+    for i in 0..n {
+        let d = input_a[i] - input_b[i]
+        dist_sq = dist_sq + d * d
+    }
+    let dist = rhd_sqrt(dist_sq + RHD_EPS)
+    return reward_diff / dist
+}
+
+@pure
+fn rhd_grad_penalty(rewards_a, rewards_b, inputs_a, inputs_b, target_lip) {
+    let n = len(rewards_a)
+    if n == 0 { return 0.0 }
+    let mut total = 0.0
+    for i in 0..n {
+        let gn = rhd_approx_grad_norm(rewards_a[i], rewards_b[i], inputs_a[i], inputs_b[i])
+        let diff = gn - target_lip
+        total = total + diff * diff
+    }
+    return total / to_float(n)
+}
+
+@pure @hot
+fn rhd_reward_with_grad_penalty(raw_reward, gp, lam) {
+    return raw_reward - lam * gp
+}
+
+@pure
+fn rhd_spectral_norm_approx(weight_matrix, n_iter) {
+    let rows = len(weight_matrix)
+    if rows == 0 { return 0.0 }
+    let cols = len(weight_matrix[0])
+    let mut u = rhd_zeros(cols)
+    for j in 0..cols {
+        u[j] = 1.0 / to_float(cols)
+    }
+    for _it in 0..n_iter {
+        let mut v = rhd_zeros(rows)
+        for i in 0..rows {
+            for j in 0..cols {
+                v[i] = v[i] + weight_matrix[i][j] * u[j]
+            }
+        }
+        let mut v_norm = 0.0
+        for i in 0..rows { v_norm = v_norm + v[i] * v[i] }
+        v_norm = rhd_sqrt(v_norm + RHD_EPS)
+        for i in 0..rows { v[i] = v[i] / v_norm }
+        let mut u_new = rhd_zeros(cols)
+        for j in 0..cols {
+            for i in 0..rows {
+                u_new[j] = u_new[j] + weight_matrix[i][j] * v[i]
+            }
+        }
+        let mut u_norm = 0.0
+        for j in 0..cols { u_norm = u_norm + u_new[j] * u_new[j] }
+        u_norm = rhd_sqrt(u_norm + RHD_EPS)
+        for j in 0..cols { u[j] = u_new[j] / u_norm }
+    }
+    let mut wu = rhd_zeros(rows)
+    for i in 0..rows {
+        for j in 0..cols {
+            wu[i] = wu[i] + weight_matrix[i][j] * u[j]
+        }
+    }
+    let mut sigma = 0.0
+    for i in 0..rows { sigma = sigma + wu[i] * wu[i] }
+    return rhd_sqrt(sigma)
+}
+
+@pure
+fn rhd_periodic_reset(policy_lp, ref_lp, step, period) {
+    if period <= 0 { return policy_lp }
+    if step % period == 0 {
+        let n = len(ref_lp)
+        let mut out = rhd_zeros(n)
+        for i in 0..n { out[i] = ref_lp[i] }
+        return out
+    }
+    return policy_lp
+}
+
+@pure
+fn rhd_partial_reset(policy_lp, ref_lp, alpha) {
+    let n = len(policy_lp)
+    let mut out = rhd_zeros(n)
+    for i in 0..n {
+        out[i] = alpha * ref_lp[i] + (1.0 - alpha) * policy_lp[i]
+    }
+    return out
+}
+
+@pure
+fn rhd_conditional_reset(policy_lp, ref_lp, kl_thresh) {
+    let kl = rhd_kl_divergence(policy_lp, ref_lp)
+    if kl > kl_thresh {
+        let n = len(ref_lp)
+        let mut out = rhd_zeros(n)
+        for i in 0..n { out[i] = ref_lp[i] }
+        return out
+    }
+    return policy_lp
+}
+
+@pure
+fn rhd_ema_toward_ref(policy_lp, ref_lp, decay) {
+    let n = len(policy_lp)
+    let mut out = rhd_zeros(n)
+    for i in 0..n {
+        out[i] = decay * policy_lp[i] + (1.0 - decay) * ref_lp[i]
+    }
+    return out
+}
+
+@pure
+fn rhd_gold_eval(gold_labels, predictions) {
+    let n = len(gold_labels)
+    if n == 0 { return 0.0 }
+    let mut total = 0.0
+    for i in 0..n {
+        total = total + rhd_abs(gold_labels[i] - predictions[i])
+    }
+    return total / to_float(n)
+}
+
+@pure
+fn rhd_gold_proxy_correlation(gold_scores, proxy_scores) {
+    let n = len(gold_scores)
+    if n < 2 { return 0.0 }
+    let g_mean = rhd_mean(gold_scores)
+    let p_mean = rhd_mean(proxy_scores)
+    let mut cov = 0.0
+    let mut g_var = 0.0
+    let mut p_var = 0.0
+    for i in 0..n {
+        let gd = gold_scores[i] - g_mean
+        let pd = proxy_scores[i] - p_mean
+        cov = cov + gd * pd
+        g_var = g_var + gd * gd
+        p_var = p_var + pd * pd
+    }
+    let denom = rhd_sqrt(g_var * p_var + RHD_EPS)
+    return cov / denom
+}
+
+@pure
+fn rhd_gold_ranking_accuracy(gold_scores, proxy_scores) {
+    let n = len(gold_scores)
+    if n < 2 { return 0.0 }
+    let mut correct = 0
+    let mut total = 0
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let gold_order = gold_scores[i] - gold_scores[j]
+            let proxy_order = proxy_scores[i] - proxy_scores[j]
+            if gold_order * proxy_order > 0.0 {
+                correct = correct + 1
+            }
+            total = total + 1
+        }
+    }
+    if total == 0 { return 0.0 }
+    return to_float(correct) / to_float(total)
+}
+
+@pure
+fn rhd_gold_trend(gold_hist) {
+    let n = len(gold_hist)
+    if n < 2 { return 0.0 }
+    return (gold_hist[n - 1] - gold_hist[0]) / to_float(n - 1)
+}
+
+@pure
+fn rhd_defense_pipeline(proxy_reward, gold_hist, proxy_hist, policy_lp, ref_lp, kl_beta, kl_limit, ensemble_rewards, gp_lam, step, reset_period) {
+    let overopt = rhd_overopt_detect(proxy_hist, gold_hist, 1.0)
+    let kl = rhd_kl_divergence(policy_lp, ref_lp)
+    let kl_ok = kl <= kl_limit
+    let kl_penalty = kl_beta * kl
+    let ens_reward = rhd_ensemble_reward(ensemble_rewards)
+    let ens_mean = rhd_mean(ens_reward)
+    let mv = rhd_uncertainty_mean_var(ensemble_rewards)
+    let unc_vars = mv["vars"]
+    let avg_unc = rhd_mean(unc_vars)
+    let adjusted = proxy_reward - kl_penalty - gp_lam * avg_unc
+    let needs_reset = step % reset_period == 0
+    return #{
+        "adjusted_reward": adjusted,
+        "kl": kl,
+        "kl_ok": kl_ok,
+        "overopt_detected": overopt,
+        "ensemble_mean": ens_mean,
+        "uncertainty": avg_unc,
+        "needs_reset": needs_reset
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  TESTS
+// ═══════════════════════════════════════════════════════════════
+
+println("=== Reward Hacking Defense (#165) tests ===")
+
+// --- 1. Overoptimization detector ---
+
+// T1: overopt_score positive when proxy > gold
+let s1 = rhd_overopt_score(5.0, 3.0)
+check("T01 overopt_score proxy>gold positive", s1 > 0.0)
+
+// T2: overopt_score zero when equal
+let s2 = rhd_overopt_score(3.0, 3.0)
+check("T02 overopt_score equal = 0", approx(s2, 0.0, 0.001))
+
+// T3: overopt_gap tracks divergence
+let gaps = rhd_overopt_gap([1.0, 2.0, 4.0], [1.0, 1.5, 2.0])
+check("T03 overopt_gap tracks divergence", approx(gaps[2], 2.0, 0.01))
+
+// T4: overopt_detect fires on large gap
+let det1 = rhd_overopt_detect([1.0, 2.0, 5.0], [1.0, 1.5, 1.0], 1.0)
+check("T04 overopt_detect fires on large gap", det1)
+
+// T5: overopt_detect no fire when aligned
+let det2 = rhd_overopt_detect([1.0, 2.0, 3.0], [1.0, 2.0, 3.0], 1.0)
+check("T05 overopt_detect no fire when aligned", !det2)
+
+// T6: overopt_detect fires on declining gold + rising proxy
+let det3 = rhd_overopt_detect([1.0, 2.0, 3.0], [1.0, 1.5, 1.0], 0.5)
+check("T06 overopt_detect declining gold + rising proxy", det3)
+
+// T7: overopt_trend positive when diverging
+let trend = rhd_overopt_trend([1.0, 2.0, 4.0, 7.0], [1.0, 1.5, 2.0, 2.5], 4.0)
+check("T07 overopt_trend positive when diverging", trend > 0.0)
+
+// --- 2. KL constraint ---
+
+// T8: kl_divergence zero for identical distributions
+let kl0 = rhd_kl_divergence([-1.0, -2.0, -0.5], [-1.0, -2.0, -0.5])
+check("T08 kl_divergence zero for identical", approx(kl0, 0.0, 0.001))
+
+// T9: kl_divergence positive for different distributions
+let kl1 = rhd_kl_divergence([-1.0, -2.0], [-0.5, -1.0])
+check("T09 kl_divergence positive for different", kl1 > 0.0)
+
+// T10: kl_hard_check passes within limit
+let hc1 = rhd_kl_hard_check([-1.0, -2.0], [-1.0, -2.0], 0.5)
+check("T10 kl_hard_check passes within limit", hc1)
+
+// T11: kl_hard_check fails beyond limit
+let hc2 = rhd_kl_hard_check([-1.0, -2.0], [-5.0, -6.0], 0.01)
+check("T11 kl_hard_check fails beyond limit", !hc2)
+
+// T12: kl_soft_penalty scales with beta
+let sp1 = rhd_kl_soft_penalty([-1.0, -2.0], [-0.5, -1.0], 0.1)
+let sp2 = rhd_kl_soft_penalty([-1.0, -2.0], [-0.5, -1.0], 0.2)
+check("T12 kl_soft_penalty scales with beta", approx(sp2, sp1 * 2.0, 0.001))
+
+// T13: kl_adaptive_beta increases when KL too high
+let ab1 = rhd_kl_adaptive_beta(0.1, 2.0, 0.5)
+check("T13 adaptive_beta increases when KL high", ab1 > 0.1)
+
+// T14: kl_adaptive_beta decreases when KL too low
+let ab2 = rhd_kl_adaptive_beta(0.1, 0.01, 0.5)
+check("T14 adaptive_beta decreases when KL low", ab2 < 0.1)
+
+// T15: kl_adaptive_beta stable when KL near target
+let ab3 = rhd_kl_adaptive_beta(0.1, 0.5, 0.5)
+check("T15 adaptive_beta stable when KL near target", approx(ab3, 0.1, 0.001))
+
+// T16: kl_constrained_reward hard limit rejection
+let cr1 = rhd_kl_constrained_reward(5.0, [-1.0, -2.0], [-5.0, -6.0], 0.1, 0.01)
+check("T16 kl_constrained_reward hard rejection", cr1 < -100.0)
+
+// --- 3. Ensemble reward ---
+
+// T17: ensemble_reward averages two models
+let ens1 = rhd_ensemble_reward([[1.0, 2.0, 3.0], [3.0, 4.0, 5.0]])
+check("T17 ensemble_reward avg two models", approx(ens1[0], 2.0, 0.01) && approx(ens1[1], 3.0, 0.01))
+
+// T18: ensemble_reward single model passthrough
+let ens2 = rhd_ensemble_reward([[1.0, 2.0, 3.0]])
+check("T18 ensemble single model passthrough", approx(ens2[0], 1.0, 0.01))
+
+// T19: ensemble_weighted respects weights
+let ensw = rhd_ensemble_weighted([[1.0, 2.0], [5.0, 6.0]], [3.0, 1.0])
+// weighted: (3*1 + 1*5)/4 = 2.0, (3*2 + 1*6)/4 = 3.0
+check("T19 ensemble_weighted respects weights", approx(ensw[0], 2.0, 0.01) && approx(ensw[1], 3.0, 0.01))
+
+// T20: ensemble_median odd number of models
+let ensm1 = rhd_ensemble_median([[1.0], [5.0], [3.0]])
+check("T20 ensemble_median odd models", approx(ensm1[0], 3.0, 0.01))
+
+// T21: ensemble_median even number of models
+let ensm2 = rhd_ensemble_median([[1.0], [5.0], [3.0], [7.0]])
+// sorted: [1, 3, 5, 7], median = (3+5)/2 = 4
+check("T21 ensemble_median even models", approx(ensm2[0], 4.0, 0.01))
+
+// T22: ensemble_conservative takes minimum
+let ensc = rhd_ensemble_conservative([[3.0, 5.0], [1.0, 7.0], [2.0, 4.0]])
+check("T22 ensemble_conservative min", approx(ensc[0], 1.0, 0.01) && approx(ensc[1], 4.0, 0.01))
+
+// --- 4. Uncertainty ---
+
+// T23: uncertainty_mean_var correct stats
+let mv = rhd_uncertainty_mean_var([[1.0, 3.0], [3.0, 5.0]])
+let mv_means = mv["means"]
+let mv_vars = mv["vars"]
+check("T23 uncertainty_mean_var means", approx(mv_means[0], 2.0, 0.01) && approx(mv_means[1], 4.0, 0.01))
+
+// T24: uncertainty_threshold flags high variance
+let flags = rhd_uncertainty_threshold([0.1, 5.0, 0.2], 1.0)
+check("T24 uncertainty_threshold flags high", !flags[0] && flags[1] && !flags[2])
+
+// T25: epistemic_disagreement measures spread
+let dis = rhd_epistemic_disagreement([[1.0], [3.0], [5.0]])
+// std of [1,3,5]: mean=3, var=(4+0+4)/3=2.67, std~1.633
+check("T25 epistemic_disagreement spread", dis[0] > 1.0)
+
+// T26: uncertainty_penalized_reward
+let upr = rhd_uncertainty_penalized_reward([5.0, 3.0], [1.0, 0.5], 2.0)
+check("T26 uncertainty_penalized reward", approx(upr[0], 3.0, 0.01) && approx(upr[1], 2.0, 0.01))
+
+// --- 5. Gradient penalty ---
+
+// T27: approx_grad_norm finite and positive
+let gn = rhd_approx_grad_norm(5.0, 3.0, [1.0, 0.0], [0.0, 1.0])
+check("T27 approx_grad_norm positive", gn > 0.0)
+
+// T28: grad_penalty zero for identical pairs
+let gp0 = rhd_grad_penalty([1.0], [1.0], [[1.0, 2.0]], [[1.0, 2.0]], 1.0)
+// Same reward, same input: grad_norm ~ 0, penalty = (0 - 1)^2 = 1
+// Actually identical inputs -> dist ~ eps -> grad_norm ~ 0
+check("T28 grad_penalty identical rewards small", gp0 < 2.0)
+
+// T29: reward_with_grad_penalty reduces reward
+let rwgp = rhd_reward_with_grad_penalty(5.0, 1.0, 0.5)
+check("T29 reward_with_grad_penalty reduces", approx(rwgp, 4.5, 0.01))
+
+// T30: spectral_norm_approx identity matrix
+let ident = [[1.0, 0.0], [0.0, 1.0]]
+let sn = rhd_spectral_norm_approx(ident, 10)
+check("T30 spectral_norm identity ~ 1", approx(sn, 1.0, 0.1))
+
+// --- 6. Periodic reset ---
+
+// T31: periodic_reset at period boundary
+let pr1 = rhd_periodic_reset([-1.0, -2.0], [-0.5, -0.5], 10, 5)
+check("T31 periodic_reset at boundary", approx(pr1[0], -0.5, 0.01))
+
+// T32: periodic_reset no change off-period
+let pr2 = rhd_periodic_reset([-1.0, -2.0], [-0.5, -0.5], 7, 5)
+check("T32 periodic_reset off-period unchanged", approx(pr2[0], -1.0, 0.01))
+
+// T33: partial_reset interpolation
+let prp = rhd_partial_reset([-2.0, -4.0], [0.0, 0.0], 0.5)
+// 0.5*0.0 + 0.5*(-2.0) = -1.0
+check("T33 partial_reset interpolation", approx(prp[0], -1.0, 0.01))
+
+// --- 7. Gold reward evaluation ---
+
+// T34: gold_eval MAE correct
+let ge = rhd_gold_eval([1.0, 2.0, 3.0], [1.5, 2.5, 2.0])
+// MAE = (0.5 + 0.5 + 1.0) / 3 = 0.667
+check("T34 gold_eval MAE", approx(ge, 0.6667, 0.01))
+
+// T35: gold_proxy_correlation perfect alignment
+let gc = rhd_gold_proxy_correlation([1.0, 2.0, 3.0, 4.0], [2.0, 4.0, 6.0, 8.0])
+check("T35 gold_proxy_correlation perfect", gc > 0.99)
+
+// T36: gold_ranking_accuracy correct ordering
+let ra = rhd_gold_ranking_accuracy([1.0, 2.0, 3.0], [10.0, 20.0, 30.0])
+check("T36 gold_ranking_accuracy perfect", approx(ra, 1.0, 0.01))
+
+// T37: gold_trend positive for increasing sequence
+let gt = rhd_gold_trend([1.0, 2.0, 3.0, 4.0])
+check("T37 gold_trend positive", approx(gt, 1.0, 0.01))
+
+// --- 8. Defense pipeline ---
+
+// T38: defense_pipeline smoke test
+let dp = rhd_defense_pipeline(
+    5.0,
+    [1.0, 1.5, 2.0],
+    [1.0, 2.0, 2.5],
+    [-1.0, -2.0],
+    [-1.0, -2.0],
+    0.1,
+    1.0,
+    [[1.0, 2.0], [3.0, 4.0]],
+    0.1,
+    10,
+    5
+)
+check("T38 defense_pipeline adjusted_reward finite", dp["adjusted_reward"] > -100.0 && dp["adjusted_reward"] < 100.0)
+
+// T39: conditional_reset triggers above threshold
+let cond1 = rhd_conditional_reset([-1.0, -3.0], [-0.5, -0.5], 0.001)
+// KL between these is large, should reset to ref
+check("T39 conditional_reset triggers", approx(cond1[0], -0.5, 0.01))
+
+// T40: ema_toward_ref decays correctly
+let ema1 = rhd_ema_toward_ref([-2.0, -4.0], [0.0, 0.0], 0.8)
+// 0.8*(-2) + 0.2*0 = -1.6
+check("T40 ema_toward_ref decay", approx(ema1[0], -1.6, 0.01))
+
+// ═══════════════════════════════════════════════════════════════
+//  Summary
+// ═══════════════════════════════════════════════════════════════
+println("")
+println("=== Results: " + to_string(pass_count) + " PASS / " + to_string(fail_count) + " FAIL ===")
+if fail_count == 0 {
+    println("ALL " + to_string(pass_count) + " tests PASSED")
+} else {
+    println("SOME TESTS FAILED")
+}

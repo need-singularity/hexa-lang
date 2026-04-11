@@ -1,0 +1,1108 @@
+// ===================================================================
+//  test_byte_latent_transformer.hexa — Byte Latent Transformer (#161)
+//
+//  ML roadmap #161 — Tokenizer-free byte-level transformer with
+//  dynamic patching and entropy-based boundary detection.
+//
+//  Verifies:
+//    T1  byte embedding table has 256 entries
+//    T2  byte embedding dimension correct
+//    T3  embed_bytes output count matches input
+//    T4  embed_bytes different bytes -> different vectors
+//    T5  local encoder creation (dim, n_heads)
+//    T6  local_encode produces correct patch count (fixed window)
+//    T7  local_encode output dim matches encoder dim
+//    T8  byte entropy is non-negative
+//    T9  byte entropy: uniform bytes -> higher entropy
+//    T10 byte entropy: repeated bytes -> lower entropy
+//    T11 boundary detection always starts at 0
+//    T12 boundary detection always ends at n
+//    T13 boundary count >= 2 (start + end)
+//    T14 boundaries monotonically increasing
+//    T15 patch_lengths sum = total bytes
+//    T16 dynamic_patch output patches > 0
+//    T17 dynamic_patch each patch has correct dim
+//    T18 latent transformer creation (layers, dim)
+//    T19 latent_forward output count = input patch count
+//    T20 latent_forward preserves dim
+//    T21 latent_forward with 2 layers changes representation
+//    T22 local decoder creation
+//    T23 decode_patches total byte vectors = sum of patch lengths
+//    T24 decode_patches output dim correct
+//    T25 prediction head creation
+//    T26 predict_bytes output: 256 logits per byte
+//    T27 predict_byte_probs sums to 1.0
+//    T28 full model creation
+//    T29 full_forward produces logits for each byte
+//    T30 full_forward logit dimension = 256
+//    T31 cross_entropy_loss >= 0
+//    T32 argmax returns value in [0, 255]
+//    T33 compression ratio: repetitive < random
+//    T34 different sequences -> different latent outputs
+//    T35 softmax output sums to 1.0
+//
+//  Pure hexa, pure CPU.
+//  Run: ./hexa self/test_byte_latent_transformer.hexa
+// ===================================================================
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ===================================================================
+//  Inlined copy of self/ml/byte_latent_transformer.hexa
+// ===================================================================
+
+// -- Math / Vector helpers --
+
+fn blt_vec_zeros(dim) {
+    let mut out = []
+    let mut i = 0
+    while i < dim {
+        out = out + [0.0]
+        i = i + 1
+    }
+    return out
+}
+
+fn blt_vec_add(a, b) {
+    let n = len(a)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [a[i] + b[i]]
+        i = i + 1
+    }
+    return out
+}
+
+fn blt_vec_scale(v, s) {
+    let n = len(v)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [v[i] * s]
+        i = i + 1
+    }
+    return out
+}
+
+fn blt_dot(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + a[i] * b[i]
+        i = i + 1
+    }
+    return s
+}
+
+fn blt_fabs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn blt_sigmoid(x) {
+    if x > 20.0 { return 1.0 }
+    if x < -20.0 { return 0.0 }
+    return 1.0 / (1.0 + exp(0.0 - x))
+}
+
+fn blt_relu(x) {
+    if x < 0.0 { return 0.0 }
+    return x
+}
+
+fn blt_softmax(logits) {
+    let n = len(logits)
+    let mut mx = logits[0]
+    let mut i = 1
+    while i < n {
+        if logits[i] > mx { mx = logits[i] }
+        i = i + 1
+    }
+    let mut exps = []
+    let mut s = 0.0
+    i = 0
+    while i < n {
+        let e = exp(logits[i] - mx)
+        exps = exps + [e]
+        s = s + e
+        i = i + 1
+    }
+    if s < 1.0e-30 { s = 1.0e-30 }
+    let mut out = []
+    i = 0
+    while i < n {
+        out = out + [exps[i] / s]
+        i = i + 1
+    }
+    return out
+}
+
+// -- Matrix helpers --
+
+fn blt_matvec(mat, vec) {
+    let rows = len(mat)
+    let mut out = []
+    let mut i = 0
+    while i < rows {
+        out = out + [blt_dot(mat[i], vec)]
+        i = i + 1
+    }
+    return out
+}
+
+fn blt_init_matrix(rows, cols, seed) {
+    let scale = 0.02
+    let mut mat = []
+    let mut i = 0
+    while i < rows {
+        let mut row = []
+        let mut j = 0
+        while j < cols {
+            let val = sin(to_float(i * 137 + j * 31 + seed)) * scale
+            row = row + [val]
+            j = j + 1
+        }
+        mat = mat + [row]
+        i = i + 1
+    }
+    return mat
+}
+
+// -- 1. Byte Embedding --
+
+struct ByteEmbedding {
+    dim: int,
+    table: array
+}
+
+fn blt_create_byte_embedding(dim) {
+    let scale = 1.0 / sqrt(to_float(dim))
+    let mut table = []
+    let mut b = 0
+    while b < 256 {
+        let mut vec = []
+        let mut d = 0
+        while d < dim {
+            let val = sin(to_float(b * 97 + d * 53 + 11)) * scale
+            vec = vec + [val]
+            d = d + 1
+        }
+        table = table + [vec]
+        b = b + 1
+    }
+    return ByteEmbedding { dim: dim, table: table }
+}
+
+fn blt_embed_bytes(emb, byte_seq) {
+    let n = len(byte_seq)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let b = byte_seq[i]
+        let mut idx = b
+        if idx < 0 { idx = 0 }
+        if idx > 255 { idx = 255 }
+        out = out + [emb.table[idx]]
+        i = i + 1
+    }
+    return out
+}
+
+// -- 2. Local Encoder --
+
+struct LocalEncoder {
+    dim: int,
+    n_heads: int,
+    head_dim: int,
+    Wq: array,
+    Wk: array,
+    Wv: array,
+    Wo: array,
+    W_ff1: array,
+    W_ff2: array
+}
+
+fn blt_create_local_encoder(dim, n_heads) {
+    let head_dim = dim / n_heads
+    let Wq = blt_init_matrix(dim, dim, 7)
+    let Wk = blt_init_matrix(dim, dim, 13)
+    let Wv = blt_init_matrix(dim, dim, 19)
+    let Wo = blt_init_matrix(dim, dim, 29)
+    let ff_dim = dim * 2
+    let W_ff1 = blt_init_matrix(ff_dim, dim, 37)
+    let W_ff2 = blt_init_matrix(dim, ff_dim, 43)
+    return LocalEncoder {
+        dim: dim,
+        n_heads: n_heads,
+        head_dim: head_dim,
+        Wq: Wq,
+        Wk: Wk,
+        Wv: Wv,
+        Wo: Wo,
+        W_ff1: W_ff1,
+        W_ff2: W_ff2
+    }
+}
+
+fn blt_window_attention(enc, byte_vecs) {
+    let n = len(byte_vecs)
+    let dim = enc.dim
+    if n == 0 { return blt_vec_zeros(dim) }
+    if n == 1 { return byte_vecs[0] }
+    let mut qs = []
+    let mut ks = []
+    let mut vs = []
+    let mut i = 0
+    while i < n {
+        qs = qs + [blt_matvec(enc.Wq, byte_vecs[i])]
+        ks = ks + [blt_matvec(enc.Wk, byte_vecs[i])]
+        vs = vs + [blt_matvec(enc.Wv, byte_vecs[i])]
+        i = i + 1
+    }
+    let q = qs[n - 1]
+    let scale = 1.0 / sqrt(to_float(dim))
+    let mut scores = []
+    i = 0
+    while i < n {
+        let s = blt_dot(q, ks[i]) * scale
+        scores = scores + [s]
+        i = i + 1
+    }
+    let probs = blt_softmax(scores)
+    let mut out = blt_vec_zeros(dim)
+    i = 0
+    while i < n {
+        let weighted = blt_vec_scale(vs[i], probs[i])
+        out = blt_vec_add(out, weighted)
+        i = i + 1
+    }
+    let projected = blt_matvec(enc.Wo, out)
+    return projected
+}
+
+fn blt_local_encode(enc, byte_vecs, window_size) {
+    let n = len(byte_vecs)
+    if n == 0 { return [] }
+    let dim = enc.dim
+    let mut patches = []
+    let mut start = 0
+    while start < n {
+        let mut end = start + window_size
+        if end > n { end = n }
+        let mut win = []
+        let mut i = start
+        while i < end {
+            win = win + [byte_vecs[i]]
+            i = i + 1
+        }
+        let attn_out = blt_window_attention(enc, win)
+        let h = blt_matvec(enc.W_ff1, attn_out)
+        let mut h_relu = []
+        let mut ri = 0
+        while ri < len(h) {
+            h_relu = h_relu + [blt_relu(h[ri])]
+            ri = ri + 1
+        }
+        let ff_out = blt_matvec(enc.W_ff2, h_relu)
+        let patch = blt_vec_add(attn_out, ff_out)
+        patches = patches + [patch]
+        start = end
+    }
+    return patches
+}
+
+// -- 3. Patch Boundary Detector --
+
+fn blt_compute_byte_entropy(byte_seq) {
+    let n = len(byte_seq)
+    if n == 0 { return [] }
+    let window = 8
+    let mut entropies = []
+    let mut i = 0
+    while i < n {
+        let mut start = i - window / 2
+        if start < 0 { start = 0 }
+        let mut end = i + window / 2
+        if end > n { end = n }
+        let win_len = end - start
+        let mut counts = #{}
+        let mut j = start
+        while j < end {
+            let b = byte_seq[j]
+            let key = to_string(b)
+            if has_key(counts, key) {
+                counts[key] = counts[key] + 1
+            } else {
+                counts[key] = 1
+            }
+            j = j + 1
+        }
+        let ks = keys(counts)
+        let nk = len(ks)
+        let mut h = 0.0
+        let mut ki = 0
+        while ki < nk {
+            let c = counts[ks[ki]]
+            let p = to_float(c) / to_float(win_len)
+            if p > 0.0 {
+                h = h - p * log(p)
+            }
+            ki = ki + 1
+        }
+        entropies = entropies + [h]
+        i = i + 1
+    }
+    return entropies
+}
+
+fn blt_detect_boundaries(entropies, threshold) {
+    let n = len(entropies)
+    let mut boundaries = [0]
+    let mut i = 1
+    while i < n {
+        if entropies[i] > threshold {
+            let last_b = boundaries[len(boundaries) - 1]
+            if i > last_b {
+                boundaries = boundaries + [i]
+            }
+        }
+        i = i + 1
+    }
+    let last = boundaries[len(boundaries) - 1]
+    if last < n {
+        boundaries = boundaries + [n]
+    }
+    return boundaries
+}
+
+fn blt_patch_lengths(boundaries) {
+    let nb = len(boundaries)
+    let mut lens = []
+    let mut i = 0
+    while i < nb - 1 {
+        lens = lens + [boundaries[i + 1] - boundaries[i]]
+        i = i + 1
+    }
+    return lens
+}
+
+// -- 7. Dynamic Patching --
+
+fn blt_dynamic_patch(byte_vecs, boundaries) {
+    let nb = len(boundaries)
+    let n = len(byte_vecs)
+    if n == 0 { return [] }
+    let dim = len(byte_vecs[0])
+    let mut patches = []
+    let mut bi = 0
+    while bi < nb - 1 {
+        let start = boundaries[bi]
+        let mut end = boundaries[bi + 1]
+        if end > n { end = n }
+        let patch_len = end - start
+        if patch_len <= 0 {
+            bi = bi + 1
+            continue
+        }
+        let mut acc = blt_vec_zeros(dim)
+        let mut j = start
+        while j < end {
+            acc = blt_vec_add(acc, byte_vecs[j])
+            j = j + 1
+        }
+        let inv = 1.0 / to_float(patch_len)
+        let patch = blt_vec_scale(acc, inv)
+        patches = patches + [patch]
+        bi = bi + 1
+    }
+    return patches
+}
+
+// -- 4. Latent Transformer --
+
+struct LatentTransformerLayer {
+    dim: int,
+    n_heads: int,
+    head_dim: int,
+    Wq: array,
+    Wk: array,
+    Wv: array,
+    Wo: array,
+    W_ff1: array,
+    W_ff2: array,
+    ff_dim: int
+}
+
+struct LatentTransformer {
+    dim: int,
+    n_heads: int,
+    n_layers: int,
+    ff_dim: int,
+    layers: array
+}
+
+fn blt_create_latent_layer(dim, n_heads, ff_dim, seed) {
+    let head_dim = dim / n_heads
+    return LatentTransformerLayer {
+        dim: dim,
+        n_heads: n_heads,
+        head_dim: head_dim,
+        Wq: blt_init_matrix(dim, dim, seed),
+        Wk: blt_init_matrix(dim, dim, seed + 7),
+        Wv: blt_init_matrix(dim, dim, seed + 13),
+        Wo: blt_init_matrix(dim, dim, seed + 19),
+        W_ff1: blt_init_matrix(ff_dim, dim, seed + 29),
+        W_ff2: blt_init_matrix(dim, ff_dim, seed + 37),
+        ff_dim: ff_dim
+    }
+}
+
+fn blt_create_latent_transformer(dim, n_heads, n_layers, ff_dim) {
+    let mut layers = []
+    let mut i = 0
+    while i < n_layers {
+        let layer = blt_create_latent_layer(dim, n_heads, ff_dim, i * 100 + 1)
+        layers = layers + [layer]
+        i = i + 1
+    }
+    return LatentTransformer {
+        dim: dim,
+        n_heads: n_heads,
+        n_layers: n_layers,
+        ff_dim: ff_dim,
+        layers: layers
+    }
+}
+
+fn blt_latent_layer_forward(layer, patches) {
+    let n = len(patches)
+    let dim = layer.dim
+    if n == 0 { return [] }
+    let mut qs = []
+    let mut ks = []
+    let mut vs = []
+    let mut i = 0
+    while i < n {
+        qs = qs + [blt_matvec(layer.Wq, patches[i])]
+        ks = ks + [blt_matvec(layer.Wk, patches[i])]
+        vs = vs + [blt_matvec(layer.Wv, patches[i])]
+        i = i + 1
+    }
+    let scale = 1.0 / sqrt(to_float(dim))
+    let mut attn_out = []
+    i = 0
+    while i < n {
+        let mut scores = []
+        let mut j = 0
+        while j < n {
+            scores = scores + [blt_dot(qs[i], ks[j]) * scale]
+            j = j + 1
+        }
+        let probs = blt_softmax(scores)
+        let mut weighted = blt_vec_zeros(dim)
+        j = 0
+        while j < n {
+            weighted = blt_vec_add(weighted, blt_vec_scale(vs[j], probs[j]))
+            j = j + 1
+        }
+        let projected = blt_matvec(layer.Wo, weighted)
+        let after_attn = blt_vec_add(patches[i], projected)
+        attn_out = attn_out + [after_attn]
+        i = i + 1
+    }
+    let mut out = []
+    i = 0
+    while i < n {
+        let h = blt_matvec(layer.W_ff1, attn_out[i])
+        let mut h_relu = []
+        let mut ri = 0
+        while ri < len(h) {
+            h_relu = h_relu + [blt_relu(h[ri])]
+            ri = ri + 1
+        }
+        let ff_out = blt_matvec(layer.W_ff2, h_relu)
+        let result = blt_vec_add(attn_out[i], ff_out)
+        out = out + [result]
+        i = i + 1
+    }
+    return out
+}
+
+fn blt_latent_forward(lt, patches) {
+    let mut h = patches
+    let mut i = 0
+    while i < lt.n_layers {
+        h = blt_latent_layer_forward(lt.layers[i], h)
+        i = i + 1
+    }
+    return h
+}
+
+// -- 5. Local Decoder --
+
+struct LocalDecoder {
+    dim: int,
+    max_patch_len: int,
+    W_expand: array
+}
+
+fn blt_create_local_decoder(dim, max_patch_len) {
+    let out_dim = max_patch_len * dim
+    let W_expand = blt_init_matrix(out_dim, dim, 59)
+    return LocalDecoder {
+        dim: dim,
+        max_patch_len: max_patch_len,
+        W_expand: W_expand
+    }
+}
+
+fn blt_decode_patches(dec, patch_vecs, patch_lens) {
+    let n_patches = len(patch_vecs)
+    let dim = dec.dim
+    let mut byte_vecs = []
+    let mut pi = 0
+    while pi < n_patches {
+        let expanded = blt_matvec(dec.W_expand, patch_vecs[pi])
+        let plen = patch_lens[pi]
+        let mut bi = 0
+        while bi < plen {
+            let offset = bi * dim
+            let mut vec = []
+            let mut d = 0
+            while d < dim {
+                vec = vec + [expanded[offset + d]]
+                d = d + 1
+            }
+            byte_vecs = byte_vecs + [vec]
+            bi = bi + 1
+        }
+        pi = pi + 1
+    }
+    return byte_vecs
+}
+
+// -- 6. Prediction Head --
+
+struct PredictionHead {
+    dim: int,
+    W_out: array,
+    bias: array
+}
+
+fn blt_create_prediction_head(dim) {
+    let W_out = blt_init_matrix(256, dim, 67)
+    let bias = blt_vec_zeros(256)
+    return PredictionHead {
+        dim: dim,
+        W_out: W_out,
+        bias: bias
+    }
+}
+
+fn blt_predict_bytes(head, byte_vecs) {
+    let n = len(byte_vecs)
+    let mut all_logits = []
+    let mut i = 0
+    while i < n {
+        let raw = blt_matvec(head.W_out, byte_vecs[i])
+        let logits = blt_vec_add(raw, head.bias)
+        all_logits = all_logits + [logits]
+        i = i + 1
+    }
+    return all_logits
+}
+
+fn blt_predict_byte_probs(head, byte_vecs) {
+    let logits = blt_predict_bytes(head, byte_vecs)
+    let n = len(logits)
+    let mut probs = []
+    let mut i = 0
+    while i < n {
+        probs = probs + [blt_softmax(logits[i])]
+        i = i + 1
+    }
+    return probs
+}
+
+// -- Full Model --
+
+struct BLTModel {
+    dim: int,
+    embedding: array,
+    local_encoder: array,
+    latent_transformer: array,
+    local_decoder: array,
+    prediction_head: array,
+    entropy_threshold: float,
+    max_patch_len: int
+}
+
+fn blt_create_model(dim, n_heads, n_layers, ff_dim, max_patch_len) {
+    let emb = blt_create_byte_embedding(dim)
+    let enc = blt_create_local_encoder(dim, n_heads)
+    let lt = blt_create_latent_transformer(dim, n_heads, n_layers, ff_dim)
+    let dec = blt_create_local_decoder(dim, max_patch_len)
+    let head = blt_create_prediction_head(dim)
+    return BLTModel {
+        dim: dim,
+        embedding: [emb],
+        local_encoder: [enc],
+        latent_transformer: [lt],
+        local_decoder: [dec],
+        prediction_head: [head],
+        entropy_threshold: 1.5,
+        max_patch_len: max_patch_len
+    }
+}
+
+fn blt_full_forward(model, byte_seq) {
+    let dim = model.dim
+    let emb = model.embedding[0]
+    let enc = model.local_encoder[0]
+    let lt = model.latent_transformer[0]
+    let dec = model.local_decoder[0]
+    let head = model.prediction_head[0]
+    let threshold = model.entropy_threshold
+    let byte_vecs = blt_embed_bytes(emb, byte_seq)
+    let n = len(byte_vecs)
+    if n == 0 { return [] }
+    let entropies = blt_compute_byte_entropy(byte_seq)
+    let boundaries = blt_detect_boundaries(entropies, threshold)
+    let patches = blt_dynamic_patch(byte_vecs, boundaries)
+    let latent_out = blt_latent_forward(lt, patches)
+    let patch_lens = blt_patch_lengths(boundaries)
+    let decoded = blt_decode_patches(dec, latent_out, patch_lens)
+    let logits = blt_predict_bytes(head, decoded)
+    return logits
+}
+
+fn blt_cross_entropy_loss(logits, targets) {
+    let n = len(logits)
+    if n == 0 { return 0.0 }
+    let mut total = 0.0
+    let mut i = 0
+    while i < n {
+        let probs = blt_softmax(logits[i])
+        let target = targets[i]
+        let mut idx = target
+        if idx < 0 { idx = 0 }
+        if idx > 255 { idx = 255 }
+        let p = probs[idx]
+        let eps = 1.0e-10
+        if p > eps {
+            total = total - log(p)
+        } else {
+            total = total - log(eps)
+        }
+        i = i + 1
+    }
+    return total / to_float(n)
+}
+
+fn blt_argmax(logits) {
+    let n = len(logits)
+    let mut best = 0
+    let mut best_v = logits[0]
+    let mut i = 1
+    while i < n {
+        if logits[i] > best_v {
+            best_v = logits[i]
+            best = i
+        }
+        i = i + 1
+    }
+    return best
+}
+
+fn blt_compression_ratio(byte_seq, threshold) {
+    let n = len(byte_seq)
+    if n == 0 { return 1.0 }
+    let entropies = blt_compute_byte_entropy(byte_seq)
+    let boundaries = blt_detect_boundaries(entropies, threshold)
+    let n_patches = len(boundaries) - 1
+    if n_patches <= 0 { return 1.0 }
+    return to_float(n_patches) / to_float(n)
+}
+
+// ===================================================================
+//  Test data
+// ===================================================================
+
+let dim = 4
+let n_heads = 2
+let ff_dim = 8
+let max_patch = 6
+
+// Simple byte sequences
+let seq_hello = [72, 101, 108, 108, 111]
+let seq_repeat = [65, 65, 65, 65, 65, 65, 65, 65]
+let seq_random = [10, 200, 55, 180, 3, 240, 99, 150]
+let seq_longer = [72, 101, 108, 108, 111, 32, 87, 111, 114, 108, 100, 33]
+
+// Create shared components for tests
+let emb = blt_create_byte_embedding(dim)
+let enc = blt_create_local_encoder(dim, n_heads)
+
+// ===================================================================
+//  T1 — byte embedding table has 256 entries
+// ===================================================================
+check("T1 embedding table has 256 entries", len(emb.table) == 256)
+
+// ===================================================================
+//  T2 — byte embedding dimension correct
+// ===================================================================
+check("T2 embedding dim correct", emb.dim == dim)
+check("T2 first entry dim correct", len(emb.table[0]) == dim)
+check("T2 last entry dim correct", len(emb.table[255]) == dim)
+
+// ===================================================================
+//  T3 — embed_bytes output count matches input
+// ===================================================================
+let embedded = blt_embed_bytes(emb, seq_hello)
+check("T3 embed output count = 5", len(embedded) == 5)
+
+// ===================================================================
+//  T4 — different bytes produce different vectors
+// ===================================================================
+let e_72 = blt_embed_bytes(emb, [72])
+let e_101 = blt_embed_bytes(emb, [101])
+let mut diff4 = false
+let mut di4 = 0
+while di4 < dim {
+    if fabs(e_72[0][di4] - e_101[0][di4]) > 1.0e-6 { diff4 = true }
+    di4 = di4 + 1
+}
+check("T4 different bytes -> different vectors", diff4)
+
+// ===================================================================
+//  T5 — local encoder creation
+// ===================================================================
+check("T5 encoder dim correct", enc.dim == dim)
+check("T5 encoder n_heads correct", enc.n_heads == n_heads)
+check("T5 encoder head_dim correct", enc.head_dim == dim / n_heads)
+
+// ===================================================================
+//  T6 — local_encode patch count (fixed window)
+// ===================================================================
+let byte_vecs6 = blt_embed_bytes(emb, seq_hello)
+let patches6 = blt_local_encode(enc, byte_vecs6, 3)
+// 5 bytes, window=3 -> ceil(5/3) = 2 patches
+check("T6 local encode patch count", len(patches6) == 2)
+
+// ===================================================================
+//  T7 — local_encode output dim
+// ===================================================================
+let mut dim7_ok = true
+let mut i7 = 0
+while i7 < len(patches6) {
+    if len(patches6[i7]) != dim { dim7_ok = false }
+    i7 = i7 + 1
+}
+check("T7 local encode output dim correct", dim7_ok)
+
+// ===================================================================
+//  T8 — byte entropy is non-negative
+// ===================================================================
+let ent8 = blt_compute_byte_entropy(seq_hello)
+check("T8 entropy count = byte count", len(ent8) == len(seq_hello))
+let mut ent8_ok = true
+let mut i8 = 0
+while i8 < len(ent8) {
+    if ent8[i8] < 0.0 { ent8_ok = false }
+    i8 = i8 + 1
+}
+check("T8 all entropies >= 0", ent8_ok)
+
+// ===================================================================
+//  T9 — uniform bytes -> higher entropy than repeated
+// ===================================================================
+let ent_rand = blt_compute_byte_entropy(seq_random)
+let ent_rep = blt_compute_byte_entropy(seq_repeat)
+// Average entropy
+let mut avg_rand = 0.0
+let mut i9r = 0
+while i9r < len(ent_rand) {
+    avg_rand = avg_rand + ent_rand[i9r]
+    i9r = i9r + 1
+}
+avg_rand = avg_rand / to_float(len(ent_rand))
+let mut avg_rep = 0.0
+let mut i9p = 0
+while i9p < len(ent_rep) {
+    avg_rep = avg_rep + ent_rep[i9p]
+    i9p = i9p + 1
+}
+avg_rep = avg_rep / to_float(len(ent_rep))
+check("T9 random bytes entropy > repeated bytes entropy", avg_rand > avg_rep)
+
+// ===================================================================
+//  T10 — repeated bytes -> low entropy
+// ===================================================================
+check("T10 repeated bytes avg entropy = 0", approx(avg_rep, 0.0, 1.0e-10))
+
+// ===================================================================
+//  T11 — boundary detection starts at 0
+// ===================================================================
+let ent11 = blt_compute_byte_entropy(seq_longer)
+let bounds11 = blt_detect_boundaries(ent11, 1.0)
+check("T11 boundaries start at 0", bounds11[0] == 0)
+
+// ===================================================================
+//  T12 — boundary detection ends at n
+// ===================================================================
+let last_b12 = bounds11[len(bounds11) - 1]
+check("T12 boundaries end at n", last_b12 == len(seq_longer))
+
+// ===================================================================
+//  T13 — boundary count >= 2
+// ===================================================================
+check("T13 boundary count >= 2", len(bounds11) >= 2)
+
+// ===================================================================
+//  T14 — boundaries monotonically increasing
+// ===================================================================
+let mut mono14 = true
+let mut i14 = 0
+while i14 < len(bounds11) - 1 {
+    if bounds11[i14] >= bounds11[i14 + 1] { mono14 = false }
+    i14 = i14 + 1
+}
+check("T14 boundaries monotonically increasing", mono14)
+
+// ===================================================================
+//  T15 — patch_lengths sum = total bytes
+// ===================================================================
+let plens15 = blt_patch_lengths(bounds11)
+let mut sum15 = 0
+let mut i15 = 0
+while i15 < len(plens15) {
+    sum15 = sum15 + plens15[i15]
+    i15 = i15 + 1
+}
+check("T15 patch lengths sum = n bytes", sum15 == len(seq_longer))
+
+// ===================================================================
+//  T16 — dynamic_patch output patches > 0
+// ===================================================================
+let bv16 = blt_embed_bytes(emb, seq_longer)
+let dp16 = blt_dynamic_patch(bv16, bounds11)
+check("T16 dynamic patch count > 0", len(dp16) > 0)
+
+// ===================================================================
+//  T17 — dynamic_patch each patch has correct dim
+// ===================================================================
+let mut dim17_ok = true
+let mut i17 = 0
+while i17 < len(dp16) {
+    if len(dp16[i17]) != dim { dim17_ok = false }
+    i17 = i17 + 1
+}
+check("T17 dynamic patch dim correct", dim17_ok)
+
+// ===================================================================
+//  T18 — latent transformer creation
+// ===================================================================
+let lt18 = blt_create_latent_transformer(dim, n_heads, 2, ff_dim)
+check("T18 latent transformer dim", lt18.dim == dim)
+check("T18 latent transformer n_layers", lt18.n_layers == 2)
+check("T18 latent transformer layer count", len(lt18.layers) == 2)
+
+// ===================================================================
+//  T19 — latent_forward output count = input
+// ===================================================================
+let out19 = blt_latent_forward(lt18, dp16)
+check("T19 latent output count = patch count", len(out19) == len(dp16))
+
+// ===================================================================
+//  T20 — latent_forward preserves dim
+// ===================================================================
+let mut dim20_ok = true
+let mut i20 = 0
+while i20 < len(out19) {
+    if len(out19[i20]) != dim { dim20_ok = false }
+    i20 = i20 + 1
+}
+check("T20 latent output dim preserved", dim20_ok)
+
+// ===================================================================
+//  T21 — latent transformer with 2 layers changes representation
+// ===================================================================
+let mut changed21 = false
+let mut i21 = 0
+while i21 < len(dp16) {
+    let mut d21 = 0
+    while d21 < dim {
+        if fabs(out19[i21][d21] - dp16[i21][d21]) > 1.0e-10 {
+            changed21 = true
+        }
+        d21 = d21 + 1
+    }
+    i21 = i21 + 1
+}
+check("T21 latent transformer changes representation", changed21)
+
+// ===================================================================
+//  T22 — local decoder creation
+// ===================================================================
+let dec22 = blt_create_local_decoder(dim, max_patch)
+check("T22 decoder dim", dec22.dim == dim)
+check("T22 decoder max_patch_len", dec22.max_patch_len == max_patch)
+
+// ===================================================================
+//  T23 — decode_patches total byte vectors = sum of patch lengths
+// ===================================================================
+let dec_out23 = blt_decode_patches(dec22, out19, plens15)
+let mut sum23 = 0
+let mut i23 = 0
+while i23 < len(plens15) {
+    sum23 = sum23 + plens15[i23]
+    i23 = i23 + 1
+}
+check("T23 decoded byte vec count = sum patch lens", len(dec_out23) == sum23)
+
+// ===================================================================
+//  T24 — decode_patches output dim
+// ===================================================================
+let mut dim24_ok = true
+let mut i24 = 0
+while i24 < len(dec_out23) {
+    if len(dec_out23[i24]) != dim { dim24_ok = false }
+    i24 = i24 + 1
+}
+check("T24 decoded byte vec dim correct", dim24_ok)
+
+// ===================================================================
+//  T25 — prediction head creation
+// ===================================================================
+let head25 = blt_create_prediction_head(dim)
+check("T25 prediction head dim", head25.dim == dim)
+check("T25 prediction head W_out rows = 256", len(head25.W_out) == 256)
+
+// ===================================================================
+//  T26 — predict_bytes output: 256 logits per byte
+// ===================================================================
+let logits26 = blt_predict_bytes(head25, dec_out23)
+check("T26 logits count = byte count", len(logits26) == len(dec_out23))
+let mut dim26_ok = true
+let mut i26 = 0
+while i26 < len(logits26) {
+    if len(logits26[i26]) != 256 { dim26_ok = false }
+    i26 = i26 + 1
+}
+check("T26 each logit dim = 256", dim26_ok)
+
+// ===================================================================
+//  T27 — predict_byte_probs sums to 1.0
+// ===================================================================
+let probs27 = blt_predict_byte_probs(head25, dec_out23)
+let mut sum27 = 0.0
+let mut i27 = 0
+while i27 < 256 {
+    sum27 = sum27 + probs27[0][i27]
+    i27 = i27 + 1
+}
+check("T27 byte probs sum to 1.0", approx(sum27, 1.0, 1.0e-6))
+
+// ===================================================================
+//  T28 — full model creation
+// ===================================================================
+let model28 = blt_create_model(dim, n_heads, 1, ff_dim, max_patch)
+check("T28 model dim", model28.dim == dim)
+check("T28 model max_patch_len", model28.max_patch_len == max_patch)
+check("T28 model entropy_threshold", model28.entropy_threshold > 0.0)
+
+// ===================================================================
+//  T29 — full_forward produces logits for each byte
+// ===================================================================
+let logits29 = blt_full_forward(model28, seq_hello)
+check("T29 full forward logit count = byte count", len(logits29) == len(seq_hello))
+
+// ===================================================================
+//  T30 — full_forward logit dimension = 256
+// ===================================================================
+let mut dim30_ok = true
+let mut i30 = 0
+while i30 < len(logits29) {
+    if len(logits29[i30]) != 256 { dim30_ok = false }
+    i30 = i30 + 1
+}
+check("T30 full forward logit dim = 256", dim30_ok)
+
+// ===================================================================
+//  T31 — cross_entropy_loss >= 0
+// ===================================================================
+let targets31 = [101, 108, 108, 111, 32]
+let loss31 = blt_cross_entropy_loss(logits29, targets31)
+check("T31 cross entropy loss >= 0", loss31 >= 0.0)
+check("T31 cross entropy loss finite", loss31 < 1.0e10)
+
+// ===================================================================
+//  T32 — argmax returns value in [0, 255]
+// ===================================================================
+let pred32 = blt_argmax(logits29[0])
+check("T32 argmax >= 0", pred32 >= 0)
+check("T32 argmax <= 255", pred32 <= 255)
+
+// ===================================================================
+//  T33 — compression ratio: repetitive < random
+// ===================================================================
+let cr_rep = blt_compression_ratio(seq_repeat, 0.5)
+let cr_rand = blt_compression_ratio(seq_random, 0.5)
+check("T33 repetitive compression <= random compression", cr_rep <= cr_rand)
+
+// ===================================================================
+//  T34 — different sequences -> different latent outputs
+// ===================================================================
+let logits_a = blt_full_forward(model28, seq_hello)
+let logits_b = blt_full_forward(model28, seq_random)
+// Compare first position logits
+let mut diff34 = false
+let mut i34 = 0
+while i34 < 256 {
+    if fabs(logits_a[0][i34] - logits_b[0][i34]) > 1.0e-10 {
+        diff34 = true
+    }
+    i34 = i34 + 1
+}
+check("T34 different input -> different logits", diff34)
+
+// ===================================================================
+//  T35 — softmax output sums to 1.0
+// ===================================================================
+let test_logits = [1.0, 2.0, 3.0, 4.0]
+let sm35 = blt_softmax(test_logits)
+let mut sum35 = 0.0
+let mut i35 = 0
+while i35 < len(sm35) {
+    sum35 = sum35 + sm35[i35]
+    i35 = i35 + 1
+}
+check("T35 softmax sums to 1.0", approx(sum35, 1.0, 1.0e-9))
+
+// ===================================================================
+//  Summary
+// ===================================================================
+println("")
+println("=== Byte Latent Transformer test summary ===")
+println("PASS: " + to_string(pass_count))
+println("FAIL: " + to_string(fail_count))
+if fail_count == 0 {
+    println("ALL GREEN — Byte Latent Transformer: tokenizer-free byte-level model OK")
+}
+println(to_string(pass_count) + " passed")

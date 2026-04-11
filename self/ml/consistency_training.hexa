@@ -1,0 +1,644 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/consistency_training.hexa — Consistency Training (#170)
+//
+//  Augmentation-invariant self-supervised learning: enforce that
+//  a model produces similar predictions for original and augmented
+//  inputs, enabling semi-supervised / unsupervised training.
+//
+//  Implements:
+//    1. Text augmentation      — dropout / swap / delete random tokens
+//    2. Dual forward           — run original + augmented through model
+//    3. Consistency loss       — KL divergence between outputs
+//    4. Sharpening             — low-temperature sharpening before loss
+//    5. EMA teacher            — exponential moving average of student
+//    6. Confidence threshold   — enforce consistency only on confident preds
+//    7. Unsupervised mode      — consistency loss without any labels
+//
+//  API (pure):
+//    ct_augment_dropout(tokens, prob, seed)              -> [int]
+//    ct_augment_swap(tokens, prob, seed)                 -> [int]
+//    ct_augment_delete(tokens, prob, seed)               -> [int]
+//    ct_augment_composite(tokens, p_drop, p_swap, p_del, seed) -> [int]
+//    ct_softmax(logits)                                  -> [float]
+//    ct_log_softmax(logits)                              -> [float]
+//    ct_sharpen(probs, temperature)                      -> [float]
+//    ct_kl_divergence(p, q)                              -> float
+//    ct_forward_linear(tokens, weights, vocab)           -> [float]
+//    ct_dual_forward(tokens, aug_tokens, weights, vocab) -> [orig_out, aug_out]
+//    ct_consistency_loss(orig_out, aug_out, temperature) -> float
+//    ct_ema_update(teacher, student, alpha)              -> [float]
+//    ct_ema_forward(tokens, teacher_weights, vocab)      -> [float]
+//    ct_max_prob(probs)                                  -> float
+//    ct_confidence_mask(probs_batch, threshold)          -> [int]
+//    ct_masked_consistency_loss(orig_batch, aug_batch, mask, temp) -> float
+//    ct_unsupervised_loss(tokens_batch, weights, vocab, p_drop, p_swap, p_del, seed, temp) -> float
+//    ct_train_step(weights, tokens_batch, vocab, lr, p_drop, p_swap, p_del, seed, temp, conf_thresh) -> [weights, loss]
+//    ct_ema_train_step(student_w, teacher_w, tokens_batch, vocab, lr, ema_alpha, p_drop, p_swap, p_del, seed, temp, conf_thresh) -> [student_w, teacher_w, loss]
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+//    @hot   — called every training step
+// ═══════════════════════════════════════════════════════════════════
+
+// ── helpers ──────────────────────────────────────────────────────
+
+fn ct_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn ct_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn ct_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn ct_log(x) {
+    if x <= 0.0 { return -20.0 }
+    // Newton's method: find y such that exp(y) = x
+    let mut y = 0.0
+    if x > 1.0 { y = x / 3.0 }
+    if x < 0.01 { y = -5.0 }
+    for _i in 0..50 {
+        let ey = ct_exp(y)
+        if ey < 1.0e-15 { y = y + 1.0 } else {
+            y = y + (x - ey) / ey
+        }
+    }
+    return y
+}
+
+fn ct_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn ct_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+// Deterministic pseudo-random from seed + index
+fn ct_hash(seed, idx) {
+    let mut h = (seed + 1) * 2654435761 + (idx + 1) * 1315423911
+    h = h % 1000003
+    if h < 0 { h = 0 - h }
+    return h
+}
+
+fn ct_rand_float(seed, idx) {
+    let h = ct_hash(seed, idx)
+    return to_float(h % 10000) / 10000.0
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  1. Text Augmentation — dropout / swap / delete
+//
+//  These augment a token sequence by randomly modifying tokens,
+//  creating a perturbed view for consistency training.
+// ═══════════════════════════════════════════════════════════════════
+
+// Dropout: replace random tokens with token 0 (mask token)
+@pure
+fn ct_augment_dropout(tokens, prob, seed) {
+    let n = len(tokens)
+    let mut out = []
+    for i in 0..n {
+        let r = ct_rand_float(seed, i)
+        if r < prob {
+            out = out + [0]
+        } else {
+            out = out + [tokens[i]]
+        }
+    }
+    return out
+}
+
+// Swap: randomly swap adjacent token pairs
+@pure
+fn ct_augment_swap(tokens, prob, seed) {
+    let n = len(tokens)
+    let mut out = []
+    for i in 0..n { out = out + [tokens[i]] }
+    let mut i = 0
+    for _step in 0..n {
+        if i >= n - 1 { break }
+        let r = ct_rand_float(seed, i + n)
+        if r < prob {
+            let tmp = out[i]
+            out[i] = out[i + 1]
+            out[i + 1] = tmp
+            i = i + 2
+        } else {
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// Delete: remove random tokens from the sequence
+@pure
+fn ct_augment_delete(tokens, prob, seed) {
+    let n = len(tokens)
+    let mut out = []
+    for i in 0..n {
+        let r = ct_rand_float(seed, i + 2 * n)
+        if r >= prob {
+            out = out + [tokens[i]]
+        }
+    }
+    // Ensure at least 1 token remains
+    if len(out) == 0 {
+        out = out + [tokens[0]]
+    }
+    return out
+}
+
+// Composite augmentation: apply all three in sequence
+@pure
+fn ct_augment_composite(tokens, p_drop, p_swap, p_del, seed) {
+    let step1 = ct_augment_dropout(tokens, p_drop, seed)
+    let step2 = ct_augment_swap(step1, p_swap, seed + 1000)
+    let step3 = ct_augment_delete(step2, p_del, seed + 2000)
+    return step3
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  2. Softmax / Log-softmax
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ct_softmax(logits) {
+    let n = len(logits)
+    let mut mx = logits[0]
+    for i in 1..n {
+        if logits[i] > mx { mx = logits[i] }
+    }
+    let mut exps = ct_zeros(n)
+    let mut z = 0.0
+    for i in 0..n {
+        exps[i] = ct_exp(logits[i] - mx)
+        z = z + exps[i]
+    }
+    let mut out = ct_zeros(n)
+    for i in 0..n {
+        out[i] = exps[i] / z
+    }
+    return out
+}
+
+@pure
+fn ct_log_softmax(logits) {
+    let n = len(logits)
+    let mut mx = logits[0]
+    for i in 1..n {
+        if logits[i] > mx { mx = logits[i] }
+    }
+    let mut z = 0.0
+    for i in 0..n {
+        z = z + ct_exp(logits[i] - mx)
+    }
+    let log_z = ct_log(z) + mx
+    let mut out = ct_zeros(n)
+    for i in 0..n {
+        out[i] = logits[i] - log_z
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  3. Sharpening — low temperature sharpening
+//
+//  Raises each probability to power (1/T) then re-normalizes.
+//  Low temperature -> sharper (more peaked) distribution.
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ct_sharpen(probs, temperature) {
+    let n = len(probs)
+    let inv_t = 1.0 / temperature
+    let mut powered = ct_zeros(n)
+    let mut z = 0.0
+    for i in 0..n {
+        let p = probs[i]
+        if p < 1.0e-12 {
+            powered[i] = 0.0
+        } else {
+            let log_p = ct_log(p)
+            powered[i] = ct_exp(log_p * inv_t)
+        }
+        z = z + powered[i]
+    }
+    let mut out = ct_zeros(n)
+    if z < 1.0e-15 {
+        // Uniform fallback
+        for i in 0..n { out[i] = 1.0 / to_float(n) }
+    } else {
+        for i in 0..n { out[i] = powered[i] / z }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  4. KL Divergence — D_KL(P || Q)
+//
+//  Sum of p[i] * log(p[i] / q[i]) for all i where p[i] > 0.
+//  Returns non-negative divergence measure.
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ct_kl_divergence(p, q) {
+    let n = len(p)
+    let mut kl = 0.0
+    for i in 0..n {
+        if p[i] > 1.0e-12 {
+            let mut qi = q[i]
+            if qi < 1.0e-12 { qi = 1.0e-12 }
+            kl = kl + p[i] * (ct_log(p[i]) - ct_log(qi))
+        }
+    }
+    if kl < 0.0 { kl = 0.0 }
+    return kl
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  5. Simple Linear Model — for testing / demonstration
+//
+//  Simulates a forward pass: each token votes on vocab logits
+//  through a weight vector. Returns logits (pre-softmax).
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ct_forward_linear(tokens, weights, vocab) {
+    let n = len(tokens)
+    let mut logits = ct_zeros(vocab)
+    for i in 0..n {
+        let t = tokens[i]
+        for v in 0..vocab {
+            let w_idx = (t * vocab + v) % len(weights)
+            logits[v] = logits[v] + weights[w_idx]
+        }
+    }
+    return logits
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  6. Dual Forward — run original and augmented through model
+//
+//  Returns: [orig_probs, aug_probs] each of length vocab
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ct_dual_forward(tokens, aug_tokens, weights, vocab) {
+    let orig_logits = ct_forward_linear(tokens, weights, vocab)
+    let aug_logits = ct_forward_linear(aug_tokens, weights, vocab)
+    let orig_probs = ct_softmax(orig_logits)
+    let aug_probs = ct_softmax(aug_logits)
+    return [orig_probs, aug_probs]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  7. Consistency Loss — KL divergence with sharpening
+//
+//  Sharpens original predictions (teacher signal), then computes
+//  KL divergence between sharpened original and augmented.
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ct_consistency_loss(orig_probs, aug_probs, temperature) {
+    let sharp_orig = ct_sharpen(orig_probs, temperature)
+    let sharp_aug = ct_sharpen(aug_probs, temperature)
+    return ct_kl_divergence(sharp_orig, sharp_aug)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  8. EMA Teacher — exponential moving average
+//
+//  teacher = alpha * teacher + (1 - alpha) * student
+//  alpha close to 1.0 -> slow update (stable teacher)
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ct_ema_update(teacher, student, alpha) {
+    let n = len(teacher)
+    let mut out = ct_zeros(n)
+    for i in 0..n {
+        out[i] = alpha * teacher[i] + (1.0 - alpha) * student[i]
+    }
+    return out
+}
+
+// EMA teacher forward pass
+@pure
+fn ct_ema_forward(tokens, teacher_weights, vocab) {
+    return ct_forward_linear(tokens, teacher_weights, vocab)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  9. Confidence Threshold — only enforce on high-confidence preds
+//
+//  Computes max probability for each sample. If max_prob >= threshold,
+//  include in consistency loss (mask=1), else skip (mask=0).
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ct_max_prob(probs) {
+    let n = len(probs)
+    let mut mx = probs[0]
+    for i in 1..n {
+        if probs[i] > mx { mx = probs[i] }
+    }
+    return mx
+}
+
+// Build confidence mask for a batch of probability distributions
+// probs_batch: array of [vocab_size] probability arrays
+// Returns: array of 0/1 integers
+@pure
+fn ct_confidence_mask(probs_batch, threshold) {
+    let n = len(probs_batch)
+    let mut mask = ct_zeros_int(n)
+    for i in 0..n {
+        let mp = ct_max_prob(probs_batch[i])
+        if mp >= threshold {
+            mask[i] = 1
+        }
+    }
+    return mask
+}
+
+// Masked consistency loss: only compute for samples where mask=1
+// orig_batch, aug_batch: arrays of probability distributions
+// mask: array of 0/1
+@pure
+fn ct_masked_consistency_loss(orig_batch, aug_batch, mask, temp) {
+    let n = len(orig_batch)
+    let mut total_loss = 0.0
+    let mut count = 0
+    for i in 0..n {
+        if mask[i] == 1 {
+            let loss = ct_consistency_loss(orig_batch[i], aug_batch[i], temp)
+            total_loss = total_loss + loss
+            count = count + 1
+        }
+    }
+    if count == 0 { return 0.0 }
+    return total_loss / to_float(count)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  10. Unsupervised Mode — consistency loss without labels
+//
+//  For each sample in the batch:
+//    1. Augment the tokens
+//    2. Forward both original and augmented
+//    3. Compute consistency loss
+//  No labeled data needed at all.
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ct_unsupervised_loss(tokens_batch, weights, vocab, p_drop, p_swap, p_del, seed, temp) {
+    let n = len(tokens_batch)
+    let mut total_loss = 0.0
+    for i in 0..n {
+        let orig = tokens_batch[i]
+        let aug = ct_augment_composite(orig, p_drop, p_swap, p_del, seed + i)
+        let orig_logits = ct_forward_linear(orig, weights, vocab)
+        let aug_logits = ct_forward_linear(aug, weights, vocab)
+        let orig_probs = ct_softmax(orig_logits)
+        let aug_probs = ct_softmax(aug_logits)
+        let loss = ct_consistency_loss(orig_probs, aug_probs, temp)
+        total_loss = total_loss + loss
+    }
+    return total_loss / to_float(n)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  11. Training Step — full consistency training iteration
+//
+//  For each sample:
+//    1. Augment
+//    2. Dual forward
+//    3. Confidence filter
+//    4. Sharpened KL loss
+//    5. Gradient approximation via finite differences
+//    6. Weight update
+//
+//  Returns: [updated_weights, avg_loss]
+// ═══════════════════════════════════════════════════════════════════
+
+@hot
+fn ct_train_step(weights, tokens_batch, vocab, lr, p_drop, p_swap, p_del, seed, temp, conf_thresh) {
+    let n_w = len(weights)
+    let n_batch = len(tokens_batch)
+
+    // Forward pass: compute consistency loss
+    let mut orig_probs_batch = []
+    let mut aug_probs_batch = []
+    for i in 0..n_batch {
+        let orig = tokens_batch[i]
+        let aug = ct_augment_composite(orig, p_drop, p_swap, p_del, seed + i)
+        let orig_logits = ct_forward_linear(orig, weights, vocab)
+        let aug_logits = ct_forward_linear(aug, weights, vocab)
+        orig_probs_batch = orig_probs_batch + [ct_softmax(orig_logits)]
+        aug_probs_batch = aug_probs_batch + [ct_softmax(aug_logits)]
+    }
+
+    // Confidence mask
+    let mask = ct_confidence_mask(orig_probs_batch, conf_thresh)
+
+    // Compute loss
+    let loss = ct_masked_consistency_loss(orig_probs_batch, aug_probs_batch, mask, temp)
+
+    // Gradient approximation via finite differences
+    let eps = 0.001
+    let mut grad = ct_zeros(n_w)
+    for w in 0..n_w {
+        let mut w_plus = ct_zeros(n_w)
+        for j in 0..n_w { w_plus[j] = weights[j] }
+        w_plus[w] = w_plus[w] + eps
+
+        let mut loss_plus = 0.0
+        let mut count_plus = 0
+        for i in 0..n_batch {
+            if mask[i] == 1 {
+                let orig = tokens_batch[i]
+                let aug = ct_augment_composite(orig, p_drop, p_swap, p_del, seed + i)
+                let ol = ct_forward_linear(orig, w_plus, vocab)
+                let al = ct_forward_linear(aug, w_plus, vocab)
+                let op = ct_softmax(ol)
+                let ap = ct_softmax(al)
+                loss_plus = loss_plus + ct_consistency_loss(op, ap, temp)
+                count_plus = count_plus + 1
+            }
+        }
+        if count_plus > 0 {
+            loss_plus = loss_plus / to_float(count_plus)
+        }
+        grad[w] = (loss_plus - loss) / eps
+    }
+
+    // Update weights
+    let mut new_w = ct_zeros(n_w)
+    for w in 0..n_w {
+        new_w[w] = weights[w] - lr * grad[w]
+    }
+
+    return [new_w, loss]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  12. EMA Training Step — student + teacher co-training
+//
+//  Uses EMA teacher for generating sharpened targets.
+//  Student learns to match teacher on augmented inputs.
+//
+//  Returns: [student_weights, teacher_weights, loss]
+// ═══════════════════════════════════════════════════════════════════
+
+@hot
+fn ct_ema_train_step(student_w, teacher_w, tokens_batch, vocab, lr, ema_alpha, p_drop, p_swap, p_del, seed, temp, conf_thresh) {
+    let n_batch = len(tokens_batch)
+
+    // Teacher forward on originals, student forward on augmented
+    let mut teacher_probs_batch = []
+    let mut student_probs_batch = []
+    for i in 0..n_batch {
+        let orig = tokens_batch[i]
+        let aug = ct_augment_composite(orig, p_drop, p_swap, p_del, seed + i)
+        let t_logits = ct_forward_linear(orig, teacher_w, vocab)
+        let s_logits = ct_forward_linear(aug, student_w, vocab)
+        teacher_probs_batch = teacher_probs_batch + [ct_softmax(t_logits)]
+        student_probs_batch = student_probs_batch + [ct_softmax(s_logits)]
+    }
+
+    // Confidence mask on teacher predictions
+    let mask = ct_confidence_mask(teacher_probs_batch, conf_thresh)
+
+    // Loss
+    let loss = ct_masked_consistency_loss(teacher_probs_batch, student_probs_batch, mask, temp)
+
+    // Simple gradient descent on student weights
+    let n_w = len(student_w)
+    let eps = 0.001
+    let mut grad = ct_zeros(n_w)
+    for w in 0..n_w {
+        let mut w_plus = ct_zeros(n_w)
+        for j in 0..n_w { w_plus[j] = student_w[j] }
+        w_plus[w] = w_plus[w] + eps
+
+        let mut loss_plus = 0.0
+        let mut cnt = 0
+        for i in 0..n_batch {
+            if mask[i] == 1 {
+                let orig = tokens_batch[i]
+                let aug = ct_augment_composite(orig, p_drop, p_swap, p_del, seed + i)
+                let tl = ct_forward_linear(orig, teacher_w, vocab)
+                let sl = ct_forward_linear(aug, w_plus, vocab)
+                let tp = ct_softmax(tl)
+                let sp = ct_softmax(sl)
+                loss_plus = loss_plus + ct_consistency_loss(tp, sp, temp)
+                cnt = cnt + 1
+            }
+        }
+        if cnt > 0 { loss_plus = loss_plus / to_float(cnt) }
+        grad[w] = (loss_plus - loss) / eps
+    }
+
+    let mut new_student = ct_zeros(n_w)
+    for w in 0..n_w {
+        new_student[w] = student_w[w] - lr * grad[w]
+    }
+
+    // EMA update teacher
+    let new_teacher = ct_ema_update(teacher_w, new_student, ema_alpha)
+
+    return [new_student, new_teacher, loss]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  13. Symmetric Consistency Loss — bidirectional KL
+//
+//  Average of KL(P||Q) and KL(Q||P) for more stable training.
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ct_symmetric_kl(p, q) {
+    let kl_pq = ct_kl_divergence(p, q)
+    let kl_qp = ct_kl_divergence(q, p)
+    return (kl_pq + kl_qp) / 2.0
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  14. Jensen-Shannon Divergence — bounded symmetric divergence
+//
+//  JSD(P||Q) = 0.5 * KL(P||M) + 0.5 * KL(Q||M) where M = (P+Q)/2
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ct_js_divergence(p, q) {
+    let n = len(p)
+    let mut m = ct_zeros(n)
+    for i in 0..n {
+        m[i] = (p[i] + q[i]) / 2.0
+    }
+    let kl_pm = ct_kl_divergence(p, m)
+    let kl_qm = ct_kl_divergence(q, m)
+    return (kl_pm + kl_qm) / 2.0
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  15. Argmax — pick most likely token
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ct_argmax(probs) {
+    let n = len(probs)
+    let mut best = 0
+    let mut best_v = probs[0]
+    for i in 1..n {
+        if probs[i] > best_v {
+            best_v = probs[i]
+            best = i
+        }
+    }
+    return best
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  16. Entropy — measure prediction uncertainty
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ct_entropy(probs) {
+    let n = len(probs)
+    let mut h = 0.0
+    for i in 0..n {
+        if probs[i] > 1.0e-12 {
+            h = h - probs[i] * ct_log(probs[i])
+        }
+    }
+    return h
+}
+
+println("[consistency_training] loaded — augmentation + dual forward + KL + sharpening + EMA + confidence")

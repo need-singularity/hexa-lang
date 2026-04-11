@@ -1,0 +1,907 @@
+// ===================================================================
+//  self/ml/hyena.hexa — Hyena: Sub-Quadratic Sequence Mixer
+//
+//  Implements the Hyena architecture (Poli et al., 2023), a sub-quadratic
+//  alternative to attention that replaces the attention matrix with
+//  long convolutions and element-wise gating.
+//
+//  Components:
+//    1. Long convolution filter    — learnable parameterized filter
+//    2. FFT-based convolution      — O(N log N) via Cooley-Tukey FFT
+//    3. Element-wise gating        — sigmoid gate on conv output
+//    4. Hyena operator             — interleaved projections + short filter
+//                                    + long conv + gating
+//    5. Multi-order Hyena          — stack multiple conv+gate stages
+//    6. Positional encoding        — sinusoidal positional encoding
+//    7. Hyena block                — Hyena operator + FFN + LayerNorm + residual
+//    8. Multi-layer stack          — configurable depth
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+//    @hot   — inner-loop kernels
+// ===================================================================
+
+// ===================================================================
+//  Math helpers
+// ===================================================================
+
+fn hy_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn hy_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn hy_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn hy_log(x) {
+    if x <= 0.0 { return -20.0 }
+    let mut y = 0.0
+    let mut t = (x - 1.0) / (x + 1.0)
+    let t2 = t * t
+    let mut term = t
+    for i in 0..15 {
+        y = y + term / to_float(2 * i + 1)
+        term = term * t2
+    }
+    return 2.0 * y
+}
+
+fn hy_sigmoid(x) {
+    if x > 20.0 { return 1.0 }
+    if x < -20.0 { return 0.0 }
+    return 1.0 / (1.0 + hy_exp(0.0 - x))
+}
+
+fn hy_sin(x) {
+    // Taylor series for sin(x), reduce to [-pi, pi]
+    let pi = 3.141592653589793
+    let mut v = x
+    // Reduce to [-pi, pi]
+    for _i in 0..20 {
+        if v > pi { v = v - 2.0 * pi }
+        if v < 0.0 - pi { v = v + 2.0 * pi }
+    }
+    let mut result = 0.0
+    let mut term = v
+    for i in 0..15 {
+        result = result + term
+        term = 0.0 - term * v * v / to_float((2 * i + 2) * (2 * i + 3))
+    }
+    return result
+}
+
+fn hy_cos(x) {
+    let pi = 3.141592653589793
+    return hy_sin(x + pi / 2.0)
+}
+
+fn hy_relu(x) {
+    if x > 0.0 { return x }
+    return 0.0
+}
+
+fn hy_gelu(x) {
+    // Approximate GELU: x * sigmoid(1.702 * x)
+    return x * hy_sigmoid(1.702 * x)
+}
+
+fn hy_max(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn hy_min(a, b) {
+    if a < b { return a }
+    return b
+}
+
+// ===================================================================
+//  Vector utilities
+// ===================================================================
+
+fn hy_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn hy_ones(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [1.0] }
+    return v
+}
+
+fn hy_vec_add(a, b) {
+    let n = len(a)
+    let mut out = []
+    for i in 0..n { out = out + [a[i] + b[i]] }
+    return out
+}
+
+fn hy_vec_sub(a, b) {
+    let n = len(a)
+    let mut out = []
+    for i in 0..n { out = out + [a[i] - b[i]] }
+    return out
+}
+
+fn hy_vec_mul(a, b) {
+    let n = len(a)
+    let mut out = []
+    for i in 0..n { out = out + [a[i] * b[i]] }
+    return out
+}
+
+fn hy_vec_scale(v, s) {
+    let n = len(v)
+    let mut out = []
+    for i in 0..n { out = out + [v[i] * s] }
+    return out
+}
+
+fn hy_vec_sigmoid(v) {
+    let n = len(v)
+    let mut out = []
+    for i in 0..n { out = out + [hy_sigmoid(v[i])] }
+    return out
+}
+
+fn hy_vec_gelu(v) {
+    let n = len(v)
+    let mut out = []
+    for i in 0..n { out = out + [hy_gelu(v[i])] }
+    return out
+}
+
+fn hy_dot(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    for i in 0..n { s = s + a[i] * b[i] }
+    return s
+}
+
+// ===================================================================
+//  Matrix utilities (row-major: array of row-vectors)
+// ===================================================================
+
+fn hy_mat_vec(mat, v) {
+    let rows = len(mat)
+    let mut out = []
+    for r in 0..rows { out = out + [hy_dot(mat[r], v)] }
+    return out
+}
+
+// Deterministic pseudo-random initialization
+fn hy_init_weight(rows, cols, seed) {
+    let scale = 1.0 / hy_sqrt(to_float(cols))
+    let mut m = []
+    for r in 0..rows {
+        let mut row = []
+        for c in 0..cols {
+            let h = (r * 137 + c * 311 + seed * 7919) % 10007
+            let val = (to_float(h) / 10007.0 - 0.5) * 2.0 * scale
+            row = row + [val]
+        }
+        m = m + [row]
+    }
+    return m
+}
+
+fn hy_init_vec(dim, seed) {
+    let scale = 1.0 / hy_sqrt(to_float(dim))
+    let mut v = []
+    for i in 0..dim {
+        let h = (i * 251 + seed * 6173) % 10007
+        let val = (to_float(h) / 10007.0 - 0.5) * 2.0 * scale
+        v = v + [val]
+    }
+    return v
+}
+
+fn hy_init_vec_range(dim, low, high, seed) {
+    let rng = high - low
+    let mut v = []
+    for i in 0..dim {
+        let h = (i * 251 + seed * 6173) % 10007
+        let val = low + to_float(h) / 10007.0 * rng
+        v = v + [val]
+    }
+    return v
+}
+
+// ===================================================================
+//  LayerNorm
+// ===================================================================
+
+struct HyLayerNorm {
+    dim: int,
+    gamma: array,
+    beta: array,
+    eps: float
+}
+
+fn hy_create_layer_norm(dim) {
+    return HyLayerNorm {
+        dim: dim,
+        gamma: hy_ones(dim),
+        beta: hy_zeros(dim),
+        eps: 1.0e-5
+    }
+}
+
+@pure
+fn hy_layer_norm_forward(ln, x) {
+    let n = ln.dim
+    let mut mean = 0.0
+    for i in 0..n { mean = mean + x[i] }
+    mean = mean / to_float(n)
+    let mut var = 0.0
+    for i in 0..n {
+        let d = x[i] - mean
+        var = var + d * d
+    }
+    var = var / to_float(n)
+    let inv_std = 1.0 / hy_sqrt(var + ln.eps)
+    let mut out = []
+    for i in 0..n {
+        let normed = (x[i] - mean) * inv_std
+        out = out + [ln.gamma[i] * normed + ln.beta[i]]
+    }
+    return out
+}
+
+// ===================================================================
+//  1. Long Convolution Filter — learnable parameterized filter
+//
+//  The filter h(t) = exp(-alpha * t) * (beta * sin(omega * t + phi))
+//  where alpha (decay), beta (amplitude), omega (frequency), phi (phase)
+//  are learnable per-channel parameters.
+//  This produces a causal filter of length L for each channel.
+// ===================================================================
+
+struct LongConvFilter {
+    dim: int,
+    filter_len: int,
+    alpha: array,
+    beta: array,
+    omega: array,
+    phi: array
+}
+
+fn hy_create_long_conv_filter(dim, filter_len, seed) {
+    return LongConvFilter {
+        dim: dim,
+        filter_len: filter_len,
+        alpha: hy_init_vec_range(dim, 0.01, 0.5, seed + 1),
+        beta: hy_init_vec_range(dim, 0.5, 1.5, seed + 2),
+        omega: hy_init_vec_range(dim, 0.1, 3.0, seed + 3),
+        phi: hy_init_vec_range(dim, 0.0, 6.283, seed + 4)
+    }
+}
+
+// Materialize the filter for channel c at all time steps [0..filter_len)
+@pure
+fn hy_materialize_filter(filt, c) {
+    let mut h = []
+    for t in 0..filt.filter_len {
+        let tf = to_float(t)
+        let decay = hy_exp(0.0 - filt.alpha[c] * tf)
+        let osc = hy_sin(filt.omega[c] * tf + filt.phi[c])
+        h = h + [filt.beta[c] * decay * osc]
+    }
+    return h
+}
+
+// Materialize full filter bank: [dim x filter_len]
+fn hy_materialize_filter_bank(filt) {
+    let mut bank = []
+    for c in 0..filt.dim {
+        bank = bank + [hy_materialize_filter(filt, c)]
+    }
+    return bank
+}
+
+// ===================================================================
+//  2. FFT-based Convolution — O(N log N) via Cooley-Tukey
+//
+//  We represent complex numbers as [real, imag] pairs.
+//  FFT -> pointwise multiply -> IFFT -> take real part.
+// ===================================================================
+
+// Next power of 2 >= n
+fn hy_next_pow2(n) {
+    let mut p = 1
+    for _i in 0..30 {
+        if p >= n { return p }
+        p = p * 2
+    }
+    return p
+}
+
+// Zero-pad signal to length n
+fn hy_pad(signal, n) {
+    let sn = len(signal)
+    let mut out = []
+    for i in 0..n {
+        if i < sn {
+            out = out + [signal[i]]
+        } else {
+            out = out + [0.0]
+        }
+    }
+    return out
+}
+
+// In-place iterative Cooley-Tukey FFT
+// Input: re, im arrays of length N (must be power of 2)
+// Returns: [re_out, im_out]
+@hot
+fn hy_fft(re, im) {
+    let n = len(re)
+    if n <= 1 { return [re, im] }
+    // Bit-reversal permutation
+    let mut r = []
+    for _i in 0..n { r = r + [0.0] }
+    let mut ri = []
+    for _i in 0..n { ri = ri + [0.0] }
+    // Compute bit-reverse indices
+    let mut rev = []
+    for _i in 0..n { rev = rev + [0] }
+    let mut bits = 0
+    let mut tmp = n
+    for _i in 0..30 {
+        if tmp <= 1 { bits = bits }
+        if tmp > 1 {
+            bits = bits + 1
+            tmp = tmp / 2
+        }
+    }
+    for i in 0..n {
+        let mut v = i
+        let mut rv = 0
+        for b in 0..bits {
+            rv = rv * 2 + v % 2
+            v = v / 2
+        }
+        rev[i] = rv
+    }
+    for i in 0..n {
+        r[i] = re[rev[i]]
+        ri[i] = im[rev[i]]
+    }
+    // Butterfly stages
+    let mut half = 1
+    for _stage in 0..30 {
+        if half >= n { half = half }
+        if half < n {
+            let full = half * 2
+            let pi = 3.141592653589793
+            let angle = 0.0 - 2.0 * pi / to_float(full)
+            let mut j = 0
+            for _jj in 0..30 {
+                if j >= n { j = j }
+                if j < n {
+                    for k in 0..half {
+                        let idx1 = j + k
+                        let idx2 = j + k + half
+                        let w_re = hy_cos(angle * to_float(k))
+                        let w_im = hy_sin(angle * to_float(k))
+                        let t_re = w_re * r[idx2] - w_im * ri[idx2]
+                        let t_im = w_re * ri[idx2] + w_im * r[idx2]
+                        let u_re = r[idx1]
+                        let u_im = ri[idx1]
+                        r[idx1] = u_re + t_re
+                        ri[idx1] = u_im + t_im
+                        r[idx2] = u_re - t_re
+                        ri[idx2] = u_im - t_im
+                    }
+                    j = j + full
+                }
+            }
+            half = half * 2
+        }
+    }
+    return [r, ri]
+}
+
+// Inverse FFT: conjugate input, FFT, conjugate output, scale by 1/N
+@hot
+fn hy_ifft(re, im) {
+    let n = len(re)
+    // Conjugate input
+    let mut im_neg = []
+    for i in 0..n { im_neg = im_neg + [0.0 - im[i]] }
+    let fwd = hy_fft(re, im_neg)
+    let fwd_re = fwd[0]
+    let fwd_im = fwd[1]
+    // Conjugate output and scale
+    let scale = 1.0 / to_float(n)
+    let mut out_re = []
+    let mut out_im = []
+    for i in 0..n {
+        out_re = out_re + [fwd_re[i] * scale]
+        out_im = out_im + [0.0 - fwd_im[i] * scale]
+    }
+    return [out_re, out_im]
+}
+
+// FFT-based convolution of two real signals (linear convolution)
+// Returns array of length len(a) + len(b) - 1 (truncated to max(len(a), len(b)))
+@hot
+fn hy_fft_convolve(a, b) {
+    let la = len(a)
+    let lb = len(b)
+    let out_len = la + lb - 1
+    let n = hy_next_pow2(out_len)
+    // Pad and FFT both signals
+    let a_pad = hy_pad(a, n)
+    let b_pad = hy_pad(b, n)
+    let zeros_n = hy_zeros(n)
+    let fa = hy_fft(a_pad, zeros_n)
+    let fb = hy_fft(b_pad, zeros_n)
+    let fa_re = fa[0]
+    let fa_im = fa[1]
+    let fb_re = fb[0]
+    let fb_im = fb[1]
+    // Pointwise complex multiply
+    let mut prod_re = []
+    let mut prod_im = []
+    for i in 0..n {
+        prod_re = prod_re + [fa_re[i] * fb_re[i] - fa_im[i] * fb_im[i]]
+        prod_im = prod_im + [fa_re[i] * fb_im[i] + fa_im[i] * fb_re[i]]
+    }
+    // IFFT
+    let result = hy_ifft(prod_re, prod_im)
+    let result_re = result[0]
+    // Truncate to output length (causal: keep first la elements)
+    let trunc_len = hy_min(la, out_len)
+    let mut out = []
+    for i in 0..trunc_len {
+        out = out + [result_re[i]]
+    }
+    return out
+}
+
+// ===================================================================
+//  3. Element-wise Gating — sigmoid gate on conv output
+//
+//  gate(x, v) = sigmoid(v) * x
+//  v is a linear projection of the input
+// ===================================================================
+
+@pure @hot
+fn hy_gate(x, v) {
+    let n = len(x)
+    let mut out = []
+    for i in 0..n {
+        out = out + [hy_sigmoid(v[i]) * x[i]]
+    }
+    return out
+}
+
+// ===================================================================
+//  4. Hyena Operator — core sequence mixer
+//
+//  For a sequence of length L and dimension D:
+//    1. Project input into (order+1) streams via linear projections
+//       -> v, x_1, x_2, ..., x_order
+//    2. For each order i:
+//       a. Apply long convolution filter to v
+//       b. Element-wise gate: v = x_i * h_i(v)
+//    3. Final output projection
+//
+//  The short filter is a small 1D convolution applied to projections.
+// ===================================================================
+
+struct HyenaOperator {
+    dim: int,
+    order: int,
+    filter_len: int,
+    W_in: array,
+    W_out: array,
+    long_filters: array,
+    short_filter_w: array,
+    short_filter_len: int
+}
+
+fn hy_create_hyena_operator(dim, order, filter_len, seed) {
+    // W_in projects dim -> dim*(order+1)
+    let in_dim = dim * (order + 1)
+    let w_in = hy_init_weight(in_dim, dim, seed + 10)
+    let w_out = hy_init_weight(dim, dim, seed + 20)
+    // Create one long conv filter per order
+    let mut filters = []
+    for o in 0..order {
+        filters = filters + [hy_create_long_conv_filter(dim, filter_len, seed + 100 + o * 50)]
+    }
+    // Short filter (per-channel weights of length short_filter_len)
+    let sf_len = 3
+    let mut sf_w = []
+    for c in 0..dim {
+        sf_w = sf_w + [hy_init_vec(sf_len, seed + 200 + c)]
+    }
+    return HyenaOperator {
+        dim: dim,
+        order: order,
+        filter_len: filter_len,
+        W_in: w_in,
+        W_out: w_out,
+        long_filters: filters,
+        short_filter_w: sf_w,
+        short_filter_len: sf_len
+    }
+}
+
+// Apply short 1D filter to a per-channel sequence
+// seq_c: [seq_len] values for one channel
+// w: [short_filter_len] weights
+@pure
+fn hy_apply_short_filter(seq_c, w, sf_len) {
+    let slen = len(seq_c)
+    let mut out = []
+    for t in 0..slen {
+        let mut acc = 0.0
+        for k in 0..sf_len {
+            let idx = t - k
+            if idx >= 0 {
+                acc = acc + w[k] * seq_c[idx]
+            }
+        }
+        out = out + [acc]
+    }
+    return out
+}
+
+// Apply long convolution (FFT-based) to a per-channel sequence
+// seq_c: [seq_len] values for one channel
+// filter_c: [filter_len] filter weights for one channel
+@hot
+fn hy_apply_long_conv(seq_c, filter_c) {
+    return hy_fft_convolve(seq_c, filter_c)
+}
+
+// Hyena operator forward
+// xs: [seq_len x dim] input sequence
+// Returns: [seq_len x dim]
+fn hy_operator_forward(op, xs) {
+    let seq_len = len(xs)
+    let d = op.dim
+    let ord = op.order
+    // Step 1: Project input into (order+1) streams
+    // Each token -> [dim*(order+1)] -> split into (order+1) chunks of dim
+    let mut streams = []
+    for _o in 0..(ord + 1) {
+        let mut stream = []
+        for _t in 0..seq_len {
+            stream = stream + [hy_zeros(d)]
+        }
+        streams = streams + [stream]
+    }
+    for t in 0..seq_len {
+        let projected = hy_mat_vec(op.W_in, xs[t])
+        for o in 0..(ord + 1) {
+            let mut chunk = []
+            for c in 0..d {
+                chunk = chunk + [projected[o * d + c]]
+            }
+            streams[o][t] = chunk
+        }
+    }
+    // streams[0] = v (the value stream)
+    // streams[1..order] = x_1 .. x_order (gating streams)
+    // Step 2: Apply short filter to v
+    // Extract per-channel sequences for v, apply short filter
+    let mut v_channels = []
+    for c in 0..d {
+        let mut ch = []
+        for t in 0..seq_len { ch = ch + [streams[0][t][c]] }
+        let filtered = hy_apply_short_filter(ch, op.short_filter_w[c], op.short_filter_len)
+        v_channels = v_channels + [filtered]
+    }
+    // Reconstruct v after short filter: [seq_len x dim]
+    let mut v_seq = []
+    for t in 0..seq_len {
+        let mut tok = []
+        for c in 0..d { tok = tok + [v_channels[c][t]] }
+        v_seq = v_seq + [tok]
+    }
+    // Step 3: For each order, apply long conv + gating
+    for o in 0..ord {
+        // Materialize filter bank for this order
+        let filt = op.long_filters[o]
+        let bank = hy_materialize_filter_bank(filt)
+        // Apply per-channel long convolution to v_seq
+        let mut conv_channels = []
+        for c in 0..d {
+            let mut ch = []
+            for t in 0..seq_len { ch = ch + [v_seq[t][c]] }
+            let conv_ch = hy_apply_long_conv(ch, bank[c])
+            conv_channels = conv_channels + [conv_ch]
+        }
+        // Reconstruct conv output and apply gating with x_{o+1}
+        for t in 0..seq_len {
+            let mut conv_tok = []
+            for c in 0..d { conv_tok = conv_tok + [conv_channels[c][t]] }
+            // Gate: v = x_{o+1} * conv(v)
+            let gate_stream = streams[o + 1][t]
+            v_seq[t] = hy_gate(conv_tok, gate_stream)
+        }
+    }
+    // Step 4: Output projection
+    let mut output = []
+    for t in 0..seq_len {
+        output = output + [hy_mat_vec(op.W_out, v_seq[t])]
+    }
+    return output
+}
+
+// ===================================================================
+//  5. Multi-Order Hyena — stack multiple conv+gate stages
+//
+//  A convenience wrapper: create a Hyena operator with configurable order.
+//  Order N means N stages of (long_conv + gating).
+// ===================================================================
+
+fn hy_create_multi_order(dim, order, filter_len, seed) {
+    return hy_create_hyena_operator(dim, order, filter_len, seed)
+}
+
+fn hy_multi_order_forward(op, xs) {
+    return hy_operator_forward(op, xs)
+}
+
+// ===================================================================
+//  6. Positional Encoding — sinusoidal
+//
+//  PE(pos, 2i)   = sin(pos / 10000^(2i/d))
+//  PE(pos, 2i+1) = cos(pos / 10000^(2i/d))
+// ===================================================================
+
+@pure
+fn hy_positional_encoding(seq_len, dim) {
+    let mut pe = []
+    for pos in 0..seq_len {
+        let mut row = []
+        for i in 0..dim {
+            let half_i = i / 2
+            let exponent = to_float(2 * half_i) / to_float(dim)
+            let denom = hy_exp(exponent * hy_log(10000.0))
+            let angle = to_float(pos) / denom
+            if i % 2 == 0 {
+                row = row + [hy_sin(angle)]
+            } else {
+                row = row + [hy_cos(angle)]
+            }
+        }
+        pe = pe + [row]
+    }
+    return pe
+}
+
+// Add positional encoding to input sequence
+fn hy_add_pos_encoding(xs, pe) {
+    let seq_len = len(xs)
+    let mut out = []
+    for t in 0..seq_len {
+        out = out + [hy_vec_add(xs[t], pe[t])]
+    }
+    return out
+}
+
+// ===================================================================
+//  7. Hyena Block — Hyena operator + FFN + LayerNorm + residual
+//
+//  x -> LayerNorm -> Hyena operator -> + residual
+//    -> LayerNorm -> FFN -> + residual
+// ===================================================================
+
+struct HyFFN {
+    dim: int,
+    ff_dim: int,
+    W1: array,
+    b1: array,
+    W2: array,
+    b2: array
+}
+
+fn hy_create_ffn(dim, ff_dim, seed) {
+    return HyFFN {
+        dim: dim,
+        ff_dim: ff_dim,
+        W1: hy_init_weight(ff_dim, dim, seed + 1),
+        b1: hy_zeros(ff_dim),
+        W2: hy_init_weight(dim, ff_dim, seed + 2),
+        b2: hy_zeros(dim)
+    }
+}
+
+@pure
+fn hy_ffn_forward(ffn, x) {
+    let h = hy_vec_gelu(hy_vec_add(hy_mat_vec(ffn.W1, x), ffn.b1))
+    return hy_vec_add(hy_mat_vec(ffn.W2, h), ffn.b2)
+}
+
+struct HyenaBlock {
+    dim: int,
+    ff_dim: int,
+    ln1: HyLayerNorm,
+    ln2: HyLayerNorm,
+    operator: HyenaOperator,
+    ffn: HyFFN
+}
+
+fn hy_create_block(dim, ff_dim, order, filter_len, seed) {
+    return HyenaBlock {
+        dim: dim,
+        ff_dim: ff_dim,
+        ln1: hy_create_layer_norm(dim),
+        ln2: hy_create_layer_norm(dim),
+        operator: hy_create_hyena_operator(dim, order, filter_len, seed),
+        ffn: hy_create_ffn(dim, ff_dim, seed + 500)
+    }
+}
+
+// Hyena block forward
+// xs: [seq_len x dim]
+// Returns: [seq_len x dim]
+fn hy_block_forward(blk, xs) {
+    let seq_len = len(xs)
+    let d = blk.dim
+    // Pre-norm + Hyena operator + residual
+    let mut normed1 = []
+    for t in 0..seq_len {
+        normed1 = normed1 + [hy_layer_norm_forward(blk.ln1, xs[t])]
+    }
+    let hy_out = hy_operator_forward(blk.operator, normed1)
+    let mut h = []
+    for t in 0..seq_len {
+        h = h + [hy_vec_add(xs[t], hy_out[t])]
+    }
+    // Pre-norm + FFN + residual
+    let mut output = []
+    for t in 0..seq_len {
+        let normed2 = hy_layer_norm_forward(blk.ln2, h[t])
+        let ffn_out = hy_ffn_forward(blk.ffn, normed2)
+        output = output + [hy_vec_add(h[t], ffn_out)]
+    }
+    return output
+}
+
+// ===================================================================
+//  8. Multi-layer Stack with Config
+// ===================================================================
+
+struct HyenaConfig {
+    n_layers: int,
+    d_model: int,
+    ff_dim: int,
+    order: int,
+    filter_len: int
+}
+
+fn hy_create_config(n_layers, d_model, ff_dim, order, filter_len) {
+    return HyenaConfig {
+        n_layers: n_layers,
+        d_model: d_model,
+        ff_dim: ff_dim,
+        order: order,
+        filter_len: filter_len
+    }
+}
+
+struct HyenaStack {
+    config: HyenaConfig,
+    blocks: array,
+    ln_out: HyLayerNorm
+}
+
+fn hy_create_stack(cfg, seed) {
+    let mut blocks = []
+    for l in 0..cfg.n_layers {
+        blocks = blocks + [hy_create_block(cfg.d_model, cfg.ff_dim, cfg.order, cfg.filter_len, seed + l * 1000)]
+    }
+    return HyenaStack {
+        config: cfg,
+        blocks: blocks,
+        ln_out: hy_create_layer_norm(cfg.d_model)
+    }
+}
+
+// Stack forward
+// xs: [seq_len x d_model]
+// Returns: [seq_len x d_model]
+fn hy_stack_forward(stack, xs) {
+    let mut h = xs
+    for l in 0..stack.config.n_layers {
+        h = hy_block_forward(stack.blocks[l], h)
+    }
+    // Final layer norm
+    let seq_len = len(h)
+    let mut output = []
+    for t in 0..seq_len {
+        output = output + [hy_layer_norm_forward(stack.ln_out, h[t])]
+    }
+    return output
+}
+
+// Stack forward with positional encoding
+fn hy_stack_forward_with_pos(stack, xs) {
+    let seq_len = len(xs)
+    let d = stack.config.d_model
+    let pe = hy_positional_encoding(seq_len, d)
+    let xs_pe = hy_add_pos_encoding(xs, pe)
+    return hy_stack_forward(stack, xs_pe)
+}
+
+// ===================================================================
+//  Embedding / Unembedding for end-to-end testing
+// ===================================================================
+
+fn hy_embed(token_id, d_model, seed) {
+    let mut v = []
+    for i in 0..d_model {
+        let h = (token_id * 137 + i * 311 + seed) % 10007
+        let val = (to_float(h) / 10007.0 - 0.5) * 0.1
+        v = v + [val]
+    }
+    return v
+}
+
+fn hy_embed_seq(token_ids, d_model, seed) {
+    let n = len(token_ids)
+    let mut xs = []
+    for t in 0..n {
+        xs = xs + [hy_embed(token_ids[t], d_model, seed)]
+    }
+    return xs
+}
+
+// ===================================================================
+//  Parameter counting
+// ===================================================================
+
+fn hy_param_count(stack) {
+    let cfg = stack.config
+    let d = cfg.d_model
+    let ff = cfg.ff_dim
+    let ord = cfg.order
+    let nl = cfg.n_layers
+    // Per block:
+    //   W_in: d*(ord+1) * d, W_out: d*d
+    //   long_filters: ord * 4 * d (alpha, beta, omega, phi per channel)
+    //   short_filter: d * short_filter_len (=3)
+    //   FFN: ff*d + ff + d*ff + d
+    //   2x LayerNorm: 2 * 2 * d
+    let w_in_params = d * (ord + 1) * d
+    let w_out_params = d * d
+    let filter_params = ord * 4 * d
+    let sf_params = d * 3
+    let ffn_params = ff * d + ff + d * ff + d
+    let ln_params = 4 * d
+    let per_block = w_in_params + w_out_params + filter_params + sf_params + ffn_params + ln_params
+    let total = nl * per_block + 2 * d
+    return total
+}
+
+println("[hyena] loaded — long conv filter + FFT conv + gating + Hyena operator + multi-order + positional encoding + Hyena block + stack")

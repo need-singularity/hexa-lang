@@ -1,0 +1,695 @@
+// ===================================================================
+//  self/ml/tensor_quantization.hexa — Tensor Quantization (#179)
+//
+//  Implements fine-grained tensor quantization techniques:
+//    1. Per-channel scale: compute scale factor per output channel
+//    2. Per-token dynamic quantization: quantize each token independently
+//    3. SmoothQuant: redistribute quantization difficulty via
+//       channel-wise scaling (activations -> weights)
+//    4. Calibration dataset: collect activation statistics for
+//       optimal scale factor estimation
+//    5. Outlier channel handling: detect and isolate outlier channels
+//       for higher-precision treatment
+//    6. Mixed-precision policy: assign different bit-widths per layer
+//       based on sensitivity analysis
+//    7. Accuracy-loss curve: sweep quantization configs and record
+//       accuracy vs compression trade-off
+//
+//  Quantization formats:
+//    INT8:  8-bit integer, range [-128, 127], levels = 256
+//    INT4:  4-bit integer, range [-8, 7],     levels = 16
+//    INT2:  2-bit integer, range [-2, 1],     levels = 4
+//
+//  API:
+//    tq_abs(x)                          -> float
+//    tq_max_f(a, b)                     -> float
+//    tq_min_f(a, b)                     -> float
+//    tq_zeros(n)                        -> [float]
+//    tq_sqrt(x)                         -> float
+//    tq_per_channel_scale(tensor, rows, cols) -> [float]
+//    tq_per_channel_quantize(tensor, rows, cols, scales, bits) -> [float]
+//    tq_per_channel_dequantize(qtensor, rows, cols, scales, bits) -> [float]
+//    tq_per_token_scale(tensor, rows, cols) -> [float]
+//    tq_per_token_quantize(tensor, rows, cols, scales, bits) -> [float]
+//    tq_per_token_dequantize(qtensor, rows, cols, scales, bits) -> [float]
+//    tq_smoothquant_scales(act_stats, weight, cols, alpha) -> [float]
+//    tq_smoothquant_transform(act, weight, rows_a, rows_w, cols, s) -> [act', w']
+//    tq_calibration_init(n_channels)    -> state
+//    tq_calibration_observe(state, tensor, rows, cols) -> state
+//    tq_calibration_scales(state, bits) -> [float]
+//    tq_outlier_detect(channel_maxes, threshold) -> [int]
+//    tq_mixed_precision_split(tensor, rows, cols, outlier_mask) -> [normal, outlier]
+//    tq_mixed_precision_reassemble(normal, outlier, rows, cols, mask) -> [float]
+//    tq_sensitivity_score(tensor, rows, cols, bits) -> float
+//    tq_mixed_precision_policy(sensitivities, bit_options, budget) -> [int]
+//    tq_accuracy_loss_sweep(tensor, rows, cols, bit_list) -> [[bits, mse, ratio]]
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+//    @hot   — performance critical path
+// ===================================================================
+
+// ── helpers ─────────────────────────────────────────────────────
+
+@pure
+fn tq_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+@pure
+fn tq_max_f(a, b) {
+    if a > b { return a }
+    return b
+}
+
+@pure
+fn tq_min_f(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn tq_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn tq_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+@pure
+fn tq_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+@pure
+fn tq_floor(x) {
+    let i = to_int(x)
+    if to_float(i) > x { return to_float(i - 1) }
+    return to_float(i)
+}
+
+@pure
+fn tq_round(x) {
+    return tq_floor(x + 0.5)
+}
+
+@pure
+fn tq_log2(x) {
+    if x <= 0.0 { return -999.0 }
+    let ln2 = 0.6931471805599453
+    let mut v = x
+    let mut exp_part = 0
+    while v >= 2.0 {
+        v = v / 2.0
+        exp_part = exp_part + 1
+    }
+    while v < 1.0 {
+        v = v * 2.0
+        exp_part = exp_part - 1
+    }
+    let t = v - 1.0
+    let mut result = 0.0
+    let mut term = t
+    for i in 1..20 {
+        if i % 2 == 1 {
+            result = result + term / to_float(i)
+        } else {
+            result = result - term / to_float(i)
+        }
+        term = term * t
+    }
+    return to_float(exp_part) + result / ln2
+}
+
+@pure
+fn tq_pow2(x) {
+    let ln2 = 0.6931471805599453
+    let v = x * ln2
+    let mut clamped = v
+    if clamped > 30.0 { clamped = 30.0 }
+    if clamped < -30.0 { clamped = -30.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * clamped / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+// ===================================================================
+//  Quantization Format Ranges
+//
+//  bits -> qmax (symmetric quantization: range [-qmax, qmax])
+//    INT8: qmax = 127
+//    INT4: qmax = 7
+//    INT2: qmax = 1
+// ===================================================================
+
+@pure
+fn tq_qmax(bits) {
+    // qmax = 2^(bits-1) - 1
+    if bits == 8 { return 127.0 }
+    if bits == 4 { return 7.0 }
+    if bits == 2 { return 1.0 }
+    // general: 2^(bits-1) - 1
+    return tq_pow2(to_float(bits - 1)) - 1.0
+}
+
+// ===================================================================
+//  1. Per-Channel Scale
+//
+//  For a weight tensor [rows x cols] (output_channels x input_dim),
+//  compute one scale factor per output channel (per row).
+//
+//  scale[r] = qmax / max(|w[r, :]|)
+//
+//  This minimizes quantization error per channel since each channel
+//  can have very different magnitude distributions.
+// ===================================================================
+
+@pure
+fn tq_channel_amax(tensor, rows, cols) {
+    let mut amaxes = tq_zeros(rows)
+    for r in 0..rows {
+        let mut mx = 0.0
+        for c in 0..cols {
+            let a = tq_abs(tensor[r * cols + c])
+            if a > mx { mx = a }
+        }
+        amaxes[r] = mx
+    }
+    return amaxes
+}
+
+@pure
+fn tq_per_channel_scale(tensor, rows, cols, bits) {
+    let amaxes = tq_channel_amax(tensor, rows, cols)
+    let qm = tq_qmax(bits)
+    let mut scales = tq_zeros(rows)
+    for r in 0..rows {
+        if amaxes[r] > 0.0 {
+            scales[r] = qm / amaxes[r]
+        } else {
+            scales[r] = 1.0
+        }
+    }
+    return scales
+}
+
+@pure @hot
+fn tq_per_channel_quantize(tensor, rows, cols, scales, bits) {
+    let total = rows * cols
+    let mut out = tq_zeros(total)
+    let qm = tq_qmax(bits)
+    for r in 0..rows {
+        for c in 0..cols {
+            let idx = r * cols + c
+            let val = tq_round(tensor[idx] * scales[r])
+            let mut clamped = val
+            if clamped > qm { clamped = qm }
+            if clamped < 0.0 - qm { clamped = 0.0 - qm }
+            out[idx] = clamped
+        }
+    }
+    return out
+}
+
+@pure @hot
+fn tq_per_channel_dequantize(qtensor, rows, cols, scales, bits) {
+    let total = rows * cols
+    let mut out = tq_zeros(total)
+    for r in 0..rows {
+        for c in 0..cols {
+            let idx = r * cols + c
+            if scales[r] != 0.0 {
+                out[idx] = qtensor[idx] / scales[r]
+            } else {
+                out[idx] = 0.0
+            }
+        }
+    }
+    return out
+}
+
+// ===================================================================
+//  2. Per-Token Dynamic Quantization
+//
+//  For an activation tensor [tokens x hidden_dim], compute one
+//  scale factor per token (per row) at runtime.
+//
+//  This adapts to the dynamic range of each token's activations,
+//  which can vary widely across sequence positions.
+// ===================================================================
+
+@pure
+fn tq_per_token_scale(tensor, rows, cols, bits) {
+    let mut scales = tq_zeros(rows)
+    let qm = tq_qmax(bits)
+    for r in 0..rows {
+        let mut mx = 0.0
+        for c in 0..cols {
+            let a = tq_abs(tensor[r * cols + c])
+            if a > mx { mx = a }
+        }
+        if mx > 0.0 {
+            scales[r] = qm / mx
+        } else {
+            scales[r] = 1.0
+        }
+    }
+    return scales
+}
+
+@pure @hot
+fn tq_per_token_quantize(tensor, rows, cols, scales, bits) {
+    let total = rows * cols
+    let mut out = tq_zeros(total)
+    let qm = tq_qmax(bits)
+    for r in 0..rows {
+        for c in 0..cols {
+            let idx = r * cols + c
+            let val = tq_round(tensor[idx] * scales[r])
+            let mut clamped = val
+            if clamped > qm { clamped = qm }
+            if clamped < 0.0 - qm { clamped = 0.0 - qm }
+            out[idx] = clamped
+        }
+    }
+    return out
+}
+
+@pure @hot
+fn tq_per_token_dequantize(qtensor, rows, cols, scales, bits) {
+    let total = rows * cols
+    let mut out = tq_zeros(total)
+    for r in 0..rows {
+        for c in 0..cols {
+            let idx = r * cols + c
+            if scales[r] != 0.0 {
+                out[idx] = qtensor[idx] / scales[r]
+            } else {
+                out[idx] = 0.0
+            }
+        }
+    }
+    return out
+}
+
+// ===================================================================
+//  3. SmoothQuant
+//
+//  Key insight: activation outliers make activation quantization hard,
+//  but weight quantization is easy. SmoothQuant applies a per-channel
+//  scaling factor s to move difficulty from activations to weights:
+//
+//    Y = (X * diag(s)^-1) * (diag(s) * W)
+//      = X_smooth * W_smooth
+//
+//  s_j = max(|X_j|)^alpha / max(|W_j|)^(1-alpha)
+//
+//  alpha in [0,1] controls the migration strength.
+//  alpha=0.5 balances difficulty equally.
+// ===================================================================
+
+@pure
+fn tq_column_amax(tensor, rows, cols) {
+    let mut amaxes = tq_zeros(cols)
+    for c in 0..cols {
+        let mut mx = 0.0
+        for r in 0..rows {
+            let a = tq_abs(tensor[r * cols + c])
+            if a > mx { mx = a }
+        }
+        amaxes[c] = mx
+    }
+    return amaxes
+}
+
+@pure
+fn tq_smoothquant_scales(act_col_max, w_col_max, cols, alpha) {
+    let mut s = tq_zeros(cols)
+    for j in 0..cols {
+        let a_max = tq_max_f(act_col_max[j], 1.0e-12)
+        let w_max = tq_max_f(w_col_max[j], 1.0e-12)
+        // s_j = a_max^alpha / w_max^(1-alpha)
+        // Using pow via exp(alpha * log(x))
+        let log_a = tq_log2(a_max)
+        let log_w = tq_log2(w_max)
+        let log_s = alpha * log_a - (1.0 - alpha) * log_w
+        s[j] = tq_pow2(log_s)
+    }
+    return s
+}
+
+@pure @hot
+fn tq_smoothquant_transform_act(act, rows, cols, s) {
+    // X_smooth = X * diag(s)^-1: divide each column by s
+    let total = rows * cols
+    let mut out = tq_zeros(total)
+    for r in 0..rows {
+        for c in 0..cols {
+            let idx = r * cols + c
+            if s[c] > 0.0 {
+                out[idx] = act[idx] / s[c]
+            } else {
+                out[idx] = act[idx]
+            }
+        }
+    }
+    return out
+}
+
+@pure @hot
+fn tq_smoothquant_transform_w(weight, rows, cols, s) {
+    // W_smooth = diag(s) * W: multiply each column of weight by s
+    // weight is [rows x cols] where rows = input_dim, cols = output_dim
+    // but smoothquant scales the input dimension, so multiply each row by s[r]
+    // Actually: W_smooth[i,j] = s[i] * W[i,j] for input dim i
+    let total = rows * cols
+    let mut out = tq_zeros(total)
+    for r in 0..rows {
+        for c in 0..cols {
+            let idx = r * cols + c
+            out[idx] = weight[idx] * s[r]
+        }
+    }
+    return out
+}
+
+// ===================================================================
+//  4. Calibration Dataset
+//
+//  Collect activation statistics over multiple batches to determine
+//  optimal per-channel scaling factors.
+//
+//  State: [running_max per channel, count]
+//  After calibration, compute final scales.
+// ===================================================================
+
+fn tq_calibration_init(n_channels) {
+    let running_max = tq_zeros(n_channels)
+    return [running_max, 0]
+}
+
+fn tq_calibration_observe(state, tensor, rows, cols) {
+    let running_max = state[0]
+    let count = state[1]
+    let mut new_max = tq_zeros(cols)
+    for c in 0..cols {
+        new_max[c] = running_max[c]
+    }
+    // Update running max per column (channel)
+    for r in 0..rows {
+        for c in 0..cols {
+            let a = tq_abs(tensor[r * cols + c])
+            if a > new_max[c] { new_max[c] = a }
+        }
+    }
+    return [new_max, count + 1]
+}
+
+@pure
+fn tq_calibration_scales(state, bits) {
+    let running_max = state[0]
+    let n = len(running_max)
+    let qm = tq_qmax(bits)
+    let mut scales = tq_zeros(n)
+    for i in 0..n {
+        if running_max[i] > 0.0 {
+            scales[i] = qm / running_max[i]
+        } else {
+            scales[i] = 1.0
+        }
+    }
+    return scales
+}
+
+// ===================================================================
+//  5. Outlier Channel Handling
+//
+//  Detect channels with abnormally large activation magnitudes.
+//  These outlier channels are quantized at higher precision (e.g.
+//  FP16) while the rest use INT8/INT4.
+//
+//  Detection: channel_max > threshold * median(channel_maxes)
+// ===================================================================
+
+@pure
+fn tq_median(values) {
+    // Simple selection: sort and pick middle
+    let n = len(values)
+    if n == 0 { return 0.0 }
+    // Copy and bubble sort (small n expected)
+    let mut sorted = tq_zeros(n)
+    for i in 0..n { sorted[i] = values[i] }
+    for i in 0..n {
+        for j in 0..(n - 1) {
+            if sorted[j] > sorted[j + 1] {
+                let tmp = sorted[j]
+                sorted[j] = sorted[j + 1]
+                sorted[j + 1] = tmp
+            }
+        }
+    }
+    return sorted[n / 2]
+}
+
+@pure
+fn tq_mean(values) {
+    let n = len(values)
+    if n == 0 { return 0.0 }
+    let mut s = 0.0
+    for i in 0..n { s = s + values[i] }
+    return s / to_float(n)
+}
+
+@pure
+fn tq_outlier_detect(channel_maxes, threshold) {
+    let n = len(channel_maxes)
+    let med = tq_median(channel_maxes)
+    let cutoff = med * threshold
+    let mut mask = tq_zeros_int(n)
+    for i in 0..n {
+        if channel_maxes[i] > cutoff {
+            mask[i] = 1
+        } else {
+            mask[i] = 0
+        }
+    }
+    return mask
+}
+
+@pure
+fn tq_outlier_count(mask) {
+    let n = len(mask)
+    let mut cnt = 0
+    for i in 0..n {
+        if mask[i] == 1 { cnt = cnt + 1 }
+    }
+    return cnt
+}
+
+// Split tensor into normal and outlier channels
+// Normal channels get zeros where outliers are, outlier channels get zeros elsewhere
+@pure
+fn tq_mixed_precision_split(tensor, rows, cols, outlier_mask) {
+    let total = rows * cols
+    let mut normal = tq_zeros(total)
+    let mut outlier = tq_zeros(total)
+    for r in 0..rows {
+        for c in 0..cols {
+            let idx = r * cols + c
+            if outlier_mask[c] == 1 {
+                outlier[idx] = tensor[idx]
+                normal[idx] = 0.0
+            } else {
+                normal[idx] = tensor[idx]
+                outlier[idx] = 0.0
+            }
+        }
+    }
+    return [normal, outlier]
+}
+
+// Reassemble normal (quantized+dequantized) and outlier (kept in FP) parts
+@pure
+fn tq_mixed_precision_reassemble(normal, outlier, rows, cols, outlier_mask) {
+    let total = rows * cols
+    let mut out = tq_zeros(total)
+    for r in 0..rows {
+        for c in 0..cols {
+            let idx = r * cols + c
+            if outlier_mask[c] == 1 {
+                out[idx] = outlier[idx]
+            } else {
+                out[idx] = normal[idx]
+            }
+        }
+    }
+    return out
+}
+
+// ===================================================================
+//  6. Mixed-Precision Policy
+//
+//  Assign different bit-widths to different layers based on
+//  sensitivity to quantization. Layers with higher sensitivity
+//  (larger accuracy drop) get more bits.
+//
+//  Sensitivity = MSE(original, quantized) / norm(original)^2
+// ===================================================================
+
+@pure
+fn tq_tensor_norm_sq(tensor) {
+    let n = len(tensor)
+    let mut s = 0.0
+    for i in 0..n { s = s + tensor[i] * tensor[i] }
+    return s
+}
+
+@pure
+fn tq_mse(original, reconstructed) {
+    let n = len(original)
+    if n == 0 { return 0.0 }
+    let mut s = 0.0
+    for i in 0..n {
+        let d = original[i] - reconstructed[i]
+        s = s + d * d
+    }
+    return s / to_float(n)
+}
+
+@pure
+fn tq_sensitivity_score(tensor, rows, cols, bits) {
+    // Quantize and dequantize, measure MSE relative to original norm
+    let scales = tq_per_channel_scale(tensor, rows, cols, bits)
+    let qt = tq_per_channel_quantize(tensor, rows, cols, scales, bits)
+    let recon = tq_per_channel_dequantize(qt, rows, cols, scales, bits)
+    let mse = tq_mse(tensor, recon)
+    let norm_sq = tq_tensor_norm_sq(tensor)
+    if norm_sq <= 0.0 { return 0.0 }
+    return mse / (norm_sq / to_float(rows * cols))
+}
+
+// Greedy policy: assign highest bits to most sensitive layers
+// within a total bit budget (average bits per layer)
+@pure
+fn tq_mixed_precision_policy(sensitivities, bit_options, budget) {
+    let n_layers = len(sensitivities)
+    let n_opts = len(bit_options)
+    // Sort bit_options ascending (assume already sorted: [2,4,8])
+    // Start all layers at lowest bits, upgrade most sensitive first
+    let mut assignments = tq_zeros_int(n_layers)
+    for i in 0..n_layers { assignments[i] = bit_options[0] }
+
+    // Greedily upgrade layers by sensitivity (highest first)
+    // until budget is met
+    let total_budget = budget * n_layers
+    let mut used = bit_options[0] * n_layers
+
+    // Build sorted indices by sensitivity (descending)
+    let mut indices = tq_zeros_int(n_layers)
+    for i in 0..n_layers { indices[i] = i }
+    for i in 0..n_layers {
+        for j in 0..(n_layers - 1) {
+            if sensitivities[indices[j]] < sensitivities[indices[j + 1]] {
+                let tmp = indices[j]
+                indices[j] = indices[j + 1]
+                indices[j + 1] = tmp
+            }
+        }
+    }
+
+    // Upgrade each layer to next bit option if budget allows
+    for oi in 1..n_opts {
+        let target_bits = bit_options[oi]
+        for si in 0..n_layers {
+            let li = indices[si]
+            if assignments[li] < target_bits {
+                let cost = target_bits - assignments[li]
+                if used + cost <= total_budget {
+                    assignments[li] = target_bits
+                    used = used + cost
+                }
+            }
+        }
+    }
+    return assignments
+}
+
+// ===================================================================
+//  7. Accuracy-Loss Curve
+//
+//  Sweep quantization bit-widths, compute MSE and compression ratio
+//  for each, returning a table of [bits, mse, compression_ratio].
+//
+//  compression_ratio = 32 / bits (assuming FP32 baseline)
+// ===================================================================
+
+@pure
+fn tq_compression_ratio(bits) {
+    return 32.0 / to_float(bits)
+}
+
+@pure
+fn tq_accuracy_loss_sweep(tensor, rows, cols, bit_list) {
+    let n_bits = len(bit_list)
+    let mut results = []
+    for bi in 0..n_bits {
+        let bits = bit_list[bi]
+        let scales = tq_per_channel_scale(tensor, rows, cols, bits)
+        let qt = tq_per_channel_quantize(tensor, rows, cols, scales, bits)
+        let recon = tq_per_channel_dequantize(qt, rows, cols, scales, bits)
+        let mse = tq_mse(tensor, recon)
+        let ratio = tq_compression_ratio(bits)
+        results = results + [[bits, mse, ratio]]
+    }
+    return results
+}
+
+// ===================================================================
+//  End-to-end quantized matmul: quantize A per-token, B per-channel,
+//  multiply, dequantize
+// ===================================================================
+
+@hot
+fn tq_quantized_matmul(a, b, m, k, n, bits) {
+    // A: [m x k], quantize per-token (per row)
+    let a_scales = tq_per_token_scale(a, m, k, bits)
+    let a_q = tq_per_token_quantize(a, m, k, a_scales, bits)
+
+    // B: [k x n], quantize per-channel (per row = per output channel of transpose)
+    let b_scales = tq_per_channel_scale(b, k, n, bits)
+    let b_q = tq_per_channel_quantize(b, k, n, b_scales, bits)
+
+    // Matmul: C[i,j] = sum_p A_q[i,p] * B_q[p,j]
+    let out_size = m * n
+    let mut c = tq_zeros(out_size)
+    for i in 0..m {
+        for j in 0..n {
+            let mut acc = 0.0
+            for p in 0..k {
+                let av = a_q[i * k + p] / a_scales[i]
+                let bv = b_q[p * n + j] / b_scales[p]
+                acc = acc + av * bv
+            }
+            c[i * n + j] = acc
+        }
+    }
+    return c
+}
+
+println("[tensor_quantization] loaded — per-channel + per-token + smoothquant + calibration + outlier + mixed-precision + accuracy-loss sweep")

@@ -1,0 +1,714 @@
+// ═══════════════════════════════════════════════════════════════
+//  test_multi_token_prediction.hexa — Multi-Token Prediction (#167)
+//
+//  Tests (>= 30):
+//    T1  mtp_zeros returns correct length
+//    T2  mtp_zeros all values are 0.0
+//    T3  mtp_make_head correct size
+//    T4  mtp_make_trunk correct size
+//    T5  trunk_forward output dim matches input dim
+//    T6  trunk_forward nonzero output
+//    T7  head_forward output size = vocab
+//    T8  head_forward nonzero output
+//    T9  softmax sums to ~1.0
+//    T10 softmax max value at argmax position
+//    T11 argmax selects correct index
+//    T12 cross_entropy >= 0
+//    T13 cross_entropy lower for higher prob
+//    T14 causal_mask correct size
+//    T15 causal_mask diagonal property (offset=1)
+//    T16 multi_head_forward returns N logit arrays
+//    T17 multi_head_forward each has vocab size
+//    T18 per_head_loss >= 0
+//    T19 per_head_loss varies by target
+//    T20 head_seq_loss >= 0
+//    T21 combined_loss >= 0
+//    T22 combined_loss with zero weights = 0
+//    T23 speculative_draft returns N tokens
+//    T24 speculative_draft tokens in vocab range
+//    T25 verify_draft perfect match
+//    T26 verify_draft mismatch at start
+//    T27 curriculum_n starts at 1
+//    T28 curriculum_n ends at max_n
+//    T29 curriculum_n monotonic
+//    T30 curriculum_n_exp starts at 1
+//    T31 curriculum_n_step discrete phases
+//    T32 schedule_weights inactive heads are 0
+//    T33 default_weights geometric decay
+//    T34 train_step returns valid loss
+//    T35 head_diversity all same = 0
+//    T36 head_diversity all different > 0
+//    T37 loss_breakdown returns N losses
+//    T38 speculative_draft_probs returns tokens and probs
+//    T39 acceptance_rate perfect = 1.0
+//    T40 causal_mask offset=0 is full lower triangle
+//
+//  Run: cargo run --release -- self/test_multi_token_prediction.hexa
+// ═══════════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ── inline helpers from multi_token_prediction.hexa ─────────
+
+fn mtp_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn mtp_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 { g = (g + x / g) / 2.0 }
+    return g
+}
+
+fn mtp_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn mtp_log(x) {
+    if x <= 0.0 { return -20.0 }
+    let mut v = (x - 1.0) / (x + 1.0)
+    let mut result = 0.0
+    let mut power = v
+    for i in 0..30 {
+        let denom = to_float(2 * i + 1)
+        result = result + power / denom
+        power = power * v * v
+    }
+    return 2.0 * result
+}
+
+fn mtp_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn mtp_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+fn mtp_hash(a, b, seed) {
+    let mut h = (a + 1) * 2654435761 + (b + 1) * 1315423911 + seed * 7919
+    h = h % 1000003
+    if h < 0 { h = 0 - h }
+    return h
+}
+
+fn mtp_make_head(vocab, dim, seed) {
+    let n = vocab * dim
+    let mut w = mtp_zeros(n)
+    for i in 0..n {
+        let h = mtp_hash(i, seed, 42)
+        w[i] = (to_float(h % 200) - 100.0) / 1000.0
+    }
+    return w
+}
+
+fn mtp_make_trunk(dim, seed) {
+    let n = dim * dim
+    let mut w = mtp_zeros(n)
+    for i in 0..n {
+        let h = mtp_hash(i, seed, 99)
+        w[i] = (to_float(h % 200) - 100.0) / 1000.0
+    }
+    return w
+}
+
+fn mtp_trunk_forward(input, weights, dim) {
+    let mut out = mtp_zeros(dim)
+    for i in 0..dim {
+        let mut s = 0.0
+        for j in 0..dim {
+            s = s + input[j] * weights[i * dim + j]
+        }
+        out[i] = s
+    }
+    return out
+}
+
+fn mtp_head_forward(hidden, head_w, vocab, dim) {
+    let mut logits = mtp_zeros(vocab)
+    for v in 0..vocab {
+        let mut s = 0.0
+        for d in 0..dim {
+            s = s + hidden[d] * head_w[v * dim + d]
+        }
+        logits[v] = s
+    }
+    return logits
+}
+
+fn mtp_softmax(logits) {
+    let n = len(logits)
+    let mut mx = logits[0]
+    for i in 1..n {
+        if logits[i] > mx { mx = logits[i] }
+    }
+    let mut exps = mtp_zeros(n)
+    let mut z = 0.0
+    for i in 0..n {
+        exps[i] = mtp_exp(logits[i] - mx)
+        z = z + exps[i]
+    }
+    let mut out = mtp_zeros(n)
+    for i in 0..n { out[i] = exps[i] / z }
+    return out
+}
+
+fn mtp_argmax(logits) {
+    let n = len(logits)
+    let mut best = 0
+    let mut best_v = logits[0]
+    for i in 1..n {
+        if logits[i] > best_v {
+            best_v = logits[i]
+            best = i
+        }
+    }
+    return best
+}
+
+fn mtp_cross_entropy(probs, target) {
+    let p = probs[target]
+    let mut clamped = p
+    if clamped < 1.0e-10 { clamped = 1.0e-10 }
+    return 0.0 - mtp_log(clamped)
+}
+
+fn mtp_causal_mask(seq_len, offset) {
+    let n = seq_len * seq_len
+    let mut mask = mtp_zeros_int(n)
+    for i in 0..seq_len {
+        for j in 0..seq_len {
+            if j <= i - offset {
+                mask[i * seq_len + j] = 1
+            }
+        }
+    }
+    return mask
+}
+
+fn mtp_valid_positions(seq_len, offset) {
+    let mut count = seq_len - offset
+    if count < 0 { count = 0 }
+    return count
+}
+
+fn mtp_multi_head_forward(input, trunk_w, heads, vocab, dim) {
+    let hidden = mtp_trunk_forward(input, trunk_w, dim)
+    let n_heads = len(heads)
+    let mut all_logits = []
+    for h in 0..n_heads {
+        let logits = mtp_head_forward(hidden, heads[h], vocab, dim)
+        all_logits = all_logits + [logits]
+    }
+    return all_logits
+}
+
+fn mtp_per_head_loss(hidden, head_w, targets, vocab, dim) {
+    let logits = mtp_head_forward(hidden, head_w, vocab, dim)
+    let probs = mtp_softmax(logits)
+    let n = len(targets)
+    if n == 0 { return 0.0 }
+    let mut total_loss = 0.0
+    for i in 0..n {
+        total_loss = total_loss + mtp_cross_entropy(probs, targets[i])
+    }
+    return total_loss / to_float(n)
+}
+
+fn mtp_head_seq_loss(hiddens, head_w, tokens, offset, vocab, dim) {
+    let seq_len = len(tokens)
+    let n_valid = seq_len - offset
+    if n_valid <= 0 { return 0.0 }
+    let mut total = 0.0
+    let mut count = 0
+    for i in 0..n_valid {
+        let logits = mtp_head_forward(hiddens[i], head_w, vocab, dim)
+        let probs = mtp_softmax(logits)
+        let target = tokens[i + offset]
+        total = total + mtp_cross_entropy(probs, target)
+        count = count + 1
+    }
+    if count == 0 { return 0.0 }
+    return total / to_float(count)
+}
+
+fn mtp_combined_loss(hiddens, heads, tokens, vocab, dim, weights) {
+    let n_heads = len(heads)
+    let mut total = 0.0
+    let mut w_sum = 0.0
+    for h in 0..n_heads {
+        let offset = h + 1
+        let loss = mtp_head_seq_loss(hiddens, heads[h], tokens, offset, vocab, dim)
+        total = total + weights[h] * loss
+        w_sum = w_sum + weights[h]
+    }
+    if w_sum < 1.0e-10 { return 0.0 }
+    return total / w_sum
+}
+
+fn mtp_make_hiddens(inputs, trunk_w, dim) {
+    let n = len(inputs)
+    let mut hiddens = []
+    for i in 0..n {
+        let h = mtp_trunk_forward(inputs[i], trunk_w, dim)
+        hiddens = hiddens + [h]
+    }
+    return hiddens
+}
+
+fn mtp_speculative_draft(input, trunk_w, heads, vocab, dim) {
+    let hidden = mtp_trunk_forward(input, trunk_w, dim)
+    let n_heads = len(heads)
+    let mut draft = []
+    for h in 0..n_heads {
+        let logits = mtp_head_forward(hidden, heads[h], vocab, dim)
+        let token = mtp_argmax(logits)
+        draft = draft + [token]
+    }
+    return draft
+}
+
+fn mtp_speculative_draft_probs(input, trunk_w, heads, vocab, dim) {
+    let hidden = mtp_trunk_forward(input, trunk_w, dim)
+    let n_heads = len(heads)
+    let mut draft_tokens = []
+    let mut draft_probs = []
+    for h in 0..n_heads {
+        let logits = mtp_head_forward(hidden, heads[h], vocab, dim)
+        let probs = mtp_softmax(logits)
+        let token = mtp_argmax(logits)
+        draft_tokens = draft_tokens + [token]
+        draft_probs = draft_probs + [probs[token]]
+    }
+    return [draft_tokens, draft_probs]
+}
+
+fn mtp_verify_draft(draft, reference) {
+    let n = len(draft)
+    let nr = len(reference)
+    let mut accepted = 0
+    let mut mn = n
+    if nr < mn { mn = nr }
+    for i in 0..mn {
+        if draft[i] == reference[i] {
+            accepted = accepted + 1
+        } else {
+            return [accepted, mn]
+        }
+    }
+    return [accepted, mn]
+}
+
+fn mtp_curriculum_n(step, total, max_n) {
+    if total <= 0 { return 1 }
+    if step >= total { return max_n }
+    let frac = to_float(step) / to_float(total)
+    let n = 1 + to_int(frac * to_float(max_n - 1))
+    if n < 1 { return 1 }
+    if n > max_n { return max_n }
+    return n
+}
+
+fn mtp_curriculum_n_exp(step, total, max_n) {
+    if total <= 0 { return 1 }
+    if step >= total { return max_n }
+    let frac = to_float(step) / to_float(total)
+    let curved = mtp_sqrt(frac)
+    let n = 1 + to_int(curved * to_float(max_n - 1))
+    if n < 1 { return 1 }
+    if n > max_n { return max_n }
+    return n
+}
+
+fn mtp_curriculum_n_step(step, total, max_n) {
+    if total <= 0 { return 1 }
+    if step >= total { return max_n }
+    let phase_len = total / max_n
+    if phase_len <= 0 { return max_n }
+    let phase = step / phase_len
+    let n = phase + 1
+    if n > max_n { return max_n }
+    return n
+}
+
+fn mtp_schedule_weights(n_heads, step, total, max_n) {
+    let active_n = mtp_curriculum_n(step, total, max_n)
+    let mut weights = mtp_zeros(n_heads)
+    for h in 0..n_heads {
+        if h < active_n {
+            let mut w = 1.0
+            for _d in 0..h { w = w * 0.5 }
+            weights[h] = w
+        }
+    }
+    return weights
+}
+
+fn mtp_default_weights(n_heads) {
+    let mut weights = mtp_zeros(n_heads)
+    let mut w = 1.0
+    for h in 0..n_heads {
+        weights[h] = w
+        w = w * 0.5
+    }
+    return weights
+}
+
+fn mtp_train_step(inputs, trunk_w, heads, tokens, vocab, dim, lr, weights) {
+    let hiddens = mtp_make_hiddens(inputs, trunk_w, dim)
+    let loss = mtp_combined_loss(hiddens, heads, tokens, vocab, dim, weights)
+    let n = len(trunk_w)
+    let mut new_w = mtp_zeros(n)
+    for i in 0..n {
+        let delta = loss * lr * (to_float(mtp_hash(i, to_int(loss * 1000.0), 77) % 200) - 100.0) / 10000.0
+        new_w[i] = trunk_w[i] - delta
+    }
+    return [loss, new_w]
+}
+
+fn mtp_acceptance_rate(drafts, references) {
+    let n = len(drafts)
+    if n == 0 { return 0.0 }
+    let mut total_acc = 0
+    let mut total_n = 0
+    for i in 0..n {
+        let result = mtp_verify_draft(drafts[i], references[i])
+        total_acc = total_acc + result[0]
+        total_n = total_n + result[1]
+    }
+    if total_n == 0 { return 0.0 }
+    return to_float(total_acc) / to_float(total_n)
+}
+
+fn mtp_head_diversity(predictions) {
+    let n = len(predictions)
+    if n <= 1 { return 0.0 }
+    let mut unique = 0
+    for i in 0..n {
+        let mut is_unique = true
+        for j in 0..i {
+            if predictions[j] == predictions[i] {
+                is_unique = false
+            }
+        }
+        if is_unique { unique = unique + 1 }
+    }
+    return to_float(unique - 1) / to_float(n - 1)
+}
+
+fn mtp_loss_breakdown(hiddens, heads, tokens, vocab, dim) {
+    let n_heads = len(heads)
+    let mut losses = []
+    for h in 0..n_heads {
+        let offset = h + 1
+        let loss = mtp_head_seq_loss(hiddens, heads[h], tokens, offset, vocab, dim)
+        losses = losses + [loss]
+    }
+    return losses
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  TEST SETUP
+// ═══════════════════════════════════════════════════════════════
+
+let VOCAB = 8
+let DIM = 4
+let N_HEADS = 4
+let SEQ_LEN = 10
+
+// Create trunk and heads
+let trunk_w = mtp_make_trunk(DIM, 1)
+let head0 = mtp_make_head(VOCAB, DIM, 10)
+let head1 = mtp_make_head(VOCAB, DIM, 20)
+let head2 = mtp_make_head(VOCAB, DIM, 30)
+let head3 = mtp_make_head(VOCAB, DIM, 40)
+let heads = [head0, head1, head2, head3]
+
+// Create input vectors
+fn make_input(idx) {
+    let mut v = mtp_zeros(DIM)
+    for d in 0..DIM {
+        let h = mtp_hash(idx, d, 55)
+        v[d] = (to_float(h % 200) - 100.0) / 100.0
+    }
+    return v
+}
+
+let mut inputs = []
+for i in 0..SEQ_LEN {
+    inputs = inputs + [make_input(i)]
+}
+
+// Target tokens
+let tokens = [3, 1, 4, 1, 5, 2, 6, 3, 7, 0]
+
+// ═══════════════════════════════════════════════════════════════
+//  TESTS
+// ═══════════════════════════════════════════════════════════════
+
+// T1: mtp_zeros correct length
+let z5 = mtp_zeros(5)
+check("T1 mtp_zeros length=5", len(z5) == 5)
+
+// T2: mtp_zeros all values 0.0
+let mut all_zero = true
+for i in 0..5 {
+    if fabs(z5[i]) > 0.001 { all_zero = false }
+}
+check("T2 mtp_zeros all values=0.0", all_zero)
+
+// T3: mtp_make_head correct size (vocab * dim)
+check("T3 head size = VOCAB*DIM", len(head0) == VOCAB * DIM)
+
+// T4: mtp_make_trunk correct size (dim * dim)
+check("T4 trunk size = DIM*DIM", len(trunk_w) == DIM * DIM)
+
+// T5: trunk_forward output dim matches
+let inp0 = make_input(0)
+let trunk_out = mtp_trunk_forward(inp0, trunk_w, DIM)
+check("T5 trunk_forward output dim", len(trunk_out) == DIM)
+
+// T6: trunk_forward nonzero output
+let mut any_nonzero = false
+for i in 0..DIM {
+    if fabs(trunk_out[i]) > 0.0001 { any_nonzero = true }
+}
+check("T6 trunk_forward nonzero output", any_nonzero)
+
+// T7: head_forward output size = vocab
+let head_out = mtp_head_forward(trunk_out, head0, VOCAB, DIM)
+check("T7 head_forward output size = VOCAB", len(head_out) == VOCAB)
+
+// T8: head_forward nonzero output
+let mut head_nz = false
+for i in 0..VOCAB {
+    if fabs(head_out[i]) > 0.0001 { head_nz = true }
+}
+check("T8 head_forward nonzero output", head_nz)
+
+// T9: softmax sums to ~1.0
+let sm = mtp_softmax(head_out)
+let mut sm_sum = 0.0
+for i in 0..VOCAB { sm_sum = sm_sum + sm[i] }
+check("T9 softmax sums to ~1.0", approx(sm_sum, 1.0, 0.01))
+
+// T10: softmax max at argmax position
+let am = mtp_argmax(head_out)
+let mut sm_max_ok = true
+for i in 0..VOCAB {
+    if sm[i] > sm[am] + 0.001 { sm_max_ok = false }
+}
+check("T10 softmax max at argmax position", sm_max_ok)
+
+// T11: argmax selects correct index
+let test_logits = [0.1, 0.5, 0.9, 0.2, 0.3, 0.1, 0.05, 0.8]
+check("T11 argmax selects index 2", mtp_argmax(test_logits) == 2)
+
+// T12: cross_entropy >= 0
+let uniform_probs = [0.125, 0.125, 0.125, 0.125, 0.125, 0.125, 0.125, 0.125]
+let ce = mtp_cross_entropy(uniform_probs, 3)
+check("T12 cross_entropy >= 0", ce >= 0.0)
+
+// T13: cross_entropy lower for higher prob
+let high_probs = [0.01, 0.01, 0.01, 0.91, 0.01, 0.01, 0.01, 0.02]
+let ce_high = mtp_cross_entropy(high_probs, 3)
+let ce_low = mtp_cross_entropy(uniform_probs, 3)
+check("T13 cross_entropy lower for higher prob", ce_high < ce_low)
+
+// T14: causal_mask correct size
+let mask1 = mtp_causal_mask(5, 1)
+check("T14 causal_mask size = seq*seq", len(mask1) == 25)
+
+// T15: causal_mask offset=1 diagonal property
+// For offset=1, position 0 should have no 1s, position 1 should have mask[1*5+0]=1
+check("T15 causal_mask offset=1: pos0 has no attend", mask1[0 * 5 + 0] == 0)
+check("T15b causal_mask offset=1: pos1 attends to 0", mask1[1 * 5 + 0] == 1)
+
+// T16: multi_head_forward returns N arrays
+let mhf = mtp_multi_head_forward(inp0, trunk_w, heads, VOCAB, DIM)
+check("T16 multi_head_forward returns N_HEADS arrays", len(mhf) == N_HEADS)
+
+// T17: each array has vocab size
+let mut all_vocab_size = true
+for h in 0..N_HEADS {
+    if len(mhf[h]) != VOCAB { all_vocab_size = false }
+}
+check("T17 multi_head_forward each has VOCAB size", all_vocab_size)
+
+// T18: per_head_loss >= 0
+let hidden = mtp_trunk_forward(inp0, trunk_w, DIM)
+let phl = mtp_per_head_loss(hidden, head0, [3, 1, 4], VOCAB, DIM)
+check("T18 per_head_loss >= 0", phl >= 0.0)
+
+// T19: per_head_loss varies by target
+let phl2 = mtp_per_head_loss(hidden, head0, [0, 0, 0], VOCAB, DIM)
+check("T19 per_head_loss varies by target", fabs(phl - phl2) > 0.001)
+
+// T20: head_seq_loss >= 0
+let hiddens = mtp_make_hiddens(inputs, trunk_w, DIM)
+let hsl = mtp_head_seq_loss(hiddens, head0, tokens, 1, VOCAB, DIM)
+check("T20 head_seq_loss >= 0", hsl >= 0.0)
+
+// T21: combined_loss >= 0
+let w4 = [1.0, 0.5, 0.25, 0.125]
+let cl = mtp_combined_loss(hiddens, heads, tokens, VOCAB, DIM, w4)
+check("T21 combined_loss >= 0", cl >= 0.0)
+
+// T22: combined_loss with zero weights = 0
+let w_zero = [0.0, 0.0, 0.0, 0.0]
+let cl_zero = mtp_combined_loss(hiddens, heads, tokens, VOCAB, DIM, w_zero)
+check("T22 combined_loss zero weights = 0", approx(cl_zero, 0.0, 0.001))
+
+// T23: speculative_draft returns N tokens
+let draft = mtp_speculative_draft(inp0, trunk_w, heads, VOCAB, DIM)
+check("T23 speculative_draft returns N_HEADS tokens", len(draft) == N_HEADS)
+
+// T24: speculative_draft tokens in vocab range
+let mut all_in_range = true
+for i in 0..N_HEADS {
+    if draft[i] < 0 { all_in_range = false }
+    if draft[i] >= VOCAB { all_in_range = false }
+}
+check("T24 speculative_draft tokens in [0, VOCAB)", all_in_range)
+
+// T25: verify_draft perfect match
+let ref_perfect = draft
+let vd_p = mtp_verify_draft(draft, ref_perfect)
+check("T25 verify_draft perfect: accepted=N", vd_p[0] == N_HEADS)
+
+// T26: verify_draft mismatch at start
+let mut bad_ref = []
+for i in 0..N_HEADS {
+    bad_ref = bad_ref + [(draft[i] + 1) % VOCAB]
+}
+let vd_bad = mtp_verify_draft(draft, bad_ref)
+check("T26 verify_draft mismatch at start: accepted=0", vd_bad[0] == 0)
+
+// T27: curriculum_n starts at 1
+check("T27 curriculum_n(0, 100, 4) = 1", mtp_curriculum_n(0, 100, 4) == 1)
+
+// T28: curriculum_n ends at max_n
+check("T28 curriculum_n(100, 100, 4) = 4", mtp_curriculum_n(100, 100, 4) == 4)
+
+// T29: curriculum_n monotonic
+let mut monotonic = true
+let mut prev_n = 0
+for s in 0..101 {
+    let cn = mtp_curriculum_n(s, 100, 4)
+    if cn < prev_n { monotonic = false }
+    prev_n = cn
+}
+check("T29 curriculum_n monotonic", monotonic)
+
+// T30: curriculum_n_exp starts at 1
+check("T30 curriculum_n_exp(0, 100, 4) = 1", mtp_curriculum_n_exp(0, 100, 4) == 1)
+
+// T31: curriculum_n_step discrete phases
+let step_n1 = mtp_curriculum_n_step(0, 100, 4)
+let step_n2 = mtp_curriculum_n_step(25, 100, 4)
+let step_n3 = mtp_curriculum_n_step(50, 100, 4)
+let step_n4 = mtp_curriculum_n_step(75, 100, 4)
+check("T31 step phases: n1=1", step_n1 == 1)
+check("T31b step phases: n2=2", step_n2 == 2)
+check("T31c step phases: n3=3", step_n3 == 3)
+check("T31d step phases: n4=4", step_n4 == 4)
+
+// T32: schedule_weights inactive heads are 0
+let sw_early = mtp_schedule_weights(4, 0, 100, 4)
+// At step 0, curriculum_n=1, so only head 0 active
+check("T32 schedule_weights head0 > 0 at start", sw_early[0] > 0.0)
+check("T32b schedule_weights head3 = 0 at start", approx(sw_early[3], 0.0, 0.001))
+
+// T33: default_weights geometric decay
+let dw = mtp_default_weights(4)
+check("T33 default_weights[0] = 1.0", approx(dw[0], 1.0, 0.001))
+check("T33b default_weights[1] = 0.5", approx(dw[1], 0.5, 0.001))
+check("T33c default_weights[2] = 0.25", approx(dw[2], 0.25, 0.001))
+check("T33d default_weights[3] = 0.125", approx(dw[3], 0.125, 0.001))
+
+// T34: train_step returns valid loss
+let ts_result = mtp_train_step(inputs, trunk_w, heads, tokens, VOCAB, DIM, 0.01, w4)
+let ts_loss = ts_result[0]
+check("T34 train_step loss >= 0", ts_loss >= 0.0)
+check("T34b train_step loss finite", ts_loss < 100.0)
+
+// T35: head_diversity all same = 0
+let same_preds = [3, 3, 3, 3]
+check("T35 head_diversity all same = 0", approx(mtp_head_diversity(same_preds), 0.0, 0.001))
+
+// T36: head_diversity all different > 0
+let diff_preds = [0, 1, 2, 3]
+check("T36 head_diversity all different = 1.0", approx(mtp_head_diversity(diff_preds), 1.0, 0.001))
+
+// T37: loss_breakdown returns N losses
+let lb = mtp_loss_breakdown(hiddens, heads, tokens, VOCAB, DIM)
+check("T37 loss_breakdown returns N_HEADS losses", len(lb) == N_HEADS)
+let mut all_nonneg = true
+for i in 0..N_HEADS {
+    if lb[i] < 0.0 { all_nonneg = false }
+}
+check("T37b all per-head losses >= 0", all_nonneg)
+
+// T38: speculative_draft_probs returns tokens and probs
+let sdp = mtp_speculative_draft_probs(inp0, trunk_w, heads, VOCAB, DIM)
+let sdp_tokens = sdp[0]
+let sdp_probs = sdp[1]
+check("T38 draft_probs tokens length = N_HEADS", len(sdp_tokens) == N_HEADS)
+check("T38b draft_probs probs length = N_HEADS", len(sdp_probs) == N_HEADS)
+let mut probs_valid = true
+for i in 0..N_HEADS {
+    if sdp_probs[i] < 0.0 { probs_valid = false }
+    if sdp_probs[i] > 1.01 { probs_valid = false }
+}
+check("T38c draft_probs all probs in [0,1]", probs_valid)
+
+// T39: acceptance_rate perfect = 1.0
+let drafts_list = [[1, 2, 3], [4, 5, 6]]
+let refs_list = [[1, 2, 3], [4, 5, 6]]
+let ar = mtp_acceptance_rate(drafts_list, refs_list)
+check("T39 acceptance_rate perfect = 1.0", approx(ar, 1.0, 0.001))
+
+// T40: causal_mask offset=0 is full lower triangle
+let mask0 = mtp_causal_mask(4, 0)
+// offset=0: position i attends to all j <= i
+check("T40 causal_mask offset=0: pos0 attends pos0", mask0[0 * 4 + 0] == 1)
+check("T40b causal_mask offset=0: pos2 attends pos1", mask0[2 * 4 + 1] == 1)
+check("T40c causal_mask offset=0: pos1 not attend pos2", mask0[1 * 4 + 2] == 0)
+
+// ═══════════════════════════════════════════════════════════════
+println("")
+println("=== multi_token_prediction test summary ===")
+println("PASS: " + str(pass_count))
+println("FAIL: " + str(fail_count))
+println("TOTAL: " + str(pass_count + fail_count))

@@ -1,0 +1,647 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/contrastive_learning.hexa — Contrastive Learning (#171)
+//
+//  SimCLR / CLIP style contrastive representation learning.
+//
+//  Implements:
+//    1. Positive/negative pair construction
+//    2. InfoNCE loss: -log(exp(sim(z_i,z_j)/tau) / sum(exp(sim(z_i,z_k)/tau)))
+//    3. Temperature parameter tau
+//    4. Projection head: MLP mapping representations to contrastive space
+//    5. Hard negative mining: select most confusing negatives
+//    6. In-batch negatives: use other samples in batch as negatives
+//    7. Cross-modal contrastive: align embeddings from different modalities
+//
+//  API (pure):
+//    cl_zeros(n)                                       -> [float]
+//    cl_dot(a, b)                                      -> float
+//    cl_norm(v)                                        -> float
+//    cl_normalize(v)                                   -> [float]
+//    cl_cosine_sim(a, b)                               -> float
+//    cl_exp(x)                                         -> float
+//    cl_log(x)                                         -> float
+//    cl_scale(v, s)                                    -> [float]
+//    cl_add(a, b)                                      -> [float]
+//    cl_relu(x)                                        -> float
+//    cl_linear(x, w, b)                                -> [float]
+//    cl_projection_head(x, w1, b1, w2, b2)             -> [float]
+//    cl_augment(x, seed)                               -> [float]
+//    cl_make_positive_pair(x, seed1, seed2)             -> [[float],[float]]
+//    cl_sim_matrix(embeddings, tau)                     -> [[float]]
+//    cl_infonce_loss(anchor, positive, negatives, tau)  -> float
+//    cl_infonce_batch(embeddings, tau)                  -> float
+//    cl_hard_negatives(anchor, negatives, k)            -> [int]
+//    cl_infonce_hard(anchor, positive, negatives, tau, k) -> float
+//    cl_in_batch_negatives(embeddings, idx)             -> [[float]]
+//    cl_cross_modal_loss(emb_a, emb_b, tau)            -> float
+//    cl_ntxent_loss(z_i, z_j, negatives, tau)          -> float
+//    cl_grad_temperature(anchor, positive, negatives, tau) -> float
+//    cl_contrastive_accuracy(embeddings, labels)        -> float
+//    cl_alignment_score(pairs)                          -> float
+//    cl_uniformity_score(embeddings, t)                 -> float
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+//    @hot   — called every training step
+// ═══════════════════════════════════════════════════════════════════
+
+// ── helpers ──────────────────────────────────────────────────────
+
+fn cl_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn cl_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn cl_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn cl_log(x) {
+    if x <= 0.0 { return -20.0 }
+    // Newton iteration for ln(x): converge y s.t. exp(y)=x
+    let mut y = 0.0
+    if x > 1.0 { y = x / 2.0 }
+    if x > 10.0 { y = 2.3 }
+    for _i in 0..60 {
+        let ey = cl_exp(y)
+        if ey < 1.0e-15 { y = y + 1.0 } else {
+            y = y + (x - ey) / ey
+        }
+    }
+    return y
+}
+
+fn cl_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn cl_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+fn cl_ones(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [1.0] }
+    return v
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Vector Operations
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn cl_dot(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    for i in 0..n {
+        s = s + a[i] * b[i]
+    }
+    return s
+}
+
+@pure
+fn cl_norm(v) {
+    return cl_sqrt(cl_dot(v, v))
+}
+
+@pure
+fn cl_normalize(v) {
+    let n = len(v)
+    let nrm = cl_norm(v)
+    if nrm < 1.0e-12 { return cl_zeros(n) }
+    let mut out = cl_zeros(n)
+    for i in 0..n {
+        out[i] = v[i] / nrm
+    }
+    return out
+}
+
+@pure
+fn cl_scale(v, s) {
+    let n = len(v)
+    let mut out = cl_zeros(n)
+    for i in 0..n {
+        out[i] = v[i] * s
+    }
+    return out
+}
+
+@pure
+fn cl_add(a, b) {
+    let n = len(a)
+    let mut out = cl_zeros(n)
+    for i in 0..n {
+        out[i] = a[i] + b[i]
+    }
+    return out
+}
+
+@pure
+fn cl_sub(a, b) {
+    let n = len(a)
+    let mut out = cl_zeros(n)
+    for i in 0..n {
+        out[i] = a[i] - b[i]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Similarity Functions
+// ═══════════════════════════════════════════════════════════════════
+
+// Cosine similarity: dot(a,b) / (||a|| * ||b||)
+@pure
+fn cl_cosine_sim(a, b) {
+    let d = cl_dot(a, b)
+    let na = cl_norm(a)
+    let nb = cl_norm(b)
+    let denom = na * nb
+    if denom < 1.0e-12 { return 0.0 }
+    return d / denom
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  ReLU activation
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn cl_relu(x) {
+    if x > 0.0 { return x }
+    return 0.0
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  4. Projection Head — MLP: z = W2 * relu(W1 * x + b1) + b2
+//
+//  Maps representations from encoder space to contrastive space.
+//  Two-layer MLP with ReLU non-linearity (SimCLR style).
+//
+//  w1: [out_dim x in_dim] flattened, b1: [out_dim]
+//  w2: [proj_dim x out_dim] flattened, b2: [proj_dim]
+// ═══════════════════════════════════════════════════════════════════
+
+// Single linear layer: y = W*x + b
+// w is [out_dim x in_dim] stored row-major flat
+@pure
+fn cl_linear(x, w, b) {
+    let in_dim = len(x)
+    let out_dim = len(b)
+    let mut out = cl_zeros(out_dim)
+    for i in 0..out_dim {
+        let mut s = b[i]
+        for j in 0..in_dim {
+            s = s + w[i * in_dim + j] * x[j]
+        }
+        out[i] = s
+    }
+    return out
+}
+
+// Two-layer projection head: z = W2 * relu(W1 * x + b1) + b2
+@pure
+fn cl_projection_head(x, w1, b1, w2, b2) {
+    let hidden = cl_linear(x, w1, b1)
+    let h_dim = len(b1)
+    let mut activated = cl_zeros(h_dim)
+    for i in 0..h_dim {
+        activated[i] = cl_relu(hidden[i])
+    }
+    let out = cl_linear(activated, w2, b2)
+    return cl_normalize(out)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  1. Positive/Negative Pair Construction
+//
+//  Augment an input to create a positive pair (two views of same data).
+//  Uses deterministic pseudo-random perturbation seeded by `seed`.
+// ═══════════════════════════════════════════════════════════════════
+
+// Augment by adding small deterministic noise
+@pure
+fn cl_augment(x, seed) {
+    let n = len(x)
+    let mut out = cl_zeros(n)
+    for i in 0..n {
+        let mut h = (seed + 1) * 2654435761 + (i + 1) * 1315423911
+        h = h % 1000003
+        if h < 0 { h = 0 - h }
+        let noise = (to_float(h % 1000) / 1000.0 - 0.5) * 0.1
+        out[i] = x[i] + noise
+    }
+    return out
+}
+
+// Create a positive pair: two augmented views of the same input
+@pure
+fn cl_make_positive_pair(x, seed1, seed2) {
+    let v1 = cl_augment(x, seed1)
+    let v2 = cl_augment(x, seed2)
+    return [v1, v2]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Similarity Matrix — pairwise cosine sim for a batch
+//
+//  embeddings: array of N vectors, each of dim D
+//  Returns: NxN flat array of similarities scaled by 1/tau
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cl_sim_matrix(embeddings, tau) {
+    let n = len(embeddings)
+    let mut mat = []
+    for i in 0..n {
+        let mut row = cl_zeros(n)
+        for j in 0..n {
+            row[j] = cl_cosine_sim(embeddings[i], embeddings[j]) / tau
+        }
+        mat = mat + [row]
+    }
+    return mat
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  2. InfoNCE Loss
+//
+//  L = -log( exp(sim(anchor, positive)/tau) /
+//            sum_k(exp(sim(anchor, z_k)/tau)) )
+//
+//  anchor: the query vector
+//  positive: the matching positive
+//  negatives: array of negative vectors
+//  tau: temperature parameter
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn cl_infonce_loss(anchor, positive, negatives, tau) {
+    let pos_sim = cl_cosine_sim(anchor, positive) / tau
+    let pos_exp = cl_exp(pos_sim)
+    let mut denom = pos_exp
+    let n_neg = len(negatives)
+    for i in 0..n_neg {
+        let neg_sim = cl_cosine_sim(anchor, negatives[i]) / tau
+        denom = denom + cl_exp(neg_sim)
+    }
+    if denom < 1.0e-15 { return 20.0 }
+    let loss = 0.0 - cl_log(pos_exp / denom)
+    return loss
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  6. In-Batch Negatives
+//
+//  Given a batch of embeddings, extract negatives for sample idx
+//  (all other samples in the batch serve as negatives).
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cl_in_batch_negatives(embeddings, idx) {
+    let n = len(embeddings)
+    let mut negs = []
+    for i in 0..n {
+        if i != idx {
+            negs = negs + [embeddings[i]]
+        }
+    }
+    return negs
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  InfoNCE over a full batch (in-batch negatives, SimCLR style)
+//
+//  embeddings: [z_1, z_1', z_2, z_2', ...] paired (even=view1, odd=view2)
+//  Each (2i, 2i+1) is a positive pair; all others are negatives.
+//  Returns: average InfoNCE loss across all anchors
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn cl_infonce_batch(embeddings, tau) {
+    let n = len(embeddings)
+    let n_pairs = n / 2
+    if n_pairs < 1 { return 0.0 }
+    let mut total_loss = 0.0
+    let mut count = 0
+    for p in 0..n_pairs {
+        let i = p * 2
+        let j = p * 2 + 1
+        // anchor = embeddings[i], positive = embeddings[j]
+        let negs_i = cl_in_batch_negatives(embeddings, i)
+        // remove the positive from negs (it's at index j-1 since we skipped i)
+        let mut filtered_negs = []
+        for k in 0..len(negs_i) {
+            // negs_i was built by skipping index i, so index j maps to j-1 if j>i
+            let mut orig_idx = k
+            if k >= i { orig_idx = k + 1 }
+            if orig_idx != j {
+                filtered_negs = filtered_negs + [negs_i[k]]
+            }
+        }
+        let loss_i = cl_infonce_loss(embeddings[i], embeddings[j], filtered_negs, tau)
+        total_loss = total_loss + loss_i
+        count = count + 1
+        // symmetric: anchor = embeddings[j], positive = embeddings[i]
+        let negs_j = cl_in_batch_negatives(embeddings, j)
+        let mut filtered_negs_j = []
+        for k in 0..len(negs_j) {
+            let mut orig_idx2 = k
+            if k >= j { orig_idx2 = k + 1 }
+            if orig_idx2 != i {
+                filtered_negs_j = filtered_negs_j + [negs_j[k]]
+            }
+        }
+        let loss_j = cl_infonce_loss(embeddings[j], embeddings[i], filtered_negs_j, tau)
+        total_loss = total_loss + loss_j
+        count = count + 1
+    }
+    if count == 0 { return 0.0 }
+    return total_loss / to_float(count)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  3. Temperature Parameter
+//
+//  Learnable temperature: gradient of loss w.r.t. tau.
+//  Used for temperature scheduling / optimization.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cl_grad_temperature(anchor, positive, negatives, tau) {
+    let eps = 0.001
+    let loss_hi = cl_infonce_loss(anchor, positive, negatives, tau + eps)
+    let loss_lo = cl_infonce_loss(anchor, positive, negatives, tau - eps)
+    return (loss_hi - loss_lo) / (2.0 * eps)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  5. Hard Negative Mining
+//
+//  Select the k negatives most similar to the anchor
+//  (hardest to distinguish from the positive).
+//  Returns: indices of top-k hardest negatives
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cl_hard_negatives(anchor, negatives, k) {
+    let n = len(negatives)
+    // compute similarity for each negative
+    let mut sims = cl_zeros(n)
+    let mut indices = cl_zeros_int(n)
+    for i in 0..n {
+        sims[i] = cl_cosine_sim(anchor, negatives[i])
+        indices[i] = i
+    }
+    // selection sort top-k by descending similarity
+    let mut topk = k
+    if topk > n { topk = n }
+    for i in 0..topk {
+        let mut best = i
+        for j in (i + 1)..n {
+            if sims[j] > sims[best] {
+                best = j
+            }
+        }
+        // swap
+        if best != i {
+            let tmp_s = sims[i]
+            sims[i] = sims[best]
+            sims[best] = tmp_s
+            let tmp_idx = indices[i]
+            indices[i] = indices[best]
+            indices[best] = tmp_idx
+        }
+    }
+    let mut result = []
+    for i in 0..topk {
+        result = result + [indices[i]]
+    }
+    return result
+}
+
+// InfoNCE with hard negative mining
+@pure @hot
+fn cl_infonce_hard(anchor, positive, negatives, tau, k) {
+    let hard_idx = cl_hard_negatives(anchor, negatives, k)
+    let mut hard_negs = []
+    for i in 0..len(hard_idx) {
+        hard_negs = hard_negs + [negatives[hard_idx[i]]]
+    }
+    return cl_infonce_loss(anchor, positive, hard_negs, tau)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  7. Cross-Modal Contrastive Loss (CLIP style)
+//
+//  Align embeddings from two different modalities.
+//  emb_a: [N vectors] modality A (e.g., images)
+//  emb_b: [N vectors] modality B (e.g., text)
+//  Diagonal pairs (a_i, b_i) are positives.
+//  Returns: average symmetric cross-modal InfoNCE loss
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn cl_cross_modal_loss(emb_a, emb_b, tau) {
+    let n = len(emb_a)
+    if n < 2 { return 0.0 }
+    let mut total = 0.0
+    // A -> B direction
+    for i in 0..n {
+        let mut negs = []
+        for j in 0..n {
+            if j != i {
+                negs = negs + [emb_b[j]]
+            }
+        }
+        total = total + cl_infonce_loss(emb_a[i], emb_b[i], negs, tau)
+    }
+    // B -> A direction (symmetric)
+    for i in 0..n {
+        let mut negs = []
+        for j in 0..n {
+            if j != i {
+                negs = negs + [emb_a[j]]
+            }
+        }
+        total = total + cl_infonce_loss(emb_b[i], emb_a[i], negs, tau)
+    }
+    return total / to_float(2 * n)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  NT-Xent Loss (Normalized Temperature-scaled Cross Entropy)
+//
+//  SimCLR variant: identical to InfoNCE but with explicit naming.
+//  z_i, z_j: positive pair embeddings
+//  negatives: other embeddings in the batch
+//  tau: temperature
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn cl_ntxent_loss(z_i, z_j, negatives, tau) {
+    return cl_infonce_loss(z_i, z_j, negatives, tau)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Contrastive Accuracy — what fraction of anchors are closest
+//  to their positive vs any negative
+//
+//  embeddings: [z_1, z_1', z_2, z_2', ...] paired
+//  Returns: fraction in [0,1]
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cl_contrastive_accuracy(embeddings) {
+    let n = len(embeddings)
+    let n_pairs = n / 2
+    if n_pairs < 1 { return 0.0 }
+    let mut correct = 0
+    for p in 0..n_pairs {
+        let i = p * 2
+        let j = p * 2 + 1
+        let pos_sim = cl_cosine_sim(embeddings[i], embeddings[j])
+        let mut is_best = true
+        for k in 0..n {
+            if k != i {
+                if k != j {
+                    let neg_sim = cl_cosine_sim(embeddings[i], embeddings[k])
+                    if neg_sim >= pos_sim { is_best = false }
+                }
+            }
+        }
+        if is_best { correct = correct + 1 }
+    }
+    return to_float(correct) / to_float(n_pairs)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Alignment Score — mean cosine sim of positive pairs
+//  Lower (closer to -1) is worse, higher (closer to 1) is better.
+//
+//  pairs: array of [vec_a, vec_b] positive pairs
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cl_alignment_score(pairs) {
+    let n = len(pairs)
+    if n == 0 { return 0.0 }
+    let mut total = 0.0
+    for i in 0..n {
+        let pair = pairs[i]
+        total = total + cl_cosine_sim(pair[0], pair[1])
+    }
+    return total / to_float(n)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Uniformity Score — measures how uniformly spread embeddings are
+//  on the unit hypersphere.  Lower is more uniform.
+//
+//  uniformity = log( mean( exp(-t * ||z_i - z_j||^2) ) )
+//  t: temperature (typically 2.0)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cl_uniformity_score(embeddings, t) {
+    let n = len(embeddings)
+    if n < 2 { return 0.0 }
+    let mut total = 0.0
+    let mut count = 0
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let diff = cl_sub(embeddings[i], embeddings[j])
+            let sq_dist = cl_dot(diff, diff)
+            total = total + cl_exp(0.0 - t * sq_dist)
+            count = count + 1
+        }
+    }
+    if count == 0 { return 0.0 }
+    let mean_val = total / to_float(count)
+    return cl_log(mean_val)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Softmax over similarities (for contrastive probability)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cl_softmax(scores) {
+    let n = len(scores)
+    let mut mx = scores[0]
+    for i in 1..n {
+        if scores[i] > mx { mx = scores[i] }
+    }
+    let mut exps = cl_zeros(n)
+    let mut z = 0.0
+    for i in 0..n {
+        exps[i] = cl_exp(scores[i] - mx)
+        z = z + exps[i]
+    }
+    let mut out = cl_zeros(n)
+    for i in 0..n {
+        out[i] = exps[i] / z
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Contrastive probability: P(positive | anchor) under InfoNCE
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cl_contrastive_prob(anchor, positive, negatives, tau) {
+    let pos_sim = cl_cosine_sim(anchor, positive) / tau
+    let mut all_sims = [pos_sim]
+    let n_neg = len(negatives)
+    for i in 0..n_neg {
+        all_sims = all_sims + [cl_cosine_sim(anchor, negatives[i]) / tau]
+    }
+    let probs = cl_softmax(all_sims)
+    return probs[0]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Margin-based Contrastive Loss (Hadsell et al.)
+//  L = (1-y) * 0.5 * d^2 + y * 0.5 * max(0, margin - d)^2
+//  y=0: same class, y=1: different class, d = euclidean distance
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cl_margin_loss(a, b, is_negative, margin) {
+    let diff = cl_sub(a, b)
+    let dist = cl_sqrt(cl_dot(diff, diff))
+    if is_negative == 0 {
+        // same class: minimize distance
+        return 0.5 * dist * dist
+    }
+    // different class: push apart beyond margin
+    let gap = margin - dist
+    if gap < 0.0 { return 0.0 }
+    return 0.5 * gap * gap
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Triplet Loss: max(0, d(a,p) - d(a,n) + margin)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cl_triplet_loss(anchor, positive, negative, margin) {
+    let dp = cl_sub(anchor, positive)
+    let dn = cl_sub(anchor, negative)
+    let dist_pos = cl_sqrt(cl_dot(dp, dp))
+    let dist_neg = cl_sqrt(cl_dot(dn, dn))
+    let loss = dist_pos - dist_neg + margin
+    if loss < 0.0 { return 0.0 }
+    return loss
+}
+
+println("[contrastive_learning] loaded — InfoNCE + projection head + hard negatives + in-batch + cross-modal + alignment/uniformity")

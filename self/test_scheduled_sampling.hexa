@@ -1,0 +1,632 @@
+// ═══════════════════════════════════════════════════════════════
+//  test_scheduled_sampling.hexa — Scheduled Sampling (#169)
+//
+//  Tests (30+):
+//    T1  linear decay at step 0 = start_prob
+//    T2  linear decay at total = end_prob
+//    T3  linear decay midpoint
+//    T4  exp decay at step 0 = start_prob
+//    T5  exp decay at total near end_prob
+//    T6  exp decay monotonically decreasing
+//    T7  inv sigmoid at step 0 near 1.0
+//    T8  inv sigmoid at total near 0.0
+//    T9  inv sigmoid S-shape: mid transition
+//    T10 schedule config creation
+//    T11 schedule dispatch linear
+//    T12 schedule dispatch exponential
+//    T13 schedule dispatch inverse sigmoid
+//    T14 warmup holds start_prob
+//    T15 per-token decisions array length
+//    T16 per-token all teacher at prob=1.0
+//    T17 per-token all free at prob=0.0
+//    T18 mixed forward uses teacher where decision=1
+//    T19 mixed forward uses model where decision=0
+//    T20 free-running forward length
+//    T21 free-running is deterministic (same logits_fn)
+//    T22 teacher forward identity
+//    T23 train step returns valid prob
+//    T24 train step n_teacher + n_free = seq_len
+//    T25 eval step fully free-running
+//    T26 error accumulation perfect match = 0
+//    T27 error accumulation total mismatch
+//    T28 error accumulation partial
+//    T29 curriculum integration lowers prob at high competence
+//    T30 curriculum integration no change at competence=0
+//    T31 error propagation rate = 0 for perfect match
+//    T32 token error first_error_pos correct
+//    T33 compare schedules returns 3 values
+//    T34 schedule monotonically decreasing over training
+//    T35 batch train returns correct count
+//
+//  run: cargo run --release -- self/test_scheduled_sampling.hexa
+// ═══════════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ── inlined from scheduled_sampling.hexa ────────────────────
+
+fn ss_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn ss_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn ss_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn ss_log(x) {
+    if x <= 0.0 { return -30.0 }
+    let mut v = x
+    let mut count = 0
+    while v > 2.0 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    let d = v - 1.0
+    return to_float(count) + d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+}
+
+fn ss_clamp(x, lo, hi) {
+    if x < lo { return lo }
+    if x > hi { return hi }
+    return x
+}
+
+fn ss_min(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn ss_max(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn ss_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn ss_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+fn ss_hash_float(seed, idx) {
+    let mut h = (seed + 1) * 2654435761 + idx * 1315423911 + 7919
+    h = h % 1000003
+    if h < 0 { h = 0 - h }
+    return to_float(h % 10000) / 10000.0
+}
+
+fn ss_argmax(logits) {
+    let n = len(logits)
+    let mut best = 0
+    let mut best_v = logits[0]
+    for i in 1..n {
+        if logits[i] > best_v {
+            best_v = logits[i]
+            best = i
+        }
+    }
+    return best
+}
+
+fn ss_make_config(start_prob, end_prob, warmup_steps, decay_type) {
+    return #{
+        "start_prob": start_prob,
+        "end_prob": end_prob,
+        "warmup_steps": warmup_steps,
+        "decay_type": decay_type
+    }
+}
+
+fn ss_warmup_prob(step, warmup_steps, start_prob) {
+    if step < warmup_steps { return start_prob }
+    return start_prob
+}
+
+fn ss_linear_decay(step, total_steps, start_prob, end_prob) {
+    if total_steps <= 0 { return end_prob }
+    let ratio = to_float(step) / to_float(total_steps)
+    let r = ss_clamp(ratio, 0.0, 1.0)
+    let p = start_prob - (start_prob - end_prob) * r
+    return ss_clamp(p, end_prob, start_prob)
+}
+
+fn ss_exp_decay(step, total_steps, start_prob, end_prob) {
+    if total_steps <= 0 { return end_prob }
+    let ratio = to_float(step) / to_float(total_steps)
+    let r = ss_clamp(ratio, 0.0, 1.0)
+    let decay = ss_exp(-5.0 * r)
+    let p = end_prob + (start_prob - end_prob) * decay
+    return ss_clamp(p, end_prob, start_prob)
+}
+
+fn ss_inv_sigmoid(step, total_steps, k) {
+    if total_steps <= 0 { return 0.0 }
+    let ratio = to_float(step) / to_float(total_steps)
+    let r = ss_clamp(ratio, 0.0, 1.0)
+    let p = 1.0 / (1.0 + ss_exp(k * (r - 0.5)))
+    return ss_clamp(p, 0.0, 1.0)
+}
+
+fn ss_inv_sigmoid_scaled(step, total_steps, k, start_prob, end_prob) {
+    let raw = ss_inv_sigmoid(step, total_steps, k)
+    let p = end_prob + (start_prob - end_prob) * raw
+    return ss_clamp(p, end_prob, start_prob)
+}
+
+fn ss_schedule(step, total_steps, cfg) {
+    let start_p = cfg["start_prob"]
+    let end_p = cfg["end_prob"]
+    let warmup = cfg["warmup_steps"]
+    let dtype = cfg["decay_type"]
+    if step < warmup { return start_p }
+    let eff_step = step - warmup
+    let eff_total = total_steps - warmup
+    if eff_total <= 0 { return end_p }
+    if dtype == 0 { return ss_linear_decay(eff_step, eff_total, start_p, end_p) }
+    if dtype == 1 { return ss_exp_decay(eff_step, eff_total, start_p, end_p) }
+    if dtype == 2 { return ss_inv_sigmoid_scaled(eff_step, eff_total, 10.0, start_p, end_p) }
+    return ss_linear_decay(eff_step, eff_total, start_p, end_p)
+}
+
+fn ss_per_token_decisions(prob, seq_len, seed, step) {
+    let mut decisions = ss_zeros_int(seq_len)
+    for i in 0..seq_len {
+        let r = ss_hash_float(seed + step * 997, i)
+        if r < prob {
+            decisions[i] = 1
+        }
+    }
+    return decisions
+}
+
+fn ss_mixed_forward(teacher_seq, model_out, decisions) {
+    let n = len(teacher_seq)
+    let mut mixed = ss_zeros_int(n)
+    for i in 0..n {
+        if decisions[i] == 1 {
+            mixed[i] = teacher_seq[i]
+        } else {
+            mixed[i] = model_out[i]
+        }
+    }
+    return mixed
+}
+
+fn ss_free_running_forward(logits_fn, start_token, n_tokens) {
+    let mut tokens = [start_token]
+    let mut prev = start_token
+    for _t in 0..n_tokens {
+        let logits = logits_fn(prev)
+        let next = ss_argmax(logits)
+        tokens = tokens + [next]
+        prev = next
+    }
+    return tokens
+}
+
+fn ss_teacher_forward(teacher_seq) {
+    let n = len(teacher_seq)
+    let mut out = ss_zeros_int(n)
+    for i in 0..n {
+        out[i] = teacher_seq[i]
+    }
+    return out
+}
+
+fn ss_train_step(teacher_seq, logits_fn, step, total_steps, cfg, seed) {
+    let prob = ss_schedule(step, total_steps, cfg)
+    let seq_len = len(teacher_seq)
+    let start_tok = teacher_seq[0]
+    let model_tokens = ss_free_running_forward(logits_fn, start_tok, seq_len - 1)
+    let decisions = ss_per_token_decisions(prob, seq_len, seed, step)
+    let mixed = ss_mixed_forward(teacher_seq, model_tokens, decisions)
+    let mut n_teacher = 0
+    let mut n_free = 0
+    for i in 0..seq_len {
+        if decisions[i] == 1 {
+            n_teacher = n_teacher + 1
+        } else {
+            n_free = n_free + 1
+        }
+    }
+    return #{
+        "prob": prob,
+        "mixed_seq": mixed,
+        "model_seq": model_tokens,
+        "decisions": decisions,
+        "n_teacher": n_teacher,
+        "n_free": n_free
+    }
+}
+
+fn ss_eval_step(logits_fn, start_token, n_tokens) {
+    return ss_free_running_forward(logits_fn, start_token, n_tokens)
+}
+
+fn ss_error_accum(teacher_seq, predicted_seq) {
+    let n = ss_min(len(teacher_seq), len(predicted_seq))
+    let mut mismatches = 0
+    let mut cumulative = ss_zeros(n)
+    let mut running = 0.0
+    for i in 0..n {
+        if teacher_seq[i] != predicted_seq[i] {
+            mismatches = mismatches + 1
+            running = running + 1.0
+        }
+        cumulative[i] = running
+    }
+    let error_rate = to_float(mismatches) / to_float(ss_max(n, 1))
+    return #{
+        "mismatches": mismatches,
+        "total": n,
+        "error_rate": error_rate,
+        "cumulative_errors": cumulative
+    }
+}
+
+fn ss_curriculum_schedule(step, total_steps, competence, cfg) {
+    let base_prob = ss_schedule(step, total_steps, cfg)
+    let alpha = 0.5
+    let adjusted = base_prob * (1.0 - alpha * ss_clamp(competence, 0.0, 1.0))
+    return ss_clamp(adjusted, 0.0, 1.0)
+}
+
+fn ss_curriculum_train_step(teacher_seq, logits_fn, step, total_steps, cfg, competence, seed) {
+    let prob = ss_curriculum_schedule(step, total_steps, competence, cfg)
+    let seq_len = len(teacher_seq)
+    let start_tok = teacher_seq[0]
+    let model_tokens = ss_free_running_forward(logits_fn, start_tok, seq_len - 1)
+    let decisions = ss_per_token_decisions(prob, seq_len, seed, step)
+    let mixed = ss_mixed_forward(teacher_seq, model_tokens, decisions)
+    let mut n_teacher = 0
+    let mut n_free = 0
+    for i in 0..seq_len {
+        if decisions[i] == 1 {
+            n_teacher = n_teacher + 1
+        } else {
+            n_free = n_free + 1
+        }
+    }
+    return #{
+        "prob": prob,
+        "mixed_seq": mixed,
+        "model_seq": model_tokens,
+        "n_teacher": n_teacher,
+        "n_free": n_free,
+        "competence": competence
+    }
+}
+
+fn ss_token_errors(teacher_seq, predicted_seq) {
+    let n = ss_min(len(teacher_seq), len(predicted_seq))
+    let mut errors = ss_zeros_int(n)
+    let mut first_err = -1
+    for i in 0..n {
+        if teacher_seq[i] != predicted_seq[i] {
+            errors[i] = 1
+            if first_err == -1 { first_err = i }
+        }
+    }
+    return #{ "errors": errors, "first_error_pos": first_err }
+}
+
+fn ss_error_propagation(teacher_seq, predicted_seq) {
+    let n = ss_min(len(teacher_seq), len(predicted_seq))
+    let mut first_err = -1
+    for i in 0..n {
+        if teacher_seq[i] != predicted_seq[i] {
+            first_err = i
+            break
+        }
+    }
+    if first_err == -1 { return 0.0 }
+    let remaining = n - first_err
+    if remaining <= 0 { return 0.0 }
+    let mut wrong = 0
+    for i in first_err..n {
+        if teacher_seq[i] != predicted_seq[i] {
+            wrong = wrong + 1
+        }
+    }
+    return to_float(wrong) / to_float(remaining)
+}
+
+fn ss_compare_schedules(step, total_steps, start_prob, end_prob) {
+    let lin = ss_linear_decay(step, total_steps, start_prob, end_prob)
+    let exp_p = ss_exp_decay(step, total_steps, start_prob, end_prob)
+    let sig = ss_inv_sigmoid_scaled(step, total_steps, 10.0, start_prob, end_prob)
+    return [lin, exp_p, sig]
+}
+
+fn ss_batch_train(teacher_batch, logits_fn, step, total_steps, cfg, seed) {
+    let batch_size = len(teacher_batch)
+    let mut results = []
+    for b in 0..batch_size {
+        let teacher_seq = teacher_batch[b]
+        let result = ss_train_step(teacher_seq, logits_fn, step, total_steps, cfg, seed + b)
+        results = results + [result]
+    }
+    return results
+}
+
+// ── mock logits function ────────────────────────────────────
+let VOCAB = 10
+
+fn mock_logits(prev) {
+    let mut logits = ss_zeros(VOCAB)
+    for i in 0..VOCAB {
+        let mut h = (prev + 1) * 31 + i * 17
+        h = h % 100
+        logits[i] = to_float(h) / 100.0
+    }
+    return logits
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  TESTS
+// ═══════════════════════════════════════════════════════════════
+
+println("=== Scheduled Sampling Tests (SSOT #169) ===")
+
+// ── T1: linear decay at step 0 = start_prob ─────────────────
+let ld0 = ss_linear_decay(0, 100, 1.0, 0.0)
+check("T1 linear decay step=0 -> start_prob", approx(ld0, 1.0, 0.01))
+
+// ── T2: linear decay at total = end_prob ─────────────────────
+let ld_end = ss_linear_decay(100, 100, 1.0, 0.0)
+check("T2 linear decay step=total -> end_prob", approx(ld_end, 0.0, 0.01))
+
+// ── T3: linear decay midpoint ────────────────────────────────
+let ld_mid = ss_linear_decay(50, 100, 1.0, 0.0)
+check("T3 linear decay midpoint=0.5", approx(ld_mid, 0.5, 0.01))
+
+// ── T4: exp decay at step 0 = start_prob ─────────────────────
+let ed0 = ss_exp_decay(0, 100, 1.0, 0.0)
+check("T4 exp decay step=0 -> start_prob", approx(ed0, 1.0, 0.01))
+
+// ── T5: exp decay at total near end_prob ─────────────────────
+let ed_end = ss_exp_decay(100, 100, 1.0, 0.0)
+check("T5 exp decay step=total near end_prob", ed_end < 0.05)
+
+// ── T6: exp decay monotonically decreasing ───────────────────
+let ed_25 = ss_exp_decay(25, 100, 1.0, 0.0)
+let ed_75 = ss_exp_decay(75, 100, 1.0, 0.0)
+check("T6 exp decay monotonic: p(25) > p(75)", ed_25 > ed_75)
+
+// ── T7: inv sigmoid at step 0 near 1.0 ──────────────────────
+let is0 = ss_inv_sigmoid(0, 100, 10.0)
+check("T7 inv sigmoid step=0 near 1.0", is0 > 0.9)
+
+// ── T8: inv sigmoid at total near 0.0 ───────────────────────
+let is_end = ss_inv_sigmoid(100, 100, 10.0)
+check("T8 inv sigmoid step=total near 0.0", is_end < 0.1)
+
+// ── T9: inv sigmoid S-shape: mid transition ──────────────────
+let is_mid = ss_inv_sigmoid(50, 100, 10.0)
+check("T9 inv sigmoid midpoint ~0.5", approx(is_mid, 0.5, 0.1))
+
+// ── T10: schedule config creation ────────────────────────────
+let cfg_lin = ss_make_config(1.0, 0.1, 10, 0)
+check("T10 config start_prob", approx(cfg_lin["start_prob"], 1.0, 0.01))
+check("T10b config end_prob", approx(cfg_lin["end_prob"], 0.1, 0.01))
+check("T10c config warmup", cfg_lin["warmup_steps"] == 10)
+check("T10d config decay_type", cfg_lin["decay_type"] == 0)
+
+// ── T11: schedule dispatch linear ────────────────────────────
+let cfg_l = ss_make_config(1.0, 0.0, 0, 0)
+let s_lin = ss_schedule(50, 100, cfg_l)
+check("T11 schedule linear at 50%", approx(s_lin, 0.5, 0.01))
+
+// ── T12: schedule dispatch exponential ───────────────────────
+let cfg_e = ss_make_config(1.0, 0.0, 0, 1)
+let s_exp_start = ss_schedule(0, 100, cfg_e)
+let s_exp_end = ss_schedule(100, 100, cfg_e)
+check("T12 schedule exp start=1.0", approx(s_exp_start, 1.0, 0.01))
+check("T12b schedule exp end near 0", s_exp_end < 0.05)
+
+// ── T13: schedule dispatch inverse sigmoid ───────────────────
+let cfg_s = ss_make_config(1.0, 0.0, 0, 2)
+let s_sig_start = ss_schedule(0, 100, cfg_s)
+let s_sig_end = ss_schedule(100, 100, cfg_s)
+check("T13 schedule inv_sig start near 1.0", s_sig_start > 0.9)
+check("T13b schedule inv_sig end near 0.0", s_sig_end < 0.1)
+
+// ── T14: warmup holds start_prob ─────────────────────────────
+let cfg_w = ss_make_config(0.9, 0.1, 20, 0)
+let w5 = ss_schedule(5, 100, cfg_w)
+let w15 = ss_schedule(15, 100, cfg_w)
+check("T14 warmup step=5 holds start_prob", approx(w5, 0.9, 0.01))
+check("T14b warmup step=15 holds start_prob", approx(w15, 0.9, 0.01))
+// After warmup, should start decaying
+let w50 = ss_schedule(50, 100, cfg_w)
+check("T14c after warmup decays", w50 < 0.9)
+
+// ── T15: per-token decisions array length ────────────────────
+let dec = ss_per_token_decisions(0.5, 20, 42, 0)
+check("T15 decisions length=20", len(dec) == 20)
+
+// ── T16: per-token all teacher at prob=1.0 ───────────────────
+let dec_all_teacher = ss_per_token_decisions(1.0, 10, 42, 0)
+let mut all_ones = true
+for i in 0..10 {
+    if dec_all_teacher[i] != 1 { all_ones = false }
+}
+check("T16 prob=1.0 -> all teacher", all_ones)
+
+// ── T17: per-token all free at prob=0.0 ──────────────────────
+let dec_all_free = ss_per_token_decisions(0.0, 10, 42, 0)
+let mut all_zeros = true
+for i in 0..10 {
+    if dec_all_free[i] != 0 { all_zeros = false }
+}
+check("T17 prob=0.0 -> all free", all_zeros)
+
+// ── T18: mixed forward uses teacher where decision=1 ─────────
+let teacher = [10, 20, 30, 40, 50]
+let model_o = [11, 21, 31, 41, 51]
+let mix_dec = [1, 0, 1, 0, 1]
+let mixed = ss_mixed_forward(teacher, model_o, mix_dec)
+check("T18 mixed[0]=teacher", mixed[0] == 10)
+check("T18b mixed[1]=model", mixed[1] == 21)
+check("T18c mixed[2]=teacher", mixed[2] == 30)
+
+// ── T19: mixed forward uses model where decision=0 ──────────
+check("T19 mixed[3]=model", mixed[3] == 41)
+check("T19b mixed[4]=teacher", mixed[4] == 50)
+
+// ── T20: free-running forward length ─────────────────────────
+let fr = ss_free_running_forward(mock_logits, 0, 15)
+check("T20 free-running length=16", len(fr) == 16)
+
+// ── T21: free-running is deterministic ───────────────────────
+let fr2 = ss_free_running_forward(mock_logits, 0, 15)
+let mut fr_same = true
+for i in 0..len(fr) {
+    if fr[i] != fr2[i] { fr_same = false }
+}
+check("T21 free-running deterministic", fr_same)
+
+// ── T22: teacher forward identity ────────────────────────────
+let teacher_seq = [5, 10, 15, 20]
+let tf = ss_teacher_forward(teacher_seq)
+check("T22 teacher forward = identity", tf[0] == 5)
+check("T22b teacher forward last", tf[3] == 20)
+
+// ── T23: train step returns valid prob ───────────────────────
+let t_seq = [0, 1, 2, 3, 4, 5, 6, 7]
+let cfg_tr = ss_make_config(1.0, 0.0, 0, 0)
+let ts = ss_train_step(t_seq, mock_logits, 50, 100, cfg_tr, 42)
+let ts_prob = ts["prob"]
+check("T23 train step prob in [0,1]", ts_prob >= 0.0)
+check("T23b train step prob <= 1", ts_prob <= 1.0)
+
+// ── T24: train step n_teacher + n_free = seq_len ─────────────
+let n_t = ts["n_teacher"]
+let n_f = ts["n_free"]
+check("T24 n_teacher + n_free = seq_len", n_t + n_f == len(t_seq))
+
+// ── T25: eval step fully free-running ────────────────────────
+let eval_out = ss_eval_step(mock_logits, 0, 10)
+check("T25 eval step length=11", len(eval_out) == 11)
+// Eval should match free-running exactly
+let fr_check = ss_free_running_forward(mock_logits, 0, 10)
+let mut eval_matches = true
+for i in 0..11 {
+    if eval_out[i] != fr_check[i] { eval_matches = false }
+}
+check("T25b eval = free-running", eval_matches)
+
+// ── T26: error accumulation perfect match = 0 ───────────────
+let err_perfect = ss_error_accum([1, 2, 3], [1, 2, 3])
+check("T26 perfect match mismatches=0", err_perfect["mismatches"] == 0)
+check("T26b perfect match error_rate=0", approx(err_perfect["error_rate"], 0.0, 0.01))
+
+// ── T27: error accumulation total mismatch ───────────────────
+let err_total = ss_error_accum([1, 2, 3], [4, 5, 6])
+check("T27 total mismatch=3", err_total["mismatches"] == 3)
+check("T27b total error_rate=1.0", approx(err_total["error_rate"], 1.0, 0.01))
+
+// ── T28: error accumulation partial ──────────────────────────
+let err_partial = ss_error_accum([1, 2, 3, 4], [1, 2, 9, 4])
+check("T28 partial mismatch=1", err_partial["mismatches"] == 1)
+check("T28b partial error_rate=0.25", approx(err_partial["error_rate"], 0.25, 0.01))
+// Cumulative errors: [0, 0, 1, 1]
+let cum = err_partial["cumulative_errors"]
+check("T28c cumulative[2]=1.0", approx(cum[2], 1.0, 0.01))
+check("T28d cumulative[3]=1.0", approx(cum[3], 1.0, 0.01))
+
+// ── T29: curriculum integration lowers prob at high competence
+let cfg_cur = ss_make_config(1.0, 0.0, 0, 0)
+let p_no_cur = ss_schedule(50, 100, cfg_cur)
+let p_cur_high = ss_curriculum_schedule(50, 100, 0.8, cfg_cur)
+check("T29 curriculum high competence lowers prob", p_cur_high < p_no_cur)
+
+// ── T30: curriculum integration no change at competence=0 ────
+let p_cur_zero = ss_curriculum_schedule(50, 100, 0.0, cfg_cur)
+check("T30 curriculum competence=0 no change", approx(p_cur_zero, p_no_cur, 0.01))
+
+// ── T31: error propagation rate = 0 for perfect match ────────
+let prop_perfect = ss_error_propagation([1, 2, 3], [1, 2, 3])
+check("T31 error propagation perfect=0", approx(prop_perfect, 0.0, 0.01))
+
+// ── T32: token error first_error_pos correct ─────────────────
+let terr = ss_token_errors([1, 2, 3, 4], [1, 2, 9, 4])
+check("T32 first_error_pos=2", terr["first_error_pos"] == 2)
+let terr_ok = ss_token_errors([1, 2, 3], [1, 2, 3])
+check("T32b no error first_error_pos=-1", terr_ok["first_error_pos"] == -1)
+
+// ── T33: compare schedules returns 3 values ──────────────────
+let cmp = ss_compare_schedules(50, 100, 1.0, 0.0)
+check("T33 compare returns 3 values", len(cmp) == 3)
+check("T33b all in [0,1]", cmp[0] >= 0.0)
+check("T33c all in [0,1]", cmp[1] >= 0.0)
+check("T33d all in [0,1]", cmp[2] >= 0.0)
+
+// ── T34: schedule monotonically decreasing over training ─────
+let cfg_mono = ss_make_config(1.0, 0.0, 0, 0)
+let mut mono_ok = true
+let mut prev_p = 2.0
+for s in 0..11 {
+    let step = s * 10
+    let p = ss_schedule(step, 100, cfg_mono)
+    if p > prev_p + 0.001 { mono_ok = false }
+    prev_p = p
+}
+check("T34 linear schedule monotonically decreasing", mono_ok)
+
+// ── T35: batch train returns correct count ───────────────────
+let batch = [[0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 0, 1]]
+let cfg_b = ss_make_config(0.8, 0.2, 0, 0)
+let batch_results = ss_batch_train(batch, mock_logits, 10, 100, cfg_b, 42)
+check("T35 batch train count=3", len(batch_results) == 3)
+
+// ═══════════════════════════════════════════════════════════════
+println("")
+println("=== Scheduled Sampling (#169) test summary ===")
+println("PASS: " + str(pass_count))
+println("FAIL: " + str(fail_count))
+println("TOTAL: " + str(pass_count + fail_count))

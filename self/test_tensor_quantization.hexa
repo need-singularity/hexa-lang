@@ -1,0 +1,947 @@
+// ===================================================================
+//  test_tensor_quantization.hexa — Tensor Quantization tests (#179)
+//
+//  Tests (40):
+//    T1  tq_abs handles negatives
+//    T2  tq_abs handles positives
+//    T3  tq_max_f returns larger
+//    T4  tq_min_f returns smaller
+//    T5  tq_zeros returns array of zeros
+//    T6  tq_sqrt approximates square root
+//    T7  tq_round rounds to nearest
+//    T8  tq_qmax INT8 = 127
+//    T9  tq_qmax INT4 = 7
+//    T10 tq_qmax INT2 = 1
+//    T11 per-channel amax finds row max
+//    T12 per-channel scale produces rows scales
+//    T13 per-channel quantize stays in range
+//    T14 per-channel dequant recovers values
+//    T15 per-channel quantize uniform row
+//    T16 per-token scale produces row scales
+//    T17 per-token quantize stays in range
+//    T18 per-token dequant recovers values
+//    T19 column amax finds column max
+//    T20 smoothquant scales shape correct
+//    T21 smoothquant alpha=0.5 divides burden
+//    T22 smoothquant transform act divides columns
+//    T23 smoothquant transform weight multiplies rows
+//    T24 calibration init state
+//    T25 calibration observe updates running max
+//    T26 calibration observe multi-batch accumulates
+//    T27 calibration scales after observation
+//    T28 median of sorted values
+//    T29 median of unsorted values
+//    T30 mean of values
+//    T31 outlier detect flags outsized channels
+//    T32 outlier count reports number of outliers
+//    T33 mixed precision split separates normal/outlier
+//    T34 mixed precision reassemble round-trip
+//    T35 tensor norm sq computes sum of squares
+//    T36 MSE between identical tensors is 0
+//    T37 sensitivity score INT8 is small
+//    T38 sensitivity score INT2 is larger than INT8
+//    T39 mixed precision policy returns correct length
+//    T40 compression ratio 32/bits
+//    T41 accuracy loss sweep returns triples
+//    T42 accuracy loss sweep MSE ordered by bits
+//    T43 quantized matmul output shape correct
+//    T44 quantized matmul is close to FP matmul
+//    T45 outlier channel handling preserves outlier values
+//
+//  Run: PATH=/Users/ghost/.cargo/bin:$PATH ./hexa self/test_tensor_quantization.hexa
+// ===================================================================
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn approx(a, b, eps) {
+    return fabs(a - b) < eps
+}
+
+// ===================================================================
+//  Inlined from ml/tensor_quantization.hexa
+// ===================================================================
+
+@pure
+fn tq_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+@pure
+fn tq_max_f(a, b) {
+    if a > b { return a }
+    return b
+}
+
+@pure
+fn tq_min_f(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn tq_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn tq_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+@pure
+fn tq_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+@pure
+fn tq_floor(x) {
+    let i = to_int(x)
+    if to_float(i) > x { return to_float(i - 1) }
+    return to_float(i)
+}
+
+@pure
+fn tq_round(x) {
+    return tq_floor(x + 0.5)
+}
+
+@pure
+fn tq_log2(x) {
+    if x <= 0.0 { return -999.0 }
+    let ln2 = 0.6931471805599453
+    let mut v = x
+    let mut exp_part = 0
+    while v >= 2.0 {
+        v = v / 2.0
+        exp_part = exp_part + 1
+    }
+    while v < 1.0 {
+        v = v * 2.0
+        exp_part = exp_part - 1
+    }
+    let t = v - 1.0
+    let mut result = 0.0
+    let mut term = t
+    for i in 1..20 {
+        if i % 2 == 1 {
+            result = result + term / to_float(i)
+        } else {
+            result = result - term / to_float(i)
+        }
+        term = term * t
+    }
+    return to_float(exp_part) + result / ln2
+}
+
+@pure
+fn tq_pow2(x) {
+    let ln2 = 0.6931471805599453
+    let v = x * ln2
+    let mut clamped = v
+    if clamped > 30.0 { clamped = 30.0 }
+    if clamped < -30.0 { clamped = -30.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * clamped / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+@pure
+fn tq_qmax(bits) {
+    if bits == 8 { return 127.0 }
+    if bits == 4 { return 7.0 }
+    if bits == 2 { return 1.0 }
+    return tq_pow2(to_float(bits - 1)) - 1.0
+}
+
+@pure
+fn tq_channel_amax(tensor, rows, cols) {
+    let mut amaxes = tq_zeros(rows)
+    for r in 0..rows {
+        let mut mx = 0.0
+        for c in 0..cols {
+            let a = tq_abs(tensor[r * cols + c])
+            if a > mx { mx = a }
+        }
+        amaxes[r] = mx
+    }
+    return amaxes
+}
+
+@pure
+fn tq_per_channel_scale(tensor, rows, cols, bits) {
+    let amaxes = tq_channel_amax(tensor, rows, cols)
+    let qm = tq_qmax(bits)
+    let mut scales = tq_zeros(rows)
+    for r in 0..rows {
+        if amaxes[r] > 0.0 {
+            scales[r] = qm / amaxes[r]
+        } else {
+            scales[r] = 1.0
+        }
+    }
+    return scales
+}
+
+@pure
+fn tq_per_channel_quantize(tensor, rows, cols, scales, bits) {
+    let total = rows * cols
+    let mut out = tq_zeros(total)
+    let qm = tq_qmax(bits)
+    for r in 0..rows {
+        for c in 0..cols {
+            let idx = r * cols + c
+            let val = tq_round(tensor[idx] * scales[r])
+            let mut clamped = val
+            if clamped > qm { clamped = qm }
+            if clamped < 0.0 - qm { clamped = 0.0 - qm }
+            out[idx] = clamped
+        }
+    }
+    return out
+}
+
+@pure
+fn tq_per_channel_dequantize(qtensor, rows, cols, scales, bits) {
+    let total = rows * cols
+    let mut out = tq_zeros(total)
+    for r in 0..rows {
+        for c in 0..cols {
+            let idx = r * cols + c
+            if scales[r] != 0.0 {
+                out[idx] = qtensor[idx] / scales[r]
+            } else {
+                out[idx] = 0.0
+            }
+        }
+    }
+    return out
+}
+
+@pure
+fn tq_per_token_scale(tensor, rows, cols, bits) {
+    let mut scales = tq_zeros(rows)
+    let qm = tq_qmax(bits)
+    for r in 0..rows {
+        let mut mx = 0.0
+        for c in 0..cols {
+            let a = tq_abs(tensor[r * cols + c])
+            if a > mx { mx = a }
+        }
+        if mx > 0.0 {
+            scales[r] = qm / mx
+        } else {
+            scales[r] = 1.0
+        }
+    }
+    return scales
+}
+
+@pure
+fn tq_per_token_quantize(tensor, rows, cols, scales, bits) {
+    let total = rows * cols
+    let mut out = tq_zeros(total)
+    let qm = tq_qmax(bits)
+    for r in 0..rows {
+        for c in 0..cols {
+            let idx = r * cols + c
+            let val = tq_round(tensor[idx] * scales[r])
+            let mut clamped = val
+            if clamped > qm { clamped = qm }
+            if clamped < 0.0 - qm { clamped = 0.0 - qm }
+            out[idx] = clamped
+        }
+    }
+    return out
+}
+
+@pure
+fn tq_per_token_dequantize(qtensor, rows, cols, scales, bits) {
+    let total = rows * cols
+    let mut out = tq_zeros(total)
+    for r in 0..rows {
+        for c in 0..cols {
+            let idx = r * cols + c
+            if scales[r] != 0.0 {
+                out[idx] = qtensor[idx] / scales[r]
+            } else {
+                out[idx] = 0.0
+            }
+        }
+    }
+    return out
+}
+
+@pure
+fn tq_column_amax(tensor, rows, cols) {
+    let mut amaxes = tq_zeros(cols)
+    for c in 0..cols {
+        let mut mx = 0.0
+        for r in 0..rows {
+            let a = tq_abs(tensor[r * cols + c])
+            if a > mx { mx = a }
+        }
+        amaxes[c] = mx
+    }
+    return amaxes
+}
+
+@pure
+fn tq_smoothquant_scales(act_col_max, w_col_max, cols, alpha) {
+    let mut s = tq_zeros(cols)
+    for j in 0..cols {
+        let a_max = tq_max_f(act_col_max[j], 1.0e-12)
+        let w_max = tq_max_f(w_col_max[j], 1.0e-12)
+        let log_a = tq_log2(a_max)
+        let log_w = tq_log2(w_max)
+        let log_s = alpha * log_a - (1.0 - alpha) * log_w
+        s[j] = tq_pow2(log_s)
+    }
+    return s
+}
+
+@pure
+fn tq_smoothquant_transform_act(act, rows, cols, s) {
+    let total = rows * cols
+    let mut out = tq_zeros(total)
+    for r in 0..rows {
+        for c in 0..cols {
+            let idx = r * cols + c
+            if s[c] > 0.0 {
+                out[idx] = act[idx] / s[c]
+            } else {
+                out[idx] = act[idx]
+            }
+        }
+    }
+    return out
+}
+
+@pure
+fn tq_smoothquant_transform_w(weight, rows, cols, s) {
+    let total = rows * cols
+    let mut out = tq_zeros(total)
+    for r in 0..rows {
+        for c in 0..cols {
+            let idx = r * cols + c
+            out[idx] = weight[idx] * s[r]
+        }
+    }
+    return out
+}
+
+fn tq_calibration_init(n_channels) {
+    let running_max = tq_zeros(n_channels)
+    return [running_max, 0]
+}
+
+fn tq_calibration_observe(state, tensor, rows, cols) {
+    let running_max = state[0]
+    let count = state[1]
+    let mut new_max = tq_zeros(cols)
+    for c in 0..cols {
+        new_max[c] = running_max[c]
+    }
+    for r in 0..rows {
+        for c in 0..cols {
+            let a = tq_abs(tensor[r * cols + c])
+            if a > new_max[c] { new_max[c] = a }
+        }
+    }
+    return [new_max, count + 1]
+}
+
+@pure
+fn tq_calibration_scales(state, bits) {
+    let running_max = state[0]
+    let n = len(running_max)
+    let qm = tq_qmax(bits)
+    let mut scales = tq_zeros(n)
+    for i in 0..n {
+        if running_max[i] > 0.0 {
+            scales[i] = qm / running_max[i]
+        } else {
+            scales[i] = 1.0
+        }
+    }
+    return scales
+}
+
+@pure
+fn tq_median(values) {
+    let n = len(values)
+    if n == 0 { return 0.0 }
+    let mut sorted = tq_zeros(n)
+    for i in 0..n { sorted[i] = values[i] }
+    for i in 0..n {
+        for j in 0..(n - 1) {
+            if sorted[j] > sorted[j + 1] {
+                let tmp = sorted[j]
+                sorted[j] = sorted[j + 1]
+                sorted[j + 1] = tmp
+            }
+        }
+    }
+    return sorted[n / 2]
+}
+
+@pure
+fn tq_mean(values) {
+    let n = len(values)
+    if n == 0 { return 0.0 }
+    let mut s = 0.0
+    for i in 0..n { s = s + values[i] }
+    return s / to_float(n)
+}
+
+@pure
+fn tq_outlier_detect(channel_maxes, threshold) {
+    let n = len(channel_maxes)
+    let med = tq_median(channel_maxes)
+    let cutoff = med * threshold
+    let mut mask = tq_zeros_int(n)
+    for i in 0..n {
+        if channel_maxes[i] > cutoff {
+            mask[i] = 1
+        } else {
+            mask[i] = 0
+        }
+    }
+    return mask
+}
+
+@pure
+fn tq_outlier_count(mask) {
+    let n = len(mask)
+    let mut cnt = 0
+    for i in 0..n {
+        if mask[i] == 1 { cnt = cnt + 1 }
+    }
+    return cnt
+}
+
+@pure
+fn tq_mixed_precision_split(tensor, rows, cols, outlier_mask) {
+    let total = rows * cols
+    let mut normal = tq_zeros(total)
+    let mut outlier = tq_zeros(total)
+    for r in 0..rows {
+        for c in 0..cols {
+            let idx = r * cols + c
+            if outlier_mask[c] == 1 {
+                outlier[idx] = tensor[idx]
+                normal[idx] = 0.0
+            } else {
+                normal[idx] = tensor[idx]
+                outlier[idx] = 0.0
+            }
+        }
+    }
+    return [normal, outlier]
+}
+
+@pure
+fn tq_mixed_precision_reassemble(normal, outlier, rows, cols, outlier_mask) {
+    let total = rows * cols
+    let mut out = tq_zeros(total)
+    for r in 0..rows {
+        for c in 0..cols {
+            let idx = r * cols + c
+            if outlier_mask[c] == 1 {
+                out[idx] = outlier[idx]
+            } else {
+                out[idx] = normal[idx]
+            }
+        }
+    }
+    return out
+}
+
+@pure
+fn tq_tensor_norm_sq(tensor) {
+    let n = len(tensor)
+    let mut s = 0.0
+    for i in 0..n { s = s + tensor[i] * tensor[i] }
+    return s
+}
+
+@pure
+fn tq_mse(original, reconstructed) {
+    let n = len(original)
+    if n == 0 { return 0.0 }
+    let mut s = 0.0
+    for i in 0..n {
+        let d = original[i] - reconstructed[i]
+        s = s + d * d
+    }
+    return s / to_float(n)
+}
+
+@pure
+fn tq_sensitivity_score(tensor, rows, cols, bits) {
+    let scales = tq_per_channel_scale(tensor, rows, cols, bits)
+    let qt = tq_per_channel_quantize(tensor, rows, cols, scales, bits)
+    let recon = tq_per_channel_dequantize(qt, rows, cols, scales, bits)
+    let mse = tq_mse(tensor, recon)
+    let norm_sq = tq_tensor_norm_sq(tensor)
+    if norm_sq <= 0.0 { return 0.0 }
+    return mse / (norm_sq / to_float(rows * cols))
+}
+
+@pure
+fn tq_mixed_precision_policy(sensitivities, bit_options, budget) {
+    let n_layers = len(sensitivities)
+    let n_opts = len(bit_options)
+    let mut assignments = tq_zeros_int(n_layers)
+    for i in 0..n_layers { assignments[i] = bit_options[0] }
+
+    let total_budget = budget * n_layers
+    let mut used = bit_options[0] * n_layers
+
+    let mut indices = tq_zeros_int(n_layers)
+    for i in 0..n_layers { indices[i] = i }
+    for i in 0..n_layers {
+        for j in 0..(n_layers - 1) {
+            if sensitivities[indices[j]] < sensitivities[indices[j + 1]] {
+                let tmp = indices[j]
+                indices[j] = indices[j + 1]
+                indices[j + 1] = tmp
+            }
+        }
+    }
+
+    for oi in 1..n_opts {
+        let target_bits = bit_options[oi]
+        for si in 0..n_layers {
+            let li = indices[si]
+            if assignments[li] < target_bits {
+                let cost = target_bits - assignments[li]
+                if used + cost <= total_budget {
+                    assignments[li] = target_bits
+                    used = used + cost
+                }
+            }
+        }
+    }
+    return assignments
+}
+
+@pure
+fn tq_compression_ratio(bits) {
+    return 32.0 / to_float(bits)
+}
+
+@pure
+fn tq_accuracy_loss_sweep(tensor, rows, cols, bit_list) {
+    let n_bits = len(bit_list)
+    let mut results = []
+    for bi in 0..n_bits {
+        let bits = bit_list[bi]
+        let scales = tq_per_channel_scale(tensor, rows, cols, bits)
+        let qt = tq_per_channel_quantize(tensor, rows, cols, scales, bits)
+        let recon = tq_per_channel_dequantize(qt, rows, cols, scales, bits)
+        let mse = tq_mse(tensor, recon)
+        let ratio = tq_compression_ratio(bits)
+        results = results + [[bits, mse, ratio]]
+    }
+    return results
+}
+
+fn tq_quantized_matmul(a, b, m, k, n, bits) {
+    let a_scales = tq_per_token_scale(a, m, k, bits)
+    let a_q = tq_per_token_quantize(a, m, k, a_scales, bits)
+
+    let b_scales = tq_per_channel_scale(b, k, n, bits)
+    let b_q = tq_per_channel_quantize(b, k, n, b_scales, bits)
+
+    let out_size = m * n
+    let mut c = tq_zeros(out_size)
+    for i in 0..m {
+        for j in 0..n {
+            let mut acc = 0.0
+            for p in 0..k {
+                let av = a_q[i * k + p] / a_scales[i]
+                let bv = b_q[p * n + j] / b_scales[p]
+                acc = acc + av * bv
+            }
+            c[i * n + j] = acc
+        }
+    }
+    return c
+}
+
+// ===================================================================
+//  Helpers
+// ===================================================================
+
+fn fp_matmul(a, b, m, k, n) {
+    let out_size = m * n
+    let mut c = tq_zeros(out_size)
+    for i in 0..m {
+        for j in 0..n {
+            let mut acc = 0.0
+            for p in 0..k {
+                acc = acc + a[i * k + p] * b[p * n + j]
+            }
+            c[i * n + j] = acc
+        }
+    }
+    return c
+}
+
+// ===================================================================
+//  TESTS
+// ===================================================================
+
+// T1: tq_abs handles negatives
+check("T1 tq_abs(-3.5) = 3.5", approx(tq_abs(-3.5), 3.5, 1.0e-9))
+
+// T2: tq_abs handles positives
+check("T2 tq_abs(2.25) = 2.25", approx(tq_abs(2.25), 2.25, 1.0e-9))
+
+// T3: tq_max_f returns larger
+check("T3 tq_max_f picks larger", approx(tq_max_f(1.5, 2.5), 2.5, 1.0e-9))
+
+// T4: tq_min_f returns smaller
+check("T4 tq_min_f picks smaller", approx(tq_min_f(1.5, 2.5), 1.5, 1.0e-9))
+
+// T5: tq_zeros returns array of zeros
+let z5 = tq_zeros(5)
+let mut all_zero5 = true
+for i in 0..5 {
+    if fabs(z5[i]) > 1.0e-12 { all_zero5 = false }
+}
+check("T5 tq_zeros(5) all zero", all_zero5 && len(z5) == 5)
+
+// T6: tq_sqrt approximates square root
+check("T6 tq_sqrt(16) = 4", approx(tq_sqrt(16.0), 4.0, 1.0e-4))
+
+// T7: tq_round rounds to nearest
+check("T7a tq_round(1.6) = 2", approx(tq_round(1.6), 2.0, 1.0e-9))
+check("T7b tq_round(1.3) = 1", approx(tq_round(1.3), 1.0, 1.0e-9))
+
+// T8: tq_qmax INT8 = 127
+check("T8 tq_qmax(8) = 127", approx(tq_qmax(8), 127.0, 1.0e-6))
+
+// T9: tq_qmax INT4 = 7
+check("T9 tq_qmax(4) = 7", approx(tq_qmax(4), 7.0, 1.0e-6))
+
+// T10: tq_qmax INT2 = 1
+check("T10 tq_qmax(2) = 1", approx(tq_qmax(2), 1.0, 1.0e-6))
+
+// Shared test tensor: 3 rows x 4 cols with varying per-row magnitudes
+// Row 0: small (~0.1), Row 1: medium (~1.0), Row 2: large (~10.0)
+let tensor_3x4 = [
+    0.1,  -0.05,  0.08,  -0.02,
+    0.5,   1.0,  -0.75,   0.25,
+    8.0,  -5.0,  10.0,   -3.0
+]
+
+// T11: per-channel amax finds row max
+let amax_rows = tq_channel_amax(tensor_3x4, 3, 4)
+check("T11a row 0 amax ~ 0.1", approx(amax_rows[0], 0.1, 1.0e-6))
+check("T11b row 1 amax ~ 1.0", approx(amax_rows[1], 1.0, 1.0e-6))
+check("T11c row 2 amax ~ 10.0", approx(amax_rows[2], 10.0, 1.0e-6))
+
+// T12: per-channel scale produces row scales
+let pc_scales8 = tq_per_channel_scale(tensor_3x4, 3, 4, 8)
+check("T12a per-channel scale length = 3", len(pc_scales8) == 3)
+// row 2: 127 / 10.0 = 12.7
+check("T12b row 2 scale = 127/10", approx(pc_scales8[2], 12.7, 1.0e-6))
+
+// T13: per-channel quantize stays in range
+let q_pc8 = tq_per_channel_quantize(tensor_3x4, 3, 4, pc_scales8, 8)
+let mut in_range_13 = true
+for i in 0..12 {
+    if q_pc8[i] > 127.0 { in_range_13 = false }
+    if q_pc8[i] < -127.0 { in_range_13 = false }
+}
+check("T13 per-channel INT8 values in [-127,127]", in_range_13)
+
+// T14: per-channel dequant recovers values closely at INT8
+let deq_pc8 = tq_per_channel_dequantize(q_pc8, 3, 4, pc_scales8, 8)
+let mut max_err_14 = 0.0
+for i in 0..12 {
+    let e = fabs(tensor_3x4[i] - deq_pc8[i])
+    if e > max_err_14 { max_err_14 = e }
+}
+check("T14 per-channel INT8 roundtrip error tiny", max_err_14 < 0.1)
+
+// T15: per-channel quantize of uniform row handles zero amax
+let uniform_tensor = [0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]
+let uniform_scales = tq_per_channel_scale(uniform_tensor, 2, 4, 8)
+check("T15 uniform-zero row gets scale=1", approx(uniform_scales[0], 1.0, 1.0e-9))
+
+// T16: per-token scale produces row scales
+let pt_scales8 = tq_per_token_scale(tensor_3x4, 3, 4, 8)
+check("T16a per-token scale length = 3", len(pt_scales8) == 3)
+// row 2: 127 / 10.0 = 12.7
+check("T16b row 2 token scale = 127/10", approx(pt_scales8[2], 12.7, 1.0e-6))
+
+// T17: per-token quantize stays in range
+let q_pt8 = tq_per_token_quantize(tensor_3x4, 3, 4, pt_scales8, 8)
+let mut in_range_17 = true
+for i in 0..12 {
+    if q_pt8[i] > 127.0 { in_range_17 = false }
+    if q_pt8[i] < -127.0 { in_range_17 = false }
+}
+check("T17 per-token INT8 values in [-127,127]", in_range_17)
+
+// T18: per-token dequant recovers values closely
+let deq_pt8 = tq_per_token_dequantize(q_pt8, 3, 4, pt_scales8, 8)
+let mut max_err_18 = 0.0
+for i in 0..12 {
+    let e = fabs(tensor_3x4[i] - deq_pt8[i])
+    if e > max_err_18 { max_err_18 = e }
+}
+check("T18 per-token INT8 roundtrip error tiny", max_err_18 < 0.1)
+
+// T19: column amax finds column max
+// tensor_3x4 columns: col0 = [0.1, 0.5, 8.0] -> 8.0
+//                     col1 = [0.05, 1.0, 5.0] -> 5.0
+//                     col2 = [0.08, 0.75, 10.0] -> 10.0
+//                     col3 = [0.02, 0.25, 3.0] -> 3.0
+let col_amax = tq_column_amax(tensor_3x4, 3, 4)
+check("T19a col 0 amax = 8.0", approx(col_amax[0], 8.0, 1.0e-6))
+check("T19b col 1 amax = 5.0", approx(col_amax[1], 5.0, 1.0e-6))
+check("T19c col 2 amax = 10.0", approx(col_amax[2], 10.0, 1.0e-6))
+check("T19d col 3 amax = 3.0", approx(col_amax[3], 3.0, 1.0e-6))
+
+// T20: smoothquant scales shape correct
+let act_col = [10.0, 1.0, 1.0, 1.0]   // outliers in col 0
+let w_col = [1.0, 1.0, 1.0, 1.0]
+let sq_s = tq_smoothquant_scales(act_col, w_col, 4, 0.5)
+check("T20 smoothquant scales length = 4", len(sq_s) == 4)
+
+// T21: smoothquant alpha=0.5 divides burden
+// s[0] = 10^0.5 / 1^0.5 = sqrt(10) ~ 3.162
+check("T21 smoothquant col 0 ~ sqrt(10)", approx(sq_s[0], 3.162, 0.05))
+
+// T22: smoothquant transform act divides columns
+// Activation 2x4 with column 0 large
+let act_tensor = [
+    10.0, 1.0, 1.0, 1.0,
+    10.0, 1.0, 1.0, 1.0
+]
+let act_smooth = tq_smoothquant_transform_act(act_tensor, 2, 4, sq_s)
+// After dividing col 0 by sq_s[0] (~3.162), 10/3.162 ~ 3.162
+check("T22a smoothquant act col 0 reduced", approx(act_smooth[0], 3.162, 0.05))
+check("T22b smoothquant act col 1 unchanged", approx(act_smooth[1], 1.0, 0.05))
+
+// T23: smoothquant transform weight multiplies rows
+// Weight 4x3: each row multiplied by sq_s[row]
+let w_tensor = [
+    1.0, 1.0, 1.0,
+    1.0, 1.0, 1.0,
+    1.0, 1.0, 1.0,
+    1.0, 1.0, 1.0
+]
+let w_smooth = tq_smoothquant_transform_w(w_tensor, 4, 3, sq_s)
+// Row 0 multiplied by sq_s[0] ~ 3.162
+check("T23a smoothquant w row 0 increased", approx(w_smooth[0], 3.162, 0.05))
+// Row 1 multiplied by sq_s[1] = 1.0
+check("T23b smoothquant w row 1 unchanged", approx(w_smooth[3], 1.0, 0.05))
+
+// T24: calibration init state
+let cal0 = tq_calibration_init(4)
+let cal0_max = cal0[0]
+check("T24a calibration init running_max length = 4", len(cal0_max) == 4)
+check("T24b calibration init count = 0", cal0[1] == 0)
+
+// T25: calibration observe updates running max
+let batch1 = [
+    1.0, 2.0, 3.0, 4.0,
+    0.5, 1.5, 2.5, 3.5
+]
+let cal1 = tq_calibration_observe(cal0, batch1, 2, 4)
+let cal1_max = cal1[0]
+check("T25a cal1 col 0 max = 1.0", approx(cal1_max[0], 1.0, 1.0e-6))
+check("T25b cal1 col 3 max = 4.0", approx(cal1_max[3], 4.0, 1.0e-6))
+check("T25c cal1 count = 1", cal1[1] == 1)
+
+// T26: calibration observe multi-batch accumulates
+let batch2 = [
+    5.0, 0.1, 0.1, 0.1,
+    0.1, 0.1, 0.1, 0.1
+]
+let cal2 = tq_calibration_observe(cal1, batch2, 2, 4)
+let cal2_max = cal2[0]
+check("T26a cal2 col 0 max = 5.0 (from batch2)", approx(cal2_max[0], 5.0, 1.0e-6))
+check("T26b cal2 col 3 max still 4.0 (from batch1)", approx(cal2_max[3], 4.0, 1.0e-6))
+check("T26c cal2 count = 2", cal2[1] == 2)
+
+// T27: calibration scales after observation
+let cal_scales = tq_calibration_scales(cal2, 8)
+// col 0: 127/5.0 = 25.4
+check("T27a cal scale col 0 = 127/5", approx(cal_scales[0], 25.4, 1.0e-4))
+// col 3: 127/4.0 = 31.75
+check("T27b cal scale col 3 = 127/4", approx(cal_scales[3], 31.75, 1.0e-4))
+
+// T28: median of sorted values
+let sorted_vals = [1.0, 2.0, 3.0, 4.0, 5.0]
+check("T28 median sorted = 3.0", approx(tq_median(sorted_vals), 3.0, 1.0e-9))
+
+// T29: median of unsorted values
+let unsorted_vals = [5.0, 1.0, 3.0, 2.0, 4.0]
+check("T29 median unsorted = 3.0", approx(tq_median(unsorted_vals), 3.0, 1.0e-9))
+
+// T30: mean of values
+let mean_vals = [1.0, 2.0, 3.0, 4.0]
+check("T30 mean = 2.5", approx(tq_mean(mean_vals), 2.5, 1.0e-9))
+
+// T31: outlier detect flags outsized channels
+// channel_maxes: [1.0, 1.0, 1.0, 1.0, 1.0, 10.0, 1.0]
+// median = 1.0, threshold * median = 3.0, so only the 10.0 entry is an outlier
+let ch_max_31 = [1.0, 1.0, 1.0, 1.0, 1.0, 10.0, 1.0]
+let mask_31 = tq_outlier_detect(ch_max_31, 3.0)
+check("T31a outlier mask index 5 flagged", mask_31[5] == 1)
+check("T31b outlier mask index 0 not flagged", mask_31[0] == 0)
+
+// T32: outlier count reports number of outliers
+check("T32 outlier count = 1", tq_outlier_count(mask_31) == 1)
+
+// T33: mixed precision split separates normal/outlier
+// 2 rows, 7 cols, with col 5 being outlier
+let tensor_2x7 = [
+    1.0, 1.0, 1.0, 1.0, 1.0, 100.0, 1.0,
+    1.0, 1.0, 1.0, 1.0, 1.0, 100.0, 1.0
+]
+let split_33 = tq_mixed_precision_split(tensor_2x7, 2, 7, mask_31)
+let normal_33 = split_33[0]
+let outlier_33 = split_33[1]
+check("T33a normal[5] = 0 (outlier moved out)", approx(normal_33[5], 0.0, 1.0e-9))
+check("T33b outlier[5] = 100", approx(outlier_33[5], 100.0, 1.0e-9))
+check("T33c normal[0] = 1 (non-outlier stays)", approx(normal_33[0], 1.0, 1.0e-9))
+check("T33d outlier[0] = 0", approx(outlier_33[0], 0.0, 1.0e-9))
+
+// T34: mixed precision reassemble round-trip
+let reasm_34 = tq_mixed_precision_reassemble(normal_33, outlier_33, 2, 7, mask_31)
+let mut reasm_ok = true
+for i in 0..14 {
+    if fabs(reasm_34[i] - tensor_2x7[i]) > 1.0e-6 { reasm_ok = false }
+}
+check("T34 reassemble recovers original tensor", reasm_ok)
+
+// T35: tensor norm sq computes sum of squares
+let norm_t = [3.0, 4.0]
+check("T35 norm_sq [3,4] = 25", approx(tq_tensor_norm_sq(norm_t), 25.0, 1.0e-9))
+
+// T36: MSE between identical tensors is 0
+let identical_a = [1.0, 2.0, 3.0]
+let identical_b = [1.0, 2.0, 3.0]
+check("T36 MSE identical = 0", approx(tq_mse(identical_a, identical_b), 0.0, 1.0e-12))
+
+// T37: sensitivity score INT8 is small
+let sens_t = [
+    0.5, -0.3, 0.8, 0.1,
+    -0.2, 1.0, -0.5, 0.3,
+    0.9, -0.1, 0.4, -0.7
+]
+let sens_int8 = tq_sensitivity_score(sens_t, 3, 4, 8)
+check("T37 sensitivity INT8 small", sens_int8 < 0.01)
+
+// T38: sensitivity score INT2 is larger than INT8
+let sens_int2 = tq_sensitivity_score(sens_t, 3, 4, 2)
+check("T38 sensitivity INT2 > INT8", sens_int2 > sens_int8)
+
+// T39: mixed precision policy returns correct length
+let sens_layers = [0.9, 0.1, 0.5, 0.2]
+let bit_opts = [2, 4, 8]
+let policy_39 = tq_mixed_precision_policy(sens_layers, bit_opts, 4)
+check("T39a policy length = 4", len(policy_39) == 4)
+// The most sensitive layer (index 0) should get the highest bits
+let high_bits_39 = policy_39[0]
+let low_bits_39 = policy_39[1]
+check("T39b most sensitive layer bits >= least sensitive", high_bits_39 >= low_bits_39)
+
+// T40: compression ratio 32/bits
+check("T40a compression INT8 = 4.0", approx(tq_compression_ratio(8), 4.0, 1.0e-9))
+check("T40b compression INT4 = 8.0", approx(tq_compression_ratio(4), 8.0, 1.0e-9))
+check("T40c compression INT2 = 16.0", approx(tq_compression_ratio(2), 16.0, 1.0e-9))
+
+// T41: accuracy loss sweep returns triples
+let sweep_bits = [2, 4, 8]
+let sweep_res = tq_accuracy_loss_sweep(sens_t, 3, 4, sweep_bits)
+check("T41a sweep result length = 3", len(sweep_res) == 3)
+check("T41b sweep first triple has 3 elements", len(sweep_res[0]) == 3)
+
+// T42: accuracy loss sweep MSE ordered by bits (more bits = lower MSE)
+let mse_at_2 = sweep_res[0][1]
+let mse_at_4 = sweep_res[1][1]
+let mse_at_8 = sweep_res[2][1]
+check("T42a MSE(INT4) <= MSE(INT2)", mse_at_4 <= mse_at_2)
+check("T42b MSE(INT8) <= MSE(INT4)", mse_at_8 <= mse_at_4)
+
+// T43: quantized matmul output shape correct
+let mm_a = [
+    1.0, 0.5, -0.5,
+    -0.25, 0.75, 1.0
+]
+let mm_b = [
+    0.5, 1.0,
+    -0.5, 0.25,
+    1.0, -0.75
+]
+let mm_out = tq_quantized_matmul(mm_a, mm_b, 2, 3, 2, 8)
+check("T43 quantized matmul output size = 4", len(mm_out) == 4)
+
+// T44: quantized matmul is close to FP matmul
+let mm_ref = fp_matmul(mm_a, mm_b, 2, 3, 2)
+let mut max_mm_err = 0.0
+for i in 0..4 {
+    let e = fabs(mm_out[i] - mm_ref[i])
+    if e > max_mm_err { max_mm_err = e }
+}
+check("T44 quantized matmul close to FP matmul", max_mm_err < 0.1)
+
+// T45: outlier channel handling preserves outlier values through split+reassemble
+// After splitting, if we only quantize the normal part and keep outlier FP,
+// the reassemble should still give outlier columns exactly.
+let outlier_cols_45 = [0, 0, 0, 0, 0, 1, 0]
+let split_45 = tq_mixed_precision_split(tensor_2x7, 2, 7, outlier_cols_45)
+let normal_45 = split_45[0]
+let outlier_45 = split_45[1]
+// Quantize the normal part at INT8 (values are all 1.0, so lossless)
+let ns45 = tq_per_channel_scale(normal_45, 2, 7, 8)
+let nq45 = tq_per_channel_quantize(normal_45, 2, 7, ns45, 8)
+let nd45 = tq_per_channel_dequantize(nq45, 2, 7, ns45, 8)
+let reasm_45 = tq_mixed_precision_reassemble(nd45, outlier_45, 2, 7, outlier_cols_45)
+// Outlier col should be exactly 100.0
+check("T45a outlier col preserved exactly", approx(reasm_45[5], 100.0, 1.0e-9))
+check("T45b normal col approx preserved", approx(reasm_45[0], 1.0, 0.05))
+
+// ===================================================================
+println("")
+println("=== tensor_quantization test summary ===")
+println("PASS: " + str(pass_count))
+println("FAIL: " + str(fail_count))
+println("TOTAL: " + str(pass_count + fail_count))

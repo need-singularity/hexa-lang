@@ -1,0 +1,729 @@
+// ===================================================================
+//  test_sparse_attention.hexa — Sparse Attention (#164)
+//
+//  Tests (35):
+//    T1  random mask shape correct
+//    T2  random mask causal (no future)
+//    T3  random mask self-attendance
+//    T4  random mask has extra random entries
+//    T5  window mask shape correct
+//    T6  window mask causal constraint
+//    T7  window mask respects window size
+//    T8  window mask first token attends only to self
+//    T9  global mask: global token full causal row
+//    T10 global mask: non-global attends to globals only
+//    T11 global mask: non-global no cross-attend
+//    T12 combined mask is superset of window mask
+//    T13 combined mask is superset of global mask
+//    T14 combined mask is superset of random mask
+//    T15 combined mask causal
+//    T16 block sparse mask shape
+//    T17 block sparse within-block attendance
+//    T18 block sparse no cross-block
+//    T19 block sparse causal
+//    T20 strided mask shape
+//    T21 strided mask self-attendance
+//    T22 strided mask hits stride positions
+//    T23 strided mask causal
+//    T24 sparse softmax output shape
+//    T25 sparse softmax output dim
+//    T26 sparse softmax with full mask equals full attention
+//    T27 sparse softmax with identity mask returns values
+//    T28 mask row count accuracy
+//    T29 mask total nonzero accuracy
+//    T30 sparsity ratio: full causal = 0
+//    T31 sparsity ratio: window < full causal
+//    T32 block sparse attention output shape
+//    T33 strided attention output shape
+//    T34 combined attention end-to-end output shape
+//    T35 random mask deterministic with same seed
+//
+//  Run: cargo run --release -- self/test_sparse_attention.hexa
+// ===================================================================
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn approx(a, b, eps) {
+    return fabs(a - b) < eps
+}
+
+// ── inlined helpers from sparse_attention.hexa ────────────────────
+
+fn sa_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn sa_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+fn sa_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn sa_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 { g = (g + x / g) / 2.0 }
+    return g
+}
+
+fn sa_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn sa_min_int(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn sa_max_int(a, b) {
+    if a > b { return a }
+    return b
+}
+
+@pure
+fn sa_lcg_next(seed, bound) {
+    let next_seed = (seed * 1103515245 + 12345) % 2147483647
+    let mut s = next_seed
+    if s < 0 { s = 0 - s }
+    let val = s % bound
+    return [next_seed, val]
+}
+
+// 1. Random mask
+@pure
+fn sa_build_random_mask(seq_len, num_random, seed) {
+    let mut mask = []
+    let mut cur_seed = seed
+    for i in 0..seq_len {
+        let mut row = sa_zeros(seq_len)
+        row[i] = 1.0
+        let pool_size = i + 1
+        let mut picks = 0
+        let max_attempts = num_random * 3 + 1
+        // Bounded for-loop replaces while+break (hexa while-break short-circuit pitfall)
+        for _a in 0..max_attempts {
+            if picks < num_random {
+                let result = sa_lcg_next(cur_seed, pool_size)
+                cur_seed = result[0]
+                let j = result[1]
+                if row[j] < 0.5 {
+                    row[j] = 1.0
+                    picks = picks + 1
+                }
+            }
+        }
+        mask = mask + [row]
+    }
+    return mask
+}
+
+// 2. Window mask
+@pure
+fn sa_build_window_mask(seq_len, window_size) {
+    let mut mask = []
+    for i in 0..seq_len {
+        let mut row = sa_zeros(seq_len)
+        let start = sa_max_int(0, i - window_size + 1)
+        for j in start..(i + 1) {
+            row[j] = 1.0
+        }
+        mask = mask + [row]
+    }
+    return mask
+}
+
+// 3. Global mask
+@pure
+fn sa_build_global_mask(seq_len, global_indices) {
+    let mut is_global = sa_zeros_int(seq_len)
+    let ng = len(global_indices)
+    for gi in 0..ng {
+        let idx = global_indices[gi]
+        if idx >= 0 {
+            if idx < seq_len {
+                is_global[idx] = 1
+            }
+        }
+    }
+    let mut mask = []
+    for i in 0..seq_len {
+        let mut row = sa_zeros(seq_len)
+        if is_global[i] == 1 {
+            for j in 0..(i + 1) {
+                row[j] = 1.0
+            }
+        } else {
+            for j in 0..(i + 1) {
+                if is_global[j] == 1 {
+                    row[j] = 1.0
+                }
+            }
+        }
+        mask = mask + [row]
+    }
+    return mask
+}
+
+// 4. Combine masks
+@pure
+fn sa_combine_two_masks(mask_a, mask_b) {
+    let seq_len = len(mask_a)
+    let mut combined = []
+    for i in 0..seq_len {
+        let mut row = sa_zeros(seq_len)
+        for j in 0..seq_len {
+            if mask_a[i][j] > 0.5 {
+                row[j] = 1.0
+            } else {
+                if mask_b[i][j] > 0.5 {
+                    row[j] = 1.0
+                }
+            }
+        }
+        combined = combined + [row]
+    }
+    return combined
+}
+
+@pure
+fn sa_build_combined_mask(seq_len, window_size, num_random, global_indices, seed) {
+    let win_mask = sa_build_window_mask(seq_len, window_size)
+    let rand_mask = sa_build_random_mask(seq_len, num_random, seed)
+    let glob_mask = sa_build_global_mask(seq_len, global_indices)
+    let wr = sa_combine_two_masks(win_mask, rand_mask)
+    return sa_combine_two_masks(wr, glob_mask)
+}
+
+// 5. Block sparse mask
+@pure
+fn sa_build_block_sparse_mask(seq_len, block_size) {
+    let mut mask = []
+    for i in 0..seq_len {
+        let mut row = sa_zeros(seq_len)
+        let block_id = i / block_size
+        let block_start = block_id * block_size
+        for j in block_start..(i + 1) {
+            row[j] = 1.0
+        }
+        mask = mask + [row]
+    }
+    return mask
+}
+
+// 6. Strided mask
+@pure
+fn sa_build_strided_mask(seq_len, stride) {
+    let mut mask = []
+    for i in 0..seq_len {
+        let mut row = sa_zeros(seq_len)
+        row[i] = 1.0
+        let mut j = 0
+        while j <= i {
+            row[j] = 1.0
+            j = j + stride
+        }
+        mask = mask + [row]
+    }
+    return mask
+}
+
+// 7. Sparse softmax attention
+@pure @hot
+fn sa_sparse_softmax_attention(queries, keys, values, mask) {
+    let seq_len = len(queries)
+    if seq_len == 0 { return [] }
+    let dim = len(queries[0])
+    let scale = 1.0 / sa_sqrt(to_float(dim))
+    let neg_inf = -1.0e9
+    let mut output = []
+
+    for i in 0..seq_len {
+        let mut active = []
+        for j in 0..seq_len {
+            if mask[i][j] > 0.5 {
+                active = active + [j]
+            }
+        }
+
+        let n_active = len(active)
+        if n_active == 0 {
+            output = output + [sa_zeros(dim)]
+        } else {
+            let mut scores = sa_zeros(n_active)
+            for aidx in 0..n_active {
+                let j = active[aidx]
+                let mut dot = 0.0
+                for d in 0..dim {
+                    dot = dot + queries[i][d] * keys[j][d]
+                }
+                scores[aidx] = dot * scale
+            }
+
+            let mut mx = scores[0]
+            for aidx in 1..n_active {
+                if scores[aidx] > mx { mx = scores[aidx] }
+            }
+            let mut exps = sa_zeros(n_active)
+            let mut z = 0.0
+            for aidx in 0..n_active {
+                exps[aidx] = sa_exp(scores[aidx] - mx)
+                z = z + exps[aidx]
+            }
+            if z < 1.0e-12 { z = 1.0e-12 }
+
+            let mut out_vec = sa_zeros(dim)
+            for aidx in 0..n_active {
+                let w = exps[aidx] / z
+                let j = active[aidx]
+                for d in 0..dim {
+                    out_vec[d] = out_vec[d] + w * values[j][d]
+                }
+            }
+            output = output + [out_vec]
+        }
+    }
+    return output
+}
+
+// Block sparse attention
+@pure @hot
+fn sa_block_sparse_attention(queries, keys, values, block_size) {
+    let mask = sa_build_block_sparse_mask(len(queries), block_size)
+    return sa_sparse_softmax_attention(queries, keys, values, mask)
+}
+
+// Strided attention
+@pure @hot
+fn sa_strided_attention(queries, keys, values, stride) {
+    let mask = sa_build_strided_mask(len(queries), stride)
+    return sa_sparse_softmax_attention(queries, keys, values, mask)
+}
+
+// Utilities
+@pure
+fn sa_mask_row_count(mask, row_idx) {
+    let row = mask[row_idx]
+    let n = len(row)
+    let mut count = 0
+    for j in 0..n {
+        if row[j] > 0.5 { count = count + 1 }
+    }
+    return count
+}
+
+@pure
+fn sa_mask_total_nonzero(mask) {
+    let seq_len = len(mask)
+    let mut total = 0
+    for i in 0..seq_len {
+        total = total + sa_mask_row_count(mask, i)
+    }
+    return total
+}
+
+@pure
+fn sa_sparsity_ratio(mask) {
+    let seq_len = len(mask)
+    let total_causal = seq_len * (seq_len + 1) / 2
+    let nonzero = sa_mask_total_nonzero(mask)
+    if total_causal == 0 { return 0.0 }
+    return 1.0 - to_float(nonzero) / to_float(total_causal)
+}
+
+// ===================================================================
+//  Test data: 6 tokens, dim=4
+// ===================================================================
+let SEQ = 6
+let DIM = 4
+
+// Q, K, V: simple patterns so results are verifiable
+let mut test_queries = []
+let mut test_keys = []
+let mut test_values = []
+for i in 0..SEQ {
+    let mut qrow = []
+    let mut krow = []
+    let mut vrow = []
+    for d in 0..DIM {
+        qrow = qrow + [to_float(i + d + 1) * 0.1]
+        krow = krow + [to_float(i * 2 + d) * 0.1]
+        vrow = vrow + [to_float(d + 1) * 0.1 + to_float(i) * 0.01]
+    }
+    test_queries = test_queries + [qrow]
+    test_keys = test_keys + [krow]
+    test_values = test_values + [vrow]
+}
+
+// ===================================================================
+//  T1: random mask shape correct
+// ===================================================================
+let rmask = sa_build_random_mask(SEQ, 2, 42)
+check("T1 random mask rows = seq_len", len(rmask) == SEQ)
+check("T1b random mask cols = seq_len", len(rmask[0]) == SEQ)
+
+// ===================================================================
+//  T2: random mask causal (no future)
+// ===================================================================
+let mut rm_causal = true
+for i in 0..SEQ {
+    for j in (i + 1)..SEQ {
+        if rmask[i][j] > 0.5 { rm_causal = false }
+    }
+}
+check("T2 random mask causal (no future)", rm_causal)
+
+// ===================================================================
+//  T3: random mask self-attendance
+// ===================================================================
+let mut rm_self = true
+for i in 0..SEQ {
+    if rmask[i][i] < 0.5 { rm_self = false }
+}
+check("T3 random mask always attends to self", rm_self)
+
+// ===================================================================
+//  T4: random mask has extra random entries for later tokens
+// ===================================================================
+// Token 5 has pool [0..5], with r=2 random + self -> at least 2 entries
+let rm_row5_count = sa_mask_row_count(rmask, 5)
+check("T4 random mask last row has >= 2 entries", rm_row5_count >= 2)
+
+// ===================================================================
+//  T5: window mask shape correct
+// ===================================================================
+let wmask = sa_build_window_mask(SEQ, 3)
+check("T5 window mask rows = seq_len", len(wmask) == SEQ)
+check("T5b window mask cols = seq_len", len(wmask[0]) == SEQ)
+
+// ===================================================================
+//  T6: window mask causal constraint
+// ===================================================================
+let mut wm_causal = true
+for i in 0..SEQ {
+    for j in (i + 1)..SEQ {
+        if wmask[i][j] > 0.5 { wm_causal = false }
+    }
+}
+check("T6 window mask causal", wm_causal)
+
+// ===================================================================
+//  T7: window mask respects window size
+// ===================================================================
+// Row 5, W=3: should attend to [3,4,5], row count = 3
+check("T7 window mask row 5 count = 3", sa_mask_row_count(wmask, 5) == 3)
+// Row 1, W=3: only [0,1] available, count = 2
+check("T7b window mask row 1 count = 2", sa_mask_row_count(wmask, 1) == 2)
+
+// ===================================================================
+//  T8: window mask first token attends only to self
+// ===================================================================
+check("T8 window mask row 0 count = 1", sa_mask_row_count(wmask, 0) == 1)
+check("T8b window mask row 0 self = 1.0", wmask[0][0] > 0.5)
+
+// ===================================================================
+//  T9: global mask: global token full causal row
+// ===================================================================
+let gmask = sa_build_global_mask(SEQ, [0])
+// Token 0 is global: row 0 attends to self
+check("T9 global token 0 attends to self", gmask[0][0] > 0.5)
+// Check token 0 row count = 1 (only causal = position 0)
+check("T9b global token 0 row count = 1", sa_mask_row_count(gmask, 0) == 1)
+
+// ===================================================================
+//  T10: global mask: non-global attends to globals only
+// ===================================================================
+// Token 3 should attend to position 0 (global)
+check("T10 non-global token 3 attends to global 0", gmask[3][0] > 0.5)
+
+// ===================================================================
+//  T11: global mask: non-global no cross-attend
+// ===================================================================
+// Token 3 should NOT attend to token 2 in global-only mask
+check("T11 non-global tokens no cross-attend", gmask[3][2] < 0.5)
+
+// ===================================================================
+//  T12: combined mask is superset of window mask
+// ===================================================================
+let cmask = sa_build_combined_mask(SEQ, 3, 2, [0], 42)
+let mut cw_superset = true
+for i in 0..SEQ {
+    for j in 0..SEQ {
+        if wmask[i][j] > 0.5 {
+            if cmask[i][j] < 0.5 { cw_superset = false }
+        }
+    }
+}
+check("T12 combined superset of window mask", cw_superset)
+
+// ===================================================================
+//  T13: combined mask is superset of global mask
+// ===================================================================
+let mut cg_superset = true
+for i in 0..SEQ {
+    for j in 0..SEQ {
+        if gmask[i][j] > 0.5 {
+            if cmask[i][j] < 0.5 { cg_superset = false }
+        }
+    }
+}
+check("T13 combined superset of global mask", cg_superset)
+
+// ===================================================================
+//  T14: combined mask is superset of random mask
+// ===================================================================
+let rmask2 = sa_build_random_mask(SEQ, 2, 42)
+let mut cr_superset = true
+for i in 0..SEQ {
+    for j in 0..SEQ {
+        if rmask2[i][j] > 0.5 {
+            if cmask[i][j] < 0.5 { cr_superset = false }
+        }
+    }
+}
+check("T14 combined superset of random mask", cr_superset)
+
+// ===================================================================
+//  T15: combined mask causal
+// ===================================================================
+let mut cm_causal = true
+for i in 0..SEQ {
+    for j in (i + 1)..SEQ {
+        if cmask[i][j] > 0.5 { cm_causal = false }
+    }
+}
+check("T15 combined mask causal", cm_causal)
+
+// ===================================================================
+//  T16: block sparse mask shape
+// ===================================================================
+let bmask = sa_build_block_sparse_mask(SEQ, 2)
+check("T16 block sparse mask rows", len(bmask) == SEQ)
+check("T16b block sparse mask cols", len(bmask[0]) == SEQ)
+
+// ===================================================================
+//  T17: block sparse within-block attendance
+// ===================================================================
+// Block 0: tokens [0,1]. Token 1 should attend to 0 and 1
+check("T17 block0 token1 attends to 0", bmask[1][0] > 0.5)
+check("T17b block0 token1 attends to 1", bmask[1][1] > 0.5)
+
+// ===================================================================
+//  T18: block sparse no cross-block
+// ===================================================================
+// Token 2 is in block 1 (tokens [2,3]). Should NOT attend to token 1 (block 0)
+check("T18 no cross-block: token 2 not attend 1", bmask[2][1] < 0.5)
+check("T18b no cross-block: token 2 not attend 0", bmask[2][0] < 0.5)
+
+// ===================================================================
+//  T19: block sparse causal
+// ===================================================================
+let mut bm_causal = true
+for i in 0..SEQ {
+    for j in (i + 1)..SEQ {
+        if bmask[i][j] > 0.5 { bm_causal = false }
+    }
+}
+check("T19 block sparse causal", bm_causal)
+
+// ===================================================================
+//  T20: strided mask shape
+// ===================================================================
+let smask = sa_build_strided_mask(SEQ, 2)
+check("T20 strided mask rows", len(smask) == SEQ)
+check("T20b strided mask cols", len(smask[0]) == SEQ)
+
+// ===================================================================
+//  T21: strided mask self-attendance
+// ===================================================================
+let mut sm_self = true
+for i in 0..SEQ {
+    if smask[i][i] < 0.5 { sm_self = false }
+}
+check("T21 strided mask self-attendance", sm_self)
+
+// ===================================================================
+//  T22: strided mask hits stride positions
+// ===================================================================
+// stride=2, token 5: should attend to 0, 2, 4, 5
+check("T22 strided token5 attends to 0", smask[5][0] > 0.5)
+check("T22b strided token5 attends to 2", smask[5][2] > 0.5)
+check("T22c strided token5 attends to 4", smask[5][4] > 0.5)
+check("T22d strided token5 attends to self", smask[5][5] > 0.5)
+
+// ===================================================================
+//  T23: strided mask causal
+// ===================================================================
+let mut sm_causal = true
+for i in 0..SEQ {
+    for j in (i + 1)..SEQ {
+        if smask[i][j] > 0.5 { sm_causal = false }
+    }
+}
+check("T23 strided mask causal", sm_causal)
+
+// ===================================================================
+//  T24: sparse softmax output shape
+// ===================================================================
+let ss_out = sa_sparse_softmax_attention(test_queries, test_keys, test_values, wmask)
+check("T24 sparse softmax output len", len(ss_out) == SEQ)
+
+// ===================================================================
+//  T25: sparse softmax output dim
+// ===================================================================
+check("T25 sparse softmax output dim", len(ss_out[0]) == DIM)
+
+// ===================================================================
+//  T26: sparse softmax with full causal mask matches full attention
+// ===================================================================
+// Build full causal mask
+let mut full_mask = []
+for i in 0..SEQ {
+    let mut row = sa_zeros(SEQ)
+    for j in 0..(i + 1) {
+        row[j] = 1.0
+    }
+    full_mask = full_mask + [row]
+}
+let full_out = sa_sparse_softmax_attention(test_queries, test_keys, test_values, full_mask)
+
+// With full-seq window = full causal
+let full_win_mask = sa_build_window_mask(SEQ, SEQ)
+let full_win_out = sa_sparse_softmax_attention(test_queries, test_keys, test_values, full_win_mask)
+
+let mut full_match = true
+for i in 0..SEQ {
+    for d in 0..DIM {
+        if fabs(full_out[i][d] - full_win_out[i][d]) > 0.001 {
+            full_match = false
+        }
+    }
+}
+check("T26 full window mask = full causal attention", full_match)
+
+// ===================================================================
+//  T27: sparse softmax with identity mask returns values
+// ===================================================================
+// Identity mask: each token attends only to self
+let mut id_mask = []
+for i in 0..SEQ {
+    let mut row = sa_zeros(SEQ)
+    row[i] = 1.0
+    id_mask = id_mask + [row]
+}
+let id_out = sa_sparse_softmax_attention(test_queries, test_keys, test_values, id_mask)
+// softmax over single entry = 1.0, so output = values[i]
+let mut id_match = true
+for i in 0..SEQ {
+    for d in 0..DIM {
+        if fabs(id_out[i][d] - test_values[i][d]) > 0.001 {
+            id_match = false
+        }
+    }
+}
+check("T27 identity mask: output = values", id_match)
+
+// ===================================================================
+//  T28: mask row count accuracy
+// ===================================================================
+// Window mask W=3, row 4: [2,3,4] -> 3
+check("T28 mask row count W=3 row 4", sa_mask_row_count(wmask, 4) == 3)
+// Row 0: [0] -> 1
+check("T28b mask row count W=3 row 0", sa_mask_row_count(wmask, 0) == 1)
+
+// ===================================================================
+//  T29: mask total nonzero accuracy
+// ===================================================================
+// Window mask seq=6, W=3:
+// row0=1, row1=2, row2=3, row3=3, row4=3, row5=3 -> total=15
+let wm_total = sa_mask_total_nonzero(wmask)
+check("T29 total nonzero W=3 seq=6 = 15", wm_total == 15)
+
+// ===================================================================
+//  T30: sparsity ratio: full causal = 0
+// ===================================================================
+let full_sparsity = sa_sparsity_ratio(full_mask)
+check("T30 full causal sparsity = 0.0", fabs(full_sparsity) < 0.01)
+
+// ===================================================================
+//  T31: sparsity ratio: window < full causal -> positive sparsity
+// ===================================================================
+let win_sparsity = sa_sparsity_ratio(sa_build_window_mask(SEQ, 2))
+check("T31 window sparsity > 0", win_sparsity > 0.0)
+check("T31b window sparsity < 1", win_sparsity < 1.0)
+
+// ===================================================================
+//  T32: block sparse attention output shape
+// ===================================================================
+let bs_out = sa_block_sparse_attention(test_queries, test_keys, test_values, 2)
+check("T32 block sparse attention output len", len(bs_out) == SEQ)
+check("T32b block sparse attention output dim", len(bs_out[0]) == DIM)
+
+// ===================================================================
+//  T33: strided attention output shape
+// ===================================================================
+let st_out = sa_strided_attention(test_queries, test_keys, test_values, 2)
+check("T33 strided attention output len", len(st_out) == SEQ)
+check("T33b strided attention output dim", len(st_out[0]) == DIM)
+
+// ===================================================================
+//  T34: combined attention end-to-end output shape
+// ===================================================================
+let comb_out = sa_sparse_softmax_attention(test_queries, test_keys, test_values, cmask)
+check("T34 combined sparse attention output len", len(comb_out) == SEQ)
+check("T34b combined sparse attention output dim", len(comb_out[0]) == DIM)
+
+// ===================================================================
+//  T35: random mask deterministic with same seed
+// ===================================================================
+let rmask_a = sa_build_random_mask(SEQ, 2, 42)
+let rmask_b = sa_build_random_mask(SEQ, 2, 42)
+let mut rm_det = true
+for i in 0..SEQ {
+    for j in 0..SEQ {
+        if fabs(rmask_a[i][j] - rmask_b[i][j]) > 0.01 { rm_det = false }
+    }
+}
+check("T35 random mask deterministic with same seed", rm_det)
+
+// ===================================================================
+//  Summary
+// ===================================================================
+println("")
+println("=== sparse_attention test summary ===")
+println("PASS: " + str(pass_count))
+println("FAIL: " + str(fail_count))
+println("TOTAL: " + str(pass_count + fail_count))

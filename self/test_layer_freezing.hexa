@@ -1,0 +1,631 @@
+// ═══════════════════════════════════════════════════════════════
+//  test_layer_freezing.hexa — Layer Freezing verification (#172)
+//
+//  Tests (>= 30):
+//    T1  make_schedule returns correct length
+//    T2  make_schedule bottom layer freezes first
+//    T3  make_schedule top layer never freezes
+//    T4  make_schedule monotonically increasing
+//    T5  is_frozen returns 0 before freeze step
+//    T6  is_frozen returns 1 at/after freeze step
+//    T7  frozen_mask all zeros at step 0
+//    T8  frozen_mask partial freeze mid-training
+//    T9  count_frozen zero at start
+//    T10 count_frozen increases over training
+//    T11 count_active decreases over training
+//    T12 gradual_bottom_up all active at step 0
+//    T13 gradual_bottom_up freezes bottom first
+//    T14 gradual_bottom_up top layer stays active
+//    T15 disc_lr top layer gets base_lr
+//    T16 disc_lr bottom layer gets smallest lr
+//    T17 disc_lr monotonically increasing
+//    T18 disc_lr_with_freeze zeros out frozen layers
+//    T19 grad_norm computes correct L2 norm
+//    T20 grad_norms returns per-layer norms
+//    T21 freeze_by_grad freezes low-norm layers
+//    T22 freeze_by_grad keeps high-norm layers active
+//    T23 should_thaw detects plateau
+//    T24 should_thaw no thaw when improving
+//    T25 thaw_layers unfreezes top frozen layers
+//    T26 thaw_policy triggers thaw on plateau
+//    T27 thaw_policy no thaw when improving
+//    T28 mem_saved positive for frozen layers
+//    T29 mem_saved zero when nothing frozen
+//    T30 mem_fraction_saved correct ratio
+//    T31 train_step frozen weights unchanged
+//    T32 train_step active weights updated
+//    T33 make_schedule_epochs same as make_schedule
+//    T34 adaptive_freeze keeps previously frozen
+//    T35 warmup_schedule no freeze during warmup
+//    T36 mem_total correct sum
+//    T37 gradual_bottom_up at 50% freezes ~half
+//
+//  Run: cargo run --release -- self/test_layer_freezing.hexa
+// ═══════════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ── inlined from layer_freezing.hexa ────────────────────────────
+
+fn lf_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn lf_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn lf_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn lf_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+fn lf_ones_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [1] }
+    return v
+}
+
+fn lf_max_f(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn lf_min_f(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn lf_min_i(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn lf_max_i(a, b) {
+    if a > b { return a }
+    return b
+}
+
+// -- schedule --
+@pure
+fn lf_make_schedule(n_layers, total_steps) {
+    let mut sched = lf_zeros_int(n_layers)
+    if n_layers <= 1 {
+        sched[0] = total_steps + 1
+        return sched
+    }
+    for i in 0..n_layers {
+        if i == n_layers - 1 {
+            sched[i] = total_steps + 1
+        } else {
+            let frac = to_float(i + 1) / to_float(n_layers)
+            sched[i] = to_int(frac * to_float(total_steps))
+        }
+    }
+    return sched
+}
+
+@pure
+fn lf_make_schedule_epochs(n_layers, total_epochs) {
+    return lf_make_schedule(n_layers, total_epochs)
+}
+
+@pure
+fn lf_is_frozen(layer_idx, step, schedule) {
+    if step >= schedule[layer_idx] { return 1 }
+    return 0
+}
+
+@pure
+fn lf_frozen_mask(step, schedule) {
+    let n = len(schedule)
+    let mut mask = lf_zeros_int(n)
+    for i in 0..n {
+        if step >= schedule[i] {
+            mask[i] = 1
+        }
+    }
+    return mask
+}
+
+@pure
+fn lf_count_frozen(step, schedule) {
+    let n = len(schedule)
+    let mut cnt = 0
+    for i in 0..n {
+        if step >= schedule[i] { cnt = cnt + 1 }
+    }
+    return cnt
+}
+
+@pure
+fn lf_count_active(step, schedule) {
+    let n = len(schedule)
+    return n - lf_count_frozen(step, schedule)
+}
+
+// -- gradual bottom-up --
+@pure
+fn lf_gradual_bottom_up(n_layers, step, total_steps) {
+    let mut mask = lf_zeros_int(n_layers)
+    if total_steps <= 0 { return mask }
+    let frac = to_float(step) / to_float(total_steps)
+    let clamped = lf_min_f(frac, 1.0)
+    let n_freeze = to_int(clamped * to_float(n_layers - 1))
+    for i in 0..n_freeze {
+        mask[i] = 1
+    }
+    return mask
+}
+
+// -- discriminative LR --
+@pure
+fn lf_disc_lr(base_lr, n_layers, decay) {
+    let mut lrs = lf_zeros(n_layers)
+    for i in 0..n_layers {
+        let exp = n_layers - 1 - i
+        let mut factor = 1.0
+        for _j in 0..exp {
+            factor = factor * decay
+        }
+        lrs[i] = base_lr * factor
+    }
+    return lrs
+}
+
+@pure
+fn lf_disc_lr_with_freeze(base_lr, n_layers, decay, frozen_mask) {
+    let mut lrs = lf_disc_lr(base_lr, n_layers, decay)
+    for i in 0..n_layers {
+        if frozen_mask[i] == 1 {
+            lrs[i] = 0.0
+        }
+    }
+    return lrs
+}
+
+// -- gradient norm --
+@pure
+fn lf_grad_norm(grad_vec) {
+    let n = len(grad_vec)
+    let mut sum_sq = 0.0
+    for i in 0..n {
+        sum_sq = sum_sq + grad_vec[i] * grad_vec[i]
+    }
+    return lf_sqrt(sum_sq)
+}
+
+@pure
+fn lf_grad_norms(grads) {
+    let n = len(grads)
+    let mut norms = lf_zeros(n)
+    for i in 0..n {
+        norms[i] = lf_grad_norm(grads[i])
+    }
+    return norms
+}
+
+@pure
+fn lf_freeze_by_grad(grad_norms, threshold) {
+    let n = len(grad_norms)
+    let mut mask = lf_zeros_int(n)
+    for i in 0..n {
+        if grad_norms[i] < threshold {
+            mask[i] = 1
+        }
+    }
+    return mask
+}
+
+@pure
+fn lf_adaptive_freeze(grad_norms, threshold, prev_mask) {
+    let n = len(grad_norms)
+    let mut mask = lf_zeros_int(n)
+    for i in 0..n {
+        if prev_mask[i] == 1 {
+            mask[i] = 1
+        } else {
+            if grad_norms[i] < threshold {
+                mask[i] = 1
+            }
+        }
+    }
+    return mask
+}
+
+// -- thaw --
+@pure
+fn lf_avg_window(loss_history, start, wlen) {
+    let mut s = 0.0
+    let n = len(loss_history)
+    let end = lf_min_i(start + wlen, n)
+    let actual = end - start
+    if actual <= 0 { return 0.0 }
+    for i in start..end {
+        s = s + loss_history[i]
+    }
+    return s / to_float(actual)
+}
+
+@pure
+fn lf_should_thaw(loss_history, window, min_improve) {
+    let n = len(loss_history)
+    if n < window * 2 { return 0 }
+    let prev_avg = lf_avg_window(loss_history, n - window * 2, window)
+    let curr_avg = lf_avg_window(loss_history, n - window, window)
+    let improvement = prev_avg - curr_avg
+    if improvement < min_improve { return 1 }
+    return 0
+}
+
+@pure
+fn lf_thaw_layers(frozen_mask, n_thaw) {
+    let n = len(frozen_mask)
+    let mut mask = lf_zeros_int(n)
+    for i in 0..n {
+        mask[i] = frozen_mask[i]
+    }
+    let mut thawed = 0
+    let mut i = n - 1
+    for _iter in 0..n {
+        if thawed >= n_thaw { break }
+        if i < 0 { break }
+        if mask[i] == 1 {
+            mask[i] = 0
+            thawed = thawed + 1
+        }
+        i = i - 1
+    }
+    return mask
+}
+
+@pure
+fn lf_thaw_policy(frozen_mask, loss_history, window, min_improve, n_thaw) {
+    let should = lf_should_thaw(loss_history, window, min_improve)
+    if should == 1 {
+        return lf_thaw_layers(frozen_mask, n_thaw)
+    }
+    let n = len(frozen_mask)
+    let mut out = lf_zeros_int(n)
+    for i in 0..n {
+        out[i] = frozen_mask[i]
+    }
+    return out
+}
+
+// -- memory --
+@pure
+fn lf_mem_per_layer(param_counts, bytes_per_param) {
+    let n = len(param_counts)
+    let mut mem = lf_zeros(n)
+    for i in 0..n {
+        mem[i] = to_float(param_counts[i]) * bytes_per_param * 3.0
+    }
+    return mem
+}
+
+@pure
+fn lf_mem_saved(param_counts, frozen_mask, bytes_per_param) {
+    let n = len(param_counts)
+    let mut saved = 0.0
+    for i in 0..n {
+        if frozen_mask[i] == 1 {
+            saved = saved + to_float(param_counts[i]) * bytes_per_param * 2.0
+        }
+    }
+    return saved
+}
+
+@pure
+fn lf_mem_total(param_counts, bytes_per_param) {
+    let n = len(param_counts)
+    let mut total = 0.0
+    for i in 0..n {
+        total = total + to_float(param_counts[i]) * bytes_per_param * 3.0
+    }
+    return total
+}
+
+@pure
+fn lf_mem_fraction_saved(param_counts, frozen_mask, bytes_per_param) {
+    let total = lf_mem_total(param_counts, bytes_per_param)
+    if total < 1.0e-10 { return 0.0 }
+    let saved = lf_mem_saved(param_counts, frozen_mask, bytes_per_param)
+    return saved / total
+}
+
+// -- train step --
+@pure @hot
+fn lf_train_step(weights, grads, lr_per_layer, frozen_mask) {
+    let n = len(weights)
+    let mut out = lf_zeros(n)
+    for i in 0..n {
+        if frozen_mask[i] == 1 {
+            out[i] = weights[i]
+        } else {
+            out[i] = weights[i] - lr_per_layer[i] * grads[i]
+        }
+    }
+    return out
+}
+
+// -- warmup schedule --
+@pure
+fn lf_warmup_schedule(n_layers, warmup_steps, total_steps) {
+    let mut sched = lf_zeros_int(n_layers)
+    let remaining = total_steps - warmup_steps
+    if remaining <= 0 {
+        for i in 0..n_layers {
+            sched[i] = total_steps + 1
+        }
+        return sched
+    }
+    for i in 0..n_layers {
+        if i == n_layers - 1 {
+            sched[i] = total_steps + 1
+        } else {
+            let frac = to_float(i + 1) / to_float(n_layers)
+            sched[i] = warmup_steps + to_int(frac * to_float(remaining))
+        }
+    }
+    return sched
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  TESTS
+// ═══════════════════════════════════════════════════════════════
+
+println("=== Layer Freezing Tests ===")
+
+// ── T1: make_schedule returns correct length ──
+let sched6 = lf_make_schedule(6, 1000)
+check("T1 make_schedule length", len(sched6) == 6)
+
+// ── T2: bottom layer freezes first (lowest freeze step) ──
+check("T2 bottom freezes first", sched6[0] <= sched6[1])
+
+// ── T3: top layer never freezes ──
+check("T3 top layer never freezes", sched6[5] > 1000)
+
+// ── T4: schedule monotonically increasing ──
+let mut mono = true
+for i in 1..6 {
+    if sched6[i] < sched6[i - 1] { mono = false }
+}
+check("T4 schedule monotonic", mono)
+
+// ── T5: is_frozen returns 0 before freeze step ──
+check("T5 not frozen before step", lf_is_frozen(0, 0, sched6) == 0)
+
+// ── T6: is_frozen returns 1 at freeze step ──
+let freeze_step_0 = sched6[0]
+check("T6 frozen at freeze step", lf_is_frozen(0, freeze_step_0, sched6) == 1)
+
+// ── T7: frozen_mask all zeros at step 0 ──
+let mask0 = lf_frozen_mask(0, sched6)
+let mut all_zero = true
+for i in 0..6 {
+    if mask0[i] != 0 { all_zero = false }
+}
+check("T7 all active at step 0", all_zero)
+
+// ── T8: frozen_mask partial at mid ──
+let mid_step = sched6[2] + 1
+let mask_mid = lf_frozen_mask(mid_step, sched6)
+let mut some_frozen = false
+let mut some_active = false
+for i in 0..6 {
+    if mask_mid[i] == 1 { some_frozen = true }
+    if mask_mid[i] == 0 { some_active = true }
+}
+check("T8 partial freeze mid-training", some_frozen && some_active)
+
+// ── T9: count_frozen zero at start ──
+check("T9 count_frozen zero at start", lf_count_frozen(0, sched6) == 0)
+
+// ── T10: count_frozen increases ──
+let cf_early = lf_count_frozen(sched6[0], sched6)
+let cf_late = lf_count_frozen(sched6[3] + 1, sched6)
+check("T10 frozen count increases", cf_late >= cf_early)
+
+// ── T11: count_active decreases ──
+let ca_start = lf_count_active(0, sched6)
+let ca_mid = lf_count_active(sched6[2] + 1, sched6)
+check("T11 active count decreases", ca_mid < ca_start)
+
+// ── T12: gradual_bottom_up all active at step 0 ──
+let gbu0 = lf_gradual_bottom_up(6, 0, 1000)
+let mut gbu_all_zero = true
+for i in 0..6 {
+    if gbu0[i] != 0 { gbu_all_zero = false }
+}
+check("T12 gradual all active at step 0", gbu_all_zero)
+
+// ── T13: gradual bottom-up freezes bottom first ──
+let gbu_mid = lf_gradual_bottom_up(6, 500, 1000)
+// at 50%, ~2-3 layers frozen from bottom
+let mut bottom_frozen = gbu_mid[0] == 1
+check("T13 gradual bottom frozen first", bottom_frozen)
+
+// ── T14: gradual top layer stays active ──
+let gbu_late = lf_gradual_bottom_up(6, 900, 1000)
+check("T14 gradual top stays active", gbu_late[5] == 0)
+
+// ── T15: disc_lr top layer gets base_lr ──
+let lrs = lf_disc_lr(0.001, 4, 0.5)
+check("T15 top layer gets base_lr", approx(lrs[3], 0.001, 1.0e-8))
+
+// ── T16: disc_lr bottom layer gets smallest ──
+let mut bottom_smallest = true
+for i in 1..4 {
+    if lrs[i] < lrs[i - 1] { bottom_smallest = false }
+}
+check("T16 bottom has smallest lr", lrs[0] < lrs[3])
+
+// ── T17: disc_lr monotonically increasing ──
+let mut lr_mono = true
+for i in 1..4 {
+    if lrs[i] < lrs[i - 1] { lr_mono = false }
+}
+check("T17 disc_lr monotonic increasing", lr_mono)
+
+// ── T18: disc_lr_with_freeze zeros frozen ──
+let fmask = [1, 1, 0, 0]
+let lrs_f = lf_disc_lr_with_freeze(0.001, 4, 0.5, fmask)
+check("T18 frozen layers lr=0", lrs_f[0] == 0.0 && lrs_f[1] == 0.0 && lrs_f[2] > 0.0)
+
+// ── T19: grad_norm computes L2 ──
+let gn = lf_grad_norm([3.0, 4.0])
+check("T19 grad_norm L2", approx(gn, 5.0, 0.01))
+
+// ── T20: grad_norms per-layer ──
+let grads = [[3.0, 4.0], [0.0, 0.0], [1.0, 0.0]]
+let norms = lf_grad_norms(grads)
+check("T20 grad_norms length", len(norms) == 3)
+
+// ── T21: freeze_by_grad freezes low-norm ──
+let norms2 = [0.01, 0.5, 2.0, 0.001]
+let fg = lf_freeze_by_grad(norms2, 0.1)
+check("T21 freeze low-norm layers", fg[0] == 1 && fg[3] == 1)
+
+// ── T22: freeze_by_grad keeps high-norm active ──
+check("T22 keep high-norm active", fg[1] == 0 && fg[2] == 0)
+
+// ── T23: should_thaw detects plateau ──
+// loss not improving: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+let plateau_loss = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+let thaw_plateau = lf_should_thaw(plateau_loss, 3, 0.01)
+check("T23 detects plateau", thaw_plateau == 1)
+
+// ── T24: should_thaw no thaw when improving ──
+let improving_loss = [2.0, 1.8, 1.5, 1.2, 0.9, 0.6]
+let thaw_improving = lf_should_thaw(improving_loss, 3, 0.01)
+check("T24 no thaw when improving", thaw_improving == 0)
+
+// ── T25: thaw_layers unfreezes top frozen ──
+let frozen_all = [1, 1, 1, 1, 0, 0]
+let thawed = lf_thaw_layers(frozen_all, 2)
+// should unfreeze layers 3 and 2 (highest frozen indices)
+check("T25 thaw top frozen", thawed[3] == 0 && thawed[2] == 0 && thawed[0] == 1 && thawed[1] == 1)
+
+// ── T26: thaw_policy triggers on plateau ──
+let frozen_tp = [1, 1, 1, 0, 0, 0]
+let tp_result = lf_thaw_policy(frozen_tp, plateau_loss, 3, 0.01, 1)
+// should have unfrozen one layer
+let mut tp_frozen_count = 0
+for i in 0..6 {
+    if tp_result[i] == 1 { tp_frozen_count = tp_frozen_count + 1 }
+}
+check("T26 thaw_policy triggers", tp_frozen_count == 2)
+
+// ── T27: thaw_policy no thaw when improving ──
+let tp_no = lf_thaw_policy(frozen_tp, improving_loss, 3, 0.01, 1)
+let mut tp_no_count = 0
+for i in 0..6 {
+    if tp_no[i] == 1 { tp_no_count = tp_no_count + 1 }
+}
+check("T27 thaw_policy no thaw", tp_no_count == 3)
+
+// ── T28: mem_saved positive for frozen ──
+let params = [1000, 1000, 1000, 1000]
+let fmask2 = [1, 1, 0, 0]
+let saved = lf_mem_saved(params, fmask2, 4.0)
+check("T28 mem_saved positive", saved > 0.0)
+
+// ── T29: mem_saved zero when nothing frozen ──
+let no_freeze = [0, 0, 0, 0]
+let saved0 = lf_mem_saved(params, no_freeze, 4.0)
+check("T29 mem_saved zero unfrozen", saved0 == 0.0)
+
+// ── T30: mem_fraction_saved correct ──
+// 2 of 4 layers frozen, each same size -> saved = 2*1000*4*2 = 16000, total = 4*1000*4*3 = 48000
+// fraction = 16000/48000 = 1/3
+let frac_saved = lf_mem_fraction_saved(params, fmask2, 4.0)
+check("T30 mem_fraction correct", approx(frac_saved, 0.3333, 0.01))
+
+// ── T31: train_step frozen weights unchanged ──
+let w = [1.0, 2.0, 3.0, 4.0]
+let g = [0.1, 0.2, 0.3, 0.4]
+let lr4 = [0.01, 0.01, 0.01, 0.01]
+let fm_train = [1, 1, 0, 0]
+let w2 = lf_train_step(w, g, lr4, fm_train)
+check("T31 frozen weights unchanged", w2[0] == 1.0 && w2[1] == 2.0)
+
+// ── T32: train_step active weights updated ──
+check("T32 active weights updated", w2[2] != 3.0 && w2[3] != 4.0)
+
+// ── T33: make_schedule_epochs same as make_schedule ──
+let sched_ep = lf_make_schedule_epochs(6, 100)
+let sched_st = lf_make_schedule(6, 100)
+let mut ep_same = true
+for i in 0..6 {
+    if sched_ep[i] != sched_st[i] { ep_same = false }
+}
+check("T33 epoch schedule == step schedule", ep_same)
+
+// ── T34: adaptive_freeze keeps previously frozen ──
+let prev = [1, 0, 0, 0]
+let gn_adapt = [0.5, 0.5, 0.5, 0.01]
+let adapted = lf_adaptive_freeze(gn_adapt, 0.1, prev)
+check("T34 adaptive keeps prev frozen", adapted[0] == 1 && adapted[3] == 1 && adapted[1] == 0)
+
+// ── T35: warmup_schedule no freeze during warmup ──
+let ws = lf_warmup_schedule(4, 200, 1000)
+let ws_mask = lf_frozen_mask(100, ws)
+let mut ws_all_active = true
+for i in 0..4 {
+    if ws_mask[i] != 0 { ws_all_active = false }
+}
+check("T35 no freeze during warmup", ws_all_active)
+
+// ── T36: mem_total correct sum ──
+let mt = lf_mem_total(params, 4.0)
+// 4 layers * 1000 params * 4 bytes * 3 (w+g+opt) = 48000
+check("T36 mem_total correct", approx(mt, 48000.0, 0.01))
+
+// ── T37: gradual at 50% freezes about half ──
+let gbu50 = lf_gradual_bottom_up(6, 500, 1000)
+let mut gbu50_frozen = 0
+for i in 0..6 {
+    if gbu50[i] == 1 { gbu50_frozen = gbu50_frozen + 1 }
+}
+check("T37 gradual 50% freezes ~half", gbu50_frozen >= 2 && gbu50_frozen <= 3)
+
+// ═══════════════════════════════════════════════════════════════
+//  Summary
+// ═══════════════════════════════════════════════════════════════
+println("")
+println("=== Layer Freezing: " + to_string(pass_count) + " passed, " + to_string(fail_count) + " failed ===")
+if fail_count == 0 {
+    println("ALL " + to_string(pass_count) + " TESTS PASSED")
+} else {
+    println("SOME TESTS FAILED")
+}

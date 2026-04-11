@@ -1,0 +1,533 @@
+// ===================================================================
+//  self/ml/inference_scaling.hexa — Inference Scaling (#178)
+//
+//  Test-time compute scaling: instead of training harder, generate
+//  multiple candidate responses and select the best one.
+//
+//  Implements:
+//    1. Best-of-N sampling     — generate N, pick highest scoring
+//    2. Majority vote          — generate N, pick most common answer
+//    3. Weighted vote          — weight votes by confidence/probability
+//    4. Reward-ranked selection — score with reward model, pick top-1
+//    5. Compute budget alloc   — given budget, decide optimal N
+//    6. Quality-vs-cost        — marginal quality gain per sample
+//    7. Scaling law estimator  — predict quality at N from few samples
+//
+//  API:
+//    is_zeros(n)                             -> [float]
+//    is_argmax(scores)                       -> int
+//    is_best_of_n(responses, score_fn)       -> [best_idx, best_score]
+//    is_majority_vote(answers)               -> [winner, count]
+//    is_weighted_vote(answers, weights)      -> [winner, total_weight]
+//    is_reward_ranked(responses, reward_fn)  -> [ranked_indices, scores]
+//    is_compute_budget(budget, cost_per)     -> n
+//    is_quality_curve(scores_by_n)           -> [marginal_gains]
+//    is_scaling_law(n_small, q_small, n_large) -> predicted_quality
+//    is_log_approx(x)                        -> float
+//    is_power_law_fit(ns, qs)                -> [a, b]
+//    is_power_law_predict(a, b, n)           -> float
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+//    @hot   — performance critical path
+// ===================================================================
+
+// === helpers ========================================================
+
+fn is_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn is_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+fn is_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn is_abs_int(x) {
+    if x < 0 { return 0 - x }
+    return x
+}
+
+fn is_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn is_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn is_log_approx(x) {
+    if x <= 0.0 { return -20.0 }
+    // Newton iteration: find y such that exp(y) = x
+    let mut y = 0.0
+    if x > 1.0 { y = to_float(to_int(x)) / 3.0 }
+    if x < 1.0 { y = -1.0 }
+    for _i in 0..40 {
+        let ey = is_exp(y)
+        if ey < 1.0e-15 { ey = 1.0e-15 }
+        y = y + (x - ey) / ey
+    }
+    return y
+}
+
+fn is_pow(base, exp_val) {
+    // base^exp_val = exp(exp_val * log(base))
+    if base <= 0.0 { return 0.0 }
+    return is_exp(exp_val * is_log_approx(base))
+}
+
+// === argmax =========================================================
+
+@pure
+fn is_argmax(scores) {
+    let n = len(scores)
+    if n == 0 { return -1 }
+    let mut best = 0
+    let mut best_v = scores[0]
+    for i in 1..n {
+        if scores[i] > best_v {
+            best_v = scores[i]
+            best = i
+        }
+    }
+    return best
+}
+
+// ===================================================================
+//  1. Best-of-N Sampling
+//
+//  Generate N candidate responses. Score each with score_fn.
+//  Return the index and score of the best candidate.
+//
+//  responses: array of candidate data (anything score_fn accepts)
+//  score_fn:  fn(response) -> float
+//
+//  Returns: [best_index, best_score]
+// ===================================================================
+@pure
+fn is_best_of_n(responses, score_fn) {
+    let n = len(responses)
+    if n == 0 { return [-1, 0.0] }
+    let mut best_idx = 0
+    let mut best_score = score_fn(responses[0])
+    for i in 1..n {
+        let s = score_fn(responses[i])
+        if s > best_score {
+            best_score = s
+            best_idx = i
+        }
+    }
+    return [best_idx, best_score]
+}
+
+// ===================================================================
+//  2. Majority Vote
+//
+//  Given N answer IDs (integers), pick the most common answer.
+//  Ties broken by first occurrence.
+//
+//  answers: [int] array of answer IDs
+//
+//  Returns: [winner_id, count]
+// ===================================================================
+@pure
+fn is_majority_vote(answers) {
+    let n = len(answers)
+    if n == 0 { return [-1, 0] }
+    // collect unique answers and their counts
+    let mut unique = []
+    let mut counts = []
+    for i in 0..n {
+        let a = answers[i]
+        let mut found = false
+        for j in 0..len(unique) {
+            if unique[j] == a {
+                counts[j] = counts[j] + 1
+                found = true
+            }
+        }
+        if found == false {
+            unique = unique + [a]
+            counts = counts + [1]
+        }
+    }
+    // find max count
+    let mut best_idx = 0
+    let mut best_count = counts[0]
+    for i in 1..len(counts) {
+        if counts[i] > best_count {
+            best_count = counts[i]
+            best_idx = i
+        }
+    }
+    return [unique[best_idx], best_count]
+}
+
+// ===================================================================
+//  3. Weighted Vote
+//
+//  Each answer has an associated confidence weight. Sum weights
+//  per unique answer and pick the one with highest total weight.
+//
+//  answers: [int]   answer IDs
+//  weights: [float] confidence weights (same length as answers)
+//
+//  Returns: [winner_id, total_weight]
+// ===================================================================
+@pure
+fn is_weighted_vote(answers, weights) {
+    let n = len(answers)
+    if n == 0 { return [-1, 0.0] }
+    let mut unique = []
+    let mut sums = []
+    for i in 0..n {
+        let a = answers[i]
+        let w = weights[i]
+        let mut found = false
+        for j in 0..len(unique) {
+            if unique[j] == a {
+                sums[j] = sums[j] + w
+                found = true
+            }
+        }
+        if found == false {
+            unique = unique + [a]
+            sums = sums + [w]
+        }
+    }
+    let mut best_idx = 0
+    let mut best_w = sums[0]
+    for i in 1..len(sums) {
+        if sums[i] > best_w {
+            best_w = sums[i]
+            best_idx = i
+        }
+    }
+    return [unique[best_idx], best_w]
+}
+
+// ===================================================================
+//  4. Reward-Ranked Selection
+//
+//  Score all responses with a reward model, sort descending,
+//  and return the ranked indices plus their scores.
+//  Top-1 is the recommended response.
+//
+//  responses: array of candidates
+//  reward_fn: fn(response) -> float
+//
+//  Returns: [ranked_indices, ranked_scores]
+//           ranked_indices[0] is the top-1 pick
+// ===================================================================
+@pure
+fn is_reward_ranked(responses, reward_fn) {
+    let n = len(responses)
+    if n == 0 { return [[], []] }
+    // compute scores
+    let mut scores = is_zeros(n)
+    for i in 0..n {
+        scores[i] = reward_fn(responses[i])
+    }
+    // build index array and sort descending by score (selection sort)
+    let mut indices = is_zeros_int(n)
+    for i in 0..n { indices[i] = i }
+    for i in 0..n {
+        let mut best = i
+        for j in (i + 1)..n {
+            if scores[indices[j]] > scores[indices[best]] {
+                best = j
+            }
+        }
+        if best != i {
+            let tmp = indices[i]
+            indices[i] = indices[best]
+            indices[best] = tmp
+        }
+    }
+    // build sorted scores
+    let mut sorted_scores = is_zeros(n)
+    for i in 0..n {
+        sorted_scores[i] = scores[indices[i]]
+    }
+    return [indices, sorted_scores]
+}
+
+// ===================================================================
+//  5. Compute Budget Allocation
+//
+//  Given a total compute budget (e.g., seconds or tokens) and
+//  the cost of generating one sample, return the optimal N.
+//  Applies diminishing-returns heuristic: N = budget / cost_per,
+//  capped at a reasonable maximum.
+//
+//  budget:   total compute budget (float)
+//  cost_per: cost to generate one candidate (float)
+//
+//  Returns: optimal N (int, at least 1)
+// ===================================================================
+@pure
+fn is_compute_budget(budget, cost_per) {
+    if cost_per <= 0.0 { return 1 }
+    if budget <= 0.0 { return 1 }
+    let raw_n = to_int(budget / cost_per)
+    if raw_n < 1 { return 1 }
+    return raw_n
+}
+
+// Advanced budget allocation with diminishing returns model.
+// Uses sqrt-scaling heuristic: effective quality ~ sqrt(N),
+// so optimal N = min(budget/cost, max_n).
+// Also returns estimated quality multiplier.
+//
+// Returns: [n, quality_multiplier]
+@pure
+fn is_budget_optimal(budget, cost_per, max_n) {
+    let n_raw = is_compute_budget(budget, cost_per)
+    let mut n = n_raw
+    if n > max_n { n = max_n }
+    let quality_mult = is_sqrt(to_float(n))
+    return [n, quality_mult]
+}
+
+// ===================================================================
+//  6. Quality-vs-Cost Tradeoff
+//
+//  Given best scores at each sample count N=1..K, compute the
+//  marginal quality gain per additional sample.
+//
+//  best_scores_by_n: [float] where best_scores_by_n[i] = best
+//                     score achievable with (i+1) samples
+//
+//  Returns: [marginal_gains] of length K-1
+//           marginal_gains[i] = quality(N=i+2) - quality(N=i+1)
+// ===================================================================
+@pure
+fn is_quality_curve(best_scores_by_n) {
+    let k = len(best_scores_by_n)
+    if k < 2 { return [] }
+    let mut gains = []
+    for i in 1..k {
+        let gain = best_scores_by_n[i] - best_scores_by_n[i - 1]
+        gains = gains + [gain]
+    }
+    return gains
+}
+
+// Compute the efficiency ratio: quality gained per unit cost.
+// cost_per_sample is uniform cost for each additional sample.
+//
+// Returns: [efficiency_ratios] of length K-1
+@pure
+fn is_efficiency_ratio(best_scores_by_n, cost_per_sample) {
+    let gains = is_quality_curve(best_scores_by_n)
+    let k = len(gains)
+    let mut ratios = []
+    for i in 0..k {
+        if cost_per_sample > 0.0 {
+            ratios = ratios + [gains[i] / cost_per_sample]
+        } else {
+            ratios = ratios + [0.0]
+        }
+    }
+    return ratios
+}
+
+// Find the optimal N where marginal gain drops below a threshold.
+// Returns the largest N worth using.
+@pure
+fn is_optimal_n(best_scores_by_n, min_gain_threshold) {
+    let gains = is_quality_curve(best_scores_by_n)
+    let k = len(gains)
+    let mut optimal = 1
+    // FP tolerance: treat values within 1e-9 as meeting threshold
+    let fp_eps = 1.0e-9
+    for i in 0..k {
+        if gains[i] >= (min_gain_threshold - fp_eps) {
+            optimal = i + 2
+        }
+    }
+    return optimal
+}
+
+// ===================================================================
+//  7. Scaling Law Estimator
+//
+//  Predict quality at a larger N from measurements at smaller N.
+//  Uses a power-law model: Q(N) = a * N^b
+//  Fit from two data points (n1, q1) and (n2, q2).
+//
+//  Simple two-point fit:
+//    b = log(q2/q1) / log(n2/n1)
+//    a = q1 / n1^b
+//
+//  Then predict: Q(n_target) = a * n_target^b
+// ===================================================================
+@pure
+fn is_power_law_fit_two(n1, q1, n2, q2) {
+    // Fit Q(N) = a * N^b from two points
+    if n1 <= 0.0 { return [0.0, 0.0] }
+    if n2 <= 0.0 { return [0.0, 0.0] }
+    if q1 <= 0.0 { return [0.0, 0.0] }
+    if q2 <= 0.0 { return [0.0, 0.0] }
+    let log_ratio_q = is_log_approx(q2 / q1)
+    let log_ratio_n = is_log_approx(n2 / n1)
+    if is_abs(log_ratio_n) < 1.0e-10 { return [q1, 0.0] }
+    let b = log_ratio_q / log_ratio_n
+    let a = q1 / is_pow(n1, b)
+    return [a, b]
+}
+
+@pure
+fn is_power_law_predict(a, b, n) {
+    if n <= 0.0 { return 0.0 }
+    return a * is_pow(n, b)
+}
+
+// Full scaling law: fit from array of (n, quality) pairs using
+// least squares in log-log space, then predict at n_target.
+//
+// ns: [float] sample counts
+// qs: [float] quality at each sample count
+//
+// Returns: [a, b] for Q(N) = a * N^b
+@pure
+fn is_power_law_fit(ns, qs) {
+    let k = len(ns)
+    if k < 2 { return [0.0, 0.0] }
+    // log-log linear regression: log(q) = log(a) + b * log(n)
+    let mut sum_x = 0.0
+    let mut sum_y = 0.0
+    let mut sum_xx = 0.0
+    let mut sum_xy = 0.0
+    let mut count = 0
+    for i in 0..k {
+        if ns[i] > 0.0 {
+            if qs[i] > 0.0 {
+                let lx = is_log_approx(ns[i])
+                let ly = is_log_approx(qs[i])
+                sum_x = sum_x + lx
+                sum_y = sum_y + ly
+                sum_xx = sum_xx + lx * lx
+                sum_xy = sum_xy + lx * ly
+                count = count + 1
+            }
+        }
+    }
+    if count < 2 { return [0.0, 0.0] }
+    let cf = to_float(count)
+    let denom = cf * sum_xx - sum_x * sum_x
+    if is_abs(denom) < 1.0e-12 { return [0.0, 0.0] }
+    let b = (cf * sum_xy - sum_x * sum_y) / denom
+    let log_a = (sum_y - b * sum_x) / cf
+    let a = is_exp(log_a)
+    return [a, b]
+}
+
+// Predict quality at a target N using the scaling law estimator.
+// Convenience function that fits + predicts in one call.
+//
+// ns:       [float] measured sample counts
+// qs:       [float] measured quality values
+// n_target: float   desired sample count
+//
+// Returns: predicted quality (float)
+@pure
+fn is_scaling_predict(ns, qs, n_target) {
+    let params = is_power_law_fit(ns, qs)
+    let a = params[0]
+    let b = params[1]
+    return is_power_law_predict(a, b, n_target)
+}
+
+// ===================================================================
+//  Bonus: Best-of-N with early stopping
+//
+//  If we find a response exceeding a quality threshold, stop early
+//  to save compute. Returns [best_idx, best_score, n_evaluated].
+// ===================================================================
+@pure
+fn is_best_of_n_early(responses, score_fn, threshold) {
+    let n = len(responses)
+    if n == 0 { return [-1, 0.0, 0] }
+    let mut best_idx = 0
+    let mut best_score = score_fn(responses[0])
+    if best_score >= threshold { return [0, best_score, 1] }
+    for i in 1..n {
+        let s = score_fn(responses[i])
+        if s > best_score {
+            best_score = s
+            best_idx = i
+        }
+        if best_score >= threshold {
+            return [best_idx, best_score, i + 1]
+        }
+    }
+    return [best_idx, best_score, n]
+}
+
+// ===================================================================
+//  Bonus: Diverse sampling via deduplication
+//
+//  Remove duplicate answers before voting, keeping first occurrence.
+//  Returns: [unique_answers, unique_weights]
+// ===================================================================
+@pure
+fn is_deduplicate(answers, weights) {
+    let n = len(answers)
+    let mut unique_a = []
+    let mut unique_w = []
+    for i in 0..n {
+        let a = answers[i]
+        let mut dup = false
+        for j in 0..len(unique_a) {
+            if unique_a[j] == a { dup = true }
+        }
+        if dup == false {
+            unique_a = unique_a + [a]
+            unique_w = unique_w + [weights[i]]
+        }
+    }
+    return [unique_a, unique_w]
+}
+
+// ===================================================================
+//  Bonus: Confidence from N samples
+//
+//  Estimate the probability that the majority answer is correct
+//  based on agreement rate. Higher agreement = higher confidence.
+//
+//  Returns: agreement_fraction (float)
+// ===================================================================
+@pure
+fn is_agreement_confidence(answers) {
+    let vote = is_majority_vote(answers)
+    let n = len(answers)
+    if n == 0 { return 0.0 }
+    return to_float(vote[1]) / to_float(n)
+}
+
+println("[inference_scaling] loaded — best-of-N + majority vote + weighted vote + reward-ranked + budget + quality curve + scaling law")

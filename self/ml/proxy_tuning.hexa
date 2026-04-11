@@ -1,0 +1,538 @@
+// ===================================================================
+//  self/ml/proxy_tuning.hexa -- Proxy Tuning (Liu et al. 2024)
+//
+//  Steers a large base model using the difference between a tuned
+//  small model and a base small model, without touching the large
+//  model's weights.
+//
+//  Implements:
+//    1. Logit arithmetic: out = logits_tuned_small - logits_base_small
+//                               + logits_base_large
+//    2. Decoding integration: apply logit arithmetic at each step
+//    3. Temperature scaling on the delta
+//    4. Anti-expert: use base_small as anti-expert to subtract
+//    5. Contrastive decoding: max(0, logit_large - alpha * logit_small)
+//    6. Configurable alpha/beta weights
+//    7. Greedy and sampling modes with proxy adjustment
+//
+//  API:
+//    pt_logit_arithmetic(tuned_s, base_s, base_l)       -> [float]
+//    pt_weighted_arithmetic(tuned_s, base_s, base_l, alpha, beta)
+//    pt_temperature_delta(tuned_s, base_s, base_l, temp)
+//    pt_anti_expert(expert_logits, anti_logits, alpha)
+//    pt_contrastive(logit_large, logit_small, alpha)
+//    pt_softmax(logits)                                  -> [float]
+//    pt_argmax(logits)                                   -> int
+//    pt_sample(probs)                                    -> int
+//    pt_generate_greedy(tuned_fn, base_s_fn, base_l_fn, start, n, cfg)
+//    pt_generate_sample(tuned_fn, base_s_fn, base_l_fn, start, n, cfg)
+//    pt_config(alpha, beta, temp, mode)                  -> config map
+//    pt_decode_step(tuned_s, base_s, base_l, cfg)        -> [float]
+//    pt_kl_divergence(p, q)                              -> float
+//    pt_quality_score(tuned_s, base_s, base_l)           -> float
+//
+//  AI-NATIVE attrs:
+//    @pure  -- no side effects
+//    @hot   -- called during generation
+// ===================================================================
+
+// -- helpers --------------------------------------------------------
+
+fn pt_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn pt_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn pt_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn pt_log(x) {
+    if x <= 0.0 { return -20.0 }
+    let mut v = x
+    let mut shift = 0.0
+    for _i in 0..20 {
+        if v > 2.0 {
+            v = v / 2.718281828
+            shift = shift + 1.0
+        }
+    }
+    let mut y = v - 1.0
+    let mut result = 0.0
+    let mut term = y
+    for n in 1..30 {
+        let nf = to_float(n)
+        let mut sign = 1.0
+        if n % 2 == 0 { sign = -1.0 }
+        result = result + sign * term / nf
+        term = term * y
+    }
+    return result + shift
+}
+
+fn pt_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn pt_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+fn pt_max_f(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn pt_min_f(a, b) {
+    if a < b { return a }
+    return b
+}
+
+// ===================================================================
+//  1. Logit Arithmetic  (core equation)
+//
+//  output[i] = logits_tuned_small[i] - logits_base_small[i]
+//              + logits_base_large[i]
+//
+//  The delta (tuned_small - base_small) captures what the small
+//  model learned from fine-tuning, and transfers it to the large
+//  model's logits.
+// ===================================================================
+@pure @hot
+fn pt_logit_arithmetic(tuned_s, base_s, base_l) {
+    let n = len(base_l)
+    let mut out = pt_zeros(n)
+    for i in 0..n {
+        out[i] = tuned_s[i] - base_s[i] + base_l[i]
+    }
+    return out
+}
+
+// ===================================================================
+//  6. Configurable alpha/beta weights
+//
+//  output[i] = base_l[i] + alpha * (tuned_s[i] - beta * base_s[i])
+//
+//  alpha controls the transfer strength, beta controls the
+//  anti-expert weight. Default alpha=1.0, beta=1.0 reduces
+//  to the standard equation.
+// ===================================================================
+@pure @hot
+fn pt_weighted_arithmetic(tuned_s, base_s, base_l, alpha, beta) {
+    let n = len(base_l)
+    let mut out = pt_zeros(n)
+    for i in 0..n {
+        let delta = tuned_s[i] - beta * base_s[i]
+        out[i] = base_l[i] + alpha * delta
+    }
+    return out
+}
+
+// ===================================================================
+//  3. Temperature Scaling on the Delta
+//
+//  output[i] = base_l[i] + (tuned_s[i] - base_s[i]) / temp
+//
+//  Lower temperature sharpens the delta influence.
+//  Higher temperature softens it.
+// ===================================================================
+@pure @hot
+fn pt_temperature_delta(tuned_s, base_s, base_l, temp) {
+    let n = len(base_l)
+    let safe_temp = pt_max_f(temp, 0.01)
+    let mut out = pt_zeros(n)
+    for i in 0..n {
+        let delta = tuned_s[i] - base_s[i]
+        out[i] = base_l[i] + delta / safe_temp
+    }
+    return out
+}
+
+// ===================================================================
+//  4. Anti-Expert
+//
+//  Treat base_small as an "anti-expert" whose knowledge we subtract.
+//  output[i] = expert_logits[i] - alpha * anti_logits[i]
+//
+//  Useful when the base small model captures generic/undesired
+//  behavior that we want to remove from the expert output.
+// ===================================================================
+@pure @hot
+fn pt_anti_expert(expert_logits, anti_logits, alpha) {
+    let n = len(expert_logits)
+    let mut out = pt_zeros(n)
+    for i in 0..n {
+        out[i] = expert_logits[i] - alpha * anti_logits[i]
+    }
+    return out
+}
+
+// ===================================================================
+//  5. Contrastive Decoding
+//
+//  output[i] = max(0, logit_large[i] - alpha * logit_small[i])
+//
+//  Suppresses tokens where the small model is confident,
+//  keeping only tokens where the large model "knows more."
+// ===================================================================
+@pure @hot
+fn pt_contrastive(logit_large, logit_small, alpha) {
+    let n = len(logit_large)
+    let mut out = pt_zeros(n)
+    for i in 0..n {
+        let val = logit_large[i] - alpha * logit_small[i]
+        if val > 0.0 {
+            out[i] = val
+        }
+    }
+    return out
+}
+
+// ===================================================================
+//  Softmax -- convert logits to probabilities
+// ===================================================================
+@pure
+fn pt_softmax(logits) {
+    let n = len(logits)
+    let mut mx = logits[0]
+    for i in 1..n {
+        if logits[i] > mx { mx = logits[i] }
+    }
+    let mut exps = pt_zeros(n)
+    let mut z = 0.0
+    for i in 0..n {
+        exps[i] = pt_exp(logits[i] - mx)
+        z = z + exps[i]
+    }
+    if z < 1.0e-12 { z = 1.0e-12 }
+    let mut out = pt_zeros(n)
+    for i in 0..n {
+        out[i] = exps[i] / z
+    }
+    return out
+}
+
+// ===================================================================
+//  Argmax -- greedy selection
+// ===================================================================
+@pure
+fn pt_argmax(logits) {
+    let n = len(logits)
+    let mut best = 0
+    let mut best_v = logits[0]
+    for i in 1..n {
+        if logits[i] > best_v {
+            best_v = logits[i]
+            best = i
+        }
+    }
+    return best
+}
+
+// ===================================================================
+//  Sampling -- pick token proportional to probabilities
+//
+//  Uses a simple linear scan of cumulative distribution.
+//  Input: probability array (already softmaxed).
+// ===================================================================
+fn pt_sample(probs) {
+    let n = len(probs)
+    let r = random()
+    let mut cumulative = 0.0
+    for i in 0..n {
+        cumulative = cumulative + probs[i]
+        if r < cumulative { return i }
+    }
+    return n - 1
+}
+
+// ===================================================================
+//  Configuration -- encapsulate tuning knobs
+//
+//  mode: "greedy" | "sample" | "contrastive"
+//  alpha: transfer strength (default 1.0)
+//  beta: anti-expert weight (default 1.0)
+//  temp: temperature for delta scaling (default 1.0)
+// ===================================================================
+@pure
+fn pt_config(alpha, beta, temp, mode) {
+    return #{
+        "alpha": alpha,
+        "beta": beta,
+        "temp": temp,
+        "mode": mode
+    }
+}
+
+@pure
+fn pt_config_default() {
+    return pt_config(1.0, 1.0, 1.0, "greedy")
+}
+
+// ===================================================================
+//  2. Decoding Integration -- single step
+//
+//  Apply logit arithmetic at each generation step.
+//  Uses configuration to select the decoding strategy.
+//
+//  Returns: adjusted logits
+// ===================================================================
+@pure @hot
+fn pt_decode_step(tuned_s, base_s, base_l, cfg) {
+    let alpha = cfg["alpha"]
+    let beta = cfg["beta"]
+    let temp = cfg["temp"]
+    let mode = cfg["mode"]
+
+    if mode == "contrastive" {
+        return pt_contrastive(base_l, base_s, alpha)
+    }
+
+    // Weighted arithmetic with temperature
+    let n = len(base_l)
+    let safe_temp = pt_max_f(temp, 0.01)
+    let mut out = pt_zeros(n)
+    for i in 0..n {
+        let delta = tuned_s[i] - beta * base_s[i]
+        out[i] = base_l[i] + alpha * delta / safe_temp
+    }
+    return out
+}
+
+// ===================================================================
+//  Token selection -- pick token from adjusted logits
+// ===================================================================
+fn pt_select_token(adjusted_logits, cfg) {
+    let mode = cfg["mode"]
+    if mode == "sample" {
+        let probs = pt_softmax(adjusted_logits)
+        return pt_sample(probs)
+    }
+    return pt_argmax(adjusted_logits)
+}
+
+// ===================================================================
+//  7. Greedy Generation with Proxy Adjustment
+//
+//  At each step:
+//    1. Query all three models for logits
+//    2. Apply logit arithmetic via decode_step
+//    3. Select token greedily
+//
+//  Returns: array of generated token IDs
+// ===================================================================
+@hot
+fn pt_generate_greedy(tuned_fn, base_s_fn, base_l_fn, start, n_tokens, cfg) {
+    let mut tokens = [start]
+    let mut prev = start
+    for _t in 0..n_tokens {
+        let ts = tuned_fn(prev)
+        let bs = base_s_fn(prev)
+        let bl = base_l_fn(prev)
+        let adjusted = pt_decode_step(ts, bs, bl, cfg)
+        let next = pt_argmax(adjusted)
+        tokens = tokens + [next]
+        prev = next
+    }
+    return tokens
+}
+
+// ===================================================================
+//  7b. Sampling Generation with Proxy Adjustment
+//
+//  Same as greedy but samples from the adjusted distribution.
+// ===================================================================
+@hot
+fn pt_generate_sample(tuned_fn, base_s_fn, base_l_fn, start, n_tokens, cfg) {
+    let mut tokens = [start]
+    let mut prev = start
+    for _t in 0..n_tokens {
+        let ts = tuned_fn(prev)
+        let bs = base_s_fn(prev)
+        let bl = base_l_fn(prev)
+        let adjusted = pt_decode_step(ts, bs, bl, cfg)
+        let probs = pt_softmax(adjusted)
+        let next = pt_sample(probs)
+        tokens = tokens + [next]
+        prev = next
+    }
+    return tokens
+}
+
+// ===================================================================
+//  KL Divergence -- D_KL(P || Q)
+//
+//  Measures how much distribution P diverges from Q.
+//  Used to measure the impact of proxy tuning on the output.
+//  Input: two probability arrays (already softmaxed).
+// ===================================================================
+@pure
+fn pt_kl_divergence(p, q) {
+    let n = len(p)
+    let mut kl = 0.0
+    for i in 0..n {
+        let pi = pt_max_f(p[i], 1.0e-12)
+        let qi = pt_max_f(q[i], 1.0e-12)
+        kl = kl + pi * (pt_log(pi) - pt_log(qi))
+    }
+    if kl < 0.0 { kl = 0.0 }
+    return kl
+}
+
+// ===================================================================
+//  Quality Score -- how much the proxy delta improves over base
+//
+//  Computes the cosine-like alignment between delta and base_large
+//  directions.  Higher score = more coherent transfer.
+// ===================================================================
+@pure
+fn pt_quality_score(tuned_s, base_s, base_l) {
+    let n = len(base_l)
+    let mut dot_dl = 0.0
+    let mut norm_d = 0.0
+    let mut norm_l = 0.0
+    for i in 0..n {
+        let delta = tuned_s[i] - base_s[i]
+        dot_dl = dot_dl + delta * base_l[i]
+        norm_d = norm_d + delta * delta
+        norm_l = norm_l + base_l[i] * base_l[i]
+    }
+    let denom = pt_sqrt(norm_d) * pt_sqrt(norm_l)
+    if denom < 1.0e-12 { return 0.0 }
+    return dot_dl / denom
+}
+
+// ===================================================================
+//  Top-K Filtering -- zero out all but top k logits
+// ===================================================================
+@pure
+fn pt_topk_filter(logits, k) {
+    let n = len(logits)
+    let mut kk = k
+    if kk > n { kk = n }
+    if kk < 1 { kk = 1 }
+
+    // Find the k-th largest value
+    let mut sorted_vals = []
+    for i in 0..n {
+        sorted_vals = sorted_vals + [logits[i]]
+    }
+    // Simple selection: sort descending, take k-th
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if sorted_vals[j] > sorted_vals[i] {
+                let tmp = sorted_vals[i]
+                sorted_vals[i] = sorted_vals[j]
+                sorted_vals[j] = tmp
+            }
+        }
+    }
+    let threshold = sorted_vals[kk - 1]
+
+    let mut out = pt_zeros(n)
+    for i in 0..n {
+        if logits[i] >= threshold {
+            out[i] = logits[i]
+        } else {
+            out[i] = -1000.0
+        }
+    }
+    return out
+}
+
+// ===================================================================
+//  Ensemble -- combine multiple proxy deltas
+//
+//  Given N tuned small models and their base, average the deltas.
+//  tuned_list: array of logit arrays from different tuned models
+//  base_s: base small logits
+//  base_l: base large logits
+// ===================================================================
+@pure
+fn pt_ensemble(tuned_list, base_s, base_l) {
+    let n = len(base_l)
+    let k = len(tuned_list)
+    if k == 0 { return base_l }
+    let mut out = pt_zeros(n)
+    for i in 0..n {
+        let mut delta_sum = 0.0
+        for j in 0..k {
+            let ts = tuned_list[j]
+            delta_sum = delta_sum + (ts[i] - base_s[i])
+        }
+        out[i] = base_l[i] + delta_sum / to_float(k)
+    }
+    return out
+}
+
+// ===================================================================
+//  Adaptive Alpha -- dynamically scale alpha per position
+//
+//  When the delta is large (confident), trust it more.
+//  When the delta is small, fall back to base_large.
+//
+//  Returns: adjusted logits with position-adaptive alpha
+// ===================================================================
+@pure @hot
+fn pt_adaptive_alpha(tuned_s, base_s, base_l, base_alpha) {
+    let n = len(base_l)
+    // Compute average absolute delta for normalization
+    let mut sum_abs = 0.0
+    for i in 0..n {
+        sum_abs = sum_abs + pt_abs(tuned_s[i] - base_s[i])
+    }
+    let avg_abs = sum_abs / to_float(n)
+    if avg_abs < 1.0e-12 { return base_l }
+
+    let mut out = pt_zeros(n)
+    for i in 0..n {
+        let delta = tuned_s[i] - base_s[i]
+        // Scale alpha by how large this particular delta is
+        let local_strength = pt_abs(delta) / avg_abs
+        let alpha_i = base_alpha * pt_min_f(local_strength, 2.0)
+        out[i] = base_l[i] + alpha_i * delta
+    }
+    return out
+}
+
+// ===================================================================
+//  Delta Norm -- magnitude of proxy delta
+//
+//  Useful for monitoring how much the tuning changes the output.
+// ===================================================================
+@pure
+fn pt_delta_norm(tuned_s, base_s) {
+    let n = len(tuned_s)
+    let mut sum_sq = 0.0
+    for i in 0..n {
+        let d = tuned_s[i] - base_s[i]
+        sum_sq = sum_sq + d * d
+    }
+    return pt_sqrt(sum_sq)
+}
+
+println("[proxy_tuning] loaded -- logit arithmetic + contrastive + anti-expert + adaptive alpha")

@@ -1,0 +1,584 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/scheduled_sampling.hexa — Scheduled Sampling (#169)
+//
+//  Teacher forcing -> free-running gradual transition to reduce
+//  exposure bias (Bengio et al. 2015).
+//
+//  Implements:
+//    1. Sampling schedules      — linear, exponential, inverse sigmoid
+//    2. Mixed teacher/free fwd  — probabilistic teacher vs model output
+//    3. Curriculum integration   — align schedule with training curriculum
+//    4. Error accumulation       — measure exposure bias over steps
+//    5. Schedule config          — start/end prob, warmup, decay type
+//    6. Per-token decision       — independent sampling per position
+//    7. Evaluation mode          — fully free-running for eval
+//
+//  API (pure where noted):
+//    ss_linear_decay(step, total, start_p, end_p)           -> float
+//    ss_exp_decay(step, total, start_p, end_p)              -> float
+//    ss_inv_sigmoid(step, total, k)                         -> float
+//    ss_schedule(step, total, cfg)                          -> float
+//    ss_per_token_decisions(prob, seq_len, seed, step)      -> [int]
+//    ss_mixed_forward(teacher, model_out, decisions)        -> [int]
+//    ss_free_running_forward(logits_fn, start_tok, n)       -> [int]
+//    ss_teacher_forward(teacher_seq)                        -> [int]
+//    ss_train_step(teacher, logits_fn, step, total, cfg, seed) -> map
+//    ss_eval_step(logits_fn, start_tok, n)                  -> [int]
+//    ss_error_accum(teacher, predicted)                     -> map
+//    ss_error_over_steps(teacher, logits_fn, total, cfg)    -> [float]
+//    ss_curriculum_schedule(step, total, competence, cfg)   -> float
+//    ss_make_config(start_p, end_p, warmup, decay_type)     -> map
+//    ss_warmup_prob(step, warmup_steps, start_p)            -> float
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+//    @hot   — called every training step
+// ═══════════════════════════════════════════════════════════════════
+
+// ── helpers ──────────────────────────────────────────────────────
+
+fn ss_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn ss_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn ss_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn ss_log(x) {
+    if x <= 0.0 { return -30.0 }
+    let mut v = x
+    let mut count = 0
+    while v > 2.0 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    let d = v - 1.0
+    return to_float(count) + d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+}
+
+fn ss_clamp(x, lo, hi) {
+    if x < lo { return lo }
+    if x > hi { return hi }
+    return x
+}
+
+fn ss_min(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn ss_max(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn ss_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn ss_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+// Deterministic pseudo-random in [0.0, 1.0) from seed + index
+fn ss_hash_float(seed, idx) {
+    let mut h = (seed + 1) * 2654435761 + idx * 1315423911 + 7919
+    h = h % 1000003
+    if h < 0 { h = 0 - h }
+    return to_float(h % 10000) / 10000.0
+}
+
+// Argmax over an array of floats
+fn ss_argmax(logits) {
+    let n = len(logits)
+    let mut best = 0
+    let mut best_v = logits[0]
+    for i in 1..n {
+        if logits[i] > best_v {
+            best_v = logits[i]
+            best = i
+        }
+    }
+    return best
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Schedule Config — encapsulate schedule parameters
+//
+//  Returns a map with: start_prob, end_prob, warmup_steps, decay_type
+//  decay_type: 0=linear, 1=exponential, 2=inverse_sigmoid
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ss_make_config(start_prob, end_prob, warmup_steps, decay_type) {
+    return #{
+        "start_prob": start_prob,
+        "end_prob": end_prob,
+        "warmup_steps": warmup_steps,
+        "decay_type": decay_type
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Warmup — hold probability at start_prob during warmup phase
+//
+//  During warmup_steps, teacher forcing probability stays at start_prob.
+//  Returns start_prob if step < warmup_steps, else start_prob.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ss_warmup_prob(step, warmup_steps, start_prob) {
+    if step < warmup_steps { return start_prob }
+    return start_prob
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Linear Decay Schedule
+//
+//  p(t) = start_prob - (start_prob - end_prob) * (t / total)
+//  Linearly decreases teacher forcing probability from start to end.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ss_linear_decay(step, total_steps, start_prob, end_prob) {
+    if total_steps <= 0 { return end_prob }
+    let ratio = to_float(step) / to_float(total_steps)
+    let r = ss_clamp(ratio, 0.0, 1.0)
+    let p = start_prob - (start_prob - end_prob) * r
+    return ss_clamp(p, end_prob, start_prob)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Exponential Decay Schedule
+//
+//  p(t) = end_prob + (start_prob - end_prob) * exp(-5 * t/total)
+//  Decays faster early, slower later.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ss_exp_decay(step, total_steps, start_prob, end_prob) {
+    if total_steps <= 0 { return end_prob }
+    let ratio = to_float(step) / to_float(total_steps)
+    let r = ss_clamp(ratio, 0.0, 1.0)
+    let decay = ss_exp(-5.0 * r)
+    let p = end_prob + (start_prob - end_prob) * decay
+    return ss_clamp(p, end_prob, start_prob)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Inverse Sigmoid Decay Schedule
+//
+//  p(t) = 1 / (1 + exp(k * (t/total - 0.5)))
+//  S-shaped transition: slow start, fast middle, slow end.
+//  k controls steepness (typical: 5-15).
+//  Scaled to [end_prob, start_prob] range.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ss_inv_sigmoid(step, total_steps, k) {
+    if total_steps <= 0 { return 0.0 }
+    let ratio = to_float(step) / to_float(total_steps)
+    let r = ss_clamp(ratio, 0.0, 1.0)
+    let p = 1.0 / (1.0 + ss_exp(k * (r - 0.5)))
+    return ss_clamp(p, 0.0, 1.0)
+}
+
+// Scaled inverse sigmoid between start_prob and end_prob
+@pure
+fn ss_inv_sigmoid_scaled(step, total_steps, k, start_prob, end_prob) {
+    let raw = ss_inv_sigmoid(step, total_steps, k)
+    let p = end_prob + (start_prob - end_prob) * raw
+    return ss_clamp(p, end_prob, start_prob)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Unified Schedule — dispatch based on config
+//
+//  cfg: map from ss_make_config
+//  Handles warmup, then delegates to the chosen decay type.
+//  Returns teacher forcing probability in [end_prob, start_prob].
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn ss_schedule(step, total_steps, cfg) {
+    let start_p = cfg["start_prob"]
+    let end_p = cfg["end_prob"]
+    let warmup = cfg["warmup_steps"]
+    let dtype = cfg["decay_type"]
+
+    // During warmup, hold at start_prob
+    if step < warmup { return start_p }
+
+    // Effective step after warmup
+    let eff_step = step - warmup
+    let eff_total = total_steps - warmup
+    if eff_total <= 0 { return end_p }
+
+    if dtype == 0 { return ss_linear_decay(eff_step, eff_total, start_p, end_p) }
+    if dtype == 1 { return ss_exp_decay(eff_step, eff_total, start_p, end_p) }
+    if dtype == 2 { return ss_inv_sigmoid_scaled(eff_step, eff_total, 10.0, start_p, end_p) }
+    // Default: linear
+    return ss_linear_decay(eff_step, eff_total, start_p, end_p)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Per-Token Decision — independent Bernoulli per position
+//
+//  For each position in [0, seq_len), draw a pseudo-random number.
+//  If rand < prob => 1 (use teacher), else 0 (use model output).
+//  Returns array of 0/1 decisions.
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn ss_per_token_decisions(prob, seq_len, seed, step) {
+    let mut decisions = ss_zeros_int(seq_len)
+    for i in 0..seq_len {
+        let r = ss_hash_float(seed + step * 997, i)
+        if r < prob {
+            decisions[i] = 1
+        }
+    }
+    return decisions
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Mixed Teacher/Free-Running Forward
+//
+//  Given teacher sequence and model output sequence (both arrays of
+//  token IDs), and per-token decisions:
+//    decision[i] == 1 => use teacher[i]
+//    decision[i] == 0 => use model_out[i]
+//
+//  Returns the mixed input sequence for the next decoder step.
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn ss_mixed_forward(teacher_seq, model_out, decisions) {
+    let n = len(teacher_seq)
+    let mut mixed = ss_zeros_int(n)
+    for i in 0..n {
+        if decisions[i] == 1 {
+            mixed[i] = teacher_seq[i]
+        } else {
+            mixed[i] = model_out[i]
+        }
+    }
+    return mixed
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Free-Running Forward — model generates all tokens autoregressively
+//
+//  logits_fn(prev_token) -> [vocab_size] logits
+//  Generates n_tokens starting from start_token.
+//  Returns: array of generated token IDs (length n_tokens + 1).
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn ss_free_running_forward(logits_fn, start_token, n_tokens) {
+    let mut tokens = [start_token]
+    let mut prev = start_token
+    for _t in 0..n_tokens {
+        let logits = logits_fn(prev)
+        let next = ss_argmax(logits)
+        tokens = tokens + [next]
+        prev = next
+    }
+    return tokens
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Teacher Forward — just return the teacher sequence (identity)
+//
+//  In teacher forcing, the input at each step is the ground truth.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ss_teacher_forward(teacher_seq) {
+    let n = len(teacher_seq)
+    let mut out = ss_zeros_int(n)
+    for i in 0..n {
+        out[i] = teacher_seq[i]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Full Train Step with Scheduled Sampling
+//
+//  1. Compute teacher forcing probability from schedule
+//  2. Generate model predictions (free-running)
+//  3. Make per-token decisions
+//  4. Mix teacher/model outputs
+//  5. Return map with: prob, mixed_seq, model_seq, n_teacher, n_free
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn ss_train_step(teacher_seq, logits_fn, step, total_steps, cfg, seed) {
+    let prob = ss_schedule(step, total_steps, cfg)
+    let seq_len = len(teacher_seq)
+
+    // Generate model predictions (free-running from teacher[0])
+    let start_tok = teacher_seq[0]
+    let model_tokens = ss_free_running_forward(logits_fn, start_tok, seq_len - 1)
+
+    // Per-token decisions
+    let decisions = ss_per_token_decisions(prob, seq_len, seed, step)
+
+    // Mix teacher and model outputs
+    let mixed = ss_mixed_forward(teacher_seq, model_tokens, decisions)
+
+    // Count teacher vs free-running tokens
+    let mut n_teacher = 0
+    let mut n_free = 0
+    for i in 0..seq_len {
+        if decisions[i] == 1 {
+            n_teacher = n_teacher + 1
+        } else {
+            n_free = n_free + 1
+        }
+    }
+
+    return #{
+        "prob": prob,
+        "mixed_seq": mixed,
+        "model_seq": model_tokens,
+        "decisions": decisions,
+        "n_teacher": n_teacher,
+        "n_free": n_free
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Evaluation Mode — fully free-running (no teacher)
+//
+//  For evaluation, always use model output (teacher prob = 0).
+//  Returns the generated token sequence.
+// ═══════════════════════════════════════════════════════════════════
+fn ss_eval_step(logits_fn, start_token, n_tokens) {
+    return ss_free_running_forward(logits_fn, start_token, n_tokens)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Error Accumulation Tracker
+//
+//  Measures exposure bias by comparing teacher sequence to predicted.
+//  Computes per-position error and cumulative error.
+//
+//  Returns map: mismatches, total, error_rate, cumulative_errors
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ss_error_accum(teacher_seq, predicted_seq) {
+    let n = ss_min(len(teacher_seq), len(predicted_seq))
+    let mut mismatches = 0
+    let mut cumulative = ss_zeros(n)
+    let mut running = 0.0
+    for i in 0..n {
+        if teacher_seq[i] != predicted_seq[i] {
+            mismatches = mismatches + 1
+            running = running + 1.0
+        }
+        cumulative[i] = running
+    }
+    let error_rate = to_float(mismatches) / to_float(ss_max(n, 1))
+    return #{
+        "mismatches": mismatches,
+        "total": n,
+        "error_rate": error_rate,
+        "cumulative_errors": cumulative
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Error Accumulation Trend Over Training Steps
+//
+//  Runs free-running generation at each checkpoint step and
+//  measures error against teacher sequence.
+//  Returns array of error rates at each sampled step.
+// ═══════════════════════════════════════════════════════════════════
+fn ss_error_over_steps(teacher_seq, logits_fn, total_steps, cfg, n_checkpoints) {
+    let mut errors = ss_zeros(n_checkpoints)
+    let seq_len = len(teacher_seq)
+    let start_tok = teacher_seq[0]
+    for c in 0..n_checkpoints {
+        let step = (c * total_steps) / n_checkpoints
+        let prob = ss_schedule(step, total_steps, cfg)
+        // At this step, generate and measure error
+        let predicted = ss_free_running_forward(logits_fn, start_tok, seq_len - 1)
+        let err_info = ss_error_accum(teacher_seq, predicted)
+        errors[c] = err_info["error_rate"]
+    }
+    return errors
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Exposure Bias Score
+//
+//  Compare error rate of teacher-forced vs free-running.
+//  Higher gap means more exposure bias.
+//  Returns: bias = free_error - teacher_error
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ss_exposure_bias(teacher_errors, free_errors) {
+    let n = ss_min(len(teacher_errors), len(free_errors))
+    if n == 0 { return 0.0 }
+    let mut t_sum = 0.0
+    let mut f_sum = 0.0
+    for i in 0..n {
+        t_sum = t_sum + teacher_errors[i]
+        f_sum = f_sum + free_errors[i]
+    }
+    let t_avg = t_sum / to_float(n)
+    let f_avg = f_sum / to_float(n)
+    return f_avg - t_avg
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Curriculum Integration — align schedule with curriculum competence
+//
+//  Adjusts teacher forcing probability based on curriculum competence.
+//  Higher competence => lower teacher forcing (model is more capable).
+//  p_adjusted = p_schedule * (1 - alpha * competence)
+//  alpha controls how much curriculum affects the schedule.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ss_curriculum_schedule(step, total_steps, competence, cfg) {
+    let base_prob = ss_schedule(step, total_steps, cfg)
+    // Scale down teacher forcing as competence increases
+    let alpha = 0.5
+    let adjusted = base_prob * (1.0 - alpha * ss_clamp(competence, 0.0, 1.0))
+    return ss_clamp(adjusted, 0.0, 1.0)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Curriculum-aware train step
+//
+//  Same as ss_train_step but uses curriculum-adjusted probability.
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn ss_curriculum_train_step(teacher_seq, logits_fn, step, total_steps, cfg, competence, seed) {
+    let prob = ss_curriculum_schedule(step, total_steps, competence, cfg)
+    let seq_len = len(teacher_seq)
+    let start_tok = teacher_seq[0]
+    let model_tokens = ss_free_running_forward(logits_fn, start_tok, seq_len - 1)
+    let decisions = ss_per_token_decisions(prob, seq_len, seed, step)
+    let mixed = ss_mixed_forward(teacher_seq, model_tokens, decisions)
+    let mut n_teacher = 0
+    let mut n_free = 0
+    for i in 0..seq_len {
+        if decisions[i] == 1 {
+            n_teacher = n_teacher + 1
+        } else {
+            n_free = n_free + 1
+        }
+    }
+    return #{
+        "prob": prob,
+        "mixed_seq": mixed,
+        "model_seq": model_tokens,
+        "n_teacher": n_teacher,
+        "n_free": n_free,
+        "competence": competence
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Token-level Error Analysis
+//
+//  Returns per-position error indicators (0=correct, 1=wrong)
+//  and the position of first error (or -1 if all correct).
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ss_token_errors(teacher_seq, predicted_seq) {
+    let n = ss_min(len(teacher_seq), len(predicted_seq))
+    let mut errors = ss_zeros_int(n)
+    let mut first_err = -1
+    for i in 0..n {
+        if teacher_seq[i] != predicted_seq[i] {
+            errors[i] = 1
+            if first_err == -1 { first_err = i }
+        }
+    }
+    return #{ "errors": errors, "first_error_pos": first_err }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Error Propagation Rate
+//
+//  After the first error, what fraction of subsequent tokens are wrong?
+//  This measures how errors compound in free-running mode.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ss_error_propagation(teacher_seq, predicted_seq) {
+    let n = ss_min(len(teacher_seq), len(predicted_seq))
+    let mut first_err = -1
+    for i in 0..n {
+        if teacher_seq[i] != predicted_seq[i] {
+            first_err = i
+            break
+        }
+    }
+    if first_err == -1 { return 0.0 }
+    let remaining = n - first_err
+    if remaining <= 0 { return 0.0 }
+    let mut wrong = 0
+    for i in first_err..n {
+        if teacher_seq[i] != predicted_seq[i] {
+            wrong = wrong + 1
+        }
+    }
+    return to_float(wrong) / to_float(remaining)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Schedule Comparison — run all three schedules and return probs
+//
+//  Returns: [linear_prob, exp_prob, inv_sigmoid_prob]
+//  Useful for visualizing/comparing schedules at a given step.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ss_compare_schedules(step, total_steps, start_prob, end_prob) {
+    let lin = ss_linear_decay(step, total_steps, start_prob, end_prob)
+    let exp_p = ss_exp_decay(step, total_steps, start_prob, end_prob)
+    let sig = ss_inv_sigmoid_scaled(step, total_steps, 10.0, start_prob, end_prob)
+    return [lin, exp_p, sig]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Batch Scheduled Sampling — process multiple sequences
+//
+//  teacher_batch: array of teacher sequences (all same length)
+//  Returns array of mixed sequences.
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn ss_batch_train(teacher_batch, logits_fn, step, total_steps, cfg, seed) {
+    let batch_size = len(teacher_batch)
+    let mut results = []
+    for b in 0..batch_size {
+        let teacher_seq = teacher_batch[b]
+        let result = ss_train_step(teacher_seq, logits_fn, step, total_steps, cfg, seed + b)
+        results = results + [result]
+    }
+    return results
+}
+
+println("[scheduled_sampling] loaded — linear/exp/inv-sigmoid decay + mixed forward + curriculum integration + error tracking")

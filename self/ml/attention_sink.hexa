@@ -1,0 +1,711 @@
+// ===================================================================
+//  self/ml/attention_sink.hexa — Attention Sink (StreamingLLM)
+//
+//  First tokens in autoregressive LLMs accumulate disproportionate
+//  attention mass ("attention sinks"). StreamingLLM exploits this by
+//  always retaining sink tokens + a rolling window, enabling
+//  infinite-length generation with bounded KV cache.
+//
+//  Implements:
+//    1. Sink token detection — identify tokens whose cumulative
+//       attention scores exceed a threshold relative to the mean
+//    2. Sink-aware KV eviction — always keep sink tokens, evict
+//       from the middle based on lowest attention score
+//    3. Rolling window — maintain recent window + sink tokens,
+//       drop everything in between
+//    4. Attention redistribution — when evicting tokens,
+//       redistribute their attention mass to remaining tokens
+//    5. StreamingLLM decode — full decode loop with bounded
+//       KV cache for infinite-length generation
+//    6. Perplexity stability check — verify output quality
+//       does not degrade as generation length increases
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+//    @hot   — performance-critical path
+// ===================================================================
+
+// ===================================================================
+//  Utility helpers
+// ===================================================================
+
+fn as_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn as_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn as_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn as_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+fn as_ones(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [1.0] }
+    return v
+}
+
+fn as_max_f(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn as_min_f(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn as_min_i(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn as_max_i(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn as_floor(x) {
+    return to_int(x)
+}
+
+fn as_exp_approx(x) {
+    let mut clamped = x
+    if clamped > 20.0 { clamped = 20.0 }
+    if clamped < -20.0 { clamped = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..25 {
+        term = term * clamped / to_float(i)
+        result = result + term
+    }
+    if result < 1.0e-30 { return 1.0e-30 }
+    return result
+}
+
+fn as_log_approx(x) {
+    if x <= 0.0 { return -30.0 }
+    let mut val = x
+    let mut adjust = 0.0
+    while val > 2.0 {
+        val = val / 2.718281828
+        adjust = adjust + 1.0
+    }
+    while val < 0.5 {
+        val = val * 2.718281828
+        adjust = adjust - 1.0
+    }
+    let y = (val - 1.0) / (val + 1.0)
+    let y2 = y * y
+    let mut s = y
+    let mut t = y
+    for i in 0..8 {
+        t = t * y2
+        let denom = to_float(2 * i + 3)
+        s = s + t / denom
+    }
+    return 2.0 * s + adjust
+}
+
+// Dot product
+@pure
+fn as_dot(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    for i in 0..n {
+        s = s + a[i] * b[i]
+    }
+    return s
+}
+
+// ===================================================================
+//  1. KV Cache data structure for Attention Sink
+//
+//  #{
+//    "keys":       [[dim floats], ...],
+//    "values":     [[dim floats], ...],
+//    "scores":     [float, ...],         // cumulative attention scores
+//    "ages":       [int, ...],           // insertion step
+//    "is_sink":    [int, ...],           // 1 if detected as sink token
+//    "dim":        int,
+//    "step":       int,
+//    "n_sink":     int,                  // number of sink slots to reserve
+//    "window_size": int                  // rolling window size
+//  }
+// ===================================================================
+
+fn as_create(dim, n_sink, window_size) {
+    return #{
+        "keys": [],
+        "values": [],
+        "scores": [],
+        "ages": [],
+        "is_sink": [],
+        "dim": dim,
+        "step": 0,
+        "n_sink": n_sink,
+        "window_size": window_size
+    }
+}
+
+fn as_size(cache) {
+    return len(cache["keys"])
+}
+
+// Insert a new KV entry
+fn as_insert(cache, key_vec, val_vec) {
+    let mut c = cache
+    let mut ks = c["keys"]
+    ks = ks + [key_vec]
+    c["keys"] = ks
+    let mut vs = c["values"]
+    vs = vs + [val_vec]
+    c["values"] = vs
+    let mut sc = c["scores"]
+    sc = sc + [0.0]
+    c["scores"] = sc
+    let mut ag = c["ages"]
+    ag = ag + [c["step"]]
+    c["ages"] = ag
+    let mut is = c["is_sink"]
+    is = is + [0]
+    c["is_sink"] = is
+    c["step"] = c["step"] + 1
+    return c
+}
+
+// ===================================================================
+//  Compute attention scores: query dot each key
+// ===================================================================
+@pure @hot
+fn as_compute_attn(cache, query) {
+    let n = as_size(cache)
+    let keys = cache["keys"]
+    let mut scores = as_zeros(n)
+    for i in 0..n {
+        scores[i] = as_dot(query, keys[i])
+    }
+    return scores
+}
+
+// Softmax over raw scores
+@pure
+fn as_softmax(scores) {
+    let n = len(scores)
+    if n == 0 { return [] }
+    let mut mx = scores[0]
+    for i in 1..n {
+        if scores[i] > mx { mx = scores[i] }
+    }
+    let mut exps = as_zeros(n)
+    let mut total = 0.0
+    for i in 0..n {
+        let e = as_exp_approx(scores[i] - mx)
+        exps[i] = e
+        total = total + e
+    }
+    if total < 1.0e-30 { total = 1.0e-30 }
+    let mut out = as_zeros(n)
+    for i in 0..n {
+        out[i] = exps[i] / total
+    }
+    return out
+}
+
+// Accumulate attention scores
+fn as_accumulate(cache, attn_scores) {
+    let n = as_size(cache)
+    let mut c = cache
+    let mut sc = c["scores"]
+    for i in 0..n {
+        sc[i] = sc[i] + attn_scores[i]
+    }
+    c["scores"] = sc
+    return c
+}
+
+// ===================================================================
+//  2. Sink Token Detection
+//     A token is a "sink" if its cumulative attention score exceeds
+//     threshold * mean_score. Early tokens (first n_sink positions)
+//     are always sinks.
+// ===================================================================
+@pure
+fn as_mean_score(cache) {
+    let n = as_size(cache)
+    if n == 0 { return 0.0 }
+    let scores = cache["scores"]
+    let mut total = 0.0
+    for i in 0..n {
+        total = total + scores[i]
+    }
+    return total / to_float(n)
+}
+
+@pure
+fn as_detect_sinks(cache, threshold) {
+    let n = as_size(cache)
+    let mean = as_mean_score(cache)
+    let scores = cache["scores"]
+    let n_sink = cache["n_sink"]
+    let mut sinks = as_zeros_int(n)
+    for i in 0..n {
+        if i < n_sink {
+            sinks[i] = 1
+        } else {
+            if mean > 1.0e-12 {
+                if scores[i] > threshold * mean {
+                    sinks[i] = 1
+                }
+            }
+        }
+    }
+    return sinks
+}
+
+// Update sink flags in cache
+fn as_update_sink_flags(cache, threshold) {
+    let sinks = as_detect_sinks(cache, threshold)
+    let mut c = cache
+    c["is_sink"] = sinks
+    return c
+}
+
+// Count sink tokens
+@pure
+fn as_count_sinks(cache) {
+    let flags = cache["is_sink"]
+    let n = len(flags)
+    let mut count = 0
+    for i in 0..n {
+        if flags[i] == 1 { count = count + 1 }
+    }
+    return count
+}
+
+// ===================================================================
+//  3. Sink-Aware KV Eviction
+//     Always keep sink tokens. Evict middle tokens with lowest
+//     attention scores until cache fits budget.
+// ===================================================================
+@hot
+fn as_sink_aware_evict(cache, budget) {
+    let n = as_size(cache)
+    if n <= budget { return cache }
+
+    let scores = cache["scores"]
+    let sink_flags = cache["is_sink"]
+
+    // Collect sink indices and non-sink indices
+    let mut sink_idx = []
+    let mut nonsink_idx = []
+    for i in 0..n {
+        if sink_flags[i] == 1 {
+            sink_idx = sink_idx + [i]
+        } else {
+            nonsink_idx = nonsink_idx + [i]
+        }
+    }
+
+    // How many non-sinks we can keep
+    let n_sinks = len(sink_idx)
+    let nonsink_budget = as_max_i(budget - n_sinks, 0)
+
+    // From non-sinks, keep those with highest scores
+    let mut kept_nonsink = []
+    let mut used = as_zeros_int(len(nonsink_idx))
+    let keep_count = as_min_i(nonsink_budget, len(nonsink_idx))
+    for _k in 0..keep_count {
+        let mut best_pos = -1
+        let mut best_score = -1.0e30
+        for j in 0..len(nonsink_idx) {
+            if used[j] == 0 {
+                let idx = nonsink_idx[j]
+                if scores[idx] > best_score {
+                    best_score = scores[idx]
+                    best_pos = j
+                }
+            }
+        }
+        if best_pos >= 0 {
+            kept_nonsink = kept_nonsink + [nonsink_idx[best_pos]]
+            used[best_pos] = 1
+        }
+    }
+
+    // Merge sink_idx + kept_nonsink, rebuild cache
+    let mut all_kept = as_zeros_int(n)
+    for i in 0..len(sink_idx) {
+        all_kept[sink_idx[i]] = 1
+    }
+    for i in 0..len(kept_nonsink) {
+        all_kept[kept_nonsink[i]] = 1
+    }
+
+    let keys = cache["keys"]
+    let vals = cache["values"]
+    let ages = cache["ages"]
+    let mut new_keys = []
+    let mut new_vals = []
+    let mut new_scores = []
+    let mut new_ages = []
+    let mut new_sinks = []
+    for i in 0..n {
+        if all_kept[i] == 1 {
+            new_keys = new_keys + [keys[i]]
+            new_vals = new_vals + [vals[i]]
+            new_scores = new_scores + [scores[i]]
+            new_ages = new_ages + [ages[i]]
+            new_sinks = new_sinks + [sink_flags[i]]
+        }
+    }
+
+    let mut c = cache
+    c["keys"] = new_keys
+    c["values"] = new_vals
+    c["scores"] = new_scores
+    c["ages"] = new_ages
+    c["is_sink"] = new_sinks
+    return c
+}
+
+// ===================================================================
+//  4. Rolling Window
+//     Keep the first n_sink tokens (sink slots) plus the most
+//     recent window_size tokens. Everything in between is dropped.
+// ===================================================================
+@hot
+fn as_rolling_window(cache) {
+    let n = as_size(cache)
+    let n_sink = cache["n_sink"]
+    let window_size = cache["window_size"]
+    let total = n_sink + window_size
+    if n <= total { return cache }
+
+    let keys = cache["keys"]
+    let vals = cache["values"]
+    let scores = cache["scores"]
+    let ages = cache["ages"]
+    let sink_flags = cache["is_sink"]
+
+    let mut new_keys = []
+    let mut new_vals = []
+    let mut new_scores = []
+    let mut new_ages = []
+    let mut new_sinks = []
+
+    // Keep first n_sink entries
+    let sink_count = as_min_i(n_sink, n)
+    for i in 0..sink_count {
+        new_keys = new_keys + [keys[i]]
+        new_vals = new_vals + [vals[i]]
+        new_scores = new_scores + [scores[i]]
+        new_ages = new_ages + [ages[i]]
+        new_sinks = new_sinks + [sink_flags[i]]
+    }
+
+    // Keep last window_size entries
+    let win_start = n - window_size
+    let actual_start = as_max_i(win_start, sink_count)
+    for i in actual_start..n {
+        new_keys = new_keys + [keys[i]]
+        new_vals = new_vals + [vals[i]]
+        new_scores = new_scores + [scores[i]]
+        new_ages = new_ages + [ages[i]]
+        new_sinks = new_sinks + [sink_flags[i]]
+    }
+
+    let mut c = cache
+    c["keys"] = new_keys
+    c["values"] = new_vals
+    c["scores"] = new_scores
+    c["ages"] = new_ages
+    c["is_sink"] = new_sinks
+    return c
+}
+
+// ===================================================================
+//  5. Attention Redistribution
+//     When tokens are evicted, their attention mass is
+//     redistributed proportionally to the remaining tokens.
+//
+//     Given old attention weights (softmax) and indices of kept
+//     tokens, compute new weights that sum to 1.0 by renormalizing.
+// ===================================================================
+@pure
+fn as_redistribute_attn(old_weights, keep_mask) {
+    let n = len(old_weights)
+    let mut kept_sum = 0.0
+    for i in 0..n {
+        if keep_mask[i] == 1 {
+            kept_sum = kept_sum + old_weights[i]
+        }
+    }
+    if kept_sum < 1.0e-30 { kept_sum = 1.0e-30 }
+    let mut new_weights = as_zeros(n)
+    for i in 0..n {
+        if keep_mask[i] == 1 {
+            new_weights[i] = old_weights[i] / kept_sum
+        }
+    }
+    return new_weights
+}
+
+// Compute weighted value output: sum_i(weight_i * value_i)
+@pure
+fn as_weighted_output(weights, values) {
+    let n = len(weights)
+    if n == 0 { return [] }
+    let dim = len(values[0])
+    let mut out = as_zeros(dim)
+    for i in 0..n {
+        if weights[i] > 1.0e-30 {
+            let v = values[i]
+            for d in 0..dim {
+                out[d] = out[d] + weights[i] * v[d]
+            }
+        }
+    }
+    return out
+}
+
+// Full attention with redistribution after eviction
+@hot
+fn as_attend_with_redistribution(cache, query) {
+    let n = as_size(cache)
+    if n == 0 { return as_zeros(cache["dim"]) }
+
+    // Compute raw attention scores
+    let raw_scores = as_compute_attn(cache, query)
+    let weights = as_softmax(raw_scores)
+
+    // All tokens kept initially (redistribution happens after eviction)
+    let values = cache["values"]
+    return as_weighted_output(weights, values)
+}
+
+// Evict + redistribute: evict middle tokens, redistribute mass
+@hot
+fn as_evict_and_redistribute(cache, query, budget) {
+    let n = as_size(cache)
+    if n <= budget {
+        return as_attend_with_redistribution(cache, query)
+    }
+
+    // Compute attention before eviction
+    let raw_scores = as_compute_attn(cache, query)
+    let weights = as_softmax(raw_scores)
+
+    // Build keep mask: sinks + top scoring non-sinks
+    let sink_flags = cache["is_sink"]
+    let scores = cache["scores"]
+
+    let mut keep_mask = as_zeros_int(n)
+    let mut sink_count = 0
+    for i in 0..n {
+        if sink_flags[i] == 1 {
+            keep_mask[i] = 1
+            sink_count = sink_count + 1
+        }
+    }
+
+    // Fill remaining budget with highest-scoring non-sinks
+    let nonsink_budget = as_max_i(budget - sink_count, 0)
+    let mut used = as_zeros_int(n)
+    for i in 0..n {
+        if keep_mask[i] == 1 { used[i] = 1 }
+    }
+    for _k in 0..nonsink_budget {
+        let mut best_idx = -1
+        let mut best_score = -1.0e30
+        for j in 0..n {
+            if used[j] == 0 {
+                if scores[j] > best_score {
+                    best_score = scores[j]
+                    best_idx = j
+                }
+            }
+        }
+        if best_idx >= 0 {
+            keep_mask[best_idx] = 1
+            used[best_idx] = 1
+        }
+    }
+
+    // Redistribute attention
+    let new_weights = as_redistribute_attn(weights, keep_mask)
+    let values = cache["values"]
+    return as_weighted_output(new_weights, values)
+}
+
+// ===================================================================
+//  6. StreamingLLM Decode
+//     Full decode loop: for each new token, insert into cache,
+//     compute attention, accumulate scores, detect sinks, apply
+//     rolling window eviction. Bounded memory.
+//
+//     simulated_logits_fn: given step -> (key_vec, val_vec, query)
+// ===================================================================
+@hot
+fn as_streaming_decode_step(cache, key_vec, val_vec, query, sink_threshold) {
+    // Insert new KV pair
+    let mut c = as_insert(cache, key_vec, val_vec)
+
+    // Compute attention and accumulate
+    let attn = as_compute_attn(c, query)
+    let weights = as_softmax(attn)
+    c = as_accumulate(c, weights)
+
+    // Update sink detection
+    c = as_update_sink_flags(c, sink_threshold)
+
+    // Apply rolling window eviction
+    c = as_rolling_window(c)
+
+    // Compute output
+    let out = as_attend_with_redistribution(c, query)
+
+    return #{"cache": c, "output": out}
+}
+
+// Run N decode steps with synthetic data
+fn as_streaming_decode_n(n_steps, dim, n_sink, window_size, sink_threshold) {
+    let mut cache = as_create(dim, n_sink, window_size)
+    let mut outputs = []
+    let max_cache = n_sink + window_size
+
+    for step in 0..n_steps {
+        // Generate synthetic KV and query
+        let sf = to_float(step)
+        let mut key_vec = as_zeros(dim)
+        let mut val_vec = as_zeros(dim)
+        let mut query = as_zeros(dim)
+        for d in 0..dim {
+            let df = to_float(d)
+            key_vec[d] = as_sin_approx(sf * 0.1 + df * 0.3)
+            val_vec[d] = as_cos_approx(sf * 0.2 + df * 0.1)
+            query[d] = as_sin_approx(sf * 0.05 + df * 0.2)
+        }
+
+        let result = as_streaming_decode_step(cache, key_vec, val_vec, query, sink_threshold)
+        cache = result["cache"]
+        outputs = outputs + [result["output"]]
+    }
+
+    return #{"cache": cache, "outputs": outputs, "n_steps": n_steps}
+}
+
+// Approximate sin for synthetic data
+fn as_sin_approx(x) {
+    let mut v = x
+    while v > 3.14159265 { v = v - 6.28318530 }
+    while v < -3.14159265 { v = v + 6.28318530 }
+    let x2 = v * v
+    let mut r = v
+    let mut term = v
+    term = term * (0.0 - x2) / 6.0
+    r = r + term
+    term = term * (0.0 - x2) / 20.0
+    r = r + term
+    term = term * (0.0 - x2) / 42.0
+    r = r + term
+    return r
+}
+
+// Approximate cos for synthetic data
+fn as_cos_approx(x) {
+    return as_sin_approx(x + 1.5707963)
+}
+
+// ===================================================================
+//  7. Perplexity Stability Check
+//     Compute proxy perplexity over sliding windows of output
+//     vectors. If perplexity stays stable (ratio near 1.0) as
+//     length grows, the attention sink mechanism is working.
+//
+//     proxy_ppl = exp(-mean(log(max(|output_d|, eps))))
+//     We compare early window PPL vs late window PPL.
+// ===================================================================
+@pure
+fn as_proxy_ppl(output_vec) {
+    let dim = len(output_vec)
+    if dim == 0 { return 1.0 }
+    let mut sum_log = 0.0
+    for d in 0..dim {
+        let val = as_abs(output_vec[d])
+        let clamped = as_max_f(val, 1.0e-8)
+        sum_log = sum_log + as_log_approx(clamped)
+    }
+    let mean_log = sum_log / to_float(dim)
+    return as_exp_approx(0.0 - mean_log)
+}
+
+// Average PPL over a range of outputs
+@pure
+fn as_avg_ppl_range(outputs, start, end_idx) {
+    let actual_end = as_min_i(end_idx, len(outputs))
+    let actual_start = as_max_i(start, 0)
+    let count = actual_end - actual_start
+    if count <= 0 { return 1.0 }
+    let mut total = 0.0
+    for i in actual_start..actual_end {
+        total = total + as_proxy_ppl(outputs[i])
+    }
+    return total / to_float(count)
+}
+
+// Check stability: ratio of late PPL to early PPL should be near 1.0
+@pure
+fn as_ppl_stability_ratio(outputs, window) {
+    let n = len(outputs)
+    if n < 2 * window { return 1.0 }
+    let early_ppl = as_avg_ppl_range(outputs, 0, window)
+    let late_ppl = as_avg_ppl_range(outputs, n - window, n)
+    if early_ppl < 1.0e-12 { return 1.0 }
+    return late_ppl / early_ppl
+}
+
+// ===================================================================
+//  8. Cache diagnostics
+// ===================================================================
+@pure
+fn as_cache_stats(cache) {
+    let n = as_size(cache)
+    let n_sink_actual = as_count_sinks(cache)
+    let scores = cache["scores"]
+    let mut total_score = 0.0
+    let mut max_score = -1.0e30
+    for i in 0..n {
+        total_score = total_score + scores[i]
+        if scores[i] > max_score { max_score = scores[i] }
+    }
+    let mut avg_score = 0.0
+    if n > 0 { avg_score = total_score / to_float(n) }
+    return #{
+        "size": n,
+        "n_sinks": n_sink_actual,
+        "avg_score": avg_score,
+        "max_score": max_score,
+        "step": cache["step"],
+        "budget": cache["n_sink"] + cache["window_size"]
+    }
+}
+
+println("[attention_sink] loaded — sink detection + sink-aware eviction + rolling window + redistribution + StreamingLLM decode + PPL stability")

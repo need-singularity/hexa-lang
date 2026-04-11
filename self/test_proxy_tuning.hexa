@@ -1,0 +1,647 @@
+// ===================================================================
+//  test_proxy_tuning.hexa -- Proxy Tuning verification (#174)
+//
+//  Tests (35):
+//    T01 logit arithmetic basic identity
+//    T02 logit arithmetic zero delta passthrough
+//    T03 logit arithmetic output length
+//    T04 weighted arithmetic alpha=1 beta=1 matches basic
+//    T05 weighted arithmetic alpha=0 returns base_large
+//    T06 weighted arithmetic alpha=2 doubles delta
+//    T07 temperature delta temp=1 matches basic
+//    T08 temperature delta low temp sharpens
+//    T09 temperature delta high temp softens
+//    T10 anti-expert subtracts alpha*anti
+//    T11 anti-expert alpha=0 returns expert unchanged
+//    T12 contrastive positive values kept
+//    T13 contrastive negative values clamped to zero
+//    T14 contrastive alpha=0 returns base_large
+//    T15 softmax sums to 1
+//    T16 softmax peak at max logit
+//    T17 argmax selects correct index
+//    T18 argmax tie goes to first
+//    T19 config stores values correctly
+//    T20 config default values
+//    T21 decode_step greedy mode matches weighted
+//    T22 decode_step contrastive mode
+//    T23 generate_greedy produces correct length
+//    T24 generate_greedy deterministic
+//    T25 generate_sample produces correct length
+//    T26 kl_divergence self is zero
+//    T27 kl_divergence different distributions positive
+//    T28 quality_score parallel vectors high
+//    T29 quality_score orthogonal near zero
+//    T30 topk_filter preserves top-k values
+//    T31 topk_filter suppresses non-top values
+//    T32 ensemble single model matches basic
+//    T33 ensemble averages deltas
+//    T34 adaptive_alpha output length
+//    T35 delta_norm zero when identical
+//
+//  Run: cargo run --release -- self/test_proxy_tuning.hexa
+// ===================================================================
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// -- inlined helpers from proxy_tuning.hexa -------------------------
+
+fn pt_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn pt_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn pt_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn pt_log(x) {
+    if x <= 0.0 { return -20.0 }
+    let mut v = x
+    let mut shift = 0.0
+    for _i in 0..20 {
+        if v > 2.0 {
+            v = v / 2.718281828
+            shift = shift + 1.0
+        }
+    }
+    let mut y = v - 1.0
+    let mut result = 0.0
+    let mut term = y
+    for n in 1..30 {
+        let nf = to_float(n)
+        let mut sign = 1.0
+        if n % 2 == 0 { sign = -1.0 }
+        result = result + sign * term / nf
+        term = term * y
+    }
+    return result + shift
+}
+
+fn pt_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn pt_max_f(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn pt_min_f(a, b) {
+    if a < b { return a }
+    return b
+}
+
+// -- core functions -------------------------------------------------
+
+fn pt_logit_arithmetic(tuned_s, base_s, base_l) {
+    let n = len(base_l)
+    let mut out = pt_zeros(n)
+    for i in 0..n {
+        out[i] = tuned_s[i] - base_s[i] + base_l[i]
+    }
+    return out
+}
+
+fn pt_weighted_arithmetic(tuned_s, base_s, base_l, alpha, beta) {
+    let n = len(base_l)
+    let mut out = pt_zeros(n)
+    for i in 0..n {
+        let delta = tuned_s[i] - beta * base_s[i]
+        out[i] = base_l[i] + alpha * delta
+    }
+    return out
+}
+
+fn pt_temperature_delta(tuned_s, base_s, base_l, temp) {
+    let n = len(base_l)
+    let safe_temp = pt_max_f(temp, 0.01)
+    let mut out = pt_zeros(n)
+    for i in 0..n {
+        let delta = tuned_s[i] - base_s[i]
+        out[i] = base_l[i] + delta / safe_temp
+    }
+    return out
+}
+
+fn pt_anti_expert(expert_logits, anti_logits, alpha) {
+    let n = len(expert_logits)
+    let mut out = pt_zeros(n)
+    for i in 0..n {
+        out[i] = expert_logits[i] - alpha * anti_logits[i]
+    }
+    return out
+}
+
+fn pt_contrastive(logit_large, logit_small, alpha) {
+    let n = len(logit_large)
+    let mut out = pt_zeros(n)
+    for i in 0..n {
+        let val = logit_large[i] - alpha * logit_small[i]
+        if val > 0.0 {
+            out[i] = val
+        }
+    }
+    return out
+}
+
+fn pt_softmax(logits) {
+    let n = len(logits)
+    let mut mx = logits[0]
+    for i in 1..n {
+        if logits[i] > mx { mx = logits[i] }
+    }
+    let mut exps = pt_zeros(n)
+    let mut z = 0.0
+    for i in 0..n {
+        exps[i] = pt_exp(logits[i] - mx)
+        z = z + exps[i]
+    }
+    if z < 1.0e-12 { z = 1.0e-12 }
+    let mut out = pt_zeros(n)
+    for i in 0..n {
+        out[i] = exps[i] / z
+    }
+    return out
+}
+
+fn pt_argmax(logits) {
+    let n = len(logits)
+    let mut best = 0
+    let mut best_v = logits[0]
+    for i in 1..n {
+        if logits[i] > best_v {
+            best_v = logits[i]
+            best = i
+        }
+    }
+    return best
+}
+
+fn pt_sample(probs) {
+    let n = len(probs)
+    let r = random()
+    let mut cumulative = 0.0
+    for i in 0..n {
+        cumulative = cumulative + probs[i]
+        if r < cumulative { return i }
+    }
+    return n - 1
+}
+
+fn pt_config(alpha, beta, temp, mode) {
+    return #{
+        "alpha": alpha,
+        "beta": beta,
+        "temp": temp,
+        "mode": mode
+    }
+}
+
+fn pt_config_default() {
+    return pt_config(1.0, 1.0, 1.0, "greedy")
+}
+
+fn pt_decode_step(tuned_s, base_s, base_l, cfg) {
+    let alpha = cfg["alpha"]
+    let beta = cfg["beta"]
+    let temp = cfg["temp"]
+    let mode = cfg["mode"]
+
+    if mode == "contrastive" {
+        return pt_contrastive(base_l, base_s, alpha)
+    }
+
+    let n = len(base_l)
+    let safe_temp = pt_max_f(temp, 0.01)
+    let mut out = pt_zeros(n)
+    for i in 0..n {
+        let delta = tuned_s[i] - beta * base_s[i]
+        out[i] = base_l[i] + alpha * delta / safe_temp
+    }
+    return out
+}
+
+fn pt_select_token(adjusted_logits, cfg) {
+    let mode = cfg["mode"]
+    if mode == "sample" {
+        let probs = pt_softmax(adjusted_logits)
+        return pt_sample(probs)
+    }
+    return pt_argmax(adjusted_logits)
+}
+
+fn pt_generate_greedy(tuned_fn, base_s_fn, base_l_fn, start, n_tokens, cfg) {
+    let mut tokens = [start]
+    let mut prev = start
+    for _t in 0..n_tokens {
+        let ts = tuned_fn(prev)
+        let bs = base_s_fn(prev)
+        let bl = base_l_fn(prev)
+        let adjusted = pt_decode_step(ts, bs, bl, cfg)
+        let next = pt_argmax(adjusted)
+        tokens = tokens + [next]
+        prev = next
+    }
+    return tokens
+}
+
+fn pt_generate_sample(tuned_fn, base_s_fn, base_l_fn, start, n_tokens, cfg) {
+    let mut tokens = [start]
+    let mut prev = start
+    for _t in 0..n_tokens {
+        let ts = tuned_fn(prev)
+        let bs = base_s_fn(prev)
+        let bl = base_l_fn(prev)
+        let adjusted = pt_decode_step(ts, bs, bl, cfg)
+        let probs = pt_softmax(adjusted)
+        let next = pt_sample(probs)
+        tokens = tokens + [next]
+        prev = next
+    }
+    return tokens
+}
+
+fn pt_kl_divergence(p, q) {
+    let n = len(p)
+    let mut kl = 0.0
+    for i in 0..n {
+        let pi = pt_max_f(p[i], 1.0e-12)
+        let qi = pt_max_f(q[i], 1.0e-12)
+        kl = kl + pi * (pt_log(pi) - pt_log(qi))
+    }
+    if kl < 0.0 { kl = 0.0 }
+    return kl
+}
+
+fn pt_quality_score(tuned_s, base_s, base_l) {
+    let n = len(base_l)
+    let mut dot_dl = 0.0
+    let mut norm_d = 0.0
+    let mut norm_l = 0.0
+    for i in 0..n {
+        let delta = tuned_s[i] - base_s[i]
+        dot_dl = dot_dl + delta * base_l[i]
+        norm_d = norm_d + delta * delta
+        norm_l = norm_l + base_l[i] * base_l[i]
+    }
+    let denom = pt_sqrt(norm_d) * pt_sqrt(norm_l)
+    if denom < 1.0e-12 { return 0.0 }
+    return dot_dl / denom
+}
+
+fn pt_topk_filter(logits, k) {
+    let n = len(logits)
+    let mut kk = k
+    if kk > n { kk = n }
+    if kk < 1 { kk = 1 }
+
+    let mut sorted_vals = []
+    for i in 0..n {
+        sorted_vals = sorted_vals + [logits[i]]
+    }
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if sorted_vals[j] > sorted_vals[i] {
+                let tmp = sorted_vals[i]
+                sorted_vals[i] = sorted_vals[j]
+                sorted_vals[j] = tmp
+            }
+        }
+    }
+    let threshold = sorted_vals[kk - 1]
+
+    let mut out = pt_zeros(n)
+    for i in 0..n {
+        if logits[i] >= threshold {
+            out[i] = logits[i]
+        } else {
+            out[i] = -1000.0
+        }
+    }
+    return out
+}
+
+fn pt_ensemble(tuned_list, base_s, base_l) {
+    let n = len(base_l)
+    let k = len(tuned_list)
+    if k == 0 { return base_l }
+    let mut out = pt_zeros(n)
+    for i in 0..n {
+        let mut delta_sum = 0.0
+        for j in 0..k {
+            let ts = tuned_list[j]
+            delta_sum = delta_sum + (ts[i] - base_s[i])
+        }
+        out[i] = base_l[i] + delta_sum / to_float(k)
+    }
+    return out
+}
+
+fn pt_adaptive_alpha(tuned_s, base_s, base_l, base_alpha) {
+    let n = len(base_l)
+    let mut sum_abs = 0.0
+    for i in 0..n {
+        sum_abs = sum_abs + pt_abs(tuned_s[i] - base_s[i])
+    }
+    let avg_abs = sum_abs / to_float(n)
+    if avg_abs < 1.0e-12 { return base_l }
+
+    let mut out = pt_zeros(n)
+    for i in 0..n {
+        let delta = tuned_s[i] - base_s[i]
+        let local_strength = pt_abs(delta) / avg_abs
+        let alpha_i = base_alpha * pt_min_f(local_strength, 2.0)
+        out[i] = base_l[i] + alpha_i * delta
+    }
+    return out
+}
+
+fn pt_delta_norm(tuned_s, base_s) {
+    let n = len(tuned_s)
+    let mut sum_sq = 0.0
+    for i in 0..n {
+        let d = tuned_s[i] - base_s[i]
+        sum_sq = sum_sq + d * d
+    }
+    return pt_sqrt(sum_sq)
+}
+
+// -- mock model functions -------------------------------------------
+
+let VOCAB = 8
+
+fn mock_tuned_small(prev) {
+    let mut logits = pt_zeros(VOCAB)
+    for i in 0..VOCAB {
+        let mut h = (prev + 1) * 31 + i * 17
+        h = h % 100
+        logits[i] = to_float(h) / 100.0 + 0.5
+    }
+    return logits
+}
+
+fn mock_base_small(prev) {
+    let mut logits = pt_zeros(VOCAB)
+    for i in 0..VOCAB {
+        let mut h = (prev + 1) * 31 + i * 17
+        h = h % 100
+        logits[i] = to_float(h) / 100.0
+    }
+    return logits
+}
+
+fn mock_base_large(prev) {
+    let mut logits = pt_zeros(VOCAB)
+    for i in 0..VOCAB {
+        let mut h = (prev + 2) * 37 + i * 13
+        h = h % 100
+        logits[i] = to_float(h) / 100.0 + 1.0
+    }
+    return logits
+}
+
+// ===================================================================
+//  TESTS
+// ===================================================================
+
+// -- test data ------------------------------------------------------
+let tuned_s = [1.0, 2.5, 0.5, 3.0, 1.5, 2.0, 0.8, 1.2]
+let base_s  = [0.5, 2.0, 0.5, 2.0, 1.0, 1.5, 0.5, 0.8]
+let base_l  = [2.0, 3.0, 1.0, 4.0, 2.5, 3.5, 1.5, 2.0]
+// delta =    [0.5, 0.5, 0.0, 1.0, 0.5, 0.5, 0.3, 0.4]
+// expected = [2.5, 3.5, 1.0, 5.0, 3.0, 4.0, 1.8, 2.4]
+
+// T01: logit arithmetic basic identity
+let arith = pt_logit_arithmetic(tuned_s, base_s, base_l)
+check("T01 logit arithmetic: out[0] = 2.5", approx(arith[0], 2.5, 0.01))
+
+// T02: logit arithmetic zero delta passthrough
+check("T02 logit arithmetic: zero delta -> base_l", approx(arith[2], 1.0, 0.01))
+
+// T03: logit arithmetic output length
+check("T03 logit arithmetic output len", len(arith) == VOCAB)
+
+// T04: weighted arithmetic alpha=1 beta=1 matches basic
+let warith = pt_weighted_arithmetic(tuned_s, base_s, base_l, 1.0, 1.0)
+let mut t04_match = true
+for i in 0..VOCAB {
+    if fabs(warith[i] - arith[i]) > 0.01 { t04_match = false }
+}
+check("T04 weighted a=1 b=1 matches basic", t04_match)
+
+// T05: weighted arithmetic alpha=0 returns base_large
+let warith0 = pt_weighted_arithmetic(tuned_s, base_s, base_l, 0.0, 1.0)
+let mut t05_match = true
+for i in 0..VOCAB {
+    if fabs(warith0[i] - base_l[i]) > 0.01 { t05_match = false }
+}
+check("T05 weighted a=0 -> base_large", t05_match)
+
+// T06: weighted arithmetic alpha=2 doubles delta
+let warith2 = pt_weighted_arithmetic(tuned_s, base_s, base_l, 2.0, 1.0)
+// out[0] = 2.0 + 2.0 * (1.0 - 0.5) = 3.0
+check("T06 weighted a=2 doubles delta", approx(warith2[0], 3.0, 0.01))
+
+// T07: temperature delta temp=1 matches basic
+let tdelta1 = pt_temperature_delta(tuned_s, base_s, base_l, 1.0)
+let mut t07_match = true
+for i in 0..VOCAB {
+    if fabs(tdelta1[i] - arith[i]) > 0.01 { t07_match = false }
+}
+check("T07 temp=1 matches basic arith", t07_match)
+
+// T08: temperature delta low temp sharpens
+let tdelta_low = pt_temperature_delta(tuned_s, base_s, base_l, 0.5)
+// delta[3]=1.0, temp=0.5 -> 1.0/0.5=2.0, out[3]=4.0+2.0=6.0
+check("T08 low temp sharpens delta", approx(tdelta_low[3], 6.0, 0.01))
+
+// T09: temperature delta high temp softens
+let tdelta_high = pt_temperature_delta(tuned_s, base_s, base_l, 2.0)
+// delta[3]=1.0, temp=2.0 -> 1.0/2.0=0.5, out[3]=4.0+0.5=4.5
+check("T09 high temp softens delta", approx(tdelta_high[3], 4.5, 0.01))
+
+// T10: anti-expert subtracts alpha*anti
+let anti = pt_anti_expert(base_l, base_s, 1.0)
+// out[0] = 2.0 - 1.0*0.5 = 1.5
+check("T10 anti-expert subtracts", approx(anti[0], 1.5, 0.01))
+
+// T11: anti-expert alpha=0 returns expert unchanged
+let anti0 = pt_anti_expert(base_l, base_s, 0.0)
+let mut t11_match = true
+for i in 0..VOCAB {
+    if fabs(anti0[i] - base_l[i]) > 0.01 { t11_match = false }
+}
+check("T11 anti-expert a=0 unchanged", t11_match)
+
+// T12: contrastive positive values kept
+let cont = pt_contrastive([5.0, 1.0, 3.0, 0.0], [1.0, 2.0, 1.0, 5.0], 1.0)
+// [5-1=4, 1-2=-1->0, 3-1=2, 0-5=-5->0]
+check("T12 contrastive keeps positive", approx(cont[0], 4.0, 0.01))
+
+// T13: contrastive negative values clamped to zero
+check("T13 contrastive clamps negative", approx(cont[1], 0.0, 0.01))
+
+// T14: contrastive alpha=0 returns base_large
+let cont0 = pt_contrastive([5.0, 1.0, 3.0, 0.5], [1.0, 2.0, 1.0, 5.0], 0.0)
+check("T14 contrastive a=0 -> base_large", approx(cont0[0], 5.0, 0.01))
+
+// T15: softmax sums to 1
+let sm = pt_softmax([1.0, 2.0, 3.0, 1.0])
+let mut sm_sum = 0.0
+for i in 0..4 { sm_sum = sm_sum + sm[i] }
+check("T15 softmax sums to 1", approx(sm_sum, 1.0, 0.01))
+
+// T16: softmax peak at max logit
+check("T16 softmax peak at max", sm[2] > sm[0])
+
+// T17: argmax selects correct index
+check("T17 argmax index 3", pt_argmax([0.1, 0.2, 0.3, 0.9, 0.4]) == 3)
+
+// T18: argmax tie goes to first
+check("T18 argmax tie -> first", pt_argmax([0.5, 0.5, 0.1]) == 0)
+
+// T19: config stores values correctly
+let cfg = pt_config(0.8, 0.9, 0.5, "greedy")
+check("T19 config alpha", approx(cfg["alpha"], 0.8, 0.01))
+
+// T20: config default values
+let cfg_d = pt_config_default()
+check("T20 config default alpha=1", approx(cfg_d["alpha"], 1.0, 0.01))
+
+// T21: decode_step greedy mode matches weighted
+let cfg_g = pt_config(1.0, 1.0, 1.0, "greedy")
+let ds = pt_decode_step(tuned_s, base_s, base_l, cfg_g)
+let mut t21_match = true
+for i in 0..VOCAB {
+    if fabs(ds[i] - arith[i]) > 0.01 { t21_match = false }
+}
+check("T21 decode_step greedy = weighted", t21_match)
+
+// T22: decode_step contrastive mode
+let cfg_c = pt_config(0.5, 1.0, 1.0, "contrastive")
+let ds_c = pt_decode_step(tuned_s, base_s, base_l, cfg_c)
+// contrastive: max(0, base_l[i] - 0.5*base_s[i])
+// [2.0-0.25=1.75, 3.0-1.0=2.0, 1.0-0.25=0.75, 4.0-1.0=3.0, ...]
+check("T22 decode_step contrastive", approx(ds_c[0], 1.75, 0.01))
+
+// T23: generate_greedy produces correct length
+let cfg_gen = pt_config(1.0, 1.0, 1.0, "greedy")
+let gen_g = pt_generate_greedy(mock_tuned_small, mock_base_small, mock_base_large, 0, 10, cfg_gen)
+check("T23 greedy gen length 11", len(gen_g) == 11)
+
+// T24: generate_greedy deterministic
+let gen_g2 = pt_generate_greedy(mock_tuned_small, mock_base_small, mock_base_large, 0, 10, cfg_gen)
+let mut t24_match = true
+for i in 0..11 {
+    if gen_g[i] != gen_g2[i] { t24_match = false }
+}
+check("T24 greedy gen deterministic", t24_match)
+
+// T25: generate_sample produces correct length
+let cfg_s = pt_config(1.0, 1.0, 1.0, "sample")
+let gen_s = pt_generate_sample(mock_tuned_small, mock_base_small, mock_base_large, 0, 10, cfg_s)
+check("T25 sample gen length 11", len(gen_s) == 11)
+
+// T26: kl_divergence self is zero
+let uniform = [0.25, 0.25, 0.25, 0.25]
+let kl_self = pt_kl_divergence(uniform, uniform)
+check("T26 KL(P||P) = 0", approx(kl_self, 0.0, 0.01))
+
+// T27: kl_divergence different distributions positive
+let dist_a = [0.9, 0.05, 0.025, 0.025]
+let kl_diff = pt_kl_divergence(dist_a, uniform)
+check("T27 KL(diff||uniform) > 0", kl_diff > 0.1)
+
+// T28: quality_score parallel vectors high
+// delta = [1,1,1,1], base_l = [2,2,2,2] => cosine = 1.0
+let qs_par = pt_quality_score([2.0, 2.0, 2.0, 2.0], [1.0, 1.0, 1.0, 1.0], [2.0, 2.0, 2.0, 2.0])
+check("T28 quality parallel ~1.0", qs_par > 0.9)
+
+// T29: quality_score orthogonal near zero
+// delta = [1,-1,0,0], base_l = [0,0,1,-1] => dot=0
+let qs_orth = pt_quality_score([2.0, 0.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0], [0.0, 0.0, 1.0, -1.0])
+check("T29 quality orthogonal ~0", fabs(qs_orth) < 0.1)
+
+// T30: topk_filter preserves top-k values
+let tk = pt_topk_filter([1.0, 4.0, 2.0, 3.0], 2)
+check("T30 topk keeps top value", approx(tk[1], 4.0, 0.01))
+
+// T31: topk_filter suppresses non-top values
+check("T31 topk suppresses low", tk[0] < -100.0)
+
+// T32: ensemble single model matches basic
+let ens_single = pt_ensemble([tuned_s], base_s, base_l)
+let arith_basic = pt_logit_arithmetic(tuned_s, base_s, base_l)
+let mut t32_match = true
+for i in 0..VOCAB {
+    if fabs(ens_single[i] - arith_basic[i]) > 0.01 { t32_match = false }
+}
+check("T32 ensemble single = basic", t32_match)
+
+// T33: ensemble averages deltas
+// Two tuned models: both have delta +0.5 at [0], so average delta = 0.5
+let tuned_s2 = [1.0, 2.5, 0.5, 3.0, 1.5, 2.0, 0.8, 1.2]
+let ens_multi = pt_ensemble([tuned_s, tuned_s2], base_s, base_l)
+check("T33 ensemble avg delta", approx(ens_multi[0], 2.5, 0.01))
+
+// T34: adaptive_alpha output length
+let adapt = pt_adaptive_alpha(tuned_s, base_s, base_l, 1.0)
+check("T34 adaptive alpha output len", len(adapt) == VOCAB)
+
+// T35: delta_norm zero when identical
+let dn_zero = pt_delta_norm(base_s, base_s)
+check("T35 delta_norm zero when same", approx(dn_zero, 0.0, 0.01))
+
+// ===================================================================
+//  Summary
+// ===================================================================
+println("")
+println("===== Proxy Tuning #174 =====")
+println("PASS: " + to_string(pass_count))
+println("FAIL: " + to_string(fail_count))
+
+if fail_count == 0 {
+    println("ALL " + to_string(pass_count) + " tests PASSED")
+} else {
+    println("SOME TESTS FAILED")
+}

@@ -1,0 +1,768 @@
+// ===================================================================
+//  test_ring_buffer_kv.hexa — Ring Buffer KV Cache tests (#168)
+//
+//  Tests (35):
+//    T1  create ring has size 0
+//    T2  create ring has correct capacity
+//    T3  create ring has correct dim
+//    T4  append increases size
+//    T5  append to full wraps write pointer
+//    T6  size never exceeds capacity
+//    T7  write_ptr wraps to 0 after capacity
+//    T8  read_ordered returns entries in insertion order (not full)
+//    T9  read_ordered handles wrap-around (full buffer)
+//    T10 oldest slot before full is 0
+//    T11 oldest slot when full is write_ptr
+//    T12 oldest age tracks first insertion
+//    T13 newest age tracks last insertion
+//    T14 eviction overwrites oldest on append when full
+//    T15 causal mask is lower-triangular
+//    T16 full mask is all ones
+//    T17 apply_mask zeroes masked positions
+//    T18 attend returns vector of correct dim
+//    T19 attend empty ring returns zeros
+//    T20 attend weights sum to 1 (softmax)
+//    T21 attend with single entry returns that value
+//    T22 stream_step appends and returns output
+//    T23 stream_step output has correct dim
+//    T24 stream_batch processes multiple tokens
+//    T25 stream_batch ring count correct
+//    T26 memory bound holds after many appends
+//    T27 memory bound holds after capacity+N appends
+//    T28 check_bound returns true for valid ring
+//    T29 stats reports correct fields
+//    T30 stats evicted count correct
+//    T31 multi-head create has correct structure
+//    T32 multi-head append and attend
+//    T33 ring copy is independent
+//    T34 logical_to_physical mapping correct before full
+//    T35 logical_to_physical mapping correct after full
+//
+//  Run: cargo run --release -- self/test_ring_buffer_kv.hexa
+// ===================================================================
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn approx(a, b, eps) {
+    return fabs(a - b) < eps
+}
+
+// ===================================================================
+//  Inlined from ring_buffer_kv.hexa
+// ===================================================================
+
+fn rbkv_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn rbkv_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn rbkv_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn rbkv_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+fn rbkv_fill_float(n, val) {
+    let mut v = []
+    for _i in 0..n { v = v + [val] }
+    return v
+}
+
+fn rbkv_max_f(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn rbkv_min_f(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn rbkv_min_i(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn rbkv_max_i(a, b) {
+    if a > b { return a }
+    return b
+}
+
+@pure
+fn rbkv_dot(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    for i in 0..n {
+        s = s + a[i] * b[i]
+    }
+    return s
+}
+
+@pure
+fn rbkv_norm(v) {
+    return rbkv_sqrt(rbkv_dot(v, v))
+}
+
+@pure
+fn rbkv_exp_approx(x) {
+    let mut cx = x
+    if cx > 20.0 { cx = 20.0 }
+    if cx < -20.0 { cx = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..20 {
+        term = term * cx / to_float(i)
+        result = result + term
+    }
+    if result < 1.0e-30 { result = 1.0e-30 }
+    return result
+}
+
+@pure
+fn rbkv_softmax(logits) {
+    let n = len(logits)
+    let mut mx = logits[0]
+    for i in 1..n {
+        if logits[i] > mx { mx = logits[i] }
+    }
+    let mut exps = rbkv_zeros(n)
+    let mut total = 0.0
+    for i in 0..n {
+        let e = rbkv_exp_approx(logits[i] - mx)
+        exps[i] = e
+        total = total + e
+    }
+    if total < 1.0e-30 { total = 1.0e-30 }
+    let mut out = rbkv_zeros(n)
+    for i in 0..n {
+        out[i] = exps[i] / total
+    }
+    return out
+}
+
+@pure
+fn rbkv_apply_mask(logits, mask_row) {
+    let n = len(logits)
+    let mut out = rbkv_zeros(n)
+    for i in 0..n {
+        if mask_row[i] > 0.5 {
+            out[i] = logits[i]
+        } else {
+            out[i] = -1.0e9
+        }
+    }
+    return out
+}
+
+fn rbkv_create(capacity, dim) {
+    let zero_vec = rbkv_zeros(dim)
+    let mut keys = []
+    let mut vals = []
+    let mut ages = []
+    let mut valid = []
+    for _i in 0..capacity {
+        keys = keys + [zero_vec]
+        vals = vals + [zero_vec]
+        ages = ages + [0]
+        valid = valid + [0]
+    }
+    return #{
+        "keys": keys,
+        "values": vals,
+        "capacity": capacity,
+        "count": 0,
+        "write_ptr": 0,
+        "step": 0,
+        "ages": ages,
+        "valid": valid,
+        "dim": dim
+    }
+}
+
+@pure
+fn rbkv_size(ring) {
+    return ring["count"]
+}
+
+@pure
+fn rbkv_capacity(ring) {
+    return ring["capacity"]
+}
+
+@pure
+fn rbkv_is_full(ring) {
+    return ring["count"] >= ring["capacity"]
+}
+
+fn rbkv_append(ring, key_vec, val_vec) {
+    let mut r = ring
+    let cap = r["capacity"]
+    let wp = r["write_ptr"]
+
+    let mut ks = r["keys"]
+    ks[wp] = key_vec
+    r["keys"] = ks
+
+    let mut vs = r["values"]
+    vs[wp] = val_vec
+    r["values"] = vs
+
+    let mut ag = r["ages"]
+    ag[wp] = r["step"]
+    r["ages"] = ag
+
+    let mut vl = r["valid"]
+    vl[wp] = 1
+    r["valid"] = vl
+
+    let next_wp = (wp + 1) % cap
+    r["write_ptr"] = next_wp
+
+    let cur_count = r["count"]
+    if cur_count < cap {
+        r["count"] = cur_count + 1
+    }
+
+    r["step"] = r["step"] + 1
+
+    return r
+}
+
+@pure
+fn rbkv_read_ordered(ring) {
+    let cap = ring["capacity"]
+    let count = ring["count"]
+    let wp = ring["write_ptr"]
+    let keys = ring["keys"]
+    let vals = ring["values"]
+
+    let mut out_keys = []
+    let mut out_vals = []
+
+    if count < cap {
+        for i in 0..count {
+            out_keys = out_keys + [keys[i]]
+            out_vals = out_vals + [vals[i]]
+        }
+    } else {
+        for i in 0..cap {
+            let idx = (wp + i) % cap
+            out_keys = out_keys + [keys[idx]]
+            out_vals = out_vals + [vals[idx]]
+        }
+    }
+
+    return #{"keys": out_keys, "values": out_vals}
+}
+
+@pure
+fn rbkv_read_keys(ring) {
+    let ordered = rbkv_read_ordered(ring)
+    return ordered["keys"]
+}
+
+@pure
+fn rbkv_logical_to_physical(ring, logical_idx) {
+    let cap = ring["capacity"]
+    let count = ring["count"]
+    let wp = ring["write_ptr"]
+    if count < cap {
+        return logical_idx
+    }
+    return (wp + logical_idx) % cap
+}
+
+@pure
+fn rbkv_oldest_slot(ring) {
+    let cap = ring["capacity"]
+    let count = ring["count"]
+    let wp = ring["write_ptr"]
+    if count < cap {
+        return 0
+    }
+    return wp
+}
+
+@pure
+fn rbkv_oldest_age(ring) {
+    let slot = rbkv_oldest_slot(ring)
+    let ages = ring["ages"]
+    return ages[slot]
+}
+
+@pure
+fn rbkv_newest_age(ring) {
+    let cap = ring["capacity"]
+    let wp = ring["write_ptr"]
+    let count = ring["count"]
+    if count == 0 { return -1 }
+    let newest_slot = (wp + cap - 1) % cap
+    let ages = ring["ages"]
+    return ages[newest_slot]
+}
+
+@pure
+fn rbkv_causal_mask(ring) {
+    let count = ring["count"]
+    let mut mask = []
+    for i in 0..count {
+        let mut row = rbkv_zeros(count)
+        for j in 0..count {
+            if j <= i {
+                row[j] = 1.0
+            }
+        }
+        mask = mask + [row]
+    }
+    return mask
+}
+
+@pure
+fn rbkv_full_mask(ring) {
+    let count = ring["count"]
+    let mut mask = []
+    for _i in 0..count {
+        let mut row = rbkv_fill_float(count, 1.0)
+        mask = mask + [row]
+    }
+    return mask
+}
+
+@hot
+fn rbkv_attend(ring, query, use_causal_mask) {
+    let count = ring["count"]
+    if count == 0 { return rbkv_zeros(ring["dim"]) }
+
+    let ordered = rbkv_read_ordered(ring)
+    let ok = ordered["keys"]
+    let ov = ordered["values"]
+
+    let mut logits = rbkv_zeros(count)
+    for i in 0..count {
+        logits[i] = rbkv_dot(query, ok[i])
+    }
+
+    if use_causal_mask {
+        let mut mask_row = rbkv_fill_float(count, 1.0)
+        logits = rbkv_apply_mask(logits, mask_row)
+    }
+
+    let weights = rbkv_softmax(logits)
+
+    let dim = ring["dim"]
+    let mut out = rbkv_zeros(dim)
+    for i in 0..count {
+        for d in 0..dim {
+            out[d] = out[d] + weights[i] * ov[i][d]
+        }
+    }
+    return out
+}
+
+@pure
+fn rbkv_raw_scores(ring, query) {
+    let count = ring["count"]
+    let ordered = rbkv_read_ordered(ring)
+    let ok = ordered["keys"]
+    let mut scores = rbkv_zeros(count)
+    for i in 0..count {
+        scores[i] = rbkv_dot(query, ok[i])
+    }
+    return scores
+}
+
+fn rbkv_stream_step(ring, key_vec, val_vec, query) {
+    let r = rbkv_append(ring, key_vec, val_vec)
+    let output = rbkv_attend(r, query, false)
+    return #{"ring": r, "output": output}
+}
+
+fn rbkv_stream_batch(ring, key_list, val_list, query_list) {
+    let n = len(key_list)
+    let mut r = ring
+    let mut outputs = []
+    for i in 0..n {
+        let result = rbkv_stream_step(r, key_list[i], val_list[i], query_list[i])
+        r = result["ring"]
+        outputs = outputs + [result["output"]]
+    }
+    return #{"ring": r, "outputs": outputs}
+}
+
+@pure
+fn rbkv_check_bound(ring) {
+    let count = ring["count"]
+    let cap = ring["capacity"]
+    if count > cap { return false }
+    let wp = ring["write_ptr"]
+    if wp < 0 { return false }
+    if wp >= cap { return false }
+    return true
+}
+
+@pure
+fn rbkv_stats(ring) {
+    let count = ring["count"]
+    let cap = ring["capacity"]
+    let dim = ring["dim"]
+    let total_tokens = ring["step"]
+    let mem_entries = cap * dim * 2
+    let mut utilization = 0.0
+    if cap > 0 {
+        utilization = to_float(count) / to_float(cap) * 100.0
+    }
+    let mut evicted = 0
+    if total_tokens > cap {
+        evicted = total_tokens - cap
+    }
+    return #{
+        "count": count,
+        "capacity": cap,
+        "dim": dim,
+        "total_tokens_seen": total_tokens,
+        "evicted": evicted,
+        "utilization_pct": utilization,
+        "mem_entries": mem_entries,
+        "write_ptr": ring["write_ptr"]
+    }
+}
+
+fn rbkv_multi_head_create(n_heads, capacity, dim) {
+    let mut heads = []
+    for _h in 0..n_heads {
+        heads = heads + [rbkv_create(capacity, dim)]
+    }
+    return #{"heads": heads, "n_heads": n_heads, "capacity": capacity, "dim": dim}
+}
+
+fn rbkv_multi_head_append(mh, head_idx, key_vec, val_vec) {
+    let mut heads = mh["heads"]
+    heads[head_idx] = rbkv_append(heads[head_idx], key_vec, val_vec)
+    let mut m = mh
+    m["heads"] = heads
+    return m
+}
+
+@hot
+fn rbkv_multi_head_attend(mh, head_idx, query) {
+    let heads = mh["heads"]
+    return rbkv_attend(heads[head_idx], query, false)
+}
+
+fn rbkv_copy(ring) {
+    let cap = ring["capacity"]
+    let keys = ring["keys"]
+    let vals = ring["values"]
+    let ages = ring["ages"]
+    let valid = ring["valid"]
+    let mut new_keys = []
+    let mut new_vals = []
+    let mut new_ages = []
+    let mut new_valid = []
+    for i in 0..cap {
+        new_keys = new_keys + [keys[i]]
+        new_vals = new_vals + [vals[i]]
+        new_ages = new_ages + [ages[i]]
+        new_valid = new_valid + [valid[i]]
+    }
+    return #{
+        "keys": new_keys,
+        "values": new_vals,
+        "capacity": cap,
+        "count": ring["count"],
+        "write_ptr": ring["write_ptr"],
+        "step": ring["step"],
+        "ages": new_ages,
+        "valid": new_valid,
+        "dim": ring["dim"]
+    }
+}
+
+// ===================================================================
+//  Test data helpers
+// ===================================================================
+
+fn make_key(idx, dim) {
+    let mut v = rbkv_zeros(dim)
+    for d in 0..dim {
+        let mut h = (idx + 1) * 37 + d * 13
+        h = h % 100
+        v[d] = to_float(h) / 50.0 - 1.0
+    }
+    return v
+}
+
+fn make_val(idx, dim) {
+    let mut v = rbkv_zeros(dim)
+    for d in 0..dim {
+        let mut h = (idx + 1) * 53 + d * 7
+        h = h % 100
+        v[d] = to_float(h) / 50.0 - 1.0
+    }
+    return v
+}
+
+fn build_ring(n, capacity, dim) {
+    let mut r = rbkv_create(capacity, dim)
+    for i in 0..n {
+        r = rbkv_append(r, make_key(i, dim), make_val(i, dim))
+    }
+    return r
+}
+
+// ===================================================================
+//  TESTS
+// ===================================================================
+let DIM = 4
+let CAP = 8
+
+// T1: create ring has size 0
+let r0 = rbkv_create(CAP, DIM)
+check("T1 create ring has size 0", rbkv_size(r0) == 0)
+
+// T2: create ring has correct capacity
+check("T2 create ring capacity = 8", rbkv_capacity(r0) == CAP)
+
+// T3: create ring has correct dim
+check("T3 create ring dim = 4", r0["dim"] == DIM)
+
+// T4: append increases size
+let r1 = rbkv_append(r0, [1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0])
+check("T4 append increases size to 1", rbkv_size(r1) == 1)
+
+// T5: append to full wraps write pointer
+let r5 = build_ring(CAP, CAP, DIM)
+check("T5 full ring size = capacity", rbkv_size(r5) == CAP)
+let r5a = rbkv_append(r5, [0.5, 0.5, 0.5, 0.5], [0.5, 0.5, 0.5, 0.5])
+check("T5b after wrap size still = capacity", rbkv_size(r5a) == CAP)
+
+// T6: size never exceeds capacity
+let r6 = build_ring(CAP + 5, CAP, DIM)
+check("T6 size never exceeds capacity", rbkv_size(r6) <= CAP)
+
+// T7: write_ptr wraps to 0 after capacity
+let r7 = build_ring(CAP, CAP, DIM)
+check("T7 write_ptr wraps to 0 after filling", r7["write_ptr"] == 0)
+
+// T8: read_ordered returns entries in insertion order (not full)
+let r8 = build_ring(3, CAP, DIM)
+let ordered8 = rbkv_read_ordered(r8)
+let ok8 = ordered8["keys"]
+check("T8 read_ordered count = 3", len(ok8) == 3)
+// First entry key should match make_key(0, DIM)
+let expected_k0 = make_key(0, DIM)
+check("T8b first key matches insertion order", approx(ok8[0][0], expected_k0[0], 1.0e-6))
+
+// T9: read_ordered handles wrap-around (full buffer)
+let r9 = build_ring(CAP + 3, CAP, DIM)
+let ordered9 = rbkv_read_ordered(r9)
+let ok9 = ordered9["keys"]
+check("T9 read_ordered count = capacity after wrap", len(ok9) == CAP)
+// After CAP+3 appends, oldest should be entry 3 (indices 0,1,2 evicted)
+let expected_k3 = make_key(3, DIM)
+check("T9b oldest entry after wrap is correct", approx(ok9[0][0], expected_k3[0], 1.0e-6))
+
+// T10: oldest slot before full is 0
+let r10 = build_ring(3, CAP, DIM)
+check("T10 oldest slot before full is 0", rbkv_oldest_slot(r10) == 0)
+
+// T11: oldest slot when full is write_ptr
+let r11 = build_ring(CAP, CAP, DIM)
+check("T11 oldest slot when full = write_ptr", rbkv_oldest_slot(r11) == r11["write_ptr"])
+
+// T12: oldest age tracks first insertion
+let r12 = build_ring(5, CAP, DIM)
+check("T12 oldest age = 0 (first insertion)", rbkv_oldest_age(r12) == 0)
+
+// T13: newest age tracks last insertion
+let r13 = build_ring(5, CAP, DIM)
+check("T13 newest age = 4 (last insertion step)", rbkv_newest_age(r13) == 4)
+
+// T14: eviction overwrites oldest on append when full
+let r14 = build_ring(CAP, CAP, DIM)
+let old_oldest_age = rbkv_oldest_age(r14)
+let r14a = rbkv_append(r14, [0.9, 0.9, 0.9, 0.9], [0.1, 0.1, 0.1, 0.1])
+let new_oldest_age = rbkv_oldest_age(r14a)
+check("T14 oldest entry evicted after wrap append", new_oldest_age > old_oldest_age)
+
+// T15: causal mask is lower-triangular
+let r15 = build_ring(4, CAP, DIM)
+let mask15 = rbkv_causal_mask(r15)
+let mut is_lower_tri = true
+for i in 0..4 {
+    for j in 0..4 {
+        if j <= i {
+            if mask15[i][j] < 0.5 { is_lower_tri = false }
+        } else {
+            if mask15[i][j] > 0.5 { is_lower_tri = false }
+        }
+    }
+}
+check("T15 causal mask is lower-triangular", is_lower_tri)
+
+// T16: full mask is all ones
+let mask16 = rbkv_full_mask(r15)
+let mut all_ones = true
+for i in 0..4 {
+    for j in 0..4 {
+        if mask16[i][j] < 0.5 { all_ones = false }
+    }
+}
+check("T16 full mask is all ones", all_ones)
+
+// T17: apply_mask zeroes masked positions
+let logits17 = [1.0, 2.0, 3.0, 4.0]
+let mask17 = [1.0, 0.0, 1.0, 0.0]
+let masked17 = rbkv_apply_mask(logits17, mask17)
+check("T17 apply_mask keeps unmasked", approx(masked17[0], 1.0, 1.0e-6))
+check("T17b apply_mask zeroes masked", masked17[1] < -1.0e8)
+
+// T18: attend returns vector of correct dim
+let r18 = build_ring(5, CAP, DIM)
+let q18 = [1.0, 0.5, 0.0, 0.0]
+let out18 = rbkv_attend(r18, q18, false)
+check("T18 attend output dim = 4", len(out18) == DIM)
+
+// T19: attend empty ring returns zeros
+let r19 = rbkv_create(CAP, DIM)
+let out19 = rbkv_attend(r19, q18, false)
+let mut all_zero = true
+for d in 0..DIM {
+    if fabs(out19[d]) > 1.0e-9 { all_zero = false }
+}
+check("T19 attend empty ring returns zeros", all_zero)
+
+// T20: attend weights sum to ~1 (softmax property)
+let r20 = build_ring(4, CAP, DIM)
+let scores20 = rbkv_raw_scores(r20, q18)
+let weights20 = rbkv_softmax(scores20)
+let mut wsum = 0.0
+for i in 0..len(weights20) {
+    wsum = wsum + weights20[i]
+}
+check("T20 softmax weights sum to 1", approx(wsum, 1.0, 1.0e-6))
+
+// T21: attend with single entry returns that value
+let r21 = rbkv_create(CAP, DIM)
+let r21a = rbkv_append(r21, [1.0, 0.0, 0.0, 0.0], [0.5, 0.3, 0.2, 0.1])
+let out21 = rbkv_attend(r21a, [1.0, 0.0, 0.0, 0.0], false)
+check("T21 single-entry attend returns that value", approx(out21[0], 0.5, 1.0e-6))
+check("T21b single-entry attend d=1", approx(out21[1], 0.3, 1.0e-6))
+
+// T22: stream_step appends and returns output
+let r22 = build_ring(3, CAP, DIM)
+let step22 = rbkv_stream_step(r22, [1.0, 0.0, 0.0, 0.0], [0.5, 0.5, 0.5, 0.5], [1.0, 0.0, 0.0, 0.0])
+let r22a = step22["ring"]
+check("T22 stream_step increments size", rbkv_size(r22a) == 4)
+
+// T23: stream_step output has correct dim
+let out22 = step22["output"]
+check("T23 stream_step output dim = 4", len(out22) == DIM)
+
+// T24: stream_batch processes multiple tokens
+let r24 = rbkv_create(CAP, DIM)
+let k_list = [make_key(0, DIM), make_key(1, DIM), make_key(2, DIM)]
+let v_list = [make_val(0, DIM), make_val(1, DIM), make_val(2, DIM)]
+let q_list = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]]
+let batch24 = rbkv_stream_batch(r24, k_list, v_list, q_list)
+check("T24 stream_batch returns 3 outputs", len(batch24["outputs"]) == 3)
+
+// T25: stream_batch ring count correct
+let r24a = batch24["ring"]
+check("T25 stream_batch ring has 3 entries", rbkv_size(r24a) == 3)
+
+// T26: memory bound holds after many appends
+let r26 = build_ring(50, CAP, DIM)
+check("T26 memory bound after 50 appends to cap=8", rbkv_size(r26) == CAP)
+check("T26b write_ptr in range", r26["write_ptr"] >= 0 && r26["write_ptr"] < CAP)
+
+// T27: memory bound holds after capacity+N appends
+let r27 = build_ring(100, CAP, DIM)
+check("T27 size = capacity after 100 appends", rbkv_size(r27) == CAP)
+check("T27b step tracks total appends", r27["step"] == 100)
+
+// T28: check_bound returns true for valid ring
+let r28 = build_ring(20, CAP, DIM)
+check("T28 check_bound returns true", rbkv_check_bound(r28))
+
+// T29: stats reports correct fields
+let r29 = build_ring(12, CAP, DIM)
+let stats29 = rbkv_stats(r29)
+check("T29 stats count = capacity", stats29["count"] == CAP)
+check("T29b stats capacity correct", stats29["capacity"] == CAP)
+check("T29c stats total_tokens_seen = 12", stats29["total_tokens_seen"] == 12)
+
+// T30: stats evicted count correct
+check("T30 stats evicted = 12 - 8 = 4", stats29["evicted"] == 4)
+check("T30b stats utilization = 100%", approx(stats29["utilization_pct"], 100.0, 0.01))
+
+// T31: multi-head create has correct structure
+let mh31 = rbkv_multi_head_create(4, CAP, DIM)
+check("T31 multi-head n_heads = 4", mh31["n_heads"] == 4)
+check("T31b multi-head heads count = 4", len(mh31["heads"]) == 4)
+
+// T32: multi-head append and attend
+let mut mh32 = rbkv_multi_head_create(2, CAP, DIM)
+mh32 = rbkv_multi_head_append(mh32, 0, [1.0, 0.0, 0.0, 0.0], [0.7, 0.3, 0.1, 0.0])
+mh32 = rbkv_multi_head_append(mh32, 1, [0.0, 1.0, 0.0, 0.0], [0.0, 0.5, 0.5, 0.0])
+let out32_h0 = rbkv_multi_head_attend(mh32, 0, [1.0, 0.0, 0.0, 0.0])
+let out32_h1 = rbkv_multi_head_attend(mh32, 1, [0.0, 1.0, 0.0, 0.0])
+check("T32 multi-head h0 output correct", approx(out32_h0[0], 0.7, 1.0e-6))
+check("T32b multi-head h1 output correct", approx(out32_h1[1], 0.5, 1.0e-6))
+
+// T33: ring copy is independent
+let r33 = build_ring(5, CAP, DIM)
+let r33c = rbkv_copy(r33)
+let r33m = rbkv_append(r33c, [0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0])
+check("T33 copy is independent (original unchanged)", rbkv_size(r33) == 5)
+check("T33b copy modified independently", rbkv_size(r33m) == 6)
+
+// T34: logical_to_physical mapping correct before full
+let r34 = build_ring(3, CAP, DIM)
+check("T34 logical 0 -> physical 0 before full", rbkv_logical_to_physical(r34, 0) == 0)
+check("T34b logical 2 -> physical 2 before full", rbkv_logical_to_physical(r34, 2) == 2)
+
+// T35: logical_to_physical mapping correct after full
+let r35 = build_ring(CAP + 2, CAP, DIM)
+// After CAP+2 appends, write_ptr = 2, so oldest is at slot 2
+let phys0 = rbkv_logical_to_physical(r35, 0)
+check("T35 logical 0 = oldest maps to write_ptr", phys0 == r35["write_ptr"])
+
+// ===================================================================
+println("")
+println("=== ring_buffer_kv test summary ===")
+println("PASS: " + str(pass_count))
+println("FAIL: " + str(fail_count))
+println("TOTAL: " + str(pass_count + fail_count))
