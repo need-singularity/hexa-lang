@@ -1,0 +1,311 @@
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/early_exit.hexa — Dynamic Early Exit
+//
+//  Features:
+//    1. Per-layer confidence estimator (hidden -> scalar)
+//    2. Threshold-based early exit (confidence > threshold -> stop)
+//    3. Remaining layer skip with final output
+//    4. Exit statistics tracking
+//
+//  API:
+//    ee_confidence(hidden, weights, bias, dim) -> float
+//    ee_softmax_confidence(logits) -> float  (max softmax prob)
+//    ee_entropy_confidence(logits) -> float  (1 - normalized entropy)
+//    early_exit_forward(layers, exit_heads, input, threshold) -> EarlyExitResult
+//    ee_make_layer(w, bias, out_dim, in_dim) -> EELayer
+//    ee_make_exit_head(w, bias, dim) -> ExitHead
+//
+//  L0 금지: src/*.rs 미접촉. 순수 .hexa.
+// ═══════════════════════════════════════════════════════════════
+
+// ── Math helpers ─────────────────────────────────────────────
+fn _ee_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn _ee_max(a, b) {
+    if a >= b { return a }
+    return b
+}
+
+// ── Structs ─────────────────────────────────────────────────
+struct EELayer {
+    w: array,
+    bias: array,
+    out_dim: int,
+    in_dim: int
+}
+
+struct ExitHead {
+    w: array,
+    bias: float,
+    dim: int
+}
+
+struct EarlyExitResult {
+    output: array,
+    exit_layer: int,
+    confidence: float,
+    total_layers: int,
+    layers_skipped: int
+}
+
+// ── Layer forward: y = W @ x + bias ─────────────────────────
+@pure
+fn ee_layer_forward(layer: EELayer, x) {
+    let m = layer.out_dim
+    let n = layer.in_dim
+    let mut y = []
+    let mut i = 0
+    while i < m {
+        let mut s = layer.bias[i]
+        let mut j = 0
+        while j < n {
+            s = s + layer.w[i][j] * x[j]
+            j = j + 1
+        }
+        y = y + [s]
+        i = i + 1
+    }
+    return y
+}
+
+// ── ReLU activation ─────────────────────────────────────────
+@pure
+fn ee_relu(x) {
+    let n = len(x)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        if x[i] > 0.0 {
+            out = out + [x[i]]
+        } else {
+            out = out + [0.0]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Confidence estimators
+// ═══════════════════════════════════════════════════════════════
+
+// Linear confidence head: sigmoid(w . hidden + bias) -> [0, 1]
+@pure
+fn ee_confidence(hidden, weights, bias, dim) {
+    let mut dot = bias
+    let mut i = 0
+    while i < dim {
+        dot = dot + weights[i] * hidden[i]
+        i = i + 1
+    }
+    // sigmoid
+    let sig = 1.0 / (1.0 + exp(0.0 - dot))
+    return sig
+}
+
+// Softmax confidence: max(softmax(logits)) -> [0, 1]
+@pure
+fn ee_softmax_confidence(logits) {
+    let n = len(logits)
+    // find max for stability
+    let mut mx = logits[0]
+    let mut i = 1
+    while i < n {
+        if logits[i] > mx { mx = logits[i] }
+        i = i + 1
+    }
+    let mut total = 0.0
+    let mut max_exp = 0.0
+    i = 0
+    while i < n {
+        let e = exp(logits[i] - mx)
+        total = total + e
+        if e > max_exp { max_exp = e }
+        i = i + 1
+    }
+    return max_exp / total
+}
+
+// Entropy-based confidence: 1 - H(softmax) / log(n)
+// Low entropy = high confidence
+@pure
+fn ee_entropy_confidence(logits) {
+    let n = len(logits)
+    if n <= 1 { return 1.0 }
+    // softmax
+    let mut mx = logits[0]
+    let mut i = 1
+    while i < n {
+        if logits[i] > mx { mx = logits[i] }
+        i = i + 1
+    }
+    let mut exps = []
+    let mut total = 0.0
+    i = 0
+    while i < n {
+        let e = exp(logits[i] - mx)
+        exps = exps + [e]
+        total = total + e
+        i = i + 1
+    }
+    // compute entropy
+    let mut entropy = 0.0
+    i = 0
+    while i < n {
+        let p = exps[i] / total
+        if p > 1.0e-10 {
+            entropy = entropy - p * ln(p)
+        }
+        i = i + 1
+    }
+    let max_entropy = ln(to_float(n))
+    if max_entropy < 1.0e-10 { return 1.0 }
+    let normalized = entropy / max_entropy
+    return 1.0 - normalized
+}
+
+// ln approximation using natural log via series
+@pure
+fn ln(x) {
+    if x <= 0.0 { return -999.0 }
+    let mut v = x
+    let mut adj = 0.0
+    while v > 2.0 {
+        v = v / 2.718281828
+        adj = adj + 1.0
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        adj = adj - 1.0
+    }
+    let t = (v - 1.0) / (v + 1.0)
+    let t2 = t * t
+    let result = 2.0 * (t + t * t2 / 3.0 + t * t2 * t2 / 5.0 + t * t2 * t2 * t2 / 7.0)
+    return result + adj
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Exit head constructor
+// ═══════════════════════════════════════════════════════════════
+
+fn ee_make_exit_head(weights, bias, dim) {
+    return ExitHead {
+        w: weights,
+        bias: bias,
+        dim: dim
+    }
+}
+
+fn ee_make_layer(w, bias, out_dim, in_dim) {
+    return EELayer {
+        w: w,
+        bias: bias,
+        out_dim: out_dim,
+        in_dim: in_dim
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Dynamic Early Exit Forward
+//
+//  For each layer:
+//    1. Compute hidden = layer(input)
+//    2. Compute confidence = exit_head(hidden)
+//    3. If confidence > threshold -> return hidden, skip rest
+//    4. Otherwise continue to next layer
+// ═══════════════════════════════════════════════════════════════
+
+@hot
+fn early_exit_forward(layers, exit_heads, input, threshold) {
+    let n = len(layers)
+    let mut hidden = input
+    let mut i = 0
+    while i < n {
+        let layer = layers[i]
+        hidden = ee_layer_forward(layer, hidden)
+        hidden = ee_relu(hidden)
+        // Check exit condition
+        let head = exit_heads[i]
+        let conf = ee_confidence(hidden, head.w, head.bias, head.dim)
+        if conf > threshold {
+            return EarlyExitResult {
+                output: hidden,
+                exit_layer: i,
+                confidence: conf,
+                total_layers: n,
+                layers_skipped: n - i - 1
+            }
+        }
+        i = i + 1
+    }
+    // No early exit — went through all layers
+    return EarlyExitResult {
+        output: hidden,
+        exit_layer: n - 1,
+        confidence: 1.0,
+        total_layers: n,
+        layers_skipped: 0
+    }
+}
+
+// ── Forward without early exit (baseline for comparison) ─────
+@pure
+fn full_forward(layers, input) {
+    let n = len(layers)
+    let mut hidden = input
+    let mut i = 0
+    while i < n {
+        hidden = ee_layer_forward(layers[i], hidden)
+        hidden = ee_relu(hidden)
+        i = i + 1
+    }
+    return hidden
+}
+
+// ── Batch early exit: track exit distribution ────────────────
+fn ee_batch_forward(layers, exit_heads, inputs, threshold) {
+    let n_inputs = len(inputs)
+    let n_layers = len(layers)
+    let mut results = []
+    let mut exit_counts = []
+    let mut i = 0
+    while i < n_layers {
+        exit_counts = exit_counts + [0]
+        i = i + 1
+    }
+    i = 0
+    while i < n_inputs {
+        let result = early_exit_forward(layers, exit_heads, inputs[i], threshold)
+        results = results + [result]
+        exit_counts[result.exit_layer] = exit_counts[result.exit_layer] + 1
+        i = i + 1
+    }
+    return [results, exit_counts]
+}
+
+// ── Average layers used ─────────────────────────────────────
+@pure
+fn ee_avg_layers_used(results) {
+    let n = len(results)
+    if n == 0 { return 0.0 }
+    let mut total = 0.0
+    let mut i = 0
+    while i < n {
+        let r = results[i]
+        total = total + to_float(r.exit_layer + 1)
+        i = i + 1
+    }
+    return total / to_float(n)
+}
+
+// ── Speedup estimate ────────────────────────────────────────
+@pure
+fn ee_speedup(total_layers, avg_layers_used) {
+    if avg_layers_used < 0.001 { return 0.0 }
+    return to_float(total_layers) / avg_layers_used
+}
+
+println("[early_exit] module loaded — confidence estimator + threshold exit + layer skip")

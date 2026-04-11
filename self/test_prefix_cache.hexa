@@ -1,0 +1,282 @@
+// ═══════════════════════════════════════════════════════════════
+//  test_prefix_cache.hexa — Prefix Caching 검증
+//
+//  검증:
+//    1. Hash determinism
+//    2. Store / lookup 왕복
+//    3. Longest prefix match
+//    4. Invalidation
+//    5. LRU eviction
+//    6. Stats (hit/miss rate)
+//
+//  실행: ./hexa self/test_prefix_cache.hexa
+// ═══════════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ═══════════════════════════════════════════════════════════════
+//  Inline core (self/ml/prefix_cache.hexa)
+// ═══════════════════════════════════════════════════════════════
+
+struct PrefixEntry { hash: int, tokens: array, kv_snapshot: array, tick: int, token_len: int }
+struct PrefixCache { entries: array, hashes: array, count: int, capacity: int, tick: int, hits: int, misses: int }
+struct PrefixHit { kv_snapshot: array, matched_len: int, hash: int }
+struct PrefixStats { count: int, capacity: int, hits: int, misses: int, hit_rate: float }
+
+// Lookup result wrapper (avoids mixed-type array)
+struct LookupResult { hit: PrefixHit, found: bool, cache: PrefixCache }
+
+fn pc_hash_tokens(tokens) {
+    let n = len(tokens)
+    let mut h = 2166136261
+    let mut i = 0
+    while i < n {
+        h = h ^ (tokens[i] * 16777619)
+        h = (h * 16777619) % 2147483647
+        if h < 0 { h = 0 - h }
+        i = i + 1
+    }
+    return h
+}
+
+fn pc_hash_prefix(tokens, k) {
+    let mut h = 2166136261
+    let mut i = 0
+    while i < k {
+        h = h ^ (tokens[i] * 16777619)
+        h = (h * 16777619) % 2147483647
+        if h < 0 { h = 0 - h }
+        i = i + 1
+    }
+    return h
+}
+
+fn pc_create(capacity) {
+    return PrefixCache { entries: [], hashes: [], count: 0, capacity: capacity, tick: 0, hits: 0, misses: 0 }
+}
+
+fn _pc_tokens_equal(a, b) {
+    let na = len(a)
+    let nb = len(b)
+    if na != nb { return false }
+    let mut i = 0
+    while i < na {
+        if a[i] != b[i] { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn _pc_find_index(cache: PrefixCache, hash, tokens) {
+    let mut i = 0
+    while i < cache.count {
+        if cache.hashes[i] == hash {
+            if _pc_tokens_equal(cache.entries[i].tokens, tokens) { return i }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn _pc_find_lru(cache: PrefixCache) {
+    let mut min_tick = cache.entries[0].tick
+    let mut min_idx = 0
+    let mut i = 1
+    while i < cache.count {
+        if cache.entries[i].tick < min_tick { min_tick = cache.entries[i].tick; min_idx = i }
+        i = i + 1
+    }
+    return min_idx
+}
+
+fn pc_store(cache: PrefixCache, tokens, kv_snapshot) {
+    let hash = pc_hash_tokens(tokens)
+    let new_tick = cache.tick + 1
+    let entry = PrefixEntry { hash: hash, tokens: tokens, kv_snapshot: kv_snapshot, tick: new_tick, token_len: len(tokens) }
+    let idx = _pc_find_index(cache, hash, tokens)
+    if idx >= 0 {
+        let mut new_entries = cache.entries
+        new_entries[idx] = entry
+        return PrefixCache { entries: new_entries, hashes: cache.hashes, count: cache.count, capacity: cache.capacity, tick: new_tick, hits: cache.hits, misses: cache.misses }
+    }
+    if cache.count >= cache.capacity {
+        let victim = _pc_find_lru(cache)
+        let mut ne = []
+        let mut nh = []
+        let mut i = 0
+        while i < cache.count {
+            if i != victim { ne = ne + [cache.entries[i]]; nh = nh + [cache.hashes[i]] }
+            i = i + 1
+        }
+        return PrefixCache { entries: ne + [entry], hashes: nh + [hash], count: cache.count, capacity: cache.capacity, tick: new_tick, hits: cache.hits, misses: cache.misses }
+    }
+    return PrefixCache { entries: cache.entries + [entry], hashes: cache.hashes + [hash], count: cache.count + 1, capacity: cache.capacity, tick: new_tick, hits: cache.hits, misses: cache.misses }
+}
+
+// Returns LookupResult { hit, found, cache }
+fn pc_lookup(cache: PrefixCache, tokens) {
+    let hash = pc_hash_tokens(tokens)
+    let idx = _pc_find_index(cache, hash, tokens)
+    let dummy_hit = PrefixHit { kv_snapshot: [], matched_len: 0, hash: 0 }
+    if idx >= 0 {
+        let new_tick = cache.tick + 1
+        let mut new_entries = cache.entries
+        let old_entry = cache.entries[idx]
+        new_entries[idx] = PrefixEntry { hash: old_entry.hash, tokens: old_entry.tokens, kv_snapshot: old_entry.kv_snapshot, tick: new_tick, token_len: old_entry.token_len }
+        let hit = PrefixHit { kv_snapshot: old_entry.kv_snapshot, matched_len: old_entry.token_len, hash: hash }
+        let updated = PrefixCache { entries: new_entries, hashes: cache.hashes, count: cache.count, capacity: cache.capacity, tick: new_tick, hits: cache.hits + 1, misses: cache.misses }
+        return LookupResult { hit: hit, found: true, cache: updated }
+    }
+    let updated = PrefixCache { entries: cache.entries, hashes: cache.hashes, count: cache.count, capacity: cache.capacity, tick: cache.tick, hits: cache.hits, misses: cache.misses + 1 }
+    return LookupResult { hit: dummy_hit, found: false, cache: updated }
+}
+
+// Returns LookupResult { hit, found, cache }
+fn pc_longest_prefix_match(cache: PrefixCache, tokens) {
+    let n = len(tokens)
+    let mut k = n
+    let dummy_hit = PrefixHit { kv_snapshot: [], matched_len: 0, hash: 0 }
+    while k > 0 {
+        let mut prefix = []
+        let mut i = 0
+        while i < k { prefix = prefix + [tokens[i]]; i = i + 1 }
+        let hash = pc_hash_tokens(prefix)
+        let idx = _pc_find_index(cache, hash, prefix)
+        if idx >= 0 {
+            let new_tick = cache.tick + 1
+            let mut new_entries = cache.entries
+            let old_entry = cache.entries[idx]
+            new_entries[idx] = PrefixEntry { hash: old_entry.hash, tokens: old_entry.tokens, kv_snapshot: old_entry.kv_snapshot, tick: new_tick, token_len: old_entry.token_len }
+            let hit = PrefixHit { kv_snapshot: old_entry.kv_snapshot, matched_len: k, hash: hash }
+            let updated = PrefixCache { entries: new_entries, hashes: cache.hashes, count: cache.count, capacity: cache.capacity, tick: new_tick, hits: cache.hits + 1, misses: cache.misses }
+            return LookupResult { hit: hit, found: true, cache: updated }
+        }
+        k = k - 1
+    }
+    let updated = PrefixCache { entries: cache.entries, hashes: cache.hashes, count: cache.count, capacity: cache.capacity, tick: cache.tick, hits: cache.hits, misses: cache.misses + 1 }
+    return LookupResult { hit: dummy_hit, found: false, cache: updated }
+}
+
+fn pc_invalidate(cache: PrefixCache, tokens) {
+    let hash = pc_hash_tokens(tokens)
+    let idx = _pc_find_index(cache, hash, tokens)
+    if idx < 0 { return cache }
+    let mut ne = []
+    let mut nh = []
+    let mut i = 0
+    while i < cache.count {
+        if i != idx { ne = ne + [cache.entries[i]]; nh = nh + [cache.hashes[i]] }
+        i = i + 1
+    }
+    return PrefixCache { entries: ne, hashes: nh, count: cache.count - 1, capacity: cache.capacity, tick: cache.tick, hits: cache.hits, misses: cache.misses }
+}
+
+fn pc_clear(cache: PrefixCache) {
+    return PrefixCache { entries: [], hashes: [], count: 0, capacity: cache.capacity, tick: cache.tick, hits: cache.hits, misses: cache.misses }
+}
+
+fn pc_stats(cache: PrefixCache) {
+    let total = cache.hits + cache.misses
+    let mut rate = 0.0
+    if total > 0 { rate = to_float(cache.hits) / to_float(total) }
+    return PrefixStats { count: cache.count, capacity: cache.capacity, hits: cache.hits, misses: cache.misses, hit_rate: rate }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Tests
+// ═══════════════════════════════════════════════════════════════
+
+// #1 Hash determinism
+let h1a = pc_hash_tokens([1, 2, 3])
+let h1b = pc_hash_tokens([1, 2, 3])
+check("#1 hash deterministic", h1a == h1b)
+
+// #2 Different tokens -> different hash
+let h2 = pc_hash_tokens([4, 5, 6])
+check("#2 different tokens diff hash", h1a != h2)
+
+// #3 Empty cache
+let c3 = pc_create(10)
+check("#3 empty cache count=0", c3.count == 0)
+
+// #4 Store and lookup
+let mut c4 = pc_create(10)
+c4 = pc_store(c4, [1, 2, 3], [10.0, 20.0, 30.0])
+let r4 = pc_lookup(c4, [1, 2, 3])
+c4 = r4.cache
+check("#4 lookup hit", r4.found == true)
+
+// #5 Lookup returns correct KV
+check("#5 kv snapshot[0]=10", r4.hit.kv_snapshot[0] == 10.0)
+
+// #6 Lookup miss
+let r6 = pc_lookup(c4, [7, 8, 9])
+c4 = r6.cache
+check("#6 lookup miss", r6.found == false)
+
+// #7 Matched length
+check("#7 matched_len=3", r4.hit.matched_len == 3)
+
+// #8 Store multiple prefixes
+let mut c8 = pc_create(10)
+c8 = pc_store(c8, [1, 2], [100.0])
+c8 = pc_store(c8, [1, 2, 3], [200.0])
+c8 = pc_store(c8, [1, 2, 3, 4], [300.0])
+check("#8 count=3", c8.count == 3)
+
+// #9 Longest prefix match
+let r9 = pc_longest_prefix_match(c8, [1, 2, 3, 4, 5])
+c8 = r9.cache
+check("#9 longest match len=4", r9.hit.matched_len == 4)
+
+// #10 Longest prefix match shorter
+let r10 = pc_longest_prefix_match(c8, [1, 2, 99])
+c8 = r10.cache
+check("#10 longest match len=2", r10.hit.matched_len == 2)
+
+// #11 Invalidate
+let mut c11 = pc_store(pc_create(10), [1, 2, 3], [42.0])
+c11 = pc_invalidate(c11, [1, 2, 3])
+check("#11 invalidate count=0", c11.count == 0)
+
+// #12 Clear
+let mut c12 = pc_create(10)
+c12 = pc_store(c12, [1], [1.0])
+c12 = pc_store(c12, [2], [2.0])
+c12 = pc_clear(c12)
+check("#12 clear count=0", c12.count == 0)
+
+// #13 LRU eviction at capacity
+let mut c13 = pc_create(2)
+c13 = pc_store(c13, [1], [10.0])
+c13 = pc_store(c13, [2], [20.0])
+c13 = pc_store(c13, [3], [30.0])
+check("#13 eviction keeps count=2", c13.count == 2)
+
+// #14 LRU evicts oldest
+let r14 = pc_lookup(c13, [1])
+c13 = r14.cache
+check("#14 LRU evicted [1]", r14.found == false)
+
+// #15 Hash prefix matches full hash for same tokens
+let hp = pc_hash_prefix([1, 2, 3], 3)
+let hf = pc_hash_tokens([1, 2, 3])
+check("#15 hash_prefix == hash_tokens", hp == hf)
+
+// ═══════════════════════════════════════════════════════════════
+println("")
+println("prefix_cache: " + to_string(pass_count) + " PASS / " + to_string(fail_count) + " FAIL")

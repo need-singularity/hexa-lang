@@ -1,0 +1,358 @@
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/kv_cache_compress.hexa — KV-Cache Compression
+//
+//  Features:
+//    1. KV INT8 quantization (per-head symmetric)
+//    2. Token importance scoring (attention weight based)
+//    3. Eviction policy (least important token removal)
+//    4. Compressed cache forward (quantize→store→dequant→attend)
+//
+//  API:
+//    kvc_quantize_int8(values)          -> QuantKV {qdata, scale}
+//    kvc_dequantize_int8(qkv)           -> [float]
+//    kvc_attention_importance(attn_weights, seq_len) -> [float]
+//    kvc_evict_least_important(cache, scores, budget) -> CompressedCache
+//    kvc_compress_forward(cache, query, budget) -> [output, new_cache]
+//
+//  Layout:
+//    flat 1D — same as kv_cache.hexa (immutable append pattern)
+//
+//  L0 금지: src/*.rs 미접촉. 순수 .hexa.
+// ═══════════════════════════════════════════════════════════════
+
+// ── Math helpers ─────────────────────────────────────────────
+fn _kvc_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn _kvc_max(a, b) {
+    if a >= b { return a }
+    return b
+}
+
+fn _kvc_min(a, b) {
+    if a <= b { return a }
+    return b
+}
+
+fn _kvc_clamp(v, lo, hi) {
+    if v < lo { return lo }
+    if v > hi { return hi }
+    return v
+}
+
+fn _kvc_round(x) {
+    if x >= 0.0 { return int(x + 0.5) }
+    return int(x - 0.5)
+}
+
+// ── Quantized KV data ───────────────────────────────────────
+struct QuantKV {
+    qdata: array,
+    scale: float,
+    numel: int
+}
+
+// ── INT8 symmetric quantization ─────────────────────────────
+// maps [-absmax, absmax] -> [-127, 127]
+@pure
+fn kvc_quantize_int8(values) {
+    let n = len(values)
+    let mut amax = 0.0
+    let mut i = 0
+    while i < n {
+        let av = _kvc_abs(values[i])
+        if av > amax { amax = av }
+        i = i + 1
+    }
+    let mut scale = 1.0
+    if amax > 0.0 { scale = amax / 127.0 }
+    let inv_scale = 1.0 / scale
+    let mut qdata = []
+    i = 0
+    while i < n {
+        let q = _kvc_clamp(_kvc_round(values[i] * inv_scale), -128, 127)
+        qdata = qdata + [q]
+        i = i + 1
+    }
+    return QuantKV {
+        qdata: qdata,
+        scale: scale,
+        numel: n
+    }
+}
+
+// ── INT8 dequantization ─────────────────────────────────────
+@pure
+fn kvc_dequantize_int8(qkv: QuantKV) {
+    let n = qkv.numel
+    let scale = qkv.scale
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [to_float(qkv.qdata[i]) * scale]
+        i = i + 1
+    }
+    return out
+}
+
+// ── Quantization error (MSE) ────────────────────────────────
+@pure
+fn kvc_quant_error(original, qkv: QuantKV) {
+    let deq = kvc_dequantize_int8(qkv)
+    let n = len(original)
+    let mut sum_sq = 0.0
+    let mut i = 0
+    while i < n {
+        let d = original[i] - deq[i]
+        sum_sq = sum_sq + d * d
+        i = i + 1
+    }
+    return sum_sq / to_float(n)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Token importance scoring (attention weight based)
+//
+//  Given attention weights [seq_len] for a query position,
+//  compute importance = sum of attention received by each token.
+//  For multi-head: average across heads.
+// ═══════════════════════════════════════════════════════════════
+
+// softmax over raw scores
+@pure
+fn _kvc_softmax(scores) {
+    let n = len(scores)
+    // find max for numerical stability
+    let mut mx = scores[0]
+    let mut i = 1
+    while i < n {
+        if scores[i] > mx { mx = scores[i] }
+        i = i + 1
+    }
+    let mut exps = []
+    let mut total = 0.0
+    i = 0
+    while i < n {
+        let e = exp(scores[i] - mx)
+        exps = exps + [e]
+        total = total + e
+        i = i + 1
+    }
+    let mut out = []
+    i = 0
+    while i < n {
+        out = out + [exps[i] / total]
+        i = i + 1
+    }
+    return out
+}
+
+// Single-head importance: attention weights for each token
+// query [head_dim], keys [seq_len * head_dim] -> importance [seq_len]
+@pure
+fn kvc_attention_importance(query, keys, seq_len, head_dim) {
+    let scale = 1.0 / sqrt(to_float(head_dim))
+    let mut scores = []
+    let mut t = 0
+    while t < seq_len {
+        let mut dot = 0.0
+        let mut d = 0
+        while d < head_dim {
+            dot = dot + query[d] * keys[t * head_dim + d]
+            d = d + 1
+        }
+        scores = scores + [dot * scale]
+        t = t + 1
+    }
+    return _kvc_softmax(scores)
+}
+
+// Multi-head importance: average attention across n_heads
+// queries [n_heads * head_dim], keys [n_heads * seq_len * head_dim]
+@pure
+fn kvc_multi_head_importance(queries, keys, seq_len, n_heads, head_dim) {
+    let mut importance = []
+    let mut t = 0
+    while t < seq_len {
+        importance = importance + [0.0]
+        t = t + 1
+    }
+    let mut h = 0
+    while h < n_heads {
+        let q_offset = h * head_dim
+        let k_offset = h * seq_len * head_dim
+        // extract single head query
+        let mut q_head = []
+        let mut d = 0
+        while d < head_dim {
+            q_head = q_head + [queries[q_offset + d]]
+            d = d + 1
+        }
+        // extract single head keys
+        let mut k_head = []
+        t = 0
+        while t < seq_len * head_dim {
+            k_head = k_head + [keys[k_offset + t]]
+            t = t + 1
+        }
+        let head_imp = kvc_attention_importance(q_head, k_head, seq_len, head_dim)
+        t = 0
+        while t < seq_len {
+            importance[t] = importance[t] + head_imp[t] / to_float(n_heads)
+            t = t + 1
+        }
+        h = h + 1
+    }
+    return importance
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Compressed Cache struct + Eviction policy
+// ═══════════════════════════════════════════════════════════════
+
+struct CompressedCache {
+    keys: array,
+    values: array,
+    token_ids: array,
+    seq_len: int,
+    capacity: int,
+    head_dim: int
+}
+
+// Create empty compressed cache
+fn kvc_cache_new(capacity, head_dim) {
+    return CompressedCache {
+        keys: [],
+        values: [],
+        token_ids: [],
+        seq_len: 0,
+        capacity: capacity,
+        head_dim: head_dim
+    }
+}
+
+// Append a token's KV to cache (flat: key [head_dim], value [head_dim])
+fn kvc_cache_append(cache: CompressedCache, token_id, key, value) {
+    let mut new_keys = cache.keys
+    let mut new_vals = cache.values
+    let mut d = 0
+    while d < cache.head_dim {
+        new_keys = new_keys + [key[d]]
+        new_vals = new_vals + [value[d]]
+        d = d + 1
+    }
+    let new_ids = cache.token_ids + [token_id]
+    return CompressedCache {
+        keys: new_keys,
+        values: new_vals,
+        token_ids: new_ids,
+        seq_len: cache.seq_len + 1,
+        capacity: cache.capacity,
+        head_dim: cache.head_dim
+    }
+}
+
+// Find index of minimum importance token
+fn _kvc_argmin(scores, n) {
+    let mut min_idx = 0
+    let mut min_val = scores[0]
+    let mut i = 1
+    while i < n {
+        if scores[i] < min_val {
+            min_val = scores[i]
+            min_idx = i
+        }
+        i = i + 1
+    }
+    return min_idx
+}
+
+// Evict least important tokens until seq_len <= budget
+@hot
+fn kvc_evict_least_important(cache: CompressedCache, importance, budget) {
+    let mut c = cache
+    let mut imp = importance
+    while c.seq_len > budget {
+        let victim = _kvc_argmin(imp, c.seq_len)
+        // Remove victim's keys, values, and token_id
+        let hd = c.head_dim
+        let v_start = victim * hd
+        let mut new_keys = []
+        let mut new_vals = []
+        let mut new_ids = []
+        let mut new_imp = []
+        let mut t = 0
+        while t < c.seq_len {
+            if t != victim {
+                let mut d = 0
+                while d < hd {
+                    new_keys = new_keys + [c.keys[t * hd + d]]
+                    new_vals = new_vals + [c.values[t * hd + d]]
+                    d = d + 1
+                }
+                new_ids = new_ids + [c.token_ids[t]]
+                new_imp = new_imp + [imp[t]]
+            }
+            t = t + 1
+        }
+        c = CompressedCache {
+            keys: new_keys,
+            values: new_vals,
+            token_ids: new_ids,
+            seq_len: c.seq_len - 1,
+            capacity: c.capacity,
+            head_dim: c.head_dim
+        }
+        imp = new_imp
+    }
+    return c
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Compressed forward pass
+//
+//  1. Compute attention importance for existing tokens
+//  2. If over budget, evict least important
+//  3. Compute output = softmax(Q*K^T/sqrt(d)) * V
+// ═══════════════════════════════════════════════════════════════
+
+@hot
+fn kvc_compress_forward(cache: CompressedCache, query, budget) {
+    let seq = cache.seq_len
+    let hd = cache.head_dim
+    // Step 1: compute importance
+    let imp = kvc_attention_importance(query, cache.keys, seq, hd)
+    // Step 2: evict if needed
+    let mut c = cache
+    if seq > budget {
+        c = kvc_evict_least_important(cache, imp, budget)
+    }
+    // Step 3: attend over remaining tokens
+    let new_seq = c.seq_len
+    let imp2 = kvc_attention_importance(query, c.keys, new_seq, hd)
+    // output = sum(imp2[t] * value[t])
+    let mut output = []
+    let mut d = 0
+    while d < hd {
+        let mut s = 0.0
+        let mut t = 0
+        while t < new_seq {
+            s = s + imp2[t] * c.values[t * hd + d]
+            t = t + 1
+        }
+        output = output + [s]
+        d = d + 1
+    }
+    return [output, c]
+}
+
+// ── Compression ratio calculation ───────────────────────────
+@pure
+fn kvc_compression_ratio(original_len, compressed_len) {
+    if compressed_len == 0 { return 0.0 }
+    return to_float(original_len) / to_float(compressed_len)
+}
+
+println("[kv_cache_compress] module loaded — INT8 quant + importance scoring + eviction")

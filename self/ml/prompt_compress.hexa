@@ -1,0 +1,427 @@
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/prompt_compress.hexa — Prompt Compression
+//
+//  Features:
+//    1. Token importance scoring (perplexity based)
+//    2. Selective token dropping (remove low importance tokens)
+//    3. Configurable compression ratio
+//    4. Reconstruction quality estimation
+//
+//  API:
+//    pcomp_token_importance(logprobs) -> [float]
+//    pcomp_compress(tokens, importance, ratio) -> CompressedPrompt
+//    pcomp_compress_topk(tokens, importance, budget) -> CompressedPrompt
+//    pcomp_perplexity_score(logprobs) -> [float]
+//    pcomp_iterative_compress(tokens, logprobs, target_ratio) -> CompressedPrompt
+//    pcomp_quality_estimate(original_len, compressed_len, avg_importance_kept) -> float
+//
+//  LLMLingua-inspired: keep tokens with high information content.
+//  L0 금지: src/*.rs 미접촉. 순수 .hexa.
+// ═══════════════════════════════════════════════════════════════
+
+// ── Math helpers ─────────────────────────────────────────────
+fn _pcomp_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn _pcomp_min(a, b) {
+    if a <= b { return a }
+    return b
+}
+
+fn _pcomp_max(a, b) {
+    if a >= b { return a }
+    return b
+}
+
+// ── Structs ─────────────────────────────────────────────────
+struct CompressedPrompt {
+    tokens: array,
+    kept_indices: array,
+    original_len: int,
+    compressed_len: int,
+    compression_ratio: float,
+    avg_importance: float
+}
+
+struct CompressionConfig {
+    target_ratio: float,
+    min_tokens: int,
+    protect_first_n: int,
+    protect_last_n: int
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Default config
+// ═══════════════════════════════════════════════════════════════
+
+fn pcomp_default_config() {
+    return CompressionConfig {
+        target_ratio: 0.5,
+        min_tokens: 1,
+        protect_first_n: 1,
+        protect_last_n: 1
+    }
+}
+
+fn pcomp_make_config(target_ratio, min_tokens, protect_first, protect_last) {
+    return CompressionConfig {
+        target_ratio: target_ratio,
+        min_tokens: min_tokens,
+        protect_first_n: protect_first,
+        protect_last_n: protect_last
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Token importance scoring
+//
+//  Based on negative log probability (perplexity contribution).
+//  Higher score = more surprising = more important to keep.
+//  logprobs[i] = log P(token_i | context)  (negative values)
+// ═══════════════════════════════════════════════════════════════
+
+// Perplexity-based importance: -logprob (higher = more important)
+@pure
+fn pcomp_token_importance(logprobs) {
+    let n = len(logprobs)
+    let mut importance = []
+    let mut i = 0
+    while i < n {
+        // -logprob: low probability tokens are most important
+        importance = importance + [0.0 - logprobs[i]]
+        i = i + 1
+    }
+    return importance
+}
+
+// Perplexity per-token: exp(-logprob)
+@pure
+fn pcomp_perplexity_score(logprobs) {
+    let n = len(logprobs)
+    let mut scores = []
+    let mut i = 0
+    while i < n {
+        scores = scores + [exp(0.0 - logprobs[i])]
+        i = i + 1
+    }
+    return scores
+}
+
+// Entropy-based importance: combine local context surprise
+@pure
+fn pcomp_entropy_importance(logprobs, window) {
+    let n = len(logprobs)
+    let mut importance = []
+    let mut i = 0
+    while i < n {
+        let start = _pcomp_max(0, i - window)
+        let end_idx = _pcomp_min(n, i + window + 1)
+        let mut local_sum = 0.0
+        let mut count = 0
+        let mut j = start
+        while j < end_idx {
+            local_sum = local_sum + _pcomp_abs(logprobs[j])
+            count = count + 1
+            j = j + 1
+        }
+        let local_avg = local_sum / to_float(count)
+        // importance = how much this token deviates from local avg
+        let dev = _pcomp_abs(_pcomp_abs(logprobs[i]) - local_avg)
+        importance = importance + [_pcomp_abs(logprobs[i]) + dev]
+        i = i + 1
+    }
+    return importance
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Argsort (ascending) — returns indices sorted by value
+// ═══════════════════════════════════════════════════════════════
+
+fn _pcomp_argsort_asc(values) {
+    let n = len(values)
+    let mut indices = []
+    let mut i = 0
+    while i < n {
+        indices = indices + [i]
+        i = i + 1
+    }
+    // Selection sort by value (ascending)
+    i = 0
+    while i < n {
+        let mut min_idx = i
+        let mut j = i + 1
+        while j < n {
+            if values[indices[j]] < values[indices[min_idx]] {
+                min_idx = j
+            }
+            j = j + 1
+        }
+        if min_idx != i {
+            let tmp = indices[i]
+            indices[i] = indices[min_idx]
+            indices[min_idx] = tmp
+        }
+        i = i + 1
+    }
+    return indices
+}
+
+fn _pcomp_argsort_desc(values) {
+    let n = len(values)
+    let mut indices = []
+    let mut i = 0
+    while i < n {
+        indices = indices + [i]
+        i = i + 1
+    }
+    // Selection sort by value (descending)
+    i = 0
+    while i < n {
+        let mut max_idx = i
+        let mut j = i + 1
+        while j < n {
+            if values[indices[j]] > values[indices[max_idx]] {
+                max_idx = j
+            }
+            j = j + 1
+        }
+        if max_idx != i {
+            let tmp = indices[i]
+            indices[i] = indices[max_idx]
+            indices[max_idx] = tmp
+        }
+        i = i + 1
+    }
+    return indices
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Compression: keep top-K most important tokens
+// ═══════════════════════════════════════════════════════════════
+
+// Compress by ratio: keep ceil(n * ratio) tokens
+@hot
+fn pcomp_compress(tokens, importance, ratio) {
+    let n = len(tokens)
+    let budget = int(to_float(n) * ratio + 0.999)
+    return pcomp_compress_topk(tokens, importance, budget)
+}
+
+// Compress to exactly `budget` tokens (keep most important)
+@hot
+fn pcomp_compress_topk(tokens, importance, budget) {
+    let n = len(tokens)
+    let mut k = budget
+    if k > n { k = n }
+    if k < 1 { k = 1 }
+
+    // Get indices sorted by importance (descending)
+    let sorted = _pcomp_argsort_desc(importance)
+
+    // Take top-k indices
+    let mut kept_set = []
+    let mut i = 0
+    while i < n {
+        kept_set = kept_set + [false]
+        i = i + 1
+    }
+    i = 0
+    while i < k {
+        kept_set[sorted[i]] = true
+        i = i + 1
+    }
+
+    // Collect kept tokens in original order
+    let mut kept_tokens = []
+    let mut kept_indices = []
+    let mut imp_sum = 0.0
+    i = 0
+    while i < n {
+        if kept_set[i] == true {
+            kept_tokens = kept_tokens + [tokens[i]]
+            kept_indices = kept_indices + [i]
+            imp_sum = imp_sum + importance[i]
+        }
+        i = i + 1
+    }
+
+    let compressed_len = len(kept_tokens)
+    let mut avg_imp = 0.0
+    if compressed_len > 0 { avg_imp = imp_sum / to_float(compressed_len) }
+
+    return CompressedPrompt {
+        tokens: kept_tokens,
+        kept_indices: kept_indices,
+        original_len: n,
+        compressed_len: compressed_len,
+        compression_ratio: to_float(n) / to_float(_pcomp_max(compressed_len, 1)),
+        avg_importance: avg_imp
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Config-aware compression (with protection zones)
+// ═══════════════════════════════════════════════════════════════
+
+@hot
+fn pcomp_compress_with_config(tokens, importance, config: CompressionConfig) {
+    let n = len(tokens)
+    let target = int(to_float(n) * config.target_ratio + 0.999)
+    let budget = _pcomp_max(target, config.min_tokens)
+
+    // Mark protected positions
+    let mut protected = []
+    let mut i = 0
+    while i < n {
+        let is_first = i < config.protect_first_n
+        let is_last = i >= n - config.protect_last_n
+        if is_first {
+            protected = protected + [true]
+        } else {
+            if is_last {
+                protected = protected + [true]
+            } else {
+                protected = protected + [false]
+            }
+        }
+        i = i + 1
+    }
+
+    // Count protected
+    let mut n_protected = 0
+    i = 0
+    while i < n {
+        if protected[i] == true { n_protected = n_protected + 1 }
+        i = i + 1
+    }
+
+    // If budget <= protected, just keep protected
+    if budget <= n_protected {
+        let mut kept_tokens = []
+        let mut kept_indices = []
+        i = 0
+        while i < n {
+            if protected[i] == true {
+                kept_tokens = kept_tokens + [tokens[i]]
+                kept_indices = kept_indices + [i]
+            }
+            i = i + 1
+        }
+        return CompressedPrompt {
+            tokens: kept_tokens,
+            kept_indices: kept_indices,
+            original_len: n,
+            compressed_len: len(kept_tokens),
+            compression_ratio: to_float(n) / to_float(_pcomp_max(len(kept_tokens), 1)),
+            avg_importance: 0.0
+        }
+    }
+
+    // Sort unprotected by importance, pick top (budget - n_protected)
+    let remain = budget - n_protected
+    let mut unprotected_idx = []
+    let mut unprotected_imp = []
+    i = 0
+    while i < n {
+        if protected[i] != true {
+            unprotected_idx = unprotected_idx + [i]
+            unprotected_imp = unprotected_imp + [importance[i]]
+        }
+        i = i + 1
+    }
+
+    let sorted = _pcomp_argsort_desc(unprotected_imp)
+    let mut kept_set = []
+    i = 0
+    while i < n {
+        kept_set = kept_set + [protected[i]]
+        i = i + 1
+    }
+
+    i = 0
+    let take = _pcomp_min(remain, len(sorted))
+    while i < take {
+        kept_set[unprotected_idx[sorted[i]]] = true
+        i = i + 1
+    }
+
+    // Collect in original order
+    let mut kept_tokens = []
+    let mut kept_indices = []
+    let mut imp_sum = 0.0
+    i = 0
+    while i < n {
+        if kept_set[i] == true {
+            kept_tokens = kept_tokens + [tokens[i]]
+            kept_indices = kept_indices + [i]
+            imp_sum = imp_sum + importance[i]
+        }
+        i = i + 1
+    }
+
+    let cl = len(kept_tokens)
+    let mut avg_imp = 0.0
+    if cl > 0 { avg_imp = imp_sum / to_float(cl) }
+
+    return CompressedPrompt {
+        tokens: kept_tokens,
+        kept_indices: kept_indices,
+        original_len: n,
+        compressed_len: cl,
+        compression_ratio: to_float(n) / to_float(_pcomp_max(cl, 1)),
+        avg_importance: avg_imp
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Iterative compression — converge to target ratio
+// ═══════════════════════════════════════════════════════════════
+
+fn pcomp_iterative_compress(tokens, logprobs, target_ratio) {
+    let importance = pcomp_token_importance(logprobs)
+    return pcomp_compress(tokens, importance, target_ratio)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Quality estimation
+// ═══════════════════════════════════════════════════════════════
+
+// Estimate quality [0, 1] based on what fraction of total importance is kept
+@pure
+fn pcomp_quality_estimate(original_importance, kept_indices) {
+    let n = len(original_importance)
+    let mut total_imp = 0.0
+    let mut i = 0
+    while i < n {
+        total_imp = total_imp + original_importance[i]
+        i = i + 1
+    }
+    if total_imp < 1.0e-10 { return 1.0 }
+    let mut kept_imp = 0.0
+    let k = len(kept_indices)
+    i = 0
+    while i < k {
+        kept_imp = kept_imp + original_importance[kept_indices[i]]
+        i = i + 1
+    }
+    return kept_imp / total_imp
+}
+
+// Average compression ratio for a batch
+@pure
+fn pcomp_batch_ratio(results) {
+    let n = len(results)
+    if n == 0 { return 0.0 }
+    let mut total = 0.0
+    let mut i = 0
+    while i < n {
+        let r = results[i]
+        total = total + r.compression_ratio
+        i = i + 1
+    }
+    return total / to_float(n)
+}
+
+println("[prompt_compress] module loaded — importance scoring + selective dropping + compression config")

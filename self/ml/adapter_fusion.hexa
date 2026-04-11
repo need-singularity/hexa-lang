@@ -1,0 +1,318 @@
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/adapter_fusion.hexa — Adapter Fusion
+//
+//  Features:
+//    1. Adapter registry (name -> weights mapping)
+//    2. Attention-based fusion (query selects adapters)
+//    3. Dynamic task routing
+//    4. LoRA-compatible adapter format
+//
+//  API:
+//    af_create_registry()  -> AdapterRegistry
+//    af_register(reg, name, adapter) -> AdapterRegistry
+//    af_get(reg, name) -> Adapter
+//    af_attention_fusion(query, adapters, n, dim) -> fused_output
+//    af_task_router(input, task_embeddings, n_tasks, dim) -> task_id
+//    af_fused_forward(input, registry, task_embed, dim) -> output
+//
+//  Ref: finetune.hexa LoRA adapter format
+//  L0 금지: src/*.rs 미접촉. 순수 .hexa.
+// ═══════════════════════════════════════════════════════════════
+
+// ── Math helpers ─────────────────────────────────────────────
+fn _af_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// ── Structs ─────────────────────────────────────────────────
+struct Adapter {
+    name: string,
+    weights: array,
+    bias: array,
+    out_dim: int,
+    in_dim: int
+}
+
+struct AdapterRegistry {
+    names: array,
+    adapters: array,
+    count: int
+}
+
+struct FusionResult {
+    output: array,
+    weights_used: array,
+    selected_adapter: string
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Adapter Registry — name -> adapter mapping
+// ═══════════════════════════════════════════════════════════════
+
+fn af_create_registry() {
+    return AdapterRegistry {
+        names: [],
+        adapters: [],
+        count: 0
+    }
+}
+
+fn af_register(reg: AdapterRegistry, name, adapter: Adapter) {
+    return AdapterRegistry {
+        names: reg.names + [name],
+        adapters: reg.adapters + [adapter],
+        count: reg.count + 1
+    }
+}
+
+fn af_get(reg: AdapterRegistry, name) {
+    let mut i = 0
+    while i < reg.count {
+        if reg.names[i] == name { return reg.adapters[i] }
+        i = i + 1
+    }
+    return nil
+}
+
+fn af_has(reg: AdapterRegistry, name) {
+    let mut i = 0
+    while i < reg.count {
+        if reg.names[i] == name { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn af_list_names(reg: AdapterRegistry) {
+    return reg.names
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Adapter construction helpers
+// ═══════════════════════════════════════════════════════════════
+
+fn af_make_adapter(name, weights, bias, out_dim, in_dim) {
+    return Adapter {
+        name: name,
+        weights: weights,
+        bias: bias,
+        out_dim: out_dim,
+        in_dim: in_dim
+    }
+}
+
+// Single adapter forward: y = W @ x + bias
+@pure
+fn af_adapter_forward(adapter: Adapter, input) {
+    let m = adapter.out_dim
+    let n = adapter.in_dim
+    let mut y = []
+    let mut i = 0
+    while i < m {
+        let mut s = adapter.bias[i]
+        let mut j = 0
+        while j < n {
+            s = s + adapter.weights[i][j] * input[j]
+            j = j + 1
+        }
+        y = y + [s]
+        i = i + 1
+    }
+    return y
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Softmax for fusion weights
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn _af_softmax(scores) {
+    let n = len(scores)
+    let mut mx = scores[0]
+    let mut i = 1
+    while i < n {
+        if scores[i] > mx { mx = scores[i] }
+        i = i + 1
+    }
+    let mut exps = []
+    let mut total = 0.0
+    i = 0
+    while i < n {
+        let e = exp(scores[i] - mx)
+        exps = exps + [e]
+        total = total + e
+        i = i + 1
+    }
+    let mut out = []
+    i = 0
+    while i < n {
+        out = out + [exps[i] / total]
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Attention-based adapter fusion
+//
+//  Given a query vector and N adapters, compute:
+//    score[i] = dot(query, adapter_key[i]) / sqrt(dim)
+//    weights = softmax(scores)
+//    output = sum(weights[i] * adapter_output[i])
+// ═══════════════════════════════════════════════════════════════
+
+// adapter_keys: each adapter's key = mean of its weight rows
+@pure
+fn af_compute_adapter_key(adapter: Adapter) {
+    let m = adapter.out_dim
+    let n = adapter.in_dim
+    let mut key = []
+    let mut j = 0
+    while j < n {
+        let mut s = 0.0
+        let mut i = 0
+        while i < m {
+            s = s + adapter.weights[i][j]
+            i = i + 1
+        }
+        key = key + [s / to_float(m)]
+        j = j + 1
+    }
+    return key
+}
+
+// Attention fusion over a list of adapters
+@hot
+fn af_attention_fusion(query, adapters, input, n_adapters, in_dim, out_dim) {
+    let scale = 1.0 / sqrt(to_float(in_dim))
+    // Compute attention scores
+    let mut scores = []
+    let mut i = 0
+    while i < n_adapters {
+        let key = af_compute_adapter_key(adapters[i])
+        let mut dot = 0.0
+        let mut j = 0
+        while j < in_dim {
+            dot = dot + query[j] * key[j]
+            j = j + 1
+        }
+        scores = scores + [dot * scale]
+        i = i + 1
+    }
+    let weights = _af_softmax(scores)
+    // Compute each adapter's output and fuse
+    let mut fused = []
+    let mut d = 0
+    while d < out_dim {
+        fused = fused + [0.0]
+        d = d + 1
+    }
+    i = 0
+    while i < n_adapters {
+        let out = af_adapter_forward(adapters[i], input)
+        d = 0
+        while d < out_dim {
+            fused[d] = fused[d] + weights[i] * out[d]
+            d = d + 1
+        }
+        i = i + 1
+    }
+    return FusionResult {
+        output: fused,
+        weights_used: weights,
+        selected_adapter: ""
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Task routing — select best adapter for a given task
+//
+//  task_embeddings: [n_tasks * dim] flat
+//  Returns index of best matching task
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn af_task_router(input, task_embeddings, n_tasks, dim) {
+    let mut best_idx = 0
+    let mut best_score = -999999.0
+    let mut t = 0
+    while t < n_tasks {
+        let mut dot = 0.0
+        let mut j = 0
+        while j < dim {
+            dot = dot + input[j] * task_embeddings[t * dim + j]
+            j = j + 1
+        }
+        if dot > best_score {
+            best_score = dot
+            best_idx = t
+        }
+        t = t + 1
+    }
+    return best_idx
+}
+
+// Soft task routing: returns weight distribution over tasks
+@pure
+fn af_soft_task_router(input, task_embeddings, n_tasks, dim) {
+    let scale = 1.0 / sqrt(to_float(dim))
+    let mut scores = []
+    let mut t = 0
+    while t < n_tasks {
+        let mut dot = 0.0
+        let mut j = 0
+        while j < dim {
+            dot = dot + input[j] * task_embeddings[t * dim + j]
+            j = j + 1
+        }
+        scores = scores + [dot * scale]
+        t = t + 1
+    }
+    return _af_softmax(scores)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Fused forward: route input to adapters via attention fusion
+//
+//  Uses registry's all adapters, fuses via attention
+// ═══════════════════════════════════════════════════════════════
+
+@hot
+fn af_fused_forward(input, reg: AdapterRegistry, out_dim) {
+    let n = reg.count
+    if n == 0 { return [] }
+    let in_dim = len(input)
+    let result = af_attention_fusion(input, reg.adapters, input, n, in_dim, out_dim)
+    return result
+}
+
+// ── Select single adapter by name and forward ───────────────
+fn af_single_forward(input, reg: AdapterRegistry, name) {
+    let adapter = af_get(reg, name)
+    return af_adapter_forward(adapter, input)
+}
+
+// ── Weighted merge: static alpha blending ───────────────────
+@pure
+fn af_weighted_merge(adapters, alphas, input, n_adapters, out_dim) {
+    let mut merged = []
+    let mut d = 0
+    while d < out_dim {
+        merged = merged + [0.0]
+        d = d + 1
+    }
+    let mut i = 0
+    while i < n_adapters {
+        let out = af_adapter_forward(adapters[i], input)
+        d = 0
+        while d < out_dim {
+            merged[d] = merged[d] + alphas[i] * out[d]
+            d = d + 1
+        }
+        i = i + 1
+    }
+    return merged
+}
+
+println("[adapter_fusion] module loaded — registry + attention fusion + task routing")

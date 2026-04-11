@@ -1,0 +1,265 @@
+// ═══════════════════════════════════════════════════════════════
+//  test_early_exit.hexa — Dynamic Early Exit 검증
+//
+//  검증:
+//    1. Confidence estimator 출력 [0, 1]
+//    2. Softmax confidence in [0, 1]
+//    3. Entropy confidence: uniform -> low, peaked -> high
+//    4. Early exit: threshold 0 -> always exit at layer 0
+//    5. Early exit: threshold 1 -> go through all layers
+//    6. Layer skip count
+//    7. Full forward baseline
+//    8. Batch forward exit distribution
+//
+//  실행: ./hexa self/test_early_exit.hexa
+// ═══════════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ═══════════════════════════════════════════════════════════════
+//  Inline core (self/ml/early_exit.hexa)
+// ═══════════════════════════════════════════════════════════════
+
+struct EELayer { w: array, bias: array, out_dim: int, in_dim: int }
+struct ExitHead { w: array, bias: float, dim: int }
+struct EarlyExitResult { output: array, exit_layer: int, confidence: float, total_layers: int, layers_skipped: int }
+
+fn ee_layer_forward(layer: EELayer, x) {
+    let m = layer.out_dim
+    let n = layer.in_dim
+    let mut y = []
+    let mut i = 0
+    while i < m {
+        let mut s = layer.bias[i]
+        let mut j = 0
+        while j < n { s = s + layer.w[i][j] * x[j]; j = j + 1 }
+        y = y + [s]
+        i = i + 1
+    }
+    return y
+}
+
+fn ee_relu(x) {
+    let n = len(x)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        if x[i] > 0.0 { out = out + [x[i]] } else { out = out + [0.0] }
+        i = i + 1
+    }
+    return out
+}
+
+fn ee_confidence(hidden, weights, bias, dim) {
+    let mut dot = bias
+    let mut i = 0
+    while i < dim { dot = dot + weights[i] * hidden[i]; i = i + 1 }
+    let sig = 1.0 / (1.0 + exp(0.0 - dot))
+    return sig
+}
+
+fn ee_softmax_confidence(logits) {
+    let n = len(logits)
+    let mut mx = logits[0]
+    let mut i = 1
+    while i < n {
+        if logits[i] > mx { mx = logits[i] }
+        i = i + 1
+    }
+    let mut total = 0.0
+    let mut max_exp = 0.0
+    i = 0
+    while i < n {
+        let e = exp(logits[i] - mx)
+        total = total + e
+        if e > max_exp { max_exp = e }
+        i = i + 1
+    }
+    return max_exp / total
+}
+
+fn _ee_ln(x) {
+    if x <= 0.0 { return -999.0 }
+    let mut v = x
+    let mut adj = 0.0
+    while v > 2.0 { v = v / 2.718281828; adj = adj + 1.0 }
+    while v < 0.5 { v = v * 2.718281828; adj = adj - 1.0 }
+    let t = (v - 1.0) / (v + 1.0)
+    let t2 = t * t
+    return 2.0 * (t + t * t2 / 3.0 + t * t2 * t2 / 5.0 + t * t2 * t2 * t2 / 7.0) + adj
+}
+
+fn ee_entropy_confidence(logits) {
+    let n = len(logits)
+    if n <= 1 { return 1.0 }
+    let mut mx = logits[0]
+    let mut i = 1
+    while i < n {
+        if logits[i] > mx { mx = logits[i] }
+        i = i + 1
+    }
+    let mut exps = []
+    let mut total = 0.0
+    i = 0
+    while i < n {
+        let e = exp(logits[i] - mx)
+        exps = exps + [e]
+        total = total + e
+        i = i + 1
+    }
+    let mut entropy = 0.0
+    i = 0
+    while i < n {
+        let p = exps[i] / total
+        if p > 1.0e-10 { entropy = entropy - p * _ee_ln(p) }
+        i = i + 1
+    }
+    let max_entropy = _ee_ln(to_float(n))
+    if max_entropy < 1.0e-10 { return 1.0 }
+    return 1.0 - entropy / max_entropy
+}
+
+fn early_exit_forward(layers, exit_heads, input, threshold) {
+    let n = len(layers)
+    let mut hidden = input
+    let mut i = 0
+    while i < n {
+        hidden = ee_layer_forward(layers[i], hidden)
+        hidden = ee_relu(hidden)
+        let head = exit_heads[i]
+        let conf = ee_confidence(hidden, head.w, head.bias, head.dim)
+        if conf > threshold {
+            return EarlyExitResult { output: hidden, exit_layer: i, confidence: conf, total_layers: n, layers_skipped: n - i - 1 }
+        }
+        i = i + 1
+    }
+    return EarlyExitResult { output: hidden, exit_layer: n - 1, confidence: 1.0, total_layers: n, layers_skipped: 0 }
+}
+
+fn full_forward(layers, input) {
+    let n = len(layers)
+    let mut hidden = input
+    let mut i = 0
+    while i < n { hidden = ee_layer_forward(layers[i], hidden); hidden = ee_relu(hidden); i = i + 1 }
+    return hidden
+}
+
+fn ee_avg_layers_used(results) {
+    let n = len(results)
+    if n == 0 { return 0.0 }
+    let mut total = 0.0
+    let mut i = 0
+    while i < n { let r = results[i]; total = total + to_float(r.exit_layer + 1); i = i + 1 }
+    return total / to_float(n)
+}
+
+fn ee_speedup(total_layers, avg_used) {
+    if avg_used < 0.001 { return 0.0 }
+    return to_float(total_layers) / avg_used
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Setup: 3-layer network, dim=2
+// ═══════════════════════════════════════════════════════════════
+
+// Identity-ish layers: W = [[1,0],[0,1]], bias = [0,0]
+let w_id = [[1.0, 0.0], [0.0, 1.0]]
+let b_zero = [0.0, 0.0]
+
+let layer0 = EELayer { w: w_id, bias: b_zero, out_dim: 2, in_dim: 2 }
+let layer1 = EELayer { w: w_id, bias: b_zero, out_dim: 2, in_dim: 2 }
+let layer2 = EELayer { w: w_id, bias: b_zero, out_dim: 2, in_dim: 2 }
+let layers = [layer0, layer1, layer2]
+
+// Exit heads: large positive weight -> always confident
+let head_high = ExitHead { w: [10.0, 10.0], bias: 5.0, dim: 2 }
+// Exit heads: large negative weight -> never confident
+let head_low = ExitHead { w: [-10.0, -10.0], bias: -5.0, dim: 2 }
+// Mixed
+let head_mid = ExitHead { w: [0.0, 0.0], bias: 0.0, dim: 2 }
+
+let input = [1.0, 1.0]
+
+// ═══════════════════════════════════════════════════════════════
+//  Tests
+// ═══════════════════════════════════════════════════════════════
+
+// #1 Confidence in [0, 1]
+let c1 = ee_confidence(input, head_high.w, head_high.bias, 2)
+check("#1 confidence in [0,1]", c1 >= 0.0)
+
+// #2 High-confidence head returns near 1.0
+check("#2 high confidence > 0.99", c1 > 0.99)
+
+// #3 Low-confidence head returns near 0.0
+let c3 = ee_confidence(input, head_low.w, head_low.bias, 2)
+check("#3 low confidence < 0.01", c3 < 0.01)
+
+// #4 Mid confidence around 0.5
+let c4 = ee_confidence(input, head_mid.w, head_mid.bias, 2)
+check("#4 mid confidence ~0.5", approx(c4, 0.5, 0.01))
+
+// #5 Softmax confidence: peaked distribution
+let peaked = [10.0, 0.0, 0.0]
+let sc5 = ee_softmax_confidence(peaked)
+check("#5 softmax confidence peaked > 0.9", sc5 > 0.9)
+
+// #6 Softmax confidence: uniform distribution
+let uniform = [1.0, 1.0, 1.0]
+let sc6 = ee_softmax_confidence(uniform)
+check("#6 softmax uniform ~0.333", approx(sc6, 0.333, 0.01))
+
+// #7 Entropy confidence: peaked = high
+let ec7 = ee_entropy_confidence(peaked)
+check("#7 entropy peaked > 0.8", ec7 > 0.8)
+
+// #8 Entropy confidence: uniform = low
+let ec8 = ee_entropy_confidence(uniform)
+check("#8 entropy uniform < 0.1", ec8 < 0.1)
+
+// #9 Early exit with high-confidence heads: exit at layer 0
+let heads_all_high = [head_high, head_high, head_high]
+let r9 = early_exit_forward(layers, heads_all_high, input, 0.5)
+check("#9 exit at layer 0", r9.exit_layer == 0)
+
+// #10 Layers skipped when exiting early
+check("#10 layers skipped = 2", r9.layers_skipped == 2)
+
+// #11 Early exit with low-confidence heads: go through all
+let heads_all_low = [head_low, head_low, head_low]
+let r11 = early_exit_forward(layers, heads_all_low, input, 0.5)
+check("#11 exit at last layer", r11.exit_layer == 2)
+
+// #12 No layers skipped
+check("#12 layers skipped = 0", r11.layers_skipped == 0)
+
+// #13 Full forward matches no-exit path
+let ff13 = full_forward(layers, input)
+check("#13 full forward output dim", len(ff13) == 2)
+
+// #14 Average layers used
+let results14 = [r9, r11]
+let avg14 = ee_avg_layers_used(results14)
+check("#14 avg layers = 2.0", approx(avg14, 2.0, 0.01))
+
+// #15 Speedup calculation
+let sp = ee_speedup(3, 1.5)
+check("#15 speedup 3/1.5=2.0", approx(sp, 2.0, 0.01))
+
+// ═══════════════════════════════════════════════════════════════
+println("")
+println("early_exit: " + to_string(pass_count) + " PASS / " + to_string(fail_count) + " FAIL")

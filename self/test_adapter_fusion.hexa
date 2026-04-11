@@ -1,0 +1,275 @@
+// ═══════════════════════════════════════════════════════════════
+//  test_adapter_fusion.hexa — Adapter Fusion 검증
+//
+//  검증:
+//    1. Registry CRUD
+//    2. Adapter forward 수학 정확성
+//    3. Attention-based fusion weights sum = 1.0
+//    4. Task routing 정확성
+//    5. Weighted merge
+//
+//  실행: ./hexa self/test_adapter_fusion.hexa
+// ═══════════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ═══════════════════════════════════════════════════════════════
+//  Inline core (self/ml/adapter_fusion.hexa)
+// ═══════════════════════════════════════════════════════════════
+
+struct Adapter { name: string, weights: array, bias: array, out_dim: int, in_dim: int }
+struct AdapterRegistry { names: array, adapters: array, count: int }
+struct FusionResult { output: array, weights_used: array, selected_adapter: string }
+
+fn af_create_registry() {
+    return AdapterRegistry { names: [], adapters: [], count: 0 }
+}
+
+fn af_register(reg: AdapterRegistry, name, adapter: Adapter) {
+    return AdapterRegistry { names: reg.names + [name], adapters: reg.adapters + [adapter], count: reg.count + 1 }
+}
+
+fn af_get(reg: AdapterRegistry, name) {
+    let mut i = 0
+    while i < reg.count {
+        if reg.names[i] == name { return reg.adapters[i] }
+        i = i + 1
+    }
+    return nil
+}
+
+fn af_has(reg: AdapterRegistry, name) {
+    let mut i = 0
+    while i < reg.count {
+        if reg.names[i] == name { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn af_make_adapter(name, weights, bias, out_dim, in_dim) {
+    return Adapter { name: name, weights: weights, bias: bias, out_dim: out_dim, in_dim: in_dim }
+}
+
+fn af_adapter_forward(adapter: Adapter, input) {
+    let m = adapter.out_dim
+    let n = adapter.in_dim
+    let mut y = []
+    let mut i = 0
+    while i < m {
+        let mut s = adapter.bias[i]
+        let mut j = 0
+        while j < n { s = s + adapter.weights[i][j] * input[j]; j = j + 1 }
+        y = y + [s]
+        i = i + 1
+    }
+    return y
+}
+
+fn _af_softmax(scores) {
+    let n = len(scores)
+    let mut mx = scores[0]
+    let mut i = 1
+    while i < n {
+        if scores[i] > mx { mx = scores[i] }
+        i = i + 1
+    }
+    let mut exps = []
+    let mut total = 0.0
+    i = 0
+    while i < n {
+        let e = exp(scores[i] - mx)
+        exps = exps + [e]
+        total = total + e
+        i = i + 1
+    }
+    let mut out = []
+    i = 0
+    while i < n { out = out + [exps[i] / total]; i = i + 1 }
+    return out
+}
+
+fn af_compute_adapter_key(adapter: Adapter) {
+    let m = adapter.out_dim
+    let n = adapter.in_dim
+    let mut key = []
+    let mut j = 0
+    while j < n {
+        let mut s = 0.0
+        let mut i = 0
+        while i < m { s = s + adapter.weights[i][j]; i = i + 1 }
+        key = key + [s / to_float(m)]
+        j = j + 1
+    }
+    return key
+}
+
+fn af_attention_fusion(query, adapters, input, n_adapters, in_dim, out_dim) {
+    let scale = 1.0 / sqrt(to_float(in_dim))
+    let mut scores = []
+    let mut i = 0
+    while i < n_adapters {
+        let key = af_compute_adapter_key(adapters[i])
+        let mut dot = 0.0
+        let mut j = 0
+        while j < in_dim { dot = dot + query[j] * key[j]; j = j + 1 }
+        scores = scores + [dot * scale]
+        i = i + 1
+    }
+    let weights = _af_softmax(scores)
+    let mut fused = []
+    let mut d = 0
+    while d < out_dim { fused = fused + [0.0]; d = d + 1 }
+    i = 0
+    while i < n_adapters {
+        let out = af_adapter_forward(adapters[i], input)
+        d = 0
+        while d < out_dim { fused[d] = fused[d] + weights[i] * out[d]; d = d + 1 }
+        i = i + 1
+    }
+    return FusionResult { output: fused, weights_used: weights, selected_adapter: "" }
+}
+
+fn af_task_router(input, task_embeddings, n_tasks, dim) {
+    let mut best_idx = 0
+    let mut best_score = -999999.0
+    let mut t = 0
+    while t < n_tasks {
+        let mut dot = 0.0
+        let mut j = 0
+        while j < dim { dot = dot + input[j] * task_embeddings[t * dim + j]; j = j + 1 }
+        if dot > best_score { best_score = dot; best_idx = t }
+        t = t + 1
+    }
+    return best_idx
+}
+
+fn af_soft_task_router(input, task_embeddings, n_tasks, dim) {
+    let scale = 1.0 / sqrt(to_float(dim))
+    let mut scores = []
+    let mut t = 0
+    while t < n_tasks {
+        let mut dot = 0.0
+        let mut j = 0
+        while j < dim { dot = dot + input[j] * task_embeddings[t * dim + j]; j = j + 1 }
+        scores = scores + [dot * scale]
+        t = t + 1
+    }
+    return _af_softmax(scores)
+}
+
+fn af_weighted_merge(adapters, alphas, input, n_adapters, out_dim) {
+    let mut merged = []
+    let mut d = 0
+    while d < out_dim { merged = merged + [0.0]; d = d + 1 }
+    let mut i = 0
+    while i < n_adapters {
+        let out = af_adapter_forward(adapters[i], input)
+        d = 0
+        while d < out_dim { merged[d] = merged[d] + alphas[i] * out[d]; d = d + 1 }
+        i = i + 1
+    }
+    return merged
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Test data: 2 adapters, dim 2->2
+// ═══════════════════════════════════════════════════════════════
+
+// Adapter A: identity
+let ada = af_make_adapter("task_a", [[1.0, 0.0], [0.0, 1.0]], [0.0, 0.0], 2, 2)
+// Adapter B: scale by 2
+let adb = af_make_adapter("task_b", [[2.0, 0.0], [0.0, 2.0]], [0.0, 0.0], 2, 2)
+// Adapter C: with bias
+let adc = af_make_adapter("task_c", [[1.0, 0.0], [0.0, 1.0]], [1.0, 2.0], 2, 2)
+
+let input = [3.0, 4.0]
+
+// ═══════════════════════════════════════════════════════════════
+//  Tests
+// ═══════════════════════════════════════════════════════════════
+
+// #1 Empty registry
+let reg = af_create_registry()
+check("#1 empty registry count=0", reg.count == 0)
+
+// #2 Register adapter
+let reg2 = af_register(reg, "task_a", ada)
+check("#2 register count=1", reg2.count == 1)
+
+// #3 Has adapter
+check("#3 has task_a", af_has(reg2, "task_a") == true)
+
+// #4 Get adapter
+let got = af_get(reg2, "task_a")
+check("#4 get adapter name", got.name == "task_a")
+
+// #5 Adapter forward: identity
+let out5 = af_adapter_forward(ada, input)
+check("#5 identity forward", approx(out5[0], 3.0, 0.001))
+
+// #6 Adapter forward: scale
+let out6 = af_adapter_forward(adb, input)
+check("#6 scale forward", approx(out6[0], 6.0, 0.001))
+
+// #7 Adapter forward: bias
+let out7 = af_adapter_forward(adc, input)
+check("#7 bias forward", approx(out7[0], 4.0, 0.001))
+
+// #8 Attention fusion weights sum = 1.0
+let adapters = [ada, adb]
+let fused = af_attention_fusion(input, adapters, input, 2, 2, 2)
+let wsum = fused.weights_used[0] + fused.weights_used[1]
+check("#8 fusion weights sum ~1.0", approx(wsum, 1.0, 0.001))
+
+// #9 Fusion output dimension
+check("#9 fusion output dim=2", len(fused.output) == 2)
+
+// #10 Task router: picks most aligned
+let task_emb = [1.0, 0.0, 0.0, 1.0]
+let route_input = [5.0, 0.1]
+let best = af_task_router(route_input, task_emb, 2, 2)
+check("#10 task router picks task 0", best == 0)
+
+// #11 Task router: other direction
+let route2 = [0.1, 5.0]
+let best2 = af_task_router(route2, task_emb, 2, 2)
+check("#11 task router picks task 1", best2 == 1)
+
+// #12 Soft router sums to 1.0
+let soft = af_soft_task_router(input, task_emb, 2, 2)
+let ssum = soft[0] + soft[1]
+check("#12 soft router sum ~1.0", approx(ssum, 1.0, 0.001))
+
+// #13 Weighted merge with equal alphas
+let merged = af_weighted_merge([ada, adb], [0.5, 0.5], input, 2, 2)
+check("#13 equal merge = 4.5", approx(merged[0], 4.5, 0.001))
+
+// #14 Weighted merge with alpha=[1,0]
+let m14 = af_weighted_merge([ada, adb], [1.0, 0.0], input, 2, 2)
+check("#14 alpha[1,0] = identity", approx(m14[0], 3.0, 0.001))
+
+// #15 Multiple adapters in registry
+let mut reg3 = af_create_registry()
+reg3 = af_register(reg3, "a", ada)
+reg3 = af_register(reg3, "b", adb)
+reg3 = af_register(reg3, "c", adc)
+check("#15 multi-register count=3", reg3.count == 3)
+
+// ═══════════════════════════════════════════════════════════════
+println("")
+println("adapter_fusion: " + to_string(pass_count) + " PASS / " + to_string(fail_count) + " FAIL")

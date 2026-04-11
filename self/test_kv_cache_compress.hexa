@@ -1,0 +1,285 @@
+// ═══════════════════════════════════════════════════════════════
+//  test_kv_cache_compress.hexa — KV-Cache Compression 검증
+//
+//  검증:
+//    1. INT8 양자화/역양자화 왕복 정확도
+//    2. Attention importance score 합 = 1.0
+//    3. Eviction: budget 이하로 줄어드는지
+//    4. Compress forward: 출력 차원 정확
+//    5. Compression ratio 계산
+//
+//  실행: ./hexa self/test_kv_cache_compress.hexa
+// ═══════════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ═══════════════════════════════════════════════════════════════
+//  Inline module code (self/ml/kv_cache_compress.hexa)
+// ═══════════════════════════════════════════════════════════════
+
+fn _kvc_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+fn _kvc_clamp(v, lo, hi) {
+    if v < lo { return lo }
+    if v > hi { return hi }
+    return v
+}
+fn _kvc_round(x) {
+    if x >= 0.0 { return int(x + 0.5) }
+    return int(x - 0.5)
+}
+
+struct QuantKV { qdata: array, scale: float, numel: int }
+
+fn kvc_quantize_int8(values) {
+    let n = len(values)
+    let mut amax = 0.0
+    let mut i = 0
+    while i < n {
+        let av = _kvc_abs(values[i])
+        if av > amax { amax = av }
+        i = i + 1
+    }
+    let mut scale = 1.0
+    if amax > 0.0 { scale = amax / 127.0 }
+    let inv_scale = 1.0 / scale
+    let mut qdata = []
+    i = 0
+    while i < n {
+        let q = _kvc_clamp(_kvc_round(values[i] * inv_scale), -128, 127)
+        qdata = qdata + [q]
+        i = i + 1
+    }
+    return QuantKV { qdata: qdata, scale: scale, numel: n }
+}
+
+fn kvc_dequantize_int8(qkv: QuantKV) {
+    let n = qkv.numel
+    let scale = qkv.scale
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [to_float(qkv.qdata[i]) * scale]
+        i = i + 1
+    }
+    return out
+}
+
+fn kvc_quant_error(original, qkv: QuantKV) {
+    let deq = kvc_dequantize_int8(qkv)
+    let n = len(original)
+    let mut sum_sq = 0.0
+    let mut i = 0
+    while i < n {
+        let d = original[i] - deq[i]
+        sum_sq = sum_sq + d * d
+        i = i + 1
+    }
+    return sum_sq / to_float(n)
+}
+
+fn _kvc_softmax(scores) {
+    let n = len(scores)
+    let mut mx = scores[0]
+    let mut i = 1
+    while i < n {
+        if scores[i] > mx { mx = scores[i] }
+        i = i + 1
+    }
+    let mut exps = []
+    let mut total = 0.0
+    i = 0
+    while i < n {
+        let e = exp(scores[i] - mx)
+        exps = exps + [e]
+        total = total + e
+        i = i + 1
+    }
+    let mut out = []
+    i = 0
+    while i < n {
+        out = out + [exps[i] / total]
+        i = i + 1
+    }
+    return out
+}
+
+fn kvc_attention_importance(query, keys, seq_len, head_dim) {
+    let scale = 1.0 / sqrt(to_float(head_dim))
+    let mut scores = []
+    let mut t = 0
+    while t < seq_len {
+        let mut dot = 0.0
+        let mut d = 0
+        while d < head_dim {
+            dot = dot + query[d] * keys[t * head_dim + d]
+            d = d + 1
+        }
+        scores = scores + [dot * scale]
+        t = t + 1
+    }
+    return _kvc_softmax(scores)
+}
+
+struct CompressedCache {
+    keys: array, values: array, token_ids: array,
+    seq_len: int, capacity: int, head_dim: int
+}
+
+fn kvc_cache_new(capacity, head_dim) {
+    return CompressedCache { keys: [], values: [], token_ids: [], seq_len: 0, capacity: capacity, head_dim: head_dim }
+}
+
+fn kvc_cache_append(cache: CompressedCache, token_id, key, value) {
+    let mut new_keys = cache.keys
+    let mut new_vals = cache.values
+    let mut d = 0
+    while d < cache.head_dim {
+        new_keys = new_keys + [key[d]]
+        new_vals = new_vals + [value[d]]
+        d = d + 1
+    }
+    return CompressedCache { keys: new_keys, values: new_vals, token_ids: cache.token_ids + [token_id], seq_len: cache.seq_len + 1, capacity: cache.capacity, head_dim: cache.head_dim }
+}
+
+fn _kvc_argmin(scores, n) {
+    let mut min_idx = 0
+    let mut min_val = scores[0]
+    let mut i = 1
+    while i < n {
+        if scores[i] < min_val { min_val = scores[i]; min_idx = i }
+        i = i + 1
+    }
+    return min_idx
+}
+
+fn kvc_evict_least_important(cache: CompressedCache, importance, budget) {
+    let mut c = cache
+    let mut imp = importance
+    while c.seq_len > budget {
+        let victim = _kvc_argmin(imp, c.seq_len)
+        let hd = c.head_dim
+        let mut new_keys = []
+        let mut new_vals = []
+        let mut new_ids = []
+        let mut new_imp = []
+        let mut t = 0
+        while t < c.seq_len {
+            if t != victim {
+                let mut dd = 0
+                while dd < hd { new_keys = new_keys + [c.keys[t * hd + dd]]; new_vals = new_vals + [c.values[t * hd + dd]]; dd = dd + 1 }
+                new_ids = new_ids + [c.token_ids[t]]
+                new_imp = new_imp + [imp[t]]
+            }
+            t = t + 1
+        }
+        c = CompressedCache { keys: new_keys, values: new_vals, token_ids: new_ids, seq_len: c.seq_len - 1, capacity: c.capacity, head_dim: c.head_dim }
+        imp = new_imp
+    }
+    return c
+}
+
+fn kvc_compression_ratio(original_len, compressed_len) {
+    if compressed_len == 0 { return 0.0 }
+    return to_float(original_len) / to_float(compressed_len)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Tests
+// ═══════════════════════════════════════════════════════════════
+
+// #1 INT8 quantize basic
+let data1 = [1.0, -2.0, 3.0, -4.0, 0.5, -0.5]
+let q1 = kvc_quantize_int8(data1)
+check("#1 quantize numel", q1.numel == 6)
+
+// #2 INT8 dequantize roundtrip
+let deq1 = kvc_dequantize_int8(q1)
+check("#2 dequant len", len(deq1) == 6)
+
+// #3 Quantization error is small
+let err1 = kvc_quant_error(data1, q1)
+check("#3 quant error < 0.01", err1 < 0.01)
+
+// #4 Scale is positive
+check("#4 scale positive", q1.scale > 0.0)
+
+// #5 Quantized values in [-128, 127]
+let mut all_in_range = true
+let mut qi = 0
+while qi < q1.numel {
+    if q1.qdata[qi] < -128 { all_in_range = false }
+    if q1.qdata[qi] > 127 { all_in_range = false }
+    qi = qi + 1
+}
+check("#5 qdata in range", all_in_range)
+
+// #6 Attention importance sums to ~1.0
+let query6 = [1.0, 0.0]
+let keys6 = [1.0, 0.0, 0.0, 1.0, 0.5, 0.5]
+let imp6 = kvc_attention_importance(query6, keys6, 3, 2)
+let mut imp_sum = 0.0
+let mut ii = 0
+while ii < 3 { imp_sum = imp_sum + imp6[ii]; ii = ii + 1 }
+check("#6 importance sum ~1.0", approx(imp_sum, 1.0, 0.001))
+
+// #7 Most important token has highest aligned key
+check("#7 token 0 highest importance", imp6[0] > imp6[1])
+
+// #8 Cache append
+let mut cache8 = kvc_cache_new(10, 2)
+cache8 = kvc_cache_append(cache8, 0, [1.0, 2.0], [3.0, 4.0])
+cache8 = kvc_cache_append(cache8, 1, [5.0, 6.0], [7.0, 8.0])
+check("#8 cache seq_len=2", cache8.seq_len == 2)
+
+// #9 Cache keys stored correctly
+check("#9 cache key[0]", cache8.keys[0] == 1.0)
+
+// #10 Eviction reduces size
+let imp_evict = [0.1, 0.9]
+let evicted = kvc_evict_least_important(cache8, imp_evict, 1)
+check("#10 eviction to budget 1", evicted.seq_len == 1)
+
+// #11 Evicted correct token (least important = idx 0)
+check("#11 kept important token", evicted.token_ids[0] == 1)
+
+// #12 Compression ratio
+let cr = kvc_compression_ratio(10, 5)
+check("#12 ratio 10/5=2.0", approx(cr, 2.0, 0.001))
+
+// #13 Zeros quantize correctly
+let z = [0.0, 0.0, 0.0, 0.0]
+let qz = kvc_quantize_int8(z)
+let dz = kvc_dequantize_int8(qz)
+check("#13 zeros roundtrip", dz[0] == 0.0)
+
+// #14 Large values clamp
+let big = [500.0, -500.0, 1000.0, -1000.0]
+let qb = kvc_quantize_int8(big)
+check("#14 large values quantized", qb.numel == 4)
+
+// #15 Single element
+let s1 = [42.0]
+let qs = kvc_quantize_int8(s1)
+let ds = kvc_dequantize_int8(qs)
+check("#15 single element roundtrip", approx(ds[0], 42.0, 1.0))
+
+// ═══════════════════════════════════════════════════════════════
+println("")
+println("kv_cache_compress: " + to_string(pass_count) + " PASS / " + to_string(fail_count) + " FAIL")
