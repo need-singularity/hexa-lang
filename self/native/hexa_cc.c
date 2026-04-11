@@ -4934,7 +4934,7 @@ HexaVal gen2_stmt(HexaVal node, HexaVal depth) {
         chunks = hexa_array_push(chunks, hexa_add(hexa_add(hexa_add(pad2, hexa_str("HexaVal __iter_arr = ")), iter_c), hexa_str(";\n")));
         chunks = hexa_array_push(chunks, hexa_add(pad2, hexa_str("for (int __fi = 0; __fi < hexa_len(__iter_arr); __fi++) {\n")));
         HexaVal pad3 = gen2_indent(hexa_add(depth, hexa_int(2)));
-        chunks = hexa_array_push(chunks, hexa_add(hexa_add(hexa_add(pad3, hexa_str("HexaVal ")), hexa_map_get(node, "name")), hexa_str(" = hexa_array_get(__iter_arr, __fi);\n")));
+        chunks = hexa_array_push(chunks, hexa_add(hexa_add(hexa_add(pad3, hexa_str("HexaVal ")), hexa_map_get(node, "name")), hexa_str(" = hexa_iter_get(__iter_arr, __fi);\n")));
         HexaVal fi = hexa_int(0);
         while (hexa_truthy(hexa_bool((fi).i < (hexa_int(hexa_len(hexa_map_get(node, "body")))).i))) {
             chunks = hexa_array_push(chunks, gen2_stmt(hexa_index_get(hexa_map_get(node, "body"), fi), hexa_add(depth, hexa_int(2))));

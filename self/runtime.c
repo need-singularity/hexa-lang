@@ -305,6 +305,20 @@ HexaVal hexa_index_get(HexaVal container, HexaVal key) {
     return hexa_array_get(container, key.i);
 }
 
+// For-in dispatch: array → element, map → key as string.
+// Used by `for x in collection { ... }` codegen so maps iterate their keys
+// (Python-style). hexa_len already handles both tags, so no separate length.
+HexaVal hexa_iter_get(HexaVal v, int64_t idx) {
+    if (v.tag == TAG_MAP) {
+        if (idx < 0 || idx >= v.map.len) {
+            fprintf(stderr, "map iter index %lld out of bounds (len %d)\n", (long long)idx, v.map.len);
+            exit(1);
+        }
+        return hexa_str(v.map.keys[idx]);
+    }
+    return hexa_array_get(v, idx);
+}
+
 // Polymorphic index set: array[int]=val or map[string]=val
 HexaVal hexa_index_set(HexaVal container, HexaVal key, HexaVal val) {
     if (container.tag == TAG_MAP && key.tag == TAG_STR) {
