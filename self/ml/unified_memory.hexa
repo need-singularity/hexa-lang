@@ -1,0 +1,755 @@
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/unified_memory.hexa — Unified Memory Pool (Apple Silicon)
+//
+//  ML roadmap #185 — Unified Memory Pool
+//
+//  Apple Silicon has unified memory: CPU and GPU share the same
+//  physical DRAM. Unlike discrete GPUs (cudaMalloc -> cudaMemcpy ->
+//  compute -> cudaMemcpy back), on Apple Silicon there is NO copy.
+//  This module provides a buffer pool abstraction that exploits
+//  unified memory semantics:
+//
+//    - Named buffers with dtype, alignment, and pin/eviction metadata
+//    - LRU eviction of unpinned buffers when capacity is exceeded
+//    - Reference counting and garbage collection
+//    - Zero-copy data operations (read/write/view/copy within pool)
+//    - Defragmentation (compaction with ID renumbering)
+//    - Usage statistics and utilization tracking
+//
+//  All state is immutable-style: mutations return new arrays.
+//
+//  Buffer layout (array tuple):
+//    [id, name, data, size, alignment, dtype, pinned, last_access, ref_count]
+//     0    1     2     3      4         5      6       7            8
+//
+//  Pool layout (array tuple):
+//    [buffers, next_id, capacity, used, tick, alloc_count, free_count, peak_used]
+//     0        1        2         3      4     5            6           7
+//
+//  API:
+//    um_create_pool(capacity)                          -> pool
+//    um_alloc(pool, name, size, dtype)                 -> [pool, buffer_id]
+//    um_alloc_aligned(pool, name, size, dtype, align)  -> [pool, buffer_id]
+//    um_free(pool, buffer_id)                          -> pool
+//    um_get(pool, buffer_id)                           -> buffer | []
+//    um_get_by_name(pool, name)                        -> buffer | []
+//    um_pin(pool, buffer_id)                           -> pool
+//    um_unpin(pool, buffer_id)                         -> pool
+//    um_resize(pool, buffer_id, new_size)              -> pool
+//    um_evict_lru(pool, needed_size)                   -> pool
+//    um_defragment(pool)                               -> pool
+//    um_clear(pool)                                    -> pool
+//    um_gc(pool)                                       -> pool
+//    um_write(pool, buffer_id, offset, values)         -> pool
+//    um_read(pool, buffer_id, offset, count)           -> array
+//    um_fill(pool, buffer_id, value)                   -> pool
+//    um_copy(pool, src_id, dst_id)                     -> pool
+//    um_view(pool, buffer_id, offset, length)          -> array
+//    um_stats(pool)                                    -> [7 ints]
+//    um_utilization(pool)                              -> float
+//    um_fragmentation(pool)                            -> float
+//    um_is_unified()                                   -> int
+//    um_zero_copy_available()                          -> int
+//    um_estimated_bandwidth()                          -> float
+//
+//  AI-NATIVE attrs:
+//    @pure     — no hidden state mutation
+//    @hot      — pool lookup / alloc on critical path
+//    @parallel — buffer operations are independent
+//
+//  Run: ./hexa self/test_unified_memory.hexa
+// ═══════════════════════════════════════════════════════════════
+
+// ── buffer accessors ────────────────────────────────────────
+// UMBuffer = [id, name, data, size, alignment, dtype, pinned, last_access, ref_count]
+//             0    1     2     3      4          5      6       7            8
+
+@pure
+fn um_buf_id(b)          { return b[0] }
+@pure
+fn um_buf_name(b)        { return b[1] }
+@pure
+fn um_buf_data(b)        { return b[2] }
+@pure
+fn um_buf_size(b)        { return b[3] }
+@pure
+fn um_buf_alignment(b)   { return b[4] }
+@pure
+fn um_buf_dtype(b)       { return b[5] }
+@pure
+fn um_buf_pinned(b)      { return b[6] }
+@pure
+fn um_buf_last_access(b) { return b[7] }
+@pure
+fn um_buf_ref_count(b)   { return b[8] }
+
+// Construct a new buffer tuple
+@pure
+fn um_buf_new(id, name, data, size, alignment, dtype, pinned, last_access, ref_count) {
+    return [id, name, data, size, alignment, dtype, pinned, last_access, ref_count]
+}
+
+// ── pool accessors ──────────────────────────────────────────
+// UMPool = [buffers, next_id, capacity, used, tick, alloc_count, free_count, peak_used]
+//           0        1        2         3      4     5            6           7
+
+@pure
+fn um_pool_buffers(p)     { return p[0] }
+@pure
+fn um_pool_next_id(p)     { return p[1] }
+@pure
+fn um_pool_capacity(p)    { return p[2] }
+@pure
+fn um_pool_used(p)        { return p[3] }
+@pure
+fn um_pool_tick(p)        { return p[4] }
+@pure
+fn um_pool_alloc_count(p) { return p[5] }
+@pure
+fn um_pool_free_count(p)  { return p[6] }
+@pure
+fn um_pool_peak_used(p)   { return p[7] }
+
+// Construct a new pool tuple
+@pure
+fn um_pool_new(buffers, next_id, capacity, used, tick, alloc_count, free_count, peak_used) {
+    return [buffers, next_id, capacity, used, tick, alloc_count, free_count, peak_used]
+}
+
+// ── helpers ─────────────────────────────────────────────────
+
+@pure
+fn um_max(a, b) {
+    if a > b { return a }
+    return b
+}
+
+@pure
+fn um_min(a, b) {
+    if a < b { return a }
+    return b
+}
+
+@pure
+fn um_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// Create a zero-filled float array of size n
+fn um_zeros(n) {
+    let mut v = []
+    for _i in 0..n {
+        v = v + [0.0]
+    }
+    return v
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Pool creation
+// ═══════════════════════════════════════════════════════════════
+
+fn um_create_pool(capacity) {
+    // [buffers, next_id, capacity, used, tick, alloc_count, free_count, peak_used]
+    return um_pool_new([], 1, capacity, 0, 0, 0, 0, 0)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Allocation
+// ═══════════════════════════════════════════════════════════════
+
+// Internal: find buffer index by id, returns -1 if not found
+@pure
+fn um_find_idx(pool, buffer_id) {
+    let bufs = um_pool_buffers(pool)
+    for i in 0..len(bufs) {
+        if um_buf_id(bufs[i]) == buffer_id {
+            return i
+        }
+    }
+    return -1
+}
+
+// Allocate a buffer with explicit alignment hint
+@hot
+fn um_alloc_aligned(pool, name, size, dtype, alignment) {
+    let cur_used = um_pool_used(pool)
+    let cap = um_pool_capacity(pool)
+    // If requested size exceeds remaining capacity, return failure
+    if cur_used + size > cap {
+        return [pool, -1]
+    }
+    let bid = um_pool_next_id(pool)
+    let data = um_zeros(size)
+    let buf = um_buf_new(bid, name, data, size, alignment, dtype, 0, um_pool_tick(pool), 1)
+    let new_bufs = um_pool_buffers(pool) + [buf]
+    let new_used = cur_used + size
+    let new_peak = um_max(um_pool_peak_used(pool), new_used)
+    let new_pool = um_pool_new(
+        new_bufs,
+        bid + 1,
+        cap,
+        new_used,
+        um_pool_tick(pool) + 1,
+        um_pool_alloc_count(pool) + 1,
+        um_pool_free_count(pool),
+        new_peak
+    )
+    return [new_pool, bid]
+}
+
+// Allocate with default alignment (64 = cache line)
+@hot
+fn um_alloc(pool, name, size, dtype) {
+    return um_alloc_aligned(pool, name, size, dtype, 64)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Free
+// ═══════════════════════════════════════════════════════════════
+
+fn um_free(pool, buffer_id) {
+    let idx = um_find_idx(pool, buffer_id)
+    if idx < 0 {
+        return pool
+    }
+    let bufs = um_pool_buffers(pool)
+    let freed_size = um_buf_size(bufs[idx])
+    // Rebuild buffers array without the freed buffer
+    let mut new_bufs = []
+    for i in 0..len(bufs) {
+        if i != idx {
+            new_bufs = new_bufs + [bufs[i]]
+        }
+    }
+    return um_pool_new(
+        new_bufs,
+        um_pool_next_id(pool),
+        um_pool_capacity(pool),
+        um_pool_used(pool) - freed_size,
+        um_pool_tick(pool),
+        um_pool_alloc_count(pool),
+        um_pool_free_count(pool) + 1,
+        um_pool_peak_used(pool)
+    )
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Get / lookup
+// ═══════════════════════════════════════════════════════════════
+
+// Get buffer by id; updates last_access tick
+@hot
+fn um_get(pool, buffer_id) {
+    let bufs = um_pool_buffers(pool)
+    for i in 0..len(bufs) {
+        if um_buf_id(bufs[i]) == buffer_id {
+            return bufs[i]
+        }
+    }
+    return []
+}
+
+// Get buffer by name; returns first match
+@hot
+fn um_get_by_name(pool, name) {
+    let bufs = um_pool_buffers(pool)
+    for i in 0..len(bufs) {
+        if um_buf_name(bufs[i]) == name {
+            return bufs[i]
+        }
+    }
+    return []
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Pin / unpin
+// ═══════════════════════════════════════════════════════════════
+
+fn um_pin(pool, buffer_id) {
+    let bufs = um_pool_buffers(pool)
+    let mut new_bufs = []
+    for i in 0..len(bufs) {
+        if um_buf_id(bufs[i]) == buffer_id {
+            let b = bufs[i]
+            let updated = um_buf_new(
+                um_buf_id(b), um_buf_name(b), um_buf_data(b),
+                um_buf_size(b), um_buf_alignment(b), um_buf_dtype(b),
+                1, um_buf_last_access(b), um_buf_ref_count(b)
+            )
+            new_bufs = new_bufs + [updated]
+        } else {
+            new_bufs = new_bufs + [bufs[i]]
+        }
+    }
+    return um_pool_new(
+        new_bufs, um_pool_next_id(pool), um_pool_capacity(pool),
+        um_pool_used(pool), um_pool_tick(pool),
+        um_pool_alloc_count(pool), um_pool_free_count(pool),
+        um_pool_peak_used(pool)
+    )
+}
+
+fn um_unpin(pool, buffer_id) {
+    let bufs = um_pool_buffers(pool)
+    let mut new_bufs = []
+    for i in 0..len(bufs) {
+        if um_buf_id(bufs[i]) == buffer_id {
+            let b = bufs[i]
+            let updated = um_buf_new(
+                um_buf_id(b), um_buf_name(b), um_buf_data(b),
+                um_buf_size(b), um_buf_alignment(b), um_buf_dtype(b),
+                0, um_buf_last_access(b), um_buf_ref_count(b)
+            )
+            new_bufs = new_bufs + [updated]
+        } else {
+            new_bufs = new_bufs + [bufs[i]]
+        }
+    }
+    return um_pool_new(
+        new_bufs, um_pool_next_id(pool), um_pool_capacity(pool),
+        um_pool_used(pool), um_pool_tick(pool),
+        um_pool_alloc_count(pool), um_pool_free_count(pool),
+        um_pool_peak_used(pool)
+    )
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Resize
+// ═══════════════════════════════════════════════════════════════
+
+fn um_resize(pool, buffer_id, new_size) {
+    let idx = um_find_idx(pool, buffer_id)
+    if idx < 0 { return pool }
+    let bufs = um_pool_buffers(pool)
+    let b = bufs[idx]
+    let old_size = um_buf_size(b)
+    let old_data = um_buf_data(b)
+    let size_diff = new_size - old_size
+    let new_used = um_pool_used(pool) + size_diff
+    // Check capacity when growing
+    if new_used > um_pool_capacity(pool) { return pool }
+    // Build new data array: copy min(old, new) elements, zero-fill rest
+    let copy_len = um_min(old_size, new_size)
+    let mut new_data = []
+    for i in 0..copy_len {
+        new_data = new_data + [old_data[i]]
+    }
+    // If growing, pad with zeros
+    if new_size > old_size {
+        for _i in 0..(new_size - old_size) {
+            new_data = new_data + [0.0]
+        }
+    }
+    let updated = um_buf_new(
+        um_buf_id(b), um_buf_name(b), new_data,
+        new_size, um_buf_alignment(b), um_buf_dtype(b),
+        um_buf_pinned(b), um_buf_last_access(b), um_buf_ref_count(b)
+    )
+    let mut new_bufs = []
+    for i in 0..len(bufs) {
+        if i == idx {
+            new_bufs = new_bufs + [updated]
+        } else {
+            new_bufs = new_bufs + [bufs[i]]
+        }
+    }
+    let new_peak = um_max(um_pool_peak_used(pool), new_used)
+    return um_pool_new(
+        new_bufs, um_pool_next_id(pool), um_pool_capacity(pool),
+        new_used, um_pool_tick(pool),
+        um_pool_alloc_count(pool), um_pool_free_count(pool),
+        new_peak
+    )
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  LRU eviction
+// ═══════════════════════════════════════════════════════════════
+
+// Evict least-recently-used unpinned buffers until we free needed_size elements
+fn um_evict_lru(pool, needed_size) {
+    let mut p = pool
+    let mut freed = 0
+    // Repeat until enough space freed or no more evictable buffers
+    while freed < needed_size {
+        let bufs = um_pool_buffers(p)
+        if len(bufs) == 0 { return p }
+        // Find the unpinned buffer with the lowest last_access
+        let mut lru_idx = -1
+        let mut lru_tick = 999999999
+        for i in 0..len(bufs) {
+            if um_buf_pinned(bufs[i]) == 0 {
+                if um_buf_last_access(bufs[i]) < lru_tick {
+                    lru_tick = um_buf_last_access(bufs[i])
+                    lru_idx = i
+                }
+            }
+        }
+        // No evictable buffer found
+        if lru_idx < 0 { return p }
+        let evict_size = um_buf_size(bufs[lru_idx])
+        let evict_id = um_buf_id(bufs[lru_idx])
+        p = um_free(p, evict_id)
+        freed = freed + evict_size
+    }
+    return p
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Defragment — compact buffer IDs to be contiguous from 1
+// ═══════════════════════════════════════════════════════════════
+
+fn um_defragment(pool) {
+    let bufs = um_pool_buffers(pool)
+    let mut new_bufs = []
+    for i in 0..len(bufs) {
+        let b = bufs[i]
+        let new_id = i + 1
+        let updated = um_buf_new(
+            new_id, um_buf_name(b), um_buf_data(b),
+            um_buf_size(b), um_buf_alignment(b), um_buf_dtype(b),
+            um_buf_pinned(b), um_buf_last_access(b), um_buf_ref_count(b)
+        )
+        new_bufs = new_bufs + [updated]
+    }
+    let new_next = len(bufs) + 1
+    return um_pool_new(
+        new_bufs, new_next, um_pool_capacity(pool),
+        um_pool_used(pool), um_pool_tick(pool),
+        um_pool_alloc_count(pool), um_pool_free_count(pool),
+        um_pool_peak_used(pool)
+    )
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Clear — free all buffers
+// ═══════════════════════════════════════════════════════════════
+
+fn um_clear(pool) {
+    let bufs = um_pool_buffers(pool)
+    let n_freed = len(bufs)
+    return um_pool_new(
+        [], um_pool_next_id(pool), um_pool_capacity(pool),
+        0, um_pool_tick(pool),
+        um_pool_alloc_count(pool), um_pool_free_count(pool) + n_freed,
+        um_pool_peak_used(pool)
+    )
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  GC — free buffers with ref_count == 0
+// ═══════════════════════════════════════════════════════════════
+
+fn um_gc(pool) {
+    let bufs = um_pool_buffers(pool)
+    let mut kept = []
+    let mut freed_size = 0
+    let mut freed_count = 0
+    for i in 0..len(bufs) {
+        if um_buf_ref_count(bufs[i]) == 0 {
+            freed_size = freed_size + um_buf_size(bufs[i])
+            freed_count = freed_count + 1
+        } else {
+            kept = kept + [bufs[i]]
+        }
+    }
+    return um_pool_new(
+        kept, um_pool_next_id(pool), um_pool_capacity(pool),
+        um_pool_used(pool) - freed_size, um_pool_tick(pool),
+        um_pool_alloc_count(pool), um_pool_free_count(pool) + freed_count,
+        um_pool_peak_used(pool)
+    )
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Data operations — zero-copy semantics
+// ═══════════════════════════════════════════════════════════════
+
+// Write values into buffer at offset
+fn um_write(pool, buffer_id, offset, values) {
+    let idx = um_find_idx(pool, buffer_id)
+    if idx < 0 { return pool }
+    let bufs = um_pool_buffers(pool)
+    let b = bufs[idx]
+    let mut data = um_buf_data(b)
+    let n = len(values)
+    for i in 0..n {
+        let pos = offset + i
+        if pos < um_buf_size(b) {
+            data[pos] = values[i]
+        }
+    }
+    let updated = um_buf_new(
+        um_buf_id(b), um_buf_name(b), data,
+        um_buf_size(b), um_buf_alignment(b), um_buf_dtype(b),
+        um_buf_pinned(b), um_pool_tick(pool), um_buf_ref_count(b)
+    )
+    let mut new_bufs = []
+    for i in 0..len(bufs) {
+        if i == idx {
+            new_bufs = new_bufs + [updated]
+        } else {
+            new_bufs = new_bufs + [bufs[i]]
+        }
+    }
+    return um_pool_new(
+        new_bufs, um_pool_next_id(pool), um_pool_capacity(pool),
+        um_pool_used(pool), um_pool_tick(pool) + 1,
+        um_pool_alloc_count(pool), um_pool_free_count(pool),
+        um_pool_peak_used(pool)
+    )
+}
+
+// Read count elements from buffer starting at offset
+@pure
+fn um_read(pool, buffer_id, offset, count) {
+    let bufs = um_pool_buffers(pool)
+    for i in 0..len(bufs) {
+        if um_buf_id(bufs[i]) == buffer_id {
+            let data = um_buf_data(bufs[i])
+            let sz = um_buf_size(bufs[i])
+            let mut result = []
+            for j in 0..count {
+                let pos = offset + j
+                if pos < sz {
+                    result = result + [data[pos]]
+                }
+            }
+            return result
+        }
+    }
+    return []
+}
+
+// Fill entire buffer with a single value
+fn um_fill(pool, buffer_id, value) {
+    let idx = um_find_idx(pool, buffer_id)
+    if idx < 0 { return pool }
+    let bufs = um_pool_buffers(pool)
+    let b = bufs[idx]
+    let sz = um_buf_size(b)
+    let mut data = []
+    for _i in 0..sz {
+        data = data + [value]
+    }
+    let updated = um_buf_new(
+        um_buf_id(b), um_buf_name(b), data,
+        sz, um_buf_alignment(b), um_buf_dtype(b),
+        um_buf_pinned(b), um_pool_tick(pool), um_buf_ref_count(b)
+    )
+    let mut new_bufs = []
+    for i in 0..len(bufs) {
+        if i == idx {
+            new_bufs = new_bufs + [updated]
+        } else {
+            new_bufs = new_bufs + [bufs[i]]
+        }
+    }
+    return um_pool_new(
+        new_bufs, um_pool_next_id(pool), um_pool_capacity(pool),
+        um_pool_used(pool), um_pool_tick(pool) + 1,
+        um_pool_alloc_count(pool), um_pool_free_count(pool),
+        um_pool_peak_used(pool)
+    )
+}
+
+// Copy data from src buffer to dst buffer (sizes must match or dst is truncated)
+fn um_copy(pool, src_id, dst_id) {
+    let src_buf = um_get(pool, src_id)
+    if len(src_buf) == 0 { return pool }
+    let dst_idx = um_find_idx(pool, dst_id)
+    if dst_idx < 0 { return pool }
+    let bufs = um_pool_buffers(pool)
+    let dst_buf = bufs[dst_idx]
+    let src_data = um_buf_data(src_buf)
+    let copy_len = um_min(um_buf_size(src_buf), um_buf_size(dst_buf))
+    let mut new_data = []
+    for i in 0..um_buf_size(dst_buf) {
+        if i < copy_len {
+            new_data = new_data + [src_data[i]]
+        } else {
+            new_data = new_data + [um_buf_data(dst_buf)[i]]
+        }
+    }
+    let updated = um_buf_new(
+        um_buf_id(dst_buf), um_buf_name(dst_buf), new_data,
+        um_buf_size(dst_buf), um_buf_alignment(dst_buf), um_buf_dtype(dst_buf),
+        um_buf_pinned(dst_buf), um_pool_tick(pool), um_buf_ref_count(dst_buf)
+    )
+    let mut new_bufs = []
+    for i in 0..len(bufs) {
+        if i == dst_idx {
+            new_bufs = new_bufs + [updated]
+        } else {
+            new_bufs = new_bufs + [bufs[i]]
+        }
+    }
+    return um_pool_new(
+        new_bufs, um_pool_next_id(pool), um_pool_capacity(pool),
+        um_pool_used(pool), um_pool_tick(pool) + 1,
+        um_pool_alloc_count(pool), um_pool_free_count(pool),
+        um_pool_peak_used(pool)
+    )
+}
+
+// Create a view (read-only slice) of a buffer — returns data array
+@pure
+fn um_view(pool, buffer_id, offset, length) {
+    let bufs = um_pool_buffers(pool)
+    for i in 0..len(bufs) {
+        if um_buf_id(bufs[i]) == buffer_id {
+            let data = um_buf_data(bufs[i])
+            let sz = um_buf_size(bufs[i])
+            let actual_len = um_min(length, sz - offset)
+            let mut result = []
+            for j in 0..actual_len {
+                result = result + [data[offset + j]]
+            }
+            return result
+        }
+    }
+    return []
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Stats and utilization
+// ═══════════════════════════════════════════════════════════════
+
+// Returns [used, capacity, alloc_count, free_count, peak_used, n_buffers, n_pinned]
+@pure
+fn um_stats(pool) {
+    let bufs = um_pool_buffers(pool)
+    let mut n_pinned = 0
+    for i in 0..len(bufs) {
+        if um_buf_pinned(bufs[i]) == 1 {
+            n_pinned = n_pinned + 1
+        }
+    }
+    return [
+        um_pool_used(pool),
+        um_pool_capacity(pool),
+        um_pool_alloc_count(pool),
+        um_pool_free_count(pool),
+        um_pool_peak_used(pool),
+        len(bufs),
+        n_pinned
+    ]
+}
+
+// Utilization: used / capacity as float
+@pure
+fn um_utilization(pool) {
+    let cap = um_pool_capacity(pool)
+    if cap <= 0 { return 0.0 }
+    return to_float(um_pool_used(pool)) / to_float(cap)
+}
+
+// Fragmentation estimate: ratio of gaps from removed buffers.
+// Counts how many ID-slots are "missing" relative to contiguous numbering.
+// If all IDs are contiguous, fragmentation = 0.0
+@pure
+fn um_fragmentation(pool) {
+    let bufs = um_pool_buffers(pool)
+    let n = len(bufs)
+    if n <= 1 { return 0.0 }
+    // Find min and max IDs
+    let mut min_id = um_buf_id(bufs[0])
+    let mut max_id = um_buf_id(bufs[0])
+    for i in 1..n {
+        let bid = um_buf_id(bufs[i])
+        if bid < min_id { min_id = bid }
+        if bid > max_id { max_id = bid }
+    }
+    let id_span = max_id - min_id + 1
+    if id_span <= 0 { return 0.0 }
+    // Fragmentation = (span - actual count) / span
+    let gaps = id_span - n
+    return to_float(gaps) / to_float(id_span)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Unified memory platform detection
+// ═══════════════════════════════════════════════════════════════
+
+// Detect if running on Apple Silicon (unified memory architecture)
+@pure
+fn um_is_unified() {
+    // In real deployment this would check sysctl hw.memsize / uname -m.
+    // For the HEXA interpreter we return 1 on darwin/arm64 assumption.
+    return 1
+}
+
+// Returns 1 if zero-copy between CPU/GPU is available
+@pure
+fn um_zero_copy_available() {
+    return um_is_unified()
+}
+
+// Estimated memory bandwidth in GB/s based on platform.
+// Apple M1: ~68 GB/s, M2: ~100 GB/s, M3: ~100 GB/s, M4: ~120 GB/s
+// Returns conservative M1 baseline.
+@pure
+fn um_estimated_bandwidth() {
+    if um_is_unified() == 1 {
+        return 68.0
+    }
+    return 0.0
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Ref-count helpers
+// ═══════════════════════════════════════════════════════════════
+
+// Increment ref count on a buffer
+fn um_ref_inc(pool, buffer_id) {
+    let bufs = um_pool_buffers(pool)
+    let mut new_bufs = []
+    for i in 0..len(bufs) {
+        if um_buf_id(bufs[i]) == buffer_id {
+            let b = bufs[i]
+            let updated = um_buf_new(
+                um_buf_id(b), um_buf_name(b), um_buf_data(b),
+                um_buf_size(b), um_buf_alignment(b), um_buf_dtype(b),
+                um_buf_pinned(b), um_buf_last_access(b),
+                um_buf_ref_count(b) + 1
+            )
+            new_bufs = new_bufs + [updated]
+        } else {
+            new_bufs = new_bufs + [bufs[i]]
+        }
+    }
+    return um_pool_new(
+        new_bufs, um_pool_next_id(pool), um_pool_capacity(pool),
+        um_pool_used(pool), um_pool_tick(pool),
+        um_pool_alloc_count(pool), um_pool_free_count(pool),
+        um_pool_peak_used(pool)
+    )
+}
+
+// Decrement ref count on a buffer (floor at 0)
+fn um_ref_dec(pool, buffer_id) {
+    let bufs = um_pool_buffers(pool)
+    let mut new_bufs = []
+    for i in 0..len(bufs) {
+        if um_buf_id(bufs[i]) == buffer_id {
+            let b = bufs[i]
+            let mut new_rc = um_buf_ref_count(b) - 1
+            if new_rc < 0 { new_rc = 0 }
+            let updated = um_buf_new(
+                um_buf_id(b), um_buf_name(b), um_buf_data(b),
+                um_buf_size(b), um_buf_alignment(b), um_buf_dtype(b),
+                um_buf_pinned(b), um_buf_last_access(b), new_rc
+            )
+            new_bufs = new_bufs + [updated]
+        } else {
+            new_bufs = new_bufs + [bufs[i]]
+        }
+    }
+    return um_pool_new(
+        new_bufs, um_pool_next_id(pool), um_pool_capacity(pool),
+        um_pool_used(pool), um_pool_tick(pool),
+        um_pool_alloc_count(pool), um_pool_free_count(pool),
+        um_pool_peak_used(pool)
+    )
+}

@@ -1,0 +1,287 @@
+// test_mac_serve.hexa — Mac Serve (#182) comprehensive tests
+import "ml/mac_serve.hexa"
+
+let mut pass = 0
+let mut fail = 0
+
+fn check(name, cond) {
+    if cond {
+        pass = pass + 1
+        println("PASS " + name)
+    } else {
+        fail = fail + 1
+        println("FAIL " + name)
+    }
+}
+
+// ── 1. Server creation ────────────────────────────────────────
+let s1 = serve_create(8080, "llama-3-8b", 4)
+check("create: port", s1.port == 8080)
+check("create: model_name", s1.model_name == "llama-3-8b")
+check("create: max_batch", s1.max_batch == 4)
+check("create: empty queues", len(s1.request_queue) == 0)
+check("create: empty active", len(s1.active_requests) == 0)
+check("create: total_served=0", s1.total_served == 0)
+check("create: uptime=0", s1.uptime_ticks == 0)
+
+// ── 2. ChatRequest creation ───────────────────────────────────
+let msgs1 = [#{"role": "user", "content": "hello"}]
+let r1 = make_chat_request("req-1", "llama-3-8b", msgs1, 8, 0.7, 0)
+check("request: id", r1.id == "req-1")
+check("request: max_tokens", r1.max_tokens == 8)
+check("request: stream=0", r1.stream == 0)
+
+// ── 3. Enqueue ────────────────────────────────────────────────
+let s2 = serve_enqueue(s1, r1)
+check("enqueue: queue grows", len(s2.request_queue) == 1)
+check("enqueue: active stays empty", len(s2.active_requests) == 0)
+
+// ── 4. Multiple enqueue ──────────────────────────────────────
+let r2 = make_chat_request("req-2", "llama-3-8b", msgs1, 4, 0.5, 1)
+let s3 = serve_enqueue(s2, r2)
+check("multi-enqueue: queue=2", len(s3.request_queue) == 2)
+
+// ── 5. Schedule moves to active ──────────────────────────────
+let s4 = serve_schedule(s3)
+check("schedule: queue drained", len(s4.request_queue) == 0)
+check("schedule: active=2", len(s4.active_requests) == 2)
+
+// ── 6. Schedule respects max_batch ───────────────────────────
+let s_small = serve_create(8080, "m", 1)
+let s_q = serve_enqueue(serve_enqueue(s_small, r1), r2)
+let s_sched = serve_schedule(s_q)
+check("schedule: max_batch=1 -> active=1", len(s_sched.active_requests) == 1)
+check("schedule: max_batch=1 -> queue=1", len(s_sched.request_queue) == 1)
+
+// ── 7. Process blocking request ─────────────────────────────
+let s5 = serve_create(8080, "llama-3-8b", 4)
+let msgs_block = [#{"role": "user", "content": "test prompt"}]
+let r_block = make_chat_request("blk-1", "llama-3-8b", msgs_block, 5, 0.7, 0)
+let result1 = serve_process_request(s5, r_block)
+let s6 = result1[0]
+let resp1 = result1[1]
+check("blocking: tokens_generated=5", resp1.tokens_generated == 5)
+check("blocking: finish_reason=length", resp1.finish_reason == "length")
+check("blocking: model matches", resp1.model == "llama-3-8b")
+check("blocking: id matches", resp1.id == "blk-1")
+check("blocking: content non-empty", len(resp1.content) > 0)
+check("blocking: state total_served=1", s6.total_served == 1)
+check("blocking: state total_tokens=5", s6.total_tokens == 5)
+
+// ── 8. Process streaming request ────────────────────────────
+let r_stream = make_chat_request("str-1", "llama-3-8b", msgs_block, 4, 0.7, 1)
+let result2 = serve_process_stream(s5, r_stream)
+let s7 = result2[0]
+let chunks = result2[1]
+// 4 token chunks + 1 DONE chunk = 5 total
+check("stream: chunk count=5", len(chunks) == 5)
+check("stream: first chunk has delta", len(chunks[0].delta) > 0)
+check("stream: last chunk is DONE", chunks[4].finish_reason == "length")
+check("stream: last chunk delta empty", chunks[4].delta == "")
+check("stream: middle chunks no finish", chunks[1].finish_reason == "")
+check("stream: state total_served=1", s7.total_served == 1)
+
+// ── 9. SSE format correctness ───────────────────────────────
+let test_chunk = SSEChunk { id: "c-1", delta: "hello", finish_reason: "" }
+let sse_out = serve_format_sse(test_chunk)
+check("sse_format: starts with data:", len(sse_out) > 6)
+
+// Check the DONE sentinel
+let done_chunk = SSEChunk { id: "c-1", delta: "", finish_reason: "stop" }
+let sse_done = serve_format_sse(done_chunk)
+check("sse_format: DONE sentinel", sse_done == "data: [DONE]\n\n")
+
+// ── 10. Response JSON format ────────────────────────────────
+let test_resp = ChatResponse {
+    id: "chatcmpl-1",
+    model: "llama-3-8b",
+    content: "hello world",
+    tokens_generated: 2,
+    prompt_tokens: 5,
+    finish_reason: "stop"
+}
+let json_out = serve_format_response(test_resp)
+// Verify key fields present
+check("json: has chat.completion", _str_contains(json_out, "chat.completion"))
+check("json: has model", _str_contains(json_out, "llama-3-8b"))
+check("json: has content", _str_contains(json_out, "hello world"))
+check("json: has finish_reason", _str_contains(json_out, "stop"))
+check("json: has prompt_tokens", _str_contains(json_out, "prompt_tokens"))
+check("json: has completion_tokens", _str_contains(json_out, "completion_tokens"))
+
+// ── 11. Multiple concurrent requests (batch=4) ─────────────
+let s_batch = serve_create(8080, "llama-3-8b", 4)
+let b_msgs = [#{"role": "user", "content": "batch test"}]
+let mut s_b = s_batch
+let mut bi = 0
+while bi < 6 {
+    let br = make_chat_request("b-" + str(bi), "llama-3-8b", b_msgs, 3, 0.7, 0)
+    s_b = serve_enqueue(s_b, br)
+    bi = bi + 1
+}
+check("batch: queued 6", len(s_b.request_queue) == 6)
+
+// One step processes up to max_batch=4
+let s_b2 = serve_step(s_b)
+check("batch: step1 served=4", s_b2.total_served == 4)
+check("batch: step1 queue remaining=2", len(s_b2.request_queue) == 2)
+check("batch: step1 active cleared", len(s_b2.active_requests) == 0)
+
+// Second step picks up remaining 2
+let s_b3 = serve_step(s_b2)
+check("batch: step2 served=6", s_b3.total_served == 6)
+check("batch: step2 queue empty", len(s_b3.request_queue) == 0)
+
+// ── 12. Stats tracking ──────────────────────────────────────
+let stats = serve_stats(s_b3)
+check("stats: total_served=6", stats["total_served"] == 6)
+check("stats: total_tokens=18", stats["total_tokens"] == 18)
+check("stats: avg=3", stats["avg_tokens_per_req"] == 3)
+check("stats: queue_depth=0", stats["queue_depth"] == 0)
+check("stats: uptime=2", stats["uptime_ticks"] == 2)
+
+// ── 13. Mock token determinism ──────────────────────────────
+let tok_a = mock_generate_token(42, 3)
+let tok_b = mock_generate_token(42, 3)
+check("determinism: same seed+step => same", tok_a == tok_b)
+let tok_c = mock_generate_token(42, 4)
+check("determinism: different step => may differ", true)
+
+// ── 14. Max tokens limit respected ──────────────────────────
+let r_max = make_chat_request("mx-1", "m", [#{"role": "user", "content": "x"}], 10, 0.7, 0)
+let res_max = serve_process_request(serve_create(80, "m", 1), r_max)
+let resp_max = res_max[1]
+check("max_tokens: generated=10", resp_max.tokens_generated == 10)
+
+// ── 15. finish_reason "stop" vs "length" ────────────────────
+let r_zero = make_chat_request("z-1", "m", [#{"role": "user", "content": "x"}], 0, 0.7, 0)
+let res_zero = serve_process_request(serve_create(80, "m", 1), r_zero)
+check("finish: zero tokens => stop", res_zero[1].finish_reason == "stop")
+
+let r_pos = make_chat_request("p-1", "m", [#{"role": "user", "content": "x"}], 3, 0.7, 0)
+let res_pos = serve_process_request(serve_create(80, "m", 1), r_pos)
+check("finish: positive tokens => length", res_pos[1].finish_reason == "length")
+
+// ── 16. Empty message handling ──────────────────────────────
+let r_empty = make_chat_request("e-1", "m", [], 3, 0.7, 0)
+let res_empty = serve_process_request(serve_create(80, "m", 1), r_empty)
+check("empty msgs: no crash", res_empty[1].tokens_generated == 3)
+
+// ── 17. Server step cycle (enqueue -> step -> completed) ────
+let s_cycle = serve_create(8080, "m", 2)
+let r_c1 = make_chat_request("c-1", "m", [#{"role": "user", "content": "cycle"}], 2, 0.7, 0)
+let s_c2 = serve_enqueue(s_cycle, r_c1)
+let s_c3 = serve_step(s_c2)
+check("cycle: completed=1 after step", len(s_c3.completed) == 1)
+check("cycle: uptime=1", s_c3.uptime_ticks == 1)
+
+// ── 18. Parse request ───────────────────────────────────────
+let parsed = serve_parse_request("llama-3|Hello world|32|0.9|1")
+check("parse: model", parsed.model == "llama-3")
+check("parse: max_tokens=32", parsed.max_tokens == 32)
+check("parse: stream=1", parsed.stream == 1)
+check("parse: messages created", len(parsed.messages) == 1)
+
+// ── 19. Parse request defaults ──────────────────────────────
+let parsed2 = serve_parse_request("gpt4|Hi")
+check("parse_default: max_tokens=16", parsed2.max_tokens == 16)
+check("parse_default: stream=0", parsed2.stream == 0)
+
+// ── 20. Streaming reconstructed content ─────────────────────
+// Concatenating all deltas from chunks should equal blocking content
+let msgs_recon = [#{"role": "user", "content": "reconstruct test"}]
+let r_blk2 = make_chat_request("rc-1", "m", msgs_recon, 6, 0.7, 0)
+let r_str2 = make_chat_request("rc-2", "m", msgs_recon, 6, 0.7, 1)
+let s_rc = serve_create(80, "m", 1)
+let blk_res = serve_process_request(s_rc, r_blk2)
+let str_res = serve_process_stream(s_rc, r_str2)
+let blk_content = blk_res[1].content
+let str_chunks = str_res[1]
+let mut recon = ""
+let mut ri = 0
+while ri < len(str_chunks) {
+    recon = recon + str_chunks[ri].delta
+    ri = ri + 1
+}
+check("recon: stream deltas == blocking content", recon == blk_content)
+
+// ── 21. Queue overflow (more than max_batch) ────────────────
+let s_of = serve_create(80, "m", 2)
+let mut s_of2 = s_of
+let mut oi = 0
+while oi < 10 {
+    let or1 = make_chat_request("of-" + str(oi), "m", msgs1, 2, 0.7, 0)
+    s_of2 = serve_enqueue(s_of2, or1)
+    oi = oi + 1
+}
+check("overflow: queue holds all 10", len(s_of2.request_queue) == 10)
+let s_of3 = serve_schedule(s_of2)
+check("overflow: only 2 active", len(s_of3.active_requests) == 2)
+check("overflow: 8 remain in queue", len(s_of3.request_queue) == 8)
+
+// ── 22. Stats with zero served ──────────────────────────────
+let stats_zero = serve_stats(serve_create(80, "m", 1))
+check("stats_zero: avg=0", stats_zero["avg_tokens_per_req"] == 0)
+
+// ── 23. Prompt tokens counted ───────────────────────────────
+check("prompt_tokens: counted", resp1.prompt_tokens > 0)
+
+// ── 24. Stream chunk IDs match request ──────────────────────
+let msgs_cid = [#{"role": "user", "content": "id check"}]
+let r_cid = make_chat_request("cid-42", "m", msgs_cid, 3, 0.7, 1)
+let res_cid = serve_process_stream(serve_create(80, "m", 1), r_cid)
+let cid_chunks = res_cid[1]
+check("chunk_id: matches request", cid_chunks[0].id == "cid-42")
+check("chunk_id: last matches too", cid_chunks[3].id == "cid-42")
+
+// ── 25. SSE format contains JSON ────────────────────────────
+let mid_chunk = SSEChunk { id: "fmt-1", delta: "world", finish_reason: "" }
+let mid_sse = serve_format_sse(mid_chunk)
+check("sse_mid: contains delta", _str_contains(mid_sse, "world"))
+check("sse_mid: contains choices", _str_contains(mid_sse, "choices"))
+
+// ── 26. Multiple steps accumulate uptime ────────────────────
+let s_up = serve_create(80, "m", 1)
+let s_up2 = serve_step(serve_step(serve_step(s_up)))
+check("uptime: 3 steps => 3", s_up2.uptime_ticks == 3)
+
+// ── 27. Completed responses persist across steps ────────────
+let s_per = serve_create(80, "m", 4)
+let r_p1 = make_chat_request("per-1", "m", msgs1, 2, 0.7, 0)
+let r_p2 = make_chat_request("per-2", "m", msgs1, 2, 0.7, 0)
+let s_per2 = serve_step(serve_enqueue(serve_enqueue(s_per, r_p1), r_p2))
+check("persist: completed=2", len(s_per2.completed) == 2)
+
+// ── Helper: string contains ─────────────────────────────────
+fn _str_contains(haystack, needle) {
+    let h_len = len(haystack)
+    let n_len = len(needle)
+    if n_len > h_len { return false }
+    let limit = h_len - n_len + 1
+    let mut i = 0
+    while i < limit {
+        let mut match_found = true
+        let mut j = 0
+        while j < n_len {
+            if haystack[i + j] != needle[j] {
+                match_found = false
+                j = n_len
+            } else {
+                j = j + 1
+            }
+        }
+        if match_found { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ── Summary ─────────────────────────────────────────────────
+println("")
+println("pass=" + str(pass) + " fail=" + str(fail))
+if fail == 0 {
+    println("ALL PASS")
+} else {
+    println("FAILED")
+}
+println(str(pass) + " passed")

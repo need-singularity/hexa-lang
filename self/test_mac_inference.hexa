@@ -1,0 +1,510 @@
+// ===================================================================
+//  test_mac_inference.hexa — Mac Inference Engine (#181) tests
+//
+//  Verifies:
+//    1.  Model creation (correct dimensions)
+//    2.  Embedding lookup
+//    3.  RMS norm (known values)
+//    4.  Pure hexa matmul correctness (2x2, 3x3, identity)
+//    5.  SiLU activation values
+//    6.  Softmax correctness
+//    7.  Attention output shapes
+//    8.  FFN output shapes
+//    9.  Forward pass (single token -> logits of vocab_size)
+//   10.  Argmax token selection
+//   11.  Generate loop (N tokens, deterministic)
+//   12.  KV-cache population after prefill
+//   13.  Decode uses cached KV
+//   14.  Accelerate detection (guarded)
+//   15.  Cache reset
+//
+//  All tests work WITHOUT Accelerate (pure hexa fallback).
+//  Run: ./hexa self/test_mac_inference.hexa
+// ===================================================================
+
+import "ml/mac_inference.hexa"
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn t_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn approx_eq(a, b, eps) {
+    return t_abs(a - b) < eps
+}
+
+println("===================================================================")
+println("  Mac Inference Engine (#181) — Test Suite")
+println("===================================================================")
+
+let eps = 1.0e-4
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 1: MacModelConfig default values
+// ═══════════════════════════════════════════════════════════════
+let cfg_def = mac_default_config()
+check("T01 default config dim=512", cfg_def.dim == 512)
+check("T02 default config n_heads=8", cfg_def.n_heads == 8)
+check("T03 default config head_dim=64", cfg_def.head_dim == 64)
+check("T04 default config ff_dim=1536", cfg_def.ff_dim == 1536)
+check("T05 default config vocab=32000", cfg_def.vocab_size == 32000)
+check("T06 default config n_layers=8", cfg_def.n_layers == 8)
+check("T07 default config max_seq=2048", cfg_def.max_seq_len == 2048)
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 2: Small config for fast testing
+// ═══════════════════════════════════════════════════════════════
+let cfg = mac_small_config()
+check("T08 small config dim=4", cfg.dim == 4)
+check("T09 small config heads=2", cfg.n_heads == 2)
+check("T10 small config head_dim=2", cfg.head_dim == 2)
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 3: Model creation with small config
+// ═══════════════════════════════════════════════════════════════
+let model = mac_model_create(cfg)
+check("T11 model W_emb size", len(model.W_emb) == cfg.vocab_size * cfg.dim)
+check("T12 model Wq layers", len(model.Wq) == cfg.n_layers)
+check("T13 model Wq[0] size", len(model.Wq[0]) == cfg.dim * cfg.dim)
+check("T14 model W_gate[0] size", len(model.W_gate[0]) == cfg.dim * cfg.ff_dim)
+check("T15 model W_down[0] size", len(model.W_down[0]) == cfg.ff_dim * cfg.dim)
+check("T16 model W_lm_head size", len(model.W_lm_head) == cfg.dim * cfg.vocab_size)
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 4: Global KV-cache initialized
+// ═══════════════════════════════════════════════════════════════
+check("T17 KV-cache dim set", MAC_KV_DIM == cfg.dim)
+check("T18 KV-cache max_seq set", MAC_KV_MAX_SEQ == cfg.max_seq_len)
+check("T19 KV-cache nlayers set", MAC_KV_NLAYERS == cfg.n_layers)
+check("T20 KV-cache pos=0", MAC_KV_POS == 0)
+check("T21 KV keys size", len(MAC_KV_KEYS) == cfg.n_layers * cfg.max_seq_len * cfg.dim)
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 5: Embedding lookup
+// ═══════════════════════════════════════════════════════════════
+let emb_0 = mac_embed(model, 0)
+check("T22 embed dim", len(emb_0) == cfg.dim)
+// Token 0 should read W_emb[0..dim]
+let mut emb_ok = true
+for i in 0..cfg.dim {
+    if t_abs(emb_0[i] - model.W_emb[i]) > 1.0e-9 {
+        emb_ok = false
+    }
+}
+check("T23 embed token0 = W_emb[0..dim]", emb_ok)
+
+// Token 1 should read W_emb[dim..2*dim]
+let emb_1 = mac_embed(model, 1)
+let mut emb1_ok = true
+for i in 0..cfg.dim {
+    if t_abs(emb_1[i] - model.W_emb[cfg.dim + i]) > 1.0e-9 {
+        emb1_ok = false
+    }
+}
+check("T24 embed token1 = W_emb[dim..2*dim]", emb1_ok)
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 6: RMS norm (known values)
+// ═══════════════════════════════════════════════════════════════
+let rms_x = [1.0, 2.0, 3.0, 4.0]
+let rms_w = [1.0, 1.0, 1.0, 1.0]
+let rms_out = mac_rms_norm(rms_x, rms_w, 4)
+check("T25 rms_norm output dim", len(rms_out) == 4)
+// mean(x^2) = (1+4+9+16)/4 = 7.5, rms = sqrt(7.5 + 1e-6) ~ 2.7386
+// out[0] = 1.0 / 2.7386 ~ 0.3651
+check("T26 rms_norm out[0] approx", approx_eq(rms_out[0], 0.3651, 0.01))
+// out[3] = 4.0 / 2.7386 ~ 1.4606
+check("T27 rms_norm out[3] approx", approx_eq(rms_out[3], 1.4606, 0.01))
+
+// RMS norm with non-unity weights
+let rms_w2 = [2.0, 0.5, 1.0, 3.0]
+let rms_out2 = mac_rms_norm(rms_x, rms_w2, 4)
+check("T28 rms_norm weighted out[0] = 2x unweighted", approx_eq(rms_out2[0], rms_out[0] * 2.0, 0.01))
+
+// RMS norm with zero input
+let rms_zero = mac_rms_norm([0.0, 0.0, 0.0, 0.0], [1.0, 1.0, 1.0, 1.0], 4)
+let mut rms_zero_ok = true
+for i in 0..4 {
+    if t_abs(rms_zero[i]) > 1.0e-3 {
+        rms_zero_ok = false
+    }
+}
+check("T29 rms_norm(zeros) ~ zeros", rms_zero_ok)
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 7: Pure hexa matmul — 2x2
+// ═══════════════════════════════════════════════════════════════
+// A = [[1,2],[3,4]], B = [[5,6],[7,8]]
+// C = [[19,22],[43,50]]
+let mm_a = [1.0, 2.0, 3.0, 4.0]
+let mm_b = [5.0, 6.0, 7.0, 8.0]
+let mm_c = mac_matmul(mm_a, mm_b, 2, 2, 2)
+check("T30 matmul 2x2 [0,0]=19", approx_eq(mm_c[0], 19.0, eps))
+check("T31 matmul 2x2 [0,1]=22", approx_eq(mm_c[1], 22.0, eps))
+check("T32 matmul 2x2 [1,0]=43", approx_eq(mm_c[2], 43.0, eps))
+check("T33 matmul 2x2 [1,1]=50", approx_eq(mm_c[3], 50.0, eps))
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 8: Matmul — identity
+// ═══════════════════════════════════════════════════════════════
+let mm_i = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+let mm_v = [3.0, 5.0, 7.0]
+let mm_iv = mac_matmul(mm_i, mm_v, 3, 1, 3)
+check("T34 matmul identity [0]=3", approx_eq(mm_iv[0], 3.0, eps))
+check("T35 matmul identity [1]=5", approx_eq(mm_iv[1], 5.0, eps))
+check("T36 matmul identity [2]=7", approx_eq(mm_iv[2], 7.0, eps))
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 9: Matmul — 3x3 to 3x2
+// ═══════════════════════════════════════════════════════════════
+let mm3_a = [1.0, 0.0, 2.0, 0.0, 3.0, 0.0, 4.0, 0.0, 5.0]
+let mm3_b = [1.0, 0.0, 0.0, 1.0, 2.0, 0.0]
+let mm3_c = mac_matmul(mm3_a, mm3_b, 3, 2, 3)
+check("T37 matmul 3x3->3x2 [0,0]=5", approx_eq(mm3_c[0], 5.0, eps))
+check("T38 matmul 3x3->3x2 [0,1]=0", approx_eq(mm3_c[1], 0.0, eps))
+check("T39 matmul 3x3->3x2 [1,0]=0", approx_eq(mm3_c[2], 0.0, eps))
+check("T40 matmul 3x3->3x2 [1,1]=3", approx_eq(mm3_c[3], 3.0, eps))
+check("T41 matmul 3x3->3x2 [2,0]=14", approx_eq(mm3_c[4], 14.0, eps))
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 10: hexa_matmul direct call
+// ═══════════════════════════════════════════════════════════════
+let hm_a = [1.0, 0.0, 0.0, 1.0]
+let hm_b = [7.0, 8.0, 9.0, 10.0]
+let hm_c = mi_zeros(4)
+let hm_r = hexa_matmul(hm_a, hm_b, hm_c, 2, 2, 2)
+check("T42 hexa_matmul identity [0]=7", approx_eq(hm_r[0], 7.0, eps))
+check("T43 hexa_matmul identity [3]=10", approx_eq(hm_r[3], 10.0, eps))
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 11: Matmul M=1 (vector-matrix multiply)
+// ═══════════════════════════════════════════════════════════════
+let vm_a = [1.0, 2.0, 3.0]
+let vm_b = [1.0, 0.0, 0.0, 1.0, 1.0, 1.0]
+let vm_c = mac_matmul(vm_a, vm_b, 1, 2, 3)
+check("T44 vec-mat mul [0]=4", approx_eq(vm_c[0], 4.0, eps))
+check("T45 vec-mat mul [1]=5", approx_eq(vm_c[1], 5.0, eps))
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 12: SiLU activation
+// ═══════════════════════════════════════════════════════════════
+let silu_in = [0.0, 1.0, 0.0 - 1.0, 2.0]
+let silu_out = mac_silu(silu_in, 4)
+check("T46 silu dim", len(silu_out) == 4)
+check("T47 silu(0)=0", approx_eq(silu_out[0], 0.0, eps))
+check("T48 silu(1)~0.731", approx_eq(silu_out[1], 0.7311, 0.01))
+check("T49 silu(-1)~-0.269", approx_eq(silu_out[2], 0.0 - 0.2689, 0.01))
+check("T50 silu(2)~1.762", approx_eq(silu_out[3], 1.7616, 0.01))
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 13: Softmax
+// ═══════════════════════════════════════════════════════════════
+let sm_in = [1.0, 2.0, 3.0]
+let sm_out = mac_softmax(sm_in, 3)
+check("T51 softmax dim", len(sm_out) == 3)
+let sm_sum = sm_out[0] + sm_out[1] + sm_out[2]
+check("T52 softmax sums to 1", approx_eq(sm_sum, 1.0, eps))
+check("T53 softmax monotonic", sm_out[2] > sm_out[1])
+check("T54 softmax monotonic2", sm_out[1] > sm_out[0])
+check("T55 softmax(3)~0.665", approx_eq(sm_out[2], 0.6652, 0.01))
+
+// Equal inputs -> equal probs
+let sm_eq = mac_softmax([1.0, 1.0, 1.0], 3)
+check("T56 softmax uniform", approx_eq(sm_eq[0], sm_eq[1], eps))
+check("T57 softmax uniform2", approx_eq(sm_eq[1], sm_eq[2], eps))
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 14: mi_vec_add correctness
+// ═══════════════════════════════════════════════════════════════
+let va = [1.0, 2.0, 3.0, 4.0]
+let vb = [0.5, 0.5, 0.5, 0.5]
+let vc = mi_vec_add(va, vb, 4)
+check("T58 vec_add [0]=1.5", approx_eq(vc[0], 1.5, eps))
+check("T59 vec_add [3]=4.5", approx_eq(vc[3], 4.5, eps))
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 15: Attention output shape (fresh model)
+// ═══════════════════════════════════════════════════════════════
+let model2 = mac_model_create(cfg)
+let x_attn = mi_init_vec(cfg.dim, 0.1)
+let attn_out = mac_attention(model2, 0, x_attn, 0, 1)
+check("T60 attention output dim", len(attn_out) == cfg.dim)
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 16: FFN output shape
+// ═══════════════════════════════════════════════════════════════
+let x_ffn = mi_init_vec(cfg.dim, 0.1)
+let ffn_out = mac_ffn(model2, 0, x_ffn)
+check("T61 ffn output dim", len(ffn_out) == cfg.dim)
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 17: Forward pass — single token -> logits of vocab_size
+// ═══════════════════════════════════════════════════════════════
+let model3 = mac_model_create(cfg)
+let logits = mac_forward(model3, 0, 0)
+check("T62 forward logits dim=vocab", len(logits) == cfg.vocab_size)
+
+// Logits should contain finite values (not all zero for random weights)
+let mut any_nonzero = false
+for i in 0..cfg.vocab_size {
+    if t_abs(logits[i]) > 1.0e-10 {
+        any_nonzero = true
+    }
+}
+check("T63 forward logits not all zero", any_nonzero)
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 18: Forward pass at different positions
+// ═══════════════════════════════════════════════════════════════
+let logits_p1 = mac_forward(model3, 1, 1)
+check("T64 forward pos=1 logits dim", len(logits_p1) == cfg.vocab_size)
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 19: Argmax token selection
+// ═══════════════════════════════════════════════════════════════
+let test_logits = [0.1, 0.5, 0.9, 0.3, 0.7]
+let best = mac_logits_to_token(test_logits, 5)
+check("T65 argmax finds index 2", best == 2)
+
+let test_logits2 = [9.0, 1.0, 2.0, 3.0]
+check("T66 argmax first elem", mac_logits_to_token(test_logits2, 4) == 0)
+
+let test_logits3 = [1.0, 2.0, 3.0, 9.0]
+check("T67 argmax last elem", mac_logits_to_token(test_logits3, 4) == 3)
+
+let test_logits4 = [0.0 - 5.0, 0.0 - 3.0, 0.0 - 1.0, 0.0 - 4.0]
+check("T68 argmax with negatives", mac_logits_to_token(test_logits4, 4) == 2)
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 20: Prefill — populates KV-cache
+// ═══════════════════════════════════════════════════════════════
+let model4 = mac_model_create(cfg)
+let prompt = [0, 1, 2]
+let pf_logits = mac_prefill(model4, prompt, 3)
+check("T69 prefill returns logits dim=vocab", len(pf_logits) == cfg.vocab_size)
+check("T70 prefill sets KV_POS=3", MAC_KV_POS == 3)
+
+// KV-cache should have non-zero entries after prefill
+let k0 = mac_kv_get_key(0, 0)
+let mut kv_nonzero = false
+for i in 0..cfg.dim {
+    if t_abs(k0[i]) > 1.0e-10 {
+        kv_nonzero = true
+    }
+}
+check("T71 KV-cache populated after prefill", kv_nonzero)
+
+// Check position 2 was also populated
+let k2 = mac_kv_get_key(0, 2)
+let mut k2_nonzero = false
+for i in 0..cfg.dim {
+    if t_abs(k2[i]) > 1.0e-10 {
+        k2_nonzero = true
+    }
+}
+check("T72 KV-cache pos=2 populated", k2_nonzero)
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 21: Decode uses cached KV
+// ═══════════════════════════════════════════════════════════════
+let dec_logits = mac_decode(model4, 3, 3)
+check("T73 decode logits dim=vocab", len(dec_logits) == cfg.vocab_size)
+check("T74 decode advances KV_POS=4", MAC_KV_POS == 4)
+
+// KV at position 3 should now be populated
+let k3 = mac_kv_get_key(0, 3)
+let mut k3_nonzero = false
+for i in 0..cfg.dim {
+    if t_abs(k3[i]) > 1.0e-10 {
+        k3_nonzero = true
+    }
+}
+check("T75 KV-cache pos=3 populated after decode", k3_nonzero)
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 22: Generate loop — deterministic N tokens
+// ═══════════════════════════════════════════════════════════════
+let model5 = mac_model_create(cfg)
+let gen_prompt = [0, 1]
+let generated = mac_generate(model5, gen_prompt, 2, 4)
+check("T76 generate returns 4 tokens", len(generated) == 4)
+
+// All generated tokens should be in [0, vocab_size)
+let mut gen_valid = true
+for i in 0..len(generated) {
+    if generated[i] < 0 {
+        gen_valid = false
+    }
+    if generated[i] >= cfg.vocab_size {
+        gen_valid = false
+    }
+}
+check("T77 generated tokens in valid range", gen_valid)
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 23: Deterministic generation (same seed -> same output)
+// ═══════════════════════════════════════════════════════════════
+MI_RNG = 12345
+let model6a = mac_model_create(cfg)
+let gen_a = mac_generate(model6a, [0, 1], 2, 3)
+
+MI_RNG = 12345
+let model6b = mac_model_create(cfg)
+let gen_b = mac_generate(model6b, [0, 1], 2, 3)
+
+let mut det_ok = true
+for i in 0..3 {
+    if gen_a[i] != gen_b[i] {
+        det_ok = false
+    }
+}
+check("T78 deterministic: same seed -> same tokens", det_ok)
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 24: Cache reset
+// ═══════════════════════════════════════════════════════════════
+let model7 = mac_model_create(cfg)
+let _ = mac_prefill(model7, [0, 1, 2], 3)
+check("T79 KV_POS=3 before reset", MAC_KV_POS == 3)
+let _ = mac_model_reset_cache()
+check("T80 KV_POS=0 after reset", MAC_KV_POS == 0)
+
+// After reset, KV at pos 0 should be zero
+let k0_reset = mac_kv_get_key(0, 0)
+let mut reset_ok = true
+for i in 0..cfg.dim {
+    if t_abs(k0_reset[i]) > 1.0e-10 {
+        reset_ok = false
+    }
+}
+check("T81 KV-cache zeroed after reset", reset_ok)
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 25: Multiple decode steps maintain sequence
+// ═══════════════════════════════════════════════════════════════
+let model9 = mac_model_create(cfg)
+let _ = mac_prefill(model9, [0], 1)
+let d1 = mac_decode(model9, 1, 1)
+let d2 = mac_decode(model9, 2, 2)
+let d3 = mac_decode(model9, 3, 3)
+check("T82 multi-decode d1 dim", len(d1) == cfg.vocab_size)
+check("T83 multi-decode d2 dim", len(d2) == cfg.vocab_size)
+check("T84 multi-decode d3 dim", len(d3) == cfg.vocab_size)
+check("T85 multi-decode KV_POS=4", MAC_KV_POS == 4)
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 26: Prefill vs sequential forward equivalence
+// ═══════════════════════════════════════════════════════════════
+MI_RNG = 99999
+let model10a = mac_model_create(cfg)
+let fwd_logits = mac_forward(model10a, 5, 0)
+
+MI_RNG = 99999
+let model10b = mac_model_create(cfg)
+let pf_logits2 = mac_prefill(model10b, [5], 1)
+
+let mut fwd_pf_ok = true
+for i in 0..cfg.vocab_size {
+    if t_abs(fwd_logits[i] - pf_logits2[i]) > 1.0e-6 {
+        fwd_pf_ok = false
+    }
+}
+check("T86 forward(tok,0) == prefill([tok],1)", fwd_pf_ok)
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 27: Accelerate detection (guarded)
+// ═══════════════════════════════════════════════════════════════
+let acc_flag = has_accelerate()
+check("T87 has_accelerate() returns bool", acc_flag == true || acc_flag == false)
+
+if has_accelerate() {
+    println("  [info] Accelerate framework detected on this Mac")
+} else {
+    println("  [info] Accelerate not detected (pure hexa fallback active)")
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 28: mi_detect_accelerate sets global flag
+// ═══════════════════════════════════════════════════════════════
+let _ = mi_detect_accelerate()
+check("T88 detect sets USE_ACCELERATE", USE_ACCELERATE == 0 || USE_ACCELERATE == 1)
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 29: Model info prints without error
+// ═══════════════════════════════════════════════════════════════
+let model8 = mac_model_create(cfg)
+let info_ret = mac_model_info(model8)
+check("T89 model_info returns 0", info_ret == 0)
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 30: W_norm initialized to ones
+// ═══════════════════════════════════════════════════════════════
+let mut norm_ok = true
+for i in 0..cfg.dim {
+    if t_abs(model.W_norm[0][i] - 1.0) > 1.0e-9 {
+        norm_ok = false
+    }
+}
+check("T90 W_norm initialized to ones", norm_ok)
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 31: KV store/get roundtrip
+// ═══════════════════════════════════════════════════════════════
+let _ = mac_kv_init(2, 8, 4)
+let test_k = [1.0, 2.0, 3.0, 4.0]
+let test_v = [5.0, 6.0, 7.0, 8.0]
+let _ = mac_kv_store(0, 0, test_k, test_v)
+let got_k = mac_kv_get_key(0, 0)
+let got_v = mac_kv_get_val(0, 0)
+let mut kv_rt_ok = true
+for i in 0..4 {
+    if t_abs(got_k[i] - test_k[i]) > 1.0e-9 { kv_rt_ok = false }
+    if t_abs(got_v[i] - test_v[i]) > 1.0e-9 { kv_rt_ok = false }
+}
+check("T91 KV store/get roundtrip", kv_rt_ok)
+
+// Store at layer 1, pos 3
+let test_k2 = [10.0, 20.0, 30.0, 40.0]
+let test_v2 = [50.0, 60.0, 70.0, 80.0]
+let _ = mac_kv_store(1, 3, test_k2, test_v2)
+let got_k2 = mac_kv_get_key(1, 3)
+let mut kv_rt2_ok = true
+for i in 0..4 {
+    if t_abs(got_k2[i] - test_k2[i]) > 1.0e-9 { kv_rt2_ok = false }
+}
+check("T92 KV store/get layer=1 pos=3", kv_rt2_ok)
+
+// Original store at (0,0) should still be intact
+let got_k_orig = mac_kv_get_key(0, 0)
+let mut kv_orig_ok = true
+for i in 0..4 {
+    if t_abs(got_k_orig[i] - test_k[i]) > 1.0e-9 { kv_orig_ok = false }
+}
+check("T93 KV store isolation between layers", kv_orig_ok)
+
+// ═══════════════════════════════════════════════════════════════
+//  Summary
+// ═══════════════════════════════════════════════════════════════
+println("")
+println("===================================================================")
+println("  Results: " + to_string(pass_count) + " passed, " + to_string(fail_count) + " failed")
+println("===================================================================")
+if fail_count == 0 {
+    println("ALL PASS")
+} else {
+    println("SOME TESTS FAILED")
+}
+println(to_string(pass_count) + " passed")
