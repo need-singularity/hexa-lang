@@ -1,0 +1,326 @@
+// ===================================================================
+//  self/ml/model_sharding.hexa — Model Sharding & Layer Offload (pure Hexa)
+//
+//  Layer-wise weight offloading for models exceeding single device memory.
+//  Supports GPU<->CPU transfer, async prefetch simulation, and disk mmap.
+//
+//  Public API:
+//    create_shard_config(n_layers, device_mem, total_mem)
+//    shard_plan(config, layer_sizes)  -> placement per layer
+//    create_layer_shard(id, weights, device)
+//    prefetch_next(shards, current_idx) -> loads next layer
+//    offload_layer(shard)              -> moves to CPU
+//    sharded_forward(shards, input, plan)
+//    disk_mmap_load(path, offset, size)
+//    disk_mmap_save(path, data)
+// ===================================================================
+
+// ===================================================================
+//  Device constants
+// ===================================================================
+let SHARD_GPU  = 0
+let SHARD_CPU  = 1
+let SHARD_DISK = 2
+
+fn device_name(dev) {
+    if dev == SHARD_GPU { return "gpu" }
+    if dev == SHARD_CPU { return "cpu" }
+    return "disk"
+}
+
+// ===================================================================
+//  Shard configuration
+// ===================================================================
+
+struct ShardConfig {
+    n_layers: int,
+    gpu_mem: int,
+    cpu_mem: int,
+    disk_enabled: bool
+}
+
+fn create_shard_config(n_layers, gpu_mem, cpu_mem, disk_enabled) {
+    return ShardConfig {
+        n_layers: n_layers,
+        gpu_mem: gpu_mem,
+        cpu_mem: cpu_mem,
+        disk_enabled: disk_enabled
+    }
+}
+
+// ===================================================================
+//  Layer shard: represents one layer's weights + placement
+// ===================================================================
+
+struct LayerShard {
+    id: int,
+    weights: array,
+    device: int,
+    size: int,
+    prefetched: bool
+}
+
+fn create_layer_shard(id, weights, device) {
+    return LayerShard {
+        id: id,
+        weights: weights,
+        device: device,
+        size: len(weights),
+        prefetched: false
+    }
+}
+
+// ===================================================================
+//  Placement planning: decide where each layer lives
+//
+//  Strategy: fill GPU first, then CPU, then disk.
+//  layer_sizes: array of int (param count per layer)
+//  Returns: array of device codes [SHARD_GPU | SHARD_CPU | SHARD_DISK]
+// ===================================================================
+
+fn shard_plan(config, layer_sizes) {
+    let n = len(layer_sizes)
+    let mut plan = []
+    let mut gpu_used = 0
+    let mut cpu_used = 0
+    let mut i = 0
+    while i < n {
+        let sz = layer_sizes[i]
+        if gpu_used + sz <= config.gpu_mem {
+            plan = plan + [SHARD_GPU]
+            gpu_used = gpu_used + sz
+        } else {
+            if cpu_used + sz <= config.cpu_mem {
+                plan = plan + [SHARD_CPU]
+                cpu_used = cpu_used + sz
+            } else {
+                if config.disk_enabled {
+                    plan = plan + [SHARD_DISK]
+                } else {
+                    plan = plan + [SHARD_CPU]
+                    cpu_used = cpu_used + sz
+                }
+            }
+        }
+        i = i + 1
+    }
+    return plan
+}
+
+// Count layers on each device
+fn count_by_device(plan) {
+    let mut gpu = 0
+    let mut cpu = 0
+    let mut disk = 0
+    let n = len(plan)
+    let mut i = 0
+    while i < n {
+        if plan[i] == SHARD_GPU { gpu = gpu + 1 }
+        if plan[i] == SHARD_CPU { cpu = cpu + 1 }
+        if plan[i] == SHARD_DISK { disk = disk + 1 }
+        i = i + 1
+    }
+    return [gpu, cpu, disk]
+}
+
+// ===================================================================
+//  Layer transfer operations
+// ===================================================================
+
+// Simulate moving a shard to GPU (for forward pass)
+fn to_gpu(shard) {
+    return LayerShard {
+        id: shard.id,
+        weights: shard.weights,
+        device: SHARD_GPU,
+        size: shard.size,
+        prefetched: shard.prefetched
+    }
+}
+
+// Offload a shard back to CPU after use
+fn offload_layer(shard) {
+    return LayerShard {
+        id: shard.id,
+        weights: shard.weights,
+        device: SHARD_CPU,
+        size: shard.size,
+        prefetched: false
+    }
+}
+
+// Offload to disk
+fn offload_to_disk(shard) {
+    return LayerShard {
+        id: shard.id,
+        weights: shard.weights,
+        device: SHARD_DISK,
+        size: shard.size,
+        prefetched: false
+    }
+}
+
+// ===================================================================
+//  Async prefetch simulation
+//
+//  Mark the next layer as "prefetched" (simulates async DMA).
+//  In real hardware, this would overlap compute with data transfer.
+// ===================================================================
+
+fn prefetch_next(shards, current_idx) {
+    let n = len(shards)
+    let next_idx = current_idx + 1
+    if next_idx >= n { return shards }
+    let mut result = []
+    let mut i = 0
+    while i < n {
+        if i == next_idx {
+            let s = shards[i]
+            let prefetched_shard = LayerShard {
+                id: s.id,
+                weights: s.weights,
+                device: SHARD_GPU,
+                size: s.size,
+                prefetched: true
+            }
+            result = result + [prefetched_shard]
+        } else {
+            result = result + [shards[i]]
+        }
+        i = i + 1
+    }
+    return result
+}
+
+// ===================================================================
+//  Disk mmap simulation
+//
+//  Simulates memory-mapped file access for large model weights.
+// ===================================================================
+
+struct MmapRegion {
+    data: array,
+    offset: int,
+    size: int
+}
+
+fn disk_mmap_save(data) {
+    return MmapRegion {
+        data: data,
+        offset: 0,
+        size: len(data)
+    }
+}
+
+fn disk_mmap_load(region, offset, size) {
+    let mut out = []
+    let mut i = 0
+    while i < size {
+        let idx = offset + i
+        if idx < len(region.data) {
+            out = out + [region.data[idx]]
+        } else {
+            out = out + [0.0]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Partial load from mmap (window)
+fn disk_mmap_window(region, start, end) {
+    let mut out = []
+    let mut i = start
+    while i < end {
+        if i < len(region.data) {
+            out = out + [region.data[i]]
+        } else {
+            out = out + [0.0]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  Simple linear forward for a single layer shard
+//  out[i] = sum_j weights[i*in_dim + j] * input[j]
+// ===================================================================
+
+fn shard_layer_forward(shard, input, out_dim, in_dim) {
+    let mut output = []
+    let mut i = 0
+    while i < out_dim {
+        let mut s = 0.0
+        let mut j = 0
+        while j < in_dim {
+            s = s + shard.weights[i * in_dim + j] * input[j]
+            j = j + 1
+        }
+        output = output + [s]
+        i = i + 1
+    }
+    return output
+}
+
+// ===================================================================
+//  Sharded forward pass with prefetch
+//
+//  Processes layers sequentially:
+//    1. If current layer not on GPU, move it
+//    2. Prefetch next layer (async simulation)
+//    3. Compute forward
+//    4. Offload current layer back
+// ===================================================================
+
+fn sharded_forward(shards, input, out_dim, in_dim) {
+    let n = len(shards)
+    let mut current_input = input
+    let mut current_shards = shards
+    let mut i = 0
+    while i < n {
+        // Ensure layer is on GPU
+        let s = current_shards[i]
+        let gpu_shard = if s.device != SHARD_GPU { to_gpu(s) } else { s }
+
+        // Prefetch next layer
+        current_shards = prefetch_next(current_shards, i)
+
+        // Forward
+        current_input = shard_layer_forward(gpu_shard, current_input, out_dim, in_dim)
+
+        // Offload current layer back to CPU
+        let mut updated = []
+        let mut j = 0
+        while j < n {
+            if j == i {
+                updated = updated + [offload_layer(gpu_shard)]
+            } else {
+                updated = updated + [current_shards[j]]
+            }
+            j = j + 1
+        }
+        current_shards = updated
+        i = i + 1
+    }
+    return current_input
+}
+
+// ===================================================================
+//  Memory usage estimation
+// ===================================================================
+
+fn estimate_memory(layer_sizes, plan) {
+    let n = len(layer_sizes)
+    let mut gpu_total = 0
+    let mut cpu_total = 0
+    let mut disk_total = 0
+    let mut i = 0
+    while i < n {
+        if plan[i] == SHARD_GPU { gpu_total = gpu_total + layer_sizes[i] }
+        if plan[i] == SHARD_CPU { cpu_total = cpu_total + layer_sizes[i] }
+        if plan[i] == SHARD_DISK { disk_total = disk_total + layer_sizes[i] }
+        i = i + 1
+    }
+    return [gpu_total, cpu_total, disk_total]
+}

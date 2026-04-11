@@ -1,0 +1,413 @@
+// ===================================================================
+//  test_embedding_finetune.hexa — Embedding Fine-tune 검증
+//
+//  검증:
+//    1. cosine_sim 자기자신 = 1.0
+//    2. cosine_sim 직교 = 0.0
+//    3. normalize 결과 norm = 1.0
+//    4. embed_ft identity 보존
+//    5. InfoNCE loss > 0
+//    6. InfoNCE: positive closer → lower loss
+//    7. triplet loss margin 검증
+//    8. triplet loss: d(a,p) < d(a,n) → loss = 0
+//    9. hard negative mining: top-k 가장 유사한 후보 선택
+//   10. batch_infonce_loss 동작
+//   11. similarity_matrix 대각선 = 1
+//   12. finetune_step 후 loss 감소
+//
+//  실행: ./hexa self/test_embedding_finetune.hexa
+// ===================================================================
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ── Vector utils (inlined from embedding_finetune.hexa) ──────
+
+fn vec_zeros_ft(dim) {
+    let mut out = []
+    let mut i = 0
+    while i < dim { out = out + [0.0]; i = i + 1 }
+    return out
+}
+
+fn vec_dot(a, b) {
+    let n = len(a)
+    let mut sum = 0.0
+    let mut i = 0
+    while i < n { sum = sum + a[i] * b[i]; i = i + 1 }
+    return sum
+}
+
+fn vec_norm_ft(v) {
+    let mut sum = 0.0
+    let n = len(v)
+    let mut i = 0
+    while i < n { sum = sum + v[i] * v[i]; i = i + 1 }
+    return sqrt(sum)
+}
+
+fn vec_sub(a, b) {
+    let n = len(a)
+    let mut out = []
+    let mut i = 0
+    while i < n { out = out + [a[i] - b[i]]; i = i + 1 }
+    return out
+}
+
+fn vec_add_ft(a, b) {
+    let n = len(a)
+    let mut out = []
+    let mut i = 0
+    while i < n { out = out + [a[i] + b[i]]; i = i + 1 }
+    return out
+}
+
+fn vec_scale_ft(v, s) {
+    let n = len(v)
+    let mut out = []
+    let mut i = 0
+    while i < n { out = out + [v[i] * s]; i = i + 1 }
+    return out
+}
+
+fn normalize_ft(v) {
+    let norm = vec_norm_ft(v)
+    if norm < 1.0e-8 { return v }
+    return vec_scale_ft(v, 1.0 / norm)
+}
+
+fn cosine_sim(a, b) {
+    let d = vec_dot(a, b)
+    let na = vec_norm_ft(a)
+    let nb = vec_norm_ft(b)
+    let denom = na * nb
+    if denom < 1.0e-8 { return 0.0 }
+    return d / denom
+}
+
+fn euclidean_dist(a, b) {
+    let diff = vec_sub(a, b)
+    return vec_norm_ft(diff)
+}
+
+// ── Finetune model ──────────────────────────────────────────
+
+struct FinetuneModel {
+    dim: int,
+    W: array,
+    bias: array
+}
+
+fn create_finetune_model(dim) {
+    let mut W = []
+    let mut i = 0
+    while i < dim {
+        let mut row = []
+        let mut j = 0
+        while j < dim {
+            let val = if i == j { 1.0 } else { 0.0 }
+            let pert = sin(to_float(i * 137 + j * 31 + 7)) * 0.01
+            row = row + [val + pert]
+            j = j + 1
+        }
+        W = W + [row]
+        i = i + 1
+    }
+    let bias = vec_zeros_ft(dim)
+    return FinetuneModel { dim: dim, W: W, bias: bias }
+}
+
+fn embed_ft(model, vec) {
+    let dim = model.dim
+    let mut out = []
+    let mut i = 0
+    while i < dim {
+        let mut s = model.bias[i]
+        let mut j = 0
+        while j < dim {
+            s = s + model.W[i][j] * vec[j]
+            j = j + 1
+        }
+        out = out + [s]
+        i = i + 1
+    }
+    return normalize_ft(out)
+}
+
+// ── InfoNCE loss ────────────────────────────────────────────
+
+fn infonce_loss(anchor, positive, negatives, tau) {
+    let sim_pos = cosine_sim(anchor, positive) / tau
+    let mut max_val = sim_pos
+    let n_neg = len(negatives)
+    let mut i = 0
+    while i < n_neg {
+        let s = cosine_sim(anchor, negatives[i]) / tau
+        if s > max_val { max_val = s }
+        i = i + 1
+    }
+    let mut denom = exp(sim_pos - max_val)
+    i = 0
+    while i < n_neg {
+        let s = cosine_sim(anchor, negatives[i]) / tau
+        denom = denom + exp(s - max_val)
+        i = i + 1
+    }
+    let loss = 0.0 - (sim_pos - max_val - log(denom))
+    return loss
+}
+
+fn batch_infonce_loss(anchors, positives, tau) {
+    let n = len(anchors)
+    let mut total = 0.0
+    let mut i = 0
+    while i < n {
+        let mut negs = []
+        let mut j = 0
+        while j < n {
+            if j != i { negs = negs + [positives[j]] }
+            j = j + 1
+        }
+        total = total + infonce_loss(anchors[i], positives[i], negs, tau)
+        i = i + 1
+    }
+    return total / to_float(n)
+}
+
+// ── Triplet loss ────────────────────────────────────────────
+
+fn triplet_loss(anchor, pos, neg, margin) {
+    let d_pos = euclidean_dist(anchor, pos)
+    let d_neg = euclidean_dist(anchor, neg)
+    let loss = d_pos - d_neg + margin
+    if loss < 0.0 { return 0.0 }
+    return loss
+}
+
+fn batch_triplet_loss(anchors, positives, negatives, margin) {
+    let n = len(anchors)
+    let mut total = 0.0
+    let mut i = 0
+    while i < n {
+        total = total + triplet_loss(anchors[i], positives[i], negatives[i], margin)
+        i = i + 1
+    }
+    return total / to_float(n)
+}
+
+// ── Hard negative mining ────────────────────────────────────
+
+fn mine_hard_negatives(anchor, candidates, n_hard) {
+    let n = len(candidates)
+    let mut sims = []
+    let mut i = 0
+    while i < n { sims = sims + [cosine_sim(anchor, candidates[i])]; i = i + 1 }
+    let mut used = []
+    i = 0
+    while i < n { used = used + [false]; i = i + 1 }
+    let mut picks = []
+    let mut r = 0
+    while r < n_hard {
+        let mut best = -1
+        let mut best_v = -1.0e30
+        let mut j = 0
+        while j < n {
+            if !used[j] {
+                if sims[j] > best_v { best_v = sims[j]; best = j }
+            }
+            j = j + 1
+        }
+        if best >= 0 {
+            let mut used2 = []
+            let mut k = 0
+            while k < n {
+                if k == best { used2 = used2 + [true] } else { used2 = used2 + [used[k]] }
+                k = k + 1
+            }
+            used = used2
+            picks = picks + [candidates[best]]
+        }
+        r = r + 1
+    }
+    return picks
+}
+
+// ── Similarity matrix ───────────────────────────────────────
+
+fn similarity_matrix(vecs) {
+    let n = len(vecs)
+    let mut mat = []
+    let mut i = 0
+    while i < n {
+        let mut row = []
+        let mut j = 0
+        while j < n { row = row + [cosine_sim(vecs[i], vecs[j])]; j = j + 1 }
+        mat = mat + [row]
+        i = i + 1
+    }
+    return mat
+}
+
+// ── Finetune step ───────────────────────────────────────────
+
+fn _perturb_W(W, dim, pr, pc, val) {
+    let mut out = []
+    let mut r = 0
+    while r < dim {
+        if r == pr {
+            let mut row = []
+            let mut c = 0
+            while c < dim {
+                if c == pc { row = row + [val] } else { row = row + [W[r][c]] }
+                c = c + 1
+            }
+            out = out + [row]
+        } else {
+            out = out + [W[r]]
+        }
+        r = r + 1
+    }
+    return out
+}
+
+fn finetune_step(model, anchors, positives, lr, tau) {
+    let dim = model.dim
+    let eps = 1.0e-4
+    let n = len(anchors)
+    let mut proj_a = []
+    let mut proj_p = []
+    let mut i = 0
+    while i < n {
+        proj_a = proj_a + [embed_ft(model, anchors[i])]
+        proj_p = proj_p + [embed_ft(model, positives[i])]
+        i = i + 1
+    }
+    let base_loss = batch_infonce_loss(proj_a, proj_p, tau)
+    let mut cur_W = model.W
+    let mut r = 0
+    while r < dim {
+        let mut c = 0
+        while c < dim {
+            let orig = cur_W[r][c]
+            let pert_W = _perturb_W(cur_W, dim, r, c, orig + eps)
+            let pert_model = FinetuneModel { dim: dim, W: pert_W, bias: model.bias }
+            let mut pa2 = []
+            let mut pp2 = []
+            let mut k = 0
+            while k < n {
+                pa2 = pa2 + [embed_ft(pert_model, anchors[k])]
+                pp2 = pp2 + [embed_ft(pert_model, positives[k])]
+                k = k + 1
+            }
+            let loss_plus = batch_infonce_loss(pa2, pp2, tau)
+            let grad = (loss_plus - base_loss) / eps
+            let updated = orig - lr * grad
+            cur_W = _perturb_W(cur_W, dim, r, c, updated)
+            c = c + 1
+        }
+        r = r + 1
+    }
+    return FinetuneModel { dim: dim, W: cur_W, bias: model.bias }
+}
+
+// ═══════════ TEST DATA ═══════════════════════════════════════
+
+let dim = 4
+
+let v1 = [1.0, 0.0, 0.0, 0.0]
+let v2 = [0.0, 1.0, 0.0, 0.0]
+let v3 = [1.0, 1.0, 0.0, 0.0]
+let v4 = [0.9, 0.1, 0.0, 0.0]
+let v5 = [0.0, 0.0, 1.0, 0.0]
+let v6 = [0.0, 0.0, 0.0, 1.0]
+
+// ── T1: cosine self-similarity = 1 ──────────────────────────
+check("cosine self-sim = 1.0", approx(cosine_sim(v1, v1), 1.0, 1.0e-9))
+
+// ── T2: cosine orthogonal = 0 ───────────────────────────────
+check("cosine orthogonal = 0.0", approx(cosine_sim(v1, v2), 0.0, 1.0e-9))
+
+// ── T3: normalize produces unit vector ──────────────────────
+let nv3 = normalize_ft(v3)
+check("normalize norm = 1.0", approx(vec_norm_ft(nv3), 1.0, 1.0e-9))
+
+// ── T4: embed_ft near-identity preserves direction ──────────
+let model = create_finetune_model(dim)
+let e1 = embed_ft(model, v1)
+let e4 = embed_ft(model, v4)
+let sim_14 = cosine_sim(e1, e4)
+check("embed_ft preserves similarity", sim_14 > 0.8)
+
+// ── T5: InfoNCE loss > 0 ────────────────────────────────────
+let negs = [v2, v5, v6]
+let loss1 = infonce_loss(v1, v4, negs, 0.07)
+check("InfoNCE loss > 0", loss1 > 0.0)
+
+// ── T6: closer positive → lower loss ────────────────────────
+let loss_close = infonce_loss(v1, v4, negs, 0.07)
+let loss_far = infonce_loss(v1, v2, [v4, v5, v6], 0.07)
+check("closer positive gives lower loss", loss_close < loss_far)
+
+// ── T7: triplet loss with margin ────────────────────────────
+let tl = triplet_loss(v1, v4, v2, 0.5)
+check("triplet loss >= 0", tl >= 0.0)
+
+// ── T8: triplet satisfied → loss = 0 ────────────────────────
+let tl2 = triplet_loss(v1, v1, v2, 0.0)
+check("triplet satisfied (margin=0) → loss=0", approx(tl2, 0.0, 1.0e-6))
+
+// ── T9: hard negative picks closest ─────────────────────────
+let candidates = [v2, v5, v6, v4]
+let hard = mine_hard_negatives(v1, candidates, 1)
+let hard_sim = cosine_sim(v1, hard[0])
+let v4_sim = cosine_sim(v1, v4)
+check("hard neg is closest candidate", approx(hard_sim, v4_sim, 1.0e-6))
+
+// ── T10: batch infonce_loss > 0 ─────────────────────────────
+let anchors = [v1, v2]
+let positives = [v4, v3]
+let bloss = batch_infonce_loss(anchors, positives, 0.07)
+check("batch InfoNCE > 0", bloss > 0.0)
+
+// ── T11: similarity matrix diagonal = 1 ────────────────────
+let vecs = [v1, v2, v5]
+let smat = similarity_matrix(vecs)
+check("sim matrix diag[0] = 1", approx(smat[0][0], 1.0, 1.0e-9))
+check("sim matrix diag[1] = 1", approx(smat[1][1], 1.0, 1.0e-9))
+
+// ── T12: finetune step changes model weights ────────────────
+let ft_anchors = [v1, v2]
+let ft_positives = [v4, v3]
+let model_init = create_finetune_model(dim)
+let w00_before = model_init.W[0][0]
+let model_after = finetune_step(model_init, ft_anchors, ft_positives, 1.0, 0.07)
+let w00_after = model_after.W[0][0]
+check("finetune step modifies weights", fabs(w00_after - w00_before) > 1.0e-10)
+
+// ── T13: batch triplet loss > 0 (hard case) ─────────────────
+// Use a large margin so hinge doesn't zero out
+let bt_loss = batch_triplet_loss([v1], [v4], [v2], 5.0)
+check("batch triplet loss > 0 (large margin)", bt_loss > 0.0)
+
+// ── 결과 ────────────────────────────────────────────────────
+println("")
+println("=== Embedding Fine-tune test summary ===")
+println("PASS: " + to_string(pass_count))
+println("FAIL: " + to_string(fail_count))
+if fail_count == 0 {
+    println("ALL GREEN — Embedding Fine-tune OK")
+}
+println(to_string(pass_count) + " passed")

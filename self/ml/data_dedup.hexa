@@ -1,0 +1,352 @@
+// ===================================================================
+//  self/ml/data_dedup.hexa — Data Deduplication via MinHash/LSH (pure Hexa)
+//
+//  Near-duplicate detection and removal for training data quality.
+//  Uses MinHash signatures with LSH banding for efficient clustering.
+//
+//  Public API:
+//    k_shingle(text, k)                   -> set of k-char shingles
+//    minhash_signature(shingles, n_hashes) -> signature array
+//    lsh_buckets(sig, bands, rows)         -> bucket keys per band
+//    lsh_candidates(sigs, bands, rows)     -> candidate pairs
+//    jaccard_similarity(a, b)             -> float [0, 1]
+//    minhash_jaccard(sig_a, sig_b)        -> approx jaccard
+//    cluster_near_duplicates(texts, k, n_hashes, bands, rows, threshold)
+//    dedup_filter(texts, k, n_hashes, bands, rows, threshold) -> unique texts
+//    simple_hash(str)                     -> int
+//    hash_family(shingle, seed)           -> int
+// ===================================================================
+
+// ===================================================================
+//  Hash utilities
+// ===================================================================
+
+// Simple string hash (DJB2 variant)
+fn simple_hash(s) {
+    let n = len(s)
+    let mut h = 5381
+    let mut i = 0
+    while i < n {
+        let c = char_code(s, i)
+        h = h * 33 + c
+        if h > 1000000000 { h = h % 1000000007 }
+        if h < -1000000000 { h = (0 - h) % 1000000007 }
+        i = i + 1
+    }
+    if h < 0 { h = 0 - h }
+    return h
+}
+
+// Hash family: produces different hashes with different seeds
+// Uses (a * hash + b) mod p scheme
+fn hash_family(shingle_hash, seed) {
+    let a = seed * 1103515245 + 12345
+    let b = seed * 214013 + 2531011
+    let p = 1000000007
+    let mut h = a * shingle_hash + b
+    if h < 0 { h = 0 - h }
+    h = h % p
+    return h
+}
+
+// ===================================================================
+//  K-shingling: extract character n-grams from text
+// ===================================================================
+
+fn k_shingle(text, k) {
+    let n = len(text)
+    let mut shingles = []
+    if n < k { return [text] }
+    let mut i = 0
+    while i < n - k + 1 {
+        let mut s = ""
+        let mut j = 0
+        while j < k {
+            let ch = text[i + j]
+            s = s + ch
+            j = j + 1
+        }
+        // Check if already in shingles (set dedup)
+        let mut found = false
+        let mut si = 0
+        while si < len(shingles) {
+            if shingles[si] == s { found = true }
+            si = si + 1
+        }
+        if !found {
+            shingles = shingles + [s]
+        }
+        i = i + 1
+    }
+    return shingles
+}
+
+// ===================================================================
+//  MinHash signature
+//
+//  For each hash function h_i, the MinHash value is:
+//    min { h_i(shingle) for shingle in shingles }
+//
+//  n_hashes = number of hash functions = signature length
+// ===================================================================
+
+fn minhash_signature(shingles, n_hashes) {
+    let n_sh = len(shingles)
+    let mut sig = []
+    let mut hi = 0
+    while hi < n_hashes {
+        let mut min_val = 2000000000
+        let mut si = 0
+        while si < n_sh {
+            let sh = simple_hash(shingles[si])
+            let hv = hash_family(sh, hi + 1)
+            if hv < min_val { min_val = hv }
+            si = si + 1
+        }
+        sig = sig + [min_val]
+        hi = hi + 1
+    }
+    return sig
+}
+
+// ===================================================================
+//  Exact Jaccard similarity between two shingle sets
+// ===================================================================
+
+fn jaccard_similarity(set_a, set_b) {
+    let na = len(set_a)
+    let nb = len(set_b)
+    // Count intersection
+    let mut inter = 0
+    let mut i = 0
+    while i < na {
+        let mut j = 0
+        while j < nb {
+            if set_a[i] == set_b[j] { inter = inter + 1 }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    // Union = |A| + |B| - |A ∩ B|
+    let union = na + nb - inter
+    if union == 0 { return 1.0 }
+    return to_float(inter) / to_float(union)
+}
+
+// ===================================================================
+//  MinHash-based approximate Jaccard similarity
+//  = fraction of positions where sig_a[i] == sig_b[i]
+// ===================================================================
+
+fn minhash_jaccard(sig_a, sig_b) {
+    let n = len(sig_a)
+    let mut agree = 0
+    let mut i = 0
+    while i < n {
+        if sig_a[i] == sig_b[i] { agree = agree + 1 }
+        i = i + 1
+    }
+    return to_float(agree) / to_float(n)
+}
+
+// ===================================================================
+//  LSH banding
+//
+//  Split signature into `bands` bands of `rows` rows each.
+//  Two documents are candidates if they share a bucket in ANY band.
+//  Each band produces a bucket key = hash of the rows in that band.
+// ===================================================================
+
+fn lsh_band_key(sig, band_idx, rows) {
+    let start = band_idx * rows
+    let mut h = 0
+    let mut i = 0
+    while i < rows {
+        let idx = start + i
+        if idx < len(sig) {
+            h = h * 31 + sig[idx]
+            if h > 1000000000 { h = h % 1000000007 }
+            if h < -1000000000 { h = (0 - h) % 1000000007 }
+        }
+        i = i + 1
+    }
+    if h < 0 { h = 0 - h }
+    return h
+}
+
+fn lsh_buckets(sig, bands, rows) {
+    let mut keys = []
+    let mut b = 0
+    while b < bands {
+        keys = keys + [lsh_band_key(sig, b, rows)]
+        b = b + 1
+    }
+    return keys
+}
+
+// ===================================================================
+//  LSH candidate pair detection
+//
+//  Given array of signatures, find all (i, j) pairs that share
+//  at least one band bucket key.
+// ===================================================================
+
+fn lsh_candidates(sigs, bands, rows) {
+    let n = len(sigs)
+    // Compute bucket keys for all documents
+    let mut all_keys = []
+    let mut i = 0
+    while i < n {
+        all_keys = all_keys + [lsh_buckets(sigs[i], bands, rows)]
+        i = i + 1
+    }
+    // Find candidate pairs (brute-force over bands)
+    let mut pairs = []
+    i = 0
+    while i < n {
+        let mut j = i + 1
+        while j < n {
+            let mut match_found = false
+            let mut b = 0
+            while b < bands {
+                if all_keys[i][b] == all_keys[j][b] {
+                    match_found = true
+                }
+                b = b + 1
+            }
+            if match_found {
+                pairs = pairs + [[i, j]]
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return pairs
+}
+
+// ===================================================================
+//  Near-duplicate clustering
+//
+//  Uses Union-Find to group near-duplicate documents.
+//  Returns array of cluster IDs (one per document).
+// ===================================================================
+
+fn uf_find(parent, x) {
+    let mut cur = x
+    while parent[cur] != cur {
+        cur = parent[cur]
+    }
+    return cur
+}
+
+fn uf_union(parent, a, b) {
+    let ra = uf_find(parent, a)
+    let rb = uf_find(parent, b)
+    if ra != rb {
+        // Path compression: point smaller to larger
+        if ra < rb {
+            parent[rb] = ra
+        } else {
+            parent[ra] = rb
+        }
+    }
+    return parent
+}
+
+fn cluster_near_duplicates(texts, k, n_hashes, bands, rows, threshold) {
+    let n = len(texts)
+    // Step 1: Shingle each document
+    let mut shingle_sets = []
+    let mut i = 0
+    while i < n {
+        shingle_sets = shingle_sets + [k_shingle(texts[i], k)]
+        i = i + 1
+    }
+    // Step 2: MinHash signatures
+    let mut sigs = []
+    i = 0
+    while i < n {
+        sigs = sigs + [minhash_signature(shingle_sets[i], n_hashes)]
+        i = i + 1
+    }
+    // Step 3: LSH candidate pairs
+    let candidates = lsh_candidates(sigs, bands, rows)
+
+    // Step 4: Union-Find with threshold verification
+    let mut parent = []
+    i = 0
+    while i < n {
+        parent = parent + [i]
+        i = i + 1
+    }
+    let n_cand = len(candidates)
+    i = 0
+    while i < n_cand {
+        let a = candidates[i][0]
+        let b = candidates[i][1]
+        let sim = minhash_jaccard(sigs[a], sigs[b])
+        if sim >= threshold {
+            parent = uf_union(parent, a, b)
+        }
+        i = i + 1
+    }
+    // Flatten parents to cluster IDs
+    let mut clusters = []
+    i = 0
+    while i < n {
+        clusters = clusters + [uf_find(parent, i)]
+        i = i + 1
+    }
+    return clusters
+}
+
+// ===================================================================
+//  Dedup filter: keep only one representative per cluster
+// ===================================================================
+
+fn dedup_filter(texts, k, n_hashes, bands, rows, threshold) {
+    let clusters = cluster_near_duplicates(texts, k, n_hashes, bands, rows, threshold)
+    let n = len(texts)
+    let mut seen = []
+    let mut result = []
+    let mut i = 0
+    while i < n {
+        let cid = clusters[i]
+        // Check if cluster already seen
+        let mut found = false
+        let mut j = 0
+        while j < len(seen) {
+            if seen[j] == cid { found = true }
+            j = j + 1
+        }
+        if !found {
+            seen = seen + [cid]
+            result = result + [texts[i]]
+        }
+        i = i + 1
+    }
+    return result
+}
+
+// ===================================================================
+//  Count unique clusters
+// ===================================================================
+
+fn count_clusters(clusters) {
+    let n = len(clusters)
+    let mut unique = []
+    let mut i = 0
+    while i < n {
+        let mut found = false
+        let mut j = 0
+        while j < len(unique) {
+            if unique[j] == clusters[i] { found = true }
+            j = j + 1
+        }
+        if !found {
+            unique = unique + [clusters[i]]
+        }
+        i = i + 1
+    }
+    return len(unique)
+}

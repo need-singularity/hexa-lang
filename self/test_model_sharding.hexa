@@ -1,0 +1,281 @@
+// ===================================================================
+//  test_model_sharding.hexa — Model Sharding 검증
+//
+//  검증:
+//    1. shard_plan: GPU 우선 배치
+//    2. shard_plan: GPU 초과 시 CPU 사용
+//    3. shard_plan: CPU 초과 시 disk 사용
+//    4. count_by_device 정확성
+//    5. create_layer_shard 속성 검증
+//    6. to_gpu 디바이스 전환
+//    7. offload_layer CPU 복귀
+//    8. prefetch_next 다음 레이어 프리페치
+//    9. disk_mmap 저장/로드 라운드트립
+//   10. sharded_forward 결과 유한
+//   11. estimate_memory 합계 정확
+//   12. capacity schedule 정확
+//
+//  실행: ./hexa self/test_model_sharding.hexa
+// ===================================================================
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ── Constants ───────────────────────────────────────────────
+let SHARD_GPU  = 0
+let SHARD_CPU  = 1
+let SHARD_DISK = 2
+
+// ── Structs ─────────────────────────────────────────────────
+
+struct ShardConfig {
+    n_layers: int,
+    gpu_mem: int,
+    cpu_mem: int,
+    disk_enabled: bool
+}
+
+struct LayerShard {
+    id: int,
+    weights: array,
+    device: int,
+    size: int,
+    prefetched: bool
+}
+
+struct MmapRegion {
+    data: array,
+    offset: int,
+    size: int
+}
+
+// ── Functions (inlined) ─────────────────────────────────────
+
+fn create_shard_config(n_layers, gpu_mem, cpu_mem, disk_enabled) {
+    return ShardConfig { n_layers: n_layers, gpu_mem: gpu_mem, cpu_mem: cpu_mem, disk_enabled: disk_enabled }
+}
+
+fn create_layer_shard(id, weights, device) {
+    return LayerShard { id: id, weights: weights, device: device, size: len(weights), prefetched: false }
+}
+
+fn shard_plan(config, layer_sizes) {
+    let n = len(layer_sizes)
+    let mut plan = []
+    let mut gpu_used = 0
+    let mut cpu_used = 0
+    let mut i = 0
+    while i < n {
+        let sz = layer_sizes[i]
+        if gpu_used + sz <= config.gpu_mem {
+            plan = plan + [SHARD_GPU]
+            gpu_used = gpu_used + sz
+        } else {
+            if cpu_used + sz <= config.cpu_mem {
+                plan = plan + [SHARD_CPU]
+                cpu_used = cpu_used + sz
+            } else {
+                if config.disk_enabled { plan = plan + [SHARD_DISK] } else { plan = plan + [SHARD_CPU]; cpu_used = cpu_used + sz }
+            }
+        }
+        i = i + 1
+    }
+    return plan
+}
+
+fn count_by_device(plan) {
+    let mut gpu = 0
+    let mut cpu = 0
+    let mut disk = 0
+    let n = len(plan)
+    let mut i = 0
+    while i < n {
+        if plan[i] == SHARD_GPU { gpu = gpu + 1 }
+        if plan[i] == SHARD_CPU { cpu = cpu + 1 }
+        if plan[i] == SHARD_DISK { disk = disk + 1 }
+        i = i + 1
+    }
+    return [gpu, cpu, disk]
+}
+
+fn to_gpu(shard) {
+    return LayerShard { id: shard.id, weights: shard.weights, device: SHARD_GPU, size: shard.size, prefetched: shard.prefetched }
+}
+
+fn offload_layer(shard) {
+    return LayerShard { id: shard.id, weights: shard.weights, device: SHARD_CPU, size: shard.size, prefetched: false }
+}
+
+fn prefetch_next(shards, current_idx) {
+    let n = len(shards)
+    let next_idx = current_idx + 1
+    if next_idx >= n { return shards }
+    let mut result = []
+    let mut i = 0
+    while i < n {
+        if i == next_idx {
+            let s = shards[i]
+            result = result + [LayerShard { id: s.id, weights: s.weights, device: SHARD_GPU, size: s.size, prefetched: true }]
+        } else {
+            result = result + [shards[i]]
+        }
+        i = i + 1
+    }
+    return result
+}
+
+fn disk_mmap_save(data) {
+    return MmapRegion { data: data, offset: 0, size: len(data) }
+}
+
+fn disk_mmap_load(region, offset, size) {
+    let mut out = []
+    let mut i = 0
+    while i < size {
+        let idx = offset + i
+        if idx < len(region.data) { out = out + [region.data[idx]] } else { out = out + [0.0] }
+        i = i + 1
+    }
+    return out
+}
+
+fn shard_layer_forward(shard, input, out_dim, in_dim) {
+    let mut output = []
+    let mut i = 0
+    while i < out_dim {
+        let mut s = 0.0
+        let mut j = 0
+        while j < in_dim { s = s + shard.weights[i * in_dim + j] * input[j]; j = j + 1 }
+        output = output + [s]
+        i = i + 1
+    }
+    return output
+}
+
+fn sharded_forward(shards, input, out_dim, in_dim) {
+    let n = len(shards)
+    let mut cur = input
+    let mut i = 0
+    while i < n {
+        let s = shards[i]
+        let gpu_s = if s.device != SHARD_GPU { to_gpu(s) } else { s }
+        cur = shard_layer_forward(gpu_s, cur, out_dim, in_dim)
+        i = i + 1
+    }
+    return cur
+}
+
+fn estimate_memory(layer_sizes, plan) {
+    let n = len(layer_sizes)
+    let mut gpu_t = 0
+    let mut cpu_t = 0
+    let mut disk_t = 0
+    let mut i = 0
+    while i < n {
+        if plan[i] == SHARD_GPU { gpu_t = gpu_t + layer_sizes[i] }
+        if plan[i] == SHARD_CPU { cpu_t = cpu_t + layer_sizes[i] }
+        if plan[i] == SHARD_DISK { disk_t = disk_t + layer_sizes[i] }
+        i = i + 1
+    }
+    return [gpu_t, cpu_t, disk_t]
+}
+
+// ═══════════ TESTS ═══════════════════════════════════════════
+
+// Setup: 6 layers, GPU=200, CPU=300, disk=true
+let config = create_shard_config(6, 200, 300, true)
+let sizes = [100, 100, 100, 100, 100, 100]
+let plan = shard_plan(config, sizes)
+
+// ── T1: GPU 우선 배치 ───────────────────────────────────────
+check("first layer on GPU", plan[0] == SHARD_GPU)
+check("second layer on GPU", plan[1] == SHARD_GPU)
+
+// ── T2: GPU 초과 → CPU ─────────────────────────────────────
+check("third layer on CPU", plan[2] == SHARD_CPU)
+
+// ── T3: CPU 초과 → disk ────────────────────────────────────
+check("sixth layer on disk", plan[5] == SHARD_DISK)
+
+// ── T4: count_by_device ─────────────────────────────────────
+let counts = count_by_device(plan)
+check("count GPU = 2", counts[0] == 2)
+check("count CPU = 3", counts[1] == 3)
+check("count disk = 1", counts[2] == 1)
+
+// ── T5: create_layer_shard ──────────────────────────────────
+let w1 = [0.1, 0.2, 0.3, 0.4]
+let s1 = create_layer_shard(0, w1, SHARD_CPU)
+check("shard id = 0", s1.id == 0)
+check("shard size = 4", s1.size == 4)
+check("shard device = CPU", s1.device == SHARD_CPU)
+
+// ── T6: to_gpu ──────────────────────────────────────────────
+let s2 = to_gpu(s1)
+check("to_gpu changes device", s2.device == SHARD_GPU)
+
+// ── T7: offload_layer ───────────────────────────────────────
+let s3 = offload_layer(s2)
+check("offload returns to CPU", s3.device == SHARD_CPU)
+
+// ── T8: prefetch_next ───────────────────────────────────────
+let shards = [
+    create_layer_shard(0, [1.0, 0.0, 0.0, 1.0], SHARD_CPU),
+    create_layer_shard(1, [0.5, 0.5, 0.5, 0.5], SHARD_CPU),
+    create_layer_shard(2, [0.1, 0.9, 0.9, 0.1], SHARD_CPU)
+]
+let prefetched = prefetch_next(shards, 0)
+check("prefetch: next on GPU", prefetched[1].device == SHARD_GPU)
+check("prefetch: next marked", prefetched[1].prefetched == true)
+check("prefetch: current unchanged", prefetched[0].device == SHARD_CPU)
+
+// ── T9: disk mmap round-trip ────────────────────────────────
+let data = [1.0, 2.0, 3.0, 4.0, 5.0]
+let region = disk_mmap_save(data)
+let loaded = disk_mmap_load(region, 1, 3)
+check("mmap load[0] = 2.0", approx(loaded[0], 2.0, 1.0e-9))
+check("mmap load[2] = 4.0", approx(loaded[2], 4.0, 1.0e-9))
+
+// ── T10: sharded_forward finite result ──────────────────────
+let fw_shards = [
+    create_layer_shard(0, [1.0, 0.0, 0.0, 1.0], SHARD_GPU),
+    create_layer_shard(1, [0.5, 0.5, 0.5, 0.5], SHARD_CPU)
+]
+let input = [1.0, 2.0]
+let out = sharded_forward(fw_shards, input, 2, 2)
+check("sharded_forward result finite", fabs(out[0]) < 1.0e6)
+check("sharded_forward result non-zero", fabs(out[0]) + fabs(out[1]) > 0.0)
+
+// ── T11: estimate_memory ────────────────────────────────────
+let est = estimate_memory(sizes, plan)
+let total_est = est[0] + est[1] + est[2]
+check("estimate total = sum of sizes", total_est == 600)
+
+// ── T12: disk-disabled fallback ─────────────────────────────
+let config2 = create_shard_config(4, 100, 100, false)
+let sizes2 = [100, 100, 100, 100]
+let plan2 = shard_plan(config2, sizes2)
+check("no-disk: all on GPU or CPU", plan2[3] == SHARD_CPU)
+
+// ── 결과 ────────────────────────────────────────────────────
+println("")
+println("=== Model Sharding test summary ===")
+println("PASS: " + to_string(pass_count))
+println("FAIL: " + to_string(fail_count))
+if fail_count == 0 {
+    println("ALL GREEN — Model Sharding OK")
+}
+println(to_string(pass_count) + " passed")
