@@ -1,0 +1,491 @@
+// ═══════════════════════════════════════════════════════════════════
+//  fsdp.hexa — Fully Sharded Data Parallel (PyTorch FSDP 스타일)
+//
+//  PyTorch FSDP idiom in pure hexa:
+//    - weight shard across N ranks (균등 분할)
+//    - forward:
+//        1. all-gather full weight
+//        2. compute (matmul)
+//        3. free full weight, keep only local shard
+//    - backward:
+//        1. all-gather full weight
+//        2. compute full gradient
+//        3. reduce-scatter gradient → each rank owns shard
+//        4. free full weight, free full grad
+//    - CPU offload (sharded state를 CPU로 이동)
+//    - mixed precision (FP16 compute, FP32 master shard)
+//    - wrap policy (layer 단위 shard, 최소 파라미터 threshold)
+//
+//  참조:
+//    - self/ml/distributed.hexa     — ring allreduce primitives
+//    - self/ml/model_sharding.hexa  — disk/CPU offload 패턴
+//    - self/ml/mixed_precision.hexa — FP16 sim + master FP32
+//    - self/ml/zero_shard.hexa      — shard boundary helpers
+//
+//  수치 동치:
+//    FSDP N-way forward/backward == single rank forward/backward
+//    (동일 입력, float round-off 허용오차 < 1e-9)
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Device constants ───────────────────────────────────────────────
+let FSDP_DEV_GPU = 0
+let FSDP_DEV_CPU = 1
+
+// ── FP16 range constants ───────────────────────────────────────────
+let FSDP_FP16_MAX = 65504.0
+let FSDP_FP16_MIN_POS = 0.00006103515625
+
+// ═══════════════════════════════════════════════════════════════════
+//  Shard 경계 계산 (zero_shard와 동일한 공식: 균등 분할)
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn fsdp_shard_begin(total_d, num_ranks, rank) {
+    return (total_d * rank) / num_ranks
+}
+
+@pure
+fn fsdp_shard_end(total_d, num_ranks, rank) {
+    return (total_d * (rank + 1)) / num_ranks
+}
+
+@pure
+fn fsdp_shard_size(total_d, num_ranks, rank) {
+    return fsdp_shard_end(total_d, num_ranks, rank) - fsdp_shard_begin(total_d, num_ranks, rank)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  FP16 simulation (mixed precision.hexa 와 동일 로직)
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn fsdp_fp16_cast(val) {
+    if val == 0.0 { return 0.0 }
+    let mut v = val
+    let mut neg = false
+    if v < 0.0 { neg = true; v = 0.0 - v }
+    if v > FSDP_FP16_MAX {
+        if neg { return 0.0 - FSDP_FP16_MAX }
+        return FSDP_FP16_MAX
+    }
+    if v < FSDP_FP16_MIN_POS { return 0.0 }
+    // Truncate mantissa to 10 bits of precision (simple quantization)
+    let mut exp = 0
+    let mut m = v
+    if m >= 2.0 {
+        while m >= 2.0 { m = m / 2.0; exp = exp + 1 }
+    } else {
+        while m < 1.0 { m = m * 2.0; exp = exp - 1 }
+    }
+    let frac = m - 1.0
+    let mant10 = to_int(frac * 1024.0 + 0.5)
+    let mut mc = mant10
+    if mc > 1023 { mc = 1023 }
+    let mut scale = 1.0
+    if exp >= 0 {
+        for _e in 0..exp { scale = scale * 2.0 }
+    } else {
+        let neg_exp = 0 - exp
+        for _e in 0..neg_exp { scale = scale / 2.0 }
+    }
+    let result = (1.0 + to_float(mc) / 1024.0) * scale
+    if neg { return 0.0 - result }
+    return result
+}
+
+@pure
+fn fsdp_array_to_fp16(arr) {
+    let n = len(arr)
+    let mut out = []
+    for i in 0..n { out = out + [fsdp_fp16_cast(arr[i])] }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  FSDP state 구조체
+//
+//  rank_shards[k]     : rank k가 소유한 FP32 master weight shard
+//  rank_fp16_shards[k]: rank k가 소유한 FP16 compute shard (mixed precision 시)
+//  num_ranks          : 샤드 개수
+//  total_d            : full parameter size
+//  cpu_offload        : true면 shard가 CPU에 올라감 (공식 시뮬)
+//  mixed_precision    : true면 fp16_shards 사용
+//  device_of_shard[k] : CPU/GPU 표시 (offload 시뮬)
+// ═══════════════════════════════════════════════════════════════════
+
+struct FSDPState {
+    rank_shards: array,
+    rank_fp16_shards: array,
+    num_ranks: int,
+    total_d: int,
+    cpu_offload: bool,
+    mixed_precision: bool,
+    device_of_shard: array
+}
+
+// ── Initializer ────────────────────────────────────────────────────
+fn fsdp_init(full_weights, num_ranks, cpu_offload, mixed_precision) {
+    let total_d = len(full_weights)
+    let mut shards = []
+    let mut fp16_shards = []
+    let mut devices = []
+    for k in 0..num_ranks {
+        let beg = fsdp_shard_begin(total_d, num_ranks, k)
+        let end = fsdp_shard_end(total_d, num_ranks, k)
+        let mut shard = []
+        for i in beg..end { shard = shard + [full_weights[i]] }
+        shards = shards + [shard]
+        if mixed_precision {
+            fp16_shards = fp16_shards + [fsdp_array_to_fp16(shard)]
+        } else {
+            fp16_shards = fp16_shards + [[]]
+        }
+        if cpu_offload {
+            devices = devices + [FSDP_DEV_CPU]
+        } else {
+            devices = devices + [FSDP_DEV_GPU]
+        }
+    }
+    return FSDPState {
+        rank_shards: shards,
+        rank_fp16_shards: fp16_shards,
+        num_ranks: num_ranks,
+        total_d: total_d,
+        cpu_offload: cpu_offload,
+        mixed_precision: mixed_precision,
+        device_of_shard: devices
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  All-gather: 모든 rank의 shard를 합쳐서 full weight 복원
+//  (real: NCCL allgather; 여기선 rank_shards를 순차 연결)
+// ═══════════════════════════════════════════════════════════════════
+fn fsdp_all_gather(state) {
+    let n = state.num_ranks
+    let mut full = []
+    for k in 0..n {
+        let shard = state.rank_shards[k]
+        let sz = len(shard)
+        // if CPU offload, simulate H2D copy by reading from CPU shard
+        for j in 0..sz { full = full + [shard[j]] }
+    }
+    return full
+}
+
+// FP16 all-gather (mixed precision forward/backward 시 사용)
+fn fsdp_all_gather_fp16(state) {
+    let n = state.num_ranks
+    let mut full = []
+    for k in 0..n {
+        let shard = state.rank_fp16_shards[k]
+        let sz = len(shard)
+        for j in 0..sz { full = full + [shard[j]] }
+    }
+    return full
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Reduce-scatter: full gradient를 N개로 나눠 각 rank에 합계 분산
+//  (real: NCCL reduce_scatter; 여기선 동일 rank 가정 → sum/N == grad)
+//
+//  input  : full_grad_per_rank[rank][i] — 각 rank가 계산한 full grad
+//  output : array of N arrays, result[k] = rank k가 소유한 shard 구간의
+//           grad sum
+// ═══════════════════════════════════════════════════════════════════
+fn fsdp_reduce_scatter(full_grads_per_rank, num_ranks, total_d) {
+    let mut out = []
+    for k in 0..num_ranks {
+        let beg = fsdp_shard_begin(total_d, num_ranks, k)
+        let end = fsdp_shard_end(total_d, num_ranks, k)
+        let mut local = []
+        for i in beg..end {
+            let mut acc = 0.0
+            for r in 0..num_ranks {
+                let grad_r = full_grads_per_rank[r]
+                acc = acc + grad_r[i]
+            }
+            local = local + [acc]
+        }
+        out = out + [local]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  FSDP Forward
+//
+//  1. all-gather full weight (CPU offload면 H2D 먼저)
+//  2. compute: y[i] = w[i] * x[i]  (element-wise demo, matmul 대응)
+//  3. free full weight (각 rank는 shard만 유지)
+//
+//  반환: forward output (full length)
+// ═══════════════════════════════════════════════════════════════════
+fn fsdp_forward(state, input) {
+    let full_w = fsdp_all_gather(state)
+    let n = len(full_w)
+    let m = len(input)
+    let sz = if n < m { n } else { m }
+    let mut out = []
+    if state.mixed_precision {
+        let fp16_w = fsdp_all_gather_fp16(state)
+        for i in 0..sz {
+            let wi = fsdp_fp16_cast(fp16_w[i])
+            let xi = fsdp_fp16_cast(input[i])
+            out = out + [fsdp_fp16_cast(wi * xi)]
+        }
+    } else {
+        for i in 0..sz { out = out + [full_w[i] * input[i]] }
+    }
+    // free full_w — in real code, drop reference; here simulator no-op
+    return out
+}
+
+// Single-rank reference forward (동치 검증용)
+fn fsdp_single_rank_forward(full_weights, input) {
+    let n = len(full_weights)
+    let m = len(input)
+    let sz = if n < m { n } else { m }
+    let mut out = []
+    for i in 0..sz { out = out + [full_weights[i] * input[i]] }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  FSDP Backward
+//
+//  Forward: y[i] = w[i] * x[i]
+//  dL/dw[i] = dL/dy[i] * x[i]
+//
+//  1. all-gather full weight
+//  2. 각 rank에서 local full gradient 계산 (여기선 동일)
+//  3. reduce-scatter: 각 rank가 자기 shard 구간 grad 합계 수신
+//  4. free full weight, free full grad
+//
+//  반환: array of N shard-grads (각 rank가 소유)
+// ═══════════════════════════════════════════════════════════════════
+fn fsdp_backward(state, input, grad_output) {
+    let _ = fsdp_all_gather(state)  // w gathered (free 생략 시뮬)
+    let d = state.total_d
+    let n = state.num_ranks
+    let m = len(input)
+    let g = len(grad_output)
+    let sz = if d < m { d } else { m }
+    let sz2 = if sz < g { sz } else { g }
+
+    // 각 rank가 동일 입력으로 full grad 계산 (data parallel + sharded)
+    let mut full_grads_per_rank = []
+    for _r in 0..n {
+        let mut grad_w = []
+        for i in 0..d {
+            if i < sz2 {
+                grad_w = grad_w + [grad_output[i] * input[i]]
+            } else {
+                grad_w = grad_w + [0.0]
+            }
+        }
+        full_grads_per_rank = full_grads_per_rank + [grad_w]
+    }
+
+    // reduce-scatter → 각 rank의 shard grad
+    let shard_grads = fsdp_reduce_scatter(full_grads_per_rank, n, d)
+    // free full weight + full grad (시뮬 no-op)
+    return shard_grads
+}
+
+// Single-rank reference full grad (동치 검증용)
+fn fsdp_single_rank_backward(full_weights, input, grad_output) {
+    let d = len(full_weights)
+    let m = len(input)
+    let g = len(grad_output)
+    let sz = if d < m { d } else { m }
+    let sz2 = if sz < g { sz } else { g }
+    let mut grad_w = []
+    for i in 0..d {
+        if i < sz2 {
+            grad_w = grad_w + [grad_output[i] * input[i]]
+        } else {
+            grad_w = grad_w + [0.0]
+        }
+    }
+    return grad_w
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  CPU offload: shard를 CPU로 이동 (공식 시뮬)
+//  (real: cudaMemcpyDeviceToHost on each shard region)
+// ═══════════════════════════════════════════════════════════════════
+fn fsdp_offload_to_cpu(state) {
+    let n = state.num_ranks
+    let mut new_devs = []
+    for k in 0..n { new_devs = new_devs + [FSDP_DEV_CPU] }
+    return FSDPState {
+        rank_shards: state.rank_shards,
+        rank_fp16_shards: state.rank_fp16_shards,
+        num_ranks: state.num_ranks,
+        total_d: state.total_d,
+        cpu_offload: true,
+        mixed_precision: state.mixed_precision,
+        device_of_shard: new_devs
+    }
+}
+
+fn fsdp_load_to_gpu(state) {
+    let n = state.num_ranks
+    let mut new_devs = []
+    for k in 0..n { new_devs = new_devs + [FSDP_DEV_GPU] }
+    return FSDPState {
+        rank_shards: state.rank_shards,
+        rank_fp16_shards: state.rank_fp16_shards,
+        num_ranks: state.num_ranks,
+        total_d: state.total_d,
+        cpu_offload: false,
+        mixed_precision: state.mixed_precision,
+        device_of_shard: new_devs
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Optimizer step (각 rank가 자기 shard만 업데이트)
+//
+//  shard_grads[k] : reduce-scatter 결과
+//  learning rate  : SGD
+//  mixed_precision: 활성 시 fp16 compute shard도 동기화
+// ═══════════════════════════════════════════════════════════════════
+fn fsdp_optimizer_step(state, shard_grads, lr) {
+    let n = state.num_ranks
+    let mut new_shards = []
+    let mut new_fp16 = []
+    for k in 0..n {
+        let shard = state.rank_shards[k]
+        let grad = shard_grads[k]
+        let sz = len(shard)
+        let mut updated = []
+        for i in 0..sz {
+            let g = grad[i]
+            let w = shard[i] - lr * g  // FP32 master update
+            updated = updated + [w]
+        }
+        new_shards = new_shards + [updated]
+        if state.mixed_precision {
+            new_fp16 = new_fp16 + [fsdp_array_to_fp16(updated)]
+        } else {
+            new_fp16 = new_fp16 + [[]]
+        }
+    }
+    return FSDPState {
+        rank_shards: new_shards,
+        rank_fp16_shards: new_fp16,
+        num_ranks: state.num_ranks,
+        total_d: state.total_d,
+        cpu_offload: state.cpu_offload,
+        mixed_precision: state.mixed_precision,
+        device_of_shard: state.device_of_shard
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  메모리 절감 비율 (rank별)
+//
+//  naive: 각 rank가 full params 보유 → mem = D
+//  fsdp : 각 rank가 shard만 보유    → mem ≈ D/N
+//
+//  반환: savings factor = D / (D/N) = N
+//  mixed_precision 시: fp16 shard + fp32 master → 1.5x 증가 (절감 factor 감소)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn fsdp_memory_savings(num_ranks, mixed_precision) {
+    let base = to_float(num_ranks)
+    if mixed_precision {
+        // fp16 compute + fp32 master = 6 bytes/param vs 4 bytes/param
+        return base / 1.5
+    }
+    return base
+}
+
+// Per-rank memory usage in "params equivalent"
+@pure
+fn fsdp_rank_memory(total_d, num_ranks, rank, mixed_precision) {
+    let sz = fsdp_shard_size(total_d, num_ranks, rank)
+    if mixed_precision {
+        // master fp32 + compute fp16 = 1.5x shard size
+        let f = to_float(sz)
+        return f * 1.5
+    }
+    return to_float(sz)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Wrap policy: layer 단위 shard 결정
+//
+//  layer_sizes   : array of int (각 레이어 파라미터 수)
+//  min_wrap_size : 이 값 이상인 레이어만 wrap (shard)
+//
+//  returns: array of bool, wrap[i] == true면 i번째 레이어를 shard
+// ═══════════════════════════════════════════════════════════════════
+fn fsdp_wrap_policy(layer_sizes, min_wrap_size) {
+    let n = len(layer_sizes)
+    let mut out = []
+    for i in 0..n {
+        let sz = layer_sizes[i]
+        if sz >= min_wrap_size {
+            out = out + [true]
+        } else {
+            out = out + [false]
+        }
+    }
+    return out
+}
+
+// Count wrapped layers
+@pure
+fn fsdp_count_wrapped(wrap_plan) {
+    let n = len(wrap_plan)
+    let mut c = 0
+    for i in 0..n {
+        if wrap_plan[i] { c = c + 1 }
+    }
+    return c
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  L2 distance helper (동치 검증용)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn fsdp_l2_diff(a, b) {
+    let la = len(a)
+    let lb = len(b)
+    let n = if la < lb { la } else { lb }
+    let mut s = 0.0
+    for i in 0..n {
+        let d = a[i] - b[i]
+        s = s + d * d
+    }
+    return s
+}
+
+// Concatenate all shard grads into full gradient (검증용)
+fn fsdp_flatten_shard_grads(shard_grads) {
+    let n = len(shard_grads)
+    let mut out = []
+    for k in 0..n {
+        let sub = shard_grads[k]
+        let sz = len(sub)
+        for j in 0..sz { out = out + [sub[j]] }
+    }
+    return out
+}
+
+// Concatenate all shards into full params (검증용)
+fn fsdp_flatten_shards(state) {
+    let n = state.num_ranks
+    let mut out = []
+    for k in 0..n {
+        let shard = state.rank_shards[k]
+        let sz = len(shard)
+        for j in 0..sz { out = out + [shard[j]] }
+    }
+    return out
+}
+
+println("[fsdp] loaded — Fully Sharded Data Parallel (shard/all-gather/reduce-scatter/cpu-offload/mixed-precision)")

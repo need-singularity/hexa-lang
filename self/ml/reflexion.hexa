@@ -1,0 +1,270 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/reflexion.hexa — Reflexion Loop (Shinn et al. 2023)
+//
+//  Iterative agent that learns from its own failures:
+//    act → evaluate → self-critique → reflect → retry
+//
+//  Core pieces:
+//    1. Agent                — produces action given task + memory
+//    2. Verifier             — success detector (binary reward)
+//    3. Self-critique        — root-cause analysis of failed attempt
+//    4. Episodic memory      — trace of (action, reward, critique)
+//    5. Retry loop           — critique injected into next attempt
+//    6. Improvement monitor  — reward trend across iterations
+//    7. Max iter guard       — bounded search
+//
+//  Pure-.hexa, no external dependency.
+//  Agent/verifier/critic are pluggable scalar functions (we use
+//  deterministic mocks for tests, but the API is the real shape).
+//
+//  API:
+//    rfx_new_memory()                                 -> memory{}
+//    rfx_trace_push(memory, action, reward, critique) -> memory{}
+//    rfx_trace_len(memory)                            -> int
+//    rfx_last_action(memory)                          -> float
+//    rfx_last_reward(memory)                          -> float
+//    rfx_last_critique(memory)                        -> string
+//    rfx_verifier(target, action, tol)                -> int(0|1)
+//    rfx_reward(target, action)                       -> float   (higher = better)
+//    rfx_self_critique(target, action)                -> string  (root cause)
+//    rfx_agent_step(target, memory)                   -> float   (next action)
+//    rfx_run(target, max_iter, tol)                   -> memory{}
+//    rfx_improvement_trend(memory)                    -> float   (>0 = improving)
+//    rfx_success_iter(memory)                         -> int     (-1 if none)
+//    rfx_summary(memory)                              -> string
+//
+//  AI-NATIVE attrs:
+//    @pure  — self-critique, verifier, reward are side-effect free
+//    @hot   — agent_step runs per iteration
+// ═══════════════════════════════════════════════════════════════════
+
+// ── helpers ──────────────────────────────────────────────────────
+
+fn rfx_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn rfx_min(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn rfx_max(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn rfx_clip(x, lo, hi) {
+    if x < lo { return lo }
+    if x > hi { return hi }
+    return x
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Episodic Memory — ordered trace of attempts
+//
+//  memory = {
+//    "actions":   [float],   // what agent tried at iter i
+//    "rewards":   [float],   // observed reward for attempt i
+//    "critiques": [string],  // self-critique after attempt i
+//    "success":   [int]      // 1 if verifier passed at iter i else 0
+//  }
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn rfx_new_memory() {
+    let m = #{}
+    m["actions"] = []
+    m["rewards"] = []
+    m["critiques"] = []
+    m["success"] = []
+    return m
+}
+
+// Append one attempt to the trace — returns a new memory
+fn rfx_trace_push(memory, action, reward, critique, success) {
+    memory["actions"] = memory["actions"] + [action]
+    memory["rewards"] = memory["rewards"] + [reward]
+    memory["critiques"] = memory["critiques"] + [critique]
+    memory["success"] = memory["success"] + [success]
+    return memory
+}
+
+@pure
+fn rfx_trace_len(memory) {
+    return len(memory["actions"])
+}
+
+@pure
+fn rfx_last_action(memory) {
+    let n = len(memory["actions"])
+    if n == 0 { return 0.0 }
+    return memory["actions"][n - 1]
+}
+
+@pure
+fn rfx_last_reward(memory) {
+    let n = len(memory["rewards"])
+    if n == 0 { return 0.0 }
+    return memory["rewards"][n - 1]
+}
+
+@pure
+fn rfx_last_critique(memory) {
+    let n = len(memory["critiques"])
+    if n == 0 { return "" }
+    return memory["critiques"][n - 1]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Verifier — binary success detector
+//
+//  The task: produce a number equal to `target` within tolerance `tol`.
+//  Pluggable; the shape is what matters for Reflexion.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn rfx_verifier(target, action, tol) {
+    if rfx_abs(target - action) <= tol { return 1 }
+    return 0
+}
+
+// Dense reward in [0, 1]: 1.0 = perfect, falls to 0 as distance grows.
+// reward = 1 / (1 + |target - action|)
+@pure
+fn rfx_reward(target, action) {
+    let d = rfx_abs(target - action)
+    return 1.0 / (1.0 + d)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Self-Critique — root-cause analysis
+//
+//  Given the last attempt, classify the failure direction:
+//    "too_low"  : action < target    → push up
+//    "too_high" : action > target    → push down
+//    "success"  : exact match
+//
+//  The critique is the signal fed back into the next agent_step.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn rfx_self_critique(target, action) {
+    let d = target - action
+    if rfx_abs(d) < 1.0e-6 { return "success" }
+    if d > 0.0 { return "too_low" }
+    return "too_high"
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Agent Step — produces next action using memory
+//
+//  Strategy (deterministic bisection informed by critique):
+//    - iter 0: start from 0.0 (no prior)
+//    - otherwise: take last_action, compute step from last_reward,
+//      then move up/down according to last_critique.
+//
+//  The key property: the NEXT action uses the CRITIQUE injected
+//  in memory — this is the essence of Reflexion.
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn rfx_agent_step(target, memory) {
+    let n = len(memory["actions"])
+    if n == 0 {
+        // Cold start: naive guess
+        return 0.0
+    }
+    let last = memory["actions"][n - 1]
+    let critique = memory["critiques"][n - 1]
+    let last_reward = memory["rewards"][n - 1]
+    // Step size shrinks as we get closer (reward → 1).
+    // step = (1 - reward) * |target or 1|  — clamped to a sane range.
+    let mut step = (1.0 - last_reward) * rfx_max(rfx_abs(target), 1.0)
+    if step < 0.1 { step = 0.1 }
+    if step > 1000.0 { step = 1000.0 }
+    // Halve the step each iteration to converge (bisection-like)
+    let halved = step / to_float(n + 1)
+    if critique == "too_low" {
+        return last + halved
+    }
+    if critique == "too_high" {
+        return last - halved
+    }
+    // success or unknown → stick
+    return last
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Reflexion Run — the main loop
+//
+//  Returns the full memory. Stops early on success.
+// ═══════════════════════════════════════════════════════════════════
+fn rfx_run(target, max_iter, tol) {
+    let mut memory = rfx_new_memory()
+    for _i in 0..max_iter {
+        // 1. act
+        let action = rfx_agent_step(target, memory)
+        // 2. evaluate
+        let reward = rfx_reward(target, action)
+        let succ = rfx_verifier(target, action, tol)
+        // 3. self-critique
+        let critique = rfx_self_critique(target, action)
+        // 4. update memory
+        memory = rfx_trace_push(memory, action, reward, critique, succ)
+        // 5. early-exit on success
+        if succ == 1 { return memory }
+    }
+    return memory
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Improvement Trend — average delta between consecutive rewards
+//
+//  > 0 : rewards monotonically (on average) improving
+//  == 0: flat
+//  < 0 : regressing (critique misled the agent)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn rfx_improvement_trend(memory) {
+    let n = len(memory["rewards"])
+    if n < 2 { return 0.0 }
+    let mut sum_delta = 0.0
+    for i in 1..n {
+        sum_delta = sum_delta + (memory["rewards"][i] - memory["rewards"][i - 1])
+    }
+    return sum_delta / to_float(n - 1)
+}
+
+// Iteration index at which verifier first passed, else -1
+@pure
+fn rfx_success_iter(memory) {
+    let n = len(memory["success"])
+    for i in 0..n {
+        if memory["success"][i] == 1 { return i }
+    }
+    return -1
+}
+
+@pure
+fn rfx_best_reward(memory) {
+    let n = len(memory["rewards"])
+    if n == 0 { return 0.0 }
+    let mut best = memory["rewards"][0]
+    for i in 1..n {
+        if memory["rewards"][i] > best { best = memory["rewards"][i] }
+    }
+    return best
+}
+
+// Human-readable one-line summary
+fn rfx_summary(memory) {
+    let n = rfx_trace_len(memory)
+    let si = rfx_success_iter(memory)
+    let br = rfx_best_reward(memory)
+    let tr = rfx_improvement_trend(memory)
+    let mut s = "[reflexion] iters=" + str(n)
+    s = s + " success_iter=" + str(si)
+    s = s + " best_reward=" + str(br)
+    s = s + " trend=" + str(tr)
+    return s
+}
+
+println("[reflexion] loaded - act/verify/critique/retry + episodic memory + trend")

@@ -1,0 +1,816 @@
+// ===================================================================
+//  test_hnsw.hexa — HNSW Vector Index verification
+//
+//  SSOT: shared/hexa-lang/ml-next-level.json id=59
+//
+//  Tests:
+//    T1  hnsw_l2_sq(v, v) = 0
+//    T2  hnsw_l2_sq symmetric
+//    T3  hnsw_cos_dist(v, v) ≈ 0
+//    T4  hnsw_cos_dist(v, -v) ≈ 2  (opposite direction)
+//    T5  create_hnsw empty: size=0, entry_point=-1
+//    T6  single insert: size=1, entry_point=0, max_level≥0
+//    T7  multi insert: size grows linearly
+//    T8  hnsw_search empty → []
+//    T9  hnsw_search trivial: query == stored vector → top1 is itself
+//   T10  hnsw_search returns exactly top_k (when N ≥ k)
+//   T11  hnsw_search top1 matches brute-force nearest on small set
+//   T12  hnsw_search results are sorted ascending by distance
+//   T13  hnsw_recall ≥ 0.70 on 40-point random set, top_k=5 (cosine)
+//   T14  hnsw_recall ≥ 0.70 on 40-point random set, top_k=5 (L2)
+//   T15  hnsw_sample_level stays within bounds
+//
+//  실행: ./hexa self/test_hnsw.hexa
+//
+//  Implementation is inlined from self/ml/hnsw.hexa (same convention
+//  as test_embedding_finetune.hexa / test_cross_encoder_rerank.hexa:
+//  module is SSOT, test file re-expresses the functions).
+// ===================================================================
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ═══════════ INLINED: hnsw module ══════════════════════════════════
+
+fn hnsw_l2_sq(a, b) {
+    let n = len(a)
+    let mut sum = 0.0
+    let mut i = 0
+    while i < n {
+        let d = a[i] - b[i]
+        sum = sum + d * d
+        i = i + 1
+    }
+    return sum
+}
+
+fn hnsw_dot(a, b) {
+    let n = len(a)
+    let mut sum = 0.0
+    let mut i = 0
+    while i < n {
+        sum = sum + a[i] * b[i]
+        i = i + 1
+    }
+    return sum
+}
+
+fn hnsw_norm(v) {
+    let mut sum = 0.0
+    let n = len(v)
+    let mut i = 0
+    while i < n {
+        sum = sum + v[i] * v[i]
+        i = i + 1
+    }
+    return sqrt(sum)
+}
+
+fn hnsw_cos_dist(a, b) {
+    let d = hnsw_dot(a, b)
+    let na = hnsw_norm(a)
+    let nb = hnsw_norm(b)
+    let denom = na * nb
+    if denom < 0.000001 { return 1.0 }
+    let sim = d / denom
+    return 1.0 - sim
+}
+
+fn hnsw_dist(index, a, b) {
+    if index.metric == 0 {
+        return hnsw_l2_sq(a, b)
+    }
+    return hnsw_cos_dist(a, b)
+}
+
+fn hnsw_rand_step(state) {
+    let mut x = state
+    if x == 0 { x = 2463534242 }
+    // Keep state in 31-bit unsigned range; emulate xorshift via modular ops.
+    let m = 2147483647  // 2^31 - 1
+    let a = (x * 1103515245 + 12345) % m
+    let b = (a * 1103515245 + 12345) % m
+    let c = (b ^ (a / 65536)) % m
+    if c < 0 { return 0 - c }
+    return c
+}
+
+fn hnsw_rand_float(state) {
+    let nx = hnsw_rand_step(state)
+    let v = to_float(nx % 1000000) / 1000000.0
+    return [nx, v]
+}
+
+fn hnsw_ln(x) {
+    if x <= 0.0 { return 0.0 }
+    let y = (x - 1.0) / (x + 1.0)
+    let y2 = y * y
+    let mut term = y
+    let mut sum = 0.0
+    let mut k = 0
+    while k < 12 {
+        let denom = to_float(2 * k + 1)
+        sum = sum + term / denom
+        term = term * y2
+        k = k + 1
+    }
+    return 2.0 * sum
+}
+
+fn hnsw_sample_level(state, mL, max_level) {
+    let pair = hnsw_rand_float(state)
+    let new_state = pair[0]
+    let mut u = pair[1]
+    if u < 0.000001 { u = 0.000001 }
+    if u > 0.999999 { u = 0.999999 }
+    let l_float = 0.0 - hnsw_ln(u) * mL
+    let mut l = to_int(l_float)
+    if l < 0 { l = 0 }
+    if l > max_level { l = max_level }
+    return [new_state, l]
+}
+
+struct HnswIndex {
+    dim: int,
+    M: int,
+    M_max: int,
+    M_max0: int,
+    efConstruction: int,
+    efSearch: int,
+    mL: float,
+    metric: int,
+    rng: int,
+    entry_point: int,
+    max_level: int,
+    nodes: array,
+    ids: array,
+    levels: array,
+    layers: array
+}
+
+fn create_hnsw(dim, M, M_max, efConstruction, efSearch, seed, metric) {
+    let mut rng = seed
+    if rng == 0 { rng = 2463534242 }
+    let denom = hnsw_ln(to_float(M))
+    let mut mL = 0.36
+    if denom > 0.01 { mL = 1.0 / denom }
+    let m0 = 2 * M
+    return HnswIndex {
+        dim: dim,
+        M: M,
+        M_max: M_max,
+        M_max0: m0,
+        efConstruction: efConstruction,
+        efSearch: efSearch,
+        mL: mL,
+        metric: metric,
+        rng: rng,
+        entry_point: -1,
+        max_level: -1,
+        nodes: [],
+        ids: [],
+        levels: [],
+        layers: []
+    }
+}
+
+fn hnsw_size(index) {
+    return len(index.nodes)
+}
+
+fn hnsw_set_arr(arr, idx, val) {
+    let n = len(arr)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        if i == idx {
+            out = out + [val]
+        } else {
+            out = out + [arr[i]]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn hnsw_set_layer_neighbors(layers, layer_idx, node_idx, new_list) {
+    let layer = layers[layer_idx]
+    let new_layer = hnsw_set_arr(layer, node_idx, new_list)
+    return hnsw_set_arr(layers, layer_idx, new_layer)
+}
+
+fn hnsw_ensure_layers(layers, target_level, node_count) {
+    let cur = len(layers)
+    if cur > target_level { return layers }
+    let mut out = layers
+    let mut l = cur
+    while l <= target_level {
+        let mut row = []
+        let mut i = 0
+        while i < node_count {
+            row = row + [[]]
+            i = i + 1
+        }
+        out = out + [row]
+        l = l + 1
+    }
+    return out
+}
+
+fn hnsw_pad_layer(layer, target_len) {
+    let cur = len(layer)
+    if cur >= target_len { return layer }
+    let mut out = layer
+    let mut i = cur
+    while i < target_len {
+        out = out + [[]]
+        i = i + 1
+    }
+    return out
+}
+
+fn hnsw_pad_all_layers(layers, target_len) {
+    let L = len(layers)
+    let mut out = []
+    let mut l = 0
+    while l < L {
+        out = out + [hnsw_pad_layer(layers[l], target_len)]
+        l = l + 1
+    }
+    return out
+}
+
+fn hnsw_contains_node(arr, node_idx) {
+    let n = len(arr)
+    let mut i = 0
+    while i < n {
+        if arr[i] == node_idx { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn hnsw_cand_contains(cands, node_idx) {
+    let n = len(cands)
+    let mut i = 0
+    while i < n {
+        if cands[i][0] == node_idx { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn hnsw_cand_insert(cands, node_idx, dist) {
+    if hnsw_cand_contains(cands, node_idx) { return cands }
+    let n = len(cands)
+    let mut out = []
+    let mut i = 0
+    let mut inserted = false
+    while i < n {
+        let c = cands[i]
+        if !inserted {
+            if dist < c[1] {
+                out = out + [[node_idx, dist]]
+                inserted = true
+            }
+        }
+        out = out + [c]
+        i = i + 1
+    }
+    if !inserted {
+        out = out + [[node_idx, dist]]
+    }
+    return out
+}
+
+fn hnsw_cand_trunc(cands, k) {
+    let n = len(cands)
+    if n <= k { return cands }
+    let mut out = []
+    let mut i = 0
+    while i < k {
+        out = out + [cands[i]]
+        i = i + 1
+    }
+    return out
+}
+
+fn hnsw_cand_max(cands) {
+    let n = len(cands)
+    if n == 0 { return 1.0e30 }
+    return cands[n - 1][1]
+}
+
+fn hnsw_search_layer(index, query, entry_nodes, layer_idx, ef) {
+    let layers = index.layers
+    let nodes = index.nodes
+
+    let mut candidates = []
+    let mut results = []
+    let mut visited = []
+
+    let nent = len(entry_nodes)
+    let mut e = 0
+    while e < nent {
+        let ni = entry_nodes[e]
+        if !hnsw_contains_node(visited, ni) {
+            visited = visited + [ni]
+            let d = hnsw_dist(index, query, nodes[ni])
+            candidates = hnsw_cand_insert(candidates, ni, d)
+            results = hnsw_cand_insert(results, ni, d)
+            results = hnsw_cand_trunc(results, ef)
+        }
+        e = e + 1
+    }
+
+    let mut steps = 0
+    let max_steps = 100000
+    while steps < max_steps {
+        if len(candidates) == 0 { return results }
+        let cur = candidates[0]
+        let mut new_cands = []
+        let mut ci = 1
+        while ci < len(candidates) {
+            new_cands = new_cands + [candidates[ci]]
+            ci = ci + 1
+        }
+        candidates = new_cands
+
+        let cur_node = cur[0]
+        let cur_dist = cur[1]
+        let worst = hnsw_cand_max(results)
+        if cur_dist > worst {
+            if len(results) >= ef { return results }
+        }
+
+        let layer = layers[layer_idx]
+        if cur_node < len(layer) {
+            let neighbors = layer[cur_node]
+            let nn = len(neighbors)
+            let mut k = 0
+            while k < nn {
+                let nb = neighbors[k]
+                if !hnsw_contains_node(visited, nb) {
+                    visited = visited + [nb]
+                    let dnb = hnsw_dist(index, query, nodes[nb])
+                    let cur_worst = hnsw_cand_max(results)
+                    if len(results) < ef {
+                        candidates = hnsw_cand_insert(candidates, nb, dnb)
+                        results = hnsw_cand_insert(results, nb, dnb)
+                    } else {
+                        if dnb < cur_worst {
+                            candidates = hnsw_cand_insert(candidates, nb, dnb)
+                            results = hnsw_cand_insert(results, nb, dnb)
+                            results = hnsw_cand_trunc(results, ef)
+                        }
+                    }
+                }
+                k = k + 1
+            }
+        }
+        steps = steps + 1
+    }
+    return results
+}
+
+fn hnsw_select_neighbors(cands, M) {
+    return hnsw_cand_trunc(cands, M)
+}
+
+fn hnsw_cand_nodes(cands) {
+    let n = len(cands)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [cands[i][0]]
+        i = i + 1
+    }
+    return out
+}
+
+fn hnsw_prune_neighbors(index, base_node, candidates_list, cap, layer_idx) {
+    let n = len(candidates_list)
+    if n <= cap { return candidates_list }
+    let base_vec = index.nodes[base_node]
+    let mut scored = []
+    let mut i = 0
+    while i < n {
+        let nb = candidates_list[i]
+        let d = hnsw_dist(index, base_vec, index.nodes[nb])
+        scored = hnsw_cand_insert(scored, nb, d)
+        i = i + 1
+    }
+    let keep = hnsw_cand_trunc(scored, cap)
+    return hnsw_cand_nodes(keep)
+}
+
+fn hnsw_insert(index, id, vector) {
+    let new_idx = len(index.nodes)
+    let mut nodes = index.nodes + [vector]
+    let mut ids = index.ids + [id]
+
+    let pair = hnsw_sample_level(index.rng, index.mL, 16)
+    let new_rng = pair[0]
+    let node_level = pair[1]
+
+    let mut levels = index.levels + [node_level]
+
+    let node_count = new_idx + 1
+    let mut layers = index.layers
+    layers = hnsw_ensure_layers(layers, node_level, node_count)
+    layers = hnsw_pad_all_layers(layers, node_count)
+
+    if index.entry_point < 0 {
+        return HnswIndex {
+            dim: index.dim,
+            M: index.M,
+            M_max: index.M_max,
+            M_max0: index.M_max0,
+            efConstruction: index.efConstruction,
+            efSearch: index.efSearch,
+            mL: index.mL,
+            metric: index.metric,
+            rng: new_rng,
+            entry_point: new_idx,
+            max_level: node_level,
+            nodes: nodes,
+            ids: ids,
+            levels: levels,
+            layers: layers
+        }
+    }
+
+    let mut tmp = HnswIndex {
+        dim: index.dim,
+        M: index.M,
+        M_max: index.M_max,
+        M_max0: index.M_max0,
+        efConstruction: index.efConstruction,
+        efSearch: index.efSearch,
+        mL: index.mL,
+        metric: index.metric,
+        rng: new_rng,
+        entry_point: index.entry_point,
+        max_level: index.max_level,
+        nodes: nodes,
+        ids: ids,
+        levels: levels,
+        layers: layers
+    }
+
+    let mut cur_ep = [index.entry_point]
+    let mut lvl = tmp.max_level
+    while lvl > node_level {
+        let res = hnsw_search_layer(tmp, vector, cur_ep, lvl, 1)
+        if len(res) > 0 {
+            cur_ep = [res[0][0]]
+        }
+        lvl = lvl - 1
+    }
+
+    let mut target_lvl = node_level
+    if target_lvl > tmp.max_level { target_lvl = tmp.max_level }
+
+    let mut layers_work = layers
+    lvl = target_lvl
+    while lvl >= 0 {
+        tmp = HnswIndex {
+            dim: tmp.dim,
+            M: tmp.M,
+            M_max: tmp.M_max,
+            M_max0: tmp.M_max0,
+            efConstruction: tmp.efConstruction,
+            efSearch: tmp.efSearch,
+            mL: tmp.mL,
+            metric: tmp.metric,
+            rng: tmp.rng,
+            entry_point: tmp.entry_point,
+            max_level: tmp.max_level,
+            nodes: tmp.nodes,
+            ids: tmp.ids,
+            levels: tmp.levels,
+            layers: layers_work
+        }
+        let W = hnsw_search_layer(tmp, vector, cur_ep, lvl, index.efConstruction)
+        let mut cap = index.M_max
+        if lvl == 0 { cap = index.M_max0 }
+        let selected = hnsw_select_neighbors(W, index.M)
+        let nbr_list = hnsw_cand_nodes(selected)
+
+        layers_work = hnsw_set_layer_neighbors(layers_work, lvl, new_idx, nbr_list)
+
+        let nn = len(nbr_list)
+        let mut k = 0
+        while k < nn {
+            let nb = nbr_list[k]
+            let layer_cur = layers_work[lvl]
+            let existing = layer_cur[nb]
+            if !hnsw_contains_node(existing, new_idx) {
+                let appended = existing + [new_idx]
+                let pruned = hnsw_prune_neighbors(tmp, nb, appended, cap, lvl)
+                layers_work = hnsw_set_layer_neighbors(layers_work, lvl, nb, pruned)
+            }
+            k = k + 1
+        }
+
+        let entries_next = hnsw_cand_nodes(W)
+        if len(entries_next) > 0 { cur_ep = entries_next }
+        lvl = lvl - 1
+    }
+
+    let mut new_ep = tmp.entry_point
+    let mut new_max = tmp.max_level
+    if node_level > tmp.max_level {
+        new_ep = new_idx
+        new_max = node_level
+    }
+
+    return HnswIndex {
+        dim: index.dim,
+        M: index.M,
+        M_max: index.M_max,
+        M_max0: index.M_max0,
+        efConstruction: index.efConstruction,
+        efSearch: index.efSearch,
+        mL: index.mL,
+        metric: index.metric,
+        rng: new_rng,
+        entry_point: new_ep,
+        max_level: new_max,
+        nodes: nodes,
+        ids: ids,
+        levels: levels,
+        layers: layers_work
+    }
+}
+
+fn hnsw_search(index, query, top_k) {
+    if index.entry_point < 0 { return [] }
+    let n = len(index.nodes)
+    if n == 0 { return [] }
+
+    let mut cur_ep = [index.entry_point]
+    let mut lvl = index.max_level
+    while lvl > 0 {
+        let r = hnsw_search_layer(index, query, cur_ep, lvl, 1)
+        if len(r) > 0 {
+            cur_ep = [r[0][0]]
+        }
+        lvl = lvl - 1
+    }
+
+    let mut ef = index.efSearch
+    if ef < top_k { ef = top_k }
+    let W = hnsw_search_layer(index, query, cur_ep, 0, ef)
+
+    let kept = hnsw_cand_trunc(W, top_k)
+    let m = len(kept)
+    let mut out = []
+    let mut i = 0
+    while i < m {
+        let ni = kept[i][0]
+        out = out + [[index.ids[ni], kept[i][1]]]
+        i = i + 1
+    }
+    return out
+}
+
+fn hnsw_brute_topk(index, query, top_k) {
+    let n = len(index.nodes)
+    if n == 0 { return [] }
+    let mut cands = []
+    let mut i = 0
+    while i < n {
+        let d = hnsw_dist(index, query, index.nodes[i])
+        cands = hnsw_cand_insert(cands, i, d)
+        i = i + 1
+    }
+    let keep = hnsw_cand_trunc(cands, top_k)
+    let m = len(keep)
+    let mut out = []
+    let mut j = 0
+    while j < m {
+        let ni = keep[j][0]
+        out = out + [index.ids[ni]]
+        j = j + 1
+    }
+    return out
+}
+
+fn hnsw_ids_overlap(gt_ids, result_pairs) {
+    let g = len(gt_ids)
+    let r = len(result_pairs)
+    let mut hit = 0
+    let mut i = 0
+    while i < g {
+        let mut j = 0
+        let mut found = false
+        while j < r {
+            if result_pairs[j][0] == gt_ids[i] { found = true }
+            j = j + 1
+        }
+        if found { hit = hit + 1 }
+        i = i + 1
+    }
+    return hit
+}
+
+fn hnsw_recall(index, queries, top_k) {
+    let q = len(queries)
+    if q == 0 { return 1.0 }
+    let mut total_hits = 0
+    let mut total_ref = 0
+    let mut i = 0
+    while i < q {
+        let query = queries[i]
+        let gt = hnsw_brute_topk(index, query, top_k)
+        let got = hnsw_search(index, query, top_k)
+        total_hits = total_hits + hnsw_ids_overlap(gt, got)
+        total_ref = total_ref + len(gt)
+        i = i + 1
+    }
+    if total_ref == 0 { return 1.0 }
+    return to_float(total_hits) / to_float(total_ref)
+}
+
+// ═══════════ TESTS ═════════════════════════════════════════════════
+
+// Deterministic pseudo-random vector (xorshift-like) for T13/T14
+let mut PR_STATE = 12345
+
+fn pr_next() {
+    let mut x = PR_STATE
+    if x == 0 { x = 2463534242 }
+    let m = 2147483647
+    x = (x * 1103515245 + 12345) % m
+    if x < 0 { x = 0 - x }
+    PR_STATE = x
+    return to_float(x % 1000) / 1000.0
+}
+
+fn pr_vec(dim) {
+    let mut v = []
+    let mut i = 0
+    while i < dim {
+        v = v + [pr_next() * 2.0 - 1.0]
+        i = i + 1
+    }
+    return v
+}
+
+// ── T1..T4: distance primitives ────────────────────────────────────
+
+let u = [1.0, 2.0, 3.0, 4.0]
+let w = [4.0, 3.0, 2.0, 1.0]
+
+check("T1: l2_sq(v,v) = 0", approx(hnsw_l2_sq(u, u), 0.0, 1.0e-9))
+
+let l2_uw = hnsw_l2_sq(u, w)
+let l2_wu = hnsw_l2_sq(w, u)
+check("T2: l2_sq symmetric", approx(l2_uw, l2_wu, 1.0e-9))
+
+let cos_self = hnsw_cos_dist(u, u)
+check("T3: cos_dist(v,v) ~ 0", approx(cos_self, 0.0, 1.0e-6))
+
+let neg_u = [0.0 - 1.0, 0.0 - 2.0, 0.0 - 3.0, 0.0 - 4.0]
+let cos_opp = hnsw_cos_dist(u, neg_u)
+check("T4: cos_dist(v,-v) ~ 2", approx(cos_opp, 2.0, 1.0e-6))
+
+// ── T5: create_hnsw empty ──────────────────────────────────────────
+
+let dim = 4
+let idx0 = create_hnsw(dim, 8, 8, 20, 20, 42, 1)  // cosine
+check("T5a: empty size=0", hnsw_size(idx0) == 0)
+check("T5b: empty entry_point=-1", idx0.entry_point == -1)
+
+// ── T6: single insert ─────────────────────────────────────────────
+
+let idx1 = hnsw_insert(idx0, "v1", [1.0, 0.0, 0.0, 0.0])
+check("T6a: single insert size=1", hnsw_size(idx1) == 1)
+check("T6b: single insert entry_point=0", idx1.entry_point == 0)
+check("T6c: single insert max_level >= 0", idx1.max_level >= 0)
+
+// ── T7: multi insert ──────────────────────────────────────────────
+
+let idx2 = hnsw_insert(idx1, "v2", [0.0, 1.0, 0.0, 0.0])
+let idx3 = hnsw_insert(idx2, "v3", [0.0, 0.0, 1.0, 0.0])
+let idx4 = hnsw_insert(idx3, "v4", [0.0, 0.0, 0.0, 1.0])
+check("T7a: size after 4 inserts = 4", hnsw_size(idx4) == 4)
+check("T7b: ids preserved", idx4.ids[0] == "v1")
+check("T7c: ids preserved last", idx4.ids[3] == "v4")
+
+// ── T8: search on empty index ─────────────────────────────────────
+
+let empty_res = hnsw_search(idx0, [1.0, 0.0, 0.0, 0.0], 3)
+check("T8: search empty -> []", len(empty_res) == 0)
+
+// ── T9: trivial search: query == stored → top1 is self ───────────
+
+let r9 = hnsw_search(idx4, [1.0, 0.0, 0.0, 0.0], 1)
+check("T9a: search returns 1 result", len(r9) == 1)
+check("T9b: top1 id is v1 (exact match)", r9[0][0] == "v1")
+
+// ── T10: top_k length ─────────────────────────────────────────────
+
+let r10 = hnsw_search(idx4, [1.0, 1.0, 0.0, 0.0], 3)
+check("T10: search returns exactly 3 results", len(r10) == 3)
+
+// ── T11: top1 matches brute-force on small set ───────────────────
+
+let q11 = [0.9, 0.1, 0.0, 0.0]
+let r11 = hnsw_search(idx4, q11, 1)
+let brute_ids = hnsw_brute_topk(idx4, q11, 1)
+check("T11: hnsw top1 == brute-force top1", r11[0][0] == brute_ids[0])
+
+// ── T12: results sorted ascending by distance ────────────────────
+
+let q12 = [0.5, 0.5, 0.5, 0.5]
+let r12 = hnsw_search(idx4, q12, 4)
+let mut sorted_ok = true
+let mut t12i = 1
+while t12i < len(r12) {
+    if r12[t12i][1] < r12[t12i - 1][1] { sorted_ok = false }
+    t12i = t12i + 1
+}
+check("T12: results sorted ascending by distance", sorted_ok)
+
+// ── T13: recall on 40-point random set, cosine ────────────────────
+
+PR_STATE = 777
+let big_dim = 8
+let mut big_idx = create_hnsw(big_dim, 8, 8, 40, 30, 11, 1)  // cosine
+let N = 40
+let mut t13i = 0
+while t13i < N {
+    let v = pr_vec(big_dim)
+    big_idx = hnsw_insert(big_idx, t13i, v)
+    t13i = t13i + 1
+}
+let mut queries13 = []
+let mut t13q = 0
+while t13q < 6 {
+    queries13 = queries13 + [pr_vec(big_dim)]
+    t13q = t13q + 1
+}
+let rec13 = hnsw_recall(big_idx, queries13, 5)
+println("[INFO] T13 cosine recall@5 = " + to_string(rec13))
+check("T13: cosine recall@5 >= 0.70", rec13 >= 0.70)
+
+// ── T14: recall with L2 metric ────────────────────────────────────
+
+PR_STATE = 999
+let mut big_idx2 = create_hnsw(big_dim, 8, 8, 40, 30, 13, 0)  // L2
+let mut t14i = 0
+while t14i < N {
+    let v = pr_vec(big_dim)
+    big_idx2 = hnsw_insert(big_idx2, t14i, v)
+    t14i = t14i + 1
+}
+let mut queries14 = []
+let mut t14q = 0
+while t14q < 6 {
+    queries14 = queries14 + [pr_vec(big_dim)]
+    t14q = t14q + 1
+}
+let rec14 = hnsw_recall(big_idx2, queries14, 5)
+println("[INFO] T14 L2 recall@5 = " + to_string(rec14))
+check("T14: L2 recall@5 >= 0.70", rec14 >= 0.70)
+
+// ── T15: sample_level bounded ────────────────────────────────────
+
+let mut sl_ok = true
+let mut sl_state = 2463534242
+let mut sl_i = 0
+while sl_i < 40 {
+    let pair = hnsw_sample_level(sl_state, 0.36, 16)
+    sl_state = pair[0]
+    let lvl = pair[1]
+    if lvl < 0 { sl_ok = false }
+    if lvl > 16 { sl_ok = false }
+    sl_i = sl_i + 1
+}
+check("T15: sample_level in [0, 16] over 40 draws", sl_ok)
+
+// ── Summary ────────────────────────────────────────────────────────
+
+println("")
+println("=== HNSW Vector Index test summary ===")
+println("PASS: " + to_string(pass_count))
+println("FAIL: " + to_string(fail_count))
+if fail_count == 0 {
+    println("ALL GREEN - HNSW OK")
+}
+println(to_string(pass_count) + " passed")

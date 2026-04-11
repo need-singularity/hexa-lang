@@ -1,0 +1,427 @@
+// ═══════════════════════════════════════════════════════════════════
+//  test_self_rewarding.hexa — Self-Rewarding LM (#65) verification
+//
+//  Tests:
+//    1. rubric levels 1..5
+//    2. default rubric criteria + weights shape
+//    3. rubric clip [1,5]
+//    4. rubric normalize 0..1
+//    5. self-prompt format includes iter marker
+//    6. judge rubric prompt non-empty
+//    7. score_one weighted avg monotone wrt judge output
+//    8. score_batch length matches responses
+//    9. argmax / argmin correctness
+//   10. make_dpo_pair chosen >= rejected score
+//   11. build_pairs filters ties
+//   12. iteration returns [pairs, stats] with stats triple
+//   13. iterative loop produces n_iters records
+//   14. quality delta: improving iterations report delta > 0
+//   15. monotone detector catches regressions
+//   16. to_dpo_ids_pair wraps tokenizer output
+//
+//  Run: ./hexa self/test_self_rewarding.hexa
+// ═══════════════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ── inlined from self/ml/self_rewarding.hexa ───────────────────────
+
+fn srlm_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn srlm_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn srlm_rubric_levels() { return [1, 2, 3, 4, 5] }
+
+fn srlm_default_rubric_criteria() {
+    return ["relevance", "correctness", "helpfulness", "clarity", "safety"]
+}
+
+fn srlm_default_rubric_weights() {
+    return [0.25, 0.25, 0.2, 0.15, 0.15]
+}
+
+fn srlm_clip_rubric(raw) {
+    if raw < 1.0 { return 1.0 }
+    if raw > 5.0 { return 5.0 }
+    return raw
+}
+
+fn srlm_normalize_rubric(score) {
+    return (srlm_clip_rubric(score) - 1.0) / 4.0
+}
+
+fn srlm_make_self_prompt(seed, iter) {
+    let mut text = "[SELF-PROMPTING iter=" + str(iter) + "]\n"
+    text = text + "=== Seed ===\n" + seed + "\n"
+    text = text + "=== Task ===\n"
+    text = text + "Produce a new helpful response, then reflect on how to improve.\n"
+    return text
+}
+
+fn srlm_make_judge_rubric_prompt(prompt, response, crit_names, crit_weights) {
+    let mut text = "[JUDGE RUBRIC 1..5]\n"
+    text = text + "=== User Prompt ===\n" + prompt + "\n"
+    text = text + "=== Response ===\n" + response + "\n"
+    text = text + "=== Criteria (score each 1..5) ===\n"
+    let n_crit = len(crit_names)
+    for i in 0..n_crit {
+        text = text + "- " + crit_names[i] + " (weight: " + str(crit_weights[i]) + ")\n"
+    }
+    text = text + "=== Output ===\n"
+    text = text + "Return one integer score per criterion, then justification.\n"
+    return text
+}
+
+fn srlm_score_one(prompt, response, crit_names, crit_weights, judge_fn) {
+    let n_crit = len(crit_names)
+    let mut total = 0.0
+    let mut weight_sum = 0.0
+    for i in 0..n_crit {
+        let raw = judge_fn(prompt, response, crit_names[i])
+        let clipped = srlm_clip_rubric(raw)
+        let norm = (clipped - 1.0) / 4.0
+        total = total + crit_weights[i] * norm
+        weight_sum = weight_sum + crit_weights[i]
+    }
+    if weight_sum > 0.0 { return total / weight_sum }
+    return 0.0
+}
+
+fn srlm_score_batch(prompt, responses, crit_names, crit_weights, judge_fn) {
+    let n = len(responses)
+    let mut scores = srlm_zeros(n)
+    for i in 0..n {
+        scores[i] = srlm_score_one(prompt, responses[i], crit_names, crit_weights, judge_fn)
+    }
+    return scores
+}
+
+fn srlm_argmax_index(values) {
+    let n = len(values)
+    if n == 0 { return -1 }
+    let mut best = 0
+    let mut best_v = values[0]
+    for i in 1..n {
+        if values[i] > best_v {
+            best = i
+            best_v = values[i]
+        }
+    }
+    return best
+}
+
+fn srlm_argmin_index(values) {
+    let n = len(values)
+    if n == 0 { return -1 }
+    let mut worst = 0
+    let mut worst_v = values[0]
+    for i in 1..n {
+        if values[i] < worst_v {
+            worst = i
+            worst_v = values[i]
+        }
+    }
+    return worst
+}
+
+fn srlm_make_dpo_pair(prompt, responses, scores) {
+    let n = len(responses)
+    if n < 2 { return [prompt, "", ""] }
+    let hi = srlm_argmax_index(scores)
+    let lo = srlm_argmin_index(scores)
+    if hi == lo { return [prompt, responses[hi], responses[hi]] }
+    return [prompt, responses[hi], responses[lo]]
+}
+
+fn srlm_pair_margin(scores) {
+    let n = len(scores)
+    if n < 2 { return 0.0 }
+    let hi = srlm_argmax_index(scores)
+    let lo = srlm_argmin_index(scores)
+    if hi == lo { return 0.0 }
+    return scores[hi] - scores[lo]
+}
+
+fn srlm_build_pairs(prompts, responses_batch, scores_batch) {
+    let n = len(prompts)
+    let mut pairs = []
+    for p in 0..n {
+        let scores = scores_batch[p]
+        let margin = srlm_pair_margin(scores)
+        if margin > 0.0 {
+            let pair = srlm_make_dpo_pair(prompts[p], responses_batch[p], scores)
+            pairs = pairs + [pair]
+        }
+    }
+    return pairs
+}
+
+fn srlm_iter_stats(scores_batch) {
+    let n = len(scores_batch)
+    if n == 0 { return [0.0, 0.0, 0.0, 0.0] }
+    let mut sum_top = 0.0
+    let mut sum_bot = 0.0
+    let mut sum_margin = 0.0
+    for p in 0..n {
+        let s = scores_batch[p]
+        let m = len(s)
+        if m == 0 { continue }
+        let hi = srlm_argmax_index(s)
+        let lo = srlm_argmin_index(s)
+        sum_top = sum_top + s[hi]
+        sum_bot = sum_bot + s[lo]
+        sum_margin = sum_margin + (s[hi] - s[lo])
+    }
+    let fn_f = to_float(n)
+    return [fn_f, sum_top / fn_f, sum_bot / fn_f, sum_margin / fn_f]
+}
+
+fn srlm_iteration_pairs(prompts, generate_fn, judge_fn, n_candidates, crit_names, crit_weights) {
+    let n_p = len(prompts)
+    let mut responses_batch = []
+    let mut scores_batch = []
+    for p in 0..n_p {
+        let prompt = prompts[p]
+        let mut resps = []
+        for _r in 0..n_candidates {
+            let resp = generate_fn(prompt)
+            resps = resps + [resp]
+        }
+        let scores = srlm_score_batch(prompt, resps, crit_names, crit_weights, judge_fn)
+        responses_batch = responses_batch + [resps]
+        scores_batch = scores_batch + [scores]
+    }
+    return srlm_build_pairs(prompts, responses_batch, scores_batch)
+}
+
+fn srlm_iteration_stats(prompts, generate_fn, judge_fn, n_candidates, crit_names, crit_weights) {
+    let n_p = len(prompts)
+    let mut scores_batch = []
+    for p in 0..n_p {
+        let prompt = prompts[p]
+        let mut resps = []
+        for _r in 0..n_candidates {
+            let resp = generate_fn(prompt)
+            resps = resps + [resp]
+        }
+        let scores = srlm_score_batch(prompt, resps, crit_names, crit_weights, judge_fn)
+        scores_batch = scores_batch + [scores]
+    }
+    return srlm_iter_stats(scores_batch)
+}
+
+fn srlm_run_loop(prompts, generate_fn, judge_fn, n_candidates, n_iters, crit_names, crit_weights) {
+    let mut records = []
+    for it in 0..n_iters {
+        let stats = srlm_iteration_stats(prompts, generate_fn, judge_fn, n_candidates, crit_names, crit_weights)
+        let rec = [to_float(it), stats[0], stats[1], stats[2], stats[3]]
+        records = records + [rec]
+    }
+    return records
+}
+
+fn srlm_quality_delta(records) {
+    let n = len(records)
+    if n < 2 { return [0.0, 0.0] }
+    let first = records[0]
+    let last = records[n - 1]
+    return [last[2] - first[2], last[4] - first[4]]
+}
+
+fn srlm_is_monotone(records, eps) {
+    let n = len(records)
+    if n < 2 { return true }
+    let mut prev = records[0][2]
+    for i in 1..n {
+        let cur = records[i][2]
+        if cur + eps < prev { return false }
+        prev = cur
+    }
+    return true
+}
+
+fn srlm_to_dpo_ids_pair(str_pair, tokenizer_fn) {
+    let chosen = tokenizer_fn(str_pair[1])
+    let rejected = tokenizer_fn(str_pair[2])
+    return [chosen, rejected]
+}
+
+// ── Mock judge (1..5 rubric) — longer text, higher rubric ─────────
+fn mock_judge(prompt, response, criterion) {
+    let l = to_float(len(response))
+    let raw = 1.0 + l / 8.0
+    if raw > 5.0 { return 5.0 }
+    if raw < 1.0 { return 1.0 }
+    return raw
+}
+
+// ── Mock generator tied to an iteration counter ───────────────────
+// Each iteration draws from a progressively better response bank.
+let mut iter_phase = 0
+let mut iter_ptr = 0
+fn mock_generate(prompt) {
+    let bank0 = ["a", "ab", "abc"]                                // poor
+    let bank1 = ["hello", "hello there", "hello there world"]      // middling
+    let bank2 = ["a longer helpful answer that is very useful indeed",
+                 "another helpful response with many tokens inside",
+                 "best response: fully aligned, safe, and extremely helpful"]
+    iter_ptr = iter_ptr + 1
+    let idx = iter_ptr % 3
+    if iter_phase == 0 { return bank0[idx] }
+    if iter_phase == 1 { return bank1[idx] }
+    return bank2[idx]
+}
+
+// Simple tokenizer: byte values mod 251 + 1
+fn mock_tokenizer(text) {
+    let mut out = []
+    let chars = text.chars()
+    let n = len(chars)
+    for i in 0..n { out = out + [i + 1] }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  TESTS
+// ═══════════════════════════════════════════════════════════════════
+
+// T1: rubric levels
+let levels = srlm_rubric_levels()
+check("rubric has 5 levels", len(levels) == 5)
+check("level 0 is 1", levels[0] == 1)
+check("level 4 is 5", levels[4] == 5)
+
+// T2: default rubric criteria + weights
+let cn = srlm_default_rubric_criteria()
+let cw = srlm_default_rubric_weights()
+check("5 criteria", len(cn) == 5)
+check("5 weights", len(cw) == 5)
+let mut wsum = 0.0
+for wi in 0..len(cw) { wsum = wsum + cw[wi] }
+check("weights sum to 1.0", approx(wsum, 1.0, 0.01))
+
+// T3: clip
+check("clip low -> 1.0", approx(srlm_clip_rubric(0.3), 1.0, 0.001))
+check("clip high -> 5.0", approx(srlm_clip_rubric(12.0), 5.0, 0.001))
+check("clip mid passthrough", approx(srlm_clip_rubric(3.5), 3.5, 0.001))
+
+// T4: normalize
+check("normalize 1 -> 0", approx(srlm_normalize_rubric(1.0), 0.0, 0.001))
+check("normalize 5 -> 1", approx(srlm_normalize_rubric(5.0), 1.0, 0.001))
+check("normalize 3 -> 0.5", approx(srlm_normalize_rubric(3.0), 0.5, 0.001))
+
+// T5: self-prompt
+let sp = srlm_make_self_prompt("Explain gradient descent.", 2)
+check("self-prompt includes iter", sp.contains("iter=2"))
+check("self-prompt includes seed", sp.contains("gradient descent"))
+
+// T6: judge rubric prompt
+let jp = srlm_make_judge_rubric_prompt("q?", "ans", cn, cw)
+check("judge prompt non-empty", len(jp) > 80)
+check("judge prompt contains rubric header", jp.contains("JUDGE RUBRIC 1..5"))
+
+// T7: score_one monotone
+let s_short = srlm_score_one("q", "a", cn, cw, mock_judge)
+let s_long = srlm_score_one("q", "a much longer and more helpful answer text body", cn, cw, mock_judge)
+check("longer response scores higher", s_long > s_short)
+check("short score in [0,1]", s_short >= 0.0 && s_short <= 1.0)
+check("long score in [0,1]", s_long >= 0.0 && s_long <= 1.0)
+
+// T8: score_batch length
+let sb = srlm_score_batch("q", ["a", "bb", "ccc"], cn, cw, mock_judge)
+check("score_batch preserves length", len(sb) == 3)
+
+// T9: argmax / argmin
+let vals = [0.1, 0.9, 0.4, 0.2]
+check("argmax picks 1", srlm_argmax_index(vals) == 1)
+check("argmin picks 0", srlm_argmin_index(vals) == 0)
+check("argmax empty -> -1", srlm_argmax_index([]) == -1)
+
+// T10: make_dpo_pair
+let resps = ["a", "longer answer", "mid"]
+let scrs = srlm_score_batch("q", resps, cn, cw, mock_judge)
+let pair = srlm_make_dpo_pair("q", resps, scrs)
+let pair_margin = srlm_pair_margin(scrs)
+check("pair has 3 slots", len(pair) == 3)
+check("pair chosen is longer answer", pair[1] == "longer answer")
+check("pair rejected is short a", pair[2] == "a")
+check("pair margin > 0", pair_margin > 0.0)
+
+// T11: build_pairs filters ties
+let rb = [["a", "bb"], ["same", "same"]]
+let sbatch = [[0.1, 0.8], [0.5, 0.5]]
+let built = srlm_build_pairs(["p1", "p2"], rb, sbatch)
+check("build_pairs drops ties (len == 1)", len(built) == 1)
+check("build_pairs kept item is pair triple", len(built[0]) == 3)
+
+// T12: iteration returns pairs + stats (two calls)
+iter_phase = 1
+iter_ptr = 0
+let it_pairs = srlm_iteration_pairs(["q1", "q2"], mock_generate, mock_judge, 3, cn, cw)
+iter_phase = 1
+iter_ptr = 0
+let it_stats = srlm_iteration_stats(["q1", "q2"], mock_generate, mock_judge, 3, cn, cw)
+check("iteration pairs count <= n_prompts", len(it_pairs) <= 2)
+check("iteration stats length = 4", len(it_stats) == 4)
+check("iteration stats n matches", approx(it_stats[0], 2.0, 0.01))
+
+// T13: run_loop produces n_iters records
+iter_phase = 0
+iter_ptr = 0
+let mut rec_all = []
+for phase in 0..3 {
+    iter_phase = phase
+    iter_ptr = 0
+    let stats = srlm_iteration_stats(["q1"], mock_generate, mock_judge, 3, cn, cw)
+    let rec = [to_float(phase), stats[0], stats[1], stats[2], stats[3]]
+    rec_all = rec_all + [rec]
+}
+check("loop produced 3 records", len(rec_all) == 3)
+
+// T14: quality delta improves across phases
+let qd = srlm_quality_delta(rec_all)
+check("delta_top >= 0 after good progression", qd[0] >= 0.0)
+check("final top >= first top", rec_all[2][2] >= rec_all[0][2])
+
+// T15: monotone detector
+let good_recs = [[0.0, 1.0, 0.2, 0.1, 0.1],
+                 [1.0, 1.0, 0.4, 0.1, 0.3],
+                 [2.0, 1.0, 0.6, 0.1, 0.5]]
+let bad_recs  = [[0.0, 1.0, 0.6, 0.1, 0.5],
+                 [1.0, 1.0, 0.2, 0.1, 0.1]]
+check("monotone detects good sequence", srlm_is_monotone(good_recs, 0.0))
+check("monotone rejects regression", srlm_is_monotone(bad_recs, 0.01) == false)
+
+// T16: tokenizer bridge
+let fake_pair = ["q", "abc", "de"]
+let id_pair = srlm_to_dpo_ids_pair(fake_pair, mock_tokenizer)
+check("tokenized chosen length", len(id_pair[0]) == 3)
+check("tokenized rejected length", len(id_pair[1]) == 2)
+
+// ═══════════════════════════════════════════════════════════════════
+println("")
+println("=== self_rewarding test summary ===")
+println("PASS: " + str(pass_count))
+println("FAIL: " + str(fail_count))
+println("TOTAL: " + str(pass_count + fail_count))

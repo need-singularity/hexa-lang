@@ -1,0 +1,638 @@
+// ═══════════════════════════════════════════════════════════════
+//  test_zero_optimizer.hexa — DeepSpeed ZeRO-1/2/3 unit tests
+//
+//  Validates:
+//    1.  shard boundary arithmetic (uneven split)
+//    2.  scatter+gather round-trip identity
+//    3.  reduce-scatter sums ranks and splits shards
+//    4.  ZeRO-1 single step matches single-rank Adam
+//    5.  ZeRO-1 two steps match single-rank Adam (bias correction works)
+//    6.  ZeRO-1 matches across 2 different num_ranks settings
+//    7.  ZeRO-2 single step matches single-rank Adam
+//    8.  ZeRO-3 single step matches single-rank Adam
+//    9.  ZeRO-3 materialize_params reconstructs the sharded vector
+//   10. memory footprint: ZeRO-1 ~ param_size * 2 + 2 * shard
+//   11. memory savings ratio: ZeRO-1 > baseline
+//   12. memory savings ratio: ZeRO-2 > ZeRO-1
+//   13. memory savings ratio: ZeRO-3 > ZeRO-2
+//   14. Adam moment shards are non-zero after the step
+//   15. Adam step with all-zero grads leaves params unchanged
+//
+//  Execution: ./hexa self/test_zero_optimizer.hexa
+// ═══════════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn approx_eq(a, b, tol) {
+    fabs(a - b) < tol
+}
+
+fn arrays_close(a, b, tol) {
+    if len(a) != len(b) { return false }
+    let n = len(a)
+    let mut i = 0
+    while i < n {
+        if fabs(a[i] - b[i]) > tol { return false }
+        i = i + 1
+    }
+    true
+}
+
+// ───────────────────────────────────────────────────────────────
+//  Inlined zero_optimizer module (self-contained test)
+// ───────────────────────────────────────────────────────────────
+
+let ZO_BETA1 = 0.9
+let ZO_BETA2 = 0.999
+let ZO_EPS   = 1.0e-8
+
+let ZERO_STAGE_1 = 1
+let ZERO_STAGE_2 = 2
+let ZERO_STAGE_3 = 3
+
+struct ZeroContext {
+    num_ranks: int,
+    param_size: int,
+    stage: int,
+    params: array,
+    grads: array,
+    m_shards: array,
+    v_shards: array,
+    grad_shards: array,
+    param_shards: array,
+    t: int
+}
+
+fn zo_shard_begin(total, num_ranks, rank) {
+    (total * rank) / num_ranks
+}
+
+fn zo_shard_end(total, num_ranks, rank) {
+    (total * (rank + 1)) / num_ranks
+}
+
+fn zo_shard_size(total, num_ranks, rank) {
+    zo_shard_end(total, num_ranks, rank) - zo_shard_begin(total, num_ranks, rank)
+}
+
+fn zo_zeros(n) {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [0.0]
+        i = i + 1
+    }
+    out
+}
+
+fn zo_copy(src) {
+    let n = len(src)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [src[i]]
+        i = i + 1
+    }
+    out
+}
+
+fn zo_slice(src, begin, end) {
+    let mut out = []
+    let mut i = begin
+    while i < end {
+        out = out + [src[i]]
+        i = i + 1
+    }
+    out
+}
+
+fn zo_scatter(src, num_ranks) {
+    let total = len(src)
+    let mut out = []
+    let mut r = 0
+    while r < num_ranks {
+        let b = zo_shard_begin(total, num_ranks, r)
+        let e = zo_shard_end(total, num_ranks, r)
+        out = out + [zo_slice(src, b, e)]
+        r = r + 1
+    }
+    out
+}
+
+fn zo_gather(shards) {
+    let num_ranks = len(shards)
+    let mut out = []
+    let mut r = 0
+    while r < num_ranks {
+        let shard = shards[r]
+        let sz = len(shard)
+        let mut i = 0
+        while i < sz {
+            out = out + [shard[i]]
+            i = i + 1
+        }
+        r = r + 1
+    }
+    out
+}
+
+fn zo_pow_pos(base, e) {
+    let mut out = 1.0
+    let mut k = 0
+    while k < e {
+        out = out * base
+        k = k + 1
+    }
+    out
+}
+
+fn zo_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut y = x
+    let mut i = 0
+    while i < 20 {
+        y = 0.5 * (y + x / y)
+        i = i + 1
+    }
+    y
+}
+
+fn zo_all_gather(shards) {
+    zo_gather(shards)
+}
+
+fn zo_reduce_scatter(grads_per_rank, num_ranks) {
+    let p = len(grads_per_rank[0])
+    let mut summed = zo_zeros(p)
+    let mut r = 0
+    while r < num_ranks {
+        let g = grads_per_rank[r]
+        let mut i = 0
+        while i < p {
+            summed[i] = summed[i] + g[i]
+            i = i + 1
+        }
+        r = r + 1
+    }
+    zo_scatter(summed, num_ranks)
+}
+
+fn zo_create(num_ranks, init_params, stage) {
+    let p = len(init_params)
+    let mut m_shards = []
+    let mut v_shards = []
+    let mut r = 0
+    while r < num_ranks {
+        let sz = zo_shard_size(p, num_ranks, r)
+        m_shards = m_shards + [zo_zeros(sz)]
+        v_shards = v_shards + [zo_zeros(sz)]
+        r = r + 1
+    }
+    let params_copy = zo_copy(init_params)
+    let param_shards = zo_scatter(init_params, num_ranks)
+    let empty_grad_shards = []
+    ZeroContext {
+        num_ranks: num_ranks,
+        param_size: p,
+        stage: stage,
+        params: params_copy,
+        grads: zo_zeros(p),
+        m_shards: m_shards,
+        v_shards: v_shards,
+        grad_shards: empty_grad_shards,
+        param_shards: param_shards,
+        t: 0
+    }
+}
+
+fn zo_set_grads(ctx, grads) {
+    ZeroContext {
+        num_ranks: ctx.num_ranks,
+        param_size: ctx.param_size,
+        stage: ctx.stage,
+        params: ctx.params,
+        grads: zo_copy(grads),
+        m_shards: ctx.m_shards,
+        v_shards: ctx.v_shards,
+        grad_shards: ctx.grad_shards,
+        param_shards: ctx.param_shards,
+        t: ctx.t
+    }
+}
+
+fn zo_adam_update_shard(param_slice, grad_slice, m_in, v_in, lr, t) {
+    let sz = len(grad_slice)
+    let mut p = zo_copy(param_slice)
+    let mut m = zo_copy(m_in)
+    let mut v = zo_copy(v_in)
+    let b1 = ZO_BETA1
+    let b2 = ZO_BETA2
+    let eps = ZO_EPS
+    let bc1 = 1.0 - zo_pow_pos(b1, t)
+    let bc2 = 1.0 - zo_pow_pos(b2, t)
+    let mut i = 0
+    while i < sz {
+        let g = grad_slice[i]
+        let mnew = b1 * m[i] + (1.0 - b1) * g
+        let vnew = b2 * v[i] + (1.0 - b2) * g * g
+        m[i] = mnew
+        v[i] = vnew
+        let m_hat = mnew / bc1
+        let v_hat = vnew / bc2
+        let step = lr * m_hat / (zo_sqrt(v_hat) + eps)
+        p[i] = p[i] - step
+        i = i + 1
+    }
+    [p, m, v]
+}
+
+fn zo_step_zero1(ctx, lr) {
+    let n = ctx.num_ranks
+    let p = ctx.param_size
+    let tnew = ctx.t + 1
+    let mut new_param_shards = []
+    let mut new_m = []
+    let mut new_v = []
+    let mut r = 0
+    while r < n {
+        let sb = zo_shard_begin(p, n, r)
+        let se = zo_shard_end(p, n, r)
+        let g_slice = zo_slice(ctx.grads, sb, se)
+        let p_slice = zo_slice(ctx.params, sb, se)
+        let res = zo_adam_update_shard(p_slice, g_slice,
+            ctx.m_shards[r], ctx.v_shards[r], lr, tnew)
+        new_param_shards = new_param_shards + [res[0]]
+        new_m = new_m + [res[1]]
+        new_v = new_v + [res[2]]
+        r = r + 1
+    }
+    let new_params = zo_gather(new_param_shards)
+    ZeroContext {
+        num_ranks: ctx.num_ranks,
+        param_size: ctx.param_size,
+        stage: ctx.stage,
+        params: new_params,
+        grads: zo_zeros(p),
+        m_shards: new_m,
+        v_shards: new_v,
+        grad_shards: ctx.grad_shards,
+        param_shards: new_param_shards,
+        t: tnew
+    }
+}
+
+fn zo_step_zero2(ctx, lr) {
+    let n = ctx.num_ranks
+    let p = ctx.param_size
+    let tnew = ctx.t + 1
+    let mut per_rank_grads = []
+    let mut r = 0
+    while r < n {
+        per_rank_grads = per_rank_grads + [zo_copy(ctx.grads)]
+        r = r + 1
+    }
+    let scatter_in_shards = zo_reduce_scatter(per_rank_grads, n)
+    let mut g_shards = []
+    r = 0
+    while r < n {
+        let sh = scatter_in_shards[r]
+        let sz = len(sh)
+        let mut scaled = []
+        let mut i = 0
+        while i < sz {
+            scaled = scaled + [sh[i] / (n * 1.0)]
+            i = i + 1
+        }
+        g_shards = g_shards + [scaled]
+        r = r + 1
+    }
+    let mut new_param_shards = []
+    let mut new_m = []
+    let mut new_v = []
+    r = 0
+    while r < n {
+        let sb = zo_shard_begin(p, n, r)
+        let se = zo_shard_end(p, n, r)
+        let p_slice = zo_slice(ctx.params, sb, se)
+        let res = zo_adam_update_shard(p_slice, g_shards[r],
+            ctx.m_shards[r], ctx.v_shards[r], lr, tnew)
+        new_param_shards = new_param_shards + [res[0]]
+        new_m = new_m + [res[1]]
+        new_v = new_v + [res[2]]
+        r = r + 1
+    }
+    let new_params = zo_gather(new_param_shards)
+    ZeroContext {
+        num_ranks: ctx.num_ranks,
+        param_size: ctx.param_size,
+        stage: ctx.stage,
+        params: new_params,
+        grads: zo_zeros(p),
+        m_shards: new_m,
+        v_shards: new_v,
+        grad_shards: g_shards,
+        param_shards: new_param_shards,
+        t: tnew
+    }
+}
+
+fn zo_step_zero3(ctx, lr) {
+    let n = ctx.num_ranks
+    let p = ctx.param_size
+    let tnew = ctx.t + 1
+    let mut per_rank_grads = []
+    let mut r = 0
+    while r < n {
+        per_rank_grads = per_rank_grads + [zo_copy(ctx.grads)]
+        r = r + 1
+    }
+    let scatter_in_shards = zo_reduce_scatter(per_rank_grads, n)
+    let mut g_shards = []
+    r = 0
+    while r < n {
+        let sh = scatter_in_shards[r]
+        let sz = len(sh)
+        let mut scaled = []
+        let mut i = 0
+        while i < sz {
+            scaled = scaled + [sh[i] / (n * 1.0)]
+            i = i + 1
+        }
+        g_shards = g_shards + [scaled]
+        r = r + 1
+    }
+    let mut new_param_shards = []
+    let mut new_m = []
+    let mut new_v = []
+    r = 0
+    while r < n {
+        let res = zo_adam_update_shard(ctx.param_shards[r], g_shards[r],
+            ctx.m_shards[r], ctx.v_shards[r], lr, tnew)
+        new_param_shards = new_param_shards + [res[0]]
+        new_m = new_m + [res[1]]
+        new_v = new_v + [res[2]]
+        r = r + 1
+    }
+    ZeroContext {
+        num_ranks: ctx.num_ranks,
+        param_size: ctx.param_size,
+        stage: ctx.stage,
+        params: zo_zeros(p),
+        grads: zo_zeros(p),
+        m_shards: new_m,
+        v_shards: new_v,
+        grad_shards: g_shards,
+        param_shards: new_param_shards,
+        t: tnew
+    }
+}
+
+fn zo_step(ctx, lr) {
+    if ctx.stage == ZERO_STAGE_1 { return zo_step_zero1(ctx, lr) }
+    if ctx.stage == ZERO_STAGE_2 { return zo_step_zero2(ctx, lr) }
+    if ctx.stage == ZERO_STAGE_3 { return zo_step_zero3(ctx, lr) }
+    zo_step_zero1(ctx, lr)
+}
+
+fn zo_materialize_params(ctx) {
+    zo_all_gather(ctx.param_shards)
+}
+
+fn zo_memory_per_rank(ctx, rank) {
+    let n = ctx.num_ranks
+    let p = ctx.param_size
+    let shard_sz = zo_shard_size(p, n, rank)
+    let m = len(ctx.m_shards[rank])
+    let v = len(ctx.v_shards[rank])
+    if ctx.stage == ZERO_STAGE_1 {
+        return p + p + m + v
+    }
+    if ctx.stage == ZERO_STAGE_2 {
+        return p + shard_sz + m + v
+    }
+    if ctx.stage == ZERO_STAGE_3 {
+        return shard_sz + shard_sz + m + v
+    }
+    p + p + p + p
+}
+
+fn zo_memory_baseline(ctx) {
+    let p = ctx.param_size
+    p + p + p + p
+}
+
+fn zo_memory_savings_ratio(ctx, rank) {
+    let base = zo_memory_baseline(ctx)
+    let cur = zo_memory_per_rank(ctx, rank)
+    if cur <= 0 { return 0.0 }
+    (base * 1.0) / (cur * 1.0)
+}
+
+// ───────────────────────────────────────────────────────────────
+//  Reference single-rank Adam (for cross-checking ZeRO-1/2/3)
+// ───────────────────────────────────────────────────────────────
+
+struct RefAdamState {
+    params: array,
+    m: array,
+    v: array,
+    t: int
+}
+
+fn ref_adam_create(init_params) {
+    let p = len(init_params)
+    RefAdamState {
+        params: zo_copy(init_params),
+        m: zo_zeros(p),
+        v: zo_zeros(p),
+        t: 0
+    }
+}
+
+fn ref_adam_step(state, grads, lr) {
+    let p = len(state.params)
+    let tnew = state.t + 1
+    let b1 = ZO_BETA1
+    let b2 = ZO_BETA2
+    let eps = ZO_EPS
+    let bc1 = 1.0 - zo_pow_pos(b1, tnew)
+    let bc2 = 1.0 - zo_pow_pos(b2, tnew)
+    let mut new_params = zo_copy(state.params)
+    let mut new_m = zo_copy(state.m)
+    let mut new_v = zo_copy(state.v)
+    let mut i = 0
+    while i < p {
+        let g = grads[i]
+        let mnew = b1 * new_m[i] + (1.0 - b1) * g
+        let vnew = b2 * new_v[i] + (1.0 - b2) * g * g
+        new_m[i] = mnew
+        new_v[i] = vnew
+        let m_hat = mnew / bc1
+        let v_hat = vnew / bc2
+        let step = lr * m_hat / (zo_sqrt(v_hat) + eps)
+        new_params[i] = new_params[i] - step
+        i = i + 1
+    }
+    RefAdamState {
+        params: new_params,
+        m: new_m,
+        v: new_v,
+        t: tnew
+    }
+}
+
+// ───────────────────────────────────────────────────────────────
+//  Tests
+// ───────────────────────────────────────────────────────────────
+
+println("[zero_optimizer test] starting ZeRO-1/2/3 unit tests")
+
+// ── Test 1: uneven shard boundaries (P=5, N=2) ──
+let t1_begin0 = zo_shard_begin(5, 2, 0)
+let t1_end0   = zo_shard_end(5, 2, 0)
+let t1_begin1 = zo_shard_begin(5, 2, 1)
+let t1_end1   = zo_shard_end(5, 2, 1)
+check("shard boundaries P=5 N=2",
+    t1_begin0 == 0 && t1_end0 == 2
+    && t1_begin1 == 2 && t1_end1 == 5)
+
+// ── Test 2: scatter+gather round trip ──
+let t2_src = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+let t2_shards = zo_scatter(t2_src, 4)
+let t2_round = zo_gather(t2_shards)
+check("scatter+gather round trip", arrays_close(t2_src, t2_round, 1.0e-9))
+
+// ── Test 3: reduce-scatter sums + shards ──
+let t3_a = [1.0, 2.0, 3.0, 4.0]
+let t3_b = [0.5, 0.5, 0.5, 0.5]
+let t3_shards = zo_reduce_scatter([t3_a, t3_b], 2)
+// Expected sum: [1.5, 2.5, 3.5, 4.5] split into [[1.5,2.5],[3.5,4.5]]
+let t3_shard0 = t3_shards[0]
+let t3_shard1 = t3_shards[1]
+check("reduce-scatter phase",
+    approx_eq(t3_shard0[0], 1.5, 1.0e-9)
+    && approx_eq(t3_shard0[1], 2.5, 1.0e-9)
+    && approx_eq(t3_shard1[0], 3.5, 1.0e-9)
+    && approx_eq(t3_shard1[1], 4.5, 1.0e-9))
+
+// ── Shared fixture ──
+let init_w = [0.5, -0.3, 0.8, -0.1, 0.4, 0.2, -0.6, 0.7]
+let fixture_grad = [0.1, -0.05, 0.2, 0.01, -0.07, 0.04, -0.02, 0.08]
+let fixture_lr = 0.01
+
+// ── Test 4: ZeRO-1 single step = single-rank Adam ──
+let ref1 = ref_adam_create(init_w)
+let ref1_after = ref_adam_step(ref1, fixture_grad, fixture_lr)
+
+let z1 = zo_create(2, init_w, ZERO_STAGE_1)
+let z1_g = zo_set_grads(z1, fixture_grad)
+let z1_after = zo_step(z1_g, fixture_lr)
+check("ZeRO-1 single step matches single-rank Adam",
+    arrays_close(z1_after.params, ref1_after.params, 1.0e-7))
+
+// ── Test 5: ZeRO-1 two steps match single-rank Adam ──
+let ref2_step1 = ref_adam_step(ref1, fixture_grad, fixture_lr)
+let ref2_step2 = ref_adam_step(ref2_step1, fixture_grad, fixture_lr)
+
+let z2 = zo_create(2, init_w, ZERO_STAGE_1)
+let z2_g1 = zo_set_grads(z2, fixture_grad)
+let z2_s1 = zo_step(z2_g1, fixture_lr)
+let z2_g2 = zo_set_grads(z2_s1, fixture_grad)
+let z2_s2 = zo_step(z2_g2, fixture_lr)
+check("ZeRO-1 two steps match single-rank Adam (bias correction)",
+    arrays_close(z2_s2.params, ref2_step2.params, 1.0e-7))
+
+// ── Test 6: ZeRO-1 invariant across rank counts ──
+let z3a = zo_create(4, init_w, ZERO_STAGE_1)
+let z3a_g = zo_set_grads(z3a, fixture_grad)
+let z3a_after = zo_step(z3a_g, fixture_lr)
+check("ZeRO-1 invariant across rank counts",
+    arrays_close(z3a_after.params, z1_after.params, 1.0e-7))
+
+// ── Test 7: ZeRO-2 single step = single-rank Adam ──
+let z7 = zo_create(2, init_w, ZERO_STAGE_2)
+let z7_g = zo_set_grads(z7, fixture_grad)
+let z7_after = zo_step(z7_g, fixture_lr)
+check("ZeRO-2 single step matches single-rank Adam",
+    arrays_close(z7_after.params, ref1_after.params, 1.0e-7))
+
+// ── Test 8: ZeRO-3 single step = single-rank Adam (via gather) ──
+let z8 = zo_create(2, init_w, ZERO_STAGE_3)
+let z8_g = zo_set_grads(z8, fixture_grad)
+let z8_after = zo_step(z8_g, fixture_lr)
+let z8_gathered = zo_materialize_params(z8_after)
+check("ZeRO-3 single step matches single-rank Adam",
+    arrays_close(z8_gathered, ref1_after.params, 1.0e-7))
+
+// ── Test 9: ZeRO-3 materialize_params reconstructs init ──
+let z9 = zo_create(2, init_w, ZERO_STAGE_3)
+let z9_init_gather = zo_materialize_params(z9)
+check("ZeRO-3 materialize_params reconstructs init",
+    arrays_close(z9_init_gather, init_w, 1.0e-9))
+
+// ── Test 10: memory footprint arithmetic for ZeRO-1 (rank 0) ──
+// P=8, N=2, shard=4 → expected 8+8+4+4 = 24
+let z10 = zo_create(2, init_w, ZERO_STAGE_1)
+let t10_mem = zo_memory_per_rank(z10, 0)
+check("ZeRO-1 memory per rank = 2P + 2*(P/N)", t10_mem == 24)
+
+// ── Test 11: ZeRO-1 savings ratio < baseline_ratio (= 1.0) ──
+let t11_base = zo_memory_baseline(z10)
+let t11_ratio = zo_memory_savings_ratio(z10, 0)
+check("ZeRO-1 memory savings ratio > 1.0",
+    t11_base == 32 && t11_ratio > 1.0)
+
+// ── Test 12: ZeRO-2 savings ratio > ZeRO-1 savings ratio ──
+let z12_1 = zo_create(2, init_w, ZERO_STAGE_1)
+let z12_2 = zo_create(2, init_w, ZERO_STAGE_2)
+let r12_1 = zo_memory_savings_ratio(z12_1, 0)
+let r12_2 = zo_memory_savings_ratio(z12_2, 0)
+check("ZeRO-2 savings ratio > ZeRO-1", r12_2 > r12_1)
+
+// ── Test 13: ZeRO-3 savings ratio > ZeRO-2 savings ratio ──
+let z13 = zo_create(2, init_w, ZERO_STAGE_3)
+let r13 = zo_memory_savings_ratio(z13, 0)
+check("ZeRO-3 savings ratio > ZeRO-2", r13 > r12_2)
+
+// ── Test 14: Adam moment shards are populated after step ──
+let t14_shard0 = z1_after.m_shards[0]
+let t14_shard1 = z1_after.m_shards[1]
+check("Adam m shards populated after step",
+    len(t14_shard0) == 4 && len(t14_shard1) == 4
+    && fabs(t14_shard0[0]) > 1.0e-9)
+
+// ── Test 15: zero-grad step leaves params unchanged ──
+let z15 = zo_create(2, init_w, ZERO_STAGE_1)
+let z15_after = zo_step(z15, fixture_lr)
+check("zero-grad step preserves params",
+    arrays_close(z15_after.params, init_w, 1.0e-12))
+
+// ───────────────────────────────────────────────────────────────
+println("")
+println("════════════════════════════════════════════════")
+println("  ZeRO Optimizer test results")
+println("  PASS: " + str(pass_count))
+println("  FAIL: " + str(fail_count))
+println("════════════════════════════════════════════════")
+
+if fail_count == 0 {
+    println("[zero_optimizer test] ALL PASS")
+} else {
+    println("[zero_optimizer test] FAIL")
+}

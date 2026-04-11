@@ -1,0 +1,385 @@
+// ===================================================================
+//  self/ml/tree_of_thoughts.hexa — Tree of Thoughts (ToT) reasoning (pure .hexa)
+//
+//  ML roadmap id=55. Pure HEXA, HX4 self-host, no Rust, no FFI.
+//
+//  Core pieces:
+//    1. Thought node     — id, parent, depth, content, score
+//    2. expand_thoughts  — generate k candidate next steps from a node
+//    3. score_thought    — voting + heuristic score (pluggable)
+//    4. tot_search_bfs   — breadth-first exploration with width limit
+//    5. tot_search_dfs   — depth-first exploration with backtracking
+//    6. combine_best     — majority vote / best-score combination
+//    7. tot_solve        — end-to-end driver with depth & width caps
+//
+//  Node representation (array-based, G5 struct-literal-in-if safe):
+//    node = [id, parent_id, depth, content, score]
+//             int int        int    string   float
+//
+//  Array indexing helpers (TOT_ID/TOT_PARENT/...) keep the code readable
+//  and avoid magic numbers while staying parser-friendly (no tuple returns).
+// ===================================================================
+
+// ── node layout constants ─────────────────────────────────────────
+fn tot_id_of(node)      { return node[0] }
+fn tot_parent_of(node)  { return node[1] }
+fn tot_depth_of(node)   { return node[2] }
+fn tot_content_of(node) { return node[3] }
+fn tot_score_of(node)   { return node[4] }
+
+fn tot_make_node(id, parent, depth, content, score) {
+    return [id, parent, depth, content, score]
+}
+
+// ── tiny deterministic hash (no RNG) ──────────────────────────────
+fn tot_hash(seed, s) {
+    let mut h = seed
+    let n = len(s)
+    let mut i = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        // string -> small int via length-weighted mix
+        let cv = len(c) + i * 7
+        h = (h * 1315423911 + cv * 2654435761 + 1) % 1000003
+        i = i + 1
+    }
+    return h
+}
+
+fn tot_fabs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// ===================================================================
+//  expand_thoughts — generate `k` candidate thoughts from a parent
+//
+//  deterministic (no randomness) so tests are reproducible.
+//  `suffixes` is the candidate vocabulary (array of strings).
+//  Only the first `k` suffixes are emitted; if k > len(suffixes)
+//  we wrap around.
+// ===================================================================
+fn tot_expand(parent_node, suffixes, k, next_id_start) {
+    let parent_id = tot_id_of(parent_node)
+    let parent_depth = tot_depth_of(parent_node)
+    let parent_content = tot_content_of(parent_node)
+    let ns = len(suffixes)
+    let mut out = []
+    let mut i = 0
+    while i < k {
+        let idx = i % ns
+        let suf = suffixes[idx]
+        let new_content = parent_content + " -> " + suf
+        let new_id = next_id_start + i
+        let child = tot_make_node(new_id, parent_id, parent_depth + 1, new_content, 0.0)
+        out = out + [child]
+        i = i + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  score_thought — voting + heuristic
+//
+//  Heuristic rewards:
+//    +1.0 per keyword hit (from `keywords`)
+//    -0.25 per repeated token in content
+//    +0.1 * depth (prefer progress)
+//  Voting: majority across multiple voters (deterministic hashes)
+// ===================================================================
+fn tot_heuristic(content, keywords, depth) {
+    let mut score = 0.1 * to_float(depth)
+    let nk = len(keywords)
+    let mut i = 0
+    while i < nk {
+        let kw = keywords[i]
+        if content.index_of(kw) >= 0 {
+            score = score + 1.0
+        }
+        i = i + 1
+    }
+    // duplication penalty: count occurrences of the last arrow token
+    let arrow = " -> "
+    let mut cnt = 0
+    let mut j = 0
+    let cl = len(content)
+    let al = len(arrow)
+    while j + al <= cl {
+        if content.substring(j, j + al) == arrow {
+            cnt = cnt + 1
+        }
+        j = j + 1
+    }
+    if cnt > depth { score = score - 0.25 * to_float(cnt - depth) }
+    return score
+}
+
+fn tot_vote(content, keywords, num_voters) {
+    let mut total = 0.0
+    let mut v = 0
+    while v < num_voters {
+        // each voter biases its own keyword subset via mod
+        let nk = len(keywords)
+        if nk == 0 { return 0.0 }
+        let mut hits = 0.0
+        let mut i = 0
+        while i < nk {
+            if (i + v) % 2 == 0 {
+                let kw = keywords[i]
+                if content.index_of(kw) >= 0 {
+                    hits = hits + 1.0
+                }
+            }
+            i = i + 1
+        }
+        total = total + hits
+        v = v + 1
+    }
+    if num_voters == 0 { return 0.0 }
+    return total / to_float(num_voters)
+}
+
+fn tot_score(node, keywords, num_voters) {
+    let content = tot_content_of(node)
+    let depth = tot_depth_of(node)
+    let h = tot_heuristic(content, keywords, depth)
+    let v = tot_vote(content, keywords, num_voters)
+    return h + 0.5 * v
+}
+
+// ===================================================================
+//  tot_search_bfs — BFS with width (beam) cap per depth
+//
+//  Returns all explored nodes (already scored) up to max_depth.
+//  `beam_width` limits frontier size at each depth (best-first).
+// ===================================================================
+fn tot_search_bfs(root_content, suffixes, keywords, max_depth, beam_width, num_voters) {
+    let root = tot_make_node(0, -1, 0, root_content, 0.0)
+    let root_scored = tot_make_node(0, -1, 0, root_content, tot_score(root, keywords, num_voters))
+    let mut all_nodes = [root_scored]
+    let mut frontier = [root_scored]
+    let mut next_id = 1
+    let mut d = 0
+    while d < max_depth {
+        let mut children = []
+        let nf = len(frontier)
+        let mut i = 0
+        while i < nf {
+            let parent = frontier[i]
+            let expanded = tot_expand(parent, suffixes, beam_width, next_id)
+            next_id = next_id + len(expanded)
+            let ne = len(expanded)
+            let mut j = 0
+            while j < ne {
+                let child = expanded[j]
+                let sc = tot_score(child, keywords, num_voters)
+                let scored = tot_make_node(tot_id_of(child), tot_parent_of(child), tot_depth_of(child), tot_content_of(child), sc)
+                children = children + [scored]
+                j = j + 1
+            }
+            i = i + 1
+        }
+        // append all, but prune frontier to top-`beam_width` by score
+        let cn = len(children)
+        let mut k = 0
+        while k < cn {
+            all_nodes = all_nodes + [children[k]]
+            k = k + 1
+        }
+        frontier = tot_topk(children, beam_width)
+        if len(frontier) == 0 { d = max_depth }
+        d = d + 1
+    }
+    return all_nodes
+}
+
+// ===================================================================
+//  tot_topk — return top-k nodes by score (stable selection sort)
+// ===================================================================
+fn tot_topk(nodes, k) {
+    let n = len(nodes)
+    if n == 0 { return [] }
+    // copy into mutable array
+    let mut arr = []
+    let mut a = 0
+    while a < n {
+        arr = arr + [nodes[a]]
+        a = a + 1
+    }
+    // selection sort descending by score
+    let mut i = 0
+    while i < n {
+        let mut best = i
+        let mut j = i + 1
+        while j < n {
+            if tot_score_of(arr[j]) > tot_score_of(arr[best]) {
+                best = j
+            }
+            j = j + 1
+        }
+        if best != i {
+            let tmp = arr[i]
+            arr[i] = arr[best]
+            arr[best] = tmp
+        }
+        i = i + 1
+    }
+    let take = if k < n { k } else { n }
+    let mut out = []
+    let mut m = 0
+    while m < take {
+        out = out + [arr[m]]
+        m = m + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  tot_search_dfs — DFS with explicit stack + backtracking
+//
+//  Depth limit stops descent. Returns all visited nodes scored.
+//  Backtracking is the implicit pop of the stack.
+// ===================================================================
+fn tot_search_dfs(root_content, suffixes, keywords, max_depth, branch, num_voters) {
+    let root = tot_make_node(0, -1, 0, root_content, 0.0)
+    let root_s = tot_make_node(0, -1, 0, root_content, tot_score(root, keywords, num_voters))
+    let mut visited = [root_s]
+    let mut stack = [root_s]
+    let mut next_id = 1
+    while len(stack) > 0 {
+        // pop
+        let top = len(stack) - 1
+        let cur = stack[top]
+        let mut new_stack = []
+        let mut z = 0
+        while z < top {
+            new_stack = new_stack + [stack[z]]
+            z = z + 1
+        }
+        stack = new_stack
+        if tot_depth_of(cur) < max_depth {
+            let kids = tot_expand(cur, suffixes, branch, next_id)
+            next_id = next_id + len(kids)
+            let nk = len(kids)
+            let mut ii = 0
+            while ii < nk {
+                let child = kids[ii]
+                let sc = tot_score(child, keywords, num_voters)
+                let child_s = tot_make_node(tot_id_of(child), tot_parent_of(child), tot_depth_of(child), tot_content_of(child), sc)
+                visited = visited + [child_s]
+                stack = stack + [child_s]
+                ii = ii + 1
+            }
+        }
+    }
+    return visited
+}
+
+// ===================================================================
+//  combine_best — pick single best leaf by score
+// ===================================================================
+fn tot_combine_best(nodes) {
+    let n = len(nodes)
+    if n == 0 { return [] }
+    let mut best = nodes[0]
+    let mut i = 1
+    while i < n {
+        if tot_score_of(nodes[i]) > tot_score_of(best) {
+            best = nodes[i]
+        }
+        i = i + 1
+    }
+    return best
+}
+
+// ===================================================================
+//  combine_majority — majority vote over leaf contents by final suffix
+//
+//  Returns the most common trailing token (after last " -> ") among
+//  leaves at max_depth. Ties broken by first seen.
+// ===================================================================
+fn tot_last_suffix(content) {
+    let arrow = " -> "
+    let al = len(arrow)
+    let cl = len(content)
+    let mut last = 0
+    let mut j = 0
+    while j + al <= cl {
+        if content.substring(j, j + al) == arrow {
+            last = j + al
+        }
+        j = j + 1
+    }
+    return content.substring(last, cl)
+}
+
+fn tot_combine_majority(nodes, target_depth) {
+    let n = len(nodes)
+    if n == 0 { return "" }
+    // gather leaves at target_depth
+    let mut labels = []
+    let mut i = 0
+    while i < n {
+        if tot_depth_of(nodes[i]) == target_depth {
+            labels = labels + [tot_last_suffix(tot_content_of(nodes[i]))]
+        }
+        i = i + 1
+    }
+    let nl = len(labels)
+    if nl == 0 { return "" }
+    // count via O(n^2) because we only care about small leaf sets
+    let mut best_label = labels[0]
+    let mut best_count = 0
+    let mut a = 0
+    while a < nl {
+        let cand = labels[a]
+        let mut c = 0
+        let mut b = 0
+        while b < nl {
+            if labels[b] == cand { c = c + 1 }
+            b = b + 1
+        }
+        if c > best_count {
+            best_count = c
+            best_label = cand
+        }
+        a = a + 1
+    }
+    return best_label
+}
+
+// ===================================================================
+//  tot_solve — end-to-end driver
+//
+//  mode: "bfs" or "dfs"
+//  combine: "best" or "majority"
+//  Returns [best_node_or_empty, majority_label, num_visited]
+// ===================================================================
+fn tot_solve(root_content, suffixes, keywords, max_depth, width, num_voters, mode, combine) {
+    let mut nodes = []
+    if mode == "bfs" {
+        nodes = tot_search_bfs(root_content, suffixes, keywords, max_depth, width, num_voters)
+    } else {
+        nodes = tot_search_dfs(root_content, suffixes, keywords, max_depth, width, num_voters)
+    }
+    // pick leaves at max_depth
+    let mut leaves = []
+    let n = len(nodes)
+    let mut i = 0
+    while i < n {
+        if tot_depth_of(nodes[i]) == max_depth {
+            leaves = leaves + [nodes[i]]
+        }
+        i = i + 1
+    }
+    let mut best_node = []
+    if combine == "best" {
+        if len(leaves) > 0 {
+            best_node = tot_combine_best(leaves)
+        } else {
+            best_node = tot_combine_best(nodes)
+        }
+    }
+    let label = tot_combine_majority(nodes, max_depth)
+    return [best_node, label, n]
+}

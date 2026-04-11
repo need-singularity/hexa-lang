@@ -1,0 +1,290 @@
+// ═══════════════════════════════════════════════════════════════════
+//  test_simpo.hexa — SimPO (Reference-Free Preference Optimization) 검증
+//
+//  검증 항목 (>=12):
+//    1. sigmoid 범위 & zero
+//    2. log_sigmoid 음수 & half
+//    3. length_normalize basic
+//    4. length_normalize zero length guard
+//    5. reward scales with beta
+//    6. loss 양수 (margin zero 초기)
+//    7. loss 감소 (chosen 우세)
+//    8. loss 증가 (rejected 우세)
+//    9. gamma 효과 (target margin 강제)
+//   10. grad_w 음수 (업데이트 방향)
+//   11. grad_l 양수 (업데이트 방향)
+//   12. 단일 train step loss 감소
+//   13. 멀티 step 수렴
+//   14. preference accuracy
+//   15. reward margin 부호
+//   16. batch loss 평균
+//   17. DPO vs SimPO 비교
+//
+//  실행: ./hexa self/test_simpo.hexa
+// ═══════════════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ── inline SimPO helpers (self-contained so test runs standalone) ─
+
+fn sp_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn sp_log(x) {
+    if x <= 0.0 { return -30.0 }
+    let mut v = x
+    let mut count = 0
+    while v > 2.0 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    let d = v - 1.0
+    let ln_v = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_v
+}
+
+fn simpo_sigmoid(x) {
+    if x > 20.0 { return 1.0 }
+    if x < -20.0 { return 0.0 }
+    return 1.0 / (1.0 + sp_exp(0.0 - x))
+}
+
+fn simpo_log_sigmoid(x) {
+    let neg_x = 0.0 - x
+    if neg_x > 20.0 { return 0.0 - neg_x }
+    if neg_x < -20.0 { return 0.0 }
+    return 0.0 - sp_log(1.0 + sp_exp(neg_x))
+}
+
+fn simpo_length_normalize(log_p, length) {
+    if length <= 0 { return log_p }
+    return log_p / to_float(length)
+}
+
+fn simpo_reward(log_p, length, beta) {
+    return beta * simpo_length_normalize(log_p, length)
+}
+
+fn simpo_loss(log_p_w, log_p_l, len_w, len_l, beta, gamma) {
+    let r_w = simpo_reward(log_p_w, len_w, beta)
+    let r_l = simpo_reward(log_p_l, len_l, beta)
+    let margin = r_w - r_l - gamma
+    return 0.0 - simpo_log_sigmoid(margin)
+}
+
+fn simpo_loss_grad_lp_w(log_p_w, log_p_l, len_w, len_l, beta, gamma) {
+    let r_w = simpo_reward(log_p_w, len_w, beta)
+    let r_l = simpo_reward(log_p_l, len_l, beta)
+    let margin = r_w - r_l - gamma
+    let s = simpo_sigmoid(margin)
+    let one_minus_s = 1.0 - s
+    if len_w <= 0 { return 0.0 }
+    return 0.0 - one_minus_s * beta / to_float(len_w)
+}
+
+fn simpo_loss_grad_lp_l(log_p_w, log_p_l, len_w, len_l, beta, gamma) {
+    let r_w = simpo_reward(log_p_w, len_w, beta)
+    let r_l = simpo_reward(log_p_l, len_l, beta)
+    let margin = r_w - r_l - gamma
+    let s = simpo_sigmoid(margin)
+    let one_minus_s = 1.0 - s
+    if len_l <= 0 { return 0.0 }
+    return one_minus_s * beta / to_float(len_l)
+}
+
+fn simpo_reward_margin(log_p_w, log_p_l, len_w, len_l, beta) {
+    let r_w = simpo_reward(log_p_w, len_w, beta)
+    let r_l = simpo_reward(log_p_l, len_l, beta)
+    return r_w - r_l
+}
+
+fn simpo_preference_accuracy(log_p_w, log_p_l, len_w, len_l) {
+    let lp_w = simpo_length_normalize(log_p_w, len_w)
+    let lp_l = simpo_length_normalize(log_p_l, len_l)
+    if lp_w > lp_l { return 1.0 }
+    return 0.0
+}
+
+fn simpo_batch_loss(batch, beta, gamma) {
+    let n = len(batch)
+    if n == 0 { return 0.0 }
+    let mut total = 0.0
+    for i in 0..n {
+        let item = batch[i]
+        let log_p_w = item[0]
+        let log_p_l = item[1]
+        let len_w = item[2]
+        let len_l = item[3]
+        total = total + simpo_loss(log_p_w, log_p_l, len_w, len_l, beta, gamma)
+    }
+    return total / to_float(n)
+}
+
+fn simpo_train_step(log_p_w, log_p_l, len_w, len_l, beta, gamma, lr) {
+    let loss = simpo_loss(log_p_w, log_p_l, len_w, len_l, beta, gamma)
+    let g_w = simpo_loss_grad_lp_w(log_p_w, log_p_l, len_w, len_l, beta, gamma)
+    let g_l = simpo_loss_grad_lp_l(log_p_w, log_p_l, len_w, len_l, beta, gamma)
+    let new_lp_w = log_p_w - lr * g_w
+    let new_lp_l = log_p_l - lr * g_l
+    return [loss, new_lp_w, new_lp_l]
+}
+
+fn simpo_train(batch, n_steps, lr, beta, gamma) {
+    let mut lp_w = batch[0]
+    let mut lp_l = batch[1]
+    let len_w = batch[2]
+    let len_l = batch[3]
+    let mut last_loss = 0.0
+    let mut step = 0
+    while step < n_steps {
+        let r = simpo_train_step(lp_w, lp_l, len_w, len_l, beta, gamma, lr)
+        last_loss = r[0]
+        lp_w = r[1]
+        lp_l = r[2]
+        step = step + 1
+    }
+    return [last_loss, lp_w, lp_l]
+}
+
+fn simpo_dpo_vs_simpo(log_p_w, log_p_l, ref_w, ref_l, len_w, len_l, beta, gamma) {
+    let log_ratio_w = log_p_w - ref_w
+    let log_ratio_l = log_p_l - ref_l
+    let dpo_logit = beta * (log_ratio_w - log_ratio_l)
+    let dpo_l = 0.0 - simpo_log_sigmoid(dpo_logit)
+    let simpo_l = simpo_loss(log_p_w, log_p_l, len_w, len_l, beta, gamma)
+    return [dpo_l, simpo_l]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Tests
+// ═══════════════════════════════════════════════════════════════════
+
+println("=== SimPO Tests ===")
+
+// 1. sigmoid basic
+check("sigmoid_pos", simpo_sigmoid(5.0) > 0.99)
+check("sigmoid_neg", simpo_sigmoid(-5.0) < 0.01)
+check("sigmoid_zero", approx(simpo_sigmoid(0.0), 0.5, 0.01))
+
+// 2. log_sigmoid negative
+let ls = simpo_log_sigmoid(1.0)
+check("log_sigmoid_neg", ls < 0.0)
+let ls0 = simpo_log_sigmoid(0.0)
+check("log_sigmoid_half", approx(ls0, sp_log(0.5), 0.1))
+
+// 3. length normalize basic
+let n1 = simpo_length_normalize(-10.0, 5)
+check("length_normalize_basic", approx(n1, -2.0, 0.001))
+
+// 4. length normalize zero guard
+let n0 = simpo_length_normalize(-10.0, 0)
+check("length_normalize_zero_guard", approx(n0, -10.0, 0.001))
+
+// 5. reward scales with beta
+let r1 = simpo_reward(-10.0, 5, 1.0)
+let r2 = simpo_reward(-10.0, 5, 2.0)
+check("reward_scales_beta", approx(r2, 2.0 * r1, 0.001))
+
+// 6. loss positive when no separation
+let l_zero = simpo_loss(-5.0, -5.0, 4, 4, 2.0, 0.5)
+check("loss_positive_no_margin", l_zero > 0.0)
+
+// 7. loss smaller when chosen clearly preferred
+let l_good = simpo_loss(-2.0, -10.0, 4, 4, 2.0, 0.5)
+let l_bad  = simpo_loss(-10.0, -2.0, 4, 4, 2.0, 0.5)
+check("loss_chosen_better_smaller", l_good < l_bad)
+
+// 8. loss larger when rejected preferred
+check("loss_rejected_worse_larger", l_bad > l_good)
+
+// 9. gamma effect — adding gamma raises the bar so loss increases
+let l_g0 = simpo_loss(-4.0, -6.0, 4, 4, 2.0, 0.0)
+let l_g1 = simpo_loss(-4.0, -6.0, 4, 4, 2.0, 1.0)
+check("gamma_raises_loss", l_g1 > l_g0)
+
+// 10. grad_w negative (loss decreases as lp_w increases)
+let gw = simpo_loss_grad_lp_w(-5.0, -5.0, 4, 4, 2.0, 0.5)
+check("grad_w_negative", gw < 0.0)
+
+// 11. grad_l positive (loss decreases as lp_l decreases)
+let gl = simpo_loss_grad_lp_l(-5.0, -5.0, 4, 4, 2.0, 0.5)
+check("grad_l_positive", gl > 0.0)
+
+// 12. single train step decreases loss
+let l_before = simpo_loss(-5.0, -5.0, 4, 4, 2.0, 0.5)
+let step_r = simpo_train_step(-5.0, -5.0, 4, 4, 2.0, 0.5, 1.0)
+let l_after_scalar = simpo_loss(step_r[1], step_r[2], 4, 4, 2.0, 0.5)
+check("train_step_decreases_loss", l_after_scalar < l_before)
+
+// 13. multi-step training converges (loss strictly drops)
+let batch0 = [-4.0, -6.0, 4, 4]
+let t1 = simpo_train(batch0, 1, 1.0, 2.0, 0.5)
+let t20 = simpo_train(batch0, 20, 1.0, 2.0, 0.5)
+check("multistep_converges", t20[0] < t1[0])
+
+// 14. preference accuracy — correct ordering
+check("pref_acc_correct", approx(simpo_preference_accuracy(-2.0, -8.0, 4, 4), 1.0, 0.001))
+check("pref_acc_wrong", approx(simpo_preference_accuracy(-8.0, -2.0, 4, 4), 0.0, 0.001))
+
+// 15. reward margin sign
+let rm_pos = simpo_reward_margin(-2.0, -8.0, 4, 4, 2.0)
+check("reward_margin_pos", rm_pos > 0.0)
+let rm_neg = simpo_reward_margin(-8.0, -2.0, 4, 4, 2.0)
+check("reward_margin_neg", rm_neg < 0.0)
+
+// 16. batch loss averages
+let batch = [[-2.0, -6.0, 4, 4], [-3.0, -7.0, 4, 4], [-1.0, -5.0, 4, 4]]
+let bl = simpo_batch_loss(batch, 2.0, 0.5)
+// Each pair is a "chosen better" case → loss should be finite positive
+check("batch_loss_positive_finite", bl > 0.0)
+// Batch loss equals manual average
+let m1 = simpo_loss(-2.0, -6.0, 4, 4, 2.0, 0.5)
+let m2 = simpo_loss(-3.0, -7.0, 4, 4, 2.0, 0.5)
+let m3 = simpo_loss(-1.0, -5.0, 4, 4, 2.0, 0.5)
+let manual = (m1 + m2 + m3) / 3.0
+check("batch_loss_matches_manual", approx(bl, manual, 0.001))
+
+// 17. DPO vs SimPO comparison — both return finite positive losses
+let cmp = simpo_dpo_vs_simpo(-2.0, -6.0, -4.0, -4.0, 4, 4, 2.0, 0.5)
+check("dpo_loss_finite", cmp[0] > 0.0)
+check("simpo_loss_finite", cmp[1] > 0.0)
+
+// 18. length bias sanity — SimPO should NOT prefer longer-but-worse
+// A longer rejected with same raw log-prob should be preferred by
+// length-normalized SimPO (lower magnitude per token).
+let lb = simpo_preference_accuracy(-10.0, -10.0, 2, 10)
+// chosen length 2 → -5/tok, rejected length 10 → -1/tok → rejected wins
+check("length_bias_aware", approx(lb, 0.0, 0.001))
+
+// ── summary ──────────────────────────────────────────────────────
+println("")
+println("SimPO: " + str(pass_count) + " passed, " + str(fail_count) + " failed")

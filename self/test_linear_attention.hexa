@@ -1,0 +1,228 @@
+// ═══════════════════════════════════════════════════════════════
+//  test_linear_attention.hexa — Linear Attention (Performer/Linformer)
+//
+//  Verifies:
+//    1.  Random projection shape  [m, d]
+//    2.  Trig feature map length  = 2m
+//    3.  Positive feature map length = m
+//    4.  Positive feature map is non-negative
+//    5.  Envelope scaling: ‖x‖=0 → φ(x)[0] = 1/√m (trig)
+//    6.  Gaussian variate mean ≈ 0
+//    7.  Gaussian variate std  ≈ 1
+//    8.  Performer(trig)   ≈ naive softmax  (large m)
+//    9.  Performer(pos+)   ≈ naive softmax  (large m)
+//   10.  Performer > random baseline accuracy
+//   11.  Causal Performer first-row attends only to itself
+//   12.  Causal ≠ non-causal
+//   13.  Performer output shape [S, dv]
+//   14.  Linformer output shape [S, dv]
+//   15.  Linformer(k=S, identity)  matches naive softmax
+//   16.  Linformer recovers sequence interactions
+//
+//  Run: ./hexa self/test_linear_attention.hexa
+// ═══════════════════════════════════════════════════════════════
+
+import "ml/linear_attention.hexa"
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn tfabs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn mat_frob(A) {
+    let rows = len(A)
+    let mut acc = 0.0
+    for i in 0..rows {
+        let cols = len(A[i])
+        for j in 0..cols {
+            acc = acc + A[i][j] * A[i][j]
+        }
+    }
+    return sqrt(acc)
+}
+
+fn mat_rel_diff(A, B) {
+    let denom = mat_frob(A)
+    let num = la_frob_diff(A, B)
+    if denom < 1.0e-12 { return num }
+    return num / denom
+}
+
+println("═══════════════════════════════════════════════════════")
+println("  Linear Attention Test Suite (Performer + Linformer)")
+println("═══════════════════════════════════════════════════════")
+
+// ── Build test matrices ─────────────────────────────────────
+// Q, K, V: [4, 3]
+let Q = [
+    [0.10, 0.20, 0.30],
+    [0.40, 0.50, 0.60],
+    [0.70, 0.80, 0.90],
+    [1.00, 1.10, 1.20]
+]
+let K = [
+    [0.20, 0.10, 0.40],
+    [0.50, 0.30, 0.20],
+    [0.10, 0.60, 0.80],
+    [0.90, 0.70, 0.50]
+]
+let V = [
+    [1.0, 0.0, 0.5],
+    [0.0, 1.0, 0.5],
+    [0.5, 0.5, 1.0],
+    [1.0, 1.0, 0.0]
+]
+
+let S = len(Q)
+let d = len(Q[0])
+let dv = len(V[0])
+
+// ── Test 1: random projection shape ─────────────────────────
+let W_small = la_random_projection(5, d, 12345)
+check("random projection [m=5,d=3] shape",
+      len(W_small) == 5 && len(W_small[0]) == 3)
+
+// ── Test 2: trig feature length = 2m ────────────────────────
+let phi_trig = la_feature_map_trig(Q[0], W_small)
+check("trig feature length = 2m", len(phi_trig) == 10)
+
+// ── Test 3: positive feature length = m ─────────────────────
+let phi_pos = la_feature_map_pos(Q[0], W_small)
+check("positive feature length = m", len(phi_pos) == 5)
+
+// ── Test 4: positive feature map non-negative ───────────────
+let mut all_nonneg = true
+for i in 0..len(phi_pos) {
+    if phi_pos[i] < 0.0 { all_nonneg = false }
+}
+check("positive feature map ≥ 0", all_nonneg)
+
+// ── Test 5: envelope scaling for ‖x‖=0 ──────────────────────
+//   φ_trig(0)[0] = exp(0) * √(1/m) * cos(0) = 1/√m
+let zero_vec = [0.0, 0.0, 0.0]
+let phi_zero = la_feature_map_trig(zero_vec, W_small)
+let expected = 1.0 / sqrt(5.0)
+check("trig φ(0)[0] = 1/√m", tfabs(phi_zero[0] - expected) < 1.0e-6)
+
+// ── Test 6: Gaussian mean ≈ 0 (N=500) ───────────────────────
+let W_big = la_random_projection(500, 1, 999)
+let mut sumv = 0.0
+for i in 0..500 {
+    sumv = sumv + W_big[i][0]
+}
+let mean = sumv / 500.0
+check("Gaussian mean ≈ 0 (|μ|<0.15)", tfabs(mean) < 0.15)
+
+// ── Test 7: Gaussian std ≈ 1 ────────────────────────────────
+let mut var = 0.0
+for i in 0..500 {
+    let delta = W_big[i][0] - mean
+    var = var + delta * delta
+}
+var = var / 500.0
+let std = sqrt(var)
+check("Gaussian std ≈ 1 (0.85<σ<1.15)", std > 0.85 && std < 1.15)
+
+// ── Test 8: Performer(trig) ≈ naive softmax (m=256) ─────────
+let naive_out = la_naive_attention(Q, K, V)
+let W_trig = la_random_projection(256, d, 42)
+let perf_trig = linear_attention_performer(Q, K, V, W_trig, true)
+let rel_trig = mat_rel_diff(naive_out, perf_trig)
+println("  [info] rel_diff trig(m=256) = " + to_string(rel_trig))
+check("Performer(trig,m=256) rel<0.25", rel_trig < 0.25)
+
+// ── Test 9: Performer(positive) ≈ naive softmax (m=256) ─────
+let W_pos = la_random_projection(256, d, 7)
+let perf_pos = linear_attention_performer(Q, K, V, W_pos, false)
+let rel_pos = mat_rel_diff(naive_out, perf_pos)
+println("  [info] rel_diff pos(m=256) = " + to_string(rel_pos))
+check("Performer(pos+,m=256) rel<0.35", rel_pos < 0.35)
+
+// ── Test 10: approx error ≥ zero (sanity baseline) ──────────
+//   Compare Performer output against a constant matrix — should be
+//   much larger relative error.  This catches the degenerate case
+//   where Performer collapses to zero output.
+let mut const_out = la_zeros_2d(S, dv)
+for i in 0..S {
+    for j in 0..dv {
+        const_out[i][j] = 0.5
+    }
+}
+let rel_const = mat_rel_diff(naive_out, const_out)
+check("Performer beats constant baseline",
+      rel_trig < rel_const && rel_pos < rel_const)
+
+// ── Test 11: Causal Performer first-row numerator only uses V[0] ──
+//   With causal masking, row 0 attends only to position 0 so the
+//   output should be dominated by V[0] (up to feature map error).
+let W_causal = la_random_projection(256, d, 123)
+let perf_causal = linear_attention_performer_causal(Q, K, V, W_causal, false)
+// Check row 0: should be (nearly) V[0]
+let row0_err = sqrt((perf_causal[0][0] - V[0][0]) * (perf_causal[0][0] - V[0][0]) +
+                    (perf_causal[0][1] - V[0][1]) * (perf_causal[0][1] - V[0][1]) +
+                    (perf_causal[0][2] - V[0][2]) * (perf_causal[0][2] - V[0][2]))
+println("  [info] causal row0 err = " + to_string(row0_err))
+check("Causal row 0 ≈ V[0] (err<0.6)", row0_err < 0.6)
+
+// ── Test 12: Causal ≠ non-causal ────────────────────────────
+let W_same = la_random_projection(64, d, 777)
+let non_causal = linear_attention_performer(Q, K, V, W_same, false)
+let causal     = linear_attention_performer_causal(Q, K, V, W_same, false)
+let diff_nc = la_frob_diff(non_causal, causal)
+check("causal ≠ non-causal", diff_nc > 1.0e-3)
+
+// ── Test 13: Performer output shape ─────────────────────────
+check("Performer output [S,dv]",
+      len(perf_trig) == S && len(perf_trig[0]) == dv)
+
+// ── Test 14: Linformer output shape ─────────────────────────
+let E = la_linformer_random_projection(2, S, 11)
+let F = la_linformer_random_projection(2, S, 22)
+let lin_out = linear_attention_linformer(Q, K, V, E, F)
+check("Linformer output [S,dv]",
+      len(lin_out) == S && len(lin_out[0]) == dv)
+
+// ── Test 15: Linformer(k=S, E=F=I) matches naive softmax ────
+//   When the projection is the identity, K̂ = K and V̂ = V, so
+//   Linformer reduces exactly to naive softmax attention.
+let mut Ik = la_zeros_2d(S, S)
+for i in 0..S { Ik[i][i] = 1.0 }
+let lin_identity = linear_attention_linformer(Q, K, V, Ik, Ik)
+let id_rel = mat_rel_diff(naive_out, lin_identity)
+println("  [info] Linformer(identity) rel = " + to_string(id_rel))
+check("Linformer(identity) matches naive", id_rel < 1.0e-6)
+
+// ── Test 16: Linformer recovers sequence interactions ───────
+//   Re-run with k=3 random projection — output must not collapse
+//   to a constant row (i.e. different query rows produce different
+//   outputs).
+let E3 = la_linformer_random_projection(3, S, 31)
+let F3 = la_linformer_random_projection(3, S, 32)
+let lin3 = linear_attention_linformer(Q, K, V, E3, F3)
+let row_diff_0_1 = tfabs(lin3[0][0] - lin3[1][0]) +
+                   tfabs(lin3[0][1] - lin3[1][1]) +
+                   tfabs(lin3[0][2] - lin3[1][2])
+check("Linformer rows not identical", row_diff_0_1 > 1.0e-4)
+
+// ═══════════════════════════════════════════════════════════════
+println("")
+println("pass=" + to_string(pass_count) + " fail=" + to_string(fail_count))
+if fail_count == 0 {
+    println("ALL PASS")
+} else {
+    println("FAILED")
+}
+println(to_string(pass_count) + " passed")

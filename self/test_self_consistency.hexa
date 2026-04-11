@@ -1,0 +1,446 @@
+// ═══════════════════════════════════════════════════════════════
+//  test_self_consistency.hexa — Self-Consistency Decoding tests
+//
+//  Tests (≥12):
+//    T1  sc_softmax sums to 1
+//    T2  sc_softmax temp=0 returns one-hot argmax
+//    T3  sc_argmax picks max
+//    T4  sc_normalize_answer lowercases + trims + strips trailing '.'
+//    T5  sc_normalize_answer collapses whitespace
+//    T6  sc_answers_equal treats "42" / "42." / "  42 " equal
+//    T7  sc_sample_categorical returns valid index & logprob<=0
+//    T8  sc_generate_samples returns 3 parallel arrays of length N
+//    T9  sc_majority_vote picks most frequent answer
+//    T10 sc_majority_vote confidence = count / N
+//    T11 sc_weighted_majority prefers higher logprob even on ties
+//    T12 sc_weighted_majority confidence in (0, 1]
+//    T13 sc_decode (plain) converges to correct answer for skewed logits
+//    T14 sc_decode (weighted) returns struct with expected fields
+//    T15 reproducibility: same seed -> same winner
+//    T16 edge: empty answer list -> answer="" confidence=0
+//
+//  실행: ./hexa self/test_self_consistency.hexa
+// ═══════════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ── inlined from self/ml/self_consistency.hexa ───────────────
+
+let mut SC_RNG = 123456789
+
+fn sc_set_seed(s) {
+    let mut v = s
+    if v < 0 { v = 0 - v }
+    v = v % 2147483647
+    if v == 0 { v = 1 }
+    SC_RNG = v
+}
+
+fn sc_rand_float() {
+    let mut x = SC_RNG
+    x = x ^ (x * 13)
+    x = x % 2147483647
+    if x < 0 { x = 0 - x }
+    x = x ^ (x / 17)
+    x = x % 2147483647
+    if x < 0 { x = 0 - x }
+    x = x ^ (x * 5)
+    x = x % 2147483647
+    if x < 0 { x = 0 - x }
+    SC_RNG = x
+    return to_float(x % 1000000) / 1000000.0
+}
+
+fn sc_abs(x) { if x < 0.0 { return 0.0 - x } return x }
+
+fn sc_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn sc_log(x) {
+    if x <= 0.0 { return -30.0 }
+    let mut v = x
+    let mut count = 0
+    while v > 2.0 { v = v / 2.718281828; count = count + 1 }
+    while v < 0.5 { v = v * 2.718281828; count = count - 1 }
+    let d = v - 1.0
+    let ln_v = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_v
+}
+
+fn sc_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn sc_argmax(v) {
+    let n = len(v)
+    let mut best_i = 0
+    let mut best_v = v[0]
+    for i in 1..n {
+        if v[i] > best_v { best_v = v[i]; best_i = i }
+    }
+    return best_i
+}
+
+fn sc_softmax(logits, temp) {
+    let n = len(logits)
+    if temp <= 0.0 {
+        let mut onehot = sc_zeros(n)
+        onehot[sc_argmax(logits)] = 1.0
+        return onehot
+    }
+    let mut scaled = sc_zeros(n)
+    for i in 0..n { scaled[i] = logits[i] / temp }
+    let mut m = scaled[0]
+    for i in 1..n {
+        if scaled[i] > m { m = scaled[i] }
+    }
+    let mut exps = sc_zeros(n)
+    let mut z = 0.0
+    for i in 0..n {
+        exps[i] = sc_exp(scaled[i] - m)
+        z = z + exps[i]
+    }
+    let mut out = sc_zeros(n)
+    if z <= 0.0 { return out }
+    for i in 0..n { out[i] = exps[i] / z }
+    return out
+}
+
+fn sc_sample_categorical(probs) {
+    let n = len(probs)
+    let r = sc_rand_float()
+    let mut cum = 0.0
+    for i in 0..n {
+        cum = cum + probs[i]
+        if cum > r {
+            return [i, sc_log(probs[i] + 1.0e-12)]
+        }
+    }
+    let last = n - 1
+    return [last, sc_log(probs[last] + 1.0e-12)]
+}
+
+struct SelfConsistencyResult {
+    answer: string,
+    count: int,
+    confidence: float,
+    n_samples: int,
+    unique_answers: int,
+    weighted: int
+}
+
+fn sc_normalize_answer(s) {
+    let low = s.to_lower()
+    let t = low.trim()
+    let chars = t.chars()
+    let n = len(chars)
+    let mut out = ""
+    let mut prev_space = false
+    for i in 0..n {
+        let cs = "" + chars[i]
+        if cs == " " {
+            if prev_space == false { out = out + " " }
+            prev_space = true
+        } else {
+            out = out + cs
+            prev_space = false
+        }
+    }
+    let ol = len(out)
+    if ol > 0 {
+        let last_idx = ol - 1
+        let tail = out.substring(last_idx, ol)
+        if tail == "." {
+            out = out.substring(0, last_idx)
+        }
+    }
+    return out
+}
+
+fn sc_generate_samples(user_generate_fn, prompt, n_samples, temperature) {
+    let mut answers = []
+    let mut logprobs = []
+    let mut raw_ids = []
+    for s in 0..n_samples {
+        let logits = user_generate_fn(prompt, s)
+        let probs = sc_softmax(logits, temperature)
+        let pair = sc_sample_categorical(probs)
+        let idx = pair[0]
+        let lp = pair[1]
+        answers = answers + [str(idx)]
+        logprobs = logprobs + [lp]
+        raw_ids = raw_ids + [idx]
+    }
+    return [answers, logprobs, raw_ids]
+}
+
+fn sc_count_answers(answers) {
+    let n = len(answers)
+    let mut keys = []
+    let mut counts = []
+    for i in 0..n {
+        let key = sc_normalize_answer(answers[i])
+        let mut found = -1
+        let nk = len(keys)
+        for j in 0..nk {
+            if keys[j] == key { found = j }
+        }
+        if found < 0 {
+            keys = keys + [key]
+            counts = counts + [1]
+        } else {
+            counts[found] = counts[found] + 1
+        }
+    }
+    return [keys, counts]
+}
+
+fn sc_majority_vote(answers) {
+    let n = len(answers)
+    if n == 0 {
+        return SelfConsistencyResult {
+            answer: "",
+            count: 0,
+            confidence: 0.0,
+            n_samples: 0,
+            unique_answers: 0,
+            weighted: 0
+        }
+    }
+    let pair = sc_count_answers(answers)
+    let keys = pair[0]
+    let counts = pair[1]
+    let nk = len(keys)
+    let mut best_i = 0
+    let mut best_c = counts[0]
+    for i in 1..nk {
+        if counts[i] > best_c { best_c = counts[i]; best_i = i }
+    }
+    let conf = to_float(best_c) / to_float(n)
+    return SelfConsistencyResult {
+        answer: keys[best_i],
+        count: best_c,
+        confidence: conf,
+        n_samples: n,
+        unique_answers: nk,
+        weighted: 0
+    }
+}
+
+fn sc_weighted_majority(answers, logprobs) {
+    let n = len(answers)
+    if n == 0 {
+        return SelfConsistencyResult {
+            answer: "",
+            count: 0,
+            confidence: 0.0,
+            n_samples: 0,
+            unique_answers: 0,
+            weighted: 1
+        }
+    }
+    let mut max_lp = logprobs[0]
+    for i in 1..n {
+        if logprobs[i] > max_lp { max_lp = logprobs[i] }
+    }
+    let mut keys = []
+    let mut weights = []
+    let mut counts = []
+    for i in 0..n {
+        let key = sc_normalize_answer(answers[i])
+        let w = sc_exp(logprobs[i] - max_lp)
+        let mut found = -1
+        let nk = len(keys)
+        for j in 0..nk {
+            if keys[j] == key { found = j }
+        }
+        if found < 0 {
+            keys = keys + [key]
+            weights = weights + [w]
+            counts = counts + [1]
+        } else {
+            weights[found] = weights[found] + w
+            counts[found] = counts[found] + 1
+        }
+    }
+    let nk = len(keys)
+    let mut best_i = 0
+    let mut best_w = weights[0]
+    let mut total_w = 0.0
+    for i in 0..nk {
+        total_w = total_w + weights[i]
+        if weights[i] > best_w { best_w = weights[i]; best_i = i }
+    }
+    let mut conf = 0.0
+    if total_w > 0.0 { conf = best_w / total_w }
+    return SelfConsistencyResult {
+        answer: keys[best_i],
+        count: counts[best_i],
+        confidence: conf,
+        n_samples: n,
+        unique_answers: nk,
+        weighted: 1
+    }
+}
+
+fn sc_decode(user_generate_fn, prompt, n_samples, temperature, use_weighted) {
+    let triple = sc_generate_samples(user_generate_fn, prompt, n_samples, temperature)
+    let answers = triple[0]
+    let logprobs = triple[1]
+    if use_weighted == 1 {
+        return sc_weighted_majority(answers, logprobs)
+    }
+    return sc_majority_vote(answers)
+}
+
+fn sc_answers_equal(a, b) {
+    return sc_normalize_answer(a) == sc_normalize_answer(b)
+}
+
+// ── mock logits generator ────────────────────────────────────
+// A 4-way vocab with token 2 strongly preferred.
+fn skewed_logits_fn(prompt, sample_idx) {
+    return [0.1, 0.2, 3.0, 0.3]
+}
+
+// Uniform logits — sampling truly random
+fn uniform_logits_fn(prompt, sample_idx) {
+    return [1.0, 1.0, 1.0, 1.0]
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  TESTS
+// ═══════════════════════════════════════════════════════════════
+
+sc_set_seed(20260411)
+
+// T1: softmax sums to 1
+let sm = sc_softmax([1.0, 2.0, 3.0, 0.5], 1.0)
+let sm_sum = sm[0] + sm[1] + sm[2] + sm[3]
+check("T1 sc_softmax sums to 1", approx(sm_sum, 1.0, 0.01))
+
+// T2: softmax temp=0 returns one-hot at argmax
+let oh = sc_softmax([0.1, 0.5, 2.0, 0.3], 0.0)
+check("T2 sc_softmax temp=0 is one-hot at argmax",
+      approx(oh[2], 1.0, 1.0e-9) && approx(oh[0] + oh[1] + oh[3], 0.0, 1.0e-9))
+
+// T3: argmax
+check("T3 sc_argmax picks max index", sc_argmax([0.1, 5.0, 2.0, 3.0]) == 1)
+
+// T4: normalize_answer lowercases + trims + strips trailing '.'
+let norm1 = sc_normalize_answer("  42.  ")
+check("T4 normalize trims + strips trailing '.'", norm1 == "42")
+let norm2 = sc_normalize_answer("Yes.")
+check("T4b normalize lowercases", norm2 == "yes")
+
+// T5: collapse inner whitespace
+let norm3 = sc_normalize_answer("the  quick   brown")
+check("T5 normalize collapses whitespace", norm3 == "the quick brown")
+
+// T6: answer equivalence
+check("T6 answers_equal 42 / 42. / '  42 '",
+      sc_answers_equal("42", "42.") && sc_answers_equal("  42 ", "42"))
+
+// T7: sample_categorical index & logprob
+let probs = sc_softmax([1.0, 2.0, 3.0, 0.5], 1.0)
+let cat = sc_sample_categorical(probs)
+let cat_idx = cat[0]
+let cat_lp = cat[1]
+check("T7 sample_categorical index in [0,4)", cat_idx >= 0 && cat_idx < 4)
+check("T7b sample_categorical logprob <= 0", cat_lp <= 0.0001)
+
+// T8: generate_samples returns 3 parallel arrays of length N
+let trip = sc_generate_samples(skewed_logits_fn, "test", 8, 0.7)
+let gens_answers = trip[0]
+let gens_logprobs = trip[1]
+let gens_raw = trip[2]
+check("T8 generate_samples answers length = N", len(gens_answers) == 8)
+check("T8b generate_samples logprobs length = N", len(gens_logprobs) == 8)
+check("T8c generate_samples raw_ids length = N", len(gens_raw) == 8)
+
+// T9: majority_vote picks most frequent
+let answers_fixed = ["42", "42", "42", "7", "42", "13", "42"]
+let mv = sc_majority_vote(answers_fixed)
+check("T9 majority_vote answer = 42", mv.answer == "42")
+check("T9b majority_vote count = 5", mv.count == 5)
+
+// T10: confidence = count / n
+check("T10 majority_vote confidence = 5/7",
+      approx(mv.confidence, 5.0 / 7.0, 0.001))
+check("T10b majority_vote n_samples = 7", mv.n_samples == 7)
+check("T10c majority_vote unique = 3", mv.unique_answers == 3)
+
+// T11: weighted_majority — tie on count, higher logprob wins
+let tie_answers = ["A", "B"]
+let tie_lps = [-2.0, -0.5]  // B has much higher probability
+let wmv = sc_weighted_majority(tie_answers, tie_lps)
+check("T11 weighted_majority picks higher-logprob B", wmv.answer == "b")
+check("T11b weighted flag set", wmv.weighted == 1)
+
+// T12: weighted confidence in (0, 1]
+check("T12 weighted confidence > 0", wmv.confidence > 0.0)
+check("T12b weighted confidence <= 1", wmv.confidence <= 1.0 + 1.0e-6)
+
+// T13: sc_decode (plain) on skewed logits — majority should be "2"
+sc_set_seed(20260411)
+let res_plain = sc_decode(skewed_logits_fn, "q", 32, 0.7, 0)
+check("T13 sc_decode plain winner = '2'", res_plain.answer == "2")
+check("T13b sc_decode plain confidence > 0.5",
+      res_plain.confidence > 0.5)
+
+// T14: sc_decode (weighted) has expected fields
+sc_set_seed(20260411)
+let res_w = sc_decode(skewed_logits_fn, "q", 32, 0.7, 1)
+check("T14 sc_decode weighted.answer non-empty", len(res_w.answer) > 0)
+check("T14b sc_decode weighted.n_samples = 32", res_w.n_samples == 32)
+check("T14c sc_decode weighted flag", res_w.weighted == 1)
+
+// T15: reproducibility — same seed yields same winner
+sc_set_seed(777)
+let rep_a = sc_decode(skewed_logits_fn, "q", 16, 0.5, 0)
+sc_set_seed(777)
+let rep_b = sc_decode(skewed_logits_fn, "q", 16, 0.5, 0)
+check("T15 same seed -> same winner", rep_a.answer == rep_b.answer)
+check("T15b same seed -> same confidence",
+      approx(rep_a.confidence, rep_b.confidence, 1.0e-9))
+
+// T16: edge — empty answer list
+let empty_mv = sc_majority_vote([])
+check("T16 empty majority_vote answer = ''", empty_mv.answer == "")
+check("T16b empty majority_vote confidence = 0", approx(empty_mv.confidence, 0.0, 1.0e-9))
+let empty_wmv = sc_weighted_majority([], [])
+check("T16c empty weighted answer = ''", empty_wmv.answer == "")
+
+// ═══════════════════════════════════════════════════════════════
+println("")
+println("=== self_consistency test summary ===")
+println("PASS: " + str(pass_count))
+println("FAIL: " + str(fail_count))
+println("TOTAL: " + str(pass_count + fail_count))

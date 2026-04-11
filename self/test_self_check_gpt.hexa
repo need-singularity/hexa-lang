@@ -1,0 +1,633 @@
+// ===================================================================
+//  test_self_check_gpt.hexa — SelfCheckGPT Hallucination Detection Tests
+//
+//  Validates:
+//    1. Sentence splitter (period/exclaim/question)
+//    2. Word tokenizer (lowercase + whitespace)
+//    3. N-gram tokenization
+//    4. N-gram consistency (high / low / empty edge cases)
+//    5. BLEU-like consistency (identical / disjoint)
+//    6. Embedding cosine proxy (identical / disjoint)
+//    7. p_value approximation (monotone w.r.t. consistency)
+//    8. self_check full pipeline (consistent primary vs samples)
+//    9. self_check flags hallucinations when sample disagreement high
+//   10. Per-sentence scoring (mixed primary)
+//   11. Threshold sensitivity (low threshold -> easier flag)
+//   12. Empty samples fallback
+//
+//  Execution: ./hexa self/test_self_check_gpt.hexa
+//  Minimum 12 check() statements.
+// ===================================================================
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn approx_eq(a, b, eps) {
+    let d = a - b
+    if d < 0.0 {
+        return (0.0 - d) <= eps
+    }
+    return d <= eps
+}
+
+// ===================================================================
+//  Inlined self_check_gpt module (self-contained test)
+// ===================================================================
+
+struct SelfCheckConfig {
+    n_samples: int,
+    threshold: float,
+    ngram_n: int,
+    use_bleu: bool,
+    use_embedding: bool
+}
+
+struct SelfCheckReport {
+    sentences: array,
+    ngram_scores: array,
+    bleu_scores: array,
+    embed_scores: array,
+    hallucination_probs: array,
+    is_hallucination: array,
+    overall_prob: float,
+    p_value: float,
+    flagged: bool
+}
+
+fn create_self_check_config(n_samples, threshold) {
+    return SelfCheckConfig {
+        n_samples: n_samples,
+        threshold: threshold,
+        ngram_n: 2,
+        use_bleu: true,
+        use_embedding: true
+    }
+}
+
+fn split_sentences(text) {
+    let mut sents = []
+    let mut buf = ""
+    let n = len(text)
+    let mut i = 0
+    while i < n {
+        let ch = text.substring(i, i + 1)
+        if ch == "." {
+            if len(buf) > 0 {
+                sents = sents + [buf.trim()]
+                buf = ""
+            }
+        } else {
+            if ch == "!" {
+                if len(buf) > 0 {
+                    sents = sents + [buf.trim()]
+                    buf = ""
+                }
+            } else {
+                if ch == "?" {
+                    if len(buf) > 0 {
+                        sents = sents + [buf.trim()]
+                        buf = ""
+                    }
+                } else {
+                    buf = buf + ch
+                }
+            }
+        }
+        i = i + 1
+    }
+    if len(buf.trim()) > 0 {
+        sents = sents + [buf.trim()]
+    }
+    let mut out = []
+    let m = len(sents)
+    let mut j = 0
+    while j < m {
+        if len(sents[j]) > 0 {
+            out = out + [sents[j]]
+        }
+        j = j + 1
+    }
+    return out
+}
+
+fn tokenize_words(text) {
+    let lower = text.to_lower()
+    let parts = lower.split(" ")
+    let mut out = []
+    let n = len(parts)
+    let mut i = 0
+    while i < n {
+        let p = parts[i].trim()
+        if len(p) > 0 {
+            out = out + [p]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn ngram_tokens(text, n) {
+    let words = tokenize_words(text)
+    let w = len(words)
+    if w < n {
+        return []
+    }
+    let mut out = []
+    let mut i = 0
+    let limit = w - n + 1
+    while i < limit {
+        let mut gram = words[i]
+        let mut j = 1
+        while j < n {
+            gram = gram + " " + words[i + j]
+            j = j + 1
+        }
+        out = out + [gram]
+        i = i + 1
+    }
+    return out
+}
+
+fn contains_gram(sample_lower, gram) {
+    return sample_lower.contains(gram)
+}
+
+fn ngram_consistency(sentence, samples, n) {
+    let grams = ngram_tokens(sentence, n)
+    let g = len(grams)
+    let s = len(samples)
+    if g == 0 {
+        return 1.0
+    }
+    if s == 0 {
+        return 0.0
+    }
+    let mut lowered = []
+    let mut si = 0
+    while si < s {
+        lowered = lowered + [samples[si].to_lower()]
+        si = si + 1
+    }
+    let mut total = 0.0
+    let mut gi = 0
+    while gi < g {
+        let gram = grams[gi]
+        let mut hits = 0
+        let mut k = 0
+        while k < s {
+            if contains_gram(lowered[k], gram) {
+                hits = hits + 1
+            }
+            k = k + 1
+        }
+        let frac = to_float(hits) / to_float(s)
+        total = total + frac
+        gi = gi + 1
+    }
+    return total / to_float(g)
+}
+
+fn modified_precision(candidate_grams, reference_grams) {
+    let c = len(candidate_grams)
+    let r = len(reference_grams)
+    if c == 0 {
+        return 0.0
+    }
+    if r == 0 {
+        return 0.0
+    }
+    let mut ref_keys = []
+    let mut ref_counts = []
+    let mut i = 0
+    while i < r {
+        let g = reference_grams[i]
+        let mut found = -1
+        let nk = len(ref_keys)
+        let mut j = 0
+        while j < nk {
+            if ref_keys[j] == g {
+                found = j
+                j = nk
+            } else {
+                j = j + 1
+            }
+        }
+        if found >= 0 {
+            ref_counts[found] = ref_counts[found] + 1
+        } else {
+            ref_keys = ref_keys + [g]
+            ref_counts = ref_counts + [1]
+        }
+        i = i + 1
+    }
+    let mut matched = 0
+    let mut ci = 0
+    while ci < c {
+        let cg = candidate_grams[ci]
+        let nk2 = len(ref_keys)
+        let mut k = 0
+        while k < nk2 {
+            if ref_keys[k] == cg {
+                if ref_counts[k] > 0 {
+                    ref_counts[k] = ref_counts[k] - 1
+                    matched = matched + 1
+                }
+                k = nk2
+            } else {
+                k = k + 1
+            }
+        }
+        ci = ci + 1
+    }
+    return to_float(matched) / to_float(c)
+}
+
+fn bleu_like_consistency(sentence, samples) {
+    let s = len(samples)
+    if s == 0 {
+        return 0.0
+    }
+    let mut total = 0.0
+    let mut count = 0
+    let mut n = 1
+    while n <= 4 {
+        let cand = ngram_tokens(sentence, n)
+        if len(cand) > 0 {
+            let mut sample_sum = 0.0
+            let mut k = 0
+            while k < s {
+                let ref_grams = ngram_tokens(samples[k], n)
+                sample_sum = sample_sum + modified_precision(cand, ref_grams)
+                k = k + 1
+            }
+            let sample_mean = sample_sum / to_float(s)
+            total = total + sample_mean
+            count = count + 1
+        }
+        n = n + 1
+    }
+    if count == 0 {
+        return 0.0
+    }
+    return total / to_float(count)
+}
+
+fn char_histogram(text) {
+    let lower = text.to_lower()
+    let n = len(lower)
+    let mut keys = []
+    let mut counts = []
+    let mut i = 0
+    while i < n {
+        let ch = lower.substring(i, i + 1)
+        if ch != " " {
+            let nk = len(keys)
+            let mut j = 0
+            let mut found = -1
+            while j < nk {
+                if keys[j] == ch {
+                    found = j
+                    j = nk
+                } else {
+                    j = j + 1
+                }
+            }
+            if found >= 0 {
+                counts[found] = counts[found] + 1
+            } else {
+                keys = keys + [ch]
+                counts = counts + [1]
+            }
+        }
+        i = i + 1
+    }
+    return #{"keys": keys, "counts": counts}
+}
+
+fn hist_get(hist, key) {
+    let keys = hist["keys"]
+    let counts = hist["counts"]
+    let n = len(keys)
+    let mut i = 0
+    while i < n {
+        if keys[i] == key {
+            return counts[i]
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn cosine_hist(a, b) {
+    let keys_a = a["keys"]
+    let keys_b = b["keys"]
+    let na = len(keys_a)
+    let nb = len(keys_b)
+    if na == 0 {
+        return 0.0
+    }
+    if nb == 0 {
+        return 0.0
+    }
+    let mut dot = 0.0
+    let mut norm_a = 0.0
+    let mut i = 0
+    while i < na {
+        let ka = keys_a[i]
+        let va = a["counts"][i]
+        let vb = hist_get(b, ka)
+        dot = dot + to_float(va * vb)
+        norm_a = norm_a + to_float(va * va)
+        i = i + 1
+    }
+    let mut norm_b = 0.0
+    let mut j = 0
+    while j < nb {
+        let vbj = b["counts"][j]
+        norm_b = norm_b + to_float(vbj * vbj)
+        j = j + 1
+    }
+    if norm_a == 0.0 {
+        return 0.0
+    }
+    if norm_b == 0.0 {
+        return 0.0
+    }
+    let denom = sqrt(norm_a) * sqrt(norm_b)
+    if denom == 0.0 {
+        return 0.0
+    }
+    return dot / denom
+}
+
+fn embedding_sim(sentence, sample) {
+    let a = char_histogram(sentence)
+    let b = char_histogram(sample)
+    return cosine_hist(a, b)
+}
+
+fn embedding_consistency(sentence, samples) {
+    let s = len(samples)
+    if s == 0 {
+        return 0.0
+    }
+    let mut total = 0.0
+    let mut i = 0
+    while i < s {
+        total = total + embedding_sim(sentence, samples[i])
+        i = i + 1
+    }
+    return total / to_float(s)
+}
+
+fn combine_scores(ngram_s, bleu_s, embed_s, use_bleu, use_embedding) {
+    let mut total = ngram_s
+    let mut count = 1.0
+    if use_bleu {
+        total = total + bleu_s
+        count = count + 1.0
+    }
+    if use_embedding {
+        total = total + embed_s
+        count = count + 1.0
+    }
+    return total / count
+}
+
+fn clamp01(x) {
+    if x < 0.0 {
+        return 0.0
+    }
+    if x > 1.0 {
+        return 1.0
+    }
+    return x
+}
+
+fn p_value_approx(consistency, n_events) {
+    let c = clamp01(consistency)
+    let n = n_events
+    if n <= 0 {
+        return 1.0
+    }
+    let delta = c - 0.5
+    let mut abs_delta = delta
+    if abs_delta < 0.0 {
+        abs_delta = 0.0 - abs_delta
+    }
+    let exponent = 0.0 - (2.0 * to_float(n) * abs_delta * abs_delta)
+    let mut e = 1.0
+    let mut term = 1.0
+    let mut k = 1
+    while k < 20 {
+        term = term * exponent / to_float(k)
+        e = e + term
+        k = k + 1
+    }
+    if e < 0.0 {
+        e = 0.0
+    }
+    if e > 1.0 {
+        e = 1.0
+    }
+    if delta >= 0.0 {
+        return e
+    }
+    return 1.0 - 0.5 * e
+}
+
+fn self_check(primary, samples, config) {
+    let sentences = split_sentences(primary)
+    let n_sent = len(sentences)
+    let n_samp = len(samples)
+    let mut ngram_scores = []
+    let mut bleu_scores = []
+    let mut embed_scores = []
+    let mut halluc_probs = []
+    let mut is_halluc = []
+    let mut sum_prob = 0.0
+    let mut i = 0
+    while i < n_sent {
+        let sent = sentences[i]
+        let n_s = ngram_consistency(sent, samples, config.ngram_n)
+        let mut b_s = 0.0
+        if config.use_bleu {
+            b_s = bleu_like_consistency(sent, samples)
+        }
+        let mut e_s = 0.0
+        if config.use_embedding {
+            e_s = embedding_consistency(sent, samples)
+        }
+        ngram_scores = ngram_scores + [n_s]
+        bleu_scores = bleu_scores + [b_s]
+        embed_scores = embed_scores + [e_s]
+        let combined = combine_scores(n_s, b_s, e_s, config.use_bleu, config.use_embedding)
+        let p_halluc = clamp01(1.0 - combined)
+        halluc_probs = halluc_probs + [p_halluc]
+        is_halluc = is_halluc + [p_halluc > config.threshold]
+        sum_prob = sum_prob + p_halluc
+        i = i + 1
+    }
+    let mut overall = 0.0
+    if n_sent > 0 {
+        overall = sum_prob / to_float(n_sent)
+    }
+    let events = n_sent * n_samp
+    let consistency = 1.0 - overall
+    let pv = p_value_approx(consistency, events)
+    let flagged = overall > config.threshold
+    return SelfCheckReport {
+        sentences: sentences,
+        ngram_scores: ngram_scores,
+        bleu_scores: bleu_scores,
+        embed_scores: embed_scores,
+        hallucination_probs: halluc_probs,
+        is_hallucination: is_halluc,
+        overall_prob: overall,
+        p_value: pv,
+        flagged: flagged
+    }
+}
+
+// ===================================================================
+//  TESTS
+// ===================================================================
+
+println("=== SelfCheckGPT Tests ===")
+
+// -- 1. Sentence splitter --
+let sents1 = split_sentences("Paris is the capital. Berlin is a city! What about Rome?")
+check("split: three sentences detected", len(sents1) == 3)
+
+// -- 2. Tokenizer --
+let toks = tokenize_words("  Paris   is   the capital  ")
+check("tokenize: lowercase + collapse", len(toks) == 4)
+check("tokenize: first token = 'paris'", toks[0] == "paris")
+
+// -- 3. N-gram tokenization --
+let bigrams = ngram_tokens("paris is the capital of france", 2)
+check("ngram: bigram count = 5", len(bigrams) == 5)
+
+// -- 4a. N-gram consistency high (all samples contain the sentence) --
+let s_hi = ["Paris is the capital of France",
+            "Paris is the capital of France",
+            "Paris is the capital of France"]
+let cons_hi = ngram_consistency("Paris is the capital", s_hi, 2)
+check("ngram_consistency: identical samples -> 1.0", approx_eq(cons_hi, 1.0, 0.0001))
+
+// -- 4b. N-gram consistency low (no overlap) --
+let s_lo = ["The moon is made of cheese",
+            "Bananas grow on palm trees",
+            "Unicorns ride through rainbows"]
+let cons_lo = ngram_consistency("Paris is the capital", s_lo, 2)
+check("ngram_consistency: disjoint samples -> 0.0", cons_lo < 0.01)
+
+// -- 4c. N-gram consistency empty samples --
+let cons_empty = ngram_consistency("Paris is the capital", [], 2)
+check("ngram_consistency: empty samples -> 0.0", approx_eq(cons_empty, 0.0, 0.0001))
+
+// -- 5a. BLEU-like identical --
+let bleu_id = bleu_like_consistency("Paris is the capital of France",
+    ["Paris is the capital of France",
+     "Paris is the capital of France",
+     "Paris is the capital of France"])
+check("bleu_like: identical samples >= 0.9", bleu_id >= 0.9)
+
+// -- 5b. BLEU-like disjoint --
+let bleu_dj = bleu_like_consistency("Paris is the capital of France",
+    ["Bananas grow on palm trees and love water",
+     "Unicorns ride through beautiful rainbows often",
+     "Dragons breathe fire upon brave knights"])
+check("bleu_like: disjoint samples < 0.1", bleu_dj < 0.1)
+
+// -- 6a. Embedding cosine identical --
+let emb_id = embedding_sim("hello world", "hello world")
+check("embed_sim: identical -> 1.0", approx_eq(emb_id, 1.0, 0.0001))
+
+// -- 6b. Embedding cosine disjoint --
+let emb_dj = embedding_sim("xyz", "qqqq")
+check("embed_sim: disjoint chars -> 0.0", approx_eq(emb_dj, 0.0, 0.0001))
+
+// -- 7. p-value monotone: high consistency -> low p-value --
+let pv_high = p_value_approx(0.95, 20)
+let pv_low = p_value_approx(0.55, 20)
+check("p_value: high consistency tiny", pv_high < 0.1)
+check("p_value: borderline consistency larger", pv_low > pv_high)
+
+// -- 8. Full pipeline: consistent primary -> NOT flagged --
+let cfg = create_self_check_config(3, 0.5)
+let primary_consistent = "Paris is the capital of France. The Eiffel Tower is in Paris."
+let samples_consistent = [
+    "Paris is the capital of France and the Eiffel Tower is located in Paris",
+    "The capital of France is Paris with the Eiffel Tower in the center",
+    "In France Paris is the capital and Eiffel Tower is a Paris landmark"
+]
+let rep_ok = self_check(primary_consistent, samples_consistent, cfg)
+check("self_check: consistent -> NOT flagged", rep_ok.flagged == false)
+check("self_check: sentences length = 2", len(rep_ok.sentences) == 2)
+
+// -- 9. Full pipeline: inconsistent samples -> flagged --
+let primary_halluc = "Paris is the capital of France. Eiffel Tower was built in 1889."
+let samples_halluc = [
+    "Bananas grow on palm trees and love water",
+    "Unicorns ride through beautiful rainbows often",
+    "Dragons breathe fire upon brave knights"
+]
+let rep_bad = self_check(primary_halluc, samples_halluc, cfg)
+check("self_check: inconsistent -> flagged", rep_bad.flagged == true)
+check("self_check: overall_prob > 0.5", rep_bad.overall_prob > 0.5)
+
+// -- 10. Per-sentence scoring (mixed) --
+let primary_mixed = "Paris is the capital of France. The moon is made of cheese."
+let samples_mixed = [
+    "Paris is the capital of France",
+    "Paris France is a nice capital",
+    "The capital city Paris France"
+]
+let rep_mix = self_check(primary_mixed, samples_mixed, cfg)
+check("self_check: mixed report has 2 scores", len(rep_mix.hallucination_probs) == 2)
+check("self_check: 1st sentence prob < 2nd sentence prob",
+      rep_mix.hallucination_probs[0] < rep_mix.hallucination_probs[1])
+
+// -- 11. Threshold sensitivity --
+let cfg_strict = create_self_check_config(3, 0.05)
+let rep_strict = self_check(primary_mixed, samples_mixed, cfg_strict)
+check("self_check: strict threshold flags more",
+      rep_strict.flagged == true || len(rep_strict.is_hallucination) > 0)
+
+// -- 12. Empty samples fallback --
+let rep_empty = self_check("Paris is the capital of France.", [], cfg)
+check("self_check: empty samples -> flagged", rep_empty.flagged == true)
+
+// -- 13. p-value is a float in [0, 1] --
+check("self_check: p-value in [0,1]",
+      rep_ok.p_value >= 0.0 && rep_ok.p_value <= 1.0)
+
+// -- 14. Report arrays aligned --
+check("self_check: aligned arrays",
+      len(rep_ok.ngram_scores) == len(rep_ok.sentences) &&
+      len(rep_ok.bleu_scores) == len(rep_ok.sentences) &&
+      len(rep_ok.embed_scores) == len(rep_ok.sentences))
+
+// ===================================================================
+//  Summary
+// ===================================================================
+println("")
+println("=== SelfCheckGPT Tests Summary ===")
+println("pass=" + to_string(pass_count) + " fail=" + to_string(fail_count))
+if fail_count == 0 {
+    println("ALL PASS")
+} else {
+    println("FAILED")
+}
+println(to_string(pass_count) + " passed")

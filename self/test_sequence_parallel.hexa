@@ -1,0 +1,708 @@
+// ===================================================================
+//  test_sequence_parallel.hexa — Megatron-LM Sequence Parallelism tests
+//
+//  Verifies:
+//    1.  sp_context_init: world_size, seq_per_rank
+//    2.  sp_split_sequence: shard count + length
+//    3.  sp_concat_sequence: round-trip identity
+//    4.  sp_all_gather_seq: equals split+concat
+//    5.  sp_layernorm_row: zero-mean unit-variance (up to eps)
+//    6.  sp_layernorm_shard: each row normalized independently
+//    7.  SP LayerNorm == single-rank LayerNorm (numerical equivalence)
+//    8.  sp_dropout_shard: keep_prob=1.0 is identity
+//    9.  SP Dropout: deterministic under fixed seed
+//   10.  Different ranks produce DIFFERENT masks (per-rank seeding)
+//   11.  sp_reduce_scatter_seq: sums then scatters correctly
+//   12.  SP+TP block forward shape (per rank)
+//   13.  SP+TP block forward == single-rank baseline (numerical)
+//   14.  sp_memory_saved_ratio: P=1 -> 0, P=4 -> 0.75
+//   15.  sp_activation_bytes: P=4 is 1/4 of no-SP bytes
+//
+//  Run: ./hexa self/test_sequence_parallel.hexa
+// ===================================================================
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn approx(a, b, tol) {
+    return fabs(a - b) < tol
+}
+
+// ===================================================================
+//  Inline SP implementation (self-contained test)
+// ===================================================================
+
+struct SPContext {
+    world_size: int,
+    seq_len: int,
+    hidden: int,
+    seq_per_rank: int
+}
+
+struct SPBlockWeights {
+    gamma1: array,
+    beta1: array,
+    gamma2: array,
+    beta2: array,
+    w_q: array,
+    w_k: array,
+    w_v: array,
+    w_o: array,
+    w_mlp1: array,
+    w_mlp2: array,
+    eps: float,
+    keep_prob: float,
+    seed: int
+}
+
+fn sp_context_init(world_size, seq_len, hidden) {
+    let per = seq_len / world_size
+    return SPContext {
+        world_size: world_size,
+        seq_len: seq_len,
+        hidden: hidden,
+        seq_per_rank: per
+    }
+}
+
+fn sp_zeros(n) {
+    let mut a = []
+    let mut i = 0
+    while i < n {
+        a = a + [0.0]
+        i = i + 1
+    }
+    return a
+}
+
+fn sp_split_sequence(X, ctx) {
+    let mut shards = []
+    let per = ctx.seq_per_rank
+    let hidden = ctx.hidden
+    let chunk = per * hidden
+    let mut r = 0
+    while r < ctx.world_size {
+        let mut shard = []
+        let base = r * chunk
+        let mut i = 0
+        while i < chunk {
+            shard = shard + [X[base + i]]
+            i = i + 1
+        }
+        shards = shards + [shard]
+        r = r + 1
+    }
+    return shards
+}
+
+fn sp_concat_sequence(shards) {
+    let mut out = []
+    let n = len(shards)
+    let mut r = 0
+    while r < n {
+        let s = shards[r]
+        let sl = len(s)
+        let mut i = 0
+        while i < sl {
+            out = out + [s[i]]
+            i = i + 1
+        }
+        r = r + 1
+    }
+    return out
+}
+
+fn sp_all_gather_seq(shards) {
+    return sp_concat_sequence(shards)
+}
+
+fn sp_reduce_scatter_seq(full_by_rank, ctx) {
+    let P = ctx.world_size
+    let hidden = ctx.hidden
+    let seq = ctx.seq_len
+    let total = seq * hidden
+
+    let mut summed = sp_zeros(total)
+    let mut r = 0
+    while r < P {
+        let full = full_by_rank[r]
+        let mut i = 0
+        while i < total {
+            summed[i] = summed[i] + full[i]
+            i = i + 1
+        }
+        r = r + 1
+    }
+    return sp_split_sequence(summed, ctx)
+}
+
+fn sp_layernorm_row(row, gamma, beta, eps, hidden) {
+    let mut mean = 0.0
+    let mut i = 0
+    while i < hidden {
+        mean = mean + row[i]
+        i = i + 1
+    }
+    mean = mean / to_float(hidden)
+
+    let mut var = 0.0
+    i = 0
+    while i < hidden {
+        let d = row[i] - mean
+        var = var + d * d
+        i = i + 1
+    }
+    var = var / to_float(hidden)
+    let inv = 1.0 / sqrt(var + eps)
+
+    let mut out = []
+    i = 0
+    while i < hidden {
+        let norm = (row[i] - mean) * inv
+        out = out + [norm * gamma[i] + beta[i]]
+        i = i + 1
+    }
+    return out
+}
+
+fn sp_layernorm_shard(shard, gamma, beta, eps, hidden) {
+    let total = len(shard)
+    let num_rows = total / hidden
+    let mut out = sp_zeros(total)
+    let mut s = 0
+    while s < num_rows {
+        let mut row = []
+        let mut h = 0
+        while h < hidden {
+            row = row + [shard[s * hidden + h]]
+            h = h + 1
+        }
+        let rn = sp_layernorm_row(row, gamma, beta, eps, hidden)
+        h = 0
+        while h < hidden {
+            out[s * hidden + h] = rn[h]
+            h = h + 1
+        }
+        s = s + 1
+    }
+    return out
+}
+
+fn sp_lcg_next(state) {
+    let a = 1664525
+    let c = 1013904223
+    let m = 2147483647
+    return (state * a + c) % m
+}
+
+fn sp_dropout_mask(n, seed, rank, keep_prob) {
+    let mut state = (seed * 131 + rank * 977 + 1) % 2147483647
+    let thresh_int = to_int(keep_prob * 1000000.0)
+    let mut mask = []
+    let mut i = 0
+    while i < n {
+        state = sp_lcg_next(state)
+        let r01 = state % 1000000
+        if r01 < thresh_int {
+            mask = mask + [1.0]
+        } else {
+            mask = mask + [0.0]
+        }
+        i = i + 1
+    }
+    return mask
+}
+
+fn sp_dropout_shard(shard, rank, seed, keep_prob) {
+    let n = len(shard)
+    if keep_prob >= 0.999999 {
+        return shard
+    }
+    let mask = sp_dropout_mask(n, seed, rank, keep_prob)
+    let scale = 1.0 / keep_prob
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [shard[i] * mask[i] * scale]
+        i = i + 1
+    }
+    return out
+}
+
+fn sp_matmul_rowmajor(X, W, rows, inner, out_cols) {
+    let mut out = sp_zeros(rows * out_cols)
+    let mut r = 0
+    while r < rows {
+        let mut c = 0
+        while c < out_cols {
+            let mut acc = 0.0
+            let mut k = 0
+            while k < inner {
+                acc = acc + X[r * inner + k] * W[k * out_cols + c]
+                k = k + 1
+            }
+            out[r * out_cols + c] = acc
+            c = c + 1
+        }
+        r = r + 1
+    }
+    return out
+}
+
+fn sp_add(a, b) {
+    let n = len(a)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [a[i] + b[i]]
+        i = i + 1
+    }
+    return out
+}
+
+fn sp_attention_tp(X_full, W_q, seq_len, hidden) {
+    return sp_matmul_rowmajor(X_full, W_q, seq_len, hidden, hidden)
+}
+
+fn sp_mlp_tp(X_full, W1, W2, seq_len, hidden, inter) {
+    let h1 = sp_matmul_rowmajor(X_full, W1, seq_len, hidden, inter)
+    return sp_matmul_rowmajor(h1, W2, seq_len, inter, hidden)
+}
+
+fn sp_block_forward(X_sharded, block, ctx) {
+    let P = ctx.world_size
+    let hidden = ctx.hidden
+    let seq = ctx.seq_len
+
+    // LayerNorm 1 per shard
+    let mut ln1_shards = []
+    let mut r = 0
+    while r < P {
+        let ln = sp_layernorm_shard(X_sharded[r], block.gamma1, block.beta1, block.eps, hidden)
+        ln1_shards = ln1_shards + [ln]
+        r = r + 1
+    }
+
+    let X_full = sp_all_gather_seq(ln1_shards)
+    let attn = sp_attention_tp(X_full, block.w_q, seq, hidden)
+
+    let mut attn_by_rank = []
+    r = 0
+    while r < P {
+        attn_by_rank = attn_by_rank + [attn]
+        r = r + 1
+    }
+    let attn_sum_shards = sp_reduce_scatter_seq(attn_by_rank, ctx)
+    let mut attn_shards = []
+    let Pf = to_float(P)
+    r = 0
+    while r < P {
+        let s = attn_sum_shards[r]
+        let sl = len(s)
+        let mut scaled = []
+        let mut i = 0
+        while i < sl {
+            scaled = scaled + [s[i] / Pf]
+            i = i + 1
+        }
+        attn_shards = attn_shards + [scaled]
+        r = r + 1
+    }
+
+    // Residual + Dropout (local)
+    let mut post_attn = []
+    r = 0
+    while r < P {
+        let sum_sh = sp_add(X_sharded[r], attn_shards[r])
+        let drop_sh = sp_dropout_shard(sum_sh, r, block.seed, block.keep_prob)
+        post_attn = post_attn + [drop_sh]
+        r = r + 1
+    }
+
+    // LayerNorm 2
+    let mut ln2_shards = []
+    r = 0
+    while r < P {
+        let ln = sp_layernorm_shard(post_attn[r], block.gamma2, block.beta2, block.eps, hidden)
+        ln2_shards = ln2_shards + [ln]
+        r = r + 1
+    }
+
+    let X_full2 = sp_all_gather_seq(ln2_shards)
+    let inter = hidden
+    let mlp = sp_mlp_tp(X_full2, block.w_mlp1, block.w_mlp2, seq, hidden, inter)
+    let mut mlp_by_rank = []
+    r = 0
+    while r < P {
+        mlp_by_rank = mlp_by_rank + [mlp]
+        r = r + 1
+    }
+    let mlp_sum_shards = sp_reduce_scatter_seq(mlp_by_rank, ctx)
+    let mut mlp_shards = []
+    r = 0
+    while r < P {
+        let s = mlp_sum_shards[r]
+        let sl = len(s)
+        let mut scaled = []
+        let mut i = 0
+        while i < sl {
+            scaled = scaled + [s[i] / Pf]
+            i = i + 1
+        }
+        mlp_shards = mlp_shards + [scaled]
+        r = r + 1
+    }
+
+    let mut out_shards = []
+    r = 0
+    while r < P {
+        let sum_sh = sp_add(post_attn[r], mlp_shards[r])
+        let drop_sh = sp_dropout_shard(sum_sh, r, block.seed + 1, block.keep_prob)
+        out_shards = out_shards + [drop_sh]
+        r = r + 1
+    }
+    return out_shards
+}
+
+fn sp_block_forward_single(X_full, block, seq_len, hidden) {
+    let ln1 = sp_layernorm_shard(X_full, block.gamma1, block.beta1, block.eps, hidden)
+    let attn = sp_attention_tp(ln1, block.w_q, seq_len, hidden)
+    let post_attn = sp_add(X_full, attn)
+    let ln2 = sp_layernorm_shard(post_attn, block.gamma2, block.beta2, block.eps, hidden)
+    let mlp = sp_mlp_tp(ln2, block.w_mlp1, block.w_mlp2, seq_len, hidden, hidden)
+    return sp_add(post_attn, mlp)
+}
+
+fn sp_activation_bytes(seq, hidden, P) {
+    let regions = 2
+    let per_rank = (seq / P) * hidden * regions * 4
+    return per_rank
+}
+
+fn sp_activation_bytes_no_sp(seq, hidden) {
+    let regions = 2
+    return seq * hidden * regions * 4
+}
+
+fn sp_memory_saved_ratio(P) {
+    if P <= 1 { return 0.0 }
+    let pf = to_float(P)
+    return 1.0 - 1.0 / pf
+}
+
+// ===================================================================
+//  TESTS
+// ===================================================================
+
+println("===================================================")
+println("  Sequence Parallelism (Megatron-SP) Test Suite")
+println("===================================================")
+
+// -- Test fixtures --
+let world_size = 4
+let seq_len = 8
+let hidden = 4
+let ctx = sp_context_init(world_size, seq_len, hidden)
+
+// Build a deterministic input: X[s,h] = s*0.1 + h*0.01
+let mut X = []
+let mut s = 0
+while s < seq_len {
+    let mut h = 0
+    while h < hidden {
+        X = X + [to_float(s) * 0.1 + to_float(h) * 0.01]
+        h = h + 1
+    }
+    s = s + 1
+}
+
+// -- 1. context ------------------------------------------------
+println("")
+println("=== Context ===")
+check("context world_size", ctx.world_size == 4)
+check("context seq_per_rank", ctx.seq_per_rank == 2)
+
+// -- 2. sp_split_sequence --------------------------------------
+println("")
+println("=== Split / Concat ===")
+let shards = sp_split_sequence(X, ctx)
+check("split shard count", len(shards) == 4)
+check("split shard length", len(shards[0]) == 2 * hidden)
+
+// -- 3. sp_concat_sequence round trip --------------------------
+let roundtrip = sp_concat_sequence(shards)
+let mut rt_ok = true
+let total_x = len(X)
+let mut ti = 0
+while ti < total_x {
+    if fabs(roundtrip[ti] - X[ti]) > 0.000001 {
+        rt_ok = false
+    }
+    ti = ti + 1
+}
+check("split+concat round trip", rt_ok)
+
+// -- 4. sp_all_gather_seq == concat ----------------------------
+let gathered = sp_all_gather_seq(shards)
+let mut g_ok = true
+let mut gi = 0
+while gi < total_x {
+    if fabs(gathered[gi] - X[gi]) > 0.000001 {
+        g_ok = false
+    }
+    gi = gi + 1
+}
+check("all_gather_seq = concat", g_ok)
+
+// -- 5. sp_layernorm_row zero mean -----------------------------
+println("")
+println("=== LayerNorm ===")
+let mut gamma = []
+let mut beta = []
+let mut ghi = 0
+while ghi < hidden {
+    gamma = gamma + [1.0]
+    beta = beta + [0.0]
+    ghi = ghi + 1
+}
+let row = [1.0, 2.0, 3.0, 4.0]
+let ln_row = sp_layernorm_row(row, gamma, beta, 0.00001, hidden)
+let mut row_mean = 0.0
+let mut ri = 0
+while ri < hidden {
+    row_mean = row_mean + ln_row[ri]
+    ri = ri + 1
+}
+row_mean = row_mean / to_float(hidden)
+check("layernorm_row zero mean", fabs(row_mean) < 0.001)
+
+// Unit variance
+let mut row_var = 0.0
+ri = 0
+while ri < hidden {
+    let d = ln_row[ri] - row_mean
+    row_var = row_var + d * d
+    ri = ri + 1
+}
+row_var = row_var / to_float(hidden)
+check("layernorm_row unit variance", fabs(row_var - 1.0) < 0.01)
+
+// -- 6. sp_layernorm_shard: each row independently normalized --
+let shard0 = shards[0]
+let ln_shard = sp_layernorm_shard(shard0, gamma, beta, 0.00001, hidden)
+// Row 0 of shard0 should have zero mean
+let mut shard_row0_mean = 0.0
+let mut sri = 0
+while sri < hidden {
+    shard_row0_mean = shard_row0_mean + ln_shard[sri]
+    sri = sri + 1
+}
+shard_row0_mean = shard_row0_mean / to_float(hidden)
+check("layernorm_shard row0 zero mean", fabs(shard_row0_mean) < 0.001)
+
+// -- 7. SP LayerNorm == single LayerNorm (full sequence) -------
+let ln_full_single = sp_layernorm_shard(X, gamma, beta, 0.00001, hidden)
+let mut ln_sp_shards = []
+let mut lr = 0
+while lr < world_size {
+    let lns = sp_layernorm_shard(shards[lr], gamma, beta, 0.00001, hidden)
+    ln_sp_shards = ln_sp_shards + [lns]
+    lr = lr + 1
+}
+let ln_sp_full = sp_concat_sequence(ln_sp_shards)
+let mut ln_ok = true
+let ln_len = len(ln_full_single)
+let mut lni = 0
+while lni < ln_len {
+    if fabs(ln_full_single[lni] - ln_sp_full[lni]) > 0.0001 {
+        ln_ok = false
+    }
+    lni = lni + 1
+}
+check("SP LayerNorm == single LayerNorm", ln_ok)
+
+// -- 8. Dropout keep_prob=1.0 is identity ----------------------
+println("")
+println("=== Dropout ===")
+let d_id = sp_dropout_shard(shard0, 0, 42, 1.0)
+let mut d_id_ok = true
+let sh_len = len(shard0)
+let mut di = 0
+while di < sh_len {
+    if fabs(d_id[di] - shard0[di]) > 0.000001 {
+        d_id_ok = false
+    }
+    di = di + 1
+}
+check("dropout keep_prob=1.0 is identity", d_id_ok)
+
+// -- 9. Deterministic seed -------------------------------------
+let d_a = sp_dropout_shard(shard0, 0, 12345, 0.5)
+let d_b = sp_dropout_shard(shard0, 0, 12345, 0.5)
+let mut det_ok = true
+let mut dai = 0
+while dai < sh_len {
+    if fabs(d_a[dai] - d_b[dai]) > 0.000001 {
+        det_ok = false
+    }
+    dai = dai + 1
+}
+check("dropout deterministic under fixed seed", det_ok)
+
+// -- 10. Per-rank different masks ------------------------------
+let d_r0 = sp_dropout_mask(sh_len, 12345, 0, 0.5)
+let d_r1 = sp_dropout_mask(sh_len, 12345, 1, 0.5)
+let mut differs = false
+let mut mi = 0
+while mi < sh_len {
+    if fabs(d_r0[mi] - d_r1[mi]) > 0.000001 {
+        differs = true
+    }
+    mi = mi + 1
+}
+check("per-rank dropout masks differ", differs)
+
+// -- 11. reduce_scatter behaves like sum+split -----------------
+println("")
+println("=== Reduce-Scatter ===")
+let total = seq_len * hidden
+// Build 4 per-rank full tensors: rank r contributes value (r+1) everywhere
+let mut rs_bufs = []
+let mut rb = 0
+while rb < world_size {
+    let val = to_float(rb + 1)
+    let mut buf = []
+    let mut bi = 0
+    while bi < total {
+        buf = buf + [val]
+        bi = bi + 1
+    }
+    rs_bufs = rs_bufs + [buf]
+    rb = rb + 1
+}
+// Sum across ranks = 1+2+3+4 = 10 everywhere
+let rs_out = sp_reduce_scatter_seq(rs_bufs, ctx)
+check("reduce-scatter shard count", len(rs_out) == 4)
+let rs_first = rs_out[0]
+check("reduce-scatter first elem = 10", approx(rs_first[0], 10.0, 0.001))
+
+// -- 12. Block forward shape ---------------------------------
+println("")
+println("=== SP Block Forward ===")
+// Build block weights: identity-ish
+let mut wq = []
+let mut wi = 0
+while wi < hidden {
+    let mut wj = 0
+    while wj < hidden {
+        if wi == wj {
+            wq = wq + [0.1]
+        } else {
+            wq = wq + [0.0]
+        }
+        wj = wj + 1
+    }
+    wi = wi + 1
+}
+let mut w1 = []
+wi = 0
+while wi < hidden {
+    let mut wj = 0
+    while wj < hidden {
+        if wi == wj {
+            w1 = w1 + [0.05]
+        } else {
+            w1 = w1 + [0.0]
+        }
+        wj = wj + 1
+    }
+    wi = wi + 1
+}
+let mut w2 = []
+wi = 0
+while wi < hidden {
+    let mut wj = 0
+    while wj < hidden {
+        if wi == wj {
+            w2 = w2 + [0.05]
+        } else {
+            w2 = w2 + [0.0]
+        }
+        wj = wj + 1
+    }
+    wi = wi + 1
+}
+
+let block = SPBlockWeights {
+    gamma1: gamma,
+    beta1: beta,
+    gamma2: gamma,
+    beta2: beta,
+    w_q: wq,
+    w_k: wq,
+    w_v: wq,
+    w_o: wq,
+    w_mlp1: w1,
+    w_mlp2: w2,
+    eps: 0.00001,
+    keep_prob: 1.0,
+    seed: 777
+}
+
+let out_shards = sp_block_forward(shards, block, ctx)
+check("block output shard count", len(out_shards) == 4)
+check("block output shard length", len(out_shards[0]) == ctx.seq_per_rank * hidden)
+
+// -- 13. SP+TP block == single-rank baseline ------------------
+let out_full_sp = sp_concat_sequence(out_shards)
+let out_single = sp_block_forward_single(X, block, seq_len, hidden)
+let mut blk_ok = true
+let out_len = len(out_single)
+let mut oi = 0
+while oi < out_len {
+    if fabs(out_full_sp[oi] - out_single[oi]) > 0.001 {
+        blk_ok = false
+    }
+    oi = oi + 1
+}
+check("SP+TP block == single-rank baseline", blk_ok)
+
+// -- 14. Memory saved ratio ------------------------------------
+println("")
+println("=== Memory Savings ===")
+check("memory_saved P=1 -> 0", approx(sp_memory_saved_ratio(1), 0.0, 0.001))
+check("memory_saved P=4 -> 0.75", approx(sp_memory_saved_ratio(4), 0.75, 0.001))
+check("memory_saved P=8 -> 0.875", approx(sp_memory_saved_ratio(8), 0.875, 0.001))
+
+// -- 15. Activation bytes --------------------------------------
+let bytes_no_sp = sp_activation_bytes_no_sp(seq_len, hidden)
+let bytes_sp4 = sp_activation_bytes(seq_len, hidden, 4)
+check("SP P=4 bytes = 1/4 no-SP bytes", bytes_sp4 * 4 == bytes_no_sp)
+
+// ===================================================================
+//  Summary
+// ===================================================================
+println("")
+println("=== Sequence Parallelism Tests Summary ===")
+println("pass=" + str(pass_count) + " fail=" + str(fail_count))
+if fail_count == 0 {
+    println("ALL PASS")
+} else {
+    println("FAILED")
+}
+println(str(pass_count) + " passed")

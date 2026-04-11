@@ -1,0 +1,396 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/self_rewarding.hexa — Self-Rewarding LM (ML #65)
+//
+//  Self-Rewarding language models remove the external reward model
+//  by letting the LM act as both generator AND judge. Over multiple
+//  iterations the model produces candidates, scores them using an
+//  LLM-as-judge rubric, converts the highest/lowest scored pairs into
+//  DPO preference tuples, and trains on its own output.
+//
+//  Pipeline (one iteration):
+//    1. self-prompting        — build a structured judge prompt
+//    2. judge scoring         — 1..5 rubric per criterion, weighted avg
+//    3. DPO pair generation   — argmax vs argmin of scored candidates
+//    4. iterative loop        — iter_k uses iter_{k-1} outputs as data
+//    5. quality measurement   — avg/margin/delta across iterations
+//
+//  Reuses:
+//    - self/ml/dpo.hexa      (preference objective, DPO pair shape)
+//    - self/ml/rlaif.hexa    (LLM-as-judge prompt + pairwise comparison)
+//
+//  Dependencies: only pure hexa + builtin len/str/to_float.
+//
+//  API (all @pure unless noted):
+//    srlm_rubric_levels()                 -> [int]  1..5 rubric values
+//    srlm_default_rubric_criteria()       -> [string]
+//    srlm_default_rubric_weights()        -> [float]
+//    srlm_make_self_prompt(seed, iter)    -> string
+//    srlm_make_judge_rubric_prompt(prompt, response,
+//                                  crit_names, crit_weights) -> string
+//    srlm_score_one(prompt, response, crit_names,
+//                   crit_weights, judge_fn)           -> float
+//    srlm_score_batch(prompt, responses, crit_names,
+//                     crit_weights, judge_fn)         -> [float]
+//    srlm_argmax_index(values)                        -> int
+//    srlm_argmin_index(values)                        -> int
+//    srlm_make_dpo_pair(prompt, responses, scores)    -> [prompt, chosen, rejected]
+//    srlm_build_pairs(prompts, responses_batch, scores_batch)
+//                                                     -> [[p, chosen, rej], ...]
+//    srlm_iteration(prompts, generate_fn, judge_fn,
+//                   n_candidates, crit_names, crit_weights)
+//                                                     -> [pairs, stats]
+//    srlm_run_loop(prompts, generate_fn, judge_fn,
+//                  n_candidates, n_iters,
+//                  crit_names, crit_weights)          -> [iter_records...]
+//    srlm_quality_delta(iter_records)                 -> [delta_avg, delta_margin]
+//    srlm_to_dpo_ids_pair(str_pair, tokenizer_fn)     -> [chosen_ids, rejected_ids]
+//
+//  AI-NATIVE attrs:
+//    @pure — no side effects
+// ═══════════════════════════════════════════════════════════════════
+
+// ── helpers ──────────────────────────────────────────────────────
+fn srlm_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn srlm_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+// ── Rubric primitives ────────────────────────────────────────────
+// 1..5 integer scale, classic Likert-style LLM-as-judge rubric.
+@pure
+fn srlm_rubric_levels() {
+    return [1, 2, 3, 4, 5]
+}
+
+@pure
+fn srlm_default_rubric_criteria() {
+    return ["relevance", "correctness", "helpfulness", "clarity", "safety"]
+}
+
+@pure
+fn srlm_default_rubric_weights() {
+    return [0.25, 0.25, 0.2, 0.15, 0.15]
+}
+
+// Clip arbitrary judge output into the 1..5 rubric band, returning a float.
+@pure
+fn srlm_clip_rubric(raw) {
+    if raw < 1.0 { return 1.0 }
+    if raw > 5.0 { return 5.0 }
+    return raw
+}
+
+// Normalize a 1..5 score to the 0..1 range (useful for DPO-compatible margins).
+@pure
+fn srlm_normalize_rubric(score) {
+    return (srlm_clip_rubric(score) - 1.0) / 4.0
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Self-prompting — build a structured prompt that nudges the policy
+//  to act as its own proposer.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn srlm_make_self_prompt(seed, iter) {
+    let mut text = "[SELF-PROMPTING iter=" + str(iter) + "]\n"
+    text = text + "=== Seed ===\n" + seed + "\n"
+    text = text + "=== Task ===\n"
+    text = text + "Produce a new helpful response, then reflect on how to improve.\n"
+    return text
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Judge rubric prompt (LLM-as-judge, 1..5 scale)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn srlm_make_judge_rubric_prompt(prompt, response, crit_names, crit_weights) {
+    let mut text = "[JUDGE RUBRIC 1..5]\n"
+    text = text + "=== User Prompt ===\n" + prompt + "\n"
+    text = text + "=== Response ===\n" + response + "\n"
+    text = text + "=== Criteria (score each 1..5) ===\n"
+    let n_crit = len(crit_names)
+    for i in 0..n_crit {
+        text = text + "- " + crit_names[i] + " (weight: " + str(crit_weights[i]) + ")\n"
+    }
+    text = text + "=== Output ===\n"
+    text = text + "Return one integer score per criterion, then justification.\n"
+    return text
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Score a single response using weighted rubric sum.
+//
+//  judge_fn(prompt, response, criterion_name) -> float (1..5)
+//  Returns: normalized weighted score in [0,1]
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn srlm_score_one(prompt, response, crit_names, crit_weights, judge_fn) {
+    let n_crit = len(crit_names)
+    let mut total = 0.0
+    let mut weight_sum = 0.0
+    for i in 0..n_crit {
+        let raw = judge_fn(prompt, response, crit_names[i])
+        let clipped = srlm_clip_rubric(raw)
+        let norm = (clipped - 1.0) / 4.0
+        total = total + crit_weights[i] * norm
+        weight_sum = weight_sum + crit_weights[i]
+    }
+    if weight_sum > 0.0 {
+        return total / weight_sum
+    }
+    return 0.0
+}
+
+// Batch-score every candidate response for a prompt.
+@pure
+fn srlm_score_batch(prompt, responses, crit_names, crit_weights, judge_fn) {
+    let n = len(responses)
+    let mut scores = srlm_zeros(n)
+    for i in 0..n {
+        scores[i] = srlm_score_one(prompt, responses[i], crit_names, crit_weights, judge_fn)
+    }
+    return scores
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Argmax / Argmin — pick the best and worst candidate.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn srlm_argmax_index(values) {
+    let n = len(values)
+    if n == 0 { return -1 }
+    let mut best = 0
+    let mut best_v = values[0]
+    for i in 1..n {
+        if values[i] > best_v {
+            best = i
+            best_v = values[i]
+        }
+    }
+    return best
+}
+
+@pure
+fn srlm_argmin_index(values) {
+    let n = len(values)
+    if n == 0 { return -1 }
+    let mut worst = 0
+    let mut worst_v = values[0]
+    for i in 1..n {
+        if values[i] < worst_v {
+            worst = i
+            worst_v = values[i]
+        }
+    }
+    return worst
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  DPO pair construction — chosen = argmax, rejected = argmin.
+//
+//  Returns [prompt, chosen_text, rejected_text]  (all strings).
+//  Margin is returned by `srlm_pair_margin` because arrays must be
+//  homogeneous in Hexa.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn srlm_make_dpo_pair(prompt, responses, scores) {
+    let n = len(responses)
+    if n < 2 {
+        return [prompt, "", ""]
+    }
+    let hi = srlm_argmax_index(scores)
+    let lo = srlm_argmin_index(scores)
+    if hi == lo {
+        return [prompt, responses[hi], responses[hi]]
+    }
+    return [prompt, responses[hi], responses[lo]]
+}
+
+// Companion float returning the margin for a single prompt's candidates.
+@pure
+fn srlm_pair_margin(scores) {
+    let n = len(scores)
+    if n < 2 { return 0.0 }
+    let hi = srlm_argmax_index(scores)
+    let lo = srlm_argmin_index(scores)
+    if hi == lo { return 0.0 }
+    return scores[hi] - scores[lo]
+}
+
+// Build DPO pairs across a batch of prompts.
+// Returns an array of [prompt, chosen, rejected]  (strings only).
+// Ties (margin == 0) are filtered out.
+fn srlm_build_pairs(prompts, responses_batch, scores_batch) {
+    let n = len(prompts)
+    let mut pairs = []
+    for p in 0..n {
+        let scores = scores_batch[p]
+        let margin = srlm_pair_margin(scores)
+        if margin > 0.0 {
+            let pair = srlm_make_dpo_pair(prompts[p], responses_batch[p], scores)
+            pairs = pairs + [pair]
+        }
+    }
+    return pairs
+}
+
+// Parallel margins for the filtered pairs (separate pass, no mixed type).
+fn srlm_build_margins(prompts, responses_batch, scores_batch) {
+    let n = len(prompts)
+    let mut margins = []
+    for p in 0..n {
+        let scores = scores_batch[p]
+        let margin = srlm_pair_margin(scores)
+        if margin > 0.0 {
+            margins = margins + [margin]
+        }
+    }
+    return margins
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Statistics — summarize an iteration's scored candidates.
+//  Returns [n_prompts, avg_top, avg_bot, avg_margin]
+// ═══════════════════════════════════════════════════════════════════
+fn srlm_iter_stats(scores_batch) {
+    let n = len(scores_batch)
+    if n == 0 { return [0.0, 0.0, 0.0, 0.0] }
+    let mut sum_top = 0.0
+    let mut sum_bot = 0.0
+    let mut sum_margin = 0.0
+    for p in 0..n {
+        let s = scores_batch[p]
+        let m = len(s)
+        if m == 0 { continue }
+        let hi = srlm_argmax_index(s)
+        let lo = srlm_argmin_index(s)
+        sum_top = sum_top + s[hi]
+        sum_bot = sum_bot + s[lo]
+        sum_margin = sum_margin + (s[hi] - s[lo])
+    }
+    let fn_f = to_float(n)
+    return [fn_f, sum_top / fn_f, sum_bot / fn_f, sum_margin / fn_f]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  One self-rewarding iteration:
+//    1. generate n_candidates per prompt
+//    2. score every candidate via judge_fn
+//    3. build DPO pairs (argmax vs argmin)
+//
+//  Returns pairs: array of [prompt, chosen, rejected]  (strings only)
+//  (use srlm_iteration_stats for numeric stats on the same inputs)
+// ═══════════════════════════════════════════════════════════════════
+fn srlm_iteration_pairs(prompts, generate_fn, judge_fn, n_candidates, crit_names, crit_weights) {
+    let n_p = len(prompts)
+    let mut responses_batch = []
+    let mut scores_batch = []
+    for p in 0..n_p {
+        let prompt = prompts[p]
+        let mut resps = []
+        for _r in 0..n_candidates {
+            let resp = generate_fn(prompt)
+            resps = resps + [resp]
+        }
+        let scores = srlm_score_batch(prompt, resps, crit_names, crit_weights, judge_fn)
+        responses_batch = responses_batch + [resps]
+        scores_batch = scores_batch + [scores]
+    }
+    return srlm_build_pairs(prompts, responses_batch, scores_batch)
+}
+
+// Same as srlm_iteration_pairs but returns stats only (all float):
+//   [n_prompts, avg_top, avg_bot, avg_margin]
+fn srlm_iteration_stats(prompts, generate_fn, judge_fn, n_candidates, crit_names, crit_weights) {
+    let n_p = len(prompts)
+    let mut scores_batch = []
+    for p in 0..n_p {
+        let prompt = prompts[p]
+        let mut resps = []
+        for _r in 0..n_candidates {
+            let resp = generate_fn(prompt)
+            resps = resps + [resp]
+        }
+        let scores = srlm_score_batch(prompt, resps, crit_names, crit_weights, judge_fn)
+        scores_batch = scores_batch + [scores]
+    }
+    return srlm_iter_stats(scores_batch)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Iterative loop — simulate iter_k quality improvement.
+//
+//  Each iteration record is all-float:
+//    [iter_index, n_pairs_f, avg_top, avg_bot, avg_margin]
+// ═══════════════════════════════════════════════════════════════════
+fn srlm_run_loop(prompts, generate_fn, judge_fn, n_candidates, n_iters, crit_names, crit_weights) {
+    let mut records = []
+    for it in 0..n_iters {
+        let stats = srlm_iteration_stats(prompts, generate_fn, judge_fn, n_candidates, crit_names, crit_weights)
+        let n_pairs_f = stats[0]
+        let rec = [to_float(it), n_pairs_f, stats[1], stats[2], stats[3]]
+        records = records + [rec]
+    }
+    return records
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Quality delta — measure improvement between first and last iter.
+//  Returns [delta_top, delta_margin]
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn srlm_quality_delta(records) {
+    let n = len(records)
+    if n < 2 { return [0.0, 0.0] }
+    let first = records[0]
+    let last = records[n - 1]
+    let delta_top = last[2] - first[2]
+    let delta_margin = last[4] - first[4]
+    return [delta_top, delta_margin]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Quality monotone check — did avg_top never drop by more than eps?
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn srlm_is_monotone(records, eps) {
+    let n = len(records)
+    if n < 2 { return true }
+    let mut prev = records[0][2]
+    for i in 1..n {
+        let cur = records[i][2]
+        if cur + eps < prev { return false }
+        prev = cur
+    }
+    return true
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Bridge to dpo.hexa — convert a (chosen_text, rejected_text) pair
+//  into (chosen_ids, rejected_ids) via a caller-provided tokenizer.
+//
+//  tokenizer_fn(text) -> [int]
+// ═══════════════════════════════════════════════════════════════════
+fn srlm_to_dpo_ids_pair(str_pair, tokenizer_fn) {
+    let chosen = tokenizer_fn(str_pair[1])
+    let rejected = tokenizer_fn(str_pair[2])
+    return [chosen, rejected]
+}
+
+// Batch-convert text pairs into DPO id pairs (list-of-[chosen_ids, rejected_ids]).
+fn srlm_to_dpo_ids_batch(pairs, tokenizer_fn) {
+    let n = len(pairs)
+    let mut out = []
+    for i in 0..n {
+        out = out + [srlm_to_dpo_ids_pair(pairs[i], tokenizer_fn)]
+    }
+    return out
+}
+
+println("[self_rewarding] loaded — self-prompt + 1..5 rubric + DPO pairs + iterative loop")

@@ -1,0 +1,180 @@
+// ═══════════════════════════════════════════════════════════════════
+//  test_contrastive_search.hexa — @contrastive_search verification
+//
+//  Tests:
+//    1. cs_softmax sums to 1 and is positive
+//    2. cs_softmax handles extreme temp (near-zero guard)
+//    3. cs_top_k_indices returns indices in descending-score order
+//    4. cs_top_k_indices clamps when k > n
+//    5. cs_cosine_sim self == 1.0
+//    6. cs_cosine_sim orthogonal == 0.0
+//    7. cs_degeneration_penalty empty prev == 0
+//    8. cs_degeneration_penalty self-hit == 1
+//    9. cs_token_score alpha=0 → model confidence
+//   10. cs_token_score alpha=1 → -penalty
+//   11. cs_pick_next returns valid topk index and token
+//   12. contrastive_generate produces exactly max_new tokens
+//   13. contrastive_generate is reproducible (deterministic)
+//   14. alpha>0 suppresses repetition vs alpha=0 (rep_rate drops)
+//   15. k>vocab clamps safely (no crash, correct length)
+//   16. cs_repetition_rate all-same = 1, all-different = 0
+//
+//  Run: ./hexa self/test_contrastive_search.hexa
+// ═══════════════════════════════════════════════════════════════════
+
+import "ml/contrastive_search.hexa"
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ── 1. softmax sums to ~1 ─────────────────────────────────────────
+let logits_a = [1.0, 2.0, 3.0, 4.0]
+let probs_a = cs_softmax(logits_a, 1.0)
+let mut sum_a = 0.0
+let mut i1 = 0
+while i1 < len(probs_a) {
+    sum_a = sum_a + probs_a[i1]
+    i1 = i1 + 1
+}
+check("softmax sums to 1", approx(sum_a, 1.0, 1.0e-6))
+
+// all entries > 0
+let mut all_pos = 1
+let mut i1b = 0
+while i1b < len(probs_a) {
+    if probs_a[i1b] <= 0.0 { all_pos = 0 }
+    i1b = i1b + 1
+}
+check("softmax all-positive", all_pos == 1)
+
+// ── 2. softmax tolerates near-zero temperature ────────────────────
+let probs_b = cs_softmax([1.0, 5.0, 2.0], 1.0e-12)
+let mut sum_b = 0.0
+let mut i2 = 0
+while i2 < len(probs_b) {
+    sum_b = sum_b + probs_b[i2]
+    i2 = i2 + 1
+}
+check("softmax temp-guard sums to 1", approx(sum_b, 1.0, 1.0e-6))
+
+// ── 3. top-k indices ranked descending ────────────────────────────
+let scores = [0.1, 0.5, 0.2, 0.9, 0.3]
+let tk = cs_top_k_indices(scores, 3)
+check("top_k len = 3", len(tk) == 3)
+check("top_k[0] picks 0.9", tk[0] == 3)
+check("top_k[1] picks 0.5", tk[1] == 1)
+check("top_k[2] picks 0.3", tk[2] == 4)
+
+// ── 4. top-k clamps when k > n ────────────────────────────────────
+let tk_clamp = cs_top_k_indices([0.7, 0.2], 5)
+check("top_k clamp to n", len(tk_clamp) == 2)
+
+// ── 5. cosine self-similarity = 1 ─────────────────────────────────
+let v = [0.3, 0.5, 0.1, 0.8]
+check("cosine self = 1", approx(cs_cosine_sim(v, v), 1.0, 1.0e-6))
+
+// ── 6. cosine orthogonal = 0 ──────────────────────────────────────
+let ox = [1.0, 0.0, 0.0]
+let oy = [0.0, 1.0, 0.0]
+check("cosine orthogonal = 0", approx(cs_cosine_sim(ox, oy), 0.0, 1.0e-6))
+
+// ── 7. degeneration penalty with empty prev = 0 ───────────────────
+let pen_empty = cs_degeneration_penalty([0.1, 0.2, 0.3], [])
+check("pen empty = 0", approx(pen_empty, 0.0, 1.0e-6))
+
+// ── 8. degeneration penalty self-hit = 1 ──────────────────────────
+let h0 = cs_mock_hidden([1, 2, 3], 5, 6)
+let pen_self = cs_degeneration_penalty(h0, [h0])
+check("pen self = 1", approx(pen_self, 1.0, 1.0e-6))
+
+// ── 9. token_score alpha=0 → p_v ──────────────────────────────────
+check("score alpha=0", approx(cs_token_score(0.4, 0.9, 0.0), 0.4, 1.0e-9))
+
+// ── 10. token_score alpha=1 → -pen ───────────────────────────────
+check("score alpha=1", approx(cs_token_score(0.4, 0.9, 1.0), 0.0 - 0.9, 1.0e-9))
+
+// alpha clamp
+check("score alpha>1 clamped", approx(cs_token_score(0.4, 0.9, 2.0), 0.0 - 0.9, 1.0e-9))
+check("score alpha<0 clamped", approx(cs_token_score(0.4, 0.9, 0.0 - 1.0), 0.4, 1.0e-9))
+
+// ── 11. pick_next returns [token, topk_idx, topk_len] ─────────────
+let picked = cs_pick_next([1, 2], 0.5, 4, 8, 4, [])
+check("pick_next has 3 fields", len(picked) == 3)
+check("pick_next topk_len = 4", picked[2] == 4)
+check("pick_next idx in range", picked[1] >= 0)
+check("pick_next idx < topk_len", picked[1] < picked[2])
+check("pick_next token in vocab", picked[0] >= 0)
+check("pick_next token < 8", picked[0] < 8)
+
+// ── 12. contrastive_generate length = max_new ─────────────────────
+let g = contrastive_generate([1, 2, 3], 8, 0.5, 4, 16, 6)
+check("generate len = max_new", len(g[0]) == 8)
+check("generate has 3 fields", len(g) == 3)
+check("generate rep field is array", len(g[1]) == 1)
+check("generate avg_topk field is array", len(g[2]) == 1)
+
+// ── 13. reproducibility (same inputs → same outputs) ──────────────
+let r1 = contrastive_generate([1, 2, 3], 10, 0.6, 4, 16, 6)
+let r2 = contrastive_generate([1, 2, 3], 10, 0.6, 4, 16, 6)
+let mut same = 1
+let mut ri = 0
+while ri < len(r1[0]) {
+    if r1[0][ri] != r2[0][ri] { same = 0 }
+    ri = ri + 1
+}
+check("reproducible across runs", same == 1)
+check("reproducible rep rate", r1[1][0] == r2[1][0])
+
+// ── 14. alpha > 0 suppresses repetition vs alpha = 0 ──────────────
+let ga = contrastive_generate([1, 2, 3], 32, 0.0, 5, 20, 8)
+let gb = contrastive_generate([1, 2, 3], 32, 0.7, 5, 20, 8)
+let rep_no_pen = ga[1][0]
+let rep_with_pen = gb[1][0]
+println("rep_alpha_0_x10000=" + to_string(rep_no_pen))
+println("rep_alpha_0.7_x10000=" + to_string(rep_with_pen))
+check("alpha>0 lowers rep rate", rep_with_pen < rep_no_pen)
+
+// pick_next with prev hidden states differs from no-prev pick
+let pick_none = cs_pick_next([1, 2], 0.9, 3, 8, 4, [])
+let hp = cs_mock_hidden([1, 2], pick_none[0], 4)
+let pick_prev = cs_pick_next([1, 2], 0.9, 3, 8, 4, [hp])
+check("prev hs changes pick", pick_prev[0] != pick_none[0])
+
+// ── 15. k > vocab safely clamped ──────────────────────────────────
+let gk = contrastive_generate([1], 5, 0.5, 100, 8, 4)
+check("k>vocab produces max_new", len(gk[0]) == 5)
+
+// ── 16. repetition rate endpoints ─────────────────────────────────
+check("rep rate all-same = 1", approx(cs_repetition_rate([3, 3, 3, 3]), 1.0, 1.0e-9))
+check("rep rate all-diff = 0", approx(cs_repetition_rate([1, 2, 3, 4]), 0.0, 1.0e-9))
+check("rep rate singleton = 0", approx(cs_repetition_rate([7]), 0.0, 1.0e-9))
+
+// ── deterministic smoke values (guards against silent regression) ──
+let det = contrastive_generate([1, 2, 3], 8, 0.5, 4, 16, 6)
+println("det_tokens=" + to_string(det[0]))
+println("det_rep_x=" + to_string(det[1][0]))
+println("det_avg_topk=" + to_string(det[2][0]))
+check("det first token = 1", det[0][0] == 1)
+check("det avg_topk = 4", det[2][0] == 4)
+
+println("")
+println("pass=" + to_string(pass_count) + " fail=" + to_string(fail_count))
+if fail_count == 0 {
+    println("ALL PASS")
+} else {
+    println("FAILED")
+}
+println(to_string(pass_count) + " passed")

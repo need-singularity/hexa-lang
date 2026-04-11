@@ -1,0 +1,288 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/simpo.hexa — Simple Preference Optimization (Reference-Free)
+//
+//  SimPO eliminates the reference model entirely (unlike DPO which needs
+//  a frozen pi_ref copy). Instead it length-normalizes the policy's own
+//  log-probabilities and adds a target reward margin gamma.
+//
+//  SimPO loss:
+//    L = -log sigma( beta * ( log pi(y_w|x)/|y_w|
+//                           - log pi(y_l|x)/|y_l| ) - gamma )
+//
+//  Key differences vs DPO:
+//    - NO reference model (saves memory, removes KL anchor)
+//    - Length-normalized log-probs (prevents length bias)
+//    - Target margin gamma (forces separation between chosen/rejected)
+//
+//  Reference: Meng et al., "SimPO: Simple Preference Optimization with
+//             a Reference-Free Reward" (NeurIPS 2024)
+//
+//  API:
+//    simpo_sigmoid(x)                              -> float
+//    simpo_log_sigmoid(x)                          -> float
+//    simpo_length_normalize(log_p, length)         -> float
+//    simpo_reward(log_p, length, beta)             -> float
+//    simpo_loss(log_p_w, log_p_l, len_w, len_l,
+//               beta, gamma)                       -> float
+//    simpo_loss_grad_lp_w(log_p_w, log_p_l,
+//                         len_w, len_l,
+//                         beta, gamma)             -> float
+//    simpo_loss_grad_lp_l(log_p_w, log_p_l,
+//                         len_w, len_l,
+//                         beta, gamma)             -> float
+//    simpo_reward_margin(log_p_w, log_p_l,
+//                        len_w, len_l, beta)       -> float
+//    simpo_preference_accuracy(log_p_w, log_p_l,
+//                              len_w, len_l)       -> float
+//    simpo_batch_loss(batch, beta, gamma)          -> float
+//    simpo_train_step(log_p_w, log_p_l, len_w,
+//                     len_l, beta, gamma, lr)      -> [float,float,float]
+//    simpo_train(batch, n_steps, lr, beta, gamma)  -> [float]
+//    simpo_dpo_vs_simpo(log_p_w, log_p_l, ref_w,
+//                       ref_l, len_w, len_l,
+//                       beta, gamma)               -> [float, float]
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+//    @hot   — called every training step
+// ═══════════════════════════════════════════════════════════════════
+
+// ── helpers (pure, no external deps) ────────────────────────────
+
+fn simpo_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn simpo_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn simpo_log(x) {
+    if x <= 0.0 { return -30.0 }
+    let mut v = x
+    let mut count = 0
+    while v > 2.0 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    let d = v - 1.0
+    let ln_v = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_v
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Sigmoid and log-sigmoid (numerically stable)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn simpo_sigmoid(x) {
+    if x > 20.0 { return 1.0 }
+    if x < -20.0 { return 0.0 }
+    return 1.0 / (1.0 + simpo_exp(0.0 - x))
+}
+
+@pure
+fn simpo_log_sigmoid(x) {
+    // log(sigmoid(x)) = -softplus(-x)
+    let neg_x = 0.0 - x
+    if neg_x > 20.0 { return 0.0 - neg_x }
+    if neg_x < -20.0 { return 0.0 }
+    return 0.0 - simpo_log(1.0 + simpo_exp(neg_x))
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Length-normalized log-probability
+//    lp_norm = log pi(y|x) / |y|
+//
+//  This is the core reason SimPO doesn't need a reference model — the
+//  length term replaces KL anchoring by preventing the policy from
+//  simply generating longer sequences to boost raw log-probs.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn simpo_length_normalize(log_p, length) {
+    if length <= 0 { return log_p }
+    return log_p / to_float(length)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  SimPO implicit reward (length-normalized, scaled by beta)
+//    r(y|x) = beta * log pi(y|x) / |y|
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn simpo_reward(log_p, length, beta) {
+    return beta * simpo_length_normalize(log_p, length)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  SimPO loss (reference-free)
+//
+//    L = -log sigma( beta * (lp_w/|y_w| - lp_l/|y_l|) - gamma )
+//
+//  Parameters:
+//    log_p_w, log_p_l : raw log pi(y|x) for chosen / rejected
+//    len_w,   len_l   : token lengths of chosen / rejected responses
+//    beta             : reward scale (typical 2.0 ~ 2.5)
+//    gamma            : target reward margin (typical 0.5 ~ 1.5)
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn simpo_loss(log_p_w, log_p_l, len_w, len_l, beta, gamma) {
+    let r_w = simpo_reward(log_p_w, len_w, beta)
+    let r_l = simpo_reward(log_p_l, len_l, beta)
+    let margin = r_w - r_l - gamma
+    return 0.0 - simpo_log_sigmoid(margin)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Gradient of SimPO loss w.r.t. log_p_w
+//
+//    dL/d(lp_w) = -(1 - sigma(x)) * beta / |y_w|
+//  where x = beta * (lp_w/|y_w| - lp_l/|y_l|) - gamma
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn simpo_loss_grad_lp_w(log_p_w, log_p_l, len_w, len_l, beta, gamma) {
+    let r_w = simpo_reward(log_p_w, len_w, beta)
+    let r_l = simpo_reward(log_p_l, len_l, beta)
+    let margin = r_w - r_l - gamma
+    let s = simpo_sigmoid(margin)
+    let one_minus_s = 1.0 - s
+    if len_w <= 0 { return 0.0 }
+    return 0.0 - one_minus_s * beta / to_float(len_w)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Gradient of SimPO loss w.r.t. log_p_l
+//
+//    dL/d(lp_l) = +(1 - sigma(x)) * beta / |y_l|
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn simpo_loss_grad_lp_l(log_p_w, log_p_l, len_w, len_l, beta, gamma) {
+    let r_w = simpo_reward(log_p_w, len_w, beta)
+    let r_l = simpo_reward(log_p_l, len_l, beta)
+    let margin = r_w - r_l - gamma
+    let s = simpo_sigmoid(margin)
+    let one_minus_s = 1.0 - s
+    if len_l <= 0 { return 0.0 }
+    return one_minus_s * beta / to_float(len_l)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Reward margin (no gamma offset)
+//    beta * (lp_w/|y_w| - lp_l/|y_l|)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn simpo_reward_margin(log_p_w, log_p_l, len_w, len_l, beta) {
+    let r_w = simpo_reward(log_p_w, len_w, beta)
+    let r_l = simpo_reward(log_p_l, len_l, beta)
+    return r_w - r_l
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Preference accuracy (does length-normalized policy prefer chosen?)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn simpo_preference_accuracy(log_p_w, log_p_l, len_w, len_l) {
+    let lp_w = simpo_length_normalize(log_p_w, len_w)
+    let lp_l = simpo_length_normalize(log_p_l, len_l)
+    if lp_w > lp_l { return 1.0 }
+    return 0.0
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Batch loss — average SimPO loss across a preference batch
+//
+//  batch: array of [log_p_w, log_p_l, len_w, len_l]
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn simpo_batch_loss(batch, beta, gamma) {
+    let n = len(batch)
+    if n == 0 { return 0.0 }
+    let mut total = 0.0
+    for i in 0..n {
+        let item = batch[i]
+        let log_p_w = item[0]
+        let log_p_l = item[1]
+        let len_w = item[2]
+        let len_l = item[3]
+        total = total + simpo_loss(log_p_w, log_p_l, len_w, len_l, beta, gamma)
+    }
+    return total / to_float(n)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Single SGD step on (log_p_w, log_p_l) toy scalars
+//
+//  Returns [loss, new_log_p_w, new_log_p_l]
+//
+//  This is the "Hexa bare-metal" training step: takes two scalars
+//  (the aggregate log-probs from a forward pass) and pushes them in
+//  opposite directions by their analytic gradients. Used by tests and
+//  by simpo_train() as the update primitive.
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn simpo_train_step(log_p_w, log_p_l, len_w, len_l, beta, gamma, lr) {
+    let loss = simpo_loss(log_p_w, log_p_l, len_w, len_l, beta, gamma)
+    let g_w = simpo_loss_grad_lp_w(log_p_w, log_p_l, len_w, len_l, beta, gamma)
+    let g_l = simpo_loss_grad_lp_l(log_p_w, log_p_l, len_w, len_l, beta, gamma)
+    let new_lp_w = log_p_w - lr * g_w
+    let new_lp_l = log_p_l - lr * g_l
+    return [loss, new_lp_w, new_lp_l]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Multi-step training loop on one preference pair
+//
+//  batch: [log_p_w, log_p_l, len_w, len_l]
+//  Returns: [final_loss, final_lp_w, final_lp_l]
+// ═══════════════════════════════════════════════════════════════════
+fn simpo_train(batch, n_steps, lr, beta, gamma) {
+    let mut lp_w = batch[0]
+    let mut lp_l = batch[1]
+    let len_w = batch[2]
+    let len_l = batch[3]
+    let mut last_loss = 0.0
+    let mut step = 0
+    while step < n_steps {
+        let r = simpo_train_step(lp_w, lp_l, len_w, len_l, beta, gamma, lr)
+        last_loss = r[0]
+        lp_w = r[1]
+        lp_l = r[2]
+        step = step + 1
+    }
+    return [last_loss, lp_w, lp_l]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Comparison: DPO loss (needs reference) vs SimPO loss (no reference)
+//
+//  DPO:   L = -log sigma( beta * (lp_w - ref_w - lp_l + ref_l) )
+//  SimPO: L = -log sigma( beta * (lp_w/|y_w| - lp_l/|y_l|) - gamma )
+//
+//  Returns [dpo_loss, simpo_loss] for head-to-head inspection.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn simpo_dpo_vs_simpo(log_p_w, log_p_l, ref_w, ref_l, len_w, len_l, beta, gamma) {
+    // DPO
+    let log_ratio_w = log_p_w - ref_w
+    let log_ratio_l = log_p_l - ref_l
+    let dpo_logit = beta * (log_ratio_w - log_ratio_l)
+    let dpo_l = 0.0 - simpo_log_sigmoid(dpo_logit)
+    // SimPO
+    let simpo_l = simpo_loss(log_p_w, log_p_l, len_w, len_l, beta, gamma)
+    return [dpo_l, simpo_l]
+}
+
+println("[simpo] loaded — reference-free, length-normalized, margin-gated")

@@ -1,0 +1,318 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/contrastive_search.hexa — Contrastive Search Decoding
+//
+//  Reference: Su et al. 2022 "A Contrastive Framework for Neural Text
+//  Generation". Pick next token from top-k candidates using:
+//
+//      score(v) = (1 - alpha) * p_model(v)
+//              -       alpha  * max_{h in H_prev} cos(h_v, h)
+//
+//  The first term rewards model confidence; the second punishes
+//  "degeneration" — that is, hidden states too similar to a previous
+//  token's hidden state. High alpha ⇒ more repetition suppression.
+//
+//  This module is pure-.hexa and self-contained: mock logits and
+//  mock hidden-state embeddings are deterministic hashes so every
+//  test is reproducible. No GPU, no I/O, no random.
+//
+//  Public API:
+//    cs_softmax(logits, temp)               -> [float]
+//    cs_top_k_indices(scores, k)            -> [int]
+//    cs_cosine_sim(a, b)                    -> float
+//    cs_degeneration_penalty(h_v, prev_hs)  -> float
+//    cs_token_score(p_v, pen_v, alpha)      -> float
+//    cs_mock_logits(ctx, vocab)             -> [float]
+//    cs_mock_hidden(ctx, token, dim)        -> [float]
+//    cs_pick_next(ctx, alpha, k, vocab, dim, prev_hs) -> [int]
+//    cs_repetition_rate(tokens)             -> float
+//    @contrastive_search
+//    contrastive_generate(ctx, max_new, alpha, k, vocab, dim) -> result
+// ═══════════════════════════════════════════════════════════════════
+
+// ── tiny math ──────────────────────────────────────────────────────
+
+fn cs_fabs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn cs_max_f(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn cs_min_f(a, b) {
+    if a < b { return a }
+    return b
+}
+
+// Guarded exp so huge/tiny arguments don't blow up interp math.
+fn cs_exp(x) {
+    let mut v = x
+    if v > 40.0 { v = 40.0 }
+    if v < 0.0 - 40.0 { v = 0.0 - 40.0 }
+    return exp(v)
+}
+
+fn cs_zeros(n) {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [0.0]
+        i = i + 1
+    }
+    return out
+}
+
+// ── softmax ────────────────────────────────────────────────────────
+
+fn cs_softmax(logits, temp) {
+    let n = len(logits)
+    let mut t = temp
+    if t < 1.0e-6 { t = 1.0e-6 }
+    // Subtract max for numerical stability.
+    let mut m = logits[0] / t
+    let mut i = 1
+    while i < n {
+        let v = logits[i] / t
+        if v > m { m = v }
+        i = i + 1
+    }
+    let mut exps = cs_zeros(n)
+    let mut z = 0.0
+    let mut j = 0
+    while j < n {
+        let e = cs_exp(logits[j] / t - m)
+        exps[j] = e
+        z = z + e
+        j = j + 1
+    }
+    if z < 1.0e-12 { z = 1.0e-12 }
+    let mut out = cs_zeros(n)
+    let mut k = 0
+    while k < n {
+        out[k] = exps[k] / z
+        k = k + 1
+    }
+    return out
+}
+
+// ── top-k indices by descending score ─────────────────────────────
+// Straightforward selection: O(n·k). Returns indices into `scores`.
+fn cs_top_k_indices(scores, k) {
+    let n = len(scores)
+    let mut kk = k
+    if kk > n { kk = n }
+    let mut used = []
+    let mut i = 0
+    while i < n {
+        used = used + [0]
+        i = i + 1
+    }
+    let mut out = []
+    let mut r = 0
+    while r < kk {
+        let mut best = 0 - 1
+        let mut best_v = 0.0 - 1.0e30
+        let mut j = 0
+        while j < n {
+            if used[j] == 0 {
+                if scores[j] > best_v {
+                    best_v = scores[j]
+                    best = j
+                }
+            }
+            j = j + 1
+        }
+        if best < 0 { return out }
+        used[best] = 1
+        out = out + [best]
+        r = r + 1
+    }
+    return out
+}
+
+// ── cosine similarity (plain float vectors) ───────────────────────
+
+fn cs_cosine_sim(a, b) {
+    let n = len(a)
+    let mut dot = 0.0
+    let mut na = 0.0
+    let mut nb = 0.0
+    let mut i = 0
+    while i < n {
+        dot = dot + a[i] * b[i]
+        na = na + a[i] * a[i]
+        nb = nb + b[i] * b[i]
+        i = i + 1
+    }
+    let denom = sqrt(na) * sqrt(nb)
+    if denom < 1.0e-8 { return 0.0 }
+    return dot / denom
+}
+
+// ── degeneration penalty ──────────────────────────────────────────
+// max cosine similarity between candidate hidden state h_v and any
+// previous hidden state. Empty prev_hs ⇒ no penalty.
+fn cs_degeneration_penalty(h_v, prev_hs) {
+    let m = len(prev_hs)
+    if m == 0 { return 0.0 }
+    let mut best = 0.0 - 1.0
+    let mut i = 0
+    while i < m {
+        let s = cs_cosine_sim(h_v, prev_hs[i])
+        if s > best { best = s }
+        i = i + 1
+    }
+    return best
+}
+
+// ── contrastive token score ───────────────────────────────────────
+// (1 - alpha) * model_confidence - alpha * degeneration_penalty
+fn cs_token_score(p_v, pen_v, alpha) {
+    let mut a = alpha
+    if a < 0.0 { a = 0.0 }
+    if a > 1.0 { a = 1.0 }
+    return (1.0 - a) * p_v - a * pen_v
+}
+
+// ── deterministic mock logits over a vocab ─────────────────────────
+// Hash the tail of ctx to a per-token score; higher score means
+// "model likes this token more" for the current context.
+fn cs_ctx_tail_hash(ctx) {
+    let n = len(ctx)
+    let mut start = 0
+    if n > 6 { start = n - 6 }
+    let mut h = 2166136261
+    let mut i = start
+    while i < n {
+        h = (h ^ (ctx[i] + 131)) * 16777619
+        h = h % 2147483647
+        if h < 0 { h = h + 2147483647 }
+        i = i + 1
+    }
+    return h
+}
+
+fn cs_mock_logits(ctx, vocab) {
+    let h = cs_ctx_tail_hash(ctx)
+    let mut out = cs_zeros(vocab)
+    let mut v = 0
+    while v < vocab {
+        // A smooth-ish distribution over vocab: logit = -|v - pref| / s
+        let pref = (h + v * 1315423911) % vocab
+        let mut d = v - pref
+        if d < 0 { d = 0 - d }
+        // Sharper peak so top-k is meaningful.
+        out[v] = 0.0 - to_float(d) * 0.35
+        v = v + 1
+    }
+    return out
+}
+
+// ── deterministic mock hidden state for (ctx, token) ──────────────
+// Returns a `dim`-length float vector in [-1, 1]-ish range.
+fn cs_mock_hidden(ctx, token, dim) {
+    let h = cs_ctx_tail_hash(ctx)
+    let mut out = cs_zeros(dim)
+    let mut i = 0
+    while i < dim {
+        let k = (h + token * 2654435761 + i * 40503) % 1000003
+        // Map to [-1, 1] via sin for smoothness.
+        out[i] = sin(to_float(k) * 0.0001)
+        i = i + 1
+    }
+    return out
+}
+
+// ── pick_next: rank top-k by contrastive score ────────────────────
+// Returns [picked_token, picked_index_in_topk, topk_len].
+fn cs_pick_next(ctx, alpha, k, vocab, dim, prev_hs) {
+    let logits = cs_mock_logits(ctx, vocab)
+    let probs = cs_softmax(logits, 1.0)
+    let topk = cs_top_k_indices(probs, k)
+    let tlen = len(topk)
+    let mut best_idx = 0
+    let mut best_score = 0.0 - 1.0e30
+    let mut i = 0
+    while i < tlen {
+        let tok = topk[i]
+        let p_v = probs[tok]
+        let h_v = cs_mock_hidden(ctx, tok, dim)
+        let pen_v = cs_degeneration_penalty(h_v, prev_hs)
+        let score = cs_token_score(p_v, pen_v, alpha)
+        if score > best_score {
+            best_score = score
+            best_idx = i
+        }
+        i = i + 1
+    }
+    let picked = topk[best_idx]
+    return [picked, best_idx, tlen]
+}
+
+// ── repetition rate: fraction of tokens that repeat a prior one ───
+fn cs_repetition_rate(tokens) {
+    let n = len(tokens)
+    if n <= 1 { return 0.0 }
+    let mut rep = 0
+    let mut i = 1
+    while i < n {
+        let mut j = 0
+        let mut hit = 0
+        while j < i {
+            if tokens[j] == tokens[i] {
+                hit = 1
+                j = i
+            } else {
+                j = j + 1
+            }
+        }
+        if hit == 1 { rep = rep + 1 }
+        i = i + 1
+    }
+    return to_float(rep) / to_float(n - 1)
+}
+
+// ── @contrastive_search: full generate loop ───────────────────────
+// Inputs:
+//   ctx       — prompt tokens (int array)
+//   max_new   — how many new tokens to produce
+//   alpha     — degeneration weight (0..1)
+//   k         — top-k candidate pool size
+//   vocab     — vocabulary size for mock model
+//   dim       — hidden dimension for mock embeddings
+//
+// Returns: [generated_tokens, [rep_rate_x10000], [avg_topk_len]]
+@contrastive_search
+fn contrastive_generate(ctx, max_new, alpha, k, vocab, dim) {
+    // local copy of ctx so we don't mutate the caller's array
+    let mut cur = []
+    let mut c = 0
+    while c < len(ctx) {
+        cur = cur + [ctx[c]]
+        c = c + 1
+    }
+    let mut prev_hs = []
+    let mut generated = []
+    let mut sum_topk = 0
+    let mut steps = 0
+    while steps < max_new {
+        let picked = cs_pick_next(cur, alpha, k, vocab, dim, prev_hs)
+        let tok = picked[0]
+        let tlen = picked[2]
+        sum_topk = sum_topk + tlen
+        // commit token
+        generated = generated + [tok]
+        cur = cur + [tok]
+        // remember its hidden state for future degeneration penalty.
+        let h_new = cs_mock_hidden(cur, tok, dim)
+        prev_hs = prev_hs + [h_new]
+        steps = steps + 1
+    }
+    let rr = cs_repetition_rate(generated)
+    let rr_x = to_int(rr * 10000.0)
+    let mut avg = 0
+    if steps > 0 { avg = sum_topk / steps }
+    return [generated, [rr_x], [avg]]
+}

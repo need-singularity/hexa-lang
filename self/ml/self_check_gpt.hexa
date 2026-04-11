@@ -1,0 +1,578 @@
+// ===================================================================
+//  self/ml/self_check_gpt.hexa — SelfCheckGPT Hallucination Detection
+//
+//  Pure Hexa implementation of consistency-based hallucination
+//  detection for LLM outputs. Given a primary generation and N
+//  stochastic samples for the same prompt, estimates hallucination
+//  probability per sentence and overall, with a p-value approximation
+//  against the null "all samples agree" hypothesis.
+//
+//  References:
+//    Manakul et al., "SelfCheckGPT: Zero-Resource Black-Box Hallucination
+//    Detection for Generative Large Language Models" (EMNLP 2023).
+//
+//  Public API:
+//    create_self_check_config(n_samples, threshold)
+//        -> SelfCheckConfig
+//    split_sentences(text)
+//        -> array<string>
+//    ngram_tokens(text, n)
+//        -> array<string>   // lowercased n-gram word tokens
+//    ngram_consistency(sentence, samples, n)
+//        -> float           // 0..1, fraction of samples containing n-grams
+//    bleu_like_consistency(sentence, samples)
+//        -> float           // 0..1, modified 1..4-gram precision mean
+//    embedding_sim(sentence, sample)
+//        -> float           // 0..1, char histogram cosine proxy
+//    embedding_consistency(sentence, samples)
+//        -> float           // 0..1, mean cosine proxy across samples
+//    self_check(primary, samples, config)
+//        -> SelfCheckReport
+//
+//  SelfCheckReport: struct with
+//        sentences:      array<string>
+//        ngram_scores:   array<float>   // per-sentence consistency
+//        bleu_scores:    array<float>
+//        embed_scores:   array<float>
+//        hallucination_probs: array<float>  // 1 - combined consistency
+//        is_hallucination:    array<bool>   // prob > threshold
+//        overall_prob:   float              // mean hallucination prob
+//        p_value:        float              // null = all consistent
+//        flagged:        bool               // overall_prob > threshold
+// ===================================================================
+
+// ===================================================================
+//  Data structures
+// ===================================================================
+struct SelfCheckConfig {
+    n_samples: int,
+    threshold: float,
+    ngram_n: int,
+    use_bleu: bool,
+    use_embedding: bool
+}
+
+struct SelfCheckReport {
+    sentences: array,
+    ngram_scores: array,
+    bleu_scores: array,
+    embed_scores: array,
+    hallucination_probs: array,
+    is_hallucination: array,
+    overall_prob: float,
+    p_value: float,
+    flagged: bool
+}
+
+// ===================================================================
+//  create_self_check_config — build a config with sane defaults.
+// ===================================================================
+fn create_self_check_config(n_samples, threshold) {
+    return SelfCheckConfig {
+        n_samples: n_samples,
+        threshold: threshold,
+        ngram_n: 2,
+        use_bleu: true,
+        use_embedding: true
+    }
+}
+
+fn default_self_check_config() {
+    return SelfCheckConfig {
+        n_samples: 5,
+        threshold: 0.5,
+        ngram_n: 2,
+        use_bleu: true,
+        use_embedding: true
+    }
+}
+
+// ===================================================================
+//  Sentence splitter — splits on '.', '!' and '?'.
+//  Avoids empty sentences; trims whitespace.
+// ===================================================================
+fn split_sentences(text) {
+    let mut sents = []
+    let mut buf = ""
+    let n = len(text)
+    let mut i = 0
+    while i < n {
+        let ch = text.substring(i, i + 1)
+        if ch == "." {
+            if len(buf) > 0 {
+                sents = sents + [buf.trim()]
+                buf = ""
+            }
+        } else {
+            if ch == "!" {
+                if len(buf) > 0 {
+                    sents = sents + [buf.trim()]
+                    buf = ""
+                }
+            } else {
+                if ch == "?" {
+                    if len(buf) > 0 {
+                        sents = sents + [buf.trim()]
+                        buf = ""
+                    }
+                } else {
+                    buf = buf + ch
+                }
+            }
+        }
+        i = i + 1
+    }
+    if len(buf.trim()) > 0 {
+        sents = sents + [buf.trim()]
+    }
+    // Drop empties that survived trimming.
+    let mut out = []
+    let m = len(sents)
+    let mut j = 0
+    while j < m {
+        if len(sents[j]) > 0 {
+            out = out + [sents[j]]
+        }
+        j = j + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  Word-level tokenizer — lowercase, whitespace split.
+// ===================================================================
+fn tokenize_words(text) {
+    let lower = text.to_lower()
+    let parts = lower.split(" ")
+    let mut out = []
+    let n = len(parts)
+    let mut i = 0
+    while i < n {
+        let p = parts[i].trim()
+        if len(p) > 0 {
+            out = out + [p]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  ngram_tokens — produce word-level n-grams as joined strings.
+// ===================================================================
+fn ngram_tokens(text, n) {
+    let words = tokenize_words(text)
+    let w = len(words)
+    if w < n {
+        return []
+    }
+    let mut out = []
+    let mut i = 0
+    let limit = w - n + 1
+    while i < limit {
+        let mut gram = words[i]
+        let mut j = 1
+        while j < n {
+            gram = gram + " " + words[i + j]
+            j = j + 1
+        }
+        out = out + [gram]
+        i = i + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  contains_gram — does a sample text contain the n-gram as substring?
+// ===================================================================
+fn contains_gram(sample_lower, gram) {
+    return sample_lower.contains(gram)
+}
+
+// ===================================================================
+//  ngram_consistency — fraction of samples that contain all the
+//  sentence's n-grams (averaged over n-grams and samples).
+//
+//  Formally: mean over n-grams g of (#samples containing g / total).
+//  Range: [0, 1]. 1 = fully consistent, 0 = fully inconsistent.
+// ===================================================================
+fn ngram_consistency(sentence, samples, n) {
+    let grams = ngram_tokens(sentence, n)
+    let g = len(grams)
+    let s = len(samples)
+    if g == 0 {
+        return 1.0
+    }
+    if s == 0 {
+        return 0.0
+    }
+    // Pre-lowercase samples once.
+    let mut lowered = []
+    let mut si = 0
+    while si < s {
+        lowered = lowered + [samples[si].to_lower()]
+        si = si + 1
+    }
+    let mut total = 0.0
+    let mut gi = 0
+    while gi < g {
+        let gram = grams[gi]
+        let mut hits = 0
+        let mut k = 0
+        while k < s {
+            if contains_gram(lowered[k], gram) {
+                hits = hits + 1
+            }
+            k = k + 1
+        }
+        let frac = to_float(hits) / to_float(s)
+        total = total + frac
+        gi = gi + 1
+    }
+    return total / to_float(g)
+}
+
+// ===================================================================
+//  BLEU-like consistency — average of 1..4-gram precisions across
+//  samples. Uses modified precision (capped matches).
+// ===================================================================
+fn modified_precision(candidate_grams, reference_grams) {
+    let c = len(candidate_grams)
+    let r = len(reference_grams)
+    if c == 0 {
+        return 0.0
+    }
+    if r == 0 {
+        return 0.0
+    }
+    // Count reference grams.
+    let mut ref_keys = []
+    let mut ref_counts = []
+    let mut i = 0
+    while i < r {
+        let g = reference_grams[i]
+        let mut found = -1
+        let nk = len(ref_keys)
+        let mut j = 0
+        while j < nk {
+            if ref_keys[j] == g {
+                found = j
+                j = nk
+            } else {
+                j = j + 1
+            }
+        }
+        if found >= 0 {
+            ref_counts[found] = ref_counts[found] + 1
+        } else {
+            ref_keys = ref_keys + [g]
+            ref_counts = ref_counts + [1]
+        }
+        i = i + 1
+    }
+    // Match candidate grams with clipping.
+    let mut matched = 0
+    let mut ci = 0
+    while ci < c {
+        let cg = candidate_grams[ci]
+        let nk2 = len(ref_keys)
+        let mut k = 0
+        let mut hit = false
+        while k < nk2 {
+            if ref_keys[k] == cg {
+                if ref_counts[k] > 0 {
+                    ref_counts[k] = ref_counts[k] - 1
+                    matched = matched + 1
+                    hit = true
+                }
+                k = nk2
+            } else {
+                k = k + 1
+            }
+        }
+        ci = ci + 1
+    }
+    return to_float(matched) / to_float(c)
+}
+
+fn bleu_like_consistency(sentence, samples) {
+    let s = len(samples)
+    if s == 0 {
+        return 0.0
+    }
+    let mut total = 0.0
+    let mut count = 0
+    let mut n = 1
+    while n <= 4 {
+        let cand = ngram_tokens(sentence, n)
+        if len(cand) > 0 {
+            let mut sample_sum = 0.0
+            let mut k = 0
+            while k < s {
+                let ref_grams = ngram_tokens(samples[k], n)
+                sample_sum = sample_sum + modified_precision(cand, ref_grams)
+                k = k + 1
+            }
+            let sample_mean = sample_sum / to_float(s)
+            total = total + sample_mean
+            count = count + 1
+        }
+        n = n + 1
+    }
+    if count == 0 {
+        return 0.0
+    }
+    return total / to_float(count)
+}
+
+// ===================================================================
+//  Embedding similarity proxy — character-histogram cosine.
+//
+//  This is a cheap, deterministic proxy for a real sentence
+//  embedding. It captures lexical overlap without requiring a model,
+//  which is the same role the real embedding plays in SelfCheckGPT.
+// ===================================================================
+fn char_histogram(text) {
+    let lower = text.to_lower()
+    let n = len(lower)
+    let mut keys = []
+    let mut counts = []
+    let mut i = 0
+    while i < n {
+        let ch = lower.substring(i, i + 1)
+        if ch != " " {
+            let nk = len(keys)
+            let mut j = 0
+            let mut found = -1
+            while j < nk {
+                if keys[j] == ch {
+                    found = j
+                    j = nk
+                } else {
+                    j = j + 1
+                }
+            }
+            if found >= 0 {
+                counts[found] = counts[found] + 1
+            } else {
+                keys = keys + [ch]
+                counts = counts + [1]
+            }
+        }
+        i = i + 1
+    }
+    return #{"keys": keys, "counts": counts}
+}
+
+fn hist_get(hist, key) {
+    let keys = hist["keys"]
+    let counts = hist["counts"]
+    let n = len(keys)
+    let mut i = 0
+    while i < n {
+        if keys[i] == key {
+            return counts[i]
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn cosine_hist(a, b) {
+    let keys_a = a["keys"]
+    let keys_b = b["keys"]
+    let na = len(keys_a)
+    let nb = len(keys_b)
+    if na == 0 {
+        return 0.0
+    }
+    if nb == 0 {
+        return 0.0
+    }
+    let mut dot = 0.0
+    let mut norm_a = 0.0
+    let mut i = 0
+    while i < na {
+        let ka = keys_a[i]
+        let va = a["counts"][i]
+        let vb = hist_get(b, ka)
+        dot = dot + to_float(va * vb)
+        norm_a = norm_a + to_float(va * va)
+        i = i + 1
+    }
+    let mut norm_b = 0.0
+    let mut j = 0
+    while j < nb {
+        let vbj = b["counts"][j]
+        norm_b = norm_b + to_float(vbj * vbj)
+        j = j + 1
+    }
+    if norm_a == 0.0 {
+        return 0.0
+    }
+    if norm_b == 0.0 {
+        return 0.0
+    }
+    let denom = sqrt(norm_a) * sqrt(norm_b)
+    if denom == 0.0 {
+        return 0.0
+    }
+    return dot / denom
+}
+
+fn embedding_sim(sentence, sample) {
+    let a = char_histogram(sentence)
+    let b = char_histogram(sample)
+    return cosine_hist(a, b)
+}
+
+fn embedding_consistency(sentence, samples) {
+    let s = len(samples)
+    if s == 0 {
+        return 0.0
+    }
+    let mut total = 0.0
+    let mut i = 0
+    while i < s {
+        total = total + embedding_sim(sentence, samples[i])
+        i = i + 1
+    }
+    return total / to_float(s)
+}
+
+// ===================================================================
+//  combine_scores — weighted average of available scoring methods.
+// ===================================================================
+fn combine_scores(ngram_s, bleu_s, embed_s, use_bleu, use_embedding) {
+    let mut total = ngram_s
+    let mut count = 1.0
+    if use_bleu {
+        total = total + bleu_s
+        count = count + 1.0
+    }
+    if use_embedding {
+        total = total + embed_s
+        count = count + 1.0
+    }
+    return total / count
+}
+
+// ===================================================================
+//  clamp01 — clamp a float to [0, 1].
+// ===================================================================
+fn clamp01(x) {
+    if x < 0.0 {
+        return 0.0
+    }
+    if x > 1.0 {
+        return 1.0
+    }
+    return x
+}
+
+// ===================================================================
+//  p_value_approx — binomial-tail-style approximation of
+//      P(consistency >= observed | null "all samples disagree")
+//
+//  We treat each sample/n-gram event as a Bernoulli draw under
+//  the null p0 = 0.5. Under the null, observing consistency c >= 0.5
+//  gets progressively less likely. This is a coarse but monotone
+//  approximation sufficient for flagging.
+//
+//      p_value ≈ exp(-2 * n_events * (c - 0.5)^2)       if c >= 0.5
+//      p_value ≈ 1 - 0.5 * exp(-2 * n_events * (0.5-c)^2) if c <  0.5
+//
+//  (Hoeffding-style one-sided tail.)
+// ===================================================================
+fn p_value_approx(consistency, n_events) {
+    let c = clamp01(consistency)
+    let n = n_events
+    if n <= 0 {
+        return 1.0
+    }
+    let delta = c - 0.5
+    let abs_delta = delta
+    if abs_delta < 0.0 {
+        abs_delta = 0.0 - abs_delta
+    }
+    let exponent = 0.0 - (2.0 * to_float(n) * abs_delta * abs_delta)
+    // Crude exp via series for |x| small; fall back to clamp.
+    let mut e = 1.0
+    let mut term = 1.0
+    let mut k = 1
+    while k < 20 {
+        term = term * exponent / to_float(k)
+        e = e + term
+        k = k + 1
+    }
+    if e < 0.0 {
+        e = 0.0
+    }
+    if e > 1.0 {
+        e = 1.0
+    }
+    if delta >= 0.0 {
+        return e
+    }
+    return 1.0 - 0.5 * e
+}
+
+// ===================================================================
+//  self_check — main entry. Runs per-sentence consistency scoring
+//  across the provided stochastic samples and produces a
+//  SelfCheckReport.
+// ===================================================================
+fn self_check(primary, samples, config) {
+    let sentences = split_sentences(primary)
+    let n_sent = len(sentences)
+    let n_samp = len(samples)
+    let mut ngram_scores = []
+    let mut bleu_scores = []
+    let mut embed_scores = []
+    let mut halluc_probs = []
+    let mut is_halluc = []
+    let mut sum_prob = 0.0
+    let mut i = 0
+    while i < n_sent {
+        let sent = sentences[i]
+        let n_s = ngram_consistency(sent, samples, config.ngram_n)
+        let mut b_s = 0.0
+        if config.use_bleu {
+            b_s = bleu_like_consistency(sent, samples)
+        }
+        let mut e_s = 0.0
+        if config.use_embedding {
+            e_s = embedding_consistency(sent, samples)
+        }
+        ngram_scores = ngram_scores + [n_s]
+        bleu_scores = bleu_scores + [b_s]
+        embed_scores = embed_scores + [e_s]
+        let combined = combine_scores(n_s, b_s, e_s, config.use_bleu, config.use_embedding)
+        let p_halluc = clamp01(1.0 - combined)
+        halluc_probs = halluc_probs + [p_halluc]
+        is_halluc = is_halluc + [p_halluc > config.threshold]
+        sum_prob = sum_prob + p_halluc
+        i = i + 1
+    }
+    let mut overall = 0.0
+    if n_sent > 0 {
+        overall = sum_prob / to_float(n_sent)
+    }
+    // p-value uses consistency = 1 - overall hallucination prob
+    // with n_events = n_sent * n_samp (sentence-sample pairs).
+    let events = n_sent * n_samp
+    let consistency = 1.0 - overall
+    let pv = p_value_approx(consistency, events)
+    let flagged = overall > config.threshold
+    return SelfCheckReport {
+        sentences: sentences,
+        ngram_scores: ngram_scores,
+        bleu_scores: bleu_scores,
+        embed_scores: embed_scores,
+        hallucination_probs: halluc_probs,
+        is_hallucination: is_halluc,
+        overall_prob: overall,
+        p_value: pv,
+        flagged: flagged
+    }
+}

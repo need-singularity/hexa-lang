@@ -1,0 +1,593 @@
+// ═══════════════════════════════════════════════════════════════
+//  test_lora_hotswap.hexa — LoRA Hot-Swap Runtime 검증 (ML #72)
+//
+//  검증 항목 (≥12):
+//    1. Empty registry
+//    2. Load adapter
+//    3. Has / Get
+//    4. List names
+//    5. Unload
+//    6. Overwrite(load 동일 이름) — delta 교체, base 불변
+//    7. Zero-entry forward == base forward (identity delta)
+//    8. Non-zero entry forward != base (실제 delta 적용)
+//    9. Session swap + swap count
+//   10. Route forward — request adapter 선택
+//   11. Route forward — unknown adapter = base only
+//   12. Concurrent multi-tenant serve (여러 요청, 여러 어댑터)
+//   13. merge(W') 수식 검증: y_merged == y_with_delta
+//   14. unmerge(merge(W)) == W  (역함수)
+//   15. Base 불변성 — merge 후 원본 base.layers 그대로
+//   16. swap_count monotonic 증가
+//   17. Stats — base/delta 파라미터 카운트
+//   18. Overwrite 후 forward 결과 변경
+//
+//  실행: ./hexa self/test_lora_hotswap.hexa
+// ═══════════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+fn vec_approx(a, b, eps) {
+    if len(a) != len(b) { return false }
+    let mut i = 0
+    while i < len(a) {
+        if !approx(a[i], b[i], eps) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn mat_approx(a, b, eps) {
+    if len(a) != len(b) { return false }
+    let mut i = 0
+    while i < len(a) {
+        if !vec_approx(a[i], b[i], eps) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Inline core (self/ml/lora_hotswap.hexa)
+// ═══════════════════════════════════════════════════════════════
+
+fn hs_zeros1(n) {
+    let mut v = []
+    for i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn hs_zeros2(rows, cols) {
+    let mut r = []
+    for i in 0..rows { r = r + [hs_zeros1(cols)] }
+    return r
+}
+
+fn hs_matvec(w, x, m, n) {
+    let mut y = []
+    for i in 0..m {
+        let mut s = 0.0
+        for j in 0..n { s = s + w[i][j] * x[j] }
+        y = y + [s]
+    }
+    return y
+}
+
+fn hs_matmul(a, b, m, k, n) {
+    let mut c = []
+    for i in 0..m {
+        let mut row = []
+        for j in 0..n {
+            let mut s = 0.0
+            for p in 0..k { s = s + a[i][p] * b[p][j] }
+            row = row + [s]
+        }
+        c = c + [row]
+    }
+    return c
+}
+
+fn hs_scale(alpha, rank) {
+    return to_float(alpha) / to_float(rank)
+}
+
+struct HSLayer { w: array, out_dim: int, in_dim: int }
+struct HotSwapBase { layers: array, n_layers: int, merged_name: string }
+struct HotSwapEntry {
+    name: string,
+    a_list: array,
+    b_list: array,
+    rank: int,
+    alpha: int,
+    n_layers: int,
+    loaded_at: int
+}
+struct HotSwapRegistry { names: array, entries: array, count: int }
+struct HotSwapSession { session_id: int, active_adapter: string, swap_count: int }
+struct HotSwapRequest { req_id: int, adapter_name: string, input: array }
+
+fn hs_make_layer(w, out_dim, in_dim) {
+    return HSLayer { w: w, out_dim: out_dim, in_dim: in_dim }
+}
+
+fn hs_make_base(layers) {
+    return HotSwapBase { layers: layers, n_layers: len(layers), merged_name: "" }
+}
+
+fn hs_make_entry(name, a_list, b_list, rank, alpha) {
+    return HotSwapEntry {
+        name: name,
+        a_list: a_list,
+        b_list: b_list,
+        rank: rank,
+        alpha: alpha,
+        n_layers: len(a_list),
+        loaded_at: 0
+    }
+}
+
+fn hs_make_zero_entry(name, base: HotSwapBase, rank, alpha) {
+    let n = base.n_layers
+    let mut a_list = []
+    let mut b_list = []
+    let mut i = 0
+    while i < n {
+        let layer = base.layers[i]
+        a_list = a_list + [hs_zeros2(rank, layer.in_dim)]
+        b_list = b_list + [hs_zeros2(layer.out_dim, rank)]
+        i = i + 1
+    }
+    return HotSwapEntry {
+        name: name,
+        a_list: a_list,
+        b_list: b_list,
+        rank: rank,
+        alpha: alpha,
+        n_layers: n,
+        loaded_at: 0
+    }
+}
+
+fn hs_create_registry() {
+    return HotSwapRegistry { names: [], entries: [], count: 0 }
+}
+
+fn hs_has(reg: HotSwapRegistry, name) {
+    let mut i = 0
+    while i < reg.count {
+        if reg.names[i] == name { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn hs_get(reg: HotSwapRegistry, name) {
+    let mut i = 0
+    while i < reg.count {
+        if reg.names[i] == name { return reg.entries[i] }
+        i = i + 1
+    }
+    return nil
+}
+
+fn hs_index_of(reg: HotSwapRegistry, name) {
+    let mut i = 0
+    while i < reg.count {
+        if reg.names[i] == name { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn hs_list_names(reg: HotSwapRegistry) { return reg.names }
+
+fn hs_load(reg: HotSwapRegistry, name, entry: HotSwapEntry) {
+    let ts = reg.count + 1
+    let new_entry = HotSwapEntry {
+        name: name,
+        a_list: entry.a_list,
+        b_list: entry.b_list,
+        rank: entry.rank,
+        alpha: entry.alpha,
+        n_layers: entry.n_layers,
+        loaded_at: ts
+    }
+    let idx = hs_index_of(reg, name)
+    if idx >= 0 {
+        let mut new_entries = []
+        let mut i = 0
+        while i < reg.count {
+            if i == idx {
+                new_entries = new_entries + [new_entry]
+            } else {
+                new_entries = new_entries + [reg.entries[i]]
+            }
+            i = i + 1
+        }
+        return HotSwapRegistry { names: reg.names, entries: new_entries, count: reg.count }
+    }
+    return HotSwapRegistry {
+        names: reg.names + [name],
+        entries: reg.entries + [new_entry],
+        count: reg.count + 1
+    }
+}
+
+fn hs_unload(reg: HotSwapRegistry, name) {
+    let idx = hs_index_of(reg, name)
+    if idx < 0 { return reg }
+    let mut new_names = []
+    let mut new_entries = []
+    let mut i = 0
+    while i < reg.count {
+        if i != idx {
+            new_names = new_names + [reg.names[i]]
+            new_entries = new_entries + [reg.entries[i]]
+        }
+        i = i + 1
+    }
+    return HotSwapRegistry { names: new_names, entries: new_entries, count: reg.count - 1 }
+}
+
+fn hs_make_session(session_id) {
+    return HotSwapSession { session_id: session_id, active_adapter: "", swap_count: 0 }
+}
+
+fn hs_swap(session: HotSwapSession, name, reg: HotSwapRegistry) {
+    if !hs_has(reg, name) {
+        return HotSwapSession {
+            session_id: session.session_id,
+            active_adapter: "",
+            swap_count: session.swap_count + 1
+        }
+    }
+    return HotSwapSession {
+        session_id: session.session_id,
+        active_adapter: name,
+        swap_count: session.swap_count + 1
+    }
+}
+
+fn hs_layer_forward_base(layer: HSLayer, x) {
+    return hs_matvec(layer.w, x, layer.out_dim, layer.in_dim)
+}
+
+fn hs_layer_forward_with_delta(layer: HSLayer, a, b, rank, alpha, x) {
+    let base = hs_matvec(layer.w, x, layer.out_dim, layer.in_dim)
+    let ax = hs_matvec(a, x, rank, layer.in_dim)
+    let bax = hs_matvec(b, ax, layer.out_dim, rank)
+    let s = hs_scale(alpha, rank)
+    let mut y = []
+    let mut i = 0
+    while i < layer.out_dim {
+        y = y + [base[i] + s * bax[i]]
+        i = i + 1
+    }
+    return y
+}
+
+fn hs_forward(base: HotSwapBase, session: HotSwapSession, reg: HotSwapRegistry, x) {
+    let n = base.n_layers
+    let name = session.active_adapter
+    let mut has_flag = false
+    if name != "" {
+        if hs_has(reg, name) { has_flag = true }
+    }
+    let mut h = x
+    let mut i = 0
+    while i < n {
+        let layer = base.layers[i]
+        if has_flag {
+            let e = hs_get(reg, name)
+            h = hs_layer_forward_with_delta(layer, e.a_list[i], e.b_list[i], e.rank, e.alpha, h)
+        } else {
+            h = hs_layer_forward_base(layer, h)
+        }
+        i = i + 1
+    }
+    return h
+}
+
+fn hs_route_forward(base: HotSwapBase, reg: HotSwapRegistry, req: HotSwapRequest) {
+    let sess = hs_make_session(req.req_id)
+    let sess2 = hs_swap(sess, req.adapter_name, reg)
+    return hs_forward(base, sess2, reg, req.input)
+}
+
+fn hs_concurrent_serve(base: HotSwapBase, reg: HotSwapRegistry, reqs) {
+    let n = len(reqs)
+    let mut outs = []
+    let mut i = 0
+    while i < n {
+        let req = reqs[i]
+        let y = hs_route_forward(base, reg, req)
+        outs = outs + [y]
+        i = i + 1
+    }
+    return outs
+}
+
+fn hs_merge(base: HotSwapBase, entry: HotSwapEntry) {
+    let n = base.n_layers
+    let s = hs_scale(entry.alpha, entry.rank)
+    let mut merged_layers = []
+    let mut i = 0
+    while i < n {
+        let layer = base.layers[i]
+        let a = entry.a_list[i]
+        let b = entry.b_list[i]
+        let m_dim = layer.out_dim
+        let n_dim = layer.in_dim
+        let r = entry.rank
+        let ba = hs_matmul(b, a, m_dim, r, n_dim)
+        let mut w_new = []
+        let mut ii = 0
+        while ii < m_dim {
+            let mut row = []
+            let mut jj = 0
+            while jj < n_dim {
+                row = row + [layer.w[ii][jj] + s * ba[ii][jj]]
+                jj = jj + 1
+            }
+            w_new = w_new + [row]
+            ii = ii + 1
+        }
+        merged_layers = merged_layers + [HSLayer { w: w_new, out_dim: m_dim, in_dim: n_dim }]
+        i = i + 1
+    }
+    return HotSwapBase { layers: merged_layers, n_layers: n, merged_name: entry.name }
+}
+
+fn hs_unmerge(merged_base: HotSwapBase, entry: HotSwapEntry) {
+    let n = merged_base.n_layers
+    let s = hs_scale(entry.alpha, entry.rank)
+    let mut unmerged_layers = []
+    let mut i = 0
+    while i < n {
+        let layer = merged_base.layers[i]
+        let a = entry.a_list[i]
+        let b = entry.b_list[i]
+        let m_dim = layer.out_dim
+        let n_dim = layer.in_dim
+        let r = entry.rank
+        let ba = hs_matmul(b, a, m_dim, r, n_dim)
+        let mut w_old = []
+        let mut ii = 0
+        while ii < m_dim {
+            let mut row = []
+            let mut jj = 0
+            while jj < n_dim {
+                row = row + [layer.w[ii][jj] - s * ba[ii][jj]]
+                jj = jj + 1
+            }
+            w_old = w_old + [row]
+            ii = ii + 1
+        }
+        unmerged_layers = unmerged_layers + [HSLayer { w: w_old, out_dim: m_dim, in_dim: n_dim }]
+        i = i + 1
+    }
+    return HotSwapBase { layers: unmerged_layers, n_layers: n, merged_name: "" }
+}
+
+fn hs_stats(reg: HotSwapRegistry, base: HotSwapBase) {
+    let mut total_base = 0
+    let mut i = 0
+    while i < base.n_layers {
+        let layer = base.layers[i]
+        total_base = total_base + layer.out_dim * layer.in_dim
+        i = i + 1
+    }
+    let mut total_delta = 0
+    let mut total_rank = 0
+    i = 0
+    while i < reg.count {
+        let e = reg.entries[i]
+        let mut j = 0
+        while j < e.n_layers {
+            let layer = base.layers[j]
+            total_delta = total_delta + e.rank * layer.in_dim + layer.out_dim * e.rank
+            j = j + 1
+        }
+        total_rank = total_rank + e.rank
+        i = i + 1
+    }
+    return #{
+        "base_params": total_base,
+        "delta_params_total": total_delta,
+        "registry_count": reg.count,
+        "rank_sum": total_rank,
+        "n_layers": base.n_layers
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Test fixtures: 2-layer base, rank=2, dim 2->2->2
+// ═══════════════════════════════════════════════════════════════
+
+// Layer 0: identity (2x2)
+let w0 = [[1.0, 0.0], [0.0, 1.0]]
+let layer0 = hs_make_layer(w0, 2, 2)
+// Layer 1: scale-by-1 (2x2)
+let w1 = [[1.0, 0.0], [0.0, 1.0]]
+let layer1 = hs_make_layer(w1, 2, 2)
+
+let base = hs_make_base([layer0, layer1])
+
+// Entry A: non-zero delta (rank=2, alpha=2 → scale=1.0)
+//   A: [r=2, in=2], B: [out=2, r=2]
+//   B @ A = [[1, 0], [0, 1]] — effectively +identity per layer
+let a_mat = [[1.0, 0.0], [0.0, 1.0]]
+let b_mat = [[1.0, 0.0], [0.0, 1.0]]
+let entry_a = hs_make_entry("task_A", [a_mat, a_mat], [b_mat, b_mat], 2, 2)
+
+// Entry B: alpha=4, rank=2 → scale=2.0 (더 큰 delta)
+let entry_b = hs_make_entry("task_B", [a_mat, a_mat], [b_mat, b_mat], 2, 4)
+
+// Entry Z: zero delta
+let entry_z = hs_make_zero_entry("task_Z", base, 2, 2)
+
+let input = [3.0, 4.0]
+
+// ═══════════════════════════════════════════════════════════════
+//  Tests
+// ═══════════════════════════════════════════════════════════════
+
+// #1 Empty registry
+let reg0 = hs_create_registry()
+check("#1 empty registry count=0", reg0.count == 0)
+
+// #2 Load adapter
+let reg1 = hs_load(reg0, "task_A", entry_a)
+check("#2 load → count=1", reg1.count == 1)
+
+// #3 Has / Get
+check("#3 has task_A", hs_has(reg1, "task_A") == true)
+let got = hs_get(reg1, "task_A")
+check("#3b get returns entry", got.name == "task_A")
+check("#3c get rank=2", got.rank == 2)
+check("#3d loaded_at > 0", got.loaded_at > 0)
+
+// #4 List names
+let reg2 = hs_load(reg1, "task_B", entry_b)
+let reg3 = hs_load(reg2, "task_Z", entry_z)
+let names = hs_list_names(reg3)
+check("#4 list_names len=3", len(names) == 3)
+check("#4b names[0]=task_A", names[0] == "task_A")
+
+// #5 Unload
+let reg4 = hs_unload(reg3, "task_B")
+check("#5 unload → count=2", reg4.count == 2)
+check("#5b has task_B false", hs_has(reg4, "task_B") == false)
+check("#5c has task_A still", hs_has(reg4, "task_A") == true)
+
+// #6 Overwrite (load 동일 이름) — delta 교체, count 유지
+let entry_a2 = hs_make_entry("task_A", [a_mat, a_mat], [b_mat, b_mat], 2, 8)  // alpha=8
+let reg5 = hs_load(reg4, "task_A", entry_a2)
+check("#6 overwrite count unchanged", reg5.count == 2)
+let got_a2 = hs_get(reg5, "task_A")
+check("#6b new alpha=8", got_a2.alpha == 8)
+
+// #7 Zero-entry forward == base forward
+let reg_z = hs_load(hs_create_registry(), "task_Z", entry_z)
+let sess_z = hs_swap(hs_make_session(1), "task_Z", reg_z)
+let y_base_only = hs_forward(base, hs_make_session(0), reg_z, input)
+let y_with_zero = hs_forward(base, sess_z, reg_z, input)
+check("#7 zero delta == base forward", vec_approx(y_base_only, y_with_zero, 0.0001))
+// base forward: [1,0;0,1] @ [3,4] = [3,4], then layer1 same = [3,4]
+check("#7b base forward == [3,4]", approx(y_base_only[0], 3.0, 0.001) && approx(y_base_only[1], 4.0, 0.001))
+
+// #8 Non-zero entry forward != base
+let reg_a = hs_load(hs_create_registry(), "task_A", entry_a)
+let sess_a = hs_swap(hs_make_session(2), "task_A", reg_a)
+let y_with_a = hs_forward(base, sess_a, reg_a, input)
+// Layer 0: W@x = [3,4]. delta = s*B@A@x = 1.0*I*[3,4]=[3,4]. total [6,8]
+// Layer 1: W@x=[6,8]. delta = [6,8]. total [12,16]
+check("#8 non-zero delta differs from base", !vec_approx(y_base_only, y_with_a, 0.0001))
+check("#8b y_with_a[0]=12", approx(y_with_a[0], 12.0, 0.001))
+check("#8c y_with_a[1]=16", approx(y_with_a[1], 16.0, 0.001))
+
+// #9 Session swap + swap_count monotonic
+let s0 = hs_make_session(99)
+check("#9 initial swap_count=0", s0.swap_count == 0)
+let s1 = hs_swap(s0, "task_A", reg_a)
+check("#9b swap_count=1", s1.swap_count == 1)
+check("#9c active=task_A", s1.active_adapter == "task_A")
+let s2 = hs_swap(s1, "unknown", reg_a)
+check("#9d unknown → active='' but count=2", s2.active_adapter == "" && s2.swap_count == 2)
+let s3 = hs_swap(s2, "task_A", reg_a)
+check("#9e reactivate task_A, count=3", s3.swap_count == 3 && s3.active_adapter == "task_A")
+
+// #10 Route forward — request adapter
+let req_a = HotSwapRequest { req_id: 101, adapter_name: "task_A", input: input }
+let y_route = hs_route_forward(base, reg_a, req_a)
+check("#10 route task_A == swap forward", vec_approx(y_route, y_with_a, 0.0001))
+
+// #11 Route forward — unknown = base only
+let req_unk = HotSwapRequest { req_id: 102, adapter_name: "missing", input: input }
+let y_unk = hs_route_forward(base, reg_a, req_unk)
+check("#11 unknown adapter → base only", vec_approx(y_unk, y_base_only, 0.0001))
+
+// #12 Concurrent multi-tenant: 3 requests, 2 adapters + 1 base
+let reg_multi = hs_load(hs_load(hs_create_registry(), "task_A", entry_a), "task_B", entry_b)
+let req1 = HotSwapRequest { req_id: 1, adapter_name: "task_A", input: [1.0, 1.0] }
+let req2 = HotSwapRequest { req_id: 2, adapter_name: "task_B", input: [1.0, 1.0] }
+let req3 = HotSwapRequest { req_id: 3, adapter_name: "", input: [1.0, 1.0] }
+let outs = hs_concurrent_serve(base, reg_multi, [req1, req2, req3])
+check("#12 concurrent serve n=3 outputs", len(outs) == 3)
+// req1: task_A scale=1 → layer0 [1+1, 1+1]=[2,2], layer1 [2+2,2+2]=[4,4]
+check("#12b req1 == [4,4]", approx(outs[0][0], 4.0, 0.001) && approx(outs[0][1], 4.0, 0.001))
+// req2: task_B scale=2 → layer0 [1+2, 1+2]=[3,3], layer1 [3+6, 3+6]=[9,9]
+check("#12c req2 == [9,9]", approx(outs[1][0], 9.0, 0.001) && approx(outs[1][1], 9.0, 0.001))
+// req3: base only → [1,1] → [1,1]
+check("#12d req3 base == [1,1]", approx(outs[2][0], 1.0, 0.001) && approx(outs[2][1], 1.0, 0.001))
+
+// #13 Merge: y_merged == y_with_delta
+let merged_base = hs_merge(base, entry_a)
+let sess_none = hs_make_session(777)
+let y_merged = hs_forward(merged_base, sess_none, hs_create_registry(), input)
+check("#13 merged forward == delta forward", vec_approx(y_merged, y_with_a, 0.0001))
+
+// #14 Unmerge(merge(W)) == W (역함수)
+let unmerged = hs_unmerge(merged_base, entry_a)
+check("#14 unmerge round-trip layer 0 W",
+      mat_approx(unmerged.layers[0].w, base.layers[0].w, 0.0001))
+check("#14b unmerge round-trip layer 1 W",
+      mat_approx(unmerged.layers[1].w, base.layers[1].w, 0.0001))
+
+// #15 Base 불변성 — merge 후 원본 base.layers 그대로 (copy-on-write)
+let stash_w00 = base.layers[0].w[0][0]
+let _merge_again = hs_merge(base, entry_a)
+check("#15 base.layers[0].w[0][0] 불변", approx(base.layers[0].w[0][0], stash_w00, 0.0001))
+check("#15b base.merged_name still ''", base.merged_name == "")
+check("#15c merged_base.merged_name='task_A'", merged_base.merged_name == "task_A")
+
+// #16 Swap count monotonic across sessions
+let sM = hs_make_session(50)
+let mut sM_cur = sM
+let mut k = 0
+while k < 5 {
+    sM_cur = hs_swap(sM_cur, "task_A", reg_a)
+    k = k + 1
+}
+check("#16 5 swaps → count=5", sM_cur.swap_count == 5)
+
+// #17 Stats — base/delta params
+let stats = hs_stats(reg_multi, base)
+// base: 2 layers * 2*2 = 8 params
+check("#17 base_params=8", stats["base_params"] == 8)
+// each entry: 2 layers * (2*2 + 2*2) = 16. 2 entries = 32
+check("#17b delta_params_total=32", stats["delta_params_total"] == 32)
+check("#17c registry_count=2", stats["registry_count"] == 2)
+check("#17d n_layers=2", stats["n_layers"] == 2)
+
+// #18 Overwrite → forward 결과 변화 (hot-swap 실제 적용 검증)
+// entry_a (alpha=2, scale=1) → entry with alpha=4, scale=2
+let reg_ow = hs_load(hs_create_registry(), "task_A", entry_a)
+let sess_ow1 = hs_swap(hs_make_session(1), "task_A", reg_ow)
+let y_before = hs_forward(base, sess_ow1, reg_ow, input)
+// overwrite with scaled-up alpha
+let entry_a_big = hs_make_entry("task_A", [a_mat, a_mat], [b_mat, b_mat], 2, 4)
+let reg_ow2 = hs_load(reg_ow, "task_A", entry_a_big)
+let sess_ow2 = hs_swap(hs_make_session(1), "task_A", reg_ow2)
+let y_after = hs_forward(base, sess_ow2, reg_ow2, input)
+check("#18 overwrite changes forward output", !vec_approx(y_before, y_after, 0.0001))
+// alpha=4, rank=2 → scale=2. layer0: [3+6,4+8]=[9,12], layer1: [9+18,12+24]=[27,36]
+check("#18b y_after[0]=27", approx(y_after[0], 27.0, 0.001))
+check("#18c y_after[1]=36", approx(y_after[1], 36.0, 0.001))
+
+// ═══════════════════════════════════════════════════════════════
+println("")
+println("lora_hotswap: " + to_string(pass_count) + " PASS / " + to_string(fail_count) + " FAIL")

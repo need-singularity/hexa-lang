@@ -1,0 +1,395 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/self_consistency.hexa — Self-Consistency Decoding
+//
+//  "Self-Consistency improves Chain of Thought Reasoning in LMs"
+//   (Wang et al., 2022 — https://arxiv.org/abs/2203.11171)
+//
+//  Idea: Instead of greedy-decoding a single answer, sample N reasoning
+//        paths at non-zero temperature, then pick the most frequent
+//        answer (majority vote). Optionally weight votes by sequence
+//        log-probability (confidence-weighted consistency).
+//
+//  Pipeline:
+//    1. sc_generate_samples(logits_fn, prompt, N, cfg)
+//         -> N candidate answers + per-sample logprob
+//    2. sc_normalize_answer(str)
+//         -> canonical form for comparison
+//    3. sc_majority_vote(answers)
+//         -> (winner, count, confidence=count/N)
+//    4. sc_weighted_majority(answers, logprobs)
+//         -> (winner, weight, confidence=exp(top_logprob)/Σexp)
+//    5. sc_decode(logits_fn, prompt, N, cfg)
+//         -> struct SelfConsistencyResult { answer, confidence, ... }
+//
+//  Sampling primitives are local (argmax / temperature / softmax /
+//  categorical sample) so this module is self-contained: no Rust,
+//  no FFI, pure .hexa. Grammar pitfalls checked:
+//    - no ;, no .substr/.find/.to_string
+//    - use str()/to_float() builtins
+//    - map keys: always non-empty string, default on missing
+//    - return struct fields only through struct literal / field access
+//
+//  AI-NATIVE attrs:
+//    @pure — sc_softmax/sc_argmax (no state)
+//    @hot  — sc_decode (called per inference request)
+// ═══════════════════════════════════════════════════════════════════
+
+// ── RNG (LCG-ish, 31-bit safe — BigInt 회피) ────────────────────
+let mut SC_RNG = 123456789
+
+fn sc_set_seed(s) {
+    let mut v = s
+    if v < 0 { v = 0 - v }
+    v = v % 2147483647
+    if v == 0 { v = 1 }
+    SC_RNG = v
+}
+
+fn sc_rand_float() {
+    let mut x = SC_RNG
+    x = x ^ (x * 13)
+    x = x % 2147483647
+    if x < 0 { x = 0 - x }
+    x = x ^ (x / 17)
+    x = x % 2147483647
+    if x < 0 { x = 0 - x }
+    x = x ^ (x * 5)
+    x = x % 2147483647
+    if x < 0 { x = 0 - x }
+    SC_RNG = x
+    return to_float(x % 1000000) / 1000000.0
+}
+
+// ── numeric helpers ──────────────────────────────────────────────
+fn sc_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn sc_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn sc_log(x) {
+    if x <= 0.0 { return -30.0 }
+    let mut v = x
+    let mut count = 0
+    while v > 2.0 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    let d = v - 1.0
+    let ln_v = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_v
+}
+
+fn sc_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+// ── core sampling primitives ─────────────────────────────────────
+
+@pure
+fn sc_argmax(v) {
+    let n = len(v)
+    let mut best_i = 0
+    let mut best_v = v[0]
+    for i in 1..n {
+        if v[i] > best_v {
+            best_v = v[i]
+            best_i = i
+        }
+    }
+    return best_i
+}
+
+// Softmax with temperature. temp <= 0 => returns one-hot at argmax.
+@pure
+fn sc_softmax(logits, temp) {
+    let n = len(logits)
+    if temp <= 0.0 {
+        let mut onehot = sc_zeros(n)
+        onehot[sc_argmax(logits)] = 1.0
+        return onehot
+    }
+    let mut scaled = sc_zeros(n)
+    for i in 0..n { scaled[i] = logits[i] / temp }
+    let mut m = scaled[0]
+    for i in 1..n {
+        if scaled[i] > m { m = scaled[i] }
+    }
+    let mut exps = sc_zeros(n)
+    let mut z = 0.0
+    for i in 0..n {
+        exps[i] = sc_exp(scaled[i] - m)
+        z = z + exps[i]
+    }
+    let mut out = sc_zeros(n)
+    if z <= 0.0 { return out }
+    for i in 0..n { out[i] = exps[i] / z }
+    return out
+}
+
+// Categorical sampling from a probability vector. Returns (idx, logprob).
+fn sc_sample_categorical(probs) {
+    let n = len(probs)
+    let r = sc_rand_float()
+    let mut cum = 0.0
+    for i in 0..n {
+        cum = cum + probs[i]
+        if cum > r {
+            return [i, sc_log(probs[i] + 1.0e-12)]
+        }
+    }
+    let last = n - 1
+    return [last, sc_log(probs[last] + 1.0e-12)]
+}
+
+// ── answer container + normalization ─────────────────────────────
+
+struct SelfConsistencyResult {
+    answer: string,
+    count: int,
+    confidence: float,
+    n_samples: int,
+    unique_answers: int,
+    weighted: int
+}
+
+// Normalize an answer for equivalence comparison:
+//   - lowercase
+//   - trim leading/trailing whitespace
+//   - collapse inner whitespace to single space
+//   - drop trailing '.' (common in "42." vs "42")
+//
+//  Note: chars() returns `char` values. We use `"" + c` to coerce each
+//  char into a 1-char string before building `out`, which also lets us
+//  compare via substring() below without char-vs-string pitfalls.
+fn sc_normalize_answer(s) {
+    let low = s.to_lower()
+    let t = low.trim()
+    let chars = t.chars()
+    let n = len(chars)
+    let mut out = ""
+    let mut prev_space = false
+    for i in 0..n {
+        let cs = "" + chars[i]
+        if cs == " " {
+            if prev_space == false { out = out + " " }
+            prev_space = true
+        } else {
+            out = out + cs
+            prev_space = false
+        }
+    }
+    // remove single trailing period if present
+    let ol = len(out)
+    if ol > 0 {
+        let last_idx = ol - 1
+        let tail = out.substring(last_idx, ol)
+        if tail == "." {
+            out = out.substring(0, last_idx)
+        }
+    }
+    return out
+}
+
+// ── sample generation ────────────────────────────────────────────
+
+// logits_fn(prompt, sample_idx) -> [float]  (vocabulary logits as a stand-in
+//   for a full generation; in production this is the full decode loop).
+// Here we let each sample return a single answer-id + logprob — decoupled
+// from the full transformer loop so unit tests can focus on the vote logic.
+
+// Generate N samples. For each sample:
+//   - call user_generate_fn(prompt, sample_idx) -> [logits]
+//   - softmax with temperature
+//   - categorical sample -> answer index (= "answer")
+//   - accumulated logprob = log p(sample)
+// Returns parallel arrays [answers], [logprobs], [raw_ids].
+fn sc_generate_samples(user_generate_fn, prompt, n_samples, temperature) {
+    let mut answers = []
+    let mut logprobs = []
+    let mut raw_ids = []
+    for s in 0..n_samples {
+        let logits = user_generate_fn(prompt, s)
+        let probs = sc_softmax(logits, temperature)
+        let pair = sc_sample_categorical(probs)
+        let idx = pair[0]
+        let lp = pair[1]
+        answers = answers + [str(idx)]
+        logprobs = logprobs + [lp]
+        raw_ids = raw_ids + [idx]
+    }
+    return [answers, logprobs, raw_ids]
+}
+
+// ── vote counting ────────────────────────────────────────────────
+
+// Normalize + count occurrences. Returns [unique_keys, counts].
+fn sc_count_answers(answers) {
+    let n = len(answers)
+    let mut keys = []
+    let mut counts = []
+    for i in 0..n {
+        let key = sc_normalize_answer(answers[i])
+        // find existing
+        let mut found = -1
+        let nk = len(keys)
+        for j in 0..nk {
+            if keys[j] == key { found = j }
+        }
+        if found < 0 {
+            keys = keys + [key]
+            counts = counts + [1]
+        } else {
+            counts[found] = counts[found] + 1
+        }
+    }
+    return [keys, counts]
+}
+
+// Majority vote — returns SelfConsistencyResult.
+fn sc_majority_vote(answers) {
+    let n = len(answers)
+    if n == 0 {
+        return SelfConsistencyResult {
+            answer: "",
+            count: 0,
+            confidence: 0.0,
+            n_samples: 0,
+            unique_answers: 0,
+            weighted: 0
+        }
+    }
+    let pair = sc_count_answers(answers)
+    let keys = pair[0]
+    let counts = pair[1]
+    let nk = len(keys)
+
+    let mut best_i = 0
+    let mut best_c = counts[0]
+    for i in 1..nk {
+        if counts[i] > best_c {
+            best_c = counts[i]
+            best_i = i
+        }
+    }
+    let conf = to_float(best_c) / to_float(n)
+    return SelfConsistencyResult {
+        answer: keys[best_i],
+        count: best_c,
+        confidence: conf,
+        n_samples: n,
+        unique_answers: nk,
+        weighted: 0
+    }
+}
+
+// ── weighted majority (confidence-weighted self-consistency) ─────
+//
+// Sum exp(logprob) per normalized key, pick the argmax, confidence =
+// winning_weight / total_weight.
+fn sc_weighted_majority(answers, logprobs) {
+    let n = len(answers)
+    if n == 0 {
+        return SelfConsistencyResult {
+            answer: "",
+            count: 0,
+            confidence: 0.0,
+            n_samples: 0,
+            unique_answers: 0,
+            weighted: 1
+        }
+    }
+
+    // normalize exp-logprobs to guard against overflow: subtract max logprob
+    let mut max_lp = logprobs[0]
+    for i in 1..n {
+        if logprobs[i] > max_lp { max_lp = logprobs[i] }
+    }
+
+    let mut keys = []
+    let mut weights = []
+    let mut counts = []
+    for i in 0..n {
+        let key = sc_normalize_answer(answers[i])
+        let w = sc_exp(logprobs[i] - max_lp)
+        // find existing
+        let mut found = -1
+        let nk = len(keys)
+        for j in 0..nk {
+            if keys[j] == key { found = j }
+        }
+        if found < 0 {
+            keys = keys + [key]
+            weights = weights + [w]
+            counts = counts + [1]
+        } else {
+            weights[found] = weights[found] + w
+            counts[found] = counts[found] + 1
+        }
+    }
+
+    let nk = len(keys)
+    let mut best_i = 0
+    let mut best_w = weights[0]
+    let mut total_w = 0.0
+    for i in 0..nk {
+        total_w = total_w + weights[i]
+        if weights[i] > best_w {
+            best_w = weights[i]
+            best_i = i
+        }
+    }
+    let mut conf = 0.0
+    if total_w > 0.0 { conf = best_w / total_w }
+
+    return SelfConsistencyResult {
+        answer: keys[best_i],
+        count: counts[best_i],
+        confidence: conf,
+        n_samples: n,
+        unique_answers: nk,
+        weighted: 1
+    }
+}
+
+// ── top-level decode entry ──────────────────────────────────────
+//
+// user_generate_fn(prompt, sample_idx) -> [float] logits vector
+// Set use_weighted = 1 for logprob-weighted majority (recommended for
+// high-variance tasks); 0 for plain count majority.
+@hot
+fn sc_decode(user_generate_fn, prompt, n_samples, temperature, use_weighted) {
+    let triple = sc_generate_samples(user_generate_fn, prompt, n_samples, temperature)
+    let answers = triple[0]
+    let logprobs = triple[1]
+    if use_weighted == 1 {
+        return sc_weighted_majority(answers, logprobs)
+    }
+    return sc_majority_vote(answers)
+}
+
+// ── answer-equivalence helper (public) ───────────────────────────
+fn sc_answers_equal(a, b) {
+    return sc_normalize_answer(a) == sc_normalize_answer(b)
+}
+
+println("[self_consistency] loaded — N-sample decode + majority/weighted vote + confidence")

@@ -1,0 +1,523 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/multi_token_predict.hexa — Multi-Token Prediction (MTP)
+//
+//  HEXA-LANG ML #62 — Meta "Better & Faster LLMs via Multi-Token
+//  Prediction" style: one shared backbone feeds n independent
+//  prediction heads that each predict token t+1, t+2, ..., t+n.
+//
+//  Pure .hexa, self/ only, zero Rust. Deterministic so tests can
+//  pin exact numbers. Heads are simple linear projections over a
+//  shared hidden; the MTP loss is the sum of per-head cross-entropy.
+//  A speculative verify hook reuses speculative_decode semantics so
+//  the n heads can be validated against a target model in parallel.
+//
+//  API (all pure or self-contained mutating local state):
+//    mtp_make_config(vocab, hidden, n_heads)                 -> MTPConfig
+//    mtp_make_model(cfg, seed)                               -> MTPModel
+//    mtp_backbone(model, tokens)                             -> [float]  hidden
+//    mtp_head_logits(model, head_idx, hidden)                -> [float]
+//    mtp_softmax(logits)                                     -> [float]
+//    mtp_log_softmax(logits)                                 -> [float]
+//    mtp_ce(logits, target)                                  -> float
+//    mtp_loss(model, tokens, targets_n)                      -> float
+//    mtp_loss_per_head(model, tokens, targets_n)             -> [float]
+//    mtp_grad_estimate(model, tokens, targets_n, eps)        -> float
+//    mtp_train_step(model, tokens, targets_n, lr)            -> float
+//    mtp_predict_n(model, tokens)                            -> [int]
+//    mtp_inference_loop(model, tokens, max_tokens)           -> [int]
+//    mtp_speculative_verify(model, tokens, target_fn)        -> [int]
+//    @multi_token_predict
+//    mtp_step(model, tokens, max_tokens)                     -> [[int],[int],[int]]
+//
+//  Rules: HX4 SELF-HOST FIRST, HX5 AI-native (no bit-twiddling),
+//         P1 no semicolons, P4 native collections.
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Structs ────────────────────────────────────────────────────
+struct MTPConfig {
+    vocab: int,
+    hidden: int,
+    n_heads: int
+}
+
+struct MTPHead {
+    w: array,      // [vocab][hidden]
+    bias: array    // [vocab]
+}
+
+struct MTPModel {
+    cfg: MTPConfig,
+    // shared backbone projection: tokens -> hidden
+    // backbone_w[hidden][vocab] (one-hot input → hidden)
+    backbone_w: array,
+    backbone_b: array,   // [hidden]
+    heads: array,        // [MTPHead] length n_heads
+    rng: int             // LCG state for deterministic init / updates
+}
+
+// ── Deterministic LCG (seeded reproducibility) ────────────────
+fn _mtp_lcg_next(state) {
+    let a = 1103515245
+    let c = 12345
+    let m = 2147483648
+    let mut s = (state * a + c) % m
+    if s < 0 { s = s + m }
+    s
+}
+
+fn _mtp_lcg_float(state) {
+    // Returns a float in roughly negative half to half, plus new state.
+    let ns = _mtp_lcg_next(state)
+    let fv = (to_float(ns % 10000) / 10000.0) - 0.5
+    let out = [fv, ns]
+    out
+}
+
+// ── Math helpers ──────────────────────────────────────────────
+fn _mtp_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    x
+}
+
+fn _mtp_ln(x) {
+    // Simple natural log fallback if builtin not available.
+    if x <= 0.0 { return 0.0 - 999.0 }
+    let mut v = x
+    let mut adj = 0.0
+    while v > 2.0 {
+        v = v / 2.718281828
+        adj = adj + 1.0
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        adj = adj - 1.0
+    }
+    // ln(1+y) ≈ y - y^2/2 + y^3/3 - y^4/4 + y^5/5
+    let y = v - 1.0
+    let y2 = y * y
+    let y3 = y2 * y
+    let y4 = y3 * y
+    let y5 = y4 * y
+    let approx = y - y2 / 2.0 + y3 / 3.0 - y4 / 4.0 + y5 / 5.0
+    adj + approx
+}
+
+// ── Config + model builders ───────────────────────────────────
+fn mtp_make_config(vocab, hidden, n_heads) {
+    MTPConfig { vocab: vocab, hidden: hidden, n_heads: n_heads }
+}
+
+fn mtp_make_model(cfg, seed) {
+    let mut rng = seed
+    // backbone_w[hidden][vocab]
+    let mut bw = []
+    let mut i = 0
+    while i < cfg.hidden {
+        let mut row = []
+        let mut j = 0
+        while j < cfg.vocab {
+            let pair = _mtp_lcg_float(rng)
+            row = row + [pair[0] * 0.1]
+            rng = pair[1]
+            j = j + 1
+        }
+        bw = bw + [row]
+        i = i + 1
+    }
+    // backbone bias
+    let mut bb = []
+    let mut ii = 0
+    while ii < cfg.hidden {
+        bb = bb + [0.0]
+        ii = ii + 1
+    }
+    // n prediction heads — each is linear [vocab x hidden] + bias[vocab]
+    let mut heads = []
+    let mut h = 0
+    while h < cfg.n_heads {
+        let mut hw = []
+        let mut hi = 0
+        while hi < cfg.vocab {
+            let mut hrow = []
+            let mut hj = 0
+            while hj < cfg.hidden {
+                let pair = _mtp_lcg_float(rng)
+                // Each head gets a slightly different offset so they
+                // actually predict different positions (t+1..t+n).
+                hrow = hrow + [pair[0] * 0.2 + to_float(h) * 0.01]
+                rng = pair[1]
+                hj = hj + 1
+            }
+            hw = hw + [hrow]
+            hi = hi + 1
+        }
+        let mut hb = []
+        let mut bi = 0
+        while bi < cfg.vocab {
+            hb = hb + [0.0]
+            bi = bi + 1
+        }
+        heads = heads + [MTPHead { w: hw, bias: hb }]
+        h = h + 1
+    }
+    MTPModel {
+        cfg: cfg,
+        backbone_w: bw,
+        backbone_b: bb,
+        heads: heads,
+        rng: rng
+    }
+}
+
+// ── Shared backbone: sum of token embeddings + bias ───────────
+// Input: tokens = [int] (indices into vocab)
+// Output: hidden vector [float] of length cfg.hidden
+@pure
+fn mtp_backbone(model, tokens) {
+    let cfg = model.cfg
+    let mut hidden = []
+    let mut i = 0
+    while i < cfg.hidden {
+        let mut s = model.backbone_b[i]
+        let mut j = 0
+        while j < len(tokens) {
+            let tok = tokens[j]
+            if tok >= 0 {
+                if tok < cfg.vocab {
+                    s = s + model.backbone_w[i][tok]
+                }
+            }
+            j = j + 1
+        }
+        // tanh-like squashing without relying on builtins
+        let v = s / (1.0 + _mtp_abs(s))
+        hidden = hidden + [v]
+        i = i + 1
+    }
+    hidden
+}
+
+// ── Head: linear projection to vocab logits ────────────────────
+@pure
+fn mtp_head_logits(model, head_idx, hidden) {
+    let head = model.heads[head_idx]
+    let cfg = model.cfg
+    let mut logits = []
+    let mut i = 0
+    while i < cfg.vocab {
+        let mut s = head.bias[i]
+        let mut j = 0
+        while j < cfg.hidden {
+            s = s + head.w[i][j] * hidden[j]
+            j = j + 1
+        }
+        logits = logits + [s]
+        i = i + 1
+    }
+    logits
+}
+
+// ── Softmax (stable) ───────────────────────────────────────────
+@pure
+fn mtp_softmax(logits) {
+    let n = len(logits)
+    let mut mx = logits[0]
+    let mut i = 1
+    while i < n {
+        if logits[i] > mx { mx = logits[i] }
+        i = i + 1
+    }
+    let mut exps = []
+    let mut total = 0.0
+    i = 0
+    while i < n {
+        let e = exp(logits[i] - mx)
+        exps = exps + [e]
+        total = total + e
+        i = i + 1
+    }
+    let mut out = []
+    i = 0
+    while i < n {
+        out = out + [exps[i] / total]
+        i = i + 1
+    }
+    out
+}
+
+// ── Log-softmax (stable) ──────────────────────────────────────
+@pure
+fn mtp_log_softmax(logits) {
+    let n = len(logits)
+    let mut mx = logits[0]
+    let mut i = 1
+    while i < n {
+        if logits[i] > mx { mx = logits[i] }
+        i = i + 1
+    }
+    let mut total = 0.0
+    i = 0
+    while i < n {
+        total = total + exp(logits[i] - mx)
+        i = i + 1
+    }
+    let log_total = _mtp_ln(total)
+    let mut out = []
+    i = 0
+    while i < n {
+        out = out + [(logits[i] - mx) - log_total]
+        i = i + 1
+    }
+    out
+}
+
+// ── Cross-entropy for one target ──────────────────────────────
+@pure
+fn mtp_ce(logits, target) {
+    let logp = mtp_log_softmax(logits)
+    0.0 - logp[target]
+}
+
+// ── MTP loss: sum of per-head CE ──────────────────────────────
+// targets_n: [int] of length n_heads
+//   targets_n[h] = ground-truth token at offset t+h+1
+@pure
+fn mtp_loss_per_head(model, tokens, targets_n) {
+    let hidden = mtp_backbone(model, tokens)
+    let n = model.cfg.n_heads
+    let mut losses = []
+    let mut h = 0
+    while h < n {
+        let logits = mtp_head_logits(model, h, hidden)
+        let tgt = targets_n[h]
+        losses = losses + [mtp_ce(logits, tgt)]
+        h = h + 1
+    }
+    losses
+}
+
+@pure
+fn mtp_loss(model, tokens, targets_n) {
+    let losses = mtp_loss_per_head(model, tokens, targets_n)
+    let mut s = 0.0
+    let mut i = 0
+    while i < len(losses) {
+        s = s + losses[i]
+        i = i + 1
+    }
+    s
+}
+
+// ── Numerical gradient magnitude estimate (diagnostic) ────────
+// Perturbs head[0] bias[0] by +eps, returns dL / eps (signed).
+fn mtp_grad_estimate(model, tokens, targets_n, eps) {
+    let base = mtp_loss(model, tokens, targets_n)
+    let mut m2 = model
+    let mut new_heads = []
+    let mut k = 0
+    while k < len(m2.heads) {
+        new_heads = new_heads + [m2.heads[k]]
+        k = k + 1
+    }
+    let head0 = new_heads[0]
+    let mut new_bias = []
+    let mut j = 0
+    while j < len(head0.bias) {
+        if j == 0 {
+            new_bias = new_bias + [head0.bias[0] + eps]
+        } else {
+            new_bias = new_bias + [head0.bias[j]]
+        }
+        j = j + 1
+    }
+    let new_head = MTPHead { w: head0.w, bias: new_bias }
+    new_heads[0] = new_head
+    m2 = MTPModel {
+        cfg: m2.cfg,
+        backbone_w: m2.backbone_w,
+        backbone_b: m2.backbone_b,
+        heads: new_heads,
+        rng: m2.rng
+    }
+    let perturbed = mtp_loss(m2, tokens, targets_n)
+    (perturbed - base) / eps
+}
+
+// ── Train step: SGD over each head's bias using softmax error ─
+// Simple analytic gradient for bias of a linear head with CE loss:
+//   dL/db[k] = softmax(logits)[k] - onehot(target)[k]
+// We only update biases (enough to move loss measurably). Returns
+// the new total loss after the step.
+fn mtp_train_step(model, tokens, targets_n, lr) {
+    let hidden = mtp_backbone(model, tokens)
+    let cfg = model.cfg
+    let mut new_heads = []
+    let mut h = 0
+    while h < cfg.n_heads {
+        let head = model.heads[h]
+        let logits = mtp_head_logits(model, h, hidden)
+        let probs = mtp_softmax(logits)
+        let tgt = targets_n[h]
+        let mut nb = []
+        let mut k = 0
+        while k < cfg.vocab {
+            let mut grad = probs[k]
+            if k == tgt { grad = grad - 1.0 }
+            nb = nb + [head.bias[k] - lr * grad]
+            k = k + 1
+        }
+        new_heads = new_heads + [MTPHead { w: head.w, bias: nb }]
+        h = h + 1
+    }
+    let m2 = MTPModel {
+        cfg: cfg,
+        backbone_w: model.backbone_w,
+        backbone_b: model.backbone_b,
+        heads: new_heads,
+        rng: model.rng
+    }
+    // return model state through a list so callers can unpack
+    let new_loss = mtp_loss(m2, tokens, targets_n)
+    // pack: new_loss, new_model
+    return [new_loss, m2]
+}
+
+// ── argmax ─────────────────────────────────────────────────────
+fn _mtp_argmax(xs) {
+    let n = len(xs)
+    let mut best = xs[0]
+    let mut idx = 0
+    let mut i = 1
+    while i < n {
+        if xs[i] > best {
+            best = xs[i]
+            idx = i
+        }
+        i = i + 1
+    }
+    idx
+}
+
+// ── Inference: predict n tokens in one forward ────────────────
+@pure
+fn mtp_predict_n(model, tokens) {
+    let hidden = mtp_backbone(model, tokens)
+    let n = model.cfg.n_heads
+    let mut out = []
+    let mut h = 0
+    while h < n {
+        let logits = mtp_head_logits(model, h, hidden)
+        out = out + [_mtp_argmax(logits)]
+        h = h + 1
+    }
+    out
+}
+
+// ── Autoregressive inference loop using MTP heads ─────────────
+// Commit all n heads per pass — this is the speed-up over 1-token
+// autoregressive decoding.
+fn mtp_inference_loop(model, tokens, max_tokens) {
+    let mut cur = []
+    let mut i = 0
+    while i < len(tokens) {
+        cur = cur + [tokens[i]]
+        i = i + 1
+    }
+    let mut produced = 0
+    let n = model.cfg.n_heads
+    while produced < max_tokens {
+        let predicted = mtp_predict_n(model, cur)
+        let remain = max_tokens - produced
+        let take = if n < remain { n } else { remain }
+        let mut k = 0
+        while k < take {
+            cur = cur + [predicted[k]]
+            k = k + 1
+        }
+        produced = produced + take
+    }
+    // return newly produced tail
+    let start = len(tokens)
+    let mut out = []
+    let mut m = start
+    while m < len(cur) {
+        out = out + [cur[m]]
+        m = m + 1
+    }
+    out
+}
+
+// ── Speculative verify hook ───────────────────────────────────
+// Feeds MTP's n predictions to a target_fn(ctx) -> int and returns
+// the per-head accepted mask [0/1]. Reuses the same accept-prefix
+// semantics as speculative_decode.hexa but operates on the parallel
+// n-head draft instead of a serial draft.
+fn mtp_speculative_verify(model, tokens, target_fn_tag) {
+    let drafted = mtp_predict_n(model, tokens)
+    let mut verified = []
+    let mut local = []
+    let mut a = 0
+    while a < len(tokens) {
+        local = local + [tokens[a]]
+        a = a + 1
+    }
+    let mut i = 0
+    while i < len(drafted) {
+        // Deterministic target: XOR rolling hash — caller-selected via tag
+        let t = _mtp_target_eval(local, target_fn_tag)
+        verified = verified + [t]
+        local = local + [drafted[i]]
+        i = i + 1
+    }
+    // accept prefix
+    let mut out = []
+    let mut j = 0
+    let mut stop = 0
+    while j < len(drafted) {
+        if stop == 0 {
+            if drafted[j] == verified[j] {
+                out = out + [1]
+            } else {
+                out = out + [0]
+                stop = 1
+            }
+        } else {
+            out = out + [0]
+        }
+        j = j + 1
+    }
+    out
+}
+
+// Target oracle for speculative verify — deterministic per tag so
+// tests can pin numbers. Tags: 0=hash_mod_vocab, 1=always_zero.
+fn _mtp_target_eval(ctx, tag) {
+    if tag == 1 { return 0 }
+    let n = len(ctx)
+    let start = if n < 4 { 0 } else { n - 4 }
+    let mut h = 2654435761
+    let mut i = start
+    while i < n {
+        h = h ^ ((ctx[i] + 1) * (i + 7) * 1315423911)
+        i = i + 1
+    }
+    let v = h % 8
+    if v < 0 { v + 8 } else { v }
+}
+
+// ── @multi_token_predict top-level step ────────────────────────
+// Returns [predicted_tokens, loss_per_head*100_int, accept_mask]
+// so tests can verify all facets in one call.
+@multi_token_predict
+fn mtp_step(model, tokens, targets_n) {
+    let pred = mtp_predict_n(model, tokens)
+    let losses = mtp_loss_per_head(model, tokens, targets_n)
+    let mut losses_x100 = []
+    let mut i = 0
+    while i < len(losses) {
+        losses_x100 = losses_x100 + [to_int(losses[i] * 100.0)]
+        i = i + 1
+    }
+    let accept = mtp_speculative_verify(model, tokens, 0)
+    return [pred, losses_x100, accept]
+}

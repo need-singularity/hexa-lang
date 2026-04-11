@@ -1,0 +1,710 @@
+// ===================================================================
+//  self/ml/hnsw.hexa — HNSW (Hierarchical Navigable Small World) ANN
+//
+//  Approximate nearest neighbor vector index, pure Hexa.
+//  Multi-layer graph: upper layers = long-range shortcuts,
+//                     layer 0    = dense bottom graph (every node).
+//
+//  Hyperparameters:
+//    M               — target out-degree per node per layer
+//    M_max           — hard cap on out-degree (layer 0 uses M_max0 = 2*M)
+//    efConstruction  — candidate list size during insert
+//    efSearch        — candidate list size during query
+//    mL              — level normalization factor (1 / ln(M))
+//
+//  Public API:
+//    create_hnsw(dim, M, M_max, efConstruction, efSearch, seed, metric)
+//    hnsw_insert(index, id, vector)             → updated index
+//    hnsw_search(index, query, top_k)           → [[id, dist], ...]
+//    hnsw_size(index)                           → int
+//    hnsw_recall(index, brute_store, queries, top_k) → float
+//
+//  Distance metrics:
+//    metric=0 → L2 (squared, smaller = closer)
+//    metric=1 → cosine distance (1 - cos_sim, smaller = closer)
+//
+//  Pitfalls avoided (HX3):
+//    • No complex index assignment: arrays/maps rebuilt functionally
+//    • No struct-literal in `if`/`while` head
+//    • No bit-twiddle loops (neighbor selection uses sorted scan)
+//    • Deterministic PRNG (xorshift32) so tests are reproducible
+// ===================================================================
+
+// ── Distance helpers ────────────────────────────────────────────────
+
+fn hnsw_l2_sq(a, b) {
+    let n = len(a)
+    let mut sum = 0.0
+    let mut i = 0
+    while i < n {
+        let d = a[i] - b[i]
+        sum = sum + d * d
+        i = i + 1
+    }
+    return sum
+}
+
+fn hnsw_dot(a, b) {
+    let n = len(a)
+    let mut sum = 0.0
+    let mut i = 0
+    while i < n {
+        sum = sum + a[i] * b[i]
+        i = i + 1
+    }
+    return sum
+}
+
+fn hnsw_norm(v) {
+    let mut sum = 0.0
+    let n = len(v)
+    let mut i = 0
+    while i < n {
+        sum = sum + v[i] * v[i]
+        i = i + 1
+    }
+    return sqrt(sum)
+}
+
+fn hnsw_cos_dist(a, b) {
+    let d = hnsw_dot(a, b)
+    let na = hnsw_norm(a)
+    let nb = hnsw_norm(b)
+    let denom = na * nb
+    if denom < 0.000001 { return 1.0 }
+    let sim = d / denom
+    return 1.0 - sim
+}
+
+fn hnsw_dist(index, a, b) {
+    if index.metric == 0 {
+        return hnsw_l2_sq(a, b)
+    }
+    return hnsw_cos_dist(a, b)
+}
+
+// ── Xorshift32 PRNG (deterministic) ─────────────────────────────────
+
+fn hnsw_rand_step(state) {
+    let mut x = state
+    if x == 0 { x = 2463534242 }
+    // Clamp state into 31-bit range to avoid BigInt overflow in pure-Hexa
+    // (shift-based xorshift would promote on the first *8192). This is a
+    // modular LCG-xor hybrid; still deterministic and well-mixed.
+    let m = 2147483647  // 2^31 - 1
+    let a = (x * 1103515245 + 12345) % m
+    let b = (a * 1103515245 + 12345) % m
+    let c = (b ^ (a / 65536)) % m
+    if c < 0 { return 0 - c }
+    return c
+}
+
+fn hnsw_rand_float(state) {
+    let nx = hnsw_rand_step(state)
+    let v = to_float(nx % 1000000) / 1000000.0
+    return [nx, v]
+}
+
+// Natural log approximation via series (enough for level sampling)
+fn hnsw_ln(x) {
+    if x <= 0.0 { return 0.0 }
+    // ln(x) = 2 * atanh((x-1)/(x+1)) via series
+    let y = (x - 1.0) / (x + 1.0)
+    let y2 = y * y
+    let mut term = y
+    let mut sum = 0.0
+    let mut k = 0
+    while k < 12 {
+        let denom = to_float(2 * k + 1)
+        sum = sum + term / denom
+        term = term * y2
+        k = k + 1
+    }
+    return 2.0 * sum
+}
+
+// Sample a level ℓ = floor(-ln(u) * mL)
+fn hnsw_sample_level(state, mL, max_level) {
+    let pair = hnsw_rand_float(state)
+    let new_state = pair[0]
+    let mut u = pair[1]
+    if u < 0.000001 { u = 0.000001 }
+    if u > 0.999999 { u = 0.999999 }
+    let l_float = 0.0 - hnsw_ln(u) * mL
+    let mut l = to_int(l_float)
+    if l < 0 { l = 0 }
+    if l > max_level { l = max_level }
+    return [new_state, l]
+}
+
+// ── Index structure ─────────────────────────────────────────────────
+//
+//  nodes[i]       = vector        (array of float)
+//  ids[i]         = external id   (any)
+//  levels[i]      = max level of node i
+//  layers[l][i]   = neighbors of node i on layer l (array of int node indices)
+//                   If node i doesn't exist at layer l, layers[l][i] = [].
+//  entry_point    = global entry node index (−1 if empty)
+//  max_level      = current top layer
+//
+//  M_max0 = max out-degree for layer 0, M_max = for upper layers.
+//  efConstruction, efSearch: dynamic candidate list sizes.
+// ───────────────────────────────────────────────────────────────────
+
+struct HnswIndex {
+    dim: int,
+    M: int,
+    M_max: int,
+    M_max0: int,
+    efConstruction: int,
+    efSearch: int,
+    mL: float,
+    metric: int,
+    rng: int,
+    entry_point: int,
+    max_level: int,
+    nodes: array,
+    ids: array,
+    levels: array,
+    layers: array
+}
+
+fn create_hnsw(dim, M, M_max, efConstruction, efSearch, seed, metric) {
+    let mut rng = seed
+    if rng == 0 { rng = 2463534242 }
+    // mL = 1/ln(M); for M=16 → ~0.36
+    let denom = hnsw_ln(to_float(M))
+    let mut mL = 0.36
+    if denom > 0.01 { mL = 1.0 / denom }
+    let m0 = 2 * M
+    return HnswIndex {
+        dim: dim,
+        M: M,
+        M_max: M_max,
+        M_max0: m0,
+        efConstruction: efConstruction,
+        efSearch: efSearch,
+        mL: mL,
+        metric: metric,
+        rng: rng,
+        entry_point: -1,
+        max_level: -1,
+        nodes: [],
+        ids: [],
+        levels: [],
+        layers: []
+    }
+}
+
+fn hnsw_size(index) {
+    return len(index.nodes)
+}
+
+// ── Functional-update helpers (avoid complex index assignment) ─────
+
+fn hnsw_set_arr(arr, idx, val) {
+    let n = len(arr)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        if i == idx {
+            out = out + [val]
+        } else {
+            out = out + [arr[i]]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn hnsw_set_layer_neighbors(layers, layer_idx, node_idx, new_list) {
+    let layer = layers[layer_idx]
+    let new_layer = hnsw_set_arr(layer, node_idx, new_list)
+    return hnsw_set_arr(layers, layer_idx, new_layer)
+}
+
+fn hnsw_ensure_layers(layers, target_level, node_count) {
+    let cur = len(layers)
+    if cur > target_level { return layers }
+    let mut out = layers
+    let mut l = cur
+    while l <= target_level {
+        // fresh layer with `node_count` empty adjacency lists
+        let mut row = []
+        let mut i = 0
+        while i < node_count {
+            row = row + [[]]
+            i = i + 1
+        }
+        out = out + [row]
+        l = l + 1
+    }
+    return out
+}
+
+fn hnsw_pad_layer(layer, target_len) {
+    let cur = len(layer)
+    if cur >= target_len { return layer }
+    let mut out = layer
+    let mut i = cur
+    while i < target_len {
+        out = out + [[]]
+        i = i + 1
+    }
+    return out
+}
+
+fn hnsw_pad_all_layers(layers, target_len) {
+    let L = len(layers)
+    let mut out = []
+    let mut l = 0
+    while l < L {
+        out = out + [hnsw_pad_layer(layers[l], target_len)]
+        l = l + 1
+    }
+    return out
+}
+
+// ── Candidate list helpers (sorted by dist ascending) ──────────────
+
+fn hnsw_contains_node(arr, node_idx) {
+    let n = len(arr)
+    let mut i = 0
+    while i < n {
+        if arr[i] == node_idx { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn hnsw_cand_contains(cands, node_idx) {
+    let n = len(cands)
+    let mut i = 0
+    while i < n {
+        if cands[i][0] == node_idx { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// Insert [node_idx, dist] into sorted cand list (ascending by dist).
+fn hnsw_cand_insert(cands, node_idx, dist) {
+    if hnsw_cand_contains(cands, node_idx) { return cands }
+    let n = len(cands)
+    let mut out = []
+    let mut i = 0
+    let mut inserted = false
+    while i < n {
+        let c = cands[i]
+        if !inserted {
+            if dist < c[1] {
+                out = out + [[node_idx, dist]]
+                inserted = true
+            }
+        }
+        out = out + [c]
+        i = i + 1
+    }
+    if !inserted {
+        out = out + [[node_idx, dist]]
+    }
+    return out
+}
+
+// Truncate cand list to at most k entries (keeps lowest-distance).
+fn hnsw_cand_trunc(cands, k) {
+    let n = len(cands)
+    if n <= k { return cands }
+    let mut out = []
+    let mut i = 0
+    while i < k {
+        out = out + [cands[i]]
+        i = i + 1
+    }
+    return out
+}
+
+// Max-dist element in cand list (since sorted asc, it's the tail).
+fn hnsw_cand_max(cands) {
+    let n = len(cands)
+    if n == 0 { return 1.0e30 }
+    return cands[n - 1][1]
+}
+
+// ── Greedy / beam search on a single layer ─────────────────────────
+//
+//  search_layer: from `entry` (node_idx), beam-search on `layer_idx`
+//  using `ef` candidate list size; return sorted list of [node, dist].
+//
+//  Classic HNSW: maintain `candidates` (min-heap of to-visit) and
+//  `results` (max-heap of best-so-far of size ef). We model both as
+//  sorted arrays ascending by distance.
+// ───────────────────────────────────────────────────────────────────
+
+fn hnsw_search_layer(index, query, entry_nodes, layer_idx, ef) {
+    let layers = index.layers
+    let nodes = index.nodes
+
+    // Initialize candidates and results from entry_nodes
+    let mut candidates = []
+    let mut results = []
+    let mut visited = []
+
+    let nent = len(entry_nodes)
+    let mut e = 0
+    while e < nent {
+        let ni = entry_nodes[e]
+        if !hnsw_contains_node(visited, ni) {
+            visited = visited + [ni]
+            let d = hnsw_dist(index, query, nodes[ni])
+            candidates = hnsw_cand_insert(candidates, ni, d)
+            results = hnsw_cand_insert(results, ni, d)
+            results = hnsw_cand_trunc(results, ef)
+        }
+        e = e + 1
+    }
+
+    // Beam loop
+    let mut steps = 0
+    let max_steps = 100000
+    while steps < max_steps {
+        if len(candidates) == 0 { return results }
+        // pop nearest candidate
+        let cur = candidates[0]
+        let mut new_cands = []
+        let mut ci = 1
+        while ci < len(candidates) {
+            new_cands = new_cands + [candidates[ci]]
+            ci = ci + 1
+        }
+        candidates = new_cands
+
+        let cur_node = cur[0]
+        let cur_dist = cur[1]
+        let worst = hnsw_cand_max(results)
+        if cur_dist > worst {
+            if len(results) >= ef { return results }
+        }
+
+        // Explore neighbors of cur_node on this layer
+        let layer = layers[layer_idx]
+        if cur_node < len(layer) {
+            let neighbors = layer[cur_node]
+            let nn = len(neighbors)
+            let mut k = 0
+            while k < nn {
+                let nb = neighbors[k]
+                if !hnsw_contains_node(visited, nb) {
+                    visited = visited + [nb]
+                    let dnb = hnsw_dist(index, query, nodes[nb])
+                    let cur_worst = hnsw_cand_max(results)
+                    if len(results) < ef {
+                        candidates = hnsw_cand_insert(candidates, nb, dnb)
+                        results = hnsw_cand_insert(results, nb, dnb)
+                    } else {
+                        if dnb < cur_worst {
+                            candidates = hnsw_cand_insert(candidates, nb, dnb)
+                            results = hnsw_cand_insert(results, nb, dnb)
+                            results = hnsw_cand_trunc(results, ef)
+                        }
+                    }
+                }
+                k = k + 1
+            }
+        }
+        steps = steps + 1
+    }
+    return results
+}
+
+// ── Neighbor selection (heuristic-lite: take top-M closest) ────────
+
+fn hnsw_select_neighbors(cands, M) {
+    // cands is already sorted ascending by dist
+    return hnsw_cand_trunc(cands, M)
+}
+
+// Extract just the node indices from a cand list.
+fn hnsw_cand_nodes(cands) {
+    let n = len(cands)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [cands[i][0]]
+        i = i + 1
+    }
+    return out
+}
+
+// ── Insert ─────────────────────────────────────────────────────────
+
+fn hnsw_insert(index, id, vector) {
+    let new_idx = len(index.nodes)
+    let mut nodes = index.nodes + [vector]
+    let mut ids = index.ids + [id]
+
+    // Sample level for this new node
+    let pair = hnsw_sample_level(index.rng, index.mL, 16)
+    let new_rng = pair[0]
+    let node_level = pair[1]
+
+    let mut levels = index.levels + [node_level]
+
+    // Ensure `layers` has at least (node_level+1) layers and all are padded.
+    let node_count = new_idx + 1
+    let mut layers = index.layers
+    layers = hnsw_ensure_layers(layers, node_level, node_count)
+    layers = hnsw_pad_all_layers(layers, node_count)
+
+    // First insert
+    if index.entry_point < 0 {
+        return HnswIndex {
+            dim: index.dim,
+            M: index.M,
+            M_max: index.M_max,
+            M_max0: index.M_max0,
+            efConstruction: index.efConstruction,
+            efSearch: index.efSearch,
+            mL: index.mL,
+            metric: index.metric,
+            rng: new_rng,
+            entry_point: new_idx,
+            max_level: node_level,
+            nodes: nodes,
+            ids: ids,
+            levels: levels,
+            layers: layers
+        }
+    }
+
+    // Temporarily construct a "view" index with updated arrays so that
+    // search_layer sees the new node's existence (but not its edges yet).
+    let mut tmp = HnswIndex {
+        dim: index.dim,
+        M: index.M,
+        M_max: index.M_max,
+        M_max0: index.M_max0,
+        efConstruction: index.efConstruction,
+        efSearch: index.efSearch,
+        mL: index.mL,
+        metric: index.metric,
+        rng: new_rng,
+        entry_point: index.entry_point,
+        max_level: index.max_level,
+        nodes: nodes,
+        ids: ids,
+        levels: levels,
+        layers: layers
+    }
+
+    // Phase 1: greedy descent from top layer down to node_level+1
+    let mut cur_ep = [index.entry_point]
+    let mut lvl = tmp.max_level
+    while lvl > node_level {
+        let res = hnsw_search_layer(tmp, vector, cur_ep, lvl, 1)
+        if len(res) > 0 {
+            cur_ep = [res[0][0]]
+        }
+        lvl = lvl - 1
+    }
+
+    // Phase 2: from min(node_level, max_level) down to 0, insert edges
+    let mut target_lvl = node_level
+    if target_lvl > tmp.max_level { target_lvl = tmp.max_level }
+
+    let mut layers_work = layers
+    lvl = target_lvl
+    while lvl >= 0 {
+        tmp = HnswIndex {
+            dim: tmp.dim,
+            M: tmp.M,
+            M_max: tmp.M_max,
+            M_max0: tmp.M_max0,
+            efConstruction: tmp.efConstruction,
+            efSearch: tmp.efSearch,
+            mL: tmp.mL,
+            metric: tmp.metric,
+            rng: tmp.rng,
+            entry_point: tmp.entry_point,
+            max_level: tmp.max_level,
+            nodes: tmp.nodes,
+            ids: tmp.ids,
+            levels: tmp.levels,
+            layers: layers_work
+        }
+        let W = hnsw_search_layer(tmp, vector, cur_ep, lvl, index.efConstruction)
+        // Cap per-layer degree
+        let mut cap = index.M_max
+        if lvl == 0 { cap = index.M_max0 }
+        let selected = hnsw_select_neighbors(W, index.M)
+        let nbr_list = hnsw_cand_nodes(selected)
+
+        // Set new_idx's neighbors on this layer
+        layers_work = hnsw_set_layer_neighbors(layers_work, lvl, new_idx, nbr_list)
+
+        // Add back-edge from each neighbor → new_idx; prune to cap
+        let nn = len(nbr_list)
+        let mut k = 0
+        while k < nn {
+            let nb = nbr_list[k]
+            let layer_cur = layers_work[lvl]
+            let existing = layer_cur[nb]
+            if !hnsw_contains_node(existing, new_idx) {
+                let appended = existing + [new_idx]
+                let pruned = hnsw_prune_neighbors(tmp, nb, appended, cap, lvl)
+                layers_work = hnsw_set_layer_neighbors(layers_work, lvl, nb, pruned)
+            }
+            k = k + 1
+        }
+
+        // Next iteration's entry points = all nodes found at this layer
+        let entries_next = hnsw_cand_nodes(W)
+        if len(entries_next) > 0 { cur_ep = entries_next }
+        lvl = lvl - 1
+    }
+
+    // Decide new entry point / max_level
+    let mut new_ep = tmp.entry_point
+    let mut new_max = tmp.max_level
+    if node_level > tmp.max_level {
+        new_ep = new_idx
+        new_max = node_level
+    }
+
+    return HnswIndex {
+        dim: index.dim,
+        M: index.M,
+        M_max: index.M_max,
+        M_max0: index.M_max0,
+        efConstruction: index.efConstruction,
+        efSearch: index.efSearch,
+        mL: index.mL,
+        metric: index.metric,
+        rng: new_rng,
+        entry_point: new_ep,
+        max_level: new_max,
+        nodes: nodes,
+        ids: ids,
+        levels: levels,
+        layers: layers_work
+    }
+}
+
+// Prune neighbor list of `base_node` on `layer_idx` to at most `cap`
+// by keeping the `cap` closest neighbors (greedy by distance).
+fn hnsw_prune_neighbors(index, base_node, candidates_list, cap, layer_idx) {
+    let n = len(candidates_list)
+    if n <= cap { return candidates_list }
+    // Score each candidate by its distance to base_node
+    let base_vec = index.nodes[base_node]
+    let mut scored = []
+    let mut i = 0
+    while i < n {
+        let nb = candidates_list[i]
+        let d = hnsw_dist(index, base_vec, index.nodes[nb])
+        scored = hnsw_cand_insert(scored, nb, d)
+        i = i + 1
+    }
+    let keep = hnsw_cand_trunc(scored, cap)
+    return hnsw_cand_nodes(keep)
+}
+
+// ── Public search ─────────────────────────────────────────────────
+
+fn hnsw_search(index, query, top_k) {
+    if index.entry_point < 0 { return [] }
+    let n = len(index.nodes)
+    if n == 0 { return [] }
+
+    // Descend from top layer using ef=1
+    let mut cur_ep = [index.entry_point]
+    let mut lvl = index.max_level
+    while lvl > 0 {
+        let r = hnsw_search_layer(index, query, cur_ep, lvl, 1)
+        if len(r) > 0 {
+            cur_ep = [r[0][0]]
+        }
+        lvl = lvl - 1
+    }
+
+    // Beam search at layer 0 with efSearch
+    let mut ef = index.efSearch
+    if ef < top_k { ef = top_k }
+    let W = hnsw_search_layer(index, query, cur_ep, 0, ef)
+
+    // Return top_k [id, dist]
+    let kept = hnsw_cand_trunc(W, top_k)
+    let m = len(kept)
+    let mut out = []
+    let mut i = 0
+    while i < m {
+        let ni = kept[i][0]
+        out = out + [[index.ids[ni], kept[i][1]]]
+        i = i + 1
+    }
+    return out
+}
+
+// ── Recall evaluation vs. brute-force ground truth ────────────────
+//
+//  For each query, compute ground-truth top_k by brute force, then
+//  check how many of HNSW's top_k ids intersect. recall = overlap / k.
+// ───────────────────────────────────────────────────────────────────
+
+fn hnsw_brute_topk(index, query, top_k) {
+    let n = len(index.nodes)
+    if n == 0 { return [] }
+    let mut cands = []
+    let mut i = 0
+    while i < n {
+        let d = hnsw_dist(index, query, index.nodes[i])
+        cands = hnsw_cand_insert(cands, i, d)
+        i = i + 1
+    }
+    let keep = hnsw_cand_trunc(cands, top_k)
+    let m = len(keep)
+    let mut out = []
+    let mut j = 0
+    while j < m {
+        let ni = keep[j][0]
+        out = out + [index.ids[ni]]
+        j = j + 1
+    }
+    return out
+}
+
+fn hnsw_ids_overlap(gt_ids, result_pairs) {
+    let g = len(gt_ids)
+    let r = len(result_pairs)
+    let mut hit = 0
+    let mut i = 0
+    while i < g {
+        let mut j = 0
+        let mut found = false
+        while j < r {
+            if result_pairs[j][0] == gt_ids[i] { found = true }
+            j = j + 1
+        }
+        if found { hit = hit + 1 }
+        i = i + 1
+    }
+    return hit
+}
+
+fn hnsw_recall(index, queries, top_k) {
+    let q = len(queries)
+    if q == 0 { return 1.0 }
+    let mut total_hits = 0
+    let mut total_ref = 0
+    let mut i = 0
+    while i < q {
+        let query = queries[i]
+        let gt = hnsw_brute_topk(index, query, top_k)
+        let got = hnsw_search(index, query, top_k)
+        total_hits = total_hits + hnsw_ids_overlap(gt, got)
+        total_ref = total_ref + len(gt)
+        i = i + 1
+    }
+    if total_ref == 0 { return 1.0 }
+    return to_float(total_hits) / to_float(total_ref)
+}

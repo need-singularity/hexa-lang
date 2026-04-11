@@ -1,0 +1,538 @@
+// ═══════════════════════════════════════════════════════════════
+//  zero_optimizer.hexa — DeepSpeed ZeRO-1/2/3 optimizer state sharding
+//
+//  Pure .hexa CPU simulation of the ZeRO family. Models N ranks as
+//  parallel arrays inside a single process so the behaviour of
+//  optimizer-state sharding, gradient sharding and parameter sharding
+//  can be unit-tested without an actual collective backend.
+//
+//  Stage breakdown (DeepSpeed terminology):
+//    ZeRO-1: optimizer state  (Adam m, v) shard across N ranks
+//    ZeRO-2: + gradient shard  (reduce-scatter, each rank owns a slice)
+//    ZeRO-3: + parameter shard (all-gather on demand, free after use)
+//
+//  Layout
+//    params  : float[P]              — full model weights (replicated at rest
+//                                       for ZeRO-1/2, sharded for ZeRO-3)
+//    grads   : float[P]              — dense gradients before scatter
+//    rank r owns slice  [shard_begin(P,N,r) .. shard_end(P,N,r))
+//
+//  Algorithmic shape is verbatim DeepSpeed/Adam with the extra bookkeeping
+//  for the shard boundaries; the single-rank Adam step is cross-checked
+//  against the sharded version in `self/test_zero_optimizer.hexa`.
+// ═══════════════════════════════════════════════════════════════
+
+// ── Adam hyperparameters ─────────────────────────────────────
+let ZO_BETA1 = 0.9
+let ZO_BETA2 = 0.999
+let ZO_EPS   = 1.0e-8
+
+// ── ZeRO stage constants ─────────────────────────────────────
+let ZERO_STAGE_1 = 1
+let ZERO_STAGE_2 = 2
+let ZERO_STAGE_3 = 3
+
+// ── ZeroContext: one process-local model of N "ranks" ───────────
+//
+//   num_ranks    : world size
+//   param_size   : P, number of parameters in the flat model
+//   stage        : 1 | 2 | 3
+//   params       : full param vector (for stage 1/2 each rank stores a copy,
+//                  for stage 3 only a shard is persistent — held in
+//                  param_shards)
+//   grads        : dense gradient buffer before reduce-scatter
+//   m_shards     : array of N shards (float arrays) — first Adam moment
+//   v_shards     : array of N shards (float arrays) — second Adam moment
+//   grad_shards  : array of N shards — set after reduce-scatter for ZeRO-2/3
+//   param_shards : array of N shards — persistent storage for ZeRO-3
+//   t            : Adam step counter (1-indexed)
+struct ZeroContext {
+    num_ranks: int,
+    param_size: int,
+    stage: int,
+    params: array,
+    grads: array,
+    m_shards: array,
+    v_shards: array,
+    grad_shards: array,
+    param_shards: array,
+    t: int
+}
+
+// ── Shard boundary helpers (identical to DeepSpeed's partitioner) ──
+
+fn zo_shard_begin(total, num_ranks, rank) {
+    (total * rank) / num_ranks
+}
+
+fn zo_shard_end(total, num_ranks, rank) {
+    (total * (rank + 1)) / num_ranks
+}
+
+fn zo_shard_size(total, num_ranks, rank) {
+    zo_shard_end(total, num_ranks, rank) - zo_shard_begin(total, num_ranks, rank)
+}
+
+// ── Low-level array helpers ────────────────────────────────────
+
+fn zo_zeros(n) {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [0.0]
+        i = i + 1
+    }
+    out
+}
+
+fn zo_copy(src) {
+    let n = len(src)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [src[i]]
+        i = i + 1
+    }
+    out
+}
+
+fn zo_slice(src, begin, end) {
+    let mut out = []
+    let mut i = begin
+    while i < end {
+        out = out + [src[i]]
+        i = i + 1
+    }
+    out
+}
+
+fn zo_scatter(src, num_ranks) {
+    let total = len(src)
+    let mut out = []
+    let mut r = 0
+    while r < num_ranks {
+        let b = zo_shard_begin(total, num_ranks, r)
+        let e = zo_shard_end(total, num_ranks, r)
+        out = out + [zo_slice(src, b, e)]
+        r = r + 1
+    }
+    out
+}
+
+// Concatenate shards back into a single flat array. The shards must
+// be contiguous — identical layout as DeepSpeed's parameter groups.
+fn zo_gather(shards) {
+    let num_ranks = len(shards)
+    let mut out = []
+    let mut r = 0
+    while r < num_ranks {
+        let shard = shards[r]
+        let sz = len(shard)
+        let mut i = 0
+        while i < sz {
+            out = out + [shard[i]]
+            i = i + 1
+        }
+        r = r + 1
+    }
+    out
+}
+
+// zo_pow_pos: positive-integer power (avoids FP pow import ambiguity)
+fn zo_pow_pos(base, e) {
+    let mut out = 1.0
+    let mut k = 0
+    while k < e {
+        out = out * base
+        k = k + 1
+    }
+    out
+}
+
+// Newton sqrt (few iterations is enough for unit tests).
+fn zo_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut y = x
+    let mut i = 0
+    while i < 20 {
+        y = 0.5 * (y + x / y)
+        i = i + 1
+    }
+    y
+}
+
+// ── Collective simulations (single-process, parallel-array model) ──
+
+// all_gather: given N shards, build the contiguous full tensor.
+// Every rank ends up with the same array (modelled by returning one).
+fn zo_all_gather(shards) {
+    zo_gather(shards)
+}
+
+// reduce_scatter: sum the rank-local "grads" copies (all-reduce phase)
+// and then return a list of N shards where shard r holds the piece owned
+// by rank r. This matches DeepSpeed's Stage 2 gradient partitioning.
+//
+//   grads_per_rank : array of N dense gradient arrays (len = P each)
+//   returns        : array of N shards (one per rank)
+fn zo_reduce_scatter(grads_per_rank, num_ranks) {
+    let p = len(grads_per_rank[0])
+    // 1) sum across ranks (all-reduce in-place conceptually)
+    let mut summed = zo_zeros(p)
+    let mut r = 0
+    while r < num_ranks {
+        let g = grads_per_rank[r]
+        let mut i = 0
+        while i < p {
+            summed[i] = summed[i] + g[i]
+            i = i + 1
+        }
+        r = r + 1
+    }
+    // 2) scatter: rank r keeps the slice [begin(r) .. end(r))
+    zo_scatter(summed, num_ranks)
+}
+
+// ── Context construction ───────────────────────────────────────
+
+fn zo_create(num_ranks, init_params, stage) {
+    let p = len(init_params)
+
+    // Sharded Adam moments — one shard per rank of size
+    // zo_shard_size(p, num_ranks, r). ZeRO-1/2/3 all share this layout.
+    let mut m_shards = []
+    let mut v_shards = []
+    let mut r = 0
+    while r < num_ranks {
+        let sz = zo_shard_size(p, num_ranks, r)
+        m_shards = m_shards + [zo_zeros(sz)]
+        v_shards = v_shards + [zo_zeros(sz)]
+        r = r + 1
+    }
+
+    // Parameter storage. For ZeRO-3 each rank only keeps a shard; the
+    // "full" params array is rebuilt transiently via zo_all_gather.
+    let params_copy = zo_copy(init_params)
+    let param_shards = zo_scatter(init_params, num_ranks)
+
+    // grad_shards starts empty; they are populated by
+    // zo_reduce_scatter during zo_step.
+    let empty_grad_shards = []
+
+    ZeroContext {
+        num_ranks: num_ranks,
+        param_size: p,
+        stage: stage,
+        params: params_copy,
+        grads: zo_zeros(p),
+        m_shards: m_shards,
+        v_shards: v_shards,
+        grad_shards: empty_grad_shards,
+        param_shards: param_shards,
+        t: 0
+    }
+}
+
+// ── Set dense gradients (typical after backward) ───────────────
+fn zo_set_grads(ctx, grads) {
+    ZeroContext {
+        num_ranks: ctx.num_ranks,
+        param_size: ctx.param_size,
+        stage: ctx.stage,
+        params: ctx.params,
+        grads: zo_copy(grads),
+        m_shards: ctx.m_shards,
+        v_shards: ctx.v_shards,
+        grad_shards: ctx.grad_shards,
+        param_shards: ctx.param_shards,
+        t: ctx.t
+    }
+}
+
+// ── Per-shard Adam update ──────────────────────────────────────
+//
+// Computes the sharded Adam update for a single rank.
+//
+//   param_slice : the rank's parameter slice (will NOT be mutated —
+//                 a new array is returned because hexa passes arrays
+//                 by value across function boundaries)
+//   grad_slice  : gradient slice for this shard
+//   m_in, v_in  : shard-local Adam moments (will be updated)
+//   lr, t       : learning rate + bias-correction step count (>=1)
+//
+// Returns: [updated_param_slice, updated_m, updated_v]
+fn zo_adam_update_shard(param_slice, grad_slice, m_in, v_in, lr, t) {
+    let sz = len(grad_slice)
+    let mut p = zo_copy(param_slice)
+    let mut m = zo_copy(m_in)
+    let mut v = zo_copy(v_in)
+
+    let b1 = ZO_BETA1
+    let b2 = ZO_BETA2
+    let eps = ZO_EPS
+    let bc1 = 1.0 - zo_pow_pos(b1, t)
+    let bc2 = 1.0 - zo_pow_pos(b2, t)
+
+    let mut i = 0
+    while i < sz {
+        let g = grad_slice[i]
+        let mnew = b1 * m[i] + (1.0 - b1) * g
+        let vnew = b2 * v[i] + (1.0 - b2) * g * g
+        m[i] = mnew
+        v[i] = vnew
+        let m_hat = mnew / bc1
+        let v_hat = vnew / bc2
+        let step = lr * m_hat / (zo_sqrt(v_hat) + eps)
+        p[i] = p[i] - step
+        i = i + 1
+    }
+    [p, m, v]
+}
+
+// ── ZeRO-1: optimizer state sharded, params replicated ─────────
+//
+// Each rank owns a slice of Adam (m,v) and updates that slice of the
+// shared parameter vector. After all ranks finish the parameter vector
+// is byte-identical to single-rank Adam.
+fn zo_step_zero1(ctx, lr) {
+    let n = ctx.num_ranks
+    let p = ctx.param_size
+    let tnew = ctx.t + 1
+    let mut new_param_shards = []
+    let mut new_m = []
+    let mut new_v = []
+    let mut r = 0
+    while r < n {
+        let sb = zo_shard_begin(p, n, r)
+        let se = zo_shard_end(p, n, r)
+        let g_slice = zo_slice(ctx.grads, sb, se)
+        let p_slice = zo_slice(ctx.params, sb, se)
+        let res = zo_adam_update_shard(p_slice, g_slice,
+            ctx.m_shards[r], ctx.v_shards[r], lr, tnew)
+        new_param_shards = new_param_shards + [res[0]]
+        new_m = new_m + [res[1]]
+        new_v = new_v + [res[2]]
+        r = r + 1
+    }
+    let new_params = zo_gather(new_param_shards)
+    ZeroContext {
+        num_ranks: ctx.num_ranks,
+        param_size: ctx.param_size,
+        stage: ctx.stage,
+        params: new_params,
+        grads: zo_zeros(p),
+        m_shards: new_m,
+        v_shards: new_v,
+        grad_shards: ctx.grad_shards,
+        param_shards: new_param_shards,
+        t: tnew
+    }
+}
+
+// ── ZeRO-2: ZeRO-1 + gradient sharding (reduce-scatter) ────────
+//
+// We model "per-rank local grads" by replicating ctx.grads (single-source
+// gradient) across ranks, reduce-scatter them, and feed the resulting
+// shards into the Adam update. The numerical result is identical to
+// ZeRO-1 (sum of identical copies is N * grads, then each rank divides
+// by N through the caller-provided grads being the already-averaged
+// batch gradient).
+fn zo_step_zero2(ctx, lr) {
+    let n = ctx.num_ranks
+    let p = ctx.param_size
+    let tnew = ctx.t + 1
+
+    // Build per-rank grad copies (already-averaged global grad replicated)
+    let mut per_rank_grads = []
+    let mut r = 0
+    while r < n {
+        per_rank_grads = per_rank_grads + [zo_copy(ctx.grads)]
+        r = r + 1
+    }
+    // reduce-scatter divides summed gradient by num_ranks so that the
+    // outcome equals single-rank Adam (which uses ctx.grads as-is).
+    let scatter_in_shards = zo_reduce_scatter(per_rank_grads, n)
+    let mut g_shards = []
+    r = 0
+    while r < n {
+        let sh = scatter_in_shards[r]
+        let sz = len(sh)
+        let mut scaled = []
+        let mut i = 0
+        while i < sz {
+            scaled = scaled + [sh[i] / (n * 1.0)]
+            i = i + 1
+        }
+        g_shards = g_shards + [scaled]
+        r = r + 1
+    }
+
+    // Adam update per shard
+    let mut new_param_shards = []
+    let mut new_m = []
+    let mut new_v = []
+    r = 0
+    while r < n {
+        let sb = zo_shard_begin(p, n, r)
+        let se = zo_shard_end(p, n, r)
+        let p_slice = zo_slice(ctx.params, sb, se)
+        let res = zo_adam_update_shard(p_slice, g_shards[r],
+            ctx.m_shards[r], ctx.v_shards[r], lr, tnew)
+        new_param_shards = new_param_shards + [res[0]]
+        new_m = new_m + [res[1]]
+        new_v = new_v + [res[2]]
+        r = r + 1
+    }
+    let new_params = zo_gather(new_param_shards)
+    ZeroContext {
+        num_ranks: ctx.num_ranks,
+        param_size: ctx.param_size,
+        stage: ctx.stage,
+        params: new_params,
+        grads: zo_zeros(p),
+        m_shards: new_m,
+        v_shards: new_v,
+        grad_shards: g_shards,
+        param_shards: new_param_shards,
+        t: tnew
+    }
+}
+
+// ── ZeRO-3: ZeRO-2 + parameter sharding ─────────────────────────
+//
+// Persistent storage is a list of N param shards. Before the optimizer
+// step we all-gather them to produce the full params vector (this is
+// the forward/backward pattern; we model it here as a transient build).
+// After the update we rescatter and drop the full copy (ctx.params is
+// cleared to a zero vector to model "freed memory").
+fn zo_step_zero3(ctx, lr) {
+    let n = ctx.num_ranks
+    let p = ctx.param_size
+    let tnew = ctx.t + 1
+
+    // reduce-scatter grads (same as ZeRO-2)
+    let mut per_rank_grads = []
+    let mut r = 0
+    while r < n {
+        per_rank_grads = per_rank_grads + [zo_copy(ctx.grads)]
+        r = r + 1
+    }
+    let scatter_in_shards = zo_reduce_scatter(per_rank_grads, n)
+    let mut g_shards = []
+    r = 0
+    while r < n {
+        let sh = scatter_in_shards[r]
+        let sz = len(sh)
+        let mut scaled = []
+        let mut i = 0
+        while i < sz {
+            scaled = scaled + [sh[i] / (n * 1.0)]
+            i = i + 1
+        }
+        g_shards = g_shards + [scaled]
+        r = r + 1
+    }
+
+    // Adam update per shard — the persistent parameter shards are the
+    // only param storage we hold, so we feed them in directly.
+    let mut new_param_shards = []
+    let mut new_m = []
+    let mut new_v = []
+    r = 0
+    while r < n {
+        let res = zo_adam_update_shard(ctx.param_shards[r], g_shards[r],
+            ctx.m_shards[r], ctx.v_shards[r], lr, tnew)
+        new_param_shards = new_param_shards + [res[0]]
+        new_m = new_m + [res[1]]
+        new_v = new_v + [res[2]]
+        r = r + 1
+    }
+
+    ZeroContext {
+        num_ranks: ctx.num_ranks,
+        param_size: ctx.param_size,
+        stage: ctx.stage,
+        params: zo_zeros(p),
+        grads: zo_zeros(p),
+        m_shards: new_m,
+        v_shards: new_v,
+        grad_shards: g_shards,
+        param_shards: new_param_shards,
+        t: tnew
+    }
+}
+
+// Top-level dispatch
+fn zo_step(ctx, lr) {
+    if ctx.stage == ZERO_STAGE_1 { return zo_step_zero1(ctx, lr) }
+    if ctx.stage == ZERO_STAGE_2 { return zo_step_zero2(ctx, lr) }
+    if ctx.stage == ZERO_STAGE_3 { return zo_step_zero3(ctx, lr) }
+    zo_step_zero1(ctx, lr)
+}
+
+// For ZeRO-3 users: materialize the full params vector for the next
+// forward pass. (In real DeepSpeed this would be a collective that
+// temporarily allocates memory.)
+fn zo_materialize_params(ctx) {
+    zo_all_gather(ctx.param_shards)
+}
+
+// ── Memory accounting ─────────────────────────────────────────
+//
+// zo_memory_per_rank(ctx, rank) : element count held by `rank`, expressed
+// in model parameter units (floats). Mirrors DeepSpeed's paper:
+//
+//   baseline  : 4 * P  (params + grads + m + v)
+//   ZeRO-1    : 2 * P + 2 * P/N      (m,v sharded)
+//   ZeRO-2    : 1 * P + 1 * P/N + 2 * P/N
+//   ZeRO-3    : 4 * P/N              (everything sharded)
+//
+// We measure actual byte-equivalent costs from the context so the
+// assertions in the test suite can verify the ratio.
+fn zo_memory_per_rank(ctx, rank) {
+    let n = ctx.num_ranks
+    let p = ctx.param_size
+    let shard_sz = zo_shard_size(p, n, rank)
+    let m = len(ctx.m_shards[rank])
+    let v = len(ctx.v_shards[rank])
+
+    if ctx.stage == ZERO_STAGE_1 {
+        // params (full) + grads (full) + m shard + v shard
+        return p + p + m + v
+    }
+    if ctx.stage == ZERO_STAGE_2 {
+        // params (full) + grad shard + m shard + v shard
+        return p + shard_sz + m + v
+    }
+    if ctx.stage == ZERO_STAGE_3 {
+        // param shard + grad shard + m shard + v shard
+        return shard_sz + shard_sz + m + v
+    }
+    // Baseline Adam replica (ZeRO-0)
+    p + p + p + p
+}
+
+// zo_memory_baseline(ctx) : what a single replica would store without
+// ZeRO (params + grads + Adam m + v = 4P).
+fn zo_memory_baseline(ctx) {
+    let p = ctx.param_size
+    p + p + p + p
+}
+
+// Memory savings vs baseline for a given rank.
+fn zo_memory_savings_ratio(ctx, rank) {
+    let base = zo_memory_baseline(ctx)
+    let cur = zo_memory_per_rank(ctx, rank)
+    if cur <= 0 { return 0.0 }
+    (base * 1.0) / (cur * 1.0)
+}
+
+// ── Diagnostics ────────────────────────────────────────────────
+fn zo_summary(ctx) {
+    println("[zero] stage=" + str(ctx.stage)
+        + " num_ranks=" + str(ctx.num_ranks)
+        + " P=" + str(ctx.param_size)
+        + " t=" + str(ctx.t))
+}
+
+println("[zero_optimizer] loaded — ZeRO-1/2/3 sharding (CPU simulation)")

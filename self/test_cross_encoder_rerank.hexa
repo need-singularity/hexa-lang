@@ -1,0 +1,526 @@
+// ===================================================================
+//  test_cross_encoder_rerank.hexa — Cross-Encoder Reranker verification
+//
+//  SSOT: shared/hexa-lang/ml-next-level.json id=60
+//
+//  Tests:
+//    T1  create_reranker shape: embeddings/W/score_head dims correct
+//    T2  pair_encode output dim == model.dim
+//    T3  pair_encode deterministic (same input → same output)
+//    T4  score_pair returns finite float
+//    T5  score_batch length == docs length
+//    T6  rerank top_k length ≤ top_k
+//    T7  rerank output is sorted desc by score
+//    T8  rerank_topk_reorder preserves doc strings
+//    T9  batch_inference shape: [n_queries][n_docs_i]
+//   T10  eval_ndcg_at_k perfect ranking = 1.0
+//   T11  eval_ndcg_at_k reversed ranking < 1.0
+//   T12  eval_mrr of first-relevant-at-1 = 1.0
+//   T13  eval_mrr of no-relevant = 0.0
+//   T14  eval_rerank returns (ndcg, mrr) tuple with sane values
+//
+//  실행: ./hexa self/test_cross_encoder_rerank.hexa
+//
+//  Implementation is inlined from self/ml/cross_encoder_rerank.hexa
+//  (same convention as test_embedding_finetune.hexa — module is SSOT,
+//  test file re-expresses the functions for hexa interpreter which
+//  resolves `use self::ml::*` relative to the running file's dir).
+// ===================================================================
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+fn is_finite(x) {
+    // NaN != NaN, and ±inf overflow sentinel ≈ large
+    if x != x { return false }
+    if fabs(x) > 1.0e30 { return false }
+    return true
+}
+
+// ═══════════ INLINED: cross_encoder_rerank module ══════════════
+
+fn rr_vec_zeros(dim) {
+    let mut out = []
+    let mut i = 0
+    while i < dim { out = out + [0.0]; i = i + 1 }
+    return out
+}
+
+fn rr_vec_add(a, b) {
+    let n = len(a)
+    let mut out = []
+    let mut i = 0
+    while i < n { out = out + [a[i] + b[i]]; i = i + 1 }
+    return out
+}
+
+fn rr_vec_scale(v, s) {
+    let n = len(v)
+    let mut out = []
+    let mut i = 0
+    while i < n { out = out + [v[i] * s]; i = i + 1 }
+    return out
+}
+
+fn rr_dot(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    let mut i = 0
+    while i < n { s = s + a[i] * b[i]; i = i + 1 }
+    return s
+}
+
+fn rr_act(x) {
+    let mut ax = x
+    if ax < 0.0 { ax = 0.0 - ax }
+    return x / (1.0 + ax)
+}
+
+struct CrossEncoderModel {
+    dim: int,
+    vocab_size: int,
+    embeddings: array,
+    W: array,
+    bias_h: array,
+    score_head: array,
+    score_bias: float
+}
+
+fn create_reranker(vocab_size, dim) {
+    let mut embeddings = []
+    let mut t = 0
+    while t < vocab_size {
+        let mut v = []
+        let mut d = 0
+        while d < dim {
+            let val = sin(to_float(t * 131 + d * 29 + 11))
+            v = v + [val * 0.1]
+            d = d + 1
+        }
+        embeddings = embeddings + [v]
+        t = t + 1
+    }
+    let mut W = []
+    let mut i = 0
+    while i < dim {
+        let mut row = []
+        let mut j = 0
+        while j < dim {
+            let diag = if i == j { 1.0 } else { 0.0 }
+            let pert = sin(to_float(i * 97 + j * 41 + 5)) * 0.02
+            row = row + [diag + pert]
+            j = j + 1
+        }
+        W = W + [row]
+        i = i + 1
+    }
+    let bias_h = rr_vec_zeros(dim)
+    let mut score_head = []
+    let mut k = 0
+    while k < dim {
+        let w = sin(to_float(k * 53 + 19)) * 0.5
+        score_head = score_head + [w]
+        k = k + 1
+    }
+    return CrossEncoderModel {
+        dim: dim,
+        vocab_size: vocab_size,
+        embeddings: embeddings,
+        W: W,
+        bias_h: bias_h,
+        score_head: score_head,
+        score_bias: 0.0
+    }
+}
+
+fn rr_byte_tokenize(text) {
+    let mut tokens = []
+    let n = len(text)
+    let mut i = 0
+    while i < n {
+        let ch = char_code(text, i)
+        tokens = tokens + [ch + 3]
+        i = i + 1
+    }
+    return tokens
+}
+
+fn rr_get_emb(model, token_id) {
+    let vs = model.vocab_size
+    if token_id >= 0 {
+        if token_id < vs { return model.embeddings[token_id] }
+    }
+    return rr_vec_zeros(model.dim)
+}
+
+fn pair_encode(model, query, doc) {
+    let dim = model.dim
+    let joined = query + " [SEP] " + doc
+    let tokens = rr_byte_tokenize(joined)
+    let n = len(tokens)
+    if n == 0 { return rr_vec_zeros(dim) }
+    let mut pooled = rr_vec_zeros(dim)
+    let mut i = 0
+    while i < n {
+        let emb = rr_get_emb(model, tokens[i])
+        pooled = rr_vec_add(pooled, emb)
+        i = i + 1
+    }
+    let inv_n = 1.0 / to_float(n)
+    pooled = rr_vec_scale(pooled, inv_n)
+    let mut h = []
+    let mut r = 0
+    while r < dim {
+        let mut s = model.bias_h[r]
+        let mut c = 0
+        while c < dim {
+            s = s + model.W[r][c] * pooled[c]
+            c = c + 1
+        }
+        h = h + [rr_act(s)]
+        r = r + 1
+    }
+    return h
+}
+
+fn score_pair(model, query, doc) {
+    let h = pair_encode(model, query, doc)
+    return rr_dot(model.score_head, h) + model.score_bias
+}
+
+fn score_batch(model, query, docs) {
+    let n = len(docs)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [score_pair(model, query, docs[i])]
+        i = i + 1
+    }
+    return out
+}
+
+fn batch_inference(model, queries, docs_list) {
+    let n = len(queries)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [score_batch(model, queries[i], docs_list[i])]
+        i = i + 1
+    }
+    return out
+}
+
+fn rerank(model, query, docs, top_k) {
+    let n = len(docs)
+    let scores = score_batch(model, query, docs)
+    let mut used = []
+    let mut i = 0
+    while i < n { used = used + [false]; i = i + 1 }
+    let mut limit = top_k
+    if limit > n { limit = n }
+    let mut out = []
+    let mut r = 0
+    while r < limit {
+        let mut best = -1
+        let mut best_v = 0.0 - 1.0e30
+        let mut j = 0
+        while j < n {
+            if !used[j] {
+                if scores[j] > best_v { best_v = scores[j]; best = j }
+            }
+            j = j + 1
+        }
+        if best >= 0 {
+            let mut used2 = []
+            let mut k = 0
+            while k < n {
+                if k == best { used2 = used2 + [true] } else { used2 = used2 + [used[k]] }
+                k = k + 1
+            }
+            used = used2
+            out = out + [(best, best_v)]
+        }
+        r = r + 1
+    }
+    return out
+}
+
+fn rerank_topk_reorder(model, query, docs, top_k) {
+    let ranked = rerank(model, query, docs, top_k)
+    let m = len(ranked)
+    let mut out = []
+    let mut i = 0
+    while i < m {
+        let pair = ranked[i]
+        let idx = pair.0
+        out = out + [docs[idx]]
+        i = i + 1
+    }
+    return out
+}
+
+fn rr_log2(x) { return log(x) / log(2.0) }
+
+fn rr_dcg_at_k(rels_sorted, k) {
+    let n = len(rels_sorted)
+    let mut lim = k
+    if lim > n { lim = n }
+    let mut dcg = 0.0
+    let mut i = 0
+    while i < lim {
+        let rel = rels_sorted[i]
+        let num = pow(2.0, rel) - 1.0
+        let den = rr_log2(to_float(i + 2))
+        dcg = dcg + num / den
+        i = i + 1
+    }
+    return dcg
+}
+
+fn rr_idcg_at_k(rels, k) {
+    let n = len(rels)
+    let mut remaining = []
+    let mut i = 0
+    while i < n { remaining = remaining + [rels[i]]; i = i + 1 }
+    let mut sorted_desc = []
+    let mut r = 0
+    while r < n {
+        let mut best = -1
+        let mut best_v = 0.0 - 1.0e30
+        let mut j = 0
+        while j < n {
+            if remaining[j] > best_v { best_v = remaining[j]; best = j }
+            j = j + 1
+        }
+        if best >= 0 {
+            let mut rem2 = []
+            let mut k2 = 0
+            while k2 < n {
+                if k2 == best { rem2 = rem2 + [0.0 - 1.0e30] } else { rem2 = rem2 + [remaining[k2]] }
+                k2 = k2 + 1
+            }
+            remaining = rem2
+            sorted_desc = sorted_desc + [best_v]
+        }
+        r = r + 1
+    }
+    return rr_dcg_at_k(sorted_desc, k)
+}
+
+fn eval_ndcg_at_k(scores, rels, k) {
+    let n = len(scores)
+    let mut used = []
+    let mut i = 0
+    while i < n { used = used + [false]; i = i + 1 }
+    let mut rels_in_order = []
+    let mut r = 0
+    while r < n {
+        let mut best = -1
+        let mut best_v = 0.0 - 1.0e30
+        let mut j = 0
+        while j < n {
+            if !used[j] {
+                if scores[j] > best_v { best_v = scores[j]; best = j }
+            }
+            j = j + 1
+        }
+        if best >= 0 {
+            let mut used2 = []
+            let mut kk = 0
+            while kk < n {
+                if kk == best { used2 = used2 + [true] } else { used2 = used2 + [used[kk]] }
+                kk = kk + 1
+            }
+            used = used2
+            rels_in_order = rels_in_order + [rels[best]]
+        }
+        r = r + 1
+    }
+    let dcg = rr_dcg_at_k(rels_in_order, k)
+    let idcg = rr_idcg_at_k(rels, k)
+    if idcg < 1.0e-12 { return 0.0 }
+    return dcg / idcg
+}
+
+fn eval_mrr(scores, rels) {
+    let n = len(scores)
+    let mut used = []
+    let mut i = 0
+    while i < n { used = used + [false]; i = i + 1 }
+    let mut rank = 1
+    let mut r = 0
+    while r < n {
+        let mut best = -1
+        let mut best_v = 0.0 - 1.0e30
+        let mut j = 0
+        while j < n {
+            if !used[j] {
+                if scores[j] > best_v { best_v = scores[j]; best = j }
+            }
+            j = j + 1
+        }
+        if best >= 0 {
+            if rels[best] > 0.0 { return 1.0 / to_float(rank) }
+            let mut used2 = []
+            let mut kk = 0
+            while kk < n {
+                if kk == best { used2 = used2 + [true] } else { used2 = used2 + [used[kk]] }
+                kk = kk + 1
+            }
+            used = used2
+            rank = rank + 1
+        }
+        r = r + 1
+    }
+    return 0.0
+}
+
+fn eval_rerank(model, query, docs, rels, k) {
+    let scores = score_batch(model, query, docs)
+    let ndcg = eval_ndcg_at_k(scores, rels, k)
+    let mrr = eval_mrr(scores, rels)
+    return (ndcg, mrr)
+}
+
+// ═══════════ TEST FIXTURE ═════════════════════════════════════
+
+let vocab_size = 320   // covers byte range + [SEP] offsets
+let dim = 6
+let model = create_reranker(vocab_size, dim)
+
+let query = "ai native compiler"
+let docs = [
+    "ai native compiler breakthrough",   // 0 — most relevant
+    "machine learning training loop",    // 1 — partially relevant
+    "cooking rice with salt",            // 2 — irrelevant
+    "pure hexa reranker module",         // 3 — topical
+    "weather forecast tomorrow"          // 4 — irrelevant
+]
+// Ground-truth graded relevance: 3=perfect, 2=high, 1=low, 0=none
+let rels = [3.0, 1.0, 0.0, 2.0, 0.0]
+
+// ── T1: model shape ─────────────────────────────────────────
+check("model.dim = 6", model.dim == 6)
+check("model.vocab_size = 320", model.vocab_size == vocab_size)
+check("embeddings rows = vocab_size", len(model.embeddings) == vocab_size)
+check("embeddings col = dim", len(model.embeddings[0]) == dim)
+check("W rows = dim", len(model.W) == dim)
+check("W cols = dim", len(model.W[0]) == dim)
+check("score_head len = dim", len(model.score_head) == dim)
+
+// ── T2: pair_encode dim ─────────────────────────────────────
+let h = pair_encode(model, query, docs[0])
+check("pair_encode hidden dim == model.dim", len(h) == dim)
+
+// ── T3: deterministic encoding ──────────────────────────────
+let h1 = pair_encode(model, query, docs[1])
+let h2 = pair_encode(model, query, docs[1])
+let mut same = true
+let mut di = 0
+while di < dim {
+    if !approx(h1[di], h2[di], 1.0e-12) { same = false }
+    di = di + 1
+}
+check("pair_encode deterministic", same)
+
+// ── T4: score_pair finite ───────────────────────────────────
+let s0 = score_pair(model, query, docs[0])
+check("score_pair returns finite", is_finite(s0))
+
+// ── T5: score_batch length ──────────────────────────────────
+let scores = score_batch(model, query, docs)
+check("score_batch length == docs length", len(scores) == len(docs))
+
+// ── T6: rerank length ≤ top_k ───────────────────────────────
+let top3 = rerank(model, query, docs, 3)
+check("rerank top_k=3 length == 3", len(top3) == 3)
+let topBig = rerank(model, query, docs, 99)
+check("rerank top_k>n clamps to n", len(topBig) == len(docs))
+
+// ── T7: rerank result sorted desc ───────────────────────────
+let mut sorted_ok = true
+let mut i = 1
+while i < len(top3) {
+    let prev = top3[i - 1].1
+    let cur = top3[i].1
+    if cur > prev { sorted_ok = false }
+    i = i + 1
+}
+check("rerank output sorted desc by score", sorted_ok)
+
+// ── T8: rerank_topk_reorder preserves doc strings ───────────
+let reordered = rerank_topk_reorder(model, query, docs, 3)
+let mut in_set = true
+let mut ri = 0
+while ri < len(reordered) {
+    let d = reordered[ri]
+    let mut found = false
+    let mut oj = 0
+    while oj < len(docs) {
+        if docs[oj] == d { found = true }
+        oj = oj + 1
+    }
+    if !found { in_set = false }
+    ri = ri + 1
+}
+check("rerank_topk_reorder docs subset of input", in_set)
+check("rerank_topk_reorder length == 3", len(reordered) == 3)
+
+// ── T9: batch_inference shape ───────────────────────────────
+let queries = ["ai native", "hexa reranker"]
+let docs_list = [docs, docs]
+let batched = batch_inference(model, queries, docs_list)
+check("batch_inference outer len == queries len", len(batched) == len(queries))
+check("batch_inference[0] len == docs len", len(batched[0]) == len(docs))
+
+// ── T10: nDCG@k = 1 for ideal ranking ───────────────────────
+// Synthetic: scores == rels → perfect ranking
+let perfect_scores = [3.0, 1.0, 0.0, 2.0, 0.0]
+let ndcg_perfect = eval_ndcg_at_k(perfect_scores, rels, 5)
+check("nDCG@5 perfect ranking = 1.0", approx(ndcg_perfect, 1.0, 1.0e-9))
+
+// ── T11: nDCG < 1 for bad ranking ───────────────────────────
+let bad_scores = [0.0, 0.0, 3.0, 0.0, 2.0]  // swaps top docs to bottom
+let ndcg_bad = eval_ndcg_at_k(bad_scores, rels, 5)
+check("nDCG@5 bad ranking < perfect", ndcg_bad < ndcg_perfect)
+check("nDCG@5 bad ranking >= 0", ndcg_bad >= 0.0)
+
+// ── T12: MRR first-hit-at-1 = 1.0 ───────────────────────────
+let mrr_top = eval_mrr([5.0, 1.0, 0.0, 2.0, 0.0], rels)
+check("MRR first relevant at rank 1 = 1.0", approx(mrr_top, 1.0, 1.0e-9))
+
+// ── T13: MRR no-relevant = 0 ────────────────────────────────
+let mrr_zero = eval_mrr([1.0, 2.0, 3.0], [0.0, 0.0, 0.0])
+check("MRR no relevant = 0.0", approx(mrr_zero, 0.0, 1.0e-9))
+
+// ── T14: eval_rerank tuple sanity ───────────────────────────
+let ev = eval_rerank(model, query, docs, rels, 5)
+let nd = ev.0
+let mr = ev.1
+check("eval_rerank nDCG in [0,1]", nd >= 0.0 && nd <= 1.0 + 1.0e-9)
+check("eval_rerank MRR in [0,1]", mr >= 0.0 && mr <= 1.0 + 1.0e-9)
+check("eval_rerank nDCG finite", is_finite(nd))
+check("eval_rerank MRR finite", is_finite(mr))
+
+// ── 결과 ────────────────────────────────────────────────────
+println("")
+println("=== Cross-Encoder Reranker test summary ===")
+println("PASS: " + to_string(pass_count))
+println("FAIL: " + to_string(fail_count))
+if fail_count == 0 {
+    println("ALL GREEN — Cross-Encoder Reranker OK")
+}
+println(to_string(pass_count) + " passed")

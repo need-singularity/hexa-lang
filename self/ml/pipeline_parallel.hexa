@@ -1,0 +1,459 @@
+// ═══════════════════════════════════════════════════════════════
+//  pipeline_parallel.hexa — 2-stage Pipeline Parallelism (1F1B)
+//
+//  Pure-hexa implementation of PipeDream-style 1F1B micro-batch
+//  scheduling for a 2-stage model split (layers 0..L/2-1 on stage 0,
+//  layers L/2..L-1 on stage 1).
+//
+//  Key pieces:
+//    • 2-stage layer split (앞/뒤 절반)
+//    • 1F1B scheduler — steady-state 1-forward-1-backward per step
+//    • forward/backward inter-stage CPU queue (sim. of device→device)
+//    • pipeline bubble 시간 측정
+//    • gradient accumulation hook for micro-batch averaging
+//
+//  Convention: "linear" model — list of layer weights w[l] (scalars)
+//    forward:  y = x + w[0] + w[1] + ... + w[L-1]
+//    backward: dy/dx = 1.0, dy/dw[l] = 1.0  (sum of grads == 1.0 each)
+//
+//  This is a *simulation* of multi-stage pipelining. It runs on a
+//  single process, but the 1F1B schedule, bubble accounting and
+//  inter-stage queue order are identical to a real distributed run.
+//
+//  Usage:
+//    use "pipeline_parallel"
+//    let cfg = pp_init(2, 4, 8)   // 2 stages, 4 layers, 8 micro-batches
+//    let res = pp_run_1f1b(cfg, inputs, weights)
+// ═══════════════════════════════════════════════════════════════
+
+// ── Config ───────────────────────────────────────────────────────
+
+struct PPConfig {
+    num_stages: int,        // must be 2
+    num_layers: int,
+    num_micro: int,
+    stage0_begin: int,
+    stage0_end: int,
+    stage1_begin: int,
+    stage1_end: int
+}
+
+fn pp_compute_split(num_layers, num_stages) {
+    let mut bounds = []
+    let mut s = 0
+    while s < num_stages {
+        let begin = (num_layers * s) / num_stages
+        let end = (num_layers * (s + 1)) / num_stages
+        bounds = bounds + [[begin, end]]
+        s = s + 1
+    }
+    return bounds
+}
+
+fn pp_init(num_stages, num_layers, num_micro) {
+    if num_stages != 2 {
+        println("[pp] NOTE: requested num_stages=" + str(num_stages) + ", clamping to 2")
+    }
+    let stages = 2
+    let bounds = pp_compute_split(num_layers, stages)
+    let s0 = bounds[0]
+    let s1 = bounds[1]
+    return PPConfig {
+        num_stages: stages,
+        num_layers: num_layers,
+        num_micro: num_micro,
+        stage0_begin: s0[0],
+        stage0_end:   s0[1],
+        stage1_begin: s1[0],
+        stage1_end:   s1[1]
+    }
+}
+
+fn pp_stage_layers(cfg, stage_id) {
+    if stage_id == 0 {
+        return [cfg.stage0_begin, cfg.stage0_end]
+    }
+    return [cfg.stage1_begin, cfg.stage1_end]
+}
+
+// ── Stage forward (linear toy model) ────────────────────────────
+// input x (float), weights w (array of floats).
+// Each layer: y = y + w[l]. We split layers by [begin,end).
+
+fn pp_stage_forward(x, weights, layer_begin, layer_end) {
+    let mut y = x
+    let mut l = layer_begin
+    while l < layer_end {
+        y = y + weights[l]
+        l = l + 1
+    }
+    return y
+}
+
+// Single-model reference (no pipelining)
+fn pp_single_forward(x, weights) {
+    let L = len(weights)
+    return pp_stage_forward(x, weights, 0, L)
+}
+
+// Stage backward: dL/dinput == dL/doutput  (identity in our toy model)
+// Returns [input_grad, weight_grads_for_this_stage]
+fn pp_stage_backward(output_grad, layer_begin, layer_end) {
+    let mut w_grads = []
+    let mut l = layer_begin
+    while l < layer_end {
+        w_grads = w_grads + [output_grad]
+        l = l + 1
+    }
+    return [output_grad, w_grads]
+}
+
+// ── Inter-stage CPU queue ───────────────────────────────────────
+// Simulates the send/recv buffer between stage 0 and stage 1 for
+// both forward activations and backward gradients.
+//
+// Each queue entry is [micro_id, payload]. FIFO semantics.
+
+struct PPQueue {
+    entries: array
+}
+
+fn ppq_new() {
+    return PPQueue { entries: [] }
+}
+
+fn ppq_push(q, micro_id, payload) {
+    let new_entries = q.entries + [[micro_id, payload]]
+    return PPQueue { entries: new_entries }
+}
+
+fn ppq_len(q) {
+    return len(q.entries)
+}
+
+fn ppq_pop(q) {
+    // returns [entry, new_queue]; entry = [micro_id, payload]
+    let n = len(q.entries)
+    if n == 0 {
+        return [[-1, 0.0], q]
+    }
+    let head = q.entries[0]
+    let mut rest = []
+    let mut i = 1
+    while i < n {
+        rest = rest + [q.entries[i]]
+        i = i + 1
+    }
+    return [head, PPQueue { entries: rest }]
+}
+
+fn ppq_peek_id(q) {
+    if len(q.entries) == 0 { return -1 }
+    let head = q.entries[0]
+    return head[0]
+}
+
+// ── 1F1B scheduler (event log) ──────────────────────────────────
+// Returns a list of events describing the 1F1B steady-state
+// schedule on 2 stages for M micro-batches.
+//
+// Event layout: [stage, kind, micro_id, step]
+//   kind: "F" = forward,  "B" = backward
+//
+// Reference schedule for P=2, M=4:
+//   step 0: s0 F0
+//   step 1: s1 F0,  s0 F1
+//   step 2: s0 B0,  s1 F1,  s0 F2   (1F1B start on s0)
+//   step 3: s1 B0,  s0 F3,  s1 F2   (1F1B start on s1; F reaches cap)
+//   step 4: s0 B1,  s1 F3
+//   step 5: s1 B1,  s0 B2
+//   step 6: s1 B2,  s0 B3
+//   step 7: s1 B3
+//
+// We emit events ordered (step asc, stage asc) so that a consumer
+// can replay them sequentially.
+
+fn pp_build_1f1b_schedule(P, M) {
+    // For simplicity we handle the general P-stage 1F1B steady-state
+    // but specialize to P=2 (the test target).
+    let mut events = []
+    let warmup = P - 1           // forward-only warmup
+    let steady = M - warmup      // 1F1B steady-state
+    let cooldown = warmup        // backward-only cooldown
+    // safety for degenerate M < P
+    let mut s_steady = steady
+    if s_steady < 0 { s_steady = 0 }
+
+    // ── warmup: each stage s runs forward on micro (t - s) if 0..M
+    let total = warmup + s_steady + (M + cooldown)
+    // Build a per-stage counter of next F / next B micro id
+    let mut next_f = []
+    let mut next_b = []
+    let mut _i = 0
+    while _i < P {
+        next_f = next_f + [0]
+        next_b = next_b + [0]
+        _i = _i + 1
+    }
+
+    // Event loop: iterate step; at each step, decide for each stage
+    // what to run. Order on each stage: B before F when in steady.
+    let mut step = 0
+    let mut done_f = 0       // total F events emitted
+    let mut done_b = 0       // total B events emitted
+    let target = P * M       // expected F events; same count for B
+
+    while done_f + done_b < 2 * target {
+        // Walk stages from last to first (B flows bottom→top, F flows top→bottom)
+        let mut s = P - 1
+        while s >= 0 {
+            let nf = next_f[s]
+            let nb = next_b[s]
+            // Can this stage run backward? Needs: its forward done for micro nb,
+            // AND if not last stage, the downstream stage has already done B on nb.
+            let mut can_b = false
+            if nb < M {
+                if nf > nb {
+                    // forward finished for this micro on this stage
+                    if s == P - 1 {
+                        can_b = true
+                    } else {
+                        if next_b[s + 1] > nb {
+                            can_b = true
+                        }
+                    }
+                }
+            }
+            // Can this stage run forward? Needs: upstream finished F for nf,
+            // AND we haven't exceeded F budget for 1F1B warmup/steady/cooldown.
+            let mut can_f = false
+            if nf < M {
+                if s == 0 {
+                    can_f = true
+                } else {
+                    if next_f[s - 1] > nf {
+                        can_f = true
+                    }
+                }
+            }
+            // 1F1B policy: once we have emitted warmup forwards on stage 0,
+            // alternate B,F on each stage per step. Prefer B when available.
+            let mut did = false
+            if can_b {
+                events = events + [[s, "B", nb, step]]
+                next_b[s] = nb + 1
+                done_b = done_b + 1
+                did = true
+            }
+            if !did {
+                if can_f {
+                    events = events + [[s, "F", nf, step]]
+                    next_f[s] = nf + 1
+                    done_f = done_f + 1
+                    did = true
+                }
+            }
+            s = s - 1
+        }
+        step = step + 1
+        // Safety cap to avoid infinite loops on malformed inputs
+        if step > 4 * target + 8 { break }
+    }
+    return events
+}
+
+// Convenience: filter schedule to a single stage
+fn pp_filter_stage(events, stage_id) {
+    let n = len(events)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let e = events[i]
+        if e[0] == stage_id {
+            out = out + [e]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ── 1F1B executor ───────────────────────────────────────────────
+// Runs the schedule end-to-end for a given input batch and weights,
+// producing:
+//   outputs[m]           → final forward result for micro-batch m
+//   weight_grad_total[l] → sum of per-stage, per-micro weight grads
+//
+// The executor is deterministic: given identical inputs+weights it
+// returns values that match pp_single_forward() exactly.
+
+struct PPResult {
+    outputs: array,          // M floats
+    weight_grads: array,     // L floats (sum across micro-batches)
+    input_grads: array,      // M floats
+    events_run: int,
+    bubble_steps: int
+}
+
+fn pp_run_1f1b(cfg, inputs, weights) {
+    let P = cfg.num_stages
+    let M = cfg.num_micro
+    let L = cfg.num_layers
+    let events = pp_build_1f1b_schedule(P, M)
+
+    // Inter-stage queues (forward act: s0→s1, backward grad: s1→s0)
+    let mut fwd_q = ppq_new()
+    let mut bwd_q = ppq_new()
+
+    // Buffers
+    let mut stage1_inputs = []     // store fwd input x_m to stage1 for checking
+    let mut outputs = []
+    let mut wgrad = []
+    let mut input_grads = []
+    let mut _i = 0
+    while _i < L { wgrad = wgrad + [0.0]; _i = _i + 1 }
+    _i = 0
+    while _i < M { outputs = outputs + [0.0]; input_grads = input_grads + [0.0]; stage1_inputs = stage1_inputs + [0.0]; _i = _i + 1 }
+
+    let n_events = len(events)
+    let mut ei = 0
+    let mut bubble_steps = 0
+    let mut last_step = -1
+    let mut active_this_step = 0
+
+    while ei < n_events {
+        let e = events[ei]
+        let stage = e[0]
+        let kind  = e[1]
+        let mid   = e[2]
+        let step  = e[3]
+
+        // bubble tracking: step with < P events is a partial cycle
+        if step != last_step {
+            if last_step >= 0 {
+                if active_this_step < P { bubble_steps = bubble_steps + (P - active_this_step) }
+            }
+            active_this_step = 0
+            last_step = step
+        }
+        active_this_step = active_this_step + 1
+
+        if kind == "F" {
+            if stage == 0 {
+                let x = inputs[mid]
+                let y = pp_stage_forward(x, weights, cfg.stage0_begin, cfg.stage0_end)
+                fwd_q = ppq_push(fwd_q, mid, y)
+            } else {
+                // stage 1: dequeue head (should be micro_id == mid in FIFO)
+                let popped = ppq_pop(fwd_q)
+                let head = popped[0]
+                fwd_q = popped[1]
+                let qmid = head[0]
+                let xin = head[1]
+                stage1_inputs[mid] = xin
+                let yout = pp_stage_forward(xin, weights, cfg.stage1_begin, cfg.stage1_end)
+                outputs[mid] = yout
+                // Seed backward pass from stage1 with upstream grad = 1.0
+                bwd_q = ppq_push(bwd_q, mid, 1.0)
+            }
+        }
+        if kind == "B" {
+            if stage == 1 {
+                // backward on stage 1: fetch from bwd_q (seeded at fwd arrival)
+                let popped = ppq_pop(bwd_q)
+                let head = popped[0]
+                bwd_q = popped[1]
+                let gout = head[1]
+                let back = pp_stage_backward(gout, cfg.stage1_begin, cfg.stage1_end)
+                let gin = back[0]
+                let wgs = back[1]
+                // accumulate weight grads for stage 1 layers
+                let mut l = cfg.stage1_begin
+                let mut k = 0
+                while l < cfg.stage1_end {
+                    wgrad[l] = wgrad[l] + wgs[k]
+                    l = l + 1
+                    k = k + 1
+                }
+                // ship gradient back to stage 0
+                bwd_q = ppq_push(bwd_q, mid, gin)
+            } else {
+                // stage 0 backward: pop grad flowing upstream
+                let popped = ppq_pop(bwd_q)
+                let head = popped[0]
+                bwd_q = popped[1]
+                let gout = head[1]
+                let back = pp_stage_backward(gout, cfg.stage0_begin, cfg.stage0_end)
+                let gin = back[0]
+                let wgs = back[1]
+                let mut l = cfg.stage0_begin
+                let mut k = 0
+                while l < cfg.stage0_end {
+                    wgrad[l] = wgrad[l] + wgs[k]
+                    l = l + 1
+                    k = k + 1
+                }
+                input_grads[mid] = gin
+            }
+        }
+        ei = ei + 1
+    }
+
+    return PPResult {
+        outputs: outputs,
+        weight_grads: wgrad,
+        input_grads: input_grads,
+        events_run: n_events,
+        bubble_steps: bubble_steps
+    }
+}
+
+// ── Bubble ratio ────────────────────────────────────────────────
+// Ideal 1F1B bubble ratio for P stages, M micro-batches:
+//     bubble = (P - 1) / (M + P - 1)
+
+fn pp_bubble_ratio(P, M) {
+    let num = to_float(P - 1)
+    let den = to_float(M + P - 1)
+    if den <= 0.0 { return 0.0 }
+    return num / den
+}
+
+fn pp_efficiency(P, M) {
+    return 1.0 - pp_bubble_ratio(P, M)
+}
+
+// Wall-clock steps consumed by the full pipeline
+// (used to cross-check executor bubble accounting)
+fn pp_total_steps(P, M) {
+    return M + P - 1
+}
+
+// ── Gradient accumulation glue ──────────────────────────────────
+// Averages the accumulated weight gradients over M micro-batches to
+// produce the optimizer-ready update. Mirrors gradient_accumulation.
+fn pp_average_grads(wgrads_sum, num_micro) {
+    let n = len(wgrads_sum)
+    let div = to_float(num_micro)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [wgrads_sum[i] / div]
+        i = i + 1
+    }
+    return out
+}
+
+// Fuse pipeline result with a grad_accumulator-style buffer.
+// `buffer` is an array of L floats. Updates buffer += pp.weight_grads.
+fn pp_accumulate_into(buffer, pp_weight_grads) {
+    let n = len(buffer)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [buffer[i] + pp_weight_grads[i]]
+        i = i + 1
+    }
+    return out
+}
+
+println("[pipeline_parallel] module loaded — 2-stage 1F1B pipeline ready")

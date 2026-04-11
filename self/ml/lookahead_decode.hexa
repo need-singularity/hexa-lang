@@ -1,0 +1,281 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/lookahead_decode.hexa — @lookahead_decode prototype
+//
+//  AI-native inference: Jacobi-style parallel decoding.
+//  Each step proposes `window` candidate tokens in parallel by running
+//  a fixpoint over a working buffer (Jacobi iteration). n-gram cache
+//  records observed n-grams so accepted continuations can be reused.
+//  The target model verifies the proposal; the longest prefix that
+//  matches is committed, advancing multiple tokens per step.
+//
+//  Hyperparameters:
+//    window  — parallel lookahead width (candidates per step)
+//    ngram   — n-gram cache order (2 = bigram, 3 = trigram, ...)
+//    iters   — Jacobi refinement iterations per step
+//
+//  Mock models are deterministic hash functions over the context tail
+//  so tests are reproducible. The attr @lookahead_decode is parser-
+//  accepted; the verify+accept+ngram loop is implemented explicitly
+//  below.
+//
+//  API (pure):
+//    lad_ctx_hash(ctx)                       -> int
+//    lad_draft(ctx)                          -> int
+//    lad_target(ctx)                         -> int
+//    jacobi_refine(ctx, window, iters)       -> [int]
+//    ngram_key(toks, start, n)               -> int
+//    ngram_store(cache, key, tok)            -> cache
+//    ngram_lookup(cache, key)                -> int   (-1 if miss)
+//    ngram_record(cache, seq, n)             -> cache
+//    lad_verify(ctx, proposal)               -> [int]
+//    lad_accept(proposal, verified)          -> int
+//    @lookahead_decode
+//    lookahead_step(ctx, window, ngram, max_tokens)
+//        -> [out, [total_proposed], [total_accepted],
+//            [steps], [ngram_hits]]
+// ═══════════════════════════════════════════════════════════════════
+
+// ── context hash (XOR of tail, window=4) ───────────────────────
+fn lad_ctx_hash(ctx) {
+    let n = len(ctx)
+    let start = if n < 4 { 0 } else { n - 4 }
+    let mut h = 2654435761
+    let mut i = start
+    while i < n {
+        h = h ^ ((ctx[i] + 1) * (i + 11) * 2246822519)
+        i = i + 1
+    }
+    h
+}
+
+// ── mock draft model (fast, deterministic) ─────────────────────
+fn lad_draft(ctx) {
+    let h = lad_ctx_hash(ctx)
+    let v = h % 16
+    if v < 0 { v + 16 } else { v }
+}
+
+// ── mock target model (agrees with draft ~80% of the time) ─────
+fn lad_target(ctx) {
+    let h = lad_ctx_hash(ctx)
+    let d = lad_draft(ctx)
+    if (h % 5) == 0 {
+        (d + 3) % 16
+    } else {
+        d
+    }
+}
+
+// ── Jacobi refinement: start from draft guess, refine in parallel
+//    Each iteration recomputes every position from the same snapshot
+//    of the previous buffer (classic Jacobi). Converges when the
+//    snapshot equals the new buffer (fixpoint).
+// ───────────────────────────────────────────────────────────────
+fn jacobi_refine(ctx, window, iters) {
+    // Initial guess: seed buffer with draft(ctx) repeated.
+    let mut buf = []
+    let mut i = 0
+    while i < window {
+        buf = buf + [lad_draft(ctx)]
+        i = i + 1
+    }
+    let mut it = 0
+    while it < iters {
+        // Snapshot previous buffer (Jacobi: no in-place updates).
+        let mut prev = []
+        let mut p = 0
+        while p < len(buf) {
+            prev = prev + [buf[p]]
+            p = p + 1
+        }
+        // Rebuild each position j from ctx + prev[0..j]
+        let mut next = []
+        let mut j = 0
+        while j < window {
+            let mut local = []
+            let mut k = 0
+            while k < len(ctx) {
+                local = local + [ctx[k]]
+                k = k + 1
+            }
+            let mut q = 0
+            while q < j {
+                local = local + [prev[q]]
+                q = q + 1
+            }
+            next = next + [lad_draft(local)]
+            j = j + 1
+        }
+        // Fixpoint check.
+        let mut same = true
+        let mut c = 0
+        while c < window {
+            if next[c] != prev[c] {
+                same = false
+            }
+            c = c + 1
+        }
+        buf = next
+        if same {
+            it = iters
+        } else {
+            it = it + 1
+        }
+    }
+    buf
+}
+
+// ── n-gram cache: hashmap keyed by integer n-gram hash ─────────
+fn ngram_key(toks, start, n) {
+    let mut h = 146527
+    let mut i = 0
+    while i < n {
+        h = h ^ ((toks[start + i] + 1) * (i + 13) * 2654435761)
+        i = i + 1
+    }
+    h
+}
+
+fn ngram_store(cache, key, tok) {
+    let k = to_string(key)
+    cache[k] = tok
+    cache
+}
+
+fn ngram_lookup(cache, key) {
+    let k = to_string(key)
+    if has_key(cache, k) {
+        cache[k]
+    } else {
+        -1
+    }
+}
+
+// Record all (ctx[i..i+n] → ctx[i+n]) n-grams from `seq`.
+fn ngram_record(cache, seq, n) {
+    let mut c = cache
+    let L = len(seq)
+    if L <= n {
+        return c
+    }
+    let mut i = 0
+    while (i + n) < L {
+        let key = ngram_key(seq, i, n)
+        c = ngram_store(c, key, seq[i + n])
+        i = i + 1
+    }
+    c
+}
+
+// ── target verify: at each position j, what would target output
+//    given ctx + proposal[0..j]?
+// ───────────────────────────────────────────────────────────────
+fn lad_verify(ctx, proposal) {
+    let mut local = []
+    let mut i = 0
+    while i < len(ctx) {
+        local = local + [ctx[i]]
+        i = i + 1
+    }
+    let mut out = []
+    let mut j = 0
+    while j < len(proposal) {
+        let t = lad_target(local)
+        out = out + [t]
+        local = local + [proposal[j]]
+        j = j + 1
+    }
+    out
+}
+
+// ── accept longest matching prefix ─────────────────────────────
+fn lad_accept(proposal, verified) {
+    let n = len(proposal)
+    let mut i = 0
+    while i < n {
+        if proposal[i] != verified[i] {
+            return i
+        }
+        i = i + 1
+    }
+    n
+}
+
+// ── @lookahead_decode: Jacobi propose → n-gram boost → verify ──
+@lookahead_decode
+fn lookahead_step(ctx, window, ngram, max_tokens) {
+    // working context
+    let mut cur = []
+    let mut i = 0
+    while i < len(ctx) {
+        cur = cur + [ctx[i]]
+        i = i + 1
+    }
+    let mut cache = #{}
+    let mut produced = 0
+    let mut total_proposed = 0
+    let mut total_accepted = 0
+    let mut steps = 0
+    let mut ngram_hits = 0
+
+    while produced < max_tokens {
+        let remain = max_tokens - produced
+        let ww = if window < remain { window } else { remain }
+
+        // 1. Jacobi propose (iters = 2 is enough for deterministic mock).
+        let mut proposal = jacobi_refine(cur, ww, 2)
+
+        // 2. n-gram boost: if we've seen this n-gram before, override
+        //    proposal[0] with the cached continuation.
+        if len(cur) >= ngram {
+            let key = ngram_key(cur, len(cur) - ngram, ngram)
+            let hit = ngram_lookup(cache, key)
+            if hit >= 0 {
+                // replace head with cached suggestion
+                let mut boosted = [hit]
+                let mut b = 1
+                while b < ww {
+                    boosted = boosted + [proposal[b]]
+                    b = b + 1
+                }
+                proposal = boosted
+                ngram_hits = ngram_hits + 1
+            }
+        }
+
+        // 3. Target verify.
+        let verified = lad_verify(cur, proposal)
+        let n_acc = lad_accept(proposal, verified)
+
+        // 4. Commit accepted prefix (advance multiple tokens per step).
+        let mut j = 0
+        while j < n_acc {
+            cur = cur + [proposal[j]]
+            j = j + 1
+        }
+        // If nothing accepted, force one token from target to progress.
+        if n_acc == 0 {
+            cur = cur + [verified[0]]
+            produced = produced + 1
+        } else {
+            produced = produced + n_acc
+        }
+
+        // 5. Record n-grams from the newly committed tail.
+        cache = ngram_record(cache, cur, ngram)
+
+        total_proposed = total_proposed + ww
+        total_accepted = total_accepted + n_acc
+        steps = steps + 1
+    }
+
+    // Extract the newly produced tail (exclude original ctx).
+    let mut out = []
+    let start = len(ctx)
+    let mut m = start
+    while m < len(cur) {
+        out = out + [cur[m]]
+        m = m + 1
+    }
+    [out, [total_proposed], [total_accepted], [steps], [ngram_hits]]
+}

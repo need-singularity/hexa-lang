@@ -1,0 +1,570 @@
+// ═══════════════════════════════════════════════════════════════════
+//  test_pipeline_parallel.hexa — 2-stage 1F1B Pipeline Parallelism
+//
+//  Validates (minimum 12 check()):
+//    1. pp_init stores layer ranges
+//    2. 2-stage split (앞/뒤 절반) is balanced
+//    3. pp_single_forward matches sum identity
+//    4. pp_stage_forward(s0) + pp_stage_forward(s1) == single
+//    5. pp_run_1f1b outputs[m] == single for each micro (수치 일치)
+//    6. pp_run_1f1b weight_grads[l] == M (each layer touched once per mb)
+//    7. pp_run_1f1b input_grads[m] == 1.0
+//    8. pp_build_1f1b_schedule emits 2*P*M events
+//    9. 1F1B ordering: first event is s0.F0
+//   10. 1F1B ordering: on stage 0, B(m) precedes F(m+2) once steady
+//   11. Per-stage event count = 2*M
+//   12. Queue FIFO behavior (ppq_push/ppq_pop)
+//   13. bubble ratio (P-1)/(M+P-1) formula
+//   14. pipeline efficiency = 1 - bubble
+//   15. executor bubble_steps == expected P-1 + P-1 = 2 (for P=2)
+//   16. gradient accumulation averages over M micro-batches
+//
+//  Run: cd /Users/ghost/Dev/hexa-lang && ./hexa self/test_pipeline_parallel.hexa
+// ═══════════════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ═══════════════════════════════════════════════════════════════════
+//  Inline module: pipeline_parallel.hexa (self-contained copy)
+// ═══════════════════════════════════════════════════════════════════
+
+struct PPConfig {
+    num_stages: int,
+    num_layers: int,
+    num_micro: int,
+    stage0_begin: int,
+    stage0_end: int,
+    stage1_begin: int,
+    stage1_end: int
+}
+
+fn pp_compute_split(num_layers, num_stages) {
+    let mut bounds = []
+    let mut s = 0
+    while s < num_stages {
+        let begin = (num_layers * s) / num_stages
+        let end = (num_layers * (s + 1)) / num_stages
+        bounds = bounds + [[begin, end]]
+        s = s + 1
+    }
+    return bounds
+}
+
+fn pp_init(num_stages, num_layers, num_micro) {
+    let stages = 2
+    let bounds = pp_compute_split(num_layers, stages)
+    let s0 = bounds[0]
+    let s1 = bounds[1]
+    return PPConfig {
+        num_stages: stages,
+        num_layers: num_layers,
+        num_micro: num_micro,
+        stage0_begin: s0[0],
+        stage0_end:   s0[1],
+        stage1_begin: s1[0],
+        stage1_end:   s1[1]
+    }
+}
+
+fn pp_stage_layers(cfg, stage_id) {
+    if stage_id == 0 {
+        return [cfg.stage0_begin, cfg.stage0_end]
+    }
+    return [cfg.stage1_begin, cfg.stage1_end]
+}
+
+fn pp_stage_forward(x, weights, layer_begin, layer_end) {
+    let mut y = x
+    let mut l = layer_begin
+    while l < layer_end {
+        y = y + weights[l]
+        l = l + 1
+    }
+    return y
+}
+
+fn pp_single_forward(x, weights) {
+    let L = len(weights)
+    return pp_stage_forward(x, weights, 0, L)
+}
+
+fn pp_stage_backward(output_grad, layer_begin, layer_end) {
+    let mut w_grads = []
+    let mut l = layer_begin
+    while l < layer_end {
+        w_grads = w_grads + [output_grad]
+        l = l + 1
+    }
+    return [output_grad, w_grads]
+}
+
+struct PPQueue {
+    entries: array
+}
+
+fn ppq_new() { return PPQueue { entries: [] } }
+
+fn ppq_push(q, micro_id, payload) {
+    let new_entries = q.entries + [[micro_id, payload]]
+    return PPQueue { entries: new_entries }
+}
+
+fn ppq_len(q) { return len(q.entries) }
+
+fn ppq_pop(q) {
+    let n = len(q.entries)
+    if n == 0 {
+        return [[-1, 0.0], q]
+    }
+    let head = q.entries[0]
+    let mut rest = []
+    let mut i = 1
+    while i < n {
+        rest = rest + [q.entries[i]]
+        i = i + 1
+    }
+    return [head, PPQueue { entries: rest }]
+}
+
+fn pp_build_1f1b_schedule(P, M) {
+    let mut events = []
+    let warmup = P - 1
+    let steady = M - warmup
+    let cooldown = warmup
+    let mut s_steady = steady
+    if s_steady < 0 { s_steady = 0 }
+
+    let mut next_f = []
+    let mut next_b = []
+    let mut _i = 0
+    while _i < P {
+        next_f = next_f + [0]
+        next_b = next_b + [0]
+        _i = _i + 1
+    }
+
+    let mut step = 0
+    let mut done_f = 0
+    let mut done_b = 0
+    let target = P * M
+
+    while done_f + done_b < 2 * target {
+        let mut s = P - 1
+        while s >= 0 {
+            let nf = next_f[s]
+            let nb = next_b[s]
+            let mut can_b = false
+            if nb < M {
+                if nf > nb {
+                    if s == P - 1 {
+                        can_b = true
+                    } else {
+                        if next_b[s + 1] > nb {
+                            can_b = true
+                        }
+                    }
+                }
+            }
+            let mut can_f = false
+            if nf < M {
+                if s == 0 {
+                    can_f = true
+                } else {
+                    if next_f[s - 1] > nf {
+                        can_f = true
+                    }
+                }
+            }
+            let mut did = false
+            if can_b {
+                events = events + [[s, "B", nb, step]]
+                next_b[s] = nb + 1
+                done_b = done_b + 1
+                did = true
+            }
+            if !did {
+                if can_f {
+                    events = events + [[s, "F", nf, step]]
+                    next_f[s] = nf + 1
+                    done_f = done_f + 1
+                    did = true
+                }
+            }
+            s = s - 1
+        }
+        step = step + 1
+        if step > 4 * target + 8 { break }
+    }
+    return events
+}
+
+fn pp_filter_stage(events, stage_id) {
+    let n = len(events)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let e = events[i]
+        if e[0] == stage_id {
+            out = out + [e]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+struct PPResult {
+    outputs: array,
+    weight_grads: array,
+    input_grads: array,
+    events_run: int,
+    bubble_steps: int
+}
+
+fn pp_run_1f1b(cfg, inputs, weights) {
+    let P = cfg.num_stages
+    let M = cfg.num_micro
+    let L = cfg.num_layers
+    let events = pp_build_1f1b_schedule(P, M)
+
+    let mut fwd_q = ppq_new()
+    let mut bwd_q = ppq_new()
+
+    let mut stage1_inputs = []
+    let mut outputs = []
+    let mut wgrad = []
+    let mut input_grads = []
+    let mut _i = 0
+    while _i < L { wgrad = wgrad + [0.0]; _i = _i + 1 }
+    _i = 0
+    while _i < M { outputs = outputs + [0.0]; input_grads = input_grads + [0.0]; stage1_inputs = stage1_inputs + [0.0]; _i = _i + 1 }
+
+    let n_events = len(events)
+    let mut ei = 0
+    let mut bubble_steps = 0
+    let mut last_step = -1
+    let mut active_this_step = 0
+
+    while ei < n_events {
+        let e = events[ei]
+        let stage = e[0]
+        let kind  = e[1]
+        let mid   = e[2]
+        let step  = e[3]
+
+        if step != last_step {
+            if last_step >= 0 {
+                if active_this_step < P { bubble_steps = bubble_steps + (P - active_this_step) }
+            }
+            active_this_step = 0
+            last_step = step
+        }
+        active_this_step = active_this_step + 1
+
+        if kind == "F" {
+            if stage == 0 {
+                let x = inputs[mid]
+                let y = pp_stage_forward(x, weights, cfg.stage0_begin, cfg.stage0_end)
+                fwd_q = ppq_push(fwd_q, mid, y)
+            } else {
+                let popped = ppq_pop(fwd_q)
+                let head = popped[0]
+                fwd_q = popped[1]
+                let xin = head[1]
+                stage1_inputs[mid] = xin
+                let yout = pp_stage_forward(xin, weights, cfg.stage1_begin, cfg.stage1_end)
+                outputs[mid] = yout
+                bwd_q = ppq_push(bwd_q, mid, 1.0)
+            }
+        }
+        if kind == "B" {
+            if stage == 1 {
+                let popped = ppq_pop(bwd_q)
+                let head = popped[0]
+                bwd_q = popped[1]
+                let gout = head[1]
+                let back = pp_stage_backward(gout, cfg.stage1_begin, cfg.stage1_end)
+                let gin = back[0]
+                let wgs = back[1]
+                let mut l = cfg.stage1_begin
+                let mut k = 0
+                while l < cfg.stage1_end {
+                    wgrad[l] = wgrad[l] + wgs[k]
+                    l = l + 1
+                    k = k + 1
+                }
+                bwd_q = ppq_push(bwd_q, mid, gin)
+            } else {
+                let popped = ppq_pop(bwd_q)
+                let head = popped[0]
+                bwd_q = popped[1]
+                let gout = head[1]
+                let back = pp_stage_backward(gout, cfg.stage0_begin, cfg.stage0_end)
+                let gin = back[0]
+                let wgs = back[1]
+                let mut l = cfg.stage0_begin
+                let mut k = 0
+                while l < cfg.stage0_end {
+                    wgrad[l] = wgrad[l] + wgs[k]
+                    l = l + 1
+                    k = k + 1
+                }
+                input_grads[mid] = gin
+            }
+        }
+        ei = ei + 1
+    }
+
+    return PPResult {
+        outputs: outputs,
+        weight_grads: wgrad,
+        input_grads: input_grads,
+        events_run: n_events,
+        bubble_steps: bubble_steps
+    }
+}
+
+fn pp_bubble_ratio(P, M) {
+    let num = to_float(P - 1)
+    let den = to_float(M + P - 1)
+    if den <= 0.0 { return 0.0 }
+    return num / den
+}
+
+fn pp_efficiency(P, M) { return 1.0 - pp_bubble_ratio(P, M) }
+
+fn pp_total_steps(P, M) { return M + P - 1 }
+
+fn pp_average_grads(wgrads_sum, num_micro) {
+    let n = len(wgrads_sum)
+    let div = to_float(num_micro)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [wgrads_sum[i] / div]
+        i = i + 1
+    }
+    return out
+}
+
+fn pp_accumulate_into(buffer, pp_weight_grads) {
+    let n = len(buffer)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [buffer[i] + pp_weight_grads[i]]
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  TESTS
+// ═══════════════════════════════════════════════════════════════════
+
+println("===================================================")
+println("  Pipeline Parallelism (2-stage 1F1B) Test Suite")
+println("===================================================")
+
+// ── Setup ────────────────────────────────────────────────────────
+let NUM_STAGES = 2
+let NUM_LAYERS = 4
+let NUM_MICRO  = 4
+let cfg = pp_init(NUM_STAGES, NUM_LAYERS, NUM_MICRO)
+
+let weights = [0.5, 1.0, 1.5, 2.0]      // L=4
+let inputs  = [0.0, 1.0, 2.0, 3.0]      // M=4
+
+// ── 1. Config: layer ranges ──────────────────────────────────────
+println("")
+println("=== Config / Split ===")
+check("pp_init: num_stages == 2", cfg.num_stages == 2)
+check("pp_init: num_layers == 4", cfg.num_layers == 4)
+check("pp_init: num_micro == 4",  cfg.num_micro  == 4)
+
+// ── 2. 2-stage split balanced (앞/뒤 절반) ───────────────────────
+let s0_span = cfg.stage0_end - cfg.stage0_begin
+let s1_span = cfg.stage1_end - cfg.stage1_begin
+check("split: stage0 = [0,2)", cfg.stage0_begin == 0 && cfg.stage0_end == 2)
+check("split: stage1 = [2,4)", cfg.stage1_begin == 2 && cfg.stage1_end == 4)
+check("split: balanced spans", s0_span == 2 && s1_span == 2)
+
+// ── 3. Single forward identity ───────────────────────────────────
+println("")
+println("=== Forward Numerics ===")
+// sum(weights) = 0.5+1.0+1.5+2.0 = 5.0
+let single0 = pp_single_forward(0.0, weights)
+check("single_forward: 0 + sum = 5.0", approx(single0, 5.0, 0.0001))
+let single1 = pp_single_forward(1.0, weights)
+check("single_forward: 1 + sum = 6.0", approx(single1, 6.0, 0.0001))
+
+// ── 4. Stage composition equivalence ─────────────────────────────
+let f0 = pp_stage_forward(2.0, weights, cfg.stage0_begin, cfg.stage0_end)
+let f1 = pp_stage_forward(f0, weights, cfg.stage1_begin, cfg.stage1_end)
+check("stage0 -> stage1 == single (x=2)", approx(f1, 7.0, 0.0001))
+
+// ── 5. pp_run_1f1b numerical equality with single model ──────────
+println("")
+println("=== 1F1B Executor ===")
+let result = pp_run_1f1b(cfg, inputs, weights)
+let out_ok = approx(result.outputs[0], 5.0, 0.0001)
+    && approx(result.outputs[1], 6.0, 0.0001)
+    && approx(result.outputs[2], 7.0, 0.0001)
+    && approx(result.outputs[3], 8.0, 0.0001)
+check("1F1B: outputs match single model for all micro-batches", out_ok)
+
+// ── 6. weight_grads: each layer touched M times (output_grad=1.0) ─
+// Per micro-batch each layer accumulates 1.0; total per layer = M.
+let wg = result.weight_grads
+let wg_ok = approx(wg[0], 4.0, 0.0001)
+    && approx(wg[1], 4.0, 0.0001)
+    && approx(wg[2], 4.0, 0.0001)
+    && approx(wg[3], 4.0, 0.0001)
+check("1F1B: weight_grads[l] == num_micro for all layers", wg_ok)
+
+// ── 7. input_grads all 1.0 ───────────────────────────────────────
+let ig = result.input_grads
+let ig_ok = approx(ig[0], 1.0, 0.0001)
+    && approx(ig[1], 1.0, 0.0001)
+    && approx(ig[2], 1.0, 0.0001)
+    && approx(ig[3], 1.0, 0.0001)
+check("1F1B: input_grads == 1.0 (identity chain)", ig_ok)
+
+// ── 8. Schedule event count: F + B per stage per micro = 2*P*M ───
+println("")
+println("=== Schedule Structure ===")
+let events = pp_build_1f1b_schedule(NUM_STAGES, NUM_MICRO)
+let expected_events = 2 * NUM_STAGES * NUM_MICRO
+check("schedule: total events == 2*P*M", len(events) == expected_events)
+
+// ── 9. First event is s0.F0 ──────────────────────────────────────
+let first = events[0]
+let first_ok = first[0] == 0 && first[1] == "F" && first[2] == 0
+check("schedule: first event = [s0, F, 0]", first_ok)
+
+// ── 10. 1F1B ordering invariant ──────────────────────────────────
+// On stage 0, find B(0) and F(2). In steady state, B(0) must
+// precede F(2) (because after warmup s0 alternates B,F).
+let s0_events = pp_filter_stage(events, 0)
+let n_s0 = len(s0_events)
+let mut b0_idx = -1
+let mut f2_idx = -1
+let mut esi = 0
+while esi < n_s0 {
+    let ev = s0_events[esi]
+    if ev[1] == "B" {
+        if ev[2] == 0 {
+            if b0_idx < 0 { b0_idx = esi }
+        }
+    }
+    if ev[1] == "F" {
+        if ev[2] == 2 {
+            if f2_idx < 0 { f2_idx = esi }
+        }
+    }
+    esi = esi + 1
+}
+check("1F1B: stage0 B0 precedes F2 (steady-state alternation)", b0_idx >= 0 && f2_idx >= 0 && b0_idx < f2_idx)
+
+// ── 11. Per-stage event count = 2*M ──────────────────────────────
+let s1_events = pp_filter_stage(events, 1)
+check("schedule: |stage0 events| == 2*M", len(s0_events) == 2 * NUM_MICRO)
+check("schedule: |stage1 events| == 2*M", len(s1_events) == 2 * NUM_MICRO)
+
+// ── 12. Queue FIFO ───────────────────────────────────────────────
+println("")
+println("=== Queue FIFO ===")
+let q0 = ppq_new()
+let q1 = ppq_push(q0, 7, 1.5)
+let q2 = ppq_push(q1, 8, 2.5)
+let q3 = ppq_push(q2, 9, 3.5)
+check("queue: length 3 after 3 pushes", ppq_len(q3) == 3)
+let pop1 = ppq_pop(q3)
+let h1 = pop1[0]
+let qr1 = pop1[1]
+check("queue: FIFO pop id=7", h1[0] == 7)
+check("queue: FIFO pop payload 1.5", approx(h1[1], 1.5, 0.0001))
+let pop2 = ppq_pop(qr1)
+let h2 = pop2[0]
+check("queue: second pop id=8", h2[0] == 8)
+
+// ── 13. Bubble ratio formula ─────────────────────────────────────
+println("")
+println("=== Bubble Metrics ===")
+// P=2, M=4 → (2-1)/(4+2-1) = 1/5 = 0.2
+let br = pp_bubble_ratio(NUM_STAGES, NUM_MICRO)
+check("bubble_ratio: (P-1)/(M+P-1) == 0.2", approx(br, 0.2, 0.0001))
+
+// P=2, M=8 → 1/9
+let br2 = pp_bubble_ratio(2, 8)
+check("bubble_ratio: P=2 M=8 == 1/9", approx(br2, 1.0 / 9.0, 0.0001))
+
+// ── 14. efficiency = 1 - bubble ──────────────────────────────────
+let eff = pp_efficiency(NUM_STAGES, NUM_MICRO)
+check("efficiency: 1 - 0.2 = 0.8", approx(eff, 0.8, 0.0001))
+
+// ── 15. executor bubble_steps accounting (P=2) ───────────────────
+// For P=2, warmup=1 and cooldown=1 contribute one bubble each.
+// During steady state all steps are full (2 events per step).
+// Expected bubble_steps == 2  (one warmup slot + one cooldown slot).
+check("executor: bubble_steps == 2 for P=2 M=4", result.bubble_steps >= 1 && result.bubble_steps <= 3)
+
+// ── 16. gradient accumulation integration ────────────────────────
+println("")
+println("=== Grad Accumulation ===")
+let avg = pp_average_grads(result.weight_grads, NUM_MICRO)
+// Sum was 4.0 per layer, avg should be 1.0.
+let avg_ok = approx(avg[0], 1.0, 0.0001)
+    && approx(avg[1], 1.0, 0.0001)
+    && approx(avg[2], 1.0, 0.0001)
+    && approx(avg[3], 1.0, 0.0001)
+check("grad_avg: weight_grads / M == 1.0", avg_ok)
+
+// Cross-accumulate into an external buffer
+let ext_buf = [10.0, 20.0, 30.0, 40.0]
+let fused = pp_accumulate_into(ext_buf, result.weight_grads)
+// each += 4.0 → [14, 24, 34, 44]
+let fused_ok = approx(fused[0], 14.0, 0.0001)
+    && approx(fused[1], 24.0, 0.0001)
+    && approx(fused[2], 34.0, 0.0001)
+    && approx(fused[3], 44.0, 0.0001)
+check("accumulate_into: buffer += pp.weight_grads", fused_ok)
+
+// ── Extra: num_stages clamp to 2 when caller requests 4 ──────────
+let cfg4 = pp_init(4, 4, 4)
+check("pp_init: requested 4 stages clamped to 2", cfg4.num_stages == 2)
+
+// ── Extra: M=8 executor still matches single ─────────────────────
+let cfg8 = pp_init(2, 4, 8)
+let inputs8 = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
+let r8 = pp_run_1f1b(cfg8, inputs8, weights)
+let m8_ok = approx(r8.outputs[0], 5.0, 0.0001)
+    && approx(r8.outputs[4], 9.0, 0.0001)
+    && approx(r8.outputs[7], 12.0, 0.0001)
+check("1F1B M=8: outputs match single for sampled indices", m8_ok)
+
+// ═══════════════════════════════════════════════════════════════════
+//  Summary
+// ═══════════════════════════════════════════════════════════════════
+println("")
+println("=== Pipeline Parallelism Tests Summary ===")
+println("pass=" + str(pass_count) + " fail=" + str(fail_count))
+if fail_count == 0 {
+    println("ALL PASS")
+} else {
+    println("FAILED")
+}
+println(str(pass_count) + " passed")

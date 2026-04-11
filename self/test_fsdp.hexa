@@ -1,0 +1,198 @@
+// ═══════════════════════════════════════════════════════════════════
+//  test_fsdp.hexa — FSDP (Fully Sharded Data Parallel) 검증
+//
+//  최소 12개 단위 테스트:
+//    1.  shard boundary 일관성 (균등 분할)
+//    2.  shard sizes 합 == total_d
+//    3.  init: N=1 shard가 원본과 동일
+//    4.  all-gather: 연결 결과 == 원본
+//    5.  forward 결과 == single rank (N=2)
+//    6.  forward 결과 == single rank (N=4)
+//    7.  backward grad concat == single rank grad (N=2)
+//    8.  backward grad concat == single rank grad (N=4)
+//    9.  reduce-scatter 합산 일관성
+//   10.  CPU offload → load 라운드트립 보존
+//   11.  메모리 절감 비율 (N=8 → 8x)
+//   12.  mixed precision init → fp16 shards 생성
+//   13.  wrap policy: 작은 레이어 제외
+//   14.  optimizer step: shard 업데이트 일관성
+//   15.  mixed precision forward 숫자 적법 범위 내
+//
+//  실행: cd /Users/ghost/Dev/hexa-lang && ./hexa self/test_fsdp.hexa
+// ═══════════════════════════════════════════════════════════════════
+
+use "ml/fsdp"
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn tfabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn tapprox(a, b, eps) { return tfabs(a - b) < eps }
+
+fn sum_shard_sizes(d, n) {
+    let mut s = 0
+    for k in 0..n { s = s + fsdp_shard_size(d, n, k) }
+    return s
+}
+
+fn main() {
+    println("=== FSDP Tests ===")
+
+    // ── 1. shard boundary 일관성 ──────────────────────────────
+    let d1 = 12
+    let n1 = 4
+    check("shard[0] begin=0", fsdp_shard_begin(d1, n1, 0) == 0)
+    check("shard[last] end==total_d", fsdp_shard_end(d1, n1, n1 - 1) == d1)
+
+    // ── 2. shard sizes 합 == total_d ──────────────────────────
+    check("sum sizes N=4,D=12", sum_shard_sizes(12, 4) == 12)
+    check("sum sizes N=3,D=10", sum_shard_sizes(10, 3) == 10)
+
+    // ── 3. init: N=1 shard가 원본과 동일 ──────────────────────
+    let w1 = [1.0, 2.0, 3.0, 4.0]
+    let st1 = fsdp_init(w1, 1, false, false)
+    let flat1 = fsdp_flatten_shards(st1)
+    check("N=1 shard == original", fsdp_l2_diff(w1, flat1) < 1.0e-12)
+
+    // ── 4. all-gather: 연결 결과 == 원본 ──────────────────────
+    let w4 = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0]
+    let st4 = fsdp_init(w4, 4, false, false)
+    let gathered = fsdp_all_gather(st4)
+    check("all-gather == original", fsdp_l2_diff(w4, gathered) < 1.0e-12)
+    check("gathered length matches", len(gathered) == 8)
+
+    // ── 5. forward (N=2) ==========================================
+    let w5 = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+    let x5 = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0]
+    let st5 = fsdp_init(w5, 2, false, false)
+    let y5_fsdp = fsdp_forward(st5, x5)
+    let y5_ref = fsdp_single_rank_forward(w5, x5)
+    check("fwd(N=2) == single rank", fsdp_l2_diff(y5_fsdp, y5_ref) < 1.0e-9)
+
+    // ── 6. forward (N=4) ==========================================
+    let st6 = fsdp_init(w5, 4, false, false)
+    let y6_fsdp = fsdp_forward(st6, x5)
+    check("fwd(N=4) == single rank", fsdp_l2_diff(y6_fsdp, y5_ref) < 1.0e-9)
+
+    // ── 7. backward (N=2) =========================================
+    let go7 = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+    let shard_g7 = fsdp_backward(st5, x5, go7)
+    let flat_g7 = fsdp_flatten_shard_grads(shard_g7)
+    let ref_g7 = fsdp_single_rank_backward(w5, x5, go7)
+    // reduce-scatter는 동일 grad를 N번 합산 → full grad * N
+    // 동치 비교: ref * num_ranks == flat_g7
+    let num_r7 = st5.num_ranks
+    let mut ref_scaled7 = []
+    for i in 0..len(ref_g7) { ref_scaled7 = ref_scaled7 + [ref_g7[i] * to_float(num_r7)] }
+    check("bwd(N=2) reduce-scatter == N*grad", fsdp_l2_diff(flat_g7, ref_scaled7) < 1.0e-9)
+
+    // ── 8. backward (N=4) =========================================
+    let shard_g8 = fsdp_backward(st6, x5, go7)
+    let flat_g8 = fsdp_flatten_shard_grads(shard_g8)
+    let num_r8 = st6.num_ranks
+    let mut ref_scaled8 = []
+    for i in 0..len(ref_g7) { ref_scaled8 = ref_scaled8 + [ref_g7[i] * to_float(num_r8)] }
+    check("bwd(N=4) reduce-scatter == N*grad", fsdp_l2_diff(flat_g8, ref_scaled8) < 1.0e-9)
+
+    // ── 9. reduce-scatter 직접 테스트 ═════════════════════════════
+    // 두 rank가 각각 [1,2,3,4] 전체 grad를 가질 때:
+    // 합산 → [2,4,6,8], rank0=[2,4], rank1=[6,8]
+    let fg9 = [[1.0, 2.0, 3.0, 4.0], [1.0, 2.0, 3.0, 4.0]]
+    let rs9 = fsdp_reduce_scatter(fg9, 2, 4)
+    let rs9_flat = fsdp_flatten_shard_grads(rs9)
+    let expected9 = [2.0, 4.0, 6.0, 8.0]
+    check("reduce-scatter sum", fsdp_l2_diff(rs9_flat, expected9) < 1.0e-12)
+
+    // ── 10. CPU offload ⇄ load 라운드트립 ═════════════════════════
+    let wA = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    let stA = fsdp_init(wA, 3, false, false)
+    let stA_off = fsdp_offload_to_cpu(stA)
+    let stA_back = fsdp_load_to_gpu(stA_off)
+    // shard 내용은 동일해야 함
+    let flatA = fsdp_flatten_shards(stA_back)
+    check("offload roundtrip preserves", fsdp_l2_diff(wA, flatA) < 1.0e-12)
+    check("offload flag CPU", stA_off.cpu_offload == true)
+    check("offload flag GPU after load", stA_back.cpu_offload == false)
+
+    // ── 11. 메모리 절감 비율 ═══════════════════════════════════════
+    // N=8, no mixed → 8x savings
+    let sav8 = fsdp_memory_savings(8, false)
+    check("memory savings N=8 = 8x", tapprox(sav8, 8.0, 1.0e-9))
+    // N=8 + mixed precision → 8 / 1.5 ≈ 5.33
+    let sav8mp = fsdp_memory_savings(8, true)
+    check("memory savings N=8 mixed < 8x", sav8mp < 8.0)
+    // Per-rank: D=16, N=4 → 4 per shard
+    let per = fsdp_rank_memory(16, 4, 0, false)
+    check("per-rank memory = D/N", tapprox(per, 4.0, 1.0e-9))
+
+    // ── 12. mixed precision init ═════════════════════════════════
+    let wMP = [1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5]
+    let stMP = fsdp_init(wMP, 2, false, true)
+    // fp16 shards must be populated
+    let has_fp16 = len(stMP.rank_fp16_shards[0]) > 0
+    check("mixed precision fp16 shards created", has_fp16)
+    // fp16 cast round-trip: value close to original (within FP16 precision)
+    let fp16_first = stMP.rank_fp16_shards[0][0]
+    check("fp16 shard[0][0] close to 1.5", tapprox(fp16_first, 1.5, 0.01))
+
+    // ── 13. wrap policy ═════════════════════════════════════════
+    let layer_sizes = [100, 2000, 50, 5000, 300]
+    let wrap = fsdp_wrap_policy(layer_sizes, 1000)
+    // layers >= 1000: index 1, 3
+    check("wrap[0] small skipped", wrap[0] == false)
+    check("wrap[1] large wrapped", wrap[1] == true)
+    check("wrap[2] small skipped", wrap[2] == false)
+    check("wrap[3] large wrapped", wrap[3] == true)
+    check("wrap count = 2", fsdp_count_wrapped(wrap) == 2)
+
+    // ── 14. optimizer step: shard 업데이트 일관성 ═════════════════
+    let wO = [10.0, 20.0, 30.0, 40.0]
+    let stO = fsdp_init(wO, 2, false, false)
+    // Manual shard_grads: rank0=[1,1], rank1=[2,2]
+    let sg_o = [[1.0, 1.0], [2.0, 2.0]]
+    let lr = 0.1
+    let stO2 = fsdp_optimizer_step(stO, sg_o, lr)
+    let flatO = fsdp_flatten_shards(stO2)
+    // expected: [10-0.1, 20-0.1, 30-0.2, 40-0.2] = [9.9, 19.9, 29.8, 39.8]
+    let expO = [9.9, 19.9, 29.8, 39.8]
+    check("optimizer step shard update", fsdp_l2_diff(flatO, expO) < 1.0e-9)
+
+    // ── 15. mixed precision forward 숫자 적법 범위 ═══════════════
+    let wF = [1.0, 2.0, 4.0, 8.0]
+    let xF = [0.5, 0.25, 0.125, 0.0625]
+    let stF = fsdp_init(wF, 2, false, true)
+    let yF = fsdp_forward(stF, xF)
+    // all outputs within FP16 range
+    let mut yF_ok = true
+    for i in 0..len(yF) {
+        let v = yF[i]
+        if tfabs(v) > 65504.0 { yF_ok = false }
+    }
+    check("mixed fwd output in FP16 range", yF_ok)
+    // Expected rough: [0.5, 0.5, 0.5, 0.5] — 모두 0.5 근처
+    let mut mp_close = true
+    for i in 0..len(yF) {
+        if tfabs(yF[i] - 0.5) > 0.02 { mp_close = false }
+    }
+    check("mixed fwd ≈ fp32 fwd", mp_close)
+
+    println("")
+    println("FSDP: " + to_string(pass_count) + " passed, " + to_string(fail_count) + " failed")
+    if fail_count > 0 {
+        println("[FAIL] test_fsdp.hexa")
+    } else {
+        println("[PASS] test_fsdp.hexa — all " + to_string(pass_count) + " FSDP tests passed")
+    }
+}
+
+main()

@@ -1,0 +1,534 @@
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/lora_hotswap.hexa — LoRA Hot-Swap Runtime (ML #72)
+//
+//  목적:
+//    멀티태넌트 서빙 — 기준 weight(W)는 보존, LoRA delta(A,B)만
+//    런타임에 교체(Hot-Swap). Full re-init 없이 adapter 전환.
+//
+//  핵심 기능:
+//    1. Adapter registry(name → (A,B,rank,alpha))
+//    2. load_adapter / unload_adapter runtime
+//    3. swap_adapter without full re-init — base W 보존, delta 교체
+//    4. Request-level routing(per-request adapter 선택)
+//    5. Concurrent multi-tenant 시뮬(세션 상태)
+//    6. merge / unmerge — delta W fold-in / fold-out
+//
+//  API:
+//    hs_make_base(layers)                        -> HotSwapBase
+//    hs_make_entry(name, a, b, rank, alpha)      -> HotSwapEntry
+//    hs_create_registry()                        -> HotSwapRegistry
+//    hs_load(reg, name, entry)                   -> HotSwapRegistry(new)
+//    hs_unload(reg, name)                        -> HotSwapRegistry(new)
+//    hs_has(reg, name)                           -> bool
+//    hs_get(reg, name)                           -> HotSwapEntry|nil
+//    hs_list_names(reg)                          -> array
+//    hs_swap(session, name, reg)                 -> HotSwapSession(new)
+//    hs_forward(base, session, x)                -> array      // request-level
+//    hs_route_forward(base, session, reg, req)   -> array      // req: {adapter, input}
+//    hs_concurrent_serve(base, reg, reqs)        -> array      // 멀티태넌트 시뮬
+//    hs_merge(base, entry)                       -> HotSwapBase(merged)
+//    hs_unmerge(merged_base, entry)              -> HotSwapBase(unmerged)
+//    hs_merge_session(base, session, reg)        -> HotSwapBase(merged)
+//    hs_stats(reg, base)                         -> map
+//
+//  기준:
+//    - base W는 불변 (hs_merge는 새 HotSwapBase 반환, 원본 보존)
+//    - 어댑터는 entry 단위로 독립 (layer별 a/b list)
+//    - swap은 세션 참조만 바꿈 — copy-free
+//
+//  Ref: self/ml/finetune.hexa, self/ml/adapter_fusion.hexa
+//  L0 금지: src/*.rs 미접촉. 순수 .hexa.
+//  HX3 pitfalls: 세미콜론 금지, struct literal in if 금지, 예약어(generate)
+// ═══════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 0: Math helpers (self-contained)
+// ═══════════════════════════════════════════════════════════════
+
+fn hs_zeros1(n) {
+    let mut v = []
+    for i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn hs_zeros2(rows, cols) {
+    let mut r = []
+    for i in 0..rows { r = r + [hs_zeros1(cols)] }
+    return r
+}
+
+@pure
+fn hs_matvec(w, x, m, n) {
+    let mut y = []
+    for i in 0..m {
+        let mut s = 0.0
+        for j in 0..n { s = s + w[i][j] * x[j] }
+        y = y + [s]
+    }
+    return y
+}
+
+@pure
+fn hs_matmul(a, b, m, k, n) {
+    let mut c = []
+    for i in 0..m {
+        let mut row = []
+        for j in 0..n {
+            let mut s = 0.0
+            for p in 0..k { s = s + a[i][p] * b[p][j] }
+            row = row + [s]
+        }
+        c = c + [row]
+    }
+    return c
+}
+
+@memoize
+fn hs_scale(alpha, rank) {
+    return to_float(alpha) / to_float(rank)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 1: Structs
+// ═══════════════════════════════════════════════════════════════
+
+// 한 레이어의 freeze된 base weight
+struct HSLayer {
+    w: array,
+    out_dim: int,
+    in_dim: int
+}
+
+// base model (freeze된 레이어들)
+struct HotSwapBase {
+    layers: array,
+    n_layers: int,
+    merged_name: string
+}
+
+// 단일 어댑터 엔트리 (name → a,b,rank,alpha per layer)
+struct HotSwapEntry {
+    name: string,
+    a_list: array,
+    b_list: array,
+    rank: int,
+    alpha: int,
+    n_layers: int,
+    loaded_at: int
+}
+
+// name → entry registry
+struct HotSwapRegistry {
+    names: array,
+    entries: array,
+    count: int
+}
+
+// 요청 단위 세션 (어떤 어댑터를 쓸지 참조만)
+struct HotSwapSession {
+    session_id: int,
+    active_adapter: string,
+    swap_count: int
+}
+
+// 요청
+struct HotSwapRequest {
+    req_id: int,
+    adapter_name: string,
+    input: array
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 2: Base / Entry factories
+// ═══════════════════════════════════════════════════════════════
+
+fn hs_make_layer(w, out_dim, in_dim) {
+    return HSLayer { w: w, out_dim: out_dim, in_dim: in_dim }
+}
+
+fn hs_make_base(layers) {
+    return HotSwapBase {
+        layers: layers,
+        n_layers: len(layers),
+        merged_name: ""
+    }
+}
+
+fn hs_make_entry(name, a_list, b_list, rank, alpha) {
+    return HotSwapEntry {
+        name: name,
+        a_list: a_list,
+        b_list: b_list,
+        rank: rank,
+        alpha: alpha,
+        n_layers: len(a_list),
+        loaded_at: 0
+    }
+}
+
+// 영행렬 어댑터(초기 상태) — base 구조에 맞춰 a/b 생성
+fn hs_make_zero_entry(name, base: HotSwapBase, rank, alpha) {
+    let n = base.n_layers
+    let mut a_list = []
+    let mut b_list = []
+    let mut i = 0
+    while i < n {
+        let layer = base.layers[i]
+        // A: [rank, in_dim], B: [out_dim, rank], zero init
+        a_list = a_list + [hs_zeros2(rank, layer.in_dim)]
+        b_list = b_list + [hs_zeros2(layer.out_dim, rank)]
+        i = i + 1
+    }
+    return HotSwapEntry {
+        name: name,
+        a_list: a_list,
+        b_list: b_list,
+        rank: rank,
+        alpha: alpha,
+        n_layers: n,
+        loaded_at: 0
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 3: Registry — load / unload runtime
+// ═══════════════════════════════════════════════════════════════
+
+fn hs_create_registry() {
+    return HotSwapRegistry { names: [], entries: [], count: 0 }
+}
+
+fn hs_has(reg: HotSwapRegistry, name) {
+    let mut i = 0
+    while i < reg.count {
+        if reg.names[i] == name { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn hs_get(reg: HotSwapRegistry, name) {
+    let mut i = 0
+    while i < reg.count {
+        if reg.names[i] == name { return reg.entries[i] }
+        i = i + 1
+    }
+    return nil
+}
+
+fn hs_index_of(reg: HotSwapRegistry, name) {
+    let mut i = 0
+    while i < reg.count {
+        if reg.names[i] == name { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn hs_list_names(reg: HotSwapRegistry) {
+    return reg.names
+}
+
+// load_adapter: name → entry 등록 (새 registry 반환)
+// 이미 존재 시 overwrite (swap without re-init)
+fn hs_load(reg: HotSwapRegistry, name, entry: HotSwapEntry) {
+    let ts = reg.count + 1
+    let new_entry = HotSwapEntry {
+        name: name,
+        a_list: entry.a_list,
+        b_list: entry.b_list,
+        rank: entry.rank,
+        alpha: entry.alpha,
+        n_layers: entry.n_layers,
+        loaded_at: ts
+    }
+    let idx = hs_index_of(reg, name)
+    if idx >= 0 {
+        // overwrite in place (delta만 교체)
+        let mut new_entries = []
+        let mut i = 0
+        while i < reg.count {
+            if i == idx {
+                new_entries = new_entries + [new_entry]
+            } else {
+                new_entries = new_entries + [reg.entries[i]]
+            }
+            i = i + 1
+        }
+        return HotSwapRegistry {
+            names: reg.names,
+            entries: new_entries,
+            count: reg.count
+        }
+    }
+    // append
+    return HotSwapRegistry {
+        names: reg.names + [name],
+        entries: reg.entries + [new_entry],
+        count: reg.count + 1
+    }
+}
+
+// unload_adapter: name 제거
+fn hs_unload(reg: HotSwapRegistry, name) {
+    let idx = hs_index_of(reg, name)
+    if idx < 0 { return reg }
+    let mut new_names = []
+    let mut new_entries = []
+    let mut i = 0
+    while i < reg.count {
+        if i != idx {
+            new_names = new_names + [reg.names[i]]
+            new_entries = new_entries + [reg.entries[i]]
+        }
+        i = i + 1
+    }
+    return HotSwapRegistry {
+        names: new_names,
+        entries: new_entries,
+        count: reg.count - 1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 4: Swap without re-init
+//
+//  세션은 base 구조를 재구축하지 않고 active_adapter 이름만 바꾼다.
+//  기존 base W는 그대로 — 어떠한 copy도 없음.
+// ═══════════════════════════════════════════════════════════════
+
+fn hs_make_session(session_id) {
+    return HotSwapSession {
+        session_id: session_id,
+        active_adapter: "",
+        swap_count: 0
+    }
+}
+
+// 세션에 어댑터 지정 (없으면 빈 이름 유지)
+fn hs_swap(session: HotSwapSession, name, reg: HotSwapRegistry) {
+    if !hs_has(reg, name) {
+        // 존재하지 않는 이름은 빈 세션(base-only) 유지
+        return HotSwapSession {
+            session_id: session.session_id,
+            active_adapter: "",
+            swap_count: session.swap_count + 1
+        }
+    }
+    return HotSwapSession {
+        session_id: session.session_id,
+        active_adapter: name,
+        swap_count: session.swap_count + 1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 5: Forward — base + LoRA delta (request-level)
+//
+//  y = W @ x + (alpha/r) * B @ (A @ x)
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn hs_layer_forward_base(layer: HSLayer, x) {
+    return hs_matvec(layer.w, x, layer.out_dim, layer.in_dim)
+}
+
+@hot
+fn hs_layer_forward_with_delta(layer: HSLayer, a, b, rank, alpha, x) {
+    let base = hs_matvec(layer.w, x, layer.out_dim, layer.in_dim)
+    let ax = hs_matvec(a, x, rank, layer.in_dim)
+    let bax = hs_matvec(b, ax, layer.out_dim, rank)
+    let s = hs_scale(alpha, rank)
+    let mut y = []
+    let mut i = 0
+    while i < layer.out_dim {
+        y = y + [base[i] + s * bax[i]]
+        i = i + 1
+    }
+    return y
+}
+
+// Full-model forward — session이 지정한 어댑터 사용
+@hot
+fn hs_forward(base: HotSwapBase, session: HotSwapSession, reg: HotSwapRegistry, x) {
+    let n = base.n_layers
+    let name = session.active_adapter
+    let has_adapter = name != "" && hs_has(reg, name)
+    let entry = nil
+    let mut has_flag = false
+    if has_adapter {
+        has_flag = true
+    }
+    let mut h = x
+    let mut i = 0
+    while i < n {
+        let layer = base.layers[i]
+        if has_flag {
+            let e = hs_get(reg, name)
+            h = hs_layer_forward_with_delta(layer, e.a_list[i], e.b_list[i], e.rank, e.alpha, h)
+        } else {
+            h = hs_layer_forward_base(layer, h)
+        }
+        i = i + 1
+    }
+    return h
+}
+
+// Request-level routing: per-request adapter 선택
+fn hs_route_forward(base: HotSwapBase, reg: HotSwapRegistry, req: HotSwapRequest) {
+    let sess = hs_make_session(req.req_id)
+    let sess2 = hs_swap(sess, req.adapter_name, reg)
+    return hs_forward(base, sess2, reg, req.input)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 6: Concurrent multi-tenant serve (시뮬)
+//
+//  여러 요청이 각자 다른 어댑터를 쓰는 상황을 순차 시뮬.
+//  기준 weight은 공유되고, 각 요청은 독립된 세션을 가진다.
+// ═══════════════════════════════════════════════════════════════
+
+fn hs_concurrent_serve(base: HotSwapBase, reg: HotSwapRegistry, reqs) {
+    let n = len(reqs)
+    let mut outs = []
+    let mut i = 0
+    while i < n {
+        let req = reqs[i]
+        let y = hs_route_forward(base, reg, req)
+        outs = outs + [y]
+        i = i + 1
+    }
+    return outs
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 7: merge / unmerge
+//
+//  merge: W' = W + (alpha/r) * B @ A  — 새 HotSwapBase 반환
+//         (원본은 불변, 조사 가능)
+//  unmerge: 원본으로 복원 (merge의 역)
+// ═══════════════════════════════════════════════════════════════
+
+fn hs_merge(base: HotSwapBase, entry: HotSwapEntry) {
+    let n = base.n_layers
+    if entry.n_layers != n {
+        println("[hs_merge] ERROR: layer count mismatch base=" + to_string(n) + " entry=" + to_string(entry.n_layers))
+        return base
+    }
+    let s = hs_scale(entry.alpha, entry.rank)
+    let mut merged_layers = []
+    let mut i = 0
+    while i < n {
+        let layer = base.layers[i]
+        let a = entry.a_list[i]
+        let b = entry.b_list[i]
+        let m_dim = layer.out_dim
+        let n_dim = layer.in_dim
+        let r = entry.rank
+        let ba = hs_matmul(b, a, m_dim, r, n_dim)
+        let mut w_new = []
+        let mut ii = 0
+        while ii < m_dim {
+            let mut row = []
+            let mut jj = 0
+            while jj < n_dim {
+                row = row + [layer.w[ii][jj] + s * ba[ii][jj]]
+                jj = jj + 1
+            }
+            w_new = w_new + [row]
+            ii = ii + 1
+        }
+        merged_layers = merged_layers + [HSLayer { w: w_new, out_dim: m_dim, in_dim: n_dim }]
+        i = i + 1
+    }
+    return HotSwapBase {
+        layers: merged_layers,
+        n_layers: n,
+        merged_name: entry.name
+    }
+}
+
+fn hs_unmerge(merged_base: HotSwapBase, entry: HotSwapEntry) {
+    let n = merged_base.n_layers
+    if entry.n_layers != n {
+        println("[hs_unmerge] ERROR: layer count mismatch")
+        return merged_base
+    }
+    let s = hs_scale(entry.alpha, entry.rank)
+    let mut unmerged_layers = []
+    let mut i = 0
+    while i < n {
+        let layer = merged_base.layers[i]
+        let a = entry.a_list[i]
+        let b = entry.b_list[i]
+        let m_dim = layer.out_dim
+        let n_dim = layer.in_dim
+        let r = entry.rank
+        let ba = hs_matmul(b, a, m_dim, r, n_dim)
+        let mut w_old = []
+        let mut ii = 0
+        while ii < m_dim {
+            let mut row = []
+            let mut jj = 0
+            while jj < n_dim {
+                row = row + [layer.w[ii][jj] - s * ba[ii][jj]]
+                jj = jj + 1
+            }
+            w_old = w_old + [row]
+            ii = ii + 1
+        }
+        unmerged_layers = unmerged_layers + [HSLayer { w: w_old, out_dim: m_dim, in_dim: n_dim }]
+        i = i + 1
+    }
+    return HotSwapBase {
+        layers: unmerged_layers,
+        n_layers: n,
+        merged_name: ""
+    }
+}
+
+// 세션이 지정한 어댑터로 merge — request 세션 값 그대로 존중
+fn hs_merge_session(base: HotSwapBase, session: HotSwapSession, reg: HotSwapRegistry) {
+    let name = session.active_adapter
+    if name == "" { return base }
+    if !hs_has(reg, name) { return base }
+    let e = hs_get(reg, name)
+    return hs_merge(base, e)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 8: Stats / introspection
+// ═══════════════════════════════════════════════════════════════
+
+fn hs_stats(reg: HotSwapRegistry, base: HotSwapBase) {
+    let mut total_base = 0
+    let mut i = 0
+    while i < base.n_layers {
+        let layer = base.layers[i]
+        total_base = total_base + layer.out_dim * layer.in_dim
+        i = i + 1
+    }
+    let mut total_delta = 0
+    let mut total_rank = 0
+    i = 0
+    while i < reg.count {
+        let e = reg.entries[i]
+        let mut j = 0
+        while j < e.n_layers {
+            let layer = base.layers[j]
+            total_delta = total_delta + e.rank * layer.in_dim + layer.out_dim * e.rank
+            j = j + 1
+        }
+        total_rank = total_rank + e.rank
+        i = i + 1
+    }
+    return #{
+        "base_params": total_base,
+        "delta_params_total": total_delta,
+        "registry_count": reg.count,
+        "rank_sum": total_rank,
+        "n_layers": base.n_layers
+    }
+}
+
+println("[lora_hotswap] module loaded — registry + load/unload + swap + route + merge/unmerge")

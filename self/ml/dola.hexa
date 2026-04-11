@@ -1,0 +1,451 @@
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/dola.hexa — DoLa (Decoding by Contrasting Layers)
+//
+//  Paper: Chuang et al. 2023, "DoLa: Decoding by Contrasting Layers
+//         Improves Factuality in Large Language Models"
+//
+//  Core idea:
+//    mature  = final-layer logits (M_N)
+//    premature = earlier-layer logits (M_k, k < N) projected via
+//                same LM head (early exit style)
+//    contrastive logit = log softmax(M_N) - log softmax(M_k*)
+//    k* chosen by maximum JSD between softmax(M_N) and softmax(M_k)
+//
+//  Features:
+//    1. Layer logit projection (hidden -> logits) via shared head
+//    2. Mature vs premature distributions
+//    3. JSD-based premature layer selection (dynamic per-token)
+//    4. Contrastive logit computation (log p_mature - log p_premature)
+//    5. APC (adaptive plausibility constraint): mask low-prob tokens
+//    6. Next-token selection (argmax contrastive)
+//    7. Hallucination suppression metric (penalty mass)
+//    8. Improvement over original decode baseline
+//
+//  API:
+//    dola_softmax(logits) -> array
+//    dola_log_softmax(logits) -> array
+//    dola_project(hidden, head_w, head_b, vocab, dim) -> array
+//    dola_jsd(p, q) -> float
+//    dola_select_premature(mature_dist, layer_dists) -> int
+//    dola_contrastive_logits(mature, premature, alpha) -> array
+//    dola_apc_mask(mature_dist, logits, alpha) -> array
+//    dola_next_token(hidden_per_layer, head, candidate_layers, alpha) -> DoLaStep
+//    dola_decode_vs_original(layer_hiddens, head, candidate_layers, alpha) -> DoLaCompare
+//    dola_hallucination_score(dist, hallucination_ids) -> float
+//
+//  L0 금지: src/*.rs 미접촉. 순수 .hexa. Rust 금지.
+// ═══════════════════════════════════════════════════════════════
+
+// ── Math helpers ─────────────────────────────────────────────
+fn _dola_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn _dola_max(a, b) {
+    if a >= b { return a }
+    return b
+}
+
+fn _dola_min(a, b) {
+    if a <= b { return a }
+    return b
+}
+
+// ── Natural log (series approx) ─────────────────────────────
+@pure
+fn dola_ln(x) {
+    if x <= 0.0 { return -999.0 }
+    let mut v = x
+    let mut adj = 0.0
+    while v > 2.0 {
+        v = v / 2.718281828
+        adj = adj + 1.0
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        adj = adj - 1.0
+    }
+    let t = (v - 1.0) / (v + 1.0)
+    let t2 = t * t
+    let r = 2.0 * (t + t * t2 / 3.0 + t * t2 * t2 / 5.0 + t * t2 * t2 * t2 / 7.0)
+    return r + adj
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Structs
+// ═══════════════════════════════════════════════════════════════
+
+// LM head: hidden[dim] -> logits[vocab] shared across layers
+struct DoLaHead {
+    w: array,
+    bias: array,
+    vocab: int,
+    dim: int
+}
+
+// Single-step DoLa output: chosen token + diagnostics
+struct DoLaStep {
+    token: int,
+    premature_layer: int,
+    mature_logprob: float,
+    premature_logprob: float,
+    contrastive: float,
+    jsd: float
+}
+
+// Comparison of DoLa vs vanilla final-layer decode
+struct DoLaCompare {
+    dola_token: int,
+    orig_token: int,
+    dola_step: DoLaStep,
+    orig_logprob: float,
+    improved: bool,
+    jsd_selected: int
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Core numerics: softmax / log_softmax / projection
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn dola_softmax(logits) {
+    let n = len(logits)
+    if n == 0 { return [] }
+    let mut mx = logits[0]
+    let mut i = 1
+    while i < n {
+        if logits[i] > mx { mx = logits[i] }
+        i = i + 1
+    }
+    let mut exps = []
+    let mut total = 0.0
+    i = 0
+    while i < n {
+        let e = exp(logits[i] - mx)
+        exps = exps + [e]
+        total = total + e
+        i = i + 1
+    }
+    let mut out = []
+    i = 0
+    while i < n {
+        out = out + [exps[i] / total]
+        i = i + 1
+    }
+    return out
+}
+
+@pure
+fn dola_log_softmax(logits) {
+    let n = len(logits)
+    if n == 0 { return [] }
+    let mut mx = logits[0]
+    let mut i = 1
+    while i < n {
+        if logits[i] > mx { mx = logits[i] }
+        i = i + 1
+    }
+    let mut total = 0.0
+    i = 0
+    while i < n {
+        total = total + exp(logits[i] - mx)
+        i = i + 1
+    }
+    let lse = mx + dola_ln(total)
+    let mut out = []
+    i = 0
+    while i < n {
+        out = out + [logits[i] - lse]
+        i = i + 1
+    }
+    return out
+}
+
+// Project a hidden vector to vocab logits via shared LM head
+// logits[v] = sum_j head.w[v][j] * hidden[j] + head.bias[v]
+@pure
+fn dola_project(hidden, head: DoLaHead) {
+    let vocab = head.vocab
+    let dim = head.dim
+    let mut logits = []
+    let mut v = 0
+    while v < vocab {
+        let mut s = head.bias[v]
+        let mut j = 0
+        while j < dim {
+            s = s + head.w[v][j] * hidden[j]
+            j = j + 1
+        }
+        logits = logits + [s]
+        v = v + 1
+    }
+    return logits
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  JSD (Jensen–Shannon divergence) — symmetric KL
+//
+//  JSD(P||Q) = 0.5 * KL(P || M) + 0.5 * KL(Q || M), M = 0.5(P+Q)
+//  Range: [0, ln 2] for base-e
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn dola_jsd(p, q) {
+    let n = len(p)
+    if n == 0 || n != len(q) { return 0.0 }
+    let mut jsd = 0.0
+    let mut i = 0
+    while i < n {
+        let pi = p[i]
+        let qi = q[i]
+        let mi = 0.5 * (pi + qi)
+        if pi > 1.0e-12 && mi > 1.0e-12 {
+            jsd = jsd + 0.5 * pi * (dola_ln(pi) - dola_ln(mi))
+        }
+        if qi > 1.0e-12 && mi > 1.0e-12 {
+            jsd = jsd + 0.5 * qi * (dola_ln(qi) - dola_ln(mi))
+        }
+        i = i + 1
+    }
+    if jsd < 0.0 { return 0.0 }
+    return jsd
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Premature layer selection
+//
+//  Given mature distribution and a list of candidate layer dists,
+//  choose the layer maximizing JSD(mature, layer). This is the
+//  dynamic premature layer (DoLa paper Eq. 5).
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn dola_select_premature(mature_dist, layer_dists, candidate_layers) {
+    let m = len(candidate_layers)
+    if m == 0 { return 0 }
+    let mut best = candidate_layers[0]
+    let mut best_jsd = dola_jsd(mature_dist, layer_dists[best])
+    let mut i = 1
+    while i < m {
+        let k = candidate_layers[i]
+        let j = dola_jsd(mature_dist, layer_dists[k])
+        if j > best_jsd {
+            best_jsd = j
+            best = k
+        }
+        i = i + 1
+    }
+    return best
+}
+
+@pure
+fn dola_select_premature_jsd(mature_dist, layer_dists, candidate_layers) {
+    let m = len(candidate_layers)
+    if m == 0 { return 0.0 }
+    let mut best_jsd = dola_jsd(mature_dist, layer_dists[candidate_layers[0]])
+    let mut i = 1
+    while i < m {
+        let j = dola_jsd(mature_dist, layer_dists[candidate_layers[i]])
+        if j > best_jsd { best_jsd = j }
+        i = i + 1
+    }
+    return best_jsd
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Contrastive logits: log p_mature(x) - alpha * log p_premature(x)
+//  (DoLa paper Eq. 3; alpha typically in (0, 1])
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn dola_contrastive_logits(mature_logits, premature_logits, alpha) {
+    let lm = dola_log_softmax(mature_logits)
+    let lp = dola_log_softmax(premature_logits)
+    let n = len(lm)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [lm[i] - alpha * lp[i]]
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  APC (Adaptive Plausibility Constraint) — paper Eq. 4
+//
+//  V_head = { x : p_mature(x) >= alpha * max p_mature }
+//  Tokens outside V_head get logit -inf (practically -1e9).
+//  Prevents contrastive scoring from rewarding implausible tokens.
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn dola_apc_mask(mature_dist, contrastive_logits, alpha) {
+    let n = len(mature_dist)
+    if n == 0 { return [] }
+    let mut mx = mature_dist[0]
+    let mut i = 1
+    while i < n {
+        if mature_dist[i] > mx { mx = mature_dist[i] }
+        i = i + 1
+    }
+    let thr = alpha * mx
+    let mut out = []
+    i = 0
+    while i < n {
+        if mature_dist[i] >= thr {
+            out = out + [contrastive_logits[i]]
+        } else {
+            out = out + [-1.0e9]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  argmax
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn dola_argmax(v) {
+    let n = len(v)
+    if n == 0 { return 0 }
+    let mut best = 0
+    let mut bv = v[0]
+    let mut i = 1
+    while i < n {
+        if v[i] > bv { bv = v[i]; best = i }
+        i = i + 1
+    }
+    return best
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  End-to-end single step
+//
+//  Inputs:
+//    layer_hiddens : per-layer hidden vectors (index 0..N-1)
+//    head          : shared LM head
+//    candidate_layers : indices into layer_hiddens considered for
+//                      "premature" (typically lower half of the stack)
+//    alpha         : contrastive strength (APC + subtraction)
+//
+//  Output: DoLaStep with chosen token and diagnostics.
+// ═══════════════════════════════════════════════════════════════
+
+@hot
+fn dola_next_token(layer_hiddens, head: DoLaHead, candidate_layers, alpha) {
+    let n = len(layer_hiddens)
+    // project every layer (O(N * vocab * dim)); small here
+    let mut layer_logits = []
+    let mut layer_dists = []
+    let mut i = 0
+    while i < n {
+        let lg = dola_project(layer_hiddens[i], head)
+        layer_logits = layer_logits + [lg]
+        layer_dists = layer_dists + [dola_softmax(lg)]
+        i = i + 1
+    }
+    let mature = n - 1
+    let mature_logits = layer_logits[mature]
+    let mature_dist = layer_dists[mature]
+
+    let prem = dola_select_premature(mature_dist, layer_dists, candidate_layers)
+    let prem_logits = layer_logits[prem]
+    let prem_dist = layer_dists[prem]
+
+    let contrast = dola_contrastive_logits(mature_logits, prem_logits, alpha)
+    let masked = dola_apc_mask(mature_dist, contrast, alpha)
+    let tok = dola_argmax(masked)
+
+    let lm_dist = dola_log_softmax(mature_logits)
+    let lp_dist = dola_log_softmax(prem_logits)
+    let jsd = dola_jsd(mature_dist, prem_dist)
+
+    return DoLaStep {
+        token: tok,
+        premature_layer: prem,
+        mature_logprob: lm_dist[tok],
+        premature_logprob: lp_dist[tok],
+        contrastive: lm_dist[tok] - alpha * lp_dist[tok],
+        jsd: jsd
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  DoLa vs original (final-layer greedy) comparison
+//
+//  "improved" := DoLa picks a different token AND mature logprob
+//  of that token is within APC band (i.e. still plausible).
+//  This is the proxy for hallucination suppression in tests.
+// ═══════════════════════════════════════════════════════════════
+
+fn dola_decode_vs_original(layer_hiddens, head: DoLaHead, candidate_layers, alpha) {
+    let step = dola_next_token(layer_hiddens, head, candidate_layers, alpha)
+    let mature_logits = dola_project(layer_hiddens[len(layer_hiddens) - 1], head)
+    let orig_tok = dola_argmax(mature_logits)
+    let orig_lp = dola_log_softmax(mature_logits)
+    let improved = step.token != orig_tok
+    return DoLaCompare {
+        dola_token: step.token,
+        orig_token: orig_tok,
+        dola_step: step,
+        orig_logprob: orig_lp[orig_tok],
+        improved: improved,
+        jsd_selected: step.premature_layer
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Hallucination score: probability mass DoLa removes from a
+//  (supplied) set of hallucinatory token ids.
+//
+//  penalty = sum_{i in H} p_mature(i) - p_dola(i)
+//  Positive => DoLa suppresses hallucinations vs original.
+//  p_dola is softmax over the contrastive+APC logits.
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn dola_hallucination_score(mature_dist, dola_dist, hallucination_ids) {
+    let m = len(hallucination_ids)
+    let mut penalty = 0.0
+    let mut i = 0
+    while i < m {
+        let id = hallucination_ids[i]
+        penalty = penalty + mature_dist[id] - dola_dist[id]
+        i = i + 1
+    }
+    return penalty
+}
+
+// Convenience: compute the DoLa post-mask distribution
+@pure
+fn dola_distribution(layer_hiddens, head: DoLaHead, candidate_layers, alpha) {
+    let n = len(layer_hiddens)
+    let mut layer_logits = []
+    let mut layer_dists = []
+    let mut i = 0
+    while i < n {
+        let lg = dola_project(layer_hiddens[i], head)
+        layer_logits = layer_logits + [lg]
+        layer_dists = layer_dists + [dola_softmax(lg)]
+        i = i + 1
+    }
+    let mature = n - 1
+    let prem = dola_select_premature(layer_dists[mature], layer_dists, candidate_layers)
+    let contrast = dola_contrastive_logits(layer_logits[mature], layer_logits[prem], alpha)
+    let masked = dola_apc_mask(layer_dists[mature], contrast, alpha)
+    return dola_softmax(masked)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Constructors
+// ═══════════════════════════════════════════════════════════════
+
+fn dola_make_head(w, bias, vocab, dim) {
+    return DoLaHead { w: w, bias: bias, vocab: vocab, dim: dim }
+}
+
+println("[dola] module loaded — contrastive layer decoding + JSD selection + APC + hallucination suppression")

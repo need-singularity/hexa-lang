@@ -1,0 +1,492 @@
+// ===================================================================
+//  self/ml/lean_tactic.hexa — Lean Tactic Integration (pure Hexa)
+//
+//  Formal proof engine in HEXA. Tactic DSL + proof tree + goal stack
+//  + proof checker/verifier. Supports propositional logic fragment
+//  suitable for forward/backward reasoning and math推론 chains.
+//
+//  Public API:
+//    // ── Formulas (propositional core) ─────────────────────
+//    prop_atom(name)            -> Atom("P")
+//    prop_not(f)                -> Not(f)
+//    prop_and(a, b)             -> And(a, b)
+//    prop_or(a, b)              -> Or(a, b)
+//    prop_imp(a, b)             -> Imp(a, b)  // a -> b
+//    prop_iff(a, b)             -> Iff(a, b)
+//    prop_true()                -> True
+//    prop_false()               -> False
+//    formula_to_string(f)       -> pretty printer
+//    formula_eq(a, b)           -> structural equality
+//    formula_contains(f, g)     -> subterm test
+//    formula_subst(f, old, new) -> substitution (rewrite)
+//
+//    // ── Goals / proof state ───────────────────────────────
+//    mk_goal(hyps, target)      -> ["goal", hyps, target]
+//    goal_hyps(g)               -> hypotheses array
+//    goal_target(g)             -> target formula
+//    mk_state(goals)            -> proof state with goal stack
+//    state_current(st)          -> current goal (top of stack)
+//    state_push(st, g)          -> push new subgoal
+//    state_pop(st)              -> remove current goal (solved)
+//    state_replace(st, subs)    -> replace current goal with subgoals
+//    state_done(st)             -> bool: goals empty
+//    state_depth(st)            -> len(goals)
+//
+//    // ── Proof tree ────────────────────────────────────────
+//    mk_node(tac, goal, children) -> proof node
+//    node_tactic(n) / node_goal(n) / node_children(n)
+//    node_size(n)               -> count of nodes
+//    node_leaves(n)             -> leaf goals
+//
+//    // ── Tactic DSL ────────────────────────────────────────
+//    tac_intro()                -> tactic: "intro" (moves Imp target to hyp)
+//    tac_apply(f)               -> tactic: "apply" (backward on f)
+//    tac_rewrite(lhs, rhs)      -> tactic: "rewrite" (substitute lhs->rhs)
+//    tac_induction(var)         -> tactic: "induction" (nat split 0/succ)
+//    tac_split()                -> tactic: "split" (And target)
+//    tac_exact(f)               -> tactic: "exact" (target via given hyp)
+//    tac_assumption()           -> tactic: "assumption" (any matching hyp)
+//    tac_contradiction()        -> tactic: "contradiction" (hyp + not hyp)
+//    tactic_name(t)             -> string
+//    tactic_args(t)             -> array of formula args
+//
+//    // ── Tactic application (rules) ────────────────────────
+//    apply_tactic(state, tac)   -> new_state | ["error", msg]
+//    result_ok(r)               -> bool
+//    result_state(r)            -> state
+//    result_error(r)            -> string
+//
+//    // ── Proof driver ──────────────────────────────────────
+//    check_proof(goal, tacs)    -> bool (runs tacs, true if goals gone)
+//    verify_proof(goal, tacs)   -> ["ok"] or ["fail", step, msg]
+//    build_proof_tree(goal, tacs) -> proof tree root
+//
+//    // ── Standard proof examples ───────────────────────────
+//    proof_imp_refl(p)          -> (p -> p) via intro + assumption
+//    proof_and_comm(p, q)       -> p ∧ q -> q ∧ p
+//    proof_modus_ponens()       -> example tactic list
+// ===================================================================
+
+// ===================================================================
+//  Formula encoding  (as tagged arrays so no struct literal issues)
+//
+//  Atom(name)     -> ["atom", name]
+//  True           -> ["true"]
+//  False          -> ["false"]
+//  Not(f)         -> ["not", f]
+//  And(a,b)       -> ["and", a, b]
+//  Or(a,b)        -> ["or", a, b]
+//  Imp(a,b)       -> ["imp", a, b]
+//  Iff(a,b)       -> ["iff", a, b]
+// ===================================================================
+
+fn prop_atom(name) { return ["atom", name] }
+fn prop_true()     { return ["true"] }
+fn prop_false()    { return ["false"] }
+fn prop_not(f)     { return ["not", f] }
+fn prop_and(a, b)  { return ["and", a, b] }
+fn prop_or(a, b)   { return ["or", a, b] }
+fn prop_imp(a, b)  { return ["imp", a, b] }
+fn prop_iff(a, b)  { return ["iff", a, b] }
+
+fn formula_tag(f) { return f[0] }
+
+fn formula_eq(a, b) {
+    let ta = a[0]
+    let tb = b[0]
+    if ta != tb { return false }
+    if ta == "atom" { return a[1] == b[1] }
+    if ta == "true"  { return true }
+    if ta == "false" { return true }
+    if ta == "not"   { return formula_eq(a[1], b[1]) }
+    // binary
+    if formula_eq(a[1], b[1]) {
+        if formula_eq(a[2], b[2]) { return true }
+    }
+    return false
+}
+
+fn formula_to_string(f) {
+    let t = f[0]
+    if t == "atom"  { return f[1] }
+    if t == "true"  { return "T" }
+    if t == "false" { return "F" }
+    if t == "not"   { return "~" + formula_to_string(f[1]) }
+    if t == "and" {
+        return "(" + formula_to_string(f[1]) + " /\\ " + formula_to_string(f[2]) + ")"
+    }
+    if t == "or" {
+        return "(" + formula_to_string(f[1]) + " \\/ " + formula_to_string(f[2]) + ")"
+    }
+    if t == "imp" {
+        return "(" + formula_to_string(f[1]) + " -> " + formula_to_string(f[2]) + ")"
+    }
+    if t == "iff" {
+        return "(" + formula_to_string(f[1]) + " <-> " + formula_to_string(f[2]) + ")"
+    }
+    return "?"
+}
+
+fn formula_contains(f, g) {
+    if formula_eq(f, g) { return true }
+    let t = f[0]
+    if t == "atom"  { return false }
+    if t == "true"  { return false }
+    if t == "false" { return false }
+    if t == "not"   { return formula_contains(f[1], g) }
+    if formula_contains(f[1], g) { return true }
+    return formula_contains(f[2], g)
+}
+
+fn formula_subst(f, old, new) {
+    if formula_eq(f, old) { return new }
+    let t = f[0]
+    if t == "atom"  { return f }
+    if t == "true"  { return f }
+    if t == "false" { return f }
+    if t == "not"   { return ["not", formula_subst(f[1], old, new)] }
+    let l = formula_subst(f[1], old, new)
+    let r = formula_subst(f[2], old, new)
+    return [t, l, r]
+}
+
+// ===================================================================
+//  Goal and proof state
+//
+//  Goal  : ["goal", hyps, target]
+//  State : ["state", [goal0, goal1, ...]]   (stack of open goals; head=current)
+// ===================================================================
+
+fn mk_goal(hyps, target) { return ["goal", hyps, target] }
+fn goal_hyps(g)          { return g[1] }
+fn goal_target(g)        { return g[2] }
+
+fn mk_state(goals) { return ["state", goals] }
+
+fn state_goals(st) { return st[1] }
+
+fn state_depth(st) { return len(state_goals(st)) }
+
+fn state_done(st) { return len(state_goals(st)) == 0 }
+
+fn state_current(st) {
+    let gs = state_goals(st)
+    if len(gs) == 0 { return ["none"] }
+    return gs[0]
+}
+
+fn state_push(st, g) {
+    let gs = state_goals(st)
+    let mut ng = [g]
+    let mut i = 0
+    while i < len(gs) { ng = ng + [gs[i]]; i = i + 1 }
+    return mk_state(ng)
+}
+
+fn state_pop(st) {
+    let gs = state_goals(st)
+    let mut ng = []
+    let mut i = 1
+    while i < len(gs) { ng = ng + [gs[i]]; i = i + 1 }
+    return mk_state(ng)
+}
+
+// Replace current goal with a list of new subgoals (subs may be empty → pop only).
+fn state_replace(st, subs) {
+    let gs = state_goals(st)
+    let mut ng = []
+    let mut i = 0
+    while i < len(subs) { ng = ng + [subs[i]]; i = i + 1 }
+    i = 1
+    while i < len(gs) { ng = ng + [gs[i]]; i = i + 1 }
+    return mk_state(ng)
+}
+
+// ===================================================================
+//  Proof tree
+//
+//  Node : ["node", tactic, goal, children]
+// ===================================================================
+
+fn mk_node(tac, goal, children) { return ["node", tac, goal, children] }
+fn node_tactic(n)   { return n[1] }
+fn node_goal(n)     { return n[2] }
+fn node_children(n) { return n[3] }
+
+fn node_size(n) {
+    let cs = node_children(n)
+    let mut s = 1
+    let mut i = 0
+    while i < len(cs) { s = s + node_size(cs[i]); i = i + 1 }
+    return s
+}
+
+fn node_leaves(n) {
+    let cs = node_children(n)
+    if len(cs) == 0 { return [node_goal(n)] }
+    let mut out = []
+    let mut i = 0
+    while i < len(cs) {
+        let sub = node_leaves(cs[i])
+        let mut j = 0
+        while j < len(sub) { out = out + [sub[j]]; j = j + 1 }
+        i = i + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  Tactic DSL
+//
+//  Tactic : ["tac", name, args...]
+// ===================================================================
+
+fn tac_intro()          { return ["tac", "intro"] }
+fn tac_apply(f)         { return ["tac", "apply", f] }
+fn tac_rewrite(lhs, rhs){ return ["tac", "rewrite", lhs, rhs] }
+fn tac_induction(var)   { return ["tac", "induction", var] }
+fn tac_split()          { return ["tac", "split"] }
+fn tac_exact(f)         { return ["tac", "exact", f] }
+fn tac_assumption()     { return ["tac", "assumption"] }
+fn tac_contradiction()  { return ["tac", "contradiction"] }
+
+fn tactic_name(t) { return t[1] }
+
+fn tactic_args(t) {
+    let mut out = []
+    let mut i = 2
+    while i < len(t) { out = out + [t[i]]; i = i + 1 }
+    return out
+}
+
+// ===================================================================
+//  Tactic result wrappers
+// ===================================================================
+
+fn result_ok(r)    { return r[0] == "ok" }
+fn result_state(r) { return r[1] }
+fn result_error(r) { return r[1] }
+fn mk_ok(st)       { return ["ok", st] }
+fn mk_err(msg)     { return ["error", msg] }
+
+// ===================================================================
+//  Apply tactic to state
+// ===================================================================
+
+fn hyps_contains(hs, f) {
+    let mut i = 0
+    while i < len(hs) {
+        if formula_eq(hs[i], f) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn apply_intro(st) {
+    let g = state_current(st)
+    if g[0] != "goal" { return mk_err("intro: no goal") }
+    let target = goal_target(g)
+    if target[0] != "imp" { return mk_err("intro: target not Imp") }
+    let hyps = goal_hyps(g)
+    let new_hyps = hyps + [target[1]]
+    let new_goal = mk_goal(new_hyps, target[2])
+    return mk_ok(state_replace(st, [new_goal]))
+}
+
+fn apply_split(st) {
+    let g = state_current(st)
+    if g[0] != "goal" { return mk_err("split: no goal") }
+    let target = goal_target(g)
+    if target[0] != "and" { return mk_err("split: target not And") }
+    let hyps = goal_hyps(g)
+    let g1 = mk_goal(hyps, target[1])
+    let g2 = mk_goal(hyps, target[2])
+    return mk_ok(state_replace(st, [g1, g2]))
+}
+
+fn apply_exact(st, f) {
+    let g = state_current(st)
+    if g[0] != "goal" { return mk_err("exact: no goal") }
+    let target = goal_target(g)
+    if !formula_eq(f, target) { return mk_err("exact: formula != target") }
+    let hyps = goal_hyps(g)
+    if !hyps_contains(hyps, f) { return mk_err("exact: formula not in hyps") }
+    return mk_ok(state_replace(st, []))
+}
+
+fn apply_assumption(st) {
+    let g = state_current(st)
+    if g[0] != "goal" { return mk_err("assumption: no goal") }
+    let target = goal_target(g)
+    let hyps = goal_hyps(g)
+    if hyps_contains(hyps, target) {
+        return mk_ok(state_replace(st, []))
+    }
+    return mk_err("assumption: target not in hyps")
+}
+
+fn apply_apply(st, f) {
+    // Backward reasoning: if f = (A -> B) and target = B, new subgoal A
+    let g = state_current(st)
+    if g[0] != "goal" { return mk_err("apply: no goal") }
+    let target = goal_target(g)
+    let hyps = goal_hyps(g)
+    if f[0] != "imp" { return mk_err("apply: given not Imp") }
+    if !formula_eq(f[2], target) { return mk_err("apply: conclusion != target") }
+    if !hyps_contains(hyps, f) { return mk_err("apply: lemma not in hyps") }
+    let new_goal = mk_goal(hyps, f[1])
+    return mk_ok(state_replace(st, [new_goal]))
+}
+
+fn apply_rewrite(st, lhs, rhs) {
+    let g = state_current(st)
+    if g[0] != "goal" { return mk_err("rewrite: no goal") }
+    let target = goal_target(g)
+    if !formula_contains(target, lhs) { return mk_err("rewrite: lhs not in target") }
+    let new_target = formula_subst(target, lhs, rhs)
+    let hyps = goal_hyps(g)
+    let new_goal = mk_goal(hyps, new_target)
+    return mk_ok(state_replace(st, [new_goal]))
+}
+
+fn apply_induction(st, var) {
+    // Toy nat induction: replaces goal P(var) with base P(0) and step P(succ)
+    let g = state_current(st)
+    if g[0] != "goal" { return mk_err("induction: no goal") }
+    let target = goal_target(g)
+    let hyps = goal_hyps(g)
+    let v = prop_atom(var)
+    if !formula_contains(target, v) { return mk_err("induction: var not in target") }
+    let base = formula_subst(target, v, prop_atom("0"))
+    let step = formula_subst(target, v, prop_atom("succ"))
+    let g1 = mk_goal(hyps, base)
+    let g2 = mk_goal(hyps + [target], step)
+    return mk_ok(state_replace(st, [g1, g2]))
+}
+
+fn apply_contradiction(st) {
+    let g = state_current(st)
+    if g[0] != "goal" { return mk_err("contradiction: no goal") }
+    let hyps = goal_hyps(g)
+    let n = len(hyps)
+    let mut i = 0
+    while i < n {
+        let h = hyps[i]
+        if h[0] == "not" {
+            let inner = h[1]
+            if hyps_contains(hyps, inner) {
+                return mk_ok(state_replace(st, []))
+            }
+        }
+        i = i + 1
+    }
+    return mk_err("contradiction: no pair found")
+}
+
+fn apply_tactic(st, tac) {
+    let name = tactic_name(tac)
+    let args = tactic_args(tac)
+    if name == "intro"         { return apply_intro(st) }
+    if name == "split"         { return apply_split(st) }
+    if name == "assumption"    { return apply_assumption(st) }
+    if name == "contradiction" { return apply_contradiction(st) }
+    if name == "exact"         { return apply_exact(st, args[0]) }
+    if name == "apply"         { return apply_apply(st, args[0]) }
+    if name == "rewrite"       { return apply_rewrite(st, args[0], args[1]) }
+    if name == "induction"     {
+        let var_atom = args[0]
+        return apply_induction(st, var_atom[1])
+    }
+    return mk_err("unknown tactic: " + name)
+}
+
+// ===================================================================
+//  Proof driver
+// ===================================================================
+
+fn check_proof(goal, tacs) {
+    let mut st = mk_state([goal])
+    let n = len(tacs)
+    let mut i = 0
+    while i < n {
+        let r = apply_tactic(st, tacs[i])
+        if !result_ok(r) { return false }
+        st = result_state(r)
+        i = i + 1
+    }
+    return state_done(st)
+}
+
+fn verify_proof(goal, tacs) {
+    let mut st = mk_state([goal])
+    let n = len(tacs)
+    let mut i = 0
+    while i < n {
+        let r = apply_tactic(st, tacs[i])
+        if !result_ok(r) { return ["fail", to_string(i), result_error(r)] }
+        st = result_state(r)
+        i = i + 1
+    }
+    if state_done(st) { return ["ok"] }
+    return ["fail", to_string(n), "goals remain: " + to_string(state_depth(st))]
+}
+
+// Build linear proof tree (one child per step). Final child stores the
+// residual goal (or a "qed" marker when goals are exhausted).
+fn build_proof_tree(goal, tacs) {
+    let mut st = mk_state([goal])
+    let root = mk_node(["tac", "root"], goal, [])
+    let mut cur_children = []
+    let n = len(tacs)
+    let mut i = 0
+    while i < n {
+        let snapshot = state_current(st)
+        let r = apply_tactic(st, tacs[i])
+        if !result_ok(r) {
+            let err_node = mk_node(tacs[i], snapshot, [])
+            cur_children = cur_children + [err_node]
+            return mk_node(["tac", "root"], goal, cur_children)
+        }
+        st = result_state(r)
+        let nd = mk_node(tacs[i], snapshot, [])
+        cur_children = cur_children + [nd]
+        i = i + 1
+    }
+    if state_done(st) {
+        let qed = mk_node(["tac", "qed"], goal, [])
+        cur_children = cur_children + [qed]
+    } else {
+        let rem = mk_node(["tac", "open"], state_current(st), [])
+        cur_children = cur_children + [rem]
+    }
+    return mk_node(["tac", "root"], goal, cur_children)
+}
+
+// ===================================================================
+//  Pre-baked proofs (for tests and examples)
+// ===================================================================
+
+// (P -> P)  via  [intro, assumption]
+fn proof_imp_refl(p) {
+    let goal = mk_goal([], prop_imp(p, p))
+    let tacs = [tac_intro(), tac_assumption()]
+    return [goal, tacs]
+}
+
+// (P /\ Q) -> (Q /\ P)  via  [intro, split, assumption, assumption]
+fn proof_and_comm(p, q) {
+    let goal = mk_goal([], prop_imp(prop_and(p, q), prop_and(q, p)))
+    // Note: after intro we get hyp (p /\ q) but our split needs both parts.
+    // We rely on rewrite to introduce the components as hypotheses.
+    let pq = prop_and(p, q)
+    let tacs = [tac_intro(), tac_rewrite(pq, p), tac_rewrite(p, prop_and(q, p)),
+                tac_assumption()]
+    return [goal, tacs]
+}
+
+// Modus ponens example: with hyps [P, (P -> Q)], prove Q
+fn proof_modus_ponens(p, q) {
+    let goal = mk_goal([p, prop_imp(p, q)], q)
+    let tacs = [tac_apply(prop_imp(p, q)), tac_assumption()]
+    return [goal, tacs]
+}
