@@ -1327,8 +1327,14 @@ fn bc_empty64() {
 }
 fn bc_caches_init() {
     bc_fn_cache = bc_empty64()
-    bc_fn_float_cache = bc_empty64()
-    bc_fn_str_cache = bc_empty64()
+    // VB3 fix (2026-04-11): bc_fn_float_cache / bc_fn_str_cache are
+    // populated during parse_fn via fn_mark_{float,str}_param() from
+    // the `: type` annotations. Resetting them here (called at the top
+    // of emit_program) wiped every parse-time annotation before
+    // emit_fn_decl could read it, so fn_param_is_str() short-circuited
+    // to false even though fn_str_params still held the key. Both
+    // caches are lazy-initialized by their _add helpers, so no reset
+    // is required. Keeping them in sync with the persistent lists.
     bc_str_arr_cache = bc_empty64()
     bc_float_var_cache = bc_empty64()
     bc_env_cache = bc_empty64()
@@ -1824,6 +1830,13 @@ fn emit_expr(node) {
             if t == "StrArr" {
                 return "((const char*)" + uvn_o + ".d[" + emit_expr(node.right) + "])"
             }
+            if t == "Str" {
+                // VB3 fix: string indexing returns the unsigned byte value
+                // 0..255 so UTF-8 decoders see the correct high bytes instead
+                // of sign-extended chars. Without this cast, `s[i]` reads a
+                // signed char and breaks any byte-arithmetic decoder.
+                return "((long)(unsigned char)" + uvn_o + "[" + emit_expr(node.right) + "])"
+            }
         }
         // 식 전체 타입으로 분기 (ex. s.chars()[i] → hexa_arr.d[i])
         let ot = type_of(obj)
@@ -1832,6 +1845,9 @@ fn emit_expr(node) {
         }
         if ot == "StrArr" {
             return "((const char*)(" + emit_expr(obj) + ").d[" + emit_expr(node.right) + "])"
+        }
+        if ot == "Str" {
+            return "((long)(unsigned char)(" + emit_expr(obj) + ")[" + emit_expr(node.right) + "])"
         }
         return emit_expr(obj) + "[" + emit_expr(node.right) + "]"
     }
@@ -4369,41 +4385,79 @@ fn split_lines(src) {
     return lines
 }
 
-// Strip `use "name"` lines so they parse cleanly. The hexa runtime
-// interpreter handles `use` semantically; the build_c.hexa codegen
-// path is single-file, so we treat use directives as comments and
-// leave actual cross-file linking to the build system (cc command
-// can take multiple translation units, OR the user can manually
-// include the dependent code).
-//
-// Full recursive expansion is implementable (try_resolve_use exists)
-// but the mac arm64 hexa interpreter is too slow to inline ~600-LOC
-// files at preprocess time (the htz x86_64 interpreter is 85× faster
-// and would handle this fine).
+// Check whether a module name is already resolved (linear scan).
+fn __module_already_resolved(name) {
+    let m = len(__resolved_modules)
+    let mut k = 0
+    while k < m {
+        if __resolved_modules[k] == name { return true }
+        k = k + 1
+    }
+    return false
+}
+
+// Parse `use "name"` from a line. Returns the name string, or "" on
+// no match. Handles leading whitespace and an optional trailing `;`.
+fn __parse_use_name(line) {
+    let llen = len(line)
+    let mut ti = 0
+    while ti < llen && (line.substring(ti, ti + 1) == " " || line.substring(ti, ti + 1) == "\t") {
+        ti = ti + 1
+    }
+    if ti + 4 > llen { return "" }
+    if line.substring(ti, ti + 4) != "use " { return "" }
+    let mut qi = ti + 4
+    while qi < llen && (line.substring(qi, qi + 1) == " " || line.substring(qi, qi + 1) == "\t") {
+        qi = qi + 1
+    }
+    if qi >= llen { return "" }
+    if line.substring(qi, qi + 1) != "\"" { return "" }
+    let mut ei = qi + 1
+    while ei < llen && line.substring(ei, ei + 1) != "\"" {
+        ei = ei + 1
+    }
+    if ei >= llen { return "" }
+    return line.substring(qi + 1, ei)
+}
+
+// Resolve `use "name"` directives by inlining referenced `.hexa` files.
+// Walks source line by line. On a `use "name"` line:
+//   - if already resolved → emit a comment, skip
+//   - else → search candidate paths via try_resolve_use, read the
+//     file, mark resolved BEFORE recursing, recursively preprocess
+//     the included content so chained `use` works, and inline it
+//   - if no candidate found → emit a warning comment, continue
+// Recursion is guarded by __resolved_modules (top-level mut list).
 fn preprocess_use(src, base_dir) {
     let lines = split_lines(src)
     let n = len(lines)
     let mut out_parts = []
     let mut li = 0
-    let mut stripped = 0
     while li < n {
         let line = lines[li]
-        let llen = len(line)
-        let mut ti = 0
-        while ti < llen && (line.substring(ti, ti + 1) == " " || line.substring(ti, ti + 1) == "\t") {
-            ti = ti + 1
-        }
-        let is_use = ti + 4 <= llen && line.substring(ti, ti + 4) == "use "
-        if is_use {
-            out_parts = out_parts.push("// [preprocess] stripped: " + line.substring(ti, llen))
-            stripped = stripped + 1
-        } else {
+        let name = __parse_use_name(line)
+        if name == "" {
             out_parts = out_parts.push(line)
+        } else {
+            if __module_already_resolved(name) {
+                out_parts = out_parts.push("// [preprocess] already-included: " + name)
+            } else {
+                let resolved_path = try_resolve_use(name, base_dir)
+                if resolved_path == "" {
+                    out_parts = out_parts.push("// [preprocess] unresolved use: " + name + " (searched base_dir + self/{,ml}/)")
+                } else {
+                    // mark BEFORE recursing to break cycles
+                    __resolved_modules = __resolved_modules.push(name)
+                    let sub_src = read_file(resolved_path)
+                    let sub_base = dirname_of(resolved_path)
+                    let expanded = preprocess_use(sub_src, sub_base)
+                    out_parts = out_parts.push("// [preprocess] begin inline: " + name + " (" + resolved_path + ")")
+                    out_parts = out_parts.push(expanded)
+                    out_parts = out_parts.push("// [preprocess] end inline: " + name)
+                }
+            }
         }
         li = li + 1
-    }
-    if stripped > 0 {
-        __resolved_modules = __resolved_modules.push(to_string(stripped))
     }
     return out_parts.join("\n")
 }

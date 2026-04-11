@@ -10,6 +10,8 @@
 #include <math.h>
 #include <ctype.h>
 #include <dlfcn.h>
+#include <time.h>
+#include <unistd.h>
 
 // Forward declarations for all runtime functions
 typedef struct HexaVal HexaVal;
@@ -585,8 +587,16 @@ static int _hexa_argc = 0;
 static char** _hexa_argv = NULL;
 
 void hexa_set_args(int argc, char** argv) {
-    _hexa_argc = argc;
-    _hexa_argv = argv;
+    // argv[0]을 2번 삽입하여 인터프리터 모드와 동일한 인덱스 유지
+    // 인터프리터: ["hexa", "script.hexa", arg1, arg2, ...]
+    // 네이티브:   ["binary", "binary",    arg1, arg2, ...]
+    _hexa_argc = argc + 1;
+    _hexa_argv = (char**)malloc(sizeof(char*) * (argc + 1));
+    _hexa_argv[0] = argv[0];
+    _hexa_argv[1] = argv[0];
+    for (int i = 1; i < argc; i++) {
+        _hexa_argv[i + 1] = argv[i];
+    }
 }
 
 HexaVal hexa_args() {
@@ -886,6 +896,29 @@ static void* hexa_ffi_dlopen(const char* lib_name) {
     snprintf(sopath, sizeof(sopath), "lib%s.so", lib_name);
     void* h2 = dlopen(sopath, RTLD_LAZY);
     if (h2) return h2;
+#ifndef __APPLE__
+    // CUDA path + soname version fallbacks (Linux)
+    {
+        char path[512];
+        const char* cuda_dirs[] = {
+            "/usr/local/cuda/lib64/lib%s.so",
+            "/usr/local/cuda/lib64/lib%s.so.12",
+            "/usr/local/cuda/lib64/lib%s.so.11",
+            NULL
+        };
+        for (int j = 0; cuda_dirs[j]; j++) {
+            snprintf(path, sizeof(path), cuda_dirs[j], lib_name);
+            void* hc = dlopen(path, RTLD_LAZY);
+            if (hc) return hc;
+        }
+        const char* sonames[] = {"lib%s.so.12", "lib%s.so.11", NULL};
+        for (int j = 0; sonames[j]; j++) {
+            snprintf(path, sizeof(path), sonames[j], lib_name);
+            void* hc = dlopen(path, RTLD_LAZY);
+            if (hc) return hc;
+        }
+    }
+#endif
     // Final attempt: bare name
     return dlopen(lib_name, RTLD_LAZY);
 }
@@ -1413,4 +1446,58 @@ HexaVal hexa_callback_get_fn(int slot_id) {
     if (slot_id < 0 || slot_id >= HEXA_TRAMPOLINE_POOL_SIZE) return hexa_void();
     if (!__hexa_cb_slots[slot_id].in_use) return hexa_void();
     return __hexa_cb_slots[slot_id].hexa_fn;
+}
+
+// ===== B4: tensor stubs + clock/random =====
+typedef struct { int64_t rows; int64_t cols; float* data; } HexaTensorStub;
+
+HexaVal hexa_tensor_new(HexaVal r, HexaVal c) {
+    int64_t rows = (r.tag==TAG_INT)?r.i:(int64_t)r.f;
+    int64_t cols = (c.tag==TAG_INT)?c.i:(int64_t)c.f;
+    HexaTensorStub* t = (HexaTensorStub*)calloc(1, sizeof(*t));
+    t->rows = rows; t->cols = cols;
+    t->data = (float*)calloc((size_t)(rows*cols), sizeof(float));
+    return hexa_int((int64_t)(uintptr_t)t);
+}
+
+HexaVal hexa_tensor_randn(HexaVal r, HexaVal c) {
+    HexaVal v = hexa_tensor_new(r, c);
+    HexaTensorStub* t = (HexaTensorStub*)(uintptr_t)v.i;
+    int64_t n = t->rows * t->cols;
+    for (int64_t i = 0; i < n; i++) {
+        double u = (rand()+1.0)/(RAND_MAX+1.0);
+        double w = (rand()+1.0)/(RAND_MAX+1.0);
+        t->data[i] = (float)(sqrt(-2.0*log(u)) * cos(6.28318530718*w));
+    }
+    return v;
+}
+
+HexaVal hexa_tensor_data_ptr(HexaVal tv) {
+    HexaTensorStub* t = (HexaTensorStub*)(uintptr_t)tv.i;
+    return hexa_int((int64_t)(uintptr_t)t->data);
+}
+
+HexaVal hexa_tensor_from_ptr(HexaVal p, HexaVal r, HexaVal c) {
+    HexaTensorStub* t = (HexaTensorStub*)calloc(1, sizeof(*t));
+    t->rows = (r.tag==TAG_INT)?r.i:(int64_t)r.f;
+    t->cols = (c.tag==TAG_INT)?c.i:(int64_t)c.f;
+    t->data = (float*)(uintptr_t)((p.tag==TAG_INT)?p.i:(int64_t)p.f);
+    return hexa_int((int64_t)(uintptr_t)t);
+}
+
+HexaVal hexa_clock(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return hexa_float((double)ts.tv_sec + (double)ts.tv_nsec/1e9);
+}
+
+HexaVal hexa_random(void) {
+    return hexa_float(rand() / (double)RAND_MAX);
+}
+
+HexaVal char_code(HexaVal s, HexaVal idx) {
+    if (s.tag != TAG_STR) return hexa_int(0);
+    int i = idx.i;
+    if (i < 0 || i >= (int)strlen(s.s)) return hexa_int(0);
+    return hexa_int((unsigned char)s.s[i]);
 }
