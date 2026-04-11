@@ -1,0 +1,620 @@
+// ═══════════════════════════════════════════════════════════════
+//  test_prefix_tuning.hexa — Prefix Tuning 검증 (ML #80)
+//
+//  검증 (≥12):
+//    1. Config 생성 — d_out = 2 * n_layers * d_head
+//    2. 파라미터 카운트: reparam < naive (동일 n_layers, prefix_len, d_head)
+//    3. Init: state shape 정확 (source/w1/b1/w2/b2)
+//    4. Reparam forward: pk/pv shape = [n_layers, prefix_len, d_head]
+//    5. Reparam forward: tanh 범위 (-1, 1) 기인 출력 유계
+//    6. Layer slice: 각 layer 로 pk/pv 분리
+//    7. Attention with prefix: output shape = [d_head]
+//    8. Attention softmax: 합계 분포 검증 (결과 유한)
+//    9. Attention identity: prefix_len=0 이면 순수 (q,k,v) attention
+//   10. MSE loss: zero gradient at exact match
+//   11. Backward shape 검증 — d_source/d_w1/d_w2/d_b2
+//   12. Gradient descent 수렴: loss 단조 감소
+//   13. Frozen backbone 불변성 — k, v 입력이 state update 에 영향 없음
+//   14. Reparam determinism: 동일 state -> 동일 pk/pv
+//
+//  실행: ./hexa self/test_prefix_tuning.hexa
+// ═══════════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+fn is_finite_f(x) { return x == x && fabs(x) < 1.0e30 }
+
+// ═══════════════════════════════════════════════════════════════
+//  Inline core (self/ml/prefix_tuning.hexa)
+// ═══════════════════════════════════════════════════════════════
+
+struct PrefixConfig {
+    n_layers: int,
+    prefix_len: int,
+    d_head: int,
+    d_mid: int,
+    d_out: int
+}
+
+struct PrefixState {
+    source: array,
+    w1: array,
+    b1: array,
+    w2: array,
+    b2: array
+}
+
+struct ReparamResult {
+    pk: array,
+    pv: array
+}
+
+struct PrefixGrad {
+    d_source: array,
+    d_w1: array,
+    d_b1: array,
+    d_w2: array,
+    d_b2: array
+}
+
+fn pt_zeros1(n) {
+    let mut v = []
+    let mut i = 0
+    while i < n { v = v + [0.0]; i = i + 1 }
+    return v
+}
+
+fn pt_zeros2(m, n) {
+    let mut r = []
+    let mut i = 0
+    while i < m { r = r + [pt_zeros1(n)]; i = i + 1 }
+    return r
+}
+
+fn pt_zeros3(l, m, n) {
+    let mut r = []
+    let mut i = 0
+    while i < l { r = r + [pt_zeros2(m, n)]; i = i + 1 }
+    return r
+}
+
+fn pt_lcg_init2(m, n, seed) {
+    let mut s = seed
+    let mut r = []
+    let mut i = 0
+    while i < m {
+        let mut row = []
+        let mut j = 0
+        while j < n {
+            s = (s * 1103515245 + 12345) % 2147483647
+            let v = (to_float(s % 2000) - 1000.0) / 10000.0
+            row = row + [v]
+            j = j + 1
+        }
+        r = r + [row]
+        i = i + 1
+    }
+    return r
+}
+
+fn pt_tanh(x) {
+    let e = exp(2.0 * x)
+    return (e - 1.0) / (e + 1.0)
+}
+
+fn pt_tanh_d(y) { return 1.0 - y * y }
+
+fn pt_create_config(n_layers, prefix_len, d_head, d_mid) {
+    let d_out = 2 * n_layers * d_head
+    return PrefixConfig {
+        n_layers: n_layers,
+        prefix_len: prefix_len,
+        d_head: d_head,
+        d_mid: d_mid,
+        d_out: d_out
+    }
+}
+
+fn pt_init(config: PrefixConfig, seed) {
+    let src = pt_lcg_init2(config.prefix_len, config.d_mid, seed + 1)
+    let w1  = pt_lcg_init2(config.d_mid, config.d_mid, seed + 2)
+    let b1  = pt_zeros1(config.d_mid)
+    let w2  = pt_lcg_init2(config.d_mid, config.d_out, seed + 3)
+    let b2  = pt_zeros1(config.d_out)
+    return PrefixState { source: src, w1: w1, b1: b1, w2: w2, b2: b2 }
+}
+
+fn pt_count_naive_params(config: PrefixConfig) {
+    return 2 * config.n_layers * config.prefix_len * config.d_head
+}
+
+fn pt_count_params(config: PrefixConfig) {
+    let pl = config.prefix_len
+    let dm = config.d_mid
+    let do_ = config.d_out
+    return pl * dm + dm * dm + dm + dm * do_ + do_
+}
+
+fn pt_reparam_forward(state: PrefixState, config: PrefixConfig) {
+    let pl = config.prefix_len
+    let dm = config.d_mid
+    let nl = config.n_layers
+    let dh = config.d_head
+    let mut pk = pt_zeros3(nl, pl, dh)
+    let mut pv = pt_zeros3(nl, pl, dh)
+    let mut p = 0
+    while p < pl {
+        let mut h = pt_zeros1(dm)
+        let mut j = 0
+        while j < dm {
+            let mut s = state.b1[j]
+            let mut k = 0
+            while k < dm {
+                s = s + state.source[p][k] * state.w1[k][j]
+                k = k + 1
+            }
+            h[j] = pt_tanh(s)
+            j = j + 1
+        }
+        let do_ = config.d_out
+        let mut o = pt_zeros1(do_)
+        let mut q = 0
+        while q < do_ {
+            let mut s2 = state.b2[q]
+            let mut k2 = 0
+            while k2 < dm {
+                s2 = s2 + h[k2] * state.w2[k2][q]
+                k2 = k2 + 1
+            }
+            o[q] = s2
+            q = q + 1
+        }
+        let mut l = 0
+        while l < nl {
+            let base_k = (2 * l) * dh
+            let base_v = (2 * l + 1) * dh
+            let mut d = 0
+            while d < dh {
+                pk[l][p][d] = o[base_k + d]
+                pv[l][p][d] = o[base_v + d]
+                d = d + 1
+            }
+            l = l + 1
+        }
+        p = p + 1
+    }
+    return ReparamResult { pk: pk, pv: pv }
+}
+
+fn pt_attention_with_prefix(q, k, v, pk, pv, seq_len, prefix_len, d_head) {
+    let total = seq_len + prefix_len
+    let scale = 1.0 / sqrt(to_float(d_head))
+    let mut scores = pt_zeros1(total)
+    let mut p = 0
+    while p < prefix_len {
+        let mut s = 0.0
+        let mut d = 0
+        while d < d_head {
+            s = s + q[d] * pk[p][d]
+            d = d + 1
+        }
+        scores[p] = s * scale
+        p = p + 1
+    }
+    let mut i = 0
+    while i < seq_len {
+        let mut s2 = 0.0
+        let mut d2 = 0
+        while d2 < d_head {
+            s2 = s2 + q[d2] * k[i][d2]
+            d2 = d2 + 1
+        }
+        scores[prefix_len + i] = s2 * scale
+        i = i + 1
+    }
+    let mut mx = scores[0]
+    let mut t = 1
+    while t < total {
+        if scores[t] > mx { mx = scores[t] }
+        t = t + 1
+    }
+    let mut exps = pt_zeros1(total)
+    let mut total_s = 0.0
+    let mut u = 0
+    while u < total {
+        let e = exp(scores[u] - mx)
+        exps[u] = e
+        total_s = total_s + e
+        u = u + 1
+    }
+    let mut probs = pt_zeros1(total)
+    let mut w = 0
+    while w < total {
+        probs[w] = exps[w] / total_s
+        w = w + 1
+    }
+    let mut y = pt_zeros1(d_head)
+    let mut p2 = 0
+    while p2 < prefix_len {
+        let coef = probs[p2]
+        let mut d3 = 0
+        while d3 < d_head {
+            y[d3] = y[d3] + coef * pv[p2][d3]
+            d3 = d3 + 1
+        }
+        p2 = p2 + 1
+    }
+    let mut i2 = 0
+    while i2 < seq_len {
+        let coef2 = probs[prefix_len + i2]
+        let mut d4 = 0
+        while d4 < d_head {
+            y[d4] = y[d4] + coef2 * v[i2][d4]
+            d4 = d4 + 1
+        }
+        i2 = i2 + 1
+    }
+    return y
+}
+
+fn pt_mse_loss(y, target) {
+    let n = len(y)
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        let d = y[i] - target[i]
+        s = s + d * d
+        i = i + 1
+    }
+    return s / to_float(n)
+}
+
+fn pt_reparam_backward(state: PrefixState, config: PrefixConfig, dpk, dpv) {
+    let pl = config.prefix_len
+    let dm = config.d_mid
+    let nl = config.n_layers
+    let dh = config.d_head
+    let do_ = config.d_out
+
+    let mut d_source = pt_zeros2(pl, dm)
+    let mut d_w1 = pt_zeros2(dm, dm)
+    let mut d_b1 = pt_zeros1(dm)
+    let mut d_w2 = pt_zeros2(dm, do_)
+    let mut d_b2 = pt_zeros1(do_)
+
+    let mut p = 0
+    while p < pl {
+        let mut h = pt_zeros1(dm)
+        let mut j = 0
+        while j < dm {
+            let mut s = state.b1[j]
+            let mut k = 0
+            while k < dm {
+                s = s + state.source[p][k] * state.w1[k][j]
+                k = k + 1
+            }
+            h[j] = pt_tanh(s)
+            j = j + 1
+        }
+        let mut d_o = pt_zeros1(do_)
+        let mut l = 0
+        while l < nl {
+            let base_k = (2 * l) * dh
+            let base_v = (2 * l + 1) * dh
+            let mut d = 0
+            while d < dh {
+                d_o[base_k + d] = dpk[l][p][d]
+                d_o[base_v + d] = dpv[l][p][d]
+                d = d + 1
+            }
+            l = l + 1
+        }
+        let mut q = 0
+        while q < do_ {
+            d_b2[q] = d_b2[q] + d_o[q]
+            let mut k2 = 0
+            while k2 < dm {
+                d_w2[k2][q] = d_w2[k2][q] + h[k2] * d_o[q]
+                k2 = k2 + 1
+            }
+            q = q + 1
+        }
+        let mut d_h = pt_zeros1(dm)
+        let mut k3 = 0
+        while k3 < dm {
+            let mut s3 = 0.0
+            let mut q2 = 0
+            while q2 < do_ {
+                s3 = s3 + state.w2[k3][q2] * d_o[q2]
+                q2 = q2 + 1
+            }
+            d_h[k3] = s3
+            k3 = k3 + 1
+        }
+        let mut d_z = pt_zeros1(dm)
+        let mut j2 = 0
+        while j2 < dm {
+            d_z[j2] = d_h[j2] * pt_tanh_d(h[j2])
+            j2 = j2 + 1
+        }
+        let mut j3 = 0
+        while j3 < dm {
+            d_b1[j3] = d_b1[j3] + d_z[j3]
+            let mut k4 = 0
+            while k4 < dm {
+                d_w1[k4][j3] = d_w1[k4][j3] + state.source[p][k4] * d_z[j3]
+                k4 = k4 + 1
+            }
+            j3 = j3 + 1
+        }
+        let mut k5 = 0
+        while k5 < dm {
+            let mut s5 = 0.0
+            let mut j4 = 0
+            while j4 < dm {
+                s5 = s5 + state.w1[k5][j4] * d_z[j4]
+                j4 = j4 + 1
+            }
+            d_source[p][k5] = s5
+            k5 = k5 + 1
+        }
+        p = p + 1
+    }
+    return PrefixGrad {
+        d_source: d_source,
+        d_w1: d_w1,
+        d_b1: d_b1,
+        d_w2: d_w2,
+        d_b2: d_b2
+    }
+}
+
+fn pt_sgd_step(state: PrefixState, grad: PrefixGrad, lr) {
+    let pl = len(state.source)
+    let dm = len(state.w1)
+    let do_ = len(state.b2)
+
+    let mut new_source = pt_zeros2(pl, dm)
+    let mut p = 0
+    while p < pl {
+        let mut k = 0
+        while k < dm {
+            new_source[p][k] = state.source[p][k] - lr * grad.d_source[p][k]
+            k = k + 1
+        }
+        p = p + 1
+    }
+
+    let mut new_w1 = pt_zeros2(dm, dm)
+    let mut i = 0
+    while i < dm {
+        let mut j = 0
+        while j < dm {
+            new_w1[i][j] = state.w1[i][j] - lr * grad.d_w1[i][j]
+            j = j + 1
+        }
+        i = i + 1
+    }
+
+    let mut new_b1 = pt_zeros1(dm)
+    let mut u = 0
+    while u < dm {
+        new_b1[u] = state.b1[u] - lr * grad.d_b1[u]
+        u = u + 1
+    }
+
+    let mut new_w2 = pt_zeros2(dm, do_)
+    let mut a = 0
+    while a < dm {
+        let mut b = 0
+        while b < do_ {
+            new_w2[a][b] = state.w2[a][b] - lr * grad.d_w2[a][b]
+            b = b + 1
+        }
+        a = a + 1
+    }
+
+    let mut new_b2 = pt_zeros1(do_)
+    let mut q = 0
+    while q < do_ {
+        new_b2[q] = state.b2[q] - lr * grad.d_b2[q]
+        q = q + 1
+    }
+    return PrefixState {
+        source: new_source,
+        w1: new_w1,
+        b1: new_b1,
+        w2: new_w2,
+        b2: new_b2
+    }
+}
+
+fn pt_layer_slice(result: ReparamResult, layer_idx) {
+    return [result.pk[layer_idx], result.pv[layer_idx]]
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Tests
+// ═══════════════════════════════════════════════════════════════
+
+// ── Test #1: Config creation ───────────────────────────────────
+let cfg = pt_create_config(2, 3, 4, 5)
+check("#1 config d_out = 2*n_layers*d_head", cfg.d_out == 2 * 2 * 4)
+
+// ── Test #2: Reparam has fewer params than naive for big n_layers
+// naive: 2*n_layers*prefix_len*d_head, reparam cost amortized via MLP
+let big_cfg = pt_create_config(24, 10, 64, 8)
+let naive_cnt = pt_count_naive_params(big_cfg)
+let reparam_cnt = pt_count_params(big_cfg)
+check("#2 reparam params < naive for deep model", reparam_cnt < naive_cnt)
+
+// ── Test #3: Init shape ────────────────────────────────────────
+let state = pt_init(cfg, 42)
+let ok3 = len(state.source) == cfg.prefix_len && len(state.source[0]) == cfg.d_mid && len(state.w1) == cfg.d_mid && len(state.w2[0]) == cfg.d_out
+check("#3 init shapes correct", ok3)
+
+// ── Test #4: Reparam forward shape ─────────────────────────────
+let rep = pt_reparam_forward(state, cfg)
+let ok4 = len(rep.pk) == cfg.n_layers && len(rep.pk[0]) == cfg.prefix_len && len(rep.pk[0][0]) == cfg.d_head && len(rep.pv) == cfg.n_layers
+check("#4 reparam pk/pv shapes", ok4)
+
+// ── Test #5: tanh bound ⇒ h bounded, so o = h @ w2 + b2 finite ─
+let mut ok5 = true
+let mut li = 0
+while li < cfg.n_layers {
+    let mut pi = 0
+    while pi < cfg.prefix_len {
+        let mut di = 0
+        while di < cfg.d_head {
+            if !is_finite_f(rep.pk[li][pi][di]) { ok5 = false }
+            if !is_finite_f(rep.pv[li][pi][di]) { ok5 = false }
+            di = di + 1
+        }
+        pi = pi + 1
+    }
+    li = li + 1
+}
+check("#5 reparam outputs finite", ok5)
+
+// ── Test #6: Layer slice ───────────────────────────────────────
+let slice0 = pt_layer_slice(rep, 0)
+let ok6 = len(slice0) == 2 && len(slice0[0]) == cfg.prefix_len && len(slice0[1]) == cfg.prefix_len
+check("#6 layer slice returns [pk_l, pv_l]", ok6)
+
+// ── Test #7: Attention with prefix — output shape ─────────────
+let d_head = cfg.d_head
+let seq_len = 2
+let q = [0.1, 0.2, 0.3, 0.4]
+let k_seq = [[0.5, 0.0, 0.0, 0.0], [0.0, 0.5, 0.0, 0.0]]
+let v_seq = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]]
+let pk0 = slice0[0]
+let pv0 = slice0[1]
+let y = pt_attention_with_prefix(q, k_seq, v_seq, pk0, pv0, seq_len, cfg.prefix_len, d_head)
+check("#7 attention output len = d_head", len(y) == d_head)
+
+// ── Test #8: Attention output finite ──────────────────────────
+let mut ok8 = true
+let mut yi = 0
+while yi < d_head {
+    if !is_finite_f(y[yi]) { ok8 = false }
+    yi = yi + 1
+}
+check("#8 attention output finite", ok8)
+
+// ── Test #9: prefix_len=0 → pure attention over (k_seq, v_seq) ─
+// Expected: with q=[0.5,0,0,0], k0=[0.5,0,0,0], k1=[0,0.5,0,0]
+// scores = [0.125, 0], scale=1/sqrt(4)=0.5 -> *0.5 = [0.0625, 0]
+// softmax -> higher weight on v0 -> y ~ close to v0 = [1,0,0,0] + a bit of v1
+let empty_pk = []
+let empty_pv = []
+let q9 = [0.5, 0.0, 0.0, 0.0]
+let y9 = pt_attention_with_prefix(q9, k_seq, v_seq, empty_pk, empty_pv, 2, 0, 4)
+let ok9 = len(y9) == 4 && y9[0] > y9[1] && is_finite_f(y9[0])
+check("#9 prefix_len=0 pure attention works", ok9)
+
+// ── Test #10: MSE loss zero at exact match ────────────────────
+let loss_exact = pt_mse_loss([1.0, 2.0, 3.0], [1.0, 2.0, 3.0])
+check("#10 MSE loss exact match = 0", approx(loss_exact, 0.0, 1.0e-9))
+
+// ── Test #11: Backward shapes ──────────────────────────────────
+// feed unit gradient dpk = ones, dpv = ones
+let mut dpk_full = pt_zeros3(cfg.n_layers, cfg.prefix_len, cfg.d_head)
+let mut dpv_full = pt_zeros3(cfg.n_layers, cfg.prefix_len, cfg.d_head)
+let mut la = 0
+while la < cfg.n_layers {
+    let mut pa = 0
+    while pa < cfg.prefix_len {
+        let mut da = 0
+        while da < cfg.d_head {
+            dpk_full[la][pa][da] = 1.0
+            dpv_full[la][pa][da] = 1.0
+            da = da + 1
+        }
+        pa = pa + 1
+    }
+    la = la + 1
+}
+let grad = pt_reparam_backward(state, cfg, dpk_full, dpv_full)
+let ok11 = len(grad.d_source) == cfg.prefix_len && len(grad.d_w1) == cfg.d_mid && len(grad.d_w2[0]) == cfg.d_out && len(grad.d_b2) == cfg.d_out
+check("#11 backward grad shapes", ok11)
+
+// ── Test #12: SGD convergence — loss decreases on a simple target
+// target = reparam forward of a perturbed state at layer 0
+fn flat_sum(rep_res) {
+    let mut s = 0.0
+    let mut li = 0
+    while li < len(rep_res.pk) {
+        let mut pi = 0
+        while pi < len(rep_res.pk[li]) {
+            let mut di = 0
+            while di < len(rep_res.pk[li][pi]) {
+                s = s + rep_res.pk[li][pi][di] + rep_res.pv[li][pi][di]
+                di = di + 1
+            }
+            pi = pi + 1
+        }
+        li = li + 1
+    }
+    return s
+}
+
+// L = 0.5 * flat_sum(rep)^2  → dL/d(pk|pv) = flat_sum(rep) everywhere
+// gradient descent reduces |flat_sum|
+let mut cur = pt_init(cfg, 7)
+let rep0 = pt_reparam_forward(cur, cfg)
+let l0 = flat_sum(rep0) * flat_sum(rep0) * 0.5
+// One SGD step
+let s0 = flat_sum(rep0)
+let mut dpk_u = pt_zeros3(cfg.n_layers, cfg.prefix_len, cfg.d_head)
+let mut dpv_u = pt_zeros3(cfg.n_layers, cfg.prefix_len, cfg.d_head)
+let mut ll = 0
+while ll < cfg.n_layers {
+    let mut pp = 0
+    while pp < cfg.prefix_len {
+        let mut ddc = 0
+        while ddc < cfg.d_head {
+            dpk_u[ll][pp][ddc] = s0
+            dpv_u[ll][pp][ddc] = s0
+            ddc = ddc + 1
+        }
+        pp = pp + 1
+    }
+    ll = ll + 1
+}
+let g1 = pt_reparam_backward(cur, cfg, dpk_u, dpv_u)
+cur = pt_sgd_step(cur, g1, 0.01)
+let rep1 = pt_reparam_forward(cur, cfg)
+let l1 = flat_sum(rep1) * flat_sum(rep1) * 0.5
+check("#12 SGD reduces loss", l1 < l0 || approx(l1, l0, 1.0e-9))
+
+// ── Test #13: Frozen backbone invariance — attention input k/v
+// not touched by any reparam state. Verify by running reparam twice
+// with modified k_seq and state stays identical.
+let before_src = state.source[0][0]
+let _yA = pt_attention_with_prefix(q, k_seq, v_seq, pk0, pv0, seq_len, cfg.prefix_len, d_head)
+let _yB = pt_attention_with_prefix(q, [[9.0, 9.0, 9.0, 9.0], [9.0, 9.0, 9.0, 9.0]], v_seq, pk0, pv0, seq_len, cfg.prefix_len, d_head)
+let after_src = state.source[0][0]
+check("#13 frozen state unchanged by attention calls", before_src == after_src)
+
+// ── Test #14: Reparam determinism ─────────────────────────────
+let rep_a = pt_reparam_forward(state, cfg)
+let rep_b = pt_reparam_forward(state, cfg)
+let ok14 = approx(rep_a.pk[0][0][0], rep_b.pk[0][0][0], 1.0e-12) && approx(rep_a.pv[1][2][3], rep_b.pv[1][2][3], 1.0e-12)
+check("#14 reparam deterministic", ok14)
+
+// ═══════════════════════════════════════════════════════════════
+println("")
+println("prefix_tuning: " + to_string(pass_count) + " PASS / " + to_string(fail_count) + " FAIL")

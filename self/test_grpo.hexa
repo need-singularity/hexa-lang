@@ -1,0 +1,425 @@
+// ═══════════════════════════════════════════════════════════════════
+//  test_grpo.hexa — GRPO (Group Relative Policy Optimization) 검증
+//
+//  검증 항목 (>=12):
+//    1. exp/log/sigmoid/sqrt numeric helpers
+//    2. mean / std group statistics
+//    3. advantages zero-mean
+//    4. advantages ~unit-variance
+//    5. ratio = 1.0 when new==old
+//    6. ratio > 1 when new>old
+//    7. clip — below / inside / above
+//    8. clipped_objective positive advantage
+//    9. clipped_objective negative advantage
+//   10. KL k3 — zero when equal
+//   11. KL k3 — positive when different
+//   12. token_loss no-KL degenerates to -A*ratio
+//   13. token_loss decreases as log_new ↑ (positive adv)
+//   14. sample_loss averages over tokens
+//   15. group_loss averages over G members
+//   16. group_step reduces loss (single step)
+//   17. multi-step group_step converges
+//   18. preference_accuracy — best reward picked
+//   19. batch_loss averages over prompts
+//   20. ratio grad sign for positive advantage
+//
+//  실행: ./hexa self/test_grpo.hexa
+// ═══════════════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ── inline GRPO helpers (self-contained) ───────────────────────────
+
+fn gr_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn gr_log(x) {
+    if x <= 0.0 { return -30.0 }
+    let mut v = x
+    let mut count = 0
+    while v > 2.0 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    let d = v - 1.0
+    let ln_v = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_v
+}
+
+fn gr_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x
+    if g > 1.0 { g = x / 2.0 }
+    let mut i = 0
+    while i < 30 {
+        g = 0.5 * (g + x / g)
+        i = i + 1
+    }
+    return g
+}
+
+fn gr_sigmoid(x) {
+    if x > 20.0 { return 1.0 }
+    if x < -20.0 { return 0.0 }
+    return 1.0 / (1.0 + gr_exp(0.0 - x))
+}
+
+let GR_EPS_NORM = 1.0e-8
+
+fn gr_mean(arr) {
+    let n = len(arr)
+    if n == 0 { return 0.0 }
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + arr[i]
+        i = i + 1
+    }
+    return s / to_float(n)
+}
+
+fn gr_std(arr) {
+    let n = len(arr)
+    if n == 0 { return 0.0 }
+    let mu = gr_mean(arr)
+    let mut var = 0.0
+    let mut i = 0
+    while i < n {
+        let d = arr[i] - mu
+        var = var + d * d
+        i = i + 1
+    }
+    return gr_sqrt(var / to_float(n))
+}
+
+fn gr_advantages(rewards) {
+    let n = len(rewards)
+    let mu = gr_mean(rewards)
+    let sd = gr_std(rewards)
+    let denom = sd + GR_EPS_NORM
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [(rewards[i] - mu) / denom]
+        i = i + 1
+    }
+    return out
+}
+
+fn gr_ratio(log_pi_new, log_pi_old) {
+    return gr_exp(log_pi_new - log_pi_old)
+}
+
+fn gr_clip(ratio, eps) {
+    let lo = 1.0 - eps
+    let hi = 1.0 + eps
+    if ratio < lo { return lo }
+    if ratio > hi { return hi }
+    return ratio
+}
+
+fn gr_clipped_objective(log_pi_new, log_pi_old, adv, eps) {
+    let ratio = gr_ratio(log_pi_new, log_pi_old)
+    let unclipped = ratio * adv
+    let clipped = gr_clip(ratio, eps) * adv
+    if unclipped < clipped { return unclipped }
+    return clipped
+}
+
+fn gr_kl_k3(log_pi, log_ref) {
+    let r = gr_exp(log_ref - log_pi)
+    let lr = log_ref - log_pi
+    let k3 = r - lr - 1.0
+    if k3 < 0.0 { return 0.0 }
+    return k3
+}
+
+fn gr_token_loss(log_new, log_old, log_ref, adv, eps_clip, beta) {
+    let obj = gr_clipped_objective(log_new, log_old, adv, eps_clip)
+    let kl = gr_kl_k3(log_new, log_ref)
+    return (0.0 - obj) + beta * kl
+}
+
+fn gr_token_grad_log_new(log_new, log_old, log_ref, adv, eps_clip, beta) {
+    let ratio = gr_ratio(log_new, log_old)
+    let unclipped = ratio * adv
+    let clipped_ratio = gr_clip(ratio, eps_clip)
+    let clipped = clipped_ratio * adv
+    let mut surrogate_grad = 0.0
+    if unclipped < clipped {
+        surrogate_grad = 0.0 - ratio * adv
+    } else {
+        surrogate_grad = 0.0
+    }
+    let r_ref = gr_exp(log_ref - log_new)
+    let kl_grad = 1.0 - r_ref
+    return surrogate_grad + beta * kl_grad
+}
+
+fn gr_sample_loss(log_new_seq, log_old_seq, log_ref_seq, adv, eps_clip, beta) {
+    let n = len(log_new_seq)
+    if n == 0 { return 0.0 }
+    let mut total = 0.0
+    let mut t = 0
+    while t < n {
+        total = total + gr_token_loss(
+            log_new_seq[t], log_old_seq[t], log_ref_seq[t],
+            adv, eps_clip, beta
+        )
+        t = t + 1
+    }
+    return total / to_float(n)
+}
+
+fn gr_group_loss(group_log_new, group_log_old, group_log_ref, rewards, eps_clip, beta) {
+    let g = len(group_log_new)
+    if g == 0 { return 0.0 }
+    let advs = gr_advantages(rewards)
+    let mut total = 0.0
+    let mut i = 0
+    while i < g {
+        let li = gr_sample_loss(
+            group_log_new[i], group_log_old[i], group_log_ref[i],
+            advs[i], eps_clip, beta
+        )
+        total = total + li
+        i = i + 1
+    }
+    return total / to_float(g)
+}
+
+// Returns updated_seq (array<float>). Pre/post loss is recomputed
+// via gr_sample_loss — avoids heterogeneous-array return type rejection.
+fn gr_sample_step(log_new_seq, log_old_seq, log_ref_seq, adv, eps_clip, beta, lr) {
+    let n = len(log_new_seq)
+    let mut out = []
+    let mut t = 0
+    while t < n {
+        let ln = log_new_seq[t]
+        let lo = log_old_seq[t]
+        let lr2 = log_ref_seq[t]
+        let g = gr_token_grad_log_new(ln, lo, lr2, adv, eps_clip, beta)
+        out = out + [ln - lr * g]
+        t = t + 1
+    }
+    return out
+}
+
+// Returns updated group_log_new (array<array<float>>).
+fn gr_group_step(group_log_new, group_log_old, group_log_ref, rewards, eps_clip, beta, lr) {
+    let g = len(group_log_new)
+    let advs = gr_advantages(rewards)
+    let mut new_group = []
+    let mut i = 0
+    while i < g {
+        let r = gr_sample_step(
+            group_log_new[i], group_log_old[i], group_log_ref[i],
+            advs[i], eps_clip, beta, lr
+        )
+        new_group = new_group + [r]
+        i = i + 1
+    }
+    return new_group
+}
+
+fn gr_preference_accuracy(rewards) {
+    let n = len(rewards)
+    if n <= 1 { return 1.0 }
+    let mut best_i = 0
+    let mut best_v = rewards[0]
+    let mut i = 1
+    while i < n {
+        if rewards[i] > best_v {
+            best_v = rewards[i]
+            best_i = i
+        }
+        i = i + 1
+    }
+    let advs = gr_advantages(rewards)
+    if advs[best_i] > 0.0 { return 1.0 }
+    return 0.0
+}
+
+// batch is passed as four parallel arrays (one entry per prompt) to
+// avoid heterogeneous-array rejection:
+//   batch_new[p]    : group_log_new for prompt p
+//   batch_old[p]    : group_log_old for prompt p
+//   batch_ref[p]    : group_log_ref for prompt p
+//   batch_rew[p]    : rewards       for prompt p
+fn gr_batch_loss(batch_new, batch_old, batch_ref, batch_rew, eps_clip, beta) {
+    let n = len(batch_new)
+    if n == 0 { return 0.0 }
+    let mut total = 0.0
+    let mut i = 0
+    while i < n {
+        let gl = gr_group_loss(batch_new[i], batch_old[i], batch_ref[i], batch_rew[i], eps_clip, beta)
+        total = total + gl
+        i = i + 1
+    }
+    return total / to_float(n)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Tests
+// ═══════════════════════════════════════════════════════════════════
+
+println("=== GRPO Tests ===")
+
+// 1. numeric helpers basic
+check("exp_zero_one", approx(gr_exp(0.0), 1.0, 0.001))
+check("log_one_zero", approx(gr_log(1.0), 0.0, 0.01))
+check("sigmoid_zero_half", approx(gr_sigmoid(0.0), 0.5, 0.01))
+check("sqrt_four_two", approx(gr_sqrt(4.0), 2.0, 0.001))
+
+// 2. mean / std statistics
+let arr = [1.0, 2.0, 3.0, 4.0, 5.0]
+check("mean_basic", approx(gr_mean(arr), 3.0, 0.001))
+// population std of 1..5 == sqrt(2)
+check("std_basic", approx(gr_std(arr), gr_sqrt(2.0), 0.01))
+
+// 3. advantages — zero mean
+let rewards = [0.2, 0.8, 0.5, 1.0, 0.3]
+let advs = gr_advantages(rewards)
+let adv_mu = gr_mean(advs)
+check("advantages_zero_mean", approx(adv_mu, 0.0, 1.0e-4))
+
+// 4. advantages — (near) unit variance (pop std = 1 up to eps_norm bias)
+let adv_sd = gr_std(advs)
+check("advantages_unit_std", approx(adv_sd, 1.0, 0.01))
+
+// 5. ratio = 1 when new == old
+check("ratio_equal_one", approx(gr_ratio(0.0, 0.0), 1.0, 0.001))
+check("ratio_equal_nonzero", approx(gr_ratio(-2.5, -2.5), 1.0, 0.001))
+
+// 6. ratio > 1 when new > old (policy got more confident)
+check("ratio_new_bigger", gr_ratio(-1.0, -2.0) > 1.0)
+check("ratio_new_smaller", gr_ratio(-2.0, -1.0) < 1.0)
+
+// 7. clip — below / inside / above bounds
+check("clip_below", approx(gr_clip(0.5, 0.2), 0.8, 0.001))
+check("clip_inside", approx(gr_clip(1.05, 0.2), 1.05, 0.001))
+check("clip_above", approx(gr_clip(2.0, 0.2), 1.2, 0.001))
+
+// 8. clipped_objective — positive advantage with ratio=1 → just A
+let obj_a = gr_clipped_objective(0.0, 0.0, 2.5, 0.2)
+check("clipped_obj_pos_adv_unit", approx(obj_a, 2.5, 0.001))
+
+// 9. clipped_objective — negative advantage:
+// with ratio≈1.5 (above upper clip 1.2) and negative A,
+// unclipped = 1.5*(-1) = -1.5, clipped = 1.2*(-1) = -1.2 → min = -1.5
+let obj_b = gr_clipped_objective(gr_log(1.5), 0.0, -1.0, 0.2)
+check("clipped_obj_neg_adv_uses_unclipped", approx(obj_b, -1.5, 0.01))
+
+// 10. KL k3 — zero when log_pi == log_ref
+check("kl_k3_zero_equal", approx(gr_kl_k3(-1.0, -1.0), 0.0, 0.001))
+
+// 11. KL k3 — positive when they differ
+let kl_pos = gr_kl_k3(-1.0, -1.5)
+check("kl_k3_positive_diff", kl_pos > 0.0)
+let kl_pos2 = gr_kl_k3(-1.5, -1.0)
+check("kl_k3_positive_both_sides", kl_pos2 > 0.0)
+
+// 12. token_loss with beta=0 reduces to -clipped_objective
+let tl_no_kl = gr_token_loss(0.0, 0.0, 0.0, 2.0, 0.2, 0.0)
+check("token_loss_no_kl_neg_obj", approx(tl_no_kl, -2.0, 0.001))
+
+// 13. token_loss decreases as log_new rises (positive advantage)
+let tl_lo = gr_token_loss(-2.0, -2.0, -2.0, 1.0, 0.2, 0.0)
+let tl_hi = gr_token_loss(-1.9, -2.0, -2.0, 1.0, 0.2, 0.0)
+check("token_loss_decreases_pos_adv", tl_hi < tl_lo)
+
+// 14. sample_loss averages per-token loss
+let seq_new = [-1.0, -1.2, -0.8]
+let seq_old = [-1.0, -1.2, -0.8]
+let seq_ref = [-1.0, -1.2, -0.8]
+let sl = gr_sample_loss(seq_new, seq_old, seq_ref, 1.0, 0.2, 0.01)
+// with ratio=1 and adv=1: each token obj = 1, loss = -1 + 0 = -1
+check("sample_loss_average", approx(sl, -1.0, 0.001))
+
+// 15. group_loss averages over G members
+let g_new = [[-1.0, -1.0], [-1.2, -1.2], [-0.9, -0.9]]
+let g_old = [[-1.0, -1.0], [-1.2, -1.2], [-0.9, -0.9]]
+let g_ref = [[-1.0, -1.0], [-1.2, -1.2], [-0.9, -0.9]]
+let g_rew = [1.0, 0.0, 0.5]
+let gl = gr_group_loss(g_new, g_old, g_ref, g_rew, 0.2, 0.01)
+// ratio=1 so clipped_obj = adv; loss = -mean(adv) = 0 (advantages zero-mean)
+check("group_loss_zero_mean_adv", approx(gl, 0.0, 1.0e-4))
+
+// 16. group_step reduces loss over one update (positive-advantage member wins)
+// start with a non-trivial group: ratio=1 at t=0, ref slightly off so KL > 0.
+let step_new = [[-1.0, -1.0], [-1.0, -1.0], [-1.0, -1.0], [-1.0, -1.0]]
+let step_old = [[-1.0, -1.0], [-1.0, -1.0], [-1.0, -1.0], [-1.0, -1.0]]
+let step_ref = [[-1.1, -1.1], [-1.1, -1.1], [-1.1, -1.1], [-1.1, -1.1]]
+let step_rew = [1.0, 0.2, 0.5, 0.8]
+let l0 = gr_group_loss(step_new, step_old, step_ref, step_rew, 0.2, 0.05)
+let new_group = gr_group_step(step_new, step_old, step_ref, step_rew, 0.2, 0.05, 0.1)
+let l1 = gr_group_loss(new_group, step_old, step_ref, step_rew, 0.2, 0.05)
+check("group_step_reduces_loss", l1 < l0)
+
+// 17. multi-step group_step converges (loss strictly drops after 10 steps)
+let mut cur = step_new
+let mut last_loss = l0
+let mut it = 0
+while it < 10 {
+    cur = gr_group_step(cur, step_old, step_ref, step_rew, 0.2, 0.05, 0.1)
+    last_loss = gr_group_loss(cur, step_old, step_ref, step_rew, 0.2, 0.05)
+    it = it + 1
+}
+check("multistep_converges", last_loss < l0)
+
+// 18. preference_accuracy — sample with highest reward has positive advantage
+check("pref_acc_best_wins", approx(gr_preference_accuracy([0.1, 0.9, 0.3, 0.2]), 1.0, 0.001))
+// single sample is trivially "correct"
+check("pref_acc_singleton", approx(gr_preference_accuracy([0.5]), 1.0, 0.001))
+
+// 19. batch_loss averages over prompt groups (parallel arrays)
+let batch_new = [g_new, g_new]
+let batch_old = [g_old, g_old]
+let batch_ref = [g_ref, g_ref]
+let batch_rew = [g_rew, g_rew]
+let bl = gr_batch_loss(batch_new, batch_old, batch_ref, batch_rew, 0.2, 0.01)
+check("batch_loss_finite", approx(bl, gl, 1.0e-4))
+
+// 20. grad sign for positive advantage (unclipped region) is negative:
+// d/d log_new [-ratio*A] = -A*ratio < 0 when A>0, so ascent step raises log_new.
+let gsign = gr_token_grad_log_new(0.0, 0.0, 0.0, 2.0, 0.2, 0.0)
+check("grad_neg_for_pos_adv", gsign < 0.0)
+
+// 21. grad is zero (plus KL only) when clipped region is hit
+// ratio=1.5 (above upper clip 1.2), positive A → clipped branch selected
+// unclipped=1.5*A, clipped=1.2*A → min uses clipped → surrogate grad = 0
+let gclipped = gr_token_grad_log_new(gr_log(1.5), 0.0, gr_log(1.5), 1.0, 0.2, 0.0)
+check("grad_zero_on_clip", approx(gclipped, 0.0, 0.001))
+
+// ── summary ────────────────────────────────────────────────────────
+println("")
+println("GRPO: " + str(pass_count) + " passed, " + str(fail_count) + " failed")

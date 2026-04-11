@@ -1,0 +1,205 @@
+// ===================================================================
+//  test_gpu_continuous_batch.hexa — GPU Continuous Batching tests
+//
+//  Verifies:
+//    T1  gcb_create initial state + pool size
+//    T2  gcb_add_request enqueues with rid monotone
+//    T3  admit pops pending -> running up to max_batch
+//    T4  prefill_phase materialises blocks + writes KV
+//    T5  after prefill, req.phase == decode
+//    T6  gcb_blocks_needed math (boundary)
+//    T7  decode_phase produces exactly 1 token per running slot
+//    T8  run_iteration: tokens_generated monotone
+//    T9  run_until_done retires all reqs + frees blocks
+//    T10 max_batch caps concurrent running
+//    T11 OOM -> waiting state (backpressure, no loss)
+//    T12 remove_request frees its blocks (abort path)
+//    T13 stats vector has 7 entries
+//    T14 KV write deterministic (same token -> same vec)
+//    T15 multi-block prefill spans >=2 pages
+//
+//  Run: ./hexa self/test_gpu_continuous_batch.hexa
+// ===================================================================
+
+import "ml/gpu_continuous_batch.hexa"
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn mk_tokens(n, base) {
+    let mut t = []
+    let mut i = 0
+    while i < n {
+        t = t + [base + i]
+        i = i + 1
+    }
+    return t
+}
+
+println("===================================================================")
+println("  GPU Continuous Batching Test Suite")
+println("===================================================================")
+
+// ── T1: create scheduler — pool has all blocks free ───────────
+let s0 = gcb_create(4, 16, 4, 8)
+let s0_free = gcb_free_blocks_count(s0)
+check("T1 scheduler max_batch=4", s0.max_batch == 4)
+check("T1b pool free=16", s0_free == 16)
+check("T1c block_size=4", s0.block_size == 4)
+check("T1d head_dim=8", s0.head_dim == 8)
+
+// ── T2: add_request enqueues + rid is monotone ────────────────
+let p_a = mk_tokens(3, 100)   // len=3
+let p_b = mk_tokens(5, 200)   // len=5
+let s1 = gcb_add_request(s0, p_a, 4)
+let s2 = gcb_add_request(s1, p_b, 3)
+check("T2 pending len=2", len(s2.pending) == 2)
+check("T2b first rid=0", s2.pending[0].rid == 0)
+check("T2c second rid=1", s2.pending[1].rid == 1)
+
+// ── T3: admit promotes pending -> running (up to max_batch) ──
+let s3 = gcb_admit(s2)
+check("T3 running len=2 after admit", len(s3.running) == 2)
+check("T3b pending empty after admit", len(s3.pending) == 0)
+check("T3c running[0] phase=prefill", s3.running[0].phase == gcb_phase_prefill())
+
+// ── T4: prefill_phase allocates blocks + writes KV ────────────
+let s4 = gcb_prefill_phase(s3, [])
+let r0_after = s4.running[0]
+let r1_after = s4.running[1]
+check("T4 req0 logical_blocks>=1", len(r0_after.logical_blocks) >= 1)
+check("T4b req0 n_tokens_cached == prompt_len", r0_after.n_tokens_cached == 3)
+check("T4c req1 n_tokens_cached == prompt_len", r1_after.n_tokens_cached == 5)
+// used blocks should now reflect the allocation
+let s4_used = gcb_used_blocks(s4)
+check("T4d pool used>=2", s4_used >= 2)
+
+// ── T5: after prefill, phase flips to decode ─────────────────
+check("T5 req0 phase=decode", r0_after.phase == gcb_phase_decode())
+check("T5b req1 phase=decode", r1_after.phase == gcb_phase_decode())
+
+// ── T6: gcb_blocks_needed math ───────────────────────────────
+check("T6 0 tokens -> 0 blocks", gcb_blocks_needed(0, 4) == 0)
+check("T6b 1 token -> 1 block", gcb_blocks_needed(1, 4) == 1)
+check("T6c 4 tokens -> 1 block", gcb_blocks_needed(4, 4) == 1)
+check("T6d 5 tokens -> 2 blocks", gcb_blocks_needed(5, 4) == 2)
+check("T6e 9 tokens -> 3 blocks", gcb_blocks_needed(9, 4) == 3)
+
+// ── T7: decode_phase adds exactly 1 token per running slot ───
+let gen_before_0 = r0_after.generated
+let gen_before_1 = r1_after.generated
+let s5 = gcb_decode_phase(s4, [])
+let r0_d = s5.running[0]
+let r1_d = s5.running[1]
+check("T7 req0 generated +1", r0_d.generated == gen_before_0 + 1)
+check("T7b req1 generated +1", r1_d.generated == gen_before_1 + 1)
+check("T7c tokens_generated>=2", s5.tokens_generated >= 2)
+
+// ── T8: run_iteration monotone on tokens_generated ───────────
+let s6 = gcb_run_iteration(s5, [])
+check("T8 iterations>prev", s6.iterations > s5.iterations)
+check("T8b tokens>=prev", s6.tokens_generated >= s5.tokens_generated)
+
+// ── T9: run_until_done retires everyone ──────────────────────
+let sA = gcb_create(2, 12, 4, 4)
+let sA1 = gcb_add_request(sA, mk_tokens(2, 10), 2)
+let sA2 = gcb_add_request(sA1, mk_tokens(3, 20), 2)
+let sA3 = gcb_add_request(sA2, mk_tokens(4, 30), 2)
+let sA_done = gcb_run_until_done(sA3, [], 100)
+let donev = gcb_get_completed(sA_done)
+check("T9 all 3 completed", len(donev) == 3)
+check("T9b running empty", len(sA_done.running) == 0)
+check("T9c pending empty", len(sA_done.pending) == 0)
+// retirement must free ALL blocks -> full free list
+let free_after = gcb_free_blocks_count(sA_done)
+check("T9d all blocks returned to pool", free_after == 12)
+
+// ── T10: max_batch caps concurrent running ──────────────────
+let sB = gcb_create(2, 32, 4, 4)
+let sB1 = gcb_add_request(sB,  mk_tokens(2, 1), 5)
+let sB2 = gcb_add_request(sB1, mk_tokens(2, 2), 5)
+let sB3 = gcb_add_request(sB2, mk_tokens(2, 3), 5)
+let sB4 = gcb_add_request(sB3, mk_tokens(2, 4), 5)
+let sB_it = gcb_run_iteration(sB4, [])
+check("T10 running capped at 2", len(sB_it.running) <= 2)
+check("T10b pending still has slack", len(sB_it.pending) >= 1)
+
+// ── T11: OOM -> waiting phase (backpressure) ────────────────
+// create a tiny pool so blocks run out fast
+let sC = gcb_create(4, 2, 2, 2)  // 2 blocks total, block_size=2
+// admit 2 requests that each need 2 blocks worth of prompt
+let sC1 = gcb_add_request(sC,  mk_tokens(3, 7), 2)  // needs ceil(3/2)=2 blocks
+let sC2 = gcb_add_request(sC1, mk_tokens(3, 9), 2)  // also 2 blocks -> OOM
+let sC_ad = gcb_admit(sC2)
+let sC_pf = gcb_prefill_phase(sC_ad, [])
+// at least one req should be in waiting now (blocks exhausted)
+let wait_cnt = gcb_waiting_count(sC_pf)
+check("T11 waiting_count>=1 under OOM", wait_cnt >= 1)
+// stats snapshot
+let sc_stats = gcb_stats(sC_pf)
+check("T11b free_blocks=0 when pool empty", sc_stats[5] == 0)
+
+// ── T12: remove_request frees its blocks ────────────────────
+let sD = gcb_create(4, 16, 4, 4)
+let sD1 = gcb_add_request(sD,  mk_tokens(4, 1), 5)
+let sD2 = gcb_add_request(sD1, mk_tokens(4, 2), 5)
+let sD_ad = gcb_admit(sD2)
+let sD_pf = gcb_prefill_phase(sD_ad, [])
+let used_before_rm = gcb_used_blocks(sD_pf)
+check("T12 used>0 before remove", used_before_rm > 0)
+let sD_rm = gcb_remove_request(sD_pf, 0)
+let used_after_rm = gcb_used_blocks(sD_rm)
+check("T12b used decreased after remove", used_after_rm < used_before_rm)
+check("T12c running len decreased", len(sD_rm.running) == 1)
+
+// ── T13: gcb_stats vector shape ─────────────────────────────
+let st = gcb_stats(sD_rm)
+check("T13 stats has 7 entries", len(st) == 7)
+
+// ── T14: KV make is deterministic per token ─────────────────
+let kv_a = gcb_make_kv_from_token(42, 4)
+let kv_b = gcb_make_kv_from_token(42, 4)
+let same_k = kv_a[0][0] == kv_b[0][0]
+let same_v = kv_a[1][3] == kv_b[1][3]
+check("T14 KV gen deterministic K", same_k)
+check("T14b KV gen deterministic V", same_v)
+
+// ── T15: multi-block prefill spans >=2 pages ────────────────
+let sE = gcb_create(1, 16, 4, 4)     // block_size=4
+let sE1 = gcb_add_request(sE, mk_tokens(9, 1000), 1)  // 9 tokens -> 3 blocks
+let sE_it = gcb_run_iteration(sE1, [])
+let e_r = sE_it.running
+if len(e_r) == 0 {
+    // might have already retired after 1 decode (max_new=1)
+    let donE = gcb_get_completed(sE_it)
+    check("T15 multi-block prefill completed", len(donE) == 1)
+    // it should have needed at least 3 logical blocks during its lifetime
+    // but after retire, blocks are freed so we only verify count was adequate
+    check("T15b pool fully returned", gcb_free_blocks_count(sE_it) == 16)
+} else {
+    let first = e_r[0]
+    check("T15 logical_blocks>=3 for 9-token prompt", len(first.logical_blocks) >= 3)
+    check("T15b n_tokens_cached>=prompt_len", first.n_tokens_cached >= first.prompt_len)
+}
+
+// ===================================================================
+//  Summary
+// ===================================================================
+println("")
+println("pass=" + to_string(pass_count) + " fail=" + to_string(fail_count))
+if fail_count == 0 {
+    println("ALL PASS")
+} else {
+    println("FAILED")
+}
+println(to_string(pass_count) + " passed")

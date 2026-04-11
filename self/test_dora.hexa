@@ -1,0 +1,694 @@
+// ═══════════════════════════════════════════════════════════════
+//  test_dora.hexa — DoRA (Weight-Decomposed Low-Rank Adaptation) tests
+//
+//  Validates:
+//    #1   zeros / ones helpers
+//    #2   column_norms correctness
+//    #3   normalize_columns unit columns
+//    #4   extract_magnitude == column_norms
+//    #5   DoraAdapter shape (make_dora_adapter)
+//    #6   magnitude init from W column norms
+//    #7   B init = zeros (LoRA convention)
+//    #8   dora_forward with B=0 => magnitude-scaled normalized W @ x
+//    #9   dora_forward output dimension
+//    #10  dora_forward identity W => expected output
+//    #11  dora_backward shape dm
+//    #12  dora_backward shape dA
+//    #13  dora_backward shape dB
+//    #14  numerical grad check dm
+//    #15  numerical grad check dA
+//    #16  numerical grad check dB
+//    #17  dora_merge shape
+//    #18  dora_merge with B=0 => original W (up to col norm)
+//    #19  dora_merge forward == dora_forward (equivalence)
+//    #20  dora_step returns loss
+//    #21  dora_step returns updated adapter
+//    #22  dora_step one step reduces loss
+//    #23  dora_trainable_count formula
+//    #24  multi-step training loss decreases
+//    #25  DoRA vs LoRA: same B=0 init => different structure
+//    #26  magnitude m is learnable (changes after step)
+//    #27  column norms of merged W match m (by construction)
+//    #28  dora_lora_scale correctness
+//
+//  Rules: pure .hexa, no Rust, HX3 pitfalls honored.
+//  Run: ./hexa self/test_dora.hexa
+// ═══════════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ═══════════════════════════════════════════════════════════════
+//  Inline core (mirror of self/ml/dora.hexa)
+// ═══════════════════════════════════════════════════════════════
+
+fn d_zeros1(n) {
+    let mut v = []
+    for i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn d_zeros2(rows, cols) {
+    let mut r = []
+    for i in 0..rows { r = r + [d_zeros1(cols)] }
+    return r
+}
+
+fn d_ones1(n) {
+    let mut v = []
+    for i in 0..n { v = v + [1.0] }
+    return v
+}
+
+fn d_kaiming(rows, cols, seed) {
+    let mut s = seed
+    let scale = 1.0 / sqrt(to_float(cols))
+    let mut r = []
+    for i in 0..rows {
+        let mut row = []
+        for j in 0..cols {
+            s = (s * 1103515245 + 12345) % 2147483647
+            let v = (to_float(s % 2000) - 1000.0) / 1000.0 * scale
+            row = row + [v]
+        }
+        r = r + [row]
+    }
+    return r
+}
+
+fn d_matvec(w, x, m, n) {
+    let mut y = []
+    for i in 0..m {
+        let mut s = 0.0
+        for j in 0..n { s = s + w[i][j] * x[j] }
+        y = y + [s]
+    }
+    return y
+}
+
+fn d_matmul(a, b, m, k, n) {
+    let mut c = []
+    for i in 0..m {
+        let mut row = []
+        for j in 0..n {
+            let mut s = 0.0
+            for p in 0..k { s = s + a[i][p] * b[p][j] }
+            row = row + [s]
+        }
+        c = c + [row]
+    }
+    return c
+}
+
+fn d_lora_scale(alpha, r) {
+    return to_float(alpha) / to_float(r)
+}
+
+// ── column_norms ────────────────────────────────────────────
+fn d_column_norms(w, out_dim, in_dim) {
+    let mut norms = []
+    for j in 0..in_dim {
+        let mut s = 0.0
+        for i in 0..out_dim {
+            s = s + w[i][j] * w[i][j]
+        }
+        norms = norms + [sqrt(s + 1.0e-8)]
+    }
+    return norms
+}
+
+// ── normalize_columns ───────────────────────────────────────
+fn d_normalize_columns(w, norms, out_dim, in_dim) {
+    let mut r = []
+    for i in 0..out_dim {
+        let mut row = []
+        for j in 0..in_dim {
+            row = row + [w[i][j] / norms[j]]
+        }
+        r = r + [row]
+    }
+    return r
+}
+
+fn d_extract_magnitude(w, out_dim, in_dim) {
+    return d_column_norms(w, out_dim, in_dim)
+}
+
+// ── DoRA adapter struct ─────────────────────────────────────
+struct DoraAdapter {
+    m: array,
+    a: array,
+    b: array,
+    out_dim: int,
+    in_dim: int,
+    rank: int
+}
+
+fn make_dora_adapter(w, out_dim, in_dim, rank, seed) {
+    let m = d_extract_magnitude(w, out_dim, in_dim)
+    let a = d_kaiming(rank, in_dim, seed)
+    let b = d_zeros2(out_dim, rank)
+    DoraAdapter {
+        m: m,
+        a: a,
+        b: b,
+        out_dim: out_dim,
+        in_dim: in_dim,
+        rank: rank
+    }
+}
+
+// ── DoRA forward ────────────────────────────────────────────
+fn d_forward(w, adapter: DoraAdapter, x, alpha) {
+    let out_dim = adapter.out_dim
+    let in_dim = adapter.in_dim
+    let r = adapter.rank
+    let s = d_lora_scale(alpha, r)
+
+    let ba = d_matmul(adapter.b, adapter.a, out_dim, r, in_dim)
+    let mut vprime = []
+    for i in 0..out_dim {
+        let mut row = []
+        for j in 0..in_dim {
+            row = row + [w[i][j] + s * ba[i][j]]
+        }
+        vprime = vprime + [row]
+    }
+
+    let norms = d_column_norms(vprime, out_dim, in_dim)
+    let v_hat = d_normalize_columns(vprime, norms, out_dim, in_dim)
+
+    let mut mx = []
+    for j in 0..in_dim {
+        mx = mx + [adapter.m[j] * x[j]]
+    }
+    let y = d_matvec(v_hat, mx, out_dim, in_dim)
+    return y
+}
+
+// ── DoRA backward ───────────────────────────────────────────
+fn d_backward(w, adapter: DoraAdapter, x, dy, alpha) {
+    let out_dim = adapter.out_dim
+    let in_dim = adapter.in_dim
+    let r = adapter.rank
+    let s = d_lora_scale(alpha, r)
+
+    let ba = d_matmul(adapter.b, adapter.a, out_dim, r, in_dim)
+    let mut vprime = []
+    for i in 0..out_dim {
+        let mut row = []
+        for j in 0..in_dim {
+            row = row + [w[i][j] + s * ba[i][j]]
+        }
+        vprime = vprime + [row]
+    }
+    let norms = d_column_norms(vprime, out_dim, in_dim)
+    let v_hat = d_normalize_columns(vprime, norms, out_dim, in_dim)
+
+    let mut mx = []
+    for j in 0..in_dim { mx = mx + [adapter.m[j] * x[j]] }
+
+    // dL/d(mx) = V_hat^T @ dy
+    let mut dmx = d_zeros1(in_dim)
+    for j in 0..in_dim {
+        let mut acc = 0.0
+        for i in 0..out_dim { acc = acc + v_hat[i][j] * dy[i] }
+        dmx[j] = acc
+    }
+
+    // dL/dm
+    let mut dm = d_zeros1(in_dim)
+    for j in 0..in_dim { dm[j] = dmx[j] * x[j] }
+
+    // dL/dV_hat = dy (outer) mx
+    let mut dv_hat = d_zeros2(out_dim, in_dim)
+    for i in 0..out_dim {
+        for j in 0..in_dim { dv_hat[i][j] = dy[i] * mx[j] }
+    }
+
+    // Through column normalization
+    let mut dvprime = d_zeros2(out_dim, in_dim)
+    for j in 0..in_dim {
+        let mut dot_j = 0.0
+        for i in 0..out_dim { dot_j = dot_j + v_hat[i][j] * dv_hat[i][j] }
+        for i in 0..out_dim {
+            dvprime[i][j] = (dv_hat[i][j] - v_hat[i][j] * dot_j) / norms[j]
+        }
+    }
+
+    // Through LoRA
+    let mut db = d_zeros2(out_dim, r)
+    for i in 0..out_dim {
+        for p in 0..r {
+            let mut acc = 0.0
+            for j in 0..in_dim { acc = acc + dvprime[i][j] * adapter.a[p][j] }
+            db[i][p] = s * acc
+        }
+    }
+
+    let mut da = d_zeros2(r, in_dim)
+    for p in 0..r {
+        for j in 0..in_dim {
+            let mut acc = 0.0
+            for i in 0..out_dim { acc = acc + adapter.b[i][p] * dvprime[i][j] }
+            da[p][j] = s * acc
+        }
+    }
+
+    return [dm, da, db]
+}
+
+// ── DoRA merge ──────────────────────────────────────────────
+fn d_merge(w, adapter: DoraAdapter, alpha) {
+    let out_dim = adapter.out_dim
+    let in_dim = adapter.in_dim
+    let r = adapter.rank
+    let s = d_lora_scale(alpha, r)
+
+    let ba = d_matmul(adapter.b, adapter.a, out_dim, r, in_dim)
+    let mut vprime = []
+    for i in 0..out_dim {
+        let mut row = []
+        for j in 0..in_dim { row = row + [w[i][j] + s * ba[i][j]] }
+        vprime = vprime + [row]
+    }
+
+    let norms = d_column_norms(vprime, out_dim, in_dim)
+
+    let mut merged = []
+    for i in 0..out_dim {
+        let mut row = []
+        for j in 0..in_dim {
+            row = row + [adapter.m[j] * vprime[i][j] / norms[j]]
+        }
+        merged = merged + [row]
+    }
+    return merged
+}
+
+// ── SGD helpers ─────────────────────────────────────────────
+fn d_sgd_2d(param, grad, lr, rows, cols) {
+    let mut out = []
+    for i in 0..rows {
+        let mut row = []
+        for j in 0..cols { row = row + [param[i][j] - lr * grad[i][j]] }
+        out = out + [row]
+    }
+    return out
+}
+
+fn d_sgd_1d(param, grad, lr, n) {
+    let mut out = []
+    for i in 0..n { out = out + [param[i] - lr * grad[i]] }
+    return out
+}
+
+fn d_mse_loss(y, target, m) {
+    let mut s = 0.0
+    for i in 0..m {
+        let d = y[i] - target[i]
+        s = s + d * d
+    }
+    return s / to_float(m)
+}
+
+fn d_mse_grad(y, target, m) {
+    let mut g = []
+    let inv = 2.0 / to_float(m)
+    for i in 0..m { g = g + [(y[i] - target[i]) * inv] }
+    return g
+}
+
+fn d_step(w, adapter: DoraAdapter, x, target, alpha, lr) {
+    let out_dim = adapter.out_dim
+    let in_dim = adapter.in_dim
+    let r = adapter.rank
+
+    let y = d_forward(w, adapter, x, alpha)
+    let loss = d_mse_loss(y, target, out_dim)
+    let dy = d_mse_grad(y, target, out_dim)
+    let grads = d_backward(w, adapter, x, dy, alpha)
+    let dm = grads[0]
+    let da = grads[1]
+    let db = grads[2]
+
+    let new_m = d_sgd_1d(adapter.m, dm, lr, in_dim)
+    let new_a = d_sgd_2d(adapter.a, da, lr, r, in_dim)
+    let new_b = d_sgd_2d(adapter.b, db, lr, out_dim, r)
+
+    let new_adapter = DoraAdapter {
+        m: new_m,
+        a: new_a,
+        b: new_b,
+        out_dim: out_dim,
+        in_dim: in_dim,
+        rank: r
+    }
+    return [new_adapter, loss]
+}
+
+fn d_trainable_count(adapter: DoraAdapter) {
+    return adapter.in_dim + adapter.rank * adapter.in_dim + adapter.out_dim * adapter.rank
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Test data
+// ═══════════════════════════════════════════════════════════════
+
+// 3x4 weight matrix (out_dim=3, in_dim=4)
+let W = [
+    [1.0, 2.0, 0.0, 1.0],
+    [0.0, 1.0, 3.0, 0.0],
+    [2.0, 0.0, 1.0, 2.0]
+]
+let out_dim = 3
+let in_dim = 4
+let rank = 2
+let alpha = 4
+
+let x_test = [1.0, 0.5, -0.3, 0.8]
+
+// ═══════════════════════════════════════════════════════════════
+//  Tests
+// ═══════════════════════════════════════════════════════════════
+
+// --- #1 zeros / ones helpers ---
+let z1 = d_zeros1(4)
+let o1 = d_ones1(3)
+check("#1a zeros1 len=4", len(z1) == 4)
+check("#1b zeros1[0]=0", approx(z1[0], 0.0, 1.0e-9))
+check("#1c ones1 len=3", len(o1) == 3)
+check("#1d ones1[2]=1", approx(o1[2], 1.0, 1.0e-9))
+
+// --- #2 column_norms ---
+// W col 0 = [1,0,2], norm = sqrt(1+0+4) = sqrt(5)
+// W col 1 = [2,1,0], norm = sqrt(4+1+0) = sqrt(5)
+// W col 2 = [0,3,1], norm = sqrt(0+9+1) = sqrt(10)
+// W col 3 = [1,0,2], norm = sqrt(1+0+4) = sqrt(5)
+let cn = d_column_norms(W, 3, 4)
+check("#2a col_norms len=4", len(cn) == 4)
+check("#2b col0 ~sqrt(5)", approx(cn[0], sqrt(5.0), 1.0e-3))
+check("#2c col2 ~sqrt(10)", approx(cn[2], sqrt(10.0), 1.0e-3))
+
+// --- #3 normalize_columns produces unit column norms ---
+let normed = d_normalize_columns(W, cn, 3, 4)
+let cn2 = d_column_norms(normed, 3, 4)
+let mut all_unit = true
+for j in 0..4 {
+    if !approx(cn2[j], 1.0, 1.0e-3) { all_unit = false }
+}
+check("#3 normalized cols have unit norm", all_unit)
+
+// --- #4 extract_magnitude == column_norms ---
+let mag = d_extract_magnitude(W, 3, 4)
+let mut mag_eq = true
+for j in 0..4 {
+    if !approx(mag[j], cn[j], 1.0e-9) { mag_eq = false }
+}
+check("#4 extract_magnitude == column_norms", mag_eq)
+
+// --- #5 DoraAdapter shape ---
+let ad = make_dora_adapter(W, out_dim, in_dim, rank, 42)
+check("#5a m len = in_dim", len(ad.m) == in_dim)
+check("#5b A rows = rank", len(ad.a) == rank)
+check("#5c A cols = in_dim", len(ad.a[0]) == in_dim)
+check("#5d B rows = out_dim", len(ad.b) == out_dim)
+check("#5e B cols = rank", len(ad.b[0]) == rank)
+
+// --- #6 magnitude init from W column norms ---
+let mut m_init_ok = true
+for j in 0..in_dim {
+    if !approx(ad.m[j], cn[j], 1.0e-6) { m_init_ok = false }
+}
+check("#6 m init = W column norms", m_init_ok)
+
+// --- #7 B init = zeros ---
+let mut b_zero = true
+for i in 0..out_dim {
+    for j in 0..rank {
+        if !approx(ad.b[i][j], 0.0, 1.0e-9) { b_zero = false }
+    }
+}
+check("#7 B init = zeros", b_zero)
+
+// --- #8 forward with B=0 => m * (W/||W||) @ x = W @ x ---
+// When B=0, V'=W, V_hat=W/||col||, y = V_hat @ (m*x) = V_hat @ (||col||*x) = W@x
+let y_init = d_forward(W, ad, x_test, alpha)
+let y_base = d_matvec(W, x_test, out_dim, in_dim)
+let mut fwd_match = true
+for i in 0..out_dim {
+    if !approx(y_init[i], y_base[i], 1.0e-4) { fwd_match = false }
+}
+check("#8 forward B=0 ~ W@x", fwd_match)
+
+// --- #9 forward output dimension ---
+check("#9 forward output dim = out_dim", len(y_init) == out_dim)
+
+// --- #10 identity W forward ---
+let W_id = [[1.0, 0.0], [0.0, 1.0]]
+let ad_id = make_dora_adapter(W_id, 2, 2, 1, 77)
+let x_id = [3.0, 4.0]
+let y_id = d_forward(W_id, ad_id, x_id, 2)
+check("#10a identity fwd[0] ~ 3.0", approx(y_id[0], 3.0, 1.0e-3))
+check("#10b identity fwd[1] ~ 4.0", approx(y_id[1], 4.0, 1.0e-3))
+
+// --- #11-#13 backward shapes ---
+let dy_test = [0.1, -0.2, 0.3]
+let grads = d_backward(W, ad, x_test, dy_test, alpha)
+let dm_g = grads[0]
+let da_g = grads[1]
+let db_g = grads[2]
+check("#11 dm len = in_dim", len(dm_g) == in_dim)
+check("#12a dA rows = rank", len(da_g) == rank)
+check("#12b dA cols = in_dim", len(da_g[0]) == in_dim)
+check("#13a dB rows = out_dim", len(db_g) == out_dim)
+check("#13b dB cols = rank", len(db_g[0]) == rank)
+
+// ═══════════════════════════════════════════════════════════════
+//  #14-#16 Numerical gradient checks
+//
+//  L = 0.5 * sum(y^2), dL/dy = y
+//  Finite difference: (L(p+eps) - L(p-eps)) / (2*eps)
+// ═══════════════════════════════════════════════════════════════
+
+fn nd_loss(w, adapter: DoraAdapter, x, alpha) {
+    let y = d_forward(w, adapter, x, alpha)
+    let n = len(y)
+    let mut s = 0.0
+    for i in 0..n { s = s + y[i] * y[i] }
+    return 0.5 * s
+}
+
+// Use a slightly perturbed adapter for numerical stability
+let ad_ng = make_dora_adapter(W, out_dim, in_dim, rank, 123)
+// Give B small nonzero values so gradients are nontrivial
+let mut b_ng = d_zeros2(out_dim, rank)
+b_ng[0][0] = 0.01
+b_ng[1][1] = -0.02
+b_ng[2][0] = 0.005
+let ad_ng2 = DoraAdapter {
+    m: ad_ng.m,
+    a: ad_ng.a,
+    b: b_ng,
+    out_dim: out_dim,
+    in_dim: in_dim,
+    rank: rank
+}
+
+let y_ng = d_forward(W, ad_ng2, x_test, alpha)
+let grads_ng = d_backward(W, ad_ng2, x_test, y_ng, alpha)
+let dm_an = grads_ng[0]
+let da_an = grads_ng[1]
+let db_an = grads_ng[2]
+
+let eps = 1.0e-4
+
+// --- #14 dm numerical check ---
+let mut dm_ok = true
+for j in 0..in_dim {
+    let mut mp = [ad_ng2.m[0], ad_ng2.m[1], ad_ng2.m[2], ad_ng2.m[3]]
+    mp[j] = mp[j] + eps
+    let ad_p = DoraAdapter { m: mp, a: ad_ng2.a, b: ad_ng2.b, out_dim: out_dim, in_dim: in_dim, rank: rank }
+    let Lp = nd_loss(W, ad_p, x_test, alpha)
+    let mut mm = [ad_ng2.m[0], ad_ng2.m[1], ad_ng2.m[2], ad_ng2.m[3]]
+    mm[j] = mm[j] - eps
+    let ad_m = DoraAdapter { m: mm, a: ad_ng2.a, b: ad_ng2.b, out_dim: out_dim, in_dim: in_dim, rank: rank }
+    let Lm = nd_loss(W, ad_m, x_test, alpha)
+    let nd = (Lp - Lm) / (2.0 * eps)
+    if fabs(nd - dm_an[j]) > 1.0e-3 { dm_ok = false }
+}
+check("#14 dm numerical ~ analytic", dm_ok)
+
+// --- #15 dA numerical check ---
+let mut dA_ok = true
+for p in 0..rank {
+    for j in 0..in_dim {
+        // Clone A
+        let mut Ap = d_zeros2(rank, in_dim)
+        for pi in 0..rank {
+            for ji in 0..in_dim { Ap[pi][ji] = ad_ng2.a[pi][ji] }
+        }
+        Ap[p][j] = Ap[p][j] + eps
+        let ad_p = DoraAdapter { m: ad_ng2.m, a: Ap, b: ad_ng2.b, out_dim: out_dim, in_dim: in_dim, rank: rank }
+        let Lp = nd_loss(W, ad_p, x_test, alpha)
+        let mut Am = d_zeros2(rank, in_dim)
+        for pi in 0..rank {
+            for ji in 0..in_dim { Am[pi][ji] = ad_ng2.a[pi][ji] }
+        }
+        Am[p][j] = Am[p][j] - eps
+        let ad_m = DoraAdapter { m: ad_ng2.m, a: Am, b: ad_ng2.b, out_dim: out_dim, in_dim: in_dim, rank: rank }
+        let Lm = nd_loss(W, ad_m, x_test, alpha)
+        let nd = (Lp - Lm) / (2.0 * eps)
+        if fabs(nd - da_an[p][j]) > 1.0e-3 { dA_ok = false }
+    }
+}
+check("#15 dA numerical ~ analytic", dA_ok)
+
+// --- #16 dB numerical check ---
+let mut dB_ok = true
+for i in 0..out_dim {
+    for p in 0..rank {
+        let mut Bp = d_zeros2(out_dim, rank)
+        for ii in 0..out_dim {
+            for pp in 0..rank { Bp[ii][pp] = ad_ng2.b[ii][pp] }
+        }
+        Bp[i][p] = Bp[i][p] + eps
+        let ad_p = DoraAdapter { m: ad_ng2.m, a: ad_ng2.a, b: Bp, out_dim: out_dim, in_dim: in_dim, rank: rank }
+        let Lp = nd_loss(W, ad_p, x_test, alpha)
+        let mut Bm = d_zeros2(out_dim, rank)
+        for ii in 0..out_dim {
+            for pp in 0..rank { Bm[ii][pp] = ad_ng2.b[ii][pp] }
+        }
+        Bm[i][p] = Bm[i][p] - eps
+        let ad_m = DoraAdapter { m: ad_ng2.m, a: ad_ng2.a, b: Bm, out_dim: out_dim, in_dim: in_dim, rank: rank }
+        let Lm = nd_loss(W, ad_m, x_test, alpha)
+        let nd = (Lp - Lm) / (2.0 * eps)
+        if fabs(nd - db_an[i][p]) > 1.0e-3 { dB_ok = false }
+    }
+}
+check("#16 dB numerical ~ analytic", dB_ok)
+
+// --- #17 merge shape ---
+let merged = d_merge(W, ad, alpha)
+check("#17a merge rows = out_dim", len(merged) == out_dim)
+check("#17b merge cols = in_dim", len(merged[0]) == in_dim)
+
+// --- #18 merge with B=0 => original W ---
+// When B=0: V'=W, merged = m * W/||col|| = ||col|| * W/||col|| = W
+let mut merge_eq = true
+for i in 0..out_dim {
+    for j in 0..in_dim {
+        if !approx(merged[i][j], W[i][j], 1.0e-4) { merge_eq = false }
+    }
+}
+check("#18 merge B=0 ~ original W", merge_eq)
+
+// --- #19 merge forward == dora_forward equivalence ---
+// After training a bit, merged W @ x should match dora_forward
+let mut ad_tr = ad_ng2
+let mut tr_step = 0
+while tr_step < 5 {
+    let target_tr = [0.0, 0.0, 0.0]
+    let res = d_step(W, ad_tr, x_test, target_tr, alpha, 0.01)
+    ad_tr = res[0]
+    tr_step = tr_step + 1
+}
+let w_merged_tr = d_merge(W, ad_tr, alpha)
+let y_fwd = d_forward(W, ad_tr, x_test, alpha)
+let y_mrg = d_matvec(w_merged_tr, x_test, out_dim, in_dim)
+let mut fwd_mrg_eq = true
+for i in 0..out_dim {
+    if !approx(y_fwd[i], y_mrg[i], 1.0e-4) { fwd_mrg_eq = false }
+}
+check("#19 merge forward == dora_forward", fwd_mrg_eq)
+
+// --- #20 step returns loss ---
+let target20 = [0.0, 0.0, 0.0]
+let res20 = d_step(W, ad, x_test, target20, alpha, 0.01)
+let loss20 = res20[1]
+check("#20 step returns loss > 0", loss20 > 0.0)
+
+// --- #21 step returns updated adapter ---
+let ad20 = res20[0]
+check("#21a updated adapter out_dim", ad20.out_dim == out_dim)
+check("#21b updated adapter rank", ad20.rank == rank)
+
+// --- #22 one step reduces loss ---
+let y_before = d_forward(W, ad, x_test, alpha)
+let loss_before = d_mse_loss(y_before, target20, out_dim)
+let y_after = d_forward(W, ad20, x_test, alpha)
+let loss_after = d_mse_loss(y_after, target20, out_dim)
+check("#22 one step reduces loss", loss_after < loss_before)
+
+// --- #23 trainable count ---
+// m: in_dim(4) + A: rank*in_dim(2*4=8) + B: out_dim*rank(3*2=6) = 18
+let tc = d_trainable_count(ad)
+check("#23 trainable = in_dim + r*in_dim + out_dim*r = 18", tc == 18)
+
+// --- #24 multi-step training loss decreases ---
+let mut ad_ms = make_dora_adapter(W, out_dim, in_dim, rank, 777)
+let target_ms = [1.0, -1.0, 0.5]
+let y_ms0 = d_forward(W, ad_ms, x_test, alpha)
+let loss_ms0 = d_mse_loss(y_ms0, target_ms, out_dim)
+
+let mut ms_step = 0
+while ms_step < 100 {
+    let res_ms = d_step(W, ad_ms, x_test, target_ms, alpha, 0.05)
+    ad_ms = res_ms[0]
+    ms_step = ms_step + 1
+}
+let y_ms_final = d_forward(W, ad_ms, x_test, alpha)
+let loss_ms_final = d_mse_loss(y_ms_final, target_ms, out_dim)
+check("#24a 100 steps reduce loss", loss_ms_final < loss_ms0)
+check("#24b 100 steps loss < 50% init", loss_ms_final < 0.5 * loss_ms0)
+
+// --- #25 DoRA vs LoRA structure: m is separate from direction ---
+// DoRA has magnitude vector, LoRA does not
+// At init with B=0, DoRA adapter.m = ||col(W)||, not just 1s
+let mut m_nontrivial = false
+for j in 0..in_dim {
+    if !approx(ad.m[j], 1.0, 0.01) { m_nontrivial = true }
+}
+check("#25 DoRA m != all-ones (data-dependent init)", m_nontrivial)
+
+// --- #26 magnitude m is learnable (changes after step) ---
+let ad_pre = make_dora_adapter(W, out_dim, in_dim, rank, 999)
+let res26 = d_step(W, ad_pre, x_test, [0.0, 0.0, 0.0], alpha, 0.1)
+let ad_post = res26[0]
+let mut m_changed = false
+for j in 0..in_dim {
+    if !approx(ad_pre.m[j], ad_post.m[j], 1.0e-9) { m_changed = true }
+}
+check("#26 magnitude m updated after step", m_changed)
+
+// --- #27 column norms of merged W match m ---
+// By construction: merged = m * V'/||V'||
+// So ||col_j(merged)|| = |m[j]| (since V'/||V'|| has unit col norms)
+let w_merged27 = d_merge(W, ad_ms, alpha)
+let cn27 = d_column_norms(w_merged27, out_dim, in_dim)
+let mut cn_match = true
+for j in 0..in_dim {
+    if !approx(cn27[j], fabs(ad_ms.m[j]), 1.0e-3) { cn_match = false }
+}
+check("#27 ||col(merged)|| ~ |m|", cn_match)
+
+// --- #28 lora_scale correctness ---
+let sc = d_lora_scale(8, 4)
+check("#28 lora_scale(8,4) = 2.0", approx(sc, 2.0, 1.0e-9))
+
+// ═══════════════════════════════════════════════════════════════
+println("")
+println("dora: " + to_string(pass_count) + " PASS / " + to_string(fail_count) + " FAIL")

@@ -1,0 +1,519 @@
+// ═══════════════════════════════════════════════════════════════
+//  test_soft_prompt.hexa — Soft Prompt Tuning (#79) 검증
+//
+//  검증:
+//    1. Prompt init shape [P x d]
+//    2. Zero prompt
+//    3. Deterministic seed (same seed → same values)
+//    4. Pool multi-task (different tasks → different prompts)
+//    5. Pool get/set (immutable update)
+//    6. sp_prepend concat order (prompt first, input after)
+//    7. Forward shape [(P+L) x m]
+//    8. Zero prompt + zero input forward = bias
+//    9. Loss MSE (identical → 0)
+//    10. Loss grad direction (positive residual → positive grad)
+//    11. Backward shape [P x d] + nonzero for nonzero upstream
+//    12. SGD update direction (grad > 0 → param decreases)
+//    13. Train step reduces loss (1 step should decrease MSE)
+//    14. Backbone is frozen (W, b unchanged after train_step)
+//    15. Param count = P * d
+//    16. Param ratio tiny (P*d << backbone)
+//    17. Pool set replaces only target task
+//    18. Train step updates only target task prompt
+//
+//  실행: ./hexa self/test_soft_prompt.hexa
+// ═══════════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ═══════════════════════════════════════════════════════════════
+//  Inline core — mirrors self/ml/soft_prompt.hexa
+// ═══════════════════════════════════════════════════════════════
+
+fn _sp_abs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn _sp_max_i(a, b) { if a >= b { return a } return b }
+
+struct SoftPromptOutput {
+    hidden: array,
+    prompt_len: int,
+    input_len: int,
+    dim: int
+}
+
+struct SoftPromptPool {
+    n_tasks: int,
+    prompt_len: int,
+    dim: int,
+    prompts: array
+}
+
+struct SoftPromptStep {
+    pool: SoftPromptPool,
+    loss: float,
+    grad_norm: float
+}
+
+fn sp_init_prompt(P, d, seed) {
+    let mut s = seed
+    if s <= 0 { s = 1 }
+    let mut prompt = []
+    let mut i = 0
+    while i < P {
+        let mut row = []
+        let mut j = 0
+        while j < d {
+            s = (s * 1103515245 + 12345) % 2147483647
+            let v = (to_float(s % 2000) - 1000.0) / 10000.0
+            row = row + [v]
+            j = j + 1
+        }
+        prompt = prompt + [row]
+        i = i + 1
+    }
+    return prompt
+}
+
+fn sp_zero_prompt(P, d) {
+    let mut prompt = []
+    let mut i = 0
+    while i < P {
+        let mut row = []
+        let mut j = 0
+        while j < d {
+            row = row + [0.0]
+            j = j + 1
+        }
+        prompt = prompt + [row]
+        i = i + 1
+    }
+    return prompt
+}
+
+fn sp_create_pool(n_tasks, P, d, seed) {
+    let mut prompts = []
+    let mut t = 0
+    while t < n_tasks {
+        let task_seed = seed + t * 7919
+        prompts = prompts + [sp_init_prompt(P, d, task_seed)]
+        t = t + 1
+    }
+    return SoftPromptPool {
+        n_tasks: n_tasks,
+        prompt_len: P,
+        dim: d,
+        prompts: prompts
+    }
+}
+
+fn sp_get_prompt(pool: SoftPromptPool, task_id) {
+    if task_id < 0 { return pool.prompts[0] }
+    if task_id >= pool.n_tasks { return pool.prompts[pool.n_tasks - 1] }
+    return pool.prompts[task_id]
+}
+
+fn sp_set_prompt(pool: SoftPromptPool, task_id, new_prompt) {
+    let mut new_prompts = []
+    let mut i = 0
+    while i < pool.n_tasks {
+        if i == task_id {
+            new_prompts = new_prompts + [new_prompt]
+        } else {
+            new_prompts = new_prompts + [pool.prompts[i]]
+        }
+        i = i + 1
+    }
+    return SoftPromptPool {
+        n_tasks: pool.n_tasks,
+        prompt_len: pool.prompt_len,
+        dim: pool.dim,
+        prompts: new_prompts
+    }
+}
+
+fn sp_prepend(prompt, input_embed) {
+    let P = len(prompt)
+    let L = len(input_embed)
+    let mut out = []
+    let mut i = 0
+    while i < P { out = out + [prompt[i]]; i = i + 1 }
+    i = 0
+    while i < L { out = out + [input_embed[i]]; i = i + 1 }
+    return out
+}
+
+fn _sp_linear(h, W, b, d, m) {
+    let mut y = []
+    let mut i = 0
+    while i < m {
+        let mut s = b[i]
+        let mut j = 0
+        while j < d {
+            s = s + W[i][j] * h[j]
+            j = j + 1
+        }
+        y = y + [s]
+        i = i + 1
+    }
+    return y
+}
+
+fn _sp_mean_pool(rows, T, d) {
+    let mut out = []
+    let inv = 1.0 / to_float(T)
+    let mut j = 0
+    while j < d {
+        let mut s = 0.0
+        let mut t = 0
+        while t < T { s = s + rows[t][j]; t = t + 1 }
+        out = out + [s * inv]
+        j = j + 1
+    }
+    return out
+}
+
+fn sp_forward(prompt, input_embed, W, b) {
+    let P = len(prompt)
+    let L = len(input_embed)
+    let d = 0 + len(prompt[0])
+    let m = 0 + len(b)
+    let prepended = sp_prepend(prompt, input_embed)
+    let total = P + L
+    let mut hidden = []
+    let mut i = 0
+    while i < total - 1 {
+        hidden = hidden + [_sp_linear(prepended[i], W, b, d, m)]
+        i = i + 1
+    }
+    let pooled = _sp_mean_pool(prepended, total, d)
+    hidden = hidden + [_sp_linear(pooled, W, b, d, m)]
+    return SoftPromptOutput {
+        hidden: hidden,
+        prompt_len: P,
+        input_len: L,
+        dim: d
+    }
+}
+
+fn sp_loss_mse(output: SoftPromptOutput, target) {
+    let total = output.prompt_len + output.input_len
+    let last = output.hidden[total - 1]
+    let m = len(last)
+    let mut s = 0.0
+    let mut i = 0
+    while i < m {
+        let diff = last[i] - target[i]
+        s = s + diff * diff
+        i = i + 1
+    }
+    return s / to_float(m)
+}
+
+fn sp_loss_grad_mse(output: SoftPromptOutput, target) {
+    let total = output.prompt_len + output.input_len
+    let last = output.hidden[total - 1]
+    let m = len(last)
+    let inv = 2.0 / to_float(m)
+    let mut g = []
+    let mut i = 0
+    while i < m {
+        g = g + [(last[i] - target[i]) * inv]
+        i = i + 1
+    }
+    return g
+}
+
+fn sp_backward(prompt, W, dL_dhidden_last, P, d, L) {
+    let m = len(dL_dhidden_last)
+    let mut dL_dx = []
+    let mut j = 0
+    while j < d {
+        let mut acc = 0.0
+        let mut i = 0
+        while i < m {
+            acc = acc + W[i][j] * dL_dhidden_last[i]
+            i = i + 1
+        }
+        dL_dx = dL_dx + [acc]
+        j = j + 1
+    }
+    let total = P + L
+    let scale = 1.0 / to_float(_sp_max_i(total, 1))
+    let mut grad = []
+    let mut p = 0
+    while p < P {
+        let mut row = []
+        let mut k = 0
+        while k < d {
+            row = row + [dL_dx[k] * scale]
+            k = k + 1
+        }
+        grad = grad + [row]
+        p = p + 1
+    }
+    return grad
+}
+
+fn sp_sgd_update(prompt, grad, lr, P, d) {
+    let mut out = []
+    let mut i = 0
+    while i < P {
+        let mut row = []
+        let mut j = 0
+        while j < d {
+            row = row + [prompt[i][j] - lr * grad[i][j]]
+            j = j + 1
+        }
+        out = out + [row]
+        i = i + 1
+    }
+    return out
+}
+
+fn sp_grad_norm(grad, P, d) {
+    let mut s = 0.0
+    let mut i = 0
+    while i < P {
+        let mut j = 0
+        while j < d {
+            s = s + grad[i][j] * grad[i][j]
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return sqrt(s)
+}
+
+fn sp_train_step(pool: SoftPromptPool, task_id, input_embed, target, W, b, lr) {
+    let prompt = sp_get_prompt(pool, task_id)
+    let out = sp_forward(prompt, input_embed, W, b)
+    let loss = sp_loss_mse(out, target)
+    let dL_dh = sp_loss_grad_mse(out, target)
+    let L = len(input_embed)
+    let grad = sp_backward(prompt, W, dL_dh, pool.prompt_len, pool.dim, L)
+    let new_prompt = sp_sgd_update(prompt, grad, lr, pool.prompt_len, pool.dim)
+    let new_pool = sp_set_prompt(pool, task_id, new_prompt)
+    let gn = sp_grad_norm(grad, pool.prompt_len, pool.dim)
+    return SoftPromptStep {
+        pool: new_pool,
+        loss: loss,
+        grad_norm: gn
+    }
+}
+
+fn sp_param_count(P, d) { return P * d }
+
+fn sp_param_ratio(P, d, backbone_params) {
+    if backbone_params <= 0 { return 0.0 }
+    return to_float(P * d) / to_float(backbone_params)
+}
+
+fn sp_prompt_mean_abs(prompt) {
+    let P = len(prompt)
+    if P == 0 { return 0.0 }
+    let d = len(prompt[0])
+    if d == 0 { return 0.0 }
+    let mut s = 0.0
+    let mut i = 0
+    while i < P {
+        let mut j = 0
+        while j < d {
+            s = s + _sp_abs(prompt[i][j])
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return s / to_float(P * d)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Tests
+// ═══════════════════════════════════════════════════════════════
+
+let P = 4
+let d = 3
+let L = 2
+let m = 2  // backbone output dim
+
+// #1 Init shape
+let p1 = sp_init_prompt(P, d, 42)
+check("#1 prompt rows=P", len(p1) == P)
+check("#1b prompt cols=d", len(p1[0]) == d)
+
+// #2 Zero prompt
+let pz = sp_zero_prompt(P, d)
+check("#2 zero prompt cell=0", approx(pz[1][1], 0.0, 1.0e-9))
+
+// #3 Deterministic seed
+let pa = sp_init_prompt(P, d, 123)
+let pb = sp_init_prompt(P, d, 123)
+check("#3 same seed same value", approx(pa[2][1], pb[2][1], 1.0e-12))
+
+// #4 Pool multi-task (different task seeds → different prompts)
+let pool = sp_create_pool(3, P, d, 7)
+let t0 = sp_get_prompt(pool, 0)
+let t1 = sp_get_prompt(pool, 1)
+check("#4 pool n_tasks=3", pool.n_tasks == 3)
+check("#4b task0 != task1", fabs(t0[0][0] - t1[0][0]) > 1.0e-9)
+
+// #5 Pool get/set immutable
+let new_prompt = sp_zero_prompt(P, d)
+let pool2 = sp_set_prompt(pool, 1, new_prompt)
+let t1_new = sp_get_prompt(pool2, 1)
+check("#5 set replaces target", approx(t1_new[0][0], 0.0, 1.0e-9))
+// original pool unchanged
+let t1_orig = sp_get_prompt(pool, 1)
+check("#5b original pool unchanged", fabs(t1_orig[0][0] - 0.0) > 1.0e-9)
+
+// #6 sp_prepend: prompt first, input after
+let inp = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+let prep = sp_prepend(pz, inp)
+check("#6 prepend total = P+L", len(prep) == P + L)
+// first P rows from prompt (zero), next L rows from input
+check("#6b prompt[0] first", approx(prep[0][0], 0.0, 1.0e-9))
+check("#6c input[0] at pos P", approx(prep[P][0], 1.0, 1.0e-9))
+check("#6d input[1] at pos P+1", approx(prep[P+1][0], 4.0, 1.0e-9))
+
+// #7 Forward shape
+// W [m x d], b [m]
+let W = [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]
+let b_vec = [0.0, 0.0]
+let out = sp_forward(pz, inp, W, b_vec)
+check("#7 hidden len = P+L", len(out.hidden) == P + L)
+check("#7b hidden[0] len = m", len(out.hidden[0]) == m)
+check("#7c prompt_len field", out.prompt_len == P)
+check("#7d input_len field", out.input_len == L)
+
+// #8 Zero prompt + zero input forward = bias
+let zero_inp = [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
+let b2 = [0.7, 0.3]
+let out8 = sp_forward(pz, zero_inp, W, b2)
+check("#8 hidden[0][0] = bias[0]", approx(out8.hidden[0][0], 0.7, 1.0e-9))
+check("#8b hidden[0][1] = bias[1]", approx(out8.hidden[0][1], 0.3, 1.0e-9))
+
+// #9 Loss MSE — target == last hidden → 0
+let last_idx = P + L - 1
+let last_h = out8.hidden[last_idx]
+let loss9 = sp_loss_mse(out8, last_h)
+check("#9 identical target → loss=0", approx(loss9, 0.0, 1.0e-9))
+
+// #9b Nonzero loss when target differs
+let tgt9b = [10.0, 10.0]
+let loss9b = sp_loss_mse(out8, tgt9b)
+check("#9b differing target → loss > 0", loss9b > 0.1)
+
+// #10 Loss grad direction — if last > target, grad > 0
+let tgt_low = [0.0, 0.0]
+let out10 = sp_forward(pz, zero_inp, W, [1.0, 2.0])
+// last hidden = [1.0, 2.0], target [0.0, 0.0] → residual positive → grad positive
+let grad10 = sp_loss_grad_mse(out10, tgt_low)
+check("#10 grad[0] positive", grad10[0] > 0.0)
+check("#10b grad[1] positive", grad10[1] > 0.0)
+
+// #11 Backward shape and nonzero for nonzero upstream
+let dL_dh = [1.0, 1.0]
+let bgrad = sp_backward(pz, W, dL_dh, P, d, L)
+check("#11 bgrad rows=P", len(bgrad) == P)
+check("#11b bgrad cols=d", len(bgrad[0]) == d)
+// dL_dx[0] = W[0][0]*1 + W[1][0]*1 = 0.1+0.4 = 0.5 ; scaled by 1/(P+L)
+let expect_b00 = 0.5 / to_float(P + L)
+check("#11c bgrad[0][0] value", approx(bgrad[0][0], expect_b00, 1.0e-9))
+// nonzero
+check("#11d bgrad nonzero", fabs(bgrad[0][0]) > 1.0e-9)
+
+// #12 SGD direction: prompt - lr * grad (positive grad → prompt decreases)
+let p_init = sp_init_prompt(P, d, 100)
+let pos_grad = sp_zero_prompt(P, d)  // clone shape
+let mut pg = pos_grad
+// set pg to all ones
+let mut pi = 0
+while pi < P {
+    let mut pj = 0
+    while pj < d {
+        pg[pi][pj] = 1.0
+        pj = pj + 1
+    }
+    pi = pi + 1
+}
+let p_updated = sp_sgd_update(p_init, pg, 0.1, P, d)
+check("#12 prompt decreases with positive grad",
+    p_updated[0][0] < p_init[0][0])
+check("#12b exact delta = -lr",
+    approx(p_updated[0][0] - p_init[0][0], 0.0 - 0.1, 1.0e-9))
+
+// #13 Train step reduces loss
+// Setup: pool task 0, small prompt, clear target
+let pool13 = sp_create_pool(2, P, d, 11)
+let inp13 = [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]
+let W13 = [[0.05, 0.1, 0.15], [0.2, 0.25, 0.3]]
+let b13 = [0.0, 0.0]
+let target13 = [3.0, 3.0]  // far from current output
+
+let p_before = sp_get_prompt(pool13, 0)
+let out_before = sp_forward(p_before, inp13, W13, b13)
+let loss_before = sp_loss_mse(out_before, target13)
+
+let step13 = sp_train_step(pool13, 0, inp13, target13, W13, b13, 0.5)
+// after one step, loss should decrease
+let p_after = sp_get_prompt(step13.pool, 0)
+let out_after = sp_forward(p_after, inp13, W13, b13)
+let loss_after = sp_loss_mse(out_after, target13)
+check("#13 train step reduces loss", loss_after < loss_before)
+check("#13b grad_norm > 0", step13.grad_norm > 0.0)
+check("#13c reported loss matches", approx(step13.loss, loss_before, 1.0e-6))
+
+// #14 Backbone frozen — W and b unchanged (we pass by value, but
+//     verify by rechecking value after train_step semantics)
+check("#14 W[0][0] unchanged", approx(W13[0][0], 0.05, 1.0e-12))
+check("#14b W[1][2] unchanged", approx(W13[1][2], 0.3, 1.0e-12))
+check("#14c b[0] unchanged", approx(b13[0], 0.0, 1.0e-12))
+
+// #15 Param count = P * d
+check("#15 param count", sp_param_count(P, d) == P * d)
+
+// #16 Param ratio tiny
+// backbone = m*d + m = 2*3 + 2 = 8 (+ many more in practice)
+// prompt P*d = 12 — so tiny vs a 1M backbone
+let ratio = sp_param_ratio(P, d, 1000000)
+check("#16 PEFT ratio < 0.001", ratio < 0.001)
+check("#16b zero backbone → 0", approx(sp_param_ratio(P, d, 0), 0.0, 1.0e-12))
+
+// #17 Pool set replaces only target task
+let pool17 = sp_create_pool(3, P, d, 50)
+let t2_before = sp_get_prompt(pool17, 2)
+let pool17b = sp_set_prompt(pool17, 1, sp_zero_prompt(P, d))
+let t2_after = sp_get_prompt(pool17b, 2)
+check("#17 task2 unchanged after set task1",
+    approx(t2_before[1][2], t2_after[1][2], 1.0e-12))
+let t1_after = sp_get_prompt(pool17b, 1)
+check("#17b task1 replaced", approx(t1_after[0][0], 0.0, 1.0e-12))
+
+// #18 Train step updates only target task prompt
+let pool18 = sp_create_pool(2, P, d, 77)
+let other_before = sp_get_prompt(pool18, 1)
+let step18 = sp_train_step(pool18, 0, inp13, target13, W13, b13, 0.1)
+let other_after = sp_get_prompt(step18.pool, 1)
+check("#18 other task prompt unchanged",
+    approx(other_before[0][0], other_after[0][0], 1.0e-12))
+// target task prompt should have changed
+let target_before = sp_get_prompt(pool18, 0)
+let target_after = sp_get_prompt(step18.pool, 0)
+check("#18b target task prompt changed",
+    fabs(target_before[0][0] - target_after[0][0]) > 1.0e-9)
+
+// ═══════════════════════════════════════════════════════════════
+println("")
+println("soft_prompt: " + to_string(pass_count) + " PASS / " + to_string(fail_count) + " FAIL")

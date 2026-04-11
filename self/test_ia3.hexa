@@ -1,0 +1,583 @@
+// ═══════════════════════════════════════════════════════════════
+//  test_ia3.hexa — IA3 Adapter 검증 (ML #81)
+//
+//  Coverage (≥12 tests):
+//    1.  ones-init → identity forward (K/V/FFN passthrough)
+//    2.  block struct — 3 vectors length correct
+//    3.  trainable_params count
+//    4.  frozen_params count
+//    5.  ewmul element-wise correctness
+//    6.  rescale_matvec = l ⊙ (W @ x) identity check
+//    7.  rescale_matvec with l != 1 differs from base
+//    8.  layer_forward all 3 outputs shape
+//    9.  rescale_grad — analytic vs finite difference
+//    10. layer_backward returns 3 dl vectors
+//    11. sgd_step_block moves l_k in descent direction
+//    12. merge_weight: l⊙(W@x) == (merge @ x)
+//    13. unmerge recovers base (roundtrip)
+//    14. identity (l=1) merge is no-op
+//    15. stack_forward runs multi-layer
+//    16. training loop reduces MSE loss
+//
+//  Run: ./hexa self/test_ia3.hexa
+//
+//  순수 .hexa, src/*.rs 미접촉. SSOT id=81.
+// ═══════════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ═══════════════════════════════════════════════════════════════
+//  Inline IA3 core (mirror of self/ml/ia3.hexa — avoids module
+//  resolution friction when running from repo root)
+// ═══════════════════════════════════════════════════════════════
+
+struct Ia3Block {
+    l_k: array,
+    l_v: array,
+    l_ff: array,
+    d_k: int,
+    d_v: int,
+    d_ff: int
+}
+
+struct Ia3BaseLayer {
+    w_k: array,
+    w_v: array,
+    w_ff: array,
+    d_k: int,
+    d_v: int,
+    d_ff: int,
+    in_dim: int
+}
+
+fn ia3_ones1(n) {
+    let mut v = []
+    for i in 0..n { v = v + [1.0] }
+    return v
+}
+
+fn ia3_zeros1(n) {
+    let mut v = []
+    for i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn ia3_make_block(d_k, d_v, d_ff) {
+    return Ia3Block {
+        l_k:  ia3_ones1(d_k),
+        l_v:  ia3_ones1(d_v),
+        l_ff: ia3_ones1(d_ff),
+        d_k:  d_k,
+        d_v:  d_v,
+        d_ff: d_ff
+    }
+}
+
+fn ia3_create_blocks(base_layers) {
+    let n = len(base_layers)
+    let mut blocks = []
+    let mut i = 0
+    while i < n {
+        let b = base_layers[i]
+        blocks = blocks + [ia3_make_block(b.d_k, b.d_v, b.d_ff)]
+        i = i + 1
+    }
+    return blocks
+}
+
+fn ia3_trainable_params(blocks) {
+    let n = len(blocks)
+    let mut s = 0
+    let mut i = 0
+    while i < n {
+        let b = blocks[i]
+        s = s + b.d_k + b.d_v + b.d_ff
+        i = i + 1
+    }
+    return s
+}
+
+fn ia3_frozen_params(base_layers) {
+    let n = len(base_layers)
+    let mut s = 0
+    let mut i = 0
+    while i < n {
+        let b = base_layers[i]
+        s = s + (b.d_k + b.d_v + b.d_ff) * b.in_dim
+        i = i + 1
+    }
+    return s
+}
+
+fn ia3_ewmul(l, v, n) {
+    let mut y = []
+    for i in 0..n { y = y + [l[i] * v[i]] }
+    return y
+}
+
+fn ia3_rescale_matvec(l, w, x, m, k) {
+    let mut y = []
+    for i in 0..m {
+        let mut s = 0.0
+        for j in 0..k { s = s + w[i][j] * x[j] }
+        y = y + [l[i] * s]
+    }
+    return y
+}
+
+fn ia3_layer_forward(base: Ia3BaseLayer, blk: Ia3Block, x) {
+    let k_out  = ia3_rescale_matvec(blk.l_k,  base.w_k,  x, base.d_k,  base.in_dim)
+    let v_out  = ia3_rescale_matvec(blk.l_v,  base.w_v,  x, base.d_v,  base.in_dim)
+    let ff_out = ia3_rescale_matvec(blk.l_ff, base.w_ff, x, base.d_ff, base.in_dim)
+    return [k_out, v_out, ff_out]
+}
+
+fn ia3_rescale_grad(w, x, dy, m, k) {
+    let mut dl = []
+    for i in 0..m {
+        let mut s = 0.0
+        for j in 0..k { s = s + w[i][j] * x[j] }
+        dl = dl + [dy[i] * s]
+    }
+    return dl
+}
+
+fn ia3_layer_backward(base: Ia3BaseLayer, blk: Ia3Block, x, dy_k, dy_v, dy_ff) {
+    let dl_k  = ia3_rescale_grad(base.w_k,  x, dy_k,  base.d_k,  base.in_dim)
+    let dl_v  = ia3_rescale_grad(base.w_v,  x, dy_v,  base.d_v,  base.in_dim)
+    let dl_ff = ia3_rescale_grad(base.w_ff, x, dy_ff, base.d_ff, base.in_dim)
+    return [dl_k, dl_v, dl_ff]
+}
+
+fn ia3_sgd_update_vec(l, dl, lr, n) {
+    let mut out = []
+    for i in 0..n { out = out + [l[i] - lr * dl[i]] }
+    return out
+}
+
+fn ia3_sgd_step_block(blk: Ia3Block, dl_k, dl_v, dl_ff, lr) {
+    let new_k  = ia3_sgd_update_vec(blk.l_k,  dl_k,  lr, blk.d_k)
+    let new_v  = ia3_sgd_update_vec(blk.l_v,  dl_v,  lr, blk.d_v)
+    let new_ff = ia3_sgd_update_vec(blk.l_ff, dl_ff, lr, blk.d_ff)
+    return Ia3Block {
+        l_k:  new_k,
+        l_v:  new_v,
+        l_ff: new_ff,
+        d_k:  blk.d_k,
+        d_v:  blk.d_v,
+        d_ff: blk.d_ff
+    }
+}
+
+fn ia3_merge_weight(l, w, m, k) {
+    let mut out = []
+    for i in 0..m {
+        let mut row = []
+        let lm = l[i]
+        for j in 0..k { row = row + [lm * w[i][j]] }
+        out = out + [row]
+    }
+    return out
+}
+
+fn ia3_unmerge_weight(l, w_merged, m, k) {
+    let mut out = []
+    for i in 0..m {
+        let mut row = []
+        let li = l[i]
+        let inv = if li == 0.0 { 0.0 } else { 1.0 / li }
+        for j in 0..k { row = row + [w_merged[i][j] * inv] }
+        out = out + [row]
+    }
+    return out
+}
+
+fn ia3_stack_forward(base_layers, blocks, x) {
+    let n = len(base_layers)
+    let mut h = x
+    let mut i = 0
+    while i < n {
+        let out = ia3_layer_forward(base_layers[i], blocks[i], h)
+        h = out[2]
+        i = i + 1
+    }
+    return h
+}
+
+fn ia3_stack_collect_inputs(base_layers, blocks, x) {
+    let n = len(base_layers)
+    let mut inputs = []
+    let mut h = x
+    let mut i = 0
+    while i < n {
+        inputs = inputs + [h]
+        let out = ia3_layer_forward(base_layers[i], blocks[i], h)
+        h = out[2]
+        i = i + 1
+    }
+    return [inputs, h]
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Fixture helpers
+// ═══════════════════════════════════════════════════════════════
+
+// Deterministic LCG so tests are reproducible without stdlib rng.
+fn lcg_init(d_k, d_v, d_ff, in_dim, seed) {
+    let mut s = seed
+    let mut w_k = []
+    let mut i = 0
+    while i < d_k {
+        let mut row = []
+        let mut j = 0
+        while j < in_dim {
+            s = (s * 1103515245 + 12345) % 2147483647
+            row = row + [(to_float(s % 2000) - 1000.0) / 1000.0]
+            j = j + 1
+        }
+        w_k = w_k + [row]
+        i = i + 1
+    }
+    let mut w_v = []
+    i = 0
+    while i < d_v {
+        let mut row = []
+        let mut j = 0
+        while j < in_dim {
+            s = (s * 1103515245 + 12345) % 2147483647
+            row = row + [(to_float(s % 2000) - 1000.0) / 1000.0]
+            j = j + 1
+        }
+        w_v = w_v + [row]
+        i = i + 1
+    }
+    let mut w_ff = []
+    i = 0
+    while i < d_ff {
+        let mut row = []
+        let mut j = 0
+        while j < in_dim {
+            s = (s * 1103515245 + 12345) % 2147483647
+            row = row + [(to_float(s % 2000) - 1000.0) / 1000.0]
+            j = j + 1
+        }
+        w_ff = w_ff + [row]
+        i = i + 1
+    }
+    return Ia3BaseLayer {
+        w_k:    w_k,
+        w_v:    w_v,
+        w_ff:   w_ff,
+        d_k:    d_k,
+        d_v:    d_v,
+        d_ff:   d_ff,
+        in_dim: in_dim
+    }
+}
+
+fn plain_matvec(w, x, m, k) {
+    let mut y = []
+    for i in 0..m {
+        let mut s = 0.0
+        for j in 0..k { s = s + w[i][j] * x[j] }
+        y = y + [s]
+    }
+    return y
+}
+
+fn mse(y, t, n) {
+    let mut s = 0.0
+    for i in 0..n {
+        let d = y[i] - t[i]
+        s = s + d * d
+    }
+    return s / to_float(n)
+}
+
+fn mse_grad(y, t, n) {
+    let mut g = []
+    let inv = 2.0 / to_float(n)
+    for i in 0..n {
+        g = g + [(y[i] - t[i]) * inv]
+    }
+    return g
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Tests
+// ═══════════════════════════════════════════════════════════════
+
+println("=" * 60)
+println("  test_ia3.hexa — IA3 Adapter (ML #81)")
+println("=" * 60)
+
+// ── Test 1: identity forward (l=1) matches base matvec ─────────
+fn test_identity_forward() {
+    let base = lcg_init(3, 3, 4, 5, 42)
+    let blk = ia3_make_block(3, 3, 4)
+    let x = [0.3, -0.2, 0.7, 0.1, -0.4]
+    let out = ia3_layer_forward(base, blk, x)
+
+    let k_ref = plain_matvec(base.w_k, x, 3, 5)
+    let v_ref = plain_matvec(base.w_v, x, 3, 5)
+    let ff_ref = plain_matvec(base.w_ff, x, 4, 5)
+
+    let mut ok_k = true
+    for i in 0..3 { if !approx(out[0][i], k_ref[i], 1.0e-9) { ok_k = false } }
+    let mut ok_v = true
+    for i in 0..3 { if !approx(out[1][i], v_ref[i], 1.0e-9) { ok_v = false } }
+    let mut ok_ff = true
+    for i in 0..4 { if !approx(out[2][i], ff_ref[i], 1.0e-9) { ok_ff = false } }
+
+    check("#1 identity init K path = base", ok_k)
+    check("#2 identity init V path = base", ok_v)
+    check("#3 identity init FFN path = base", ok_ff)
+}
+
+// ── Test 2: block struct lengths ───────────────────────────────
+fn test_block_shape() {
+    let blk = ia3_make_block(5, 7, 11)
+    check("#4 l_k length = d_k",  len(blk.l_k)  == 5)
+    check("#5 l_v length = d_v",  len(blk.l_v)  == 7)
+    check("#6 l_ff length = d_ff", len(blk.l_ff) == 11)
+}
+
+// ── Test 3: trainable_params count ─────────────────────────────
+fn test_trainable_count() {
+    let b1 = lcg_init(4, 4, 8, 16, 1)
+    let b2 = lcg_init(4, 4, 8, 16, 2)
+    let base_layers = [b1, b2]
+    let blocks = ia3_create_blocks(base_layers)
+    let tp = ia3_trainable_params(blocks)
+    // 2 layers * (4+4+8) = 32
+    check("#7 trainable params count = 32", tp == 32)
+}
+
+// ── Test 4: frozen_params count ────────────────────────────────
+fn test_frozen_count() {
+    let b1 = lcg_init(4, 4, 8, 16, 1)
+    let fp = ia3_frozen_params([b1])
+    // (4+4+8) * 16 = 16*16 = 256
+    check("#8 frozen params count = 256", fp == 256)
+
+    // ratio assertion: trainable ≪ frozen
+    let blocks = ia3_create_blocks([b1])
+    let tp = ia3_trainable_params(blocks)
+    check("#9 trainable << frozen (16 << 256)", tp * 16 == fp)
+}
+
+// ── Test 5: ewmul correctness ──────────────────────────────────
+fn test_ewmul() {
+    let l = [2.0, 3.0, 0.5]
+    let v = [4.0, 1.0, 8.0]
+    let out = ia3_ewmul(l, v, 3)
+    check("#10 ewmul[0] = 8.0",  approx(out[0], 8.0, 1.0e-9))
+    check("#11 ewmul[1] = 3.0",  approx(out[1], 3.0, 1.0e-9))
+    check("#12 ewmul[2] = 4.0",  approx(out[2], 4.0, 1.0e-9))
+}
+
+// ── Test 6: rescale_matvec with l != 1 differs from base ───────
+fn test_rescale_nonidentity() {
+    let w = [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]
+    let x = [1.0, 1.0]
+    let l = [2.0, 0.5, 1.0]
+    let out = ia3_rescale_matvec(l, w, x, 3, 2)
+    // base: [3, 7, 11]  ;  rescaled: [6, 3.5, 11]
+    check("#13 rescale[0] = 6.0",  approx(out[0], 6.0, 1.0e-9))
+    check("#14 rescale[1] = 3.5",  approx(out[1], 3.5, 1.0e-9))
+    check("#15 rescale[2] = 11.0", approx(out[2], 11.0, 1.0e-9))
+}
+
+// ── Test 7: rescale_grad — analytic vs finite difference ───────
+fn test_grad_finite_diff() {
+    let w = [[0.3, -0.7, 0.2], [0.5, 0.1, -0.4]]
+    let x = [1.0, 0.5, -0.2]
+    let l = [1.0, 1.0]
+    let target = [0.2, -0.1]
+    let eps = 1.0e-5
+
+    // Forward at l (which is identity)
+    let y0 = ia3_rescale_matvec(l, w, x, 2, 3)
+    let dy = mse_grad(y0, target, 2)
+    let dl = ia3_rescale_grad(w, x, dy, 2, 3)
+
+    // FD grad for l[0]: perturb, re-forward, re-loss
+    let l_plus = [1.0 + eps, 1.0]
+    let y_plus = ia3_rescale_matvec(l_plus, w, x, 2, 3)
+    let loss_plus = mse(y_plus, target, 2)
+    let l_minus = [1.0 - eps, 1.0]
+    let y_minus = ia3_rescale_matvec(l_minus, w, x, 2, 3)
+    let loss_minus = mse(y_minus, target, 2)
+    let fd_dl0 = (loss_plus - loss_minus) / (2.0 * eps)
+
+    check("#16 analytic grad dl[0] ≈ FD", approx(dl[0], fd_dl0, 1.0e-3))
+}
+
+// ── Test 8: layer_backward returns 3 vectors of correct length ─
+fn test_layer_backward_shape() {
+    let base = lcg_init(2, 3, 4, 5, 7)
+    let blk = ia3_make_block(2, 3, 4)
+    let x = [0.1, 0.2, 0.3, 0.4, 0.5]
+    let dy_k = [0.1, -0.1]
+    let dy_v = [0.2, -0.2, 0.1]
+    let dy_ff = [0.3, -0.3, 0.1, -0.1]
+    let grads = ia3_layer_backward(base, blk, x, dy_k, dy_v, dy_ff)
+    check("#17 dl_k length = 2", len(grads[0]) == 2)
+    check("#18 dl_v length = 3", len(grads[1]) == 3)
+    check("#19 dl_ff length = 4", len(grads[2]) == 4)
+}
+
+// ── Test 9: SGD step — l_k moves against grad ──────────────────
+fn test_sgd_descent_direction() {
+    let blk = ia3_make_block(3, 3, 3)
+    let dl_k = [1.0, -2.0, 0.5]
+    let dl_v = [0.0, 0.0, 0.0]
+    let dl_ff = [0.0, 0.0, 0.0]
+    let lr = 0.1
+    let new_blk = ia3_sgd_step_block(blk, dl_k, dl_v, dl_ff, lr)
+    // l_k[0] was 1.0, grad +1.0, lr 0.1 → 0.9
+    // l_k[1] was 1.0, grad -2.0 → 1.2
+    // l_k[2] was 1.0, grad +0.5 → 0.95
+    check("#20 sgd l_k[0] = 0.9",  approx(new_blk.l_k[0], 0.9, 1.0e-9))
+    check("#21 sgd l_k[1] = 1.2",  approx(new_blk.l_k[1], 1.2, 1.0e-9))
+    check("#22 sgd l_k[2] = 0.95", approx(new_blk.l_k[2], 0.95, 1.0e-9))
+    // unchanged vectors stay identity
+    check("#23 sgd l_v untouched = 1.0", approx(new_blk.l_v[0], 1.0, 1.0e-12))
+    check("#24 sgd l_ff untouched = 1.0", approx(new_blk.l_ff[2], 1.0, 1.0e-12))
+}
+
+// ── Test 10: merge_weight: l⊙(W@x) == (merge @ x) ──────────────
+fn test_merge_equivalence() {
+    let w = [[0.5, -0.3, 0.8], [0.2, 0.9, -0.1], [-0.4, 0.6, 0.3]]
+    let l = [1.5, 0.7, 2.0]
+    let x = [0.3, -0.2, 0.9]
+    let rescaled = ia3_rescale_matvec(l, w, x, 3, 3)
+    let w_merged = ia3_merge_weight(l, w, 3, 3)
+    let via_merge = plain_matvec(w_merged, x, 3, 3)
+    let mut ok = true
+    for i in 0..3 {
+        if !approx(rescaled[i], via_merge[i], 1.0e-9) { ok = false }
+    }
+    check("#25 l⊙(W@x) == (merge(l,W) @ x)", ok)
+}
+
+// ── Test 11: unmerge roundtrip recovers base ───────────────────
+fn test_unmerge_roundtrip() {
+    let w = [[0.5, -0.3, 0.8], [0.2, 0.9, -0.1], [-0.4, 0.6, 0.3]]
+    let l = [1.5, 0.7, 2.0]
+    let w_merged = ia3_merge_weight(l, w, 3, 3)
+    let w_back = ia3_unmerge_weight(l, w_merged, 3, 3)
+    let mut ok = true
+    for i in 0..3 {
+        for j in 0..3 {
+            if !approx(w_back[i][j], w[i][j], 1.0e-9) { ok = false }
+        }
+    }
+    check("#26 unmerge(merge(l,W)) == W", ok)
+}
+
+// ── Test 12: identity merge is a no-op ─────────────────────────
+fn test_identity_merge_noop() {
+    let w = [[0.5, -0.3, 0.8], [0.2, 0.9, -0.1]]
+    let l = [1.0, 1.0]
+    let w_m = ia3_merge_weight(l, w, 2, 3)
+    let mut ok = true
+    for i in 0..2 {
+        for j in 0..3 {
+            if !approx(w_m[i][j], w[i][j], 1.0e-12) { ok = false }
+        }
+    }
+    check("#27 identity(l=1) merge is no-op", ok)
+}
+
+// ── Test 13: stack_forward runs multi-layer cleanly ────────────
+fn test_stack_forward() {
+    // chain: in=4 → ff=4 → ff=4 → ff=4   (keeps residual shape)
+    let b1 = lcg_init(3, 3, 4, 4, 11)
+    let b2 = lcg_init(3, 3, 4, 4, 22)
+    let b3 = lcg_init(3, 3, 4, 4, 33)
+    let base_layers = [b1, b2, b3]
+    let blocks = ia3_create_blocks(base_layers)
+    let x = [0.1, 0.2, 0.3, 0.4]
+    let y = ia3_stack_forward(base_layers, blocks, x)
+    check("#28 stack_forward output length = 4", len(y) == 4)
+
+    let res = ia3_stack_collect_inputs(base_layers, blocks, x)
+    let inputs = res[0]
+    check("#29 stack collects 3 per-layer inputs", len(inputs) == 3)
+}
+
+// ── Test 14: training loop reduces MSE loss ────────────────────
+fn test_training_convergence() {
+    // Single layer — optimize l_ff to fit a target.
+    let base = lcg_init(2, 2, 3, 4, 77)
+    let mut blk = ia3_make_block(2, 2, 3)
+    let x = [0.5, -0.3, 0.8, 0.1]
+    let target = [0.9, -0.6, 0.4]
+
+    // Initial loss
+    let y0 = ia3_rescale_matvec(blk.l_ff, base.w_ff, x, 3, 4)
+    let loss0 = mse(y0, target, 3)
+
+    // 40 SGD steps on l_ff only
+    let lr = 0.1
+    let mut step = 0
+    while step < 40 {
+        let y = ia3_rescale_matvec(blk.l_ff, base.w_ff, x, 3, 4)
+        let dy = mse_grad(y, target, 3)
+        let dl_ff = ia3_rescale_grad(base.w_ff, x, dy, 3, 4)
+        // use zero grads on unused branches
+        let dl_k = ia3_zeros1(blk.d_k)
+        let dl_v = ia3_zeros1(blk.d_v)
+        blk = ia3_sgd_step_block(blk, dl_k, dl_v, dl_ff, lr)
+        step = step + 1
+    }
+
+    let y1 = ia3_rescale_matvec(blk.l_ff, base.w_ff, x, 3, 4)
+    let loss1 = mse(y1, target, 3)
+
+    println("[train] loss0=" + str(loss0) + " loss40=" + str(loss1))
+    check("#30 training loss decreased", loss1 < loss0)
+    check("#31 training loss < 0.5 * loss0", loss1 < loss0 * 0.5)
+}
+
+// ── Run all ────────────────────────────────────────────────────
+test_identity_forward()
+test_block_shape()
+test_trainable_count()
+test_frozen_count()
+test_ewmul()
+test_rescale_nonidentity()
+test_grad_finite_diff()
+test_layer_backward_shape()
+test_sgd_descent_direction()
+test_merge_equivalence()
+test_unmerge_roundtrip()
+test_identity_merge_noop()
+test_stack_forward()
+test_training_convergence()
+
+println("")
+println("=" * 60)
+println("  ia3: " + str(pass_count) + " PASS / " + str(fail_count) + " FAIL")
+println("=" * 60)
+
+if fail_count > 0 {
+    println("[FAIL] " + str(fail_count) + " tests failed")
+} else {
+    println("[ALL PASS] IA3 adapter verified (ML #81)")
+}

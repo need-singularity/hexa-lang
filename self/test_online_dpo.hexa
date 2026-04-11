@@ -1,0 +1,517 @@
+// ═══════════════════════════════════════════════════════════════════
+//  test_online_dpo.hexa — Online DPO (#87) verification
+//
+//  Covers:
+//    1.  new_policy shape + determinism
+//    2.  copy_policy deep-copy
+//    3.  log_prob sums to 1 (via softmax) - probability normalisation
+//    4.  log_prob out-of-range guard
+//    5.  sample returns k items
+//    6.  sample returns valid actions
+//    7.  judge_linear passthrough + bounds
+//    8.  build_pair: chosen_reward >= rejected_reward
+//    9.  loss positive when chosen preferred by judge
+//   10.  loss decreases after odpo_step (learning signal)
+//   11.  margin increases after odpo_step
+//   12.  replay_push respects capacity
+//   13.  replay_sample returns a stored pair
+//   14.  policy_drift == 0 for identical policies
+//   15.  policy_drift > 0 after training
+//   16.  kl_drift >= 0 always
+//   17.  train_step advances step counter
+//   18.  full train loop reduces total_loss-per-step over time
+//   19.  replay_ratio=1 uses buffer (no new pushes after seed)
+//
+//  Pattern: inline all odpo_* helpers (mirrors test_dpo_variants.hexa)
+//
+//  Run: ./hexa self/test_online_dpo.hexa
+// ═══════════════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ── inline numeric helpers ──────────────────────────────────────
+
+fn odpo_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn odpo_log(x) {
+    if x <= 0.0 { return -30.0 }
+    let mut v = x
+    let mut count = 0
+    while v > 2.0 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    let d = v - 1.0
+    let ln_v = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_v
+}
+
+fn odpo_sigmoid(x) {
+    if x > 20.0 { return 1.0 }
+    if x < -20.0 { return 0.0 }
+    return 1.0 / (1.0 + odpo_exp(0.0 - x))
+}
+
+fn odpo_log_sigmoid(x) {
+    let neg_x = 0.0 - x
+    if neg_x > 20.0 { return 0.0 - neg_x }
+    if neg_x < -20.0 { return 0.0 }
+    return 0.0 - odpo_log(1.0 + odpo_exp(neg_x))
+}
+
+fn odpo_hash(seed, i) {
+    let h = ((seed * 2654435761 + i * 1315423911 + 731) % 10007)
+    return to_float(h) / 10007.0
+}
+
+fn odpo_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+// ── inline policy / log_prob / sample ───────────────────────────
+
+fn odpo_new_policy(d, seed) {
+    let mut v = []
+    for i in 0..d {
+        let a = odpo_hash(seed, i * 2)
+        let b = odpo_hash(seed, i * 2 + 1)
+        v = v + [(a - 0.5) * 0.1 + (b - 0.5) * 0.1]
+    }
+    return v
+}
+
+fn odpo_copy_policy(p) {
+    let n = len(p)
+    let mut out = []
+    for i in 0..n { out = out + [p[i]] }
+    return out
+}
+
+fn odpo_softmax(logits) {
+    let n = len(logits)
+    let mut mx = logits[0]
+    let mut i = 1
+    while i < n {
+        if logits[i] > mx { mx = logits[i] }
+        i = i + 1
+    }
+    let mut exps = odpo_zeros(n)
+    let mut s = 0.0
+    let mut j = 0
+    while j < n {
+        let e = odpo_exp(logits[j] - mx)
+        exps[j] = e
+        s = s + e
+        j = j + 1
+    }
+    if s <= 0.0 { s = 1.0e-10 }
+    let mut k = 0
+    while k < n {
+        exps[k] = exps[k] / s
+        k = k + 1
+    }
+    return exps
+}
+
+fn odpo_log_prob(policy, action) {
+    let n = len(policy)
+    if action < 0 { return -30.0 }
+    if action >= n { return -30.0 }
+    let mut mx = policy[0]
+    let mut i = 1
+    while i < n {
+        if policy[i] > mx { mx = policy[i] }
+        i = i + 1
+    }
+    let mut sum_exp = 0.0
+    let mut j = 0
+    while j < n {
+        sum_exp = sum_exp + odpo_exp(policy[j] - mx)
+        j = j + 1
+    }
+    let lse = mx + odpo_log(sum_exp)
+    return policy[action] - lse
+}
+
+fn odpo_sample(policy, k, seed) {
+    let probs = odpo_softmax(policy)
+    let n = len(probs)
+    let mut out = []
+    let mut i = 0
+    while i < k {
+        let u = odpo_hash(seed + i * 97, i * 131 + 7)
+        let mut acc = 0.0
+        let mut chosen = n - 1
+        let mut j = 0
+        let mut done = false
+        while j < n {
+            if done == false {
+                acc = acc + probs[j]
+                if u <= acc {
+                    chosen = j
+                    done = true
+                }
+            }
+            j = j + 1
+        }
+        let lp = odpo_log_prob(policy, chosen)
+        out = out + [[chosen, lp]]
+        i = i + 1
+    }
+    return out
+}
+
+fn odpo_judge_linear(reward_vec, action) {
+    let n = len(reward_vec)
+    if action < 0 { return 0.0 }
+    if action >= n { return 0.0 }
+    return reward_vec[action]
+}
+
+fn odpo_build_pair(policy, k, seed, reward_vec) {
+    let samples = odpo_sample(policy, k, seed)
+    let ns = len(samples)
+    if ns < 2 {
+        let a = samples[0][0]
+        return [a, a, 0.0]
+    }
+    let mut best_a = samples[0][0]
+    let mut worst_a = samples[0][0]
+    let mut best_r = odpo_judge_linear(reward_vec, best_a)
+    let mut worst_r = best_r
+    let mut i = 1
+    while i < ns {
+        let a = samples[i][0]
+        let r = odpo_judge_linear(reward_vec, a)
+        if r > best_r {
+            best_r = r
+            best_a = a
+        }
+        if r < worst_r {
+            worst_r = r
+            worst_a = a
+        }
+        i = i + 1
+    }
+    return [best_a, worst_a, best_r - worst_r]
+}
+
+fn odpo_loss(policy, ref, chosen, rejected, beta) {
+    let lpi_w = odpo_log_prob(policy, chosen)
+    let lpi_l = odpo_log_prob(policy, rejected)
+    let lref_w = odpo_log_prob(ref, chosen)
+    let lref_l = odpo_log_prob(ref, rejected)
+    let margin = beta * ((lpi_w - lref_w) - (lpi_l - lref_l))
+    let loss = 0.0 - odpo_log_sigmoid(margin)
+    return [loss, margin]
+}
+
+// Returns [updated_policy, loss] — callers must rebind the policy.
+fn odpo_grad_step(policy, ref, chosen, rejected, beta, lr) {
+    let n = len(policy)
+    let res = odpo_loss(policy, ref, chosen, rejected, beta)
+    let margin = res[1]
+    let neg_sigmoid = 0.0 - odpo_sigmoid(0.0 - margin)
+    let mut out = policy
+    let mut j = 0
+    while j < n {
+        let mut ind = 0.0
+        if j == chosen { ind = ind + 1.0 }
+        if j == rejected { ind = ind - 1.0 }
+        let grad = neg_sigmoid * beta * ind
+        out[j] = out[j] - lr * grad
+        j = j + 1
+    }
+    return [out, res[0]]
+}
+
+fn odpo_step(policy, ref, pair, beta, lr) {
+    let chosen = pair[0]
+    let rejected = pair[1]
+    if chosen == rejected { return [policy, 0.0] }
+    return odpo_grad_step(policy, ref, chosen, rejected, beta, lr)
+}
+
+fn odpo_replay_push(buf, cap, pair) {
+    let mut out = buf
+    out = out + [pair]
+    while len(out) > cap {
+        let mut trimmed = []
+        let mut i = 1
+        while i < len(out) {
+            trimmed = trimmed + [out[i]]
+            i = i + 1
+        }
+        out = trimmed
+    }
+    return out
+}
+
+fn odpo_replay_sample(buf, seed) {
+    let n = len(buf)
+    if n <= 0 { return [0, 0, 0.0] }
+    let u = odpo_hash(seed, 17)
+    let mut idx = to_int(u * to_float(n))
+    if idx < 0 { idx = 0 }
+    if idx >= n { idx = n - 1 }
+    return buf[idx]
+}
+
+fn odpo_policy_drift(policy, ref) {
+    let n = len(policy)
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        let d = policy[i] - ref[i]
+        s = s + d * d
+        i = i + 1
+    }
+    return sqrt(s)
+}
+
+fn odpo_kl_drift(policy, ref) {
+    let p = odpo_softmax(policy)
+    let q = odpo_softmax(ref)
+    let n = len(p)
+    let mut kl = 0.0
+    let mut i = 0
+    while i < n {
+        let pi = p[i]
+        if pi > 1.0e-12 {
+            let qi = q[i]
+            let mut qsafe = 1.0e-12
+            if qi > 1.0e-12 { qsafe = qi }
+            kl = kl + pi * (odpo_log(pi) - odpo_log(qsafe))
+        }
+        i = i + 1
+    }
+    return kl
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Tests
+// ═══════════════════════════════════════════════════════════════════
+
+println("=== Online DPO Tests ===")
+
+// Shared fixtures
+let D = 8
+let seed0 = 12345
+let policy0 = odpo_new_policy(D, seed0)
+let ref_pol = odpo_copy_policy(policy0)
+
+// rewards: action 3 best, action 1 worst
+let mut reward_vec = []
+reward_vec = reward_vec + [0.1]
+reward_vec = reward_vec + [-1.0]
+reward_vec = reward_vec + [0.0]
+reward_vec = reward_vec + [1.0]
+reward_vec = reward_vec + [0.2]
+reward_vec = reward_vec + [0.3]
+reward_vec = reward_vec + [-0.5]
+reward_vec = reward_vec + [0.0]
+
+// 1. new_policy shape
+check("new_policy_shape", len(policy0) == D)
+
+// 2. copy_policy equal contents + independent reference
+let indep = odpo_copy_policy(policy0)
+let mut all_eq = true
+let mut i_eq = 0
+while i_eq < D {
+    if indep[i_eq] != policy0[i_eq] { all_eq = false }
+    i_eq = i_eq + 1
+}
+check("copy_policy_equal", all_eq)
+indep[0] = indep[0] + 99.0
+check("copy_policy_independent", indep[0] != policy0[0])
+
+// 3. softmax sums to 1 (via exp(log_prob))
+let mut prob_sum = 0.0
+let mut ip = 0
+while ip < D {
+    prob_sum = prob_sum + odpo_exp(odpo_log_prob(policy0, ip))
+    ip = ip + 1
+}
+check("softmax_normalised", approx(prob_sum, 1.0, 0.01))
+
+// 4. log_prob out-of-range guard
+check("log_prob_oob_low", odpo_log_prob(policy0, -1) < -20.0)
+check("log_prob_oob_high", odpo_log_prob(policy0, D + 5) < -20.0)
+
+// 5. sample returns k items
+let samples_k = odpo_sample(policy0, 6, 777)
+check("sample_len", len(samples_k) == 6)
+
+// 6. sample actions in [0, D)
+let mut valid = true
+let mut is_i = 0
+while is_i < len(samples_k) {
+    let a = samples_k[is_i][0]
+    if a < 0 { valid = false }
+    if a >= D { valid = false }
+    is_i = is_i + 1
+}
+check("sample_valid_actions", valid)
+
+// 7. judge_linear passthrough
+check("judge_linear", approx(odpo_judge_linear(reward_vec, 3), 1.0, 0.001))
+check("judge_linear_oob", approx(odpo_judge_linear(reward_vec, -1), 0.0, 0.001))
+
+// 8. build_pair — chosen reward >= rejected reward
+//    We use a skewed policy (boost action 3) so the sampler can actually
+//    hit both high and low actions deterministically.
+let mut skewed = odpo_copy_policy(policy0)
+skewed[3] = skewed[3] + 0.3
+skewed[1] = skewed[1] + 0.3
+let pair = odpo_build_pair(skewed, 16, 4242, reward_vec)
+let pair_chosen = pair[0]
+let pair_rejected = pair[1]
+let pair_gap = pair[2]
+let r_w = odpo_judge_linear(reward_vec, pair_chosen)
+let r_l = odpo_judge_linear(reward_vec, pair_rejected)
+check("pair_chosen_ge_rejected", r_w >= r_l)
+check("pair_gap_nonneg", pair_gap >= 0.0)
+
+// 9. loss > 0 always (softplus)
+let loss_info = odpo_loss(policy0, ref_pol, 3, 1, 0.1)
+check("loss_positive", loss_info[0] > 0.0)
+
+// At the initial point policy==ref so the margin must be exactly 0.
+check("loss_initial_margin_zero", approx(loss_info[1], 0.0, 0.001))
+// And therefore loss == -log(0.5) = log(2)
+check("loss_initial_value", approx(loss_info[0], odpo_log(2.0), 0.01))
+
+// 10. loss decreases after odpo_step (with synthetic fixed pair)
+let mut pol_a = odpo_copy_policy(policy0)
+let ref_a = odpo_copy_policy(policy0)
+let pre_loss_res = odpo_loss(pol_a, ref_a, 3, 1, 0.5)
+let pre_loss = pre_loss_res[0]
+let step_a = odpo_step(pol_a, ref_a, [3, 1, 1.0], 0.5, 0.5)
+pol_a = step_a[0]
+let post_loss_res = odpo_loss(pol_a, ref_a, 3, 1, 0.5)
+let post_loss = post_loss_res[0]
+check("loss_decreases", post_loss < pre_loss)
+
+// 11. margin increases after step
+check("margin_increases", post_loss_res[1] > pre_loss_res[1])
+
+// 12. replay_push respects capacity
+let mut buf = []
+let cap = 4
+buf = odpo_replay_push(buf, cap, [3, 1, 1.0])
+buf = odpo_replay_push(buf, cap, [3, 2, 0.8])
+buf = odpo_replay_push(buf, cap, [5, 1, 1.2])
+buf = odpo_replay_push(buf, cap, [4, 0, 0.4])
+buf = odpo_replay_push(buf, cap, [3, 6, 0.9])  // should evict first
+check("replay_cap", len(buf) == cap)
+check("replay_fifo", buf[0][1] == 2)  // second pair (3,2) is now at index 0
+
+// 13. replay_sample returns one of stored pairs
+let sampled = odpo_replay_sample(buf, 999)
+let mut found = false
+let mut bi = 0
+while bi < len(buf) {
+    if buf[bi][0] == sampled[0] {
+        if buf[bi][1] == sampled[1] { found = true }
+    }
+    bi = bi + 1
+}
+check("replay_sample_in_buf", found)
+
+// 14. drift == 0 for equal policies
+check("drift_zero_equal", approx(odpo_policy_drift(policy0, policy0), 0.0, 1.0e-6))
+
+// 15. drift > 0 after training several steps
+let mut pol_b = odpo_copy_policy(policy0)
+let ref_b = odpo_copy_policy(policy0)
+let mut t = 0
+while t < 10 {
+    let p = odpo_build_pair(pol_b, 16, 7000 + t * 31, reward_vec)
+    let step_b = odpo_step(pol_b, ref_b, p, 0.5, 0.3)
+    pol_b = step_b[0]
+    t = t + 1
+}
+let drift_after = odpo_policy_drift(pol_b, ref_b)
+check("drift_grows", drift_after > 1.0e-4)
+
+// 16. KL >= 0
+check("kl_nonneg_equal", odpo_kl_drift(policy0, policy0) >= -1.0e-6)
+check("kl_nonneg_train", odpo_kl_drift(pol_b, ref_b) >= -1.0e-6)
+
+// 17. loss-per-step drops over an online training run
+//     Compare avg loss in first 4 steps vs last 4 steps.
+let mut pol_c = odpo_copy_policy(policy0)
+let ref_c = odpo_copy_policy(policy0)
+let mut early_loss = 0.0
+let mut late_loss = 0.0
+let mut s = 0
+let total_steps = 20
+while s < total_steps {
+    let pc = odpo_build_pair(pol_c, 16, 9000 + s * 29, reward_vec)
+    let step_c = odpo_step(pol_c, ref_c, pc, 0.5, 0.25)
+    pol_c = step_c[0]
+    let l = step_c[1]
+    if s < 4 { early_loss = early_loss + l }
+    if s >= total_steps - 4 { late_loss = late_loss + l }
+    s = s + 1
+}
+check("online_loss_decreases", late_loss < early_loss)
+
+// 18. Cumulative drift monotone over training (policy moved away from ref)
+check("cumulative_drift_positive", odpo_policy_drift(pol_c, ref_c) > 0.0)
+
+// 19. replay-only path does not mutate buffer composition
+//     (replay_ratio=1 means no new pushes; we emulate by running
+//     odpo_step on replay-sampled pairs and checking buf length).
+let mut buf2 = []
+buf2 = odpo_replay_push(buf2, 4, [3, 1, 1.0])
+buf2 = odpo_replay_push(buf2, 4, [3, 6, 0.9])
+let pre_buf_len = len(buf2)
+let mut pol_d = odpo_copy_policy(policy0)
+let ref_d = odpo_copy_policy(policy0)
+let mut rr = 0
+while rr < 5 {
+    let rp = odpo_replay_sample(buf2, 1000 + rr * 51)
+    let step_d = odpo_step(pol_d, ref_d, rp, 0.5, 0.2)
+    pol_d = step_d[0]
+    rr = rr + 1
+}
+check("replay_only_no_push", len(buf2) == pre_buf_len)
+check("replay_only_policy_moved", odpo_policy_drift(pol_d, ref_d) > 0.0)
+
+// ── summary ──────────────────────────────────────────────────────
+println("")
+println("Online DPO: " + str(pass_count) + " passed, " + str(fail_count) + " failed")

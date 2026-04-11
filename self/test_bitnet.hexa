@@ -1,0 +1,399 @@
+// ===================================================================
+//  test_bitnet.hexa — BitNet 1.58-bit ternary quantization tests
+//
+//  Covers:
+//    1.  absmean computation
+//    2.  ternary quantization values ⊂ {-1, 0, 1}
+//    3.  absmean thresholding rule
+//    4.  dequantize = gamma * q
+//    5.  round-trip MSE bound
+//    6.  zero-vector edge case
+//    7.  constant-vector edge case
+//    8.  STE backward identity region
+//    9.  STE backward clip region
+//   10.  train-step descent direction
+//   11.  matmul ternary vs dense equivalence
+//   12.  matmul shape correctness
+//   13.  memory ratio ~= 10x (FP16 baseline)
+//   14.  packed vs unpacked storage
+//   15.  nonzero ratio sanity
+//   16.  quantization-error SNR positive on random data
+// ===================================================================
+
+use "ml/bitnet"
+
+let mut PASS = 0
+let mut FAIL = 0
+
+fn check(label, cond) {
+    if cond {
+        PASS = PASS + 1
+    } else {
+        FAIL = FAIL + 1
+        println("  FAIL: " + label)
+    }
+}
+
+fn t_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn t_max_err(a, b) {
+    let n = len(a)
+    let mut m = 0.0
+    let mut i = 0
+    while i < n {
+        let e = t_abs(a[i] - b[i])
+        if e > m { m = e }
+        i = i + 1
+    }
+    return m
+}
+
+// -- Deterministic PRNG (LCG) ---------------------------------------
+let mut _BR = 424242
+
+fn t_rand() {
+    _BR = (_BR * 1664525 + 1013904223) % 2147483648
+    return _BR
+}
+
+fn t_rand_float() {
+    let r = t_rand()
+    return (to_float(r) / 1073741824.0) - 1.0
+}
+
+fn t_rand_vec(n) {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [t_rand_float()]
+        i = i + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  Test 1: absmean
+// ===================================================================
+println("--- Test 1: absmean ---")
+
+let w1 = [0.2, -0.4, 0.6, -0.8]
+let am1 = bitnet_absmean(w1)
+// (0.2+0.4+0.6+0.8)/4 = 0.5
+check("absmean basic", t_abs(am1 - 0.5) < 0.0001)
+
+let w1b = [0.0, 0.0, 0.0]
+check("absmean zero", bitnet_absmean(w1b) == 0.0)
+
+let w1c = []
+check("absmean empty", bitnet_absmean(w1c) == 0.0)
+
+// ===================================================================
+//  Test 2: quantized values are ternary
+// ===================================================================
+println("--- Test 2: ternary output set ---")
+
+let w2 = [0.1, 0.9, -0.3, -0.7, 0.5, 0.0]
+let bt2 = bitnet_quantize(w2)
+check("numel preserved", bt2.numel == 6)
+check("data length", len(bt2.data) == 6)
+
+let mut in_set = true
+let mut i = 0
+while i < bt2.numel {
+    let q = bt2.data[i]
+    if q != 0 {
+        if q != 1 {
+            if q != 0 - 1 {
+                in_set = false
+            }
+        }
+    }
+    i = i + 1
+}
+check("all q in {-1,0,1}", in_set)
+
+// ===================================================================
+//  Test 3: absmean threshold rule
+//
+//  For w = [0.1, 0.9, -0.3, -0.7, 0.5, 0.0]
+//    gamma = (0.1+0.9+0.3+0.7+0.5+0.0)/6 = 2.5/6 ≈ 0.4167
+//  Expected:
+//    0.1 -> 0   (0.1 <= gamma)
+//    0.9 -> +1  (0.9 > gamma)
+//   -0.3 -> 0   (|-0.3| <= gamma)
+//   -0.7 -> -1  (-0.7 < -gamma)
+//    0.5 -> +1  (0.5 > gamma)
+//    0.0 -> 0
+// ===================================================================
+println("--- Test 3: threshold rule ---")
+
+check("q[0]=0",    bt2.data[0] == 0)
+check("q[1]=+1",   bt2.data[1] == 1)
+check("q[2]=0",    bt2.data[2] == 0)
+check("q[3]=-1",   bt2.data[3] == 0 - 1)
+check("q[4]=+1",   bt2.data[4] == 1)
+check("q[5]=0",    bt2.data[5] == 0)
+
+// ===================================================================
+//  Test 4: dequantize = gamma * q
+// ===================================================================
+println("--- Test 4: dequantize ---")
+
+let deq2 = bitnet_dequantize(bt2)
+check("deq length", len(deq2) == 6)
+check("deq[0] zero",  deq2[0] == 0.0)
+check("deq[1] +gamma", t_abs(deq2[1] - bt2.gamma) < 0.0001)
+check("deq[3] -gamma", t_abs(deq2[3] + bt2.gamma) < 0.0001)
+
+// ===================================================================
+//  Test 5: round-trip MSE bound
+// ===================================================================
+println("--- Test 5: round-trip MSE ---")
+
+_BR = 1337
+let w5 = t_rand_vec(128)
+let bt5 = bitnet_quantize(w5)
+let err5 = bitnet_quantization_error(w5, bt5)
+
+// For random data in [-1,1] with ternary {-gamma, 0, +gamma},
+// worst-case |w - q*gamma| < 1.0, MSE should be bounded ~< 1.0.
+check("mse bounded", err5.mse < 1.0)
+check("max_err bounded", err5.max_err < 2.0)
+check("numel 128", bt5.numel == 128)
+
+// ===================================================================
+//  Test 6: zero-vector edge case
+// ===================================================================
+println("--- Test 6: zero vector ---")
+
+let w6 = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+let bt6 = bitnet_quantize(w6)
+check("gamma=0", bt6.gamma == 0.0)
+
+let mut all_zero = true
+let mut j = 0
+while j < 8 {
+    if bt6.data[j] != 0 { all_zero = false }
+    j = j + 1
+}
+check("all q=0", all_zero)
+
+let deq6 = bitnet_dequantize(bt6)
+let mut all_zero_out = true
+j = 0
+while j < 8 {
+    if deq6[j] != 0.0 { all_zero_out = false }
+    j = j + 1
+}
+check("deq all zero", all_zero_out)
+
+// ===================================================================
+//  Test 7: constant-vector edge case
+//
+//  For w = [c,c,c,c], gamma = |c| and every entry is exactly on the
+//  threshold (|w_i| == gamma), so quantizer maps them all to 0.
+//  This is expected behaviour; gamma is preserved as scale.
+// ===================================================================
+println("--- Test 7: constant vector ---")
+
+let w7 = [0.5, 0.5, 0.5, 0.5]
+let bt7 = bitnet_quantize(w7)
+check("const gamma=0.5", t_abs(bt7.gamma - 0.5) < 0.0001)
+check("const all on threshold -> 0",
+    bt7.data[0] == 0 && bt7.data[1] == 0 && bt7.data[2] == 0 && bt7.data[3] == 0)
+
+// ===================================================================
+//  Test 8: STE backward identity region
+//
+//  For |w_i| <= 1, grad should pass through unchanged.
+// ===================================================================
+println("--- Test 8: STE backward identity ---")
+
+let w8 = [0.3, -0.5, 0.0, 0.9]
+let g8 = [1.0, 2.0, 3.0, 4.0]
+let bt8 = bitnet_quantize(w8)
+let dw8 = bitnet_ste_backward(g8, w8, bt8)
+check("ste identity len", len(dw8) == 4)
+check("ste passthrough [0]", dw8[0] == 1.0)
+check("ste passthrough [1]", dw8[1] == 2.0)
+check("ste passthrough [2]", dw8[2] == 3.0)
+check("ste passthrough [3]", dw8[3] == 4.0)
+
+// ===================================================================
+//  Test 9: STE backward clip region
+//
+//  For |w_i| > 1, grad is zeroed.
+// ===================================================================
+println("--- Test 9: STE backward clip ---")
+
+let w9 = [1.5, -2.0, 0.5]
+let g9 = [10.0, 20.0, 30.0]
+let bt9 = bitnet_quantize(w9)
+let dw9 = bitnet_ste_backward(g9, w9, bt9)
+check("ste clip pos", dw9[0] == 0.0)
+check("ste clip neg", dw9[1] == 0.0)
+check("ste clip keep", dw9[2] == 30.0)
+
+// ===================================================================
+//  Test 10: train-step descent
+// ===================================================================
+println("--- Test 10: train-step ---")
+
+let w10 = [1.0, 2.0, 3.0, 4.0]
+let grad10 = [0.5, 1.0, 1.5, 2.0]
+let w10_next = bitnet_train_step(w10, grad10, 0.1)
+// w_new[i] = w[i] - 0.1 * grad[i]
+check("train step [0]", t_abs(w10_next[0] - 0.95) < 0.0001)
+check("train step [1]", t_abs(w10_next[1] - 1.9) < 0.0001)
+check("train step [2]", t_abs(w10_next[2] - 2.85) < 0.0001)
+check("train step [3]", t_abs(w10_next[3] - 3.8) < 0.0001)
+
+// ===================================================================
+//  Test 11: matmul ternary vs dense equivalence
+//
+//  Verify bitnet_matmul matches a dense reconstruction matmul.
+//  Shapes: x=(2,3), W=(3,4), y=(2,4).
+// ===================================================================
+println("--- Test 11: matmul equivalence ---")
+
+// Start from weights that will produce a mix of -1/0/+1 after quantization.
+// gamma of w11 = mean(|w|) — pick values spanning +/- region.
+let w11 = [
+    0.9, 0.1, -0.8,  0.2,
+   -0.7, 0.6,  0.05, -0.9,
+    0.4, -0.3, 0.85, 0.05
+]
+let rows11 = 3
+let cols11 = 4
+let bt11 = bitnet_quantize_2d(w11, rows11, cols11)
+let deq11 = bitnet_dequantize(bt11)
+
+let x11 = [
+    0.5, -0.25, 0.1,
+    0.3, 0.7, -0.4
+]
+let m11 = 2
+let k11 = 3
+let n11 = 4
+
+let y_bitnet = bitnet_matmul(x11, bt11, m11, k11, n11)
+
+// Dense reference using the dequantized weights
+fn dense_matmul(x, w, m, k, n) {
+    let mut out = []
+    let mut i = 0
+    while i < m {
+        let mut j = 0
+        while j < n {
+            let mut acc = 0.0
+            let mut p = 0
+            while p < k {
+                acc = acc + x[i * k + p] * w[p * n + j]
+                p = p + 1
+            }
+            out = out + [acc]
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+let y_dense = dense_matmul(x11, deq11, m11, k11, n11)
+check("matmul shape", len(y_bitnet) == m11 * n11)
+let err11 = t_max_err(y_bitnet, y_dense)
+check("matmul equals dense(dequant)", err11 < 0.0001)
+
+// ===================================================================
+//  Test 12: matmul shape correctness (larger)
+// ===================================================================
+println("--- Test 12: matmul larger shape ---")
+
+_BR = 77
+let w12 = t_rand_vec(4 * 8)
+let bt12 = bitnet_quantize_2d(w12, 4, 8)
+let x12 = t_rand_vec(3 * 4)
+let y12 = bitnet_matmul(x12, bt12, 3, 4, 8)
+check("y12 shape", len(y12) == 3 * 8)
+
+// ===================================================================
+//  Test 13: memory ratio ~10x vs FP16
+// ===================================================================
+println("--- Test 13: memory ratio ---")
+
+let ratio = bitnet_memory_ratio(1000)
+// 16 / 1.58 ≈ 10.12
+check("fp16 ratio ~10x", ratio > 9.5 && ratio < 11.0)
+
+let ratio_fp32 = bitnet_memory_ratio_fp32(1000)
+// 32 / 1.58 ≈ 20.25
+check("fp32 ratio ~20x", ratio_fp32 > 19.0 && ratio_fp32 < 21.0)
+
+// ===================================================================
+//  Test 14: packed vs unpacked storage
+//
+//  For n=1000, packed = ceil(1000/5) + 8 = 200 + 8 = 208 bytes,
+//                unpacked = 1000 * 8 + 8 = 8008 bytes.
+// ===================================================================
+println("--- Test 14: packed/unpacked bytes ---")
+
+_BR = 2026
+let w14 = t_rand_vec(1000)
+let bt14 = bitnet_quantize(w14)
+let packed = bitnet_memory_bytes(bt14, true)
+let unpacked = bitnet_memory_bytes(bt14, false)
+check("packed bytes", packed == 208)
+check("unpacked bytes", unpacked == 8008)
+check("packed < unpacked", packed < unpacked)
+
+// Ratio vs FP16 baseline (2 bytes/weight = 2000B)
+let fp16_bytes = 1000 * 2
+let actual_ratio = to_float(fp16_bytes) / to_float(packed)
+// 2000 / 208 ≈ 9.6x — close to theoretical 10x
+check("fp16 vs packed ~10x", actual_ratio > 8.0 && actual_ratio < 11.0)
+
+// ===================================================================
+//  Test 15: nonzero ratio sanity
+//
+//  On random data, the absmean threshold splits weights roughly
+//  half-above / half-below, so the nonzero fraction should be
+//  non-trivial (roughly 40-60%).
+// ===================================================================
+println("--- Test 15: nonzero ratio ---")
+
+_BR = 9090
+let w15 = t_rand_vec(256)
+let bt15 = bitnet_quantize(w15)
+let err15 = bitnet_quantization_error(w15, bt15)
+check("nonzero > 0.2", err15.nonzero_ratio > 0.2)
+check("nonzero < 0.8", err15.nonzero_ratio < 0.8)
+
+// ===================================================================
+//  Test 16: SNR positive on random data
+// ===================================================================
+println("--- Test 16: SNR positive ---")
+
+_BR = 4040
+let w16 = t_rand_vec(512)
+let bt16 = bitnet_quantize(w16)
+let err16 = bitnet_quantization_error(w16, bt16)
+// Ternary is lossy but should still carry some signal above zero dB.
+check("snr > 0 dB", err16.snr > 0.0)
+check("mse finite", err16.mse > 0.0 && err16.mse < 10.0)
+
+// ===================================================================
+//  Summary
+// ===================================================================
+println("")
+println("=== bitnet tests ===")
+println("PASS: " + str(PASS))
+println("FAIL: " + str(FAIL))
+println("TOTAL: " + str(PASS + FAIL))
+if FAIL == 0 {
+    println("ALL TESTS PASSED")
+} else {
+    println("SOME TESTS FAILED")
+}

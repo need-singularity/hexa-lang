@@ -1,0 +1,833 @@
+// ═══════════════════════════════════════════════════════════════
+//  test_expert_parallel.hexa — Expert Parallelism (MoE) verification
+//
+//  ML roadmap #98
+//
+//  Verifies:
+//    T1  ep_ceil_div edge cases
+//    T2  ep_expert_owner: contiguous block sharding
+//    T3  ep_expert_local_index: owner + local id reconstruction
+//    T4  ep_experts_on_rank: non-divisible sharding counts
+//    T5  shard_experts round-trip: every global expert reachable once
+//    T6  pack + all-to-all-dispatch: token count conservation
+//    T7  dispatch ↔ combine invariant (inverse permutation)
+//    T8  local expert calls limited to its own shard
+//    T9  single-token sanity: output matches ep_expert_forward * 1.0
+//    T10 multi-rank forward ≡ single-rank reference (|diff| < 1e-9)
+//    T11 load-balance loss minimum: uniform gate + uniform counts
+//    T12 load-balance loss detects extreme imbalance (skewed > uniform)
+//    T13 expert_calls = total_tokens * k (conservation)
+//    T14 asymmetric rank sizes (rank batches 3 + 1) still equivalent
+//
+//  Pure hexa, pure CPU — no CUDA/NCCL. The same routing layout maps
+//  directly onto ncclAllToAll when running on H100.
+//
+//  Run: ./hexa self/test_expert_parallel.hexa
+// ═══════════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ═══════════════════════════════════════════════════════════════
+//  Inlined copy of self/ml/expert_parallel.hexa (test_moe.hexa style)
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn ep_ceil_div(a, b) {
+    if b <= 0 { return 0 }
+    let q = a / b
+    if q * b < a { return q + 1 }
+    return q
+}
+
+@pure
+fn ep_expert_owner(expert_id, nrank, n_experts) {
+    let epr = ep_ceil_div(n_experts, nrank)
+    let r = expert_id / epr
+    if r >= nrank { return nrank - 1 }
+    return r
+}
+
+@pure
+fn ep_expert_local_index(expert_id, nrank, n_experts) {
+    let epr = ep_ceil_div(n_experts, nrank)
+    let owner = ep_expert_owner(expert_id, nrank, n_experts)
+    return expert_id - owner * epr
+}
+
+@pure
+fn ep_experts_on_rank(r, nrank, n_experts) {
+    let epr = ep_ceil_div(n_experts, nrank)
+    let start = r * epr
+    let mut end = start + epr
+    if end > n_experts { end = n_experts }
+    if end < start { return 0 }
+    return end - start
+}
+
+@pure
+fn ep_gate_scores(gate_w, x, n_experts, d_in) {
+    let mut s = []
+    for e in 0..n_experts {
+        let mut acc = 0.0
+        for j in 0..d_in {
+            acc = acc + gate_w[e][j] * x[j]
+        }
+        s = s + [acc]
+    }
+    return s
+}
+
+fn ep_topk_indices(scores, n_experts, k) {
+    let mut used = []
+    for i in 0..n_experts { used = used + [false] }
+    let mut picks = []
+    for r in 0..k {
+        let mut best = 0
+        let mut best_v = -1.0e30
+        let mut found = false
+        for e in 0..n_experts {
+            if !used[e] {
+                if !found {
+                    best = e
+                    best_v = scores[e]
+                    found = true
+                } else {
+                    if scores[e] > best_v {
+                        best_v = scores[e]
+                        best = e
+                    }
+                }
+            }
+        }
+        let mut used2 = []
+        for i in 0..n_experts {
+            if i == best { used2 = used2 + [true] } else { used2 = used2 + [used[i]] }
+        }
+        used = used2
+        picks = picks + [best]
+    }
+    return picks
+}
+
+@pure
+fn ep_softmax_subset(scores, picks, k) {
+    let mut m = scores[picks[0]]
+    for r in 1..k {
+        if scores[picks[r]] > m { m = scores[picks[r]] }
+    }
+    let mut exps = []
+    let mut z = 0.0
+    for r in 0..k {
+        let v = exp(scores[picks[r]] - m)
+        exps = exps + [v]
+        z = z + v
+    }
+    let mut out = []
+    for r in 0..k {
+        out = out + [exps[r] / z]
+    }
+    return out
+}
+
+@pure
+fn ep_softmax_all(scores, n) {
+    let mut m = scores[0]
+    for i in 1..n { if scores[i] > m { m = scores[i] } }
+    let mut exps = []
+    let mut z = 0.0
+    for i in 0..n {
+        let v = exp(scores[i] - m)
+        exps = exps + [v]
+        z = z + v
+    }
+    let mut out = []
+    for i in 0..n { out = out + [exps[i] / z] }
+    return out
+}
+
+@pure
+fn ep_expert_forward(w, b, x, d_out, d_in) {
+    let mut y = []
+    for i in 0..d_out {
+        let mut s = b[i]
+        for j in 0..d_in {
+            s = s + w[i][j] * x[j]
+        }
+        y = y + [s]
+    }
+    return y
+}
+
+fn ep_shard_experts(experts_w_all, experts_b_all, n_experts, nrank) {
+    let epr = ep_ceil_div(n_experts, nrank)
+    let mut shards_w = []
+    let mut shards_b = []
+    for r in 0..nrank {
+        let start = r * epr
+        let mut end = start + epr
+        if end > n_experts { end = n_experts }
+        let mut rw = []
+        let mut rb = []
+        for e in start..end {
+            rw = rw + [experts_w_all[e]]
+            rb = rb + [experts_b_all[e]]
+        }
+        shards_w = shards_w + [rw]
+        shards_b = shards_b + [rb]
+    }
+    return [shards_w, shards_b]
+}
+
+fn ep_gate_tokens(gate_w, X_local, n_experts, d_in, k) {
+    let n_tok = len(X_local)
+    let mut picks_all = []
+    let mut probs_all = []
+    let mut full_all  = []
+    for t in 0..n_tok {
+        let x = X_local[t]
+        let scores = ep_gate_scores(gate_w, x, n_experts, d_in)
+        let picks  = ep_topk_indices(scores, n_experts, k)
+        let probs  = ep_softmax_subset(scores, picks, k)
+        let full   = ep_softmax_all(scores, n_experts)
+        picks_all = picks_all + [picks]
+        probs_all = probs_all + [probs]
+        full_all  = full_all  + [full]
+    }
+    return [picks_all, probs_all, full_all]
+}
+
+fn ep_pack_sends(X_ranks, picks_ranks, probs_ranks, nrank, n_experts, k) {
+    let mut grid = []
+    for r in 0..nrank {
+        let mut row = []
+        for s in 0..nrank { row = row + [[]] }
+        grid = grid + [row]
+    }
+    for src in 0..nrank {
+        let X = X_ranks[src]
+        let picks_r = picks_ranks[src]
+        let probs_r = probs_ranks[src]
+        let n_tok = len(X)
+        for t in 0..n_tok {
+            for slot in 0..k {
+                let e = picks_r[t][slot]
+                let p = probs_r[t][slot]
+                let dst = ep_expert_owner(e, nrank, n_experts)
+                let msg = [t, slot, e, p, X[t]]
+                let mut new_row = []
+                for s in 0..nrank {
+                    if s == dst {
+                        new_row = new_row + [grid[src][s] + [msg]]
+                    } else {
+                        new_row = new_row + [grid[src][s]]
+                    }
+                }
+                let mut new_grid = []
+                for r in 0..nrank {
+                    if r == src { new_grid = new_grid + [new_row] }
+                    else        { new_grid = new_grid + [grid[r]] }
+                }
+                grid = new_grid
+            }
+        }
+    }
+    return grid
+}
+
+fn ep_all_to_all_dispatch(send_grid, nrank) {
+    let mut recv = []
+    for dst in 0..nrank {
+        let mut row = []
+        for src in 0..nrank {
+            row = row + [send_grid[src][dst]]
+        }
+        recv = recv + [row]
+    }
+    return recv
+}
+
+fn ep_rank_inbox_size(recv_row, nrank) {
+    let mut n = 0
+    for s in 0..nrank { n = n + len(recv_row[s]) }
+    return n
+}
+
+let mut EP_EXPERT_CALLS = 0
+fn ep_reset_expert_calls() { EP_EXPERT_CALLS = 0 }
+fn ep_get_expert_calls() { return EP_EXPERT_CALLS }
+
+fn ep_run_local_experts(recv_grid, shards_w, shards_b, nrank, n_experts, d_out, d_in) {
+    let mut out_grid = []
+    for dst in 0..nrank {
+        let mut row = []
+        for src in 0..nrank { row = row + [[]] }
+        out_grid = out_grid + [row]
+    }
+    for dst in 0..nrank {
+        let shard_w = shards_w[dst]
+        let shard_b = shards_b[dst]
+        let inbox = recv_grid[dst]
+        for src in 0..nrank {
+            let msgs = inbox[src]
+            let n = len(msgs)
+            let mut replies = []
+            for i in 0..n {
+                let m = msgs[i]
+                let tok_id = m[0]
+                let slot   = m[1]
+                let expert = m[2]
+                let prob   = m[3]
+                let x      = m[4]
+                let local_idx = ep_expert_local_index(expert, nrank, n_experts)
+                let w = shard_w[local_idx]
+                let b = shard_b[local_idx]
+                EP_EXPERT_CALLS = EP_EXPERT_CALLS + 1
+                let y = ep_expert_forward(w, b, x, d_out, d_in)
+                replies = replies + [[tok_id, slot, prob, y]]
+            }
+            let mut new_row = []
+            for s in 0..nrank {
+                if s == src { new_row = new_row + [replies] }
+                else        { new_row = new_row + [out_grid[dst][s]] }
+            }
+            let mut new_grid = []
+            for d in 0..nrank {
+                if d == dst { new_grid = new_grid + [new_row] }
+                else        { new_grid = new_grid + [out_grid[d]] }
+            }
+            out_grid = new_grid
+        }
+    }
+    return out_grid
+}
+
+fn ep_all_to_all_combine(out_grid, nrank) {
+    let mut back = []
+    for src in 0..nrank {
+        let mut row = []
+        for dst in 0..nrank {
+            row = row + [out_grid[dst][src]]
+        }
+        back = back + [row]
+    }
+    return back
+}
+
+fn ep_reduce_replies(back_row, n_local_tokens, nrank, d_out) {
+    let mut Y = []
+    for t in 0..n_local_tokens {
+        let mut yi = []
+        for i in 0..d_out { yi = yi + [0.0] }
+        Y = Y + [yi]
+    }
+    for dst in 0..nrank {
+        let msgs = back_row[dst]
+        let n = len(msgs)
+        for i in 0..n {
+            let m = msgs[i]
+            let tok_id = m[0]
+            let prob   = m[2]
+            let y      = m[3]
+            let mut new_row = []
+            for j in 0..d_out {
+                new_row = new_row + [Y[tok_id][j] + prob * y[j]]
+            }
+            let mut new_Y = []
+            for tt in 0..n_local_tokens {
+                if tt == tok_id { new_Y = new_Y + [new_row] }
+                else            { new_Y = new_Y + [Y[tt]] }
+            }
+            Y = new_Y
+        }
+    }
+    return Y
+}
+
+fn ep_load_balance_loss(picks_ranks, full_ranks, nrank, n_experts, k, alpha) {
+    let mut counts = []
+    let mut p_mean = []
+    for e in 0..n_experts { counts = counts + [0] }
+    for e in 0..n_experts { p_mean = p_mean + [0.0] }
+    let mut total_tok = 0
+    for r in 0..nrank {
+        let picks_r = picks_ranks[r]
+        let full_r  = full_ranks[r]
+        let n_tok = len(picks_r)
+        for t in 0..n_tok {
+            total_tok = total_tok + 1
+            for e in 0..n_experts {
+                p_mean[e] = p_mean[e] + full_r[t][e]
+            }
+            for slot in 0..k {
+                let ee = picks_r[t][slot]
+                counts[ee] = counts[ee] + 1
+            }
+        }
+    }
+    if total_tok == 0 { return 0.0 }
+    let nt = to_float(total_tok)
+    let ntk = to_float(total_tok * k)
+    let mut f = []
+    let mut P = []
+    for e in 0..n_experts {
+        f = f + [to_float(counts[e]) / ntk]
+        P = P + [p_mean[e] / nt]
+    }
+    let mut s = 0.0
+    for e in 0..n_experts {
+        s = s + f[e] * P[e]
+    }
+    return alpha * to_float(n_experts) * s
+}
+
+fn ep_moe_forward(X_ranks, gate_w, experts_w_all, experts_b_all,
+                  n_experts, nrank, d_in, d_out, k, alpha) {
+    let shards = ep_shard_experts(experts_w_all, experts_b_all, n_experts, nrank)
+    let shards_w = shards[0]
+    let shards_b = shards[1]
+
+    let mut picks_ranks = []
+    let mut probs_ranks = []
+    let mut full_ranks  = []
+    for r in 0..nrank {
+        let g = ep_gate_tokens(gate_w, X_ranks[r], n_experts, d_in, k)
+        picks_ranks = picks_ranks + [g[0]]
+        probs_ranks = probs_ranks + [g[1]]
+        full_ranks  = full_ranks  + [g[2]]
+    }
+
+    let send_grid = ep_pack_sends(X_ranks, picks_ranks, probs_ranks, nrank, n_experts, k)
+    let recv_grid = ep_all_to_all_dispatch(send_grid, nrank)
+    let out_grid  = ep_run_local_experts(recv_grid, shards_w, shards_b,
+                                         nrank, n_experts, d_out, d_in)
+    let back_grid = ep_all_to_all_combine(out_grid, nrank)
+
+    let mut Y_ranks = []
+    for r in 0..nrank {
+        let n_local = len(X_ranks[r])
+        let Yr = ep_reduce_replies(back_grid[r], n_local, nrank, d_out)
+        Y_ranks = Y_ranks + [Yr]
+    }
+    let L_aux = ep_load_balance_loss(picks_ranks, full_ranks, nrank, n_experts, k, alpha)
+    return [Y_ranks, L_aux]
+}
+
+fn ep_moe_forward_single(X, gate_w, experts_w_all, experts_b_all,
+                         n_experts, d_in, d_out, k) {
+    let n_tok = len(X)
+    let mut Y = []
+    for t in 0..n_tok {
+        let x = X[t]
+        let scores = ep_gate_scores(gate_w, x, n_experts, d_in)
+        let picks  = ep_topk_indices(scores, n_experts, k)
+        let probs  = ep_softmax_subset(scores, picks, k)
+        let mut y = []
+        for i in 0..d_out { y = y + [0.0] }
+        for slot in 0..k {
+            let e = picks[slot]
+            let p = probs[slot]
+            let ye = ep_expert_forward(experts_w_all[e], experts_b_all[e], x, d_out, d_in)
+            let mut y2 = []
+            for i in 0..d_out { y2 = y2 + [y[i] + p * ye[i]] }
+            y = y2
+        }
+        Y = Y + [y]
+    }
+    return Y
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Test data builders
+// ═══════════════════════════════════════════════════════════════
+let d_in   = 3
+let d_out  = 2
+let n_experts_base = 4
+let nrank_base     = 2
+let k_base         = 2
+
+fn mk_expert_w(seed, d_out2, d_in2) {
+    let mut w = []
+    for i in 0..d_out2 {
+        let mut row = []
+        for j in 0..d_in2 {
+            let v = (to_float((seed * 7 + i * 3 + j + 1) % 11) - 5.0) / 10.0
+            row = row + [v]
+        }
+        w = w + [row]
+    }
+    return w
+}
+fn mk_expert_b(seed, d_out2) {
+    let mut b = []
+    for i in 0..d_out2 { b = b + [to_float((seed + i) % 3) / 10.0] }
+    return b
+}
+
+fn build_experts(n_experts2, d_out2, d_in2) {
+    let mut ew = []
+    let mut eb = []
+    for e in 0..n_experts2 {
+        ew = ew + [mk_expert_w(e + 1, d_out2, d_in2)]
+        eb = eb + [mk_expert_b(e + 1, d_out2)]
+    }
+    return [ew, eb]
+}
+
+// gate_w: [n_experts][d_in], a deterministic pattern so different
+// tokens activate different experts (spreads load).
+fn build_gate(n_experts2, d_in2) {
+    let mut gw = []
+    for e in 0..n_experts2 {
+        let mut row = []
+        for j in 0..d_in2 {
+            let v = (to_float((e * 13 + j * 5 + 2) % 17) - 8.0) / 10.0
+            row = row + [v]
+        }
+        gw = gw + [row]
+    }
+    return gw
+}
+
+// A flat token set then split into per-rank mini-batches.
+fn build_tokens_flat(n_tok, d_in2) {
+    let mut X = []
+    for t in 0..n_tok {
+        let mut x = []
+        for j in 0..d_in2 {
+            let v = (to_float((t * 11 + j * 3 + 4) % 19) - 9.0) / 10.0
+            x = x + [v]
+        }
+        X = X + [x]
+    }
+    return X
+}
+fn split_ranks(X, nrank) {
+    let n = len(X)
+    let per = n / nrank
+    let mut X_ranks = []
+    for r in 0..nrank {
+        let start = r * per
+        let mut end = start + per
+        if r == nrank - 1 { end = n }
+        let mut sub = []
+        for t in start..end { sub = sub + [X[t]] }
+        X_ranks = X_ranks + [sub]
+    }
+    return X_ranks
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  T1 — ep_ceil_div edge cases
+// ═══════════════════════════════════════════════════════════════
+check("T1 ceil_div 4/2 = 2",  ep_ceil_div(4, 2) == 2)
+check("T1 ceil_div 5/2 = 3",  ep_ceil_div(5, 2) == 3)
+check("T1 ceil_div 7/3 = 3",  ep_ceil_div(7, 3) == 3)
+check("T1 ceil_div 0/4 = 0",  ep_ceil_div(0, 4) == 0)
+
+// ═══════════════════════════════════════════════════════════════
+//  T2 — expert_owner contiguous block sharding
+// ═══════════════════════════════════════════════════════════════
+// 4 experts / 2 ranks → rank 0 owns {0,1}, rank 1 owns {2,3}
+check("T2 owner(0,2,4)=0", ep_expert_owner(0, 2, 4) == 0)
+check("T2 owner(1,2,4)=0", ep_expert_owner(1, 2, 4) == 0)
+check("T2 owner(2,2,4)=1", ep_expert_owner(2, 2, 4) == 1)
+check("T2 owner(3,2,4)=1", ep_expert_owner(3, 2, 4) == 1)
+// 1 expert per rank (canonical MoE EP case): 4 experts / 4 ranks
+check("T2 owner(3,4,4)=3", ep_expert_owner(3, 4, 4) == 3)
+check("T2 owner(0,4,4)=0", ep_expert_owner(0, 4, 4) == 0)
+
+// ═══════════════════════════════════════════════════════════════
+//  T3 — local index reconstruction
+// ═══════════════════════════════════════════════════════════════
+check("T3 local(0,2,4)=0", ep_expert_local_index(0, 2, 4) == 0)
+check("T3 local(1,2,4)=1", ep_expert_local_index(1, 2, 4) == 1)
+check("T3 local(2,2,4)=0", ep_expert_local_index(2, 2, 4) == 0)
+check("T3 local(3,2,4)=1", ep_expert_local_index(3, 2, 4) == 1)
+
+// ═══════════════════════════════════════════════════════════════
+//  T4 — non-divisible sharding (5 experts over 2 ranks)
+//        epr = ceil(5/2) = 3, so rank 0 owns 3 experts, rank 1 owns 2
+// ═══════════════════════════════════════════════════════════════
+check("T4 experts_on_rank(0,2,5)=3", ep_experts_on_rank(0, 2, 5) == 3)
+check("T4 experts_on_rank(1,2,5)=2", ep_experts_on_rank(1, 2, 5) == 2)
+
+// ═══════════════════════════════════════════════════════════════
+//  T5 — shard_experts round-trip: reconstructing gives back all experts
+// ═══════════════════════════════════════════════════════════════
+let test5 = build_experts(n_experts_base, d_out, d_in)
+let ew5 = test5[0]
+let eb5 = test5[1]
+let shards5 = ep_shard_experts(ew5, eb5, n_experts_base, nrank_base)
+let sw5 = shards5[0]
+let sb5 = shards5[1]
+// reconstruct
+let mut rebuilt_w = []
+let mut rebuilt_b = []
+for r in 0..nrank_base {
+    let rw = sw5[r]
+    let rb = sb5[r]
+    for e in 0..len(rw) {
+        rebuilt_w = rebuilt_w + [rw[e]]
+        rebuilt_b = rebuilt_b + [rb[e]]
+    }
+}
+let mut t5_ok = true
+for e in 0..n_experts_base {
+    for i in 0..d_out {
+        for j in 0..d_in {
+            if !approx(rebuilt_w[e][i][j], ew5[e][i][j], 1.0e-12) { t5_ok = false }
+        }
+    }
+}
+check("T5 shard_experts round-trip weights", t5_ok)
+check("T5 shard count", len(sw5) == nrank_base)
+
+// ═══════════════════════════════════════════════════════════════
+//  T6 — pack + dispatch: token-slot count is conserved
+//        (every token emits exactly k messages, total = sum_tok * k)
+// ═══════════════════════════════════════════════════════════════
+let gw = build_gate(n_experts_base, d_in)
+let exp_pack = build_experts(n_experts_base, d_out, d_in)
+let ew_pack = exp_pack[0]
+let eb_pack = exp_pack[1]
+let X_flat = build_tokens_flat(4, d_in)
+let X_ranks = split_ranks(X_flat, nrank_base)
+
+let mut picks_ranks_t6 = []
+let mut probs_ranks_t6 = []
+for r in 0..nrank_base {
+    let g = ep_gate_tokens(gw, X_ranks[r], n_experts_base, d_in, k_base)
+    picks_ranks_t6 = picks_ranks_t6 + [g[0]]
+    probs_ranks_t6 = probs_ranks_t6 + [g[1]]
+}
+let sg = ep_pack_sends(X_ranks, picks_ranks_t6, probs_ranks_t6,
+                       nrank_base, n_experts_base, k_base)
+let mut send_total = 0
+for src in 0..nrank_base {
+    for dst in 0..nrank_base {
+        send_total = send_total + len(sg[src][dst])
+    }
+}
+let expected_msgs = len(X_flat) * k_base
+check("T6 dispatch conserves token*k messages", send_total == expected_msgs)
+
+// ═══════════════════════════════════════════════════════════════
+//  T7 — dispatch/combine invariant
+//        recv = transpose(send); back = transpose(out);
+//        For any x, transpose(transpose(x)) == x (shape-wise)
+// ═══════════════════════════════════════════════════════════════
+let rg = ep_all_to_all_dispatch(sg, nrank_base)
+// recv_total should equal send_total
+let mut recv_total = 0
+for dst in 0..nrank_base {
+    for src in 0..nrank_base {
+        recv_total = recv_total + len(rg[dst][src])
+    }
+}
+check("T7 all_to_all conserves total", recv_total == send_total)
+// double-transpose identity
+let rg2 = ep_all_to_all_dispatch(rg, nrank_base)
+let mut t7_ok = true
+for src in 0..nrank_base {
+    for dst in 0..nrank_base {
+        if len(rg2[src][dst]) != len(sg[src][dst]) { t7_ok = false }
+    }
+}
+check("T7 transpose involution", t7_ok)
+
+// ═══════════════════════════════════════════════════════════════
+//  T8 — local expert calls only use shard experts
+//        total expert_calls on a rank == number of messages it received
+// ═══════════════════════════════════════════════════════════════
+let sh8 = ep_shard_experts(ew_pack, eb_pack, n_experts_base, nrank_base)
+ep_reset_expert_calls()
+let og8 = ep_run_local_experts(rg, sh8[0], sh8[1], nrank_base, n_experts_base, d_out, d_in)
+let calls8 = ep_get_expert_calls()
+check("T8 expert_calls = recv_total", calls8 == recv_total)
+
+// ═══════════════════════════════════════════════════════════════
+//  T9 — single-token sanity
+//        With k=1, a 1-token/rank forward must equal
+//        probs[0]==1 * expert_forward(chosen) directly.
+// ═══════════════════════════════════════════════════════════════
+let X1 = [X_flat[0]]
+let Xr1 = [X1, []]  // rank 0 has 1 token, rank 1 empty
+let res9 = ep_moe_forward(Xr1, gw, ew_pack, eb_pack,
+                          n_experts_base, nrank_base, d_in, d_out, 1, 0.01)
+let Y9 = res9[0]
+// ground truth
+let sc9 = ep_gate_scores(gw, X_flat[0], n_experts_base, d_in)
+let picks9 = ep_topk_indices(sc9, n_experts_base, 1)
+let chosen = picks9[0]
+let y9ref = ep_expert_forward(ew_pack[chosen], eb_pack[chosen], X_flat[0], d_out, d_in)
+check("T9 single-token y[0] matches", approx(Y9[0][0][0], y9ref[0], 1.0e-9))
+check("T9 single-token y[1] matches", approx(Y9[0][0][1], y9ref[1], 1.0e-9))
+
+// ═══════════════════════════════════════════════════════════════
+//  T10 — multi-rank forward ≡ single-rank reference
+//        This is the core correctness invariant of expert parallelism:
+//        sharding experts across ranks must not change the math.
+// ═══════════════════════════════════════════════════════════════
+let res10 = ep_moe_forward(X_ranks, gw, ew_pack, eb_pack,
+                           n_experts_base, nrank_base, d_in, d_out, k_base, 0.01)
+let Y10 = res10[0]
+let Y_ref = ep_moe_forward_single(X_flat, gw, ew_pack, eb_pack,
+                                  n_experts_base, d_in, d_out, k_base)
+// Flatten Y10 back to global token order (rank-major)
+let mut Y_flat = []
+for r in 0..nrank_base {
+    let Yr = Y10[r]
+    for t in 0..len(Yr) { Y_flat = Y_flat + [Yr[t]] }
+}
+let mut t10_max_diff = 0.0
+for t in 0..len(Y_ref) {
+    for i in 0..d_out {
+        let d = fabs(Y_flat[t][i] - Y_ref[t][i])
+        if d > t10_max_diff { t10_max_diff = d }
+    }
+}
+check("T10 ep == single-rank (max |diff| < 1e-9)", t10_max_diff < 1.0e-9)
+
+// ═══════════════════════════════════════════════════════════════
+//  T11 — load-balance loss: uniform counts + uniform gate → alpha
+//        (for uniform f and P, sum_e f*P = 1/n_experts, so
+//         L_aux = alpha * n_experts * (1/n_experts) = alpha)
+// ═══════════════════════════════════════════════════════════════
+// Construct synthetic uniform picks_ranks / full_ranks.
+fn mk_uniform_picks(n_tok, n_experts2, k2) {
+    // each slot picks a different expert, round-robin
+    let mut all = []
+    for t in 0..n_tok {
+        let mut row = []
+        for s in 0..k2 { row = row + [(t * k2 + s) % n_experts2] }
+        all = all + [row]
+    }
+    return all
+}
+fn mk_uniform_full(n_tok, n_experts2) {
+    let p = 1.0 / to_float(n_experts2)
+    let mut all = []
+    for t in 0..n_tok {
+        let mut row = []
+        for e in 0..n_experts2 { row = row + [p] }
+        all = all + [row]
+    }
+    return all
+}
+let ne11 = 4
+let k11  = 2
+// Give 4 tokens on 1 rank, so each expert receives exactly 2 picks
+// (uniform). Gate is full uniform. Expected L_aux = alpha.
+let picks11 = [mk_uniform_picks(4, ne11, k11)]
+let full11  = [mk_uniform_full(4, ne11)]
+let alpha11 = 0.01
+let L11 = ep_load_balance_loss(picks11, full11, 1, ne11, k11, alpha11)
+check("T11 uniform load-balance loss ~ alpha",
+      approx(L11, alpha11, 1.0e-9))
+
+// ═══════════════════════════════════════════════════════════════
+//  T12 — skewed load-balance loss > uniform
+//        All 4 tokens route every slot to expert 0 → f_0 = 1,
+//        others zero. Gate still uniform → P uniform. L_aux > alpha.
+// ═══════════════════════════════════════════════════════════════
+fn mk_skewed_picks(n_tok, k2) {
+    let mut all = []
+    for t in 0..n_tok {
+        let mut row = []
+        for s in 0..k2 { row = row + [0] }
+        all = all + [row]
+    }
+    return all
+}
+let picks12 = [mk_skewed_picks(4, k11)]
+let full12  = [mk_uniform_full(4, ne11)]
+let L12 = ep_load_balance_loss(picks12, full12, 1, ne11, k11, alpha11)
+// For this case: f_0 = 1, others 0; P_e = 1/4 for all e.
+// L_aux = alpha * n_experts * (1 * 1/4) = alpha * 4 * 0.25 = alpha.
+// But compared to L11 where L_aux ≈ alpha the numerical values are
+// equal (uniform minimum across *both* axes). We need non-uniform P
+// to see strict inequality; use full12_skewed below.
+fn mk_skewed_full(n_tok, n_experts2) {
+    let mut all = []
+    for t in 0..n_tok {
+        let mut row = []
+        // give expert 0 the full mass
+        for e in 0..n_experts2 {
+            if e == 0 { row = row + [1.0] }
+            else      { row = row + [0.0] }
+        }
+        all = all + [row]
+    }
+    return all
+}
+let full12b = [mk_skewed_full(4, ne11)]
+let L12b = ep_load_balance_loss(picks12, full12b, 1, ne11, k11, alpha11)
+// Here f_0 = 1, P_0 = 1 → L_aux = alpha * n_experts * 1 = alpha * 4
+check("T12 skewed loss ~ alpha*n_experts",
+      approx(L12b, alpha11 * to_float(ne11), 1.0e-9))
+check("T12 skewed > uniform", L12b > L11 + 1.0e-9)
+
+// ═══════════════════════════════════════════════════════════════
+//  T13 — expert call conservation:
+//        in a full forward, total expert_calls == total_tokens * k
+// ═══════════════════════════════════════════════════════════════
+ep_reset_expert_calls()
+let _res13 = ep_moe_forward(X_ranks, gw, ew_pack, eb_pack,
+                            n_experts_base, nrank_base, d_in, d_out, k_base, 0.01)
+let calls13 = ep_get_expert_calls()
+check("T13 calls == total_tokens * k",
+      calls13 == len(X_flat) * k_base)
+
+// ═══════════════════════════════════════════════════════════════
+//  T14 — asymmetric rank sizes
+//        4 tokens split as [3, 1] across 2 ranks must still match
+//        the single-rank reference over the same 4 tokens.
+// ═══════════════════════════════════════════════════════════════
+let X14_r0 = [X_flat[0], X_flat[1], X_flat[2]]
+let X14_r1 = [X_flat[3]]
+let X14_ranks = [X14_r0, X14_r1]
+let res14 = ep_moe_forward(X14_ranks, gw, ew_pack, eb_pack,
+                           n_experts_base, nrank_base, d_in, d_out, k_base, 0.01)
+let Y14 = res14[0]
+let mut Y14_flat = []
+for r in 0..nrank_base {
+    let Yr = Y14[r]
+    for t in 0..len(Yr) { Y14_flat = Y14_flat + [Yr[t]] }
+}
+let Y14_ref = ep_moe_forward_single(X_flat, gw, ew_pack, eb_pack,
+                                    n_experts_base, d_in, d_out, k_base)
+let mut t14_max_diff = 0.0
+for t in 0..len(Y14_ref) {
+    for i in 0..d_out {
+        let d = fabs(Y14_flat[t][i] - Y14_ref[t][i])
+        if d > t14_max_diff { t14_max_diff = d }
+    }
+}
+check("T14 asymmetric ranks ≡ single-rank (|diff| < 1e-9)",
+      t14_max_diff < 1.0e-9)
+
+// ═══════════════════════════════════════════════════════════════
+//  Summary
+// ═══════════════════════════════════════════════════════════════
+println("")
+println("=== Expert Parallelism test summary ===")
+println("PASS: " + to_string(pass_count))
+println("FAIL: " + to_string(fail_count))
+if fail_count == 0 {
+    println("ALL GREEN — MoE all-to-all dispatch/combine + load balance OK")
+}
+println(to_string(pass_count) + " passed")

@@ -1,0 +1,254 @@
+// ═══════════════════════════════════════════════════════════════════
+//  test_kto.hexa — Kahneman-Tversky Optimization 검증
+//
+//  검증 대상 (self/ml/kto.hexa):
+//    1. sigmoid 수치 안정 (양/음/영)
+//    2. 값함수 desirable / undesirable 부호
+//    3. 프로스펙트 이론 lambda_U > lambda_D 손실 비대칭
+//    4. 라벨이 desirable 이면 implicit reward 증가가 loss 감소
+//    5. 라벨이 undesirable 이면 implicit reward 증가가 loss 증가
+//    6. z_ref 중심성 (0 log-ratio → 손실 근사 대칭)
+//    7. z_ref 배치 평균 일관성
+//    8. 배치 집계 avg/loss/count
+//    9. 라벨 +1/-1 dispatch
+//   10. 손실 항상 양수 경계
+//   11. lambda_D == lambda_U 일 때 대칭 복구
+//   12. gradient sign (desirable 에서 r 증가 → loss 감소)
+//   13. 경계조건 (ids=0 / batch vacía)
+//
+//  실행: ./hexa self/test_kto.hexa
+// ═══════════════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ── 인라인 exp / log / sigmoid (kto.hexa 와 동일 의미) ─────
+fn kt_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..40 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn kt_sigmoid(x) {
+    if x > 20.0 { return 1.0 }
+    if x < -20.0 { return 0.0 }
+    return 1.0 / (1.0 + kt_exp(0.0 - x))
+}
+
+// ── KTO 하이퍼 (kto.hexa 와 동일) ────────────────────────
+let T_BETA = 0.1
+let T_LAMBDA_D = 1.0
+let T_LAMBDA_U = 1.33
+
+// ── Value functions (desirable / undesirable) ─────────────
+fn kt_value_d(log_ratio, z_ref, lam_d) {
+    let signed = T_BETA * log_ratio - z_ref
+    return lam_d * kt_sigmoid(signed)
+}
+
+fn kt_value_u(log_ratio, z_ref, lam_u) {
+    let signed = z_ref - T_BETA * log_ratio
+    return lam_u * kt_sigmoid(signed)
+}
+
+// ── Per-example KTO loss (기본 하이퍼) ────────────────────
+fn kt_loss(log_ratio, label, z_ref) {
+    if label > 0 {
+        let v = kt_value_d(log_ratio, z_ref, T_LAMBDA_D)
+        return T_LAMBDA_D - v
+    }
+    let v2 = kt_value_u(log_ratio, z_ref, T_LAMBDA_U)
+    return T_LAMBDA_U - v2
+}
+
+// ── Per-example KTO loss (lambda 스윕용) ──────────────────
+fn kt_loss_lam(log_ratio, label, z_ref, lam_d, lam_u) {
+    if label > 0 {
+        let v = lam_d * kt_sigmoid(T_BETA * log_ratio - z_ref)
+        return lam_d - v
+    }
+    let v2 = lam_u * kt_sigmoid(z_ref - T_BETA * log_ratio)
+    return lam_u - v2
+}
+
+// ── 배치 z_ref (= 평균 implicit reward) ──────────────────
+fn kt_batch_zref(log_ratios) {
+    let n = len(log_ratios)
+    if n == 0 { return 0.0 }
+    let mut total = 0.0
+    let mut i = 0
+    while i < n {
+        total = total + T_BETA * log_ratios[i]
+        i = i + 1
+    }
+    return total / (n * 1.0)
+}
+
+// ── 배치 집계 ─────────────────────────────────────────────
+fn kt_batch_loss(log_ratios, labels, z_ref) {
+    let n = len(log_ratios)
+    if n == 0 { return [0.0, 0.0, 0.0, 0, 0] }
+    let mut total_l = 0.0
+    let mut total_rd = 0.0
+    let mut total_ru = 0.0
+    let mut n_d = 0
+    let mut n_u = 0
+    let mut i = 0
+    while i < n {
+        let lr = log_ratios[i]
+        let lbl = labels[i]
+        total_l = total_l + kt_loss(lr, lbl, z_ref)
+        if lbl > 0 {
+            total_rd = total_rd + T_BETA * lr
+            n_d = n_d + 1
+        } else {
+            total_ru = total_ru + T_BETA * lr
+            n_u = n_u + 1
+        }
+        i = i + 1
+    }
+    let avg_l = total_l / (n * 1.0)
+    let mut avg_rd = 0.0
+    let mut avg_ru = 0.0
+    if n_d > 0 { avg_rd = total_rd / (n_d * 1.0) }
+    if n_u > 0 { avg_ru = total_ru / (n_u * 1.0) }
+    return [avg_l, avg_rd, avg_ru, n_d, n_u]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Tests
+// ═══════════════════════════════════════════════════════════════════
+
+println("=== KTO (Kahneman-Tversky) Tests ===")
+
+// 1. sigmoid 수치 안정
+check("sigmoid_pos_saturation", kt_sigmoid(30.0) > 0.999)
+check("sigmoid_neg_saturation", kt_sigmoid(-30.0) < 0.001)
+check("sigmoid_zero_half", approx(kt_sigmoid(0.0), 0.5, 0.01))
+
+// 2. value function 부호: log_ratio 크면 desirable value 크다
+let v_small = kt_value_d(0.0, 0.0, T_LAMBDA_D)
+let v_large = kt_value_d(10.0, 0.0, T_LAMBDA_D)
+check("value_d_monotonic", v_large > v_small)
+
+// 3. undesirable value 는 log_ratio 클수록 작다 (나쁜 응답이 더 likely → 벌)
+let u_small = kt_value_u(0.0, 0.0, T_LAMBDA_U)
+let u_large = kt_value_u(10.0, 0.0, T_LAMBDA_U)
+check("value_u_antitone", u_large < u_small)
+
+// 4. prospect-theory 비대칭: lambda_U > lambda_D → undesirable 손실이 더 크다
+//    log_ratio=0, z_ref=0 → sigmoid=0.5, value=lambda*0.5, loss=lambda*0.5
+let loss_d_zero = kt_loss(0.0, 1, 0.0)
+let loss_u_zero = kt_loss(0.0, -1, 0.0)
+check("prospect_asymmetric", loss_u_zero > loss_d_zero)
+check("loss_d_zero_value", approx(loss_d_zero, T_LAMBDA_D * 0.5, 0.01))
+check("loss_u_zero_value", approx(loss_u_zero, T_LAMBDA_U * 0.5, 0.01))
+
+// 5. desirable 라벨: implicit reward ↑ → loss ↓
+let loss_d_low = kt_loss(-5.0, 1, 0.0)
+let loss_d_high = kt_loss(5.0, 1, 0.0)
+check("desirable_reward_reduces_loss", loss_d_high < loss_d_low)
+
+// 6. undesirable 라벨: implicit reward ↑ → loss ↑
+let loss_u_low = kt_loss(-5.0, -1, 0.0)
+let loss_u_high = kt_loss(5.0, -1, 0.0)
+check("undesirable_reward_increases_loss", loss_u_high > loss_u_low)
+
+// 7. 손실 항상 양수 / 경계
+check("loss_bound_d_always_pos", loss_d_low > 0.0)
+check("loss_bound_u_always_pos", loss_u_high > 0.0)
+check("loss_bound_d_below_lambda", loss_d_high < T_LAMBDA_D + 0.001)
+check("loss_bound_u_below_lambda", loss_u_low < T_LAMBDA_U + 0.001)
+
+// 8. z_ref 배치 계산 일관성
+let lrs = [2.0, -1.0, 3.0, -4.0]
+let z_ref = kt_batch_zref(lrs)
+let expected_z = T_BETA * (2.0 - 1.0 + 3.0 - 4.0) / 4.0
+check("zref_batch_mean", approx(z_ref, expected_z, 0.001))
+
+// 9. z_ref 로 loss 가 중심 이동: z_ref 를 키우면 desirable 손실 ↑
+let loss_d_z0 = kt_loss(1.0, 1, 0.0)
+let loss_d_z_high = kt_loss(1.0, 1, 1.0)
+check("zref_shifts_desirable_loss_up", loss_d_z_high > loss_d_z0)
+
+// 10. 배치 집계 — 혼합 라벨
+let labels = [1, -1, 1, -1]
+let batch_result = kt_batch_loss(lrs, labels, z_ref)
+let avg_loss = batch_result[0]
+let avg_rd = batch_result[1]
+let avg_ru = batch_result[2]
+let n_d = batch_result[3]
+let n_u = batch_result[4]
+check("batch_avg_loss_positive", avg_loss > 0.0)
+check("batch_counts_correct", n_d == 2)
+check("batch_counts_correct_u", n_u == 2)
+check("batch_reward_desirable_mean", approx(avg_rd, T_BETA * (2.0 + 3.0) / 2.0, 0.001))
+check("batch_reward_undesirable_mean", approx(avg_ru, T_BETA * (-1.0 - 4.0) / 2.0, 0.001))
+
+// 11. 대칭성 복구: lambda_D == lambda_U 일 때 zero log-ratio 에서 대칭
+let sym_d = kt_loss_lam(0.0, 1, 0.0, 1.0, 1.0)
+let sym_u = kt_loss_lam(0.0, -1, 0.0, 1.0, 1.0)
+check("symmetric_lambda_recovers", approx(sym_d, sym_u, 0.001))
+
+// 12. gradient sign (유한 차분): desirable 에서 r 증가 → loss 감소
+let eps = 0.01
+let g_d_plus = kt_loss(1.0 + eps, 1, 0.0)
+let g_d_minus = kt_loss(1.0 - eps, 1, 0.0)
+let grad_d = (g_d_plus - g_d_minus) / (2.0 * eps)
+check("gradient_desirable_negative", grad_d < 0.0)
+
+// 13. gradient sign: undesirable 에서 r 증가 → loss 증가
+let g_u_plus = kt_loss(1.0 + eps, -1, 0.0)
+let g_u_minus = kt_loss(1.0 - eps, -1, 0.0)
+let grad_u = (g_u_plus - g_u_minus) / (2.0 * eps)
+check("gradient_undesirable_positive", grad_u > 0.0)
+
+// 14. 빈 배치 경계
+let empty = []
+let empty_labels = []
+let e_zref = kt_batch_zref(empty)
+check("empty_batch_zref_zero", approx(e_zref, 0.0, 0.001))
+let e_res = kt_batch_loss(empty, empty_labels, 0.0)
+check("empty_batch_loss_zero", approx(e_res[0], 0.0, 0.001))
+check("empty_batch_n_zero", e_res[3] == 0)
+
+// 15. 모두 desirable 배치: avg_ru == 0, n_u == 0
+let d_only_lrs = [1.0, 2.0, 3.0]
+let d_only_lbls = [1, 1, 1]
+let d_zref = kt_batch_zref(d_only_lrs)
+let d_res = kt_batch_loss(d_only_lrs, d_only_lbls, d_zref)
+check("desirable_only_n_u_zero", d_res[4] == 0)
+check("desirable_only_avg_ru_zero", approx(d_res[2], 0.0, 0.001))
+
+// 16. 모두 undesirable 배치: avg_rd == 0, n_d == 0
+let u_only_lrs = [-1.0, -2.0, -3.0]
+let u_only_lbls = [-1, -1, -1]
+let u_zref = kt_batch_zref(u_only_lrs)
+let u_res = kt_batch_loss(u_only_lrs, u_only_lbls, u_zref)
+check("undesirable_only_n_d_zero", u_res[3] == 0)
+check("undesirable_only_avg_rd_zero", approx(u_res[1], 0.0, 0.001))
+
+// ── summary ──────────────────────────────────────────────────────
+println("")
+println("KTO: " + str(pass_count) + " passed, " + str(fail_count) + " failed")

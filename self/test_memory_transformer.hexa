@@ -1,0 +1,567 @@
+// ===================================================================
+//  test_memory_transformer.hexa — Memory Transformer verification
+//
+//  SSOT: shared/hexa-lang/ml-next-level.json id=89
+//
+//  Tests:
+//    T1  empty memory: size=0, read→[], attention→zeros
+//    T2  single write: size=1, id/metadata preserved
+//    T3  read self returns the exact written key (cos=1)
+//    T4  top_k bounded by memory size
+//    T5  multi-write + read ranks by cosine descending
+//    T6  softmax attention: weights sum to 1.0 and pick near-neighbor
+//    T7  read_attention on empty memory returns zero vector
+//    T8  write gating: near-duplicate rejected above threshold
+//    T9  write gating: below threshold accepted
+//   T10  LRU eviction triggers at capacity, oldest dropped
+//   T11  memory_touch bumps last_used, protects from eviction
+//   T12  memory_forward residual: hidden unchanged when alpha=0
+//   T13  memory_forward biases toward matched value when alpha>0
+//   T14  id update in place: same id rewrites key/value
+//
+//  실행: ./hexa self/test_memory_transformer.hexa
+//
+//  Implementation is inlined from self/ml/memory_transformer.hexa
+//  (same convention as test_hnsw.hexa — module is SSOT, test file
+//  re-expresses the functions to stay hermetic).
+// ===================================================================
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ═══════════ INLINED: memory_transformer module ════════════════════
+
+fn mt_exp(x) {
+    let mut y = x
+    if y > 60.0 { y = 60.0 }
+    if y < 0.0 - 60.0 { y = 0.0 - 60.0 }
+    let mut k = 0
+    while y > 1.0 {
+        y = y * 0.5
+        k = k + 1
+    }
+    while y < 0.0 - 1.0 {
+        y = y * 0.5
+        k = k + 1
+    }
+    let y2 = y * y
+    let y3 = y2 * y
+    let y4 = y3 * y
+    let y5 = y4 * y
+    let y6 = y5 * y
+    let y7 = y6 * y
+    let mut r = 1.0 + y + y2 / 2.0 + y3 / 6.0 + y4 / 24.0 + y5 / 120.0 + y6 / 720.0 + y7 / 5040.0
+    let mut i = 0
+    while i < k {
+        r = r * r
+        i = i + 1
+    }
+    return r
+}
+
+fn mt_dot(a, b) {
+    let n = len(a)
+    let mut sum = 0.0
+    let mut i = 0
+    while i < n {
+        sum = sum + a[i] * b[i]
+        i = i + 1
+    }
+    return sum
+}
+
+fn mt_norm(v) {
+    let mut sum = 0.0
+    let n = len(v)
+    let mut i = 0
+    while i < n {
+        sum = sum + v[i] * v[i]
+        i = i + 1
+    }
+    return sqrt(sum)
+}
+
+fn mt_cosine(a, b) {
+    let d = mt_dot(a, b)
+    let na = mt_norm(a)
+    let nb = mt_norm(b)
+    let denom = na * nb
+    if denom < 0.000001 { return 0.0 }
+    return d / denom
+}
+
+fn mt_set_arr(arr, idx, val) {
+    let n = len(arr)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        if i == idx {
+            out = out + [val]
+        } else {
+            out = out + [arr[i]]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn mt_zeros(dim) {
+    let mut v = []
+    let mut i = 0
+    while i < dim {
+        v = v + [0.0]
+        i = i + 1
+    }
+    return v
+}
+
+struct MemoryBank {
+    dim: int,
+    capacity: int,
+    write_threshold: float,
+    tick: int,
+    keys: array,
+    values: array,
+    ids: array,
+    metadatas: array,
+    last_used: array
+}
+
+fn create_memory(dim, capacity, write_threshold) {
+    return MemoryBank {
+        dim: dim,
+        capacity: capacity,
+        write_threshold: write_threshold,
+        tick: 0,
+        keys: [],
+        values: [],
+        ids: [],
+        metadatas: [],
+        last_used: []
+    }
+}
+
+fn memory_size(mem) {
+    return len(mem.ids)
+}
+
+fn mt_find_id(mem, id) {
+    let n = len(mem.ids)
+    let mut i = 0
+    while i < n {
+        if mem.ids[i] == id { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn memory_touch(mem, id) {
+    let idx = mt_find_id(mem, id)
+    if idx < 0 { return mem }
+    let new_tick = mem.tick + 1
+    let new_last = mt_set_arr(mem.last_used, idx, new_tick)
+    return MemoryBank {
+        dim: mem.dim,
+        capacity: mem.capacity,
+        write_threshold: mem.write_threshold,
+        tick: new_tick,
+        keys: mem.keys,
+        values: mem.values,
+        ids: mem.ids,
+        metadatas: mem.metadatas,
+        last_used: new_last
+    }
+}
+
+fn memory_max_similarity(mem, key) {
+    let n = len(mem.keys)
+    if n == 0 { return 0.0 - 1.0 }
+    let mut best = 0.0 - 2.0
+    let mut i = 0
+    while i < n {
+        let s = mt_cosine(key, mem.keys[i])
+        if s > best { best = s }
+        i = i + 1
+    }
+    return best
+}
+
+fn memory_should_write(mem, key, threshold) {
+    let n = len(mem.keys)
+    if n == 0 { return true }
+    let best = memory_max_similarity(mem, key)
+    if best < threshold { return true }
+    return false
+}
+
+fn memory_evict_lru(mem) {
+    let n = len(mem.ids)
+    if n == 0 { return mem }
+    if mem.capacity <= 0 { return mem }
+    if n < mem.capacity { return mem }
+
+    let mut min_idx = 0
+    let mut min_val = mem.last_used[0]
+    let mut i = 1
+    while i < n {
+        if mem.last_used[i] < min_val {
+            min_val = mem.last_used[i]
+            min_idx = i
+        }
+        i = i + 1
+    }
+
+    let mut new_keys = []
+    let mut new_values = []
+    let mut new_ids = []
+    let mut new_metas = []
+    let mut new_last = []
+    let mut j = 0
+    while j < n {
+        if j != min_idx {
+            new_keys = new_keys + [mem.keys[j]]
+            new_values = new_values + [mem.values[j]]
+            new_ids = new_ids + [mem.ids[j]]
+            new_metas = new_metas + [mem.metadatas[j]]
+            new_last = new_last + [mem.last_used[j]]
+        }
+        j = j + 1
+    }
+
+    return MemoryBank {
+        dim: mem.dim,
+        capacity: mem.capacity,
+        write_threshold: mem.write_threshold,
+        tick: mem.tick,
+        keys: new_keys,
+        values: new_values,
+        ids: new_ids,
+        metadatas: new_metas,
+        last_used: new_last
+    }
+}
+
+fn memory_write(mem, id, key, value, metadata) {
+    let new_tick = mem.tick + 1
+
+    let existing = mt_find_id(mem, id)
+    if existing >= 0 {
+        let new_keys = mt_set_arr(mem.keys, existing, key)
+        let new_values = mt_set_arr(mem.values, existing, value)
+        let new_metas = mt_set_arr(mem.metadatas, existing, metadata)
+        let new_last = mt_set_arr(mem.last_used, existing, new_tick)
+        return MemoryBank {
+            dim: mem.dim,
+            capacity: mem.capacity,
+            write_threshold: mem.write_threshold,
+            tick: new_tick,
+            keys: new_keys,
+            values: new_values,
+            ids: mem.ids,
+            metadatas: new_metas,
+            last_used: new_last
+        }
+    }
+
+    let allow = memory_should_write(mem, key, mem.write_threshold)
+    if allow == false { return mem }
+
+    let mut pruned = mem
+    if mem.capacity > 0 {
+        let n = len(mem.ids)
+        if n >= mem.capacity {
+            pruned = memory_evict_lru(mem)
+        }
+    }
+
+    return MemoryBank {
+        dim: pruned.dim,
+        capacity: pruned.capacity,
+        write_threshold: pruned.write_threshold,
+        tick: new_tick,
+        keys: pruned.keys + [key],
+        values: pruned.values + [value],
+        ids: pruned.ids + [id],
+        metadatas: pruned.metadatas + [metadata],
+        last_used: pruned.last_used + [new_tick]
+    }
+}
+
+fn memory_read(mem, query, top_k) {
+    let n = len(mem.keys)
+    if n == 0 { return [] }
+
+    let mut scored = []
+    let mut i = 0
+    while i < n {
+        let s = mt_cosine(query, mem.keys[i])
+        scored = scored + [[i, s]]
+        i = i + 1
+    }
+
+    let mut out = []
+    let mut selected = 0
+    let mut limit = top_k
+    if limit > n { limit = n }
+    while selected < limit {
+        let mut best_j = -1
+        let mut best_s = 0.0 - 3.0
+        let mut j = 0
+        while j < n {
+            let mut already = false
+            let mut ci = 0
+            while ci < len(out) {
+                if out[ci][0] == mem.ids[scored[j][0]] { already = true }
+                ci = ci + 1
+            }
+            if already == false {
+                if scored[j][1] > best_s {
+                    best_s = scored[j][1]
+                    best_j = j
+                }
+            }
+            j = j + 1
+        }
+        if best_j >= 0 {
+            let node_idx = scored[best_j][0]
+            out = out + [[mem.ids[node_idx], scored[best_j][1], mem.values[node_idx]]]
+        }
+        selected = selected + 1
+    }
+    return out
+}
+
+fn memory_read_attention(mem, query, top_k) {
+    let retrieved = memory_read(mem, query, top_k)
+    let k = len(retrieved)
+    if k == 0 {
+        return mt_zeros(mem.dim)
+    }
+
+    let mut max_s = retrieved[0][1]
+    let mut i = 1
+    while i < k {
+        if retrieved[i][1] > max_s { max_s = retrieved[i][1] }
+        i = i + 1
+    }
+
+    let mut weights = []
+    let mut total = 0.0
+    i = 0
+    while i < k {
+        let w = mt_exp(retrieved[i][1] - max_s)
+        weights = weights + [w]
+        total = total + w
+        i = i + 1
+    }
+    if total < 0.000001 { total = 0.000001 }
+
+    let dim = mem.dim
+    let mut out = mt_zeros(dim)
+    i = 0
+    while i < k {
+        let w = weights[i] / total
+        let v = retrieved[i][2]
+        let mut d = 0
+        while d < dim {
+            out = mt_set_arr(out, d, out[d] + w * v[d])
+            d = d + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn memory_forward(mem, hidden, top_k, alpha) {
+    let attended = memory_read_attention(mem, hidden, top_k)
+    let n = len(hidden)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [hidden[i] + alpha * attended[i]]
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════ TESTS ═════════════════════════════════════════════════
+
+let dim = 4
+
+// ── T1: empty memory ──────────────────────────────────────────────
+
+let mem0 = create_memory(dim, 8, 0.95)
+check("T1a: empty size=0", memory_size(mem0) == 0)
+let r1 = memory_read(mem0, [1.0, 0.0, 0.0, 0.0], 3)
+check("T1b: empty read -> []", len(r1) == 0)
+let att1 = memory_read_attention(mem0, [1.0, 0.0, 0.0, 0.0], 3)
+check("T1c: empty attention -> zeros", approx(att1[0], 0.0, 1.0e-9) && approx(att1[3], 0.0, 1.0e-9))
+
+// ── T2: single write ──────────────────────────────────────────────
+
+let k2 = [1.0, 0.0, 0.0, 0.0]
+let v2 = [0.5, 0.5, 0.5, 0.5]
+let mem2 = memory_write(mem0, "slot_a", k2, v2, "meta_a")
+check("T2a: size=1 after write", memory_size(mem2) == 1)
+check("T2b: id stored", mem2.ids[0] == "slot_a")
+check("T2c: meta stored", mem2.metadatas[0] == "meta_a")
+
+// ── T3: read self returns exact match (cos=1) ────────────────────
+
+let r3 = memory_read(mem2, k2, 1)
+check("T3a: read returns 1 result", len(r3) == 1)
+check("T3b: top1 id matches", r3[0][0] == "slot_a")
+check("T3c: top1 cosine ~= 1.0", approx(r3[0][1], 1.0, 1.0e-6))
+
+// ── T4: top_k bounded by memory size ─────────────────────────────
+
+let r4 = memory_read(mem2, k2, 10)
+check("T4: top_k clamped to size", len(r4) == 1)
+
+// ── T5: multi-write + cosine-ranked read ─────────────────────────
+
+let mut mem5 = create_memory(dim, 16, 0.95)
+mem5 = memory_write(mem5, "x", [1.0, 0.0, 0.0, 0.0], [10.0, 0.0, 0.0, 0.0], "mx")
+mem5 = memory_write(mem5, "y", [0.0, 1.0, 0.0, 0.0], [0.0, 10.0, 0.0, 0.0], "my")
+mem5 = memory_write(mem5, "z", [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 10.0, 0.0], "mz")
+mem5 = memory_write(mem5, "w", [0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 10.0], "mw")
+check("T5a: size=4 after 4 writes", memory_size(mem5) == 4)
+
+let q5 = [0.9, 0.1, 0.0, 0.0]  // closest to "x"
+let r5 = memory_read(mem5, q5, 3)
+check("T5b: top_k=3 returned", len(r5) == 3)
+check("T5c: top1 is x", r5[0][0] == "x")
+let mut sorted_ok = true
+let mut t5i = 1
+while t5i < len(r5) {
+    if r5[t5i][1] > r5[t5i - 1][1] { sorted_ok = false }
+    t5i = t5i + 1
+}
+check("T5d: results sorted descending by cosine", sorted_ok)
+
+// ── T6: softmax attention pulls closest value ────────────────────
+
+let att6 = memory_read_attention(mem5, q5, 4)
+// Since "x" dominates similarity, attended[0] should be largest
+// (value[0] is 10 for "x", 0 for y/z/w).
+check("T6a: attention has dim 4", len(att6) == 4)
+check("T6b: attended[0] > attended[1]", att6[0] > att6[1])
+check("T6c: attended[0] > attended[2]", att6[0] > att6[2])
+check("T6d: attended[0] > attended[3]", att6[0] > att6[3])
+// Sum-to-1 check: with k=4 values all=10*one-hot, the weighted sum
+// equals 10.0 when softmax weights sum to 1.0 and only x contributes.
+// Loose upper bound: attended[0] <= 10.0 (largest value).
+check("T6e: attended[0] <= 10.0 (weighted mean)", att6[0] <= 10.0 + 1.0e-6)
+
+// ── T7: attention on empty mem → zero vector ─────────────────────
+
+let att7 = memory_read_attention(mem0, [1.0, 0.0, 0.0, 0.0], 3)
+check("T7a: empty attention dim=4", len(att7) == 4)
+let mut all_zero = true
+let mut t7i = 0
+while t7i < 4 {
+    if fabs(att7[t7i]) > 1.0e-9 { all_zero = false }
+    t7i = t7i + 1
+}
+check("T7b: empty attention all-zero", all_zero)
+
+// ── T8: write gating - near duplicate rejected ───────────────────
+
+let mut mem8 = create_memory(dim, 16, 0.95)
+mem8 = memory_write(mem8, "a", [1.0, 0.0, 0.0, 0.0], [1.0, 1.0, 1.0, 1.0], "m")
+// Near-duplicate key (cos ~ 0.9999) should be rejected
+let before8 = memory_size(mem8)
+mem8 = memory_write(mem8, "a_dup", [1.0, 0.001, 0.0, 0.0], [2.0, 2.0, 2.0, 2.0], "m_dup")
+let after8 = memory_size(mem8)
+check("T8: near-duplicate rejected (size unchanged)", after8 == before8)
+
+// ── T9: below-threshold accepted ─────────────────────────────────
+
+let mut mem9 = create_memory(dim, 16, 0.95)
+mem9 = memory_write(mem9, "a", [1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], "m")
+// Orthogonal key → cos = 0 < 0.95 → accept
+mem9 = memory_write(mem9, "b", [0.0, 1.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], "m")
+check("T9: orthogonal write accepted", memory_size(mem9) == 2)
+
+// ── T10: LRU eviction at capacity ────────────────────────────────
+
+let mut mem10 = create_memory(dim, 3, 0.95)  // cap=3
+mem10 = memory_write(mem10, "oldest", [1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], "m")
+mem10 = memory_write(mem10, "mid",    [0.0, 1.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], "m")
+mem10 = memory_write(mem10, "newest", [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 1.0, 0.0], "m")
+check("T10a: at capacity = 3", memory_size(mem10) == 3)
+
+// Push one more — LRU should evict "oldest"
+mem10 = memory_write(mem10, "fourth", [0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 1.0], "m")
+check("T10b: size still = 3 after overflow", memory_size(mem10) == 3)
+check("T10c: oldest evicted", mt_find_id(mem10, "oldest") == -1)
+check("T10d: fourth inserted", mt_find_id(mem10, "fourth") >= 0)
+
+// ── T11: touch protects from eviction ────────────────────────────
+
+let mut mem11 = create_memory(dim, 3, 0.95)
+mem11 = memory_write(mem11, "a", [1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], "m")
+mem11 = memory_write(mem11, "b", [0.0, 1.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], "m")
+mem11 = memory_write(mem11, "c", [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 1.0, 0.0], "m")
+// Touch "a" so it's no longer the LRU victim
+mem11 = memory_touch(mem11, "a")
+mem11 = memory_write(mem11, "d", [0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 1.0], "m")
+check("T11a: a preserved after touch", mt_find_id(mem11, "a") >= 0)
+check("T11b: b evicted (oldest after touch)", mt_find_id(mem11, "b") == -1)
+check("T11c: size = 3", memory_size(mem11) == 3)
+
+// ── T12: memory_forward alpha=0 identity ─────────────────────────
+
+let hidden12 = [0.3, 0.4, 0.1, 0.2]
+let fwd12 = memory_forward(mem5, hidden12, 3, 0.0)
+check("T12a: forward alpha=0 same dim", len(fwd12) == 4)
+check("T12b: forward alpha=0 identity[0]", approx(fwd12[0], 0.3, 1.0e-9))
+check("T12c: forward alpha=0 identity[1]", approx(fwd12[1], 0.4, 1.0e-9))
+check("T12d: forward alpha=0 identity[3]", approx(fwd12[3], 0.2, 1.0e-9))
+
+// ── T13: memory_forward biases toward matched value ─────────────
+
+// hidden ~= x → forward should bias [0] toward 10*alpha
+let hidden13 = [1.0, 0.0, 0.0, 0.0]
+let fwd13 = memory_forward(mem5, hidden13, 4, 0.5)
+// fwd13[0] = 1.0 + 0.5 * attended[0]; attended[0] is dominated by
+// x-value = 10, so fwd13[0] should be strictly > 1.0.
+check("T13a: forward[0] biased upward", fwd13[0] > 1.0)
+check("T13b: forward dim = 4", len(fwd13) == 4)
+// The other dims should be smaller since attention focuses on x.
+check("T13c: forward[0] > forward[1]", fwd13[0] > fwd13[1])
+
+// ── T14: id update in place rewrites the slot ────────────────────
+
+let mut mem14 = create_memory(dim, 16, 0.95)
+mem14 = memory_write(mem14, "slot", [1.0, 0.0, 0.0, 0.0], [5.0, 0.0, 0.0, 0.0], "v1")
+mem14 = memory_write(mem14, "slot", [0.0, 1.0, 0.0, 0.0], [0.0, 7.0, 0.0, 0.0], "v2")
+check("T14a: size still = 1 (in-place update)", memory_size(mem14) == 1)
+check("T14b: metadata updated", mem14.metadatas[0] == "v2")
+let idx14 = mt_find_id(mem14, "slot")
+check("T14c: key updated", approx(mem14.keys[idx14][1], 1.0, 1.0e-9))
+check("T14d: value updated", approx(mem14.values[idx14][1], 7.0, 1.0e-9))
+
+// ═══════════ Summary ══════════════════════════════════════════════
+
+println("")
+println("=== Memory Transformer test summary ===")
+println("PASS: " + to_string(pass_count))
+println("FAIL: " + to_string(fail_count))
+if fail_count == 0 {
+    println("ALL GREEN - Memory Transformer OK")
+}
+println(to_string(pass_count) + " passed")

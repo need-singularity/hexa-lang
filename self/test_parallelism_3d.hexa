@@ -1,0 +1,442 @@
+// ═══════════════════════════════════════════════════════════════════
+//  test_parallelism_3d.hexa — 3D Parallelism (TP × PP × ZeRO) tests
+//
+//  Verifies that the fused 3D parallel step in self/ml/parallelism_3d
+//  reproduces the single-device reference computation for every axis
+//  combination, and that the per-axis primitives (mesh, layer ranges,
+//  load balance, gradient sync, ZeRO optimizer step) are self-
+//  consistent.
+//
+//  Minimum test checklist (≥12):
+//    1.  p3d_init stores dims correctly
+//    2.  p3d_flat/of coordinate round-trip
+//    3.  p3d_build_mesh length + p3d_mesh_valid
+//    4.  p3d_layer_ranges on 4 layers / 2 stages is balanced
+//    5.  p3d_load_imbalance == 0 on 4 layers / 2 stages
+//    6.  p3d_load_imbalance > 0 on 5 layers / 2 stages
+//    7.  p3d_ffn_forward TP=1 matches single-GEMM
+//    8.  p3d_ffn_forward TP=2 matches single-GEMM
+//    9.  p3d_split_batch round-trip via concat
+//   10.  p3d_grad_allreduce averages identical grads
+//   11.  merged step (TP=1,PP=1,DP=1,ZeRO-0) == reference
+//   12.  merged step (TP=2,PP=1,DP=1,ZeRO-1) == reference  (TP-only)
+//   13.  merged step (TP=1,PP=2,DP=1,ZeRO-1) == reference  (PP-only)
+//   14.  merged step (TP=1,PP=1,DP=2,ZeRO-2) == reference  (DP-only)
+//   15.  merged step (TP=2,PP=2,DP=2,ZeRO-1) == reference  (full 3D)
+//   16.  merged step (TP=2,PP=2,DP=2,ZeRO-3) == reference  (ZeRO-3)
+//   17.  optimizer context t incremented after merged step
+//   18.  p3d_memory_per_rank(ZeRO-3) < p3d_memory_per_rank(ZeRO-0)
+//   19.  bubble_steps matches 2*(pp_size-1)
+//
+//  Run: cd /Users/ghost/Dev/hexa-lang && ./hexa self/test_parallelism_3d.hexa
+//
+//  ML roadmap #96 — 3D Parallelism (Megatron-DeepSpeed)
+// ═══════════════════════════════════════════════════════════════════
+
+import "ml/parallelism_3d.hexa"
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn fabs3d(x) { if x < 0.0 { 0.0 - x } else { x } }
+
+fn check(name, cond) {
+    if cond {
+        pass_count = pass_count + 1
+        println("[PASS] " + name)
+    } else {
+        fail_count = fail_count + 1
+        println("[FAIL] " + name)
+    }
+}
+
+fn check_near(name, got, expected, tol) {
+    let d = fabs3d(got - expected)
+    if d < tol {
+        pass_count = pass_count + 1
+        println("[PASS] " + name)
+    } else {
+        fail_count = fail_count + 1
+        println("[FAIL] " + name + " got=" + str(got) + " expected=" + str(expected) + " diff=" + str(d))
+    }
+}
+
+// Element-wise max abs diff for two flat matrices.
+fn max_abs_diff3d(A, B, n) {
+    let mut m = 0.0
+    let mut i = 0
+    while i < n {
+        let d = fabs3d(A[i] - B[i])
+        if d > m { m = d }
+        i = i + 1
+    }
+    m
+}
+
+// ── Shared fixture: FFN layer stack with deterministic weights ──
+fn make_stack(num_layers, dim, hidden) {
+    let mut W1_list = []
+    let mut W2_list = []
+    let mut l = 0
+    while l < num_layers {
+        W1_list = W1_list + [tp_mat_range(dim, hidden, -0.2 + to_float(l) * 0.01, 0.03)]
+        W2_list = W2_list + [tp_mat_range(hidden, dim, 0.15 - to_float(l) * 0.01, 0.02)]
+        l = l + 1
+    }
+    return P3DLayerStack {
+        num_layers: num_layers,
+        W1_list: W1_list,
+        W2_list: W2_list,
+        dim: dim,
+        hidden: hidden
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Test 1 — p3d_init stores dims correctly
+// ═══════════════════════════════════════════════════════════════════
+fn test_init() {
+    println("[test] 1. p3d_init dimensions")
+    let cfg = p3d_init(2, 2, 2, 4, 8, 4, 6, 1)
+    check("tp_size", cfg.tp_size == 2)
+    check("pp_size", cfg.pp_size == 2)
+    check("dp_size", cfg.dp_size == 2)
+    check("world_size", cfg.world_size == 8)
+    check("num_layers", cfg.num_layers == 4)
+    check("global_batch", cfg.global_batch == 8)
+    check("zero_stage", cfg.zero_stage == 1)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Test 2 — coordinate round-trip
+// ═══════════════════════════════════════════════════════════════════
+fn test_coord_roundtrip() {
+    println("[test] 2. p3d_flat ↔ p3d_*_of round-trip")
+    let cfg = p3d_init(2, 2, 2, 4, 4, 4, 6, 1)
+    let mut dp = 0
+    let mut all_ok = true
+    while dp < cfg.dp_size {
+        let mut pp = 0
+        while pp < cfg.pp_size {
+            let mut tp = 0
+            while tp < cfg.tp_size {
+                let f = p3d_flat(cfg, tp, pp, dp)
+                let tp2 = p3d_tp_of(cfg, f)
+                let pp2 = p3d_pp_of(cfg, f)
+                let dp2 = p3d_dp_of(cfg, f)
+                if tp != tp2 { all_ok = false }
+                if pp != pp2 { all_ok = false }
+                if dp != dp2 { all_ok = false }
+                tp = tp + 1
+            }
+            pp = pp + 1
+        }
+        dp = dp + 1
+    }
+    check("coord round-trip", all_ok)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Test 3 — mesh length + validity
+// ═══════════════════════════════════════════════════════════════════
+fn test_mesh_build() {
+    println("[test] 3. p3d_build_mesh + p3d_mesh_valid")
+    let cfg = p3d_init(2, 2, 2, 4, 4, 4, 6, 1)
+    let mesh = p3d_build_mesh(cfg)
+    check("mesh len == world", len(mesh) == cfg.world_size)
+    check("mesh valid", p3d_mesh_valid(cfg, mesh))
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Test 4 — layer ranges balanced (4 layers / 2 stages)
+// ═══════════════════════════════════════════════════════════════════
+fn test_layer_ranges_balanced() {
+    println("[test] 4. p3d_layer_ranges balanced (4/2)")
+    let cfg = p3d_init(1, 2, 1, 4, 2, 4, 6, 0)
+    let ranges = p3d_layer_ranges(cfg)
+    check("num ranges", len(ranges) == 2)
+    let r0 = ranges[0]
+    let r1 = ranges[1]
+    check("stage0 [0,2)", r0[0] == 0)
+    check("stage0 end 2",  r0[1] == 2)
+    check("stage1 [2,4)", r1[0] == 2)
+    check("stage1 end 4",  r1[1] == 4)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Test 5 — load imbalance = 0 when divisible
+// ═══════════════════════════════════════════════════════════════════
+fn test_load_imbalance_zero() {
+    println("[test] 5. p3d_load_imbalance == 0 (4/2)")
+    let cfg = p3d_init(1, 2, 1, 4, 2, 4, 6, 0)
+    check("imbalance == 0", p3d_load_imbalance(cfg) == 0)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Test 6 — load imbalance > 0 when not divisible
+// ═══════════════════════════════════════════════════════════════════
+fn test_load_imbalance_nonzero() {
+    println("[test] 6. p3d_load_imbalance > 0 (5/2)")
+    let cfg = p3d_init(1, 2, 1, 5, 2, 4, 6, 0)
+    check("imbalance == 1", p3d_load_imbalance(cfg) == 1)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Test 7 — FFN forward (TP=1) matches single
+// ═══════════════════════════════════════════════════════════════════
+fn test_ffn_tp1() {
+    println("[test] 7. p3d_ffn_forward TP=1 == single")
+    let batch = 4
+    let dim = 4
+    let hidden = 6
+    let X = tp_mat_range(batch, dim, 0.05, 0.013)
+    let W1 = tp_mat_range(dim, hidden, -0.25, 0.031)
+    let W2 = tp_mat_range(hidden, dim, 0.17, 0.023)
+    let Y_single = p3d_ffn_forward_single(X, W1, W2, batch, dim, hidden)
+    let Y_tp = p3d_ffn_forward(X, W1, W2, batch, dim, hidden, 1)
+    check("FFN TP=1 match", max_abs_diff3d(Y_single, Y_tp, batch * dim) < 0.000001)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Test 8 — FFN forward (TP=2) matches single
+// ═══════════════════════════════════════════════════════════════════
+fn test_ffn_tp2() {
+    println("[test] 8. p3d_ffn_forward TP=2 == single")
+    let batch = 4
+    let dim = 4
+    let hidden = 6
+    let X = tp_mat_range(batch, dim, 0.05, 0.013)
+    let W1 = tp_mat_range(dim, hidden, -0.25, 0.031)
+    let W2 = tp_mat_range(hidden, dim, 0.17, 0.023)
+    let Y_single = p3d_ffn_forward_single(X, W1, W2, batch, dim, hidden)
+    let Y_tp = p3d_ffn_forward(X, W1, W2, batch, dim, hidden, 2)
+    check("FFN TP=2 match", max_abs_diff3d(Y_single, Y_tp, batch * dim) < 0.000001)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Test 9 — batch split round-trip
+// ═══════════════════════════════════════════════════════════════════
+fn test_split_batch_roundtrip() {
+    println("[test] 9. p3d_split_batch round-trip")
+    let batch = 4
+    let feat = 3
+    let X = tp_mat_range(batch, feat, 0.1, 0.07)
+    let shards = p3d_split_batch(X, batch, feat, 2)
+    check("shard count", len(shards) == 2)
+    let s0 = shards[0]
+    let s1 = shards[1]
+    check("shard0 len", len(s0) == 2 * feat)
+    check("shard1 len", len(s1) == 2 * feat)
+    // Concat back via p3d_concat_outputs (same shape semantics).
+    let reb = p3d_concat_outputs(shards, 2, feat)
+    check("round-trip", max_abs_diff3d(X, reb, batch * feat) < 0.000001)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Test 10 — grad all-reduce averages identical replicas
+// ═══════════════════════════════════════════════════════════════════
+fn test_grad_allreduce() {
+    println("[test] 10. p3d_grad_allreduce averages")
+    let g0 = [1.0, 2.0, 3.0, 4.0]
+    let g1 = [1.0, 2.0, 3.0, 4.0]
+    let result = p3d_grad_allreduce([g0, g1], 2)
+    check_near("avg [0]", result[0], 1.0, 0.000001)
+    check_near("avg [1]", result[1], 2.0, 0.000001)
+    check_near("avg [2]", result[2], 3.0, 0.000001)
+    check_near("avg [3]", result[3], 4.0, 0.000001)
+    // non-uniform
+    let h0 = [2.0, 4.0, 6.0, 8.0]
+    let h1 = [0.0, 0.0, 0.0, 0.0]
+    let res2 = p3d_grad_allreduce([h0, h1], 2)
+    check_near("avg mixed [0]", res2[0], 1.0, 0.000001)
+    check_near("avg mixed [3]", res2[3], 4.0, 0.000001)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Test 11 — merged step (TP=1, PP=1, DP=1, ZeRO-0) == reference
+// ═══════════════════════════════════════════════════════════════════
+fn test_merged_trivial() {
+    println("[test] 11. merged step trivial (1,1,1,ZeRO0) == ref")
+    let cfg = p3d_init(1, 1, 1, 2, 2, 4, 6, 0)
+    let stack = make_stack(cfg.num_layers, cfg.dim, cfg.hidden)
+    let X = tp_mat_range(cfg.global_batch, cfg.dim, 0.05, 0.011)
+    let flat_params = [0.01, 0.02]
+    let syn_grads = [0.1, 0.1]
+    let res = p3d_step(cfg, X, stack, flat_params, syn_grads, 0.01)
+    let Y_ref = p3d_reference_forward(cfg, X, stack)
+    let Y_merged = p3d_concat_outputs(res.outputs, p3d_dp_batch_size(cfg), cfg.dim)
+    check("trivial match", max_abs_diff3d(Y_ref, Y_merged, cfg.global_batch * cfg.dim) < 0.000001)
+    check("mesh valid", res.mesh_valid)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Test 12 — merged step (TP=2, PP=1, DP=1, ZeRO-1) == reference
+// ═══════════════════════════════════════════════════════════════════
+fn test_merged_tp_only() {
+    println("[test] 12. merged step TP-only (2,1,1,ZeRO1) == ref")
+    let cfg = p3d_init(2, 1, 1, 2, 2, 4, 6, 1)
+    let stack = make_stack(cfg.num_layers, cfg.dim, cfg.hidden)
+    let X = tp_mat_range(cfg.global_batch, cfg.dim, 0.05, 0.011)
+    let flat_params = [0.01, 0.02]
+    let syn_grads = [0.1, 0.1]
+    let res = p3d_step(cfg, X, stack, flat_params, syn_grads, 0.01)
+    let Y_ref = p3d_reference_forward(cfg, X, stack)
+    let Y_merged = p3d_concat_outputs(res.outputs, p3d_dp_batch_size(cfg), cfg.dim)
+    check("TP-only match", max_abs_diff3d(Y_ref, Y_merged, cfg.global_batch * cfg.dim) < 0.000001)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Test 13 — merged step (TP=1, PP=2, DP=1, ZeRO-1) == reference
+// ═══════════════════════════════════════════════════════════════════
+fn test_merged_pp_only() {
+    println("[test] 13. merged step PP-only (1,2,1,ZeRO1) == ref")
+    let cfg = p3d_init(1, 2, 1, 4, 2, 4, 6, 1)
+    let stack = make_stack(cfg.num_layers, cfg.dim, cfg.hidden)
+    let X = tp_mat_range(cfg.global_batch, cfg.dim, 0.05, 0.011)
+    let flat_params = [0.01, 0.02, 0.03, 0.04]
+    let syn_grads = [0.1, 0.1, 0.1, 0.1]
+    let res = p3d_step(cfg, X, stack, flat_params, syn_grads, 0.01)
+    let Y_ref = p3d_reference_forward(cfg, X, stack)
+    let Y_merged = p3d_concat_outputs(res.outputs, p3d_dp_batch_size(cfg), cfg.dim)
+    check("PP-only match", max_abs_diff3d(Y_ref, Y_merged, cfg.global_batch * cfg.dim) < 0.000001)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Test 14 — merged step (TP=1, PP=1, DP=2, ZeRO-2) == reference
+// ═══════════════════════════════════════════════════════════════════
+fn test_merged_dp_only() {
+    println("[test] 14. merged step DP-only (1,1,2,ZeRO2) == ref")
+    let cfg = p3d_init(1, 1, 2, 2, 4, 4, 6, 2)
+    let stack = make_stack(cfg.num_layers, cfg.dim, cfg.hidden)
+    let X = tp_mat_range(cfg.global_batch, cfg.dim, 0.05, 0.011)
+    let flat_params = [0.01, 0.02]
+    let syn_grads = [0.1, 0.1]
+    let res = p3d_step(cfg, X, stack, flat_params, syn_grads, 0.01)
+    let Y_ref = p3d_reference_forward(cfg, X, stack)
+    let Y_merged = p3d_concat_outputs(res.outputs, p3d_dp_batch_size(cfg), cfg.dim)
+    check("DP-only match", max_abs_diff3d(Y_ref, Y_merged, cfg.global_batch * cfg.dim) < 0.000001)
+    check("DP opt t=1", res.opt_ctx.t == 1)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Test 15 — full 3D merged step (TP=2, PP=2, DP=2, ZeRO-1) == reference
+// ═══════════════════════════════════════════════════════════════════
+fn test_merged_full_3d_zero1() {
+    println("[test] 15. merged step full 3D (2,2,2,ZeRO1) == ref")
+    let cfg = p3d_init(2, 2, 2, 4, 4, 4, 6, 1)
+    let stack = make_stack(cfg.num_layers, cfg.dim, cfg.hidden)
+    let X = tp_mat_range(cfg.global_batch, cfg.dim, 0.05, 0.011)
+    let flat_params = [0.01, 0.02, 0.03, 0.04]
+    let syn_grads = [0.1, 0.1, 0.1, 0.1]
+    let res = p3d_step(cfg, X, stack, flat_params, syn_grads, 0.01)
+    let Y_ref = p3d_reference_forward(cfg, X, stack)
+    let Y_merged = p3d_concat_outputs(res.outputs, p3d_dp_batch_size(cfg), cfg.dim)
+    check("full 3D ZeRO-1 match", max_abs_diff3d(Y_ref, Y_merged, cfg.global_batch * cfg.dim) < 0.000001)
+    check("world_size == 8", cfg.world_size == 8)
+    check("mesh valid", res.mesh_valid)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Test 16 — full 3D merged step with ZeRO-3
+// ═══════════════════════════════════════════════════════════════════
+fn test_merged_full_3d_zero3() {
+    println("[test] 16. merged step full 3D (2,2,2,ZeRO3) == ref")
+    let cfg = p3d_init(2, 2, 2, 4, 4, 4, 6, 3)
+    let stack = make_stack(cfg.num_layers, cfg.dim, cfg.hidden)
+    let X = tp_mat_range(cfg.global_batch, cfg.dim, 0.05, 0.011)
+    let flat_params = [0.01, 0.02, 0.03, 0.04]
+    let syn_grads = [0.1, 0.1, 0.1, 0.1]
+    let res = p3d_step(cfg, X, stack, flat_params, syn_grads, 0.01)
+    let Y_ref = p3d_reference_forward(cfg, X, stack)
+    let Y_merged = p3d_concat_outputs(res.outputs, p3d_dp_batch_size(cfg), cfg.dim)
+    check("full 3D ZeRO-3 match", max_abs_diff3d(Y_ref, Y_merged, cfg.global_batch * cfg.dim) < 0.000001)
+    check("ZeRO-3 stage", res.opt_ctx.stage == 3)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Test 17 — optimizer context advanced after step
+// ═══════════════════════════════════════════════════════════════════
+fn test_opt_t_advanced() {
+    println("[test] 17. optimizer t incremented after merged step")
+    let cfg = p3d_init(2, 2, 2, 4, 4, 4, 6, 1)
+    let stack = make_stack(cfg.num_layers, cfg.dim, cfg.hidden)
+    let X = tp_mat_range(cfg.global_batch, cfg.dim, 0.05, 0.011)
+    let flat_params = [0.01, 0.02, 0.03, 0.04]
+    let syn_grads = [0.1, 0.1, 0.1, 0.1]
+    let res = p3d_step(cfg, X, stack, flat_params, syn_grads, 0.01)
+    check("t == 1", res.opt_ctx.t == 1)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Test 18 — memory sharding: ZeRO-3 rank cost < ZeRO-0 cost
+// ═══════════════════════════════════════════════════════════════════
+fn test_memory_zero3_lt_zero0() {
+    println("[test] 18. p3d_memory_per_rank ZeRO-3 < ZeRO-0")
+    let cfg_zero0 = p3d_init(2, 2, 2, 4, 4, 4, 6, 0)
+    let cfg_zero3 = p3d_init(2, 2, 2, 4, 4, 4, 6, 3)
+    let m_z0 = p3d_memory_per_rank(cfg_zero0, 0)
+    let m_z3 = p3d_memory_per_rank(cfg_zero3, 0)
+    check("ZeRO-3 < ZeRO-0", m_z3 < m_z0)
+    let base = p3d_memory_baseline(cfg_zero3)
+    check("baseline > ZeRO-3 rank", base > m_z3)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Test 19 — bubble_steps matches expected formula
+// ═══════════════════════════════════════════════════════════════════
+fn test_bubble_steps() {
+    println("[test] 19. bubble_steps == 2*(pp_size-1)")
+    // PP=1 → bubble 0
+    let cfg1 = p3d_init(1, 1, 1, 2, 2, 4, 6, 0)
+    let stack1 = make_stack(cfg1.num_layers, cfg1.dim, cfg1.hidden)
+    let X1 = tp_mat_range(cfg1.global_batch, cfg1.dim, 0.05, 0.011)
+    let res1 = p3d_step(cfg1, X1, stack1, [0.01, 0.02], [0.1, 0.1], 0.01)
+    check("PP=1 bubble=0", res1.bubble_steps == 0)
+    // PP=2 → bubble 2
+    let cfg2 = p3d_init(1, 2, 1, 4, 2, 4, 6, 1)
+    let stack2 = make_stack(cfg2.num_layers, cfg2.dim, cfg2.hidden)
+    let X2 = tp_mat_range(cfg2.global_batch, cfg2.dim, 0.05, 0.011)
+    let res2 = p3d_step(cfg2, X2, stack2, [0.01, 0.02, 0.03, 0.04], [0.1, 0.1, 0.1, 0.1], 0.01)
+    check("PP=2 bubble=2", res2.bubble_steps == 2)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Runner
+// ═══════════════════════════════════════════════════════════════════
+fn run_all() {
+    println("============================================================")
+    println("  3D Parallelism Tests (TP x PP x ZeRO/DP)  — ML #96")
+    println("============================================================")
+    test_init()
+    test_coord_roundtrip()
+    test_mesh_build()
+    test_layer_ranges_balanced()
+    test_load_imbalance_zero()
+    test_load_imbalance_nonzero()
+    test_ffn_tp1()
+    test_ffn_tp2()
+    test_split_batch_roundtrip()
+    test_grad_allreduce()
+    test_merged_trivial()
+    test_merged_tp_only()
+    test_merged_pp_only()
+    test_merged_dp_only()
+    test_merged_full_3d_zero1()
+    test_merged_full_3d_zero3()
+    test_opt_t_advanced()
+    test_memory_zero3_lt_zero0()
+    test_bubble_steps()
+
+    println("")
+    println("============================================================")
+    let total = pass_count + fail_count
+    println("  Results: " + str(pass_count) + "/" + str(total) + " passed")
+    if fail_count > 0 {
+        println("  FAILED: " + str(fail_count) + " tests")
+    } else {
+        println("  ALL PASSED")
+    }
+    println("============================================================")
+}
+
+run_all()

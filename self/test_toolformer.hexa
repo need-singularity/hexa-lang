@@ -1,0 +1,294 @@
+// ===================================================================
+//  test_toolformer.hexa — Toolformer self-supervised tool learning
+//
+//  Tests (≥12):
+//    1.  tf_hash deterministic
+//    2.  tf_rand01 in [0,1)
+//    3.  tf_sample_positions picks above-threshold positions
+//    4.  tf_sample_positions honors max_pos cap
+//    5.  tf_sample_calls generates k candidates
+//    6.  tf_execute_candidate dispatches to executor
+//    7.  tf_perplexity_with uses tool result context
+//    8.  tf_perplexity_without uses bare context
+//    9.  tf_perplexity_gain positive when tool helps
+//   10.  tf_filter_candidates keeps gain >= tau
+//   11.  tf_filter_candidates drops gain < tau
+//   12.  tf_top_per_position picks best per position
+//   13.  tf_build_training_example splices tags at position
+//   14.  tf_build_incontext_dataset end-to-end kept count
+//   15.  tf_has_trigger_token finds explicit marker
+//   16.  tf_inference_should_trigger via trigger token
+//   17.  tf_inference_should_trigger via lm_score threshold
+//   18.  tf_inference_step no-fire branch
+//   19.  tf_inference_step fire branch splices tags
+//   20.  parse_tool_calls roundtrips built training example
+//
+//  Run: hexa self/test_toolformer.hexa
+// ===================================================================
+import "ml/toolformer.hexa"
+
+let mut pass = 0
+let mut fail = 0
+
+fn tcheck(name, cond) {
+    if cond {
+        pass = pass + 1
+        println("[PASS] " + name)
+    } else {
+        fail = fail + 1
+        println("[FAIL] " + name)
+    }
+}
+
+// ── Mock LM score helpers (hoisted so fn lookup is unambiguous) ────
+fn tf_test_never_low(ctx, tgt) { return 999.0 }
+fn tf_test_always_zero(ctx, tgt) { return 0.0 }
+
+// ── 1. tf_hash is deterministic ────────────────────────────────────
+tcheck("tf_hash determinism", tf_hash(42, 7) == tf_hash(42, 7))
+tcheck("tf_hash nonneg", tf_hash(123, 456) >= 0)
+
+// ── 2. tf_rand01 bounded ───────────────────────────────────────────
+let r = tf_rand01(11, 3)
+tcheck("tf_rand01 lower", r >= 0.0)
+tcheck("tf_rand01 upper", r < 1.0)
+
+// ── Mock probability: prob high at even positions ──────────────────
+fn mock_prob(text, pos) {
+    if pos % 3 == 0 { return 0.9 }
+    return 0.1
+}
+
+// ── 3. sample_positions picks above threshold ──────────────────────
+let txt = "Hello world this is a test string"
+let positions = tf_sample_positions(txt, mock_prob, 0.5, 100)
+tcheck("sample_positions nonempty", len(positions) > 0)
+let mut all_mod3 = true
+let mut pi = 0
+while pi < len(positions) {
+    if positions[pi] % 3 != 0 { all_mod3 = false }
+    pi = pi + 1
+}
+tcheck("sample_positions only above thresh", all_mod3)
+
+// ── 4. max_pos caps output ─────────────────────────────────────────
+let capped = tf_sample_positions(txt, mock_prob, 0.5, 2)
+tcheck("sample_positions max_pos cap", len(capped) == 2)
+
+// ── Mock tool + args generator ─────────────────────────────────────
+let calc_tool = define_tool("calc", "Math calculator",
+    [define_param("expr", "string", "Expression", true)])
+let qa_tool = define_tool("qa", "Question answering",
+    [define_param("q", "string", "Question", true)])
+let tools = [calc_tool, qa_tool]
+
+fn mock_args(text, pos, tool, sample_i) {
+    if tool["name"] == "calc" {
+        return "{\"expr\": \"2+" + to_string(sample_i) + "\"}"
+    }
+    return "{\"q\": \"what at " + to_string(pos) + "\"}"
+}
+
+// ── 5. sample_calls generates k candidates ─────────────────────────
+let cand = tf_sample_calls(txt, 5, calc_tool, 3, mock_args)
+tcheck("sample_calls count", len(cand) == 3)
+tcheck("sample_calls name", cand[0]["name"] == "calc")
+tcheck("sample_calls position", cand[2]["position"] == 5)
+tcheck("sample_calls arguments contains sample_i",
+       cand[1]["arguments"].contains("2+1"))
+
+// ── Mock executor: calc returns numeric string, qa returns "answer:N"
+fn mock_exec(name, args) {
+    if name == "calc" {
+        return "7"
+    }
+    if name == "qa" {
+        return "answer:42"
+    }
+    return ""
+}
+
+// ── 6. execute_candidate dispatches ────────────────────────────────
+let exec_res = tf_execute_candidate(cand[0], mock_exec)
+tcheck("execute_candidate dispatches", exec_res == "7")
+
+// ── Mock LM score: returns higher (worse) for shorter contexts,
+//   lower (better) when the context contains "tool_result". This makes
+//   tool-augmented prefixes strictly more helpful.
+fn mock_lm_score(ctx, target) {
+    let base = to_float(50)
+    let len_ctx = len(ctx)
+    let mut score = base - to_float(len_ctx) * 0.01
+    if ctx.contains("<tool_result>") {
+        score = score - 5.0
+    }
+    if ctx.contains("answer:42") {
+        score = score - 3.0
+    }
+    if score < 0.0 { return 0.0 }
+    return score
+}
+
+// ── 7-9. perplexity_with / without / gain ──────────────────────────
+let prefix = "The answer is"
+let suffix = " after computing."
+let target = "7"
+let mock_call_a = #{}
+mock_call_a["name"] = "calc"
+mock_call_a["arguments"] = "{\"expr\": \"2+5\"}"
+let ppl_with = tf_perplexity_with(prefix, mock_call_a, "7", suffix,
+                                  target, mock_lm_score)
+let ppl_without = tf_perplexity_without(prefix, suffix, target, mock_lm_score)
+tcheck("perplexity_with is finite", ppl_with >= 0.0)
+tcheck("perplexity_without is finite", ppl_without >= 0.0)
+tcheck("perplexity_gain positive (tool helps)",
+       tf_perplexity_gain(prefix, mock_call_a, "7", suffix, target, mock_lm_score) > 0.0)
+
+// ── 10-11. filter_candidates ────────────────────────────────────────
+let good = #{}
+good["name"] = "calc"
+good["arguments"] = "{\"expr\":\"1+1\"}"
+good["position"] = 0
+good["sample"] = 0
+good["result"] = "2"
+good["ppl_with"] = 10.0
+good["ppl_without"] = 15.0
+
+let bad = #{}
+bad["name"] = "calc"
+bad["arguments"] = "{\"expr\":\"x\"}"
+bad["position"] = 3
+bad["sample"] = 0
+bad["result"] = "err"
+bad["ppl_with"] = 20.0
+bad["ppl_without"] = 20.5
+
+let filtered = tf_filter_candidates([good, bad], 1.0)
+tcheck("filter keeps high gain", len(filtered) == 1)
+tcheck("filter keeps the right one", filtered[0]["name"] == "calc")
+tcheck("filter records gain", filtered[0]["gain"] >= 4.9)
+
+let filtered_strict = tf_filter_candidates([good, bad], 100.0)
+tcheck("filter rejects below tau", len(filtered_strict) == 0)
+
+// ── 12. top_per_position ────────────────────────────────────────────
+let c1 = #{}
+c1["name"] = "a"
+c1["position"] = 5
+c1["gain"] = 2.0
+c1["arguments"] = "{}"
+c1["sample"] = 0
+c1["result"] = "r1"
+let c2 = #{}
+c2["name"] = "b"
+c2["position"] = 5
+c2["gain"] = 5.0
+c2["arguments"] = "{}"
+c2["sample"] = 1
+c2["result"] = "r2"
+let c3 = #{}
+c3["name"] = "c"
+c3["position"] = 8
+c3["gain"] = 1.0
+c3["arguments"] = "{}"
+c3["sample"] = 0
+c3["result"] = "r3"
+let top = tf_top_per_position([c1, c2, c3])
+tcheck("top_per_position dedupes positions", len(top) == 2)
+// best at position 5 should be c2 (gain 5.0)
+let mut found5 = false
+let mut best5_name = ""
+let mut ti = 0
+while ti < len(top) {
+    if top[ti]["position"] == 5 {
+        found5 = true
+        best5_name = top[ti]["name"]
+    }
+    ti = ti + 1
+}
+tcheck("top_per_position keeps max-gain", found5 && best5_name == "b")
+
+// ── 13. build_training_example ──────────────────────────────────────
+let ex_call = #{}
+ex_call["name"] = "calc"
+ex_call["arguments"] = "{\"expr\": \"2+5\"}"
+let ex = tf_build_training_example("The answer is after computing.",
+                                   ex_call, "7", 14)
+tcheck("training_example has call tag", ex.contains("<tool_call>"))
+tcheck("training_example has result tag", ex.contains("<tool_result>"))
+tcheck("training_example has prefix", ex.contains("The answer is"))
+tcheck("training_example has suffix", ex.contains("after computing."))
+
+// ── 14. end-to-end dataset builder ──────────────────────────────────
+let corpus = ["The cost is 3 dollars per kg today.",
+              "Tokyo population grows steadily each year."]
+let ds = tf_build_incontext_dataset(corpus, tools, 2, 1.0,
+                                    mock_prob, mock_args, mock_exec,
+                                    mock_lm_score, 0.5, 3)
+tcheck("dataset has stats", has_key(ds, "stats"))
+tcheck("dataset has dataset arr", has_key(ds, "dataset"))
+tcheck("dataset n_candidates > 0", ds["stats"]["n_candidates"] > 0)
+tcheck("dataset n_kept > 0", ds["stats"]["n_kept"] > 0)
+tcheck("dataset examples > 0", len(ds["dataset"]) > 0)
+
+// All kept examples should contain the tool_call tag
+let mut all_have_tag = true
+let mut di = 0
+while di < len(ds["dataset"]) {
+    if ds["dataset"][di].contains("<tool_call>") == false {
+        all_have_tag = false
+    }
+    di = di + 1
+}
+tcheck("every kept example has <tool_call>", all_have_tag)
+
+// ── 15. has_trigger_token ───────────────────────────────────────────
+tcheck("has_trigger_token hit", tf_has_trigger_token("foo [TOOL] bar", ["[TOOL]"]))
+tcheck("has_trigger_token miss", tf_has_trigger_token("plain text", ["[TOOL]"]) == false)
+
+// ── 16. inference_should_trigger via token ──────────────────────────
+let trg = ["[TOOL]"]
+tcheck("should_trigger explicit token",
+       tf_inference_should_trigger("hi [TOOL] now", trg, tf_test_never_low, 0.1))
+
+// ── 17. inference_should_trigger via score threshold ────────────────
+let dbg_az_direct = tf_test_always_zero("plain", "<tool_call>")
+println("  DBG always_zero direct: " + to_string(dbg_az_direct))
+let dbg_has = tf_has_trigger_token("plain", trg)
+println("  DBG has_trigger: " + to_string(dbg_has))
+let dbg_ret = tf_inference_should_trigger("plain", trg, tf_test_always_zero, 0.5)
+println("  DBG ret: " + to_string(dbg_ret))
+tcheck("should_trigger score threshold", dbg_ret)
+tcheck("should_not_trigger when score high",
+       tf_inference_should_trigger("plain", trg, tf_test_never_low, 0.5) == false)
+
+// ── 18. inference_step no-fire branch ───────────────────────────────
+let no_fire = tf_inference_step("plain", tools, mock_args, mock_exec,
+                                tf_test_never_low, trg, 0.1)
+tcheck("no_fire returns fired=false", no_fire["fired"] == false)
+tcheck("no_fire keeps text", no_fire["text"] == "plain")
+
+// ── 19. inference_step fire branch splices tags ─────────────────────
+let fire = tf_inference_step("Tell me 2+5: [TOOL]", tools, mock_args,
+                             mock_exec, mock_lm_score, trg, 1000.0)
+tcheck("fire returns fired=true", fire["fired"] == true)
+tcheck("fire text has <tool_call>", fire["text"].contains("<tool_call>"))
+tcheck("fire text has <tool_result>", fire["text"].contains("<tool_result>"))
+tcheck("fire picks one of our tools",
+       fire["call"]["name"] == "calc" || fire["call"]["name"] == "qa")
+
+// ── 20. parse_tool_calls should roundtrip the spliced example ───────
+let rt_calls = parse_tool_calls(fire["text"])
+tcheck("roundtrip parse finds call", len(rt_calls) == 1)
+tcheck("roundtrip name matches",
+       rt_calls[0]["name"] == fire["call"]["name"])
+
+// ── summary ────────────────────────────────────────────────────────
+println("")
+println("pass=" + to_string(pass) + " fail=" + to_string(fail))
+if fail == 0 {
+    println("ALL PASS")
+} else {
+    println("FAILED")
+}
+println(to_string(pass) + " passed")

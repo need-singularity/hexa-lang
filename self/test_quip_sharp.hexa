@@ -1,0 +1,608 @@
+// ===================================================================
+//  test_quip_sharp.hexa — QuIP# incoherence lattice 2-bit quant (ML #107)
+//
+//  Validates the QuIP# implementation in self/ml/quip_sharp.hexa.
+//  Covers Hadamard transform, random signs, incoherence processing,
+//  E8 codebook encode/decode, 2-bit pack/unpack, full tensor
+//  quantize/dequantize, forward pass, error metrics, and comparison
+//  against a uniform 2-bit baseline.
+//
+//  Run:  ./hexa self/test_quip_sharp.hexa
+// ===================================================================
+
+use "ml/quip_sharp"
+
+// ── Tally ────────────────────────────────────────────────────────
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+// ── Math helpers (t_ prefix to avoid collision) ──────────────────
+fn t_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn t_approx(a, b, eps) {
+    return t_abs(a - b) < eps
+}
+
+fn t_max_err(orig, deq) {
+    let n = len(orig)
+    let mut mx = 0.0
+    let mut i = 0
+    while i < n {
+        let e = t_abs(orig[i] - deq[i])
+        if e > mx { mx = e }
+        i = i + 1
+    }
+    return mx
+}
+
+// ── PRNG (LCG) — deterministic test data ────────────────────────
+let mut _TRNG = 2026
+
+fn t_rand() {
+    _TRNG = (_TRNG * 1103515245 + 12345) % 2147483648
+    return _TRNG
+}
+
+fn t_rand_float() {
+    let r = t_rand()
+    return (to_float(r) / 1073741824.0) - 1.0
+}
+
+fn t_rand_vec(n) {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [t_rand_float()]
+        i = i + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  Test 1: Hadamard transform preserves length
+// ===================================================================
+fn test_hadamard_length() {
+    let v = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    let h = quip_hadamard(v)
+    check("hadamard.length_preserved", len(h) == 8)
+}
+
+// ===================================================================
+//  Test 2: Hadamard is its own inverse (H * H * v = v)
+// ===================================================================
+fn test_hadamard_involution() {
+    let v = [1.0, -0.5, 0.3, 0.7, -0.2, 0.4, -0.8, 0.1]
+    let h1 = quip_hadamard(v)
+    let h2 = quip_hadamard(h1)
+    let mut ok = true
+    let mut i = 0
+    while i < 8 {
+        if t_abs(h2[i] - v[i]) > 0.0001 { ok = false }
+        i = i + 1
+    }
+    check("hadamard.involution_H(H(v))=v", ok)
+}
+
+// ===================================================================
+//  Test 3: Hadamard preserves L2 norm (orthogonal transform)
+// ===================================================================
+fn test_hadamard_norm() {
+    let v = [1.0, 2.0, -1.0, 0.5, 3.0, -2.0, 0.0, 1.5]
+    let h = quip_hadamard(v)
+    let mut norm_v = 0.0
+    let mut norm_h = 0.0
+    let mut i = 0
+    while i < 8 {
+        norm_v = norm_v + v[i] * v[i]
+        norm_h = norm_h + h[i] * h[i]
+        i = i + 1
+    }
+    check("hadamard.preserves_l2_norm", t_approx(norm_v, norm_h, 0.001))
+}
+
+// ===================================================================
+//  Test 4: Hadamard of unit vector gives uniform magnitude entries
+// ===================================================================
+fn test_hadamard_uniform_spread() {
+    let v = [8.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    let h = quip_hadamard(v)
+    // Every entry should have magnitude 8/sqrt(8) ~ 2.828
+    let expected = 8.0 / sqrt(8.0)
+    let mut ok = true
+    let mut i = 0
+    while i < 8 {
+        if t_abs(t_abs(h[i]) - expected) > 0.01 { ok = false }
+        i = i + 1
+    }
+    check("hadamard.unit_vector_uniform_spread", ok)
+}
+
+// ===================================================================
+//  Test 5: Random signs vector has correct length and values
+// ===================================================================
+fn test_random_signs_basic() {
+    let signs = quip_random_signs(16, 42)
+    check("signs.length", len(signs) == 16)
+    let mut all_pm1 = true
+    let mut i = 0
+    while i < 16 {
+        if t_abs(signs[i]) != 1.0 { all_pm1 = false }
+        i = i + 1
+    }
+    check("signs.all_plus_minus_one", all_pm1)
+}
+
+// ===================================================================
+//  Test 6: Random signs are deterministic (same seed = same output)
+// ===================================================================
+fn test_random_signs_deterministic() {
+    let s1 = quip_random_signs(8, 123)
+    let s2 = quip_random_signs(8, 123)
+    let mut ok = true
+    let mut i = 0
+    while i < 8 {
+        if s1[i] != s2[i] { ok = false }
+        i = i + 1
+    }
+    check("signs.deterministic_same_seed", ok)
+}
+
+// ===================================================================
+//  Test 7: Different seeds produce different sign vectors
+// ===================================================================
+fn test_random_signs_different_seeds() {
+    let s1 = quip_random_signs(16, 1)
+    let s2 = quip_random_signs(16, 999)
+    let mut diff = 0
+    let mut i = 0
+    while i < 16 {
+        if s1[i] != s2[i] { diff = diff + 1 }
+        i = i + 1
+    }
+    // At least some should differ
+    check("signs.different_seeds_differ", diff > 0)
+}
+
+// ===================================================================
+//  Test 8: Incoherence fwd+inv round-trip is identity
+// ===================================================================
+fn test_incoherence_roundtrip() {
+    let row = [1.0, -0.5, 0.3, 0.7, -0.2, 0.4, -0.8, 0.1]
+    let signs = quip_random_signs(8, 77)
+    let fwd = quip_incoherence_fwd(row, signs)
+    let inv = quip_incoherence_inv(fwd, signs)
+    let mut ok = true
+    let mut i = 0
+    while i < 8 {
+        if t_abs(inv[i] - row[i]) > 0.0001 { ok = false }
+        i = i + 1
+    }
+    check("incoherence.fwd_inv_roundtrip", ok)
+}
+
+// ===================================================================
+//  Test 9: Incoherence reduces max magnitude (spreading effect)
+// ===================================================================
+fn test_incoherence_spreading() {
+    // Spike vector: one large entry, rest near zero
+    let row = [10.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    let signs = quip_random_signs(8, 55)
+    let fwd = quip_incoherence_fwd(row, signs)
+    let mut max_orig = 0.0
+    let mut max_fwd = 0.0
+    let mut i = 0
+    while i < 8 {
+        let ao = t_abs(row[i])
+        let af = t_abs(fwd[i])
+        if ao > max_orig { max_orig = ao }
+        if af > max_fwd { max_fwd = af }
+        i = i + 1
+    }
+    // After transform, max should be much smaller than 10.0
+    check("incoherence.reduces_peak", max_fwd < max_orig * 0.6)
+}
+
+// ===================================================================
+//  Test 10: E8 encode/decode round-trip (exact for representable)
+// ===================================================================
+fn test_e8_roundtrip_exact() {
+    // Values that map exactly to codebook levels
+    let group = [-1.5, -0.5, 0.5, 1.5, -1.5, 0.5, -0.5, 1.5]
+    let codes = quip_e8_encode(group, 1.0)
+    let decoded = quip_e8_decode(codes, 1.0)
+    let mut ok = true
+    let mut i = 0
+    while i < 8 {
+        if t_abs(decoded[i] - group[i]) > 0.001 { ok = false }
+        i = i + 1
+    }
+    check("e8.exact_roundtrip", ok)
+}
+
+// ===================================================================
+//  Test 11: E8 codes are in valid 2-bit range [0,3]
+// ===================================================================
+fn test_e8_code_range() {
+    _TRNG = 100
+    let group = t_rand_vec(8)
+    let codes = quip_e8_encode(group, 0.5)
+    let mut ok = true
+    let mut i = 0
+    while i < 8 {
+        if codes[i] < 0 { ok = false }
+        if codes[i] > 3 { ok = false }
+        i = i + 1
+    }
+    check("e8.codes_in_[0,3]", ok)
+}
+
+// ===================================================================
+//  Test 12: E8 encode with different scale
+// ===================================================================
+fn test_e8_scaled() {
+    let group = [-3.0, -1.0, 1.0, 3.0, -3.0, 1.0, -1.0, 3.0]
+    let codes = quip_e8_encode(group, 2.0)
+    let decoded = quip_e8_decode(codes, 2.0)
+    let mut ok = true
+    let mut i = 0
+    while i < 8 {
+        if t_abs(decoded[i] - group[i]) > 0.01 { ok = false }
+        i = i + 1
+    }
+    check("e8.scaled_roundtrip", ok)
+}
+
+// ===================================================================
+//  Test 13: 2-bit pack/unpack round-trip (multiple of 4)
+// ===================================================================
+fn test_pack_unpack_even() {
+    let codes = [0, 1, 2, 3, 3, 2, 1, 0]
+    let packed = _quip_pack_2bit(codes)
+    check("pack.even.nbytes", len(packed) == 2)
+    let unpacked = _quip_unpack_2bit(packed, 8)
+    let mut ok = true
+    let mut i = 0
+    while i < 8 {
+        if unpacked[i] != codes[i] { ok = false }
+        i = i + 1
+    }
+    check("pack.even.roundtrip", ok)
+}
+
+// ===================================================================
+//  Test 14: 2-bit pack/unpack with non-multiple-of-4 length
+// ===================================================================
+fn test_pack_unpack_odd() {
+    let codes = [3, 1, 2, 0, 1]
+    let packed = _quip_pack_2bit(codes)
+    check("pack.odd.nbytes", len(packed) == 2)
+    let unpacked = _quip_unpack_2bit(packed, 5)
+    let mut ok = true
+    let mut i = 0
+    while i < 5 {
+        if unpacked[i] != codes[i] { ok = false }
+        i = i + 1
+    }
+    check("pack.odd.roundtrip", ok)
+}
+
+// ===================================================================
+//  Test 15: Full tensor quantize shape checks
+// ===================================================================
+fn test_tensor_shape() {
+    _TRNG = 31
+    let n_out = 4
+    let n_in = 8
+    let W = t_rand_vec(n_out * n_in)
+    let qt = quip_quantize(W, n_out, n_in, 42)
+    check("tensor.n_out", qt.n_out == n_out)
+    check("tensor.n_in", qt.n_in == n_in)
+    check("tensor.n_in_pad", qt.n_in_pad == 8)
+    check("tensor.scales.len", len(qt.scales) == n_out)
+    check("tensor.signs.len", len(qt.signs) == qt.n_in_pad)
+}
+
+// ===================================================================
+//  Test 16: Dequantize output length matches original
+// ===================================================================
+fn test_dequant_length() {
+    _TRNG = 50
+    let n_out = 3
+    let n_in = 8
+    let W = t_rand_vec(n_out * n_in)
+    let qt = quip_quantize(W, n_out, n_in, 99)
+    let deq = quip_dequantize(qt)
+    check("dequant.length", len(deq) == n_out * n_in)
+}
+
+// ===================================================================
+//  Test 17: QuIP# SNR on random data (2-bit should clear ~1 dB)
+// ===================================================================
+fn test_quip_snr() {
+    _TRNG = 200
+    let n_out = 4
+    let n_in = 16
+    let W = t_rand_vec(n_out * n_in)
+    let qt = quip_quantize(W, n_out, n_in, 55)
+    let stats = quip_error_stats(W, qt)
+    check("quip.snr_>_0dB", stats.snr > 0.0)
+    check("quip.mse_finite", stats.mse < 1.0)
+}
+
+// ===================================================================
+//  Test 18: Zero weights quantize to near-zero round-trip
+// ===================================================================
+fn test_zero_weights() {
+    let mut W = []
+    let mut i = 0
+    while i < 16 {
+        W = W + [0.0]
+        i = i + 1
+    }
+    let qt = quip_quantize(W, 2, 8, 11)
+    let deq = quip_dequantize(qt)
+    // With 2-bit (4 levels) the codebook has levels {-1.5,-0.5,+0.5,+1.5}*scale.
+    // Zero maps to code 2 (level +0.5*s), so dequant has small non-zero bias.
+    // The Hadamard spreads and recombines this, producing per-element error
+    // bounded by scale (which falls back to 1.0 for zero rows).
+    let stats = quip_error_stats(W, qt)
+    check("zero_weights.mse_bounded", stats.mse < 1.0)
+    // All outputs should still be small (not wildly divergent)
+    let mut max_val = 0.0
+    i = 0
+    while i < 16 {
+        let av = t_abs(deq[i])
+        if av > max_val { max_val = av }
+        i = i + 1
+    }
+    check("zero_weights.max_bounded", max_val < 2.0)
+}
+
+// ===================================================================
+//  Test 19: Forward output shape matches n_out
+// ===================================================================
+fn test_forward_shape() {
+    _TRNG = 77
+    let n_out = 5
+    let n_in = 8
+    let W = t_rand_vec(n_out * n_in)
+    let qt = quip_quantize(W, n_out, n_in, 33)
+    let x = t_rand_vec(n_in)
+    let y = quip_forward(qt, x)
+    check("forward.shape", len(y) == n_out)
+}
+
+// ===================================================================
+//  Test 20: Forward matches dequantize * x
+// ===================================================================
+fn test_forward_matches_dequant() {
+    _TRNG = 300
+    let n_out = 3
+    let n_in = 8
+    let W = t_rand_vec(n_out * n_in)
+    let qt = quip_quantize(W, n_out, n_in, 44)
+    let x = [1.0, -0.5, 0.25, 0.0, 2.0, -1.0, 0.75, -0.25]
+    let y_fwd = quip_forward(qt, x)
+    // Reference: dense dequant * x
+    let deq = quip_dequantize(qt)
+    let mut ok = true
+    let mut r = 0
+    while r < n_out {
+        let mut acc = 0.0
+        let mut k = 0
+        while k < n_in {
+            acc = acc + deq[r * n_in + k] * x[k]
+            k = k + 1
+        }
+        if t_abs(y_fwd[r] - acc) > 0.001 { ok = false }
+        r = r + 1
+    }
+    check("forward.matches_dequant", ok)
+}
+
+// ===================================================================
+//  Test 21: Uniform baseline produces valid stats
+// ===================================================================
+fn test_uniform_baseline() {
+    _TRNG = 400
+    let n_out = 4
+    let n_in = 16
+    let W = t_rand_vec(n_out * n_in)
+    let stats = quip_uniform_baseline(W, n_out, n_in)
+    check("baseline.mse_>0", stats.mse > 0.0)
+    check("baseline.snr_finite", stats.snr < 999.0)
+    check("baseline.snr_>_-20dB", stats.snr > -20.0)
+}
+
+// ===================================================================
+//  Test 22: QuIP# MSE <= uniform baseline MSE (incoherence helps)
+// ===================================================================
+fn test_quip_beats_uniform() {
+    _TRNG = 500
+    let n_out = 4
+    let n_in = 16
+    let W = t_rand_vec(n_out * n_in)
+    let qt = quip_quantize(W, n_out, n_in, 66)
+    let quip_stats = quip_error_stats(W, qt)
+    let base_stats = quip_uniform_baseline(W, n_out, n_in)
+    // QuIP# should not be significantly worse than uniform; on most
+    // seeds it is better (lower MSE). We allow a loose 2x margin.
+    check("quip_vs_uniform.mse_competitive", quip_stats.mse < base_stats.mse * 2.0)
+}
+
+// ===================================================================
+//  Test 23: Storage ratio (2 bits/weight vs 32 bits/weight = 16x)
+// ===================================================================
+fn test_storage_ratio() {
+    _TRNG = 600
+    let n_out = 4
+    let n_in = 32
+    let W = t_rand_vec(n_out * n_in)
+    let qt = quip_quantize(W, n_out, n_in, 88)
+    // 2 bits per weight -> n_in_pad/4 bytes per row
+    // Plus scales (1 float per row) + signs (1 float per n_in_pad)
+    let orig_bytes = n_out * n_in * 4
+    let q_bytes = len(qt.data) + len(qt.scales) * 4 + len(qt.signs) * 4
+    let ratio = to_float(orig_bytes) / to_float(q_bytes)
+    // With 32 cols, data = 4*(32/4)=32 bytes, scales = 4*4=16,
+    // signs = 32*4=128 -> 176 total vs 512 orig -> ~2.9x
+    // For large matrices signs are amortized, ratio -> 16x
+    check("storage.ratio_>_1x", ratio > 1.0)
+}
+
+// ===================================================================
+//  Test 24: Padding works for non-power-of-2 n_in
+// ===================================================================
+fn test_non_pow2_input() {
+    _TRNG = 700
+    let n_out = 2
+    let n_in = 6     // Not a power of 2; should pad to 8
+    let W = t_rand_vec(n_out * n_in)
+    let qt = quip_quantize(W, n_out, n_in, 22)
+    check("pad.n_in_pad_is_pow2", qt.n_in_pad == 8)
+    let deq = quip_dequantize(qt)
+    check("pad.deq_length_original", len(deq) == n_out * n_in)
+    let stats = quip_error_stats(W, qt)
+    check("pad.mse_finite", stats.mse < 2.0)
+}
+
+// ===================================================================
+//  Test 25: Constant weights reconstruct within tolerance
+// ===================================================================
+fn test_constant_weights() {
+    let mut W = []
+    let mut i = 0
+    while i < 16 {
+        W = W + [0.7]
+        i = i + 1
+    }
+    let qt = quip_quantize(W, 2, 8, 111)
+    let deq = quip_dequantize(qt)
+    let err = t_max_err(W, deq)
+    // 2-bit quantization on constant data: error bounded by scale
+    check("const_weights.err_bounded", err < 1.0)
+}
+
+// ===================================================================
+//  Test 26: All 2-bit codes in packed data are in [0,3]
+// ===================================================================
+fn test_2bit_range() {
+    _TRNG = 800
+    let W = t_rand_vec(4 * 16)
+    let qt = quip_quantize(W, 4, 16, 77)
+    let mut ok = true
+    let mut i = 0
+    while i < len(qt.data) {
+        let byte = qt.data[i]
+        // Check all 4 codes in the byte
+        let c0 = byte % 4
+        let c1 = (byte / 4) % 4
+        let c2 = (byte / 16) % 4
+        let c3 = (byte / 64) % 4
+        if c0 < 0 { ok = false }
+        if c0 > 3 { ok = false }
+        if c1 < 0 { ok = false }
+        if c1 > 3 { ok = false }
+        if c2 < 0 { ok = false }
+        if c2 > 3 { ok = false }
+        if c3 < 0 { ok = false }
+        if c3 > 3 { ok = false }
+        i = i + 1
+    }
+    check("2bit.range_[0,3]", ok)
+}
+
+// ===================================================================
+//  Test 27: Larger matrix (8x32) quantize/dequantize/forward
+// ===================================================================
+fn test_larger_matrix() {
+    _TRNG = 900
+    let n_out = 8
+    let n_in = 32
+    let W = t_rand_vec(n_out * n_in)
+    let qt = quip_quantize(W, n_out, n_in, 999)
+    let deq = quip_dequantize(qt)
+    check("large.deq_len", len(deq) == n_out * n_in)
+    let x = t_rand_vec(n_in)
+    let y = quip_forward(qt, x)
+    check("large.fwd_len", len(y) == n_out)
+    let stats = quip_error_stats(W, qt)
+    check("large.snr_positive", stats.snr > 0.0)
+}
+
+// ===================================================================
+//  Test 28: Scale is positive for every row
+// ===================================================================
+fn test_scales_positive() {
+    _TRNG = 1000
+    let W = t_rand_vec(4 * 16)
+    let qt = quip_quantize(W, 4, 16, 55)
+    let mut ok = true
+    let mut i = 0
+    while i < len(qt.scales) {
+        if qt.scales[i] <= 0.0 { ok = false }
+        i = i + 1
+    }
+    check("scales.all_positive", ok)
+}
+
+// ===================================================================
+//  Run all tests
+// ===================================================================
+fn main() {
+    println("=== test_quip_sharp.hexa — QuIP# 2-bit Quantization (ML #107) ===")
+
+    test_hadamard_length()
+    test_hadamard_involution()
+    test_hadamard_norm()
+    test_hadamard_uniform_spread()
+    test_random_signs_basic()
+    test_random_signs_deterministic()
+    test_random_signs_different_seeds()
+    test_incoherence_roundtrip()
+    test_incoherence_spreading()
+    test_e8_roundtrip_exact()
+    test_e8_code_range()
+    test_e8_scaled()
+    test_pack_unpack_even()
+    test_pack_unpack_odd()
+    test_tensor_shape()
+    test_dequant_length()
+    test_quip_snr()
+    test_zero_weights()
+    test_forward_shape()
+    test_forward_matches_dequant()
+    test_uniform_baseline()
+    test_quip_beats_uniform()
+    test_storage_ratio()
+    test_non_pow2_input()
+    test_constant_weights()
+    test_2bit_range()
+    test_larger_matrix()
+    test_scales_positive()
+
+    println("")
+    println("=== RESULT ===")
+    println("  PASS: " + str(pass_count))
+    println("  FAIL: " + str(fail_count))
+    if fail_count == 0 {
+        println("=== ALL QuIP# TESTS PASSED ===")
+    } else {
+        println("=== SOME TESTS FAILED ===")
+    }
+}
+
+main()

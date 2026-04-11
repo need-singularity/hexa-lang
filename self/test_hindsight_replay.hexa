@@ -1,0 +1,438 @@
+// ═══════════════════════════════════════════════════════════════
+//  test_hindsight_replay.hexa — HER verification (≥12 tests)
+//
+//  Tests:
+//    T01. sparse reward: r=0 at goal, r=-1 otherwise
+//    T02. L2 distance correctness
+//    T03. episode add_transition length grows
+//    T04. transition field accessors
+//    T05. buffer capacity enforcement (sliding window)
+//    T06. store_episode accumulates into buffer
+//    T07. final_goal returns last achieved state
+//    T08. future_goal picks state from [t+1, end]
+//    T09. random_goal in-range from buffer
+//    T10. episode_goal in-range from episode
+//    T11. relabel(final) boosts nonneg-reward ratio on failed ep
+//    T12. relabel(future) boosts nonneg-reward ratio on failed ep
+//    T13. relabel count: original + k synthetic per step
+//    T14. sparse_success_rate: all-fail = 0.0, all-hit = 1.0
+//    T15. sample_batch respects batch_size and is in buffer
+//    T16. synth rollout ends at done when goal reached
+//    T17. dense shaping strictly > sparse at distance > eps
+//
+//  실행: ./hexa self/test_hindsight_replay.hexa
+// ═══════════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ── inlined from hindsight_replay.hexa ────────────────────────
+
+fn her_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn her_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn her_min(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn her_max(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn her_hash(seed, i) {
+    let h = ((seed * 2654435761 + i * 1315423911 + 7919) % 100003)
+    if h < 0 { return 0 - h }
+    return h
+}
+
+fn her_l2_distance(a, b) {
+    let na = len(a)
+    let nb = len(b)
+    let n = her_min(na, nb)
+    let mut sum = 0.0
+    for i in 0..n {
+        let d = a[i] - b[i]
+        sum = sum + d * d
+    }
+    return her_sqrt(sum)
+}
+
+fn her_goal_reward(state, goal, eps) {
+    let d = her_l2_distance(state, goal)
+    if d < eps { return 0.0 }
+    return 0.0 - 1.0
+}
+
+fn her_dense_shaping(state, goal) {
+    return 0.0 - her_l2_distance(state, goal)
+}
+
+fn her_new_episode() { return [] }
+
+fn her_make_transition(state, action, reward, next_state, goal, done) {
+    let tr = #{}
+    tr["state"] = state
+    tr["action"] = action
+    tr["reward"] = reward
+    tr["next"] = next_state
+    tr["goal"] = goal
+    tr["done"] = done
+    return tr
+}
+
+fn her_add_transition(ep, state, action, reward, next_state, goal, done) {
+    let tr = her_make_transition(state, action, reward, next_state, goal, done)
+    return ep + [tr]
+}
+
+fn her_episode_length(ep) { return len(ep) }
+
+fn her_tr_state(tr)  { return tr["state"] }
+fn her_tr_action(tr) { return tr["action"] }
+fn her_tr_reward(tr) { return tr["reward"] }
+fn her_tr_next(tr)   { return tr["next"] }
+fn her_tr_goal(tr)   { return tr["goal"] }
+fn her_tr_done(tr)   { return tr["done"] }
+
+fn her_new_buffer(capacity) {
+    let b = #{}
+    b["cap"] = capacity
+    b["data"] = []
+    return b
+}
+fn her_buffer_capacity(buf) { return buf["cap"] }
+fn her_buffer_size(buf)     { return len(buf["data"]) }
+fn her_buffer_data(buf)     { return buf["data"] }
+
+fn her_buffer_push(buf, tr) {
+    let cap = buf["cap"]
+    let cur = buf["data"]
+    let mut nxt = cur + [tr]
+    if len(nxt) > cap {
+        let mut trimmed = []
+        let over = len(nxt) - cap
+        for i in over..len(nxt) {
+            trimmed = trimmed + [nxt[i]]
+        }
+        nxt = trimmed
+    }
+    let out = #{}
+    out["cap"] = cap
+    out["data"] = nxt
+    return out
+}
+
+fn her_store_episode(buf, ep) {
+    let n = len(ep)
+    let mut b = buf
+    for i in 0..n {
+        b = her_buffer_push(b, ep[i])
+    }
+    return b
+}
+
+fn her_final_goal(ep) {
+    let n = len(ep)
+    if n == 0 { return [] }
+    let last = ep[n - 1]
+    return her_tr_next(last)
+}
+
+fn her_future_goal(ep, t, seed) {
+    let n = len(ep)
+    if n == 0 { return [] }
+    if t >= n - 1 { return her_tr_next(ep[n - 1]) }
+    let lo = t + 1
+    let hi = n
+    let range = hi - lo
+    if range <= 0 { return her_tr_next(ep[n - 1]) }
+    let r = her_hash(seed, t) % range
+    let idx = lo + r
+    return her_tr_next(ep[idx])
+}
+
+fn her_random_goal(buf, seed) {
+    let data = her_buffer_data(buf)
+    let n = len(data)
+    if n == 0 { return [] }
+    let r = her_hash(seed, 42) % n
+    return her_tr_next(data[r])
+}
+
+fn her_episode_goal(ep, seed) {
+    let n = len(ep)
+    if n == 0 { return [] }
+    let r = her_hash(seed, 9) % n
+    return her_tr_next(ep[r])
+}
+
+fn her_relabel_episode(ep, strategy, k, eps, seed) {
+    let n = len(ep)
+    let mut out = []
+    for t in 0..n {
+        let tr = ep[t]
+        out = out + [tr]
+        for ki in 0..k {
+            let sub_seed = seed + t * 31 + ki * 97
+            let mut new_goal = []
+            if strategy == 0 { new_goal = her_final_goal(ep) }
+            if strategy == 1 { new_goal = her_future_goal(ep, t, sub_seed) }
+            if strategy == 3 { new_goal = her_episode_goal(ep, sub_seed) }
+            if strategy == 2 { new_goal = her_final_goal(ep) }
+            if len(new_goal) == 0 { new_goal = her_final_goal(ep) }
+            let ns = her_tr_next(tr)
+            let new_r = her_goal_reward(ns, new_goal, eps)
+            let mut new_done = false
+            if new_r > 0.0 - 0.5 { new_done = true }
+            let new_tr = her_make_transition(her_tr_state(tr), her_tr_action(tr), new_r, ns, new_goal, new_done)
+            out = out + [new_tr]
+        }
+    }
+    return out
+}
+
+fn her_sample_batch(buf, batch_size, seed) {
+    let data = her_buffer_data(buf)
+    let n = len(data)
+    let mut batch = []
+    if n == 0 { return batch }
+    for i in 0..batch_size {
+        let r = her_hash(seed, i) % n
+        batch = batch + [data[r]]
+    }
+    return batch
+}
+
+fn her_sparse_success_rate(ep, eps) {
+    let n = len(ep)
+    if n == 0 { return 0.0 }
+    let mut hit = 0
+    for i in 0..n {
+        let tr = ep[i]
+        let ns = her_tr_next(tr)
+        let g = her_tr_goal(tr)
+        let r = her_goal_reward(ns, g, eps)
+        if r > 0.0 - 0.5 { hit = hit + 1 }
+    }
+    return to_float(hit) / to_float(n)
+}
+
+fn her_synth_rollout(start, goal, max_steps, step_size, eps) {
+    let mut ep = her_new_episode()
+    let mut s = [start]
+    for t in 0..max_steps {
+        let a = [step_size]
+        let ns = [s[0] + step_size]
+        let r = her_goal_reward(ns, goal, eps)
+        let mut done = false
+        if r > 0.0 - 0.5 { done = true }
+        ep = her_add_transition(ep, s, a, r, ns, goal, done)
+        s = ns
+        if done { return ep }
+    }
+    return ep
+}
+
+fn her_batch_avg_reward(batch) {
+    let n = len(batch)
+    if n == 0 { return 0.0 - 1.0 }
+    let mut sum = 0.0
+    for i in 0..n {
+        sum = sum + her_tr_reward(batch[i])
+    }
+    return sum / to_float(n)
+}
+
+fn her_batch_nonneg_ratio(batch) {
+    let n = len(batch)
+    if n == 0 { return 0.0 }
+    let mut hit = 0
+    for i in 0..n {
+        if her_tr_reward(batch[i]) > 0.0 - 0.5 { hit = hit + 1 }
+    }
+    return to_float(hit) / to_float(n)
+}
+
+// helper: build a failed rollout (never reaches goal)
+fn build_failed_ep() {
+    // start=0, goal=10, step=1, eps=0.5, max=5 → never reaches
+    return her_synth_rollout(0.0, [10.0], 5, 1.0, 0.5)
+}
+
+// helper: build a successful rollout (reaches goal)
+fn build_success_ep() {
+    // start=0, goal=3, step=1, eps=0.5, max=10 → step 3 is within eps of goal
+    return her_synth_rollout(0.0, [3.0], 10, 1.0, 0.5)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  TESTS
+// ═══════════════════════════════════════════════════════════════
+
+// T01: sparse reward
+let r0 = her_goal_reward([2.0], [2.0], 0.1)
+let r1 = her_goal_reward([0.0], [5.0], 0.1)
+check("T01 sparse r=0 at goal", approx(r0, 0.0, 0.01))
+check("T01 sparse r=-1 far from goal", approx(r1, 0.0 - 1.0, 0.01))
+
+// T02: L2 distance correctness
+let d_zero = her_l2_distance([1.0, 2.0], [1.0, 2.0])
+let d_345 = her_l2_distance([0.0, 0.0], [3.0, 4.0])
+check("T02 L2 distance zero self", approx(d_zero, 0.0, 0.001))
+check("T02 L2 distance 3-4-5", approx(d_345, 5.0, 0.01))
+
+// T03: episode add_transition length grows
+let mut ep3 = her_new_episode()
+ep3 = her_add_transition(ep3, [0.0], [1.0], 0.0 - 1.0, [1.0], [5.0], false)
+ep3 = her_add_transition(ep3, [1.0], [1.0], 0.0 - 1.0, [2.0], [5.0], false)
+check("T03 episode length=2 after 2 adds", her_episode_length(ep3) == 2)
+
+// T04: transition field accessors
+let tr4 = ep3[0]
+check("T04 tr_state", her_tr_state(tr4)[0] == 0.0)
+check("T04 tr_action", her_tr_action(tr4)[0] == 1.0)
+check("T04 tr_reward -1", approx(her_tr_reward(tr4), 0.0 - 1.0, 0.01))
+check("T04 tr_next=[1.0]", her_tr_next(tr4)[0] == 1.0)
+check("T04 tr_goal=[5.0]", her_tr_goal(tr4)[0] == 5.0)
+check("T04 tr_done=false", her_tr_done(tr4) == false)
+
+// T05: buffer capacity (sliding window)
+let mut buf5 = her_new_buffer(3)
+let tr_a = her_make_transition([0.0], [0.0], 0.0 - 1.0, [1.0], [9.0], false)
+let tr_b = her_make_transition([1.0], [0.0], 0.0 - 1.0, [2.0], [9.0], false)
+let tr_c = her_make_transition([2.0], [0.0], 0.0 - 1.0, [3.0], [9.0], false)
+let tr_d = her_make_transition([3.0], [0.0], 0.0 - 1.0, [4.0], [9.0], false)
+buf5 = her_buffer_push(buf5, tr_a)
+buf5 = her_buffer_push(buf5, tr_b)
+buf5 = her_buffer_push(buf5, tr_c)
+buf5 = her_buffer_push(buf5, tr_d)
+check("T05 buffer size==capacity(3)", her_buffer_size(buf5) == 3)
+let data5 = her_buffer_data(buf5)
+check("T05 oldest evicted (front=tr_b)", her_tr_state(data5[0])[0] == 1.0)
+check("T05 newest kept (back=tr_d)", her_tr_state(data5[2])[0] == 3.0)
+
+// T06: store_episode accumulates
+let mut buf6 = her_new_buffer(100)
+let ep6 = build_failed_ep()
+buf6 = her_store_episode(buf6, ep6)
+check("T06 store_episode size matches ep len", her_buffer_size(buf6) == her_episode_length(ep6))
+
+// T07: final_goal returns last achieved (next) state
+let ep7 = build_failed_ep()
+let final_g = her_final_goal(ep7)
+let n7 = her_episode_length(ep7)
+let last_ns = her_tr_next(ep7[n7 - 1])
+check("T07 final_goal == last next_state", final_g[0] == last_ns[0])
+
+// T08: future_goal picks from [t+1, end]
+let ep8 = build_failed_ep()
+let fg = her_future_goal(ep8, 0, 12345)
+// ep: s=0→1→2→3→4→5; next_state sequence = [1,2,3,4,5]
+// future of t=0 ∈ {next[1..5]} = {2,3,4,5}
+check("T08 future_goal in valid range", fg[0] >= 2.0)
+check("T08 future_goal ≤ last ns", fg[0] <= 5.0)
+
+// T09: random_goal in-range from buffer
+let mut buf9 = her_new_buffer(100)
+buf9 = her_store_episode(buf9, build_failed_ep())
+let rg = her_random_goal(buf9, 777)
+check("T09 random_goal has next_state shape", len(rg) == 1)
+check("T09 random_goal in [1,5]", rg[0] >= 1.0)
+
+// T10: episode_goal in-range from same episode
+let ep10 = build_failed_ep()
+let eg = her_episode_goal(ep10, 555)
+check("T10 episode_goal in [1,5]", eg[0] >= 1.0)
+check("T10 episode_goal ≤ last ns", eg[0] <= 5.0)
+
+// T11: relabel(final) boosts nonneg-reward ratio on all-failure ep
+let ep11 = build_failed_ep()  // all reward=-1
+let orig_rate = her_sparse_success_rate(ep11, 0.5)
+let relabeled11 = her_relabel_episode(ep11, 0, 1, 0.5, 42)
+let nn_ratio11 = her_batch_nonneg_ratio(relabeled11)
+check("T11 original all-fail rate=0", approx(orig_rate, 0.0, 0.01))
+check("T11 relabel(final) nonneg ratio > 0", nn_ratio11 > 0.0)
+
+// T12: relabel(future) boosts nonneg-reward ratio
+let ep12 = build_failed_ep()
+let relabeled12 = her_relabel_episode(ep12, 1, 4, 0.5, 42)
+let nn_ratio12 = her_batch_nonneg_ratio(relabeled12)
+check("T12 relabel(future) nonneg ratio > 0", nn_ratio12 > 0.0)
+
+// T13: relabel count = n_original * (1 + k)
+let ep13 = build_failed_ep()
+let n_orig = her_episode_length(ep13)
+let k = 4
+let relabeled13 = her_relabel_episode(ep13, 1, k, 0.5, 42)
+check("T13 relabel count = n*(1+k)", len(relabeled13) == n_orig * (1 + k))
+
+// T14: sparse_success_rate all-fail=0, all-hit>0
+let ep14a = build_failed_ep()
+let ep14b = build_success_ep()
+let rate_fail = her_sparse_success_rate(ep14a, 0.5)
+let rate_hit = her_sparse_success_rate(ep14b, 0.5)
+check("T14 all-fail rate == 0", approx(rate_fail, 0.0, 0.01))
+check("T14 success rollout rate > 0", rate_hit > 0.0)
+
+// T15: sample_batch respects batch_size
+let mut buf15 = her_new_buffer(100)
+buf15 = her_store_episode(buf15, build_failed_ep())
+let batch15 = her_sample_batch(buf15, 8, 123)
+check("T15 batch size=8", len(batch15) == 8)
+// each sample comes from buffer (next_state in [1..5])
+let tr15_0 = batch15[0]
+check("T15 batch elem is transition", her_tr_next(tr15_0)[0] >= 1.0)
+
+// T16: synth rollout terminates at done when goal reached
+let ep16 = build_success_ep()
+let n16 = her_episode_length(ep16)
+let last16 = ep16[n16 - 1]
+check("T16 success rollout last done=true", her_tr_done(last16) == true)
+check("T16 success rollout ≤ 10 steps", n16 <= 10)
+
+// T17: dense shaping > sparse at distance > eps (dense=-d, sparse=-1, d<1)
+// use distance 0.8, eps=0.5 → dense=-0.8, sparse=-1 → dense > sparse
+let dense17 = her_dense_shaping([0.0], [0.8])
+let sparse17 = her_goal_reward([0.0], [0.8], 0.5)
+check("T17 dense shaping > sparse at d=0.8", dense17 > sparse17)
+
+// HER core invariant: relabeled batch has strictly more nonneg rewards
+// than the original all-fail episode — the main HER value prop.
+let ep_inv = build_failed_ep()
+let orig_nn = her_batch_nonneg_ratio(ep_inv)
+let her_nn = her_batch_nonneg_ratio(her_relabel_episode(ep_inv, 0, 1, 0.5, 42))
+check("HER invariant: relabel > original nonneg ratio", her_nn > orig_nn)
+
+// ═══════════════════════════════════════════════════════════════
+println("")
+println("=== hindsight_replay test summary ===")
+println("PASS: " + str(pass_count))
+println("FAIL: " + str(fail_count))
+println("TOTAL: " + str(pass_count + fail_count))

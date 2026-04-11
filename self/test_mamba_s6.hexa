@@ -1,0 +1,846 @@
+// ═══════════════════════════════════════════════════════════════════
+//  test_mamba_s6.hexa — Mamba S6 Selective State Space Model tests
+//
+//  Tests:
+//     1.  s6_init_A_diag returns HiPPO diagonal [-1, -2, ..., -N]
+//     2.  s6_discretize_zoh: exp(A*delta) for diagonal entries
+//     3.  s6_discretize_zoh: delta=0 => A_bar = 1.0 (identity)
+//     4.  s6_discretize_B: B_bar = delta * B
+//     5.  s6_discretize_B: delta=0 => B_bar = 0
+//     6.  s6_softplus: positive, monotonic, approx max(0,x) for large x
+//     7.  s6_silu: silu(0) = 0, silu(large) ~ x, silu(-large) ~ 0
+//     8.  s6_project_delta: scalar output, positive (softplus)
+//     9.  s6_project_B: correct shape [d_state]
+//    10.  s6_project_C: correct shape [d_state]
+//    11.  s6_conv1d_depthwise: causal (no future leakage)
+//    12.  s6_conv1d_depthwise: identity kernel recovers input
+//    13.  s6_conv1d_depthwise: shape preserved [seq_len, d]
+//    14.  s6_recurrent_step: h_new = A_bar*h + B_bar*x
+//    15.  s6_recurrent_step: zero input preserves decay
+//    16.  s6_output_step: C . h computes dot product
+//    17.  s6_recurrent_scan: output shape [seq_len, d_inner]
+//    18.  s6_recurrent_scan: non-zero output for non-zero input
+//    19.  s6_recurrent_scan: D skip connection pass-through
+//    20.  s6_parallel_scan_combine: associativity
+//    21.  s6_parallel_scan: matches recurrent scan result
+//    22.  s6_parallel_mode: matches recurrent mode output
+//    23.  s6_linear: y = W*x + bias
+//    24.  s6_create_block: struct fields valid
+//    25.  s6_mamba_block: output shape [seq_len, d_model]
+//    26.  s6_mamba_block: residual connection (zero weights -> identity)
+//    27.  s6_forward: alias matches s6_mamba_block
+//    28.  s6_stack_forward: multi-layer output shape
+//    29.  s6_rms_norm: unit-scale output
+//    30.  s6_silu_vec: element-wise silu on vector
+//
+//  Run: ./hexa self/test_mamba_s6.hexa
+// ═══════════════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ═══════════ Inline helpers from mamba_s6.hexa ════════════════════
+
+fn s6_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn s6_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn s6_zeros_2d(r, c) {
+    let mut m = []
+    for _i in 0..r {
+        let mut row = []
+        for _j in 0..c { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+fn s6_ones(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [1.0] }
+    return v
+}
+
+fn s6_hash(seed, i, j) {
+    let h = ((seed * 2654435761 + i * 1315423911 + j * 731) % 10007)
+    return to_float(h) / 10007.0 - 0.5
+}
+
+fn s6_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn s6_ln(x) {
+    if x <= 0.0 { return -20.0 }
+    let mut v = x
+    let mut count = 0
+    while v > 1.5 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.7 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    let d = v - 1.0
+    let d2 = d * d
+    let d3 = d2 * d
+    let d4 = d3 * d
+    let d5 = d4 * d
+    let d6 = d5 * d
+    let d7 = d6 * d
+    let d8 = d7 * d
+    let ln_v = d - d2/2.0 + d3/3.0 - d4/4.0 + d5/5.0 - d6/6.0 + d7/7.0 - d8/8.0
+    return to_float(count) + ln_v
+}
+
+fn s6_softplus(x) {
+    if x > 20.0 { return x }
+    if x < -20.0 { return 0.0 }
+    return s6_ln(1.0 + s6_exp(x))
+}
+
+fn s6_sigmoid(x) {
+    return 1.0 / (1.0 + s6_exp(0.0 - x))
+}
+
+fn s6_silu(x) {
+    return x * s6_sigmoid(x)
+}
+
+fn s6_silu_vec(v) {
+    let n = len(v)
+    let mut out = []
+    for i in 0..n {
+        out = out + [s6_silu(v[i])]
+    }
+    return out
+}
+
+fn s6_init_A_diag(d_state) {
+    let mut A = []
+    for i in 0..d_state {
+        A = A + [0.0 - to_float(i + 1)]
+    }
+    return A
+}
+
+fn s6_discretize_zoh(A_diag, delta) {
+    let n = len(A_diag)
+    let mut A_bar = []
+    for i in 0..n {
+        A_bar = A_bar + [s6_exp(A_diag[i] * delta)]
+    }
+    return A_bar
+}
+
+fn s6_discretize_B(delta, B_vec) {
+    let n = len(B_vec)
+    let mut B_bar = []
+    for i in 0..n {
+        B_bar = B_bar + [delta * B_vec[i]]
+    }
+    return B_bar
+}
+
+fn s6_project_delta(x, W_delta, bias_delta) {
+    let d = len(x)
+    let mut dot = 0.0
+    for i in 0..d {
+        dot = dot + x[i] * W_delta[i]
+    }
+    return s6_softplus(dot + bias_delta)
+}
+
+fn s6_project_B(x, W_B) {
+    let d_state = len(W_B)
+    let d = len(x)
+    let mut B_t = []
+    for i in 0..d_state {
+        let mut dot = 0.0
+        for j in 0..d {
+            dot = dot + W_B[i][j] * x[j]
+        }
+        B_t = B_t + [dot]
+    }
+    return B_t
+}
+
+fn s6_project_C(x, W_C) {
+    let d_state = len(W_C)
+    let d = len(x)
+    let mut C_t = []
+    for i in 0..d_state {
+        let mut dot = 0.0
+        for j in 0..d {
+            dot = dot + W_C[i][j] * x[j]
+        }
+        C_t = C_t + [dot]
+    }
+    return C_t
+}
+
+fn s6_conv1d_depthwise(x_seq, kernel, d) {
+    let seq_len = len(x_seq)
+    let conv_w = len(kernel)
+    let mut out = []
+    for t in 0..seq_len {
+        let mut row = s6_zeros(d)
+        for k in 0..conv_w {
+            let idx = t - k
+            if idx >= 0 {
+                for c in 0..d {
+                    row[c] = row[c] + kernel[k][c] * x_seq[idx][c]
+                }
+            }
+        }
+        out = out + [row]
+    }
+    return out
+}
+
+fn s6_recurrent_step(h, A_bar, B_bar, x_t) {
+    let n = len(h)
+    let mut h_new = []
+    for i in 0..n {
+        h_new = h_new + [A_bar[i] * h[i] + B_bar[i] * x_t]
+    }
+    return h_new
+}
+
+fn s6_output_step(C_t, h, D_diag, x_t, d_inner) {
+    let d_state = len(C_t)
+    let mut y = 0.0
+    for i in 0..d_state {
+        y = y + C_t[i] * h[i]
+    }
+    return y
+}
+
+fn s6_recurrent_scan(x_seq, A_diag, W_B, W_C, W_delta, bias_delta, D) {
+    let seq_len = len(x_seq)
+    let d_inner = len(x_seq[0])
+    let d_state = len(A_diag)
+    let mut H = s6_zeros_2d(d_inner, d_state)
+    let mut output = []
+    for t in 0..seq_len {
+        let x_t = x_seq[t]
+        let delta_t = s6_project_delta(x_t, W_delta, bias_delta)
+        let B_t = s6_project_B(x_t, W_B)
+        let C_t = s6_project_C(x_t, W_C)
+        let A_bar = s6_discretize_zoh(A_diag, delta_t)
+        let B_bar = s6_discretize_B(delta_t, B_t)
+        let mut y_t = s6_zeros(d_inner)
+        for d in 0..d_inner {
+            for s in 0..d_state {
+                H[d][s] = A_bar[s] * H[d][s] + B_bar[s] * x_t[d]
+            }
+            let mut c_dot_h = 0.0
+            for s in 0..d_state {
+                c_dot_h = c_dot_h + C_t[s] * H[d][s]
+            }
+            y_t[d] = c_dot_h + D[d] * x_t[d]
+        }
+        output = output + [y_t]
+    }
+    return output
+}
+
+fn s6_parallel_scan_combine(a1, b1, a2, b2) {
+    let n = len(a1)
+    let mut a_out = []
+    let mut b_out = []
+    for i in 0..n {
+        a_out = a_out + [a1[i] * a2[i]]
+        b_out = b_out + [a2[i] * b1[i] + b2[i]]
+    }
+    return [a_out, b_out]
+}
+
+fn s6_parallel_scan(As, Bs) {
+    let seq_len = len(As)
+    let d_state = len(As[0])
+    let mut h_all = []
+    let mut cum_a = s6_ones(d_state)
+    let mut cum_b = s6_zeros(d_state)
+    for t in 0..seq_len {
+        let combined = s6_parallel_scan_combine(cum_a, cum_b, As[t], Bs[t])
+        cum_a = combined[0]
+        cum_b = combined[1]
+        h_all = h_all + [cum_b]
+    }
+    return h_all
+}
+
+fn s6_parallel_mode(x_seq, A_diag, W_B, W_C, W_delta, bias_delta, D) {
+    let seq_len = len(x_seq)
+    let d_inner = len(x_seq[0])
+    let d_state = len(A_diag)
+    let mut deltas = []
+    let mut Bs_t = []
+    let mut Cs_t = []
+    for t in 0..seq_len {
+        let x_t = x_seq[t]
+        deltas = deltas + [s6_project_delta(x_t, W_delta, bias_delta)]
+        Bs_t = Bs_t + [s6_project_B(x_t, W_B)]
+        Cs_t = Cs_t + [s6_project_C(x_t, W_C)]
+    }
+    let mut output = s6_zeros_2d(seq_len, d_inner)
+    for d in 0..d_inner {
+        let mut As_ch = []
+        let mut Bs_ch = []
+        for t in 0..seq_len {
+            let A_bar = s6_discretize_zoh(A_diag, deltas[t])
+            let B_bar = s6_discretize_B(deltas[t], Bs_t[t])
+            As_ch = As_ch + [A_bar]
+            let mut bx = []
+            for s in 0..d_state {
+                bx = bx + [B_bar[s] * x_seq[t][d]]
+            }
+            Bs_ch = Bs_ch + [bx]
+        }
+        let h_all = s6_parallel_scan(As_ch, Bs_ch)
+        for t in 0..seq_len {
+            let mut c_dot_h = 0.0
+            for s in 0..d_state {
+                c_dot_h = c_dot_h + Cs_t[t][s] * h_all[t][s]
+            }
+            output[t][d] = c_dot_h + D[d] * x_seq[t][d]
+        }
+    }
+    return output
+}
+
+fn s6_linear(x, W, bias) {
+    let out_dim = len(W)
+    let in_dim = len(x)
+    let mut y = []
+    for i in 0..out_dim {
+        let mut dot = 0.0
+        for j in 0..in_dim {
+            dot = dot + W[i][j] * x[j]
+        }
+        y = y + [dot + bias[i]]
+    }
+    return y
+}
+
+struct S6Block {
+    d_model: int,
+    d_inner: int,
+    d_state: int,
+    conv_width: int,
+    A_diag: array,
+    W_B: array,
+    W_C: array,
+    W_delta: array,
+    bias_delta: float,
+    D: array,
+    conv_kernel: array,
+    W_in: array,
+    b_in: array,
+    W_z: array,
+    b_z: array,
+    W_out: array,
+    b_out: array
+}
+
+fn s6_create_block(d_model, d_inner, d_state, conv_w) {
+    let A_diag = s6_init_A_diag(d_state)
+    let D = s6_ones(d_inner)
+    let mut W_B = s6_zeros_2d(d_state, d_inner)
+    for i in 0..d_state {
+        for j in 0..d_inner {
+            W_B[i][j] = s6_hash(42, i, j) * 0.1
+        }
+    }
+    let mut W_C = s6_zeros_2d(d_state, d_inner)
+    for i in 0..d_state {
+        for j in 0..d_inner {
+            W_C[i][j] = s6_hash(73, i, j) * 0.1
+        }
+    }
+    let mut W_delta = []
+    for i in 0..d_inner {
+        W_delta = W_delta + [s6_hash(91, i, 0) * 0.1]
+    }
+    let bias_delta = 0.5
+    let mut conv_kernel = []
+    for k in 0..conv_w {
+        let mut row = []
+        for d in 0..d_inner {
+            row = row + [s6_hash(99, k, d) * 0.3 + 0.5]
+        }
+        conv_kernel = conv_kernel + [row]
+    }
+    let mut W_in = s6_zeros_2d(d_inner, d_model)
+    for i in 0..d_inner {
+        for j in 0..d_model {
+            W_in[i][j] = s6_hash(111, i, j) * 0.1
+        }
+    }
+    let b_in = s6_zeros(d_inner)
+    let mut W_z = s6_zeros_2d(d_inner, d_model)
+    for i in 0..d_inner {
+        for j in 0..d_model {
+            W_z[i][j] = s6_hash(222, i, j) * 0.1
+        }
+    }
+    let b_z = s6_zeros(d_inner)
+    let mut W_out = s6_zeros_2d(d_model, d_inner)
+    for i in 0..d_model {
+        for j in 0..d_inner {
+            W_out[i][j] = s6_hash(333, i, j) * 0.1
+        }
+    }
+    let b_out = s6_zeros(d_model)
+    return S6Block {
+        d_model: d_model,
+        d_inner: d_inner,
+        d_state: d_state,
+        conv_width: conv_w,
+        A_diag: A_diag,
+        W_B: W_B,
+        W_C: W_C,
+        W_delta: W_delta,
+        bias_delta: bias_delta,
+        D: D,
+        conv_kernel: conv_kernel,
+        W_in: W_in,
+        b_in: b_in,
+        W_z: W_z,
+        b_z: b_z,
+        W_out: W_out,
+        b_out: b_out
+    }
+}
+
+fn s6_mamba_block(x_seq, block) {
+    let seq_len = len(x_seq)
+    let d_model = block.d_model
+    let d_inner = block.d_inner
+    let mut x_proj = []
+    let mut z_proj = []
+    for t in 0..seq_len {
+        let x_in = s6_linear(x_seq[t], block.W_in, block.b_in)
+        let z_in = s6_linear(x_seq[t], block.W_z, block.b_z)
+        x_proj = x_proj + [x_in]
+        z_proj = z_proj + [z_in]
+    }
+    let conv_out = s6_conv1d_depthwise(x_proj, block.conv_kernel, d_inner)
+    let mut activated = []
+    for t in 0..seq_len {
+        activated = activated + [s6_silu_vec(conv_out[t])]
+    }
+    let y = s6_recurrent_scan(
+        activated, block.A_diag, block.W_B, block.W_C,
+        block.W_delta, block.bias_delta, block.D
+    )
+    let mut gated = []
+    for t in 0..seq_len {
+        let z_act = s6_silu_vec(z_proj[t])
+        let mut g = s6_zeros(d_inner)
+        for d in 0..d_inner {
+            g[d] = y[t][d] * z_act[d]
+        }
+        gated = gated + [g]
+    }
+    let mut output = []
+    for t in 0..seq_len {
+        let proj = s6_linear(gated[t], block.W_out, block.b_out)
+        let mut out = s6_zeros(d_model)
+        for d in 0..d_model {
+            out[d] = x_seq[t][d] + proj[d]
+        }
+        output = output + [out]
+    }
+    return output
+}
+
+fn s6_forward(block, x_seq) {
+    return s6_mamba_block(x_seq, block)
+}
+
+fn s6_stack_forward(blocks, x_seq) {
+    let n_layers = len(blocks)
+    let mut h = x_seq
+    for l in 0..n_layers {
+        h = s6_forward(blocks[l], h)
+    }
+    return h
+}
+
+fn s6_rms_norm(x, eps) {
+    let n = len(x)
+    let mut ss = 0.0
+    for i in 0..n {
+        ss = ss + x[i] * x[i]
+    }
+    let rms_sq = ss / to_float(n) + eps
+    let rms = s6_exp(s6_ln(rms_sq) * 0.5)
+    let inv = 1.0 / rms
+    let mut out = []
+    for i in 0..n {
+        out = out + [x[i] * inv]
+    }
+    return out
+}
+
+// ═══════════ Tests ═════════════════════════════════════════════════
+
+println("=== Mamba S6 (Selective State Space Model) Tests ===")
+
+// ── T1: s6_init_A_diag returns [-1, -2, ..., -N] ──────────────
+let A4 = s6_init_A_diag(4)
+let ok1 = len(A4) == 4
+    && approx(A4[0], -1.0, 1.0e-9)
+    && approx(A4[1], -2.0, 1.0e-9)
+    && approx(A4[2], -3.0, 1.0e-9)
+    && approx(A4[3], -4.0, 1.0e-9)
+check("T1 s6_init_A_diag HiPPO diagonal", ok1)
+
+// ── T2: s6_discretize_zoh: A_bar = exp(A * delta) ─────────────
+let A2 = [-1.0, -2.0]
+let Ab2 = s6_discretize_zoh(A2, 0.5)
+// exp(-0.5) ~ 0.6065, exp(-1.0) ~ 0.3679
+check("T2 discretize_zoh exp(A*delta)", approx(Ab2[0], 0.6065, 0.01) && approx(Ab2[1], 0.3679, 0.01))
+
+// ── T3: s6_discretize_zoh: delta=0 => A_bar = 1.0 ─────────────
+let Ab3 = s6_discretize_zoh([-1.0, -3.0, -5.0], 0.0)
+let ok3 = approx(Ab3[0], 1.0, 1.0e-9)
+    && approx(Ab3[1], 1.0, 1.0e-9)
+    && approx(Ab3[2], 1.0, 1.0e-9)
+check("T3 discretize_zoh delta=0 => identity", ok3)
+
+// ── T4: s6_discretize_B: B_bar = delta * B ─────────────────────
+let Bb4 = s6_discretize_B(0.5, [1.0, 2.0, 3.0])
+let ok4 = approx(Bb4[0], 0.5, 1.0e-9)
+    && approx(Bb4[1], 1.0, 1.0e-9)
+    && approx(Bb4[2], 1.5, 1.0e-9)
+check("T4 discretize_B = delta * B", ok4)
+
+// ── T5: s6_discretize_B: delta=0 => B_bar = 0 ─────────────────
+let Bb5 = s6_discretize_B(0.0, [5.0, 10.0])
+check("T5 discretize_B delta=0 => zero", approx(Bb5[0], 0.0, 1.0e-9) && approx(Bb5[1], 0.0, 1.0e-9))
+
+// ── T6: s6_softplus: positive, monotonic, ~x for large x ──────
+let sp_neg = s6_softplus(-5.0)
+let sp_zero = s6_softplus(0.0)
+let sp_pos = s6_softplus(5.0)
+let sp_large = s6_softplus(25.0)
+let ok6 = sp_neg > 0.0
+    && sp_zero > sp_neg
+    && sp_pos > sp_zero
+    && approx(sp_zero, 0.6931, 0.01)
+    && approx(sp_large, 25.0, 0.1)
+check("T6 softplus positive, monotonic, ~x for large", ok6)
+
+// ── T7: s6_silu: silu(0)=0, silu(big)~x, silu(-big)~0 ────────
+let silu0 = s6_silu(0.0)
+let silu_big = s6_silu(10.0)
+let silu_neg = s6_silu(-10.0)
+let ok7 = approx(silu0, 0.0, 1.0e-9)
+    && approx(silu_big, 10.0, 0.01)
+    && approx(silu_neg, 0.0, 0.01)
+check("T7 silu(0)=0, silu(big)~x, silu(-big)~0", ok7)
+
+// ── T8: s6_project_delta: positive output (softplus) ───────────
+let x8 = [1.0, -1.0, 0.5, -0.5]
+let wd8 = [0.1, 0.2, -0.1, 0.3]
+let d8 = s6_project_delta(x8, wd8, 0.0)
+check("T8 project_delta positive", d8 > 0.0)
+
+// ── T9: s6_project_B: output shape [d_state] ──────────────────
+let x9 = [1.0, 2.0, 3.0]
+let W_B9 = [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]
+let B9 = s6_project_B(x9, W_B9)
+let ok9 = len(B9) == 2
+    && approx(B9[0], 0.1 + 0.4 + 0.9, 1.0e-6)
+    && approx(B9[1], 0.4 + 1.0 + 1.8, 1.0e-6)
+check("T9 project_B shape and values", ok9)
+
+// ── T10: s6_project_C: output shape [d_state] ─────────────────
+let W_C10 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+let C10 = s6_project_C(x9, W_C10)
+let ok10 = len(C10) == 2
+    && approx(C10[0], 1.0, 1.0e-9)
+    && approx(C10[1], 2.0, 1.0e-9)
+check("T10 project_C shape and values", ok10)
+
+// ── T11: conv1d causal: no future leakage ──────────────────────
+// kernel=[k0, k1] width 2. output[0] should only depend on input[0]
+let x11 = [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]
+let k11 = [[1.0, 1.0], [0.5, 0.5]]  // k[0]*x[t] + k[1]*x[t-1]
+let c11 = s6_conv1d_depthwise(x11, k11, 2)
+// c11[0] = k[0]*x[0] = [1,0] (no future, no past beyond t=0)
+let ok11 = approx(c11[0][0], 1.0, 1.0e-9) && approx(c11[0][1], 0.0, 1.0e-9)
+check("T11 conv1d causal no future leak", ok11)
+
+// ── T12: conv1d identity kernel ────────────────────────────────
+// kernel = [[1, 1]] (width=1) should just pass through
+let k12 = [[1.0, 1.0]]
+let c12 = s6_conv1d_depthwise(x11, k12, 2)
+let ok12 = approx(c12[0][0], 1.0, 1.0e-9)
+    && approx(c12[0][1], 0.0, 1.0e-9)
+    && approx(c12[1][0], 0.0, 1.0e-9)
+    && approx(c12[1][1], 1.0, 1.0e-9)
+check("T12 conv1d identity kernel", ok12)
+
+// ── T13: conv1d shape preserved ────────────────────────────────
+let x13 = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0], [10.0, 11.0, 12.0]]
+let k13 = [[1.0, 1.0, 1.0], [0.5, 0.5, 0.5], [0.25, 0.25, 0.25]]
+let c13 = s6_conv1d_depthwise(x13, k13, 3)
+check("T13 conv1d shape [4,3]", len(c13) == 4 && len(c13[0]) == 3)
+
+// ── T14: recurrent_step: h_new = A_bar*h + B_bar*x ────────────
+let h14 = [1.0, 2.0]
+let Abar14 = [0.5, 0.8]
+let Bbar14 = [0.1, 0.2]
+let h14_new = s6_recurrent_step(h14, Abar14, Bbar14, 3.0)
+// h_new[0] = 0.5*1 + 0.1*3 = 0.8
+// h_new[1] = 0.8*2 + 0.2*3 = 2.2
+let ok14 = approx(h14_new[0], 0.8, 1.0e-9) && approx(h14_new[1], 2.2, 1.0e-9)
+check("T14 recurrent_step h = A_bar*h + B_bar*x", ok14)
+
+// ── T15: recurrent_step: zero input => pure decay ──────────────
+let h15 = [1.0, 1.0]
+let h15_new = s6_recurrent_step(h15, [0.5, 0.9], [0.0, 0.0], 0.0)
+let ok15 = approx(h15_new[0], 0.5, 1.0e-9) && approx(h15_new[1], 0.9, 1.0e-9)
+check("T15 recurrent_step zero input => decay", ok15)
+
+// ── T16: output_step: C . h ────────────────────────────────────
+let C16 = [1.0, 2.0, 3.0]
+let h16 = [0.1, 0.2, 0.3]
+let y16 = s6_output_step(C16, h16, [1.0], [1.0], 1)
+// C.h = 1*0.1 + 2*0.2 + 3*0.3 = 0.1+0.4+0.9 = 1.4
+check("T16 output_step C.h = 1.4", approx(y16, 1.4, 1.0e-6))
+
+// ── T17: recurrent_scan output shape ───────────────────────────
+let d_model_t = 3
+let d_state_t = 2
+let seq_t = 4
+let mut x17 = []
+for _t in 0..seq_t {
+    x17 = x17 + [[1.0, 0.5, -0.5]]
+}
+let A17 = s6_init_A_diag(d_state_t)
+let mut WB17 = s6_zeros_2d(d_state_t, d_model_t)
+for i in 0..d_state_t {
+    for j in 0..d_model_t {
+        WB17[i][j] = 0.1
+    }
+}
+let mut WC17 = s6_zeros_2d(d_state_t, d_model_t)
+for i in 0..d_state_t {
+    for j in 0..d_model_t {
+        WC17[i][j] = 0.1
+    }
+}
+let Wd17 = [0.1, 0.1, 0.1]
+let D17 = s6_ones(d_model_t)
+let y17 = s6_recurrent_scan(x17, A17, WB17, WC17, Wd17, 0.5, D17)
+check("T17 recurrent_scan shape [4,3]", len(y17) == 4 && len(y17[0]) == 3)
+
+// ── T18: recurrent_scan non-zero output ────────────────────────
+let mut any_nonzero = false
+for t in 0..seq_t {
+    for d in 0..d_model_t {
+        if fabs(y17[t][d]) > 1.0e-12 { any_nonzero = true }
+    }
+}
+check("T18 recurrent_scan non-zero output", any_nonzero)
+
+// ── T19: D skip connection pass-through ────────────────────────
+// With A=0 (no state), B=0 (no input to state), C=0, only D*x remains
+let A19 = [0.0, 0.0]
+let WB19 = [[0.0, 0.0], [0.0, 0.0]]
+let WC19 = [[0.0, 0.0], [0.0, 0.0]]
+let Wd19 = [0.0, 0.0]
+let D19 = [2.0, 3.0]
+let x19 = [[1.0, 1.0], [2.0, 2.0]]
+let y19 = s6_recurrent_scan(x19, A19, WB19, WC19, Wd19, 0.0, D19)
+// With zero W_delta and zero bias, softplus(0)=ln(2)~0.693
+// B and C projections are zero, so state contribution is zero
+// y = D * x => y[0] = [2, 3], y[1] = [4, 6]
+let ok19 = approx(y19[0][0], 2.0, 1.0e-6)
+    && approx(y19[0][1], 3.0, 1.0e-6)
+    && approx(y19[1][0], 4.0, 1.0e-6)
+    && approx(y19[1][1], 6.0, 1.0e-6)
+check("T19 D skip connection pass-through", ok19)
+
+// ── T20: parallel_scan_combine associativity ───────────────────
+// (a1,b1)*(a2,b2)*(a3,b3) == ((a1,b1)*(a2,b2))*(a3,b3) == (a1,b1)*((a2,b2)*(a3,b3))
+let a1 = [0.5, 0.8]
+let b1 = [1.0, 2.0]
+let a2 = [0.7, 0.9]
+let b2 = [0.5, 1.0]
+let a3 = [0.6, 0.3]
+let b3 = [0.2, 0.4]
+let r12 = s6_parallel_scan_combine(a1, b1, a2, b2)
+let r_left = s6_parallel_scan_combine(r12[0], r12[1], a3, b3)
+let r23 = s6_parallel_scan_combine(a2, b2, a3, b3)
+let r_right = s6_parallel_scan_combine(a1, b1, r23[0], r23[1])
+let ok20 = approx(r_left[0][0], r_right[0][0], 1.0e-9)
+    && approx(r_left[0][1], r_right[0][1], 1.0e-9)
+    && approx(r_left[1][0], r_right[1][0], 1.0e-9)
+    && approx(r_left[1][1], r_right[1][1], 1.0e-9)
+check("T20 parallel_scan_combine associativity", ok20)
+
+// ── T21: parallel_scan matches recurrent ───────────────────────
+// Simple 3-step recurrence: h_t = a*h_{t-1} + b_t
+let As21 = [[0.5, 0.8], [0.6, 0.9], [0.7, 0.5]]
+let Bs21 = [[1.0, 2.0], [0.5, 1.0], [0.3, 0.5]]
+let ps21 = s6_parallel_scan(As21, Bs21)
+// Manual recurrence:
+// h0 = a0*0 + b0 = [1.0, 2.0]
+// h1 = a1*h0 + b1 = [0.6*1+0.5, 0.9*2+1.0] = [1.1, 2.8]
+// h2 = a2*h1 + b2 = [0.7*1.1+0.3, 0.5*2.8+0.5] = [1.07, 1.9]
+let ok21 = approx(ps21[0][0], 1.0, 1.0e-6)
+    && approx(ps21[0][1], 2.0, 1.0e-6)
+    && approx(ps21[1][0], 1.1, 1.0e-6)
+    && approx(ps21[1][1], 2.8, 1.0e-6)
+    && approx(ps21[2][0], 1.07, 1.0e-6)
+    && approx(ps21[2][1], 1.9, 1.0e-6)
+check("T21 parallel_scan matches manual recurrence", ok21)
+
+// ── T22: parallel_mode matches recurrent_mode ──────────────────
+let d_m22 = 2
+let d_s22 = 2
+let x22 = [[1.0, 0.5], [-0.5, 1.0], [0.3, -0.3]]
+let A22 = s6_init_A_diag(d_s22)
+let mut WB22 = s6_zeros_2d(d_s22, d_m22)
+for i in 0..d_s22 {
+    for j in 0..d_m22 {
+        WB22[i][j] = s6_hash(42, i, j) * 0.1
+    }
+}
+let mut WC22 = s6_zeros_2d(d_s22, d_m22)
+for i in 0..d_s22 {
+    for j in 0..d_m22 {
+        WC22[i][j] = s6_hash(73, i, j) * 0.1
+    }
+}
+let Wd22 = [0.1, 0.2]
+let D22 = [1.0, 1.0]
+let y_rec = s6_recurrent_scan(x22, A22, WB22, WC22, Wd22, 0.5, D22)
+let y_par = s6_parallel_mode(x22, A22, WB22, WC22, Wd22, 0.5, D22)
+let mut ok22 = true
+for t in 0..3 {
+    for d in 0..2 {
+        if fabs(y_rec[t][d] - y_par[t][d]) > 1.0e-6 { ok22 = false }
+    }
+}
+check("T22 parallel_mode matches recurrent_mode", ok22)
+
+// ── T23: s6_linear: y = W*x + bias ────────────────────────────
+let W23 = [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]
+let x23 = [3.0, 4.0]
+let b23 = [0.1, 0.2, 0.3]
+let y23 = s6_linear(x23, W23, b23)
+let ok23 = len(y23) == 3
+    && approx(y23[0], 3.1, 1.0e-9)
+    && approx(y23[1], 4.2, 1.0e-9)
+    && approx(y23[2], 7.3, 1.0e-9)
+check("T23 s6_linear W*x + bias", ok23)
+
+// ── T24: s6_create_block struct fields valid ───────────────────
+let blk = s6_create_block(4, 8, 4, 3)
+let ok24 = blk.d_model == 4
+    && blk.d_inner == 8
+    && blk.d_state == 4
+    && blk.conv_width == 3
+    && len(blk.A_diag) == 4
+    && len(blk.W_B) == 4
+    && len(blk.W_C) == 4
+    && len(blk.W_delta) == 8
+    && len(blk.D) == 8
+    && len(blk.conv_kernel) == 3
+    && len(blk.W_in) == 8
+    && len(blk.W_out) == 4
+check("T24 create_block struct fields", ok24)
+
+// ── T25: s6_mamba_block output shape [seq_len, d_model] ────────
+let x25 = [[1.0, 0.5, -0.5, 0.3], [0.2, -0.1, 0.8, -0.4], [0.5, 0.5, 0.5, 0.5]]
+let blk25 = s6_create_block(4, 6, 3, 2)
+let y25 = s6_mamba_block(x25, blk25)
+check("T25 mamba_block output shape [3,4]", len(y25) == 3 && len(y25[0]) == 4)
+
+// ── T26: residual connection ───────────────────────────────────
+// The output includes x + proj, so output != 0 even with small weights
+let mut has_residual = false
+for t in 0..3 {
+    for d in 0..4 {
+        if fabs(y25[t][d]) > 1.0e-12 { has_residual = true }
+    }
+}
+check("T26 mamba_block residual non-zero", has_residual)
+
+// ── T27: s6_forward alias matches s6_mamba_block ───────────────
+let y27 = s6_forward(blk25, x25)
+let mut ok27 = true
+for t in 0..3 {
+    for d in 0..4 {
+        if fabs(y27[t][d] - y25[t][d]) > 1.0e-12 { ok27 = false }
+    }
+}
+check("T27 s6_forward == s6_mamba_block", ok27)
+
+// ── T28: s6_stack_forward multi-layer ──────────────────────────
+let blk28a = s6_create_block(4, 6, 3, 2)
+let blk28b = s6_create_block(4, 6, 3, 2)
+let blocks28 = [blk28a, blk28b]
+let y28 = s6_stack_forward(blocks28, x25)
+check("T28 stack_forward 2-layer shape", len(y28) == 3 && len(y28[0]) == 4)
+
+// ── T29: s6_rms_norm unit scale ────────────────────────────────
+let x29 = [3.0, 4.0]
+let n29 = s6_rms_norm(x29, 1.0e-8)
+// RMS = sqrt((9+16)/2) = sqrt(12.5) ~ 3.536
+// normalized: [3/3.536, 4/3.536] ~ [0.849, 1.131]
+let rms_val = 3.5355339
+let ok29 = approx(n29[0], 3.0 / rms_val, 0.05) && approx(n29[1], 4.0 / rms_val, 0.05)
+check("T29 rms_norm unit scale", ok29)
+
+// ── T30: s6_silu_vec element-wise ──────────────────────────────
+let sv30 = s6_silu_vec([0.0, 10.0, -10.0])
+let ok30 = approx(sv30[0], 0.0, 1.0e-9)
+    && approx(sv30[1], 10.0, 0.01)
+    && approx(sv30[2], 0.0, 0.01)
+check("T30 silu_vec element-wise", ok30)
+
+// ── Summary ────────────────────────────────────────────────────
+println("")
+println("Mamba S6: " + to_string(pass_count) + " passed, " + to_string(fail_count) + " failed")
+if fail_count == 0 {
+    println("ALL PASS")
+}

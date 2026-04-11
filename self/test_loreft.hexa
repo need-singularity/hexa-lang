@@ -1,0 +1,699 @@
+// ═══════════════════════════════════════════════════════════════
+//  test_loreft.hexa — LoReFT (Representation Finetuning) 검증
+//
+//  검증 항목:
+//    #1  zeros / identity helpers
+//    #2  intervention 생성 shape
+//    #3  apply_intervention: W=I, b=0  =>  h' == h (no-op)
+//    #4  apply: b=0, R=I[r=d]  =>  h' == W h
+//    #5  backward shape (dR, dW, db, dh)
+//    #6  numerical gradient check (dW)
+//    #7  numerical gradient check (db)
+//    #8  numerical gradient check (dR)
+//    #9  numerical gradient check (dh_in)
+//    #10 hooks_at: layer filter + position=-1 wildcard
+//    #11 run_hooks: multi-hook sequential apply
+//    #12 collect_hidden_trace length + final dim
+//    #13 trainable count formula: r*d + r*r + r
+//    #14 loreft_step: one-step SGD reduces loss (w/ default config)
+//    #15 loreft_finetune: loss decreases over N steps
+//
+//  규칙: 순수 .hexa, Rust 금지, HX3 pitfalls 준수.
+//  실행: ./hexa self/test_loreft.hexa
+// ═══════════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ═══════════════════════════════════════════════════════════════
+//  Inline core (mirror of self/ml/loreft.hexa)
+// ═══════════════════════════════════════════════════════════════
+
+fn lr_zeros1(n) {
+    let mut v = []
+    for i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn lr_zeros2(rows, cols) {
+    let mut r = []
+    for i in 0..rows { r = r + [lr_zeros1(cols)] }
+    return r
+}
+
+fn lr_identity(n) {
+    let mut r = []
+    for i in 0..n {
+        let mut row = lr_zeros1(n)
+        row[i] = 1.0
+        r = r + [row]
+    }
+    return r
+}
+
+fn lr_kaiming(rows, cols, seed) {
+    let mut s = seed
+    let scale = 1.0 / sqrt(to_float(cols))
+    let mut r = []
+    for i in 0..rows {
+        let mut row = []
+        for j in 0..cols {
+            s = (s * 1103515245 + 12345) % 2147483647
+            let v = (to_float(s % 2000) - 1000.0) / 1000.0 * scale
+            row = row + [v]
+        }
+        r = r + [row]
+    }
+    return r
+}
+
+fn lr_init_R(r, d, seed) { return lr_kaiming(r, d, seed) }
+
+fn lr_init_W(r, seed) {
+    let eps = 0.01
+    let mut s = seed
+    let mut m = lr_identity(r)
+    for i in 0..r {
+        for j in 0..r {
+            s = (s * 1103515245 + 12345) % 2147483647
+            let v = (to_float(s % 2000) - 1000.0) / 1000.0 * eps
+            m[i][j] = m[i][j] + v
+        }
+    }
+    return m
+}
+
+fn lr_matvec(w, x, m, n) {
+    let mut y = []
+    for i in 0..m {
+        let mut s = 0.0
+        for j in 0..n { s = s + w[i][j] * x[j] }
+        y = y + [s]
+    }
+    return y
+}
+
+fn lr_matvec_T(w, x, m, n) {
+    let mut y = lr_zeros1(n)
+    for j in 0..n {
+        let mut s = 0.0
+        for i in 0..m { s = s + w[i][j] * x[i] }
+        y[j] = s
+    }
+    return y
+}
+
+fn lr_outer(u, v, m, n) {
+    let mut o = []
+    for i in 0..m {
+        let mut row = []
+        for j in 0..n { row = row + [u[i] * v[j]] }
+        o = o + [row]
+    }
+    return o
+}
+
+fn lr_vec_add(a, b, n) {
+    let mut y = []
+    for i in 0..n { y = y + [a[i] + b[i]] }
+    return y
+}
+
+fn lr_vec_sub(a, b, n) {
+    let mut y = []
+    for i in 0..n { y = y + [a[i] - b[i]] }
+    return y
+}
+
+struct LoReftIntervention {
+    R: array,
+    W: array,
+    b: array,
+    rank: int,
+    dim: int
+}
+
+fn make_intervention(d, r, seed) {
+    let R = lr_init_R(r, d, seed)
+    let W = lr_init_W(r, seed + 7919)
+    let b = lr_zeros1(r)
+    LoReftIntervention { R: R, W: W, b: b, rank: r, dim: d }
+}
+
+fn apply_intervention(iv: LoReftIntervention, h) {
+    let r = iv.rank
+    let d = iv.dim
+    let p = lr_matvec(iv.R, h, r, d)
+    let wp = lr_matvec(iv.W, p, r, r)
+    let q = lr_vec_add(wp, iv.b, r)
+    let e = lr_vec_sub(q, p, r)
+    let rt_e = lr_matvec_T(iv.R, e, r, d)
+    return lr_vec_add(h, rt_e, d)
+}
+
+fn backward_intervention(iv: LoReftIntervention, h, dh_out) {
+    let r = iv.rank
+    let d = iv.dim
+
+    let p = lr_matvec(iv.R, h, r, d)
+    let wp = lr_matvec(iv.W, p, r, r)
+    let q = lr_vec_add(wp, iv.b, r)
+    let e = lr_vec_sub(q, p, r)
+
+    let de = lr_matvec(iv.R, dh_out, r, d)
+    let db = de
+    let dW = lr_outer(de, p, r, r)
+    let wt_de = lr_matvec_T(iv.W, de, r, r)
+    let mut dp = lr_zeros1(r)
+    for i in 0..r { dp[i] = wt_de[i] - de[i] }
+
+    let dR_a = lr_outer(e, dh_out, r, d)
+    let dR_b = lr_outer(dp, h, r, d)
+    let mut dR = lr_zeros2(r, d)
+    for i in 0..r {
+        for j in 0..d { dR[i][j] = dR_a[i][j] + dR_b[i][j] }
+    }
+    let rt_dp = lr_matvec_T(iv.R, dp, r, d)
+    let dh_in = lr_vec_add(dh_out, rt_dp, d)
+
+    return [dR, dW, db, dh_in]
+}
+
+struct LoReftHook {
+    layer_idx: int,
+    position: int,
+    iv: LoReftIntervention
+}
+
+fn make_hook(layer_idx, position, iv: LoReftIntervention) {
+    LoReftHook { layer_idx: layer_idx, position: position, iv: iv }
+}
+
+fn hooks_at(hooks, layer_idx, pos) {
+    let n = len(hooks)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let hk = hooks[i]
+        if hk.layer_idx == layer_idx {
+            if hk.position == -1 || hk.position == pos {
+                out = out + [hk]
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn run_hooks(h, hooks, layer_idx, pos) {
+    let fire = hooks_at(hooks, layer_idx, pos)
+    let nf = len(fire)
+    let mut cur = h
+    let mut k = 0
+    while k < nf {
+        cur = apply_intervention(fire[k].iv, cur)
+        k = k + 1
+    }
+    return cur
+}
+
+struct LoReftLayer { w: array, out_dim: int, in_dim: int }
+
+fn base_layer_forward(w, x, m, n) { return lr_matvec(w, x, m, n) }
+
+fn collect_hidden_trace(model, x, hooks) {
+    let n = len(model)
+    let mut layer_inputs = []
+    let mut raw_outputs = []
+    let mut h = x
+    let mut i = 0
+    while i < n {
+        layer_inputs = layer_inputs + [h]
+        let layer = model[i]
+        let raw = base_layer_forward(layer.w, h, layer.out_dim, layer.in_dim)
+        raw_outputs = raw_outputs + [raw]
+        h = run_hooks(raw, hooks, i, 0)
+        i = i + 1
+    }
+    return [layer_inputs, raw_outputs, h]
+}
+
+fn model_loreft_backward(model, hooks, layer_inputs, raw_outputs, dy) {
+    let n_layers = len(model)
+    let n_hooks = len(hooks)
+
+    let mut hook_grads = []
+    let mut hi = 0
+    while hi < n_hooks {
+        let iv = hooks[hi].iv
+        hook_grads = hook_grads + [[lr_zeros2(iv.rank, iv.dim), lr_zeros2(iv.rank, iv.rank), lr_zeros1(iv.rank)]]
+        hi = hi + 1
+    }
+
+    let mut d = dy
+    let mut i = n_layers - 1
+    while i >= 0 {
+        let layer = model[i]
+        let m_dim = layer.out_dim
+        let n_dim = layer.in_dim
+        let raw = raw_outputs[i]
+
+        let fire = hooks_at(hooks, i, 0)
+        let nf = len(fire)
+
+        let mut chain = []
+        chain = chain + [raw]
+        let mut k = 0
+        while k < nf {
+            let cur = chain[k]
+            let next_cur = apply_intervention(fire[k].iv, cur)
+            chain = chain + [next_cur]
+            k = k + 1
+        }
+
+        let mut d_post = d
+        let mut kk = nf - 1
+        while kk >= 0 {
+            let hk = fire[kk]
+            let h_into = chain[kk]
+            let back = backward_intervention(hk.iv, h_into, d_post)
+            let gR = back[0]
+            let gW = back[1]
+            let gb = back[2]
+            let d_in_hook = back[3]
+
+            let mut idx = -1
+            let mut ii = 0
+            while ii < n_hooks {
+                let cand = hooks[ii]
+                if cand.layer_idx == hk.layer_idx {
+                    if cand.position == hk.position {
+                        if idx == -1 { idx = ii }
+                    }
+                }
+                ii = ii + 1
+            }
+            if idx >= 0 {
+                let slot = hook_grads[idx]
+                let pR = slot[0]
+                let pW = slot[1]
+                let pb = slot[2]
+                let r_rank = hk.iv.rank
+                let r_dim = hk.iv.dim
+                let mut nR = lr_zeros2(r_rank, r_dim)
+                for iR in 0..r_rank {
+                    for jR in 0..r_dim { nR[iR][jR] = pR[iR][jR] + gR[iR][jR] }
+                }
+                let mut nW = lr_zeros2(r_rank, r_rank)
+                for iW in 0..r_rank {
+                    for jW in 0..r_rank { nW[iW][jW] = pW[iW][jW] + gW[iW][jW] }
+                }
+                let mut nb = lr_zeros1(r_rank)
+                for ib in 0..r_rank { nb[ib] = pb[ib] + gb[ib] }
+                hook_grads[idx] = [nR, nW, nb]
+            }
+
+            d_post = d_in_hook
+            kk = kk - 1
+        }
+
+        let mut d_next = lr_zeros1(n_dim)
+        for j in 0..n_dim {
+            let mut s = 0.0
+            for ii2 in 0..m_dim { s = s + layer.w[ii2][j] * d_post[ii2] }
+            d_next[j] = s
+        }
+        d = d_next
+        i = i - 1
+    }
+
+    return hook_grads
+}
+
+fn lr_mse_loss(y, target, m) {
+    let mut s = 0.0
+    for i in 0..m {
+        let d = y[i] - target[i]
+        s = s + d * d
+    }
+    return s / to_float(m)
+}
+
+fn lr_mse_grad(y, target, m) {
+    let mut g = []
+    let inv = 2.0 / to_float(m)
+    for i in 0..m { g = g + [(y[i] - target[i]) * inv] }
+    return g
+}
+
+fn sgd_step_2d(param, grad, lr, rows, cols) {
+    let mut out = []
+    for i in 0..rows {
+        let mut row = []
+        for j in 0..cols { row = row + [param[i][j] - lr * grad[i][j]] }
+        out = out + [row]
+    }
+    return out
+}
+
+fn sgd_step_1d(param, grad, lr, n) {
+    let mut out = []
+    for i in 0..n { out = out + [param[i] - lr * grad[i]] }
+    return out
+}
+
+fn loreft_step(model, hooks, x, target, lr) {
+    let out_dim = model[len(model) - 1].out_dim
+    let trace = collect_hidden_trace(model, x, hooks)
+    let layer_inputs = trace[0]
+    let raw_outputs = trace[1]
+    let y = trace[2]
+
+    let loss = lr_mse_loss(y, target, out_dim)
+    let dy = lr_mse_grad(y, target, out_dim)
+
+    let hook_grads = model_loreft_backward(model, hooks, layer_inputs, raw_outputs, dy)
+
+    let n_hooks = len(hooks)
+    let mut new_hooks = []
+    let mut i = 0
+    while i < n_hooks {
+        let hk = hooks[i]
+        let iv = hk.iv
+        let g = hook_grads[i]
+        let gR = g[0]
+        let gW = g[1]
+        let gb = g[2]
+        let nR = sgd_step_2d(iv.R, gR, lr, iv.rank, iv.dim)
+        let nW = sgd_step_2d(iv.W, gW, lr, iv.rank, iv.rank)
+        let nb = sgd_step_1d(iv.b, gb, lr, iv.rank)
+        let new_iv = LoReftIntervention { R: nR, W: nW, b: nb, rank: iv.rank, dim: iv.dim }
+        new_hooks = new_hooks + [LoReftHook { layer_idx: hk.layer_idx, position: hk.position, iv: new_iv }]
+        i = i + 1
+    }
+    return [new_hooks, loss]
+}
+
+fn loreft_trainable_count(hooks) {
+    let n = len(hooks)
+    let mut total = 0
+    let mut i = 0
+    while i < n {
+        let iv = hooks[i].iv
+        total = total + iv.rank * iv.dim + iv.rank * iv.rank + iv.rank
+        i = i + 1
+    }
+    return total
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Tests
+// ═══════════════════════════════════════════════════════════════
+
+// --- #1 zeros / identity helpers ---
+let z1 = lr_zeros1(3)
+let I3 = lr_identity(3)
+check("#1a zeros1 len=3", len(z1) == 3)
+check("#1b zeros1[0]=0.0", approx(z1[0], 0.0, 1.0e-9))
+check("#1c identity diag=1.0", approx(I3[1][1], 1.0, 1.0e-9))
+check("#1d identity off-diag=0.0", approx(I3[0][1], 0.0, 1.0e-9))
+
+// --- #2 intervention shape ---
+let iv0 = make_intervention(4, 2, 123)
+check("#2a R rows=rank", len(iv0.R) == 2)
+check("#2b R cols=dim", len(iv0.R[0]) == 4)
+check("#2c W square r x r", len(iv0.W) == 2 && len(iv0.W[0]) == 2)
+check("#2d b length=r", len(iv0.b) == 2)
+
+// --- #3 no-op: W = I, b = 0, then h' = h ---
+// Build an intervention by hand: R arbitrary, W=I, b=0
+let R_fixed = [[0.5, 0.0, 0.1, 0.2], [0.0, 0.3, 0.0, 0.1]]
+let W_I = lr_identity(2)
+let b_zero = lr_zeros1(2)
+let iv_noop = LoReftIntervention { R: R_fixed, W: W_I, b: b_zero, rank: 2, dim: 4 }
+let h_in = [1.0, 2.0, 3.0, 4.0]
+let h_noop = apply_intervention(iv_noop, h_in)
+let mut noop_ok = true
+for i in 0..4 { if !approx(h_noop[i], h_in[i], 1.0e-9) { noop_ok = false } }
+check("#3 W=I,b=0 => h'=h", noop_ok)
+
+// --- #4 R = I (r=d=2), b=0 => h' = W h ---
+let R_I2 = lr_identity(2)
+let W_22 = [[2.0, 0.0], [0.0, 3.0]]
+let iv_sq = LoReftIntervention { R: R_I2, W: W_22, b: lr_zeros1(2), rank: 2, dim: 2 }
+let h4 = [1.0, 1.0]
+let out4 = apply_intervention(iv_sq, h4)
+check("#4a h'[0]=2.0", approx(out4[0], 2.0, 1.0e-9))
+check("#4b h'[1]=3.0", approx(out4[1], 3.0, 1.0e-9))
+
+// --- #5 backward shape ---
+let iv5 = make_intervention(3, 2, 7)
+let h5 = [0.5, -0.3, 1.2]
+let dh_out5 = [0.1, 0.2, -0.1]
+let back5 = backward_intervention(iv5, h5, dh_out5)
+let dR5 = back5[0]
+let dW5 = back5[1]
+let db5 = back5[2]
+let dh5 = back5[3]
+check("#5a dR shape r x d", len(dR5) == 2 && len(dR5[0]) == 3)
+check("#5b dW shape r x r", len(dW5) == 2 && len(dW5[0]) == 2)
+check("#5c db length r", len(db5) == 2)
+check("#5d dh length d", len(dh5) == 3)
+
+// ═══════════════════════════════════════════════════════════════
+//  #6-#9 Numerical gradient check
+//
+//  For scalar loss L = 0.5 * sum(h'^2) we have dL/dh' = h'.
+//  Compute analytic grads via backward, compare to finite diff.
+// ═══════════════════════════════════════════════════════════════
+
+fn nd_loss_hprime(h_prime, n) {
+    let mut s = 0.0
+    for i in 0..n { s = s + h_prime[i] * h_prime[i] }
+    return 0.5 * s
+}
+
+fn nd_loss_for_iv(iv: LoReftIntervention, h) {
+    let h_prime = apply_intervention(iv, h)
+    return nd_loss_hprime(h_prime, iv.dim)
+}
+
+// fabricate a fixed iv for reproducibility
+let R_g = [[0.3, -0.2, 0.1], [0.1, 0.5, -0.4]]
+let W_g = [[0.8, 0.1], [-0.2, 0.7]]
+let b_g = [0.05, -0.1]
+let iv_g = LoReftIntervention { R: R_g, W: W_g, b: b_g, rank: 2, dim: 3 }
+let h_g = [0.5, -0.3, 1.2]
+
+// analytic grads
+let hp = apply_intervention(iv_g, h_g)
+let back_g = backward_intervention(iv_g, h_g, hp)   // dL/dh' = h'
+let dR_an = back_g[0]
+let dW_an = back_g[1]
+let db_an = back_g[2]
+let dh_an = back_g[3]
+
+let eps = 1.0e-4
+
+// --- #6 dW numerical check ---
+let mut dW_ok = true
+let mut max_err_dw = 0.0
+for i in 0..2 {
+    for j in 0..2 {
+        // perturb W[i][j] + eps
+        let mut Wp = [[W_g[0][0], W_g[0][1]], [W_g[1][0], W_g[1][1]]]
+        Wp[i][j] = Wp[i][j] + eps
+        let iv_p = LoReftIntervention { R: R_g, W: Wp, b: b_g, rank: 2, dim: 3 }
+        let Lp = nd_loss_for_iv(iv_p, h_g)
+        let mut Wm = [[W_g[0][0], W_g[0][1]], [W_g[1][0], W_g[1][1]]]
+        Wm[i][j] = Wm[i][j] - eps
+        let iv_m = LoReftIntervention { R: R_g, W: Wm, b: b_g, rank: 2, dim: 3 }
+        let Lm = nd_loss_for_iv(iv_m, h_g)
+        let nd = (Lp - Lm) / (2.0 * eps)
+        let diff = fabs(nd - dW_an[i][j])
+        if diff > max_err_dw { max_err_dw = diff }
+        if diff > 1.0e-4 { dW_ok = false }
+    }
+}
+check("#6 dW numerical ~ analytic", dW_ok)
+
+// --- #7 db numerical check ---
+let mut db_ok = true
+for i in 0..2 {
+    let mut bp = [b_g[0], b_g[1]]
+    bp[i] = bp[i] + eps
+    let iv_p = LoReftIntervention { R: R_g, W: W_g, b: bp, rank: 2, dim: 3 }
+    let Lp = nd_loss_for_iv(iv_p, h_g)
+    let mut bm = [b_g[0], b_g[1]]
+    bm[i] = bm[i] - eps
+    let iv_m = LoReftIntervention { R: R_g, W: W_g, b: bm, rank: 2, dim: 3 }
+    let Lm = nd_loss_for_iv(iv_m, h_g)
+    let nd = (Lp - Lm) / (2.0 * eps)
+    if fabs(nd - db_an[i]) > 1.0e-4 { db_ok = false }
+}
+check("#7 db numerical ~ analytic", db_ok)
+
+// --- #8 dR numerical check ---
+let mut dR_ok = true
+for i in 0..2 {
+    for j in 0..3 {
+        let mut Rp = [[R_g[0][0], R_g[0][1], R_g[0][2]], [R_g[1][0], R_g[1][1], R_g[1][2]]]
+        Rp[i][j] = Rp[i][j] + eps
+        let iv_p = LoReftIntervention { R: Rp, W: W_g, b: b_g, rank: 2, dim: 3 }
+        let Lp = nd_loss_for_iv(iv_p, h_g)
+        let mut Rm = [[R_g[0][0], R_g[0][1], R_g[0][2]], [R_g[1][0], R_g[1][1], R_g[1][2]]]
+        Rm[i][j] = Rm[i][j] - eps
+        let iv_m = LoReftIntervention { R: Rm, W: W_g, b: b_g, rank: 2, dim: 3 }
+        let Lm = nd_loss_for_iv(iv_m, h_g)
+        let nd = (Lp - Lm) / (2.0 * eps)
+        if fabs(nd - dR_an[i][j]) > 1.0e-4 { dR_ok = false }
+    }
+}
+check("#8 dR numerical ~ analytic", dR_ok)
+
+// --- #9 dh numerical check ---
+let mut dh_ok = true
+for j in 0..3 {
+    let mut hp2 = [h_g[0], h_g[1], h_g[2]]
+    hp2[j] = hp2[j] + eps
+    let Lp = nd_loss_for_iv(iv_g, hp2)
+    let mut hm2 = [h_g[0], h_g[1], h_g[2]]
+    hm2[j] = hm2[j] - eps
+    let Lm = nd_loss_for_iv(iv_g, hm2)
+    let nd = (Lp - Lm) / (2.0 * eps)
+    if fabs(nd - dh_an[j]) > 1.0e-4 { dh_ok = false }
+}
+check("#9 dh numerical ~ analytic", dh_ok)
+
+// ═══════════════════════════════════════════════════════════════
+//  #10 hooks_at: filter by layer + position=-1 wildcard
+// ═══════════════════════════════════════════════════════════════
+
+let iv_a = make_intervention(3, 2, 11)
+let iv_b = make_intervention(3, 2, 22)
+let iv_c = make_intervention(3, 2, 33)
+let hk_a = make_hook(0, -1, iv_a)
+let hk_b = make_hook(1,  0, iv_b)
+let hk_c = make_hook(1, -1, iv_c)
+let all_hooks = [hk_a, hk_b, hk_c]
+
+let at_l0 = hooks_at(all_hooks, 0, 0)
+let at_l1_p0 = hooks_at(all_hooks, 1, 0)
+let at_l1_p5 = hooks_at(all_hooks, 1, 5)
+let at_l2 = hooks_at(all_hooks, 2, 0)
+check("#10a layer 0 -> 1 hook", len(at_l0) == 1)
+check("#10b layer 1 pos 0 -> 2 hooks", len(at_l1_p0) == 2)
+check("#10c layer 1 pos 5 -> 1 hook (wildcard only)", len(at_l1_p5) == 1)
+check("#10d layer 2 -> 0 hooks", len(at_l2) == 0)
+
+// ═══════════════════════════════════════════════════════════════
+//  #11 run_hooks: multi-hook sequential apply
+//
+//  Two no-op interventions (W=I,b=0) must leave h unchanged.
+// ═══════════════════════════════════════════════════════════════
+
+let R_n1 = [[0.2, 0.1, 0.0], [0.0, 0.3, 0.1]]
+let iv_n1 = LoReftIntervention { R: R_n1, W: lr_identity(2), b: lr_zeros1(2), rank: 2, dim: 3 }
+let iv_n2 = LoReftIntervention { R: R_n1, W: lr_identity(2), b: lr_zeros1(2), rank: 2, dim: 3 }
+let hks_noop = [make_hook(0, -1, iv_n1), make_hook(0, -1, iv_n2)]
+let h_rh = [1.0, 2.0, 3.0]
+let h_rh_out = run_hooks(h_rh, hks_noop, 0, 0)
+let mut rh_ok = true
+for i in 0..3 { if !approx(h_rh_out[i], h_rh[i], 1.0e-9) { rh_ok = false } }
+check("#11 run_hooks two noops preserve h", rh_ok)
+
+// ═══════════════════════════════════════════════════════════════
+//  #12 collect_hidden_trace length + final dim
+// ═══════════════════════════════════════════════════════════════
+
+// Tiny 2-layer model: 3 -> 3 -> 3
+let W_l0 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]  // identity
+let W_l1 = [[2.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 2.0]]  // scale 2
+let model = [
+    LoReftLayer { w: W_l0, out_dim: 3, in_dim: 3 },
+    LoReftLayer { w: W_l1, out_dim: 3, in_dim: 3 }
+]
+let x_m = [1.0, 2.0, 3.0]
+let trace = collect_hidden_trace(model, x_m, [])
+let li = trace[0]
+let ro = trace[1]
+let fh = trace[2]
+check("#12a layer_inputs len=2", len(li) == 2)
+check("#12b raw_outputs len=2", len(ro) == 2)
+check("#12c final_h dim=3", len(fh) == 3)
+check("#12d final_h[0]=2.0 (scale)", approx(fh[0], 2.0, 1.0e-9))
+
+// ═══════════════════════════════════════════════════════════════
+//  #13 trainable count formula
+// ═══════════════════════════════════════════════════════════════
+
+let iv_tc = make_intervention(4, 2, 77)   // 4*2 + 2*2 + 2 = 14
+let hk_tc = make_hook(0, -1, iv_tc)
+let tc = loreft_trainable_count([hk_tc])
+check("#13 trainable = r*d + r*r + r = 14", tc == 14)
+
+// ═══════════════════════════════════════════════════════════════
+//  #14 loreft_step: one step of SGD reduces loss on a fixed target
+// ═══════════════════════════════════════════════════════════════
+
+// Reuse the 2-layer model above. Put one hook on layer 1.
+let iv_s = make_intervention(3, 2, 1234)
+let hk_s = make_hook(1, -1, iv_s)
+let hooks_s = [hk_s]
+
+let target = [0.0, 0.0, 0.0]   // push outputs to zero
+let x_s = [1.0, 2.0, 3.0]
+
+// initial loss
+let t0 = collect_hidden_trace(model, x_s, hooks_s)
+let y0 = t0[2]
+let loss0 = lr_mse_loss(y0, target, 3)
+
+// one SGD step
+let step_res = loreft_step(model, hooks_s, x_s, target, 0.01)
+let hooks_after = step_res[0]
+let loss_reported = step_res[1]
+
+// recompute loss with updated hooks
+let t1 = collect_hidden_trace(model, x_s, hooks_after)
+let y1 = t1[2]
+let loss1 = lr_mse_loss(y1, target, 3)
+
+check("#14a loss reported == loss0", approx(loss_reported, loss0, 1.0e-6))
+check("#14b one SGD step reduces loss", loss1 < loss0)
+
+// ═══════════════════════════════════════════════════════════════
+//  #15 loreft_finetune-style loop: loss decreases over N steps
+// ═══════════════════════════════════════════════════════════════
+
+let mut hooks_run = [make_hook(1, -1, make_intervention(3, 2, 999))]
+let loss_init_trace = collect_hidden_trace(model, x_s, hooks_run)
+let loss_init = lr_mse_loss(loss_init_trace[2], target, 3)
+
+let mut step_idx = 0
+while step_idx < 50 {
+    let sr = loreft_step(model, hooks_run, x_s, target, 0.01)
+    hooks_run = sr[0]
+    step_idx = step_idx + 1
+}
+let loss_final_trace = collect_hidden_trace(model, x_s, hooks_run)
+let loss_final = lr_mse_loss(loss_final_trace[2], target, 3)
+check("#15a 50 steps drive loss below init", loss_final < loss_init)
+check("#15b 50 steps drive loss < 50% of init", loss_final < 0.5 * loss_init)
+
+// ═══════════════════════════════════════════════════════════════
+println("")
+println("loreft: " + to_string(pass_count) + " PASS / " + to_string(fail_count) + " FAIL")

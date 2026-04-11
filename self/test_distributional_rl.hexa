@@ -1,0 +1,538 @@
+// ═══════════════════════════════════════════════════════════════════
+//  test_distributional_rl.hexa — Distributional RL (ML #91) verification
+//
+//  Tests:
+//     1. c51_make_atoms builds correct support (z_0 = V_min, z_{N-1} = V_max)
+//     2. c51_delta_z matches (V_max − V_min)/(N−1)
+//     3. c51_softmax sums to 1.0 and is monotonic in logits
+//     4. c51_expected_q returns Σ z_i p_i
+//     5. c51_action_values returns one Q per action
+//     6. c51_select_action returns argmax over Q
+//     7. c51_epsilon_greedy with eps=0 always picks greedy
+//     8. c51_epsilon_greedy with eps=1 covers full action space
+//     9. c51_project: terminal (done=1) places all mass on r
+//    10. c51_project: preserves total mass (sums to ≈ 1.0)
+//    11. c51_project: γ=0 → delta at clip(r) regardless of next_dist
+//    12. c51_cross_entropy non-negative; zero on matching dist
+//    13. c51_bellman_loss drops when dist approaches projected target
+//    14. qr_make_taus midpoints (2i+1)/(2N), sum = N/2
+//    15. qr_expected_q = mean of quantiles
+//    16. qr_select_action picks argmax of means
+//    17. qr_huber matches quadratic small / linear large
+//    18. qr_quantile_loss ≥ 0 and decreases when θ → target
+//    19. qr_make_targets applies γ·next_θ + r (done=0)
+//
+//  Run: ./hexa self/test_distributional_rl.hexa
+// ═══════════════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ═══════════ Inlined distributional_rl.hexa ════════════════════════
+
+fn drl_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn drl_max(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn drl_min(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn drl_clip(x, lo, hi) {
+    if x < lo { return lo }
+    if x > hi { return hi }
+    return x
+}
+
+fn drl_rand(state) {
+    let a = 1103515245
+    let c = 12345
+    let m = 2147483648
+    let nxt = (a * state + c) % m
+    let u = to_float(nxt) / 2147483648.0
+    return [nxt, u]
+}
+
+fn c51_make_atoms(n_atoms, v_min, v_max) {
+    let mut atoms = []
+    if n_atoms <= 1 {
+        atoms = atoms + [v_min]
+        return atoms
+    }
+    let dz = (v_max - v_min) / to_float(n_atoms - 1)
+    let mut i = 0
+    while i < n_atoms {
+        atoms = atoms + [v_min + to_float(i) * dz]
+        i = i + 1
+    }
+    return atoms
+}
+
+fn c51_delta_z(v_min, v_max, n_atoms) {
+    if n_atoms <= 1 { return 0.0 }
+    return (v_max - v_min) / to_float(n_atoms - 1)
+}
+
+fn c51_softmax(logits) {
+    let n = len(logits)
+    if n == 0 { return [] }
+    let mut maxv = logits[0]
+    let mut i = 1
+    while i < n {
+        if logits[i] > maxv { maxv = logits[i] }
+        i = i + 1
+    }
+    let mut out = []
+    let mut sum = 0.0
+    let mut j = 0
+    while j < n {
+        let e = exp(logits[j] - maxv)
+        out = out + [e]
+        sum = sum + e
+        j = j + 1
+    }
+    if sum <= 0.0 { sum = 1.0e-12 }
+    let mut k = 0
+    while k < n {
+        out[k] = out[k] / sum
+        k = k + 1
+    }
+    return out
+}
+
+fn c51_expected_q(dist, atoms) {
+    let n = len(dist)
+    let mut q = 0.0
+    let mut i = 0
+    while i < n {
+        q = q + atoms[i] * dist[i]
+        i = i + 1
+    }
+    return q
+}
+
+fn c51_action_values(all_dists, atoms) {
+    let na = len(all_dists)
+    let mut qvals = []
+    let mut a = 0
+    while a < na {
+        qvals = qvals + [c51_expected_q(all_dists[a], atoms)]
+        a = a + 1
+    }
+    return qvals
+}
+
+fn c51_select_action(all_dists, atoms) {
+    let na = len(all_dists)
+    if na == 0 { return 0 }
+    let qvals = c51_action_values(all_dists, atoms)
+    let mut best = 0
+    let mut best_q = qvals[0]
+    let mut a = 1
+    while a < na {
+        if qvals[a] > best_q {
+            best_q = qvals[a]
+            best = a
+        }
+        a = a + 1
+    }
+    return best
+}
+
+fn c51_epsilon_greedy(all_dists, atoms, eps, rng_state) {
+    let na = len(all_dists)
+    if na == 0 { return [0, rng_state] }
+    let r1 = drl_rand(rng_state)
+    let s1 = r1[0]
+    let u1 = r1[1]
+    if u1 < eps {
+        let r2 = drl_rand(s1)
+        let s2 = r2[0]
+        let u2 = r2[1]
+        let mut act = 0
+        let f = u2 * to_float(na)
+        let idx = floor(f)
+        act = idx
+        if act < 0 { act = 0 }
+        if act >= na { act = na - 1 }
+        return [act, s2]
+    }
+    let greedy = c51_select_action(all_dists, atoms)
+    return [greedy, s1]
+}
+
+fn c51_project(next_dist, reward, gamma, done, v_min, v_max, n_atoms) {
+    let dz = c51_delta_z(v_min, v_max, n_atoms)
+    let mut m = []
+    let mut z = 0
+    while z < n_atoms {
+        m = m + [0.0]
+        z = z + 1
+    }
+    if dz <= 0.0 { return m }
+    let not_done = 1.0 - done
+    let mut i = 0
+    while i < n_atoms {
+        let zi = v_min + to_float(i) * dz
+        let tzi_raw = reward + gamma * zi * not_done
+        let tzi = drl_clip(tzi_raw, v_min, v_max)
+        let b = (tzi - v_min) / dz
+        let lf = floor(b)
+        let mut l = lf
+        let mut u = lf + 1
+        if l < 0 { l = 0 }
+        if l >= n_atoms { l = n_atoms - 1 }
+        if u < 0 { u = 0 }
+        if u >= n_atoms { u = n_atoms - 1 }
+        let p = next_dist[i]
+        if l == u {
+            m[l] = m[l] + p
+        } else {
+            let bf = to_float(lf)
+            let frac_u = b - bf
+            let frac_l = 1.0 - frac_u
+            m[l] = m[l] + p * frac_l
+            m[u] = m[u] + p * frac_u
+        }
+        i = i + 1
+    }
+    return m
+}
+
+fn c51_cross_entropy(m, p) {
+    let n = len(m)
+    let mut loss = 0.0
+    let mut j = 0
+    while j < n {
+        let pj = p[j]
+        let safe = drl_max(pj, 1.0e-12)
+        loss = loss - m[j] * ln(safe)
+        j = j + 1
+    }
+    return loss
+}
+
+fn c51_bellman_loss(dist, next_dist, reward, gamma, done,
+                    v_min, v_max, n_atoms) {
+    let m = c51_project(next_dist, reward, gamma, done, v_min, v_max, n_atoms)
+    return c51_cross_entropy(m, dist)
+}
+
+fn qr_make_taus(n_quantiles) {
+    let mut taus = []
+    if n_quantiles <= 0 { return taus }
+    let denom = 2.0 * to_float(n_quantiles)
+    let mut i = 0
+    while i < n_quantiles {
+        let num = 2.0 * to_float(i) + 1.0
+        taus = taus + [num / denom]
+        i = i + 1
+    }
+    return taus
+}
+
+fn qr_expected_q(theta) {
+    let n = len(theta)
+    if n == 0 { return 0.0 }
+    let mut sum = 0.0
+    let mut i = 0
+    while i < n {
+        sum = sum + theta[i]
+        i = i + 1
+    }
+    return sum / to_float(n)
+}
+
+fn qr_action_values(all_theta) {
+    let na = len(all_theta)
+    let mut qvals = []
+    let mut a = 0
+    while a < na {
+        qvals = qvals + [qr_expected_q(all_theta[a])]
+        a = a + 1
+    }
+    return qvals
+}
+
+fn qr_select_action(all_theta) {
+    let na = len(all_theta)
+    if na == 0 { return 0 }
+    let qvals = qr_action_values(all_theta)
+    let mut best = 0
+    let mut best_q = qvals[0]
+    let mut a = 1
+    while a < na {
+        if qvals[a] > best_q {
+            best_q = qvals[a]
+            best = a
+        }
+        a = a + 1
+    }
+    return best
+}
+
+fn qr_huber(u, kappa) {
+    let au = drl_abs(u)
+    if au <= kappa {
+        return 0.5 * u * u
+    }
+    return kappa * (au - 0.5 * kappa)
+}
+
+fn qr_quantile_loss(theta, target, taus, kappa) {
+    let n = len(theta)
+    let m = len(target)
+    if n == 0 { return 0.0 }
+    if m == 0 { return 0.0 }
+    let mut total = 0.0
+    let mut i = 0
+    while i < n {
+        let ti = taus[i]
+        let mut inner = 0.0
+        let mut j = 0
+        while j < m {
+            let u = target[j] - theta[i]
+            let lh = qr_huber(u, kappa)
+            let mut w = ti
+            if u < 0.0 { w = ti - 1.0 }
+            let aw = drl_abs(w)
+            inner = inner + aw * lh
+            j = j + 1
+        }
+        total = total + inner / to_float(m)
+        i = i + 1
+    }
+    return total / to_float(n)
+}
+
+fn qr_make_targets(next_theta, reward, gamma, done) {
+    let n = len(next_theta)
+    let mut y = []
+    let not_done = 1.0 - done
+    let mut j = 0
+    while j < n {
+        y = y + [reward + gamma * next_theta[j] * not_done]
+        j = j + 1
+    }
+    return y
+}
+
+// ═══════════ Tests ═════════════════════════════════════════════════
+
+println("=== Distributional RL (C51 + QR-DQN) Tests ===")
+
+// ── T1: c51_make_atoms support [-10, 10] with N=21 ─────────────
+let atoms1 = c51_make_atoms(21, -10.0, 10.0)
+// Expect z_0 = -10, z_20 = 10, step = 1.0
+let ok1 = approx(atoms1[0], -10.0, 1.0e-9)
+    && approx(atoms1[20], 10.0, 1.0e-9)
+    && approx(atoms1[10], 0.0, 1.0e-9)
+    && len(atoms1) == 21
+check("T1 c51_make_atoms support [-10,10] N=21", ok1)
+
+// ── T2: c51_delta_z = 1.0 ──────────────────────────────────────
+let dz2 = c51_delta_z(-10.0, 10.0, 21)
+check("T2 c51_delta_z = 1.0", approx(dz2, 1.0, 1.0e-9))
+
+// ── T3: c51_softmax sums to 1 and monotone ─────────────────────
+let logits3 = [1.0, 2.0, 3.0, 4.0]
+let probs3 = c51_softmax(logits3)
+let mut s3 = 0.0
+let mut i3 = 0
+while i3 < 4 { s3 = s3 + probs3[i3]; i3 = i3 + 1 }
+let mono3 = probs3[0] < probs3[1]
+    && probs3[1] < probs3[2]
+    && probs3[2] < probs3[3]
+check("T3 softmax sums to 1 and monotone", approx(s3, 1.0, 1.0e-9) && mono3)
+
+// ── T4: expected Q = Σ z_i p_i ─────────────────────────────────
+// dist = [0.1, 0.2, 0.4, 0.2, 0.1], atoms = [0, 1, 2, 3, 4]
+// EQ = 0·0.1 + 1·0.2 + 2·0.4 + 3·0.2 + 4·0.1 = 0.2+0.8+0.6+0.4 = 2.0
+let atoms4 = [0.0, 1.0, 2.0, 3.0, 4.0]
+let dist4 = [0.1, 0.2, 0.4, 0.2, 0.1]
+let q4 = c51_expected_q(dist4, atoms4)
+check("T4 expected Q = 2.0", approx(q4, 2.0, 1.0e-9))
+
+// ── T5: action values one per action ───────────────────────────
+let all5 = [
+    [0.1, 0.2, 0.4, 0.2, 0.1],  // EQ = 2.0
+    [0.0, 0.0, 0.0, 0.0, 1.0],  // EQ = 4.0
+    [1.0, 0.0, 0.0, 0.0, 0.0]   // EQ = 0.0
+]
+let qvals5 = c51_action_values(all5, atoms4)
+let ok5 = len(qvals5) == 3
+    && approx(qvals5[0], 2.0, 1.0e-9)
+    && approx(qvals5[1], 4.0, 1.0e-9)
+    && approx(qvals5[2], 0.0, 1.0e-9)
+check("T5 c51_action_values per action", ok5)
+
+// ── T6: select_action = argmax (action 1) ──────────────────────
+let a6 = c51_select_action(all5, atoms4)
+check("T6 c51_select_action argmax = 1", a6 == 1)
+
+// ── T7: epsilon_greedy eps=0 always greedy ─────────────────────
+let mut ok7 = true
+let mut state7 = 42
+let mut trial7 = 0
+while trial7 < 50 {
+    let res = c51_epsilon_greedy(all5, atoms4, 0.0, state7)
+    state7 = res[1]
+    if res[0] != 1 { ok7 = false }
+    trial7 = trial7 + 1
+}
+check("T7 epsilon_greedy eps=0 always greedy", ok7)
+
+// ── T8: epsilon_greedy eps=1 explores all 3 actions ────────────
+let mut seen8 = [false, false, false]
+let mut state8 = 999
+let mut trial8 = 0
+while trial8 < 300 {
+    let res = c51_epsilon_greedy(all5, atoms4, 1.0, state8)
+    state8 = res[1]
+    let a = res[0]
+    if a >= 0 {
+        if a < 3 { seen8[a] = true }
+    }
+    trial8 = trial8 + 1
+}
+let ok8 = seen8[0] && seen8[1] && seen8[2]
+check("T8 epsilon_greedy eps=1 covers full action space", ok8)
+
+// ── T9: project terminal (done=1) places all mass at r ─────────
+// N=11, V_min=-5, V_max=5, Δz=1. r=2.0, done=1 → m has mass only at atom 7 (z=2)
+let next9 = [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.0]
+// uniform-ish (sums to 1) — but with done=1, the next_dist doesn't matter much
+// since Tz_i = clip(r + 0, ..., ...) = r. All probability lands at r.
+let m9 = c51_project(next9, 2.0, 0.99, 1.0, -5.0, 5.0, 11)
+// z=2 corresponds to index 7 (z_0=-5, z_7=2). All mass should be there.
+let mut total9 = 0.0
+let mut i9 = 0
+while i9 < 11 { total9 = total9 + m9[i9]; i9 = i9 + 1 }
+let ok9 = approx(m9[7], 1.0, 1.0e-9) && approx(total9, 1.0, 1.0e-9)
+check("T9 project done=1 mass at r=2", ok9)
+
+// ── T10: project preserves total mass ──────────────────────────
+// non-terminal with γ=0.9
+let next10 = [0.0, 0.0, 0.1, 0.2, 0.4, 0.2, 0.1, 0.0, 0.0, 0.0, 0.0]
+let m10 = c51_project(next10, 1.0, 0.9, 0.0, -5.0, 5.0, 11)
+let mut total10 = 0.0
+let mut i10 = 0
+while i10 < 11 { total10 = total10 + m10[i10]; i10 = i10 + 1 }
+check("T10 project preserves mass ≈ 1.0", approx(total10, 1.0, 1.0e-9))
+
+// ── T11: γ=0 → delta at clip(r) regardless of next_dist ────────
+// N=11, V=[-5,5], r=3, γ=0, done=0 → Tz_i=3 for all i → index 8
+let next11 = [0.5, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0]
+let m11 = c51_project(next11, 3.0, 0.0, 0.0, -5.0, 5.0, 11)
+let ok11 = approx(m11[8], 1.0, 1.0e-9)
+check("T11 γ=0 → delta at r", ok11)
+
+// ── T12: cross_entropy non-negative; minimal on match ──────────
+// If m == p, CE = Σ −p log p = entropy H(p) ≥ 0
+let p12 = [0.25, 0.25, 0.25, 0.25]
+let m12 = [0.25, 0.25, 0.25, 0.25]
+let ce12_match = c51_cross_entropy(m12, p12)
+// CE of mismatched distribution should be larger
+let p12b = [0.97, 0.01, 0.01, 0.01]
+let ce12_mismatch = c51_cross_entropy(m12, p12b)
+check("T12 CE ≥ 0 and match < mismatch",
+    ce12_match >= 0.0 && ce12_mismatch > ce12_match)
+
+// ── T13: bellman_loss drops as dist approaches projected target ─
+let next13 = [0.0, 0.0, 0.1, 0.2, 0.4, 0.2, 0.1, 0.0, 0.0, 0.0, 0.0]
+let m13 = c51_project(next13, 0.5, 0.9, 0.0, -5.0, 5.0, 11)
+// bad dist (uniform)
+let mut bad13 = []
+let mut ib13 = 0
+while ib13 < 11 { bad13 = bad13 + [1.0 / 11.0]; ib13 = ib13 + 1 }
+let loss_bad = c51_bellman_loss(bad13, next13, 0.5, 0.9, 0.0, -5.0, 5.0, 11)
+// good dist (exactly m)
+let loss_good = c51_bellman_loss(m13, next13, 0.5, 0.9, 0.0, -5.0, 5.0, 11)
+println("  loss_good=" + to_string(loss_good) + " loss_bad=" + to_string(loss_bad))
+check("T13 bellman_loss smaller when dist ≈ target", loss_good < loss_bad)
+
+// ── T14: qr_make_taus midpoints ────────────────────────────────
+let taus14 = qr_make_taus(4)
+// N=4 → [1/8, 3/8, 5/8, 7/8]
+let ok14 = approx(taus14[0], 0.125, 1.0e-9)
+    && approx(taus14[1], 0.375, 1.0e-9)
+    && approx(taus14[2], 0.625, 1.0e-9)
+    && approx(taus14[3], 0.875, 1.0e-9)
+// sum should be N/2 = 2.0
+let mut sumT = 0.0
+let mut it14 = 0
+while it14 < 4 { sumT = sumT + taus14[it14]; it14 = it14 + 1 }
+check("T14 qr_make_taus midpoints + sum = N/2",
+    ok14 && approx(sumT, 2.0, 1.0e-9))
+
+// ── T15: qr_expected_q = mean ──────────────────────────────────
+let theta15 = [1.0, 2.0, 3.0, 4.0, 5.0]
+let eq15 = qr_expected_q(theta15)
+check("T15 qr_expected_q = 3.0", approx(eq15, 3.0, 1.0e-9))
+
+// ── T16: qr_select_action argmax of means ──────────────────────
+let all16 = [
+    [1.0, 2.0, 3.0],   // mean 2.0
+    [0.5, 0.5, 0.5],   // mean 0.5
+    [4.0, 4.0, 4.0]    // mean 4.0
+]
+let a16 = qr_select_action(all16)
+check("T16 qr_select_action = 2", a16 == 2)
+
+// ── T17: qr_huber quadratic small / linear large ───────────────
+// κ=1, u=0.5 → 0.5·0.25 = 0.125
+// κ=1, u=3   → 1·(3 − 0.5) = 2.5
+let h_small = qr_huber(0.5, 1.0)
+let h_large = qr_huber(3.0, 1.0)
+check("T17 qr_huber quadratic/linear",
+    approx(h_small, 0.125, 1.0e-9) && approx(h_large, 2.5, 1.0e-9))
+
+// ── T18: quantile_loss ≥ 0 and decreases when θ → target ───────
+let taus18 = qr_make_taus(5)
+let target18 = [1.0, 2.0, 3.0, 4.0, 5.0]
+// bad: all zeros
+let theta18_bad = [0.0, 0.0, 0.0, 0.0, 0.0]
+// good: close to target
+let theta18_good = [1.0, 2.0, 3.0, 4.0, 5.0]
+let l_bad = qr_quantile_loss(theta18_bad, target18, taus18, 1.0)
+let l_good = qr_quantile_loss(theta18_good, target18, taus18, 1.0)
+println("  ql_good=" + to_string(l_good) + " ql_bad=" + to_string(l_bad))
+check("T18 quantile_loss ≥ 0 and good < bad",
+    l_bad >= 0.0 && l_good >= 0.0 && l_good < l_bad)
+
+// ── T19: qr_make_targets r + γ·next ────────────────────────────
+// r=1, γ=0.9, done=0, next=[1,2,3] → [1+0.9, 1+1.8, 1+2.7] = [1.9,2.8,3.7]
+let next19 = [1.0, 2.0, 3.0]
+let y19 = qr_make_targets(next19, 1.0, 0.9, 0.0)
+let ok19 = approx(y19[0], 1.9, 1.0e-9)
+    && approx(y19[1], 2.8, 1.0e-9)
+    && approx(y19[2], 3.7, 1.0e-9)
+check("T19 qr_make_targets r + γ·next", ok19)
+
+// ── Summary ─────────────────────────────────────────────────────
+println("")
+println("Distributional RL: " + to_string(pass_count) + " passed, "
+    + to_string(fail_count) + " failed")
+if fail_count == 0 {
+    println("ALL PASS")
+}

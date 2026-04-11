@@ -1,0 +1,243 @@
+// ═══════════════════════════════════════════════════════════════
+//  test_flash_decode.hexa — Flash Decoding correctness tests
+//
+//  Verifies:
+//    1. flash_decode_single matches naive_decode_single
+//    2. Different chunk_size values produce identical results
+//    3. Output shape is [d]
+//    4. Edge cases: Lk=1, chunk_size>Lk, chunk_size=1, Lk not divisible
+//    5. Batch variant matches element-wise single variant
+//    6. KV-cache variant integrates with self/ml/kv_cache.hexa
+//    7. Long KV stability (Lk=32) matches reference
+//
+//  Run: ./hexa self/test_flash_decode.hexa
+// ═══════════════════════════════════════════════════════════════
+
+import "ml/flash_decode.hexa"
+import "ml/kv_cache.hexa"
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn tfabs(x) {
+    if x < 0.0 {
+        return 0.0 - x
+    }
+    return x
+}
+
+fn vec_approx_eq(a, b, eps) {
+    if len(a) != len(b) {
+        return false
+    }
+    for i in 0..len(a) {
+        if tfabs(a[i] - b[i]) > eps {
+            return false
+        }
+    }
+    return true
+}
+
+fn mat_approx_eq(A, B, eps) {
+    if len(A) != len(B) {
+        return false
+    }
+    for i in 0..len(A) {
+        if !vec_approx_eq(A[i], B[i], eps) {
+            return false
+        }
+    }
+    return true
+}
+
+fn max_abs_diff_vec(a, b) {
+    let mut mx = 0.0
+    for i in 0..len(a) {
+        let d = tfabs(a[i] - b[i])
+        if d > mx {
+            mx = d
+        }
+    }
+    return mx
+}
+
+println("═══════════════════════════════════════════════════════")
+println("  Flash Decode Test Suite")
+println("═══════════════════════════════════════════════════════")
+
+// ── Build small fixtures ─────────────────────────────────────
+// q : [d=3],   K,V : [Lk=4, d=3]
+let q = [0.1, 0.5, 0.9]
+let K = [
+    [0.2, 0.1, 0.4],
+    [0.5, 0.3, 0.2],
+    [0.1, 0.6, 0.8],
+    [0.9, 0.7, 0.5]
+]
+let V = [
+    [1.0, 0.0, 0.5],
+    [0.0, 1.0, 0.5],
+    [0.5, 0.5, 1.0],
+    [1.0, 1.0, 0.0]
+]
+
+let eps = 1.0e-6
+let ref_out = naive_decode_single(q, K, V)
+
+// ── Test 1: flash_decode(cs=2) matches naive ─────────────────
+let fd2 = flash_decode_single(q, K, V, 2)
+check("flash_decode(cs=2) matches naive", vec_approx_eq(fd2, ref_out, eps))
+
+// ── Test 2: flash_decode(cs=1) matches naive ─────────────────
+let fd1 = flash_decode_single(q, K, V, 1)
+check("flash_decode(cs=1) matches naive", vec_approx_eq(fd1, ref_out, eps))
+
+// ── Test 3: flash_decode(cs=4) single chunk == full softmax ──
+let fd4 = flash_decode_single(q, K, V, 4)
+check("flash_decode(cs=4) matches naive", vec_approx_eq(fd4, ref_out, eps))
+
+// ── Test 4: chunk_size > Lk clamps to full softmax ───────────
+let fd8 = flash_decode_single(q, K, V, 8)
+check("flash_decode(cs=8>Lk) matches naive", vec_approx_eq(fd8, ref_out, eps))
+
+// ── Test 5: different chunk sizes agree with each other ──────
+check("cs=1 == cs=2", vec_approx_eq(fd1, fd2, eps))
+
+// ── Test 6: output shape is [d] ──────────────────────────────
+check("output length = d", len(fd2) == 3)
+
+// ── Test 7: max_abs_diff tiny (≤1e-6) ────────────────────────
+let diff = max_abs_diff_vec(fd2, ref_out)
+check("max_abs_diff < 1e-6", diff < 1.0e-6)
+
+// ── Test 8: Lk=1 edge case (single key/value) ────────────────
+let q1 = [0.5, 0.3]
+let K1 = [[0.2, 0.7]]
+let V1 = [[1.0, 2.0]]
+let out1 = flash_decode_single(q1, K1, V1, 1)
+// with Lk=1 softmax is degenerate: output == V[0]
+let lk1_ok = tfabs(out1[0] - 1.0) < eps
+let lk1_ok2 = tfabs(out1[1] - 2.0) < eps
+check("Lk=1 output = V[0]", lk1_ok && lk1_ok2)
+
+// ── Test 9: chunk_size not dividing Lk (Lk=5, cs=2) ──────────
+let q3 = [0.2, 0.4]
+let K3 = [
+    [0.1, 0.2],
+    [0.3, 0.4],
+    [0.5, 0.6],
+    [0.7, 0.8],
+    [0.9, 0.1]
+]
+let V3 = [
+    [1.0, 0.0],
+    [0.0, 1.0],
+    [0.5, 0.5],
+    [0.3, 0.7],
+    [0.8, 0.2]
+]
+let ref3 = naive_decode_single(q3, K3, V3)
+let fd3 = flash_decode_single(q3, K3, V3, 2)
+check("Lk=5 cs=2 (uneven) matches naive", vec_approx_eq(fd3, ref3, eps))
+
+// ── Test 10: batch variant matches per-row single variant ────
+let Qs = [
+    [0.1, 0.5, 0.9],
+    [0.8, 0.2, 0.4]
+]
+let batch_out = flash_decode_batch(Qs, K, V, 2)
+let ref_row0 = naive_decode_single(Qs[0], K, V)
+let ref_row1 = naive_decode_single(Qs[1], K, V)
+let b_ok0 = vec_approx_eq(batch_out[0], ref_row0, eps)
+let b_ok1 = vec_approx_eq(batch_out[1], ref_row1, eps)
+check("batch row0 matches naive", b_ok0)
+check("batch row1 matches naive", b_ok1)
+
+// ── Test 11: long KV (Lk=16) stability across chunk sizes ────
+// build a deterministic Lk=16 d=4 fixture
+let mut Klong = []
+let mut Vlong = []
+for i in 0..16 {
+    let fi = i * 1.0
+    let row_k = [
+        0.1 + fi * 0.013,
+        0.2 - fi * 0.007,
+        0.3 + fi * 0.011,
+        0.4 - fi * 0.005
+    ]
+    let row_v = [
+        0.5 + fi * 0.009,
+        0.6 - fi * 0.003,
+        0.7 + fi * 0.002,
+        0.8 - fi * 0.006
+    ]
+    Klong = Klong + [row_k]
+    Vlong = Vlong + [row_v]
+}
+let qlong = [0.3, 0.4, 0.5, 0.6]
+let ref_long = naive_decode_single(qlong, Klong, Vlong)
+let fd_cs4 = flash_decode_single(qlong, Klong, Vlong, 4)
+let fd_cs3 = flash_decode_single(qlong, Klong, Vlong, 3)
+let fd_csLk = flash_decode_single(qlong, Klong, Vlong, 16)
+check("Lk=16 cs=4 matches naive", vec_approx_eq(fd_cs4, ref_long, eps))
+check("Lk=16 cs=3 (uneven) matches naive", vec_approx_eq(fd_cs3, ref_long, eps))
+check("Lk=16 cs=16 matches naive", vec_approx_eq(fd_csLk, ref_long, eps))
+
+// ── Test 12: all chunk sizes agree on long KV ────────────────
+check("Lk=16 cs=4 == cs=3", vec_approx_eq(fd_cs4, fd_cs3, eps))
+
+// ── Test 13: numerical stability with large scores ───────────
+// craft q,K that yield scores around ±20 — naive softmax without
+// max-subtract would overflow; flash_decode must still match naive.
+let qbig = [5.0, 5.0]
+let Kbig = [
+    [4.0, 4.0],
+    [5.0, 5.0],
+    [0.0 - 3.0, 0.0 - 3.0],
+    [6.0, 6.0]
+]
+let Vbig = [
+    [1.0, 0.0],
+    [0.0, 1.0],
+    [0.5, 0.5],
+    [1.0, 1.0]
+]
+let ref_big = naive_decode_single(qbig, Kbig, Vbig)
+let fd_big = flash_decode_single(qbig, Kbig, Vbig, 2)
+check("large-score stability", vec_approx_eq(fd_big, ref_big, 1.0e-5))
+
+// ── Test 14: KV-cache integration ────────────────────────────
+// stage 2 layers / 2 heads / head_dim 2, fill positions 0..3
+let n_layers = 1
+let max_len  = 4
+let n_heads  = 1
+let head_dim = 3
+let mut cache = kv_cache_new(n_layers, max_len, n_heads, head_dim)
+// fill with the same K/V as the top-level fixture (Lk=4, d=3)
+for p in 0..4 {
+    let kp = [K[p][0], K[p][1], K[p][2]]
+    let vp = [V[p][0], V[p][1], V[p][2]]
+    cache = kv_cache_append(cache, 0, p, kp, vp)
+}
+let out_cache = flash_decode_kv_cache(q, cache, 0, 0, 2)
+check("kv_cache decode matches ref", vec_approx_eq(out_cache, ref_out, eps))
+
+// ═══════════════════════════════════════════════════════════════
+println("")
+println("pass=" + to_string(pass_count) + " fail=" + to_string(fail_count))
+if fail_count == 0 {
+    println("ALL PASS")
+} else {
+    println("FAILED")
+}
+println(to_string(pass_count) + " passed")

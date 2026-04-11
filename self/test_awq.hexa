@@ -1,0 +1,615 @@
+// ===================================================================
+//  test_awq.hexa -- AWQ (Activation-aware Weight Quantization) tests
+//
+//  Validates self/ml/awq.hexa: salience computation, salient channel
+//  detection, AWQ scale formula, int4 quantize/dequantize roundtrip,
+//  forward inference path, error statistics, and edge cases.
+//
+//  Run:  ./hexa self/test_awq.hexa
+// ===================================================================
+
+use "ml/awq"
+
+// -- Tally --------------------------------------------------------
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+// -- Math helpers (prefixed t_ to avoid collision with awq.hexa) --
+fn t_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn t_approx(a, b, eps) {
+    return t_abs(a - b) < eps
+}
+
+fn t_max_err(orig, deq) {
+    let n = len(orig)
+    let mut mx = 0.0
+    let mut i = 0
+    while i < n {
+        let e = t_abs(orig[i] - deq[i])
+        if e > mx { mx = e }
+        i = i + 1
+    }
+    return mx
+}
+
+fn t_mse(orig, deq) {
+    let n = len(orig)
+    let mut sum_sq = 0.0
+    let mut i = 0
+    while i < n {
+        let e = orig[i] - deq[i]
+        sum_sq = sum_sq + e * e
+        i = i + 1
+    }
+    return sum_sq / to_float(n)
+}
+
+// -- PRNG (LCG) -- deterministic test data ------------------------
+let mut _TRNG = 2026
+
+fn t_rand() {
+    _TRNG = (_TRNG * 1103515245 + 12345) % 2147483648
+    return _TRNG
+}
+
+fn t_rand_float() {
+    let r = t_rand()
+    return (to_float(r) / 1073741824.0) - 1.0
+}
+
+fn t_rand_vec(n) {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [t_rand_float()]
+        i = i + 1
+    }
+    return out
+}
+
+fn t_contains(arr, val) {
+    let mut i = 0
+    while i < len(arr) {
+        if arr[i] == val { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ===================================================================
+//  Test 1: Salience -- basic mean absolute activation
+// ===================================================================
+fn test_salience_basic() {
+    // 2 tokens x 3 channels
+    // Channel activations:
+    //   t0: [1.0, -2.0,  0.5]
+    //   t1: [3.0,  0.0, -0.5]
+    // salience[0] = (|1|+|3|)/2 = 2.0
+    // salience[1] = (|2|+|0|)/2 = 1.0
+    // salience[2] = (|0.5|+|0.5|)/2 = 0.5
+    let acts = [1.0, -2.0, 0.5, 3.0, 0.0, -0.5]
+    let sal = awq_compute_salience(acts, 3, 2)
+    check("salience.len", len(sal) == 3)
+    check("salience.ch0=2.0", t_approx(sal[0], 2.0, 0.001))
+    check("salience.ch1=1.0", t_approx(sal[1], 1.0, 0.001))
+    check("salience.ch2=0.5", t_approx(sal[2], 0.5, 0.001))
+}
+
+// ===================================================================
+//  Test 2: Salience -- single token
+// ===================================================================
+fn test_salience_single_token() {
+    let acts = [0.3, -0.7, 1.5, 0.0]
+    let sal = awq_compute_salience(acts, 4, 1)
+    check("salience_1tok.ch0", t_approx(sal[0], 0.3, 0.001))
+    check("salience_1tok.ch1", t_approx(sal[1], 0.7, 0.001))
+    check("salience_1tok.ch2", t_approx(sal[2], 1.5, 0.001))
+    check("salience_1tok.ch3", t_approx(sal[3], 0.0, 0.001))
+}
+
+// ===================================================================
+//  Test 3: Salient channel detection -- top ratio
+// ===================================================================
+fn test_find_salient() {
+    // 8 channels, one dominant
+    let sal = [0.1, 0.2, 0.05, 10.0, 0.3, 0.15, 5.0, 0.08]
+    // top 25% = 2 channels => indices 3 (10.0) and 6 (5.0)
+    let top = awq_find_salient(sal, 0.25)
+    check("find_salient.len=2", len(top) == 2)
+    check("find_salient.has_3", t_contains(top, 3))
+    check("find_salient.has_6", t_contains(top, 6))
+}
+
+// ===================================================================
+//  Test 4: Salient channel detection -- top 1 (very small ratio)
+// ===================================================================
+fn test_find_salient_top1() {
+    let sal = [0.5, 0.1, 0.9, 0.3]
+    // ratio small enough to pick just 1 channel (the max, idx 2)
+    let top = awq_find_salient(sal, 0.01)
+    check("find_salient_top1.len>=1", len(top) >= 1)
+    check("find_salient_top1.has_2", t_contains(top, 2))
+}
+
+// ===================================================================
+//  Test 5: AWQ scales -- alpha=0 produces uniform scales
+// ===================================================================
+fn test_scales_alpha0() {
+    let sal = [1.0, 5.0, 0.5, 3.0]
+    let sc = awq_compute_scales(sal, 0.0)
+    check("scales_a0.len", len(sc) == 4)
+    // alpha=0 -> all raw = 1.0 -> geomean=1 -> scales all 1.0
+    let mut all_one = true
+    let mut i = 0
+    while i < 4 {
+        if t_abs(sc[i] - 1.0) > 0.01 { all_one = false }
+        i = i + 1
+    }
+    check("scales_a0.all_~1.0", all_one)
+}
+
+// ===================================================================
+//  Test 6: AWQ scales -- alpha=0.5 protects salient channels
+// ===================================================================
+fn test_scales_alpha05() {
+    // Channel 0 has 10x the salience of channel 1
+    let sal = [10.0, 1.0, 1.0, 1.0]
+    let sc = awq_compute_scales(sal, 0.5)
+    check("scales_a05.len", len(sc) == 4)
+    // Salient channel (idx 0) should have scale > 1.0
+    check("scales_a05.ch0_>_1", sc[0] > 1.0)
+    // Non-salient channels should have scale < 1.0 (redistributed)
+    check("scales_a05.ch1_<_1", sc[1] < 1.0)
+}
+
+// ===================================================================
+//  Test 7: AWQ scales -- higher alpha gives larger scale ratio
+// ===================================================================
+fn test_scales_alpha_monotone() {
+    let sal = [8.0, 1.0, 1.0, 1.0]
+    let sc_low = awq_compute_scales(sal, 0.25)
+    let sc_high = awq_compute_scales(sal, 0.75)
+    // ratio = sc[0] / sc[1]; higher alpha should give bigger ratio
+    let ratio_low = sc_low[0] / sc_low[1]
+    let ratio_high = sc_high[0] / sc_high[1]
+    check("scales_alpha_mono.high>low", ratio_high > ratio_low)
+}
+
+// ===================================================================
+//  Test 8: Quantize/dequantize roundtrip -- shape
+// ===================================================================
+fn test_quant_shape() {
+    let n_out = 3
+    let n_in = 4
+    let W = [0.5, -0.3, 0.7, -0.1,
+             1.0, -1.0, 0.0, 0.5,
+             0.2, 0.8, -0.6, 0.4]
+    let sc = awq_compute_scales([1.0, 1.0, 1.0, 1.0], 0.0)
+    let qt = awq_quantize(W, n_out, n_in, sc, 0.0)
+    check("quant.n_out", qt.n_out == 3)
+    check("quant.n_in", qt.n_in == 4)
+    check("quant.qdata.len", len(qt.qdata) == 12)
+    check("quant.d_scales.len", len(qt.d_scales) == 3)
+    check("quant.s_channels.len", len(qt.s_channels) == 4)
+}
+
+// ===================================================================
+//  Test 9: int4 codes in [-8, 7]
+// ===================================================================
+fn test_int4_range() {
+    _TRNG = 100
+    let W = t_rand_vec(4 * 8)
+    let sc = awq_compute_scales([1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0], 0.5)
+    let qt = awq_quantize(W, 4, 8, sc, 0.5)
+    let mut ok = true
+    let mut i = 0
+    while i < len(qt.qdata) {
+        if qt.qdata[i] < -8 { ok = false }
+        if qt.qdata[i] > 7 { ok = false }
+        i = i + 1
+    }
+    check("int4.range_[-8,7]", ok)
+}
+
+// ===================================================================
+//  Test 10: Dequantize shape matches original
+// ===================================================================
+fn test_dequant_shape() {
+    let W = [1.0, -1.0, 0.5, -0.5, 0.0, 0.3, -0.3, 0.9]
+    let sc = awq_compute_scales([1.0, 1.0, 1.0, 1.0], 0.0)
+    let qt = awq_quantize(W, 2, 4, sc, 0.0)
+    let deq = awq_dequantize(qt)
+    check("dequant.len", len(deq) == 8)
+}
+
+// ===================================================================
+//  Test 11: Roundtrip error is bounded (uniform scales)
+// ===================================================================
+fn test_roundtrip_error_uniform() {
+    let W = [0.5, -0.3, 0.7, -0.1,
+             1.0, -1.0, 0.0, 0.5]
+    let sc = awq_compute_scales([1.0, 1.0, 1.0, 1.0], 0.0)
+    let qt = awq_quantize(W, 2, 4, sc, 0.0)
+    let deq = awq_dequantize(qt)
+    let err = t_max_err(W, deq)
+    // int4 symmetric with range /7 -> max error bounded by scale/2 ~ absmax/14
+    check("roundtrip_uniform.max_err<0.2", err < 0.2)
+}
+
+// ===================================================================
+//  Test 12: AWQ scales reduce salient channel error vs uniform
+// ===================================================================
+fn test_awq_vs_uniform_error() {
+    _TRNG = 42
+    let n_out = 4
+    let n_in = 8
+    let W = t_rand_vec(n_out * n_in)
+    // Create salience with one dominant channel (idx 0)
+    let sal = [10.0, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+    // Uniform quantization (alpha=0)
+    let sc0 = awq_compute_scales(sal, 0.0)
+    let qt0 = awq_quantize(W, n_out, n_in, sc0, 0.0)
+    let err0 = awq_quant_error(W, qt0, [0])
+    // AWQ quantization (alpha=0.5)
+    let sc5 = awq_compute_scales(sal, 0.5)
+    let qt5 = awq_quantize(W, n_out, n_in, sc5, 0.5)
+    let err5 = awq_quant_error(W, qt5, [0])
+    // AWQ should have lower salient MSE (or at worst comparable)
+    // The total MSE might increase slightly but salient channels improve
+    check("awq_vs_unif.salient_mse_improved", err5.salient_mse <= err0.salient_mse + 0.01)
+}
+
+// ===================================================================
+//  Test 13: Forward output shape
+// ===================================================================
+fn test_forward_shape() {
+    let W = [1.0, 0.0, 0.5, -0.5,
+             0.0, 1.0, -0.5, 0.5,
+             0.5, 0.5, 1.0, 0.0]
+    let sc = awq_compute_scales([1.0, 1.0, 1.0, 1.0], 0.5)
+    let qt = awq_quantize(W, 3, 4, sc, 0.5)
+    let x = [1.0, 2.0, -1.0, 0.5]
+    let y = awq_forward(qt, x)
+    check("forward.shape", len(y) == 3)
+}
+
+// ===================================================================
+//  Test 14: Forward matches dequantize * x
+// ===================================================================
+fn test_forward_matches_dequant() {
+    _TRNG = 777
+    let n_out = 3
+    let n_in = 6
+    let W = t_rand_vec(n_out * n_in)
+    let sal = [2.0, 0.5, 1.0, 0.3, 3.0, 0.8]
+    let sc = awq_compute_scales(sal, 0.5)
+    let qt = awq_quantize(W, n_out, n_in, sc, 0.5)
+    let x = [1.0, -0.5, 0.25, 0.0, 2.0, -1.0]
+    let y_fwd = awq_forward(qt, x)
+    // Reference: dequantize then matmul
+    let deq = awq_dequantize(qt)
+    let mut y_ref = []
+    let mut r = 0
+    while r < n_out {
+        let mut acc = 0.0
+        let mut k = 0
+        while k < n_in {
+            acc = acc + deq[r * n_in + k] * x[k]
+            k = k + 1
+        }
+        y_ref = y_ref + [acc]
+        r = r + 1
+    }
+    let mut ok = true
+    let mut i = 0
+    while i < n_out {
+        if t_abs(y_fwd[i] - y_ref[i]) > 0.01 { ok = false }
+        i = i + 1
+    }
+    check("forward.matches_dequant", ok)
+}
+
+// ===================================================================
+//  Test 15: Reference matmul correctness
+// ===================================================================
+fn test_reference_matmul() {
+    // 2x3 @ 3 -> 2
+    // W = [[1,2,3],[4,5,6]], x = [1,0,-1]
+    // y[0] = 1-3 = -2, y[1] = 4-6 = -2
+    let W = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    let x = [1.0, 0.0, -1.0]
+    let y = awq_matmul_reference(W, 2, 3, x)
+    check("ref_matmul.len", len(y) == 2)
+    check("ref_matmul.y0", t_approx(y[0], -2.0, 0.001))
+    check("ref_matmul.y1", t_approx(y[1], -2.0, 0.001))
+}
+
+// ===================================================================
+//  Test 16: Zero weights -- roundtrip gives zeros
+// ===================================================================
+fn test_zero_weights() {
+    let W = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    let sc = awq_compute_scales([1.0, 1.0, 1.0], 0.5)
+    let qt = awq_quantize(W, 2, 3, sc, 0.5)
+    let deq = awq_dequantize(qt)
+    let mut all_zero = true
+    let mut i = 0
+    while i < 6 {
+        if t_abs(deq[i]) > 0.001 { all_zero = false }
+        i = i + 1
+    }
+    check("zero_weights.roundtrip", all_zero)
+}
+
+// ===================================================================
+//  Test 17: Zero weights -- forward gives zeros
+// ===================================================================
+fn test_zero_weights_forward() {
+    let W = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    let sc = awq_compute_scales([1.0, 1.0, 1.0], 0.5)
+    let qt = awq_quantize(W, 2, 3, sc, 0.5)
+    let y = awq_forward(qt, [5.0, 3.0, -2.0])
+    let mut ok = true
+    let mut i = 0
+    while i < 2 {
+        if t_abs(y[i]) > 0.001 { ok = false }
+        i = i + 1
+    }
+    check("zero_weights.forward", ok)
+}
+
+// ===================================================================
+//  Test 18: Uniform activations -- all salience equal
+// ===================================================================
+fn test_uniform_activations() {
+    // 3 tokens x 4 channels, all activations = 1.0
+    let mut acts = []
+    let mut i = 0
+    while i < 12 {
+        acts = acts + [1.0]
+        i = i + 1
+    }
+    let sal = awq_compute_salience(acts, 4, 3)
+    // All channels should have equal salience = 1.0
+    let mut all_eq = true
+    i = 0
+    while i < 4 {
+        if t_abs(sal[i] - 1.0) > 0.001 { all_eq = false }
+        i = i + 1
+    }
+    check("uniform_acts.equal_salience", all_eq)
+    // Scales should all be ~1.0 regardless of alpha
+    let sc = awq_compute_scales(sal, 0.5)
+    let mut all_one = true
+    i = 0
+    while i < 4 {
+        if t_abs(sc[i] - 1.0) > 0.01 { all_one = false }
+        i = i + 1
+    }
+    check("uniform_acts.scales_~1", all_one)
+}
+
+// ===================================================================
+//  Test 19: Single channel (n_in=1)
+// ===================================================================
+fn test_single_channel() {
+    let W = [0.8, -0.6]
+    let sal = [3.0]
+    let sc = awq_compute_scales(sal, 0.5)
+    check("single_ch.scale_len", len(sc) == 1)
+    // Single channel -> geomean = value -> scale = 1.0
+    check("single_ch.scale_~1", t_approx(sc[0], 1.0, 0.01))
+    let qt = awq_quantize(W, 2, 1, sc, 0.5)
+    let deq = awq_dequantize(qt)
+    check("single_ch.roundtrip_err<0.2", t_max_err(W, deq) < 0.2)
+}
+
+// ===================================================================
+//  Test 20: Error stats -- MSE and max_err
+// ===================================================================
+fn test_error_stats() {
+    _TRNG = 200
+    let n_out = 4
+    let n_in = 8
+    let W = t_rand_vec(n_out * n_in)
+    let sal = awq_compute_salience(t_rand_vec(3 * n_in), n_in, 3)
+    let sc = awq_compute_scales(sal, 0.5)
+    let qt = awq_quantize(W, n_out, n_in, sc, 0.5)
+    let stats = awq_quant_error(W, qt, [])
+    check("error_stats.mse>=0", stats.mse >= 0.0)
+    check("error_stats.max_err>=0", stats.max_err >= 0.0)
+    check("error_stats.mse<max_err^2+eps", stats.mse <= stats.max_err * stats.max_err + 0.001)
+}
+
+// ===================================================================
+//  Test 21: Error stats -- salient subset
+// ===================================================================
+fn test_error_stats_salient() {
+    _TRNG = 300
+    let n_out = 4
+    let n_in = 8
+    let W = t_rand_vec(n_out * n_in)
+    let sc = awq_compute_scales([5.0, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5], 0.5)
+    let qt = awq_quantize(W, n_out, n_in, sc, 0.5)
+    let stats = awq_quant_error(W, qt, [0])
+    check("salient_err.count", stats.salient_count == n_out)
+    check("salient_err.mse>=0", stats.salient_mse >= 0.0)
+    check("salient_err.max>=0", stats.salient_max_err >= 0.0)
+}
+
+// ===================================================================
+//  Test 22: Calibration flow -- salience -> scales -> quant -> forward
+// ===================================================================
+fn test_calibration_flow() {
+    _TRNG = 500
+    let n_out = 4
+    let n_in = 8
+    let W = t_rand_vec(n_out * n_in)
+    // 5 calibration tokens
+    let calib = t_rand_vec(5 * n_in)
+    let sal = awq_compute_salience(calib, n_in, 5)
+    check("calib_flow.sal_len", len(sal) == n_in)
+    let salient_idx = awq_find_salient(sal, 0.25)
+    check("calib_flow.salient_count", len(salient_idx) == 2)
+    let sc = awq_compute_scales(sal, 0.5)
+    let qt = awq_quantize(W, n_out, n_in, sc, 0.5)
+    let x = t_rand_vec(n_in)
+    let y_awq = awq_forward(qt, x)
+    let y_ref = awq_matmul_reference(W, n_out, n_in, x)
+    // Forward error should be moderate for int4
+    let mut max_fwd_err = 0.0
+    let mut i = 0
+    while i < n_out {
+        let e = t_abs(y_awq[i] - y_ref[i])
+        if e > max_fwd_err { max_fwd_err = e }
+        i = i + 1
+    }
+    check("calib_flow.fwd_err<1.0", max_fwd_err < 1.0)
+}
+
+// ===================================================================
+//  Test 23: d_scales are positive for nonzero rows
+// ===================================================================
+fn test_d_scales_positive() {
+    _TRNG = 600
+    let W = t_rand_vec(3 * 6)
+    let sc = awq_compute_scales([1.0, 2.0, 0.5, 1.5, 0.8, 3.0], 0.5)
+    let qt = awq_quantize(W, 3, 6, sc, 0.5)
+    let mut all_pos = true
+    let mut i = 0
+    while i < 3 {
+        if qt.d_scales[i] <= 0.0 { all_pos = false }
+        i = i + 1
+    }
+    check("d_scales.positive", all_pos)
+}
+
+// ===================================================================
+//  Test 24: Alpha stored in AWQTensor
+// ===================================================================
+fn test_alpha_stored() {
+    let W = [1.0, -1.0, 0.5, -0.5]
+    let sc = awq_compute_scales([1.0, 1.0], 0.75)
+    let qt = awq_quantize(W, 2, 2, sc, 0.75)
+    check("alpha_stored", t_approx(qt.alpha, 0.75, 0.001))
+}
+
+// ===================================================================
+//  Test 25: Large random matrix -- MSE bounded for int4
+// ===================================================================
+fn test_large_matrix_mse() {
+    _TRNG = 999
+    let n_out = 8
+    let n_in = 16
+    let W = t_rand_vec(n_out * n_in)
+    let calib = t_rand_vec(10 * n_in)
+    let sal = awq_compute_salience(calib, n_in, 10)
+    let sc = awq_compute_scales(sal, 0.5)
+    let qt = awq_quantize(W, n_out, n_in, sc, 0.5)
+    let stats = awq_quant_error(W, qt, [])
+    // int4 on random [-1,1] data: MSE should be well under 0.1
+    check("large_mat.mse<0.1", stats.mse < 0.1)
+    check("large_mat.max_err<1.0", stats.max_err < 1.0)
+}
+
+// ===================================================================
+//  Test 26: Constant weights quantize cleanly
+// ===================================================================
+fn test_constant_weights() {
+    let mut W = []
+    let mut i = 0
+    while i < 12 {
+        W = W + [0.42]
+        i = i + 1
+    }
+    let sc = awq_compute_scales([1.0, 1.0, 1.0, 1.0], 0.0)
+    let qt = awq_quantize(W, 3, 4, sc, 0.0)
+    let deq = awq_dequantize(qt)
+    let err = t_max_err(W, deq)
+    check("const_weights.err<0.15", err < 0.15)
+}
+
+// ===================================================================
+//  Test 27: Salience with negative activations
+// ===================================================================
+fn test_salience_negative() {
+    // All negative activations -- salience is mean |x|
+    let acts = [-2.0, -4.0, -1.0, -3.0, -6.0, -0.5]
+    let sal = awq_compute_salience(acts, 3, 2)
+    // ch0: (2+3)/2=2.5, ch1: (4+6)/2=5.0, ch2: (1+0.5)/2=0.75
+    check("sal_neg.ch0", t_approx(sal[0], 2.5, 0.001))
+    check("sal_neg.ch1", t_approx(sal[1], 5.0, 0.001))
+    check("sal_neg.ch2", t_approx(sal[2], 0.75, 0.001))
+}
+
+// ===================================================================
+//  Test 28: awq_summary returns error stats
+// ===================================================================
+fn test_summary() {
+    let W = [1.0, -0.5, 0.3, -0.8]
+    let sc = awq_compute_scales([1.0, 1.0], 0.5)
+    let qt = awq_quantize(W, 2, 2, sc, 0.5)
+    let err = awq_summary("test_2x2", W, qt)
+    check("summary.mse>=0", err.mse >= 0.0)
+    check("summary.max_err>=0", err.max_err >= 0.0)
+}
+
+// ===================================================================
+//  Run all tests
+// ===================================================================
+fn main() {
+    println("=== test_awq.hexa -- AWQ Quantization (ML #84) ===")
+    test_salience_basic()
+    test_salience_single_token()
+    test_find_salient()
+    test_find_salient_top1()
+    test_scales_alpha0()
+    test_scales_alpha05()
+    test_scales_alpha_monotone()
+    test_quant_shape()
+    test_int4_range()
+    test_dequant_shape()
+    test_roundtrip_error_uniform()
+    test_awq_vs_uniform_error()
+    test_forward_shape()
+    test_forward_matches_dequant()
+    test_reference_matmul()
+    test_zero_weights()
+    test_zero_weights_forward()
+    test_uniform_activations()
+    test_single_channel()
+    test_error_stats()
+    test_error_stats_salient()
+    test_calibration_flow()
+    test_d_scales_positive()
+    test_alpha_stored()
+    test_large_matrix_mse()
+    test_constant_weights()
+    test_salience_negative()
+    test_summary()
+    println("")
+    println("=== RESULT ===")
+    println("  PASS: " + str(pass_count))
+    println("  FAIL: " + str(fail_count))
+    if fail_count == 0 {
+        println("=== ALL AWQ TESTS PASSED ===")
+    } else {
+        println("=== SOME TESTS FAILED ===")
+    }
+}
+
+main()
