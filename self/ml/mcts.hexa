@@ -1,0 +1,443 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/mcts.hexa — Monte Carlo Tree Search Reasoning (pure Hexa)
+//
+//  ML #71 — MCTS Reasoning
+//
+//  UCB1 selection + expansion + random rollout + backprop + root
+//  best-child, demonstrated on a deterministic dummy MDP (chain world)
+//  and a compact tic-tac-toe evaluator.
+//
+//  Node layout: each entry in MCTS_NODES is a map:
+//    #{
+//        "id": int,
+//        "parent": int,        // -1 if root
+//        "state": any,         // opaque game state payload
+//        "action": any,        // action that produced this state (-1 at root)
+//        "player": int,        // player to move at this node
+//        "visits": float,
+//        "value": float,       // total reward backed up into this node
+//        "children": [int],    // child node ids
+//        "untried": [any],     // yet-to-be-expanded actions
+//        "terminal": bool
+//    }
+//
+//  NOTE on design: the current hexa runtime passes arrays and maps by
+//  value to function parameters (no mutation propagates back to the
+//  caller). To keep mutation efficient we store the tree in a single
+//  global array `MCTS_NODES` that helper functions mutate directly.
+//  A single MCTS search is active at a time — reset it with
+//  `mcts_new_tree(...)`.
+//
+//  Public API:
+//    mcts_set_seed(s)
+//    mcts_set_env(env_id)                -- choose dispatched environment
+//    mcts_new_tree(root_state, legal_actions, player)
+//    mcts_ucb1(node, parent_visits, c)
+//    mcts_select(c)                      -> node id at the edge of the tree
+//    mcts_expand(node_id)
+//    mcts_rollout(node_id, max_depth)
+//    mcts_backprop(node_id, reward)
+//    mcts_iter(max_depth, c)
+//    mcts_run(iters, max_depth, c)
+//    mcts_best_child(root_id)            -> child node id with most visits
+//    mcts_best_action(root_id)           -> action from best_child
+//    mcts_get(id) / mcts_node_count()    -> node inspectors
+//
+//  Environments provided (select with mcts_set_env):
+//    "chain"  — 8-state chain world, reward at state 7.
+//    "ttt"    — Tic-tac-toe (3x3 board, 0 empty, 1/2 players).
+//
+//  Rationale for env dispatch: the current hexa runtime caches a
+//  function parameter on first call, so passing two different step_fns
+//  across calls silently routes to the wrong function. We instead
+//  dispatch through a global env_id string — the same pattern used by
+//  other ML subsystems that need polymorphic backends.
+// ═══════════════════════════════════════════════════════════════════
+
+// ─── global tree store + env dispatch ──────────────────────────────
+let mut MCTS_NODES = []
+let mut MCTS_ENV = "chain"
+
+fn mcts_set_env(env_id) {
+    MCTS_ENV = env_id
+}
+
+// ─── deterministic LCG (reproducible rollouts) ─────────────────────
+let mut MCTS_SEED = 1337
+
+fn mcts_set_seed(s) {
+    MCTS_SEED = s
+}
+
+fn mcts_rand_int() {
+    MCTS_SEED = (MCTS_SEED * 1103515245 + 12345) % 2147483648
+    let v = MCTS_SEED
+    if v < 0 { return 0 - v }
+    return v
+}
+
+fn mcts_rand_range(n) {
+    if n <= 0 { return 0 }
+    return mcts_rand_int() % n
+}
+
+fn mcts_rand_float() {
+    let r = mcts_rand_int()
+    return to_float(r) / 2147483648.0
+}
+
+// ─── tiny math helpers ─────────────────────────────────────────────
+fn mcts_fabs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// natural log via range reduction + Taylor series around 1.
+// ln(x) = k * ln(2) + ln(m) where m ∈ [1, 2).
+// ln(m) via ln((1+t)/(1-t)) = 2*(t + t^3/3 + t^5/5 + ...) for t = (m-1)/(m+1).
+fn mcts_ln(x) {
+    if x <= 0.0 { return -30.0 }
+    let mut v = x
+    let mut k = 0
+    while v >= 2.0 { v = v / 2.0; k = k + 1 }
+    while v < 1.0 { v = v * 2.0; k = k - 1 }
+    let t = (v - 1.0) / (v + 1.0)
+    let t2 = t * t
+    let t3 = t2 * t
+    let t5 = t3 * t2
+    let t7 = t5 * t2
+    let t9 = t7 * t2
+    let series = 2.0 * (t + t3 / 3.0 + t5 / 5.0 + t7 / 7.0 + t9 / 9.0)
+    return to_float(k) * 0.6931471805599453 + series
+}
+
+// ─── node constructors ─────────────────────────────────────────────
+fn mcts_new_node(id, parent, state, action, player, untried, terminal) {
+    let node = #{}
+    node["id"] = id
+    node["parent"] = parent
+    node["state"] = state
+    node["action"] = action
+    node["player"] = player
+    node["visits"] = 0.0
+    node["value"] = 0.0
+    node["children"] = []
+    node["untried"] = untried
+    node["terminal"] = terminal
+    return node
+}
+
+fn mcts_new_tree(root_state, legal_actions, player) {
+    let root = mcts_new_node(0, -1, root_state, -1, player, legal_actions, false)
+    MCTS_NODES = [root]
+    return 0
+}
+
+fn mcts_node_count() {
+    return len(MCTS_NODES)
+}
+
+fn mcts_get(id) {
+    return MCTS_NODES[id]
+}
+
+// ─── UCB1 score ────────────────────────────────────────────────────
+// Q(node) + c * sqrt( ln(parent_visits) / n(node) )
+fn mcts_ucb1(node, parent_visits, c) {
+    let n = node["visits"]
+    if n < 0.5 {
+        // unvisited children have infinite priority
+        return 1000000.0
+    }
+    let q = node["value"] / n
+    let pv = parent_visits
+    let mut ln_p = 0.0
+    if pv > 1.0 { ln_p = mcts_ln(pv) }
+    let explore = c * sqrt(ln_p / n)
+    return q + explore
+}
+
+// ─── SELECT: descend tree until reaching a node with untried actions
+fn mcts_select(c) {
+    let mut id = 0
+    let mut guard = 0
+    while guard < 10000 {
+        guard = guard + 1
+        let node = MCTS_NODES[id]
+        if node["terminal"] { return id }
+        if len(node["untried"]) > 0 { return id }
+        let kids = node["children"]
+        if len(kids) == 0 { return id }
+        let pv = node["visits"]
+        let mut best_id = kids[0]
+        let mut best_score = -1000000.0
+        let mut i = 0
+        while i < len(kids) {
+            let child = MCTS_NODES[kids[i]]
+            let s = mcts_ucb1(child, pv, c)
+            if s > best_score {
+                best_score = s
+                best_id = kids[i]
+            }
+            i = i + 1
+        }
+        id = best_id
+    }
+    return id
+}
+
+// ─── ENV DISPATCH: avoids the fn-parameter aliasing issue ──────────
+// Returns [new_state, new_player, legal, terminal]
+fn mcts_env_step(state, action, player) {
+    if MCTS_ENV == "chain" { return chain_step(state, action, player) }
+    if MCTS_ENV == "ttt" { return ttt_step(state, action, player) }
+    return chain_step(state, action, player)
+}
+
+fn mcts_env_reward(state, player_at_root, terminal) {
+    if MCTS_ENV == "chain" { return chain_reward(state, player_at_root, terminal) }
+    if MCTS_ENV == "ttt" { return ttt_reward(state, player_at_root, terminal) }
+    return chain_reward(state, player_at_root, terminal)
+}
+
+// ─── EXPAND: pull one untried action, create a fresh child node ────
+fn mcts_expand(node_id) {
+    let parent_node = MCTS_NODES[node_id]
+    if parent_node["terminal"] { return node_id }
+    let untried = parent_node["untried"]
+    if len(untried) == 0 { return node_id }
+
+    let pick_idx = mcts_rand_range(len(untried))
+    let action = untried[pick_idx]
+    let mut remaining = []
+    let mut i = 0
+    while i < len(untried) {
+        if i != pick_idx { remaining = remaining + [untried[i]] }
+        i = i + 1
+    }
+    MCTS_NODES[node_id]["untried"] = remaining
+
+    let res = mcts_env_step(parent_node["state"], action, parent_node["player"])
+    let new_state = res[0]
+    let new_player = res[1]
+    let new_legal = res[2]
+    let new_terminal = res[3]
+
+    let new_id = len(MCTS_NODES)
+    let child = mcts_new_node(new_id, node_id, new_state, action, new_player, new_legal, new_terminal)
+    MCTS_NODES = MCTS_NODES + [child]
+    MCTS_NODES[node_id]["children"] = MCTS_NODES[node_id]["children"] + [new_id]
+    return new_id
+}
+
+// ─── ROLLOUT: random policy from a state to terminal / depth cap ──
+fn mcts_rollout(node_id, max_depth) {
+    let start_node = MCTS_NODES[node_id]
+    if start_node["terminal"] {
+        return mcts_env_reward(start_node["state"], start_node["player"], true)
+    }
+    let mut state = start_node["state"]
+    let mut player = start_node["player"]
+    // Rebuild the complete legal-action set at this node: untried + any
+    // actions already consumed by expansion (stored as children's action).
+    let mut legal = start_node["untried"] + []
+    let kids = start_node["children"]
+    let mut ci = 0
+    while ci < len(kids) {
+        let ch = MCTS_NODES[kids[ci]]
+        legal = legal + [ch["action"]]
+        ci = ci + 1
+    }
+    let root_player = start_node["player"]
+    let mut terminal = false
+    let mut depth = 0
+    while depth < max_depth {
+        if terminal { break }
+        if len(legal) == 0 { break }
+        let idx = mcts_rand_range(len(legal))
+        let a = legal[idx]
+        let res = mcts_env_step(state, a, player)
+        state = res[0]
+        player = res[1]
+        legal = res[2]
+        terminal = res[3]
+        depth = depth + 1
+    }
+    return mcts_env_reward(state, root_player, terminal)
+}
+
+// ─── BACKPROP: walk up to the root, updating visits & value ────────
+fn mcts_backprop(node_id, reward) {
+    let mut id = node_id
+    let mut guard = 0
+    while guard < 100000 {
+        guard = guard + 1
+        MCTS_NODES[id]["visits"] = MCTS_NODES[id]["visits"] + 1.0
+        MCTS_NODES[id]["value"] = MCTS_NODES[id]["value"] + reward
+        let parent = MCTS_NODES[id]["parent"]
+        if parent < 0 { return true }
+        id = parent
+    }
+    return false
+}
+
+// ─── ONE FULL MCTS ITERATION ───────────────────────────────────────
+fn mcts_iter(max_depth, c) {
+    let leaf_id = mcts_select(c)
+    let leaf = MCTS_NODES[leaf_id]
+    let mut sim_id = leaf_id
+    if len(leaf["untried"]) > 0 && !leaf["terminal"] {
+        sim_id = mcts_expand(leaf_id)
+    }
+    let reward = mcts_rollout(sim_id, max_depth)
+    mcts_backprop(sim_id, reward)
+    return sim_id
+}
+
+fn mcts_run(iters, max_depth, c) {
+    let mut i = 0
+    while i < iters {
+        mcts_iter(max_depth, c)
+        i = i + 1
+    }
+    return true
+}
+
+// ─── BEST CHILD: highest visit count at root ───────────────────────
+fn mcts_best_child(root_id) {
+    let root = MCTS_NODES[root_id]
+    let kids = root["children"]
+    if len(kids) == 0 { return -1 }
+    let mut best = kids[0]
+    let mut best_visits = -1.0
+    let mut i = 0
+    while i < len(kids) {
+        let child = MCTS_NODES[kids[i]]
+        if child["visits"] > best_visits {
+            best_visits = child["visits"]
+            best = kids[i]
+        }
+        i = i + 1
+    }
+    return best
+}
+
+fn mcts_best_action(root_id) {
+    let bid = mcts_best_child(root_id)
+    if bid < 0 { return -1 }
+    let node = MCTS_NODES[bid]
+    return node["action"]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  DUMMY MDP: Chain world
+//  States: 0..7, actions: 0 = left, 1 = right.
+//  Start at state 3. Reward: 1.0 at state 7, 0.1 at state 0, 0 else.
+//  Terminal: state 0 or state 7. Optimal action at start = right.
+// ═══════════════════════════════════════════════════════════════════
+fn chain_start() { return 3 }
+
+fn chain_legal(state) {
+    if state <= 0 { return [] }
+    if state >= 7 { return [] }
+    return [0, 1]
+}
+
+fn chain_is_terminal(state) {
+    if state <= 0 { return true }
+    if state >= 7 { return true }
+    return false
+}
+
+fn chain_step(state, action, player) {
+    let mut ns = state
+    if action == 0 { ns = state - 1 }
+    if action == 1 { ns = state + 1 }
+    let term = chain_is_terminal(ns)
+    let legal = chain_legal(ns)
+    return [ns, player, legal, term]
+}
+
+fn chain_reward(state, player_at_root, terminal) {
+    if !terminal { return 0.0 }
+    if state >= 7 { return 1.0 }
+    if state <= 0 { return 0.1 }
+    return 0.0
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  TIC-TAC-TOE
+//  Board = array(9), 0 empty, 1 = X, 2 = O. Player 1 starts.
+// ═══════════════════════════════════════════════════════════════════
+fn ttt_start() {
+    let mut b = []
+    for _i in 0..9 { b = b + [0] }
+    return b
+}
+
+fn ttt_legal(board) {
+    let mut out = []
+    let mut i = 0
+    while i < 9 {
+        if board[i] == 0 { out = out + [i] }
+        i = i + 1
+    }
+    return out
+}
+
+fn ttt_line(board, a, b, c) {
+    if board[a] == 0 { return 0 }
+    if board[a] == board[b] && board[b] == board[c] { return board[a] }
+    return 0
+}
+
+fn ttt_winner(board) {
+    let rows = [[0,1,2],[3,4,5],[6,7,8]]
+    let cols = [[0,3,6],[1,4,7],[2,5,8]]
+    let diags = [[0,4,8],[2,4,6]]
+    let all_lines = rows + cols + diags
+    let mut i = 0
+    while i < len(all_lines) {
+        let l = all_lines[i]
+        let w = ttt_line(board, l[0], l[1], l[2])
+        if w != 0 { return w }
+        i = i + 1
+    }
+    return 0
+}
+
+fn ttt_is_terminal(board) {
+    let w = ttt_winner(board)
+    if w != 0 { return true }
+    let mut i = 0
+    while i < 9 {
+        if board[i] == 0 { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn ttt_step(state, action, player) {
+    let mut nb = []
+    let mut i = 0
+    while i < 9 {
+        if i == action { nb = nb + [player] } else { nb = nb + [state[i]] }
+        i = i + 1
+    }
+    let mut np = 1
+    if player == 1 { np = 2 } else { np = 1 }
+    let term = ttt_is_terminal(nb)
+    let mut legal = []
+    if !term { legal = ttt_legal(nb) }
+    return [nb, np, legal, term]
+}
+
+// Reward from the perspective of "player_at_root" (the player to move
+// at the node that initiated the rollout).
+fn ttt_reward(state, player_at_root, terminal) {
+    if !terminal { return 0.0 }
+    let w = ttt_winner(state)
+    if w == 0 { return 0.5 }
+    if w == player_at_root { return 1.0 }
+    return 0.0
+}
