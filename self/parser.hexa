@@ -156,6 +156,9 @@ pub let mut p_pending_symbol = ""   // @symbol("name") — pending C symbol alia
 pub let mut p_pending_link = ""     // @link("lib") — pending library name
 // M0: AI-native @attr accumulator — parse_stmt fills this, parse_fn_decl consumes
 pub let mut p_pending_attrs = ""
+// Struct literal disambiguation: when set, `Name {` is NOT parsed as
+// struct literal (used inside if/while/match conditions where `{` is body).
+pub let mut p_suppress_struct_lit = false
 
 // ── I1: Error Recovery ─────────────────────────────────────
 // Collect all parse errors instead of halting on the first one.
@@ -352,10 +355,19 @@ fn parse_strict(tokens) {
 
 fn parse_stmt() {
     p_skip_newlines()
-    // M0: collect leading @attr markers (e.g. @optimize @memoize)
+    // M0: collect leading @attr markers (e.g. @optimize @memoize @pure @async)
     while p_peek_kind() == "At" {
         p_advance() // consume @
-        let attr_name = p_expect_ident()
+        // Attribute name may be a keyword (e.g. @pure where `pure` is a keyword)
+        let next_tok = p_peek()
+        let mut attr_name = ""
+        if p_peek_kind() == "Ident" {
+            attr_name = p_expect_ident()
+        } else {
+            // Accept any keyword token's value as the attribute name
+            attr_name = next_tok.value
+            p_advance()
+        }
         // Optional parenthesized argument: @symbol("x"), @link("libm"), ...
         let mut attr_arg = ""
         if p_peek_kind() == "LParen" {
@@ -397,6 +409,7 @@ fn parse_stmt() {
     if kind == "Return" { return parse_return() }
     if kind == "Proof" { return parse_proof_stmt() }
     if kind == "Assert" { return parse_assert_stmt() }
+    if kind == "Invariant" { return parse_invariant_stmt() }
     if kind == "Impl" { return parse_impl_block() }
     if kind == "Trait" { return parse_trait_decl() }
     if kind == "Use" { return parse_use_decl() }
@@ -448,19 +461,33 @@ fn parse_stmt() {
     if kind == "Theorem" { return parse_theorem_stmt() }
     if kind == "Handle" { return parse_handle_stmt() }
     if kind == "Recover" { return parse_recover_stmt() }
+    if kind == "Resume" { return parse_resume_stmt() }
 
     // @attribute(...) — consume and attach to next declaration
     if kind == "Attribute" {
         return parse_attribute_prefix()
     }
 
-    // Expression statement or assignment
+    // Expression statement or assignment (incl. compound: +=, -=, *=, /=, %=)
     let expr = parse_expr()
-    if p_peek_kind() == "Eq" {
+    let pk = p_peek_kind()
+    if pk == "Eq" {
         p_advance() // consume =
         let rhs = parse_expr()
         return #{
             "kind": "AssignStmt", "name": "", "value": "", "op": "",
+            "left": expr, "right": rhs, "cond": "", "then_body": "", "else_body": "",
+            "params": "", "body": "", "args": "", "fields": "", "items": "",
+            "variants": "", "arms": "", "iter_expr": "", "ret_type": "",
+            "target": "", "trait_name": "", "methods": ""
+        }
+    }
+    if pk == "PlusEq" || pk == "MinusEq" || pk == "StarEq" || pk == "SlashEq" || pk == "PercentEq" {
+        let op_tok = p_advance()
+        let op_str = if pk == "PlusEq" { "+" } else { if pk == "MinusEq" { "-" } else { if pk == "StarEq" { "*" } else { if pk == "SlashEq" { "/" } else { "%" } } } }
+        let rhs = parse_expr()
+        return #{
+            "kind": "CompoundAssign", "name": "", "value": "", "op": op_str,
             "left": expr, "right": rhs, "cond": "", "then_body": "", "else_body": "",
             "params": "", "body": "", "args": "", "fields": "", "items": "",
             "variants": "", "arms": "", "iter_expr": "", "ret_type": "",
@@ -602,6 +629,32 @@ fn parse_assert_stmt() {
     }
 }
 
+// ── resume expr (inside effect handler) ────────────────────
+fn parse_resume_stmt() {
+    p_advance() // consume 'resume'
+    let expr = parse_expr()
+    return #{
+        "kind": "Resume", "name": "", "value": "", "op": "",
+        "left": expr, "right": "", "cond": "", "then_body": "", "else_body": "",
+        "params": "", "body": "", "args": "", "fields": "", "items": "",
+        "variants": "", "arms": "", "iter_expr": "", "ret_type": "",
+        "target": "", "trait_name": "", "methods": ""
+    }
+}
+
+// ── invariant expr (proof block hint) ───────────────────────
+fn parse_invariant_stmt() {
+    p_advance() // consume 'invariant'
+    let expr = parse_expr()
+    return #{
+        "kind": "Invariant", "name": "", "value": "", "op": "",
+        "left": expr, "right": "", "cond": "", "then_body": "", "else_body": "",
+        "params": "", "body": "", "args": "", "fields": "", "items": "",
+        "variants": "", "arms": "", "iter_expr": "", "ret_type": "",
+        "target": "", "trait_name": "", "methods": ""
+    }
+}
+
 // ── use path::to::module ────────────────────────────────────
 
 fn parse_use_decl() {
@@ -691,6 +744,8 @@ fn parse_params() {
     if p_peek_kind() == "RParen" {
         return params
     }
+    // Optional `mut` modifier on parameter
+    if p_peek_kind() == "Mut" { p_advance() }
     let name = p_expect_ident()
     let mut typ = ""
     if p_peek_kind() == "Colon" {
@@ -706,6 +761,7 @@ fn parse_params() {
     })
     while p_peek_kind() == "Comma" {
         p_advance()
+        if p_peek_kind() == "Mut" { p_advance() }
         let pname = p_expect_ident()
         let mut ptyp = ""
         if p_peek_kind() == "Colon" {
@@ -738,8 +794,12 @@ fn parse_struct_decl() {
     let mut fields = []
     while p_peek_kind() != "RBrace" && p_peek_kind() != "Eof" {
         let fname = p_expect_ident()
-        p_expect("Colon")
-        let ftype = p_expect_ident()
+        // Type annotation is optional: `value` and `value: int` both parse.
+        let mut ftype = ""
+        if p_peek_kind() == "Colon" {
+            p_advance()
+            ftype = p_expect_ident()
+        }
         fields = fields.push(#{
             "kind": "StructField", "name": fname, "value": ftype, "op": "",
             "left": "", "right": "", "cond": "", "then_body": "", "else_body": "",
@@ -917,7 +977,10 @@ fn parse_for_stmt() {
         p_record_error(in_tok.line, in_tok.col, for_msg)
         println("Parse error: " + for_msg)
     }
+    let prev_supp = p_suppress_struct_lit
+    p_suppress_struct_lit = true
     let iter = parse_expr()
+    p_suppress_struct_lit = prev_supp
     let body = parse_block()
     return #{
         "kind": "ForStmt", "name": var, "value": "", "op": "",
@@ -932,7 +995,12 @@ fn parse_for_stmt() {
 
 fn parse_while_stmt() {
     p_advance() // consume 'while'
+    // Suppress struct-literal parsing inside the condition (Name { ... } would
+    // collide with while body brace).
+    let prev_supp = p_suppress_struct_lit
+    p_suppress_struct_lit = true
     let cond = parse_expr()
+    p_suppress_struct_lit = prev_supp
     let body = parse_block()
     return #{
         "kind": "WhileStmt", "name": "", "value": "", "op": "",
@@ -961,7 +1029,10 @@ fn parse_loop_stmt() {
 
 fn parse_if_expr() {
     p_advance() // consume 'if'
+    let prev_supp = p_suppress_struct_lit
+    p_suppress_struct_lit = true
     let cond = parse_expr()
+    p_suppress_struct_lit = prev_supp
     let then_b = parse_block()
     let saved = p_pos
     p_skip_newlines()
@@ -998,7 +1069,10 @@ fn parse_if_expr() {
 
 fn parse_match_expr() {
     p_advance() // consume 'match'
+    let prev_supp = p_suppress_struct_lit
+    p_suppress_struct_lit = true
     let scrutinee = parse_expr()
+    p_suppress_struct_lit = prev_supp
     p_expect("LBrace")
     p_skip_newlines()
     let mut arms = []
@@ -1379,7 +1453,7 @@ fn parse_primary() {
                 }
             }
         }
-        if p_peek_kind() == "LBrace" {
+        if p_peek_kind() == "LBrace" && !p_suppress_struct_lit {
             let chars = name.chars()
             if len(chars) > 0 {
                 let first_ch = chars[0]
@@ -1518,6 +1592,45 @@ fn parse_primary() {
             "kind": "Lambda", "name": "", "value": "", "op": "",
             "left": lbody, "right": "", "cond": "", "then_body": "", "else_body": "",
             "params": lparams, "body": "", "args": "", "fields": "", "items": "",
+            "variants": "", "arms": "", "iter_expr": "", "ret_type": "",
+            "target": "", "trait_name": "", "methods": ""
+        }
+    }
+    if k == "Or" {
+        // Zero-arg lambda: || body
+        // Ambiguous with logical-or, but in primary-expression position
+        // we're always at the START of an expression so || must be lambda.
+        p_advance() // consume ||
+        let mut lbody = ""
+        if p_peek_kind() == "LBrace" {
+            lbody = parse_block()
+        } else {
+            lbody = parse_expr()
+        }
+        return #{
+            "kind": "Lambda", "name": "", "value": "", "op": "",
+            "left": lbody, "right": "", "cond": "", "then_body": "", "else_body": "",
+            "params": [], "body": "", "args": "", "fields": "", "items": "",
+            "variants": "", "arms": "", "iter_expr": "", "ret_type": "",
+            "target": "", "trait_name": "", "methods": ""
+        }
+    }
+    if k == "Fn" {
+        // Anonymous fn: fn(params) -> ret? { body }
+        p_advance() // consume 'fn'
+        p_expect("LParen")
+        let fparams = parse_params()
+        p_expect("RParen")
+        // Optional return type
+        if p_peek_kind() == "Arrow" {
+            p_advance()
+            let _ret = p_expect_ident()
+        }
+        let fbody = parse_block()
+        return #{
+            "kind": "Lambda", "name": "", "value": "", "op": "",
+            "left": fbody, "right": "", "cond": "", "then_body": "", "else_body": "",
+            "params": fparams, "body": "", "args": "", "fields": "", "items": "",
             "variants": "", "arms": "", "iter_expr": "", "ret_type": "",
             "target": "", "trait_name": "", "methods": ""
         }
@@ -1794,10 +1907,16 @@ fn parse_atomic_let() {
     p_advance() // consume 'atomic'
     p_expect("Let")
     let name = p_expect_ident()
+    // Optional type annotation: atomic let x: int = 0
+    let mut typ = ""
+    if p_peek_kind() == "Colon" {
+        p_advance()
+        typ = parse_type_annotation()
+    }
     p_expect("Eq")
     let expr = parse_expr()
     return #{
-        "kind": "AtomicLet", "name": name, "value": "", "op": "",
+        "kind": "AtomicLet", "name": name, "value": typ, "op": "",
         "left": expr, "right": "", "cond": "", "then_body": "", "else_body": "",
         "params": "", "body": "", "args": "", "fields": "", "items": "",
         "variants": "", "arms": "", "iter_expr": "", "ret_type": "",
@@ -2267,10 +2386,15 @@ fn parse_handle_stmt() {
             }
             p_expect("RParen")
         }
-        // Expect => (Eq + Gt)
-        if p_peek_kind() == "Eq" {
+        // Expect => (Eq + Gt) or -> (Arrow) or FatArrow
+        let pk = p_peek_kind()
+        if pk == "Eq" {
             p_advance()
             if p_peek_kind() == "Gt" {
+                p_advance()
+            }
+        } else {
+            if pk == "Arrow" || pk == "FatArrow" {
                 p_advance()
             }
         }
@@ -2850,12 +2974,22 @@ fn tokenize(source) {
         } else {
             let start_col = col
             if ch == '+' {
-                tokens = tokens.push(Token { kind: "Plus", value: "+", line: line, col: start_col })
-                pos = pos + 1
-                col = col + 1
+                if pos + 1 < total && chars[pos + 1] == '=' {
+                    tokens = tokens.push(Token { kind: "PlusEq", value: "+=", line: line, col: start_col })
+                    pos = pos + 2
+                    col = col + 2
+                } else {
+                    tokens = tokens.push(Token { kind: "Plus", value: "+", line: line, col: start_col })
+                    pos = pos + 1
+                    col = col + 1
+                }
             } else if ch == '-' {
                 if pos + 1 < total && chars[pos + 1] == '>' {
                     tokens = tokens.push(Token { kind: "Arrow", value: "->", line: line, col: start_col })
+                    pos = pos + 2
+                    col = col + 2
+                } else if pos + 1 < total && chars[pos + 1] == '=' {
+                    tokens = tokens.push(Token { kind: "MinusEq", value: "-=", line: line, col: start_col })
                     pos = pos + 2
                     col = col + 2
                 } else {
@@ -2868,19 +3002,35 @@ fn tokenize(source) {
                     tokens = tokens.push(Token { kind: "Power", value: "**", line: line, col: start_col })
                     pos = pos + 2
                     col = col + 2
+                } else if pos + 1 < total && chars[pos + 1] == '=' {
+                    tokens = tokens.push(Token { kind: "StarEq", value: "*=", line: line, col: start_col })
+                    pos = pos + 2
+                    col = col + 2
                 } else {
                     tokens = tokens.push(Token { kind: "Star", value: "*", line: line, col: start_col })
                     pos = pos + 1
                     col = col + 1
                 }
             } else if ch == '/' {
-                tokens = tokens.push(Token { kind: "Slash", value: "/", line: line, col: start_col })
-                pos = pos + 1
-                col = col + 1
+                if pos + 1 < total && chars[pos + 1] == '=' {
+                    tokens = tokens.push(Token { kind: "SlashEq", value: "/=", line: line, col: start_col })
+                    pos = pos + 2
+                    col = col + 2
+                } else {
+                    tokens = tokens.push(Token { kind: "Slash", value: "/", line: line, col: start_col })
+                    pos = pos + 1
+                    col = col + 1
+                }
             } else if ch == '%' {
-                tokens = tokens.push(Token { kind: "Percent", value: "%", line: line, col: start_col })
-                pos = pos + 1
-                col = col + 1
+                if pos + 1 < total && chars[pos + 1] == '=' {
+                    tokens = tokens.push(Token { kind: "PercentEq", value: "%=", line: line, col: start_col })
+                    pos = pos + 2
+                    col = col + 2
+                } else {
+                    tokens = tokens.push(Token { kind: "Percent", value: "%", line: line, col: start_col })
+                    pos = pos + 1
+                    col = col + 1
+                }
             } else if ch == '=' {
                 if pos + 1 < total && chars[pos + 1] == '=' {
                     tokens = tokens.push(Token { kind: "EqEq", value: "==", line: line, col: start_col })

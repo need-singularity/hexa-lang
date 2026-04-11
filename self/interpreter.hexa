@@ -30,36 +30,41 @@ fn val_str(s) { return Val { tag: "str", int_val: 0, float_val: 0.0, bool_val: f
 fn val_void() { return Val { tag: "void", int_val: 0, float_val: 0.0, bool_val: false, str_val: "", char_val: "", array_val: "", fn_name: "", fn_params: "", fn_body: "", struct_name: "", struct_fields: "" } }
 
 // ── Environment (scope-based variable storage) ───────────
+// NOTE: All module-level state declared `pub let mut` so cross-module
+// callers (host_test.hexa, bootstrap pipelines, fixpoint runners) can
+// reset and re-enter `interpret()`. Same pattern as self/parser.hexa.
+// Without `pub`, lookups from within import dispatch see uninitialized
+// captures and fail with "undefined variable: env_vars".
 
-let mut env_vars = []      // array of {name, value} pairs
-let mut env_scopes = [0]   // scope boundary stack
-let mut env_fns = []      // function registry: name -> {params, body}
-let mut return_flag = false
-let mut return_val = val_void()
-let mut break_flag = false
-let mut continue_flag = false
-let mut throw_flag = false
-let mut throw_val = val_void()
+pub let mut env_vars = []      // array of {name, value} pairs
+pub let mut env_scopes = [0]   // scope boundary stack
+pub let mut env_fns = []      // function registry: name -> {params, body}
+pub let mut return_flag = false
+pub let mut return_val = val_void()
+pub let mut break_flag = false
+pub let mut continue_flag = false
+pub let mut throw_flag = false
+pub let mut throw_val = val_void()
 // Panic: unrecoverable abort. Propagates through all enclosing blocks like
 // throw, but is NOT cleared by try/catch or recover — only program exit
 // observes it (interpret() prints "panic: <msg>" to stderr and returns void).
-let mut panic_flag = false
-let mut panic_msg = ""
-let mut call_stack = []    // stack trace: array of function names
+pub let mut panic_flag = false
+pub let mut panic_msg = ""
+pub let mut call_stack = []    // stack trace: array of function names
 // ── Sprint C: yield / eager generator buffer ─────────────
 // Functions containing `yield` accumulate values into gen_buffer; upon
 // return the accumulated array becomes the function's result. This is
 // semantically correct for finite generators (no coroutines required).
 // Each call frame saves/restores the outer buffer+flag so nested and
 // non-generator calls are unaffected.
-let mut gen_buffer = []
-let mut gen_active = false
+pub let mut gen_buffer = []
+pub let mut gen_active = false
 
 // ── @memo/@memoize/@cache runtime support ───────────────
 // fn_attrs: maps function name -> comma-separated attr string
-let mut fn_attrs = []      // [[name, attrs_str], ...]
+pub let mut fn_attrs = []      // [[name, attrs_str], ...]
 // memo_cache: [[fn_name, [[key_str, result_val], ...]], ...]
-let mut memo_cache = []
+pub let mut memo_cache = []
 
 fn fn_attrs_set(name, attrs) {
     fn_attrs = fn_attrs.push([name, attrs])
@@ -113,7 +118,7 @@ fn memo_store(key, result) {
 // ── Extern FFI storage ──────────────────────────────────
 // Each entry: [hexa_name, c_symbol, ret_type, link_lib]
 // c_symbol is from @symbol("name"); if empty, hexa_name is used for dlsym.
-let mut extern_fns = []
+pub let mut extern_fns = []
 
 // Look up the C symbol name for a hexa extern function.
 // Returns the @symbol alias if set, otherwise the hexa name itself.
@@ -143,17 +148,17 @@ fn extern_link_lib(hexa_name) {
 // ── Impl block storage (struct method dispatch) ─────────
 // Each entry: [target_name, methods_array]
 // methods_array: each is a FnDecl node with .name, .params, .body
-let mut impl_store = []
+pub let mut impl_store = []
 
 // ── Closure environment storage ─────────────────────────
 // Closures capture a snapshot of env_vars at creation time
-let mut closure_store = []
+pub let mut closure_store = []
 
 // ── Callback trampoline storage (G4) ───────────────────
 // Pool of 16 callback slots for interpreter mode.
 // Each slot: [in_use (0/1), fn_val]
-let mut callback_slots = []
-let mut callback_inited = false
+pub let mut callback_slots = []
+pub let mut callback_inited = false
 
 fn callback_init() {
     if callback_inited { return 0 }
@@ -212,6 +217,426 @@ fn callback_call(slot, args) {
     return val_void()
 }
 
+// ── Host builtin shims ─────────────────────────────────────
+// call_builtin's parameter `args` shadows the host's `args()` builtin,
+// so we need top-level helpers (no `args` param) to reach it.
+// host_args: would return host CLI args, but call_builtin's `args` param
+// shadows the host builtin. Top-level capture also clashes with how the
+// host hexa loads modules. Returning empty array as safe fallback.
+// User code calling args() inside self-host gets [] — not ideal but stable.
+fn host_args() { return [] }
+fn host_argc() { return len(args()) }
+fn host_arg(i) {
+    let a = host_args()
+    if i >= 0 && i < len(a) { return a[i] }
+    return ""
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Phase 7 골화 — FFI: extern fn dispatch + value/C ABI bridge
+//  src/interpreter.rs:10814 (call_extern_fn) 대응
+// ═══════════════════════════════════════════════════════════
+//  Self-host 인터프리터는 dlsym+transmute를 직접 못 함.
+//  대신 호스트 인터프리터(이 코드를 실행 중인 native hexa)가
+//  제공하는 빌트인 `__host_extern_call`을 거쳐 dispatch.
+//  호스트가 그 빌트인을 노출하지 않는 경우는 error 반환.
+
+// Convert a Val to a C-ABI i64 (matches src::value_to_c_arg)
+//   int → i64 그대로
+//   bool → 0/1
+//   float → bit-cast (정확도는 호스트 책임)
+//   str → 호스트가 펀딩한 UTF-8 ptr (현 self-host: 길이만 반환)
+//   pointer → addr
+//   기타 → 0
+fn value_to_c_arg(v) {
+    if v.tag == "int" { return v.int_val }
+    if v.tag == "bool" { if v.bool_val { return 1 } else { return 0 } }
+    if v.tag == "pointer" { return v.int_val }
+    if v.tag == "char" {
+        let cs = v.char_val
+        if len(cs) > 0 { return cs[0] }
+        return 0
+    }
+    // float / str / 기타: self-host에선 안전 fallback
+    return 0
+}
+
+// Convert a C-ABI i64 return back to a Val based on declared ret_type.
+//   "int"|"i64"|"" → int
+//   "bool" → bool
+//   "ptr"|"void*" → pointer
+//   "char"|"i8" → char
+//   기타 → int
+fn c_ret_to_value(raw, ret_type) {
+    if ret_type == "bool" { return val_bool(raw != 0) }
+    if ret_type == "ptr" || ret_type == "void*" || ret_type == "*mut" {
+        return val_pointer(raw)
+    }
+    if ret_type == "char" || ret_type == "i8" {
+        return Val { tag: "char", int_val: raw, float_val: 0.0, bool_val: false, str_val: "", char_val: to_string(raw), array_val: "", fn_name: "", fn_params: "", fn_body: "", struct_name: "", struct_fields: "" }
+    }
+    return val_int(raw)
+}
+
+// call_extern_fn(builtin_name, args) — dispatch C extern from .hexa interpreter
+//   builtin_name format: "__extern_<fn_name>"
+//   1. Extract fn_name
+//   2. Look up declared ret_type
+//   3. Resolve C symbol via @symbol alias (extern_c_symbol)
+//   4. Convert args to i64
+//   5. Delegate to host builtin __host_extern_call(c_symbol, link_lib, [c_args])
+//   6. Convert result via c_ret_to_value
+fn call_extern_fn(builtin_name, args) {
+    let fn_name = builtin_name.substring(9, len(builtin_name))   // strip "__extern_"
+    let c_sym = extern_c_symbol(fn_name)
+    let lib = extern_link_lib(fn_name)
+    let mut ret_type = ""
+    let mut i = len(extern_fns) - 1
+    while i >= 0 {
+        if extern_fns[i][0] == fn_name {
+            ret_type = extern_fns[i][2]
+            i = -1
+        } else {
+            i = i - 1
+        }
+    }
+    let mut c_args = []
+    for a in args { c_args = c_args.push(value_to_c_arg(a)) }
+    // Delegate to host runtime via builtin. If host doesn't expose it,
+    // not_builtin sentinel propagates → fall through to error.
+    let host_result = call_builtin("__host_extern_call", [val_str(c_sym), val_str(lib), val_array_simple(c_args)])
+    if host_result.tag == "__not_builtin__" {
+        return Val { tag: "error", int_val: 0, float_val: 0.0, bool_val: false, str_val: "extern '" + fn_name + "': host runtime does not expose __host_extern_call", char_val: "", array_val: "", fn_name: "", fn_params: "", fn_body: "", struct_name: "", struct_fields: "" }
+    }
+    if host_result.tag == "int" {
+        return c_ret_to_value(host_result.int_val, ret_type)
+    }
+    return host_result
+}
+
+// Helper: build a Val::Array from a flat int array (used by call_extern_fn)
+fn val_array_simple(int_items) {
+    let mut wrapped = []
+    for n in int_items { wrapped = wrapped.push(val_int(n)) }
+    return val_array(wrapped)
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Phase 9 골화 — Formal proof engine bridge
+//  src/interpreter.rs:11968-12045 대응
+// ═══════════════════════════════════════════════════════════
+//  HEXA Expr → ProofExpr 변환 + execute_proof_block_stmt.
+//  실제 SAT/SMT solver는 src::proof_engine (Rust)에 있으므로
+//  self-host에선 호스트 빌트인 __host_proof_check를 시도하고,
+//  미노출 시 "skipped" 결과를 반환.
+
+// ProofExpr는 hexa에선 [kind, ...payload] 배열로 인코딩.
+//   ["var", name]            ["bool", b]                ["int", n]
+//   ["and", l, r]            ["or", l, r]               ["not", x]
+//   ["eq", l, r]             ["lt", l, r]               ["gt", l, r]
+//   ["le", l, r]             ["ge", l, r]               ["add", l, r]
+//   ["implies", l, r]        ["fn_call", name, args]    ["unknown", desc]
+
+fn proof_var(name) { return ["var", name] }
+fn proof_bool(b) { return ["bool", b] }
+fn proof_int(n) { return ["int", n] }
+fn proof_and(l, r) { return ["and", l, r] }
+fn proof_or(l, r) { return ["or", l, r] }
+fn proof_not(x) { return ["not", x] }
+fn proof_eq(l, r) { return ["eq", l, r] }
+fn proof_lt(l, r) { return ["lt", l, r] }
+fn proof_gt(l, r) { return ["gt", l, r] }
+fn proof_le(l, r) { return ["le", l, r] }
+fn proof_ge(l, r) { return ["ge", l, r] }
+fn proof_add(l, r) { return ["add", l, r] }
+fn proof_implies(l, r) { return ["implies", l, r] }
+fn proof_fn_call(name, args) { return ["fn_call", name, args] }
+fn proof_unknown(desc) { return ["unknown", desc] }
+
+fn expr_to_proof_expr(expr) {
+    if type_of(expr) == "string" { return proof_unknown("string_expr") }
+    let k = expr.kind
+    if k == "Ident" { return proof_var(expr.name) }
+    if k == "BoolLit" { return proof_bool(expr.value) }
+    if k == "IntLit" { return proof_int(expr.value) }
+    if k == "Binary" {
+        let l = expr_to_proof_expr(expr.left)
+        let r = expr_to_proof_expr(expr.right)
+        let op = expr.op
+        if op == "&&" || op == "and" { return proof_and(l, r) }
+        if op == "||" || op == "or" { return proof_or(l, r) }
+        if op == "==" { return proof_eq(l, r) }
+        if op == "<" { return proof_lt(l, r) }
+        if op == ">" { return proof_gt(l, r) }
+        if op == "<=" { return proof_le(l, r) }
+        if op == ">=" { return proof_ge(l, r) }
+        if op == "+" { return proof_add(l, r) }
+        if op == "->" || op == "=>" { return proof_implies(l, r) }
+        return proof_unknown("binop_" + op)
+    }
+    if k == "Unary" && expr.op == "!" {
+        return proof_not(expr_to_proof_expr(expr.operand))
+    }
+    if k == "Call" {
+        // parser AST stores callee in `left` field, not `callee`
+        let callee = expr.left
+        if type_of(callee) != "string" && callee.kind == "Ident" {
+            let mut p_args = []
+            for a in expr.args { p_args = p_args.push(expr_to_proof_expr(a)) }
+            return proof_fn_call(callee.name, p_args)
+        }
+        return proof_unknown("unknown_call")
+    }
+    return proof_unknown("expr_" + k)
+}
+
+// execute_proof_block_stmt(stmt) — dispatch a single proof block statement.
+//   Returns ["proved" | "refuted" | "skipped" | "unknown", message]
+fn execute_proof_block_stmt(stmt) {
+    if type_of(stmt) == "string" { return ["skipped", "string_stmt"] }
+    let k = stmt.kind
+    let mut req = val_void()
+    if k == "ForAll" {
+        let cond_pe = expr_to_proof_expr(stmt.condition)
+        let conc_pe = expr_to_proof_expr(stmt.conclusion)
+        req = ["forall", cond_pe, conc_pe]
+    }
+    if k == "Exists" {
+        let cond_pe = expr_to_proof_expr(stmt.condition)
+        req = ["exists", cond_pe]
+    }
+    if k == "Assert" || k == "AssertStmt" {
+        let pe = expr_to_proof_expr(stmt.left)
+        req = ["assert", pe]
+    }
+    if k == "Invariant" {
+        // parser uses .left for the expression (not .expr)
+        let pe = expr_to_proof_expr(stmt.left)
+        req = ["assert", pe]
+    }
+    if k == "CheckLaw" {
+        req = ["check_law", stmt.n]
+    }
+    if type_of(req) != "string" && req.tag == "void" {
+        return ["skipped", "unknown_proof_stmt_kind"]
+    }
+    // Delegate to host proof engine if available
+    let host = call_builtin("__host_proof_check", [req])
+    if host.tag != "__not_builtin__" { return host }
+    return ["skipped", "host runtime does not expose __host_proof_check"]
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Phase 8 골화 — fusion chain optimizer
+//  src/interpreter.rs:11441 try_fuse_chain 대응
+// ═══════════════════════════════════════════════════════════
+//  arr.map(f).filter(g).sum() 같은 인접 체인을 single-pass
+//  루프로 융합. terminal: map/filter/fold/sum/count/any/all/find.
+//  실패/미적용은 sentinel tag="__not_fused__" 반환 → caller fallback.
+
+fn fuse_sentinel() {
+    return Val { tag: "__not_fused__", int_val: 0, float_val: 0.0, bool_val: false, str_val: "", char_val: "", array_val: "", fn_name: "", fn_params: "", fn_body: "", struct_name: "", struct_fields: "" }
+}
+
+fn is_fuse_terminal(method) {
+    if method == "map" { return true }
+    if method == "filter" { return true }
+    if method == "fold" { return true }
+    if method == "sum" { return true }
+    if method == "count" { return true }
+    if method == "any" { return true }
+    if method == "all" { return true }
+    if method == "find" { return true }
+    return false
+}
+
+fn try_fuse_chain(obj_expr, final_method, final_args) {
+    if !is_fuse_terminal(final_method) { return fuse_sentinel() }
+    // Walk the chain: collect (method, args) pairs, terminating at non-map/filter
+    let mut ops_methods = [final_method]
+    let mut ops_args = [final_args]
+    let mut current = obj_expr
+    let mut walking = true
+    while walking {
+        if type_of(current) == "string" { walking = false } else {
+            // Defensive: parser may emit non-struct stub on syntax error
+            if type_of(current) != "struct" && type_of(current) != "map" { walking = false } else {
+                if current.kind == "Call" {
+                    // parser AST stores callee in `left` field
+                    let callee = current.left
+                    if type_of(callee) != "string" && callee.kind == "Field" {
+                        let m = callee.name
+                        if m == "map" || m == "filter" {
+                            ops_methods = ops_methods.push(m)
+                            ops_args = ops_args.push(current.args)
+                            current = callee.left
+                        } else { walking = false }
+                    } else { walking = false }
+                } else { walking = false }
+            }
+        }
+    }
+    if len(ops_methods) < 2 { return fuse_sentinel() }
+    // Reverse to execution order (innermost first)
+    let mut rev_methods = []
+    let mut rev_args = []
+    let mut ri = len(ops_methods) - 1
+    while ri >= 0 {
+        rev_methods = rev_methods.push(ops_methods[ri])
+        rev_args = rev_args.push(ops_args[ri])
+        ri = ri - 1
+    }
+    // Evaluate root
+    let root = eval_expr(current)
+    if root.tag != "array" { return fuse_sentinel() }
+    let arr = get_array(root)
+    // Evaluate closures (may be void for sum/count)
+    let mut closures = []
+    let mut ci = 0
+    while ci < len(rev_methods) {
+        let m = rev_methods[ci]
+        if m == "sum" || m == "count" {
+            closures = closures.push(val_void())
+        } else {
+            let aa = rev_args[ci]
+            if len(aa) == 0 { return fuse_sentinel() }
+            closures = closures.push(eval_expr(aa[0]))
+        }
+        ci = ci + 1
+    }
+    let last_method = rev_methods[len(rev_methods) - 1]
+    let chain_len = len(rev_methods)
+    // map/filter terminal → array result
+    if last_method == "map" || last_method == "filter" {
+        let mut result = []
+        for item in arr {
+            let mut val = item
+            let mut keep = true
+            let mut mi = 0
+            while mi < chain_len && keep {
+                let m = rev_methods[mi]
+                let f = closures[mi]
+                if m == "map" {
+                    val = call_fn_val(f, [val])
+                } else {
+                    if m == "filter" {
+                        let test = call_fn_val(f, [val])
+                        if !is_truthy(test) { keep = false }
+                    }
+                }
+                mi = mi + 1
+            }
+            if keep { result = result.push(val) }
+        }
+        return val_array(result)
+    }
+    // fold terminal: needs init + fn (skip last in chain loop, fold separately)
+    if last_method == "fold" {
+        let fold_args_raw = rev_args[chain_len - 1]
+        if len(fold_args_raw) < 2 { return fuse_sentinel() }
+        let mut acc = eval_expr(fold_args_raw[0])
+        let fold_fn = eval_expr(fold_args_raw[1])
+        for item in arr {
+            let mut val = item
+            let mut keep = true
+            let mut mi = 0
+            while mi < chain_len - 1 && keep {
+                let m = rev_methods[mi]
+                let f = closures[mi]
+                if m == "map" { val = call_fn_val(f, [val]) }
+                else { if m == "filter" {
+                    let test = call_fn_val(f, [val])
+                    if !is_truthy(test) { keep = false }
+                } }
+                mi = mi + 1
+            }
+            if keep { acc = call_fn_val(fold_fn, [acc, val]) }
+        }
+        return acc
+    }
+    // sum / count
+    if last_method == "sum" {
+        let mut int_sum = 0
+        let mut has_float = false
+        let mut float_sum = 0.0
+        for item in arr {
+            let mut val = item
+            let mut keep = true
+            let mut mi = 0
+            while mi < chain_len - 1 && keep {
+                let m = rev_methods[mi]
+                let f = closures[mi]
+                if m == "map" { val = call_fn_val(f, [val]) }
+                else { if m == "filter" {
+                    let test = call_fn_val(f, [val])
+                    if !is_truthy(test) { keep = false }
+                } }
+                mi = mi + 1
+            }
+            if keep {
+                if val.tag == "float" { has_float = true; float_sum = float_sum + val.float_val }
+                else { int_sum = int_sum + val.int_val; float_sum = float_sum + val.int_val }
+            }
+        }
+        if has_float { return val_float(float_sum) }
+        return val_int(int_sum)
+    }
+    if last_method == "count" {
+        let mut cnt = 0
+        for item in arr {
+            let mut val = item
+            let mut keep = true
+            let mut mi = 0
+            while mi < chain_len - 1 && keep {
+                let m = rev_methods[mi]
+                let f = closures[mi]
+                if m == "map" { val = call_fn_val(f, [val]) }
+                else { if m == "filter" {
+                    let test = call_fn_val(f, [val])
+                    if !is_truthy(test) { keep = false }
+                } }
+                mi = mi + 1
+            }
+            if keep { cnt = cnt + 1 }
+        }
+        return val_int(cnt)
+    }
+    // any / all / find — predicate is final closure
+    if last_method == "any" || last_method == "all" || last_method == "find" {
+        let pred = closures[chain_len - 1]
+        let is_any = (last_method == "any")
+        let is_find = (last_method == "find")
+        for item in arr {
+            let mut val = item
+            let mut keep = true
+            let mut mi = 0
+            while mi < chain_len - 1 && keep {
+                let m = rev_methods[mi]
+                let f = closures[mi]
+                if m == "map" { val = call_fn_val(f, [val]) }
+                else { if m == "filter" {
+                    let test = call_fn_val(f, [val])
+                    if !is_truthy(test) { keep = false }
+                } }
+                mi = mi + 1
+            }
+            if keep {
+                let test = call_fn_val(pred, [val])
+                if is_truthy(test) {
+                    if is_find { return val }
+                    if is_any { return val_bool(true) }
+                } else {
+                    if !is_any && !is_find { return val_bool(false) }
+                }
+            }
+        }
+        if is_any { return val_bool(false) }
+        if is_find { return val_void() }
+        return val_bool(true)
+    }
+    return fuse_sentinel()
+}
+
 fn env_push_scope() {
     env_scopes = env_scopes.push(len(env_vars))
 }
@@ -263,10 +688,18 @@ fn env_set(name, value) {
 // ── Core: eval_expr ──────────────────────────────────────
 
 fn eval_expr_at(arr, idx) {
-    let k = arr[idx].kind
+    // Defensive: parser may emit Str("") or non-struct stubs when recovering
+    // from a syntax error. Bail out to void instead of crashing.
+    let elem = arr[idx]
+    if type_of(elem) == "string" { return val_void() }
+    if type_of(elem) == "int" { return val_int(elem) }
+    if type_of(elem) == "float" { return val_float(elem) }
+    if type_of(elem) != "struct" && type_of(elem) != "map" { return val_void() }
+    let k = elem.kind
+    if type_of(k) != "string" { return val_void() }
 
-    if k == "IntLit" { return val_int(to_int(arr[idx].value)) }
-    if k == "FloatLit" { return val_float(to_float(arr[idx].value)) }
+    if k == "IntLit" { return val_int(arr[idx].value.parse_int()) }
+    if k == "FloatLit" { return val_float(arr[idx].value.parse_float()) }
     if k == "BoolLit" { return val_bool(arr[idx].value == "true") }
     if k == "StringLit" { return val_str(arr[idx].value) }
     if k == "CharLit" { return val_str(arr[idx].value) }
@@ -282,10 +715,17 @@ fn eval_expr(node) {
 }
 
 fn eval_expr_inner(node) {
+    // Defensive: parser may produce non-struct stub values when recovering
+    // from a syntax error. Treat them as void to keep interpret() resilient.
+    if type_of(node) == "string" { return val_void() }
+    if type_of(node) == "int" { return val_int(node) }
+    if type_of(node) == "float" { return val_float(node) }
+    if type_of(node) != "struct" && type_of(node) != "map" { return val_void() }
     let k = node.kind
+    if type_of(k) != "string" { return val_void() }
 
-    if k == "IntLit" { return val_int(to_int(node.value)) }
-    if k == "FloatLit" { return val_float(to_float(node.value)) }
+    if k == "IntLit" { return val_int(node.value.parse_int()) }
+    if k == "FloatLit" { return val_float(node.value.parse_float()) }
     if k == "BoolLit" { return val_bool(node.value == "true") }
     if k == "StringLit" { return val_str(node.value) }
     if k == "CharLit" { return val_str(node.value) }
@@ -382,6 +822,8 @@ fn eval_expr_inner(node) {
             let mut _ai = 0
             while _ai < len(raw_args) {
                 call_args = call_args.push(eval_expr_at(raw_args, _ai))
+                // Propagate throw from arg expression evaluation
+                if throw_flag || panic_flag { return val_void() }
                 _ai = _ai + 1
             }
         }
@@ -398,11 +840,31 @@ fn eval_expr_inner(node) {
         }
         if type_of(callee) != "string" && callee.kind == "Ident" {
             let fname = callee.name
+            // User function takes precedence over builtin (allows shadowing)
+            let user_info = find_fn(fname)
+            if user_info != "" { return call_user_fn(fname, call_args) }
             let br = call_builtin(fname, call_args)
             if br.tag != "__not_builtin__" { return br }
             return call_user_fn(fname, call_args)
         }
         if type_of(callee) != "string" && callee.kind == "Field" {
+            // Effect call: if receiver is an Ident naming a registered effect,
+            // route to eval_effect_call. effect_def_lookup returns either a
+            // host array (of op names) or val_void() on miss.
+            if type_of(callee.left) != "string" && callee.left.kind == "Ident" {
+                let recv_name = callee.left.name
+                let ops_or_void = effect_def_lookup(recv_name)
+                if type_of(ops_or_void) == "array" {
+                    return eval_effect_call(recv_name, callee.name, call_args)
+                }
+            }
+            // ── Phase 8 골화: fusion chain 시도 ──
+            // src/interpreter.rs:11441 try_fuse_chain 동치.
+            // map/filter/fold/sum/count/any/all/find의 인접 체인을
+            // single-pass 루프로 병합. 미스매치 시 fallback.
+            let fuse_result = try_fuse_chain(callee.left, callee.name, node.args)
+            if fuse_result.tag != "__not_fused__" { return fuse_result }
+
             let obj = eval_expr(callee.left)
             let method = callee.name
             let result = call_method(obj, method, call_args)
@@ -548,6 +1010,139 @@ fn eval_expr_inner(node) {
         let err = eval_expr(node.left)
         exec_throw(err)
         return val_void()
+    }
+
+    // ═══════════════════════════════════════════════════════
+    //  Phase 10 골화 — 추가 expression kinds
+    // ═══════════════════════════════════════════════════════
+
+    // Block expression: { stmts; final_expr }
+    if k == "Block" || k == "BlockExpr" {
+        return eval_block(node.body)
+    }
+
+    // Tuple expression: (a, b, c) — represented as array of evaluated elements
+    if k == "Tuple" || k == "TupleExpr" {
+        let mut items = []
+        if type_of(node.elements) == "array" {
+            for e in node.elements { items = items.push(eval_expr(e)) }
+        }
+        return val_array(items)
+    }
+
+    // HandleWith: handle { body } with { eff.op(...) -> ... }
+    //   Note: AST stores effect name in `name` field (not `effect`, which is a keyword)
+    if k == "HandleWith" {
+        let mut entries = []
+        if type_of(node.handlers) == "array" {
+            for h in node.handlers {
+                let key = h.name + "." + h.op
+                entries = entries.push([key, h.params, h.body])
+            }
+        }
+        effect_handler_push(entries)
+        let result = eval_expr(node.body)
+        effect_handler_pop()
+        return result
+    }
+
+    // EffectCall: eff.op(args) — AST uses `name` for effect identifier
+    if k == "EffectCall" {
+        let mut eargs = []
+        if type_of(node.args) == "array" {
+            for a in node.args { eargs = eargs.push(eval_expr(a)) }
+        }
+        return eval_effect_call(node.name, node.op, eargs)
+    }
+
+    // Resume: inside an effect handler, set the resume value (parser: .left)
+    if k == "Resume" || k == "ResumeExpr" {
+        let v = eval_expr(node.left)
+        resume_value = v
+        resume_set = true
+        return val_void()
+    }
+
+    // Comptime expression: evaluate at compile time (here just eval normally)
+    if k == "Comptime" || k == "ComptimeExpr" {
+        return eval_expr(node.expr)
+    }
+
+    // Template / string interpolation: concatenate parts
+    //   parts: array of {kind: "lit", value} | {kind: "expr", expr}
+    if k == "Template" || k == "TemplateExpr" || k == "InterpolatedString" {
+        let mut out = ""
+        if type_of(node.parts) == "array" {
+            for p in node.parts {
+                if type_of(p) == "string" {
+                    out = out + p
+                } else {
+                    if p.kind == "lit" || p.kind == "StringLit" { out = out + p.value }
+                    else { out = out + val_to_string(eval_expr(p.expr)) }
+                }
+            }
+        }
+        return val_str(out)
+    }
+
+    // Wildcard / ArrayPattern: only meaningful in patterns; in expr context yields void
+    if k == "Wildcard" || k == "ArrayPattern" {
+        return val_void()
+    }
+
+    // Own / Move / Borrow: ownership annotations have no runtime effect
+    if k == "Own" || k == "Move" || k == "MoveExpr" || k == "Borrow" || k == "BorrowExpr" {
+        return eval_expr(node.expr)
+    }
+
+    // Await: in single-thread interpreter, await is identity (already-resolved)
+    if k == "Await" || k == "AwaitExpr" {
+        let v = eval_expr(node.expr)
+        // If it's a future struct, extract value; else passthrough
+        if v.tag == "struct" && v.struct_name == "Future" {
+            let fields = get_struct_fields(v)
+            if type_of(fields) == "map" { return map_get(fields, val_str("value")) }
+        }
+        return v
+    }
+
+    // DynCast: trait object dispatch (.hexa interp doesn't track trait impls
+    //   strongly; passthrough the value tagged with trait_name)
+    if k == "DynCast" || k == "DynCastExpr" {
+        return eval_expr(node.expr)
+    }
+
+    // MacroInvoc: macros are pre-expanded by parser; if seen here, treat
+    //   as a tagged Call to a function with the same name
+    if k == "MacroInvoc" || k == "MacroInvocation" {
+        let mut margs = []
+        if type_of(node.args) == "array" {
+            for a in node.args { margs = margs.push(eval_expr(a)) }
+        }
+        return call_user_fn(node.name, margs)
+    }
+
+    // TryCatch as expression
+    if k == "TryCatchExpr" || k == "TryCatch" {
+        let try_body = node.try_body
+        let catch_var = node.catch_var
+        let catch_body = node.catch_body
+        env_push_scope()
+        let result = eval_body(try_body)
+        env_pop_scope()
+        if throw_flag {
+            let caught = throw_val
+            throw_flag = false
+            throw_val = val_void()
+            env_push_scope()
+            if type_of(catch_var) == "string" && catch_var != "" {
+                env_define(catch_var, caught)
+            }
+            let cresult = eval_body(catch_body)
+            env_pop_scope()
+            return cresult
+        }
+        return result
     }
 
     // ── MatchExpr: match expr { pattern -> body, ... } ──────
@@ -997,7 +1592,11 @@ fn exec_stmt(node) {
 
 fn exec_stmt_at(stmts, idx) {
     let node = stmts[idx]
+    // Defensive: parser may emit Str("") or non-struct stub on syntax error
+    if type_of(node) == "string" { return val_void() }
+    if type_of(node) != "struct" && type_of(node) != "map" { return val_void() }
     let k = node.kind
+    if type_of(k) != "string" { return val_void() }
 
     if k == "LetStmt" || k == "LetMutStmt" || k == "ConstStmt" || k == "StaticStmt" {
         let val = val_void()
@@ -1252,6 +1851,228 @@ fn exec_stmt_at(stmts, idx) {
         return val_void()
     }
 
+    // ═══════════════════════════════════════════════════════
+    //  Phase 10 골화 — 추가 statement kinds (.rs 대응)
+    // ═══════════════════════════════════════════════════════
+
+    // Stmt::Mod — module declaration: just exec body in current scope
+    if k == "Mod" || k == "ModStmt" {
+        let body = node.body
+        if type_of(body) == "array" { eval_body(body) }
+        return val_void()
+    }
+
+    // Stmt::Use / ImportStmt — module path import: no-op (resolution at parser level)
+    if k == "Use" || k == "UseStmt" || k == "ImportStmt" {
+        return val_void()
+    }
+
+    // Stmt::Assert — runtime assertion (parser uses .left)
+    if k == "AssertStmt" || k == "Assert" {
+        let cond = eval_expr(node.left)
+        if !is_truthy(cond) {
+            throw_flag = true
+            throw_val = val_str("assertion failed")
+        }
+        return val_void()
+    }
+    // Stmt::Invariant — proof block invariant marker (treat like assertion at runtime)
+    if k == "Invariant" {
+        let cond = eval_expr(node.left)
+        if !is_truthy(cond) {
+            throw_flag = true
+            throw_val = val_str("invariant violated")
+        }
+        return val_void()
+    }
+
+    // Stmt::Resume — inside effect handler, capture value and halt body
+    if k == "Resume" {
+        let v = eval_expr(node.left)
+        resume_value = v
+        resume_set = true
+        return_flag = true  // halt handler body
+        return_val = v
+        return val_void()
+    }
+
+    // Stmt::ContractAssert — @requires/@ensures runtime check
+    if k == "ContractAssert" {
+        let cond = eval_expr(node.left)
+        if !is_truthy(cond) {
+            throw_flag = true
+            throw_val = val_str("contract violated")
+        }
+        return val_void()
+    }
+
+    // Stmt::EffectDecl — register an effect with its operations
+    //   parser stores op list in `items`, each EffectOp has .name
+    if k == "EffectDecl" {
+        let effect_name = node.name
+        let mut op_names = []
+        if type_of(node.items) == "array" {
+            for op in node.items { op_names = op_names.push(op.name) }
+        }
+        effect_def_add(effect_name, op_names)
+        return val_void()
+    }
+
+    // Stmt::TypeAlias / Stmt::DeriveDecl — declarative, no runtime effect
+    if k == "TypeAlias" || k == "TypeAliasStmt" || k == "DeriveDecl" || k == "DeriveStmt" {
+        return val_void()
+    }
+
+    // Stmt::AtomicLet — let with Atomic wrapper
+    if k == "AtomicLet" {
+        let val = eval_expr(node.left)
+        let atom = val_atomic(val)
+        env_define(node.name, atom)
+        return val_void()
+    }
+
+    // Stmt::Spawn — fire-and-forget block (single-threaded eval: just run inline)
+    if k == "Spawn" || k == "SpawnNamed" || k == "SpawnStmt" {
+        let body = node.body
+        if type_of(body) == "array" { eval_body(body) }
+        return val_void()
+    }
+
+    // Stmt::Scope — scoped block
+    if k == "Scope" || k == "ScopeStmt" {
+        let body = node.body
+        if type_of(body) == "array" { eval_block(body) }
+        return val_void()
+    }
+
+    // Stmt::DropStmt — explicit destructor call (interpreter no-op)
+    if k == "DropStmt" || k == "Drop" {
+        return val_void()
+    }
+
+    // Stmt::ProofBlock / Theorem — formal proof statements
+    if k == "ProofBlock" || k == "Theorem" {
+        let stmts = node.proof_stmts
+        if type_of(stmts) == "array" {
+            for ps in stmts {
+                let r = execute_proof_block_stmt(ps)
+                // Result format: ["proved" | "refuted" | "skipped" | ...]
+                if type_of(r) == "array" && len(r) >= 1 && r[0] == "refuted" {
+                    throw_flag = true
+                    throw_val = val_str("proof refuted: " + r[1])
+                    return val_void()
+                }
+            }
+        }
+        return val_void()
+    }
+
+    // Stmt::Intent / Stmt::Verify / Stmt::ConsciousnessBlock / Stmt::EvolveFn
+    // — declarative consciousness/AI markers, no runtime effect in self-host
+    if k == "Intent" || k == "IntentStmt" || k == "Verify" || k == "VerifyStmt" {
+        return val_void()
+    }
+    if k == "ConsciousnessBlock" || k == "EvolveFn" || k == "EvolveFnDecl" {
+        return val_void()
+    }
+
+    // Stmt::MacroDef — macro registration (interpreter ignores; expansion at parser)
+    if k == "MacroDef" || k == "MacroDefStmt" {
+        return val_void()
+    }
+    if k == "ComptimeFn" || k == "ComptimeFnDecl" {
+        // Comptime functions evaluated lazily; treat as regular FnDecl
+        env_fns = env_fns.push([node.name, node])
+        return val_void()
+    }
+
+    // Stmt::Generate / Stmt::Optimize — directive declarations
+    if k == "Generate" || k == "Optimize" || k == "OptimizeStmt" || k == "GenerateStmt" || k == "GenerateFnStmt" || k == "OptimizeFnStmt" {
+        return val_void()
+    }
+
+    // Stmt::TheoremStmt — alias for Theorem (Phase 9 proof block)
+    if k == "TheoremStmt" {
+        let stmts = node.proof_stmts
+        if type_of(stmts) == "array" {
+            for ps in stmts { execute_proof_block_stmt(ps) }
+        }
+        return val_void()
+    }
+
+    // Stmt::HandleWithStmt — statement-form of handle/with
+    //   parser stores handlers in `items`, each EffectHandler has
+    //   .target = effect name, .name = op name, .params, .body
+    if k == "HandleWithStmt" {
+        let mut entries = []
+        if type_of(node.items) == "array" {
+            for h in node.items {
+                let key = h.target + "." + h.name
+                entries = entries.push([key, h.params, h.body])
+            }
+        }
+        effect_handler_push(entries)
+        eval_body(node.body)
+        effect_handler_pop()
+        return val_void()
+    }
+
+    // Stmt::PureFnDecl — function declared @pure; same as FnDecl, but tag the
+    //   pure flag so effect calls inside trigger an error.
+    if k == "PureFnDecl" {
+        env_fns = env_fns.push([node.name, node])
+        fn_attrs_set(node.name, "pure")
+        return val_void()
+    }
+
+    // Comptime variants — evaluated in regular context (no compile-time phase)
+    if k == "ComptimeAssert" {
+        let cond = eval_expr(node.left)
+        if !is_truthy(cond) {
+            throw_flag = true
+            throw_val = val_str("comptime assertion failed")
+        }
+        return val_void()
+    }
+    if k == "ComptimeBlock" {
+        let body = node.body
+        if type_of(body) == "array" { eval_body(body) }
+        return val_void()
+    }
+    if k == "ComptimeLet" || k == "ComptimeConst" {
+        let val = eval_expr(node.left)
+        env_define(node.name, val)
+        return val_void()
+    }
+    if k == "ComptimeFnDecl" {
+        env_fns = env_fns.push([node.name, node])
+        return val_void()
+    }
+
+    // Stmt::Select — channel select (single-thread: pick first ready)
+    //   Note: AST uses `chan` field for channel expression (channel is a keyword)
+    if k == "Select" || k == "SelectStmt" {
+        let arms = node.arms
+        if type_of(arms) == "array" && len(arms) > 0 {
+            for arm in arms {
+                let ch = eval_expr(arm.chan)
+                if ch.tag == "channel" {
+                    let v = channel_recv(ch)
+                    if v.tag != "void" {
+                        env_push_scope()
+                        if type_of(arm.var_name) == "string" && arm.var_name != "" {
+                            env_define(arm.var_name, v)
+                        }
+                        eval_body(arm.body)
+                        env_pop_scope()
+                        return val_void()
+                    }
+                }
+            }
+        }
+        return val_void()
+    }
+
     // Ignore unknown statement kinds
     return val_void()
 }
@@ -1307,12 +2128,13 @@ fn eval_call(node) {
     // Direct call: name(args)
     if type_of(callee) != "string" && callee.kind == "Ident" {
         let name = callee.name
-        // Builtins
+        // User function takes precedence over builtin (allows shadowing)
+        let user_info = find_fn(name)
+        if user_info != "" { return call_user_fn(name, args) }
         let builtin_result = call_builtin(name, args)
         if builtin_result.tag != "__not_builtin__" {
             return builtin_result
         }
-        // User functions
         return call_user_fn(name, args)
     }
 
@@ -1381,14 +2203,30 @@ fn call_user_fn(name, args) {
     gen_buffer = []
     gen_active = false
     // Inline body execution (avoid struct copy via eval_body)
+    // Track the last ExprStmt's value for implicit return semantics:
+    // a fn body ending in `expr` (no return) yields that expr's value.
+    let mut last_expr_val = val_void()
     let mut _cbi = 0
     while _cbi < len(body) {
         if return_flag || throw_flag { _cbi = len(body) } else {
-            exec_stmt_at(body, _cbi)
+            let stmt = body[_cbi]
+            if type_of(stmt) != "string" && type_of(stmt) == "struct" || type_of(stmt) == "map" {
+                if stmt.kind == "ExprStmt" {
+                    last_expr_val = eval_expr(stmt.left)
+                } else {
+                    exec_stmt_at(body, _cbi)
+                }
+            } else {
+                exec_stmt_at(body, _cbi)
+            }
             _cbi = _cbi + 1
         }
     }
     let mut result = return_val
+    // Implicit return: if no explicit return fired, use last expression value
+    if !return_flag && result.tag == "void" && last_expr_val.tag != "void" {
+        result = last_expr_val
+    }
     // Sprint C: if at least one yield happened AND no explicit return
     // value was set, convert the accumulated buffer into an array value.
     if gen_active && !return_flag {
@@ -1542,6 +2380,22 @@ fn call_builtin(name, args) {
         }
         return val_void()
     }
+    if name == "eprintln" {
+        let mut out = ""
+        for a in args { out = out + val_to_string(a) }
+        try {
+            eprintln(out)
+        } catch e {
+            let es = e.to_string()
+            if es.contains("pipe") || es.contains("EPIPE") || es.contains("BrokenPipe") {
+                exit(0)
+            }
+            // can't use eprintln to report eprintln failure — fall to plain println
+            println("[interpreter.eprintln] " + es)
+            exit(1)
+        }
+        return val_void()
+    }
     if name == "print" {
         let mut out = ""
         for a in args { out = out + val_to_string(a) }
@@ -1556,6 +2410,2722 @@ fn call_builtin(name, args) {
             exit(1)
         }
         return val_void()
+    }
+    // ── Phase 12 골화 — 호스트 빌트인 패스스루 ──
+    // exec(cmd) → 호스트 shell에 위임. 실패 시 tag="error" Val.
+    //   exec()는 매우 자주 쓰이며 P11 안티패턴(`exec(...).trim()`)의 출처.
+    //   여기선 호스트 인터프리터 빌트인을 직접 호출.
+    if name == "exec" {
+        if len(args) == 0 { return val_str("") }
+        try {
+            let result = exec(args[0].str_val)
+            return val_str(result)
+        } catch e {
+            return Val { tag: "error", int_val: 0, float_val: 0.0, bool_val: false, str_val: e.to_string(), char_val: "", array_val: "", fn_name: "", fn_params: "", fn_body: "", struct_name: "", struct_fields: "" }
+        }
+    }
+    if name == "exec_with_status" {
+        if len(args) == 0 { return val_array([val_str(""), val_int(0)]) }
+        try {
+            let result = exec(args[0].str_val)
+            return val_array([val_str(result), val_int(0)])
+        } catch e {
+            return val_array([val_str(e.to_string()), val_int(1)])
+        }
+    }
+    if name == "env" || name == "env_get" {
+        if len(args) == 0 { return val_str("") }
+        let v = env_var(args[0].str_val)
+        return val_str(v)
+    }
+    if name == "args" || name == "argv" {
+        let a = host_args()
+        let mut wrapped = []
+        if type_of(a) == "array" {
+            let mut _ai = 0
+            while _ai < len(a) {
+                wrapped = wrapped.push(val_str(to_string(a[_ai])))
+                _ai = _ai + 1
+            }
+        }
+        return val_array(wrapped)
+    }
+    if name == "file_size" {
+        if len(args) == 0 { return val_int(0) }
+        try {
+            let content = read_file(args[0].str_val)
+            return val_int(len(content))
+        } catch e {
+            return val_int(-1)
+        }
+    }
+    if name == "clock" || name == "elapsed" {
+        return val_int(timestamp())
+    }
+    if name == "chr" {
+        if len(args) == 0 { return val_str("") }
+        return val_str(to_string(args[0].int_val))
+    }
+    if name == "arange" {
+        // arange(n) | arange(start, end) | arange(start, end, step)
+        let start = if len(args) >= 2 { args[0].int_val } else { 0 }
+        let end = if len(args) >= 2 { args[1].int_val } else { args[0].int_val }
+        let step = if len(args) >= 3 { args[2].int_val } else { 1 }
+        let mut result = []
+        let mut i = start
+        if step > 0 {
+            while i < end { result = result.push(val_int(i)); i = i + step }
+        }
+        return val_array(result)
+    }
+    if name == "argmax" {
+        if len(args) == 0 { return val_int(-1) }
+        let arr = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        if len(arr) == 0 { return val_int(-1) }
+        let mut best_i = 0
+        let mut best_v = if type_of(arr[0]) == "float" { arr[0] } else { to_float_val(arr[0]) }
+        let mut i = 1
+        while i < len(arr) {
+            let v = if type_of(arr[i]) == "float" { arr[i] } else { to_float_val(arr[i]) }
+            if v > best_v { best_v = v; best_i = i }
+            i = i + 1
+        }
+        return val_int(best_i)
+    }
+    if name == "flatten" {
+        if len(args) == 0 { return val_array([]) }
+        let arr = get_array(args[0])
+        let mut result = []
+        for item in arr {
+            if item.tag == "array" {
+                let sub = get_array(item)
+                for s in sub { result = result.push(s) }
+            } else {
+                result = result.push(item)
+            }
+        }
+        return val_array(result)
+    }
+    if name == "f32_bits" {
+        // float → IEEE-754 single bits (host runtime delegate)
+        // self-host fallback: int_val of integer cast (lossy, but matches API)
+        if len(args) == 0 { return val_int(0) }
+        return val_int(args[0].int_val)
+    }
+    if name == "f32_from_bits" {
+        if len(args) == 0 { return val_float(0.0) }
+        return val_float(args[0].int_val + 0.0)
+    }
+    if name == "channel" {
+        // channel() | channel(capacity)
+        let cap = if len(args) > 0 { args[0].int_val } else { 0 }
+        return val_channel_make(cap)
+    }
+    if name == "bigint" {
+        if len(args) == 0 { return val_bigint("0") }
+        if args[0].tag == "int" { return val_bigint_from_int(args[0].int_val) }
+        if args[0].tag == "str" { return val_bigint(args[0].str_val) }
+        return val_bigint(val_to_string(args[0]))
+    }
+    // ── Phase 12b 골화 — math/loss/util builtins ──
+    if name == "clip" {
+        // clip(x, lo, hi)
+        if len(args) < 3 { return val_float(0.0) }
+        let x = to_float_val(args[0])
+        let lo = to_float_val(args[1])
+        let hi = to_float_val(args[2])
+        if x < lo { return val_float(lo) }
+        if x > hi { return val_float(hi) }
+        return val_float(x)
+    }
+    if name == "ema" {
+        // ema(prev, x, alpha) → prev*(1-alpha) + x*alpha
+        if len(args) < 3 { return val_float(0.0) }
+        let prev = to_float_val(args[0])
+        let x = to_float_val(args[1])
+        let alpha = to_float_val(args[2])
+        return val_float(prev * (1.0 - alpha) + x * alpha)
+    }
+    if name == "entropy" {
+        // entropy(probs) — Shannon entropy
+        if len(args) == 0 { return val_float(0.0) }
+        let arr = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let mut h = 0.0
+        for v in arr {
+            let p = if type_of(v) == "float" { v } else { to_float_val(v) }
+            if p > 0.0 { h = h - p * ln(p) }
+        }
+        return val_float(h)
+    }
+    if name == "cosine_sim" {
+        // cosine_sim(a, b) → dot/(|a|*|b|)
+        if len(args) < 2 { return val_float(0.0) }
+        let a = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let b = if args[1].tag == "tensor" { tensor_data(args[1]) } else { get_array(args[1]) }
+        let n = if len(a) < len(b) { len(a) } else { len(b) }
+        let mut dot_p = 0.0
+        let mut na = 0.0
+        let mut nb = 0.0
+        let mut i = 0
+        while i < n {
+            let av = if type_of(a[i]) == "float" { a[i] } else { to_float_val(a[i]) }
+            let bv = if type_of(b[i]) == "float" { b[i] } else { to_float_val(b[i]) }
+            dot_p = dot_p + av * bv
+            na = na + av * av
+            nb = nb + bv * bv
+            i = i + 1
+        }
+        let denom = sqrt(na) * sqrt(nb)
+        if denom == 0.0 { return val_float(0.0) }
+        return val_float(dot_p / denom)
+    }
+    if name == "cross_entropy" {
+        // cross_entropy(logits, target_idx) — softmax + -log p[target]
+        if len(args) < 2 { return val_float(0.0) }
+        let logits = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let target = args[1].int_val
+        if target < 0 || target >= len(logits) { return val_float(0.0) }
+        // softmax stability: subtract max
+        let mut max_l = if type_of(logits[0]) == "float" { logits[0] } else { to_float_val(logits[0]) }
+        for v in logits {
+            let f = if type_of(v) == "float" { v } else { to_float_val(v) }
+            if f > max_l { max_l = f }
+        }
+        let mut sum_exp = 0.0
+        for v in logits {
+            let f = if type_of(v) == "float" { v } else { to_float_val(v) }
+            sum_exp = sum_exp + exp(f - max_l)
+        }
+        let target_v = if type_of(logits[target]) == "float" { logits[target] } else { to_float_val(logits[target]) }
+        let log_softmax = (target_v - max_l) - ln(sum_exp)
+        return val_float(0.0 - log_softmax)
+    }
+    if name == "cosine_lr" {
+        // cosine_lr(step, total, base, min_lr) — cosine annealing schedule
+        if len(args) < 4 { return val_float(0.0) }
+        let step = to_float_val(args[0])
+        let total = to_float_val(args[1])
+        let base = to_float_val(args[2])
+        let min_lr = to_float_val(args[3])
+        if total <= 0.0 { return val_float(base) }
+        let progress = step / total
+        let factor = 0.5 * (1.0 + cos(3.14159265358979 * progress))
+        return val_float(min_lr + (base - min_lr) * factor)
+    }
+    if name == "base64_encode" {
+        if len(args) == 0 { return val_str("") }
+        // Self-host: delegate to host if exposed; else simple stub
+        let s = if args[0].tag == "str" { args[0].str_val } else { val_to_string(args[0]) }
+        try {
+            let result = base64_encode(s)
+            return val_str(result)
+        } catch e {
+            return val_str(s)
+        }
+    }
+    if name == "base64_decode" {
+        if len(args) == 0 { return val_str("") }
+        let s = args[0].str_val
+        try {
+            let result = base64_decode(s)
+            return val_str(result)
+        } catch e {
+            return val_str(s)
+        }
+    }
+    if name == "dropout" {
+        // dropout(x, rate) — for inference, identity (rate ignored)
+        if len(args) == 0 { return val_void() }
+        return args[0]
+    }
+    if name == "batch_norm" {
+        // batch_norm(x, mean, var, eps) — (x - mean) / sqrt(var + eps)
+        if len(args) < 4 { return val_void() }
+        let arr = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let mean = to_float_val(args[1])
+        let var = to_float_val(args[2])
+        let eps = to_float_val(args[3])
+        let denom = sqrt(var + eps)
+        let mut out = []
+        for v in arr {
+            let f = if type_of(v) == "float" { v } else { to_float_val(v) }
+            out = out.push((f - mean) / denom)
+        }
+        if args[0].tag == "tensor" { return val_tensor(tensor_shape(args[0]), out) }
+        return val_array(out)
+    }
+    if name == "embedding" {
+        // embedding(table, idx, dim) → row of `dim` floats from table starting at idx*dim
+        if len(args) < 3 { return val_array([]) }
+        let table = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let idx = args[1].int_val
+        let dim = args[2].int_val
+        let base = idx * dim
+        if base < 0 || base + dim > len(table) { return val_array([]) }
+        let mut out = []
+        let mut i = 0
+        while i < dim {
+            let v = table[base + i]
+            if type_of(v) == "float" { out = out.push(v) }
+            else { out = out.push(to_float_val(v)) }
+            i = i + 1
+        }
+        return val_tensor([dim], out)
+    }
+    if name == "softmax" {
+        if len(args) == 0 { return val_array([]) }
+        let arr = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        if len(arr) == 0 { return val_array([]) }
+        // stable softmax
+        let mut max_v = to_float_val(arr[0])
+        for v in arr {
+            let f = to_float_val(v)
+            if f > max_v { max_v = f }
+        }
+        let mut exps = []
+        let mut sum_e = 0.0
+        for v in arr {
+            let f = to_float_val(v)
+            let e = exp(f - max_v)
+            exps = exps.push(e)
+            sum_e = sum_e + e
+        }
+        // Wrap each result as val_float so downstream sum/map work
+        let mut out = []
+        for e in exps { out = out.push(val_float(e / sum_e)) }
+        if args[0].tag == "tensor" {
+            let mut raw_out = []
+            for w in out { raw_out = raw_out.push(w.float_val) }
+            return val_tensor(tensor_shape(args[0]), raw_out)
+        }
+        return val_array(out)
+    }
+
+    // ── Phase 13 골화 — ML training builtins ──
+    // adam_step(p, g, m, v, lr, b1, b2, eps, t) → [new_p..., new_m..., new_v...]
+    if name == "adam_step" {
+        if len(args) < 9 { return val_array([]) }
+        let p = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let g = if args[1].tag == "tensor" { tensor_data(args[1]) } else { get_array(args[1]) }
+        let m = if args[2].tag == "tensor" { tensor_data(args[2]) } else { get_array(args[2]) }
+        let v = if args[3].tag == "tensor" { tensor_data(args[3]) } else { get_array(args[3]) }
+        let lr = to_float_val(args[4])
+        let beta1 = to_float_val(args[5])
+        let beta2 = to_float_val(args[6])
+        let eps = to_float_val(args[7])
+        let t = to_float_val(args[8])
+        let n = len(p)
+        let bc1 = 1.0 - pow(beta1, t)
+        let bc2 = 1.0 - pow(beta2, t)
+        let mut new_p = []
+        let mut new_m = []
+        let mut new_v = []
+        let mut i = 0
+        while i < n {
+            let pf = if type_of(p[i]) == "float" { p[i] } else { to_float_val(p[i]) }
+            let gf = if type_of(g[i]) == "float" { g[i] } else { to_float_val(g[i]) }
+            let mf = if type_of(m[i]) == "float" { m[i] } else { to_float_val(m[i]) }
+            let vf = if type_of(v[i]) == "float" { v[i] } else { to_float_val(v[i]) }
+            let mi = beta1 * mf + (1.0 - beta1) * gf
+            let vi = beta2 * vf + (1.0 - beta2) * gf * gf
+            let m_hat = mi / bc1
+            let v_hat = vi / bc2
+            let pi_new = pf - lr * m_hat / (sqrt(v_hat) + eps)
+            new_p = new_p.push(pi_new)
+            new_m = new_m.push(mi)
+            new_v = new_v.push(vi)
+            i = i + 1
+        }
+        // Concat: [new_p..., new_m..., new_v...]
+        let mut result = []
+        for x in new_p { result = result.push(val_float(x)) }
+        for x in new_m { result = result.push(val_float(x)) }
+        for x in new_v { result = result.push(val_float(x)) }
+        return val_array(result)
+    }
+    // adamw_step — same as adam but decoupled weight decay
+    if name == "adamw_step" {
+        if len(args) < 10 { return val_array([]) }
+        let p = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let g = if args[1].tag == "tensor" { tensor_data(args[1]) } else { get_array(args[1]) }
+        let m = if args[2].tag == "tensor" { tensor_data(args[2]) } else { get_array(args[2]) }
+        let v = if args[3].tag == "tensor" { tensor_data(args[3]) } else { get_array(args[3]) }
+        let lr = to_float_val(args[4])
+        let beta1 = to_float_val(args[5])
+        let beta2 = to_float_val(args[6])
+        let eps = to_float_val(args[7])
+        let t = to_float_val(args[8])
+        let wd = to_float_val(args[9])
+        let n = len(p)
+        let bc1 = 1.0 - pow(beta1, t)
+        let bc2 = 1.0 - pow(beta2, t)
+        let mut new_p = []
+        let mut new_m = []
+        let mut new_v = []
+        let mut i = 0
+        while i < n {
+            let pf = if type_of(p[i]) == "float" { p[i] } else { to_float_val(p[i]) }
+            let gf = if type_of(g[i]) == "float" { g[i] } else { to_float_val(g[i]) }
+            let mf = if type_of(m[i]) == "float" { m[i] } else { to_float_val(m[i]) }
+            let vf = if type_of(v[i]) == "float" { v[i] } else { to_float_val(v[i]) }
+            let mi = beta1 * mf + (1.0 - beta1) * gf
+            let vi = beta2 * vf + (1.0 - beta2) * gf * gf
+            let m_hat = mi / bc1
+            let v_hat = vi / bc2
+            let pi_new = pf * (1.0 - lr * wd) - lr * m_hat / (sqrt(v_hat) + eps)
+            new_p = new_p.push(pi_new)
+            new_m = new_m.push(mi)
+            new_v = new_v.push(vi)
+            i = i + 1
+        }
+        let mut result = []
+        for x in new_p { result = result.push(val_float(x)) }
+        for x in new_m { result = result.push(val_float(x)) }
+        for x in new_v { result = result.push(val_float(x)) }
+        return val_array(result)
+    }
+    // warmup_lr(base, step, warmup_steps)
+    if name == "warmup_lr" {
+        if len(args) < 3 { return val_float(0.0) }
+        let base = to_float_val(args[0])
+        let step = to_float_val(args[1])
+        let warmup = to_float_val(args[2])
+        if step < warmup { return val_float(base * step / warmup) }
+        return val_float(base)
+    }
+    // phase_lr(base, step, total, n_phases)
+    if name == "phase_lr" {
+        if len(args) < 4 { return val_float(0.0) }
+        let base = to_float_val(args[0])
+        let step = to_float_val(args[1])
+        let total = to_float_val(args[2])
+        let n_phases = args[3].int_val
+        let phase_idx = floor(step / total * n_phases)
+        let phase_clamped = if phase_idx >= n_phases { n_phases - 1 } else { phase_idx }
+        let decay = pow(0.5, phase_clamped)
+        return val_float(base * decay)
+    }
+    // layer_norm(x, dim) → normalized
+    if name == "layer_norm" {
+        if len(args) < 2 { return val_array([]) }
+        let x = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let dim = args[1].int_val
+        if dim == 0 { return val_array([]) }
+        let n_samples = len(x) / dim
+        let mut result = []
+        let mut s = 0
+        while s < n_samples {
+            let base = s * dim
+            let mut mean = 0.0
+            let mut d = 0
+            while d < dim {
+                let v = if type_of(x[base + d]) == "float" { x[base + d] } else { to_float_val(x[base + d]) }
+                mean = mean + v
+                d = d + 1
+            }
+            mean = mean / dim
+            let mut var = 0.0
+            d = 0
+            while d < dim {
+                let v = if type_of(x[base + d]) == "float" { x[base + d] } else { to_float_val(x[base + d]) }
+                var = var + (v - mean) * (v - mean)
+                d = d + 1
+            }
+            var = var / dim
+            let denom = sqrt(var + 0.00001)
+            d = 0
+            while d < dim {
+                let v = if type_of(x[base + d]) == "float" { x[base + d] } else { to_float_val(x[base + d]) }
+                result = result.push(val_float((v - mean) / denom))
+                d = d + 1
+            }
+            s = s + 1
+        }
+        return val_array(result)
+    }
+    // mse(pred, target)
+    if name == "mse" || name == "mean_squared_error" {
+        if len(args) < 2 { return val_float(0.0) }
+        let p = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let t = if args[1].tag == "tensor" { tensor_data(args[1]) } else { get_array(args[1]) }
+        let n = if len(p) < len(t) { len(p) } else { len(t) }
+        if n == 0 { return val_float(0.0) }
+        let mut total = 0.0
+        let mut i = 0
+        while i < n {
+            let pf = if type_of(p[i]) == "float" { p[i] } else { to_float_val(p[i]) }
+            let tf = if type_of(t[i]) == "float" { t[i] } else { to_float_val(t[i]) }
+            let d = pf - tf
+            total = total + d * d
+            i = i + 1
+        }
+        return val_float(total / n)
+    }
+    // mae(pred, target)
+    if name == "mae" || name == "mean_absolute_error" {
+        if len(args) < 2 { return val_float(0.0) }
+        let p = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let t = if args[1].tag == "tensor" { tensor_data(args[1]) } else { get_array(args[1]) }
+        let n = if len(p) < len(t) { len(p) } else { len(t) }
+        if n == 0 { return val_float(0.0) }
+        let mut total = 0.0
+        let mut i = 0
+        while i < n {
+            let pf = if type_of(p[i]) == "float" { p[i] } else { to_float_val(p[i]) }
+            let tf = if type_of(t[i]) == "float" { t[i] } else { to_float_val(t[i]) }
+            let d = pf - tf
+            total = total + abs(d)
+            i = i + 1
+        }
+        return val_float(total / n)
+    }
+    // smooth_l1_loss / huber_loss
+    if name == "smooth_l1_loss" || name == "huber_loss" {
+        if len(args) < 2 { return val_float(0.0) }
+        let p = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let t = if args[1].tag == "tensor" { tensor_data(args[1]) } else { get_array(args[1]) }
+        let beta = if len(args) > 2 { to_float_val(args[2]) } else { 1.0 }
+        let n = if len(p) < len(t) { len(p) } else { len(t) }
+        if n == 0 { return val_float(0.0) }
+        let mut total = 0.0
+        let mut i = 0
+        while i < n {
+            let pf = if type_of(p[i]) == "float" { p[i] } else { to_float_val(p[i]) }
+            let tf = if type_of(t[i]) == "float" { t[i] } else { to_float_val(t[i]) }
+            let diff = abs(pf - tf)
+            if diff < beta { total = total + 0.5 * diff * diff / beta }
+            else { total = total + diff - 0.5 * beta }
+            i = i + 1
+        }
+        return val_float(total / n)
+    }
+    // focal_loss(pred, target, gamma)
+    if name == "focal_loss" {
+        if len(args) < 2 { return val_float(0.0) }
+        let p = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let t = if args[1].tag == "tensor" { tensor_data(args[1]) } else { get_array(args[1]) }
+        let gamma = if len(args) > 2 { to_float_val(args[2]) } else { 2.0 }
+        let n = if len(p) < len(t) { len(p) } else { len(t) }
+        if n == 0 { return val_float(0.0) }
+        let mut total = 0.0
+        let mut i = 0
+        while i < n {
+            let pf = if type_of(p[i]) == "float" { p[i] } else { to_float_val(p[i]) }
+            let tf = if type_of(t[i]) == "float" { t[i] } else { to_float_val(t[i]) }
+            let pt = if tf > 0.5 { pf } else { 1.0 - pf }
+            let pt_safe = if pt < 0.000001 { 0.000001 } else { pt }
+            total = total - pow(1.0 - pt_safe, gamma) * ln(pt_safe)
+            i = i + 1
+        }
+        return val_float(total / n)
+    }
+    // contrastive_loss(emb1, emb2, label, margin) — InfoNCE-ish
+    if name == "contrastive_loss" {
+        if len(args) < 3 { return val_float(0.0) }
+        let e1 = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let e2 = if args[1].tag == "tensor" { tensor_data(args[1]) } else { get_array(args[1]) }
+        let label = to_float_val(args[2])
+        let margin = if len(args) > 3 { to_float_val(args[3]) } else { 1.0 }
+        let n = if len(e1) < len(e2) { len(e1) } else { len(e2) }
+        let mut dist_sq = 0.0
+        let mut i = 0
+        while i < n {
+            let a = if type_of(e1[i]) == "float" { e1[i] } else { to_float_val(e1[i]) }
+            let b = if type_of(e2[i]) == "float" { e2[i] } else { to_float_val(e2[i]) }
+            let d = a - b
+            dist_sq = dist_sq + d * d
+            i = i + 1
+        }
+        let dist = sqrt(dist_sq)
+        // similar (label=1): minimize dist^2; dissimilar (label=0): maximize margin-dist
+        let pos = label * dist_sq
+        let neg_diff = if margin - dist > 0.0 { margin - dist } else { 0.0 }
+        let neg = (1.0 - label) * neg_diff * neg_diff
+        return val_float(0.5 * (pos + neg))
+    }
+    // gelu(x) — Gaussian Error Linear Unit
+    if name == "gelu" {
+        if len(args) == 0 { return val_array([]) }
+        let arr = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let mut result = []
+        for v in arr {
+            let f = if type_of(v) == "float" { v } else { to_float_val(v) }
+            // approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+            let inner = sqrt(2.0 / 3.14159265358979) * (f + 0.044715 * f * f * f)
+            let g = 0.5 * f * (1.0 + tanh(inner))
+            result = result.push(val_float(g))
+        }
+        if args[0].tag == "tensor" { return val_tensor(tensor_shape(args[0]), [].push(0)) }
+        return val_array(result)
+    }
+    // swish(x) = x * sigmoid(x)
+    if name == "swish" || name == "silu" {
+        if len(args) == 0 { return val_array([]) }
+        let arr = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let mut result = []
+        for v in arr {
+            let f = if type_of(v) == "float" { v } else { to_float_val(v) }
+            let s = 1.0 / (1.0 + exp(0.0 - f))
+            result = result.push(val_float(f * s))
+        }
+        return val_array(result)
+    }
+    // transpose(matrix, rows, cols) → transposed flat array
+    if name == "transpose" {
+        if len(args) < 3 { return val_array([]) }
+        let m = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let rows = args[1].int_val
+        let cols = args[2].int_val
+        let mut result = []
+        let mut c = 0
+        while c < cols {
+            let mut r = 0
+            while r < rows {
+                let v = m[r * cols + c]
+                if type_of(v) == "float" { result = result.push(val_float(v)) }
+                else { result = result.push(v) }
+                r = r + 1
+            }
+            c = c + 1
+        }
+        return val_array(result)
+    }
+    // zeros(n) / ones(n)
+    if name == "zeros" {
+        if len(args) == 0 { return val_array([]) }
+        let n = args[0].int_val
+        let mut result = []
+        let mut i = 0
+        while i < n { result = result.push(val_float(0.0)); i = i + 1 }
+        return val_array(result)
+    }
+    if name == "ones" {
+        if len(args) == 0 { return val_array([]) }
+        let n = args[0].int_val
+        let mut result = []
+        let mut i = 0
+        while i < n { result = result.push(val_float(1.0)); i = i + 1 }
+        return val_array(result)
+    }
+    // ── Phase 13b 골화 — attention/conv/lora ──
+    // attention(Q, K, V, seq, dim, causal?) — scaled dot-product attention
+    if name == "attention" {
+        if len(args) < 5 { return val_array([]) }
+        let q = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let k = if args[1].tag == "tensor" { tensor_data(args[1]) } else { get_array(args[1]) }
+        let v = if args[2].tag == "tensor" { tensor_data(args[2]) } else { get_array(args[2]) }
+        let seq = args[3].int_val
+        let dim = args[4].int_val
+        let causal = if len(args) > 5 { args[5].bool_val } else { false }
+        let scale = 1.0 / sqrt(dim + 0.0)
+        let mut output = []
+        let mut i = 0
+        while i < seq {
+            let mut scores = []
+            let mut j = 0
+            while j < seq {
+                if causal && j > i {
+                    scores = scores.push(0.0 - 1000000000.0)
+                } else {
+                    let mut dot = 0.0
+                    let mut d = 0
+                    while d < dim {
+                        let qv = if type_of(q[i * dim + d]) == "float" { q[i * dim + d] } else { to_float_val(q[i * dim + d]) }
+                        let kv = if type_of(k[j * dim + d]) == "float" { k[j * dim + d] } else { to_float_val(k[j * dim + d]) }
+                        dot = dot + qv * kv
+                        d = d + 1
+                    }
+                    scores = scores.push(dot * scale)
+                }
+                j = j + 1
+            }
+            // softmax
+            let mut max_s = scores[0]
+            for s in scores { if s > max_s { max_s = s } }
+            let mut exps = []
+            let mut sum_e = 0.0
+            for s in scores {
+                let e = exp(s - max_s)
+                exps = exps.push(e)
+                sum_e = sum_e + e
+            }
+            // weighted V
+            let mut d = 0
+            while d < dim {
+                let mut val = 0.0
+                let mut jj = 0
+                while jj < seq {
+                    let w = exps[jj] / sum_e
+                    let vv = if type_of(v[jj * dim + d]) == "float" { v[jj * dim + d] } else { to_float_val(v[jj * dim + d]) }
+                    val = val + w * vv
+                    jj = jj + 1
+                }
+                output = output.push(val_float(val))
+                d = d + 1
+            }
+            i = i + 1
+        }
+        return val_array(output)
+    }
+    // conv1d(input, kernel, in_len, k_len, stride) → output
+    if name == "conv1d" {
+        if len(args) < 4 { return val_array([]) }
+        let x = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let k = if args[1].tag == "tensor" { tensor_data(args[1]) } else { get_array(args[1]) }
+        let in_len = args[2].int_val
+        let k_len = args[3].int_val
+        let stride = if len(args) > 4 { args[4].int_val } else { 1 }
+        let out_len = (in_len - k_len) / stride + 1
+        let mut result = []
+        let mut o = 0
+        while o < out_len {
+            let mut acc = 0.0
+            let mut ki = 0
+            while ki < k_len {
+                let xv = if type_of(x[o * stride + ki]) == "float" { x[o * stride + ki] } else { to_float_val(x[o * stride + ki]) }
+                let kv = if type_of(k[ki]) == "float" { k[ki] } else { to_float_val(k[ki]) }
+                acc = acc + xv * kv
+                ki = ki + 1
+            }
+            result = result.push(val_float(acc))
+            o = o + 1
+        }
+        return val_array(result)
+    }
+    // lora_init(in_dim, out_dim, rank) → [A, B]
+    if name == "lora_init" {
+        if len(args) < 3 { return val_array([]) }
+        let ind = args[0].int_val
+        let outd = args[1].int_val
+        let rank = args[2].int_val
+        let std = sqrt(1.0 / rank)
+        let mut a = []
+        let mut i = 0
+        while i < rank * ind {
+            // simple deterministic hash for reproducibility
+            let h = ((i * 2654435761) % 10000) / 10000.0 - 0.5
+            a = a.push(val_float(h * 2.0 * std))
+            i = i + 1
+        }
+        let mut b = []
+        i = 0
+        while i < outd * rank { b = b.push(val_float(0.0)); i = i + 1 }
+        return val_array([val_array(a), val_array(b)])
+    }
+    // lora_forward(x, W, A, B, in_dim, out_dim, rank, alpha)
+    if name == "lora_forward" {
+        if len(args) < 8 { return val_array([]) }
+        let x = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let w = if args[1].tag == "tensor" { tensor_data(args[1]) } else { get_array(args[1]) }
+        let a = if args[2].tag == "tensor" { tensor_data(args[2]) } else { get_array(args[2]) }
+        let b = if args[3].tag == "tensor" { tensor_data(args[3]) } else { get_array(args[3]) }
+        let ind = args[4].int_val
+        let outd = args[5].int_val
+        let rank = args[6].int_val
+        let alpha = to_float_val(args[7])
+        // base = W @ x  [outd]
+        let mut base = []
+        let mut r = 0
+        while r < outd {
+            let mut acc = 0.0
+            let mut c = 0
+            while c < ind {
+                let wv = if type_of(w[r * ind + c]) == "float" { w[r * ind + c] } else { to_float_val(w[r * ind + c]) }
+                let xv = if type_of(x[c]) == "float" { x[c] } else { to_float_val(x[c]) }
+                acc = acc + wv * xv
+                c = c + 1
+            }
+            base = base.push(acc)
+            r = r + 1
+        }
+        // ax = A @ x  [rank]
+        let mut ax = []
+        r = 0
+        while r < rank {
+            let mut acc = 0.0
+            let mut c = 0
+            while c < ind {
+                let av = if type_of(a[r * ind + c]) == "float" { a[r * ind + c] } else { to_float_val(a[r * ind + c]) }
+                let xv = if type_of(x[c]) == "float" { x[c] } else { to_float_val(x[c]) }
+                acc = acc + av * xv
+                c = c + 1
+            }
+            ax = ax.push(acc)
+            r = r + 1
+        }
+        // base += alpha * (B @ ax)
+        r = 0
+        while r < outd {
+            let mut delta = 0.0
+            let mut c = 0
+            while c < rank {
+                let bv = if type_of(b[r * rank + c]) == "float" { b[r * rank + c] } else { to_float_val(b[r * rank + c]) }
+                delta = delta + bv * ax[c]
+                c = c + 1
+            }
+            base[r] = base[r] + alpha * delta
+            r = r + 1
+        }
+        let mut result = []
+        for v in base { result = result.push(val_float(v)) }
+        return val_array(result)
+    }
+    // cosine_sim_matrix(hiddens, n, dim) → [n*n] flat similarity matrix
+    if name == "cosine_sim_matrix" {
+        if len(args) < 3 { return val_array([]) }
+        let h = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let n = args[1].int_val
+        let dim = args[2].int_val
+        let mut result = []
+        let mut i = 0
+        while i < n {
+            let mut j = 0
+            while j < n {
+                let mut dot = 0.0
+                let mut ni = 0.0
+                let mut nj = 0.0
+                let mut d = 0
+                while d < dim {
+                    let vi = if type_of(h[i * dim + d]) == "float" { h[i * dim + d] } else { to_float_val(h[i * dim + d]) }
+                    let vj = if type_of(h[j * dim + d]) == "float" { h[j * dim + d] } else { to_float_val(h[j * dim + d]) }
+                    dot = dot + vi * vj
+                    ni = ni + vi * vi
+                    nj = nj + vj * vj
+                    d = d + 1
+                }
+                let denom = sqrt(ni) * sqrt(nj)
+                if denom == 0.0 { result = result.push(val_float(0.0)) }
+                else { result = result.push(val_float(dot / denom)) }
+                j = j + 1
+            }
+            i = i + 1
+        }
+        return val_array(result)
+    }
+    // ── Phase 14 골화 — 수론/수학/유틸 ──
+    // sigma(n) — sum of divisors
+    if name == "sigma" {
+        if len(args) == 0 { return val_int(0) }
+        let n = args[0].int_val
+        if n <= 0 { return val_int(0) }
+        let mut s = 0
+        let mut d = 1
+        while d * d <= n {
+            if n % d == 0 {
+                s = s + d
+                if d != n / d { s = s + n / d }
+            }
+            d = d + 1
+        }
+        return val_int(s)
+    }
+    // tau(n) — number of divisors
+    if name == "tau" {
+        if len(args) == 0 { return val_int(0) }
+        let n = args[0].int_val
+        if n <= 0 { return val_int(0) }
+        let mut t = 0
+        let mut d = 1
+        while d * d <= n {
+            if n % d == 0 {
+                t = t + 1
+                if d != n / d { t = t + 1 }
+            }
+            d = d + 1
+        }
+        return val_int(t)
+    }
+    // sopfr(n) — sum of prime factors with repetition
+    if name == "sopfr" {
+        if len(args) == 0 { return val_int(0) }
+        let mut n = args[0].int_val
+        if n <= 1 { return val_int(0) }
+        let mut s = 0
+        let mut p = 2
+        while p * p <= n {
+            while n % p == 0 {
+                s = s + p
+                n = n / p
+            }
+            p = p + 1
+        }
+        if n > 1 { s = s + n }
+        return val_int(s)
+    }
+    // mean(arr)
+    if name == "mean" {
+        if len(args) == 0 { return val_float(0.0) }
+        let arr = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        if len(arr) == 0 { return val_float(0.0) }
+        let mut total = 0.0
+        for v in arr { total = total + (if type_of(v) == "float" { v } else { to_float_val(v) }) }
+        return val_float(total / len(arr))
+    }
+    // normalize(arr) — divide by L2 norm
+    if name == "normalize" {
+        if len(args) == 0 { return val_array([]) }
+        let arr = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let mut sq = 0.0
+        for v in arr {
+            let f = if type_of(v) == "float" { v } else { to_float_val(v) }
+            sq = sq + f * f
+        }
+        let norm = sqrt(sq)
+        if norm == 0.0 { return args[0] }
+        let mut result = []
+        for v in arr {
+            let f = if type_of(v) == "float" { v } else { to_float_val(v) }
+            result = result.push(val_float(f / norm))
+        }
+        if args[0].tag == "tensor" { return val_tensor(tensor_shape(args[0]), [].push(0)) }
+        return val_array(result)
+    }
+    // matmul(a, b, m, n, k) — general matmul
+    if name == "matmul" {
+        if len(args) < 5 { return val_array([]) }
+        let a = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let b = if args[1].tag == "tensor" { tensor_data(args[1]) } else { get_array(args[1]) }
+        let m = args[2].int_val
+        let n = args[3].int_val
+        let k = args[4].int_val
+        let mut out = []
+        let mut mi = 0
+        while mi < m {
+            let mut nj = 0
+            while nj < n {
+                let mut acc = 0.0
+                let mut kk = 0
+                while kk < k {
+                    let av = if type_of(a[mi * k + kk]) == "float" { a[mi * k + kk] } else { to_float_val(a[mi * k + kk]) }
+                    let bv = if type_of(b[kk * n + nj]) == "float" { b[kk * n + nj] } else { to_float_val(b[kk * n + nj]) }
+                    acc = acc + av * bv
+                    kk = kk + 1
+                }
+                out = out.push(val_float(acc))
+                nj = nj + 1
+            }
+            mi = mi + 1
+        }
+        return val_array(out)
+    }
+    // matvec(W, x, rows, cols)
+    if name == "matvec" {
+        if len(args) < 4 { return val_array([]) }
+        let w = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let x = if args[1].tag == "tensor" { tensor_data(args[1]) } else { get_array(args[1]) }
+        let rows = args[2].int_val
+        let cols = args[3].int_val
+        let mut out = []
+        let mut r = 0
+        while r < rows {
+            let mut acc = 0.0
+            let mut c = 0
+            while c < cols {
+                let wv = if type_of(w[r * cols + c]) == "float" { w[r * cols + c] } else { to_float_val(w[r * cols + c]) }
+                let xv = if type_of(x[c]) == "float" { x[c] } else { to_float_val(x[c]) }
+                acc = acc + wv * xv
+                c = c + 1
+            }
+            out = out.push(val_float(acc))
+            r = r + 1
+        }
+        return val_array(out)
+    }
+    // hadamard(a, b) — element-wise product
+    if name == "hadamard" {
+        if len(args) < 2 { return val_array([]) }
+        let a = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let b = if args[1].tag == "tensor" { tensor_data(args[1]) } else { get_array(args[1]) }
+        let n = if len(a) < len(b) { len(a) } else { len(b) }
+        let mut out = []
+        let mut i = 0
+        while i < n {
+            let av = if type_of(a[i]) == "float" { a[i] } else { to_float_val(a[i]) }
+            let bv = if type_of(b[i]) == "float" { b[i] } else { to_float_val(b[i]) }
+            out = out.push(val_float(av * bv))
+            i = i + 1
+        }
+        return val_array(out)
+    }
+    // one_hot(idx, n) → [n] vector with 1.0 at idx
+    if name == "one_hot" {
+        if len(args) < 2 { return val_array([]) }
+        let idx = args[0].int_val
+        let n = args[1].int_val
+        let mut out = []
+        let mut i = 0
+        while i < n {
+            if i == idx { out = out.push(val_float(1.0)) }
+            else { out = out.push(val_float(0.0)) }
+            i = i + 1
+        }
+        return val_array(out)
+    }
+    // topk(arr, k) — top-k indices (descending by value)
+    if name == "topk" {
+        if len(args) < 2 { return val_array([]) }
+        let arr = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let k = args[1].int_val
+        let mut indices = []
+        let mut values = []
+        let mut i = 0
+        while i < len(arr) {
+            indices = indices.push(i)
+            let v = if type_of(arr[i]) == "float" { arr[i] } else { to_float_val(arr[i]) }
+            values = values.push(v)
+            i = i + 1
+        }
+        // simple selection: pick max k times
+        let mut result = []
+        let mut picked = 0
+        while picked < k && picked < len(arr) {
+            let mut best = -1
+            let mut best_v = 0.0 - 1000000000.0
+            let mut j = 0
+            while j < len(indices) {
+                if indices[j] >= 0 && values[j] > best_v { best = j; best_v = values[j] }
+                j = j + 1
+            }
+            if best < 0 { picked = k }
+            else {
+                result = result.push(val_int(indices[best]))
+                indices[best] = -1
+                picked = picked + 1
+            }
+        }
+        return val_array(result)
+    }
+    // shuffle(arr) — random permutation (Fisher-Yates)
+    if name == "shuffle" {
+        if len(args) == 0 { return val_array([]) }
+        let arr = get_array(args[0])
+        let n = len(arr)
+        let mut result = []
+        for v in arr { result = result.push(v) }
+        let mut i = n - 1
+        while i > 0 {
+            let j = floor(random() * (i + 1))
+            let tmp = result[i]
+            result[i] = result[j]
+            result[j] = tmp
+            i = i - 1
+        }
+        return val_array(result)
+    }
+    // randn() — normal random ~ N(0,1) (Box-Muller, simplified)
+    if name == "randn" {
+        let u1 = random()
+        let u2 = random()
+        let safe_u1 = if u1 < 0.000001 { 0.000001 } else { u1 }
+        let z = sqrt(0.0 - 2.0 * ln(safe_u1)) * cos(2.0 * 3.14159265358979 * u2)
+        return val_float(z)
+    }
+    if name == "random_int" {
+        if len(args) < 2 { return val_int(0) }
+        let lo = args[0].int_val
+        let hi = args[1].int_val
+        let r = lo + floor(random() * (hi - lo))
+        return val_int(r)
+    }
+    // hex_encode(s) → hex string
+    if name == "hex_encode" {
+        if len(args) == 0 { return val_str("") }
+        let s = args[0].str_val
+        let mut out = ""
+        let cs = s.chars()
+        for c in cs {
+            let code = char_code(to_string(c), 0)
+            out = out + hex(code).pad_left(2, "0")
+        }
+        return val_str(out)
+    }
+    // hex_decode(hex_str) → string (reverse of hex_encode, simplified)
+    if name == "hex_decode" {
+        if len(args) == 0 { return val_str("") }
+        let s = args[0].str_val
+        let n = len(s) / 2
+        let mut out = ""
+        let mut i = 0
+        while i < n {
+            let pair = s.substring(i * 2, i * 2 + 2)
+            // simple hex parse (assume 2-char pairs)
+            try {
+                let code = to_int("0x" + pair)
+                out = out + to_string(code)
+            } catch e {
+                // skip invalid
+            }
+            i = i + 1
+        }
+        return val_str(out)
+    }
+    // bytes_encode(s) → array of byte ints
+    if name == "bytes_encode" {
+        if len(args) == 0 { return val_array([]) }
+        let s = args[0].str_val
+        let cs = s.chars()
+        let mut result = []
+        for c in cs { result = result.push(val_int(char_code(to_string(c), 0))) }
+        return val_array(result)
+    }
+    // bytes_decode(bytes_arr) → string
+    if name == "bytes_decode" {
+        if len(args) == 0 { return val_str("") }
+        let arr = get_array(args[0])
+        let mut out = ""
+        for b in arr { out = out + to_string(b.int_val) }
+        return val_str(out)
+    }
+    // log(base, x) — alias log_b(x); also log(x) = ln(x)
+    if name == "log" {
+        if len(args) == 0 { return val_float(0.0) }
+        if len(args) == 1 { return val_float(ln(to_float_val(args[0]))) }
+        let base = to_float_val(args[0])
+        let x = to_float_val(args[1])
+        return val_float(ln(x) / ln(base))
+    }
+    // print_err — alias eprintln
+    if name == "print_err" {
+        let mut out = ""
+        for a in args { out = out + val_to_string(a) }
+        try { eprintln(out) } catch e { println("[print_err] " + e.to_string()) }
+        return val_void()
+    }
+    // timestamp / now / time_elapsed
+    if name == "timestamp" || name == "now" {
+        return val_int(timestamp())
+    }
+    if name == "time_elapsed" {
+        if len(args) == 0 { return val_int(0) }
+        return val_int(timestamp() - args[0].int_val)
+    }
+    // model_size_kb(byte_count) → KB
+    if name == "model_size_kb" {
+        if len(args) == 0 { return val_float(0.0) }
+        return val_float(args[0].int_val / 1024.0)
+    }
+    // ── ML extras ──
+    // rms_norm(x, dim, eps?) — RMS normalization
+    if name == "rms_norm" {
+        if len(args) < 2 { return val_array([]) }
+        let x = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let dim = args[1].int_val
+        let eps = if len(args) > 2 { to_float_val(args[2]) } else { 0.000001 }
+        let n_samples = len(x) / dim
+        let mut result = []
+        let mut s = 0
+        while s < n_samples {
+            let base = s * dim
+            let mut sq = 0.0
+            let mut d = 0
+            while d < dim {
+                let v = if type_of(x[base + d]) == "float" { x[base + d] } else { to_float_val(x[base + d]) }
+                sq = sq + v * v
+                d = d + 1
+            }
+            let rms = sqrt(sq / dim + eps)
+            d = 0
+            while d < dim {
+                let v = if type_of(x[base + d]) == "float" { x[base + d] } else { to_float_val(x[base + d]) }
+                result = result.push(val_float(v / rms))
+                d = d + 1
+            }
+            s = s + 1
+        }
+        return val_array(result)
+    }
+    // xavier_init(in_dim, out_dim) — Glorot init
+    if name == "xavier_init" {
+        if len(args) < 2 { return val_array([]) }
+        let ind = args[0].int_val
+        let outd = args[1].int_val
+        let std = sqrt(2.0 / (ind + outd))
+        let mut result = []
+        let mut i = 0
+        while i < ind * outd {
+            let h = ((i * 2654435761) % 10000) / 10000.0 - 0.5
+            result = result.push(val_float(h * 2.0 * std))
+            i = i + 1
+        }
+        return val_array(result)
+    }
+    // kaiming_init(in_dim, out_dim) — He init
+    if name == "kaiming_init" {
+        if len(args) < 2 { return val_array([]) }
+        let ind = args[0].int_val
+        let outd = args[1].int_val
+        let std = sqrt(2.0 / ind)
+        let mut result = []
+        let mut i = 0
+        while i < ind * outd {
+            let h = ((i * 2654435761) % 10000) / 10000.0 - 0.5
+            result = result.push(val_float(h * 2.0 * std))
+            i = i + 1
+        }
+        return val_array(result)
+    }
+    // sgd_step(params, grads, lr)
+    if name == "sgd_step" {
+        if len(args) < 3 { return val_array([]) }
+        let p = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let g = if args[1].tag == "tensor" { tensor_data(args[1]) } else { get_array(args[1]) }
+        let lr = to_float_val(args[2])
+        let n = if len(p) < len(g) { len(p) } else { len(g) }
+        let mut result = []
+        let mut i = 0
+        while i < n {
+            let pf = if type_of(p[i]) == "float" { p[i] } else { to_float_val(p[i]) }
+            let gf = if type_of(g[i]) == "float" { g[i] } else { to_float_val(g[i]) }
+            result = result.push(val_float(pf - lr * gf))
+            i = i + 1
+        }
+        return val_array(result)
+    }
+    // weight_decay(params, decay)
+    if name == "weight_decay" {
+        if len(args) < 2 { return val_array([]) }
+        let p = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let decay = to_float_val(args[1])
+        let mut result = []
+        for v in p {
+            let f = if type_of(v) == "float" { v } else { to_float_val(v) }
+            result = result.push(val_float(f * (1.0 - decay)))
+        }
+        return val_array(result)
+    }
+    // kl_divergence(p, q) — KL(p || q)
+    if name == "kl_divergence" {
+        if len(args) < 2 { return val_float(0.0) }
+        let p = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let q = if args[1].tag == "tensor" { tensor_data(args[1]) } else { get_array(args[1]) }
+        let n = if len(p) < len(q) { len(p) } else { len(q) }
+        let mut total = 0.0
+        let mut i = 0
+        while i < n {
+            let pv = if type_of(p[i]) == "float" { p[i] } else { to_float_val(p[i]) }
+            let qv = if type_of(q[i]) == "float" { q[i] } else { to_float_val(q[i]) }
+            if pv > 0.0 && qv > 0.0 { total = total + pv * ln(pv / qv) }
+            i = i + 1
+        }
+        return val_float(total)
+    }
+    // js_divergence(p, q) — symmetric Jensen-Shannon
+    if name == "js_divergence" {
+        if len(args) < 2 { return val_float(0.0) }
+        let p = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let q = if args[1].tag == "tensor" { tensor_data(args[1]) } else { get_array(args[1]) }
+        let n = if len(p) < len(q) { len(p) } else { len(q) }
+        let mut total = 0.0
+        let mut i = 0
+        while i < n {
+            let pv = if type_of(p[i]) == "float" { p[i] } else { to_float_val(p[i]) }
+            let qv = if type_of(q[i]) == "float" { q[i] } else { to_float_val(q[i]) }
+            let m = 0.5 * (pv + qv)
+            if pv > 0.0 && m > 0.0 { total = total + 0.5 * pv * ln(pv / m) }
+            if qv > 0.0 && m > 0.0 { total = total + 0.5 * qv * ln(qv / m) }
+            i = i + 1
+        }
+        return val_float(total)
+    }
+    // grad_clip_norm(grads, max_norm)
+    if name == "grad_clip_norm" {
+        if len(args) < 2 { return val_array([]) }
+        let g = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let max_norm = to_float_val(args[1])
+        let mut sq = 0.0
+        for v in g {
+            let f = if type_of(v) == "float" { v } else { to_float_val(v) }
+            sq = sq + f * f
+        }
+        let total_norm = sqrt(sq)
+        if total_norm <= max_norm { return args[0] }
+        let scale = max_norm / total_norm
+        let mut result = []
+        for v in g {
+            let f = if type_of(v) == "float" { v } else { to_float_val(v) }
+            result = result.push(val_float(f * scale))
+        }
+        return val_array(result)
+    }
+    // numerical_grad — finite difference (placeholder, requires fn pointer)
+    if name == "numerical_grad" {
+        return val_array([])
+    }
+    // sinusoidal_pe(seq_len, dim) — sinusoidal positional encoding
+    if name == "sinusoidal_pe" {
+        if len(args) < 2 { return val_array([]) }
+        let seq = args[0].int_val
+        let dim = args[1].int_val
+        let mut result = []
+        let mut pos = 0
+        while pos < seq {
+            let mut d = 0
+            while d < dim {
+                let dpf = (d / 2) * 2 + 0.0
+                let div = pow(10000.0, dpf / dim)
+                let theta = pos / div
+                if d % 2 == 0 { result = result.push(val_float(sin(theta))) }
+                else { result = result.push(val_float(cos(theta))) }
+                d = d + 1
+            }
+            pos = pos + 1
+        }
+        return val_array(result)
+    }
+    // label_smoothing(target_idx, n_classes, eps) → smoothed distribution
+    if name == "label_smoothing" {
+        if len(args) < 3 { return val_array([]) }
+        let target = args[0].int_val
+        let n = args[1].int_val
+        let eps = to_float_val(args[2])
+        let mut result = []
+        let mut i = 0
+        while i < n {
+            if i == target { result = result.push(val_float(1.0 - eps + eps / n)) }
+            else { result = result.push(val_float(eps / n)) }
+            i = i + 1
+        }
+        return val_array(result)
+    }
+    // mse_loss — alias mse
+    if name == "mse_loss" {
+        if len(args) < 2 { return val_float(0.0) }
+        let p = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let t = if args[1].tag == "tensor" { tensor_data(args[1]) } else { get_array(args[1]) }
+        let n = if len(p) < len(t) { len(p) } else { len(t) }
+        if n == 0 { return val_float(0.0) }
+        let mut total = 0.0
+        let mut i = 0
+        while i < n {
+            let pf = if type_of(p[i]) == "float" { p[i] } else { to_float_val(p[i]) }
+            let tf = if type_of(t[i]) == "float" { t[i] } else { to_float_val(t[i]) }
+            let d = pf - tf
+            total = total + d * d
+            i = i + 1
+        }
+        return val_float(total / n)
+    }
+
+    // ── Phase 15 골화 — KV-cache / RoPE / multi-head / etc ──
+    // KV-cache: registry of [shape_data, data, write_pos] per cache
+    // (single-stream interpreter — no real concurrency, just bookkeeping)
+    if name == "kv_cache_init" {
+        // kv_cache_init(max_len, n_kv_head, head_dim) → cache (tensor wrapper)
+        if len(args) < 3 { return val_void() }
+        let max_len = args[0].int_val
+        let n_kv = args[1].int_val
+        let head_dim = args[2].int_val
+        let total = max_len * n_kv * head_dim
+        let mut data = []
+        let mut i = 0
+        while i < total { data = data.push(0.0); i = i + 1 }
+        return val_tensor([max_len, n_kv, head_dim], data)
+    }
+    if name == "kv_cache_reset" {
+        // Reset cache to zeros (in-place fill)
+        if len(args) == 0 { return val_void() }
+        let cache = args[0]
+        if cache.tag != "tensor" { return val_void() }
+        let n = tensor_numel(cache)
+        let mut data = []
+        let mut i = 0
+        while i < n { data = data.push(0.0); i = i + 1 }
+        tensor_set_data(cache, data)
+        return cache
+    }
+    if name == "kv_cache_append" {
+        // kv_cache_append(cache, k, v, pos) — write at row `pos`
+        if len(args) < 4 { return val_void() }
+        let cache = args[0]
+        let k_in = if args[1].tag == "tensor" { tensor_data(args[1]) } else { get_array(args[1]) }
+        let pos = args[3].int_val
+        if cache.tag != "tensor" { return val_void() }
+        let shape = tensor_shape(cache)
+        if len(shape) < 3 { return val_void() }
+        let head_dim = shape[2]
+        let n_kv = shape[1]
+        let row_size = n_kv * head_dim
+        let mut data = tensor_data(cache)
+        let base = pos * row_size
+        let mut d = 0
+        while d < row_size && d < len(k_in) {
+            let v = if type_of(k_in[d]) == "float" { k_in[d] } else { to_float_val(k_in[d]) }
+            data[base + d] = v
+            d = d + 1
+        }
+        tensor_set_data(cache, data)
+        return cache
+    }
+    if name == "kv_cache_decode" {
+        // kv_cache_decode(cache, q, pos, n_kv_head, head_dim) → output [head_dim]
+        // Single-step decode: attend to all positions <= pos
+        if len(args) < 5 { return val_array([]) }
+        let cache = args[0]
+        let q = if args[1].tag == "tensor" { tensor_data(args[1]) } else { get_array(args[1]) }
+        let pos = args[2].int_val
+        let n_kv = args[3].int_val
+        let head_dim = args[4].int_val
+        if cache.tag != "tensor" { return val_array([]) }
+        let cd = tensor_data(cache)
+        let row_size = n_kv * head_dim
+        let scale = 1.0 / sqrt(head_dim + 0.0)
+        // scores[i] = q · K[i] * scale
+        let mut scores = []
+        let mut i = 0
+        while i <= pos {
+            let mut dot = 0.0
+            let mut d = 0
+            while d < head_dim {
+                let qv = if type_of(q[d]) == "float" { q[d] } else { to_float_val(q[d]) }
+                let kv = cd[i * row_size + d]
+                dot = dot + qv * kv
+                d = d + 1
+            }
+            scores = scores.push(dot * scale)
+            i = i + 1
+        }
+        // softmax
+        let mut max_s = scores[0]
+        for s in scores { if s > max_s { max_s = s } }
+        let mut exps = []
+        let mut sum_e = 0.0
+        for s in scores {
+            let e = exp(s - max_s)
+            exps = exps.push(e)
+            sum_e = sum_e + e
+        }
+        let mut output = []
+        let mut d = 0
+        while d < head_dim {
+            let mut val = 0.0
+            i = 0
+            while i <= pos {
+                let w = exps[i] / sum_e
+                let vv = cd[i * row_size + d]
+                val = val + w * vv
+                i = i + 1
+            }
+            output = output.push(val_float(val))
+            d = d + 1
+        }
+        return val_array(output)
+    }
+    if name == "kv_cache_decode_bench" {
+        return val_int(0)
+    }
+
+    // rope(x, pos, dim) — Rotary Position Embedding (single token)
+    //   x: input vector [dim], pos: token position, dim: embedding dim
+    //   Pairs (x[2i], x[2i+1]) rotated by angle = pos / 10000^(2i/dim)
+    if name == "rope" || name == "rope_inplace" {
+        if len(args) < 3 { return val_array([]) }
+        let x = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let pos = args[1].int_val
+        let dim = args[2].int_val
+        let mut result = []
+        let mut i = 0
+        while i < dim - 1 {
+            let exponent = (i + 0.0) / dim
+            let theta = pos / pow(10000.0, exponent)
+            let c = cos(theta)
+            let s = sin(theta)
+            let x0 = if type_of(x[i]) == "float" { x[i] } else { to_float_val(x[i]) }
+            let x1 = if type_of(x[i + 1]) == "float" { x[i + 1] } else { to_float_val(x[i + 1]) }
+            result = result.push(val_float(x0 * c - x1 * s))
+            result = result.push(val_float(x0 * s + x1 * c))
+            i = i + 2
+        }
+        // remainder if dim is odd
+        if i < dim {
+            result = result.push(val_float(if type_of(x[i]) == "float" { x[i] } else { to_float_val(x[i]) }))
+        }
+        return val_array(result)
+    }
+
+    // multi_head_attention(Q, K, V, seq, n_heads, head_dim, causal?)
+    if name == "multi_head_attention" {
+        if len(args) < 6 { return val_array([]) }
+        let q_all = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let k_all = if args[1].tag == "tensor" { tensor_data(args[1]) } else { get_array(args[1]) }
+        let v_all = if args[2].tag == "tensor" { tensor_data(args[2]) } else { get_array(args[2]) }
+        let seq = args[3].int_val
+        let n_h = args[4].int_val
+        let head_dim = args[5].int_val
+        let causal = if len(args) > 6 { args[6].bool_val } else { false }
+        let scale = 1.0 / sqrt(head_dim + 0.0)
+        let dim = n_h * head_dim
+        let mut output = []
+        let mut h = 0
+        while h < n_h {
+            let h_off = h * head_dim
+            let mut qh = []
+            let mut kh = []
+            let mut vh = []
+            // extract head h from each token
+            let mut t = 0
+            while t < seq {
+                let mut d = 0
+                while d < head_dim {
+                    let qv = if type_of(q_all[t * dim + h_off + d]) == "float" { q_all[t * dim + h_off + d] } else { to_float_val(q_all[t * dim + h_off + d]) }
+                    let kv = if type_of(k_all[t * dim + h_off + d]) == "float" { k_all[t * dim + h_off + d] } else { to_float_val(k_all[t * dim + h_off + d]) }
+                    let vv = if type_of(v_all[t * dim + h_off + d]) == "float" { v_all[t * dim + h_off + d] } else { to_float_val(v_all[t * dim + h_off + d]) }
+                    qh = qh.push(qv)
+                    kh = kh.push(kv)
+                    vh = vh.push(vv)
+                    d = d + 1
+                }
+                t = t + 1
+            }
+            // attention within this head
+            let mut head_out = []
+            t = 0
+            while t < seq {
+                let mut scores = []
+                let mut j = 0
+                while j < seq {
+                    if causal && j > t {
+                        scores = scores.push(0.0 - 1000000000.0)
+                    } else {
+                        let mut dot = 0.0
+                        let mut d = 0
+                        while d < head_dim {
+                            dot = dot + qh[t * head_dim + d] * kh[j * head_dim + d]
+                            d = d + 1
+                        }
+                        scores = scores.push(dot * scale)
+                    }
+                    j = j + 1
+                }
+                let mut max_s = scores[0]
+                for s in scores { if s > max_s { max_s = s } }
+                let mut exps = []
+                let mut sum_e = 0.0
+                for s in scores {
+                    let e = exp(s - max_s)
+                    exps = exps.push(e)
+                    sum_e = sum_e + e
+                }
+                let mut d = 0
+                while d < head_dim {
+                    let mut val = 0.0
+                    j = 0
+                    while j < seq {
+                        val = val + (exps[j] / sum_e) * vh[j * head_dim + d]
+                        j = j + 1
+                    }
+                    head_out = head_out.push(val)
+                    d = d + 1
+                }
+                t = t + 1
+            }
+            // assemble output (interleave heads back)
+            t = 0
+            while t < seq {
+                let mut d = 0
+                while d < head_dim {
+                    output = output.push(val_float(head_out[t * head_dim + d]))
+                    d = d + 1
+                }
+                t = t + 1
+            }
+            h = h + 1
+        }
+        return val_array(output)
+    }
+
+    // grouped_query_attention — wraps multi_head with KV grouping
+    if name == "grouped_query_attention" {
+        return val_array([])
+    }
+    // sliding_window_attention(Q, K, V, seq, dim, window)
+    if name == "sliding_window_attention" {
+        if len(args) < 6 { return val_array([]) }
+        let q = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let k = if args[1].tag == "tensor" { tensor_data(args[1]) } else { get_array(args[1]) }
+        let v = if args[2].tag == "tensor" { tensor_data(args[2]) } else { get_array(args[2]) }
+        let seq = args[3].int_val
+        let dim = args[4].int_val
+        let window = args[5].int_val
+        let scale = 1.0 / sqrt(dim + 0.0)
+        let mut output = []
+        let mut i = 0
+        while i < seq {
+            let lo = if i - window < 0 { 0 } else { i - window }
+            let mut scores = []
+            let mut j = lo
+            while j <= i {
+                let mut dot = 0.0
+                let mut d = 0
+                while d < dim {
+                    let qv = if type_of(q[i * dim + d]) == "float" { q[i * dim + d] } else { to_float_val(q[i * dim + d]) }
+                    let kv = if type_of(k[j * dim + d]) == "float" { k[j * dim + d] } else { to_float_val(k[j * dim + d]) }
+                    dot = dot + qv * kv
+                    d = d + 1
+                }
+                scores = scores.push(dot * scale)
+                j = j + 1
+            }
+            let mut max_s = scores[0]
+            for s in scores { if s > max_s { max_s = s } }
+            let mut exps = []
+            let mut sum_e = 0.0
+            for s in scores { let e = exp(s - max_s); exps = exps.push(e); sum_e = sum_e + e }
+            let mut d = 0
+            while d < dim {
+                let mut val = 0.0
+                let mut idx = 0
+                j = lo
+                while j <= i {
+                    let vv = if type_of(v[j * dim + d]) == "float" { v[j * dim + d] } else { to_float_val(v[j * dim + d]) }
+                    val = val + (exps[idx] / sum_e) * vv
+                    idx = idx + 1
+                    j = j + 1
+                }
+                output = output.push(val_float(val))
+                d = d + 1
+            }
+            i = i + 1
+        }
+        return val_array(output)
+    }
+
+    // group_norm(x, n_groups, dim) — normalize per group
+    if name == "group_norm" {
+        if len(args) < 3 { return val_array([]) }
+        let x = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let n_groups = args[1].int_val
+        let dim = args[2].int_val
+        let group_size = dim / n_groups
+        let n_samples = len(x) / dim
+        let mut result = []
+        let mut s = 0
+        while s < n_samples {
+            let mut g = 0
+            while g < n_groups {
+                let base = s * dim + g * group_size
+                let mut mean = 0.0
+                let mut k = 0
+                while k < group_size {
+                    let v = if type_of(x[base + k]) == "float" { x[base + k] } else { to_float_val(x[base + k]) }
+                    mean = mean + v
+                    k = k + 1
+                }
+                mean = mean / group_size
+                let mut var = 0.0
+                k = 0
+                while k < group_size {
+                    let v = if type_of(x[base + k]) == "float" { x[base + k] } else { to_float_val(x[base + k]) }
+                    var = var + (v - mean) * (v - mean)
+                    k = k + 1
+                }
+                var = var / group_size
+                let denom = sqrt(var + 0.00001)
+                k = 0
+                while k < group_size {
+                    let v = if type_of(x[base + k]) == "float" { x[base + k] } else { to_float_val(x[base + k]) }
+                    result = result.push(val_float((v - mean) / denom))
+                    k = k + 1
+                }
+                g = g + 1
+            }
+            s = s + 1
+        }
+        return val_array(result)
+    }
+
+    // max_pool1d(x, kernel_size, stride)
+    if name == "max_pool1d" {
+        if len(args) < 3 { return val_array([]) }
+        let x = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let k = args[1].int_val
+        let stride = args[2].int_val
+        let n = len(x)
+        let out_n = (n - k) / stride + 1
+        let mut result = []
+        let mut o = 0
+        while o < out_n {
+            let mut best = if type_of(x[o * stride]) == "float" { x[o * stride] } else { to_float_val(x[o * stride]) }
+            let mut i = 1
+            while i < k {
+                let v = if type_of(x[o * stride + i]) == "float" { x[o * stride + i] } else { to_float_val(x[o * stride + i]) }
+                if v > best { best = v }
+                i = i + 1
+            }
+            result = result.push(val_float(best))
+            o = o + 1
+        }
+        return val_array(result)
+    }
+
+    // gru_cell(x, h, Wxr, Whr, Wxz, Whz, Wxn, Whn) — simplified GRU
+    if name == "gru_cell" {
+        // 8-arg signature, returns new hidden state. Skip if args insufficient.
+        return val_array([])
+    }
+
+    // moe_gate(x, gates, n_experts) → top-1 expert index + softmax weight
+    if name == "moe_gate" {
+        if len(args) < 3 { return val_array([]) }
+        let g = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let n_experts = args[2].int_val
+        // softmax over gates
+        let mut max_g = if type_of(g[0]) == "float" { g[0] } else { to_float_val(g[0]) }
+        let mut i = 0
+        while i < n_experts {
+            let v = if type_of(g[i]) == "float" { g[i] } else { to_float_val(g[i]) }
+            if v > max_g { max_g = v }
+            i = i + 1
+        }
+        let mut exps = []
+        let mut sum_e = 0.0
+        i = 0
+        while i < n_experts {
+            let v = if type_of(g[i]) == "float" { g[i] } else { to_float_val(g[i]) }
+            let e = exp(v - max_g)
+            exps = exps.push(e)
+            sum_e = sum_e + e
+            i = i + 1
+        }
+        // pick max
+        let mut best = 0
+        let mut best_p = exps[0] / sum_e
+        i = 1
+        while i < n_experts {
+            let p = exps[i] / sum_e
+            if p > best_p { best = i; best_p = p }
+            i = i + 1
+        }
+        return val_array([val_int(best), val_float(best_p)])
+    }
+    if name == "moe_combine" {
+        // moe_combine(expert_outputs, weights) — weighted sum
+        if len(args) < 2 { return val_array([]) }
+        let outs = get_array(args[0])
+        let ws = if args[1].tag == "tensor" { tensor_data(args[1]) } else { get_array(args[1]) }
+        if len(outs) == 0 { return val_array([]) }
+        let first = if outs[0].tag == "tensor" { tensor_data(outs[0]) } else { get_array(outs[0]) }
+        let dim = len(first)
+        let mut result = []
+        let mut d = 0
+        while d < dim {
+            let mut acc = 0.0
+            let mut e = 0
+            while e < len(outs) {
+                let exp_data = if outs[e].tag == "tensor" { tensor_data(outs[e]) } else { get_array(outs[e]) }
+                let v = if type_of(exp_data[d]) == "float" { exp_data[d] } else { to_float_val(exp_data[d]) }
+                let w = if type_of(ws[e]) == "float" { ws[e] } else { to_float_val(ws[e]) }
+                acc = acc + w * v
+                e = e + 1
+            }
+            result = result.push(val_float(acc))
+            d = d + 1
+        }
+        return val_array(result)
+    }
+
+    // ── Phase 16 골화 — FFI memory + JSON + utility ──
+    // alloc_raw(size) — return Pointer to managed buffer (registry-backed)
+    if name == "alloc_raw" {
+        if len(args) == 0 { return val_pointer(0) }
+        let size = args[0].int_val
+        if size <= 0 { return val_pointer(0) }
+        // Use atomic_store as a buffer registry: alloc one cell of zeros
+        let mut buf = []
+        let mut i = 0
+        while i < size { buf = buf.push(val_int(0)); i = i + 1 }
+        let id = len(atomic_store)
+        atomic_store = atomic_store.push(val_array(buf))
+        return val_pointer(id + 1000000)  // mark as managed
+    }
+    if name == "free_raw" {
+        // No-op in self-host (storage GC'd elsewhere)
+        return val_void()
+    }
+    if name == "arena_reset" {
+        return val_void()
+    }
+    if name == "mem_budget" || name == "mem_stats" {
+        // Return [used, total] as array of ints (best-effort: report 0)
+        return val_array([val_int(0), val_int(0)])
+    }
+    if name == "mem_region" {
+        return val_void()
+    }
+    if name == "memcpy_host" {
+        // memcpy_host(dst, src, n) — copy n elements
+        if len(args) < 3 { return val_void() }
+        let n = args[2].int_val
+        let src = if args[1].tag == "tensor" { tensor_data(args[1]) } else { get_array(args[1]) }
+        if args[0].tag == "tensor" {
+            let mut data = []
+            let mut i = 0
+            while i < n && i < len(src) { data = data.push(src[i]); i = i + 1 }
+            tensor_set_data(args[0], data)
+        }
+        return val_void()
+    }
+    if name == "deref_f32" || name == "deref_i32" {
+        // Read from pointer (managed alloc registry)
+        if len(args) == 0 { return val_int(0) }
+        let p = args[0]
+        if p.tag != "pointer" { return val_int(0) }
+        let id = p.int_val - 1000000
+        if id < 0 || id >= len(atomic_store) { return val_int(0) }
+        let buf_val = atomic_store[id]
+        if buf_val.tag != "array" { return val_int(0) }
+        let buf = get_array(buf_val)
+        let offset = if len(args) > 1 { args[1].int_val } else { 0 }
+        if offset < 0 || offset >= len(buf) { return val_int(0) }
+        return buf[offset]
+    }
+    if name == "write_f32" || name == "write_i32" || name == "write_i64" {
+        // write(ptr, offset, value)
+        if len(args) < 3 { return val_void() }
+        let p = args[0]
+        if p.tag != "pointer" { return val_void() }
+        let id = p.int_val - 1000000
+        if id < 0 || id >= len(atomic_store) { return val_void() }
+        let buf_val = atomic_store[id]
+        if buf_val.tag != "array" { return val_void() }
+        let mut buf = get_array(buf_val)
+        let offset = args[1].int_val
+        if offset >= 0 && offset < len(buf) {
+            buf[offset] = args[2]
+            atomic_store[id] = val_array(buf)
+        }
+        return val_void()
+    }
+    if name == "ptr_from_int" {
+        if len(args) == 0 { return val_pointer(0) }
+        return val_pointer(args[0].int_val)
+    }
+    if name == "from_cstring_n" {
+        // Convert pointer + length to string (best-effort: return as int wrapper)
+        if len(args) == 0 { return val_str("") }
+        return val_str("")
+    }
+    if name == "tensor_data_f32_ptr" {
+        // Get pointer to underlying tensor data (registry-tagged)
+        if len(args) == 0 { return val_pointer(0) }
+        let t = args[0]
+        if t.tag != "tensor" { return val_pointer(0) }
+        return val_pointer(t.int_val + 2000000)  // tensor-tagged ptr
+    }
+    if name == "tensor_from_f32_ptr" {
+        // Reverse: pointer → tensor
+        if len(args) == 0 { return val_tensor([0], []) }
+        let p = args[0]
+        if p.tag != "pointer" { return val_tensor([0], []) }
+        let id = p.int_val - 2000000
+        if id < 0 || id >= len(tensor_shape_store) { return val_tensor([0], []) }
+        return Val { tag: "tensor", int_val: id, float_val: 0.0, bool_val: false, str_val: "", char_val: "", array_val: "", fn_name: "", fn_params: "", fn_body: "", struct_name: "", struct_fields: "" }
+    }
+
+    // ── JSON: proper parse/stringify ──
+    if name == "json_stringify" {
+        if len(args) == 0 { return val_str("null") }
+        return val_str(val_to_json(args[0]))
+    }
+    if name == "json_parse" {
+        if len(args) == 0 { return val_void() }
+        return json_to_val(args[0].str_val)
+    }
+
+    // ── benchmark / test runner ──
+    if name == "bench_fn" {
+        // bench_fn(fn, n_iters) → elapsed time in milliseconds
+        if len(args) < 2 { return val_int(0) }
+        let f = args[0]
+        let n = args[1].int_val
+        let start_time = timestamp()
+        let mut i = 0
+        while i < n {
+            call_fn_val(f, [])
+            i = i + 1
+        }
+        return val_int(timestamp() - start_time)
+    }
+    if name == "run_tests" || name == "run_benchmarks" {
+        // Self-host stub: actual test harness lives in user code
+        return val_int(0)
+    }
+
+    // ── ascii visualization ──
+    if name == "ascii_bar" {
+        // ascii_bar(value, max, width) → string bar
+        if len(args) < 3 { return val_str("") }
+        let v = to_float_val(args[0])
+        let max_v = to_float_val(args[1])
+        let width = args[2].int_val
+        if max_v <= 0.0 { return val_str("") }
+        let n_filled = floor(v / max_v * width)
+        let mut out = ""
+        let mut i = 0
+        while i < n_filled { out = out + "█"; i = i + 1 }
+        while i < width { out = out + "·"; i = i + 1 }
+        return val_str(out)
+    }
+    if name == "ascii_plot" {
+        // ascii_plot(values, height) → multi-line string
+        if len(args) == 0 { return val_str("") }
+        let values = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let height = if len(args) > 1 { args[1].int_val } else { 10 }
+        let n = len(values)
+        if n == 0 { return val_str("") }
+        let mut max_v = if type_of(values[0]) == "float" { values[0] } else { to_float_val(values[0]) }
+        let mut min_v = max_v
+        for v in values {
+            let f = if type_of(v) == "float" { v } else { to_float_val(v) }
+            if f > max_v { max_v = f }
+            if f < min_v { min_v = f }
+        }
+        let range = max_v - min_v
+        if range == 0.0 { return val_str("(constant)") }
+        let mut out = ""
+        let mut row = height - 1
+        while row >= 0 {
+            let mut i = 0
+            while i < n {
+                let v = if type_of(values[i]) == "float" { values[i] } else { to_float_val(values[i]) }
+                let row_v = floor((v - min_v) / range * (height - 1))
+                if row_v >= row { out = out + "█" }
+                else { out = out + " " }
+                i = i + 1
+            }
+            out = out + "\n"
+            row = row - 1
+        }
+        return val_str(out)
+    }
+
+    // ── consciousness/anima placeholders ──
+    // These return safe defaults so anima.hexa code parses & runs.
+    // Real consciousness ops require shared state with the host runtime.
+    if name == "consciousness_phi" {
+        // Default IIT Φ = 0 (no integration)
+        return val_float(0.0)
+    }
+    if name == "consciousness_vector" {
+        // Returns the input array unchanged (passthrough)
+        if len(args) == 0 { return val_array([]) }
+        return args[0]
+    }
+    if name == "consciousness_decoder_dim" || name == "consciousness_max_cells" {
+        return val_int(0)
+    }
+    if name == "phi" || name == "phi_predict" {
+        return val_float(0.0)
+    }
+    if name == "psi_balance" || name == "psi_coupling" || name == "psi_entropy" || name == "psi_frustration" || name == "psi_steps" {
+        return val_float(0.0)
+    }
+    if name == "tension" || name == "tension_link" {
+        return val_float(0.0)
+    }
+    if name == "evolve_gen" || name == "evolve_stats" {
+        return val_array([])
+    }
+    if name == "faction" || name == "faction_consensus" {
+        return val_array([])
+    }
+    if name == "combined_reward" || name == "curiosity_reward" || name == "dialogue_reward" {
+        return val_float(0.0)
+    }
+    if name == "chaos_perturb" {
+        if len(args) == 0 { return val_array([]) }
+        return args[0]
+    }
+    if name == "lorenz_step" {
+        // 3D Lorenz attractor step: returns [new_x, new_y, new_z]
+        if len(args) < 4 { return val_array([]) }
+        let x = to_float_val(args[0])
+        let y = to_float_val(args[1])
+        let z = to_float_val(args[2])
+        let dt = to_float_val(args[3])
+        let sigma_l = 10.0
+        let rho = 28.0
+        let beta = 8.0 / 3.0
+        let dx = sigma_l * (y - x)
+        let dy = x * (rho - z) - y
+        let dz = x * y - beta * z
+        return val_array([val_float(x + dx * dt), val_float(y + dy * dt), val_float(z + dz * dt)])
+    }
+    if name == "laws" || name == "meta_laws" || name == "meta" || name == "hexad_modules" || name == "hexad_left" || name == "hexad_right" {
+        return val_array([])
+    }
+    if name == "auto_topology" || name == "ring_topology" || name == "small_world_topology" || name == "hypercube_topology" {
+        return val_array([])
+    }
+    if name == "nexus_n6_check" {
+        return val_bool(true)
+    }
+    if name == "running_stats" {
+        // running_stats(prev_mean, prev_var, prev_n, x) → [new_mean, new_var, new_n]
+        if len(args) < 4 { return val_array([]) }
+        let prev_mean = to_float_val(args[0])
+        let prev_var = to_float_val(args[1])
+        let prev_n = args[2].int_val
+        let x = to_float_val(args[3])
+        let new_n = prev_n + 1
+        let delta = x - prev_mean
+        let new_mean = prev_mean + delta / new_n
+        let delta2 = x - new_mean
+        let new_var = if prev_n == 0 { 0.0 } else { (prev_var * prev_n + delta * delta2) / new_n }
+        return val_array([val_float(new_mean), val_float(new_var), val_int(new_n)])
+    }
+    if name == "trend_slope" {
+        // Linear regression slope (least squares)
+        if len(args) == 0 { return val_float(0.0) }
+        let arr = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let n = len(arr)
+        if n < 2 { return val_float(0.0) }
+        let mut sum_x = 0.0
+        let mut sum_y = 0.0
+        let mut sum_xy = 0.0
+        let mut sum_xx = 0.0
+        let mut i = 0
+        while i < n {
+            let x = i + 0.0
+            let y = if type_of(arr[i]) == "float" { arr[i] } else { to_float_val(arr[i]) }
+            sum_x = sum_x + x
+            sum_y = sum_y + y
+            sum_xy = sum_xy + x * y
+            sum_xx = sum_xx + x * x
+            i = i + 1
+        }
+        let denom = n * sum_xx - sum_x * sum_x
+        if denom == 0.0 { return val_float(0.0) }
+        return val_float((n * sum_xy - sum_x * sum_y) / denom)
+    }
+    if name == "autocorrelation" {
+        // autocorr(arr, lag)
+        if len(args) < 2 { return val_float(0.0) }
+        let arr = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let lag = args[1].int_val
+        let n = len(arr)
+        if n - lag < 2 { return val_float(0.0) }
+        let mut mean = 0.0
+        for v in arr { mean = mean + (if type_of(v) == "float" { v } else { to_float_val(v) }) }
+        mean = mean / n
+        let mut num = 0.0
+        let mut den = 0.0
+        let mut i = 0
+        while i < n {
+            let v = if type_of(arr[i]) == "float" { arr[i] } else { to_float_val(arr[i]) }
+            den = den + (v - mean) * (v - mean)
+            if i + lag < n {
+                let v2 = if type_of(arr[i + lag]) == "float" { arr[i + lag] } else { to_float_val(arr[i + lag]) }
+                num = num + (v - mean) * (v2 - mean)
+            }
+            i = i + 1
+        }
+        if den == 0.0 { return val_float(0.0) }
+        return val_float(num / den)
+    }
+    if name == "mutual_information" {
+        // Simplified: 0 for now (full impl needs joint distribution)
+        return val_float(0.0)
+    }
+    if name == "ewc_penalty" || name == "fisher_diagonal" || name == "magnitude_prune" || name == "sparsity" {
+        return val_float(0.0)
+    }
+    if name == "data_split" {
+        if len(args) < 2 { return val_array([]) }
+        let arr = get_array(args[0])
+        let ratio = to_float_val(args[1])
+        let split_idx = floor(len(arr) * ratio)
+        let mut train = []
+        let mut test = []
+        let mut i = 0
+        while i < len(arr) {
+            if i < split_idx { train = train.push(arr[i]) }
+            else { test = test.push(arr[i]) }
+            i = i + 1
+        }
+        return val_array([val_array(train), val_array(test)])
+    }
+    if name == "quantize_int8" {
+        // quantize float array to [-127,127]
+        if len(args) == 0 { return val_array([]) }
+        let arr = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let mut max_abs = 0.0
+        for v in arr {
+            let f = if type_of(v) == "float" { v } else { to_float_val(v) }
+            let a = if f < 0.0 { 0.0 - f } else { f }
+            if a > max_abs { max_abs = a }
+        }
+        if max_abs == 0.0 {
+            let mut z = []
+            let mut i = 0
+            while i < len(arr) { z = z.push(val_int(0)); i = i + 1 }
+            return val_array([val_array(z), val_float(1.0)])
+        }
+        let scale = 127.0 / max_abs
+        let mut quantized = []
+        for v in arr {
+            let f = if type_of(v) == "float" { v } else { to_float_val(v) }
+            quantized = quantized.push(val_int(floor(f * scale)))
+        }
+        return val_array([val_array(quantized), val_float(scale)])
+    }
+    if name == "dequantize_int8" {
+        if len(args) < 2 { return val_array([]) }
+        let arr = get_array(args[0])
+        let scale = to_float_val(args[1])
+        let mut result = []
+        for v in arr { result = result.push(val_float(v.int_val / scale)) }
+        return val_array(result)
+    }
+    if name == "hmac_sha256" {
+        // self-host can't do crypto; return empty string
+        return val_str("")
+    }
+    if name == "url_decode" {
+        if len(args) == 0 { return val_str("") }
+        return val_str(args[0].str_val)
+    }
+    if name == "is_numeric" {
+        if len(args) == 0 { return val_bool(false) }
+        let v = args[0]
+        return val_bool(v.tag == "int" || v.tag == "float")
+    }
+    if name == "is_whitespace" {
+        if len(args) == 0 { return val_bool(false) }
+        let s = args[0].str_val
+        return val_bool(s == " " || s == "\t" || s == "\n" || s == "\r")
+    }
+    if name == "input_all" || name == "readline" {
+        return val_str(input(""))
+    }
+    if name == "read_file_bytes" {
+        if len(args) == 0 { return val_array([]) }
+        let s = read_file(args[0].str_val)
+        let mut out = []
+        let cs = s.chars()
+        for c in cs { out = out.push(val_int(char_code(to_string(c), 0))) }
+        return val_array(out)
+    }
+    if name == "write_file_bytes" {
+        if len(args) < 2 { return val_void() }
+        let arr = get_array(args[1])
+        let mut s = ""
+        for b in arr { s = s + to_string(b.int_val) }
+        write_file(args[0].str_val, s)
+        return val_void()
+    }
+
+    // ── Phase 17 골화 — 잔여 빌트인 ──
+    // linear_attention(Q, K, V, seq, dim) — feature-based linear attention
+    if name == "linear_attention" {
+        if len(args) < 5 { return val_array([]) }
+        let q = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let k = if args[1].tag == "tensor" { tensor_data(args[1]) } else { get_array(args[1]) }
+        let v = if args[2].tag == "tensor" { tensor_data(args[2]) } else { get_array(args[2]) }
+        let seq = args[3].int_val
+        let dim = args[4].int_val
+        // Approximation: φ(x) = elu(x) + 1, attention = (Q · ΣK·Vᵀ) / (Q · ΣK)
+        // Single-pass simplified version
+        let mut sum_kv = []
+        let mut sum_k = []
+        let mut i = 0
+        while i < dim * dim { sum_kv = sum_kv.push(0.0); i = i + 1 }
+        i = 0
+        while i < dim { sum_k = sum_k.push(0.0); i = i + 1 }
+        // Accumulate over sequence
+        let mut t = 0
+        while t < seq {
+            let mut d1 = 0
+            while d1 < dim {
+                let kv1 = if type_of(k[t * dim + d1]) == "float" { k[t * dim + d1] } else { to_float_val(k[t * dim + d1]) }
+                let phi_k = if kv1 > 0.0 { kv1 + 1.0 } else { exp(kv1) }
+                sum_k[d1] = sum_k[d1] + phi_k
+                let mut d2 = 0
+                while d2 < dim {
+                    let vv = if type_of(v[t * dim + d2]) == "float" { v[t * dim + d2] } else { to_float_val(v[t * dim + d2]) }
+                    sum_kv[d1 * dim + d2] = sum_kv[d1 * dim + d2] + phi_k * vv
+                    d2 = d2 + 1
+                }
+                d1 = d1 + 1
+            }
+            t = t + 1
+        }
+        // Now compute Q · sum_kv / Q · sum_k for each query
+        let mut output = []
+        t = 0
+        while t < seq {
+            let mut denom = 0.0
+            let mut d1 = 0
+            while d1 < dim {
+                let qv = if type_of(q[t * dim + d1]) == "float" { q[t * dim + d1] } else { to_float_val(q[t * dim + d1]) }
+                let phi_q = if qv > 0.0 { qv + 1.0 } else { exp(qv) }
+                denom = denom + phi_q * sum_k[d1]
+                d1 = d1 + 1
+            }
+            let mut d2 = 0
+            while d2 < dim {
+                let mut num = 0.0
+                d1 = 0
+                while d1 < dim {
+                    let qv = if type_of(q[t * dim + d1]) == "float" { q[t * dim + d1] } else { to_float_val(q[t * dim + d1]) }
+                    let phi_q = if qv > 0.0 { qv + 1.0 } else { exp(qv) }
+                    num = num + phi_q * sum_kv[d1 * dim + d2]
+                    d1 = d1 + 1
+                }
+                if denom == 0.0 { output = output.push(val_float(0.0)) }
+                else { output = output.push(val_float(num / denom)) }
+                d2 = d2 + 1
+            }
+            t = t + 1
+        }
+        return val_array(output)
+    }
+    // sample_token(logits, temperature) → int (argmax of softmax * temp)
+    if name == "sample_token" {
+        if len(args) == 0 { return val_int(0) }
+        let logits = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let temp = if len(args) > 1 { to_float_val(args[1]) } else { 1.0 }
+        if len(logits) == 0 { return val_int(0) }
+        // softmax with temperature
+        let mut max_l = if type_of(logits[0]) == "float" { logits[0] } else { to_float_val(logits[0]) }
+        for v in logits {
+            let f = if type_of(v) == "float" { v } else { to_float_val(v) }
+            if f > max_l { max_l = f }
+        }
+        let mut exps = []
+        let mut sum_e = 0.0
+        for v in logits {
+            let f = if type_of(v) == "float" { v } else { to_float_val(v) }
+            let e = exp((f - max_l) / temp)
+            exps = exps.push(e)
+            sum_e = sum_e + e
+        }
+        // sample via cumulative
+        let r = random() * sum_e
+        let mut cum = 0.0
+        let mut i = 0
+        while i < len(exps) {
+            cum = cum + exps[i]
+            if r <= cum { return val_int(i) }
+            i = i + 1
+        }
+        return val_int(len(exps) - 1)
+    }
+    // beam_search_step(logits, beam_width) → top-k indices
+    if name == "beam_search_step" {
+        if len(args) < 2 { return val_array([]) }
+        return call_builtin("topk", args)
+    }
+    // mat_scale(m, s) — scalar multiply
+    if name == "mat_scale" {
+        if len(args) < 2 { return val_array([]) }
+        let m = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let s = to_float_val(args[1])
+        let mut result = []
+        for v in m {
+            let f = if type_of(v) == "float" { v } else { to_float_val(v) }
+            result = result.push(val_float(f * s))
+        }
+        return val_array(result)
+    }
+    // mat_add_inplace(a, b) — a += b
+    if name == "mat_add_inplace" {
+        if len(args) < 2 { return val_void() }
+        if args[0].tag != "tensor" { return val_void() }
+        let a_data = tensor_data(args[0])
+        let b = if args[1].tag == "tensor" { tensor_data(args[1]) } else { get_array(args[1]) }
+        let n = if len(a_data) < len(b) { len(a_data) } else { len(b) }
+        let mut new_data = []
+        let mut i = 0
+        while i < len(a_data) {
+            if i < n {
+                let av = if type_of(a_data[i]) == "float" { a_data[i] } else { to_float_val(a_data[i]) }
+                let bv = if type_of(b[i]) == "float" { b[i] } else { to_float_val(b[i]) }
+                new_data = new_data.push(av + bv)
+            } else {
+                new_data = new_data.push(a_data[i])
+            }
+            i = i + 1
+        }
+        tensor_set_data(args[0], new_data)
+        return args[0]
+    }
+    // grad_accumulate(grad_acc, grad) → new_grad_acc
+    if name == "grad_accumulate" {
+        if len(args) < 2 { return val_array([]) }
+        let acc = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let g = if args[1].tag == "tensor" { tensor_data(args[1]) } else { get_array(args[1]) }
+        let n = if len(acc) < len(g) { len(acc) } else { len(g) }
+        let mut result = []
+        let mut i = 0
+        while i < n {
+            let av = if type_of(acc[i]) == "float" { acc[i] } else { to_float_val(acc[i]) }
+            let gv = if type_of(g[i]) == "float" { g[i] } else { to_float_val(g[i]) }
+            result = result.push(val_float(av + gv))
+            i = i + 1
+        }
+        return val_array(result)
+    }
+    // param_count(weight_dict) → total scalar count
+    if name == "param_count" {
+        if len(args) == 0 { return val_int(0) }
+        if args[0].tag == "map" {
+            let vals = get_map_values(args[0])
+            let mut total = 0
+            for v in vals {
+                if v.tag == "tensor" { total = total + tensor_numel(v) }
+                else { if v.tag == "array" { total = total + len(get_array(v)) } }
+            }
+            return val_int(total)
+        }
+        if args[0].tag == "tensor" { return val_int(tensor_numel(args[0])) }
+        if args[0].tag == "array" { return val_int(len(get_array(args[0]))) }
+        return val_int(0)
+    }
+    // load_array(path) → array of floats from file
+    if name == "load_array" {
+        if len(args) == 0 { return val_array([]) }
+        try {
+            let s = read_file(args[0].str_val)
+            let lines = s.split("\n")
+            let mut result = []
+            for l in lines {
+                let trimmed = l.trim()
+                if trimmed != "" { result = result.push(val_float(to_float(val_str(trimmed)))) }
+            }
+            return val_array(result)
+        } catch e {
+            return val_array([])
+        }
+    }
+    // save_array(path, arr) → void
+    if name == "save_array" {
+        if len(args) < 2 { return val_void() }
+        let arr = if args[1].tag == "tensor" { tensor_data(args[1]) } else { get_array(args[1]) }
+        let mut s = ""
+        for v in arr {
+            let f = if type_of(v) == "float" { v } else { to_float_val(v) }
+            s = s + to_string(f) + "\n"
+        }
+        write_file(args[0].str_val, s)
+        return val_void()
+    }
+    // log_get_entries — return empty (log subsystem stub)
+    if name == "log_get_entries" {
+        return val_array([])
+    }
+    if name == "law_count" {
+        return val_int(60)  // HEXA has 60 laws
+    }
+    // cell_merge / cell_split — consciousness cell ops, return passthrough
+    if name == "cell_merge" {
+        if len(args) < 2 { return val_array([]) }
+        let a = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let b = if args[1].tag == "tensor" { tensor_data(args[1]) } else { get_array(args[1]) }
+        let n = if len(a) < len(b) { len(a) } else { len(b) }
+        let mut result = []
+        let mut i = 0
+        while i < n {
+            let av = if type_of(a[i]) == "float" { a[i] } else { to_float_val(a[i]) }
+            let bv = if type_of(b[i]) == "float" { b[i] } else { to_float_val(b[i]) }
+            result = result.push(val_float(0.5 * (av + bv)))
+            i = i + 1
+        }
+        return val_array(result)
+    }
+    if name == "cell_split" {
+        if len(args) == 0 { return val_array([]) }
+        // Returns [cell, copy_with_perturbation]
+        let arr = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let mut copy = []
+        for v in arr {
+            let f = if type_of(v) == "float" { v } else { to_float_val(v) }
+            copy = copy.push(val_float(f + 0.001 * (random() - 0.5)))
+        }
+        return val_array([args[0], val_array(copy)])
+    }
+    // attention_fused_into — alias to attention but writes into a tensor
+    if name == "attention_fused_into" || name == "attention_cached" {
+        // Compute attention and copy result into out tensor
+        if len(args) < 6 { return val_void() }
+        let out = args[0]
+        let inner_args = []
+        let mut i = 1
+        while i < len(args) { inner_args.push(args[i]); i = i + 1 }
+        let result = call_builtin("attention", inner_args)
+        if out.tag == "tensor" && result.tag == "array" {
+            let arr = get_array(result)
+            let mut data = []
+            for v in arr { data = data.push(if type_of(v) == "float" { v } else { to_float_val(v) }) }
+            tensor_set_data(out, data)
+        }
+        return out
+    }
+    // ffn_fused_into(out, x, w1, w2, dim, hidden) — feed-forward block
+    if name == "ffn_fused_into" {
+        if len(args) < 6 { return val_void() }
+        let out = args[0]
+        let x = if args[1].tag == "tensor" { tensor_data(args[1]) } else { get_array(args[1]) }
+        let w1 = if args[2].tag == "tensor" { tensor_data(args[2]) } else { get_array(args[2]) }
+        let w2 = if args[3].tag == "tensor" { tensor_data(args[3]) } else { get_array(args[3]) }
+        let dim = args[4].int_val
+        let hidden = args[5].int_val
+        // h = relu(W1 @ x)
+        let mut h = []
+        let mut i = 0
+        while i < hidden {
+            let mut acc = 0.0
+            let mut c = 0
+            while c < dim {
+                let wv = if type_of(w1[i * dim + c]) == "float" { w1[i * dim + c] } else { to_float_val(w1[i * dim + c]) }
+                let xv = if type_of(x[c]) == "float" { x[c] } else { to_float_val(x[c]) }
+                acc = acc + wv * xv
+                c = c + 1
+            }
+            if acc < 0.0 { h = h.push(0.0) } else { h = h.push(acc) }
+            i = i + 1
+        }
+        // y = W2 @ h
+        let mut y = []
+        i = 0
+        while i < dim {
+            let mut acc = 0.0
+            let mut c = 0
+            while c < hidden {
+                let wv = if type_of(w2[i * hidden + c]) == "float" { w2[i * hidden + c] } else { to_float_val(w2[i * hidden + c]) }
+                acc = acc + wv * h[c]
+                c = c + 1
+            }
+            y = y.push(acc)
+            i = i + 1
+        }
+        if out.tag == "tensor" {
+            tensor_set_data(out, y)
+            return out
+        }
+        let mut wrapped = []
+        for v in y { wrapped = wrapped.push(val_float(v)) }
+        return val_array(wrapped)
+    }
+    // block_forward_chain — multi-layer transformer block stub
+    if name == "block_forward_chain" || name == "block_forward_chain_f32" || name == "block_forward_fused" {
+        // Pass through (output identity); real impl is fused kernel
+        if len(args) > 0 { return args[0] }
+        return val_array([])
+    }
+    // ── Channel/IO/HTTP stubs (host-dependent) ──
+    if name == "send" {
+        if len(args) >= 2 && args[0].tag == "channel" { return val_bool(channel_send(args[0], args[1])) }
+        return val_bool(false)
+    }
+    if name == "recv" {
+        if len(args) >= 1 && args[0].tag == "channel" { return channel_recv(args[0]) }
+        return val_void()
+    }
+    if name == "try_recv" {
+        if len(args) >= 1 && args[0].tag == "channel" {
+            let v = channel_recv(args[0])
+            if v.tag == "void" { return val_enum("Option", "None", "") }
+            return val_enum("Option", "Some", v)
+        }
+        return val_enum("Option", "None", "")
+    }
+    if name == "is_ready" {
+        if len(args) == 0 { return val_bool(false) }
+        return val_bool(true)
+    }
+    if name == "deque_len" {
+        if len(args) == 0 { return val_int(0) }
+        if args[0].tag == "array" { return val_int(len(get_array(args[0]))) }
+        return val_int(0)
+    }
+    if name == "io_reader_next" || name == "fs_watch" || name == "http_get" || name == "http_post" || name == "http_serve" {
+        // Host runtime delegate
+        return val_str("")
+    }
+    if name == "tanh_" {
+        if len(args) == 0 { return val_float(0.0) }
+        return val_float(tanh(to_float_val(args[0])))
+    }
+    if name == "to_char" {
+        if len(args) == 0 { return val_str("") }
+        return val_str(to_string(args[0].int_val))
+    }
+    if name == "try_float" {
+        if len(args) == 0 { return val_float(0.0) }
+        try { return val_float(to_float(args[0])) }
+        catch e { return val_float(0.0) }
+    }
+    if name == "str" {
+        if len(args) == 0 { return val_str("") }
+        return val_str(val_to_string(args[0]))
+    }
+    if name == "gen" {
+        // Generator stub: empty array
+        return val_array([])
+    }
+    if name == "hello" {
+        return val_str("hello from hexa interpreter (self-host)")
+    }
+
+    // ── Phase 22b 골화 — 호스트 핵심 빌트인 패스스루 ──
+    // 이전 batch들이 alias만 추가하고 이름 자체 누락한 경우 보강.
+    if name == "time" {
+        return val_int(timestamp())
+    }
+    if name == "sleep" {
+        if len(args) > 0 { sleep(args[0].int_val) }
+        return val_void()
+    }
+    if name == "random" {
+        return val_float(random())
+    }
+    if name == "range" {
+        // range(n) | range(start, end) | range(start, end, step)
+        let start = if len(args) >= 2 { args[0].int_val } else { 0 }
+        let end = if len(args) >= 2 { args[1].int_val } else { args[0].int_val }
+        let step = if len(args) >= 3 { args[2].int_val } else { 1 }
+        let mut result = []
+        let mut i = start
+        if step > 0 {
+            while i < end { result = result.push(val_int(i)); i = i + step }
+        }
+        if step < 0 {
+            while i > end { result = result.push(val_int(i)); i = i + step }
+        }
+        return val_array(result)
+    }
+    if name == "assert" {
+        if len(args) > 0 && !is_truthy(args[0]) {
+            throw_flag = true
+            let msg = if len(args) > 1 { args[1].str_val } else { "assertion failed" }
+            throw_val = val_str(msg)
+        }
+        return val_void()
+    }
+    if name == "sort" {
+        if len(args) == 0 { return val_array([]) }
+        let arr = get_array(args[0])
+        return val_array(sort_array(arr))
+    }
+    if name == "read_file" {
+        if len(args) == 0 { return val_str("") }
+        let result = read_file(args[0].str_val)
+        // host read_file returns either Str or Error value (not via throw)
+        if is_error(result) {
+            return Val { tag: "error", int_val: 0, float_val: 0.0, bool_val: false, str_val: "read_file failed", char_val: "", array_val: "", fn_name: "", fn_params: "", fn_body: "", struct_name: "", struct_fields: "" }
+        }
+        return val_str(result)
+    }
+    if name == "write_file" {
+        if len(args) < 2 { return val_void() }
+        try { write_file(args[0].str_val, args[1].str_val) } catch e { }
+        return val_void()
+    }
+    if name == "append_file" {
+        if len(args) < 2 { return val_void() }
+        try { append_file(args[0].str_val, args[1].str_val) } catch e { }
+        return val_void()
+    }
+    if name == "read_lines" {
+        if len(args) == 0 { return val_array([]) }
+        try {
+            let lines = read_lines(args[0].str_val)
+            let mut result = []
+            for l in lines { result = result.push(val_str(l)) }
+            return val_array(result)
+        } catch e { return val_array([]) }
+    }
+    if name == "file_exists" {
+        if len(args) == 0 { return val_bool(false) }
+        return val_bool(file_exists(args[0].str_val))
+    }
+    if name == "delete_file" {
+        if len(args) == 0 { return val_void() }
+        try { delete_file(args[0].str_val) } catch e { }
+        return val_void()
+    }
+    if name == "input" {
+        let prompt = if len(args) > 0 { args[0].str_val } else { "" }
+        return val_str(input(prompt))
+    }
+    if name == "read_stdin" {
+        // Read all stdin until EOF (best-effort via input loop)
+        let mut buf = ""
+        try {
+            while true {
+                let line = input("")
+                if line == "" { return val_str(buf) }
+                if buf == "" { buf = line } else { buf = buf + "\n" + line }
+            }
+        } catch e { }
+        return val_str(buf)
+    }
+    if name == "array_fill" {
+        // array_fill(value, n) → [value, value, ..., value]
+        if len(args) < 2 { return val_array([]) }
+        let v = args[0]
+        let n = args[1].int_val
+        let mut result = []
+        let mut i = 0
+        while i < n { result = result.push(v); i = i + 1 }
+        return val_array(result)
+    }
+    if name == "split" {
+        // split(string, delim) → array of strings
+        if len(args) < 2 { return val_array([]) }
+        let s = args[0].str_val
+        let d = args[1].str_val
+        let parts = s.split(d)
+        let mut result = []
+        for p in parts { result = result.push(val_str(p)) }
+        return val_array(result)
+    }
+    if name == "exit" {
+        let code = if len(args) > 0 { args[0].int_val } else { 0 }
+        exit(code)
+        return val_void()
+    }
+    if name == "env_var" {
+        if len(args) == 0 { return val_str("") }
+        return val_str(env_var(args[0].str_val))
+    }
+    if name == "command_args" {
+        let a = host_args()
+        let mut result = []
+        for s in a { result = result.push(val_str(s)) }
+        return val_array(result)
+    }
+    if name == "argc" {
+        let a = host_args()
+        return val_int(len(a))
+    }
+    if name == "arg" {
+        if len(args) == 0 { return val_str("") }
+        let i = args[0].int_val
+        let a = host_args()
+        if i >= 0 && i < len(a) { return val_str(a[i]) }
+        return val_str("")
+    }
+    if name == "parse_int" {
+        if len(args) == 0 { return val_int(0) }
+        if args[0].tag == "str" { return val_int(args[0].str_val.parse_int()) }
+        if args[0].tag == "int" { return args[0] }
+        if args[0].tag == "float" { return val_int(floor(args[0].float_val)) }
+        return val_int(0)
+    }
+    if name == "parse_float" {
+        if len(args) == 0 { return val_float(0.0) }
+        if args[0].tag == "str" { return val_float(args[0].str_val.parse_float()) }
+        if args[0].tag == "float" { return args[0] }
+        if args[0].tag == "int" { return val_float(args[0].int_val + 0.0) }
+        return val_float(0.0)
+    }
+    if name == "format" {
+        // format(template, ...args) → string with {}/{N} placeholders
+        if len(args) == 0 { return val_str("") }
+        let mut result = args[0].str_val
+        let mut i = 1
+        while i < len(args) {
+            let placeholder = "{" + to_string(i - 1) + "}"
+            result = result.replace(placeholder, val_to_string(args[i]))
+            i = i + 1
+        }
+        return val_str(result)
+    }
+    if name == "hex" {
+        if len(args) == 0 { return val_str("") }
+        return val_str(hex(args[0].int_val))
+    }
+    if name == "bin" {
+        if len(args) == 0 { return val_str("") }
+        return val_str(bin(args[0].int_val))
+    }
+    if name == "char_code" {
+        if len(args) == 0 { return val_int(0) }
+        let s = if args[0].tag == "char" { args[0].char_val } else { args[0].str_val }
+        if len(s) == 0 { return val_int(0) }
+        return val_int(char_code(s, 0))
+    }
+    if name == "from_char_code" {
+        if len(args) == 0 { return val_str("") }
+        return val_str(to_string(args[0].int_val))
+    }
+    if name == "to_json" {
+        if len(args) == 0 { return val_str("null") }
+        return val_str(val_to_json(args[0]))
+    }
+    if name == "from_json" {
+        if len(args) == 0 { return val_void() }
+        return json_to_val(args[0].str_val)
+    }
+    if name == "is_error" {
+        if len(args) == 0 { return val_bool(false) }
+        return val_bool(args[0].tag == "error")
+    }
+    if name == "stack_trace" {
+        return val_str(format_stack_trace())
+    }
+    if name == "error" {
+        let msg = if len(args) > 0 { args[0].str_val } else { "error" }
+        return Val { tag: "error", int_val: 0, float_val: 0.0, bool_val: false, str_val: msg, char_val: "", array_val: "", fn_name: "", fn_params: "", fn_body: "", struct_name: "", struct_fields: "" }
+    }
+
+    // matrix_det(m, n) — determinant via cofactor expansion (small matrices only)
+    if name == "matrix_det" {
+        if len(args) < 2 { return val_float(0.0) }
+        let m = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let n = args[1].int_val
+        if n == 1 { return val_float(if type_of(m[0]) == "float" { m[0] } else { to_float_val(m[0]) }) }
+        if n == 2 {
+            let a = if type_of(m[0]) == "float" { m[0] } else { to_float_val(m[0]) }
+            let b = if type_of(m[1]) == "float" { m[1] } else { to_float_val(m[1]) }
+            let c = if type_of(m[2]) == "float" { m[2] } else { to_float_val(m[2]) }
+            let d = if type_of(m[3]) == "float" { m[3] } else { to_float_val(m[3]) }
+            return val_float(a * d - b * c)
+        }
+        if n == 3 {
+            let g00 = if type_of(m[0]) == "float" { m[0] } else { to_float_val(m[0]) }
+            let g01 = if type_of(m[1]) == "float" { m[1] } else { to_float_val(m[1]) }
+            let g02 = if type_of(m[2]) == "float" { m[2] } else { to_float_val(m[2]) }
+            let g10 = if type_of(m[3]) == "float" { m[3] } else { to_float_val(m[3]) }
+            let g11 = if type_of(m[4]) == "float" { m[4] } else { to_float_val(m[4]) }
+            let g12 = if type_of(m[5]) == "float" { m[5] } else { to_float_val(m[5]) }
+            let g20 = if type_of(m[6]) == "float" { m[6] } else { to_float_val(m[6]) }
+            let g21 = if type_of(m[7]) == "float" { m[7] } else { to_float_val(m[7]) }
+            let g22 = if type_of(m[8]) == "float" { m[8] } else { to_float_val(m[8]) }
+            return val_float(g00*(g11*g22-g12*g21) - g01*(g10*g22-g12*g20) + g02*(g10*g21-g11*g20))
+        }
+        return val_float(0.0)  // larger matrices unsupported in self-host
+    }
+
+
+    // batch_matvec(W, x_batch, batch_size, out_dim, in_dim) → [batch * out_dim]
+    if name == "batch_matvec" {
+        if len(args) < 5 { return val_array([]) }
+        let w = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let x = if args[1].tag == "tensor" { tensor_data(args[1]) } else { get_array(args[1]) }
+        let batch = args[2].int_val
+        let outd = args[3].int_val
+        let ind = args[4].int_val
+        let mut result = []
+        let mut bi = 0
+        while bi < batch {
+            let mut o = 0
+            while o < outd {
+                let mut acc = 0.0
+                let mut c = 0
+                while c < ind {
+                    let wv = if type_of(w[o * ind + c]) == "float" { w[o * ind + c] } else { to_float_val(w[o * ind + c]) }
+                    let xv = if type_of(x[bi * ind + c]) == "float" { x[bi * ind + c] } else { to_float_val(x[bi * ind + c]) }
+                    acc = acc + wv * xv
+                    c = c + 1
+                }
+                result = result.push(val_float(acc))
+                o = o + 1
+            }
+            bi = bi + 1
+        }
+        return val_array(result)
     }
     if name == "len" {
         if len(args) > 0 {
@@ -1573,12 +5143,27 @@ fn call_builtin(name, args) {
         if len(args) > 0 { return val_str(args[0].tag) }
         return val_str("void")
     }
-    if name == "int" {
-        if len(args) > 0 { return val_int(to_int(val_to_string(args[0]))) }
+    if name == "int" || name == "to_int" {
+        if len(args) == 0 { return val_int(0) }
+        let v = args[0]
+        if v.tag == "int" { return v }
+        if v.tag == "float" { return val_int(floor(v.float_val)) }
+        if v.tag == "str" {
+            // Use host string method parse_int (avoids recursing into our to_int)
+            return val_int(v.str_val.parse_int())
+        }
+        if v.tag == "bool" { if v.bool_val { return val_int(1) } else { return val_int(0) } }
         return val_int(0)
     }
-    if name == "float" {
-        if len(args) > 0 { return val_float(to_float(val_to_string(args[0]))) }
+    if name == "float" || name == "to_float" {
+        if len(args) == 0 { return val_float(0.0) }
+        let v = args[0]
+        if v.tag == "float" { return v }
+        if v.tag == "int" { return val_float(v.int_val * 1.0) }
+        if v.tag == "str" {
+            // Use host string method parse_float (avoids recursing into our to_float)
+            return val_float(v.str_val.parse_float())
+        }
         return val_float(0.0)
     }
     if name == "bool" {
@@ -1601,7 +5186,7 @@ fn call_builtin(name, args) {
             let s = args[0].str_val
             if len(s) > 0 {
                 let cs = s.chars()
-                return val_int(char_code(cs[0]))
+                return val_int(char_code(cs[0], 0))
             }
         }
         return val_int(0)
@@ -1795,7 +5380,7 @@ fn call_builtin(name, args) {
         return val_float(random())
     }
     if name == "time" {
-        return val_float(time())
+        return val_float(timestamp())
     }
     if name == "sleep" {
         if len(args) > 0 { sleep(args[0].int_val) }
@@ -2314,12 +5899,18 @@ fn call_builtin(name, args) {
         return val_str("")
     }
     if name == "char_code" {
-        if len(args) > 0 && args[0].tag == "str" {
+        if len(args) == 0 { return val_int(0) }
+        // host char_code takes (str, idx). Handle (char) and (str) calls.
+        if args[0].tag == "char" {
+            let s = args[0].char_val
+            if len(s) > 0 { return val_int(char_code(s, 0)) }
+            return val_int(0)
+        }
+        if args[0].tag == "str" {
             let s = args[0].str_val
-            if len(s) > 0 {
-                let cs = s.chars()
-                return val_int(char_code(cs[0]))
-            }
+            if len(s) == 0 { return val_int(0) }
+            let idx = if len(args) > 1 { args[1].int_val } else { 0 }
+            return val_int(char_code(s, idx))
         }
         return val_int(0)
     }
@@ -2425,7 +6016,7 @@ fn call_builtin(name, args) {
         return val_str("")
     }
     if name == "command_args" {
-        let raw_args = args()
+        let raw_args = host_args()
         let mut result = []
         for a in raw_args {
             result = result.push(val_str(to_string(a)))
@@ -2777,12 +6368,426 @@ fn call_builtin(name, args) {
         return val_int(0)
     }
 
+    // ═══════════════════════════════════════════════════════
+    //  Phase 2-5 골화 — Tensor / BLAS / Quant / Attention
+    //  src/interpreter.rs:4779-5400 대응
+    // ═══════════════════════════════════════════════════════
+
+    // ── tensor(array, shape?) — flat data + optional shape ──
+    if name == "tensor" {
+        if len(args) == 0 { return val_void() }
+        // already a tensor → identity
+        if args[0].tag == "tensor" { return args[0] }
+        let src = get_array(args[0])
+        let mut data = []
+        for v in src { data = data.push(to_float_val(v)) }
+        let shape = if len(args) > 1 && args[1].tag == "array" {
+            let s_arr = get_array(args[1])
+            let mut shp = []
+            for sv in s_arr { shp = shp.push(sv.int_val) }
+            shp
+        } else {
+            [len(data)]
+        }
+        return val_tensor(shape, data)
+    }
+    if name == "tensor_zeros" {
+        let n = args[0].int_val
+        if n < 0 { return val_void() }
+        let mut data = []
+        let mut zi = 0
+        while zi < n { data = data.push(0.0); zi = zi + 1 }
+        return val_tensor([n], data)
+    }
+    if name == "tensor_fill" {
+        let n = args[0].int_val
+        let v = to_float_val(args[1])
+        if n < 0 { return val_void() }
+        let mut data = []
+        let mut fi = 0
+        while fi < n { data = data.push(v); fi = fi + 1 }
+        return val_tensor([n], data)
+    }
+    if name == "tensor_last_row" {
+        // tensor_last_row(t, rows, cols) — return shape=[cols] copy of last row
+        let rows = args[1].int_val
+        let cols = args[2].int_val
+        if rows <= 0 || cols <= 0 { return val_void() }
+        let src = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let n_src = len(src)
+        if n_src < rows * cols { return val_void() }
+        let base = (rows - 1) * cols
+        let mut data = []
+        let mut ri = 0
+        while ri < cols {
+            let v = src[base + ri]
+            if type_of(v) == "float" { data = data.push(v) }
+            else { data = data.push(to_float_val(v)) }
+            ri = ri + 1
+        }
+        return val_tensor([cols], data)
+    }
+    // weight_dict([names], [tensors]) → map name -> tensor
+    if name == "weight_dict" {
+        let names = get_array(args[0])
+        let tensors = get_array(args[1])
+        let mut keys = []
+        let mut vals = []
+        let mut wi = 0
+        while wi < len(names) && wi < len(tensors) {
+            keys = keys.push(names[wi])
+            vals = vals.push(tensors[wi])
+            wi = wi + 1
+        }
+        return val_map(keys, vals)
+    }
+    // dot(a, b) — vector dot product (returns float)
+    if name == "dot" {
+        let a = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let b = if args[1].tag == "tensor" { tensor_data(args[1]) } else { get_array(args[1]) }
+        let n_dot = if len(a) < len(b) { len(a) } else { len(b) }
+        let mut acc = 0.0
+        let mut di = 0
+        while di < n_dot {
+            let av = if type_of(a[di]) == "float" { a[di] } else { to_float_val(a[di]) }
+            let bv = if type_of(b[di]) == "float" { b[di] } else { to_float_val(b[di]) }
+            acc = acc + av * bv
+            di = di + 1
+        }
+        return val_float(acc)
+    }
+
+    // ── BLAS kernels (Phase 3) ──
+    // matmul_into(out, a, b, m, n, k) — out[m,n] = a[m,k] · b[k,n]
+    if name == "matmul_into" {
+        let out_t = args[0]
+        let a = if args[1].tag == "tensor" { tensor_data(args[1]) } else { get_array(args[1]) }
+        let b = if args[2].tag == "tensor" { tensor_data(args[2]) } else { get_array(args[2]) }
+        let m = args[3].int_val
+        let n = args[4].int_val
+        let k = args[5].int_val
+        let mut out = if out_t.tag == "tensor" { tensor_data(out_t) } else { [] }
+        if len(out) < m * n {
+            // grow
+            let mut z = 0
+            while len(out) < m * n { out = out.push(0.0); z = z + 1 }
+        }
+        let mut mi = 0
+        while mi < m {
+            let mut nj = 0
+            while nj < n {
+                let mut acc = 0.0
+                let mut kk = 0
+                while kk < k {
+                    acc = acc + a[mi * k + kk] * b[kk * n + nj]
+                    kk = kk + 1
+                }
+                out[mi * n + nj] = acc
+                nj = nj + 1
+            }
+            mi = mi + 1
+        }
+        if out_t.tag == "tensor" { tensor_set_data(out_t, out); return out_t }
+        return val_tensor([m, n], out)
+    }
+    // matmul_into_accumulate(out, a, b, m, n, k) — out += a · b
+    if name == "matmul_into_accumulate" {
+        let out_t = args[0]
+        let a = if args[1].tag == "tensor" { tensor_data(args[1]) } else { get_array(args[1]) }
+        let b = if args[2].tag == "tensor" { tensor_data(args[2]) } else { get_array(args[2]) }
+        let m = args[3].int_val
+        let n = args[4].int_val
+        let k = args[5].int_val
+        let mut out = if out_t.tag == "tensor" { tensor_data(out_t) } else { [] }
+        while len(out) < m * n { out = out.push(0.0) }
+        let mut mi = 0
+        while mi < m {
+            let mut nj = 0
+            while nj < n {
+                let mut acc = out[mi * n + nj]
+                let mut kk = 0
+                while kk < k {
+                    acc = acc + a[mi * k + kk] * b[kk * n + nj]
+                    kk = kk + 1
+                }
+                out[mi * n + nj] = acc
+                nj = nj + 1
+            }
+            mi = mi + 1
+        }
+        if out_t.tag == "tensor" { tensor_set_data(out_t, out); return out_t }
+        return val_tensor([m, n], out)
+    }
+    // matmul_transpose_a_into(out, a, b, m, n, k) — out = aᵀ · b, a shape [k,m]
+    if name == "matmul_transpose_a_into" {
+        let out_t = args[0]
+        let a = if args[1].tag == "tensor" { tensor_data(args[1]) } else { get_array(args[1]) }
+        let b = if args[2].tag == "tensor" { tensor_data(args[2]) } else { get_array(args[2]) }
+        let m = args[3].int_val
+        let n = args[4].int_val
+        let k = args[5].int_val
+        let mut out = if out_t.tag == "tensor" { tensor_data(out_t) } else { [] }
+        while len(out) < m * n { out = out.push(0.0) }
+        let mut mi = 0
+        while mi < m {
+            let mut nj = 0
+            while nj < n {
+                let mut acc = 0.0
+                let mut kk = 0
+                while kk < k {
+                    acc = acc + a[kk * m + mi] * b[kk * n + nj]
+                    kk = kk + 1
+                }
+                out[mi * n + nj] = acc
+                nj = nj + 1
+            }
+            mi = mi + 1
+        }
+        if out_t.tag == "tensor" { tensor_set_data(out_t, out); return out_t }
+        return val_tensor([m, n], out)
+    }
+    // matmul_transpose_b_into(out, a, b, m, n, k) — out = a · bᵀ, b shape [n,k]
+    if name == "matmul_transpose_b_into" {
+        let out_t = args[0]
+        let a = if args[1].tag == "tensor" { tensor_data(args[1]) } else { get_array(args[1]) }
+        let b = if args[2].tag == "tensor" { tensor_data(args[2]) } else { get_array(args[2]) }
+        let m = args[3].int_val
+        let n = args[4].int_val
+        let k = args[5].int_val
+        let mut out = if out_t.tag == "tensor" { tensor_data(out_t) } else { [] }
+        while len(out) < m * n { out = out.push(0.0) }
+        let mut mi = 0
+        while mi < m {
+            let mut nj = 0
+            while nj < n {
+                let mut acc = 0.0
+                let mut kk = 0
+                while kk < k {
+                    acc = acc + a[mi * k + kk] * b[nj * k + kk]
+                    kk = kk + 1
+                }
+                out[mi * n + nj] = acc
+                nj = nj + 1
+            }
+            mi = mi + 1
+        }
+        if out_t.tag == "tensor" { tensor_set_data(out_t, out); return out_t }
+        return val_tensor([m, n], out)
+    }
+    // axpy(out, a, x, y) — out = a*x + y (BLAS-1)
+    if name == "axpy" {
+        let out_t = args[0]
+        let alpha = to_float_val(args[1])
+        let x = if args[2].tag == "tensor" { tensor_data(args[2]) } else { get_array(args[2]) }
+        let y = if args[3].tag == "tensor" { tensor_data(args[3]) } else { get_array(args[3]) }
+        let n_axpy = if len(x) < len(y) { len(x) } else { len(y) }
+        let mut out = []
+        let mut ai = 0
+        while ai < n_axpy {
+            out = out.push(alpha * x[ai] + y[ai])
+            ai = ai + 1
+        }
+        if out_t.tag == "tensor" { tensor_set_data(out_t, out); return out_t }
+        return val_tensor([n_axpy], out)
+    }
+    // mat_add(a, b) — element-wise addition
+    if name == "mat_add" {
+        let a = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let b = if args[1].tag == "tensor" { tensor_data(args[1]) } else { get_array(args[1]) }
+        let n_add = if len(a) < len(b) { len(a) } else { len(b) }
+        let mut out = []
+        let mut ai = 0
+        while ai < n_add { out = out.push(a[ai] + b[ai]); ai = ai + 1 }
+        let shape = if args[0].tag == "tensor" { tensor_shape(args[0]) } else { [n_add] }
+        return val_tensor(shape, out)
+    }
+    // mat_scale_inplace(t, s) — t *= s in place
+    if name == "mat_scale_inplace" {
+        let t = args[0]
+        let s_scale = to_float_val(args[1])
+        if t.tag != "tensor" { return val_void() }
+        let data = tensor_data(t)
+        let mut out = []
+        for v in data { out = out.push(v * s_scale) }
+        tensor_set_data(t, out)
+        return t
+    }
+
+    // ── Quant + GGUF (Phase 4) ──
+    // q4_0_dequantize(blocks, n_elements) — Q4_0 → f32 array
+    // Q4_0 block: 18 bytes = 2 bytes f16 scale + 16 bytes (32 quants × 4 bits)
+    if name == "q4_0_dequantize" {
+        let blocks = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let n_elem = args[1].int_val
+        let mut out = []
+        let n_blocks = n_elem / 32
+        let mut bi = 0
+        while bi < n_blocks {
+            let block_off = bi * 18
+            // f16 scale (we approximate via float read; real impl needs f16 decode)
+            let scale = blocks[block_off + 0]
+            let mut qi = 0
+            while qi < 16 {
+                let byte = blocks[block_off + 2 + qi]
+                let lo = (byte % 16) - 8
+                let hi = (byte / 16) - 8
+                out = out.push(scale * lo)
+                out = out.push(scale * hi)
+                qi = qi + 1
+            }
+            bi = bi + 1
+        }
+        return val_tensor([n_elem], out)
+    }
+    // q4_0_matvec(out, weight_q, x, m, k) — y[m] = W[m,k] · x[k] (W in Q4_0)
+    if name == "q4_0_matvec" {
+        let out_t = args[0]
+        let w = if args[1].tag == "tensor" { tensor_data(args[1]) } else { get_array(args[1]) }
+        let x = if args[2].tag == "tensor" { tensor_data(args[2]) } else { get_array(args[2]) }
+        let m = args[3].int_val
+        let k = args[4].int_val
+        let block_size = 32
+        let n_blocks_per_row = k / block_size
+        let block_bytes = 18
+        let mut out = []
+        let mut mi = 0
+        while mi < m {
+            let mut acc = 0.0
+            let mut bi = 0
+            while bi < n_blocks_per_row {
+                let block_off = (mi * n_blocks_per_row + bi) * block_bytes
+                let scale = w[block_off]
+                let mut qi = 0
+                while qi < 16 {
+                    let byte = w[block_off + 2 + qi]
+                    let lo = (byte % 16) - 8
+                    let hi = (byte / 16) - 8
+                    let xi = bi * block_size + qi * 2
+                    acc = acc + scale * lo * x[xi]
+                    acc = acc + scale * hi * x[xi + 1]
+                    qi = qi + 1
+                }
+                bi = bi + 1
+            }
+            out = out.push(acc)
+            mi = mi + 1
+        }
+        if out_t.tag == "tensor" { tensor_set_data(out_t, out); return out_t }
+        return val_tensor([m], out)
+    }
+    // mmap_gguf(path) → [names, tensors] — stub: delegates to file_read + parse
+    if name == "mmap_gguf" || name == "mmap_weights" || name == "load_weights_bin" {
+        // Real GGUF parsing requires byte-level f16/i32 decoding which the
+        // self-host interpreter cannot do efficiently. We expose an error tag
+        // value that downstream code can detect; production code uses Rust path.
+        return Val { tag: "error", int_val: 0, float_val: 0.0, bool_val: false, str_val: "mmap_gguf: requires native runtime (not available in self-host)", char_val: "", array_val: "", fn_name: "", fn_params: "", fn_body: "", struct_name: "", struct_fields: "" }
+    }
+
+    // ── Attention fusion (Phase 5) ──
+    // gqa_expand_kv_into(out, kv, n_kv_head, n_head, head_dim) — broadcast KV groups
+    if name == "gqa_expand_kv_into" {
+        let out_t = args[0]
+        let kv = if args[1].tag == "tensor" { tensor_data(args[1]) } else { get_array(args[1]) }
+        let n_kv = args[2].int_val
+        let n_h = args[3].int_val
+        let head_dim = args[4].int_val
+        let group = n_h / n_kv
+        let mut out = []
+        let mut hi = 0
+        while hi < n_h {
+            let kv_idx = hi / group
+            let base = kv_idx * head_dim
+            let mut di = 0
+            while di < head_dim {
+                out = out.push(kv[base + di])
+                di = di + 1
+            }
+            hi = hi + 1
+        }
+        if out_t.tag == "tensor" { tensor_set_data(out_t, out); return out_t }
+        return val_tensor([n_h * head_dim], out)
+    }
+    // qkv_fused_into(q_out, k_out, v_out, w_qkv, x, n_q, n_k, n_v, dim) — fused proj
+    if name == "qkv_fused_into" {
+        let q_out = args[0]
+        let k_out = args[1]
+        let v_out = args[2]
+        let w = if args[3].tag == "tensor" { tensor_data(args[3]) } else { get_array(args[3]) }
+        let x = if args[4].tag == "tensor" { tensor_data(args[4]) } else { get_array(args[4]) }
+        let n_q = args[5].int_val
+        let n_k = args[6].int_val
+        let n_v = args[7].int_val
+        let dim = args[8].int_val
+        let total = n_q + n_k + n_v
+        let mut all_out = []
+        let mut oi = 0
+        while oi < total {
+            let mut acc = 0.0
+            let mut di = 0
+            while di < dim { acc = acc + w[oi * dim + di] * x[di]; di = di + 1 }
+            all_out = all_out.push(acc)
+            oi = oi + 1
+        }
+        let mut q_data = []
+        let mut k_data = []
+        let mut v_data = []
+        let mut si = 0
+        while si < n_q { q_data = q_data.push(all_out[si]); si = si + 1 }
+        while si < n_q + n_k { k_data = k_data.push(all_out[si]); si = si + 1 }
+        while si < total { v_data = v_data.push(all_out[si]); si = si + 1 }
+        if q_out.tag == "tensor" { tensor_set_data(q_out, q_data) }
+        if k_out.tag == "tensor" { tensor_set_data(k_out, k_data) }
+        if v_out.tag == "tensor" { tensor_set_data(v_out, v_data) }
+        return val_void()
+    }
+    // repeat_kv(kv, n_repeat, n_kv_head, head_dim) — broadcast each KV head n_repeat times
+    if name == "repeat_kv" {
+        let kv = if args[0].tag == "tensor" { tensor_data(args[0]) } else { get_array(args[0]) }
+        let n_rep = args[1].int_val
+        let n_kv = args[2].int_val
+        let head_dim = args[3].int_val
+        let mut out = []
+        let mut hi = 0
+        while hi < n_kv {
+            let base = hi * head_dim
+            let mut ri = 0
+            while ri < n_rep {
+                let mut di = 0
+                while di < head_dim { out = out.push(kv[base + di]); di = di + 1 }
+                ri = ri + 1
+            }
+            hi = hi + 1
+        }
+        return val_tensor([n_kv * n_rep * head_dim], out)
+    }
+
     return not_builtin
 }
 
 // ── Method dispatch ──────────────────────────────────────
 
 fn call_method(obj, method, args) {
+    // ── Error fallback (P13 골화, mirrors src/interpreter.rs:3717) ──
+    // exec(...).trim() 패턴이 subprocess 실패 시 Error → .trim() 크래시로 이어지던
+    // P11 안티패턴 영구 소거. tag="error"는 string method 호출 시 안전 기본값 반환.
+    if obj.tag == "error" {
+        if method == "trim" || method == "to_lower" || method == "to_upper" || method == "to_lowercase" || method == "to_uppercase" {
+            return val_str("")
+        }
+        if method == "len" { return val_int(0) }
+        if method == "is_empty" { return val_bool(true) }
+        if method == "contains" || method == "starts_with" || method == "ends_with" {
+            return val_bool(false)
+        }
+        if method == "split" || method == "lines" || method == "chars" || method == "bytes" {
+            return val_array([])
+        }
+        if method == "replace" || method == "replacen" { return val_str("") }
+        if method == "find" || method == "rfind" || method == "index_of" { return val_int(-1) }
+        if method == "to_string" { return val_str(obj.str_val) }
+        // 그 외 메소드는 fall-through (오류 명시는 dispatcher 끝에서)
+    }
+
     // String methods
     if obj.tag == "str" {
         let s = obj.str_val
@@ -2913,9 +6918,76 @@ fn call_method(obj, method, args) {
         if method == "bytes" {
             let cs = s.chars()
             let mut result = []
-            for c in cs { result = result.push(val_int(char_code(c))) }
+            for c in cs { result = result.push(val_int(char_code(to_string(c), 0))) }
             return val_array(result)
         }
+    }
+
+    // ── Phase 7 골화 — Pointer methods ──
+    if obj.tag == "pointer" {
+        if method == "is_null" { return val_bool(obj.int_val == 0) }
+        if method == "addr" { return val_int(obj.int_val) }
+        if method == "to_string" { return val_str("0x" + hex(obj.int_val)) }
+    }
+
+    // ── Phase 7 골화 — Atomic methods ──
+    if obj.tag == "atomic" {
+        if method == "load" { return atomic_load(obj) }
+        if method == "store" { atomic_store_op(obj, args[0]); return val_void() }
+        if method == "compare_swap" || method == "compare_and_swap" {
+            return atomic_compare_swap(obj, args[0], args[1])
+        }
+        if method == "fetch_add" { return atomic_fetch_add(obj, args[0]) }
+    }
+
+    // ── Phase 7 골화 — Channel methods (Sender/Receiver unified) ──
+    if obj.tag == "channel" {
+        if method == "send" { return val_bool(channel_send(obj, args[0])) }
+        if method == "recv" {
+            let r = channel_recv(obj)
+            if r.tag == "void" {
+                return Val { tag: "error", int_val: 0, float_val: 0.0, bool_val: false, str_val: "channel closed", char_val: "", array_val: "", fn_name: "", fn_params: "", fn_body: "", struct_name: "", struct_fields: "" }
+            }
+            return r
+        }
+        if method == "try_recv" {
+            let r = channel_recv(obj)
+            // Some(r) | None as enum
+            if r.tag == "void" { return val_enum("Option", "None", "") }
+            return val_enum("Option", "Some", r)
+        }
+        if method == "close" { channel_close(obj); return val_void() }
+        if method == "receiver" { return val_channel_recv_view(obj) }
+    }
+
+    // ── Phase 2 골화 — Tensor methods ──
+    if obj.tag == "tensor" {
+        if method == "shape" {
+            let shp = tensor_shape(obj)
+            let mut wrapped = []
+            for d in shp { wrapped = wrapped.push(val_int(d)) }
+            return val_array(wrapped)
+        }
+        if method == "data" {
+            let d = tensor_data(obj)
+            let mut wrapped = []
+            for v in d { wrapped = wrapped.push(val_float(v)) }
+            return val_array(wrapped)
+        }
+        if method == "numel" || method == "len" { return val_int(tensor_numel(obj)) }
+        if method == "rank" { return val_int(len(tensor_shape(obj))) }
+        if method == "to_array" {
+            let d = tensor_data(obj)
+            let mut wrapped = []
+            for v in d { wrapped = wrapped.push(val_float(v)) }
+            return val_array(wrapped)
+        }
+    }
+
+    // ── Phase 4 골화 — BigInt methods ──
+    if obj.tag == "bigint" {
+        if method == "to_string" { return val_str(bigint_str(obj)) }
+        if method == "to_int" { return val_int(to_int(bigint_str(obj))) }
     }
 
     // Array methods
@@ -3296,6 +7368,33 @@ fn call_method(obj, method, args) {
             while si < n {
                 let idx = floor(random() * n_items)
                 result = result.push(items[idx])
+                si = si + 1
+            }
+            return val_array(result)
+        }
+        // .fill(value) — return new array of same length, all entries = value
+        if method == "fill" {
+            let v = args[0]
+            let mut result = []
+            let mut fi = 0
+            while fi < len(items) {
+                result = result.push(v)
+                fi = fi + 1
+            }
+            return val_array(result)
+        }
+        // .swap(i, j) — return new array with positions i and j swapped
+        if method == "swap" {
+            let i = args[0].int_val
+            let j = args[1].int_val
+            let n_items = len(items)
+            if i < 0 || j < 0 || i >= n_items || j >= n_items { return val_array(items) }
+            let mut result = []
+            let mut si = 0
+            while si < n_items {
+                if si == i { result = result.push(items[j]) }
+                else if si == j { result = result.push(items[i]) }
+                else { result = result.push(items[si]) }
                 si = si + 1
             }
             return val_array(result)
@@ -3716,7 +7815,7 @@ fn to_float_val(v) {
 // ── Array storage (using host arrays) ────────────────────
 // We store arrays as actual hexa arrays wrapped in Val
 
-let mut array_store = []
+pub let mut array_store = []
 
 fn val_array(items) {
     let idx = len(array_store)
@@ -3784,7 +7883,7 @@ fn val_closure(name, params, body, captured_env) {
 
 // ── Map storage ─────────────────────────────────────────
 // Maps stored as pairs of [keys_array, values_array]
-let mut map_store = []
+pub let mut map_store = []
 
 fn val_map(keys, values) {
     let idx = len(map_store)
@@ -3873,7 +7972,7 @@ fn val_eq(a, b) {
 }
 
 // ── Struct storage ───────────────────────────────────────
-let mut struct_store = []
+pub let mut struct_store = []
 
 fn val_struct(name, fields) {
     let idx = len(struct_store)
@@ -3888,7 +7987,7 @@ fn get_struct_fields(v) {
 // ── Enum value storage ──────────────────────────────────
 // Enum values: tag="enum", struct_name="EnumName::Variant", str_val stores variant name
 // If the variant carries data, it's stored in enum_data_store[int_val]
-let mut enum_data_store = []
+pub let mut enum_data_store = []
 
 fn val_enum(enum_name, variant, data) {
     let full_name = enum_name + "::" + variant
@@ -3903,6 +8002,340 @@ fn val_enum(enum_name, variant, data) {
 fn get_enum_data(v) {
     if v.int_val < 0 { return val_void() }
     return enum_data_store[v.int_val]
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Phase 1 골화 — 확장 Value 타입 (7종)
+// ═══════════════════════════════════════════════════════════
+//  Val struct 자체는 변경 없음. int_val을 ref index로 쓰는
+//  기존 array/map/struct/enum/closure 패턴을 그대로 적용.
+//  각 신규 타입은 별도 storage + 생성자/접근자 함수 한 쌍.
+//  src/interpreter.rs의 Value::{Tensor,Sender,Receiver,EffectRequest,
+//  Atomic,Pointer,BigInt} variant들에 대응.
+
+// ── Tensor: shape + flat data (f64) ──────────────────────
+pub let mut tensor_shape_store = []   // [[d0,d1,...], ...]
+pub let mut tensor_data_store = []    // [[f0,f1,...], ...]
+
+fn val_tensor(shape, data) {
+    let idx = len(tensor_shape_store)
+    tensor_shape_store = tensor_shape_store.push(shape)
+    tensor_data_store = tensor_data_store.push(data)
+    return Val { tag: "tensor", int_val: idx, float_val: 0.0, bool_val: false, str_val: "", char_val: "", array_val: "", fn_name: "", fn_params: "", fn_body: "", struct_name: "", struct_fields: "" }
+}
+
+fn tensor_shape(v) {
+    if v.tag != "tensor" { return [] }
+    return tensor_shape_store[v.int_val]
+}
+
+fn tensor_data(v) {
+    if v.tag != "tensor" { return [] }
+    return tensor_data_store[v.int_val]
+}
+
+fn tensor_set_data(v, new_data) {
+    // in-place update via slot replacement (immutable wrapper, mutable storage)
+    if v.tag != "tensor" { return }
+    tensor_data_store[v.int_val] = new_data
+}
+
+fn tensor_numel(v) {
+    let shape = tensor_shape(v)
+    let mut n = 1
+    for d in shape { n = n * d }
+    return n
+}
+
+// ── Channel: bounded queue (Sender + Receiver share id) ──
+//  src의 Value::Sender/Value::Receiver는 같은 채널을 가리키는
+//  두 view. .hexa에선 단일 tag="channel" + 방향 플래그(int_val 부호로 인코딩).
+//    int_val ≥ 0: sender (idx)
+//    int_val <  0: receiver, idx = -int_val - 1
+pub let mut channel_buffer_store = []  // [[items], ...]
+pub let mut channel_closed_store = []  // [bool, ...]
+pub let mut channel_capacity_store = []
+
+fn val_channel_make(cap) {
+    let idx = len(channel_buffer_store)
+    channel_buffer_store = channel_buffer_store.push([])
+    channel_closed_store = channel_closed_store.push(false)
+    channel_capacity_store = channel_capacity_store.push(cap)
+    return Val { tag: "channel", int_val: idx, float_val: 0.0, bool_val: false, str_val: "sender", char_val: "", array_val: "", fn_name: "", fn_params: "", fn_body: "", struct_name: "", struct_fields: "" }
+}
+
+fn val_channel_recv_view(sender) {
+    // sender→receiver view: same id, str_val flag
+    return Val { tag: "channel", int_val: sender.int_val, float_val: 0.0, bool_val: false, str_val: "receiver", char_val: "", array_val: "", fn_name: "", fn_params: "", fn_body: "", struct_name: "", struct_fields: "" }
+}
+
+fn channel_send(ch, item) {
+    if ch.tag != "channel" { return false }
+    let id = ch.int_val
+    if channel_closed_store[id] { return false }
+    let cap = channel_capacity_store[id]
+    let buf = channel_buffer_store[id]
+    if cap > 0 && len(buf) >= cap { return false }
+    channel_buffer_store[id] = buf.push(item)
+    return true
+}
+
+fn channel_recv(ch) {
+    if ch.tag != "channel" { return val_void() }
+    let id = ch.int_val
+    let buf = channel_buffer_store[id]
+    if len(buf) == 0 { return val_void() }
+    let head = buf[0]
+    let mut rest = []
+    let mut ri = 1
+    while ri < len(buf) { rest = rest.push(buf[ri]); ri = ri + 1 }
+    channel_buffer_store[id] = rest
+    return head
+}
+
+fn channel_close(ch) {
+    if ch.tag != "channel" { return }
+    channel_closed_store[ch.int_val] = true
+}
+
+// ── EffectRequest: algebraic effect propagation ──────────
+//  Each request: {effect: name, op: name, args: [Val], k: continuation}
+pub let mut effect_effect_store = []
+pub let mut effect_op_store = []
+pub let mut effect_args_store = []
+pub let mut effect_k_store = []         // resumption (Val of tag="fn") or void
+
+fn val_effect_request(effect_name, op, args) {
+    let idx = len(effect_effect_store)
+    effect_effect_store = effect_effect_store.push(effect_name)
+    effect_op_store = effect_op_store.push(op)
+    effect_args_store = effect_args_store.push(args)
+    effect_k_store = effect_k_store.push(val_void())
+    return Val { tag: "effect_request", int_val: idx, float_val: 0.0, bool_val: false, str_val: effect_name, char_val: op, array_val: "", fn_name: "", fn_params: "", fn_body: "", struct_name: "", struct_fields: "" }
+}
+
+fn effect_args(v) {
+    if v.tag != "effect_request" { return [] }
+    return effect_args_store[v.int_val]
+}
+
+fn effect_set_continuation(v, k) {
+    if v.tag != "effect_request" { return }
+    effect_k_store[v.int_val] = k
+}
+
+fn effect_continuation(v) {
+    if v.tag != "effect_request" { return val_void() }
+    return effect_k_store[v.int_val]
+}
+
+// ── Atomic: single-cell with lock-free ops ───────────────
+//  HEXA interpreter is single-threaded so atomic == regular cell.
+//  But the API needs to exist for self-host parity.
+pub let mut atomic_store = []   // [Val, ...]
+
+fn val_atomic(initial) {
+    let idx = len(atomic_store)
+    atomic_store = atomic_store.push(initial)
+    return Val { tag: "atomic", int_val: idx, float_val: 0.0, bool_val: false, str_val: "", char_val: "", array_val: "", fn_name: "", fn_params: "", fn_body: "", struct_name: "", struct_fields: "" }
+}
+
+fn atomic_load(v) {
+    if v.tag != "atomic" { return val_void() }
+    return atomic_store[v.int_val]
+}
+
+fn atomic_store_op(v, new_val) {
+    if v.tag != "atomic" { return }
+    atomic_store[v.int_val] = new_val
+}
+
+fn atomic_compare_swap(v, expected, new_val) {
+    if v.tag != "atomic" { return val_bool(false) }
+    let cur = atomic_store[v.int_val]
+    if val_eq(cur, expected) {
+        atomic_store[v.int_val] = new_val
+        return val_bool(true)
+    }
+    return val_bool(false)
+}
+
+fn atomic_fetch_add(v, delta) {
+    if v.tag != "atomic" { return val_int(0) }
+    let cur = atomic_store[v.int_val]
+    let next = val_int(cur.int_val + delta.int_val)
+    atomic_store[v.int_val] = next
+    return cur
+}
+
+// ── BigInt: arbitrary precision integer (string-encoded) ──
+//  Stored as decimal string for simplicity. Large arithmetic ops
+//  are routed through string-based long arithmetic helpers.
+pub let mut bigint_store = []   // [string, ...]
+
+fn val_bigint(decimal_str) {
+    let idx = len(bigint_store)
+    bigint_store = bigint_store.push(decimal_str)
+    return Val { tag: "bigint", int_val: idx, float_val: 0.0, bool_val: false, str_val: decimal_str, char_val: "", array_val: "", fn_name: "", fn_params: "", fn_body: "", struct_name: "", struct_fields: "" }
+}
+
+fn val_bigint_from_int(n) {
+    return val_bigint(to_string(n))
+}
+
+fn bigint_str(v) {
+    if v.tag != "bigint" { return "0" }
+    return bigint_store[v.int_val]
+}
+
+// ── Pointer: opaque address (FFI) ────────────────────────
+//  Stored as raw int64. Used for C extern fn calls.
+fn val_pointer(addr) {
+    return Val { tag: "pointer", int_val: addr, float_val: 0.0, bool_val: false, str_val: "", char_val: "", array_val: "", fn_name: "", fn_params: "", fn_body: "", struct_name: "", struct_fields: "" }
+}
+
+fn pointer_addr(v) {
+    if v.tag != "pointer" { return 0 }
+    return v.int_val
+}
+
+fn pointer_is_null(v) {
+    if v.tag != "pointer" { return true }
+    return v.int_val == 0
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Phase 6 골화 — Algebraic Effects (handle/with + resume)
+//  src/interpreter.rs:11872-11933 대응
+// ═══════════════════════════════════════════════════════════
+//  Effect 등록부: effect 이름 → 허용된 op 이름 배열
+//  Handler stack: 각 프레임은 [[key, params, body], ...]
+//  Resume value: handler 안에서 resume(v) 호출 시 저장
+//  Pure flag: 순수 함수 안에서 effect 호출 차단
+
+pub let mut effect_defs_keys = []      // [effect_name, ...]
+pub let mut effect_defs_ops = []       // [[op1, op2, ...], ...]
+pub let mut effect_handler_stack = []  // [[entry, ...], ...] — 각 entry: [key, params, body]
+pub let mut resume_value = val_void()
+pub let mut resume_set = false
+pub let mut in_pure_fn = false
+
+fn effect_def_add(effect_name, ops) {
+    effect_defs_keys = effect_defs_keys.push(effect_name)
+    effect_defs_ops = effect_defs_ops.push(ops)
+}
+
+fn effect_def_lookup(effect_name) {
+    let mut i = 0
+    while i < len(effect_defs_keys) {
+        if effect_defs_keys[i] == effect_name { return effect_defs_ops[i] }
+        i = i + 1
+    }
+    return val_void()
+}
+
+fn effect_def_has_op(effect_name, op) {
+    let ops = effect_def_lookup(effect_name)
+    if type_of(ops) != "array" { return false }
+    let mut i = 0
+    while i < len(ops) {
+        if ops[i] == op { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn effect_handler_push(handlers) {
+    // handlers: array of [key, params, body] entries
+    effect_handler_stack = effect_handler_stack.push(handlers)
+}
+
+fn effect_handler_pop() {
+    let n = len(effect_handler_stack)
+    if n == 0 { return }
+    let mut new_stack = []
+    let mut i = 0
+    while i < n - 1 { new_stack = new_stack.push(effect_handler_stack[i]); i = i + 1 }
+    effect_handler_stack = new_stack
+}
+
+fn effect_handler_find(key) {
+    // Search from top of stack down (most recent first)
+    let mut i = len(effect_handler_stack) - 1
+    while i >= 0 {
+        let frame = effect_handler_stack[i]
+        let mut j = 0
+        while j < len(frame) {
+            let entry = frame[j]
+            if entry[0] == key { return entry }
+            j = j + 1
+        }
+        i = i - 1
+    }
+    return val_void()
+}
+
+// eval_effect_call(effect, op, args) — dispatch effect operation
+//   1. pure-fn 차단
+//   2. effect 정의 검증
+//   3. handler stack 검색
+//   4. 발견 시 handler body 실행 (resume_value 반영)
+//   5. 미발견 시 EffectRequest 전파 (caller가 handle해야 함)
+fn eval_effect_call(effect_name, op, args) {
+    if in_pure_fn {
+        throw_flag = true
+        throw_val = val_str("effect " + effect_name + "." + op + " not allowed in pure function")
+        return val_void()
+    }
+    if !effect_def_has_op(effect_name, op) {
+        throw_flag = true
+        throw_val = val_str("undefined effect or operation: " + effect_name + "." + op)
+        return val_void()
+    }
+    let key = effect_name + "." + op
+    let entry = effect_handler_find(key)
+    // entry is a host array on hit, val_void() on miss
+    if type_of(entry) != "array" {
+        // No handler — propagate as EffectRequest
+        return val_effect_request(effect_name, op, args)
+    }
+    // entry: [key, params, body]
+    let params = entry[1]
+    let body = entry[2]
+    env_push_scope()
+    let mut pi = 0
+    while pi < len(params) && pi < len(args) {
+        env_define(params[pi], args[pi])
+        pi = pi + 1
+    }
+    resume_set = false
+    resume_value = val_void()
+    let mut result = val_void()
+    let mut bi = 0
+    while bi < len(body) && !return_flag && !throw_flag && !panic_flag {
+        result = exec_stmt_at(body, bi)
+        bi = bi + 1
+    }
+    if return_flag {
+        result = return_val
+        return_flag = false
+    }
+    env_pop_scope()
+    if resume_set {
+        let r = resume_value
+        resume_set = false
+        return r
+    }
+    return result
+}
+
+// eval_handle_with(body_fn, handler_entries) — push frame, eval body, pop
+//   handler_entries: [[key, params, body_stmts], ...]
+fn eval_handle_with(body_fn, handler_entries) {
+    effect_handler_push(handler_entries)
+    let result = call_fn_val(body_fn, [])
+    effect_handler_pop()
+    return result
 }
 
 // ── Stack trace helper ──────────────────────────────────
@@ -3947,15 +8380,17 @@ fn interpret(ast) {
     let mut result = val_void()
     let mut _si = 0
     while _si < len(ast) {
-        if panic_flag || throw_flag { _si = len(ast) } else {
+        if panic_flag || throw_flag || return_flag { _si = len(ast) } else {
             result = exec_stmt_at(ast, _si)
             _si = _si + 1
+            // Top-level return: capture value and stop iteration.
             if return_flag {
                 result = return_val
-                return_flag = false
+                _si = len(ast)
             }
         }
     }
+    return_flag = false
     // Uncaught panic — print diagnostic. Uses println (no stderr binding in
     // self interp), prefixed with "panic: " so callers can detect the abort.
     if panic_flag {
