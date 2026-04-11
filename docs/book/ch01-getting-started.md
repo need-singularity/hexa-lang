@@ -10,13 +10,14 @@ Choose one of three methods:
 # Option A: Homebrew (macOS)
 brew install need-singularity/tap/hexa-lang
 
-# Option B: Cargo (any platform with Rust)
-cargo install hexa-lang
+# Option B: hx package manager (any platform)
+# (see pkg/hx — no Rust toolchain required)
 
-# Option C: From source
+# Option C: From source (self-host — 2026-04-11 onward)
 git clone https://github.com/need-singularity/hexa-lang.git
-cd hexa-lang && cargo build --release
-cp target/release/hexa /usr/local/bin/
+cd hexa-lang
+cp hexa /usr/local/bin/    # precompiled self-host binary
+# For rebuild: bootstrap via build_hexa.hexa (hexa_v2 → C → clang → hexa_v3)
 ```
 
 Verify the installation:

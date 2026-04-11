@@ -145,15 +145,19 @@ println(fib(90))
 ## 아키텍처
 
 ### 파일 매핑
+
+> 2026-04-11 업데이트: `src/` 디렉터리 전체 삭제됨. 아래 경로는 모두
+> self-host .hexa 파일로 이전됨.
+
 ```
-Token:       src/token.rs    — Attribute(RcStr), AttrKind enum
-Lexer:       src/lexer.rs    — @word → Attribute 토큰
-AST:         src/ast.rs      — Attribute struct, FnDecl.attrs
-Parser:      src/parser.rs   — pending_attrs → take_attrs()
-Compiler:    src/compiler.rs — CompiledFunction.is_memoize
-VM:          src/vm.rs       — memo_cache, CallFrame.memo_key
-JIT:         src/jit.rs      — define_memo_wrapper(), memo_data
-Interpreter: src/interpreter.rs — __memoize__ prefix, memo_cache
+Token:       self/token.hexa    — Attribute(str), AttrKind enum
+Lexer:       self/lexer.hexa    — @word → Attribute 토큰
+AST:         self/ast.hexa      — Attribute struct, FnDecl.attrs
+Parser:      self/parser.hexa   — p_pending_attrs → take_attrs()
+Compiler:    self/compiler.hexa — CompiledFunction.is_memoize
+VM:          self/vm.hexa       — memo_cache, CallFrame.memo_key
+JIT:         self/jit.hexa      — define_memo_wrapper(), memo_data
+Interpreter: self/interpreter.hexa — __memoize__ prefix, memo_cache
 ```
 
 ### Tiered Execution 주의
