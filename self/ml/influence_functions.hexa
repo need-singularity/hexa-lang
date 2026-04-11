@@ -1,0 +1,258 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/influence_functions.hexa — Influence Functions (#282)
+//
+//  Koh & Liang 2017:
+//
+//      I_up,loss(z_test, z_train) = -∇_θ L(z_test)ᵀ · H⁻¹ · ∇_θ L(z_train)
+//
+//  We use a small logistic regression model (binary classifier) so
+//  that gradients and the Hessian are closed-form.  To avoid full
+//  matrix inversion we keep only a diagonal Hessian approximation.
+//
+//  Model:  p(y=1|x) = σ(wᵀx)
+//  Loss :  -y·log p - (1-y)·log(1-p)
+//  ∇L   :  (p - y) · x
+//  H_ii :  (1/N) Σ p_n (1-p_n) x_{n,i}² + λ      (λ = damping)
+//
+//  API:
+//    if_sigmoid(inp)                                 -> float
+//    if_forward(w, feat)                             -> float         // prob
+//    if_loss(w, feat, label)                         -> float
+//    if_grad(w, feat, label)                         -> [float]
+//    if_dataset_loss(w, X, Y)                        -> float
+//    if_diag_hessian(w, X, damping)                  -> [float]
+//    if_hvp_inv(grad, diag_H)                        -> [float]
+//    if_influence(w, z_test_feat, z_test_label, z_train_feat, z_train_label, diag_H) -> float
+//    if_rank_train(w, test_feat, test_label, X, Y, damping) -> #{"scores","order"}
+//    if_fit_logreg(X, Y, lr, steps)                  -> [float]
+// ═══════════════════════════════════════════════════════════════════
+
+fn if_exp(inp) {
+    let mut v = inp
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn if_log(inp) {
+    if inp <= 0.0 { return -30.0 }
+    let mut v = inp
+    let mut count = 0
+    while v > 2.0 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    let d = v - 1.0
+    let ln_v = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_v
+}
+
+fn if_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+@pure
+fn if_sigmoid(inp) {
+    if inp >= 0.0 {
+        let e = if_exp(0.0 - inp)
+        return 1.0 / (1.0 + e)
+    } else {
+        let e = if_exp(inp)
+        return e / (1.0 + e)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  1. Forward, loss, gradient for one example
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn if_forward(w, feat) {
+    let D = len(w)
+    let mut s = 0.0
+    for j in 0..D { s = s + w[j] * feat[j] }
+    return if_sigmoid(s)
+}
+
+@pure
+fn if_loss(w, feat, label) {
+    let p = if_forward(w, feat)
+    let mut pp = p
+    if pp < 1.0e-12 { pp = 1.0e-12 }
+    if pp > 1.0 - 1.0e-12 { pp = 1.0 - 1.0e-12 }
+    if label == 1 {
+        return 0.0 - if_log(pp)
+    }
+    return 0.0 - if_log(1.0 - pp)
+}
+
+@pure
+fn if_grad(w, feat, label) {
+    let D = len(w)
+    let p = if_forward(w, feat)
+    let diff = p - to_float(label)
+    let mut g = if_zeros(D)
+    for j in 0..D {
+        g[j] = diff * feat[j]
+    }
+    return g
+}
+
+@pure
+fn if_dataset_loss(w, X, Y) {
+    let n = len(X)
+    if n == 0 { return 0.0 }
+    let mut s = 0.0
+    for i in 0..n {
+        s = s + if_loss(w, X[i], Y[i])
+    }
+    return s / to_float(n)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  2. Diagonal Hessian
+//
+//  H_ii = (1/N) Σ p_n(1-p_n) x_{n,i}² + damping
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn if_diag_hessian(w, X, damping) {
+    let n = len(X)
+    let D = len(w)
+    let mut diag_H = if_zeros(D)
+    if n == 0 {
+        for j in 0..D { diag_H[j] = damping }
+        return diag_H
+    }
+    for i in 0..n {
+        let p = if_forward(w, X[i])
+        let v = p * (1.0 - p)
+        for j in 0..D {
+            diag_H[j] = diag_H[j] + v * X[i][j] * X[i][j]
+        }
+    }
+    let nf = to_float(n)
+    for j in 0..D {
+        diag_H[j] = diag_H[j] / nf + damping
+    }
+    return diag_H
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  3. Diagonal H⁻¹ applied to a gradient vector
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn if_hvp_inv(grad, diag_H) {
+    let D = len(grad)
+    let mut out = if_zeros(D)
+    for j in 0..D {
+        let mut d = diag_H[j]
+        if ofa_abs_fallback(d) < 1.0e-12 { d = 1.0e-12 }
+        out[j] = grad[j] / d
+    }
+    return out
+}
+
+fn ofa_abs_fallback(inp) {
+    if inp < 0.0 { return 0.0 - inp }
+    return inp
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  4. Influence of z_train on z_test
+//
+//  I = -∇L(z_test)ᵀ · H⁻¹ · ∇L(z_train)
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn if_influence(w, z_test_feat, z_test_label, z_train_feat, z_train_label, diag_H) {
+    let g_test = if_grad(w, z_test_feat, z_test_label)
+    let g_train = if_grad(w, z_train_feat, z_train_label)
+    let h_inv_g_train = if_hvp_inv(g_train, diag_H)
+    let D = len(g_test)
+    let mut s = 0.0
+    for j in 0..D { s = s + g_test[j] * h_inv_g_train[j] }
+    return 0.0 - s
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  5. Rank training samples by absolute influence on a test point
+//
+//  Returns descending indices of |influence|.
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn if_rank_train(w, test_feat, test_label, X, Y, damping) {
+    let n = len(X)
+    let diag_H = if_diag_hessian(w, X, damping)
+    let mut scores = if_zeros(n)
+    for i in 0..n {
+        scores[i] = if_influence(w, test_feat, test_label, X[i], Y[i], diag_H)
+    }
+    // Sort indices by |score| descending via simple selection sort.
+    let mut order = []
+    for i in 0..n { order = order + [i] }
+    for i in 0..n {
+        let mut best = i
+        let mut best_v = ofa_abs_fallback(scores[order[i]])
+        for j in (i + 1)..n {
+            let v = ofa_abs_fallback(scores[order[j]])
+            if v > best_v {
+                best_v = v
+                best = j
+            }
+        }
+        if best != i {
+            let tmp = order[i]
+            order[i] = order[best]
+            order[best] = tmp
+        }
+    }
+    return #{
+        "scores": scores,
+        "order": order
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  6. Tiny logistic regression trainer — used by tests
+// ═══════════════════════════════════════════════════════════════════
+
+@hot
+fn if_fit_logreg(X, Y, lr, steps) {
+    let n = len(X)
+    if n == 0 { return [] }
+    let D = len(X[0])
+    let mut w = if_zeros(D)
+    for _s in 0..steps {
+        let mut g = if_zeros(D)
+        for i in 0..n {
+            let p = if_forward(w, X[i])
+            let diff = p - to_float(Y[i])
+            for j in 0..D {
+                g[j] = g[j] + diff * X[i][j]
+            }
+        }
+        let nf = to_float(n)
+        for j in 0..D {
+            w[j] = w[j] - lr * g[j] / nf
+        }
+    }
+    return w
+}
+
+println("[influence_functions] loaded — logreg gradient + diagonal Hessian⁻¹ scoring")
