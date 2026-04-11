@@ -1,0 +1,541 @@
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/kan.hexa — Kolmogorov-Arnold Network (#194)
+//
+//  KAN replaces fixed activation functions (ReLU/GELU) with
+//  learnable B-spline activations on EDGES rather than NODES.
+//  Each connection has its own learned activation function,
+//  parameterized by B-spline coefficients.
+//
+//  Core insight (Kolmogorov-Arnold theorem):
+//    Any multivariate continuous function f(x1,...,xn) can be
+//    decomposed into sums and compositions of univariate functions.
+//    KAN parameterizes these univariate functions as B-splines
+//    on every edge, enabling fine-grained function learning.
+//
+//  B-spline evaluation uses recursive Cox-de Boor:
+//    B_{i,0}(x) = 1 if knot[i] <= x < knot[i+1], else 0
+//    B_{i,k}(x) = w1 * B_{i,k-1}(x) + w2 * B_{i+1,k-1}(x)
+//    where w1 = (x - knot[i]) / (knot[i+k] - knot[i])
+//          w2 = (knot[i+k+1] - x) / (knot[i+k+1] - knot[i+1])
+//
+//  Reference:
+//    Liu et al. "KAN: Kolmogorov-Arnold Networks" (2024)
+//
+//  API (all pure, no BLAS / no external deps):
+//    kan_bspline_basis(x, knots, n_knots, degree, i)
+//    kan_bspline_eval(x, coeffs, knots, n_knots, degree, n_basis)
+//    kan_create_layer(in_dim, out_dim, n_basis, degree)
+//    kan_layer_forward(layer, input, in_dim)
+//    kan_create_network(layer_dims, n_basis, degree)
+//    kan_forward(network, input)
+//    kan_uniform_knots(lo, hi, n_internal, degree)
+//    kan_init_coeffs(n_basis)
+//    kan_train_step(network, input, target, lr)
+//    kan_regularization(network, lambda_l1)
+//    kan_prune_edge(network, layer_idx, in_idx, out_idx)
+//    kan_param_count(network)
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+//    @hot   — called every training step
+// ═══════════════════════════════════════════════════════════════
+
+// ── numeric helpers (prefixed to avoid collision) ────────────
+
+fn kan_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn kan_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn kan_max_f(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn kan_min_f(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn kan_clamp(x, lo, hi) {
+    if x < lo { return lo }
+    if x > hi { return hi }
+    return x
+}
+
+// ── deterministic LCG pseudo-random ─────────────────────────
+fn kan_lcg_next(seed) {
+    return (seed * 1103515245 + 12345) % 2147483647
+}
+
+fn kan_lcg_float(seed) {
+    // returns value in roughly [-1, 1]
+    return (to_float(seed % 2000) - 1000.0) / 1000.0
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 1: Knot vector construction
+//
+//  Uniform knot vector for B-splines of given degree.
+//  Boundary knots are repeated (degree+1) times so the spline
+//  is clamped at both endpoints.
+//
+//  Total knots = n_internal + 2 * (degree + 1)
+//  Total basis = n_internal + degree + 1
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn kan_uniform_knots(lo, hi, n_internal, degree) {
+    // Total knot count: (degree+1) left repeats + n_internal + (degree+1) right repeats
+    let n_total = n_internal + 2 * (degree + 1)
+    let mut knots = kan_zeros(n_total)
+
+    // Left boundary repeats
+    for i in 0..(degree + 1) {
+        knots[i] = lo
+    }
+
+    // Internal knots (uniformly spaced)
+    if n_internal > 0 {
+        let step = (hi - lo) / to_float(n_internal + 1)
+        for i in 0..n_internal {
+            knots[degree + 1 + i] = lo + step * to_float(i + 1)
+        }
+    }
+
+    // Right boundary repeats
+    for i in 0..(degree + 1) {
+        knots[degree + 1 + n_internal + i] = hi
+    }
+
+    return knots
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 2: B-spline basis evaluation (Cox-de Boor recursion)
+//
+//  B_{i,0}(x) = 1 if knot[i] <= x < knot[i+1], else 0
+//  B_{i,k}(x) = w1 * B_{i,k-1}(x) + w2 * B_{i+1,k-1}(x)
+//
+//  For the last interval we include the right endpoint.
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn kan_bspline_basis(x, knots, n_knots, degree, i) {
+    // degree 0: indicator function
+    if degree == 0 {
+        // Include right endpoint for the last valid interval
+        if i == n_knots - 2 {
+            if x >= knots[i] {
+                if x <= knots[i + 1] { return 1.0 }
+            }
+            return 0.0
+        }
+        if x >= knots[i] {
+            if x < knots[i + 1] { return 1.0 }
+        }
+        return 0.0
+    }
+
+    // Recursive case
+    let mut result = 0.0
+
+    // Left term: (x - knot[i]) / (knot[i+degree] - knot[i]) * B_{i, degree-1}
+    let denom1 = knots[i + degree] - knots[i]
+    if kan_abs(denom1) > 1.0e-12 {
+        let b1 = kan_bspline_basis(x, knots, n_knots, degree - 1, i)
+        result = result + (x - knots[i]) / denom1 * b1
+    }
+
+    // Right term: (knot[i+degree+1] - x) / (knot[i+degree+1] - knot[i+1]) * B_{i+1, degree-1}
+    let denom2 = knots[i + degree + 1] - knots[i + 1]
+    if kan_abs(denom2) > 1.0e-12 {
+        let b2 = kan_bspline_basis(x, knots, n_knots, degree - 1, i + 1)
+        result = result + (knots[i + degree + 1] - x) / denom2 * b2
+    }
+
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 3: B-spline curve evaluation
+//
+//  phi(x) = sum_i coeffs[i] * B_{i,degree}(x)
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn kan_bspline_eval(x, coeffs, knots, n_knots, degree, n_basis) {
+    let mut result = 0.0
+    for i in 0..n_basis {
+        let b = kan_bspline_basis(x, knots, n_knots, degree, i)
+        result = result + coeffs[i] * b
+    }
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 4: B-spline coefficient initialization
+//
+//  Small random values to break symmetry. Scale ~ 0.1/n_basis
+//  so the initial spline is near-zero (residual-style).
+// ═══════════════════════════════════════════════════════════════
+
+fn kan_init_coeffs(n_basis) {
+    let mut coeffs = kan_zeros(n_basis)
+    let scale = 0.1 / to_float(n_basis)
+    let mut seed = n_basis * 7 + 42
+    for i in 0..n_basis {
+        seed = kan_lcg_next(seed)
+        coeffs[i] = kan_lcg_float(seed) * scale
+    }
+    return coeffs
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 5: KAN layer creation
+//
+//  A KAN layer stores:
+//    [coeffs_flat, knots_flat, in_dim, out_dim, n_basis, degree]
+//
+//  coeffs_flat has shape [out_dim * in_dim * n_basis]
+//    indexing: edge (out_i, in_j) -> offset = (out_i * in_dim + in_j) * n_basis
+//
+//  knots_flat: one shared knot vector per layer (uniform)
+//    length = n_internal + 2 * (degree + 1)  where n_internal = n_basis - degree - 1
+// ═══════════════════════════════════════════════════════════════
+
+fn kan_create_layer(in_dim, out_dim, n_basis, degree) {
+    // Number of internal knots
+    let n_internal = n_basis - degree - 1
+    let safe_internal = kan_max_f(to_float(n_internal), 0.0)
+
+    // Knot vector (shared for all edges in this layer)
+    let knots = kan_uniform_knots(-1.0, 1.0, to_int(safe_internal), degree)
+
+    // Coefficients: one set per edge
+    let n_edges = out_dim * in_dim
+    let total_coeffs = n_edges * n_basis
+    let mut coeffs_flat = kan_zeros(total_coeffs)
+    let scale = 0.1 / to_float(n_basis)
+    let mut seed = in_dim * 31 + out_dim * 17 + n_basis * 7 + 42
+    for idx in 0..total_coeffs {
+        seed = kan_lcg_next(seed)
+        coeffs_flat[idx] = kan_lcg_float(seed) * scale
+    }
+
+    return [coeffs_flat, knots, in_dim, out_dim, n_basis, degree]
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 6: KAN layer forward
+//
+//  For each output neuron out_i:
+//    y[out_i] = sum_{in_j=0..in_dim-1} phi_{out_i,in_j}(input[in_j])
+//
+//  where phi is the learned B-spline on edge (out_i, in_j).
+// ═══════════════════════════════════════════════════════════════
+
+@hot
+@pure
+fn kan_layer_forward(layer, input, in_dim) {
+    let coeffs_flat = layer[0]
+    let knots = layer[1]
+    let l_in_dim = to_int(layer[2])
+    let l_out_dim = to_int(layer[3])
+    let n_basis = to_int(layer[4])
+    let degree = to_int(layer[5])
+    let n_knots = len(knots)
+
+    let mut output = kan_zeros(l_out_dim)
+
+    for out_i in 0..l_out_dim {
+        let mut sum_val = 0.0
+        for in_j in 0..l_in_dim {
+            // Extract coefficients for this edge
+            let base = (out_i * l_in_dim + in_j) * n_basis
+            let mut edge_coeffs = kan_zeros(n_basis)
+            for k in 0..n_basis {
+                edge_coeffs[k] = coeffs_flat[base + k]
+            }
+            // Evaluate B-spline at input[in_j]
+            let x_val = kan_clamp(input[in_j], -1.0, 1.0)
+            let phi = kan_bspline_eval(x_val, edge_coeffs, knots, n_knots, degree, n_basis)
+            sum_val = sum_val + phi
+        }
+        output[out_i] = sum_val
+    }
+
+    return output
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 7: KAN network creation
+//
+//  layer_dims: array of layer widths, e.g. [2, 5, 1]
+//    creates len(layer_dims)-1 KAN layers.
+// ═══════════════════════════════════════════════════════════════
+
+fn kan_create_network(layer_dims, n_basis, degree) {
+    let n_layers = len(layer_dims) - 1
+    let mut layers = []
+    for i in 0..n_layers {
+        let in_d = layer_dims[i]
+        let out_d = layer_dims[i + 1]
+        let layer = kan_create_layer(in_d, out_d, n_basis, degree)
+        layers = layers + [layer]
+    }
+    return layers
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 8: KAN full forward
+//
+//  Pass input through all layers sequentially.
+//  Each layer's output becomes the next layer's input.
+// ═══════════════════════════════════════════════════════════════
+
+@hot
+fn kan_forward(network, input) {
+    let n_layers = len(network)
+    let mut act = input
+    for i in 0..n_layers {
+        let layer = network[i]
+        let in_d = to_int(layer[2])
+        act = kan_layer_forward(layer, act, in_d)
+    }
+    return act
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 9: Parameter counting
+//
+//  Total spline coefficients across all layers.
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn kan_param_count(network) {
+    let n_layers = len(network)
+    let mut total = 0
+    for i in 0..n_layers {
+        let layer = network[i]
+        total = total + len(layer[0])
+    }
+    return total
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 10: L1 regularization on spline coefficients
+//
+//  Encourages sparsity — edges with near-zero coefficients can
+//  be pruned, yielding interpretable symbolic structure.
+//
+//  reg = lambda * sum |coeffs[i]| across all layers
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn kan_regularization(network, lambda_l1) {
+    let n_layers = len(network)
+    let mut total = 0.0
+    for i in 0..n_layers {
+        let coeffs = network[i][0]
+        let nc = len(coeffs)
+        for j in 0..nc {
+            total = total + kan_abs(coeffs[j])
+        }
+    }
+    return lambda_l1 * total
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 11: Edge pruning
+//
+//  Zero out all B-spline coefficients for edge (in_idx, out_idx)
+//  in layer layer_idx. This removes that connection entirely.
+//  Returns a new network with the pruned layer.
+// ═══════════════════════════════════════════════════════════════
+
+fn kan_prune_edge(network, layer_idx, in_idx, out_idx) {
+    let n_layers = len(network)
+    let mut new_net = []
+    for i in 0..n_layers {
+        if i == layer_idx {
+            let layer = network[i]
+            let coeffs = layer[0]
+            let l_in_dim = to_int(layer[2])
+            let n_basis = to_int(layer[4])
+            let base = (out_idx * l_in_dim + in_idx) * n_basis
+
+            // Copy coefficients, zeroing out the target edge
+            let nc = len(coeffs)
+            let mut new_coeffs = kan_zeros(nc)
+            for j in 0..nc {
+                if j >= base {
+                    if j < base + n_basis {
+                        new_coeffs[j] = 0.0
+                    } else {
+                        new_coeffs[j] = coeffs[j]
+                    }
+                } else {
+                    new_coeffs[j] = coeffs[j]
+                }
+            }
+            new_net = new_net + [[new_coeffs, layer[1], layer[2], layer[3], layer[4], layer[5]]]
+        } else {
+            new_net = new_net + [network[i]]
+        }
+    }
+    return new_net
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 12: Training step (SGD with finite-difference gradient)
+//
+//  For each coefficient, perturb by epsilon, measure loss change,
+//  compute numerical gradient, update with SGD.
+//
+//  Loss = MSE = sum((output[k] - target[k])^2) / n_out
+// ═══════════════════════════════════════════════════════════════
+
+fn kan_mse_loss(output, target) {
+    let n = len(output)
+    if n == 0 { return 0.0 }
+    let mut total = 0.0
+    for i in 0..n {
+        let d = output[i] - target[i]
+        total = total + d * d
+    }
+    return total / to_float(n)
+}
+
+@hot
+fn kan_train_step(network, input, target, lr) {
+    let eps = 1.0e-4
+    let n_layers = len(network)
+
+    // Current loss
+    let pred = kan_forward(network, input)
+    let loss0 = kan_mse_loss(pred, target)
+
+    let mut new_net = []
+    for li in 0..n_layers {
+        let layer = network[li]
+        let coeffs = layer[0]
+        let nc = len(coeffs)
+        let mut new_coeffs = kan_zeros(nc)
+        for ci in 0..nc {
+            new_coeffs[ci] = coeffs[ci]
+        }
+
+        // Finite-difference gradient for each coefficient
+        for ci in 0..nc {
+            let old_val = new_coeffs[ci]
+            new_coeffs[ci] = old_val + eps
+
+            // Rebuild network with perturbed coefficient
+            let mut tmp_net = []
+            for li2 in 0..n_layers {
+                if li2 == li {
+                    tmp_net = tmp_net + [[new_coeffs, layer[1], layer[2], layer[3], layer[4], layer[5]]]
+                } else {
+                    tmp_net = tmp_net + [network[li2]]
+                }
+            }
+
+            let pred_p = kan_forward(tmp_net, input)
+            let loss_p = kan_mse_loss(pred_p, target)
+            let grad = (loss_p - loss0) / eps
+
+            // SGD update
+            new_coeffs[ci] = old_val - lr * grad
+        }
+
+        new_net = new_net + [[new_coeffs, layer[1], layer[2], layer[3], layer[4], layer[5]]]
+    }
+
+    return new_net
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 13: Edge magnitude (for pruning decisions)
+//
+//  Measure the L1 magnitude of each edge's spline coefficients.
+//  Returns a flat array of shape [out_dim * in_dim] per layer.
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn kan_edge_magnitudes(layer) {
+    let coeffs = layer[0]
+    let l_in_dim = to_int(layer[2])
+    let l_out_dim = to_int(layer[3])
+    let n_basis = to_int(layer[4])
+    let n_edges = l_out_dim * l_in_dim
+
+    let mut mags = kan_zeros(n_edges)
+    for e in 0..n_edges {
+        let base = e * n_basis
+        let mut mag = 0.0
+        for k in 0..n_basis {
+            mag = mag + kan_abs(coeffs[base + k])
+        }
+        mags[e] = mag
+    }
+    return mags
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 14: Auto-prune (zero out edges below threshold)
+// ═══════════════════════════════════════════════════════════════
+
+fn kan_auto_prune(network, threshold) {
+    let n_layers = len(network)
+    let mut new_net = []
+    for li in 0..n_layers {
+        let layer = network[li]
+        let mags = kan_edge_magnitudes(layer)
+        let l_in_dim = to_int(layer[2])
+        let l_out_dim = to_int(layer[3])
+        let n_basis = to_int(layer[4])
+
+        let mut pruned_net = new_net + [layer]
+        let mut cur_net = pruned_net
+        for out_i in 0..l_out_dim {
+            for in_j in 0..l_in_dim {
+                let edge_idx = out_i * l_in_dim + in_j
+                if mags[edge_idx] < threshold {
+                    // Use prune on the partial network being built
+                    let last_idx = len(cur_net) - 1
+                    let cur_layer = cur_net[last_idx]
+                    let coeffs = cur_layer[0]
+                    let base = (out_i * l_in_dim + in_j) * n_basis
+                    let nc = len(coeffs)
+                    let mut nc2 = kan_zeros(nc)
+                    for ci in 0..nc {
+                        if ci >= base {
+                            if ci < base + n_basis {
+                                nc2[ci] = 0.0
+                            } else {
+                                nc2[ci] = coeffs[ci]
+                            }
+                        } else {
+                            nc2[ci] = coeffs[ci]
+                        }
+                    }
+                    let mut rebuilt = []
+                    for ri in 0..last_idx {
+                        rebuilt = rebuilt + [cur_net[ri]]
+                    }
+                    rebuilt = rebuilt + [[nc2, cur_layer[1], cur_layer[2], cur_layer[3], cur_layer[4], cur_layer[5]]]
+                    cur_net = rebuilt
+                }
+            }
+        }
+        new_net = cur_net
+    }
+    return new_net
+}

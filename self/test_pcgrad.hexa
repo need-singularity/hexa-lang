@@ -1,0 +1,463 @@
+// ===================================================================
+//  test_pcgrad.hexa — PCGrad (Projecting Conflicting Gradients) tests
+//
+//  ML roadmap #197 — Gradient Surgery for Multi-Task Learning
+//                    (Yu et al. NeurIPS 2020)
+//
+//  Tests (33):
+//    T1  pcg_abs positive input
+//    T2  pcg_abs negative input
+//    T3  pcg_sqrt perfect square
+//    T4  pcg_sqrt non-square
+//    T5  pcg_sqrt zero
+//    T6  pcg_zeros correct length, all 0.0
+//    T7  pcg_copy equals original
+//    T8  pcg_copy deep copy independence
+//    T9  pcg_dot orthogonal vectors = 0
+//    T10 pcg_dot aligned vectors > 0
+//    T11 pcg_dot conflicting vectors < 0
+//    T12 pcg_norm of unit vector
+//    T13 pcg_cosine orthogonal = 0
+//    T14 pcg_cosine aligned = 1
+//    T15 pcg_cosine opposite = -1
+//    T16 pcg_cosine zero vector safe (=0)
+//    T17 pcg_is_conflicting opposite = true
+//    T18 pcg_is_conflicting orthogonal = false
+//    T19 pcg_is_conflicting aligned = false
+//    T20 pcg_project no-conflict passthrough
+//    T21 pcg_project kills conflicting component
+//    T22 pcg_project orthogonality after projection
+//    T23 pcg_project zero g_j safe
+//    T24 pcg_resolve_pair no-conflict copies g1
+//    T25 pcg_resolve_pair conflict projects g1
+//    T26 pcg_resolve_all two-task no-conflict unchanged
+//    T27 pcg_resolve_all two-task conflict → dot >= 0 after
+//    T28 pcg_resolve_all three-task all pairs resolved
+//    T29 pcg_aggregate sums resolved grads
+//    T30 pcg_conflict_count counts pairs correctly
+//    T31 pcg_conflict_ratio in [0,1]
+//    T32 pcg_train_step applies SGD update
+//    T33 pcg_train_step decreases loss on synthetic 2-task
+//    T34 pcg_cosine_matrix symmetric, diag=1
+//    T35 pcg_gradient_magnitude per-task norms
+//    T36 pcg_improvement_ratio for resolved vs orig
+//    T37 single task (n=1) no change
+//    T38 norm preservation for non-conflicting case
+//
+//  Run: ./hexa self/test_pcgrad.hexa
+// ===================================================================
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ===================================================================
+//  Inlined PCGrad implementation (mirrors self/ml/pcgrad.hexa)
+// ===================================================================
+
+fn pcg_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn pcg_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn pcg_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn pcg_copy(a, n) {
+    let mut out = pcg_zeros(n)
+    for i in 0..n { out[i] = a[i] }
+    return out
+}
+
+fn pcg_dot(a, b, n) {
+    let mut s = 0.0
+    for i in 0..n {
+        s = s + a[i] * b[i]
+    }
+    return s
+}
+
+fn pcg_norm(a, n) {
+    let d = pcg_dot(a, a, n)
+    return pcg_sqrt(d)
+}
+
+fn pcg_cosine(a, b, n) {
+    let d = pcg_dot(a, b, n)
+    let na = pcg_norm(a, n)
+    let nb = pcg_norm(b, n)
+    let denom = na * nb
+    if denom < 1.0e-12 { return 0.0 }
+    return d / denom
+}
+
+fn pcg_is_conflicting(g1, g2, n) {
+    let c = pcg_cosine(g1, g2, n)
+    return c < 0.0
+}
+
+fn pcg_project(g_i, g_j, n) {
+    let d_ij = pcg_dot(g_i, g_j, n)
+    let d_jj = pcg_dot(g_j, g_j, n)
+    if d_jj < 1.0e-12 { return pcg_copy(g_i, n) }
+    let coeff = d_ij / d_jj
+    let mut out = pcg_zeros(n)
+    for k in 0..n {
+        out[k] = g_i[k] - coeff * g_j[k]
+    }
+    return out
+}
+
+fn pcg_resolve_pair(g1, g2, n) {
+    let is_conf = pcg_is_conflicting(g1, g2, n)
+    if is_conf {
+        return pcg_project(g1, g2, n)
+    }
+    return pcg_copy(g1, n)
+}
+
+fn pcg_resolve_all(task_grads, n_tasks, dim) {
+    let mut resolved = []
+    for i in 0..n_tasks {
+        resolved = resolved + [pcg_copy(task_grads[i], dim)]
+    }
+    for i in 0..n_tasks {
+        let mut gi = pcg_copy(resolved[i], dim)
+        for j in 0..n_tasks {
+            if i != j {
+                let cos_val = pcg_cosine(gi, task_grads[j], dim)
+                if cos_val < 0.0 {
+                    gi = pcg_project(gi, task_grads[j], dim)
+                }
+            }
+        }
+        resolved[i] = gi
+    }
+    return resolved
+}
+
+fn pcg_aggregate(resolved_grads, n_tasks, dim) {
+    let mut agg = pcg_zeros(dim)
+    for t in 0..n_tasks {
+        for k in 0..dim {
+            agg[k] = agg[k] + resolved_grads[t][k]
+        }
+    }
+    return agg
+}
+
+fn pcg_conflict_count(task_grads, n_tasks, dim) {
+    let mut count = 0
+    for i in 0..n_tasks {
+        let j_start = i + 1
+        for j in j_start..n_tasks {
+            let c = pcg_cosine(task_grads[i], task_grads[j], dim)
+            if c < 0.0 {
+                count = count + 1
+            }
+        }
+    }
+    return count
+}
+
+fn pcg_conflict_ratio(task_grads, n_tasks, dim) {
+    if n_tasks < 2 { return 0.0 }
+    let total = n_tasks * (n_tasks - 1) / 2
+    let conflicts = pcg_conflict_count(task_grads, n_tasks, dim)
+    return to_float(conflicts) / to_float(total)
+}
+
+fn pcg_train_step(params, task_grads, n_tasks, dim, lr) {
+    let resolved = pcg_resolve_all(task_grads, n_tasks, dim)
+    let agg = pcg_aggregate(resolved, n_tasks, dim)
+    let mut new_params = pcg_copy(params, dim)
+    for k in 0..dim {
+        new_params[k] = new_params[k] - lr * agg[k]
+    }
+    return new_params
+}
+
+fn pcg_cosine_matrix(task_grads, n_tasks, dim) {
+    let mut mat = []
+    for i in 0..n_tasks {
+        let mut row = pcg_zeros(n_tasks)
+        for j in 0..n_tasks {
+            row[j] = pcg_cosine(task_grads[i], task_grads[j], dim)
+        }
+        mat = mat + [row]
+    }
+    return mat
+}
+
+fn pcg_gradient_magnitude(task_grads, n_tasks, dim) {
+    let mut mags = pcg_zeros(n_tasks)
+    for i in 0..n_tasks {
+        mags[i] = pcg_norm(task_grads[i], dim)
+    }
+    return mags
+}
+
+fn pcg_improvement_ratio(original_grads, resolved_grads, n_tasks, dim) {
+    let before = pcg_conflict_count(original_grads, n_tasks, dim)
+    if before == 0 { return 1.0 }
+    let after = pcg_conflict_count(resolved_grads, n_tasks, dim)
+    return 1.0 - to_float(after) / to_float(before)
+}
+
+// ===================================================================
+//  Tests
+// ===================================================================
+
+// --- T1~T5: scalar helpers ---------------------------------------------
+check("T1 pcg_abs positive", approx(pcg_abs(3.5), 3.5, 1.0e-9))
+check("T2 pcg_abs negative", approx(pcg_abs(0.0 - 2.25), 2.25, 1.0e-9))
+check("T3 pcg_sqrt perfect square", approx(pcg_sqrt(9.0), 3.0, 1.0e-6))
+check("T4 pcg_sqrt non-square", approx(pcg_sqrt(2.0), 1.41421356, 1.0e-5))
+check("T5 pcg_sqrt zero", approx(pcg_sqrt(0.0), 0.0, 1.0e-9))
+
+// --- T6: zeros ---------------------------------------------------------
+let z5 = pcg_zeros(5)
+let mut z_ok = len(z5) == 5
+for i in 0..5 {
+    if z5[i] != 0.0 { z_ok = false }
+}
+check("T6 pcg_zeros len=5 all 0.0", z_ok)
+
+// --- T7~T8: deep copy independence ------------------------------------
+let orig_v = [1.0, 2.0, 3.0, 4.0]
+let cp_v = pcg_copy(orig_v, 4)
+let mut copy_eq = true
+for i in 0..4 {
+    if cp_v[i] != orig_v[i] { copy_eq = false }
+}
+check("T7 pcg_copy equals original", copy_eq)
+
+// mutate copy, orig should remain unchanged
+let mut cp_mut = pcg_copy(orig_v, 4)
+cp_mut[0] = 999.0
+cp_mut[2] = 888.0
+check("T8 pcg_copy deep independence", (orig_v[0] == 1.0) && (orig_v[2] == 3.0) && (cp_mut[0] == 999.0))
+
+// --- T9~T11: dot product sign cases -----------------------------------
+// orthogonal: e1 . e2 = 0
+let e1 = [1.0, 0.0, 0.0]
+let e2 = [0.0, 1.0, 0.0]
+check("T9 pcg_dot orthogonal = 0", approx(pcg_dot(e1, e2, 3), 0.0, 1.0e-9))
+
+// aligned (positive scaling)
+let al_a = [1.0, 2.0, 3.0]
+let al_b = [2.0, 4.0, 6.0]
+check("T10 pcg_dot aligned > 0", pcg_dot(al_a, al_b, 3) > 0.0)
+
+// conflicting (opposing)
+let cf_a = [1.0, 2.0, 3.0]
+let cf_b = [-1.0, -2.0, -3.0]
+check("T11 pcg_dot conflicting < 0", pcg_dot(cf_a, cf_b, 3) < 0.0)
+
+// --- T12: norm ---------------------------------------------------------
+// ||(3,4)|| = 5
+let n_vec = [3.0, 4.0]
+check("T12 pcg_norm (3,4) = 5", approx(pcg_norm(n_vec, 2), 5.0, 1.0e-5))
+
+// --- T13~T16: cosine similarity ---------------------------------------
+check("T13 pcg_cosine orthogonal = 0", approx(pcg_cosine(e1, e2, 3), 0.0, 1.0e-6))
+// aligned: same direction → 1.0
+let co_a = [1.0, 2.0, 2.0]
+let co_b = [2.0, 4.0, 4.0]
+check("T14 pcg_cosine aligned = 1", approx(pcg_cosine(co_a, co_b, 3), 1.0, 1.0e-5))
+// opposite: →  -1.0
+let op_a = [1.0, 2.0, 2.0]
+let op_b = [-1.0, -2.0, -2.0]
+check("T15 pcg_cosine opposite = -1", approx(pcg_cosine(op_a, op_b, 3), -1.0, 1.0e-5))
+// safe with zero vector
+let zero3 = pcg_zeros(3)
+check("T16 pcg_cosine zero-vec safe (=0)", approx(pcg_cosine(zero3, e1, 3), 0.0, 1.0e-9))
+
+// --- T17~T19: conflict detection --------------------------------------
+check("T17 is_conflicting opposite=true", pcg_is_conflicting(op_a, op_b, 3))
+check("T18 is_conflicting orthogonal=false", pcg_is_conflicting(e1, e2, 3) == false)
+check("T19 is_conflicting aligned=false", pcg_is_conflicting(co_a, co_b, 3) == false)
+
+// --- T20: projection passthrough (when no conflict; project still runs)
+// With orthogonal vectors, pcg_project should return g_i unchanged because
+// dot(g_i, g_j) = 0 so coeff = 0.
+let proj_e1 = pcg_project(e1, e2, 3)
+check("T20 project orthogonal returns g_i", approx(proj_e1[0], 1.0, 1.0e-9) && approx(proj_e1[1], 0.0, 1.0e-9) && approx(proj_e1[2], 0.0, 1.0e-9))
+
+// --- T21: projection kills conflicting component ----------------------
+// g_i = (1, 0), g_j = (-1, 0) → g_i' = g_i - ((-1)/1)*(-1,0) = (1,0) + (-1,0) = (0,0)
+let pi21 = [1.0, 0.0]
+let pj21 = [-1.0, 0.0]
+let pr21 = pcg_project(pi21, pj21, 2)
+check("T21 project kills conflict component", approx(pr21[0], 0.0, 1.0e-9) && approx(pr21[1], 0.0, 1.0e-9))
+
+// --- T22: after projecting g_i onto normal-plane of g_j, (g_i' . g_j) ~ 0 ---
+// Arbitrary conflicting example: g_i = (1, 1), g_j = (-2, 1) (cos<0?)
+// dot = -2 + 1 = -1 < 0 → conflict
+let pi22 = [1.0, 1.0]
+let pj22 = [-2.0, 1.0]
+let pr22 = pcg_project(pi22, pj22, 2)
+check("T22 project → orthogonal to g_j", approx(pcg_dot(pr22, pj22, 2), 0.0, 1.0e-6))
+
+// --- T23: zero g_j safety --------------------------------------------
+let pr23 = pcg_project(pi22, pcg_zeros(2), 2)
+check("T23 project with g_j=0 returns copy of g_i", approx(pr23[0], 1.0, 1.0e-9) && approx(pr23[1], 1.0, 1.0e-9))
+
+// --- T24: resolve_pair no-conflict copies g1 --------------------------
+let rp_a = [1.0, 2.0]
+let rp_b = [2.0, 1.0]
+let rp_ok = pcg_resolve_pair(rp_a, rp_b, 2)
+check("T24 resolve_pair no-conflict = copy(g1)", approx(rp_ok[0], 1.0, 1.0e-9) && approx(rp_ok[1], 2.0, 1.0e-9))
+
+// --- T25: resolve_pair conflict → projected --------------------------
+// g1 = (1, 1), g2 = (-2, 1)  → conflict (cos<0), expected same as T22
+let rp_c = pcg_resolve_pair(pi22, pj22, 2)
+check("T25 resolve_pair conflict → project", approx(pcg_dot(rp_c, pj22, 2), 0.0, 1.0e-6))
+
+// --- T26: resolve_all two-task no conflict → unchanged ----------------
+let ra_a = [1.0, 0.0, 0.0]
+let ra_b = [0.0, 1.0, 0.0]
+let ra_tasks = [ra_a, ra_b]
+let ra_res = pcg_resolve_all(ra_tasks, 2, 3)
+let mut ra_unchanged = true
+for k in 0..3 {
+    if fabs(ra_res[0][k] - ra_a[k]) > 1.0e-9 { ra_unchanged = false }
+    if fabs(ra_res[1][k] - ra_b[k]) > 1.0e-9 { ra_unchanged = false }
+}
+check("T26 resolve_all two-task no-conflict unchanged", ra_unchanged)
+
+// --- T27: resolve_all two-task conflict → dot >= 0 after --------------
+// g1 = (1,1), g2 = (-2,1). After PCGrad (project both), resolved
+// gradients should no longer conflict: dot(g1', g2') >= 0 (approximately).
+let rc_tasks = [pi22, pj22]
+let rc_res = pcg_resolve_all(rc_tasks, 2, 2)
+let rc_dot = pcg_dot(rc_res[0], rc_res[1], 2)
+check("T27 resolve_all two-task dot >= 0 after", rc_dot >= -1.0e-9)
+
+// --- T28: resolve_all three-task all pairs resolved --------------------
+// three task gradients in 2D with pairwise conflicts
+let ta1 = [1.0, 0.0]
+let ta2 = [-0.5, 1.0]    // conflicts with ta1 (dot=-0.5<0)
+let ta3 = [0.3, -0.8]    // conflicts with ta2 (dot=-0.15-0.8=-0.95<0)
+let ta_tasks = [ta1, ta2, ta3]
+// before: count conflicting pairs
+let cc_before = pcg_conflict_count(ta_tasks, 3, 2)
+let ta_res = pcg_resolve_all(ta_tasks, 3, 2)
+// after: aggregate should be well-defined; check that fewer or equal conflicts
+let cc_after = pcg_conflict_count(ta_res, 3, 2)
+check("T28 resolve_all 3-task reduces conflicts", cc_after <= cc_before)
+
+// --- T29: aggregate sums resolved grads --------------------------------
+let ag_a = [1.0, 2.0, 3.0]
+let ag_b = [4.0, 5.0, 6.0]
+let ag_tasks = [ag_a, ag_b]
+let ag = pcg_aggregate(ag_tasks, 2, 3)
+check("T29 aggregate sums", approx(ag[0], 5.0, 1.0e-9) && approx(ag[1], 7.0, 1.0e-9) && approx(ag[2], 9.0, 1.0e-9))
+
+// --- T30: conflict_count ----------------------------------------------
+// two conflicting pairs in T28 example: (ta1,ta2) and (ta2,ta3)
+// (ta1,ta3) dot=0.3-0=0.3 > 0 → no conflict
+// expect count = 2
+check("T30 conflict_count = 2", pcg_conflict_count(ta_tasks, 3, 2) == 2)
+
+// --- T31: conflict_ratio ----------------------------------------------
+// 2 conflicts / 3 pairs = 0.6667
+let cr = pcg_conflict_ratio(ta_tasks, 3, 2)
+check("T31 conflict_ratio ~0.667", approx(cr, 2.0 / 3.0, 1.0e-5))
+
+// --- T32: train_step applies SGD update --------------------------------
+// params = (10,10), grads = [(1,0),(0,1)], no conflict (orthogonal)
+// resolved = same; agg=(1,1); lr=0.1 → new = (9.9, 9.9)
+let ts_p = [10.0, 10.0]
+let ts_g = [[1.0, 0.0], [0.0, 1.0]]
+let ts_new = pcg_train_step(ts_p, ts_g, 2, 2, 0.1)
+check("T32 train_step SGD update", approx(ts_new[0], 9.9, 1.0e-6) && approx(ts_new[1], 9.9, 1.0e-6))
+
+// --- T33: train_step on synthetic 2-task loss decreases total ---------
+// Loss: L1(x) = (x - 1)^2, L2(x) = (x + 1)^2
+// Optimal: x* = 0 (average). Single gradients:
+//    dL1 = 2*(x-1), dL2 = 2*(x+1)
+// At x=2: dL1=2, dL2=6 (aligned, no conflict, both positive → move left).
+// Apply one PCGrad SGD step with lr=0.1 and verify x decreases.
+let x_now = [2.0]
+let g1_s = [2.0 * (x_now[0] - 1.0)]   // = 2.0
+let g2_s = [2.0 * (x_now[0] + 1.0)]   // = 6.0
+let grads_s = [g1_s, g2_s]
+let x_next = pcg_train_step(x_now, grads_s, 2, 1, 0.1)
+// expect decrease: x_next < x_now
+check("T33 train_step decreases x on synthetic", x_next[0] < x_now[0])
+
+// --- T34: cosine_matrix symmetric, diag=1 ----------------------------
+let cm_tasks = [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]
+let cm = pcg_cosine_matrix(cm_tasks, 3, 2)
+let mut sym_ok = true
+for i in 0..3 {
+    for j in 0..3 {
+        if fabs(cm[i][j] - cm[j][i]) > 1.0e-6 { sym_ok = false }
+    }
+    if fabs(cm[i][i] - 1.0) > 1.0e-6 { sym_ok = false }
+}
+check("T34 cosine_matrix symmetric, diag=1", sym_ok)
+
+// --- T35: gradient_magnitude ------------------------------------------
+// norms: ||(3,4)||=5, ||(1,0)||=1, ||(0,2)||=2
+let gm_tasks = [[3.0, 4.0], [1.0, 0.0], [0.0, 2.0]]
+let gm = pcg_gradient_magnitude(gm_tasks, 3, 2)
+check("T35 gradient_magnitude per-task norms", approx(gm[0], 5.0, 1.0e-5) && approx(gm[1], 1.0, 1.0e-5) && approx(gm[2], 2.0, 1.0e-5))
+
+// --- T36: improvement_ratio -------------------------------------------
+// ta_tasks has cc_before=2. If resolved fully, cc_after=0 → ratio=1.0.
+// If partially, ratio in [0,1]. Sanity-check in [0,1].
+let ir = pcg_improvement_ratio(ta_tasks, ta_res, 3, 2)
+check("T36 improvement_ratio in [0,1]", (ir >= 0.0 - 1.0e-9) && (ir <= 1.0 + 1.0e-9))
+
+// --- T37: single task (n_tasks=1) → no change --------------------------
+let s_task = [[1.5, -2.5, 0.5]]
+let s_res = pcg_resolve_all(s_task, 1, 3)
+check("T37 single-task resolve = same", approx(s_res[0][0], 1.5, 1.0e-9) && approx(s_res[0][1], -2.5, 1.0e-9) && approx(s_res[0][2], 0.5, 1.0e-9))
+
+// --- T38: norm preservation for non-conflicting case -------------------
+// For orthogonal/non-conflicting tasks, resolve_all must not change norms.
+let np_a = [1.0, 0.0, 0.0]
+let np_b = [0.0, 1.0, 0.0]
+let np_c = [0.0, 0.0, 1.0]
+let np_tasks = [np_a, np_b, np_c]
+let np_res = pcg_resolve_all(np_tasks, 3, 3)
+let na0 = pcg_norm(np_a, 3)
+let na1 = pcg_norm(np_b, 3)
+let na2 = pcg_norm(np_c, 3)
+let nr0 = pcg_norm(np_res[0], 3)
+let nr1 = pcg_norm(np_res[1], 3)
+let nr2 = pcg_norm(np_res[2], 3)
+check("T38 non-conflict norm preservation", approx(na0, nr0, 1.0e-6) && approx(na1, nr1, 1.0e-6) && approx(na2, nr2, 1.0e-6))
+
+// ===================================================================
+println("")
+println("=== PCGrad test summary ===")
+println("PASS: " + str(pass_count))
+println("FAIL: " + str(fail_count))

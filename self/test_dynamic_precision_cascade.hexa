@@ -1,0 +1,264 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/test_dynamic_precision_cascade.hexa — DPC verification (#199)
+//
+//  Tests layer-wise adaptive quantization with a memory budget:
+//    - utility primitives round-trip correctly
+//    - int4 / int8 / fp16 reconstruction error orders as int4>int8>fp16
+//    - sensitivity metrics behave monotonically with weight scale
+//    - assignment policy respects zero / huge / intermediate budgets
+//    - memory accounting and savings ratio are exact
+//    - forward simulation preserves shape and fp16 is closer to fp32
+//    - 4-layer synthetic cascade produces a valid plan
+//
+//  Run: ./hexa self/test_dynamic_precision_cascade.hexa
+// ═══════════════════════════════════════════════════════════════════
+
+import "ml/dynamic_precision_cascade.hexa"
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn t_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn t_approx(a, b, eps) {
+    return t_abs(a - b) < eps
+}
+
+fn t_mse(a, b, n) {
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        let d = a[i] - b[i]
+        s = s + d * d
+        i = i + 1
+    }
+    return s / to_float(n)
+}
+
+// ── Utility primitives ──────────────────────────────────────────
+
+// T1 dpc_zeros length and value
+let z = dpc_zeros(5)
+check("T1 dpc_zeros length", len(z) == 5)
+
+let mut _all_zero = true
+for i in 0..5 { if z[i] != 0.0 { _all_zero = false } }
+check("T2 dpc_zeros all zero", _all_zero)
+
+// T3 dpc_abs positive + negative
+check("T3 dpc_abs positive", dpc_abs(3.5) == 3.5)
+check("T4 dpc_abs negative", dpc_abs(-3.5) == 3.5)
+
+// T5 dpc_max / dpc_min
+check("T5 dpc_max picks larger", dpc_max(2.0, 7.0) == 7.0)
+check("T6 dpc_min picks smaller", dpc_min(2.0, 7.0) == 2.0)
+
+// T7 dpc_sqrt
+check("T7 dpc_sqrt(9)~3", t_approx(dpc_sqrt(9.0), 3.0, 0.001))
+check("T8 dpc_sqrt(0)=0", dpc_sqrt(0.0) == 0.0)
+
+// T9 dpc_clamp
+check("T9 dpc_clamp in-range", dpc_clamp(5.0, 0.0, 10.0) == 5.0)
+check("T10 dpc_clamp low", dpc_clamp(-3.0, 0.0, 10.0) == 0.0)
+check("T11 dpc_clamp high", dpc_clamp(99.0, 0.0, 10.0) == 10.0)
+
+// T12 dpc_round_to_int
+check("T12 round 2.7->3", dpc_round_to_int(2.7) == 3)
+check("T13 round -2.7->-3", dpc_round_to_int(-2.7) == -3)
+
+// ── int4 quantize/dequantize ────────────────────────────────────
+
+let w1 = [1.0, -2.0, 3.0, -4.0, 0.5, -0.25, 7.0, -3.5]
+let n1 = 8
+let q4 = dpc_int4_quantize(w1, n1)
+check("T14 int4 bits field", q4.bits == 4)
+check("T15 int4 q length", len(q4.q) == n1)
+
+// scale = max_abs / 7 = 7/7 = 1.0 here
+check("T16 int4 scale = max_abs/7", t_approx(q4.scale, 1.0, 1.0e-6))
+
+let dq4 = dpc_int4_dequantize(q4, n1)
+check("T17 int4 dequant length", len(dq4) == n1)
+
+// round-trip MSE must be < (scale * 0.5)^2 = 0.25 (an upper bound)
+let mse4 = dpc_reconstruction_error(w1, dq4, n1)
+check("T18 int4 round-trip MSE bounded", mse4 < 0.26)
+
+// ── int8 quantize/dequantize ────────────────────────────────────
+
+let q8 = dpc_int8_quantize(w1, n1)
+check("T19 int8 bits field", q8.bits == 8)
+
+let dq8 = dpc_int8_dequantize(q8, n1)
+let mse8 = dpc_reconstruction_error(w1, dq8, n1)
+// int8 should be strictly better than int4 for non-trivial data
+check("T20 int8 better than int4", mse8 < mse4)
+
+// ── fp16 simulate ───────────────────────────────────────────────
+
+let f16 = dpc_fp16_simulate(w1, n1)
+let mse16 = dpc_reconstruction_error(w1, f16, n1)
+check("T21 fp16 better than int8", mse16 < mse8)
+
+// fp32 simulate is identity
+let f32 = dpc_fp32_simulate(w1, n1)
+let mse32 = dpc_reconstruction_error(w1, f32, n1)
+check("T22 fp32 simulate exact", mse32 == 0.0)
+
+// ── Sensitivity ─────────────────────────────────────────────────
+
+// T23 magnitude non-negative
+let mag1 = dpc_layer_sensitivity_magnitude(w1, n1)
+check("T23 magnitude non-negative", mag1 >= 0.0)
+
+// T24 magnitude scales with weight magnitude
+let w_small = [0.1, -0.2, 0.3, -0.4]
+let w_big = [10.0, -20.0, 30.0, -40.0]
+let mag_small = dpc_layer_sensitivity_magnitude(w_small, 4)
+let mag_big = dpc_layer_sensitivity_magnitude(w_big, 4)
+check("T24 magnitude scales with weight", mag_big > mag_small * 10.0 - 0.001)
+
+// T25 variance zero for uniform input
+let w_uniform = [2.0, 2.0, 2.0, 2.0]
+let var_u = dpc_layer_sensitivity_variance(w_uniform, 4)
+check("T25 variance uniform = 0", t_approx(var_u, 0.0, 1.0e-9))
+
+// T26 variance > 0 for varied input
+let w_varied = [1.0, 3.0, 5.0, 7.0]
+let var_v = dpc_layer_sensitivity_variance(w_varied, 4)
+check("T26 variance varied > 0", var_v > 0.0)
+
+// T27 hessian proxy: |w*g| sum
+let w_h = [2.0, -3.0, 4.0]
+let g_h = [0.5, 0.5, 0.5]
+let hess = dpc_layer_sensitivity_hessian_approx(w_h, g_h, 3)
+// expected = 0.5*(2 + 3 + 4) = 4.5
+check("T27 hessian proxy exact", t_approx(hess, 4.5, 1.0e-6))
+
+// T28 combined score non-negative and reflects weight size
+let score_small = dpc_score_layer(w_small, [], 4)
+let score_big = dpc_score_layer(w_big, [], 4)
+check("T28 score_big > score_small", score_big > score_small)
+
+// ── Assignment policy ───────────────────────────────────────────
+
+// 4 layers, 100 params each
+let sens = [10.0, 1.0, 5.0, 2.0]
+let params = [100, 100, 100, 100]
+
+// T29 zero budget -> all INT4
+let precs_zero = dpc_assign_precisions(sens, 0.0, 4, params)
+let mut _all_int4 = true
+for i in 0..4 { if precs_zero[i] != 0 { _all_int4 = false } }
+check("T29 zero budget all INT4", _all_int4)
+
+// T30 huge budget -> all FP32
+let precs_huge = dpc_assign_precisions(sens, 100000.0, 4, params)
+let mut _all_fp32 = true
+for i in 0..4 { if precs_huge[i] != 3 { _all_fp32 = false } }
+check("T30 huge budget all FP32", _all_fp32)
+
+// T31 intermediate budget: most sensitive layer gets highest precision
+// Budget 500: starting cost 200 (all INT4), +300 for upgrades.
+// Tier1 promotion costs 50/layer -> promote all 4 -> 400 used.
+// Tier2 promotion costs 100/layer -> promote layer 0 only -> 500 used.
+let precs_mid = dpc_assign_precisions(sens, 500.0, 4, params)
+check("T31 most sensitive highest", precs_mid[0] >= precs_mid[1])
+check("T32 most sensitive highest (vs lowest)", precs_mid[0] >= precs_mid[1])
+check("T33 sens layer0 highest prec", precs_mid[0] == 2)
+check("T34 sens layer1 lowest prec", precs_mid[1] == 1)
+
+// ── Memory accounting ───────────────────────────────────────────
+
+// T35 memory_cost exact: 0.5*100 + 1*100 + 2*100 + 4*100 = 50+100+200+400 = 750
+let mixed = [0, 1, 2, 3]
+let cost_mixed = dpc_memory_cost(mixed, params, 4)
+check("T35 memory_cost exact", t_approx(cost_mixed, 750.0, 1.0e-6))
+
+// T36 all INT4 = 200
+let all4 = [0, 0, 0, 0]
+check("T36 all INT4 cost = 200", dpc_memory_cost(all4, params, 4) == 200.0)
+
+// T37 all FP32 = 1600
+let all32 = [3, 3, 3, 3]
+check("T37 all FP32 cost = 1600", dpc_memory_cost(all32, params, 4) == 1600.0)
+
+// T38 memory_saved > 0 when downgrading some layers
+let base_all_fp16 = [2, 2, 2, 2]
+let downgrade = [0, 2, 2, 2]   // layer 0 dropped to INT4
+let saved = dpc_memory_saved(downgrade, base_all_fp16, params, 4)
+check("T38 memory_saved > 0", saved > 0.0)
+
+// T39 memory_saved equals algebraic expectation:
+// base = 2*400 = 800; new = 0.5*100+2*300 = 50+600 = 650; saved = 150/800 = 0.1875
+check("T39 memory_saved exact", t_approx(saved, 0.1875, 1.0e-6))
+
+// T40 memory_saved = 0 when precisions match
+check("T40 memory_saved zero on identity", dpc_memory_saved(base_all_fp16, base_all_fp16, params, 4) == 0.0)
+
+// ── Forward simulation ──────────────────────────────────────────
+
+let inp = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+let out_int4 = dpc_layer_forward_quantized(inp, w1, 0)
+check("T41 forward output shape", len(out_int4) == len(inp))
+
+let out_fp32 = dpc_layer_forward_quantized(inp, w1, 3)
+// fp32 should reproduce input*w exactly for this input
+let ref_mul = []
+let mut ref_ok = true
+let mut rr = 0
+while rr < n1 {
+    if out_fp32[rr] != inp[rr] * w1[rr] { ref_ok = false }
+    rr = rr + 1
+}
+check("T42 forward fp32 == input*w", ref_ok)
+
+// T43 reconstruction_error same input = 0
+check("T43 reconstruction_error identity", dpc_reconstruction_error(w1, w1, n1) == 0.0)
+
+// ── Cascade plan ────────────────────────────────────────────────
+
+// 4 synthetic layers with varying sensitivity
+let sens2 = [100.0, 10.0, 50.0, 1.0]
+let params2 = [50, 50, 50, 50]
+let plan = dpc_cascade_plan(sens2, params2, 4, 200.0)
+check("T44 plan n_layers", plan.n_layers == 4)
+check("T45 plan precisions length", len(plan.precisions) == 4)
+check("T46 plan memory_cost <= budget", plan.memory_cost <= plan.memory_budget + 1.0e-9)
+// Most sensitive layer (idx 0) should have >= precision of least (idx 3)
+check("T47 plan sens monotone", plan.precisions[0] >= plan.precisions[3])
+
+// Varied bytes_per_param check
+check("T48 bpp INT4 = 0.5", dpc_bytes_per_param(0) == 0.5)
+check("T49 bpp INT8 = 1", dpc_bytes_per_param(1) == 1.0)
+check("T50 bpp FP16 = 2", dpc_bytes_per_param(2) == 2.0)
+check("T51 bpp FP32 = 4", dpc_bytes_per_param(3) == 4.0)
+
+// T52 dpc_quantize_layer produces right metadata
+let ql = dpc_quantize_layer(w1, 1)
+check("T52 quantize_layer precision=1", ql.precision == 1)
+check("T53 quantize_layer n=8", ql.n == 8)
+check("T54 quantize_layer weights len", len(ql.weights) == 8)
+
+// T55 count_precision helper
+let mixed2 = [0, 1, 2, 2]
+check("T55 count precision 2", dpc_count_precision(mixed2, 4, 2) == 2)
+
+println("")
+println("dynamic_precision_cascade: " + to_string(pass_count) + " passed, " + to_string(fail_count) + " failed")
+if fail_count == 0 {
+    println("ALL PASS")
+}

@@ -1,0 +1,575 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/longrope.hexa — LongRoPE (#198)
+//
+//  Progressive position extension 4K → 2M tokens.
+//
+//  Implements:
+//    1. Standard RoPE frequencies           — ω_i = base^(-2i/dim)
+//    2. rotate_half trick                   — [-x1, x0] pair-swap
+//    3. cos/sin tables (via cos,sin builtins)
+//    4. Linear Position Interpolation (PI)  — position m → m/scale
+//    5. NTK-aware base adjust               — base' = base * scale^(dim/(dim-2))
+//    6. YaRN-style per-freq ramp scale      — wavelength-band blending
+//    7. LongRoPE per-freq non-uniform λ_i   — dict-based scale_factors
+//    8. Evolutionary search (stub fitness)  — mutation/selection for λ_i
+//    9. Extend pos (4K→target)              — returns freqs + scale_factors
+//   10. Dynamic NTK at runtime              — auto-adjust when seq_len > orig_max
+//
+//  API (all prefixed `lrope_`):
+//    lrope_init(dim, base, max_pos)                  → #{"freqs": [...], "dim":..., "base":..., "max_pos":...}
+//    lrope_rotate_half(x)                            → [dim] pair-swapped negated
+//    lrope_apply(q, k, pos, freqs, scale_factors)    → [q_rot, k_rot]
+//    lrope_ntk_base(base, dim, scale)                → new_base (float)
+//    lrope_yarn_scale(freq_idx, dim, beta_fast, beta_slow, scale)
+//    lrope_linear_scale_factors(n_freqs, scale)      → [scale,scale,...]
+//    lrope_evo_search(n_freqs, pop_size, n_gen)      → best [λ_i]
+//    lrope_extend_pos(orig_max, target_max, base, dim) → dict
+//    lrope_dynamic_ntk(base, dim, seq_len, orig_max) → dict
+//
+//  Data layout:
+//    freqs: [half] array of ω_i
+//    scale_factors: [half] array of λ_i (one per freq pair)
+//    dict-based results (no custom types, per HX spec)
+//
+//  AI-NATIVE attrs:
+//    @pure — no mutation of globals
+//    @hot  — called every forward step
+// ═══════════════════════════════════════════════════════════════════
+
+// ── constants ────────────────────────────────────────────────────
+let LROPE_PI = 3.141592653589793
+let LROPE_TWO_PI = 6.283185307179586
+
+// ── math helpers ─────────────────────────────────────────────────
+
+@pure
+fn lrope_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+@pure
+fn lrope_max_f(a, b) {
+    if a > b { return a }
+    return b
+}
+
+@pure
+fn lrope_min_f(a, b) {
+    if a < b { return a }
+    return b
+}
+
+@pure
+fn lrope_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+@pure
+fn lrope_ones(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [1.0] }
+    return v
+}
+
+// Trig via builtins — wrap to [-pi, pi] for numerical stability
+@pure
+fn lrope_cos(x) {
+    let mut v = x
+    // reduce to [-pi, pi] to keep builtin cos accurate for very large args
+    while v > LROPE_PI { v = v - LROPE_TWO_PI }
+    while v < 0.0 - LROPE_PI { v = v + LROPE_TWO_PI }
+    return cos(v)
+}
+
+@pure
+fn lrope_sin(x) {
+    let mut v = x
+    while v > LROPE_PI { v = v - LROPE_TWO_PI }
+    while v < 0.0 - LROPE_PI { v = v + LROPE_TWO_PI }
+    return sin(v)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  1. lrope_init — build frequency table
+//
+//    freqs[i] = 1.0 / (base^(2i/dim))   for i in 0..dim/2
+//
+//  Returns dict with:
+//    freqs   — [dim/2] base frequencies (ω_i)
+//    dim     — rotation dim
+//    base    — base constant (e.g. 10000)
+//    max_pos — original max position (for context tracking)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn lrope_init(dim, base, max_pos) {
+    let half = dim / 2
+    let mut freqs = []
+    for i in 0..half {
+        let exponent = 2.0 * to_float(i) / to_float(dim)
+        let omega = 1.0 / pow(base, exponent)
+        freqs = freqs + [omega]
+    }
+    return #{
+        "freqs": freqs,
+        "dim": dim,
+        "base": base,
+        "max_pos": max_pos
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  2. lrope_rotate_half — [x0,x1,x2,x3,...] → [-x1,x0,-x3,x2,...]
+//
+//  Standard RoPE identity:
+//    rotate_half(rotate_half(x)) = -x  for even-dim x
+//
+//  (Two successive rotations = 180° total = -x)
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn lrope_rotate_half(x) {
+    let n = len(x)
+    let mut out = lrope_zeros(n)
+    let half = n / 2
+    for i in 0..half {
+        out[2 * i] = 0.0 - x[2 * i + 1]
+        out[2 * i + 1] = x[2 * i]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  3. cos/sin tables — bounded in [-1, 1]
+//
+//  Build per-position tables:
+//    cos_tab[p][i] = cos(p * ω_i * λ_i)
+//    sin_tab[p][i] = sin(p * ω_i * λ_i)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn lrope_build_cos_sin(freqs, scale_factors, n_positions) {
+    let half = len(freqs)
+    let mut cos_tab = []
+    let mut sin_tab = []
+    for p in 0..n_positions {
+        let mut cos_row = []
+        let mut sin_row = []
+        for i in 0..half {
+            let effective = freqs[i] * scale_factors[i]
+            let angle = to_float(p) * effective
+            cos_row = cos_row + [lrope_cos(angle)]
+            sin_row = sin_row + [lrope_sin(angle)]
+        }
+        cos_tab = cos_tab + [cos_row]
+        sin_tab = sin_tab + [sin_row]
+    }
+    return #{"cos": cos_tab, "sin": sin_tab}
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  4. lrope_apply — rotate q,k by position embedding
+//
+//  For each dim-pair (2i, 2i+1):
+//    angle = pos * freqs[i] * scale_factors[i]
+//    c, s  = cos(angle), sin(angle)
+//    q'_2i   = q_2i * c - q_{2i+1} * s
+//    q'_2i+1 = q_2i * s + q_{2i+1} * c
+//    (likewise for k)
+//
+//  Identity: at pos==0 angle=0, c=1, s=0, so q'=q, k'=k.
+//
+//  Returns [q_rot, k_rot].
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn lrope_apply(q, k, pos, freqs, scale_factors) {
+    let dq = len(q)
+    let half = dq / 2
+    let mut q_out = lrope_zeros(dq)
+    let mut k_out = lrope_zeros(dq)
+    let p = to_float(pos)
+    for i in 0..half {
+        let effective = freqs[i] * scale_factors[i]
+        let angle = p * effective
+        let c = lrope_cos(angle)
+        let s = lrope_sin(angle)
+        let q0 = q[2 * i]
+        let q1 = q[2 * i + 1]
+        q_out[2 * i] = q0 * c - q1 * s
+        q_out[2 * i + 1] = q0 * s + q1 * c
+        let k0 = k[2 * i]
+        let k1 = k[2 * i + 1]
+        k_out[2 * i] = k0 * c - k1 * s
+        k_out[2 * i + 1] = k0 * s + k1 * c
+    }
+    return [q_out, k_out]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  5. lrope_ntk_base — NTK-aware base adjustment
+//
+//  Instead of scaling positions, scale the base frequency:
+//    new_base = base * scale^(dim / (dim - 2))
+//  Preserves high-frequency components better than linear PI.
+//
+//  When scale > 1, new_base > original base.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn lrope_ntk_base(base, dim, scale) {
+    if scale <= 1.0 { return base }
+    let exponent = to_float(dim) / (to_float(dim) - 2.0)
+    return base * pow(scale, exponent)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  6. lrope_yarn_scale — wavelength-based per-freq scaling
+//
+//  YaRN divides dimensions into bands by wavelength:
+//    wavelength_i = 2π / ω_i = 2π * base^(2i/dim)
+//
+//  Compare wavelength to original context (4096 default):
+//    low  = ctx / beta_fast   (high-freq boundary)
+//    high = ctx / beta_slow   (low-freq boundary)
+//
+//    if wavelength < low  → factor = 1.0            (high freq, keep)
+//    if wavelength > high → factor = 1.0 / scale    (low freq, full interp)
+//    else                 → linear ramp
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn lrope_yarn_scale(freq_idx, dim, beta_fast, beta_slow, scale) {
+    let exponent = 2.0 * to_float(freq_idx) / to_float(dim)
+    let base_val = 10000.0
+    let omega = 1.0 / pow(base_val, exponent)
+    let wavelength = LROPE_TWO_PI / omega
+
+    let ctx = 4096.0
+    let low = ctx / beta_fast
+    let high = ctx / beta_slow
+
+    if wavelength < low { return 1.0 }
+    if wavelength > high { return 1.0 / scale }
+    if high <= low { return 1.0 }
+    // linear ramp: t from 0 (at low) to 1 (at high)
+    let t = (wavelength - low) / (high - low)
+    let blend = (1.0 - t) * 1.0 + t * (1.0 / scale)
+    return blend
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  7. lrope_linear_scale_factors — uniform scaling (position interpolation)
+//
+//  Equivalent to position scaling m → m/scale by applying factor=1/scale
+//  to every frequency component.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn lrope_linear_scale_factors(n_freqs, scale) {
+    let inv = 1.0 / scale
+    let mut out = []
+    for _i in 0..n_freqs { out = out + [inv] }
+    return out
+}
+
+// YaRN per-freq scale factors built from lrope_yarn_scale
+@pure
+fn lrope_yarn_scale_factors(n_freqs, dim, beta_fast, beta_slow, scale) {
+    let mut out = []
+    for i in 0..n_freqs {
+        out = out + [lrope_yarn_scale(i, dim, beta_fast, beta_slow, scale)]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  8. lrope_evo_search — simple evolutionary search for per-freq λ_i
+//
+//  Population of candidate scale-factor vectors; each generation:
+//    - score all candidates via fitness_fn (stub)
+//    - keep top half
+//    - mutate survivors by small perturbation
+//    - refill population
+//
+//  Fitness stub: prefers moderate scaling around the wavelength-cutoff
+//  region — i.e. prefers scale factors near 1.0 at high-freq indices
+//  and near 1/target_scale at low-freq indices.
+//
+//  Returns the best factor vector found (length n_freqs).
+// ═══════════════════════════════════════════════════════════════════
+
+// simple LCG random in [0, 1)
+@pure
+fn lrope_rand(state) {
+    let a = 1664525
+    let c = 1013904223
+    let m = 4294967296
+    let next = (state * a + c) % m
+    let r = to_float(next) / 4294967296.0
+    return [r, next]
+}
+
+// initial population: uniform perturbations around 1.0
+@pure
+fn lrope_evo_init_pop(pop_size, n_freqs, seed) {
+    let mut pop = []
+    let mut st = seed
+    for _p in 0..pop_size {
+        let mut ind = []
+        for _i in 0..n_freqs {
+            let r = lrope_rand(st)
+            st = r[1]
+            // range [0.25, 1.25]
+            let val = 0.25 + r[0]
+            ind = ind + [val]
+        }
+        pop = pop + [ind]
+    }
+    return [pop, st]
+}
+
+// Stub fitness: lower is better.
+// Prefers monotonically non-increasing factors (high-freq ≈1, low-freq scaled)
+// and penalizes extremes outside [0.1, 1.1].
+// Target: smooth decreasing from ~1.0 at idx 0 to ~1/scale at idx n-1.
+@pure
+fn lrope_evo_fitness(factors, target_scale) {
+    let n = len(factors)
+    if n == 0 { return 1.0e9 }
+    let mut cost = 0.0
+    let inv = 1.0 / target_scale
+    for i in 0..n {
+        let t = to_float(i) / to_float(n - 1 + 1)  // [0, 1)
+        // ideal = lerp(1.0, inv, t)
+        let ideal = 1.0 * (1.0 - t) + inv * t
+        let diff = factors[i] - ideal
+        cost = cost + diff * diff
+        // bounds penalty
+        if factors[i] < 0.05 { cost = cost + 10.0 }
+        if factors[i] > 2.0 { cost = cost + 10.0 }
+    }
+    // monotonicity bonus (smaller if monotonic decreasing)
+    let mut mono_viol = 0.0
+    for i in 1..n {
+        let d = factors[i] - factors[i - 1]
+        if d > 0.05 { mono_viol = mono_viol + d }
+    }
+    return cost + mono_viol
+}
+
+// mutate: small gaussian-ish perturbation (uniform within ±0.1)
+@pure
+fn lrope_evo_mutate(ind, state, rate) {
+    let n = len(ind)
+    let mut out = lrope_zeros(n)
+    let mut st = state
+    for i in 0..n {
+        let r1 = lrope_rand(st)
+        st = r1[1]
+        if r1[0] < rate {
+            let r2 = lrope_rand(st)
+            st = r2[1]
+            let delta = (r2[0] - 0.5) * 0.2
+            out[i] = ind[i] + delta
+            if out[i] < 0.05 { out[i] = 0.05 }
+            if out[i] > 2.0 { out[i] = 2.0 }
+        } else {
+            out[i] = ind[i]
+        }
+    }
+    return [out, st]
+}
+
+// Evolutionary search. Returns best factors + final fitness + initial fitness.
+@pure
+fn lrope_evo_search(n_freqs, pop_size, n_gen, target_scale, seed) {
+    let init = lrope_evo_init_pop(pop_size, n_freqs, seed)
+    let mut pop = init[0]
+    let mut st = init[1]
+
+    // compute initial fitness
+    let mut best_idx = 0
+    let mut best_fit = lrope_evo_fitness(pop[0], target_scale)
+    for i in 1..pop_size {
+        let f = lrope_evo_fitness(pop[i], target_scale)
+        if f < best_fit {
+            best_fit = f
+            best_idx = i
+        }
+    }
+    let initial_best = best_fit
+    let mut best_ind = pop[best_idx]
+
+    for _g in 0..n_gen {
+        // score
+        let mut fits = []
+        for i in 0..pop_size {
+            fits = fits + [lrope_evo_fitness(pop[i], target_scale)]
+        }
+        // pick best half indices (simple selection: sort-like pass)
+        let half = pop_size / 2
+        if half < 1 { break }
+        // gather survivors: naive top-half via repeated min
+        let mut taken = lrope_zeros(pop_size)
+        let mut survivors = []
+        for _s in 0..half {
+            let mut mi = -1
+            let mut mv = 1.0e9
+            for k in 0..pop_size {
+                if taken[k] < 0.5 {
+                    if fits[k] < mv {
+                        mv = fits[k]
+                        mi = k
+                    }
+                }
+            }
+            if mi >= 0 {
+                taken[mi] = 1.0
+                survivors = survivors + [pop[mi]]
+            }
+        }
+        // track global best
+        let gen_best = survivors[0]
+        let gen_best_fit = lrope_evo_fitness(gen_best, target_scale)
+        if gen_best_fit < best_fit {
+            best_fit = gen_best_fit
+            best_ind = gen_best
+        }
+        // build next pop: survivors + mutated survivors
+        let mut new_pop = []
+        for i in 0..half {
+            new_pop = new_pop + [survivors[i]]
+        }
+        let mut remaining = pop_size - half
+        let mut idx = 0
+        while remaining > 0 {
+            let base_ind = survivors[idx % half]
+            let m = lrope_evo_mutate(base_ind, st, 0.4)
+            st = m[1]
+            new_pop = new_pop + [m[0]]
+            idx = idx + 1
+            remaining = remaining - 1
+        }
+        pop = new_pop
+    }
+
+    return #{
+        "best": best_ind,
+        "final_fitness": best_fit,
+        "initial_fitness": initial_best
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  9. lrope_extend_pos — full context extension pipeline
+//
+//  Given:
+//    orig_max   — original trained context (e.g. 4096)
+//    target_max — desired extended context (e.g. 2_000_000)
+//    base       — RoPE base (10000)
+//    dim        — rotation dim
+//
+//  Compute:
+//    scale = target_max / orig_max
+//    new_base = NTK-adjusted base
+//    freqs    = frequencies at new_base
+//    scale_factors = YaRN-style per-freq factors
+//
+//  High-frequency freqs are unchanged relative to the base table;
+//  low-frequency freqs get scaled down by ≈ 1/scale.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn lrope_extend_pos(orig_max, target_max, base, dim) {
+    let scale = to_float(target_max) / to_float(orig_max)
+    let new_base = lrope_ntk_base(base, dim, scale)
+    let state = lrope_init(dim, new_base, target_max)
+    let half = dim / 2
+    let scale_factors = lrope_yarn_scale_factors(half, dim, 32.0, 1.0, scale)
+    return #{
+        "freqs": state["freqs"],
+        "scale_factors": scale_factors,
+        "dim": dim,
+        "base": new_base,
+        "orig_base": base,
+        "orig_max": orig_max,
+        "target_max": target_max,
+        "scale": scale
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  10. lrope_dynamic_ntk — runtime NTK adjustment
+//
+//  When seq_len ≤ orig_max: base unchanged.
+//  When seq_len > orig_max: scale = seq_len / orig_max, adjust base via NTK.
+//
+//  Returns dict with freqs and effective base.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn lrope_dynamic_ntk(base, dim, seq_len, orig_max) {
+    if seq_len <= orig_max {
+        let st = lrope_init(dim, base, orig_max)
+        return #{
+            "freqs": st["freqs"],
+            "base": base,
+            "scale": 1.0,
+            "seq_len": seq_len,
+            "orig_max": orig_max
+        }
+    }
+    let scale = to_float(seq_len) / to_float(orig_max)
+    let new_base = lrope_ntk_base(base, dim, scale)
+    let st = lrope_init(dim, new_base, seq_len)
+    return #{
+        "freqs": st["freqs"],
+        "base": new_base,
+        "scale": scale,
+        "seq_len": seq_len,
+        "orig_max": orig_max
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Utility: dot product (for tests)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn lrope_dot(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    for i in 0..n {
+        s = s + a[i] * b[i]
+    }
+    return s
+}
+
+// Vector difference for comparison
+@pure
+fn lrope_vec_max_abs_diff(a, b) {
+    let n = len(a)
+    let mut m = 0.0
+    for i in 0..n {
+        let d = lrope_abs(a[i] - b[i])
+        if d > m { m = d }
+    }
+    return m
+}
+
+// Check monotonically non-increasing
+@pure
+fn lrope_is_non_increasing(v) {
+    let n = len(v)
+    for i in 1..n {
+        if v[i] > v[i - 1] + 1.0e-10 { return false }
+    }
+    return true
+}
+
+// Check all values in [lo, hi]
+@pure
+fn lrope_in_range(v, lo, hi) {
+    let n = len(v)
+    for i in 0..n {
+        if v[i] < lo { return false }
+        if v[i] > hi { return false }
+    }
+    return true
+}
+
+println("[longrope] loaded — LongRoPE (#198): init + rotate_half + apply + NTK + YaRN + linear + evo_search + extend_pos + dynamic_ntk")

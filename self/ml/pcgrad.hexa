@@ -1,0 +1,268 @@
+// ===================================================================
+//  self/ml/pcgrad.hexa — PCGrad: Projecting Conflicting Gradients (#197)
+//
+//  Paper: "Gradient Surgery for Multi-Task Learning"
+//         Yu et al. NeurIPS 2020
+//
+//  Problem: multi-task learning with shared parameters often suffers
+//  from *gradient conflict* — task gradients pointing in opposing
+//  directions (negative cosine similarity). Naively summing them
+//  creates destructive interference, degrading all tasks.
+//
+//  Solution: for each task gradient g_i, check pairwise cosine
+//  similarity against every other task gradient g_j. If cos(g_i,g_j)<0
+//  (conflict), *project* g_i onto the normal plane of g_j:
+//
+//    g_i' = g_i - (dot(g_i, g_j) / dot(g_j, g_j)) * g_j
+//
+//  This removes the component of g_i that opposes g_j, so the final
+//  aggregated gradient no longer fights itself. Iterate over all
+//  conflicting pairs (in random order per the paper).
+//
+//  Full algorithm (per training step):
+//    1. Compute per-task gradients g_1..g_T
+//    2. For each task i, iterate over all other tasks j:
+//       - if cos(g_i, g_j) < 0: project g_i onto normal plane of g_j
+//    3. Aggregate (sum) the resolved gradients
+//    4. Apply SGD update: params -= lr * aggregated_grad
+//
+//  All tensors are flat float arrays. No BLAS. Pure Hexa.
+//
+//  Pitfalls observed:
+//    - No struct-literal inside if blocks.
+//    - No semicolons, no continue, no ternary.
+//    - Arrays by-value across fn boundaries.
+//    - for i in 0..N is valid range syntax.
+//
+//  Public API:
+//    pcg_dot(a, b, n)                                     -> float
+//    pcg_norm(a, n)                                       -> float
+//    pcg_cosine(a, b, n)                                  -> float
+//    pcg_is_conflicting(g1, g2, n)                        -> bool
+//    pcg_project(g_i, g_j, n)                             -> [float]
+//    pcg_resolve_pair(g1, g2, n)                           -> [float]
+//    pcg_resolve_all(task_grads, n_tasks, dim)             -> [[float]]
+//    pcg_aggregate(resolved_grads, n_tasks, dim)           -> [float]
+//    pcg_conflict_count(task_grads, n_tasks, dim)          -> int
+//    pcg_conflict_ratio(task_grads, n_tasks, dim)          -> float
+//    pcg_train_step(params, task_grads, n_tasks, dim, lr)  -> [float]
+//    pcg_cosine_matrix(task_grads, n_tasks, dim)           -> [[float]]
+//    pcg_gradient_magnitude(task_grads, n_tasks, dim)      -> [float]
+//    pcg_improvement_ratio(orig, resolved, n_tasks, dim)   -> float
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects, deterministic
+//    @hot   — called every training step
+// ===================================================================
+
+// ── numeric helpers ─────────────────────────────────────────────
+
+fn pcg_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn pcg_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn pcg_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn pcg_copy(a, n) {
+    let mut out = pcg_zeros(n)
+    for i in 0..n { out[i] = a[i] }
+    return out
+}
+
+// ── core vector ops ─────────────────────────────────────────────
+
+// dot product of a and b (length n)
+@pure
+pub fn pcg_dot(a, b, n) {
+    let mut s = 0.0
+    for i in 0..n {
+        s = s + a[i] * b[i]
+    }
+    return s
+}
+
+// L2 norm of a (length n)
+@pure
+pub fn pcg_norm(a, n) {
+    let d = pcg_dot(a, a, n)
+    return pcg_sqrt(d)
+}
+
+// cosine similarity: dot(a,b) / (||a|| * ||b||)
+@pure
+pub fn pcg_cosine(a, b, n) {
+    let d = pcg_dot(a, b, n)
+    let na = pcg_norm(a, n)
+    let nb = pcg_norm(b, n)
+    let denom = na * nb
+    if denom < 1.0e-12 { return 0.0 }
+    return d / denom
+}
+
+// true if cos(g1, g2) < 0  (gradient conflict)
+@pure
+pub fn pcg_is_conflicting(g1, g2, n) {
+    let c = pcg_cosine(g1, g2, n)
+    return c < 0.0
+}
+
+// ── projection ──────────────────────────────────────────────────
+
+// project g_i onto the normal plane of g_j:
+//   g_i' = g_i - (dot(g_i, g_j) / dot(g_j, g_j)) * g_j
+// This removes the component of g_i that points along g_j.
+@pure @hot
+pub fn pcg_project(g_i, g_j, n) {
+    let d_ij = pcg_dot(g_i, g_j, n)
+    let d_jj = pcg_dot(g_j, g_j, n)
+    if d_jj < 1.0e-12 { return pcg_copy(g_i, n) }
+    let coeff = d_ij / d_jj
+    let mut out = pcg_zeros(n)
+    for k in 0..n {
+        out[k] = g_i[k] - coeff * g_j[k]
+    }
+    return out
+}
+
+// if g1 conflicts with g2, project g1; otherwise keep g1 unchanged
+@pure
+pub fn pcg_resolve_pair(g1, g2, n) {
+    let is_conf = pcg_is_conflicting(g1, g2, n)
+    if is_conf {
+        return pcg_project(g1, g2, n)
+    }
+    return pcg_copy(g1, n)
+}
+
+// ── PCGrad full resolution ──────────────────────────────────────
+
+// For each task i, project its gradient against all conflicting
+// other tasks. Returns resolved gradients for every task.
+// task_grads is a list of T gradient vectors, each of length dim.
+@pure @hot
+pub fn pcg_resolve_all(task_grads, n_tasks, dim) {
+    // copy all task gradients into resolved
+    let mut resolved = []
+    for i in 0..n_tasks {
+        resolved = resolved + [pcg_copy(task_grads[i], dim)]
+    }
+    // for each task, project against every other conflicting task
+    for i in 0..n_tasks {
+        let mut gi = pcg_copy(resolved[i], dim)
+        for j in 0..n_tasks {
+            if i != j {
+                let cos_val = pcg_cosine(gi, task_grads[j], dim)
+                if cos_val < 0.0 {
+                    gi = pcg_project(gi, task_grads[j], dim)
+                }
+            }
+        }
+        resolved[i] = gi
+    }
+    return resolved
+}
+
+// sum resolved gradients -> final update direction
+@pure
+pub fn pcg_aggregate(resolved_grads, n_tasks, dim) {
+    let mut agg = pcg_zeros(dim)
+    for t in 0..n_tasks {
+        for k in 0..dim {
+            agg[k] = agg[k] + resolved_grads[t][k]
+        }
+    }
+    return agg
+}
+
+// ── conflict analysis ───────────────────────────────────────────
+
+// count pairwise conflicts (unique pairs i<j with cos < 0)
+@pure
+pub fn pcg_conflict_count(task_grads, n_tasks, dim) {
+    let mut count = 0
+    for i in 0..n_tasks {
+        let j_start = i + 1
+        for j in j_start..n_tasks {
+            let c = pcg_cosine(task_grads[i], task_grads[j], dim)
+            if c < 0.0 {
+                count = count + 1
+            }
+        }
+    }
+    return count
+}
+
+// conflict ratio: conflicts / total_pairs
+@pure
+pub fn pcg_conflict_ratio(task_grads, n_tasks, dim) {
+    if n_tasks < 2 { return 0.0 }
+    let total = n_tasks * (n_tasks - 1) / 2
+    let conflicts = pcg_conflict_count(task_grads, n_tasks, dim)
+    return to_float(conflicts) / to_float(total)
+}
+
+// ── training step ───────────────────────────────────────────────
+
+// full PCGrad step: resolve -> aggregate -> SGD update
+//   params[k] -= lr * aggregated_grad[k]
+@hot
+pub fn pcg_train_step(params, task_grads, n_tasks, dim, lr) {
+    let resolved = pcg_resolve_all(task_grads, n_tasks, dim)
+    let agg = pcg_aggregate(resolved, n_tasks, dim)
+    let mut new_params = pcg_copy(params, dim)
+    for k in 0..dim {
+        new_params[k] = new_params[k] - lr * agg[k]
+    }
+    return new_params
+}
+
+// ── diagnostics ─────────────────────────────────────────────────
+
+// pairwise cosine similarity matrix (n_tasks x n_tasks)
+@pure
+pub fn pcg_cosine_matrix(task_grads, n_tasks, dim) {
+    let mut mat = []
+    for i in 0..n_tasks {
+        let mut row = pcg_zeros(n_tasks)
+        for j in 0..n_tasks {
+            row[j] = pcg_cosine(task_grads[i], task_grads[j], dim)
+        }
+        mat = mat + [row]
+    }
+    return mat
+}
+
+// per-task gradient norms
+@pure
+pub fn pcg_gradient_magnitude(task_grads, n_tasks, dim) {
+    let mut mags = pcg_zeros(n_tasks)
+    for i in 0..n_tasks {
+        mags[i] = pcg_norm(task_grads[i], dim)
+    }
+    return mags
+}
+
+// improvement ratio: how much conflict was reduced
+// compare conflict count before (original) vs after (resolved)
+@pure
+pub fn pcg_improvement_ratio(original_grads, resolved_grads, n_tasks, dim) {
+    let before = pcg_conflict_count(original_grads, n_tasks, dim)
+    if before == 0 { return 1.0 }
+    let after = pcg_conflict_count(resolved_grads, n_tasks, dim)
+    return 1.0 - to_float(after) / to_float(before)
+}

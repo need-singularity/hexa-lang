@@ -1,0 +1,536 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/steerlm.hexa — SteerLM: Attribute-Conditioned Generation (#192)
+//
+//  SteerLM enables controllable generation by conditioning on multi-
+//  dimensional reward attributes. Each attribute (helpfulness,
+//  correctness, coherence, complexity, verbosity) is scored 0-4.
+//  The model learns an attribute embedding W_attr [n_attrs x dim]
+//  that projects the target attribute vector into the hidden space,
+//  steering generation toward the desired qualities.
+//
+//  Pipeline:
+//    1) Annotator scores responses on each attribute (0-4)
+//    2) Reward model is trained to predict per-attribute scores
+//    3) During generation, user provides target attribute values
+//    4) Attribute embedding is added to hidden states
+//    5) Model generates text conditioned on target attributes
+//
+//  API:
+//    steer_create_model(vocab, dim, n_attrs)            -> model
+//    steer_encode_attributes(attrs, n_attrs)             -> [float] (0..1)
+//    steer_attribute_embedding(model, attrs)             -> [float] (dim)
+//    steer_conditioned_logits(model, hidden, attrs, vocab, dim) -> [float]
+//    steer_reward_model(model, response, attrs, n_tokens, dim)  -> [float]
+//    steer_regression_loss(predicted, target, n_attrs)   -> float
+//    steer_train_reward_step(model, responses, labels, n, dim, lr) -> float
+//    steer_generate(model, prompt_hidden, attrs, max_tokens, vocab, dim) -> [int]
+//    steer_default_attrs()                              -> [int]
+//    steer_safety_attrs()                               -> [int]
+//    steer_creative_attrs()                             -> [int]
+//    steer_attr_names()                                 -> [str]
+//    steer_score_response(model, response, n_tokens, dim) -> [float]
+//    steer_preference_pair(model, resp_a, resp_b, n_a, n_b, dim) -> int
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+//    @hot   — called every training/generation step
+// ═══════════════════════════════════════════════════════════════════
+
+// ── numeric helpers (self-contained to avoid module coupling) ────
+
+@pure
+fn steer_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+@pure
+fn steer_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+@pure
+fn steer_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+@pure
+fn steer_log(x) {
+    if x <= 0.0 { return -30.0 }
+    let mut v = x
+    let mut count = 0
+    while v > 2.0 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    let d = v - 1.0
+    let ln_v = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_v
+}
+
+// ── array constructors ──────────────────────────────────────────
+
+fn steer_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn steer_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+// deterministic hash PRNG
+fn steer_hash(seed, i) {
+    let h = ((seed * 2654435761 + i * 1315423911 + 731) % 10007)
+    if h < 0 { return 0 - h }
+    return h
+}
+
+fn steer_hash_float(seed, i) {
+    let h = steer_hash(seed, i)
+    return to_float(h % 1000) / 1000.0
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Constants — 5 default attributes, each scored 0-4
+// ═══════════════════════════════════════════════════════════════════
+let STEER_N_ATTRS      = 5
+let STEER_MAX_SCORE    = 4
+let STEER_ATTR_HELP    = 0
+let STEER_ATTR_CORRECT = 1
+let STEER_ATTR_COHERE  = 2
+let STEER_ATTR_COMPLEX = 3
+let STEER_ATTR_VERBOSE = 4
+
+// ═══════════════════════════════════════════════════════════════════
+//  steer_attr_names — human-readable attribute names
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn steer_attr_names() {
+    return ["helpfulness", "correctness", "coherence", "complexity", "verbosity"]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  steer_default_attrs — balanced high-quality generation
+//  helpfulness=4, correctness=4, coherence=4, complexity=2, verbosity=2
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn steer_default_attrs() {
+    return [4, 4, 4, 2, 2]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  steer_safety_attrs — safe, concise output
+//  helpfulness=4, correctness=4, coherence=4, complexity=1, verbosity=1
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn steer_safety_attrs() {
+    return [4, 4, 4, 1, 1]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  steer_creative_attrs — creative, detailed output
+//  helpfulness=3, correctness=3, coherence=3, complexity=4, verbosity=3
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn steer_creative_attrs() {
+    return [3, 3, 3, 4, 3]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  steer_encode_attributes — normalize attribute scores to [0, 1]
+//
+//  attrs:   raw integer scores (0..STEER_MAX_SCORE)
+//  n_attrs: number of attributes
+//
+//  Returns: float array with each value in [0.0, 1.0]
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn steer_encode_attributes(attrs, n_attrs) {
+    let mut encoded = steer_zeros(n_attrs)
+    for i in 0..n_attrs {
+        let mut val = to_float(attrs[i]) / to_float(STEER_MAX_SCORE)
+        if val < 0.0 { val = 0.0 }
+        if val > 1.0 { val = 1.0 }
+        encoded[i] = val
+    }
+    return encoded
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  steer_create_model — initialize model with attribute projection
+//
+//  Returns dict with:
+//    w_attr:  [n_attrs x dim] attribute embedding weights (flat)
+//    w_proj:  [dim x vocab]   output projection (flat)
+//    w_score: [dim x n_attrs] reward scoring head (flat)
+//    vocab, dim, n_attrs: dimensions
+//
+//  Weights are initialized with deterministic pseudo-random values
+//  in range [-0.1, 0.1] for stable initial behavior.
+// ═══════════════════════════════════════════════════════════════════
+fn steer_create_model(vocab, dim, n_attrs) {
+    let attr_size = n_attrs * dim
+    let proj_size = dim * vocab
+    let score_size = dim * n_attrs
+
+    // W_attr: [n_attrs x dim] — maps attribute vector to hidden dim
+    let mut w_attr = steer_zeros(attr_size)
+    for i in 0..attr_size {
+        w_attr[i] = (steer_hash_float(42, i) - 0.5) * 0.2
+    }
+
+    // W_proj: [dim x vocab] — maps hidden to logits
+    let mut w_proj = steer_zeros(proj_size)
+    for i in 0..proj_size {
+        w_proj[i] = (steer_hash_float(137, i) - 0.5) * 0.2
+    }
+
+    // W_score: [dim x n_attrs] — reward model scoring head
+    let mut w_score = steer_zeros(score_size)
+    for i in 0..score_size {
+        w_score[i] = (steer_hash_float(271, i) - 0.5) * 0.2
+    }
+
+    return {
+        "w_attr": w_attr,
+        "w_proj": w_proj,
+        "w_score": w_score,
+        "vocab": vocab,
+        "dim": dim,
+        "n_attrs": n_attrs
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  steer_attribute_embedding — project attribute vector into hidden space
+//
+//  Computes: attr_embed[j] = sum_i(W_attr[i, j] * encoded_attrs[i])
+//  where W_attr is [n_attrs x dim] and encoded_attrs is [n_attrs]
+//
+//  Returns: [dim] attribute embedding vector
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn steer_attribute_embedding(model, attrs) {
+    let n_attrs = model["n_attrs"]
+    let dim = model["dim"]
+    let w_attr = model["w_attr"]
+    let encoded = steer_encode_attributes(attrs, n_attrs)
+
+    let mut embed = steer_zeros(dim)
+    for j in 0..dim {
+        let mut sum = 0.0
+        for i in 0..n_attrs {
+            // W_attr layout: [i * dim + j] for attr i, dim j
+            sum = sum + w_attr[i * dim + j] * encoded[i]
+        }
+        embed[j] = sum
+    }
+    return embed
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  steer_conditioned_logits — compute logits conditioned on attributes
+//
+//  hidden:  [dim] hidden state from transformer
+//  attrs:   [n_attrs] target attribute scores
+//
+//  Process:
+//    1) attr_embed = steer_attribute_embedding(model, attrs)
+//    2) conditioned = hidden + attr_embed  (additive steering)
+//    3) logits[v] = sum_j(W_proj[j, v] * conditioned[j])
+//
+//  Returns: [vocab] logits
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn steer_conditioned_logits(model, hidden, attrs, vocab, dim) {
+    let w_proj = model["w_proj"]
+    let attr_embed = steer_attribute_embedding(model, attrs)
+
+    // conditioned = hidden + attr_embed
+    let mut conditioned = steer_zeros(dim)
+    for j in 0..dim {
+        conditioned[j] = hidden[j] + attr_embed[j]
+    }
+
+    // logits = W_proj^T * conditioned
+    let mut logits = steer_zeros(vocab)
+    for v in 0..vocab {
+        let mut sum = 0.0
+        for j in 0..dim {
+            // W_proj layout: [j * vocab + v]
+            sum = sum + w_proj[j * vocab + v] * conditioned[j]
+        }
+        logits[v] = sum
+    }
+    return logits
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  steer_softmax — numerically stable softmax
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn steer_softmax(logits) {
+    let n = len(logits)
+    let mut mx = logits[0]
+    for i in 1..n {
+        if logits[i] > mx { mx = logits[i] }
+    }
+    let mut exps = steer_zeros(n)
+    let mut z = 0.0
+    for i in 0..n {
+        exps[i] = steer_exp(logits[i] - mx)
+        z = z + exps[i]
+    }
+    let mut out = steer_zeros(n)
+    for i in 0..n {
+        out[i] = exps[i] / z
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  steer_argmax — greedy token selection
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn steer_argmax(logits) {
+    let n = len(logits)
+    let mut best = 0
+    let mut best_v = logits[0]
+    for i in 1..n {
+        if logits[i] > best_v {
+            best_v = logits[i]
+            best = i
+        }
+    }
+    return best
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  steer_reward_model — predict per-attribute scores for a response
+//
+//  Takes response hidden states, averages them, and projects through
+//  W_score to predict attribute scores.
+//
+//  response: [n_tokens x dim] flat hidden states
+//  attrs:    unused (target attrs for alignment, kept for API compat)
+//
+//  Returns: [n_attrs] predicted attribute scores (raw, not clamped)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn steer_reward_model(model, response, attrs, n_tokens, dim) {
+    let n_attrs = model["n_attrs"]
+    let w_score = model["w_score"]
+
+    // mean-pool response hidden states
+    let mut pooled = steer_zeros(dim)
+    for t in 0..n_tokens {
+        for j in 0..dim {
+            pooled[j] = pooled[j] + response[t * dim + j]
+        }
+    }
+    if n_tokens > 0 {
+        let inv_n = 1.0 / to_float(n_tokens)
+        for j in 0..dim {
+            pooled[j] = pooled[j] * inv_n
+        }
+    }
+
+    // project: scores[a] = sum_j(W_score[j * n_attrs + a] * pooled[j])
+    let mut scores = steer_zeros(n_attrs)
+    for a in 0..n_attrs {
+        let mut sum = 0.0
+        for j in 0..dim {
+            sum = sum + w_score[j * n_attrs + a] * pooled[j]
+        }
+        scores[a] = sum
+    }
+    return scores
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  steer_regression_loss — MSE loss per attribute
+//
+//  predicted: [n_attrs] predicted scores
+//  target:    [n_attrs] ground truth scores (normalized to [0,1])
+//
+//  Returns: scalar MSE averaged over attributes
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn steer_regression_loss(predicted, target, n_attrs) {
+    let mut mse = 0.0
+    for i in 0..n_attrs {
+        let diff = predicted[i] - target[i]
+        mse = mse + diff * diff
+    }
+    return mse / to_float(n_attrs)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  steer_train_reward_step — one gradient step on the reward model
+//
+//  Trains W_score to predict attribute labels from response hidden
+//  states via MSE loss with finite-difference gradient.
+//
+//  responses: list of [n_tokens * dim] flat hidden state arrays
+//  labels:    list of [n_attrs] target attribute scores (normalized)
+//  n:         number of examples (batch size)
+//  dim:       hidden dimension
+//  lr:        learning rate
+//
+//  Returns: average loss over the batch
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn steer_train_reward_step(model, responses, labels, n, dim, lr) {
+    let n_attrs = model["n_attrs"]
+    let w_score = model["w_score"]
+    let score_size = dim * n_attrs
+
+    // forward: compute avg loss
+    let mut total_loss = 0.0
+    for b in 0..n {
+        let resp = responses[b]
+        let lab = labels[b]
+        let n_tok = len(resp) / dim
+        let pred = steer_reward_model(model, resp, lab, n_tok, dim)
+        let encoded_lab = steer_encode_attributes(lab, n_attrs)
+        let loss = steer_regression_loss(pred, encoded_lab, n_attrs)
+        total_loss = total_loss + loss
+    }
+    let avg_loss = total_loss / to_float(n)
+
+    // finite-difference gradient on W_score
+    let eps = 0.001
+    let mut grad = steer_zeros(score_size)
+    for p in 0..score_size {
+        let orig = w_score[p]
+        w_score[p] = orig + eps
+        let mut loss_plus = 0.0
+        for b in 0..n {
+            let resp = responses[b]
+            let lab = labels[b]
+            let n_tok = len(resp) / dim
+            let pred = steer_reward_model(model, resp, lab, n_tok, dim)
+            let encoded_lab = steer_encode_attributes(lab, n_attrs)
+            loss_plus = loss_plus + steer_regression_loss(pred, encoded_lab, n_attrs)
+        }
+        w_score[p] = orig
+        grad[p] = (loss_plus / to_float(n) - avg_loss) / eps
+    }
+
+    // SGD update
+    for p in 0..score_size {
+        w_score[p] = w_score[p] - lr * grad[p]
+    }
+
+    return avg_loss
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  steer_generate — generate tokens conditioned on target attributes
+//
+//  prompt_hidden: [dim] initial hidden state (from prompt encoding)
+//  attrs:         [n_attrs] target attribute scores (0-4)
+//  max_tokens:    number of tokens to generate
+//  vocab, dim:    vocabulary size and hidden dimension
+//
+//  Uses greedy decoding: at each step, compute conditioned logits
+//  and pick argmax. The hidden state is updated by adding a scaled
+//  embedding of the chosen token (simplified recurrence).
+//
+//  Returns: [max_tokens] generated token ids
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn steer_generate(model, prompt_hidden, attrs, max_tokens, vocab, dim) {
+    let mut tokens = steer_zeros_int(max_tokens)
+    let mut hidden = steer_zeros(dim)
+    for j in 0..dim {
+        hidden[j] = prompt_hidden[j]
+    }
+
+    for t in 0..max_tokens {
+        let logits = steer_conditioned_logits(model, hidden, attrs, vocab, dim)
+        let tok = steer_argmax(logits)
+        tokens[t] = tok
+
+        // simplified recurrence: perturb hidden by token embedding
+        for j in 0..dim {
+            let w_val = model["w_proj"][j * vocab + tok]
+            hidden[j] = hidden[j] * 0.9 + w_val * 0.1
+        }
+    }
+    return tokens
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  steer_score_response — score an existing response on all attributes
+//
+//  Runs the reward model on the given response hidden states and
+//  clamps outputs to [0, 4] (original attribute scale).
+//
+//  response:  [n_tokens * dim] flat hidden states
+//  n_tokens:  number of tokens
+//  dim:       hidden dimension
+//
+//  Returns: [n_attrs] predicted scores in [0, 4]
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn steer_score_response(model, response, n_tokens, dim) {
+    let n_attrs = model["n_attrs"]
+    let raw = steer_reward_model(model, response, [], n_tokens, dim)
+    let mut scores = steer_zeros(n_attrs)
+    for i in 0..n_attrs {
+        // raw is in normalized space, scale back to [0, 4]
+        let mut s = raw[i] * to_float(STEER_MAX_SCORE)
+        if s < 0.0 { s = 0.0 }
+        if s > to_float(STEER_MAX_SCORE) { s = to_float(STEER_MAX_SCORE) }
+        scores[i] = s
+    }
+    return scores
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  steer_preference_pair — compare two responses
+//
+//  Scores both responses and computes total attribute sum.
+//  Returns: 0 if resp_a is better/equal, 1 if resp_b is better
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn steer_preference_pair(model, resp_a, resp_b, n_a, n_b, dim) {
+    let n_attrs = model["n_attrs"]
+    let scores_a = steer_score_response(model, resp_a, n_a, dim)
+    let scores_b = steer_score_response(model, resp_b, n_b, dim)
+
+    let mut sum_a = 0.0
+    let mut sum_b = 0.0
+    for i in 0..n_attrs {
+        sum_a = sum_a + scores_a[i]
+        sum_b = sum_b + scores_b[i]
+    }
+
+    if sum_b > sum_a { return 1 }
+    return 0
+}

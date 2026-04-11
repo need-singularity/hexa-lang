@@ -1,0 +1,287 @@
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/lars_lamb.hexa — LARS / LAMB Layer-wise Adaptive Optimizers
+//
+//  LARS (Layer-wise Adaptive Rate Scaling):
+//    You et al., "Large Batch Training of Convolutional Networks" (2017)
+//    Scales learning rate per-layer by the ratio of weight norm to
+//    gradient norm, enabling stable SGD training with batch sizes up
+//    to 32K without divergence.
+//
+//    local_lr = lr * trust_coeff * ||w|| / (||g + wd*w|| + eps)
+//    momentum_buf = mu * momentum_buf + local_lr * (grad + wd * w)
+//    param -= momentum_buf
+//
+//  LAMB (Layer-wise Adaptive Moments for Batch training):
+//    You et al., "Large Batch Optimization for Deep Learning" (2019)
+//    Extends Adam with per-layer trust ratio, enabling stable
+//    training at batch sizes up to 64K for BERT-scale models.
+//
+//    m = beta1*m + (1-beta1)*g
+//    v = beta2*v + (1-beta2)*g^2
+//    m_hat = m / (1-beta1^t), v_hat = v / (1-beta2^t)
+//    update = m_hat / (sqrt(v_hat) + eps) + wd * param
+//    trust = ||param|| / (||update|| + eps)
+//    param -= lr * trust * update
+//
+//  API (all pure, no BLAS / no external deps):
+//    lars_trust_ratio(w_norm, g_norm, eps)           -> float
+//    lars_step(params, grads, lr, momentum_buf,
+//              weight_decay, trust_coeff, eps, n)     -> [params, mbuf]
+//    lamb_step(params, grads, m, v, t, lr,
+//              beta1, beta2, eps, weight_decay, n)    -> [params, m, v]
+//    lars_create_state(n)                             -> [mbuf, t]
+//    lamb_create_state(n)                             -> [m, v, t]
+//    lars_norm(params, n)                             -> float
+//    lamb_norm(params, n)                             -> float
+//    lars_multi_layer_step(layers_params, layers_grads,
+//                          states, lr, wd, n_layers)  -> [params, states]
+//    lamb_multi_layer_step(layers_params, layers_grads,
+//                          states, lr, b1, b2,
+//                          wd, n_layers)               -> [params, states]
+//    lars_effective_lr(lr, trust_ratio)               -> float
+//    lamb_effective_lr(lr, param_norm, update_norm)    -> float
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects, deterministic
+//    @hot   — called every training step on every layer
+// ═══════════════════════════════════════════════════════════════
+
+let LARS_DEFAULT_EPS   = 1.0e-8
+let LARS_DEFAULT_MU    = 0.9
+let LARS_DEFAULT_TC    = 0.001
+let LAMB_DEFAULT_BETA1 = 0.9
+let LAMB_DEFAULT_BETA2 = 0.999
+
+// ── numeric helpers (prefixed, self-contained) ──────────────
+
+fn ll_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn ll_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn ll_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 { g = (g + x / g) / 2.0 }
+    return g
+}
+
+fn ll_pow(base, exp) {
+    if exp == 0 { return 1.0 }
+    let mut result = 1.0
+    for _i in 0..exp { result = result * base }
+    return result
+}
+
+// ── L2 norm ─────────────────────────────────────────────────
+
+@pure
+fn lars_norm(params, n) {
+    let mut s = 0.0
+    for i in 0..n { s = s + params[i] * params[i] }
+    return ll_sqrt(s)
+}
+
+@pure
+fn lamb_norm(params, n) {
+    let mut s = 0.0
+    for i in 0..n { s = s + params[i] * params[i] }
+    return ll_sqrt(s)
+}
+
+// ── LARS trust ratio ────────────────────────────────────────
+//  phi = ||w|| / (||g|| + eps)
+//  Clipped by trust_coeff in lars_step; raw ratio here.
+
+@pure
+fn lars_trust_ratio(w_norm, g_norm, eps) {
+    if w_norm <= 0.0 { return 0.0 }
+    return w_norm / (g_norm + eps)
+}
+
+// ── LARS effective LR ───────────────────────────────────────
+
+@pure
+fn lars_effective_lr(lr, trust_ratio) {
+    return lr * trust_ratio
+}
+
+// ── LAMB effective LR ───────────────────────────────────────
+
+@pure
+fn lamb_effective_lr(lr, param_norm, update_norm) {
+    if param_norm <= 0.0 { return lr }
+    if update_norm <= 0.0 { return lr }
+    return lr * param_norm / (update_norm + 1.0e-8)
+}
+
+// ── state constructors ──────────────────────────────────────
+
+fn lars_create_state(n) {
+    let mbuf = ll_zeros(n)
+    return [mbuf, 0]
+}
+
+fn lamb_create_state(n) {
+    let m = ll_zeros(n)
+    let v = ll_zeros(n)
+    return [m, v, 0]
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  LARS SGD with momentum (per-layer)
+//
+//  g_i       = grad_i + weight_decay * param_i
+//  w_norm    = ||param||
+//  g_norm    = ||g||
+//  trust     = trust_coeff * w_norm / (g_norm + eps)
+//  local_lr  = lr * trust
+//  mbuf_i    = mu * mbuf_i + local_lr * g_i
+//  param_i  -= mbuf_i
+// ═══════════════════════════════════════════════════════════════
+
+@hot
+fn lars_step(params, grads, lr, momentum_buf, weight_decay, trust_coeff, eps, n) {
+    // compute regularized gradient g = grad + wd * param
+    let mut g = ll_zeros(n)
+    for i in 0..n {
+        g[i] = grads[i] + weight_decay * params[i]
+    }
+
+    // norms
+    let w_norm = lars_norm(params, n)
+    let g_norm = lars_norm(g, n)
+
+    // trust ratio with coefficient
+    let mut trust = 1.0
+    if w_norm > 0.0 {
+        if g_norm > 0.0 {
+            trust = trust_coeff * lars_trust_ratio(w_norm, g_norm, eps)
+        }
+    }
+    let local_lr = lr * trust
+
+    // momentum update
+    let mu = LARS_DEFAULT_MU
+    let mut new_mbuf = ll_zeros(n)
+    let mut new_params = ll_zeros(n)
+    for i in 0..n {
+        new_mbuf[i] = mu * momentum_buf[i] + local_lr * g[i]
+        new_params[i] = params[i] - new_mbuf[i]
+    }
+
+    return [new_params, new_mbuf]
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  LAMB Adam (per-layer)
+//
+//  m_i     = beta1 * m_i + (1-beta1) * g_i
+//  v_i     = beta2 * v_i + (1-beta2) * g_i^2
+//  m_hat_i = m_i / (1 - beta1^t)
+//  v_hat_i = v_i / (1 - beta2^t)
+//  update_i = m_hat_i / (sqrt(v_hat_i) + eps) + wd * param_i
+//  trust    = ||param|| / (||update|| + eps)
+//  param_i -= lr * trust * update_i
+// ═══════════════════════════════════════════════════════════════
+
+@hot
+fn lamb_step(params, grads, m, v, t, lr, beta1, beta2, eps, weight_decay, n) {
+    let step = t + 1
+
+    // bias correction denominators
+    let bc1 = 1.0 - ll_pow(beta1, step)
+    let bc2 = 1.0 - ll_pow(beta2, step)
+
+    // first and second moment update
+    let mut new_m = ll_zeros(n)
+    let mut new_v = ll_zeros(n)
+    for i in 0..n {
+        new_m[i] = beta1 * m[i] + (1.0 - beta1) * grads[i]
+        new_v[i] = beta2 * v[i] + (1.0 - beta2) * grads[i] * grads[i]
+    }
+
+    // bias-corrected update + weight decay
+    let mut update = ll_zeros(n)
+    for i in 0..n {
+        let m_hat = new_m[i] / bc1
+        let v_hat = new_v[i] / bc2
+        update[i] = m_hat / (ll_sqrt(v_hat) + eps) + weight_decay * params[i]
+    }
+
+    // layer-wise trust ratio
+    let p_norm = lamb_norm(params, n)
+    let u_norm = lamb_norm(update, n)
+    let mut trust = 1.0
+    if p_norm > 0.0 {
+        if u_norm > 0.0 {
+            trust = p_norm / (u_norm + eps)
+        }
+    }
+
+    // param update
+    let mut new_params = ll_zeros(n)
+    for i in 0..n {
+        new_params[i] = params[i] - lr * trust * update[i]
+    }
+
+    return [new_params, new_m, new_v]
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Multi-layer wrappers
+//  layers_params / layers_grads: array of arrays (one per layer)
+//  states: array of [mbuf, t] for LARS, [m, v, t] for LAMB
+// ═══════════════════════════════════════════════════════════════
+
+// NOTE: caller-scope locals are named `out_params`/`out_states` (not
+// `new_params`/`new_states`) to dodge a known @hot codegen bug where
+// caller and callee mut variables with the same name share a slot —
+// see feedback_hot_attr_dict_mutation memory and the lars_step callee
+// which uses `new_params` internally.
+fn lars_multi_layer_step(layers_params, layers_grads, states, lr, wd, n_layers) {
+    let mut out_params = []
+    let mut out_states = []
+    for l in 0..n_layers {
+        let p = layers_params[l]
+        let g = layers_grads[l]
+        let st = states[l]
+        let mbuf = st[0]
+        let n = len(p)
+        let result = lars_step(p, g, lr, mbuf, wd, LARS_DEFAULT_TC, LARS_DEFAULT_EPS, n)
+        let updated_p = result[0]
+        let updated_mb = result[1]
+        out_params = out_params + [updated_p]
+        let new_t = st[1] + 1
+        out_states = out_states + [[updated_mb, new_t]]
+    }
+    return [out_params, out_states]
+}
+
+fn lamb_multi_layer_step(layers_params, layers_grads, states, lr, beta1, beta2, wd, n_layers) {
+    let mut out_params = []
+    let mut out_states = []
+    for l in 0..n_layers {
+        let p = layers_params[l]
+        let g = layers_grads[l]
+        let st = states[l]
+        let m_buf = st[0]
+        let v_buf = st[1]
+        let t_val = st[2]
+        let n = len(p)
+        let result = lamb_step(p, g, m_buf, v_buf, t_val, lr, beta1, beta2, LARS_DEFAULT_EPS, wd, n)
+        let updated_p = result[0]
+        let updated_m = result[1]
+        let updated_v = result[2]
+        out_params = out_params + [updated_p]
+        out_states = out_states + [[updated_m, updated_v, t_val + 1]]
+    }
+    return [out_params, out_states]
+}
