@@ -21,3 +21,16 @@
 | 로드맵 | `shared/roadmaps/anima_hexa_common.json` | anima x hexa P0~P5 |
 | 문법 | `shared/hexa-lang/grammar.jsonl` | 전체 문법 + pitfalls |
 | AI-native | `docs/ai-native.md` | 24종 벡터 로드맵 |
+| ML 로드맵 | `shared/hexa-lang/ml-next-level.json` | 15+N 다음 레벨 |
+
+## ml 명령어
+
+사용자가 `ml`, `ml go`, `ml next`, `ml 5`, `ml done 1`, `ml add ...`, `ml sync` 입력 시 `.claude/commands/ml.md` 의 절차를 따른다.
+
+- `ml` → 전체 목록 ASCII 표
+- `ml go` → todo/partial **전부** 병렬 bg Agent 발사 (확인 없이)
+- `ml next` → 최우선 항목 계획 → 확인 → 구현
+- `ml 숫자` → 해당 id 항목 구현
+- `ml done 숫자` → 완료 마킹 + JSON 갱신
+- `ml add 이름 | 설명 | 영향` → 새 항목 추가
+- `ml sync` → roadmap.md + README.md 동기화
