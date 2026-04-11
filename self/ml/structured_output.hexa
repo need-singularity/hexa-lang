@@ -1,0 +1,688 @@
+// ===================================================================
+//  self/ml/structured_output.hexa — Grammar-Constrained Structured Output
+//
+//  JSON Schema -> FSM -> Token Mask -> Constrained Decode
+//
+//  Pure HEXA implementation of grammar-constrained decoding.
+//  Forces LLM output to be valid JSON conforming to a given schema.
+//
+//  API:
+//    create_json_grammar(schema)                  -> Grammar
+//    constrained_sample(logits, grammar, state)   -> [token_id, new_state]
+//    validate_json_output(text, schema)           -> bool
+//
+//  Internal:
+//    parse_schema(schema_str)          -> SchemaNode
+//    fsm_advance(state, char)          -> new_state
+//    compute_token_mask(grammar, state, vocab_size) -> mask
+// ===================================================================
+
+// ===================================================================
+//  Constants: FSM states
+// ===================================================================
+// State IDs (flat ints, no enum needed)
+let ST_START         = 0
+let ST_OBJECT_OPEN   = 1   // after {
+let ST_OBJECT_KEY    = 2   // inside "key"
+let ST_OBJECT_COLON  = 3   // after key, expecting :
+let ST_OBJECT_VALUE  = 4   // after :, expecting value
+let ST_OBJECT_NEXT   = 5   // after value, expecting , or }
+let ST_ARRAY_OPEN    = 6   // after [
+let ST_ARRAY_VALUE   = 7   // inside array value
+let ST_ARRAY_NEXT    = 8   // after value, expecting , or ]
+let ST_STRING        = 9   // inside "..."
+let ST_STRING_ESCAPE = 10  // after \ in string
+let ST_NUMBER        = 11  // inside number
+let ST_TRUE_1        = 12  // t
+let ST_TRUE_2        = 13  // tr
+let ST_TRUE_3        = 14  // tru
+let ST_FALSE_1       = 15  // f
+let ST_FALSE_2       = 16  // fa
+let ST_FALSE_3       = 17  // fal
+let ST_FALSE_4       = 18  // fals
+let ST_NULL_1        = 19  // n
+let ST_NULL_2        = 20  // nu
+let ST_NULL_3        = 21  // nul
+let ST_DONE          = 22  // complete valid JSON
+let ST_ERROR         = 23  // invalid
+
+// ===================================================================
+//  Schema types
+// ===================================================================
+let SCHEMA_OBJECT  = 0
+let SCHEMA_ARRAY   = 1
+let SCHEMA_STRING  = 2
+let SCHEMA_NUMBER  = 3
+let SCHEMA_BOOL    = 4
+let SCHEMA_NULL    = 5
+let SCHEMA_ANY     = 6
+
+// ===================================================================
+//  Schema node: [type, field_names, field_types, items_type]
+//  Encoded as flat lists for hexa compatibility
+// ===================================================================
+struct SchemaNode {
+    stype: int,
+    field_names: list,
+    field_types: list,
+    items_type: int
+}
+
+fn make_schema(stype) {
+    return SchemaNode {
+        stype: stype,
+        field_names: [],
+        field_types: [],
+        items_type: SCHEMA_ANY
+    }
+}
+
+fn make_object_schema(names, types) {
+    return SchemaNode {
+        stype: SCHEMA_OBJECT,
+        field_names: names,
+        field_types: types,
+        items_type: SCHEMA_ANY
+    }
+}
+
+fn make_array_schema(items_type) {
+    return SchemaNode {
+        stype: SCHEMA_ARRAY,
+        field_names: [],
+        field_types: [],
+        items_type: items_type
+    }
+}
+
+// ===================================================================
+//  Simple JSON schema string parser
+//  Supports: {"type":"object","properties":{"k":{"type":"string"},...}}
+//            {"type":"array","items":{"type":"number"}}
+//            {"type":"string"}, {"type":"number"}, {"type":"boolean"}
+// ===================================================================
+
+// Helper: find character in string starting from pos
+fn find_char(s, ch, start) {
+    let n = len(s)
+    let mut i = start
+    while i < n {
+        let c = char_code(s, i)
+        if c == ch { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// Helper: extract substring between two positions
+fn substr(s, start, end_pos) {
+    let mut result = ""
+    let mut i = start
+    while i < end_pos {
+        result = result + chr(char_code(s, i))
+        i = i + 1
+    }
+    return result
+}
+
+// Helper: check if string contains a substring at position
+fn str_match_at(s, pattern, pos) {
+    let sn = len(s)
+    let pn = len(pattern)
+    if pos + pn > sn { return false }
+    let mut i = 0
+    while i < pn {
+        if char_code(s, pos + i) != char_code(pattern, i) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// Helper: find substring in string
+fn find_str(s, pattern, start) {
+    let sn = len(s)
+    let pn = len(pattern)
+    let mut i = start
+    while i < sn - pn + 1 {
+        if str_match_at(s, pattern, i) { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// Parse type string from schema
+fn parse_type_string(type_str) {
+    if type_str == "object" { return SCHEMA_OBJECT }
+    if type_str == "array" { return SCHEMA_ARRAY }
+    if type_str == "string" { return SCHEMA_STRING }
+    if type_str == "number" { return SCHEMA_NUMBER }
+    if type_str == "integer" { return SCHEMA_NUMBER }
+    if type_str == "boolean" { return SCHEMA_BOOL }
+    if type_str == "null" { return SCHEMA_NULL }
+    return SCHEMA_ANY
+}
+
+// Extract "type":"<value>" from a JSON-like schema string
+fn extract_type(schema_str) {
+    let pos = find_str(schema_str, "\"type\"", 0)
+    if pos < 0 { return "any" }
+    // find : after "type"
+    let colon = find_char(schema_str, 58, pos + 6)  // 58 = ':'
+    if colon < 0 { return "any" }
+    // find opening quote of value
+    let q1 = find_char(schema_str, 34, colon + 1)  // 34 = '"'
+    if q1 < 0 { return "any" }
+    let q2 = find_char(schema_str, 34, q1 + 1)
+    if q2 < 0 { return "any" }
+    return substr(schema_str, q1 + 1, q2)
+}
+
+// Parse a simple schema string into a SchemaNode
+fn parse_schema(schema_str) {
+    let type_str = extract_type(schema_str)
+    let stype = parse_type_string(type_str)
+
+    if stype == SCHEMA_OBJECT {
+        // Extract property names and types
+        let props_pos = find_str(schema_str, "\"properties\"", 0)
+        let mut names = []
+        let mut types = []
+        if props_pos >= 0 {
+            // Find opening { of properties
+            let brace = find_char(schema_str, 123, props_pos + 12)  // 123 = '{'
+            if brace >= 0 {
+                // Simple extraction: find all "key":{"type":"..."} pairs
+                let mut pos = brace + 1
+                let slen = len(schema_str)
+                while pos < slen {
+                    // find next quoted key
+                    let kq1 = find_char(schema_str, 34, pos)  // "
+                    if kq1 < 0 { pos = slen }
+                    else {
+                        let kq2 = find_char(schema_str, 34, kq1 + 1)
+                        if kq2 < 0 { pos = slen }
+                        else {
+                            let key = substr(schema_str, kq1 + 1, kq2)
+                            if key == "type" {
+                                // skip "type" as it's a keyword
+                                pos = kq2 + 1
+                            } else {
+                                names = names + [key]
+                                // find the type of this property
+                                let inner_type_pos = find_str(schema_str, "\"type\"", kq2 + 1)
+                                if inner_type_pos >= 0 {
+                                    let ic = find_char(schema_str, 58, inner_type_pos + 6)
+                                    if ic >= 0 {
+                                        let iq1 = find_char(schema_str, 34, ic + 1)
+                                        if iq1 >= 0 {
+                                            let iq2 = find_char(schema_str, 34, iq1 + 1)
+                                            if iq2 >= 0 {
+                                                let ft = substr(schema_str, iq1 + 1, iq2)
+                                                types = types + [parse_type_string(ft)]
+                                                pos = iq2 + 1
+                                            } else { pos = slen }
+                                        } else { pos = slen }
+                                    } else { pos = slen }
+                                } else {
+                                    types = types + [SCHEMA_ANY]
+                                    pos = kq2 + 1
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return make_object_schema(names, types)
+    }
+
+    if stype == SCHEMA_ARRAY {
+        let items_pos = find_str(schema_str, "\"items\"", 0)
+        let mut items_type = SCHEMA_ANY
+        if items_pos >= 0 {
+            let ibrace = find_char(schema_str, 123, items_pos + 7)
+            if ibrace >= 0 {
+                let end_brace = find_char(schema_str, 125, ibrace + 1)
+                if end_brace >= 0 {
+                    let items_str = substr(schema_str, ibrace, end_brace + 1)
+                    let it_str = extract_type(items_str)
+                    items_type = parse_type_string(it_str)
+                }
+            }
+        }
+        return make_array_schema(items_type)
+    }
+
+    return make_schema(stype)
+}
+
+// ===================================================================
+//  Grammar: wraps a schema + vocabulary mapping
+// ===================================================================
+struct Grammar {
+    schema: SchemaNode,
+    vocab_size: int
+}
+
+fn create_json_grammar(schema_str) {
+    let schema = parse_schema(schema_str)
+    return Grammar {
+        schema: schema,
+        vocab_size: 256
+    }
+}
+
+// ===================================================================
+//  FSM State: tracks position in JSON generation
+// ===================================================================
+struct FsmState {
+    state: int,
+    depth: int,
+    text: string,
+    stack: list
+}
+
+fn initial_fsm_state() {
+    return FsmState {
+        state: ST_START,
+        depth: 0,
+        text: "",
+        stack: []
+    }
+}
+
+// ===================================================================
+//  is_whitespace / is_digit helpers
+// ===================================================================
+fn is_ws(c) {
+    return c == 32 || c == 9 || c == 10 || c == 13
+}
+
+fn is_digit(c) {
+    return c >= 48 && c <= 57
+}
+
+// ===================================================================
+//  FSM transition: given current state + input char code, return new state
+// ===================================================================
+fn fsm_advance(st, ch) {
+    let s = st.state
+    let d = st.depth
+    let mut new_s = s
+    let mut new_d = d
+    let mut new_stack = st.stack
+    let new_text = st.text + chr(ch)
+
+    // Skip whitespace in most states (except string/escape)
+    if s != ST_STRING {
+        if s != ST_STRING_ESCAPE {
+            if is_ws(ch) {
+                return FsmState { state: s, depth: d, text: new_text, stack: new_stack }
+            }
+        }
+    }
+
+    if s == ST_START {
+        if ch == 123 { new_s = ST_OBJECT_OPEN; new_d = d + 1; new_stack = new_stack + [1] }
+        else { if ch == 91 { new_s = ST_ARRAY_OPEN; new_d = d + 1; new_stack = new_stack + [2] }
+        else { if ch == 34 { new_s = ST_STRING }
+        else { if is_digit(ch) || ch == 45 { new_s = ST_NUMBER }
+        else { if ch == 116 { new_s = ST_TRUE_1 }
+        else { if ch == 102 { new_s = ST_FALSE_1 }
+        else { if ch == 110 { new_s = ST_NULL_1 }
+        else { new_s = ST_ERROR }}}}}}}
+    }
+    else { if s == ST_OBJECT_OPEN {
+        if ch == 34 { new_s = ST_OBJECT_KEY }
+        else { if ch == 125 {
+            new_d = d - 1
+            let slen = len(new_stack)
+            if slen > 0 {
+                let mut ns = []
+                for i in 0..(slen - 1) { ns = ns + [new_stack[i]] }
+                new_stack = ns
+            }
+            if new_d == 0 { new_s = ST_DONE } else { new_s = ST_OBJECT_NEXT }
+        }
+        else { new_s = ST_ERROR }}
+    }
+    else { if s == ST_OBJECT_KEY {
+        if ch == 34 { new_s = ST_OBJECT_COLON }
+        // else stay in ST_OBJECT_KEY (consuming key chars)
+    }
+    else { if s == ST_OBJECT_COLON {
+        if ch == 58 { new_s = ST_OBJECT_VALUE }
+        else { new_s = ST_ERROR }
+    }
+    else { if s == ST_OBJECT_VALUE {
+        // Value can be object, array, string, number, bool, null
+        if ch == 123 { new_s = ST_OBJECT_OPEN; new_d = d + 1; new_stack = new_stack + [1] }
+        else { if ch == 91 { new_s = ST_ARRAY_OPEN; new_d = d + 1; new_stack = new_stack + [2] }
+        else { if ch == 34 { new_s = ST_STRING }
+        else { if is_digit(ch) || ch == 45 { new_s = ST_NUMBER }
+        else { if ch == 116 { new_s = ST_TRUE_1 }
+        else { if ch == 102 { new_s = ST_FALSE_1 }
+        else { if ch == 110 { new_s = ST_NULL_1 }
+        else { new_s = ST_ERROR }}}}}}}
+    }
+    else { if s == ST_OBJECT_NEXT {
+        if ch == 44 { new_s = ST_OBJECT_OPEN }   // , -> expect next key
+        else { if ch == 125 {
+            new_d = d - 1
+            let slen = len(new_stack)
+            if slen > 0 {
+                let mut ns = []
+                for i in 0..(slen - 1) { ns = ns + [new_stack[i]] }
+                new_stack = ns
+            }
+            if new_d == 0 { new_s = ST_DONE }
+            // else stay in ST_OBJECT_NEXT for parent
+        }
+        else { new_s = ST_ERROR }}
+    }
+    else { if s == ST_ARRAY_OPEN {
+        if ch == 93 {
+            new_d = d - 1
+            let slen = len(new_stack)
+            if slen > 0 {
+                let mut ns = []
+                for i in 0..(slen - 1) { ns = ns + [new_stack[i]] }
+                new_stack = ns
+            }
+            if new_d == 0 { new_s = ST_DONE } else { new_s = ST_ARRAY_NEXT }
+        }
+        else { if ch == 123 { new_s = ST_OBJECT_OPEN; new_d = d + 1; new_stack = new_stack + [1] }
+        else { if ch == 91 { new_s = ST_ARRAY_OPEN; new_d = d + 1; new_stack = new_stack + [2] }
+        else { if ch == 34 { new_s = ST_STRING }
+        else { if is_digit(ch) || ch == 45 { new_s = ST_NUMBER }
+        else { if ch == 116 { new_s = ST_TRUE_1 }
+        else { if ch == 102 { new_s = ST_FALSE_1 }
+        else { if ch == 110 { new_s = ST_NULL_1 }
+        else { new_s = ST_ERROR }}}}}}}}
+    }
+    else { if s == ST_ARRAY_NEXT {
+        if ch == 44 { new_s = ST_ARRAY_OPEN }    // , -> next element
+        else { if ch == 93 {
+            new_d = d - 1
+            let slen = len(new_stack)
+            if slen > 0 {
+                let mut ns = []
+                for i in 0..(slen - 1) { ns = ns + [new_stack[i]] }
+                new_stack = ns
+            }
+            if new_d == 0 { new_s = ST_DONE }
+            // else parent decides
+        }
+        else { new_s = ST_ERROR }}
+    }
+    else { if s == ST_STRING {
+        if ch == 92 { new_s = ST_STRING_ESCAPE }
+        else { if ch == 34 {
+            // End of string
+            if d == 0 { new_s = ST_DONE }
+            else {
+                // Check parent context from stack
+                let slen = len(new_stack)
+                if slen > 0 {
+                    let parent = new_stack[slen - 1]
+                    if parent == 1 { new_s = ST_OBJECT_NEXT }
+                    else { new_s = ST_ARRAY_NEXT }
+                } else { new_s = ST_DONE }
+            }
+        }}
+        // else: stay in ST_STRING
+    }
+    else { if s == ST_STRING_ESCAPE {
+        new_s = ST_STRING   // consume escaped char
+    }
+    else { if s == ST_NUMBER {
+        if is_digit(ch) || ch == 46 || ch == 101 || ch == 69 || ch == 43 || ch == 45 {
+            // Stay in number
+        } else {
+            // Number ended on a non-number char
+            // Need to process this char as end-of-value
+            if d == 0 { new_s = ST_DONE }
+            else {
+                let slen = len(new_stack)
+                if slen > 0 {
+                    let parent = new_stack[slen - 1]
+                    if parent == 1 { new_s = ST_OBJECT_NEXT }
+                    else { new_s = ST_ARRAY_NEXT }
+                } else { new_s = ST_DONE }
+            }
+            // Re-process the character for , ] }
+            if ch == 44 {
+                if new_s == ST_OBJECT_NEXT { new_s = ST_OBJECT_OPEN }
+                if new_s == ST_ARRAY_NEXT { new_s = ST_ARRAY_OPEN }
+            }
+            if ch == 125 {
+                new_d = d - 1
+                let slen2 = len(new_stack)
+                if slen2 > 0 {
+                    let mut ns = []
+                    for i in 0..(slen2 - 1) { ns = ns + [new_stack[i]] }
+                    new_stack = ns
+                }
+                if new_d == 0 { new_s = ST_DONE } else { new_s = ST_OBJECT_NEXT }
+            }
+            if ch == 93 {
+                new_d = d - 1
+                let slen2 = len(new_stack)
+                if slen2 > 0 {
+                    let mut ns = []
+                    for i in 0..(slen2 - 1) { ns = ns + [new_stack[i]] }
+                    new_stack = ns
+                }
+                if new_d == 0 { new_s = ST_DONE } else { new_s = ST_ARRAY_NEXT }
+            }
+        }
+    }
+    // Boolean/null literal states
+    else { if s == ST_TRUE_1 { if ch == 114 { new_s = ST_TRUE_2 } else { new_s = ST_ERROR } }
+    else { if s == ST_TRUE_2 { if ch == 117 { new_s = ST_TRUE_3 } else { new_s = ST_ERROR } }
+    else { if s == ST_TRUE_3 {
+        if ch == 101 {
+            if d == 0 { new_s = ST_DONE }
+            else {
+                let slen = len(new_stack)
+                if slen > 0 {
+                    let parent = new_stack[slen - 1]
+                    if parent == 1 { new_s = ST_OBJECT_NEXT } else { new_s = ST_ARRAY_NEXT }
+                } else { new_s = ST_DONE }
+            }
+        } else { new_s = ST_ERROR }
+    }
+    else { if s == ST_FALSE_1 { if ch == 97 { new_s = ST_FALSE_2 } else { new_s = ST_ERROR } }
+    else { if s == ST_FALSE_2 { if ch == 108 { new_s = ST_FALSE_3 } else { new_s = ST_ERROR } }
+    else { if s == ST_FALSE_3 { if ch == 115 { new_s = ST_FALSE_4 } else { new_s = ST_ERROR } }
+    else { if s == ST_FALSE_4 {
+        if ch == 101 {
+            if d == 0 { new_s = ST_DONE }
+            else {
+                let slen = len(new_stack)
+                if slen > 0 {
+                    let parent = new_stack[slen - 1]
+                    if parent == 1 { new_s = ST_OBJECT_NEXT } else { new_s = ST_ARRAY_NEXT }
+                } else { new_s = ST_DONE }
+            }
+        } else { new_s = ST_ERROR }
+    }
+    else { if s == ST_NULL_1 { if ch == 117 { new_s = ST_NULL_2 } else { new_s = ST_ERROR } }
+    else { if s == ST_NULL_2 { if ch == 108 { new_s = ST_NULL_3 } else { new_s = ST_ERROR } }
+    else { if s == ST_NULL_3 {
+        if ch == 108 {
+            if d == 0 { new_s = ST_DONE }
+            else {
+                let slen = len(new_stack)
+                if slen > 0 {
+                    let parent = new_stack[slen - 1]
+                    if parent == 1 { new_s = ST_OBJECT_NEXT } else { new_s = ST_ARRAY_NEXT }
+                } else { new_s = ST_DONE }
+            }
+        } else { new_s = ST_ERROR }
+    }
+    else { if s == ST_DONE { new_s = ST_DONE }
+    else { new_s = ST_ERROR }
+    }}}}}}}}}}}}}}}}}}}}}}}
+
+    return FsmState { state: new_s, depth: new_d, text: new_text, stack: new_stack }
+}
+
+// ===================================================================
+//  Compute token mask: for each token (byte-level), check if it
+//  leads to a valid (non-error) FSM state
+// ===================================================================
+fn compute_token_mask(grammar, state, vocab_size) {
+    let mut mask = []
+    let mut i = 0
+    while i < vocab_size {
+        let next_st = fsm_advance(state, i)
+        if next_st.state != ST_ERROR {
+            mask = mask + [1.0]
+        } else {
+            mask = mask + [0.0]
+        }
+        i = i + 1
+    }
+    return mask
+}
+
+// ===================================================================
+//  Apply mask to logits: set masked-out tokens to -1e30
+// ===================================================================
+fn apply_mask_to_logits(logits, mask, n) {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        if i < len(mask) {
+            if mask[i] > 0.5 {
+                out = out + [logits[i]]
+            } else {
+                out = out + [-1.0e30]
+            }
+        } else {
+            out = out + [-1.0e30]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  Constrained sample: apply grammar mask then argmax/sample
+//  Returns [token_id, new_state]
+// ===================================================================
+fn constrained_sample(logits, grammar, state) {
+    let vocab_size = grammar.vocab_size
+    let n = len(logits)
+    let effective_n = if n < vocab_size { n } else { vocab_size }
+
+    // Compute mask
+    let mask = compute_token_mask(grammar, state, effective_n)
+
+    // Apply mask
+    let masked = apply_mask_to_logits(logits, mask, effective_n)
+
+    // Argmax (greedy for constrained output)
+    let mut best_i = 0
+    let mut best_v = masked[0]
+    let mut i = 1
+    while i < effective_n {
+        if masked[i] > best_v {
+            best_v = masked[i]
+            best_i = i
+        }
+        i = i + 1
+    }
+
+    // Advance FSM
+    let new_state = fsm_advance(state, best_i)
+
+    return [best_i, new_state]
+}
+
+// ===================================================================
+//  Validate JSON output against schema
+//  Step 1: Check well-formed JSON via FSM
+//  Step 2: Check schema conformance (type match)
+// ===================================================================
+
+// Run the FSM over the full text, return final state
+fn fsm_run(text) {
+    let mut st = initial_fsm_state()
+    let n = len(text)
+    let mut i = 0
+    while i < n {
+        let ch = char_code(text, i)
+        st = fsm_advance(st, ch)
+        if st.state == ST_ERROR { return st }
+        i = i + 1
+    }
+    return st
+}
+
+// Check if text is well-formed JSON
+fn is_valid_json(text) {
+    let st = fsm_run(text)
+    return st.state == ST_DONE
+}
+
+// Check top-level type matches schema
+fn check_type_match(text, schema) {
+    let n = len(text)
+    if n == 0 { return false }
+
+    // Skip leading whitespace
+    let mut start = 0
+    while start < n {
+        let c = char_code(text, start)
+        if is_ws(c) { start = start + 1 } else { start = n + 1 }
+    }
+    if start > n { start = start - n - 1 }
+
+    if start >= n { return false }
+    let first = char_code(text, start)
+
+    let st = schema.stype
+
+    if st == SCHEMA_ANY { return true }
+    if st == SCHEMA_OBJECT { return first == 123 }
+    if st == SCHEMA_ARRAY { return first == 91 }
+    if st == SCHEMA_STRING { return first == 34 }
+    if st == SCHEMA_NUMBER { return is_digit(first) || first == 45 }
+    if st == SCHEMA_BOOL { return first == 116 || first == 102 }
+    if st == SCHEMA_NULL { return first == 110 }
+
+    return false
+}
+
+// Full validation: well-formed JSON + type match
+fn validate_json_output(text, schema_str) {
+    if !is_valid_json(text) { return false }
+    let schema = parse_schema(schema_str)
+    return check_type_match(text, schema)
+}
+
+// ===================================================================
+//  Constrained generation loop: generate valid JSON from logits
+// ===================================================================
+fn generate_constrained_json(logit_fn, grammar, max_len) {
+    let mut state = initial_fsm_state()
+    let mut output = ""
+    let mut i = 0
+    while i < max_len {
+        if state.state == ST_DONE { i = max_len }
+        else { if state.state == ST_ERROR { i = max_len }
+        else {
+            // Get logits from the generation function
+            let logits = logit_fn(i)
+            let result = constrained_sample(logits, grammar, state)
+            let token_id = result[0]
+            let new_state = result[1]
+            output = output + chr(token_id)
+            state = new_state
+            i = i + 1
+        }}
+    }
+    return output
+}

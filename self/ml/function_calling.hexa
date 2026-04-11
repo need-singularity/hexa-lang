@@ -1,0 +1,482 @@
+// ===================================================================
+//  self/ml/function_calling.hexa — Function Calling / Tool Use
+//
+//  Pure Hexa implementation of LLM function calling (tool use).
+//
+//  Pipeline:
+//    1. Define tools (name, description, JSON schema params)
+//    2. Format tool definitions into system prompt
+//    3. Generate model output
+//    4. Parse <tool_call>...</tool_call> blocks from output
+//    5. Execute tools via user-supplied executor
+//    6. Inject results back into conversation
+//    7. Loop until model produces final response (no tool calls)
+//
+//  Public API:
+//    define_tool(name, desc, params)         -> Tool (map)
+//    define_param(name, type_str, desc, req) -> Param (map)
+//    format_tools_prompt(tools)              -> str
+//    parse_tool_calls(text)                  -> array of ToolCall
+//    inject_tool_result(conversation, call, result) -> conversation
+//    run_tool_loop(generate_fn, tools, executor, prompt, max_rounds) -> str
+//
+//  Conventions:
+//    - Tool call format: <tool_call>{"name":"...", "arguments":{...}}</tool_call>
+//    - Tool result format: <tool_result>{"name":"...", "result":"..."}</tool_result>
+//    - Uses #{} map literals (no {k:v} inside if blocks)
+// ===================================================================
+
+// ===================================================================
+//  Tool & Param structs (as maps)
+// ===================================================================
+
+fn define_param(name, type_str, description, required) {
+    let p = #{}
+    p["name"] = name
+    p["type"] = type_str
+    p["description"] = description
+    p["required"] = required
+    return p
+}
+
+fn define_tool(name, description, params) {
+    let t = #{}
+    t["name"] = name
+    t["description"] = description
+    t["parameters"] = params
+    return t
+}
+
+// ===================================================================
+//  Format a single parameter as JSON schema string
+// ===================================================================
+fn format_param_json(param) {
+    let mut s = "\"" + param["name"] + "\": "
+    s = s + "{\"type\": \"" + param["type"] + "\""
+    s = s + ", \"description\": \"" + param["description"] + "\""
+    s = s + "}"
+    return s
+}
+
+// ===================================================================
+//  Format a single tool definition as JSON string
+// ===================================================================
+fn format_tool_json(tool) {
+    let mut s = "{\n"
+    s = s + "  \"name\": \"" + tool["name"] + "\",\n"
+    s = s + "  \"description\": \"" + tool["description"] + "\",\n"
+    s = s + "  \"parameters\": {\n"
+    s = s + "    \"type\": \"object\",\n"
+    s = s + "    \"properties\": {\n"
+
+    let params = tool["parameters"]
+    let n = len(params)
+    let mut i = 0
+    while i < n {
+        s = s + "      " + format_param_json(params[i])
+        if i < n - 1 {
+            s = s + ","
+        }
+        s = s + "\n"
+        i = i + 1
+    }
+
+    s = s + "    },\n"
+
+    // required list
+    s = s + "    \"required\": ["
+    let mut req_parts = []
+    i = 0
+    while i < n {
+        if params[i]["required"] {
+            req_parts = req_parts + ["\"" + params[i]["name"] + "\""]
+        }
+        i = i + 1
+    }
+    s = s + req_parts.join(", ")
+    s = s + "]\n"
+
+    s = s + "  }\n"
+    s = s + "}"
+    return s
+}
+
+// ===================================================================
+//  Format all tools into a system prompt section
+// ===================================================================
+fn format_tools_prompt(tools) {
+    let mut s = "You have access to the following tools:\n\n"
+    let n = len(tools)
+    let mut i = 0
+    while i < n {
+        s = s + format_tool_json(tools[i])
+        if i < n - 1 {
+            s = s + "\n\n"
+        }
+        i = i + 1
+    }
+    s = s + "\n\nTo use a tool, respond with:\n"
+    s = s + "<tool_call>{\"name\": \"tool_name\", \"arguments\": {\"arg\": \"value\"}}</tool_call>\n"
+    s = s + "You may make multiple tool calls in a single response.\n"
+    s = s + "After receiving tool results, provide your final answer."
+    return s
+}
+
+// ===================================================================
+//  String search helpers (self-contained, no import needed)
+// ===================================================================
+fn _fc_index_of(s, needle, start) {
+    let sn = len(s)
+    let nn = len(needle)
+    if nn == 0 { return start }
+    if nn > sn { return 0 - 1 }
+    let limit = sn - nn
+    let mut i = start
+    while i <= limit {
+        let mut j = 0
+        let mut ok = true
+        while j < nn {
+            if s[i + j] != needle[j] {
+                ok = false
+                j = nn
+            }
+            j = j + 1
+        }
+        if ok { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn _fc_contains(s, needle) {
+    return _fc_index_of(s, needle, 0) >= 0
+}
+
+// ===================================================================
+//  Minimal JSON value extractor
+//  Extract string value for a given key from a flat JSON object
+// ===================================================================
+fn _fc_extract_json_str(json_str, key) {
+    let search = "\"" + key + "\""
+    let idx = _fc_index_of(json_str, search, 0)
+    if idx < 0 { return "" }
+
+    // scan forward from after the key for ":"
+    let after_key = idx + len(search)
+    let sn = len(json_str)
+    let mut ci = after_key
+
+    // find colon
+    while ci < sn {
+        if json_str[ci] == ":" {
+            ci = ci + 1
+            break
+        }
+        ci = ci + 1
+    }
+
+    // skip whitespace after colon
+    while ci < sn {
+        if json_str[ci] == " " {
+            ci = ci + 1
+        } else {
+            break
+        }
+    }
+
+    // now ci should point at opening quote
+    if ci < sn {
+        if json_str[ci] == "\"" {
+            let start = ci + 1
+            let mut ei = start
+            while ei < sn {
+                if json_str[ei] == "\"" {
+                    return json_str.substring(start, ei)
+                }
+                ei = ei + 1
+            }
+        }
+    }
+    return ""
+}
+
+// ===================================================================
+//  Extract the JSON object substring for "arguments" key
+// ===================================================================
+fn _fc_extract_arguments(json_str) {
+    let search = "\"arguments\""
+    let idx = _fc_index_of(json_str, search, 0)
+    if idx < 0 { return "{}" }
+
+    let after_key = idx + len(search)
+    let sn = len(json_str)
+
+    // find colon
+    let mut ci = after_key
+    while ci < sn {
+        if json_str[ci] == ":" {
+            ci = ci + 1
+            break
+        }
+        ci = ci + 1
+    }
+
+    // skip whitespace
+    while ci < sn {
+        if json_str[ci] == " " {
+            ci = ci + 1
+        } else {
+            break
+        }
+    }
+
+    // now ci should point at '{' — find matching '}'
+    if ci < sn {
+        if json_str[ci] == "{" {
+            let start = ci
+            let mut depth = 0
+            let mut ei = ci
+            while ei < sn {
+                if json_str[ei] == "{" { depth = depth + 1 }
+                if json_str[ei] == "}" { depth = depth - 1 }
+                if depth == 0 {
+                    return json_str.substring(start, ei + 1)
+                }
+                ei = ei + 1
+            }
+        }
+    }
+    return "{}"
+}
+
+// ===================================================================
+//  Parse tool calls from model output text
+//  Looks for <tool_call>...</tool_call> blocks
+//  Returns array of maps with "name" and "arguments" keys
+// ===================================================================
+fn parse_tool_calls(text) {
+    let open_tag = "<tool_call>"
+    let close_tag = "</tool_call>"
+    let open_len = len(open_tag)
+    let close_len = len(close_tag)
+    let text_len = len(text)
+
+    let mut calls = []
+    let mut pos = 0
+
+    while pos < text_len {
+        let start = _fc_index_of(text, open_tag, pos)
+        if start < 0 {
+            pos = text_len
+        } else {
+            let content_start = start + open_len
+            let end = _fc_index_of(text, close_tag, content_start)
+            if end < 0 {
+                pos = text_len
+            } else {
+                let json_body = text.substring(content_start, end).trim()
+                let name = _fc_extract_json_str(json_body, "name")
+                let arguments = _fc_extract_arguments(json_body)
+
+                let call = #{}
+                call["name"] = name
+                call["arguments"] = arguments
+                call["raw"] = json_body
+                calls = calls + [call]
+
+                pos = end + close_len
+            }
+        }
+    }
+
+    return calls
+}
+
+// ===================================================================
+//  Check if text contains any tool call
+// ===================================================================
+fn has_tool_calls(text) {
+    return _fc_contains(text, "<tool_call>")
+}
+
+// ===================================================================
+//  Extract non-tool-call text (the "thinking" or final answer part)
+// ===================================================================
+fn extract_text_outside_calls(text) {
+    let open_tag = "<tool_call>"
+    let close_tag = "</tool_call>"
+    let close_len = len(close_tag)
+    let text_len = len(text)
+
+    let mut parts = []
+    let mut pos = 0
+
+    while pos < text_len {
+        let start = _fc_index_of(text, open_tag, pos)
+        if start < 0 {
+            // rest of string is plain text
+            parts = parts + [text.substring(pos, text_len)]
+            pos = text_len
+        } else {
+            // text before the tool call
+            if start > pos {
+                parts = parts + [text.substring(pos, start)]
+            }
+            let end = _fc_index_of(text, close_tag, start)
+            if end < 0 {
+                pos = text_len
+            } else {
+                pos = end + close_len
+            }
+        }
+    }
+
+    return parts.join("").trim()
+}
+
+// ===================================================================
+//  Build a tool result message
+// ===================================================================
+fn format_tool_result(call_name, result_str) {
+    let mut s = "<tool_result>"
+    s = s + "{\"name\": \"" + call_name + "\""
+    s = s + ", \"result\": \"" + result_str + "\"}"
+    s = s + "</tool_result>"
+    return s
+}
+
+// ===================================================================
+//  Inject tool result into conversation
+//  conversation: array of maps with "role" and "content"
+//  Returns new conversation array with assistant message + tool result
+// ===================================================================
+fn inject_tool_result(conversation, assistant_text, call, result_str) {
+    let mut conv = conversation
+
+    // Add assistant message (the model's output that contained tool calls)
+    let asst_msg = #{}
+    asst_msg["role"] = "assistant"
+    asst_msg["content"] = assistant_text
+    conv = conv + [asst_msg]
+
+    // Add tool result as a "tool" role message
+    let tool_msg = #{}
+    tool_msg["role"] = "tool"
+    tool_msg["content"] = format_tool_result(call["name"], result_str)
+    conv = conv + [tool_msg]
+
+    return conv
+}
+
+// ===================================================================
+//  Build conversation into a single prompt string
+//  Simple format: [system]\n...\n[user]\n...\n[assistant]\n...
+// ===================================================================
+fn conversation_to_prompt(conversation) {
+    let n = len(conversation)
+    let mut parts = []
+    let mut i = 0
+    while i < n {
+        let msg = conversation[i]
+        let role = msg["role"]
+        let content = msg["content"]
+        parts = parts + ["[" + role + "]\n" + content]
+        i = i + 1
+    }
+    return parts.join("\n\n")
+}
+
+// ===================================================================
+//  Run tool call loop
+//
+//  generate_fn: fn(prompt) -> str  (generates model response)
+//  tools:       array of Tool maps
+//  executor:    fn(name, arguments_json) -> str  (executes a tool)
+//  prompt:      initial user prompt string
+//  max_rounds:  maximum tool call rounds before forced stop
+//
+//  Returns the final response text (after all tools resolved)
+// ===================================================================
+fn run_tool_loop(generate_fn, tools, executor, prompt, max_rounds) {
+    let system_prompt = format_tools_prompt(tools)
+
+    // Build initial conversation
+    let sys_msg = #{}
+    sys_msg["role"] = "system"
+    sys_msg["content"] = system_prompt
+
+    let user_msg = #{}
+    user_msg["role"] = "user"
+    user_msg["content"] = prompt
+
+    let mut conversation = [sys_msg, user_msg]
+
+    let mut round = 0
+    while round < max_rounds {
+        let full_prompt = conversation_to_prompt(conversation)
+        let response = generate_fn(full_prompt)
+
+        if has_tool_calls(response) {
+            let calls = parse_tool_calls(response)
+            let n_calls = len(calls)
+
+            // Execute each tool call and inject results
+            let mut ci = 0
+            while ci < n_calls {
+                let call = calls[ci]
+                let result = executor(call["name"], call["arguments"])
+                conversation = inject_tool_result(conversation, response, call, result)
+                ci = ci + 1
+            }
+        } else {
+            // No tool calls — this is the final response
+            return response
+        }
+
+        round = round + 1
+    }
+
+    // Max rounds exceeded — return last generation
+    let last_prompt = conversation_to_prompt(conversation)
+    return generate_fn(last_prompt)
+}
+
+// ===================================================================
+//  Validate tool call against defined tools
+//  Returns true if tool name exists in the tools array
+// ===================================================================
+fn validate_tool_call(call, tools) {
+    let call_name = call["name"]
+    let n = len(tools)
+    let mut i = 0
+    while i < n {
+        if tools[i]["name"] == call_name {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// ===================================================================
+//  Find tool by name
+// ===================================================================
+fn find_tool(name, tools) {
+    let n = len(tools)
+    let mut i = 0
+    while i < n {
+        if tools[i]["name"] == name {
+            return tools[i]
+        }
+        i = i + 1
+    }
+    let empty = #{}
+    return empty
+}
+
+// Check if a find_tool result is a valid (non-empty) tool
+fn is_tool_found(result) {
+    return len(keys(result)) > 0
+}
+
+println("[function_calling] module loaded")

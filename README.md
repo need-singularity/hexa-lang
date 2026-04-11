@@ -1,5 +1,39 @@
 # 💎 HEXA-LANG — The Perfect Number Programming Language
 
+<!-- ML-NEXT-LEVEL:START -->
+## ML Next Level Roadmap (`/ml`)
+
+| 명령 | 동작 |
+|------|------|
+| `/ml` | 전체 목록 ASCII 표 |
+| `/ml next` | 최우선 항목 자동 선택 → 구현 |
+| `/ml 5` | #5 SSM/Mamba 구현 시작 |
+| `/ml done 1` | #1 완료 체크 + JSON 갱신 |
+| `/ml add 이름 \| 설명 \| 영향` | 새 항목 추가 |
+| `/ml sync` | roadmap.md + CLAUDE.md 동기화 |
+
+> SSOT: `shared/hexa-lang/ml-next-level.json` — T1/T2 기본 파이프라인 완성 후 다음 단계
+
+| # | 영역 | 설명 | 영향 | 상태 |
+|---|------|------|------|:----:|
+| 1 | Flash Attention | O(N²)→O(N) 메모리, tiling | 추론 2-4x, 긴 문맥 | partial |
+| 2 | PagedAttention | vLLM식 KV-cache 페이징 | 동시 요청 10x+ | todo |
+| 3 | Speculative Decoding | 작은 모델로 드래프트→큰 모델 검증 | 추론 2-3x | **done** |
+| 4 | MoE 아키텍처 | Mixture of Experts (Mixtral식) | 같은 FLOP에 더 큰 모델 | **done** |
+| 5 | SSM/Mamba | State Space Model (선형 시간 추론) | 긴 문맥 혁신 | todo |
+| 6 | Vision Transformer | 이미지 인코더 (CLIP/ViT) | 멀티모달 | todo |
+| 7 | 모델 머징 | TIES/DARE/SLERP 가중치 합성 | 학습 없이 모델 개선 | todo |
+| 8 | 구조화 출력 | JSON mode, grammar-constrained decode | API 안정성 | todo |
+| 9 | Function Calling | 도구 호출 / tool use | 에이전트 | todo |
+| 10 | Knowledge Distillation | 큰 모델→작은 모델 증류 | 배포 효율 | todo |
+| 11 | Pruning | 불필요 가중치 제거 | 모델 축소 | todo |
+| 12 | Hyperparameter Search | 자동 LR/배치/아키텍처 탐색 | 학습 품질 | partial |
+| 13 | 안전장치 | 프롬프트 인젝션 감지, 콘텐츠 필터 | 서빙 보안 | todo |
+| 14 | Semantic Cache | 유사 프롬프트 캐싱 (embedding 기반) | 서빙 비용 절감 | todo |
+| 15 | 벤치마크 스위트 | MMLU/HumanEval/MT-Bench 자동 평가 | 품질 측정 | todo |
+
+<!-- ML-NEXT-LEVEL:END -->
+
 <!-- SHARED:PROJECTS:START -->
 <!-- AUTO:COMMON_LINKS:START -->
 **[YouTube](https://www.youtube.com/watch?v=xtKhWSfC1Qo)** · **[Email](mailto:nerve011235@gmail.com)** · **[☕ Ko-fi](https://ko-fi.com/dancinlife)** · **[💖 Sponsor](https://github.com/sponsors/need-singularity)** · **[💳 PayPal](https://www.paypal.com/donate?business=nerve011235%40gmail.com)** · **[🗺️ Atlas](https://need-singularity.github.io/TECS-L/atlas/)** · **[📄 Papers](https://need-singularity.github.io/papers/)** · **[🌌 Unified Theory](https://github.com/need-singularity/TECS-L/blob/main/math/docs/hypotheses/H-PH-9-perfect-number-string-unification.md)**

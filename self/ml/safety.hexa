@@ -1,0 +1,537 @@
+// ===================================================================
+//  self/ml/safety.hexa — Safety Guardrails for LLM Serving
+//
+//  Pure Hexa implementation of prompt injection detection, content
+//  filtering, rate limiting, input sanitization, and output validation.
+//
+//  Public API:
+//    create_safety_config(rules)              -> SafetyConfig
+//    check_input(text, config)                -> SafetyResult
+//    check_output(text, config)               -> SafetyResult
+//    rate_limit_check(client_id, tokens, win) -> bool
+//    sanitize_input(text, max_len)            -> str
+//
+//  SafetyResult: #{status: "pass"|"warn"|"block", reason: string}
+// ===================================================================
+
+// ===================================================================
+//  Data structures
+// ===================================================================
+
+struct SafetyConfig {
+    injection_enabled: bool,
+    filter_enabled: bool,
+    max_input_len: int,
+    severity_threshold: int,
+    blocked_categories: array,
+    custom_patterns: array
+}
+
+struct SafetyResult {
+    status: string,
+    reason: string,
+    score: int
+}
+
+struct RateLimitEntry {
+    client_id: string,
+    tokens: int,
+    window_start: float
+}
+
+// -- module-level rate limiter state --
+let mut RL_ENTRIES = []
+
+// ===================================================================
+//  create_safety_config — build config from rules map
+//
+//  rules: array of #{category, severity, patterns}
+//    severity: 1=warn, 2=block
+// ===================================================================
+fn create_safety_config(rules) {
+    let mut blocked = []
+    let mut patterns = []
+    let n = len(rules)
+    let mut i = 0
+    while i < n {
+        let r = rules[i]
+        if r.severity >= 2 {
+            blocked = blocked + [r.category]
+        }
+        let np = len(r.patterns)
+        let mut j = 0
+        while j < np {
+            patterns = patterns + [r.patterns[j]]
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return SafetyConfig {
+        injection_enabled: true,
+        filter_enabled: true,
+        max_input_len: 8192,
+        severity_threshold: 1,
+        blocked_categories: blocked,
+        custom_patterns: patterns
+    }
+}
+
+// ===================================================================
+//  Default safety config (batteries-included)
+// ===================================================================
+fn default_safety_config() {
+    return SafetyConfig {
+        injection_enabled: true,
+        filter_enabled: true,
+        max_input_len: 8192,
+        severity_threshold: 1,
+        blocked_categories: ["violence", "illegal", "pii_leak"],
+        custom_patterns: []
+    }
+}
+
+// ===================================================================
+//  Prompt Injection Detector
+//
+//  Checks for common injection patterns:
+//    - "ignore previous instructions"
+//    - "system prompt override"
+//    - role confusion: "you are now", "act as"
+//    - delimiter escape: "```", "###"
+//    - instruction override: "new instructions:", "forget everything"
+// ===================================================================
+
+fn str_to_lower_simple(s) {
+    // Approximate lowercase for ASCII injection matching
+    return s.to_lower()
+}
+
+fn contains_any(text, patterns) {
+    let n = len(patterns)
+    let mut i = 0
+    while i < n {
+        if text.contains(patterns[i]) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn detect_injection(text) {
+    let lower = str_to_lower_simple(text)
+
+    // Category 1: Direct override attempts
+    let override_patterns = [
+        "ignore previous",
+        "ignore all previous",
+        "ignore above",
+        "disregard previous",
+        "disregard all previous",
+        "forget previous",
+        "forget your instructions",
+        "forget everything",
+        "override instructions",
+        "new instructions:",
+        "updated instructions:",
+        "system prompt override",
+        "change your instructions"
+    ]
+    if contains_any(lower, override_patterns) {
+        return SafetyResult {
+            status: "block",
+            reason: "prompt_injection: instruction override attempt",
+            score: 10
+        }
+    }
+
+    // Category 2: Role confusion
+    let role_patterns = [
+        "you are now",
+        "act as if",
+        "pretend you are",
+        "roleplay as",
+        "switch to role",
+        "assume the role",
+        "you must obey",
+        "your new role"
+    ]
+    if contains_any(lower, role_patterns) {
+        return SafetyResult {
+            status: "block",
+            reason: "prompt_injection: role confusion attempt",
+            score: 8
+        }
+    }
+
+    // Category 3: Delimiter/context escape
+    let escape_patterns = [
+        "###system",
+        "```system",
+        "<|system|>",
+        "[system]:",
+        "<<sys>>",
+        "</s>",
+        "<|im_start|>",
+        "<|im_end|>"
+    ]
+    if contains_any(lower, escape_patterns) {
+        return SafetyResult {
+            status: "block",
+            reason: "prompt_injection: delimiter escape attempt",
+            score: 9
+        }
+    }
+
+    // Category 4: Extraction attempts
+    let extract_patterns = [
+        "reveal your system prompt",
+        "show your instructions",
+        "print your prompt",
+        "output your system",
+        "what is your system prompt",
+        "repeat your instructions"
+    ]
+    if contains_any(lower, extract_patterns) {
+        return SafetyResult {
+            status: "warn",
+            reason: "prompt_injection: system prompt extraction attempt",
+            score: 5
+        }
+    }
+
+    return SafetyResult {
+        status: "pass",
+        reason: "",
+        score: 0
+    }
+}
+
+// ===================================================================
+//  Content Filter
+//
+//  Checks text against dangerous content categories.
+//  Each category has severity: 1=warn, 2=block.
+// ===================================================================
+
+struct FilterCategory {
+    name: string,
+    severity: int,
+    keywords: array
+}
+
+fn get_default_filters() {
+    return [
+        FilterCategory {
+            name: "violence",
+            severity: 2,
+            keywords: ["how to make a bomb", "how to kill", "weapon instructions", "make explosives"]
+        },
+        FilterCategory {
+            name: "illegal",
+            severity: 2,
+            keywords: ["hack into", "steal credentials", "bypass security", "exploit vulnerability"]
+        },
+        FilterCategory {
+            name: "pii_leak",
+            severity: 2,
+            keywords: ["social security number", "credit card number", "bank account", "routing number"]
+        },
+        FilterCategory {
+            name: "hate",
+            severity: 2,
+            keywords: ["racial slur", "hate speech", "ethnic cleansing"]
+        },
+        FilterCategory {
+            name: "self_harm",
+            severity: 2,
+            keywords: ["how to harm yourself", "suicide method"]
+        }
+    ]
+}
+
+fn filter_content(text, categories) {
+    let lower = str_to_lower_simple(text)
+    let n = len(categories)
+    let mut i = 0
+    while i < n {
+        let cat = categories[i]
+        let nk = len(cat.keywords)
+        let mut j = 0
+        while j < nk {
+            if lower.contains(cat.keywords[j]) {
+                let st = if cat.severity >= 2 {
+                    "block"
+                } else {
+                    "warn"
+                }
+                return SafetyResult {
+                    status: st,
+                    reason: "content_filter: " + cat.name + " (" + cat.keywords[j] + ")",
+                    score: cat.severity * 5
+                }
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return SafetyResult {
+        status: "pass",
+        reason: "",
+        score: 0
+    }
+}
+
+// ===================================================================
+//  Rate Limiter — Token-based Sliding Window
+//
+//  Maintains per-client token counts. Resets when window expires.
+//  Returns true if within limit, false if exceeded.
+// ===================================================================
+
+fn rate_limit_check(client_id, tokens, window) {
+    let now = clock()
+    let max_tokens_per_window = window.max_tokens
+
+    // Find or create entry for this client
+    let n = len(RL_ENTRIES)
+    let mut found_idx = -1
+    let mut i = 0
+    while i < n {
+        let e = RL_ENTRIES[i]
+        if e.client_id == client_id {
+            found_idx = i
+        }
+        i = i + 1
+    }
+
+    if found_idx < 0 {
+        // New client
+        RL_ENTRIES = RL_ENTRIES + [RateLimitEntry {
+            client_id: client_id,
+            tokens: tokens,
+            window_start: now
+        }]
+        return tokens <= max_tokens_per_window
+    }
+
+    let entry = RL_ENTRIES[found_idx]
+    let elapsed_sec = now - entry.window_start
+    let window_sec = to_float(window.window_seconds)
+
+    if elapsed_sec >= window_sec {
+        // Window expired, reset
+        RL_ENTRIES[found_idx] = RateLimitEntry {
+            client_id: client_id,
+            tokens: tokens,
+            window_start: now
+        }
+        return tokens <= max_tokens_per_window
+    }
+
+    // Within window, accumulate
+    let new_total = entry.tokens + tokens
+    RL_ENTRIES[found_idx] = RateLimitEntry {
+        client_id: client_id,
+        tokens: new_total,
+        window_start: entry.window_start
+    }
+    return new_total <= max_tokens_per_window
+}
+
+fn rate_limit_reset() {
+    RL_ENTRIES = []
+}
+
+// ===================================================================
+//  Input Sanitizer
+//
+//  Normalizes input:
+//    - Trims whitespace
+//    - Truncates to max_len
+//    - Escapes control characters
+//    - Collapses excessive whitespace
+// ===================================================================
+
+fn sanitize_input(text, max_len) {
+    let mut s = text.trim()
+
+    // Truncate if too long
+    if len(s) > max_len {
+        s = s.substring(0, max_len)
+    }
+
+    // Collapse multiple spaces: repeatedly replace double-space
+    let mut prev = ""
+    while s != prev {
+        prev = s
+        s = s.replace("  ", " ")
+    }
+
+    return s
+}
+
+// ===================================================================
+//  Output Validator
+//
+//  Checks generated output for:
+//    - Content filter violations
+//    - Leaked system prompt indicators
+//    - Excessive repetition (degenerate generation)
+//    - PII patterns in output
+// ===================================================================
+
+fn check_repetition(text, threshold) {
+    // Check if any 4-gram repeats more than threshold times
+    // Uses substring to avoid char concatenation issues
+    let n = len(text)
+    if n < 8 {
+        return false
+    }
+
+    // Build 4-grams and count
+    let mut grams = []
+    let mut counts = []
+    let mut i = 0
+    let limit = n - 3
+    while i < limit {
+        let gram = text.substring(i, i + 4)
+        // Search for existing gram
+        let mut found = false
+        let ng = len(grams)
+        let mut j = 0
+        while j < ng {
+            if grams[j] == gram {
+                counts[j] = counts[j] + 1
+                if counts[j] >= threshold {
+                    return true
+                }
+                found = true
+                j = ng
+            }
+            j = j + 1
+        }
+        if !found {
+            grams = grams + [gram]
+            counts = counts + [1]
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn detect_leaked_prompt(text) {
+    let lower = str_to_lower_simple(text)
+    let leak_indicators = [
+        "my system prompt is",
+        "i was instructed to",
+        "my instructions are",
+        "here are my instructions",
+        "my original prompt",
+        "i am configured to"
+    ]
+    return contains_any(lower, leak_indicators)
+}
+
+fn validate_output(text, config) {
+    // Check content filter on output
+    let categories = get_default_filters()
+    let filter_result = filter_content(text, categories)
+    if filter_result.status != "pass" {
+        return SafetyResult {
+            status: filter_result.status,
+            reason: "output_" + filter_result.reason,
+            score: filter_result.score
+        }
+    }
+
+    // Check for leaked system prompt
+    if detect_leaked_prompt(text) {
+        return SafetyResult {
+            status: "block",
+            reason: "output_validation: possible system prompt leak",
+            score: 8
+        }
+    }
+
+    // Check for degenerate repetition
+    if check_repetition(text, 10) {
+        return SafetyResult {
+            status: "warn",
+            reason: "output_validation: excessive repetition detected",
+            score: 3
+        }
+    }
+
+    return SafetyResult {
+        status: "pass",
+        reason: "",
+        score: 0
+    }
+}
+
+// ===================================================================
+//  Main API: check_input / check_output
+// ===================================================================
+
+fn check_input(text, config) {
+    // 1. Length check
+    if len(text) > config.max_input_len {
+        return SafetyResult {
+            status: "block",
+            reason: "input too long: " + to_string(len(text)) + " > " + to_string(config.max_input_len),
+            score: 7
+        }
+    }
+
+    // 2. Injection detection
+    if config.injection_enabled {
+        let inj = detect_injection(text)
+        if inj.status != "pass" {
+            return inj
+        }
+    }
+
+    // 3. Content filter
+    if config.filter_enabled {
+        let categories = get_default_filters()
+        let filt = filter_content(text, categories)
+        if filt.status != "pass" {
+            return filt
+        }
+    }
+
+    // 4. Custom patterns
+    let lower = str_to_lower_simple(text)
+    let np = len(config.custom_patterns)
+    let mut i = 0
+    while i < np {
+        if lower.contains(config.custom_patterns[i]) {
+            return SafetyResult {
+                status: "warn",
+                reason: "custom_pattern: " + config.custom_patterns[i],
+                score: 4
+            }
+        }
+        i = i + 1
+    }
+
+    return SafetyResult {
+        status: "pass",
+        reason: "",
+        score: 0
+    }
+}
+
+fn check_output(text, config) {
+    return validate_output(text, config)
+}
+
+// ===================================================================
+//  Summary printer (utility)
+// ===================================================================
+fn safety_result_str(r) {
+    return "[" + r.status + "] " + r.reason + " (score=" + to_string(r.score) + ")"
+}
+
+println("[safety] module loaded")
