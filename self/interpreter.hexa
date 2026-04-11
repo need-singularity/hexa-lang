@@ -38,6 +38,16 @@ fn val_void() { return Val { tag: "void", int_val: 0, float_val: 0.0, bool_val: 
 
 pub let mut env_vars = []      // array of {name, value} pairs
 pub let mut env_scopes = [0]   // scope boundary stack
+// ── O(1) env_lookup cache (perf) ──────────────────────────
+// Parallel to env_vars: 64 buckets, each a list of [name, env_index].
+// env_define appends; env_lookup/set scan only the name's bucket and
+// pick the entry with the largest index (newest binding still in scope).
+// env_pop_scope prunes entries whose index >= new boundary. Any wholesale
+// reassignment of env_vars (match arm save/restore, closure call swap,
+// interpret() reset) MUST call env_rebuild_cache() to resync.
+// Bucket count 64 = power of two, empirically covers typical
+// top-level fn + let counts (~100) with avg chain length <2.
+pub let mut env_cache = []     // list of 64 buckets; each bucket is [[name, idx], ...]
 pub let mut env_fns = []      // function registry: name -> {params, body}
 pub let mut return_flag = false
 pub let mut return_val = val_void()
@@ -637,6 +647,47 @@ fn try_fuse_chain(obj_expr, final_method, final_args) {
     return fuse_sentinel()
 }
 
+// ── env_cache helpers (O(1) avg lookup) ───────────────────
+// Hash a name into one of 64 buckets. Simple sum-of-char-codes mod 64;
+// collisions are fine because each bucket is still linearly scanned,
+// just over a much smaller set (~len(env_vars)/64).
+fn env_hash(name) {
+    let mut h = 0
+    let mut i = 0
+    let n = len(name)
+    while i < n {
+        h = h + char_code(name, i)
+        i = i + 1
+    }
+    let mut b = h
+    while b < 0 { b = b + 64 }
+    return b % 64
+}
+
+fn env_cache_init() {
+    let mut buckets = []
+    let mut i = 0
+    while i < 64 {
+        buckets = buckets.push([])
+        i = i + 1
+    }
+    env_cache = buckets
+}
+
+// Rebuild cache from current env_vars. Called after any wholesale
+// reassignment of env_vars (match save/restore, closure swap, reset).
+fn env_rebuild_cache() {
+    env_cache_init()
+    let mut i = 0
+    let n = len(env_vars)
+    while i < n {
+        let pair = env_vars[i]
+        let b = env_hash(pair[0])
+        env_cache[b] = env_cache[b].push([pair[0], i])
+        i = i + 1
+    }
+}
+
 fn env_push_scope() {
     env_scopes = env_scopes.push(len(env_vars))
 }
@@ -655,15 +706,61 @@ fn env_pop_scope() {
         new_vars = new_vars.push(env_vars[i])
     }
     env_vars = new_vars
+    // Prune cache: drop any bucket entry whose index >= boundary.
+    // O(total cache entries) — same order as the truncation itself,
+    // so no asymptotic regression vs the old scheme.
+    let mut bi = 0
+    while bi < 64 {
+        let bucket = env_cache[bi]
+        let mut kept = []
+        let mut ki = 0
+        let bn = len(bucket)
+        while ki < bn {
+            let entry = bucket[ki]
+            if entry[1] < boundary {
+                kept = kept.push(entry)
+            }
+            ki = ki + 1
+        }
+        env_cache[bi] = kept
+        bi = bi + 1
+    }
 }
 
 fn env_define(name, value) {
+    let idx = len(env_vars)
     env_vars = env_vars.push([name, value])
+    // Lazily init cache on first define after reset.
+    if len(env_cache) != 64 { env_cache_init() }
+    let b = env_hash(name)
+    env_cache[b] = env_cache[b].push([name, idx])
 }
 
 fn env_lookup(name) {
-    // Walk backwards for lexical scoping
-    let i = len(env_vars) - 1
+    // O(1) avg via bucket cache. Fall back to linear scan only if
+    // cache is empty (e.g., right after wholesale env_vars swap that
+    // forgot to rebuild — defensive).
+    if len(env_cache) == 64 {
+        let b = env_hash(name)
+        let bucket = env_cache[b]
+        // Pick entry with largest index (newest binding still in scope).
+        let mut best = -1
+        let mut bi = 0
+        let bn = len(bucket)
+        while bi < bn {
+            let entry = bucket[bi]
+            if entry[0] == name {
+                if entry[1] > best { best = entry[1] }
+            }
+            bi = bi + 1
+        }
+        if best >= 0 && best < len(env_vars) {
+            return env_vars[best][1]
+        }
+        return val_void()
+    }
+    // Fallback linear scan
+    let mut i = len(env_vars) - 1
     while i >= 0 {
         if env_vars[i][0] == name {
             return env_vars[i][1]
@@ -674,7 +771,26 @@ fn env_lookup(name) {
 }
 
 fn env_set(name, value) {
-    let i = len(env_vars) - 1
+    if len(env_cache) == 64 {
+        let b = env_hash(name)
+        let bucket = env_cache[b]
+        let mut best = -1
+        let mut bi = 0
+        let bn = len(bucket)
+        while bi < bn {
+            let entry = bucket[bi]
+            if entry[0] == name {
+                if entry[1] > best { best = entry[1] }
+            }
+            bi = bi + 1
+        }
+        if best >= 0 && best < len(env_vars) {
+            env_vars[best] = [name, value]
+            return true
+        }
+        return false
+    }
+    let mut i = len(env_vars) - 1
     while i >= 0 {
         if env_vars[i][0] == name {
             env_vars[i] = [name, value]
@@ -1174,6 +1290,7 @@ fn eval_expr_inner(node) {
                     // Restore env to pre-match state to prevent leakage
                     env_vars = saved_env_vars
                     env_scopes = saved_env_scopes
+                    env_rebuild_cache()
                     if return_flag {
                         return return_val
                     }
@@ -1184,6 +1301,7 @@ fn eval_expr_inner(node) {
             // Restore env to pre-match state for failed arms too
             env_vars = saved_env_vars
             env_scopes = saved_env_scopes
+            env_rebuild_cache()
             mi = mi + 1
         }
         return val_void()
@@ -2312,6 +2430,7 @@ fn call_fn_val(fn_val, args) {
         let captured = closure_store[fn_val.int_val]
         env_vars = captured
         env_scopes = [0]
+        env_rebuild_cache()
     }
 
     env_push_scope()
@@ -2353,6 +2472,7 @@ fn call_fn_val(fn_val, args) {
     if is_closure {
         env_vars = saved_vars
         env_scopes = saved_scopes
+        env_rebuild_cache()
     }
 
     return result
@@ -8355,6 +8475,7 @@ fn interpret(ast) {
     // Reset state
     env_vars = []
     env_scopes = [0]
+    env_cache_init()
     env_fns = []
     return_flag = false
     return_val = val_void()
