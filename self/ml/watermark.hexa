@@ -1,0 +1,303 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/watermark.hexa — Output Watermark (Kirchenbauer et al.)
+//
+//  Implements:
+//    1. Green/red token list   — hash-based partition of vocabulary
+//    2. Logit bias             — add delta to green token logits
+//    3. Detection z-test       — statistical test for watermark
+//    4. Watermarked generation — greedy/sampling with green bias
+//
+//  The watermark works by:
+//    - For each token position, hash the previous token to split
+//      the vocabulary into "green" and "red" sets (50/50 default)
+//    - During generation, add a constant delta to green logits
+//    - During detection, count green tokens and apply a z-test
+//    - Under null hypothesis (no watermark), ~50% are green
+//    - With watermark, significantly more are green (z > threshold)
+//
+//  API:
+//    wm_hash_token(prev_token, vocab_size, seed)  -> [green_mask]
+//    wm_apply_bias(logits, green_mask, delta)      -> [float]
+//    wm_count_green(tokens, vocab_size, seed)       -> [n_green, n_total]
+//    wm_z_score(n_green, n_total, gamma)            -> float
+//    wm_detect(tokens, vocab_size, seed, threshold) -> [detected, z]
+//    wm_generate(logits_fn, prev, n_tokens, vocab_size, seed, delta)
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+//    @hot   — called during generation
+// ═══════════════════════════════════════════════════════════════════
+
+// ── helpers ──────────────────────────────────────────────────────
+
+fn wm_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn wm_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn wm_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn wm_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn wm_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Hash Function — deterministic pseudo-random from prev_token
+//
+//  Maps (prev_token, token_id) -> 0 or 1 (green or red)
+//  Uses multiplicative hashing for good distribution.
+// ═══════════════════════════════════════════════════════════════════
+fn wm_hash_single(prev_token, token_id, seed) {
+    let mut h = (prev_token + 1) * 2654435761 + token_id * 1315423911 + seed * 7919
+    h = h % 1000003
+    if h < 0 { h = 0 - h }
+    return h
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Green/Red Partition — hash-based vocabulary split
+//
+//  Given prev_token, split vocab into green (1) and red (0).
+//  gamma: fraction of vocab that is green (default 0.5)
+//
+//  Returns: array of 0/1 (length = vocab_size)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn wm_green_mask(prev_token, vocab_size, seed, gamma) {
+    let mut mask = wm_zeros_int(vocab_size)
+    let threshold = to_int(gamma * to_float(vocab_size))
+    for t in 0..vocab_size {
+        let h = wm_hash_single(prev_token, t, seed)
+        let bucket = h % vocab_size
+        if bucket < threshold {
+            mask[t] = 1
+        }
+    }
+    return mask
+}
+
+// Default gamma=0.5
+@pure
+fn wm_green_mask_default(prev_token, vocab_size, seed) {
+    return wm_green_mask(prev_token, vocab_size, seed, 0.5)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Apply Logit Bias — add delta to green token logits
+//
+//  logits: [vocab_size] pre-softmax scores
+//  green_mask: [vocab_size] 0/1 from wm_green_mask
+//  delta: bias strength (typical: 1.0 ~ 2.5)
+//
+//  Returns: biased logits
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn wm_apply_bias(logits, green_mask, delta) {
+    let n = len(logits)
+    let mut out = wm_zeros(n)
+    for i in 0..n {
+        out[i] = logits[i]
+        if green_mask[i] == 1 {
+            out[i] = out[i] + delta
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Softmax — for sampling from biased logits
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn wm_softmax(logits) {
+    let n = len(logits)
+    let mut mx = logits[0]
+    for i in 1..n {
+        if logits[i] > mx { mx = logits[i] }
+    }
+    let mut exps = wm_zeros(n)
+    let mut z = 0.0
+    for i in 0..n {
+        exps[i] = wm_exp(logits[i] - mx)
+        z = z + exps[i]
+    }
+    let mut out = wm_zeros(n)
+    for i in 0..n {
+        out[i] = exps[i] / z
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Argmax — greedy selection from logits
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn wm_argmax(logits) {
+    let n = len(logits)
+    let mut best = 0
+    let mut best_v = logits[0]
+    for i in 1..n {
+        if logits[i] > best_v {
+            best_v = logits[i]
+            best = i
+        }
+    }
+    return best
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Count Green Tokens — for detection
+//
+//  Given a sequence of tokens, count how many fall in the green set.
+//  We start from index 1 (token[0] has no prev_token context).
+//
+//  Returns: [n_green, n_total]
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn wm_count_green(tokens, vocab_size, seed) {
+    let n = len(tokens)
+    if n < 2 { return [0, 0] }
+    let mut n_green = 0
+    let mut n_total = 0
+    for i in 1..n {
+        let prev = tokens[i - 1]
+        let cur = tokens[i]
+        let mask = wm_green_mask_default(prev, vocab_size, seed)
+        if mask[cur] == 1 {
+            n_green = n_green + 1
+        }
+        n_total = n_total + 1
+    }
+    return [n_green, n_total]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Z-Score — one-proportion z-test
+//
+//  H0: proportion of green = gamma (default 0.5)
+//  z = (p_hat - gamma) / sqrt(gamma * (1-gamma) / n)
+//
+//  High z → likely watermarked (reject H0)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn wm_z_score(n_green, n_total, gamma) {
+    if n_total <= 0 { return 0.0 }
+    let p_hat = to_float(n_green) / to_float(n_total)
+    let denom = wm_sqrt(gamma * (1.0 - gamma) / to_float(n_total))
+    if denom < 1.0e-10 { return 0.0 }
+    return (p_hat - gamma) / denom
+}
+
+// Default gamma=0.5
+@pure
+fn wm_z_score_default(n_green, n_total) {
+    return wm_z_score(n_green, n_total, 0.5)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Detect Watermark — full pipeline
+//
+//  1. Count green tokens
+//  2. Compute z-score
+//  3. Compare against threshold (typical: 4.0 for p < 0.00003)
+//
+//  Returns: [detected (0/1), z_score, n_green, n_total]
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn wm_detect(tokens, vocab_size, seed, threshold) {
+    let counts = wm_count_green(tokens, vocab_size, seed)
+    let n_green = counts[0]
+    let n_total = counts[1]
+    let z = wm_z_score_default(n_green, n_total)
+    let mut detected = 0
+    if z >= threshold { detected = 1 }
+    return [detected, z, n_green, n_total]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Watermarked Generation — greedy with green bias
+//
+//  logits_fn(prev_token) -> [vocab_size] raw logits
+//  Generates n_tokens with watermark delta applied.
+//
+//  Returns: array of generated token IDs
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn wm_generate(logits_fn, start_token, n_tokens, vocab_size, seed, delta) {
+    let mut tokens = [start_token]
+    let mut prev = start_token
+    for _t in 0..n_tokens {
+        let raw_logits = logits_fn(prev)
+        let mask = wm_green_mask_default(prev, vocab_size, seed)
+        let biased = wm_apply_bias(raw_logits, mask, delta)
+        let next = wm_argmax(biased)
+        tokens = tokens + [next]
+        prev = next
+    }
+    return tokens
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Unwatermarked Generation — baseline for comparison
+// ═══════════════════════════════════════════════════════════════════
+fn wm_generate_clean(logits_fn, start_token, n_tokens) {
+    let mut tokens = [start_token]
+    let mut prev = start_token
+    for _t in 0..n_tokens {
+        let raw_logits = logits_fn(prev)
+        let next = wm_argmax(raw_logits)
+        tokens = tokens + [next]
+        prev = next
+    }
+    return tokens
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  P-Value Approximation — from z-score (standard normal CDF)
+//
+//  Uses Abramowitz & Stegun approximation for upper tail.
+//  Returns: probability of seeing this z under null hypothesis
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn wm_p_value(z) {
+    if z < 0.0 { return 1.0 }
+    // Approximation: P(Z > z) ≈ (1/sqrt(2*pi)) * exp(-z^2/2) / z
+    let pi = 3.141592653589793
+    let inv_sqrt2pi = 1.0 / wm_sqrt(2.0 * pi)
+    let pdf = inv_sqrt2pi * wm_exp(-0.5 * z * z)
+    if z < 0.01 { return 0.5 }
+    let p = pdf / z
+    if p > 0.5 { return 0.5 }
+    return p
+}
+
+println("[watermark] loaded — green/red hash + logit bias + z-test detection")

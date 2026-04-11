@@ -1,0 +1,275 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/rlaif.hexa — Reinforcement Learning from AI Feedback
+//
+//  RLAIF eliminates human annotators by using an AI judge to generate
+//  preference pairs, then training via DPO/RLHF.
+//
+//  Implements:
+//    1. AI judge prompt generation — structured evaluation prompt
+//    2. Judge scoring             — multi-criteria scoring (simulated)
+//    3. Preference pair generation — pairwise comparison from scores
+//    4. Batch preference collection — multiple prompts x responses
+//    5. DPO/RLHF integration      — connect to existing pipelines
+//
+//  Criteria are represented as two parallel arrays:
+//    crit_names:   [string]  — criterion names
+//    crit_weights: [float]   — corresponding weights
+//
+//  API:
+//    rlaif_default_crit_names()   -> [string]
+//    rlaif_default_crit_weights() -> [float]
+//    rlaif_make_judge_prompt(prompt, resp_a, resp_b, crit_names, crit_weights)
+//    rlaif_score_response(prompt, response, crit_names, crit_weights, judge_fn)
+//    generate_preference(prompt, response_a, response_b, judge_fn)
+//    rlaif_collect_pairs(prompts, responses, judge_fn)
+//    rlaif_quality_filter_margins(margins, min_margin) -> [int] kept indices
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+// ═══════════════════════════════════════════════════════════════════
+
+// ── helpers ──────────────────────────────────────────────────────
+
+fn rlaif_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn rlaif_hash(seed, i) {
+    let mut h = seed * 2654435761 + i * 1315423911
+    h = h % 1000000
+    if h < 0 { h = 0 - h }
+    return h
+}
+
+fn rlaif_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Default Evaluation Criteria (separate arrays to avoid mixed types)
+// ═══════════════════════════════════════════════════════════════════
+fn rlaif_default_crit_names() {
+    return ["helpfulness", "accuracy", "harmlessness", "conciseness"]
+}
+
+fn rlaif_default_crit_weights() {
+    return [0.3, 0.3, 0.2, 0.2]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Make Judge Prompt — structured prompt for AI evaluator
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn rlaif_make_judge_prompt(prompt, response_a, response_b, crit_names, crit_weights) {
+    let mut text = "[JUDGE EVALUATION]\n"
+    text = text + "=== User Prompt ===\n"
+    text = text + prompt + "\n"
+    text = text + "=== Response A ===\n"
+    text = text + response_a + "\n"
+    text = text + "=== Response B ===\n"
+    text = text + response_b + "\n"
+    text = text + "=== Criteria ===\n"
+    let n_crit = len(crit_names)
+    for i in 0..n_crit {
+        text = text + "- " + crit_names[i] + " (weight: " + str(crit_weights[i]) + ")\n"
+    }
+    text = text + "=== Task ===\n"
+    text = text + "Compare Response A and Response B on each criterion.\n"
+    text = text + "Output the better response (A or B) with a confidence score.\n"
+    return text
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Score Response — evaluate single response on criteria
+//
+//  judge_fn(prompt, response, criterion_name) -> float (0..1)
+//  Returns: weighted total score
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn rlaif_score_response(prompt, response, crit_names, crit_weights, judge_fn) {
+    let n_crit = len(crit_names)
+    let mut total = 0.0
+    let mut weight_sum = 0.0
+    for i in 0..n_crit {
+        let name = crit_names[i]
+        let weight = crit_weights[i]
+        let score = judge_fn(prompt, response, name)
+        total = total + weight * score
+        weight_sum = weight_sum + weight
+    }
+    if weight_sum > 0.0 {
+        return total / weight_sum
+    }
+    return 0.0
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Generate Preference — compare two responses
+//
+//  Returns: [score_a, score_b, margin]
+//  Caller decides which is chosen/rejected based on scores.
+//
+//  This is the core RLAIF API function.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn generate_preference(prompt, response_a, response_b, judge_fn) {
+    let cn = rlaif_default_crit_names()
+    let cw = rlaif_default_crit_weights()
+    let score_a = rlaif_score_response(prompt, response_a, cn, cw, judge_fn)
+    let score_b = rlaif_score_response(prompt, response_b, cn, cw, judge_fn)
+    let margin = rlaif_abs(score_a - score_b)
+    return [score_a, score_b, margin]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Generate Preference with Custom Criteria
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn generate_preference_custom(prompt, response_a, response_b, judge_fn, cn, cw) {
+    let score_a = rlaif_score_response(prompt, response_a, cn, cw, judge_fn)
+    let score_b = rlaif_score_response(prompt, response_b, cn, cw, judge_fn)
+    let margin = rlaif_abs(score_a - score_b)
+    return [score_a, score_b, margin]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Collect Preference Scores — batch over multiple prompts
+//
+//  prompts: array of prompt strings
+//  responses: array of arrays [[resp1, resp2, ...], ...]
+//  judge_fn: scoring function
+//
+//  Returns: array of [score_a, score_b, margin] for each pair
+//  Also returns string pairs via chosen_texts / rejected_texts arrays
+// ═══════════════════════════════════════════════════════════════════
+fn rlaif_collect_scores(prompts, responses, judge_fn) {
+    let n_prompts = len(prompts)
+    let mut scores = []
+    for p in 0..n_prompts {
+        let prompt = prompts[p]
+        let resps = responses[p]
+        let n_resp = len(resps)
+        for i in 0..(n_resp - 1) {
+            for j in (i + 1)..n_resp {
+                let pref = generate_preference(prompt, resps[i], resps[j], judge_fn)
+                scores = scores + [pref]
+            }
+        }
+    }
+    return scores
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Collect chosen/rejected text pairs (separate string arrays)
+// ═══════════════════════════════════════════════════════════════════
+fn rlaif_collect_chosen(prompts, responses, judge_fn) {
+    let n_prompts = len(prompts)
+    let mut chosen = []
+    let mut rejected = []
+    for p in 0..n_prompts {
+        let prompt = prompts[p]
+        let resps = responses[p]
+        let n_resp = len(resps)
+        for i in 0..(n_resp - 1) {
+            for j in (i + 1)..n_resp {
+                let pref = generate_preference(prompt, resps[i], resps[j], judge_fn)
+                if pref[0] >= pref[1] {
+                    chosen = chosen + [resps[i]]
+                    rejected = rejected + [resps[j]]
+                } else {
+                    chosen = chosen + [resps[j]]
+                    rejected = rejected + [resps[i]]
+                }
+            }
+        }
+    }
+    return [chosen, rejected]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Quality Filter — keep indices where margin >= min_margin
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn rlaif_quality_filter_margins(margins, min_margin) {
+    let n = len(margins)
+    let mut kept = []
+    for i in 0..n {
+        if margins[i] >= min_margin {
+            kept = kept + [i]
+        }
+    }
+    return kept
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Extract margins from score triples
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn rlaif_extract_margins(score_triples) {
+    let n = len(score_triples)
+    let mut margins = rlaif_zeros(n)
+    for i in 0..n {
+        margins[i] = score_triples[i][2]
+    }
+    return margins
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Self-Play — generate responses then judge them
+// ═══════════════════════════════════════════════════════════════════
+fn rlaif_self_play(prompts, generate_fn, judge_fn, n_responses) {
+    let n_prompts = len(prompts)
+    let mut all_responses = []
+    for p in 0..n_prompts {
+        let mut resps = []
+        for r in 0..n_responses {
+            let resp = generate_fn(prompts[p])
+            resps = resps + [resp]
+        }
+        all_responses = all_responses + [resps]
+    }
+    return rlaif_collect_scores(prompts, all_responses, judge_fn)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Constitutional AI Filter — reject by harm score
+//
+//  harm_scores: [float] array, one per pair
+//  threshold: max acceptable harm level
+//  Returns: indices of safe pairs
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn rlaif_constitutional_filter(harm_scores, threshold) {
+    let n = len(harm_scores)
+    let mut safe = []
+    for i in 0..n {
+        if harm_scores[i] < threshold {
+            safe = safe + [i]
+        }
+    }
+    return safe
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Stats — summary of preference collection
+// ═══════════════════════════════════════════════════════════════════
+fn rlaif_stats(margins) {
+    let n = len(margins)
+    if n == 0 { return [0.0, 0.0, 0.0, 0.0] }
+    let mut sum_m = 0.0
+    let mut min_m = margins[0]
+    let mut max_m = margins[0]
+    for i in 0..n {
+        let m = margins[i]
+        sum_m = sum_m + m
+        if m < min_m { min_m = m }
+        if m > max_m { max_m = m }
+    }
+    let avg_m = sum_m / to_float(n)
+    return [to_float(n), avg_m, min_m, max_m]
+}
+
+println("[rlaif] loaded — AI judge + preference pairs + DPO/RLHF integration")

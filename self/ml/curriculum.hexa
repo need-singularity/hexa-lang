@@ -1,0 +1,271 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/curriculum.hexa — Curriculum Learning
+//
+//  Implements:
+//    1. Difficulty scorer   — loss-based difficulty for each sample
+//    2. Pacing function     — linear / sqrt / step competence growth
+//    3. Data scheduler      — easy→hard batch ordering via competence
+//    4. Curriculum trainer  — train loop with progressive difficulty
+//
+//  API (pure):
+//    score_difficulty(losses)                   -> [float]
+//    normalize_scores(scores)                   -> [float]  (0..1)
+//    pace_linear(step, total)                   -> float    (0..1)
+//    pace_sqrt(step, total)                     -> float    (0..1)
+//    pace_step(step, total, n_stages)           -> float    (0..1)
+//    schedule_batch(scores, competence, batch_size) -> [int] indices
+//    sort_indices_by_score(scores)              -> [int]    (ascending)
+//    curriculum_train_step(model, data, scores, competence, batch_size, lr)
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+//    @hot   — called every training step
+// ═══════════════════════════════════════════════════════════════════
+
+// ── helpers ──────────────────────────────────────────────────────
+
+fn cl_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn cl_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn cl_floor(x) {
+    let i = to_int(x)
+    if to_float(i) > x { return i - 1 }
+    return i
+}
+
+fn cl_min(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn cl_max(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn cl_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn cl_hash(seed, i) {
+    let h = ((seed * 2654435761 + i * 1315423911) % 10007)
+    if h < 0 { return 0 - h }
+    return h
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Difficulty Scorer — loss-based
+//
+//  Higher loss = harder sample. Returns raw difficulty scores.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn score_difficulty(losses) {
+    let n = len(losses)
+    let mut scores = cl_zeros(n)
+    for i in 0..n {
+        scores[i] = losses[i]
+    }
+    return scores
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Normalize Scores — map to [0, 1] range via min-max
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn normalize_scores(scores) {
+    let n = len(scores)
+    if n == 0 { return [] }
+    let mut lo = scores[0]
+    let mut hi = scores[0]
+    for i in 1..n {
+        if scores[i] < lo { lo = scores[i] }
+        if scores[i] > hi { hi = scores[i] }
+    }
+    let range = hi - lo
+    let mut out = cl_zeros(n)
+    if range < 1.0e-10 {
+        for i in 0..n { out[i] = 0.5 }
+        return out
+    }
+    for i in 0..n {
+        out[i] = (scores[i] - lo) / range
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Pacing Functions — competence c(t) in [0, 1]
+//
+//  c(t) determines what fraction of the data is "unlocked"
+//  at training step t out of total steps.
+// ═══════════════════════════════════════════════════════════════════
+
+// Linear: c(t) = t / total
+@pure
+fn pace_linear(step, total) {
+    if total <= 0 { return 1.0 }
+    let c = to_float(step) / to_float(total)
+    return cl_min(c, 1.0)
+}
+
+// Square root: c(t) = sqrt(t / total) — faster early unlock
+@pure
+fn pace_sqrt(step, total) {
+    if total <= 0 { return 1.0 }
+    let ratio = to_float(step) / to_float(total)
+    let c = cl_sqrt(cl_min(ratio, 1.0))
+    return cl_min(c, 1.0)
+}
+
+// Step: discrete stages — c jumps by 1/n_stages at each boundary
+@pure
+fn pace_step(step, total, n_stages) {
+    if total <= 0 { return 1.0 }
+    if n_stages <= 0 { return 1.0 }
+    let stage_len = total / n_stages
+    if stage_len <= 0 { return 1.0 }
+    let cur_stage = step / stage_len
+    let s = cl_min(cur_stage + 1, n_stages)
+    return to_float(s) / to_float(n_stages)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Sort Indices by Score — ascending (easy first)
+//
+//  Returns array of indices sorted by scores[i] ascending.
+//  Uses selection sort (simple, correct for curriculum sizes).
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn sort_indices_by_score(scores) {
+    let n = len(scores)
+    let mut indices = []
+    for i in 0..n { indices = indices + [i] }
+    // selection sort ascending
+    for i in 0..n {
+        let mut best = i
+        for j in (i + 1)..n {
+            if scores[indices[j]] < scores[indices[best]] {
+                best = j
+            }
+        }
+        if best != i {
+            let tmp = indices[i]
+            indices[i] = indices[best]
+            indices[best] = tmp
+        }
+    }
+    return indices
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Data Scheduler — select batch indices given competence
+//
+//  1. Sort all samples by difficulty (ascending = easy first)
+//  2. Determine pool size = competence * n (unlock fraction)
+//  3. Pick batch_size samples from the unlocked pool
+//
+//  Returns array of original data indices.
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn schedule_batch(scores, competence, batch_size) {
+    let n = len(scores)
+    let sorted_idx = sort_indices_by_score(scores)
+    // Pool = first ceil(competence * n) easiest samples
+    let pool_size_f = competence * to_float(n)
+    let mut pool_size = cl_floor(pool_size_f)
+    if pool_size < 1 { pool_size = 1 }
+    if pool_size > n { pool_size = n }
+    // Pick batch_size from pool (cycling if batch > pool)
+    let mut batch = []
+    let actual_bs = cl_min(batch_size, pool_size)
+    for i in 0..actual_bs {
+        let idx = i % pool_size
+        batch = batch + [sorted_idx[idx]]
+    }
+    return batch
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Rank-based Difficulty — alternative: rank / N as score
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn rank_difficulty(losses) {
+    let n = len(losses)
+    let sorted_idx = sort_indices_by_score(losses)
+    let mut ranks = cl_zeros(n)
+    for r in 0..n {
+        let orig = sorted_idx[r]
+        ranks[orig] = to_float(r) / to_float(n)
+    }
+    return ranks
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Curriculum Train Step (mock)
+//
+//  Given a model (weights), data samples, difficulty scores:
+//    1. Compute competence from pacing
+//    2. Schedule a batch (easy→hard)
+//    3. Compute loss on selected batch
+//    4. Return [avg_loss, pool_fraction]
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn curriculum_train_step(weights, data, scores, step, total_steps, batch_size, pace_mode) {
+    // Compute competence
+    let mut competence = 0.0
+    if pace_mode == 0 { competence = pace_linear(step, total_steps) }
+    if pace_mode == 1 { competence = pace_sqrt(step, total_steps) }
+    if pace_mode == 2 { competence = pace_step(step, total_steps, 5) }
+    // Schedule
+    let batch_indices = schedule_batch(scores, competence, batch_size)
+    let bs = len(batch_indices)
+    // Mock forward: loss = sum of scores for selected samples / bs
+    let mut total_loss = 0.0
+    for i in 0..bs {
+        let idx = batch_indices[i]
+        total_loss = total_loss + scores[idx]
+    }
+    let avg_loss = total_loss / to_float(bs)
+    return [avg_loss, competence]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Anti-curriculum (hard first) — for comparison/ablation
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn schedule_batch_hard_first(scores, competence, batch_size) {
+    let n = len(scores)
+    let sorted_idx = sort_indices_by_score(scores)
+    // Reverse: hard first
+    let mut rev_idx = []
+    for i in 0..n {
+        rev_idx = rev_idx + [sorted_idx[n - 1 - i]]
+    }
+    let pool_size_f = competence * to_float(n)
+    let mut pool_size = cl_floor(pool_size_f)
+    if pool_size < 1 { pool_size = 1 }
+    if pool_size > n { pool_size = n }
+    let mut batch = []
+    let actual_bs = cl_min(batch_size, pool_size)
+    for i in 0..actual_bs {
+        let idx = i % pool_size
+        batch = batch + [rev_idx[idx]]
+    }
+    return batch
+}
+
+println("[curriculum] loaded — difficulty scorer + pacing (linear/sqrt/step) + data scheduler")

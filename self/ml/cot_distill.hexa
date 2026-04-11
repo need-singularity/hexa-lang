@@ -1,0 +1,350 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/cot_distill.hexa — Chain-of-Thought Distillation
+//
+//  Distills reasoning ability from a teacher (with explicit CoT traces)
+//  into a smaller student model. Extends distillation.hexa.
+//
+//  Implements:
+//    1. CoT trace collection  — gather teacher reasoning chains
+//    2. Trace encoding        — convert step-by-step text to token IDs
+//    3. Trace-conditioned loss — student learns to replicate each step
+//    4. Step-by-step KD       — per-step KL divergence
+//    5. Combined CoT loss     — alpha * step_KL + (1-alpha) * final_CE
+//    6. CoT distill train step — gradient update with trace loss
+//
+//  API:
+//    cot_collect_trace(teacher_fn, prompt)          -> [step1, step2, ..., answer]
+//    cot_encode_trace(trace, tokenize_fn)           -> [[int]]
+//    cot_step_loss(student_logits, teacher_logits, temp)  -> float
+//    cot_trace_loss(student, teacher, trace_tokens, temp, alpha) -> float
+//    cot_distill_step(student, teacher, traces, temp, alpha, lr) -> student'
+//    cot_score_reasoning(student, trace_tokens)     -> float
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+//    @hot   — called every training step
+// ═══════════════════════════════════════════════════════════════════
+
+// ── helpers (from distillation.hexa convention) ──────────────────
+
+fn cot_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn cot_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn cot_log(x) {
+    if x <= 0.0 { return -30.0 }
+    let mut v = x
+    let mut count = 0
+    while v > 2.0 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    let d = v - 1.0
+    let ln_v = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_v
+}
+
+fn cot_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn cot_hash(seed, i, j) {
+    let h = ((seed * 2654435761 + i * 1315423911 + j * 731) % 10007)
+    return to_float(h) / 10007.0 - 0.5
+}
+
+fn cot_min(a, b) {
+    if a < b { return a }
+    return b
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Softmax with Temperature (from distillation.hexa)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cot_softmax(logits, temp) {
+    let n = len(logits)
+    let mut scaled = cot_zeros(n)
+    for i in 0..n {
+        scaled[i] = logits[i] / temp
+    }
+    let mut m = scaled[0]
+    for i in 1..n {
+        if scaled[i] > m { m = scaled[i] }
+    }
+    let mut exps = cot_zeros(n)
+    let mut z = 0.0
+    for i in 0..n {
+        exps[i] = cot_exp(scaled[i] - m)
+        z = z + exps[i]
+    }
+    let mut out = cot_zeros(n)
+    for i in 0..n {
+        out[i] = exps[i] / z
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  KL Divergence — KL(P || Q)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cot_kl(p, q) {
+    let n = len(p)
+    let mut kl = 0.0
+    for i in 0..n {
+        if p[i] > 1.0e-10 {
+            let ratio = p[i] / (q[i] + 1.0e-10)
+            kl = kl + p[i] * cot_log(ratio)
+        }
+    }
+    return kl
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Cross Entropy — CE(target_idx, logits)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cot_cross_entropy(logits, target_idx) {
+    let probs = cot_softmax(logits, 1.0)
+    let p = probs[target_idx]
+    if p > 1.0e-10 {
+        return 0.0 - cot_log(p)
+    }
+    return 30.0
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Linear Forward — simple mock model
+//
+//  weights: [out_dim x in_dim]
+//  input: [in_dim]
+//  Returns: [out_dim] logits
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cot_forward(weights, input) {
+    let out_dim = len(weights)
+    let in_dim = len(input)
+    let mut logits = cot_zeros(out_dim)
+    for i in 0..out_dim {
+        let mut s = 0.0
+        for j in 0..in_dim {
+            s = s + weights[i][j] * input[j]
+        }
+        logits[i] = s
+    }
+    return logits
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  CoT Trace Collection — teacher generates step-by-step reasoning
+//
+//  teacher_fn(prompt) -> string (full CoT trace with steps)
+//  Splits by "\n" to extract individual reasoning steps.
+//
+//  Returns: array of step strings (last element = final answer)
+// ═══════════════════════════════════════════════════════════════════
+fn cot_collect_trace(teacher_fn, prompt) {
+    let full_response = teacher_fn(prompt)
+    // Split into steps by newline using builtin split
+    let parts = split(full_response, "\n")
+    let mut steps = []
+    for i in 0..len(parts) {
+        if len(parts[i]) > 0 {
+            steps = steps + [parts[i]]
+        }
+    }
+    return steps
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  CoT Encode Trace — convert text steps to token sequences
+//
+//  tokenize_fn(text) -> [int] (token IDs)
+//  Returns: array of token arrays, one per step
+// ═══════════════════════════════════════════════════════════════════
+fn cot_encode_trace(trace_steps, tokenize_fn) {
+    let n_steps = len(trace_steps)
+    let mut encoded = []
+    for i in 0..n_steps {
+        let tokens = tokenize_fn(trace_steps[i])
+        encoded = encoded + [tokens]
+    }
+    return encoded
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Step-Level KD Loss — KL between teacher and student for one step
+//
+//  Computes KL(teacher_soft || student_soft) scaled by T^2
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn cot_step_loss(student_logits, teacher_logits, temp) {
+    let teacher_soft = cot_softmax(teacher_logits, temp)
+    let student_soft = cot_softmax(student_logits, temp)
+    let kl = cot_kl(teacher_soft, student_soft)
+    return temp * temp * kl
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Trace-Conditioned Loss — per-step KL + final CE
+//
+//  For each reasoning step, compute KL between teacher and student.
+//  Plus cross-entropy on the final answer token.
+//
+//  trace_tokens: array of token arrays (one per step)
+//  student/teacher: weight matrices [out_dim x in_dim]
+//  alpha: weight for step KL vs final CE
+//
+//  Returns: combined loss
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn cot_trace_loss(student_w, teacher_w, trace_inputs, temp, alpha) {
+    let n_steps = len(trace_inputs)
+    if n_steps == 0 { return 0.0 }
+
+    // Per-step KL loss
+    let mut step_kl_sum = 0.0
+    for s in 0..n_steps {
+        let input = trace_inputs[s]
+        let t_logits = cot_forward(teacher_w, input)
+        let s_logits = cot_forward(student_w, input)
+        let kl = cot_step_loss(s_logits, t_logits, temp)
+        step_kl_sum = step_kl_sum + kl
+    }
+    let avg_step_kl = step_kl_sum / to_float(n_steps)
+
+    // Final answer CE loss (last step, argmax of teacher as target)
+    let last_input = trace_inputs[n_steps - 1]
+    let t_last = cot_forward(teacher_w, last_input)
+    let s_last = cot_forward(student_w, last_input)
+    let mut target_idx = 0
+    let mut max_val = t_last[0]
+    for i in 1..len(t_last) {
+        if t_last[i] > max_val {
+            max_val = t_last[i]
+            target_idx = i
+        }
+    }
+    let ce = cot_cross_entropy(s_last, target_idx)
+
+    return alpha * avg_step_kl + (1.0 - alpha) * ce
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  CoT Distillation Train Step
+//
+//  Numerical gradient on student weights using trace loss.
+//  Returns: updated student weights
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn cot_distill_step(student, teacher, trace_inputs, temp, alpha, lr) {
+    let out_dim = len(student)
+    let in_dim = len(student[0])
+    let eps = 1.0e-4
+
+    let loss0 = cot_trace_loss(student, teacher, trace_inputs, temp, alpha)
+
+    // Copy student for perturbation
+    let mut tmp = []
+    for i in 0..out_dim {
+        let mut row = cot_zeros(in_dim)
+        for j in 0..in_dim { row[j] = student[i][j] }
+        tmp = tmp + [row]
+    }
+
+    // Compute gradients
+    let mut grads = []
+    for i in 0..out_dim {
+        let mut grow = cot_zeros(in_dim)
+        grads = grads + [grow]
+    }
+
+    for i in 0..out_dim {
+        for j in 0..in_dim {
+            let orig = tmp[i][j]
+            tmp[i][j] = orig + eps
+            let loss_p = cot_trace_loss(tmp, teacher, trace_inputs, temp, alpha)
+            grads[i][j] = (loss_p - loss0) / eps
+            tmp[i][j] = orig
+        }
+    }
+
+    // Apply gradients
+    let mut new_student = []
+    for i in 0..out_dim {
+        let mut row = cot_zeros(in_dim)
+        for j in 0..in_dim {
+            row[j] = student[i][j] - lr * grads[i][j]
+        }
+        new_student = new_student + [row]
+    }
+
+    return new_student
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Score Reasoning — how well student reproduces CoT steps
+//
+//  Returns: average per-step agreement (argmax match ratio)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cot_score_reasoning(student_w, teacher_w, trace_inputs) {
+    let n_steps = len(trace_inputs)
+    if n_steps == 0 { return 0.0 }
+    let mut matches = 0
+    for s in 0..n_steps {
+        let input = trace_inputs[s]
+        let t_logits = cot_forward(teacher_w, input)
+        let s_logits = cot_forward(student_w, input)
+        // Check argmax agreement
+        let mut t_best = 0
+        let mut s_best = 0
+        let out_dim = len(t_logits)
+        for i in 1..out_dim {
+            if t_logits[i] > t_logits[t_best] { t_best = i }
+            if s_logits[i] > s_logits[s_best] { s_best = i }
+        }
+        if t_best == s_best { matches = matches + 1 }
+    }
+    return to_float(matches) / to_float(n_steps)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Batch CoT Distill — multiple traces in one step
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn cot_batch_distill(student, teacher, all_traces, temp, alpha, lr) {
+    let n_traces = len(all_traces)
+    let mut current = student
+    let mut total_loss = 0.0
+    for t in 0..n_traces {
+        let loss = cot_trace_loss(current, teacher, all_traces[t], temp, alpha)
+        total_loss = total_loss + loss
+        current = cot_distill_step(current, teacher, all_traces[t], temp, alpha, lr)
+    }
+    return [current, total_loss / to_float(n_traces)]
+}
+
+println("[cot_distill] loaded — CoT trace collection + step-by-step KD + trace-conditioned loss")

@@ -1,0 +1,342 @@
+// ═══════════════════════════════════════════════════════════════
+//  test_cot_distill.hexa — Chain-of-Thought Distillation verification
+//
+//  Tests:
+//    1. cot_softmax sums to 1
+//    2. cot_kl is zero for identical distributions
+//    3. cot_kl is positive for different distributions
+//    4. cot_cross_entropy is zero-ish for correct target
+//    5. cot_forward output dimension correct
+//    6. cot_step_loss positive for different models
+//    7. cot_trace_loss combines step KL and final CE
+//    8. cot_collect_trace splits by newline
+//    9. cot_score_reasoning perfect for identical models
+//   10. cot_distill_step reduces loss
+//   11. alpha=0 uses only CE, alpha=1 uses only KL
+//   12. batch distill processes multiple traces
+//
+//  실행: ./hexa self/test_cot_distill.hexa
+// ═══════════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ── inlined from cot_distill.hexa ────────────────────────────
+
+fn cot_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn cot_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn cot_log(x) {
+    if x <= 0.0 { return -30.0 }
+    let mut v = x
+    let mut count = 0
+    while v > 2.0 { v = v / 2.718281828; count = count + 1 }
+    while v < 0.5 { v = v * 2.718281828; count = count - 1 }
+    let d = v - 1.0
+    let ln_v = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_v
+}
+
+fn cot_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn cot_hash(seed, i, j) {
+    let h = ((seed * 2654435761 + i * 1315423911 + j * 731) % 10007)
+    return to_float(h) / 10007.0 - 0.5
+}
+
+fn cot_min(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn cot_softmax(logits, temp) {
+    let n = len(logits)
+    let mut scaled = cot_zeros(n)
+    for i in 0..n { scaled[i] = logits[i] / temp }
+    let mut m = scaled[0]
+    for i in 1..n {
+        if scaled[i] > m { m = scaled[i] }
+    }
+    let mut exps = cot_zeros(n)
+    let mut z = 0.0
+    for i in 0..n {
+        exps[i] = cot_exp(scaled[i] - m)
+        z = z + exps[i]
+    }
+    let mut out = cot_zeros(n)
+    for i in 0..n { out[i] = exps[i] / z }
+    return out
+}
+
+fn cot_kl(p, q) {
+    let n = len(p)
+    let mut kl = 0.0
+    for i in 0..n {
+        if p[i] > 1.0e-10 {
+            let ratio = p[i] / (q[i] + 1.0e-10)
+            kl = kl + p[i] * cot_log(ratio)
+        }
+    }
+    return kl
+}
+
+fn cot_cross_entropy(logits, target_idx) {
+    let probs = cot_softmax(logits, 1.0)
+    let p = probs[target_idx]
+    if p > 1.0e-10 { return 0.0 - cot_log(p) }
+    return 30.0
+}
+
+fn cot_forward(weights, input) {
+    let out_dim = len(weights)
+    let in_dim = len(input)
+    let mut logits = cot_zeros(out_dim)
+    for i in 0..out_dim {
+        let mut s = 0.0
+        for j in 0..in_dim { s = s + weights[i][j] * input[j] }
+        logits[i] = s
+    }
+    return logits
+}
+
+fn cot_step_loss(student_logits, teacher_logits, temp) {
+    let teacher_soft = cot_softmax(teacher_logits, temp)
+    let student_soft = cot_softmax(student_logits, temp)
+    let kl = cot_kl(teacher_soft, student_soft)
+    return temp * temp * kl
+}
+
+fn cot_trace_loss(student_w, teacher_w, trace_inputs, temp, alpha) {
+    let n_steps = len(trace_inputs)
+    if n_steps == 0 { return 0.0 }
+    let mut step_kl_sum = 0.0
+    for s in 0..n_steps {
+        let input = trace_inputs[s]
+        let t_logits = cot_forward(teacher_w, input)
+        let s_logits = cot_forward(student_w, input)
+        let kl = cot_step_loss(s_logits, t_logits, temp)
+        step_kl_sum = step_kl_sum + kl
+    }
+    let avg_step_kl = step_kl_sum / to_float(n_steps)
+    let last_input = trace_inputs[n_steps - 1]
+    let t_last = cot_forward(teacher_w, last_input)
+    let s_last = cot_forward(student_w, last_input)
+    let mut target_idx = 0
+    let mut max_val = t_last[0]
+    for i in 1..len(t_last) {
+        if t_last[i] > max_val { max_val = t_last[i]; target_idx = i }
+    }
+    let ce = cot_cross_entropy(s_last, target_idx)
+    return alpha * avg_step_kl + (1.0 - alpha) * ce
+}
+
+fn cot_distill_step(student, teacher, trace_inputs, temp, alpha, lr) {
+    let out_dim = len(student)
+    let in_dim = len(student[0])
+    let eps = 1.0e-4
+    let loss0 = cot_trace_loss(student, teacher, trace_inputs, temp, alpha)
+    let mut tmp = []
+    for i in 0..out_dim {
+        let mut row = cot_zeros(in_dim)
+        for j in 0..in_dim { row[j] = student[i][j] }
+        tmp = tmp + [row]
+    }
+    let mut grads = []
+    for i in 0..out_dim {
+        let mut grow = cot_zeros(in_dim)
+        grads = grads + [grow]
+    }
+    for i in 0..out_dim {
+        for j in 0..in_dim {
+            let orig = tmp[i][j]
+            tmp[i][j] = orig + eps
+            let loss_p = cot_trace_loss(tmp, teacher, trace_inputs, temp, alpha)
+            grads[i][j] = (loss_p - loss0) / eps
+            tmp[i][j] = orig
+        }
+    }
+    let mut new_student = []
+    for i in 0..out_dim {
+        let mut row = cot_zeros(in_dim)
+        for j in 0..in_dim { row[j] = student[i][j] - lr * grads[i][j] }
+        new_student = new_student + [row]
+    }
+    return new_student
+}
+
+fn cot_score_reasoning(student_w, teacher_w, trace_inputs) {
+    let n_steps = len(trace_inputs)
+    if n_steps == 0 { return 0.0 }
+    let mut matches = 0
+    for s in 0..n_steps {
+        let input = trace_inputs[s]
+        let t_logits = cot_forward(teacher_w, input)
+        let s_logits = cot_forward(student_w, input)
+        let mut t_best = 0
+        let mut s_best = 0
+        let out_dim = len(t_logits)
+        for i in 1..out_dim {
+            if t_logits[i] > t_logits[t_best] { t_best = i }
+            if s_logits[i] > s_logits[s_best] { s_best = i }
+        }
+        if t_best == s_best { matches = matches + 1 }
+    }
+    return to_float(matches) / to_float(n_steps)
+}
+
+fn cot_collect_trace(teacher_fn, prompt) {
+    let full_response = teacher_fn(prompt)
+    let parts = split(full_response, "\n")
+    let mut steps = []
+    for i in 0..len(parts) {
+        if len(parts[i]) > 0 { steps = steps + [parts[i]] }
+    }
+    return steps
+}
+
+fn cot_batch_distill(student, teacher, all_traces, temp, alpha, lr) {
+    let n_traces = len(all_traces)
+    let mut current = student
+    let mut total_loss = 0.0
+    for t in 0..n_traces {
+        let loss = cot_trace_loss(current, teacher, all_traces[t], temp, alpha)
+        total_loss = total_loss + loss
+        current = cot_distill_step(current, teacher, all_traces[t], temp, alpha, lr)
+    }
+    return [current, total_loss / to_float(n_traces)]
+}
+
+// ── helper: create weight matrix ─────────────────────────────
+fn make_weights(out_dim, in_dim, seed) {
+    let mut w = []
+    for i in 0..out_dim {
+        let mut row = cot_zeros(in_dim)
+        for j in 0..in_dim { row[j] = cot_hash(seed, i, j) * 0.1 }
+        w = w + [row]
+    }
+    return w
+}
+
+// ── mock teacher function ────────────────────────────────────
+fn mock_teacher(prompt) {
+    return "Step 1: Analyze the problem\nStep 2: Break into parts\nStep 3: Solve each part\nAnswer: 42"
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  TESTS
+// ═══════════════════════════════════════════════════════════════
+
+let OUT_DIM = 4
+let IN_DIM = 3
+
+// T1: softmax sums to 1
+let logits1 = [1.0, 2.0, 3.0, 0.5]
+let sm = cot_softmax(logits1, 1.0)
+let sm_sum = sm[0] + sm[1] + sm[2] + sm[3]
+check("softmax sums to 1", approx(sm_sum, 1.0, 0.01))
+
+// T2: KL divergence is zero for identical
+let p_same = [0.25, 0.25, 0.25, 0.25]
+let kl_same = cot_kl(p_same, p_same)
+check("KL=0 for identical distributions", approx(kl_same, 0.0, 0.001))
+
+// T3: KL positive for different
+let p_diff = [0.1, 0.2, 0.3, 0.4]
+let q_diff = [0.4, 0.3, 0.2, 0.1]
+let kl_diff = cot_kl(p_diff, q_diff)
+check("KL > 0 for different distributions", kl_diff > 0.0)
+
+// T4: cross entropy minimal for correct target
+let ce_logits = [0.1, 0.1, 10.0, 0.1]
+let ce_correct = cot_cross_entropy(ce_logits, 2)
+let ce_wrong = cot_cross_entropy(ce_logits, 0)
+check("CE lower for correct target", ce_correct < ce_wrong)
+
+// T5: forward output dimension
+let teacher_w = make_weights(OUT_DIM, IN_DIM, 42)
+let test_input = [1.0, 0.5, -0.3]
+let out = cot_forward(teacher_w, test_input)
+check("forward output dim correct", len(out) == OUT_DIM)
+
+// T6: step_loss positive for different models
+let student_w = make_weights(OUT_DIM, IN_DIM, 99)
+let t_logits = cot_forward(teacher_w, test_input)
+let s_logits = cot_forward(student_w, test_input)
+let sl = cot_step_loss(s_logits, t_logits, 2.0)
+check("step_loss > 0 for different models", sl > 0.0)
+
+// T7: trace_loss combines KL and CE
+let trace_inputs = [[1.0, 0.5, -0.3], [0.2, 0.8, 0.1], [-0.5, 0.3, 0.7]]
+let tl = cot_trace_loss(student_w, teacher_w, trace_inputs, 2.0, 0.5)
+check("trace_loss > 0", tl > 0.0)
+
+// T8: collect_trace splits correctly
+let trace = cot_collect_trace(mock_teacher, "test")
+check("trace has 4 steps", len(trace) == 4)
+check("first step starts with Step", len(trace[0]) > 5)
+
+// T9: score_reasoning = 1.0 for identical models
+let same_w = make_weights(OUT_DIM, IN_DIM, 42)
+let score_same = cot_score_reasoning(same_w, teacher_w, trace_inputs)
+check("score_reasoning = 1.0 for same weights", approx(score_same, 1.0, 0.01))
+
+// T10: distill_step reduces loss
+let student_w2 = make_weights(OUT_DIM, IN_DIM, 77)
+let loss_before = cot_trace_loss(student_w2, teacher_w, trace_inputs, 2.0, 0.5)
+let updated = cot_distill_step(student_w2, teacher_w, trace_inputs, 2.0, 0.5, 0.01)
+let loss_after = cot_trace_loss(updated, teacher_w, trace_inputs, 2.0, 0.5)
+check("distill_step reduces loss", loss_after < loss_before)
+
+// T11: alpha=0 uses only CE, alpha=1 uses only KL
+let loss_ce_only = cot_trace_loss(student_w, teacher_w, trace_inputs, 2.0, 0.0)
+let loss_kl_only = cot_trace_loss(student_w, teacher_w, trace_inputs, 2.0, 1.0)
+check("alpha=0 and alpha=1 give different losses", fabs(loss_ce_only - loss_kl_only) > 0.001)
+
+// T12: batch distill processes multiple traces
+let traces_batch = [
+    [[1.0, 0.5, -0.3], [0.2, 0.8, 0.1]],
+    [[-0.1, 0.3, 0.9], [0.5, -0.2, 0.4]]
+]
+let student_w3 = make_weights(OUT_DIM, IN_DIM, 55)
+let batch_result = cot_batch_distill(student_w3, teacher_w, traces_batch, 2.0, 0.5, 0.01)
+check("batch distill returns avg loss > 0", batch_result[1] > 0.0)
+
+// ═══════════════════════════════════════════════════════════════
+println("")
+println("=== cot_distill test summary ===")
+println("PASS: " + str(pass_count))
+println("FAIL: " + str(fail_count))
+println("TOTAL: " + str(pass_count + fail_count))

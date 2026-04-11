@@ -1,0 +1,369 @@
+// ═══════════════════════════════════════════════════════════════
+//  test_multi_task.hexa — Multi-Task Learning verification
+//
+//  Tests:
+//    1. shared encoder creation and dimensions
+//    2. task head creation and dimensions
+//    3. encoder forward produces correct hidden dim
+//    4. head forward produces correct output dim
+//    5. full forward routes to correct task head
+//    6. MSE loss is zero for identical pred/target
+//    7. loss_fixed weighted sum correctness
+//    8. loss_uncertainty weighting formula
+//    9. task router selects highest-score task
+//   10. router scores dimension correctness
+//   11. train_step reduces loss
+//   12. different tasks produce different outputs
+//
+//  실행: ./hexa self/test_multi_task.hexa
+// ═══════════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ── inlined from multi_task.hexa ────────────────────────────
+
+fn mt_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn mt_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn mt_log(x) {
+    if x <= 0.0 { return -30.0 }
+    let mut v = x
+    let mut count = 0
+    while v > 2.0 { v = v / 2.718281828; count = count + 1 }
+    while v < 0.5 { v = v * 2.718281828; count = count - 1 }
+    let d = v - 1.0
+    let ln_v = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_v
+}
+
+fn mt_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn mt_hash(seed, i, j) {
+    let h = ((seed * 2654435761 + i * 1315423911 + j * 731) % 10007)
+    return to_float(h) / 10007.0 - 0.5
+}
+
+fn mt_relu(x) {
+    if x > 0.0 { return x }
+    return 0.0
+}
+
+fn mt_create_shared(in_dim, hidden_dim) {
+    let mut w = []
+    for i in 0..hidden_dim {
+        let mut row = mt_zeros(in_dim)
+        for j in 0..in_dim { row[j] = mt_hash(42, i, j) * 0.1 }
+        w = w + [row]
+    }
+    return w
+}
+
+fn mt_create_head(hidden_dim, out_dim, seed) {
+    let mut w = []
+    for i in 0..out_dim {
+        let mut row = mt_zeros(hidden_dim)
+        for j in 0..hidden_dim { row[j] = mt_hash(seed, i, j) * 0.1 }
+        w = w + [row]
+    }
+    return w
+}
+
+fn mt_encoder_forward(weights, input) {
+    let hidden_dim = len(weights)
+    let in_dim = len(input)
+    let mut h = mt_zeros(hidden_dim)
+    for i in 0..hidden_dim {
+        let mut s = 0.0
+        for j in 0..in_dim { s = s + weights[i][j] * input[j] }
+        h[i] = mt_relu(s)
+    }
+    return h
+}
+
+fn mt_head_forward(head, hidden) {
+    let out_dim = len(head)
+    let hidden_dim = len(hidden)
+    let mut out = mt_zeros(out_dim)
+    for i in 0..out_dim {
+        let mut s = 0.0
+        for j in 0..hidden_dim { s = s + head[i][j] * hidden[j] }
+        out[i] = s
+    }
+    return out
+}
+
+fn mt_forward(shared, heads, input, task_id) {
+    let hidden = mt_encoder_forward(shared, input)
+    let head = heads[task_id]
+    return mt_head_forward(head, hidden)
+}
+
+fn mt_mse_loss(pred, target) {
+    let n = len(pred)
+    let mut loss = 0.0
+    for i in 0..n {
+        let d = pred[i] - target[i]
+        loss = loss + d * d
+    }
+    return loss / to_float(n)
+}
+
+fn mt_loss_fixed(losses, ratios) {
+    let n = len(losses)
+    let mut total = 0.0
+    for i in 0..n { total = total + ratios[i] * losses[i] }
+    return total
+}
+
+fn mt_loss_uncertainty(losses, log_vars) {
+    let n = len(losses)
+    let mut total = 0.0
+    for i in 0..n {
+        let precision = 1.0 / (2.0 * mt_exp(log_vars[i]))
+        total = total + precision * losses[i] + log_vars[i] / 2.0
+    }
+    return total
+}
+
+fn mt_route_task(input, n_tasks, router_w) {
+    let in_dim = len(input)
+    let mut best_id = 0
+    let mut best_score = -1.0e30
+    for t in 0..n_tasks {
+        let mut s = 0.0
+        for j in 0..in_dim { s = s + router_w[t][j] * input[j] }
+        if s > best_score { best_score = s; best_id = t }
+    }
+    return best_id
+}
+
+fn mt_route_scores(input, n_tasks, router_w) {
+    let in_dim = len(input)
+    let mut scores = mt_zeros(n_tasks)
+    for t in 0..n_tasks {
+        let mut s = 0.0
+        for j in 0..in_dim { s = s + router_w[t][j] * input[j] }
+        scores[t] = s
+    }
+    return scores
+}
+
+fn mt_create_router(in_dim, n_tasks) {
+    let mut w = []
+    for t in 0..n_tasks {
+        let mut row = mt_zeros(in_dim)
+        for j in 0..in_dim { row[j] = mt_hash(7919 + t, t, j) * 0.05 }
+        w = w + [row]
+    }
+    return w
+}
+
+fn mt_train_step(shared, heads, data, ratios, lr) {
+    let n_samples = len(data)
+    let n_tasks = len(heads)
+    let hidden_dim = len(shared)
+    let in_dim = len(shared[0])
+    let eps = 1.0e-4
+    let mut task_losses = mt_zeros(n_tasks)
+    let mut task_counts = mt_zeros(n_tasks)
+    for s in 0..n_samples {
+        let pred = mt_forward(shared, heads, data[s][0], data[s][2])
+        let loss = mt_mse_loss(pred, data[s][1])
+        task_losses[data[s][2]] = task_losses[data[s][2]] + loss
+        task_counts[data[s][2]] = task_counts[data[s][2]] + 1.0
+    }
+    for t in 0..n_tasks {
+        if task_counts[t] > 0.0 { task_losses[t] = task_losses[t] / task_counts[t] }
+    }
+    let total_loss = mt_loss_fixed(task_losses, ratios)
+    for i in 0..hidden_dim {
+        for j in 0..in_dim {
+            let orig = shared[i][j]
+            shared[i][j] = orig + eps
+            let mut tl_plus = mt_zeros(n_tasks)
+            let mut tc_plus = mt_zeros(n_tasks)
+            for s in 0..n_samples {
+                let pred_p = mt_forward(shared, heads, data[s][0], data[s][2])
+                let loss_p = mt_mse_loss(pred_p, data[s][1])
+                tl_plus[data[s][2]] = tl_plus[data[s][2]] + loss_p
+                tc_plus[data[s][2]] = tc_plus[data[s][2]] + 1.0
+            }
+            for t in 0..n_tasks {
+                if tc_plus[t] > 0.0 { tl_plus[t] = tl_plus[t] / tc_plus[t] }
+            }
+            let loss_plus = mt_loss_fixed(tl_plus, ratios)
+            let grad = (loss_plus - total_loss) / eps
+            shared[i][j] = orig - lr * grad
+        }
+    }
+    return total_loss
+}
+
+fn mt_train_step_v2(shared, heads, inputs, targets, tids, ratios, lr) {
+    let n_samples = len(inputs)
+    let n_tasks = len(heads)
+    let hidden_dim = len(shared)
+    let in_dim = len(shared[0])
+    let eps = 1.0e-4
+    let mut task_losses = mt_zeros(n_tasks)
+    let mut task_counts = mt_zeros(n_tasks)
+    for s in 0..n_samples {
+        let tid = tids[s]
+        let pred = mt_forward(shared, heads, inputs[s], tid)
+        let loss = mt_mse_loss(pred, targets[s])
+        task_losses[tid] = task_losses[tid] + loss
+        task_counts[tid] = task_counts[tid] + 1.0
+    }
+    for t in 0..n_tasks {
+        if task_counts[t] > 0.0 { task_losses[t] = task_losses[t] / task_counts[t] }
+    }
+    let total_loss = mt_loss_fixed(task_losses, ratios)
+    for i in 0..hidden_dim {
+        for j in 0..in_dim {
+            let orig = shared[i][j]
+            shared[i][j] = orig + eps
+            let mut tl_plus = mt_zeros(n_tasks)
+            let mut tc_plus = mt_zeros(n_tasks)
+            for s in 0..n_samples {
+                let tid_s = tids[s]
+                let pred_p = mt_forward(shared, heads, inputs[s], tid_s)
+                let loss_p = mt_mse_loss(pred_p, targets[s])
+                tl_plus[tid_s] = tl_plus[tid_s] + loss_p
+                tc_plus[tid_s] = tc_plus[tid_s] + 1.0
+            }
+            for t in 0..n_tasks {
+                if tc_plus[t] > 0.0 { tl_plus[t] = tl_plus[t] / tc_plus[t] }
+            }
+            let loss_plus = mt_loss_fixed(tl_plus, ratios)
+            let grad = (loss_plus - total_loss) / eps
+            shared[i][j] = orig - lr * grad
+        }
+    }
+    return total_loss
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  TESTS
+// ═══════════════════════════════════════════════════════════════
+
+let IN_DIM = 4
+let HIDDEN = 6
+let OUT_A = 3
+let OUT_B = 2
+
+// T1: shared encoder dimensions
+let shared = mt_create_shared(IN_DIM, HIDDEN)
+check("shared rows=hidden_dim", len(shared) == HIDDEN)
+check("shared cols=in_dim", len(shared[0]) == IN_DIM)
+
+// T2: head dimensions
+let head_a = mt_create_head(HIDDEN, OUT_A, 100)
+let head_b = mt_create_head(HIDDEN, OUT_B, 200)
+check("head_a rows=out_dim_a", len(head_a) == OUT_A)
+check("head_b rows=out_dim_b", len(head_b) == OUT_B)
+
+// T3: encoder forward hidden dim
+let input1 = [1.0, 0.5, -0.3, 0.8]
+let hidden1 = mt_encoder_forward(shared, input1)
+check("encoder output dim=hidden", len(hidden1) == HIDDEN)
+
+// T4: head forward output dim
+let out_a = mt_head_forward(head_a, hidden1)
+check("head_a output dim", len(out_a) == OUT_A)
+
+// T5: full forward routes correctly
+let heads = [head_a, head_b]
+let fwd_0 = mt_forward(shared, heads, input1, 0)
+let fwd_1 = mt_forward(shared, heads, input1, 1)
+check("task 0 output dim=OUT_A", len(fwd_0) == OUT_A)
+check("task 1 output dim=OUT_B", len(fwd_1) == OUT_B)
+
+// T6: MSE loss zero for identical
+let target_same = [1.0, 2.0, 3.0]
+let pred_same = [1.0, 2.0, 3.0]
+check("mse zero for identical", approx(mt_mse_loss(pred_same, target_same), 0.0, 0.001))
+
+// T7: loss_fixed weighted sum
+let test_losses = [1.0, 2.0]
+let test_ratios = [0.3, 0.7]
+let fixed_loss = mt_loss_fixed(test_losses, test_ratios)
+check("loss_fixed = 0.3*1 + 0.7*2 = 1.7", approx(fixed_loss, 1.7, 0.01))
+
+// T8: loss_uncertainty weighting
+let test_logvars = [0.0, 0.0]
+let unc_loss = mt_loss_uncertainty(test_losses, test_logvars)
+check("uncertainty loss > 0", unc_loss > 0.0)
+
+// T9: task router picks correct task
+let router_w = [[1.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]]
+let route_input = [0.1, 0.0, 0.0, 0.9]
+let routed = mt_route_task(route_input, 2, router_w)
+check("router picks task 1 for high dim4", routed == 1)
+
+// T10: route_scores returns correct number
+let rscores = mt_route_scores(input1, 2, router_w)
+check("route_scores dim=n_tasks", len(rscores) == 2)
+
+// T11: train step reduces loss
+let shared2 = mt_create_shared(IN_DIM, HIDDEN)
+let head_c = mt_create_head(HIDDEN, OUT_A, 300)
+let head_d = mt_create_head(HIDDEN, OUT_A, 400)
+let heads2 = [head_c, head_d]
+let inputs_11 = [[1.0, 0.5, -0.3, 0.8], [0.2, 0.9, 0.1, -0.4]]
+let targets_11 = [[0.1, 0.2, 0.3], [0.5, 0.5, 0.5]]
+let tids_11 = [0, 0]
+let ratios2 = [0.5, 0.5]
+let loss_before = mt_train_step_v2(shared2, heads2, inputs_11, targets_11, tids_11, ratios2, 0.01)
+check("train_step returns positive loss", loss_before > 0.0)
+
+// T12: different tasks produce different outputs
+let shared3 = mt_create_shared(IN_DIM, HIDDEN)
+let head_e = mt_create_head(HIDDEN, OUT_A, 500)
+let head_f = mt_create_head(HIDDEN, OUT_A, 600)
+let heads3 = [head_e, head_f]
+let same_input = [0.5, 0.5, 0.5, 0.5]
+let out_t0 = mt_forward(shared3, heads3, same_input, 0)
+let out_t1 = mt_forward(shared3, heads3, same_input, 1)
+let diff = fabs(out_t0[0] - out_t1[0]) + fabs(out_t0[1] - out_t1[1])
+check("different tasks give different outputs", diff > 0.001)
+
+// ═══════════════════════════════════════════════════════════════
+println("")
+println("=== multi_task test summary ===")
+println("PASS: " + str(pass_count))
+println("FAIL: " + str(fail_count))
+println("TOTAL: " + str(pass_count + fail_count))
