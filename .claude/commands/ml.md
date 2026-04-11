@@ -18,12 +18,13 @@ ML 다음 레벨 로드맵을 관리한다.
 done: N / partial: N / todo: N  (총 N개)
 ```
 
-### "go" (메인 명령어, "next"와 동일)
-- status가 todo 또는 partial인 항목 중 priority 가장 높은(P0>P1>P2>P3) 것을 선택
-- 해당 항목의 remaining 작업을 분석
-- **확인 없이 즉시 구현 시작** (GO 모드)
-- 독립적인 항목이 여러 개면 병렬 Agent 발사 (최대 5개)
-- 완료 후 JSON 갱신 + ASCII 결과표 출력
+### "go" (메인 명령어)
+- status가 todo 또는 partial인 **모든** 항목을 수집
+- **전부 병렬 백그라운드 Agent로 동시 발사** (run_in_background: true)
+- 확인 질문 없이 즉시 실행
+- 발사 테이블 출력 (항목별 에이전트 ID + 상태)
+- 각 에이전트가 완료되면 JSON status/summary 자동 갱신
+- 에이전트 프롬프트에 반드시 포함: 파일 경로, remaining 작업, 문법 주의사항, 구현 규칙, JSON 갱신 지시
 
 ### "next"
 - "go"와 동일하되, 구현 계획을 먼저 제시하고 사용자 확인 후 시작
