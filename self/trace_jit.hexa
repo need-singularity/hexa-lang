@@ -1,0 +1,235 @@
+// Trace JIT: hot loop detection and trace recording for the HEXA VM.
+// Port of src/trace_jit.rs to self-host.
+//
+// Strategy (trace-based JIT compilation):
+//   1. Detect backward jumps (loops) in the VM dispatch loop.
+//   2. Count iterations per loop header (keyed by code_segment_idx + ip).
+//   3. When a loop becomes "hot" (>= HOTNESS_THRESHOLD iterations), start
+//      recording the sequence of opcodes executed during one full iteration.
+//   4. The recorded trace is a linear sequence of opcodes that can be
+//      compiled to native code.
+//   5. On subsequent iterations, execute the compiled trace instead of
+//      interpreting opcode-by-opcode.
+//
+// Self-host scope: steps 1–4 only (the VM the trace JIT serves is the
+// src/vm.rs Rust VM — self-host has no bytecode VM yet so this module
+// is a bookkeeping / state-machine reference port).
+
+pub let mut HOTNESS_THRESHOLD = 100
+
+// LoopId: (code_idx, header_ip). Encoded as a single 64-bit-ish key for
+// host array lookup:  code_idx * 1_000_000 + header_ip
+fn loop_id_key(code_idx, header_ip) {
+    return code_idx * 1000000 + header_ip
+}
+
+// ── Loop status values ──
+// We use small integer tags instead of a sum type:
+//   0 = Counting(count)
+//   1 = Recording(trace)
+//   2 = Ready(trace)
+let STATUS_COUNTING  = 0
+let STATUS_RECORDING = 1
+let STATUS_READY     = 2
+
+// TraceAction values (returned to the VM):
+//   "interpret"       — continue normal interpretation
+//   "start_recording" — begin recording this iteration
+//   "trace_ready"     — trace is finalized / ready for replay
+//   "execute_native"  — compiled trace available, execute native
+
+// ── Engine state (module-level, mirrors the Rust struct) ───
+pub let mut tjit_loop_keys = []         // host array of int keys
+pub let mut tjit_loop_status = []       // host array of int status tags
+pub let mut tjit_loop_counts = []       // Counting count
+pub let mut tjit_loop_entries = []      // Recording/Ready entries (host array of [ip, opcode])
+pub let mut tjit_loop_exec_count = []   // Ready trace exec_count
+pub let mut tjit_loop_compiled = []     // Ready trace is_compiled (bool)
+pub let mut tjit_active_recording = -1  // loop key currently recording, -1 = none
+
+fn tjit_new() {
+    tjit_loop_keys = []
+    tjit_loop_status = []
+    tjit_loop_counts = []
+    tjit_loop_entries = []
+    tjit_loop_exec_count = []
+    tjit_loop_compiled = []
+    tjit_active_recording = -1
+}
+
+fn tjit_find_loop(key) {
+    let mut i = 0
+    while i < len(tjit_loop_keys) {
+        if tjit_loop_keys[i] == key { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn tjit_add_loop(key) {
+    tjit_loop_keys = tjit_loop_keys.push(key)
+    tjit_loop_status = tjit_loop_status.push(STATUS_COUNTING)
+    tjit_loop_counts = tjit_loop_counts.push(0)
+    tjit_loop_entries = tjit_loop_entries.push([])
+    tjit_loop_exec_count = tjit_loop_exec_count.push(0)
+    tjit_loop_compiled = tjit_loop_compiled.push(false)
+    return len(tjit_loop_keys) - 1
+}
+
+// ── Hot loop detection ──
+// Called by the VM on every backward jump. Returns the action the VM should take.
+fn tjit_on_backward_jump(code_idx, target_ip) {
+    let key = loop_id_key(code_idx, target_ip)
+
+    // If we are currently recording a *different* loop, just interpret.
+    if tjit_active_recording >= 0 {
+        if tjit_active_recording != key {
+            return "interpret"
+        }
+    }
+
+    let mut idx = tjit_find_loop(key)
+    if idx < 0 { idx = tjit_add_loop(key) }
+
+    let status = tjit_loop_status[idx]
+    if status == STATUS_COUNTING {
+        let c = tjit_loop_counts[idx] + 1
+        tjit_loop_counts[idx] = c
+        if c >= HOTNESS_THRESHOLD {
+            tjit_loop_status[idx] = STATUS_RECORDING
+            tjit_loop_entries[idx] = []
+            tjit_active_recording = key
+            return "start_recording"
+        }
+        return "interpret"
+    }
+    if status == STATUS_RECORDING {
+        // Hit the backward jump again — iteration complete. Finalize.
+        tjit_loop_status[idx] = STATUS_READY
+        tjit_active_recording = -1
+        return "trace_ready"
+    }
+    if status == STATUS_READY {
+        tjit_loop_exec_count[idx] = tjit_loop_exec_count[idx] + 1
+        if tjit_loop_compiled[idx] {
+            return "execute_native"
+        }
+        return "trace_ready"
+    }
+    return "interpret"
+}
+
+// ── Trace recording ──
+fn tjit_is_recording() {
+    return tjit_active_recording >= 0
+}
+
+// Record an opcode during trace recording. Called by the VM for every
+// opcode executed while recording is active.
+fn tjit_record_opcode(ip, opcode) {
+    if tjit_active_recording < 0 { return }
+    let idx = tjit_find_loop(tjit_active_recording)
+    if idx < 0 { return }
+    if tjit_loop_status[idx] != STATUS_RECORDING { return }
+    tjit_loop_entries[idx] = tjit_loop_entries[idx].push([ip, opcode])
+}
+
+// ── Trace access ──
+fn tjit_get_trace(code_idx, header_ip) {
+    let key = loop_id_key(code_idx, header_ip)
+    let idx = tjit_find_loop(key)
+    if idx < 0 { return "" }
+    if tjit_loop_status[idx] != STATUS_READY { return "" }
+    return tjit_loop_entries[idx]
+}
+
+fn tjit_mark_compiled(code_idx, header_ip) {
+    let key = loop_id_key(code_idx, header_ip)
+    let idx = tjit_find_loop(key)
+    if idx < 0 { return }
+    if tjit_loop_status[idx] != STATUS_READY { return }
+    tjit_loop_compiled[idx] = true
+}
+
+fn tjit_loop_count(code_idx, header_ip) {
+    let key = loop_id_key(code_idx, header_ip)
+    let idx = tjit_find_loop(key)
+    if idx < 0 { return 0 }
+    let status = tjit_loop_status[idx]
+    if status == STATUS_COUNTING { return tjit_loop_counts[idx] }
+    if status == STATUS_RECORDING { return HOTNESS_THRESHOLD }
+    if status == STATUS_READY { return HOTNESS_THRESHOLD + tjit_loop_exec_count[idx] }
+    return 0
+}
+
+fn tjit_traced_loops() {
+    let mut out = []
+    let mut i = 0
+    while i < len(tjit_loop_keys) {
+        if tjit_loop_status[i] == STATUS_READY {
+            out = out.push(tjit_loop_keys[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn tjit_reset() {
+    tjit_new()
+}
+
+// ── Tests (mirror src/trace_jit.rs `mod tests`) ──
+fn _tjit_test_hotness_counting() {
+    tjit_reset()
+    // First 99 iterations — still cold.
+    let mut i = 0
+    while i < 99 {
+        let a = tjit_on_backward_jump(0, 5)
+        assert a == "interpret"
+        i = i + 1
+    }
+    // 100th iteration — becomes hot, starts recording.
+    let a = tjit_on_backward_jump(0, 5)
+    assert a == "start_recording"
+}
+
+fn _tjit_test_recording_and_finalization() {
+    tjit_reset()
+    // Warm up to threshold.
+    let mut i = 0
+    while i < HOTNESS_THRESHOLD {
+        tjit_on_backward_jump(0, 5)
+        i = i + 1
+    }
+    assert tjit_is_recording()
+    // Record a few opcodes.
+    tjit_record_opcode(10, "add")
+    tjit_record_opcode(11, "load")
+    tjit_record_opcode(12, "branch")
+    // Second backward jump → finalize.
+    let a = tjit_on_backward_jump(0, 5)
+    assert a == "trace_ready"
+    let trace = tjit_get_trace(0, 5)
+    assert type_of(trace) == "array"
+    assert len(trace) == 3
+}
+
+fn _tjit_test_mark_compiled() {
+    tjit_reset()
+    // Build a ready trace.
+    let mut i = 0
+    while i < HOTNESS_THRESHOLD + 1 {
+        tjit_on_backward_jump(0, 5)
+        i = i + 1
+    }
+    tjit_mark_compiled(0, 5)
+    let a = tjit_on_backward_jump(0, 5)
+    assert a == "execute_native"
+}
+
+fn trace_jit_run_tests() {
+    _tjit_test_hotness_counting()
+    _tjit_test_recording_and_finalization()
+    _tjit_test_mark_compiled()
+    println("trace_jit: 3 tests PASS")
+}
