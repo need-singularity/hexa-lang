@@ -1,0 +1,716 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/mamba_s6.hexa — Mamba S6: Selective State Space Model
+//
+//  Full Mamba architecture (Gu & Dao, 2023):
+//    - SSM parameters: A (diagonal state), B (input), C (output), D (skip)
+//    - Discretization: zero-order hold  A_bar = exp(delta*A), B_bar = delta*B
+//    - Input-dependent selection: delta, B, C computed from input x
+//    - Conv1d depthwise causal preprocessing
+//    - Recurrent mode: h_{t+1} = A_bar * h_t + B_bar * x_t
+//    - Parallel scan mode for training (associative scan)
+//    - Full Mamba block: linear proj -> conv1d -> SSM -> output proj + residual
+//
+//  API:
+//    s6_zeros(n)                                      -> [float]
+//    s6_zeros_2d(r, c)                                -> [[float]]
+//    s6_init_A_diag(d_state)                          -> [float]
+//    s6_discretize_zoh(A_diag, delta)                 -> [float]  (A_bar diag)
+//    s6_discretize_B(delta, B_vec)                    -> [float]  (B_bar)
+//    s6_project_delta(x, W_delta, bias_delta)         -> float
+//    s6_project_B(x, W_B)                             -> [float]
+//    s6_project_C(x, W_C)                             -> [float]
+//    s6_softplus(x)                                   -> float
+//    s6_conv1d_depthwise(x_seq, kernel, d)            -> [[float]]
+//    s6_recurrent_step(h, A_bar, B_bar, x_t)          -> [float]
+//    s6_output_step(C_t, h, D_diag, x_t)              -> [float]
+//    s6_recurrent_scan(x_seq, A_diag, W_B, W_C,
+//                      W_delta, bias_delta, D)         -> [[float]]
+//    s6_parallel_scan_combine(a1, b1, a2, b2)         -> [a, b]
+//    s6_parallel_scan(As, Bs)                         -> [[float]]
+//    s6_parallel_mode(x_seq, A_diag, W_B, W_C,
+//                     W_delta, bias_delta, D)          -> [[float]]
+//    s6_linear(x, W, bias)                            -> [float]
+//    s6_silu(x)                                       -> float
+//    s6_silu_vec(v)                                   -> [float]
+//    s6_mamba_block(x_seq, block)                     -> [[float]]
+//    s6_create_block(d_model, d_inner, d_state, conv_w) -> S6Block
+//    s6_forward(block, x_seq)                         -> [[float]]
+//    s6_stack_forward(blocks, x_seq)                  -> [[float]]
+//
+//  AI-NATIVE attrs:
+//    @pure     — no hidden state mutation
+//    @hot      — called every forward step
+//    @fuse     — inner loops fused
+// ═══════════════════════════════════════════════════════════════════
+
+// ── helpers ─────────────────────────────────────────────────────
+
+fn s6_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn s6_max(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn s6_min(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn s6_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn s6_zeros_2d(r, c) {
+    let mut m = []
+    for _i in 0..r {
+        let mut row = []
+        for _j in 0..c { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+fn s6_ones(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [1.0] }
+    return v
+}
+
+// deterministic pseudo-random for weight init
+fn s6_hash(seed, i, j) {
+    let h = ((seed * 2654435761 + i * 1315423911 + j * 731) % 10007)
+    return to_float(h) / 10007.0 - 0.5
+}
+
+fn s6_hash_pos(seed, i) {
+    let h = ((seed * 2654435761 + i * 1315423911) % 10007)
+    return to_float(h) / 10007.0
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Core math: exp, log, softplus, sigmoid, silu
+// ═══════════════════════════════════════════════════════════════════
+
+fn s6_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn s6_ln(x) {
+    if x <= 0.0 { return -20.0 }
+    let mut v = x
+    let mut count = 0
+    while v > 1.5 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.7 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    let d = v - 1.0
+    let d2 = d * d
+    let d3 = d2 * d
+    let d4 = d3 * d
+    let d5 = d4 * d
+    let d6 = d5 * d
+    let d7 = d6 * d
+    let d8 = d7 * d
+    let ln_v = d - d2/2.0 + d3/3.0 - d4/4.0 + d5/5.0 - d6/6.0 + d7/7.0 - d8/8.0
+    return to_float(count) + ln_v
+}
+
+fn s6_softplus(x) {
+    // softplus(x) = ln(1 + exp(x))
+    if x > 20.0 { return x }
+    if x < -20.0 { return 0.0 }
+    return s6_ln(1.0 + s6_exp(x))
+}
+
+fn s6_sigmoid(x) {
+    return 1.0 / (1.0 + s6_exp(0.0 - x))
+}
+
+fn s6_silu(x) {
+    return x * s6_sigmoid(x)
+}
+
+fn s6_silu_vec(v) {
+    let n = len(v)
+    let mut out = []
+    for i in 0..n {
+        out = out + [s6_silu(v[i])]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  A matrix: HiPPO-style diagonal (-1, -2, ..., -N)
+//  Stored as 1D vector of diagonal entries for efficiency.
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn s6_init_A_diag(d_state) {
+    let mut A = []
+    for i in 0..d_state {
+        A = A + [0.0 - to_float(i + 1)]
+    }
+    return A
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Discretization: Zero-Order Hold (ZOH)
+//
+//  Given diagonal A and scalar delta:
+//    A_bar[i] = exp(A[i] * delta)
+//    B_bar[i] = delta * B[i]    (simplified S6 form)
+//
+//  The exact formula is B_bar = (A_bar - I) * A^{-1} * B but for
+//  Mamba S6, the simplified delta*B form is used since B is
+//  recomputed per step from input.
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn s6_discretize_zoh(A_diag, delta) {
+    let n = len(A_diag)
+    let mut A_bar = []
+    for i in 0..n {
+        A_bar = A_bar + [s6_exp(A_diag[i] * delta)]
+    }
+    return A_bar
+}
+
+@pure
+fn s6_discretize_B(delta, B_vec) {
+    let n = len(B_vec)
+    let mut B_bar = []
+    for i in 0..n {
+        B_bar = B_bar + [delta * B_vec[i]]
+    }
+    return B_bar
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Input-dependent projections (Selective mechanism, S6 core)
+//
+//  delta_t = softplus(x . W_delta + bias_delta)
+//  B_t = x . W_B          shape [d_state]
+//  C_t = x . W_C          shape [d_state]
+//
+//  This is what makes Mamba "selective": the SSM params change per
+//  token, allowing content-aware filtering of information.
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn s6_project_delta(x, W_delta, bias_delta) {
+    // x: [d_inner], W_delta: [d_inner], bias_delta: float -> scalar delta
+    let d = len(x)
+    let mut dot = 0.0
+    for i in 0..d {
+        dot = dot + x[i] * W_delta[i]
+    }
+    return s6_softplus(dot + bias_delta)
+}
+
+@pure
+fn s6_project_B(x, W_B) {
+    // x: [d_inner], W_B: [d_state, d_inner] -> [d_state]
+    let d_state = len(W_B)
+    let d = len(x)
+    let mut B_t = []
+    for i in 0..d_state {
+        let mut dot = 0.0
+        for j in 0..d {
+            dot = dot + W_B[i][j] * x[j]
+        }
+        B_t = B_t + [dot]
+    }
+    return B_t
+}
+
+@pure
+fn s6_project_C(x, W_C) {
+    // x: [d_inner], W_C: [d_state, d_inner] -> [d_state]
+    let d_state = len(W_C)
+    let d = len(x)
+    let mut C_t = []
+    for i in 0..d_state {
+        let mut dot = 0.0
+        for j in 0..d {
+            dot = dot + W_C[i][j] * x[j]
+        }
+        C_t = C_t + [dot]
+    }
+    return C_t
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Conv1d — depthwise causal convolution
+//
+//  x_seq: [seq_len, d_inner]
+//  kernel: [conv_w, d_inner]  (depthwise: each channel independent)
+//  Causal: output[t] only uses input[t-k..t]
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn s6_conv1d_depthwise(x_seq, kernel, d) {
+    let seq_len = len(x_seq)
+    let conv_w = len(kernel)
+    let mut out = []
+    for t in 0..seq_len {
+        let mut row = s6_zeros(d)
+        for k in 0..conv_w {
+            let idx = t - k
+            if idx >= 0 {
+                for c in 0..d {
+                    row[c] = row[c] + kernel[k][c] * x_seq[idx][c]
+                }
+            }
+        }
+        out = out + [row]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Recurrent mode: step-by-step SSM
+//
+//  h_{t+1} = A_bar * h_t + B_bar * x_t     (element-wise, diagonal A)
+//  y_t     = C_t . h_{t+1} + D * x_t        (dot product + skip)
+// ═══════════════════════════════════════════════════════════════════
+
+@pure @hot
+fn s6_recurrent_step(h, A_bar, B_bar, x_t) {
+    // h: [d_state], A_bar: [d_state], B_bar: [d_state], x_t: scalar broadcast
+    let n = len(h)
+    let mut h_new = []
+    for i in 0..n {
+        h_new = h_new + [A_bar[i] * h[i] + B_bar[i] * x_t]
+    }
+    return h_new
+}
+
+@pure
+fn s6_output_step(C_t, h, D_diag, x_t, d_inner) {
+    // C_t: [d_state], h: [d_state], D_diag: [d_inner], x_t: [d_inner]
+    // output for one channel: C_t . h
+    let d_state = len(C_t)
+    let mut y = 0.0
+    for i in 0..d_state {
+        y = y + C_t[i] * h[i]
+    }
+    return y
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Recurrent scan — full sequence in recurrent mode
+//
+//  For each time step t and each channel d:
+//    delta_t = s6_project_delta(x_t, W_delta, bias_delta)
+//    B_t = s6_project_B(x_t, W_B)
+//    C_t = s6_project_C(x_t, W_C)
+//    A_bar = exp(A_diag * delta_t)
+//    B_bar = delta_t * B_t
+//    h = A_bar * h + B_bar * x_t[d]     for each d_state dim
+//    y_t[d] = C_t . h + D[d] * x_t[d]
+// ═══════════════════════════════════════════════════════════════════
+
+@hot @fuse
+fn s6_recurrent_scan(x_seq, A_diag, W_B, W_C, W_delta, bias_delta, D) {
+    let seq_len = len(x_seq)
+    let d_inner = len(x_seq[0])
+    let d_state = len(A_diag)
+
+    // per-channel hidden state
+    let mut H = s6_zeros_2d(d_inner, d_state)
+    let mut output = []
+
+    for t in 0..seq_len {
+        let x_t = x_seq[t]
+
+        // input-dependent selection
+        let delta_t = s6_project_delta(x_t, W_delta, bias_delta)
+        let B_t = s6_project_B(x_t, W_B)
+        let C_t = s6_project_C(x_t, W_C)
+
+        // discretize
+        let A_bar = s6_discretize_zoh(A_diag, delta_t)
+        let B_bar = s6_discretize_B(delta_t, B_t)
+
+        // update state and compute output per channel
+        let mut y_t = s6_zeros(d_inner)
+        for d in 0..d_inner {
+            // h_{d,t+1} = A_bar * h_{d,t} + B_bar * x_t[d]
+            for s in 0..d_state {
+                H[d][s] = A_bar[s] * H[d][s] + B_bar[s] * x_t[d]
+            }
+            // y_t[d] = C_t . h_d + D[d] * x_t[d]
+            let mut c_dot_h = 0.0
+            for s in 0..d_state {
+                c_dot_h = c_dot_h + C_t[s] * H[d][s]
+            }
+            y_t[d] = c_dot_h + D[d] * x_t[d]
+        }
+        output = output + [y_t]
+    }
+    return output
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Parallel scan — associative scan for training efficiency
+//
+//  The recurrence h_t = a_t * h_{t-1} + b_t is an associative
+//  operation with binary operator:
+//    (a1, b1) * (a2, b2) = (a1*a2, a2*b1 + b2)
+//
+//  This allows a parallel prefix sum (Blelloch scan) in O(log n).
+//  Here we implement a simple sequential prefix version that
+//  demonstrates the API, with the same semantics.
+//
+//  As: [seq_len, d_state]  — per-step A_bar values
+//  Bs: [seq_len, d_state]  — per-step B_bar * x values
+//  Returns: [seq_len, d_state] — all hidden states
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn s6_parallel_scan_combine(a1, b1, a2, b2) {
+    // (a1, b1) * (a2, b2) = (a1*a2, a2*b1 + b2)
+    let n = len(a1)
+    let mut a_out = []
+    let mut b_out = []
+    for i in 0..n {
+        a_out = a_out + [a1[i] * a2[i]]
+        b_out = b_out + [a2[i] * b1[i] + b2[i]]
+    }
+    return [a_out, b_out]
+}
+
+@pure
+fn s6_parallel_scan(As, Bs) {
+    let seq_len = len(As)
+    let d_state = len(As[0])
+
+    // Up sweep: compute prefix products
+    // result[t] = scan of (a_0,b_0)*(a_1,b_1)*...*(a_t,b_t)
+    // The "b" part of each result is the hidden state h_t
+    let mut h_all = []
+    let mut cum_a = s6_ones(d_state)
+    let mut cum_b = s6_zeros(d_state)
+
+    for t in 0..seq_len {
+        let combined = s6_parallel_scan_combine(cum_a, cum_b, As[t], Bs[t])
+        cum_a = combined[0]
+        cum_b = combined[1]
+        h_all = h_all + [cum_b]
+    }
+    return h_all
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Parallel mode — full sequence using parallel scan
+//
+//  Same result as recurrent scan, but uses the associative scan
+//  formulation. For each channel d independently:
+//    A_bar_t, B_bar_t * x_t[d] are computed, then scanned.
+// ═══════════════════════════════════════════════════════════════════
+
+@hot
+fn s6_parallel_mode(x_seq, A_diag, W_B, W_C, W_delta, bias_delta, D) {
+    let seq_len = len(x_seq)
+    let d_inner = len(x_seq[0])
+    let d_state = len(A_diag)
+
+    // Pre-compute per-step selection params
+    let mut deltas = []
+    let mut Bs_t = []
+    let mut Cs_t = []
+    for t in 0..seq_len {
+        let x_t = x_seq[t]
+        deltas = deltas + [s6_project_delta(x_t, W_delta, bias_delta)]
+        Bs_t = Bs_t + [s6_project_B(x_t, W_B)]
+        Cs_t = Cs_t + [s6_project_C(x_t, W_C)]
+    }
+
+    // Per-channel parallel scan
+    let mut output = s6_zeros_2d(seq_len, d_inner)
+    for d in 0..d_inner {
+        // Build As and Bs for this channel
+        let mut As_ch = []
+        let mut Bs_ch = []
+        for t in 0..seq_len {
+            let A_bar = s6_discretize_zoh(A_diag, deltas[t])
+            let B_bar = s6_discretize_B(deltas[t], Bs_t[t])
+            As_ch = As_ch + [A_bar]
+            // Bs for scan = B_bar * x_t[d]
+            let mut bx = []
+            for s in 0..d_state {
+                bx = bx + [B_bar[s] * x_seq[t][d]]
+            }
+            Bs_ch = Bs_ch + [bx]
+        }
+
+        // Parallel scan to get all hidden states
+        let h_all = s6_parallel_scan(As_ch, Bs_ch)
+
+        // Compute output: y_t[d] = C_t . h_t + D[d] * x_t[d]
+        for t in 0..seq_len {
+            let mut c_dot_h = 0.0
+            for s in 0..d_state {
+                c_dot_h = c_dot_h + Cs_t[t][s] * h_all[t][s]
+            }
+            output[t][d] = c_dot_h + D[d] * x_seq[t][d]
+        }
+    }
+    return output
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Linear projection: y = W * x + bias
+//  W: [out_dim, in_dim], x: [in_dim], bias: [out_dim]
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn s6_linear(x, W, bias) {
+    let out_dim = len(W)
+    let in_dim = len(x)
+    let mut y = []
+    for i in 0..out_dim {
+        let mut dot = 0.0
+        for j in 0..in_dim {
+            dot = dot + W[i][j] * x[j]
+        }
+        y = y + [dot + bias[i]]
+    }
+    return y
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  S6Block struct — full Mamba block with all parameters
+// ═══════════════════════════════════════════════════════════════════
+
+struct S6Block {
+    d_model: int,
+    d_inner: int,
+    d_state: int,
+    conv_width: int,
+    A_diag: array,          // [d_state]
+    W_B: array,             // [d_state, d_inner]
+    W_C: array,             // [d_state, d_inner]
+    W_delta: array,         // [d_inner]
+    bias_delta: float,
+    D: array,               // [d_inner]
+    conv_kernel: array,     // [conv_w, d_inner]
+    W_in: array,            // [d_inner, d_model]  input projection
+    b_in: array,            // [d_inner]
+    W_z: array,             // [d_inner, d_model]  gate projection
+    b_z: array,             // [d_inner]
+    W_out: array,           // [d_model, d_inner]  output projection
+    b_out: array            // [d_model]
+}
+
+fn s6_create_block(d_model, d_inner, d_state, conv_w) {
+    let A_diag = s6_init_A_diag(d_state)
+    let D = s6_ones(d_inner)
+
+    // W_B: [d_state, d_inner]
+    let mut W_B = s6_zeros_2d(d_state, d_inner)
+    for i in 0..d_state {
+        for j in 0..d_inner {
+            W_B[i][j] = s6_hash(42, i, j) * 0.1
+        }
+    }
+
+    // W_C: [d_state, d_inner]
+    let mut W_C = s6_zeros_2d(d_state, d_inner)
+    for i in 0..d_state {
+        for j in 0..d_inner {
+            W_C[i][j] = s6_hash(73, i, j) * 0.1
+        }
+    }
+
+    // W_delta: [d_inner]
+    let mut W_delta = []
+    for i in 0..d_inner {
+        W_delta = W_delta + [s6_hash(91, i, 0) * 0.1]
+    }
+    let bias_delta = 0.5
+
+    // conv kernel: [conv_w, d_inner]
+    let mut conv_kernel = []
+    for k in 0..conv_w {
+        let mut row = []
+        for d in 0..d_inner {
+            row = row + [s6_hash(99, k, d) * 0.3 + 0.5]
+        }
+        conv_kernel = conv_kernel + [row]
+    }
+
+    // W_in: [d_inner, d_model]
+    let mut W_in = s6_zeros_2d(d_inner, d_model)
+    for i in 0..d_inner {
+        for j in 0..d_model {
+            W_in[i][j] = s6_hash(111, i, j) * 0.1
+        }
+    }
+    let b_in = s6_zeros(d_inner)
+
+    // W_z: [d_inner, d_model] gate
+    let mut W_z = s6_zeros_2d(d_inner, d_model)
+    for i in 0..d_inner {
+        for j in 0..d_model {
+            W_z[i][j] = s6_hash(222, i, j) * 0.1
+        }
+    }
+    let b_z = s6_zeros(d_inner)
+
+    // W_out: [d_model, d_inner]
+    let mut W_out = s6_zeros_2d(d_model, d_inner)
+    for i in 0..d_model {
+        for j in 0..d_inner {
+            W_out[i][j] = s6_hash(333, i, j) * 0.1
+        }
+    }
+    let b_out = s6_zeros(d_model)
+
+    return S6Block {
+        d_model: d_model,
+        d_inner: d_inner,
+        d_state: d_state,
+        conv_width: conv_w,
+        A_diag: A_diag,
+        W_B: W_B,
+        W_C: W_C,
+        W_delta: W_delta,
+        bias_delta: bias_delta,
+        D: D,
+        conv_kernel: conv_kernel,
+        W_in: W_in,
+        b_in: b_in,
+        W_z: W_z,
+        b_z: b_z,
+        W_out: W_out,
+        b_out: b_out
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Full Mamba block forward
+//
+//  x_seq: [seq_len, d_model]
+//
+//  Flow:
+//    1. Input projection:  x' = silu(W_in * x + b_in)   [d_inner]
+//    2. Gate projection:   z  = silu(W_z  * x + b_z)    [d_inner]
+//    3. Conv1d causal:     x'' = conv1d(x')              [d_inner]
+//    4. SiLU activation:   x''' = silu(x'')
+//    5. SSM (selective):   y = recurrent_scan(x''')      [d_inner]
+//    6. Gated output:      g = y * z
+//    7. Output projection: out = W_out * g + b_out       [d_model]
+//    8. Residual:          return x + out
+// ═══════════════════════════════════════════════════════════════════
+
+@hot
+fn s6_mamba_block(x_seq, block) {
+    let seq_len = len(x_seq)
+    let d_model = block.d_model
+    let d_inner = block.d_inner
+
+    // 1. Input projection + 2. Gate projection
+    let mut x_proj = []
+    let mut z_proj = []
+    for t in 0..seq_len {
+        let x_in = s6_linear(x_seq[t], block.W_in, block.b_in)
+        let z_in = s6_linear(x_seq[t], block.W_z, block.b_z)
+        x_proj = x_proj + [x_in]
+        z_proj = z_proj + [z_in]
+    }
+
+    // 3. Conv1d causal depthwise
+    let conv_out = s6_conv1d_depthwise(x_proj, block.conv_kernel, d_inner)
+
+    // 4. SiLU activation
+    let mut activated = []
+    for t in 0..seq_len {
+        activated = activated + [s6_silu_vec(conv_out[t])]
+    }
+
+    // 5. SSM recurrent scan (selective)
+    let y = s6_recurrent_scan(
+        activated, block.A_diag, block.W_B, block.W_C,
+        block.W_delta, block.bias_delta, block.D
+    )
+
+    // 6. Gated output: y * silu(z)
+    let mut gated = []
+    for t in 0..seq_len {
+        let z_act = s6_silu_vec(z_proj[t])
+        let mut g = s6_zeros(d_inner)
+        for d in 0..d_inner {
+            g[d] = y[t][d] * z_act[d]
+        }
+        gated = gated + [g]
+    }
+
+    // 7. Output projection + 8. Residual
+    let mut output = []
+    for t in 0..seq_len {
+        let proj = s6_linear(gated[t], block.W_out, block.b_out)
+        let mut out = s6_zeros(d_model)
+        for d in 0..d_model {
+            out[d] = x_seq[t][d] + proj[d]
+        }
+        output = output + [out]
+    }
+    return output
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Convenience wrappers
+// ═══════════════════════════════════════════════════════════════════
+
+@hot
+fn s6_forward(block, x_seq) {
+    return s6_mamba_block(x_seq, block)
+}
+
+// Stack multiple Mamba blocks
+fn s6_stack_forward(blocks, x_seq) {
+    let n_layers = len(blocks)
+    let mut h = x_seq
+    for l in 0..n_layers {
+        h = s6_forward(blocks[l], h)
+    }
+    return h
+}
+
+// Norm-free RMS for optional pre-norm
+@pure
+fn s6_rms_norm(x, eps) {
+    let n = len(x)
+    let mut ss = 0.0
+    for i in 0..n {
+        ss = ss + x[i] * x[i]
+    }
+    let rms = s6_ln(ss / to_float(n) + eps)
+    let inv = 1.0 / s6_exp(rms * 0.5)
+    let mut out = []
+    for i in 0..n {
+        out = out + [x[i] * inv]
+    }
+    return out
+}

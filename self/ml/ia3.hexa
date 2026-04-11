@@ -1,0 +1,323 @@
+// ═══════════════════════════════════════════════════════════════
+//  ia3.hexa — IA3 Adapter (Infused Adapter by Inhibiting &
+//                           Amplifying Inner Activations)
+//
+//  Ref:  Liu et al. 2022 — "Few-Shot Parameter-Efficient Fine-Tuning
+//        is Better and Cheaper than In-Context Learning"
+//
+//  Core idea — 3 learned rescale vectors applied element-wise:
+//    l_k  ∈ R^{d_k}   — rescales keys      : K'  = l_k  ⊙ (W_k  @ x)
+//    l_v  ∈ R^{d_v}   — rescales values    : V'  = l_v  ⊙ (W_v  @ x)
+//    l_ff ∈ R^{d_ff}  — rescales FFN inner : FF' = l_ff ⊙ (W_ff @ x)
+//
+//  Trainable params = d_k + d_v + d_ff  (≪ full fine-tune)
+//
+//  Init : all vectors = 1.0   (identity — zero drift at step 0)
+//  Merge: W'[i,j] = l[i] * W[i,j]   (row-wise absorb; l⊙(W@x) == (l·W)@x)
+//  Unmerge : W[i,j] = W'[i,j] / l[i]  (requires l[i] != 0)
+//
+//  Base: self/ml/finetune.hexa — reuses ft_matvec / ft_zeros / AdamW.
+//
+//  AI-NATIVE:
+//    @pure    — math kernels (forward / merge / backward)
+//    @hot     — train_step inner
+//
+//  HX3/memory pitfalls honored:
+//    • no complex-index-assignment on deep structs (rebuild arrays)
+//    • no bit-twiddling, no manual loop micro-opts
+//    • struct mutate via field reassign (arrays ok)
+//
+//  L0 금지: src/*.rs 미접촉. 순수 .hexa.
+// ═══════════════════════════════════════════════════════════════
+
+use "finetune"
+use "finetune_config"
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 1: Structs
+// ═══════════════════════════════════════════════════════════════
+
+// IA3 per-layer block — one attention + FFN layer worth of params.
+// The 3 rescale vectors are the ONLY trainable tensors.
+struct Ia3Block {
+    l_k: array,     // [d_k]
+    l_v: array,     // [d_v]
+    l_ff: array,    // [d_ff]
+    d_k: int,
+    d_v: int,
+    d_ff: int
+}
+
+// Frozen base weights for one IA3-adapted layer.
+// W_k : [d_k , in_dim]
+// W_v : [d_v , in_dim]
+// W_ff: [d_ff, in_dim]
+struct Ia3BaseLayer {
+    w_k: array,
+    w_v: array,
+    w_ff: array,
+    d_k: int,
+    d_v: int,
+    d_ff: int,
+    in_dim: int
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 2: Init — identity rescale (all ones)
+// ═══════════════════════════════════════════════════════════════
+
+// Ones vector of length n.
+fn ia3_ones1(n) {
+    let mut v = []
+    for i in 0..n { v = v + [1.0] }
+    return v
+}
+
+// Build a fresh IA3 block — identity (all 1.0), zero drift at step 0.
+fn ia3_make_block(d_k, d_v, d_ff) {
+    return Ia3Block {
+        l_k:  ia3_ones1(d_k),
+        l_v:  ia3_ones1(d_v),
+        l_ff: ia3_ones1(d_ff),
+        d_k:  d_k,
+        d_v:  d_v,
+        d_ff: d_ff
+    }
+}
+
+// Build IA3 blocks for a list of Ia3BaseLayer.
+fn ia3_create_blocks(base_layers) {
+    let n = len(base_layers)
+    let mut blocks = []
+    let mut i = 0
+    while i < n {
+        let b = base_layers[i]
+        blocks = blocks + [ia3_make_block(b.d_k, b.d_v, b.d_ff)]
+        i = i + 1
+    }
+    return blocks
+}
+
+// Count trainable IA3 params across blocks.
+@pure
+fn ia3_trainable_params(blocks) {
+    let n = len(blocks)
+    let mut s = 0
+    let mut i = 0
+    while i < n {
+        let b = blocks[i]
+        s = s + b.d_k + b.d_v + b.d_ff
+        i = i + 1
+    }
+    return s
+}
+
+// Count frozen base params across layers.
+@pure
+fn ia3_frozen_params(base_layers) {
+    let n = len(base_layers)
+    let mut s = 0
+    let mut i = 0
+    while i < n {
+        let b = base_layers[i]
+        s = s + (b.d_k + b.d_v + b.d_ff) * b.in_dim
+        i = i + 1
+    }
+    return s
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 3: Element-wise helpers
+// ═══════════════════════════════════════════════════════════════
+
+// y[i] = l[i] * v[i]    (element-wise multiply, length n)
+@pure
+fn ia3_ewmul(l, v, n) {
+    let mut y = []
+    for i in 0..n { y = y + [l[i] * v[i]] }
+    return y
+}
+
+// y[i] = l[i] * (W @ x)[i]   — fused rescale-matvec.
+// W: [m, k], x: [k], l: [m]  => y: [m]
+@pure
+fn ia3_rescale_matvec(l, w, x, m, k) {
+    let mut y = []
+    for i in 0..m {
+        let mut s = 0.0
+        for j in 0..k { s = s + w[i][j] * x[j] }
+        y = y + [l[i] * s]
+    }
+    return y
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 4: Forward — IA3 per-layer
+// ═══════════════════════════════════════════════════════════════
+
+// Produce K' / V' / FFN' rescaled outputs for one IA3-adapted layer.
+// Returns [k_out, v_out, ff_out].
+@pure
+fn ia3_layer_forward(base: Ia3BaseLayer, blk: Ia3Block, x) {
+    let k_out  = ia3_rescale_matvec(blk.l_k,  base.w_k,  x, base.d_k,  base.in_dim)
+    let v_out  = ia3_rescale_matvec(blk.l_v,  base.w_v,  x, base.d_v,  base.in_dim)
+    let ff_out = ia3_rescale_matvec(blk.l_ff, base.w_ff, x, base.d_ff, base.in_dim)
+    return [k_out, v_out, ff_out]
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 5: Backward — gradient for 3 rescale vectors
+// ═══════════════════════════════════════════════════════════════
+
+// Given:   y = l ⊙ (W @ x)
+//          dy / dl[i] = (W @ x)[i]
+//          dL / dl[i] = dy[i] * (W @ x)[i]
+//
+// Input:
+//   w    — [m, k]        (frozen base)
+//   x    — [k]           (layer input)
+//   l    — [m]           (current rescale — unused by grad, for signature sym)
+//   dy   — [m]           (upstream grad on output)
+//
+// Returns: dl — [m]  (gradient w.r.t. the rescale vector)
+@pure
+fn ia3_rescale_grad(w, x, dy, m, k) {
+    let mut dl = []
+    for i in 0..m {
+        let mut s = 0.0
+        for j in 0..k { s = s + w[i][j] * x[j] }
+        dl = dl + [dy[i] * s]
+    }
+    return dl
+}
+
+// Per-layer backward: given upstream grads for K', V', FFN' outputs,
+// return [dl_k, dl_v, dl_ff].
+@pure
+fn ia3_layer_backward(base: Ia3BaseLayer, blk: Ia3Block, x, dy_k, dy_v, dy_ff) {
+    let dl_k  = ia3_rescale_grad(base.w_k,  x, dy_k,  base.d_k,  base.in_dim)
+    let dl_v  = ia3_rescale_grad(base.w_v,  x, dy_v,  base.d_v,  base.in_dim)
+    let dl_ff = ia3_rescale_grad(base.w_ff, x, dy_ff, base.d_ff, base.in_dim)
+    return [dl_k, dl_v, dl_ff]
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 6: SGD update for rescale vectors
+// ═══════════════════════════════════════════════════════════════
+
+// Plain SGD (no momentum) — IA3 vectors are tiny; Adam is overkill.
+@hot
+fn ia3_sgd_update_vec(l, dl, lr, n) {
+    let mut out = []
+    for i in 0..n { out = out + [l[i] - lr * dl[i]] }
+    return out
+}
+
+// Apply SGD to the 3 rescale vectors of one block → new block.
+@hot
+fn ia3_sgd_step_block(blk: Ia3Block, dl_k, dl_v, dl_ff, lr) {
+    let new_k  = ia3_sgd_update_vec(blk.l_k,  dl_k,  lr, blk.d_k)
+    let new_v  = ia3_sgd_update_vec(blk.l_v,  dl_v,  lr, blk.d_v)
+    let new_ff = ia3_sgd_update_vec(blk.l_ff, dl_ff, lr, blk.d_ff)
+    return Ia3Block {
+        l_k:  new_k,
+        l_v:  new_v,
+        l_ff: new_ff,
+        d_k:  blk.d_k,
+        d_v:  blk.d_v,
+        d_ff: blk.d_ff
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 7: Merge / Unmerge — absorb rescale into base weights
+// ═══════════════════════════════════════════════════════════════
+
+// W_merged[i,j] = l[i] * W[i,j]    (row-wise)
+//
+// Property:   (l ⊙ (W @ x))  ==  (W_merged @ x)
+//
+// This lets us freeze-bake an IA3 block into a regular matmul path for
+// deployment, eliminating runtime element-wise mult.
+@pure
+fn ia3_merge_weight(l, w, m, k) {
+    let mut out = []
+    for i in 0..m {
+        let mut row = []
+        let lm = l[i]
+        for j in 0..k { row = row + [lm * w[i][j]] }
+        out = out + [row]
+    }
+    return out
+}
+
+// Merge one full IA3-adapted layer → returns [w_k', w_v', w_ff'].
+fn ia3_merge_layer(base: Ia3BaseLayer, blk: Ia3Block) {
+    let w_k_m  = ia3_merge_weight(blk.l_k,  base.w_k,  base.d_k,  base.in_dim)
+    let w_v_m  = ia3_merge_weight(blk.l_v,  base.w_v,  base.d_v,  base.in_dim)
+    let w_ff_m = ia3_merge_weight(blk.l_ff, base.w_ff, base.d_ff, base.in_dim)
+    return [w_k_m, w_v_m, w_ff_m]
+}
+
+// W_unmerged[i,j] = W_merged[i,j] / l[i]    (row-wise, l[i] != 0)
+//
+// Identity-safe if l[i] == 1.0 (no change). Used to peel IA3 back off
+// of previously merged weights so a fresh adapter can be trained.
+@pure
+fn ia3_unmerge_weight(l, w_merged, m, k) {
+    let mut out = []
+    for i in 0..m {
+        let mut row = []
+        let li = l[i]
+        // avoid division by zero — if l[i] == 0 we cannot invert; passthrough.
+        let inv = if li == 0.0 { 0.0 } else { 1.0 / li }
+        for j in 0..k { row = row + [w_merged[i][j] * inv] }
+        out = out + [row]
+    }
+    return out
+}
+
+// Unmerge one IA3-adapted layer — pass the merged weights, recover base.
+fn ia3_unmerge_layer(blk: Ia3Block, w_k_m, w_v_m, w_ff_m) {
+    let w_k  = ia3_unmerge_weight(blk.l_k,  w_k_m,  blk.d_k,  len(w_k_m[0]))
+    let w_v  = ia3_unmerge_weight(blk.l_v,  w_v_m,  blk.d_v,  len(w_v_m[0]))
+    let w_ff = ia3_unmerge_weight(blk.l_ff, w_ff_m, blk.d_ff, len(w_ff_m[0]))
+    return [w_k, w_v, w_ff]
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 8: Multi-layer forward convenience
+// ═══════════════════════════════════════════════════════════════
+
+// Run IA3 forward over a stack of IA3-adapted layers.  The "output" of
+// one layer in this minimal harness is the concatenation semantics of
+// the FFN branch alone (K/V are aux heads).  We thread ff_out forward
+// as the residual hidden state so tests can check convergence.
+fn ia3_stack_forward(base_layers, blocks, x) {
+    let n = len(base_layers)
+    let mut h = x
+    let mut i = 0
+    while i < n {
+        let out = ia3_layer_forward(base_layers[i], blocks[i], h)
+        h = out[2]   // FFN branch is residual carrier
+        i = i + 1
+    }
+    return h
+}
+
+// Collect per-layer inputs for backward.
+fn ia3_stack_collect_inputs(base_layers, blocks, x) {
+    let n = len(base_layers)
+    let mut inputs = []
+    let mut h = x
+    let mut i = 0
+    while i < n {
+        inputs = inputs + [h]
+        let out = ia3_layer_forward(base_layers[i], blocks[i], h)
+        h = out[2]
+        i = i + 1
+    }
+    return [inputs, h]
+}
+
+println("[ia3] module loaded — 3-vector rescale adapter, merge/unmerge ready")

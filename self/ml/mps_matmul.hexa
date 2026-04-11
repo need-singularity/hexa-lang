@@ -1,0 +1,359 @@
+// ===================================================================
+//  self/ml/mps_matmul.hexa — MPS Matmul wrapper (#200)
+//
+//  Metal Performance Shaders matmul semantic wrapper. Binds the
+//  MPSMatrixMultiplication API surface (descriptors, row-major
+//  buffers, transpose flags, FP16 accumulation, fused bias, batched
+//  matmul). Real Metal FFI is not wired into the Hexa runtime yet,
+//  so we provide a CPU reference that matches MPS semantics exactly.
+//
+//  MPS conventions honored:
+//    - Row-major storage (MPSMatrix default).
+//    - A is [M x K], B is [K x N], C is [M x N].
+//    - transA / transB flags applied *before* multiplication.
+//    - FP16 accumulation rounds every partial sum to 10-bit mantissa.
+//    - fused matmul+bias adds a per-row bias vector (shape [N]).
+//    - Batched matmul applies the same op to an aligned batch.
+//
+//  Public API:
+//    mpsm_create_descriptor(rows, cols, dtype) -> dict
+//    mpsm_create_matrix(data, desc)            -> dict
+//    mpsm_matmul(A, B, transA, transB)         -> matrix dict
+//    mpsm_matmul_fp16_accum(A, B)              -> matrix dict
+//    mpsm_fused_matmul_bias(A, B, bias)        -> matrix dict
+//    mpsm_batched_matmul(A_batch, B_batch, n)  -> [matrix dict]
+//    mpsm_estimate_flops(m, k, n)              -> int
+//    mpsm_validate_shapes(A, B)                -> string
+//
+//  Helpers:
+//    mpsm_zeros / mpsm_identity / mpsm_get / mpsm_set / mpsm_shape
+//    mpsm_transpose / mpsm_equals / mpsm_rel_err
+//
+//  AI-native attrs:
+//    @pure  — deterministic CPU reference
+//    @hot   — matmul is on every inference path
+// ===================================================================
+
+// ── numeric helpers ─────────────────────────────────────────────
+
+@pure
+fn mpsm_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+@pure
+fn mpsm_max(a, b) {
+    if a > b { return a }
+    return b
+}
+
+// Power-of-two scaling used by the FP16 simulator. Pure integer
+// exponent — 53 bits fits in an f64 mantissa so this stays exact.
+@pure
+fn mpsm_pow2(exp) {
+    let mut v = 1.0
+    if exp >= 0 {
+        let mut i = 0
+        while i < exp {
+            v = v * 2.0
+            i = i + 1
+        }
+        return v
+    }
+    let m = 0 - exp
+    let mut j = 0
+    while j < m {
+        v = v / 2.0
+        j = j + 1
+    }
+    return v
+}
+
+// Floor-log2 for positive floats. Result is an int e s.t.
+// 2^e <= x < 2^(e+1). Returns -1023 for zero (fp16 subnormal floor).
+@pure
+fn mpsm_floor_log2(x) {
+    if x <= 0.0 { return -1023 }
+    let mut e = 0
+    let mut v = x
+    while v >= 2.0 {
+        v = v / 2.0
+        e = e + 1
+    }
+    while v < 1.0 {
+        v = v * 2.0
+        e = e - 1
+    }
+    return e
+}
+
+@pure
+fn mpsm_round_to_int(x) {
+    if x >= 0.0 {
+        let i = to_int(x + 0.5)
+        return i
+    }
+    let i = to_int(x - 0.5)
+    return i
+}
+
+// Round a scalar to the nearest representable FP16 magnitude.
+// fp16 has a 10-bit mantissa. Values below the subnormal floor
+// flush to 0; values above +/-65504 clamp to the sign-preserving max.
+@pure
+fn mpsm_fp16_round(x) {
+    if x == 0.0 { return 0.0 }
+    let a = mpsm_abs(x)
+    if a < 0.00006103515625 { return 0.0 }
+    if a > 65504.0 {
+        if x < 0.0 { return -65504.0 }
+        return 65504.0
+    }
+    let e = mpsm_floor_log2(a)
+    let step = mpsm_pow2(e - 10)
+    let q = mpsm_round_to_int(x / step)
+    return to_float(q) * step
+}
+
+// ── buffer constructors ─────────────────────────────────────────
+
+@pure
+fn mpsm_zeros(rows, cols) {
+    let n = rows * cols
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+@pure
+fn mpsm_identity(n) {
+    let mut v = mpsm_zeros(n, n)
+    for i in 0..n { v[i * n + i] = 1.0 }
+    return v
+}
+
+// ── descriptor / matrix dicts ───────────────────────────────────
+
+// Create an MPSMatrixDescriptor-compatible dict. Row-major stride
+// equals `cols * elem_size`; we store it in elements (float counts)
+// so the CPU reference can compute offsets without caring about bytes.
+@pure
+pub fn mpsm_create_descriptor(rows, cols, dtype) {
+    return #{
+        "rows": rows,
+        "cols": cols,
+        "dtype": dtype,
+        "stride": cols,
+        "row_bytes": cols * 4
+    }
+}
+
+// Wrap a flat row-major buffer into an MPSMatrix-compatible dict.
+// `data` length must equal rows*cols; validation is left to the
+// caller (mirrors the Metal API which trusts the caller).
+@pure
+pub fn mpsm_create_matrix(data, desc) {
+    return #{
+        "rows": desc["rows"],
+        "cols": desc["cols"],
+        "dtype": desc["dtype"],
+        "stride": desc["stride"],
+        "data": data,
+        "desc": desc
+    }
+}
+
+// ── accessors ──────────────────────────────────────────────────
+
+@pure
+fn mpsm_get(M, i, j) {
+    let s = M["stride"]
+    return M["data"][i * s + j]
+}
+
+@pure
+fn mpsm_shape_rows(M) { return M["rows"] }
+
+@pure
+fn mpsm_shape_cols(M) { return M["cols"] }
+
+// Return a new matrix that is the transpose of M.
+// Used internally by matmul when transA/transB is true; exposed for
+// tests that want to verify transpose semantics symbolically.
+@pure
+fn mpsm_transpose(M) {
+    let r = M["rows"]
+    let c = M["cols"]
+    let mut out = mpsm_zeros(c, r)
+    for i in 0..r {
+        for j in 0..c {
+            out[j * r + i] = mpsm_get(M, i, j)
+        }
+    }
+    let desc = mpsm_create_descriptor(c, r, M["dtype"])
+    return mpsm_create_matrix(out, desc)
+}
+
+// ── shape validation ────────────────────────────────────────────
+
+// Validate that the inner dims of A and B are compatible (A.cols ==
+// B.rows). Returns an empty string on success, or a human-readable
+// error otherwise — same convention MPSMatrixMultiplication uses
+// when it raises NSInvalidArgumentException.
+@pure
+pub fn mpsm_validate_shapes(A, B) {
+    if A["cols"] != B["rows"] {
+        return "shape mismatch: A.cols != B.rows"
+    }
+    if A["rows"] <= 0 { return "A.rows must be positive" }
+    if B["cols"] <= 0 { return "B.cols must be positive" }
+    if A["cols"] <= 0 { return "inner dim must be positive" }
+    return ""
+}
+
+// ── core matmul (CPU reference) ─────────────────────────────────
+
+// C = op(A) * op(B). op(X) is X^T when transX is true.
+// Pure FP32 accumulation; matches MPS default when useFP16Accumulate
+// is off. Returns a new matrix dict.
+//
+// NOTE: @hot intentionally omitted — JIT @hot + dict mutation aliases
+// the source buffers. See feedback_hot_attr_dict_mutation.
+@pure
+pub fn mpsm_matmul(A, B, transA, transB) {
+    let Aeff = if transA { mpsm_transpose(A) } else { A }
+    let Beff = if transB { mpsm_transpose(B) } else { B }
+    let err = mpsm_validate_shapes(Aeff, Beff)
+    if err != "" {
+        // Return an empty 0x0 matrix so callers can detect the error
+        // via shape inspection; real Metal would throw here.
+        let d0 = mpsm_create_descriptor(0, 0, Aeff["dtype"])
+        return mpsm_create_matrix([], d0)
+    }
+    let m = Aeff["rows"]
+    let k = Aeff["cols"]
+    let n = Beff["cols"]
+    let mut out = mpsm_zeros(m, n)
+    for i in 0..m {
+        for j in 0..n {
+            let mut acc = 0.0
+            for p in 0..k {
+                acc = acc + mpsm_get(Aeff, i, p) * mpsm_get(Beff, p, j)
+            }
+            out[i * n + j] = acc
+        }
+    }
+    let desc = mpsm_create_descriptor(m, n, Aeff["dtype"])
+    return mpsm_create_matrix(out, desc)
+}
+
+// FP16 accumulate variant. Every partial sum is rounded to the
+// nearest representable FP16 magnitude, mirroring Apple's
+// useFP16Accumulate option. Relative error stays bounded below
+// ~1e-3 for reasonable dynamic range.
+@pure
+pub fn mpsm_matmul_fp16_accum(A, B) {
+    let err = mpsm_validate_shapes(A, B)
+    if err != "" {
+        let d0 = mpsm_create_descriptor(0, 0, A["dtype"])
+        return mpsm_create_matrix([], d0)
+    }
+    let m = A["rows"]
+    let k = A["cols"]
+    let n = B["cols"]
+    let mut out = mpsm_zeros(m, n)
+    for i in 0..m {
+        for j in 0..n {
+            let mut acc = 0.0
+            for p in 0..k {
+                let a = mpsm_fp16_round(mpsm_get(A, i, p))
+                let b = mpsm_fp16_round(mpsm_get(B, p, j))
+                acc = mpsm_fp16_round(acc + a * b)
+            }
+            out[i * n + j] = acc
+        }
+    }
+    let desc = mpsm_create_descriptor(m, n, "fp16")
+    return mpsm_create_matrix(out, desc)
+}
+
+// Fused matmul + bias. `bias` is a flat [N] vector broadcast over
+// every row of A*B. Equivalent to calling mpsm_matmul and then
+// adding bias, but exposed as a single op so downstream codegen can
+// fuse the two on real Metal.
+@pure
+pub fn mpsm_fused_matmul_bias(A, B, bias) {
+    let C = mpsm_matmul(A, B, false, false)
+    let m = C["rows"]
+    let n = C["cols"]
+    let mut out = mpsm_zeros(m, n)
+    for i in 0..m {
+        for j in 0..n {
+            out[i * n + j] = mpsm_get(C, i, j) + bias[j]
+        }
+    }
+    let desc = mpsm_create_descriptor(m, n, C["dtype"])
+    return mpsm_create_matrix(out, desc)
+}
+
+// Batched matmul. A_batch and B_batch are arrays of matrices; the
+// result is an array of n_batch matrices. Mirrors the MPSMatrix
+// batchStart/batchRows API shape.
+@pure
+pub fn mpsm_batched_matmul(A_batch, B_batch, n_batch) {
+    let mut out = []
+    for b in 0..n_batch {
+        let C = mpsm_matmul(A_batch[b], B_batch[b], false, false)
+        out = out + [C]
+    }
+    return out
+}
+
+// ── cost estimation ─────────────────────────────────────────────
+
+// MxK times KxN matmul costs 2*M*K*N flops (one multiply + one add
+// per inner step). Used by the roofline planner in batch_inference.
+@pure
+pub fn mpsm_estimate_flops(m, k, n) {
+    return 2 * m * k * n
+}
+
+// ── equality / error helpers ────────────────────────────────────
+
+// Max-abs elementwise equality check within epsilon. Useful for
+// regression tests that compare FP16-accum output against the FP32
+// reference.
+@pure
+fn mpsm_equals(A, B, eps) {
+    if A["rows"] != B["rows"] { return false }
+    if A["cols"] != B["cols"] { return false }
+    let m = A["rows"]
+    let n = A["cols"]
+    for i in 0..m {
+        for j in 0..n {
+            let d = mpsm_abs(mpsm_get(A, i, j) - mpsm_get(B, i, j))
+            if d > eps { return false }
+        }
+    }
+    return true
+}
+
+// Relative error between two same-shape matrices. Guarded against
+// a zero reference so we never divide by 0.
+@pure
+fn mpsm_rel_err(ref_M, test_M) {
+    let m = ref_M["rows"]
+    let n = ref_M["cols"]
+    let mut max_err = 0.0
+    for i in 0..m {
+        for j in 0..n {
+            let r = mpsm_get(ref_M, i, j)
+            let t = mpsm_get(test_M, i, j)
+            let denom = mpsm_max(mpsm_abs(r), 1.0e-12)
+            let e = mpsm_abs(r - t) / denom
+            if e > max_err { max_err = e }
+        }
+    }
+    return max_err
+}

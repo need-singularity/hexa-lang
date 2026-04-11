@@ -1,0 +1,701 @@
+// ═══════════════════════════════════════════════════════════════════
+//  test_diffusion_forcing.hexa — Diffusion Forcing (#207) verification
+//
+//  Tests (40):
+//    T1  sample_noise_levels correct length
+//    T2  sample_noise_levels all in [0,1]
+//    T3  sample_noise_levels deterministic (same seed)
+//    T4  sample_noise_levels different seeds differ
+//    T5  add_noise preserves length
+//    T6  add_noise noise_level=0 preserves tokens
+//    T7  add_noise noise_level=1 masks all tokens
+//    T8  add_noise deterministic (same seed)
+//    T9  add_continuous_noise sigma=0 preserves vec
+//    T10 add_continuous_noise sigma>0 perturbs vec
+//    T11 cosine_schedule step=0 returns ~1
+//    T12 cosine_schedule step=total returns ~0
+//    T13 cosine_schedule monotonically decreasing
+//    T14 softmax sums to 1.0
+//    T15 softmax all non-negative
+//    T16 softmax highest logit gets highest prob
+//    T17 argmax picks highest index
+//    T18 argmax handles ties (first index)
+//    T19 create_model correct vocab/dim
+//    T20 create_model embed matrix shape
+//    T21 create_model unembed matrix shape
+//    T22 model_forward output length == input length
+//    T23 model_forward each logit row == vocab
+//    T24 loss_per_token length == input length
+//    T25 loss_per_token all >= 0
+//    T26 loss with noisy token > 0 (not perfect prediction)
+//    T27 weighted_loss zero weights -> 0
+//    T28 weighted_loss uniform weights = mean
+//    T29 weighted_loss monotone with larger weights on larger losses
+//    T30 ar_generate returns n_tokens new tokens
+//    T31 ar_generate deterministic (same prefix+seed)
+//    T32 ar_generate tokens in vocab range
+//    T33 diffusion_generate length == seq_len
+//    T34 diffusion_generate tokens in vocab range
+//    T35 diffusion_generate deterministic
+//    T36 mixed_generate length == prefix + n_new
+//    T37 mixed_generate preserves prefix tokens
+//    T38 mixed_generate deterministic
+//    T39 cosine_schedule output in [0,1]
+//    T40 total_loss >= 0
+//
+//  Run: PATH=/Users/ghost/.cargo/bin:$PATH ./hexa self/test_diffusion_forcing.hexa
+// ═══════════════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ── inlined diffusion_forcing implementation ───────────────────────
+
+fn df_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn df_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn df_log(x) {
+    if x <= 0.0 { return -20.0 }
+    let mut y = 0.0
+    let mut t = (x - 1.0) / (x + 1.0)
+    let t2 = t * t
+    let mut term = t
+    for i in 0..15 {
+        y = y + term / to_float(2 * i + 1)
+        term = term * t2
+    }
+    return 2.0 * y
+}
+
+fn df_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 { g = (g + x / g) / 2.0 }
+    return g
+}
+
+fn df_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn df_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+fn df_hash(seed, idx) {
+    let mut h = (seed + 1) * 2654435761 + (idx + 1) * 1315423911
+    h = h % 1000003
+    if h < 0 { h = 0 - h }
+    return h
+}
+
+fn df_rand(seed, idx) {
+    let h = df_hash(seed, idx)
+    return to_float(h % 100000) / 100000.0
+}
+
+fn df_randn(seed, idx) {
+    let u1 = df_rand(seed, idx * 2)
+    let mut safe_u1 = u1
+    if safe_u1 < 0.0001 { safe_u1 = 0.0001 }
+    let u2 = df_rand(seed, idx * 2 + 1)
+    let r = df_sqrt(0.0 - 2.0 * df_log(safe_u1))
+    let c = 1.0 - 8.0 * (u2 - 0.5) * (u2 - 0.5) * (u2 - 0.5) * (u2 - 0.5)
+    return r * c
+}
+
+fn df_sample_noise_levels(n, seed) {
+    let mut out = df_zeros(n)
+    for i in 0..n {
+        let r = df_rand(seed + 13, i)
+        out[i] = r
+    }
+    return out
+}
+
+fn df_add_noise(tokens, noise_levels, mask_id, seed) {
+    let n = len(tokens)
+    let mut out = df_zeros_int(n)
+    for i in 0..n {
+        let nl = noise_levels[i]
+        let u = df_rand(seed + 101, i)
+        if u < nl {
+            out[i] = mask_id
+        } else {
+            out[i] = tokens[i]
+        }
+    }
+    return out
+}
+
+fn df_add_continuous_noise(vec, sigma, seed) {
+    let n = len(vec)
+    let mut out = df_zeros(n)
+    for i in 0..n {
+        let z = df_randn(seed + 777, i)
+        out[i] = vec[i] + sigma * z
+    }
+    return out
+}
+
+fn df_cosine_schedule(step, total) {
+    if total <= 0 { return 0.0 }
+    let frac = to_float(step) / to_float(total)
+    let x = frac
+    let x2 = x * x
+    let c = 1.0 - 1.2337 * x2 + 0.2536 * x2 * x2
+    if c < 0.0 { return 0.0 }
+    if c > 1.0 { return 1.0 }
+    return c
+}
+
+fn df_softmax(logits, n) {
+    let mut mx = logits[0]
+    for i in 1..n {
+        if logits[i] > mx { mx = logits[i] }
+    }
+    let mut exps = df_zeros(n)
+    let mut z = 0.0
+    for i in 0..n {
+        exps[i] = df_exp(logits[i] - mx)
+        z = z + exps[i]
+    }
+    let mut out = df_zeros(n)
+    if z < 1.0e-15 {
+        for i in 0..n { out[i] = 1.0 / to_float(n) }
+    } else {
+        for i in 0..n { out[i] = exps[i] / z }
+    }
+    return out
+}
+
+fn df_argmax(logits, n) {
+    let mut best = 0
+    let mut best_v = logits[0]
+    for i in 1..n {
+        if logits[i] > best_v {
+            best_v = logits[i]
+            best = i
+        }
+    }
+    return best
+}
+
+fn df_create_model(vocab, dim) {
+    let mut embed = []
+    for t in 0..vocab {
+        let mut row = df_zeros(dim)
+        for i in 0..dim {
+            let h = (t * 73 + i * 17 + 5) % 997
+            row[i] = (to_float(h) / 997.0 - 0.5) * 0.4
+        }
+        embed = embed + [row]
+    }
+    let mut unembed = []
+    for i in 0..dim {
+        let mut row = df_zeros(vocab)
+        for t in 0..vocab {
+            let h = (i * 41 + t * 29 + 11) % 997
+            row[t] = (to_float(h) / 997.0 - 0.5) * 0.4
+        }
+        unembed = unembed + [row]
+    }
+    return #{
+        "vocab": vocab,
+        "dim": dim,
+        "embed": embed,
+        "unembed": unembed,
+    }
+}
+
+fn df_lookup(model, token_id, dim) {
+    let vocab = model["vocab"]
+    let embed = model["embed"]
+    let safe_id = token_id % vocab
+    let mut out = df_zeros(dim)
+    for i in 0..dim {
+        out[i] = embed[safe_id][i]
+    }
+    return out
+}
+
+fn df_condition(emb, noise_level, dim) {
+    let mut out = df_zeros(dim)
+    let x = noise_level
+    let x2 = x * x
+    let mut scale = 1.0 - 1.2337 * x2 + 0.2536 * x2 * x2
+    if scale < 0.0 { scale = 0.0 }
+    if scale > 1.0 { scale = 1.0 }
+    for i in 0..dim {
+        out[i] = emb[i] * scale
+    }
+    return out
+}
+
+fn df_model_forward(model, noisy_tokens, noise_levels, dim) {
+    let n = len(noisy_tokens)
+    let vocab = model["vocab"]
+    let unembed = model["unembed"]
+    let mut ctx = df_zeros(dim)
+    let mut all_logits = []
+    for t in 0..n {
+        let emb = df_lookup(model, noisy_tokens[t], dim)
+        let cond = df_condition(emb, noise_levels[t], dim)
+        let mut h = df_zeros(dim)
+        for i in 0..dim {
+            h[i] = 0.5 * cond[i] + 0.5 * ctx[i]
+            ctx[i] = ctx[i] + cond[i] * 0.1
+        }
+        let mut logits = df_zeros(vocab)
+        for v in 0..vocab {
+            let mut s = 0.0
+            for i in 0..dim {
+                s = s + h[i] * unembed[i][v]
+            }
+            logits[v] = s
+        }
+        all_logits = all_logits + [logits]
+    }
+    return all_logits
+}
+
+fn df_weighted_loss(losses, weights, n) {
+    let mut total = 0.0
+    let mut wsum = 0.0
+    for i in 0..n {
+        total = total + losses[i] * weights[i]
+        wsum = wsum + weights[i]
+    }
+    if wsum < 1.0e-12 { return 0.0 }
+    return total / wsum
+}
+
+fn df_loss_per_token(model, clean, noisy, noise_levels, vocab) {
+    let n = len(clean)
+    let dim = model["dim"]
+    let all_logits = df_model_forward(model, noisy, noise_levels, dim)
+    let mut out = df_zeros(n)
+    for t in 0..n {
+        let probs = df_softmax(all_logits[t], vocab)
+        let target = clean[t]
+        let mut p = probs[target]
+        if p < 1.0e-12 { p = 1.0e-12 }
+        out[t] = 0.0 - df_log(p)
+    }
+    return out
+}
+
+fn df_total_loss(model, clean, noisy, noise_levels, vocab) {
+    let per = df_loss_per_token(model, clean, noisy, noise_levels, vocab)
+    let n = len(per)
+    return df_weighted_loss(per, noise_levels, n)
+}
+
+fn df_ar_generate(model, prefix, n_tokens, vocab, seed) {
+    let dim = model["dim"]
+    let mask_id = vocab - 1
+    let n_prefix = len(prefix)
+    let total = n_prefix + n_tokens
+    let mut tokens = df_zeros_int(total)
+    let mut noise_levels = df_zeros(total)
+    for i in 0..n_prefix {
+        tokens[i] = prefix[i]
+        noise_levels[i] = 0.0
+    }
+    for i in 0..n_tokens {
+        tokens[n_prefix + i] = mask_id
+        noise_levels[n_prefix + i] = 1.0
+    }
+    for step in 0..n_tokens {
+        let all_logits = df_model_forward(model, tokens, noise_levels, dim)
+        let pos = n_prefix + step
+        let next_id = df_argmax(all_logits[pos], vocab)
+        tokens[pos] = next_id
+        noise_levels[pos] = 0.0
+    }
+    let mut out = df_zeros_int(n_tokens)
+    for i in 0..n_tokens { out[i] = tokens[n_prefix + i] }
+    return out
+}
+
+fn df_diffusion_generate(model, seq_len, n_steps, vocab, seed) {
+    let dim = model["dim"]
+    let mask_id = vocab - 1
+    let mut tokens = df_zeros_int(seq_len)
+    for i in 0..seq_len { tokens[i] = mask_id }
+    let mut noise_levels = df_zeros(seq_len)
+    for i in 0..seq_len { noise_levels[i] = 1.0 }
+    let total = n_steps
+    for step in 1..(total + 1) {
+        let level = df_cosine_schedule(step, total)
+        for i in 0..seq_len { noise_levels[i] = level }
+        let all_logits = df_model_forward(model, tokens, noise_levels, dim)
+        for i in 0..seq_len {
+            let id = df_argmax(all_logits[i], vocab)
+            tokens[i] = id
+        }
+    }
+    for i in 0..seq_len { noise_levels[i] = 0.0 }
+    return tokens
+}
+
+fn df_mixed_generate(model, prefix, n_new, n_diffusion_steps, vocab, seed) {
+    let dim = model["dim"]
+    let mask_id = vocab - 1
+    let n_prefix = len(prefix)
+    let total_len = n_prefix + n_new
+    let mut tokens = df_zeros_int(total_len)
+    let mut noise_levels = df_zeros(total_len)
+    for i in 0..n_prefix {
+        tokens[i] = prefix[i]
+        noise_levels[i] = 0.0
+    }
+    for i in 0..n_new {
+        tokens[n_prefix + i] = mask_id
+        noise_levels[n_prefix + i] = 1.0
+    }
+    let denoise_steps = if n_diffusion_steps < 1 { 1 } else { n_diffusion_steps }
+    for s in 1..(denoise_steps + 1) {
+        let level = df_cosine_schedule(s, denoise_steps)
+        for i in 0..n_new { noise_levels[n_prefix + i] = level }
+        let all_logits = df_model_forward(model, tokens, noise_levels, dim)
+        for i in 0..n_new {
+            let pos = n_prefix + i
+            tokens[pos] = df_argmax(all_logits[pos], vocab)
+        }
+    }
+    for i in 0..n_new { noise_levels[n_prefix + i] = 0.0 }
+    let all_logits2 = df_model_forward(model, tokens, noise_levels, dim)
+    for i in 0..n_new {
+        let pos = n_prefix + i
+        tokens[pos] = df_argmax(all_logits2[pos], vocab)
+    }
+    return tokens
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  TESTS — small dimensions for speed
+// ═══════════════════════════════════════════════════════════════════
+
+let VOCAB = 8
+let DIM = 4
+let SEED = 42
+
+// T1: sample_noise_levels correct length
+let nl_out = df_sample_noise_levels(10, SEED)
+check("T1 sample_noise_levels length", len(nl_out) == 10)
+
+// T2: sample_noise_levels all in [0, 1]
+let mut in_range = true
+for i in 0..10 {
+    if nl_out[i] < 0.0 { in_range = false }
+    if nl_out[i] > 1.0 { in_range = false }
+}
+check("T2 sample_noise_levels in [0,1]", in_range)
+
+// T3: sample_noise_levels deterministic
+let nl_a = df_sample_noise_levels(6, 7)
+let nl_b = df_sample_noise_levels(6, 7)
+let mut same = true
+for i in 0..6 {
+    if fabs(nl_a[i] - nl_b[i]) > 1.0e-10 { same = false }
+}
+check("T3 sample_noise_levels deterministic", same)
+
+// T4: sample_noise_levels different seeds differ
+let nl_c = df_sample_noise_levels(6, 77)
+let mut any_diff = false
+for i in 0..6 {
+    if fabs(nl_a[i] - nl_c[i]) > 1.0e-6 { any_diff = true }
+}
+check("T4 sample_noise_levels seed-dependent", any_diff)
+
+// T5: add_noise preserves length
+let toks = [1, 2, 3, 4, 5]
+let levels_mid = [0.5, 0.5, 0.5, 0.5, 0.5]
+let noisy_mid = df_add_noise(toks, levels_mid, 0, SEED)
+check("T5 add_noise length", len(noisy_mid) == 5)
+
+// T6: noise_level=0 preserves tokens
+let levels_zero = [0.0, 0.0, 0.0, 0.0, 0.0]
+let noisy_zero = df_add_noise(toks, levels_zero, 0, SEED)
+let mut all_preserved = true
+for i in 0..5 {
+    if noisy_zero[i] != toks[i] { all_preserved = false }
+}
+check("T6 noise=0 preserves", all_preserved)
+
+// T7: noise_level=1 masks all tokens
+let levels_one = [1.0, 1.0, 1.0, 1.0, 1.0]
+let MASK_ID = 99
+let noisy_one = df_add_noise(toks, levels_one, MASK_ID, SEED)
+let mut all_masked = true
+for i in 0..5 {
+    if noisy_one[i] != MASK_ID { all_masked = false }
+}
+check("T7 noise=1 masks all", all_masked)
+
+// T8: add_noise deterministic
+let noisy_a = df_add_noise(toks, levels_mid, 0, SEED)
+let noisy_b = df_add_noise(toks, levels_mid, 0, SEED)
+let mut nb_same = true
+for i in 0..5 {
+    if noisy_a[i] != noisy_b[i] { nb_same = false }
+}
+check("T8 add_noise deterministic", nb_same)
+
+// T9: add_continuous_noise sigma=0 preserves vec
+let vec_in = [1.0, 2.0, 3.0, 4.0]
+let vec_zero = df_add_continuous_noise(vec_in, 0.0, SEED)
+let mut vec_same = true
+for i in 0..4 {
+    if fabs(vec_in[i] - vec_zero[i]) > 1.0e-10 { vec_same = false }
+}
+check("T9 add_continuous_noise sigma=0", vec_same)
+
+// T10: add_continuous_noise sigma>0 perturbs
+let vec_noisy = df_add_continuous_noise(vec_in, 1.0, SEED)
+let mut any_moved = false
+for i in 0..4 {
+    if fabs(vec_in[i] - vec_noisy[i]) > 1.0e-6 { any_moved = true }
+}
+check("T10 add_continuous_noise sigma>0", any_moved)
+
+// T11: cosine_schedule step=0 returns ~1
+let sched0 = df_cosine_schedule(0, 20)
+check("T11 cosine_schedule step=0 ~1", approx(sched0, 1.0, 0.01))
+
+// T12: cosine_schedule step=total returns ~0
+let sched_end = df_cosine_schedule(20, 20)
+check("T12 cosine_schedule step=total ~0", sched_end < 0.05)
+
+// T13: monotonically decreasing
+let mut monotone = true
+let mut prev = df_cosine_schedule(0, 20)
+for s in 1..21 {
+    let cur = df_cosine_schedule(s, 20)
+    if cur > prev + 1.0e-6 { monotone = false }
+    prev = cur
+}
+check("T13 cosine_schedule decreasing", monotone)
+
+// T14: softmax sums to 1.0
+let sm_in = [1.0, 2.0, 3.0, 0.5, 1.5, 0.0, 2.5, 1.2]
+let sm_out = df_softmax(sm_in, 8)
+let mut sm_sum = 0.0
+for i in 0..8 { sm_sum = sm_sum + sm_out[i] }
+check("T14 softmax sums to 1", approx(sm_sum, 1.0, 0.001))
+
+// T15: softmax all non-negative
+let mut all_nn = true
+for i in 0..8 {
+    if sm_out[i] < 0.0 { all_nn = false }
+}
+check("T15 softmax non-negative", all_nn)
+
+// T16: softmax highest logit gets highest prob
+// logits max is at index 2 (value 3.0)
+let mut sm_max_idx = 0
+let mut sm_max_v = sm_out[0]
+for i in 1..8 {
+    if sm_out[i] > sm_max_v { sm_max_v = sm_out[i] sm_max_idx = i }
+}
+check("T16 softmax max at logit max", sm_max_idx == 2)
+
+// T17: argmax picks highest
+let am_in = [0.1, 0.5, 0.9, 0.3, 0.7, 0.2, 0.4, 0.6]
+check("T17 argmax picks idx 2", df_argmax(am_in, 8) == 2)
+
+// T18: argmax with ties — first occurrence
+let tie_in = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+check("T18 argmax ties -> 0", df_argmax(tie_in, 8) == 0)
+
+// T19: create_model correct vocab/dim
+let model = df_create_model(VOCAB, DIM)
+check("T19 model vocab/dim", model["vocab"] == VOCAB && model["dim"] == DIM)
+
+// T20: create_model embed shape
+let emb_mat = model["embed"]
+let mut embed_shape_ok = len(emb_mat) == VOCAB
+if embed_shape_ok {
+    for t in 0..VOCAB {
+        if len(emb_mat[t]) != DIM { embed_shape_ok = false }
+    }
+}
+check("T20 model embed shape", embed_shape_ok)
+
+// T21: create_model unembed shape
+let un_mat = model["unembed"]
+let mut unembed_shape_ok = len(un_mat) == DIM
+if unembed_shape_ok {
+    for i in 0..DIM {
+        if len(un_mat[i]) != VOCAB { unembed_shape_ok = false }
+    }
+}
+check("T21 model unembed shape", unembed_shape_ok)
+
+// T22: model_forward output length
+let test_tokens = [0, 1, 2, 3]
+let test_levels = [0.2, 0.4, 0.6, 0.8]
+let logits = df_model_forward(model, test_tokens, test_levels, DIM)
+check("T22 model_forward length", len(logits) == 4)
+
+// T23: each row == vocab
+let mut logits_shape_ok = true
+for t in 0..4 {
+    if len(logits[t]) != VOCAB { logits_shape_ok = false }
+}
+check("T23 model_forward row shape", logits_shape_ok)
+
+// T24: loss_per_token length
+let clean_toks = [0, 1, 2, 3]
+let noisy_toks = [0, 1, 7, 7]
+let noise_lvl = [0.0, 0.0, 1.0, 1.0]
+let per_tok = df_loss_per_token(model, clean_toks, noisy_toks, noise_lvl, VOCAB)
+check("T24 loss_per_token length", len(per_tok) == 4)
+
+// T25: loss_per_token all >= 0
+let mut all_nonneg = true
+for i in 0..4 {
+    if per_tok[i] < 0.0 { all_nonneg = false }
+}
+check("T25 loss_per_token >= 0", all_nonneg)
+
+// T26: noisy (masked) positions should generally have loss > 0
+let mut noisy_has_loss = false
+for i in 2..4 {
+    if per_tok[i] > 0.001 { noisy_has_loss = true }
+}
+check("T26 noisy tokens have loss", noisy_has_loss)
+
+// T27: weighted_loss zero weights -> 0
+let z_losses = [0.5, 1.0, 2.0, 0.3]
+let z_weights = [0.0, 0.0, 0.0, 0.0]
+check("T27 weighted_loss zero weights = 0", approx(df_weighted_loss(z_losses, z_weights, 4), 0.0, 1.0e-9))
+
+// T28: weighted_loss uniform weights = mean
+let u_weights = [1.0, 1.0, 1.0, 1.0]
+let expected_mean = (0.5 + 1.0 + 2.0 + 0.3) / 4.0
+check("T28 weighted_loss uniform = mean", approx(df_weighted_loss(z_losses, u_weights, 4), expected_mean, 1.0e-6))
+
+// T29: weighted_loss monotone — larger weights on larger losses -> higher weighted mean
+let w_bias_small = [1.0, 1.0, 0.1, 1.0]
+let w_bias_large = [1.0, 1.0, 10.0, 1.0]
+let wl_small = df_weighted_loss(z_losses, w_bias_small, 4)
+let wl_large = df_weighted_loss(z_losses, w_bias_large, 4)
+// z_losses[2] = 2.0 is the largest, so weighting it more should raise the mean.
+check("T29 weighted_loss monotone with weights", wl_large > wl_small)
+
+// T30: ar_generate returns n_tokens
+let prefix = [0, 1, 2]
+let gen_ar = df_ar_generate(model, prefix, 4, VOCAB, SEED)
+check("T30 ar_generate length", len(gen_ar) == 4)
+
+// T31: ar_generate deterministic
+let gen_ar2 = df_ar_generate(model, prefix, 4, VOCAB, SEED)
+let mut ar_same = true
+for i in 0..4 {
+    if gen_ar[i] != gen_ar2[i] { ar_same = false }
+}
+check("T31 ar_generate deterministic", ar_same)
+
+// T32: ar_generate tokens in vocab range
+let mut ar_in_range = true
+for i in 0..4 {
+    if gen_ar[i] < 0 { ar_in_range = false }
+    if gen_ar[i] >= VOCAB { ar_in_range = false }
+}
+check("T32 ar_generate tokens in [0,VOCAB)", ar_in_range)
+
+// T33: diffusion_generate length
+let gen_diff = df_diffusion_generate(model, 5, 4, VOCAB, SEED)
+check("T33 diffusion_generate length", len(gen_diff) == 5)
+
+// T34: diffusion tokens in range
+let mut diff_in_range = true
+for i in 0..5 {
+    if gen_diff[i] < 0 { diff_in_range = false }
+    if gen_diff[i] >= VOCAB { diff_in_range = false }
+}
+check("T34 diffusion_generate in range", diff_in_range)
+
+// T35: diffusion deterministic
+let gen_diff2 = df_diffusion_generate(model, 5, 4, VOCAB, SEED)
+let mut diff_same = true
+for i in 0..5 {
+    if gen_diff[i] != gen_diff2[i] { diff_same = false }
+}
+check("T35 diffusion_generate deterministic", diff_same)
+
+// T36: mixed_generate length == prefix + n_new
+let gen_mix = df_mixed_generate(model, prefix, 3, 4, VOCAB, SEED)
+check("T36 mixed_generate length", len(gen_mix) == 6)
+
+// T37: mixed_generate preserves prefix
+let mut prefix_preserved = true
+for i in 0..3 {
+    if gen_mix[i] != prefix[i] { prefix_preserved = false }
+}
+check("T37 mixed_generate prefix preserved", prefix_preserved)
+
+// T38: mixed_generate deterministic
+let gen_mix2 = df_mixed_generate(model, prefix, 3, 4, VOCAB, SEED)
+let mut mix_same = true
+for i in 0..6 {
+    if gen_mix[i] != gen_mix2[i] { mix_same = false }
+}
+check("T38 mixed_generate deterministic", mix_same)
+
+// T39: cosine_schedule output in [0,1]
+let mut sched_in_range = true
+for s in 0..21 {
+    let v = df_cosine_schedule(s, 20)
+    if v < 0.0 { sched_in_range = false }
+    if v > 1.0 { sched_in_range = false }
+}
+check("T39 cosine_schedule in [0,1]", sched_in_range)
+
+// T40: total_loss >= 0
+let tl = df_total_loss(model, clean_toks, noisy_toks, noise_lvl, VOCAB)
+check("T40 total_loss >= 0", tl >= 0.0)
+
+// ═══════════════════════════════════════════════════════════════════
+println("")
+println("=== diffusion_forcing test summary ===")
+println("PASS: " + str(pass_count))
+println("FAIL: " + str(fail_count))
+println("TOTAL: " + str(pass_count + fail_count))

@@ -1,0 +1,571 @@
+// ===================================================================
+//  self/ml/react_agent.hexa — ReAct Agent (ML #116)
+//
+//  Reason + Act interleaved loop (Yao et al., 2022).
+//  Base module: self/ml/function_calling.hexa (tool definitions,
+//  parse_tool_calls, format_tool_result).
+//
+//  Pipeline (per step):
+//    1. Thought — generate reasoning text about current state
+//    2. Action  — select tool + arguments from available tools
+//    3. Observation — receive tool output
+//    Repeat until "finish" action or max_steps reached.
+//
+//  Data structures (all #{} maps):
+//    Step     = { step, thought, action_tool, action_args, observation }
+//    Trace    = { steps: [Step], query, answer, status, n_steps }
+//    Tool     = { name, description, parameters }  (from function_calling)
+//    Registry = { tools: #{name -> Tool}, names: [name...] }
+//
+//  Public API:
+//    react_tool(name, desc, params)       -> Tool map
+//    react_registry()                     -> empty Registry
+//    react_register(reg, tool)            -> Registry with tool added
+//    react_lookup(reg, name)              -> Tool or empty #{}
+//    react_has_tool(reg, name)            -> bool
+//    react_list_tools(reg)                -> [name...]
+//    react_step_new(idx, thought, tool, args, obs)  -> Step
+//    react_trace_new(query)               -> empty Trace
+//    react_trace_add(trace, step)         -> Trace with step appended
+//    react_trace_len(trace)               -> int
+//    react_trace_last(trace)              -> Step or empty #{}
+//    react_trace_thoughts(trace)          -> [thought strings]
+//    react_trace_observations(trace)      -> [observation strings]
+//    react_is_finish(action_tool)         -> bool
+//    react_format_prompt(query, trace, reg)  -> prompt string
+//    react_parse_thought(text)            -> thought string
+//    react_parse_action(text)             -> {tool, args} map
+//    react_run(query, reg, think_fn, act_fn, exec_fn, max_steps)  -> Trace
+//    react_run_simple(query, reg, generate_fn, exec_fn, max_steps) -> Trace
+//
+//  Conventions:
+//    - Tag format: <thought>...</thought> <action>tool: args</action>
+//    - "finish" as action tool name signals termination
+//    - Uses #{} map literals, no {k:v} inside if blocks (HX3)
+//    - No semicolons (P1)
+//    - Flag-variable break pattern (no break inside if)
+// ===================================================================
+
+import "ml/function_calling.hexa"
+
+// ===================================================================
+//  String helpers (self-contained, prefix _ra_ to avoid collision)
+// ===================================================================
+
+fn _ra_index_of(s, needle, start) {
+    let sn = len(s)
+    let nn = len(needle)
+    if nn == 0 { return start }
+    if nn > sn { return 0 - 1 }
+    let limit = sn - nn
+    let mut i = start
+    while i <= limit {
+        let mut j = 0
+        let mut ok = true
+        while j < nn {
+            if s[i + j] != needle[j] {
+                ok = false
+                j = nn
+            }
+            j = j + 1
+        }
+        if ok { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn _ra_contains(s, needle) {
+    return _ra_index_of(s, needle, 0) >= 0
+}
+
+fn _ra_extract_between(text, open_tag, close_tag) {
+    let ot_len = len(open_tag)
+    let start = _ra_index_of(text, open_tag, 0)
+    if start < 0 { return "" }
+    let content_start = start + ot_len
+    let end = _ra_index_of(text, close_tag, content_start)
+    if end < 0 { return "" }
+    return text.substring(content_start, end).trim()
+}
+
+// ===================================================================
+//  Tool definition (re-uses function_calling define_tool/define_param)
+// ===================================================================
+
+fn react_tool(name, description, params) {
+    return define_tool(name, description, params)
+}
+
+// ===================================================================
+//  Tool Registry — register / lookup / list
+// ===================================================================
+
+fn react_registry() {
+    let reg = #{}
+    reg["tools"] = #{}
+    reg["names"] = []
+    return reg
+}
+
+fn react_register(reg, tool) {
+    let name = tool["name"]
+    let tools = reg["tools"]
+    tools[name] = tool
+    let mut names = reg["names"]
+    // avoid duplicate
+    let mut found = false
+    let mut i = 0
+    while i < len(names) {
+        if names[i] == name { found = true }
+        i = i + 1
+    }
+    if found == false {
+        names = names + [name]
+    }
+    let out = #{}
+    out["tools"] = tools
+    out["names"] = names
+    return out
+}
+
+fn react_lookup(reg, name) {
+    let tools = reg["tools"]
+    if has_key(tools, name) {
+        return tools[name]
+    }
+    let empty = #{}
+    return empty
+}
+
+fn react_has_tool(reg, name) {
+    return has_key(reg["tools"], name)
+}
+
+fn react_list_tools(reg) {
+    return reg["names"]
+}
+
+fn react_registry_size(reg) {
+    return len(reg["names"])
+}
+
+// Format registry tools as descriptive string for prompt
+fn react_format_tool_list(reg) {
+    let names = reg["names"]
+    let tools = reg["tools"]
+    let n = len(names)
+    let mut parts = []
+    let mut i = 0
+    while i < n {
+        let t = tools[names[i]]
+        parts = parts + [t["name"] + " — " + t["description"]]
+        i = i + 1
+    }
+    return parts.join("\n")
+}
+
+// ===================================================================
+//  Step — a single (thought, action, observation) triple
+// ===================================================================
+
+fn react_step_new(idx, thought, action_tool, action_args, observation) {
+    let s = #{}
+    s["step"] = idx
+    s["thought"] = thought
+    s["action_tool"] = action_tool
+    s["action_args"] = action_args
+    s["observation"] = observation
+    return s
+}
+
+fn react_step_is_finish(step) {
+    return step["action_tool"] == "finish"
+}
+
+// ===================================================================
+//  Trace — full history buffer
+// ===================================================================
+
+fn react_trace_new(query) {
+    let t = #{}
+    t["query"] = query
+    t["steps"] = []
+    t["answer"] = ""
+    t["status"] = "running"
+    t["n_steps"] = 0
+    return t
+}
+
+fn react_trace_add(trace, step) {
+    let mut steps = trace["steps"]
+    steps = steps + [step]
+    let out = #{}
+    out["query"] = trace["query"]
+    out["steps"] = steps
+    out["n_steps"] = len(steps)
+    out["answer"] = trace["answer"]
+    out["status"] = trace["status"]
+    return out
+}
+
+fn react_trace_len(trace) {
+    return trace["n_steps"]
+}
+
+fn react_trace_last(trace) {
+    let steps = trace["steps"]
+    let n = len(steps)
+    if n == 0 {
+        let empty = #{}
+        return empty
+    }
+    return steps[n - 1]
+}
+
+fn react_trace_thoughts(trace) {
+    let steps = trace["steps"]
+    let n = len(steps)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [steps[i]["thought"]]
+        i = i + 1
+    }
+    return out
+}
+
+fn react_trace_observations(trace) {
+    let steps = trace["steps"]
+    let n = len(steps)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [steps[i]["observation"]]
+        i = i + 1
+    }
+    return out
+}
+
+fn react_trace_actions(trace) {
+    let steps = trace["steps"]
+    let n = len(steps)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [steps[i]["action_tool"]]
+        i = i + 1
+    }
+    return out
+}
+
+fn react_trace_set_answer(trace, answer) {
+    let out = #{}
+    out["query"] = trace["query"]
+    out["steps"] = trace["steps"]
+    out["n_steps"] = trace["n_steps"]
+    out["answer"] = answer
+    out["status"] = "finished"
+    return out
+}
+
+fn react_trace_set_status(trace, status) {
+    let out = #{}
+    out["query"] = trace["query"]
+    out["steps"] = trace["steps"]
+    out["n_steps"] = trace["n_steps"]
+    out["answer"] = trace["answer"]
+    out["status"] = status
+    return out
+}
+
+// ===================================================================
+//  Finish detection — "finish" action means stop the loop
+// ===================================================================
+
+fn react_is_finish(action_tool) {
+    return action_tool == "finish"
+}
+
+// ===================================================================
+//  Prompt formatting — build the ReAct prompt from query + trace
+// ===================================================================
+
+fn react_format_prompt(query, trace, reg) {
+    let mut prompt = "Answer the following question by reasoning step by step.\n"
+    prompt = prompt + "Available tools:\n"
+    prompt = prompt + react_format_tool_list(reg) + "\n\n"
+    prompt = prompt + "Use this format:\n"
+    prompt = prompt + "Thought: reasoning about what to do\n"
+    prompt = prompt + "Action: tool_name: arguments\n"
+    prompt = prompt + "Observation: tool output\n"
+    prompt = prompt + "... (repeat as needed)\n"
+    prompt = prompt + "Thought: I have the answer\n"
+    prompt = prompt + "Action: finish: final answer\n\n"
+    prompt = prompt + "Question: " + query + "\n\n"
+
+    // Append existing trace
+    let steps = trace["steps"]
+    let n = len(steps)
+    let mut i = 0
+    while i < n {
+        let s = steps[i]
+        prompt = prompt + "Thought: " + s["thought"] + "\n"
+        prompt = prompt + "Action: " + s["action_tool"] + ": " + s["action_args"] + "\n"
+        prompt = prompt + "Observation: " + s["observation"] + "\n"
+        i = i + 1
+    }
+
+    return prompt
+}
+
+// ===================================================================
+//  Parse thought from generated text
+//  Looks for "Thought: ..." or <thought>...</thought>
+// ===================================================================
+
+fn react_parse_thought(text) {
+    // Try tagged format first
+    let tagged = _ra_extract_between(text, "<thought>", "</thought>")
+    if len(tagged) > 0 { return tagged }
+
+    // Try "Thought: ..." line format
+    let marker = "Thought: "
+    let idx = _ra_index_of(text, marker, 0)
+    if idx < 0 { return text.trim() }
+    let start = idx + len(marker)
+    let text_len = len(text)
+    // find end of line
+    let mut ei = start
+    let mut found_nl = false
+    while ei < text_len {
+        if text[ei] == '\n' {
+            found_nl = true
+            ei = text_len
+        } else {
+            ei = ei + 1
+        }
+    }
+    if found_nl {
+        let nl_pos = _ra_index_of(text, "\n", start)
+        if nl_pos >= 0 {
+            return text.substring(start, nl_pos).trim()
+        }
+    }
+    return text.substring(start, text_len).trim()
+}
+
+// ===================================================================
+//  Parse action from generated text
+//  Looks for "Action: tool_name: args" or <action>tool: args</action>
+//  Returns map { tool, args }
+// ===================================================================
+
+fn react_parse_action(text) {
+    let out = #{}
+    out["tool"] = ""
+    out["args"] = ""
+
+    // Try tagged format
+    let tagged = _ra_extract_between(text, "<action>", "</action>")
+    let mut content = tagged
+    if len(content) == 0 {
+        // Try "Action: ..." line format
+        let marker = "Action: "
+        let idx = _ra_index_of(text, marker, 0)
+        if idx < 0 { return out }
+        let start = idx + len(marker)
+        let text_len = len(text)
+        let nl_pos = _ra_index_of(text, "\n", start)
+        if nl_pos >= 0 {
+            content = text.substring(start, nl_pos).trim()
+        } else {
+            content = text.substring(start, text_len).trim()
+        }
+    }
+
+    if len(content) == 0 { return out }
+
+    // Split on first ": " to get tool and args
+    let colon_pos = _ra_index_of(content, ": ", 0)
+    if colon_pos < 0 {
+        // No args, just tool name
+        out["tool"] = content.trim()
+        out["args"] = ""
+        return out
+    }
+    out["tool"] = content.substring(0, colon_pos).trim()
+    out["args"] = content.substring(colon_pos + 2, len(content)).trim()
+    return out
+}
+
+// ===================================================================
+//  Execute action via registry + executor
+//  exec_fn: fn(tool_name, args_str) -> observation string
+// ===================================================================
+
+fn react_execute(reg, exec_fn, tool_name, args_str) {
+    if react_is_finish(tool_name) {
+        return args_str
+    }
+    if react_has_tool(reg, tool_name) == false {
+        return "Error: unknown tool '" + tool_name + "'"
+    }
+    return exec_fn(tool_name, args_str)
+}
+
+// ===================================================================
+//  Single ReAct step — given think_fn and act_fn (separate)
+//
+//  think_fn(prompt) -> thought text
+//  act_fn(prompt, thought) -> "tool_name: args" string
+// ===================================================================
+
+fn react_one_step(query, trace, reg, think_fn, act_fn, exec_fn, step_idx) {
+    let prompt = react_format_prompt(query, trace, reg)
+
+    // 1. Thought
+    let thought = think_fn(prompt)
+
+    // 2. Action
+    let action_raw = act_fn(prompt, thought)
+    let parsed = react_parse_action("Action: " + action_raw)
+    let tool_name = parsed["tool"]
+    let args_str = parsed["args"]
+
+    // 3. Observation
+    let observation = react_execute(reg, exec_fn, tool_name, args_str)
+
+    return react_step_new(step_idx, thought, tool_name, args_str, observation)
+}
+
+// ===================================================================
+//  ReAct loop — full orchestrator with separate think/act callbacks
+//
+//  think_fn(prompt) -> thought string
+//  act_fn(prompt, thought) -> "tool_name: args" action string
+//  exec_fn(tool_name, args_str) -> observation string
+//  max_steps: hard limit to prevent infinite loops
+//
+//  Returns Trace with all steps + final answer
+// ===================================================================
+
+fn react_run(query, reg, think_fn, act_fn, exec_fn, max_steps) {
+    let mut trace = react_trace_new(query)
+    let mut step_idx = 0
+
+    while step_idx < max_steps {
+        let step = react_one_step(query, trace, reg, think_fn, act_fn,
+                                  exec_fn, step_idx)
+        trace = react_trace_add(trace, step)
+
+        if react_is_finish(step["action_tool"]) {
+            trace = react_trace_set_answer(trace, step["action_args"])
+            trace = react_trace_set_status(trace, "finished")
+            return trace
+        }
+
+        step_idx = step_idx + 1
+    }
+
+    // max_steps exceeded
+    trace = react_trace_set_status(trace, "max_steps")
+    return trace
+}
+
+// ===================================================================
+//  Simplified ReAct loop — single generate_fn that returns both
+//  thought and action in one shot.
+//
+//  generate_fn(prompt) -> text with "Thought: ...\nAction: tool: args"
+//  exec_fn(tool_name, args_str) -> observation string
+// ===================================================================
+
+fn react_run_simple(query, reg, generate_fn, exec_fn, max_steps) {
+    let mut trace = react_trace_new(query)
+    let mut step_idx = 0
+
+    while step_idx < max_steps {
+        let prompt = react_format_prompt(query, trace, reg)
+        let generated = generate_fn(prompt)
+
+        let thought = react_parse_thought(generated)
+        let action = react_parse_action(generated)
+        let tool_name = action["tool"]
+        let args_str = action["args"]
+
+        let observation = react_execute(reg, exec_fn, tool_name, args_str)
+        let step = react_step_new(step_idx, thought, tool_name, args_str,
+                                  observation)
+        trace = react_trace_add(trace, step)
+
+        if react_is_finish(tool_name) {
+            trace = react_trace_set_answer(trace, args_str)
+            trace = react_trace_set_status(trace, "finished")
+            return trace
+        }
+
+        step_idx = step_idx + 1
+    }
+
+    trace = react_trace_set_status(trace, "max_steps")
+    return trace
+}
+
+// ===================================================================
+//  Trace serialization — convert trace to readable string
+// ===================================================================
+
+fn react_trace_to_string(trace) {
+    let mut out = "Query: " + trace["query"] + "\n"
+    let steps = trace["steps"]
+    let n = len(steps)
+    let mut i = 0
+    while i < n {
+        let s = steps[i]
+        out = out + "--- Step " + to_string(s["step"]) + " ---\n"
+        out = out + "Thought: " + s["thought"] + "\n"
+        out = out + "Action: " + s["action_tool"] + ": " + s["action_args"] + "\n"
+        out = out + "Observation: " + s["observation"] + "\n"
+        i = i + 1
+    }
+    out = out + "Status: " + trace["status"] + "\n"
+    out = out + "Answer: " + trace["answer"] + "\n"
+    return out
+}
+
+// ===================================================================
+//  Trace statistics
+// ===================================================================
+
+fn react_trace_stats(trace) {
+    let stats = #{}
+    stats["n_steps"] = trace["n_steps"]
+    stats["status"] = trace["status"]
+    stats["has_answer"] = len(trace["answer"]) > 0
+
+    // Count unique tools used
+    let steps = trace["steps"]
+    let n = len(steps)
+    let mut tool_set = #{}
+    let mut i = 0
+    while i < n {
+        let tname = steps[i]["action_tool"]
+        tool_set[tname] = true
+        i = i + 1
+    }
+    stats["unique_tools"] = len(keys(tool_set))
+
+    // Total thought length
+    let mut total_thought_len = 0
+    i = 0
+    while i < n {
+        total_thought_len = total_thought_len + len(steps[i]["thought"])
+        i = i + 1
+    }
+    stats["total_thought_len"] = total_thought_len
+
+    return stats
+}
+
+println("[react_agent] module loaded")

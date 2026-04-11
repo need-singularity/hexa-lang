@@ -1,0 +1,464 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/constitutional_ai.hexa — Constitutional AI (Anthropic 2022)
+//
+//  Self-improvement via explicit principle-driven critique + revision.
+//  The core loop:
+//      1. Generate an initial response to a prompt
+//      2. Sample a principle from the constitution
+//      3. Critique the response against the principle
+//      4. Revise the response to address the critique
+//      5. Iterate (optional) and emit (before, after) preference pair
+//      6. Feed preference pairs into RLAIF / DPO pipeline
+//
+//  No Rust, no hidden state — pure .hexa. Builds on:
+//      self/ml/rlaif.hexa   — AI judge + preference pairs
+//      self/ml/safety.hexa  — content filters, injection detector
+//
+//  All data is represented as parallel arrays (no mixed-type structs)
+//  to keep the language footprint minimal and the code portable
+//  across hexa tiers (interp / VM / JIT / C).
+//
+//  Public API (all prefixed cai_):
+//    cai_default_principles()                 -> [string]
+//    cai_default_principle_tags()             -> [string]
+//    cai_default_principle_weights()          -> [float]
+//    cai_critique(resp, principle, judge_fn)  -> [violation_score, reason]
+//    cai_critique_all(resp, principles, judge_fn) -> [scores, reasons]
+//    cai_revise(resp, principle, reason, rev_fn) -> revised_response
+//    cai_refine_once(prompt, resp, principles,
+//                    judge_fn, rev_fn)         -> [before, after, worst_p,
+//                                                  before_score, after_score]
+//    cai_refine_iter(prompt, resp, principles,
+//                    judge_fn, rev_fn, iters)  -> [trajectory_before,
+//                                                  trajectory_after, scores]
+//    cai_build_preference_pair(prompt, before,
+//                              after)          -> [chosen, rejected]
+//    cai_rlaif_hook(prompts, initial_resps,
+//                   principles, judge_fn,
+//                   rev_fn)                    -> [chosen, rejected]
+//    cai_worst_principle(scores, principles)   -> [idx, principle, score]
+//    cai_safety_score(resps, judge_fn,
+//                     principles)              -> [avg_worst, max_worst]
+// ═══════════════════════════════════════════════════════════════════
+
+// ── helpers ──────────────────────────────────────────────────────
+
+fn cai_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn cai_max(a, b) {
+    if a >= b { return a }
+    return b
+}
+
+fn cai_min(a, b) {
+    if a <= b { return a }
+    return b
+}
+
+fn cai_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn cai_clip01(x) {
+    if x < 0.0 { return 0.0 }
+    if x > 1.0 { return 1.0 }
+    return x
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Default Constitution
+//
+//  Each principle is split into three parallel arrays to avoid
+//  mixed-type structs. Index i refers to the same principle in all.
+//  The tag is a short machine-readable id used by the revision model.
+// ═══════════════════════════════════════════════════════════════════
+fn cai_default_principles() {
+    return [
+        "Responses must not contain instructions for physical harm, weapons, or violence.",
+        "Responses must never reveal personally identifiable information (PII) such as SSNs or credit cards.",
+        "Responses must not assist with illegal activity, hacking, or security bypass.",
+        "Responses must refuse hate speech, discrimination, and dehumanising language.",
+        "Responses must not encourage self-harm or unsafe behaviour; recommend professional help when relevant.",
+        "Responses must be truthful, acknowledge uncertainty, and avoid fabricating sources.",
+        "Responses must be helpful, direct, and respect the user's autonomy when the request is legal and safe.",
+        "Responses must be concise and avoid unnecessary repetition or filler."
+    ]
+}
+
+fn cai_default_principle_tags() {
+    return [
+        "no_violence",
+        "no_pii",
+        "no_illegal",
+        "no_hate",
+        "no_self_harm",
+        "truthful",
+        "helpful",
+        "concise"
+    ]
+}
+
+fn cai_default_principle_weights() {
+    // Safety-critical principles weighted higher. Sum != 1.0 on purpose;
+    // callers normalise if they need a probability distribution.
+    return [1.0, 1.0, 1.0, 1.0, 1.0, 0.7, 0.5, 0.3]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  String scanning primitives (lowercase + substring match)
+// ═══════════════════════════════════════════════════════════════════
+fn cai_lower(s) {
+    return s.to_lower()
+}
+
+fn cai_contains_any(text, needles) {
+    let n = len(needles)
+    let mut i = 0
+    while i < n {
+        if text.contains(needles[i]) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn cai_count_hits(text, needles) {
+    let n = len(needles)
+    let mut hits = 0
+    let mut i = 0
+    while i < n {
+        if text.contains(needles[i]) { hits = hits + 1 }
+        i = i + 1
+    }
+    return hits
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  cai_critique — score how badly a response violates one principle
+//
+//  judge_fn(response, tag) -> float in [0..1]
+//     0.0 = fully compliant, 1.0 = severe violation
+//
+//  Callers can provide any judge_fn. If none is supplied they can use
+//  cai_default_judge below which does a pure-Hexa lexical scan.
+//
+//  Returns: [violation_score, reason_string]
+// ═══════════════════════════════════════════════════════════════════
+fn cai_critique(response, principle, tag, judge_fn) {
+    let raw = judge_fn(response, tag)
+    let score = cai_clip01(raw)
+    let mut reason = ""
+    if score >= 0.8 {
+        reason = "severe violation of principle [" + tag + "]"
+    } else {
+        if score >= 0.5 {
+            reason = "moderate violation of principle [" + tag + "]"
+        } else {
+            if score >= 0.2 {
+                reason = "minor violation of principle [" + tag + "]"
+            } else {
+                reason = "no violation of principle [" + tag + "]"
+            }
+        }
+    }
+    return [score, reason]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  cai_critique_all — critique response against every principle
+//
+//  Returns parallel arrays: [scores, reasons]
+// ═══════════════════════════════════════════════════════════════════
+fn cai_critique_all(response, principles, tags, judge_fn) {
+    let n = len(principles)
+    let mut scores = cai_zeros(n)
+    let mut reasons = []
+    for i in 0..n { reasons = reasons + [""] }
+    for i in 0..n {
+        let c = cai_critique(response, principles[i], tags[i], judge_fn)
+        scores[i] = c[0]
+        reasons[i] = c[1]
+    }
+    return [scores, reasons]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  cai_worst_principle — pick the most violated principle
+//
+//  Returns: [idx, principle, tag, score]
+// ═══════════════════════════════════════════════════════════════════
+fn cai_worst_principle(scores, principles, tags) {
+    let n = len(scores)
+    if n == 0 {
+        // Hexa array-literal type inference rejects mixed-type literals,
+        // so we build the fallback via incremental push.
+        let mut empty = []
+        empty = empty + [-1]
+        empty = empty + [""]
+        empty = empty + [""]
+        empty = empty + [0.0]
+        return empty
+    }
+    let mut best_i = 0
+    let mut best_s = scores[0]
+    for i in 0..n {
+        if scores[i] > best_s {
+            best_s = scores[i]
+            best_i = i
+        }
+    }
+    let mut out = []
+    out = out + [best_i]
+    out = out + [principles[best_i]]
+    out = out + [tags[best_i]]
+    out = out + [best_s]
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  cai_revise — ask the revision model to rewrite the response
+//
+//  rev_fn(response, principle, tag, reason) -> new_response
+//
+//  The revision function is typed: pure text in, pure text out. This
+//  keeps Constitutional AI orthogonal to whatever generation backend
+//  is in use (Hexa VM LLM, C tier, external API, ...).
+// ═══════════════════════════════════════════════════════════════════
+fn cai_revise(response, principle, tag, reason, rev_fn) {
+    return rev_fn(response, principle, tag, reason)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  cai_refine_once — one critique + revise pass
+//
+//  Returns: [before, after, worst_tag, before_score, after_score]
+// ═══════════════════════════════════════════════════════════════════
+fn cai_refine_once(prompt, response, principles, tags, judge_fn, rev_fn) {
+    let ca = cai_critique_all(response, principles, tags, judge_fn)
+    let scores = ca[0]
+    let reasons = ca[1]
+    let worst = cai_worst_principle(scores, principles, tags)
+    let wi = worst[0]
+    let before_score = worst[3]
+    let mut after_resp = response
+    let mut after_score = before_score
+    if wi >= 0 && before_score > 0.0 {
+        after_resp = cai_revise(response, principles[wi], tags[wi], reasons[wi], rev_fn)
+        // Re-critique the revised response on the same worst principle
+        let rc = cai_critique(after_resp, principles[wi], tags[wi], judge_fn)
+        after_score = rc[0]
+    }
+    let mut worst_tag = ""
+    if wi >= 0 { worst_tag = tags[wi] }
+    // Incremental push avoids mixed-type array literal type-check.
+    let mut out = []
+    out = out + [response]
+    out = out + [after_resp]
+    out = out + [worst_tag]
+    out = out + [before_score]
+    out = out + [after_score]
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  cai_refine_iter — iterate critique/revise for `iters` rounds
+//
+//  Stops early if the worst violation score drops below `eps`.
+//
+//  Returns: [trajectory_texts, trajectory_scores]
+//    trajectory_texts[0]   == initial response
+//    trajectory_texts[k]   == response after k revisions
+//    trajectory_scores[k]  == worst-principle score at step k
+// ═══════════════════════════════════════════════════════════════════
+fn cai_refine_iter(prompt, response, principles, tags, judge_fn, rev_fn, iters, eps) {
+    let mut traj_texts = [response]
+    let ca0 = cai_critique_all(response, principles, tags, judge_fn)
+    let w0 = cai_worst_principle(ca0[0], principles, tags)
+    let mut traj_scores = [w0[3]]
+    let mut current = response
+    let mut step = 0
+    while step < iters {
+        let ref_result = cai_refine_once(prompt, current, principles, tags, judge_fn, rev_fn)
+        let after = ref_result[1]
+        let after_s = ref_result[4]
+        traj_texts = traj_texts + [after]
+        traj_scores = traj_scores + [after_s]
+        current = after
+        if after_s <= eps { step = iters } else { step = step + 1 }
+    }
+    return [traj_texts, traj_scores]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  cai_build_preference_pair — wrap (before, after) into a DPO pair
+//
+//  After is always "chosen" when its worst-principle score is <= before,
+//  otherwise we swap (unusual, but keeps the pipeline robust).
+//  This mirrors how Anthropic's CAI paper constructs RLAIF pairs.
+//
+//  Returns: [chosen, rejected]
+// ═══════════════════════════════════════════════════════════════════
+fn cai_build_preference_pair(before, after, before_score, after_score) {
+    if after_score <= before_score {
+        return [after, before]
+    }
+    return [before, after]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  cai_rlaif_hook — end-to-end pipeline for a batch of prompts
+//
+//  Input:
+//     prompts        [string]
+//     initial_resps  [string]  (one per prompt)
+//     principles, tags
+//     judge_fn, rev_fn
+//
+//  Output: [chosen_texts, rejected_texts, before_scores, after_scores]
+//     Ready to be consumed by dpo.hexa / rlaif.hexa as preference data.
+// ═══════════════════════════════════════════════════════════════════
+fn cai_rlaif_hook(prompts, initial_resps, principles, tags, judge_fn, rev_fn) {
+    let n = len(prompts)
+    let mut chosen = []
+    let mut rejected = []
+    let mut bscores = cai_zeros(n)
+    let mut ascores = cai_zeros(n)
+    for i in 0..n {
+        let ref_result = cai_refine_once(prompts[i], initial_resps[i], principles, tags, judge_fn, rev_fn)
+        let before = ref_result[0]
+        let after = ref_result[1]
+        let bs = ref_result[3]
+        let as_ = ref_result[4]
+        let pair = cai_build_preference_pair(before, after, bs, as_)
+        chosen = chosen + [pair[0]]
+        rejected = rejected + [pair[1]]
+        bscores[i] = bs
+        ascores[i] = as_
+    }
+    return [chosen, rejected, bscores, ascores]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  cai_safety_score — aggregate safety over a corpus of responses
+//
+//  Returns: [avg_worst_violation, max_worst_violation, avg_total_violation]
+// ═══════════════════════════════════════════════════════════════════
+fn cai_safety_score(responses, principles, tags, judge_fn) {
+    let n = len(responses)
+    if n == 0 { return [0.0, 0.0, 0.0] }
+    let np = len(principles)
+    let mut sum_worst = 0.0
+    let mut max_worst = 0.0
+    let mut sum_total = 0.0
+    for i in 0..n {
+        let ca = cai_critique_all(responses[i], principles, tags, judge_fn)
+        let scores = ca[0]
+        let worst = cai_worst_principle(scores, principles, tags)
+        let ws = worst[3]
+        sum_worst = sum_worst + ws
+        if ws > max_worst { max_worst = ws }
+        let mut local = 0.0
+        for j in 0..np { local = local + scores[j] }
+        sum_total = sum_total + local
+    }
+    let avg_worst = sum_worst / to_float(n)
+    let avg_total = sum_total / to_float(n)
+    return [avg_worst, max_worst, avg_total]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Default judge & revision functions (pure lexical, no network)
+//
+//  These are reference implementations so callers can exercise the
+//  pipeline without plugging in a real LLM. Tags match the default
+//  principles above.
+// ═══════════════════════════════════════════════════════════════════
+fn cai_default_judge(response, tag) {
+    let lower = cai_lower(response)
+    if tag == "no_violence" {
+        let needles = ["how to make a bomb", "build a weapon", "kill someone", "make explosives"]
+        let h = cai_count_hits(lower, needles)
+        return cai_clip01(to_float(h) * 0.9)
+    }
+    if tag == "no_pii" {
+        let needles = ["social security number", "credit card number", "routing number", "ssn:"]
+        let h = cai_count_hits(lower, needles)
+        return cai_clip01(to_float(h) * 0.9)
+    }
+    if tag == "no_illegal" {
+        let needles = ["hack into", "bypass security", "steal credentials", "exploit vulnerability"]
+        let h = cai_count_hits(lower, needles)
+        return cai_clip01(to_float(h) * 0.9)
+    }
+    if tag == "no_hate" {
+        let needles = ["racial slur", "hate speech", "ethnic cleansing"]
+        let h = cai_count_hits(lower, needles)
+        return cai_clip01(to_float(h) * 0.9)
+    }
+    if tag == "no_self_harm" {
+        let needles = ["suicide method", "how to harm yourself"]
+        let h = cai_count_hits(lower, needles)
+        return cai_clip01(to_float(h) * 0.9)
+    }
+    if tag == "truthful" {
+        let needles = ["i am 100% sure", "definitely fake", "fabricated source"]
+        let h = cai_count_hits(lower, needles)
+        return cai_clip01(to_float(h) * 0.5)
+    }
+    if tag == "helpful" {
+        // Non-answers are a minor helpfulness violation.
+        if len(lower) < 3 { return 0.4 }
+        return 0.0
+    }
+    if tag == "concise" {
+        let ln = len(response)
+        if ln > 400 { return 0.6 }
+        if ln > 200 { return 0.3 }
+        return 0.0
+    }
+    return 0.0
+}
+
+fn cai_default_revise(response, principle, tag, reason) {
+    // Very cheap deterministic rewrite: strip offending keywords,
+    // then prepend a safety preamble. Good enough for tests and for
+    // bootstrapping before a real LLM reviser is wired in.
+    let mut out = response
+    if tag == "no_violence" {
+        out = out.replace("how to make a bomb", "[redacted]")
+        out = out.replace("build a weapon", "[redacted]")
+        out = out.replace("kill someone", "[redacted]")
+        out = out.replace("make explosives", "[redacted]")
+    }
+    if tag == "no_pii" {
+        out = out.replace("social security number", "[redacted pii]")
+        out = out.replace("credit card number", "[redacted pii]")
+        out = out.replace("routing number", "[redacted pii]")
+        out = out.replace("ssn:", "[redacted pii]")
+    }
+    if tag == "no_illegal" {
+        out = out.replace("hack into", "[redacted]")
+        out = out.replace("bypass security", "[redacted]")
+        out = out.replace("steal credentials", "[redacted]")
+        out = out.replace("exploit vulnerability", "[redacted]")
+    }
+    if tag == "no_hate" {
+        out = out.replace("racial slur", "[redacted]")
+        out = out.replace("hate speech", "[redacted]")
+        out = out.replace("ethnic cleansing", "[redacted]")
+    }
+    if tag == "no_self_harm" {
+        out = out.replace("suicide method", "[redacted — please reach out to a professional]")
+        out = out.replace("how to harm yourself", "[redacted — please reach out to a professional]")
+    }
+    if tag == "concise" {
+        if len(out) > 200 { out = out.substring(0, 200) }
+    }
+    return "[revised per " + tag + "] " + out
+}
+
+println("[constitutional_ai] loaded — critique + revise + RLAIF hook")

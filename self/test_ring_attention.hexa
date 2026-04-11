@@ -1,22 +1,22 @@
-// ═══════════════════════════════════════════════════════════════════
-//  test_ring_attention.hexa — Ring Attention 검증
+// ═══════════════════════════════════════════════════════════════
+//  test_ring_attention.hexa — Ring Attention correctness tests
 //
-//  검증:
-//    1. ra_zeros 길이 및 값
-//    2. ra_split_seq 청크 분할
-//    3. ra_dot 내적
-//    4. ra_softmax 합 = 1
-//    5. ra_causal_mask 형태
-//    6. ra_blockwise_attention 출력 차원
-//    7. ra_ring_step 순환
-//    8. ra_matmul 수동 검증
-//    9. ra_scale / ra_add
-//   10. ra_online_softmax_block
-//   11. ra_merge_blocks
-//   12. ra_ring_attention 전체 파이프라인
+//  Verifies:
+//    1. Ring topology (next/prev)
+//    2. Sequence chunking and unchunking
+//    3. KV chunk rotation
+//    4. ring_attention_forward matches ra_naive_attention
+//    5. ring_attention_causal matches ra_naive_attention_causal
+//    6. Different world_size values produce identical results
+//    7. Partial attention + merge correctness
+//    8. Communication cost model
+//    9. Numerical stability with large scores
+//   10. Edge cases: world_size=1, uniform Q/K/V
 //
-//  실행: ./hexa self/test_ring_attention.hexa
-// ═══════════════════════════════════════════════════════════════════
+//  Run: ./hexa self/test_ring_attention.hexa
+// ═══════════════════════════════════════════════════════════════
+
+import "ml/ring_attention.hexa"
 
 let mut pass_count = 0
 let mut fail_count = 0
@@ -31,275 +31,364 @@ fn check(name, cond) {
     }
 }
 
-fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
-fn approx(a, b, eps) { return fabs(a - b) < eps }
-
-// ── inline helpers (from ring_attention.hexa) ────────────────────
-
-fn ra_exp(x) {
-    let mut v = x
-    if v > 20.0 { v = 20.0 }
-    if v < -20.0 { v = -20.0 }
-    let mut result = 1.0
-    let mut term = 1.0
-    for i in 1..30 {
-        term = term * v / to_float(i)
-        result = result + term
+fn t_fabs(x) {
+    if x < 0.0 {
+        return 0.0 - x
     }
-    if result < 0.0 { return 0.0 }
-    return result
+    return x
 }
 
-fn ra_sqrt(x) {
-    if x <= 0.0 { return 0.0 }
-    let mut g = x / 2.0
-    for _i in 0..20 { g = (g + x / g) / 2.0 }
-    return g
-}
-
-fn ra_zeros(n) {
-    let mut v = []
-    for _i in 0..n { v = v + [0.0] }
-    return v
-}
-
-fn ra_split_seq(seq, n_chunks) {
-    let total = len(seq)
-    let chunk_size = total / n_chunks
-    let mut chunks = []
-    for c in 0..n_chunks {
-        let start = c * chunk_size
-        let mut end = start + chunk_size
-        if c == n_chunks - 1 { end = total }
-        let mut chunk = []
-        for i in start..end { chunk = chunk + [seq[i]] }
-        chunks = chunks + [chunk]
+fn vec_approx_eq(a, b, eps) {
+    if len(a) != len(b) {
+        return false
     }
-    return chunks
-}
-
-fn ra_dot(a, b) {
-    let n = len(a)
-    let mut s = 0.0
-    for i in 0..n { s = s + a[i] * b[i] }
-    return s
-}
-
-fn ra_scale(v, s) {
-    let n = len(v)
-    let mut out = ra_zeros(n)
-    for i in 0..n { out[i] = v[i] * s }
-    return out
-}
-
-fn ra_add(a, b) {
-    let n = len(a)
-    let mut out = ra_zeros(n)
-    for i in 0..n { out[i] = a[i] + b[i] }
-    return out
-}
-
-fn ra_matmul(A, B, m, k, n) {
-    let mut C = ra_zeros(m * n)
-    for i in 0..m {
-        for j in 0..n {
-            let mut s = 0.0
-            for p in 0..k { s = s + A[i * k + p] * B[p * n + j] }
-            C[i * n + j] = s
+    for i in 0..len(a) {
+        if t_fabs(a[i] - b[i]) > eps {
+            return false
         }
     }
-    return C
+    return true
 }
 
-fn ra_softmax(logits) {
-    let n = len(logits)
-    let mut mx = logits[0]
-    for i in 1..n {
-        if logits[i] > mx { mx = logits[i] }
+fn mat_approx_eq(A, B, eps) {
+    if len(A) != len(B) {
+        return false
     }
-    let mut exps = ra_zeros(n)
-    let mut z = 0.0
-    for i in 0..n {
-        exps[i] = ra_exp(logits[i] - mx)
-        z = z + exps[i]
+    for i in 0..len(A) {
+        if !vec_approx_eq(A[i], B[i], eps) {
+            return false
+        }
     }
-    let mut out = ra_zeros(n)
-    for i in 0..n { out[i] = exps[i] / z }
-    return out
+    return true
 }
 
-fn ra_causal_mask(q_start, q_len, k_start, k_len) {
-    let mut mask = ra_zeros(q_len * k_len)
-    for i in 0..q_len {
-        for j in 0..k_len {
-            let q_pos = q_start + i
-            let k_pos = k_start + j
-            if q_pos >= k_pos {
-                mask[i * k_len + j] = 0.0
-            } else {
-                mask[i * k_len + j] = -1000000000.0
+fn max_abs_diff_mat(A, B) {
+    let mut mx = 0.0
+    for i in 0..len(A) {
+        for j in 0..len(A[i]) {
+            let d = t_fabs(A[i][j] - B[i][j])
+            if d > mx {
+                mx = d
             }
         }
     }
-    return mask
+    return mx
 }
 
-fn ra_blockwise_attention(Q, K, V, d, q_start, k_start) {
-    let q_len = len(Q) / d
-    let k_len = len(K) / d
-    let scale = 1.0 / ra_sqrt(to_float(d))
-    let mut scores = ra_zeros(q_len * k_len)
-    for i in 0..q_len {
-        for j in 0..k_len {
-            let mut s = 0.0
-            for p in 0..d { s = s + Q[i * d + p] * K[j * d + p] }
-            scores[i * k_len + j] = s * scale
-        }
-    }
-    let mask = ra_causal_mask(q_start, q_len, k_start, k_len)
-    for i in 0..(q_len * k_len) { scores[i] = scores[i] + mask[i] }
-    let mut out = ra_zeros(q_len * d)
-    for i in 0..q_len {
-        let mut row = ra_zeros(k_len)
-        for j in 0..k_len { row[j] = scores[i * k_len + j] }
-        let probs = ra_softmax(row)
-        for p in 0..d {
-            let mut s = 0.0
-            for j in 0..k_len { s = s + probs[j] * V[j * d + p] }
-            out[i * d + p] = s
-        }
-    }
-    return out
+println("=======================================================")
+println("  Ring Attention Test Suite")
+println("=======================================================")
+
+let eps = 1.0e-6
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 1-2: Ring topology next/prev
+// ═══════════════════════════════════════════════════════════════
+check("ring_next(0,4)=1", ring_next(0, 4) == 1)
+check("ring_prev(0,4)=3", ring_prev(0, 4) == 3)
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 3-4: ring_next/prev wrap around
+// ═══════════════════════════════════════════════════════════════
+check("ring_next(3,4)=0", ring_next(3, 4) == 0)
+check("ring_prev(1,4)=0", ring_prev(1, 4) == 0)
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 5: ring_topology_info
+// ═══════════════════════════════════════════════════════════════
+let info = ring_topology_info(1, 4, 16)
+check("topology_info rank=1", info[0] == 1)
+check("topology_info next=2", info[2] == 2)
+check("topology_info prev=0", info[3] == 0)
+check("topology_info chunk=4", info[4] == 4)
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 6-7: Sequence chunking
+// ═══════════════════════════════════════════════════════════════
+let mat4 = [
+    [1.0, 2.0],
+    [3.0, 4.0],
+    [5.0, 6.0],
+    [7.0, 8.0]
+]
+let chunks = ra_chunk_seq(mat4, 2)
+check("chunk count=2", len(chunks) == 2)
+check("chunk[0] rows=2", len(chunks[0]) == 2)
+check("chunk[0][0]=[1,2]", vec_approx_eq(chunks[0][0], [1.0, 2.0], eps))
+check("chunk[1][0]=[5,6]", vec_approx_eq(chunks[1][0], [5.0, 6.0], eps))
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 8: Unchunk roundtrip
+// ═══════════════════════════════════════════════════════════════
+let restored = ra_unchunk_seq(chunks, 2)
+check("unchunk roundtrip", mat_approx_eq(restored, mat4, eps))
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 9: KV rotation
+// ═══════════════════════════════════════════════════════════════
+let kv3 = [
+    [[1.0]],
+    [[2.0]],
+    [[3.0]]
+]
+let rotated = ra_rotate_chunks(kv3, 3)
+// new[0] = old[prev(0)] = old[2] = [[3.0]]
+check("rotate[0]=old[2]", rotated[0][0][0] == 3.0)
+// new[1] = old[prev(1)] = old[0] = [[1.0]]
+check("rotate[1]=old[0]", rotated[1][0][0] == 1.0)
+// new[2] = old[prev(2)] = old[1] = [[2.0]]
+check("rotate[2]=old[1]", rotated[2][0][0] == 2.0)
+
+// ═══════════════════════════════════════════════════════════════
+//  Build test fixtures: S=4, d=3
+// ═══════════════════════════════════════════════════════════════
+let Q4 = [
+    [0.1, 0.5, 0.9],
+    [0.8, 0.2, 0.4],
+    [0.3, 0.7, 0.1],
+    [0.6, 0.4, 0.8]
+]
+let K4 = [
+    [0.2, 0.1, 0.4],
+    [0.5, 0.3, 0.2],
+    [0.1, 0.6, 0.8],
+    [0.9, 0.7, 0.5]
+]
+let V4 = [
+    [1.0, 0.0, 0.5],
+    [0.0, 1.0, 0.5],
+    [0.5, 0.5, 1.0],
+    [1.0, 1.0, 0.0]
+]
+
+let ref_noncausal = ra_naive_attention(Q4, K4, V4)
+let ref_causal = ra_naive_attention_causal(Q4, K4, V4)
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 10: ring_attention_forward(W=2) matches naive
+// ═══════════════════════════════════════════════════════════════
+let ring_w2 = ring_attention_forward(Q4, K4, V4, 2)
+check("ring_fwd(W=2) shape", len(ring_w2) == 4)
+check("ring_fwd(W=2) d", len(ring_w2[0]) == 3)
+check("ring_fwd(W=2) matches naive", mat_approx_eq(ring_w2, ref_noncausal, eps))
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 11: ring_attention_forward(W=1) matches naive (degenerate)
+// ═══════════════════════════════════════════════════════════════
+let ring_w1 = ring_attention_forward(Q4, K4, V4, 1)
+check("ring_fwd(W=1) matches naive", mat_approx_eq(ring_w1, ref_noncausal, eps))
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 12: ring_attention_forward(W=4) matches naive
+// ═══════════════════════════════════════════════════════════════
+let ring_w4 = ring_attention_forward(Q4, K4, V4, 4)
+check("ring_fwd(W=4) matches naive", mat_approx_eq(ring_w4, ref_noncausal, eps))
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 13: W=2 == W=4 (different partitions, same result)
+// ═══════════════════════════════════════════════════════════════
+check("ring_fwd W=2 == W=4", mat_approx_eq(ring_w2, ring_w4, eps))
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 14: ring_attention_causal(W=2) matches naive causal
+// ═══════════════════════════════════════════════════════════════
+let ring_c2 = ring_attention_causal(Q4, K4, V4, 2)
+check("ring_causal(W=2) matches naive", mat_approx_eq(ring_c2, ref_causal, eps))
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 15: ring_attention_causal(W=4) matches naive causal
+// ═══════════════════════════════════════════════════════════════
+let ring_c4 = ring_attention_causal(Q4, K4, V4, 4)
+check("ring_causal(W=4) matches naive", mat_approx_eq(ring_c4, ref_causal, eps))
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 16: ring_attention_causal(W=1) matches naive causal
+// ═══════════════════════════════════════════════════════════════
+let ring_c1 = ring_attention_causal(Q4, K4, V4, 1)
+check("ring_causal(W=1) matches naive", mat_approx_eq(ring_c1, ref_causal, eps))
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 17: causal != non-causal (they should differ)
+// ═══════════════════════════════════════════════════════════════
+let diff_cn = max_abs_diff_mat(ring_w2, ring_c2)
+check("causal != noncausal", diff_cn > 1.0e-4)
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 18: Partial attention + merge = full attention
+//  Split K,V into 2 halves, compute partials, merge, compare
+// ═══════════════════════════════════════════════════════════════
+let Q_part = [[0.1, 0.5, 0.9]]
+let K_h1 = [
+    [0.2, 0.1, 0.4],
+    [0.5, 0.3, 0.2]
+]
+let V_h1 = [
+    [1.0, 0.0, 0.5],
+    [0.0, 1.0, 0.5]
+]
+let K_h2 = [
+    [0.1, 0.6, 0.8],
+    [0.9, 0.7, 0.5]
+]
+let V_h2 = [
+    [0.5, 0.5, 1.0],
+    [1.0, 1.0, 0.0]
+]
+
+let p1 = ring_partial_attention(Q_part, K_h1, V_h1)
+let p2 = ring_partial_attention(Q_part, K_h2, V_h2)
+
+let merged = ring_merge_partials(p1[0], p1[1], p1[2], p2[0], p2[1], p2[2])
+// Normalize merged
+let merged_O = merged[0]
+let merged_l = merged[2]
+let mut final_merged = ra_zeros_2d(1, 3)
+for k in 0..3 {
+    final_merged[0][k] = merged_O[0][k] / merged_l[0]
 }
 
-fn ra_ring_step(kv_chunks, ring_size) {
-    let mut new_chunks = []
-    for i in 0..ring_size {
-        let src = (i - 1 + ring_size) % ring_size
-        new_chunks = new_chunks + [kv_chunks[src]]
+// Reference: naive attention of Q_part against all K4, V4
+// Q=[1,3], K=[4,3], V=[4,3] — compute manually
+let ref_d = 3
+let ref_scale = 1.0 / sqrt(ref_d * 1.0)
+let mut ref_scores = ra_zeros_1d(4)
+for j in 0..4 {
+    let mut dot = 0.0
+    for k in 0..ref_d {
+        dot = dot + Q_part[0][k] * K4[j][k]
     }
-    return new_chunks
+    ref_scores[j] = dot * ref_scale
 }
-
-fn ra_online_softmax_block(scores, values, d) {
-    let k_len = len(scores)
-    let mut mx = scores[0]
-    for j in 1..k_len {
-        if scores[j] > mx { mx = scores[j] }
+let mut ref_m = ref_scores[0]
+for j in 1..4 {
+    if ref_scores[j] > ref_m {
+        ref_m = ref_scores[j]
     }
-    let mut total_w = 0.0
-    let mut weighted = ra_zeros(d)
-    for j in 0..k_len {
-        let w = ra_exp(scores[j] - mx)
-        total_w = total_w + w
-        for p in 0..d { weighted[p] = weighted[p] + w * values[j * d + p] }
-    }
-    return [weighted, [mx], [total_w]]
 }
-
-fn ra_merge_blocks(blocks, d) {
-    let n = len(blocks)
-    let mut global_max = blocks[0][1][0]
-    for i in 1..n {
-        let bm = blocks[i][1][0]
-        if bm > global_max { global_max = bm }
-    }
-    let mut merged = ra_zeros(d)
-    let mut total = 0.0
-    for i in 0..n {
-        let bm = blocks[i][1][0]
-        let bw = blocks[i][2][0]
-        let correction = ra_exp(bm - global_max)
-        let adj_w = bw * correction
-        total = total + adj_w
-        let weighted = blocks[i][0]
-        for p in 0..d { merged[p] = merged[p] + weighted[p] * correction }
-    }
-    if total > 0.0 {
-        for p in 0..d { merged[p] = merged[p] / total }
-    }
-    return merged
+let mut ref_sum = 0.0
+let mut ref_exps = ra_zeros_1d(4)
+for j in 0..4 {
+    let e = exp(ref_scores[j] - ref_m)
+    ref_exps[j] = e
+    ref_sum = ref_sum + e
 }
+let mut ref_out = ra_zeros_1d(3)
+for k in 0..ref_d {
+    let mut acc = 0.0
+    for j in 0..4 {
+        acc = acc + ref_exps[j] * V4[j][k]
+    }
+    ref_out[k] = acc / ref_sum
+}
+check("partial_merge matches full", vec_approx_eq(final_merged[0], ref_out, eps))
 
-// ═══════════════════════════════════════════════════════════════════
-//  Tests
-// ═══════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════
+//  Test 19: Communication cost model
+// ═══════════════════════════════════════════════════════════════
+let comm = ring_comm_bytes(1024, 64, 4)
+// = 2 * 1024 * 64 * 4 = 524288
+check("comm_bytes", comm == 524288)
 
-println("=== Ring Attention Tests ===")
+// ═══════════════════════════════════════════════════════════════
+//  Test 20: Numerical stability — large scores
+// ═══════════════════════════════════════════════════════════════
+let Q_big = [
+    [5.0, 5.0],
+    [4.0, 4.0],
+    [3.0, 3.0],
+    [6.0, 6.0]
+]
+let K_big = [
+    [4.0, 4.0],
+    [5.0, 5.0],
+    [0.0 - 3.0, 0.0 - 3.0],
+    [6.0, 6.0]
+]
+let V_big = [
+    [1.0, 0.0],
+    [0.0, 1.0],
+    [0.5, 0.5],
+    [1.0, 1.0]
+]
+let ref_big = ra_naive_attention(Q_big, K_big, V_big)
+let ring_big = ring_attention_forward(Q_big, K_big, V_big, 2)
+check("large-score stability fwd", mat_approx_eq(ring_big, ref_big, 1.0e-5))
 
-// 1. ra_zeros
-let z4 = ra_zeros(4)
-check("zeros_len", len(z4) == 4)
-check("zeros_val", z4[0] == 0.0)
+// ═══════════════════════════════════════════════════════════════
+//  Test 21: Large scores causal
+// ═══════════════════════════════════════════════════════════════
+let ref_big_c = ra_naive_attention_causal(Q_big, K_big, V_big)
+let ring_big_c = ring_attention_causal(Q_big, K_big, V_big, 2)
+check("large-score stability causal", mat_approx_eq(ring_big_c, ref_big_c, 1.0e-5))
 
-// 2. split_seq
-let seq8 = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
-let chunks = ra_split_seq(seq8, 2)
-check("split_2chunks", len(chunks) == 2)
-check("split_chunk0_len", len(chunks[0]) == 4)
-check("split_chunk1_first", chunks[1][0] == 5.0)
+// ═══════════════════════════════════════════════════════════════
+//  Test 22: Uniform Q/K/V — attention output = mean(V)
+// ═══════════════════════════════════════════════════════════════
+let Q_uni = [
+    [1.0, 0.0],
+    [1.0, 0.0],
+    [1.0, 0.0],
+    [1.0, 0.0]
+]
+let K_uni = [
+    [1.0, 0.0],
+    [1.0, 0.0],
+    [1.0, 0.0],
+    [1.0, 0.0]
+]
+let V_uni = [
+    [1.0, 0.0],
+    [0.0, 1.0],
+    [1.0, 0.0],
+    [0.0, 1.0]
+]
+// All scores equal => uniform softmax => output = mean(V) = [0.5, 0.5]
+let ring_uni = ring_attention_forward(Q_uni, K_uni, V_uni, 2)
+check("uniform Q/K: out[0]=[0.5,0.5]", vec_approx_eq(ring_uni[0], [0.5, 0.5], eps))
+check("uniform Q/K: out[3]=[0.5,0.5]", vec_approx_eq(ring_uni[3], [0.5, 0.5], eps))
 
-// 3. dot product
-let a3 = [1.0, 2.0, 3.0]
-let b3 = [4.0, 5.0, 6.0]
-check("dot_product", approx(ra_dot(a3, b3), 32.0, 0.001))
+// ═══════════════════════════════════════════════════════════════
+//  Test 23: Longer sequence S=8, d=2, W=2
+// ═══════════════════════════════════════════════════════════════
+let mut Q8 = []
+let mut K8 = []
+let mut V8 = []
+for i in 0..8 {
+    let fi = i * 1.0
+    Q8 = Q8 + [[0.1 + fi * 0.05, 0.2 - fi * 0.03]]
+    K8 = K8 + [[0.3 + fi * 0.04, 0.4 - fi * 0.02]]
+    V8 = V8 + [[0.5 + fi * 0.01, 0.6 - fi * 0.01]]
+}
+let ref8 = ra_naive_attention(Q8, K8, V8)
+let ring8_w2 = ring_attention_forward(Q8, K8, V8, 2)
+let ring8_w4 = ring_attention_forward(Q8, K8, V8, 4)
+check("S=8 W=2 matches naive", mat_approx_eq(ring8_w2, ref8, eps))
+check("S=8 W=4 matches naive", mat_approx_eq(ring8_w4, ref8, eps))
 
-// 4. softmax sums to 1
-let sm = ra_softmax([1.0, 2.0, 3.0])
-let sm_sum = sm[0] + sm[1] + sm[2]
-check("softmax_sum_1", approx(sm_sum, 1.0, 0.001))
-check("softmax_order", sm[2] > sm[1])
+// ═══════════════════════════════════════════════════════════════
+//  Test 24: S=8 causal with W=2,4
+// ═══════════════════════════════════════════════════════════════
+let ref8c = ra_naive_attention_causal(Q8, K8, V8)
+let ring8c_w2 = ring_attention_causal(Q8, K8, V8, 2)
+let ring8c_w4 = ring_attention_causal(Q8, K8, V8, 4)
+check("S=8 causal W=2 matches naive", mat_approx_eq(ring8c_w2, ref8c, eps))
+check("S=8 causal W=4 matches naive", mat_approx_eq(ring8c_w4, ref8c, eps))
 
-// 5. causal mask
-let mask = ra_causal_mask(0, 3, 0, 3)
-check("mask_diag", mask[0] == 0.0)
-check("mask_upper", mask[1] < -1000.0)
+// ═══════════════════════════════════════════════════════════════
+//  Test 25: max_abs_diff is small
+// ═══════════════════════════════════════════════════════════════
+let diff_w2 = max_abs_diff_mat(ring_w2, ref_noncausal)
+check("max_abs_diff(fwd W=2) < 1e-6", diff_w2 < 1.0e-6)
 
-// 6. scale + add
-let scaled = ra_scale([1.0, 2.0], 3.0)
-check("scale", approx(scaled[0], 3.0, 0.001))
-let added = ra_add([1.0, 2.0], [3.0, 4.0])
-check("add", approx(added[1], 6.0, 0.001))
+let diff_c2 = max_abs_diff_mat(ring_c2, ref_causal)
+check("max_abs_diff(causal W=2) < 1e-6", diff_c2 < 1.0e-6)
 
-// 7. matmul 2x2
-let A = [1.0, 2.0, 3.0, 4.0]
-let B = [5.0, 6.0, 7.0, 8.0]
-let C = ra_matmul(A, B, 2, 2, 2)
-check("matmul_00", approx(C[0], 19.0, 0.001))
-check("matmul_11", approx(C[3], 50.0, 0.001))
-
-// 8. blockwise attention output dimension
-let d = 2
-let Q2 = [1.0, 0.0, 0.0, 1.0]
-let K2 = [1.0, 0.0, 0.0, 1.0]
-let V2 = [1.0, 2.0, 3.0, 4.0]
-let att_out = ra_blockwise_attention(Q2, K2, V2, d, 0, 0)
-check("attn_dim", len(att_out) == 4)
-
-// 9. ring_step rotation
-let kv = ["a", "b", "c"]
-let rotated = ra_ring_step(kv, 3)
-check("ring_rotate", rotated[1] == "a")
-check("ring_rotate2", rotated[0] == "c")
-
-// 10. online softmax block
-let scores2 = [1.0, 2.0]
-let vals2 = [1.0, 0.0, 0.0, 1.0]
-let block = ra_online_softmax_block(scores2, vals2, 2)
-check("online_max", approx(block[1][0], 2.0, 0.001))
-check("online_weight_pos", block[2][0] > 0.0)
-
-// 11. merge_blocks
-let b1 = [[1.0, 0.0], [2.0], [1.5]]
-let b2 = [[0.0, 1.0], [1.0], [1.0]]
-let merged = ra_merge_blocks([b1, b2], 2)
-check("merge_dim", len(merged) == 2)
-
-// 12. causal mask asymmetry
-let mask2 = ra_causal_mask(2, 2, 0, 2)
-check("mask_asym_lower", mask2[0] == 0.0)
-check("mask_asym_all", mask2[2] == 0.0)
-
-// ── summary ──────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
 println("")
-println("Ring Attention: " + str(pass_count) + " passed, " + str(fail_count) + " failed")
+println("pass=" + to_string(pass_count) + " fail=" + to_string(fail_count))
+if fail_count == 0 {
+    println("ALL PASS")
+} else {
+    println("FAILED")
+}
+println(to_string(pass_count) + " passed")

@@ -1,0 +1,505 @@
+// ═══════════════════════════════════════════════════════════════
+//  dora.hexa — DoRA: Weight-Decomposed Low-Rank Adaptation
+//
+//  Ref:  Liu et al. 2024 — "DoRA: Weight-Decomposed Low-Rank
+//        Adaptation"
+//
+//  Core idea — decompose pretrained W into magnitude + direction:
+//    W = m * V / ||V||      (column-wise)
+//    where m = ||W_col||    (learnable magnitude, 1D vector)
+//          V = W            (direction matrix)
+//
+//  Fine-tune:
+//    - Apply LoRA (B @ A) to direction only:
+//      V' = V + B @ A
+//    - Magnitude m is a separate learnable vector
+//    - Forward:  y = m * (V + B@A) / ||(V + B@A)_col|| @ x
+//    - Only m, A, B are trainable; original V (=W) frozen.
+//
+//  Merge for inference:
+//    W' = m * (V + B@A) / ||(V + B@A)_col||
+//    => single merged matrix, no runtime overhead.
+//
+//  AI-NATIVE:
+//    @pure    — math kernels (forward / backward / merge / norms)
+//    @memoize — lora_scale constant
+//    @hot     — train step inner loop
+//
+//  HX3/memory pitfalls honored:
+//    - no semicolons
+//    - no complex-index-assignment on deep structs
+//    - struct fields via rebuild
+//    - no bit-twiddling / manual-loop micro-opts
+//
+//  Base: self/ml/lora.hexa + self/ml/finetune.hexa patterns.
+//  L0: src/*.rs untouched. Pure .hexa.
+// ═══════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 1: Core math helpers (self-contained)
+// ═══════════════════════════════════════════════════════════════
+
+fn dora_zeros1(n) {
+    let mut v = []
+    for i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn dora_zeros2(rows, cols) {
+    let mut r = []
+    for i in 0..rows { r = r + [dora_zeros1(cols)] }
+    return r
+}
+
+fn dora_ones1(n) {
+    let mut v = []
+    for i in 0..n { v = v + [1.0] }
+    return v
+}
+
+// ── deterministic LCG init (Kaiming-like) ──────────────────
+fn dora_kaiming(rows, cols, seed) {
+    let mut s = seed
+    let scale = 1.0 / sqrt(to_float(cols))
+    let mut r = []
+    for i in 0..rows {
+        let mut row = []
+        for j in 0..cols {
+            s = (s * 1103515245 + 12345) % 2147483647
+            let v = (to_float(s % 2000) - 1000.0) / 1000.0 * scale
+            row = row + [v]
+        }
+        r = r + [row]
+    }
+    return r
+}
+
+// ── matvec: y[m] = W[m,n] @ x[n] ──────────────────────────
+@pure
+fn dora_matvec(w, x, m, n) {
+    let mut y = []
+    for i in 0..m {
+        let mut s = 0.0
+        for j in 0..n { s = s + w[i][j] * x[j] }
+        y = y + [s]
+    }
+    return y
+}
+
+// ── matmul: C[m,n] = A[m,k] @ B[k,n] ──────────────────────
+@pure
+fn dora_matmul(a, b, m, k, n) {
+    let mut c = []
+    for i in 0..m {
+        let mut row = []
+        for j in 0..n {
+            let mut s = 0.0
+            for p in 0..k { s = s + a[i][p] * b[p][j] }
+            row = row + [s]
+        }
+        c = c + [row]
+    }
+    return c
+}
+
+// ── LoRA scale: alpha / r ──────────────────────────────────
+@memoize
+fn dora_lora_scale(alpha, r) {
+    return to_float(alpha) / to_float(r)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 2: Column-norm operations
+//
+//  For DoRA we need column norms of W (out_dim x in_dim).
+//  Column j norm = sqrt( sum_i W[i][j]^2 ).
+//  This gives a vector of length in_dim.
+// ═══════════════════════════════════════════════════════════════
+
+// ── column_norms: ||W_col_j|| for each column j ────────────
+@pure
+fn column_norms(w, out_dim, in_dim) {
+    let mut norms = []
+    for j in 0..in_dim {
+        let mut s = 0.0
+        for i in 0..out_dim {
+            s = s + w[i][j] * w[i][j]
+        }
+        norms = norms + [sqrt(s + 1.0e-8)]
+    }
+    return norms
+}
+
+// ── normalize_columns: W_norm[i][j] = W[i][j] / ||col_j|| ─
+@pure
+fn normalize_columns(w, norms, out_dim, in_dim) {
+    let mut r = []
+    for i in 0..out_dim {
+        let mut row = []
+        for j in 0..in_dim {
+            row = row + [w[i][j] / norms[j]]
+        }
+        r = r + [row]
+    }
+    return r
+}
+
+// ── extract_magnitude: m[j] = ||col_j|| of original W ─────
+@pure
+fn extract_magnitude(w, out_dim, in_dim) {
+    return column_norms(w, out_dim, in_dim)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 3: DoRA adapter struct
+// ═══════════════════════════════════════════════════════════════
+
+struct DoraAdapter {
+    m: array,       // magnitude vector [in_dim] — learnable
+    a: array,       // LoRA A [rank, in_dim] — Kaiming init, learnable
+    b: array,       // LoRA B [out_dim, rank] — zero init, learnable
+    out_dim: int,
+    in_dim: int,
+    rank: int
+}
+
+// ── Create DoRA adapter for one layer ──────────────────────
+// m initialized from column norms of original W
+// A: Kaiming init, B: zero init (LoRA convention)
+fn make_dora_adapter(w, out_dim, in_dim, rank, seed) {
+    let m = extract_magnitude(w, out_dim, in_dim)
+    let a = dora_kaiming(rank, in_dim, seed)
+    let b = dora_zeros2(out_dim, rank)
+    DoraAdapter {
+        m: m,
+        a: a,
+        b: b,
+        out_dim: out_dim,
+        in_dim: in_dim,
+        rank: rank
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 4: DoRA forward
+//
+//  y = diag(m) * normalize_cols(V + s*B@A) @ x
+//
+//  Where V = frozen W (direction), s = alpha/r.
+//  Step by step:
+//    1. V' = V + s * B @ A           [out_dim x in_dim]
+//    2. norms_j = ||col_j(V')||      [in_dim]
+//    3. V_hat[i][j] = V'[i][j] / norms_j  (column-normalized)
+//    4. y_raw = V_hat @ x            [out_dim]
+//    5. y[i] = sum_j m[j] * V_hat[i][j] * x[j]
+//       equivalently: y = V_hat @ (m * x)  (element-wise m*x)
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn dora_forward(w, adapter: DoraAdapter, x, alpha) {
+    let out_dim = adapter.out_dim
+    let in_dim = adapter.in_dim
+    let r = adapter.rank
+    let s = dora_lora_scale(alpha, r)
+
+    // 1. Compute V' = W + s * B @ A
+    let ba = dora_matmul(adapter.b, adapter.a, out_dim, r, in_dim)
+    let mut vprime = []
+    for i in 0..out_dim {
+        let mut row = []
+        for j in 0..in_dim {
+            row = row + [w[i][j] + s * ba[i][j]]
+        }
+        vprime = vprime + [row]
+    }
+
+    // 2. Column norms of V'
+    let norms = column_norms(vprime, out_dim, in_dim)
+
+    // 3. Normalize columns of V'
+    let v_hat = normalize_columns(vprime, norms, out_dim, in_dim)
+
+    // 4. y = V_hat @ (m .* x)  — magnitude applied to input
+    let mut mx = []
+    for j in 0..in_dim {
+        mx = mx + [adapter.m[j] * x[j]]
+    }
+    let y = dora_matvec(v_hat, mx, out_dim, in_dim)
+
+    return y
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 5: DoRA backward
+//
+//  Given dL/dy, compute gradients for m, A, B.
+//
+//  Forward recap:
+//    V' = W + s * B@A
+//    norms[j] = ||col_j(V')||
+//    V_hat[i][j] = V'[i][j] / norms[j]
+//    y = V_hat @ (m .* x)
+//
+//  Gradients (chain rule):
+//    dL/d(mx) = V_hat^T @ dy           [in_dim]
+//    dL/dm[j] = dL/d(mx)[j] * x[j]    [in_dim]
+//    dL/dV_hat = dy (x) (m.*x)^T       [out_dim x in_dim]
+//
+//  Then through column normalization:
+//    dL/dV'[i][j] = (dL/dV_hat[i][j] - V_hat[i][j] * dot_j) / norms[j]
+//    where dot_j = sum_i V_hat[i][j] * dL/dV_hat[i][j]
+//
+//  Then through LoRA:
+//    dL/dB = s * dV' @ A^T
+//    dL/dA = s * B^T @ dV'
+//
+//  Returns: [dm, dA, dB]
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn dora_backward(w, adapter: DoraAdapter, x, dy, alpha) {
+    let out_dim = adapter.out_dim
+    let in_dim = adapter.in_dim
+    let r = adapter.rank
+    let s = dora_lora_scale(alpha, r)
+
+    // Recompute forward intermediates
+    let ba = dora_matmul(adapter.b, adapter.a, out_dim, r, in_dim)
+    let mut vprime = []
+    for i in 0..out_dim {
+        let mut row = []
+        for j in 0..in_dim {
+            row = row + [w[i][j] + s * ba[i][j]]
+        }
+        vprime = vprime + [row]
+    }
+    let norms = column_norms(vprime, out_dim, in_dim)
+    let v_hat = normalize_columns(vprime, norms, out_dim, in_dim)
+
+    // m .* x
+    let mut mx = []
+    for j in 0..in_dim { mx = mx + [adapter.m[j] * x[j]] }
+
+    // ── dL/d(mx) = V_hat^T @ dy ──────────────────────────
+    let mut dmx = dora_zeros1(in_dim)
+    for j in 0..in_dim {
+        let mut acc = 0.0
+        for i in 0..out_dim { acc = acc + v_hat[i][j] * dy[i] }
+        dmx[j] = acc
+    }
+
+    // ── dL/dm[j] = dmx[j] * x[j] ────────────────────────
+    let mut dm = dora_zeros1(in_dim)
+    for j in 0..in_dim {
+        dm[j] = dmx[j] * x[j]
+    }
+
+    // ── dL/dV_hat = dy (outer) mx^T ─────────────────────
+    let mut dv_hat = dora_zeros2(out_dim, in_dim)
+    for i in 0..out_dim {
+        for j in 0..in_dim {
+            dv_hat[i][j] = dy[i] * mx[j]
+        }
+    }
+
+    // ── Through column normalization ────────────────────
+    // dL/dV'[i][j] = (dv_hat[i][j] - v_hat[i][j] * dot_j) / norms[j]
+    // where dot_j = sum_i v_hat[i][j] * dv_hat[i][j]
+    let mut dvprime = dora_zeros2(out_dim, in_dim)
+    for j in 0..in_dim {
+        let mut dot_j = 0.0
+        for i in 0..out_dim {
+            dot_j = dot_j + v_hat[i][j] * dv_hat[i][j]
+        }
+        for i in 0..out_dim {
+            dvprime[i][j] = (dv_hat[i][j] - v_hat[i][j] * dot_j) / norms[j]
+        }
+    }
+
+    // ── Through LoRA: V' = W + s * B@A ──────────────────
+    // dL/dB = s * dvprime @ A^T   [out_dim x rank]
+    let mut db = dora_zeros2(out_dim, r)
+    for i in 0..out_dim {
+        for p in 0..r {
+            let mut acc = 0.0
+            for j in 0..in_dim {
+                acc = acc + dvprime[i][j] * adapter.a[p][j]
+            }
+            db[i][p] = s * acc
+        }
+    }
+
+    // dL/dA = s * B^T @ dvprime   [rank x in_dim]
+    let mut da = dora_zeros2(r, in_dim)
+    for p in 0..r {
+        for j in 0..in_dim {
+            let mut acc = 0.0
+            for i in 0..out_dim {
+                acc = acc + adapter.b[i][p] * dvprime[i][j]
+            }
+            da[p][j] = s * acc
+        }
+    }
+
+    return [dm, da, db]
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 6: DoRA merge
+//
+//  For inference, merge into a single weight matrix:
+//    W_merged[i][j] = m[j] * V'[i][j] / ||col_j(V')||
+//  where V' = W + (alpha/r) * B @ A
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn dora_merge(w, adapter: DoraAdapter, alpha) {
+    let out_dim = adapter.out_dim
+    let in_dim = adapter.in_dim
+    let r = adapter.rank
+    let s = dora_lora_scale(alpha, r)
+
+    // V' = W + s * B @ A
+    let ba = dora_matmul(adapter.b, adapter.a, out_dim, r, in_dim)
+    let mut vprime = []
+    for i in 0..out_dim {
+        let mut row = []
+        for j in 0..in_dim {
+            row = row + [w[i][j] + s * ba[i][j]]
+        }
+        vprime = vprime + [row]
+    }
+
+    // Column norms
+    let norms = column_norms(vprime, out_dim, in_dim)
+
+    // W_merged = diag(m) * normalize_cols(V')
+    // W_merged[i][j] = m[j] * V'[i][j] / norms[j]
+    let mut merged = []
+    for i in 0..out_dim {
+        let mut row = []
+        for j in 0..in_dim {
+            row = row + [adapter.m[j] * vprime[i][j] / norms[j]]
+        }
+        merged = merged + [row]
+    }
+    return merged
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 7: SGD update helpers
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn dora_sgd_2d(param, grad, lr, rows, cols) {
+    let mut out = []
+    for i in 0..rows {
+        let mut row = []
+        for j in 0..cols { row = row + [param[i][j] - lr * grad[i][j]] }
+        out = out + [row]
+    }
+    return out
+}
+
+@pure
+fn dora_sgd_1d(param, grad, lr, n) {
+    let mut out = []
+    for i in 0..n { out = out + [param[i] - lr * grad[i]] }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 8: Loss helpers
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn dora_mse_loss(y, target, m) {
+    let mut s = 0.0
+    for i in 0..m {
+        let d = y[i] - target[i]
+        s = s + d * d
+    }
+    return s / to_float(m)
+}
+
+@pure
+fn dora_mse_grad(y, target, m) {
+    let mut g = []
+    let inv = 2.0 / to_float(m)
+    for i in 0..m { g = g + [(y[i] - target[i]) * inv] }
+    return g
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 9: DoRA training step
+//
+//  One SGD step: forward -> loss -> backward -> update m,A,B
+//  Returns: [updated_adapter, loss]
+// ═══════════════════════════════════════════════════════════════
+
+@hot
+fn dora_step(w, adapter: DoraAdapter, x, target, alpha, lr) {
+    let out_dim = adapter.out_dim
+    let in_dim = adapter.in_dim
+    let r = adapter.rank
+
+    // Forward
+    let y = dora_forward(w, adapter, x, alpha)
+
+    // Loss + grad
+    let loss = dora_mse_loss(y, target, out_dim)
+    let dy = dora_mse_grad(y, target, out_dim)
+
+    // Backward
+    let grads = dora_backward(w, adapter, x, dy, alpha)
+    let dm = grads[0]
+    let da = grads[1]
+    let db = grads[2]
+
+    // SGD update
+    let new_m = dora_sgd_1d(adapter.m, dm, lr, in_dim)
+    let new_a = dora_sgd_2d(adapter.a, da, lr, r, in_dim)
+    let new_b = dora_sgd_2d(adapter.b, db, lr, out_dim, r)
+
+    let new_adapter = DoraAdapter {
+        m: new_m,
+        a: new_a,
+        b: new_b,
+        out_dim: out_dim,
+        in_dim: in_dim,
+        rank: r
+    }
+
+    return [new_adapter, loss]
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 10: Trainable param count
+// ═══════════════════════════════════════════════════════════════
+
+fn dora_trainable_count(adapter: DoraAdapter) {
+    // m: in_dim + A: rank*in_dim + B: out_dim*rank
+    return adapter.in_dim + adapter.rank * adapter.in_dim + adapter.out_dim * adapter.rank
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 11: Gradient norm (for clipping / monitoring)
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn dora_grad_norm_1d(g, n) {
+    let mut s = 0.0
+    for i in 0..n { s = s + g[i] * g[i] }
+    return sqrt(s)
+}
+
+@pure
+fn dora_grad_norm_2d(g, rows, cols) {
+    let mut s = 0.0
+    for i in 0..rows {
+        for j in 0..cols { s = s + g[i][j] * g[i][j] }
+    }
+    return sqrt(s)
+}
+
+println("[dora] module loaded — DoRA: Weight-Decomposed Low-Rank Adaptation")

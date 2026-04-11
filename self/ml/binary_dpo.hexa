@@ -1,0 +1,370 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/binary_dpo.hexa — Binary DPO (2-class single-label preference)
+//
+//  Binary DPO (bDPO) reduces Direct Preference Optimization to a single
+//  binary classification head per sample. Each sample carries one label
+//  y in {+1, -1} (positive = desirable, negative = undesirable) and a
+//  single log-ratio (policy vs. reference). This collapses the pairwise
+//  DPO (chosen/rejected) into a BCE-style loss that can be trained on
+//  mixed positive-only or negative-only corpora.
+//
+//  Two flavors:
+//
+//    1. Reference-full bDPO (analogous to KTO but single-sided)
+//         r(x)   = beta * (log pi(x) - log pi_ref(x))
+//         L_pos  = -log sigmoid(r - rho)            if y = +1
+//         L_neg  = -log sigmoid(rho - r)            if y = -1
+//       where rho is a soft margin anchor (default 0).
+//
+//    2. Reference-free bDPO ("bDPO-RF")
+//         r(x)   = beta * log pi(x)
+//         L_pos  = -log sigmoid(r - rho)
+//         L_neg  = -log sigmoid(rho - r)
+//       no reference model required — only the policy log-prob.
+//
+//  BCE form (equivalent, numerically safer):
+//
+//       target = 1 if y=+1 else 0
+//       L      = softplus(-z) + (1 - target) * z
+//                = -target*log sigmoid(z) - (1-target)*log sigmoid(-z)
+//
+//  API:
+//    bdpo_sigmoid(x)                                         -> float
+//    bdpo_log_sigmoid(x)                                     -> float
+//    bdpo_softplus(x)                                        -> float
+//    bdpo_bce_from_logit(z, target)                          -> float
+//
+//    bdpo_reward(log_pi, log_ref, beta)                      -> float
+//    bdpo_reward_free(log_pi, beta)                          -> float
+//
+//    bdpo_loss_pos(log_pi, log_ref, beta, rho)               -> float
+//    bdpo_loss_neg(log_pi, log_ref, beta, rho)               -> float
+//    bdpo_loss(log_pi, log_ref, beta, rho, label)            -> float
+//    bdpo_loss_rf(log_pi, beta, rho, label)                  -> float
+//
+//    bdpo_grad_logit(z, target)                              -> float
+//    bdpo_grad_log_pi(log_pi, log_ref, beta, rho, label)     -> float
+//    bdpo_grad_log_pi_rf(log_pi, beta, rho, label)           -> float
+//
+//    bdpo_batch_train_step(log_pis, log_refs, labels,
+//                          beta, rho, lr)                    -> [loss, acc]
+//    bdpo_batch_train_step_rf(log_pis, labels,
+//                             beta, rho, lr)                 -> [loss, acc]
+//
+//    bdpo_alignment_margin(log_pi, log_ref, beta, label)     -> float
+//    bdpo_preference_accuracy(rewards, labels)               -> float
+//    bdpo_vs_dpo_quality(bdpo_rw, bdpo_rl, dpo_rw, dpo_rl,
+//                        beta)                               -> [float]
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+//    @hot   — called every training step
+// ═══════════════════════════════════════════════════════════════════
+
+// ── numerics helpers (self-contained to avoid module coupling) ───
+
+@pure
+fn bdpo_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+@pure
+fn bdpo_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+@pure
+fn bdpo_log(x) {
+    if x <= 0.0 { return -30.0 }
+    let mut v = x
+    let mut count = 0
+    while v > 2.0 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    let d = v - 1.0
+    let ln_v = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_v
+}
+
+// ── core nonlinearities ──────────────────────────────────────────
+
+@pure @hot
+pub fn bdpo_sigmoid(x) {
+    if x > 20.0 { return 1.0 }
+    if x < -20.0 { return 0.0 }
+    return 1.0 / (1.0 + bdpo_exp(0.0 - x))
+}
+
+@pure @hot
+pub fn bdpo_log_sigmoid(x) {
+    // -softplus(-x), numerically stable
+    let neg_x = 0.0 - x
+    if neg_x > 20.0 { return 0.0 - neg_x }
+    if neg_x < -20.0 { return 0.0 }
+    return 0.0 - bdpo_log(1.0 + bdpo_exp(neg_x))
+}
+
+@pure @hot
+pub fn bdpo_softplus(x) {
+    // log(1 + exp(x)), stable
+    if x > 20.0 { return x }
+    if x < -20.0 { return 0.0 }
+    return bdpo_log(1.0 + bdpo_exp(x))
+}
+
+// ── BCE from logit ───────────────────────────────────────────────
+//   target in {0.0, 1.0}, z in R
+//   BCE(z, target) = softplus(-z) + (1 - target) * z
+//                  = -target*log_sigmoid(z) - (1-target)*log_sigmoid(-z)
+
+@pure @hot
+pub fn bdpo_bce_from_logit(z, target) {
+    // softplus(-z) + (1 - target) * z
+    let sp = bdpo_softplus(0.0 - z)
+    return sp + (1.0 - target) * z
+}
+
+// ── reward(s) ────────────────────────────────────────────────────
+
+@pure @hot
+pub fn bdpo_reward(log_pi, log_ref, beta) {
+    return beta * (log_pi - log_ref)
+}
+
+@pure @hot
+pub fn bdpo_reward_free(log_pi, beta) {
+    return beta * log_pi
+}
+
+// ── losses: reference-full ───────────────────────────────────────
+
+@pure @hot
+pub fn bdpo_loss_pos(log_pi, log_ref, beta, rho) {
+    let r = bdpo_reward(log_pi, log_ref, beta)
+    let z = r - rho
+    // target = 1.0
+    return bdpo_bce_from_logit(z, 1.0)
+}
+
+@pure @hot
+pub fn bdpo_loss_neg(log_pi, log_ref, beta, rho) {
+    let r = bdpo_reward(log_pi, log_ref, beta)
+    let z = r - rho
+    // target = 0.0  -> BCE = softplus(-z) + z = softplus(z)
+    return bdpo_bce_from_logit(z, 0.0)
+}
+
+@pure @hot
+pub fn bdpo_loss(log_pi, log_ref, beta, rho, label) {
+    // label: +1 = positive, -1 = negative
+    if label > 0 {
+        return bdpo_loss_pos(log_pi, log_ref, beta, rho)
+    }
+    return bdpo_loss_neg(log_pi, log_ref, beta, rho)
+}
+
+// ── losses: reference-free ───────────────────────────────────────
+
+@pure @hot
+pub fn bdpo_loss_pos_rf(log_pi, beta, rho) {
+    let r = bdpo_reward_free(log_pi, beta)
+    let z = r - rho
+    return bdpo_bce_from_logit(z, 1.0)
+}
+
+@pure @hot
+pub fn bdpo_loss_neg_rf(log_pi, beta, rho) {
+    let r = bdpo_reward_free(log_pi, beta)
+    let z = r - rho
+    return bdpo_bce_from_logit(z, 0.0)
+}
+
+@pure @hot
+pub fn bdpo_loss_rf(log_pi, beta, rho, label) {
+    if label > 0 {
+        return bdpo_loss_pos_rf(log_pi, beta, rho)
+    }
+    return bdpo_loss_neg_rf(log_pi, beta, rho)
+}
+
+// ── analytic gradients (w.r.t. logit z, and w.r.t. log_pi) ───────
+//   d/dz  BCE(z, target) = sigmoid(z) - target
+//   d/dlog_pi z = beta   (reference-full and reference-free)
+
+@pure @hot
+pub fn bdpo_grad_logit(z, target) {
+    return bdpo_sigmoid(z) - target
+}
+
+@pure @hot
+pub fn bdpo_grad_log_pi(log_pi, log_ref, beta, rho, label) {
+    let r = bdpo_reward(log_pi, log_ref, beta)
+    let z = r - rho
+    let mut target = 0.0
+    if label > 0 { target = 1.0 }
+    let g_z = bdpo_grad_logit(z, target)
+    return beta * g_z
+}
+
+@pure @hot
+pub fn bdpo_grad_log_pi_rf(log_pi, beta, rho, label) {
+    let r = bdpo_reward_free(log_pi, beta)
+    let z = r - rho
+    let mut target = 0.0
+    if label > 0 { target = 1.0 }
+    let g_z = bdpo_grad_logit(z, target)
+    return beta * g_z
+}
+
+// ── batch train step (on vector of log-probs) ────────────────────
+//   Performs a single plain SGD step on the virtual "log_pi" scalar
+//   per sample (useful for unit-testing the learning signal without
+//   a full transformer forward).
+//   Returns [avg_loss, accuracy, updated_log_pis] — caller must
+//   reassign its log_pis vector with the returned one (hexa arrays
+//   pass by value through function parameters).
+
+pub fn bdpo_batch_train_step(log_pis, log_refs, labels, beta, rho, lr) {
+    let n = len(log_pis)
+    let mut total_loss = 0.0
+    let mut correct = 0
+    let mut updated = []
+    let mut i = 0
+    while i < n {
+        let lp = log_pis[i]
+        let lr_i = log_refs[i]
+        let lab = labels[i]
+        let loss = bdpo_loss(lp, lr_i, beta, rho, lab)
+        total_loss = total_loss + loss
+        let r = bdpo_reward(lp, lr_i, beta)
+        let z = r - rho
+        if z >= 0.0 {
+            if lab > 0 { correct = correct + 1 }
+        } else {
+            if lab <= 0 { correct = correct + 1 }
+        }
+        // scalar SGD update on log_pi (virtual param)
+        let g = bdpo_grad_log_pi(lp, lr_i, beta, rho, lab)
+        let new_lp = lp - lr * g
+        updated = updated + [new_lp]
+        i = i + 1
+    }
+    let avg_loss = total_loss / to_float(n)
+    let acc = to_float(correct) / to_float(n)
+    let __ret = [avg_loss, acc, updated]
+    return __ret
+}
+
+pub fn bdpo_batch_train_step_rf(log_pis, labels, beta, rho, lr) {
+    let n = len(log_pis)
+    let mut total_loss = 0.0
+    let mut correct = 0
+    let mut updated = []
+    let mut i = 0
+    while i < n {
+        let lp = log_pis[i]
+        let lab = labels[i]
+        let loss = bdpo_loss_rf(lp, beta, rho, lab)
+        total_loss = total_loss + loss
+        let r = bdpo_reward_free(lp, beta)
+        let z = r - rho
+        if z >= 0.0 {
+            if lab > 0 { correct = correct + 1 }
+        } else {
+            if lab <= 0 { correct = correct + 1 }
+        }
+        let g = bdpo_grad_log_pi_rf(lp, beta, rho, lab)
+        let new_lp = lp - lr * g
+        updated = updated + [new_lp]
+        i = i + 1
+    }
+    let avg_loss = total_loss / to_float(n)
+    let acc = to_float(correct) / to_float(n)
+    let __ret = [avg_loss, acc, updated]
+    return __ret
+}
+
+// ── alignment quality helpers ────────────────────────────────────
+
+@pure
+pub fn bdpo_alignment_margin(log_pi, log_ref, beta, label) {
+    let r = bdpo_reward(log_pi, log_ref, beta)
+    if label > 0 { return r }
+    return 0.0 - r
+}
+
+pub fn bdpo_preference_accuracy(rewards, labels) {
+    let n = len(rewards)
+    if n == 0 { return 0.0 }
+    let mut correct = 0
+    let mut i = 0
+    while i < n {
+        let r = rewards[i]
+        let lab = labels[i]
+        if r >= 0.0 {
+            if lab > 0 { correct = correct + 1 }
+        } else {
+            if lab <= 0 { correct = correct + 1 }
+        }
+        i = i + 1
+    }
+    return to_float(correct) / to_float(n)
+}
+
+// ── bDPO vs. DPO alignment comparison ────────────────────────────
+//   Given matched pair rewards from both methods, return:
+//     [bdpo_margin, dpo_margin, agreement]
+//   agreement = 1.0 if both prefer the same side, 0.0 otherwise.
+
+@pure
+pub fn bdpo_vs_dpo_quality(bdpo_rw, bdpo_rl, dpo_rw, dpo_rl, beta) {
+    let bdpo_margin = beta * (bdpo_rw - bdpo_rl)
+    let dpo_margin = beta * (dpo_rw - dpo_rl)
+    let mut agreement = 0.0
+    if bdpo_margin >= 0.0 {
+        if dpo_margin >= 0.0 { agreement = 1.0 }
+    } else {
+        if dpo_margin < 0.0 { agreement = 1.0 }
+    }
+    let __ret = [bdpo_margin, dpo_margin, agreement]
+    return __ret
+}
+
+// ── DPO-equivalence check ────────────────────────────────────────
+//   For a paired (positive, negative) sample, summing two bDPO losses
+//   is closely related to the standard pairwise DPO loss. This helper
+//   exposes the sum so tests can compare behaviours under the soft
+//   margin rho=0 regime.
+
+@pure
+pub fn bdpo_pair_sum_loss(log_pi_w, log_ref_w, log_pi_l, log_ref_l, beta, rho) {
+    let l_pos = bdpo_loss_pos(log_pi_w, log_ref_w, beta, rho)
+    let l_neg = bdpo_loss_neg(log_pi_l, log_ref_l, beta, rho)
+    return l_pos + l_neg
+}
+
+@pure
+pub fn bdpo_standard_dpo_loss(log_pi_w, log_ref_w, log_pi_l, log_ref_l, beta) {
+    let log_ratio_w = log_pi_w - log_ref_w
+    let log_ratio_l = log_pi_l - log_ref_l
+    let logit = beta * (log_ratio_w - log_ratio_l)
+    return 0.0 - bdpo_log_sigmoid(logit)
+}
+
+println("[binary_dpo] loaded — BCE-form single-label DPO + reference-free path")

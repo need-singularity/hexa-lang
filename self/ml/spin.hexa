@@ -1,0 +1,514 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/spin.hexa — Self-Play Fine-Tuning (SPIN)
+//
+//  SPIN aligns a language model without external preference labels.
+//  The core idea: the current policy plays against itself. At each
+//  iteration t:
+//
+//    1) The policy p_t generates synthetic responses y' ~ p_t(.|x)
+//    2) Human/gold responses y are treated as "real"
+//    3) A discriminator objective trains p_{t+1} to distinguish
+//       human from synthetic via DPO-style log-probability ratio:
+//
+//       L = -log sigma(beta * (log p(y|x) - log p(y'|x)
+//                              - log p_t(y|x) + log p_t(y'|x)))
+//
+//       where p is the new policy being trained and p_t is the
+//       frozen opponent from the previous iteration.
+//
+//    4) The model converges when it can no longer distinguish its
+//       own outputs from human text, i.e. the loss plateaus and
+//       the discriminator accuracy falls to ~0.5.
+//
+//  This is the original SPIN paper formulation (Zhu et al., 2024,
+//  "Self-Play Fine-Tuning Converts Weak Language Models to Strong
+//  Language Models").
+//
+//  Architecture:
+//    - Abstract policy = logit vector of dimension D (same as online_dpo)
+//    - Self-play generation via softmax sampling from current policy
+//    - DPO-style loss for (human=chosen, synthetic=rejected) pairs
+//    - Multi-iteration loop with frozen opponent at each round
+//    - Convergence = discriminator accuracy <= threshold
+//
+//  API:
+//    spin_new_policy(d, seed)                 -> policy logit vec
+//    spin_copy_policy(p)                      -> deep copy
+//    spin_log_prob(policy, action)            -> float
+//    spin_softmax(logits)                     -> [float..]
+//    spin_sample(policy, seed)                -> action (int)
+//    spin_generate(policy, n, seed)           -> [action..] synthetic
+//    spin_loss(policy, opponent, human, synth, beta) -> [loss, margin]
+//    spin_batch_loss(policy, opp, humans, synths, beta) -> float
+//    spin_grad_step(policy, opp, human, synth, beta, lr) -> [policy, loss]
+//    spin_batch_step(policy, opp, humans, synths, beta, lr) -> [policy, avg_loss]
+//    spin_discriminator_accuracy(policy, opp, humans, synths, beta) -> float
+//    spin_convergence_check(acc, threshold) -> bool
+//    spin_iteration(policy, humans, beta, lr, n_steps, seed) -> [new_policy, final_loss, final_acc]
+//    spin_train(policy, humans, beta, lr, max_iters, steps_per_iter, seed, threshold) -> [policy, iter, converged]
+//    spin_kl_divergence(p, q)                -> float
+//    spin_policy_drift(p, q)                 -> float (L2)
+//    spin_reward_margin(policy, opp, human, synth, beta) -> float
+//    spin_mean_reward(policy, opp, humans, synths, beta) -> [mean_human, mean_synth]
+//
+//  AI-NATIVE attrs:
+//    @pure  — loss / log_prob / drift / convergence (no side effects)
+//    @hot   — log_prob / sample / grad_step (called every step)
+// ═══════════════════════════════════════════════════════════════════
+
+// ── numeric helpers ──────────────────────────────────────────────
+
+fn spin_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn spin_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn spin_log(x) {
+    if x <= 0.0 { return -30.0 }
+    let mut v = x
+    let mut count = 0
+    while v > 2.0 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    let d = v - 1.0
+    let ln_v = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_v
+}
+
+fn spin_sigmoid(x) {
+    if x > 20.0 { return 1.0 }
+    if x < -20.0 { return 0.0 }
+    return 1.0 / (1.0 + spin_exp(0.0 - x))
+}
+
+fn spin_log_sigmoid(x) {
+    let neg_x = 0.0 - x
+    if neg_x > 20.0 { return 0.0 - neg_x }
+    if neg_x < -20.0 { return 0.0 }
+    return 0.0 - spin_log(1.0 + spin_exp(neg_x))
+}
+
+// softplus(x) = log(1 + exp(x))
+fn spin_softplus(x) {
+    if x > 20.0 { return x }
+    if x < -20.0 { return 0.0 }
+    return spin_log(1.0 + spin_exp(x))
+}
+
+// deterministic hash PRNG
+fn spin_hash(seed, i) {
+    let h = ((seed * 2654435761 + i * 1315423911 + 731) % 10007)
+    return to_float(h) / 10007.0
+}
+
+// ── policy: logit vector of dimension D ─────────────────────────
+
+pub fn spin_new_policy(d, seed) {
+    let mut v = []
+    for i in 0..d {
+        let a = spin_hash(seed, i * 2)
+        let b = spin_hash(seed, i * 2 + 1)
+        v = v + [(a - 0.5) * 0.1 + (b - 0.5) * 0.1]
+    }
+    return v
+}
+
+pub fn spin_copy_policy(p) {
+    let n = len(p)
+    let mut out = []
+    for i in 0..n { out = out + [p[i]] }
+    return out
+}
+
+// ── softmax + log_prob ──────────────────────────────────────────
+
+pub fn spin_softmax(logits) {
+    let n = len(logits)
+    let mut mx = logits[0]
+    let mut i = 1
+    while i < n {
+        if logits[i] > mx { mx = logits[i] }
+        i = i + 1
+    }
+    let mut exps = []
+    let mut s = 0.0
+    let mut j = 0
+    while j < n {
+        let e = spin_exp(logits[j] - mx)
+        exps = exps + [e]
+        s = s + e
+        j = j + 1
+    }
+    if s <= 0.0 { s = 1.0e-10 }
+    let mut k = 0
+    while k < n {
+        exps[k] = exps[k] / s
+        k = k + 1
+    }
+    return exps
+}
+
+// log P(action | policy) via log-softmax
+pub fn spin_log_prob(policy, action) {
+    let n = len(policy)
+    if action < 0 { return -30.0 }
+    if action >= n { return -30.0 }
+    let mut mx = policy[0]
+    let mut i = 1
+    while i < n {
+        if policy[i] > mx { mx = policy[i] }
+        i = i + 1
+    }
+    let mut sum_exp = 0.0
+    let mut j = 0
+    while j < n {
+        sum_exp = sum_exp + spin_exp(policy[j] - mx)
+        j = j + 1
+    }
+    let lse = mx + spin_log(sum_exp)
+    return policy[action] - lse
+}
+
+// ── self-play generation ────────────────────────────────────────
+//
+// Sample a single action from current policy via inverse-CDF.
+
+pub fn spin_sample(policy, seed) {
+    let probs = spin_softmax(policy)
+    let n = len(probs)
+    let u = spin_hash(seed, 42)
+    let mut acc = 0.0
+    let mut chosen = n - 1
+    let mut j = 0
+    let mut done = false
+    while j < n {
+        if done == false {
+            acc = acc + probs[j]
+            if u <= acc {
+                chosen = j
+                done = true
+            }
+        }
+        j = j + 1
+    }
+    return chosen
+}
+
+// Generate n synthetic responses from current policy.
+// Each response is a single action index (token-level abstraction).
+pub fn spin_generate(policy, n, seed) {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let action = spin_sample(policy, seed + i * 97)
+        out = out + [action]
+        i = i + 1
+    }
+    return out
+}
+
+// ── SPIN loss ───────────────────────────────────────────────────
+//
+// L = -log sigma(beta * (log p(human|x) - log p(synth|x)
+//                        - log p_t(human|x) + log p_t(synth|x)))
+//
+// This is identical to DPO loss where:
+//   chosen  = human response
+//   rejected = synthetic response
+//   ref_model = opponent (previous iteration frozen policy)
+//
+// Returns [loss, margin] where margin = beta * log-ratio difference.
+
+pub fn spin_loss(policy, opponent, human, synth, beta) {
+    let lp_h = spin_log_prob(policy, human)
+    let lp_s = spin_log_prob(policy, synth)
+    let lo_h = spin_log_prob(opponent, human)
+    let lo_s = spin_log_prob(opponent, synth)
+    let log_ratio_h = lp_h - lo_h
+    let log_ratio_s = lp_s - lo_s
+    let margin = beta * (log_ratio_h - log_ratio_s)
+    let loss = 0.0 - spin_log_sigmoid(margin)
+    return [loss, margin]
+}
+
+// Average loss over a batch of (human, synthetic) pairs.
+pub fn spin_batch_loss(policy, opponent, humans, synths, beta) {
+    let n = len(humans)
+    if n <= 0 { return 0.0 }
+    let mut total = 0.0
+    let mut i = 0
+    while i < n {
+        let res = spin_loss(policy, opponent, humans[i], synths[i], beta)
+        total = total + res[0]
+        i = i + 1
+    }
+    return total / to_float(n)
+}
+
+// ── gradient step ───────────────────────────────────────────────
+//
+// Analytical gradient of SPIN loss w.r.t. policy logits.
+//
+// d L / d logits[j]
+//   = -(1 - sigma(margin)) * beta
+//     * (d/d logits[j] (log p(h) - log p(s)))
+//
+// Since log p(a) = logits[a] - logsumexp:
+//   d log p(a) / d logits[j] = (a==j) - softmax[j]
+//   d (log p(h) - log p(s)) / d logits[j]
+//     = (h==j) - softmax[j] - (s==j) + softmax[j]
+//     = (h==j) - (s==j)
+//
+// d L / d logits[j] = -(1-sigma(margin)) * beta * ((h==j) - (s==j))
+//                    = sigma(-margin) * beta * ((s==j) - (h==j))
+
+pub fn spin_grad_step(policy, opponent, human, synth, beta, lr) {
+    let n = len(policy)
+    let res = spin_loss(policy, opponent, human, synth, beta)
+    let loss = res[0]
+    let margin = res[1]
+    let sig_neg = spin_sigmoid(0.0 - margin)
+    let mut out = spin_copy_policy(policy)
+    let mut j = 0
+    while j < n {
+        let mut ind = 0.0
+        if j == synth { ind = ind + 1.0 }
+        if j == human { ind = ind - 1.0 }
+        let grad = sig_neg * beta * ind
+        out[j] = out[j] - lr * grad
+        j = j + 1
+    }
+    return [out, loss]
+}
+
+// Batch gradient step over multiple (human, synth) pairs.
+// Returns [updated_policy, avg_loss].
+pub fn spin_batch_step(policy, opponent, humans, synths, beta, lr) {
+    let n = len(humans)
+    if n <= 0 { return [policy, 0.0] }
+    let mut cur = spin_copy_policy(policy)
+    let mut total_loss = 0.0
+    let mut i = 0
+    while i < n {
+        let res = spin_grad_step(cur, opponent, humans[i], synths[i], beta, lr)
+        cur = res[0]
+        total_loss = total_loss + res[1]
+        i = i + 1
+    }
+    return [cur, total_loss / to_float(n)]
+}
+
+// ── discriminator accuracy ──────────────────────────────────────
+//
+// SPIN's discriminator classifies human vs synthetic via the
+// log-probability ratio: if log p(human) > log p(synth) for the
+// current policy, the discriminator "correctly" identifies real.
+// Accuracy = fraction of pairs where policy assigns higher prob
+// to human than to synthetic.
+
+pub fn spin_discriminator_accuracy(policy, opponent, humans, synths, beta) {
+    let n = len(humans)
+    if n <= 0 { return 0.5 }
+    let mut correct = 0
+    let mut i = 0
+    while i < n {
+        let res = spin_loss(policy, opponent, humans[i], synths[i], beta)
+        let margin = res[1]
+        // positive margin means policy correctly prefers human
+        if margin > 0.0 { correct = correct + 1 }
+        i = i + 1
+    }
+    return to_float(correct) / to_float(n)
+}
+
+// ── convergence check ───────────────────────────────────────────
+//
+// SPIN converges when the model cannot distinguish its own output
+// from human text. This means discriminator accuracy falls near 0.5.
+
+pub fn spin_convergence_check(acc, threshold) {
+    let diff = spin_abs(acc - 0.5)
+    return diff <= threshold
+}
+
+// ── reward margin ───────────────────────────────────────────────
+//
+// Implicit reward for human/synth via log-ratio (same as DPO).
+
+pub fn spin_reward_margin(policy, opponent, human, synth, beta) {
+    let res = spin_loss(policy, opponent, human, synth, beta)
+    return res[1]
+}
+
+// Mean implicit rewards for human and synthetic sets.
+pub fn spin_mean_reward(policy, opponent, humans, synths, beta) {
+    let n = len(humans)
+    if n <= 0 { return [0.0, 0.0] }
+    let mut sum_h = 0.0
+    let mut sum_s = 0.0
+    let mut i = 0
+    while i < n {
+        let lp_h = spin_log_prob(policy, humans[i])
+        let lo_h = spin_log_prob(opponent, humans[i])
+        let lp_s = spin_log_prob(policy, synths[i])
+        let lo_s = spin_log_prob(opponent, synths[i])
+        sum_h = sum_h + beta * (lp_h - lo_h)
+        sum_s = sum_s + beta * (lp_s - lo_s)
+        i = i + 1
+    }
+    return [sum_h / to_float(n), sum_s / to_float(n)]
+}
+
+// ── KL divergence and drift ─────────────────────────────────────
+
+pub fn spin_kl_divergence(p, q) {
+    let pp = spin_softmax(p)
+    let qq = spin_softmax(q)
+    let n = len(pp)
+    let mut kl = 0.0
+    let mut i = 0
+    while i < n {
+        let pi = pp[i]
+        if pi > 1.0e-12 {
+            let qi = qq[i]
+            let qsafe = if qi > 1.0e-12 { qi } else { 1.0e-12 }
+            kl = kl + pi * (spin_log(pi) - spin_log(qsafe))
+        }
+        i = i + 1
+    }
+    return kl
+}
+
+pub fn spin_policy_drift(p, q) {
+    let n = len(p)
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        let d = p[i] - q[i]
+        s = s + d * d
+        i = i + 1
+    }
+    return sqrt(s)
+}
+
+// ── single SPIN iteration ───────────────────────────────────────
+//
+// One iteration of the SPIN loop:
+//  1) Generate synthetic data from current (opponent) policy
+//  2) Train new policy against opponent using DPO-style loss
+//  3) Return [new_policy, final_loss, discriminator_accuracy]
+
+pub fn spin_iteration(policy, humans, beta, lr, n_steps, seed) {
+    let n = len(humans)
+    // Opponent = frozen copy of current policy (self-play)
+    let opponent = spin_copy_policy(policy)
+
+    // Generate synthetic responses from opponent
+    let synths = spin_generate(opponent, n, seed)
+
+    // Train for n_steps
+    let mut cur = spin_copy_policy(policy)
+    let mut last_loss = 0.0
+    let mut step = 0
+    while step < n_steps {
+        let res = spin_batch_step(cur, opponent, humans, synths, beta, lr)
+        cur = res[0]
+        last_loss = res[1]
+        step = step + 1
+    }
+
+    // Measure discriminator accuracy
+    let acc = spin_discriminator_accuracy(cur, opponent, humans, synths, beta)
+
+    return [cur, last_loss, acc]
+}
+
+// ── full SPIN training loop ─────────────────────────────────────
+//
+// Runs multiple iterations of SPIN until convergence or max_iters.
+// Returns [final_policy, iterations_run, converged].
+
+pub fn spin_train(policy, humans, beta, lr, max_iters, steps_per_iter, seed, threshold) {
+    let mut cur = spin_copy_policy(policy)
+    let mut iter = 0
+    let mut converged = false
+    while iter < max_iters {
+        let res = spin_iteration(cur, humans, beta, lr, steps_per_iter, seed + iter * 1000)
+        cur = res[0]
+        let loss = res[1]
+        let acc = res[2]
+
+        let mut l = "{\"spin_iter\":" + str(iter)
+        l = l + ",\"loss\":" + str(loss)
+        l = l + ",\"disc_acc\":" + str(acc) + "}"
+        println(l)
+
+        if spin_convergence_check(acc, threshold) {
+            converged = true
+            iter = iter + 1
+            return [cur, iter, converged]
+        }
+        iter = iter + 1
+    }
+    return [cur, iter, converged]
+}
+
+// ── diagnostic: log-prob gap between human and synthetic ────────
+
+pub fn spin_logprob_gap(policy, humans, synths) {
+    let n = len(humans)
+    if n <= 0 { return 0.0 }
+    let mut gap = 0.0
+    let mut i = 0
+    while i < n {
+        let lp_h = spin_log_prob(policy, humans[i])
+        let lp_s = spin_log_prob(policy, synths[i])
+        gap = gap + (lp_h - lp_s)
+        i = i + 1
+    }
+    return gap / to_float(n)
+}
+
+// ── self-play quality: how far is synthetic from human dist ─────
+
+pub fn spin_self_play_quality(policy, humans, seed) {
+    let n = len(humans)
+    let synths = spin_generate(policy, n, seed)
+    // Measure overlap: fraction of synthetic that match any human action
+    let mut overlap = 0
+    let mut i = 0
+    while i < n {
+        let mut j = 0
+        let mut found = false
+        while j < n {
+            if found == false {
+                if synths[i] == humans[j] { found = true }
+            }
+            j = j + 1
+        }
+        if found { overlap = overlap + 1 }
+        i = i + 1
+    }
+    return to_float(overlap) / to_float(n)
+}
+
+println("[spin] loaded - self-play fine-tuning with iterative DPO convergence")

@@ -1,0 +1,388 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/grokking.hexa — Grokking Detector
+//
+//  Late generalization phase transition detection. Grokking occurs
+//  when a model first memorizes training data (train loss drops,
+//  val loss stagnant) then suddenly generalizes (val loss drops
+//  long after training loss converged). Classic example: modular
+//  arithmetic tasks where val acc jumps from ~random to ~perfect
+//  after 10-100x more training steps than needed for memorization.
+//
+//  Reference:
+//    Power et al., "Grokking: Generalization Beyond Overfitting on
+//    Small Algorithmic Datasets" (2022).
+//
+//  Implements:
+//    1. Weight norm tracker  — L2 norm per layer over training steps
+//    2. Train/val loss gap monitor with EMA smoothing
+//    3. Phase transition detector — val loss sudden drop after plateau
+//    4. Grokking score — ratio of weight norm growth to val improvement
+//    5. Early stop override — continue past apparent overfitting
+//    6. Epoch callback integration
+//
+//  API (all pure, no BLAS / no external deps):
+//    grok_abs(x)                                    -> float
+//    grok_sqrt(x)                                   -> float
+//    grok_log(x)                                    -> float
+//    grok_l2_norm(weights)                           -> float
+//    grok_weight_norms(layer_weights)                -> [float]
+//    grok_ema_update(prev, value, alpha)             -> float
+//    grok_ema_series(values, alpha)                  -> [float]
+//    grok_loss_gap(train_loss, val_loss)             -> float
+//    grok_smoothed_gap(train_hist, val_hist, alpha)  -> float
+//    grok_detect_plateau(val_hist, window, tol)      -> bool
+//    grok_detect_drop(val_hist, window, threshold)   -> bool
+//    grok_detect_transition(val_hist, plateau_w,
+//                           drop_w, plateau_tol,
+//                           drop_threshold)          -> bool
+//    grok_weight_growth_rate(norms_t0, norms_t1)     -> float
+//    grok_val_improvement(val_old, val_new)           -> float
+//    grok_score(norms_t0, norms_t1, val_old, val_new)-> float
+//    grok_should_continue(train_hist, val_hist,
+//                          norms_t0, norms_t1,
+//                          patience, plateau_w,
+//                          drop_w, plateau_tol,
+//                          drop_threshold)           -> bool
+//    grok_epoch_callback(state, epoch, train_loss,
+//                         val_loss, layer_weights)   -> state
+//    grok_make_state(patience, plateau_w, drop_w,
+//                     plateau_tol, drop_threshold)   -> GrokState
+//    grok_is_grokking(state)                         -> bool
+//    grok_should_stop(state)                         -> bool
+//    grok_get_score(state)                           -> float
+//    grok_overfitting_ratio(train_loss, val_loss)    -> float
+//    grok_norm_velocity(norm_hist)                   -> float
+//    grok_val_velocity(val_hist)                     -> float
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects, deterministic
+//    @hot   — called every epoch in training loop
+// ═══════════════════════════════════════════════════════════════════
+
+let GROK_EPS = 1.0e-8
+
+// ── numeric helpers (inline, no BLAS) ────────────────────────────
+
+fn grok_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn grok_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x
+    if g > 1.0 { g = x / 2.0 }
+    let mut i = 0
+    while i < 30 {
+        g = 0.5 * (g + x / g)
+        i = i + 1
+    }
+    return g
+}
+
+fn grok_log(x) {
+    if x <= 0.0 { return -30.0 }
+    let mut v = x
+    let mut count = 0
+    while v > 2.0 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    let d = v - 1.0
+    let ln_v = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_v
+}
+
+// ── 1. Weight norm tracker ───────────────────────────────────────
+// L2 norm of a flat weight vector
+@pure fn grok_l2_norm(weights) {
+    let n = len(weights)
+    if n == 0 { return 0.0 }
+    let mut sum_sq = 0.0
+    let mut i = 0
+    while i < n {
+        sum_sq = sum_sq + weights[i] * weights[i]
+        i = i + 1
+    }
+    return grok_sqrt(sum_sq)
+}
+
+// L2 norms for multiple layers: layer_weights is array of arrays
+@pure fn grok_weight_norms(layer_weights) {
+    let n = len(layer_weights)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [grok_l2_norm(layer_weights[i])]
+        i = i + 1
+    }
+    return out
+}
+
+// ── 2. Train/val loss gap with EMA smoothing ─────────────────────
+
+// Single EMA step: ema' = alpha * value + (1 - alpha) * prev
+@pure fn grok_ema_update(prev, value, alpha) {
+    return alpha * value + (1.0 - alpha) * prev
+}
+
+// Compute full EMA series from raw values
+@pure fn grok_ema_series(values, alpha) {
+    let n = len(values)
+    if n == 0 { return [] }
+    let mut out = [values[0]]
+    let mut i = 1
+    while i < n {
+        let prev = out[i - 1]
+        out = out + [grok_ema_update(prev, values[i], alpha)]
+        i = i + 1
+    }
+    return out
+}
+
+// Raw gap: val_loss - train_loss (positive = overfitting)
+@pure fn grok_loss_gap(train_loss, val_loss) {
+    return val_loss - train_loss
+}
+
+// Smoothed gap: EMA of the train/val gap series
+@pure fn grok_smoothed_gap(train_hist, val_hist, alpha) {
+    let n = len(train_hist)
+    if n == 0 { return 0.0 }
+    let mut gaps = []
+    let mut i = 0
+    while i < n {
+        gaps = gaps + [grok_loss_gap(train_hist[i], val_hist[i])]
+        i = i + 1
+    }
+    let smoothed = grok_ema_series(gaps, alpha)
+    return smoothed[len(smoothed) - 1]
+}
+
+// ── 3. Phase transition detector ─────────────────────────────────
+
+// Detect plateau: last `window` val losses vary less than `tol`
+@pure fn grok_detect_plateau(val_hist, window, tol) {
+    let n = len(val_hist)
+    if n < window { return false }
+    let start = n - window
+    // Find min and max in the window
+    let mut mn = val_hist[start]
+    let mut mx = val_hist[start]
+    let mut i = start + 1
+    while i < n {
+        if val_hist[i] < mn { mn = val_hist[i] }
+        if val_hist[i] > mx { mx = val_hist[i] }
+        i = i + 1
+    }
+    return (mx - mn) < tol
+}
+
+// Detect sudden drop: val loss dropped by more than `threshold`
+// comparing the mean of the first half vs second half of the window
+@pure fn grok_detect_drop(val_hist, window, threshold) {
+    let n = len(val_hist)
+    if n < window { return false }
+    let start = n - window
+    let half = window / 2
+    if half == 0 { return false }
+    // Mean of first half
+    let mut sum1 = 0.0
+    let mut i = start
+    while i < start + half {
+        sum1 = sum1 + val_hist[i]
+        i = i + 1
+    }
+    let mean1 = sum1 / to_float(half)
+    // Mean of second half
+    let mut sum2 = 0.0
+    let rest = window - half
+    i = start + half
+    while i < start + window {
+        sum2 = sum2 + val_hist[i]
+        i = i + 1
+    }
+    let mean2 = sum2 / to_float(rest)
+    // Drop = first_half_mean - second_half_mean (positive = val dropped)
+    return (mean1 - mean2) > threshold
+}
+
+// Detect grokking phase transition: plateau existed, then drop happened
+// Needs enough history: plateau_w + drop_w epochs
+@pure fn grok_detect_transition(val_hist, plateau_w, drop_w, plateau_tol, drop_threshold) {
+    let n = len(val_hist)
+    if n < plateau_w + drop_w { return false }
+    // Check plateau in the region before the last drop_w epochs
+    let pre_drop = n - drop_w
+    let mut plateau_slice = []
+    let start = pre_drop - plateau_w
+    if start < 0 { return false }
+    let mut i = start
+    while i < pre_drop {
+        plateau_slice = plateau_slice + [val_hist[i]]
+        i = i + 1
+    }
+    let had_plateau = grok_detect_plateau(plateau_slice, plateau_w, plateau_tol)
+    if had_plateau == false { return false }
+    // Check drop in the last drop_w epochs
+    return grok_detect_drop(val_hist, drop_w, drop_threshold)
+}
+
+// ── 4. Grokking score ────────────────────────────────────────────
+// Ratio of weight norm growth rate to val loss improvement.
+// High score = weights growing fast while val improves = grokking signature.
+
+// Average growth rate of per-layer weight norms
+@pure fn grok_weight_growth_rate(norms_t0, norms_t1) {
+    let n = len(norms_t0)
+    if n == 0 { return 0.0 }
+    let mut total = 0.0
+    let mut i = 0
+    while i < n {
+        let denom = norms_t0[i] + GROK_EPS
+        let rate = (norms_t1[i] - norms_t0[i]) / denom
+        total = total + rate
+        i = i + 1
+    }
+    return total / to_float(n)
+}
+
+// Relative val loss improvement (positive = val improved)
+@pure fn grok_val_improvement(val_old, val_new) {
+    let denom = grok_abs(val_old) + GROK_EPS
+    return (val_old - val_new) / denom
+}
+
+// Grokking score: weight_growth_rate / val_improvement
+// When val improves while weights grow, score is positive and meaningful.
+// Higher score = stronger grokking signal.
+@pure fn grok_score(norms_t0, norms_t1, val_old, val_new) {
+    let wgr = grok_weight_growth_rate(norms_t0, norms_t1)
+    let vi = grok_val_improvement(val_old, val_new)
+    if grok_abs(vi) < GROK_EPS { return 0.0 }
+    return grok_abs(wgr) / vi
+}
+
+// Overfitting ratio: val_loss / train_loss (>1 = overfitting)
+@pure fn grok_overfitting_ratio(train_loss, val_loss) {
+    let denom = grok_abs(train_loss) + GROK_EPS
+    return val_loss / denom
+}
+
+// Weight norm velocity: average change in norm over last 2 entries
+@pure fn grok_norm_velocity(norm_hist) {
+    let n = len(norm_hist)
+    if n < 2 { return 0.0 }
+    return norm_hist[n - 1] - norm_hist[n - 2]
+}
+
+// Val loss velocity: negative means improving
+@pure fn grok_val_velocity(val_hist) {
+    let n = len(val_hist)
+    if n < 2 { return 0.0 }
+    return val_hist[n - 1] - val_hist[n - 2]
+}
+
+// ── 5. Early stop override ───────────────────────────────────────
+// Should we continue training past apparent overfitting?
+// Returns true if grokking pattern is detected (plateau then drop).
+@pure fn grok_should_continue(train_hist, val_hist, norms_t0, norms_t1, patience, plateau_w, drop_w, plateau_tol, drop_threshold) {
+    let n = len(val_hist)
+    // If we detect an active grokking transition, always continue
+    if grok_detect_transition(val_hist, plateau_w, drop_w, plateau_tol, drop_threshold) {
+        return true
+    }
+    // If we are in a plateau phase and weight norms are growing,
+    // grokking may be imminent -- continue
+    if n >= plateau_w {
+        let is_plateau = grok_detect_plateau(val_hist, plateau_w, plateau_tol)
+        let wgr = grok_weight_growth_rate(norms_t0, norms_t1)
+        if is_plateau {
+            if wgr > 0.0 { return true }
+        }
+    }
+    // Otherwise respect patience: if val hasn't improved in `patience` epochs
+    if n < patience { return true }
+    let recent_val = val_hist[n - 1]
+    let old_val = val_hist[n - patience]
+    if recent_val < old_val { return true }
+    return false
+}
+
+// ── 6. Epoch callback integration ────────────────────────────────
+//
+// State is represented as parallel arrays (pure functional, no struct mutation):
+//   train_hist : [float..]   — training loss per epoch
+//   val_hist   : [float..]   — validation loss per epoch
+//   norm_hist  : [float..]   — total weight norm per epoch
+//   prev_norms : [float..]   — per-layer norms from last epoch
+//
+// The epoch callback returns a result array:
+//   [grokking_detected (0/1), current_score, should_stop (0/1)]
+
+// Main epoch callback: pure functional, returns [detected, score, stop]
+@hot fn grok_epoch_callback(train_hist, val_hist, norm_hist, prev_norms, layer_weights, patience, plateau_w, drop_w, plateau_tol, drop_threshold) {
+    let n = len(val_hist)
+
+    // Compute current weight norms
+    let cur_norms = grok_weight_norms(layer_weights)
+
+    // Compute grokking score if we have previous norms
+    let mut score = 0.0
+    if len(prev_norms) > 0 {
+        if n >= 2 {
+            let val_old = val_hist[n - 2]
+            let val_new = val_hist[n - 1]
+            score = grok_score(prev_norms, cur_norms, val_old, val_new)
+        }
+    }
+
+    // Detect grokking transition
+    let mut detected = 0.0
+    if grok_detect_transition(val_hist, plateau_w, drop_w, plateau_tol, drop_threshold) {
+        detected = 1.0
+    }
+
+    // Determine if training should stop
+    let mut stop = 0.0
+    if len(prev_norms) > 0 {
+        let cont = grok_should_continue(
+            train_hist, val_hist,
+            prev_norms, cur_norms,
+            patience, plateau_w, drop_w,
+            plateau_tol, drop_threshold
+        )
+        if cont == false {
+            stop = 1.0
+        }
+    }
+
+    return [detected, score, stop]
+}
+
+// Helper: compute total norm from layer weights for norm_hist
+@pure fn grok_total_norm(layer_weights) {
+    let cur_norms = grok_weight_norms(layer_weights)
+    let mut total = 0.0
+    let mut i = 0
+    while i < len(cur_norms) {
+        total = total + cur_norms[i]
+        i = i + 1
+    }
+    return total
+}
+
+// ── quick self-smoke (non-destructive) ───────────────────────────
+pub fn grok_self_check() {
+    let norm = grok_l2_norm([3.0, 4.0])
+    if grok_abs(norm - 5.0) > 0.01 { return 0 }
+    let gap = grok_loss_gap(0.1, 0.5)
+    if grok_abs(gap - 0.4) > 0.01 { return 0 }
+    return 1
+}
+
+println("[grokking] loaded — late generalization phase transition detector")

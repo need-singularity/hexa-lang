@@ -1,0 +1,569 @@
+// ===================================================================
+//  squeeze_llm.hexa — SqueezeLLM: Sensitivity-based Non-uniform
+//  Quantization (ML #100)
+//
+//  Reference: Kim et al. 2023 "SqueezeLLM: Dense-and-Sparse
+//  Quantization" (UC Berkeley).
+//
+//  Core idea:
+//    Uniform quantization wastes bits on low-sensitivity regions and
+//    under-represents high-sensitivity weights. SqueezeLLM computes
+//    per-weight sensitivity (Fisher/Hessian diagonal), then builds a
+//    non-uniform codebook via density-weighted k-means clustering.
+//    Each weight maps to a codebook index (int3/int4) and is
+//    reconstructed by lookup.
+//
+//  Algorithm:
+//    1. Compute per-weight sensitivity  s[i] = h[i] * w[i]^2
+//       where h[i] is the diagonal Hessian (Fisher approx).
+//    2. Build a 1-D codebook of K entries (K=8 for int3, K=16 for
+//       int4) by density-weighted k-means:  each weight contributes
+//       mass proportional to its sensitivity, so important weights
+//       pull centroids toward them.
+//    3. Assign each weight to its nearest centroid -> int3/int4 code.
+//    4. Dequantize by codebook lookup.
+//
+//  API:
+//    sq_sensitivity(W, calib, in_dim)         -> [float] per-weight
+//    sq_kmeans_init(W, sens, k)               -> [float] centroids
+//    sq_kmeans_step(W, sens, centroids)        -> [float] new centroids
+//    sq_build_codebook(W, sens, k, iters)     -> SqCodebook
+//    sq_quantize(W, n_out, n_in, calib, bits) -> SqTensor
+//    sq_dequantize(st)                        -> [float]
+//    sq_forward(st, x)                        -> [float] y = W * x
+//    sq_error_stats(W, st)                    -> SqStats
+//
+//  Storage format (SqTensor):
+//    n_out      : int           output rows
+//    n_in       : int           input columns
+//    bits       : int           3 or 4
+//    codebook   : [float]       K centroids (K = 2^bits)
+//    codes      : [int]         per-weight codebook index (flat)
+//    sens       : [float]       per-weight sensitivity (for reference)
+//
+//  Pure hexa -- no external dependencies.
+// ===================================================================
+
+// ── Constants ────────────────────────────────────────────────────
+@pure fn SQ_DEFAULT_ITERS() { return 20 }
+@pure fn SQ_DAMP() { return 0.01 }
+
+// ── Result structs ───────────────────────────────────────────────
+struct SqCodebook {
+    centroids: array,
+    k: int
+}
+
+struct SqTensor {
+    n_out: int,
+    n_in: int,
+    bits: int,
+    codebook: array,
+    codes: array,
+    sens: array
+}
+
+struct SqStats {
+    mse: float,
+    max_err: float,
+    snr: float
+}
+
+// ── Math helpers (private, prefixed _sq to avoid collision) ──────
+fn _sq_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn _sq_max(a, b) {
+    if a >= b { return a }
+    return b
+}
+
+fn _sq_min(a, b) {
+    if a <= b { return a }
+    return b
+}
+
+fn _sq_clamp(v, lo, hi) {
+    if v < lo { return lo }
+    if v > hi { return hi }
+    return v
+}
+
+fn _sq_round(x) {
+    if x >= 0.0 { return int(x + 0.5) }
+    return int(x - 0.5)
+}
+
+fn _sq_log10(x) {
+    if x <= 0.0 { return -999.0 }
+    let mut v = x
+    let mut result = 0.0
+    while v >= 10.0 {
+        v = v / 10.0
+        result = result + 1.0
+    }
+    while v < 1.0 {
+        v = v * 10.0
+        result = result - 1.0
+    }
+    let t = (v - 1.0) / (v + 1.0)
+    let t2 = t * t
+    let ln_v = 2.0 * (t + t * t2 / 3.0 + t * t2 * t2 / 5.0 + t * t2 * t2 * t2 / 7.0 + t * t2 * t2 * t2 * t2 / 9.0)
+    result = result + ln_v / 2.302585
+    return result
+}
+
+// ===================================================================
+//  sq_hessian_diag(calib, in_dim) -> [float]
+//
+//  Diagonal Hessian from calibration data (Fisher approximation).
+//  calib is flat [nsamples x in_dim].  Returns length-in_dim array.
+//  Matches GPTQ hessian construction with dampening.
+// ===================================================================
+fn sq_hessian_diag(calib, in_dim) {
+    let n = len(calib)
+    let nsamples = n / in_dim
+    let mut h = []
+    let mut c = 0
+    while c < in_dim {
+        h = h + [0.0]
+        c = c + 1
+    }
+    let mut s = 0
+    while s < nsamples {
+        let base = s * in_dim
+        c = 0
+        while c < in_dim {
+            let v = calib[base + c]
+            h[c] = h[c] + v * v
+            c = c + 1
+        }
+        s = s + 1
+    }
+    let norm = 2.0 / _sq_max(to_float(nsamples), 1.0)
+    let mut mean_d = 0.0
+    c = 0
+    while c < in_dim {
+        h[c] = h[c] * norm
+        mean_d = mean_d + h[c]
+        c = c + 1
+    }
+    mean_d = mean_d / _sq_max(to_float(in_dim), 1.0)
+    let damp = SQ_DAMP() * mean_d
+    c = 0
+    while c < in_dim {
+        h[c] = h[c] + damp
+        c = c + 1
+    }
+    return h
+}
+
+// ===================================================================
+//  sq_sensitivity(W, n_out, n_in, calib) -> [float]
+//
+//  Per-weight sensitivity:  s[r, c] = h[c] * w[r, c]^2
+//  where h is the column-wise Hessian diagonal. Flat output,
+//  same layout as W (row-major, n_out * n_in).
+//
+//  If calib is empty, falls back to uniform h = [1, 1, ...].
+// ===================================================================
+fn sq_sensitivity(W, n_out, n_in, calib) {
+    let n = n_out * n_in
+    let mut h = []
+    if len(calib) == 0 {
+        let mut c = 0
+        while c < n_in {
+            h = h + [1.0]
+            c = c + 1
+        }
+    } else {
+        h = sq_hessian_diag(calib, n_in)
+    }
+    let mut sens = []
+    let mut i = 0
+    while i < n {
+        let col = i % n_in
+        let w = W[i]
+        sens = sens + [h[col] * w * w]
+        i = i + 1
+    }
+    return sens
+}
+
+// ===================================================================
+//  sq_kmeans_init(W, sens, k) -> [float]
+//
+//  Initialize k centroids for density-weighted k-means.
+//  Strategy: sort a copy of the weights and pick k evenly-spaced
+//  data points as initial centroids. This ensures centroids start
+//  where actual data lives, avoiding empty-cluster problems that
+//  arise with linear spacing on gapped distributions.
+// ===================================================================
+fn sq_kmeans_init(W, sens, k) {
+    let n = len(W)
+    if n == 0 { return [] }
+    if k == 1 {
+        // Sensitivity-weighted mean
+        let mut sw_sum = 0.0
+        let mut s_sum = 0.0
+        let mut i = 0
+        while i < n {
+            sw_sum = sw_sum + sens[i] * W[i]
+            s_sum = s_sum + sens[i]
+            i = i + 1
+        }
+        let mut wmean = 0.0
+        if s_sum > 0.0 { wmean = sw_sum / s_sum }
+        return [wmean]
+    }
+    // Copy and sort weights (insertion sort -- O(n^2), fine for quant)
+    let mut sorted = []
+    let mut i = 0
+    while i < n {
+        sorted = sorted + [W[i]]
+        i = i + 1
+    }
+    i = 1
+    while i < n {
+        let mut j = i
+        while j > 0 {
+            if sorted[j - 1] <= sorted[j] { break }
+            let tmp = sorted[j - 1]
+            sorted[j - 1] = sorted[j]
+            sorted[j] = tmp
+            j = j - 1
+        }
+        i = i + 1
+    }
+    // Pick k evenly-spaced data points from sorted weights
+    let mut centroids = []
+    let mut ci = 0
+    while ci < k {
+        let mut idx = 0
+        if k > 1 {
+            idx = ci * (n - 1) / (k - 1)
+        }
+        centroids = centroids + [sorted[idx]]
+        ci = ci + 1
+    }
+    return centroids
+}
+
+// ===================================================================
+//  sq_kmeans_step(W, sens, centroids) -> [float]
+//
+//  One iteration of density-weighted k-means.
+//  Assignment: each weight -> nearest centroid.
+//  Update: new centroid = sum(sens[i]*w[i]) / sum(sens[i]) for
+//  weights assigned to that cluster. Sensitivity weighting ensures
+//  high-importance weights have proportionally more pull.
+// ===================================================================
+fn sq_kmeans_step(W, sens, centroids) {
+    let n = len(W)
+    let k = len(centroids)
+    // Accumulators for each cluster
+    let mut c_sum = []
+    let mut c_weight = []
+    let mut j = 0
+    while j < k {
+        c_sum = c_sum + [0.0]
+        c_weight = c_weight + [0.0]
+        j = j + 1
+    }
+    // Assign each weight to nearest centroid and accumulate
+    let mut i = 0
+    while i < n {
+        let w = W[i]
+        let s = sens[i]
+        let mut best_j = 0
+        let mut best_d = _sq_abs(w - centroids[0])
+        j = 1
+        while j < k {
+            let d = _sq_abs(w - centroids[j])
+            if d < best_d {
+                best_d = d
+                best_j = j
+            }
+            j = j + 1
+        }
+        c_sum[best_j] = c_sum[best_j] + s * w
+        c_weight[best_j] = c_weight[best_j] + s
+        i = i + 1
+    }
+    // New centroids (keep old if cluster is empty)
+    let mut new_c = []
+    j = 0
+    while j < k {
+        if c_weight[j] > 0.0 {
+            new_c = new_c + [c_sum[j] / c_weight[j]]
+        } else {
+            new_c = new_c + [centroids[j]]
+        }
+        j = j + 1
+    }
+    return new_c
+}
+
+// ===================================================================
+//  sq_build_codebook(W, sens, k, iters) -> SqCodebook
+//
+//  Build a k-entry codebook via density-weighted k-means.
+//  k = 2^bits (8 for int3, 16 for int4).
+// ===================================================================
+fn sq_build_codebook(W, sens, k, iters) {
+    let mut centroids = sq_kmeans_init(W, sens, k)
+    let mut it = 0
+    while it < iters {
+        centroids = sq_kmeans_step(W, sens, centroids)
+        it = it + 1
+    }
+    // Sort centroids ascending for deterministic ordering
+    let mut i = 1
+    while i < k {
+        let mut j = i
+        while j > 0 {
+            if centroids[j - 1] <= centroids[j] { break }
+            let tmp = centroids[j - 1]
+            centroids[j - 1] = centroids[j]
+            centroids[j] = tmp
+            j = j - 1
+        }
+        i = i + 1
+    }
+    return SqCodebook { centroids: centroids, k: k }
+}
+
+// ===================================================================
+//  sq_assign(W, codebook) -> [int]
+//
+//  Assign each weight to the nearest codebook centroid.
+//  Returns flat array of codebook indices (0..k-1).
+// ===================================================================
+fn sq_assign(W, codebook) {
+    let n = len(W)
+    let k = codebook.k
+    let cents = codebook.centroids
+    let mut codes = []
+    let mut i = 0
+    while i < n {
+        let w = W[i]
+        let mut best_j = 0
+        let mut best_d = _sq_abs(w - cents[0])
+        let mut j = 1
+        while j < k {
+            let d = _sq_abs(w - cents[j])
+            if d < best_d {
+                best_d = d
+                best_j = j
+            }
+            j = j + 1
+        }
+        codes = codes + [best_j]
+        i = i + 1
+    }
+    return codes
+}
+
+// ===================================================================
+//  sq_quantize(W, n_out, n_in, calib, bits) -> SqTensor
+//
+//  Full SqueezeLLM quantization pipeline:
+//    1. Compute per-weight sensitivity
+//    2. Build density-weighted codebook (k = 2^bits)
+//    3. Assign each weight to codebook entry
+//
+//  bits: 3 (int3, K=8) or 4 (int4, K=16).
+//  calib: flat [nsamples x n_in] calibration activations (may be []).
+// ===================================================================
+fn sq_quantize(W, n_out, n_in, calib, bits) {
+    let n = n_out * n_in
+    let k = 1
+    // compute 2^bits
+    let mut kval = 1
+    let mut b = 0
+    while b < bits {
+        kval = kval * 2
+        b = b + 1
+    }
+    let sens = sq_sensitivity(W, n_out, n_in, calib)
+    let codebook = sq_build_codebook(W, sens, kval, SQ_DEFAULT_ITERS())
+    let codes = sq_assign(W, codebook)
+    return SqTensor {
+        n_out: n_out,
+        n_in: n_in,
+        bits: bits,
+        codebook: codebook.centroids,
+        codes: codes,
+        sens: sens
+    }
+}
+
+// ===================================================================
+//  sq_dequantize(st) -> [float]
+//
+//  Reconstruct the weight matrix via codebook lookup.
+//  W_hat[i] = codebook[codes[i]]
+// ===================================================================
+fn sq_dequantize(st) {
+    let n = st.n_out * st.n_in
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let code = st.codes[i]
+        out = out + [st.codebook[code]]
+        i = i + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  sq_forward(st, x) -> [float]
+//
+//  Matrix-vector product y = W * x using codebook dequantization
+//  on the fly (dequantize-to-register pattern). x has length n_in,
+//  output has length n_out.
+// ===================================================================
+fn sq_forward(st, x) {
+    let n_out = st.n_out
+    let n_in = st.n_in
+    let cb = st.codebook
+    let mut y = []
+    let mut r = 0
+    while r < n_out {
+        let base = r * n_in
+        let mut acc = 0.0
+        let mut c = 0
+        while c < n_in {
+            let code = st.codes[base + c]
+            let w = cb[code]
+            acc = acc + w * x[c]
+            c = c + 1
+        }
+        y = y + [acc]
+        r = r + 1
+    }
+    return y
+}
+
+// ===================================================================
+//  sq_matmul_ref(W, n_out, n_in, x) -> [float]
+//
+//  Naive FP32 reference matmul for tests.
+// ===================================================================
+fn sq_matmul_ref(W, n_out, n_in, x) {
+    let mut y = []
+    let mut r = 0
+    while r < n_out {
+        let base = r * n_in
+        let mut acc = 0.0
+        let mut c = 0
+        while c < n_in {
+            acc = acc + W[base + c] * x[c]
+            c = c + 1
+        }
+        y = y + [acc]
+        r = r + 1
+    }
+    return y
+}
+
+// ===================================================================
+//  sq_error_stats(W, st) -> SqStats
+//
+//  MSE / max-err / SNR (dB) between original W and codebook
+//  reconstruction.
+// ===================================================================
+fn sq_error_stats(W, st) {
+    let deq = sq_dequantize(st)
+    let n = len(W)
+    let mut sse = 0.0
+    let mut mx = 0.0
+    let mut sig = 0.0
+    let mut i = 0
+    while i < n {
+        let e = _sq_abs(W[i] - deq[i])
+        sse = sse + e * e
+        if e > mx { mx = e }
+        sig = sig + W[i] * W[i]
+        i = i + 1
+    }
+    let mse = sse / _sq_max(to_float(n), 1.0)
+    let mut snr = 999.0
+    if sse > 0.0 {
+        let ratio = sig / sse
+        snr = 10.0 * _sq_log10(ratio)
+    }
+    return SqStats { mse: mse, max_err: mx, snr: snr }
+}
+
+// ===================================================================
+//  sq_codebook_stats(st) -> (float, float, float)
+//
+//  Return (min, max, spread) of codebook centroids.
+// ===================================================================
+fn sq_codebook_min(st) {
+    let k = len(st.codebook)
+    let mut mn = st.codebook[0]
+    let mut i = 1
+    while i < k {
+        if st.codebook[i] < mn { mn = st.codebook[i] }
+        i = i + 1
+    }
+    return mn
+}
+
+fn sq_codebook_max(st) {
+    let k = len(st.codebook)
+    let mut mx = st.codebook[0]
+    let mut i = 1
+    while i < k {
+        if st.codebook[i] > mx { mx = st.codebook[i] }
+        i = i + 1
+    }
+    return mx
+}
+
+fn sq_codebook_spread(st) {
+    return sq_codebook_max(st) - sq_codebook_min(st)
+}
+
+// ===================================================================
+//  sq_sensitivity_stats(sens) -> (mean, max)
+// ===================================================================
+fn sq_sens_mean(sens) {
+    let n = len(sens)
+    if n == 0 { return 0.0 }
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + sens[i]
+        i = i + 1
+    }
+    return s / to_float(n)
+}
+
+fn sq_sens_max(sens) {
+    let n = len(sens)
+    if n == 0 { return 0.0 }
+    let mut mx = sens[0]
+    let mut i = 1
+    while i < n {
+        if sens[i] > mx { mx = sens[i] }
+        i = i + 1
+    }
+    return mx
+}
+
+// ===================================================================
+//  sq_summary(name, W, st) — debug print
+// ===================================================================
+fn sq_summary(name, W, st) {
+    let err = sq_error_stats(W, st)
+    let n = st.n_out * st.n_in
+    let k = len(st.codebook)
+    println("[squeeze] " + name + ": " + to_string(st.n_out) + "x" + to_string(st.n_in) + " bits=" + to_string(st.bits) + " k=" + to_string(k))
+    println("  n=" + to_string(n) + " mse=" + to_string(err.mse) + " max_err=" + to_string(err.max_err) + " snr=" + to_string(err.snr) + "dB")
+    return err
+}

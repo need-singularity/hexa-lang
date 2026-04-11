@@ -1,0 +1,414 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/speculative_streaming.hexa — Speculative Streaming (#216)
+//
+//  HEXA-LANG ML #216 — Stream-based speculative decoding.
+//  Instead of the classic "propose-K, verify-K, accept-some" cycle,
+//  we maintain a RING of K parallel draft streams that continuously
+//  generate ahead while the verifier catches up. Accepted tokens
+//  slide the ring forward; rejected tokens invalidate specific
+//  streams so they can be re-seeded without blocking the verifier.
+//
+//  Conceptually:
+//
+//    stream_0: [t0, t1, t2, t3]      (depth=4, conf=0.82)
+//    stream_1: [t0, t1, t2', t3']    (depth=4, conf=0.77)   <-- diverged
+//    stream_2: [t0, t1, t2'', ...]   (depth=3, conf=0.91)
+//    stream_3: [t0, t1, t2, t3, t4]  (depth=5, conf=0.65)   <-- deepest
+//
+//  The verifier picks the highest-confidence stream for its next
+//  verification batch, and slides the ring by the accepted prefix
+//  length after each verification round.
+//
+//  API (all prefixed `specs_`):
+//    specs_create_stream(max_depth, vocab)                -> dict
+//    specs_create_ring(k, max_depth, vocab)               -> [dict]
+//    specs_advance_stream(stream, draft_fn, vocab)        -> dict
+//    specs_verify_tokens(stream, verified, n_verified)    -> int
+//    specs_invalidate_stream(stream)                      -> dict
+//    specs_select_best_stream(ring, k)                    -> int
+//    specs_slide_ring(ring, k, accepted_prefix)           -> [dict]
+//    specs_stream_length(stream)                          -> int
+//    specs_confidence_product(stream, depth)              -> float
+//    specs_merge_common_prefix(ring, k)                   -> int
+//    specs_reset_ring(ring, k)                            -> [dict]
+//    specs_generate(draft_fn, verifier_fn, prefix,
+//                   n_new, k, max_depth, vocab)           -> [int]
+//
+//  Stream layout (dict):
+//    tokens       : [int]    drafted tokens, len <= max_depth
+//    confidences  : [float]  per-token draft confidence in (0,1]
+//    valid        : int      1 = active, 0 = invalidated
+//    depth        : int      current length of tokens
+//    max_depth    : int      fixed capacity
+//    vocab        : int      vocab size (for clamping)
+//
+//  Rules: HX4 SELF-HOST FIRST, HX5 AI-native, P1 no semicolons,
+//         P4 native collections. @pure on math helpers only —
+//         NEVER @hot on functions that mutate dict fields
+//         (see feedback_hot_attr_dict_mutation.md).
+// ═══════════════════════════════════════════════════════════════════
+
+// ── math helpers ─────────────────────────────────────────────────
+@pure
+fn _specs_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+@pure
+fn _specs_min_int(a, b) {
+    if a < b { return a }
+    return b
+}
+
+@pure
+fn _specs_max_int(a, b) {
+    if a > b { return a }
+    return b
+}
+
+// Tail-hash style confidence: deterministic, in (0.0, 1.0].
+// Uses the token id and position so deeper draft tokens decay.
+@pure
+fn _specs_token_conf(token, pos) {
+    let mut h = (token + 1) * 2654435761 + (pos + 7) * 1315423911
+    h = h % 997
+    if h < 0 { h = 0 - h }
+    // map to (0.5, 1.0] so the product doesn't vanish too fast in tests
+    let f = 0.5 + to_float(h) / 1994.0
+    return f
+}
+
+// ── factory ──────────────────────────────────────────────────────
+// Create an empty stream with capacity max_depth.
+@pure
+fn specs_create_stream(max_depth, vocab) {
+    return #{
+        "tokens": [],
+        "confidences": [],
+        "valid": 1,
+        "depth": 0,
+        "max_depth": max_depth,
+        "vocab": vocab
+    }
+}
+
+// Create a ring of K parallel streams. Each stream starts empty.
+@pure
+fn specs_create_ring(k, max_depth, vocab) {
+    let mut ring = []
+    let mut i = 0
+    while i < k {
+        ring = ring + [specs_create_stream(max_depth, vocab)]
+        i = i + 1
+    }
+    return ring
+}
+
+// ── stream advance ───────────────────────────────────────────────
+// Extend stream by 1 drafted token. Calls draft_fn(tokens_so_far)
+// which should return an int in [0, vocab). If the stream is full
+// or invalidated, the call is a no-op.
+fn specs_advance_stream(stream, draft_fn, vocab) {
+    let mut s = stream
+    if s["valid"] == 0 { return s }
+    if s["depth"] >= s["max_depth"] { return s }
+    let cur_tokens = s["tokens"]
+    let raw = draft_fn(cur_tokens)
+    // Clamp to [0, vocab)
+    let mut tok = raw % vocab
+    if tok < 0 { tok = tok + vocab }
+    let pos = s["depth"]
+    let conf = _specs_token_conf(tok, pos)
+    s["tokens"] = cur_tokens + [tok]
+    s["confidences"] = s["confidences"] + [conf]
+    s["depth"] = pos + 1
+    return s
+}
+
+// ── verification ─────────────────────────────────────────────────
+// Compare the first n_verified drafted tokens against verified[].
+// Returns the count of matching tokens from position 0 until the
+// first mismatch. A stream is *not* invalidated here — the caller
+// decides, based on the returned number, whether to slide or
+// invalidate.
+@pure
+fn specs_verify_tokens(stream, verified, n_verified) {
+    let drafted = stream["tokens"]
+    let cap = _specs_min_int(len(drafted), n_verified)
+    let mut accepted = 0
+    let mut i = 0
+    let mut stop = 0
+    while i < cap {
+        if stop == 0 {
+            if drafted[i] == verified[i] {
+                accepted = accepted + 1
+            } else {
+                stop = 1
+            }
+        }
+        i = i + 1
+    }
+    return accepted
+}
+
+// Mark a stream as invalidated. Tokens and confidences preserved
+// so callers can still inspect the previous draft, but `valid=0`.
+@pure
+fn specs_invalidate_stream(stream) {
+    let mut s = stream
+    s["valid"] = 0
+    return s
+}
+
+// ── ring scheduling ──────────────────────────────────────────────
+// Pick the index of the highest-confidence valid stream. Scored by
+// sum of log-ish confidences (we use the raw product since probs
+// are ≥0.5, which keeps arithmetic simple and monotone). Ties
+// resolved by smallest index. Returns -1 if all streams invalid.
+@pure
+fn specs_select_best_stream(ring, k) {
+    let mut best_idx = -1
+    let mut best_score = -1.0
+    let mut i = 0
+    while i < k {
+        let s = ring[i]
+        if s["valid"] == 1 {
+            let score = specs_confidence_product(s, s["depth"])
+            if score > best_score {
+                best_score = score
+                best_idx = i
+            }
+        }
+        i = i + 1
+    }
+    return best_idx
+}
+
+// Slide every stream forward by `accepted_prefix` tokens:
+// drop the first N tokens/confidences from each, shrink depth,
+// and keep `valid` as-is. Empty-after-slide streams stay valid
+// but depth=0 so they can be advanced again.
+@pure
+fn specs_slide_ring(ring, k, accepted_prefix) {
+    let mut out = []
+    let mut i = 0
+    while i < k {
+        let s = ring[i]
+        let d = s["depth"]
+        let take = _specs_min_int(accepted_prefix, d)
+        let mut new_tokens = []
+        let mut new_confs = []
+        let mut j = take
+        while j < d {
+            new_tokens = new_tokens + [s["tokens"][j]]
+            new_confs = new_confs + [s["confidences"][j]]
+            j = j + 1
+        }
+        let mut ns = s
+        ns["tokens"] = new_tokens
+        ns["confidences"] = new_confs
+        ns["depth"] = d - take
+        out = out + [ns]
+        i = i + 1
+    }
+    return out
+}
+
+// ── stream introspection ─────────────────────────────────────────
+@pure
+fn specs_stream_length(stream) {
+    return stream["depth"]
+}
+
+// Product of per-token confidences for the first `depth` tokens.
+// Empty stream => 1.0. Result is in (0.0, 1.0] for confs in (0,1].
+@pure
+fn specs_confidence_product(stream, depth) {
+    let d = _specs_min_int(depth, stream["depth"])
+    let confs = stream["confidences"]
+    let mut prod = 1.0
+    let mut i = 0
+    while i < d {
+        prod = prod * confs[i]
+        i = i + 1
+    }
+    return prod
+}
+
+// ── common-prefix merge ──────────────────────────────────────────
+// Scan every valid stream in the ring and return the length of the
+// longest common prefix that all valid streams share. If there are
+// no valid streams returns 0.
+@pure
+fn specs_merge_common_prefix(ring, k) {
+    // find first valid stream as pivot
+    let mut pivot = -1
+    let mut i = 0
+    while i < k {
+        if ring[i]["valid"] == 1 { pivot = i i = k } else { i = i + 1 }
+    }
+    if pivot < 0 { return 0 }
+    let pivot_s = ring[pivot]
+    let pivot_tokens = pivot_s["tokens"]
+    let pivot_depth = pivot_s["depth"]
+    // walk positions 0..pivot_depth and check agreement
+    let mut common = 0
+    let mut p = 0
+    let mut halted = 0
+    while p < pivot_depth {
+        if halted == 0 {
+            let pt = pivot_tokens[p]
+            let mut agree = 1
+            let mut q = 0
+            while q < k {
+                let sq = ring[q]
+                if sq["valid"] == 1 {
+                    if sq["depth"] <= p {
+                        agree = 0
+                    } else {
+                        if sq["tokens"][p] != pt {
+                            agree = 0
+                        }
+                    }
+                }
+                q = q + 1
+            }
+            if agree == 1 {
+                common = common + 1
+            } else {
+                halted = 1
+            }
+        }
+        p = p + 1
+    }
+    return common
+}
+
+// ── ring reset ───────────────────────────────────────────────────
+// Clear every stream in the ring: tokens=[], depth=0, valid=1.
+// Preserves max_depth and vocab.
+@pure
+fn specs_reset_ring(ring, k) {
+    let mut out = []
+    let mut i = 0
+    while i < k {
+        let s = ring[i]
+        let md = s["max_depth"]
+        let vo = s["vocab"]
+        out = out + [specs_create_stream(md, vo)]
+        i = i + 1
+    }
+    return out
+}
+
+// ── full generate loop ───────────────────────────────────────────
+// Continuously draft into every stream, verify the best one,
+// slide the ring, repeat. Returns the full extended sequence
+// (prefix + n_new generated tokens).
+//
+//   draft_fn(ctx)         -> int     proposes next token given ctx
+//   verifier_fn(ctx, n)   -> [int]   emits n "golden" tokens
+//
+// Uses a guard bound so no step can loop forever.
+fn specs_generate(draft_fn, verifier_fn, prefix, n_new, k, max_depth, vocab) {
+    let mut cur = []
+    let mut i = 0
+    while i < len(prefix) {
+        cur = cur + [prefix[i]]
+        i = i + 1
+    }
+    if n_new <= 0 { return cur }
+    let mut ring = specs_create_ring(k, max_depth, vocab)
+    let mut produced = 0
+    let mut guard = 0
+    let hard_limit = n_new * 8 + 32
+    while produced < n_new {
+        if guard >= hard_limit {
+            // Safety hatch: force verifier-only progress for remaining tokens.
+            let need = n_new - produced
+            let forced = verifier_fn(cur, need)
+            let mut f = 0
+            while f < len(forced) {
+                if produced < n_new {
+                    cur = cur + [forced[f]]
+                    produced = produced + 1
+                }
+                f = f + 1
+            }
+            produced = n_new
+        } else {
+            // 1. Advance every valid stream by 1.
+            let mut r2 = []
+            let mut si = 0
+            while si < k {
+                let s = ring[si]
+                let s2 = specs_advance_stream(s, draft_fn, vocab)
+                r2 = r2 + [s2]
+                si = si + 1
+            }
+            ring = r2
+
+            // 2. Select the best stream and verify its drafted tokens.
+            let best = specs_select_best_stream(ring, k)
+            if best < 0 {
+                ring = specs_reset_ring(ring, k)
+                guard = guard + 1
+            } else {
+                let bs = ring[best]
+                let depth = bs["depth"]
+                if depth == 0 {
+                    guard = guard + 1
+                } else {
+                    let verified = verifier_fn(cur, depth)
+                    let n_acc = specs_verify_tokens(bs, verified, len(verified))
+                    // 3. Commit accepted tokens (at least 1 to guarantee progress).
+                    let commit = if n_acc > 0 { n_acc } else { 1 }
+                    let remain = n_new - produced
+                    let take = _specs_min_int(commit, remain)
+                    let drafted = bs["tokens"]
+                    let mut c = 0
+                    while c < take {
+                        if c < n_acc {
+                            cur = cur + [drafted[c]]
+                        } else {
+                            cur = cur + [verified[c]]
+                        }
+                        c = c + 1
+                    }
+                    produced = produced + take
+                    // 4. Slide ring by take (never by more than slide_by).
+                    ring = specs_slide_ring(ring, k, take)
+                    // 5. Invalidate streams that diverged at position n_acc.
+                    if n_acc < len(verified) {
+                        let mut vi = 0
+                        while vi < k {
+                            let sv = ring[vi]
+                            if sv["valid"] == 1 {
+                                if sv["depth"] > 0 {
+                                    // If its first surviving token disagrees with the
+                                    // next verified token, invalidate.
+                                    // (cheap heuristic — keeps the ring fresh.)
+                                    let nxt = sv["tokens"][0]
+                                    if n_acc < len(verified) {
+                                        if nxt != verified[n_acc] {
+                                            ring[vi] = specs_invalidate_stream(sv)
+                                        }
+                                    }
+                                }
+                            }
+                            vi = vi + 1
+                        }
+                    }
+                    // 6. If all invalidated, reset.
+                    let any_best = specs_select_best_stream(ring, k)
+                    if any_best < 0 {
+                        ring = specs_reset_ring(ring, k)
+                    }
+                    guard = guard + 1
+                }
+            }
+        }
+    }
+    return cur
+}

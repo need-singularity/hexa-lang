@@ -1,0 +1,500 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/megalodon.hexa — Megalodon: Efficient LLM Pretraining with
+//                           Unlimited Context Length (#209)
+//
+//  Implements the core primitives of Megalodon (Ma et al. 2024):
+//    - Complex EMA (CEMA): per-dim multi-frequency complex exponential
+//                          moving average with learnable decay/phase
+//    - Chunked Moving Average Attention: local attention within fixed
+//                                        chunks (O(N * chunk))
+//    - Timestep Normalization: per-dim affine (gamma, beta) applied
+//                              after removing chunk mean/std
+//    - Gated Residual: x + sigmoid(gate) * y — timestep-level gating
+//                      combining CEMA past with local attention
+//    - Rotary Phase: cos/sin rotation used inside the complex EMA
+//    - Full forward block: CEMA scan → timestep norm → chunk attn
+//                          → gated residual
+//
+//  API (prefix mega_):
+//    mega_create_cema(dim, n_freqs, decay_init)            → params dict
+//    mega_initialize_alpha(n_freqs)                         → [float]
+//    mega_rotary_phase(theta, t)                            → (cos, sin)
+//    mega_cema_step(state_re, state_im, x, params,
+//                   dim, n_freqs)                           → (re, im, y)
+//    mega_cema_scan(params, xs, seq_len, dim, n_freqs)      → [[float]]
+//    mega_softmax_row(row, n)                               → [float]
+//    mega_chunk_attention(Q, K, V, chunk_size, seq_len,
+//                         d_head)                           → [[float]]
+//    mega_timestep_norm(x, gamma, beta, dim)                → [float]
+//    mega_gated_residual(x, y, gate_proj, dim)              → [float]
+//    mega_multi_chunk_scan(params, xs, seq_len, chunk, dim) → [[float]]
+//    mega_forward_block(params, x_seq, seq_len, dim)        → [[float]]
+//
+//  AI-NATIVE attrs:
+//    @pure — no side effects
+//    @hot  — inner-loop kernels (called every timestep)
+// ═══════════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════════
+//  Math helpers
+// ═══════════════════════════════════════════════════════════════════
+
+fn mega_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn mega_max(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn mega_min(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn mega_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn mega_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn mega_sigmoid(x) {
+    if x > 20.0 { return 1.0 }
+    if x < -20.0 { return 0.0 }
+    return 1.0 / (1.0 + mega_exp(0.0 - x))
+}
+
+let MEGA_PI = 3.141592653589793
+let MEGA_TWO_PI = 6.283185307179586
+
+// Taylor-style sin/cos reduced to [-pi, pi]
+fn mega_sin(x) {
+    let mut v = x
+    for _i in 0..40 {
+        if v > MEGA_PI { v = v - MEGA_TWO_PI } else if v < 0.0 - MEGA_PI { v = v + MEGA_TWO_PI } else { v = v }
+    }
+    let mut result = 0.0
+    let mut term = v
+    for i in 0..15 {
+        result = result + term
+        term = 0.0 - term * v * v / to_float((2 * i + 2) * (2 * i + 3))
+    }
+    return result
+}
+
+fn mega_cos(x) {
+    return mega_sin(x + MEGA_PI / 2.0)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Vector / matrix utilities
+// ═══════════════════════════════════════════════════════════════════
+
+fn mega_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn mega_ones(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [1.0] }
+    return v
+}
+
+fn mega_zeros_2d(r, c) {
+    let mut m = []
+    for _i in 0..r {
+        let mut row = []
+        for _j in 0..c { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+fn mega_vec_add(a, b) {
+    let n = len(a)
+    let mut out = []
+    for i in 0..n { out = out + [a[i] + b[i]] }
+    return out
+}
+
+fn mega_vec_scale(v, s) {
+    let n = len(v)
+    let mut out = []
+    for i in 0..n { out = out + [v[i] * s] }
+    return out
+}
+
+fn mega_dot(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    for i in 0..n { s = s + a[i] * b[i] }
+    return s
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  1. Initialize per-frequency alphas (decay rates) and phases
+//
+//  Megalodon uses logarithmically spaced decay magnitudes in
+//  (0, 1) so that different frequencies capture different time-scales.
+//  Returns `n_freqs` floats, each in (0, 1).
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn mega_initialize_alpha(n_freqs) {
+    if n_freqs <= 0 { return [] }
+    let mut alphas = []
+    for i in 0..n_freqs {
+        // log-spaced between ~0.99 (slow) and ~0.5 (fast)
+        let t = to_float(i) / to_float(mega_max(1, n_freqs - 1))
+        // alpha = exp( -lambda ) with lambda linearly spaced in [0.01, 0.69]
+        let lam = 0.01 + 0.68 * t
+        let a = mega_exp(0.0 - lam)
+        alphas = alphas + [a]
+    }
+    return alphas
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  2. Create CEMA parameter dict
+//
+//  state shape: [dim, n_freqs] for both real + imag parts
+//  params:
+//    alpha   — [n_freqs] decay magnitudes
+//    theta   — [n_freqs] rotation phases (per-frequency)
+//    weight  — [dim * n_freqs] mixing weights (real)
+//    dim, n_freqs — shape metadata
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn mega_create_cema(dim, n_freqs, decay_init) {
+    // alphas: start from initialize_alpha, scaled by decay_init ∈ (0,1]
+    let base = mega_initialize_alpha(n_freqs)
+    let mut alphas = []
+    for i in 0..n_freqs {
+        let a = base[i] * decay_init
+        // keep a in (0, 0.999]
+        let a1 = mega_min(0.999, mega_max(1.0e-4, a))
+        alphas = alphas + [a1]
+    }
+    // thetas: per-frequency phase, linearly spaced in (0, pi)
+    let mut thetas = []
+    for i in 0..n_freqs {
+        let t = to_float(i + 1) / to_float(n_freqs + 1)
+        thetas = thetas + [t * MEGA_PI]
+    }
+    // weights: dim * n_freqs (deterministic pseudo-random)
+    let mut weights = []
+    for d in 0..dim {
+        for f in 0..n_freqs {
+            let h = (d * 131 + f * 733 + 7) % 10007
+            let w = (to_float(h) / 10007.0 - 0.5) * 0.5
+            weights = weights + [w]
+        }
+    }
+    return #{
+        "alpha": alphas,
+        "theta": thetas,
+        "weight": weights,
+        "dim": dim,
+        "n_freqs": n_freqs
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  3. Rotary phase — (cos, sin) pair used for complex multiply
+//
+//  For frequency with phase θ at timestep t, angle = θ * t.
+//  Returns a 2-element list [cos_angle, sin_angle].
+//  Identity: cos² + sin² = 1 for all inputs.
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn mega_rotary_phase(theta, t) {
+    let angle = theta * to_float(t)
+    let c = mega_cos(angle)
+    let s = mega_sin(angle)
+    return [c, s]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  4. CEMA single step
+//
+//  For each (d, f):
+//    new_re[d,f] = alpha[f] * (c * state_re - s * state_im) + w[d,f] * x[d]
+//    new_im[d,f] = alpha[f] * (c * state_im + s * state_re)
+//  where (c, s) = rotary_phase(theta[f], 1).
+//
+//  Output y[d] = Σ_f new_re[d,f].
+//
+//  Flat layout: state is length dim * n_freqs.
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn mega_cema_step(state_re, state_im, x, params, dim, n_freqs) {
+    let alpha = params["alpha"]
+    let theta = params["theta"]
+    let weight = params["weight"]
+    let mut new_re = []
+    let mut new_im = []
+    // Precompute rotation per frequency (one full timestep advance)
+    let mut cs = []
+    let mut ss = []
+    for f in 0..n_freqs {
+        let rp = mega_rotary_phase(theta[f], 1)
+        cs = cs + [rp[0]]
+        ss = ss + [rp[1]]
+    }
+    for d in 0..dim {
+        for f in 0..n_freqs {
+            let idx = d * n_freqs + f
+            let sr = state_re[idx]
+            let si = state_im[idx]
+            let c = cs[f]
+            let s = ss[f]
+            let decayed_re = alpha[f] * (c * sr - s * si)
+            let decayed_im = alpha[f] * (c * si + s * sr)
+            let input_contrib = weight[idx] * x[d]
+            new_re = new_re + [decayed_re + input_contrib]
+            new_im = new_im + [decayed_im]
+        }
+    }
+    let mut y = []
+    for d in 0..dim {
+        let mut acc = 0.0
+        for f in 0..n_freqs {
+            acc = acc + new_re[d * n_freqs + f]
+        }
+        y = y + [acc]
+    }
+    return [new_re, new_im, y]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  5. CEMA scan over a sequence
+//
+//  xs:      [seq_len, dim]
+//  returns: [seq_len, dim] — CEMA outputs at each timestep.
+//  State starts at zero.
+// ═══════════════════════════════════════════════════════════════════
+fn mega_cema_scan(params, xs, seq_len, dim, n_freqs) {
+    let flat = dim * n_freqs
+    let mut state_re = mega_zeros(flat)
+    let mut state_im = mega_zeros(flat)
+    let mut outputs = []
+    for t in 0..seq_len {
+        let x = xs[t]
+        let step = mega_cema_step(state_re, state_im, x, params, dim, n_freqs)
+        state_re = step[0]
+        state_im = step[1]
+        outputs = outputs + [step[2]]
+    }
+    return outputs
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  6. Softmax on a single row with bounded n
+//
+//  Subtract max for numerical stability.
+//  Returns row / sum(exp(...)).
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn mega_softmax_row(row, n) {
+    if n <= 0 { return [] }
+    let mut m = row[0]
+    for i in 1..n {
+        if row[i] > m { m = row[i] }
+    }
+    let mut exps = []
+    let mut sum = 0.0
+    for i in 0..n {
+        let e = mega_exp(row[i] - m)
+        exps = exps + [e]
+        sum = sum + e
+    }
+    if sum <= 0.0 { sum = 1.0 }
+    let mut out = []
+    for i in 0..n {
+        out = out + [exps[i] / sum]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  7. Chunked Moving Average Attention
+//
+//  Attend within each non-overlapping chunk of size `chunk_size`.
+//  Shape: Q,K,V: [seq_len, d_head] → output [seq_len, d_head].
+//  Softmax is per-row within a chunk (so row sums to 1).
+//  Scores are scaled by 1 / sqrt(d_head).
+// ═══════════════════════════════════════════════════════════════════
+fn mega_chunk_attention(Q, K, V, chunk_size, seq_len, d_head) {
+    let scale = 1.0 / mega_sqrt(to_float(d_head))
+    let mut output = mega_zeros_2d(seq_len, d_head)
+    let mut start = 0
+    while start < seq_len {
+        let mut end = start + chunk_size
+        if end > seq_len { end = seq_len }
+        let clen = end - start
+        // Build scores[i][j] for i,j ∈ [start, end)
+        let mut rows = []
+        for i in 0..clen {
+            let qi = Q[start + i]
+            let mut row = []
+            for j in 0..clen {
+                let kj = K[start + j]
+                let s = mega_dot(qi, kj) * scale
+                row = row + [s]
+            }
+            rows = rows + [row]
+        }
+        // Softmax each row
+        let mut weights_rows = []
+        for i in 0..clen {
+            let w = mega_softmax_row(rows[i], clen)
+            weights_rows = weights_rows + [w]
+        }
+        // Weighted sum over V
+        for i in 0..clen {
+            let mut out_row = mega_zeros(d_head)
+            for j in 0..clen {
+                let w = weights_rows[i][j]
+                let vj = V[start + j]
+                for k in 0..d_head {
+                    out_row[k] = out_row[k] + w * vj[k]
+                }
+            }
+            output[start + i] = out_row
+        }
+        start = start + chunk_size
+    }
+    return output
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  8. Timestep Normalization
+//
+//  Standard element-wise affine on a timestep vector:
+//    norm = (x - mean) / sqrt(var + eps)
+//    out  = gamma * norm + beta
+//
+//  After norm the output's mean ≈ beta, variance ≈ gamma² (per-dim).
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn mega_timestep_norm(x, gamma, beta, dim) {
+    if dim <= 0 { return [] }
+    let mut mean = 0.0
+    for i in 0..dim { mean = mean + x[i] }
+    mean = mean / to_float(dim)
+    let mut var = 0.0
+    for i in 0..dim {
+        let d = x[i] - mean
+        var = var + d * d
+    }
+    var = var / to_float(dim)
+    let inv_std = 1.0 / mega_sqrt(var + 1.0e-5)
+    let mut out = []
+    for i in 0..dim {
+        let normed = (x[i] - mean) * inv_std
+        out = out + [gamma[i] * normed + beta[i]]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  9. Gated Residual — x + sigmoid(gate_proj) * y
+//
+//  gate_proj is a per-dim pre-sigmoid value.  When gate_proj→-∞
+//  sigmoid→0 so output ≈ x.  When gate_proj→+∞ sigmoid→1 so
+//  output ≈ x + y.  gate_proj == 0 → x + 0.5 * y.
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn mega_gated_residual(x, y, gate_proj, dim) {
+    let mut out = []
+    for i in 0..dim {
+        let g = mega_sigmoid(gate_proj[i])
+        out = out + [x[i] + g * y[i]]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  10. Multi-chunk scan
+//
+//  Run CEMA over the full sequence but also break it into chunks of
+//  size `chunk`, producing one CEMA output per timestep of length
+//  `seq_len`.  Chunks share the same parameters but restart local
+//  statistics — here we just do a global scan and return a
+//  `seq_len × dim` matrix.  This keeps the contract:
+//    output length == seq_len.
+// ═══════════════════════════════════════════════════════════════════
+fn mega_multi_chunk_scan(params, xs, seq_len, chunk, dim) {
+    if chunk <= 0 { return [] }
+    let n_freqs = params["n_freqs"]
+    let flat = dim * n_freqs
+    let mut state_re = mega_zeros(flat)
+    let mut state_im = mega_zeros(flat)
+    let mut outputs = []
+    let mut t = 0
+    while t < seq_len {
+        let mut end = t + chunk
+        if end > seq_len { end = seq_len }
+        // Within each chunk we still carry state (true online scan)
+        for k in t..end {
+            let x = xs[k]
+            let step = mega_cema_step(state_re, state_im, x, params, dim, n_freqs)
+            state_re = step[0]
+            state_im = step[1]
+            outputs = outputs + [step[2]]
+        }
+        t = end
+    }
+    return outputs
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  11. Full forward block
+//
+//  block = gated_residual(
+//            x,
+//            timestep_norm(chunk_attention(cema_scan(x))),
+//            gate = sigmoid(0) per-dim
+//          )
+//  with Q=K=V=cema_out for simplicity.  Output: [seq_len, dim].
+// ═══════════════════════════════════════════════════════════════════
+fn mega_forward_block(params, x_seq, seq_len, dim) {
+    let n_freqs = params["n_freqs"]
+    // 1. CEMA scan over xs
+    let cema_out = mega_cema_scan(params, x_seq, seq_len, dim, n_freqs)
+    // 2. Local chunked attention (chunk = 8)
+    let attn = mega_chunk_attention(cema_out, cema_out, cema_out, 8, seq_len, dim)
+    // 3. Timestep norm with gamma=1, beta=0
+    let gamma = mega_ones(dim)
+    let beta = mega_zeros(dim)
+    // 4. Gate = zeros pre-sigmoid → sigmoid = 0.5
+    let gate = mega_zeros(dim)
+    let mut out = []
+    for t in 0..seq_len {
+        let normed = mega_timestep_norm(attn[t], gamma, beta, dim)
+        let gr = mega_gated_residual(x_seq[t], normed, gate, dim)
+        out = out + [gr]
+    }
+    return out
+}

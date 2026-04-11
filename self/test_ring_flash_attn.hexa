@@ -1,0 +1,409 @@
+// ═══════════════════════════════════════════════════════════════
+//  test_ring_flash_attn.hexa — Ring-FlashAttention correctness tests
+//
+//  ML roadmap #221 — Ring Attention + FlashAttention block fusion
+//
+//  Verifies (32 tests):
+//    #1  rfa_exp(0) = 1.0
+//    #2  rfa_exp(huge) is finite (clamped)
+//    #3  rfa_exp(-huge) is positive (clamped)
+//    #4  rfa_row_max basic
+//    #5  rfa_row_max single element
+//    #6  rfa_row_sum basic
+//    #7  rfa_row_sum empty (n=0) returns 0
+//    #8  rfa_shard_kv: chunks count == n_ranks
+//    #9  rfa_shard_kv: each chunk has seq_len // n_ranks rows
+//    #10 rfa_shard_kv: shard contents reassemble to original
+//    #11 rfa_rotate_ring: shape preserved
+//    #12 rfa_rotate_ring: step=0 is identity
+//    #13 rfa_rotate_ring: step=n_ranks full cycle is identity
+//    #14 rfa_rotate_ring: step=1 shifts by one
+//    #15 rfa_online_softmax_init: m = -inf
+//    #16 rfa_online_softmax_init: l = 0
+//    #17 rfa_online_softmax_init: out is zeros
+//    #18 rfa_compute_block: scores shape [q_len, k_len]
+//    #19 rfa_compute_block: weighted shape [q_len, d_head]
+//    #20 rfa_finalize_output: divides by l correctly
+//    #21 rfa_finalize_output: l=0 yields 0 (no NaN)
+//    #22 rfa_causal_mask_block: future positions = -inf
+//    #23 rfa_causal_mask_block: causal positions preserved
+//    #24 rfa_reference_attention: shape [seq_len, d_head]
+//    #25 rfa_reference_attention: rows are convex combinations of V
+//    #26 Online softmax merge ≡ full softmax (single-shot)
+//    #27 rfa_ring_attention: shape [seq_len, d_head]
+//    #28 rfa_ring_attention: matches reference (n_ranks=1)
+//    #29 rfa_ring_attention: matches reference (n_ranks=2)
+//    #30 rfa_ring_attention: matches reference (n_ranks=4)
+//    #31 rfa_ring_attention: n_ranks=2 == n_ranks=4 (same answer)
+//    #32 rfa_ring_attention: numerically stable with large scores
+//
+//  Run: PATH=/Users/ghost/.cargo/bin:$PATH ./hexa self/test_ring_flash_attn.hexa
+// ═══════════════════════════════════════════════════════════════
+
+import "ml/ring_flash_attn.hexa"
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(id, cond) {
+    if cond {
+        println("[PASS] #" + to_string(id))
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] #" + to_string(id))
+        fail_count = fail_count + 1
+    }
+}
+
+fn t_fabs(x) {
+    if x < 0.0 {
+        return 0.0 - x
+    }
+    return x
+}
+
+fn vec_close(a, b, eps) {
+    if len(a) != len(b) {
+        return false
+    }
+    for i in 0..len(a) {
+        if t_fabs(a[i] - b[i]) > eps {
+            return false
+        }
+    }
+    return true
+}
+
+fn mat_close(A, B, eps) {
+    if len(A) != len(B) {
+        return false
+    }
+    for i in 0..len(A) {
+        if !vec_close(A[i], B[i], eps) {
+            return false
+        }
+    }
+    return true
+}
+
+fn mat_max_diff(A, B) {
+    let mut mx = 0.0
+    for i in 0..len(A) {
+        for j in 0..len(A[i]) {
+            let d = t_fabs(A[i][j] - B[i][j])
+            if d > mx {
+                mx = d
+            }
+        }
+    }
+    return mx
+}
+
+println("=======================================================")
+println("  Ring-FlashAttention test suite (#221)")
+println("=======================================================")
+
+let eps = 1.0e-5
+let big_eps = 1.0e-4
+
+// ─── #1 rfa_exp(0) ────────────────────────────────────────────
+let e0 = rfa_exp(0.0)
+check(1, t_fabs(e0 - 1.0) < 1.0e-9)
+
+// ─── #2 rfa_exp(huge) finite ──────────────────────────────────
+let e_big = rfa_exp(1.0e9)
+check(2, e_big > 0.0 && e_big < 1.0e30)
+
+// ─── #3 rfa_exp(-huge) positive (clamped) ────────────────────
+let e_small = rfa_exp(0.0 - 1.0e9)
+check(3, e_small > 0.0)
+
+// ─── #4 rfa_row_max basic ────────────────────────────────────
+let row1 = [1.0, 5.0, 3.0, 2.0]
+check(4, t_fabs(rfa_row_max(row1, 4) - 5.0) < 1.0e-9)
+
+// ─── #5 rfa_row_max single element ───────────────────────────
+let row1b = [7.5]
+check(5, t_fabs(rfa_row_max(row1b, 1) - 7.5) < 1.0e-9)
+
+// ─── #6 rfa_row_sum basic ────────────────────────────────────
+let row2 = [1.0, 2.0, 3.0, 4.0]
+check(6, t_fabs(rfa_row_sum(row2, 4) - 10.0) < 1.0e-9)
+
+// ─── #7 rfa_row_sum n=0 ──────────────────────────────────────
+check(7, t_fabs(rfa_row_sum(row2, 0) - 0.0) < 1.0e-9)
+
+// ─── Build a small fixture: seq_len=4, d_head=3 ──────────────
+let Q = [
+    [0.10, 0.50, 0.90],
+    [0.80, 0.20, 0.40],
+    [0.30, 0.70, 0.10],
+    [0.60, 0.40, 0.80]
+]
+let K = [
+    [0.20, 0.10, 0.40],
+    [0.50, 0.30, 0.20],
+    [0.10, 0.60, 0.80],
+    [0.90, 0.70, 0.50]
+]
+let V = [
+    [1.00, 0.00, 0.50],
+    [0.00, 1.00, 0.50],
+    [0.50, 0.50, 1.00],
+    [1.00, 1.00, 0.00]
+]
+let seq_len = 4
+let d_head = 3
+
+// ─── #8 rfa_shard_kv: count ──────────────────────────────────
+let shards = rfa_shard_kv(K, V, 2, seq_len, d_head)
+let K_sh = shards[0]
+let V_sh = shards[1]
+check(8, len(K_sh) == 2 && len(V_sh) == 2)
+
+// ─── #9 rfa_shard_kv: chunk size ─────────────────────────────
+check(9, len(K_sh[0]) == 2 && len(K_sh[1]) == 2 && len(V_sh[0]) == 2 && len(V_sh[1]) == 2)
+
+// ─── #10 rfa_shard_kv: contents ──────────────────────────────
+let mut shard_ok = true
+for r in 0..2 {
+    for i in 0..2 {
+        let global = r * 2 + i
+        if !vec_close(K_sh[r][i], K[global], eps) { shard_ok = false }
+        if !vec_close(V_sh[r][i], V[global], eps) { shard_ok = false }
+    }
+}
+check(10, shard_ok)
+
+// ─── #11 rfa_rotate_ring: shape preserved ────────────────────
+let rot1 = rfa_rotate_ring(K_sh, 2, 1)
+check(11, len(rot1) == 2 && len(rot1[0]) == 2 && len(rot1[1]) == 2)
+
+// ─── #12 rfa_rotate_ring: step=0 identity ────────────────────
+let rot0 = rfa_rotate_ring(K_sh, 2, 0)
+let mut rot0_ok = true
+for r in 0..2 {
+    for i in 0..2 {
+        if !vec_close(rot0[r][i], K_sh[r][i], eps) { rot0_ok = false }
+    }
+}
+check(12, rot0_ok)
+
+// ─── #13 rfa_rotate_ring: full cycle == identity ─────────────
+let K_sh_full = rfa_shard_kv(K, V, 4, seq_len, d_head)[0]
+let rot_full = rfa_rotate_ring(K_sh_full, 4, 4)
+let mut full_ok = true
+for r in 0..4 {
+    if !vec_close(rot_full[r][0], K_sh_full[r][0], eps) { full_ok = false }
+}
+check(13, full_ok)
+
+// ─── #14 rfa_rotate_ring: step=1 shifts by one ───────────────
+//   new[r] = old[(r-1+n)%n]   so new[1] = old[0]
+let rot_one = rfa_rotate_ring(K_sh_full, 4, 1)
+check(14, vec_close(rot_one[1][0], K_sh_full[0][0], eps) &&
+          vec_close(rot_one[0][0], K_sh_full[3][0], eps))
+
+// ─── #15 rfa_online_softmax_init: m = -inf ───────────────────
+let init = rfa_online_softmax_init(seq_len, d_head)
+let m_init = init[0]
+let l_init = init[1]
+let out_init = init[2]
+check(15, m_init[0] < (0.0 - 1.0e29) && m_init[seq_len - 1] < (0.0 - 1.0e29))
+
+// ─── #16 rfa_online_softmax_init: l = 0 ──────────────────────
+let mut l_ok = true
+for i in 0..seq_len {
+    if t_fabs(l_init[i] - 0.0) > 1.0e-12 { l_ok = false }
+}
+check(16, l_ok)
+
+// ─── #17 rfa_online_softmax_init: out zeros ──────────────────
+let mut out_zero_ok = true
+for i in 0..seq_len {
+    for k in 0..d_head {
+        if t_fabs(out_init[i][k] - 0.0) > 1.0e-12 { out_zero_ok = false }
+    }
+}
+check(17, out_zero_ok)
+
+// ─── #18 rfa_compute_block: scores shape ─────────────────────
+let blk = rfa_compute_block(Q, K, V, seq_len, seq_len, d_head)
+let blk_scores = blk[0]
+let blk_weighted = blk[1]
+check(18, len(blk_scores) == seq_len && len(blk_scores[0]) == seq_len)
+
+// ─── #19 rfa_compute_block: weighted shape ───────────────────
+check(19, len(blk_weighted) == seq_len && len(blk_weighted[0]) == d_head)
+
+// ─── #20 rfa_finalize_output: divides by l ───────────────────
+//   construct hand-built m,l,out and check normalization
+let mut m_h = []
+let mut l_h = []
+let mut out_h = []
+for i in 0..seq_len {
+    m_h = m_h + [0.0]
+    l_h = l_h + [2.0]
+    out_h = out_h + [[2.0, 4.0, 6.0]]
+}
+let final_h = rfa_finalize_output(m_h, l_h, out_h, seq_len, d_head)
+check(20, vec_close(final_h[0], [1.0, 2.0, 3.0], eps) &&
+          vec_close(final_h[seq_len - 1], [1.0, 2.0, 3.0], eps))
+
+// ─── #21 rfa_finalize_output: l=0 yields 0 (no NaN) ─────────
+let mut l_z = []
+let mut out_z = []
+let mut m_z = []
+for i in 0..seq_len {
+    m_z = m_z + [0.0]
+    l_z = l_z + [0.0]
+    out_z = out_z + [[5.0, 5.0, 5.0]]
+}
+let fz = rfa_finalize_output(m_z, l_z, out_z, seq_len, d_head)
+check(21, t_fabs(fz[0][0] - 0.0) < 1.0e-12)
+
+// ─── #22 rfa_causal_mask_block: future = -inf ────────────────
+let mut tile = []
+for i in 0..2 {
+    let mut r = []
+    for j in 0..2 {
+        r = r + [1.0]
+    }
+    tile = tile + [r]
+}
+let masked = rfa_causal_mask_block(tile, 0, 0, 2, 2)
+// q=0,k=1: future, masked. q=1,k=0: past, kept.
+check(22, masked[0][1] < (0.0 - 1.0e29) && t_fabs(masked[1][0] - 1.0) < 1.0e-9)
+
+// ─── #23 rfa_causal_mask_block: diagonal preserved ───────────
+check(23, t_fabs(masked[0][0] - 1.0) < 1.0e-9 && t_fabs(masked[1][1] - 1.0) < 1.0e-9)
+
+// ─── #24 rfa_reference_attention: shape ──────────────────────
+let ref_out = rfa_reference_attention(Q, K, V, seq_len, d_head)
+check(24, len(ref_out) == seq_len && len(ref_out[0]) == d_head)
+
+// ─── #25 rfa_reference_attention: convex combinations ───────
+//   each output row component must lie within [min(V[:,k]), max(V[:,k])]
+let mut convex_ok = true
+for k in 0..d_head {
+    let mut vmin = V[0][k]
+    let mut vmax = V[0][k]
+    for j in 1..seq_len {
+        if V[j][k] < vmin { vmin = V[j][k] }
+        if V[j][k] > vmax { vmax = V[j][k] }
+    }
+    for i in 0..seq_len {
+        let v = ref_out[i][k]
+        if v < vmin - 1.0e-6 { convex_ok = false }
+        if v > vmax + 1.0e-6 { convex_ok = false }
+    }
+}
+check(25, convex_ok)
+
+// ─── #26 online softmax merge ≡ full softmax ─────────────────
+//   Build a single Q row of length 1 against full K,V — split K,V
+//   into two halves, run two updates, finalize, compare to reference.
+let Q1 = [[0.30, 0.40, 0.50]]
+let K_a = [
+    [0.20, 0.10, 0.40],
+    [0.50, 0.30, 0.20]
+]
+let V_a = [
+    [1.00, 0.00, 0.50],
+    [0.00, 1.00, 0.50]
+]
+let K_b = [
+    [0.10, 0.60, 0.80],
+    [0.90, 0.70, 0.50]
+]
+let V_b = [
+    [0.50, 0.50, 1.00],
+    [1.00, 1.00, 0.00]
+]
+let init1 = rfa_online_softmax_init(1, 3)
+let blk_a = rfa_compute_block(Q1, K_a, V_a, 1, 2, 3)
+let upd1 = rfa_online_softmax_update(init1[0], init1[1], init1[2],
+                                     blk_a[0], V_a, 1, 3, 2)
+let blk_b = rfa_compute_block(Q1, K_b, V_b, 1, 2, 3)
+let upd2 = rfa_online_softmax_update(upd1[0], upd1[1], upd1[2],
+                                     blk_b[0], V_b, 1, 3, 2)
+let merged = rfa_finalize_output(upd2[0], upd2[1], upd2[2], 1, 3)
+// Reference: Q1 (1 row) vs full K (4 rows) — inline since reference_attention assumes same seq_len for Q and K
+let scale26 = 1.0 / sqrt(3.0)
+let mut sc26 = [0.0, 0.0, 0.0, 0.0]
+for jj in 0..4 {
+    let mut dd = 0.0
+    for kk in 0..3 { dd = dd + Q1[0][kk] * K[jj][kk] }
+    sc26[jj] = dd * scale26
+}
+let mx26 = rfa_row_max(sc26, 4)
+let mut e26 = rfa_zeros_1d(4)
+let mut se26 = 0.0
+for jj in 0..4 { e26[jj] = rfa_exp(sc26[jj] - mx26); se26 = se26 + e26[jj] }
+let mut ref26 = rfa_zeros_1d(3)
+for kk in 0..3 {
+    let mut ac = 0.0
+    for jj in 0..4 { ac = ac + e26[jj] * V[jj][kk] }
+    ref26[kk] = ac / se26
+}
+check(26, vec_close(merged[0], ref26, eps))
+
+// ─── #27 ring_attention: shape ───────────────────────────────
+let sh2 = rfa_shard_kv(K, V, 2, seq_len, d_head)
+let ring_out2 = rfa_ring_attention(Q, sh2[0], sh2[1], 2, 0, seq_len, d_head)
+check(27, len(ring_out2) == seq_len && len(ring_out2[0]) == d_head)
+
+// ─── #28 ring_attention(n_ranks=1) == reference ─────────────
+let sh1 = rfa_shard_kv(K, V, 1, seq_len, d_head)
+let ring_out1 = rfa_ring_attention(Q, sh1[0], sh1[1], 1, 0, seq_len, d_head)
+let ref1 = rfa_reference_attention(Q, K, V, seq_len, d_head)
+check(28, mat_close(ring_out1, ref1, eps))
+
+// ─── #29 ring_attention(n_ranks=2) == reference ─────────────
+let diff2 = mat_max_diff(ring_out2, ref1)
+check(29, diff2 < eps)
+
+// ─── #30 ring_attention(n_ranks=4) == reference ─────────────
+let sh4 = rfa_shard_kv(K, V, 4, seq_len, d_head)
+let ring_out4 = rfa_ring_attention(Q, sh4[0], sh4[1], 4, 0, seq_len, d_head)
+let diff4 = mat_max_diff(ring_out4, ref1)
+check(30, diff4 < eps)
+
+// ─── #31 ring_attention: n_ranks=2 == n_ranks=4 ─────────────
+check(31, mat_close(ring_out2, ring_out4, eps))
+
+// ─── #32 numerically stable with large scores ────────────────
+let Q_big = [
+    [5.0, 5.0],
+    [4.0, 4.0],
+    [3.0, 3.0],
+    [6.0, 6.0]
+]
+let K_big = [
+    [4.0, 4.0],
+    [5.0, 5.0],
+    [0.0 - 3.0, 0.0 - 3.0],
+    [6.0, 6.0]
+]
+let V_big = [
+    [1.0, 0.0],
+    [0.0, 1.0],
+    [0.5, 0.5],
+    [1.0, 1.0]
+]
+let ref_big = rfa_reference_attention(Q_big, K_big, V_big, 4, 2)
+let sh_big = rfa_shard_kv(K_big, V_big, 2, 4, 2)
+let ring_big = rfa_ring_attention(Q_big, sh_big[0], sh_big[1], 2, 0, 4, 2)
+check(32, mat_close(ring_big, ref_big, big_eps))
+
+// ─── summary ─────────────────────────────────────────────────
+println("")
+println("=======================================================")
+println("  pass=" + to_string(pass_count) + " fail=" + to_string(fail_count))
+if fail_count == 0 {
+    println("  ALL PASS")
+} else {
+    println("  FAILED")
+}
+println("=======================================================")
+println(to_string(pass_count) + " passed")

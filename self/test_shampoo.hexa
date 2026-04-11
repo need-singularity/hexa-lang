@@ -1,0 +1,451 @@
+// ===================================================================
+//  test_shampoo.hexa — Shampoo Optimizer verification (#213)
+//
+//  Kronecker-factored preconditioning:
+//    L += G G^T ,   R += G^T G ,   P = L^(-1/4) G R^(-1/4)
+//
+//  Tests (35):
+//    T01 shampoo_zeros2 rows
+//    T02 shampoo_zeros2 cols
+//    T03 shampoo_zeros2 values are 0
+//    T04 shampoo_eye2 diag = 1
+//    T05 shampoo_eye2 off-diag = 0
+//    T06 shampoo_eye2 shape
+//    T07 matmul identity: I * A = A
+//    T08 matmul shape (m x n)
+//    T09 matmul [[1,2],[3,4]] * I = same
+//    T10 transpose shape
+//    T11 transpose values
+//    T12 transpose round-trip T(T(A)) = A
+//    T13 add_outer [1,0] x [1,0] -> [[1,0],[0,0]]
+//    T14 add_outer accumulates into existing L
+//    T15 scale_matrix linear
+//    T16 scale_matrix by 0 -> zeros
+//    T17 trace of eye_n = n
+//    T18 trace of diag [2,3,4] = 9
+//    T19 frobenius >= 0
+//    T20 frobenius ||[[3,4]]|| = 5
+//    T21 frobenius zero matrix = 0
+//    T22 inverse_fourth_root_approx(I) = I (diag=1)
+//    T23 inverse_fourth_root_approx(I) off-diag = 0
+//    T24 inverse_fourth_root_approx(4*I) diag = 4^(-1/4)
+//    T25 create_state rows/cols correct
+//    T26 create_state step = 0
+//    T27 create_state L is rows x rows identity
+//    T28 create_state R is cols x cols identity
+//    T29 step increments state["step"]
+//    T30 step returns param of same shape
+//    T31 step with zero grad leaves param unchanged
+//    T32 step accumulates L (trace grows)
+//    T33 multi_layer_step updates every layer
+//    T34 multi_layer_step preserves layer count
+//    T35 quadratic loss decreases over N steps
+//    T36 lr_warmup at step 0 is 0
+//    T37 lr_warmup at step >= warmup is base
+//    T38 lr_warmup linear at midpoint
+//
+//  Run: ./hexa self/test_shampoo.hexa
+// ===================================================================
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ===================================================================
+//  Inlined from self/ml/shampoo.hexa
+// ===================================================================
+
+let SHAMPOO_DEFAULT_LR  = 0.01
+let SHAMPOO_DEFAULT_EPS = 1.0e-6
+
+fn shampoo_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn shampoo_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..40 { g = (g + x / g) / 2.0 }
+    return g
+}
+
+@pure
+fn shampoo_zeros2(r, c) {
+    let mut out = []
+    for _i in 0..r {
+        let mut row = []
+        for _j in 0..c { row = row + [0.0] }
+        out = out + [row]
+    }
+    return out
+}
+
+@pure
+fn shampoo_eye2(n) {
+    let mut out = []
+    for i in 0..n {
+        let mut row = []
+        for j in 0..n {
+            if i == j {
+                row = row + [1.0]
+            } else {
+                row = row + [0.0]
+            }
+        }
+        out = out + [row]
+    }
+    return out
+}
+
+@hot
+fn shampoo_matmul(a, b, m, k, n) {
+    let mut c = []
+    for i in 0..m {
+        let mut row = []
+        for j in 0..n {
+            let mut s = 0.0
+            for p in 0..k { s = s + a[i][p] * b[p][j] }
+            row = row + [s]
+        }
+        c = c + [row]
+    }
+    return c
+}
+
+@pure
+fn shampoo_transpose(a, r, c) {
+    let mut t = []
+    for j in 0..c {
+        let mut row = []
+        for i in 0..r { row = row + [a[i][j]] }
+        t = t + [row]
+    }
+    return t
+}
+
+@pure
+fn shampoo_scale_matrix(m_mat, s, r, c) {
+    let mut out = []
+    for i in 0..r {
+        let mut row = []
+        for j in 0..c { row = row + [m_mat[i][j] * s] }
+        out = out + [row]
+    }
+    return out
+}
+
+@hot
+fn shampoo_add_outer(l_mat, g_mat, gt_mat, r, c) {
+    let outer = shampoo_matmul(g_mat, gt_mat, r, c, r)
+    let mut out = []
+    for i in 0..r {
+        let mut row = []
+        for j in 0..r { row = row + [l_mat[i][j] + outer[i][j]] }
+        out = out + [row]
+    }
+    return out
+}
+
+@pure
+fn shampoo_trace(m_mat, n) {
+    let mut s = 0.0
+    for i in 0..n { s = s + m_mat[i][i] }
+    return s
+}
+
+@pure
+fn shampoo_frobenius(m_mat, r, c) {
+    let mut s = 0.0
+    for i in 0..r {
+        for j in 0..c { s = s + m_mat[i][j] * m_mat[i][j] }
+    }
+    return shampoo_sqrt(s)
+}
+
+@hot
+fn shampoo_inverse_fourth_root_approx(m_mat, n) {
+    let tr = shampoo_trace(m_mat, n)
+    let avg = tr / to_float(n)
+    let eps = 1.0e-12
+    let base = avg + eps
+    let s1 = shampoo_sqrt(base)
+    let s2 = shampoo_sqrt(s1)
+    let mut factor = 1.0
+    if s2 > 0.0 { factor = 1.0 / s2 }
+    return shampoo_scale_matrix(shampoo_eye2(n), factor, n, n)
+}
+
+fn shampoo_create_state(rows, cols) {
+    return #{
+        "L": shampoo_eye2(rows),
+        "R": shampoo_eye2(cols),
+        "rows": rows,
+        "cols": cols,
+        "step": 0
+    }
+}
+
+@hot
+fn shampoo_step(state, param, grad, rows, cols, lr, eps) {
+    let l_old = state["L"]
+    let r_old = state["R"]
+    let gt = shampoo_transpose(grad, rows, cols)
+
+    let l_new = shampoo_add_outer(l_old, grad, gt, rows, cols)
+    let r_new = shampoo_add_outer(r_old, gt, grad, cols, rows)
+
+    let l_inv4 = shampoo_inverse_fourth_root_approx(l_new, rows)
+    let r_inv4 = shampoo_inverse_fourth_root_approx(r_new, cols)
+
+    let lg = shampoo_matmul(l_inv4, grad, rows, rows, cols)
+    let p_upd = shampoo_matmul(lg, r_inv4, rows, cols, cols)
+
+    let mut new_param = shampoo_zeros2(rows, cols)
+    for i in 0..rows {
+        for j in 0..cols {
+            new_param[i][j] = param[i][j] - lr * p_upd[i][j]
+        }
+    }
+
+    let new_state = #{
+        "L": l_new,
+        "R": r_new,
+        "rows": rows,
+        "cols": cols,
+        "step": state["step"] + 1
+    }
+    return [new_param, new_state]
+}
+
+fn shampoo_multi_layer_step(layers, grads, states, lr) {
+    let n_layers = len(layers)
+    let mut out_layers = []
+    let mut out_states = []
+    for l in 0..n_layers {
+        let st = states[l]
+        let rows = st["rows"]
+        let cols = st["cols"]
+        let res = shampoo_step(st, layers[l], grads[l], rows, cols, lr, SHAMPOO_DEFAULT_EPS)
+        out_layers = out_layers + [res[0]]
+        out_states = out_states + [res[1]]
+    }
+    return [out_layers, out_states]
+}
+
+@pure
+fn shampoo_lr_warmup(base_lr, step, warmup) {
+    if warmup <= 0 { return base_lr }
+    if step >= warmup { return base_lr }
+    return base_lr * to_float(step) / to_float(warmup)
+}
+
+// ===================================================================
+//  TEST HELPERS — quadratic loss 0.5 * ||W||_F^2
+// ===================================================================
+
+fn quad_loss(w, r, c) {
+    let mut s = 0.0
+    for i in 0..r {
+        for j in 0..c { s = s + 0.5 * w[i][j] * w[i][j] }
+    }
+    return s
+}
+
+fn quad_grad(w, r, c) {
+    let mut g = []
+    for i in 0..r {
+        let mut row = []
+        for j in 0..c { row = row + [w[i][j]] }
+        g = g + [row]
+    }
+    return g
+}
+
+// ===================================================================
+//  TESTS
+// ===================================================================
+
+// ── T01-T03: zeros2 shape + values ──────────────────────────
+let z = shampoo_zeros2(3, 4)
+check("T01 zeros2 rows=3", len(z) == 3)
+check("T02 zeros2 cols=4", len(z[0]) == 4)
+check("T03 zeros2 values 0", approx(z[1][2], 0.0, 1.0e-12))
+
+// ── T04-T06: eye2 diag/off-diag/shape ───────────────────────
+let e3 = shampoo_eye2(3)
+check("T04 eye2 diag=1", approx(e3[0][0], 1.0, 1.0e-12) && approx(e3[1][1], 1.0, 1.0e-12) && approx(e3[2][2], 1.0, 1.0e-12))
+check("T05 eye2 off=0", approx(e3[0][1], 0.0, 1.0e-12) && approx(e3[2][0], 0.0, 1.0e-12))
+check("T06 eye2 shape 3x3", len(e3) == 3 && len(e3[0]) == 3)
+
+// ── T07-T09: matmul ─────────────────────────────────────────
+let a22 = [[1.0, 2.0], [3.0, 4.0]]
+let i2 = shampoo_eye2(2)
+let ia = shampoo_matmul(i2, a22, 2, 2, 2)
+check("T07 I*A[0][0]=1 I*A[1][1]=4", approx(ia[0][0], 1.0, 1.0e-9) && approx(ia[1][1], 4.0, 1.0e-9))
+
+let a23 = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+let b32 = [[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]]
+let ab = shampoo_matmul(a23, b32, 2, 3, 2)
+check("T08 matmul shape 2x2", len(ab) == 2 && len(ab[0]) == 2)
+
+let ai = shampoo_matmul(a22, i2, 2, 2, 2)
+check("T09 A*I = A", approx(ai[0][1], 2.0, 1.0e-9) && approx(ai[1][0], 3.0, 1.0e-9))
+
+// ── T10-T12: transpose ──────────────────────────────────────
+let m23 = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+let mt = shampoo_transpose(m23, 2, 3)
+check("T10 transpose shape 3x2", len(mt) == 3 && len(mt[0]) == 2)
+check("T11 transpose[1][0]=2 [2][1]=6", approx(mt[1][0], 2.0, 1.0e-9) && approx(mt[2][1], 6.0, 1.0e-9))
+
+let mtt = shampoo_transpose(mt, 3, 2)
+let mut rt_ok = true
+for i in 0..2 {
+    for j in 0..3 {
+        if fabs(mtt[i][j] - m23[i][j]) > 1.0e-9 { rt_ok = false }
+    }
+}
+check("T12 T(T(A)) = A", rt_ok)
+
+// ── T13-T14: add_outer ──────────────────────────────────────
+// G is 2x1 column [[1],[0]], so G * G^T =
+//   [[1,0],[0,0]]
+let g21 = [[1.0], [0.0]]
+let gt12 = shampoo_transpose(g21, 2, 1)
+let l_zero = shampoo_zeros2(2, 2)
+let l1 = shampoo_add_outer(l_zero, g21, gt12, 2, 1)
+check("T13 add_outer [[1,0],[0,0]]", approx(l1[0][0], 1.0, 1.0e-9) && approx(l1[0][1], 0.0, 1.0e-9) && approx(l1[1][0], 0.0, 1.0e-9) && approx(l1[1][1], 0.0, 1.0e-9))
+
+// Accumulate twice -> L[0][0] = 2.0
+let l2 = shampoo_add_outer(l1, g21, gt12, 2, 1)
+check("T14 add_outer accumulates", approx(l2[0][0], 2.0, 1.0e-9))
+
+// ── T15-T16: scale_matrix ───────────────────────────────────
+let s_in = [[2.0, 4.0], [6.0, 8.0]]
+let s_out = shampoo_scale_matrix(s_in, 0.5, 2, 2)
+check("T15 scale by 0.5", approx(s_out[0][0], 1.0, 1.0e-9) && approx(s_out[1][1], 4.0, 1.0e-9))
+
+let s_zero = shampoo_scale_matrix(s_in, 0.0, 2, 2)
+check("T16 scale by 0", approx(s_zero[0][0], 0.0, 1.0e-12) && approx(s_zero[1][1], 0.0, 1.0e-12))
+
+// ── T17-T18: trace ──────────────────────────────────────────
+let e4 = shampoo_eye2(4)
+check("T17 trace(I_4)=4", approx(shampoo_trace(e4, 4), 4.0, 1.0e-9))
+
+let diag_mat = [[2.0, 0.0, 0.0], [0.0, 3.0, 0.0], [0.0, 0.0, 4.0]]
+check("T18 trace(diag[2,3,4])=9", approx(shampoo_trace(diag_mat, 3), 9.0, 1.0e-9))
+
+// ── T19-T21: frobenius ──────────────────────────────────────
+let f_ex = [[3.0, 4.0], [0.0, 0.0]]
+let fv = shampoo_frobenius(f_ex, 2, 2)
+check("T19 frobenius >= 0", fv >= 0.0)
+check("T20 frobenius = 5", approx(fv, 5.0, 1.0e-6))
+
+let f_z = shampoo_zeros2(3, 3)
+check("T21 frobenius(zeros)=0", approx(shampoo_frobenius(f_z, 3, 3), 0.0, 1.0e-9))
+
+// ── T22-T24: inverse_fourth_root_approx ─────────────────────
+let i4 = shampoo_inverse_fourth_root_approx(shampoo_eye2(3), 3)
+// trace(I)/3 = 1, 1^(-1/4) = 1 -> should return I
+check("T22 inv4(I) diag = 1", approx(i4[0][0], 1.0, 1.0e-6) && approx(i4[1][1], 1.0, 1.0e-6) && approx(i4[2][2], 1.0, 1.0e-6))
+check("T23 inv4(I) off = 0", approx(i4[0][1], 0.0, 1.0e-9) && approx(i4[2][0], 0.0, 1.0e-9))
+
+// 4*I: trace/3 = 4, 4^(-1/4) = 1/sqrt(2) ~ 0.70710678
+let mat4i = shampoo_scale_matrix(shampoo_eye2(3), 4.0, 3, 3)
+let inv4_4i = shampoo_inverse_fourth_root_approx(mat4i, 3)
+let target = 1.0 / shampoo_sqrt(shampoo_sqrt(4.0))  // = 1/sqrt(2)
+check("T24 inv4(4I) diag = 4^(-1/4)", approx(inv4_4i[0][0], target, 1.0e-6))
+
+// ── T25-T28: create_state ───────────────────────────────────
+let st = shampoo_create_state(3, 4)
+check("T25 state rows=3 cols=4", st["rows"] == 3 && st["cols"] == 4)
+check("T26 state step=0", st["step"] == 0)
+
+let st_L = st["L"]
+let st_R = st["R"]
+check("T27 state L is 3x3 I", len(st_L) == 3 && len(st_L[0]) == 3 && approx(st_L[0][0], 1.0, 1.0e-12) && approx(st_L[0][1], 0.0, 1.0e-12))
+check("T28 state R is 4x4 I", len(st_R) == 4 && len(st_R[0]) == 4 && approx(st_R[2][2], 1.0, 1.0e-12) && approx(st_R[1][3], 0.0, 1.0e-12))
+
+// ── T29-T32: step ────────────────────────────────────────────
+let p_init = [[1.0, 2.0], [3.0, 4.0]]
+let g_init = [[0.1, 0.2], [0.3, 0.4]]
+let st0 = shampoo_create_state(2, 2)
+let stp1 = shampoo_step(st0, p_init, g_init, 2, 2, 0.01, 1.0e-6)
+let p1 = stp1[0]
+let st1 = stp1[1]
+check("T29 step increments step", st1["step"] == 1)
+check("T30 step returns 2x2 param", len(p1) == 2 && len(p1[0]) == 2)
+
+// Zero grad -> unchanged param
+let g_zero = [[0.0, 0.0], [0.0, 0.0]]
+let stz = shampoo_create_state(2, 2)
+let stz1 = shampoo_step(stz, p_init, g_zero, 2, 2, 0.01, 1.0e-6)
+let p_z = stz1[0]
+let mut unchanged = true
+for i in 0..2 {
+    for j in 0..2 {
+        if fabs(p_z[i][j] - p_init[i][j]) > 1.0e-9 { unchanged = false }
+    }
+}
+check("T31 zero grad leaves param unchanged", unchanged)
+
+// L trace grows after step with nonzero grad
+let l_before_trace = shampoo_trace(st0["L"], 2)
+let l_after_trace = shampoo_trace(st1["L"], 2)
+check("T32 L trace grows (Kronecker accumulation)", l_after_trace > l_before_trace)
+
+// ── T33-T34: multi_layer_step ───────────────────────────────
+let layer_a = [[1.0, 0.0], [0.0, 1.0]]
+let layer_b = [[2.0, 3.0], [4.0, 5.0]]
+let grad_a = [[0.1, 0.1], [0.1, 0.1]]
+let grad_b = [[0.2, 0.2], [0.2, 0.2]]
+let st_a = shampoo_create_state(2, 2)
+let st_b = shampoo_create_state(2, 2)
+let mls = shampoo_multi_layer_step([layer_a, layer_b], [grad_a, grad_b], [st_a, st_b], 0.01)
+let new_layers = mls[0]
+let new_states = mls[1]
+check("T33 multi_layer preserves count", len(new_layers) == 2 && len(new_states) == 2)
+
+let layer_a_changed = fabs(new_layers[0][0][0] - layer_a[0][0]) > 1.0e-9 || fabs(new_layers[0][1][1] - layer_a[1][1]) > 1.0e-9
+let layer_b_changed = fabs(new_layers[1][0][0] - layer_b[0][0]) > 1.0e-9 || fabs(new_layers[1][1][1] - layer_b[1][1]) > 1.0e-9
+check("T34 multi_layer updates every layer", layer_a_changed && layer_b_changed)
+
+// ── T35: convergence on quadratic 0.5 * ||W||_F^2 ───────────
+let mut w = [[1.0, 2.0], [3.0, 4.0]]
+let loss0 = quad_loss(w, 2, 2)
+let mut cst = shampoo_create_state(2, 2)
+for _s in 0..30 {
+    let g = quad_grad(w, 2, 2)
+    let r = shampoo_step(cst, w, g, 2, 2, 0.2, 1.0e-6)
+    w = r[0]
+    cst = r[1]
+}
+let loss_n = quad_loss(w, 2, 2)
+check("T35 quadratic loss decreases", loss_n < loss0)
+
+// ── T36-T38: lr_warmup ──────────────────────────────────────
+check("T36 warmup step=0 -> 0", approx(shampoo_lr_warmup(0.1, 0, 10), 0.0, 1.0e-12))
+check("T37 warmup step>=warmup -> base", approx(shampoo_lr_warmup(0.1, 10, 10), 0.1, 1.0e-12) && approx(shampoo_lr_warmup(0.1, 15, 10), 0.1, 1.0e-12))
+check("T38 warmup midpoint = half", approx(shampoo_lr_warmup(0.1, 5, 10), 0.05, 1.0e-12))
+
+// ===================================================================
+//  Summary
+// ===================================================================
+println("")
+println("=== shampoo test summary ===")
+println("PASS: " + str(pass_count))
+println("FAIL: " + str(fail_count))
+println("TOTAL: " + str(pass_count + fail_count))

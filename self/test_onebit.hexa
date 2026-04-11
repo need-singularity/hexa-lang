@@ -1,0 +1,362 @@
+// ===================================================================
+//  test_onebit.hexa — OneBit 1-bit weight quantization tests (#218)
+//
+//  ML roadmap #218 — extreme quantization: 1 sign bit per weight plus
+//  per-row and per-column real-valued scale vectors (SVID).
+//
+//  Tests (35):
+//    #1  ob_sign(-0.5) = -1
+//    #2  ob_sign(0.5)  = +1
+//    #3  ob_sign(0)    = +1   (convention)
+//    #4  ob_sign matrix length
+//    #5  ob_sign matrix all in {-1,+1}
+//    #6  ob_sign matrix matches sign element-wise
+//    #7  ob_row_absmean length
+//    #8  ob_row_absmean non-negative
+//    #9  ob_row_absmean known value
+//    #10 ob_col_absmean length
+//    #11 ob_col_absmean non-negative
+//    #12 ob_col_absmean known value
+//    #13 svid_decompose sign shape
+//    #14 svid_decompose a length
+//    #15 svid_decompose b length
+//    #16 svid_decompose rows / cols carry
+//    #17 svid_reconstruct length
+//    #18 separable W: reconstruction exact
+//    #19 separable W: error == 0
+//    #20 generic W: error non-negative
+//    #21 generic W: error not NaN
+//    #22 ob_per_column_scale length
+//    #23 ob_per_column_scale broadcast
+//    #24 ob_per_row_scale length
+//    #25 ob_per_row_scale broadcast
+//    #26 svid_matmul output length
+//    #27 svid_matmul matches dense reconstruction (separable)
+//    #28 svid_matmul matches dense reconstruction (generic)
+//    #29 ob_layer_forward shape
+//    #30 ob_layer_forward equivalence with svid_matmul
+//    #31 ob_param_bytes formula
+//    #32 ob_param_bytes large matrix
+//    #33 ob_compression_ratio > 10x for large matrix
+//    #34 ob_compression_ratio guards zero
+//    #35 zero matrix decomposes safely
+//    #36 zero matrix reconstruction is zero
+//    #37 single-row matrix round-trip
+//
+//  Run: ./hexa self/test_onebit.hexa
+// ===================================================================
+
+import "ml/onebit.hexa"
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn t_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn t_max_err(a, b) {
+    let n = len(a)
+    let mut m = 0.0
+    let mut i = 0
+    while i < n {
+        let e = t_abs(a[i] - b[i])
+        if e > m { m = e }
+        i = i + 1
+    }
+    return m
+}
+
+// Dense reference matmul: y = W @ x where W is (rows, cols) row-major
+// and x has length cols. y has length rows. Mirrors the SVID forward.
+fn dense_mv(W, x, rows, cols) {
+    let mut out = []
+    let mut i = 0
+    while i < rows {
+        let mut acc = 0.0
+        let mut j = 0
+        while j < cols {
+            acc = acc + W[i * cols + j] * x[j]
+            j = j + 1
+        }
+        out = out + [acc]
+        i = i + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  Sign function (#1 #2 #3)
+// ===================================================================
+println("--- ob_sign ---")
+check("#1 ob_sign(-0.5) = -1", ob_sign(-0.5) == 0 - 1)
+check("#2 ob_sign(0.5)  = +1", ob_sign(0.5) == 1)
+check("#3 ob_sign(0)    = +1", ob_sign(0.0) == 1)
+
+// ===================================================================
+//  Sign matrix (#4 #5 #6)
+// ===================================================================
+println("--- ob_sign_matrix ---")
+
+let W_simple = [
+     0.3, -0.7,  0.1,
+    -0.4,  0.0,  0.9
+]
+let rows_s = 2
+let cols_s = 3
+let sm = ob_sign_matrix(W_simple, rows_s, cols_s)
+check("#4 sign matrix length", len(sm) == rows_s * cols_s)
+
+let mut all_in_set = true
+let mut idx = 0
+while idx < rows_s * cols_s {
+    let v = sm[idx]
+    if v != 1 {
+        if v != 0 - 1 { all_in_set = false }
+    }
+    idx = idx + 1
+}
+check("#5 sign matrix all in {-1,+1}", all_in_set)
+
+// Element-wise sanity:
+//   W[0]=+0.3 -> +1, W[1]=-0.7 -> -1, W[2]=+0.1 -> +1,
+//   W[3]=-0.4 -> -1, W[4]= 0.0 -> +1, W[5]=+0.9 -> +1
+let expected_sm = [1, 0 - 1, 1, 0 - 1, 1, 1]
+let mut signs_match = true
+let mut k_sm = 0
+while k_sm < 6 {
+    if sm[k_sm] != expected_sm[k_sm] { signs_match = false }
+    k_sm = k_sm + 1
+}
+check("#6 sign matrix element-wise", signs_match)
+
+// ===================================================================
+//  Row absmean (#7 #8 #9)
+// ===================================================================
+println("--- ob_row_absmean ---")
+
+let row_a = ob_row_absmean(W_simple, rows_s, cols_s)
+check("#7 row absmean length", len(row_a) == rows_s)
+
+let mut row_nonneg = true
+let mut ri = 0
+while ri < rows_s {
+    if row_a[ri] < 0.0 { row_nonneg = false }
+    ri = ri + 1
+}
+check("#8 row absmean non-negative", row_nonneg)
+
+// row 0: (|0.3|+|-0.7|+|0.1|)/3 = 1.1/3 ≈ 0.36667
+// row 1: (|-0.4|+|0.0|+|0.9|)/3 = 1.3/3 ≈ 0.43333
+check("#9 row absmean known values",
+    t_abs(row_a[0] - 0.36667) < 0.001 && t_abs(row_a[1] - 0.43333) < 0.001)
+
+// ===================================================================
+//  Column absmean (#10 #11 #12)
+// ===================================================================
+println("--- ob_col_absmean ---")
+
+let col_b = ob_col_absmean(W_simple, rows_s, cols_s)
+check("#10 col absmean length", len(col_b) == cols_s)
+
+let mut col_nonneg = true
+let mut ci = 0
+while ci < cols_s {
+    if col_b[ci] < 0.0 { col_nonneg = false }
+    ci = ci + 1
+}
+check("#11 col absmean non-negative", col_nonneg)
+
+// col 0: (|0.3|+|-0.4|)/2 = 0.7/2 = 0.35
+// col 1: (|-0.7|+|0.0|)/2 = 0.7/2 = 0.35
+// col 2: (|0.1|+|0.9|)/2  = 1.0/2 = 0.50
+check("#12 col absmean known values",
+    t_abs(col_b[0] - 0.35) < 0.001 && t_abs(col_b[1] - 0.35) < 0.001 && t_abs(col_b[2] - 0.50) < 0.001)
+
+// ===================================================================
+//  SVID decompose (#13 #14 #15 #16)
+// ===================================================================
+println("--- ob_svid_decompose ---")
+
+let pack = ob_svid_decompose(W_simple, rows_s, cols_s)
+check("#13 decompose sign shape", len(pack.sign_W) == rows_s * cols_s)
+check("#14 decompose a length", len(pack.a) == rows_s)
+check("#15 decompose b length", len(pack.b) == cols_s)
+check("#16 decompose carries shape", pack.rows == rows_s && pack.cols == cols_s)
+
+// ===================================================================
+//  SVID reconstruct (#17 #18 #19 #20 #21)
+// ===================================================================
+println("--- ob_svid_reconstruct ---")
+
+let approx = ob_svid_reconstruct(pack.sign_W, pack.a, pack.b, rows_s, cols_s)
+check("#17 reconstruct length", len(approx) == rows_s * cols_s)
+
+// Build a separable matrix W = sign * outer(a0, b0). Reconstruction
+// must be exact because the SVID normalization absorbs the global
+// scale: a[i]*b[j] = row_absmean[i] * col_absmean[j] / global_mean.
+let a0 = [0.4, 0.8, 0.2]
+let b0 = [0.5, 0.7, 0.3, 0.9]
+let signs0 = [
+     1, 0 - 1,  1, 0 - 1,
+    0 - 1,  1,  1,  1,
+     1,  1, 0 - 1,  1
+]
+let rows_p = 3
+let cols_p = 4
+
+let mut W_sep = []
+let mut pi = 0
+while pi < rows_p {
+    let mut pj = 0
+    while pj < cols_p {
+        let s = signs0[pi * cols_p + pj]
+        W_sep = W_sep + [to_float(s) * a0[pi] * b0[pj]]
+        pj = pj + 1
+    }
+    pi = pi + 1
+}
+
+let pack_sep = ob_svid_decompose(W_sep, rows_p, cols_p)
+let approx_sep = ob_svid_reconstruct(pack_sep.sign_W, pack_sep.a, pack_sep.b, rows_p, cols_p)
+let max_sep_err = t_max_err(W_sep, approx_sep)
+check("#18 separable reconstruction exact", max_sep_err < 0.0001)
+
+let err_sep = ob_svid_error(W_sep, approx_sep, rows_p, cols_p)
+check("#19 separable error == 0", err_sep < 0.0001)
+
+let err_simple = ob_svid_error(W_simple, approx, rows_s, cols_s)
+check("#20 generic error non-negative", err_simple >= 0.0)
+check("#21 generic error finite", err_simple < 1000.0)
+
+// ===================================================================
+//  Per-column / per-row scaling (#22 #23 #24 #25)
+// ===================================================================
+println("--- ob_per_column_scale / ob_per_row_scale ---")
+
+let xv = [1.0, 2.0, 3.0]
+let bv = [0.5, 0.25, 4.0]
+let scaled = ob_per_column_scale(xv, bv, 3)
+check("#22 per_column_scale length", len(scaled) == 3)
+check("#23 per_column_scale broadcast",
+    t_abs(scaled[0] - 0.5) < 0.0001 &&
+    t_abs(scaled[1] - 0.5) < 0.0001 &&
+    t_abs(scaled[2] - 12.0) < 0.0001)
+
+let yv = [10.0, 20.0]
+let av = [0.1, 2.0]
+let yscaled = ob_per_row_scale(yv, av, 2)
+check("#24 per_row_scale length", len(yscaled) == 2)
+check("#25 per_row_scale broadcast",
+    t_abs(yscaled[0] - 1.0) < 0.0001 &&
+    t_abs(yscaled[1] - 40.0) < 0.0001)
+
+// ===================================================================
+//  SVID matmul (#26 #27 #28)
+// ===================================================================
+println("--- ob_svid_matmul ---")
+
+let x_sep = [0.6, -0.4, 0.2, 0.8]
+let y_svid_sep = ob_svid_matmul(pack_sep.sign_W, pack_sep.a, pack_sep.b, x_sep, rows_p, cols_p)
+check("#26 svid_matmul length", len(y_svid_sep) == rows_p)
+
+// Reference: dense matmul with the reconstructed (≈ original) matrix.
+let y_dense_sep = dense_mv(W_sep, x_sep, rows_p, cols_p)
+let mm_sep_err = t_max_err(y_svid_sep, y_dense_sep)
+check("#27 svid_matmul == dense (separable)", mm_sep_err < 0.0001)
+
+// Generic case: matmul should match dense_mv on the *reconstructed*
+// approximation, not the original W. The shortcut is mathematically
+// identical to dense_mv(reconstruct(pack), x).
+let x_gen = [0.5, -0.25, 0.1]
+let y_svid_gen = ob_svid_matmul(pack.sign_W, pack.a, pack.b, x_gen, rows_s, cols_s)
+let y_dense_gen = dense_mv(approx, x_gen, rows_s, cols_s)
+let mm_gen_err = t_max_err(y_svid_gen, y_dense_gen)
+check("#28 svid_matmul == dense (reconstructed)", mm_gen_err < 0.0001)
+
+// ===================================================================
+//  ob_layer_forward (#29 #30)
+// ===================================================================
+println("--- ob_layer_forward ---")
+
+let y_layer = ob_layer_forward(pack_sep.sign_W, pack_sep.a, pack_sep.b, x_sep, rows_p, cols_p)
+check("#29 layer_forward length", len(y_layer) == rows_p)
+let layer_err = t_max_err(y_layer, y_svid_sep)
+check("#30 layer_forward == svid_matmul", layer_err < 0.0000001)
+
+// ===================================================================
+//  Param bytes / compression (#31 #32 #33 #34)
+// ===================================================================
+println("--- ob_param_bytes / ob_compression_ratio ---")
+
+// Small matrix: 8x8 -> 64 sign bits = 8 bytes; scales = 4*(8+8) = 64.
+// total = 72.
+let pb_small = ob_param_bytes(8, 8)
+check("#31 param_bytes 8x8", pb_small == 72)
+
+// Large matrix: 4096x4096 -> 4096*4096/8 = 2097152 sign bytes,
+// scales = 4*(4096+4096) = 32768. Total = 2129920.
+let pb_large = ob_param_bytes(4096, 4096)
+let expected_large = (4096 * 4096) / 8 + 4 * (4096 + 4096)
+check("#32 param_bytes 4096x4096", pb_large == expected_large)
+
+// FP32 baseline: 4 * rows * cols.
+let fp32_large = 4 * 4096 * 4096
+let ratio_large = ob_compression_ratio(fp32_large, pb_large)
+check("#33 compression > 10x for large matrix", ratio_large > 10.0)
+
+// Defensive: ob_bytes <= 0 must not blow up.
+let ratio_zero = ob_compression_ratio(1024, 0)
+check("#34 compression guards zero", ratio_zero == 0.0)
+
+// ===================================================================
+//  Edge cases: zero matrix + single row (#35 #36 #37)
+// ===================================================================
+println("--- edge cases ---")
+
+let W_zero = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+let pack_zero = ob_svid_decompose(W_zero, 2, 3)
+check("#35 zero matrix decomposes safely",
+    len(pack_zero.sign_W) == 6 && len(pack_zero.a) == 2 && len(pack_zero.b) == 3)
+
+let approx_zero = ob_svid_reconstruct(pack_zero.sign_W, pack_zero.a, pack_zero.b, 2, 3)
+let mut zero_recon = true
+let mut zi = 0
+while zi < 6 {
+    if t_abs(approx_zero[zi]) > 0.0001 { zero_recon = false }
+    zi = zi + 1
+}
+check("#36 zero matrix reconstruction is zero", zero_recon)
+
+// Single-row matrix: rows=1 makes the row vector trivially
+// rank-1 separable, so SVID round-trip is exact regardless of values.
+let W_single_row = [0.5, -0.3, 0.8, -0.2]
+let pack_sr = ob_svid_decompose(W_single_row, 1, 4)
+let approx_sr = ob_svid_reconstruct(pack_sr.sign_W, pack_sr.a, pack_sr.b, 1, 4)
+let sr_err = t_max_err(W_single_row, approx_sr)
+check("#37 single-row matrix round-trip", sr_err < 0.0001)
+
+// ===================================================================
+//  Summary
+// ===================================================================
+println("")
+println("=== onebit tests ===")
+println("PASS: " + str(pass_count))
+println("FAIL: " + str(fail_count))
+println("TOTAL: " + str(pass_count + fail_count))
+if fail_count == 0 {
+    println("ALL TESTS PASSED")
+} else {
+    println("SOME TESTS FAILED")
+}

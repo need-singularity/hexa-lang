@@ -1,0 +1,776 @@
+// ===================================================================
+//  self/ml/gpu_continuous_batch.hexa — vLLM-style GPU Continuous Batching
+//
+//  Iteration-level scheduling with GPU paged-KV-cache (H100 friendly).
+//  Fuses two ingredients into a single serving path:
+//    1. GPU KV page allocator — per-request block tables
+//       (baseline: self/ml/paged_attention.hexa)
+//    2. Iteration-level scheduler — prefill/decode phase split
+//       (baseline: self/ml/continuous_batching.hexa)
+//
+//  Public API:
+//    gcb_create(max_batch, num_blocks, block_size, head_dim)
+//    gcb_add_request(s, prompt_tokens, max_new)     -- enqueue
+//    gcb_run_iteration(s, model)                    -- one step
+//    gcb_run_until_done(s, model, max_iters)
+//    gcb_prefill_phase(s, model)                    -- phase-0 only
+//    gcb_decode_phase(s, model)                     -- phase-1 only
+//    gcb_remove_request(s, rid)                     -- abort / evict
+//    gcb_stats(s)                                   -- [pending, running,
+//                                                        waiting, done,
+//                                                        used_blocks,
+//                                                        free_blocks,
+//                                                        tokens]
+//    gcb_get_completed(s)
+//
+//  Key properties:
+//    * page allocator is shared across all in-flight requests
+//    * prefill returns a request that still owns >=1 block
+//    * decode appends one token per active slot per iteration
+//    * OOM on block alloc -> request stays "waiting" (backpressure)
+//    * removal frees all its physical blocks
+//
+//  AI-NATIVE:
+//    @hot     prefill/decode forward
+//    @parallel across request slots (independent)
+//    @pure    math kernels
+// ===================================================================
+
+import "ml/paged_attention.hexa"
+
+// ── phase constants ─────────────────────────────────────────────
+// 0 = queued (pending), 1 = waiting-for-blocks, 2 = prefill,
+// 3 = decode, 4 = finished
+fn gcb_phase_queued()   { return 0 }
+fn gcb_phase_waiting()  { return 1 }
+fn gcb_phase_prefill()  { return 2 }
+fn gcb_phase_decode()   { return 3 }
+fn gcb_phase_done()     { return 4 }
+
+// ===================================================================
+//  GcbRequest — per-request state with its own logical block list
+// ===================================================================
+struct GcbRequest {
+    rid: int,
+    prompt: array,
+    prompt_len: int,
+    max_new: int,
+    generated: int,
+    output_ids: array,
+    logical_blocks: array, // array of physical block ids owned by this req
+    n_tokens_cached: int,  // number of KV tokens written to its own blocks
+    cur_token: int,
+    phase: int
+}
+
+// ===================================================================
+//  GcbScheduler — scheduler + GPU block pool + per-req storage
+// ===================================================================
+struct GcbScheduler {
+    max_batch: int,
+    block_size: int,
+    head_dim: int,
+    pool: BlockTable,        // free_list + ref counts
+    kv_blocks: array,        // simulated GPU storage, indexed by phys_id
+    pending: array,          // enqueued, not yet running
+    running: array,          // currently in prefill or decode
+    completed: array,
+    next_rid: int,
+    iterations: int,
+    tokens_generated: int
+}
+
+// ===================================================================
+//  Pool constructor — wraps paged_attention block allocator.
+//  We reuse the `BlockTable.free_list` but keep per-request mappings
+//  in each GcbRequest (BlockTable.mapping is left empty to avoid
+//  global conflict).
+// ===================================================================
+fn gcb_make_pool(num_blocks, block_size) {
+    return create_block_table(num_blocks, block_size)
+}
+
+fn gcb_make_storage(num_blocks, block_size, head_dim) {
+    return create_kv_blocks(num_blocks, block_size, head_dim)
+}
+
+// ── alloc one block from the shared pool ───────────────────────
+// pitfall: use allocate_block → pop a phys_id. `mapping` is appended
+// for bookkeeping but we clear it afterwards to keep req-local blocks.
+fn gcb_alloc_one(pool) {
+    let res = allocate_block(pool)
+    let p2  = res[0]
+    let pid = res[1]
+    if pid < 0 {
+        return [pool, -1]
+    }
+    // scrub appended mapping so it stays req-local
+    let mut clean_mapping = []
+    let n = len(p2.mapping) - 1
+    let mut i = 0
+    while i < n {
+        clean_mapping = clean_mapping + [p2.mapping[i]]
+        i = i + 1
+    }
+    let scrub = BlockTable {
+        mapping: clean_mapping,
+        free_list: p2.free_list,
+        ref_count: p2.ref_count,
+        cow_flag: p2.cow_flag,
+        num_blocks: p2.num_blocks,
+        block_size: p2.block_size
+    }
+    return [scrub, pid]
+}
+
+// ── free a list of physical blocks back to the pool ───────────
+fn gcb_free_blocks(pool, block_ids) {
+    let mut p = pool
+    let n = len(block_ids)
+    let mut i = 0
+    while i < n {
+        p = free_block(p, block_ids[i])
+        i = i + 1
+    }
+    return p
+}
+
+// ===================================================================
+//  Constructor
+// ===================================================================
+fn gcb_create(max_batch, num_blocks, block_size, head_dim) {
+    let pool = gcb_make_pool(num_blocks, block_size)
+    let store = gcb_make_storage(num_blocks, block_size, head_dim)
+    return GcbScheduler {
+        max_batch: max_batch,
+        block_size: block_size,
+        head_dim: head_dim,
+        pool: pool,
+        kv_blocks: store,
+        pending: [],
+        running: [],
+        completed: [],
+        next_rid: 0,
+        iterations: 0,
+        tokens_generated: 0
+    }
+}
+
+// ===================================================================
+//  Add request (prompt_tokens is array<int>)
+// ===================================================================
+fn gcb_add_request(s, prompt_tokens, max_new) {
+    let req = GcbRequest {
+        rid: s.next_rid,
+        prompt: prompt_tokens,
+        prompt_len: len(prompt_tokens),
+        max_new: max_new,
+        generated: 0,
+        output_ids: [],
+        logical_blocks: [],
+        n_tokens_cached: 0,
+        cur_token: 0,
+        phase: gcb_phase_queued()
+    }
+    return GcbScheduler {
+        max_batch: s.max_batch,
+        block_size: s.block_size,
+        head_dim: s.head_dim,
+        pool: s.pool,
+        kv_blocks: s.kv_blocks,
+        pending: s.pending + [req],
+        running: s.running,
+        completed: s.completed,
+        next_rid: s.next_rid + 1,
+        iterations: s.iterations,
+        tokens_generated: s.tokens_generated
+    }
+}
+
+// ===================================================================
+//  Admission: try to move pending -> running while free slots exist.
+//  A newly admitted request enters `prefill` phase but has NO blocks
+//  yet; prefill_phase will materialise them.
+// ===================================================================
+fn gcb_admit(s) {
+    let n_run = len(s.running)
+    let mut free_slots = s.max_batch - n_run
+    if free_slots <= 0 {
+        return s
+    }
+    let mut new_running = s.running
+    let mut new_pending = []
+    let mut admitted = 0
+    let n_pend = len(s.pending)
+    let mut i = 0
+    while i < n_pend {
+        if admitted < free_slots {
+            let p = s.pending[i]
+            let promo = GcbRequest {
+                rid: p.rid,
+                prompt: p.prompt,
+                prompt_len: p.prompt_len,
+                max_new: p.max_new,
+                generated: p.generated,
+                output_ids: p.output_ids,
+                logical_blocks: p.logical_blocks,
+                n_tokens_cached: p.n_tokens_cached,
+                cur_token: p.cur_token,
+                phase: gcb_phase_prefill()
+            }
+            new_running = new_running + [promo]
+            admitted = admitted + 1
+        } else {
+            new_pending = new_pending + [s.pending[i]]
+        }
+        i = i + 1
+    }
+    return GcbScheduler {
+        max_batch: s.max_batch,
+        block_size: s.block_size,
+        head_dim: s.head_dim,
+        pool: s.pool,
+        kv_blocks: s.kv_blocks,
+        pending: new_pending,
+        running: new_running,
+        completed: s.completed,
+        next_rid: s.next_rid,
+        iterations: s.iterations,
+        tokens_generated: s.tokens_generated
+    }
+}
+
+// ===================================================================
+//  Compute how many logical blocks a request needs to hold `tokens`
+// ===================================================================
+fn gcb_blocks_needed(tokens, block_size) {
+    if tokens <= 0 { return 0 }
+    let q = tokens / block_size
+    let r = tokens - q * block_size
+    if r > 0 { return q + 1 }
+    return q
+}
+
+// ===================================================================
+//  Ensure a running request has enough blocks to cache `target` tokens.
+//  Returns [new_pool, new_req, ok_flag].
+//  If allocator is out of blocks the request is moved to `waiting`
+//  phase and ok_flag=0 (caller should NOT advance it this step).
+// ===================================================================
+fn gcb_ensure_blocks(pool, req, target, block_size) {
+    let need = gcb_blocks_needed(target, block_size)
+    let have = len(req.logical_blocks)
+    if need <= have {
+        return [pool, req, 1]
+    }
+    let mut p = pool
+    let mut blocks = req.logical_blocks
+    let mut i = have
+    let mut ok = 1
+    while i < need {
+        let alloc_res = gcb_alloc_one(p)
+        p = alloc_res[0]
+        let pid = alloc_res[1]
+        if pid < 0 {
+            ok = 0
+            i = need  // break
+        } else {
+            blocks = blocks + [pid]
+            i = i + 1
+        }
+    }
+    let new_phase = req.phase
+    let phase_if_oom = gcb_phase_waiting()
+    let mut final_phase = new_phase
+    if ok == 0 { final_phase = phase_if_oom }
+    let nr = GcbRequest {
+        rid: req.rid,
+        prompt: req.prompt,
+        prompt_len: req.prompt_len,
+        max_new: req.max_new,
+        generated: req.generated,
+        output_ids: req.output_ids,
+        logical_blocks: blocks,
+        n_tokens_cached: req.n_tokens_cached,
+        cur_token: req.cur_token,
+        phase: final_phase
+    }
+    return [p, nr, ok]
+}
+
+// ===================================================================
+//  Write a single token's KV into the request's own block pages.
+//  pos = absolute token position [0..prompt_len+generated).
+//  Returns updated [kv_blocks, req].
+//
+//  For this CPU-sim path we derive K,V deterministically from the
+//  token id so tests are reproducible. On GPU this becomes a D2D
+//  copy into the paged buffers (see gpu_kv_cache_append).
+// ===================================================================
+fn gcb_make_kv_from_token(token_id, head_dim) {
+    let mut k = []
+    let mut v = []
+    let mut d = 0
+    while d < head_dim {
+        let kf = (token_id * 3 + d * 7) % 97
+        let vf = (token_id * 5 + d * 11) % 89
+        k = k + [kf * 1.0 / 100.0]
+        v = v + [vf * 1.0 / 100.0]
+        d = d + 1
+    }
+    return [k, v]
+}
+
+fn gcb_write_token_kv(kv_blocks, req, pos, token_id, block_size, head_dim) {
+    let logical_blk = pos / block_size
+    let pos_in_blk  = pos - logical_blk * block_size
+    if logical_blk >= len(req.logical_blocks) {
+        // caller contract: blocks must be allocated in advance
+        return [kv_blocks, req]
+    }
+    let phys = req.logical_blocks[logical_blk]
+    let kv = gcb_make_kv_from_token(token_id, head_dim)
+    let k_vec = kv[0]
+    let v_vec = kv[1]
+    let new_blocks = write_kv_to_block(kv_blocks, phys, pos_in_blk, k_vec, v_vec, head_dim)
+    let new_req = GcbRequest {
+        rid: req.rid,
+        prompt: req.prompt,
+        prompt_len: req.prompt_len,
+        max_new: req.max_new,
+        generated: req.generated,
+        output_ids: req.output_ids,
+        logical_blocks: req.logical_blocks,
+        n_tokens_cached: req.n_tokens_cached + 1,
+        cur_token: req.cur_token,
+        phase: req.phase
+    }
+    return [new_blocks, new_req]
+}
+
+// ===================================================================
+//  PREFILL PHASE — write all prompt tokens into the request's pages.
+//  On success the req transitions to decode phase.
+//  On partial OOM the req remains in `prefill` and keeps already
+//  written tokens; next iter retries the rest.
+//
+//  model param is reserved for a real forward pass; this module
+//  focuses on the scheduler + page dataflow.
+// ===================================================================
+fn gcb_prefill_one(pool, kv_blocks, req, block_size, head_dim) {
+    if req.phase == gcb_phase_done() {
+        return [pool, kv_blocks, req]
+    }
+    if req.phase != gcb_phase_prefill() {
+        if req.phase != gcb_phase_waiting() {
+            return [pool, kv_blocks, req]
+        }
+    }
+    // ensure enough blocks for the full prompt
+    let ensure = gcb_ensure_blocks(pool, req, req.prompt_len, block_size)
+    let pool2 = ensure[0]
+    let mut r = ensure[1]
+    let ok = ensure[2]
+    // write tokens we haven't written yet
+    let mut kvb = kv_blocks
+    let mut pos = r.n_tokens_cached
+    while pos < r.prompt_len {
+        let needed_blk = pos / block_size + 1
+        if needed_blk > len(r.logical_blocks) {
+            pos = r.prompt_len
+        } else {
+            let token = r.prompt[pos]
+            let w = gcb_write_token_kv(kvb, r, pos, token, block_size, head_dim)
+            kvb = w[0]
+            r = w[1]
+            pos = pos + 1
+        }
+    }
+    // phase transition
+    let mut next_phase = r.phase
+    if r.n_tokens_cached >= r.prompt_len {
+        next_phase = gcb_phase_decode()
+    } else {
+        if ok == 0 {
+            next_phase = gcb_phase_waiting()
+        }
+    }
+    let r2 = GcbRequest {
+        rid: r.rid,
+        prompt: r.prompt,
+        prompt_len: r.prompt_len,
+        max_new: r.max_new,
+        generated: r.generated,
+        output_ids: r.output_ids,
+        logical_blocks: r.logical_blocks,
+        n_tokens_cached: r.n_tokens_cached,
+        cur_token: r.cur_token,
+        phase: next_phase
+    }
+    return [pool2, kvb, r2]
+}
+
+// ===================================================================
+//  DECODE PHASE — produce one new token for a request.
+//  1. allocate a block if needed (may OOM -> waiting)
+//  2. synthesise next token from its state (deterministic sim)
+//  3. write its KV into the new slot
+// ===================================================================
+fn gcb_sim_next_token(req) {
+    let base = req.prompt_len * 11 + req.generated * 17
+    let last = req.cur_token
+    let tok = (base + last * 3) % 94 + 33
+    return tok
+}
+
+fn gcb_is_eos(token_id) {
+    if token_id == 2 { return true }
+    return false
+}
+
+fn gcb_decode_one(pool, kv_blocks, req, block_size, head_dim) {
+    if req.phase == gcb_phase_done() {
+        return [pool, kv_blocks, req]
+    }
+    if req.phase != gcb_phase_decode() {
+        if req.phase != gcb_phase_waiting() {
+            return [pool, kv_blocks, req]
+        }
+    }
+    let target_tokens = req.prompt_len + req.generated + 1
+    let ensure = gcb_ensure_blocks(pool, req, target_tokens, block_size)
+    let pool2 = ensure[0]
+    let r = ensure[1]
+    let ok = ensure[2]
+    if ok == 0 {
+        // still waiting for blocks — no progress, stay in waiting
+        return [pool2, kv_blocks, r]
+    }
+    let tok = gcb_sim_next_token(r)
+    let pos = r.prompt_len + r.generated
+    let w = gcb_write_token_kv(kv_blocks, r, pos, tok, block_size, head_dim)
+    let kvb2 = w[0]
+    let r_after_write = w[1]
+    let r2 = GcbRequest {
+        rid: r_after_write.rid,
+        prompt: r_after_write.prompt,
+        prompt_len: r_after_write.prompt_len,
+        max_new: r_after_write.max_new,
+        generated: r_after_write.generated + 1,
+        output_ids: r_after_write.output_ids + [tok],
+        logical_blocks: r_after_write.logical_blocks,
+        n_tokens_cached: r_after_write.n_tokens_cached,
+        cur_token: tok,
+        phase: gcb_phase_decode()
+    }
+    // retirement check
+    let mut final_req = r2
+    if final_req.generated >= final_req.max_new {
+        final_req = GcbRequest {
+            rid: r2.rid,
+            prompt: r2.prompt,
+            prompt_len: r2.prompt_len,
+            max_new: r2.max_new,
+            generated: r2.generated,
+            output_ids: r2.output_ids,
+            logical_blocks: r2.logical_blocks,
+            n_tokens_cached: r2.n_tokens_cached,
+            cur_token: r2.cur_token,
+            phase: gcb_phase_done()
+        }
+    } else {
+        if gcb_is_eos(tok) {
+            final_req = GcbRequest {
+                rid: r2.rid,
+                prompt: r2.prompt,
+                prompt_len: r2.prompt_len,
+                max_new: r2.max_new,
+                generated: r2.generated,
+                output_ids: r2.output_ids,
+                logical_blocks: r2.logical_blocks,
+                n_tokens_cached: r2.n_tokens_cached,
+                cur_token: r2.cur_token,
+                phase: gcb_phase_done()
+            }
+        }
+    }
+    return [pool2, kvb2, final_req]
+}
+
+// ===================================================================
+//  Prefill phase — scan running list once, upgrade any req
+//  that is in `prefill` or `waiting`.
+// ===================================================================
+fn gcb_prefill_phase(s, model) {
+    let mut pool = s.pool
+    let mut kvb  = s.kv_blocks
+    let mut out  = []
+    let mut i = 0
+    let n = len(s.running)
+    while i < n {
+        let r = s.running[i]
+        if r.phase == gcb_phase_prefill() {
+            let step = gcb_prefill_one(pool, kvb, r, s.block_size, s.head_dim)
+            pool = step[0]
+            kvb  = step[1]
+            out  = out + [step[2]]
+        } else {
+            if r.phase == gcb_phase_waiting() {
+                if r.n_tokens_cached < r.prompt_len {
+                    let step2 = gcb_prefill_one(pool, kvb, r, s.block_size, s.head_dim)
+                    pool = step2[0]
+                    kvb  = step2[1]
+                    out  = out + [step2[2]]
+                } else {
+                    out = out + [r]
+                }
+            } else {
+                out = out + [r]
+            }
+        }
+        i = i + 1
+    }
+    return GcbScheduler {
+        max_batch: s.max_batch,
+        block_size: s.block_size,
+        head_dim: s.head_dim,
+        pool: pool,
+        kv_blocks: kvb,
+        pending: s.pending,
+        running: out,
+        completed: s.completed,
+        next_rid: s.next_rid,
+        iterations: s.iterations,
+        tokens_generated: s.tokens_generated
+    }
+}
+
+// ===================================================================
+//  Decode phase — each running req in decode/waiting produces 1 token.
+// ===================================================================
+fn gcb_decode_phase(s, model) {
+    let mut pool = s.pool
+    let mut kvb  = s.kv_blocks
+    let mut out  = []
+    let mut tokens = 0
+    let mut i = 0
+    let n = len(s.running)
+    while i < n {
+        let r = s.running[i]
+        let before = r.generated
+        let is_decode = r.phase == gcb_phase_decode()
+        let is_waiting_decoded = false
+        let need_decode = is_decode || (r.phase == gcb_phase_waiting() && r.n_tokens_cached >= r.prompt_len)
+        if need_decode {
+            let step = gcb_decode_one(pool, kvb, r, s.block_size, s.head_dim)
+            pool = step[0]
+            kvb  = step[1]
+            let r_after = step[2]
+            out  = out + [r_after]
+            if r_after.generated > before {
+                tokens = tokens + 1
+            }
+        } else {
+            out = out + [r]
+        }
+        i = i + 1
+    }
+    return GcbScheduler {
+        max_batch: s.max_batch,
+        block_size: s.block_size,
+        head_dim: s.head_dim,
+        pool: pool,
+        kv_blocks: kvb,
+        pending: s.pending,
+        running: out,
+        completed: s.completed,
+        next_rid: s.next_rid,
+        iterations: s.iterations,
+        tokens_generated: s.tokens_generated + tokens
+    }
+}
+
+// ===================================================================
+//  Retire finished requests — free their blocks, move to completed.
+// ===================================================================
+fn gcb_retire(s) {
+    let mut pool = s.pool
+    let mut still = []
+    let mut done  = s.completed
+    let mut i = 0
+    let n = len(s.running)
+    while i < n {
+        let r = s.running[i]
+        if r.phase == gcb_phase_done() {
+            pool = gcb_free_blocks(pool, r.logical_blocks)
+            done = done + [r]
+        } else {
+            still = still + [r]
+        }
+        i = i + 1
+    }
+    return GcbScheduler {
+        max_batch: s.max_batch,
+        block_size: s.block_size,
+        head_dim: s.head_dim,
+        pool: pool,
+        kv_blocks: s.kv_blocks,
+        pending: s.pending,
+        running: still,
+        completed: done,
+        next_rid: s.next_rid,
+        iterations: s.iterations,
+        tokens_generated: s.tokens_generated
+    }
+}
+
+// ===================================================================
+//  Full iteration: admit -> prefill -> decode -> retire
+//  (vLLM-style single scheduling step).
+// ===================================================================
+@hot
+fn gcb_run_iteration(s, model) {
+    let s1 = gcb_admit(s)
+    let s2 = gcb_prefill_phase(s1, model)
+    let s3 = gcb_decode_phase(s2, model)
+    let s4 = gcb_retire(s3)
+    return GcbScheduler {
+        max_batch: s4.max_batch,
+        block_size: s4.block_size,
+        head_dim: s4.head_dim,
+        pool: s4.pool,
+        kv_blocks: s4.kv_blocks,
+        pending: s4.pending,
+        running: s4.running,
+        completed: s4.completed,
+        next_rid: s4.next_rid,
+        iterations: s4.iterations + 1,
+        tokens_generated: s4.tokens_generated
+    }
+}
+
+// ===================================================================
+//  Run until everything is done, bounded by max_iters.
+// ===================================================================
+fn gcb_run_until_done(s, model, max_iters) {
+    let mut cur = s
+    let mut it = 0
+    while it < max_iters {
+        let n_run = len(cur.running)
+        let n_pen = len(cur.pending)
+        if n_run == 0 {
+            if n_pen == 0 {
+                return cur
+            }
+        }
+        cur = gcb_run_iteration(cur, model)
+        it = it + 1
+    }
+    return cur
+}
+
+// ===================================================================
+//  Abort / evict a request by rid — frees its blocks.
+//  Scans pending + running and removes matching entry.
+// ===================================================================
+fn gcb_remove_request(s, rid) {
+    let mut new_pending = []
+    let mut i = 0
+    let np = len(s.pending)
+    while i < np {
+        let r = s.pending[i]
+        if r.rid != rid {
+            new_pending = new_pending + [r]
+        }
+        i = i + 1
+    }
+    let mut new_running = []
+    let mut pool = s.pool
+    i = 0
+    let nr = len(s.running)
+    while i < nr {
+        let r = s.running[i]
+        if r.rid != rid {
+            new_running = new_running + [r]
+        } else {
+            pool = gcb_free_blocks(pool, r.logical_blocks)
+        }
+        i = i + 1
+    }
+    return GcbScheduler {
+        max_batch: s.max_batch,
+        block_size: s.block_size,
+        head_dim: s.head_dim,
+        pool: pool,
+        kv_blocks: s.kv_blocks,
+        pending: new_pending,
+        running: new_running,
+        completed: s.completed,
+        next_rid: s.next_rid,
+        iterations: s.iterations,
+        tokens_generated: s.tokens_generated
+    }
+}
+
+// ===================================================================
+//  Introspection helpers
+// ===================================================================
+fn gcb_waiting_count(s) {
+    let mut c = 0
+    let mut i = 0
+    let n = len(s.running)
+    while i < n {
+        if s.running[i].phase == gcb_phase_waiting() { c = c + 1 }
+        i = i + 1
+    }
+    return c
+}
+
+fn gcb_used_blocks(s) {
+    return num_used_blocks(s.pool)
+}
+
+fn gcb_free_blocks_count(s) {
+    return num_free_blocks(s.pool)
+}
+
+fn gcb_stats(s) {
+    return [
+        len(s.pending),
+        len(s.running),
+        gcb_waiting_count(s),
+        len(s.completed),
+        gcb_used_blocks(s),
+        gcb_free_blocks_count(s),
+        s.tokens_generated
+    ]
+}
+
+fn gcb_get_completed(s) {
+    return s.completed
+}
+
+fn gcb_find_running(s, rid) {
+    let mut i = 0
+    let n = len(s.running)
+    while i < n {
+        if s.running[i].rid == rid {
+            return s.running[i]
+        }
+        i = i + 1
+    }
+    return GcbRequest {
+        rid: -1,
+        prompt: [],
+        prompt_len: 0,
+        max_new: 0,
+        generated: 0,
+        output_ids: [],
+        logical_blocks: [],
+        n_tokens_cached: 0,
+        cur_token: 0,
+        phase: -1
+    }
+}
+
+println("[gpu_continuous_batch] loaded — vLLM-style GPU scheduler (paged KV + prefill/decode split)")

@@ -1,0 +1,443 @@
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/soft_prompt.hexa — Soft Prompt Tuning (#79)
+//
+//  Prompt Tuning (Lester et al. 2021):
+//    learn a small [P x d] continuous prompt embedding per task,
+//    prepend it to the input embedding, keep the backbone frozen.
+//    Only the prompt is trained → PEFT param count = P*d (<<1% of full).
+//
+//  Features:
+//    1. Learned prompt embedding parameter [P x d]
+//    2. Frozen backbone forward (prompt prepended)
+//    3. Prompt gradient (only prompt trains)
+//    4. Task-specific prompt pool (multi-task switching)
+//    5. Initialization from vocab (seed / random / copy)
+//    6. SGD + mean-pooled loss
+//
+//  API:
+//    sp_init_prompt(P, d, seed)            -> [P x d]
+//    sp_zero_prompt(P, d)                   -> [P x d]
+//    sp_create_pool(n_tasks, P, d, seed)    -> SoftPromptPool
+//    sp_get_prompt(pool, task_id)           -> [P x d]
+//    sp_set_prompt(pool, task_id, prompt)   -> SoftPromptPool
+//    sp_prepend(prompt, input_embed)        -> [(P+L) x d]
+//    sp_forward(prompt, input_embed, W, b)  -> SoftPromptOutput
+//    sp_loss_mse(output, target)            -> float
+//    sp_loss_grad_mse(output, target)       -> [m]
+//    sp_backward(prompt, dL_dhidden, P, d)  -> [P x d] (prompt grad only)
+//    sp_sgd_update(prompt, grad, lr, P, d)  -> [P x d]
+//    sp_train_step(pool, task_id, input_embed, target, W, b, lr) -> (new_pool, loss)
+//    sp_param_count(P, d)                   -> int
+//    sp_param_ratio(P, d, backbone_params)  -> float
+//
+//  Memory pitfalls:
+//    - backbone (W, b) are frozen → NEVER call sgd_update on them
+//    - prompt is [P x d] 2D array; use deterministic LCG init (no rand state leak)
+//    - gradient only flows through prompt rows (pool[0..P])
+//    - pool returns new struct on set (immutable update pattern)
+//
+//  L0 금지: src/*.rs 미접촉. 순수 .hexa.
+//  HX3 pitfalls 확인: 세미콜론X, 배열 push = arr + [x], struct literal 2칸 들여쓰기.
+// ═══════════════════════════════════════════════════════════════
+
+// ── Math helpers ─────────────────────────────────────────────
+@pure
+fn _sp_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+@pure
+fn _sp_max_i(a, b) {
+    if a >= b { return a }
+    return b
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Structs
+// ═══════════════════════════════════════════════════════════════
+
+// Soft prompt output — hidden states over (P + L) positions
+struct SoftPromptOutput {
+    hidden: array,      // [(P+L) x m] — m = backbone out_dim
+    prompt_len: int,    // P
+    input_len: int,     // L
+    dim: int            // d (embed dim)
+}
+
+// Per-task prompt pool
+struct SoftPromptPool {
+    n_tasks: int,
+    prompt_len: int,    // P
+    dim: int,           // d
+    prompts: array      // [n_tasks][P][d]
+}
+
+// Training result
+struct SoftPromptStep {
+    pool: SoftPromptPool,
+    loss: float,
+    grad_norm: float
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Init helpers
+// ═══════════════════════════════════════════════════════════════
+
+// Deterministic LCG init for a [P x d] prompt (small values, no NaN)
+fn sp_init_prompt(P, d, seed) {
+    let mut s = seed
+    if s <= 0 { s = 1 }
+    let mut prompt = []
+    let mut i = 0
+    while i < P {
+        let mut row = []
+        let mut j = 0
+        while j < d {
+            s = (s * 1103515245 + 12345) % 2147483647
+            let v = (to_float(s % 2000) - 1000.0) / 10000.0
+            row = row + [v]
+            j = j + 1
+        }
+        prompt = prompt + [row]
+        i = i + 1
+    }
+    return prompt
+}
+
+// Zero prompt (useful for unit tests)
+fn sp_zero_prompt(P, d) {
+    let mut prompt = []
+    let mut i = 0
+    while i < P {
+        let mut row = []
+        let mut j = 0
+        while j < d {
+            row = row + [0.0]
+            j = j + 1
+        }
+        prompt = prompt + [row]
+        i = i + 1
+    }
+    return prompt
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Task-specific prompt pool
+// ═══════════════════════════════════════════════════════════════
+
+fn sp_create_pool(n_tasks, P, d, seed) {
+    let mut prompts = []
+    let mut t = 0
+    while t < n_tasks {
+        // each task gets a different seed slice to avoid collision
+        let task_seed = seed + t * 7919
+        prompts = prompts + [sp_init_prompt(P, d, task_seed)]
+        t = t + 1
+    }
+    return SoftPromptPool {
+        n_tasks: n_tasks,
+        prompt_len: P,
+        dim: d,
+        prompts: prompts
+    }
+}
+
+fn sp_get_prompt(pool: SoftPromptPool, task_id) {
+    if task_id < 0 { return pool.prompts[0] }
+    if task_id >= pool.n_tasks { return pool.prompts[pool.n_tasks - 1] }
+    return pool.prompts[task_id]
+}
+
+// Immutable update — return new pool with prompt replaced
+fn sp_set_prompt(pool: SoftPromptPool, task_id, new_prompt) {
+    let mut new_prompts = []
+    let mut i = 0
+    while i < pool.n_tasks {
+        if i == task_id {
+            new_prompts = new_prompts + [new_prompt]
+        } else {
+            new_prompts = new_prompts + [pool.prompts[i]]
+        }
+        i = i + 1
+    }
+    return SoftPromptPool {
+        n_tasks: pool.n_tasks,
+        prompt_len: pool.prompt_len,
+        dim: pool.dim,
+        prompts: new_prompts
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Prepend: concatenate prompt [P x d] with input_embed [L x d]
+//  Result: [(P+L) x d]
+// ═══════════════════════════════════════════════════════════════
+
+@hot
+fn sp_prepend(prompt, input_embed) {
+    let P = len(prompt)
+    let L = len(input_embed)
+    let mut out = []
+    let mut i = 0
+    while i < P {
+        out = out + [prompt[i]]
+        i = i + 1
+    }
+    i = 0
+    while i < L {
+        out = out + [input_embed[i]]
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Forward: frozen backbone (W [m x d] @ h + b [m])
+//
+//  To make soft prompt influence the last-position hidden (the
+//  standard prompt-tuning inductive bias where prompt tokens flow
+//  into downstream positions via attention), the LAST hidden row
+//  is computed from the MEAN-POOLED prepended sequence:
+//
+//      pool_h[j] = (1/(P+L)) * Σ_t prepended[t][j]
+//      hidden[last] = W @ pool_h + b
+//
+//  Earlier positions keep pointwise linear (h_t = W @ prepended[t] + b).
+//  This gives gradient coverage: dL/dprompt[p] = (1/(P+L)) * W^T dL/dh_last
+//
+//  W and b are frozen (never updated by sp_sgd_update).
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn _sp_linear(h, W, b, d, m) {
+    let mut y = []
+    let mut i = 0
+    while i < m {
+        let mut s = b[i]
+        let mut j = 0
+        while j < d {
+            s = s + W[i][j] * h[j]
+            j = j + 1
+        }
+        y = y + [s]
+        i = i + 1
+    }
+    return y
+}
+
+// Mean-pool rows [T x d] → [d]
+@pure
+fn _sp_mean_pool(rows, T, d) {
+    let mut out = []
+    let inv = 1.0 / to_float(T)
+    let mut j = 0
+    while j < d {
+        let mut s = 0.0
+        let mut t = 0
+        while t < T {
+            s = s + rows[t][j]
+            t = t + 1
+        }
+        out = out + [s * inv]
+        j = j + 1
+    }
+    return out
+}
+
+@hot
+fn sp_forward(prompt, input_embed, W, b) {
+    let P = len(prompt)
+    let L = len(input_embed)
+    let d = 0 + len(prompt[0])
+    let m = 0 + len(b)
+    let prepended = sp_prepend(prompt, input_embed)
+    let total = P + L
+    let mut hidden = []
+    let mut i = 0
+    while i < total - 1 {
+        hidden = hidden + [_sp_linear(prepended[i], W, b, d, m)]
+        i = i + 1
+    }
+    // last position = linear(mean_pool(prepended)) — prompt-tuning attention limit
+    let pooled = _sp_mean_pool(prepended, total, d)
+    hidden = hidden + [_sp_linear(pooled, W, b, d, m)]
+    return SoftPromptOutput {
+        hidden: hidden,
+        prompt_len: P,
+        input_len: L,
+        dim: d
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Loss: mean-squared over last-position hidden vs target [m]
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn sp_loss_mse(output: SoftPromptOutput, target) {
+    let total = output.prompt_len + output.input_len
+    let last = output.hidden[total - 1]
+    let m = len(last)
+    let mut s = 0.0
+    let mut i = 0
+    while i < m {
+        let diff = last[i] - target[i]
+        s = s + diff * diff
+        i = i + 1
+    }
+    return s / to_float(m)
+}
+
+@pure
+fn sp_loss_grad_mse(output: SoftPromptOutput, target) {
+    let total = output.prompt_len + output.input_len
+    let last = output.hidden[total - 1]
+    let m = len(last)
+    let inv = 2.0 / to_float(m)
+    let mut g = []
+    let mut i = 0
+    while i < m {
+        g = g + [(last[i] - target[i]) * inv]
+        i = i + 1
+    }
+    return g
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Backward: compute gradient for prompt only
+//
+//  The last hidden row = linear(mean_pool_{t=0..P+L-1} prepended[t])
+//  → dL/dprepended[t][j] = (1/(P+L)) * Σ_i W[i][j] * dL/dh_last[i]
+//  Since prepended[0..P] == prompt, the prompt gradient is
+//     dL/dprompt[p][j] = (1/(P+L)) * Σ_i W[i][j] * dL/dh_last[i]
+//
+//  Backbone W, b are NEVER updated.
+// ═══════════════════════════════════════════════════════════════
+
+@hot
+fn sp_backward(prompt, W, dL_dhidden_last, P, d, L) {
+    let m = len(dL_dhidden_last)
+    // dL/dx[j] = Σ_i W[i][j] * dL/dy[i]
+    let mut dL_dx = []
+    let mut j = 0
+    while j < d {
+        let mut acc = 0.0
+        let mut i = 0
+        while i < m {
+            acc = acc + W[i][j] * dL_dhidden_last[i]
+            i = i + 1
+        }
+        dL_dx = dL_dx + [acc]
+        j = j + 1
+    }
+    // distribute uniformly across (P+L) positions (mean-pool chain rule)
+    let total = P + L
+    let scale = 1.0 / to_float(_sp_max_i(total, 1))
+    let mut grad = []
+    let mut p = 0
+    while p < P {
+        let mut row = []
+        let mut k = 0
+        while k < d {
+            row = row + [dL_dx[k] * scale]
+            k = k + 1
+        }
+        grad = grad + [row]
+        p = p + 1
+    }
+    return grad
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  SGD update for the prompt (backbone is frozen — not touched)
+// ═══════════════════════════════════════════════════════════════
+
+@hot
+fn sp_sgd_update(prompt, grad, lr, P, d) {
+    let mut out = []
+    let mut i = 0
+    while i < P {
+        let mut row = []
+        let mut j = 0
+        while j < d {
+            row = row + [prompt[i][j] - lr * grad[i][j]]
+            j = j + 1
+        }
+        out = out + [row]
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Full train step (task-specific)
+// ═══════════════════════════════════════════════════════════════
+
+fn sp_grad_norm(grad, P, d) {
+    let mut s = 0.0
+    let mut i = 0
+    while i < P {
+        let mut j = 0
+        while j < d {
+            s = s + grad[i][j] * grad[i][j]
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return sqrt(s)
+}
+
+fn sp_train_step(pool: SoftPromptPool, task_id, input_embed, target, W, b, lr) {
+    let prompt = sp_get_prompt(pool, task_id)
+    let out = sp_forward(prompt, input_embed, W, b)
+    let loss = sp_loss_mse(out, target)
+    let dL_dh = sp_loss_grad_mse(out, target)
+    let L = len(input_embed)
+    let grad = sp_backward(prompt, W, dL_dh, pool.prompt_len, pool.dim, L)
+    let new_prompt = sp_sgd_update(prompt, grad, lr, pool.prompt_len, pool.dim)
+    let new_pool = sp_set_prompt(pool, task_id, new_prompt)
+    let gn = sp_grad_norm(grad, pool.prompt_len, pool.dim)
+    return SoftPromptStep {
+        pool: new_pool,
+        loss: loss,
+        grad_norm: gn
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  PEFT accounting: how small is soft prompt vs full model?
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn sp_param_count(P, d) {
+    return P * d
+}
+
+@pure
+fn sp_param_ratio(P, d, backbone_params) {
+    if backbone_params <= 0 { return 0.0 }
+    return to_float(P * d) / to_float(backbone_params)
+}
+
+// Frobenius-like mean absolute value of a prompt (sanity for train dynamics)
+@pure
+fn sp_prompt_mean_abs(prompt) {
+    let P = len(prompt)
+    if P == 0 { return 0.0 }
+    let d = len(prompt[0])
+    if d == 0 { return 0.0 }
+    let mut s = 0.0
+    let mut i = 0
+    while i < P {
+        let mut j = 0
+        while j < d {
+            s = s + _sp_abs(prompt[i][j])
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return s / to_float(P * d)
+}
+
+println("[soft_prompt] module loaded — learned prompt [P x d] + frozen backbone + task pool (#79)")

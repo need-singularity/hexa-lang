@@ -1,0 +1,576 @@
+// ═══════════════════════════════════════════════════════════════
+//  test_zero_plus_plus.hexa — ZeRO++ verification (#212)
+//
+//  Tests (35):
+//    #1   zpp_create_topology basic (G=2,K=4 → total=8)
+//    #2   zpp_create_topology G=1 (single node)
+//    #3   zpp_create_topology K=1 (one rank per node)
+//    #4   zpp_create_topology stores n_nodes
+//    #5   zpp_partition_params shard count == total_ranks
+//    #6   zpp_partition_params shard size ≈ dim / total
+//    #7   zpp_partition_params boundaries contiguous
+//    #8   zpp_collect_shards length == total dim
+//    #9   zpp_collect_shards round-trip == original
+//    #10  zpp_partition single rank returns full vector
+//    #11  zpp_quantize_int8_sym scale matches max_abs
+//    #12  zpp_quantize_int8_sym q values bounded [-127, 127]
+//    #13  INT8 round-trip bounded error ≤ scale step
+//    #14  INT8 round-trip on zero vector returns zeros
+//    #15  INT8 round-trip n=0 edge case
+//    #16  zpp_hierarchical_all_gather reconstructs full vector
+//    #17  zpp_hierarchical_all_gather length == dim
+//    #18  zpp_hierarchical_reduce_scatter shards sum equals full
+//    #19  zpp_hierarchical_reduce_scatter shard count == total
+//    #20  zpp_quant_all_gather length == dim
+//    #21  zpp_quant_all_gather approximates full within tolerance
+//    #22  zpp_quant_reduce_scatter shards concat ≈ original
+//    #23  zpp_communication_bytes fp32 == dim * 4
+//    #24  zpp_communication_bytes int8 == dim + 4
+//    #25  INT8 bytes ≤ fp32 bytes at dim ≥ 2
+//    #26  zpp_communication_saving > 0 when int8 used
+//    #27  zpp_communication_saving ≈ 0 for identical inputs
+//    #28  zpp_step_simulate returns full dim vector
+//    #29  zpp_step_simulate reduces quadratic loss
+//    #30  zpp_step_simulate with G=1 (single node) still works
+//    #31  zpp_step_simulate zero grad ≈ unchanged params
+//    #32  Topology 1 node == simple ZeRO (total == K)
+//    #33  Edge: total=1 rank → partition length 1
+//    #34  Edge: total=1 rank → all_gather round-trip == params
+//    #35  zpp_communication_saving large dim ≈ 0.75 (4x ratio)
+//
+//  Run: ./hexa self/test_zero_plus_plus.hexa
+// ═══════════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ═══════════════════════════════════════════════════════════════
+//  Inlined from self/ml/zero_plus_plus.hexa
+// ═══════════════════════════════════════════════════════════════
+
+fn zpp_zeros(n) {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [0.0]
+        i = i + 1
+    }
+    return out
+}
+
+fn zpp_copy(src) {
+    let n = len(src)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [src[i]]
+        i = i + 1
+    }
+    return out
+}
+
+fn zpp_fabs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn zpp_int_floor(x) {
+    let neg = x < 0.0
+    let mut ax = x
+    if neg { ax = 0.0 - ax }
+    let mut out = 0
+    let mut rem = ax
+    while rem >= 1.0 {
+        rem = rem - 1.0
+        out = out + 1
+    }
+    if neg { return 0 - out }
+    return out
+}
+
+fn zpp_create_topology(n_nodes, n_ranks_per_node) {
+    let total = n_nodes * n_ranks_per_node
+    return #{
+        "n_nodes": n_nodes,
+        "n_ranks_per_node": n_ranks_per_node,
+        "total_ranks": total
+    }
+}
+
+fn zpp_shard_begin(dim, total, rank) {
+    return (dim * rank) / total
+}
+
+fn zpp_shard_end(dim, total, rank) {
+    return (dim * (rank + 1)) / total
+}
+
+fn zpp_shard_size(dim, total, rank) {
+    return zpp_shard_end(dim, total, rank) - zpp_shard_begin(dim, total, rank)
+}
+
+fn zpp_partition_params(params, total_dim, topology) {
+    let total = topology["total_ranks"]
+    let mut out = []
+    let mut r = 0
+    while r < total {
+        let sb = zpp_shard_begin(total_dim, total, r)
+        let se = zpp_shard_end(total_dim, total, r)
+        let mut shard = []
+        let mut i = sb
+        while i < se {
+            shard = shard + [params[i]]
+            i = i + 1
+        }
+        out = out + [shard]
+        r = r + 1
+    }
+    return out
+}
+
+fn zpp_collect_shards(shards, topology, dim) {
+    let total = topology["total_ranks"]
+    let mut out = []
+    let mut r = 0
+    while r < total {
+        let shard = shards[r]
+        let sz = len(shard)
+        let mut i = 0
+        while i < sz {
+            out = out + [shard[i]]
+            i = i + 1
+        }
+        r = r + 1
+    }
+    return out
+}
+
+fn zpp_quantize_int8_sym(vec, n) {
+    if n <= 0 {
+        return #{"q": [], "scale": 0.0, "n": 0}
+    }
+    let mut max_abs = 0.0
+    let mut i = 0
+    while i < n {
+        let a = zpp_fabs(vec[i])
+        if a > max_abs { max_abs = a }
+        i = i + 1
+    }
+    if max_abs <= 0.0 {
+        let mut z = []
+        let mut j = 0
+        while j < n {
+            z = z + [0.0]
+            j = j + 1
+        }
+        return #{"q": z, "scale": 0.0, "n": n}
+    }
+    let s = max_abs / 127.0
+    let mut q = []
+    i = 0
+    while i < n {
+        let v = vec[i] / s
+        let mut rv = 0.0
+        if v >= 0.0 {
+            let fi = zpp_int_floor(v + 0.5)
+            rv = fi * 1.0
+        } else {
+            let fi = zpp_int_floor((0.0 - v) + 0.5)
+            rv = 0.0 - (fi * 1.0)
+        }
+        if rv > 127.0 { rv = 127.0 }
+        if rv < -127.0 { rv = -127.0 }
+        q = q + [rv]
+        i = i + 1
+    }
+    return #{"q": q, "scale": s, "n": n}
+}
+
+fn zpp_dequantize_int8_sym(q, scale, n) {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [q[i] * scale]
+        i = i + 1
+    }
+    return out
+}
+
+fn zpp_hierarchical_all_gather(shards_list, topology) {
+    let total = topology["total_ranks"]
+    let mut out = []
+    let mut r = 0
+    while r < total {
+        let shard = shards_list[r]
+        let sz = len(shard)
+        let mut i = 0
+        while i < sz {
+            out = out + [shard[i]]
+            i = i + 1
+        }
+        r = r + 1
+    }
+    return out
+}
+
+fn zpp_hierarchical_reduce_scatter(full_grad, topology) {
+    let total = topology["total_ranks"]
+    let dim = len(full_grad)
+    let mut out = []
+    let mut r = 0
+    while r < total {
+        let sb = zpp_shard_begin(dim, total, r)
+        let se = zpp_shard_end(dim, total, r)
+        let mut shard = []
+        let mut i = sb
+        while i < se {
+            shard = shard + [full_grad[i]]
+            i = i + 1
+        }
+        out = out + [shard]
+        r = r + 1
+    }
+    return out
+}
+
+fn zpp_quant_all_gather(shards_list, topology) {
+    let full = zpp_hierarchical_all_gather(shards_list, topology)
+    let n = len(full)
+    let qt = zpp_quantize_int8_sym(full, n)
+    let dq = zpp_dequantize_int8_sym(qt["q"], qt["scale"], qt["n"])
+    return dq
+}
+
+fn zpp_quant_reduce_scatter(full_grad, topology) {
+    let n = len(full_grad)
+    let qt = zpp_quantize_int8_sym(full_grad, n)
+    let dq = zpp_dequantize_int8_sym(qt["q"], qt["scale"], qt["n"])
+    return zpp_hierarchical_reduce_scatter(dq, topology)
+}
+
+fn zpp_communication_bytes(topology, dim, int8) {
+    if int8 == 1 {
+        return dim + 4
+    }
+    return dim * 4
+}
+
+fn zpp_communication_saving(baseline_bytes, compressed_bytes) {
+    if baseline_bytes <= 0 { return 0.0 }
+    let base_f = baseline_bytes * 1.0
+    let comp_f = compressed_bytes * 1.0
+    return 1.0 - (comp_f / base_f)
+}
+
+fn zpp_step_simulate(params, grads, topology, lr, dim) {
+    let g_shards = zpp_quant_reduce_scatter(grads, topology)
+    let p_shards = zpp_partition_params(params, dim, topology)
+    let total = topology["total_ranks"]
+    let mut new_shards = []
+    let mut r = 0
+    while r < total {
+        let p_s = p_shards[r]
+        let g_s = g_shards[r]
+        let sz = len(p_s)
+        let mut upd = []
+        let mut i = 0
+        while i < sz {
+            upd = upd + [p_s[i] - lr * g_s[i]]
+            i = i + 1
+        }
+        new_shards = new_shards + [upd]
+        r = r + 1
+    }
+    let full = zpp_quant_all_gather(new_shards, topology)
+    return full
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Tests
+// ═══════════════════════════════════════════════════════════════
+
+println("[zero_plus_plus test] starting ZeRO++ unit tests (ml#212)")
+
+// ── #1: topology basic ──
+let t1 = zpp_create_topology(2, 4)
+check("#1 zpp_create_topology G=2 K=4 → total=8",
+    t1["total_ranks"] == 8)
+
+// ── #2: single-node topology ──
+let t2 = zpp_create_topology(1, 4)
+check("#2 zpp_create_topology G=1 K=4 → total=4",
+    t2["total_ranks"] == 4 && t2["n_nodes"] == 1)
+
+// ── #3: K=1 topology ──
+let t3 = zpp_create_topology(4, 1)
+check("#3 zpp_create_topology G=4 K=1 → total=4",
+    t3["total_ranks"] == 4 && t3["n_ranks_per_node"] == 1)
+
+// ── #4: topology field access ──
+check("#4 topology stores n_nodes correctly",
+    t1["n_nodes"] == 2 && t1["n_ranks_per_node"] == 4)
+
+// ── #5: partition shard count ──
+let params_16 = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0,
+                 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0]
+let shards_16 = zpp_partition_params(params_16, 16, t1)
+check("#5 partition shard count == total_ranks",
+    len(shards_16) == 8)
+
+// ── #6: partition shard size ≈ dim / total ──
+let all_two = len(shards_16[0]) == 2 && len(shards_16[3]) == 2 && len(shards_16[7]) == 2
+check("#6 partition shard size ≈ dim / total (16/8=2)", all_two)
+
+// ── #7: partition boundaries contiguous ──
+// shards_16[0] should be [0,1], shards_16[1] [2,3], etc.
+let contiguous = approx(shards_16[0][0], 0.0, 1.0e-9)
+             && approx(shards_16[0][1], 1.0, 1.0e-9)
+             && approx(shards_16[1][0], 2.0, 1.0e-9)
+             && approx(shards_16[7][1], 15.0, 1.0e-9)
+check("#7 partition boundaries contiguous", contiguous)
+
+// ── #8: collect_shards length == dim ──
+let collected = zpp_collect_shards(shards_16, t1, 16)
+check("#8 collect_shards length == dim", len(collected) == 16)
+
+// ── #9: collect_shards round-trip == original ──
+let mut rt_ok = true
+let mut k9 = 0
+while k9 < 16 {
+    if fabs(collected[k9] - params_16[k9]) > 1.0e-12 { rt_ok = false }
+    k9 = k9 + 1
+}
+check("#9 collect_shards round-trip matches params", rt_ok)
+
+// ── #10: single rank returns full vector ──
+let t_single = zpp_create_topology(1, 1)
+let single_shards = zpp_partition_params(params_16, 16, t_single)
+check("#10 single rank partition length 1 and full",
+    len(single_shards) == 1 && len(single_shards[0]) == 16)
+
+// ── #11: INT8 quant scale ──
+let vec_a = [0.1, -0.3, 0.7, -1.0, 0.25, -0.5, 0.8, 0.4]
+let qa = zpp_quantize_int8_sym(vec_a, 8)
+// max_abs == 1.0 → scale == 1/127
+check("#11 int8 scale ≈ max_abs / 127",
+    approx(qa["scale"], 1.0 / 127.0, 1.0e-6))
+
+// ── #12: q values bounded [-127, 127] ──
+let mut q_bounded = true
+let mut k12 = 0
+while k12 < 8 {
+    let q_val = qa["q"][k12]
+    if q_val > 127.0 { q_bounded = false }
+    if q_val < -127.0 { q_bounded = false }
+    k12 = k12 + 1
+}
+check("#12 int8 q values bounded [-127, 127]", q_bounded)
+
+// ── #13: INT8 round-trip bounded error ≤ scale ──
+let da = zpp_dequantize_int8_sym(qa["q"], qa["scale"], qa["n"])
+let tol_a = qa["scale"] + 1.0e-9
+let mut rt_bounded = true
+let mut k13 = 0
+while k13 < 8 {
+    if fabs(vec_a[k13] - da[k13]) > tol_a { rt_bounded = false }
+    k13 = k13 + 1
+}
+check("#13 int8 round-trip ≤ scale step", rt_bounded)
+
+// ── #14: zero vector round-trip ──
+let zeros8 = zpp_zeros(8)
+let qz = zpp_quantize_int8_sym(zeros8, 8)
+let dz = zpp_dequantize_int8_sym(qz["q"], qz["scale"], qz["n"])
+let mut all_zero = true
+let mut k14 = 0
+while k14 < 8 {
+    if fabs(dz[k14]) > 1.0e-12 { all_zero = false }
+    k14 = k14 + 1
+}
+check("#14 int8 round-trip zero vector yields zeros", all_zero)
+
+// ── #15: n=0 edge case ──
+let q0 = zpp_quantize_int8_sym([], 0)
+check("#15 int8 quant n=0 edge case",
+    q0["n"] == 0 && len(q0["q"]) == 0)
+
+// ── #16: hierarchical all_gather reconstructs full vector ──
+let gathered = zpp_hierarchical_all_gather(shards_16, t1)
+let mut recon_ok = true
+let mut k16 = 0
+while k16 < 16 {
+    if fabs(gathered[k16] - params_16[k16]) > 1.0e-12 { recon_ok = false }
+    k16 = k16 + 1
+}
+check("#16 hierarchical all_gather reconstructs full vector", recon_ok)
+
+// ── #17: all_gather length == dim ──
+check("#17 hierarchical all_gather length == dim", len(gathered) == 16)
+
+// ── #18: reduce_scatter shards concat == full ──
+let grad_full = [2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0,
+                 18.0, 20.0, 22.0, 24.0, 26.0, 28.0, 30.0, 32.0]
+let rs_shards = zpp_hierarchical_reduce_scatter(grad_full, t1)
+// concat back
+let rs_full = zpp_collect_shards(rs_shards, t1, 16)
+let mut rs_ok = true
+let mut k18 = 0
+while k18 < 16 {
+    if fabs(rs_full[k18] - grad_full[k18]) > 1.0e-12 { rs_ok = false }
+    k18 = k18 + 1
+}
+check("#18 reduce_scatter shards concat == full", rs_ok)
+
+// ── #19: reduce_scatter shard count == total ──
+check("#19 reduce_scatter shard count == total_ranks", len(rs_shards) == 8)
+
+// ── #20: quant_all_gather length == dim ──
+let qag = zpp_quant_all_gather(shards_16, t1)
+check("#20 quant_all_gather length == dim", len(qag) == 16)
+
+// ── #21: quant_all_gather approximates full vector ──
+// scale = 15/127 ≈ 0.118 → tolerance is scale plus epsilon.
+let t21_scale = 15.0 / 127.0 + 1.0e-6
+let mut t21_ok = true
+let mut k21 = 0
+while k21 < 16 {
+    if fabs(qag[k21] - params_16[k21]) > t21_scale { t21_ok = false }
+    k21 = k21 + 1
+}
+check("#21 quant_all_gather approximates full vector", t21_ok)
+
+// ── #22: quant_reduce_scatter shards concat ≈ original ──
+let qrs = zpp_quant_reduce_scatter(grad_full, t1)
+let qrs_full = zpp_collect_shards(qrs, t1, 16)
+// max_abs = 32 → scale = 32/127 ≈ 0.252
+let t22_scale = 32.0 / 127.0 + 1.0e-6
+let mut t22_ok = true
+let mut k22 = 0
+while k22 < 16 {
+    if fabs(qrs_full[k22] - grad_full[k22]) > t22_scale { t22_ok = false }
+    k22 = k22 + 1
+}
+check("#22 quant_reduce_scatter shards concat ≈ original", t22_ok)
+
+// ── #23: comm bytes fp32 == dim * 4 ──
+let b_fp32 = zpp_communication_bytes(t1, 16, 0)
+check("#23 communication_bytes fp32 == dim*4", b_fp32 == 64)
+
+// ── #24: comm bytes int8 == dim + 4 ──
+let b_int8 = zpp_communication_bytes(t1, 16, 1)
+check("#24 communication_bytes int8 == dim+4", b_int8 == 20)
+
+// ── #25: int8 bytes ≤ fp32 bytes ──
+check("#25 int8 bytes ≤ fp32 bytes at dim=16",
+    b_int8 < b_fp32)
+
+// ── #26: saving > 0 for int8 ──
+let sav1 = zpp_communication_saving(b_fp32, b_int8)
+check("#26 communication_saving > 0 for int8", sav1 > 0.0)
+
+// ── #27: saving ≈ 0 for identical inputs ──
+let sav_eq = zpp_communication_saving(100, 100)
+check("#27 communication_saving ≈ 0 for identical inputs",
+    approx(sav_eq, 0.0, 1.0e-9))
+
+// ── #28: step_simulate returns full dim vector ──
+let init_p = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+let init_g = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+let t28 = zpp_create_topology(2, 2)
+let step_out = zpp_step_simulate(init_p, init_g, t28, 0.1, 8)
+check("#28 step_simulate returns full dim vector", len(step_out) == 8)
+
+// ── #29: step reduces quadratic loss ──
+// loss = 0.5 * sum(p^2), grad = p. After one SGD step with lr=0.1,
+// p_new ≈ 0.9 * p, so loss shrinks. (Quantization adds noise but
+// leaves the direction intact for well-scaled inputs.)
+let q_params = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+let q_grads  = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+let loss_before = 0.5 * (1.0 + 4.0 + 9.0 + 16.0 + 25.0 + 36.0 + 49.0 + 64.0)
+let t29 = zpp_create_topology(2, 2)
+let q_new = zpp_step_simulate(q_params, q_grads, t29, 0.1, 8)
+let mut loss_after = 0.0
+let mut k29 = 0
+while k29 < 8 {
+    loss_after = loss_after + 0.5 * q_new[k29] * q_new[k29]
+    k29 = k29 + 1
+}
+check("#29 step_simulate reduces quadratic loss",
+    loss_after < loss_before)
+
+// ── #30: step_simulate with G=1 single node ──
+let t30 = zpp_create_topology(1, 4)
+let step30 = zpp_step_simulate(init_p, init_g, t30, 0.1, 8)
+check("#30 step_simulate G=1 returns full vector", len(step30) == 8)
+
+// ── #31: zero grad ≈ unchanged params ──
+let zero_g = zpp_zeros(8)
+let t31 = zpp_create_topology(2, 2)
+let step31 = zpp_step_simulate(init_p, zero_g, t31, 0.1, 8)
+// Params themselves get round-tripped through INT8 during the
+// qwZ gather, so tolerance is the scale of init_p (max_abs 8 →
+// scale ≈ 0.063). max error per element ≤ scale.
+let t31_tol = 8.0 / 127.0 + 1.0e-6
+let mut t31_ok = true
+let mut k31 = 0
+while k31 < 8 {
+    if fabs(step31[k31] - init_p[k31]) > t31_tol { t31_ok = false }
+    k31 = k31 + 1
+}
+check("#31 zero grad ≈ unchanged params (within qwZ scale)", t31_ok)
+
+// ── #32: Topology with 1 node == simple ZeRO (total == K) ──
+let t32 = zpp_create_topology(1, 8)
+check("#32 1-node topology: total_ranks == K",
+    t32["total_ranks"] == 8 && t32["n_nodes"] == 1)
+
+// ── #33: Edge total=1 → partition length 1 ──
+let t33 = zpp_create_topology(1, 1)
+let shards33 = zpp_partition_params(params_16, 16, t33)
+check("#33 single-rank partition length 1", len(shards33) == 1)
+
+// ── #34: Edge total=1 → all_gather round-trip ──
+let ag33 = zpp_hierarchical_all_gather(shards33, t33)
+let mut k34_ok = true
+let mut k34 = 0
+while k34 < 16 {
+    if fabs(ag33[k34] - params_16[k34]) > 1.0e-12 { k34_ok = false }
+    k34 = k34 + 1
+}
+check("#34 single-rank all_gather round-trip", k34_ok)
+
+// ── #35: large-dim int8 saving ≈ 0.75 (4x compression) ──
+// dim=1024 → fp32=4096, int8=1028, saving = 1 - 1028/4096 ≈ 0.749
+let b32 = zpp_communication_bytes(t1, 1024, 0)
+let b8 = zpp_communication_bytes(t1, 1024, 1)
+let sav2 = zpp_communication_saving(b32, b8)
+check("#35 large-dim int8 saving ≈ 0.75 (~4x compression)",
+    sav2 > 0.7 && sav2 < 0.8)
+
+// ═══════════════════════════════════════════════════════════════
+println("")
+println("════════════════════════════════════════════════")
+println("  ZeRO++ (#212) test results")
+println("  PASS: " + str(pass_count))
+println("  FAIL: " + str(fail_count))
+println("  TOTAL: " + str(pass_count + fail_count))
+println("════════════════════════════════════════════════")
+
+if fail_count == 0 {
+    println("[zero_plus_plus test] ALL PASS")
+} else {
+    println("[zero_plus_plus test] FAIL")
+}

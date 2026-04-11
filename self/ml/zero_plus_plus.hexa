@@ -1,0 +1,370 @@
+// ═══════════════════════════════════════════════════════════════
+//  zero_plus_plus.hexa — ZeRO++ (#212)
+//
+//  Hierarchical partitioning + compressed communication.
+//  Extends ZeRO with:
+//    (a) Hierarchical partitioning — split params globally across
+//        nodes, replicate within a node. Intra-node all-gather is
+//        local (replica already resident); inter-node gather only
+//        happens once per node, so the inter-node bandwidth cost
+//        drops from O(P*(W-1)/W) to O(P*(G-1)/G).
+//    (b) INT8 symmetric quantized all-gather (qwZ) for the weight
+//        transfer on the wire. 4x less bandwidth at the cost of a
+//        per-tensor scale (4 bytes) and bounded round-trip error.
+//    (c) INT8 quantized reduce-scatter (qgZ) for gradients, same
+//        compression recipe as qwZ applied to the grad wire.
+//
+//  All "collectives" are simulated single-process by treating each
+//  rank as an index into a parallel-array world. Ground truth for the
+//  numerical checks is full-precision SGD on the full parameter
+//  vector. Quantization errors are bounded, NOT zero.
+//
+//  Topology dict:
+//    #{"n_nodes": G, "n_ranks_per_node": K, "total_ranks": G*K}
+//
+//  Prefix: zpp_
+// ═══════════════════════════════════════════════════════════════
+
+// ── Low-level helpers ─────────────────────────────────────────
+
+fn zpp_zeros(n) {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [0.0]
+        i = i + 1
+    }
+    return out
+}
+
+fn zpp_copy(src) {
+    let n = len(src)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [src[i]]
+        i = i + 1
+    }
+    return out
+}
+
+fn zpp_fabs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn zpp_int_floor(x) {
+    // portable truncating cast: round toward zero
+    let neg = x < 0.0
+    let mut ax = x
+    if neg { ax = 0.0 - ax }
+    let mut out = 0
+    let mut rem = ax
+    while rem >= 1.0 {
+        rem = rem - 1.0
+        out = out + 1
+    }
+    if neg { return 0 - out }
+    return out
+}
+
+// ── Topology ─────────────────────────────────────────────────
+//
+//   n_nodes          : G  (globally split dim across nodes)
+//   n_ranks_per_node : K  (replicate within a node)
+//   total_ranks      : G * K
+//
+// Returned as a dict so the test layer can poke at individual
+// fields without caring about struct declaration order.
+fn zpp_create_topology(n_nodes, n_ranks_per_node) {
+    let total = n_nodes * n_ranks_per_node
+    return #{
+        "n_nodes": n_nodes,
+        "n_ranks_per_node": n_ranks_per_node,
+        "total_ranks": total
+    }
+}
+
+// ── Shard boundary helpers ───────────────────────────────────
+// Classic ZeRO-3 boundaries. Each of the `total_ranks` ranks owns
+// a contiguous slice of size approx dim/total.
+fn zpp_shard_begin(dim, total, rank) {
+    return (dim * rank) / total
+}
+
+fn zpp_shard_end(dim, total, rank) {
+    return (dim * (rank + 1)) / total
+}
+
+fn zpp_shard_size(dim, total, rank) {
+    return zpp_shard_end(dim, total, rank) - zpp_shard_begin(dim, total, rank)
+}
+
+// ── Partition: full param vector → per-rank shards ───────────
+//
+// Returns an array of `total_ranks` arrays. With total=1 the
+// returned value is [params] (edge case: "1 rank — no comms").
+fn zpp_partition_params(params, total_dim, topology) {
+    let total = topology["total_ranks"]
+    let mut out = []
+    let mut r = 0
+    while r < total {
+        let sb = zpp_shard_begin(total_dim, total, r)
+        let se = zpp_shard_end(total_dim, total, r)
+        let mut shard = []
+        let mut i = sb
+        while i < se {
+            shard = shard + [params[i]]
+            i = i + 1
+        }
+        out = out + [shard]
+        r = r + 1
+    }
+    return out
+}
+
+// ── Collect shards → full vector ─────────────────────────────
+//
+// Inverse of zpp_partition_params. Concatenates the shards in
+// rank order, returning a flat vector of length `dim`.
+fn zpp_collect_shards(shards, topology, dim) {
+    let total = topology["total_ranks"]
+    let mut out = []
+    let mut r = 0
+    while r < total {
+        let shard = shards[r]
+        let sz = len(shard)
+        let mut i = 0
+        while i < sz {
+            out = out + [shard[i]]
+            i = i + 1
+        }
+        r = r + 1
+    }
+    return out
+}
+
+// ── INT8 symmetric quantization ──────────────────────────────
+//
+//   scale = max_abs / 127
+//   q[i]  = round(v[i] / scale)  clipped to [-127, 127]
+//
+// Returns a dict #{"q": int8-as-float array, "scale": float, "n": int}.
+// Using a dict keeps the return heterogeneous without forcing a
+// dedicated struct (ZeRO++ quant state is ephemeral — it never
+// crosses a step boundary).
+//
+// n is the element count to dequantize; passed in so callers can
+// round-trip partial arrays and so the contract matches the spec.
+fn zpp_quantize_int8_sym(vec, n) {
+    if n <= 0 {
+        return #{"q": [], "scale": 0.0, "n": 0}
+    }
+    // max |vec[i]|
+    let mut max_abs = 0.0
+    let mut i = 0
+    while i < n {
+        let a = zpp_fabs(vec[i])
+        if a > max_abs { max_abs = a }
+        i = i + 1
+    }
+    if max_abs <= 0.0 {
+        // all zeros — scale 0 is fine; dequantize will yield zeros.
+        let mut z = []
+        let mut j = 0
+        while j < n {
+            z = z + [0.0]
+            j = j + 1
+        }
+        return #{"q": z, "scale": 0.0, "n": n}
+    }
+    let s = max_abs / 127.0
+    let mut q = []
+    i = 0
+    while i < n {
+        let v = vec[i] / s
+        // round half-away-from-zero using zpp_int_floor truncation
+        let mut rv = 0.0
+        if v >= 0.0 {
+            let fi = zpp_int_floor(v + 0.5)
+            rv = fi * 1.0
+        } else {
+            let fi = zpp_int_floor((0.0 - v) + 0.5)
+            rv = 0.0 - (fi * 1.0)
+        }
+        if rv > 127.0 { rv = 127.0 }
+        if rv < -127.0 { rv = -127.0 }
+        q = q + [rv]
+        i = i + 1
+    }
+    return #{"q": q, "scale": s, "n": n}
+}
+
+// Dequantize with the stored scale.
+// q is the quantized array, scale the per-tensor scale, n the
+// element count.
+fn zpp_dequantize_int8_sym(q, scale, n) {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [q[i] * scale]
+        i = i + 1
+    }
+    return out
+}
+
+// ── Hierarchical all-gather ──────────────────────────────────
+//
+// Ground truth: concatenate every rank's shard in order and
+// return the full parameter vector.
+//
+// In real ZeRO++ the inter-node leg only ships P/G elements per
+// node (one per peer) and intra-node is free because the replica
+// is already resident. We simulate the numerical end result —
+// which is simply "full vector" — and leave the byte-count
+// accounting to zpp_communication_bytes.
+fn zpp_hierarchical_all_gather(shards_list, topology) {
+    // total_ranks must equal len(shards_list)
+    let total = topology["total_ranks"]
+    let mut out = []
+    let mut r = 0
+    while r < total {
+        let shard = shards_list[r]
+        let sz = len(shard)
+        let mut i = 0
+        while i < sz {
+            out = out + [shard[i]]
+            i = i + 1
+        }
+        r = r + 1
+    }
+    return out
+}
+
+// ── Hierarchical reduce-scatter ──────────────────────────────
+//
+// Input  : a single full-dim vector (the globally-summed grad).
+// Output : per-rank shards, each shard owning its slice of the
+//          full vector (contiguous partition, same boundaries as
+//          zpp_partition_params).
+//
+// This mirrors the ZeRO-3 primitive: after the sum every rank
+// only keeps its own chunk.
+fn zpp_hierarchical_reduce_scatter(full_grad, topology) {
+    let total = topology["total_ranks"]
+    let dim = len(full_grad)
+    let mut out = []
+    let mut r = 0
+    while r < total {
+        let sb = zpp_shard_begin(dim, total, r)
+        let se = zpp_shard_end(dim, total, r)
+        let mut shard = []
+        let mut i = sb
+        while i < se {
+            shard = shard + [full_grad[i]]
+            i = i + 1
+        }
+        out = out + [shard]
+        r = r + 1
+    }
+    return out
+}
+
+// ── Quantized all-gather (qwZ wire effect) ────────────────────
+//
+// Collect shards → quantize the full vector → dequantize.
+// The result is an APPROXIMATE full vector: the only difference
+// from the FP32 all-gather is per-element INT8 rounding noise.
+fn zpp_quant_all_gather(shards_list, topology) {
+    let full = zpp_hierarchical_all_gather(shards_list, topology)
+    let n = len(full)
+    let qt = zpp_quantize_int8_sym(full, n)
+    let dq = zpp_dequantize_int8_sym(qt["q"], qt["scale"], qt["n"])
+    return dq
+}
+
+// ── Quantized reduce-scatter (qgZ wire effect) ───────────────
+//
+// Quantize the summed grad vector → dequantize → scatter into
+// per-rank shards. Same boundaries as the FP32 version; error is
+// bounded by the INT8 scale step.
+fn zpp_quant_reduce_scatter(full_grad, topology) {
+    let n = len(full_grad)
+    let qt = zpp_quantize_int8_sym(full_grad, n)
+    let dq = zpp_dequantize_int8_sym(qt["q"], qt["scale"], qt["n"])
+    return zpp_hierarchical_reduce_scatter(dq, topology)
+}
+
+// ── Communication byte accounting ────────────────────────────
+//
+//   dim : number of elements crossing the wire
+//   int8: 1 → INT8 payload  (1 byte/elem + 4-byte scale per tensor)
+//         0 → FP32 payload  (4 bytes/elem)
+//
+// Returned as a single integer (total bytes). Callers aggregate
+// across gather/scatter legs themselves.
+fn zpp_communication_bytes(topology, dim, int8) {
+    // Note: topology isn't used directly in the per-leg byte cost
+    // here — the saving from hpZ is already baked into the `dim`
+    // the caller passes (per-leg size). This keeps the function
+    // pure arithmetic and easy to audit.
+    if int8 == 1 {
+        return dim + 4
+    }
+    return dim * 4
+}
+
+// ── Communication saving ─────────────────────────────────────
+//
+// saving = 1 - compressed/baseline.
+// > 0  → compressed wins
+// = 0  → identical
+// < 0  → regressed (should never happen for qwZ/qgZ)
+fn zpp_communication_saving(baseline_bytes, compressed_bytes) {
+    if baseline_bytes <= 0 { return 0.0 }
+    let base_f = baseline_bytes * 1.0
+    let comp_f = compressed_bytes * 1.0
+    return 1.0 - (comp_f / base_f)
+}
+
+// ── Full step simulation (SGD with simulated comms) ──────────
+//
+// Pipeline:
+//   1) reduce-scatter   : simulated on full grad vector
+//   2) per-rank SGD     : p_i -= lr * g_i on the rank's shard
+//   3) all-gather       : collect updated shards back into a full
+//                         param vector
+//
+// The qwZ/qgZ paths are enabled unconditionally here so the test
+// can verify the bounded-error contract on a non-trivial loss.
+fn zpp_step_simulate(params, grads, topology, lr, dim) {
+    // 1) quantized reduce-scatter (qgZ)
+    let g_shards = zpp_quant_reduce_scatter(grads, topology)
+
+    // 2) partition current params so each rank owns a slice, apply
+    //    the local SGD update, collect the new shards.
+    let p_shards = zpp_partition_params(params, dim, topology)
+    let total = topology["total_ranks"]
+    let mut new_shards = []
+    let mut r = 0
+    while r < total {
+        let p_s = p_shards[r]
+        let g_s = g_shards[r]
+        let sz = len(p_s)
+        let mut upd = []
+        let mut i = 0
+        while i < sz {
+            upd = upd + [p_s[i] - lr * g_s[i]]
+            i = i + 1
+        }
+        new_shards = new_shards + [upd]
+        r = r + 1
+    }
+
+    // 3) quantized all-gather (qwZ) — returns the full vector each
+    //    rank sees inside its forward pass after the step.
+    let full = zpp_quant_all_gather(new_shards, topology)
+    return full
+}
+
+println("[zero_plus_plus] loaded — ZeRO++ hierarchical + INT8 (CPU sim)")

@@ -1,0 +1,521 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/mps_fp16_kv_cache.hexa — MPS FP16 KV Cache (#202)
+//
+//  Metal unified memory KV cache with FP16 storage.
+//  Zero-copy append to a contiguous unified-memory buffer per layer.
+//  Simulated on CPU: each K/V row is quantized to FP16 precision
+//  (10-bit mantissa round) then stored flat; dequantize = identity
+//  (the stored float already lives on the fp16 lattice).
+//
+//  Layout per layer:
+//    k_bufs[layer] : flat 1D array of length max_seq * n_heads * d_head
+//    v_bufs[layer] : flat 1D array of length max_seq * n_heads * d_head
+//    lengths[layer]    : current number of filled positions
+//    capacities[layer] : max_seq for that layer (uniform across layers)
+//
+//  Index formula (layer, pos, head, d):
+//    base = (pos * n_heads + head) * d_head + d
+//
+//  FP16 simulation — round to 10-bit mantissa:
+//    exp_e = floor_log2(|x|)
+//    step  = 2^(exp_e - 10)
+//    x_hat = round(x / step) * step
+//  Subnormals flushed to 0, values above 65504 clamped sign-preservingly.
+//
+//  Public API (prefix mpskv_):
+//    mpskv_create_cache(n_layers, max_seq, n_heads, d_head) -> dict
+//    mpskv_fp16_round(x)                         -> float (10-bit mantissa)
+//    mpskv_fp16_round_row(row, n)                -> [float]
+//    mpskv_append(cache, layer, k_row, v_row)    -> cache (mutated)
+//    mpskv_append_batch(cache, layer, k_rows, v_rows, n) -> cache
+//    mpskv_read_key(cache, layer, pos, head)     -> [float]  (d_head)
+//    mpskv_read_value(cache, layer, pos, head)   -> [float]  (d_head)
+//    mpskv_attention_read(cache, layer, query, n_heads, d_head) -> [float]
+//    mpskv_memory_bytes(cache)                   -> int  (2 bytes/elem)
+//    mpskv_eviction_sliding(cache, layer, window)-> cache
+//    mpskv_get_length(cache, layer)              -> int
+//    mpskv_reset(cache)                          -> cache
+//
+//  AI-NATIVE attrs: @pure on math helpers, @hot on tight inner loops.
+// ═══════════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════════
+//  Math helpers
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn mpskv_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+@pure
+fn mpskv_max_f(a, b) {
+    if a > b { return a }
+    return b
+}
+
+@pure
+fn mpskv_min_i(a, b) {
+    if a < b { return a }
+    return b
+}
+
+@pure
+fn mpskv_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    let mut i = 0
+    while i < 30 {
+        g = (g + x / g) / 2.0
+        i = i + 1
+    }
+    return g
+}
+
+@pure
+fn mpskv_zeros(n) {
+    let mut v = []
+    let mut i = 0
+    while i < n {
+        v = v + [0.0]
+        i = i + 1
+    }
+    return v
+}
+
+@pure
+fn mpskv_zeros_int(n) {
+    let mut v = []
+    let mut i = 0
+    while i < n {
+        v = v + [0]
+        i = i + 1
+    }
+    return v
+}
+
+@pure
+fn mpskv_round_to_int(x) {
+    if x >= 0.0 { return to_int(x + 0.5) }
+    return to_int(x - 0.5)
+}
+
+// Power-of-two scaling for FP16 lattice alignment.
+@pure
+fn mpskv_pow2(exp) {
+    let mut v = 1.0
+    if exp >= 0 {
+        let mut i = 0
+        while i < exp {
+            v = v * 2.0
+            i = i + 1
+        }
+        return v
+    }
+    let m = 0 - exp
+    let mut j = 0
+    while j < m {
+        v = v / 2.0
+        j = j + 1
+    }
+    return v
+}
+
+// floor_log2 for positive float. Returns e with 2^e <= x < 2^(e+1).
+@pure
+fn mpskv_floor_log2(x) {
+    if x <= 0.0 { return -1023 }
+    let mut e = 0
+    let mut v = x
+    while v >= 2.0 {
+        v = v / 2.0
+        e = e + 1
+    }
+    while v < 1.0 {
+        v = v * 2.0
+        e = e - 1
+    }
+    return e
+}
+
+// Fast exp approximation (Taylor series) used by softmax.
+@pure
+fn mpskv_exp(x) {
+    let mut cx = x
+    if cx > 20.0 { cx = 20.0 }
+    if cx < -20.0 { cx = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    let mut i = 1
+    while i < 20 {
+        term = term * cx / to_float(i)
+        result = result + term
+        i = i + 1
+    }
+    if result < 1.0e-30 { result = 1.0e-30 }
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  FP16 rounding (10-bit mantissa)
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn mpskv_fp16_round(x) {
+    if x == 0.0 { return 0.0 }
+    let a = mpskv_abs(x)
+    // Flush subnormals: |x| < 2^-14 ~ 6.103515625e-5
+    if a < 0.00006103515625 { return 0.0 }
+    // Clamp to fp16 max
+    if a > 65504.0 {
+        if x < 0.0 { return -65504.0 }
+        return 65504.0
+    }
+    let e = mpskv_floor_log2(a)
+    let step = mpskv_pow2(e - 10)
+    let q = mpskv_round_to_int(x / step)
+    return to_float(q) * step
+}
+
+@hot
+fn mpskv_fp16_round_row(row, n) {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [mpskv_fp16_round(row[i])]
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Cache creation
+//
+//  Layout: k_bufs / v_bufs are lists of flat per-layer buffers.
+//  Each buffer has slab_size = max_seq * n_heads * d_head floats,
+//  pre-allocated to 0.0 — simulating contiguous unified memory.
+// ═══════════════════════════════════════════════════════════════════
+
+fn mpskv_create_cache(n_layers, max_seq, n_heads, d_head) {
+    let slab = max_seq * n_heads * d_head
+    let mut k_bufs = []
+    let mut v_bufs = []
+    let mut lengths = []
+    let mut capacities = []
+    let mut l = 0
+    while l < n_layers {
+        k_bufs = k_bufs + [mpskv_zeros(slab)]
+        v_bufs = v_bufs + [mpskv_zeros(slab)]
+        lengths = lengths + [0]
+        capacities = capacities + [max_seq]
+        l = l + 1
+    }
+    return #{
+        "k_bufs": k_bufs,
+        "v_bufs": v_bufs,
+        "lengths": lengths,
+        "capacities": capacities,
+        "n_layers": n_layers,
+        "max_seq": max_seq,
+        "n_heads": n_heads,
+        "d_head": d_head,
+        "slab": slab
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Helpers — index + reads
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn mpskv_flat_index(pos, head, d, n_heads, d_head) {
+    return (pos * n_heads + head) * d_head + d
+}
+
+fn mpskv_get_length(cache, layer) {
+    let lens = cache["lengths"]
+    return lens[layer]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Append single position (writes one row of n_heads*d_head floats)
+//
+//  k_row / v_row are flat of length n_heads * d_head.
+//  The cache is mutated in-place (dict + inner array mutation).
+//  Over-capacity append is silently truncated (length unchanged)
+//  with the slab left untouched so tests can detect the no-op.
+// ═══════════════════════════════════════════════════════════════════
+
+fn mpskv_append(cache, layer, k_row, v_row) {
+    let mut c = cache
+    let lens = c["lengths"]
+    let caps = c["capacities"]
+    let cur = lens[layer]
+    let cap = caps[layer]
+    if cur >= cap {
+        // over capacity -> truncate (no write, length unchanged)
+        return c
+    }
+    let n_heads = c["n_heads"]
+    let d_head = c["d_head"]
+    let slab_row = n_heads * d_head
+    let base = cur * slab_row
+
+    // Pull and mutate the layer's k/v buffer.
+    let mut k_bufs = c["k_bufs"]
+    let mut v_bufs = c["v_bufs"]
+    let mut kb = k_bufs[layer]
+    let mut vb = v_bufs[layer]
+    let mut d = 0
+    while d < slab_row {
+        kb[base + d] = mpskv_fp16_round(k_row[d])
+        vb[base + d] = mpskv_fp16_round(v_row[d])
+        d = d + 1
+    }
+    k_bufs[layer] = kb
+    v_bufs[layer] = vb
+    c["k_bufs"] = k_bufs
+    c["v_bufs"] = v_bufs
+
+    // Advance length.
+    let mut new_lens = lens
+    new_lens[layer] = cur + 1
+    c["lengths"] = new_lens
+    return c
+}
+
+// Append n positions in batch. k_rows / v_rows are lists of n rows,
+// each row has length n_heads * d_head.
+fn mpskv_append_batch(cache, layer, k_rows, v_rows, n) {
+    let mut c = cache
+    let mut i = 0
+    while i < n {
+        c = mpskv_append(c, layer, k_rows[i], v_rows[i])
+        i = i + 1
+    }
+    return c
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Reads
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn mpskv_read_key(cache, layer, pos, head) {
+    let n_heads = cache["n_heads"]
+    let d_head = cache["d_head"]
+    let k_bufs = cache["k_bufs"]
+    let kb = k_bufs[layer]
+    let mut out = []
+    let mut d = 0
+    while d < d_head {
+        let idx = mpskv_flat_index(pos, head, d, n_heads, d_head)
+        out = out + [kb[idx]]
+        d = d + 1
+    }
+    return out
+}
+
+@pure
+fn mpskv_read_value(cache, layer, pos, head) {
+    let n_heads = cache["n_heads"]
+    let d_head = cache["d_head"]
+    let v_bufs = cache["v_bufs"]
+    let vb = v_bufs[layer]
+    let mut out = []
+    let mut d = 0
+    while d < d_head {
+        let idx = mpskv_flat_index(pos, head, d, n_heads, d_head)
+        out = out + [vb[idx]]
+        d = d + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Attention read (causal)
+//
+//  query: flat [n_heads*d_head] row.
+//  For each position p < length, score_p = dot(query_h, key_{p,h})
+//  summed over heads; softmax over positions then mixes values.
+//  Empty-cache / length==0 returns a zero row of length n_heads*d_head.
+// ═══════════════════════════════════════════════════════════════════
+
+@hot
+fn mpskv_attention_read(cache, layer, query, n_heads, d_head) {
+    let slab_row = n_heads * d_head
+    let zero_out = mpskv_zeros(slab_row)
+    let lens = cache["lengths"]
+    let length = lens[layer]
+    if length == 0 { return zero_out }
+
+    let k_bufs = cache["k_bufs"]
+    let v_bufs = cache["v_bufs"]
+    let kb = k_bufs[layer]
+    let vb = v_bufs[layer]
+    let scale = 1.0 / mpskv_sqrt(to_float(d_head))
+
+    // Compute raw scores (one per position)
+    let mut scores = []
+    let mut p = 0
+    while p < length {
+        let mut s = 0.0
+        let mut h = 0
+        while h < n_heads {
+            let mut d = 0
+            while d < d_head {
+                let base = (p * n_heads + h) * d_head + d
+                let qi = h * d_head + d
+                s = s + query[qi] * kb[base]
+                d = d + 1
+            }
+            h = h + 1
+        }
+        scores = scores + [s * scale]
+        p = p + 1
+    }
+
+    // Softmax (stable)
+    let mut mx = scores[0]
+    let mut i = 1
+    while i < length {
+        if scores[i] > mx { mx = scores[i] }
+        i = i + 1
+    }
+    let mut exps = []
+    let mut z = 0.0
+    let mut j = 0
+    while j < length {
+        let e = mpskv_exp(scores[j] - mx)
+        exps = exps + [e]
+        z = z + e
+        j = j + 1
+    }
+    if z < 1.0e-30 { z = 1.0e-30 }
+
+    // Weighted sum of value rows.
+    let mut out = mpskv_zeros(slab_row)
+    let mut pp = 0
+    while pp < length {
+        let w = exps[pp] / z
+        let mut hh = 0
+        while hh < n_heads {
+            let mut dd = 0
+            while dd < d_head {
+                let base = (pp * n_heads + hh) * d_head + dd
+                let oi = hh * d_head + dd
+                out[oi] = out[oi] + w * vb[base]
+                dd = dd + 1
+            }
+            hh = hh + 1
+        }
+        pp = pp + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Memory accounting — FP16 = 2 bytes / element
+//
+//  total = 2 * sum(capacities[layer] * n_heads * d_head)
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn mpskv_memory_bytes(cache) {
+    let n_layers = cache["n_layers"]
+    let n_heads = cache["n_heads"]
+    let d_head = cache["d_head"]
+    let caps = cache["capacities"]
+    let mut total = 0
+    let mut l = 0
+    while l < n_layers {
+        // k and v both stored -> factor 2 on buffers,
+        // FP16 = 2 bytes/elem -> factor 2 on per-elem size.
+        total = total + 2 * 2 * caps[l] * n_heads * d_head
+        l = l + 1
+    }
+    return total
+}
+
+// Memory bytes for only the K or V side (useful for the spec check).
+@pure
+fn mpskv_memory_bytes_kv_single(cache) {
+    let n_layers = cache["n_layers"]
+    let n_heads = cache["n_heads"]
+    let d_head = cache["d_head"]
+    let caps = cache["capacities"]
+    let mut total = 0
+    let mut l = 0
+    while l < n_layers {
+        total = total + 2 * caps[l] * n_heads * d_head
+        l = l + 1
+    }
+    return total
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Sliding-window eviction: keep last `window` positions for a layer
+//
+//  If current length <= window, no-op.
+//  Otherwise, shift slab_row-sized rows from positions
+//    [length-window, length) to [0, window), then truncate length.
+// ═══════════════════════════════════════════════════════════════════
+
+fn mpskv_eviction_sliding(cache, layer, window) {
+    let mut c = cache
+    let lens = c["lengths"]
+    let cur = lens[layer]
+    if cur <= window { return c }
+
+    let n_heads = c["n_heads"]
+    let d_head = c["d_head"]
+    let slab_row = n_heads * d_head
+    let start = cur - window
+
+    let mut k_bufs = c["k_bufs"]
+    let mut v_bufs = c["v_bufs"]
+    let mut kb = k_bufs[layer]
+    let mut vb = v_bufs[layer]
+
+    let mut new_idx = 0
+    while new_idx < window {
+        let src = start + new_idx
+        let src_base = src * slab_row
+        let dst_base = new_idx * slab_row
+        let mut d = 0
+        while d < slab_row {
+            kb[dst_base + d] = kb[src_base + d]
+            vb[dst_base + d] = vb[src_base + d]
+            d = d + 1
+        }
+        new_idx = new_idx + 1
+    }
+    k_bufs[layer] = kb
+    v_bufs[layer] = vb
+    c["k_bufs"] = k_bufs
+    c["v_bufs"] = v_bufs
+
+    let mut new_lens = lens
+    new_lens[layer] = window
+    c["lengths"] = new_lens
+    return c
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Reset — clear all lengths (slab contents irrelevant)
+// ═══════════════════════════════════════════════════════════════════
+
+fn mpskv_reset(cache) {
+    let mut c = cache
+    let n_layers = c["n_layers"]
+    let mut new_lens = []
+    let mut i = 0
+    while i < n_layers {
+        new_lens = new_lens + [0]
+        i = i + 1
+    }
+    c["lengths"] = new_lens
+    return c
+}
