@@ -1,0 +1,509 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/zamba_hybrid.hexa — Zamba Hybrid (Mamba + Shared Attention)
+//
+//  SSOT: shared/hexa-lang/ml-next-level.json id=210
+//
+//  Zamba alternates many cheap Mamba (SSM) blocks with periodically
+//  inserted SHARED self-attention blocks. The attention parameters
+//  (W_q, W_k, W_v, W_o) are reused across every shared layer instead
+//  of being duplicated, with a small per-layer linear adapter that
+//  projects the layer-local hidden state into / out of the shared
+//  attention space. Net effect: a transformer-class hybrid with the
+//  parameter footprint of a Mamba stack plus a single attention block.
+//
+//  Architecture (layers 0..N-1):
+//      every layer        :  cheap Mamba/SSM block (per-layer state)
+//      every K-th layer   :  + shared self-attention (with adapter)
+//
+//      shared attention is the SAME object across all attention slots
+//      per-layer adapter (W_in, W_out) is unique per layer
+//
+//  API:
+//    zam_create_config(n_layers, shared_attn_every, dim, d_head, n_heads) -> #{}
+//    zam_create_shared_attn(dim, d_head, n_heads)                          -> #{}
+//    zam_per_layer_proj(dim)                                               -> #{}
+//    zam_mamba_block_forward(state, x, dim)                                -> #{}
+//    zam_shared_attn_forward(x_seq, attn_params, seq_len, d_head, n_heads) -> [[float]]
+//    zam_layer_forward(layer_idx, x_seq, state, config,
+//                      attn_params, layer_params)                          -> #{}
+//    zam_build_layer_plan(config)                                          -> [string]
+//    zam_count_attn_layers(plan)                                           -> int
+//    zam_count_unique_params(config, attn_params, per_layer_params)        -> int
+//    zam_forward(config, attn_params, per_layer_params, x_seq, seq_len, dim) -> [[float]]
+//    zam_softmax_row(row, n)                                               -> [float]
+//    zam_residual_add(x, y, n)                                             -> [float]
+//
+//  AI-NATIVE attrs:
+//    @pure — math helpers free of side effects
+//    @hot  — called every forward pass
+// ═══════════════════════════════════════════════════════════════════
+
+// ── numeric helpers ──────────────────────────────────────────────
+
+fn zam_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn zam_max_f(a, b) {
+    if a > b { return a }
+    return b
+}
+
+@pure
+fn zam_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+@pure
+fn zam_sigmoid(x) {
+    if x > 20.0 { return 1.0 }
+    if x < -20.0 { return 0.0 }
+    return 1.0 / (1.0 + zam_exp(0.0 - x))
+}
+
+fn zam_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 { g = (g + x / g) / 2.0 }
+    return g
+}
+
+// ── deterministic LCG (no global mutable, fully pure) ───────────
+
+fn zam_hash(seed, i, j) {
+    let h = ((seed * 2654435761 + i * 1315423911 + j * 731) % 10007)
+    return to_float(h) / 10007.0 - 0.5
+}
+
+// ── vector / matrix builders ────────────────────────────────────
+
+fn zam_zeros_1d(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn zam_zeros_2d(r, c) {
+    let mut m = []
+    for _i in 0..r {
+        let mut row = []
+        for _j in 0..c { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+fn zam_init_matrix(rows, cols, seed) {
+    let mut m = []
+    for i in 0..rows {
+        let mut row = []
+        for j in 0..cols {
+            row = row + [zam_hash(seed, i, j) * 0.1]
+        }
+        m = m + [row]
+    }
+    return m
+}
+
+// ── matvec: W [rows][cols] * v [cols] -> [rows] ─────────────────
+@hot
+fn zam_matvec(W, v, rows, cols) {
+    let mut out = []
+    let mut i = 0
+    while i < rows {
+        let mut s = 0.0
+        let mut j = 0
+        while j < cols {
+            s = s + W[i][j] * v[j]
+            j = j + 1
+        }
+        out = out + [s]
+        i = i + 1
+    }
+    return out
+}
+
+// ── softmax with max-subtraction for stability ──────────────────
+@pure
+fn zam_softmax_row(row, n) {
+    if n <= 0 { return [] }
+    let mut m = row[0]
+    let mut i = 1
+    while i < n {
+        if row[i] > m { m = row[i] }
+        i = i + 1
+    }
+    let mut exps = []
+    let mut k = 0
+    let mut total = 0.0
+    while k < n {
+        let e = zam_exp(row[k] - m)
+        exps = exps + [e]
+        total = total + e
+        k = k + 1
+    }
+    if total <= 0.0 { return exps }
+    let mut out = []
+    let mut q = 0
+    while q < n {
+        out = out + [exps[q] / total]
+        q = q + 1
+    }
+    return out
+}
+
+// ── element-wise residual add (pure, dim n) ─────────────────────
+@pure
+fn zam_residual_add(x, y, n) {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [x[i] + y[i]]
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  config + factory
+// ═══════════════════════════════════════════════════════════════════
+
+// Returns a #{} dict so callers can index by string key — keeps the
+// API uniform with other ml/* modules and avoids struct-in-if pitfalls.
+fn zam_create_config(n_layers, shared_attn_every, dim, d_head, n_heads) {
+    return #{
+        "n_layers": n_layers,
+        "shared_attn_every": shared_attn_every,
+        "dim": dim,
+        "d_head": d_head,
+        "n_heads": n_heads
+    }
+}
+
+// Shared attention parameters: SAME object reused across every Kth
+// layer. Includes W_q,W_k,W_v in the (n_heads*d_head, dim) shape and
+// W_o that projects (n_heads*d_head, dim).
+fn zam_create_shared_attn(dim, d_head, n_heads) {
+    let proj_dim = n_heads * d_head
+    let W_q = zam_init_matrix(proj_dim, dim, 11)
+    let W_k = zam_init_matrix(proj_dim, dim, 22)
+    let W_v = zam_init_matrix(proj_dim, dim, 33)
+    let W_o = zam_init_matrix(dim, proj_dim, 44)
+    return #{
+        "W_q": W_q,
+        "W_k": W_k,
+        "W_v": W_v,
+        "W_o": W_o,
+        "dim": dim,
+        "d_head": d_head,
+        "n_heads": n_heads,
+        "proj_dim": proj_dim
+    }
+}
+
+// Per-layer projection: tiny linear that warps THIS layer's hidden
+// into the shared attention input space and a matching W_out coming
+// back. Independent per layer => "shared attention with per-layer
+// adapter" pattern from the Zamba paper.
+fn zam_per_layer_proj(dim) {
+    let W_in = zam_init_matrix(dim, dim, 55)
+    let W_out = zam_init_matrix(dim, dim, 66)
+    // identity diagonal bump so a fresh adapter starts close to id
+    let mut Wi = W_in
+    let mut Wo = W_out
+    let mut k = 0
+    while k < dim {
+        Wi[k][k] = Wi[k][k] + 1.0
+        Wo[k][k] = Wo[k][k] + 1.0
+        k = k + 1
+    }
+    return #{
+        "W_in": Wi,
+        "W_out": Wo,
+        "dim": dim
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Mamba block (cheap SSM-like recurrence, per-layer state)
+//
+//  state[i+1] = decay*state[i] + x[i]
+//  y[i]       = sigmoid(state[i+1]) * x[i]
+//
+//  Returns #{ "state": new_state, "y": output_vec }
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn zam_mamba_block_forward(state, x, dim) {
+    let decay = 0.9
+    let mut new_state = []
+    let mut y = []
+    let mut i = 0
+    while i < dim {
+        let s = decay * state[i] + x[i]
+        new_state = new_state + [s]
+        let g = zam_sigmoid(s)
+        y = y + [g * x[i]]
+        i = i + 1
+    }
+    return #{
+        "state": new_state,
+        "y": y
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Shared attention forward (single-head simplification)
+//
+//  Q,K,V: project x_seq[t] -> proj_dim, then standard scaled
+//  dot-product attention. Causal-style row-softmax.
+//  Output: project back via W_o -> [seq_len, dim]
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn zam_shared_attn_forward(x_seq, attn_params, seq_len, d_head, n_heads) {
+    let dim = attn_params["dim"]
+    let proj_dim = attn_params["proj_dim"]
+    let W_q = attn_params["W_q"]
+    let W_k = attn_params["W_k"]
+    let W_v = attn_params["W_v"]
+    let W_o = attn_params["W_o"]
+
+    // 1) project each step into Q,K,V (shape [seq_len, proj_dim])
+    let mut Q = []
+    let mut K = []
+    let mut V = []
+    let mut t = 0
+    while t < seq_len {
+        Q = Q + [zam_matvec(W_q, x_seq[t], proj_dim, dim)]
+        K = K + [zam_matvec(W_k, x_seq[t], proj_dim, dim)]
+        V = V + [zam_matvec(W_v, x_seq[t], proj_dim, dim)]
+        t = t + 1
+    }
+
+    let scale = 1.0 / zam_sqrt(to_float(d_head))
+
+    // 2) attention scores -> softmax -> aggregate V
+    //    we treat n_heads*d_head as a single flat dim for simplicity
+    //    (good enough for shape/correctness tests; physical multi-head
+    //    is inside the linear projection structure).
+    let mut ctx = []
+    let mut ti = 0
+    while ti < seq_len {
+        // raw scores [seq_len]
+        let mut row = []
+        let mut tj = 0
+        while tj < seq_len {
+            let mut s = 0.0
+            let mut k = 0
+            while k < proj_dim {
+                s = s + Q[ti][k] * K[tj][k]
+                k = k + 1
+            }
+            row = row + [s * scale]
+            tj = tj + 1
+        }
+        let probs = zam_softmax_row(row, seq_len)
+        // sum probs[tj] * V[tj]
+        let mut acc = zam_zeros_1d(proj_dim)
+        let mut tj2 = 0
+        while tj2 < seq_len {
+            let p = probs[tj2]
+            let mut k2 = 0
+            while k2 < proj_dim {
+                acc[k2] = acc[k2] + p * V[tj2][k2]
+                k2 = k2 + 1
+            }
+            tj2 = tj2 + 1
+        }
+        ctx = ctx + [acc]
+        ti = ti + 1
+    }
+
+    // 3) project back to model dim via W_o
+    let mut out_seq = []
+    let mut tt = 0
+    while tt < seq_len {
+        out_seq = out_seq + [zam_matvec(W_o, ctx[tt], dim, proj_dim)]
+        tt = tt + 1
+    }
+    return out_seq
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Layer plan: list of "mamba" / "shared_attn"
+//
+//  Every shared_attn_every-th layer carries an attention slot.
+//  Layer 0 is always Mamba so the plan stays length == n_layers.
+// ═══════════════════════════════════════════════════════════════════
+fn zam_build_layer_plan(config) {
+    let n = config["n_layers"]
+    let k = config["shared_attn_every"]
+    let mut plan = []
+    let mut i = 0
+    while i < n {
+        if k > 0 {
+            if i > 0 {
+                if (i % k) == 0 {
+                    plan = plan + ["shared_attn"]
+                } else {
+                    plan = plan + ["mamba"]
+                }
+            } else {
+                plan = plan + ["mamba"]
+            }
+        } else {
+            plan = plan + ["mamba"]
+        }
+        i = i + 1
+    }
+    return plan
+}
+
+fn zam_count_attn_layers(plan) {
+    let mut c = 0
+    let mut i = 0
+    while i < len(plan) {
+        if plan[i] == "shared_attn" { c = c + 1 }
+        i = i + 1
+    }
+    return c
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Single layer forward
+//
+//  inputs:
+//    x_seq        : [seq_len, dim]
+//    state        : per-layer mamba state, [dim]
+//    config       : zam_create_config dict
+//    attn_params  : SHARED zam_create_shared_attn dict
+//    layer_params : per-layer adapter (W_in / W_out / dim)
+//
+//  output: #{ "x_seq": new x_seq, "state": new mamba state }
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn zam_layer_forward(layer_idx, x_seq, state, config, attn_params, layer_params) {
+    let dim = config["dim"]
+    let d_head = config["d_head"]
+    let n_heads = config["n_heads"]
+    let k = config["shared_attn_every"]
+    let seq_len = len(x_seq)
+
+    // 1) Mamba per timestep, threading state forward
+    let mut cur_state = state
+    let mut mamba_seq = []
+    let mut t = 0
+    while t < seq_len {
+        let r = zam_mamba_block_forward(cur_state, x_seq[t], dim)
+        cur_state = r["state"]
+        mamba_seq = mamba_seq + [r["y"]]
+        t = t + 1
+    }
+
+    // residual after mamba branch
+    let mut after_mamba = []
+    let mut tr = 0
+    while tr < seq_len {
+        after_mamba = after_mamba + [zam_residual_add(x_seq[tr], mamba_seq[tr], dim)]
+        tr = tr + 1
+    }
+
+    // 2) Conditional shared attention (every Kth layer, skip layer 0)
+    let needs_attn = (k > 0) && (layer_idx > 0) && ((layer_idx % k) == 0)
+
+    if needs_attn {
+        // adapter: project each step into shared space via W_in
+        let W_in = layer_params["W_in"]
+        let W_out = layer_params["W_out"]
+        let mut adapted = []
+        let mut s = 0
+        while s < seq_len {
+            adapted = adapted + [zam_matvec(W_in, after_mamba[s], dim, dim)]
+            s = s + 1
+        }
+        let attn_out = zam_shared_attn_forward(adapted, attn_params, seq_len, d_head, n_heads)
+        // back-project + residual
+        let mut out_seq = []
+        let mut t2 = 0
+        while t2 < seq_len {
+            let back = zam_matvec(W_out, attn_out[t2], dim, dim)
+            out_seq = out_seq + [zam_residual_add(after_mamba[t2], back, dim)]
+            t2 = t2 + 1
+        }
+        return #{
+            "x_seq": out_seq,
+            "state": cur_state
+        }
+    }
+
+    return #{
+        "x_seq": after_mamba,
+        "state": cur_state
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Full forward over all N layers
+//
+//  per_layer_params : array of length n_layers, each is a per-layer
+//                     adapter dict from zam_per_layer_proj.
+//  attn_params      : single SHARED dict — same object every layer.
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn zam_forward(config, attn_params, per_layer_params, x_seq, seq_len, dim) {
+    let n = config["n_layers"]
+    // initial mamba state per layer = zeros[dim]
+    let mut states = []
+    let mut i0 = 0
+    while i0 < n {
+        states = states + [zam_zeros_1d(dim)]
+        i0 = i0 + 1
+    }
+    let mut cur = x_seq
+    let mut layer = 0
+    while layer < n {
+        let r = zam_layer_forward(layer, cur, states[layer], config, attn_params, per_layer_params[layer])
+        cur = r["x_seq"]
+        states[layer] = r["state"]
+        layer = layer + 1
+    }
+    return cur
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Param count estimate
+//
+//  shared attn:    proj_dim*dim*3 + dim*proj_dim   = 4 * proj_dim * dim
+//  per-layer adapter:  2 * dim * dim
+//  full attn baseline (no sharing): 4 * proj_dim * dim * (#attn layers)
+// ═══════════════════════════════════════════════════════════════════
+fn zam_count_unique_params(config, shared_attn_params, per_layer_params) {
+    let dim = config["dim"]
+    let proj_dim = shared_attn_params["proj_dim"]
+    let attn_unique = 4 * proj_dim * dim                       // shared once
+    let n_layers = config["n_layers"]
+    let adapter_per_layer = 2 * dim * dim
+    let total_adapter = adapter_per_layer * n_layers
+    return attn_unique + total_adapter
+}
+
+// Reference: param count if attention were duplicated per attn layer
+// (no sharing), used by tests to confirm sharing reduces footprint.
+fn zam_count_full_attn_params(config, shared_attn_params, plan) {
+    let dim = config["dim"]
+    let proj_dim = shared_attn_params["proj_dim"]
+    let n_attn = zam_count_attn_layers(plan)
+    let attn_per_layer = 4 * proj_dim * dim
+    return attn_per_layer * n_attn
+}

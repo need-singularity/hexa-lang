@@ -1,0 +1,624 @@
+// ═══════════════════════════════════════════════════════════════
+//  test_mps_flash_attention.hexa — MPS Flash Attention verification
+//
+//  ML roadmap #201 — MPSGraph-based scaled-dot-product attention
+//
+//  Tests (32):
+//    T1  mpsfa_softmax_row sums to 1.0
+//    T2  mpsfa_softmax_row non-negative
+//    T3  mpsfa_softmax_row on uniform input yields uniform output
+//    T4  mpsfa_softmax_row max-subtract handles large scores
+//    T5  mpsfa_softmax_row handles entirely masked row (uniform fallback)
+//    T6  mpsfa_causal_mask_score: upper triangle is -inf
+//    T7  mpsfa_causal_mask_score: lower triangle preserved
+//    T8  mpsfa_scaled_dot_product shape [L, d_head]
+//    T9  mpsfa_scaled_dot_product rows are finite
+//    T10 mpsfa_scaled_dot_product K=V=I, uniform Q ≈ mean of V rows
+//    T11 mpsfa_scaled_dot_product zero V → zero output
+//    T12 mpsfa_tile_forward tile_size=1 matches non-tiled (<1e-5)
+//    T13 mpsfa_tile_forward tile_size=2 matches non-tiled (<1e-5)
+//    T14 mpsfa_tile_forward tile_size=full matches non-tiled (<1e-5)
+//    T15 mpsfa_tile_forward odd tile_size (tile_size=3, L=7) matches
+//    T16 mpsfa_multi_head output shape [L, n_heads * d_head]
+//    T17 mpsfa_multi_head head blocks correct
+//    T18 mpsfa_fused_qkv_proj Q,K,V shapes match [L, d_head]
+//    T19 mpsfa_fused_qkv_proj zero input → zero Q,K,V
+//    T20 mpsfa_out_proj output shape [L, dim]
+//    T21 mpsfa_out_proj zero weights → zero output
+//    T22 mpsfa_attention_entropy length == seq_len
+//    T23 mpsfa_attention_entropy bounded [0, log(seq_len)]
+//    T24 mpsfa_attention_entropy peaked row ≈ 0
+//    T25 mpsfa_attention_entropy uniform row ≈ log(seq_len)
+//    T26 mpsfa_with_dropout_mask renormalizes to 1.0 per row
+//    T27 mpsfa_with_dropout_mask all-zero row → zero row
+//    T28 mpsfa_create_graph_descriptor has required keys
+//    T29 mpsfa_create_graph_descriptor scale = 1/sqrt(d_head)
+//    T30 mpsfa_scaled_dot_product_causal: output i depends only on ≤ i
+//    T31 numerical stability: large raw scores do not overflow
+//    T32 mpsfa_raw_scores symmetric for symmetric inputs
+//
+//  Run: PATH=/Users/ghost/.cargo/bin:$PATH ./hexa self/test_mps_flash_attention.hexa
+// ═══════════════════════════════════════════════════════════════
+
+import "ml/mps_flash_attention.hexa"
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn t_fabs(x) {
+    if x < 0.0 {
+        return 0.0 - x
+    }
+    return x
+}
+
+fn t_approx(a, b, eps) {
+    return t_fabs(a - b) < eps
+}
+
+fn mat_max_diff(A, B) {
+    let mut mx = 0.0
+    let mut i = 0
+    while i < len(A) {
+        let mut j = 0
+        while j < len(A[i]) {
+            let d = t_fabs(A[i][j] - B[i][j])
+            if d > mx {
+                mx = d
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return mx
+}
+
+fn make_identity(n) {
+    let mut m = []
+    let mut i = 0
+    while i < n {
+        let mut row = []
+        let mut j = 0
+        while j < n {
+            if i == j {
+                row = row + [1.0]
+            } else {
+                row = row + [0.0]
+            }
+            j = j + 1
+        }
+        m = m + [row]
+        i = i + 1
+    }
+    return m
+}
+
+fn make_filled(r, c, v) {
+    let mut m = []
+    let mut i = 0
+    while i < r {
+        let mut row = []
+        let mut j = 0
+        while j < c {
+            row = row + [v]
+            j = j + 1
+        }
+        m = m + [row]
+        i = i + 1
+    }
+    return m
+}
+
+// Deterministic pseudo-random matrix in [-1, 1] via hash.
+fn make_rand(r, c, seed) {
+    let mut m = []
+    let mut i = 0
+    while i < r {
+        let mut row = []
+        let mut j = 0
+        while j < c {
+            let h = (i * 131 + j * 97 + seed * 173) % 10007
+            let v = to_float(h) / 10007.0 * 2.0 - 1.0
+            row = row + [v]
+            j = j + 1
+        }
+        m = m + [row]
+        i = i + 1
+    }
+    return m
+}
+
+println("=======================================================")
+println("  MPS Flash Attention (#201) Test Suite")
+println("=======================================================")
+
+// ─── T1: softmax sums to 1.0 ──────────────────────────────────
+let sm_in = [1.0, 2.0, 3.0, 0.5, 1.5]
+let sm_out = mpsfa_softmax_row(sm_in, 5)
+let mut sm_sum = 0.0
+let mut ti = 0
+while ti < 5 {
+    sm_sum = sm_sum + sm_out[ti]
+    ti = ti + 1
+}
+check("T1 softmax sums to 1.0", t_approx(sm_sum, 1.0, 1.0e-6))
+
+// ─── T2: softmax non-negative ─────────────────────────────────
+let mut sm_nneg = true
+ti = 0
+while ti < 5 {
+    if sm_out[ti] < 0.0 {
+        sm_nneg = false
+    }
+    ti = ti + 1
+}
+check("T2 softmax non-negative", sm_nneg)
+
+// ─── T3: softmax on uniform input yields uniform output ────────
+let uniform_in = [2.0, 2.0, 2.0, 2.0]
+let uniform_out = mpsfa_softmax_row(uniform_in, 4)
+let mut uni_ok = true
+let mut ui = 0
+while ui < 4 {
+    if !t_approx(uniform_out[ui], 0.25, 1.0e-9) {
+        uni_ok = false
+    }
+    ui = ui + 1
+}
+check("T3 softmax uniform input → uniform output", uni_ok)
+
+// ─── T4: softmax handles large scores (numerical stability) ────
+let big_in = [1000.0, 1001.0, 999.0]
+let big_out = mpsfa_softmax_row(big_in, 3)
+let mut big_sum = 0.0
+let mut bi = 0
+while bi < 3 {
+    big_sum = big_sum + big_out[bi]
+    bi = bi + 1
+}
+check("T4 softmax large scores sums to 1.0", t_approx(big_sum, 1.0, 1.0e-6))
+
+// ─── T5: entirely masked row → uniform fallback ───────────────
+let masked_in = [mpsfa_neg_inf(), mpsfa_neg_inf(), mpsfa_neg_inf(), mpsfa_neg_inf()]
+let masked_out = mpsfa_softmax_row(masked_in, 4)
+let mut masked_sum = 0.0
+let mut mi = 0
+while mi < 4 {
+    masked_sum = masked_sum + masked_out[mi]
+    mi = mi + 1
+}
+check("T5 fully masked row → uniform fallback (sum=1)", t_approx(masked_sum, 1.0, 1.0e-6))
+
+// ─── T6/T7: causal mask correctness ───────────────────────────
+let L6 = 4
+let D6 = 3
+let Q6 = make_rand(L6, D6, 1)
+let K6 = make_rand(L6, D6, 2)
+let raw6 = mpsfa_raw_scores(Q6, K6, L6, D6)
+let masked6 = mpsfa_causal_mask_score(raw6, L6)
+
+let mut upper_ok = true
+let mut lower_ok = true
+let mut ii = 0
+while ii < L6 {
+    let mut jj = 0
+    while jj < L6 {
+        if jj > ii {
+            if masked6[ii][jj] > (0.0 - 1.0e29) {
+                upper_ok = false
+            }
+        } else {
+            if !t_approx(masked6[ii][jj], raw6[ii][jj], 1.0e-12) {
+                lower_ok = false
+            }
+        }
+        jj = jj + 1
+    }
+    ii = ii + 1
+}
+check("T6 causal mask: upper triangle is -inf", upper_ok)
+check("T7 causal mask: lower triangle preserved", lower_ok)
+
+// ─── T8/T9: SDPA shape and finiteness ─────────────────────────
+let L8 = 5
+let D8 = 4
+let Q8 = make_rand(L8, D8, 10)
+let K8 = make_rand(L8, D8, 20)
+let V8 = make_rand(L8, D8, 30)
+let out8 = mpsfa_scaled_dot_product(Q8, K8, V8, L8, D8)
+check("T8 SDPA shape [L, d_head]", len(out8) == L8 && len(out8[0]) == D8)
+
+let mut finite_ok = true
+let mut i9 = 0
+while i9 < L8 {
+    let mut j9 = 0
+    while j9 < D8 {
+        let v = out8[i9][j9]
+        if t_fabs(v) > 1.0e20 {
+            finite_ok = false
+        }
+        j9 = j9 + 1
+    }
+    i9 = i9 + 1
+}
+check("T9 SDPA rows are finite", finite_ok)
+
+// ─── T10: K=V=I, uniform Q ≈ mean of V rows = mean of I rows ───
+// With K=I, score = Q @ I^T = Q (identity). With Q all equal,
+// every row of softmax is uniform → output equals (1/L) * sum of V rows.
+// Since V = I, each output row = (1/L, 1/L, ..., 1/L).
+let L10 = 4
+let V_I = make_identity(L10)
+let K_I = make_identity(L10)
+let Q_uni = make_filled(L10, L10, 0.5)
+let out10 = mpsfa_scaled_dot_product(Q_uni, K_I, V_I, L10, L10)
+let mut uni_ok2 = true
+let mut i10 = 0
+while i10 < L10 {
+    let mut j10 = 0
+    while j10 < L10 {
+        if !t_approx(out10[i10][j10], 1.0 / to_float(L10), 1.0e-6) {
+            uni_ok2 = false
+        }
+        j10 = j10 + 1
+    }
+    i10 = i10 + 1
+}
+check("T10 uniform Q + K=V=I → row = (1/L,...)", uni_ok2)
+
+// ─── T11: zero V → zero output ────────────────────────────────
+let L11 = 4
+let D11 = 3
+let Q11 = make_rand(L11, D11, 5)
+let K11 = make_rand(L11, D11, 6)
+let V11 = make_filled(L11, D11, 0.0)
+let out11 = mpsfa_scaled_dot_product(Q11, K11, V11, L11, D11)
+let mut zero_ok = true
+let mut i11 = 0
+while i11 < L11 {
+    let mut j11 = 0
+    while j11 < D11 {
+        if t_fabs(out11[i11][j11]) > 1.0e-9 {
+            zero_ok = false
+        }
+        j11 = j11 + 1
+    }
+    i11 = i11 + 1
+}
+check("T11 zero V → zero output", zero_ok)
+
+// ─── T12–T15: tiled SDPA matches non-tiled ────────────────────
+let L12 = 6
+let D12 = 4
+let Q12 = make_rand(L12, D12, 100)
+let K12 = make_rand(L12, D12, 200)
+let V12 = make_rand(L12, D12, 300)
+let ref12 = mpsfa_scaled_dot_product(Q12, K12, V12, L12, D12)
+
+let tiled_1 = mpsfa_tile_forward(Q12, K12, V12, L12, D12, 1)
+let diff_1 = mat_max_diff(ref12, tiled_1)
+check("T12 tile_size=1 matches non-tiled (<1e-5)", diff_1 < 1.0e-5)
+
+let tiled_2 = mpsfa_tile_forward(Q12, K12, V12, L12, D12, 2)
+let diff_2 = mat_max_diff(ref12, tiled_2)
+check("T13 tile_size=2 matches non-tiled (<1e-5)", diff_2 < 1.0e-5)
+
+let tiled_full = mpsfa_tile_forward(Q12, K12, V12, L12, D12, L12)
+let diff_full = mat_max_diff(ref12, tiled_full)
+check("T14 tile_size=full matches non-tiled (<1e-5)", diff_full < 1.0e-5)
+
+let L15 = 7
+let D15 = 3
+let Q15 = make_rand(L15, D15, 111)
+let K15 = make_rand(L15, D15, 222)
+let V15 = make_rand(L15, D15, 333)
+let ref15 = mpsfa_scaled_dot_product(Q15, K15, V15, L15, D15)
+let tiled_3 = mpsfa_tile_forward(Q15, K15, V15, L15, D15, 3)
+let diff_3 = mat_max_diff(ref15, tiled_3)
+check("T15 odd tile_size=3 L=7 matches non-tiled", diff_3 < 1.0e-5)
+
+// ─── T16/T17: multi-head SDPA ─────────────────────────────────
+let N_H = 3
+let D_H = 2
+let L_H = 4
+let mut Q_heads = []
+let mut K_heads = []
+let mut V_heads = []
+let mut h16 = 0
+while h16 < N_H {
+    Q_heads = Q_heads + [make_rand(L_H, D_H, 500 + h16)]
+    K_heads = K_heads + [make_rand(L_H, D_H, 600 + h16)]
+    V_heads = V_heads + [make_rand(L_H, D_H, 700 + h16)]
+    h16 = h16 + 1
+}
+let mh_out = mpsfa_multi_head(Q_heads, K_heads, V_heads, N_H, D_H, L_H)
+check("T16 multi-head shape [L, n_heads*d_head]", len(mh_out) == L_H && len(mh_out[0]) == N_H * D_H)
+
+// Verify head blocks: for head 0, the first D_H columns should match the
+// single-head SDPA output for Q_heads[0], K_heads[0], V_heads[0].
+let head0_ref = mpsfa_scaled_dot_product(Q_heads[0], K_heads[0], V_heads[0], L_H, D_H)
+let mut block_ok = true
+let mut i17 = 0
+while i17 < L_H {
+    let mut d17 = 0
+    while d17 < D_H {
+        if !t_approx(mh_out[i17][d17], head0_ref[i17][d17], 1.0e-9) {
+            block_ok = false
+        }
+        d17 = d17 + 1
+    }
+    i17 = i17 + 1
+}
+check("T17 multi-head head-0 block matches single-head", block_ok)
+
+// ─── T18/T19: fused QKV projection ────────────────────────────
+let L18 = 3
+let DIM18 = 4
+let DH18 = 2
+let x18 = make_rand(L18, DIM18, 900)
+let Wq = make_rand(DIM18, DH18, 901)
+let Wk = make_rand(DIM18, DH18, 902)
+let Wv = make_rand(DIM18, DH18, 903)
+let qkv = mpsfa_fused_qkv_proj(x18, Wq, Wk, Wv, DIM18, DH18)
+let Q18 = qkv[0]
+let K18 = qkv[1]
+let V18 = qkv[2]
+check("T18 fused_qkv_proj shapes match [L, d_head]",
+    len(Q18) == L18 && len(Q18[0]) == DH18 &&
+    len(K18) == L18 && len(K18[0]) == DH18 &&
+    len(V18) == L18 && len(V18[0]) == DH18)
+
+let x_zero = make_filled(L18, DIM18, 0.0)
+let qkv_zero = mpsfa_fused_qkv_proj(x_zero, Wq, Wk, Wv, DIM18, DH18)
+let mut qkv_zero_ok = true
+let mut i19 = 0
+while i19 < L18 {
+    let mut d19 = 0
+    while d19 < DH18 {
+        if t_fabs(qkv_zero[0][i19][d19]) > 1.0e-12 { qkv_zero_ok = false }
+        if t_fabs(qkv_zero[1][i19][d19]) > 1.0e-12 { qkv_zero_ok = false }
+        if t_fabs(qkv_zero[2][i19][d19]) > 1.0e-12 { qkv_zero_ok = false }
+        d19 = d19 + 1
+    }
+    i19 = i19 + 1
+}
+check("T19 zero input → zero Q,K,V", qkv_zero_ok)
+
+// ─── T20/T21: output projection ───────────────────────────────
+let L20 = 3
+let FEAT = 5
+let DIM20 = 4
+let attn20 = make_rand(L20, FEAT, 400)
+let Wo = make_rand(FEAT, DIM20, 401)
+let proj20 = mpsfa_out_proj(attn20, Wo, DIM20)
+check("T20 out_proj shape [L, dim]", len(proj20) == L20 && len(proj20[0]) == DIM20)
+
+let Wo_zero = make_filled(FEAT, DIM20, 0.0)
+let proj21 = mpsfa_out_proj(attn20, Wo_zero, DIM20)
+let mut proj21_ok = true
+let mut i21 = 0
+while i21 < L20 {
+    let mut d21 = 0
+    while d21 < DIM20 {
+        if t_fabs(proj21[i21][d21]) > 1.0e-12 {
+            proj21_ok = false
+        }
+        d21 = d21 + 1
+    }
+    i21 = i21 + 1
+}
+check("T21 out_proj zero weights → zero", proj21_ok)
+
+// ─── T22–T25: attention entropy ───────────────────────────────
+let L22 = 4
+let D22 = 3
+let Q22 = make_rand(L22, D22, 11)
+let K22 = make_rand(L22, D22, 22)
+let raw22 = mpsfa_raw_scores(Q22, K22, L22, D22)
+let ents22 = mpsfa_attention_entropy(raw22, L22)
+check("T22 entropy length == seq_len", len(ents22) == L22)
+
+let log_L = log(to_float(L22))
+let mut bounds_ok = true
+let mut i23 = 0
+while i23 < L22 {
+    let e = ents22[i23]
+    if e < 0.0 - 1.0e-9 { bounds_ok = false }
+    if e > log_L + 1.0e-6 { bounds_ok = false }
+    i23 = i23 + 1
+}
+check("T23 entropy bounded [0, log(L)]", bounds_ok)
+
+// Peaked row: one score very large → entropy ≈ 0
+// Build full 4x4 matrix where every row is peaked.
+let peaked_scores = [
+    [100.0, -100.0, -100.0, -100.0],
+    [100.0, -100.0, -100.0, -100.0],
+    [100.0, -100.0, -100.0, -100.0],
+    [100.0, -100.0, -100.0, -100.0]
+]
+let ent_peaked = mpsfa_attention_entropy(peaked_scores, 4)
+check("T24 peaked row entropy ≈ 0", ent_peaked[0] < 1.0e-6)
+
+// Uniform row: all equal scores → entropy = log(L)
+let flat_scores = [
+    [0.5, 0.5, 0.5, 0.5],
+    [0.5, 0.5, 0.5, 0.5],
+    [0.5, 0.5, 0.5, 0.5],
+    [0.5, 0.5, 0.5, 0.5]
+]
+let ent_flat = mpsfa_attention_entropy(flat_scores, 4)
+check("T25 uniform row entropy ≈ log(4)", t_approx(ent_flat[0], log(4.0), 1.0e-6))
+
+// ─── T26: dropout mask renormalizes ───────────────────────────
+// Start with uniform probability matrix, apply mask keeping 2 of 4
+// per row → resulting row should sum to 1.0.
+let probs26 = [[0.25, 0.25, 0.25, 0.25], [0.25, 0.25, 0.25, 0.25]]
+let mask26 = [[1.0, 0.0, 1.0, 0.0], [0.0, 1.0, 0.0, 1.0]]
+let drop26 = mpsfa_with_dropout_mask(probs26, mask26)
+let mut row0_sum = 0.0
+let mut row1_sum = 0.0
+let mut k26 = 0
+while k26 < 4 {
+    row0_sum = row0_sum + drop26[0][k26]
+    row1_sum = row1_sum + drop26[1][k26]
+    k26 = k26 + 1
+}
+check("T26 dropout mask renormalizes rows to 1.0",
+    t_approx(row0_sum, 1.0, 1.0e-9) && t_approx(row1_sum, 1.0, 1.0e-9))
+
+// ─── T27: all-zero mask row → zero row ────────────────────────
+let probs27 = [[0.25, 0.25, 0.25, 0.25]]
+let mask27 = [[0.0, 0.0, 0.0, 0.0]]
+let drop27 = mpsfa_with_dropout_mask(probs27, mask27)
+let mut row27_sum = 0.0
+let mut k27 = 0
+while k27 < 4 {
+    row27_sum = row27_sum + drop27[0][k27]
+    k27 = k27 + 1
+}
+check("T27 all-zero mask → zero row", row27_sum < 1.0e-12)
+
+// ─── T28/T29: graph descriptor ────────────────────────────────
+let desc = mpsfa_create_graph_descriptor(16, 4, 8)
+check("T28 descriptor has required keys",
+    desc["seq_len"] == 16 &&
+    desc["n_heads"] == 4 &&
+    desc["d_head"] == 8 &&
+    desc["model_dim"] == 32 &&
+    desc["op"] == "mpsfa_sdpa")
+
+let expected_scale = 1.0 / sqrt(8.0)
+check("T29 descriptor scale = 1/sqrt(d_head)",
+    t_approx(desc["scale"], expected_scale, 1.0e-9))
+
+// ─── T30: causal output at position i only depends on ≤ i ────
+// Construct two K sequences that differ only at position L-1
+// (the future position) — the causal output at position 0 must be
+// identical for both since j > 0 is masked except position 0 itself.
+let L30 = 4
+let D30 = 3
+let Q30 = make_rand(L30, D30, 55)
+let mut K30a = make_rand(L30, D30, 66)
+let mut V30a = make_rand(L30, D30, 77)
+let mut K30b = []
+let mut V30b = []
+let mut i30 = 0
+while i30 < L30 {
+    let mut ra = []
+    let mut rb = []
+    let mut j30 = 0
+    while j30 < D30 {
+        ra = ra + [K30a[i30][j30]]
+        rb = rb + [V30a[i30][j30]]
+        j30 = j30 + 1
+    }
+    K30b = K30b + [ra]
+    V30b = V30b + [rb]
+    i30 = i30 + 1
+}
+// Perturb only the last row (future position from i=0's perspective).
+let mut K30b_new = []
+let mut V30b_new = []
+let mut it30 = 0
+while it30 < L30 {
+    if it30 == L30 - 1 {
+        let mut nk = []
+        let mut nv = []
+        let mut jt30 = 0
+        while jt30 < D30 {
+            nk = nk + [K30b[it30][jt30] + 10.0]
+            nv = nv + [V30b[it30][jt30] + 10.0]
+            jt30 = jt30 + 1
+        }
+        K30b_new = K30b_new + [nk]
+        V30b_new = V30b_new + [nv]
+    } else {
+        K30b_new = K30b_new + [K30b[it30]]
+        V30b_new = V30b_new + [V30b[it30]]
+    }
+    it30 = it30 + 1
+}
+let outA = mpsfa_scaled_dot_product_causal(Q30, K30a, V30a, L30, D30)
+let outB = mpsfa_scaled_dot_product_causal(Q30, K30b_new, V30b_new, L30, D30)
+let mut row0_same = true
+let mut j30b = 0
+while j30b < D30 {
+    if !t_approx(outA[0][j30b], outB[0][j30b], 1.0e-9) {
+        row0_same = false
+    }
+    j30b = j30b + 1
+}
+check("T30 causal: row 0 independent of future K,V", row0_same)
+
+// ─── T31: numerical stability with large raw scores ──────────
+let L31 = 4
+let D31 = 2
+let mut Q_big = []
+let mut K_big = []
+let V31 = make_rand(L31, D31, 31)
+let mut i31 = 0
+while i31 < L31 {
+    let mut qr = []
+    let mut kr = []
+    let mut j31 = 0
+    while j31 < D31 {
+        qr = qr + [50.0]
+        kr = kr + [50.0]
+        j31 = j31 + 1
+    }
+    Q_big = Q_big + [qr]
+    K_big = K_big + [kr]
+    i31 = i31 + 1
+}
+let out31 = mpsfa_scaled_dot_product(Q_big, K_big, V31, L31, D31)
+let mut stable_ok = true
+let mut i31a = 0
+while i31a < L31 {
+    let mut j31a = 0
+    while j31a < D31 {
+        let v = out31[i31a][j31a]
+        if t_fabs(v) > 1.0e10 {
+            stable_ok = false
+        }
+        j31a = j31a + 1
+    }
+    i31a = i31a + 1
+}
+check("T31 large raw scores stable (no overflow)", stable_ok)
+
+// ─── T32: raw_scores symmetric for symmetric inputs ───────────
+// When Q = K and both have symmetric structure, S = Q @ K^T must
+// be symmetric (S[i][j] == S[j][i]).
+let L32 = 4
+let D32 = 3
+let Q32 = make_rand(L32, D32, 420)
+let raw32 = mpsfa_raw_scores(Q32, Q32, L32, D32)
+let mut sym_ok = true
+let mut i32 = 0
+while i32 < L32 {
+    let mut j32 = 0
+    while j32 < L32 {
+        if !t_approx(raw32[i32][j32], raw32[j32][i32], 1.0e-9) {
+            sym_ok = false
+        }
+        j32 = j32 + 1
+    }
+    i32 = i32 + 1
+}
+check("T32 raw_scores symmetric for Q=K", sym_ok)
+
+// ═══════════════════════════════════════════════════════════════
+println("")
+println("=== MPS Flash Attention test summary ===")
+println("PASS: " + str(pass_count) + " / FAIL: " + str(fail_count) + " / TOTAL: " + str(pass_count + fail_count))

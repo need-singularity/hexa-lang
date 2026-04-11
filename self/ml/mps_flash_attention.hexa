@@ -1,0 +1,599 @@
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/mps_flash_attention.hexa — MPS Flash Attention (SDPA)
+//
+//  ML roadmap #201 — MPSGraph-based scaled-dot-product attention
+//
+//  Simulates Apple MPSGraph's fused attention on CPU:
+//    1. Fused QKV matmul   — W_q, W_k, W_v applied from input x
+//    2. Scaled dot product — S = Q @ K^T / sqrt(d_head)
+//    3. Causal masking     — -inf above the diagonal (optional)
+//    4. Softmax per row    — max-subtract for numerical stability
+//    5. V aggregation      — O = softmax(S) @ V
+//    6. Output projection  — W_o applied to attention output
+//
+//  Tiled variant (Flash-style) computes identical numerics with
+//  block-wise online softmax; matches non-tiled within 1e-5.
+//
+//  Multi-head: each head has its own [d_head] slice of Q/K/V
+//  and outputs are concatenated along the feature dim.
+//
+//  API:
+//    mpsfa_scaled_dot_product(Q, K, V, seq_len, d_head)
+//      -> out [seq_len, d_head]
+//    mpsfa_causal_mask_score(scores, seq_len)
+//      -> scores with -inf above diagonal
+//    mpsfa_softmax_row(scores_row, n)
+//      -> probability vector summing to 1.0
+//    mpsfa_tile_forward(Q, K, V, seq_len, d_head, tile_size)
+//      -> Flash-style tiled SDPA, equal to non-tiled within 1e-5
+//    mpsfa_multi_head(Q_heads, K_heads, V_heads, n_heads, d_head, seq_len)
+//      -> concatenated [seq_len, n_heads * d_head]
+//    mpsfa_fused_qkv_proj(x, W_q, W_k, W_v, dim, d_head)
+//      -> [Q, K, V]
+//    mpsfa_out_proj(attn_out, W_o, dim)
+//      -> projected [seq_len, dim]
+//    mpsfa_attention_entropy(scores, seq_len)
+//      -> entropy per row (array of length seq_len)
+//    mpsfa_with_dropout_mask(scores, mask)
+//      -> element-wise masked scores
+//    mpsfa_create_graph_descriptor(seq_len, n_heads, d_head)
+//      -> dict descriptor modelling MPSGraph metadata
+//
+//  AI-NATIVE attrs:
+//    @hot      — called every forward step
+//    @parallel — head loop and query-tile loop independent
+//    @fuse     — softmax fused with V aggregation
+//    @pure     — no side effects in math helpers
+// ═══════════════════════════════════════════════════════════════
+
+// ── helpers ──────────────────────────────────────────────────
+
+fn mpsfa_zeros_1d(n) {
+    let mut v = []
+    let mut i = 0
+    while i < n {
+        v = v + [0.0]
+        i = i + 1
+    }
+    return v
+}
+
+fn mpsfa_zeros_2d(r, c) {
+    let mut m = []
+    let mut i = 0
+    while i < r {
+        m = m + [mpsfa_zeros_1d(c)]
+        i = i + 1
+    }
+    return m
+}
+
+@pure
+fn mpsfa_fabs(x) {
+    if x < 0.0 {
+        return 0.0 - x
+    }
+    return x
+}
+
+@pure
+fn mpsfa_max_f(a, b) {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+@pure
+fn mpsfa_min_i(a, b) {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+// Large negative sentinel representing -inf in score arrays.
+fn mpsfa_neg_inf() {
+    return 0.0 - 1.0e30
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Stable softmax over a 1D row (max-subtract then normalize).
+//  Rows that are entirely masked (all -inf) produce a uniform
+//  distribution to avoid divide-by-zero.
+// ═══════════════════════════════════════════════════════════════
+@pure
+fn mpsfa_softmax_row(scores_row, n) {
+    // Find row max while skipping -inf entries.
+    let mut mx = mpsfa_neg_inf()
+    let mut any_finite = false
+    let mut i = 0
+    while i < n {
+        let s = scores_row[i]
+        if s > (0.0 - 1.0e29) {
+            any_finite = true
+            if s > mx {
+                mx = s
+            }
+        }
+        i = i + 1
+    }
+
+    if !any_finite {
+        // Entirely masked row → uniform fallback.
+        let u = 1.0 / to_float(n)
+        let mut out = []
+        let mut j = 0
+        while j < n {
+            out = out + [u]
+            j = j + 1
+        }
+        return out
+    }
+
+    let mut exps = []
+    let mut sum_e = 0.0
+    i = 0
+    while i < n {
+        let s = scores_row[i]
+        if s > (0.0 - 1.0e29) {
+            let e = exp(s - mx)
+            exps = exps + [e]
+            sum_e = sum_e + e
+        } else {
+            exps = exps + [0.0]
+        }
+        i = i + 1
+    }
+    let inv = 1.0 / sum_e
+    let mut result = []
+    i = 0
+    while i < n {
+        result = result + [exps[i] * inv]
+        i = i + 1
+    }
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Causal mask: set scores[i][j] = -inf whenever j > i.
+//  Operates on a [seq_len, seq_len] nested array and returns the
+//  masked copy.
+// ═══════════════════════════════════════════════════════════════
+fn mpsfa_causal_mask_score(scores, seq_len) {
+    let mut out = []
+    let mut i = 0
+    while i < seq_len {
+        let mut row = []
+        let mut j = 0
+        while j < seq_len {
+            if j > i {
+                row = row + [mpsfa_neg_inf()]
+            } else {
+                row = row + [scores[i][j]]
+            }
+            j = j + 1
+        }
+        out = out + [row]
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Scaled dot-product attention (non-tiled reference).
+//
+//  S = Q @ K^T / sqrt(d_head)
+//  P = softmax(S) (row-wise)
+//  O = P @ V
+//
+//  Shapes:
+//    Q : [seq_len, d_head]
+//    K : [seq_len, d_head]
+//    V : [seq_len, d_head]
+//    out: [seq_len, d_head]
+// ═══════════════════════════════════════════════════════════════
+@hot @pure
+fn mpsfa_scaled_dot_product(Q, K, V, seq_len, d_head) {
+    let scale = 1.0 / sqrt(to_float(d_head))
+    let mut out = mpsfa_zeros_2d(seq_len, d_head)
+
+    let mut i = 0
+    while i < seq_len {
+        // compute score row for query i
+        let mut scores_row = []
+        let mut j = 0
+        while j < seq_len {
+            let mut dot = 0.0
+            let mut k = 0
+            while k < d_head {
+                dot = dot + Q[i][k] * K[j][k]
+                k = k + 1
+            }
+            scores_row = scores_row + [dot * scale]
+            j = j + 1
+        }
+
+        let probs = mpsfa_softmax_row(scores_row, seq_len)
+
+        // weighted sum of V rows
+        let mut d = 0
+        while d < d_head {
+            let mut acc = 0.0
+            let mut t = 0
+            while t < seq_len {
+                acc = acc + probs[t] * V[t][d]
+                t = t + 1
+            }
+            out[i][d] = acc
+            d = d + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Causal-masked scaled dot-product attention (reference).
+@hot @pure
+fn mpsfa_scaled_dot_product_causal(Q, K, V, seq_len, d_head) {
+    let scale = 1.0 / sqrt(to_float(d_head))
+    let mut out = mpsfa_zeros_2d(seq_len, d_head)
+
+    let mut i = 0
+    while i < seq_len {
+        let mut scores_row = []
+        let mut j = 0
+        while j < seq_len {
+            if j > i {
+                scores_row = scores_row + [mpsfa_neg_inf()]
+            } else {
+                let mut dot = 0.0
+                let mut k = 0
+                while k < d_head {
+                    dot = dot + Q[i][k] * K[j][k]
+                    k = k + 1
+                }
+                scores_row = scores_row + [dot * scale]
+            }
+            j = j + 1
+        }
+
+        let probs = mpsfa_softmax_row(scores_row, seq_len)
+
+        let mut d = 0
+        while d < d_head {
+            let mut acc = 0.0
+            let mut t = 0
+            while t < seq_len {
+                acc = acc + probs[t] * V[t][d]
+                t = t + 1
+            }
+            out[i][d] = acc
+            d = d + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Flash-style tiled SDPA — online softmax, block-wise accumulation
+//
+//  For each query row i the KV sequence is walked in tile_size
+//  chunks. Running max m_i and running denominator l_i are updated
+//  each tile, and the partial output O_i is rescaled before adding
+//  the new tile contribution. Output matches mpsfa_scaled_dot_product
+//  up to 1e-5 on small seqs.
+// ═══════════════════════════════════════════════════════════════
+@hot @parallel @fuse
+fn mpsfa_tile_forward(Q, K, V, seq_len, d_head, tile_size) {
+    let scale = 1.0 / sqrt(to_float(d_head))
+    let mut out = mpsfa_zeros_2d(seq_len, d_head)
+    let n_tiles = (seq_len + tile_size - 1) / tile_size
+
+    let mut i = 0
+    while i < seq_len {
+        let mut m_i = mpsfa_neg_inf()
+        let mut l_i = 0.0
+        let mut O_i = mpsfa_zeros_1d(d_head)
+
+        let mut tb = 0
+        while tb < n_tiles {
+            let t_start = tb * tile_size
+            let t_end = mpsfa_min_i(t_start + tile_size, seq_len)
+            let tlen = t_end - t_start
+
+            // compute tile score row
+            let mut s_tile = []
+            let mut kj = 0
+            while kj < tlen {
+                let mut dot = 0.0
+                let mut k = 0
+                while k < d_head {
+                    dot = dot + Q[i][k] * K[t_start + kj][k]
+                    k = k + 1
+                }
+                s_tile = s_tile + [dot * scale]
+                kj = kj + 1
+            }
+
+            // find tile max
+            let mut tile_max = s_tile[0]
+            let mut jj = 1
+            while jj < tlen {
+                if s_tile[jj] > tile_max {
+                    tile_max = s_tile[jj]
+                }
+                jj = jj + 1
+            }
+
+            let m_old = m_i
+            let m_new = mpsfa_max_f(m_old, tile_max)
+            let alpha = exp(m_old - m_new)
+
+            // tile exponents and sum
+            let mut p_tile = []
+            let mut tile_sum = 0.0
+            jj = 0
+            while jj < tlen {
+                let p = exp(s_tile[jj] - m_new)
+                p_tile = p_tile + [p]
+                tile_sum = tile_sum + p
+                jj = jj + 1
+            }
+
+            let l_new = l_i * alpha + tile_sum
+
+            // rescale existing O_i and add tile contribution
+            let mut d = 0
+            while d < d_head {
+                let mut scaled_prev = O_i[d] * alpha
+                let mut kk = 0
+                while kk < tlen {
+                    scaled_prev = scaled_prev + p_tile[kk] * V[t_start + kk][d]
+                    kk = kk + 1
+                }
+                O_i[d] = scaled_prev
+                d = d + 1
+            }
+
+            m_i = m_new
+            l_i = l_new
+            tb = tb + 1
+        }
+
+        // final normalize O_i by l_i
+        let inv_l = 1.0 / l_i
+        let mut d = 0
+        while d < d_head {
+            out[i][d] = O_i[d] * inv_l
+            d = d + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Multi-head SDPA
+//
+//  Q_heads, K_heads, V_heads are lists of n_heads matrices,
+//  each [seq_len, d_head]. Outputs are concatenated along the
+//  feature dim, producing [seq_len, n_heads * d_head].
+// ═══════════════════════════════════════════════════════════════
+@hot @parallel
+fn mpsfa_multi_head(Q_heads, K_heads, V_heads, n_heads, d_head, seq_len) {
+    let total = n_heads * d_head
+    // Use a distinct name from the inner SDPA helper's `out` binding to
+    // avoid a known hexa runtime aliasing bug with same-named 2D arrays.
+    let mut mh_out = mpsfa_zeros_2d(seq_len, total)
+
+    let mut h = 0
+    while h < n_heads {
+        let o_h = mpsfa_scaled_dot_product(Q_heads[h], K_heads[h], V_heads[h], seq_len, d_head)
+        let mut i = 0
+        while i < seq_len {
+            let mut d = 0
+            while d < d_head {
+                mh_out[i][h * d_head + d] = o_h[i][d]
+                d = d + 1
+            }
+            i = i + 1
+        }
+        h = h + 1
+    }
+    return mh_out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Fused QKV projection
+//
+//  Given input x [seq_len, dim] and weight matrices
+//    W_q : [dim, d_head]
+//    W_k : [dim, d_head]
+//    W_v : [dim, d_head]
+//  produce Q, K, V each [seq_len, d_head].
+//
+//  The three matmuls are "fused" in the MPSGraph sense because
+//  they share the same input x — on CPU we just compute them
+//  contiguously so the intermediate is visited once per row.
+// ═══════════════════════════════════════════════════════════════
+@hot
+fn mpsfa_fused_qkv_proj(x, W_q, W_k, W_v, dim, d_head) {
+    let seq_len = len(x)
+    let mut Q = mpsfa_zeros_2d(seq_len, d_head)
+    let mut K = mpsfa_zeros_2d(seq_len, d_head)
+    let mut V = mpsfa_zeros_2d(seq_len, d_head)
+
+    let mut i = 0
+    while i < seq_len {
+        let row = x[i]
+        let mut d = 0
+        while d < d_head {
+            let mut q_acc = 0.0
+            let mut k_acc = 0.0
+            let mut v_acc = 0.0
+            let mut f = 0
+            while f < dim {
+                let xf = row[f]
+                q_acc = q_acc + xf * W_q[f][d]
+                k_acc = k_acc + xf * W_k[f][d]
+                v_acc = v_acc + xf * W_v[f][d]
+                f = f + 1
+            }
+            Q[i][d] = q_acc
+            K[i][d] = k_acc
+            V[i][d] = v_acc
+            d = d + 1
+        }
+        i = i + 1
+    }
+    return [Q, K, V]
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Output projection
+//
+//  attn_out : [seq_len, feat_in]  (feat_in == len(attn_out[0]))
+//  W_o      : [feat_in, dim]
+//  returns  : [seq_len, dim]
+// ═══════════════════════════════════════════════════════════════
+@hot
+fn mpsfa_out_proj(attn_out, W_o, dim) {
+    let seq_len = len(attn_out)
+    let feat_in = len(attn_out[0])
+    let mut out = mpsfa_zeros_2d(seq_len, dim)
+
+    let mut i = 0
+    while i < seq_len {
+        let row = attn_out[i]
+        let mut d = 0
+        while d < dim {
+            let mut acc = 0.0
+            let mut f = 0
+            while f < feat_in {
+                acc = acc + row[f] * W_o[f][d]
+                f = f + 1
+            }
+            out[i][d] = acc
+            d = d + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Attention entropy per query row.
+//
+//  scores : [seq_len, seq_len] raw (pre-softmax) scores.
+//  Returns an array of length seq_len where entry i is
+//      H_i = - sum_j p_ij log(p_ij)
+//  with p = softmax(scores[i]).
+//
+//  For any finite row, 0 <= H_i <= log(seq_len).
+// ═══════════════════════════════════════════════════════════════
+@pure
+fn mpsfa_attention_entropy(scores, seq_len) {
+    let mut ents = []
+    let mut i = 0
+    while i < seq_len {
+        let probs = mpsfa_softmax_row(scores[i], seq_len)
+        let mut h = 0.0
+        let mut j = 0
+        while j < seq_len {
+            let p = probs[j]
+            if p > 1.0e-12 {
+                h = h - p * log(p)
+            }
+            j = j + 1
+        }
+        ents = ents + [h]
+        i = i + 1
+    }
+    return ents
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Element-wise dropout mask applied to the probability matrix,
+//  followed by row-wise renormalization (so each row still sums
+//  to 1.0 whenever at least one element survived).
+//
+//  probs : [seq_len, seq_len] probabilities
+//  mask  : [seq_len, seq_len] 0/1 values
+// ═══════════════════════════════════════════════════════════════
+fn mpsfa_with_dropout_mask(probs, mask) {
+    let rows = len(probs)
+    let mut out = []
+    let mut i = 0
+    while i < rows {
+        let cols = len(probs[i])
+        let mut row = mpsfa_zeros_1d(cols)
+        let mut sum = 0.0
+        let mut j = 0
+        while j < cols {
+            let v = probs[i][j] * mask[i][j]
+            row[j] = v
+            sum = sum + v
+            j = j + 1
+        }
+        if sum > 1.0e-12 {
+            let inv = 1.0 / sum
+            j = 0
+            while j < cols {
+                row[j] = row[j] * inv
+                j = j + 1
+            }
+        }
+        out = out + [row]
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  MPSGraph descriptor (dict metadata)
+//
+//  Mirrors the information MPSGraph records when building an
+//  attention subgraph: sequence length, head count, head dim,
+//  derived model dimension, and scale factor.
+// ═══════════════════════════════════════════════════════════════
+@pure
+fn mpsfa_create_graph_descriptor(seq_len, n_heads, d_head) {
+    let model_dim = n_heads * d_head
+    let scale = 1.0 / sqrt(to_float(d_head))
+    return #{
+        "seq_len": seq_len,
+        "n_heads": n_heads,
+        "d_head": d_head,
+        "model_dim": model_dim,
+        "scale": scale,
+        "op": "mpsfa_sdpa"
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Utility: construct the raw score matrix S = Q @ K^T * scale
+//  (used by tests verifying causal mask and entropy).
+// ═══════════════════════════════════════════════════════════════
+@pure
+fn mpsfa_raw_scores(Q, K, seq_len, d_head) {
+    let scale = 1.0 / sqrt(to_float(d_head))
+    let mut S = mpsfa_zeros_2d(seq_len, seq_len)
+    let mut i = 0
+    while i < seq_len {
+        let mut j = 0
+        while j < seq_len {
+            let mut dot = 0.0
+            let mut k = 0
+            while k < d_head {
+                dot = dot + Q[i][k] * K[j][k]
+                k = k + 1
+            }
+            S[i][j] = dot * scale
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return S
+}

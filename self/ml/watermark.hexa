@@ -300,4 +300,231 @@ fn wm_p_value(z) {
     return p
 }
 
-println("[watermark] loaded — green/red hash + logit bias + z-test detection")
+// ═══════════════════════════════════════════════════════════════════
+//  Sliding Window Detection — robust to token edits/insertions
+//
+//  Scans all windows of size `window_size` within the token sequence,
+//  returning the window with the highest z-score. This handles cases
+//  where parts of the text have been edited or tokens inserted/removed.
+//
+//  Returns: [best_z, best_start, best_end, best_n_green, best_n_total]
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn wm_detect_sliding(tokens, vocab_size, seed, window_size) {
+    let n = len(tokens)
+    if n < 3 { return [0.0, 0, 0, 0, 0] }
+    let mut ws = window_size
+    if ws > n { ws = n }
+    if ws < 3 { ws = 3 }
+    let mut best_z = -999.0
+    let mut best_start = 0
+    let mut best_end = 0
+    let mut best_ng = 0
+    let mut best_nt = 0
+    let num_windows = n - ws + 1
+    for s in 0..num_windows {
+        let e = s + ws
+        // count green tokens in this window
+        let mut ng = 0
+        let mut nt = 0
+        for i in (s + 1)..e {
+            let prev = tokens[i - 1]
+            let cur = tokens[i]
+            let mask = wm_green_mask_default(prev, vocab_size, seed)
+            if mask[cur] == 1 { ng = ng + 1 }
+            nt = nt + 1
+        }
+        let z = wm_z_score_default(ng, nt)
+        if z > best_z {
+            best_z = z
+            best_start = s
+            best_end = e
+            best_ng = ng
+            best_nt = nt
+        }
+    }
+    return [best_z, best_start, best_end, best_ng, best_nt]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Detect with P-value threshold
+//
+//  Instead of a raw z threshold, use a p-value cutoff.
+//  Typical: p_threshold = 0.01 for 99% confidence
+//  Mapped to z via common thresholds:
+//    p=0.05 -> z~1.645, p=0.01 -> z~2.326, p=0.001 -> z~3.09
+//    p=0.0001 -> z~3.72, p=0.00001 -> z~4.26
+//
+//  Returns: [detected (0/1), z_score, p_value, n_green, n_total]
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn wm_p_to_z_threshold(p_threshold) {
+    // Lookup table for common p-values
+    if p_threshold >= 0.05 { return 1.645 }
+    if p_threshold >= 0.01 { return 2.326 }
+    if p_threshold >= 0.001 { return 3.09 }
+    if p_threshold >= 0.0001 { return 3.72 }
+    if p_threshold >= 0.00001 { return 4.26 }
+    return 4.75
+}
+
+@pure
+fn wm_detect_pvalue(tokens, vocab_size, seed, p_threshold) {
+    let z_thresh = wm_p_to_z_threshold(p_threshold)
+    let counts = wm_count_green(tokens, vocab_size, seed)
+    let ng = counts[0]
+    let nt = counts[1]
+    let z = wm_z_score_default(ng, nt)
+    let p = wm_p_value(z)
+    let mut detected = 0
+    if z >= z_thresh { detected = 1 }
+    return [detected, z, p, ng, nt]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Key Management — multi-key watermarking
+//
+//  wm_keygen: generate a deterministic key from a passphrase
+//  wm_key_fingerprint: short hash for key identity
+//  wm_rotate_key: derive a new key from old key + epoch
+//  wm_multi_key_detect: try multiple keys, return best match
+// ═══════════════════════════════════════════════════════════════════
+
+// Derive a numeric seed from a passphrase string
+@pure
+fn wm_keygen(passphrase) {
+    let chars = passphrase.chars()
+    let n = len(chars)
+    let mut h = 5381
+    for i in 0..n {
+        let c = to_int(chars[i])
+        h = h * 33 + c
+        h = h % 2147483647
+    }
+    if h < 0 { h = 0 - h }
+    return h
+}
+
+// Short fingerprint (last 6 digits) for key identity
+@pure
+fn wm_key_fingerprint(seed) {
+    let mut fp = seed % 1000000
+    if fp < 0 { fp = 0 - fp }
+    return fp
+}
+
+// Rotate key: derive next epoch's key
+@pure
+fn wm_rotate_key(seed, epoch) {
+    let mut h = seed * 2654435761 + epoch * 1315423911 + 7919
+    h = h % 2147483647
+    if h < 0 { h = 0 - h }
+    return h
+}
+
+// Try multiple keys and return the one with highest z-score
+// keys: array of integer seeds
+// Returns: [best_key_idx, best_z, detected (0/1), n_green, n_total]
+@pure
+fn wm_multi_key_detect(tokens, vocab_size, keys, threshold) {
+    let nk = len(keys)
+    let mut best_idx = -1
+    let mut best_z = -999.0
+    let mut best_ng = 0
+    let mut best_nt = 0
+    for k in 0..nk {
+        let counts = wm_count_green(tokens, vocab_size, keys[k])
+        let ng = counts[0]
+        let nt = counts[1]
+        let z = wm_z_score_default(ng, nt)
+        if z > best_z {
+            best_z = z
+            best_idx = k
+            best_ng = ng
+            best_nt = nt
+        }
+    }
+    let mut detected = 0
+    if best_z >= threshold { detected = 1 }
+    return [best_idx, best_z, detected, best_ng, best_nt]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Watermark Strength Estimator
+//
+//  Given a token sequence, estimate the effective watermark strength
+//  (green fraction - expected fraction) normalized by sequence length.
+//  Returns: [strength, green_fraction, expected_fraction]
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn wm_strength(tokens, vocab_size, seed, gamma) {
+    let n = len(tokens)
+    if n < 2 { return [0.0, 0.0, gamma] }
+    let mut ng = 0
+    let mut nt = 0
+    for i in 1..n {
+        let prev = tokens[i - 1]
+        let cur = tokens[i]
+        let mask = wm_green_mask(prev, vocab_size, seed, gamma)
+        if mask[cur] == 1 { ng = ng + 1 }
+        nt = nt + 1
+    }
+    let gf = to_float(ng) / to_float(nt)
+    return [gf - gamma, gf, gamma]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Configurable Gamma Detection
+//
+//  Detect with a custom green list fraction (not just 0.5).
+//  Useful for asymmetric watermarks or steganographic variants.
+//
+//  Returns: [detected (0/1), z_score, n_green, n_total]
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn wm_count_green_gamma(tokens, vocab_size, seed, gamma) {
+    let n = len(tokens)
+    if n < 2 { return [0, 0] }
+    let mut ng = 0
+    let mut nt = 0
+    for i in 1..n {
+        let prev = tokens[i - 1]
+        let cur = tokens[i]
+        let mask = wm_green_mask(prev, vocab_size, seed, gamma)
+        if mask[cur] == 1 { ng = ng + 1 }
+        nt = nt + 1
+    }
+    return [ng, nt]
+}
+
+@pure
+fn wm_detect_gamma(tokens, vocab_size, seed, gamma, threshold) {
+    let counts = wm_count_green_gamma(tokens, vocab_size, seed, gamma)
+    let ng = counts[0]
+    let nt = counts[1]
+    let z = wm_z_score(ng, nt, gamma)
+    let mut detected = 0
+    if z >= threshold { detected = 1 }
+    return [detected, z, ng, nt]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Robust Sliding Window + P-value Detection (combined)
+//
+//  Scans windows and uses p-value threshold for detection.
+//  Best for texts that have been partially edited.
+//
+//  Returns: [detected (0/1), best_z, best_p, best_start, best_end]
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn wm_detect_robust(tokens, vocab_size, seed, window_size, p_threshold) {
+    let sw = wm_detect_sliding(tokens, vocab_size, seed, window_size)
+    let best_z = sw[0]
+    let best_p = wm_p_value(best_z)
+    let z_thresh = wm_p_to_z_threshold(p_threshold)
+    let mut detected = 0
+    if best_z >= z_thresh { detected = 1 }
+    return [detected, best_z, best_p, sw[1], sw[2]]
+}
+
+println("[watermark] loaded — green/red hash + logit bias + z-test + sliding window + key management")

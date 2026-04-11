@@ -1,0 +1,687 @@
+// ═══════════════════════════════════════════════════════════════
+//  loreft.hexa — LoReFT (Low-rank Representation Finetuning)
+//
+//  Paper: Wu et al. 2024, "ReFT: Representation Finetuning for
+//  Language Models" (https://arxiv.org/abs/2404.03592)
+//
+//  Core idea: instead of editing weights (LoRA), edit hidden
+//  representations at specific layers/positions via a low-rank
+//  intervention learned from data. Base model is fully frozen.
+//
+//  Intervention (LoReFT variant):
+//      h' = h + R^T (W (R h) + b - (R h))
+//         = h + R^T ((W - I) R h + b)
+//
+//  Where
+//      h   : [d]           base hidden state
+//      R   : [r, d]        projection (orthogonal-ish) — learned
+//      W   : [r, r]        low-rank edit matrix — learned
+//      b   : [r]           bias — learned
+//      r   : rank << d
+//
+//  Trainable params per intervention:  r*d + r*r + r
+//  (vs LoRA at rank r on a d x d linear:  2*r*d)
+//
+//  Forward hook: an intervention is attached to a (layer_idx,
+//  position) pair. When the base model produces hidden state h
+//  at that position, the hook replaces it with h'. Position = -1
+//  means "apply at every token".
+//
+//  Public API:
+//    make_intervention(d, r, seed)       — one LoReFT intervention
+//    apply_intervention(ih, h)           — h -> h'
+//    make_hook(layer_idx, position, iv)  — attach to layer/token
+//    run_hooks(hs, hooks, pos)           — apply all hooks matching layer at a single forward step
+//    collect_hidden_trace(model, x, hooks, alpha_unused) — LoReFT forward: layers with hooks injected
+//    loreft_step(...)                    — single-sample fwd+bwd+update on R,W,b
+//    loreft_finetune(model, dataset, cfg) — training loop
+//
+//  AI-NATIVE:
+//    @pure     math kernels
+//    @memoize  scale/norm helpers
+//    @hot      per-step update
+//
+//  L0 금지: src/*.rs 미접촉. 순수 .hexa.
+// ═══════════════════════════════════════════════════════════════
+
+use "finetune_config"
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 1: Helpers (zeros / identity / init)
+// ═══════════════════════════════════════════════════════════════
+
+fn lr_zeros1(n) {
+    let mut v = []
+    for i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn lr_zeros2(rows, cols) {
+    let mut r = []
+    for i in 0..rows { r = r + [lr_zeros1(cols)] }
+    return r
+}
+
+fn lr_identity(n) {
+    let mut r = []
+    for i in 0..n {
+        let mut row = lr_zeros1(n)
+        row[i] = 1.0
+        r = r + [row]
+    }
+    return r
+}
+
+// Deterministic LCG init — rows x cols, scaled by 1/sqrt(cols)
+fn lr_kaiming(rows, cols, seed) {
+    let mut s = seed
+    let scale = 1.0 / sqrt(to_float(cols))
+    let mut r = []
+    for i in 0..rows {
+        let mut row = []
+        for j in 0..cols {
+            s = (s * 1103515245 + 12345) % 2147483647
+            let v = (to_float(s % 2000) - 1000.0) / 1000.0 * scale
+            row = row + [v]
+        }
+        r = r + [row]
+    }
+    return r
+}
+
+// Near-orthogonal R init: Kaiming scaled by 1/sqrt(d)
+// (true Gram-Schmidt is overkill for tests; scaled random gives stable conditioning)
+fn lr_init_R(r, d, seed) {
+    return lr_kaiming(r, d, seed)
+}
+
+// W init: start at identity so early training barely touches h
+fn lr_init_W(r, seed) {
+    // tiny perturbation so gradients flow; identity would be zero-grad trap.
+    let eps = 0.01
+    let mut s = seed
+    let mut m = lr_identity(r)
+    for i in 0..r {
+        for j in 0..r {
+            s = (s * 1103515245 + 12345) % 2147483647
+            let v = (to_float(s % 2000) - 1000.0) / 1000.0 * eps
+            m[i][j] = m[i][j] + v
+        }
+    }
+    return m
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 2: Low-level math (matvec, outer, transpose apply)
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn lr_matvec(w, x, m, n) {
+    let mut y = []
+    for i in 0..m {
+        let mut s = 0.0
+        for j in 0..n { s = s + w[i][j] * x[j] }
+        y = y + [s]
+    }
+    return y
+}
+
+// y[n] = W^T[n,m] @ x[m]
+@pure
+fn lr_matvec_T(w, x, m, n) {
+    let mut y = lr_zeros1(n)
+    for j in 0..n {
+        let mut s = 0.0
+        for i in 0..m { s = s + w[i][j] * x[i] }
+        y[j] = s
+    }
+    return y
+}
+
+// outer product: u[m] (x) v[n] -> [m,n]
+@pure
+fn lr_outer(u, v, m, n) {
+    let mut o = []
+    for i in 0..m {
+        let mut row = []
+        for j in 0..n { row = row + [u[i] * v[j]] }
+        o = o + [row]
+    }
+    return o
+}
+
+@pure
+fn lr_vec_add(a, b, n) {
+    let mut y = []
+    for i in 0..n { y = y + [a[i] + b[i]] }
+    return y
+}
+
+@pure
+fn lr_vec_sub(a, b, n) {
+    let mut y = []
+    for i in 0..n { y = y + [a[i] - b[i]] }
+    return y
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 3: LoReFT intervention struct
+// ═══════════════════════════════════════════════════════════════
+
+struct LoReftIntervention {
+    R: array,      // [r, d]
+    W: array,      // [r, r]
+    b: array,      // [r]
+    rank: int,     // r
+    dim: int       // d
+}
+
+fn make_intervention(d, r, seed) {
+    let R = lr_init_R(r, d, seed)
+    let W = lr_init_W(r, seed + 7919)
+    let b = lr_zeros1(r)
+    LoReftIntervention {
+        R: R,
+        W: W,
+        b: b,
+        rank: r,
+        dim: d
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 4: Intervention forward
+//
+//  h' = h + R^T ( W (R h) + b - (R h) )
+//
+//  Equivalent formulation used in backward:
+//    p  = R h                  [r]
+//    q  = W p + b              [r]
+//    e  = q - p                [r]   (edit in r-space)
+//    h' = h + R^T e            [d]
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn apply_intervention(iv: LoReftIntervention, h) {
+    let r = iv.rank
+    let d = iv.dim
+    let p = lr_matvec(iv.R, h, r, d)           // R h
+    let wp = lr_matvec(iv.W, p, r, r)          // W R h
+    let q = lr_vec_add(wp, iv.b, r)            // W R h + b
+    let e = lr_vec_sub(q, p, r)                // (W R h + b) - R h
+    let rt_e = lr_matvec_T(iv.R, e, r, d)      // R^T e
+    return lr_vec_add(h, rt_e, d)              // h + R^T e
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 5: Intervention backward
+//
+//  Given dL/dh' (= dh_out, length d), returns
+//      dR : [r, d]
+//      dW : [r, r]
+//      db : [r]
+//      dh : [d]     (gradient w.r.t. input h, for upstream backprop)
+//
+//  Math:
+//      h'  = h + R^T (W (R h) + b - R h)
+//      p   = R h
+//      e   = W p + b - p        = (W - I) p + b
+//      h'  = h + R^T e
+//
+//      dh'/dh = I + R^T (W - I) R
+//      de     = R dh'           (shape r)
+//
+//      dW = de · p^T            (outer; [r,r])
+//      db = de
+//      dR contributions:
+//          from (R h)  through p in e:  dR_p_path[i,j] = (W-I)^T de[i] * h[j]
+//                                                       = (W^T de - de)[i] * h[j]
+//          from R^T e outer layer:      dR_T_path[i,j] = e[i] * dh'[j]
+//      dh from p:       (W-I)^T de  ->  R^T-ish?  no — we differentiate
+//                       wrt h through R h only, giving  R^T (W-I)^T de
+//          from direct h term: dh'
+//
+//      Total dh = dh' + R^T (W - I)^T de    (which equals (I + R^T(W-I)R) dh')
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn backward_intervention(iv: LoReftIntervention, h, dh_out) {
+    let r = iv.rank
+    let d = iv.dim
+
+    // Recompute forward trail
+    let p = lr_matvec(iv.R, h, r, d)           // R h
+    let wp = lr_matvec(iv.W, p, r, r)
+    let q = lr_vec_add(wp, iv.b, r)
+    let e = lr_vec_sub(q, p, r)                // edit in r-space
+
+    // de = R dh_out   (gradient on e through h' = h + R^T e)
+    let de = lr_matvec(iv.R, dh_out, r, d)
+
+    // db = de
+    let db = de
+
+    // dW = de outer p   (shape [r,r])
+    let dW = lr_outer(de, p, r, r)
+
+    // dR has TWO contributions:
+    //   (a) outer layer R^T e         -> dR_a[i,j] = e[i] * dh_out[j]
+    //   (b) inner p = R h             -> dR_b[i,j] = dp[i] * h[j]
+    //       where dp = (W - I)^T de = W^T de - de
+    let wt_de = lr_matvec_T(iv.W, de, r, r)    // W^T de   (shape r)
+    let mut dp = lr_zeros1(r)
+    for i in 0..r { dp[i] = wt_de[i] - de[i] }
+
+    let dR_a = lr_outer(e, dh_out, r, d)
+    let dR_b = lr_outer(dp, h, r, d)
+
+    let mut dR = lr_zeros2(r, d)
+    for i in 0..r {
+        for j in 0..d {
+            dR[i][j] = dR_a[i][j] + dR_b[i][j]
+        }
+    }
+
+    // dh propagated upstream:
+    //   dh = dh_out + R^T dp
+    let rt_dp = lr_matvec_T(iv.R, dp, r, d)
+    let dh_in = lr_vec_add(dh_out, rt_dp, d)
+
+    return [dR, dW, db, dh_in]
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 6: Forward hooks (layer_idx, position)
+//
+//  A hook says: at layer L, after the base layer produces hidden
+//  state h (or for a sequence, the hidden at token `position`),
+//  apply this intervention.
+//
+//  position = -1 means "every token" — in our scalar hidden case
+//  (single vector per layer) it simply means "this layer".
+// ═══════════════════════════════════════════════════════════════
+
+struct LoReftHook {
+    layer_idx: int,
+    position: int,          // -1 for every token
+    iv: LoReftIntervention
+}
+
+fn make_hook(layer_idx, position, iv: LoReftIntervention) {
+    LoReftHook { layer_idx: layer_idx, position: position, iv: iv }
+}
+
+// Return the list of hooks that should fire at the given (layer, pos).
+fn hooks_at(hooks, layer_idx, pos) {
+    let n = len(hooks)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let hk = hooks[i]
+        if hk.layer_idx == layer_idx {
+            if hk.position == -1 || hk.position == pos {
+                out = out + [hk]
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Apply every matching hook sequentially to h, returning h'.
+// Used at a single forward step (one token).
+fn run_hooks(h, hooks, layer_idx, pos) {
+    let fire = hooks_at(hooks, layer_idx, pos)
+    let nf = len(fire)
+    let mut cur = h
+    let mut k = 0
+    while k < nf {
+        cur = apply_intervention(fire[k].iv, cur)
+        k = k + 1
+    }
+    return cur
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 7: Base model forward (frozen) with intervention hooks
+//
+//  model: [FTLayer-like { w, out_dim, in_dim }]
+//  x:     [in_dim] for first layer
+//  hooks: list of LoReftHook
+//
+//  At each layer i, we compute:
+//      raw = layer.w @ h
+//      h_next = run_hooks(raw, hooks, i, 0)
+//
+//  (position hardcoded to 0 because we do single-vector forward.
+//   Multi-token forward would loop positions; we keep scalar.)
+//
+//  Returns [inputs_after_hook_per_layer, final_h]
+//  where inputs_after_hook_per_layer[i] is the hidden produced by
+//  layer i AFTER any hook at layer i — we need these for backward.
+//
+//  We also need the raw pre-hook values at hooked layers to compute
+//  intervention gradients; we store them in raw_per_layer.
+// ═══════════════════════════════════════════════════════════════
+
+struct LoReftLayer {
+    w: array,
+    out_dim: int,
+    in_dim: int
+}
+
+// Forward a single base linear layer
+@pure
+fn base_layer_forward(w, x, m, n) {
+    return lr_matvec(w, x, m, n)
+}
+
+// collect_hidden_trace: returns
+//   [0] layer_inputs   — x fed into each layer (post-hook of previous layer)
+//   [1] raw_outputs    — raw output of each layer (pre-hook)
+//   [2] final_h        — final hidden state (post-hook of last layer)
+fn collect_hidden_trace(model, x, hooks) {
+    let n = len(model)
+    let mut layer_inputs = []
+    let mut raw_outputs = []
+    let mut h = x
+    let mut i = 0
+    while i < n {
+        layer_inputs = layer_inputs + [h]
+        let layer = model[i]
+        let raw = base_layer_forward(layer.w, h, layer.out_dim, layer.in_dim)
+        raw_outputs = raw_outputs + [raw]
+        // hooks fire on raw output of layer i at position 0
+        h = run_hooks(raw, hooks, i, 0)
+        i = i + 1
+    }
+    return [layer_inputs, raw_outputs, h]
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 8: Backward through frozen model + interventions
+//
+//  Only interventions are trainable. We still must propagate
+//  gradients through frozen base layers to reach earlier hooks.
+//
+//  At layer i:
+//    pre-hook raw: r_i = W_i h_{i-1}        (frozen W_i)
+//    post-hook:    h_i = hook_i(r_i)        (trainable iff hook exists)
+//
+//  Given d h_i from upstream, hook_i.backward returns:
+//    dR, dW, db for each intervention at that layer
+//    d r_i = dh_out + R^T dp
+//  Then base layer backward gives d h_{i-1} = W_i^T d r_i.
+//
+//  If no hook fires, d r_i = d h_i and we just propagate through W_i.
+//
+//  Returns list (same order as hooks[]) of [dR, dW, db] tuples,
+//  with zeros for hooks that never fired (defensive).
+// ═══════════════════════════════════════════════════════════════
+
+fn model_loreft_backward(model, hooks, layer_inputs, raw_outputs, dy) {
+    let n_layers = len(model)
+    let n_hooks = len(hooks)
+
+    // Allocate zero grad slot per hook
+    let mut hook_grads = []
+    let mut hi = 0
+    while hi < n_hooks {
+        let iv = hooks[hi].iv
+        hook_grads = hook_grads + [[lr_zeros2(iv.rank, iv.dim), lr_zeros2(iv.rank, iv.rank), lr_zeros1(iv.rank)]]
+        hi = hi + 1
+    }
+
+    let mut d = dy
+    let mut i = n_layers - 1
+    while i >= 0 {
+        let layer = model[i]
+        let m_dim = layer.out_dim
+        let n_dim = layer.in_dim
+        let raw = raw_outputs[i]
+        let h_in = layer_inputs[i]
+
+        // Find hooks at this layer (in order). We must reverse-apply them
+        // because in forward they were applied in list order (hook[0] then hook[1]).
+        // For backward we walk last->first.
+        let fire = hooks_at(hooks, i, 0)
+        let nf = len(fire)
+
+        // In forward: cur0=raw, cur1=apply(h0, cur0), cur2=apply(h1, cur1), ...
+        // For the general multi-hook backward we need the intermediate states.
+        // Simpler: if nf==0 skip; if nf>=1 we recompute chain quickly.
+        let mut chain = []   // chain[k] = input to hook k in forward
+        chain = chain + [raw]
+        let mut k = 0
+        while k < nf {
+            let cur = chain[k]
+            let next_cur = apply_intervention(fire[k].iv, cur)
+            chain = chain + [next_cur]
+            k = k + 1
+        }
+        // chain now has length nf+1; chain[nf] is post-hook (== h_i).
+
+        // Walk hooks in reverse, accumulating grads into hook_grads by identity.
+        let mut d_post = d
+        let mut kk = nf - 1
+        while kk >= 0 {
+            let hk = fire[kk]
+            let h_into = chain[kk]
+            let back = backward_intervention(hk.iv, h_into, d_post)
+            let gR = back[0]
+            let gW = back[1]
+            let gb = back[2]
+            let d_in_hook = back[3]
+
+            // Locate this hook's index in the original hooks[] list to accumulate.
+            let mut idx = -1
+            let mut ii = 0
+            while ii < n_hooks {
+                let cand = hooks[ii]
+                // identity match via layer_idx + position + pointer-ish fields
+                if cand.layer_idx == hk.layer_idx {
+                    if cand.position == hk.position {
+                        if idx == -1 { idx = ii }
+                    }
+                }
+                ii = ii + 1
+            }
+            if idx >= 0 {
+                // accumulate
+                let slot = hook_grads[idx]
+                let pR = slot[0]
+                let pW = slot[1]
+                let pb = slot[2]
+                let r_rank = hk.iv.rank
+                let r_dim = hk.iv.dim
+                let mut nR = lr_zeros2(r_rank, r_dim)
+                for iR in 0..r_rank {
+                    for jR in 0..r_dim { nR[iR][jR] = pR[iR][jR] + gR[iR][jR] }
+                }
+                let mut nW = lr_zeros2(r_rank, r_rank)
+                for iW in 0..r_rank {
+                    for jW in 0..r_rank { nW[iW][jW] = pW[iW][jW] + gW[iW][jW] }
+                }
+                let mut nb = lr_zeros1(r_rank)
+                for ib in 0..r_rank { nb[ib] = pb[ib] + gb[ib] }
+                hook_grads[idx] = [nR, nW, nb]
+            }
+
+            d_post = d_in_hook
+            kk = kk - 1
+        }
+
+        // Propagate d_post (which is d_raw) back through frozen layer.
+        // d h_{i-1}[j] = sum_i W[i,j] * d_raw[i]
+        let mut d_next = lr_zeros1(n_dim)
+        for j in 0..n_dim {
+            let mut s = 0.0
+            for ii2 in 0..m_dim { s = s + layer.w[ii2][j] * d_post[ii2] }
+            d_next[j] = s
+        }
+        d = d_next
+        i = i - 1
+    }
+
+    return hook_grads
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 9: Loss (MSE) + per-step optimizer (vanilla SGD)
+//
+//  We use plain SGD for LoReFT to keep this module lean; a user
+//  wanting AdamW can reuse finetune.hexa's adamw_step_2d on R/W.
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn lr_mse_loss(y, target, m) {
+    let mut s = 0.0
+    for i in 0..m {
+        let d = y[i] - target[i]
+        s = s + d * d
+    }
+    return s / to_float(m)
+}
+
+@pure
+fn lr_mse_grad(y, target, m) {
+    let mut g = []
+    let inv = 2.0 / to_float(m)
+    for i in 0..m { g = g + [(y[i] - target[i]) * inv] }
+    return g
+}
+
+@pure
+fn sgd_step_2d(param, grad, lr, rows, cols) {
+    let mut out = []
+    for i in 0..rows {
+        let mut row = []
+        for j in 0..cols { row = row + [param[i][j] - lr * grad[i][j]] }
+        out = out + [row]
+    }
+    return out
+}
+
+@pure
+fn sgd_step_1d(param, grad, lr, n) {
+    let mut out = []
+    for i in 0..n { out = out + [param[i] - lr * grad[i]] }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 10: loreft_step — single fwd+bwd+update
+// ═══════════════════════════════════════════════════════════════
+
+// Returns [new_hooks, loss]
+@hot
+fn loreft_step(model, hooks, x, target, lr) {
+    let out_dim = model[len(model) - 1].out_dim
+    let trace = collect_hidden_trace(model, x, hooks)
+    let layer_inputs = trace[0]
+    let raw_outputs = trace[1]
+    let y = trace[2]
+
+    let loss = lr_mse_loss(y, target, out_dim)
+    let dy = lr_mse_grad(y, target, out_dim)
+
+    let hook_grads = model_loreft_backward(model, hooks, layer_inputs, raw_outputs, dy)
+
+    // Update each hook's intervention
+    let n_hooks = len(hooks)
+    let mut new_hooks = []
+    let mut i = 0
+    while i < n_hooks {
+        let hk = hooks[i]
+        let iv = hk.iv
+        let g = hook_grads[i]
+        let gR = g[0]
+        let gW = g[1]
+        let gb = g[2]
+        let nR = sgd_step_2d(iv.R, gR, lr, iv.rank, iv.dim)
+        let nW = sgd_step_2d(iv.W, gW, lr, iv.rank, iv.rank)
+        let nb = sgd_step_1d(iv.b, gb, lr, iv.rank)
+        let new_iv = LoReftIntervention {
+            R: nR, W: nW, b: nb, rank: iv.rank, dim: iv.dim
+        }
+        new_hooks = new_hooks + [LoReftHook {
+            layer_idx: hk.layer_idx,
+            position: hk.position,
+            iv: new_iv
+        }]
+        i = i + 1
+    }
+
+    return [new_hooks, loss]
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 11: loreft_finetune — full training loop
+// ═══════════════════════════════════════════════════════════════
+
+// Count trainable params across a hook list.
+fn loreft_trainable_count(hooks) {
+    let n = len(hooks)
+    let mut total = 0
+    let mut i = 0
+    while i < n {
+        let iv = hooks[i].iv
+        total = total + iv.rank * iv.dim + iv.rank * iv.rank + iv.rank
+        i = i + 1
+    }
+    return total
+}
+
+fn loreft_finetune(model, dataset, config: FinetuneConfig, hooks) {
+    let n_layers = len(model)
+    let n_data = len(dataset)
+    let n_hooks = len(hooks)
+
+    println("[loreft_finetune] starting — " + str(n_layers) + " layers, " + str(n_hooks) + " hooks")
+
+    // Count frozen base params
+    let mut frozen = 0
+    let mut i = 0
+    while i < n_layers {
+        let layer = model[i]
+        frozen = frozen + layer.out_dim * layer.in_dim
+        i = i + 1
+    }
+    let trainable = loreft_trainable_count(hooks)
+    println("[loreft_finetune] frozen=" + str(frozen) + " trainable=" + str(trainable))
+
+    let mut cur_hooks = hooks
+    let mut train_log = []
+    let mut step = 0
+    let total = config.total_steps
+    let lr = config.lr
+    let out_dim = model[n_layers - 1].out_dim
+
+    while step < total {
+        let sample_idx = step % n_data
+        let sample = dataset[sample_idx]
+        let x = sample[0]
+        let target = sample[1]
+
+        let result = loreft_step(model, cur_hooks, x, target, lr)
+        cur_hooks = result[0]
+        let loss = result[1]
+
+        if step % config.log_interval == 0 {
+            println("[loreft] step=" + str(step) + " loss=" + str(loss))
+            train_log = train_log + [loss]
+        }
+
+        step = step + 1
+    }
+
+    // Final loss
+    let final_sample = dataset[0]
+    let final_trace = collect_hidden_trace(model, final_sample[0], cur_hooks)
+    let final_loss = lr_mse_loss(final_trace[2], final_sample[1], out_dim)
+    println("[loreft_finetune] done — final_loss=" + str(final_loss))
+
+    return [cur_hooks, final_loss, train_log]
+}
+
+println("[loreft] module loaded — make_intervention + apply + hooks + loreft_finetune")

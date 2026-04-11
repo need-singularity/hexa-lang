@@ -1,0 +1,355 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/grpo.hexa — Group Relative Policy Optimization (DeepSeek-R1)
+//
+//  GRPO removes the value function (PPO's critic) entirely. Instead of
+//  GAE + value baseline, it samples a *group* of G responses per prompt
+//  and uses group-relative normalization as the advantage. Memory drops
+//  ~half and training remains stable thanks to PPO-style clipping plus
+//  a KL penalty against a frozen reference policy.
+//
+//  Per-token loss (single group member i, token t):
+//
+//      ratio_{i,t} = exp( log pi_theta(a|s) - log pi_old(a|s) )
+//      A_i         = ( r_i - mean(r) ) / ( std(r) + eps_norm )
+//      clip_obj    = min( ratio * A_i,
+//                         clip(ratio, 1-eps, 1+eps) * A_i )
+//      kl_k3       = ratio_ref - log(ratio_ref) - 1          (k3 estim.)
+//                     where  ratio_ref = exp(log pi_ref - log pi_theta)
+//      L_{i,t}     = -clip_obj + beta * kl_k3
+//
+//  Group loss: mean over G members and per-member tokens.
+//
+//  Reference:
+//    Shao et al., "DeepSeekMath: Pushing the Limits of Mathematical
+//    Reasoning in Open Language Models" (2024), appendix E (GRPO).
+//    Adopted verbatim in DeepSeek-R1 for RL-driven reasoning alignment.
+//
+//  API (all pure, no BLAS / no external deps):
+//    grpo_sigmoid(x)                                     -> float
+//    grpo_exp(x), grpo_log(x), grpo_abs(x)               -> float
+//    grpo_mean(arr)                                      -> float
+//    grpo_std(arr)                                       -> float (pop)
+//    grpo_advantages(rewards)                            -> [float..]
+//    grpo_ratio(log_pi_new, log_pi_old)                  -> float
+//    grpo_clip(ratio, eps)                               -> float
+//    grpo_clipped_objective(log_new, log_old, adv, eps)  -> float
+//    grpo_kl_k3(log_pi, log_ref)                         -> float
+//    grpo_token_loss(log_new, log_old, log_ref,
+//                    adv, eps_clip, beta)                -> float
+//    grpo_sample_loss(log_new_seq, log_old_seq,
+//                     log_ref_seq, adv,
+//                     eps_clip, beta)                    -> float
+//    grpo_group_loss(group_log_new, group_log_old,
+//                    group_log_ref, rewards,
+//                    eps_clip, beta)                     -> float
+//    grpo_sample_step(log_new_seq, log_old_seq,
+//                     log_ref_seq, adv,
+//                     eps_clip, beta, lr)                -> [float..]
+//    grpo_group_step(group_log_new, group_log_old,
+//                    group_log_ref, rewards,
+//                    eps_clip, beta, lr)                 -> [[float..]..]
+//    grpo_preference_accuracy(rewards)                   -> float
+//    grpo_batch_loss(batch_new, batch_old, batch_ref,
+//                    batch_rew, eps_clip, beta)           -> float
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects, deterministic
+//    @hot   — called every RL step on every token
+// ═══════════════════════════════════════════════════════════════════
+
+let GRPO_EPS_NORM = 1.0e-8
+let GRPO_CLIP_EPS = 0.2
+let GRPO_BETA_KL  = 0.04
+
+// ── numeric helpers (inline, no BLAS) ─────────────────────────────
+
+fn grpo_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn grpo_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn grpo_log(x) {
+    if x <= 0.0 { return -30.0 }
+    let mut v = x
+    let mut count = 0
+    while v > 2.0 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    let d = v - 1.0
+    let ln_v = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_v
+}
+
+fn grpo_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x
+    if g > 1.0 { g = x / 2.0 }
+    let mut i = 0
+    while i < 30 {
+        g = 0.5 * (g + x / g)
+        i = i + 1
+    }
+    return g
+}
+
+fn grpo_sigmoid(x) {
+    if x > 20.0 { return 1.0 }
+    if x < -20.0 { return 0.0 }
+    return 1.0 / (1.0 + grpo_exp(0.0 - x))
+}
+
+// ── group statistics ──────────────────────────────────────────────
+
+fn grpo_mean(arr) {
+    let n = len(arr)
+    if n == 0 { return 0.0 }
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + arr[i]
+        i = i + 1
+    }
+    return s / to_float(n)
+}
+
+fn grpo_std(arr) {
+    let n = len(arr)
+    if n == 0 { return 0.0 }
+    let mu = grpo_mean(arr)
+    let mut var = 0.0
+    let mut i = 0
+    while i < n {
+        let d = arr[i] - mu
+        var = var + d * d
+        i = i + 1
+    }
+    return grpo_sqrt(var / to_float(n))
+}
+
+// ── group-relative advantage normalization ───────────────────────
+// A_i = (r_i - mean(r)) / (std(r) + eps_norm)
+pub fn grpo_advantages(rewards) {
+    let n = len(rewards)
+    let mu = grpo_mean(rewards)
+    let sd = grpo_std(rewards)
+    let denom = sd + GRPO_EPS_NORM
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [(rewards[i] - mu) / denom]
+        i = i + 1
+    }
+    return out
+}
+
+// ── policy ratio ρ = π_θ / π_θ_old ────────────────────────────────
+pub fn grpo_ratio(log_pi_new, log_pi_old) {
+    return grpo_exp(log_pi_new - log_pi_old)
+}
+
+// ── PPO-style scalar clip ─────────────────────────────────────────
+pub fn grpo_clip(ratio, eps) {
+    let lo = 1.0 - eps
+    let hi = 1.0 + eps
+    if ratio < lo { return lo }
+    if ratio > hi { return hi }
+    return ratio
+}
+
+// ── PPO clipped surrogate (per-token) ─────────────────────────────
+//   min( ratio*A, clip(ratio,1±eps)*A )
+pub fn grpo_clipped_objective(log_pi_new, log_pi_old, adv, eps) {
+    let ratio = grpo_ratio(log_pi_new, log_pi_old)
+    let unclipped = ratio * adv
+    let clipped = grpo_clip(ratio, eps) * adv
+    if unclipped < clipped { return unclipped }
+    return clipped
+}
+
+// ── KL penalty (Schulman k3 unbiased estimator) ──────────────────
+// KL[π_θ || π_ref] ≈ r - log r - 1 ,  r = π_ref / π_θ
+pub fn grpo_kl_k3(log_pi, log_ref) {
+    let r = grpo_exp(log_ref - log_pi)
+    let lr = log_ref - log_pi
+    let k3 = r - lr - 1.0
+    if k3 < 0.0 { return 0.0 }
+    return k3
+}
+
+// ── per-token loss ────────────────────────────────────────────────
+// L_{i,t} = -clipped_objective + beta * KL
+pub fn grpo_token_loss(log_new, log_old, log_ref, adv, eps_clip, beta) {
+    let obj = grpo_clipped_objective(log_new, log_old, adv, eps_clip)
+    let kl = grpo_kl_k3(log_new, log_ref)
+    return (0.0 - obj) + beta * kl
+}
+
+// ── sample loss: average per-token loss for group member i ───────
+pub fn grpo_sample_loss(log_new_seq, log_old_seq, log_ref_seq, adv, eps_clip, beta) {
+    let n = len(log_new_seq)
+    if n == 0 { return 0.0 }
+    let mut total = 0.0
+    let mut t = 0
+    while t < n {
+        total = total + grpo_token_loss(
+            log_new_seq[t], log_old_seq[t], log_ref_seq[t],
+            adv, eps_clip, beta
+        )
+        t = t + 1
+    }
+    return total / to_float(n)
+}
+
+// ── full group loss ──────────────────────────────────────────────
+// group_log_*: array of G sequences (array of arrays)
+// rewards:     scalar reward per group member (length G)
+pub fn grpo_group_loss(group_log_new, group_log_old, group_log_ref, rewards, eps_clip, beta) {
+    let g = len(group_log_new)
+    if g == 0 { return 0.0 }
+    let advs = grpo_advantages(rewards)
+    let mut total = 0.0
+    let mut i = 0
+    while i < g {
+        let li = grpo_sample_loss(
+            group_log_new[i], group_log_old[i], group_log_ref[i],
+            advs[i], eps_clip, beta
+        )
+        total = total + li
+        i = i + 1
+    }
+    return total / to_float(g)
+}
+
+// ── gradient wrt log_pi_new for a single token ───────────────────
+// d/d log_new of L :
+//   unclipped branch :  -A * ratio   +  beta * (ratio_ref - 1)
+//   clipped branch   :   0           +  beta * (ratio_ref - 1)
+// (we detect which branch wins by comparing unclipped vs clipped)
+pub fn grpo_token_grad_log_new(log_new, log_old, log_ref, adv, eps_clip, beta) {
+    let ratio = grpo_ratio(log_new, log_old)
+    let unclipped = ratio * adv
+    let clipped_ratio = grpo_clip(ratio, eps_clip)
+    let clipped = clipped_ratio * adv
+    let mut surrogate_grad = 0.0
+    if unclipped < clipped {
+        // min is unclipped → L has -ratio*A component
+        surrogate_grad = 0.0 - ratio * adv
+    } else {
+        // min is clipped → constant wrt log_new (zero surrogate grad)
+        surrogate_grad = 0.0
+    }
+    // KL k3 :  r - (log_ref - log_new) - 1 ,  r = exp(log_ref - log_new)
+    // d/d log_new = -r + 1 = (1 - r)
+    let r_ref = grpo_exp(log_ref - log_new)
+    let kl_grad = 1.0 - r_ref
+    return surrogate_grad + beta * kl_grad
+}
+
+// ── one gradient step on the per-token log_pi_new array ─────────
+// Returns the updated log_new sequence. Heterogeneous (float+array)
+// returns are rejected by the type checker, so callers recompute the
+// pre/post loss via grpo_sample_loss if they need it.
+pub fn grpo_sample_step(log_new_seq, log_old_seq, log_ref_seq, adv, eps_clip, beta, lr) {
+    let n = len(log_new_seq)
+    let mut out = []
+    let mut t = 0
+    while t < n {
+        let ln = log_new_seq[t]
+        let lo = log_old_seq[t]
+        let lr2 = log_ref_seq[t]
+        let g = grpo_token_grad_log_new(ln, lo, lr2, adv, eps_clip, beta)
+        out = out + [ln - lr * g]
+        t = t + 1
+    }
+    return out
+}
+
+// ── full group step: update every member's log_pi_new ───────────
+// Returns the updated group_log_new (array<array<float>>).
+// Use grpo_group_loss(.., rewards, ..) to measure pre/post loss.
+pub fn grpo_group_step(group_log_new, group_log_old, group_log_ref, rewards, eps_clip, beta, lr) {
+    let g = len(group_log_new)
+    let advs = grpo_advantages(rewards)
+    let mut new_group = []
+    let mut i = 0
+    while i < g {
+        let updated = grpo_sample_step(
+            group_log_new[i], group_log_old[i], group_log_ref[i],
+            advs[i], eps_clip, beta, lr
+        )
+        new_group = new_group + [updated]
+        i = i + 1
+    }
+    return new_group
+}
+
+// ── preference accuracy (pairwise): best-reward sample picked ───
+pub fn grpo_preference_accuracy(rewards) {
+    let n = len(rewards)
+    if n <= 1 { return 1.0 }
+    let mut best_i = 0
+    let mut best_v = rewards[0]
+    let mut i = 1
+    while i < n {
+        if rewards[i] > best_v {
+            best_v = rewards[i]
+            best_i = i
+        }
+        i = i + 1
+    }
+    // Reference accuracy: 1.0 if the best-reward sample has positive advantage
+    let advs = grpo_advantages(rewards)
+    if advs[best_i] > 0.0 { return 1.0 }
+    return 0.0
+}
+
+// ── batch loss across many prompt groups ─────────────────────────
+// Four parallel arrays (one entry per prompt) — heterogeneous arrays
+// are rejected by the type checker, so we can't nest [gN,gO,gR,rew].
+//   batch_new[p] : group_log_new for prompt p   (array<array<float>>)
+//   batch_old[p] : group_log_old for prompt p   (array<array<float>>)
+//   batch_ref[p] : group_log_ref for prompt p   (array<array<float>>)
+//   batch_rew[p] : rewards       for prompt p   (array<float>)
+pub fn grpo_batch_loss(batch_new, batch_old, batch_ref, batch_rew, eps_clip, beta) {
+    let n = len(batch_new)
+    if n == 0 { return 0.0 }
+    let mut total = 0.0
+    let mut i = 0
+    while i < n {
+        let gl = grpo_group_loss(batch_new[i], batch_old[i], batch_ref[i], batch_rew[i], eps_clip, beta)
+        total = total + gl
+        i = i + 1
+    }
+    return total / to_float(n)
+}
+
+// ── quick self-smoke (non-destructive) ──────────────────────────
+pub fn grpo_self_check() {
+    let rewards = [1.0, 0.0, 0.5, 0.75]
+    let advs = grpo_advantages(rewards)
+    let mu = grpo_mean(advs)
+    // Normalized advantages must have ~zero mean
+    if grpo_abs(mu) > 1.0e-3 { return 0 }
+    return 1
+}
+
+println("[grpo] loaded — group-relative PPO, clip=" + str(GRPO_CLIP_EPS) + ", beta=" + str(GRPO_BETA_KL))

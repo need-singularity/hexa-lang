@@ -1,0 +1,402 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/colm.hexa — COLM Consensus Decode (#214)
+//
+//  Consensus decoding combines multiple model distributions per token
+//  step by averaging (or min/max/geometric/intersect) their probability
+//  distributions, producing a consensus token. Reduces hallucination
+//  by only picking tokens that multiple models agree on.
+//
+//  API:
+//    colm_softmax(logits, n)                        -> [float]
+//    colm_average_distributions(dists, m, v)        -> [float]
+//    colm_geometric_mean_dist(dists, m, v)          -> [float]
+//    colm_min_distribution(dists, m, v)             -> [float]
+//    colm_intersect_threshold(dists, m, v, t)       -> [float]
+//    colm_consensus_argmax(dists, m, v, mode)       -> int
+//    colm_disagreement_score(dists, m, v)           -> float
+//    colm_kl_divergence(p, q, n)                    -> float
+//    colm_entropy(dist, n)                          -> float
+//    colm_softmax_from_logits(logits_list, m, v)    -> [[float]]
+//    colm_generate_greedy(fns, m, prefix, n, v)     -> [int]
+//    colm_normalize(dist, n)                        -> [float]
+//
+//  AI-NATIVE attrs:
+//    @pure — no side effects
+//    @hot  — called every decode step
+// ═══════════════════════════════════════════════════════════════════
+
+// ── math helpers ─────────────────────────────────────────────────
+
+fn colm_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn colm_max(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn colm_min(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn colm_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn colm_log(x) {
+    if x <= 0.0 { return -30.0 }
+    let mut v = x
+    let mut count = 0
+    while v > 2.0 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    let d = v - 1.0
+    let ln_v = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_v
+}
+
+fn colm_pow(base, exponent) {
+    // base^exponent via exp(exponent * log(base))
+    if base <= 0.0 { return 0.0 }
+    return colm_exp(exponent * colm_log(base))
+}
+
+fn colm_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn colm_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+fn colm_argmax(vals, n) {
+    let mut best = 0
+    let mut best_v = vals[0]
+    for i in 1..n {
+        if vals[i] > best_v {
+            best_v = vals[i]
+            best = i
+        }
+    }
+    return best
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (1) Softmax — numerically stable
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn colm_softmax(logits, n) {
+    let mut m = logits[0]
+    for i in 1..n {
+        if logits[i] > m { m = logits[i] }
+    }
+    let mut exps = colm_zeros(n)
+    let mut z = 0.0
+    for i in 0..n {
+        exps[i] = colm_exp(logits[i] - m)
+        z = z + exps[i]
+    }
+    if z < 1.0e-12 { z = 1.0e-12 }
+    let mut out = colm_zeros(n)
+    for i in 0..n {
+        out[i] = exps[i] / z
+    }
+    return out
+}
+
+// Convert list of logits [n_models][vocab] into list of softmaxed dists
+@pure
+fn colm_softmax_from_logits(logits_list, n_models, vocab) {
+    let mut out = []
+    for m in 0..n_models {
+        let probs = colm_softmax(logits_list[m], vocab)
+        out = out + [probs]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (2) Normalize — sum-to-1 re-normalization
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn colm_normalize(dist, n) {
+    let mut s = 0.0
+    for i in 0..n {
+        if dist[i] > 0.0 {
+            s = s + dist[i]
+        }
+    }
+    if s < 1.0e-12 {
+        // Degenerate: return uniform
+        let mut u = colm_zeros(n)
+        let v = 1.0 / to_float(n)
+        for i in 0..n { u[i] = v }
+        return u
+    }
+    let mut out = colm_zeros(n)
+    for i in 0..n {
+        let v = dist[i]
+        if v > 0.0 {
+            out[i] = v / s
+        } else {
+            out[i] = 0.0
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (3) Average Distributions — elementwise mean across models
+//
+//  dists: [n_models][vocab]
+//  Returns: arithmetic mean distribution over vocab
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn colm_average_distributions(dists, n_models, vocab) {
+    let mut avg = colm_zeros(vocab)
+    if n_models <= 0 { return avg }
+    for m in 0..n_models {
+        for v in 0..vocab {
+            avg[v] = avg[v] + dists[m][v]
+        }
+    }
+    let inv = 1.0 / to_float(n_models)
+    for v in 0..vocab {
+        avg[v] = avg[v] * inv
+    }
+    return avg
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (4) Geometric Mean Distribution — product of p^(1/n), renormalized
+//
+//  Favours tokens that *all* models assign non-trivial mass to.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn colm_geometric_mean_dist(dists, n_models, vocab) {
+    let mut out = colm_zeros(vocab)
+    if n_models <= 0 { return out }
+    let inv_n = 1.0 / to_float(n_models)
+    for v in 0..vocab {
+        // sum of log(p_m(v)) * inv_n -> exp -> geometric mean
+        let mut log_sum = 0.0
+        let mut any_zero = false
+        for m in 0..n_models {
+            let p = dists[m][v]
+            if p <= 1.0e-12 {
+                any_zero = true
+            } else {
+                log_sum = log_sum + colm_log(p)
+            }
+        }
+        if any_zero {
+            out[v] = 0.0
+        } else {
+            out[v] = colm_exp(log_sum * inv_n)
+        }
+    }
+    return colm_normalize(out, vocab)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (5) Min Distribution — elementwise minimum, renormalized
+//
+//  Picks the pessimistic consensus: each bin only as high as the
+//  lowest-agreeing model.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn colm_min_distribution(dists, n_models, vocab) {
+    let mut out = colm_zeros(vocab)
+    if n_models <= 0 { return out }
+    for v in 0..vocab {
+        let mut lo = dists[0][v]
+        for m in 1..n_models {
+            if dists[m][v] < lo { lo = dists[m][v] }
+        }
+        out[v] = lo
+    }
+    return colm_normalize(out, vocab)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (6) Intersect Threshold — keep tokens whose min prob ≥ threshold
+//
+//  All tokens below threshold (for any model) are zeroed out.
+//  Remaining mass gets averaged then renormalized.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn colm_intersect_threshold(dists, n_models, vocab, threshold) {
+    let mut out = colm_zeros(vocab)
+    if n_models <= 0 { return out }
+    for v in 0..vocab {
+        let mut lo = dists[0][v]
+        for m in 1..n_models {
+            if dists[m][v] < lo { lo = dists[m][v] }
+        }
+        if lo >= threshold {
+            // Keep token: mean across models
+            let mut s = 0.0
+            for m in 0..n_models {
+                s = s + dists[m][v]
+            }
+            out[v] = s / to_float(n_models)
+        } else {
+            out[v] = 0.0
+        }
+    }
+    return colm_normalize(out, vocab)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (7) Consensus Argmax — pick token via one of the above methods
+//
+//  mode: 0 = average, 1 = geometric, 2 = min, 3 = intersect(thr=0.05)
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn colm_consensus_argmax(dists, n_models, vocab, mode) {
+    let mut consensus = colm_zeros(vocab)
+    if mode == 0 {
+        consensus = colm_average_distributions(dists, n_models, vocab)
+    } else {
+        if mode == 1 {
+            consensus = colm_geometric_mean_dist(dists, n_models, vocab)
+        } else {
+            if mode == 2 {
+                consensus = colm_min_distribution(dists, n_models, vocab)
+            } else {
+                consensus = colm_intersect_threshold(dists, n_models, vocab, 0.05)
+            }
+        }
+    }
+    return colm_argmax(consensus, vocab)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (8) Disagreement Score — max |p_i(v) - p_j(v)| over all i,j,v
+//
+//  0.0 when all models agree perfectly, ~1.0 when they're disjoint.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn colm_disagreement_score(dists, n_models, vocab) {
+    if n_models <= 1 { return 0.0 }
+    let mut max_diff = 0.0
+    for v in 0..vocab {
+        for i in 0..n_models {
+            for j in 0..n_models {
+                if i < j {
+                    let d = colm_abs(dists[i][v] - dists[j][v])
+                    if d > max_diff { max_diff = d }
+                }
+            }
+        }
+    }
+    return max_diff
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (9) KL Divergence — KL(p || q) = sum(p * log(p/q))
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn colm_kl_divergence(p, q, n) {
+    let mut kl = 0.0
+    for i in 0..n {
+        if p[i] > 1.0e-10 {
+            let qi = q[i] + 1.0e-10
+            kl = kl + p[i] * colm_log(p[i] / qi)
+        }
+    }
+    if kl < 0.0 { return 0.0 }
+    return kl
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (10) Entropy — H(p) = -sum(p * log(p))
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn colm_entropy(dist, n) {
+    let mut h = 0.0
+    for i in 0..n {
+        if dist[i] > 1.0e-10 {
+            h = h - dist[i] * colm_log(dist[i])
+        }
+    }
+    return h
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (11) Deterministic mock "logits" — seed based
+//
+//  Given a model id, prefix list, vocab size, produce a deterministic
+//  logit vector. Used by colm_generate_greedy tests as a lightweight
+//  stand-in for real model forward passes.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn colm_mock_logits(model_id, prefix, vocab) {
+    let mut out = colm_zeros(vocab)
+    let n = len(prefix)
+    let mut h = (model_id * 2654435761 + 11) % 100003
+    for i in 0..n {
+        h = (h * 16777619 + prefix[i] * 131 + 7) % 100003
+    }
+    for v in 0..vocab {
+        let g = (h * 1103515245 + v * 12345) % 100003
+        out[v] = to_float(g) / 100003.0
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (12) Generate Greedy — consensus-decoded sequence
+//
+//  model_ids: [n_models] — passed to colm_mock_logits per step
+//  prefix:    [int] — starting tokens
+//  n_tokens:  number of new tokens to emit
+//  vocab:     vocab size
+//  mode:      consensus mode (0=avg / 1=geo / 2=min / 3=intersect)
+//
+//  Returns: [int] of length n_tokens
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn colm_generate_greedy(model_ids, n_models, prefix, n_tokens, vocab, mode) {
+    let mut ctx = []
+    let p = len(prefix)
+    for i in 0..p { ctx = ctx + [prefix[i]] }
+    let mut out = []
+    for _t in 0..n_tokens {
+        // Build dists: [n_models][vocab] = softmax(mock_logits)
+        let mut dists = []
+        for m in 0..n_models {
+            let logits = colm_mock_logits(model_ids[m], ctx, vocab)
+            let probs = colm_softmax(logits, vocab)
+            dists = dists + [probs]
+        }
+        let tok = colm_consensus_argmax(dists, n_models, vocab, mode)
+        out = out + [tok]
+        ctx = ctx + [tok]
+    }
+    return out
+}
+
+println("[colm] loaded — consensus decode (avg/geo/min/intersect) + KL + entropy + disagreement + greedy")

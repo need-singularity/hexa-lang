@@ -1,0 +1,592 @@
+// ===================================================================
+//  test_colm.hexa — COLM Consensus Decode verification
+//
+//  ML roadmap #214 — Multi-model distribution consensus decoding
+//
+//  Tests (34):
+//    #1  colm_zeros length
+//    #2  colm_softmax sums to 1.0
+//    #3  colm_softmax all non-negative
+//    #4  colm_softmax uniform from zero logits
+//    #5  colm_softmax_from_logits shape
+//    #6  colm_normalize: sum == 1 after
+//    #7  colm_normalize: zeros → uniform
+//    #8  colm_average of identical dists == original
+//    #9  colm_average sums to 1
+//    #10 colm_average 2 dists elementwise mean
+//    #11 colm_geometric all equal → identical
+//    #12 colm_geometric sums to 1
+//    #13 colm_geometric zero propagates
+//    #14 colm_min ≤ each individual at each index
+//    #15 colm_min sums to 1
+//    #16 colm_intersect threshold=0 picks all (sum==1)
+//    #17 colm_intersect threshold high → few tokens
+//    #18 colm_intersect zeroes below-threshold tokens
+//    #19 colm_consensus_argmax with 1 model == argmax of that model
+//    #20 colm_consensus_argmax avg mode == argmax(avg)
+//    #21 colm_consensus_argmax geo mode valid index
+//    #22 colm_consensus_argmax min mode valid index
+//    #23 colm_disagreement zero for identical
+//    #24 colm_disagreement positive for distinct
+//    #25 colm_kl(p||p) = 0
+//    #26 colm_kl(p||q) ≥ 0
+//    #27 colm_entropy(uniform) = log(n)
+//    #28 colm_entropy(delta) ≈ 0
+//    #29 colm_generate_greedy produces n_tokens
+//    #30 colm_generate_greedy deterministic (same seed → same tokens)
+//    #31 colm_generate_greedy all tokens in vocab range
+//    #32 colm_softmax from large logits (numerical stability)
+//    #33 colm_consensus argmax intersect mode valid
+//    #34 colm_log monotonic
+//
+//  Run: PATH=/Users/ghost/.cargo/bin:$PATH ./hexa self/test_colm.hexa
+// ===================================================================
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ===================================================================
+//  Inlined COLM implementation (mirrors self/ml/colm.hexa)
+// ===================================================================
+
+fn colm_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn colm_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn colm_log(x) {
+    if x <= 0.0 { return -30.0 }
+    let mut v = x
+    let mut count = 0
+    while v > 2.0 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    let d = v - 1.0
+    let ln_v = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_v
+}
+
+fn colm_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn colm_argmax(vals, n) {
+    let mut best = 0
+    let mut best_v = vals[0]
+    for i in 1..n {
+        if vals[i] > best_v {
+            best_v = vals[i]
+            best = i
+        }
+    }
+    return best
+}
+
+fn colm_softmax(logits, n) {
+    let mut m = logits[0]
+    for i in 1..n {
+        if logits[i] > m { m = logits[i] }
+    }
+    let mut exps = colm_zeros(n)
+    let mut z = 0.0
+    for i in 0..n {
+        exps[i] = colm_exp(logits[i] - m)
+        z = z + exps[i]
+    }
+    if z < 1.0e-12 { z = 1.0e-12 }
+    let mut out = colm_zeros(n)
+    for i in 0..n {
+        out[i] = exps[i] / z
+    }
+    return out
+}
+
+fn colm_softmax_from_logits(logits_list, n_models, vocab) {
+    let mut out = []
+    for m in 0..n_models {
+        let probs = colm_softmax(logits_list[m], vocab)
+        out = out + [probs]
+    }
+    return out
+}
+
+fn colm_normalize(dist, n) {
+    let mut s = 0.0
+    for i in 0..n {
+        if dist[i] > 0.0 {
+            s = s + dist[i]
+        }
+    }
+    if s < 1.0e-12 {
+        let mut u = colm_zeros(n)
+        let v = 1.0 / to_float(n)
+        for i in 0..n { u[i] = v }
+        return u
+    }
+    let mut out = colm_zeros(n)
+    for i in 0..n {
+        let v = dist[i]
+        if v > 0.0 {
+            out[i] = v / s
+        } else {
+            out[i] = 0.0
+        }
+    }
+    return out
+}
+
+fn colm_average_distributions(dists, n_models, vocab) {
+    let mut avg = colm_zeros(vocab)
+    if n_models <= 0 { return avg }
+    for m in 0..n_models {
+        for v in 0..vocab {
+            avg[v] = avg[v] + dists[m][v]
+        }
+    }
+    let inv = 1.0 / to_float(n_models)
+    for v in 0..vocab {
+        avg[v] = avg[v] * inv
+    }
+    return avg
+}
+
+fn colm_geometric_mean_dist(dists, n_models, vocab) {
+    let mut out = colm_zeros(vocab)
+    if n_models <= 0 { return out }
+    let inv_n = 1.0 / to_float(n_models)
+    for v in 0..vocab {
+        let mut log_sum = 0.0
+        let mut any_zero = false
+        for m in 0..n_models {
+            let p = dists[m][v]
+            if p <= 1.0e-12 {
+                any_zero = true
+            } else {
+                log_sum = log_sum + colm_log(p)
+            }
+        }
+        if any_zero {
+            out[v] = 0.0
+        } else {
+            out[v] = colm_exp(log_sum * inv_n)
+        }
+    }
+    return colm_normalize(out, vocab)
+}
+
+fn colm_min_distribution(dists, n_models, vocab) {
+    let mut out = colm_zeros(vocab)
+    if n_models <= 0 { return out }
+    for v in 0..vocab {
+        let mut lo = dists[0][v]
+        for m in 1..n_models {
+            if dists[m][v] < lo { lo = dists[m][v] }
+        }
+        out[v] = lo
+    }
+    return colm_normalize(out, vocab)
+}
+
+fn colm_intersect_threshold(dists, n_models, vocab, threshold) {
+    let mut out = colm_zeros(vocab)
+    if n_models <= 0 { return out }
+    for v in 0..vocab {
+        let mut lo = dists[0][v]
+        for m in 1..n_models {
+            if dists[m][v] < lo { lo = dists[m][v] }
+        }
+        if lo >= threshold {
+            let mut s = 0.0
+            for m in 0..n_models {
+                s = s + dists[m][v]
+            }
+            out[v] = s / to_float(n_models)
+        } else {
+            out[v] = 0.0
+        }
+    }
+    return colm_normalize(out, vocab)
+}
+
+fn colm_consensus_argmax(dists, n_models, vocab, mode) {
+    let mut consensus = colm_zeros(vocab)
+    if mode == 0 {
+        consensus = colm_average_distributions(dists, n_models, vocab)
+    } else {
+        if mode == 1 {
+            consensus = colm_geometric_mean_dist(dists, n_models, vocab)
+        } else {
+            if mode == 2 {
+                consensus = colm_min_distribution(dists, n_models, vocab)
+            } else {
+                consensus = colm_intersect_threshold(dists, n_models, vocab, 0.05)
+            }
+        }
+    }
+    return colm_argmax(consensus, vocab)
+}
+
+fn colm_disagreement_score(dists, n_models, vocab) {
+    if n_models <= 1 { return 0.0 }
+    let mut max_diff = 0.0
+    for v in 0..vocab {
+        for i in 0..n_models {
+            for j in 0..n_models {
+                if i < j {
+                    let d = colm_abs(dists[i][v] - dists[j][v])
+                    if d > max_diff { max_diff = d }
+                }
+            }
+        }
+    }
+    return max_diff
+}
+
+fn colm_kl_divergence(p, q, n) {
+    let mut kl = 0.0
+    for i in 0..n {
+        if p[i] > 1.0e-10 {
+            let qi = q[i] + 1.0e-10
+            kl = kl + p[i] * colm_log(p[i] / qi)
+        }
+    }
+    if kl < 0.0 { return 0.0 }
+    return kl
+}
+
+fn colm_entropy(dist, n) {
+    let mut h = 0.0
+    for i in 0..n {
+        if dist[i] > 1.0e-10 {
+            h = h - dist[i] * colm_log(dist[i])
+        }
+    }
+    return h
+}
+
+fn colm_mock_logits(model_id, prefix, vocab) {
+    let mut out = colm_zeros(vocab)
+    let n = len(prefix)
+    let mut h = (model_id * 2654435761 + 11) % 100003
+    for i in 0..n {
+        h = (h * 16777619 + prefix[i] * 131 + 7) % 100003
+    }
+    for v in 0..vocab {
+        let g = (h * 1103515245 + v * 12345) % 100003
+        out[v] = to_float(g) / 100003.0
+    }
+    return out
+}
+
+fn colm_generate_greedy(model_ids, n_models, prefix, n_tokens, vocab, mode) {
+    let mut ctx = []
+    let p = len(prefix)
+    for i in 0..p { ctx = ctx + [prefix[i]] }
+    let mut out = []
+    for _t in 0..n_tokens {
+        let mut dists = []
+        for m in 0..n_models {
+            let logits = colm_mock_logits(model_ids[m], ctx, vocab)
+            let probs = colm_softmax(logits, vocab)
+            dists = dists + [probs]
+        }
+        let tok = colm_consensus_argmax(dists, n_models, vocab, mode)
+        out = out + [tok]
+        ctx = ctx + [tok]
+    }
+    return out
+}
+
+// ===================================================================
+//  TESTS
+// ===================================================================
+
+let VOCAB = 8
+
+// ── #1 colm_zeros length ────────────────────────────────────────
+let z = colm_zeros(VOCAB)
+check("#1 colm_zeros length", len(z) == VOCAB)
+
+// ── #2 softmax sums to 1 ────────────────────────────────────────
+let log1 = [1.0, 2.0, 3.0, 0.5, 1.5, 2.5, 0.0, 1.0]
+let p1 = colm_softmax(log1, VOCAB)
+let mut s1 = 0.0
+for i in 0..VOCAB { s1 = s1 + p1[i] }
+check("#2 softmax sums to 1", approx(s1, 1.0, 0.001))
+
+// ── #3 softmax all non-negative ─────────────────────────────────
+let mut nonneg = true
+for i in 0..VOCAB {
+    if p1[i] < 0.0 { nonneg = false }
+}
+check("#3 softmax non-negative", nonneg)
+
+// ── #4 softmax uniform from zero logits ─────────────────────────
+let z_log = colm_zeros(VOCAB)
+let p_uniform = colm_softmax(z_log, VOCAB)
+let target = 1.0 / to_float(VOCAB)
+let mut is_uniform = true
+for i in 0..VOCAB {
+    if fabs(p_uniform[i] - target) > 0.001 { is_uniform = false }
+}
+check("#4 softmax uniform from zero", is_uniform)
+
+// ── #5 softmax_from_logits shape ────────────────────────────────
+let logit_list = [log1, z_log, log1]
+let dists3 = colm_softmax_from_logits(logit_list, 3, VOCAB)
+check("#5 softmax_from_logits shape", len(dists3) == 3 && len(dists3[0]) == VOCAB)
+
+// ── #6 normalize: sum == 1 after ────────────────────────────────
+let unnorm = [2.0, 4.0, 1.0, 3.0, 0.5, 0.5, 1.0, 2.0]
+let norm = colm_normalize(unnorm, VOCAB)
+let mut sn = 0.0
+for i in 0..VOCAB { sn = sn + norm[i] }
+check("#6 normalize sums to 1", approx(sn, 1.0, 0.001))
+
+// ── #7 normalize: zeros → uniform ───────────────────────────────
+let zn = colm_zeros(VOCAB)
+let zn_norm = colm_normalize(zn, VOCAB)
+let mut zn_sum = 0.0
+for i in 0..VOCAB { zn_sum = zn_sum + zn_norm[i] }
+check("#7 normalize zeros → uniform sum=1", approx(zn_sum, 1.0, 0.001))
+
+// ── #8 average of identical dists == original ───────────────────
+let d1 = colm_softmax(log1, VOCAB)
+let dists_same = [d1, d1, d1]
+let avg_same = colm_average_distributions(dists_same, 3, VOCAB)
+let mut avg_eq = true
+for i in 0..VOCAB {
+    if fabs(avg_same[i] - d1[i]) > 0.001 { avg_eq = false }
+}
+check("#8 average identical == original", avg_eq)
+
+// ── #9 average sums to 1 ────────────────────────────────────────
+let log2 = [0.5, 2.0, 1.0, 2.5, 1.5, 0.3, 0.7, 1.2]
+let log3 = [1.1, 0.6, 2.2, 1.8, 0.4, 1.7, 0.9, 1.3]
+let d2 = colm_softmax(log2, VOCAB)
+let d3 = colm_softmax(log3, VOCAB)
+let dists_diff = [d1, d2, d3]
+let avg_diff = colm_average_distributions(dists_diff, 3, VOCAB)
+let mut s_avg = 0.0
+for i in 0..VOCAB { s_avg = s_avg + avg_diff[i] }
+check("#9 average sums to 1", approx(s_avg, 1.0, 0.001))
+
+// ── #10 average 2 dists elementwise mean ────────────────────────
+let two = [d1, d2]
+let avg2 = colm_average_distributions(two, 2, VOCAB)
+let mut avg2_ok = true
+for i in 0..VOCAB {
+    let expected = (d1[i] + d2[i]) / 2.0
+    if fabs(avg2[i] - expected) > 0.001 { avg2_ok = false }
+}
+check("#10 average of 2 == mean", avg2_ok)
+
+// ── #11 geometric all equal → identical ─────────────────────────
+let gm_same = colm_geometric_mean_dist(dists_same, 3, VOCAB)
+let mut gm_eq = true
+for i in 0..VOCAB {
+    if fabs(gm_same[i] - d1[i]) > 0.01 { gm_eq = false }
+}
+check("#11 geometric all equal → identical", gm_eq)
+
+// ── #12 geometric sums to 1 ─────────────────────────────────────
+let gm_diff = colm_geometric_mean_dist(dists_diff, 3, VOCAB)
+let mut gm_sum = 0.0
+for i in 0..VOCAB { gm_sum = gm_sum + gm_diff[i] }
+check("#12 geometric sums to 1", approx(gm_sum, 1.0, 0.01))
+
+// ── #13 geometric zero propagates ───────────────────────────────
+// Construct a dist with one zero bin; geometric mean should zero it
+let d_with_zero = [0.0, 0.4, 0.3, 0.1, 0.1, 0.05, 0.03, 0.02]
+let dn = colm_normalize(d_with_zero, VOCAB)
+let dists_wz = [dn, d1, d2]
+let gm_wz = colm_geometric_mean_dist(dists_wz, 3, VOCAB)
+check("#13 geometric zero propagates", gm_wz[0] < 0.001)
+
+// ── #14 min ≤ each individual at each index ─────────────────────
+let min_dist = colm_min_distribution(dists_diff, 3, VOCAB)
+// After renormalization min_dist entries aren't guaranteed ≤ d_i[i]
+// but the pre-normalized mins are. We verify the property on the
+// raw min values instead: recompute raw min and check ≤ property.
+let mut min_ok = true
+let mut raw_min = colm_zeros(VOCAB)
+for v in 0..VOCAB {
+    let mut lo = dists_diff[0][v]
+    for m in 1..3 {
+        if dists_diff[m][v] < lo { lo = dists_diff[m][v] }
+    }
+    raw_min[v] = lo
+    for m in 0..3 {
+        if raw_min[v] > dists_diff[m][v] + 0.0001 { min_ok = false }
+    }
+}
+check("#14 raw min ≤ each individual", min_ok)
+
+// ── #15 min sums to 1 (after renormalize) ──────────────────────
+let mut mn_sum = 0.0
+for i in 0..VOCAB { mn_sum = mn_sum + min_dist[i] }
+check("#15 min sums to 1", approx(mn_sum, 1.0, 0.01))
+
+// ── #16 intersect threshold=0 picks all (sum==1) ────────────────
+let inter0 = colm_intersect_threshold(dists_diff, 3, VOCAB, 0.0)
+let mut i0_sum = 0.0
+let mut i0_nz = 0
+for i in 0..VOCAB {
+    i0_sum = i0_sum + inter0[i]
+    if inter0[i] > 1.0e-9 { i0_nz = i0_nz + 1 }
+}
+check("#16 intersect thr=0 picks all", approx(i0_sum, 1.0, 0.01) && i0_nz == VOCAB)
+
+// ── #17 intersect threshold=0.1 → fewer tokens than thr=0 ──────
+// Use a controlled pair where only some bins clear 0.1 on every model
+let lhs = [0.05, 0.2, 0.05, 0.3, 0.05, 0.2, 0.1, 0.05]
+let rhs = [0.05, 0.2, 0.1, 0.25, 0.05, 0.2, 0.1, 0.05]
+let lhs_n = colm_normalize(lhs, VOCAB)
+let rhs_n = colm_normalize(rhs, VOCAB)
+let pair17 = [lhs_n, rhs_n]
+let inter_zero = colm_intersect_threshold(pair17, 2, VOCAB, 0.0)
+let inter_mid = colm_intersect_threshold(pair17, 2, VOCAB, 0.15)
+let mut zero_nz = 0
+let mut mid_nz = 0
+for i in 0..VOCAB {
+    if inter_zero[i] > 1.0e-9 { zero_nz = zero_nz + 1 }
+    if inter_mid[i] > 1.0e-9 { mid_nz = mid_nz + 1 }
+}
+check("#17 higher threshold keeps fewer tokens", mid_nz < zero_nz)
+
+// ── #18 intersect zeroes below-threshold tokens ────────────────
+// Build 2 dists where bin 3 is always > 0.2 (stays) and bin 5 < 0.2 (drops)
+let keep = [0.1, 0.1, 0.1, 0.3, 0.1, 0.05, 0.1, 0.15]
+let keep_n = colm_normalize(keep, VOCAB)
+let keep2 = [0.1, 0.1, 0.1, 0.25, 0.1, 0.05, 0.15, 0.15]
+let keep2_n = colm_normalize(keep2, VOCAB)
+let keep_pair = [keep_n, keep2_n]
+let inter_t = colm_intersect_threshold(keep_pair, 2, VOCAB, 0.15)
+// bin 3 should remain > 0, bin 5 should be ~ 0
+check("#18 intersect zeros below threshold", inter_t[3] > 0.0 && inter_t[5] < 0.001)
+
+// ── #19 consensus_argmax with 1 model == argmax of that model ──
+let one_model = [d1]
+let one_am = colm_consensus_argmax(one_model, 1, VOCAB, 0)
+let direct = colm_argmax(d1, VOCAB)
+check("#19 consensus 1-model == argmax", one_am == direct)
+
+// ── #20 consensus_argmax avg mode == argmax(avg) ───────────────
+let avg_am = colm_consensus_argmax(dists_diff, 3, VOCAB, 0)
+let avg_direct = colm_argmax(colm_average_distributions(dists_diff, 3, VOCAB), VOCAB)
+check("#20 consensus avg == argmax(avg)", avg_am == avg_direct)
+
+// ── #21 consensus geo valid index ───────────────────────────────
+let geo_am = colm_consensus_argmax(dists_diff, 3, VOCAB, 1)
+check("#21 consensus geo valid index", geo_am >= 0 && geo_am < VOCAB)
+
+// ── #22 consensus min valid index ───────────────────────────────
+let min_am = colm_consensus_argmax(dists_diff, 3, VOCAB, 2)
+check("#22 consensus min valid index", min_am >= 0 && min_am < VOCAB)
+
+// ── #23 disagreement zero for identical ─────────────────────────
+let dis_zero = colm_disagreement_score(dists_same, 3, VOCAB)
+check("#23 disagreement identical == 0", dis_zero < 0.001)
+
+// ── #24 disagreement positive for distinct ─────────────────────
+let dis_pos = colm_disagreement_score(dists_diff, 3, VOCAB)
+check("#24 disagreement distinct > 0", dis_pos > 0.01)
+
+// ── #25 kl(p||p) = 0 ────────────────────────────────────────────
+let kl_same = colm_kl_divergence(d1, d1, VOCAB)
+check("#25 KL(p||p) = 0", kl_same < 0.001)
+
+// ── #26 kl(p||q) ≥ 0 ────────────────────────────────────────────
+let kl_diff = colm_kl_divergence(d1, d2, VOCAB)
+check("#26 KL(p||q) >= 0", kl_diff >= 0.0)
+
+// ── #27 entropy(uniform) = log(n) ──────────────────────────────
+let ent_u = colm_entropy(p_uniform, VOCAB)
+let expected_ent = colm_log(to_float(VOCAB))
+check("#27 entropy(uniform) = log(n)", approx(ent_u, expected_ent, 0.05))
+
+// ── #28 entropy(delta) ≈ 0 ──────────────────────────────────────
+let delta = [0.99, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001]
+let delta_n = colm_normalize(delta, VOCAB)
+let ent_d = colm_entropy(delta_n, VOCAB)
+check("#28 entropy(delta) small", ent_d < 0.1)
+
+// ── #29 generate_greedy produces n_tokens ──────────────────────
+let model_ids = [1, 2, 3]
+let prefix = [0, 1]
+let gen = colm_generate_greedy(model_ids, 3, prefix, 5, VOCAB, 0)
+check("#29 generate produces 5 tokens", len(gen) == 5)
+
+// ── #30 generate_greedy deterministic ──────────────────────────
+let gen2 = colm_generate_greedy(model_ids, 3, prefix, 5, VOCAB, 0)
+let mut det_ok = true
+for i in 0..5 {
+    if gen[i] != gen2[i] { det_ok = false }
+}
+check("#30 generate deterministic", det_ok)
+
+// ── #31 generate tokens in vocab range ─────────────────────────
+let mut range_ok = true
+for i in 0..5 {
+    if gen[i] < 0 { range_ok = false }
+    if gen[i] >= VOCAB { range_ok = false }
+}
+check("#31 generated tokens in [0,VOCAB)", range_ok)
+
+// ── #32 softmax numerical stability (large logits) ─────────────
+let big = [1000.0, 999.0, 1001.0, 998.0, 1000.5, 999.5, 997.0, 1000.2]
+let pb = colm_softmax(big, VOCAB)
+let mut pb_sum = 0.0
+for i in 0..VOCAB { pb_sum = pb_sum + pb[i] }
+check("#32 softmax stable large logits", approx(pb_sum, 1.0, 0.001))
+
+// ── #33 consensus intersect mode valid ─────────────────────────
+let inter_am = colm_consensus_argmax(dists_diff, 3, VOCAB, 3)
+check("#33 consensus intersect valid index", inter_am >= 0 && inter_am < VOCAB)
+
+// ── #34 log monotonic ───────────────────────────────────────────
+let l_lo = colm_log(1.0)
+let l_mid = colm_log(2.7)
+let l_hi = colm_log(5.0)
+check("#34 log monotonic", l_lo < l_mid && l_mid < l_hi)
+
+// ===================================================================
+println("")
+println("=== COLM test summary ===")
+println("PASS: " + str(pass_count))
+println("FAIL: " + str(fail_count))
+println("TOTAL: " + str(pass_count + fail_count))

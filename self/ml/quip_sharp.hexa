@@ -1,0 +1,682 @@
+// ===================================================================
+//  quip_sharp.hexa — QuIP# incoherence lattice 2-bit quantization
+//
+//  Reference: Chee et al. 2024 "QuIP#: Even Better LLM Quantization
+//  with Hadamard Incoherence and Lattice Codebooks".
+//
+//  Core idea:
+//    Standard round-to-nearest quantization at 2 bits/weight is
+//    catastrophically bad because a few large-magnitude weights
+//    dominate the error. QuIP# solves this in two steps:
+//
+//    1. INCOHERENCE PROCESSING
+//       Apply a random orthogonal transform (Hadamard + random sign)
+//       to both rows and columns of the weight matrix. This spreads
+//       information across all entries, making the post-transform
+//       magnitudes nearly uniform. Uniform magnitudes are ideal for
+//       fixed-point quantization because no single entry dominates.
+//
+//    2. E8 LATTICE CODEBOOK
+//       Instead of scalar rounding (per-element round-to-nearest),
+//       QuIP# groups entries into 8-tuples and rounds to the nearest
+//       point in the E8 lattice. The E8 lattice has the densest
+//       known sphere packing in R^8, giving ~0.5 dB better SNR
+//       than scalar rounding at the same 2 bits/weight budget.
+//
+//  Simplified implementation (pure hexa, CPU-only):
+//    - Hadamard transform via recursive butterfly (O(n log n))
+//    - Random sign vector from seeded LCG (deterministic)
+//    - E8 codebook approximated by coordinate-wise 2-bit rounding
+//      of 8-element groups (simplified lattice nearest-point)
+//    - Dequantize: codebook decode + inverse Hadamard
+//    - Forward pass: dequantize-to-register matmul
+//
+//  Functions:
+//    quip_hadamard(v)                       -> [float]
+//    quip_inv_hadamard(v)                   -> [float]
+//    quip_random_signs(n, seed)             -> [float] (+1/-1)
+//    quip_incoherence_fwd(row, signs)       -> [float]
+//    quip_incoherence_inv(row, signs)       -> [float]
+//    quip_e8_encode(group8, scale)          -> [int] (8 codes)
+//    quip_e8_decode(codes8, scale)          -> [float] (8 vals)
+//    quip_quantize(W, n_out, n_in, seed)    -> QuipTensor
+//    quip_dequantize(qt)                    -> [float]
+//    quip_forward(qt, x)                    -> [float]
+//    quip_error_stats(W, qt)               -> QuipStats
+//    quip_uniform_baseline(W, n_out, n_in) -> QuipStats
+//
+//  Storage: 2 bits/weight -> 4 weights per byte.
+//  Pure hexa — no external dependencies.
+// ===================================================================
+
+// ── Constants ────────────────────────────────────────────────────
+@pure fn QUIP_BITS() { return 2 }
+@pure fn QUIP_LEVELS() { return 4 }          // 2^2
+@pure fn QUIP_QMIN() { return 0 }
+@pure fn QUIP_QMAX() { return 3 }
+@pure fn QUIP_GROUP() { return 8 }           // E8 lattice dimension
+@pure fn QUIP_LCG_A() { return 1103515245 }
+@pure fn QUIP_LCG_C() { return 12345 }
+@pure fn QUIP_LCG_M() { return 2147483648 }
+
+// ── Result structs ───────────────────────────────────────────────
+struct QuipTensor {
+    n_out: int,
+    n_in: int,
+    n_in_pad: int,
+    seed: int,
+    signs: array,
+    scales: array,
+    data: array
+}
+
+struct QuipStats {
+    mse: float,
+    max_err: float,
+    snr: float
+}
+
+// ── Math helpers (pure hexa, _q prefix) ──────────────────────────
+fn _q_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn _q_max(a, b) {
+    if a >= b { return a }
+    return b
+}
+
+fn _q_min(a, b) {
+    if a <= b { return a }
+    return b
+}
+
+fn _q_clamp(v, lo, hi) {
+    if v < lo { return lo }
+    if v > hi { return hi }
+    return v
+}
+
+fn _q_round(x) {
+    if x >= 0.0 { return int(x + 0.5) }
+    return int(x - 0.5)
+}
+
+fn _q_log10(x) {
+    if x <= 0.0 { return -999.0 }
+    let mut v = x
+    let mut result = 0.0
+    while v >= 10.0 {
+        v = v / 10.0
+        result = result + 1.0
+    }
+    while v < 1.0 {
+        v = v * 10.0
+        result = result - 1.0
+    }
+    let t = (v - 1.0) / (v + 1.0)
+    let t2 = t * t
+    let ln_v = 2.0 * (t + t * t2 / 3.0 + t * t2 * t2 / 5.0 + t * t2 * t2 * t2 / 7.0 + t * t2 * t2 * t2 * t2 / 9.0)
+    result = result + ln_v / 2.302585
+    return result
+}
+
+fn _q_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g == 0.0 { g = 1.0 }
+    let mut i = 0
+    while i < 30 {
+        g = (g + x / g) / 2.0
+        i = i + 1
+    }
+    return g
+}
+
+// ===================================================================
+//  _q_next_pow2(n) -> int
+//
+//  Smallest power of 2 >= n.  Used to pad vectors to Hadamard size.
+// ===================================================================
+fn _q_next_pow2(n) {
+    let mut p = 1
+    while p < n {
+        p = p * 2
+    }
+    return p
+}
+
+// ===================================================================
+//  quip_random_signs(n, seed) -> [float]
+//
+//  Generate a length-n vector of +1.0 / -1.0 from a seeded LCG.
+//  Deterministic given the same seed, so quantize/dequantize agree.
+// ===================================================================
+fn quip_random_signs(n, seed) {
+    let mut s = seed
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        s = (s * QUIP_LCG_A() + QUIP_LCG_C()) % QUIP_LCG_M()
+        // Extract bit 16 (not bit 0 which alternates in this LCG)
+        let bit = (s / 65536) % 2
+        if bit == 0 {
+            out = out + [1.0]
+        } else {
+            out = out + [-1.0]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  quip_hadamard(v) -> [float]
+//
+//  In-place Walsh-Hadamard transform (WHT).  Input length must be a
+//  power of 2.  The transform is its own inverse up to a 1/n factor.
+//  Uses the iterative butterfly decomposition: O(n log n).
+//
+//  H_n * v  where H_n is the normalized Hadamard matrix.
+//  We store the unnormalized result; normalization is applied once
+//  at the end by dividing by sqrt(n).
+// ===================================================================
+fn quip_hadamard(v) {
+    let n = len(v)
+    let mut buf = []
+    let mut i = 0
+    while i < n {
+        buf = buf + [v[i]]
+        i = i + 1
+    }
+    let mut half = 1
+    while half < n {
+        let mut j = 0
+        while j < n {
+            let mut k = 0
+            while k < half {
+                let a = buf[j + k]
+                let b = buf[j + k + half]
+                buf[j + k] = a + b
+                buf[j + k + half] = a - b
+                k = k + 1
+            }
+            j = j + half * 2
+        }
+        half = half * 2
+    }
+    let norm = _q_sqrt(to_float(n))
+    i = 0
+    while i < n {
+        buf[i] = buf[i] / norm
+        i = i + 1
+    }
+    return buf
+}
+
+// ===================================================================
+//  quip_inv_hadamard(v) -> [float]
+//
+//  Inverse WHT.  Since the normalized Hadamard matrix is symmetric
+//  and orthogonal, H^{-1} = H (i.e. applying it twice gives identity).
+//  So the inverse is the same butterfly + same normalization.
+// ===================================================================
+fn quip_inv_hadamard(v) {
+    return quip_hadamard(v)
+}
+
+// ===================================================================
+//  quip_incoherence_fwd(row, signs) -> [float]
+//
+//  Forward incoherence processing for a single row:
+//    1. Element-wise multiply by random signs  (diagonal D)
+//    2. Hadamard transform                    (H)
+//  Result:  H * D * row
+//  This makes the row entries approximately uniform in magnitude.
+// ===================================================================
+fn quip_incoherence_fwd(row, signs) {
+    let n = len(row)
+    let mut tmp = []
+    let mut i = 0
+    while i < n {
+        tmp = tmp + [row[i] * signs[i]]
+        i = i + 1
+    }
+    return quip_hadamard(tmp)
+}
+
+// ===================================================================
+//  quip_incoherence_inv(row, signs) -> [float]
+//
+//  Inverse incoherence processing:
+//    row_orig = D^{-1} * H^{-1} * row_transformed
+//  Since D is diagonal with +/-1, D^{-1} = D.
+// ===================================================================
+fn quip_incoherence_inv(row, signs) {
+    let tmp = quip_inv_hadamard(row)
+    let n = len(tmp)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [tmp[i] * signs[i]]
+        i = i + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  quip_e8_encode(group8, scale) -> [int]
+//
+//  Simplified E8 lattice nearest-point encoding for an 8-element group.
+//
+//  Full QuIP# uses the E8 lattice which has 240 nearest neighbors and
+//  optimal sphere packing in R^8.  Here we approximate with:
+//    - Symmetric 2-bit per coordinate: codes {0,1,2,3}
+//    - Dequant levels: {-1.5, -0.5, +0.5, +1.5} * scale
+//    - Round each coordinate to the nearest level
+//
+//  This gives the same 2 bits/weight budget.  The incoherence
+//  transform ensures all coordinates are roughly equal magnitude,
+//  making this coordinate-wise rounding close to the true E8 result.
+// ===================================================================
+fn quip_e8_encode(group8, scale) {
+    let mut codes = []
+    let inv_s = 1.0 / _q_max(scale, 0.0001)
+    let mut i = 0
+    while i < QUIP_GROUP() {
+        let v = group8[i] * inv_s
+        // Map to level index: levels at -1.5, -0.5, +0.5, +1.5
+        // Shift: (v + 1.5) / 1.0 gives float index
+        // Then round and clamp to [0, 3]
+        let idx = _q_clamp(_q_round(v + 1.5), QUIP_QMIN(), QUIP_QMAX())
+        codes = codes + [idx]
+        i = i + 1
+    }
+    return codes
+}
+
+// ===================================================================
+//  quip_e8_decode(codes8, scale) -> [float]
+//
+//  Decode 8 codes back to float values.
+//  Level mapping: code c -> (c - 1.5) * scale
+// ===================================================================
+fn quip_e8_decode(codes8, scale) {
+    let mut out = []
+    let mut i = 0
+    while i < QUIP_GROUP() {
+        let c = codes8[i]
+        out = out + [(to_float(c) - 1.5) * scale]
+        i = i + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  _quip_pack_2bit(codes) -> [int]
+//
+//  Pack an array of 2-bit codes into bytes (4 codes per byte).
+//  Layout: byte = c0 + c1*4 + c2*16 + c3*64
+//  If len(codes) is not a multiple of 4, pad with 0.
+// ===================================================================
+fn _quip_pack_2bit(codes) {
+    let n = len(codes)
+    let nbytes = (n + 3) / 4
+    let mut out = []
+    let mut i = 0
+    while i < nbytes {
+        let base = i * 4
+        let mut byte = 0
+        let mut j = 0
+        while j < 4 {
+            let idx = base + j
+            let mut c = 0
+            if idx < n {
+                c = codes[idx]
+            }
+            // Shift: j=0 -> *1, j=1 -> *4, j=2 -> *16, j=3 -> *64
+            let mut shift = 1
+            let mut k = 0
+            while k < j {
+                shift = shift * 4
+                k = k + 1
+            }
+            byte = byte + c * shift
+            j = j + 1
+        }
+        out = out + [byte]
+        i = i + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  _quip_unpack_2bit(bytes, n) -> [int]
+//
+//  Unpack n 2-bit codes from a byte array.
+// ===================================================================
+fn _quip_unpack_2bit(bytes, n) {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let byte_idx = i / 4
+        let pos = i % 4
+        let byte = bytes[byte_idx]
+        // Extract 2-bit code at position pos
+        let mut shift = 1
+        let mut k = 0
+        while k < pos {
+            shift = shift * 4
+            k = k + 1
+        }
+        let c = (byte / shift) % 4
+        out = out + [c]
+        i = i + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  quip_quantize(W, n_out, n_in, seed) -> QuipTensor
+//
+//  Full QuIP# quantization pipeline:
+//    1. Pad n_in to the next power of 2 (Hadamard requirement)
+//    2. Generate random sign vector
+//    3. For each row:
+//       a. Pad to n_in_pad, apply incoherence transform
+//       b. Compute per-row scale from absmax of transformed row
+//       c. Encode 8-element groups via E8 codebook
+//       d. Pack 2-bit codes
+//    4. Return QuipTensor with packed data + metadata
+// ===================================================================
+fn quip_quantize(W, n_out, n_in, seed) {
+    let n_in_pad = _q_next_pow2(n_in)
+    let signs = quip_random_signs(n_in_pad, seed)
+
+    let mut all_scales = []
+    let mut all_data = []
+
+    let mut r = 0
+    while r < n_out {
+        let base = r * n_in
+        // Extract row and zero-pad to n_in_pad
+        let mut row = []
+        let mut k = 0
+        while k < n_in_pad {
+            if k < n_in {
+                row = row + [W[base + k]]
+            } else {
+                row = row + [0.0]
+            }
+            k = k + 1
+        }
+
+        // Incoherence forward transform
+        let tr = quip_incoherence_fwd(row, signs)
+
+        // Per-row absmax scale for the transformed row
+        let mut amax = 0.0
+        k = 0
+        while k < n_in_pad {
+            let av = _q_abs(tr[k])
+            if av > amax { amax = av }
+            k = k + 1
+        }
+        // Scale maps [-1.5*s, 1.5*s] to cover the data range
+        let mut scale = amax / 1.5
+        if scale == 0.0 { scale = 1.0 }
+        all_scales = all_scales + [scale]
+
+        // Encode in groups of 8
+        let ngroups = n_in_pad / QUIP_GROUP()
+        let mut row_codes = []
+        let mut g = 0
+        while g < ngroups {
+            let gbase = g * QUIP_GROUP()
+            let mut group = []
+            let mut gi = 0
+            while gi < QUIP_GROUP() {
+                group = group + [tr[gbase + gi]]
+                gi = gi + 1
+            }
+            let codes = quip_e8_encode(group, scale)
+            gi = 0
+            while gi < QUIP_GROUP() {
+                row_codes = row_codes + [codes[gi]]
+                gi = gi + 1
+            }
+            g = g + 1
+        }
+
+        // Pack 2-bit codes into bytes
+        let packed = _quip_pack_2bit(row_codes)
+        let mut pi = 0
+        while pi < len(packed) {
+            all_data = all_data + [packed[pi]]
+            pi = pi + 1
+        }
+
+        r = r + 1
+    }
+
+    return QuipTensor {
+        n_out: n_out,
+        n_in: n_in,
+        n_in_pad: n_in_pad,
+        seed: seed,
+        signs: signs,
+        scales: all_scales,
+        data: all_data
+    }
+}
+
+// ===================================================================
+//  quip_dequantize(qt) -> [float]
+//
+//  Reconstruct the weight matrix (flat, row-major, n_out * n_in):
+//    1. Unpack 2-bit codes per row
+//    2. Decode via E8 codebook
+//    3. Apply inverse incoherence transform
+//    4. Truncate padding back to n_in
+// ===================================================================
+fn quip_dequantize(qt) {
+    let nbytes_row = (qt.n_in_pad + 3) / 4
+    let mut out = []
+
+    let mut r = 0
+    while r < qt.n_out {
+        let byte_base = r * nbytes_row
+        // Extract row bytes
+        let mut row_bytes = []
+        let mut bi = 0
+        while bi < nbytes_row {
+            row_bytes = row_bytes + [qt.data[byte_base + bi]]
+            bi = bi + 1
+        }
+        let codes = _quip_unpack_2bit(row_bytes, qt.n_in_pad)
+        let scale = qt.scales[r]
+
+        // Decode groups of 8
+        let ngroups = qt.n_in_pad / QUIP_GROUP()
+        let mut tr_row = []
+        let mut g = 0
+        while g < ngroups {
+            let gbase = g * QUIP_GROUP()
+            let mut group_codes = []
+            let mut gi = 0
+            while gi < QUIP_GROUP() {
+                group_codes = group_codes + [codes[gbase + gi]]
+                gi = gi + 1
+            }
+            let decoded = quip_e8_decode(group_codes, scale)
+            gi = 0
+            while gi < QUIP_GROUP() {
+                tr_row = tr_row + [decoded[gi]]
+                gi = gi + 1
+            }
+            g = g + 1
+        }
+
+        // Inverse incoherence transform
+        let orig_row = quip_incoherence_inv(tr_row, qt.signs)
+
+        // Truncate to original n_in (remove padding)
+        let mut k = 0
+        while k < qt.n_in {
+            out = out + [orig_row[k]]
+            k = k + 1
+        }
+
+        r = r + 1
+    }
+
+    return out
+}
+
+// ===================================================================
+//  quip_forward(qt, x) -> [float]
+//
+//  Matrix-vector product  y = W * x  from the QuIP# representation.
+//  Dequantize-to-register pattern: decode each row on the fly,
+//  compute the dot product, discard the decoded row.
+// ===================================================================
+fn quip_forward(qt, x) {
+    let nbytes_row = (qt.n_in_pad + 3) / 4
+    let mut y = []
+
+    let mut r = 0
+    while r < qt.n_out {
+        let byte_base = r * nbytes_row
+        let mut row_bytes = []
+        let mut bi = 0
+        while bi < nbytes_row {
+            row_bytes = row_bytes + [qt.data[byte_base + bi]]
+            bi = bi + 1
+        }
+        let codes = _quip_unpack_2bit(row_bytes, qt.n_in_pad)
+        let scale = qt.scales[r]
+
+        // Decode groups
+        let ngroups = qt.n_in_pad / QUIP_GROUP()
+        let mut tr_row = []
+        let mut g = 0
+        while g < ngroups {
+            let gbase = g * QUIP_GROUP()
+            let mut group_codes = []
+            let mut gi = 0
+            while gi < QUIP_GROUP() {
+                group_codes = group_codes + [codes[gbase + gi]]
+                gi = gi + 1
+            }
+            let decoded = quip_e8_decode(group_codes, scale)
+            gi = 0
+            while gi < QUIP_GROUP() {
+                tr_row = tr_row + [decoded[gi]]
+                gi = gi + 1
+            }
+            g = g + 1
+        }
+
+        // Inverse incoherence
+        let orig_row = quip_incoherence_inv(tr_row, qt.signs)
+
+        // Dot product with x (only up to n_in)
+        let mut acc = 0.0
+        let mut k = 0
+        while k < qt.n_in {
+            acc = acc + orig_row[k] * x[k]
+            k = k + 1
+        }
+        y = y + [acc]
+
+        r = r + 1
+    }
+
+    return y
+}
+
+// ===================================================================
+//  quip_error_stats(W, qt) -> QuipStats
+//
+//  MSE / max-err / SNR (dB) between original W and QuIP# round-trip.
+// ===================================================================
+fn quip_error_stats(W, qt) {
+    let deq = quip_dequantize(qt)
+    let n = len(W)
+    let mut sse = 0.0
+    let mut mx = 0.0
+    let mut sig = 0.0
+    let mut i = 0
+    while i < n {
+        let e = _q_abs(W[i] - deq[i])
+        sse = sse + e * e
+        if e > mx { mx = e }
+        sig = sig + W[i] * W[i]
+        i = i + 1
+    }
+    let mse = sse / _q_max(to_float(n), 1.0)
+    let mut snr = 999.0
+    if sse > 0.0 {
+        let ratio = sig / sse
+        snr = 10.0 * _q_log10(ratio)
+    }
+    return QuipStats { mse: mse, max_err: mx, snr: snr }
+}
+
+// ===================================================================
+//  quip_uniform_baseline(W, n_out, n_in) -> QuipStats
+//
+//  Compute error stats for naive uniform 2-bit quantization (no
+//  incoherence, no lattice codebook).  Per-row symmetric quantization
+//  with 4 levels {-1.5, -0.5, +0.5, +1.5} * scale.
+//  Used as a reference point to demonstrate QuIP# improvement.
+// ===================================================================
+fn quip_uniform_baseline(W, n_out, n_in) {
+    let n = n_out * n_in
+    let mut deq = []
+    let mut r = 0
+    while r < n_out {
+        let base = r * n_in
+        // Per-row absmax
+        let mut amax = 0.0
+        let mut k = 0
+        while k < n_in {
+            let av = _q_abs(W[base + k])
+            if av > amax { amax = av }
+            k = k + 1
+        }
+        let mut scale = amax / 1.5
+        if scale == 0.0 { scale = 1.0 }
+        let inv_s = 1.0 / scale
+        // Quantize + dequantize each element (scalar 2-bit)
+        k = 0
+        while k < n_in {
+            let v = W[base + k] * inv_s
+            let idx = _q_clamp(_q_round(v + 1.5), 0, 3)
+            let dq = (to_float(idx) - 1.5) * scale
+            deq = deq + [dq]
+            k = k + 1
+        }
+        r = r + 1
+    }
+    // Compute stats
+    let mut sse = 0.0
+    let mut mx = 0.0
+    let mut sig = 0.0
+    let mut i = 0
+    while i < n {
+        let e = _q_abs(W[i] - deq[i])
+        sse = sse + e * e
+        if e > mx { mx = e }
+        sig = sig + W[i] * W[i]
+        i = i + 1
+    }
+    let mse = sse / _q_max(to_float(n), 1.0)
+    let mut snr = 999.0
+    if sse > 0.0 {
+        let ratio = sig / sse
+        snr = 10.0 * _q_log10(ratio)
+    }
+    return QuipStats { mse: mse, max_err: mx, snr: snr }
+}

@@ -1,0 +1,395 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/hindsight_replay.hexa — Hindsight Experience Replay (HER)
+//
+//  Paper: "Hindsight Experience Replay", Andrychowicz et al. 2017
+//
+//  Core idea: in sparse-reward goal-conditioned RL, relabel failed
+//  trajectories with achieved states as alternative goals, turning
+//  failures into successful trajectories for off-policy learning.
+//
+//  Transition schema:
+//    (state, action, reward, next_state, goal, done)
+//
+//  Relabel strategies:
+//    0 = final   — use last state of episode as new goal
+//    1 = future  — pick a random future state from same episode
+//    2 = random  — pick a random state from replay buffer
+//    3 = episode — pick any state from same episode
+//
+//  Reward fn: r(s, g) = 0 if |s - g| < eps else -1  (sparse)
+//
+//  API (pure, no global mutable state):
+//    her_new_buffer(capacity)                        -> buffer
+//    her_new_episode()                               -> episode
+//    her_add_transition(ep, s, a, r, ns, g, done)    -> episode'
+//    her_goal_reward(state, goal, eps)               -> float
+//    her_final_goal(episode)                         -> goal
+//    her_future_goal(episode, t, seed)               -> goal
+//    her_random_goal(buffer, seed)                   -> goal
+//    her_relabel_episode(episode, strategy, k, seed) -> transitions
+//    her_store_episode(buffer, episode)              -> buffer'
+//    her_sample_batch(buffer, batch_size, seed)      -> transitions
+//    her_sparse_success_rate(episode, eps)           -> float
+//    her_dense_shaping(state, goal)                  -> float
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects, functional core
+//    @hot   — called every env step / train batch
+// ═══════════════════════════════════════════════════════════════════
+
+// ── math helpers ────────────────────────────────────────────────
+fn her_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn her_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn her_min(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn her_max(a, b) {
+    if a > b { return a }
+    return b
+}
+
+// Deterministic hash (no global RNG — functional pure)
+fn her_hash(seed, i) {
+    let h = ((seed * 2654435761 + i * 1315423911 + 7919) % 100003)
+    if h < 0 { return 0 - h }
+    return h
+}
+
+// ── L2 distance in goal space ───────────────────────────────────
+@pure
+fn her_l2_distance(a, b) {
+    let na = len(a)
+    let nb = len(b)
+    let n = her_min(na, nb)
+    let mut sum = 0.0
+    for i in 0..n {
+        let d = a[i] - b[i]
+        sum = sum + d * d
+    }
+    return her_sqrt(sum)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Sparse goal-conditioned reward
+//
+//  r(s, g) = 0 if dist(s, g) < eps  (success)
+//          = -1 otherwise            (ongoing failure)
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn her_goal_reward(state, goal, eps) {
+    let d = her_l2_distance(state, goal)
+    if d < eps { return 0.0 }
+    return 0.0 - 1.0
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Dense shaping reward (alternative) — negative distance
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn her_dense_shaping(state, goal) {
+    return 0.0 - her_l2_distance(state, goal)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Episode buffer — append-only list of transition maps
+//
+//  episode = [transition_map, ...]
+//  transition = #{ "state":[float], "action":[float], "reward":float,
+//                  "next":[float], "goal":[float], "done":bool }
+//
+//  Why maps: hexa arrays require homogeneous element types; mixed
+//  (array|float|bool) fields force map-keyed storage.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn her_new_episode() {
+    return []
+}
+
+@pure @hot
+fn her_make_transition(state, action, reward, next_state, goal, done) {
+    let tr = #{}
+    tr["state"] = state
+    tr["action"] = action
+    tr["reward"] = reward
+    tr["next"] = next_state
+    tr["goal"] = goal
+    tr["done"] = done
+    return tr
+}
+
+@pure @hot
+fn her_add_transition(ep, state, action, reward, next_state, goal, done) {
+    let tr = her_make_transition(state, action, reward, next_state, goal, done)
+    return ep + [tr]
+}
+
+@pure
+fn her_episode_length(ep) {
+    return len(ep)
+}
+
+// ── Accessors for transition fields ─────────────────────────────
+@pure
+fn her_tr_state(tr)      { return tr["state"] }
+@pure
+fn her_tr_action(tr)     { return tr["action"] }
+@pure
+fn her_tr_reward(tr)     { return tr["reward"] }
+@pure
+fn her_tr_next(tr)       { return tr["next"] }
+@pure
+fn her_tr_goal(tr)       { return tr["goal"] }
+@pure
+fn her_tr_done(tr)       { return tr["done"] }
+
+// ═══════════════════════════════════════════════════════════════════
+//  Replay buffer — FIFO with capacity
+//
+//  buffer = #{ "cap":int, "data":[transition] }
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn her_new_buffer(capacity) {
+    let b = #{}
+    b["cap"] = capacity
+    b["data"] = []
+    return b
+}
+
+@pure
+fn her_buffer_capacity(buf) { return buf["cap"] }
+
+@pure
+fn her_buffer_size(buf) { return len(buf["data"]) }
+
+@pure
+fn her_buffer_data(buf) { return buf["data"] }
+
+// Append transition, evict oldest if over capacity
+@pure @hot
+fn her_buffer_push(buf, tr) {
+    let cap = buf["cap"]
+    let cur = buf["data"]
+    let mut nxt = cur + [tr]
+    if len(nxt) > cap {
+        let mut trimmed = []
+        let over = len(nxt) - cap
+        for i in over..len(nxt) {
+            trimmed = trimmed + [nxt[i]]
+        }
+        nxt = trimmed
+    }
+    let out = #{}
+    out["cap"] = cap
+    out["data"] = nxt
+    return out
+}
+
+@pure
+fn her_store_episode(buf, ep) {
+    let n = len(ep)
+    let mut b = buf
+    for i in 0..n {
+        b = her_buffer_push(b, ep[i])
+    }
+    return b
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Goal selection strategies
+//
+//  Each returns a "goal" (same shape as state vector).
+// ═══════════════════════════════════════════════════════════════════
+
+// final: achieved state at end of episode
+@pure
+fn her_final_goal(ep) {
+    let n = len(ep)
+    if n == 0 { return [] }
+    let last = ep[n - 1]
+    // goal = next_state of last transition (achieved state)
+    return her_tr_next(last)
+}
+
+// future: random state from [t+1, end]
+fn her_future_goal(ep, t, seed) {
+    let n = len(ep)
+    if n == 0 { return [] }
+    if t >= n - 1 { return her_tr_next(ep[n - 1]) }
+    let lo = t + 1
+    let hi = n
+    let range = hi - lo
+    if range <= 0 { return her_tr_next(ep[n - 1]) }
+    let r = her_hash(seed, t) % range
+    let idx = lo + r
+    return her_tr_next(ep[idx])
+}
+
+// random: sample from entire buffer
+fn her_random_goal(buf, seed) {
+    let data = her_buffer_data(buf)
+    let n = len(data)
+    if n == 0 { return [] }
+    let r = her_hash(seed, 42) % n
+    return her_tr_next(data[r])
+}
+
+// episode: sample from same episode
+fn her_episode_goal(ep, seed) {
+    let n = len(ep)
+    if n == 0 { return [] }
+    let r = her_hash(seed, 9) % n
+    return her_tr_next(ep[r])
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Relabel episode — HER's core mechanism
+//
+//  For each transition t in episode:
+//    1. Keep original transition
+//    2. Generate k synthetic transitions with alternative goals
+//       using `strategy`, recomputing reward under new goal
+//
+//  Returns flat array of transitions (original + relabeled).
+//
+//  strategies:
+//    0 = final
+//    1 = future
+//    2 = random (needs buffer; not applied here → degrade to final)
+//    3 = episode
+// ═══════════════════════════════════════════════════════════════════
+fn her_relabel_episode(ep, strategy, k, eps, seed) {
+    let n = len(ep)
+    let mut out = []
+    for t in 0..n {
+        let tr = ep[t]
+        out = out + [tr]
+        // k synthetic relabels
+        for ki in 0..k {
+            let sub_seed = seed + t * 31 + ki * 97
+            let mut new_goal = []
+            if strategy == 0 {
+                new_goal = her_final_goal(ep)
+            }
+            if strategy == 1 {
+                new_goal = her_future_goal(ep, t, sub_seed)
+            }
+            if strategy == 3 {
+                new_goal = her_episode_goal(ep, sub_seed)
+            }
+            // strategy 2 (random) handled externally via buffer
+            if strategy == 2 {
+                new_goal = her_final_goal(ep)
+            }
+            if len(new_goal) == 0 { new_goal = her_final_goal(ep) }
+            // recompute reward under new goal using next_state
+            let ns = her_tr_next(tr)
+            let new_r = her_goal_reward(ns, new_goal, eps)
+            // done if reward is 0 (reached goal)
+            let mut new_done = false
+            if new_r > 0.0 - 0.5 { new_done = true }
+            let new_tr = her_make_transition(her_tr_state(tr), her_tr_action(tr), new_r, ns, new_goal, new_done)
+            out = out + [new_tr]
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Sampling — uniform over buffer for off-policy update
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn her_sample_batch(buf, batch_size, seed) {
+    let data = her_buffer_data(buf)
+    let n = len(data)
+    let mut batch = []
+    if n == 0 { return batch }
+    for i in 0..batch_size {
+        let r = her_hash(seed, i) % n
+        batch = batch + [data[r]]
+    }
+    return batch
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Sparse success-rate metric — fraction of transitions that hit
+//  their original goal (reward == 0).
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn her_sparse_success_rate(ep, eps) {
+    let n = len(ep)
+    if n == 0 { return 0.0 }
+    let mut hit = 0
+    for i in 0..n {
+        let tr = ep[i]
+        let ns = her_tr_next(tr)
+        let g = her_tr_goal(tr)
+        let r = her_goal_reward(ns, g, eps)
+        if r > 0.0 - 0.5 { hit = hit + 1 }
+    }
+    return to_float(hit) / to_float(n)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Rollout synth: simple 1D environment — agent moves toward goal
+//  by action size. Used for self-tests without RL policy net.
+// ═══════════════════════════════════════════════════════════════════
+fn her_synth_rollout(start, goal, max_steps, step_size, eps) {
+    let mut ep = her_new_episode()
+    let mut s = [start]
+    for t in 0..max_steps {
+        // action = +step_size (deterministic "wrong" direction for failures)
+        let a = [step_size]
+        let ns = [s[0] + step_size]
+        let r = her_goal_reward(ns, goal, eps)
+        let mut done = false
+        if r > 0.0 - 0.5 { done = true }
+        ep = her_add_transition(ep, s, a, r, ns, goal, done)
+        s = ns
+        if done { return ep }
+    }
+    return ep
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Off-policy TD-style update sanity: returns average |r| over batch
+//  (proxy that HER-relabelled batch has more non-negative rewards
+//   than raw sparse batch)
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn her_batch_avg_reward(batch) {
+    let n = len(batch)
+    if n == 0 { return 0.0 - 1.0 }
+    let mut sum = 0.0
+    for i in 0..n {
+        sum = sum + her_tr_reward(batch[i])
+    }
+    return sum / to_float(n)
+}
+
+@pure
+fn her_batch_nonneg_ratio(batch) {
+    let n = len(batch)
+    if n == 0 { return 0.0 }
+    let mut hit = 0
+    for i in 0..n {
+        if her_tr_reward(batch[i]) > 0.0 - 0.5 { hit = hit + 1 }
+    }
+    return to_float(hit) / to_float(n)
+}
+
+println("[hindsight_replay] loaded — HER buffer + relabel(final/future/random/episode) + sparse reward recovery")

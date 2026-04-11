@@ -1,0 +1,555 @@
+// ===================================================================
+//  test_mps_matmul.hexa — MPS Matmul wrapper verification (#200)
+//
+//  Validates the Metal Performance Shaders matmul semantic wrapper
+//  against a hand-checked CPU reference. The Hexa runtime ships
+//  without Metal FFI so this exercises the CPU fallback that
+//  matches MPSMatrixMultiplication semantics exactly.
+//
+//  Tests (38):
+//    T1  abs positive
+//    T2  abs negative
+//    T3  max picks larger
+//    T4  pow2 zero exponent = 1.0
+//    T5  pow2 positive exponent
+//    T6  pow2 negative exponent
+//    T7  floor_log2 of 1
+//    T8  floor_log2 of 8
+//    T9  fp16_round zero stays zero
+//    T10 fp16_round subnormal flushes to zero
+//    T11 fp16_round overflow clamps to ±65504
+//    T12 zeros length and value
+//    T13 identity diagonal
+//    T14 identity off-diagonal
+//    T15 create_descriptor stores rows/cols/dtype/stride
+//    T16 create_matrix wraps buffer + desc
+//    T17 mpsm_get reads row-major buffer
+//    T18 transpose 2x2 swaps off-diagonal
+//    T19 transpose 2x3 changes shape to 3x2
+//    T20 transpose involution: T(T(A))==A
+//    T21 validate_shapes accepts compatible
+//    T22 validate_shapes rejects inner mismatch
+//    T23 validate_shapes rejects zero rows
+//    T24 matmul 2x2 exact integers
+//    T25 matmul shape MxK * KxN -> MxN
+//    T26 matmul identity left: I*A == A
+//    T27 matmul identity right: A*I == A
+//    T28 matmul transA flag matches manual transpose
+//    T29 matmul transB flag matches manual transpose
+//    T30 matmul transA + transB matches double transpose
+//    T31 matmul associative up to FP error
+//    T32 matmul zero matrix yields zero
+//    T33 matmul rectangular 3x2 * 2x4
+//    T34 matmul_fp16_accum shape preserved
+//    T35 matmul_fp16_accum bounded relative error vs FP32
+//    T36 fused_matmul_bias == matmul + bias broadcast
+//    T37 fused_matmul_bias zero bias == matmul
+//    T38 batched_matmul == n_batch sequential matmuls
+//    T39 estimate_flops == 2*m*k*n
+//    T40 estimate_flops zero on empty
+//
+//  Run: PATH=/Users/ghost/.cargo/bin:$PATH ./hexa self/test_mps_matmul.hexa
+// ===================================================================
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ===================================================================
+//  Inlined MPS Matmul implementation (mirrors self/ml/mps_matmul.hexa)
+// ===================================================================
+
+fn mpsm_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn mpsm_max(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn mpsm_pow2(exp) {
+    let mut v = 1.0
+    if exp >= 0 {
+        let mut i = 0
+        while i < exp {
+            v = v * 2.0
+            i = i + 1
+        }
+        return v
+    }
+    let m = 0 - exp
+    let mut j = 0
+    while j < m {
+        v = v / 2.0
+        j = j + 1
+    }
+    return v
+}
+
+fn mpsm_floor_log2(x) {
+    if x <= 0.0 { return -1023 }
+    let mut e = 0
+    let mut v = x
+    while v >= 2.0 {
+        v = v / 2.0
+        e = e + 1
+    }
+    while v < 1.0 {
+        v = v * 2.0
+        e = e - 1
+    }
+    return e
+}
+
+fn mpsm_round_to_int(x) {
+    if x >= 0.0 {
+        let i = to_int(x + 0.5)
+        return i
+    }
+    let i = to_int(x - 0.5)
+    return i
+}
+
+fn mpsm_fp16_round(x) {
+    if x == 0.0 { return 0.0 }
+    let a = mpsm_abs(x)
+    if a < 0.00006103515625 { return 0.0 }
+    if a > 65504.0 {
+        if x < 0.0 { return -65504.0 }
+        return 65504.0
+    }
+    let e = mpsm_floor_log2(a)
+    let step = mpsm_pow2(e - 10)
+    let q = mpsm_round_to_int(x / step)
+    return to_float(q) * step
+}
+
+fn mpsm_zeros(rows, cols) {
+    let n = rows * cols
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn mpsm_identity(n) {
+    let mut v = mpsm_zeros(n, n)
+    for i in 0..n { v[i * n + i] = 1.0 }
+    return v
+}
+
+fn mpsm_create_descriptor(rows, cols, dtype) {
+    return #{
+        "rows": rows,
+        "cols": cols,
+        "dtype": dtype,
+        "stride": cols,
+        "row_bytes": cols * 4
+    }
+}
+
+fn mpsm_create_matrix(data, desc) {
+    return #{
+        "rows": desc["rows"],
+        "cols": desc["cols"],
+        "dtype": desc["dtype"],
+        "stride": desc["stride"],
+        "data": data,
+        "desc": desc
+    }
+}
+
+fn mpsm_get(M, i, j) {
+    let s = M["stride"]
+    return M["data"][i * s + j]
+}
+
+fn mpsm_transpose(M) {
+    let r = M["rows"]
+    let c = M["cols"]
+    let mut out = mpsm_zeros(c, r)
+    for i in 0..r {
+        for j in 0..c {
+            out[j * r + i] = mpsm_get(M, i, j)
+        }
+    }
+    let desc = mpsm_create_descriptor(c, r, M["dtype"])
+    return mpsm_create_matrix(out, desc)
+}
+
+fn mpsm_validate_shapes(A, B) {
+    if A["cols"] != B["rows"] {
+        return "shape mismatch: A.cols != B.rows"
+    }
+    if A["rows"] <= 0 { return "A.rows must be positive" }
+    if B["cols"] <= 0 { return "B.cols must be positive" }
+    if A["cols"] <= 0 { return "inner dim must be positive" }
+    return ""
+}
+
+fn mpsm_matmul(A, B, transA, transB) {
+    let Aeff = if transA { mpsm_transpose(A) } else { A }
+    let Beff = if transB { mpsm_transpose(B) } else { B }
+    let err = mpsm_validate_shapes(Aeff, Beff)
+    if err != "" {
+        let d0 = mpsm_create_descriptor(0, 0, Aeff["dtype"])
+        return mpsm_create_matrix([], d0)
+    }
+    let m = Aeff["rows"]
+    let k = Aeff["cols"]
+    let n = Beff["cols"]
+    let mut out = mpsm_zeros(m, n)
+    for i in 0..m {
+        for j in 0..n {
+            let mut acc = 0.0
+            for p in 0..k {
+                acc = acc + mpsm_get(Aeff, i, p) * mpsm_get(Beff, p, j)
+            }
+            out[i * n + j] = acc
+        }
+    }
+    let desc = mpsm_create_descriptor(m, n, Aeff["dtype"])
+    return mpsm_create_matrix(out, desc)
+}
+
+fn mpsm_matmul_fp16_accum(A, B) {
+    let err = mpsm_validate_shapes(A, B)
+    if err != "" {
+        let d0 = mpsm_create_descriptor(0, 0, A["dtype"])
+        return mpsm_create_matrix([], d0)
+    }
+    let m = A["rows"]
+    let k = A["cols"]
+    let n = B["cols"]
+    let mut out = mpsm_zeros(m, n)
+    for i in 0..m {
+        for j in 0..n {
+            let mut acc = 0.0
+            for p in 0..k {
+                let a = mpsm_fp16_round(mpsm_get(A, i, p))
+                let b = mpsm_fp16_round(mpsm_get(B, p, j))
+                acc = mpsm_fp16_round(acc + a * b)
+            }
+            out[i * n + j] = acc
+        }
+    }
+    let desc = mpsm_create_descriptor(m, n, "fp16")
+    return mpsm_create_matrix(out, desc)
+}
+
+fn mpsm_fused_matmul_bias(A, B, bias) {
+    let C = mpsm_matmul(A, B, false, false)
+    let m = C["rows"]
+    let n = C["cols"]
+    let mut out = mpsm_zeros(m, n)
+    for i in 0..m {
+        for j in 0..n {
+            out[i * n + j] = mpsm_get(C, i, j) + bias[j]
+        }
+    }
+    let desc = mpsm_create_descriptor(m, n, C["dtype"])
+    return mpsm_create_matrix(out, desc)
+}
+
+fn mpsm_batched_matmul(A_batch, B_batch, n_batch) {
+    let mut out = []
+    for b in 0..n_batch {
+        let C = mpsm_matmul(A_batch[b], B_batch[b], false, false)
+        out = out + [C]
+    }
+    return out
+}
+
+fn mpsm_estimate_flops(m, k, n) {
+    return 2 * m * k * n
+}
+
+// ===================================================================
+//  Test fixtures
+// ===================================================================
+
+let d2 = mpsm_create_descriptor(2, 2, "fp32")
+let d23 = mpsm_create_descriptor(2, 3, "fp32")
+let d32 = mpsm_create_descriptor(3, 2, "fp32")
+let d24 = mpsm_create_descriptor(2, 4, "fp32")
+let d34 = mpsm_create_descriptor(3, 4, "fp32")
+
+let A22 = mpsm_create_matrix([1.0, 2.0, 3.0, 4.0], d2)
+let B22 = mpsm_create_matrix([5.0, 6.0, 7.0, 8.0], d2)
+let I2  = mpsm_create_matrix(mpsm_identity(2), d2)
+let Z22 = mpsm_create_matrix(mpsm_zeros(2, 2), d2)
+
+// 3x2 and 2x4 for rectangular tests
+let A32 = mpsm_create_matrix([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], d32)
+let B24 = mpsm_create_matrix([1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0], d24)
+
+// ===================================================================
+//  T1..T11 — numeric helpers
+// ===================================================================
+
+check("T1 abs(3.5) = 3.5", mpsm_abs(3.5) == 3.5)
+check("T2 abs(-3.5) = 3.5", mpsm_abs(-3.5) == 3.5)
+check("T3 max(2.0, 7.0) = 7.0", mpsm_max(2.0, 7.0) == 7.0)
+check("T4 pow2(0) = 1.0", mpsm_pow2(0) == 1.0)
+check("T5 pow2(4) = 16.0", mpsm_pow2(4) == 16.0)
+check("T6 pow2(-2) = 0.25", mpsm_pow2(-2) == 0.25)
+check("T7 floor_log2(1) = 0", mpsm_floor_log2(1.0) == 0)
+check("T8 floor_log2(8) = 3", mpsm_floor_log2(8.0) == 3)
+check("T9 fp16_round(0) = 0", mpsm_fp16_round(0.0) == 0.0)
+check("T10 fp16_round subnormal = 0", mpsm_fp16_round(1.0e-10) == 0.0)
+check("T11 fp16_round overflow clamps", mpsm_fp16_round(100000.0) == 65504.0 && mpsm_fp16_round(-100000.0) == -65504.0)
+
+// ===================================================================
+//  T12..T20 — buffers, descriptors, transpose
+// ===================================================================
+
+// T12 zeros length and value
+let z = mpsm_zeros(2, 3)
+let mut z_ok = (len(z) == 6)
+for i in 0..6 { if z[i] != 0.0 { z_ok = false } }
+check("T12 zeros length=6 all 0.0", z_ok)
+
+// T13 identity diagonal
+let id3 = mpsm_identity(3)
+check("T13 identity diagonal == 1.0", id3[0] == 1.0 && id3[4] == 1.0 && id3[8] == 1.0)
+
+// T14 identity off-diagonal
+check("T14 identity off-diagonal == 0.0", id3[1] == 0.0 && id3[2] == 0.0 && id3[3] == 0.0 && id3[5] == 0.0 && id3[6] == 0.0 && id3[7] == 0.0)
+
+// T15 descriptor stores rows/cols/dtype/stride
+let dtest = mpsm_create_descriptor(7, 5, "fp32")
+check("T15 descriptor rows/cols/dtype/stride", dtest["rows"] == 7 && dtest["cols"] == 5 && dtest["dtype"] == "fp32" && dtest["stride"] == 5)
+
+// T16 create_matrix wraps buffer + desc
+let dtm = mpsm_create_descriptor(2, 2, "fp32")
+let Mtm = mpsm_create_matrix([10.0, 20.0, 30.0, 40.0], dtm)
+check("T16 create_matrix wraps", Mtm["rows"] == 2 && Mtm["cols"] == 2 && Mtm["data"][0] == 10.0 && Mtm["data"][3] == 40.0)
+
+// T17 mpsm_get row-major
+check("T17 mpsm_get row-major access", mpsm_get(A22, 0, 0) == 1.0 && mpsm_get(A22, 0, 1) == 2.0 && mpsm_get(A22, 1, 0) == 3.0 && mpsm_get(A22, 1, 1) == 4.0)
+
+// T18 transpose 2x2 swaps off-diagonal
+let A22T = mpsm_transpose(A22)
+check("T18 transpose 2x2 off-diagonal", mpsm_get(A22T, 0, 1) == 3.0 && mpsm_get(A22T, 1, 0) == 2.0 && mpsm_get(A22T, 0, 0) == 1.0 && mpsm_get(A22T, 1, 1) == 4.0)
+
+// T19 transpose 2x3 changes shape
+let M23 = mpsm_create_matrix([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], d23)
+let M23T = mpsm_transpose(M23)
+check("T19 transpose 2x3 -> 3x2 shape", M23T["rows"] == 3 && M23T["cols"] == 2 && mpsm_get(M23T, 0, 0) == 1.0 && mpsm_get(M23T, 2, 1) == 6.0 && mpsm_get(M23T, 1, 0) == 2.0)
+
+// T20 transpose involution
+let M23TT = mpsm_transpose(M23T)
+let mut tt_ok = (M23TT["rows"] == 2 && M23TT["cols"] == 3)
+for i in 0..2 {
+    for j in 0..3 {
+        if mpsm_get(M23TT, i, j) != mpsm_get(M23, i, j) { tt_ok = false }
+    }
+}
+check("T20 transpose involution T(T(A))==A", tt_ok)
+
+// ===================================================================
+//  T21..T23 — shape validation
+// ===================================================================
+
+// T21 compatible shapes
+check("T21 validate accepts 2x3 * 3x2", mpsm_validate_shapes(M23, mpsm_create_matrix([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], d32)) == "")
+
+// T22 inner mismatch
+check("T22 validate rejects 2x2 * 3x2", mpsm_validate_shapes(A22, A32) != "")
+
+// T23 zero rows
+let d_bad = mpsm_create_descriptor(0, 2, "fp32")
+let M_bad = mpsm_create_matrix([], d_bad)
+check("T23 validate rejects zero rows", mpsm_validate_shapes(M_bad, A22) != "")
+
+// ===================================================================
+//  T24..T33 — matmul correctness
+// ===================================================================
+
+// T24 exact 2x2 integer matmul
+// [[1,2],[3,4]] * [[5,6],[7,8]] = [[19,22],[43,50]]
+let C22 = mpsm_matmul(A22, B22, false, false)
+check("T24 matmul 2x2 exact integers", mpsm_get(C22, 0, 0) == 19.0 && mpsm_get(C22, 0, 1) == 22.0 && mpsm_get(C22, 1, 0) == 43.0 && mpsm_get(C22, 1, 1) == 50.0)
+
+// T25 shape MxK * KxN -> MxN
+// 3x2 * 2x4 -> 3x4
+let C34 = mpsm_matmul(A32, B24, false, false)
+check("T25 matmul shape 3x2 * 2x4 -> 3x4", C34["rows"] == 3 && C34["cols"] == 4)
+
+// T26 identity left I*A == A
+let IA = mpsm_matmul(I2, A22, false, false)
+let mut ia_ok = true
+for i in 0..2 {
+    for j in 0..2 {
+        if mpsm_get(IA, i, j) != mpsm_get(A22, i, j) { ia_ok = false }
+    }
+}
+check("T26 I*A == A", ia_ok)
+
+// T27 identity right A*I == A
+let AI = mpsm_matmul(A22, I2, false, false)
+let mut ai_ok = true
+for i in 0..2 {
+    for j in 0..2 {
+        if mpsm_get(AI, i, j) != mpsm_get(A22, i, j) { ai_ok = false }
+    }
+}
+check("T27 A*I == A", ai_ok)
+
+// T28 transA flag matches manual transpose
+let AtB_flag = mpsm_matmul(A22, B22, true, false)
+let A22T_manual = mpsm_transpose(A22)
+let AtB_manual = mpsm_matmul(A22T_manual, B22, false, false)
+let mut tA_ok = true
+for i in 0..2 {
+    for j in 0..2 {
+        if mpsm_get(AtB_flag, i, j) != mpsm_get(AtB_manual, i, j) { tA_ok = false }
+    }
+}
+check("T28 matmul transA flag == manual T(A)*B", tA_ok)
+
+// T29 transB flag matches manual transpose
+let ABt_flag = mpsm_matmul(A22, B22, false, true)
+let B22T_manual = mpsm_transpose(B22)
+let ABt_manual = mpsm_matmul(A22, B22T_manual, false, false)
+let mut tB_ok = true
+for i in 0..2 {
+    for j in 0..2 {
+        if mpsm_get(ABt_flag, i, j) != mpsm_get(ABt_manual, i, j) { tB_ok = false }
+    }
+}
+check("T29 matmul transB flag == manual A*T(B)", tB_ok)
+
+// T30 transA + transB matches double transpose
+let AtBt_flag = mpsm_matmul(A22, B22, true, true)
+let AtBt_manual = mpsm_matmul(A22T_manual, B22T_manual, false, false)
+let mut tAB_ok = true
+for i in 0..2 {
+    for j in 0..2 {
+        if mpsm_get(AtBt_flag, i, j) != mpsm_get(AtBt_manual, i, j) { tAB_ok = false }
+    }
+}
+check("T30 transA + transB == manual T(A)*T(B)", tAB_ok)
+
+// T31 associativity (A*B)*C ≈ A*(B*C)
+let C22_assoc = mpsm_create_matrix([0.5, 1.5, 2.5, 3.5], d2)
+let AB_then_C = mpsm_matmul(mpsm_matmul(A22, B22, false, false), C22_assoc, false, false)
+let A_then_BC = mpsm_matmul(A22, mpsm_matmul(B22, C22_assoc, false, false), false, false)
+let mut assoc_ok = true
+for i in 0..2 {
+    for j in 0..2 {
+        if !approx(mpsm_get(AB_then_C, i, j), mpsm_get(A_then_BC, i, j), 0.001) { assoc_ok = false }
+    }
+}
+check("T31 (A*B)*C ~ A*(B*C)", assoc_ok)
+
+// T32 zero matrix
+let ZA = mpsm_matmul(Z22, A22, false, false)
+let mut zero_ok = true
+for i in 0..2 {
+    for j in 0..2 {
+        if mpsm_get(ZA, i, j) != 0.0 { zero_ok = false }
+    }
+}
+check("T32 Z*A == zero", zero_ok)
+
+// T33 rectangular 3x2 * 2x4
+// First row of C34 should be A32_row0 * B24:
+//   [1,2] * [[1,0,0,1],[0,1,1,0]] = [1, 2, 2, 1]
+check("T33 matmul rectangular row check", mpsm_get(C34, 0, 0) == 1.0 && mpsm_get(C34, 0, 1) == 2.0 && mpsm_get(C34, 0, 2) == 2.0 && mpsm_get(C34, 0, 3) == 1.0)
+
+// ===================================================================
+//  T34..T35 — FP16 accumulate variant
+// ===================================================================
+
+// T34 fp16 shape preserved
+let C_fp16 = mpsm_matmul_fp16_accum(A22, B22)
+check("T34 fp16_accum shape preserved", C_fp16["rows"] == 2 && C_fp16["cols"] == 2)
+
+// T35 bounded relative error vs FP32
+let C_fp32 = mpsm_matmul(A22, B22, false, false)
+let mut max_rel_err = 0.0
+for i in 0..2 {
+    for j in 0..2 {
+        let r = mpsm_get(C_fp32, i, j)
+        let t = mpsm_get(C_fp16, i, j)
+        let denom = mpsm_max(mpsm_abs(r), 1.0e-12)
+        let e = mpsm_abs(r - t) / denom
+        if e > max_rel_err { max_rel_err = e }
+    }
+}
+check("T35 fp16_accum rel_err < 1e-3", max_rel_err < 1.0e-3)
+
+// ===================================================================
+//  T36..T37 — fused matmul + bias
+// ===================================================================
+
+// T36 fused == matmul + bias broadcast
+let bias22 = [10.0, 20.0]
+let CB_fused = mpsm_fused_matmul_bias(A22, B22, bias22)
+let CB_manual_base = mpsm_matmul(A22, B22, false, false)
+let mut fb_ok = true
+for i in 0..2 {
+    for j in 0..2 {
+        let expected = mpsm_get(CB_manual_base, i, j) + bias22[j]
+        if !approx(mpsm_get(CB_fused, i, j), expected, 1.0e-9) { fb_ok = false }
+    }
+}
+check("T36 fused_matmul_bias == matmul + bias", fb_ok)
+
+// T37 zero bias == matmul
+let zero_bias = [0.0, 0.0]
+let CB_zero = mpsm_fused_matmul_bias(A22, B22, zero_bias)
+let mut fb_zero_ok = true
+for i in 0..2 {
+    for j in 0..2 {
+        if mpsm_get(CB_zero, i, j) != mpsm_get(CB_manual_base, i, j) { fb_zero_ok = false }
+    }
+}
+check("T37 fused_matmul_bias zero bias == matmul", fb_zero_ok)
+
+// ===================================================================
+//  T38 — batched matmul
+// ===================================================================
+
+let A_batch = [A22, A22, B22]
+let B_batch = [B22, A22, A22]
+let batched = mpsm_batched_matmul(A_batch, B_batch, 3)
+let mut bm_ok = (len(batched) == 3)
+for b in 0..3 {
+    let single = mpsm_matmul(A_batch[b], B_batch[b], false, false)
+    for i in 0..2 {
+        for j in 0..2 {
+            if mpsm_get(batched[b], i, j) != mpsm_get(single, i, j) { bm_ok = false }
+        }
+    }
+}
+check("T38 batched_matmul == n sequential matmuls", bm_ok)
+
+// ===================================================================
+//  T39..T40 — flops estimation
+// ===================================================================
+
+check("T39 estimate_flops 2*M*K*N", mpsm_estimate_flops(3, 4, 5) == 120 && mpsm_estimate_flops(2, 2, 2) == 16)
+
+check("T40 estimate_flops zero on empty", mpsm_estimate_flops(0, 4, 5) == 0 && mpsm_estimate_flops(3, 0, 5) == 0)
+
+// ===================================================================
+println("")
+println("=== MPS Matmul test summary ===")
+println("PASS: " + str(pass_count))
+println("FAIL: " + str(fail_count))
+println("TOTAL: " + str(pass_count + fail_count))

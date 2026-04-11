@@ -1,0 +1,404 @@
+// ===================================================================
+//  bitnet_b158.hexa — BitNet b1.58 (ternary {-1, 0, +1} 1.58-bit train)
+//
+//  ML roadmap #217.
+//
+//  Reference: Ma et al., "The Era of 1-bit LLMs: All Large Language
+//  Models are in 1.58 Bits" (2024).
+//
+//  Where the original BitNet (#1, see ml/bitnet.hexa) uses absmean
+//  thresholding to map weights to {-1, 0, +1} via dead-zone clipping,
+//  BitNet b1.58 instead uses absmean SCALING + ROUNDING:
+//
+//      scale         = mean(|W|) + eps
+//      W_q[i]        = round(clip(W[i] / scale, -1, +1))   ∈ {-1, 0, +1}
+//      W_dequant[i]  = scale * W_q[i]
+//
+//  Activations are quantized to int8 with absmax scaling per token.
+//
+//  Forward path (linear layer):
+//      y = scale * (W_q · x_q) * activation_scale
+//
+//  Training uses the straight-through estimator (STE): the gradient
+//  flows through the round() / clip() as if they were the identity.
+//  A continuous "shadow" weight matrix is updated via SGD, then re-
+//  quantized for the next forward pass.
+//
+//  Effective bit-width:
+//      log2(3) ≈ 1.58 bits per weight (information-theoretic minimum
+//      for a ternary alphabet). With 5 trits packed per byte (3^5 =
+//      243 < 256) the practical storage cost is ~1.6 bits/weight.
+//
+//  Public API (prefix b158_):
+//
+//  Math helpers:
+//    b158_abs(x)                       -> float
+//    b158_max(a, b)                    -> numeric
+//    b158_min(a, b)                    -> numeric
+//    b158_clip(x, lo, hi)              -> numeric
+//    b158_round_ternary(x)             -> int     (-1, 0, +1)
+//    b158_round_int(x)                 -> int
+//
+//  Quantization core:
+//    b158_absmean(w, n)                -> float                   (scale)
+//    b158_quantize_weight(w, n)        -> B158Tensor
+//    b158_dequantize(q, scale, n)      -> [float]
+//    b158_activation_quantize(x, n, nbits) -> B158ActTensor      (int8)
+//    b158_activation_dequantize(at)    -> [float]
+//
+//  Linear / inference:
+//    b158_matmul(W_q, W_scale, x, rows, cols) -> [float]
+//    b158_layer_forward(w_q, w_scale, x, rows, cols) -> [float]
+//
+//  Training:
+//    b158_straight_through_gradient(grad_q, w, scale, n) -> [float]
+//    b158_train_step(w, grads, lr, n)                    -> [float]
+//
+//  Memory accounting:
+//    b158_param_bytes(n)               -> int                  (1.58→2 bit)
+//    b158_compression_ratio(fp32_bytes, b158_bytes) -> float
+//
+//  Pure .hexa — no FFI, no Rust, no extern.
+// ===================================================================
+
+// ── Result structs ──────────────────────────────────────────────
+
+struct B158Tensor {
+    // Ternary codes in {-1, 0, +1}, length n.
+    q: array,
+    // Absmean scale (gamma) — multiply q by scale to recover float.
+    scale: float,
+    // Element count.
+    n: int
+}
+
+struct B158ActTensor {
+    // int8 codes (-127..127), length n.
+    q: array,
+    // Per-tensor absmax scale.
+    scale: float,
+    // Element count.
+    n: int,
+    // Quantization bit width (typically 8).
+    nbits: int
+}
+
+// ===================================================================
+//  Math helpers — prefixed b158_ to avoid collision with bitnet.hexa
+// ===================================================================
+
+fn b158_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn b158_max(a, b) {
+    if a >= b { return a }
+    return b
+}
+
+fn b158_min(a, b) {
+    if a <= b { return a }
+    return b
+}
+
+fn b158_clip(x, lo, hi) {
+    if x < lo { return lo }
+    if x > hi { return hi }
+    return x
+}
+
+// Round-to-nearest-int (banker-free): 0.4→0, 0.6→1, -0.6→-1.
+fn b158_round_int(x) {
+    if x >= 0.0 { return to_int(x + 0.5) }
+    return to_int(x - 0.5)
+}
+
+// Round to ternary {-1, 0, +1} after clipping into [-1, +1].
+fn b158_round_ternary(x) {
+    let c = b158_clip(x, -1.0, 1.0)
+    let r = b158_round_int(c)
+    if r > 1 { return 1 }
+    if r < 0 - 1 { return 0 - 1 }
+    return r
+}
+
+// ===================================================================
+//  Absmean — scale = (1/n) * sum(|w_i|), with epsilon floor.
+// ===================================================================
+fn b158_absmean(w, n) {
+    if n == 0 { return 0.0 }
+    let mut acc = 0.0
+    let mut i = 0
+    while i < n {
+        acc = acc + b158_abs(w[i])
+        i = i + 1
+    }
+    return acc / to_float(n)
+}
+
+// ===================================================================
+//  b158_quantize_weight(w, n) -> B158Tensor
+//
+//  scale  = mean(|w|)
+//  q[i]   = round(clip(w[i]/scale, -1, +1))      ∈ {-1, 0, +1}
+//
+//  When scale == 0 (all zero input) the quantized tensor is all zero
+//  with scale 0; that round-trips correctly through dequantize.
+// ===================================================================
+fn b158_quantize_weight(w, n) {
+    let scale = b158_absmean(w, n)
+    let mut qdata = []
+    let mut i = 0
+    if scale <= 0.0 {
+        while i < n {
+            qdata = qdata + [0]
+            i = i + 1
+        }
+        return B158Tensor {
+            q: qdata,
+            scale: 0.0,
+            n: n
+        }
+    }
+    let inv = 1.0 / scale
+    while i < n {
+        let scaled = w[i] * inv
+        qdata = qdata + [b158_round_ternary(scaled)]
+        i = i + 1
+    }
+    return B158Tensor {
+        q: qdata,
+        scale: scale,
+        n: n
+    }
+}
+
+// ===================================================================
+//  b158_dequantize(q, scale, n) -> [float]
+//
+//  w_hat[i] = scale * q[i]
+//
+//  Accepts either a raw ternary array `q` or a B158Tensor (the latter
+//  via the `_tensor` helper below). For the array form the caller must
+//  pass scale + n explicitly.
+// ===================================================================
+fn b158_dequantize(q, scale, n) {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [scale * to_float(q[i])]
+        i = i + 1
+    }
+    return out
+}
+
+fn b158_dequantize_tensor(bt) {
+    return b158_dequantize(bt.q, bt.scale, bt.n)
+}
+
+// ===================================================================
+//  b158_activation_quantize(x, n, nbits) -> B158ActTensor
+//
+//  Symmetric int-N absmax quantization (default N=8). Activations are
+//  scaled to fit in [-(2^(nbits-1)-1), +(2^(nbits-1)-1)] then rounded.
+// ===================================================================
+fn b158_activation_quantize(x, n, nbits) {
+    if n == 0 {
+        return B158ActTensor {
+            q: [],
+            scale: 0.0,
+            n: 0,
+            nbits: nbits
+        }
+    }
+    // qmax = 2^(nbits-1) - 1   (e.g. 127 for nbits=8)
+    let mut qmax = 1
+    let mut k = 1
+    while k < nbits {
+        qmax = qmax * 2
+        k = k + 1
+    }
+    qmax = qmax - 1
+    let qmax_f = to_float(qmax)
+
+    // absmax
+    let mut amax = 0.0
+    let mut i = 0
+    while i < n {
+        let a = b158_abs(x[i])
+        if a > amax { amax = a }
+        i = i + 1
+    }
+    if amax <= 0.0 {
+        let mut zeros = []
+        let mut j = 0
+        while j < n {
+            zeros = zeros + [0]
+            j = j + 1
+        }
+        return B158ActTensor {
+            q: zeros,
+            scale: 0.0,
+            n: n,
+            nbits: nbits
+        }
+    }
+    let scale = amax / qmax_f
+    let inv = qmax_f / amax
+    let mut qdata = []
+    let mut t = 0
+    while t < n {
+        let raw = x[t] * inv
+        let mut q = b158_round_int(raw)
+        if q > qmax { q = qmax }
+        if q < 0 - qmax { q = 0 - qmax }
+        qdata = qdata + [q]
+        t = t + 1
+    }
+    return B158ActTensor {
+        q: qdata,
+        scale: scale,
+        n: n,
+        nbits: nbits
+    }
+}
+
+fn b158_activation_dequantize(at) {
+    let mut out = []
+    let mut i = 0
+    while i < at.n {
+        out = out + [to_float(at.q[i]) * at.scale]
+        i = i + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  b158_matmul(W_q, W_scale, x, rows, cols) -> [float]
+//
+//  W : [rows, cols] flattened row-major, ternary in {-1, 0, +1}
+//  x : [cols]
+//  y : [rows]
+//
+//  Because q ∈ {-1, 0, +1}, the inner product collapses to sign +
+//  add — no float multiplies on weights. The single multiply is by
+//  the global per-tensor `W_scale`.
+// ===================================================================
+fn b158_matmul(W_q, W_scale, x, rows, cols) {
+    let mut out = []
+    let mut r = 0
+    while r < rows {
+        let mut acc = 0.0
+        let mut c = 0
+        while c < cols {
+            let q = W_q[r * cols + c]
+            if q == 1 {
+                acc = acc + x[c]
+            } else {
+                if q == 0 - 1 {
+                    acc = acc - x[c]
+                }
+            }
+            c = c + 1
+        }
+        out = out + [acc * W_scale]
+        r = r + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  b158_layer_forward(w_q, w_scale, x, rows, cols) -> [float]
+//
+//  Convenience wrapper: same as b158_matmul, exposed as the public
+//  forward op for a single linear layer.
+// ===================================================================
+fn b158_layer_forward(w_q, w_scale, x, rows, cols) {
+    return b158_matmul(w_q, w_scale, x, rows, cols)
+}
+
+// ===================================================================
+//  b158_straight_through_gradient(grad_q, w, scale, n) -> [float]
+//
+//  Straight-through estimator: dL/dw ≈ dL/dq when |w/scale| <= 1.
+//  Outside the clip region the gradient is killed to zero so the
+//  shadow weight cannot drift unboundedly.
+// ===================================================================
+fn b158_straight_through_gradient(grad_q, w, scale, n) {
+    let mut grad_w = []
+    let mut i = 0
+    let s = scale
+    while i < n {
+        if s <= 0.0 {
+            grad_w = grad_w + [grad_q[i]]
+        } else {
+            let r = w[i] / s
+            if r > 1.0 {
+                grad_w = grad_w + [0.0]
+            } else {
+                if r < 0.0 - 1.0 {
+                    grad_w = grad_w + [0.0]
+                } else {
+                    grad_w = grad_w + [grad_q[i]]
+                }
+            }
+        }
+        i = i + 1
+    }
+    return grad_w
+}
+
+// ===================================================================
+//  b158_train_step(w, grads, lr, n) -> [float]
+//
+//  Single SGD step on the continuous shadow weights:
+//      w_new[i] = w[i] - lr * grads[i]
+//  Caller re-runs b158_quantize_weight() before the next forward.
+// ===================================================================
+fn b158_train_step(w, grads, lr, n) {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [w[i] - lr * grads[i]]
+        i = i + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  b158_param_bytes(n) -> int
+//
+//  Practical packed storage cost. The information-theoretic minimum
+//  is log2(3) ≈ 1.58 bits / weight, but no real ISA can address
+//  fractional bits. With 5 trits packed per byte (3^5 = 243 < 256)
+//  the cost is ceil(n/5) bytes ≈ n * 1.6 / 8 = n * 0.2.
+//
+//  We round up so a tensor of length n always reports at least 1
+//  byte to avoid downstream division-by-zero in compression-ratio
+//  computations.
+// ===================================================================
+fn b158_param_bytes(n) {
+    if n <= 0 { return 1 }
+    let bytes = (n + 4) / 5
+    if bytes <= 0 { return 1 }
+    return bytes
+}
+
+// ===================================================================
+//  b158_compression_ratio(fp32_bytes, b158_bytes) -> float
+//
+//  fp32_bytes / b158_bytes — how many times smaller the b1.58 form is.
+//  Defensive guard against b158_bytes <= 0.
+// ===================================================================
+fn b158_compression_ratio(fp32_bytes, b158_bytes) {
+    if b158_bytes <= 0 { return 0.0 }
+    return to_float(fp32_bytes) / to_float(b158_bytes)
+}
+
+// ===================================================================
+//  b158_param_count helper for layered models.
+// ===================================================================
+fn b158_param_count(rows, cols) {
+    return rows * cols
+}

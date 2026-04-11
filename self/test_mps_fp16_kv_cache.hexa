@@ -1,0 +1,474 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/test_mps_fp16_kv_cache.hexa — MPS FP16 KV Cache (#202)
+//
+//  Tests (34):
+//    T1  create_cache produces n_layers buffers
+//    T2  create_cache capacities match max_seq
+//    T3  create_cache initial lengths all 0
+//    T4  create_cache slab size = max_seq*n_heads*d_head
+//    T5  fp16_round(0) == 0
+//    T6  fp16_round roundtrip error bounded for typical value
+//    T7  fp16_round negative value preserved
+//    T8  fp16_round subnormal flushed to 0
+//    T9  fp16_round clamps huge positive
+//    T10 fp16_round clamps huge negative
+//    T11 fp16_round row length preserved
+//    T12 append increments length by 1
+//    T13 append over-capacity truncated (length unchanged)
+//    T14 append stores approximately same values (FP16 tolerance)
+//    T15 multi-layer isolation: append to layer 0 doesn't affect layer 1
+//    T16 read_key returns d_head-length row
+//    T17 read_value returns d_head-length row
+//    T18 read_key matches fp16-rounded input
+//    T19 read_value matches fp16-rounded input
+//    T20 memory_bytes == 2 * total cap * n_heads * d_head (k+v)
+//    T21 memory_bytes_kv_single single-sided accounting
+//    T22 get_length tracks current length
+//    T23 length monotonic non-decreasing under appends
+//    T24 append_batch equals n single appends
+//    T25 sliding eviction keeps last window entries
+//    T26 sliding eviction no-op when length <= window
+//    T27 reset clears all layer lengths
+//    T28 reset preserves cache shape
+//    T29 attention_read returns slab_row-length vector
+//    T30 attention_read zero-length returns zero vector
+//    T31 attention_read single entry ~ that value
+//    T32 attention_read uses only past positions (causal)
+//    T33 attention_read softmax weights implicit sum to 1 (norm check)
+//    T34 append after reset works cleanly
+//
+//  Run: PATH=/Users/ghost/.cargo/bin:$PATH ./hexa self/test_mps_fp16_kv_cache.hexa
+// ═══════════════════════════════════════════════════════════════════
+
+import "ml/mps_fp16_kv_cache.hexa"
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn t_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn t_approx(a, b, eps) {
+    return t_abs(a - b) < eps
+}
+
+fn t_rel_err(a, b) {
+    let denom = t_abs(a)
+    if denom < 1.0e-12 { return t_abs(a - b) }
+    return t_abs(a - b) / denom
+}
+
+// Build a simple deterministic row of length n_heads * d_head.
+fn make_row(n_heads, d_head, seed) {
+    let mut out = []
+    let n = n_heads * d_head
+    let mut i = 0
+    while i < n {
+        let v = 0.1 * to_float(seed + i) - 0.3 * to_float(i)
+        out = out + [v]
+        i = i + 1
+    }
+    return out
+}
+
+// Number of floats shared between layer bufs.
+let N_LAYERS = 3
+let MAX_SEQ  = 8
+let N_HEADS  = 2
+let D_HEAD   = 4
+let SLAB_ROW = N_HEADS * D_HEAD  // 8
+let SLAB     = MAX_SEQ * SLAB_ROW  // 64
+
+// ───────────────────────────────────────────────────────────────────
+// T1 — create_cache produces n_layers buffers
+let c1 = mpskv_create_cache(N_LAYERS, MAX_SEQ, N_HEADS, D_HEAD)
+check("T1 create_cache n_layers buffers", len(c1["k_bufs"]) == N_LAYERS && len(c1["v_bufs"]) == N_LAYERS)
+
+// T2 — capacities match max_seq
+let caps1 = c1["capacities"]
+let mut _caps_ok = true
+let mut _i2 = 0
+while _i2 < N_LAYERS {
+    if caps1[_i2] != MAX_SEQ { _caps_ok = false }
+    _i2 = _i2 + 1
+}
+check("T2 capacities match max_seq", _caps_ok)
+
+// T3 — initial lengths all 0
+let lens1 = c1["lengths"]
+let mut _lens_ok = true
+let mut _i3 = 0
+while _i3 < N_LAYERS {
+    if lens1[_i3] != 0 { _lens_ok = false }
+    _i3 = _i3 + 1
+}
+check("T3 initial lengths all 0", _lens_ok)
+
+// T4 — slab size check
+let kb0_init = (c1["k_bufs"])[0]
+check("T4 slab size = max_seq*n_heads*d_head", len(kb0_init) == SLAB && c1["slab"] == SLAB)
+
+// ───────────────────────────────────────────────────────────────────
+// FP16 rounding behavior
+
+// T5 — fp16_round(0) == 0
+check("T5 fp16_round(0) == 0", mpskv_fp16_round(0.0) == 0.0)
+
+// T6 — roundtrip error bounded (1e-3 relative for typical magnitude)
+let x_typ = 1.234567
+let r_typ = mpskv_fp16_round(x_typ)
+check("T6 fp16_round rel err < 1e-3", t_rel_err(x_typ, r_typ) < 1.0e-3)
+
+// T7 — negative value preserved
+let x_neg = -0.7654321
+let r_neg = mpskv_fp16_round(x_neg)
+check("T7 fp16_round negative preserved", r_neg < 0.0 && t_rel_err(x_neg, r_neg) < 1.0e-3)
+
+// T8 — subnormal flushed to 0 (|x| < 2^-14)
+check("T8 fp16_round subnormal -> 0", mpskv_fp16_round(1.0e-8) == 0.0)
+
+// T9 — clamps huge positive to 65504
+check("T9 fp16_round clamps +inf-ish", mpskv_fp16_round(1.0e10) == 65504.0)
+
+// T10 — clamps huge negative to -65504
+check("T10 fp16_round clamps -inf-ish", mpskv_fp16_round(-1.0e10) == -65504.0)
+
+// T11 — fp16_round_row length preserved
+let row_in = [0.25, -0.5, 1.0, 2.0, -3.5, 0.125, 7.0, -8.0]
+let row_rt = mpskv_fp16_round_row(row_in, 8)
+check("T11 fp16_round_row length", len(row_rt) == 8)
+
+// ───────────────────────────────────────────────────────────────────
+// Append / length
+
+// T12 — append increments length by 1
+let mut c12 = mpskv_create_cache(N_LAYERS, MAX_SEQ, N_HEADS, D_HEAD)
+let k_a = make_row(N_HEADS, D_HEAD, 10)
+let v_a = make_row(N_HEADS, D_HEAD, 20)
+c12 = mpskv_append(c12, 0, k_a, v_a)
+check("T12 append increments length", mpskv_get_length(c12, 0) == 1)
+
+// T13 — append over-capacity truncated
+let mut c13 = mpskv_create_cache(1, 2, N_HEADS, D_HEAD)
+let k_b = make_row(N_HEADS, D_HEAD, 30)
+let v_b = make_row(N_HEADS, D_HEAD, 31)
+c13 = mpskv_append(c13, 0, k_b, v_b)
+c13 = mpskv_append(c13, 0, k_b, v_b)
+let len_before = mpskv_get_length(c13, 0)
+// third append should be truncated
+c13 = mpskv_append(c13, 0, k_b, v_b)
+let len_after = mpskv_get_length(c13, 0)
+check("T13 over-capacity append truncated", len_before == 2 && len_after == 2)
+
+// T14 — stored values approximately match input under FP16 tolerance
+let mut c14 = mpskv_create_cache(1, 4, N_HEADS, D_HEAD)
+let k_c = make_row(N_HEADS, D_HEAD, 40)
+let v_c = make_row(N_HEADS, D_HEAD, 50)
+c14 = mpskv_append(c14, 0, k_c, v_c)
+// read_key for pos 0 head 0 should match first d_head entries of k_c under FP16.
+let read_k0 = mpskv_read_key(c14, 0, 0, 0)
+let mut _t14_ok = true
+let mut _d14 = 0
+while _d14 < D_HEAD {
+    let expected = mpskv_fp16_round(k_c[_d14])
+    if t_abs(read_k0[_d14] - expected) > 1.0e-9 { _t14_ok = false }
+    _d14 = _d14 + 1
+}
+check("T14 append stores fp16-rounded input", _t14_ok)
+
+// T15 — multi-layer isolation
+let mut c15 = mpskv_create_cache(2, 4, N_HEADS, D_HEAD)
+let k_d = make_row(N_HEADS, D_HEAD, 60)
+let v_d = make_row(N_HEADS, D_HEAD, 61)
+c15 = mpskv_append(c15, 0, k_d, v_d)
+check("T15 multi-layer isolation", mpskv_get_length(c15, 0) == 1 && mpskv_get_length(c15, 1) == 0)
+
+// ───────────────────────────────────────────────────────────────────
+// Reads
+
+// T16 — read_key returns d_head-length row
+let rk16 = mpskv_read_key(c15, 0, 0, 0)
+check("T16 read_key length == d_head", len(rk16) == D_HEAD)
+
+// T17 — read_value returns d_head-length row
+let rv17 = mpskv_read_value(c15, 0, 0, 0)
+check("T17 read_value length == d_head", len(rv17) == D_HEAD)
+
+// T18 — read_key matches fp16-rounded input
+let mut _t18_ok = true
+let mut _d18 = 0
+while _d18 < D_HEAD {
+    if t_abs(rk16[_d18] - mpskv_fp16_round(k_d[_d18])) > 1.0e-9 { _t18_ok = false }
+    _d18 = _d18 + 1
+}
+check("T18 read_key matches fp16-rounded input", _t18_ok)
+
+// T19 — read_value matches fp16-rounded input
+let mut _t19_ok = true
+let mut _d19 = 0
+while _d19 < D_HEAD {
+    if t_abs(rv17[_d19] - mpskv_fp16_round(v_d[_d19])) > 1.0e-9 { _t19_ok = false }
+    _d19 = _d19 + 1
+}
+check("T19 read_value matches fp16-rounded input", _t19_ok)
+
+// ───────────────────────────────────────────────────────────────────
+// Memory accounting
+
+// T20 — memory_bytes == 2 * 2 * total_slab (k and v, 2 bytes each)
+let expected_total = 2 * 2 * N_LAYERS * MAX_SEQ * N_HEADS * D_HEAD
+check("T20 memory_bytes == 2*2*total_slab", mpskv_memory_bytes(c1) == expected_total)
+
+// T21 — memory_bytes_kv_single side
+let expected_single = 2 * N_LAYERS * MAX_SEQ * N_HEADS * D_HEAD
+check("T21 memory_bytes_kv_single", mpskv_memory_bytes_kv_single(c1) == expected_single)
+
+// ───────────────────────────────────────────────────────────────────
+// Length dynamics
+
+// T22 — get_length tracks current length
+let mut c22 = mpskv_create_cache(1, 6, N_HEADS, D_HEAD)
+let k22 = make_row(N_HEADS, D_HEAD, 70)
+let v22 = make_row(N_HEADS, D_HEAD, 71)
+c22 = mpskv_append(c22, 0, k22, v22)
+c22 = mpskv_append(c22, 0, k22, v22)
+c22 = mpskv_append(c22, 0, k22, v22)
+check("T22 get_length == 3 after 3 appends", mpskv_get_length(c22, 0) == 3)
+
+// T23 — length monotonic under appends
+let mut c23 = mpskv_create_cache(1, 5, N_HEADS, D_HEAD)
+let mut last_len = 0
+let mut _mono = true
+let mut _k = 0
+while _k < 5 {
+    let kr = make_row(N_HEADS, D_HEAD, 80 + _k)
+    let vr = make_row(N_HEADS, D_HEAD, 90 + _k)
+    c23 = mpskv_append(c23, 0, kr, vr)
+    let nl = mpskv_get_length(c23, 0)
+    if nl < last_len { _mono = false }
+    last_len = nl
+    _k = _k + 1
+}
+check("T23 length monotonic under appends", _mono && last_len == 5)
+
+// T24 — append_batch equals n single appends
+let mut c24a = mpskv_create_cache(1, 6, N_HEADS, D_HEAD)
+let mut c24b = mpskv_create_cache(1, 6, N_HEADS, D_HEAD)
+let row1 = make_row(N_HEADS, D_HEAD, 100)
+let row2 = make_row(N_HEADS, D_HEAD, 101)
+let row3 = make_row(N_HEADS, D_HEAD, 102)
+// single appends
+c24a = mpskv_append(c24a, 0, row1, row1)
+c24a = mpskv_append(c24a, 0, row2, row2)
+c24a = mpskv_append(c24a, 0, row3, row3)
+// batched
+c24b = mpskv_append_batch(c24b, 0, [row1, row2, row3], [row1, row2, row3], 3)
+// compare lengths + all three positions x heads
+let _la = mpskv_get_length(c24a, 0)
+let _lb = mpskv_get_length(c24b, 0)
+let mut _t24_ok = (_la == 3) && (_lb == 3)
+let mut _p = 0
+while _p < 3 {
+    let mut _h = 0
+    while _h < N_HEADS {
+        let ka = mpskv_read_key(c24a, 0, _p, _h)
+        let kb = mpskv_read_key(c24b, 0, _p, _h)
+        let va = mpskv_read_value(c24a, 0, _p, _h)
+        let vb = mpskv_read_value(c24b, 0, _p, _h)
+        let mut _d = 0
+        while _d < D_HEAD {
+            if t_abs(ka[_d] - kb[_d]) > 1.0e-9 { _t24_ok = false }
+            if t_abs(va[_d] - vb[_d]) > 1.0e-9 { _t24_ok = false }
+            _d = _d + 1
+        }
+        _h = _h + 1
+    }
+    _p = _p + 1
+}
+check("T24 batch append == n singles", _t24_ok)
+
+// ───────────────────────────────────────────────────────────────────
+// Eviction
+
+// T25 — sliding eviction keeps last window entries
+let mut c25 = mpskv_create_cache(1, 8, N_HEADS, D_HEAD)
+// Append 6 distinct rows (row_i magnitudes differ by seed)
+let mut _i25 = 0
+while _i25 < 6 {
+    let kr = make_row(N_HEADS, D_HEAD, 200 + _i25 * 5)
+    let vr = make_row(N_HEADS, D_HEAD, 300 + _i25 * 5)
+    c25 = mpskv_append(c25, 0, kr, vr)
+    _i25 = _i25 + 1
+}
+// Before eviction: length 6
+let _before = mpskv_get_length(c25, 0)
+// Expected new position 0 after eviction = old position 3 (6-3)
+let expected_new0_k = mpskv_read_key(c25, 0, 3, 0)
+c25 = mpskv_eviction_sliding(c25, 0, 3)
+let _after = mpskv_get_length(c25, 0)
+let new0_k = mpskv_read_key(c25, 0, 0, 0)
+let mut _t25_ok = (_before == 6) && (_after == 3)
+let mut _d25 = 0
+while _d25 < D_HEAD {
+    if t_abs(new0_k[_d25] - expected_new0_k[_d25]) > 1.0e-9 { _t25_ok = false }
+    _d25 = _d25 + 1
+}
+check("T25 sliding eviction keeps last window", _t25_ok)
+
+// T26 — sliding eviction no-op when length <= window
+let mut c26 = mpskv_create_cache(1, 8, N_HEADS, D_HEAD)
+let kr26 = make_row(N_HEADS, D_HEAD, 400)
+let vr26 = make_row(N_HEADS, D_HEAD, 500)
+c26 = mpskv_append(c26, 0, kr26, vr26)
+c26 = mpskv_append(c26, 0, kr26, vr26)
+let before26 = mpskv_get_length(c26, 0)
+c26 = mpskv_eviction_sliding(c26, 0, 5)
+let after26 = mpskv_get_length(c26, 0)
+check("T26 sliding eviction no-op when len<=window", before26 == 2 && after26 == 2)
+
+// ───────────────────────────────────────────────────────────────────
+// Reset
+
+// T27 — reset clears all layer lengths
+let mut c27 = mpskv_create_cache(N_LAYERS, MAX_SEQ, N_HEADS, D_HEAD)
+let kr27 = make_row(N_HEADS, D_HEAD, 600)
+let vr27 = make_row(N_HEADS, D_HEAD, 700)
+c27 = mpskv_append(c27, 0, kr27, vr27)
+c27 = mpskv_append(c27, 1, kr27, vr27)
+c27 = mpskv_append(c27, 2, kr27, vr27)
+c27 = mpskv_reset(c27)
+let mut _t27_ok = true
+let mut _l27 = 0
+while _l27 < N_LAYERS {
+    if mpskv_get_length(c27, _l27) != 0 { _t27_ok = false }
+    _l27 = _l27 + 1
+}
+check("T27 reset clears all layer lengths", _t27_ok)
+
+// T28 — reset preserves cache shape
+check("T28 reset preserves shape", c27["n_layers"] == N_LAYERS && c27["n_heads"] == N_HEADS && c27["d_head"] == D_HEAD && c27["max_seq"] == MAX_SEQ)
+
+// ───────────────────────────────────────────────────────────────────
+// Attention
+
+// T29 — attention_read returns slab_row-length vector
+let mut c29 = mpskv_create_cache(1, 4, N_HEADS, D_HEAD)
+let k29a = make_row(N_HEADS, D_HEAD, 800)
+let v29a = make_row(N_HEADS, D_HEAD, 900)
+c29 = mpskv_append(c29, 0, k29a, v29a)
+let q29 = make_row(N_HEADS, D_HEAD, 850)
+let att29 = mpskv_attention_read(c29, 0, q29, N_HEADS, D_HEAD)
+check("T29 attention_read length == slab_row", len(att29) == SLAB_ROW)
+
+// T30 — zero-length cache returns zero vector
+let empty_c = mpskv_create_cache(1, 4, N_HEADS, D_HEAD)
+let q_any = make_row(N_HEADS, D_HEAD, 1000)
+let att_empty = mpskv_attention_read(empty_c, 0, q_any, N_HEADS, D_HEAD)
+let mut _t30_ok = len(att_empty) == SLAB_ROW
+let mut _i30 = 0
+while _i30 < SLAB_ROW {
+    if att_empty[_i30] != 0.0 { _t30_ok = false }
+    _i30 = _i30 + 1
+}
+check("T30 zero-length attention -> zero vector", _t30_ok)
+
+// T31 — single entry attention ~ that value (softmax over 1 = weight 1)
+let mut c31 = mpskv_create_cache(1, 4, N_HEADS, D_HEAD)
+let k31 = make_row(N_HEADS, D_HEAD, 1100)
+let v31 = make_row(N_HEADS, D_HEAD, 1200)
+c31 = mpskv_append(c31, 0, k31, v31)
+let q31 = make_row(N_HEADS, D_HEAD, 1150)
+let att31 = mpskv_attention_read(c31, 0, q31, N_HEADS, D_HEAD)
+// With length=1, softmax weight is 1 so out should equal fp16-rounded v31.
+let mut _t31_ok = true
+let mut _i31 = 0
+while _i31 < SLAB_ROW {
+    let expected = mpskv_fp16_round(v31[_i31])
+    if t_abs(att31[_i31] - expected) > 1.0e-6 { _t31_ok = false }
+    _i31 = _i31 + 1
+}
+check("T31 single entry attention == that value", _t31_ok)
+
+// T32 — causal: append one entry, compare; append a second very different
+// entry and confirm attention changes only based on past positions.
+// Specifically, attention is always over lengths[layer] past tokens.
+// So: at length=1 output uses v1 only, at length=2 it blends both —
+// proving it cannot see "future" since we only add one at a time.
+let mut c32 = mpskv_create_cache(1, 4, N_HEADS, D_HEAD)
+let k32a = make_row(N_HEADS, D_HEAD, 1300)
+let v32a = make_row(N_HEADS, D_HEAD, 1400)
+c32 = mpskv_append(c32, 0, k32a, v32a)
+let q32 = make_row(N_HEADS, D_HEAD, 1350)
+let att32_t1 = mpskv_attention_read(c32, 0, q32, N_HEADS, D_HEAD)
+let k32b = make_row(N_HEADS, D_HEAD, 1500)
+let v32b = make_row(N_HEADS, D_HEAD, 1600)
+c32 = mpskv_append(c32, 0, k32b, v32b)
+let att32_t2 = mpskv_attention_read(c32, 0, q32, N_HEADS, D_HEAD)
+// t1 must equal v32a (only past == itself); t2 must differ from t1
+// (now mixes v32b). This validates that the second append changed
+// the output only after it was appended — i.e. causal ordering.
+let mut _t32_t1_ok = true
+let mut _i32a = 0
+while _i32a < SLAB_ROW {
+    let expected = mpskv_fp16_round(v32a[_i32a])
+    if t_abs(att32_t1[_i32a] - expected) > 1.0e-6 { _t32_t1_ok = false }
+    _i32a = _i32a + 1
+}
+let mut _t32_differ = false
+let mut _i32b = 0
+while _i32b < SLAB_ROW {
+    if t_abs(att32_t1[_i32b] - att32_t2[_i32b]) > 1.0e-9 { _t32_differ = true }
+    _i32b = _i32b + 1
+}
+check("T32 attention is causal (past-only)", _t32_t1_ok && _t32_differ)
+
+// T33 — softmax weights implicit sum to 1: ||attention_output|| should be
+// bounded by max row norm. With three identical rows v, output == v.
+let mut c33 = mpskv_create_cache(1, 6, N_HEADS, D_HEAD)
+let k33 = make_row(N_HEADS, D_HEAD, 1700)
+let v33 = make_row(N_HEADS, D_HEAD, 1800)
+c33 = mpskv_append(c33, 0, k33, v33)
+c33 = mpskv_append(c33, 0, k33, v33)
+c33 = mpskv_append(c33, 0, k33, v33)
+let q33 = make_row(N_HEADS, D_HEAD, 1750)
+let att33 = mpskv_attention_read(c33, 0, q33, N_HEADS, D_HEAD)
+let mut _t33_ok = true
+let mut _i33 = 0
+while _i33 < SLAB_ROW {
+    let expected = mpskv_fp16_round(v33[_i33])
+    if t_abs(att33[_i33] - expected) > 1.0e-6 { _t33_ok = false }
+    _i33 = _i33 + 1
+}
+check("T33 identical-row attention == that row (weights sum to 1)", _t33_ok)
+
+// T34 — append after reset works cleanly
+let mut c34 = mpskv_create_cache(1, 4, N_HEADS, D_HEAD)
+let k34 = make_row(N_HEADS, D_HEAD, 1900)
+let v34 = make_row(N_HEADS, D_HEAD, 2000)
+c34 = mpskv_append(c34, 0, k34, v34)
+c34 = mpskv_append(c34, 0, k34, v34)
+c34 = mpskv_reset(c34)
+c34 = mpskv_append(c34, 0, k34, v34)
+check("T34 append after reset works", mpskv_get_length(c34, 0) == 1)
+
+// ═══════════════════════════════════════════════════════════════════
+//  Summary
+// ═══════════════════════════════════════════════════════════════════
+
+println("")
+println("=== MPS FP16 KV Cache test summary ===")
+println("PASS: " + str(pass_count))
+println("FAIL: " + str(fail_count))
+println("TOTAL: " + str(pass_count + fail_count))

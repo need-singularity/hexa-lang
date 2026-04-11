@@ -1,0 +1,1036 @@
+// ===================================================================
+//  self/ml/decision_transformer.hexa — Decision Transformer (#110)
+//
+//  Paper: "Decision Transformer: RL via Sequence Modeling"
+//         Chen et al. 2021
+//
+//  Core idea: cast offline RL as a sequence modeling problem.
+//  Given a dataset of (state, action, reward) trajectories, compute
+//  return-to-go at each step and train an autoregressive transformer
+//  to predict actions conditioned on desired return.
+//
+//  Token sequence layout (interleaved triples):
+//    R_1, s_1, a_1, R_2, s_2, a_2, ...
+//  where R_t = return-to-go = sum_{t'>=t} r_{t'}
+//
+//  Architecture:
+//    1. Token Embeddings:
+//       - Return embed: linear R -> d_model
+//       - State embed:  linear s[state_dim] -> d_model
+//       - Action embed: linear onehot(a)[act_dim] -> d_model
+//    2. Timestep positional embedding: learned per timestep
+//    3. Causal transformer (GPT-style) over interleaved (R,s,a) tokens
+//    4. Action prediction head: project from transformer output at
+//       state positions to action logits
+//
+//  Offline RL pipeline:
+//    - Store trajectories (s, a, r) in a dataset
+//    - Compute return-to-go for each trajectory
+//    - Train: predict a_t given (R_1,s_1,a_1,...,R_t,s_t)
+//    - Inference: set desired return R, autoregressively generate actions
+//
+//  All tensors are flat float arrays. No bit-twiddling. Pure Hexa.
+//
+//  Pitfalls observed:
+//    - No struct-literal inside if blocks (use pre-computed flags).
+//    - No semicolons.
+//    - Arrays are by-value across fn boundaries.
+//    - No tail-position array literal return — always bind first.
+//    - for i in 0..N is valid range syntax.
+//
+//  Public API:
+//    dt_create(state_dim, act_dim, d_model, n_heads, n_layers, max_timestep, ctx_len)
+//    dt_embed_return(model, rtg)
+//    dt_embed_state(model, state_vec)
+//    dt_embed_action(model, action)
+//    dt_timestep_embed(model, timestep)
+//    dt_build_sequence(model, rtgs, states, actions, timesteps)
+//    dt_causal_mask(seq_len)
+//    dt_attention(model, layer, Q, K, V, seq_len, mask)
+//    dt_layer_forward(model, layer, x, seq_len, mask)
+//    dt_forward(model, rtgs, states, actions, timesteps)
+//    dt_predict_action(model, logits_at_state)
+//    dt_new_dataset()
+//    dt_add_trajectory(dataset, states, actions, rewards)
+//    dt_compute_rtg(rewards)
+//    dt_get_context(dataset, traj_idx, t, ctx_len)
+//    dt_action_loss(model, dataset, traj_idx, t)
+//    dt_train_step(model, dataset, traj_idx, t, lr)
+//    dt_inference_step(model, rtgs, states, actions, timesteps, desired_rtg, cur_state, cur_timestep)
+// ===================================================================
+
+// ── math helpers ───────────────────────────────────────────────────
+fn dt_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn dt_max(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn dt_min(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn dt_tanh(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < 0.0 - 20.0 { v = 0.0 - 20.0 }
+    let ep = exp(v)
+    let en = exp(0.0 - v)
+    return (ep - en) / (ep + en)
+}
+
+fn dt_clip(x, lo, hi) {
+    if x < lo { return lo }
+    if x > hi { return hi }
+    return x
+}
+
+// Deterministic LCG RNG
+let mut DT_RNG = 42
+
+fn dt_rand() {
+    let a = 1103515245
+    let c = 12345
+    let m = 2147483648
+    let nxt = (a * DT_RNG + c) % m
+    DT_RNG = nxt
+    return to_float(nxt) / 2147483648.0
+}
+
+fn dt_init_vec(n, scale) {
+    let mut v = []
+    let mut i = 0
+    while i < n {
+        let u = dt_rand() * 2.0 - 1.0
+        v = v + [u * scale]
+        i = i + 1
+    }
+    return v
+}
+
+fn dt_zeros(n) {
+    let mut v = []
+    let mut i = 0
+    while i < n {
+        v = v + [0.0]
+        i = i + 1
+    }
+    return v
+}
+
+// matvec: y[rows] = M[rows,cols] * x[cols]
+fn dt_matvec(M, x, rows, cols) {
+    let mut y = []
+    let mut r = 0
+    while r < rows {
+        let base = r * cols
+        let mut sum = 0.0
+        let mut c = 0
+        while c < cols {
+            sum = sum + M[base + c] * x[c]
+            c = c + 1
+        }
+        y = y + [sum]
+        r = r + 1
+    }
+    return y
+}
+
+// dot product
+fn dt_dot(a, b, n) {
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + a[i] * b[i]
+        i = i + 1
+    }
+    return s
+}
+
+// elementwise add
+fn dt_add(a, b, n) {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [a[i] + b[i]]
+        i = i + 1
+    }
+    return out
+}
+
+// elementwise scale
+fn dt_scale(a, s, n) {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [a[i] * s]
+        i = i + 1
+    }
+    return out
+}
+
+// one-hot encode action index -> vector of length act_dim
+fn dt_onehot(a, act_dim) {
+    let mut v = []
+    let mut i = 0
+    while i < act_dim {
+        if i == a {
+            v = v + [1.0]
+        } else {
+            v = v + [0.0]
+        }
+        i = i + 1
+    }
+    return v
+}
+
+// softmax over array of length n
+@pure
+fn dt_softmax(logits, n) {
+    if n == 0 { return [] }
+    let mut mx = logits[0]
+    let mut i = 1
+    while i < n {
+        if logits[i] > mx { mx = logits[i] }
+        i = i + 1
+    }
+    let mut sum_e = 0.0
+    let mut exps = []
+    i = 0
+    while i < n {
+        let e = exp(logits[i] - mx)
+        exps = exps + [e]
+        sum_e = sum_e + e
+        i = i + 1
+    }
+    if sum_e < 1.0e-12 { sum_e = 1.0e-12 }
+    let mut out = []
+    i = 0
+    while i < n {
+        out = out + [exps[i] / sum_e]
+        i = i + 1
+    }
+    return out
+}
+
+// Layer normalization: LN(x) = (x - mean) / sqrt(var + eps) * gamma + beta
+fn dt_layer_norm(x, gamma, beta, d) {
+    let mut mean = 0.0
+    let mut i = 0
+    while i < d {
+        mean = mean + x[i]
+        i = i + 1
+    }
+    mean = mean / to_float(d)
+    let mut var = 0.0
+    i = 0
+    while i < d {
+        let diff = x[i] - mean
+        var = var + diff * diff
+        i = i + 1
+    }
+    var = var / to_float(d)
+    let inv = 1.0 / sqrt(var + 1.0e-5)
+    let mut out = []
+    i = 0
+    while i < d {
+        out = out + [(x[i] - mean) * inv * gamma[i] + beta[i]]
+        i = i + 1
+    }
+    return out
+}
+
+// GELU activation (approx): x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715*x^3)))
+fn dt_gelu(x) {
+    let c = 0.7978845608  // sqrt(2/pi)
+    let inner = c * (x + 0.044715 * x * x * x)
+    return 0.5 * x * (1.0 + dt_tanh(inner))
+}
+
+// ===================================================================
+//  dt_create — build a Decision Transformer model
+//
+//  Parameters:
+//    state_dim   — observation/state vector dimension
+//    act_dim     — number of discrete actions
+//    d_model     — transformer hidden dimension
+//    n_heads     — number of attention heads
+//    n_layers    — number of transformer layers
+//    max_timestep — maximum episode timestep for positional embedding
+//    ctx_len     — context window length (number of timestep triples)
+//
+//  Returns a model map with all weight arrays
+// ===================================================================
+pub fn dt_create(state_dim, act_dim, d_model, n_heads, n_layers, max_timestep, ctx_len) {
+    DT_RNG = 7654321
+    let scale_emb = 0.1
+    let scale_attn = 0.1 / sqrt(to_float(d_model))
+    let scale_ffn = 0.1
+
+    let model = #{}
+    model["state_dim"] = state_dim
+    model["act_dim"] = act_dim
+    model["d_model"] = d_model
+    model["n_heads"] = n_heads
+    model["n_layers"] = n_layers
+    model["max_timestep"] = max_timestep
+    model["ctx_len"] = ctx_len
+    model["head_dim"] = d_model / n_heads
+
+    // Token embedding weights
+    // Return embed: 1 -> d_model (linear projection of scalar)
+    model["W_rtg"] = dt_init_vec(d_model, scale_emb)
+    model["b_rtg"] = dt_zeros(d_model)
+
+    // State embed: state_dim -> d_model
+    model["W_state"] = dt_init_vec(d_model * state_dim, scale_emb)
+    model["b_state"] = dt_zeros(d_model)
+
+    // Action embed: act_dim -> d_model
+    model["W_action"] = dt_init_vec(d_model * act_dim, scale_emb)
+    model["b_action"] = dt_zeros(d_model)
+
+    // Timestep positional embedding: max_timestep * d_model
+    model["W_timestep"] = dt_init_vec(max_timestep * d_model, scale_emb)
+
+    // Transformer layers
+    let mut l = 0
+    while l < n_layers {
+        let prefix = "L" + to_string(l) + "_"
+
+        // Layer norm 1 (pre-attention)
+        model[prefix + "ln1_g"] = dt_init_vec(d_model, 0.0)
+        // Initialize gamma to 1.0
+        let mut gi = 0
+        let ln1_g = model[prefix + "ln1_g"]
+        while gi < d_model {
+            ln1_g[gi] = 1.0
+            gi = gi + 1
+        }
+        model[prefix + "ln1_g"] = ln1_g
+        model[prefix + "ln1_b"] = dt_zeros(d_model)
+
+        // QKV projections: d_model -> d_model each
+        model[prefix + "Wq"] = dt_init_vec(d_model * d_model, scale_attn)
+        model[prefix + "Wk"] = dt_init_vec(d_model * d_model, scale_attn)
+        model[prefix + "Wv"] = dt_init_vec(d_model * d_model, scale_attn)
+        model[prefix + "Wo"] = dt_init_vec(d_model * d_model, scale_attn)
+
+        // Layer norm 2 (pre-FFN)
+        model[prefix + "ln2_g"] = dt_init_vec(d_model, 0.0)
+        let ln2_g = model[prefix + "ln2_g"]
+        gi = 0
+        while gi < d_model {
+            ln2_g[gi] = 1.0
+            gi = gi + 1
+        }
+        model[prefix + "ln2_g"] = ln2_g
+        model[prefix + "ln2_b"] = dt_zeros(d_model)
+
+        // FFN: d_model -> 4*d_model -> d_model
+        let ffn_dim = 4 * d_model
+        model[prefix + "W_ff1"] = dt_init_vec(ffn_dim * d_model, scale_ffn)
+        model[prefix + "b_ff1"] = dt_zeros(ffn_dim)
+        model[prefix + "W_ff2"] = dt_init_vec(d_model * ffn_dim, scale_ffn)
+        model[prefix + "b_ff2"] = dt_zeros(d_model)
+
+        l = l + 1
+    }
+
+    // Final layer norm
+    model["ln_f_g"] = dt_init_vec(d_model, 0.0)
+    let ln_f_g = model["ln_f_g"]
+    let mut fi = 0
+    while fi < d_model {
+        ln_f_g[fi] = 1.0
+        fi = fi + 1
+    }
+    model["ln_f_g"] = ln_f_g
+    model["ln_f_b"] = dt_zeros(d_model)
+
+    // Action prediction head: d_model -> act_dim
+    model["W_head"] = dt_init_vec(act_dim * d_model, scale_emb)
+    model["b_head"] = dt_zeros(act_dim)
+
+    return model
+}
+
+// ===================================================================
+//  Token embedding functions
+// ===================================================================
+
+// Embed a scalar return-to-go into d_model vector
+pub fn dt_embed_return(model, rtg) {
+    let d = model["d_model"]
+    let W = model["W_rtg"]
+    let b = model["b_rtg"]
+    let mut out = []
+    let mut i = 0
+    while i < d {
+        out = out + [W[i] * rtg + b[i]]
+        i = i + 1
+    }
+    return out
+}
+
+// Embed a state vector (state_dim) into d_model vector
+pub fn dt_embed_state(model, state_vec) {
+    let d = model["d_model"]
+    let sd = model["state_dim"]
+    let W = model["W_state"]
+    let b = model["b_state"]
+    let proj = dt_matvec(W, state_vec, d, sd)
+    return dt_add(proj, b, d)
+}
+
+// Embed a discrete action into d_model vector
+pub fn dt_embed_action(model, action) {
+    let d = model["d_model"]
+    let ad = model["act_dim"]
+    let W = model["W_action"]
+    let b = model["b_action"]
+    let a_vec = dt_onehot(action, ad)
+    let proj = dt_matvec(W, a_vec, d, ad)
+    return dt_add(proj, b, d)
+}
+
+// Get timestep positional embedding
+pub fn dt_timestep_embed(model, timestep) {
+    let d = model["d_model"]
+    let max_t = model["max_timestep"]
+    let W = model["W_timestep"]
+    let t = dt_min(timestep, max_t - 1)
+    let base = t * d
+    let mut out = []
+    let mut i = 0
+    while i < d {
+        out = out + [W[base + i]]
+        i = i + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  Build interleaved sequence of embedded tokens
+//
+//  Input: arrays of rtgs[T], states[T][state_dim], actions[T], timesteps[T]
+//  Output: flat array [3*T*d_model] representing token embeddings
+//          token order: R_0, s_0, a_0, R_1, s_1, a_1, ...
+//
+//  Each token embedding = type_embed + timestep_embed
+// ===================================================================
+pub fn dt_build_sequence(model, rtgs, states, actions, timesteps) {
+    let d = model["d_model"]
+    let T = len(rtgs)
+    let seq_len = 3 * T
+    let mut tokens = []
+
+    let mut t = 0
+    while t < T {
+        let ts_emb = dt_timestep_embed(model, timesteps[t])
+
+        // R token
+        let r_emb = dt_embed_return(model, rtgs[t])
+        let r_tok = dt_add(r_emb, ts_emb, d)
+        tokens = tokens + [r_tok]
+
+        // s token
+        let s_emb = dt_embed_state(model, states[t])
+        let s_tok = dt_add(s_emb, ts_emb, d)
+        tokens = tokens + [s_tok]
+
+        // a token
+        let a_emb = dt_embed_action(model, actions[t])
+        let a_tok = dt_add(a_emb, ts_emb, d)
+        tokens = tokens + [a_tok]
+
+        t = t + 1
+    }
+    return tokens
+}
+
+// ===================================================================
+//  Causal attention mask: lower triangular (allow attending to self + past)
+//  Returns flat array [seq_len * seq_len] where 1.0 = attend, 0.0 = mask
+// ===================================================================
+pub fn dt_causal_mask(seq_len) {
+    let mut mask = []
+    let mut i = 0
+    while i < seq_len {
+        let mut j = 0
+        while j < seq_len {
+            if j <= i {
+                mask = mask + [1.0]
+            } else {
+                mask = mask + [0.0]
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return mask
+}
+
+// ===================================================================
+//  Multi-head causal self-attention for one layer
+//
+//  tokens: array of seq_len vectors, each of length d_model
+//  mask: flat [seq_len * seq_len] causal mask
+//  Returns: array of seq_len vectors, each of length d_model
+// ===================================================================
+@hot
+pub fn dt_attention(model, layer, tokens, seq_len, mask) {
+    let d = model["d_model"]
+    let nh = model["n_heads"]
+    let hd = model["head_dim"]
+    let prefix = "L" + to_string(layer) + "_"
+    let Wq = model[prefix + "Wq"]
+    let Wk = model[prefix + "Wk"]
+    let Wv = model[prefix + "Wv"]
+    let Wo = model[prefix + "Wo"]
+
+    // Project all tokens to Q, K, V
+    let mut Q = []
+    let mut K = []
+    let mut V = []
+    let mut i = 0
+    while i < seq_len {
+        let tok = tokens[i]
+        Q = Q + [dt_matvec(Wq, tok, d, d)]
+        K = K + [dt_matvec(Wk, tok, d, d)]
+        V = V + [dt_matvec(Wv, tok, d, d)]
+        i = i + 1
+    }
+
+    let scale = 1.0 / sqrt(to_float(hd))
+
+    // Per-head attention
+    let mut out_tokens = []
+    i = 0
+    while i < seq_len {
+        let mut concat = dt_zeros(d)
+
+        let mut h = 0
+        while h < nh {
+            let h_off = h * hd
+
+            // Compute attention scores for token i, head h
+            let mut scores = []
+            let mut j = 0
+            while j < seq_len {
+                let m_val = mask[i * seq_len + j]
+                if m_val > 0.5 {
+                    // dot(Q_i[head h], K_j[head h])
+                    let mut dot = 0.0
+                    let mut dd = 0
+                    while dd < hd {
+                        dot = dot + Q[i][h_off + dd] * K[j][h_off + dd]
+                        dd = dd + 1
+                    }
+                    scores = scores + [dot * scale]
+                } else {
+                    scores = scores + [0.0 - 1.0e9]
+                }
+                j = j + 1
+            }
+
+            // Softmax over scores
+            let attn = dt_softmax(scores, seq_len)
+
+            // Weighted sum of V
+            let mut dd = 0
+            while dd < hd {
+                let mut acc = 0.0
+                j = 0
+                while j < seq_len {
+                    acc = acc + attn[j] * V[j][h_off + dd]
+                    j = j + 1
+                }
+                concat[h_off + dd] = acc
+                dd = dd + 1
+            }
+
+            h = h + 1
+        }
+
+        // Output projection
+        let projected = dt_matvec(Wo, concat, d, d)
+        out_tokens = out_tokens + [projected]
+        i = i + 1
+    }
+
+    return out_tokens
+}
+
+// ===================================================================
+//  Single transformer layer forward pass
+//
+//  x: array of seq_len vectors [d_model]
+//  Returns: array of seq_len vectors [d_model]
+// ===================================================================
+@hot
+pub fn dt_layer_forward(model, layer, x, seq_len, mask) {
+    let d = model["d_model"]
+    let prefix = "L" + to_string(layer) + "_"
+    let ln1_g = model[prefix + "ln1_g"]
+    let ln1_b = model[prefix + "ln1_b"]
+    let ln2_g = model[prefix + "ln2_g"]
+    let ln2_b = model[prefix + "ln2_b"]
+    let W1 = model[prefix + "W_ff1"]
+    let b1 = model[prefix + "b_ff1"]
+    let W2 = model[prefix + "W_ff2"]
+    let b2 = model[prefix + "b_ff2"]
+    let ffn_dim = 4 * d
+
+    // Pre-norm attention
+    let mut normed = []
+    let mut i = 0
+    while i < seq_len {
+        normed = normed + [dt_layer_norm(x[i], ln1_g, ln1_b, d)]
+        i = i + 1
+    }
+
+    let attn_out = dt_attention(model, layer, normed, seq_len, mask)
+
+    // Residual + attention
+    let mut h = []
+    i = 0
+    while i < seq_len {
+        h = h + [dt_add(x[i], attn_out[i], d)]
+        i = i + 1
+    }
+
+    // Pre-norm FFN
+    let mut out = []
+    i = 0
+    while i < seq_len {
+        let normed2 = dt_layer_norm(h[i], ln2_g, ln2_b, d)
+
+        // FFN: GELU(x W1 + b1) W2 + b2
+        let hidden = dt_matvec(W1, normed2, ffn_dim, d)
+        let biased1 = dt_add(hidden, b1, ffn_dim)
+        let mut activated = []
+        let mut j = 0
+        while j < ffn_dim {
+            activated = activated + [dt_gelu(biased1[j])]
+            j = j + 1
+        }
+        let proj = dt_matvec(W2, activated, d, ffn_dim)
+        let biased2 = dt_add(proj, b2, d)
+
+        // Residual
+        let res = dt_add(h[i], biased2, d)
+        out = out + [res]
+        i = i + 1
+    }
+
+    return out
+}
+
+// ===================================================================
+//  Full Decision Transformer forward pass
+//
+//  Input: rtgs[T], states[T][state_dim], actions[T], timesteps[T]
+//  Output: array of seq_len (=3*T) output vectors [d_model]
+//
+//  Action logits are extracted from state token positions (index 3t+1).
+// ===================================================================
+@hot
+pub fn dt_forward(model, rtgs, states, actions, timesteps) {
+    let d = model["d_model"]
+    let n_layers = model["n_layers"]
+    let T = len(rtgs)
+    let seq_len = 3 * T
+
+    // Build token embeddings
+    let tokens = dt_build_sequence(model, rtgs, states, actions, timesteps)
+
+    // Causal mask
+    let mask = dt_causal_mask(seq_len)
+
+    // Transformer layers
+    let mut h = tokens
+    let mut l = 0
+    while l < n_layers {
+        h = dt_layer_forward(model, l, h, seq_len, mask)
+        l = l + 1
+    }
+
+    // Final layer norm
+    let ln_g = model["ln_f_g"]
+    let ln_b = model["ln_f_b"]
+    let mut out = []
+    let mut i = 0
+    while i < seq_len {
+        out = out + [dt_layer_norm(h[i], ln_g, ln_b, d)]
+        i = i + 1
+    }
+
+    return out
+}
+
+// ===================================================================
+//  Action prediction: given transformer output at a state position,
+//  project to action logits and return the greedy action.
+// ===================================================================
+pub fn dt_action_logits(model, hidden_vec) {
+    let d = model["d_model"]
+    let ad = model["act_dim"]
+    let W = model["W_head"]
+    let b = model["b_head"]
+    let proj = dt_matvec(W, hidden_vec, ad, d)
+    return dt_add(proj, b, ad)
+}
+
+pub fn dt_predict_action(model, hidden_vec) {
+    let logits = dt_action_logits(model, hidden_vec)
+    let ad = model["act_dim"]
+    if ad == 0 { return 0 }
+    let mut best = 0
+    let mut best_v = logits[0]
+    let mut i = 1
+    while i < ad {
+        if logits[i] > best_v {
+            best_v = logits[i]
+            best = i
+        }
+        i = i + 1
+    }
+    return best
+}
+
+// ===================================================================
+//  Offline Dataset: store (state, action, reward) trajectories
+// ===================================================================
+pub fn dt_new_dataset() {
+    let ds = #{}
+    ds["trajectories"] = []
+    ds["count"] = 0
+    return ds
+}
+
+// Add a trajectory: states[T][state_dim], actions[T], rewards[T]
+pub fn dt_add_trajectory(dataset, states, actions, rewards) {
+    let traj = #{}
+    traj["states"] = states
+    traj["actions"] = actions
+    traj["rewards"] = rewards
+    let T = len(rewards)
+    traj["length"] = T
+
+    // Compute return-to-go for each step
+    let rtgs = dt_compute_rtg(rewards)
+    traj["rtgs"] = rtgs
+
+    let trajs = dataset["trajectories"]
+    let new_trajs = trajs + [traj]
+    let new_ds = #{}
+    new_ds["trajectories"] = new_trajs
+    new_ds["count"] = dataset["count"] + 1
+    return new_ds
+}
+
+// Compute return-to-go: R_t = sum_{t'>=t} r_{t'}
+pub fn dt_compute_rtg(rewards) {
+    let T = len(rewards)
+    let mut rtgs = dt_zeros(T)
+    if T == 0 { return rtgs }
+
+    let mut running = 0.0
+    let mut t = T - 1
+    while t >= 0 {
+        running = running + rewards[t]
+        rtgs[t] = running
+        t = t - 1
+    }
+    return rtgs
+}
+
+// Get a context window from dataset for training
+// Returns: map with rtgs, states, actions, timesteps arrays of length min(ctx_len, t+1)
+pub fn dt_get_context(dataset, traj_idx, t, ctx_len) {
+    let trajs = dataset["trajectories"]
+    let traj = trajs[traj_idx]
+    let all_states = traj["states"]
+    let all_actions = traj["actions"]
+    let all_rtgs = traj["rtgs"]
+    let T = traj["length"]
+
+    // Context window: [max(0, t-ctx_len+1)..t]
+    let start = dt_max(0, t - ctx_len + 1)
+    let end = dt_min(t + 1, T)
+
+    let mut rtgs = []
+    let mut states = []
+    let mut actions = []
+    let mut timesteps = []
+
+    let mut i = start
+    while i < end {
+        rtgs = rtgs + [all_rtgs[i]]
+        states = states + [all_states[i]]
+        actions = actions + [all_actions[i]]
+        timesteps = timesteps + [i]
+        i = i + 1
+    }
+
+    let ctx = #{}
+    ctx["rtgs"] = rtgs
+    ctx["states"] = states
+    ctx["actions"] = actions
+    ctx["timesteps"] = timesteps
+    ctx["target_action"] = all_actions[t]
+    ctx["length"] = end - start
+    return ctx
+}
+
+// ===================================================================
+//  Training: cross-entropy loss for action prediction at position t
+// ===================================================================
+pub fn dt_action_loss(model, dataset, traj_idx, t) {
+    let ctx_len = model["ctx_len"]
+    let ctx = dt_get_context(dataset, traj_idx, t, ctx_len)
+    let rtgs = ctx["rtgs"]
+    let states = ctx["states"]
+    let actions = ctx["actions"]
+    let timesteps = ctx["timesteps"]
+    let target = ctx["target_action"]
+    let ad = model["act_dim"]
+
+    // Forward pass
+    let out = dt_forward(model, rtgs, states, actions, timesteps)
+
+    // Get output at the last state token position
+    // In the interleaved sequence, the last state token is at position 3*(len-1)+1
+    let last_idx = 3 * (len(rtgs) - 1) + 1
+    let hidden = out[last_idx]
+
+    // Action logits and cross-entropy loss
+    let logits = dt_action_logits(model, hidden)
+    let probs = dt_softmax(logits, ad)
+
+    let mut p = probs[target]
+    if p < 1.0e-12 { p = 1.0e-12 }
+    let loss = 0.0 - log(p)
+
+    return loss
+}
+
+// ===================================================================
+//  One numerical-gradient training step on the action prediction head.
+//  (Full backprop through the transformer is out of scope; we train
+//   the head W_head/b_head for a cheap but real loss decrease.)
+//
+//  Returns map with "model", "loss_before", "loss_after"
+// ===================================================================
+pub fn dt_train_step(model, dataset, traj_idx, t, lr) {
+    let loss_before = dt_action_loss(model, dataset, traj_idx, t)
+    let ad = model["act_dim"]
+    let d = model["d_model"]
+    let eps = 1.0e-4
+
+    let W = model["W_head"]
+    let b = model["b_head"]
+    let W_size = ad * d
+
+    // Gradient on W_head (numerical)
+    let mut new_W = []
+    let mut i = 0
+    while i < W_size {
+        let orig = W[i]
+        // Build probed W
+        let mut probe = []
+        let mut k = 0
+        while k < W_size {
+            if k == i {
+                probe = probe + [orig + eps]
+            } else {
+                probe = probe + [W[k]]
+            }
+            k = k + 1
+        }
+        // Temp model with probed W_head
+        let tmp = dt_clone_model_with(model, "W_head", probe, "b_head", b)
+        let loss_plus = dt_action_loss(tmp, dataset, traj_idx, t)
+        let g = (loss_plus - loss_before) / eps
+        new_W = new_W + [orig - lr * g]
+        i = i + 1
+    }
+
+    // Gradient on b_head
+    let mut new_b = []
+    i = 0
+    while i < ad {
+        let orig = b[i]
+        let mut probe_b = []
+        let mut k = 0
+        while k < ad {
+            if k == i {
+                probe_b = probe_b + [orig + eps]
+            } else {
+                probe_b = probe_b + [b[k]]
+            }
+            k = k + 1
+        }
+        let tmp2 = dt_clone_model_with(model, "W_head", W, "b_head", probe_b)
+        let loss_plus2 = dt_action_loss(tmp2, dataset, traj_idx, t)
+        let g2 = (loss_plus2 - loss_before) / eps
+        new_b = new_b + [orig - lr * g2]
+        i = i + 1
+    }
+
+    // Build updated model
+    let new_model = dt_clone_model_with(model, "W_head", new_W, "b_head", new_b)
+    let loss_after = dt_action_loss(new_model, dataset, traj_idx, t)
+
+    let result = #{}
+    result["model"] = new_model
+    result["loss_before"] = loss_before
+    result["loss_after"] = loss_after
+    return result
+}
+
+// Helper: clone model replacing two keys
+fn dt_clone_model_with(model, key1, val1, key2, val2) {
+    let m = #{}
+    m["state_dim"] = model["state_dim"]
+    m["act_dim"] = model["act_dim"]
+    m["d_model"] = model["d_model"]
+    m["n_heads"] = model["n_heads"]
+    m["n_layers"] = model["n_layers"]
+    m["max_timestep"] = model["max_timestep"]
+    m["ctx_len"] = model["ctx_len"]
+    m["head_dim"] = model["head_dim"]
+    m["W_rtg"] = model["W_rtg"]
+    m["b_rtg"] = model["b_rtg"]
+    m["W_state"] = model["W_state"]
+    m["b_state"] = model["b_state"]
+    m["W_action"] = model["W_action"]
+    m["b_action"] = model["b_action"]
+    m["W_timestep"] = model["W_timestep"]
+    m["ln_f_g"] = model["ln_f_g"]
+    m["ln_f_b"] = model["ln_f_b"]
+    m["W_head"] = model["W_head"]
+    m["b_head"] = model["b_head"]
+
+    // Copy layer weights
+    let nl = model["n_layers"]
+    let mut l = 0
+    while l < nl {
+        let p = "L" + to_string(l) + "_"
+        m[p + "ln1_g"] = model[p + "ln1_g"]
+        m[p + "ln1_b"] = model[p + "ln1_b"]
+        m[p + "Wq"] = model[p + "Wq"]
+        m[p + "Wk"] = model[p + "Wk"]
+        m[p + "Wv"] = model[p + "Wv"]
+        m[p + "Wo"] = model[p + "Wo"]
+        m[p + "ln2_g"] = model[p + "ln2_g"]
+        m[p + "ln2_b"] = model[p + "ln2_b"]
+        m[p + "W_ff1"] = model[p + "W_ff1"]
+        m[p + "b_ff1"] = model[p + "b_ff1"]
+        m[p + "W_ff2"] = model[p + "W_ff2"]
+        m[p + "b_ff2"] = model[p + "b_ff2"]
+        l = l + 1
+    }
+
+    // Override the two keys
+    m[key1] = val1
+    m[key2] = val2
+    return m
+}
+
+// ===================================================================
+//  Inference: given context so far + desired return + current state,
+//  predict the next action autoregressively.
+//
+//  rtgs, states, actions, timesteps: prior context arrays
+//  desired_rtg: target return-to-go for current step
+//  cur_state: current state vector
+//  cur_timestep: current timestep
+//
+//  Returns map with "action", "logits", "probs"
+// ===================================================================
+pub fn dt_inference_step(model, rtgs, states, actions, timesteps, desired_rtg, cur_state, cur_timestep) {
+    let ad = model["act_dim"]
+    let ctx_len = model["ctx_len"]
+
+    // Extend context with current step (use action=0 as placeholder)
+    let new_rtgs = rtgs + [desired_rtg]
+    let new_states = states + [cur_state]
+    let new_actions = actions + [0]
+    let new_timesteps = timesteps + [cur_timestep]
+
+    // Trim to context window
+    let total = len(new_rtgs)
+    let start = dt_max(0, total - ctx_len)
+
+    let mut ctx_rtgs = []
+    let mut ctx_states = []
+    let mut ctx_actions = []
+    let mut ctx_timesteps = []
+    let mut i = start
+    while i < total {
+        ctx_rtgs = ctx_rtgs + [new_rtgs[i]]
+        ctx_states = ctx_states + [new_states[i]]
+        ctx_actions = ctx_actions + [new_actions[i]]
+        ctx_timesteps = ctx_timesteps + [new_timesteps[i]]
+        i = i + 1
+    }
+
+    // Forward pass
+    let out = dt_forward(model, ctx_rtgs, ctx_states, ctx_actions, ctx_timesteps)
+
+    // Extract output at the last state token position
+    let T = len(ctx_rtgs)
+    let last_state_pos = 3 * (T - 1) + 1
+    let hidden = out[last_state_pos]
+
+    // Action logits
+    let logits = dt_action_logits(model, hidden)
+    let probs = dt_softmax(logits, ad)
+
+    // Greedy action
+    let action = dt_predict_action(model, hidden)
+
+    let result = #{}
+    result["action"] = action
+    result["logits"] = logits
+    result["probs"] = probs
+    return result
+}
+
+// ===================================================================
+//  Utility: compute total return of a trajectory
+// ===================================================================
+pub fn dt_total_return(rewards) {
+    let mut total = 0.0
+    let mut i = 0
+    while i < len(rewards) {
+        total = total + rewards[i]
+        i = i + 1
+    }
+    return total
+}
+
+// ===================================================================
+//  Utility: get trajectory statistics
+// ===================================================================
+pub fn dt_trajectory_stats(dataset, traj_idx) {
+    let trajs = dataset["trajectories"]
+    let traj = trajs[traj_idx]
+    let rewards = traj["rewards"]
+    let T = traj["length"]
+    let rtgs = traj["rtgs"]
+
+    let stats = #{}
+    stats["length"] = T
+    stats["total_return"] = dt_total_return(rewards)
+    stats["initial_rtg"] = rtgs[0]
+    stats["final_rtg"] = rtgs[T - 1]
+    return stats
+}

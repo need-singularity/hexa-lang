@@ -1,0 +1,651 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/jamba_hybrid.hexa — Jamba Hybrid MoE (#206)
+//
+//  Jamba (AI21 Labs, 2024) interleaves Mamba SSM blocks, Attention
+//  blocks, and MoE feed-forward sub-layers inside a single Transformer
+//  stack. The typical ratio is 1 attention block per ~8 layers, and
+//  MoE replaces the dense FFN every ~2 layers, giving a sparse hybrid
+//  that trades memory for quality.
+//
+//  This module provides a minimal, pure-hexa reference implementation
+//  of the core operators:
+//
+//    Config / plan
+//      jamba_create_config(n_layers, attn_ratio, moe_ratio,
+//                          dim, n_experts, top_k)     -> #{} config
+//      jamba_build_layer_plan(config)                 -> [layer_type]
+//      jamba_count_layer_types(plan)                  -> #{} counts
+//      jamba_memory_estimate(config)                  -> int bytes
+//
+//    Blocks
+//      jamba_mamba_block_forward(state, x, dim)       -> [new_state, y]
+//      jamba_attn_block_forward(x_seq, Wq,Wk,Wv,Wo,
+//                               seq_len, dim)         -> [[out]]
+//      jamba_ffn_forward(x, W1, W2, dim, hidden)      -> [out]
+//      jamba_moe_forward(x, experts_W1, experts_b1,
+//                        experts_W2, router_W,
+//                        n_experts, top_k, dim, hidden)-> [out]
+//
+//    Routing helpers
+//      jamba_softmax(logits, n)
+//      jamba_router_top_k(router_logits, n_experts, top_k)
+//                                                       -> [idx, wts]
+//
+//    Sequence / cache
+//      jamba_layer_forward(layer_type, state, x_seq,
+//                          config, params)             -> [state, out]
+//      jamba_forward_sequence(config, params_per_layer,
+//                             x_seq, seq_len, dim)     -> [[out]]
+//      jamba_cache_create(config, seq_len)             -> #{} cache
+//
+//  Notes:
+//    - Mamba block is a tiny linear-recurrent SSM: y = A*state + B*x,
+//      state' = y. This is enough to test state evolution without
+//      pulling in the full Mamba_s6 machinery.
+//    - Attention block is single-head, no softmax scale factor bells
+//      and whistles; it preserves shape [seq_len, dim].
+//    - MoE uses top_k routing over experts, each expert is a tiny
+//      2-layer FFN. With n_experts=1 and top_k=1 it collapses to
+//      plain FFN (verified in tests).
+//    - HX3 honored: no semicolons, no ternary, rebuild patterns,
+//      #{} dict literals, `//` int div, no array_push.
+// ═══════════════════════════════════════════════════════════════════
+
+// ── small math helpers ─────────────────────────────────────────────
+
+fn jamba_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn jamba_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn jamba_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn jamba_zeros_2d(rows, cols) {
+    let mut m = []
+    for _r in 0..rows { m = m + [jamba_zeros(cols)] }
+    return m
+}
+
+fn jamba_ones(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [1.0] }
+    return v
+}
+
+fn jamba_eye(n, scale) {
+    let mut m = []
+    for i in 0..n {
+        let mut row = []
+        for j in 0..n {
+            if i == j { row = row + [scale] } else { row = row + [0.0] }
+        }
+        m = m + [row]
+    }
+    return m
+}
+
+fn jamba_vec_add(a, b) {
+    let n = len(a)
+    let mut out = []
+    for i in 0..n { out = out + [a[i] + b[i]] }
+    return out
+}
+
+fn jamba_vec_scale(v, s) {
+    let n = len(v)
+    let mut out = []
+    for i in 0..n { out = out + [v[i] * s] }
+    return out
+}
+
+fn jamba_mat_vec(mat, v) {
+    let rows = len(mat)
+    let mut out = []
+    for r in 0..rows {
+        let row = mat[r]
+        let n = len(row)
+        let mut s = 0.0
+        for c in 0..n { s = s + row[c] * v[c] }
+        out = out + [s]
+    }
+    return out
+}
+
+fn jamba_hash_float(seed, i, j) {
+    let h = ((seed * 2654435761 + i * 1315423911 + j * 2246822519) % 10007)
+    return to_float(h) / 10007.0 - 0.5
+}
+
+fn jamba_init_weight(rows, cols, seed) {
+    let mut m = []
+    for r in 0..rows {
+        let mut row = []
+        for c in 0..cols {
+            row = row + [jamba_hash_float(seed, r, c) * 0.2]
+        }
+        m = m + [row]
+    }
+    return m
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Softmax (numerically stable)
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn jamba_softmax(logits, n) {
+    let mut mx = logits[0]
+    for i in 1..n {
+        if logits[i] > mx { mx = logits[i] }
+    }
+    let mut exps = []
+    let mut z = 0.0
+    for i in 0..n {
+        let e = jamba_exp(logits[i] - mx)
+        exps = exps + [e]
+        z = z + e
+    }
+    let safe_z = if z < 1.0e-12 { 1.0e-12 } else { z }
+    let mut out = []
+    for i in 0..n { out = out + [exps[i] / safe_z] }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Config + Layer plan
+//
+//  attn_ratio — fraction of layers that use attention (else Mamba)
+//  moe_ratio  — fraction of layers whose FFN is replaced with MoE
+//
+//  Plan is deterministic and avoids early layers being attention
+//  (matching the Jamba pattern where attention is sparse).
+// ═══════════════════════════════════════════════════════════════════
+
+fn jamba_create_config(n_layers, attn_ratio, moe_ratio, dim, n_experts, top_k) {
+    let cfg = #{}
+    cfg["n_layers"] = n_layers
+    cfg["attn_ratio"] = attn_ratio
+    cfg["moe_ratio"] = moe_ratio
+    cfg["dim"] = dim
+    cfg["n_experts"] = n_experts
+    cfg["top_k"] = top_k
+    cfg["hidden"] = dim * 2
+    return cfg
+}
+
+// Decide per-layer attention vs mamba using even-spacing of attn layers.
+fn jamba_build_layer_plan(config) {
+    let n_layers = config["n_layers"]
+    let attn_r = config["attn_ratio"]
+    let moe_r = config["moe_ratio"]
+
+    // number of attention layers
+    let mut n_attn = to_int(to_float(n_layers) * attn_r + 0.5)
+    if n_attn < 0 { n_attn = 0 }
+    if n_attn > n_layers { n_attn = n_layers }
+    let mut n_moe = to_int(to_float(n_layers) * moe_r + 0.5)
+    if n_moe < 0 { n_moe = 0 }
+    if n_moe > n_layers { n_moe = n_layers }
+
+    // Mark attention slots evenly spaced (skip first layer when possible)
+    let mut is_attn = []
+    for _i in 0..n_layers { is_attn = is_attn + [false] }
+    if n_attn > 0 {
+        let stride_num = n_layers
+        let mut placed = 0
+        let mut l = 0
+        while placed < n_attn && l < n_layers {
+            // position = (placed+1)*n_layers/(n_attn+1)
+            let pos = ((placed + 1) * stride_num) / (n_attn + 1)
+            if pos >= n_layers { l = n_layers } else {
+                let mut new_is = []
+                for k in 0..n_layers {
+                    if k == pos { new_is = new_is + [true] } else { new_is = new_is + [is_attn[k]] }
+                }
+                is_attn = new_is
+                placed = placed + 1
+                l = l + 1
+            }
+        }
+    }
+
+    // Mark MoE slots — prefer even layers, skip attention-with-moe overlap
+    // so attn_moe and mamba_moe both appear when feasible.
+    let mut is_moe = []
+    for _i in 0..n_layers { is_moe = is_moe + [false] }
+    if n_moe > 0 && n_layers > 0 {
+        let step = if n_moe > 0 { n_layers / n_moe } else { 1 }
+        let safe_step = if step < 1 { 1 } else { step }
+        let mut placed = 0
+        let mut l = 1
+        while placed < n_moe && l < n_layers {
+            let mut new_is = []
+            for k in 0..n_layers {
+                if k == l { new_is = new_is + [true] } else { new_is = new_is + [is_moe[k]] }
+            }
+            is_moe = new_is
+            placed = placed + 1
+            l = l + safe_step
+        }
+        // If we still have MoE slots left, fill from the start.
+        let mut l2 = 0
+        while placed < n_moe && l2 < n_layers {
+            if is_moe[l2] == false {
+                let mut new_is = []
+                for k in 0..n_layers {
+                    if k == l2 { new_is = new_is + [true] } else { new_is = new_is + [is_moe[k]] }
+                }
+                is_moe = new_is
+                placed = placed + 1
+            }
+            l2 = l2 + 1
+        }
+    }
+
+    let mut plan = []
+    for l in 0..n_layers {
+        let a = is_attn[l]
+        let m = is_moe[l]
+        if a && m { plan = plan + ["attn_moe"] }
+        if a && (m == false) { plan = plan + ["attn"] }
+        if (a == false) && m { plan = plan + ["mamba_moe"] }
+        if (a == false) && (m == false) { plan = plan + ["mamba"] }
+    }
+    return plan
+}
+
+fn jamba_count_layer_types(plan) {
+    let n = len(plan)
+    let counts = #{}
+    counts["mamba"] = 0
+    counts["attn"] = 0
+    counts["mamba_moe"] = 0
+    counts["attn_moe"] = 0
+    for i in 0..n {
+        let k = plan[i]
+        counts[k] = counts[k] + 1
+    }
+    return counts
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Rough memory estimate (bytes). Counts parameters only.
+// ═══════════════════════════════════════════════════════════════════
+
+fn jamba_memory_estimate(config) {
+    let d = config["dim"]
+    let h = config["hidden"]
+    let n = config["n_layers"]
+    let ne = config["n_experts"]
+    // Attn params per layer (Wq,Wk,Wv,Wo) + FFN (W1,W2) or MoE
+    let attn_params = 4 * d * d
+    let ffn_params = d * h + h * d
+    let moe_params = ne * (d * h + h * d) + ne * d
+    let mamba_params = d * d + d  // simplified block
+    let avg = attn_params + moe_params + mamba_params + ffn_params
+    let total_params = n * avg
+    return total_params * 4  // 4 bytes per float
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Mamba block — minimal linear SSM
+//
+//  y = A * state + B * x
+//  new_state = y
+//
+//  A is a small damping matrix (diagonal 0.5), B is identity.
+// ═══════════════════════════════════════════════════════════════════
+
+fn jamba_make_mamba_A(dim) {
+    return jamba_eye(dim, 0.5)
+}
+
+fn jamba_make_mamba_B(dim) {
+    return jamba_eye(dim, 1.0)
+}
+
+@hot
+fn jamba_mamba_block_forward(state, x, dim) {
+    // Treat A,B as fixed matrices (canonical damped SSM)
+    let A = jamba_make_mamba_A(dim)
+    let B = jamba_make_mamba_B(dim)
+    let as_part = jamba_mat_vec(A, state)
+    let bx_part = jamba_mat_vec(B, x)
+    let y = jamba_vec_add(as_part, bx_part)
+    // new state = y
+    return [y, y]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Attention block — single-head full attention over the sequence
+//
+//  x_seq : [seq_len, dim]
+//  Wq/Wk/Wv/Wo : [dim, dim]
+//
+//  output[t] = Wo @ sum_s softmax(q_t . k_s) * v_s
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn jamba_attn_block_forward(x_seq, Wq, Wk, Wv, Wo, seq_len, dim) {
+    // project all positions
+    let mut Qs = []
+    let mut Ks = []
+    let mut Vs = []
+    for t in 0..seq_len {
+        Qs = Qs + [jamba_mat_vec(Wq, x_seq[t])]
+        Ks = Ks + [jamba_mat_vec(Wk, x_seq[t])]
+        Vs = Vs + [jamba_mat_vec(Wv, x_seq[t])]
+    }
+    let scale = 1.0 / jamba_sqrt_approx(to_float(dim))
+    let mut out = []
+    for t in 0..seq_len {
+        // compute raw scores
+        let mut scores = []
+        for s in 0..seq_len {
+            let mut dot = 0.0
+            for i in 0..dim { dot = dot + Qs[t][i] * Ks[s][i] }
+            scores = scores + [dot * scale]
+        }
+        let probs = jamba_softmax(scores, seq_len)
+        // weighted sum of V
+        let mut ctx = jamba_zeros(dim)
+        for s in 0..seq_len {
+            let w = probs[s]
+            for i in 0..dim { ctx[i] = ctx[i] + w * Vs[s][i] }
+        }
+        let o_t = jamba_mat_vec(Wo, ctx)
+        out = out + [o_t]
+    }
+    return out
+}
+
+fn jamba_sqrt_approx(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..20 { g = (g + x / g) / 2.0 }
+    return g
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Plain FFN used by non-MoE layers.
+//
+//  W1: [hidden, dim], W2: [dim, hidden]
+//  h = relu(W1 @ x)
+//  y = W2 @ h
+// ═══════════════════════════════════════════════════════════════════
+
+fn jamba_relu(x) {
+    if x > 0.0 { return x }
+    return 0.0
+}
+
+@pure
+fn jamba_ffn_forward(x, W1, W2, dim, hidden) {
+    let h_raw = jamba_mat_vec(W1, x)
+    let mut h = []
+    for i in 0..hidden { h = h + [jamba_relu(h_raw[i])] }
+    let y = jamba_mat_vec(W2, h)
+    return y
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Router top-k: pick highest k logits, softmax over that subset.
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn jamba_router_top_k(router_logits, n_experts, top_k) {
+    // Argmax-by-subtraction loop.
+    let mut used = []
+    for _i in 0..n_experts { used = used + [false] }
+    let mut picks = []
+    let mut picked_logits = []
+    let mut r = 0
+    while r < top_k && r < n_experts {
+        let mut best = -1
+        let mut best_v = -1.0e30
+        for e in 0..n_experts {
+            if used[e] == false {
+                if router_logits[e] > best_v {
+                    best_v = router_logits[e]
+                    best = e
+                }
+            }
+        }
+        if best < 0 { r = top_k } else {
+            let mut new_used = []
+            for k in 0..n_experts {
+                if k == best { new_used = new_used + [true] } else { new_used = new_used + [used[k]] }
+            }
+            used = new_used
+            picks = picks + [best]
+            picked_logits = picked_logits + [best_v]
+            r = r + 1
+        }
+    }
+    // softmax over picked logits
+    let k_eff = len(picks)
+    if k_eff == 0 { return [picks, []] }
+    let weights = jamba_softmax(picked_logits, k_eff)
+    return [picks, weights]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  MoE feed-forward.
+//
+//  experts_W1 : [n_experts] of [hidden, dim]
+//  experts_b1 : [n_experts] of [hidden]
+//  experts_W2 : [n_experts] of [dim, hidden]
+//  router_W   : [n_experts, dim]
+//
+//  y = sum_k w_k * expert_k(x)
+//  expert_k(x) = W2_k @ relu(W1_k @ x + b1_k)
+//
+//  With n_experts=1 and top_k=1 this reduces to a plain FFN
+//  (assuming biases are zero).
+// ═══════════════════════════════════════════════════════════════════
+
+@hot
+fn jamba_moe_forward(x, experts_W1, experts_b1, experts_W2, router_W, n_experts, top_k, dim, hidden) {
+    // router logits
+    let router_logits = jamba_mat_vec(router_W, x)
+    let route = jamba_router_top_k(router_logits, n_experts, top_k)
+    let picks = route[0]
+    let weights = route[1]
+
+    let mut y = jamba_zeros(dim)
+    let k_eff = len(picks)
+    for k in 0..k_eff {
+        let idx = picks[k]
+        let w = weights[k]
+        let W1 = experts_W1[idx]
+        let b1 = experts_b1[idx]
+        let W2 = experts_W2[idx]
+        let h_raw = jamba_mat_vec(W1, x)
+        let mut h = []
+        for i in 0..hidden { h = h + [jamba_relu(h_raw[i] + b1[i])] }
+        let ex_out = jamba_mat_vec(W2, h)
+        for i in 0..dim { y[i] = y[i] + w * ex_out[i] }
+    }
+    return y
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Layer forward — dispatches on layer type.
+//
+//  params is a #{} dict keyed by names; not every layer type uses
+//  every field. For mamba layers the state is an array with the
+//  per-position Mamba hidden state.
+// ═══════════════════════════════════════════════════════════════════
+
+fn jamba_layer_forward(layer_type, state, x_seq, config, params) {
+    let seq_len = len(x_seq)
+    let dim = config["dim"]
+    let hidden = config["hidden"]
+    let n_experts = config["n_experts"]
+    let top_k = config["top_k"]
+
+    // Step 1: mixer output per position (attn vs mamba)
+    let mut mixer_out = []
+    let mut new_state = state
+    if layer_type == "mamba" || layer_type == "mamba_moe" {
+        let mut st = state
+        for t in 0..seq_len {
+            let res = jamba_mamba_block_forward(st, x_seq[t], dim)
+            st = res[1]
+            mixer_out = mixer_out + [res[0]]
+        }
+        new_state = st
+    }
+    if layer_type == "attn" || layer_type == "attn_moe" {
+        let Wq = params["Wq"]
+        let Wk = params["Wk"]
+        let Wv = params["Wv"]
+        let Wo = params["Wo"]
+        mixer_out = jamba_attn_block_forward(x_seq, Wq, Wk, Wv, Wo, seq_len, dim)
+    }
+
+    // Step 2: FFN / MoE per position
+    let mut layer_out = []
+    let is_moe = layer_type == "mamba_moe" || layer_type == "attn_moe"
+    if is_moe {
+        let eW1 = params["experts_W1"]
+        let eB1 = params["experts_b1"]
+        let eW2 = params["experts_W2"]
+        let rW = params["router_W"]
+        for t in 0..seq_len {
+            let y = jamba_moe_forward(mixer_out[t], eW1, eB1, eW2, rW, n_experts, top_k, dim, hidden)
+            layer_out = layer_out + [y]
+        }
+    }
+    if is_moe == false {
+        let W1 = params["W1"]
+        let W2 = params["W2"]
+        for t in 0..seq_len {
+            let y = jamba_ffn_forward(mixer_out[t], W1, W2, dim, hidden)
+            layer_out = layer_out + [y]
+        }
+    }
+
+    return [new_state, layer_out]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Forward full sequence through all layers.
+//
+//  params_per_layer : array of #{} params aligned with layer plan
+//  x_seq            : [seq_len, dim]
+//  returns          : [seq_len, dim]
+// ═══════════════════════════════════════════════════════════════════
+
+fn jamba_forward_sequence(config, params_per_layer, x_seq, seq_len, dim) {
+    let plan = jamba_build_layer_plan(config)
+    let n_layers = config["n_layers"]
+    let mut h = x_seq
+    for l in 0..n_layers {
+        let layer_type = plan[l]
+        let params = params_per_layer[l]
+        // Fresh state per layer (per-layer Mamba hidden state).
+        let init_state = jamba_zeros(dim)
+        let res = jamba_layer_forward(layer_type, init_state, h, config, params)
+        h = res[1]
+    }
+    return h
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Cache — per-layer Mamba state + KV for attention.
+// ═══════════════════════════════════════════════════════════════════
+
+fn jamba_cache_create(config, seq_len) {
+    let n_layers = config["n_layers"]
+    let dim = config["dim"]
+    let plan = jamba_build_layer_plan(config)
+    let mut mamba_states = []
+    let mut kv_keys = []
+    let mut kv_vals = []
+    for l in 0..n_layers {
+        mamba_states = mamba_states + [jamba_zeros(dim)]
+        let t = plan[l]
+        if t == "attn" || t == "attn_moe" {
+            kv_keys = kv_keys + [jamba_zeros_2d(seq_len, dim)]
+            kv_vals = kv_vals + [jamba_zeros_2d(seq_len, dim)]
+        }
+        if (t == "attn" || t == "attn_moe") == false {
+            kv_keys = kv_keys + [[]]
+            kv_vals = kv_vals + [[]]
+        }
+    }
+    let cache = #{}
+    cache["mamba_states"] = mamba_states
+    cache["kv_keys"] = kv_keys
+    cache["kv_vals"] = kv_vals
+    cache["n_layers"] = n_layers
+    cache["seq_len"] = seq_len
+    cache["dim"] = dim
+    cache["plan"] = plan
+    return cache
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Convenience — build default params per layer for a config. Uses
+//  deterministic init so callers can get a working stack without
+//  manually wiring every weight.
+// ═══════════════════════════════════════════════════════════════════
+
+fn jamba_default_params_per_layer(config, seed) {
+    let n_layers = config["n_layers"]
+    let dim = config["dim"]
+    let hidden = config["hidden"]
+    let n_experts = config["n_experts"]
+    let plan = jamba_build_layer_plan(config)
+
+    let mut params_list = []
+    for l in 0..n_layers {
+        let t = plan[l]
+        let p = #{}
+        // Attention weights (only used by attn layers)
+        p["Wq"] = jamba_init_weight(dim, dim, seed + l * 101 + 1)
+        p["Wk"] = jamba_init_weight(dim, dim, seed + l * 101 + 2)
+        p["Wv"] = jamba_init_weight(dim, dim, seed + l * 101 + 3)
+        p["Wo"] = jamba_init_weight(dim, dim, seed + l * 101 + 4)
+        // Dense FFN
+        p["W1"] = jamba_init_weight(hidden, dim, seed + l * 101 + 5)
+        p["W2"] = jamba_init_weight(dim, hidden, seed + l * 101 + 6)
+        // MoE experts
+        let mut eW1 = []
+        let mut eB1 = []
+        let mut eW2 = []
+        for e in 0..n_experts {
+            eW1 = eW1 + [jamba_init_weight(hidden, dim, seed + l * 101 + 10 + e * 3)]
+            eB1 = eB1 + [jamba_zeros(hidden)]
+            eW2 = eW2 + [jamba_init_weight(dim, hidden, seed + l * 101 + 11 + e * 3)]
+        }
+        p["experts_W1"] = eW1
+        p["experts_b1"] = eB1
+        p["experts_W2"] = eW2
+        p["router_W"] = jamba_init_weight(n_experts, dim, seed + l * 101 + 99)
+        params_list = params_list + [p]
+    }
+    return params_list
+}
+
+// End of jamba_hybrid.hexa

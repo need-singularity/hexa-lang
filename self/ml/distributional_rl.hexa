@@ -1,0 +1,385 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/distributional_rl.hexa — Distributional RL (ML #91)
+//
+//  Pure .hexa implementation of distributional reinforcement learning:
+//
+//    1. C51 (Categorical DQN) — Bellemare et al. 2017
+//         — value distribution as categorical over N atoms
+//         — atoms z_i = V_min + i · Δz, Δz = (V_max − V_min)/(N−1)
+//         — Q(s,a) = Σ_i z_i · p_i(s,a)
+//         — projected Bellman: m_j = Σ_i p_i · [1 − |Tz_i − z_j|/Δz]_+
+//             where Tz_i = clip(r + γ·z_i·(1−done), V_min, V_max)
+//         — categorical cross-entropy loss: −Σ_j m_j · log p_j
+//         — ε-greedy / argmax policy over Q-values
+//
+//    2. QR-DQN (Quantile Regression DQN) — Dabney et al. 2018 — alternative
+//         — N quantiles τ_i = (2i+1)/(2N)
+//         — Q(s,a) = (1/N)·Σ_i θ_i(s,a)
+//         — target: y_i = r + γ·θ_i(s',a*)·(1−done)
+//         — quantile Huber loss: ρ_τ(u) = |τ − 1{u<0}| · L_κ(u)
+//
+//  Design notes:
+//    — All operations pure .hexa. No FFI, no Rust.
+//    — Deterministic LCG RNG for tests.
+//    — Q-values stored as 1D arrays indexed by action: q[a].
+//    — Distributions stored as arrays of arrays: dist[a][i] is p_i for action a.
+//    — Softmax numerically stable (max subtraction).
+//
+//  Public API (pure, no side effects unless noted):
+//    — c51_make_atoms(n_atoms, v_min, v_max) -> atoms[]
+//    — c51_delta_z(v_min, v_max, n_atoms) -> Δz
+//    — c51_softmax(logits) -> probs
+//    — c51_expected_q(dist, atoms) -> Q value (scalar)
+//    — c51_action_values(all_dists, atoms) -> array of Q-values per action
+//    — c51_select_action(all_dists, atoms) -> greedy action (argmax)
+//    — c51_epsilon_greedy(all_dists, atoms, eps, rng_state) -> [action, new_state]
+//    — c51_project(next_dist, reward, gamma, done, v_min, v_max, n_atoms) -> m[]
+//    — c51_cross_entropy(m, p_logits) -> loss (scalar)
+//    — c51_bellman_loss(dist, next_dist, reward, gamma, done,
+//                       v_min, v_max, n_atoms) -> loss
+//    — qr_make_taus(n_quantiles) -> τ[]
+//    — qr_expected_q(theta) -> Q (mean of quantiles)
+//    — qr_action_values(all_theta) -> Q[]
+//    — qr_select_action(all_theta) -> greedy action
+//    — qr_huber(u, kappa) -> L_κ(u)
+//    — qr_quantile_loss(theta, target, taus, kappa) -> loss
+//
+//  HX3 pitfalls checked:
+//    — No semicolons (P1)
+//    — No exec (P2/P3)
+//    — Native collection ops only (P4)
+//    — No cwd-relative paths (P5)
+//    — Deterministic LCG RNG, no system entropy
+//    — while/for not using -1 sentinel break (hexa has no short-circuit break)
+//    — if blocks never start with `{` struct literal (parser conflict)
+// ═══════════════════════════════════════════════════════════════════
+
+// ── numeric helpers ─────────────────────────────────────────────────
+
+fn drl_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn drl_max(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn drl_min(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn drl_clip(x, lo, hi) {
+    if x < lo { return lo }
+    if x > hi { return hi }
+    return x
+}
+
+// Deterministic LCG (Numerical Recipes) for reproducible tests.
+fn drl_rand(state) {
+    let a = 1103515245
+    let c = 12345
+    let m = 2147483648
+    let nxt = (a * state + c) % m
+    let u = to_float(nxt) / 2147483648.0
+    return [nxt, u]
+}
+
+// ── C51 core ────────────────────────────────────────────────────────
+
+// Build the atom support z = [v_min, v_min+Δz, ..., v_max].
+fn c51_make_atoms(n_atoms, v_min, v_max) {
+    let mut atoms = []
+    if n_atoms <= 1 {
+        atoms = atoms + [v_min]
+        return atoms
+    }
+    let dz = (v_max - v_min) / to_float(n_atoms - 1)
+    let mut i = 0
+    while i < n_atoms {
+        atoms = atoms + [v_min + to_float(i) * dz]
+        i = i + 1
+    }
+    return atoms
+}
+
+fn c51_delta_z(v_min, v_max, n_atoms) {
+    if n_atoms <= 1 { return 0.0 }
+    return (v_max - v_min) / to_float(n_atoms - 1)
+}
+
+// Numerically stable softmax on logits -> categorical distribution over atoms.
+fn c51_softmax(logits) {
+    let n = len(logits)
+    if n == 0 { return [] }
+    let mut maxv = logits[0]
+    let mut i = 1
+    while i < n {
+        if logits[i] > maxv { maxv = logits[i] }
+        i = i + 1
+    }
+    let mut out = []
+    let mut sum = 0.0
+    let mut j = 0
+    while j < n {
+        let e = exp(logits[j] - maxv)
+        out = out + [e]
+        sum = sum + e
+        j = j + 1
+    }
+    if sum <= 0.0 { sum = 1.0e-12 }
+    let mut k = 0
+    while k < n {
+        out[k] = out[k] / sum
+        k = k + 1
+    }
+    return out
+}
+
+// Expected Q value: Σ_i z_i · p_i.
+fn c51_expected_q(dist, atoms) {
+    let n = len(dist)
+    let mut q = 0.0
+    let mut i = 0
+    while i < n {
+        q = q + atoms[i] * dist[i]
+        i = i + 1
+    }
+    return q
+}
+
+// Q-value for every action, given an array of per-action distributions.
+fn c51_action_values(all_dists, atoms) {
+    let na = len(all_dists)
+    let mut qvals = []
+    let mut a = 0
+    while a < na {
+        qvals = qvals + [c51_expected_q(all_dists[a], atoms)]
+        a = a + 1
+    }
+    return qvals
+}
+
+// Greedy action selection: argmax over expected Q.
+fn c51_select_action(all_dists, atoms) {
+    let na = len(all_dists)
+    if na == 0 { return 0 }
+    let qvals = c51_action_values(all_dists, atoms)
+    let mut best = 0
+    let mut best_q = qvals[0]
+    let mut a = 1
+    while a < na {
+        if qvals[a] > best_q {
+            best_q = qvals[a]
+            best = a
+        }
+        a = a + 1
+    }
+    return best
+}
+
+// ε-greedy action selection. Returns [action, new_rng_state].
+// With probability ε, pick uniformly random action; else argmax.
+fn c51_epsilon_greedy(all_dists, atoms, eps, rng_state) {
+    let na = len(all_dists)
+    if na == 0 { return [0, rng_state] }
+    let r1 = drl_rand(rng_state)
+    let s1 = r1[0]
+    let u1 = r1[1]
+    if u1 < eps {
+        let r2 = drl_rand(s1)
+        let s2 = r2[0]
+        let u2 = r2[1]
+        let mut act = 0
+        let f = u2 * to_float(na)
+        let idx = floor(f)
+        act = idx
+        if act < 0 { act = 0 }
+        if act >= na { act = na - 1 }
+        return [act, s2]
+    }
+    let greedy = c51_select_action(all_dists, atoms)
+    return [greedy, s1]
+}
+
+// Projected Bellman update.
+// next_dist:  categorical next-state distribution p'(s', a*) length N
+// reward:     scalar r
+// gamma:      discount γ
+// done:       0.0 or 1.0 (1.0 kills bootstrap)
+// v_min/v_max/n_atoms: support parameters
+// Returns the projected target distribution m of length n_atoms.
+fn c51_project(next_dist, reward, gamma, done, v_min, v_max, n_atoms) {
+    let dz = c51_delta_z(v_min, v_max, n_atoms)
+    let mut m = []
+    let mut z = 0
+    while z < n_atoms {
+        m = m + [0.0]
+        z = z + 1
+    }
+    if dz <= 0.0 { return m }
+    let not_done = 1.0 - done
+    let mut i = 0
+    while i < n_atoms {
+        // Tz_i = clip(r + γ·z_i·(1−done), V_min, V_max)
+        let zi = v_min + to_float(i) * dz
+        let tzi_raw = reward + gamma * zi * not_done
+        let tzi = drl_clip(tzi_raw, v_min, v_max)
+        // b = (Tz_i − V_min) / Δz
+        let b = (tzi - v_min) / dz
+        let lf = floor(b)
+        let mut l = lf
+        let mut u = lf + 1
+        // Clamp indices
+        if l < 0 { l = 0 }
+        if l >= n_atoms { l = n_atoms - 1 }
+        if u < 0 { u = 0 }
+        if u >= n_atoms { u = n_atoms - 1 }
+        let p = next_dist[i]
+        if l == u {
+            m[l] = m[l] + p
+        } else {
+            let bf = to_float(lf)
+            let frac_u = b - bf
+            let frac_l = 1.0 - frac_u
+            m[l] = m[l] + p * frac_l
+            m[u] = m[u] + p * frac_u
+        }
+        i = i + 1
+    }
+    return m
+}
+
+// Cross-entropy loss: −Σ_j m_j · log p_j.
+// Caller passes p (probabilities), we clamp log to avoid log(0).
+fn c51_cross_entropy(m, p) {
+    let n = len(m)
+    let mut loss = 0.0
+    let mut j = 0
+    while j < n {
+        let pj = p[j]
+        let safe = drl_max(pj, 1.0e-12)
+        loss = loss - m[j] * ln(safe)
+        j = j + 1
+    }
+    return loss
+}
+
+// End-to-end Bellman loss: project next_dist, compute cross-entropy vs p(s,a).
+fn c51_bellman_loss(dist, next_dist, reward, gamma, done,
+                    v_min, v_max, n_atoms) {
+    let m = c51_project(next_dist, reward, gamma, done, v_min, v_max, n_atoms)
+    return c51_cross_entropy(m, dist)
+}
+
+// ── QR-DQN alternative ──────────────────────────────────────────────
+
+// Quantile midpoints τ_i = (2i+1)/(2N).
+fn qr_make_taus(n_quantiles) {
+    let mut taus = []
+    if n_quantiles <= 0 { return taus }
+    let denom = 2.0 * to_float(n_quantiles)
+    let mut i = 0
+    while i < n_quantiles {
+        let num = 2.0 * to_float(i) + 1.0
+        taus = taus + [num / denom]
+        i = i + 1
+    }
+    return taus
+}
+
+// Expected Q from quantile estimates (mean).
+fn qr_expected_q(theta) {
+    let n = len(theta)
+    if n == 0 { return 0.0 }
+    let mut sum = 0.0
+    let mut i = 0
+    while i < n {
+        sum = sum + theta[i]
+        i = i + 1
+    }
+    return sum / to_float(n)
+}
+
+fn qr_action_values(all_theta) {
+    let na = len(all_theta)
+    let mut qvals = []
+    let mut a = 0
+    while a < na {
+        qvals = qvals + [qr_expected_q(all_theta[a])]
+        a = a + 1
+    }
+    return qvals
+}
+
+fn qr_select_action(all_theta) {
+    let na = len(all_theta)
+    if na == 0 { return 0 }
+    let qvals = qr_action_values(all_theta)
+    let mut best = 0
+    let mut best_q = qvals[0]
+    let mut a = 1
+    while a < na {
+        if qvals[a] > best_q {
+            best_q = qvals[a]
+            best = a
+        }
+        a = a + 1
+    }
+    return best
+}
+
+// Huber function L_κ(u): quadratic for |u|<=κ, linear beyond.
+fn qr_huber(u, kappa) {
+    let au = drl_abs(u)
+    if au <= kappa {
+        return 0.5 * u * u
+    }
+    return kappa * (au - 0.5 * kappa)
+}
+
+// Quantile Huber regression loss, averaged over i,j pairs.
+// theta:  current quantile estimates θ_i(s,a) length N
+// target: bootstrap targets y_j length N  (e.g. r + γ·θ_j(s',a*))
+// taus:   quantile midpoints τ_i length N
+// kappa:  Huber threshold (commonly 1.0)
+fn qr_quantile_loss(theta, target, taus, kappa) {
+    let n = len(theta)
+    let m = len(target)
+    if n == 0 { return 0.0 }
+    if m == 0 { return 0.0 }
+    let mut total = 0.0
+    let mut i = 0
+    while i < n {
+        let ti = taus[i]
+        let mut inner = 0.0
+        let mut j = 0
+        while j < m {
+            let u = target[j] - theta[i]
+            let lh = qr_huber(u, kappa)
+            let mut w = ti
+            if u < 0.0 { w = ti - 1.0 }
+            let aw = drl_abs(w)
+            inner = inner + aw * lh
+            j = j + 1
+        }
+        total = total + inner / to_float(m)
+        i = i + 1
+    }
+    return total / to_float(n)
+}
+
+// Helper: build targets y_j = r + γ·θ_j(s',a*)·(1−done) for QR-DQN.
+fn qr_make_targets(next_theta, reward, gamma, done) {
+    let n = len(next_theta)
+    let mut y = []
+    let not_done = 1.0 - done
+    let mut j = 0
+    while j < n {
+        y = y + [reward + gamma * next_theta[j] * not_done]
+        j = j + 1
+    }
+    return y
+}

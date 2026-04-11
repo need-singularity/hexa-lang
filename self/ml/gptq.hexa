@@ -1,0 +1,465 @@
+// ===================================================================
+//  gptq.hexa — GPTQ post-training quantization (ML #83)
+//
+//  GPTQ: Hessian-aware int4 weight quantization with error propagation.
+//  Reference: Frantar et al. 2022 "GPTQ: Accurate Post-Training
+//  Quantization for Generative Pre-trained Transformers".
+//
+//  Algorithm (per layer W: [out, in]):
+//    1. Build calibration Hessian  H ≈ (2/nsamples) · X^T X      (in x in)
+//       - Here we keep only the diagonal:  h[c] = Σ x[:,c]^2
+//       - Full Hessian storage is O(in^2) — we use diagonal form for
+//         O(in) storage while preserving the ordering/error-feedback
+//         properties (same as GPTQ "act_order" + diagonal dampening).
+//    2. Sort columns by diagonal descending → quant order (largest first).
+//    3. For each row r, iterate columns in sorted order:
+//         q  = clamp(round(w / s) + 8, 0, 15)    // int4
+//         dq = s * (q - 8)
+//         err = (w - dq) / h_col
+//         propagate: w[c'] += err * h[c']  for c' not yet quantized
+//       This is the GPTQ update with a diagonal Hessian.
+//    4. Store int4 weights (packed nibbles), per-row scale, column order.
+//
+//  Functions:
+//    gptq_hessian(calib, in_dim)              -> [float] diagonal
+//    gptq_order(h)                            -> [int] column order (desc)
+//    gptq_quantize_row(row, h, order)         -> GPTQRow {qs, scale}
+//    gptq_quantize(W, out, in, calib)         -> GPTQTensor
+//    gptq_dequantize(gt)                      -> [float] (flat W, row-major)
+//    gptq_forward(gt, x)                      -> [float] (y = W · x)
+//    gptq_error_stats(W, gt)                  -> ErrorStats {mse,max,snr}
+//
+//  Storage format (GPTQTensor):
+//    out          : int            number of output rows
+//    in_dim       : int            number of input columns
+//    order        : [int]          global column permutation  (length in)
+//    scales       : [float]        per-row scale              (length out)
+//    data         : [int]          packed nibbles (row-major, 2 per byte)
+//                                  length = out * ceil(in/2)
+//
+//  Pure hexa — no external dependencies.
+// ===================================================================
+
+// ── Constants ────────────────────────────────────────────────────
+@pure fn GPTQ_QMIN() { return 0 }
+@pure fn GPTQ_QMAX() { return 15 }
+@pure fn GPTQ_ZERO() { return 8 }          // symmetric int4 zero-point
+@pure fn GPTQ_DAMP() { return 0.01 }       // Hessian dampening (GPTQ §3.2)
+
+// ── Result structs ───────────────────────────────────────────────
+struct GPTQRow {
+    qs: array,        // int4 values in permuted order (length in_dim)
+    scale: float
+}
+
+struct GPTQTensor {
+    out: int,
+    in_dim: int,
+    order: array,     // column permutation (desc by Hessian diag)
+    scales: array,    // per-row scale (length out)
+    data: array       // packed nibbles, row-major
+}
+
+struct GPTQStats {
+    mse: float,
+    max_err: float,
+    snr: float
+}
+
+// ── Math helpers (pure hexa) ─────────────────────────────────────
+fn _g_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn _g_max(a, b) {
+    if a >= b { return a }
+    return b
+}
+
+fn _g_clamp(v, lo, hi) {
+    if v < lo { return lo }
+    if v > hi { return hi }
+    return v
+}
+
+fn _g_round(x) {
+    if x >= 0.0 { return int(x + 0.5) }
+    return int(x - 0.5)
+}
+
+// log10 via ln series (shared with quantize.hexa algorithm)
+fn _g_log10(x) {
+    if x <= 0.0 { return -999.0 }
+    let mut v = x
+    let mut result = 0.0
+    while v >= 10.0 {
+        v = v / 10.0
+        result = result + 1.0
+    }
+    while v < 1.0 {
+        v = v * 10.0
+        result = result - 1.0
+    }
+    let t = (v - 1.0) / (v + 1.0)
+    let t2 = t * t
+    let ln_v = 2.0 * (t + t * t2 / 3.0 + t * t2 * t2 / 5.0 + t * t2 * t2 * t2 / 7.0 + t * t2 * t2 * t2 * t2 / 9.0)
+    result = result + ln_v / 2.302585
+    return result
+}
+
+// ===================================================================
+//  gptq_hessian(calib, in_dim) -> [float]
+//
+//  Build the diagonal of  H = (2/N) · X^T X   from calibration samples.
+//  `calib` is a flat array of N·in_dim values (row-major, one sample row).
+//  Returns a length-in_dim array of positive diagonal entries
+//  (with Hessian dampening to avoid degenerate columns).
+// ===================================================================
+fn gptq_hessian(calib, in_dim) {
+    let n = len(calib)
+    let nsamples = n / in_dim
+    let mut h = []
+    let mut c = 0
+    while c < in_dim {
+        h = h + [0.0]
+        c = c + 1
+    }
+    let mut s = 0
+    while s < nsamples {
+        let base = s * in_dim
+        c = 0
+        while c < in_dim {
+            let v = calib[base + c]
+            h[c] = h[c] + v * v
+            c = c + 1
+        }
+        s = s + 1
+    }
+    // Normalize and dampen.  damp = GPTQ_DAMP * mean(diag)  — prevents
+    // tiny columns from amplifying the error feedback.
+    let norm = 2.0 / _g_max(to_float(nsamples), 1.0)
+    let mut mean_d = 0.0
+    c = 0
+    while c < in_dim {
+        h[c] = h[c] * norm
+        mean_d = mean_d + h[c]
+        c = c + 1
+    }
+    mean_d = mean_d / _g_max(to_float(in_dim), 1.0)
+    let damp = GPTQ_DAMP() * mean_d
+    c = 0
+    while c < in_dim {
+        h[c] = h[c] + damp
+        c = c + 1
+    }
+    return h
+}
+
+// ===================================================================
+//  gptq_order(h) -> [int]
+//
+//  Produce the column permutation that sorts `h` in descending order.
+//  Columns with the largest activation magnitude are quantized first —
+//  this is GPTQ's `act_order=True` mode and it is what lets the error
+//  feedback spend its budget on the most important weights.
+//
+//  Insertion-sort on indices — O(n^2), fine for small calibration sets
+//  and matches the quantize_test.hexa complexity budget.
+// ===================================================================
+fn gptq_order(h) {
+    let n = len(h)
+    let mut order = []
+    let mut i = 0
+    while i < n {
+        order = order + [i]
+        i = i + 1
+    }
+    // Descending insertion sort — swap-based, no index assignment into
+    // freshly created array to avoid HX3 complex-index-assign pitfall.
+    i = 1
+    while i < n {
+        let mut j = i
+        while j > 0 {
+            let a = order[j - 1]
+            let b = order[j]
+            if h[a] >= h[b] { break }
+            order = order.swap(j - 1, j)
+            j = j - 1
+        }
+        i = i + 1
+    }
+    return order
+}
+
+// ===================================================================
+//  _gptq_pack_row(qs) -> [int]
+//
+//  Pack an array of 4-bit nibbles into bytes (2 per byte, lo then hi).
+//  If the row length is odd the last nibble occupies the low half of
+//  the final byte and the high half is zero.
+// ===================================================================
+fn _gptq_pack_row(qs) {
+    let n = len(qs)
+    let nbytes = (n + 1) / 2
+    let mut out = []
+    let mut i = 0
+    while i < nbytes {
+        let lo_idx = i * 2
+        let hi_idx = i * 2 + 1
+        let lo = qs[lo_idx]
+        let mut hi = 0
+        if hi_idx < n { hi = qs[hi_idx] }
+        out = out + [lo + hi * 16]
+        i = i + 1
+    }
+    return out
+}
+
+fn _gptq_unpack_row(bytes, n) {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let byte = bytes[i / 2]
+        let mut v = 0
+        if i % 2 == 0 {
+            v = byte % 16
+        } else {
+            v = byte / 16
+        }
+        out = out + [v]
+        i = i + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  gptq_quantize_row(row, h, order) -> GPTQRow
+//
+//  Quantize a single weight row using GPTQ error feedback.
+//  `row`   length-in_dim weights
+//  `h`     length-in_dim positive diagonal (from gptq_hessian)
+//  `order` length-in_dim column permutation (descending importance)
+//
+//  Returns a GPTQRow holding int4 values *in the permuted order*
+//  together with the row's symmetric scale.
+// ===================================================================
+fn gptq_quantize_row(row, h, order) {
+    let n = len(row)
+    // Working copy — errors are propagated into this buffer as we go.
+    let mut w = []
+    let mut k = 0
+    while k < n {
+        w = w + [row[k]]
+        k = k + 1
+    }
+    // Row-wise scale from absmax (symmetric int4, zero-point = 8).
+    let mut amax = 0.0
+    k = 0
+    while k < n {
+        let av = _g_abs(row[k])
+        if av > amax { amax = av }
+        k = k + 1
+    }
+    let mut scale = amax / 7.0
+    if scale == 0.0 { scale = 1.0 }
+    let inv_scale = 1.0 / scale
+    // Quantized values stored in permuted order (matches `order`).
+    let mut qs_perm = []
+    let mut visited = []
+    k = 0
+    while k < n {
+        visited = visited + [false]
+        k = k + 1
+    }
+    let mut step = 0
+    while step < n {
+        let col = order[step]
+        visited[col] = true
+        let wv = w[col]
+        let q = _g_clamp(_g_round(wv * inv_scale) + GPTQ_ZERO(), GPTQ_QMIN(), GPTQ_QMAX())
+        qs_perm = qs_perm + [q]
+        // Dequantized value for error computation.
+        let dq = scale * to_float(q - GPTQ_ZERO())
+        let h_col = h[col]
+        let mut ferr = 0.0
+        if h_col > 0.0 { ferr = (wv - dq) / h_col }
+        // Propagate error to every not-yet-quantized column.  With the
+        // diagonal Hessian approximation the update reduces to
+        //     w[c'] += ferr * h[c']
+        // which preserves the GPTQ invariant E[||Wx - W'x||^2] minimal
+        // over the remaining columns.
+        let mut c = 0
+        while c < n {
+            if visited[c] == false {
+                w[c] = w[c] + ferr * h[c]
+            }
+            c = c + 1
+        }
+        step = step + 1
+    }
+    return GPTQRow { qs: qs_perm, scale: scale }
+}
+
+// ===================================================================
+//  gptq_quantize(W, out, in_dim, calib) -> GPTQTensor
+//
+//  Quantize a full [out × in_dim] weight matrix.  `W` is flat row-major.
+//  `calib` is the calibration activation matrix (nsamples × in_dim,
+//  flat).  If `calib` is empty we fall back to a uniform Hessian —
+//  this degrades GPTQ to round-to-nearest int4 with propagation on a
+//  flat importance curve, but still round-trips.
+// ===================================================================
+fn gptq_quantize(W, out, in_dim, calib) {
+    let mut h = []
+    if len(calib) == 0 {
+        let mut c = 0
+        while c < in_dim {
+            h = h + [1.0]
+            c = c + 1
+        }
+    } else {
+        h = gptq_hessian(calib, in_dim)
+    }
+    let order = gptq_order(h)
+    let mut scales = []
+    let mut data = []
+    let mut r = 0
+    while r < out {
+        let base = r * in_dim
+        // Slice the row — avoid .slice() to stay in the "safe subset".
+        let mut row = []
+        let mut k = 0
+        while k < in_dim {
+            row = row + [W[base + k]]
+            k = k + 1
+        }
+        let grow = gptq_quantize_row(row, h, order)
+        scales = scales + [grow.scale]
+        let packed = _gptq_pack_row(grow.qs)
+        let mut pi = 0
+        while pi < len(packed) {
+            data = data + [packed[pi]]
+            pi = pi + 1
+        }
+        r = r + 1
+    }
+    return GPTQTensor {
+        out: out,
+        in_dim: in_dim,
+        order: order,
+        scales: scales,
+        data: data
+    }
+}
+
+// ===================================================================
+//  gptq_dequantize(gt) -> [float]
+//
+//  Reconstruct the quantized weight matrix, flat row-major, in the
+//  *original* column order (i.e. un-permuted).  Used for sanity
+//  checks and for fused kernels that expect a dense layout.
+// ===================================================================
+fn gptq_dequantize(gt) {
+    let nbytes_row = (gt.in_dim + 1) / 2
+    let mut out = []
+    let mut r = 0
+    while r < gt.out {
+        // Grab the row bytes.
+        let base = r * nbytes_row
+        let mut bytes = []
+        let mut bi = 0
+        while bi < nbytes_row {
+            bytes = bytes + [gt.data[base + bi]]
+            bi = bi + 1
+        }
+        let qs_perm = _gptq_unpack_row(bytes, gt.in_dim)
+        let scale = gt.scales[r]
+        // Scatter permuted nibbles back to their original column index.
+        let mut row_out = []
+        let mut k = 0
+        while k < gt.in_dim {
+            row_out = row_out + [0.0]
+            k = k + 1
+        }
+        let mut step = 0
+        while step < gt.in_dim {
+            let col = gt.order[step]
+            let q = qs_perm[step]
+            row_out[col] = scale * to_float(q - GPTQ_ZERO())
+            step = step + 1
+        }
+        k = 0
+        while k < gt.in_dim {
+            out = out + [row_out[k]]
+            k = k + 1
+        }
+        r = r + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  gptq_forward(gt, x) -> [float]
+//
+//  Matrix-vector product  y = W · x  on the fly from the packed int4
+//  representation (dequantize-to-register pattern).  `x` must have
+//  length gt.in_dim; output has length gt.out.
+// ===================================================================
+fn gptq_forward(gt, x) {
+    let nbytes_row = (gt.in_dim + 1) / 2
+    let mut y = []
+    let mut r = 0
+    while r < gt.out {
+        let base = r * nbytes_row
+        let mut bytes = []
+        let mut bi = 0
+        while bi < nbytes_row {
+            bytes = bytes + [gt.data[base + bi]]
+            bi = bi + 1
+        }
+        let qs_perm = _gptq_unpack_row(bytes, gt.in_dim)
+        let scale = gt.scales[r]
+        let mut acc = 0.0
+        let mut step = 0
+        while step < gt.in_dim {
+            let col = gt.order[step]
+            let q = qs_perm[step]
+            let w = scale * to_float(q - GPTQ_ZERO())
+            acc = acc + w * x[col]
+            step = step + 1
+        }
+        y = y + [acc]
+        r = r + 1
+    }
+    return y
+}
+
+// ===================================================================
+//  gptq_error_stats(W, gt) -> GPTQStats
+//
+//  MSE / max-err / SNR (dB) between the original matrix `W` (flat
+//  row-major, length out·in_dim) and its GPTQ round-trip.
+// ===================================================================
+fn gptq_error_stats(W, gt) {
+    let deq = gptq_dequantize(gt)
+    let n = len(W)
+    let mut sse = 0.0
+    let mut mx = 0.0
+    let mut sig = 0.0
+    let mut i = 0
+    while i < n {
+        let e = _g_abs(W[i] - deq[i])
+        sse = sse + e * e
+        if e > mx { mx = e }
+        sig = sig + W[i] * W[i]
+        i = i + 1
+    }
+    let mse = sse / _g_max(to_float(n), 1.0)
+    let mut snr = 999.0
+    if sse > 0.0 {
+        let ratio = sig / sse
+        snr = 10.0 * _g_log10(ratio)
+    }
+    return GPTQStats { mse: mse, max_err: mx, snr: snr }
+}

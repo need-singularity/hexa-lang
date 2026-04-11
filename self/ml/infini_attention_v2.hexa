@@ -1,0 +1,426 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/infini_attention_v2.hexa — Infini-Attention v2
+//
+//  SSOT: shared/hexa-lang/ml-next-level.json id=208
+//
+//  Paper: "Leave No Context Behind: Efficient Infinite Context
+//         Transformers with Infini-attention", Munkhdalai et al. 2024
+//
+//  Core idea: combine standard causal local attention over a bounded
+//  segment window with an unbounded compressive memory that summarises
+//  all past segments via a delta-rule linear attention update.
+//
+//    Local  : softmax(QK^T / sqrt(d)) V over current segment
+//    Compressive : phi(Q) * M, M_t = M_{t-1} + phi(K)^T V  (delta rule)
+//    Gated combination : g * local + (1-g) * compressive
+//
+//  Compressive memory is a [d_head, d_head] matrix that accumulates
+//  phi(K)^T V for all past tokens in streaming fashion, giving O(1)
+//  per-step updates and a bounded memory footprint regardless of the
+//  total context length. Phi feature map is elu(x)+1 (always >= 0)
+//  so the compressive retrieval acts like a positive kernel sum.
+//
+//  Public API (prefix ia2_):
+//    ia2_create_state(d_head)                         -> #{M, z, seen}
+//    ia2_elu_plus_one(x)                              -> float
+//    ia2_phi_vec(vec, d)                              -> vector[d]
+//    ia2_delta_update(M, K_seg, V_seg, seg_len, d)    -> M'
+//    ia2_compressive_retrieve(M, Q, d)                -> vector[d]
+//    ia2_compressive_norm(M, Q, d)                    -> float
+//    ia2_local_attention(Q, K, V, seg_len, d)         -> [seg_len, d]
+//    ia2_softmax_row(row, n)                          -> vector[n]
+//    ia2_gate(beta_logit)                             -> float in (0,1)
+//    ia2_combine(local, compressive, gate)            -> vector
+//    ia2_segment_forward(state, Qs, Ks, Vs, sl, d)    -> [output, state]
+//    ia2_multi_segment_forward(Q, K, V, seg_size, T, d) -> [T, d]
+//
+//  Pitfalls avoided (HX3):
+//    * no semicolons (P1)
+//    * no struct-literal inside if/while head (uses plain dict #{})
+//    * no complex nested index assignment — rebuild rows where needed
+//    * no reserved keywords as identifiers
+//    * `//` used for integer division only where both sides are ints;
+//      for floats we compute `a * (1.0 / b)` / division freely
+//
+//  AI-NATIVE attrs:
+//    @pure   — deterministic given inputs (no global state)
+//    @hot    — called per forward / per segment
+// ═══════════════════════════════════════════════════════════════════
+
+// ── numeric helpers ─────────────────────────────────────────────────
+
+fn ia2_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn ia2_max_f(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn ia2_min_i(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn ia2_zeros_1d(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn ia2_zeros_2d(r, c) {
+    let mut m = []
+    for _i in 0..r {
+        let mut row = []
+        for _j in 0..c { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+// ── exp / sigmoid (stable) ─────────────────────────────────────────
+
+fn ia2_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    return exp(v)
+}
+
+@pure @hot
+fn ia2_sigmoid(x) {
+    if x > 20.0 { return 1.0 }
+    if x < -20.0 { return 0.0 }
+    return 1.0 / (1.0 + ia2_exp(0.0 - x))
+}
+
+// ── phi feature map: elu(x) + 1  (always >= 0) ──────────────────────
+
+@pure @hot
+fn ia2_elu_plus_one(x) {
+    if x >= 0.0 {
+        return x + 1.0
+    }
+    return ia2_exp(x)
+}
+
+@pure @hot
+fn ia2_phi_vec(vec, d) {
+    let mut out = []
+    for i in 0..d {
+        out = out + [ia2_elu_plus_one(vec[i])]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Compressive memory state
+//
+//  state = #{ "M": [d, d] float matrix,
+//             "z": [d] float vector (sum of phi(K) for normalization),
+//             "seen": int, total tokens accumulated into memory }
+// ═══════════════════════════════════════════════════════════════════
+
+fn ia2_create_state(d_head) {
+    let s = #{}
+    s["M"] = ia2_zeros_2d(d_head, d_head)
+    s["z"] = ia2_zeros_1d(d_head)
+    s["seen"] = 0
+    return s
+}
+
+fn ia2_state_get_M(state) { return state["M"] }
+fn ia2_state_get_z(state) { return state["z"] }
+fn ia2_state_get_seen(state) { return state["seen"] }
+
+// ═══════════════════════════════════════════════════════════════════
+//  Delta update rule (Katharopoulos-style linear attention update):
+//
+//    M_t = M_{t-1} + sum_i phi(K_i) V_i^T
+//    z_t = z_{t-1} + sum_i phi(K_i)
+//
+//  M has shape [d_head, d_head]; for each token we add the outer
+//  product phi(K)[a] * V[b] into M[a][b]. This is O(d^2) per token.
+// ═══════════════════════════════════════════════════════════════════
+
+@pure @hot
+fn ia2_delta_update(M, K_seg, V_seg, seg_len, d_head) {
+    // Clone M into a new matrix so we return a fresh result (pure).
+    let mut newM = ia2_zeros_2d(d_head, d_head)
+    for a in 0..d_head {
+        for b in 0..d_head {
+            newM[a][b] = M[a][b]
+        }
+    }
+    for i in 0..seg_len {
+        let phi_k = ia2_phi_vec(K_seg[i], d_head)
+        for a in 0..d_head {
+            let pa = phi_k[a]
+            for b in 0..d_head {
+                newM[a][b] = newM[a][b] + pa * V_seg[i][b]
+            }
+        }
+    }
+    return newM
+}
+
+// Update normalizer vector z = z + sum_i phi(K_i)
+@pure @hot
+fn ia2_delta_update_z(z, K_seg, seg_len, d_head) {
+    let mut newz = ia2_zeros_1d(d_head)
+    for a in 0..d_head {
+        newz[a] = z[a]
+    }
+    for i in 0..seg_len {
+        let phi_k = ia2_phi_vec(K_seg[i], d_head)
+        for a in 0..d_head {
+            newz[a] = newz[a] + phi_k[a]
+        }
+    }
+    return newz
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Compressive retrieval
+//
+//    numerator_b   = sum_a phi(Q)[a] * M[a][b]     (length d)
+//    denominator   = sum_a phi(Q)[a] * z[a]        (scalar, >= 0)
+//    compressive_b = numerator_b / denominator
+//
+//  We expose ia2_compressive_retrieve as the unnormalized numerator
+//  (length d_head), plus a separate ia2_compressive_norm for the
+//  denominator so callers can decide when to normalize.
+// ═══════════════════════════════════════════════════════════════════
+
+@pure @hot
+fn ia2_compressive_retrieve(M, Q, d_head) {
+    let phi_q = ia2_phi_vec(Q, d_head)
+    let mut out = ia2_zeros_1d(d_head)
+    for b in 0..d_head {
+        let mut acc = 0.0
+        for a in 0..d_head {
+            acc = acc + phi_q[a] * M[a][b]
+        }
+        out[b] = acc
+    }
+    return out
+}
+
+@pure @hot
+fn ia2_compressive_norm(M, Q, d_head) {
+    // denominator = phi(Q) . z, where z = sum_i phi(K_i) over all
+    // past tokens. Since we don't have z directly here, we recover
+    // it from M by noticing that z[a] = sum_b M[a][b] / <mean_V[b]>
+    // is not exactly recoverable; callers should use state["z"].
+    // For the reduced-arg signature, we interpret M as storing the
+    // weight matrix and return phi(Q) . (row-sums of M). Practical
+    // Infini-Attention code keeps z separately (see state). This
+    // fallback is used only when caller does not track z.
+    let phi_q = ia2_phi_vec(Q, d_head)
+    let mut denom = 0.0
+    for a in 0..d_head {
+        let mut row_sum = 0.0
+        for b in 0..d_head {
+            row_sum = row_sum + M[a][b]
+        }
+        denom = denom + phi_q[a] * row_sum
+    }
+    if denom < 1.0e-10 { return 1.0e-10 }
+    return denom
+}
+
+// Preferred: denominator using explicit z vector
+@pure @hot
+fn ia2_compressive_norm_z(z, Q, d_head) {
+    let phi_q = ia2_phi_vec(Q, d_head)
+    let mut denom = 0.0
+    for a in 0..d_head {
+        denom = denom + phi_q[a] * z[a]
+    }
+    if denom < 1.0e-10 { return 1.0e-10 }
+    return denom
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Local segment attention — standard causal softmax attention over
+//  the current segment only. O(seg_len^2) but seg_len is bounded.
+// ═══════════════════════════════════════════════════════════════════
+
+@pure @hot
+fn ia2_softmax_row(row, n) {
+    let mut m = row[0]
+    for j in 1..n {
+        if row[j] > m { m = row[j] }
+    }
+    let mut exps = ia2_zeros_1d(n)
+    let mut total = 0.0
+    for j in 0..n {
+        let e = ia2_exp(row[j] - m)
+        exps[j] = e
+        total = total + e
+    }
+    let inv = if total > 0.0 { 1.0 / total } else { 0.0 }
+    let mut out = ia2_zeros_1d(n)
+    for j in 0..n {
+        out[j] = exps[j] * inv
+    }
+    return out
+}
+
+@pure @hot
+fn ia2_local_attention(Q, K, V, seg_len, d_head) {
+    let scale = 1.0 / sqrt(d_head * 1.0)
+    let mut out = ia2_zeros_2d(seg_len, d_head)
+    for i in 0..seg_len {
+        let mut scores = ia2_zeros_1d(seg_len)
+        for j in 0..seg_len {
+            if j > i {
+                scores[j] = 0.0 - 1.0e30
+            } else {
+                let mut dot = 0.0
+                for k in 0..d_head {
+                    dot = dot + Q[i][k] * K[j][k]
+                }
+                scores[j] = dot * scale
+            }
+        }
+        let probs = ia2_softmax_row(scores, seg_len)
+        for b in 0..d_head {
+            let mut acc = 0.0
+            for j in 0..seg_len {
+                acc = acc + probs[j] * V[j][b]
+            }
+            out[i][b] = acc
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Gating and combination
+//
+//  gate g = sigmoid(beta) in (0, 1)
+//  out   = g * local + (1 - g) * compressive
+// ═══════════════════════════════════════════════════════════════════
+
+@pure @hot
+fn ia2_gate(beta_logit) {
+    return ia2_sigmoid(beta_logit)
+}
+
+@pure @hot
+fn ia2_combine(local_vec, compressive_vec, gate) {
+    let n = len(local_vec)
+    let mut out = ia2_zeros_1d(n)
+    let one_minus = 1.0 - gate
+    for i in 0..n {
+        out[i] = gate * local_vec[i] + one_minus * compressive_vec[i]
+    }
+    return out
+}
+
+fn ia2_combine_mat(local_mat, compressive_mat, gate, seg_len, d_head) {
+    let mut out = ia2_zeros_2d(seg_len, d_head)
+    for i in 0..seg_len {
+        out[i] = ia2_combine(local_mat[i], compressive_mat[i], gate)
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Segment forward
+//
+//  Given a segment Q_seg, K_seg, V_seg and the running compressive
+//  memory state, produce the fused output for this segment and the
+//  new state (M, z, seen updated with this segment's K,V).
+// ═══════════════════════════════════════════════════════════════════
+
+fn ia2_segment_forward(state, Q_seg, K_seg, V_seg, seg_len, d_head) {
+    let M_cur = ia2_state_get_M(state)
+    let z_cur = ia2_state_get_z(state)
+    let seen = ia2_state_get_seen(state)
+
+    // Local attention
+    let local_out = ia2_local_attention(Q_seg, K_seg, V_seg, seg_len, d_head)
+
+    // Compressive retrieval per query (only if we have prior memory,
+    // else compressive path contributes zero and gate collapses to 1)
+    let mut comp_out = ia2_zeros_2d(seg_len, d_head)
+    if seen > 0 {
+        for i in 0..seg_len {
+            let num = ia2_compressive_retrieve(M_cur, Q_seg[i], d_head)
+            let den = ia2_compressive_norm_z(z_cur, Q_seg[i], d_head)
+            let inv = 1.0 / den
+            let mut row = ia2_zeros_1d(d_head)
+            for b in 0..d_head {
+                row[b] = num[b] * inv
+            }
+            comp_out[i] = row
+        }
+    }
+
+    // Gate — learned scalar; here we use a neutral 0.5 for a
+    // deterministic reference implementation. Callers can override
+    // via ia2_combine(local, comp, custom_gate).
+    let mut g = 0.5
+    if seen == 0 { g = 1.0 }
+    let out = ia2_combine_mat(local_out, comp_out, g, seg_len, d_head)
+
+    // Delta-update memory with this segment's K, V
+    let new_M = ia2_delta_update(M_cur, K_seg, V_seg, seg_len, d_head)
+    let new_z = ia2_delta_update_z(z_cur, K_seg, seg_len, d_head)
+
+    let new_state = #{}
+    new_state["M"] = new_M
+    new_state["z"] = new_z
+    new_state["seen"] = seen + seg_len
+
+    return [out, new_state]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Multi-segment forward — streams Q, K, V in chunks of seg_size
+//  and concatenates segment outputs. total_len must be divisible by
+//  seg_size unless the last chunk is handled specially.
+// ═══════════════════════════════════════════════════════════════════
+
+fn ia2_multi_segment_forward(Q, K, V, seg_size, total_len, d_head) {
+    let mut state = ia2_create_state(d_head)
+    let mut out = []
+    let mut s = 0
+    while s < total_len {
+        let remain = total_len - s
+        let this_seg = ia2_min_i(seg_size, remain)
+        // Build segment slices
+        let mut Qs = []
+        let mut Ks = []
+        let mut Vs = []
+        for i in 0..this_seg {
+            Qs = Qs + [Q[s + i]]
+            Ks = Ks + [K[s + i]]
+            Vs = Vs + [V[s + i]]
+        }
+        let res = ia2_segment_forward(state, Qs, Ks, Vs, this_seg, d_head)
+        let seg_out = res[0]
+        state = res[1]
+        for i in 0..this_seg {
+            out = out + [seg_out[i]]
+        }
+        s = s + this_seg
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Parameter count helper (for sanity tests / SSOT reporting)
+// ═══════════════════════════════════════════════════════════════════
+
+fn ia2_param_count(d_head) {
+    // Compressive memory is non-parametric at inference time;
+    // parametric pieces would be Q/K/V projections (d_head*d_head
+    // each) plus a gate scalar beta. For the reference module we
+    // report d_head*d_head*3 + 1.
+    return d_head * d_head * 3 + 1
+}

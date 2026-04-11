@@ -1,0 +1,429 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/online_dpo.hexa — Online Direct Preference Optimization
+//
+//  Standard DPO (dpo.hexa) assumes a static preference dataset. Online
+//  DPO samples fresh responses from the CURRENT policy at every step,
+//  sends them to a judge/oracle for preference labels, and immediately
+//  applies a DPO update. This closes the distribution-shift gap that
+//  offline DPO suffers from after a few epochs.
+//
+//  Pipeline (per prompt):
+//    1) sample K candidates from current policy (temperature / top-k)
+//    2) judge(prompt, candidate) -> scalar reward
+//    3) pick argmax / argmin -> (chosen, rejected) pair
+//    4) DPO update on that pair
+//    5) push (prompt, chosen, rejected, reward_gap) into replay buffer
+//    6) occasionally resample from replay (stabilises drift)
+//    7) track cumulative KL / parameter drift vs ref_policy
+//
+//  Because the full LM forward lives in dpo.hexa, this module operates
+//  on abstract *policy state vectors* (shape = [D]). A policy maps a
+//  prompt embedding -> D-dim logit vector over candidate actions, and
+//  each action has a judge-assigned reward. This gives us a self-
+//  contained, deterministic implementation with full unit tests, while
+//  keeping a clean `odpo_train_step(policy, ref, judge, prompt, ...)`
+//  API so the real transformer in dpo.hexa can plug in later.
+//
+//  API:
+//    odpo_new_policy(d, seed)                        -> policy (logits D)
+//    odpo_copy_policy(p)                             -> policy
+//    odpo_log_prob(policy, action)                   -> float
+//    odpo_sample(policy, k, seed)                    -> [action, logp]
+//    odpo_judge_linear(reward_vec, action)           -> float
+//    odpo_build_pair(policy, k, seed, reward_vec)    -> [chosen, rejected, gap]
+//    odpo_loss(policy, ref, chosen, rejected, beta)  -> [loss, margin]
+//    odpo_step(policy, ref, pair, beta, lr)          -> loss
+//    odpo_replay_push(buf, cap, pair)                -> buf
+//    odpo_replay_sample(buf, seed)                   -> pair
+//    odpo_policy_drift(policy, ref)                  -> float  (L2)
+//    odpo_kl_drift(policy, ref)                      -> float  (sum p*log(p/q))
+//    odpo_train_step(state, reward_vec, beta, lr)    -> state
+//
+//  AI-NATIVE attrs:
+//    @pure — loss / log_prob / drift (no side effects)
+//    @hot  — log_prob / sample / step (called every step)
+// ═══════════════════════════════════════════════════════════════════
+
+// ── numeric helpers ──────────────────────────────────────────────
+
+fn odpo_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn odpo_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn odpo_log(x) {
+    if x <= 0.0 { return -30.0 }
+    let mut v = x
+    let mut count = 0
+    while v > 2.0 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    let d = v - 1.0
+    let ln_v = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_v
+}
+
+fn odpo_sigmoid(x) {
+    if x > 20.0 { return 1.0 }
+    if x < -20.0 { return 0.0 }
+    return 1.0 / (1.0 + odpo_exp(0.0 - x))
+}
+
+fn odpo_log_sigmoid(x) {
+    let neg_x = 0.0 - x
+    if neg_x > 20.0 { return 0.0 - neg_x }
+    if neg_x < -20.0 { return 0.0 }
+    return 0.0 - odpo_log(1.0 + odpo_exp(neg_x))
+}
+
+// deterministic hash PRNG (no floating-point RNG available)
+fn odpo_hash(seed, i) {
+    let h = ((seed * 2654435761 + i * 1315423911 + 731) % 10007)
+    return to_float(h) / 10007.0
+}
+
+fn odpo_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+// ── policy state ─────────────────────────────────────────────────
+//
+// A "policy" is just a logit vector of length D — each index is an
+// action. We softmax it to get P(action). This mirrors what a real
+// LM head computes before argmax decoding.
+
+pub fn odpo_new_policy(d, seed) {
+    let mut v = []
+    for i in 0..d {
+        // small Gaussian-ish init using two hashes
+        let a = odpo_hash(seed, i * 2)
+        let b = odpo_hash(seed, i * 2 + 1)
+        v = v + [(a - 0.5) * 0.1 + (b - 0.5) * 0.1]
+    }
+    return v
+}
+
+pub fn odpo_copy_policy(p) {
+    let n = len(p)
+    let mut out = []
+    for i in 0..n { out = out + [p[i]] }
+    return out
+}
+
+// softmax over full action space
+fn odpo_softmax(logits) {
+    let n = len(logits)
+    let mut mx = logits[0]
+    let mut i = 1
+    while i < n {
+        if logits[i] > mx { mx = logits[i] }
+        i = i + 1
+    }
+    let mut exps = odpo_zeros(n)
+    let mut s = 0.0
+    let mut j = 0
+    while j < n {
+        let e = odpo_exp(logits[j] - mx)
+        exps[j] = e
+        s = s + e
+        j = j + 1
+    }
+    if s <= 0.0 { s = 1.0e-10 }
+    let mut k = 0
+    while k < n {
+        exps[k] = exps[k] / s
+        k = k + 1
+    }
+    return exps
+}
+
+// log P(action)
+pub fn odpo_log_prob(policy, action) {
+    let n = len(policy)
+    if action < 0 { return -30.0 }
+    if action >= n { return -30.0 }
+    let mut mx = policy[0]
+    let mut i = 1
+    while i < n {
+        if policy[i] > mx { mx = policy[i] }
+        i = i + 1
+    }
+    let mut sum_exp = 0.0
+    let mut j = 0
+    while j < n {
+        sum_exp = sum_exp + odpo_exp(policy[j] - mx)
+        j = j + 1
+    }
+    let lse = mx + odpo_log(sum_exp)
+    return policy[action] - lse
+}
+
+// ── online sampling ──────────────────────────────────────────────
+//
+// Draws k candidate actions from current policy using inverse-CDF
+// sampling over softmax probabilities, returns [[action, log_p], ...].
+
+pub fn odpo_sample(policy, k, seed) {
+    let probs = odpo_softmax(policy)
+    let n = len(probs)
+    let mut out = []
+    let mut i = 0
+    while i < k {
+        let u = odpo_hash(seed + i * 97, i * 131 + 7)
+        let mut acc = 0.0
+        let mut chosen = n - 1
+        let mut j = 0
+        let mut done = false
+        while j < n {
+            if done == false {
+                acc = acc + probs[j]
+                if u <= acc {
+                    chosen = j
+                    done = true
+                }
+            }
+            j = j + 1
+        }
+        let lp = odpo_log_prob(policy, chosen)
+        out = out + [[chosen, lp]]
+        i = i + 1
+    }
+    return out
+}
+
+// ── judge ────────────────────────────────────────────────────────
+//
+// The judge is an external oracle: judge(prompt, action) -> reward.
+// We expose a simple linear-reward judge: r(a) = reward_vec[a].
+// In practice this slot would call an LLM-as-judge or a reward model.
+
+pub fn odpo_judge_linear(reward_vec, action) {
+    let n = len(reward_vec)
+    if action < 0 { return 0.0 }
+    if action >= n { return 0.0 }
+    return reward_vec[action]
+}
+
+// Build a (chosen, rejected) preference pair from online samples.
+// Returns [chosen_action, rejected_action, reward_gap].
+pub fn odpo_build_pair(policy, k, seed, reward_vec) {
+    let samples = odpo_sample(policy, k, seed)
+    let ns = len(samples)
+    if ns < 2 {
+        let a = samples[0][0]
+        return [a, a, 0.0]
+    }
+    let mut best_a = samples[0][0]
+    let mut worst_a = samples[0][0]
+    let mut best_r = odpo_judge_linear(reward_vec, best_a)
+    let mut worst_r = best_r
+    let mut i = 1
+    while i < ns {
+        let a = samples[i][0]
+        let r = odpo_judge_linear(reward_vec, a)
+        if r > best_r { best_r = r; best_a = a }
+        if r < worst_r { worst_r = r; worst_a = a }
+        i = i + 1
+    }
+    return [best_a, worst_a, best_r - worst_r]
+}
+
+// ── DPO loss + step ──────────────────────────────────────────────
+//
+// L = -log sigma(beta * (logpi_w - logpi_l - logref_w + logref_l))
+// Returns [loss, margin].
+pub fn odpo_loss(policy, ref, chosen, rejected, beta) {
+    let lpi_w = odpo_log_prob(policy, chosen)
+    let lpi_l = odpo_log_prob(policy, rejected)
+    let lref_w = odpo_log_prob(ref, chosen)
+    let lref_l = odpo_log_prob(ref, rejected)
+    let margin = beta * ((lpi_w - lref_w) - (lpi_l - lref_l))
+    let loss = 0.0 - odpo_log_sigmoid(margin)
+    return [loss, margin]
+}
+
+// Analytical gradient of DPO loss w.r.t. the logit vector (policy).
+// Because policy = logits and log_prob = logits[a] - logsumexp(logits),
+// d log_prob / d logits[j] = (a==j) - softmax(logits)[j].
+// d margin / d logits[j] = beta * ((a_w==j) - p[j] - (a_l==j) + p[j])
+//                        = beta * ((a_w==j) - (a_l==j))
+// d L / d margin = -sigmoid(-margin)
+//
+// Returns [updated_policy, loss]. Hexa arrays pass by value for the
+// caller, so the caller must rebind:  policy = odpo_step(...)[0].
+fn odpo_grad_step(policy, ref, chosen, rejected, beta, lr) {
+    let n = len(policy)
+    let res = odpo_loss(policy, ref, chosen, rejected, beta)
+    let margin = res[1]
+    let neg_sigmoid = 0.0 - odpo_sigmoid(0.0 - margin)
+    let mut out = policy
+    let mut j = 0
+    while j < n {
+        let mut ind = 0.0
+        if j == chosen { ind = ind + 1.0 }
+        if j == rejected { ind = ind - 1.0 }
+        let grad = neg_sigmoid * beta * ind
+        out[j] = out[j] - lr * grad
+        j = j + 1
+    }
+    return [out, res[0]]
+}
+
+// Returns [updated_policy, loss].
+pub fn odpo_step(policy, ref, pair, beta, lr) {
+    let chosen = pair[0]
+    let rejected = pair[1]
+    if chosen == rejected { return [policy, 0.0] }
+    return odpo_grad_step(policy, ref, chosen, rejected, beta, lr)
+}
+
+// ── replay buffer ────────────────────────────────────────────────
+//
+// Online DPO without replay is unstable — once the policy moves away
+// from an earlier pair, that pair's information is lost forever. We
+// keep a ring buffer of recent (chosen, rejected, gap) triples.
+
+pub fn odpo_replay_push(buf, cap, pair) {
+    let mut out = buf
+    out = out + [pair]
+    while len(out) > cap {
+        let mut trimmed = []
+        let mut i = 1
+        while i < len(out) {
+            trimmed = trimmed + [out[i]]
+            i = i + 1
+        }
+        out = trimmed
+    }
+    return out
+}
+
+pub fn odpo_replay_sample(buf, seed) {
+    let n = len(buf)
+    if n <= 0 { return [0, 0, 0.0] }
+    let u = odpo_hash(seed, 17)
+    let mut idx = to_int(u * to_float(n))
+    if idx < 0 { idx = 0 }
+    if idx >= n { idx = n - 1 }
+    return buf[idx]
+}
+
+// ── drift measurements ───────────────────────────────────────────
+//
+// L2 parameter drift ||policy - ref||_2 — cheap, no softmax.
+pub fn odpo_policy_drift(policy, ref) {
+    let n = len(policy)
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        let d = policy[i] - ref[i]
+        s = s + d * d
+        i = i + 1
+    }
+    return sqrt(s)
+}
+
+// Forward KL(policy || ref) — the quantity DPO's beta is supposed
+// to regularise. We use a numerically stable estimator.
+pub fn odpo_kl_drift(policy, ref) {
+    let p = odpo_softmax(policy)
+    let q = odpo_softmax(ref)
+    let n = len(p)
+    let mut kl = 0.0
+    let mut i = 0
+    while i < n {
+        let pi = p[i]
+        if pi > 1.0e-12 {
+            let qi = q[i]
+            let qsafe = if qi > 1.0e-12 { qi } else { 1.0e-12 }
+            kl = kl + pi * (odpo_log(pi) - odpo_log(qsafe))
+        }
+        i = i + 1
+    }
+    return kl
+}
+
+// ── full online train step ───────────────────────────────────────
+//
+// state = [policy, ref, buf, cap, beta, lr, step, total_loss, total_drift]
+pub fn odpo_new_state(d, seed, cap, beta, lr) {
+    let policy = odpo_new_policy(d, seed)
+    let ref = odpo_copy_policy(policy)
+    return [policy, ref, [], cap, beta, lr, 0, 0.0, 0.0]
+}
+
+// Perform one full online DPO step: sample -> judge -> DPO update.
+// replay_ratio in [0,1] — probability of using a replay pair instead
+// of a fresh online pair (0 = pure online, 1 = pure replay).
+pub fn odpo_train_step(state, reward_vec, k, seed, replay_ratio) {
+    let policy = state[0]
+    let ref = state[1]
+    let mut buf = state[2]
+    let cap = state[3]
+    let beta = state[4]
+    let lr = state[5]
+    let step = state[6]
+    let mut total_loss = state[7]
+    let mut total_drift = state[8]
+
+    // 1) decide fresh vs replay
+    let u = odpo_hash(seed + step, 1019)
+    let use_replay = if u < replay_ratio {
+        if len(buf) > 0 { true } else { false }
+    } else { false }
+
+    let mut pair = [0, 0, 0.0]
+    if use_replay {
+        pair = odpo_replay_sample(buf, seed + step * 7)
+    } else {
+        pair = odpo_build_pair(policy, k, seed + step * 13, reward_vec)
+        buf = odpo_replay_push(buf, cap, pair)
+    }
+
+    // 2) DPO update — odpo_step returns [new_policy, loss]
+    let upd = odpo_step(policy, ref, pair, beta, lr)
+    let new_policy = upd[0]
+    let loss = upd[1]
+    total_loss = total_loss + loss
+
+    // 3) track drift against frozen reference
+    let drift = odpo_policy_drift(new_policy, ref)
+    total_drift = total_drift + drift
+
+    return [new_policy, ref, buf, cap, beta, lr, step + 1, total_loss, total_drift]
+}
+
+// Run n steps of online DPO. For determinism we use seed + i as the
+// per-step seed. Returns the final state.
+pub fn odpo_train(state, reward_vec, k, n_steps, base_seed, replay_ratio) {
+    let mut cur = state
+    let mut i = 0
+    while i < n_steps {
+        cur = odpo_train_step(cur, reward_vec, k, base_seed + i, replay_ratio)
+        i = i + 1
+    }
+    return cur
+}
+
+println("[online_dpo] loaded - online sample + judge + DPO + replay + drift")

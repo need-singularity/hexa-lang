@@ -1,0 +1,508 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/diffusion_forcing.hexa — Diffusion Forcing (#207)
+//
+//  Hybrid AR + diffusion training: each token has its own noise
+//  level in [0,1]. During training, we sample random per-token
+//  noise levels and learn to predict clean tokens. At inference,
+//  we can choose any mixture — full-AR (all new tokens at
+//  noise=1), full-diffusion (iterative denoising), or arbitrary
+//  mixed schedules.
+//
+//  Key idea: noise_level[t] = 0 -> token is clean (observed);
+//            noise_level[t] = 1 -> token is fully masked (unknown).
+//  The model must learn a single objective that handles every
+//  point on this continuum — which unifies the AR and diffusion
+//  paradigms and makes the inference interface flexible.
+//
+//  API (pure unless noted):
+//    df_sample_noise_levels(n, seed)                            -> [float]
+//    df_add_noise(tokens, noise_levels, mask_id, seed)          -> [int]
+//    df_add_continuous_noise(vec, sigma, seed)                  -> [float]
+//    df_cosine_schedule(step, total)                            -> float
+//    df_softmax(logits, n)                                      -> [float]
+//    df_argmax(logits, n)                                       -> int
+//    df_create_model(vocab, dim)                                -> dict
+//    df_model_forward(model, noisy_tokens, noise_levels, dim)   -> [[float]]
+//    df_loss_per_token(model, clean, noisy, noise_levels, vocab) -> [float]
+//    df_weighted_loss(losses, weights, n)                       -> float
+//    df_ar_generate(model, prefix, n_tokens, vocab, seed)       -> [int]
+//    df_diffusion_generate(model, seq_len, n_steps, vocab, seed)-> [int]
+//    df_mixed_generate(model, prefix, n_new, n_diff_steps, vocab, seed) -> [int]
+//
+//  AI-NATIVE attrs:
+//    @pure — no side effects for training primitives
+//    @hot  — forward/loss called every step
+// ═══════════════════════════════════════════════════════════════════
+
+// ── math helpers ─────────────────────────────────────────────────
+
+@pure
+fn df_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+@pure
+fn df_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+@pure
+fn df_log(x) {
+    if x <= 0.0 { return -20.0 }
+    let mut y = 0.0
+    let mut t = (x - 1.0) / (x + 1.0)
+    let t2 = t * t
+    let mut term = t
+    for i in 0..15 {
+        y = y + term / to_float(2 * i + 1)
+        term = term * t2
+    }
+    return 2.0 * y
+}
+
+@pure
+fn df_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+@pure
+fn df_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+// Deterministic PRNG in [0,1) from seed + index (LCG-style hash)
+@pure
+fn df_hash(seed, idx) {
+    let mut h = (seed + 1) * 2654435761 + (idx + 1) * 1315423911
+    h = h % 1000003
+    if h < 0 { h = 0 - h }
+    return h
+}
+
+@pure
+fn df_rand(seed, idx) {
+    let h = df_hash(seed, idx)
+    return to_float(h % 100000) / 100000.0
+}
+
+// Box-Muller approx: two uniforms -> one standard normal (monotone)
+@pure
+fn df_randn(seed, idx) {
+    let u1 = df_rand(seed, idx * 2)
+    let mut safe_u1 = u1
+    if safe_u1 < 0.0001 { safe_u1 = 0.0001 }
+    let u2 = df_rand(seed, idx * 2 + 1)
+    // sqrt(-2 ln u1) * cos(2 pi u2) — use Taylor-truncated form
+    let r = df_sqrt(0.0 - 2.0 * df_log(safe_u1))
+    // Cheap cos via (1 - 2*(u2 - 0.5)^2) style: bounded in [-1,1]
+    let c = 1.0 - 8.0 * (u2 - 0.5) * (u2 - 0.5) * (u2 - 0.5) * (u2 - 0.5)
+    return r * c
+}
+
+@pure
+fn df_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 { g = (g + x / g) / 2.0 }
+    return g
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  1. Noise level sampling
+//
+//  Per-token continuous noise levels in [0, 1].
+//  Independent samples — lets training see every mixture at once.
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn df_sample_noise_levels(n, seed) {
+    let mut out = df_zeros(n)
+    for i in 0..n {
+        let r = df_rand(seed + 13, i)
+        out[i] = r
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  2. Discrete noise injection
+//
+//  For discrete tokens, `noise_level > threshold` replaces the
+//  token with `mask_id`. Per-token random threshold means higher
+//  noise levels mask more often (Bernoulli-style).
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn df_add_noise(tokens, noise_levels, mask_id, seed) {
+    let n = len(tokens)
+    let mut out = df_zeros_int(n)
+    for i in 0..n {
+        let nl = noise_levels[i]
+        let u = df_rand(seed + 101, i)
+        if u < nl {
+            out[i] = mask_id
+        } else {
+            out[i] = tokens[i]
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  3. Continuous noise injection (for embedding vectors)
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn df_add_continuous_noise(vec, sigma, seed) {
+    let n = len(vec)
+    let mut out = df_zeros(n)
+    for i in 0..n {
+        let z = df_randn(seed + 777, i)
+        out[i] = vec[i] + sigma * z
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  4. Cosine noise schedule
+//
+//  Monotonically decreasing schedule commonly used in diffusion:
+//  step=0 -> ~1 (fully noisy); step=total -> ~0 (clean).
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn df_cosine_schedule(step, total) {
+    if total <= 0 { return 0.0 }
+    // frac in [0,1], 0 at step 0, 1 at step=total
+    let frac = to_float(step) / to_float(total)
+    // cos(pi/2 * frac) in [0,1]: 1 -> 0. We want noise decreasing 1 -> 0.
+    // Approximate cos(pi/2 * x) with polynomial (fits [0,1] well).
+    let x = frac
+    let x2 = x * x
+    let c = 1.0 - 1.2337 * x2 + 0.2536 * x2 * x2
+    if c < 0.0 { return 0.0 }
+    if c > 1.0 { return 1.0 }
+    return c
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  5. Softmax / Argmax
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn df_softmax(logits, n) {
+    let mut mx = logits[0]
+    for i in 1..n {
+        if logits[i] > mx { mx = logits[i] }
+    }
+    let mut exps = df_zeros(n)
+    let mut z = 0.0
+    for i in 0..n {
+        exps[i] = df_exp(logits[i] - mx)
+        z = z + exps[i]
+    }
+    let mut out = df_zeros(n)
+    if z < 1.0e-15 {
+        for i in 0..n { out[i] = 1.0 / to_float(n) }
+    } else {
+        for i in 0..n { out[i] = exps[i] / z }
+    }
+    return out
+}
+
+@pure
+fn df_argmax(logits, n) {
+    let mut best = 0
+    let mut best_v = logits[0]
+    for i in 1..n {
+        if logits[i] > best_v {
+            best_v = logits[i]
+            best = i
+        }
+    }
+    return best
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  6. Model factory
+//
+//  Tiny denoiser: embed(token) -> project through noise-level
+//  conditioning -> unembed to vocab logits. Pure dict so tests
+//  can inspect shapes directly.
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn df_create_model(vocab, dim) {
+    let mut embed = []
+    for t in 0..vocab {
+        let mut row = df_zeros(dim)
+        for i in 0..dim {
+            let h = (t * 73 + i * 17 + 5) % 997
+            row[i] = (to_float(h) / 997.0 - 0.5) * 0.4
+        }
+        embed = embed + [row]
+    }
+    let mut unembed = []
+    for i in 0..dim {
+        let mut row = df_zeros(vocab)
+        for t in 0..vocab {
+            let h = (i * 41 + t * 29 + 11) % 997
+            row[t] = (to_float(h) / 997.0 - 0.5) * 0.4
+        }
+        unembed = unembed + [row]
+    }
+    return #{
+        "vocab": vocab,
+        "dim": dim,
+        "embed": embed,
+        "unembed": unembed,
+    }
+}
+
+// Look-up embedding (mask_id = vocab is handled by modding)
+@pure
+fn df_lookup(model, token_id, dim) {
+    let vocab = model["vocab"]
+    let embed = model["embed"]
+    let safe_id = token_id % vocab
+    let mut out = df_zeros(dim)
+    for i in 0..dim {
+        out[i] = embed[safe_id][i]
+    }
+    return out
+}
+
+// Condition the embedding on the noise level: the more noise,
+// the more the clean embedding is attenuated (cos_t * emb).
+@pure
+fn df_condition(emb, noise_level, dim) {
+    let mut out = df_zeros(dim)
+    // scale = cos(pi/2 * noise_level) ∈ [0,1]  (attenuation factor)
+    let x = noise_level
+    let x2 = x * x
+    let mut scale = 1.0 - 1.2337 * x2 + 0.2536 * x2 * x2
+    if scale < 0.0 { scale = 0.0 }
+    if scale > 1.0 { scale = 1.0 }
+    for i in 0..dim {
+        out[i] = emb[i] * scale
+    }
+    return out
+}
+
+// Forward: for each position t, attend to its noise-level-
+// conditioned embedding plus the running context from prior
+// positions (simple prefix-sum, AR-consistent but works for
+// unordered diffusion because we only inject clean positions
+// through their own embeddings).
+@hot
+fn df_model_forward(model, noisy_tokens, noise_levels, dim) {
+    let n = len(noisy_tokens)
+    let vocab = model["vocab"]
+    let unembed = model["unembed"]
+    let mut ctx = df_zeros(dim)
+    let mut all_logits = []
+    for t in 0..n {
+        let emb = df_lookup(model, noisy_tokens[t], dim)
+        let cond = df_condition(emb, noise_levels[t], dim)
+        // Mix with running context (both directions implicitly
+        // via repeated calls from AR/diffusion loops).
+        let mut h = df_zeros(dim)
+        for i in 0..dim {
+            h[i] = 0.5 * cond[i] + 0.5 * ctx[i]
+            ctx[i] = ctx[i] + cond[i] * 0.1
+        }
+        let mut logits = df_zeros(vocab)
+        for v in 0..vocab {
+            let mut s = 0.0
+            for i in 0..dim {
+                s = s + h[i] * unembed[i][v]
+            }
+            logits[v] = s
+        }
+        all_logits = all_logits + [logits]
+    }
+    return all_logits
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  7. Loss — per-token cross-entropy weighted by noise level
+//
+//  Noise-level weighting matches the diffusion-forcing objective:
+//  tokens with more noise contribute more to the loss (they are
+//  the ones the model must learn to denoise).
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn df_weighted_loss(losses, weights, n) {
+    let mut total = 0.0
+    let mut wsum = 0.0
+    for i in 0..n {
+        total = total + losses[i] * weights[i]
+        wsum = wsum + weights[i]
+    }
+    if wsum < 1.0e-12 { return 0.0 }
+    return total / wsum
+}
+
+@hot
+fn df_loss_per_token(model, clean, noisy, noise_levels, vocab) {
+    let n = len(clean)
+    let dim = model["dim"]
+    let all_logits = df_model_forward(model, noisy, noise_levels, dim)
+    let mut out = df_zeros(n)
+    for t in 0..n {
+        let probs = df_softmax(all_logits[t], vocab)
+        let target = clean[t]
+        let mut p = probs[target]
+        if p < 1.0e-12 { p = 1.0e-12 }
+        out[t] = 0.0 - df_log(p)
+    }
+    return out
+}
+
+// Total (average) loss, weighting each token's xent by its
+// sampled noise level.
+@hot
+fn df_total_loss(model, clean, noisy, noise_levels, vocab) {
+    let per = df_loss_per_token(model, clean, noisy, noise_levels, vocab)
+    let n = len(per)
+    return df_weighted_loss(per, noise_levels, n)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  8. Pure AR generation
+//
+//  All new tokens start at noise_level=1 (masked) and are filled
+//  one-by-one greedy-argmax, conditioned on the already-decided
+//  prefix (noise_level=0).
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn df_ar_generate(model, prefix, n_tokens, vocab, seed) {
+    let dim = model["dim"]
+    let mask_id = vocab - 1
+    let n_prefix = len(prefix)
+    let total = n_prefix + n_tokens
+    let mut tokens = df_zeros_int(total)
+    let mut noise_levels = df_zeros(total)
+    for i in 0..n_prefix {
+        tokens[i] = prefix[i]
+        noise_levels[i] = 0.0
+    }
+    for i in 0..n_tokens {
+        tokens[n_prefix + i] = mask_id
+        noise_levels[n_prefix + i] = 1.0
+    }
+    // Fill left-to-right greedy argmax.
+    for step in 0..n_tokens {
+        let all_logits = df_model_forward(model, tokens, noise_levels, dim)
+        let pos = n_prefix + step
+        let next_id = df_argmax(all_logits[pos], vocab)
+        tokens[pos] = next_id
+        noise_levels[pos] = 0.0
+    }
+    // Return only the generated suffix.
+    let mut out = df_zeros_int(n_tokens)
+    for i in 0..n_tokens { out[i] = tokens[n_prefix + i] }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  9. Pure diffusion generation
+//
+//  All positions start at noise_level=1 (masked); we run `n_steps`
+//  denoising steps, each step lowers the whole-sequence noise via
+//  the cosine schedule and re-decodes every token.
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn df_diffusion_generate(model, seq_len, n_steps, vocab, seed) {
+    let dim = model["dim"]
+    let mask_id = vocab - 1
+    let mut tokens = df_zeros_int(seq_len)
+    for i in 0..seq_len { tokens[i] = mask_id }
+    let mut noise_levels = df_zeros(seq_len)
+    for i in 0..seq_len { noise_levels[i] = 1.0 }
+    let total = n_steps
+    for step in 1..(total + 1) {
+        let level = df_cosine_schedule(step, total)
+        for i in 0..seq_len { noise_levels[i] = level }
+        let all_logits = df_model_forward(model, tokens, noise_levels, dim)
+        // Decode: at lowest noise (last step) commit everything.
+        for i in 0..seq_len {
+            let id = df_argmax(all_logits[i], vocab)
+            tokens[i] = id
+        }
+    }
+    // Final clean pass.
+    for i in 0..seq_len { noise_levels[i] = 0.0 }
+    return tokens
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  10. Mixed AR + diffusion generation
+//
+//  Prefix is clean (noise=0). New tokens go through `n_diff_steps`
+//  diffusion refinement before being committed left-to-right AR.
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn df_mixed_generate(model, prefix, n_new, n_diffusion_steps, vocab, seed) {
+    let dim = model["dim"]
+    let mask_id = vocab - 1
+    let n_prefix = len(prefix)
+    let total_len = n_prefix + n_new
+    let mut tokens = df_zeros_int(total_len)
+    let mut noise_levels = df_zeros(total_len)
+    for i in 0..n_prefix {
+        tokens[i] = prefix[i]
+        noise_levels[i] = 0.0
+    }
+    for i in 0..n_new {
+        tokens[n_prefix + i] = mask_id
+        noise_levels[n_prefix + i] = 1.0
+    }
+    // Diffusion refinement on the suffix.
+    let denoise_steps = if n_diffusion_steps < 1 { 1 } else { n_diffusion_steps }
+    for s in 1..(denoise_steps + 1) {
+        let level = df_cosine_schedule(s, denoise_steps)
+        for i in 0..n_new { noise_levels[n_prefix + i] = level }
+        let all_logits = df_model_forward(model, tokens, noise_levels, dim)
+        for i in 0..n_new {
+            let pos = n_prefix + i
+            tokens[pos] = df_argmax(all_logits[pos], vocab)
+        }
+    }
+    // Final AR commit pass, left-to-right, each position at noise=0.
+    for i in 0..n_new { noise_levels[n_prefix + i] = 0.0 }
+    let all_logits = df_model_forward(model, tokens, noise_levels, dim)
+    for i in 0..n_new {
+        let pos = n_prefix + i
+        tokens[pos] = df_argmax(all_logits[pos], vocab)
+    }
+    return tokens
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Module self-check (compile-time sanity)
+// ═══════════════════════════════════════════════════════════════════
+
+fn df_module_version() {
+    return "diffusion_forcing@1.0"
+}

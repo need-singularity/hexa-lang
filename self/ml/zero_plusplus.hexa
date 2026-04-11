@@ -1,0 +1,737 @@
+// ═══════════════════════════════════════════════════════════════
+//  zero_plusplus.hexa — DeepSpeed ZeRO++ Hierarchical sharding
+//                      + quantized collectives (fp16 → int8)
+//
+//  Extends self/ml/zero_optimizer.hexa (ZeRO-1/2/3) with three
+//  H100-class optimizations from the ZeRO++ paper (Wang et al. 2023):
+//
+//    qwZ  (quantized weight gather)
+//      - Primary parameter shards are kept in FP32.
+//      - The transient all-gather (model forward / backward) quantizes
+//        each shard to INT8 before the cross-node hop, cutting the
+//        wire volume from 32 bit → 8 bit (4x). Each rank dequantizes
+//        after receive.
+//
+//    hpZ  (hierarchical partition — intra-node replication)
+//      - Model the world as G nodes × K ranks (world = G*K).
+//      - Full parameter tensor is replicated inside each node (cheap
+//        intra-node NVLink), so the expensive inter-node all-gather
+//        is sized by the NUMBER OF NODES, not the world size. This
+//        cuts inter-node traffic by K (gpus-per-node) vs classic
+//        ZeRO-3 at the cost of one replica worth of DRAM per node.
+//
+//    qgZ  (quantized gradient reduce)
+//      - Gradients are quantized to INT8 before reduce-scatter and
+//        dequantized after, again giving a 4x reduction in the
+//        (dominant) gradient traffic.
+//
+//  Communication ratio, vs. plain ZeRO-3 per training step (model=P):
+//      hpZ              : inter-node all-gather  P/G    (vs  P*(1-1/W))
+//      qwZ              : *  1/4  bit-width ratio       (FP32 → INT8)
+//      qgZ              : reduce-scatter   P/4
+//      combined         : ≈ 4x reduction (weight)   + 4x (gradient)
+//
+//  This file models all three on CPU via the same parallel-array trick
+//  as zero_optimizer.hexa. Each rank is one index into an array; nodes
+//  are groups of consecutive ranks. Real DeepSpeed has collective
+//  backends; here we simulate them deterministically so unit tests
+//  can assert byte-for-byte equivalence vs. reference Adam.
+//
+//  Author: hexa-ml ml#95 (2026-04-11)
+// ═══════════════════════════════════════════════════════════════
+
+// ── Adam hyperparameters (shared with zero_optimizer) ─────────
+let ZPP_BETA1 = 0.9
+let ZPP_BETA2 = 0.999
+let ZPP_EPS   = 1.0e-8
+
+// ── Quantization constants ──────────────────────────────────
+//  INT8 symmetric quantization uses the per-shard max-abs as the
+//  scale. We simulate fp16 as fp32 with reduced precision by
+//  round-to-17-bit-mantissa in zpp_q_fp16.
+let ZPP_INT8_MAX = 127.0
+
+// ── Hierarchical context ─────────────────────────────────────
+//
+//   nodes          : G (world = G * ranks_per_node)
+//   ranks_per_node : K
+//   world_size     : G * K
+//   param_size     : P
+//   params         : full FP32 weights (replicated)
+//   grads          : dense gradients (replicated)
+//   m_shards       : per-rank Adam moment 1 (shard of P/world)
+//   v_shards       : per-rank Adam moment 2
+//   param_shards   : per-rank primary FP32 weight shard
+//   node_replicas  : array of G full-P FP32 replicas (intra-node
+//                    replication — hpZ). Kept between steps so
+//                    the inter-node gather only happens once.
+//   t              : Adam step counter
+//   flags          : [use_qwZ, use_hpZ, use_qgZ] booleans
+struct ZPPContext {
+    nodes: int,
+    ranks_per_node: int,
+    world_size: int,
+    param_size: int,
+    params: array,
+    grads: array,
+    m_shards: array,
+    v_shards: array,
+    param_shards: array,
+    node_replicas: array,
+    t: int,
+    use_qwZ: bool,
+    use_hpZ: bool,
+    use_qgZ: bool
+}
+
+// ── Communication accounting ─────────────────────────────────
+//
+//   intra_bytes : NVLink-style intra-node cost
+//   inter_bytes : cross-node (IB/RoCE) cost
+//   gather_bytes: weight all-gather leg
+//   reduce_bytes: gradient reduce-scatter leg
+struct ZPPComm {
+    intra_bytes: int,
+    inter_bytes: int,
+    gather_bytes: int,
+    reduce_bytes: int
+}
+
+// ── Low-level helpers ─────────────────────────────────────────
+
+fn zpp_zeros(n) {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [0.0]
+        i = i + 1
+    }
+    out
+}
+
+fn zpp_copy(src) {
+    let n = len(src)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [src[i]]
+        i = i + 1
+    }
+    out
+}
+
+fn zpp_slice(src, begin, end) {
+    let mut out = []
+    let mut i = begin
+    while i < end {
+        out = out + [src[i]]
+        i = i + 1
+    }
+    out
+}
+
+fn zpp_fabs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn zpp_pow_pos(base, e) {
+    let mut out = 1.0
+    let mut k = 0
+    while k < e {
+        out = out * base
+        k = k + 1
+    }
+    out
+}
+
+fn zpp_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut y = x
+    let mut i = 0
+    while i < 20 {
+        y = 0.5 * (y + x / y)
+        i = i + 1
+    }
+    y
+}
+
+fn zpp_int_floor(x) {
+    // portable truncating cast: round toward zero
+    let neg = x < 0.0
+    let mut ax = x
+    if neg { ax = 0.0 - ax }
+    let mut out = 0
+    let mut rem = ax
+    while rem >= 1.0 {
+        rem = rem - 1.0
+        out = out + 1
+    }
+    if neg { return 0 - out }
+    out
+}
+
+// ── Shard boundaries (world-wide ZeRO-3 layout) ──
+fn zpp_shard_begin(total, world, rank) {
+    (total * rank) / world
+}
+
+fn zpp_shard_end(total, world, rank) {
+    (total * (rank + 1)) / world
+}
+
+fn zpp_shard_size(total, world, rank) {
+    zpp_shard_end(total, world, rank) - zpp_shard_begin(total, world, rank)
+}
+
+// Convert (node, local_rank) → flat rank id
+fn zpp_rank_id(node, local_rank, ranks_per_node) {
+    node * ranks_per_node + local_rank
+}
+
+// Which node owns a flat rank id
+fn zpp_node_of(rank, ranks_per_node) {
+    rank / ranks_per_node
+}
+
+// ── FP16 quantization (simulated as fp32 rounding to 10 mantissa bits) ──
+//
+// FP16 has 1 sign + 5 exp + 10 mantissa bits. We approximate the
+// precision by rounding each value to 1024-part-of-max-abs. The sign
+// and magnitude structure is preserved exactly; this gives the right
+// rounding error for the test assertions (~1e-3 relative) and keeps
+// every arithmetic step in pure floats.
+fn zpp_q_fp16(data) {
+    let n = len(data)
+    if n == 0 { return [] }
+    let mut max_abs = 0.0
+    let mut i = 0
+    while i < n {
+        let a = zpp_fabs(data[i])
+        if a > max_abs { max_abs = a }
+        i = i + 1
+    }
+    if max_abs <= 0.0 { return zpp_copy(data) }
+    // Scale so 1.0 → 1024; round to nearest integer; scale back.
+    let scale = 1024.0 / max_abs
+    let mut out = []
+    i = 0
+    while i < n {
+        let v = data[i] * scale
+        // round half-away-from-zero
+        let mut rv = 0.0
+        if v >= 0.0 {
+            let fi = zpp_int_floor(v + 0.5)
+            rv = fi * 1.0
+        } else {
+            let fi = zpp_int_floor((0.0 - v) + 0.5)
+            rv = 0.0 - (fi * 1.0)
+        }
+        out = out + [rv / scale]
+        i = i + 1
+    }
+    out
+}
+
+// ── INT8 symmetric quantization ──
+//
+// Per-tensor scale s = max_abs / 127. Stored as (scale, int8[]).
+// Dequantize: q * s. This is exactly the qwZ/qgZ path DeepSpeed uses
+// for the wire representation.
+struct ZPPQuant {
+    scale: float,
+    q: array,
+    numel: int
+}
+
+fn zpp_q_int8(data) {
+    let n = len(data)
+    if n == 0 {
+        return ZPPQuant { scale: 0.0, q: [], numel: 0 }
+    }
+    let mut max_abs = 0.0
+    let mut i = 0
+    while i < n {
+        let a = zpp_fabs(data[i])
+        if a > max_abs { max_abs = a }
+        i = i + 1
+    }
+    if max_abs <= 0.0 {
+        return ZPPQuant { scale: 0.0, q: zpp_copy(data), numel: n }
+    }
+    let s = max_abs / ZPP_INT8_MAX
+    let mut q = []
+    i = 0
+    while i < n {
+        let v = data[i] / s
+        // round to nearest int, clamp [-127, 127]
+        let mut rv = 0.0
+        if v >= 0.0 {
+            let fi = zpp_int_floor(v + 0.5)
+            rv = fi * 1.0
+        } else {
+            let fi = zpp_int_floor((0.0 - v) + 0.5)
+            rv = 0.0 - (fi * 1.0)
+        }
+        if rv > ZPP_INT8_MAX { rv = ZPP_INT8_MAX }
+        if rv < (0.0 - ZPP_INT8_MAX) { rv = 0.0 - ZPP_INT8_MAX }
+        q = q + [rv]
+        i = i + 1
+    }
+    ZPPQuant { scale: s, q: q, numel: n }
+}
+
+fn zpp_dq_int8(qt) {
+    let n = qt.numel
+    let s = qt.scale
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [qt.q[i] * s]
+        i = i + 1
+    }
+    out
+}
+
+// Bytes on the wire for an INT8-quantized tensor (1 byte/elem + 4 scale)
+fn zpp_q_int8_bytes(numel) {
+    numel + 4
+}
+
+// Bytes for an FP16 tensor (2 bytes/elem)
+fn zpp_fp16_bytes(numel) {
+    numel * 2
+}
+
+// Bytes for an FP32 tensor (4 bytes/elem)
+fn zpp_fp32_bytes(numel) {
+    numel * 4
+}
+
+// ── Context construction ─────────────────────────────────────
+
+fn zpp_create(nodes, ranks_per_node, init_params, use_qwZ, use_hpZ, use_qgZ) {
+    let p = len(init_params)
+    let world = nodes * ranks_per_node
+
+    // Sharded Adam moments (world-wide layout)
+    let mut m_shards = []
+    let mut v_shards = []
+    let mut param_shards = []
+    let mut r = 0
+    while r < world {
+        let sb = zpp_shard_begin(p, world, r)
+        let se = zpp_shard_end(p, world, r)
+        m_shards = m_shards + [zpp_zeros(se - sb)]
+        v_shards = v_shards + [zpp_zeros(se - sb)]
+        param_shards = param_shards + [zpp_slice(init_params, sb, se)]
+        r = r + 1
+    }
+
+    // hpZ: each node keeps one full replica of the weights.
+    // Simulation: create G identical copies so we can measure their
+    // footprint and the fact that intra-node all-gather is free.
+    let mut node_reps = []
+    let mut g = 0
+    while g < nodes {
+        node_reps = node_reps + [zpp_copy(init_params)]
+        g = g + 1
+    }
+
+    ZPPContext {
+        nodes: nodes,
+        ranks_per_node: ranks_per_node,
+        world_size: world,
+        param_size: p,
+        params: zpp_copy(init_params),
+        grads: zpp_zeros(p),
+        m_shards: m_shards,
+        v_shards: v_shards,
+        param_shards: param_shards,
+        node_replicas: node_reps,
+        t: 0,
+        use_qwZ: use_qwZ,
+        use_hpZ: use_hpZ,
+        use_qgZ: use_qgZ
+    }
+}
+
+fn zpp_set_grads(ctx, grads) {
+    ZPPContext {
+        nodes: ctx.nodes,
+        ranks_per_node: ctx.ranks_per_node,
+        world_size: ctx.world_size,
+        param_size: ctx.param_size,
+        params: ctx.params,
+        grads: zpp_copy(grads),
+        m_shards: ctx.m_shards,
+        v_shards: ctx.v_shards,
+        param_shards: ctx.param_shards,
+        node_replicas: ctx.node_replicas,
+        t: ctx.t,
+        use_qwZ: ctx.use_qwZ,
+        use_hpZ: ctx.use_hpZ,
+        use_qgZ: ctx.use_qgZ
+    }
+}
+
+// ── hpZ all-gather ──
+//
+// Classic ZeRO-3 all-gather: every rank receives a full P vector
+// constructed by concatenating `world` shards. Cost: (W-1)*P/W.
+//
+// hpZ all-gather: only the NODE_PRIMARY (local_rank=0) communicates.
+// It receives the (G-1) shards from the other G-1 node primaries,
+// which already own their contiguous region via intra-node replication.
+// The inter-node volume is P * (G-1)/G, a factor of K smaller than
+// classic ZeRO-3. Intra-node, the full replica is already valid.
+//
+// We return (full_params, comm_accounting).
+fn zpp_hp_all_gather(ctx) {
+    let p = ctx.param_size
+    let g = ctx.nodes
+    let k = ctx.ranks_per_node
+
+    // Rebuild full P from the world param_shards (ground truth).
+    let mut full = []
+    let mut r = 0
+    while r < ctx.world_size {
+        let sh = ctx.param_shards[r]
+        let sz = len(sh)
+        let mut i = 0
+        while i < sz {
+            // Optional qwZ: quantize → dequantize before wire transit.
+            let v = sh[i]
+            full = full + [v]
+            i = i + 1
+        }
+        r = r + 1
+    }
+
+    // If qwZ is enabled, round-trip the whole vector through INT8 to
+    // approximate the actual wire fidelity loss. (This happens only
+    // in the inter-node leg; intra-node keeps FP32.)
+    let mut wire = full
+    if ctx.use_qwZ {
+        let qt = zpp_q_int8(full)
+        wire = zpp_dq_int8(qt)
+    }
+
+    // Comm accounting
+    let mut inter = 0
+    let mut intra = 0
+    let mut gather = 0
+    if ctx.use_hpZ {
+        // hpZ: inter-node only ships P/G per node (G-1 legs)
+        let per_leg = p / g
+        let legs = g - 1
+        let base = per_leg * legs
+        if ctx.use_qwZ {
+            gather = zpp_q_int8_bytes(base)
+        } else {
+            gather = zpp_fp32_bytes(base)
+        }
+        inter = gather
+        // intra-node gather is free (replica stays resident) → 0
+    } else {
+        // Classic ZeRO-3: inter = world-wide all-gather (W-1)*P/W
+        let world_gather = p * (ctx.world_size - 1) / ctx.world_size
+        if ctx.use_qwZ {
+            gather = zpp_q_int8_bytes(world_gather)
+        } else {
+            gather = zpp_fp32_bytes(world_gather)
+        }
+        inter = gather
+    }
+
+    [wire, ZPPComm { intra_bytes: intra, inter_bytes: inter,
+                     gather_bytes: gather, reduce_bytes: 0 }]
+}
+
+// ── qgZ reduce-scatter ──
+//
+// The shard layout matches param_shards. Each rank starts with a
+// dense grads copy (dup inside zpp_step), sums across world ranks
+// and scatters into per-rank slices. With qgZ, the cross-node leg
+// is INT8; intra-node stays FP32.
+//
+// Note: the sum of N identical replicas is N * grads, so after
+// reduce-scatter we divide each shard by world to obtain the mean
+// (exactly mirroring zero_optimizer.hexa).
+fn zpp_qg_reduce_scatter(ctx, per_rank_grads) {
+    let p = ctx.param_size
+    let w = ctx.world_size
+
+    // sum all replicas
+    let mut summed = zpp_zeros(p)
+    let mut r = 0
+    while r < w {
+        let g = per_rank_grads[r]
+        let mut i = 0
+        while i < p {
+            summed[i] = summed[i] + g[i]
+            i = i + 1
+        }
+        r = r + 1
+    }
+
+    // optional qgZ round-trip (wire effect)
+    let mut wire_sum = summed
+    if ctx.use_qgZ {
+        let qt = zpp_q_int8(summed)
+        wire_sum = zpp_dq_int8(qt)
+    }
+
+    // scatter into per-rank mean shards
+    let mut out_shards = []
+    r = 0
+    while r < w {
+        let sb = zpp_shard_begin(p, w, r)
+        let se = zpp_shard_end(p, w, r)
+        let sz = se - sb
+        let mut sh = []
+        let mut i = 0
+        while i < sz {
+            sh = sh + [wire_sum[sb + i] / (w * 1.0)]
+            i = i + 1
+        }
+        out_shards = out_shards + [sh]
+        r = r + 1
+    }
+
+    // comm accounting: reduce leg volume
+    let mut reduce = 0
+    let base = p * (w - 1) / w
+    if ctx.use_qgZ {
+        reduce = zpp_q_int8_bytes(base)
+    } else {
+        reduce = zpp_fp32_bytes(base)
+    }
+    [out_shards, ZPPComm { intra_bytes: 0, inter_bytes: reduce,
+                           gather_bytes: 0, reduce_bytes: reduce }]
+}
+
+// ── Per-shard Adam update (local math, never hits the wire) ──
+fn zpp_adam_update_shard(param_slice, grad_slice, m_in, v_in, lr, t) {
+    let sz = len(grad_slice)
+    let mut p = zpp_copy(param_slice)
+    let mut m = zpp_copy(m_in)
+    let mut v = zpp_copy(v_in)
+    let b1 = ZPP_BETA1
+    let b2 = ZPP_BETA2
+    let eps = ZPP_EPS
+    let bc1 = 1.0 - zpp_pow_pos(b1, t)
+    let bc2 = 1.0 - zpp_pow_pos(b2, t)
+    let mut i = 0
+    while i < sz {
+        let g = grad_slice[i]
+        let mnew = b1 * m[i] + (1.0 - b1) * g
+        let vnew = b2 * v[i] + (1.0 - b2) * g * g
+        m[i] = mnew
+        v[i] = vnew
+        let m_hat = mnew / bc1
+        let v_hat = vnew / bc2
+        let step = lr * m_hat / (zpp_sqrt(v_hat) + eps)
+        p[i] = p[i] - step
+        i = i + 1
+    }
+    [p, m, v]
+}
+
+// ── Full ZeRO++ optimizer step ──
+//
+// Pipeline:
+//   1) dup dense grads per rank                     (set-up, no wire cost)
+//   2) reduce-scatter with optional qgZ             (inter-node bytes)
+//   3) per-rank Adam update on grad shard           (local compute)
+//   4) all-gather with optional qwZ + hpZ           (inter-node bytes)
+//   5) refresh node replicas + params from shards   (for next step)
+//
+// Returns: new context.
+fn zpp_step(ctx, lr) {
+    let w = ctx.world_size
+    let p = ctx.param_size
+    let tnew = ctx.t + 1
+
+    // 1) per-rank grad replicas (all identical, matching real DeepSpeed
+    //    where every rank stores the full dense grad prior to scatter)
+    let mut per_rank_grads = []
+    let mut r = 0
+    while r < w {
+        per_rank_grads = per_rank_grads + [zpp_copy(ctx.grads)]
+        r = r + 1
+    }
+
+    // 2) reduce-scatter (qgZ optional)
+    let rs = zpp_qg_reduce_scatter(ctx, per_rank_grads)
+    let g_shards = rs[0]
+
+    // 3) Adam per-shard update
+    let mut new_param_shards = []
+    let mut new_m = []
+    let mut new_v = []
+    r = 0
+    while r < w {
+        let res = zpp_adam_update_shard(ctx.param_shards[r], g_shards[r],
+            ctx.m_shards[r], ctx.v_shards[r], lr, tnew)
+        new_param_shards = new_param_shards + [res[0]]
+        new_m = new_m + [res[1]]
+        new_v = new_v + [res[2]]
+        r = r + 1
+    }
+
+    // 4) reconstruct full params by gather; apply qwZ wire loss if enabled
+    //    (the persistent param_shards stay FP32; only the forward-pass
+    //    gather may quantize, matching DeepSpeed.)
+    let mut full = []
+    r = 0
+    while r < w {
+        let sh = new_param_shards[r]
+        let sz = len(sh)
+        let mut i = 0
+        while i < sz {
+            full = full + [sh[i]]
+            i = i + 1
+        }
+        r = r + 1
+    }
+    // NOTE: we do NOT clobber full with the quantized wire value here;
+    // param_shards (FP32) are the master copy, used on the next step.
+
+    // 5) refresh intra-node replicas (every node keeps a full copy)
+    let mut node_reps = []
+    let mut node = 0
+    while node < ctx.nodes {
+        node_reps = node_reps + [zpp_copy(full)]
+        node = node + 1
+    }
+
+    ZPPContext {
+        nodes: ctx.nodes,
+        ranks_per_node: ctx.ranks_per_node,
+        world_size: w,
+        param_size: p,
+        params: full,
+        grads: zpp_zeros(p),
+        m_shards: new_m,
+        v_shards: new_v,
+        param_shards: new_param_shards,
+        node_replicas: node_reps,
+        t: tnew,
+        use_qwZ: ctx.use_qwZ,
+        use_hpZ: ctx.use_hpZ,
+        use_qgZ: ctx.use_qgZ
+    }
+}
+
+// ── Forward-pass materialization (with qwZ wire effects) ──
+//
+// Returns what each rank would actually see inside a forward pass:
+// the FP32 replica if hpZ is on (intra-node already resident), OR
+// the wire-quantized vector if qwZ is on and hpZ is off (classic ZeRO-3
+// with quantized gather).
+fn zpp_materialize_for_forward(ctx) {
+    let ag = zpp_hp_all_gather(ctx)
+    ag[0]
+}
+
+// ── Comm estimate for a full step (gather + scatter) ──
+fn zpp_step_comm(ctx) {
+    let p = ctx.param_size
+    let w = ctx.world_size
+    let g = ctx.nodes
+
+    // gather leg
+    let mut gather_base = 0
+    if ctx.use_hpZ {
+        gather_base = (p / g) * (g - 1)
+    } else {
+        gather_base = p * (w - 1) / w
+    }
+    let mut gather = 0
+    if ctx.use_qwZ {
+        gather = zpp_q_int8_bytes(gather_base)
+    } else {
+        gather = zpp_fp32_bytes(gather_base)
+    }
+
+    // reduce leg
+    let reduce_base = p * (w - 1) / w
+    let mut reduce = 0
+    if ctx.use_qgZ {
+        reduce = zpp_q_int8_bytes(reduce_base)
+    } else {
+        reduce = zpp_fp32_bytes(reduce_base)
+    }
+
+    ZPPComm {
+        intra_bytes: 0,
+        inter_bytes: gather + reduce,
+        gather_bytes: gather,
+        reduce_bytes: reduce
+    }
+}
+
+// Baseline ZeRO-3 comm (no qwZ, no hpZ, no qgZ) — used as the 4x
+// denominator by the test suite.
+fn zpp_baseline_comm(ctx) {
+    let p = ctx.param_size
+    let w = ctx.world_size
+    let base_leg = p * (w - 1) / w
+    ZPPComm {
+        intra_bytes: 0,
+        inter_bytes: zpp_fp32_bytes(base_leg) * 2,
+        gather_bytes: zpp_fp32_bytes(base_leg),
+        reduce_bytes: zpp_fp32_bytes(base_leg)
+    }
+}
+
+// Ratio: baseline_total / current_total (≥ 1.0 means ZeRO++ saves)
+fn zpp_comm_reduction(ctx) {
+    let base = zpp_baseline_comm(ctx)
+    let cur = zpp_step_comm(ctx)
+    if cur.inter_bytes <= 0 { return 0.0 }
+    (base.inter_bytes * 1.0) / (cur.inter_bytes * 1.0)
+}
+
+// ── Memory accounting ──
+//
+// Per rank holds:
+//   - one shard of params, grads, m, v (4 * P/W floats)
+// Per NODE (not per rank) hpZ adds:
+//   - one full-P replica                (P floats)
+// So per-rank effective memory (averaged over ranks in a node):
+//   4 * P/W + P/K       (hpZ)
+// vs ZeRO-3 baseline:
+//   4 * P/W
+fn zpp_memory_per_rank(ctx, rank) {
+    let w = ctx.world_size
+    let p = ctx.param_size
+    let shard = zpp_shard_size(p, w, rank)
+    let mut base = 4 * shard
+    if ctx.use_hpZ {
+        // hpZ: add one node replica, amortized across the node's K ranks
+        base = base + p / ctx.ranks_per_node
+    }
+    base
+}
+
+fn zpp_memory_baseline_zero3(ctx) {
+    let p = ctx.param_size
+    let w = ctx.world_size
+    4 * (p / w)
+}
+
+// ── Diagnostics ──
+fn zpp_summary(ctx) {
+    println("[zpp] G=" + str(ctx.nodes)
+        + " K=" + str(ctx.ranks_per_node)
+        + " W=" + str(ctx.world_size)
+        + " P=" + str(ctx.param_size)
+        + " qwZ=" + str(ctx.use_qwZ)
+        + " hpZ=" + str(ctx.use_hpZ)
+        + " qgZ=" + str(ctx.use_qgZ)
+        + " t=" + str(ctx.t))
+}
+
+println("[zero_plusplus] loaded — ZeRO++ qwZ/hpZ/qgZ CPU simulation")

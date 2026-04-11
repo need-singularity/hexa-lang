@@ -1,0 +1,610 @@
+// ═══════════════════════════════════════════════════════════════════
+//  test_infini_attention_v2.hexa — Infini-Attention v2 verification
+//
+//  ML roadmap #208 — Infinite-context compressive memory with
+//  delta-rule update. Combines local causal attention on a bounded
+//  segment with a streaming compressive memory summary of all past.
+//
+//  Tests (32):
+//    T01  elu+1 at x=0 equals 1
+//    T02  elu+1 at x=1 equals 2
+//    T03  elu+1 at x=-10 is strictly positive (>0)
+//    T04  phi_vec length matches input
+//    T05  phi_vec all components >= 0
+//    T06  zeros_2d shape [d,d]
+//    T07  initial compressive state M all zero
+//    T08  initial compressive state z all zero
+//    T09  initial compressive state seen == 0
+//    T10  delta_update increments M off-zero with non-zero input
+//    T11  delta_update shape preserved [d,d]
+//    T12  delta_update_z increments z with non-zero input
+//    T13  compressive_retrieve output length == d_head
+//    T14  compressive retrieve on empty M returns all zero
+//    T15  compressive_norm_z >= 1e-10 (never exactly zero)
+//    T16  local_attention output shape [seg_len, d_head]
+//    T17  local softmax row sums to 1.0 (causal row 0)
+//    T18  local attention causal row 0 depends only on token 0
+//    T19  gate strictly inside (0,1) for finite beta
+//    T20  gate at beta=0 equals 0.5
+//    T21  gate saturates to ~1 for large beta
+//    T22  gate saturates to ~0 for very negative beta
+//    T23  combine linearity: g*a + (1-g)*b
+//    T24  combine at gate=1 returns local exactly
+//    T25  combine at gate=0 returns compressive exactly
+//    T26  segment_forward output shape [seg_len, d_head]
+//    T27  segment_forward state seen accumulates
+//    T28  multi_segment_forward output length == total_len
+//    T29  multi_segment_forward output shape per row == d_head
+//    T30  zero inputs -> zero output (deterministic identity)
+//    T31  state accumulates across multiple segments (seen==T)
+//    T32  single-token segment: compressive retrieve is a
+//         deterministic function of that token (repro)
+//
+//  Run: PATH=/Users/ghost/.cargo/bin:$PATH ./hexa self/test_infini_attention_v2.hexa
+// ═══════════════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ═══════════════════════════════════════════════════════════════════
+//  Inlined Infini-Attention v2 implementation (mirror of
+//  self/ml/infini_attention_v2.hexa — kept in-sync, hermetic test)
+// ═══════════════════════════════════════════════════════════════════
+
+fn ia2_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn ia2_max_f(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn ia2_min_i(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn ia2_zeros_1d(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn ia2_zeros_2d(r, c) {
+    let mut m = []
+    for _i in 0..r {
+        let mut row = []
+        for _j in 0..c { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+fn ia2_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    return exp(v)
+}
+
+fn ia2_sigmoid(x) {
+    if x > 20.0 { return 1.0 }
+    if x < -20.0 { return 0.0 }
+    return 1.0 / (1.0 + ia2_exp(0.0 - x))
+}
+
+fn ia2_elu_plus_one(x) {
+    if x >= 0.0 {
+        return x + 1.0
+    }
+    return ia2_exp(x)
+}
+
+fn ia2_phi_vec(vec, d) {
+    let mut out = []
+    for i in 0..d {
+        out = out + [ia2_elu_plus_one(vec[i])]
+    }
+    return out
+}
+
+fn ia2_create_state(d_head) {
+    let s = #{}
+    s["M"] = ia2_zeros_2d(d_head, d_head)
+    s["z"] = ia2_zeros_1d(d_head)
+    s["seen"] = 0
+    return s
+}
+
+fn ia2_state_get_M(state) { return state["M"] }
+fn ia2_state_get_z(state) { return state["z"] }
+fn ia2_state_get_seen(state) { return state["seen"] }
+
+fn ia2_delta_update(M, K_seg, V_seg, seg_len, d_head) {
+    let mut newM = ia2_zeros_2d(d_head, d_head)
+    for a in 0..d_head {
+        for b in 0..d_head {
+            newM[a][b] = M[a][b]
+        }
+    }
+    for i in 0..seg_len {
+        let phi_k = ia2_phi_vec(K_seg[i], d_head)
+        for a in 0..d_head {
+            let pa = phi_k[a]
+            for b in 0..d_head {
+                newM[a][b] = newM[a][b] + pa * V_seg[i][b]
+            }
+        }
+    }
+    return newM
+}
+
+fn ia2_delta_update_z(z, K_seg, seg_len, d_head) {
+    let mut newz = ia2_zeros_1d(d_head)
+    for a in 0..d_head {
+        newz[a] = z[a]
+    }
+    for i in 0..seg_len {
+        let phi_k = ia2_phi_vec(K_seg[i], d_head)
+        for a in 0..d_head {
+            newz[a] = newz[a] + phi_k[a]
+        }
+    }
+    return newz
+}
+
+fn ia2_compressive_retrieve(M, Q, d_head) {
+    let phi_q = ia2_phi_vec(Q, d_head)
+    let mut out = ia2_zeros_1d(d_head)
+    for b in 0..d_head {
+        let mut acc = 0.0
+        for a in 0..d_head {
+            acc = acc + phi_q[a] * M[a][b]
+        }
+        out[b] = acc
+    }
+    return out
+}
+
+fn ia2_compressive_norm(M, Q, d_head) {
+    let phi_q = ia2_phi_vec(Q, d_head)
+    let mut denom = 0.0
+    for a in 0..d_head {
+        let mut row_sum = 0.0
+        for b in 0..d_head {
+            row_sum = row_sum + M[a][b]
+        }
+        denom = denom + phi_q[a] * row_sum
+    }
+    if denom < 1.0e-10 { return 1.0e-10 }
+    return denom
+}
+
+fn ia2_compressive_norm_z(z, Q, d_head) {
+    let phi_q = ia2_phi_vec(Q, d_head)
+    let mut denom = 0.0
+    for a in 0..d_head {
+        denom = denom + phi_q[a] * z[a]
+    }
+    if denom < 1.0e-10 { return 1.0e-10 }
+    return denom
+}
+
+fn ia2_softmax_row(row, n) {
+    let mut m = row[0]
+    for j in 1..n {
+        if row[j] > m { m = row[j] }
+    }
+    let mut exps = ia2_zeros_1d(n)
+    let mut total = 0.0
+    for j in 0..n {
+        let e = ia2_exp(row[j] - m)
+        exps[j] = e
+        total = total + e
+    }
+    let inv = if total > 0.0 { 1.0 / total } else { 0.0 }
+    let mut out = ia2_zeros_1d(n)
+    for j in 0..n {
+        out[j] = exps[j] * inv
+    }
+    return out
+}
+
+fn ia2_local_attention(Q, K, V, seg_len, d_head) {
+    let scale = 1.0 / sqrt(d_head * 1.0)
+    let mut out = ia2_zeros_2d(seg_len, d_head)
+    for i in 0..seg_len {
+        let mut scores = ia2_zeros_1d(seg_len)
+        for j in 0..seg_len {
+            if j > i {
+                scores[j] = 0.0 - 1.0e30
+            } else {
+                let mut dot = 0.0
+                for k in 0..d_head {
+                    dot = dot + Q[i][k] * K[j][k]
+                }
+                scores[j] = dot * scale
+            }
+        }
+        let probs = ia2_softmax_row(scores, seg_len)
+        for b in 0..d_head {
+            let mut acc = 0.0
+            for j in 0..seg_len {
+                acc = acc + probs[j] * V[j][b]
+            }
+            out[i][b] = acc
+        }
+    }
+    return out
+}
+
+fn ia2_gate(beta_logit) {
+    return ia2_sigmoid(beta_logit)
+}
+
+fn ia2_combine(local_vec, compressive_vec, gate) {
+    let n = len(local_vec)
+    let mut out = ia2_zeros_1d(n)
+    let one_minus = 1.0 - gate
+    for i in 0..n {
+        out[i] = gate * local_vec[i] + one_minus * compressive_vec[i]
+    }
+    return out
+}
+
+fn ia2_combine_mat(local_mat, compressive_mat, gate, seg_len, d_head) {
+    let mut out = ia2_zeros_2d(seg_len, d_head)
+    for i in 0..seg_len {
+        out[i] = ia2_combine(local_mat[i], compressive_mat[i], gate)
+    }
+    return out
+}
+
+fn ia2_segment_forward(state, Q_seg, K_seg, V_seg, seg_len, d_head) {
+    let M_cur = ia2_state_get_M(state)
+    let z_cur = ia2_state_get_z(state)
+    let seen = ia2_state_get_seen(state)
+
+    let local_out = ia2_local_attention(Q_seg, K_seg, V_seg, seg_len, d_head)
+
+    let mut comp_out = ia2_zeros_2d(seg_len, d_head)
+    if seen > 0 {
+        for i in 0..seg_len {
+            let num = ia2_compressive_retrieve(M_cur, Q_seg[i], d_head)
+            let den = ia2_compressive_norm_z(z_cur, Q_seg[i], d_head)
+            let inv = 1.0 / den
+            let mut row = ia2_zeros_1d(d_head)
+            for b in 0..d_head {
+                row[b] = num[b] * inv
+            }
+            comp_out[i] = row
+        }
+    }
+
+    let mut g = 0.5
+    if seen == 0 { g = 1.0 }
+    let out = ia2_combine_mat(local_out, comp_out, g, seg_len, d_head)
+
+    let new_M = ia2_delta_update(M_cur, K_seg, V_seg, seg_len, d_head)
+    let new_z = ia2_delta_update_z(z_cur, K_seg, seg_len, d_head)
+
+    let new_state = #{}
+    new_state["M"] = new_M
+    new_state["z"] = new_z
+    new_state["seen"] = seen + seg_len
+
+    return [out, new_state]
+}
+
+fn ia2_multi_segment_forward(Q, K, V, seg_size, total_len, d_head) {
+    let mut state = ia2_create_state(d_head)
+    let mut out = []
+    let mut s = 0
+    while s < total_len {
+        let remain = total_len - s
+        let this_seg = ia2_min_i(seg_size, remain)
+        let mut Qs = []
+        let mut Ks = []
+        let mut Vs = []
+        for i in 0..this_seg {
+            Qs = Qs + [Q[s + i]]
+            Ks = Ks + [K[s + i]]
+            Vs = Vs + [V[s + i]]
+        }
+        let res = ia2_segment_forward(state, Qs, Ks, Vs, this_seg, d_head)
+        let seg_out = res[0]
+        state = res[1]
+        for i in 0..this_seg {
+            out = out + [seg_out[i]]
+        }
+        s = s + this_seg
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Test fixtures
+// ═══════════════════════════════════════════════════════════════════
+
+let D = 4
+let SEG = 3
+let TOTAL = 6
+
+// Deterministic small matrices with [seq_len, d_head] shape.
+fn build_seq(n, d, seed) {
+    let mut out = []
+    for i in 0..n {
+        let mut row = []
+        for k in 0..d {
+            let h = ((i * 17 + k * 31 + seed * 7) % 13) - 6
+            row = row + [to_float(h) * 0.1]
+        }
+        out = out + [row]
+    }
+    return out
+}
+
+fn zero_seq(n, d) {
+    let mut out = []
+    for _i in 0..n {
+        let mut row = []
+        for _k in 0..d { row = row + [0.0] }
+        out = out + [row]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Tests
+// ═══════════════════════════════════════════════════════════════════
+
+// T01: elu+1 at x=0 equals 1
+check("T01 elu+1(0) == 1.0", approx(ia2_elu_plus_one(0.0), 1.0, 1.0e-6))
+
+// T02: elu+1 at x=1 equals 2
+check("T02 elu+1(1) == 2.0", approx(ia2_elu_plus_one(1.0), 2.0, 1.0e-6))
+
+// T03: elu+1 at x=-10 strictly positive
+let em10 = ia2_elu_plus_one(-10.0)
+check("T03 elu+1(-10) > 0", em10 > 0.0)
+
+// T04: phi_vec length matches input
+let pv_in = [0.5, -0.2, 1.3, -0.7]
+let pv_out = ia2_phi_vec(pv_in, 4)
+check("T04 phi_vec length == 4", len(pv_out) == 4)
+
+// T05: phi_vec all components >= 0
+let mut all_nonneg = true
+for i in 0..4 {
+    if pv_out[i] < 0.0 { all_nonneg = false }
+}
+check("T05 phi_vec all >= 0", all_nonneg)
+
+// T06: zeros_2d shape [d,d]
+let z2 = ia2_zeros_2d(4, 4)
+check("T06 zeros_2d shape 4x4", len(z2) == 4 && len(z2[0]) == 4)
+
+// T07: initial M all zero
+let st0 = ia2_create_state(D)
+let M0 = ia2_state_get_M(st0)
+let mut m_all_zero = true
+for a in 0..D {
+    for b in 0..D {
+        if fabs(M0[a][b]) > 1.0e-12 { m_all_zero = false }
+    }
+}
+check("T07 initial M all zero", m_all_zero)
+
+// T08: initial z all zero
+let z0 = ia2_state_get_z(st0)
+let mut z_all_zero = true
+for a in 0..D {
+    if fabs(z0[a]) > 1.0e-12 { z_all_zero = false }
+}
+check("T08 initial z all zero", z_all_zero)
+
+// T09: initial seen == 0
+check("T09 initial seen == 0", ia2_state_get_seen(st0) == 0)
+
+// T10: delta_update increments M off zero
+let Kseg_t10 = build_seq(SEG, D, 1)
+let Vseg_t10 = build_seq(SEG, D, 2)
+let M1 = ia2_delta_update(M0, Kseg_t10, Vseg_t10, SEG, D)
+let mut any_nonzero = false
+for a in 0..D {
+    for b in 0..D {
+        if fabs(M1[a][b]) > 1.0e-9 { any_nonzero = true }
+    }
+}
+check("T10 delta_update M non-zero", any_nonzero)
+
+// T11: delta_update shape preserved
+check("T11 delta_update shape DxD", len(M1) == D && len(M1[0]) == D)
+
+// T12: delta_update_z increments z
+let z1 = ia2_delta_update_z(z0, Kseg_t10, SEG, D)
+let mut z_any = false
+for a in 0..D {
+    if z1[a] > 1.0e-9 { z_any = true }
+}
+check("T12 delta_update_z z non-zero", z_any)
+
+// T13: compressive_retrieve output length == d_head
+let Qprobe = [0.3, -0.1, 0.5, -0.2]
+let ret1 = ia2_compressive_retrieve(M1, Qprobe, D)
+check("T13 compressive_retrieve length == D", len(ret1) == D)
+
+// T14: compressive_retrieve on empty M returns zeros
+let ret_empty = ia2_compressive_retrieve(M0, Qprobe, D)
+let mut ret_zero = true
+for b in 0..D {
+    if fabs(ret_empty[b]) > 1.0e-12 { ret_zero = false }
+}
+check("T14 compressive_retrieve on empty M == 0", ret_zero)
+
+// T15: compressive_norm_z >= 1e-10
+let norm_empty = ia2_compressive_norm_z(z0, Qprobe, D)
+let norm_full = ia2_compressive_norm_z(z1, Qprobe, D)
+check("T15 compressive_norm_z >= 1e-10", norm_empty >= 1.0e-10 && norm_full >= 1.0e-10)
+
+// T16: local_attention output shape
+let Q_t16 = build_seq(SEG, D, 3)
+let K_t16 = build_seq(SEG, D, 4)
+let V_t16 = build_seq(SEG, D, 5)
+let la = ia2_local_attention(Q_t16, K_t16, V_t16, SEG, D)
+check("T16 local_attention shape [SEG, D]", len(la) == SEG && len(la[0]) == D)
+
+// T17: softmax row sums to 1 (verify via direct softmax of causal row 0 scores)
+// Row 0 under causal mask: position 0 valid, rest = -1e30, softmax collapses
+// to [1.0, 0, 0]. We instead test a plain row to ensure softmax is correct.
+let row_probs = ia2_softmax_row([1.0, 2.0, 3.0, 0.5], 4)
+let mut s_sum = 0.0
+for j in 0..4 { s_sum = s_sum + row_probs[j] }
+check("T17 softmax row sums to 1.0", approx(s_sum, 1.0, 1.0e-6))
+
+// T18: causal row 0 equals V[0] exactly (only valid key is itself)
+let mut row0_match = true
+for b in 0..D {
+    if fabs(la[0][b] - V_t16[0][b]) > 1.0e-5 { row0_match = false }
+}
+check("T18 causal row 0 == V[0] (self only)", row0_match)
+
+// T19: gate strictly inside (0,1)
+let g1 = ia2_gate(0.5)
+check("T19 gate in (0,1)", g1 > 0.0 && g1 < 1.0)
+
+// T20: gate at beta=0 equals 0.5
+let g0 = ia2_gate(0.0)
+check("T20 gate(0) == 0.5", approx(g0, 0.5, 1.0e-6))
+
+// T21: gate saturates to ~1 for large positive beta
+let g_big = ia2_gate(50.0)
+check("T21 gate(large) ~ 1", approx(g_big, 1.0, 1.0e-6))
+
+// T22: gate saturates to ~0 for very negative beta
+let g_neg = ia2_gate(-50.0)
+check("T22 gate(-large) ~ 0", approx(g_neg, 0.0, 1.0e-6))
+
+// T23: combine linearity g*a + (1-g)*b
+let a_vec = [1.0, 2.0, 3.0, 4.0]
+let b_vec = [5.0, 6.0, 7.0, 8.0]
+let g_mid = 0.3
+let comb = ia2_combine(a_vec, b_vec, g_mid)
+let mut lin_ok = true
+for i in 0..4 {
+    let expected = g_mid * a_vec[i] + (1.0 - g_mid) * b_vec[i]
+    if fabs(comb[i] - expected) > 1.0e-6 { lin_ok = false }
+}
+check("T23 combine linear g*a + (1-g)*b", lin_ok)
+
+// T24: combine at gate=1 returns local exactly
+let comb1 = ia2_combine(a_vec, b_vec, 1.0)
+let mut eq_a = true
+for i in 0..4 {
+    if fabs(comb1[i] - a_vec[i]) > 1.0e-6 { eq_a = false }
+}
+check("T24 combine gate=1 == local", eq_a)
+
+// T25: combine at gate=0 returns compressive exactly
+let comb0 = ia2_combine(a_vec, b_vec, 0.0)
+let mut eq_b = true
+for i in 0..4 {
+    if fabs(comb0[i] - b_vec[i]) > 1.0e-6 { eq_b = false }
+}
+check("T25 combine gate=0 == compressive", eq_b)
+
+// T26: segment_forward output shape
+let Q_t26 = build_seq(SEG, D, 10)
+let K_t26 = build_seq(SEG, D, 11)
+let V_t26 = build_seq(SEG, D, 12)
+let sf = ia2_segment_forward(ia2_create_state(D), Q_t26, K_t26, V_t26, SEG, D)
+let sf_out = sf[0]
+check("T26 segment_forward shape [SEG, D]", len(sf_out) == SEG && len(sf_out[0]) == D)
+
+// T27: segment_forward state seen accumulates
+let sf_state = sf[1]
+check("T27 state.seen == SEG after 1 segment", ia2_state_get_seen(sf_state) == SEG)
+
+// T28: multi_segment_forward output length == total_len
+let Q_t28 = build_seq(TOTAL, D, 20)
+let K_t28 = build_seq(TOTAL, D, 21)
+let V_t28 = build_seq(TOTAL, D, 22)
+let ms_out = ia2_multi_segment_forward(Q_t28, K_t28, V_t28, SEG, TOTAL, D)
+check("T28 multi_segment output length == TOTAL", len(ms_out) == TOTAL)
+
+// T29: multi_segment_forward per-row shape == d_head
+let mut row_shape_ok = true
+for i in 0..TOTAL {
+    if len(ms_out[i]) != D { row_shape_ok = false }
+}
+check("T29 multi_segment per-row length == D", row_shape_ok)
+
+// T30: zero inputs -> zero output
+let Z = zero_seq(TOTAL, D)
+let z_out = ia2_multi_segment_forward(Z, Z, Z, SEG, TOTAL, D)
+let mut z_out_zero = true
+for i in 0..TOTAL {
+    for b in 0..D {
+        if fabs(z_out[i][b]) > 1.0e-9 { z_out_zero = false }
+    }
+}
+check("T30 zero inputs -> zero output", z_out_zero)
+
+// T31: state accumulates over multiple segments
+let mut state_acc = ia2_create_state(D)
+let mut seen_total = 0
+for seg_idx in 0..3 {
+    let Kseg = build_seq(SEG, D, 30 + seg_idx)
+    let Vseg = build_seq(SEG, D, 40 + seg_idx)
+    let Qseg = build_seq(SEG, D, 50 + seg_idx)
+    let r = ia2_segment_forward(state_acc, Qseg, Kseg, Vseg, SEG, D)
+    state_acc = r[1]
+    seen_total = seen_total + SEG
+}
+check("T31 state.seen accumulates across segments", ia2_state_get_seen(state_acc) == seen_total)
+
+// T32: single-token segment, compressive retrieve is a deterministic
+// function of that token. Run twice, expect identical output.
+let Qone = [[0.3, -0.1, 0.5, -0.2]]
+let Kone = [[0.1, 0.2, -0.3, 0.4]]
+let Vone = [[0.5, 0.6, 0.7, 0.8]]
+
+// First, prime state with a different segment so compressive path is active.
+let prime_state = ia2_create_state(D)
+let Kp = build_seq(SEG, D, 61)
+let Vp = build_seq(SEG, D, 62)
+let Qp = build_seq(SEG, D, 63)
+let rp = ia2_segment_forward(prime_state, Qp, Kp, Vp, SEG, D)
+let state_primed = rp[1]
+
+let r_a = ia2_segment_forward(state_primed, Qone, Kone, Vone, 1, D)
+let r_b = ia2_segment_forward(state_primed, Qone, Kone, Vone, 1, D)
+let out_a = r_a[0]
+let out_b = r_b[0]
+let mut det_ok = true
+for b in 0..D {
+    if fabs(out_a[0][b] - out_b[0][b]) > 1.0e-9 { det_ok = false }
+}
+check("T32 single-token compressive deterministic", det_ok)
+
+// ═══════════════════════════════════════════════════════════════════
+println("")
+println("=== infini_attention_v2 test summary ===")
+println("PASS: " + str(pass_count))
+println("FAIL: " + str(fail_count))
+println("TOTAL: " + str(pass_count + fail_count))

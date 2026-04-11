@@ -1,0 +1,1048 @@
+// ===================================================================
+//  test_mps_kernel_fusion.hexa — MPSGraph-style Kernel Fusion (#203)
+//
+//  ML roadmap #203 — MPSGraph multi-op fusion
+//                    (matmul + bias + activation into one fused op)
+//
+//  Tests (40):
+//    T1  mpskf_relu(1) = 1
+//    T2  mpskf_relu(-1) = 0
+//    T3  mpskf_relu(0) = 0
+//    T4  mpskf_silu(0) = 0
+//    T5  mpskf_gelu(0) = 0
+//    T6  mpskf_gelu monotonic on positive region
+//    T7  mpskf_tanh(0) = 0
+//    T8  mpskf_layernorm mean ~ 0
+//    T9  mpskf_layernorm std ~ 1
+//    T10 new_graph has empty ops/inputs/output
+//    T11 add_input records declared placeholder
+//    T12 add_matmul appends matmul op
+//    T13 add_bias appends bias op
+//    T14 add_activation appends activation op
+//    T15 add_layernorm appends layernorm op
+//    T16 set_output marks graph output
+//    T17 count_ops before compile (3 ops: mm,bias,relu)
+//    T18 count_fused_ops after compile (1 fused_linear)
+//    T19 count_fused_ops <= count_ops (fusion does not grow)
+//    T20 matmul-only graph execute == manual matmul
+//    T21 matmul + bias fused == manual chain
+//    T22 matmul + bias + relu fused == manual chain
+//    T23 matmul + bias + gelu fused == manual chain
+//    T24 matmul + bias + silu fused == manual chain
+//    T25 fused vs raw produce identical output
+//    T26 fusion reduces matmul+bias+activation count (3 -> 1)
+//    T27 layernorm op execute correct
+//    T28 layernorm gamma=1 beta=0 ~ zero mean
+//    T29 fusion idempotent: compile(compile(g)) == compile(g)
+//    T30 compile preserves output name
+//    T31 compile preserves inputs declaration
+//    T32 empty graph -> error
+//    T33 graph with no output set -> error
+//    T34 output name not in graph -> error
+//    T35 execute missing input -> error
+//    T36 unknown activation kind -> error
+//    T37 execute on compiled graph with wrong input missing -> error
+//    T38 two parallel matmul outputs consumed separately: no fusion
+//    T39 fused_linear handles gelu on positive output
+//    T40 deep chain (matmul + bias + tanh) final value matches manual
+//
+//  Run: PATH=/Users/ghost/.cargo/bin:$PATH ./hexa self/test_mps_kernel_fusion.hexa
+// ===================================================================
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ===================================================================
+//  Inlined module (mirrors self/ml/mps_kernel_fusion.hexa)
+// ===================================================================
+
+fn mpskf_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn mpskf_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn mpskf_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn mpskf_tanh_scalar(x) {
+    if x > 10.0 { return 1.0 }
+    if x < -10.0 { return 0.0 - 1.0 }
+    let e2 = mpskf_exp(2.0 * x)
+    return (e2 - 1.0) / (e2 + 1.0)
+}
+
+fn mpskf_relu(x) {
+    if x > 0.0 { return x }
+    return 0.0
+}
+
+fn mpskf_gelu(x) {
+    let c = 0.7978845608028654
+    let k = 0.044715
+    let x3 = x * x * x
+    let inner = c * (x + k * x3)
+    let t = mpskf_tanh_scalar(inner)
+    return 0.5 * x * (1.0 + t)
+}
+
+fn mpskf_silu(x) {
+    return x / (1.0 + mpskf_exp(0.0 - x))
+}
+
+fn mpskf_tanh(x) {
+    return mpskf_tanh_scalar(x)
+}
+
+fn mpskf_layernorm(x, gamma, beta, eps, n) {
+    let mut sum = 0.0
+    for i in 0..n {
+        sum = sum + x[i]
+    }
+    let mean = sum / to_float(n)
+
+    let mut var_sum = 0.0
+    for i in 0..n {
+        let d = x[i] - mean
+        var_sum = var_sum + d * d
+    }
+    let variance = var_sum / to_float(n)
+    let inv_std = 1.0 / mpskf_sqrt(variance + eps)
+
+    let mut out = []
+    for i in 0..n {
+        let x_hat = (x[i] - mean) * inv_std
+        out = out + [x_hat * gamma[i] + beta[i]]
+    }
+    return out
+}
+
+fn mpskf_apply_activation(x, kind, n) {
+    if kind == "relu" {
+        let mut out = []
+        for i in 0..n { out = out + [mpskf_relu(x[i])] }
+        return out
+    }
+    if kind == "gelu" {
+        let mut out = []
+        for i in 0..n { out = out + [mpskf_gelu(x[i])] }
+        return out
+    }
+    if kind == "silu" {
+        let mut out = []
+        for i in 0..n { out = out + [mpskf_silu(x[i])] }
+        return out
+    }
+    if kind == "tanh" {
+        let mut out = []
+        for i in 0..n { out = out + [mpskf_tanh(x[i])] }
+        return out
+    }
+    return []
+}
+
+fn mpskf_is_valid_activation(kind) {
+    if kind == "relu" { return true }
+    if kind == "gelu" { return true }
+    if kind == "silu" { return true }
+    if kind == "tanh" { return true }
+    return false
+}
+
+fn mpskf_matmul(a, b, M, K, N) {
+    let mut out = []
+    for _i in 0..(M * N) { out = out + [0.0] }
+    for i in 0..M {
+        for j in 0..N {
+            let mut s = 0.0
+            for k in 0..K {
+                s = s + a[i * K + k] * b[k * N + j]
+            }
+            out[i * N + j] = s
+        }
+    }
+    return out
+}
+
+fn mpskf_bias_broadcast(x, bias, M, N) {
+    let mut out = []
+    for _i in 0..(M * N) { out = out + [0.0] }
+    for i in 0..M {
+        for j in 0..N {
+            out[i * N + j] = x[i * N + j] + bias[j]
+        }
+    }
+    return out
+}
+
+// ── graph construction ────────────────────────────────────────
+
+fn mpskf_new_graph() {
+    return #{
+        "ops": [],
+        "inputs": #{},
+        "output": "",
+        "compiled": false
+    }
+}
+
+fn mpskf_add_input(g, name, shape) {
+    let mut inputs = g["inputs"]
+    inputs[name] = shape
+    g["inputs"] = inputs
+    let op = #{
+        "kind": "input",
+        "name": name,
+        "a": "",
+        "b": "",
+        "bias": "",
+        "gamma": "",
+        "beta": "",
+        "activation": "",
+        "M": 0,
+        "K": 0,
+        "N": shape,
+        "eps": 0.0,
+        "n": shape
+    }
+    let ops = g["ops"] + [op]
+    g["ops"] = ops
+    return g
+}
+
+fn mpskf_add_matmul(g, name, a, b, M, K, N) {
+    let op = #{
+        "kind": "matmul",
+        "name": name,
+        "a": a,
+        "b": b,
+        "bias": "",
+        "gamma": "",
+        "beta": "",
+        "activation": "",
+        "M": M,
+        "K": K,
+        "N": N,
+        "eps": 0.0,
+        "n": M * N
+    }
+    let ops = g["ops"] + [op]
+    g["ops"] = ops
+    return g
+}
+
+fn mpskf_add_bias(g, name, x, bias) {
+    let ops_prev = g["ops"]
+    let mut M = 1
+    let mut N = 1
+    for i in 0..len(ops_prev) {
+        if ops_prev[i]["name"] == x {
+            M = ops_prev[i]["M"]
+            N = ops_prev[i]["N"]
+        }
+    }
+    let op = #{
+        "kind": "bias",
+        "name": name,
+        "a": x,
+        "b": "",
+        "bias": bias,
+        "gamma": "",
+        "beta": "",
+        "activation": "",
+        "M": M,
+        "K": 0,
+        "N": N,
+        "eps": 0.0,
+        "n": M * N
+    }
+    let ops = g["ops"] + [op]
+    g["ops"] = ops
+    return g
+}
+
+fn mpskf_add_activation(g, name, x, kind) {
+    let ops_prev = g["ops"]
+    let mut M = 1
+    let mut N = 1
+    for i in 0..len(ops_prev) {
+        if ops_prev[i]["name"] == x {
+            M = ops_prev[i]["M"]
+            N = ops_prev[i]["N"]
+        }
+    }
+    let op = #{
+        "kind": "activation",
+        "name": name,
+        "a": x,
+        "b": "",
+        "bias": "",
+        "gamma": "",
+        "beta": "",
+        "activation": kind,
+        "M": M,
+        "K": 0,
+        "N": N,
+        "eps": 0.0,
+        "n": M * N
+    }
+    let ops = g["ops"] + [op]
+    g["ops"] = ops
+    return g
+}
+
+fn mpskf_add_layernorm(g, name, x, gamma, beta, eps, n) {
+    let op = #{
+        "kind": "layernorm",
+        "name": name,
+        "a": x,
+        "b": "",
+        "bias": "",
+        "gamma": gamma,
+        "beta": beta,
+        "activation": "",
+        "M": 1,
+        "K": 0,
+        "N": n,
+        "eps": eps,
+        "n": n
+    }
+    let ops = g["ops"] + [op]
+    g["ops"] = ops
+    return g
+}
+
+fn mpskf_set_output(g, name) {
+    g["output"] = name
+    return g
+}
+
+fn mpskf_count_ops(g) {
+    let ops = g["ops"]
+    let mut c = 0
+    for i in 0..len(ops) {
+        if ops[i]["kind"] != "input" {
+            c = c + 1
+        }
+    }
+    return c
+}
+
+fn mpskf_count_fused_ops(compiled) {
+    return mpskf_count_ops(compiled)
+}
+
+fn mpskf_consumer_count(ops, tensor_name) {
+    let mut c = 0
+    for i in 0..len(ops) {
+        let op = ops[i]
+        if op["a"] == tensor_name { c = c + 1 }
+        if op["b"] == tensor_name { c = c + 1 }
+    }
+    return c
+}
+
+fn mpskf_compile(g) {
+    let ops = g["ops"]
+    let n_ops = len(ops)
+    let mut fused_ops = []
+    let mut i = 0
+    while i < n_ops {
+        let op = ops[i]
+        let k = op["kind"]
+
+        if k == "input" {
+            fused_ops = fused_ops + [op]
+            i = i + 1
+            continue
+        }
+        if k == "layernorm" {
+            fused_ops = fused_ops + [op]
+            i = i + 1
+            continue
+        }
+        if k == "fused_linear" {
+            fused_ops = fused_ops + [op]
+            i = i + 1
+            continue
+        }
+
+        if k == "matmul" {
+            let mm_name = op["name"]
+            let mut has_bias = false
+            let mut bias_name = ""
+            let mut bias_tensor = ""
+            let mut next_out_name = mm_name
+            let mut next_i = i + 1
+            if next_i < n_ops {
+                let n1 = ops[next_i]
+                let only_one = mpskf_consumer_count(ops, mm_name) == 1
+                if n1["kind"] == "bias" {
+                    if n1["a"] == mm_name {
+                        if only_one {
+                            has_bias = true
+                            bias_name = n1["name"]
+                            bias_tensor = n1["bias"]
+                            next_out_name = bias_name
+                            next_i = next_i + 1
+                        }
+                    }
+                }
+            }
+
+            let mut has_act = false
+            let mut act_kind = ""
+            let mut act_name = ""
+            if next_i < n_ops {
+                let n2 = ops[next_i]
+                let parent = next_out_name
+                let only_one2 = mpskf_consumer_count(ops, parent) == 1
+                if n2["kind"] == "activation" {
+                    if n2["a"] == parent {
+                        if only_one2 {
+                            has_act = true
+                            act_kind = n2["activation"]
+                            act_name = n2["name"]
+                            next_out_name = act_name
+                            next_i = next_i + 1
+                        }
+                    }
+                }
+            }
+
+            if has_bias || has_act {
+                let mut final_name = mm_name
+                if has_bias { final_name = bias_name }
+                if has_act { final_name = act_name }
+                let fused = #{
+                    "kind": "fused_linear",
+                    "name": final_name,
+                    "a": op["a"],
+                    "b": op["b"],
+                    "bias": bias_tensor,
+                    "gamma": "",
+                    "beta": "",
+                    "activation": act_kind,
+                    "M": op["M"],
+                    "K": op["K"],
+                    "N": op["N"],
+                    "eps": 0.0,
+                    "n": op["M"] * op["N"]
+                }
+                fused_ops = fused_ops + [fused]
+                i = next_i
+                continue
+            }
+
+            fused_ops = fused_ops + [op]
+            i = i + 1
+            continue
+        }
+
+        fused_ops = fused_ops + [op]
+        i = i + 1
+    }
+
+    let compiled = #{
+        "ops": fused_ops,
+        "inputs": g["inputs"],
+        "output": g["output"],
+        "compiled": true
+    }
+    return compiled
+}
+
+fn mpskf_make_error(msg) {
+    return #{"ok": false, "error": msg, "value": []}
+}
+
+fn mpskf_make_ok(v) {
+    return #{"ok": true, "error": "", "value": v}
+}
+
+fn mpskf_exec_op(op, tensors, inputs) {
+    let k = op["kind"]
+    let name = op["name"]
+
+    if k == "input" {
+        if has_key(inputs, name) == false {
+            return mpskf_make_error("missing input: " + name)
+        }
+        let v = inputs[name]
+        return mpskf_make_ok(v)
+    }
+
+    if k == "matmul" {
+        let a_name = op["a"]
+        let b_name = op["b"]
+        if has_key(tensors, a_name) == false {
+            return mpskf_make_error("matmul missing operand: " + a_name)
+        }
+        if has_key(tensors, b_name) == false {
+            return mpskf_make_error("matmul missing operand: " + b_name)
+        }
+        let a_val = tensors[a_name]
+        let b_val = tensors[b_name]
+        let M = op["M"]
+        let K = op["K"]
+        let N = op["N"]
+        let out = mpskf_matmul(a_val, b_val, M, K, N)
+        return mpskf_make_ok(out)
+    }
+
+    if k == "bias" {
+        let x_name = op["a"]
+        let bias_name = op["bias"]
+        if has_key(tensors, x_name) == false {
+            return mpskf_make_error("bias missing operand: " + x_name)
+        }
+        if has_key(tensors, bias_name) == false {
+            return mpskf_make_error("bias missing operand: " + bias_name)
+        }
+        let x_val = tensors[x_name]
+        let bias_val = tensors[bias_name]
+        let M = op["M"]
+        let N = op["N"]
+        let out = mpskf_bias_broadcast(x_val, bias_val, M, N)
+        return mpskf_make_ok(out)
+    }
+
+    if k == "activation" {
+        let x_name = op["a"]
+        if has_key(tensors, x_name) == false {
+            return mpskf_make_error("activation missing operand: " + x_name)
+        }
+        let kind = op["activation"]
+        if mpskf_is_valid_activation(kind) == false {
+            return mpskf_make_error("unknown activation: " + kind)
+        }
+        let x_val = tensors[x_name]
+        let n = op["n"]
+        let out = mpskf_apply_activation(x_val, kind, n)
+        return mpskf_make_ok(out)
+    }
+
+    if k == "layernorm" {
+        let x_name = op["a"]
+        let gamma_name = op["gamma"]
+        let beta_name = op["beta"]
+        if has_key(tensors, x_name) == false {
+            return mpskf_make_error("layernorm missing x: " + x_name)
+        }
+        if has_key(tensors, gamma_name) == false {
+            return mpskf_make_error("layernorm missing gamma: " + gamma_name)
+        }
+        if has_key(tensors, beta_name) == false {
+            return mpskf_make_error("layernorm missing beta: " + beta_name)
+        }
+        let x_val = tensors[x_name]
+        let g_val = tensors[gamma_name]
+        let b_val = tensors[beta_name]
+        let out = mpskf_layernorm(x_val, g_val, b_val, op["eps"], op["n"])
+        return mpskf_make_ok(out)
+    }
+
+    if k == "fused_linear" {
+        let a_name = op["a"]
+        let b_name = op["b"]
+        if has_key(tensors, a_name) == false {
+            return mpskf_make_error("fused_linear missing operand: " + a_name)
+        }
+        if has_key(tensors, b_name) == false {
+            return mpskf_make_error("fused_linear missing operand: " + b_name)
+        }
+        let a_val = tensors[a_name]
+        let b_val = tensors[b_name]
+        let M = op["M"]
+        let K = op["K"]
+        let N = op["N"]
+        let mm_out = mpskf_matmul(a_val, b_val, M, K, N)
+
+        let mut cur = mm_out
+        let bias_name = op["bias"]
+        if bias_name != "" {
+            if has_key(tensors, bias_name) == false {
+                return mpskf_make_error("fused_linear missing bias: " + bias_name)
+            }
+            let bias_val = tensors[bias_name]
+            cur = mpskf_bias_broadcast(cur, bias_val, M, N)
+        }
+        let act = op["activation"]
+        if act != "" {
+            if mpskf_is_valid_activation(act) == false {
+                return mpskf_make_error("unknown activation: " + act)
+            }
+            cur = mpskf_apply_activation(cur, act, M * N)
+        }
+        return mpskf_make_ok(cur)
+    }
+
+    return mpskf_make_error("unknown op kind: " + k)
+}
+
+fn mpskf_execute(g, inputs) {
+    let ops = g["ops"]
+    let n_ops = len(ops)
+    if n_ops == 0 {
+        return mpskf_make_error("empty graph")
+    }
+    let out_name = g["output"]
+    if out_name == "" {
+        return mpskf_make_error("no output set")
+    }
+
+    let mut tensors = #{}
+    let k_in = keys(inputs)
+    for i in 0..len(k_in) {
+        tensors[k_in[i]] = inputs[k_in[i]]
+    }
+
+    let declared = keys(g["inputs"])
+    for i in 0..len(declared) {
+        if has_key(tensors, declared[i]) == false {
+            return mpskf_make_error("missing input: " + declared[i])
+        }
+    }
+
+    let mut output_found = false
+    for i in 0..n_ops {
+        if ops[i]["name"] == out_name {
+            output_found = true
+        }
+    }
+    if output_found == false {
+        return mpskf_make_error("output not in graph: " + out_name)
+    }
+
+    for i in 0..n_ops {
+        let res = mpskf_exec_op(ops[i], tensors, inputs)
+        if res["ok"] == false {
+            return res
+        }
+        tensors[ops[i]["name"]] = res["value"]
+    }
+
+    if has_key(tensors, out_name) == false {
+        return mpskf_make_error("output tensor missing after run: " + out_name)
+    }
+    return mpskf_make_ok(tensors[out_name])
+}
+
+// ===================================================================
+//  Test fixtures
+// ===================================================================
+
+// (1,6) input
+let FIX_X = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+
+// (6,4) weight, row-major
+let FIX_W = [0.1, 0.2, 0.3, 0.4,
+             0.2, 0.3, 0.4, 0.5,
+             0.3, 0.4, 0.5, 0.6,
+             0.4, 0.5, 0.6, 0.7,
+             0.5, 0.6, 0.7, 0.8,
+             0.6, 0.7, 0.8, 0.9]
+// bias (4,)
+let FIX_B = [0.5, -0.5, 1.0, -1.0]
+
+// Manual-chain reference values
+let manual_mm = mpskf_matmul(FIX_X, FIX_W, 1, 6, 4)
+let manual_mb = mpskf_bias_broadcast(manual_mm, FIX_B, 1, 4)
+
+fn manual_act_chain(kind) {
+    return mpskf_apply_activation(manual_mb, kind, 4)
+}
+
+// ===================================================================
+//  Tests
+// ===================================================================
+
+// T1: relu(1) = 1
+check("T1 relu(1) = 1", approx(mpskf_relu(1.0), 1.0, 1.0e-9))
+
+// T2: relu(-1) = 0
+check("T2 relu(-1) = 0", approx(mpskf_relu(0.0 - 1.0), 0.0, 1.0e-9))
+
+// T3: relu(0) = 0
+check("T3 relu(0) = 0", approx(mpskf_relu(0.0), 0.0, 1.0e-9))
+
+// T4: silu(0) = 0
+check("T4 silu(0) = 0", approx(mpskf_silu(0.0), 0.0, 1.0e-6))
+
+// T5: gelu(0) = 0
+check("T5 gelu(0) = 0", approx(mpskf_gelu(0.0), 0.0, 1.0e-6))
+
+// T6: gelu monotonic on positive region
+let g1 = mpskf_gelu(0.5)
+let g2 = mpskf_gelu(1.0)
+let g3 = mpskf_gelu(2.0)
+let g4 = mpskf_gelu(3.0)
+check("T6 gelu monotonic on positive", (g2 > g1) && (g3 > g2) && (g4 > g3))
+
+// T7: tanh(0) = 0
+check("T7 tanh(0) = 0", approx(mpskf_tanh(0.0), 0.0, 1.0e-6))
+
+// T8: layernorm mean ~ 0
+let ln_x = [1.0, 2.0, 3.0, 4.0, 5.0]
+let ln_gamma = [1.0, 1.0, 1.0, 1.0, 1.0]
+let ln_beta = [0.0, 0.0, 0.0, 0.0, 0.0]
+let ln_out = mpskf_layernorm(ln_x, ln_gamma, ln_beta, 1.0e-5, 5)
+let mut ln_sum = 0.0
+for i in 0..5 { ln_sum = ln_sum + ln_out[i] }
+let ln_mean = ln_sum / 5.0
+check("T8 layernorm mean ~ 0", approx(ln_mean, 0.0, 1.0e-5))
+
+// T9: layernorm std ~ 1
+let mut ln_var = 0.0
+for i in 0..5 {
+    let d = ln_out[i] - ln_mean
+    ln_var = ln_var + d * d
+}
+ln_var = ln_var / 5.0
+let ln_std = mpskf_sqrt(ln_var)
+check("T9 layernorm std ~ 1", approx(ln_std, 1.0, 1.0e-3))
+
+// T10: new_graph structure
+let empty_g = mpskf_new_graph()
+let empty_ops = empty_g["ops"]
+let empty_out = empty_g["output"]
+check("T10 new_graph empty", len(empty_ops) == 0 && empty_out == "")
+
+// T11: add_input registers placeholder
+let mut g_in = mpskf_new_graph()
+g_in = mpskf_add_input(g_in, "x", 6)
+let g_in_inputs = g_in["inputs"]
+check("T11 add_input declared", has_key(g_in_inputs, "x") && len(g_in["ops"]) == 1)
+
+// T12: add_matmul appends
+let mut g_mm = mpskf_new_graph()
+g_mm = mpskf_add_input(g_mm, "x", 6)
+g_mm = mpskf_add_matmul(g_mm, "mm", "x", "W", 1, 6, 4)
+let mm_ops = g_mm["ops"]
+check("T12 add_matmul appends", len(mm_ops) == 2 && mm_ops[1]["kind"] == "matmul")
+
+// T13: add_bias appends
+let mut g_mb = g_mm
+g_mb = mpskf_add_bias(g_mb, "mb", "mm", "B")
+let mb_ops = g_mb["ops"]
+check("T13 add_bias appends", len(mb_ops) == 3 && mb_ops[2]["kind"] == "bias")
+
+// T14: add_activation appends
+let mut g_mba = g_mb
+g_mba = mpskf_add_activation(g_mba, "mba", "mb", "relu")
+let mba_ops = g_mba["ops"]
+check("T14 add_activation appends", len(mba_ops) == 4 && mba_ops[3]["kind"] == "activation")
+
+// T15: add_layernorm appends
+let mut g_ln = mpskf_new_graph()
+g_ln = mpskf_add_input(g_ln, "x", 5)
+g_ln = mpskf_add_layernorm(g_ln, "ln", "x", "G", "Bt", 1.0e-5, 5)
+let ln_ops = g_ln["ops"]
+check("T15 add_layernorm appends", len(ln_ops) == 2 && ln_ops[1]["kind"] == "layernorm")
+
+// T16: set_output marks output
+let mut g_so = g_mba
+g_so = mpskf_set_output(g_so, "mba")
+check("T16 set_output marks", g_so["output"] == "mba")
+
+// T17: count_ops = 3 (mm, bias, relu — excludes input placeholder)
+check("T17 count_ops = 3", mpskf_count_ops(g_so) == 3)
+
+// T18: count_fused_ops = 1 after compile
+let compiled_mba = mpskf_compile(g_so)
+check("T18 count_fused_ops = 1", mpskf_count_fused_ops(compiled_mba) == 1)
+
+// T19: fused <= original
+check("T19 fused <= original", mpskf_count_fused_ops(compiled_mba) <= mpskf_count_ops(g_so))
+
+// T20: matmul-only graph matches manual
+let mut g_mm_only = mpskf_new_graph()
+g_mm_only = mpskf_add_input(g_mm_only, "x", 6)
+g_mm_only = mpskf_add_matmul(g_mm_only, "mm", "x", "W", 1, 6, 4)
+g_mm_only = mpskf_set_output(g_mm_only, "mm")
+let c_mm_only = mpskf_compile(g_mm_only)
+let res_mm_only = mpskf_execute(c_mm_only, #{"x": FIX_X, "W": FIX_W})
+let mut eq_mm = true
+if res_mm_only["ok"] {
+    let v = res_mm_only["value"]
+    for j in 0..4 {
+        if approx(v[j], manual_mm[j], 1.0e-6) == false { eq_mm = false }
+    }
+} else {
+    eq_mm = false
+}
+check("T20 matmul-only = manual matmul", eq_mm)
+
+// T21: matmul + bias fused == manual A*B + bias
+let mut g_mb2 = mpskf_new_graph()
+g_mb2 = mpskf_add_input(g_mb2, "x", 6)
+g_mb2 = mpskf_add_matmul(g_mb2, "mm", "x", "W", 1, 6, 4)
+g_mb2 = mpskf_add_bias(g_mb2, "mb", "mm", "B")
+g_mb2 = mpskf_set_output(g_mb2, "mb")
+let c_mb2 = mpskf_compile(g_mb2)
+let res_mb2 = mpskf_execute(c_mb2, #{"x": FIX_X, "W": FIX_W, "B": FIX_B})
+let mut eq_mb = true
+if res_mb2["ok"] {
+    let v = res_mb2["value"]
+    for j in 0..4 {
+        if approx(v[j], manual_mb[j], 1.0e-6) == false { eq_mb = false }
+    }
+} else {
+    eq_mb = false
+}
+check("T21 matmul+bias fused = manual", eq_mb)
+
+// T22: matmul + bias + relu fused == manual chain
+let mut g_relu = mpskf_new_graph()
+g_relu = mpskf_add_input(g_relu, "x", 6)
+g_relu = mpskf_add_matmul(g_relu, "mm", "x", "W", 1, 6, 4)
+g_relu = mpskf_add_bias(g_relu, "mb", "mm", "B")
+g_relu = mpskf_add_activation(g_relu, "mba", "mb", "relu")
+g_relu = mpskf_set_output(g_relu, "mba")
+let c_relu = mpskf_compile(g_relu)
+let res_relu = mpskf_execute(c_relu, #{"x": FIX_X, "W": FIX_W, "B": FIX_B})
+let manual_relu = manual_act_chain("relu")
+let mut eq_relu = true
+if res_relu["ok"] {
+    let v = res_relu["value"]
+    for j in 0..4 {
+        if approx(v[j], manual_relu[j], 1.0e-6) == false { eq_relu = false }
+    }
+} else {
+    eq_relu = false
+}
+check("T22 matmul+bias+relu fused = manual", eq_relu)
+
+// T23: matmul + bias + gelu fused == manual chain
+let mut g_gelu = mpskf_new_graph()
+g_gelu = mpskf_add_input(g_gelu, "x", 6)
+g_gelu = mpskf_add_matmul(g_gelu, "mm", "x", "W", 1, 6, 4)
+g_gelu = mpskf_add_bias(g_gelu, "mb", "mm", "B")
+g_gelu = mpskf_add_activation(g_gelu, "mba", "mb", "gelu")
+g_gelu = mpskf_set_output(g_gelu, "mba")
+let c_gelu = mpskf_compile(g_gelu)
+let res_gelu = mpskf_execute(c_gelu, #{"x": FIX_X, "W": FIX_W, "B": FIX_B})
+let manual_gelu = manual_act_chain("gelu")
+let mut eq_gelu = true
+if res_gelu["ok"] {
+    let v = res_gelu["value"]
+    for j in 0..4 {
+        if approx(v[j], manual_gelu[j], 1.0e-5) == false { eq_gelu = false }
+    }
+} else {
+    eq_gelu = false
+}
+check("T23 matmul+bias+gelu fused = manual", eq_gelu)
+
+// T24: matmul + bias + silu fused == manual chain
+let mut g_silu = mpskf_new_graph()
+g_silu = mpskf_add_input(g_silu, "x", 6)
+g_silu = mpskf_add_matmul(g_silu, "mm", "x", "W", 1, 6, 4)
+g_silu = mpskf_add_bias(g_silu, "mb", "mm", "B")
+g_silu = mpskf_add_activation(g_silu, "mba", "mb", "silu")
+g_silu = mpskf_set_output(g_silu, "mba")
+let c_silu = mpskf_compile(g_silu)
+let res_silu = mpskf_execute(c_silu, #{"x": FIX_X, "W": FIX_W, "B": FIX_B})
+let manual_silu = manual_act_chain("silu")
+let mut eq_silu = true
+if res_silu["ok"] {
+    let v = res_silu["value"]
+    for j in 0..4 {
+        if approx(v[j], manual_silu[j], 1.0e-5) == false { eq_silu = false }
+    }
+} else {
+    eq_silu = false
+}
+check("T24 matmul+bias+silu fused = manual", eq_silu)
+
+// T25: fused vs raw (non-compiled) produce identical output
+let raw_res = mpskf_execute(g_relu, #{"x": FIX_X, "W": FIX_W, "B": FIX_B})
+let mut eq_fr = true
+if raw_res["ok"] && res_relu["ok"] {
+    let vr = raw_res["value"]
+    let vf = res_relu["value"]
+    for j in 0..4 {
+        if approx(vr[j], vf[j], 1.0e-6) == false { eq_fr = false }
+    }
+} else {
+    eq_fr = false
+}
+check("T25 fused == raw output", eq_fr)
+
+// T26: fusion reduces 3 ops -> 1
+check("T26 fusion 3 -> 1", mpskf_count_ops(g_relu) == 3 && mpskf_count_fused_ops(c_relu) == 1)
+
+// T27: layernorm op executes
+let mut g_ln2 = mpskf_new_graph()
+g_ln2 = mpskf_add_input(g_ln2, "x", 5)
+g_ln2 = mpskf_add_layernorm(g_ln2, "ln", "x", "G", "Bt", 1.0e-5, 5)
+g_ln2 = mpskf_set_output(g_ln2, "ln")
+let c_ln2 = mpskf_compile(g_ln2)
+let gamma_v = [1.0, 1.0, 1.0, 1.0, 1.0]
+let beta_v = [0.0, 0.0, 0.0, 0.0, 0.0]
+let ln_res = mpskf_execute(c_ln2, #{"x": [1.0, 2.0, 3.0, 4.0, 5.0], "G": gamma_v, "Bt": beta_v})
+check("T27 layernorm op executes ok", ln_res["ok"] && len(ln_res["value"]) == 5)
+
+// T28: layernorm (gamma=1, beta=0) zero-mean output
+let mut ln_sum2 = 0.0
+if ln_res["ok"] {
+    let v = ln_res["value"]
+    for i in 0..5 { ln_sum2 = ln_sum2 + v[i] }
+}
+check("T28 layernorm zero-mean output", approx(ln_sum2 / 5.0, 0.0, 1.0e-5))
+
+// T29: fusion idempotent
+let c_once = mpskf_compile(g_relu)
+let c_twice = mpskf_compile(c_once)
+let same_count = mpskf_count_fused_ops(c_once) == mpskf_count_fused_ops(c_twice)
+let mut same_names = true
+let ops_once = c_once["ops"]
+let ops_twice = c_twice["ops"]
+if len(ops_once) == len(ops_twice) {
+    for i in 0..len(ops_once) {
+        if ops_once[i]["name"] != ops_twice[i]["name"] { same_names = false }
+        if ops_once[i]["kind"] != ops_twice[i]["kind"] { same_names = false }
+    }
+} else {
+    same_names = false
+}
+check("T29 fusion idempotent", same_count && same_names)
+
+// T30: compile preserves output name
+check("T30 compile preserves output", c_relu["output"] == g_relu["output"])
+
+// T31: compile preserves inputs
+let orig_inputs_keys = keys(g_relu["inputs"])
+let comp_inputs_keys = keys(c_relu["inputs"])
+check("T31 compile preserves inputs", len(orig_inputs_keys) == len(comp_inputs_keys))
+
+// T32: empty graph -> error
+let empty2 = mpskf_new_graph()
+let re_empty = mpskf_execute(empty2, #{})
+check("T32 empty graph error", re_empty["ok"] == false && re_empty["error"] == "empty graph")
+
+// T33: graph with no output set -> error
+let mut g_noout = mpskf_new_graph()
+g_noout = mpskf_add_input(g_noout, "x", 2)
+let re_noout = mpskf_execute(g_noout, #{"x": [1.0, 2.0]})
+check("T33 no output error", re_noout["ok"] == false && re_noout["error"] == "no output set")
+
+// T34: output name not in graph
+let mut g_badout = mpskf_new_graph()
+g_badout = mpskf_add_input(g_badout, "x", 2)
+g_badout = mpskf_set_output(g_badout, "nope")
+let re_badout = mpskf_execute(g_badout, #{"x": [1.0, 2.0]})
+check("T34 output not in graph", re_badout["ok"] == false)
+
+// T35: execute with missing input
+let mut g_miss = mpskf_new_graph()
+g_miss = mpskf_add_input(g_miss, "x", 2)
+g_miss = mpskf_set_output(g_miss, "x")
+let re_miss = mpskf_execute(g_miss, #{})
+check("T35 missing input error", re_miss["ok"] == false)
+
+// T36: unknown activation kind
+let mut g_badact = mpskf_new_graph()
+g_badact = mpskf_add_input(g_badact, "x", 2)
+g_badact = mpskf_add_activation(g_badact, "a1", "x", "weird")
+g_badact = mpskf_set_output(g_badact, "a1")
+let re_badact = mpskf_execute(g_badact, #{"x": [1.0, 2.0]})
+check("T36 unknown activation error", re_badact["ok"] == false)
+
+// T37: execute compiled graph without the weight tensor
+let re_missing_w = mpskf_execute(c_relu, #{"x": FIX_X, "B": FIX_B})
+check("T37 compiled missing weight error", re_missing_w["ok"] == false)
+
+// T38: two matmul outputs — fan-out to two consumers, no fusion
+// mm1 feeds both bias b1 and bias b2 => consumer count 2, not fused.
+let mut g_fan = mpskf_new_graph()
+g_fan = mpskf_add_input(g_fan, "x", 6)
+g_fan = mpskf_add_matmul(g_fan, "mm1", "x", "W", 1, 6, 4)
+g_fan = mpskf_add_bias(g_fan, "b1", "mm1", "B1")
+g_fan = mpskf_add_bias(g_fan, "b2", "mm1", "B2")
+g_fan = mpskf_set_output(g_fan, "b2")
+// mm1 has two consumers (b1 and b2) so fusion with b1 is blocked.
+// After compile: mm1 stays as matmul, b1 stays bias, b2 stays bias => 3 ops.
+let c_fan = mpskf_compile(g_fan)
+check("T38 fan-out blocks fusion", mpskf_count_fused_ops(c_fan) == 3)
+
+// T39: fused_linear with gelu on positive output
+// Use only positive weights/bias so every pre-activation is positive,
+// then gelu(x) ~= x for large x — verify fused output > bias-only output.
+let mut g_pos = mpskf_new_graph()
+g_pos = mpskf_add_input(g_pos, "x", 6)
+g_pos = mpskf_add_matmul(g_pos, "mm", "x", "W", 1, 6, 4)
+g_pos = mpskf_add_bias(g_pos, "mb", "mm", "B")
+g_pos = mpskf_add_activation(g_pos, "mba", "mb", "gelu")
+g_pos = mpskf_set_output(g_pos, "mba")
+let c_pos = mpskf_compile(g_pos)
+let pos_res = mpskf_execute(c_pos, #{"x": FIX_X, "W": FIX_W, "B": FIX_B})
+let mut gelu_ok = true
+if pos_res["ok"] {
+    let pv = pos_res["value"]
+    // mm+b at index 0 = 9.6, gelu(9.6) ~ 9.6 (within 1%)
+    if approx(pv[0], 9.6, 0.05) == false { gelu_ok = false }
+} else {
+    gelu_ok = false
+}
+check("T39 fused_linear+gelu on positive", gelu_ok)
+
+// T40: deep chain matmul + bias + tanh final value matches manual
+let mut g_tanh = mpskf_new_graph()
+g_tanh = mpskf_add_input(g_tanh, "x", 6)
+g_tanh = mpskf_add_matmul(g_tanh, "mm", "x", "W", 1, 6, 4)
+g_tanh = mpskf_add_bias(g_tanh, "mb", "mm", "B")
+g_tanh = mpskf_add_activation(g_tanh, "mba", "mb", "tanh")
+g_tanh = mpskf_set_output(g_tanh, "mba")
+let c_tanh = mpskf_compile(g_tanh)
+let res_tanh = mpskf_execute(c_tanh, #{"x": FIX_X, "W": FIX_W, "B": FIX_B})
+let manual_tanh = manual_act_chain("tanh")
+let mut eq_tanh = true
+if res_tanh["ok"] {
+    let v = res_tanh["value"]
+    for j in 0..4 {
+        if approx(v[j], manual_tanh[j], 1.0e-5) == false { eq_tanh = false }
+    }
+} else {
+    eq_tanh = false
+}
+check("T40 matmul+bias+tanh fused = manual", eq_tanh)
+
+// ===================================================================
+println("")
+println("=== MPS Kernel Fusion (#203) test summary ===")
+println("PASS: " + str(pass_count))
+println("FAIL: " + str(fail_count))

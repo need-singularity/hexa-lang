@@ -1,0 +1,455 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/orpo.hexa — Odds Ratio Preference Optimization (ORPO)
+//
+//  ORPO (Hong et al., 2024) unifies SFT and preference alignment into
+//  a single-stage, reference-free training objective.  Unlike DPO which
+//  requires a frozen reference model and a separate SFT warm-up, ORPO
+//  trains a single policy from scratch on preference pairs.
+//
+//  Key insight: the standard cross-entropy (SFT) loss already pushes
+//  probability mass toward chosen responses; ORPO adds a *log odds
+//  ratio* penalty that explicitly widens the gap between chosen and
+//  rejected.  Because the odds ratio is computed from the policy alone,
+//  no reference model is needed.
+//
+//  Definitions:
+//    P(y|x)        = exp(avg log-prob over tokens of y given x)
+//    odds(y|x)     = P(y|x) / (1 - P(y|x))
+//    OR(y_w, y_l)  = odds(y_w|x) / odds(y_l|x)
+//    L_OR          = -log sigmoid(log OR)
+//    L_SFT         = -avg log P(token_t | token_<t) for chosen y_w
+//    L_ORPO        = L_SFT + lambda * L_OR
+//
+//  Properties:
+//    - Reference-free: only one model, no pi_ref
+//    - Single-stage: no SFT warm-up required
+//    - Stable: odds ratio is bounded and well-behaved
+//    - Efficient: one forward per response (chosen + rejected)
+//
+//  Reference:
+//    Hong et al., "ORPO: Monolithic Preference Optimization without
+//    Reference Model" (2024), arXiv:2403.07691.
+//
+//  API (all pure, no BLAS / no external deps):
+//    orpo_exp(x)                                        -> float
+//    orpo_log(x)                                        -> float
+//    orpo_sigmoid(x)                                    -> float
+//    orpo_log_sigmoid(x)                                -> float
+//    orpo_softplus(x)                                   -> float
+//    orpo_avg_log_prob(log_probs)                       -> float
+//    orpo_prob_from_avg_log(avg_log_p)                  -> float
+//    orpo_odds(prob)                                    -> float
+//    orpo_log_odds(prob)                                -> float
+//    orpo_odds_ratio(avg_lp_w, avg_lp_l)               -> float
+//    orpo_log_odds_ratio(avg_lp_w, avg_lp_l)           -> float
+//    orpo_sft_loss(log_probs_chosen)                    -> float
+//    orpo_or_loss(avg_lp_w, avg_lp_l)                  -> float
+//    orpo_loss(log_probs_w, log_probs_l, lambda)        -> [loss, sft, or]
+//    orpo_grad_or_wrt_avg_lp_w(avg_lp_w, avg_lp_l)    -> float
+//    orpo_grad_or_wrt_avg_lp_l(avg_lp_w, avg_lp_l)    -> float
+//    orpo_token_grad_chosen(log_probs_w, log_probs_l,
+//                           lambda, idx)                -> float
+//    orpo_token_grad_rejected(log_probs_w, log_probs_l,
+//                             lambda, idx)              -> float
+//    orpo_step_chosen(log_probs_w, log_probs_l,
+//                     lambda, lr)                       -> [float..]
+//    orpo_step_rejected(log_probs_w, log_probs_l,
+//                       lambda, lr)                     -> [float..]
+//    orpo_pair_step(log_probs_w, log_probs_l,
+//                   lambda, lr)                         -> [[float..],[float..],loss]
+//    orpo_batch_loss(batch_w, batch_l, lambda)          -> float
+//    orpo_batch_step(batch_w, batch_l, lambda, lr)      -> [float, [batch_w], [batch_l]]
+//    orpo_multi_step(batch_w, batch_l, lambda, lr, n)   -> [float, [batch_w], [batch_l]]
+//    orpo_preference_accuracy(batch_w, batch_l)         -> float
+//    orpo_reward_margin(avg_lp_w, avg_lp_l)             -> float
+//
+//  AI-NATIVE attrs:
+//    @pure  -- no side effects, deterministic
+//    @hot   -- called every training step
+// ═══════════════════════════════════════════════════════════════════
+
+let ORPO_LAMBDA  = 0.1
+let ORPO_EPS     = 1.0e-10
+
+// ── numeric helpers (inline, no BLAS) ─────────────────────────────
+
+@pure
+fn orpo_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+@pure
+fn orpo_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+@pure
+fn orpo_log(x) {
+    if x <= 0.0 { return -30.0 }
+    let mut v = x
+    let mut count = 0
+    while v > 2.0 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    let d = v - 1.0
+    let ln_v = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_v
+}
+
+@pure
+fn orpo_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x
+    if g > 1.0 { g = x / 2.0 }
+    let mut i = 0
+    while i < 30 {
+        g = 0.5 * (g + x / g)
+        i = i + 1
+    }
+    return g
+}
+
+@pure
+pub fn orpo_sigmoid(x) {
+    if x > 20.0 { return 1.0 }
+    if x < -20.0 { return 0.0 }
+    return 1.0 / (1.0 + orpo_exp(0.0 - x))
+}
+
+@pure
+pub fn orpo_log_sigmoid(x) {
+    // log(sigmoid(x)) = -softplus(-x)
+    let neg_x = 0.0 - x
+    if neg_x > 20.0 { return 0.0 - neg_x }
+    if neg_x < -20.0 { return 0.0 }
+    return 0.0 - orpo_log(1.0 + orpo_exp(neg_x))
+}
+
+@pure
+pub fn orpo_softplus(x) {
+    // softplus(x) = log(1 + exp(x))
+    if x > 20.0 { return x }
+    if x < -20.0 { return 0.0 }
+    return orpo_log(1.0 + orpo_exp(x))
+}
+
+// ── average log probability ──────────────────────────────────────
+// Given per-token log probs [log p(t_1|...), log p(t_2|...), ...],
+// compute the mean. This is the "average log-likelihood" used in ORPO.
+
+@pure
+pub fn orpo_avg_log_prob(log_probs) {
+    let n = len(log_probs)
+    if n == 0 { return -30.0 }
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + log_probs[i]
+        i = i + 1
+    }
+    return s / to_float(n)
+}
+
+// ── probability from average log-prob ────────────────────────────
+// P(y|x) = exp(avg_log_p)  (geometric mean of per-token probs)
+
+@pure
+pub fn orpo_prob_from_avg_log(avg_log_p) {
+    let p = orpo_exp(avg_log_p)
+    if p > 1.0 { return 1.0 }
+    if p < 0.0 { return 0.0 }
+    return p
+}
+
+// ── odds: P / (1 - P) ───────────────────────────────────────────
+
+@pure
+pub fn orpo_odds(prob) {
+    let p = prob
+    let q = 1.0 - p
+    if q < ORPO_EPS { return 1.0 / ORPO_EPS }
+    return p / q
+}
+
+// ── log odds: log(P / (1 - P)) ──────────────────────────────────
+
+@pure
+pub fn orpo_log_odds(prob) {
+    let p = prob
+    if p < ORPO_EPS { return -30.0 }
+    let q = 1.0 - p
+    if q < ORPO_EPS { return 30.0 }
+    return orpo_log(p / q)
+}
+
+// ── odds ratio: odds(y_w) / odds(y_l) ──────────────────────────
+// Given average log-probs for chosen and rejected, compute OR.
+
+@pure
+pub fn orpo_odds_ratio(avg_lp_w, avg_lp_l) {
+    let p_w = orpo_prob_from_avg_log(avg_lp_w)
+    let p_l = orpo_prob_from_avg_log(avg_lp_l)
+    let odds_w = orpo_odds(p_w)
+    let odds_l = orpo_odds(p_l)
+    if odds_l < ORPO_EPS { return odds_w / ORPO_EPS }
+    return odds_w / odds_l
+}
+
+// ── log odds ratio: log(OR) = log_odds(y_w) - log_odds(y_l) ────
+
+@pure
+pub fn orpo_log_odds_ratio(avg_lp_w, avg_lp_l) {
+    let p_w = orpo_prob_from_avg_log(avg_lp_w)
+    let p_l = orpo_prob_from_avg_log(avg_lp_l)
+    let lo_w = orpo_log_odds(p_w)
+    let lo_l = orpo_log_odds(p_l)
+    return lo_w - lo_l
+}
+
+// ── SFT loss: negative average log-prob on chosen ────────────────
+// L_SFT = -avg(log P(token_t | token_<t)) for chosen response
+
+@pure
+pub fn orpo_sft_loss(log_probs_chosen) {
+    return 0.0 - orpo_avg_log_prob(log_probs_chosen)
+}
+
+// ── OR loss: -log sigmoid(log OR) ────────────────────────────────
+// Penalises when odds_chosen < odds_rejected
+
+@pure
+pub fn orpo_or_loss(avg_lp_w, avg_lp_l) {
+    let lor = orpo_log_odds_ratio(avg_lp_w, avg_lp_l)
+    // -log sigmoid(lor) = softplus(-lor)
+    return orpo_softplus(0.0 - lor)
+}
+
+// ── combined ORPO loss ──────────────────────────────────────────
+// L = L_SFT + lambda * L_OR
+// Returns [total_loss, sft_loss, or_loss]
+
+@pure
+pub fn orpo_loss(log_probs_w, log_probs_l, lambda) {
+    let avg_lp_w = orpo_avg_log_prob(log_probs_w)
+    let avg_lp_l = orpo_avg_log_prob(log_probs_l)
+    let sft = orpo_sft_loss(log_probs_w)
+    let or_l = orpo_or_loss(avg_lp_w, avg_lp_l)
+    let total = sft + lambda * or_l
+    return [total, sft, or_l]
+}
+
+// ── gradient of OR loss w.r.t. avg_lp_w ─────────────────────────
+// d L_OR / d avg_lp_w
+// L_OR = softplus(-log_OR) where log_OR = log_odds(p_w) - log_odds(p_l)
+// d L_OR / d log_OR = -sigmoid(-log_OR)
+// d log_OR / d avg_lp_w = d log_odds(p_w) / d avg_lp_w
+//   = (d/dp_w [log(p_w/(1-p_w))]) * dp_w/d avg_lp_w
+//   = (1/(p_w*(1-p_w))) * p_w   (since dp/d avg_lp = p = exp(avg_lp))
+//   = 1/(1-p_w)
+
+@pure
+pub fn orpo_grad_or_wrt_avg_lp_w(avg_lp_w, avg_lp_l) {
+    let lor = orpo_log_odds_ratio(avg_lp_w, avg_lp_l)
+    let d_lor = 0.0 - orpo_sigmoid(0.0 - lor)
+    let p_w = orpo_prob_from_avg_log(avg_lp_w)
+    let one_minus_pw = 1.0 - p_w
+    let chain = if one_minus_pw < ORPO_EPS { 1.0 / ORPO_EPS } else { 1.0 / one_minus_pw }
+    return d_lor * chain
+}
+
+// ── gradient of OR loss w.r.t. avg_lp_l ─────────────────────────
+// d log_OR / d avg_lp_l = -1/(1-p_l)
+
+@pure
+pub fn orpo_grad_or_wrt_avg_lp_l(avg_lp_w, avg_lp_l) {
+    let lor = orpo_log_odds_ratio(avg_lp_w, avg_lp_l)
+    let d_lor = 0.0 - orpo_sigmoid(0.0 - lor)
+    let p_l = orpo_prob_from_avg_log(avg_lp_l)
+    let one_minus_pl = 1.0 - p_l
+    let chain = if one_minus_pl < ORPO_EPS { 0.0 - 1.0 / ORPO_EPS } else { 0.0 - 1.0 / one_minus_pl }
+    return d_lor * chain
+}
+
+// ── per-token gradient for chosen response ──────────────────────
+// Total loss = L_SFT + lambda * L_OR
+// d L_SFT / d log_probs_w[i] = -1/n
+// d L_OR / d log_probs_w[i] = (d L_OR / d avg_lp_w) * (1/n)
+
+@pure
+pub fn orpo_token_grad_chosen(log_probs_w, log_probs_l, lambda, idx) {
+    let n = len(log_probs_w)
+    if n == 0 { return 0.0 }
+    let inv_n = 1.0 / to_float(n)
+    let avg_lp_w = orpo_avg_log_prob(log_probs_w)
+    let avg_lp_l = orpo_avg_log_prob(log_probs_l)
+    // SFT gradient: d(-avg_lp) / d lp[i] = -1/n
+    let sft_grad = 0.0 - inv_n
+    // OR gradient through chosen
+    let or_grad_avg = orpo_grad_or_wrt_avg_lp_w(avg_lp_w, avg_lp_l)
+    let or_grad = or_grad_avg * inv_n
+    return sft_grad + lambda * or_grad
+}
+
+// ── per-token gradient for rejected response ────────────────────
+// Only OR loss contributes (SFT loss only depends on chosen)
+
+@pure
+pub fn orpo_token_grad_rejected(log_probs_w, log_probs_l, lambda, idx) {
+    let n = len(log_probs_l)
+    if n == 0 { return 0.0 }
+    let inv_n = 1.0 / to_float(n)
+    let avg_lp_w = orpo_avg_log_prob(log_probs_w)
+    let avg_lp_l = orpo_avg_log_prob(log_probs_l)
+    let or_grad_avg = orpo_grad_or_wrt_avg_lp_l(avg_lp_w, avg_lp_l)
+    let or_grad = or_grad_avg * inv_n
+    return lambda * or_grad
+}
+
+// ── gradient step on chosen log-probs ───────────────────────────
+
+pub fn orpo_step_chosen(log_probs_w, log_probs_l, lambda, lr) {
+    let n = len(log_probs_w)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let g = orpo_token_grad_chosen(log_probs_w, log_probs_l, lambda, i)
+        out = out + [log_probs_w[i] - lr * g]
+        i = i + 1
+    }
+    return out
+}
+
+// ── gradient step on rejected log-probs ─────────────────────────
+
+pub fn orpo_step_rejected(log_probs_w, log_probs_l, lambda, lr) {
+    let n = len(log_probs_l)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let g = orpo_token_grad_rejected(log_probs_w, log_probs_l, lambda, i)
+        out = out + [log_probs_l[i] - lr * g]
+        i = i + 1
+    }
+    return out
+}
+
+// ── single pair step: update both chosen and rejected ───────────
+// Returns [updated_w, updated_l, total_loss]
+
+pub fn orpo_pair_step(log_probs_w, log_probs_l, lambda, lr) {
+    let res = orpo_loss(log_probs_w, log_probs_l, lambda)
+    let new_w = orpo_step_chosen(log_probs_w, log_probs_l, lambda, lr)
+    let new_l = orpo_step_rejected(log_probs_w, log_probs_l, lambda, lr)
+    return [new_w, new_l, res[0]]
+}
+
+// ── batch loss across multiple preference pairs ─────────────────
+// batch_w[i], batch_l[i]: per-token log-probs for pair i
+
+@pure
+pub fn orpo_batch_loss(batch_w, batch_l, lambda) {
+    let n = len(batch_w)
+    if n == 0 { return 0.0 }
+    let mut total = 0.0
+    let mut i = 0
+    while i < n {
+        let res = orpo_loss(batch_w[i], batch_l[i], lambda)
+        total = total + res[0]
+        i = i + 1
+    }
+    return total / to_float(n)
+}
+
+// ── batch step: update all pairs ────────────────────────────────
+// Returns [avg_loss, new_batch_w, new_batch_l]
+
+pub fn orpo_batch_step(batch_w, batch_l, lambda, lr) {
+    let n = len(batch_w)
+    if n == 0 { return [0.0, [], []] }
+    let mut total_loss = 0.0
+    let mut new_w = []
+    let mut new_l = []
+    let mut i = 0
+    while i < n {
+        let res = orpo_pair_step(batch_w[i], batch_l[i], lambda, lr)
+        new_w = new_w + [res[0]]
+        new_l = new_l + [res[1]]
+        total_loss = total_loss + res[2]
+        i = i + 1
+    }
+    let avg_loss = total_loss / to_float(n)
+    return [avg_loss, new_w, new_l]
+}
+
+// ── multi-step training ─────────────────────────────────────────
+// Run n gradient steps on the batch. Returns final [avg_loss, batch_w, batch_l].
+
+pub fn orpo_multi_step(batch_w, batch_l, lambda, lr, n) {
+    let mut cur_w = batch_w
+    let mut cur_l = batch_l
+    let mut last_loss = 0.0
+    let mut step = 0
+    while step < n {
+        let res = orpo_batch_step(cur_w, cur_l, lambda, lr)
+        last_loss = res[0]
+        cur_w = res[1]
+        cur_l = res[2]
+        step = step + 1
+    }
+    return [last_loss, cur_w, cur_l]
+}
+
+// ── preference accuracy ─────────────────────────────────────────
+// Fraction of pairs where avg_log_prob(chosen) > avg_log_prob(rejected)
+
+@pure
+pub fn orpo_preference_accuracy(batch_w, batch_l) {
+    let n = len(batch_w)
+    if n == 0 { return 0.0 }
+    let mut correct = 0
+    let mut i = 0
+    while i < n {
+        let avg_w = orpo_avg_log_prob(batch_w[i])
+        let avg_l = orpo_avg_log_prob(batch_l[i])
+        if avg_w > avg_l { correct = correct + 1 }
+        i = i + 1
+    }
+    return to_float(correct) / to_float(n)
+}
+
+// ── reward margin: log_odds difference ──────────────────────────
+
+@pure
+pub fn orpo_reward_margin(avg_lp_w, avg_lp_l) {
+    return orpo_log_odds_ratio(avg_lp_w, avg_lp_l)
+}
+
+// ── self-smoke check ────────────────────────────────────────────
+
+pub fn orpo_self_check() {
+    let lp_w = [-0.5, -0.6, -0.4]
+    let lp_l = [-1.5, -1.8, -1.2]
+    let res = orpo_loss(lp_w, lp_l, ORPO_LAMBDA)
+    // loss should be finite and positive
+    if res[0] < 0.0 { return 0 }
+    if res[0] > 100.0 { return 0 }
+    return 1
+}
+
+println("[orpo] loaded — reference-free preference, lambda=" + str(ORPO_LAMBDA) + ", single-stage SFT+OR")

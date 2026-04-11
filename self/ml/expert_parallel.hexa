@@ -1,0 +1,569 @@
+// ═══════════════════════════════════════════════════════════════
+//  expert_parallel.hexa — Expert Parallelism (EP) for MoE
+//
+//  ML roadmap #98 — Expert Parallelism
+//
+//  Shards the experts of a Mixture-of-Experts layer across ranks
+//  (1 expert per rank in the canonical case, or n_experts/nranks per
+//  rank when n_experts > nranks). Tokens are routed to the rank that
+//  owns their selected expert via an all-to-all dispatch; the per-rank
+//  expert outputs are then returned to the source rank via an
+//  all-to-all combine and weighted-summed by the gate probabilities.
+//
+//  All communication is simulated in pure hexa (no CUDA, no NCCL):
+//  the "mesh" is just a 2-D array of per-rank send buffers. This lets
+//  us test correctness of the routing/combine/load-balance loss math
+//  independently of the H100 transport layer, while the same layout
+//  is what an NCCL ncclAllToAll path would expose.
+//
+//  Semantics (for nrank ranks, n_experts >= nrank, top-k gating):
+//    1. Each rank has a local mini-batch of tokens [n_local x d_in]
+//       and the full gate weights [n_experts x d_in].
+//    2. Each token is gated against all experts; its top-k
+//       (expert_id, gate_prob) pairs are computed locally.
+//    3. ep_expert_owner(e, nrank, n_experts) maps an expert id to its
+//       owning rank. Tokens whose top-k expert lives on rank r are
+//       packed into send_bufs[src][r].
+//    4. ep_all_to_all_dispatch permutes send_bufs so that
+//       recv_bufs[dst][src] = send_bufs[src][dst]. After this each rank
+//       only holds tokens whose expert it owns.
+//    5. Each rank runs expert_forward over its received tokens.
+//    6. ep_all_to_all_combine performs the inverse permutation to
+//       return every token's expert output back to its source rank.
+//    7. The source rank weighted-sums over top-k to produce the final
+//       token output and accumulates the load-balance (Switch) loss.
+//
+//  Load-balance loss (Switch Transformer, eq. 4):
+//    L_aux = alpha * n_experts * sum_e ( f_e * P_e )
+//      f_e = fraction of tokens routed to expert e
+//      P_e = mean gate probability for expert e
+//    Minimising L_aux encourages uniform utilisation.
+//
+//  References:
+//    - Fedus et al. 2021, "Switch Transformers" (load-balance loss)
+//    - Lepikhin et al. 2020, "GShard" (all-to-all expert parallel)
+// ═══════════════════════════════════════════════════════════════
+
+// ── small utilities ─────────────────────────────────────────
+@pure
+fn ep_fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+
+// Ceil division used for expert-per-rank sharding.
+@pure
+fn ep_ceil_div(a, b) {
+    if b <= 0 { return 0 }
+    let q = a / b
+    if q * b < a { return q + 1 }
+    return q
+}
+
+// Expert → owning rank mapping. Contiguous blocks of size
+// ceil(n_experts/nrank) so that rank 0 owns experts [0, epr),
+// rank 1 owns [epr, 2*epr) and so on.
+@pure
+fn ep_expert_owner(expert_id, nrank, n_experts) {
+    let epr = ep_ceil_div(n_experts, nrank)
+    let r = expert_id / epr
+    if r >= nrank { return nrank - 1 }
+    return r
+}
+
+// Local index of an expert within its owning rank.
+@pure
+fn ep_expert_local_index(expert_id, nrank, n_experts) {
+    let epr = ep_ceil_div(n_experts, nrank)
+    let owner = ep_expert_owner(expert_id, nrank, n_experts)
+    return expert_id - owner * epr
+}
+
+// Number of experts owned by rank r.
+@pure
+fn ep_experts_on_rank(r, nrank, n_experts) {
+    let epr = ep_ceil_div(n_experts, nrank)
+    let start = r * epr
+    let mut end = start + epr
+    if end > n_experts { end = n_experts }
+    if end < start { return 0 }
+    return end - start
+}
+
+// ── gating: compute (expert_id, prob) top-k per token ───────
+// gate_w: [n_experts][d_in]
+// returns:
+//   scores:     [n_experts]
+//   picks:      [k]      expert ids selected
+//   probs:      [k]      softmax over the picked subset (sum = 1)
+@pure
+fn ep_gate_scores(gate_w, x, n_experts, d_in) {
+    let mut s = []
+    for e in 0..n_experts {
+        let mut acc = 0.0
+        for j in 0..d_in {
+            acc = acc + gate_w[e][j] * x[j]
+        }
+        s = s + [acc]
+    }
+    return s
+}
+
+fn ep_topk_indices(scores, n_experts, k) {
+    let mut used = []
+    for i in 0..n_experts { used = used + [false] }
+    let mut picks = []
+    for r in 0..k {
+        let mut best = 0
+        let mut best_v = -1.0e30
+        let mut found = false
+        for e in 0..n_experts {
+            if !used[e] {
+                if !found {
+                    best = e
+                    best_v = scores[e]
+                    found = true
+                } else {
+                    if scores[e] > best_v {
+                        best_v = scores[e]
+                        best = e
+                    }
+                }
+            }
+        }
+        let mut used2 = []
+        for i in 0..n_experts {
+            if i == best { used2 = used2 + [true] } else { used2 = used2 + [used[i]] }
+        }
+        used = used2
+        picks = picks + [best]
+    }
+    return picks
+}
+
+@pure
+fn ep_softmax_subset(scores, picks, k) {
+    let mut m = scores[picks[0]]
+    for r in 1..k {
+        if scores[picks[r]] > m { m = scores[picks[r]] }
+    }
+    let mut exps = []
+    let mut z = 0.0
+    for r in 0..k {
+        let v = exp(scores[picks[r]] - m)
+        exps = exps + [v]
+        z = z + v
+    }
+    let mut out = []
+    for r in 0..k {
+        out = out + [exps[r] / z]
+    }
+    return out
+}
+
+// Full-softmax (used for the auxiliary load-balance loss, which
+// averages over the *full* gate distribution P, not the top-k slice).
+@pure
+fn ep_softmax_all(scores, n) {
+    let mut m = scores[0]
+    for i in 1..n { if scores[i] > m { m = scores[i] } }
+    let mut exps = []
+    let mut z = 0.0
+    for i in 0..n {
+        let v = exp(scores[i] - m)
+        exps = exps + [v]
+        z = z + v
+    }
+    let mut out = []
+    for i in 0..n { out = out + [exps[i] / z] }
+    return out
+}
+
+// ── expert kernel (dense Linear: Y = W x + b) ───────────────
+// w: [d_out][d_in], b: [d_out]
+@pure
+fn ep_expert_forward(w, b, x, d_out, d_in) {
+    let mut y = []
+    for i in 0..d_out {
+        let mut s = b[i]
+        for j in 0..d_in {
+            s = s + w[i][j] * x[j]
+        }
+        y = y + [s]
+    }
+    return y
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Expert sharding: distribute experts across ranks
+//
+//  experts_w_all: [n_experts][d_out][d_in]
+//  experts_b_all: [n_experts][d_out]
+//
+//  shards_w[r][local]  = experts_w_all[r*epr + local]
+//  shards_b[r][local]  = experts_b_all[r*epr + local]
+// ═══════════════════════════════════════════════════════════════
+fn ep_shard_experts(experts_w_all, experts_b_all, n_experts, nrank) {
+    let epr = ep_ceil_div(n_experts, nrank)
+    let mut shards_w = []
+    let mut shards_b = []
+    for r in 0..nrank {
+        let start = r * epr
+        let mut end = start + epr
+        if end > n_experts { end = n_experts }
+        let mut rw = []
+        let mut rb = []
+        for e in start..end {
+            rw = rw + [experts_w_all[e]]
+            rb = rb + [experts_b_all[e]]
+        }
+        shards_w = shards_w + [rw]
+        shards_b = shards_b + [rb]
+    }
+    return [shards_w, shards_b]
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Packing: produce send buffers for each (src rank, dst rank)
+//
+//  For each local token, for each of its top-k picks, append a
+//  "message" [token_src_id, k_slot, expert_id, prob, x_vec] to
+//  send_bufs[src_rank][dst_rank], where dst_rank owns expert_id.
+//
+//  token_src_id   = index of the token inside its source rank's batch
+//  k_slot         = 0..k-1 (which top-k slot this message represents)
+// ═══════════════════════════════════════════════════════════════
+
+// Build the per-token gate decision (picks, probs, full-softmax P).
+fn ep_gate_tokens(gate_w, X_local, n_experts, d_in, k) {
+    let n_tok = len(X_local)
+    let mut picks_all = []
+    let mut probs_all = []
+    let mut full_all  = []
+    for t in 0..n_tok {
+        let x = X_local[t]
+        let scores = ep_gate_scores(gate_w, x, n_experts, d_in)
+        let picks  = ep_topk_indices(scores, n_experts, k)
+        let probs  = ep_softmax_subset(scores, picks, k)
+        let full   = ep_softmax_all(scores, n_experts)
+        picks_all = picks_all + [picks]
+        probs_all = probs_all + [probs]
+        full_all  = full_all  + [full]
+    }
+    return [picks_all, probs_all, full_all]
+}
+
+// Produce send_bufs[src][dst] = list of messages
+// message = [tok_id, k_slot, expert_id, prob, x]
+fn ep_pack_sends(X_ranks, picks_ranks, probs_ranks, nrank, n_experts, k) {
+    // init nrank x nrank grid of empty lists
+    let mut grid = []
+    for r in 0..nrank {
+        let mut row = []
+        for s in 0..nrank { row = row + [[]] }
+        grid = grid + [row]
+    }
+    for src in 0..nrank {
+        let X = X_ranks[src]
+        let picks_r = picks_ranks[src]
+        let probs_r = probs_ranks[src]
+        let n_tok = len(X)
+        for t in 0..n_tok {
+            for slot in 0..k {
+                let e = picks_r[t][slot]
+                let p = probs_r[t][slot]
+                let dst = ep_expert_owner(e, nrank, n_experts)
+                let msg = [t, slot, e, p, X[t]]
+                let mut new_row = []
+                for s in 0..nrank {
+                    if s == dst {
+                        new_row = new_row + [grid[src][s] + [msg]]
+                    } else {
+                        new_row = new_row + [grid[src][s]]
+                    }
+                }
+                let mut new_grid = []
+                for r in 0..nrank {
+                    if r == src { new_grid = new_grid + [new_row] }
+                    else        { new_grid = new_grid + [grid[r]] }
+                }
+                grid = new_grid
+            }
+        }
+    }
+    return grid
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  All-to-all dispatch
+//
+//  Input  : send[src][dst]  — message list that src wants to send dst
+//  Output : recv[dst][src]  — message list that dst received from src
+//
+//  Equivalent to NCCL all-to-all: a global transpose of the rank grid.
+// ═══════════════════════════════════════════════════════════════
+fn ep_all_to_all_dispatch(send_grid, nrank) {
+    let mut recv = []
+    for dst in 0..nrank {
+        let mut row = []
+        for src in 0..nrank {
+            row = row + [send_grid[src][dst]]
+        }
+        recv = recv + [row]
+    }
+    return recv
+}
+
+// Total number of messages in a rank's receive row.
+fn ep_rank_inbox_size(recv_row, nrank) {
+    let mut n = 0
+    for s in 0..nrank { n = n + len(recv_row[s]) }
+    return n
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Expert compute on each rank
+//
+//  For every message received by rank r:
+//    - look up local expert (shard_w[local], shard_b[local])
+//    - forward x through it
+//    - produce a return message [tok_id, k_slot, prob, y]
+//      keyed by the source rank it came from.
+//
+//  expert_calls counter lets tests verify that each rank only
+//  evaluates its own experts (lazy: tokens routed elsewhere never
+//  touch this rank's expert weights).
+// ═══════════════════════════════════════════════════════════════
+let mut EP_EXPERT_CALLS = 0
+fn ep_reset_expert_calls() { EP_EXPERT_CALLS = 0 }
+fn ep_get_expert_calls() { return EP_EXPERT_CALLS }
+
+fn ep_run_local_experts(recv_grid, shards_w, shards_b, nrank, n_experts, d_out, d_in) {
+    // out_grid[dst][src] = list of [tok_id, k_slot, prob, y_vec]
+    let mut out_grid = []
+    for dst in 0..nrank {
+        let mut row = []
+        for src in 0..nrank { row = row + [[]] }
+        out_grid = out_grid + [row]
+    }
+    for dst in 0..nrank {
+        let shard_w = shards_w[dst]
+        let shard_b = shards_b[dst]
+        let inbox = recv_grid[dst]
+        for src in 0..nrank {
+            let msgs = inbox[src]
+            let n = len(msgs)
+            let mut replies = []
+            for i in 0..n {
+                let m = msgs[i]
+                let tok_id = m[0]
+                let slot   = m[1]
+                let expert = m[2]
+                let prob   = m[3]
+                let x      = m[4]
+                let local_idx = ep_expert_local_index(expert, nrank, n_experts)
+                let w = shard_w[local_idx]
+                let b = shard_b[local_idx]
+                EP_EXPERT_CALLS = EP_EXPERT_CALLS + 1
+                let y = ep_expert_forward(w, b, x, d_out, d_in)
+                replies = replies + [[tok_id, slot, prob, y]]
+            }
+            let mut new_row = []
+            for s in 0..nrank {
+                if s == src { new_row = new_row + [replies] }
+                else        { new_row = new_row + [out_grid[dst][s]] }
+            }
+            let mut new_grid = []
+            for d in 0..nrank {
+                if d == dst { new_grid = new_grid + [new_row] }
+                else        { new_grid = new_grid + [out_grid[d]] }
+            }
+            out_grid = new_grid
+        }
+    }
+    return out_grid
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  All-to-all combine (inverse permutation of dispatch)
+//
+//  Input  : out[dst][src]    — reply list produced on dst for src
+//  Output : back[src][dst]   — reply list src now sees from dst
+// ═══════════════════════════════════════════════════════════════
+fn ep_all_to_all_combine(out_grid, nrank) {
+    let mut back = []
+    for src in 0..nrank {
+        let mut row = []
+        for dst in 0..nrank {
+            row = row + [out_grid[dst][src]]
+        }
+        back = back + [row]
+    }
+    return back
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Per-rank reduction: gather all replies, weighted-sum by prob
+//  into per-token y vectors.
+// ═══════════════════════════════════════════════════════════════
+fn ep_reduce_replies(back_grid, n_local_tokens, nrank, d_out) {
+    let mut Y = []
+    for t in 0..n_local_tokens {
+        let mut yi = []
+        for i in 0..d_out { yi = yi + [0.0] }
+        Y = Y + [yi]
+    }
+    let inbox = back_grid
+    for dst in 0..nrank {
+        let msgs = inbox[dst]
+        let n = len(msgs)
+        for i in 0..n {
+            let m = msgs[i]
+            let tok_id = m[0]
+            let prob   = m[2]
+            let y      = m[3]
+            let mut new_row = []
+            for j in 0..d_out {
+                new_row = new_row + [Y[tok_id][j] + prob * y[j]]
+            }
+            let mut new_Y = []
+            for tt in 0..n_local_tokens {
+                if tt == tok_id { new_Y = new_Y + [new_row] }
+                else            { new_Y = new_Y + [Y[tt]] }
+            }
+            Y = new_Y
+        }
+    }
+    return Y
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Load-balance auxiliary loss (Switch Transformer)
+//
+//  Given the gate decisions of every token on every rank, compute:
+//    f_e = fraction of tokens that routed to expert e (any slot)
+//    P_e = mean full-softmax probability for expert e
+//    L_aux = alpha * n_experts * sum_e f_e * P_e
+//
+//  Minimum is L_aux = alpha when f and P are uniform (1/n_experts each).
+// ═══════════════════════════════════════════════════════════════
+fn ep_load_balance_loss(picks_ranks, full_ranks, nrank, n_experts, k, alpha) {
+    let mut counts = []
+    let mut p_mean = []
+    for e in 0..n_experts { counts = counts + [0] }
+    for e in 0..n_experts { p_mean = p_mean + [0.0] }
+    let mut total_tok = 0
+    for r in 0..nrank {
+        let picks_r = picks_ranks[r]
+        let full_r  = full_ranks[r]
+        let n_tok = len(picks_r)
+        for t in 0..n_tok {
+            total_tok = total_tok + 1
+            for e in 0..n_experts {
+                p_mean[e] = p_mean[e] + full_r[t][e]
+            }
+            for slot in 0..k {
+                let ee = picks_r[t][slot]
+                counts[ee] = counts[ee] + 1
+            }
+        }
+    }
+    if total_tok == 0 { return 0.0 }
+    let nt = to_float(total_tok)
+    let ntk = to_float(total_tok * k)
+    let mut f = []
+    let mut P = []
+    for e in 0..n_experts {
+        f = f + [to_float(counts[e]) / ntk]
+        P = P + [p_mean[e] / nt]
+    }
+    let mut s = 0.0
+    for e in 0..n_experts {
+        s = s + f[e] * P[e]
+    }
+    return alpha * to_float(n_experts) * s
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Top-level expert-parallel forward
+//
+//  Inputs:
+//    X_ranks       : array[nrank] of [n_local_tokens][d_in]
+//    gate_w        : [n_experts][d_in]
+//    experts_w_all : [n_experts][d_out][d_in]
+//    experts_b_all : [n_experts][d_out]
+//    n_experts, nrank, d_in, d_out, k
+//
+//  Returns [Y_ranks, L_aux] where
+//    Y_ranks[r] = [n_local_tokens_r][d_out]
+// ═══════════════════════════════════════════════════════════════
+fn ep_moe_forward(X_ranks, gate_w, experts_w_all, experts_b_all,
+                  n_experts, nrank, d_in, d_out, k, alpha) {
+    // 1. shard experts across ranks
+    let shards = ep_shard_experts(experts_w_all, experts_b_all, n_experts, nrank)
+    let shards_w = shards[0]
+    let shards_b = shards[1]
+
+    // 2. per-rank gating (picks, probs, full softmax)
+    let mut picks_ranks = []
+    let mut probs_ranks = []
+    let mut full_ranks  = []
+    for r in 0..nrank {
+        let g = ep_gate_tokens(gate_w, X_ranks[r], n_experts, d_in, k)
+        picks_ranks = picks_ranks + [g[0]]
+        probs_ranks = probs_ranks + [g[1]]
+        full_ranks  = full_ranks  + [g[2]]
+    }
+
+    // 3. pack + dispatch
+    let send_grid = ep_pack_sends(X_ranks, picks_ranks, probs_ranks,
+                                  nrank, n_experts, k)
+    let recv_grid = ep_all_to_all_dispatch(send_grid, nrank)
+
+    // 4. local experts
+    let out_grid = ep_run_local_experts(recv_grid, shards_w, shards_b,
+                                        nrank, n_experts, d_out, d_in)
+
+    // 5. combine back
+    let back_grid = ep_all_to_all_combine(out_grid, nrank)
+
+    // 6. per-rank reduction
+    let mut Y_ranks = []
+    for r in 0..nrank {
+        let n_local = len(X_ranks[r])
+        let Yr = ep_reduce_replies(back_grid[r], n_local, nrank, d_out)
+        Y_ranks = Y_ranks + [Yr]
+    }
+
+    // 7. load-balance loss
+    let L_aux = ep_load_balance_loss(picks_ranks, full_ranks, nrank, n_experts, k, alpha)
+
+    return [Y_ranks, L_aux]
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Reference path: single-rank MoE top-k forward (no sharding)
+//  Used as ground truth in tests.
+// ═══════════════════════════════════════════════════════════════
+fn ep_moe_forward_single(X, gate_w, experts_w_all, experts_b_all,
+                         n_experts, d_in, d_out, k) {
+    let n_tok = len(X)
+    let mut Y = []
+    for t in 0..n_tok {
+        let x = X[t]
+        let scores = ep_gate_scores(gate_w, x, n_experts, d_in)
+        let picks  = ep_topk_indices(scores, n_experts, k)
+        let probs  = ep_softmax_subset(scores, picks, k)
+        let mut y = []
+        for i in 0..d_out { y = y + [0.0] }
+        for slot in 0..k {
+            let e = picks[slot]
+            let p = probs[slot]
+            let ye = ep_expert_forward(experts_w_all[e], experts_b_all[e], x, d_out, d_in)
+            let mut y2 = []
+            for i in 0..d_out { y2 = y2 + [y[i] + p * ye[i]] }
+            y = y2
+        }
+        Y = Y + [y]
+    }
+    return Y
+}
+
+println("[expert_parallel] module loaded — MoE all-to-all routing ready")

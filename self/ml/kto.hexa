@@ -1,0 +1,275 @@
+// ═══════════════════════════════════════════════════════════════
+//  kto.hexa — Kahneman-Tversky Optimization in pure Hexa
+//
+//  KTO replaces DPO's paired chosen/rejected requirement with a
+//  single-label objective: each example is either *desirable* or
+//  *undesirable*.  The loss is derived from Kahneman-Tversky
+//  prospect theory, where the agent's "value" is a concave
+//  sigmoid over the log-ratio gain above a reference KL anchor.
+//
+//  KTO loss (single example, label y in {+1, -1}):
+//    r(x, y)  = log pi(y|x) - log pi_ref(y|x)
+//    z_ref    = E_y'~D [ beta * (log pi(y'|x) - log pi_ref(y'|x)) ]
+//              (a detached KL baseline, estimated on-batch)
+//
+//    if y is desirable:
+//        v(x, y) = lambda_D * sigmoid( beta * r(x, y) - z_ref )
+//        L       = lambda_D - v(x, y)                (desirable pulls up)
+//    if y is undesirable:
+//        v(x, y) = lambda_U * sigmoid( z_ref - beta * r(x, y) )
+//        L       = lambda_U - v(x, y)                (undesirable pulls down)
+//
+//  Prospect theory says losses loom larger than gains, so the
+//  canonical recipe uses lambda_U > lambda_D (e.g. 1.33 vs 1.0).
+//
+//  KTO does not need paired data, so every example contributes
+//  independently — making it trivial to train on click/thumbs-up
+//  logs or reward-free production traces.
+//
+//  Base transformer / log-prob plumbing is delegated to dpo.hexa
+//  so the two stay architecturally identical.  Only the loss,
+//  gradient, and training loop are KTO-specific.
+// ═══════════════════════════════════════════════════════════════
+
+// ── KTO hyperparameters ────────────────────────────────────
+let KTO_LAMBDA_D = 1.0
+let KTO_LAMBDA_U = 1.33
+let KTO_BETA     = 0.1
+let KTO_MOMENTUM = 0.9
+let KTO_WD       = 0.01
+
+// ── Weight / grad / scratch constructors ───────────────────
+// Architecturally identical to dpo_*, exposed under kto_ names
+// so downstream callers can stay in the KTO namespace.
+pub fn kto_create_weights() { return dpo_create_weights() }
+pub fn kto_copy_weights(src) { return dpo_copy_weights(src) }
+pub fn kto_create_grads() { return dpo_create_grads() }
+pub fn kto_create_momentum() { return dpo_create_momentum() }
+pub fn kto_create_scratch() { return dpo_create_scratch() }
+
+// ── sigmoid (clamped, numerically safe) ────────────────────
+pub fn kto_sigmoid(x) {
+    if x > 20.0 { return 1.0 }
+    if x < -20.0 { return 0.0 }
+    return 1.0 / (1.0 + exp(0.0 - x))
+}
+
+// ── Kahneman-Tversky value function ────────────────────────
+// v(x, y) = lambda * sigmoid(signed_logit)
+// For desirable:   signed_logit =  beta*r - z_ref
+// For undesirable: signed_logit =  z_ref  - beta*r
+pub fn kto_value_desirable(log_ratio, z_ref) {
+    let signed = KTO_BETA * log_ratio - z_ref
+    return KTO_LAMBDA_D * kto_sigmoid(signed)
+}
+
+pub fn kto_value_undesirable(log_ratio, z_ref) {
+    let signed = z_ref - KTO_BETA * log_ratio
+    return KTO_LAMBDA_U * kto_sigmoid(signed)
+}
+
+// ── Per-example KTO loss ───────────────────────────────────
+// label = +1 (desirable) or -1 (undesirable)
+// Returns [loss, implicit_reward, value]
+pub fn kto_loss_example(policy_weights, ref_weights, ids, label, z_ref, scratch) {
+    let log_pi  = dpo_log_prob(policy_weights, ids, scratch)
+    let log_ref = dpo_log_prob(ref_weights, ids, scratch)
+    let log_ratio = log_pi - log_ref
+    let implicit_reward = KTO_BETA * log_ratio
+    let mut value = 0.0
+    let mut loss = 0.0
+    if label > 0 {
+        value = kto_value_desirable(log_ratio, z_ref)
+        loss  = KTO_LAMBDA_D - value
+    } else {
+        value = kto_value_undesirable(log_ratio, z_ref)
+        loss  = KTO_LAMBDA_U - value
+    }
+    let __ret = [loss, implicit_reward, value]
+    return __ret
+}
+
+// ── Batch-level KL reference anchor (z_ref) ────────────────
+// KTO uses a *detached* estimate of the average implicit reward
+// across the batch as the KT reference point.  We compute it
+// once per batch from the current policy vs reference model.
+pub fn kto_batch_zref(policy_weights, ref_weights, batch, scratch) {
+    let n = len(batch)
+    if n == 0 { return 0.0 }
+    let mut total = 0.0
+    let mut i = 0
+    while i < n {
+        let ex = batch[i]
+        let ids = ex[0]
+        let log_pi  = dpo_log_prob(policy_weights, ids, scratch)
+        let log_ref = dpo_log_prob(ref_weights, ids, scratch)
+        total = total + KTO_BETA * (log_pi - log_ref)
+        i = i + 1
+    }
+    return total / (n * 1.0)
+}
+
+// ── Batch loss aggregator ──────────────────────────────────
+// batch: array of [ids, label] where label in {+1, -1}
+// Returns [avg_loss, avg_reward_D, avg_reward_U, n_D, n_U]
+pub fn kto_batch_loss(policy_weights, ref_weights, batch, z_ref, scratch) {
+    let n = len(batch)
+    let mut total_loss = 0.0
+    let mut total_rd = 0.0
+    let mut total_ru = 0.0
+    let mut n_d = 0
+    let mut n_u = 0
+    let mut i = 0
+    while i < n {
+        let ex = batch[i]
+        let ids = ex[0]
+        let label = ex[1]
+        let r = kto_loss_example(policy_weights, ref_weights, ids, label, z_ref, scratch)
+        total_loss = total_loss + r[0]
+        if label > 0 {
+            total_rd = total_rd + r[1]
+            n_d = n_d + 1
+        } else {
+            total_ru = total_ru + r[1]
+            n_u = n_u + 1
+        }
+        i = i + 1
+    }
+    let denom = n * 1.0
+    if denom < 1.0 { return [0.0, 0.0, 0.0, 0, 0] }
+    let avg_loss = total_loss / denom
+    let mut avg_rd = 0.0
+    let mut avg_ru = 0.0
+    if n_d > 0 { avg_rd = total_rd / (n_d * 1.0) }
+    if n_u > 0 { avg_ru = total_ru / (n_u * 1.0) }
+    let __ret = [avg_loss, avg_rd, avg_ru, n_d, n_u]
+    return __ret
+}
+
+// ── Numerical gradient on LM head (batch, single example) ──
+// Mirrors dpo_numerical_grad_head but evaluates KTO loss.
+// Subset stride keeps cost bounded for CPU finite differences.
+fn kto_numerical_grad_head(policy_weights, ref_weights, ids, label, z_ref, scratch, eps) {
+    let W_lmh = policy_weights[7]
+    let n = DPO_DIM * DPO_VOCAB
+    let g_lmh = tensor_zeros(n)
+    let stride = n / 64
+    let mut i = 0
+    while i < n {
+        let orig = W_lmh[i]
+        W_lmh[i] = orig + eps
+        let lp = kto_loss_example(policy_weights, ref_weights, ids, label, z_ref, scratch)
+        W_lmh[i] = orig - eps
+        let lm = kto_loss_example(policy_weights, ref_weights, ids, label, z_ref, scratch)
+        W_lmh[i] = orig
+        g_lmh[i] = (lp[0] - lm[0]) / (2.0 * eps)
+        i = i + stride
+    }
+    g_lmh
+}
+
+// ── Zero grads / SGD step / opt step ───────────────────────
+// Same layout as DPO — we reuse the DPO tensor shapes so the
+// optimizer can accept KTO grads without adaptation.
+fn kto_zero_grad(grads) {
+    let mut li = 0
+    while li < DPO_LAYERS {
+        mat_scale_inplace(grads[0][li], 0.0)
+        mat_scale_inplace(grads[1][li], 0.0)
+        mat_scale_inplace(grads[2][li], 0.0)
+        mat_scale_inplace(grads[3][li], 0.0)
+        mat_scale_inplace(grads[4][li], 0.0)
+        mat_scale_inplace(grads[5][li], 0.0)
+        li = li + 1
+    }
+    mat_scale_inplace(grads[6], 0.0)
+    mat_scale_inplace(grads[7], 0.0)
+    0
+}
+
+fn kto_sgd(w, g, m, lr) {
+    mat_scale_inplace(w, 1.0 - lr * KTO_WD)
+    mat_scale_inplace(m, KTO_MOMENTUM)
+    mat_add_inplace(m, g)
+    axpy(w, m, -1.0 * lr)
+}
+
+fn kto_opt_step(weights, grads, momenta, lr) {
+    let mut li = 0
+    while li < DPO_LAYERS {
+        kto_sgd(weights[0][li], grads[0][li], momenta[0][li], lr)
+        kto_sgd(weights[1][li], grads[1][li], momenta[1][li], lr)
+        kto_sgd(weights[2][li], grads[2][li], momenta[2][li], lr)
+        kto_sgd(weights[3][li], grads[3][li], momenta[3][li], lr)
+        kto_sgd(weights[4][li], grads[4][li], momenta[4][li], lr)
+        kto_sgd(weights[5][li], grads[5][li], momenta[5][li], lr)
+        li = li + 1
+    }
+    kto_sgd(weights[6], grads[6], momenta[6], lr)
+    kto_sgd(weights[7], grads[7], momenta[7], lr)
+    0
+}
+
+// ── KTO training loop ──────────────────────────────────────
+// batch: array of [ids, label] with label in {+1, -1}
+pub fn kto_train(policy_weights, ref_weights, grads, momenta, scratch, batch, n_steps, lr) {
+    let n_ex = len(batch)
+    println("[kto] training on " + str(n_ex) + " examples, beta=" + str(KTO_BETA) + ", lambda_D=" + str(KTO_LAMBDA_D) + ", lambda_U=" + str(KTO_LAMBDA_U) + ", lr=" + str(lr))
+    let eps = 1.0e-4
+    let mut step = 0
+    while step < n_steps {
+        let t0 = clock()
+        // Detached KL reference anchor (recomputed each step)
+        let z_ref = kto_batch_zref(policy_weights, ref_weights, batch, scratch)
+        // Per-example accumulation
+        let mut total_loss = 0.0
+        let mut total_rd = 0.0
+        let mut total_ru = 0.0
+        let mut n_d = 0
+        let mut n_u = 0
+        let mut ei = 0
+        while ei < n_ex {
+            kto_zero_grad(grads)
+            let ex = batch[ei]
+            let ids = ex[0]
+            let label = ex[1]
+            let r = kto_loss_example(policy_weights, ref_weights, ids, label, z_ref, scratch)
+            total_loss = total_loss + r[0]
+            if label > 0 {
+                total_rd = total_rd + r[1]
+                n_d = n_d + 1
+            } else {
+                total_ru = total_ru + r[1]
+                n_u = n_u + 1
+            }
+            let g_lmh = kto_numerical_grad_head(policy_weights, ref_weights, ids, label, z_ref, scratch, eps)
+            mat_add_inplace(grads[7], g_lmh)
+            kto_opt_step(policy_weights, grads, momenta, lr)
+            ei = ei + 1
+        }
+        let t1 = clock()
+        let avg_loss = total_loss / (n_ex * 1.0)
+        let mut avg_rd = 0.0
+        let mut avg_ru = 0.0
+        if n_d > 0 { avg_rd = total_rd / (n_d * 1.0) }
+        if n_u > 0 { avg_ru = total_ru / (n_u * 1.0) }
+        let ms = (t1 - t0) * 1000.0
+        let mut l = "{\"step\":" + str(step)
+        l = l + ",\"loss\":" + str(avg_loss)
+        l = l + ",\"reward_desirable\":" + str(avg_rd)
+        l = l + ",\"reward_undesirable\":" + str(avg_ru)
+        l = l + ",\"margin\":" + str(avg_rd - avg_ru)
+        l = l + ",\"z_ref\":" + str(z_ref)
+        l = l + ",\"n_D\":" + str(n_d)
+        l = l + ",\"n_U\":" + str(n_u)
+        l = l + ",\"ms\":" + str(ms) + "}"
+        println(l)
+        step = step + 1
+    }
+    0
+}
+
+// ── Param count (identical to DPO architecture) ────────────
+pub fn kto_param_count() { return dpo_param_count() }
+
+println("[kto] loaded — Kahneman-Tversky preference, lambda_D=" + str(KTO_LAMBDA_D) + ", lambda_U=" + str(KTO_LAMBDA_U) + ", beta=" + str(KTO_BETA))

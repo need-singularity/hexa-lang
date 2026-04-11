@@ -1,0 +1,746 @@
+// ═══════════════════════════════════════════════════════════════════
+//  test_megalodon.hexa — Megalodon CEMA + Chunked MA attention (#209)
+//
+//  Tests (35):
+//    T1  initialize_alpha length == n_freqs
+//    T2  initialize_alpha values strictly in (0,1)
+//    T3  initialize_alpha monotonically decreasing
+//    T4  create_cema dim + n_freqs stored
+//    T5  create_cema alpha length == n_freqs
+//    T6  create_cema theta length == n_freqs
+//    T7  create_cema weight length == dim*n_freqs
+//    T8  rotary_phase returns 2-element list
+//    T9  rotary_phase at t=0: (1, 0)
+//    T10 rotary_phase: cos² + sin² = 1
+//    T11 rotary_phase: bounded [-1, 1]
+//    T12 CEMA state_re length == dim*n_freqs
+//    T13 CEMA state_im length == dim*n_freqs
+//    T14 CEMA step output y length == dim
+//    T15 CEMA step updates state (non-zero from non-zero input)
+//    T16 CEMA zero input → zero state update
+//    T17 CEMA scan length == seq_len
+//    T18 CEMA scan row length == dim
+//    T19 CEMA scan deterministic (same params → same output)
+//    T20 softmax row sums to 1.0
+//    T21 softmax row non-negative
+//    T22 softmax_row bounded [0,1]
+//    T23 chunk attention shape preserved
+//    T24 chunk attention row sums to 1.0 (per chunk) in weight layer
+//    T25 chunk attention: identity V values preserved when uniform Q,K
+//    T26 timestep_norm output mean ≈ beta (zeros)
+//    T27 timestep_norm output std ≈ gamma (ones)
+//    T28 timestep_norm gamma=3 → std ≈ 3
+//    T29 gated_residual gate=-inf → output == x
+//    T30 gated_residual gate=+inf → output == x + y
+//    T31 gated_residual gate=0 → output == x + 0.5 y
+//    T32 multi_chunk_scan length == seq_len
+//    T33 multi_chunk_scan row length == dim
+//    T34 forward_block output shape [seq_len, dim]
+//    T35 forward_block deterministic
+//
+//  Run: PATH=/Users/ghost/.cargo/bin:$PATH ./hexa self/test_megalodon.hexa
+// ═══════════════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ═══════════════════════════════════════════════════════════════════
+//  Inlined Megalodon implementation (mirrors self/ml/megalodon.hexa)
+// ═══════════════════════════════════════════════════════════════════
+
+fn mega_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn mega_max(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn mega_min(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn mega_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn mega_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn mega_sigmoid(x) {
+    if x > 20.0 { return 1.0 }
+    if x < -20.0 { return 0.0 }
+    return 1.0 / (1.0 + mega_exp(0.0 - x))
+}
+
+let MEGA_PI = 3.141592653589793
+let MEGA_TWO_PI = 6.283185307179586
+
+fn mega_sin(x) {
+    let mut v = x
+    for _i in 0..40 {
+        if v > MEGA_PI {
+            v = v - MEGA_TWO_PI
+        } else if v < 0.0 - MEGA_PI {
+            v = v + MEGA_TWO_PI
+        } else {
+            v = v
+        }
+    }
+    let mut result = 0.0
+    let mut term = v
+    for i in 0..15 {
+        result = result + term
+        term = 0.0 - term * v * v / to_float((2 * i + 2) * (2 * i + 3))
+    }
+    return result
+}
+
+fn mega_cos(x) {
+    return mega_sin(x + MEGA_PI / 2.0)
+}
+
+fn mega_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn mega_ones(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [1.0] }
+    return v
+}
+
+fn mega_zeros_2d(r, c) {
+    let mut m = []
+    for _i in 0..r {
+        let mut row = []
+        for _j in 0..c { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+fn mega_vec_add(a, b) {
+    let n = len(a)
+    let mut out = []
+    for i in 0..n { out = out + [a[i] + b[i]] }
+    return out
+}
+
+fn mega_vec_scale(v, s) {
+    let n = len(v)
+    let mut out = []
+    for i in 0..n { out = out + [v[i] * s] }
+    return out
+}
+
+fn mega_dot(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    for i in 0..n { s = s + a[i] * b[i] }
+    return s
+}
+
+fn mega_initialize_alpha(n_freqs) {
+    if n_freqs <= 0 { return [] }
+    let mut alphas = []
+    for i in 0..n_freqs {
+        let denom = mega_max(1, n_freqs - 1)
+        let t = to_float(i) / to_float(denom)
+        let lam = 0.01 + 0.68 * t
+        let a = mega_exp(0.0 - lam)
+        alphas = alphas + [a]
+    }
+    return alphas
+}
+
+fn mega_create_cema(dim, n_freqs, decay_init) {
+    let base = mega_initialize_alpha(n_freqs)
+    let mut alphas = []
+    for i in 0..n_freqs {
+        let a = base[i] * decay_init
+        let a1 = mega_min(0.999, mega_max(1.0e-4, a))
+        alphas = alphas + [a1]
+    }
+    let mut thetas = []
+    for i in 0..n_freqs {
+        let t = to_float(i + 1) / to_float(n_freqs + 1)
+        thetas = thetas + [t * MEGA_PI]
+    }
+    let mut weights = []
+    for d in 0..dim {
+        for f in 0..n_freqs {
+            let h = (d * 131 + f * 733 + 7) % 10007
+            let w = (to_float(h) / 10007.0 - 0.5) * 0.5
+            weights = weights + [w]
+        }
+    }
+    return #{
+        "alpha": alphas,
+        "theta": thetas,
+        "weight": weights,
+        "dim": dim,
+        "n_freqs": n_freqs
+    }
+}
+
+fn mega_rotary_phase(theta, t) {
+    let angle = theta * to_float(t)
+    let c = mega_cos(angle)
+    let s = mega_sin(angle)
+    return [c, s]
+}
+
+fn mega_cema_step(state_re, state_im, x, params, dim, n_freqs) {
+    let alpha = params["alpha"]
+    let theta = params["theta"]
+    let weight = params["weight"]
+    let mut new_re = []
+    let mut new_im = []
+    let mut cs = []
+    let mut ss = []
+    for f in 0..n_freqs {
+        let rp = mega_rotary_phase(theta[f], 1)
+        cs = cs + [rp[0]]
+        ss = ss + [rp[1]]
+    }
+    for d in 0..dim {
+        for f in 0..n_freqs {
+            let idx = d * n_freqs + f
+            let sr = state_re[idx]
+            let si = state_im[idx]
+            let c = cs[f]
+            let s = ss[f]
+            let decayed_re = alpha[f] * (c * sr - s * si)
+            let decayed_im = alpha[f] * (c * si + s * sr)
+            let input_contrib = weight[idx] * x[d]
+            new_re = new_re + [decayed_re + input_contrib]
+            new_im = new_im + [decayed_im]
+        }
+    }
+    let mut y = []
+    for d in 0..dim {
+        let mut acc = 0.0
+        for f in 0..n_freqs {
+            acc = acc + new_re[d * n_freqs + f]
+        }
+        y = y + [acc]
+    }
+    return [new_re, new_im, y]
+}
+
+fn mega_cema_scan(params, xs, seq_len, dim, n_freqs) {
+    let flat = dim * n_freqs
+    let mut state_re = mega_zeros(flat)
+    let mut state_im = mega_zeros(flat)
+    let mut outputs = []
+    for t in 0..seq_len {
+        let x = xs[t]
+        let step = mega_cema_step(state_re, state_im, x, params, dim, n_freqs)
+        state_re = step[0]
+        state_im = step[1]
+        outputs = outputs + [step[2]]
+    }
+    return outputs
+}
+
+fn mega_softmax_row(row, n) {
+    if n <= 0 { return [] }
+    let mut m = row[0]
+    for i in 1..n {
+        if row[i] > m { m = row[i] }
+    }
+    let mut exps = []
+    let mut sum = 0.0
+    for i in 0..n {
+        let e = mega_exp(row[i] - m)
+        exps = exps + [e]
+        sum = sum + e
+    }
+    if sum <= 0.0 { sum = 1.0 }
+    let mut out = []
+    for i in 0..n {
+        out = out + [exps[i] / sum]
+    }
+    return out
+}
+
+fn mega_chunk_attention(Q, K, V, chunk_size, seq_len, d_head) {
+    let scale = 1.0 / mega_sqrt(to_float(d_head))
+    let mut output = mega_zeros_2d(seq_len, d_head)
+    let mut start = 0
+    while start < seq_len {
+        let mut end = start + chunk_size
+        if end > seq_len { end = seq_len }
+        let clen = end - start
+        let mut rows = []
+        for i in 0..clen {
+            let qi = Q[start + i]
+            let mut row = []
+            for j in 0..clen {
+                let kj = K[start + j]
+                let s = mega_dot(qi, kj) * scale
+                row = row + [s]
+            }
+            rows = rows + [row]
+        }
+        let mut weights_rows = []
+        for i in 0..clen {
+            let w = mega_softmax_row(rows[i], clen)
+            weights_rows = weights_rows + [w]
+        }
+        for i in 0..clen {
+            let mut out_row = mega_zeros(d_head)
+            for j in 0..clen {
+                let w = weights_rows[i][j]
+                let vj = V[start + j]
+                for k in 0..d_head {
+                    out_row[k] = out_row[k] + w * vj[k]
+                }
+            }
+            output[start + i] = out_row
+        }
+        start = start + chunk_size
+    }
+    return output
+}
+
+fn mega_timestep_norm(x, gamma, beta, dim) {
+    if dim <= 0 { return [] }
+    let mut mean = 0.0
+    for i in 0..dim { mean = mean + x[i] }
+    mean = mean / to_float(dim)
+    let mut var = 0.0
+    for i in 0..dim {
+        let d = x[i] - mean
+        var = var + d * d
+    }
+    var = var / to_float(dim)
+    let inv_std = 1.0 / mega_sqrt(var + 1.0e-5)
+    let mut out = []
+    for i in 0..dim {
+        let normed = (x[i] - mean) * inv_std
+        out = out + [gamma[i] * normed + beta[i]]
+    }
+    return out
+}
+
+fn mega_gated_residual(x, y, gate_proj, dim) {
+    let mut out = []
+    for i in 0..dim {
+        let g = mega_sigmoid(gate_proj[i])
+        out = out + [x[i] + g * y[i]]
+    }
+    return out
+}
+
+fn mega_multi_chunk_scan(params, xs, seq_len, chunk, dim) {
+    if chunk <= 0 { return [] }
+    let n_freqs = params["n_freqs"]
+    let flat = dim * n_freqs
+    let mut state_re = mega_zeros(flat)
+    let mut state_im = mega_zeros(flat)
+    let mut outputs = []
+    let mut t = 0
+    while t < seq_len {
+        let mut end = t + chunk
+        if end > seq_len { end = seq_len }
+        for k in t..end {
+            let x = xs[k]
+            let step = mega_cema_step(state_re, state_im, x, params, dim, n_freqs)
+            state_re = step[0]
+            state_im = step[1]
+            outputs = outputs + [step[2]]
+        }
+        t = end
+    }
+    return outputs
+}
+
+fn mega_forward_block(params, x_seq, seq_len, dim) {
+    let n_freqs = params["n_freqs"]
+    let cema_out = mega_cema_scan(params, x_seq, seq_len, dim, n_freqs)
+    let attn = mega_chunk_attention(cema_out, cema_out, cema_out, 8, seq_len, dim)
+    let gamma = mega_ones(dim)
+    let beta = mega_zeros(dim)
+    let gate = mega_zeros(dim)
+    let mut out = []
+    for t in 0..seq_len {
+        let normed = mega_timestep_norm(attn[t], gamma, beta, dim)
+        let gr = mega_gated_residual(x_seq[t], normed, gate, dim)
+        out = out + [gr]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  TESTS
+// ═══════════════════════════════════════════════════════════════════
+
+let DIM = 4
+let N_FREQS = 3
+let SEQ_LEN = 10
+
+let params = mega_create_cema(DIM, N_FREQS, 1.0)
+
+// Build a deterministic input sequence
+fn build_xs(seq_len, dim) {
+    let mut xs = []
+    for t in 0..seq_len {
+        let mut row = []
+        for d in 0..dim {
+            let h = (t * 17 + d * 31 + 1) % 97
+            row = row + [to_float(h) / 97.0]
+        }
+        xs = xs + [row]
+    }
+    return xs
+}
+
+let xs = build_xs(SEQ_LEN, DIM)
+let zero_xs = mega_zeros_2d(SEQ_LEN, DIM)
+
+// T1 initialize_alpha length
+let a1 = mega_initialize_alpha(N_FREQS)
+check("T1 initialize_alpha length == n_freqs", len(a1) == N_FREQS)
+
+// T2 initialize_alpha values in (0, 1)
+let mut in_range = true
+for i in 0..N_FREQS {
+    if a1[i] <= 0.0 || a1[i] >= 1.0 { in_range = false }
+}
+check("T2 initialize_alpha values in (0,1)", in_range)
+
+// T3 initialize_alpha monotonically decreasing
+let mut mono = true
+for i in 1..N_FREQS {
+    if a1[i] > a1[i - 1] { mono = false }
+}
+check("T3 initialize_alpha monotonically decreasing", mono)
+
+// T4 create_cema dim + n_freqs stored
+check("T4 create_cema stores dim+n_freqs",
+    params["dim"] == DIM && params["n_freqs"] == N_FREQS)
+
+// T5 alpha length
+let palpha = params["alpha"]
+check("T5 create_cema alpha length == n_freqs", len(palpha) == N_FREQS)
+
+// T6 theta length
+let ptheta = params["theta"]
+check("T6 create_cema theta length == n_freqs", len(ptheta) == N_FREQS)
+
+// T7 weight length
+let pweight = params["weight"]
+check("T7 create_cema weight length == dim*n_freqs",
+    len(pweight) == DIM * N_FREQS)
+
+// T8 rotary_phase returns 2-element list
+let rp8 = mega_rotary_phase(0.3, 5)
+check("T8 rotary_phase returns 2-element list", len(rp8) == 2)
+
+// T9 rotary_phase at t=0: (1, 0)
+let rp9 = mega_rotary_phase(0.5, 0)
+check("T9 rotary_phase at t=0 is (1,0)",
+    approx(rp9[0], 1.0, 1.0e-6) && approx(rp9[1], 0.0, 1.0e-6))
+
+// T10 rotary_phase cos² + sin² = 1
+let mut cssum_ok = true
+let test_thetas = [0.0, 0.3, 0.7, 1.1, 2.5, 3.14, 5.0]
+let test_ts = [0, 1, 3, 7, 17]
+for i in 0..7 {
+    for j in 0..5 {
+        let rp = mega_rotary_phase(test_thetas[i], test_ts[j])
+        let c = rp[0]
+        let s = rp[1]
+        let sum = c * c + s * s
+        if !approx(sum, 1.0, 1.0e-4) { cssum_ok = false }
+    }
+}
+check("T10 rotary_phase cos² + sin² == 1", cssum_ok)
+
+// T11 rotary_phase bounded
+let mut bounded = true
+for i in 0..7 {
+    for j in 0..5 {
+        let rp = mega_rotary_phase(test_thetas[i], test_ts[j])
+        if rp[0] > 1.0 + 1.0e-6 || rp[0] < -1.0 - 1.0e-6 { bounded = false }
+        if rp[1] > 1.0 + 1.0e-6 || rp[1] < -1.0 - 1.0e-6 { bounded = false }
+    }
+}
+check("T11 rotary_phase bounded [-1,1]", bounded)
+
+// T12, T13 state shapes
+let flat = DIM * N_FREQS
+let state_re0 = mega_zeros(flat)
+let state_im0 = mega_zeros(flat)
+check("T12 CEMA state_re length == dim*n_freqs", len(state_re0) == flat)
+check("T13 CEMA state_im length == dim*n_freqs", len(state_im0) == flat)
+
+// T14 CEMA step output y length
+let x_test = [0.5, 0.3, 0.2, 0.4]
+let step14 = mega_cema_step(state_re0, state_im0, x_test, params, DIM, N_FREQS)
+let new_re_14 = step14[0]
+let new_im_14 = step14[1]
+let y_14 = step14[2]
+check("T14 CEMA step output y length == dim", len(y_14) == DIM)
+
+// T15 CEMA step updates state (new_re not all zero)
+let mut any_nonzero = false
+for i in 0..flat {
+    if fabs(new_re_14[i]) > 1.0e-9 { any_nonzero = true }
+}
+check("T15 CEMA step updates state (non-zero)", any_nonzero)
+
+// T16 CEMA zero input → zero state update
+let zero_x = mega_zeros(DIM)
+let step16 = mega_cema_step(state_re0, state_im0, zero_x, params, DIM, N_FREQS)
+let new_re_16 = step16[0]
+let new_im_16 = step16[1]
+let mut all_zero_state = true
+for i in 0..flat {
+    if fabs(new_re_16[i]) > 1.0e-12 { all_zero_state = false }
+    if fabs(new_im_16[i]) > 1.0e-12 { all_zero_state = false }
+}
+check("T16 CEMA zero input → zero state update", all_zero_state)
+
+// T17 CEMA scan length
+let outs17 = mega_cema_scan(params, xs, SEQ_LEN, DIM, N_FREQS)
+check("T17 CEMA scan length == seq_len", len(outs17) == SEQ_LEN)
+
+// T18 CEMA scan row length
+let mut rows_ok18 = true
+for t in 0..SEQ_LEN {
+    if len(outs17[t]) != DIM { rows_ok18 = false }
+}
+check("T18 CEMA scan row length == dim", rows_ok18)
+
+// T19 CEMA scan deterministic
+let outs19 = mega_cema_scan(params, xs, SEQ_LEN, DIM, N_FREQS)
+let mut det = true
+for t in 0..SEQ_LEN {
+    for d in 0..DIM {
+        if !approx(outs17[t][d], outs19[t][d], 1.0e-12) { det = false }
+    }
+}
+check("T19 CEMA scan deterministic", det)
+
+// T20 softmax row sums to 1.0
+let sm_row = [1.0, 2.0, 3.0, 4.0, 0.5]
+let sm20 = mega_softmax_row(sm_row, 5)
+let mut sm_sum = 0.0
+for i in 0..5 { sm_sum = sm_sum + sm20[i] }
+check("T20 softmax row sums to 1.0", approx(sm_sum, 1.0, 1.0e-6))
+
+// T21 softmax row non-negative
+let mut non_neg = true
+for i in 0..5 { if sm20[i] < 0.0 { non_neg = false } }
+check("T21 softmax row non-negative", non_neg)
+
+// T22 softmax row bounded [0,1]
+let mut sm_bounded = true
+for i in 0..5 {
+    if sm20[i] < 0.0 - 1.0e-9 || sm20[i] > 1.0 + 1.0e-9 { sm_bounded = false }
+}
+check("T22 softmax row bounded [0,1]", sm_bounded)
+
+// T23 chunk attention shape preserved
+let d_head = 4
+let seq_a = 10
+let chunk = 4
+// Build random-ish Q,K,V
+fn build_qkv(seq, dh, seed) {
+    let mut m = []
+    for t in 0..seq {
+        let mut row = []
+        for d in 0..dh {
+            let h = (t * 23 + d * 41 + seed * 7) % 113
+            row = row + [to_float(h) / 113.0]
+        }
+        m = m + [row]
+    }
+    return m
+}
+let Q_a = build_qkv(seq_a, d_head, 1)
+let K_a = build_qkv(seq_a, d_head, 2)
+let V_a = build_qkv(seq_a, d_head, 3)
+let attn23 = mega_chunk_attention(Q_a, K_a, V_a, chunk, seq_a, d_head)
+check("T23 chunk attention shape preserved",
+    len(attn23) == seq_a && len(attn23[0]) == d_head)
+
+// T24 chunk attention row softmax sums to 1 — test the weight layer directly
+// by computing scores and softmax for one chunk row
+let scale24 = 1.0 / mega_sqrt(to_float(d_head))
+let mut sums_ok = true
+let mut start24 = 0
+while start24 < seq_a {
+    let mut end24 = start24 + chunk
+    if end24 > seq_a { end24 = seq_a }
+    let clen24 = end24 - start24
+    for i in 0..clen24 {
+        let qi = Q_a[start24 + i]
+        let mut rowscores = []
+        for j in 0..clen24 {
+            let kj = K_a[start24 + j]
+            rowscores = rowscores + [mega_dot(qi, kj) * scale24]
+        }
+        let w = mega_softmax_row(rowscores, clen24)
+        let mut s = 0.0
+        for k in 0..clen24 { s = s + w[k] }
+        if !approx(s, 1.0, 1.0e-6) { sums_ok = false }
+    }
+    start24 = start24 + chunk
+}
+check("T24 chunk attention softmax row sums to 1.0 per chunk", sums_ok)
+
+// T25 chunk attention with uniform Q=K=zero and V=constant
+// → weights uniform → output == average of V in chunk
+let zero_q = mega_zeros_2d(seq_a, d_head)
+let zero_k = mega_zeros_2d(seq_a, d_head)
+let mut const_v = []
+for _t in 0..seq_a {
+    let mut row = []
+    for _d in 0..d_head { row = row + [0.7] }
+    const_v = const_v + [row]
+}
+let attn25 = mega_chunk_attention(zero_q, zero_k, const_v, chunk, seq_a, d_head)
+let mut const_ok = true
+for t in 0..seq_a {
+    for d in 0..d_head {
+        if !approx(attn25[t][d], 0.7, 1.0e-6) { const_ok = false }
+    }
+}
+check("T25 chunk attention preserves constant V", const_ok)
+
+// T26 timestep_norm output mean ≈ beta(zeros)
+let tnx = [1.0, 3.0, 5.0, 7.0]
+let tngamma = mega_ones(4)
+let tnbeta = mega_zeros(4)
+let tn26 = mega_timestep_norm(tnx, tngamma, tnbeta, 4)
+let mut tnmean = 0.0
+for i in 0..4 { tnmean = tnmean + tn26[i] }
+tnmean = tnmean / 4.0
+check("T26 timestep_norm mean ≈ 0 (beta=0)", approx(tnmean, 0.0, 1.0e-4))
+
+// T27 timestep_norm std ≈ gamma(1)
+let mut tnvar = 0.0
+for i in 0..4 {
+    let d = tn26[i] - tnmean
+    tnvar = tnvar + d * d
+}
+tnvar = tnvar / 4.0
+let tnstd = mega_sqrt(tnvar)
+check("T27 timestep_norm std ≈ gamma (1.0)", approx(tnstd, 1.0, 1.0e-2))
+
+// T28 timestep_norm gamma=3 → std ≈ 3
+let gamma3 = [3.0, 3.0, 3.0, 3.0]
+let tn28 = mega_timestep_norm(tnx, gamma3, tnbeta, 4)
+let mut m28 = 0.0
+for i in 0..4 { m28 = m28 + tn28[i] }
+m28 = m28 / 4.0
+let mut v28 = 0.0
+for i in 0..4 { let d = tn28[i] - m28; v28 = v28 + d * d }
+v28 = v28 / 4.0
+let std28 = mega_sqrt(v28)
+check("T28 timestep_norm gamma=3 → std ≈ 3", approx(std28, 3.0, 1.0e-2))
+
+// T29 gated_residual gate=-inf → output == x
+let gx = [0.5, 0.6, 0.7, 0.8]
+let gy = [1.0, 2.0, 3.0, 4.0]
+let g_neg = [-30.0, -30.0, -30.0, -30.0]
+let gr29 = mega_gated_residual(gx, gy, g_neg, 4)
+let mut gr29_ok = true
+for i in 0..4 {
+    if !approx(gr29[i], gx[i], 1.0e-6) { gr29_ok = false }
+}
+check("T29 gated_residual gate=-inf → output == x", gr29_ok)
+
+// T30 gated_residual gate=+inf → output == x + y
+let g_pos = [30.0, 30.0, 30.0, 30.0]
+let gr30 = mega_gated_residual(gx, gy, g_pos, 4)
+let mut gr30_ok = true
+for i in 0..4 {
+    if !approx(gr30[i], gx[i] + gy[i], 1.0e-6) { gr30_ok = false }
+}
+check("T30 gated_residual gate=+inf → output == x + y", gr30_ok)
+
+// T31 gated_residual gate=0 → x + 0.5 * y
+let g_zero = [0.0, 0.0, 0.0, 0.0]
+let gr31 = mega_gated_residual(gx, gy, g_zero, 4)
+let mut gr31_ok = true
+for i in 0..4 {
+    if !approx(gr31[i], gx[i] + 0.5 * gy[i], 1.0e-6) { gr31_ok = false }
+}
+check("T31 gated_residual gate=0 → x + 0.5 y", gr31_ok)
+
+// T32 multi_chunk_scan length == seq_len
+let mcs32 = mega_multi_chunk_scan(params, xs, SEQ_LEN, 4, DIM)
+check("T32 multi_chunk_scan length == seq_len", len(mcs32) == SEQ_LEN)
+
+// T33 multi_chunk_scan row length == dim
+let mut mcs_row_ok = true
+for t in 0..SEQ_LEN {
+    if len(mcs32[t]) != DIM { mcs_row_ok = false }
+}
+check("T33 multi_chunk_scan row length == dim", mcs_row_ok)
+
+// T34 forward_block output shape
+let blk34 = mega_forward_block(params, xs, SEQ_LEN, DIM)
+let mut shape_ok = true
+if len(blk34) != SEQ_LEN { shape_ok = false }
+for t in 0..SEQ_LEN {
+    if len(blk34[t]) != DIM { shape_ok = false }
+}
+check("T34 forward_block output shape [seq_len, dim]", shape_ok)
+
+// T35 forward_block deterministic
+let blk35 = mega_forward_block(params, xs, SEQ_LEN, DIM)
+let mut fb_det = true
+for t in 0..SEQ_LEN {
+    for d in 0..DIM {
+        if !approx(blk34[t][d], blk35[t][d], 1.0e-12) { fb_det = false }
+    }
+}
+check("T35 forward_block deterministic", fb_det)
+
+// ═══════════════════════════════════════════════════════════════════
+println("")
+println("=== Megalodon test summary ===")
+println("PASS: " + str(pass_count))
+println("FAIL: " + str(fail_count))
+println("TOTAL: " + str(pass_count + fail_count))

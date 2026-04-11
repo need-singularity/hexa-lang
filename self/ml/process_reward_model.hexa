@@ -1,0 +1,309 @@
+// ===================================================================
+//  self/ml/process_reward_model.hexa — Process Reward Model (#222)
+//
+//  PRM (Lightman et al. "Let's Verify Step by Step", 2023; Wang et al.
+//  "Math-Shepherd", 2024). Unlike outcome-only reward models that score
+//  the final answer, a Process Reward Model scores EVERY reasoning step
+//  with a 0/1 (bad/good) signal. This gives a much denser learning
+//  signal for chain-of-thought training and enables PRM-guided beam
+//  search where each candidate step is gated by the PRM score.
+//
+//  Components:
+//    1. Linear scorer       — sigmoid(W·hidden + b) per step
+//    2. Trajectory scoring  — list of step scores
+//    3. Aggregations:
+//         min          — bottleneck step
+//         product      — joint independence
+//         min+last     — average of weakest and final step
+//         weighted     — generic weighted sum
+//    4. Beam search step    — keep top-k candidates by PRM score
+//    5. BCE training        — gradient step on labelled steps
+//    6. Trajectory eval     — overall quality (default: min+last)
+//    7. Pairwise compare    — return 0 (a) or 1 (b)
+//
+//  Representation:
+//    scorer = [W (array of dim floats), b (1-element array)]
+//
+//  All ops are pure .hexa, deterministic, prefix `prm_`.
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+//    @hot   — inner scoring/beam loop
+// ===================================================================
+
+// ===================================================================
+//  Math helpers
+// ===================================================================
+
+@pure
+fn prm_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+@pure
+fn prm_max(a, b) {
+    if a > b { return a }
+    return b
+}
+
+@pure
+fn prm_min(a, b) {
+    if a < b { return a }
+    return b
+}
+
+@pure
+fn prm_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+@pure
+fn prm_log_safe(x) {
+    // Bounded log: log(0) → -30 instead of -inf
+    if x <= 1.0e-12 { return -30.0 }
+    let mut y = 0.0
+    let t = (x - 1.0) / (x + 1.0)
+    let t2 = t * t
+    let mut term = t
+    for i in 0..15 {
+        y = y + term / to_float(2 * i + 1)
+        term = term * t2
+    }
+    return 2.0 * y
+}
+
+@pure @hot
+fn prm_sigmoid(x) {
+    if x > 20.0 { return 1.0 }
+    if x < -20.0 { return 0.0 }
+    return 1.0 / (1.0 + prm_exp(0.0 - x))
+}
+
+// ===================================================================
+//  Vector helpers
+// ===================================================================
+
+@pure
+fn prm_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+@pure
+fn prm_ones(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [1.0] }
+    return v
+}
+
+// Deterministic small init in [-scale, +scale]
+@pure
+fn prm_init_vec(dim, seed) {
+    let mut v = []
+    for i in 0..dim {
+        let h = (i * 251 + seed * 6173) % 10007
+        let val = (to_float(h) / 10007.0 - 0.5) * 0.2
+        v = v + [val]
+    }
+    return v
+}
+
+@pure @hot
+fn prm_dot(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    for i in 0..n { s = s + a[i] * b[i] }
+    return s
+}
+
+// ===================================================================
+//  1. Scorer creation
+//     scorer = [W (dim floats), b (1-element)]
+// ===================================================================
+
+@pure
+fn prm_create_scorer(dim) {
+    let W = prm_init_vec(dim, 1337)
+    let b = [0.0]
+    return [W, b]
+}
+
+// ===================================================================
+//  2. Per-step scoring
+//     score = sigmoid(W·hidden + b)
+// ===================================================================
+
+@pure @hot
+fn prm_score_step(scorer, hidden, dim) {
+    let W = scorer[0]
+    let b = scorer[1]
+    let logit = prm_dot(W, hidden) + b[0]
+    return prm_sigmoid(logit)
+}
+
+// ===================================================================
+//  3. Trajectory scoring
+//     hidden_steps: array of n_steps hidden vectors (each length dim)
+// ===================================================================
+
+@pure
+fn prm_score_trajectory(scorer, hidden_steps, n_steps, dim) {
+    let mut scores = []
+    for i in 0..n_steps {
+        scores = scores + [prm_score_step(scorer, hidden_steps[i], dim)]
+    }
+    return scores
+}
+
+// ===================================================================
+//  4. Aggregations
+// ===================================================================
+
+@pure
+fn prm_aggregate_min(scores, n) {
+    if n == 0 { return 0.0 }
+    let mut m = scores[0]
+    for i in 1..n {
+        if scores[i] < m { m = scores[i] }
+    }
+    return m
+}
+
+@pure
+fn prm_aggregate_product(scores, n) {
+    if n == 0 { return 0.0 }
+    let mut p = 1.0
+    for i in 0..n { p = p * scores[i] }
+    return p
+}
+
+@pure
+fn prm_aggregate_min_last(scores, n) {
+    if n == 0 { return 0.0 }
+    let m = prm_aggregate_min(scores, n)
+    let last = scores[n - 1]
+    return (m + last) / 2.0
+}
+
+@pure
+fn prm_aggregate_weighted(scores, weights, n) {
+    if n == 0 { return 0.0 }
+    let mut s = 0.0
+    for i in 0..n { s = s + scores[i] * weights[i] }
+    return s
+}
+
+// ===================================================================
+//  5. PRM-guided beam search step
+//     candidates: array of candidate step indices
+//     hidden_states: array of corresponding hidden vectors
+//     Returns: top beam_size indices sorted by PRM score
+// ===================================================================
+
+@pure @hot
+fn prm_beam_search_step(prm_scorer, candidates, hidden_states, dim, beam_size) {
+    let n = len(candidates)
+    if n == 0 { return [] }
+    // Score each candidate
+    let mut scores = []
+    for i in 0..n {
+        scores = scores + [prm_score_step(prm_scorer, hidden_states[i], dim)]
+    }
+    // Selection-sort top-k indices
+    let k = if beam_size < n { beam_size } else { n }
+    let mut taken = []
+    for _u in 0..n { taken = taken + [false] }
+    let mut top = []
+    for _u in 0..k {
+        let mut best_idx = -1
+        let mut best_val = -1.0
+        for j in 0..n {
+            if taken[j] == false {
+                if scores[j] > best_val {
+                    best_val = scores[j]
+                    best_idx = j
+                }
+            }
+        }
+        if best_idx >= 0 {
+            top = top + [candidates[best_idx]]
+            taken[best_idx] = true
+        }
+    }
+    return top
+}
+
+// ===================================================================
+//  6. Binary cross-entropy loss for a single step
+//     L = -[y log(p) + (1-y) log(1-p)]
+// ===================================================================
+
+@pure
+fn prm_bce_loss(score, label) {
+    let p = score
+    let y = label
+    let one_m_p = 1.0 - p
+    let term1 = y * prm_log_safe(p)
+    let term2 = (1.0 - y) * prm_log_safe(one_m_p)
+    let loss = 0.0 - (term1 + term2)
+    if loss < 0.0 { return 0.0 }
+    return loss
+}
+
+// ===================================================================
+//  7. Single train step (gradient descent on W,b)
+//     dL/d_logit = (p - y)
+//     dL/dW      = (p - y) * hidden
+//     dL/db      = (p - y)
+//     Returns NEW scorer (functional update — original unchanged)
+// ===================================================================
+
+@pure
+fn prm_train_step(scorer, hidden, label, dim, lr) {
+    let W = scorer[0]
+    let b = scorer[1]
+    let p = prm_score_step(scorer, hidden, dim)
+    let diff = p - label
+    let mut new_W = []
+    for i in 0..dim {
+        new_W = new_W + [W[i] - lr * diff * hidden[i]]
+    }
+    let new_b = [b[0] - lr * diff]
+    return [new_W, new_b]
+}
+
+// ===================================================================
+//  8. Trajectory evaluation — overall quality scalar
+//     Default aggregation: min+last (Math-Shepherd style)
+// ===================================================================
+
+@pure
+fn prm_eval_trajectory(scorer, trajectory, n_steps, dim) {
+    let scores = prm_score_trajectory(scorer, trajectory, n_steps, dim)
+    return prm_aggregate_min_last(scores, n_steps)
+}
+
+// ===================================================================
+//  9. Pairwise comparison
+//     Returns 0 if trajectory_a is better, 1 if trajectory_b is better
+// ===================================================================
+
+@pure
+fn prm_compare_trajectories(scorer, traj_a, traj_b, n_steps_a, n_steps_b, dim) {
+    let qa = prm_eval_trajectory(scorer, traj_a, n_steps_a, dim)
+    let qb = prm_eval_trajectory(scorer, traj_b, n_steps_b, dim)
+    if qa >= qb { return 0 }
+    return 1
+}

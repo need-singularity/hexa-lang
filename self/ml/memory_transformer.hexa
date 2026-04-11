@@ -1,0 +1,467 @@
+// ===================================================================
+//  self/ml/memory_transformer.hexa — Memory Transformer
+//
+//  SSOT: shared/hexa-lang/ml-next-level.json id=89
+//
+//  External memory-augmented transformer:
+//    - Memory slots as (key, value) pairs stored in a vector store.
+//    - Read path: query → kNN retrieval → attention over retrieved k/v.
+//    - Write path: LRU eviction + similarity-threshold gating.
+//    - Forward integration: hidden ← hidden + read_attention(query).
+//
+//  This module stays self-contained (pure Hexa) and is intentionally
+//  independent of hnsw.hexa / vector_store.hexa to avoid cross-module
+//  coupling and keep tests hermetic. The read path uses brute-force
+//  cosine search (exact top_k) which serves as a correct reference
+//  implementation; callers can swap in hnsw_search if desired.
+//
+//  Public API:
+//    create_memory(dim, capacity, write_threshold)  → MemoryBank
+//    memory_write(mem, key, value, metadata)        → updated bank
+//    memory_read(mem, query, top_k)                 → [[id, score, value], ...]
+//    memory_read_attention(mem, query, top_k)       → attended value vector
+//    memory_forward(mem, hidden, top_k, alpha)      → new hidden + residual
+//    memory_size(mem)                               → int
+//    memory_touch(mem, id)                          → updated bank (LRU bump)
+//    memory_evict_lru(mem)                          → updated bank
+//    memory_should_write(mem, key, threshold)       → bool
+//
+//  Pitfalls avoided (HX3):
+//    • No complex index assignment — functional array rebuild
+//    • No struct-literal inside `if` / `while` head
+//    • No bit-twiddle / manual-loop tricks — @attr vector math
+//    • Deterministic LRU via monotonically-increasing tick counter
+//    • softmax numerically stable via max-subtraction
+// ===================================================================
+
+// ── Numeric helpers (local, no cross-module deps) ──────────────────
+
+fn mt_exp(x) {
+    // Fast-enough exp approximation via Horner / series (dim-agnostic,
+    // used only inside softmax on small top_k vectors).
+    let mut y = x
+    // Clamp extreme values so softmax stays sane even with rough series.
+    if y > 60.0 { y = 60.0 }
+    if y < 0.0 - 60.0 { y = 0.0 - 60.0 }
+    // exp(x) = 2^(x/ln2); use hexa builtin if available, else Taylor.
+    // Stable series centered at 0 with range-reduction by halves.
+    let mut k = 0
+    let mut scale = 1.0
+    while y > 1.0 {
+        y = y * 0.5
+        scale = scale * 2.0  // we'll square later
+        k = k + 1
+    }
+    while y < 0.0 - 1.0 {
+        y = y * 0.5
+        scale = scale * 2.0
+        k = k + 1
+    }
+    // Taylor: 1 + y + y^2/2 + y^3/6 + y^4/24 + y^5/120 + y^6/720 + y^7/5040
+    let y2 = y * y
+    let y3 = y2 * y
+    let y4 = y3 * y
+    let y5 = y4 * y
+    let y6 = y5 * y
+    let y7 = y6 * y
+    let mut r = 1.0 + y + y2 / 2.0 + y3 / 6.0 + y4 / 24.0 + y5 / 120.0 + y6 / 720.0 + y7 / 5040.0
+    // Square r back k times to recover exp(original y)
+    let mut i = 0
+    while i < k {
+        r = r * r
+        i = i + 1
+    }
+    return r
+}
+
+fn mt_dot(a, b) {
+    let n = len(a)
+    let mut sum = 0.0
+    let mut i = 0
+    while i < n {
+        sum = sum + a[i] * b[i]
+        i = i + 1
+    }
+    return sum
+}
+
+fn mt_norm(v) {
+    let mut sum = 0.0
+    let n = len(v)
+    let mut i = 0
+    while i < n {
+        sum = sum + v[i] * v[i]
+        i = i + 1
+    }
+    return sqrt(sum)
+}
+
+fn mt_cosine(a, b) {
+    let d = mt_dot(a, b)
+    let na = mt_norm(a)
+    let nb = mt_norm(b)
+    let denom = na * nb
+    if denom < 0.000001 { return 0.0 }
+    return d / denom
+}
+
+// Functional array update: return a new array with arr[idx] = val.
+fn mt_set_arr(arr, idx, val) {
+    let n = len(arr)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        if i == idx {
+            out = out + [val]
+        } else {
+            out = out + [arr[i]]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn mt_zeros(dim) {
+    let mut v = []
+    let mut i = 0
+    while i < dim {
+        v = v + [0.0]
+        i = i + 1
+    }
+    return v
+}
+
+// ── Memory bank structure ──────────────────────────────────────────
+//
+//  keys[i]        — key vector (used for similarity lookup)
+//  values[i]      — value vector (what gets read back)
+//  ids[i]         — stable external id
+//  metadatas[i]   — opaque metadata (can be anything)
+//  last_used[i]   — monotonic tick of last read/write for LRU
+//  tick           — global monotonic counter
+//  capacity       — max number of slots (0 = unbounded)
+//  dim            — vector dimensionality (keys == values dim)
+//  write_threshold — cosine threshold below which new keys are written
+//                    (if similarity to nearest existing key is ≥ this,
+//                     the write is skipped to avoid duplicates)
+// ───────────────────────────────────────────────────────────────────
+
+struct MemoryBank {
+    dim: int,
+    capacity: int,
+    write_threshold: float,
+    tick: int,
+    keys: array,
+    values: array,
+    ids: array,
+    metadatas: array,
+    last_used: array
+}
+
+fn create_memory(dim, capacity, write_threshold) {
+    return MemoryBank {
+        dim: dim,
+        capacity: capacity,
+        write_threshold: write_threshold,
+        tick: 0,
+        keys: [],
+        values: [],
+        ids: [],
+        metadatas: [],
+        last_used: []
+    }
+}
+
+fn memory_size(mem) {
+    return len(mem.ids)
+}
+
+// Return index of `id` in ids array, or -1.
+fn mt_find_id(mem, id) {
+    let n = len(mem.ids)
+    let mut i = 0
+    while i < n {
+        if mem.ids[i] == id { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// LRU bump: update last_used[i] to current tick for matching id.
+fn memory_touch(mem, id) {
+    let idx = mt_find_id(mem, id)
+    if idx < 0 { return mem }
+    let new_tick = mem.tick + 1
+    let new_last = mt_set_arr(mem.last_used, idx, new_tick)
+    return MemoryBank {
+        dim: mem.dim,
+        capacity: mem.capacity,
+        write_threshold: mem.write_threshold,
+        tick: new_tick,
+        keys: mem.keys,
+        values: mem.values,
+        ids: mem.ids,
+        metadatas: mem.metadatas,
+        last_used: new_last
+    }
+}
+
+// ── Max-similarity helper for write gating ────────────────────────
+
+fn memory_max_similarity(mem, key) {
+    let n = len(mem.keys)
+    if n == 0 { return 0.0 - 1.0 }
+    let mut best = 0.0 - 2.0
+    let mut i = 0
+    while i < n {
+        let s = mt_cosine(key, mem.keys[i])
+        if s > best { best = s }
+        i = i + 1
+    }
+    return best
+}
+
+// Write gate: true if max cosine to existing keys is STRICTLY below
+// threshold (write is useful). Empty bank always accepts.
+fn memory_should_write(mem, key, threshold) {
+    let n = len(mem.keys)
+    if n == 0 { return true }
+    let best = memory_max_similarity(mem, key)
+    if best < threshold { return true }
+    return false
+}
+
+// ── LRU eviction ───────────────────────────────────────────────────
+//
+//  Remove the slot with smallest last_used. If the bank is below
+//  capacity, returns unchanged. Returns a functionally-new bank.
+// ───────────────────────────────────────────────────────────────────
+
+fn memory_evict_lru(mem) {
+    let n = len(mem.ids)
+    if n == 0 { return mem }
+    if mem.capacity <= 0 { return mem }
+    if n < mem.capacity { return mem }
+
+    // Find index with minimum last_used
+    let mut min_idx = 0
+    let mut min_val = mem.last_used[0]
+    let mut i = 1
+    while i < n {
+        if mem.last_used[i] < min_val {
+            min_val = mem.last_used[i]
+            min_idx = i
+        }
+        i = i + 1
+    }
+
+    // Rebuild arrays without min_idx
+    let mut new_keys = []
+    let mut new_values = []
+    let mut new_ids = []
+    let mut new_metas = []
+    let mut new_last = []
+    let mut j = 0
+    while j < n {
+        if j != min_idx {
+            new_keys = new_keys + [mem.keys[j]]
+            new_values = new_values + [mem.values[j]]
+            new_ids = new_ids + [mem.ids[j]]
+            new_metas = new_metas + [mem.metadatas[j]]
+            new_last = new_last + [mem.last_used[j]]
+        }
+        j = j + 1
+    }
+
+    return MemoryBank {
+        dim: mem.dim,
+        capacity: mem.capacity,
+        write_threshold: mem.write_threshold,
+        tick: mem.tick,
+        keys: new_keys,
+        values: new_values,
+        ids: new_ids,
+        metadatas: new_metas,
+        last_used: new_last
+    }
+}
+
+// ── Write path ─────────────────────────────────────────────────────
+//
+//  memory_write respects the write_threshold gate. If a slot with the
+//  same id already exists, it is updated in place (LRU bump). If the
+//  bank is full and we still want to write, LRU eviction fires first.
+//  Returns the new bank unchanged if the write is rejected by the gate.
+// ───────────────────────────────────────────────────────────────────
+
+fn memory_write(mem, id, key, value, metadata) {
+    let new_tick = mem.tick + 1
+
+    // If id already exists, update key/value and bump LRU.
+    let existing = mt_find_id(mem, id)
+    if existing >= 0 {
+        let new_keys = mt_set_arr(mem.keys, existing, key)
+        let new_values = mt_set_arr(mem.values, existing, value)
+        let new_metas = mt_set_arr(mem.metadatas, existing, metadata)
+        let new_last = mt_set_arr(mem.last_used, existing, new_tick)
+        return MemoryBank {
+            dim: mem.dim,
+            capacity: mem.capacity,
+            write_threshold: mem.write_threshold,
+            tick: new_tick,
+            keys: new_keys,
+            values: new_values,
+            ids: mem.ids,
+            metadatas: new_metas,
+            last_used: new_last
+        }
+    }
+
+    // Gate on novelty (similarity threshold).
+    let allow = memory_should_write(mem, key, mem.write_threshold)
+    if allow == false { return mem }
+
+    // If at capacity, evict LRU first.
+    let mut pruned = mem
+    if mem.capacity > 0 {
+        let n = len(mem.ids)
+        if n >= mem.capacity {
+            pruned = memory_evict_lru(mem)
+        }
+    }
+
+    return MemoryBank {
+        dim: pruned.dim,
+        capacity: pruned.capacity,
+        write_threshold: pruned.write_threshold,
+        tick: new_tick,
+        keys: pruned.keys + [key],
+        values: pruned.values + [value],
+        ids: pruned.ids + [id],
+        metadatas: pruned.metadatas + [metadata],
+        last_used: pruned.last_used + [new_tick]
+    }
+}
+
+// ── Read path ──────────────────────────────────────────────────────
+//
+//  Exact brute-force kNN over keys using cosine similarity. Returns
+//  top_k [id, score, value_vector] descending by score.
+// ───────────────────────────────────────────────────────────────────
+
+fn memory_read(mem, query, top_k) {
+    let n = len(mem.keys)
+    if n == 0 { return [] }
+
+    // Compute all similarities
+    let mut scored = []
+    let mut i = 0
+    while i < n {
+        let s = mt_cosine(query, mem.keys[i])
+        scored = scored + [[i, s]]
+        i = i + 1
+    }
+
+    // Selection-pick top_k by score descending (stable for small top_k)
+    let mut out = []
+    let mut selected = 0
+    let mut limit = top_k
+    if limit > n { limit = n }
+    while selected < limit {
+        let mut best_j = -1
+        let mut best_s = 0.0 - 3.0
+        let mut j = 0
+        while j < n {
+            let mut already = false
+            let mut ci = 0
+            while ci < len(out) {
+                if out[ci][0] == mem.ids[scored[j][0]] { already = true }
+                ci = ci + 1
+            }
+            if already == false {
+                if scored[j][1] > best_s {
+                    best_s = scored[j][1]
+                    best_j = j
+                }
+            }
+            j = j + 1
+        }
+        if best_j >= 0 {
+            let node_idx = scored[best_j][0]
+            out = out + [[mem.ids[node_idx], scored[best_j][1], mem.values[node_idx]]]
+        }
+        selected = selected + 1
+    }
+    return out
+}
+
+// ── Attention over retrieved memory ────────────────────────────────
+//
+//  Given a query, pull top_k (k, v) pairs, softmax their scores, and
+//  return the weighted sum of values. Softmax uses max subtraction
+//  for numerical stability.
+// ───────────────────────────────────────────────────────────────────
+
+fn memory_read_attention(mem, query, top_k) {
+    let retrieved = memory_read(mem, query, top_k)
+    let k = len(retrieved)
+    if k == 0 {
+        return mt_zeros(mem.dim)
+    }
+
+    // Max score for stable softmax
+    let mut max_s = retrieved[0][1]
+    let mut i = 1
+    while i < k {
+        if retrieved[i][1] > max_s { max_s = retrieved[i][1] }
+        i = i + 1
+    }
+
+    // Exponentiated weights and normalizer
+    let mut weights = []
+    let mut total = 0.0
+    i = 0
+    while i < k {
+        let w = mt_exp(retrieved[i][1] - max_s)
+        weights = weights + [w]
+        total = total + w
+        i = i + 1
+    }
+    if total < 0.000001 { total = 0.000001 }
+
+    // Weighted sum of value vectors
+    let dim = mem.dim
+    let mut out = mt_zeros(dim)
+    i = 0
+    while i < k {
+        let w = weights[i] / total
+        let v = retrieved[i][2]
+        let mut d = 0
+        while d < dim {
+            out = mt_set_arr(out, d, out[d] + w * v[d])
+            d = d + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ── Forward integration ────────────────────────────────────────────
+//
+//  new_hidden = hidden + alpha * read_attention(hidden)
+//  (residual injection of memory read into the current hidden state).
+//
+//  alpha controls how strongly memory feedback bleeds into the state.
+// ───────────────────────────────────────────────────────────────────
+
+fn memory_forward(mem, hidden, top_k, alpha) {
+    let attended = memory_read_attention(mem, hidden, top_k)
+    let n = len(hidden)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [hidden[i] + alpha * attended[i]]
+        i = i + 1
+    }
+    return out
+}

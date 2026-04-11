@@ -484,4 +484,101 @@ fn sp_memory_saved_ratio(P) {
     return 1.0 - 1.0 / pf
 }
 
-println("[sequence_parallel] loaded — Megatron-SP LN/Dropout shard + all-gather / reduce-scatter + TP block")
+// ── Communication volume per layer (elements, both directions) ──
+fn sp_comm_volume_per_layer(seq, hidden, P) {
+    // all-gather: seq * hidden (gather full seq from P shards)
+    // reduce-scatter: seq * hidden (scatter reduced back)
+    // Both directions per block (attn + MLP = 2 all-gather + 2 reduce-scatter)
+    return 4 * seq * hidden
+}
+
+// ── Communication overlap scheduling ────────────────────────────
+//
+// Megatron-SP overlaps all-gather with LayerNorm computation and
+// reduce-scatter with the next layer's residual/dropout. This struct
+// models the overlap opportunity for a single layer.
+
+struct SPOverlapSchedule {
+    layer_id: int,
+    ag_overlaps_ln: bool,
+    rs_overlaps_residual: bool,
+    ag_volume: int,
+    rs_volume: int,
+    comp_flops_ln: int,
+    comp_flops_ffn: int,
+    overlap_ratio: float
+}
+
+fn sp_overlap_schedule(layer_id, seq, hidden, P) {
+    let spr = seq / P
+    let ag_vol = seq * hidden
+    let rs_vol = seq * hidden
+    let ln_flops = spr * hidden * 5
+    let ffn_flops = spr * hidden * hidden * 2
+    // overlap_ratio: fraction of comm that can be hidden behind compute
+    // Simplified: min(1.0, comp_time / comm_time). Since we are CPU-sim,
+    // we estimate as min(1.0, ffn_flops / (2 * ag_vol))
+    let ratio_num = to_float(ffn_flops)
+    let ratio_den = to_float(2 * ag_vol)
+    let mut ratio = ratio_num / ratio_den
+    if ratio > 1.0 { ratio = 1.0 }
+    return SPOverlapSchedule {
+        layer_id: layer_id,
+        ag_overlaps_ln: true,
+        rs_overlaps_residual: true,
+        ag_volume: ag_vol,
+        rs_volume: rs_vol,
+        comp_flops_ln: ln_flops,
+        comp_flops_ffn: ffn_flops,
+        overlap_ratio: ratio
+    }
+}
+
+// ── Multi-layer SP forward ──────────────────────────────────────
+
+fn sp_multi_layer_forward(X_sharded, blocks, num_layers, ctx) {
+    let mut current = X_sharded
+    let mut l = 0
+    while l < num_layers {
+        current = sp_block_forward(current, blocks[l], ctx)
+        l = l + 1
+    }
+    return current
+}
+
+fn sp_multi_layer_forward_single(X_full, blocks, num_layers, seq_len, hidden) {
+    let mut current = X_full
+    let mut l = 0
+    while l < num_layers {
+        current = sp_block_forward_single(current, blocks[l], seq_len, hidden)
+        l = l + 1
+    }
+    return current
+}
+
+// ── Max absolute difference utility ─────────────────────────────
+fn sp_max_abs_diff(A, B, n) {
+    let mut m = 0.0
+    let mut i = 0
+    while i < n {
+        let d = A[i] - B[i]
+        let ad = if d < 0.0 { 0.0 - d } else { d }
+        if ad > m { m = ad }
+        i = i + 1
+    }
+    return m
+}
+
+// ── Sequence chunk size per rank ────────────────────────────────
+fn sp_chunk_size(seq_len, sp_size) {
+    return seq_len / sp_size
+}
+
+// ── Validate divisibility constraint ────────────────────────────
+fn sp_valid_config(seq_len, sp_size) {
+    if sp_size <= 0 { return false }
+    if seq_len % sp_size != 0 { return false }
+    return true
+}
+
+println("[sequence_parallel] loaded — Megatron-SP LN/Dropout shard + all-gather / reduce-scatter + TP block + overlap + multi-layer")

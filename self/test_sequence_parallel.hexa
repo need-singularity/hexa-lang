@@ -405,6 +405,85 @@ fn sp_memory_saved_ratio(P) {
     return 1.0 - 1.0 / pf
 }
 
+fn sp_comm_volume_per_layer(seq, hidden, P) {
+    return 4 * seq * hidden
+}
+
+struct SPOverlapSchedule {
+    layer_id: int,
+    ag_overlaps_ln: bool,
+    rs_overlaps_residual: bool,
+    ag_volume: int,
+    rs_volume: int,
+    comp_flops_ln: int,
+    comp_flops_ffn: int,
+    overlap_ratio: float
+}
+
+fn sp_overlap_schedule(layer_id, seq, hidden, P) {
+    let spr = seq / P
+    let ag_vol = seq * hidden
+    let rs_vol = seq * hidden
+    let ln_flops = spr * hidden * 5
+    let ffn_flops = spr * hidden * hidden * 2
+    let ratio_num = to_float(ffn_flops)
+    let ratio_den = to_float(2 * ag_vol)
+    let mut ratio = ratio_num / ratio_den
+    if ratio > 1.0 { ratio = 1.0 }
+    return SPOverlapSchedule {
+        layer_id: layer_id,
+        ag_overlaps_ln: true,
+        rs_overlaps_residual: true,
+        ag_volume: ag_vol,
+        rs_volume: rs_vol,
+        comp_flops_ln: ln_flops,
+        comp_flops_ffn: ffn_flops,
+        overlap_ratio: ratio
+    }
+}
+
+fn sp_multi_layer_forward(X_sharded, blocks, num_layers, ctx) {
+    let mut current = X_sharded
+    let mut l = 0
+    while l < num_layers {
+        current = sp_block_forward(current, blocks[l], ctx)
+        l = l + 1
+    }
+    return current
+}
+
+fn sp_multi_layer_forward_single(X_full, blocks, num_layers, seq_len, hidden) {
+    let mut current = X_full
+    let mut l = 0
+    while l < num_layers {
+        current = sp_block_forward_single(current, blocks[l], seq_len, hidden)
+        l = l + 1
+    }
+    return current
+}
+
+fn sp_max_abs_diff(A, B, n) {
+    let mut m = 0.0
+    let mut i = 0
+    while i < n {
+        let d = A[i] - B[i]
+        let ad = if d < 0.0 { 0.0 - d } else { d }
+        if ad > m { m = ad }
+        i = i + 1
+    }
+    return m
+}
+
+fn sp_chunk_size(seq_len, sp_size) {
+    return seq_len / sp_size
+}
+
+fn sp_valid_config(seq_len, sp_size) {
+    if sp_size <= 0 { return false }
+    if seq_len % sp_size != 0 { return false }
+    return true
+}
+
 // ===================================================================
 //  TESTS
 // ===================================================================
@@ -694,15 +773,173 @@ let bytes_no_sp = sp_activation_bytes_no_sp(seq_len, hidden)
 let bytes_sp4 = sp_activation_bytes(seq_len, hidden, 4)
 check("SP P=4 bytes = 1/4 no-SP bytes", bytes_sp4 * 4 == bytes_no_sp)
 
+// -- 16. P=2 block forward == single-rank baseline ---------------
+println("")
+println("=== SP P=2 Equivalence ===")
+let ctx2 = sp_context_init(2, seq_len, hidden)
+let shards2 = sp_split_sequence(X, ctx2)
+let out_shards2 = sp_block_forward(shards2, block, ctx2)
+let out_full_sp2 = sp_concat_sequence(out_shards2)
+let mut blk2_ok = true
+let mut oi2 = 0
+while oi2 < out_len {
+    if fabs(out_full_sp2[oi2] - out_single[oi2]) > 0.001 {
+        blk2_ok = false
+    }
+    oi2 = oi2 + 1
+}
+check("SP P=2 block == single-rank baseline", blk2_ok)
+
+// -- 17. reduce-scatter last shard also = 10 ----------------------
+let rs_last = rs_out[3]
+check("reduce-scatter last elem = 10", approx(rs_last[0], 10.0, 0.001))
+
+// -- 18. P=8 split produces 8 equal-length shards ----------------
+println("")
+println("=== P=8 Split ===")
+let ctx8 = sp_context_init(8, 16, hidden)
+let mut X16 = []
+let mut x16i = 0
+while x16i < 16 * hidden {
+    X16 = X16 + [to_float(x16i) * 0.01]
+    x16i = x16i + 1
+}
+let shards8 = sp_split_sequence(X16, ctx8)
+check("P=8 shard count = 8", len(shards8) == 8)
+check("P=8 shard len = 2*hidden", len(shards8[0]) == 2 * hidden)
+
+// -- 19. P=8 split + concat round-trip ----------------------------
+let rt8 = sp_concat_sequence(shards8)
+let mut rt8_ok = true
+let mut rt8i = 0
+while rt8i < 16 * hidden {
+    if fabs(rt8[rt8i] - X16[rt8i]) > 0.000001 {
+        rt8_ok = false
+    }
+    rt8i = rt8i + 1
+}
+check("P=8 split+concat round trip", rt8_ok)
+
+// -- 20. Communication volume calculation -------------------------
+println("")
+println("=== Communication Volume ===")
+let vol = sp_comm_volume_per_layer(seq_len, hidden, world_size)
+check("comm volume = 4*seq*hidden", vol == 4 * seq_len * hidden)
+
+// -- 21. Communication volume scales with sequence length ---------
+let vol2 = sp_comm_volume_per_layer(16, hidden, world_size)
+check("comm volume doubles with 2x seq", vol2 == 2 * vol)
+
+// -- 22. Overlap schedule: fields valid ---------------------------
+println("")
+println("=== Overlap Schedule ===")
+let sched = sp_overlap_schedule(0, seq_len, hidden, world_size)
+check("overlap ag_overlaps_ln = true", sched.ag_overlaps_ln)
+check("overlap rs_overlaps_residual = true", sched.rs_overlaps_residual)
+check("overlap ag_volume = seq*hidden", sched.ag_volume == seq_len * hidden)
+check("overlap ratio in [0,1]", sched.overlap_ratio >= 0.0)
+check("overlap ratio <= 1.0", sched.overlap_ratio <= 1.0)
+
+// -- 23. Multi-layer forward (2 layers) == single baseline --------
+println("")
+println("=== Multi-Layer SP ===")
+let block2_layer = SPBlockWeights {
+    gamma1: gamma,
+    beta1: beta,
+    gamma2: gamma,
+    beta2: beta,
+    w_q: wq,
+    w_k: wq,
+    w_v: wq,
+    w_o: wq,
+    w_mlp1: w1,
+    w_mlp2: w2,
+    eps: 0.00001,
+    keep_prob: 1.0,
+    seed: 888
+}
+let blocks = [block, block2_layer]
+let ml_out_sp = sp_multi_layer_forward(shards, blocks, 2, ctx)
+let ml_out_sp_full = sp_concat_sequence(ml_out_sp)
+let ml_out_single = sp_multi_layer_forward_single(X, blocks, 2, seq_len, hidden)
+let ml_diff = sp_max_abs_diff(ml_out_sp_full, ml_out_single, seq_len * hidden)
+check("multi-layer (2L) SP == single", ml_diff < 0.001)
+
+// -- 24. sp_chunk_size correctness --------------------------------
+println("")
+println("=== Chunk Size / Validation ===")
+check("chunk_size(8,4) = 2", sp_chunk_size(8, 4) == 2)
+check("chunk_size(16,2) = 8", sp_chunk_size(16, 2) == 8)
+
+// -- 25. sp_valid_config ------------------------------------------
+check("valid_config(8,4) = true", sp_valid_config(8, 4))
+check("valid_config(8,3) = false", sp_valid_config(8, 3) == false)
+check("valid_config(8,0) = false", sp_valid_config(8, 0) == false)
+
+// -- 26. Memory P=2 saves 50% ------------------------------------
+println("")
+println("=== Memory P=2 ===")
+check("memory_saved P=2 -> 0.5", approx(sp_memory_saved_ratio(2), 0.5, 0.001))
+
+// -- 27. Activation bytes P=2 = 1/2 no-SP -------------------------
+let bytes_sp2 = sp_activation_bytes(seq_len, hidden, 2)
+check("SP P=2 bytes = 1/2 no-SP", bytes_sp2 * 2 == bytes_no_sp)
+
+// -- 28. Dropout with keep_prob=0.5 zeros some elements -----------
+println("")
+println("=== Dropout Sparsity ===")
+let d_half = sp_dropout_shard(shard0, 0, 99, 0.5)
+let d_half_len = len(d_half)
+let mut zero_count = 0
+let mut dhi = 0
+while dhi < d_half_len {
+    if fabs(d_half[dhi]) < 0.000001 {
+        zero_count = zero_count + 1
+    }
+    dhi = dhi + 1
+}
+check("dropout 0.5 has some zeros", zero_count > 0)
+
+// -- 29. LayerNorm with non-unit gamma/beta -----------------------
+println("")
+println("=== LayerNorm scaled ===")
+let mut gamma2_v = []
+let mut beta2_v = []
+let mut g2i = 0
+while g2i < hidden {
+    gamma2_v = gamma2_v + [2.0]
+    beta2_v = beta2_v + [1.0]
+    g2i = g2i + 1
+}
+let ln_scaled = sp_layernorm_row(row, gamma2_v, beta2_v, 0.00001, hidden)
+// With gamma=2, beta=1: output mean should be ~1.0 (beta shifts)
+let mut scaled_mean = 0.0
+let mut si = 0
+while si < hidden {
+    scaled_mean = scaled_mean + ln_scaled[si]
+    si = si + 1
+}
+scaled_mean = scaled_mean / to_float(hidden)
+check("LN gamma=2 beta=1 mean ~ 1.0", approx(scaled_mean, 1.0, 0.01))
+
+// -- 30. sp_max_abs_diff utility works ----------------------------
+let arr_a = [1.0, 2.0, 3.0, 4.0]
+let arr_b = [1.0, 2.1, 3.0, 3.5]
+let mad = sp_max_abs_diff(arr_a, arr_b, 4)
+check("max_abs_diff = 0.5", approx(mad, 0.5, 0.001))
+
 // ===================================================================
 //  Summary
 // ===================================================================
 println("")
-println("=== Sequence Parallelism Tests Summary ===")
-println("pass=" + str(pass_count) + " fail=" + str(fail_count))
-if fail_count == 0 {
-    println("ALL PASS")
+println("============================================================")
+println("  Sequence Parallelism (Megatron-SP) — ML #106")
+println("============================================================")
+let total_tests = pass_count + fail_count
+println("  Results: " + str(pass_count) + "/" + str(total_tests) + " passed")
+if fail_count > 0 {
+    println("  FAILED: " + str(fail_count) + " tests")
 } else {
-    println("FAILED")
+    println("  ALL PASSED")
 }
-println(str(pass_count) + " passed")
+println("============================================================")

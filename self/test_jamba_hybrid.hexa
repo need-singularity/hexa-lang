@@ -1,0 +1,845 @@
+// ═══════════════════════════════════════════════════════════════════
+//  test_jamba_hybrid.hexa — Jamba Hybrid MoE verification (#206)
+//
+//  Tests (36):
+//    #1  jamba_zeros produces correct length
+//    #2  jamba_exp(0) ~ 1
+//    #3  jamba_softmax sums to 1
+//    #4  jamba_softmax all outputs in [0,1]
+//    #5  jamba_create_config shape
+//    #6  jamba_build_layer_plan length == n_layers
+//    #7  jamba_build_layer_plan has correct attn count
+//    #8  jamba_build_layer_plan has expected mamba majority
+//    #9  jamba_count_layer_types sums to n_layers
+//    #10 jamba_count_layer_types matches plan
+//    #11 MoE layers exist when moe_ratio > 0
+//    #12 No MoE when moe_ratio = 0
+//    #13 jamba_mamba_block_forward output shape
+//    #14 jamba_mamba_block_forward state updates (new != init)
+//    #15 jamba_mamba_block_forward two-step state evolution
+//    #16 jamba_attn_block_forward output shape [seq_len, dim]
+//    #17 jamba_attn_block_forward zero input with zero biases -> zero
+//    #18 jamba_ffn_forward output shape
+//    #19 jamba_ffn_forward zero input -> zero
+//    #20 jamba_router_top_k picks exactly top_k indices
+//    #21 jamba_router_top_k weights sum ~ 1
+//    #22 jamba_router_top_k picks highest logits
+//    #23 jamba_moe_forward output shape
+//    #24 jamba_moe_forward with n_experts=1 == FFN
+//    #25 jamba_layer_forward mamba output shape
+//    #26 jamba_layer_forward attn output shape
+//    #27 jamba_layer_forward attn_moe output shape
+//    #28 jamba_layer_forward mamba_moe output shape
+//    #29 jamba_forward_sequence preserves [seq_len, dim]
+//    #30 jamba_forward_sequence deterministic
+//    #31 jamba_cache_create mamba_states length == n_layers
+//    #32 jamba_cache_create kv only on attn layers
+//    #33 jamba_cache_create all mamba_state vectors sized dim
+//    #34 jamba_memory_estimate > 0
+//    #35 jamba_memory_estimate scales with n_layers
+//    #36 count_layer_types has expected keys
+//
+//  Run: PATH=/Users/ghost/.cargo/bin:$PATH ./hexa self/test_jamba_hybrid.hexa
+// ═══════════════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ═══════════════════════════════════════════════════════════════════
+//  Inlined jamba_hybrid module (mirror of self/ml/jamba_hybrid.hexa)
+// ═══════════════════════════════════════════════════════════════════
+
+fn jamba_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn jamba_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn jamba_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn jamba_zeros_2d(rows, cols) {
+    let mut m = []
+    for _r in 0..rows { m = m + [jamba_zeros(cols)] }
+    return m
+}
+
+fn jamba_ones(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [1.0] }
+    return v
+}
+
+fn jamba_eye(n, scale) {
+    let mut m = []
+    for i in 0..n {
+        let mut row = []
+        for j in 0..n {
+            if i == j { row = row + [scale] } else { row = row + [0.0] }
+        }
+        m = m + [row]
+    }
+    return m
+}
+
+fn jamba_vec_add(a, b) {
+    let n = len(a)
+    let mut out = []
+    for i in 0..n { out = out + [a[i] + b[i]] }
+    return out
+}
+
+fn jamba_vec_scale(v, s) {
+    let n = len(v)
+    let mut out = []
+    for i in 0..n { out = out + [v[i] * s] }
+    return out
+}
+
+fn jamba_mat_vec(mat, v) {
+    let rows = len(mat)
+    let mut out = []
+    for r in 0..rows {
+        let row = mat[r]
+        let n = len(row)
+        let mut s = 0.0
+        for c in 0..n { s = s + row[c] * v[c] }
+        out = out + [s]
+    }
+    return out
+}
+
+fn jamba_hash_float(seed, i, j) {
+    let h = ((seed * 2654435761 + i * 1315423911 + j * 2246822519) % 10007)
+    return to_float(h) / 10007.0 - 0.5
+}
+
+fn jamba_init_weight(rows, cols, seed) {
+    let mut m = []
+    for r in 0..rows {
+        let mut row = []
+        for c in 0..cols {
+            row = row + [jamba_hash_float(seed, r, c) * 0.2]
+        }
+        m = m + [row]
+    }
+    return m
+}
+
+fn jamba_softmax(logits, n) {
+    let mut mx = logits[0]
+    for i in 1..n {
+        if logits[i] > mx { mx = logits[i] }
+    }
+    let mut exps = []
+    let mut z = 0.0
+    for i in 0..n {
+        let e = jamba_exp(logits[i] - mx)
+        exps = exps + [e]
+        z = z + e
+    }
+    let safe_z = if z < 1.0e-12 { 1.0e-12 } else { z }
+    let mut out = []
+    for i in 0..n { out = out + [exps[i] / safe_z] }
+    return out
+}
+
+fn jamba_create_config(n_layers, attn_ratio, moe_ratio, dim, n_experts, top_k) {
+    let cfg = #{}
+    cfg["n_layers"] = n_layers
+    cfg["attn_ratio"] = attn_ratio
+    cfg["moe_ratio"] = moe_ratio
+    cfg["dim"] = dim
+    cfg["n_experts"] = n_experts
+    cfg["top_k"] = top_k
+    cfg["hidden"] = dim * 2
+    return cfg
+}
+
+fn jamba_build_layer_plan(config) {
+    let n_layers = config["n_layers"]
+    let attn_r = config["attn_ratio"]
+    let moe_r = config["moe_ratio"]
+
+    let mut n_attn = to_int(to_float(n_layers) * attn_r + 0.5)
+    if n_attn < 0 { n_attn = 0 }
+    if n_attn > n_layers { n_attn = n_layers }
+    let mut n_moe = to_int(to_float(n_layers) * moe_r + 0.5)
+    if n_moe < 0 { n_moe = 0 }
+    if n_moe > n_layers { n_moe = n_layers }
+
+    let mut is_attn = []
+    for _i in 0..n_layers { is_attn = is_attn + [false] }
+    if n_attn > 0 {
+        let stride_num = n_layers
+        let mut placed = 0
+        let mut l = 0
+        while placed < n_attn && l < n_layers {
+            let pos = ((placed + 1) * stride_num) / (n_attn + 1)
+            if pos >= n_layers { l = n_layers } else {
+                let mut new_is = []
+                for k in 0..n_layers {
+                    if k == pos { new_is = new_is + [true] } else { new_is = new_is + [is_attn[k]] }
+                }
+                is_attn = new_is
+                placed = placed + 1
+                l = l + 1
+            }
+        }
+    }
+
+    let mut is_moe = []
+    for _i in 0..n_layers { is_moe = is_moe + [false] }
+    if n_moe > 0 && n_layers > 0 {
+        let step = if n_moe > 0 { n_layers / n_moe } else { 1 }
+        let safe_step = if step < 1 { 1 } else { step }
+        let mut placed = 0
+        let mut l = 1
+        while placed < n_moe && l < n_layers {
+            let mut new_is = []
+            for k in 0..n_layers {
+                if k == l { new_is = new_is + [true] } else { new_is = new_is + [is_moe[k]] }
+            }
+            is_moe = new_is
+            placed = placed + 1
+            l = l + safe_step
+        }
+        let mut l2 = 0
+        while placed < n_moe && l2 < n_layers {
+            if is_moe[l2] == false {
+                let mut new_is = []
+                for k in 0..n_layers {
+                    if k == l2 { new_is = new_is + [true] } else { new_is = new_is + [is_moe[k]] }
+                }
+                is_moe = new_is
+                placed = placed + 1
+            }
+            l2 = l2 + 1
+        }
+    }
+
+    let mut plan = []
+    for l in 0..n_layers {
+        let a = is_attn[l]
+        let m = is_moe[l]
+        if a && m { plan = plan + ["attn_moe"] }
+        if a && (m == false) { plan = plan + ["attn"] }
+        if (a == false) && m { plan = plan + ["mamba_moe"] }
+        if (a == false) && (m == false) { plan = plan + ["mamba"] }
+    }
+    return plan
+}
+
+fn jamba_count_layer_types(plan) {
+    let n = len(plan)
+    let counts = #{}
+    counts["mamba"] = 0
+    counts["attn"] = 0
+    counts["mamba_moe"] = 0
+    counts["attn_moe"] = 0
+    for i in 0..n {
+        let k = plan[i]
+        counts[k] = counts[k] + 1
+    }
+    return counts
+}
+
+fn jamba_memory_estimate(config) {
+    let d = config["dim"]
+    let h = config["hidden"]
+    let n = config["n_layers"]
+    let ne = config["n_experts"]
+    let attn_params = 4 * d * d
+    let ffn_params = d * h + h * d
+    let moe_params = ne * (d * h + h * d) + ne * d
+    let mamba_params = d * d + d
+    let avg = attn_params + moe_params + mamba_params + ffn_params
+    let total_params = n * avg
+    return total_params * 4
+}
+
+fn jamba_make_mamba_A(dim) { return jamba_eye(dim, 0.5) }
+fn jamba_make_mamba_B(dim) { return jamba_eye(dim, 1.0) }
+
+fn jamba_mamba_block_forward(state, x, dim) {
+    let A = jamba_make_mamba_A(dim)
+    let B = jamba_make_mamba_B(dim)
+    let as_part = jamba_mat_vec(A, state)
+    let bx_part = jamba_mat_vec(B, x)
+    let y = jamba_vec_add(as_part, bx_part)
+    return [y, y]
+}
+
+fn jamba_sqrt_approx(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..20 { g = (g + x / g) / 2.0 }
+    return g
+}
+
+fn jamba_attn_block_forward(x_seq, Wq, Wk, Wv, Wo, seq_len, dim) {
+    let mut Qs = []
+    let mut Ks = []
+    let mut Vs = []
+    for t in 0..seq_len {
+        Qs = Qs + [jamba_mat_vec(Wq, x_seq[t])]
+        Ks = Ks + [jamba_mat_vec(Wk, x_seq[t])]
+        Vs = Vs + [jamba_mat_vec(Wv, x_seq[t])]
+    }
+    let scale = 1.0 / jamba_sqrt_approx(to_float(dim))
+    let mut out = []
+    for t in 0..seq_len {
+        let mut scores = []
+        for s in 0..seq_len {
+            let mut dot = 0.0
+            for i in 0..dim { dot = dot + Qs[t][i] * Ks[s][i] }
+            scores = scores + [dot * scale]
+        }
+        let probs = jamba_softmax(scores, seq_len)
+        let mut ctx = jamba_zeros(dim)
+        for s in 0..seq_len {
+            let w = probs[s]
+            for i in 0..dim { ctx[i] = ctx[i] + w * Vs[s][i] }
+        }
+        let o_t = jamba_mat_vec(Wo, ctx)
+        out = out + [o_t]
+    }
+    return out
+}
+
+fn jamba_relu(x) {
+    if x > 0.0 { return x }
+    return 0.0
+}
+
+fn jamba_ffn_forward(x, W1, W2, dim, hidden) {
+    let h_raw = jamba_mat_vec(W1, x)
+    let mut h = []
+    for i in 0..hidden { h = h + [jamba_relu(h_raw[i])] }
+    let y = jamba_mat_vec(W2, h)
+    return y
+}
+
+fn jamba_router_top_k(router_logits, n_experts, top_k) {
+    let mut used = []
+    for _i in 0..n_experts { used = used + [false] }
+    let mut picks = []
+    let mut picked_logits = []
+    let mut r = 0
+    while r < top_k && r < n_experts {
+        let mut best = -1
+        let mut best_v = -1.0e30
+        for e in 0..n_experts {
+            if used[e] == false {
+                if router_logits[e] > best_v {
+                    best_v = router_logits[e]
+                    best = e
+                }
+            }
+        }
+        if best < 0 { r = top_k } else {
+            let mut new_used = []
+            for k in 0..n_experts {
+                if k == best { new_used = new_used + [true] } else { new_used = new_used + [used[k]] }
+            }
+            used = new_used
+            picks = picks + [best]
+            picked_logits = picked_logits + [best_v]
+            r = r + 1
+        }
+    }
+    let k_eff = len(picks)
+    if k_eff == 0 { return [picks, []] }
+    let weights = jamba_softmax(picked_logits, k_eff)
+    return [picks, weights]
+}
+
+fn jamba_moe_forward(x, experts_W1, experts_b1, experts_W2, router_W, n_experts, top_k, dim, hidden) {
+    let router_logits = jamba_mat_vec(router_W, x)
+    let route = jamba_router_top_k(router_logits, n_experts, top_k)
+    let picks = route[0]
+    let weights = route[1]
+
+    let mut y = jamba_zeros(dim)
+    let k_eff = len(picks)
+    for k in 0..k_eff {
+        let idx = picks[k]
+        let w = weights[k]
+        let W1 = experts_W1[idx]
+        let b1 = experts_b1[idx]
+        let W2 = experts_W2[idx]
+        let h_raw = jamba_mat_vec(W1, x)
+        let mut h = []
+        for i in 0..hidden { h = h + [jamba_relu(h_raw[i] + b1[i])] }
+        let ex_out = jamba_mat_vec(W2, h)
+        for i in 0..dim { y[i] = y[i] + w * ex_out[i] }
+    }
+    return y
+}
+
+fn jamba_layer_forward(layer_type, state, x_seq, config, params) {
+    let seq_len = len(x_seq)
+    let dim = config["dim"]
+    let hidden = config["hidden"]
+    let n_experts = config["n_experts"]
+    let top_k = config["top_k"]
+
+    let mut mixer_out = []
+    let mut new_state = state
+    if layer_type == "mamba" || layer_type == "mamba_moe" {
+        let mut st = state
+        for t in 0..seq_len {
+            let res = jamba_mamba_block_forward(st, x_seq[t], dim)
+            st = res[1]
+            mixer_out = mixer_out + [res[0]]
+        }
+        new_state = st
+    }
+    if layer_type == "attn" || layer_type == "attn_moe" {
+        let Wq = params["Wq"]
+        let Wk = params["Wk"]
+        let Wv = params["Wv"]
+        let Wo = params["Wo"]
+        mixer_out = jamba_attn_block_forward(x_seq, Wq, Wk, Wv, Wo, seq_len, dim)
+    }
+
+    let mut layer_out = []
+    let is_moe = layer_type == "mamba_moe" || layer_type == "attn_moe"
+    if is_moe {
+        let eW1 = params["experts_W1"]
+        let eB1 = params["experts_b1"]
+        let eW2 = params["experts_W2"]
+        let rW = params["router_W"]
+        for t in 0..seq_len {
+            let y = jamba_moe_forward(mixer_out[t], eW1, eB1, eW2, rW, n_experts, top_k, dim, hidden)
+            layer_out = layer_out + [y]
+        }
+    }
+    if is_moe == false {
+        let W1 = params["W1"]
+        let W2 = params["W2"]
+        for t in 0..seq_len {
+            let y = jamba_ffn_forward(mixer_out[t], W1, W2, dim, hidden)
+            layer_out = layer_out + [y]
+        }
+    }
+
+    return [new_state, layer_out]
+}
+
+fn jamba_forward_sequence(config, params_per_layer, x_seq, seq_len, dim) {
+    let plan = jamba_build_layer_plan(config)
+    let n_layers = config["n_layers"]
+    let mut h = x_seq
+    for l in 0..n_layers {
+        let layer_type = plan[l]
+        let params = params_per_layer[l]
+        let init_state = jamba_zeros(dim)
+        let res = jamba_layer_forward(layer_type, init_state, h, config, params)
+        h = res[1]
+    }
+    return h
+}
+
+fn jamba_cache_create(config, seq_len) {
+    let n_layers = config["n_layers"]
+    let dim = config["dim"]
+    let plan = jamba_build_layer_plan(config)
+    let mut mamba_states = []
+    let mut kv_keys = []
+    let mut kv_vals = []
+    for l in 0..n_layers {
+        mamba_states = mamba_states + [jamba_zeros(dim)]
+        let t = plan[l]
+        if t == "attn" || t == "attn_moe" {
+            kv_keys = kv_keys + [jamba_zeros_2d(seq_len, dim)]
+            kv_vals = kv_vals + [jamba_zeros_2d(seq_len, dim)]
+        }
+        if (t == "attn" || t == "attn_moe") == false {
+            kv_keys = kv_keys + [[]]
+            kv_vals = kv_vals + [[]]
+        }
+    }
+    let cache = #{}
+    cache["mamba_states"] = mamba_states
+    cache["kv_keys"] = kv_keys
+    cache["kv_vals"] = kv_vals
+    cache["n_layers"] = n_layers
+    cache["seq_len"] = seq_len
+    cache["dim"] = dim
+    cache["plan"] = plan
+    return cache
+}
+
+fn jamba_default_params_per_layer(config, seed) {
+    let n_layers = config["n_layers"]
+    let dim = config["dim"]
+    let hidden = config["hidden"]
+    let n_experts = config["n_experts"]
+    let plan = jamba_build_layer_plan(config)
+
+    let mut params_list = []
+    for l in 0..n_layers {
+        let p = #{}
+        p["Wq"] = jamba_init_weight(dim, dim, seed + l * 101 + 1)
+        p["Wk"] = jamba_init_weight(dim, dim, seed + l * 101 + 2)
+        p["Wv"] = jamba_init_weight(dim, dim, seed + l * 101 + 3)
+        p["Wo"] = jamba_init_weight(dim, dim, seed + l * 101 + 4)
+        p["W1"] = jamba_init_weight(hidden, dim, seed + l * 101 + 5)
+        p["W2"] = jamba_init_weight(dim, hidden, seed + l * 101 + 6)
+        let mut eW1 = []
+        let mut eB1 = []
+        let mut eW2 = []
+        for e in 0..n_experts {
+            eW1 = eW1 + [jamba_init_weight(hidden, dim, seed + l * 101 + 10 + e * 3)]
+            eB1 = eB1 + [jamba_zeros(hidden)]
+            eW2 = eW2 + [jamba_init_weight(dim, hidden, seed + l * 101 + 11 + e * 3)]
+        }
+        p["experts_W1"] = eW1
+        p["experts_b1"] = eB1
+        p["experts_W2"] = eW2
+        p["router_W"] = jamba_init_weight(n_experts, dim, seed + l * 101 + 99)
+        params_list = params_list + [p]
+    }
+    return params_list
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  TESTS
+// ═══════════════════════════════════════════════════════════════════
+
+let DIM = 4
+let HIDDEN = 8
+let SEQ = 3
+let N_LAYERS = 8
+let N_EXPERTS = 3
+let TOP_K = 2
+let SEED = 42
+
+// -- #1 jamba_zeros length --
+let z4 = jamba_zeros(DIM)
+check("#1 jamba_zeros length", len(z4) == DIM)
+
+// -- #2 jamba_exp(0) ~ 1 --
+check("#2 jamba_exp(0) ~ 1", approx(jamba_exp(0.0), 1.0, 0.001))
+
+// -- #3 jamba_softmax sums to 1 --
+let sm = jamba_softmax([1.0, 2.0, 3.0, 0.5], 4)
+let mut sm_sum = 0.0
+for i in 0..4 { sm_sum = sm_sum + sm[i] }
+check("#3 softmax sums to 1", approx(sm_sum, 1.0, 0.001))
+
+// -- #4 softmax all in [0,1] --
+let mut sm_ok = true
+for i in 0..4 {
+    if sm[i] < 0.0 || sm[i] > 1.0 { sm_ok = false }
+}
+check("#4 softmax all in [0,1]", sm_ok)
+
+// -- #5 create_config shape --
+let cfg = jamba_create_config(N_LAYERS, 0.25, 0.5, DIM, N_EXPERTS, TOP_K)
+check("#5 create_config fields",
+    cfg["n_layers"] == N_LAYERS &&
+    cfg["dim"] == DIM &&
+    cfg["n_experts"] == N_EXPERTS &&
+    cfg["top_k"] == TOP_K &&
+    cfg["hidden"] == DIM * 2)
+
+// -- #6 layer plan length --
+let plan = jamba_build_layer_plan(cfg)
+check("#6 plan length == n_layers", len(plan) == N_LAYERS)
+
+// -- #7 plan attn count matches ratio --
+let mut n_attn_found = 0
+let mut n_mamba_found = 0
+for i in 0..N_LAYERS {
+    if plan[i] == "attn" || plan[i] == "attn_moe" { n_attn_found = n_attn_found + 1 }
+    if plan[i] == "mamba" || plan[i] == "mamba_moe" { n_mamba_found = n_mamba_found + 1 }
+}
+let expected_attn = to_int(to_float(N_LAYERS) * 0.25 + 0.5)
+check("#7 plan attn count matches ratio", n_attn_found == expected_attn)
+
+// -- #8 plan mamba-dominant (attn_ratio=0.25 -> most layers are mamba) --
+check("#8 plan mamba-dominant", n_mamba_found > n_attn_found)
+
+// -- #9 count_layer_types sum == n_layers --
+let counts = jamba_count_layer_types(plan)
+let total_ct = counts["mamba"] + counts["attn"] + counts["mamba_moe"] + counts["attn_moe"]
+check("#9 count sum == n_layers", total_ct == N_LAYERS)
+
+// -- #10 counts match plan scan --
+let mut manual_mamba = 0
+let mut manual_attn = 0
+let mut manual_mamba_moe = 0
+let mut manual_attn_moe = 0
+for i in 0..N_LAYERS {
+    let k = plan[i]
+    if k == "mamba" { manual_mamba = manual_mamba + 1 }
+    if k == "attn" { manual_attn = manual_attn + 1 }
+    if k == "mamba_moe" { manual_mamba_moe = manual_mamba_moe + 1 }
+    if k == "attn_moe" { manual_attn_moe = manual_attn_moe + 1 }
+}
+check("#10 counts match plan",
+    counts["mamba"] == manual_mamba &&
+    counts["attn"] == manual_attn &&
+    counts["mamba_moe"] == manual_mamba_moe &&
+    counts["attn_moe"] == manual_attn_moe)
+
+// -- #11 MoE layers exist when moe_ratio>0 --
+let n_moe_layers = counts["mamba_moe"] + counts["attn_moe"]
+check("#11 MoE layers exist", n_moe_layers > 0)
+
+// -- #12 no MoE when moe_ratio=0 --
+let cfg_no_moe = jamba_create_config(6, 0.3, 0.0, DIM, N_EXPERTS, TOP_K)
+let plan_no_moe = jamba_build_layer_plan(cfg_no_moe)
+let counts_no_moe = jamba_count_layer_types(plan_no_moe)
+check("#12 no MoE when moe_ratio=0",
+    counts_no_moe["mamba_moe"] == 0 && counts_no_moe["attn_moe"] == 0)
+
+// -- #13 mamba block output shape --
+let state0 = jamba_zeros(DIM)
+let x1 = [1.0, 0.5, -0.25, 0.1]
+let res13 = jamba_mamba_block_forward(state0, x1, DIM)
+check("#13 mamba block output shape", len(res13[0]) == DIM && len(res13[1]) == DIM)
+
+// -- #14 mamba state updates (non-zero input -> non-zero state) --
+let mut any_nonzero = false
+for i in 0..DIM {
+    if fabs(res13[1][i]) > 1.0e-9 { any_nonzero = true }
+}
+check("#14 mamba state updates", any_nonzero)
+
+// -- #15 mamba two-step evolution: state after 2 steps reflects decay --
+// y1 = 0.5*0 + x1 = x1 ; y2 = 0.5*x1 + x1 = 1.5*x1
+let res15a = jamba_mamba_block_forward(state0, x1, DIM)
+let res15b = jamba_mamba_block_forward(res15a[1], x1, DIM)
+let mut two_step_ok = true
+for i in 0..DIM {
+    let expected = 1.5 * x1[i]
+    if fabs(res15b[0][i] - expected) > 0.001 { two_step_ok = false }
+}
+check("#15 mamba two-step recurrence", two_step_ok)
+
+// -- #16 attention block output shape --
+let Wq = jamba_init_weight(DIM, DIM, SEED + 1)
+let Wk = jamba_init_weight(DIM, DIM, SEED + 2)
+let Wv = jamba_init_weight(DIM, DIM, SEED + 3)
+let Wo = jamba_init_weight(DIM, DIM, SEED + 4)
+let mut xs = []
+for t in 0..SEQ { xs = xs + [[to_float(t + 1) * 0.1, 0.2, 0.3, 0.4]] }
+let attn_out = jamba_attn_block_forward(xs, Wq, Wk, Wv, Wo, SEQ, DIM)
+check("#16 attn output shape",
+    len(attn_out) == SEQ && len(attn_out[0]) == DIM && len(attn_out[SEQ - 1]) == DIM)
+
+// -- #17 zero-input attention with zero weights -> zero --
+let W_zero = jamba_zeros_2d(DIM, DIM)
+let mut zs = []
+for t in 0..SEQ { zs = zs + [jamba_zeros(DIM)] }
+let attn_zero = jamba_attn_block_forward(zs, W_zero, W_zero, W_zero, W_zero, SEQ, DIM)
+let mut attn_all_zero = true
+for t in 0..SEQ {
+    for i in 0..DIM {
+        if fabs(attn_zero[t][i]) > 1.0e-9 { attn_all_zero = false }
+    }
+}
+check("#17 zero attention -> zero", attn_all_zero)
+
+// -- #18 ffn forward shape --
+let W1 = jamba_init_weight(HIDDEN, DIM, SEED + 10)
+let W2 = jamba_init_weight(DIM, HIDDEN, SEED + 11)
+let ffn_out = jamba_ffn_forward(x1, W1, W2, DIM, HIDDEN)
+check("#18 ffn output shape", len(ffn_out) == DIM)
+
+// -- #19 ffn zero input -> zero (relu and bias-free) --
+let ffn_zero = jamba_ffn_forward(jamba_zeros(DIM), W1, W2, DIM, HIDDEN)
+let mut ffn_zero_ok = true
+for i in 0..DIM {
+    if fabs(ffn_zero[i]) > 1.0e-9 { ffn_zero_ok = false }
+}
+check("#19 ffn zero -> zero", ffn_zero_ok)
+
+// -- #20 router_top_k picks exactly k --
+let rlogits = [0.1, 0.9, 0.3, 0.8, 0.5]
+let route20 = jamba_router_top_k(rlogits, 5, 3)
+check("#20 router picks k", len(route20[0]) == 3)
+
+// -- #21 router weights sum ~ 1 --
+let mut rsum = 0.0
+for i in 0..3 { rsum = rsum + route20[1][i] }
+check("#21 router weights sum ~ 1", approx(rsum, 1.0, 0.001))
+
+// -- #22 router picks highest logits --
+// top-3 by value: 0.9 (1), 0.8 (3), 0.5 (4) -- first pick should be index 1
+check("#22 router first pick is highest", route20[0][0] == 1)
+
+// -- #23 moe_forward output shape --
+let mut exps_W1 = []
+let mut exps_b1 = []
+let mut exps_W2 = []
+for e in 0..N_EXPERTS {
+    exps_W1 = exps_W1 + [jamba_init_weight(HIDDEN, DIM, SEED + 200 + e)]
+    exps_b1 = exps_b1 + [jamba_zeros(HIDDEN)]
+    exps_W2 = exps_W2 + [jamba_init_weight(DIM, HIDDEN, SEED + 300 + e)]
+}
+let router_W = jamba_init_weight(N_EXPERTS, DIM, SEED + 77)
+let moe_out = jamba_moe_forward(x1, exps_W1, exps_b1, exps_W2, router_W, N_EXPERTS, TOP_K, DIM, HIDDEN)
+check("#23 moe output shape", len(moe_out) == DIM)
+
+// -- #24 MoE with 1 expert + top_k=1 equals plain FFN --
+let one_W1 = [jamba_init_weight(HIDDEN, DIM, SEED + 901)]
+let one_b1 = [jamba_zeros(HIDDEN)]
+let one_W2 = [jamba_init_weight(DIM, HIDDEN, SEED + 902)]
+let one_rW = jamba_init_weight(1, DIM, SEED + 903)
+let moe_one = jamba_moe_forward(x1, one_W1, one_b1, one_W2, one_rW, 1, 1, DIM, HIDDEN)
+let ffn_one = jamba_ffn_forward(x1, one_W1[0], one_W2[0], DIM, HIDDEN)
+let mut moe_eq_ffn = true
+for i in 0..DIM {
+    if fabs(moe_one[i] - ffn_one[i]) > 1.0e-6 { moe_eq_ffn = false }
+}
+check("#24 MoE(n=1,k=1) == FFN", moe_eq_ffn)
+
+// -- #25 layer_forward mamba shape --
+let params_m = #{}
+params_m["W1"] = W1
+params_m["W2"] = W2
+let resL25 = jamba_layer_forward("mamba", jamba_zeros(DIM), xs, cfg, params_m)
+check("#25 layer mamba output shape",
+    len(resL25[1]) == SEQ && len(resL25[1][0]) == DIM)
+
+// -- #26 layer_forward attn shape --
+let params_a = #{}
+params_a["Wq"] = Wq
+params_a["Wk"] = Wk
+params_a["Wv"] = Wv
+params_a["Wo"] = Wo
+params_a["W1"] = W1
+params_a["W2"] = W2
+let resL26 = jamba_layer_forward("attn", jamba_zeros(DIM), xs, cfg, params_a)
+check("#26 layer attn output shape",
+    len(resL26[1]) == SEQ && len(resL26[1][0]) == DIM)
+
+// -- #27 layer_forward attn_moe shape --
+let params_am = #{}
+params_am["Wq"] = Wq
+params_am["Wk"] = Wk
+params_am["Wv"] = Wv
+params_am["Wo"] = Wo
+params_am["experts_W1"] = exps_W1
+params_am["experts_b1"] = exps_b1
+params_am["experts_W2"] = exps_W2
+params_am["router_W"] = router_W
+let resL27 = jamba_layer_forward("attn_moe", jamba_zeros(DIM), xs, cfg, params_am)
+check("#27 layer attn_moe output shape",
+    len(resL27[1]) == SEQ && len(resL27[1][0]) == DIM)
+
+// -- #28 layer_forward mamba_moe shape --
+let params_mm = #{}
+params_mm["experts_W1"] = exps_W1
+params_mm["experts_b1"] = exps_b1
+params_mm["experts_W2"] = exps_W2
+params_mm["router_W"] = router_W
+let resL28 = jamba_layer_forward("mamba_moe", jamba_zeros(DIM), xs, cfg, params_mm)
+check("#28 layer mamba_moe output shape",
+    len(resL28[1]) == SEQ && len(resL28[1][0]) == DIM)
+
+// -- #29 forward_sequence preserves [seq_len, dim] --
+let params_all = jamba_default_params_per_layer(cfg, SEED)
+let seq_out = jamba_forward_sequence(cfg, params_all, xs, SEQ, DIM)
+let mut fs_shape_ok = len(seq_out) == SEQ
+if fs_shape_ok {
+    for t in 0..SEQ {
+        if len(seq_out[t]) != DIM { fs_shape_ok = false }
+    }
+}
+check("#29 forward_sequence shape", fs_shape_ok)
+
+// -- #30 forward_sequence deterministic --
+let seq_out2 = jamba_forward_sequence(cfg, params_all, xs, SEQ, DIM)
+let mut det_ok = true
+for t in 0..SEQ {
+    for i in 0..DIM {
+        if fabs(seq_out[t][i] - seq_out2[t][i]) > 1.0e-9 { det_ok = false }
+    }
+}
+check("#30 forward_sequence deterministic", det_ok)
+
+// -- #31 cache mamba_states length --
+let cache = jamba_cache_create(cfg, SEQ)
+check("#31 cache mamba_states length", len(cache["mamba_states"]) == N_LAYERS)
+
+// -- #32 cache kv populated only on attn layers --
+let kv_keys = cache["kv_keys"]
+let mut kv_ok = true
+for l in 0..N_LAYERS {
+    let t = plan[l]
+    let is_attn_l = t == "attn" || t == "attn_moe"
+    if is_attn_l {
+        if len(kv_keys[l]) != SEQ { kv_ok = false }
+    }
+    if is_attn_l == false {
+        if len(kv_keys[l]) != 0 { kv_ok = false }
+    }
+}
+check("#32 cache kv only on attn layers", kv_ok)
+
+// -- #33 all mamba_state vectors sized dim --
+let mut st_ok = true
+let mstates = cache["mamba_states"]
+for l in 0..N_LAYERS {
+    if len(mstates[l]) != DIM { st_ok = false }
+}
+check("#33 cache mamba_states sized dim", st_ok)
+
+// -- #34 memory_estimate > 0 --
+let mem1 = jamba_memory_estimate(cfg)
+check("#34 memory_estimate > 0", mem1 > 0)
+
+// -- #35 memory scales with n_layers --
+let cfg_big = jamba_create_config(N_LAYERS * 2, 0.25, 0.5, DIM, N_EXPERTS, TOP_K)
+let mem2 = jamba_memory_estimate(cfg_big)
+check("#35 memory scales with n_layers", mem2 > mem1)
+
+// -- #36 count_layer_types has expected keys --
+let k1 = has_key(counts, "mamba")
+let k2 = has_key(counts, "attn")
+let k3 = has_key(counts, "mamba_moe")
+let k4 = has_key(counts, "attn_moe")
+let has_all_keys = k1 && k2 && k3 && k4
+check("#36 count_layer_types keys", has_all_keys)
+
+// ═══════════════════════════════════════════════════════════════════
+println("")
+println("=== Jamba Hybrid MoE test summary ===")
+println("PASS: " + str(pass_count))
+println("FAIL: " + str(fail_count))
+println("TOTAL: " + str(pass_count + fail_count))

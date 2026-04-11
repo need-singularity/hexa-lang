@@ -1,0 +1,365 @@
+// ===================================================================
+//  bitnet.hexa — BitNet 1.58-bit ternary weight quantization
+//
+//  Reference: "The Era of 1-bit LLMs: All Large Language Models are
+//  in 1.58 Bits" (Ma et al., 2024)
+//
+//  Weights are quantized to {-1, 0, +1} using absmean thresholding.
+//  For a weight matrix W with mean absolute value gamma = mean(|W|),
+//  each element w is mapped to:
+//      q =  1   if w >  gamma
+//      q =  0   if |w| <= gamma
+//      q = -1   if w < -gamma
+//
+//  Effective bit-width per weight: log2(3) ≈ 1.58 bits.
+//
+//  Functions:
+//    bitnet_quantize(w)                -> BitNetTensor
+//    bitnet_dequantize(bt)             -> [float]
+//    bitnet_matmul(x, bt, m, k, n)     -> [float]
+//    bitnet_ste_backward(grad, w, bt)  -> [float]
+//    bitnet_memory_ratio(n)            -> float
+//    bitnet_quantization_error(w, bt)  -> ErrorStats
+//    bitnet_train_step(w, grad, lr)    -> [float]
+//    bitnet_summary(name, w, bt)       -> void
+//
+//  Base: self/ml/quantize.hexa patterns (QuantizedTensor-like struct).
+//  Pure .hexa — no Rust, no extern.
+// ===================================================================
+
+// ── Struct definitions ──────────────────────────────────────────
+struct BitNetTensor {
+    // Packed ternary data — one int per element carrying value in {-1,0,1}
+    // A future optimization could pack 5 ternaries per byte (3^5=243<256),
+    // but we store one-per-slot for clarity + round-trip simplicity.
+    data: array,
+    // Global absmean scale gamma (acts as the scale factor on dequant)
+    gamma: float,
+    // Total number of weights
+    numel: int,
+    // Shape metadata (optional, used for matmul routing)
+    rows: int,
+    cols: int
+}
+
+struct BitNetErrorStats {
+    mse: float,
+    max_err: float,
+    snr: float,
+    nonzero_ratio: float
+}
+
+// ── Local math helpers (avoid cross-module name collisions) ──────
+fn _bn_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn _bn_max(a, b) {
+    if a >= b { return a }
+    return b
+}
+
+// Pure log10 approximation — mirrors quantize._log10_approx.
+fn _bn_log10(x) {
+    if x <= 0.0 { return -999.0 }
+    let mut v = x
+    let mut result = 0.0
+    while v >= 10.0 {
+        v = v / 10.0
+        result = result + 1.0
+    }
+    while v < 1.0 {
+        v = v * 10.0
+        result = result - 1.0
+    }
+    let t = (v - 1.0) / (v + 1.0)
+    let t2 = t * t
+    let ln_v = 2.0 * (t + t * t2 / 3.0 + t * t2 * t2 / 5.0 + t * t2 * t2 * t2 / 7.0 + t * t2 * t2 * t2 * t2 / 9.0)
+    result = result + ln_v / 2.302585
+    return result
+}
+
+// ── Core absmean threshold ──────────────────────────────────────
+// gamma = (1/n) * sum(|w_i|)
+fn bitnet_absmean(w) {
+    let n = len(w)
+    if n == 0 { return 0.0 }
+    let mut acc = 0.0
+    let mut i = 0
+    while i < n {
+        acc = acc + _bn_abs(w[i])
+        i = i + 1
+    }
+    return acc / to_float(n)
+}
+
+// ===================================================================
+//  bitnet_quantize(w) -> BitNetTensor
+//
+//  Quantize a flat FP32 weight array to ternary using absmean
+//  thresholding. Returns a BitNetTensor with gamma as the scale.
+// ===================================================================
+fn bitnet_quantize(w) {
+    let n = len(w)
+    let gamma = bitnet_absmean(w)
+    let mut qdata = []
+    let mut i = 0
+    while i < n {
+        let v = w[i]
+        let mut q = 0
+        if v > gamma {
+            q = 1
+        } else {
+            if v < 0.0 - gamma {
+                q = 0 - 1
+            }
+        }
+        qdata = qdata + [q]
+        i = i + 1
+    }
+    return BitNetTensor {
+        data: qdata,
+        gamma: gamma,
+        numel: n,
+        rows: 0,
+        cols: 0
+    }
+}
+
+// ===================================================================
+//  bitnet_quantize_2d(w, rows, cols) -> BitNetTensor
+//
+//  Same as bitnet_quantize but stores shape for matmul routing.
+// ===================================================================
+fn bitnet_quantize_2d(w, rows, cols) {
+    let bt = bitnet_quantize(w)
+    return BitNetTensor {
+        data: bt.data,
+        gamma: bt.gamma,
+        numel: bt.numel,
+        rows: rows,
+        cols: cols
+    }
+}
+
+// ===================================================================
+//  bitnet_dequantize(bt) -> [float]
+//
+//  Reconstruct FP32 values: w_hat = gamma * q   (q in {-1,0,1}).
+// ===================================================================
+fn bitnet_dequantize(bt) {
+    let n = bt.numel
+    let g = bt.gamma
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let q = bt.data[i]
+        out = out + [g * to_float(q)]
+        i = i + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  bitnet_matmul(x, bt, m, k, n) -> [float]
+//
+//  Compute y = x @ W  where
+//    x has shape (m, k)  — flat row-major,
+//    W has shape (k, n)  — ternary, stored row-major,
+//    y has shape (m, n).
+//
+//  Since q ∈ {-1, 0, +1}, multiplications collapse to sign + adds.
+//  This is the whole point of BitNet: no float multiplies on weights.
+// ===================================================================
+fn bitnet_matmul(x, bt, m, k, n) {
+    let g = bt.gamma
+    let w = bt.data
+    let mut out = []
+    let mut i = 0
+    while i < m {
+        let mut j = 0
+        while j < n {
+            let mut acc = 0.0
+            let mut p = 0
+            while p < k {
+                let q = w[p * n + j]
+                if q == 1 {
+                    acc = acc + x[i * k + p]
+                } else {
+                    if q == 0 - 1 {
+                        acc = acc - x[i * k + p]
+                    }
+                }
+                p = p + 1
+            }
+            out = out + [acc * g]
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  bitnet_ste_backward(grad_out, x_or_w, bt) -> [float]
+//
+//  Straight-Through Estimator: during backward, treat the quantizer
+//  as the identity, i.e. dL/dw ≈ dL/dq when |w| <= clip_val.
+//
+//  Inputs:
+//    grad_out : dL/dw_hat (same shape as weights, FP32)
+//    x_or_w   : original (unquantized) weights — used for clipping mask
+//    bt       : the quantized BitNetTensor (for numel sanity check)
+//
+//  Returns grad for w, with values clipped outside [-1, 1] zeroed.
+// ===================================================================
+fn bitnet_ste_backward(grad_out, w_orig, bt) {
+    let n = bt.numel
+    let mut grad_w = []
+    let mut i = 0
+    while i < n {
+        let wi = w_orig[i]
+        // STE clip: pass grad through only if |w| <= 1
+        if wi > 1.0 {
+            grad_w = grad_w + [0.0]
+        } else {
+            if wi < 0.0 - 1.0 {
+                grad_w = grad_w + [0.0]
+            } else {
+                grad_w = grad_w + [grad_out[i]]
+            }
+        }
+        i = i + 1
+    }
+    return grad_w
+}
+
+// ===================================================================
+//  bitnet_train_step(w, grad, lr) -> [float]
+//
+//  One SGD step using STE: w_new = w - lr * grad  (then re-quantize).
+//  Returns updated FP32 weights; caller re-runs bitnet_quantize() as
+//  needed. This models the "latent weight" training loop from the
+//  BitNet paper.
+// ===================================================================
+fn bitnet_train_step(w, grad, lr) {
+    let n = len(w)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [w[i] - lr * grad[i]]
+        i = i + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  bitnet_memory_ratio(n) -> float
+//
+//  Expected compression ratio vs FP32 baseline.
+//  FP32: 32 bits/weight.
+//  BitNet: log2(3) ≈ 1.58 bits/weight (information-theoretic lower bound).
+//  Ratio = 32 / 1.58 ≈ 20.25x  (theoretical max).
+//
+//  Our one-int-per-slot storage is uncompressed (intentional, for
+//  clarity). This function returns the *theoretical* compression
+//  ratio you'd get with optimal 5-trit-per-byte packing — which is
+//  the number we report for hardware comparisons.
+//
+//  Observed floor with typical packing (8-bit code): 32/8 = 4x.
+//  The paper's 10x figure assumes FP16 baseline and bit-packed weights.
+//
+//  We return the FP16→ternary ratio of 16/1.58 ≈ 10.12x (paper number).
+// ===================================================================
+fn bitnet_memory_ratio(n) {
+    // FP16 baseline: 16 bits/weight
+    // Ternary: 1.58 bits/weight
+    return 16.0 / 1.58
+}
+
+// Theoretical compression vs FP32 (for reference).
+fn bitnet_memory_ratio_fp32(n) {
+    return 32.0 / 1.58
+}
+
+// ===================================================================
+//  bitnet_memory_bytes(bt, packed) -> int
+//
+//  Reports storage footprint of a BitNetTensor under two modes:
+//    packed=false : 1 int per weight (what we store)  -> n*8 bytes
+//    packed=true  : 5 trits per byte (optimal pack)   -> ceil(n/5) bytes
+//
+//  Both add an 8-byte FP64 gamma.
+// ===================================================================
+fn bitnet_memory_bytes(bt, packed) {
+    let n = bt.numel
+    let mut bytes = 0
+    if packed {
+        // 5 trits per byte (3^5 = 243 < 256)
+        bytes = (n + 4) / 5
+    } else {
+        bytes = n * 8
+    }
+    // 8-byte gamma scale
+    return bytes + 8
+}
+
+// ===================================================================
+//  bitnet_quantization_error(w, bt) -> BitNetErrorStats
+//
+//  Reconstruction MSE, max abs error, SNR (dB), and nonzero ratio.
+//  nonzero_ratio = |{q != 0}| / n  (fraction of "active" weights).
+// ===================================================================
+fn bitnet_quantization_error(w, bt) {
+    let deq = bitnet_dequantize(bt)
+    let n = len(w)
+    let mut sum_sq_err = 0.0
+    let mut max_err = 0.0
+    let mut sum_sq_sig = 0.0
+    let mut nz = 0
+    let mut i = 0
+    while i < n {
+        let err = _bn_abs(w[i] - deq[i])
+        sum_sq_err = sum_sq_err + err * err
+        if err > max_err { max_err = err }
+        sum_sq_sig = sum_sq_sig + w[i] * w[i]
+        if bt.data[i] != 0 {
+            nz = nz + 1
+        }
+        i = i + 1
+    }
+    let mse = sum_sq_err / to_float(n)
+    let mut snr = 0.0
+    if sum_sq_err > 0.0 {
+        let ratio = sum_sq_sig / sum_sq_err
+        snr = 10.0 * _bn_log10(ratio)
+    } else {
+        snr = 999.0
+    }
+    let nr = to_float(nz) / to_float(n)
+    return BitNetErrorStats {
+        mse: mse,
+        max_err: max_err,
+        snr: snr,
+        nonzero_ratio: nr
+    }
+}
+
+// ===================================================================
+//  bitnet_summary(name, w, bt) -> void
+// ===================================================================
+fn bitnet_summary(name, w, bt) {
+    let err = bitnet_quantization_error(w, bt)
+    let mem_packed = bitnet_memory_bytes(bt, true)
+    let mem_unpacked = bitnet_memory_bytes(bt, false)
+    let fp16_bytes = bt.numel * 2
+    let fp32_bytes = bt.numel * 4
+    let ratio_fp16 = to_float(fp16_bytes) / to_float(_bn_max(mem_packed, 1))
+    println("[bitnet] " + name + ": " + str(bt.numel) + " params")
+    println("  gamma=" + str(bt.gamma) + " nonzero=" + str(err.nonzero_ratio))
+    println("  mem_packed=" + str(mem_packed) + "B  mem_unpacked=" + str(mem_unpacked) + "B")
+    println("  fp16_baseline=" + str(fp16_bytes) + "B  fp32_baseline=" + str(fp32_bytes) + "B")
+    println("  ratio_vs_fp16=" + str(ratio_fp16) + "x")
+    println("  MSE=" + str(err.mse) + " max_err=" + str(err.max_err) + " SNR=" + str(err.snr) + "dB")
+}
