@@ -92,6 +92,30 @@ impl Parser {
         }
     }
 
+    /// P11 골화 (line continuation): 현재 peek 이 Newline 이면 앞으로 non-Newline 토큰까지 미리 본 후,
+    /// 그 토큰이 continuation token (.[&&|| + - 등) 이면 newline 을 skip 하고 true 반환.
+    /// 그렇지 않으면 아무것도 건드리지 않고 false 반환. 인접 statement 를 잘못 먹지 않음.
+    fn skip_newlines_if_continuation(&mut self, is_continuation: fn(&Token) -> bool) -> bool {
+        if !matches!(self.peek(), Token::Newline | Token::Semicolon) {
+            return false;
+        }
+        // lookahead: first non-newline/semicolon token
+        let mut ahead = 1;
+        loop {
+            let t = self.peek_ahead(ahead);
+            if matches!(t, Token::Newline | Token::Semicolon) {
+                ahead += 1;
+                continue;
+            }
+            if is_continuation(t) {
+                // commit skip
+                for _ in 0..ahead { self.advance(); }
+                return true;
+            }
+            return false;
+        }
+    }
+
     fn error(&self, message: String) -> HexaError {
         let span = self.current_span();
         HexaError {
@@ -1753,6 +1777,8 @@ impl Parser {
     fn parse_or(&mut self) -> Result<Expr, HexaError> {
         let mut left = self.parse_and()?;
         loop {
+            // P11 fix: `a\n    || b` 허용
+            self.skip_newlines_if_continuation(|t| matches!(t, Token::Or | Token::Xor));
             let op = match self.peek() {
                 Token::Or => BinOp::Or,
                 Token::Xor => BinOp::Xor,
@@ -1770,6 +1796,8 @@ impl Parser {
     fn parse_and(&mut self) -> Result<Expr, HexaError> {
         let mut left = self.parse_comparison()?;
         loop {
+            // P11 fix: `a\n    && b` 허용
+            self.skip_newlines_if_continuation(|t| matches!(t, Token::And));
             if !matches!(self.peek(), Token::And) {
                 break;
             }
@@ -1785,6 +1813,9 @@ impl Parser {
     fn parse_comparison(&mut self) -> Result<Expr, HexaError> {
         let mut left = self.parse_addition()?;
         loop {
+            // P11 fix: `a\n    == b` 허용
+            self.skip_newlines_if_continuation(|t| matches!(t,
+                Token::EqEq | Token::NotEq | Token::Lt | Token::Gt | Token::LtEq | Token::GtEq));
             let op = match self.peek() {
                 Token::EqEq => BinOp::Eq,
                 Token::NotEq => BinOp::Ne,
@@ -1806,6 +1837,10 @@ impl Parser {
     fn parse_addition(&mut self) -> Result<Expr, HexaError> {
         let mut left = self.parse_multiplication()?;
         loop {
+            // P11 fix: `a\n    + b` 허용. Plus/Minus 는 unary prefix 가능 모호성 있으나
+            // 실전에서 top-level `-bar` 자립 문장은 없음 — 체이닝 우선.
+            self.skip_newlines_if_continuation(|t| matches!(t,
+                Token::Plus | Token::Minus | Token::BitXor | Token::BitAnd));
             let op = match self.peek() {
                 Token::Plus => BinOp::Add,
                 Token::Minus => BinOp::Sub,
@@ -1825,6 +1860,9 @@ impl Parser {
     fn parse_multiplication(&mut self) -> Result<Expr, HexaError> {
         let mut left = self.parse_unary()?;
         loop {
+            // P11 fix: `a\n    * b` 허용 (이 연산자들은 unary prefix 없음 → 모호성 無)
+            self.skip_newlines_if_continuation(|t| matches!(t,
+                Token::Star | Token::Slash | Token::Percent | Token::Power));
             let op = match self.peek() {
                 Token::Star => BinOp::Mul,
                 Token::Slash => BinOp::Div,
@@ -1861,6 +1899,10 @@ impl Parser {
     fn parse_postfix(&mut self) -> Result<Expr, HexaError> {
         let mut expr = self.parse_primary()?;
         loop {
+            // P11 fix: 메서드 체인 `foo\n  .bar()` 허용
+            // `[` (인덱싱) 도 줄바꿈 허용.
+            // `(` 은 모호성 때문에 줄바꿈 불허용 (파이썬과 같은 정책).
+            self.skip_newlines_if_continuation(|t| matches!(t, Token::Dot | Token::LBracket));
             match self.peek() {
                 Token::LParen => {
                     self.advance();
