@@ -1,10 +1,12 @@
 // token-forge — LLM token compression engine (hexa-lang)
 // Absorbed from token-forge repo: proxy + cache + forge + anvil + bench
 //
-// 2026-04-11 cleanup: server.py → server.hexa (proxy entry)
-// REMAINING-PYTHON3-DEP: compress_messages/analyze_cache/bench_dfs 내부 JSON
-//   manipulation 3건이 still python3 -c '...'. 향후 hexa json_parse + 순수
-//   hexa 로직으로 재작성하면 token-forge는 python 0이 됨.
+// 2026-04-11 cleanup:
+//   - server.py → server.hexa (proxy entry)
+//   - analyze_cache/bench_dfs/compress_messages 3건 모두 pure-hexa 재작성 완료.
+//     json_parse + json_stringify + 직접 경로 mutation 으로 python3 의존 0.
+//     주의: hexa 객체는 복사 시맨틱이라 let-bind 우회 불가, msgs[i][...]["k"] = v
+//     처럼 풀 경로 mutation 필수.
 
 // ═══════════════════════════════════════════════════════════════════════
 //  CONSTANTS
@@ -59,26 +61,40 @@ fn compress_twostage(text: str) -> str {
 // ═══════════════════════════════════════════════════════════════════════
 
 fn compress_messages(messages: str, keep_recent: int, max_tool: int, max_asst: int) -> str {
-    // Parse JSON messages array, compress old turns
-    let cmd = "python3 -c \"" +
-        "import json,sys\n" +
-        "msgs=json.loads(sys.argv[1])\n" +
-        "n=len(msgs)\n" +
-        "keep=" + to_string(keep_recent) + "\n" +
-        "mt=" + to_string(max_tool) + "\n" +
-        "ma=" + to_string(max_asst) + "\n" +
-        "for i in range(max(0,n-keep)):\n" +
-        "  m=msgs[i]\n" +
-        "  if isinstance(m.get('content'),list):\n" +
-        "    for b in m['content']:\n" +
-        "      if isinstance(b,dict):\n" +
-        "        if b.get('type')=='tool_result' and len(str(b.get('content','')))>mt:\n" +
-        "          b['content']=str(b['content'])[:mt]+'...[truncated]'\n" +
-        "  if m.get('role')=='assistant' and isinstance(m.get('content'),str) and len(m['content'])>ma:\n" +
-        "    m['content']=m['content'][:ma]+'...[truncated]'\n" +
-        "print(json.dumps(msgs))\n" +
-        "\" '" + messages.replace("'", "'\\''") + "'"
-    return exec(cmd).trim()
+    // 2026-04-11: pure-hexa rewrite — json_parse + 직접 경로 변형 + json_stringify.
+    // python3 의존 0 (forge.hexa 3건 중 마지막). hexa 객체 mutation 의미는 복사
+    // 시맨틱이라 `let m = msgs[i]` 우회 불가 → msgs[i][...] 풀 경로로 변형 필수.
+    let msgs = json_parse(messages)
+    let n = len(msgs)
+    let limit = if n - keep_recent > 0 { n - keep_recent } else { 0 }
+    let mut i = 0
+    while i < limit {
+        let content = msgs[i]["content"]
+        let ctype = type_of(content)
+        if ctype == "array" {
+            let nc = len(content)
+            let mut j = 0
+            while j < nc {
+                let block = msgs[i]["content"][j]
+                if type_of(block) == "map" {
+                    if block["type"] == "tool_result" {
+                        let bc = to_string(block["content"])
+                        if len(bc) > max_tool {
+                            msgs[i]["content"][j]["content"] = bc.substring(0, max_tool) + "...[truncated]"
+                        }
+                    }
+                }
+                j = j + 1
+            }
+        } else if ctype == "string" && msgs[i]["role"] == "assistant" {
+            let cstr = to_string(content)
+            if len(cstr) > max_asst {
+                msgs[i]["content"] = cstr.substring(0, max_asst) + "...[truncated]"
+            }
+        }
+        i = i + 1
+    }
+    return json_stringify(msgs)
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -86,24 +102,43 @@ fn compress_messages(messages: str, keep_recent: int, max_tool: int, max_asst: i
 // ═══════════════════════════════════════════════════════════════════════
 
 fn analyze_cache(session_path: str) -> str {
-    let cmd = "python3 -c \"" +
-        "import json\n" +
-        "turns=[]\n" +
-        "for l in open('" + session_path + "'):\n" +
-        "  try: d=json.loads(l)\n" +
-        "  except: continue\n" +
-        "  if d.get('type')=='assistant':\n" +
-        "    u=d.get('message',{}).get('usage',{})\n" +
-        "    if u: turns.append(u)\n" +
-        "if not turns: print('no data'); exit()\n" +
-        "total_in=sum(t.get('input_tokens',0) for t in turns)\n" +
-        "total_cache=sum(t.get('cache_read_input_tokens',0) for t in turns)\n" +
-        "total_create=sum(t.get('cache_creation_input_tokens',0) for t in turns)\n" +
-        "total_out=sum(t.get('output_tokens',0) for t in turns)\n" +
-        "hit=total_cache/(total_cache+total_create+total_in)*100 if (total_cache+total_create+total_in)>0 else 0\n" +
-        "print(f'turns={len(turns)} cache_hit={hit:.1f}% in={total_in} cache_read={total_cache} create={total_create} out={total_out}')\n" +
-        "\""
-    return exec(cmd).trim()
+    // 2026-04-11: pure-hexa rewrite — read_file + json_parse + 정수 누적.
+    // python3 의존 0 (forge.hexa 3건 중 1건 해소).
+    let content = read_file(session_path)
+    let lines = content.split("\n")
+    let mut turns = 0
+    let mut total_in = 0
+    let mut total_cache = 0
+    let mut total_create = 0
+    let mut total_out = 0
+    for line in lines {
+        if len(line) > 0 {
+            let d = json_parse(line)
+            if d["type"] == "assistant" {
+                let msg = d["message"]
+                let u = msg["usage"]
+                if to_string(u) != "" {
+                    turns = turns + 1
+                    total_in = total_in + to_int(u["input_tokens"])
+                    total_cache = total_cache + to_int(u["cache_read_input_tokens"])
+                    total_create = total_create + to_int(u["cache_creation_input_tokens"])
+                    total_out = total_out + to_int(u["output_tokens"])
+                }
+            }
+        }
+    }
+    if turns == 0 { return "no data" }
+    let denom = total_cache + total_create + total_in
+    let hit_pct = if denom > 0 { (total_cache * 1000) / denom } else { 0 }
+    // hit_pct = hit% × 10 (1자리 정수 분수)
+    let hit_int = hit_pct / 10
+    let hit_frac = hit_pct - (hit_int * 10)
+    return "turns=" + to_string(turns) +
+           " cache_hit=" + to_string(hit_int) + "." + to_string(hit_frac) + "%" +
+           " in=" + to_string(total_in) +
+           " cache_read=" + to_string(total_cache) +
+           " create=" + to_string(total_create) +
+           " out=" + to_string(total_out)
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -139,22 +174,22 @@ fn bench_dfs(session_path: str, max_depth: int) -> str {
     println("  cache: " + cache_info)
     println("")
 
-    // parse user/assistant messages
-    let parse_cmd = "python3 -c \"" +
-        "import json\n" +
-        "msgs=[]\n" +
-        "for l in open('" + session_path + "'):\n" +
-        "  try: d=json.loads(l)\n" +
-        "  except: continue\n" +
-        "  r=d.get('type','')\n" +
-        "  if r not in('user','assistant'): continue\n" +
-        "  c=d.get('message',{}).get('content','')\n" +
-        "  if isinstance(c,list): c=' '.join(b.get('text','') if isinstance(b,dict) else str(b) for b in c)\n" +
-        "  if len(str(c))>10: msgs.append({'role':r,'text':str(c)[:500]})\n" +
-        "print(json.dumps(msgs[:50]))\n" +
-        "\""
-    let msgs_json = exec(parse_cmd).trim()
-    println("  parsed messages")
+    // 2026-04-11: pure-hexa rewrite — read_file + json_parse 만으로 user/assistant
+    // 메시지를 카운트. 결과 문자열은 사용처가 없어 카운트만 출력.
+    let raw = read_file(session_path)
+    let lines = raw.split("\n")
+    let mut msg_count = 0
+    let cap = 50
+    for line in lines {
+        if msg_count >= cap { } else if len(line) > 0 {
+            let d = json_parse(line)
+            let r = d["type"]
+            if r == "user" || r == "assistant" {
+                msg_count = msg_count + 1
+            }
+        }
+    }
+    println("  parsed messages: " + to_string(msg_count) + " (cap " + to_string(cap) + ")")
 
     return "benchmark complete — see bench reports"
 }
@@ -192,7 +227,8 @@ consciousness TokenForgeRouter {
         println("⬡ starting compression proxy on :" + to_string(PROXY_PORT))
         println("  ANTHROPIC_BASE_URL=http://localhost:" + to_string(PROXY_PORT) + "/v1 claude")
         // 2026-04-11: server.py → server.hexa, python3 → ./hexa
-        let hexa_bin = env("HEXA_BIN") ?? "/Users/ghost/Dev/hexa-lang/hexa"
+        let env_bin = env("HEXA_BIN")
+        let hexa_bin = if env_bin == "" { "/Users/ghost/Dev/hexa-lang/hexa" } else { env_bin }
         exec(hexa_bin + " " + argv[2].replace("forge.hexa", "proxy/server.hexa"))
     }
     if cmd == "cache" {
