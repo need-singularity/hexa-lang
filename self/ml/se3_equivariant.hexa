@@ -1,0 +1,493 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/se3_equivariant.hexa — SE(3)-Equivariant NN (#245)
+//
+//  Message passing on a graph of 3D points (atoms/residues/particles)
+//  that is equivariant under the Euclidean group SE(3) = rotations +
+//  translations.  Following Satorras et al., "E(n)-Equivariant Graph
+//  Neural Networks" (EGNN, 2021) the invariants used in messages are
+//  pairwise squared distances, and coordinate updates are along the
+//  line connecting two points — both automatically equivariant.
+//
+//  Per-layer update (EGNN, batch of 1):
+//    m_ij = φ_e( h_i, h_j, ||x_i - x_j||^2 )
+//    x_i' = x_i + (1/(N-1)) * Σ_{j≠i} (x_i - x_j) * φ_x(m_ij)
+//    m_i  = Σ_{j≠i} m_ij
+//    h_i' = φ_h( h_i, m_i )
+//
+//  φ_e, φ_x, φ_h are small MLPs (2 linear + swish).  We implement them
+//  as plain matrices with one hidden layer and ReLU activation.
+//
+//  API:
+//    se3_rot_matrix(theta, axis)        -> [[float; 3]; 3]  axis 0/1/2
+//    se3_apply_rot(R, points)           -> [[float]]
+//    se3_translate(points, t)           -> [[float]]
+//    se3_dist_sq(a, b)                  -> float
+//    se3_mlp_forward(x, w1, b1, w2, b2) -> [float]
+//    se3_layer_forward(h, x, edges, weights) -> dict{"h","x"}
+//    se3_build_edges_knn(points, k)     -> dict{"src":[int],"dst":[int]}
+//    se3_relative_pos(points, edges)    -> [[float]]
+//    se3_invariance_check(h, x, R, t)   -> float      diag
+//
+//  AI-NATIVE attrs:
+//    @pure  — stateless
+//    @hot   — called for every forward step
+// ═══════════════════════════════════════════════════════════════════
+
+// ── helpers ─────────────────────────────────────────────────────
+
+fn se3_abs(v) { if v < 0.0 { return 0.0 - v } return v }
+
+fn se3_sqrt(v) {
+    if v <= 0.0 { return 0.0 }
+    let mut g = v / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 { g = (g + v / g) / 2.0 }
+    return g
+}
+
+fn se3_cos(theta) {
+    // Taylor series, range-reduce [-pi, pi]
+    let pi = 3.14159265358979
+    let mut t = theta
+    while t > pi { t = t - 2.0 * pi }
+    while t < 0.0 - pi { t = t + 2.0 * pi }
+    let mut result = 1.0
+    let mut term = 1.0
+    let mut sign = -1.0
+    for i in 1..20 {
+        term = term * t * t / (to_float(2 * i) * to_float(2 * i - 1))
+        result = result + sign * term
+        sign = 0.0 - sign
+    }
+    return result
+}
+
+fn se3_sin(theta) {
+    let pi = 3.14159265358979
+    let mut t = theta
+    while t > pi { t = t - 2.0 * pi }
+    while t < 0.0 - pi { t = t + 2.0 * pi }
+    let mut result = t
+    let mut term = t
+    let mut sign = -1.0
+    for i in 1..20 {
+        let k = 2 * i + 1
+        term = term * t * t / (to_float(k) * to_float(k - 1))
+        result = result + sign * term
+        sign = 0.0 - sign
+    }
+    return result
+}
+
+fn se3_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn se3_zeros_2d(r, c) {
+    let mut m = []
+    for _i in 0..r {
+        let mut row = se3_zeros(c)
+        m = m + [row]
+    }
+    return m
+}
+
+fn se3_hash(seed, i, j) {
+    let h = ((seed * 2654435761 + i * 1315423911 + j * 731) % 10007)
+    return to_float(h) / 10007.0 - 0.5
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (1) 3D rotation matrix about principal axes (for testing equivariance)
+//
+//  axis = 0 -> X, 1 -> Y, 2 -> Z
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn se3_rot_matrix(theta, axis) {
+    let c = se3_cos(theta)
+    let s = se3_sin(theta)
+    let mut R = se3_zeros_2d(3, 3)
+    if axis == 0 {
+        R[0][0] = 1.0 ; R[0][1] = 0.0 ; R[0][2] = 0.0
+        R[1][0] = 0.0 ; R[1][1] = c   ; R[1][2] = 0.0 - s
+        R[2][0] = 0.0 ; R[2][1] = s   ; R[2][2] = c
+    }
+    if axis == 1 {
+        R[0][0] = c   ; R[0][1] = 0.0 ; R[0][2] = s
+        R[1][0] = 0.0 ; R[1][1] = 1.0 ; R[1][2] = 0.0
+        R[2][0] = 0.0 - s ; R[2][1] = 0.0 ; R[2][2] = c
+    }
+    if axis == 2 {
+        R[0][0] = c   ; R[0][1] = 0.0 - s ; R[0][2] = 0.0
+        R[1][0] = s   ; R[1][1] = c       ; R[1][2] = 0.0
+        R[2][0] = 0.0 ; R[2][1] = 0.0     ; R[2][2] = 1.0
+    }
+    return R
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (2) Apply a 3x3 rotation to every point
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn se3_apply_rot(R, points) {
+    let n = len(points)
+    let mut out = []
+    for i in 0..n {
+        let p = points[i]
+        let rx = R[0][0] * p[0] + R[0][1] * p[1] + R[0][2] * p[2]
+        let ry = R[1][0] * p[0] + R[1][1] * p[1] + R[1][2] * p[2]
+        let rz = R[2][0] * p[0] + R[2][1] * p[1] + R[2][2] * p[2]
+        out = out + [[rx, ry, rz]]
+    }
+    return out
+}
+
+@pure
+fn se3_translate(points, t) {
+    let n = len(points)
+    let mut out = []
+    for i in 0..n {
+        let p = points[i]
+        out = out + [[p[0] + t[0], p[1] + t[1], p[2] + t[2]]]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (3) Squared Euclidean distance between two 3D points
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn se3_dist_sq(a, b) {
+    let dx = a[0] - b[0]
+    let dy = a[1] - b[1]
+    let dz = a[2] - b[2]
+    return dx * dx + dy * dy + dz * dz
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (4) Tiny 2-layer MLP: y = W2 * relu(W1 * x + b1) + b2
+//
+//  Hidden act is ReLU (swish would also work but keeps pure ops simple).
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn se3_relu(v) { if v > 0.0 { return v } return 0.0 }
+
+@pure
+fn se3_mlp_forward(vec_in, w1, b1, w2, b2) {
+    let in_dim = len(vec_in)
+    let hidden = len(w1)
+    let out_dim = len(w2)
+
+    let mut h = se3_zeros(hidden)
+    for i in 0..hidden {
+        let mut s = b1[i]
+        for j in 0..in_dim {
+            s = s + w1[i][j] * vec_in[j]
+        }
+        h[i] = se3_relu(s)
+    }
+
+    let mut y = se3_zeros(out_dim)
+    for i in 0..out_dim {
+        let mut s = b2[i]
+        for j in 0..hidden {
+            s = s + w2[i][j] * h[j]
+        }
+        y[i] = s
+    }
+    return y
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (5) Full EGNN layer forward
+//
+//  Inputs:
+//    h: [N][d_h]   node features
+//    x: [N][3]     3D coordinates
+//    edges: [[i,j], ...] undirected graph (both directions needed)
+//    weights: dict with keys
+//       phi_e_w1,b1,w2,b2  (edge MLP), in_dim = 2*d_h + 1
+//       phi_x_w1,b1,w2,b2  (coord MLP), in_dim = d_msg, out_dim = 1
+//       phi_h_w1,b1,w2,b2  (node MLP), in_dim = d_h + d_msg, out_dim = d_h
+//
+//  Returns a dict {"h": [N][d_h], "x": [N][3]}.
+//
+//  SE(3)-equivariance: messages depend on (h_i, h_j, dist^2), coord
+//  updates on (x_i - x_j), so any rigid transform of x commutes
+//  through the layer (rotates/translates x' similarly, leaves h' the
+//  same).
+// ═══════════════════════════════════════════════════════════════════
+fn se3_layer_forward(h, coords, edges, weights) {
+    let n_nodes = len(h)
+    let d_h = len(h[0])
+
+    let phi_e_w1 = weights["phi_e_w1"]
+    let phi_e_b1 = weights["phi_e_b1"]
+    let phi_e_w2 = weights["phi_e_w2"]
+    let phi_e_b2 = weights["phi_e_b2"]
+
+    let phi_x_w1 = weights["phi_x_w1"]
+    let phi_x_b1 = weights["phi_x_b1"]
+    let phi_x_w2 = weights["phi_x_w2"]
+    let phi_x_b2 = weights["phi_x_b2"]
+
+    let phi_h_w1 = weights["phi_h_w1"]
+    let phi_h_b1 = weights["phi_h_b1"]
+    let phi_h_w2 = weights["phi_h_w2"]
+    let phi_h_b2 = weights["phi_h_b2"]
+
+    let d_msg = len(phi_e_w2)
+
+    // aggregated messages per node
+    let mut m_sum = []
+    for _i in 0..n_nodes {
+        m_sum = m_sum + [se3_zeros(d_msg)]
+    }
+
+    // new coordinates per node (start at input coords, accumulate sum, normalize later)
+    let mut x_out = []
+    for i in 0..n_nodes {
+        x_out = x_out + [[coords[i][0], coords[i][1], coords[i][2]]]
+    }
+
+    let mut counts = se3_zeros(n_nodes)
+
+    let src = edges["src"]
+    let dst = edges["dst"]
+    let n_edges = len(src)
+    for e in 0..n_edges {
+        let i = src[e]
+        let j = dst[e]
+        if i == j { continue }
+
+        let mut edge_in = se3_zeros(2 * d_h + 1)
+        for k in 0..d_h { edge_in[k] = h[i][k] }
+        for k in 0..d_h { edge_in[d_h + k] = h[j][k] }
+        edge_in[2 * d_h] = se3_dist_sq(coords[i], coords[j])
+
+        let m_ij = se3_mlp_forward(edge_in, phi_e_w1, phi_e_b1, phi_e_w2, phi_e_b2)
+
+        // accumulate message sum
+        for k in 0..d_msg {
+            m_sum[i][k] = m_sum[i][k] + m_ij[k]
+        }
+
+        // coord update: x' = x + (x_i - x_j) * phi_x(m_ij)
+        let cvec = se3_mlp_forward(m_ij, phi_x_w1, phi_x_b1, phi_x_w2, phi_x_b2)
+        let cscale = cvec[0]
+        let diff0 = coords[i][0] - coords[j][0]
+        let diff1 = coords[i][1] - coords[j][1]
+        let diff2 = coords[i][2] - coords[j][2]
+        x_out[i][0] = x_out[i][0] + diff0 * cscale
+        x_out[i][1] = x_out[i][1] + diff1 * cscale
+        x_out[i][2] = x_out[i][2] + diff2 * cscale
+        counts[i] = counts[i] + 1.0
+    }
+
+    // normalize coord update by neighbor count (if > 0)
+    for i in 0..n_nodes {
+        let c = counts[i]
+        if c > 0.0 {
+            let inv = 1.0 / c
+            // Already accumulated as sum; scale delta = x_out - coords by inv.
+            let dx = (x_out[i][0] - coords[i][0]) * inv
+            let dy = (x_out[i][1] - coords[i][1]) * inv
+            let dz = (x_out[i][2] - coords[i][2]) * inv
+            x_out[i][0] = coords[i][0] + dx
+            x_out[i][1] = coords[i][1] + dy
+            x_out[i][2] = coords[i][2] + dz
+        }
+    }
+
+    // update h: h' = phi_h(h || m_sum)
+    let mut h_out = []
+    for i in 0..n_nodes {
+        let mut cat = se3_zeros(d_h + d_msg)
+        for k in 0..d_h { cat[k] = h[i][k] }
+        for k in 0..d_msg { cat[d_h + k] = m_sum[i][k] }
+        let new_h = se3_mlp_forward(cat, phi_h_w1, phi_h_b1, phi_h_w2, phi_h_b2)
+        // residual: h' = h + Δh
+        let mut hh = se3_zeros(d_h)
+        for k in 0..d_h { hh[k] = h[i][k] + new_h[k] }
+        h_out = h_out + [hh]
+    }
+
+    let mut out = #{}
+    out["h"] = h_out
+    out["x"] = x_out
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (6) Build k-nearest-neighbor edges (deterministic, O(N^2 log k))
+//
+//  Returns [[i, j], ...] with each node i connected to its k nearest
+//  neighbors (excluding self).
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn se3_build_edges_knn(points, k) {
+    let n = len(points)
+    let mut src_list = []
+    let mut dst_list = []
+    for i in 0..n {
+        // O(N) per node: find k nearest via scan-and-mark
+        let mut dvals = []
+        let mut used = []
+        for j in 0..n {
+            dvals = dvals + [se3_dist_sq(points[i], points[j])]
+            if j == i { used = used + [1.0] }
+            else { used = used + [0.0] }
+        }
+        let mut picked = 0
+        while picked < k && picked < n - 1 {
+            let mut best_v = 1.0e30
+            let mut best_ix = 0
+            let mut found = false
+            for t in 0..n {
+                if used[t] < 0.5 && dvals[t] < best_v {
+                    best_v = dvals[t]
+                    best_ix = t
+                    found = true
+                }
+            }
+            if !found { break }
+            used[best_ix] = 1.0
+            src_list = src_list + [i]
+            dst_list = dst_list + [best_ix]
+            picked = picked + 1
+        }
+    }
+    let mut edges = #{}
+    edges["src"] = src_list
+    edges["dst"] = dst_list
+    return edges
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (7) Relative positions along edges (used in training feeders)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn se3_relative_pos(points, edges) {
+    let src = edges["src"]
+    let dst = edges["dst"]
+    let m = len(src)
+    let mut out = []
+    for e in 0..m {
+        let i = src[e]
+        let j = dst[e]
+        let dx = points[i][0] - points[j][0]
+        let dy = points[i][1] - points[j][1]
+        let dz = points[i][2] - points[j][2]
+        out = out + [[dx, dy, dz]]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (8) Convenience: random-ish weight initializer for tests
+//
+//  Returns a dict with all twelve MLPs sized for (d_h, d_msg).
+// ═══════════════════════════════════════════════════════════════════
+fn se3_init_weights(d_h, d_msg, hidden, seed) {
+    // phi_e: in = 2*d_h + 1, hidden, out = d_msg
+    let in_e = 2 * d_h + 1
+    let mut pe_w1 = []
+    for i in 0..hidden {
+        let mut row = se3_zeros(in_e)
+        for j in 0..in_e { row[j] = se3_hash(seed + 1, i, j) * 0.3 }
+        pe_w1 = pe_w1 + [row]
+    }
+    let mut pe_b1 = se3_zeros(hidden)
+    let mut pe_w2 = []
+    for i in 0..d_msg {
+        let mut row = se3_zeros(hidden)
+        for j in 0..hidden { row[j] = se3_hash(seed + 2, i, j) * 0.3 }
+        pe_w2 = pe_w2 + [row]
+    }
+    let mut pe_b2 = se3_zeros(d_msg)
+
+    // phi_x: in = d_msg, hidden, out = 1
+    let mut px_w1 = []
+    for i in 0..hidden {
+        let mut row = se3_zeros(d_msg)
+        for j in 0..d_msg { row[j] = se3_hash(seed + 3, i, j) * 0.1 }
+        px_w1 = px_w1 + [row]
+    }
+    let mut px_b1 = se3_zeros(hidden)
+    let mut px_w2 = []
+    for i in 0..1 {
+        let mut row = se3_zeros(hidden)
+        for j in 0..hidden { row[j] = se3_hash(seed + 4, i, j) * 0.01 }
+        px_w2 = px_w2 + [row]
+    }
+    let mut px_b2 = se3_zeros(1)
+
+    // phi_h: in = d_h + d_msg, hidden, out = d_h
+    let in_h = d_h + d_msg
+    let mut ph_w1 = []
+    for i in 0..hidden {
+        let mut row = se3_zeros(in_h)
+        for j in 0..in_h { row[j] = se3_hash(seed + 5, i, j) * 0.2 }
+        ph_w1 = ph_w1 + [row]
+    }
+    let mut ph_b1 = se3_zeros(hidden)
+    let mut ph_w2 = []
+    for i in 0..d_h {
+        let mut row = se3_zeros(hidden)
+        for j in 0..hidden { row[j] = se3_hash(seed + 6, i, j) * 0.2 }
+        ph_w2 = ph_w2 + [row]
+    }
+    let mut ph_b2 = se3_zeros(d_h)
+
+    let mut w = #{}
+    w["phi_e_w1"] = pe_w1 ; w["phi_e_b1"] = pe_b1
+    w["phi_e_w2"] = pe_w2 ; w["phi_e_b2"] = pe_b2
+    w["phi_x_w1"] = px_w1 ; w["phi_x_b1"] = px_b1
+    w["phi_x_w2"] = px_w2 ; w["phi_x_b2"] = px_b2
+    w["phi_h_w1"] = ph_w1 ; w["phi_h_b1"] = ph_b1
+    w["phi_h_w2"] = ph_w2 ; w["phi_h_b2"] = ph_b2
+    return w
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (9) Equivariance diagnostic
+//
+//  Runs a layer on (h, x) and on (h, R x + t), then rotates+translates
+//  the first output and compares: residual should be near zero for
+//  coordinates, and the node features h should be identical.
+//  Returns max |difference|.
+// ═══════════════════════════════════════════════════════════════════
+fn se3_invariance_check(h, coords, edges, weights, R, t) {
+    let r1 = se3_layer_forward(h, coords, edges, weights)
+    let xt = se3_translate(se3_apply_rot(R, coords), t)
+    let r2 = se3_layer_forward(h, xt, edges, weights)
+
+    // rotate+translate r1["x"] and compare to r2["x"]
+    let expected = se3_translate(se3_apply_rot(R, r1["x"]), t)
+
+    let n = len(expected)
+    let mut max_err = 0.0
+    for i in 0..n {
+        for k in 0..3 {
+            let d = se3_abs(expected[i][k] - r2["x"][i][k])
+            if d > max_err { max_err = d }
+        }
+    }
+
+    // feature invariance
+    let h1 = r1["h"]
+    let h2 = r2["h"]
+    let d_h = len(h1[0])
+    for i in 0..n {
+        for k in 0..d_h {
+            let d = se3_abs(h1[i][k] - h2[i][k])
+            if d > max_err { max_err = d }
+        }
+    }
+
+    return max_err
+}
+
+println("[se3_equivariant] loaded — EGNN layer + equivariance check + knn edges")
