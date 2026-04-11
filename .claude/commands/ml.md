@@ -1,58 +1,53 @@
 ML 다음 레벨 로드맵을 관리한다.
 
+## ⛔ 표시 규칙 (절대 위반 금지)
+
+1. **status="done" 항목은 절대 표시하지 않는다** — todo와 partial만 표시
+2. **매 행 사이에 ├────┼── 가로 구분선을 반드시 넣는다**
+3. 표시할 항목이 20개 미만이면 새 항목을 자동 제안하여 20개까지 채운다
+4. 하단에 done/partial/todo 카운트 표시
+
 ## 실행 절차
 
 1. `shared/hexa-lang/ml-next-level.json` 을 읽는다 (SSOT).
 2. 인자($ARGUMENTS)에 따라 분기:
 
 ### 인자 없음 또는 "list"
-- 전체 항목을 아래 형식 ASCII 표로 출력:
+- JSON에서 status가 "todo" 또는 "partial"인 항목만 필터링
+- 아래 형식으로 출력 (done 항목은 절대 포함하지 않는다):
 ```
-┌────┬─────────────────────┬──────────────────────────────────────┬────────────────────┬────────┐
-│ #  │ 영역                │ 설명                                 │ 영향               │ 상태   │
-├────┼─────────────────────┼──────────────────────────────────────┼────────────────────┼────────┤
-│  1 │ Flash Attention     │ O(N²)→O(N) 메모리, tiling            │ 추론 2-4x          │ ✅ done│
-│  2 │ PagedAttention      │ vLLM식 KV-cache 페이징               │ 동시 요청 10x+     │ todo   │
-│ ...│                     │                                      │                    │        │
-└────┴─────────────────────┴──────────────────────────────────────┴────────────────────┴────────┘
-done: N / partial: N / todo: N  (총 N개)
+┌────┬──────────────┬──────────────────────┬──────────────┬────────┐
+│ #  │ 영역         │ 설명                 │ 영향         │ 상태   │
+├────┼──────────────┼──────────────────────┼──────────────┼────────┤
+│  2 │ PagedAttention│ vLLM식 KV-cache      │ 동시 요청 10x│ todo   │
+├────┼──────────────┼──────────────────────┼──────────────┼────────┤
+│ 20 │ Tensor Par.  │ GPU 간 분할          │ 단일 GPU 초과│ todo   │
+└────┴──────────────┴──────────────────────┴──────────────┴────────┘
+done: 49 / todo: 1  (총 50개)
 ```
 
 ### "go" (메인 명령어)
-- status가 todo 또는 partial인 **모든** 항목을 수집
-- **전부 병렬 백그라운드 Agent로 동시 발사** (run_in_background: true)
+- status=todo|partial 전부 병렬 bg Agent 발사 (run_in_background: true 필수)
 - 확인 질문 없이 즉시 실행
-- 발사 테이블 출력 (항목별 에이전트 ID + 상태)
-- 각 에이전트가 완료되면 JSON status/summary 자동 갱신
-- 에이전트 프롬프트에 반드시 포함: 파일 경로, remaining 작업, 문법 주의사항, 구현 규칙, JSON 갱신 지시
+- 포그라운드 Agent 금지
 
 ### "next"
-- "go"와 동일하되, 구현 계획을 먼저 제시하고 사용자 확인 후 시작
+- 최우선 항목 계획 → 확인 → 구현
 
-### 숫자 (예: "1", "5")
-- 해당 id의 항목을 선택하여 구현 시작
-- existing_files 가 있으면 먼저 읽고 확장
-- 없으면 `self/ml/` 아래 새 파일 생성
-- 완료 시 JSON의 status를 "done"으로, completed_at 기록, remaining을 null로 갱신
+### 숫자 (예: "5")
+- 해당 id 항목 구현 시작
 
 ### "done 숫자" (예: "done 1")
-- 해당 항목을 done 으로 마킹 (수동 완료 체크)
-- JSON 갱신 + summary 카운트 재계산
+- 해당 항목 done 마킹 + JSON summary 재계산
 
 ### "add 이름 | 설명 | 영향"
-- 새 항목을 items 배열 끝에 추가 (id = max+1)
-- status: "todo", priority/difficulty/est_hours 자동 판단
+- items 끝에 새 항목 추가 (id=max+1, status=todo)
 
 ### "sync"
-- ml-next-level.json 의 현재 상태를 docs/plans/roadmap.md 의 해당 섹션에 반영
-- CLAUDE.md ref 테이블에 ml-next-level.json 항목이 없으면 추가
-- README.md 의 ML-NEXT-LEVEL 표도 갱신
+- ml-next-level.json → docs/plans/roadmap.md + README.md 갱신
 
 ## 구현 규칙
 
-- 모든 구현은 순수 `.hexa` (self/ml/ 아래)
-- Rust src/ 수정 금지
-- 빌트인 추가 필요 시 interpreter.hexa + env.hexa + compiler.hexa 3파일 동시 등록 (HX-R-DEC-2)
-- 테스트 파일 `self/test_{feature_name}.hexa` 생성 필수
+- 순수 `.hexa` (self/ml/ 아래), Rust 수정 금지
+- 테스트 `self/test_{feature}.hexa` 필수
 - 완료 후 JSON status/summary 즉시 갱신
-- docs/plans/roadmap.md 에 완료 항목 체크
