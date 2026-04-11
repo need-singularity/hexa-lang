@@ -13,9 +13,21 @@
 
 > shared/ JSON 단일진실 (R14). 규칙: `shared/rules/common.json` (R0~R27)
 
-## ⛔ 규칙 준수 (필수)
+## ⛔ 규칙 (위반 시 즉시 중단)
 
-작업 시작 전 `shared/rules/common.json` + `shared/rules/hexa-lang.json` 을 읽고 전 규칙 준수. 위반 시 즉시 수정.
+### 공통 (`shared/rules/common.json`)
+- **R1** HEXA-FIRST — 신규 코드 .hexa로만 작성
+- **R2** 하드코딩 금지 — shared/*.jsonl에서 동적 로드
+- **R14** shared/ JSON 단일진실 — SSOT 1개만 존재
+- **AI-NATIVE** bit-twiddling/manual-loop 금지, @attr 우선, O(n²)→해시맵
+
+### hexa-lang 전용 (`shared/rules/hexa-lang.json`)
+- **HX3** pitfalls 체크 — .hexa 작성 전 `shared/hexa-lang/grammar.jsonl` 참조
+- **HX4** SELF-HOST FIRST — src/ Rust 폐기, 모든 코드 .hexa
+- **HX5** AI-native 알고리즘 교체 의무 — `docs/ai-native.md` 24종 벡터
+- **HX6** 돌파 시 nexus blowup 연동 + growth_bus 기록
+
+전체 규칙: `shared/rules/common.json` (R0~R27) + `shared/rules/hexa-lang.json` (HX1~HX6)
 
 ## ref
 
