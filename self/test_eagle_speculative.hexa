@@ -1,0 +1,812 @@
+// ═══════════════════════════════════════════════════════════════
+//  test_eagle_speculative.hexa — Eagle-2 Speculative Decoding Tests (#122)
+//
+//  Tests (40):
+//    T1  feature extraction returns correct size
+//    T2  feature values in [0, 1] range
+//    T3  different contexts produce different features
+//    T4  feature concat correct length
+//    T5  feature concat preserves hidden states
+//    T6  feature concat preserves embeddings
+//    T7  draft head returns correct vocab size logits
+//    T8  draft head different inputs -> different logits
+//    T9  softmax sums to 1.0
+//    T10 softmax preserves ordering
+//    T11 argmax picks correct index
+//    T12 topk returns k indices
+//    T13 topk first element is argmax
+//    T14 tree attention mask diagonal is 1
+//    T15 tree attention mask root visible to all
+//    T16 tree attention mask is causal (ancestor-only)
+//    T17 path to root is just [0]
+//    T18 path to child includes parent
+//    T19 tree expand root token matches context
+//    T20 tree expand produces correct depths
+//    T21 tree expand node count matches expectation
+//    T22 verification root is always verified
+//    T23 longest accepted path starts at root
+//    T24 accepted tokens excludes root
+//    T25 topk tree build correct structure
+//    T26 batch speculative processes all sequences
+//    T27 acceptance rate 0 for 0 drafted
+//    T28 acceptance rate correct calculation
+//    T29 dynamic depth increases on high acceptance
+//    T30 dynamic depth decreases on low acceptance
+//    T31 dynamic depth respects min/max bounds
+//    T32 dynamic branch adjustment
+//    T33 full speculative step returns tokens
+//    T34 multi-round generation produces tokens
+//    T35 tree depth counts sum to total nodes
+//    T36 tree leaves have no children
+//    T37 mask density is in valid range
+//    T38 path score is non-negative
+//    T39 count verified >= 1 (root always verified)
+//    T40 context-aware features change with window size
+//
+//  Run: cargo run --release -- self/test_eagle_speculative.hexa
+// ═══════════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ── inlined helpers from eagle_speculative.hexa ─────────────
+
+fn eag_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn eag_abs_int(x) {
+    if x < 0 { return 0 - x }
+    return x
+}
+
+fn eag_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn eag_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn eag_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+fn eag_min_int(a, b) {
+    if a <= b { return a }
+    return b
+}
+
+fn eag_max_int(a, b) {
+    if a >= b { return a }
+    return b
+}
+
+fn eag_score_encode(f) {
+    return to_int(f * 10000.0)
+}
+
+fn eag_score_decode(i) {
+    return to_float(i) / 10000.0
+}
+
+fn eag_extract_features(context, window_size) {
+    let n = len(context)
+    let ws = eag_min_int(window_size, n)
+    let start = n - ws
+    let mut features = eag_zeros(ws)
+    let mut h = 2654435761
+    for i in 0..ws {
+        let tok = context[start + i]
+        h = eag_abs_int((h * 31 + tok * 17 + i * 7) % 1000003)
+        features[i] = to_float(h % 1000) / 1000.0
+    }
+    return features
+}
+
+fn eag_feature_concat(hidden_states, token_embeddings) {
+    let nh = len(hidden_states)
+    let ne = len(token_embeddings)
+    let total = nh + ne
+    let mut out = eag_zeros(total)
+    for i in 0..nh { out[i] = hidden_states[i] }
+    for i in 0..ne { out[nh + i] = token_embeddings[i] }
+    return out
+}
+
+fn eag_draft_head(features, vocab_size) {
+    let n = len(features)
+    let mut logits = eag_zeros(vocab_size)
+    for v in 0..vocab_size {
+        let mut score = 0.0
+        for f in 0..n {
+            let w = to_float(eag_abs_int(((v + 1) * 2654435 + (f + 1) * 131543) % 1000003) % 200 - 100) / 100.0
+            score = score + features[f] * w
+        }
+        logits[v] = score
+    }
+    return logits
+}
+
+fn eag_softmax(logits) {
+    let n = len(logits)
+    let mut mx = logits[0]
+    for i in 1..n { if logits[i] > mx { mx = logits[i] } }
+    let mut exps = eag_zeros(n)
+    let mut z = 0.0
+    for i in 0..n {
+        exps[i] = eag_exp(logits[i] - mx)
+        z = z + exps[i]
+    }
+    let mut out = eag_zeros(n)
+    for i in 0..n { out[i] = exps[i] / z }
+    return out
+}
+
+fn eag_argmax(logits) {
+    let n = len(logits)
+    let mut best = 0
+    let mut best_v = logits[0]
+    for i in 1..n {
+        if logits[i] > best_v {
+            best_v = logits[i]
+            best = i
+        }
+    }
+    return best
+}
+
+fn eag_topk(logits, k) {
+    let n = len(logits)
+    let actual_k = eag_min_int(k, n)
+    let mut indices = eag_zeros_int(actual_k)
+    let mut used = eag_zeros_int(n)
+    for ki in 0..actual_k {
+        let mut best = -1
+        let mut best_v = -1.0e30
+        for i in 0..n {
+            if used[i] == 0 {
+                if logits[i] > best_v {
+                    best_v = logits[i]
+                    best = i
+                }
+            }
+        }
+        indices[ki] = best
+        if best >= 0 { used[best] = 1 }
+    }
+    return indices
+}
+
+fn eag_tree_attention_mask(parents, n) {
+    let mut mask = []
+    for i in 0..n {
+        let mut row = eag_zeros_int(n)
+        let mut cur = i
+        let mut steps = 0
+        while cur >= 0 {
+            if steps > n { break }
+            let mut nrow = eag_zeros_int(n)
+            for ri in 0..n {
+                if ri == cur {
+                    nrow[ri] = 1
+                } else {
+                    nrow[ri] = row[ri]
+                }
+            }
+            row = nrow
+            cur = parents[cur]
+            steps = steps + 1
+        }
+        mask = mask + [row]
+    }
+    return mask
+}
+
+fn eag_path_to_node(parents, node) {
+    let mut path = []
+    let mut cur = node
+    let mut steps = 0
+    let n = len(parents)
+    while cur >= 0 {
+        if steps > n { break }
+        path = [cur] + path
+        cur = parents[cur]
+        steps = steps + 1
+    }
+    return path
+}
+
+fn eag_tree_expand(context, vocab_size, max_depth, branch_factor, feature_window) {
+    let root_tok = context[len(context) - 1]
+    let mut tokens = [root_tok]
+    let mut parents = [-1]
+    let mut depths = [0]
+    let mut scores_i = [10000]
+    let mut n = 1
+    let mut current_leaves = [0]
+
+    for d in 1..(max_depth + 1) {
+        let mut next_leaves = []
+        for li in 0..len(current_leaves) {
+            let leaf_idx = current_leaves[li]
+            let path = eag_path_to_node(parents, leaf_idx)
+            let mut ctx = []
+            let ctx_start = eag_max_int(0, len(context) - feature_window)
+            for ci in ctx_start..len(context) { ctx = ctx + [context[ci]] }
+            for pi in 1..len(path) { ctx = ctx + [tokens[path[pi]]] }
+
+            let features = eag_extract_features(ctx, feature_window)
+            let embeddings = eag_extract_features(ctx, eag_min_int(3, len(ctx)))
+            let concat = eag_feature_concat(features, embeddings)
+            let logits = eag_draft_head(concat, vocab_size)
+            let probs = eag_softmax(logits)
+            let topk = eag_topk(logits, branch_factor)
+
+            for ki in 0..len(topk) {
+                let child_tok = topk[ki]
+                tokens = tokens + [child_tok]
+                parents = parents + [leaf_idx]
+                depths = depths + [d]
+                scores_i = scores_i + [eag_score_encode(probs[child_tok])]
+                next_leaves = next_leaves + [n]
+                n = n + 1
+            }
+        }
+        current_leaves = next_leaves
+    }
+
+    return [tokens, parents, depths, scores_i]
+}
+
+fn eag_verify_tree(context, tree, target_fn) {
+    let tokens = tree[0]
+    let parents = tree[1]
+    let n = len(tokens)
+    let mut verified = eag_zeros_int(n)
+    verified[0] = 1
+
+    for i in 1..n {
+        let path = eag_path_to_node(parents, i)
+        let mut ctx = []
+        for ci in 0..len(context) { ctx = ctx + [context[ci]] }
+        for pi in 1..(len(path) - 1) { ctx = ctx + [tokens[path[pi]]] }
+        let target_tok = target_fn(ctx)
+        if target_tok == tokens[i] { verified[i] = 1 }
+    }
+
+    return verified
+}
+
+fn eag_longest_accepted_path(tree, verified) {
+    let tokens = tree[0]
+    let parents = tree[1]
+    let depths = tree[2]
+    let n = len(tokens)
+    let mut best_depth = 0
+    let mut best_leaf = 0
+
+    for i in 0..n {
+        if verified[i] == 1 {
+            if depths[i] > best_depth {
+                let path = eag_path_to_node(parents, i)
+                let mut all_ok = true
+                for pi in 0..len(path) {
+                    if verified[path[pi]] == 0 { all_ok = false }
+                }
+                if all_ok {
+                    best_depth = depths[i]
+                    best_leaf = i
+                }
+            }
+        }
+    }
+
+    return eag_path_to_node(parents, best_leaf)
+}
+
+fn eag_accepted_tokens(tree, path) {
+    let tokens = tree[0]
+    let mut result = []
+    for i in 1..len(path) { result = result + [tokens[path[i]]] }
+    return result
+}
+
+fn eag_topk_tree_build(all_logits, k) {
+    let num_levels = len(all_logits)
+    let mut tokens = [0]
+    let mut parents = [-1]
+    let mut depths = [0]
+    let mut scores_i = [10000]
+    let mut n = 1
+    let mut current_leaves = [0]
+
+    for level in 0..num_levels {
+        let logits = all_logits[level]
+        let probs = eag_softmax(logits)
+        let topk = eag_topk(logits, k)
+        let mut next_leaves = []
+
+        for li in 0..len(current_leaves) {
+            let parent = current_leaves[li]
+            for ki in 0..len(topk) {
+                let tok = topk[ki]
+                tokens = tokens + [tok]
+                parents = parents + [parent]
+                depths = depths + [level + 1]
+                scores_i = scores_i + [eag_score_encode(probs[tok])]
+                next_leaves = next_leaves + [n]
+                n = n + 1
+            }
+        }
+        current_leaves = next_leaves
+    }
+
+    return [tokens, parents, depths, scores_i]
+}
+
+fn eag_batch_speculative(contexts, vocab_size, max_depth, branch_factor, feature_window, target_fn) {
+    let batch_size = len(contexts)
+    let mut results = []
+    for b in 0..batch_size {
+        let ctx = contexts[b]
+        let tree = eag_tree_expand(ctx, vocab_size, max_depth, branch_factor, feature_window)
+        let verified = eag_verify_tree(ctx, tree, target_fn)
+        let path = eag_longest_accepted_path(tree, verified)
+        let accepted = eag_accepted_tokens(tree, path)
+        results = results + [accepted]
+    }
+    return results
+}
+
+fn eag_acceptance_rate(total_drafted, total_accepted) {
+    if total_drafted <= 0 { return 0.0 }
+    return to_float(total_accepted) / to_float(total_drafted)
+}
+
+fn eag_adjust_depth(current_depth, acceptance_rate, min_depth, max_depth_limit) {
+    let mut new_depth = current_depth
+    if acceptance_rate > 0.7 { new_depth = current_depth + 1 }
+    if acceptance_rate < 0.3 { new_depth = current_depth - 1 }
+    if new_depth < min_depth { new_depth = min_depth }
+    if new_depth > max_depth_limit { new_depth = max_depth_limit }
+    return new_depth
+}
+
+fn eag_adjust_branch(current_branch, acceptance_rate, min_branch, max_branch) {
+    let mut new_branch = current_branch
+    if acceptance_rate > 0.8 { new_branch = current_branch + 1 }
+    if acceptance_rate < 0.2 { new_branch = current_branch - 1 }
+    if new_branch < min_branch { new_branch = min_branch }
+    if new_branch > max_branch { new_branch = max_branch }
+    return new_branch
+}
+
+fn eag_speculative_step_tokens(context, vocab_size, max_depth, branch_factor, feature_window, target_fn) {
+    let tree = eag_tree_expand(context, vocab_size, max_depth, branch_factor, feature_window)
+    let verified = eag_verify_tree(context, tree, target_fn)
+    let path = eag_longest_accepted_path(tree, verified)
+    let accepted = eag_accepted_tokens(tree, path)
+    return accepted
+}
+
+fn eag_speculative_step_stats(context, vocab_size, max_depth, branch_factor, feature_window, target_fn) {
+    let tree = eag_tree_expand(context, vocab_size, max_depth, branch_factor, feature_window)
+    let n_nodes = len(tree[0])
+    let verified = eag_verify_tree(context, tree, target_fn)
+    let path = eag_longest_accepted_path(tree, verified)
+    let accepted = eag_accepted_tokens(tree, path)
+    let n_drafted = n_nodes - 1
+    let n_accepted = len(accepted)
+    return [n_drafted, n_accepted]
+}
+
+fn eag_generate_tokens(context, vocab_size, max_tokens, init_depth, init_branch, feature_window, target_fn) {
+    let mut ctx = []
+    for i in 0..len(context) { ctx = ctx + [context[i]] }
+    let mut generated = []
+    let mut total_drafted = 0
+    let mut total_accepted = 0
+    let mut rounds = 0
+    let mut depth = init_depth
+    let mut branch = init_branch
+
+    while len(generated) < max_tokens {
+        let accepted = eag_speculative_step_tokens(ctx, vocab_size, depth, branch, feature_window, target_fn)
+        let stats = eag_speculative_step_stats(ctx, vocab_size, depth, branch, feature_window, target_fn)
+
+        total_drafted = total_drafted + stats[0]
+        total_accepted = total_accepted + stats[1]
+        rounds = rounds + 1
+
+        if len(accepted) == 0 {
+            let target_tok = target_fn(ctx)
+            generated = generated + [target_tok]
+            ctx = ctx + [target_tok]
+        } else {
+            for i in 0..len(accepted) {
+                if len(generated) < max_tokens {
+                    generated = generated + [accepted[i]]
+                    ctx = ctx + [accepted[i]]
+                }
+            }
+        }
+
+        let rate = eag_acceptance_rate(total_drafted, total_accepted)
+        depth = eag_adjust_depth(depth, rate, 1, 6)
+        branch = eag_adjust_branch(branch, rate, 1, 5)
+        if rounds > max_tokens { break }
+    }
+
+    return generated
+}
+
+fn eag_generate_stats(context, vocab_size, max_tokens, init_depth, init_branch, feature_window, target_fn) {
+    let mut ctx = []
+    for i in 0..len(context) { ctx = ctx + [context[i]] }
+    let mut total_drafted = 0
+    let mut total_accepted = 0
+    let mut rounds = 0
+    let mut n_generated = 0
+    let mut depth = init_depth
+    let mut branch = init_branch
+
+    while n_generated < max_tokens {
+        let accepted = eag_speculative_step_tokens(ctx, vocab_size, depth, branch, feature_window, target_fn)
+        let stats = eag_speculative_step_stats(ctx, vocab_size, depth, branch, feature_window, target_fn)
+
+        total_drafted = total_drafted + stats[0]
+        total_accepted = total_accepted + stats[1]
+        rounds = rounds + 1
+
+        if len(accepted) == 0 {
+            let target_tok = target_fn(ctx)
+            ctx = ctx + [target_tok]
+            n_generated = n_generated + 1
+        } else {
+            for i in 0..len(accepted) {
+                if n_generated < max_tokens {
+                    ctx = ctx + [accepted[i]]
+                    n_generated = n_generated + 1
+                }
+            }
+        }
+
+        let rate = eag_acceptance_rate(total_drafted, total_accepted)
+        depth = eag_adjust_depth(depth, rate, 1, 6)
+        branch = eag_adjust_branch(branch, rate, 1, 5)
+        if rounds > max_tokens { break }
+    }
+
+    return [total_drafted, total_accepted, rounds]
+}
+
+fn eag_path_score(tree, path) {
+    let scores_i = tree[3]
+    let mut total = 0
+    for i in 0..len(path) { total = total + scores_i[path[i]] }
+    return eag_score_decode(total)
+}
+
+fn eag_tree_depth_counts(tree) {
+    let depths = tree[2]
+    let n = len(depths)
+    let mut max_d = 0
+    for i in 0..n { if depths[i] > max_d { max_d = depths[i] } }
+    let mut counts = eag_zeros_int(max_d + 1)
+    for i in 0..n {
+        let d = depths[i]
+        counts[d] = counts[d] + 1
+    }
+    return counts
+}
+
+fn eag_count_verified(verified) {
+    let mut c = 0
+    for i in 0..len(verified) { if verified[i] == 1 { c = c + 1 } }
+    return c
+}
+
+fn eag_tree_leaves(tree) {
+    let parents = tree[1]
+    let n = len(parents)
+    let mut is_parent = eag_zeros_int(n)
+    for i in 0..n {
+        let p = parents[i]
+        if p >= 0 { is_parent[p] = 1 }
+    }
+    let mut leaves = []
+    for i in 0..n { if is_parent[i] == 0 { leaves = leaves + [i] } }
+    return leaves
+}
+
+fn eag_mask_density(mask, n) {
+    let mut ones = 0
+    let total = n * n
+    for i in 0..n {
+        for j in 0..n {
+            if mask[i][j] == 1 { ones = ones + 1 }
+        }
+    }
+    if total == 0 { return 0.0 }
+    return to_float(ones) / to_float(total)
+}
+
+// ── mock target model ───────────────────────────────────────
+fn mock_target(ctx) {
+    let n = len(ctx)
+    let mut h = 2654435761
+    let start = eag_max_int(0, n - 4)
+    for i in start..n {
+        h = eag_abs_int((h * 31 + ctx[i] * 17 + i * 7) % 1000003)
+    }
+    return h % 8
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  TESTS
+// ═══════════════════════════════════════════════════════════════
+
+let VOCAB = 8
+let CTX = [1, 3, 5, 2, 4]
+
+// ── T1: feature extraction returns correct size ──
+let feat1 = eag_extract_features(CTX, 3)
+check("T1 feature extraction size = window_size", len(feat1) == 3)
+
+// ── T2: feature values in [0, 1] range ──
+let mut all_in_range = true
+for i in 0..len(feat1) {
+    if feat1[i] < 0.0 { all_in_range = false }
+    if feat1[i] > 1.0 { all_in_range = false }
+}
+check("T2 feature values in [0,1]", all_in_range)
+
+// ── T3: different contexts produce different features ──
+let feat2 = eag_extract_features([9, 8, 7, 6, 5], 3)
+let mut feats_differ = false
+for i in 0..len(feat1) {
+    if fabs(feat1[i] - feat2[i]) > 0.001 { feats_differ = true }
+}
+check("T3 different ctx -> different features", feats_differ)
+
+// ── T4: feature concat correct length ──
+let hidden = [0.1, 0.2, 0.3]
+let embed = [0.4, 0.5]
+let concat = eag_feature_concat(hidden, embed)
+check("T4 concat length = hidden + embed", len(concat) == 5)
+
+// ── T5: feature concat preserves hidden states ──
+check("T5 concat preserves hidden[0]", approx(concat[0], 0.1, 0.001))
+check("T5b concat preserves hidden[2]", approx(concat[2], 0.3, 0.001))
+
+// ── T6: feature concat preserves embeddings ──
+check("T6 concat preserves embed[0]", approx(concat[3], 0.4, 0.001))
+check("T6b concat preserves embed[1]", approx(concat[4], 0.5, 0.001))
+
+// ── T7: draft head returns correct vocab size logits ──
+let draft_logits = eag_draft_head(feat1, VOCAB)
+check("T7 draft head output size = vocab", len(draft_logits) == VOCAB)
+
+// ── T8: draft head different inputs -> different logits ──
+let draft_logits2 = eag_draft_head(feat2, VOCAB)
+let mut logits_differ = false
+for i in 0..VOCAB {
+    if fabs(draft_logits[i] - draft_logits2[i]) > 0.001 { logits_differ = true }
+}
+check("T8 different features -> different logits", logits_differ)
+
+// ── T9: softmax sums to 1.0 ──
+let sm = eag_softmax(draft_logits)
+let mut sm_sum = 0.0
+for i in 0..len(sm) { sm_sum = sm_sum + sm[i] }
+check("T9 softmax sums to ~1.0", approx(sm_sum, 1.0, 0.001))
+
+// ── T10: softmax preserves ordering ──
+let test_logits = [1.0, 3.0, 2.0, 0.5]
+let sm_ordered = eag_softmax(test_logits)
+check("T10 softmax preserves ordering (max at idx 1)", sm_ordered[1] > sm_ordered[0])
+
+// ── T11: argmax picks correct index ──
+check("T11 argmax picks index 1", eag_argmax(test_logits) == 1)
+
+// ── T12: topk returns k indices ──
+let tk = eag_topk(test_logits, 2)
+check("T12 topk returns 2 indices", len(tk) == 2)
+
+// ── T13: topk first element is argmax ──
+check("T13 topk[0] is argmax", tk[0] == 1)
+
+// ── T14: tree attention mask diagonal is 1 ──
+let test_parents = [-1, 0, 0, 1, 1]
+let mask = eag_tree_attention_mask(test_parents, 5)
+let mut diag_ok = true
+for i in 0..5 {
+    if mask[i][i] != 1 { diag_ok = false }
+}
+check("T14 tree mask diagonal is 1", diag_ok)
+
+// ── T15: tree attention mask root visible to all ──
+let mut root_vis = true
+for i in 0..5 {
+    if mask[i][0] != 1 { root_vis = false }
+}
+check("T15 root visible to all nodes", root_vis)
+
+// ── T16: tree attention mask is causal (child cannot attend to sibling) ──
+check("T16 sibling nodes not visible (node2 cannot see node1)", mask[2][1] == 0)
+
+// ── T17: path to root is just [0] ──
+let path_root = eag_path_to_node(test_parents, 0)
+check("T17 path to root = [0]", len(path_root) == 1)
+
+// ── T18: path to child includes parent ──
+let path_child = eag_path_to_node(test_parents, 3)
+check("T18 path to node3 length = 3", len(path_child) == 3)
+check("T18b path starts at root", path_child[0] == 0)
+
+// ── T19: tree expand root token matches context ──
+let tree = eag_tree_expand(CTX, VOCAB, 2, 2, 4)
+let tree_tokens = tree[0]
+let tree_parents = tree[1]
+let tree_depths = tree[2]
+let tree_scores = tree[3]
+let tree_n = len(tree_tokens)
+check("T19 root token = last context token", tree_tokens[0] == CTX[len(CTX) - 1])
+
+// ── T20: tree expand produces correct depths ──
+check("T20 root depth = 0", tree_depths[0] == 0)
+let mut has_d1 = false
+let mut has_d2 = false
+for i in 0..tree_n {
+    if tree_depths[i] == 1 { has_d1 = true }
+    if tree_depths[i] == 2 { has_d2 = true }
+}
+check("T20b has depth-1 nodes", has_d1)
+check("T20c has depth-2 nodes", has_d2)
+
+// ── T21: tree expand node count matches expected ──
+// depth=2, branch=2: root(1) + depth1(2) + depth2(2*2=4) = 7
+check("T21 tree node count = 1 + 2 + 4 = 7", tree_n == 7)
+
+// ── T22: verification root is always verified ──
+let verified = eag_verify_tree(CTX, tree, mock_target)
+check("T22 root always verified", verified[0] == 1)
+
+// ── T23: longest accepted path starts at root ──
+let best_path = eag_longest_accepted_path(tree, verified)
+check("T23 accepted path starts at root", best_path[0] == 0)
+
+// ── T24: accepted tokens excludes root ──
+let acc_tok = eag_accepted_tokens(tree, best_path)
+check("T24 accepted tokens len = path_len - 1", len(acc_tok) == len(best_path) - 1)
+
+// ── T25: topk tree build correct structure ──
+let logits_l1 = [1.0, 3.0, 2.0, 0.5, 1.5, 0.8, 2.5, 0.3]
+let logits_l2 = [2.0, 0.5, 3.0, 1.0, 0.8, 1.5, 0.3, 2.5]
+let tk_tree = eag_topk_tree_build([logits_l1, logits_l2], 2)
+let tk_depths = tk_tree[2]
+let tk_n = len(tk_tree[0])
+check("T25 topk tree has root", tk_depths[0] == 0)
+check("T25b topk tree total nodes = 7", tk_n == 7)
+
+// ── T26: batch speculative processes all sequences ──
+let batch_ctx = [[1, 2, 3], [4, 5, 6]]
+let batch_result = eag_batch_speculative(batch_ctx, VOCAB, 2, 2, 3, mock_target)
+check("T26 batch returns 2 results", len(batch_result) == 2)
+
+// ── T27: acceptance rate 0 for 0 drafted ──
+let rate0 = eag_acceptance_rate(0, 0)
+check("T27 acceptance rate 0 for 0 drafted", approx(rate0, 0.0, 0.001))
+
+// ── T28: acceptance rate correct calculation ──
+let rate_half = eag_acceptance_rate(10, 5)
+check("T28 acceptance rate 5/10 = 0.5", approx(rate_half, 0.5, 0.001))
+
+// ── T29: dynamic depth increases on high acceptance ──
+let depth_up = eag_adjust_depth(3, 0.85, 1, 6)
+check("T29 high acceptance -> depth increases", depth_up == 4)
+
+// ── T30: dynamic depth decreases on low acceptance ──
+let depth_down = eag_adjust_depth(3, 0.15, 1, 6)
+check("T30 low acceptance -> depth decreases", depth_down == 2)
+
+// ── T31: dynamic depth respects min/max bounds ──
+let depth_min = eag_adjust_depth(1, 0.1, 1, 6)
+check("T31 depth respects min bound", depth_min == 1)
+let depth_max = eag_adjust_depth(6, 0.9, 1, 6)
+check("T31b depth respects max bound", depth_max == 6)
+
+// ── T32: dynamic branch adjustment ──
+let branch_up = eag_adjust_branch(2, 0.9, 1, 5)
+check("T32 high acceptance -> branch increases", branch_up == 3)
+let branch_down = eag_adjust_branch(2, 0.1, 1, 5)
+check("T32b low acceptance -> branch decreases", branch_down == 1)
+
+// ── T33: full speculative step returns tokens ──
+let step_tok = eag_speculative_step_tokens(CTX, VOCAB, 2, 2, 4, mock_target)
+let step_stats = eag_speculative_step_stats(CTX, VOCAB, 2, 2, 4, mock_target)
+check("T33 step drafted > 0", step_stats[0] > 0)
+check("T33b step accepted count >= 0", step_stats[1] >= 0)
+
+// ── T34: multi-round generation produces tokens ──
+let gen_tokens = eag_generate_tokens(CTX, VOCAB, 10, 2, 2, 4, mock_target)
+let gen_stats = eag_generate_stats(CTX, VOCAB, 10, 2, 2, 4, mock_target)
+check("T34 generated >= 10 tokens", len(gen_tokens) >= 10)
+check("T34b generation used > 0 rounds", gen_stats[2] > 0)
+check("T34c total drafted > 0", gen_stats[0] > 0)
+
+// ── T35: tree depth counts sum to total nodes ──
+let dcounts = eag_tree_depth_counts(tree)
+let mut dsum = 0
+for i in 0..len(dcounts) { dsum = dsum + dcounts[i] }
+check("T35 depth counts sum = total nodes", dsum == tree_n)
+
+// ── T36: tree leaves have no children ──
+let leaves = eag_tree_leaves(tree)
+check("T36 leaves exist", len(leaves) > 0)
+let mut leaves_ok = true
+for i in 0..len(leaves) {
+    let leaf = leaves[i]
+    let mut has_child = false
+    for j in 0..tree_n {
+        if tree_parents[j] == leaf { has_child = true }
+    }
+    if has_child { leaves_ok = false }
+}
+check("T36b leaves have no children", leaves_ok)
+
+// ── T37: mask density is in valid range ──
+let tree_mask = eag_tree_attention_mask(tree_parents, tree_n)
+let density = eag_mask_density(tree_mask, tree_n)
+check("T37 mask density > 0", density > 0.0)
+check("T37b mask density <= 1", density <= 1.0)
+
+// ── T38: path score is non-negative ──
+let pscore = eag_path_score(tree, best_path)
+check("T38 path score >= 0", pscore >= 0.0)
+
+// ── T39: count verified >= 1 (root always verified) ──
+let n_verified = eag_count_verified(verified)
+check("T39 count verified >= 1", n_verified >= 1)
+
+// ── T40: context-aware features change with window size ──
+let feat_w2 = eag_extract_features(CTX, 2)
+let feat_w4 = eag_extract_features(CTX, 4)
+check("T40 window=2 gives 2 features", len(feat_w2) == 2)
+check("T40b window=4 gives 4 features", len(feat_w4) == 4)
+
+// ═══════════════════════════════════════════════════════════════
+println("")
+println("=== eagle_speculative test summary ===")
+println("PASS: " + str(pass_count))
+println("FAIL: " + str(fail_count))
+println("TOTAL: " + str(pass_count + fail_count))

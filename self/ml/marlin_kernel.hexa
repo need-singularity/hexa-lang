@@ -1,0 +1,728 @@
+// ===================================================================
+//  self/ml/marlin_kernel.hexa — Marlin Kernel (#156)
+//
+//  4-bit GEMM simulation for quantized inference, inspired by the
+//  Marlin kernel (IST-DASLab).  Pure-hexa simulation covering:
+//
+//    1. INT4 packing      — pack two INT4 values into one INT8
+//    2. Dequantization    — INT4 -> FP32 with per-group scale + zero-point
+//    3. Tiled GEMM        — blocked matrix multiply (configurable tiles)
+//    4. Group quantization — per-group (64/128) quantization params
+//    5. Permutation       — reorder weight layout for sequential access
+//    6. Async pipeline    — overlap dequant + compute stages
+//    7. Memory layout     — optimal packing for sequential reads
+//    8. Benchmark         — quantized vs full-precision accuracy + speedup
+//
+//  Structs:
+//    MarlinMeta     — tile/group config
+//    MarlinTensor   — packed INT4 weights + group params
+//    MarlinPipeline — async pipeline stage state
+//    MarlinBench    — benchmark result (MSE, max err, speedup)
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+//    @hot   — performance-critical paths
+// ===================================================================
+
+// ── Math helpers ─────────────────────────────────────────────────
+
+fn _mk_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn _mk_max(a, b) {
+    if a >= b { return a }
+    return b
+}
+
+fn _mk_min(a, b) {
+    if a <= b { return a }
+    return b
+}
+
+fn _mk_clamp(v, lo, hi) {
+    if v < lo { return lo }
+    if v > hi { return hi }
+    return v
+}
+
+fn _mk_round(x) {
+    if x >= 0.0 { return to_int(x + 0.5) }
+    return to_int(x - 0.5)
+}
+
+fn _mk_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn _mk_log10(x) {
+    if x <= 0.0 { return -999.0 }
+    let mut v = x
+    let mut result = 0.0
+    while v >= 10.0 {
+        v = v / 10.0
+        result = result + 1.0
+    }
+    while v < 1.0 {
+        v = v * 10.0
+        result = result - 1.0
+    }
+    let t = (v - 1.0) / (v + 1.0)
+    let t2 = t * t
+    let ln_v = 2.0 * (t + t * t2 / 3.0 + t * t2 * t2 / 5.0 + t * t2 * t2 * t2 / 7.0)
+    result = result + ln_v / 2.302585
+    return result
+}
+
+// Zeros utilities
+fn _mk_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn _mk_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+// ── Structs ──────────────────────────────────────────────────────
+
+struct MarlinMeta {
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    group_size: int
+}
+
+struct MarlinTensor {
+    rows: int,
+    cols: int,
+    group_size: int,
+    packed: array,
+    scales: array,
+    zeros: array,
+    perm: array
+}
+
+struct MarlinPipeline {
+    stage: int,
+    dequant_buf: array,
+    compute_buf: array,
+    done: bool
+}
+
+struct MarlinBench {
+    mse: float,
+    max_err: float,
+    snr_db: float,
+    speedup: float
+}
+
+// ===================================================================
+//  1. INT4 Packing — pack two 4-bit values into one byte
+//
+//  Layout: byte = lo_nibble + hi_nibble * 16
+//  lo_nibble occupies bits [0..3], hi_nibble occupies bits [4..7].
+//  Values are unsigned: 0..15.
+// ===================================================================
+
+@pure
+fn mk_pack_nibbles(lo, hi) {
+    let clo = _mk_clamp(lo, 0, 15)
+    let chi = _mk_clamp(hi, 0, 15)
+    return clo + chi * 16
+}
+
+@pure
+fn mk_unpack_lo(byte) {
+    return byte % 16
+}
+
+@pure
+fn mk_unpack_hi(byte) {
+    return byte / 16
+}
+
+// Pack an array of INT4 values into bytes (2 per byte).
+// If odd length, last byte has hi=0.
+@pure
+fn mk_pack_array(vals) {
+    let n = len(vals)
+    let nbytes = (n + 1) / 2
+    let mut out = []
+    for i in 0..nbytes {
+        let lo_idx = i * 2
+        let hi_idx = i * 2 + 1
+        let lo = vals[lo_idx]
+        let mut hi = 0
+        if hi_idx < n { hi = vals[hi_idx] }
+        out = out + [mk_pack_nibbles(lo, hi)]
+        i = i
+    }
+    return out
+}
+
+// Unpack bytes back to array of INT4 values (length n).
+@pure
+fn mk_unpack_array(bytes, n) {
+    let mut out = []
+    for i in 0..n {
+        let byte = bytes[i / 2]
+        let mut v = 0
+        if i % 2 == 0 {
+            v = mk_unpack_lo(byte)
+        } else {
+            v = mk_unpack_hi(byte)
+        }
+        out = out + [v]
+    }
+    return out
+}
+
+// ===================================================================
+//  2. Dequantization Kernel — INT4 -> FP32
+//
+//  dequant(q) = scale * (q - zero_point)
+//
+//  Per-group: each group of `group_size` elements shares one
+//  (scale, zero_point) pair.
+// ===================================================================
+
+@pure @hot
+fn mk_dequant_value(q, scale, zero_point) {
+    return scale * (to_float(q) - to_float(zero_point))
+}
+
+// Dequantize an entire array of INT4 values with per-group params.
+// scales[g], zeros[g] for group g = i / group_size.
+@pure @hot
+fn mk_dequant_array(int4_vals, scales, zeros, group_size) {
+    let n = len(int4_vals)
+    let mut out = _mk_zeros(n)
+    for i in 0..n {
+        let g = i / group_size
+        out[i] = mk_dequant_value(int4_vals[i], scales[g], zeros[g])
+    }
+    return out
+}
+
+// Dequantize from packed bytes directly.
+@pure @hot
+fn mk_dequant_packed(packed, n, scales, zeros, group_size) {
+    let int4_vals = mk_unpack_array(packed, n)
+    return mk_dequant_array(int4_vals, scales, zeros, group_size)
+}
+
+// ===================================================================
+//  3. Tiled GEMM Simulation — blocked matrix multiply
+//
+//  C[M,N] = A[M,K] * B[K,N]
+//  All stored flat row-major.
+//  Tiles: tile_m x tile_k from A, tile_k x tile_n from B.
+// ===================================================================
+
+// Standard (full-precision) matmul for reference
+@pure
+fn mk_matmul(a, b, m, k, n) {
+    let mut c = _mk_zeros(m * n)
+    for i in 0..m {
+        for j in 0..n {
+            let mut acc = 0.0
+            for p in 0..k {
+                acc = acc + a[i * k + p] * b[p * n + j]
+            }
+            c[i * n + j] = acc
+        }
+    }
+    return c
+}
+
+// Tiled matmul with configurable tile sizes
+@pure @hot
+fn mk_tiled_matmul(a, b, m, k, n, tile_m, tile_k, tile_n) {
+    let mut c = _mk_zeros(m * n)
+    let mut ti = 0
+    while ti < m {
+        let i_end = _mk_min(ti + tile_m, m)
+        let mut tk = 0
+        while tk < k {
+            let k_end = _mk_min(tk + tile_k, k)
+            let mut tj = 0
+            while tj < n {
+                let j_end = _mk_min(tj + tile_n, n)
+                // Compute tile
+                let mut i = ti
+                while i < i_end {
+                    let mut j = tj
+                    while j < j_end {
+                        let mut acc = c[i * n + j]
+                        let mut p = tk
+                        while p < k_end {
+                            acc = acc + a[i * k + p] * b[p * n + j]
+                            p = p + 1
+                        }
+                        c[i * n + j] = acc
+                        j = j + 1
+                    }
+                    i = i + 1
+                }
+                tj = tj + tile_n
+            }
+            tk = tk + tile_k
+        }
+        ti = ti + tile_m
+    }
+    return c
+}
+
+// ===================================================================
+//  4. Group Quantization — per-group scale and zero-point
+//
+//  For a row of floats, divide into groups of `group_size`.
+//  Per group: find min/max, compute scale = (max - min) / 15,
+//  zero_point = round(-min / scale).
+//  Quantize: q = clamp(round(val / scale) + zero_point, 0, 15)
+// ===================================================================
+
+// Compute group quantization parameters for one group of values
+@pure
+fn mk_group_params(vals, start, end) {
+    let mut mn = vals[start]
+    let mut mx = vals[start]
+    let mut i = start + 1
+    while i < end {
+        if vals[i] < mn { mn = vals[i] }
+        if vals[i] > mx { mx = vals[i] }
+        i = i + 1
+    }
+    let range = mx - mn
+    let mut scale = range / 15.0
+    if scale < 1.0e-10 { scale = 1.0e-10 }
+    let zero_point = _mk_round(0.0 - mn / scale)
+    let clamped_zp = _mk_clamp(zero_point, 0, 15)
+    return [scale, clamped_zp]
+}
+
+// Quantize an entire row of floats with group quantization
+@pure
+fn mk_group_quantize(vals, group_size) {
+    let n = len(vals)
+    let n_groups = (n + group_size - 1) / group_size
+    let mut quant_vals = _mk_zeros_int(n)
+    let mut scales = []
+    let mut zeros = []
+    for g in 0..n_groups {
+        let start = g * group_size
+        let mut end = start + group_size
+        if end > n { end = n }
+        let params = mk_group_params(vals, start, end)
+        let scale = params[0]
+        let zp = params[1]
+        scales = scales + [scale]
+        zeros = zeros + [zp]
+        let mut i = start
+        while i < end {
+            let q = _mk_round(vals[i] / scale) + zp
+            quant_vals[i] = _mk_clamp(q, 0, 15)
+            i = i + 1
+        }
+    }
+    return [quant_vals, scales, zeros]
+}
+
+// Full matrix quantization: row-major [rows, cols]
+@pure
+fn mk_quantize_matrix(w, rows, cols, group_size) {
+    let mut all_packed = []
+    let mut all_scales = []
+    let mut all_zeros = []
+    for r in 0..rows {
+        let mut row = []
+        for c in 0..cols {
+            row = row + [w[r * cols + c]]
+        }
+        let result = mk_group_quantize(row, group_size)
+        let qvals = result[0]
+        let sc = result[1]
+        let zp = result[2]
+        let packed = mk_pack_array(qvals)
+        all_packed = all_packed + packed
+        all_scales = all_scales + sc
+        all_zeros = all_zeros + zp
+    }
+    let perm = _mk_zeros_int(cols)
+    for i in 0..cols { perm[i] = i }
+    return MarlinTensor {
+        rows: rows,
+        cols: cols,
+        group_size: group_size,
+        packed: all_packed,
+        scales: all_scales,
+        zeros: all_zeros,
+        perm: perm
+    }
+}
+
+// ===================================================================
+//  5. Permutation — reorder weight columns for sequential access
+//
+//  Marlin reorders columns so that threads access memory in a
+//  sequential pattern.  We simulate this with a column permutation.
+//
+//  Strategy: interleave-based permutation. For tile_k-wide access,
+//  rearrange columns so consecutive groups fall on consecutive tiles.
+// ===================================================================
+
+@pure
+fn mk_build_permutation(cols, tile_k) {
+    let n_tiles = (cols + tile_k - 1) / tile_k
+    let mut perm = _mk_zeros_int(cols)
+    let mut idx = 0
+    // Interleave: first element of each tile, then second, etc.
+    for offset in 0..tile_k {
+        for t in 0..n_tiles {
+            let src = t * tile_k + offset
+            if src < cols {
+                perm[idx] = src
+                idx = idx + 1
+            }
+        }
+    }
+    return perm
+}
+
+// Apply permutation to a row of values
+@pure
+fn mk_apply_perm(vals, perm) {
+    let n = len(perm)
+    let mut out = _mk_zeros(n)
+    for i in 0..n {
+        out[i] = vals[perm[i]]
+    }
+    return out
+}
+
+// Apply inverse permutation
+@pure
+fn mk_apply_inv_perm(vals, perm) {
+    let n = len(perm)
+    let mut out = _mk_zeros(n)
+    for i in 0..n {
+        out[perm[i]] = vals[i]
+    }
+    return out
+}
+
+// Quantize matrix with permutation applied
+@pure
+fn mk_quantize_matrix_perm(w, rows, cols, group_size, tile_k) {
+    let perm = mk_build_permutation(cols, tile_k)
+    // Apply permutation to each row before quantizing
+    let mut permuted_w = _mk_zeros(rows * cols)
+    for r in 0..rows {
+        let mut row = []
+        for c in 0..cols {
+            row = row + [w[r * cols + c]]
+        }
+        let prow = mk_apply_perm(row, perm)
+        for c in 0..cols {
+            permuted_w[r * cols + c] = prow[c]
+        }
+    }
+    let mt = mk_quantize_matrix(permuted_w, rows, cols, group_size)
+    return MarlinTensor {
+        rows: mt.rows,
+        cols: mt.cols,
+        group_size: mt.group_size,
+        packed: mt.packed,
+        scales: mt.scales,
+        zeros: mt.zeros,
+        perm: perm
+    }
+}
+
+// ===================================================================
+//  6. Async Pipeline Simulation — overlap dequant + compute
+//
+//  In a real GPU kernel, Marlin pipelines:
+//    Stage 0: dequantize next tile (global mem -> shared mem)
+//    Stage 1: compute on current tile (shared mem -> registers)
+//
+//  We simulate this by tracking stages and buffers.
+// ===================================================================
+
+fn mk_pipeline_init(buf_size) {
+    return MarlinPipeline {
+        stage: 0,
+        dequant_buf: _mk_zeros(buf_size),
+        compute_buf: _mk_zeros(buf_size),
+        done: false
+    }
+}
+
+// Simulate one pipeline step: dequant tile -> compute with previous tile
+@hot
+fn mk_pipeline_step(pipe, packed_tile, tile_n, scales, zeros, group_size, a_tile, prev_accum) {
+    // Stage 0: dequant the current tile into dequant_buf
+    let dq = mk_dequant_packed(packed_tile, tile_n, scales, zeros, group_size)
+    // Stage 1: compute using the previous dequant_buf (which is now compute_buf)
+    let mut accum = prev_accum
+    let buf_n = len(dq)
+    for i in 0..len(a_tile) {
+        let mut dot = 0.0
+        for j in 0..buf_n {
+            dot = dot + a_tile[i] * dq[j]
+        }
+        accum = accum + [dot]
+    }
+    return MarlinPipeline {
+        stage: pipe.stage + 1,
+        dequant_buf: dq,
+        compute_buf: pipe.dequant_buf,
+        done: false
+    }
+}
+
+// Full pipelined GEMM: C[M,N] = A[M,K] * dequant(B_packed[K,N])
+@hot
+fn mk_pipelined_gemm(a, mt, m, k, n, tile_k) {
+    let groups_per_row = (mt.cols + mt.group_size - 1) / mt.group_size
+    let bytes_per_row = (mt.cols + 1) / 2
+    let mut c = _mk_zeros(m * n)
+    // Process row by row of B (each row of B = column of B^T)
+    for i in 0..m {
+        for j in 0..n {
+            // Dequantize row j of B
+            let row_packed_start = j * bytes_per_row
+            let mut row_packed = []
+            for b in 0..bytes_per_row {
+                row_packed = row_packed + [mt.packed[row_packed_start + b]]
+            }
+            let scale_start = j * groups_per_row
+            let mut row_scales = []
+            let mut row_zeros = []
+            for g in 0..groups_per_row {
+                row_scales = row_scales + [mt.scales[scale_start + g]]
+                row_zeros = row_zeros + [mt.zeros[scale_start + g]]
+            }
+            let dq = mk_dequant_packed(row_packed, k, row_scales, row_zeros, mt.group_size)
+            // If B was permuted, apply inverse permutation
+            let mut dq_final = dq
+            if len(mt.perm) == k {
+                dq_final = mk_apply_inv_perm(dq, mt.perm)
+            }
+            // Dot product for C[i,j]
+            let mut acc = 0.0
+            for p in 0..k {
+                acc = acc + a[i * k + p] * dq_final[p]
+            }
+            c[i * n + j] = acc
+        }
+    }
+    return c
+}
+
+// ===================================================================
+//  7. Memory Layout — optimal packing format
+//
+//  Marlin stores weights in a column-major INT4 format where
+//  consecutive threads read consecutive bytes.
+//  We provide layout analysis functions.
+// ===================================================================
+
+// Compute memory footprint in bytes
+@pure
+fn mk_memory_footprint(rows, cols, group_size) {
+    let n_groups = (cols + group_size - 1) / group_size
+    let packed_bytes = rows * ((cols + 1) / 2)
+    // scales: n_groups * rows * 4 bytes (float32)
+    let scale_bytes = rows * n_groups * 4
+    // zeros: n_groups * rows * 4 bytes (int stored as i32)
+    let zero_bytes = rows * n_groups * 4
+    let total = packed_bytes + scale_bytes + zero_bytes
+    return [packed_bytes, scale_bytes, zero_bytes, total]
+}
+
+// Compression ratio vs FP32
+@pure
+fn mk_compression_ratio(rows, cols, group_size) {
+    let fp32_bytes = rows * cols * 4
+    let footprint = mk_memory_footprint(rows, cols, group_size)
+    let quant_bytes = footprint[3]
+    if quant_bytes == 0 { return 1.0 }
+    return to_float(fp32_bytes) / to_float(quant_bytes)
+}
+
+// Check if layout is tile-aligned
+@pure
+fn mk_is_tile_aligned(cols, tile_k) {
+    return cols % tile_k == 0
+}
+
+// Compute padding needed for tile alignment
+@pure
+fn mk_tile_padding(cols, tile_k) {
+    let rem = cols % tile_k
+    if rem == 0 { return 0 }
+    return tile_k - rem
+}
+
+// ===================================================================
+//  8. Benchmark — quantized vs full precision
+//
+//  Compare accuracy (MSE, max error, SNR) and estimate speedup.
+//  Speedup is based on memory bandwidth reduction (INT4 = ~3.5x less).
+// ===================================================================
+
+@pure
+fn mk_mse(ref_vals, test_vals) {
+    let n = len(ref_vals)
+    if n == 0 { return 0.0 }
+    let mut sum_sq = 0.0
+    for i in 0..n {
+        let d = ref_vals[i] - test_vals[i]
+        sum_sq = sum_sq + d * d
+    }
+    return sum_sq / to_float(n)
+}
+
+@pure
+fn mk_max_error(ref_vals, test_vals) {
+    let n = len(ref_vals)
+    let mut mx = 0.0
+    for i in 0..n {
+        let d = _mk_abs(ref_vals[i] - test_vals[i])
+        if d > mx { mx = d }
+    }
+    return mx
+}
+
+@pure
+fn mk_signal_power(vals) {
+    let n = len(vals)
+    if n == 0 { return 0.0 }
+    let mut s = 0.0
+    for i in 0..n {
+        s = s + vals[i] * vals[i]
+    }
+    return s / to_float(n)
+}
+
+@pure
+fn mk_snr_db(ref_vals, test_vals) {
+    let sig = mk_signal_power(ref_vals)
+    let noise = mk_mse(ref_vals, test_vals)
+    if noise < 1.0e-15 { return 999.0 }
+    return 10.0 * _mk_log10(sig / noise)
+}
+
+// Estimate speedup from memory bandwidth reduction
+@pure
+fn mk_estimated_speedup(rows, cols, group_size) {
+    let ratio = mk_compression_ratio(rows, cols, group_size)
+    // Marlin achieves ~80% of theoretical bandwidth speedup
+    // due to dequant overhead. Simulate as ratio * 0.8
+    return ratio * 0.8
+}
+
+// Full benchmark: quantize, compute, compare
+@pure
+fn mk_benchmark(w, a, m, k, n, group_size) {
+    // Reference: FP32 matmul
+    let ref_c = mk_matmul(a, w, m, k, n)
+    // Quantize B (weights) as [N, K] stored row-major
+    // We treat w as [K, N] for matmul, but quantize rows
+    let mt = mk_quantize_matrix(w, k, n, group_size)
+    // Dequantize and compute
+    let mut dq_w = _mk_zeros(k * n)
+    let groups_per_row = (n + group_size - 1) / group_size
+    let bytes_per_row = (n + 1) / 2
+    for r in 0..k {
+        let row_start = r * bytes_per_row
+        let mut row_packed = []
+        for b in 0..bytes_per_row {
+            row_packed = row_packed + [mt.packed[row_start + b]]
+        }
+        let sc_start = r * groups_per_row
+        let mut sc = []
+        let mut zp = []
+        for g in 0..groups_per_row {
+            sc = sc + [mt.scales[sc_start + g]]
+            zp = zp + [mt.zeros[sc_start + g]]
+        }
+        let dq_row = mk_dequant_packed(row_packed, n, sc, zp, group_size)
+        for c in 0..n {
+            dq_w[r * n + c] = dq_row[c]
+        }
+    }
+    let quant_c = mk_matmul(a, dq_w, m, k, n)
+    let mse = mk_mse(ref_c, quant_c)
+    let max_err = mk_max_error(ref_c, quant_c)
+    let snr = mk_snr_db(ref_c, quant_c)
+    let speedup = mk_estimated_speedup(k, n, group_size)
+    return MarlinBench {
+        mse: mse,
+        max_err: max_err,
+        snr_db: snr,
+        speedup: speedup
+    }
+}
+
+// ===================================================================
+//  Quantized GEMM forward — the full Marlin-style forward pass
+//
+//  Given MarlinTensor (quantized B[K,N]) and activation A[M,K],
+//  compute C[M,N] = A * dequant(B).
+// ===================================================================
+
+@hot
+fn mk_forward(a, mt, m, k, n) {
+    let groups_per_row = (mt.cols + mt.group_size - 1) / mt.group_size
+    let bytes_per_row = (mt.cols + 1) / 2
+    // Dequantize all of B
+    let mut dq_w = _mk_zeros(k * n)
+    for r in 0..k {
+        let row_start = r * bytes_per_row
+        let mut row_packed = []
+        for b in 0..bytes_per_row {
+            row_packed = row_packed + [mt.packed[row_start + b]]
+        }
+        let sc_start = r * groups_per_row
+        let mut sc = []
+        let mut zp = []
+        for g in 0..groups_per_row {
+            sc = sc + [mt.scales[sc_start + g]]
+            zp = zp + [mt.zeros[sc_start + g]]
+        }
+        let dq_row = mk_dequant_packed(row_packed, n, sc, zp, mt.group_size)
+        for c in 0..n {
+            dq_w[r * n + c] = dq_row[c]
+        }
+    }
+    return mk_matmul(a, dq_w, m, k, n)
+}
+
+// ===================================================================
+//  Default configuration
+// ===================================================================
+
+@pure
+fn mk_default_meta() {
+    return MarlinMeta {
+        tile_m: 16,
+        tile_n: 16,
+        tile_k: 64,
+        group_size: 64
+    }
+}
+
+println("[marlin_kernel] loaded — INT4 GEMM + group quantization + tiled matmul + async pipeline")

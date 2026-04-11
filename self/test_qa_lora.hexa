@@ -1,0 +1,863 @@
+// ===================================================================
+//  test_qa_lora.hexa — QA-LoRA verification (#143)
+//
+//  Tests (35):
+//    T1  symmetric quant produces correct length
+//    T2  symmetric quant values in range
+//    T3  symmetric dequant reconstructs approximately
+//    T4  symmetric quant scale positive
+//    T5  asymmetric quant values non-negative
+//    T6  asymmetric dequant reconstructs approximately
+//    T7  asymmetric zero_point non-negative
+//    T8  group quantize correct output length
+//    T9  group quantize correct number of scales
+//    T10 group dequantize reconstructs approximately
+//    T11 INT4 pack/unpack roundtrip
+//    T12 INT4 pack reduces size
+//    T13 INT4 unpack correct count
+//    T14 LoRA creation correct dims
+//    T15 LoRA forward output correct size
+//    T16 LoRA B-zero init -> zero output
+//    T17 LoRA forward with nonzero B produces output
+//    T18 QA-LoRA layer creation
+//    T19 QA-LoRA forward output size
+//    T20 QA-LoRA forward produces values
+//    T21 STE error is small for 8-bit
+//    T22 STE error is larger for 4-bit than 8-bit
+//    T23 merge LoRA sets merged flag
+//    T24 merge LoRA zeros out LoRA matrices
+//    T25 merged forward approx equals pre-merge forward
+//    T26 calibration preserves dimensions
+//    T27 calibration produces valid quant params
+//    T28 export returns correct format
+//    T29 export has packed weights for INT4
+//    T30 export total_params correct
+//    T31 INT4 matmul simulation produces output
+//    T32 INT4 matmul sim approx matches float matmul
+//    T33 quant error MSE is small for 8-bit
+//    T34 group quant error decreases with more bits
+//    T35 rank search returns valid rank
+//
+//  Run: cargo run --release -- self/test_qa_lora.hexa
+// ===================================================================
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ── inlined helpers from qa_lora.hexa ──────────────────────────
+
+fn ql_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn ql_abs_int(x) {
+    if x < 0 { return 0 - x }
+    return x
+}
+
+fn ql_max_f(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn ql_min_f(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn ql_max_i(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn ql_min_i(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn ql_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 { g = (g + x / g) / 2.0 }
+    return g
+}
+
+fn ql_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn ql_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+fn ql_floor(x) {
+    let i = to_int(x)
+    if to_float(i) > x { return i - 1 }
+    return i
+}
+
+fn ql_round(x) {
+    return ql_floor(x + 0.5)
+}
+
+fn ql_clamp_f(x, lo, hi) {
+    if x < lo { return lo }
+    if x > hi { return hi }
+    return x
+}
+
+fn ql_clamp_i(x, lo, hi) {
+    if x < lo { return lo }
+    if x > hi { return hi }
+    return x
+}
+
+fn ql_pseudo_rand(seed, idx) {
+    let mut h = (seed + 1) * 2654435761 + idx * 1315423911 + 7919
+    h = h % 1000003
+    if h < 0 { h = 0 - h }
+    return to_float(h % 1000) / 1000.0 - 0.5
+}
+
+// ── Symmetric quantization ──
+
+fn ql_quantize_symmetric(vals, n_bits) {
+    let n = len(vals)
+    let qmax = to_int(pow(2.0, to_float(n_bits - 1))) - 1
+    let mut amax = 0.0
+    for i in 0..n {
+        let a = ql_abs(vals[i])
+        if a > amax { amax = a }
+    }
+    let mut scale = 0.0
+    if amax > 1.0e-10 {
+        scale = amax / to_float(qmax)
+    } else {
+        scale = 1.0
+    }
+    let mut qvals = ql_zeros_int(n)
+    for i in 0..n {
+        let q = ql_round(vals[i] / scale)
+        qvals[i] = ql_clamp_i(to_int(q), 0 - qmax, qmax)
+    }
+    return [qvals, scale]
+}
+
+fn ql_dequantize_symmetric(qvals, scale) {
+    let n = len(qvals)
+    let mut out = ql_zeros(n)
+    for i in 0..n {
+        out[i] = to_float(qvals[i]) * scale
+    }
+    return out
+}
+
+// ── Asymmetric quantization ──
+
+fn ql_quantize_asymmetric(vals, n_bits) {
+    let n = len(vals)
+    let qmax = to_int(pow(2.0, to_float(n_bits))) - 1
+    let mut vmin = vals[0]
+    let mut vmax = vals[0]
+    for i in 1..n {
+        if vals[i] < vmin { vmin = vals[i] }
+        if vals[i] > vmax { vmax = vals[i] }
+    }
+    let range = vmax - vmin
+    let mut scale = 1.0
+    if range > 1.0e-10 {
+        scale = range / to_float(qmax)
+    }
+    let zp = ql_round(0.0 - vmin / scale)
+    let zero_point = ql_clamp_i(to_int(zp), 0, qmax)
+    let mut qvals = ql_zeros_int(n)
+    for i in 0..n {
+        let q = ql_round(vals[i] / scale) + zero_point
+        qvals[i] = ql_clamp_i(to_int(q), 0, qmax)
+    }
+    return [qvals, scale, zero_point]
+}
+
+fn ql_dequantize_asymmetric(qvals, scale, zero_point) {
+    let n = len(qvals)
+    let mut out = ql_zeros(n)
+    for i in 0..n {
+        out[i] = to_float(qvals[i] - zero_point) * scale
+    }
+    return out
+}
+
+// ── Group quantization ──
+
+fn ql_group_quantize(vals, group_size, n_bits) {
+    let n = len(vals)
+    let mut qvals = ql_zeros_int(n)
+    let mut scales = []
+    let mut zps = []
+    let mut g = 0
+    while g < n {
+        let mut gend = g + group_size
+        if gend > n { gend = n }
+        let mut gvals = []
+        for i in g..gend {
+            gvals = gvals + [vals[i]]
+        }
+        let res = ql_quantize_asymmetric(gvals, n_bits)
+        let gq = res[0]
+        scales = scales + [res[1]]
+        zps = zps + [res[2]]
+        let gn = gend - g
+        for i in 0..gn {
+            qvals[g + i] = gq[i]
+        }
+        g = gend
+    }
+    return [qvals, scales, zps]
+}
+
+fn ql_group_dequantize(qvals, scales, zps, group_size) {
+    let n = len(qvals)
+    let mut out = ql_zeros(n)
+    let mut gi = 0
+    let mut g = 0
+    while g < n {
+        let mut gend = g + group_size
+        if gend > n { gend = n }
+        let s = scales[gi]
+        let z = zps[gi]
+        for i in g..gend {
+            out[i] = to_float(qvals[i] - z) * s
+        }
+        gi = gi + 1
+        g = gend
+    }
+    return out
+}
+
+// ── INT4 pack/unpack ──
+
+fn ql_pack_int4(vals) {
+    let n = len(vals)
+    let mut packed_len = n / 2
+    if n % 2 != 0 { packed_len = packed_len + 1 }
+    let mut packed = ql_zeros_int(packed_len)
+    for i in 0..packed_len {
+        let lo_idx = i * 2
+        let hi_idx = i * 2 + 1
+        let lo = ql_clamp_i(vals[lo_idx], 0, 15)
+        let mut hi = 0
+        if hi_idx < n {
+            hi = ql_clamp_i(vals[hi_idx], 0, 15)
+        }
+        packed[i] = lo + hi * 16
+    }
+    return packed
+}
+
+fn ql_unpack_int4(packed, count) {
+    let mut vals = ql_zeros_int(count)
+    let pn = len(packed)
+    for i in 0..pn {
+        let lo_idx = i * 2
+        let hi_idx = i * 2 + 1
+        let lo = packed[i] % 16
+        let hi = packed[i] / 16
+        if lo_idx < count { vals[lo_idx] = lo }
+        if hi_idx < count { vals[hi_idx] = hi }
+    }
+    return vals
+}
+
+// ── LoRA ──
+
+fn ql_create_lora(in_dim, out_dim, rank) {
+    let a_size = out_dim * rank
+    let b_size = rank * in_dim
+    let mut a_mat = ql_zeros(a_size)
+    let mut b_mat = ql_zeros(b_size)
+    for i in 0..a_size {
+        a_mat[i] = ql_pseudo_rand(42, i) * 0.02
+    }
+    let alpha = 1.0
+    return #{
+        "in_dim": in_dim,
+        "out_dim": out_dim,
+        "rank": rank,
+        "a_mat": a_mat,
+        "b_mat": b_mat,
+        "alpha": alpha
+    }
+}
+
+fn ql_lora_forward(lora, x) {
+    let in_dim = lora["in_dim"]
+    let out_dim = lora["out_dim"]
+    let rank = lora["rank"]
+    let a_mat = lora["a_mat"]
+    let b_mat = lora["b_mat"]
+    let alpha = lora["alpha"]
+    let scale = alpha / to_float(rank)
+    let mut h = ql_zeros(rank)
+    for r in 0..rank {
+        let mut sum = 0.0
+        for j in 0..in_dim {
+            sum = sum + b_mat[r * in_dim + j] * x[j]
+        }
+        h[r] = sum
+    }
+    let mut out = ql_zeros(out_dim)
+    for i in 0..out_dim {
+        let mut sum = 0.0
+        for r in 0..rank {
+            sum = sum + a_mat[i * rank + r] * h[r]
+        }
+        out[i] = sum * scale
+    }
+    return out
+}
+
+// ── QA-LoRA layer ──
+
+fn ql_create_base_weights(in_dim, out_dim, seed) {
+    let n = in_dim * out_dim
+    let mut w = ql_zeros(n)
+    for i in 0..n {
+        w[i] = ql_pseudo_rand(seed, i) * 0.1
+    }
+    return w
+}
+
+fn ql_create_qalora_layer(in_dim, out_dim, rank, group_size, n_bits) {
+    let base_fp = ql_create_base_weights(in_dim, out_dim, 123)
+    let gq = ql_group_quantize(base_fp, group_size, n_bits)
+    let lora = ql_create_lora(in_dim, out_dim, rank)
+    return #{
+        "in_dim": in_dim,
+        "out_dim": out_dim,
+        "rank": rank,
+        "group_size": group_size,
+        "n_bits": n_bits,
+        "base_qvals": gq[0],
+        "base_scales": gq[1],
+        "base_zps": gq[2],
+        "base_fp": base_fp,
+        "lora": lora,
+        "merged": false
+    }
+}
+
+fn ql_qalora_forward(layer, x) {
+    let in_dim = layer["in_dim"]
+    let out_dim = layer["out_dim"]
+    let group_size = layer["group_size"]
+    let base_deq = ql_group_dequantize(
+        layer["base_qvals"], layer["base_scales"],
+        layer["base_zps"], group_size
+    )
+    let mut out = ql_zeros(out_dim)
+    for i in 0..out_dim {
+        let mut sum = 0.0
+        for j in 0..in_dim {
+            sum = sum + base_deq[i * in_dim + j] * x[j]
+        }
+        out[i] = sum
+    }
+    let lora_out = ql_lora_forward(layer["lora"], x)
+    for i in 0..out_dim {
+        out[i] = out[i] + lora_out[i]
+    }
+    return out
+}
+
+fn ql_ste_error(vals, n_bits) {
+    let qr = ql_quantize_symmetric(vals, n_bits)
+    let deq = ql_dequantize_symmetric(qr[0], qr[1])
+    let n = len(vals)
+    let mut err = 0.0
+    for i in 0..n {
+        let d = vals[i] - deq[i]
+        err = err + d * d
+    }
+    return err / to_float(n)
+}
+
+// ── Merge ──
+
+fn ql_merge_lora_into_quantized(layer) {
+    let in_dim = layer["in_dim"]
+    let out_dim = layer["out_dim"]
+    let group_size = layer["group_size"]
+    let n_bits = layer["n_bits"]
+    let lora = layer["lora"]
+    let rank = lora["rank"]
+    let a_mat = lora["a_mat"]
+    let b_mat = lora["b_mat"]
+    let alpha = lora["alpha"]
+    let scale_factor = alpha / to_float(rank)
+    let base_deq = ql_group_dequantize(
+        layer["base_qvals"], layer["base_scales"],
+        layer["base_zps"], group_size
+    )
+    let n = in_dim * out_dim
+    let mut merged_fp = ql_zeros(n)
+    for i in 0..out_dim {
+        for j in 0..in_dim {
+            let mut lora_val = 0.0
+            for r in 0..rank {
+                lora_val = lora_val + a_mat[i * rank + r] * b_mat[r * in_dim + j]
+            }
+            merged_fp[i * in_dim + j] = base_deq[i * in_dim + j] + lora_val * scale_factor
+        }
+    }
+    let gq = ql_group_quantize(merged_fp, group_size, n_bits)
+    let a_size = out_dim * rank
+    let b_size = rank * in_dim
+    let zero_a = ql_zeros(a_size)
+    let zero_b = ql_zeros(b_size)
+    let new_lora = #{
+        "in_dim": in_dim,
+        "out_dim": out_dim,
+        "rank": rank,
+        "a_mat": zero_a,
+        "b_mat": zero_b,
+        "alpha": alpha
+    }
+    return #{
+        "in_dim": in_dim,
+        "out_dim": out_dim,
+        "rank": rank,
+        "group_size": group_size,
+        "n_bits": n_bits,
+        "base_qvals": gq[0],
+        "base_scales": gq[1],
+        "base_zps": gq[2],
+        "base_fp": merged_fp,
+        "lora": new_lora,
+        "merged": true
+    }
+}
+
+// ── Calibration ──
+
+fn ql_calibrate(layer, data_batches) {
+    let in_dim = layer["in_dim"]
+    let out_dim = layer["out_dim"]
+    let group_size = layer["group_size"]
+    let n_bits = layer["n_bits"]
+    let nb = len(data_batches)
+    let base_fp = layer["base_fp"]
+    let n = in_dim * out_dim
+    let mut running_min = ql_zeros(n)
+    let mut running_max = ql_zeros(n)
+    for i in 0..n {
+        running_min[i] = base_fp[i]
+        running_max[i] = base_fp[i]
+    }
+    for b in 0..nb {
+        let x = data_batches[b]
+        for i in 0..out_dim {
+            for j in 0..in_dim {
+                let idx = i * in_dim + j
+                let effective = base_fp[idx] * x[j]
+                if effective < running_min[idx] {
+                    running_min[idx] = effective
+                }
+                if effective > running_max[idx] {
+                    running_max[idx] = effective
+                }
+            }
+        }
+    }
+    let mut calibrated = ql_zeros(n)
+    for i in 0..n {
+        calibrated[i] = base_fp[i]
+    }
+    let gq = ql_group_quantize(calibrated, group_size, n_bits)
+    return #{
+        "in_dim": in_dim,
+        "out_dim": out_dim,
+        "rank": layer["rank"],
+        "group_size": group_size,
+        "n_bits": n_bits,
+        "base_qvals": gq[0],
+        "base_scales": gq[1],
+        "base_zps": gq[2],
+        "base_fp": calibrated,
+        "lora": layer["lora"],
+        "merged": layer["merged"]
+    }
+}
+
+// ── Export ──
+
+fn ql_export(layer) {
+    let mut final_layer = layer
+    if layer["merged"] == false {
+        final_layer = ql_merge_lora_into_quantized(layer)
+    }
+    let in_dim = final_layer["in_dim"]
+    let out_dim = final_layer["out_dim"]
+    let n = in_dim * out_dim
+    let n_bits = final_layer["n_bits"]
+    let mut packed = final_layer["base_qvals"]
+    let mut is_packed = false
+    if n_bits == 4 {
+        packed = ql_pack_int4(final_layer["base_qvals"])
+        is_packed = true
+    }
+    return #{
+        "format": "qa_lora_export_v1",
+        "in_dim": in_dim,
+        "out_dim": out_dim,
+        "n_bits": n_bits,
+        "group_size": final_layer["group_size"],
+        "packed_weights": packed,
+        "is_packed": is_packed,
+        "scales": final_layer["base_scales"],
+        "zero_points": final_layer["base_zps"],
+        "total_params": n,
+        "merged": true
+    }
+}
+
+// ── INT4 matmul sim ──
+
+fn ql_int4_matmul_sim(w_qvals, w_scale, w_zp, x_vals, rows, cols) {
+    let xq = ql_quantize_symmetric(x_vals, 8)
+    let x_quant = xq[0]
+    let x_scale = xq[1]
+    let mut out = ql_zeros(rows)
+    for i in 0..rows {
+        let mut acc = 0
+        for j in 0..cols {
+            let w_val = w_qvals[i * cols + j] - w_zp
+            acc = acc + w_val * x_quant[j]
+        }
+        out[i] = to_float(acc) * w_scale * x_scale
+    }
+    return out
+}
+
+// ── Error analysis ──
+
+fn ql_quant_error_mse(original, qvals, scale, zero_point) {
+    let n = len(original)
+    let mut mse = 0.0
+    for i in 0..n {
+        let deq = to_float(qvals[i] - zero_point) * scale
+        let d = original[i] - deq
+        mse = mse + d * d
+    }
+    return mse / to_float(n)
+}
+
+fn ql_group_quant_error(original, qvals, scales, zps, group_size) {
+    let n = len(original)
+    let mut total_err = 0.0
+    let mut gi = 0
+    let mut g = 0
+    while g < n {
+        let mut gend = g + group_size
+        if gend > n { gend = n }
+        let gn = gend - g
+        let mut gerr = 0.0
+        for i in g..gend {
+            let deq = to_float(qvals[i] - zps[gi]) * scales[gi]
+            let d = original[i] - deq
+            gerr = gerr + d * d
+        }
+        total_err = total_err + gerr / to_float(gn)
+        gi = gi + 1
+        g = gend
+    }
+    let n_groups = len(scales)
+    return total_err / to_float(n_groups)
+}
+
+// ── Rank search ──
+
+fn ql_rank_search(in_dim, out_dim, group_size, n_bits, ranks, test_x) {
+    let n_ranks = len(ranks)
+    let mut best_rank = ranks[0]
+    let mut best_norm = 999999.0
+    for ri in 0..n_ranks {
+        let r = ranks[ri]
+        let layer = ql_create_qalora_layer(in_dim, out_dim, r, group_size, n_bits)
+        let y = ql_qalora_forward(layer, test_x)
+        let mut norm = 0.0
+        for i in 0..len(y) {
+            norm = norm + y[i] * y[i]
+        }
+        let param_cost = to_float(r * (in_dim + out_dim)) / to_float(in_dim * out_dim)
+        let score = param_cost
+        if score < best_norm {
+            best_norm = score
+            best_rank = r
+        }
+    }
+    return best_rank
+}
+
+// ===================================================================
+//  TESTS
+// ===================================================================
+
+// ── Test data ──
+let test_vals = [0.5, -0.3, 0.8, -0.1, 0.4, -0.6, 0.2, -0.9, 0.7, -0.4, 0.1, -0.5, 0.3, -0.7, 0.6, -0.2]
+
+// T1: symmetric quant correct length
+let sq = ql_quantize_symmetric(test_vals, 8)
+let sq_vals = sq[0]
+check("T1 symmetric quant len = input len", len(sq_vals) == len(test_vals))
+
+// T2: symmetric quant values in range [-127, 127]
+let mut t2_ok = true
+for i in 0..len(sq_vals) {
+    if sq_vals[i] < -127 { t2_ok = false }
+    if sq_vals[i] > 127 { t2_ok = false }
+}
+check("T2 symmetric quant values in INT8 range", t2_ok)
+
+// T3: symmetric dequant reconstructs approximately
+let sq_deq = ql_dequantize_symmetric(sq_vals, sq[1])
+let mut t3_max_err = 0.0
+for i in 0..len(test_vals) {
+    let e = fabs(test_vals[i] - sq_deq[i])
+    if e > t3_max_err { t3_max_err = e }
+}
+check("T3 symmetric dequant max error < 0.01", t3_max_err < 0.01)
+
+// T4: symmetric quant scale positive
+check("T4 symmetric quant scale > 0", sq[1] > 0.0)
+
+// T5: asymmetric quant values non-negative
+let aq = ql_quantize_asymmetric(test_vals, 8)
+let aq_vals = aq[0]
+let mut t5_ok = true
+for i in 0..len(aq_vals) {
+    if aq_vals[i] < 0 { t5_ok = false }
+}
+check("T5 asymmetric quant values >= 0", t5_ok)
+
+// T6: asymmetric dequant reconstructs approximately
+let aq_deq = ql_dequantize_asymmetric(aq_vals, aq[1], aq[2])
+let mut t6_max_err = 0.0
+for i in 0..len(test_vals) {
+    let e = fabs(test_vals[i] - aq_deq[i])
+    if e > t6_max_err { t6_max_err = e }
+}
+check("T6 asymmetric dequant max error < 0.02", t6_max_err < 0.02)
+
+// T7: asymmetric zero_point non-negative
+check("T7 asymmetric zero_point >= 0", aq[2] >= 0)
+
+// T8: group quantize correct output length
+let gq = ql_group_quantize(test_vals, 4, 8)
+check("T8 group quant output len == input len", len(gq[0]) == len(test_vals))
+
+// T9: group quantize correct number of scales (16 vals / 4 per group = 4 groups)
+check("T9 group quant 4 groups -> 4 scales", len(gq[1]) == 4)
+
+// T10: group dequantize reconstructs approximately
+let gq_deq = ql_group_dequantize(gq[0], gq[1], gq[2], 4)
+let mut t10_max_err = 0.0
+for i in 0..len(test_vals) {
+    let e = fabs(test_vals[i] - gq_deq[i])
+    if e > t10_max_err { t10_max_err = e }
+}
+check("T10 group dequant max error < 0.02", t10_max_err < 0.02)
+
+// T11: INT4 pack/unpack roundtrip
+let int4_vals = [3, 7, 1, 15, 0, 8, 5, 12]
+let packed = ql_pack_int4(int4_vals)
+let unpacked = ql_unpack_int4(packed, 8)
+let mut t11_ok = true
+for i in 0..8 {
+    if unpacked[i] != int4_vals[i] { t11_ok = false }
+}
+check("T11 INT4 pack/unpack roundtrip", t11_ok)
+
+// T12: INT4 pack reduces size (8 vals -> 4 packed)
+check("T12 INT4 pack reduces size", len(packed) == 4)
+
+// T13: INT4 unpack correct count
+check("T13 INT4 unpack correct count", len(unpacked) == 8)
+
+// T14: LoRA creation correct dims
+let lora = ql_create_lora(8, 4, 2)
+check("T14 LoRA in_dim=8", lora["in_dim"] == 8)
+check("T14b LoRA out_dim=4", lora["out_dim"] == 4)
+check("T14c LoRA rank=2", lora["rank"] == 2)
+
+// T15: LoRA forward output correct size
+let lora_x = [1.0, 0.5, -0.3, 0.2, 0.8, -0.1, 0.4, -0.6]
+let lora_out = ql_lora_forward(lora, lora_x)
+check("T15 LoRA forward output size=4", len(lora_out) == 4)
+
+// T16: LoRA B-zero init -> zero output
+let mut t16_all_zero = true
+for i in 0..len(lora_out) {
+    if fabs(lora_out[i]) > 1.0e-10 { t16_all_zero = false }
+}
+check("T16 LoRA B=0 -> zero output", t16_all_zero)
+
+// T17: LoRA forward with nonzero B produces output
+let mut lora_nz = ql_create_lora(8, 4, 2)
+let mut b_nz = ql_zeros(2 * 8)
+for i in 0..16 {
+    b_nz[i] = ql_pseudo_rand(99, i) * 0.1
+}
+lora_nz = #{
+    "in_dim": 8,
+    "out_dim": 4,
+    "rank": 2,
+    "a_mat": lora_nz["a_mat"],
+    "b_mat": b_nz,
+    "alpha": 1.0
+}
+let lora_nz_out = ql_lora_forward(lora_nz, lora_x)
+let mut t17_any_nonzero = false
+for i in 0..len(lora_nz_out) {
+    if fabs(lora_nz_out[i]) > 1.0e-10 { t17_any_nonzero = true }
+}
+check("T17 LoRA nonzero B -> nonzero output", t17_any_nonzero)
+
+// T18: QA-LoRA layer creation
+let layer = ql_create_qalora_layer(8, 4, 2, 4, 4)
+check("T18 QA-LoRA layer in_dim=8", layer["in_dim"] == 8)
+check("T18b QA-LoRA layer out_dim=4", layer["out_dim"] == 4)
+check("T18c QA-LoRA layer n_bits=4", layer["n_bits"] == 4)
+
+// T19: QA-LoRA forward output size
+let qa_x = [1.0, 0.5, -0.3, 0.2, 0.8, -0.1, 0.4, -0.6]
+let qa_out = ql_qalora_forward(layer, qa_x)
+check("T19 QA-LoRA forward output size=4", len(qa_out) == 4)
+
+// T20: QA-LoRA forward produces values (not all zeros)
+let mut t20_any = false
+for i in 0..len(qa_out) {
+    if fabs(qa_out[i]) > 1.0e-10 { t20_any = true }
+}
+check("T20 QA-LoRA forward produces values", t20_any)
+
+// T21: STE error is small for 8-bit
+let ste8 = ql_ste_error(test_vals, 8)
+check("T21 STE error 8-bit < 0.001", ste8 < 0.001)
+
+// T22: STE error is larger for 4-bit than 8-bit
+let ste4 = ql_ste_error(test_vals, 4)
+check("T22 STE error 4-bit >= 8-bit error", ste4 >= ste8)
+
+// T23: merge LoRA sets merged flag
+let merged = ql_merge_lora_into_quantized(layer)
+check("T23 merged flag is true", merged["merged"] == true)
+
+// T24: merge LoRA zeros out LoRA matrices
+let merged_lora = merged["lora"]
+let merged_b = merged_lora["b_mat"]
+let mut t24_all_zero = true
+for i in 0..len(merged_b) {
+    if fabs(merged_b[i]) > 1.0e-10 { t24_all_zero = false }
+}
+check("T24 merged LoRA B is all zeros", t24_all_zero)
+
+// T25: merged forward approx equals pre-merge forward
+let merged_out = ql_qalora_forward(merged, qa_x)
+let mut t25_ok = true
+for i in 0..len(qa_out) {
+    if fabs(qa_out[i] - merged_out[i]) > 0.15 { t25_ok = false }
+}
+check("T25 merged forward approx pre-merge", t25_ok)
+
+// T26: calibration preserves dimensions
+let calib_data = [
+    [1.0, 0.5, -0.3, 0.2, 0.8, -0.1, 0.4, -0.6],
+    [0.3, -0.7, 0.1, 0.9, -0.4, 0.6, -0.2, 0.5],
+    [-0.5, 0.8, 0.4, -0.3, 0.7, -0.9, 0.1, 0.2]
+]
+let calibrated = ql_calibrate(layer, calib_data)
+check("T26 calibrated in_dim=8", calibrated["in_dim"] == 8)
+check("T26b calibrated out_dim=4", calibrated["out_dim"] == 4)
+
+// T27: calibration produces valid quant params
+check("T27 calibrated has scales", len(calibrated["base_scales"]) > 0)
+check("T27b calibrated has zps", len(calibrated["base_zps"]) > 0)
+
+// T28: export returns correct format
+let exported = ql_export(layer)
+check("T28 export format correct", exported["format"] == "qa_lora_export_v1")
+
+// T29: export has packed weights for INT4
+check("T29 export is_packed for INT4", exported["is_packed"] == true)
+
+// T30: export total_params correct (8 * 4 = 32)
+check("T30 export total_params=32", exported["total_params"] == 32)
+
+// T31: INT4 matmul simulation produces output
+let w_vals = [0.5, -0.3, 0.8, -0.1, 0.4, -0.6, 0.2, -0.9]
+let wq = ql_quantize_asymmetric(w_vals, 4)
+let sim_x = [1.0, 0.5]
+let sim_out = ql_int4_matmul_sim(wq[0], wq[1], wq[2], sim_x, 4, 2)
+check("T31 INT4 matmul sim output size=4", len(sim_out) == 4)
+
+// T32: INT4 matmul sim approx matches float matmul
+// Float matmul: row0 = 0.5*1.0 + (-0.3)*0.5 = 0.35
+let mut float_out = ql_zeros(4)
+for i in 0..4 {
+    let mut sum = 0.0
+    for j in 0..2 {
+        sum = sum + w_vals[i * 2 + j] * sim_x[j]
+    }
+    float_out[i] = sum
+}
+let mut t32_ok = true
+for i in 0..4 {
+    if fabs(sim_out[i] - float_out[i]) > 0.3 { t32_ok = false }
+}
+check("T32 INT4 matmul sim approx float matmul", t32_ok)
+
+// T33: quant error MSE is small for 8-bit
+let err_mse = ql_quant_error_mse(test_vals, aq_vals, aq[1], aq[2])
+check("T33 quant error MSE 8-bit < 0.001", err_mse < 0.001)
+
+// T34: group quant error decreases with more bits
+let gq4 = ql_group_quantize(test_vals, 4, 4)
+let err4 = ql_group_quant_error(test_vals, gq4[0], gq4[1], gq4[2], 4)
+let gq8 = ql_group_quantize(test_vals, 4, 8)
+let err8 = ql_group_quant_error(test_vals, gq8[0], gq8[1], gq8[2], 4)
+check("T34 group quant error 8-bit <= 4-bit", err8 <= err4)
+
+// T35: rank search returns valid rank
+let search_x = [1.0, 0.5, -0.3, 0.2, 0.8, -0.1, 0.4, -0.6]
+let best_r = ql_rank_search(8, 4, 4, 4, [1, 2, 4], search_x)
+let mut t35_valid = false
+if best_r == 1 { t35_valid = true }
+if best_r == 2 { t35_valid = true }
+if best_r == 4 { t35_valid = true }
+check("T35 rank search returns valid rank", t35_valid)
+
+// ===================================================================
+println("")
+println("=== qa_lora test summary ===")
+println("PASS: " + str(pass_count))
+println("FAIL: " + str(fail_count))
+println("TOTAL: " + str(pass_count + fail_count))

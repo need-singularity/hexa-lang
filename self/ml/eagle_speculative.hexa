@@ -1,0 +1,756 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/eagle_speculative.hexa — Eagle-2 Context-Aware Speculative Decoding
+//
+//  Implements Eagle-2 speculative decoding with tree structure:
+//    1. Feature concatenation layer (hidden states + token embeddings -> draft input)
+//    2. Lightweight draft head (single transformer layer / MLP)
+//    3. Tree attention mask builder (from candidate tree structure)
+//    4. Tree expand: generate candidate tokens in tree structure
+//    5. Verification: compare draft tokens against target model
+//    6. Top-k tree construction from draft logits
+//    7. Multi-sequence support (batch tree speculative)
+//    8. Acceptance rate tracker and dynamic tree depth adjustment
+//    9. Context-aware feature extraction from previous hidden states
+//
+//  Tree Representation (all int arrays — homogeneous types):
+//    tree = [tokens, parents, depths, scores_i]
+//      tokens[i]   : token at node i
+//      parents[i]  : parent index (-1 for root)
+//      depths[i]   : tree depth (root = 0)
+//      scores_i[i] : draft confidence * 10000 (int-encoded)
+//    n = len(tokens)
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+//    @hot   — performance critical path
+// ═══════════════════════════════════════════════════════════════════
+
+// ── helpers ──────────────────────────────────────────────────────
+
+fn eag_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn eag_abs_int(x) {
+    if x < 0 { return 0 - x }
+    return x
+}
+
+fn eag_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn eag_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn eag_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn eag_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+fn eag_min_int(a, b) {
+    if a <= b { return a }
+    return b
+}
+
+fn eag_max_int(a, b) {
+    if a >= b { return a }
+    return b
+}
+
+// Score encoding: float -> int (scale by 10000)
+fn eag_score_encode(f) {
+    return to_int(f * 10000.0)
+}
+
+fn eag_score_decode(i) {
+    return to_float(i) / 10000.0
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  1. Context-Aware Feature Extraction
+//
+//  Extracts hidden state features from a context window.
+//  Uses a rolling hash to simulate hidden state representation.
+//  Returns: array of float feature values
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn eag_extract_features(context, window_size) {
+    let n = len(context)
+    let ws = eag_min_int(window_size, n)
+    let start = n - ws
+    let mut features = eag_zeros(ws)
+    let mut h = 2654435761
+    for i in 0..ws {
+        let tok = context[start + i]
+        h = eag_abs_int((h * 31 + tok * 17 + i * 7) % 1000003)
+        features[i] = to_float(h % 1000) / 1000.0
+    }
+    return features
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Feature Concatenation Layer
+//
+//  Concatenates hidden states and token embeddings to produce
+//  draft model input. Eagle-2 uses this fusion for context-aware drafting.
+//
+//  hidden_states: [float] from previous layer
+//  token_embeddings: [float] for current tokens
+//  Returns: concatenated feature vector [float]
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn eag_feature_concat(hidden_states, token_embeddings) {
+    let nh = len(hidden_states)
+    let ne = len(token_embeddings)
+    let total = nh + ne
+    let mut out = eag_zeros(total)
+    for i in 0..nh {
+        out[i] = hidden_states[i]
+    }
+    for i in 0..ne {
+        out[nh + i] = token_embeddings[i]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  2. Lightweight Draft Head (MLP)
+//
+//  A simple 2-layer MLP: input -> hidden -> output logits
+//  Uses deterministic weights derived from input hash for simulation.
+//
+//  features: [float] concatenated features
+//  vocab_size: int output vocabulary size
+//  Returns: [float] draft logits of length vocab_size
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn eag_draft_head(features, vocab_size) {
+    let n = len(features)
+    let mut logits = eag_zeros(vocab_size)
+    for v in 0..vocab_size {
+        let mut score = 0.0
+        for f in 0..n {
+            let w = to_float(eag_abs_int(((v + 1) * 2654435 + (f + 1) * 131543) % 1000003) % 200 - 100) / 100.0
+            score = score + features[f] * w
+        }
+        logits[v] = score
+    }
+    return logits
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Softmax
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn eag_softmax(logits) {
+    let n = len(logits)
+    let mut mx = logits[0]
+    for i in 1..n {
+        if logits[i] > mx { mx = logits[i] }
+    }
+    let mut exps = eag_zeros(n)
+    let mut z = 0.0
+    for i in 0..n {
+        exps[i] = eag_exp(logits[i] - mx)
+        z = z + exps[i]
+    }
+    let mut out = eag_zeros(n)
+    for i in 0..n {
+        out[i] = exps[i] / z
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Argmax
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn eag_argmax(logits) {
+    let n = len(logits)
+    let mut best = 0
+    let mut best_v = logits[0]
+    for i in 1..n {
+        if logits[i] > best_v {
+            best_v = logits[i]
+            best = i
+        }
+    }
+    return best
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Top-k indices from logits
+//
+//  Returns array of k token indices with highest logit values.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn eag_topk(logits, k) {
+    let n = len(logits)
+    let actual_k = eag_min_int(k, n)
+    let mut indices = eag_zeros_int(actual_k)
+    let mut used = eag_zeros_int(n)
+    for ki in 0..actual_k {
+        let mut best = -1
+        let mut best_v = -1.0e30
+        for i in 0..n {
+            if used[i] == 0 {
+                if logits[i] > best_v {
+                    best_v = logits[i]
+                    best = i
+                }
+            }
+        }
+        indices[ki] = best
+        if best >= 0 {
+            used[best] = 1
+        }
+    }
+    return indices
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  3. Tree Attention Mask Builder
+//
+//  Given parent array, builds a mask where mask[i][j] = 1 iff j is
+//  an ancestor of i (including i itself). This enables parallel
+//  verification of all tree paths in one forward pass.
+//
+//  parents: [int] parent indices (-1 for root)
+//  n: number of nodes
+//  Returns: [[int]] n x n attention mask
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn eag_tree_attention_mask(parents, n) {
+    let mut mask = []
+    for i in 0..n {
+        let mut row = eag_zeros_int(n)
+        let mut cur = i
+        let mut steps = 0
+        while cur >= 0 {
+            if steps > n { break }
+            // Rebuild row with cur set to 1 (no complex index assign)
+            let mut nrow = eag_zeros_int(n)
+            for ri in 0..n {
+                if ri == cur {
+                    nrow[ri] = 1
+                } else {
+                    nrow[ri] = row[ri]
+                }
+            }
+            row = nrow
+            cur = parents[cur]
+            steps = steps + 1
+        }
+        mask = mask + [row]
+    }
+    return mask
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Get path from root to a given node
+//
+//  Returns: [int] node indices from root to node
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn eag_path_to_node(parents, node) {
+    let mut path = []
+    let mut cur = node
+    let mut steps = 0
+    let n = len(parents)
+    while cur >= 0 {
+        if steps > n { break }
+        path = [cur] + path
+        cur = parents[cur]
+        steps = steps + 1
+    }
+    return path
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  4. Tree Expand — Generate Candidate Tokens in Tree Structure
+//
+//  Starting from a context, expand a tree of candidate tokens using
+//  the draft head. At each depth, expand top-k children per leaf.
+//
+//  context: [int] current token context
+//  vocab_size: int
+//  max_depth: int tree depth
+//  branch_factor: int children per node (top-k)
+//  feature_window: int context window for feature extraction
+//
+//  Returns: [tokens, parents, depths, scores_i]  (all int arrays)
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn eag_tree_expand(context, vocab_size, max_depth, branch_factor, feature_window) {
+    let root_tok = context[len(context) - 1]
+    let mut tokens = [root_tok]
+    let mut parents = [-1]
+    let mut depths = [0]
+    let mut scores_i = [10000]
+    let mut n = 1
+    let mut current_leaves = [0]
+
+    for d in 1..(max_depth + 1) {
+        let mut next_leaves = []
+        for li in 0..len(current_leaves) {
+            let leaf_idx = current_leaves[li]
+            let path = eag_path_to_node(parents, leaf_idx)
+            let mut ctx = []
+            let ctx_start = eag_max_int(0, len(context) - feature_window)
+            for ci in ctx_start..len(context) {
+                ctx = ctx + [context[ci]]
+            }
+            for pi in 1..len(path) {
+                ctx = ctx + [tokens[path[pi]]]
+            }
+
+            let features = eag_extract_features(ctx, feature_window)
+            let embeddings = eag_extract_features(ctx, eag_min_int(3, len(ctx)))
+            let concat = eag_feature_concat(features, embeddings)
+            let logits = eag_draft_head(concat, vocab_size)
+            let probs = eag_softmax(logits)
+            let topk = eag_topk(logits, branch_factor)
+
+            for ki in 0..len(topk) {
+                let child_tok = topk[ki]
+                tokens = tokens + [child_tok]
+                parents = parents + [leaf_idx]
+                depths = depths + [d]
+                scores_i = scores_i + [eag_score_encode(probs[child_tok])]
+                next_leaves = next_leaves + [n]
+                n = n + 1
+            }
+        }
+        current_leaves = next_leaves
+    }
+
+    return [tokens, parents, depths, scores_i]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  5. Verification — Compare Draft Tokens Against Target Model
+//
+//  target_fn(context) -> token: simulates target model
+//  Verifies each node in the tree by checking if the target model
+//  agrees with the draft token given the same context path.
+//
+//  Returns: [int] verified[i] = 1 if target agrees, 0 otherwise
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn eag_verify_tree(context, tree, target_fn) {
+    let tokens = tree[0]
+    let parents = tree[1]
+    let n = len(tokens)
+    let mut verified = eag_zeros_int(n)
+    verified[0] = 1
+
+    for i in 1..n {
+        let path = eag_path_to_node(parents, i)
+        let mut ctx = []
+        for ci in 0..len(context) {
+            ctx = ctx + [context[ci]]
+        }
+        for pi in 1..(len(path) - 1) {
+            ctx = ctx + [tokens[path[pi]]]
+        }
+        let target_tok = target_fn(ctx)
+        if target_tok == tokens[i] {
+            verified[i] = 1
+        }
+    }
+
+    return verified
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Find the longest accepted path through the tree
+//
+//  Walks from leaves upward, finds the deepest fully-verified path.
+//  Returns: [int] indices of accepted nodes from root to deepest
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn eag_longest_accepted_path(tree, verified) {
+    let tokens = tree[0]
+    let parents = tree[1]
+    let depths = tree[2]
+    let n = len(tokens)
+
+    let mut best_depth = 0
+    let mut best_leaf = 0
+
+    for i in 0..n {
+        if verified[i] == 1 {
+            if depths[i] > best_depth {
+                let path = eag_path_to_node(parents, i)
+                let mut all_ok = true
+                for pi in 0..len(path) {
+                    if verified[path[pi]] == 0 {
+                        all_ok = false
+                    }
+                }
+                if all_ok {
+                    best_depth = depths[i]
+                    best_leaf = i
+                }
+            }
+        }
+    }
+
+    return eag_path_to_node(parents, best_leaf)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Extract accepted tokens from a path
+//
+//  Returns: [int] token values along the accepted path (excluding root)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn eag_accepted_tokens(tree, path) {
+    let tokens = tree[0]
+    let mut result = []
+    for i in 1..len(path) {
+        result = result + [tokens[path[i]]]
+    }
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  6. Top-k Tree Construction from Draft Logits
+//
+//  Given a set of logits for multiple positions, build a tree by
+//  selecting top-k at each level.
+//
+//  all_logits: [[float]] logits at each position
+//  k: int top candidates per level
+//  Returns: [tokens, parents, depths, scores_i]
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn eag_topk_tree_build(all_logits, k) {
+    let num_levels = len(all_logits)
+    let mut tokens = [0]
+    let mut parents = [-1]
+    let mut depths = [0]
+    let mut scores_i = [10000]
+    let mut n = 1
+    let mut current_leaves = [0]
+
+    for level in 0..num_levels {
+        let logits = all_logits[level]
+        let probs = eag_softmax(logits)
+        let topk = eag_topk(logits, k)
+        let mut next_leaves = []
+
+        for li in 0..len(current_leaves) {
+            let parent = current_leaves[li]
+            for ki in 0..len(topk) {
+                let tok = topk[ki]
+                tokens = tokens + [tok]
+                parents = parents + [parent]
+                depths = depths + [level + 1]
+                scores_i = scores_i + [eag_score_encode(probs[tok])]
+                next_leaves = next_leaves + [n]
+                n = n + 1
+            }
+        }
+        current_leaves = next_leaves
+    }
+
+    return [tokens, parents, depths, scores_i]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  7. Multi-Sequence Support (Batch Tree Speculative)
+//
+//  Processes multiple sequences in parallel, each with its own
+//  context and tree expansion.
+//
+//  Returns: [[int]] batch of accepted token arrays
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn eag_batch_speculative(contexts, vocab_size, max_depth, branch_factor, feature_window, target_fn) {
+    let batch_size = len(contexts)
+    let mut results = []
+
+    for b in 0..batch_size {
+        let ctx = contexts[b]
+        let tree = eag_tree_expand(ctx, vocab_size, max_depth, branch_factor, feature_window)
+        let verified = eag_verify_tree(ctx, tree, target_fn)
+        let path = eag_longest_accepted_path(tree, verified)
+        let accepted = eag_accepted_tokens(tree, path)
+        results = results + [accepted]
+    }
+
+    return results
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  8. Acceptance Rate Tracker
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn eag_acceptance_rate(total_drafted, total_accepted) {
+    if total_drafted <= 0 { return 0.0 }
+    return to_float(total_accepted) / to_float(total_drafted)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Dynamic Tree Depth Adjustment
+//
+//  High acceptance -> deeper trees (more speculation)
+//  Low acceptance -> shallower trees (less wasted work)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn eag_adjust_depth(current_depth, acceptance_rate, min_depth, max_depth_limit) {
+    let mut new_depth = current_depth
+    if acceptance_rate > 0.7 {
+        new_depth = current_depth + 1
+    }
+    if acceptance_rate < 0.3 {
+        new_depth = current_depth - 1
+    }
+    if new_depth < min_depth { new_depth = min_depth }
+    if new_depth > max_depth_limit { new_depth = max_depth_limit }
+    return new_depth
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Dynamic Branch Factor Adjustment
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn eag_adjust_branch(current_branch, acceptance_rate, min_branch, max_branch) {
+    let mut new_branch = current_branch
+    if acceptance_rate > 0.8 {
+        new_branch = current_branch + 1
+    }
+    if acceptance_rate < 0.2 {
+        new_branch = current_branch - 1
+    }
+    if new_branch < min_branch { new_branch = min_branch }
+    if new_branch > max_branch { new_branch = max_branch }
+    return new_branch
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Full Eagle-2 Speculative Decode Step
+//
+//  Returns 4 separate values via array of ints:
+//    [n_drafted, n_accepted]
+//  Plus accepted tokens as separate return via wrapper.
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn eag_speculative_step_tokens(context, vocab_size, max_depth, branch_factor, feature_window, target_fn) {
+    let tree = eag_tree_expand(context, vocab_size, max_depth, branch_factor, feature_window)
+    let verified = eag_verify_tree(context, tree, target_fn)
+    let path = eag_longest_accepted_path(tree, verified)
+    let accepted = eag_accepted_tokens(tree, path)
+    return accepted
+}
+
+@hot
+fn eag_speculative_step_stats(context, vocab_size, max_depth, branch_factor, feature_window, target_fn) {
+    let tree = eag_tree_expand(context, vocab_size, max_depth, branch_factor, feature_window)
+    let n_nodes = len(tree[0])
+    let verified = eag_verify_tree(context, tree, target_fn)
+    let path = eag_longest_accepted_path(tree, verified)
+    let accepted = eag_accepted_tokens(tree, path)
+    let n_drafted = n_nodes - 1
+    let n_accepted = len(accepted)
+    return [n_drafted, n_accepted]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Multi-round speculative generation
+//
+//  Returns 4 separate values via wrapper calls:
+//    generated tokens, total_drafted, total_accepted, rounds
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn eag_generate_tokens(context, vocab_size, max_tokens, init_depth, init_branch, feature_window, target_fn) {
+    let mut ctx = []
+    for i in 0..len(context) { ctx = ctx + [context[i]] }
+    let mut generated = []
+    let mut total_drafted = 0
+    let mut total_accepted = 0
+    let mut rounds = 0
+    let mut depth = init_depth
+    let mut branch = init_branch
+
+    while len(generated) < max_tokens {
+        let accepted = eag_speculative_step_tokens(ctx, vocab_size, depth, branch, feature_window, target_fn)
+        let stats = eag_speculative_step_stats(ctx, vocab_size, depth, branch, feature_window, target_fn)
+        let drafted = stats[0]
+        let acc = stats[1]
+
+        total_drafted = total_drafted + drafted
+        total_accepted = total_accepted + acc
+        rounds = rounds + 1
+
+        if len(accepted) == 0 {
+            let target_tok = target_fn(ctx)
+            generated = generated + [target_tok]
+            ctx = ctx + [target_tok]
+        } else {
+            for i in 0..len(accepted) {
+                if len(generated) < max_tokens {
+                    generated = generated + [accepted[i]]
+                    ctx = ctx + [accepted[i]]
+                }
+            }
+        }
+
+        let rate = eag_acceptance_rate(total_drafted, total_accepted)
+        depth = eag_adjust_depth(depth, rate, 1, 6)
+        branch = eag_adjust_branch(branch, rate, 1, 5)
+
+        if rounds > max_tokens { break }
+    }
+
+    return generated
+}
+
+fn eag_generate_stats(context, vocab_size, max_tokens, init_depth, init_branch, feature_window, target_fn) {
+    let mut ctx = []
+    for i in 0..len(context) { ctx = ctx + [context[i]] }
+    let mut total_drafted = 0
+    let mut total_accepted = 0
+    let mut rounds = 0
+    let mut n_generated = 0
+    let mut depth = init_depth
+    let mut branch = init_branch
+
+    while n_generated < max_tokens {
+        let accepted = eag_speculative_step_tokens(ctx, vocab_size, depth, branch, feature_window, target_fn)
+        let stats = eag_speculative_step_stats(ctx, vocab_size, depth, branch, feature_window, target_fn)
+
+        total_drafted = total_drafted + stats[0]
+        total_accepted = total_accepted + stats[1]
+        rounds = rounds + 1
+
+        if len(accepted) == 0 {
+            let target_tok = target_fn(ctx)
+            ctx = ctx + [target_tok]
+            n_generated = n_generated + 1
+        } else {
+            for i in 0..len(accepted) {
+                if n_generated < max_tokens {
+                    ctx = ctx + [accepted[i]]
+                    n_generated = n_generated + 1
+                }
+            }
+        }
+
+        let rate = eag_acceptance_rate(total_drafted, total_accepted)
+        depth = eag_adjust_depth(depth, rate, 1, 6)
+        branch = eag_adjust_branch(branch, rate, 1, 5)
+
+        if rounds > max_tokens { break }
+    }
+
+    return [total_drafted, total_accepted, rounds]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Tree Score — sum of draft confidence scores along a path
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn eag_path_score(tree, path) {
+    let scores_i = tree[3]
+    let mut total = 0
+    for i in 0..len(path) {
+        total = total + scores_i[path[i]]
+    }
+    return eag_score_decode(total)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Tree Statistics — count nodes at each depth
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn eag_tree_depth_counts(tree) {
+    let depths = tree[2]
+    let n = len(depths)
+    let mut max_d = 0
+    for i in 0..n {
+        if depths[i] > max_d { max_d = depths[i] }
+    }
+    let mut counts = eag_zeros_int(max_d + 1)
+    for i in 0..n {
+        let d = depths[i]
+        counts[d] = counts[d] + 1
+    }
+    return counts
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Count verified nodes
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn eag_count_verified(verified) {
+    let mut c = 0
+    for i in 0..len(verified) {
+        if verified[i] == 1 { c = c + 1 }
+    }
+    return c
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Tree Leaf Nodes — nodes with no children
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn eag_tree_leaves(tree) {
+    let parents = tree[1]
+    let n = len(parents)
+    let mut is_parent = eag_zeros_int(n)
+    for i in 0..n {
+        let p = parents[i]
+        if p >= 0 { is_parent[p] = 1 }
+    }
+    let mut leaves = []
+    for i in 0..n {
+        if is_parent[i] == 0 { leaves = leaves + [i] }
+    }
+    return leaves
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Mask density — fraction of 1s in attention mask
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn eag_mask_density(mask, n) {
+    let mut ones = 0
+    let total = n * n
+    for i in 0..n {
+        for j in 0..n {
+            if mask[i][j] == 1 { ones = ones + 1 }
+        }
+    }
+    if total == 0 { return 0.0 }
+    return to_float(ones) / to_float(total)
+}
+
+println("[eagle_speculative] loaded — Eagle-2 context-aware speculative decoding with tree structure")

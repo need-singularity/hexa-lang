@@ -1,0 +1,788 @@
+// ===================================================================
+//  self/ml/tool_use_agent.hexa — Tool Use Agent (ML #154)
+//
+//  Function calling, parsing, and execution loop agent.
+//
+//  Pipeline:
+//    1. Register tools with name, description, parameter schema
+//    2. Parse model output to extract function name and arguments
+//    3. Extract key=value argument pairs from function call string
+//    4. Execute tool function in sandbox, capture result
+//    5. Format tool results for model consumption
+//    6. Multi-turn loop: model -> parse -> execute -> format -> model
+//    7. Retry failed tool calls with error feedback
+//    8. Score and rank tools for relevance to query
+//
+//  Data structures (all #{} maps):
+//    Tool     = { name, description, params: [{name, type, desc, required}] }
+//    Registry = { tools: #{name -> Tool}, names: [name...] }
+//    ArgMap   = #{key -> value_string}
+//    CallResult = { tool, args, result, status, error }
+//    Turn     = { role, content, tool_call, tool_result }
+//    Session  = { query, turns: [Turn], registry, status, answer, retries }
+//
+//  Public API:
+//    tua_param(name, type_str, desc, required)      -> Param map
+//    tua_tool(name, desc, params)                    -> Tool map
+//    tua_registry()                                  -> empty Registry
+//    tua_register(reg, tool)                         -> Registry with tool
+//    tua_unregister(reg, name)                       -> Registry without tool
+//    tua_lookup(reg, name)                           -> Tool or empty #{}
+//    tua_has_tool(reg, name)                         -> bool
+//    tua_list_tools(reg)                             -> [name...]
+//    tua_registry_size(reg)                          -> int
+//    tua_parse_call(text)                            -> {name, args_str}
+//    tua_extract_args(args_str)                      -> #{key -> val}
+//    tua_execute(reg, executor, name, args)          -> CallResult
+//    tua_format_result(call_result)                  -> string
+//    tua_format_tool_list(reg)                       -> string
+//    tua_format_prompt(query, turns, reg)            -> string
+//    tua_turn_new(role, content)                     -> Turn
+//    tua_turn_tool_call(name, args_str)              -> Turn
+//    tua_turn_tool_result(name, result_str, status)  -> Turn
+//    tua_session_new(query, reg)                     -> Session
+//    tua_session_add_turn(session, turn)             -> Session
+//    tua_session_len(session)                        -> int
+//    tua_session_last(session)                       -> Turn or empty
+//    tua_session_set_answer(session, answer)         -> Session
+//    tua_run_loop(query, reg, gen_fn, exec_fn, max_turns)   -> Session
+//    tua_run_with_retry(query, reg, gen_fn, exec_fn, max_turns, max_retries) -> Session
+//    tua_score_tool(tool, query)                     -> float
+//    tua_rank_tools(reg, query)                      -> [{name, score}...]
+//    tua_select_top_tools(reg, query, k)             -> [name...]
+//    tua_session_to_string(session)                  -> string
+//    tua_session_stats(session)                      -> stats map
+//
+//  Conventions:
+//    - Call format: <call>name(key=value, ...)</call>
+//    - Done signal: <done>answer</done>
+//    - Uses #{} map literals (HX3)
+//    - No semicolons (P1)
+//    - Flag-variable break pattern (no break inside if)
+// ===================================================================
+
+// ===================================================================
+//  String helpers (prefixed _tua_ to avoid collision)
+// ===================================================================
+
+fn _tua_index_of(s, needle, start) {
+    let sn = len(s)
+    let nn = len(needle)
+    if nn == 0 { return start }
+    if nn > sn { return 0 - 1 }
+    let limit = sn - nn
+    let mut i = start
+    while i <= limit {
+        let mut j = 0
+        let mut ok = true
+        while j < nn {
+            if s[i + j] != needle[j] {
+                ok = false
+                j = nn
+            }
+            j = j + 1
+        }
+        if ok { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn _tua_contains(s, needle) {
+    return _tua_index_of(s, needle, 0) >= 0
+}
+
+fn _tua_extract_between(text, open_tag, close_tag) {
+    let ot_len = len(open_tag)
+    let start = _tua_index_of(text, open_tag, 0)
+    if start < 0 { return "" }
+    let content_start = start + ot_len
+    let end_pos = _tua_index_of(text, close_tag, content_start)
+    if end_pos < 0 { return "" }
+    return text.substring(content_start, end_pos).trim()
+}
+
+fn _tua_starts_with(s, prefix) {
+    let sn = len(s)
+    let pn = len(prefix)
+    if pn > sn { return false }
+    let sub = s.substring(0, pn)
+    return sub == prefix
+}
+
+fn _tua_to_lower_char(c) {
+    if c == 'A' { return 'a' }
+    if c == 'B' { return 'b' }
+    if c == 'C' { return 'c' }
+    if c == 'D' { return 'd' }
+    if c == 'E' { return 'e' }
+    if c == 'F' { return 'f' }
+    if c == 'G' { return 'g' }
+    if c == 'H' { return 'h' }
+    if c == 'I' { return 'i' }
+    if c == 'J' { return 'j' }
+    if c == 'K' { return 'k' }
+    if c == 'L' { return 'l' }
+    if c == 'M' { return 'm' }
+    if c == 'N' { return 'n' }
+    if c == 'O' { return 'o' }
+    if c == 'P' { return 'p' }
+    if c == 'Q' { return 'q' }
+    if c == 'R' { return 'r' }
+    if c == 'S' { return 's' }
+    if c == 'T' { return 't' }
+    if c == 'U' { return 'u' }
+    if c == 'V' { return 'v' }
+    if c == 'W' { return 'w' }
+    if c == 'X' { return 'x' }
+    if c == 'Y' { return 'y' }
+    if c == 'Z' { return 'z' }
+    return c
+}
+
+fn _tua_to_lower(s) {
+    let n = len(s)
+    let mut out = ""
+    let mut i = 0
+    while i < n {
+        out = out + to_string(_tua_to_lower_char(s[i]))
+        i = i + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  Tool & Param definitions
+// ===================================================================
+
+fn tua_param(name, type_str, description, required) {
+    let p = #{}
+    p["name"] = name
+    p["type"] = type_str
+    p["description"] = description
+    p["required"] = required
+    return p
+}
+
+fn tua_tool(name, description, params) {
+    let t = #{}
+    t["name"] = name
+    t["description"] = description
+    t["params"] = params
+    return t
+}
+
+// ===================================================================
+//  Tool Registry
+// ===================================================================
+
+fn tua_registry() {
+    let reg = #{}
+    reg["tools"] = #{}
+    reg["names"] = []
+    return reg
+}
+
+fn tua_register(reg, tool) {
+    let name = tool["name"]
+    let tools = reg["tools"]
+    tools[name] = tool
+    let mut names = reg["names"]
+    let mut found = false
+    let mut i = 0
+    while i < len(names) {
+        if names[i] == name { found = true }
+        i = i + 1
+    }
+    if found == false {
+        names = names + [name]
+    }
+    let out = #{}
+    out["tools"] = tools
+    out["names"] = names
+    return out
+}
+
+fn tua_unregister(reg, name) {
+    let tools = reg["tools"]
+    let names = reg["names"]
+    let new_tools = #{}
+    let mut new_names = []
+    let mut i = 0
+    while i < len(names) {
+        if names[i] != name {
+            new_names = new_names + [names[i]]
+            new_tools[names[i]] = tools[names[i]]
+        }
+        i = i + 1
+    }
+    let out = #{}
+    out["tools"] = new_tools
+    out["names"] = new_names
+    return out
+}
+
+fn tua_lookup(reg, name) {
+    let tools = reg["tools"]
+    if has_key(tools, name) {
+        return tools[name]
+    }
+    let empty = #{}
+    return empty
+}
+
+fn tua_has_tool(reg, name) {
+    return has_key(reg["tools"], name)
+}
+
+fn tua_list_tools(reg) {
+    return reg["names"]
+}
+
+fn tua_registry_size(reg) {
+    return len(reg["names"])
+}
+
+// ===================================================================
+//  Format tool list as descriptive string
+// ===================================================================
+
+fn tua_format_tool_list(reg) {
+    let names = reg["names"]
+    let tools = reg["tools"]
+    let n = len(names)
+    let mut parts = []
+    let mut i = 0
+    while i < n {
+        let t = tools[names[i]]
+        let mut desc = t["name"] + "("
+        let params = t["params"]
+        let pn = len(params)
+        let mut pi = 0
+        while pi < pn {
+            if pi > 0 { desc = desc + ", " }
+            desc = desc + params[pi]["name"] + ":" + params[pi]["type"]
+            pi = pi + 1
+        }
+        desc = desc + ") - " + t["description"]
+        parts = parts + [desc]
+        i = i + 1
+    }
+    return parts.join("\n")
+}
+
+// ===================================================================
+//  Parse function call from model output
+//  Looks for: <call>name(key=val, ...)</call>
+//  Returns map { name, args_str }
+// ===================================================================
+
+fn tua_parse_call(text) {
+    let out = #{}
+    out["name"] = ""
+    out["args_str"] = ""
+
+    let content = _tua_extract_between(text, "<call>", "</call>")
+    if len(content) == 0 { return out }
+
+    // Find opening paren
+    let paren_pos = _tua_index_of(content, "(", 0)
+    if paren_pos < 0 {
+        // No parens, just function name
+        out["name"] = content.trim()
+        return out
+    }
+
+    out["name"] = content.substring(0, paren_pos).trim()
+
+    // Find closing paren
+    let close_paren = _tua_index_of(content, ")", paren_pos)
+    if close_paren < 0 {
+        out["args_str"] = content.substring(paren_pos + 1, len(content)).trim()
+    } else {
+        out["args_str"] = content.substring(paren_pos + 1, close_paren).trim()
+    }
+
+    return out
+}
+
+// ===================================================================
+//  Extract key=value argument pairs from string
+//  Input: "key1=val1, key2=val2"
+//  Returns: #{key1 -> val1, key2 -> val2}
+// ===================================================================
+
+fn tua_extract_args(args_str) {
+    let result = #{}
+    if len(args_str) == 0 { return result }
+
+    let parts = args_str.split(", ")
+    let n = len(parts)
+    let mut i = 0
+    while i < n {
+        let part = parts[i].trim()
+        if len(part) > 0 {
+            let eq_pos = _tua_index_of(part, "=", 0)
+            if eq_pos > 0 {
+                let k = part.substring(0, eq_pos).trim()
+                let v = part.substring(eq_pos + 1, len(part)).trim()
+                result[k] = v
+            }
+        }
+        i = i + 1
+    }
+    return result
+}
+
+// ===================================================================
+//  Parse <done>answer</done> from text
+// ===================================================================
+
+fn tua_parse_done(text) {
+    return _tua_extract_between(text, "<done>", "</done>")
+}
+
+fn tua_is_done(text) {
+    return _tua_contains(text, "<done>")
+}
+
+// ===================================================================
+//  Execute tool function in sandbox, capture result
+//  executor: fn(name, args_map) -> string
+//  Returns CallResult map
+// ===================================================================
+
+fn tua_execute(reg, executor, name, args) {
+    let cr = #{}
+    cr["tool"] = name
+    cr["args"] = args
+    cr["result"] = ""
+    cr["status"] = "error"
+    cr["error"] = ""
+
+    if tua_has_tool(reg, name) == false {
+        cr["error"] = "unknown tool: " + name
+        return cr
+    }
+
+    let res = executor(name, args)
+    cr["result"] = res
+    cr["status"] = "ok"
+    return cr
+}
+
+// ===================================================================
+//  Format tool result for model consumption
+// ===================================================================
+
+fn tua_format_result(call_result) {
+    if call_result["status"] == "ok" {
+        return "<result tool=\"" + call_result["tool"] + "\">" + call_result["result"] + "</result>"
+    }
+    return "<error tool=\"" + call_result["tool"] + "\">" + call_result["error"] + "</error>"
+}
+
+// ===================================================================
+//  Turn — a single conversation turn
+// ===================================================================
+
+fn tua_turn_new(role, content) {
+    let t = #{}
+    t["role"] = role
+    t["content"] = content
+    t["tool_call"] = ""
+    t["tool_result"] = ""
+    return t
+}
+
+fn tua_turn_tool_call(name, args_str) {
+    let t = #{}
+    t["role"] = "assistant"
+    t["content"] = "<call>" + name + "(" + args_str + ")</call>"
+    t["tool_call"] = name
+    t["tool_result"] = ""
+    return t
+}
+
+fn tua_turn_tool_result(name, result_str, status) {
+    let t = #{}
+    t["role"] = "tool"
+    t["content"] = result_str
+    t["tool_call"] = name
+    t["tool_result"] = result_str
+    t["status"] = status
+    return t
+}
+
+// ===================================================================
+//  Session — full conversation state
+// ===================================================================
+
+fn tua_session_new(query, reg) {
+    let s = #{}
+    s["query"] = query
+    s["turns"] = []
+    s["registry"] = reg
+    s["status"] = "running"
+    s["answer"] = ""
+    s["retries"] = 0
+    s["total_calls"] = 0
+    return s
+}
+
+fn tua_session_add_turn(session, turn) {
+    let mut turns = session["turns"]
+    turns = turns + [turn]
+    let out = #{}
+    out["query"] = session["query"]
+    out["turns"] = turns
+    out["registry"] = session["registry"]
+    out["status"] = session["status"]
+    out["answer"] = session["answer"]
+    out["retries"] = session["retries"]
+    out["total_calls"] = session["total_calls"]
+    return out
+}
+
+fn tua_session_len(session) {
+    return len(session["turns"])
+}
+
+fn tua_session_last(session) {
+    let turns = session["turns"]
+    let n = len(turns)
+    if n == 0 {
+        let empty = #{}
+        return empty
+    }
+    return turns[n - 1]
+}
+
+fn tua_session_set_answer(session, answer) {
+    let out = #{}
+    out["query"] = session["query"]
+    out["turns"] = session["turns"]
+    out["registry"] = session["registry"]
+    out["status"] = "finished"
+    out["answer"] = answer
+    out["retries"] = session["retries"]
+    out["total_calls"] = session["total_calls"]
+    return out
+}
+
+fn _tua_session_set_status(session, status) {
+    let out = #{}
+    out["query"] = session["query"]
+    out["turns"] = session["turns"]
+    out["registry"] = session["registry"]
+    out["status"] = status
+    out["answer"] = session["answer"]
+    out["retries"] = session["retries"]
+    out["total_calls"] = session["total_calls"]
+    return out
+}
+
+fn _tua_session_inc_retries(session) {
+    let out = #{}
+    out["query"] = session["query"]
+    out["turns"] = session["turns"]
+    out["registry"] = session["registry"]
+    out["status"] = session["status"]
+    out["answer"] = session["answer"]
+    out["retries"] = session["retries"] + 1
+    out["total_calls"] = session["total_calls"]
+    return out
+}
+
+fn _tua_session_inc_calls(session) {
+    let out = #{}
+    out["query"] = session["query"]
+    out["turns"] = session["turns"]
+    out["registry"] = session["registry"]
+    out["status"] = session["status"]
+    out["answer"] = session["answer"]
+    out["retries"] = session["retries"]
+    out["total_calls"] = session["total_calls"] + 1
+    return out
+}
+
+// ===================================================================
+//  Format prompt — build prompt from session state
+// ===================================================================
+
+fn tua_format_prompt(query, turns, reg) {
+    let mut prompt = "You are an assistant with tool access.\n"
+    prompt = prompt + "Available tools:\n"
+    prompt = prompt + tua_format_tool_list(reg) + "\n\n"
+    prompt = prompt + "To call a tool: <call>tool_name(key=value, ...)</call>\n"
+    prompt = prompt + "When done: <done>final answer</done>\n\n"
+    prompt = prompt + "Query: " + query + "\n\n"
+
+    let n = len(turns)
+    let mut i = 0
+    while i < n {
+        let t = turns[i]
+        let role = t["role"]
+        prompt = prompt + "[" + role + "] " + t["content"] + "\n"
+        i = i + 1
+    }
+
+    return prompt
+}
+
+// ===================================================================
+//  Multi-turn loop: model -> parse -> execute -> format -> model
+//  gen_fn: fn(prompt) -> model_output_string
+//  exec_fn: fn(name, args_map) -> result_string
+// ===================================================================
+
+fn tua_run_loop(query, reg, gen_fn, exec_fn, max_turns) {
+    let mut session = tua_session_new(query, reg)
+    let mut turn_idx = 0
+
+    while turn_idx < max_turns {
+        let prompt = tua_format_prompt(query, session["turns"], reg)
+        let output = gen_fn(prompt)
+
+        // Check if done
+        if tua_is_done(output) {
+            let answer = tua_parse_done(output)
+            let asst_turn = tua_turn_new("assistant", output)
+            session = tua_session_add_turn(session, asst_turn)
+            session = tua_session_set_answer(session, answer)
+            return session
+        }
+
+        // Parse tool call
+        let call = tua_parse_call(output)
+        let call_name = call["name"]
+        let call_args_str = call["args_str"]
+
+        if len(call_name) == 0 {
+            // No valid call or done signal, treat as final answer
+            let asst_turn = tua_turn_new("assistant", output)
+            session = tua_session_add_turn(session, asst_turn)
+            session = tua_session_set_answer(session, output)
+            return session
+        }
+
+        // Record assistant turn
+        let asst_turn = tua_turn_tool_call(call_name, call_args_str)
+        session = tua_session_add_turn(session, asst_turn)
+        session = _tua_session_inc_calls(session)
+
+        // Extract args and execute
+        let args_map = tua_extract_args(call_args_str)
+        let cr = tua_execute(reg, exec_fn, call_name, args_map)
+
+        // Record tool result turn
+        let formatted = tua_format_result(cr)
+        let res_turn = tua_turn_tool_result(call_name, formatted, cr["status"])
+        session = tua_session_add_turn(session, res_turn)
+
+        turn_idx = turn_idx + 1
+    }
+
+    session = _tua_session_set_status(session, "max_turns")
+    return session
+}
+
+// ===================================================================
+//  Retry logic — retry failed tool calls with error feedback
+// ===================================================================
+
+fn tua_run_with_retry(query, reg, gen_fn, exec_fn, max_turns, max_retries) {
+    let mut session = tua_session_new(query, reg)
+    let mut turn_idx = 0
+    let mut consecutive_errors = 0
+
+    while turn_idx < max_turns {
+        let prompt = tua_format_prompt(query, session["turns"], reg)
+        let output = gen_fn(prompt)
+
+        // Check if done
+        if tua_is_done(output) {
+            let answer = tua_parse_done(output)
+            let asst_turn = tua_turn_new("assistant", output)
+            session = tua_session_add_turn(session, asst_turn)
+            session = tua_session_set_answer(session, answer)
+            return session
+        }
+
+        // Parse tool call
+        let call = tua_parse_call(output)
+        let call_name = call["name"]
+        let call_args_str = call["args_str"]
+
+        if len(call_name) == 0 {
+            let asst_turn = tua_turn_new("assistant", output)
+            session = tua_session_add_turn(session, asst_turn)
+            session = tua_session_set_answer(session, output)
+            return session
+        }
+
+        let asst_turn = tua_turn_tool_call(call_name, call_args_str)
+        session = tua_session_add_turn(session, asst_turn)
+        session = _tua_session_inc_calls(session)
+
+        let args_map = tua_extract_args(call_args_str)
+        let cr = tua_execute(reg, exec_fn, call_name, args_map)
+
+        let formatted = tua_format_result(cr)
+        let res_turn = tua_turn_tool_result(call_name, formatted, cr["status"])
+        session = tua_session_add_turn(session, res_turn)
+
+        if cr["status"] == "error" {
+            consecutive_errors = consecutive_errors + 1
+            session = _tua_session_inc_retries(session)
+            if consecutive_errors > max_retries {
+                session = _tua_session_set_status(session, "max_retries")
+                return session
+            }
+        } else {
+            consecutive_errors = 0
+        }
+
+        turn_idx = turn_idx + 1
+    }
+
+    session = _tua_session_set_status(session, "max_turns")
+    return session
+}
+
+// ===================================================================
+//  Tool selection — score and rank tools by relevance to query
+//  Simple keyword overlap scoring
+// ===================================================================
+
+fn _tua_word_overlap(a, b) {
+    let a_lower = _tua_to_lower(a)
+    let b_lower = _tua_to_lower(b)
+    let words_a = a_lower.split(" ")
+    let na = len(words_a)
+    let mut score = 0.0
+    let mut i = 0
+    while i < na {
+        let w = words_a[i]
+        if len(w) > 1 {
+            if _tua_contains(b_lower, w) {
+                score = score + 1.0
+            }
+        }
+        i = i + 1
+    }
+    return score
+}
+
+fn tua_score_tool(tool, query) {
+    let name_score = _tua_word_overlap(query, tool["name"])
+    let desc_score = _tua_word_overlap(query, tool["description"])
+    // Params contribute partial score
+    let params = tool["params"]
+    let pn = len(params)
+    let mut param_score = 0.0
+    let mut i = 0
+    while i < pn {
+        param_score = param_score + _tua_word_overlap(query, params[i]["description"])
+        i = i + 1
+    }
+    return name_score * 2.0 + desc_score + param_score * 0.5
+}
+
+fn tua_rank_tools(reg, query) {
+    let names = reg["names"]
+    let tools = reg["tools"]
+    let n = len(names)
+    let mut ranked = []
+    let mut i = 0
+    while i < n {
+        let tool = tools[names[i]]
+        let score = tua_score_tool(tool, query)
+        let entry = #{}
+        entry["name"] = names[i]
+        entry["score"] = score
+        ranked = ranked + [entry]
+        i = i + 1
+    }
+
+    // Simple insertion sort by score descending
+    let rn = len(ranked)
+    let mut si = 1
+    while si < rn {
+        let mut sj = si
+        while sj > 0 {
+            if ranked[sj]["score"] > ranked[sj - 1]["score"] {
+                let tmp = ranked[sj]
+                ranked[sj] = ranked[sj - 1]
+                ranked[sj - 1] = tmp
+            }
+            sj = sj - 1
+        }
+        si = si + 1
+    }
+
+    return ranked
+}
+
+fn tua_select_top_tools(reg, query, k) {
+    let ranked = tua_rank_tools(reg, query)
+    let n = len(ranked)
+    let limit = min(k, n)
+    let mut result = []
+    let mut i = 0
+    while i < limit {
+        result = result + [ranked[i]["name"]]
+        i = i + 1
+    }
+    return result
+}
+
+// ===================================================================
+//  Session serialization
+// ===================================================================
+
+fn tua_session_to_string(session) {
+    let mut out = "Query: " + session["query"] + "\n"
+    let turns = session["turns"]
+    let n = len(turns)
+    let mut i = 0
+    while i < n {
+        let t = turns[i]
+        out = out + "[" + t["role"] + "] " + t["content"] + "\n"
+        i = i + 1
+    }
+    out = out + "Status: " + session["status"] + "\n"
+    out = out + "Answer: " + session["answer"] + "\n"
+    return out
+}
+
+// ===================================================================
+//  Session statistics
+// ===================================================================
+
+fn tua_session_stats(session) {
+    let stats = #{}
+    stats["n_turns"] = len(session["turns"])
+    stats["status"] = session["status"]
+    stats["has_answer"] = len(session["answer"]) > 0
+    stats["retries"] = session["retries"]
+    stats["total_calls"] = session["total_calls"]
+
+    // Count unique tools called
+    let turns = session["turns"]
+    let n = len(turns)
+    let mut tool_set = #{}
+    let mut i = 0
+    while i < n {
+        let tc = turns[i]["tool_call"]
+        if len(tc) > 0 {
+            tool_set[tc] = true
+        }
+        i = i + 1
+    }
+    stats["unique_tools"] = len(keys(tool_set))
+
+    return stats
+}
+
+println("[tool_use_agent] module loaded")

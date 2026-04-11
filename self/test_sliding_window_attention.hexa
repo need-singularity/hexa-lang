@@ -1,0 +1,832 @@
+// ===================================================================
+//  test_sliding_window_attention.hexa — Sliding Window Attention (#130)
+//
+//  Tests (35):
+//    T1  window mask size correct
+//    T2  window mask causal (no future)
+//    T3  window mask respects window size
+//    T4  window mask first token attends only to self
+//    T5  causal window output shape
+//    T6  causal window identity check (self-attention)
+//    T7  causal window with W=1 (only self)
+//    T8  causal window respects locality
+//    T9  dilated mask shape
+//    T10 dilated mask dilation=1 same as normal window
+//    T11 dilated mask dilation=2 effective field larger
+//    T12 dilated window output shape
+//    T13 global mask: global token attends to all prior
+//    T14 global mask: non-global token attends to global tokens
+//    T15 global mask: non-global tokens do not attend to each other
+//    T16 combine masks OR semantics
+//    T17 local+global attention output shape
+//    T18 masked attention output shape
+//    T19 variable window: get_layer_window returns correct
+//    T20 variable window: clamp out of bounds
+//    T21 linear schedule monotonically increasing
+//    T22 exponential schedule doubles each layer
+//    T23 per-layer attention output shape
+//    T24 chunked attention output shape
+//    T25 chunked attention first token matches non-chunked
+//    T26 KV cache create empty
+//    T27 KV cache append grows size
+//    T28 KV cache eviction limits to window
+//    T29 KV cache attend returns correct dim
+//    T30 KV cache decode output shape
+//    T31 ERF uniform formula correct
+//    T32 ERF variable formula correct
+//    T33 ERF dilated formula correct
+//    T34 mask row count accuracy
+//    T35 mask total nonzero accuracy
+//
+//  Run: cargo run --release -- self/test_sliding_window_attention.hexa
+// ===================================================================
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn approx(a, b, eps) {
+    return fabs(a - b) < eps
+}
+
+// ── inlined from sliding_window_attention.hexa ─────────────────
+
+fn swa_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn swa_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+fn swa_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn swa_abs_int(x) {
+    if x < 0 { return 0 - x }
+    return x
+}
+
+fn swa_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 { g = (g + x / g) / 2.0 }
+    return g
+}
+
+fn swa_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn swa_min(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn swa_max(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn swa_min_int(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn swa_max_int(a, b) {
+    if a > b { return a }
+    return b
+}
+
+// ── 1. Window Mask Builder ──
+
+fn swa_build_window_mask(seq_len, window_size) {
+    let mut mask = []
+    for i in 0..seq_len {
+        let mut row = swa_zeros(seq_len)
+        let start = swa_max_int(0, i - window_size + 1)
+        for j in start..(i + 1) {
+            row[j] = 1.0
+        }
+        mask = mask + [row]
+    }
+    return mask
+}
+
+// ── 2. Causal Sliding Window ──
+
+fn swa_causal_window(queries, keys, values, window_size) {
+    let seq_len = len(queries)
+    if seq_len == 0 { return [] }
+    let dim = len(queries[0])
+    let scale = 1.0 / swa_sqrt(to_float(dim))
+    let mut output = []
+
+    for i in 0..seq_len {
+        let start = swa_max_int(0, i - window_size + 1)
+        let end = i + 1
+        let window_len = end - start
+        let mut scores = swa_zeros(window_len)
+        for widx in 0..window_len {
+            let j = start + widx
+            let mut dot = 0.0
+            for d in 0..dim {
+                dot = dot + queries[i][d] * keys[j][d]
+            }
+            scores[widx] = dot * scale
+        }
+        let mut mx = scores[0]
+        for widx in 1..window_len {
+            if scores[widx] > mx { mx = scores[widx] }
+        }
+        let mut exps = swa_zeros(window_len)
+        let mut z = 0.0
+        for widx in 0..window_len {
+            exps[widx] = swa_exp(scores[widx] - mx)
+            z = z + exps[widx]
+        }
+        if z < 1.0e-12 { z = 1.0e-12 }
+        let mut out_vec = swa_zeros(dim)
+        for widx in 0..window_len {
+            let w = exps[widx] / z
+            let j = start + widx
+            for d in 0..dim {
+                out_vec[d] = out_vec[d] + w * values[j][d]
+            }
+        }
+        output = output + [out_vec]
+    }
+    return output
+}
+
+// ── 3. Dilated Sliding Window ──
+
+fn swa_build_dilated_mask(seq_len, window_size, dilation) {
+    let mut mask = []
+    for i in 0..seq_len {
+        let mut row = swa_zeros(seq_len)
+        let mut count = 0
+        let mut j = i
+        while j >= 0 {
+            if count < window_size {
+                row[j] = 1.0
+                count = count + 1
+            }
+            j = j - dilation
+        }
+        mask = mask + [row]
+    }
+    return mask
+}
+
+fn swa_dilated_window(queries, keys, values, window_size, dilation) {
+    let seq_len = len(queries)
+    if seq_len == 0 { return [] }
+    let dim = len(queries[0])
+    let scale = 1.0 / swa_sqrt(to_float(dim))
+    let mut output = []
+
+    for i in 0..seq_len {
+        let mut positions = []
+        let mut count = 0
+        let mut j = i
+        while j >= 0 {
+            if count < window_size {
+                positions = positions + [j]
+                count = count + 1
+            }
+            j = j - dilation
+        }
+        let n_pos = len(positions)
+        if n_pos == 0 {
+            output = output + [swa_zeros(dim)]
+            continue
+        }
+        let mut scores = swa_zeros(n_pos)
+        for pidx in 0..n_pos {
+            let pj = positions[pidx]
+            let mut dot = 0.0
+            for d in 0..dim {
+                dot = dot + queries[i][d] * keys[pj][d]
+            }
+            scores[pidx] = dot * scale
+        }
+        let mut mx = scores[0]
+        for pidx in 1..n_pos {
+            if scores[pidx] > mx { mx = scores[pidx] }
+        }
+        let mut exps = swa_zeros(n_pos)
+        let mut z = 0.0
+        for pidx in 0..n_pos {
+            exps[pidx] = swa_exp(scores[pidx] - mx)
+            z = z + exps[pidx]
+        }
+        if z < 1.0e-12 { z = 1.0e-12 }
+        let mut out_vec = swa_zeros(dim)
+        for pidx in 0..n_pos {
+            let w = exps[pidx] / z
+            let pj = positions[pidx]
+            for d in 0..dim {
+                out_vec[d] = out_vec[d] + w * values[pj][d]
+            }
+        }
+        output = output + [out_vec]
+    }
+    return output
+}
+
+// ── 4. Global Tokens ──
+
+fn swa_build_global_mask(seq_len, global_indices) {
+    let mut mask = []
+    let mut is_global = swa_zeros_int(seq_len)
+    let ng = len(global_indices)
+    for gi in 0..ng {
+        let idx = global_indices[gi]
+        if idx >= 0 {
+            if idx < seq_len {
+                is_global[idx] = 1
+            }
+        }
+    }
+    for i in 0..seq_len {
+        let mut row = swa_zeros(seq_len)
+        if is_global[i] == 1 {
+            for j in 0..(i + 1) {
+                row[j] = 1.0
+            }
+        } else {
+            for j in 0..(i + 1) {
+                if is_global[j] == 1 {
+                    row[j] = 1.0
+                }
+            }
+        }
+        mask = mask + [row]
+    }
+    return mask
+}
+
+// ── 5. Combine Masks ──
+
+fn swa_combine_masks(local_mask, global_mask) {
+    let seq_len = len(local_mask)
+    let mut combined = []
+    for i in 0..seq_len {
+        let mut row = swa_zeros(seq_len)
+        for j in 0..seq_len {
+            if local_mask[i][j] > 0.5 {
+                row[j] = 1.0
+            } else {
+                if global_mask[i][j] > 0.5 {
+                    row[j] = 1.0
+                }
+            }
+        }
+        combined = combined + [row]
+    }
+    return combined
+}
+
+fn swa_masked_attention(queries, keys, values, mask) {
+    let seq_len = len(queries)
+    if seq_len == 0 { return [] }
+    let dim = len(queries[0])
+    let scale = 1.0 / swa_sqrt(to_float(dim))
+    let neg_inf = -1.0e9
+    let mut output = []
+
+    for i in 0..seq_len {
+        let mut scores = swa_zeros(seq_len)
+        for j in 0..seq_len {
+            if mask[i][j] > 0.5 {
+                let mut dot = 0.0
+                for d in 0..dim {
+                    dot = dot + queries[i][d] * keys[j][d]
+                }
+                scores[j] = dot * scale
+            } else {
+                scores[j] = neg_inf
+            }
+        }
+        let mut mx = neg_inf
+        for j in 0..seq_len {
+            if scores[j] > mx { mx = scores[j] }
+        }
+        let mut exps = swa_zeros(seq_len)
+        let mut z = 0.0
+        for j in 0..seq_len {
+            exps[j] = swa_exp(scores[j] - mx)
+            z = z + exps[j]
+        }
+        if z < 1.0e-12 { z = 1.0e-12 }
+        let mut out_vec = swa_zeros(dim)
+        for j in 0..seq_len {
+            let w = exps[j] / z
+            for d in 0..dim {
+                out_vec[d] = out_vec[d] + w * values[j][d]
+            }
+        }
+        output = output + [out_vec]
+    }
+    return output
+}
+
+fn swa_local_global_attention(queries, keys, values, window_size, global_indices) {
+    let seq_len = len(queries)
+    let local_mask = swa_build_window_mask(seq_len, window_size)
+    let global_mask = swa_build_global_mask(seq_len, global_indices)
+    let combined = swa_combine_masks(local_mask, global_mask)
+    return swa_masked_attention(queries, keys, values, combined)
+}
+
+// ── 6. Variable Window ──
+
+fn swa_get_layer_window(layer_windows, layer_idx) {
+    let n = len(layer_windows)
+    if layer_idx < 0 { return layer_windows[0] }
+    if layer_idx >= n { return layer_windows[n - 1] }
+    return layer_windows[layer_idx]
+}
+
+fn swa_linear_window_schedule(n_layers, min_window, max_window) {
+    let mut schedule = []
+    if n_layers <= 1 {
+        return [min_window]
+    }
+    for l in 0..n_layers {
+        let frac = to_float(l) / to_float(n_layers - 1)
+        let w = min_window + to_int(frac * to_float(max_window - min_window))
+        schedule = schedule + [w]
+    }
+    return schedule
+}
+
+fn swa_exponential_window_schedule(n_layers, base_window) {
+    let mut schedule = []
+    for l in 0..n_layers {
+        let mut w = base_window
+        for _p in 0..l { w = w * 2 }
+        schedule = schedule + [w]
+    }
+    return schedule
+}
+
+fn swa_per_layer_attention(queries, keys, values, layer_windows, layer_idx) {
+    let w = swa_get_layer_window(layer_windows, layer_idx)
+    return swa_causal_window(queries, keys, values, w)
+}
+
+// ── 7. Chunked Computation ──
+
+fn swa_chunked_attention(queries, keys, values, window_size, chunk_size) {
+    let seq_len = len(queries)
+    if seq_len == 0 { return [] }
+    let dim = len(queries[0])
+    let overlap = window_size - 1
+    let stride = chunk_size - overlap
+    let effective_stride = swa_max_int(stride, 1)
+    let mut output = []
+    for _i in 0..seq_len { output = output + [swa_zeros(dim)] }
+    let mut pos = 0
+    while pos < seq_len {
+        let chunk_end = swa_min_int(pos + chunk_size, seq_len)
+        let actual_chunk = chunk_end - pos
+        let mut chunk_q = []
+        let mut chunk_k = []
+        let mut chunk_v = []
+        for ci in 0..actual_chunk {
+            chunk_q = chunk_q + [queries[pos + ci]]
+            chunk_k = chunk_k + [keys[pos + ci]]
+            chunk_v = chunk_v + [values[pos + ci]]
+        }
+        let chunk_out = swa_causal_window(chunk_q, chunk_k, chunk_v, window_size)
+        if pos > 0 {
+            let skip = swa_min_int(overlap, actual_chunk)
+            for ci in skip..actual_chunk {
+                let global_idx = pos + ci
+                if global_idx < seq_len {
+                    output[global_idx] = chunk_out[ci]
+                }
+            }
+        } else {
+            for ci in 0..actual_chunk {
+                output[ci] = chunk_out[ci]
+            }
+        }
+        pos = pos + effective_stride
+    }
+    return output
+}
+
+// ── 8. KV Cache ──
+
+fn swa_kv_cache_create() {
+    return [[], []]
+}
+
+fn swa_kv_cache_size(cache) {
+    return len(cache[0])
+}
+
+fn swa_kv_cache_append(cache, new_key, new_value, window_size) {
+    let mut cached_keys = cache[0] + [new_key]
+    let mut cached_vals = cache[1] + [new_value]
+    let n = len(cached_keys)
+    if n > window_size {
+        let drop_count = n - window_size
+        let mut new_keys = []
+        let mut new_vals = []
+        for i in drop_count..n {
+            new_keys = new_keys + [cached_keys[i]]
+            new_vals = new_vals + [cached_vals[i]]
+        }
+        cached_keys = new_keys
+        cached_vals = new_vals
+    }
+    return [cached_keys, cached_vals]
+}
+
+fn swa_kv_cache_attend(cache, query) {
+    let cached_keys = cache[0]
+    let cached_vals = cache[1]
+    let n = len(cached_keys)
+    if n == 0 { return query }
+    let dim = len(query)
+    let scale = 1.0 / swa_sqrt(to_float(dim))
+    let mut scores = swa_zeros(n)
+    for j in 0..n {
+        let mut dot = 0.0
+        for d in 0..dim {
+            dot = dot + query[d] * cached_keys[j][d]
+        }
+        scores[j] = dot * scale
+    }
+    let mut mx = scores[0]
+    for j in 1..n {
+        if scores[j] > mx { mx = scores[j] }
+    }
+    let mut exps = swa_zeros(n)
+    let mut z = 0.0
+    for j in 0..n {
+        exps[j] = swa_exp(scores[j] - mx)
+        z = z + exps[j]
+    }
+    if z < 1.0e-12 { z = 1.0e-12 }
+    let mut out = swa_zeros(dim)
+    for j in 0..n {
+        let w = exps[j] / z
+        for d in 0..dim {
+            out[d] = out[d] + w * cached_vals[j][d]
+        }
+    }
+    return out
+}
+
+fn swa_kv_cache_decode(queries, keys, values, window_size) {
+    let seq_len = len(queries)
+    let mut cache = swa_kv_cache_create()
+    let mut output = []
+    for i in 0..seq_len {
+        cache = swa_kv_cache_append(cache, keys[i], values[i], window_size)
+        let out = swa_kv_cache_attend(cache, queries[i])
+        output = output + [out]
+    }
+    return output
+}
+
+// ── 9. Effective Receptive Field ──
+
+fn swa_erf_uniform(n_layers, window_size) {
+    return 1 + n_layers * (window_size - 1)
+}
+
+fn swa_erf_variable(layer_windows) {
+    let n = len(layer_windows)
+    let mut erf = 1
+    for i in 0..n {
+        erf = erf + layer_windows[i] - 1
+    }
+    return erf
+}
+
+fn swa_erf_dilated(layer_windows, layer_dilations) {
+    let n = len(layer_windows)
+    let mut erf = 1
+    for i in 0..n {
+        erf = erf + (layer_windows[i] - 1) * layer_dilations[i]
+    }
+    return erf
+}
+
+// ── Utility ──
+
+fn swa_mask_row_count(mask, row_idx) {
+    let row = mask[row_idx]
+    let n = len(row)
+    let mut count = 0
+    for j in 0..n {
+        if row[j] > 0.5 { count = count + 1 }
+    }
+    return count
+}
+
+fn swa_mask_total_nonzero(mask) {
+    let seq_len = len(mask)
+    let mut total = 0
+    for i in 0..seq_len {
+        total = total + swa_mask_row_count(mask, i)
+    }
+    return total
+}
+
+// ===================================================================
+//  Test data: small 6-token sequence with dim=4
+// ===================================================================
+let SEQ = 6
+let DIM = 4
+
+// Generate deterministic test QKV
+fn make_test_vec(idx, offset) {
+    let mut v = []
+    for d in 0..DIM {
+        let val = to_float((idx * 7 + d * 3 + offset) % 13) / 13.0
+        v = v + [val]
+    }
+    return v
+}
+
+let mut test_queries = []
+let mut test_keys = []
+let mut test_values = []
+for i in 0..SEQ {
+    test_queries = test_queries + [make_test_vec(i, 0)]
+    test_keys = test_keys + [make_test_vec(i, 5)]
+    test_values = test_values + [make_test_vec(i, 10)]
+}
+
+// ===================================================================
+//  TESTS
+// ===================================================================
+
+// ── T1: window mask size correct ──
+let mask1 = swa_build_window_mask(SEQ, 3)
+check("T1 window mask rows = seq_len", len(mask1) == SEQ)
+check("T1b window mask cols = seq_len", len(mask1[0]) == SEQ)
+
+// ── T2: window mask causal (no future) ──
+let mut causal_ok = true
+for i in 0..SEQ {
+    for j in (i + 1)..SEQ {
+        if mask1[i][j] > 0.5 { causal_ok = false }
+    }
+}
+check("T2 window mask causal (no future)", causal_ok)
+
+// ── T3: window mask respects window size ──
+// For W=3, row i should have min(i+1, 3) nonzero entries
+let mut w3_ok = true
+for i in 0..SEQ {
+    let expected = swa_min_int(i + 1, 3)
+    let actual = swa_mask_row_count(mask1, i)
+    if actual != expected { w3_ok = false }
+}
+check("T3 window mask respects W=3", w3_ok)
+
+// ── T4: first token only attends to self ──
+let row0_count = swa_mask_row_count(mask1, 0)
+check("T4 first token attends only to self", row0_count == 1)
+
+// ── T5: causal window output shape ──
+let cw_out = swa_causal_window(test_queries, test_keys, test_values, 3)
+check("T5 causal window output len = seq_len", len(cw_out) == SEQ)
+check("T5b causal window output dim = DIM", len(cw_out[0]) == DIM)
+
+// ── T6: causal window with identity (Q=K=V) sums to ~V ──
+let mut id_vecs = []
+for i in 0..4 {
+    let mut v = swa_zeros(DIM)
+    v[i] = 1.0
+    id_vecs = id_vecs + [v]
+}
+let id_out = swa_causal_window(id_vecs, id_vecs, id_vecs, 4)
+// last token should be weighted avg of all 4, roughly uniform
+let mut id_sum = 0.0
+for d in 0..DIM { id_sum = id_sum + id_out[3][d] }
+check("T6 identity output sums to ~1.0", approx(id_sum, 1.0, 0.01))
+
+// ── T7: causal window W=1 (only self) ──
+let w1_out = swa_causal_window(test_queries, test_keys, test_values, 1)
+// With W=1, each token only attends to itself, so output should be values (post softmax on single element)
+let mut w1_ok = true
+for i in 0..SEQ {
+    for d in 0..DIM {
+        if fabs(w1_out[i][d] - test_values[i][d]) > 0.01 { w1_ok = false }
+    }
+}
+check("T7 W=1 output equals values", w1_ok)
+
+// ── T8: causal window locality ──
+// With W=2, token 0 only sees self, token 5 only sees 4 and 5
+let w2_mask = swa_build_window_mask(SEQ, 2)
+check("T8 W=2 last row has 2 entries", swa_mask_row_count(w2_mask, SEQ - 1) == 2)
+
+// ── T9: dilated mask shape ──
+let dmask = swa_build_dilated_mask(8, 3, 2)
+check("T9 dilated mask rows = 8", len(dmask) == 8)
+check("T9b dilated mask cols = 8", len(dmask[0]) == 8)
+
+// ── T10: dilated mask dilation=1 same as normal window ──
+let dmask1 = swa_build_dilated_mask(SEQ, 3, 1)
+let nmask = swa_build_window_mask(SEQ, 3)
+let mut d1_same = true
+for i in 0..SEQ {
+    for j in 0..SEQ {
+        if fabs(dmask1[i][j] - nmask[i][j]) > 0.01 { d1_same = false }
+    }
+}
+check("T10 dilated d=1 same as normal window", d1_same)
+
+// ── T11: dilated mask dilation=2 covers larger field ──
+// For token 7 with W=3, d=2: attends to 7, 5, 3 -> span of 5
+// Normal W=3: attends to 7, 6, 5 -> span of 3
+let d2_mask = swa_build_dilated_mask(8, 3, 2)
+// row 7: should have entries at 7, 5, 3
+let mut d2_has_7 = d2_mask[7][7] > 0.5
+let mut d2_has_5 = d2_mask[7][5] > 0.5
+let mut d2_has_3 = d2_mask[7][3] > 0.5
+check("T11 dilated d=2 covers positions 7,5,3", d2_has_7 && d2_has_5 && d2_has_3)
+
+// ── T12: dilated window output shape ──
+let dw_out = swa_dilated_window(test_queries, test_keys, test_values, 3, 1)
+check("T12 dilated window output len", len(dw_out) == SEQ)
+check("T12b dilated window output dim", len(dw_out[0]) == DIM)
+
+// ── T13: global mask: global token attends to all prior ──
+let gmask = swa_build_global_mask(SEQ, [0])
+// Token 0 is global, so it attends to position 0 only (causal)
+check("T13 global token 0 attends to self", gmask[0][0] > 0.5)
+
+// ── T14: global mask: non-global token attends to global tokens ──
+// Token 3 should attend to position 0 (the global token)
+check("T14 non-global token 3 attends to global 0", gmask[3][0] > 0.5)
+
+// ── T15: non-global tokens don't attend to each other via global mask ──
+// Token 3 should NOT attend to token 2 in the global mask
+check("T15 non-global tokens dont cross-attend in global mask", gmask[3][2] < 0.5)
+
+// ── T16: combine masks OR semantics ──
+let local_m = swa_build_window_mask(SEQ, 2)
+let global_m = swa_build_global_mask(SEQ, [0])
+let combined_m = swa_combine_masks(local_m, global_m)
+// Token 3: local W=2 gives [2,3], global gives [0]. Combined: [0,2,3]
+check("T16 combined mask: token 3 sees global 0", combined_m[3][0] > 0.5)
+check("T16b combined mask: token 3 sees local 2", combined_m[3][2] > 0.5)
+check("T16c combined mask: token 3 sees self", combined_m[3][3] > 0.5)
+
+// ── T17: local+global attention output shape ──
+let lg_out = swa_local_global_attention(test_queries, test_keys, test_values, 2, [0])
+check("T17 local+global output len", len(lg_out) == SEQ)
+check("T17b local+global output dim", len(lg_out[0]) == DIM)
+
+// ── T18: masked attention output shape ──
+let full_mask = swa_build_window_mask(SEQ, SEQ)
+let ma_out = swa_masked_attention(test_queries, test_keys, test_values, full_mask)
+check("T18 masked attention output len", len(ma_out) == SEQ)
+
+// ── T19: variable window get_layer_window ──
+let lw = [2, 4, 8, 16]
+check("T19 layer 0 window = 2", swa_get_layer_window(lw, 0) == 2)
+check("T19b layer 2 window = 8", swa_get_layer_window(lw, 2) == 8)
+
+// ── T20: variable window clamp out of bounds ──
+check("T20 layer -1 clamps to first", swa_get_layer_window(lw, -1) == 2)
+check("T20b layer 99 clamps to last", swa_get_layer_window(lw, 99) == 16)
+
+// ── T21: linear schedule monotonically increasing ──
+let lin_sched = swa_linear_window_schedule(4, 2, 16)
+check("T21 linear schedule len = 4", len(lin_sched) == 4)
+let mut lin_mono = true
+for i in 1..4 {
+    if lin_sched[i] < lin_sched[i - 1] { lin_mono = false }
+}
+check("T21b linear schedule monotonically increasing", lin_mono)
+check("T21c linear schedule first = min", lin_sched[0] == 2)
+check("T21d linear schedule last = max", lin_sched[3] == 16)
+
+// ── T22: exponential schedule doubles ──
+let exp_sched = swa_exponential_window_schedule(4, 2)
+check("T22 exp schedule len = 4", len(exp_sched) == 4)
+check("T22b exp schedule: 2,4,8,16", exp_sched[0] == 2 && exp_sched[1] == 4 && exp_sched[2] == 8 && exp_sched[3] == 16)
+
+// ── T23: per-layer attention output shape ──
+let pl_out = swa_per_layer_attention(test_queries, test_keys, test_values, lw, 1)
+check("T23 per-layer attention output len", len(pl_out) == SEQ)
+
+// ── T24: chunked attention output shape ──
+let ch_out = swa_chunked_attention(test_queries, test_keys, test_values, 2, 4)
+check("T24 chunked output len = seq_len", len(ch_out) == SEQ)
+check("T24b chunked output dim", len(ch_out[0]) == DIM)
+
+// ── T25: chunked attention first token matches non-chunked ──
+let full_out = swa_causal_window(test_queries, test_keys, test_values, 2)
+let mut t0_match = true
+for d in 0..DIM {
+    if fabs(ch_out[0][d] - full_out[0][d]) > 0.01 { t0_match = false }
+}
+check("T25 chunked first token matches non-chunked", t0_match)
+
+// ── T26: KV cache create empty ──
+let cache0 = swa_kv_cache_create()
+check("T26 KV cache empty keys", len(cache0[0]) == 0)
+check("T26b KV cache empty vals", len(cache0[1]) == 0)
+
+// ── T27: KV cache append grows ──
+let cache1 = swa_kv_cache_append(cache0, [1.0, 0.0], [0.5, 0.5], 4)
+check("T27 KV cache size after 1 append", len(cache1[0]) == 1)
+let cache2 = swa_kv_cache_append(cache1, [0.0, 1.0], [0.3, 0.7], 4)
+check("T27b KV cache size after 2 appends", len(cache2[0]) == 2)
+
+// ── T28: KV cache eviction limits to window ──
+let mut cache_e = swa_kv_cache_create()
+for i in 0..10 {
+    let kv = [to_float(i), to_float(i)]
+    cache_e = swa_kv_cache_append(cache_e, kv, kv, 3)
+}
+check("T28 KV cache eviction: size <= 3", len(cache_e[0]) <= 3)
+check("T28b KV cache eviction: size == 3", len(cache_e[0]) == 3)
+
+// ── T29: KV cache attend returns correct dim ──
+let query_test = [0.5, 0.5]
+let attend_out = swa_kv_cache_attend(cache_e, query_test)
+check("T29 KV cache attend output dim = 2", len(attend_out) == 2)
+
+// ── T30: KV cache decode output shape ──
+let kv_dec = swa_kv_cache_decode(test_queries, test_keys, test_values, 3)
+check("T30 KV cache decode output len", len(kv_dec) == SEQ)
+check("T30b KV cache decode output dim", len(kv_dec[0]) == DIM)
+
+// ── T31: ERF uniform formula ──
+// 4 layers, W=8: ERF = 1 + 4*(8-1) = 29
+check("T31 ERF uniform 4 layers W=8 = 29", swa_erf_uniform(4, 8) == 29)
+check("T31b ERF uniform 1 layer W=1 = 1", swa_erf_uniform(1, 1) == 1)
+
+// ── T32: ERF variable formula ──
+// [4, 8, 16]: ERF = 1 + 3 + 7 + 15 = 26
+check("T32 ERF variable [4,8,16] = 26", swa_erf_variable([4, 8, 16]) == 26)
+
+// ── T33: ERF dilated formula ──
+// windows=[4,4], dilations=[1,2]: ERF = 1 + 3*1 + 3*2 = 10
+check("T33 ERF dilated [4,4] d=[1,2] = 10", swa_erf_dilated([4, 4], [1, 2]) == 10)
+
+// ── T34: mask row count accuracy ──
+let mask34 = swa_build_window_mask(8, 4)
+// Row 7 (last): should have 4 entries (4,5,6,7)
+check("T34 mask row 7 count = 4", swa_mask_row_count(mask34, 7) == 4)
+// Row 1: should have 2 entries (0,1)
+check("T34b mask row 1 count = 2", swa_mask_row_count(mask34, 1) == 2)
+
+// ── T35: mask total nonzero accuracy ──
+// For seq=4, W=2: row0=1, row1=2, row2=2, row3=2 -> total=7
+let mask35 = swa_build_window_mask(4, 2)
+check("T35 total nonzero for seq=4 W=2 = 7", swa_mask_total_nonzero(mask35) == 7)
+
+// ===================================================================
+//  Summary
+// ===================================================================
+println("")
+println("=== sliding_window_attention test summary ===")
+println("PASS: " + str(pass_count))
+println("FAIL: " + str(fail_count))
+println("TOTAL: " + str(pass_count + fail_count))

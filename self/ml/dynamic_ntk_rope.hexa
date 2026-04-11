@@ -1,0 +1,509 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/dynamic_ntk_rope.hexa — Dynamic NTK-aware RoPE
+//
+//  Implements context-length extension via rotary position embeddings:
+//    1. Base RoPE              — standard rotary position embedding
+//    2. Linear interpolation   — scale positions for longer contexts
+//    3. NTK-aware interpolation— adjust base frequency (alpha scaling)
+//    4. Dynamic NTK            — auto-adjust alpha at inference time
+//    5. YaRN (NTK-by-parts)   — per-band interpolation + attn scaling
+//    6. Length scaling factor  — temperature on attention by extension
+//    7. Frequency base adjust  — per-dimension frequency modification
+//    8. Progressive extension  — gradual context increase in training
+//    9. Comparison utility     — perplexity at different lengths/methods
+//
+//  API:
+//    rope_base_freqs(dim, base)             -> [dim/2] frequencies
+//    rope_embed(pos, freqs)                 -> [dim] (cos,sin pairs)
+//    rope_apply(x, cos_sin)                 -> [dim] rotated vector
+//    rope_linear_freqs(dim, base, scale)    -> [dim/2] scaled freqs
+//    rope_ntk_freqs(dim, base, alpha)       -> [dim/2] NTK-aware freqs
+//    rope_dynamic_alpha(seq_len, max_len)   -> float alpha
+//    rope_dynamic_freqs(dim, base, seq_len, max_len) -> [dim/2]
+//    yarn_freqs(dim, base, alpha, beta_fast, beta_slow) -> [dim/2]
+//    yarn_attn_scale(scale_factor)          -> float
+//    rope_length_scale(seq_len, max_len)    -> float temperature
+//    rope_freq_adjust(freqs, adjustments)   -> [dim/2]
+//    rope_progressive_scale(step, warmup, target_scale) -> float
+//    rope_compare_methods(dim, base, seq_len, max_len)  -> results
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects, deterministic
+//    @hot   — called every forward step
+// ═══════════════════════════════════════════════════════════════════
+
+// ── math helpers ────────────────────────────────────────────────
+
+fn ntk_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn ntk_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..40 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn ntk_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..35 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn ntk_log(x) {
+    if x <= 0.0 { return -20.0 }
+    // Newton-Raphson: find y such that exp(y) = x
+    let mut y = 0.0
+    if x > 1.0 { y = 1.0 }
+    if x > 10.0 { y = 2.3 }
+    if x > 100.0 { y = 4.6 }
+    if x > 1000.0 { y = 6.9 }
+    if x > 10000.0 { y = 9.2 }
+    if x < 1.0 { y = -1.0 }
+    if x < 0.1 { y = -2.3 }
+    if x < 0.01 { y = -4.6 }
+    for _i in 0..50 {
+        let ey = ntk_exp(y)
+        if ey < 1.0e-15 { y = y + 1.0 } else {
+            y = y - (ey - x) / ey
+        }
+    }
+    return y
+}
+
+fn ntk_pow(base, exp_val) {
+    if base <= 0.0 { return 0.0 }
+    return ntk_exp(exp_val * ntk_log(base))
+}
+
+fn ntk_sin(x) {
+    let pi = 3.141592653589793
+    let mut v = x
+    // Normalize to [-pi, pi]
+    for _i in 0..20 {
+        if v > pi { v = v - 2.0 * pi }
+        if v < 0.0 - pi { v = v + 2.0 * pi }
+    }
+    // Taylor series
+    let mut result = 0.0
+    let mut term = v
+    for i in 0..15 {
+        result = result + term
+        let n = 2 * i + 2
+        term = 0.0 - term * v * v / to_float(n * (n + 1))
+    }
+    return result
+}
+
+fn ntk_cos(x) {
+    let pi = 3.141592653589793
+    let mut v = x
+    for _i in 0..20 {
+        if v > pi { v = v - 2.0 * pi }
+        if v < 0.0 - pi { v = v + 2.0 * pi }
+    }
+    let mut result = 0.0
+    let mut term = 1.0
+    for i in 0..15 {
+        result = result + term
+        let n = 2 * i + 1
+        term = 0.0 - term * v * v / to_float(n * (n + 1))
+    }
+    return result
+}
+
+fn ntk_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn ntk_min_f(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn ntk_max_f(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn ntk_floor(x) {
+    let i = to_int(x)
+    if to_float(i) > x { return i - 1 }
+    return i
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  1. Base RoPE — standard rotary position embedding
+//
+//  theta_i = base^(-2i/dim) for i in 0..dim/2
+//  For position p, rotation angle = p * theta_i
+//  Apply as: [x_2i * cos(angle) - x_{2i+1} * sin(angle),
+//             x_2i * sin(angle) + x_{2i+1} * cos(angle)]
+// ═══════════════════════════════════════════════════════════════════
+
+// Compute base frequencies: theta_i = 1.0 / (base^(2i/dim))
+@pure
+fn rope_base_freqs(dim, base) {
+    let half = dim / 2
+    let mut freqs = ntk_zeros(half)
+    for i in 0..half {
+        let exponent = 2.0 * to_float(i) / to_float(dim)
+        freqs[i] = 1.0 / ntk_pow(base, exponent)
+    }
+    return freqs
+}
+
+// Compute cos/sin embedding for a given position
+// Returns [cos_0, sin_0, cos_1, sin_1, ...]  (length = dim)
+@pure
+fn rope_embed(pos, freqs) {
+    let half = len(freqs)
+    let dim = half * 2
+    let mut out = ntk_zeros(dim)
+    let p = to_float(pos)
+    for i in 0..half {
+        let angle = p * freqs[i]
+        out[2 * i] = ntk_cos(angle)
+        out[2 * i + 1] = ntk_sin(angle)
+    }
+    return out
+}
+
+// Apply rotary embedding to a vector x given cos/sin pairs
+// x: [dim], cos_sin: [dim] from rope_embed
+@pure @hot
+fn rope_apply(x, cos_sin) {
+    let half = len(x) / 2
+    let mut out = ntk_zeros(len(x))
+    for i in 0..half {
+        let c = cos_sin[2 * i]
+        let s = cos_sin[2 * i + 1]
+        let x0 = x[2 * i]
+        let x1 = x[2 * i + 1]
+        out[2 * i] = x0 * c - x1 * s
+        out[2 * i + 1] = x0 * s + x1 * c
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  2. Linear Position Interpolation (Chen et al. 2023)
+//
+//  Scale positions by factor: pos' = pos / scale_factor
+//  Equivalent to scaling frequencies: freq' = freq / scale_factor
+//  Extends context from L to L * scale_factor
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn rope_linear_freqs(dim, base, scale_factor) {
+    let raw = rope_base_freqs(dim, base)
+    let half = len(raw)
+    let mut freqs = ntk_zeros(half)
+    for i in 0..half {
+        freqs[i] = raw[i] / scale_factor
+    }
+    return freqs
+}
+
+// Embed with linear interpolation: scale position
+@pure
+fn rope_linear_embed(pos, freqs, scale_factor) {
+    let scaled_pos = to_float(pos) / scale_factor
+    let half = len(freqs)
+    let dim = half * 2
+    let mut out = ntk_zeros(dim)
+    for i in 0..half {
+        let angle = scaled_pos * freqs[i]
+        out[2 * i] = ntk_cos(angle)
+        out[2 * i + 1] = ntk_sin(angle)
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  3. NTK-aware Interpolation (bloc97, 2023)
+//
+//  Instead of scaling positions, scale the base frequency:
+//    base' = base * alpha^(dim / (dim - 2))
+//  where alpha = scale_factor
+//  This preserves high-frequency components better than linear.
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn rope_ntk_base(base, alpha, dim) {
+    let exponent = to_float(dim) / (to_float(dim) - 2.0)
+    return base * ntk_pow(alpha, exponent)
+}
+
+@pure
+fn rope_ntk_freqs(dim, base, alpha) {
+    let new_base = rope_ntk_base(base, alpha, dim)
+    return rope_base_freqs(dim, new_base)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  4. Dynamic NTK — auto alpha at inference
+//
+//  At inference, if seq_len > max_trained_len, compute:
+//    alpha = (seq_len / max_trained_len)
+//  Then apply NTK interpolation with that alpha.
+//  If seq_len <= max_trained_len, use standard RoPE.
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn rope_dynamic_alpha(seq_len, max_trained_len) {
+    if seq_len <= max_trained_len { return 1.0 }
+    return to_float(seq_len) / to_float(max_trained_len)
+}
+
+@pure
+fn rope_dynamic_freqs(dim, base, seq_len, max_trained_len) {
+    let alpha = rope_dynamic_alpha(seq_len, max_trained_len)
+    if alpha <= 1.0 {
+        return rope_base_freqs(dim, base)
+    }
+    return rope_ntk_freqs(dim, base, alpha)
+}
+
+// Embed with dynamic NTK: auto-switch based on position
+@pure @hot
+fn rope_dynamic_embed(pos, dim, base, max_trained_len) {
+    let alpha = rope_dynamic_alpha(pos + 1, max_trained_len)
+    let freqs = rope_dynamic_freqs(dim, base, pos + 1, max_trained_len)
+    return rope_embed(pos, freqs)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  5. YaRN — NTK-by-parts with attention scaling (Peng et al. 2023)
+//
+//  Divides dimensions into three bands:
+//    - High freq (low dim idx): no interpolation (ramp = 1)
+//    - Medium freq: linear ramp between no-interp and full-interp
+//    - Low freq (high dim idx): full NTK interpolation (ramp = 0)
+//
+//  beta_fast: wavelength threshold for high-freq band (default 32)
+//  beta_slow: wavelength threshold for low-freq band (default 1)
+//
+//  ramp(i) determines blend: freq_final = (1-ramp)*freq_ntk + ramp*freq_base
+// ═══════════════════════════════════════════════════════════════════
+
+// Compute wavelength for dimension index i
+@pure
+fn yarn_wavelength(dim, base, i) {
+    let pi = 3.141592653589793
+    let exponent = 2.0 * to_float(i) / to_float(dim)
+    let theta = 1.0 / ntk_pow(base, exponent)
+    if theta < 1.0e-15 { return 1.0e15 }
+    return 2.0 * pi / theta
+}
+
+// Ramp function: maps wavelength to [0,1] blend factor
+// 0 = fully NTK-interpolated, 1 = fully original
+@pure
+fn yarn_ramp(wavelength, beta_fast, beta_slow, max_len) {
+    let low = to_float(max_len) / to_float(beta_fast)
+    let high = to_float(max_len) / to_float(beta_slow)
+    if high <= low { return 1.0 }
+    let r = (wavelength - low) / (high - low)
+    if r < 0.0 { return 0.0 }
+    if r > 1.0 { return 1.0 }
+    return r
+}
+
+// YaRN frequencies: blend base and NTK per dimension
+@pure
+fn yarn_freqs(dim, base, alpha, beta_fast, beta_slow, max_len) {
+    let base_f = rope_base_freqs(dim, base)
+    let ntk_f = rope_ntk_freqs(dim, base, alpha)
+    let half = len(base_f)
+    let mut freqs = ntk_zeros(half)
+    for i in 0..half {
+        let wl = yarn_wavelength(dim, base, i)
+        let r = yarn_ramp(wl, beta_fast, beta_slow, max_len)
+        // Blend: ramp=1 -> use original, ramp=0 -> use NTK
+        freqs[i] = (1.0 - r) * ntk_f[i] + r * base_f[i]
+    }
+    return freqs
+}
+
+// YaRN attention scaling factor
+// sqrt(1 + 0.1 * ln(scale_factor))
+@pure
+fn yarn_attn_scale(scale_factor) {
+    if scale_factor <= 1.0 { return 1.0 }
+    return ntk_sqrt(1.0 + 0.1 * ntk_log(scale_factor))
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  6. Length Scaling Factor
+//
+//  Apply a temperature to attention logits based on extension ratio.
+//  temp = sqrt(scale_factor) (scales down dot products for longer seqs)
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn rope_length_scale(seq_len, max_trained_len) {
+    if seq_len <= max_trained_len { return 1.0 }
+    let ratio = to_float(seq_len) / to_float(max_trained_len)
+    return ntk_sqrt(ratio)
+}
+
+// Apply length scaling to attention scores
+@pure
+fn rope_apply_length_scale(scores, temp) {
+    let n = len(scores)
+    let mut out = ntk_zeros(n)
+    for i in 0..n {
+        out[i] = scores[i] / temp
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  7. Frequency Base Adjustment — per-dimension modification
+//
+//  Allow per-dimension frequency adjustments (e.g., learned offsets).
+//  freq_adjusted[i] = freq[i] * adjustment[i]
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn rope_freq_adjust(freqs, adjustments) {
+    let n = len(freqs)
+    let mut out = ntk_zeros(n)
+    for i in 0..n {
+        out[i] = freqs[i] * adjustments[i]
+    }
+    return out
+}
+
+// Scale specific dimension bands
+// low_dims get multiplied by low_scale, high_dims by high_scale
+@pure
+fn rope_band_adjust(freqs, split_idx, low_scale, high_scale) {
+    let n = len(freqs)
+    let mut out = ntk_zeros(n)
+    for i in 0..n {
+        if i < split_idx {
+            out[i] = freqs[i] * low_scale
+        } else {
+            out[i] = freqs[i] * high_scale
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  8. Progressive Extension — gradual context increase
+//
+//  During training, gradually increase the effective context length.
+//  scale(step) ramps from 1.0 to target_scale over warmup_steps.
+//  This avoids sudden distribution shift.
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn rope_progressive_scale(step, warmup_steps, target_scale) {
+    if step >= warmup_steps { return target_scale }
+    if warmup_steps <= 0 { return target_scale }
+    let progress = to_float(step) / to_float(warmup_steps)
+    // Linear ramp from 1.0 to target_scale
+    return 1.0 + progress * (target_scale - 1.0)
+}
+
+// Get progressive NTK freqs at a given training step
+@pure
+fn rope_progressive_freqs(dim, base, step, warmup_steps, target_scale) {
+    let scale = rope_progressive_scale(step, warmup_steps, target_scale)
+    if scale <= 1.0 { return rope_base_freqs(dim, base) }
+    return rope_ntk_freqs(dim, base, scale)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  9. Comparison Utility — evaluate methods at different lengths
+//
+//  Compute a "coherence score" (simulated perplexity proxy) for each
+//  method at a given sequence length. Lower is better.
+//
+//  The score measures how much the frequency spectrum distorts
+//  compared to the original base RoPE frequencies.
+// ═══════════════════════════════════════════════════════════════════
+
+// Frequency distortion score: MSE between method freqs and ideal freqs
+@pure
+fn rope_freq_distortion(method_freqs, base_freqs) {
+    let n = len(method_freqs)
+    let mut mse = 0.0
+    for i in 0..n {
+        let diff = method_freqs[i] - base_freqs[i]
+        mse = mse + diff * diff
+    }
+    return mse / to_float(n)
+}
+
+// Compare all methods at given configuration
+// Returns: [base_distortion, linear_distortion, ntk_distortion,
+//           dynamic_distortion, yarn_distortion]
+@pure
+fn rope_compare_methods(dim, base, seq_len, max_trained_len) {
+    let base_f = rope_base_freqs(dim, base)
+
+    let scale = to_float(seq_len) / to_float(max_trained_len)
+    let alpha = ntk_max_f(scale, 1.0)
+
+    // Base (no extension) — reference
+    let d_base = 0.0
+
+    // Linear interpolation
+    let linear_f = rope_linear_freqs(dim, base, ntk_max_f(scale, 1.0))
+    let d_linear = rope_freq_distortion(linear_f, base_f)
+
+    // NTK-aware
+    let ntk_f = rope_ntk_freqs(dim, base, alpha)
+    let d_ntk = rope_freq_distortion(ntk_f, base_f)
+
+    // Dynamic NTK
+    let dyn_f = rope_dynamic_freqs(dim, base, seq_len, max_trained_len)
+    let d_dyn = rope_freq_distortion(dyn_f, base_f)
+
+    // YaRN
+    let yarn_f = yarn_freqs(dim, base, alpha, 32, 1, max_trained_len)
+    let d_yarn = rope_freq_distortion(yarn_f, base_f)
+
+    return [d_base, d_linear, d_ntk, d_dyn, d_yarn]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Dot product utility (for attention simulation)
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn rope_dot(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    for i in 0..n {
+        s = s + a[i] * b[i]
+    }
+    return s
+}
+
+// Vector norm
+@pure
+fn rope_norm(v) {
+    return ntk_sqrt(rope_dot(v, v))
+}
+
+println("[dynamic_ntk_rope] loaded — base RoPE + linear + NTK + dynamic + YaRN + length scale + freq adjust + progressive")

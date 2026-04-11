@@ -1,0 +1,593 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/ppo_clip.hexa — PPO-Clip (Proximal Policy Optimization)
+//
+//  Schulman et al. "Proximal Policy Optimization Algorithms" (2017)
+//
+//  Implements:
+//    1. Policy ratio          — pi_new(a|s) / pi_old(a|s)
+//    2. Clipped surrogate     — min(r*A, clip(r,1-e,1+e)*A)
+//    3. Value function loss   — MSE with optional clipping
+//    4. GAE-lambda            — Generalized Advantage Estimation
+//    5. Rollout buffer        — states, actions, log_probs, rewards, values, dones
+//    6. Advantage normalization (mean-subtract, std-divide)
+//    7. Entropy bonus         — encourage exploration
+//    8. KL penalty            — optional adaptive KL
+//    9. Multi-epoch updates   — reuse rollout data for K epochs
+//   10. Reward normalization  — running mean/var statistics
+//
+//  API (pure, no BLAS):
+//    ppo_ratio(log_new, log_old)                         -> float
+//    ppo_clip_ratio(ratio, eps)                          -> float
+//    ppo_surrogate(log_new, log_old, adv, eps)           -> float
+//    ppo_value_loss(vpred, vtarget)                      -> float
+//    ppo_value_loss_clipped(vpred, vpred_old, vtarget, eps) -> float
+//    ppo_gae(rewards, values, dones, gamma, lam)         -> [float]
+//    ppo_returns(rewards, values, dones, gamma, lam)     -> [float]
+//    ppo_rollout_create(n)                               -> rollout
+//    ppo_rollout_add(buf, s, a, lp, r, v, d)            -> buf
+//    ppo_normalize_advantages(advs)                      -> [float]
+//    ppo_entropy_gaussian(log_std)                       -> float
+//    ppo_entropy_categorical(probs)                      -> float
+//    ppo_kl_divergence(log_old, log_new)                 -> float
+//    ppo_adaptive_kl_beta(beta, kl, kl_target)           -> float
+//    ppo_combined_loss(surr, v_loss, ent, c_vf, c_ent)   -> float
+//    ppo_update_step(log_new, log_old, advs, eps, lr)    -> [float]
+//    ppo_multi_epoch(logp, logp_old, advs, eps, lr, epochs) -> [float]
+//    ppo_reward_normalize(rewards, run_mean, run_var, count) -> result
+//    ppo_running_stats_update(old_mean, old_var, old_count, batch) -> stats
+//    ppo_softmax(logits)                                 -> [float]
+//    ppo_log_softmax(logits)                             -> [float]
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+//    @hot   — called every RL step
+// ═══════════════════════════════════════════════════════════════════
+
+let PPO_EPS_NORM = 1.0e-8
+let PPO_CLIP_EPS = 0.2
+let PPO_GAMMA = 0.99
+let PPO_LAMBDA = 0.95
+let PPO_C_VF = 0.5
+let PPO_C_ENT = 0.01
+
+// ── numeric helpers ──────────────────────────────────────────────
+
+fn ppo_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn ppo_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn ppo_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn ppo_log(x) {
+    if x <= 0.0 { return -20.0 }
+    let mut v = x
+    let mut shift = 0.0
+    for _i in 0..20 {
+        if v > 2.0 {
+            v = v / 2.718281828
+            shift = shift + 1.0
+        }
+    }
+    for _i in 0..20 {
+        if v < 0.5 {
+            v = v * 2.718281828
+            shift = shift - 1.0
+        }
+    }
+    let y = (v - 1.0) / (v + 1.0)
+    let y2 = y * y
+    let mut s = y
+    let mut t = y
+    for k in 1..15 {
+        t = t * y2
+        s = s + t / to_float(2 * k + 1)
+    }
+    return 2.0 * s + shift
+}
+
+fn ppo_min(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn ppo_max(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn ppo_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn ppo_mean(arr) {
+    let n = len(arr)
+    if n == 0 { return 0.0 }
+    let mut s = 0.0
+    for i in 0..n { s = s + arr[i] }
+    return s / to_float(n)
+}
+
+fn ppo_std(arr) {
+    let n = len(arr)
+    if n < 2 { return 0.0 }
+    let m = ppo_mean(arr)
+    let mut ss = 0.0
+    for i in 0..n {
+        let d = arr[i] - m
+        ss = ss + d * d
+    }
+    return ppo_sqrt(ss / to_float(n))
+}
+
+fn ppo_sum(arr) {
+    let mut s = 0.0
+    for i in 0..len(arr) { s = s + arr[i] }
+    return s
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  1. Policy Ratio  —  r(theta) = pi_new(a|s) / pi_old(a|s)
+//     In log space: ratio = exp(log_pi_new - log_pi_old)
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn ppo_ratio(log_pi_new, log_pi_old) {
+    return ppo_exp(log_pi_new - log_pi_old)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  2. Clipped Surrogate Objective
+//     L^CLIP = min(r * A, clip(r, 1-eps, 1+eps) * A)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ppo_clip_ratio(ratio, eps) {
+    let lo = 1.0 - eps
+    let hi = 1.0 + eps
+    if ratio < lo { return lo }
+    if ratio > hi { return hi }
+    return ratio
+}
+
+@pure @hot
+fn ppo_surrogate(log_pi_new, log_pi_old, advantage, eps) {
+    let r = ppo_ratio(log_pi_new, log_pi_old)
+    let clipped_r = ppo_clip_ratio(r, eps)
+    let unclipped = r * advantage
+    let clipped = clipped_r * advantage
+    return ppo_min(unclipped, clipped)
+}
+
+// Batch surrogate: mean over array of transitions
+@pure
+fn ppo_surrogate_batch(log_new_arr, log_old_arr, advs, eps) {
+    let n = len(log_new_arr)
+    if n == 0 { return 0.0 }
+    let mut total = 0.0
+    for i in 0..n {
+        total = total + ppo_surrogate(log_new_arr[i], log_old_arr[i], advs[i], eps)
+    }
+    return total / to_float(n)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  3. Value Function Loss
+//     MSE: (V_pred - V_target)^2
+//     Clipped variant: max( (Vp - Vt)^2, (clip(Vp, Vo-e, Vo+e) - Vt)^2 )
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ppo_value_loss(vpred, vtarget) {
+    let d = vpred - vtarget
+    return d * d
+}
+
+@pure
+fn ppo_value_loss_clipped(vpred, vpred_old, vtarget, eps) {
+    let d1 = vpred - vtarget
+    let loss_unclipped = d1 * d1
+    let vpred_c = ppo_clip_ratio(vpred - vpred_old + 1.0, eps) - 1.0 + vpred_old
+    let d2 = vpred_c - vtarget
+    let loss_clipped = d2 * d2
+    return ppo_max(loss_unclipped, loss_clipped)
+}
+
+// Batch value loss
+@pure
+fn ppo_value_loss_batch(vpreds, vtargets) {
+    let n = len(vpreds)
+    if n == 0 { return 0.0 }
+    let mut total = 0.0
+    for i in 0..n {
+        total = total + ppo_value_loss(vpreds[i], vtargets[i])
+    }
+    return total / to_float(n)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  4. GAE-lambda  —  Generalized Advantage Estimation
+//     delta_t = r_t + gamma * V(s_{t+1}) * (1-done) - V(s_t)
+//     A_t = sum_{l=0}^{T-t} (gamma*lambda)^l * delta_{t+l}
+//     Computed in reverse for O(T) efficiency.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ppo_gae(rewards, values, dones, gamma, lam) {
+    let n = len(rewards)
+    let mut advs = ppo_zeros(n)
+    let mut last_gae = 0.0
+    let mut idx = n - 1
+    for _i in 0..n {
+        let mut next_val = 0.0
+        if idx < n - 1 {
+            next_val = values[idx + 1]
+        }
+        let mask = 1.0 - dones[idx]
+        let delta = rewards[idx] + gamma * next_val * mask - values[idx]
+        last_gae = delta + gamma * lam * mask * last_gae
+        advs[idx] = last_gae
+        idx = idx - 1
+    }
+    return advs
+}
+
+// Returns = advantages + values (the TD-lambda returns)
+@pure
+fn ppo_returns(rewards, values, dones, gamma, lam) {
+    let advs = ppo_gae(rewards, values, dones, gamma, lam)
+    let n = len(advs)
+    let mut ret = ppo_zeros(n)
+    for i in 0..n {
+        ret[i] = advs[i] + values[i]
+    }
+    return ret
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  5. Rollout Buffer
+//     Store transitions: states, actions, log_probs, rewards, values, dones
+//     Represented as a map with array fields.
+// ═══════════════════════════════════════════════════════════════════
+fn ppo_rollout_create() {
+    return #{
+        "states": [],
+        "actions": [],
+        "log_probs": [],
+        "rewards": [],
+        "values": [],
+        "dones": [],
+        "size": 0
+    }
+}
+
+fn ppo_rollout_add(buf, state, action, log_prob, reward, value, done) {
+    let mut b = buf
+    b["states"] = b["states"] + [state]
+    b["actions"] = b["actions"] + [action]
+    b["log_probs"] = b["log_probs"] + [log_prob]
+    b["rewards"] = b["rewards"] + [reward]
+    b["values"] = b["values"] + [value]
+    b["dones"] = b["dones"] + [done]
+    b["size"] = b["size"] + 1
+    return b
+}
+
+fn ppo_rollout_get_field(buf, field) {
+    return buf[field]
+}
+
+fn ppo_rollout_size(buf) {
+    return buf["size"]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  6. Advantage Normalization
+//     A_norm = (A - mean(A)) / (std(A) + eps)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ppo_normalize_advantages(advs) {
+    let n = len(advs)
+    if n < 2 { return advs }
+    let m = ppo_mean(advs)
+    let s = ppo_std(advs)
+    let mut out = ppo_zeros(n)
+    for i in 0..n {
+        out[i] = (advs[i] - m) / (s + PPO_EPS_NORM)
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  7. Entropy Bonus
+//     Gaussian:    H = 0.5 * ln(2*pi*e) + log_std
+//     Categorical: H = -sum(p * log(p))
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ppo_entropy_gaussian(log_std) {
+    // H = 0.5 * (1 + ln(2*pi)) + log_std = 0.5 * ln(2*pi*e) + log_std
+    let half_log2pie = 0.9189385332  // 0.5 * ln(2*pi*e) = 0.5 * (1 + ln(2*pi))
+    return half_log2pie + log_std
+}
+
+@pure
+fn ppo_entropy_categorical(probs) {
+    let n = len(probs)
+    let mut h = 0.0
+    for i in 0..n {
+        if probs[i] > PPO_EPS_NORM {
+            h = h - probs[i] * ppo_log(probs[i])
+        }
+    }
+    return h
+}
+
+// Batch entropy for categorical policies
+@pure
+fn ppo_entropy_batch(probs_batch) {
+    let n = len(probs_batch)
+    if n == 0 { return 0.0 }
+    let mut total = 0.0
+    for i in 0..n {
+        total = total + ppo_entropy_categorical(probs_batch[i])
+    }
+    return total / to_float(n)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  8. KL Penalty (Adaptive)
+//     KL(old || new) approx = sum( exp(log_old - log_new) - 1 - (log_old - log_new) )
+//     Simplified per-token: 0.5 * (log_old - log_new)^2  (2nd order Taylor)
+//     Adaptive beta: if kl > 1.5 * kl_target, beta *= 2
+//                    if kl < kl_target / 1.5, beta /= 2
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ppo_kl_divergence(log_old, log_new) {
+    // KL(old||new) using the exact formula: r_old - log(r_old) - 1
+    // where r_old = exp(log_old - log_new) = pi_old / pi_new
+    let diff = log_old - log_new
+    let r = ppo_exp(diff)
+    return r - diff - 1.0
+}
+
+// Batch KL divergence
+@pure
+fn ppo_kl_batch(log_old_arr, log_new_arr) {
+    let n = len(log_old_arr)
+    if n == 0 { return 0.0 }
+    let mut total = 0.0
+    for i in 0..n {
+        total = total + ppo_kl_divergence(log_old_arr[i], log_new_arr[i])
+    }
+    return total / to_float(n)
+}
+
+@pure
+fn ppo_adaptive_kl_beta(beta, kl, kl_target) {
+    if kl > 1.5 * kl_target {
+        return beta * 2.0
+    }
+    if kl < kl_target / 1.5 {
+        return beta / 2.0
+    }
+    return beta
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Combined PPO Loss
+//  L = -L^CLIP + c_vf * L^VF - c_ent * H
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ppo_combined_loss(surrogate, value_loss, entropy, c_vf, c_ent) {
+    return (0.0 - surrogate) + c_vf * value_loss - c_ent * entropy
+}
+
+// Full loss with optional KL penalty
+@pure
+fn ppo_combined_loss_kl(surrogate, value_loss, entropy, kl, c_vf, c_ent, beta_kl) {
+    return (0.0 - surrogate) + c_vf * value_loss - c_ent * entropy + beta_kl * kl
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  9. Multi-Epoch PPO Updates
+//     Reuse the same rollout data for K epochs of gradient updates.
+//     Simulated with simple gradient step on log_probs.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ppo_update_step(log_new_arr, log_old_arr, advs, eps, lr) {
+    let n = len(log_new_arr)
+    let mut updated = ppo_zeros(n)
+    for i in 0..n {
+        let r = ppo_ratio(log_new_arr[i], log_old_arr[i])
+        let clipped_r = ppo_clip_ratio(r, eps)
+        let mut grad = advs[i]
+        // If clipped and gradient would push further, zero out
+        if r < 1.0 - eps {
+            if advs[i] < 0.0 { grad = 0.0 }
+        }
+        if r > 1.0 + eps {
+            if advs[i] > 0.0 { grad = 0.0 }
+        }
+        updated[i] = log_new_arr[i] + lr * grad
+    }
+    return updated
+}
+
+@pure
+fn ppo_multi_epoch(log_probs, log_old, advs, eps, lr, epochs) {
+    let mut current = ppo_zeros(len(log_probs))
+    for i in 0..len(log_probs) { current[i] = log_probs[i] }
+    for _e in 0..epochs {
+        current = ppo_update_step(current, log_old, advs, eps, lr)
+    }
+    return current
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  10. Reward Normalization / Running Statistics
+//      Welford online algorithm for running mean and variance.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ppo_running_stats_update(old_mean, old_var, old_count, batch) {
+    let n = len(batch)
+    if n == 0 { return [old_mean, old_var, old_count] }
+    let batch_mean = ppo_mean(batch)
+    let mut batch_var = 0.0
+    for i in 0..n {
+        let d = batch[i] - batch_mean
+        batch_var = batch_var + d * d
+    }
+    batch_var = batch_var / to_float(n)
+    let new_count = old_count + to_float(n)
+    let delta = batch_mean - old_mean
+    let new_mean = old_mean + delta * to_float(n) / new_count
+    let m_a = old_var * old_count
+    let m_b = batch_var * to_float(n)
+    let m2 = m_a + m_b + delta * delta * old_count * to_float(n) / new_count
+    let new_var = m2 / new_count
+    return [new_mean, new_var, new_count]
+}
+
+@pure
+fn ppo_reward_normalize(rewards, run_mean, run_var) {
+    let n = len(rewards)
+    let mut out = ppo_zeros(n)
+    let std = ppo_sqrt(run_var + PPO_EPS_NORM)
+    for i in 0..n {
+        out[i] = (rewards[i] - run_mean) / std
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Softmax / Log-Softmax utilities
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ppo_softmax(logits) {
+    let n = len(logits)
+    let mut mx = logits[0]
+    for i in 1..n {
+        if logits[i] > mx { mx = logits[i] }
+    }
+    let mut exps = ppo_zeros(n)
+    let mut z = 0.0
+    for i in 0..n {
+        exps[i] = ppo_exp(logits[i] - mx)
+        z = z + exps[i]
+    }
+    let mut out = ppo_zeros(n)
+    for i in 0..n {
+        out[i] = exps[i] / z
+    }
+    return out
+}
+
+@pure
+fn ppo_log_softmax(logits) {
+    let n = len(logits)
+    let mut mx = logits[0]
+    for i in 1..n {
+        if logits[i] > mx { mx = logits[i] }
+    }
+    let mut z = 0.0
+    for i in 0..n {
+        z = z + ppo_exp(logits[i] - mx)
+    }
+    let log_z = ppo_log(z) + mx
+    let mut out = ppo_zeros(n)
+    for i in 0..n {
+        out[i] = logits[i] - log_z
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Discount returns (simple cumulative gamma-discounted)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ppo_discount_returns(rewards, gamma) {
+    let n = len(rewards)
+    let mut ret = ppo_zeros(n)
+    let mut running = 0.0
+    let mut idx = n - 1
+    for _i in 0..n {
+        running = rewards[idx] + gamma * running
+        ret[idx] = running
+        idx = idx - 1
+    }
+    return ret
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Explained variance  —  metric for value function quality
+//  EV = 1 - Var(returns - vpreds) / Var(returns)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ppo_explained_variance(vpreds, returns) {
+    let n = len(vpreds)
+    if n < 2 { return 0.0 }
+    let mut diffs = ppo_zeros(n)
+    for i in 0..n {
+        diffs[i] = returns[i] - vpreds[i]
+    }
+    let var_diff = ppo_std(diffs) * ppo_std(diffs)
+    let var_ret = ppo_std(returns) * ppo_std(returns)
+    if var_ret < PPO_EPS_NORM { return 0.0 }
+    return 1.0 - var_diff / var_ret
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Clip fraction  —  fraction of ratios that are clipped
+//  Useful as a diagnostic metric during training.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ppo_clip_fraction(log_new_arr, log_old_arr, eps) {
+    let n = len(log_new_arr)
+    if n == 0 { return 0.0 }
+    let mut clipped = 0
+    for i in 0..n {
+        let r = ppo_ratio(log_new_arr[i], log_old_arr[i])
+        if r < 1.0 - eps { clipped = clipped + 1 }
+        if r > 1.0 + eps { clipped = clipped + 1 }
+    }
+    return to_float(clipped) / to_float(n)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Approx KL (simplified, from log-ratio mean)
+//  approx_kl = mean( (ratio - 1) - log(ratio) )
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ppo_approx_kl(log_new_arr, log_old_arr) {
+    let n = len(log_new_arr)
+    if n == 0 { return 0.0 }
+    let mut total = 0.0
+    for i in 0..n {
+        let log_r = log_new_arr[i] - log_old_arr[i]
+        let r = ppo_exp(log_r)
+        total = total + r - log_r - 1.0
+    }
+    return total / to_float(n)
+}
+
+println("[ppo_clip] loaded — PPO-Clip: surrogate + GAE + value loss + entropy + KL + multi-epoch")

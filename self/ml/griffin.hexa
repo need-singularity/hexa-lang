@@ -1,0 +1,1029 @@
+// ===================================================================
+//  self/ml/griffin.hexa — Griffin: Gated Linear RNN + Local Attention Hybrid
+//
+//  Implements the Griffin architecture (De et al., 2024), combining
+//  gated linear recurrences (RG-LRU) with local window attention
+//  for efficient sequence modeling with O(1) per-step inference.
+//
+//  Components:
+//    1. Real-Gated Linear Recurrence Unit (RG-LRU)
+//       x_t = a_t * x_{t-1} + (1 - a_t) * input_t
+//    2. Gating mechanism: input gate + recurrence gate (sigmoid)
+//    3. Local window attention: standard attention within window
+//    4. Griffin block: RG-LRU or local attention layer + MLP
+//    5. Temporal mixing: linear projection of current + previous token
+//    6. Multi-layer stack: configurable interleaving (RLRL, RRRL, etc.)
+//    7. Recurrent inference: O(1) per step via RG-LRU state
+//    8. Parallel training mode: scan-based parallel recurrence
+//    9. Configuration: d_model, num_layers, window_size, pattern
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+//    @hot   — inner-loop kernels
+// ===================================================================
+
+// ===================================================================
+//  Math helpers (griffin_ prefixed to avoid collisions)
+// ===================================================================
+
+fn griffin_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn griffin_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn griffin_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn griffin_log(x) {
+    if x <= 0.0 { return -20.0 }
+    let mut y = 0.0
+    let mut t = (x - 1.0) / (x + 1.0)
+    let t2 = t * t
+    let mut term = t
+    for i in 0..15 {
+        y = y + term / to_float(2 * i + 1)
+        term = term * t2
+    }
+    return 2.0 * y
+}
+
+fn griffin_sigmoid(x) {
+    if x > 20.0 { return 1.0 }
+    if x < -20.0 { return 0.0 }
+    return 1.0 / (1.0 + griffin_exp(0.0 - x))
+}
+
+fn griffin_tanh(x) {
+    if x > 10.0 { return 1.0 }
+    if x < -10.0 { return -1.0 }
+    let e2x = griffin_exp(2.0 * x)
+    return (e2x - 1.0) / (e2x + 1.0)
+}
+
+fn griffin_gelu(x) {
+    // Approximate GELU: x * sigmoid(1.702 * x)
+    return x * griffin_sigmoid(1.702 * x)
+}
+
+fn griffin_max(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn griffin_min(a, b) {
+    if a < b { return a }
+    return b
+}
+
+// ===================================================================
+//  Vector utilities
+// ===================================================================
+
+fn griffin_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn griffin_ones(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [1.0] }
+    return v
+}
+
+fn griffin_vec_add(a, b) {
+    let n = len(a)
+    let mut out = []
+    for i in 0..n { out = out + [a[i] + b[i]] }
+    return out
+}
+
+fn griffin_vec_sub(a, b) {
+    let n = len(a)
+    let mut out = []
+    for i in 0..n { out = out + [a[i] - b[i]] }
+    return out
+}
+
+fn griffin_vec_mul(a, b) {
+    let n = len(a)
+    let mut out = []
+    for i in 0..n { out = out + [a[i] * b[i]] }
+    return out
+}
+
+fn griffin_vec_scale(v, s) {
+    let n = len(v)
+    let mut out = []
+    for i in 0..n { out = out + [v[i] * s] }
+    return out
+}
+
+fn griffin_dot(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    for i in 0..n { s = s + a[i] * b[i] }
+    return s
+}
+
+fn griffin_vec_sigmoid(v) {
+    let n = len(v)
+    let mut out = []
+    for i in 0..n { out = out + [griffin_sigmoid(v[i])] }
+    return out
+}
+
+fn griffin_vec_gelu(v) {
+    let n = len(v)
+    let mut out = []
+    for i in 0..n { out = out + [griffin_gelu(v[i])] }
+    return out
+}
+
+// ===================================================================
+//  Matrix utilities (row-major: array of row-vectors)
+// ===================================================================
+
+fn griffin_mat_zeros(rows, cols) {
+    let mut m = []
+    for _r in 0..rows { m = m + [griffin_zeros(cols)] }
+    return m
+}
+
+fn griffin_mat_vec(mat, v) {
+    let rows = len(mat)
+    let mut out = []
+    for r in 0..rows { out = out + [griffin_dot(mat[r], v)] }
+    return out
+}
+
+// Deterministic pseudo-random initialization
+fn griffin_init_weight(rows, cols, seed) {
+    let scale = 1.0 / griffin_sqrt(to_float(cols))
+    let mut m = []
+    for r in 0..rows {
+        let mut row = []
+        for c in 0..cols {
+            let h = (r * 137 + c * 311 + seed * 7919) % 10007
+            let val = (to_float(h) / 10007.0 - 0.5) * 2.0 * scale
+            row = row + [val]
+        }
+        m = m + [row]
+    }
+    return m
+}
+
+fn griffin_init_vec(dim, seed) {
+    let scale = 1.0 / griffin_sqrt(to_float(dim))
+    let mut v = []
+    for i in 0..dim {
+        let h = (i * 251 + seed * 6173) % 10007
+        let val = (to_float(h) / 10007.0 - 0.5) * 2.0 * scale
+        v = v + [val]
+    }
+    return v
+}
+
+fn griffin_init_vec_range(dim, low, high, seed) {
+    let range = high - low
+    let mut v = []
+    for i in 0..dim {
+        let h = (i * 251 + seed * 6173) % 10007
+        let val = low + to_float(h) / 10007.0 * range
+        v = v + [val]
+    }
+    return v
+}
+
+// ===================================================================
+//  RMSNorm (Griffin uses RMSNorm instead of LayerNorm)
+//
+//  y = gamma * x / sqrt(mean(x^2) + eps)
+// ===================================================================
+
+struct RMSNorm {
+    dim: int,
+    gamma: array,
+    eps: float
+}
+
+fn create_rms_norm(dim) {
+    return RMSNorm {
+        dim: dim,
+        gamma: griffin_ones(dim),
+        eps: 1.0e-6
+    }
+}
+
+@pure
+fn rms_norm_forward(rn, x) {
+    let n = rn.dim
+    let mut sq_sum = 0.0
+    for i in 0..n {
+        sq_sum = sq_sum + x[i] * x[i]
+    }
+    let rms = griffin_sqrt(sq_sum / to_float(n) + rn.eps)
+    let inv_rms = 1.0 / rms
+    let mut out = []
+    for i in 0..n {
+        out = out + [rn.gamma[i] * x[i] * inv_rms]
+    }
+    return out
+}
+
+// ===================================================================
+//  Temporal Mixing — linear blend of current + previous token
+//
+//  mixed = mu * x_prev + (1 - mu) * x_curr
+//  mu is a per-dimension learnable coefficient in [0,1]
+// ===================================================================
+
+@pure @hot
+fn griffin_temporal_mix(x_curr, x_prev, mu) {
+    let n = len(x_curr)
+    let mut out = []
+    for i in 0..n {
+        out = out + [mu[i] * x_prev[i] + (1.0 - mu[i]) * x_curr[i]]
+    }
+    return out
+}
+
+// ===================================================================
+//  Real-Gated Linear Recurrence Unit (RG-LRU)
+//
+//  The core recurrence in Griffin. For each time step t:
+//    input_gate = sigmoid(W_i . x_t + b_i)
+//    recurrence_gate = sigmoid(W_r . x_t + b_r)
+//    a_t = recurrence_gate                       (recurrence weight)
+//    gated_input = input_gate * (W_x . x_t)      (gated linear input)
+//    h_t = a_t * h_{t-1} + (1 - a_t) * gated_input
+//    y_t = h_t
+//
+//  The gates are learned per-dimension. The recurrence_gate controls
+//  how much of the previous state to keep vs how much new input to add.
+// ===================================================================
+
+struct RGLRU {
+    dim: int,
+    W_input_gate: array,
+    b_input_gate: array,
+    W_recur_gate: array,
+    b_recur_gate: array,
+    W_x: array,
+    mu: array
+}
+
+fn create_rglru(dim, seed) {
+    return RGLRU {
+        dim: dim,
+        W_input_gate: griffin_init_weight(dim, dim, seed + 1),
+        b_input_gate: griffin_init_vec(dim, seed + 2),
+        W_recur_gate: griffin_init_weight(dim, dim, seed + 3),
+        b_recur_gate: griffin_init_vec(dim, seed + 4),
+        W_x: griffin_init_weight(dim, dim, seed + 5),
+        mu: griffin_init_vec_range(dim, 0.3, 0.7, seed + 6)
+    }
+}
+
+// RG-LRU single-step (recurrent mode)
+// x: current input [dim]
+// h_prev: previous hidden state [dim]
+// x_prev: previous input for temporal mixing [dim]
+// Returns: [output, new_h, x]
+@pure @hot
+fn rglru_step(lru, x, h_prev, x_prev) {
+    let d = lru.dim
+    // Temporal mixing
+    let mixed = griffin_temporal_mix(x, x_prev, lru.mu)
+    // Compute gates
+    let ig_raw = griffin_vec_add(griffin_mat_vec(lru.W_input_gate, mixed), lru.b_input_gate)
+    let rg_raw = griffin_vec_add(griffin_mat_vec(lru.W_recur_gate, mixed), lru.b_recur_gate)
+    let input_gate = griffin_vec_sigmoid(ig_raw)
+    let recur_gate = griffin_vec_sigmoid(rg_raw)
+    // Gated linear input
+    let x_proj = griffin_mat_vec(lru.W_x, mixed)
+    let gated_input = griffin_vec_mul(input_gate, x_proj)
+    // Recurrence: h_t = a_t * h_{t-1} + (1 - a_t) * gated_input
+    let mut h_new = []
+    for i in 0..d {
+        let a = recur_gate[i]
+        let h_val = a * h_prev[i] + (1.0 - a) * gated_input[i]
+        h_new = h_new + [h_val]
+    }
+    return [h_new, h_new, x]
+}
+
+// RG-LRU sequence mode (parallel scan simulation for training)
+// xs: [seq_len x dim]
+// Returns: [seq_len x dim] outputs
+fn rglru_sequence(lru, xs) {
+    let seq_len = len(xs)
+    let d = lru.dim
+    let mut h = griffin_zeros(d)
+    let mut x_prev = griffin_zeros(d)
+    let mut outputs = []
+    for t in 0..seq_len {
+        let res = rglru_step(lru, xs[t], h, x_prev)
+        outputs = outputs + [res[0]]
+        h = res[1]
+        x_prev = res[2]
+    }
+    return outputs
+}
+
+// Parallel scan for RG-LRU (scan-based parallel computation)
+// Computes the linear recurrence h_t = a_t * h_{t-1} + b_t
+// using prefix scan. For training on GPU, this would be truly parallel.
+// Here we simulate the scan semantics.
+// as_seq: [seq_len x dim] recurrence coefficients
+// bs_seq: [seq_len x dim] input terms
+// Returns: [seq_len x dim] hidden states
+fn rglru_parallel_scan(as_seq, bs_seq) {
+    let seq_len = len(as_seq)
+    let d = len(as_seq[0])
+    let mut h = griffin_zeros(d)
+    let mut outputs = []
+    for t in 0..seq_len {
+        let mut h_new = []
+        for i in 0..d {
+            h_new = h_new + [as_seq[t][i] * h[i] + bs_seq[t][i]]
+        }
+        h = h_new
+        outputs = outputs + [h_new]
+    }
+    return outputs
+}
+
+// ===================================================================
+//  Local Window Attention
+//
+//  Standard scaled dot-product attention but restricted to a local
+//  window of W tokens. Each token attends only to tokens within
+//  its window: [max(0, t-W+1) .. t].
+//
+//  Q = W_q . x,  K = W_k . x,  V = W_v . x
+//  attn(q, K, V) = softmax(q . K^T / sqrt(d)) . V  (within window)
+// ===================================================================
+
+struct LocalAttention {
+    dim: int,
+    window_size: int,
+    W_q: array,
+    W_k: array,
+    W_v: array,
+    W_o: array
+}
+
+fn create_local_attention(dim, window_size, seed) {
+    return LocalAttention {
+        dim: dim,
+        window_size: window_size,
+        W_q: griffin_init_weight(dim, dim, seed + 10),
+        W_k: griffin_init_weight(dim, dim, seed + 11),
+        W_v: griffin_init_weight(dim, dim, seed + 12),
+        W_o: griffin_init_weight(dim, dim, seed + 13)
+    }
+}
+
+// Softmax over a small vector
+@pure
+fn griffin_softmax(logits) {
+    let n = len(logits)
+    if n == 0 { return [] }
+    let mut mx = logits[0]
+    for i in 1..n { if logits[i] > mx { mx = logits[i] } }
+    let mut exps = []
+    let mut z = 0.0
+    for i in 0..n {
+        let e = griffin_exp(logits[i] - mx)
+        exps = exps + [e]
+        z = z + e
+    }
+    let mut out = []
+    for i in 0..n { out = out + [exps[i] / z] }
+    return out
+}
+
+// Local attention forward: full sequence
+// xs: [seq_len x dim]
+// Returns: [seq_len x dim]
+fn local_attention_forward(la, xs) {
+    let seq_len = len(xs)
+    let d = la.dim
+    let w = la.window_size
+    let scale = 1.0 / griffin_sqrt(to_float(d))
+    // Compute Q, K, V for all positions
+    let mut qs = []
+    let mut ks = []
+    let mut vs = []
+    for t in 0..seq_len {
+        qs = qs + [griffin_mat_vec(la.W_q, xs[t])]
+        ks = ks + [griffin_mat_vec(la.W_k, xs[t])]
+        vs = vs + [griffin_mat_vec(la.W_v, xs[t])]
+    }
+    // For each position, attend only within local window
+    let mut outputs = []
+    for t in 0..seq_len {
+        let q = qs[t]
+        // Window: [start .. t] inclusive
+        let mut start = t - w + 1
+        if start < 0 { start = 0 }
+        // Compute attention scores within window
+        let mut scores = []
+        for j in start..(t + 1) {
+            let s = griffin_dot(q, ks[j]) * scale
+            scores = scores + [s]
+        }
+        let weights = griffin_softmax(scores)
+        // Weighted sum of values
+        let mut attn_out = griffin_zeros(d)
+        let n_w = len(weights)
+        for wi in 0..n_w {
+            let j = start + wi
+            for i in 0..d {
+                attn_out[i] = attn_out[i] + weights[wi] * vs[j][i]
+            }
+        }
+        // Output projection
+        let projected = griffin_mat_vec(la.W_o, attn_out)
+        outputs = outputs + [projected]
+    }
+    return outputs
+}
+
+// Local attention: single step with KV cache
+// q: query for current position [dim]
+// kv_cache: [[k, v], ...] for positions in window
+// Returns: output [dim]
+@hot
+fn local_attention_step(la, q_input, kv_cache) {
+    let d = la.dim
+    let scale = 1.0 / griffin_sqrt(to_float(d))
+    let q = griffin_mat_vec(la.W_q, q_input)
+    let n_cache = len(kv_cache)
+    if n_cache == 0 {
+        // No cache yet, self-attend
+        let k = griffin_mat_vec(la.W_k, q_input)
+        let v = griffin_mat_vec(la.W_v, q_input)
+        return griffin_mat_vec(la.W_o, v)
+    }
+    // Compute scores against cached keys
+    let mut scores = []
+    for j in 0..n_cache {
+        let s = griffin_dot(q, kv_cache[j][0]) * scale
+        scores = scores + [s]
+    }
+    // Also include current token
+    let cur_k = griffin_mat_vec(la.W_k, q_input)
+    let cur_v = griffin_mat_vec(la.W_v, q_input)
+    let cur_score = griffin_dot(q, cur_k) * scale
+    scores = scores + [cur_score]
+    let weights = griffin_softmax(scores)
+    // Weighted sum
+    let mut attn_out = griffin_zeros(d)
+    for j in 0..n_cache {
+        for i in 0..d {
+            attn_out[i] = attn_out[i] + weights[j] * kv_cache[j][1][i]
+        }
+    }
+    // Add current token contribution
+    for i in 0..d {
+        attn_out[i] = attn_out[i] + weights[n_cache] * cur_v[i]
+    }
+    return griffin_mat_vec(la.W_o, attn_out)
+}
+
+// ===================================================================
+//  MLP (Feed-Forward Network) with gating
+//
+//  Griffin uses a gated MLP:
+//  gate = gelu(W_gate . x)
+//  up = W_up . x
+//  output = W_down . (gate * up)
+// ===================================================================
+
+struct GriffinMLP {
+    dim: int,
+    ff_dim: int,
+    W_gate: array,
+    W_up: array,
+    W_down: array
+}
+
+fn create_griffin_mlp(dim, ff_dim, seed) {
+    return GriffinMLP {
+        dim: dim,
+        ff_dim: ff_dim,
+        W_gate: griffin_init_weight(ff_dim, dim, seed + 20),
+        W_up: griffin_init_weight(ff_dim, dim, seed + 21),
+        W_down: griffin_init_weight(dim, ff_dim, seed + 22)
+    }
+}
+
+@hot
+fn griffin_mlp_forward(mlp, x) {
+    let gate = griffin_vec_gelu(griffin_mat_vec(mlp.W_gate, x))
+    let up = griffin_mat_vec(mlp.W_up, x)
+    let gated = griffin_vec_mul(gate, up)
+    return griffin_mat_vec(mlp.W_down, gated)
+}
+
+// ===================================================================
+//  Griffin Block
+//
+//  A single Griffin block uses either RG-LRU or local attention
+//  as its sequence mixing layer, followed by an MLP.
+//
+//  block_forward(x):
+//    y = RMSNorm(x)
+//    y = seq_mixer(y)   # RG-LRU or local attention
+//    x = x + y          # residual
+//    z = RMSNorm(x)
+//    z = MLP(z)
+//    x = x + z          # residual
+//    return x
+//
+//  layer_type: 0 = RG-LRU, 1 = local attention
+// ===================================================================
+
+struct GriffinBlock {
+    dim: int,
+    layer_type: int,
+    norm1: RMSNorm,
+    norm2: RMSNorm,
+    rglru: RGLRU,
+    local_attn: LocalAttention,
+    mlp: GriffinMLP
+}
+
+fn create_griffin_block(dim, ff_dim, window_size, layer_type, seed) {
+    return GriffinBlock {
+        dim: dim,
+        layer_type: layer_type,
+        norm1: create_rms_norm(dim),
+        norm2: create_rms_norm(dim),
+        rglru: create_rglru(dim, seed),
+        local_attn: create_local_attention(dim, window_size, seed + 50),
+        mlp: create_griffin_mlp(dim, ff_dim, seed + 100)
+    }
+}
+
+// Griffin block: single step (recurrent mode)
+// x: current input [dim]
+// h_prev: RG-LRU hidden state [dim]
+// x_prev: previous input for temporal mixing [dim]
+// kv_cache: local attention KV cache [[k,v], ...]
+// Returns: [output, new_h, new_x_prev, new_kv_cache]
+fn griffin_block_step(blk, x, h_prev, x_prev, kv_cache) {
+    let d = blk.dim
+    // Pre-norm
+    let normed1 = rms_norm_forward(blk.norm1, x)
+    // Sequence mixer
+    let mut seq_out = griffin_zeros(d)
+    let mut new_h = h_prev
+    let mut new_x_prev = x
+    let mut new_kv = kv_cache
+    if blk.layer_type == 0 {
+        // RG-LRU path
+        let lru_res = rglru_step(blk.rglru, normed1, h_prev, x_prev)
+        seq_out = lru_res[0]
+        new_h = lru_res[1]
+        new_x_prev = lru_res[2]
+    } else {
+        // Local attention path
+        seq_out = local_attention_step(blk.local_attn, normed1, kv_cache)
+        // Update KV cache: append current K,V and trim to window
+        let cur_k = griffin_mat_vec(blk.local_attn.W_k, normed1)
+        let cur_v = griffin_mat_vec(blk.local_attn.W_v, normed1)
+        new_kv = kv_cache + [[cur_k, cur_v]]
+        let w = blk.local_attn.window_size
+        if len(new_kv) > w {
+            // Trim to window size (keep last w entries)
+            let excess = len(new_kv) - w
+            let mut trimmed = []
+            for i in excess..len(new_kv) {
+                trimmed = trimmed + [new_kv[i]]
+            }
+            new_kv = trimmed
+        }
+    }
+    // Residual connection
+    let x2 = griffin_vec_add(x, seq_out)
+    // MLP with pre-norm + residual
+    let normed2 = rms_norm_forward(blk.norm2, x2)
+    let mlp_out = griffin_mlp_forward(blk.mlp, normed2)
+    let x3 = griffin_vec_add(x2, mlp_out)
+    return [x3, new_h, new_x_prev, new_kv]
+}
+
+// Griffin block: full sequence mode
+// xs: [seq_len x dim]
+// Returns: [seq_len x dim]
+fn griffin_block_sequence(blk, xs) {
+    let seq_len = len(xs)
+    let d = blk.dim
+    if blk.layer_type == 0 {
+        // RG-LRU path: process sequentially with recurrence
+        let mut h = griffin_zeros(d)
+        let mut x_prev = griffin_zeros(d)
+        let mut outputs = []
+        for t in 0..seq_len {
+            let normed = rms_norm_forward(blk.norm1, xs[t])
+            let lru_res = rglru_step(blk.rglru, normed, h, x_prev)
+            let x2 = griffin_vec_add(xs[t], lru_res[0])
+            h = lru_res[1]
+            x_prev = lru_res[2]
+            let normed2 = rms_norm_forward(blk.norm2, x2)
+            let mlp_out = griffin_mlp_forward(blk.mlp, normed2)
+            let x3 = griffin_vec_add(x2, mlp_out)
+            outputs = outputs + [x3]
+        }
+        return outputs
+    } else {
+        // Local attention path: compute attention then MLP
+        let mut normed_xs = []
+        for t in 0..seq_len {
+            normed_xs = normed_xs + [rms_norm_forward(blk.norm1, xs[t])]
+        }
+        let attn_outs = local_attention_forward(blk.local_attn, normed_xs)
+        let mut outputs = []
+        for t in 0..seq_len {
+            let x2 = griffin_vec_add(xs[t], attn_outs[t])
+            let normed2 = rms_norm_forward(blk.norm2, x2)
+            let mlp_out = griffin_mlp_forward(blk.mlp, normed2)
+            let x3 = griffin_vec_add(x2, mlp_out)
+            outputs = outputs + [x3]
+        }
+        return outputs
+    }
+}
+
+// ===================================================================
+//  Griffin State — container for multi-layer recurrent state
+//
+//  Each layer stores: h (RG-LRU hidden), x_prev (temporal mixing),
+//  kv_cache (local attention window)
+// ===================================================================
+
+struct GriffinState {
+    n_layers: int,
+    dim: int,
+    h_states: array,
+    x_prevs: array,
+    kv_caches: array
+}
+
+fn create_griffin_state(n_layers, dim) {
+    let mut hs = []
+    let mut xps = []
+    let mut kvs = []
+    for _l in 0..n_layers {
+        hs = hs + [griffin_zeros(dim)]
+        xps = xps + [griffin_zeros(dim)]
+        kvs = kvs + [[]]
+    }
+    return GriffinState {
+        n_layers: n_layers,
+        dim: dim,
+        h_states: hs,
+        x_prevs: xps,
+        kv_caches: kvs
+    }
+}
+
+// ===================================================================
+//  Griffin Config — configurable interleaving pattern
+//
+//  pattern: array of 0/1 per layer (0=RG-LRU, 1=local attention)
+//  Common patterns:
+//    RLRL: [0,1,0,1]  (alternating)
+//    RRRL: [0,0,0,1]  (mostly recurrent)
+//    RRRR: [0,0,0,0]  (all recurrent, no attention)
+// ===================================================================
+
+struct GriffinConfig {
+    d_model: int,
+    ff_dim: int,
+    n_layers: int,
+    window_size: int,
+    pattern: array
+}
+
+fn create_griffin_config(d_model, ff_dim, n_layers, window_size, pattern) {
+    return GriffinConfig {
+        d_model: d_model,
+        ff_dim: ff_dim,
+        n_layers: n_layers,
+        window_size: window_size,
+        pattern: pattern
+    }
+}
+
+// Helper: generate alternating RLRL pattern
+fn pattern_alternating(n_layers) {
+    let mut p = []
+    for i in 0..n_layers {
+        p = p + [i % 2]
+    }
+    return p
+}
+
+// Helper: generate RRRL pattern (3 recurrent, 1 attention, repeating)
+fn pattern_mostly_recurrent(n_layers) {
+    let mut p = []
+    for i in 0..n_layers {
+        if (i + 1) % 4 == 0 {
+            p = p + [1]
+        } else {
+            p = p + [0]
+        }
+    }
+    return p
+}
+
+// Helper: all recurrent
+fn pattern_all_recurrent(n_layers) {
+    let mut p = []
+    for _i in 0..n_layers { p = p + [0] }
+    return p
+}
+
+// ===================================================================
+//  Multi-layer Griffin Stack
+// ===================================================================
+
+struct GriffinStack {
+    config: GriffinConfig,
+    blocks: array,
+    norm_out: RMSNorm
+}
+
+fn create_griffin_stack(config, seed) {
+    let mut blocks = []
+    for l in 0..config.n_layers {
+        let lt = config.pattern[l]
+        blocks = blocks + [create_griffin_block(config.d_model, config.ff_dim, config.window_size, lt, seed + l * 1000)]
+    }
+    return GriffinStack {
+        config: config,
+        blocks: blocks,
+        norm_out: create_rms_norm(config.d_model)
+    }
+}
+
+// Stack forward: single step (recurrent mode)
+// x: current input [d_model]
+// state: GriffinState
+// Returns: [output, new_state]
+fn griffin_stack_step(stack, x, state) {
+    let mut h = x
+    let mut new_hs = []
+    let mut new_xps = []
+    let mut new_kvs = []
+    for l in 0..stack.config.n_layers {
+        let blk = stack.blocks[l]
+        let res = griffin_block_step(blk, h, state.h_states[l], state.x_prevs[l], state.kv_caches[l])
+        h = res[0]
+        new_hs = new_hs + [res[1]]
+        new_xps = new_xps + [res[2]]
+        new_kvs = new_kvs + [res[3]]
+    }
+    let out = rms_norm_forward(stack.norm_out, h)
+    let new_state = GriffinState {
+        n_layers: state.n_layers,
+        dim: state.dim,
+        h_states: new_hs,
+        x_prevs: new_xps,
+        kv_caches: new_kvs
+    }
+    return [out, new_state]
+}
+
+// Stack forward: full sequence
+// xs: [seq_len x d_model]
+// Returns: [seq_len x d_model]
+fn griffin_stack_sequence(stack, xs) {
+    let mut current = xs
+    for l in 0..stack.config.n_layers {
+        current = griffin_block_sequence(stack.blocks[l], current)
+    }
+    // Final norm
+    let seq_len = len(current)
+    let mut outputs = []
+    for t in 0..seq_len {
+        outputs = outputs + [rms_norm_forward(stack.norm_out, current[t])]
+    }
+    return outputs
+}
+
+// ===================================================================
+//  Embedding / Unembedding (deterministic pseudo-random)
+// ===================================================================
+
+fn griffin_embed(token_id, d_model, seed) {
+    let mut v = []
+    for i in 0..d_model {
+        let h = (token_id * 137 + i * 311 + seed) % 10007
+        let val = (to_float(h) / 10007.0 - 0.5) * 0.1
+        v = v + [val]
+    }
+    return v
+}
+
+fn griffin_embed_seq(token_ids, d_model, seed) {
+    let n = len(token_ids)
+    let mut xs = []
+    for t in 0..n {
+        xs = xs + [griffin_embed(token_ids[t], d_model, seed)]
+    }
+    return xs
+}
+
+fn griffin_unembed(h, vocab_size, d_model, seed) {
+    let mut logits = []
+    for v in 0..vocab_size {
+        let mut score = 0.0
+        for i in 0..d_model {
+            let w_h = (v * 137 + i * 311 + seed + 999) % 10007
+            let w = (to_float(w_h) / 10007.0 - 0.5) * 0.1
+            score = score + h[i] * w
+        }
+        logits = logits + [score]
+    }
+    return logits
+}
+
+// ===================================================================
+//  Argmax
+// ===================================================================
+
+@pure
+fn griffin_argmax(logits) {
+    let n = len(logits)
+    let mut best = 0
+    let mut best_v = logits[0]
+    for i in 1..n {
+        if logits[i] > best_v {
+            best_v = logits[i]
+            best = i
+        }
+    }
+    return best
+}
+
+// ===================================================================
+//  Generation — greedy, using recurrent mode (O(1) per step for RG-LRU)
+// ===================================================================
+
+fn griffin_generate(stack, start_tokens, n_gen, vocab_size, emb_seed) {
+    let d = stack.config.d_model
+    let n_layers = stack.config.n_layers
+    let mut state = create_griffin_state(n_layers, d)
+    // Prefill
+    let n_prompt = len(start_tokens)
+    let mut last_out = griffin_zeros(d)
+    for t in 0..n_prompt {
+        let emb = griffin_embed(start_tokens[t], d, emb_seed)
+        let res = griffin_stack_step(stack, emb, state)
+        last_out = res[0]
+        state = res[1]
+    }
+    // Generate
+    let mut generated = []
+    for _g in 0..n_gen {
+        let logits = griffin_unembed(last_out, vocab_size, d, emb_seed)
+        let next_id = griffin_argmax(logits)
+        generated = generated + [next_id]
+        let emb = griffin_embed(next_id, d, emb_seed)
+        let res = griffin_stack_step(stack, emb, state)
+        last_out = res[0]
+        state = res[1]
+    }
+    return generated
+}
+
+// ===================================================================
+//  Training mode — full sequence forward pass
+// ===================================================================
+
+fn griffin_train_forward(stack, token_ids, vocab_size, emb_seed) {
+    let d = stack.config.d_model
+    let seq_len = len(token_ids)
+    let mut xs = []
+    for t in 0..seq_len {
+        xs = xs + [griffin_embed(token_ids[t], d, emb_seed)]
+    }
+    let outs = griffin_stack_sequence(stack, xs)
+    let mut all_logits = []
+    for t in 0..seq_len {
+        let logits = griffin_unembed(outs[t], vocab_size, d, emb_seed)
+        all_logits = all_logits + [logits]
+    }
+    return all_logits
+}
+
+// ===================================================================
+//  Cross-entropy loss
+// ===================================================================
+
+@pure
+fn griffin_cross_entropy(logits, target) {
+    let probs = griffin_softmax(logits)
+    let p = probs[target]
+    let safe_p = if p < 1.0e-10 { 1.0e-10 } else { p }
+    return 0.0 - griffin_log(safe_p)
+}
+
+fn griffin_sequence_loss(all_logits, targets) {
+    let n = len(targets)
+    if n == 0 { return 0.0 }
+    let mut total = 0.0
+    for i in 0..n {
+        total = total + griffin_cross_entropy(all_logits[i], targets[i])
+    }
+    return total / to_float(n)
+}
+
+// ===================================================================
+//  Parameter count
+// ===================================================================
+
+fn griffin_param_count(stack) {
+    let d = stack.config.d_model
+    let ff = stack.config.ff_dim
+    let n = stack.config.n_layers
+    // Per RG-LRU layer: 3*d*d + 2*d + d weights for gates+projection + d for mu
+    let rglru_params = 3 * d * d + 3 * d
+    // Per local attention layer: 4*d*d
+    let attn_params = 4 * d * d
+    // Per MLP: 2*ff*d + d*ff
+    let mlp_params = 2 * ff * d + d * ff
+    // Per RMSNorm: d
+    let norm_params = d
+    let mut total = 0
+    for l in 0..n {
+        let lt = stack.config.pattern[l]
+        if lt == 0 {
+            total = total + rglru_params
+        } else {
+            total = total + attn_params
+        }
+        total = total + mlp_params + 2 * norm_params
+    }
+    total = total + norm_params
+    return total
+}
+
+// ===================================================================
+//  Verify recurrent vs sequential equivalence
+// ===================================================================
+
+fn griffin_verify_equivalence(stack, token_ids, emb_seed) {
+    let d = stack.config.d_model
+    let n = len(token_ids)
+    let n_layers = stack.config.n_layers
+    // Recurrent mode
+    let mut state = create_griffin_state(n_layers, d)
+    let mut rec_outs = []
+    for t in 0..n {
+        let emb = griffin_embed(token_ids[t], d, emb_seed)
+        let res = griffin_stack_step(stack, emb, state)
+        rec_outs = rec_outs + [res[0]]
+        state = res[1]
+    }
+    // Sequential (parallel) mode
+    let embs = griffin_embed_seq(token_ids, d, emb_seed)
+    let par_outs = griffin_stack_sequence(stack, embs)
+    // Compare
+    let mut max_diff = 0.0
+    for t in 0..n {
+        for i in 0..d {
+            let diff = griffin_abs(rec_outs[t][i] - par_outs[t][i])
+            if diff > max_diff { max_diff = diff }
+        }
+    }
+    return max_diff
+}
+
+println("[griffin] loaded — RG-LRU + local window attention hybrid + multi-layer stack + recurrent inference")

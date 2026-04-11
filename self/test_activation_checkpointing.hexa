@@ -1,0 +1,789 @@
+// ===================================================================
+//  test_activation_checkpointing.hexa — Activation Checkpointing (#132)
+//
+//  Tests (35):
+//    T1  create_layer returns 5-element array
+//    T2  layer accessors return correct values
+//    T3  create_model wraps layers + stats
+//    T4  mark_checkpoint sets flag
+//    T5  unmark_checkpoint clears flag
+//    T6  mark_no_recompute sets flag
+//    T7  unmark_no_recompute clears flag
+//    T8  clear_checkpoints clears all
+//    T9  segment policy every-2 on 8 layers
+//    T10 segment policy sets last layer
+//    T11 sqrt policy on 16 layers -> segment ~4
+//    T12 every-layer policy checkpoints all
+//    T13 none policy clears all
+//    T14 auto_policy selects "none" if budget large
+//    T15 auto_policy selects "sqrt" for medium budget
+//    T16 auto_policy selects "every" for tiny budget
+//    T17 estimate_memory_no_ckpt sums all activations
+//    T18 estimate_memory with ckpt < without
+//    T19 memory_savings positive with checkpointing
+//    T20 memory_savings fraction in [0, 1]
+//    T21 forward_pass produces output
+//    T22 forward_pass stores checkpoint activations
+//    T23 backward_pass produces grad
+//    T24 backward_pass counts recomputations
+//    T25 stats track recompute count after backward
+//    T26 stats track forward calls
+//    T27 reset_stats clears all counters
+//    T28 tradeoff returns 5 values
+//    T29 tradeoff compute overhead > 0 with ckpt
+//    T30 nested forward produces output
+//    T31 nested backward counts inner recomputes
+//    T32 no_recompute layers not counted as recomputes
+//    T33 count_checkpoints correct
+//    T34 count_no_recompute correct
+//    T35 get_segments returns correct segment lengths
+//
+//  Run: cargo run --release -- self/test_activation_checkpointing.hexa
+// ===================================================================
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ── inline from activation_checkpointing.hexa ───────────────────
+
+fn ac_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn ac_sqrt_approx(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn ac_floor_int(x) {
+    return to_int(x)
+}
+
+fn ac_max(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn ac_min(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn ac_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn ac_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+fn ac_create_layer(id, compute_cost, activation_size) {
+    return [id, compute_cost, activation_size, 0, 0]
+}
+
+fn ac_layer_id(layer) { return layer[0] }
+fn ac_layer_cost(layer) { return layer[1] }
+fn ac_layer_actsize(layer) { return layer[2] }
+fn ac_layer_is_ckpt(layer) { return layer[3] }
+fn ac_layer_is_norecompute(layer) { return layer[4] }
+
+fn ac_create_model(layers) {
+    let stats = [0, 0.0, 0, 0]
+    return [layers, stats]
+}
+
+fn ac_model_layers(model) { return model[0] }
+fn ac_model_stats(model) { return model[1] }
+
+fn ac_model_num_layers(model) {
+    return len(ac_model_layers(model))
+}
+
+fn ac_mark_checkpoint(model, layer_idx) {
+    let layers = ac_model_layers(model)
+    let n = len(layers)
+    if layer_idx < 0 { return model }
+    if layer_idx >= n { return model }
+    let mut new_layers = []
+    for i in 0..n {
+        let l = layers[i]
+        if i == layer_idx {
+            new_layers = new_layers + [[l[0], l[1], l[2], 1, l[4]]]
+        } else {
+            new_layers = new_layers + [l]
+        }
+    }
+    return [new_layers, ac_model_stats(model)]
+}
+
+fn ac_unmark_checkpoint(model, layer_idx) {
+    let layers = ac_model_layers(model)
+    let n = len(layers)
+    if layer_idx < 0 { return model }
+    if layer_idx >= n { return model }
+    let mut new_layers = []
+    for i in 0..n {
+        let l = layers[i]
+        if i == layer_idx {
+            new_layers = new_layers + [[l[0], l[1], l[2], 0, l[4]]]
+        } else {
+            new_layers = new_layers + [l]
+        }
+    }
+    return [new_layers, ac_model_stats(model)]
+}
+
+fn ac_mark_no_recompute(model, layer_idx) {
+    let layers = ac_model_layers(model)
+    let n = len(layers)
+    if layer_idx < 0 { return model }
+    if layer_idx >= n { return model }
+    let mut new_layers = []
+    for i in 0..n {
+        let l = layers[i]
+        if i == layer_idx {
+            new_layers = new_layers + [[l[0], l[1], l[2], l[3], 1]]
+        } else {
+            new_layers = new_layers + [l]
+        }
+    }
+    return [new_layers, ac_model_stats(model)]
+}
+
+fn ac_unmark_no_recompute(model, layer_idx) {
+    let layers = ac_model_layers(model)
+    let n = len(layers)
+    if layer_idx < 0 { return model }
+    if layer_idx >= n { return model }
+    let mut new_layers = []
+    for i in 0..n {
+        let l = layers[i]
+        if i == layer_idx {
+            new_layers = new_layers + [[l[0], l[1], l[2], l[3], 0]]
+        } else {
+            new_layers = new_layers + [l]
+        }
+    }
+    return [new_layers, ac_model_stats(model)]
+}
+
+fn ac_clear_checkpoints(model) {
+    let layers = ac_model_layers(model)
+    let n = len(layers)
+    let mut new_layers = []
+    for i in 0..n {
+        let l = layers[i]
+        new_layers = new_layers + [[l[0], l[1], l[2], 0, l[4]]]
+    }
+    return [new_layers, ac_model_stats(model)]
+}
+
+fn ac_apply_segment_policy(model, segment_size) {
+    let layers = ac_model_layers(model)
+    let n = len(layers)
+    let mut seg = segment_size
+    if seg < 1 { seg = 1 }
+    let mut new_layers = []
+    for i in 0..n {
+        let l = layers[i]
+        let mut is_ckpt = 0
+        if i % seg == 0 { is_ckpt = 1 }
+        if i == n - 1 { is_ckpt = 1 }
+        new_layers = new_layers + [[l[0], l[1], l[2], is_ckpt, l[4]]]
+    }
+    return [new_layers, ac_model_stats(model)]
+}
+
+fn ac_apply_sqrt_policy(model) {
+    let n = ac_model_num_layers(model)
+    let seg = ac_floor_int(ac_sqrt_approx(to_float(n)))
+    let mut final_seg = seg
+    if final_seg < 1 { final_seg = 1 }
+    return ac_apply_segment_policy(model, final_seg)
+}
+
+fn ac_apply_every_layer_policy(model) {
+    return ac_apply_segment_policy(model, 1)
+}
+
+fn ac_apply_none_policy(model) {
+    return ac_clear_checkpoints(model)
+}
+
+fn ac_estimate_memory_no_ckpt(model) {
+    let layers = ac_model_layers(model)
+    let n = len(layers)
+    let mut total = 0.0
+    for i in 0..n {
+        total = total + to_float(ac_layer_actsize(layers[i]))
+    }
+    return total
+}
+
+fn ac_estimate_memory(model) {
+    let layers = ac_model_layers(model)
+    let n = len(layers)
+    if n == 0 { return 0.0 }
+
+    let mut has_ckpt = false
+    for i in 0..n {
+        if ac_layer_is_ckpt(layers[i]) == 1 { has_ckpt = true }
+    }
+    if !has_ckpt { return ac_estimate_memory_no_ckpt(model) }
+
+    let mut ckpt_mem = 0.0
+    for i in 0..n {
+        if ac_layer_is_ckpt(layers[i]) == 1 {
+            ckpt_mem = ckpt_mem + to_float(ac_layer_actsize(layers[i]))
+        }
+    }
+
+    let mut norecomp_mem = 0.0
+    for i in 0..n {
+        if ac_layer_is_norecompute(layers[i]) == 1 {
+            if ac_layer_is_ckpt(layers[i]) == 0 {
+                norecomp_mem = norecomp_mem + to_float(ac_layer_actsize(layers[i]))
+            }
+        }
+    }
+
+    let mut max_seg = 0.0
+    let mut cur_seg = 0.0
+    for i in 0..n {
+        if ac_layer_is_ckpt(layers[i]) == 1 {
+            if cur_seg > max_seg { max_seg = cur_seg }
+            cur_seg = 0.0
+        } else {
+            if ac_layer_is_norecompute(layers[i]) == 0 {
+                cur_seg = cur_seg + to_float(ac_layer_actsize(layers[i]))
+            }
+        }
+    }
+    if cur_seg > max_seg { max_seg = cur_seg }
+
+    return ckpt_mem + norecomp_mem + max_seg
+}
+
+fn ac_memory_savings(model) {
+    let no_ckpt = ac_estimate_memory_no_ckpt(model)
+    let with_ckpt = ac_estimate_memory(model)
+    let saved = no_ckpt - with_ckpt
+    let mut frac = 0.0
+    if no_ckpt > 0.0 {
+        frac = saved / no_ckpt
+    }
+    return [saved, frac]
+}
+
+fn ac_forward_pass(model, input) {
+    let layers = ac_model_layers(model)
+    let n = len(layers)
+    let mut current = input
+    let mut stored = []
+
+    let stats = ac_model_stats(model)
+    let new_stats = [stats[0], stats[1], stats[2] + 1, stats[3]]
+
+    for i in 0..n {
+        let l = layers[i]
+        let cost = to_float(ac_layer_cost(l))
+        let mut next = []
+        let dim = len(current)
+        for d in 0..dim {
+            next = next + [current[d] * (1.0 + cost / 100.0)]
+        }
+        current = next
+
+        if ac_layer_is_ckpt(l) == 1 {
+            stored = stored + [[i, current]]
+        } else {
+            if ac_layer_is_norecompute(l) == 1 {
+                stored = stored + [[i, current]]
+            }
+        }
+    }
+
+    let new_model = [layers, new_stats]
+    return [current, stored, new_model]
+}
+
+fn ac_backward_pass(model, grad) {
+    let layers = ac_model_layers(model)
+    let n = len(layers)
+    let mut current_grad = grad
+    let mut recompute_count = 0
+
+    for idx in 0..n {
+        let i = n - 1 - idx
+        let l = layers[i]
+
+        if ac_layer_is_ckpt(l) == 0 {
+            if ac_layer_is_norecompute(l) == 0 {
+                recompute_count = recompute_count + 1
+            }
+        }
+
+        let cost = to_float(ac_layer_cost(l))
+        let dim = len(current_grad)
+        let mut next_grad = []
+        for d in 0..dim {
+            next_grad = next_grad + [current_grad[d] * (1.0 + cost / 100.0)]
+        }
+        current_grad = next_grad
+    }
+
+    let stats = ac_model_stats(model)
+    let mem_saved_est = to_float(recompute_count) * 100.0
+    let new_stats = [stats[0] + recompute_count, stats[1] + mem_saved_est, stats[2], stats[3] + 1]
+    let new_model = [layers, new_stats]
+
+    return [current_grad, recompute_count, new_model]
+}
+
+fn ac_tradeoff(model) {
+    let layers = ac_model_layers(model)
+    let n = len(layers)
+
+    let mem_with = ac_estimate_memory(model)
+    let mem_without = ac_estimate_memory_no_ckpt(model)
+    let mut savings_frac = 0.0
+    if mem_without > 0.0 {
+        savings_frac = (mem_without - mem_with) / mem_without
+    }
+
+    let mut total_compute = 0.0
+    let mut extra_compute = 0.0
+    for i in 0..n {
+        let l = layers[i]
+        let cost = to_float(ac_layer_cost(l))
+        total_compute = total_compute + cost
+        if ac_layer_is_ckpt(l) == 0 {
+            if ac_layer_is_norecompute(l) == 0 {
+                extra_compute = extra_compute + cost
+            }
+        }
+    }
+
+    let mut compute_overhead = 0.0
+    if total_compute > 0.0 {
+        compute_overhead = extra_compute / total_compute
+    }
+
+    return [mem_with, mem_without, savings_frac, extra_compute, compute_overhead]
+}
+
+fn ac_get_stats(model) {
+    let s = ac_model_stats(model)
+    return [s[0], s[1], s[2], s[3]]
+}
+
+fn ac_reset_stats(model) {
+    let layers = ac_model_layers(model)
+    return [layers, [0, 0.0, 0, 0]]
+}
+
+fn ac_count_checkpoints(model) {
+    let layers = ac_model_layers(model)
+    let n = len(layers)
+    let mut count = 0
+    for i in 0..n {
+        if ac_layer_is_ckpt(layers[i]) == 1 { count = count + 1 }
+    }
+    return count
+}
+
+fn ac_count_no_recompute(model) {
+    let layers = ac_model_layers(model)
+    let n = len(layers)
+    let mut count = 0
+    for i in 0..n {
+        if ac_layer_is_norecompute(layers[i]) == 1 { count = count + 1 }
+    }
+    return count
+}
+
+fn ac_auto_policy(model, memory_budget) {
+    let mem_no_ckpt = ac_estimate_memory_no_ckpt(model)
+    if mem_no_ckpt <= memory_budget {
+        let m = ac_apply_none_policy(model)
+        return [m, "none"]
+    }
+    let m_sqrt = ac_apply_sqrt_policy(model)
+    let mem_sqrt = ac_estimate_memory(m_sqrt)
+    if mem_sqrt <= memory_budget {
+        return [m_sqrt, "sqrt"]
+    }
+    let m_every = ac_apply_every_layer_policy(model)
+    return [m_every, "every"]
+}
+
+fn ac_create_nested(outer_layers, inner_layers) {
+    let outer = ac_create_model(outer_layers)
+    let inner = ac_create_model(inner_layers)
+    return [outer, inner]
+}
+
+fn ac_nested_outer(nested) { return nested[0] }
+fn ac_nested_inner(nested) { return nested[1] }
+
+fn ac_forward_nested(nested, input) {
+    let outer = ac_nested_outer(nested)
+    let inner = ac_nested_inner(nested)
+
+    let outer_layers = ac_model_layers(outer)
+    let n_outer = len(outer_layers)
+    let mid = n_outer / 2
+    let mut current = input
+
+    for i in 0..mid {
+        let l = outer_layers[i]
+        let cost = to_float(ac_layer_cost(l))
+        let dim = len(current)
+        let mut next = []
+        for d in 0..dim {
+            next = next + [current[d] * (1.0 + cost / 100.0)]
+        }
+        current = next
+    }
+
+    let inner_result = ac_forward_pass(inner, current)
+    current = inner_result[0]
+    let inner_stored = inner_result[1]
+    let inner_updated = inner_result[2]
+
+    for i in mid..n_outer {
+        let l = outer_layers[i]
+        let cost = to_float(ac_layer_cost(l))
+        let dim = len(current)
+        let mut next = []
+        for d in 0..dim {
+            next = next + [current[d] * (1.0 + cost / 100.0)]
+        }
+        current = next
+    }
+
+    let new_nested = [outer, inner_updated]
+    return [current, inner_stored, new_nested]
+}
+
+fn ac_backward_nested(nested, grad) {
+    let outer = ac_nested_outer(nested)
+    let inner = ac_nested_inner(nested)
+
+    let outer_layers = ac_model_layers(outer)
+    let n_outer = len(outer_layers)
+    let mid = n_outer / 2
+    let mut current_grad = grad
+
+    for idx in 0..(n_outer - mid) {
+        let i = n_outer - 1 - idx
+        let l = outer_layers[i]
+        let cost = to_float(ac_layer_cost(l))
+        let dim = len(current_grad)
+        let mut next_grad = []
+        for d in 0..dim {
+            next_grad = next_grad + [current_grad[d] * (1.0 + cost / 100.0)]
+        }
+        current_grad = next_grad
+    }
+
+    let inner_result = ac_backward_pass(inner, current_grad)
+    current_grad = inner_result[0]
+    let inner_recomp = inner_result[1]
+    let inner_updated = inner_result[2]
+
+    for idx in 0..mid {
+        let i = mid - 1 - idx
+        let l = outer_layers[i]
+        let cost = to_float(ac_layer_cost(l))
+        let dim = len(current_grad)
+        let mut next_grad = []
+        for d in 0..dim {
+            next_grad = next_grad + [current_grad[d] * (1.0 + cost / 100.0)]
+        }
+        current_grad = next_grad
+    }
+
+    let new_nested = [outer, inner_updated]
+    return [current_grad, inner_recomp, new_nested]
+}
+
+fn ac_estimate_nested_memory(nested) {
+    let outer_mem = ac_estimate_memory(ac_nested_outer(nested))
+    let inner_mem = ac_estimate_memory(ac_nested_inner(nested))
+    return outer_mem + inner_mem
+}
+
+fn ac_get_segments(model) {
+    let layers = ac_model_layers(model)
+    let n = len(layers)
+    let mut segments = []
+    let mut cur_len = 0
+    for i in 0..n {
+        cur_len = cur_len + 1
+        if ac_layer_is_ckpt(layers[i]) == 1 {
+            segments = segments + [cur_len]
+            cur_len = 0
+        }
+    }
+    if cur_len > 0 {
+        segments = segments + [cur_len]
+    }
+    return segments
+}
+
+fn ac_total_recompute_cost(model) {
+    let layers = ac_model_layers(model)
+    let n = len(layers)
+    let mut total = 0.0
+    for i in 0..n {
+        let l = layers[i]
+        if ac_layer_is_ckpt(l) == 0 {
+            if ac_layer_is_norecompute(l) == 0 {
+                total = total + to_float(ac_layer_cost(l))
+            }
+        }
+    }
+    return total
+}
+
+// ===================================================================
+//  Build test model: 8 layers, each with cost=10, activation_size=100
+// ===================================================================
+
+fn make_test_layers(n, cost, actsize) {
+    let mut layers = []
+    for i in 0..n {
+        layers = layers + [ac_create_layer(i, cost, actsize)]
+    }
+    return layers
+}
+
+// ===================================================================
+//  TESTS
+// ===================================================================
+
+// T1: create_layer returns 5-element array
+let l0 = ac_create_layer(0, 10, 100)
+check("T1 create_layer returns 5 elements", len(l0) == 5)
+
+// T2: layer accessors
+check("T2a layer id correct", ac_layer_id(l0) == 0)
+check("T2b layer cost correct", ac_layer_cost(l0) == 10)
+check("T2c layer actsize correct", ac_layer_actsize(l0) == 100)
+check("T2d layer not checkpoint by default", ac_layer_is_ckpt(l0) == 0)
+check("T2e layer not no_recompute by default", ac_layer_is_norecompute(l0) == 0)
+
+// T3: create_model wraps layers + stats
+let layers8 = make_test_layers(8, 10, 100)
+let model = ac_create_model(layers8)
+check("T3a model has 8 layers", ac_model_num_layers(model) == 8)
+let init_stats = ac_get_stats(model)
+check("T3b initial recompute count = 0", init_stats[0] == 0)
+
+// T4: mark_checkpoint sets flag
+let m4 = ac_mark_checkpoint(model, 3)
+let l4 = ac_model_layers(m4)
+check("T4 layer 3 is now checkpoint", ac_layer_is_ckpt(l4[3]) == 1)
+
+// T5: unmark_checkpoint clears flag
+let m5 = ac_unmark_checkpoint(m4, 3)
+let l5 = ac_model_layers(m5)
+check("T5 layer 3 no longer checkpoint", ac_layer_is_ckpt(l5[3]) == 0)
+
+// T6: mark_no_recompute sets flag
+let m6 = ac_mark_no_recompute(model, 0)
+let l6 = ac_model_layers(m6)
+check("T6 layer 0 is no_recompute", ac_layer_is_norecompute(l6[0]) == 1)
+
+// T7: unmark_no_recompute clears flag
+let m7 = ac_unmark_no_recompute(m6, 0)
+let l7 = ac_model_layers(m7)
+check("T7 layer 0 no longer no_recompute", ac_layer_is_norecompute(l7[0]) == 0)
+
+// T8: clear_checkpoints
+let m8a = ac_mark_checkpoint(model, 0)
+let m8b = ac_mark_checkpoint(m8a, 4)
+let m8c = ac_clear_checkpoints(m8b)
+check("T8 clear_checkpoints removes all", ac_count_checkpoints(m8c) == 0)
+
+// T9: segment policy every-2 on 8 layers
+// layers 0,2,4,6,7 should be checkpoints
+let m9 = ac_apply_segment_policy(model, 2)
+let ckpt9 = ac_count_checkpoints(m9)
+check("T9 segment_policy(2) on 8 layers -> 5 checkpoints", ckpt9 == 5)
+
+// T10: segment policy last layer always set
+let l10 = ac_model_layers(m9)
+check("T10 last layer is checkpoint", ac_layer_is_ckpt(l10[7]) == 1)
+
+// T11: sqrt policy on 16 layers -> segment ~4, checkpoints at 0,4,8,12,15
+let layers16 = make_test_layers(16, 10, 100)
+let model16 = ac_create_model(layers16)
+let m11 = ac_apply_sqrt_policy(model16)
+let ckpt11 = ac_count_checkpoints(m11)
+check("T11 sqrt policy on 16 layers gives 5 checkpoints", ckpt11 == 5)
+
+// T12: every-layer policy checkpoints all
+let m12 = ac_apply_every_layer_policy(model)
+check("T12 every-layer policy: all 8 checkpointed", ac_count_checkpoints(m12) == 8)
+
+// T13: none policy clears all
+let m13 = ac_apply_none_policy(m12)
+check("T13 none policy: 0 checkpoints", ac_count_checkpoints(m13) == 0)
+
+// T14: auto_policy selects "none" if budget large
+let ap14 = ac_auto_policy(model, 10000.0)
+check("T14 auto_policy large budget -> none", ap14[1] == "none")
+
+// T15: auto_policy selects "sqrt" for medium budget
+// 8 layers * 100 = 800 total. sqrt(seg=2) -> 600 memory.
+// Budget 650 fits sqrt but not full.
+let ap15 = ac_auto_policy(model, 650.0)
+check("T15 auto_policy medium budget -> sqrt", ap15[1] == "sqrt")
+
+// T16: auto_policy selects "every" for tiny budget
+let ap16 = ac_auto_policy(model, 50.0)
+check("T16 auto_policy tiny budget -> every", ap16[1] == "every")
+
+// T17: estimate_memory_no_ckpt sums all activations
+let mem17 = ac_estimate_memory_no_ckpt(model)
+check("T17 no_ckpt memory = 800.0", approx(mem17, 800.0, 0.01))
+
+// T18: estimate_memory with ckpt < without
+let m18 = ac_apply_segment_policy(model, 4)
+let mem18 = ac_estimate_memory(m18)
+check("T18 ckpt memory < no-ckpt memory", mem18 < mem17)
+
+// T19: memory_savings positive
+let sav19 = ac_memory_savings(m18)
+check("T19 memory saved > 0", sav19[0] > 0.0)
+
+// T20: savings fraction in [0, 1]
+check("T20 savings fraction >= 0", sav19[1] >= 0.0)
+check("T20b savings fraction <= 1", sav19[1] <= 1.0)
+
+// T21: forward_pass produces output
+let m21 = ac_apply_segment_policy(model, 2)
+let input21 = [1.0, 2.0, 3.0, 4.0]
+let fwd21 = ac_forward_pass(m21, input21)
+let output21 = fwd21[0]
+check("T21 forward output has 4 dims", len(output21) == 4)
+
+// T22: forward_pass stores checkpoint activations
+let stored21 = fwd21[1]
+check("T22 stored activations > 0", len(stored21) > 0)
+
+// T23: backward_pass produces grad
+let m21_updated = fwd21[2]
+let grad21 = [1.0, 1.0, 1.0, 1.0]
+let bwd21 = ac_backward_pass(m21_updated, grad21)
+let grad_out = bwd21[0]
+check("T23 backward grad has 4 dims", len(grad_out) == 4)
+
+// T24: backward_pass counts recomputations
+let recomp_count = bwd21[1]
+check("T24 recompute count > 0", recomp_count > 0)
+
+// T25: stats track recompute count
+let m25 = bwd21[2]
+let stats25 = ac_get_stats(m25)
+check("T25 stats recompute_count > 0", stats25[0] > 0)
+
+// T26: stats track forward calls
+let fwd26 = ac_forward_pass(model, [1.0, 2.0])
+let m26 = fwd26[2]
+let stats26 = ac_get_stats(m26)
+check("T26 stats forward_calls = 1", stats26[2] == 1)
+
+// T27: reset_stats clears all
+let m27 = ac_reset_stats(m25)
+let stats27 = ac_get_stats(m27)
+check("T27 reset stats: recompute = 0", stats27[0] == 0)
+check("T27b reset stats: forward = 0", stats27[2] == 0)
+
+// T28: tradeoff returns 5 values
+let m28 = ac_apply_segment_policy(model, 2)
+let t28 = ac_tradeoff(m28)
+check("T28 tradeoff returns 5 values", len(t28) == 5)
+
+// T29: tradeoff compute overhead > 0
+check("T29 tradeoff compute overhead > 0", t28[4] > 0.0)
+
+// T30: nested forward produces output
+let outer_layers = make_test_layers(4, 5, 50)
+let inner_layers = make_test_layers(4, 10, 100)
+let nested = ac_create_nested(outer_layers, inner_layers)
+let inner_ckpt = ac_apply_segment_policy(ac_nested_inner(nested), 2)
+let nested2 = [ac_nested_outer(nested), inner_ckpt]
+let nfwd = ac_forward_nested(nested2, [1.0, 2.0, 3.0])
+let nfwd_out = nfwd[0]
+check("T30 nested forward output has 3 dims", len(nfwd_out) == 3)
+
+// T31: nested backward counts inner recomputes
+let nested3 = nfwd[2]
+let nbwd = ac_backward_nested(nested3, [1.0, 1.0, 1.0])
+let inner_recomp = nbwd[1]
+check("T31 nested backward inner recomputes > 0", inner_recomp > 0)
+
+// T32: no_recompute layers not counted as recomputes
+let m32_base = ac_apply_segment_policy(model, 4)
+let m32 = ac_mark_no_recompute(m32_base, 1)
+let bwd32 = ac_backward_pass(m32, [1.0, 1.0, 1.0, 1.0])
+let recomp32 = bwd32[1]
+// Without no_recompute, we'd have more recomputations
+let bwd32b = ac_backward_pass(m32_base, [1.0, 1.0, 1.0, 1.0])
+let recomp32b = bwd32b[1]
+check("T32 no_recompute reduces recompute count", recomp32 < recomp32b)
+
+// T33: count_checkpoints correct
+let m33 = ac_mark_checkpoint(model, 0)
+let m33b = ac_mark_checkpoint(m33, 4)
+let m33c = ac_mark_checkpoint(m33b, 7)
+check("T33 count_checkpoints = 3", ac_count_checkpoints(m33c) == 3)
+
+// T34: count_no_recompute correct
+let m34 = ac_mark_no_recompute(model, 0)
+let m34b = ac_mark_no_recompute(m34, 1)
+check("T34 count_no_recompute = 2", ac_count_no_recompute(m34b) == 2)
+
+// T35: get_segments returns correct lengths
+// 8 layers, checkpoints at 0, 4, 7 -> segments [1, 4, 3]
+let m35 = ac_mark_checkpoint(model, 0)
+let m35b = ac_mark_checkpoint(m35, 4)
+let m35c = ac_mark_checkpoint(m35b, 7)
+let segs = ac_get_segments(m35c)
+check("T35a 3 segments", len(segs) == 3)
+check("T35b first segment length = 1", segs[0] == 1)
+check("T35c second segment length = 4", segs[1] == 4)
+check("T35d third segment length = 3", segs[2] == 3)
+
+// ===================================================================
+println("")
+println("=== activation_checkpointing test summary ===")
+println("PASS: " + str(pass_count))
+println("FAIL: " + str(fail_count))
+println("TOTAL: " + str(pass_count + fail_count))

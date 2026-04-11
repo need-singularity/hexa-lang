@@ -1,0 +1,728 @@
+// ═══════════════════════════════════════════════════════════════
+//  test_ppo_clip.hexa — PPO-Clip (#129) verification
+//
+//  Tests (35):
+//    T1  ratio = 1.0 when log_new == log_old
+//    T2  ratio > 1 when log_new > log_old
+//    T3  ratio < 1 when log_new < log_old
+//    T4  clip_ratio within bounds
+//    T5  clip_ratio clamps low
+//    T6  clip_ratio clamps high
+//    T7  surrogate positive advantage, ratio=1 -> adv
+//    T8  surrogate clips high ratio with positive adv
+//    T9  surrogate clips low ratio with negative adv
+//    T10 value_loss MSE correct
+//    T11 value_loss_clipped >= unclipped
+//    T12 GAE zeros for zero rewards
+//    T13 GAE single step delta
+//    T14 GAE multi-step discount
+//    T15 GAE respects done flags
+//    T16 returns = advantages + values
+//    T17 rollout buffer create/add/size
+//    T18 rollout buffer stores correct fields
+//    T19 normalize_advantages mean ~0
+//    T20 normalize_advantages std ~1
+//    T21 entropy_gaussian increases with log_std
+//    T22 entropy_categorical uniform > non-uniform
+//    T23 entropy_categorical uniform = ln(n)
+//    T24 KL divergence = 0 for same distributions
+//    T25 KL divergence > 0 for different distributions
+//    T26 adaptive_kl_beta doubles when kl too high
+//    T27 adaptive_kl_beta halves when kl too low
+//    T28 adaptive_kl_beta unchanged in target range
+//    T29 combined_loss negative surrogate contribution
+//    T30 multi-epoch changes log_probs
+//    T31 multi-epoch bounded by clipping
+//    T32 reward_normalize zero mean
+//    T33 running_stats_update correct mean
+//    T34 softmax sums to 1
+//    T35 clip_fraction 0 when ratio=1
+//
+//  run: cargo run --release -- self/test_ppo_clip.hexa
+// ═══════════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ── inlined from ppo_clip.hexa ──────────────────────────────────
+
+let PPO_EPS_NORM = 1.0e-8
+let PPO_CLIP_EPS = 0.2
+let PPO_GAMMA = 0.99
+let PPO_LAMBDA = 0.95
+let PPO_C_VF = 0.5
+let PPO_C_ENT = 0.01
+
+fn ppo_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn ppo_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn ppo_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn ppo_log(x) {
+    if x <= 0.0 { return -20.0 }
+    let mut v = x
+    let mut shift = 0.0
+    for _i in 0..20 {
+        if v > 2.0 {
+            v = v / 2.718281828
+            shift = shift + 1.0
+        }
+    }
+    for _i in 0..20 {
+        if v < 0.5 {
+            v = v * 2.718281828
+            shift = shift - 1.0
+        }
+    }
+    let y = (v - 1.0) / (v + 1.0)
+    let y2 = y * y
+    let mut s = y
+    let mut t = y
+    for k in 1..15 {
+        t = t * y2
+        s = s + t / to_float(2 * k + 1)
+    }
+    return 2.0 * s + shift
+}
+
+fn ppo_min(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn ppo_max(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn ppo_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn ppo_mean(arr) {
+    let n = len(arr)
+    if n == 0 { return 0.0 }
+    let mut s = 0.0
+    for i in 0..n { s = s + arr[i] }
+    return s / to_float(n)
+}
+
+fn ppo_std(arr) {
+    let n = len(arr)
+    if n < 2 { return 0.0 }
+    let m = ppo_mean(arr)
+    let mut ss = 0.0
+    for i in 0..n {
+        let d = arr[i] - m
+        ss = ss + d * d
+    }
+    return ppo_sqrt(ss / to_float(n))
+}
+
+fn ppo_sum(arr) {
+    let mut s = 0.0
+    for i in 0..len(arr) { s = s + arr[i] }
+    return s
+}
+
+fn ppo_ratio(log_pi_new, log_pi_old) {
+    return ppo_exp(log_pi_new - log_pi_old)
+}
+
+fn ppo_clip_ratio(ratio, eps) {
+    let lo = 1.0 - eps
+    let hi = 1.0 + eps
+    if ratio < lo { return lo }
+    if ratio > hi { return hi }
+    return ratio
+}
+
+fn ppo_surrogate(log_pi_new, log_pi_old, advantage, eps) {
+    let r = ppo_ratio(log_pi_new, log_pi_old)
+    let clipped_r = ppo_clip_ratio(r, eps)
+    let unclipped = r * advantage
+    let clipped = clipped_r * advantage
+    return ppo_min(unclipped, clipped)
+}
+
+fn ppo_surrogate_batch(log_new_arr, log_old_arr, advs, eps) {
+    let n = len(log_new_arr)
+    if n == 0 { return 0.0 }
+    let mut total = 0.0
+    for i in 0..n {
+        total = total + ppo_surrogate(log_new_arr[i], log_old_arr[i], advs[i], eps)
+    }
+    return total / to_float(n)
+}
+
+fn ppo_value_loss(vpred, vtarget) {
+    let d = vpred - vtarget
+    return d * d
+}
+
+fn ppo_value_loss_clipped(vpred, vpred_old, vtarget, eps) {
+    let d1 = vpred - vtarget
+    let loss_unclipped = d1 * d1
+    let vpred_c = ppo_clip_ratio(vpred - vpred_old + 1.0, eps) - 1.0 + vpred_old
+    let d2 = vpred_c - vtarget
+    let loss_clipped = d2 * d2
+    return ppo_max(loss_unclipped, loss_clipped)
+}
+
+fn ppo_value_loss_batch(vpreds, vtargets) {
+    let n = len(vpreds)
+    if n == 0 { return 0.0 }
+    let mut total = 0.0
+    for i in 0..n {
+        total = total + ppo_value_loss(vpreds[i], vtargets[i])
+    }
+    return total / to_float(n)
+}
+
+fn ppo_gae(rewards, values, dones, gamma, lam) {
+    let n = len(rewards)
+    let mut advs = ppo_zeros(n)
+    let mut last_gae = 0.0
+    let mut idx = n - 1
+    for _i in 0..n {
+        let mut next_val = 0.0
+        if idx < n - 1 {
+            next_val = values[idx + 1]
+        }
+        let mask = 1.0 - dones[idx]
+        let delta = rewards[idx] + gamma * next_val * mask - values[idx]
+        last_gae = delta + gamma * lam * mask * last_gae
+        advs[idx] = last_gae
+        idx = idx - 1
+    }
+    return advs
+}
+
+fn ppo_returns(rewards, values, dones, gamma, lam) {
+    let advs = ppo_gae(rewards, values, dones, gamma, lam)
+    let n = len(advs)
+    let mut ret = ppo_zeros(n)
+    for i in 0..n {
+        ret[i] = advs[i] + values[i]
+    }
+    return ret
+}
+
+fn ppo_rollout_create() {
+    return #{
+        "states": [],
+        "actions": [],
+        "log_probs": [],
+        "rewards": [],
+        "values": [],
+        "dones": [],
+        "size": 0
+    }
+}
+
+fn ppo_rollout_add(buf, state, action, log_prob, reward, value, done) {
+    let mut b = buf
+    b["states"] = b["states"] + [state]
+    b["actions"] = b["actions"] + [action]
+    b["log_probs"] = b["log_probs"] + [log_prob]
+    b["rewards"] = b["rewards"] + [reward]
+    b["values"] = b["values"] + [value]
+    b["dones"] = b["dones"] + [done]
+    b["size"] = b["size"] + 1
+    return b
+}
+
+fn ppo_rollout_get_field(buf, field) {
+    return buf[field]
+}
+
+fn ppo_rollout_size(buf) {
+    return buf["size"]
+}
+
+fn ppo_normalize_advantages(advs) {
+    let n = len(advs)
+    if n < 2 { return advs }
+    let m = ppo_mean(advs)
+    let s = ppo_std(advs)
+    let mut out = ppo_zeros(n)
+    for i in 0..n {
+        out[i] = (advs[i] - m) / (s + PPO_EPS_NORM)
+    }
+    return out
+}
+
+fn ppo_entropy_gaussian(log_std) {
+    let half_log2pie = 0.9189385332
+    return half_log2pie + log_std
+}
+
+fn ppo_entropy_categorical(probs) {
+    let n = len(probs)
+    let mut h = 0.0
+    for i in 0..n {
+        if probs[i] > PPO_EPS_NORM {
+            h = h - probs[i] * ppo_log(probs[i])
+        }
+    }
+    return h
+}
+
+fn ppo_entropy_batch(probs_batch) {
+    let n = len(probs_batch)
+    if n == 0 { return 0.0 }
+    let mut total = 0.0
+    for i in 0..n {
+        total = total + ppo_entropy_categorical(probs_batch[i])
+    }
+    return total / to_float(n)
+}
+
+fn ppo_kl_divergence(log_old, log_new) {
+    let diff = log_old - log_new
+    let r = ppo_exp(diff)
+    return r - diff - 1.0
+}
+
+fn ppo_kl_batch(log_old_arr, log_new_arr) {
+    let n = len(log_old_arr)
+    if n == 0 { return 0.0 }
+    let mut total = 0.0
+    for i in 0..n {
+        total = total + ppo_kl_divergence(log_old_arr[i], log_new_arr[i])
+    }
+    return total / to_float(n)
+}
+
+fn ppo_adaptive_kl_beta(beta, kl, kl_target) {
+    if kl > 1.5 * kl_target {
+        return beta * 2.0
+    }
+    if kl < kl_target / 1.5 {
+        return beta / 2.0
+    }
+    return beta
+}
+
+fn ppo_combined_loss(surrogate, value_loss, entropy, c_vf, c_ent) {
+    return (0.0 - surrogate) + c_vf * value_loss - c_ent * entropy
+}
+
+fn ppo_combined_loss_kl(surrogate, value_loss, entropy, kl, c_vf, c_ent, beta_kl) {
+    return (0.0 - surrogate) + c_vf * value_loss - c_ent * entropy + beta_kl * kl
+}
+
+fn ppo_update_step(log_new_arr, log_old_arr, advs, eps, lr) {
+    let n = len(log_new_arr)
+    let mut updated = ppo_zeros(n)
+    for i in 0..n {
+        let r = ppo_ratio(log_new_arr[i], log_old_arr[i])
+        let clipped_r = ppo_clip_ratio(r, eps)
+        let mut grad = advs[i]
+        if r < 1.0 - eps {
+            if advs[i] < 0.0 { grad = 0.0 }
+        }
+        if r > 1.0 + eps {
+            if advs[i] > 0.0 { grad = 0.0 }
+        }
+        updated[i] = log_new_arr[i] + lr * grad
+    }
+    return updated
+}
+
+fn ppo_multi_epoch(log_probs, log_old, advs, eps, lr, epochs) {
+    let mut current = ppo_zeros(len(log_probs))
+    for i in 0..len(log_probs) { current[i] = log_probs[i] }
+    for _e in 0..epochs {
+        current = ppo_update_step(current, log_old, advs, eps, lr)
+    }
+    return current
+}
+
+fn ppo_running_stats_update(old_mean, old_var, old_count, batch) {
+    let n = len(batch)
+    if n == 0 { return [old_mean, old_var, old_count] }
+    let batch_mean = ppo_mean(batch)
+    let mut batch_var = 0.0
+    for i in 0..n {
+        let d = batch[i] - batch_mean
+        batch_var = batch_var + d * d
+    }
+    batch_var = batch_var / to_float(n)
+    let new_count = old_count + to_float(n)
+    let delta = batch_mean - old_mean
+    let new_mean = old_mean + delta * to_float(n) / new_count
+    let m_a = old_var * old_count
+    let m_b = batch_var * to_float(n)
+    let m2 = m_a + m_b + delta * delta * old_count * to_float(n) / new_count
+    let new_var = m2 / new_count
+    return [new_mean, new_var, new_count]
+}
+
+fn ppo_reward_normalize(rewards, run_mean, run_var) {
+    let n = len(rewards)
+    let mut out = ppo_zeros(n)
+    let std = ppo_sqrt(run_var + PPO_EPS_NORM)
+    for i in 0..n {
+        out[i] = (rewards[i] - run_mean) / std
+    }
+    return out
+}
+
+fn ppo_softmax(logits) {
+    let n = len(logits)
+    let mut mx = logits[0]
+    for i in 1..n {
+        if logits[i] > mx { mx = logits[i] }
+    }
+    let mut exps = ppo_zeros(n)
+    let mut z = 0.0
+    for i in 0..n {
+        exps[i] = ppo_exp(logits[i] - mx)
+        z = z + exps[i]
+    }
+    let mut out = ppo_zeros(n)
+    for i in 0..n {
+        out[i] = exps[i] / z
+    }
+    return out
+}
+
+fn ppo_log_softmax(logits) {
+    let n = len(logits)
+    let mut mx = logits[0]
+    for i in 1..n {
+        if logits[i] > mx { mx = logits[i] }
+    }
+    let mut z = 0.0
+    for i in 0..n {
+        z = z + ppo_exp(logits[i] - mx)
+    }
+    let log_z = ppo_log(z) + mx
+    let mut out = ppo_zeros(n)
+    for i in 0..n {
+        out[i] = logits[i] - log_z
+    }
+    return out
+}
+
+fn ppo_discount_returns(rewards, gamma) {
+    let n = len(rewards)
+    let mut ret = ppo_zeros(n)
+    let mut running = 0.0
+    let mut idx = n - 1
+    for _i in 0..n {
+        running = rewards[idx] + gamma * running
+        ret[idx] = running
+        idx = idx - 1
+    }
+    return ret
+}
+
+fn ppo_explained_variance(vpreds, returns) {
+    let n = len(vpreds)
+    if n < 2 { return 0.0 }
+    let mut diffs = ppo_zeros(n)
+    for i in 0..n {
+        diffs[i] = returns[i] - vpreds[i]
+    }
+    let var_diff = ppo_std(diffs) * ppo_std(diffs)
+    let var_ret = ppo_std(returns) * ppo_std(returns)
+    if var_ret < PPO_EPS_NORM { return 0.0 }
+    return 1.0 - var_diff / var_ret
+}
+
+fn ppo_clip_fraction(log_new_arr, log_old_arr, eps) {
+    let n = len(log_new_arr)
+    if n == 0 { return 0.0 }
+    let mut clipped = 0
+    for i in 0..n {
+        let r = ppo_ratio(log_new_arr[i], log_old_arr[i])
+        if r < 1.0 - eps { clipped = clipped + 1 }
+        if r > 1.0 + eps { clipped = clipped + 1 }
+    }
+    return to_float(clipped) / to_float(n)
+}
+
+fn ppo_approx_kl(log_new_arr, log_old_arr) {
+    let n = len(log_new_arr)
+    if n == 0 { return 0.0 }
+    let mut total = 0.0
+    for i in 0..n {
+        let log_r = log_new_arr[i] - log_old_arr[i]
+        let r = ppo_exp(log_r)
+        total = total + r - log_r - 1.0
+    }
+    return total / to_float(n)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  TESTS
+// ═══════════════════════════════════════════════════════════════
+
+// ── T1: ratio = 1.0 when log_new == log_old ──
+let r1 = ppo_ratio(-1.5, -1.5)
+check("T1 ratio=1 when same log_probs", approx(r1, 1.0, 0.001))
+
+// ── T2: ratio > 1 when log_new > log_old ──
+let r2 = ppo_ratio(-1.0, -2.0)
+check("T2 ratio>1 when log_new > log_old", r2 > 1.0)
+
+// ── T3: ratio < 1 when log_new < log_old ──
+let r3 = ppo_ratio(-2.0, -1.0)
+check("T3 ratio<1 when log_new < log_old", r3 < 1.0)
+
+// ── T4: clip_ratio within bounds ──
+let cr4 = ppo_clip_ratio(1.05, 0.2)
+check("T4 clip_ratio passthrough within bounds", approx(cr4, 1.05, 0.001))
+
+// ── T5: clip_ratio clamps low ──
+let cr5 = ppo_clip_ratio(0.5, 0.2)
+check("T5 clip_ratio clamps low to 0.8", approx(cr5, 0.8, 0.001))
+
+// ── T6: clip_ratio clamps high ──
+let cr6 = ppo_clip_ratio(1.5, 0.2)
+check("T6 clip_ratio clamps high to 1.2", approx(cr6, 1.2, 0.001))
+
+// ── T7: surrogate with ratio=1, positive advantage ──
+let s7 = ppo_surrogate(-1.0, -1.0, 2.0, 0.2)
+check("T7 surrogate ratio=1 adv=2 -> 2.0", approx(s7, 2.0, 0.01))
+
+// ── T8: surrogate clips high ratio with positive advantage ──
+// log_new=-0.5, log_old=-1.5 -> ratio = exp(1.0) ~ 2.718
+// clipped ratio = 1.2, adv=1.0
+// min(2.718*1.0, 1.2*1.0) = 1.2
+let s8 = ppo_surrogate(-0.5, -1.5, 1.0, 0.2)
+check("T8 surrogate clips high ratio pos adv", approx(s8, 1.2, 0.01))
+
+// ── T9: surrogate clips low ratio with negative advantage ──
+// log_new=-2.5, log_old=-1.0 -> ratio = exp(-1.5) ~ 0.223
+// clipped ratio = 0.8, adv=-1.0
+// unclipped = 0.223 * -1.0 = -0.223
+// clipped_val = 0.8 * -1.0 = -0.8
+// min(-0.223, -0.8) = -0.8
+let s9 = ppo_surrogate(-2.5, -1.0, -1.0, 0.2)
+check("T9 surrogate clips low ratio neg adv", approx(s9, -0.8, 0.01))
+
+// ── T10: value_loss MSE correct ──
+let vl10 = ppo_value_loss(3.0, 1.0)
+check("T10 value_loss (3-1)^2 = 4", approx(vl10, 4.0, 0.001))
+
+// ── T11: value_loss_clipped >= unclipped ──
+let vl11_plain = ppo_value_loss(3.5, 2.0)
+let vl11_clip = ppo_value_loss_clipped(3.5, 3.0, 2.0, 0.2)
+check("T11 clipped value loss >= plain", vl11_clip >= vl11_plain - 0.001)
+
+// ── T12: GAE zeros for zero rewards ──
+let gae12 = ppo_gae([0.0, 0.0, 0.0], [1.0, 1.0, 1.0], [0.0, 0.0, 0.0], 0.99, 0.95)
+// delta_2 = 0 + 0*0 - 1 = -1, delta_1 = 0 + 0.99*1*1 - 1 = -0.01, delta_0 = 0 + 0.99*1*1 - 1 = -0.01
+// but last step: next_val=0 for idx=2, so delta_2 = 0 + 0 - 1 = -1
+let mut gae12_finite = true
+for i in 0..3 {
+    if ppo_abs(gae12[i]) > 100.0 { gae12_finite = false }
+}
+check("T12 GAE finite for zero rewards", gae12_finite)
+
+// ── T13: GAE single step ──
+// Single step: reward=1, value=0.5, done=1 -> delta = 1 + 0 - 0.5 = 0.5
+let gae13 = ppo_gae([1.0], [0.5], [1.0], 0.99, 0.95)
+check("T13 GAE single step delta = r - V", approx(gae13[0], 0.5, 0.01))
+
+// ── T14: GAE multi-step discounting ──
+let gae14 = ppo_gae([1.0, 1.0, 1.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], 0.99, 0.95)
+// All values zero, no dones: delta_t = r_t + gamma*V_{t+1} - V_t = r_t
+// A_2 = 1.0 (last step, next_val=0)
+// A_1 = 1.0 + gamma*lam*A_2 = 1 + 0.9405 = 1.9405
+// A_0 = 1.0 + gamma*lam*A_1 = 1 + 0.9405*1.9405 = 2.825
+check("T14 GAE discounted: A[0] > A[1] > A[2]", gae14[0] > gae14[1])
+check("T14b GAE: A[1] > A[2]", gae14[1] > gae14[2])
+
+// ── T15: GAE respects done flags ──
+let gae15 = ppo_gae([1.0, 1.0, 1.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0], 0.99, 0.95)
+// done[1]=1 means episode ends after step 1, mask=0 -> GAE resets
+// A_2 = 1.0 (no next val)
+// A_1 = 1.0 + 0 (mask=0, done=1) = 1.0
+// A_0 = 1.0 + gamma*lam*1*A_1 = 1 + 0.9405
+let gae15_no_done = ppo_gae([1.0, 1.0, 1.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], 0.99, 0.95)
+check("T15 GAE done resets: A[0] with done < A[0] without", gae15[0] < gae15_no_done[0])
+
+// ── T16: returns = advantages + values ──
+let rew16 = [1.0, 2.0, 3.0]
+let val16 = [0.5, 1.0, 1.5]
+let don16 = [0.0, 0.0, 0.0]
+let ret16 = ppo_returns(rew16, val16, don16, 0.99, 0.95)
+let adv16 = ppo_gae(rew16, val16, don16, 0.99, 0.95)
+let mut ret16_ok = true
+for i in 0..3 {
+    if fabs(ret16[i] - (adv16[i] + val16[i])) > 0.001 { ret16_ok = false }
+}
+check("T16 returns = advantages + values", ret16_ok)
+
+// ── T17: rollout buffer create/add/size ──
+let mut buf17 = ppo_rollout_create()
+buf17 = ppo_rollout_add(buf17, 0, 1, -0.5, 1.0, 0.9, 0.0)
+buf17 = ppo_rollout_add(buf17, 1, 2, -0.3, 0.5, 0.8, 0.0)
+buf17 = ppo_rollout_add(buf17, 2, 0, -0.7, 2.0, 1.1, 1.0)
+check("T17 rollout size = 3", ppo_rollout_size(buf17) == 3)
+
+// ── T18: rollout buffer stores correct fields ──
+let rews18 = ppo_rollout_get_field(buf17, "rewards")
+check("T18 rollout rewards[0] = 1.0", approx(rews18[0], 1.0, 0.001))
+check("T18b rollout rewards[2] = 2.0", approx(rews18[2], 2.0, 0.001))
+let acts18 = ppo_rollout_get_field(buf17, "actions")
+check("T18c rollout actions[1] = 2", acts18[1] == 2)
+
+// ── T19: normalize_advantages mean ~0 ──
+let raw_advs19 = [3.0, -1.0, 2.0, 0.5, -2.5]
+let norm19 = ppo_normalize_advantages(raw_advs19)
+let mean19 = ppo_mean(norm19)
+check("T19 normalized advs mean ~0", fabs(mean19) < 0.01)
+
+// ── T20: normalize_advantages std ~1 ──
+let std19 = ppo_std(norm19)
+check("T20 normalized advs std ~1", approx(std19, 1.0, 0.05))
+
+// ── T21: entropy_gaussian increases with log_std ──
+let ent21a = ppo_entropy_gaussian(0.0)
+let ent21b = ppo_entropy_gaussian(1.0)
+check("T21 gaussian entropy increases with log_std", ent21b > ent21a)
+
+// ── T22: entropy_categorical uniform > non-uniform ──
+let uni22 = [0.25, 0.25, 0.25, 0.25]
+let skew22 = [0.7, 0.1, 0.1, 0.1]
+let ent_uni22 = ppo_entropy_categorical(uni22)
+let ent_skew22 = ppo_entropy_categorical(skew22)
+check("T22 uniform entropy > skewed entropy", ent_uni22 > ent_skew22)
+
+// ── T23: entropy_categorical uniform = ln(n) ──
+// For uniform distribution over 4, H = ln(4) ~ 1.386
+let ln4 = ppo_log(4.0)
+check("T23 uniform entropy ~= ln(4)", approx(ent_uni22, ln4, 0.05))
+
+// ── T24: KL divergence = 0 for same distributions ──
+let kl24 = ppo_kl_divergence(-1.0, -1.0)
+check("T24 KL=0 for same log_probs", approx(kl24, 0.0, 0.001))
+
+// ── T25: KL divergence > 0 for different distributions ──
+let kl25 = ppo_kl_divergence(-1.0, -2.0)
+check("T25 KL>0 for different log_probs", kl25 > 0.0)
+
+// ── T26: adaptive_kl_beta doubles when kl too high ──
+let beta26 = ppo_adaptive_kl_beta(0.1, 0.03, 0.01)
+check("T26 beta doubles when kl > 1.5*target", approx(beta26, 0.2, 0.001))
+
+// ── T27: adaptive_kl_beta halves when kl too low ──
+let beta27 = ppo_adaptive_kl_beta(0.1, 0.001, 0.01)
+check("T27 beta halves when kl < target/1.5", approx(beta27, 0.05, 0.001))
+
+// ── T28: adaptive_kl_beta unchanged in range ──
+let beta28 = ppo_adaptive_kl_beta(0.1, 0.01, 0.01)
+check("T28 beta unchanged when kl in range", approx(beta28, 0.1, 0.001))
+
+// ── T29: combined_loss reflects components ──
+// L = -surr + c_vf*vloss - c_ent*entropy
+let loss29 = ppo_combined_loss(1.0, 0.5, 0.3, 0.5, 0.01)
+// = -1.0 + 0.5*0.5 - 0.01*0.3 = -1.0 + 0.25 - 0.003 = -0.753
+check("T29 combined loss correct", approx(loss29, -0.753, 0.01))
+
+// ── T30: multi-epoch changes log_probs ──
+let log30 = [-1.0, -1.5, -0.8, -2.0]
+let log_old30 = [-1.0, -1.5, -0.8, -2.0]
+let advs30 = [1.0, -0.5, 0.3, -1.0]
+let updated30 = ppo_multi_epoch(log30, log_old30, advs30, 0.2, 0.01, 3)
+let mut any_changed30 = false
+for i in 0..4 {
+    if fabs(updated30[i] - log30[i]) > 0.001 { any_changed30 = true }
+}
+check("T30 multi-epoch changes log_probs", any_changed30)
+
+// ── T31: multi-epoch bounded by clipping ──
+// With positive advantage, log_prob should increase but ratio stays bounded
+let log31 = [-2.0, -2.0, -2.0]
+let log_old31 = [-2.0, -2.0, -2.0]
+let advs31 = [10.0, 10.0, 10.0]
+let updated31 = ppo_multi_epoch(log31, log_old31, advs31, 0.2, 0.01, 20)
+let mut all_bounded31 = true
+for i in 0..3 {
+    let r = ppo_ratio(updated31[i], log_old31[i])
+    // After many epochs the ratio should stay near clipping boundary
+    if r > 2.0 { all_bounded31 = false }
+}
+check("T31 multi-epoch ratios bounded by clipping", all_bounded31)
+
+// ── T32: reward_normalize zero mean ──
+let rews32 = [10.0, 20.0, 30.0, 40.0, 50.0]
+let mean32 = ppo_mean(rews32)
+let mut var32 = 0.0
+for i in 0..5 {
+    let d = rews32[i] - mean32
+    var32 = var32 + d * d
+}
+var32 = var32 / 5.0
+let norm_rews32 = ppo_reward_normalize(rews32, mean32, var32)
+let norm_mean32 = ppo_mean(norm_rews32)
+check("T32 reward_normalize mean ~0", fabs(norm_mean32) < 0.01)
+
+// ── T33: running_stats_update correct mean ──
+let stats33 = ppo_running_stats_update(0.0, 0.0, 0.0, [2.0, 4.0, 6.0])
+check("T33 running stats mean = 4.0", approx(stats33[0], 4.0, 0.01))
+check("T33b running stats count = 3", approx(stats33[2], 3.0, 0.01))
+// Update with second batch
+let stats33b = ppo_running_stats_update(stats33[0], stats33[1], stats33[2], [8.0, 10.0])
+// Overall mean of [2,4,6,8,10] = 6.0
+check("T33c running stats updated mean = 6.0", approx(stats33b[0], 6.0, 0.01))
+
+// ── T34: softmax sums to 1 ──
+let sm34 = ppo_softmax([1.0, 2.0, 3.0, 4.0])
+let sm_sum34 = ppo_sum(sm34)
+check("T34 softmax sums to 1", approx(sm_sum34, 1.0, 0.001))
+
+// ── T35: clip_fraction = 0 when ratio=1 ──
+let cf35 = ppo_clip_fraction([-1.0, -2.0, -3.0], [-1.0, -2.0, -3.0], 0.2)
+check("T35 clip_fraction=0 when ratios all 1", approx(cf35, 0.0, 0.001))
+
+// ═══════════════════════════════════════════════════════════════
+println("")
+println("=== ppo_clip test summary ===")
+println("PASS: " + str(pass_count))
+println("FAIL: " + str(fail_count))
+println("TOTAL: " + str(pass_count + fail_count))

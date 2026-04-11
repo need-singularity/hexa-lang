@@ -1,0 +1,803 @@
+// ===================================================================
+//  self/ml/kv_cache_compression.hexa — KV Cache Compression
+//
+//  Token merging/dropping for inference memory savings.
+//
+//  Implements:
+//    1. Attention score eviction — evict KV entries with lowest
+//       cumulative attention scores
+//    2. Heavy Hitter Oracle (H2O) — keep top-k heavy hitter tokens
+//       plus a recent window
+//    3. Token merging — merge similar KV entries by averaging
+//       their key/value vectors
+//    4. Adaptive budget — dynamically adjust cache size based on
+//       sequence length
+//    5. Sliding window + sink tokens — keep first few sink tokens
+//       plus a sliding window of recent tokens
+//    6. Quantized KV — INT8/INT4 quantization of cached key/value
+//       tensors
+//    7. Compression ratio tracker — measure actual memory savings
+//       vs full cache
+//    8. Eviction policy comparison — benchmark different policies
+//       on same input
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+//    @hot   — performance-critical path
+// ===================================================================
+
+// ===================================================================
+//  Utility helpers
+// ===================================================================
+
+fn kvc_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn kvc_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn kvc_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn kvc_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+fn kvc_ones(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [1.0] }
+    return v
+}
+
+fn kvc_fill_float(n, val) {
+    let mut v = []
+    for _i in 0..n { v = v + [val] }
+    return v
+}
+
+fn kvc_max_f(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn kvc_min_f(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn kvc_min_i(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn kvc_max_i(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn kvc_floor(x) {
+    return to_int(x)
+}
+
+fn kvc_clamp_f(x, lo, hi) {
+    if x < lo { return lo }
+    if x > hi { return hi }
+    return x
+}
+
+// Dot product of two vectors
+@pure
+fn kvc_dot(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    for i in 0..n {
+        s = s + a[i] * b[i]
+    }
+    return s
+}
+
+// L2 norm
+@pure
+fn kvc_norm(v) {
+    return kvc_sqrt(kvc_dot(v, v))
+}
+
+// Cosine similarity
+@pure
+fn kvc_cosine_sim(a, b) {
+    let na = kvc_norm(a)
+    let nb = kvc_norm(b)
+    if na < 1.0e-12 { return 0.0 }
+    if nb < 1.0e-12 { return 0.0 }
+    return kvc_dot(a, b) / (na * nb)
+}
+
+// Average two vectors element-wise
+@pure
+fn kvc_vec_avg(a, b) {
+    let n = len(a)
+    let mut out = kvc_zeros(n)
+    for i in 0..n {
+        out[i] = (a[i] + b[i]) / 2.0
+    }
+    return out
+}
+
+// ===================================================================
+//  1. KV Cache data structure
+//
+//  A cache is represented as a map:
+//    #{
+//      "keys":    [[dim floats], ...],   // list of key vectors
+//      "values":  [[dim floats], ...],   // list of value vectors
+//      "scores":  [float, ...],          // cumulative attention scores
+//      "ages":    [int, ...],            // insertion step per entry
+//      "dim":     int,                   // vector dimension
+//      "step":    int                    // current time step
+//    }
+// ===================================================================
+
+fn kvc_create(dim) {
+    return #{
+        "keys": [],
+        "values": [],
+        "scores": [],
+        "ages": [],
+        "dim": dim,
+        "step": 0
+    }
+}
+
+// Insert a new KV entry
+fn kvc_insert(cache, key_vec, val_vec) {
+    let mut c = cache
+    let mut ks = c["keys"]
+    ks = ks + [key_vec]
+    c["keys"] = ks
+    let mut vs = c["values"]
+    vs = vs + [val_vec]
+    c["values"] = vs
+    let mut sc = c["scores"]
+    sc = sc + [0.0]
+    c["scores"] = sc
+    let mut ag = c["ages"]
+    ag = ag + [c["step"]]
+    c["ages"] = ag
+    c["step"] = c["step"] + 1
+    return c
+}
+
+// Get cache size (number of entries)
+@pure
+fn kvc_size(cache) {
+    return len(cache["keys"])
+}
+
+// ===================================================================
+//  Compute attention scores: query dot-product with each key
+// ===================================================================
+@pure @hot
+fn kvc_compute_attn_scores(cache, query) {
+    let n = kvc_size(cache)
+    let keys = cache["keys"]
+    let mut scores = kvc_zeros(n)
+    for i in 0..n {
+        scores[i] = kvc_dot(query, keys[i])
+    }
+    return scores
+}
+
+// Accumulate attention scores into cache cumulative scores
+fn kvc_accumulate_scores(cache, attn_scores) {
+    let n = kvc_size(cache)
+    let mut c = cache
+    let mut sc = c["scores"]
+    for i in 0..n {
+        sc[i] = sc[i] + attn_scores[i]
+    }
+    c["scores"] = sc
+    return c
+}
+
+// ===================================================================
+//  2. Attention Score Eviction
+//     Evict entries with lowest cumulative attention scores
+// ===================================================================
+@hot
+fn kvc_evict_lowest_scores(cache, budget) {
+    let n = kvc_size(cache)
+    if n <= budget { return cache }
+
+    // Find indices sorted by score (descending) — keep top budget
+    let scores = cache["scores"]
+    let mut indices = []
+    for i in 0..n { indices = indices + [i] }
+
+    // Selection: keep top-budget by score (simple O(n*budget) selection)
+    let mut kept = []
+    let mut used = kvc_zeros_int(n)
+    let keep_count = kvc_min_i(budget, n)
+    for _k in 0..keep_count {
+        let mut best_idx = -1
+        let mut best_score = -1.0e30
+        for j in 0..n {
+            if used[j] == 0 {
+                if scores[j] > best_score {
+                    best_score = scores[j]
+                    best_idx = j
+                }
+            }
+        }
+        if best_idx >= 0 {
+            kept = kept + [best_idx]
+            used[best_idx] = 1
+        }
+    }
+
+    // Rebuild cache with kept entries
+    let mut new_keys = []
+    let mut new_vals = []
+    let mut new_scores = []
+    let mut new_ages = []
+    let keys = cache["keys"]
+    let vals = cache["values"]
+    let ages = cache["ages"]
+    for i in 0..len(kept) {
+        let idx = kept[i]
+        new_keys = new_keys + [keys[idx]]
+        new_vals = new_vals + [vals[idx]]
+        new_scores = new_scores + [scores[idx]]
+        new_ages = new_ages + [ages[idx]]
+    }
+
+    let mut c = cache
+    c["keys"] = new_keys
+    c["values"] = new_vals
+    c["scores"] = new_scores
+    c["ages"] = new_ages
+    return c
+}
+
+// ===================================================================
+//  3. Heavy Hitter Oracle (H2O)
+//     Keep top-k heavy hitter tokens + recent window
+//     - heavy hitters: entries with highest cumulative attention
+//     - recent window: most recently inserted entries
+// ===================================================================
+@hot
+fn kvc_h2o_evict(cache, k_heavy, window_size) {
+    let n = kvc_size(cache)
+    let total_budget = k_heavy + window_size
+    if n <= total_budget { return cache }
+
+    let scores = cache["scores"]
+    let ages = cache["ages"]
+
+    // Mark recent window entries (highest ages = most recent)
+    let mut is_recent = kvc_zeros_int(n)
+    let mut age_indices = []
+    for i in 0..n { age_indices = age_indices + [i] }
+
+    // Find the window_size most recent entries by age
+    let mut recent_used = kvc_zeros_int(n)
+    let ws = kvc_min_i(window_size, n)
+    for _w in 0..ws {
+        let mut best_idx = -1
+        let mut best_age = -1
+        for j in 0..n {
+            if recent_used[j] == 0 {
+                if ages[j] > best_age {
+                    best_age = ages[j]
+                    best_idx = j
+                }
+            }
+        }
+        if best_idx >= 0 {
+            is_recent[best_idx] = 1
+            recent_used[best_idx] = 1
+        }
+    }
+
+    // From non-recent entries, pick top-k by score (heavy hitters)
+    let mut is_heavy = kvc_zeros_int(n)
+    let kh = kvc_min_i(k_heavy, n)
+    let mut heavy_used = kvc_zeros_int(n)
+    for _h in 0..kh {
+        let mut best_idx = -1
+        let mut best_score = -1.0e30
+        for j in 0..n {
+            if heavy_used[j] == 0 {
+                if is_recent[j] == 0 {
+                    if scores[j] > best_score {
+                        best_score = scores[j]
+                        best_idx = j
+                    }
+                }
+            }
+        }
+        if best_idx >= 0 {
+            is_heavy[best_idx] = 1
+            heavy_used[best_idx] = 1
+        }
+    }
+
+    // Rebuild: keep entries that are recent OR heavy hitter
+    let mut new_keys = []
+    let mut new_vals = []
+    let mut new_scores = []
+    let mut new_ages = []
+    let keys = cache["keys"]
+    let vals = cache["values"]
+    for i in 0..n {
+        if is_recent[i] == 1 || is_heavy[i] == 1 {
+            new_keys = new_keys + [keys[i]]
+            new_vals = new_vals + [vals[i]]
+            new_scores = new_scores + [scores[i]]
+            new_ages = new_ages + [ages[i]]
+        }
+    }
+
+    let mut c = cache
+    c["keys"] = new_keys
+    c["values"] = new_vals
+    c["scores"] = new_scores
+    c["ages"] = new_ages
+    return c
+}
+
+// ===================================================================
+//  4. Token Merging
+//     Merge the two most similar KV entries by cosine similarity,
+//     replacing them with their element-wise average.
+//     Repeat until cache fits budget.
+// ===================================================================
+@hot
+fn kvc_merge_most_similar(cache) {
+    let n = kvc_size(cache)
+    if n < 2 { return cache }
+
+    let keys = cache["keys"]
+
+    // Find pair with highest cosine similarity
+    let mut best_i = 0
+    let mut best_j = 1
+    let mut best_sim = -2.0
+    for i in 0..n {
+        let j_start = i + 1
+        for j in j_start..n {
+            let sim = kvc_cosine_sim(keys[i], keys[j])
+            if sim > best_sim {
+                best_sim = sim
+                best_i = i
+                best_j = j
+            }
+        }
+    }
+
+    // Merge best_i and best_j -> replace best_i, remove best_j
+    let vals = cache["values"]
+    let scores = cache["scores"]
+    let ages = cache["ages"]
+
+    let merged_key = kvc_vec_avg(keys[best_i], keys[best_j])
+    let merged_val = kvc_vec_avg(vals[best_i], vals[best_j])
+    let merged_score = (scores[best_i] + scores[best_j]) / 2.0
+    let merged_age = kvc_max_i(ages[best_i], ages[best_j])
+
+    let mut new_keys = []
+    let mut new_vals = []
+    let mut new_scores = []
+    let mut new_ages = []
+    for i in 0..n {
+        if i == best_i {
+            new_keys = new_keys + [merged_key]
+            new_vals = new_vals + [merged_val]
+            new_scores = new_scores + [merged_score]
+            new_ages = new_ages + [merged_age]
+        } else {
+            if i != best_j {
+                new_keys = new_keys + [keys[i]]
+                new_vals = new_vals + [vals[i]]
+                new_scores = new_scores + [scores[i]]
+                new_ages = new_ages + [ages[i]]
+            }
+        }
+    }
+
+    let mut c = cache
+    c["keys"] = new_keys
+    c["values"] = new_vals
+    c["scores"] = new_scores
+    c["ages"] = new_ages
+    return c
+}
+
+// Merge until cache fits budget
+@hot
+fn kvc_merge_to_budget(cache, budget) {
+    let mut c = cache
+    let mut safety = 0
+    while kvc_size(c) > budget {
+        if safety > 500 { return c }
+        c = kvc_merge_most_similar(c)
+        safety = safety + 1
+    }
+    return c
+}
+
+// ===================================================================
+//  5. Adaptive Budget
+//     Dynamically adjust cache size based on sequence length.
+//     budget = base_size + alpha * sqrt(seq_len)
+//     Clamped to [min_budget, max_budget].
+// ===================================================================
+@pure
+fn kvc_adaptive_budget(seq_len, base_size, alpha, min_budget, max_budget) {
+    let raw = to_float(base_size) + alpha * kvc_sqrt(to_float(seq_len))
+    let budget = kvc_floor(raw)
+    return kvc_max_i(min_budget, kvc_min_i(budget, max_budget))
+}
+
+// ===================================================================
+//  6. Sliding Window + Sink Tokens
+//     Keep the first n_sink "sink" tokens (position 0..n_sink-1)
+//     plus the most recent window_size tokens.
+//     Tokens in between are evicted.
+// ===================================================================
+@hot
+fn kvc_sliding_window_sink(cache, n_sink, window_size) {
+    let n = kvc_size(cache)
+    let total = n_sink + window_size
+    if n <= total { return cache }
+
+    let keys = cache["keys"]
+    let vals = cache["values"]
+    let scores = cache["scores"]
+    let ages = cache["ages"]
+
+    let mut new_keys = []
+    let mut new_vals = []
+    let mut new_scores = []
+    let mut new_ages = []
+
+    // Keep first n_sink entries (sink tokens)
+    let sink_count = kvc_min_i(n_sink, n)
+    for i in 0..sink_count {
+        new_keys = new_keys + [keys[i]]
+        new_vals = new_vals + [vals[i]]
+        new_scores = new_scores + [scores[i]]
+        new_ages = new_ages + [ages[i]]
+    }
+
+    // Keep last window_size entries (recent window)
+    let win_start = n - window_size
+    let actual_start = kvc_max_i(win_start, sink_count)
+    for i in actual_start..n {
+        new_keys = new_keys + [keys[i]]
+        new_vals = new_vals + [vals[i]]
+        new_scores = new_scores + [scores[i]]
+        new_ages = new_ages + [ages[i]]
+    }
+
+    let mut c = cache
+    c["keys"] = new_keys
+    c["values"] = new_vals
+    c["scores"] = new_scores
+    c["ages"] = new_ages
+    return c
+}
+
+// ===================================================================
+//  7. Quantized KV Cache
+//     INT8 quantization: store values as integers in [-128, 127]
+//     with a per-vector scale factor.
+//     INT4 quantization: values in [-8, 7] with scale factor.
+//
+//     Quantize: q = round(x / scale), scale = max(|x|) / range_max
+//     Dequantize: x_hat = q * scale
+// ===================================================================
+
+// Quantize a float vector to INT8 range [-128, 127]
+@pure
+fn kvc_quantize_int8(vec) {
+    let n = len(vec)
+    let mut max_abs = 0.0
+    for i in 0..n {
+        let a = kvc_abs(vec[i])
+        if a > max_abs { max_abs = a }
+    }
+    let mut scale = 1.0
+    if max_abs > 1.0e-12 {
+        scale = max_abs / 127.0
+    }
+    let mut qvals = kvc_zeros_int(n)
+    for i in 0..n {
+        let mut q = kvc_floor(vec[i] / scale + 0.5)
+        if q > 127 { q = 127 }
+        if q < -128 { q = -128 }
+        qvals[i] = q
+    }
+    return #{"qvals": qvals, "scale": scale, "bits": 8}
+}
+
+// Dequantize INT8 back to float
+@pure
+fn kvc_dequantize_int8(qdata) {
+    let qvals = qdata["qvals"]
+    let scale = qdata["scale"]
+    let n = len(qvals)
+    let mut out = kvc_zeros(n)
+    for i in 0..n {
+        out[i] = to_float(qvals[i]) * scale
+    }
+    return out
+}
+
+// Quantize a float vector to INT4 range [-8, 7]
+@pure
+fn kvc_quantize_int4(vec) {
+    let n = len(vec)
+    let mut max_abs = 0.0
+    for i in 0..n {
+        let a = kvc_abs(vec[i])
+        if a > max_abs { max_abs = a }
+    }
+    let mut scale = 1.0
+    if max_abs > 1.0e-12 {
+        scale = max_abs / 7.0
+    }
+    let mut qvals = kvc_zeros_int(n)
+    for i in 0..n {
+        let mut q = kvc_floor(vec[i] / scale + 0.5)
+        if q > 7 { q = 7 }
+        if q < -8 { q = -8 }
+        qvals[i] = q
+    }
+    return #{"qvals": qvals, "scale": scale, "bits": 4}
+}
+
+// Dequantize INT4 back to float
+@pure
+fn kvc_dequantize_int4(qdata) {
+    let qvals = qdata["qvals"]
+    let scale = qdata["scale"]
+    let n = len(qvals)
+    let mut out = kvc_zeros(n)
+    for i in 0..n {
+        out[i] = to_float(qvals[i]) * scale
+    }
+    return out
+}
+
+// Quantize entire cache (keys + values) to INT8
+fn kvc_quantize_cache_int8(cache) {
+    let n = kvc_size(cache)
+    let keys = cache["keys"]
+    let vals = cache["values"]
+    let mut qkeys = []
+    let mut qvals = []
+    for i in 0..n {
+        qkeys = qkeys + [kvc_quantize_int8(keys[i])]
+        qvals = qvals + [kvc_quantize_int8(vals[i])]
+    }
+    return #{"qkeys": qkeys, "qvals": qvals, "n": n, "bits": 8, "dim": cache["dim"]}
+}
+
+// Dequantize entire cache from INT8
+fn kvc_dequantize_cache_int8(qcache) {
+    let n = qcache["n"]
+    let qkeys = qcache["qkeys"]
+    let qvals = qcache["qvals"]
+    let mut keys = []
+    let mut vals = []
+    for i in 0..n {
+        keys = keys + [kvc_dequantize_int8(qkeys[i])]
+        vals = vals + [kvc_dequantize_int8(qvals[i])]
+    }
+    return #{"keys": keys, "values": vals, "n": n}
+}
+
+// Quantize entire cache to INT4
+fn kvc_quantize_cache_int4(cache) {
+    let n = kvc_size(cache)
+    let keys = cache["keys"]
+    let vals = cache["values"]
+    let mut qkeys = []
+    let mut qvals = []
+    for i in 0..n {
+        qkeys = qkeys + [kvc_quantize_int4(keys[i])]
+        qvals = qvals + [kvc_quantize_int4(vals[i])]
+    }
+    return #{"qkeys": qkeys, "qvals": qvals, "n": n, "bits": 4, "dim": cache["dim"]}
+}
+
+// ===================================================================
+//  8. Compression Ratio Tracker
+//     Measure actual memory savings vs full cache.
+//
+//     full_memory   = seq_len * dim * 2 (keys + values) * bytes_per_float
+//     actual_memory = cache_size * dim * 2 * bytes_per_element
+//     ratio         = full_memory / actual_memory
+// ===================================================================
+@pure
+fn kvc_compression_ratio(full_seq_len, cache_size, bits_full, bits_compressed) {
+    if cache_size <= 0 { return 0.0 }
+    let full_mem = to_float(full_seq_len) * to_float(bits_full)
+    let comp_mem = to_float(cache_size) * to_float(bits_compressed)
+    if comp_mem < 1.0e-12 { return 0.0 }
+    return full_mem / comp_mem
+}
+
+// Memory savings as a percentage
+@pure
+fn kvc_memory_savings_pct(full_seq_len, cache_size, bits_full, bits_compressed) {
+    if full_seq_len <= 0 { return 0.0 }
+    let full_mem = to_float(full_seq_len) * to_float(bits_full)
+    let comp_mem = to_float(cache_size) * to_float(bits_compressed)
+    return (full_mem - comp_mem) / full_mem * 100.0
+}
+
+// Detailed stats for a cache
+@pure
+fn kvc_stats(cache, full_seq_len) {
+    let n = kvc_size(cache)
+    let dim = cache["dim"]
+    let full_entries = full_seq_len * dim * 2
+    let current_entries = n * dim * 2
+    let mut ratio = 0.0
+    if current_entries > 0 {
+        ratio = to_float(full_entries) / to_float(current_entries)
+    }
+    let mut savings = 0.0
+    if full_entries > 0 {
+        savings = (to_float(full_entries) - to_float(current_entries)) / to_float(full_entries) * 100.0
+    }
+    return #{
+        "cache_size": n,
+        "full_seq_len": full_seq_len,
+        "dim": dim,
+        "compression_ratio": ratio,
+        "savings_pct": savings
+    }
+}
+
+// ===================================================================
+//  9. Eviction Policy Comparison
+//     Benchmark different eviction policies on the same cache.
+//     Returns per-policy stats: [name, resulting_size, avg_score_kept]
+// ===================================================================
+
+// Average of cumulative scores in cache
+@pure
+fn kvc_avg_score(cache) {
+    let n = kvc_size(cache)
+    if n == 0 { return 0.0 }
+    let scores = cache["scores"]
+    let mut total = 0.0
+    for i in 0..n {
+        total = total + scores[i]
+    }
+    return total / to_float(n)
+}
+
+// Deep copy a cache (for comparison benchmarks)
+fn kvc_copy(cache) {
+    let n = kvc_size(cache)
+    let keys = cache["keys"]
+    let vals = cache["values"]
+    let scores = cache["scores"]
+    let ages = cache["ages"]
+    let mut new_keys = []
+    let mut new_vals = []
+    let mut new_scores = []
+    let mut new_ages = []
+    for i in 0..n {
+        new_keys = new_keys + [keys[i]]
+        new_vals = new_vals + [vals[i]]
+        new_scores = new_scores + [scores[i]]
+        new_ages = new_ages + [ages[i]]
+    }
+    return #{
+        "keys": new_keys,
+        "values": new_vals,
+        "scores": new_scores,
+        "ages": new_ages,
+        "dim": cache["dim"],
+        "step": cache["step"]
+    }
+}
+
+// Compare eviction policies on same input cache
+// Returns array of [policy_name, result_size, avg_score_kept]
+fn kvc_compare_policies(cache, budget) {
+    let mut results = []
+
+    // Policy 1: Score-based eviction
+    let c1 = kvc_copy(cache)
+    let r1 = kvc_evict_lowest_scores(c1, budget)
+    results = results + [["score_eviction", kvc_size(r1), kvc_avg_score(r1)]]
+
+    // Policy 2: H2O (half budget heavy, half window)
+    let c2 = kvc_copy(cache)
+    let half = budget / 2
+    let other_half = budget - half
+    let r2 = kvc_h2o_evict(c2, half, other_half)
+    results = results + [["h2o", kvc_size(r2), kvc_avg_score(r2)]]
+
+    // Policy 3: Token merging
+    let c3 = kvc_copy(cache)
+    let r3 = kvc_merge_to_budget(c3, budget)
+    results = results + [["token_merge", kvc_size(r3), kvc_avg_score(r3)]]
+
+    // Policy 4: Sliding window + sink (2 sinks)
+    let c4 = kvc_copy(cache)
+    let win = budget - 2
+    let r4 = kvc_sliding_window_sink(c4, 2, kvc_max_i(win, 1))
+    results = results + [["sliding_sink", kvc_size(r4), kvc_avg_score(r4)]]
+
+    return results
+}
+
+// ===================================================================
+//  10. Combined pipeline: insert + query + evict
+//      A convenience function that simulates a full attention step:
+//        1. Insert new KV pair
+//        2. Compute attention scores with query
+//        3. Accumulate scores
+//        4. Evict if over budget
+// ===================================================================
+@hot
+fn kvc_attention_step(cache, key_vec, val_vec, query, budget, policy) {
+    let mut c = kvc_insert(cache, key_vec, val_vec)
+    let attn = kvc_compute_attn_scores(c, query)
+    c = kvc_accumulate_scores(c, attn)
+
+    if kvc_size(c) > budget {
+        if policy == "score" {
+            c = kvc_evict_lowest_scores(c, budget)
+        } else {
+            if policy == "h2o" {
+                let half = budget / 2
+                c = kvc_h2o_evict(c, half, budget - half)
+            } else {
+                if policy == "merge" {
+                    c = kvc_merge_to_budget(c, budget)
+                } else {
+                    if policy == "sliding" {
+                        c = kvc_sliding_window_sink(c, 2, budget - 2)
+                    } else {
+                        c = kvc_evict_lowest_scores(c, budget)
+                    }
+                }
+            }
+        }
+    }
+    return c
+}
+
+// Quantization error: mean absolute error between original and dequantized
+@pure
+fn kvc_quantization_error(original, qdata_fn, dequant_fn) {
+    let n = len(original)
+    let mut total_err = 0.0
+    for i in 0..n {
+        total_err = total_err + kvc_abs(original[i] - dequant_fn[i])
+    }
+    return total_err / to_float(n)
+}
+
+println("[kv_cache_compression] loaded — eviction + H2O + merge + adaptive + sliding/sink + quantized KV + ratio tracker")

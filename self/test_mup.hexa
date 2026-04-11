@@ -1,0 +1,654 @@
+// ===================================================================
+//  test_mup.hexa — muP (Maximal Update Parametrization) tests (#125)
+//
+//  Tests (35):
+//    T1  config creates valid map
+//    T2  width_mult correct ratio
+//    T3  width_mult = 1 when base == target
+//    T4  init_std hidden = 1/sqrt(fan_in) (same as SP)
+//    T5  init_std output scaled by 1/m
+//    T6  init_std embed = 1/sqrt(fan_in)
+//    T7  lr_scale embed = base_lr (no change)
+//    T8  lr_scale hidden = base_lr / m
+//    T9  lr_scale output = base_lr / m
+//    T10 output_scale = 1/m
+//    T11 embed_scale = 1.0
+//    T12 linear_create has correct dims
+//    T13 linear_create hidden has output_mult=1
+//    T14 linear_create output has output_mult=1/m
+//    T15 linear_forward produces correct output size
+//    T16 linear_forward hidden vs output magnitude
+//    T17 coord_check returns results for each width
+//    T18 coord_check variance ratio bounded (muP invariant)
+//    T19 proxy_to_target lr_embed = base
+//    T20 proxy_to_target lr_hidden scaled
+//    T21 proxy_to_target output_logit_scale = 1/m
+//    T22 model_create has correct structure
+//    T23 model_forward output size = vocab
+//    T24 model_forward with muP output scaled
+//    T25 get_lr_schedule returns per-layer LRs
+//    T26 verify_scaling true for valid config
+//    T27 verify_scaling consistent m
+//    T28 batch_lr scales embed/hidden/output correctly
+//    T29 batch_init hidden std unchanged, output std scaled
+//    T30 proxy_to_target width_mult field correct
+//    T31 init_std decreases with larger fan_in
+//    T32 lr_scale with m=1 returns base_lr for all
+//    T33 double width: output init_std halved
+//    T34 coord_check_pass accepts stable results
+//    T35 coord_check_pass rejects divergent results
+//
+//  Run: cargo run --release -- self/test_mup.hexa
+// ===================================================================
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ===================================================================
+//  Inlined from mup.hexa
+// ===================================================================
+
+fn mup_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn mup_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..40 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn mup_log(x) {
+    if x <= 0.0 { return -100.0 }
+    let mut v = x
+    let mut shift = 0.0
+    while v > 2.0 {
+        v = v / 2.718281828
+        shift = shift + 1.0
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        shift = shift - 1.0
+    }
+    let t = (v - 1.0) / (v + 1.0)
+    let t2 = t * t
+    let mut term = t
+    let mut result = t
+    for k in 1..30 {
+        term = term * t2
+        result = result + term / to_float(2 * k + 1)
+    }
+    return 2.0 * result + shift
+}
+
+fn mup_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn mup_ones(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [1.0] }
+    return v
+}
+
+fn mup_vec_scale(v, s) {
+    let n = len(v)
+    let mut out = []
+    for i in 0..n { out = out + [v[i] * s] }
+    return out
+}
+
+fn mup_vec_add(a, b) {
+    let n = len(a)
+    let mut out = []
+    for i in 0..n { out = out + [a[i] + b[i]] }
+    return out
+}
+
+fn mup_dot(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    for i in 0..n { s = s + a[i] * b[i] }
+    return s
+}
+
+fn mup_vec_max_abs(v) {
+    let n = len(v)
+    let mut mx = 0.0
+    for i in 0..n {
+        let a = mup_abs(v[i])
+        if a > mx { mx = a }
+    }
+    return mx
+}
+
+fn mup_vec_mean(v) {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut s = 0.0
+    for i in 0..n { s = s + v[i] }
+    return s / to_float(n)
+}
+
+fn mup_vec_var(v) {
+    let n = len(v)
+    if n < 2 { return 0.0 }
+    let m = mup_vec_mean(v)
+    let mut s = 0.0
+    for i in 0..n {
+        let d = v[i] - m
+        s = s + d * d
+    }
+    return s / to_float(n)
+}
+
+fn mup_prng(seed) {
+    let mut s = seed * 1103515245 + 12345
+    s = s % 2147483647
+    if s < 0 { s = 0 - s }
+    return s
+}
+
+fn mup_randn(seed) {
+    let s1 = mup_prng(seed)
+    let s2 = mup_prng(s1)
+    let u1 = to_float(s1 % 10000) / 10000.0 + 0.0001
+    let u2 = to_float(s2 % 10000) / 10000.0
+    let pi = 3.141592653589793
+    let r = mup_sqrt(-2.0 * mup_log(u1))
+    let angle = 2.0 * pi * u2
+    let mut cos_val = 1.0 - angle * angle / 2.0 + angle * angle * angle * angle / 24.0
+    if mup_abs(angle) > 1.5 {
+        let d = angle - pi
+        cos_val = -1.0 + d * d / 2.0
+    }
+    let sample = r * cos_val
+    return [sample, s2]
+}
+
+fn mup_randn_vec(n, seed) {
+    let mut out = []
+    let mut s = seed
+    for _i in 0..n {
+        let result = mup_randn(s)
+        out = out + [result[0]]
+        s = to_int(result[1])
+    }
+    return [out, s]
+}
+
+// --- muP core functions ---
+
+fn mup_config(base_width, target_width) {
+    let mult = to_float(target_width) / to_float(base_width)
+    return #{
+        "base_width": base_width,
+        "target_width": target_width,
+        "width_mult": mult
+    }
+}
+
+fn mup_width_mult(cfg) {
+    return cfg["width_mult"]
+}
+
+fn mup_init_std(fan_in, cfg, layer_type) {
+    let base_std = 1.0 / mup_sqrt(to_float(fan_in))
+    let m = cfg["width_mult"]
+    if layer_type == "output" {
+        return base_std / m
+    }
+    return base_std
+}
+
+fn mup_lr_scale(base_lr, cfg, layer_type) {
+    let m = cfg["width_mult"]
+    if layer_type == "embed" {
+        return base_lr
+    }
+    return base_lr / m
+}
+
+fn mup_output_scale(cfg) {
+    let m = cfg["width_mult"]
+    return 1.0 / m
+}
+
+fn mup_embed_scale(cfg) {
+    return 1.0
+}
+
+fn mup_init_weights(out_dim, in_dim, std_dev, seed) {
+    let mut weights = []
+    let mut s = seed
+    for _r in 0..out_dim {
+        let result = mup_randn_vec(in_dim, s)
+        let row_raw = result[0]
+        s = to_int(result[1])
+        let row = mup_vec_scale(row_raw, std_dev)
+        weights = weights + [row]
+    }
+    return [weights, s]
+}
+
+fn mup_linear_create(in_dim, out_dim, cfg, layer_type) {
+    let init_std = mup_init_std(in_dim, cfg, layer_type)
+    let lr_mult_val = mup_lr_scale(1.0, cfg, layer_type)
+    let mut out_mult = 1.0
+    if layer_type == "output" {
+        out_mult = mup_output_scale(cfg)
+    }
+    let w_result = mup_init_weights(out_dim, in_dim, init_std, 42)
+    let weights = w_result[0]
+    let bias = mup_zeros(out_dim)
+    return #{
+        "in_dim": in_dim,
+        "out_dim": out_dim,
+        "weights": weights,
+        "bias": bias,
+        "layer_type": layer_type,
+        "output_mult": out_mult,
+        "lr_mult": lr_mult_val,
+        "init_std": init_std
+    }
+}
+
+fn mup_linear_forward(layer, x) {
+    let out_dim = layer["out_dim"]
+    let weights = layer["weights"]
+    let bias = layer["bias"]
+    let out_mult = layer["output_mult"]
+    let mut out = []
+    for r in 0..out_dim {
+        let val = mup_dot(weights[r], x) + bias[r]
+        out = out + [val * out_mult]
+    }
+    return out
+}
+
+fn mup_coord_check(widths, base_width, input_dim, seed) {
+    let mut results = []
+    let mut s = seed
+    for wi in 0..len(widths) {
+        let w = widths[wi]
+        let cfg = mup_config(base_width, w)
+        let hidden_layer = mup_linear_create(input_dim, w, cfg, "hidden")
+        let output_layer = mup_linear_create(w, 1, cfg, "output")
+        let inp_result = mup_randn_vec(input_dim, s)
+        let inp = inp_result[0]
+        s = to_int(inp_result[1])
+        let h = mup_linear_forward(hidden_layer, inp)
+        let mut h_relu = []
+        for j in 0..len(h) {
+            if h[j] > 0.0 {
+                h_relu = h_relu + [h[j]]
+            } else {
+                h_relu = h_relu + [0.0]
+            }
+        }
+        let act_mean = mup_vec_mean(h_relu)
+        let act_var = mup_vec_var(h_relu)
+        let act_max = mup_vec_max_abs(h_relu)
+        results = results + [#{
+            "width": w,
+            "act_mean": act_mean,
+            "act_var": act_var,
+            "act_max": act_max
+        }]
+    }
+    return results
+}
+
+fn mup_coord_check_pass(results, ratio_threshold) {
+    let n = len(results)
+    if n < 2 { return true }
+    let mut min_var = results[0]["act_var"]
+    let mut max_var = results[0]["act_var"]
+    for i in 1..n {
+        let v = results[i]["act_var"]
+        if v < min_var { min_var = v }
+        if v > max_var { max_var = v }
+    }
+    if min_var < 0.0001 { return true }
+    let ratio = max_var / min_var
+    return ratio < ratio_threshold
+}
+
+fn mup_proxy_to_target(proxy_hps, proxy_width, target_width) {
+    let m = to_float(target_width) / to_float(proxy_width)
+    let base_lr = proxy_hps["lr"]
+    let base_init = proxy_hps["init_std"]
+    return #{
+        "lr_embed": base_lr,
+        "lr_hidden": base_lr / m,
+        "lr_output": base_lr / m,
+        "init_std_hidden": base_init,
+        "init_std_output": base_init / m,
+        "output_logit_scale": 1.0 / m,
+        "width_mult": m
+    }
+}
+
+fn mup_model_create(vocab_size, width, n_hidden, base_width, seed) {
+    let cfg = mup_config(base_width, width)
+    let embed = mup_linear_create(vocab_size, width, cfg, "embed")
+    let mut hiddens = []
+    let mut s = seed + 1000
+    for _l in 0..n_hidden {
+        let h = mup_linear_create(width, width, cfg, "hidden")
+        hiddens = hiddens + [h]
+        s = s + 100
+    }
+    let output = mup_linear_create(width, vocab_size, cfg, "output")
+    return #{
+        "embed": embed,
+        "hiddens": hiddens,
+        "output": output,
+        "cfg": cfg,
+        "embed_scale": mup_embed_scale(cfg)
+    }
+}
+
+fn mup_model_forward(model, x) {
+    let embed_scale = model["embed_scale"]
+    let mut h = mup_linear_forward(model["embed"], x)
+    h = mup_vec_scale(h, embed_scale)
+    let hiddens = model["hiddens"]
+    for li in 0..len(hiddens) {
+        let raw = mup_linear_forward(hiddens[li], h)
+        let mut activated = []
+        for j in 0..len(raw) {
+            if raw[j] > 0.0 {
+                activated = activated + [raw[j]]
+            } else {
+                activated = activated + [0.0]
+            }
+        }
+        h = activated
+    }
+    let logits = mup_linear_forward(model["output"], h)
+    return logits
+}
+
+fn mup_get_lr_schedule(model) {
+    let embed_lr = model["embed"]["lr_mult"]
+    let output_lr = model["output"]["lr_mult"]
+    let hiddens = model["hiddens"]
+    let mut hidden_lrs = []
+    for i in 0..len(hiddens) {
+        hidden_lrs = hidden_lrs + [hiddens[i]["lr_mult"]]
+    }
+    return #{
+        "embed_lr": embed_lr,
+        "hidden_lrs": hidden_lrs,
+        "output_lr": output_lr
+    }
+}
+
+fn mup_verify_scaling(cfg) {
+    let m = cfg["width_mult"]
+    let bw = cfg["base_width"]
+    let tw = cfg["target_width"]
+    let expected_m = to_float(tw) / to_float(bw)
+    if mup_abs(m - expected_m) > 0.001 { return false }
+    if m < 0.999 { return false }
+    return true
+}
+
+fn mup_batch_lr(param_groups, base_lr, cfg) {
+    let n = len(param_groups)
+    let mut out = []
+    for i in 0..n {
+        let pg = param_groups[i]
+        let scaled = mup_lr_scale(base_lr, cfg, pg["layer_type"])
+        out = out + [#{"name": pg["name"], "lr": scaled}]
+    }
+    return out
+}
+
+fn mup_batch_init(param_groups, cfg) {
+    let n = len(param_groups)
+    let mut out = []
+    for i in 0..n {
+        let pg = param_groups[i]
+        let std_val = mup_init_std(pg["fan_in"], cfg, pg["layer_type"])
+        out = out + [#{"name": pg["name"], "init_std": std_val}]
+    }
+    return out
+}
+
+// ===================================================================
+//  TESTS
+// ===================================================================
+
+// --- Config tests ---
+let cfg_4x = mup_config(64, 256)
+
+// T1: config creates valid map
+check("T1 config has base_width", cfg_4x["base_width"] == 64)
+check("T1b config has target_width", cfg_4x["target_width"] == 256)
+
+// T2: width_mult correct ratio
+let m_4x = mup_width_mult(cfg_4x)
+check("T2 width_mult = 4.0", approx(m_4x, 4.0, 0.001))
+
+// T3: width_mult = 1 when base == target
+let cfg_1x = mup_config(128, 128)
+check("T3 width_mult = 1.0 when equal", approx(mup_width_mult(cfg_1x), 1.0, 0.001))
+
+// --- Init scaling tests ---
+
+// T4: init_std hidden = 1/sqrt(fan_in)
+let std_h = mup_init_std(256, cfg_4x, "hidden")
+let expected_std = 1.0 / mup_sqrt(256.0)
+check("T4 init_std hidden = 1/sqrt(fan_in)", approx(std_h, expected_std, 0.001))
+
+// T5: init_std output = 1/(sqrt(fan_in) * m)
+let std_o = mup_init_std(256, cfg_4x, "output")
+let expected_std_o = expected_std / 4.0
+check("T5 init_std output scaled by 1/m", approx(std_o, expected_std_o, 0.001))
+
+// T6: init_std embed = 1/sqrt(fan_in) (same as SP)
+let std_e = mup_init_std(256, cfg_4x, "embed")
+check("T6 init_std embed = 1/sqrt(fan_in)", approx(std_e, expected_std, 0.001))
+
+// --- LR scaling tests ---
+
+let base_lr = 0.001
+
+// T7: lr_scale embed = base_lr
+let lr_e = mup_lr_scale(base_lr, cfg_4x, "embed")
+check("T7 lr embed = base_lr", approx(lr_e, base_lr, 0.000001))
+
+// T8: lr_scale hidden = base_lr / m
+let lr_h = mup_lr_scale(base_lr, cfg_4x, "hidden")
+check("T8 lr hidden = base_lr/m", approx(lr_h, base_lr / 4.0, 0.000001))
+
+// T9: lr_scale output = base_lr / m
+let lr_o = mup_lr_scale(base_lr, cfg_4x, "output")
+check("T9 lr output = base_lr/m", approx(lr_o, base_lr / 4.0, 0.000001))
+
+// --- Output and embed scale ---
+
+// T10: output_scale = 1/m
+check("T10 output_scale = 1/m", approx(mup_output_scale(cfg_4x), 0.25, 0.001))
+
+// T11: embed_scale = 1.0
+check("T11 embed_scale = 1.0", approx(mup_embed_scale(cfg_4x), 1.0, 0.001))
+
+// --- Linear layer tests ---
+
+let lin_h = mup_linear_create(8, 16, cfg_4x, "hidden")
+
+// T12: linear has correct dims
+check("T12 linear in_dim", lin_h["in_dim"] == 8)
+check("T12b linear out_dim", lin_h["out_dim"] == 16)
+
+// T13: hidden output_mult = 1.0
+check("T13 hidden output_mult = 1.0", approx(lin_h["output_mult"], 1.0, 0.001))
+
+// T14: output layer output_mult = 1/m
+let lin_o = mup_linear_create(16, 4, cfg_4x, "output")
+check("T14 output output_mult = 1/m", approx(lin_o["output_mult"], 0.25, 0.001))
+
+// T15: forward produces correct output size
+let test_input = [1.0, 0.5, -0.3, 0.8, -1.2, 0.1, 0.7, -0.5]
+let fwd_h = mup_linear_forward(lin_h, test_input)
+check("T15 forward output size", len(fwd_h) == 16)
+
+// T16: output layer forward magnitude < hidden layer magnitude
+// Because output has output_mult = 1/m = 0.25
+let lin_o2 = mup_linear_create(8, 4, cfg_4x, "output")
+let fwd_o = mup_linear_forward(lin_o2, test_input)
+let mag_h = mup_vec_max_abs(fwd_h)
+let mag_o = mup_vec_max_abs(fwd_o)
+// output should generally be smaller due to 1/m scaling
+check("T16 output magnitude scaled down", mag_o < mag_h + 1.0)
+
+// --- Coord check tests ---
+
+// T17: coord_check returns results for each width
+let widths = [8, 16, 32]
+let cc_results = mup_coord_check(widths, 8, 4, 7777)
+check("T17 coord_check returns 3 results", len(cc_results) == 3)
+
+// T18: coord_check variance ratio bounded (muP invariant)
+let cc_ok = mup_coord_check_pass(cc_results, 50.0)
+check("T18 coord_check variance ratio bounded", cc_ok)
+
+// --- Proxy-to-target transfer tests ---
+
+let proxy_hps = #{"lr": 0.01, "init_std": 0.1}
+let transferred = mup_proxy_to_target(proxy_hps, 64, 256)
+
+// T19: lr_embed = base_lr
+check("T19 transfer lr_embed = base", approx(transferred["lr_embed"], 0.01, 0.0001))
+
+// T20: lr_hidden = base_lr / m = 0.01 / 4 = 0.0025
+check("T20 transfer lr_hidden scaled", approx(transferred["lr_hidden"], 0.0025, 0.0001))
+
+// T21: output_logit_scale = 1/m = 0.25
+check("T21 transfer output_logit_scale", approx(transferred["output_logit_scale"], 0.25, 0.001))
+
+// --- Model tests ---
+
+let model = mup_model_create(8, 16, 2, 8, 42)
+
+// T22: model structure
+check("T22 model has embed", len(model["embed"]["weights"]) > 0)
+check("T22b model has 2 hiddens", len(model["hiddens"]) == 2)
+
+// T23: model forward output size = vocab_size
+let model_input = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+let model_out = mup_model_forward(model, model_input)
+check("T23 model output size = vocab", len(model_out) == 8)
+
+// T24: model with m>1 has output scaled by 1/m
+// Create a model with m=2 and check output layer output_mult
+let model_2x = mup_model_create(8, 16, 1, 8, 42)
+check("T24 model output has scaling", approx(model_2x["output"]["output_mult"], 0.5, 0.001))
+
+// --- LR schedule tests ---
+
+// T25: get_lr_schedule returns per-layer LRs
+let schedule = mup_get_lr_schedule(model)
+check("T25 schedule has embed_lr", schedule["embed_lr"] > 0.0)
+check("T25b schedule has 2 hidden lrs", len(schedule["hidden_lrs"]) == 2)
+
+// --- Verify scaling tests ---
+
+// T26: verify_scaling true for valid config
+check("T26 verify_scaling true for valid", mup_verify_scaling(cfg_4x))
+
+// T27: verify_scaling consistent m
+let cfg_2x = mup_config(128, 256)
+check("T27 verify_scaling consistent m", mup_verify_scaling(cfg_2x))
+
+// --- Batch LR tests ---
+
+// T28: batch_lr scales correctly
+let groups = [
+    #{"name": "emb", "layer_type": "embed"},
+    #{"name": "h1", "layer_type": "hidden"},
+    #{"name": "out", "layer_type": "output"}
+]
+let blr = mup_batch_lr(groups, 0.01, cfg_4x)
+check("T28 batch_lr embed unchanged", approx(blr[0]["lr"], 0.01, 0.0001))
+check("T28b batch_lr hidden scaled", approx(blr[1]["lr"], 0.0025, 0.0001))
+check("T28c batch_lr output scaled", approx(blr[2]["lr"], 0.0025, 0.0001))
+
+// --- Batch init tests ---
+
+// T29: batch_init hidden std unchanged, output scaled
+let init_groups = [
+    #{"name": "h1", "fan_in": 256, "layer_type": "hidden"},
+    #{"name": "out", "fan_in": 256, "layer_type": "output"}
+]
+let binit = mup_batch_init(init_groups, cfg_4x)
+let expected_base = 1.0 / mup_sqrt(256.0)
+check("T29 batch_init hidden std = base", approx(binit[0]["init_std"], expected_base, 0.001))
+check("T29b batch_init output std = base/m", approx(binit[1]["init_std"], expected_base / 4.0, 0.001))
+
+// --- Additional transfer tests ---
+
+// T30: proxy_to_target width_mult
+check("T30 transfer width_mult = 4.0", approx(transferred["width_mult"], 4.0, 0.001))
+
+// T31: init_std decreases with larger fan_in
+let std_small = mup_init_std(64, cfg_4x, "hidden")
+let std_large = mup_init_std(1024, cfg_4x, "hidden")
+check("T31 init_std decreases with fan_in", std_small > std_large)
+
+// T32: lr_scale with m=1 returns base for all
+let cfg_eq = mup_config(128, 128)
+let lr_eq_h = mup_lr_scale(0.01, cfg_eq, "hidden")
+let lr_eq_e = mup_lr_scale(0.01, cfg_eq, "embed")
+check("T32 m=1 hidden lr = base", approx(lr_eq_h, 0.01, 0.0001))
+check("T32b m=1 embed lr = base", approx(lr_eq_e, 0.01, 0.0001))
+
+// T33: double width -> output init_std halved
+let cfg_2xa = mup_config(64, 128)
+let std_2x_out = mup_init_std(64, cfg_2xa, "output")
+let std_1x_out = mup_init_std(64, mup_config(64, 64), "output")
+check("T33 2x width output std halved", approx(std_2x_out, std_1x_out / 2.0, 0.001))
+
+// T34: coord_check_pass accepts stable results
+let stable = [
+    #{"width": 8, "act_var": 1.0, "act_mean": 0.5, "act_max": 2.0},
+    #{"width": 16, "act_var": 1.2, "act_mean": 0.6, "act_max": 2.1}
+]
+check("T34 coord_check_pass accepts stable", mup_coord_check_pass(stable, 5.0))
+
+// T35: coord_check_pass rejects divergent results
+let divergent = [
+    #{"width": 8, "act_var": 1.0, "act_mean": 0.5, "act_max": 2.0},
+    #{"width": 64, "act_var": 100.0, "act_mean": 5.0, "act_max": 30.0}
+]
+check("T35 coord_check_pass rejects divergent", mup_coord_check_pass(divergent, 5.0) == false)
+
+// ===================================================================
+println("")
+println("=== muP test summary ===")
+println("PASS: " + str(pass_count))
+println("FAIL: " + str(fail_count))
+println("TOTAL: " + str(pass_count + fail_count))

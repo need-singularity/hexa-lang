@@ -1,0 +1,764 @@
+// ===================================================================
+//  test_fp8_training.hexa — FP8 Mixed-Precision Training tests (#121)
+//
+//  Tests (35):
+//    T1  E4M3 format maxval = 448
+//    T2  E5M2 format maxval = 57344
+//    T3  E4M3 min positive correct
+//    T4  E5M2 min positive correct
+//    T5  fp8_cast saturation clamps to maxval
+//    T6  fp8_cast negative saturation
+//    T7  fp8_cast zero stays zero
+//    T8  fp8_cast small value below min rounds to zero
+//    T9  fp8_dequant inverse of scale
+//    T10 fp8_cast_tensor preserves length
+//    T11 fp8_cast_tensor values within range
+//    T12 fp8_amax finds correct absolute max
+//    T13 fp8_amax with negatives
+//    T14 fp8_amax empty tensor returns 0
+//    T15 amax history update shifts left
+//    T16 amax history update appends new value
+//    T17 amax history max returns correct max
+//    T18 compute scale: scale * amax ~ maxval
+//    T19 compute scale zero amax returns 1
+//    T20 compute scale with margin
+//    T21 delayed scaling init has correct format
+//    T22 delayed scaling step quantizes and updates
+//    T23 delayed scaling multi-step scale adapts
+//    T24 fp8_matmul dimensions correct
+//    T25 fp8_matmul identity matrix
+//    T26 mixed precision forward output shape
+//    T27 mixed precision backward output shape
+//    T28 loss scaler init values correct
+//    T29 loss scaler no overflow grows scale
+//    T30 loss scaler overflow halves scale
+//    T31 per-channel amax per-row
+//    T32 per-channel amax per-col
+//    T33 per-channel quantize preserves shape
+//    T34 per-channel dequantize recovers approx values
+//    T35 training context init structure
+//
+//  Run: cargo run --release -- self/test_fp8_training.hexa
+// ===================================================================
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ── inlined from fp8_training.hexa ──────────────────────────────
+
+fn fp8_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn fp8_max_f(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn fp8_min_f(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn fp8_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn fp8_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+fn fp8_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn fp8_log2(x) {
+    if x <= 0.0 { return -999.0 }
+    let ln2 = 0.6931471805599453
+    let mut v = x
+    let mut exp_part = 0
+    while v >= 2.0 {
+        v = v / 2.0
+        exp_part = exp_part + 1
+    }
+    while v < 1.0 {
+        v = v * 2.0
+        exp_part = exp_part - 1
+    }
+    let t = v - 1.0
+    let mut result = 0.0
+    let mut term = t
+    for i in 1..20 {
+        if i % 2 == 1 {
+            result = result + term / to_float(i)
+        } else {
+            result = result - term / to_float(i)
+        }
+        term = term * t
+    }
+    return to_float(exp_part) + result / ln2
+}
+
+fn fp8_pow2(x) {
+    let ln2 = 0.6931471805599453
+    let v = x * ln2
+    let mut clamped = v
+    if clamped > 30.0 { clamped = 30.0 }
+    if clamped < -30.0 { clamped = -30.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * clamped / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn fp8_floor(x) {
+    let i = to_int(x)
+    if to_float(i) > x { return to_float(i - 1) }
+    return to_float(i)
+}
+
+fn fp8_format_info(fmt) {
+    if fmt == 0 {
+        return [448.0, 0.001953125]
+    }
+    return [57344.0, 0.00006103515625]
+}
+
+fn fp8_maxval(fmt) {
+    let info = fp8_format_info(fmt)
+    return info[0]
+}
+
+fn fp8_minval_pos(fmt) {
+    let info = fp8_format_info(fmt)
+    return info[1]
+}
+
+fn fp8_format_name(fmt) {
+    if fmt == 0 { return "E4M3" }
+    return "E5M2"
+}
+
+fn fp8_cast(val, fmt, scale) {
+    if val > 1.0e30 { return fp8_maxval(fmt) }
+    if val < -1.0e30 { return 0.0 - fp8_maxval(fmt) }
+
+    let scaled = val * scale
+    let mx = fp8_maxval(fmt)
+
+    let mut clamped = scaled
+    if clamped > mx { clamped = mx }
+    if clamped < 0.0 - mx { clamped = 0.0 - mx }
+
+    let abs_v = fp8_abs(clamped)
+    let min_pos = fp8_minval_pos(fmt)
+    if abs_v < min_pos { return 0.0 }
+
+    let mut mantissa_bits = 3
+    if fmt == 1 { mantissa_bits = 2 }
+    let levels = fp8_pow2(to_float(mantissa_bits))
+
+    let log_v = fp8_log2(abs_v)
+    let exponent = fp8_floor(log_v)
+    let base = fp8_pow2(exponent)
+    let step = base / levels
+
+    let mut q = 0.0
+    if step > 0.0 {
+        let ratio = abs_v / step
+        let rounded = fp8_floor(ratio + 0.5)
+        q = rounded * step
+    } else {
+        q = abs_v
+    }
+
+    if q > mx { q = mx }
+
+    if clamped < 0.0 { return 0.0 - q }
+    return q
+}
+
+fn fp8_dequant(val, scale) {
+    if scale == 0.0 { return 0.0 }
+    return val / scale
+}
+
+fn fp8_cast_tensor(tensor, fmt, scale) {
+    let n = len(tensor)
+    let mut out = fp8_zeros(n)
+    for i in 0..n {
+        out[i] = fp8_cast(tensor[i], fmt, scale)
+    }
+    return out
+}
+
+fn fp8_dequant_tensor(tensor, scale) {
+    let n = len(tensor)
+    let mut out = fp8_zeros(n)
+    for i in 0..n {
+        out[i] = fp8_dequant(tensor[i], scale)
+    }
+    return out
+}
+
+fn fp8_amax(tensor) {
+    let n = len(tensor)
+    if n == 0 { return 0.0 }
+    let mut mx = 0.0
+    for i in 0..n {
+        let a = fp8_abs(tensor[i])
+        if a > mx { mx = a }
+    }
+    return mx
+}
+
+fn fp8_amax_history_update(history, new_amax) {
+    let n = len(history)
+    let mut out = fp8_zeros(n)
+    for i in 0..(n - 1) {
+        out[i] = history[i + 1]
+    }
+    out[n - 1] = new_amax
+    return out
+}
+
+fn fp8_amax_history_max(history) {
+    let n = len(history)
+    let mut mx = 0.0
+    for i in 0..n {
+        if history[i] > mx { mx = history[i] }
+    }
+    return mx
+}
+
+fn fp8_compute_scale(amax_val, fmt) {
+    if amax_val <= 0.0 { return 1.0 }
+    let mx = fp8_maxval(fmt)
+    return mx / amax_val
+}
+
+fn fp8_compute_scale_with_margin(amax_val, fmt, margin) {
+    if amax_val <= 0.0 { return 1.0 }
+    let mx = fp8_maxval(fmt)
+    return mx / (amax_val * margin)
+}
+
+fn fp8_compute_scale_from_history(history, fmt) {
+    let amax_max = fp8_amax_history_max(history)
+    return fp8_compute_scale(amax_max, fmt)
+}
+
+fn fp8_delayed_scaling_init(history_len, fmt) {
+    let mut history = fp8_zeros(history_len)
+    return [history, 1.0, fmt]
+}
+
+fn fp8_delayed_scaling_step(state, tensor) {
+    let history = state[0]
+    let scale = state[1]
+    let fmt = state[2]
+
+    let quantized = fp8_cast_tensor(tensor, fmt, scale)
+    let new_amax = fp8_amax(tensor)
+    let new_history = fp8_amax_history_update(history, new_amax)
+    let new_scale = fp8_compute_scale_from_history(new_history, fmt)
+
+    let new_state = [new_history, new_scale, fmt]
+    return [quantized, new_state]
+}
+
+fn fp8_matmul(a, b, scale_a, scale_b, m, k, n) {
+    let fmt_fwd = 0
+    let a_q = fp8_cast_tensor(a, fmt_fwd, scale_a)
+    let b_q = fp8_cast_tensor(b, fmt_fwd, scale_b)
+
+    let out_size = m * n
+    let mut c = fp8_zeros(out_size)
+    for i in 0..m {
+        for j in 0..n {
+            let mut acc = 0.0
+            for p in 0..k {
+                let a_val = a_q[i * k + p]
+                let b_val = b_q[p * n + j]
+                acc = acc + a_val * b_val
+            }
+            c[i * n + j] = acc
+        }
+    }
+
+    let combined_scale = scale_a * scale_b
+    let result = fp8_dequant_tensor(c, combined_scale)
+    return result
+}
+
+fn fp8_mixed_precision_forward(x, w, batch, in_dim, out_dim, fmt_act, fmt_w) {
+    let x_amax = fp8_amax(x)
+    let w_amax = fp8_amax(w)
+    let x_scale = fp8_compute_scale(x_amax, fmt_act)
+    let w_scale = fp8_compute_scale(w_amax, fmt_w)
+
+    let out = fp8_matmul(x, w, x_scale, w_scale, batch, in_dim, out_dim)
+    return [out, x_scale, w_scale]
+}
+
+fn fp8_mixed_precision_backward(grad_out, w, batch, in_dim, out_dim) {
+    let fmt_grad = 1
+    let fmt_w = 0
+
+    let grad_amax = fp8_amax(grad_out)
+    let w_amax = fp8_amax(w)
+    let grad_scale = fp8_compute_scale(grad_amax, fmt_grad)
+    let w_scale = fp8_compute_scale(w_amax, fmt_w)
+
+    let grad_q = fp8_cast_tensor(grad_out, fmt_grad, grad_scale)
+    let w_q = fp8_cast_tensor(w, fmt_w, w_scale)
+
+    let gi_size = batch * in_dim
+    let mut grad_input = fp8_zeros(gi_size)
+    for i in 0..batch {
+        for j in 0..in_dim {
+            let mut acc = 0.0
+            for p in 0..out_dim {
+                let g_val = grad_q[i * out_dim + p]
+                let w_val = w_q[j * out_dim + p]
+                acc = acc + g_val * w_val
+            }
+            grad_input[i * in_dim + j] = acc
+        }
+    }
+
+    let combined_scale = grad_scale * w_scale
+    let result = fp8_dequant_tensor(grad_input, combined_scale)
+    return [result, grad_scale]
+}
+
+fn fp8_loss_scaler_init(init_scale, growth_interval) {
+    return [init_scale, 0, growth_interval, 0, 0]
+}
+
+fn fp8_has_overflow(tensor, threshold) {
+    let n = len(tensor)
+    for i in 0..n {
+        if fp8_abs(tensor[i]) > threshold { return true }
+    }
+    return false
+}
+
+fn fp8_grad_overflow(grad_norm, threshold) {
+    return grad_norm > threshold
+}
+
+fn fp8_scale_grads(grads, loss_scale) {
+    let n = len(grads)
+    let mut out = fp8_zeros(n)
+    let inv_scale = 1.0 / loss_scale
+    for i in 0..n {
+        out[i] = grads[i] * inv_scale
+    }
+    return out
+}
+
+fn fp8_loss_scaler_step(scaler, grad_norm) {
+    let scale = scaler[0]
+    let counter = scaler[1]
+    let interval = scaler[2]
+    let overflow_count = scaler[3]
+    let step_count = scaler[4]
+
+    let overflow_thresh = 65504.0
+    let has_overflow = fp8_grad_overflow(grad_norm, overflow_thresh)
+
+    if has_overflow {
+        let new_scale = fp8_max_f(scale / 2.0, 1.0)
+        return [0, new_scale, 0, interval, overflow_count + 1, step_count + 1]
+    }
+
+    let new_counter = counter + 1
+    if new_counter >= interval {
+        let new_scale = fp8_min_f(scale * 2.0, 1073741824.0)
+        return [1, new_scale, 0, interval, overflow_count, step_count + 1]
+    }
+
+    return [1, scale, new_counter, interval, overflow_count, step_count + 1]
+}
+
+fn fp8_per_channel_amax(tensor, rows, cols, dim) {
+    if dim == 0 {
+        let mut amaxes = fp8_zeros(rows)
+        for r in 0..rows {
+            let mut mx = 0.0
+            for c in 0..cols {
+                let a = fp8_abs(tensor[r * cols + c])
+                if a > mx { mx = a }
+            }
+            amaxes[r] = mx
+        }
+        return amaxes
+    }
+    let mut amaxes = fp8_zeros(cols)
+    for c in 0..cols {
+        let mut mx = 0.0
+        for r in 0..rows {
+            let a = fp8_abs(tensor[r * cols + c])
+            if a > mx { mx = a }
+        }
+        amaxes[c] = mx
+    }
+    return amaxes
+}
+
+fn fp8_per_channel_scales(amaxes, fmt) {
+    let n = len(amaxes)
+    let mut scales = fp8_zeros(n)
+    for i in 0..n {
+        scales[i] = fp8_compute_scale(amaxes[i], fmt)
+    }
+    return scales
+}
+
+fn fp8_per_channel_quantize(tensor, rows, cols, dim, scales, fmt) {
+    let total = rows * cols
+    let mut out = fp8_zeros(total)
+
+    if dim == 0 {
+        for r in 0..rows {
+            for c in 0..cols {
+                let idx = r * cols + c
+                out[idx] = fp8_cast(tensor[idx], fmt, scales[r])
+            }
+        }
+    } else {
+        for r in 0..rows {
+            for c in 0..cols {
+                let idx = r * cols + c
+                out[idx] = fp8_cast(tensor[idx], fmt, scales[c])
+            }
+        }
+    }
+    return out
+}
+
+fn fp8_per_channel_dequantize(tensor, rows, cols, dim, scales) {
+    let total = rows * cols
+    let mut out = fp8_zeros(total)
+
+    if dim == 0 {
+        for r in 0..rows {
+            for c in 0..cols {
+                let idx = r * cols + c
+                out[idx] = fp8_dequant(tensor[idx], scales[r])
+            }
+        }
+    } else {
+        for r in 0..rows {
+            for c in 0..cols {
+                let idx = r * cols + c
+                out[idx] = fp8_dequant(tensor[idx], scales[c])
+            }
+        }
+    }
+    return out
+}
+
+fn fp8_tensor_norm(tensor) {
+    let n = len(tensor)
+    let mut s = 0.0
+    for i in 0..n {
+        s = s + tensor[i] * tensor[i]
+    }
+    return fp8_sqrt(s)
+}
+
+fn fp8_quant_error(original, quantized) {
+    let n = len(original)
+    if n == 0 { return 0.0 }
+    let mut s = 0.0
+    for i in 0..n {
+        let d = original[i] - quantized[i]
+        s = s + d * d
+    }
+    return s / to_float(n)
+}
+
+fn fp8_training_context_init(history_len, loss_scale, growth_interval) {
+    let act_state = fp8_delayed_scaling_init(history_len, 0)
+    let w_state = fp8_delayed_scaling_init(history_len, 0)
+    let grad_state = fp8_delayed_scaling_init(history_len, 1)
+    let loss_scaler = fp8_loss_scaler_init(loss_scale, growth_interval)
+    return [act_state, w_state, grad_state, loss_scaler]
+}
+
+fn fp8_training_step_forward(ctx, x, w, batch, in_dim, out_dim) {
+    let act_state = ctx[0]
+    let w_state = ctx[1]
+    let grad_state = ctx[2]
+    let loss_scaler = ctx[3]
+
+    let act_result = fp8_delayed_scaling_step(act_state, x)
+    let x_q = act_result[0]
+    let new_act_state = act_result[1]
+
+    let w_result = fp8_delayed_scaling_step(w_state, w)
+    let w_q = w_result[0]
+    let new_w_state = w_result[1]
+
+    let act_scale = new_act_state[1]
+    let w_scale = new_w_state[1]
+
+    let out_size = batch * out_dim
+    let mut out = fp8_zeros(out_size)
+    for i in 0..batch {
+        for j in 0..out_dim {
+            let mut acc = 0.0
+            for p in 0..in_dim {
+                acc = acc + x_q[i * in_dim + p] * w_q[p * out_dim + j]
+            }
+            out[i * out_dim + j] = acc
+        }
+    }
+
+    let new_ctx = [new_act_state, new_w_state, grad_state, loss_scaler]
+    return [out, new_ctx]
+}
+
+// ===================================================================
+//  TESTS
+// ===================================================================
+
+// T1: E4M3 maxval = 448
+let e4m3_info = fp8_format_info(0)
+check("T1 E4M3 maxval = 448", approx(e4m3_info[0], 448.0, 0.01))
+
+// T2: E5M2 maxval = 57344
+let e5m2_info = fp8_format_info(1)
+check("T2 E5M2 maxval = 57344", approx(e5m2_info[0], 57344.0, 0.01))
+
+// T3: E4M3 min positive
+check("T3 E4M3 min_pos ~ 0.00195", approx(e4m3_info[1], 0.001953125, 0.0001))
+
+// T4: E5M2 min positive
+check("T4 E5M2 min_pos ~ 6.1e-5", e5m2_info[1] < 0.001)
+
+// T5: fp8_cast saturation clamps to maxval
+let sat_val = fp8_cast(1000.0, 0, 1.0)
+check("T5 fp8_cast saturates to 448 (E4M3)", sat_val <= 448.0)
+
+// T6: fp8_cast negative saturation
+let sat_neg = fp8_cast(-1000.0, 0, 1.0)
+check("T6 fp8_cast neg saturates to -448", sat_neg >= -448.0)
+
+// T7: fp8_cast zero stays zero
+let cast_zero = fp8_cast(0.0, 0, 1.0)
+check("T7 fp8_cast(0) = 0", approx(cast_zero, 0.0, 0.0001))
+
+// T8: fp8_cast tiny value below min rounds to zero
+let tiny = fp8_cast(0.0001, 0, 1.0)
+check("T8 fp8_cast tiny value below E4M3 min -> 0", approx(tiny, 0.0, 0.001))
+
+// T9: fp8_dequant is inverse of scale
+let dq = fp8_dequant(10.0, 2.0)
+check("T9 fp8_dequant(10, 2) = 5", approx(dq, 5.0, 0.01))
+
+// T10: fp8_cast_tensor preserves length
+let t10_in = [1.0, 2.0, 3.0, 4.0, 5.0]
+let t10_out = fp8_cast_tensor(t10_in, 0, 1.0)
+check("T10 cast_tensor preserves length", len(t10_out) == 5)
+
+// T11: fp8_cast_tensor values within E4M3 range
+let mut t11_ok = true
+for i in 0..len(t10_out) {
+    if fp8_abs(t10_out[i]) > 448.0 { t11_ok = false }
+}
+check("T11 cast_tensor values within E4M3 range", t11_ok)
+
+// T12: fp8_amax finds correct absolute max
+let t12 = [1.0, 5.0, 3.0, 2.0]
+check("T12 amax([1,5,3,2]) = 5", approx(fp8_amax(t12), 5.0, 0.01))
+
+// T13: fp8_amax with negatives
+let t13 = [1.0, -7.0, 3.0, -2.0]
+check("T13 amax with negatives = 7", approx(fp8_amax(t13), 7.0, 0.01))
+
+// T14: fp8_amax empty tensor
+let t14 = []
+check("T14 amax([]) = 0", approx(fp8_amax(t14), 0.0, 0.01))
+
+// T15: amax history update shifts left
+let hist = [1.0, 2.0, 3.0, 4.0]
+let hist_updated = fp8_amax_history_update(hist, 5.0)
+check("T15 history[0] shifted to old [1]", approx(hist_updated[0], 2.0, 0.01))
+
+// T16: amax history update appends new value
+check("T16 history[-1] = new amax", approx(hist_updated[3], 5.0, 0.01))
+
+// T17: amax history max
+let hist17 = [3.0, 1.0, 4.0, 1.5]
+check("T17 history max = 4", approx(fp8_amax_history_max(hist17), 4.0, 0.01))
+
+// T18: compute scale: scale * amax ~ maxval
+let sc18 = fp8_compute_scale(100.0, 0)
+let product18 = sc18 * 100.0
+check("T18 scale * amax = maxval(E4M3)", approx(product18, 448.0, 0.1))
+
+// T19: compute scale zero amax returns 1
+let sc19 = fp8_compute_scale(0.0, 0)
+check("T19 scale(amax=0) = 1", approx(sc19, 1.0, 0.01))
+
+// T20: compute scale with margin
+let sc20 = fp8_compute_scale_with_margin(100.0, 0, 2.0)
+// Expected: 448 / (100 * 2) = 2.24
+check("T20 scale with margin=2", approx(sc20, 2.24, 0.01))
+
+// T21: delayed scaling init
+let ds21 = fp8_delayed_scaling_init(4, 0)
+let ds21_hist = ds21[0]
+check("T21 delayed scaling init history len=4", len(ds21_hist) == 4)
+check("T21b init scale = 1.0", approx(ds21[1], 1.0, 0.01))
+
+// T22: delayed scaling step quantizes
+let ds22_state = fp8_delayed_scaling_init(4, 0)
+let ds22_tensor = [10.0, 20.0, 30.0, 40.0]
+let ds22_result = fp8_delayed_scaling_step(ds22_state, ds22_tensor)
+let ds22_quant = ds22_result[0]
+let ds22_new_state = ds22_result[1]
+check("T22 delayed scaling step produces quantized output", len(ds22_quant) == 4)
+check("T22b new state has updated scale != 1", ds22_new_state[1] > 1.0)
+
+// T23: delayed scaling multi-step — scale adapts to tensor magnitude
+let mut ds23_state = fp8_delayed_scaling_init(4, 0)
+let ds23_tensors = [
+    [100.0, 200.0, 150.0],
+    [50.0, 80.0, 60.0],
+    [200.0, 300.0, 250.0]
+]
+let mut ds23_prev_scale = 1.0
+for step in 0..3 {
+    let t = ds23_tensors[step]
+    let r = fp8_delayed_scaling_step(ds23_state, t)
+    ds23_state = r[1]
+}
+let ds23_final_scale = ds23_state[1]
+// After seeing tensors with amax up to 300, scale should have adapted
+check("T23 delayed scaling adapts over steps", ds23_final_scale > 1.0)
+
+// T24: fp8_matmul dimensions correct
+// A: 2x3, B: 3x2 => C: 2x2
+let a24 = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+let b24 = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+let c24 = fp8_matmul(a24, b24, 1.0, 1.0, 2, 3, 2)
+check("T24 matmul output size = 4 (2x2)", len(c24) == 4)
+
+// T25: fp8_matmul identity-like
+// A=[[1,0],[0,1]], B=[[5,3],[7,2]], expect C ~ [[5,3],[7,2]]
+let a25 = [1.0, 0.0, 0.0, 1.0]
+let b25 = [5.0, 3.0, 7.0, 2.0]
+let c25 = fp8_matmul(a25, b25, 1.0, 1.0, 2, 2, 2)
+// With scale=1 and small values, quantization should be close
+check("T25 identity matmul c[0] ~ 5", approx(c25[0], 5.0, 1.0))
+check("T25b identity matmul c[3] ~ 2", approx(c25[3], 2.0, 1.0))
+
+// T26: mixed precision forward output shape
+let x26 = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]   // 2x3
+let w26 = [0.5, 0.3, 0.1, 0.4, 0.2, 0.6]     // 3x2
+let fwd26 = fp8_mixed_precision_forward(x26, w26, 2, 3, 2, 0, 0)
+let out26 = fwd26[0]
+check("T26 mixed precision forward output len = 4", len(out26) == 4)
+
+// T27: mixed precision backward output shape
+let grad27 = [0.1, 0.2, 0.3, 0.4]  // 2x2
+let w27 = [0.5, 0.3, 0.1, 0.4, 0.2, 0.6]  // 3x2
+let bwd27 = fp8_mixed_precision_backward(grad27, w27, 2, 3, 2)
+let gi27 = bwd27[0]
+check("T27 backward output len = 6 (2x3)", len(gi27) == 6)
+
+// T28: loss scaler init
+let ls28 = fp8_loss_scaler_init(32768.0, 2000)
+check("T28 loss scaler init scale", approx(ls28[0], 32768.0, 0.01))
+check("T28b loss scaler init interval", ls28[2] == 2000)
+
+// T29: loss scaler no overflow -> scale grows after interval
+// Returns: [should_step, scale, counter, interval, overflow_count, step_count]
+let mut ls29 = fp8_loss_scaler_init(1024.0, 3)
+// 3 steps without overflow => should grow
+for _i in 0..3 {
+    let r = fp8_loss_scaler_step(ls29, 1.0)
+    // Extract new scaler state from flat result (skip should_step at [0])
+    ls29 = [r[1], r[2], r[3], r[4], r[5]]
+}
+check("T29 scale doubled after growth_interval", approx(ls29[0], 2048.0, 0.01))
+
+// T30: loss scaler overflow -> halve scale
+let mut ls30 = fp8_loss_scaler_init(1024.0, 2000)
+let r30 = fp8_loss_scaler_step(ls30, 100000.0)  // overflow!
+// r30 = [should_step, scale, counter, interval, overflow_count, step_count]
+check("T30 overflow halves scale", approx(r30[1], 512.0, 0.01))
+check("T30b overflow returns should_step=0", r30[0] == 0)
+
+// T31: per-channel amax per-row
+// 2x3 matrix: [[1, -5, 3], [2, 4, -6]]
+let t31 = [1.0, -5.0, 3.0, 2.0, 4.0, -6.0]
+let amx31 = fp8_per_channel_amax(t31, 2, 3, 0)
+check("T31 per-row amax[0] = 5", approx(amx31[0], 5.0, 0.01))
+check("T31b per-row amax[1] = 6", approx(amx31[1], 6.0, 0.01))
+
+// T32: per-channel amax per-col
+let amx32 = fp8_per_channel_amax(t31, 2, 3, 1)
+check("T32 per-col amax[0] = 2", approx(amx32[0], 2.0, 0.01))
+check("T32b per-col amax[1] = 5", approx(amx32[1], 5.0, 0.01))
+check("T32c per-col amax[2] = 6", approx(amx32[2], 6.0, 0.01))
+
+// T33: per-channel quantize preserves shape
+let scales33 = fp8_per_channel_scales(amx31, 0)
+let quant33 = fp8_per_channel_quantize(t31, 2, 3, 0, scales33, 0)
+check("T33 per-channel quantize preserves len", len(quant33) == 6)
+
+// T34: per-channel dequantize recovers approximate values
+let deq34 = fp8_per_channel_dequantize(quant33, 2, 3, 0, scales33)
+let mut t34_close = true
+for i in 0..6 {
+    // Allow reasonable quantization error (FP8 is lossy)
+    if fabs(deq34[i] - t31[i]) > 2.0 { t34_close = false }
+}
+check("T34 per-channel round-trip approx preserves values", t34_close)
+
+// T35: training context init structure
+let ctx35 = fp8_training_context_init(8, 32768.0, 2000)
+check("T35 training context has 4 components", len(ctx35) == 4)
+// Check loss scaler is accessible
+let ls35 = ctx35[3]
+check("T35b loss scaler scale = 32768", approx(ls35[0], 32768.0, 0.01))
+
+// ===================================================================
+println("")
+println("=== fp8_training test summary ===")
+println("PASS: " + str(pass_count))
+println("FAIL: " + str(fail_count))
+println("TOTAL: " + str(pass_count + fail_count))

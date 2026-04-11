@@ -1,28 +1,52 @@
 // ═══════════════════════════════════════════════════════════════════
-//  self/ml/synthetic_data.hexa — Synthetic Data Generation Pipeline
+//  self/ml/synthetic_data.hexa — Synthetic Data Generation (#135)
 //
-//  Complete pipeline for generating training data:
-//    1. Seed prompts — template-based generation from patterns
-//    2. Generation   — expand seeds into full examples
-//    3. Quality scoring — length/diversity/coherence metrics
-//    4. Filtering    — threshold-based quality gate
-//    5. Deduplication — hash-based exact + near-duplicate removal
+//  Self-Instruct style synthetic data generation pipeline.
+//
+//  Implements:
+//    1. Seed task pool          — manage initial seed instructions
+//    2. Instruction generation  — template-based new instruction gen
+//    3. Instance generation     — input-output pair generation
+//    4. Quality filter          — score/filter by length, diversity, format
+//    5. Diversity filter        — n-gram overlap check
+//    6. Evol-Instruct           — iteratively evolve instructions
+//    7. Self-play               — generate both sides of conversation
+//    8. Decontamination         — check against test sets for leakage
+//    9. Pipeline orchestrator   — chain all steps together
 //
 //  API:
-//    sd_create_template(pattern, slots)                -> template
-//    sd_fill_template(template, values)                -> string
-//    sd_generate_from_seed(seed, n_variants, rng_seed) -> [string]
-//    sd_score_length(text, min_len, max_len)            -> float
-//    sd_score_diversity(text)                           -> float
-//    sd_score_coherence(text)                           -> float
-//    sd_quality_score(text, min_len, max_len)           -> float
-//    sd_filter(examples, threshold)                     -> [string]
-//    sd_hash_text(text)                                -> int
-//    sd_dedup(examples)                                -> [string]
-//    sd_pipeline(seeds, n_variants, threshold, rng)     -> [string]
+//    sd_create_seed_pool(seeds)                        -> pool (array)
+//    sd_add_seed(pool, seed)                           -> pool
+//    sd_pool_size(pool)                                -> int
+//    sd_get_seed(pool, idx)                            -> string
+//    sd_sample_seeds(pool, n, rng_seed)                -> [string]
+//    sd_generate_instruction(pool, template_id, seed)  -> string
+//    sd_generate_batch(pool, n, rng_seed)              -> [string]
+//    sd_generate_instance(instruction, rng_seed)       -> [input, output]
+//    sd_generate_instances(instructions, rng_seed)     -> [[input, output]]
+//    sd_score_length(text, min_len, max_len)           -> float
+//    sd_score_diversity(text)                          -> float
+//    sd_score_coherence(text)                          -> float
+//    sd_quality_score(text, min_len, max_len)          -> float
+//    sd_filter_quality(examples, threshold)            -> [string]
+//    sd_ngram_extract(words, n)                        -> [int]
+//    sd_ngram_overlap(a_words, b_words, n)             -> float
+//    sd_diversity_filter(items, max_overlap)           -> [string]
+//    sd_evol_deepen(instruction, rng_seed)             -> string
+//    sd_evol_broaden(instruction, rng_seed)            -> string
+//    sd_evol_constrain(instruction, rng_seed)          -> string
+//    sd_evol_step(instruction, rng_seed, mode)         -> string
+//    sd_evol_multi(instruction, n_steps, rng_seed)     -> string
+//    sd_self_play_turn(context, role, rng_seed)        -> string
+//    sd_self_play(topic, n_turns, rng_seed)            -> [[role, text]]
+//    sd_is_contaminated(item, test_set, threshold)     -> bool
+//    sd_decontaminate(items, test_set, threshold)      -> [string]
+//    sd_contamination_count(items, test_set, threshold)-> int
+//    sd_pipeline(seeds, n_gen, n_evol, rng_seed)       -> [instructions, instances, stats]
 //
 //  AI-NATIVE attrs:
-//    @pure     — no side effects
+//    @pure  — no side effects
+//    @hot   — called in generation loops
 // ═══════════════════════════════════════════════════════════════════
 
 // ── helpers ──────────────────────────────────────────────────────
@@ -30,30 +54,6 @@
 fn sd_abs(x) {
     if x < 0.0 { return 0.0 - x }
     return x
-}
-
-fn sd_sqrt(x) {
-    if x <= 0.0 { return 0.0 }
-    let mut g = x / 2.0
-    for _i in 0..20 { g = (g + x / g) / 2.0 }
-    return g
-}
-
-fn sd_log(x) {
-    if x <= 0.0 { return -30.0 }
-    let mut v = x
-    let mut count = 0
-    while v > 2.0 {
-        v = v / 2.718281828
-        count = count + 1
-    }
-    while v < 0.5 {
-        v = v * 2.718281828
-        count = count - 1
-    }
-    let d = v - 1.0
-    let ln_v = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
-    return to_float(count) + ln_v
 }
 
 fn sd_min(a, b) {
@@ -66,100 +66,159 @@ fn sd_max(a, b) {
     return b
 }
 
-fn sd_zeros(n) {
-    let mut v = []
-    for _i in 0..n { v = v + [0.0] }
-    return v
+fn sd_clamp(x, lo, hi) {
+    if x < lo { return lo }
+    if x > hi { return hi }
+    return x
 }
 
-fn sd_hash_int(seed, i) {
-    return (seed * 2654435761 + i * 1315423911 + 731) % 1000003
+fn sd_hash(seed, i) {
+    let mut h = (seed + 1) * 2654435761 + i * 1315423911 + 7919
+    h = h % 1000003
+    if h < 0 { h = 0 - h }
+    return h
+}
+
+fn sd_hash2(a, b) {
+    let mut h = (a + 1) * 31 + (b + 1) * 1315423911 + 997
+    h = h % 1000003
+    if h < 0 { h = 0 - h }
+    return h
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  Template creation
-//  pattern: string with {0}, {1}, ... placeholders
-//  slots: number of slots
+//  1. Seed Task Pool — manage initial seed instructions/examples
 // ═══════════════════════════════════════════════════════════════════
 @pure
-fn sd_create_template(pattern, slots) {
-    return [pattern, slots]
+fn sd_create_seed_pool(seeds) {
+    let mut pool = []
+    for i in 0..len(seeds) {
+        pool = pool + [seeds[i]]
+    }
+    return pool
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Template filling — replace {i} with values[i]
-// ═══════════════════════════════════════════════════════════════════
 @pure
-fn sd_fill_template(template, values) {
-    let pattern = template[0]
-    let slots = template[1]
-    let mut result = pattern
-    for i in 0..slots {
-        let placeholder = "{" + str(i) + "}"
-        let val = values[i]
-        // Simple string replace
-        let mut new_result = ""
-        let plen = len(placeholder)
-        let rlen = len(result)
-        let mut pos = 0
-        while pos < rlen {
-            let mut found = true
-            if pos + plen > rlen {
-                found = false
-            } else {
-                for c in 0..plen {
-                    if result[pos + c] != placeholder[c] { found = false }
-                }
-            }
-            if found {
-                new_result = new_result + val
-                pos = pos + plen
-            } else {
-                new_result = new_result + result[pos]
-                pos = pos + 1
-            }
-        }
-        result = new_result
+fn sd_add_seed(pool, seed) {
+    return pool + [seed]
+}
+
+@pure
+fn sd_pool_size(pool) {
+    return len(pool)
+}
+
+@pure
+fn sd_get_seed(pool, idx) {
+    return pool[idx]
+}
+
+@pure
+fn sd_sample_seeds(pool, n, rng_seed) {
+    let pool_n = len(pool)
+    if pool_n == 0 { return [] }
+    let mut result = []
+    for i in 0..n {
+        let idx = sd_hash(rng_seed, i) % pool_n
+        result = result + [pool[idx]]
     }
     return result
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  Seed-based variant generation
-//  Given a seed prompt, produce n_variants by word shuffling / augmentation
+//  2. Instruction Generation — template-based new instruction gen
+//
+//  Templates combine seed fragments deterministically.
+//  template_id: 0=combine, 1=rephrase, 2=extend, 3=specialize
 // ═══════════════════════════════════════════════════════════════════
+
 @pure
-fn sd_generate_from_seed(seed, n_variants, rng_seed) {
-    let mut variants = []
-    let slen = len(seed)
-    for v in 0..n_variants {
-        let h = sd_hash_int(rng_seed, v)
-        // Strategy 1: prefix/suffix augmentation
-        let prefix_idx = h % 5
-        let mut prefix = ""
-        if prefix_idx == 0 { prefix = "Explain: " }
-        if prefix_idx == 1 { prefix = "Describe: " }
-        if prefix_idx == 2 { prefix = "Analyze: " }
-        if prefix_idx == 3 { prefix = "Summarize: " }
-        if prefix_idx == 4 { prefix = "Discuss: " }
+fn sd_template_prefix(template_id) {
+    if template_id == 0 { return "Combine: " }
+    if template_id == 1 { return "Rephrase: " }
+    if template_id == 2 { return "Extend: " }
+    if template_id == 3 { return "Specialize: " }
+    return "Task: "
+}
 
-        let suffix_idx = (h / 5) % 4
-        let mut suffix = ""
-        if suffix_idx == 0 { suffix = " in detail." }
-        if suffix_idx == 1 { suffix = " briefly." }
-        if suffix_idx == 2 { suffix = " with examples." }
-        if suffix_idx == 3 { suffix = " step by step." }
+@pure
+fn sd_template_suffix(rng_seed) {
+    let pick = rng_seed % 5
+    if pick == 0 { return " with examples" }
+    if pick == 1 { return " step by step" }
+    if pick == 2 { return " in detail" }
+    if pick == 3 { return " concisely" }
+    return " and explain"
+}
 
-        let variant = prefix + seed + suffix
-        variants = variants + [variant]
+@pure @hot
+fn sd_generate_instruction(pool, template_id, rng_seed) {
+    let n = len(pool)
+    if n == 0 { return "empty pool" }
+    let idx = sd_hash(rng_seed, template_id) % n
+    let base = pool[idx]
+    let prefix = sd_template_prefix(template_id)
+    let suffix = sd_template_suffix(rng_seed)
+    return prefix + base + suffix
+}
+
+@pure
+fn sd_generate_batch(pool, n, rng_seed) {
+    let mut batch = []
+    for i in 0..n {
+        let tid = i % 4
+        let inst = sd_generate_instruction(pool, tid, sd_hash(rng_seed, i))
+        batch = batch + [inst]
     }
-    return variants
+    return batch
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  Quality scoring — length
-//  Returns 1.0 if within [min_len, max_len], degrades outside
+//  3. Instance Generation — generate input-output pairs
 // ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn sd_input_template(rng_seed) {
+    let pick = rng_seed % 4
+    if pick == 0 { return "Given the task: " }
+    if pick == 1 { return "Please complete: " }
+    if pick == 2 { return "Following the instruction: " }
+    return "Input for: "
+}
+
+@pure
+fn sd_output_template(rng_seed) {
+    let pick = rng_seed % 4
+    if pick == 0 { return "The answer is: " }
+    if pick == 1 { return "Completed: " }
+    if pick == 2 { return "Result: " }
+    return "Output: "
+}
+
+@pure @hot
+fn sd_generate_instance(instruction, rng_seed) {
+    let input_prefix = sd_input_template(rng_seed)
+    let output_prefix = sd_output_template(sd_hash(rng_seed, 1))
+    let input_text = input_prefix + instruction
+    let output_text = output_prefix + instruction + " done"
+    return [input_text, output_text]
+}
+
+@pure
+fn sd_generate_instances(instructions, rng_seed) {
+    let n = len(instructions)
+    let mut instances = []
+    for i in 0..n {
+        let inst = sd_generate_instance(instructions[i], sd_hash(rng_seed, i))
+        instances = instances + [inst]
+    }
+    return instances
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  4. Quality Filter — score and filter generated data
+// ═══════════════════════════════════════════════════════════════════
+
 @pure
 fn sd_score_length(text, min_len, max_len) {
     let l = len(text)
@@ -168,22 +227,15 @@ fn sd_score_length(text, min_len, max_len) {
         if lf <= to_float(max_len) { return 1.0 }
     }
     if lf < to_float(min_len) {
-        let ratio = lf / to_float(min_len)
-        return ratio
+        return lf / to_float(min_len)
     }
-    // too long
-    let ratio = to_float(max_len) / lf
-    return ratio
+    return to_float(max_len) / lf
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Quality scoring — character diversity (unique chars / total chars)
-// ═══════════════════════════════════════════════════════════════════
 @pure
 fn sd_score_diversity(text) {
     let n = len(text)
     if n == 0 { return 0.0 }
-    // Count unique characters using a simple seen-list
     let mut seen = []
     let mut unique = 0
     for i in 0..n {
@@ -198,15 +250,9 @@ fn sd_score_diversity(text) {
         }
     }
     let ratio = to_float(unique) / to_float(n)
-    // Normalize: good diversity is around 0.3-0.5 for natural text
-    let score = sd_min(ratio * 3.0, 1.0)
-    return score
+    return sd_min(ratio * 3.0, 1.0)
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Quality scoring — coherence (space-separated word ratio proxy)
-//  Higher ratio of alphabetic chars and proper spacing = higher score
-// ═══════════════════════════════════════════════════════════════════
 @pure
 fn sd_score_coherence(text) {
     let n = len(text)
@@ -224,32 +270,24 @@ fn sd_score_coherence(text) {
     }
     let space_ratio = to_float(spaces) / to_float(n)
     let non_space_ratio = to_float(non_space) / to_float(n)
-    // Good text has ~15-20% spaces and >60% non-space (words)
     let space_score = sd_min(space_ratio * 6.0, 1.0)
     let word_score = sd_min(non_space_ratio * 1.2, 1.0)
     return (space_score + word_score) / 2.0
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Combined quality score (weighted average)
-// ═══════════════════════════════════════════════════════════════════
 @pure
 fn sd_quality_score(text, min_len, max_len) {
     let s_len = sd_score_length(text, min_len, max_len)
     let s_div = sd_score_diversity(text)
     let s_coh = sd_score_coherence(text)
-    // Weights: length=0.3, diversity=0.3, coherence=0.4
     return 0.3 * s_len + 0.3 * s_div + 0.4 * s_coh
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Filtering — keep examples above quality threshold
-// ═══════════════════════════════════════════════════════════════════
 @pure
-fn sd_filter(examples, threshold, min_len, max_len) {
+fn sd_filter_quality(examples, threshold) {
     let mut kept = []
     for i in 0..len(examples) {
-        let score = sd_quality_score(examples[i], min_len, max_len)
+        let score = sd_quality_score(examples[i], 10, 500)
         if score >= threshold {
             kept = kept + [examples[i]]
         }
@@ -258,140 +296,262 @@ fn sd_filter(examples, threshold, min_len, max_len) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  Text hashing for deduplication
+//  5. Diversity Filter — n-gram overlap check
 // ═══════════════════════════════════════════════════════════════════
+
 @pure
-fn sd_hash_text(text) {
-    let n = len(text)
-    let mut h = 5381
+fn sd_tokenize(text) {
+    return text.split(" ")
+}
+
+@pure
+fn sd_ngram_extract(words, n) {
+    let nw = len(words)
+    if nw < n { return [] }
+    let mut ngrams = []
+    for i in 0..(nw - n + 1) {
+        let mut h = 0
+        for j in 0..n {
+            let w = words[i + j]
+            let wchars = w.chars()
+            let wlen = len(wchars)
+            for k in 0..wlen {
+                h = h * 31 + to_int(wchars[k])
+                h = h % 999983
+            }
+            h = h * 131 + j
+            h = h % 999983
+        }
+        if h < 0 { h = 0 - h }
+        ngrams = ngrams + [h]
+    }
+    return ngrams
+}
+
+@pure
+fn sd_ngram_overlap(a_words, b_words, n) {
+    let a_ng = sd_ngram_extract(a_words, n)
+    let b_ng = sd_ngram_extract(b_words, n)
+    let na = len(a_ng)
+    let nb = len(b_ng)
+    if na == 0 { return 0.0 }
+    let mut matches = 0
+    for i in 0..na {
+        for j in 0..nb {
+            if a_ng[i] == b_ng[j] {
+                matches = matches + 1
+                break
+            }
+        }
+    }
+    return to_float(matches) / to_float(na)
+}
+
+@pure
+fn sd_diversity_filter(items, max_overlap) {
+    let n = len(items)
+    if n == 0 { return [] }
+    let mut accepted = [items[0]]
+    for i in 1..n {
+        let words_i = sd_tokenize(items[i])
+        let mut too_similar = false
+        for j in 0..len(accepted) {
+            let words_j = sd_tokenize(accepted[j])
+            let overlap = sd_ngram_overlap(words_i, words_j, 2)
+            if overlap > max_overlap {
+                too_similar = true
+                break
+            }
+        }
+        if !too_similar {
+            accepted = accepted + [items[i]]
+        }
+    }
+    return accepted
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  6. Evol-Instruct — iteratively evolve instructions
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn sd_evol_deepen(instruction, rng_seed) {
+    let pick = rng_seed % 3
+    if pick == 0 { return "Analyze step by step: " + instruction }
+    if pick == 1 { return "Provide detailed reasoning for: " + instruction }
+    return "Think critically about: " + instruction
+}
+
+@pure
+fn sd_evol_broaden(instruction, rng_seed) {
+    let pick = rng_seed % 3
+    if pick == 0 { return "Generalize to multiple domains: " + instruction }
+    if pick == 1 { return "Extend to broader context: " + instruction }
+    return "Apply more widely: " + instruction
+}
+
+@pure
+fn sd_evol_constrain(instruction, rng_seed) {
+    let pick = rng_seed % 4
+    if pick == 0 { return instruction + " (limit to 100 words)" }
+    if pick == 1 { return instruction + " (use formal language)" }
+    if pick == 2 { return instruction + " (include examples)" }
+    return instruction + " (explain for beginners)"
+}
+
+// mode: 0=deepen, 1=broaden, 2=constrain
+@pure @hot
+fn sd_evol_step(instruction, rng_seed, mode) {
+    if mode == 0 { return sd_evol_deepen(instruction, rng_seed) }
+    if mode == 1 { return sd_evol_broaden(instruction, rng_seed) }
+    if mode == 2 { return sd_evol_constrain(instruction, rng_seed) }
+    return instruction
+}
+
+@pure
+fn sd_evol_multi(instruction, n_steps, rng_seed) {
+    let mut current = instruction
+    for i in 0..n_steps {
+        let mode = i % 3
+        let step_seed = sd_hash(rng_seed, i)
+        current = sd_evol_step(current, step_seed, mode)
+    }
+    return current
+}
+
+@pure
+fn sd_evol_batch(instructions, n_steps, rng_seed) {
+    let n = len(instructions)
+    let mut results = []
     for i in 0..n {
-        // djb2-like hash using char position
-        let c = text[i]
-        // use string comparison to map common chars to ints
-        let mut cv = i % 256
-        h = ((h * 33) + cv) % 1000000007
+        let evolved = sd_evol_multi(instructions[i], n_steps, sd_hash(rng_seed, i))
+        results = results + [evolved]
     }
-    return h
+    return results
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  Exact deduplication using hash
+//  7. Self-Play — generate both sides of a conversation
 // ═══════════════════════════════════════════════════════════════════
+
 @pure
-fn sd_dedup(examples) {
-    let mut seen_hashes = []
-    let mut unique = []
-    for i in 0..len(examples) {
-        let h = sd_hash_text(examples[i])
-        let mut dup = false
-        for j in 0..len(seen_hashes) {
-            if seen_hashes[j] == h { dup = true }
-        }
-        if !dup {
-            seen_hashes = seen_hashes + [h]
-            unique = unique + [examples[i]]
-        }
-    }
-    return unique
+fn sd_self_play_user_turn(context, rng_seed) {
+    let pick = rng_seed % 4
+    if pick == 0 { return "Can you help me with " + context }
+    if pick == 1 { return "Tell me more about " + context }
+    if pick == 2 { return "How would you approach " + context }
+    return "What is the best way to handle " + context
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Near-duplicate detection using character-level n-gram Jaccard
-// ═══════════════════════════════════════════════════════════════════
 @pure
-fn sd_jaccard_similarity(a, b) {
-    let la = len(a)
-    let lb = len(b)
-    if la < 3 { return 0.0 }
-    if lb < 3 { return 0.0 }
-    // 3-gram sets (using hash for each trigram)
-    let mut set_a = []
-    for i in 0..(la - 2) {
-        let h = sd_hash_int(i, la) + sd_hash_int(i + 1, la + 1)
-        set_a = set_a + [h]
-    }
-    let mut set_b = []
-    for i in 0..(lb - 2) {
-        let h = sd_hash_int(i, lb) + sd_hash_int(i + 1, lb + 1)
-        set_b = set_b + [h]
-    }
-    // Count intersection
-    let mut intersection = 0
-    for i in 0..len(set_a) {
-        for j in 0..len(set_b) {
-            if set_a[i] == set_b[j] { intersection = intersection + 1 }
-        }
-    }
-    let union_size = len(set_a) + len(set_b) - intersection
-    if union_size == 0 { return 1.0 }
-    return to_float(intersection) / to_float(union_size)
+fn sd_self_play_assistant_turn(context, rng_seed) {
+    let pick = rng_seed % 4
+    if pick == 0 { return "Sure, regarding " + context + " I would suggest" }
+    if pick == 1 { return "Great question about " + context + " here is my approach" }
+    if pick == 2 { return "For " + context + " the key consideration is" }
+    return "Let me explain about " + context + " in detail"
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Near-dedup: remove items with Jaccard > threshold to any kept item
-// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn sd_self_play_turn(context, role, rng_seed) {
+    if role == 0 { return sd_self_play_user_turn(context, rng_seed) }
+    return sd_self_play_assistant_turn(context, rng_seed)
+}
+
 @pure
-fn sd_near_dedup(examples, sim_threshold) {
-    let mut kept = []
-    for i in 0..len(examples) {
-        let mut is_dup = false
-        for j in 0..len(kept) {
-            let sim = sd_jaccard_similarity(examples[i], kept[j])
-            if sim > sim_threshold { is_dup = true }
-        }
-        if !is_dup {
-            kept = kept + [examples[i]]
-        }
+fn sd_self_play(topic, n_turns, rng_seed) {
+    let mut conversation = []
+    let mut context = topic
+    for i in 0..n_turns {
+        let role = i % 2
+        let turn_seed = sd_hash(rng_seed, i)
+        let text = sd_self_play_turn(context, role, turn_seed)
+        conversation = conversation + [[role, text]]
+        context = text
     }
-    return kept
+    return conversation
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  Full pipeline: seeds -> generate -> score -> filter -> dedup
+//  8. Decontamination — check against test sets for leakage
 // ═══════════════════════════════════════════════════════════════════
-fn sd_pipeline(seeds, n_variants, threshold, rng_seed) {
-    let min_len = 10
-    let max_len = 200
-    // 1. Generate variants from all seeds
-    let mut all_examples = []
-    for i in 0..len(seeds) {
-        let variants = sd_generate_from_seed(seeds[i], n_variants, rng_seed + i)
-        for j in 0..len(variants) {
-            all_examples = all_examples + [variants[j]]
-        }
-    }
-    let gen_count = len(all_examples)
 
-    // 2. Filter by quality
-    let filtered = sd_filter(all_examples, threshold, min_len, max_len)
-    let filter_count = len(filtered)
-
-    // 3. Dedup
-    let deduped = sd_dedup(filtered)
-    let dedup_count = len(deduped)
-
-    println("[synth] generated=" + str(gen_count) + " filtered=" + str(filter_count) + " deduped=" + str(dedup_count))
-    return deduped
-}
-
-// ═══════════════════════════════════════════════════════════════════
-//  Statistics — compute quality distribution over examples
-// ═══════════════════════════════════════════════════════════════════
 @pure
-fn sd_quality_stats(examples, min_len, max_len) {
-    let n = len(examples)
-    if n == 0 { return [0.0, 0.0, 0.0] }
-    let mut total = 0.0
-    let mut mn = 999.0
-    let mut mx = -999.0
+fn sd_is_contaminated(item, test_set, threshold) {
+    let item_words = sd_tokenize(item)
+    let n_test = len(test_set)
+    for i in 0..n_test {
+        let test_words = sd_tokenize(test_set[i])
+        let overlap = sd_ngram_overlap(item_words, test_words, 2)
+        if overlap > threshold {
+            return true
+        }
+    }
+    return false
+}
+
+@pure
+fn sd_decontaminate(items, test_set, threshold) {
+    let n = len(items)
+    let mut clean = []
     for i in 0..n {
-        let s = sd_quality_score(examples[i], min_len, max_len)
-        total = total + s
-        if s < mn { mn = s }
-        if s > mx { mx = s }
+        if !sd_is_contaminated(items[i], test_set, threshold) {
+            clean = clean + [items[i]]
+        }
     }
-    let avg = total / to_float(n)
-    return [avg, mn, mx]
+    return clean
 }
 
-println("[synthetic_data] loaded — seed-template generation + length/diversity/coherence scoring + filter + dedup")
+@pure
+fn sd_contamination_count(items, test_set, threshold) {
+    let n = len(items)
+    let mut count = 0
+    for i in 0..n {
+        if sd_is_contaminated(items[i], test_set, threshold) {
+            count = count + 1
+        }
+    }
+    return count
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  9. Pipeline Orchestrator — chain all steps together
+//
+//  Full pipeline:
+//    1. Create seed pool
+//    2. Generate instructions from seeds
+//    3. Evolve instructions (Evol-Instruct)
+//    4. Quality filter
+//    5. Diversity filter
+//    6. Generate instances (input-output pairs)
+//    7. Return [instructions, instances, stats]
+//       stats = [n_generated, n_after_quality, n_after_diversity, n_instances]
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn sd_pipeline(seeds, n_gen, n_evol_steps, rng_seed) {
+    let pool = sd_create_seed_pool(seeds)
+    let raw_instructions = sd_generate_batch(pool, n_gen, rng_seed)
+    let n_generated = len(raw_instructions)
+    let evolved = sd_evol_batch(raw_instructions, n_evol_steps, sd_hash(rng_seed, 100))
+    let quality_filtered = sd_filter_quality(evolved, 0.3)
+    let n_after_quality = len(quality_filtered)
+    let diverse = sd_diversity_filter(quality_filtered, 0.9)
+    let n_after_diversity = len(diverse)
+    let instances = sd_generate_instances(diverse, sd_hash(rng_seed, 200))
+    let stats = [n_generated, n_after_quality, n_after_diversity, len(instances)]
+    return [diverse, instances, stats]
+}
+
+@hot
+fn sd_pipeline_decontaminated(seeds, n_gen, n_evol_steps, rng_seed, test_set) {
+    let result = sd_pipeline(seeds, n_gen, n_evol_steps, rng_seed)
+    let instructions = result[0]
+    let stats = result[2]
+    let clean_instructions = sd_decontaminate(instructions, test_set, 0.5)
+    let n_final = len(clean_instructions)
+    let clean_instances = sd_generate_instances(clean_instructions, sd_hash(rng_seed, 300))
+    let final_stats = [stats[0], stats[1], stats[2], n_final]
+    return [clean_instructions, clean_instances, final_stats]
+}
+
+println("[synthetic_data] loaded — seed pool + instruction gen + instance gen + quality filter + diversity filter + evol-instruct + self-play + decontamination + pipeline")

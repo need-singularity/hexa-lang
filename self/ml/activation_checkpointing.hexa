@@ -1,0 +1,755 @@
+// ===================================================================
+//  self/ml/activation_checkpointing.hexa — Activation Checkpointing
+//
+//  Gradient checkpointing for memory savings: discard intermediate
+//  activations during forward pass, recompute them during backward.
+//
+//  Implements:
+//    1. Checkpoint boundary markers
+//    2. Selective recomputation (discard + recompute)
+//    3. Segment-based checkpointing (every N layers)
+//    4. Memory estimator
+//    5. Checkpoint policy (none / sqrt(n) / every-layer)
+//    6. no_recompute marker
+//    7. Nested checkpoint support
+//    8. Memory vs compute tradeoff calculator
+//    9. Stats tracker
+//
+//  API:
+//    ac_create_layer(id, compute_cost, activation_size)
+//    ac_create_model(layers)
+//    ac_mark_checkpoint(model, layer_idx)
+//    ac_mark_no_recompute(model, layer_idx)
+//    ac_clear_checkpoints(model)
+//    ac_apply_segment_policy(model, segment_size)
+//    ac_apply_sqrt_policy(model)
+//    ac_apply_every_layer_policy(model)
+//    ac_apply_none_policy(model)
+//    ac_auto_policy(model, memory_budget)
+//    ac_forward_pass(model, input)
+//    ac_backward_pass(model, grad)
+//    ac_estimate_memory(model)
+//    ac_estimate_memory_no_ckpt(model)
+//    ac_memory_savings(model)
+//    ac_tradeoff(model)
+//    ac_get_stats(model)
+//    ac_reset_stats(model)
+//    ac_create_nested(outer_layers, inner_layers)
+//    ac_forward_nested(nested, input)
+//    ac_backward_nested(nested, grad)
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects (estimators)
+//    @hot   — called during training loops
+// ===================================================================
+
+// ── helpers ──────────────────────────────────────────────────────
+
+fn ac_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn ac_sqrt_approx(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn ac_floor_int(x) {
+    return to_int(x)
+}
+
+fn ac_max(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn ac_min(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn ac_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn ac_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+// ===================================================================
+//  Layer representation
+//
+//  Each layer is a flat array:
+//    [id, compute_cost, activation_size, is_checkpoint, is_no_recompute]
+//  Index: 0=id, 1=compute_cost, 2=activation_size, 3=checkpoint?, 4=no_recompute?
+// ===================================================================
+
+fn ac_create_layer(id, compute_cost, activation_size) {
+    return [id, compute_cost, activation_size, 0, 0]
+}
+
+fn ac_layer_id(layer) { return layer[0] }
+fn ac_layer_cost(layer) { return layer[1] }
+fn ac_layer_actsize(layer) { return layer[2] }
+fn ac_layer_is_ckpt(layer) { return layer[3] }
+fn ac_layer_is_norecompute(layer) { return layer[4] }
+
+// ===================================================================
+//  Model representation
+//
+//  Model is an array:
+//    [layers_array, stats_array]
+//  stats_array: [recompute_count, memory_saved, forward_calls, backward_calls]
+// ===================================================================
+
+fn ac_create_model(layers) {
+    let stats = [0, 0.0, 0, 0]
+    return [layers, stats]
+}
+
+fn ac_model_layers(model) { return model[0] }
+fn ac_model_stats(model) { return model[1] }
+
+fn ac_model_num_layers(model) {
+    return len(ac_model_layers(model))
+}
+
+// ===================================================================
+//  Checkpoint boundary markers
+//
+//  Mark which layers are checkpoint boundaries. At these layers,
+//  activations are saved; between checkpoints, activations are
+//  discarded and recomputed during backward.
+// ===================================================================
+
+fn ac_mark_checkpoint(model, layer_idx) {
+    let layers = ac_model_layers(model)
+    let n = len(layers)
+    if layer_idx < 0 { return model }
+    if layer_idx >= n { return model }
+    let mut new_layers = []
+    for i in 0..n {
+        let l = layers[i]
+        if i == layer_idx {
+            new_layers = new_layers + [[l[0], l[1], l[2], 1, l[4]]]
+        } else {
+            new_layers = new_layers + [l]
+        }
+    }
+    return [new_layers, ac_model_stats(model)]
+}
+
+fn ac_unmark_checkpoint(model, layer_idx) {
+    let layers = ac_model_layers(model)
+    let n = len(layers)
+    if layer_idx < 0 { return model }
+    if layer_idx >= n { return model }
+    let mut new_layers = []
+    for i in 0..n {
+        let l = layers[i]
+        if i == layer_idx {
+            new_layers = new_layers + [[l[0], l[1], l[2], 0, l[4]]]
+        } else {
+            new_layers = new_layers + [l]
+        }
+    }
+    return [new_layers, ac_model_stats(model)]
+}
+
+// ===================================================================
+//  no_recompute marker
+//
+//  Certain ops (e.g., embedding lookups, dropout with fixed seed)
+//  should never be recomputed. Mark them to always keep activations.
+// ===================================================================
+
+fn ac_mark_no_recompute(model, layer_idx) {
+    let layers = ac_model_layers(model)
+    let n = len(layers)
+    if layer_idx < 0 { return model }
+    if layer_idx >= n { return model }
+    let mut new_layers = []
+    for i in 0..n {
+        let l = layers[i]
+        if i == layer_idx {
+            new_layers = new_layers + [[l[0], l[1], l[2], l[3], 1]]
+        } else {
+            new_layers = new_layers + [l]
+        }
+    }
+    return [new_layers, ac_model_stats(model)]
+}
+
+fn ac_unmark_no_recompute(model, layer_idx) {
+    let layers = ac_model_layers(model)
+    let n = len(layers)
+    if layer_idx < 0 { return model }
+    if layer_idx >= n { return model }
+    let mut new_layers = []
+    for i in 0..n {
+        let l = layers[i]
+        if i == layer_idx {
+            new_layers = new_layers + [[l[0], l[1], l[2], l[3], 0]]
+        } else {
+            new_layers = new_layers + [l]
+        }
+    }
+    return [new_layers, ac_model_stats(model)]
+}
+
+// ===================================================================
+//  Clear all checkpoints
+// ===================================================================
+
+fn ac_clear_checkpoints(model) {
+    let layers = ac_model_layers(model)
+    let n = len(layers)
+    let mut new_layers = []
+    for i in 0..n {
+        let l = layers[i]
+        new_layers = new_layers + [[l[0], l[1], l[2], 0, l[4]]]
+    }
+    return [new_layers, ac_model_stats(model)]
+}
+
+// ===================================================================
+//  Segment-based checkpointing — checkpoint every N layers
+//
+//  For a model with L layers and segment_size S, checkpoints are
+//  placed at layers 0, S, 2S, 3S, ... and at L-1 (last layer).
+// ===================================================================
+
+fn ac_apply_segment_policy(model, segment_size) {
+    let layers = ac_model_layers(model)
+    let n = len(layers)
+    let mut seg = segment_size
+    if seg < 1 { seg = 1 }
+    let mut new_layers = []
+    for i in 0..n {
+        let l = layers[i]
+        let mut is_ckpt = 0
+        if i % seg == 0 { is_ckpt = 1 }
+        if i == n - 1 { is_ckpt = 1 }
+        new_layers = new_layers + [[l[0], l[1], l[2], is_ckpt, l[4]]]
+    }
+    return [new_layers, ac_model_stats(model)]
+}
+
+// ===================================================================
+//  Checkpoint policy: sqrt(n)
+//
+//  Place checkpoints every floor(sqrt(n)) layers.
+//  Optimal for memory/compute tradeoff: O(sqrt(n)) memory.
+// ===================================================================
+
+fn ac_apply_sqrt_policy(model) {
+    let n = ac_model_num_layers(model)
+    let seg = ac_floor_int(ac_sqrt_approx(to_float(n)))
+    let mut final_seg = seg
+    if final_seg < 1 { final_seg = 1 }
+    return ac_apply_segment_policy(model, final_seg)
+}
+
+// ===================================================================
+//  Checkpoint policy: every layer
+//
+//  Maximum memory savings, maximum recomputation.
+//  Every layer is a checkpoint boundary.
+// ===================================================================
+
+fn ac_apply_every_layer_policy(model) {
+    return ac_apply_segment_policy(model, 1)
+}
+
+// ===================================================================
+//  Checkpoint policy: none
+//
+//  No checkpointing — keep all activations. Standard training.
+// ===================================================================
+
+fn ac_apply_none_policy(model) {
+    return ac_clear_checkpoints(model)
+}
+
+// ===================================================================
+//  Auto policy selection based on memory budget
+//
+//  Given a memory budget (in abstract units matching activation_size):
+//    - If total activation memory fits in budget -> none
+//    - If sqrt(n) policy fits in budget -> sqrt(n)
+//    - Otherwise -> every-layer
+//
+//  Returns: [model_with_policy, policy_name]
+//    policy_name: "none", "sqrt", "every"
+// ===================================================================
+
+fn ac_auto_policy(model, memory_budget) {
+    let mem_no_ckpt = ac_estimate_memory_no_ckpt(model)
+    if mem_no_ckpt <= memory_budget {
+        let m = ac_apply_none_policy(model)
+        return [m, "none"]
+    }
+    let m_sqrt = ac_apply_sqrt_policy(model)
+    let mem_sqrt = ac_estimate_memory(m_sqrt)
+    if mem_sqrt <= memory_budget {
+        return [m_sqrt, "sqrt"]
+    }
+    let m_every = ac_apply_every_layer_policy(model)
+    return [m_every, "every"]
+}
+
+// ===================================================================
+//  Memory estimator (no checkpointing)
+//
+//  Total activation memory = sum of all layer activation sizes.
+// ===================================================================
+@pure
+fn ac_estimate_memory_no_ckpt(model) {
+    let layers = ac_model_layers(model)
+    let n = len(layers)
+    let mut total = 0.0
+    for i in 0..n {
+        total = total + to_float(ac_layer_actsize(layers[i]))
+    }
+    return total
+}
+
+// ===================================================================
+//  Memory estimator (with checkpointing)
+//
+//  With checkpointing, we only keep activations at checkpoint layers
+//  plus the activations of no_recompute layers.
+//  Between checkpoints, activations are discarded.
+//
+//  Peak memory = sum(checkpoint layer activations)
+//              + sum(no_recompute layer activations)
+//              + max segment memory (for the segment currently
+//                being recomputed during backward)
+//
+//  Segment memory = sum of activation sizes between consecutive
+//  checkpoints (the segment being recomputed).
+// ===================================================================
+@pure
+fn ac_estimate_memory(model) {
+    let layers = ac_model_layers(model)
+    let n = len(layers)
+    if n == 0 { return 0.0 }
+
+    // Check if any checkpoints exist
+    let mut has_ckpt = false
+    for i in 0..n {
+        if ac_layer_is_ckpt(layers[i]) == 1 { has_ckpt = true }
+    }
+    if !has_ckpt { return ac_estimate_memory_no_ckpt(model) }
+
+    // Sum checkpoint activations
+    let mut ckpt_mem = 0.0
+    for i in 0..n {
+        if ac_layer_is_ckpt(layers[i]) == 1 {
+            ckpt_mem = ckpt_mem + to_float(ac_layer_actsize(layers[i]))
+        }
+    }
+
+    // Sum no_recompute activations (that are not already checkpointed)
+    let mut norecomp_mem = 0.0
+    for i in 0..n {
+        if ac_layer_is_norecompute(layers[i]) == 1 {
+            if ac_layer_is_ckpt(layers[i]) == 0 {
+                norecomp_mem = norecomp_mem + to_float(ac_layer_actsize(layers[i]))
+            }
+        }
+    }
+
+    // Find max segment memory (between consecutive checkpoints)
+    let mut max_seg = 0.0
+    let mut cur_seg = 0.0
+    for i in 0..n {
+        if ac_layer_is_ckpt(layers[i]) == 1 {
+            if cur_seg > max_seg { max_seg = cur_seg }
+            cur_seg = 0.0
+        } else {
+            if ac_layer_is_norecompute(layers[i]) == 0 {
+                cur_seg = cur_seg + to_float(ac_layer_actsize(layers[i]))
+            }
+        }
+    }
+    if cur_seg > max_seg { max_seg = cur_seg }
+
+    return ckpt_mem + norecomp_mem + max_seg
+}
+
+// ===================================================================
+//  Memory savings
+//
+//  Returns: [saved_bytes, savings_fraction]
+//    saved_bytes = no_ckpt_mem - ckpt_mem
+//    savings_fraction = saved_bytes / no_ckpt_mem
+// ===================================================================
+@pure
+fn ac_memory_savings(model) {
+    let no_ckpt = ac_estimate_memory_no_ckpt(model)
+    let with_ckpt = ac_estimate_memory(model)
+    let saved = no_ckpt - with_ckpt
+    let mut frac = 0.0
+    if no_ckpt > 0.0 {
+        frac = saved / no_ckpt
+    }
+    return [saved, frac]
+}
+
+// ===================================================================
+//  Forward pass simulation
+//
+//  Simulates forward pass through the model.
+//  - At each layer, apply a simple linear transform to input
+//  - Checkpoint layers: store activation
+//  - Non-checkpoint layers: activation is discarded (not stored)
+//  - no_recompute layers: always store activation
+//
+//  Returns: [output, stored_activations_map]
+//    stored_activations_map is an array of [layer_idx, activation]
+// ===================================================================
+@hot
+fn ac_forward_pass(model, input) {
+    let layers = ac_model_layers(model)
+    let n = len(layers)
+    let mut current = input
+    let mut stored = []
+
+    // Update stats
+    let stats = ac_model_stats(model)
+    let new_stats = [stats[0], stats[1], stats[2] + 1, stats[3]]
+
+    for i in 0..n {
+        let l = layers[i]
+        let cost = to_float(ac_layer_cost(l))
+        // Simulate computation: scale by (1 + cost/100)
+        let mut next = []
+        let dim = len(current)
+        for d in 0..dim {
+            next = next + [current[d] * (1.0 + cost / 100.0)]
+        }
+        current = next
+
+        // Store if checkpoint or no_recompute
+        if ac_layer_is_ckpt(l) == 1 {
+            stored = stored + [[i, current]]
+        } else {
+            if ac_layer_is_norecompute(l) == 1 {
+                stored = stored + [[i, current]]
+            }
+        }
+    }
+
+    let new_model = [layers, new_stats]
+    return [current, stored, new_model]
+}
+
+// ===================================================================
+//  Backward pass simulation
+//
+//  During backward, for each segment between checkpoints, recompute
+//  from the last checkpoint to recover intermediate activations.
+//
+//  Returns: [grad_input, recompute_count, updated_model]
+// ===================================================================
+@hot
+fn ac_backward_pass(model, grad) {
+    let layers = ac_model_layers(model)
+    let n = len(layers)
+    let mut current_grad = grad
+    let mut recompute_count = 0
+
+    for idx in 0..n {
+        let i = n - 1 - idx
+        let l = layers[i]
+
+        // If not a checkpoint and not no_recompute, we need recomputation
+        if ac_layer_is_ckpt(l) == 0 {
+            if ac_layer_is_norecompute(l) == 0 {
+                recompute_count = recompute_count + 1
+            }
+        }
+
+        // Simulate gradient computation: scale by (1 + cost/100)
+        let cost = to_float(ac_layer_cost(l))
+        let dim = len(current_grad)
+        let mut next_grad = []
+        for d in 0..dim {
+            next_grad = next_grad + [current_grad[d] * (1.0 + cost / 100.0)]
+        }
+        current_grad = next_grad
+    }
+
+    // Update stats
+    let stats = ac_model_stats(model)
+    let mem_saved_est = to_float(recompute_count) * 100.0
+    let new_stats = [stats[0] + recompute_count, stats[1] + mem_saved_est, stats[2], stats[3] + 1]
+    let new_model = [layers, new_stats]
+
+    return [current_grad, recompute_count, new_model]
+}
+
+// ===================================================================
+//  Memory vs compute tradeoff calculator
+//
+//  Analyzes the current checkpointing configuration and returns:
+//    [memory_with_ckpt, memory_without_ckpt, savings_fraction,
+//     extra_compute_cost, compute_overhead_fraction]
+//
+//  extra_compute_cost: sum of compute costs for all layers that
+//    would be recomputed (non-checkpoint, non-no_recompute layers)
+//  total_compute: sum of all layer compute costs
+//  compute_overhead_fraction: extra / total
+// ===================================================================
+@pure
+fn ac_tradeoff(model) {
+    let layers = ac_model_layers(model)
+    let n = len(layers)
+
+    let mem_with = ac_estimate_memory(model)
+    let mem_without = ac_estimate_memory_no_ckpt(model)
+    let mut savings_frac = 0.0
+    if mem_without > 0.0 {
+        savings_frac = (mem_without - mem_with) / mem_without
+    }
+
+    let mut total_compute = 0.0
+    let mut extra_compute = 0.0
+    for i in 0..n {
+        let l = layers[i]
+        let cost = to_float(ac_layer_cost(l))
+        total_compute = total_compute + cost
+        if ac_layer_is_ckpt(l) == 0 {
+            if ac_layer_is_norecompute(l) == 0 {
+                extra_compute = extra_compute + cost
+            }
+        }
+    }
+
+    let mut compute_overhead = 0.0
+    if total_compute > 0.0 {
+        compute_overhead = extra_compute / total_compute
+    }
+
+    return [mem_with, mem_without, savings_frac, extra_compute, compute_overhead]
+}
+
+// ===================================================================
+//  Stats tracker
+//
+//  Track recomputations, memory saved, forward/backward call counts.
+//  stats: [recompute_count, memory_saved, forward_calls, backward_calls]
+// ===================================================================
+
+fn ac_get_stats(model) {
+    let s = ac_model_stats(model)
+    return [s[0], s[1], s[2], s[3]]
+}
+
+fn ac_reset_stats(model) {
+    let layers = ac_model_layers(model)
+    return [layers, [0, 0.0, 0, 0]]
+}
+
+// ===================================================================
+//  Count checkpoint layers
+// ===================================================================
+@pure
+fn ac_count_checkpoints(model) {
+    let layers = ac_model_layers(model)
+    let n = len(layers)
+    let mut count = 0
+    for i in 0..n {
+        if ac_layer_is_ckpt(layers[i]) == 1 { count = count + 1 }
+    }
+    return count
+}
+
+// ===================================================================
+//  Count no_recompute layers
+// ===================================================================
+@pure
+fn ac_count_no_recompute(model) {
+    let layers = ac_model_layers(model)
+    let n = len(layers)
+    let mut count = 0
+    for i in 0..n {
+        if ac_layer_is_norecompute(layers[i]) == 1 { count = count + 1 }
+    }
+    return count
+}
+
+// ===================================================================
+//  Nested checkpoint support
+//
+//  An outer model contains inner sub-models (e.g., a transformer
+//  block that itself has checkpointed attention + MLP).
+//
+//  nested: [outer_model, inner_model]
+//  Outer layers run sequentially; one of them invokes the inner model.
+// ===================================================================
+
+fn ac_create_nested(outer_layers, inner_layers) {
+    let outer = ac_create_model(outer_layers)
+    let inner = ac_create_model(inner_layers)
+    return [outer, inner]
+}
+
+fn ac_nested_outer(nested) { return nested[0] }
+fn ac_nested_inner(nested) { return nested[1] }
+
+fn ac_forward_nested(nested, input) {
+    let outer = ac_nested_outer(nested)
+    let inner = ac_nested_inner(nested)
+
+    // Forward through outer first half (layers before inner)
+    let outer_layers = ac_model_layers(outer)
+    let n_outer = len(outer_layers)
+    let mid = n_outer / 2
+    let mut current = input
+
+    for i in 0..mid {
+        let l = outer_layers[i]
+        let cost = to_float(ac_layer_cost(l))
+        let dim = len(current)
+        let mut next = []
+        for d in 0..dim {
+            next = next + [current[d] * (1.0 + cost / 100.0)]
+        }
+        current = next
+    }
+
+    // Forward through inner model
+    let inner_result = ac_forward_pass(inner, current)
+    current = inner_result[0]
+    let inner_stored = inner_result[1]
+    let inner_updated = inner_result[2]
+
+    // Forward through outer second half
+    for i in mid..n_outer {
+        let l = outer_layers[i]
+        let cost = to_float(ac_layer_cost(l))
+        let dim = len(current)
+        let mut next = []
+        for d in 0..dim {
+            next = next + [current[d] * (1.0 + cost / 100.0)]
+        }
+        current = next
+    }
+
+    let new_nested = [outer, inner_updated]
+    return [current, inner_stored, new_nested]
+}
+
+fn ac_backward_nested(nested, grad) {
+    let outer = ac_nested_outer(nested)
+    let inner = ac_nested_inner(nested)
+
+    let outer_layers = ac_model_layers(outer)
+    let n_outer = len(outer_layers)
+    let mid = n_outer / 2
+    let mut current_grad = grad
+
+    // Backward through outer second half
+    for idx in 0..(n_outer - mid) {
+        let i = n_outer - 1 - idx
+        let l = outer_layers[i]
+        let cost = to_float(ac_layer_cost(l))
+        let dim = len(current_grad)
+        let mut next_grad = []
+        for d in 0..dim {
+            next_grad = next_grad + [current_grad[d] * (1.0 + cost / 100.0)]
+        }
+        current_grad = next_grad
+    }
+
+    // Backward through inner model (with recomputation)
+    let inner_result = ac_backward_pass(inner, current_grad)
+    current_grad = inner_result[0]
+    let inner_recomp = inner_result[1]
+    let inner_updated = inner_result[2]
+
+    // Backward through outer first half
+    for idx in 0..mid {
+        let i = mid - 1 - idx
+        let l = outer_layers[i]
+        let cost = to_float(ac_layer_cost(l))
+        let dim = len(current_grad)
+        let mut next_grad = []
+        for d in 0..dim {
+            next_grad = next_grad + [current_grad[d] * (1.0 + cost / 100.0)]
+        }
+        current_grad = next_grad
+    }
+
+    let new_nested = [outer, inner_updated]
+    return [current_grad, inner_recomp, new_nested]
+}
+
+// ===================================================================
+//  Nested memory estimator
+// ===================================================================
+@pure
+fn ac_estimate_nested_memory(nested) {
+    let outer_mem = ac_estimate_memory(ac_nested_outer(nested))
+    let inner_mem = ac_estimate_memory(ac_nested_inner(nested))
+    return outer_mem + inner_mem
+}
+
+// ===================================================================
+//  Get segment sizes (between consecutive checkpoints)
+//
+//  Returns array of segment lengths.
+// ===================================================================
+@pure
+fn ac_get_segments(model) {
+    let layers = ac_model_layers(model)
+    let n = len(layers)
+    let mut segments = []
+    let mut cur_len = 0
+    for i in 0..n {
+        cur_len = cur_len + 1
+        if ac_layer_is_ckpt(layers[i]) == 1 {
+            segments = segments + [cur_len]
+            cur_len = 0
+        }
+    }
+    if cur_len > 0 {
+        segments = segments + [cur_len]
+    }
+    return segments
+}
+
+// ===================================================================
+//  Total recompute cost (estimate)
+//
+//  Sum of compute costs for layers that will be recomputed.
+// ===================================================================
+@pure
+fn ac_total_recompute_cost(model) {
+    let layers = ac_model_layers(model)
+    let n = len(layers)
+    let mut total = 0.0
+    for i in 0..n {
+        let l = layers[i]
+        if ac_layer_is_ckpt(l) == 0 {
+            if ac_layer_is_norecompute(l) == 0 {
+                total = total + to_float(ac_layer_cost(l))
+            }
+        }
+    }
+    return total
+}
+
+println("[activation_checkpointing] loaded — checkpoint boundaries + selective recompute + segment policy + memory estimator + stats tracker")

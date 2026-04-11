@@ -1,0 +1,660 @@
+// ===================================================================
+//  self/ml/representation_engineering.hexa
+//  Representation Engineering — Activation Steering for Behavior Control
+//
+//  Implements (Li et al. 2023):
+//    1. Contrast pair dataset: positive/negative example pairs
+//    2. Concept vector extraction: collect activations from contrast pairs
+//    3. PCA direction finding: principal component of activation diffs
+//    4. Activation addition/subtraction: add scaled direction to hidden states
+//    5. Control strength parameter (alpha scaling)
+//    6. Multi-concept steering: combine multiple direction vectors
+//    7. Reading vector: project onto concept direction to measure presence
+//    8. Layer selection: choose which layers to intervene on
+//    9. Direction quality metrics (separability, consistency)
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+//    @hot   — called during forward pass
+// ===================================================================
+
+// ===================================================================
+//  Vector utilities
+// ===================================================================
+
+fn re_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn re_ones(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [1.0] }
+    return v
+}
+
+fn re_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn re_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..40 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn re_vec_add(a, b) {
+    let n = len(a)
+    let mut out = re_zeros(n)
+    for i in 0..n { out[i] = a[i] + b[i] }
+    return out
+}
+
+fn re_vec_sub(a, b) {
+    let n = len(a)
+    let mut out = re_zeros(n)
+    for i in 0..n { out[i] = a[i] - b[i] }
+    return out
+}
+
+fn re_vec_scale(v, s) {
+    let n = len(v)
+    let mut out = re_zeros(n)
+    for i in 0..n { out[i] = v[i] * s }
+    return out
+}
+
+fn re_dot(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    for i in 0..n { s = s + a[i] * b[i] }
+    return s
+}
+
+fn re_norm(v) {
+    return re_sqrt(re_dot(v, v))
+}
+
+fn re_normalize(v) {
+    let n = re_norm(v)
+    if n < 1.0e-12 { return v }
+    return re_vec_scale(v, 1.0 / n)
+}
+
+fn re_vec_mean(vecs) {
+    let nv = len(vecs)
+    if nv == 0 { return [] }
+    let dim = len(vecs[0])
+    let mut acc = re_zeros(dim)
+    for i in 0..nv {
+        acc = re_vec_add(acc, vecs[i])
+    }
+    return re_vec_scale(acc, 1.0 / to_float(nv))
+}
+
+// ===================================================================
+//  1. Contrast Pair Dataset
+//
+//  A contrast pair is [positive_activation, negative_activation].
+//  Each is a vector of hidden_dim floats representing activations
+//  collected from model at a chosen layer.
+//
+//  create_contrast_pair(pos_act, neg_act) -> pair
+//  create_contrast_dataset(pairs) -> dataset
+//  get_pair_diff(pair) -> difference vector
+//  get_all_diffs(dataset) -> array of difference vectors
+// ===================================================================
+
+@pure
+fn re_create_contrast_pair(pos_act, neg_act) {
+    return [pos_act, neg_act]
+}
+
+@pure
+fn re_get_pair_diff(pair) {
+    return re_vec_sub(pair[0], pair[1])
+}
+
+@pure
+fn re_create_contrast_dataset(pairs) {
+    return pairs
+}
+
+@pure
+fn re_get_all_diffs(dataset) {
+    let n = len(dataset)
+    let mut diffs = []
+    for i in 0..n {
+        diffs = diffs + [re_get_pair_diff(dataset[i])]
+    }
+    return diffs
+}
+
+@pure
+fn re_dataset_size(dataset) {
+    return len(dataset)
+}
+
+// ===================================================================
+//  2. Concept Vector Extraction
+//
+//  Given contrast pairs, compute the mean difference vector.
+//  This is the raw concept direction before PCA refinement.
+//
+//  extract_concept_raw(dataset) -> mean_diff vector
+// ===================================================================
+
+@pure
+fn re_extract_concept_raw(dataset) {
+    let diffs = re_get_all_diffs(dataset)
+    return re_vec_mean(diffs)
+}
+
+// ===================================================================
+//  3. PCA Direction Finding
+//
+//  Power iteration to find principal component of difference vectors.
+//  Steps:
+//    a. Center the diffs (subtract mean)
+//    b. Iterate: v <- (D^T D) v, then normalize
+//    c. The result is the direction of max variance
+//
+//  re_pca_direction(diffs, n_iter) -> unit direction vector
+// ===================================================================
+
+@pure
+fn re_center_diffs(diffs) {
+    let mean = re_vec_mean(diffs)
+    let n = len(diffs)
+    let mut centered = []
+    for i in 0..n {
+        centered = centered + [re_vec_sub(diffs[i], mean)]
+    }
+    return centered
+}
+
+// Compute D^T D v  where D is matrix of centered diffs (each row is a diff)
+@pure
+fn re_cov_mul(centered, v) {
+    let n = len(centered)
+    let dim = len(v)
+    let mut result = re_zeros(dim)
+    for i in 0..n {
+        let proj = re_dot(centered[i], v)
+        for j in 0..dim {
+            result[j] = result[j] + proj * centered[i][j]
+        }
+    }
+    return result
+}
+
+@pure
+fn re_pca_direction(diffs, n_iter) {
+    let centered = re_center_diffs(diffs)
+    let dim = len(diffs[0])
+    // Check if centered diffs have any variance; if not, use mean direction
+    let mut has_var = false
+    let nc = len(centered)
+    for i in 0..nc {
+        if re_norm(centered[i]) > 1.0e-10 { has_var = true }
+    }
+    if has_var == false {
+        // All diffs are identical — return normalized mean diff
+        let mean_d = re_vec_mean(diffs)
+        return re_normalize(mean_d)
+    }
+    // Initialize with arbitrary vector
+    let mut v = re_zeros(dim)
+    for i in 0..dim {
+        v[i] = to_float(i + 1) * 0.1 + 0.5
+    }
+    v = re_normalize(v)
+    for _it in 0..n_iter {
+        let nv = re_cov_mul(centered, v)
+        if re_norm(nv) < 1.0e-12 {
+            return v
+        }
+        v = re_normalize(nv)
+    }
+    return v
+}
+
+// Full pipeline: dataset -> PCA direction
+@pure
+fn re_find_direction(dataset, n_iter) {
+    let diffs = re_get_all_diffs(dataset)
+    if len(diffs) == 0 { return [] }
+    return re_pca_direction(diffs, n_iter)
+}
+
+// ===================================================================
+//  4. Activation Addition/Subtraction
+//
+//  Add or subtract a scaled concept direction to hidden states.
+//  This steers the model toward or away from the concept.
+//
+//  re_steer(hidden, direction, alpha) -> steered_hidden
+//  alpha > 0 : steer toward concept
+//  alpha < 0 : steer away from concept
+// ===================================================================
+
+@pure @hot
+fn re_steer(hidden, direction, alpha) {
+    let n = len(hidden)
+    let mut out = re_zeros(n)
+    for i in 0..n {
+        out[i] = hidden[i] + alpha * direction[i]
+    }
+    return out
+}
+
+// Steer a batch of hidden states (list of vectors)
+@pure @hot
+fn re_steer_batch(hiddens, direction, alpha) {
+    let n = len(hiddens)
+    let mut out = []
+    for i in 0..n {
+        out = out + [re_steer(hiddens[i], direction, alpha)]
+    }
+    return out
+}
+
+// ===================================================================
+//  5. Control Strength Parameter (alpha scaling)
+//
+//  Utilities for computing and validating steering strength.
+//  Adaptive alpha based on hidden state norm to prevent drift.
+//
+//  re_adaptive_alpha(hidden, direction, base_alpha) -> scaled_alpha
+//  re_clamp_alpha(alpha, min_a, max_a) -> clamped
+// ===================================================================
+
+@pure
+fn re_adaptive_alpha(hidden, direction, base_alpha) {
+    let h_norm = re_norm(hidden)
+    let d_norm = re_norm(direction)
+    if d_norm < 1.0e-12 { return 0.0 }
+    // Scale alpha proportionally to hidden norm, inversely to direction norm
+    return base_alpha * h_norm / d_norm
+}
+
+@pure
+fn re_clamp_alpha(alpha, min_a, max_a) {
+    let mut a = alpha
+    if a < min_a { a = min_a }
+    if a > max_a { a = max_a }
+    return a
+}
+
+// Compute steering magnitude: how much the hidden state changes
+@pure
+fn re_steer_magnitude(direction, alpha) {
+    return re_abs(alpha) * re_norm(direction)
+}
+
+// ===================================================================
+//  6. Multi-Concept Steering
+//
+//  Combine multiple direction vectors with individual alphas.
+//  Supports optional orthogonalization to reduce interference.
+//
+//  re_multi_steer(hidden, directions, alphas) -> steered_hidden
+//  re_orthogonalize(directions) -> orthogonal directions
+// ===================================================================
+
+@pure @hot
+fn re_multi_steer(hidden, directions, alphas) {
+    let n = len(directions)
+    let mut out = hidden
+    for i in 0..n {
+        out = re_steer(out, directions[i], alphas[i])
+    }
+    return out
+}
+
+// Gram-Schmidt orthogonalization
+@pure
+fn re_orthogonalize(directions) {
+    let n = len(directions)
+    if n == 0 { return [] }
+    let mut ortho = []
+    for i in 0..n {
+        let mut v = directions[i]
+        // Subtract projections onto all previous orthogonal vectors
+        for j in 0..i {
+            let oj = ortho[j]
+            let proj = re_dot(v, oj)
+            v = re_vec_sub(v, re_vec_scale(oj, proj))
+        }
+        let norm_v = re_norm(v)
+        if norm_v > 1.0e-12 {
+            v = re_vec_scale(v, 1.0 / norm_v)
+        }
+        ortho = ortho + [v]
+    }
+    return ortho
+}
+
+// Multi-steer with orthogonalization
+@pure @hot
+fn re_multi_steer_ortho(hidden, directions, alphas) {
+    let ortho_dirs = re_orthogonalize(directions)
+    return re_multi_steer(hidden, ortho_dirs, alphas)
+}
+
+// ===================================================================
+//  7. Reading Vector — Concept Presence Measurement
+//
+//  Project activations onto concept direction to measure how much
+//  a concept is present in the hidden state.
+//
+//  re_read_concept(hidden, direction) -> float score
+//  re_read_multi(hidden, directions) -> array of scores
+//  re_classify_concept(hidden, direction, threshold) -> 0/1
+// ===================================================================
+
+@pure
+fn re_read_concept(hidden, direction) {
+    // Project hidden onto direction (dot product with normalized direction)
+    let dir_norm = re_normalize(direction)
+    return re_dot(hidden, dir_norm)
+}
+
+@pure
+fn re_read_multi(hidden, directions) {
+    let n = len(directions)
+    let mut scores = []
+    for i in 0..n {
+        scores = scores + [re_read_concept(hidden, directions[i])]
+    }
+    return scores
+}
+
+@pure
+fn re_classify_concept(hidden, direction, threshold) {
+    let score = re_read_concept(hidden, direction)
+    if score >= threshold { return 1 }
+    return 0
+}
+
+// Batch reading: measure concept for multiple hidden states
+@pure
+fn re_read_batch(hiddens, direction) {
+    let n = len(hiddens)
+    let mut scores = []
+    for i in 0..n {
+        scores = scores + [re_read_concept(hiddens[i], direction)]
+    }
+    return scores
+}
+
+// ===================================================================
+//  8. Layer Selection
+//
+//  Choose which layers to intervene on. Provides:
+//  - Layer mask creation (which layers get steering)
+//  - Per-layer alpha scaling (different strength per layer)
+//  - Layer range selection
+//
+//  re_create_layer_mask(n_layers, active_layers) -> [0/1] mask
+//  re_create_layer_alphas(n_layers, base_alpha, mask) -> [float]
+//  re_apply_at_layer(layer_idx, mask, hidden, direction, alpha) -> hidden
+// ===================================================================
+
+@pure
+fn re_create_layer_mask(n_layers, active_layers) {
+    let mut mask = []
+    for _i in 0..n_layers { mask = mask + [0] }
+    let na = len(active_layers)
+    for i in 0..na {
+        let idx = active_layers[i]
+        if idx >= 0 {
+            if idx < n_layers {
+                mask[idx] = 1
+            }
+        }
+    }
+    return mask
+}
+
+@pure
+fn re_create_layer_alphas(n_layers, base_alpha, mask) {
+    let mut alphas = re_zeros(n_layers)
+    for i in 0..n_layers {
+        if mask[i] == 1 {
+            alphas[i] = base_alpha
+        }
+    }
+    return alphas
+}
+
+// Create layer mask for a contiguous range [start, end)
+@pure
+fn re_layer_range_mask(n_layers, start, end) {
+    let mut mask = []
+    for i in 0..n_layers {
+        if i >= start {
+            if i < end {
+                mask = mask + [1]
+            } else {
+                mask = mask + [0]
+            }
+        } else {
+            mask = mask + [0]
+        }
+    }
+    return mask
+}
+
+// Apply steering only if layer is active in the mask
+@pure @hot
+fn re_apply_at_layer(layer_idx, mask, hidden, direction, alpha) {
+    if layer_idx < 0 { return hidden }
+    if layer_idx >= len(mask) { return hidden }
+    if mask[layer_idx] == 0 { return hidden }
+    return re_steer(hidden, direction, alpha)
+}
+
+// Apply with per-layer alphas
+@pure @hot
+fn re_apply_at_layer_scaled(layer_idx, mask, layer_alphas, hidden, direction) {
+    if layer_idx < 0 { return hidden }
+    if layer_idx >= len(mask) { return hidden }
+    if mask[layer_idx] == 0 { return hidden }
+    return re_steer(hidden, direction, layer_alphas[layer_idx])
+}
+
+// ===================================================================
+//  9. Direction Quality Metrics
+//
+//  Measure how good a concept direction is:
+//  - Separability: how well the direction separates pos/neg examples
+//  - Consistency: variance of projections within pos/neg groups
+//  - Explained variance ratio: fraction of total variance captured
+//
+//  re_separability(dataset, direction) -> float
+//  re_consistency(dataset, direction) -> float
+//  re_explained_variance(diffs, direction) -> float
+// ===================================================================
+
+// Separability: |mean_pos_proj - mean_neg_proj| / pooled_std
+@pure
+fn re_separability(dataset, direction) {
+    let n = len(dataset)
+    if n == 0 { return 0.0 }
+    let dir_n = re_normalize(direction)
+    let mut pos_projs = []
+    let mut neg_projs = []
+    for i in 0..n {
+        let pos_p = re_dot(dataset[i][0], dir_n)
+        let neg_p = re_dot(dataset[i][1], dir_n)
+        pos_projs = pos_projs + [pos_p]
+        neg_projs = neg_projs + [neg_p]
+    }
+    // Means
+    let mut pos_mean = 0.0
+    let mut neg_mean = 0.0
+    for i in 0..n {
+        pos_mean = pos_mean + pos_projs[i]
+        neg_mean = neg_mean + neg_projs[i]
+    }
+    pos_mean = pos_mean / to_float(n)
+    neg_mean = neg_mean / to_float(n)
+    // Pooled variance
+    let mut var_sum = 0.0
+    for i in 0..n {
+        let dp = pos_projs[i] - pos_mean
+        let dn = neg_projs[i] - neg_mean
+        var_sum = var_sum + dp * dp + dn * dn
+    }
+    let pooled_std = re_sqrt(var_sum / to_float(2 * n))
+    if pooled_std < 1.0e-12 { return 999.0 }
+    return re_abs(pos_mean - neg_mean) / pooled_std
+}
+
+// Consistency: 1 - (avg within-class variance / total variance)
+// Higher is better (projections are consistent within each class)
+@pure
+fn re_consistency(dataset, direction) {
+    let n = len(dataset)
+    if n < 2 { return 1.0 }
+    let dir_n = re_normalize(direction)
+    let mut pos_projs = []
+    let mut neg_projs = []
+    for i in 0..n {
+        pos_projs = pos_projs + [re_dot(dataset[i][0], dir_n)]
+        neg_projs = neg_projs + [re_dot(dataset[i][1], dir_n)]
+    }
+    // Within-class variance
+    let mut pos_mean = 0.0
+    let mut neg_mean = 0.0
+    for i in 0..n {
+        pos_mean = pos_mean + pos_projs[i]
+        neg_mean = neg_mean + neg_projs[i]
+    }
+    pos_mean = pos_mean / to_float(n)
+    neg_mean = neg_mean / to_float(n)
+    let mut pos_var = 0.0
+    let mut neg_var = 0.0
+    for i in 0..n {
+        let dp = pos_projs[i] - pos_mean
+        let dn = neg_projs[i] - neg_mean
+        pos_var = pos_var + dp * dp
+        neg_var = neg_var + dn * dn
+    }
+    pos_var = pos_var / to_float(n)
+    neg_var = neg_var / to_float(n)
+    let within_var = (pos_var + neg_var) / 2.0
+    // Total variance (all projections combined)
+    let mut all_projs = []
+    for i in 0..n {
+        all_projs = all_projs + [pos_projs[i]]
+        all_projs = all_projs + [neg_projs[i]]
+    }
+    let n2 = len(all_projs)
+    let mut total_mean = 0.0
+    for i in 0..n2 { total_mean = total_mean + all_projs[i] }
+    total_mean = total_mean / to_float(n2)
+    let mut total_var = 0.0
+    for i in 0..n2 {
+        let d = all_projs[i] - total_mean
+        total_var = total_var + d * d
+    }
+    total_var = total_var / to_float(n2)
+    if total_var < 1.0e-12 { return 1.0 }
+    return 1.0 - within_var / total_var
+}
+
+// Explained variance: fraction of total diff variance along the direction
+@pure
+fn re_explained_variance(diffs, direction) {
+    let n = len(diffs)
+    if n == 0 { return 0.0 }
+    let dir_n = re_normalize(direction)
+    // Variance of projections onto direction
+    let mut proj_sum = 0.0
+    let mut proj_sq_sum = 0.0
+    for i in 0..n {
+        let p = re_dot(diffs[i], dir_n)
+        proj_sum = proj_sum + p
+        proj_sq_sum = proj_sq_sum + p * p
+    }
+    let proj_mean = proj_sum / to_float(n)
+    let proj_var = proj_sq_sum / to_float(n) - proj_mean * proj_mean
+    // Total variance (sum of per-dimension variances)
+    let dim = len(diffs[0])
+    let mut total_var = 0.0
+    for d in 0..dim {
+        let mut s = 0.0
+        let mut sq = 0.0
+        for i in 0..n {
+            s = s + diffs[i][d]
+            sq = sq + diffs[i][d] * diffs[i][d]
+        }
+        let m = s / to_float(n)
+        total_var = total_var + sq / to_float(n) - m * m
+    }
+    if total_var < 1.0e-12 { return 1.0 }
+    return proj_var / total_var
+}
+
+// ===================================================================
+//  Convenience: Full Pipeline
+//
+//  re_build_steering(dataset, n_pca_iter) -> concept_direction
+//  re_full_pipeline_steer(hidden, dataset, alpha, n_pca_iter) -> steered
+// ===================================================================
+
+@pure
+fn re_build_steering(dataset, n_pca_iter) {
+    return re_find_direction(dataset, n_pca_iter)
+}
+
+@pure @hot
+fn re_full_pipeline_steer(hidden, dataset, alpha, n_pca_iter) {
+    let direction = re_build_steering(dataset, n_pca_iter)
+    return re_steer(hidden, direction, alpha)
+}
+
+// ===================================================================
+//  Concept Erasing: remove a concept direction from hidden states
+//  (project out the concept component)
+// ===================================================================
+
+@pure @hot
+fn re_erase_concept(hidden, direction) {
+    let dir_n = re_normalize(direction)
+    let proj = re_dot(hidden, dir_n)
+    return re_vec_sub(hidden, re_vec_scale(dir_n, proj))
+}
+
+@pure
+fn re_erase_batch(hiddens, direction) {
+    let n = len(hiddens)
+    let mut out = []
+    for i in 0..n {
+        out = out + [re_erase_concept(hiddens[i], direction)]
+    }
+    return out
+}
+
+// ===================================================================
+//  Cosine similarity between two vectors
+// ===================================================================
+
+@pure
+fn re_cosine_sim(a, b) {
+    let na = re_norm(a)
+    let nb = re_norm(b)
+    if na < 1.0e-12 { return 0.0 }
+    if nb < 1.0e-12 { return 0.0 }
+    return re_dot(a, b) / (na * nb)
+}
+
+println("[representation_engineering] loaded — activation steering for behavior control")

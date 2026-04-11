@@ -1,0 +1,534 @@
+// ===================================================================
+//  self/ml/sophia.hexa — Sophia: Second-Order Optimizer
+//
+//  Liu et al. 2023 — "Sophia: A Scalable Stochastic Second-Order
+//  Optimizer for Language Model Pre-training"
+//
+//  Sophia uses diagonal Hessian estimates for adaptive learning:
+//    - Gradient EMA:  m = beta1 * m + (1 - beta1) * g
+//    - Hessian EMA:   h = beta2 * h + (1 - beta2) * hhat
+//    - Clipped update: p -= lr * clip(m / max(h, rho), 1)
+//    - Weight decay:  p -= lr * wd * p
+//
+//  Two variants:
+//    Sophia-H: Hutchinson diagonal Hessian estimator
+//              hhat_i = u_i * (grad(g . u))_i  where u ~ Rademacher
+//    Sophia-G: Gauss-Newton-Bartlett estimator
+//              hhat_i = (grad_i(loss_per_sample))^2  (mini-batch avg)
+//
+//  Key advantages over AdamW:
+//    - Better curvature adaptation via Hessian diagonal
+//    - Rho clipping prevents catastrophic updates in flat directions
+//    - Hessian estimated every k steps (gamma schedule) for efficiency
+//
+//  Public API:
+//    sophia_create(lr, beta1, beta2, rho, weight_decay, hessian_interval)
+//    sophia_create_default()
+//    sophia_init_state(dim)
+//    sophia_step_h(opt, params, grads, hessian_diag, state, step)
+//    sophia_step_g(opt, params, grads, gnb_diag, state, step)
+//    sophia_hutchinson_estimator(grads, hvp, u)
+//    sophia_gnb_estimator(per_sample_grads, n_samples)
+//    sophia_rademacher(dim, seed)
+//    sophia_clip_scalar(x, bound)
+//    sophia_lr_warmup(base_lr, step, warmup_steps)
+//    sophia_lr_cosine(base_lr, step, total, min_lr)
+//    sophia_clip_global_norm(grads, max_norm)
+//    sophia_adamw_step(params, grads, m, v, lr, b1, b2, eps, wd, t)
+//    sophia_compare(init_params, n_steps)
+//    sophia_quadratic_loss(params)
+//    sophia_quadratic_grad(params)
+//    sophia_quadratic_hessian_diag(params)
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+//    @hot   — performance-critical path
+// ===================================================================
+
+// ===================================================================
+//  Math helpers
+// ===================================================================
+
+fn sophia_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn sophia_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..40 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn sophia_cos(x) {
+    let pi = 3.141592653589793
+    let mut v = x
+    while v > pi { v = v - 2.0 * pi }
+    while v < 0.0 - pi { v = v + 2.0 * pi }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..20 {
+        term = 0.0 - term * v * v / to_float(2 * i * (2 * i - 1))
+        result = result + term
+    }
+    return result
+}
+
+fn sophia_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn sophia_ones(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [1.0] }
+    return v
+}
+
+fn sophia_max_f(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn sophia_min_f(a, b) {
+    if a < b { return a }
+    return b
+}
+
+// ===================================================================
+//  Scalar clipping:  clip(x, bound)  = max(-bound, min(bound, x))
+// ===================================================================
+@pure
+fn sophia_clip_scalar(x, bound) {
+    if x > bound { return bound }
+    if x < 0.0 - bound { return 0.0 - bound }
+    return x
+}
+
+// ===================================================================
+//  Rademacher random vector: entries +1 or -1
+//  Simple deterministic LCG-based pseudo-random for reproducibility.
+//  seed must be > 0.
+// ===================================================================
+@pure
+fn sophia_rademacher(dim, seed) {
+    let mut v = sophia_zeros(dim)
+    let mut s = seed
+    if s <= 0 { s = 42 }
+    for i in 0..dim {
+        // LCG: s = (s * 1103515245 + 12345) mod 2^31
+        s = (s * 1103515245 + 12345) % 2147483648
+        if s % 2 == 0 {
+            v[i] = 1.0
+        } else {
+            v[i] = 0.0 - 1.0
+        }
+    }
+    return v
+}
+
+// ===================================================================
+//  Hutchinson diagonal Hessian estimator
+//
+//  Given:
+//    grads:  gradient g at current params
+//    hvp:    Hessian-vector product H*u  (precomputed externally)
+//    u:      random Rademacher vector used for hvp
+//
+//  Returns: hhat[i] = u[i] * hvp[i]  (element-wise)
+//
+//  Theory: E[u * (Hu)] = diag(H) when u ~ Rademacher
+// ===================================================================
+@pure
+fn sophia_hutchinson_estimator(grads, hvp, u) {
+    let dim = len(grads)
+    let mut hhat = sophia_zeros(dim)
+    for i in 0..dim {
+        hhat[i] = u[i] * hvp[i]
+    }
+    return hhat
+}
+
+// ===================================================================
+//  Gauss-Newton-Bartlett (GNB) diagonal estimator
+//
+//  Given per-sample gradients (B x dim), compute:
+//    hhat[i] = (1/B) * sum_b (g_b[i])^2
+//
+//  This approximates the diagonal of the Gauss-Newton matrix.
+//  Sophia-G uses this instead of Hutchinson.
+// ===================================================================
+@pure
+fn sophia_gnb_estimator(per_sample_grads, n_samples) {
+    if n_samples <= 0 { return [] }
+    let dim = len(per_sample_grads[0])
+    let mut hhat = sophia_zeros(dim)
+    for b in 0..n_samples {
+        let g_b = per_sample_grads[b]
+        for i in 0..dim {
+            hhat[i] = hhat[i] + g_b[i] * g_b[i]
+        }
+    }
+    let inv_b = 1.0 / to_float(n_samples)
+    for i in 0..dim {
+        hhat[i] = hhat[i] * inv_b
+    }
+    return hhat
+}
+
+// ===================================================================
+//  Create Sophia optimizer config
+//
+//  Defaults (from paper):
+//    lr               = 1e-4
+//    beta1            = 0.965
+//    beta2            = 0.99
+//    rho              = 0.04   (lower bound on Hessian estimate)
+//    weight_decay     = 0.1
+//    hessian_interval = 10     (update Hessian every k steps)
+//    max_clip         = 1.0    (clipping bound for update)
+// ===================================================================
+@pure
+fn sophia_create(lr, beta1, beta2, rho, weight_decay, hessian_interval) {
+    return #{
+        "lr": lr,
+        "beta1": beta1,
+        "beta2": beta2,
+        "rho": rho,
+        "weight_decay": weight_decay,
+        "hessian_interval": hessian_interval,
+        "max_clip": 1.0
+    }
+}
+
+@pure
+fn sophia_create_default() {
+    return sophia_create(0.0001, 0.965, 0.99, 0.04, 0.1, 10)
+}
+
+// ===================================================================
+//  Optimizer state: gradient EMA (m) + Hessian EMA (h) + step
+// ===================================================================
+@pure
+fn sophia_init_state(dim) {
+    return #{
+        "m": sophia_zeros(dim),
+        "h": sophia_zeros(dim),
+        "step": 0
+    }
+}
+
+// ===================================================================
+//  Sophia-H step: Hutchinson-based diagonal Hessian
+//
+//  Algorithm:
+//    1. m = beta1 * m + (1 - beta1) * g           (gradient EMA)
+//    2. If step % k == 0:
+//         h = beta2 * h + (1 - beta2) * hhat      (Hessian EMA)
+//    3. For each param i:
+//         ratio = m[i] / max(h[i], rho)
+//         update = clip(ratio, max_clip)
+//         p[i] = p[i] - lr * (update + wd * p[i])
+//
+//  hessian_diag: precomputed diagonal Hessian estimate for this step
+//                (can be None-equivalent [] if not a Hessian step)
+// ===================================================================
+@hot
+fn sophia_step_h(opt, params, grads, hessian_diag, state, step) {
+    let lr = opt["lr"]
+    let b1 = opt["beta1"]
+    let b2 = opt["beta2"]
+    let rho = opt["rho"]
+    let wd = opt["weight_decay"]
+    let max_clip = opt["max_clip"]
+    let k = opt["hessian_interval"]
+    let dim = len(params)
+    let m = state["m"]
+    let h = state["h"]
+
+    let mut new_m = sophia_zeros(dim)
+    let mut new_h = sophia_zeros(dim)
+    let mut new_params = sophia_zeros(dim)
+
+    // Step 1: gradient EMA
+    for i in 0..dim {
+        new_m[i] = b1 * m[i] + (1.0 - b1) * grads[i]
+    }
+
+    // Step 2: Hessian EMA (only every k steps)
+    let update_hessian = (step % k) == 0
+    if update_hessian && len(hessian_diag) == dim {
+        for i in 0..dim {
+            new_h[i] = b2 * h[i] + (1.0 - b2) * sophia_abs(hessian_diag[i])
+        }
+    } else {
+        for i in 0..dim {
+            new_h[i] = h[i]
+        }
+    }
+
+    // Step 3: clipped update
+    for i in 0..dim {
+        let denom = sophia_max_f(new_h[i], rho)
+        let ratio = new_m[i] / denom
+        let clipped = sophia_clip_scalar(ratio, max_clip)
+        new_params[i] = params[i] - lr * (clipped + wd * params[i])
+    }
+
+    let new_state = #{
+        "m": new_m,
+        "h": new_h,
+        "step": step + 1
+    }
+    return [new_params, new_state]
+}
+
+// ===================================================================
+//  Sophia-G step: Gauss-Newton-Bartlett variant
+//
+//  Identical to Sophia-H except the Hessian diagonal comes from
+//  GNB estimator (per-sample gradient squared).  The interface
+//  is the same — caller passes gnb_diag instead of hutchinson diag.
+// ===================================================================
+@hot
+fn sophia_step_g(opt, params, grads, gnb_diag, state, step) {
+    return sophia_step_h(opt, params, grads, gnb_diag, state, step)
+}
+
+// ===================================================================
+//  Learning rate scheduling
+// ===================================================================
+
+@pure
+fn sophia_lr_warmup(base_lr, step, warmup_steps) {
+    if warmup_steps <= 0 { return base_lr }
+    if step >= warmup_steps { return base_lr }
+    return base_lr * to_float(step) / to_float(warmup_steps)
+}
+
+@pure
+fn sophia_lr_cosine(base_lr, step, total_steps, min_lr) {
+    if step >= total_steps { return min_lr }
+    if step <= 0 { return base_lr }
+    let pi = 3.141592653589793
+    let progress = to_float(step) / to_float(total_steps)
+    let cosine_decay = 0.5 * (1.0 + sophia_cos(pi * progress))
+    return min_lr + (base_lr - min_lr) * cosine_decay
+}
+
+@pure
+fn sophia_lr_schedule(base_lr, step, warmup_steps, total_steps, min_lr) {
+    if step < warmup_steps {
+        return sophia_lr_warmup(base_lr, step, warmup_steps)
+    }
+    let decay_step = step - warmup_steps
+    let decay_total = total_steps - warmup_steps
+    return sophia_lr_cosine(base_lr, decay_step, decay_total, min_lr)
+}
+
+// ===================================================================
+//  Gradient clipping — global norm
+// ===================================================================
+
+@pure
+fn sophia_grad_norm(grads) {
+    let mut norm_sq = 0.0
+    let n = len(grads)
+    for i in 0..n {
+        norm_sq = norm_sq + grads[i] * grads[i]
+    }
+    return sophia_sqrt(norm_sq)
+}
+
+@pure
+fn sophia_clip_global_norm(grads, max_norm) {
+    let norm = sophia_grad_norm(grads)
+    if norm <= max_norm { return grads }
+    let scale = max_norm / norm
+    let n = len(grads)
+    let mut clipped = sophia_zeros(n)
+    for i in 0..n {
+        clipped[i] = grads[i] * scale
+    }
+    return clipped
+}
+
+// ===================================================================
+//  Sophia step with warmup + cosine schedule + gradient clipping
+// ===================================================================
+@hot
+fn sophia_step_scheduled(opt, params, grads, hessian_diag, state, step, warmup, total, min_lr, max_grad_norm) {
+    let base_lr = opt["lr"]
+    let scheduled_lr = sophia_lr_schedule(base_lr, step, warmup, total, min_lr)
+    let scheduled_opt = #{
+        "lr": scheduled_lr,
+        "beta1": opt["beta1"],
+        "beta2": opt["beta2"],
+        "rho": opt["rho"],
+        "weight_decay": opt["weight_decay"],
+        "hessian_interval": opt["hessian_interval"],
+        "max_clip": opt["max_clip"]
+    }
+    let clipped_grads = sophia_clip_global_norm(grads, max_grad_norm)
+    return sophia_step_h(scheduled_opt, params, clipped_grads, hessian_diag, state, step)
+}
+
+// ===================================================================
+//  Simple objectives for testing / comparison
+// ===================================================================
+
+@pure
+fn sophia_quadratic_loss(params) {
+    let mut loss = 0.0
+    let n = len(params)
+    for i in 0..n {
+        loss = loss + 0.5 * params[i] * params[i]
+    }
+    return loss
+}
+
+@pure
+fn sophia_quadratic_grad(params) {
+    let n = len(params)
+    let mut g = sophia_zeros(n)
+    for i in 0..n {
+        g[i] = params[i]
+    }
+    return g
+}
+
+// For quadratic f(x) = 0.5 * sum(x_i^2), Hessian is identity.
+// diag(H) = [1, 1, ..., 1]
+@pure
+fn sophia_quadratic_hessian_diag(params) {
+    let n = len(params)
+    return sophia_ones(n)
+}
+
+// Ill-conditioned quadratic: f(x) = 0.5 * sum(a_i * x_i^2)
+// where a_i varies significantly -> tests curvature adaptation
+@pure
+fn sophia_ill_cond_loss(params, scales) {
+    let mut loss = 0.0
+    let n = len(params)
+    for i in 0..n {
+        loss = loss + 0.5 * scales[i] * params[i] * params[i]
+    }
+    return loss
+}
+
+@pure
+fn sophia_ill_cond_grad(params, scales) {
+    let n = len(params)
+    let mut g = sophia_zeros(n)
+    for i in 0..n {
+        g[i] = scales[i] * params[i]
+    }
+    return g
+}
+
+@pure
+fn sophia_ill_cond_hessian_diag(scales) {
+    let n = len(scales)
+    let mut h = sophia_zeros(n)
+    for i in 0..n {
+        h[i] = scales[i]
+    }
+    return h
+}
+
+// ===================================================================
+//  AdamW step — for comparison with Sophia
+// ===================================================================
+@hot
+fn sophia_adamw_step(params, grads, m, v, lr, b1, b2, eps, wd, t) {
+    let dim = len(params)
+    let mut new_params = sophia_zeros(dim)
+    let mut new_m = sophia_zeros(dim)
+    let mut new_v = sophia_zeros(dim)
+
+    let mut b1_pow = 1.0
+    let mut b2_pow = 1.0
+    for _i in 0..t {
+        b1_pow = b1_pow * b1
+        b2_pow = b2_pow * b2
+    }
+    let b1_corr = 1.0 - b1_pow
+    let b2_corr = 1.0 - b2_pow
+
+    for i in 0..dim {
+        new_m[i] = b1 * m[i] + (1.0 - b1) * grads[i]
+        new_v[i] = b2 * v[i] + (1.0 - b2) * grads[i] * grads[i]
+        let m_hat = new_m[i] / b1_corr
+        let v_hat = new_v[i] / b2_corr
+        new_params[i] = params[i] - lr * (m_hat / (sophia_sqrt(v_hat) + eps) + wd * params[i])
+    }
+
+    return [new_params, new_m, new_v]
+}
+
+// ===================================================================
+//  Comparison: Sophia vs AdamW on quadratic
+//
+//  Returns [sophia_final_loss, adamw_final_loss]
+// ===================================================================
+fn sophia_compare(init_params, n_steps) {
+    let dim = len(init_params)
+
+    // Sophia setup
+    let sopt = sophia_create(0.001, 0.965, 0.99, 0.04, 0.0, 1)
+    let mut s_params = sophia_zeros(dim)
+    for i in 0..dim { s_params[i] = init_params[i] }
+    let mut s_state = sophia_init_state(dim)
+
+    // AdamW setup
+    let mut a_params = sophia_zeros(dim)
+    for i in 0..dim { a_params[i] = init_params[i] }
+    let mut a_m = sophia_zeros(dim)
+    let mut a_v = sophia_zeros(dim)
+
+    for step in 0..n_steps {
+        // Sophia step
+        let sg = sophia_quadratic_grad(s_params)
+        let sh = sophia_quadratic_hessian_diag(s_params)
+        let s_result = sophia_step_h(sopt, s_params, sg, sh, s_state, step)
+        s_params = s_result[0]
+        s_state = s_result[1]
+
+        // AdamW step
+        let ag = sophia_quadratic_grad(a_params)
+        let a_result = sophia_adamw_step(
+            a_params, ag, a_m, a_v,
+            0.01, 0.9, 0.999, 1.0e-8, 0.0, step + 1
+        )
+        a_params = a_result[0]
+        a_m = a_result[1]
+        a_v = a_result[2]
+    }
+
+    let s_loss = sophia_quadratic_loss(s_params)
+    let a_loss = sophia_quadratic_loss(a_params)
+    return [s_loss, a_loss]
+}
+
+// ===================================================================
+//  Memory usage comparison
+//
+//  Sophia: m + h = 2 buffers (same as Adam)
+//  But Hessian computed every k steps -> less compute per step
+// ===================================================================
+@pure
+fn sophia_memory_usage(dim, n_params) {
+    let total_dim = dim * n_params
+    let bytes_per_float = 8
+    let sophia_bytes = total_dim * bytes_per_float * 2
+    let adam_bytes = total_dim * bytes_per_float * 2
+    return [sophia_bytes, adam_bytes]
+}
+
+println("[sophia] loaded — Hutchinson/GNB Hessian + clipped update + EMA + weight decay + lr schedule + grad clip + comparison")

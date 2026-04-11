@@ -1,0 +1,864 @@
+// ===================================================================
+//  test_marlin_kernel.hexa — Marlin Kernel verification (#156)
+//
+//  Tests (35):
+//    T01 pack_nibbles basic
+//    T02 unpack_lo extracts low nibble
+//    T03 unpack_hi extracts high nibble
+//    T04 pack/unpack roundtrip
+//    T05 pack_array even length
+//    T06 pack_array odd length
+//    T07 unpack_array roundtrip
+//    T08 dequant zero-point centered
+//    T09 dequant with offset zero-point
+//    T10 dequant_array per-group
+//    T11 dequant_packed roundtrip
+//    T12 matmul identity
+//    T13 matmul known result
+//    T14 tiled_matmul matches standard
+//    T15 tiled_matmul small tiles
+//    T16 group_params min/max range
+//    T17 group_params zero-point positive
+//    T18 group_quantize values in [0,15]
+//    T19 group_quantize roundtrip accuracy
+//    T20 quantize_matrix produces valid tensor
+//    T21 quantize_matrix packed size correct
+//    T22 build_permutation covers all indices
+//    T23 build_permutation no duplicates
+//    T24 apply_perm + inv_perm roundtrip
+//    T25 quantize_matrix_perm roundtrip
+//    T26 pipeline_init state
+//    T27 pipeline_step advances stage
+//    T28 memory_footprint positive
+//    T29 compression_ratio > 1
+//    T30 tile_padding correct
+//    T31 mse zero for identical
+//    T32 mse positive for different
+//    T33 snr_db high for close values
+//    T34 benchmark returns valid results
+//    T35 forward matches reference approximately
+//
+//  Run: cargo run --release -- self/test_marlin_kernel.hexa
+// ===================================================================
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn approx(a, b, eps) {
+    return fabs(a - b) < eps
+}
+
+// ── inlined helpers ──────────────────────────────────────────────
+
+fn _mk_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn _mk_max(a, b) {
+    if a >= b { return a }
+    return b
+}
+
+fn _mk_min(a, b) {
+    if a <= b { return a }
+    return b
+}
+
+fn _mk_clamp(v, lo, hi) {
+    if v < lo { return lo }
+    if v > hi { return hi }
+    return v
+}
+
+fn _mk_round(x) {
+    if x >= 0.0 { return to_int(x + 0.5) }
+    return to_int(x - 0.5)
+}
+
+fn _mk_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn _mk_log10(x) {
+    if x <= 0.0 { return -999.0 }
+    let mut v = x
+    let mut result = 0.0
+    while v >= 10.0 {
+        v = v / 10.0
+        result = result + 1.0
+    }
+    while v < 1.0 {
+        v = v * 10.0
+        result = result - 1.0
+    }
+    let t = (v - 1.0) / (v + 1.0)
+    let t2 = t * t
+    let ln_v = 2.0 * (t + t * t2 / 3.0 + t * t2 * t2 / 5.0 + t * t2 * t2 * t2 / 7.0)
+    result = result + ln_v / 2.302585
+    return result
+}
+
+fn _mk_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn _mk_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+// ── Structs ──────────────────────────────────────────────────────
+
+struct MarlinMeta {
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    group_size: int
+}
+
+struct MarlinTensor {
+    rows: int,
+    cols: int,
+    group_size: int,
+    packed: array,
+    scales: array,
+    zeros: array,
+    perm: array
+}
+
+struct MarlinPipeline {
+    stage: int,
+    dequant_buf: array,
+    compute_buf: array,
+    done: bool
+}
+
+struct MarlinBench {
+    mse: float,
+    max_err: float,
+    snr_db: float,
+    speedup: float
+}
+
+// ── Inlined functions from marlin_kernel.hexa ────────────────────
+
+fn mk_pack_nibbles(lo, hi) {
+    let clo = _mk_clamp(lo, 0, 15)
+    let chi = _mk_clamp(hi, 0, 15)
+    return clo + chi * 16
+}
+
+fn mk_unpack_lo(byte) {
+    return byte % 16
+}
+
+fn mk_unpack_hi(byte) {
+    return byte / 16
+}
+
+fn mk_pack_array(vals) {
+    let n = len(vals)
+    let nbytes = (n + 1) / 2
+    let mut out = []
+    for i in 0..nbytes {
+        let lo_idx = i * 2
+        let hi_idx = i * 2 + 1
+        let lo = vals[lo_idx]
+        let mut hi = 0
+        if hi_idx < n { hi = vals[hi_idx] }
+        out = out + [mk_pack_nibbles(lo, hi)]
+    }
+    return out
+}
+
+fn mk_unpack_array(bytes, n) {
+    let mut out = []
+    for i in 0..n {
+        let byte = bytes[i / 2]
+        let mut v = 0
+        if i % 2 == 0 {
+            v = mk_unpack_lo(byte)
+        } else {
+            v = mk_unpack_hi(byte)
+        }
+        out = out + [v]
+    }
+    return out
+}
+
+fn mk_dequant_value(q, scale, zero_point) {
+    return scale * (to_float(q) - to_float(zero_point))
+}
+
+fn mk_dequant_array(int4_vals, scales, zeros, group_size) {
+    let n = len(int4_vals)
+    let mut out = _mk_zeros(n)
+    for i in 0..n {
+        let g = i / group_size
+        out[i] = mk_dequant_value(int4_vals[i], scales[g], zeros[g])
+    }
+    return out
+}
+
+fn mk_dequant_packed(packed, n, scales, zeros, group_size) {
+    let int4_vals = mk_unpack_array(packed, n)
+    return mk_dequant_array(int4_vals, scales, zeros, group_size)
+}
+
+fn mk_matmul(a, b, m, k, n) {
+    let mut c = _mk_zeros(m * n)
+    for i in 0..m {
+        for j in 0..n {
+            let mut acc = 0.0
+            for p in 0..k {
+                acc = acc + a[i * k + p] * b[p * n + j]
+            }
+            c[i * n + j] = acc
+        }
+    }
+    return c
+}
+
+fn mk_tiled_matmul(a, b, m, k, n, tile_m, tile_k, tile_n) {
+    let mut c = _mk_zeros(m * n)
+    let mut ti = 0
+    while ti < m {
+        let i_end = _mk_min(ti + tile_m, m)
+        let mut tk = 0
+        while tk < k {
+            let k_end = _mk_min(tk + tile_k, k)
+            let mut tj = 0
+            while tj < n {
+                let j_end = _mk_min(tj + tile_n, n)
+                let mut i = ti
+                while i < i_end {
+                    let mut j = tj
+                    while j < j_end {
+                        let mut acc = c[i * n + j]
+                        let mut p = tk
+                        while p < k_end {
+                            acc = acc + a[i * k + p] * b[p * n + j]
+                            p = p + 1
+                        }
+                        c[i * n + j] = acc
+                        j = j + 1
+                    }
+                    i = i + 1
+                }
+                tj = tj + tile_n
+            }
+            tk = tk + tile_k
+        }
+        ti = ti + tile_m
+    }
+    return c
+}
+
+fn mk_group_params(vals, start, end) {
+    let mut mn = vals[start]
+    let mut mx = vals[start]
+    let mut i = start + 1
+    while i < end {
+        if vals[i] < mn { mn = vals[i] }
+        if vals[i] > mx { mx = vals[i] }
+        i = i + 1
+    }
+    let range = mx - mn
+    let mut scale = range / 15.0
+    if scale < 1.0e-10 { scale = 1.0e-10 }
+    let zero_point = _mk_round(0.0 - mn / scale)
+    let clamped_zp = _mk_clamp(zero_point, 0, 15)
+    return [scale, clamped_zp]
+}
+
+fn mk_group_quantize(vals, group_size) {
+    let n = len(vals)
+    let n_groups = (n + group_size - 1) / group_size
+    let mut quant_vals = _mk_zeros_int(n)
+    let mut scales = []
+    let mut zeros = []
+    for g in 0..n_groups {
+        let start = g * group_size
+        let mut end = start + group_size
+        if end > n { end = n }
+        let params = mk_group_params(vals, start, end)
+        let scale = params[0]
+        let zp = params[1]
+        scales = scales + [scale]
+        zeros = zeros + [zp]
+        let mut i = start
+        while i < end {
+            let q = _mk_round(vals[i] / scale) + zp
+            quant_vals[i] = _mk_clamp(q, 0, 15)
+            i = i + 1
+        }
+    }
+    return [quant_vals, scales, zeros]
+}
+
+fn mk_quantize_matrix(w, rows, cols, group_size) {
+    let mut all_packed = []
+    let mut all_scales = []
+    let mut all_zeros = []
+    for r in 0..rows {
+        let mut row = []
+        for c in 0..cols {
+            row = row + [w[r * cols + c]]
+        }
+        let result = mk_group_quantize(row, group_size)
+        let qvals = result[0]
+        let sc = result[1]
+        let zp = result[2]
+        let packed = mk_pack_array(qvals)
+        all_packed = all_packed + packed
+        all_scales = all_scales + sc
+        all_zeros = all_zeros + zp
+    }
+    let perm = _mk_zeros_int(cols)
+    for i in 0..cols { perm[i] = i }
+    return MarlinTensor {
+        rows: rows,
+        cols: cols,
+        group_size: group_size,
+        packed: all_packed,
+        scales: all_scales,
+        zeros: all_zeros,
+        perm: perm
+    }
+}
+
+fn mk_build_permutation(cols, tile_k) {
+    let n_tiles = (cols + tile_k - 1) / tile_k
+    let mut perm = _mk_zeros_int(cols)
+    let mut idx = 0
+    for offset in 0..tile_k {
+        for t in 0..n_tiles {
+            let src = t * tile_k + offset
+            if src < cols {
+                perm[idx] = src
+                idx = idx + 1
+            }
+        }
+    }
+    return perm
+}
+
+fn mk_apply_perm(vals, perm) {
+    let n = len(perm)
+    let mut out = _mk_zeros(n)
+    for i in 0..n {
+        out[i] = vals[perm[i]]
+    }
+    return out
+}
+
+fn mk_apply_inv_perm(vals, perm) {
+    let n = len(perm)
+    let mut out = _mk_zeros(n)
+    for i in 0..n {
+        out[perm[i]] = vals[i]
+    }
+    return out
+}
+
+fn mk_quantize_matrix_perm(w, rows, cols, group_size, tile_k) {
+    let perm = mk_build_permutation(cols, tile_k)
+    let mut permuted_w = _mk_zeros(rows * cols)
+    for r in 0..rows {
+        let mut row = []
+        for c in 0..cols {
+            row = row + [w[r * cols + c]]
+        }
+        let prow = mk_apply_perm(row, perm)
+        for c in 0..cols {
+            permuted_w[r * cols + c] = prow[c]
+        }
+    }
+    let mt = mk_quantize_matrix(permuted_w, rows, cols, group_size)
+    return MarlinTensor {
+        rows: mt.rows,
+        cols: mt.cols,
+        group_size: mt.group_size,
+        packed: mt.packed,
+        scales: mt.scales,
+        zeros: mt.zeros,
+        perm: perm
+    }
+}
+
+fn mk_pipeline_init(buf_size) {
+    return MarlinPipeline {
+        stage: 0,
+        dequant_buf: _mk_zeros(buf_size),
+        compute_buf: _mk_zeros(buf_size),
+        done: false
+    }
+}
+
+fn mk_pipeline_step(pipe, packed_tile, tile_n, scales, zeros, group_size, a_tile, prev_accum) {
+    let dq = mk_dequant_packed(packed_tile, tile_n, scales, zeros, group_size)
+    let mut accum = prev_accum
+    let buf_n = len(dq)
+    for i in 0..len(a_tile) {
+        let mut dot = 0.0
+        for j in 0..buf_n {
+            dot = dot + a_tile[i] * dq[j]
+        }
+        accum = accum + [dot]
+    }
+    return MarlinPipeline {
+        stage: pipe.stage + 1,
+        dequant_buf: dq,
+        compute_buf: pipe.dequant_buf,
+        done: false
+    }
+}
+
+fn mk_memory_footprint(rows, cols, group_size) {
+    let n_groups = (cols + group_size - 1) / group_size
+    let packed_bytes = rows * ((cols + 1) / 2)
+    let scale_bytes = rows * n_groups * 4
+    let zero_bytes = rows * n_groups * 4
+    let total = packed_bytes + scale_bytes + zero_bytes
+    return [packed_bytes, scale_bytes, zero_bytes, total]
+}
+
+fn mk_compression_ratio(rows, cols, group_size) {
+    let fp32_bytes = rows * cols * 4
+    let footprint = mk_memory_footprint(rows, cols, group_size)
+    let quant_bytes = footprint[3]
+    if quant_bytes == 0 { return 1.0 }
+    return to_float(fp32_bytes) / to_float(quant_bytes)
+}
+
+fn mk_is_tile_aligned(cols, tile_k) {
+    return cols % tile_k == 0
+}
+
+fn mk_tile_padding(cols, tile_k) {
+    let rem = cols % tile_k
+    if rem == 0 { return 0 }
+    return tile_k - rem
+}
+
+fn mk_mse(ref_vals, test_vals) {
+    let n = len(ref_vals)
+    if n == 0 { return 0.0 }
+    let mut sum_sq = 0.0
+    for i in 0..n {
+        let d = ref_vals[i] - test_vals[i]
+        sum_sq = sum_sq + d * d
+    }
+    return sum_sq / to_float(n)
+}
+
+fn mk_max_error(ref_vals, test_vals) {
+    let n = len(ref_vals)
+    let mut mx = 0.0
+    for i in 0..n {
+        let d = _mk_abs(ref_vals[i] - test_vals[i])
+        if d > mx { mx = d }
+    }
+    return mx
+}
+
+fn mk_signal_power(vals) {
+    let n = len(vals)
+    if n == 0 { return 0.0 }
+    let mut s = 0.0
+    for i in 0..n {
+        s = s + vals[i] * vals[i]
+    }
+    return s / to_float(n)
+}
+
+fn mk_snr_db(ref_vals, test_vals) {
+    let sig = mk_signal_power(ref_vals)
+    let noise = mk_mse(ref_vals, test_vals)
+    if noise < 1.0e-15 { return 999.0 }
+    return 10.0 * _mk_log10(sig / noise)
+}
+
+fn mk_estimated_speedup(rows, cols, group_size) {
+    let ratio = mk_compression_ratio(rows, cols, group_size)
+    return ratio * 0.8
+}
+
+fn mk_forward(a, mt, m, k, n) {
+    let groups_per_row = (mt.cols + mt.group_size - 1) / mt.group_size
+    let bytes_per_row = (mt.cols + 1) / 2
+    let mut dq_w = _mk_zeros(k * n)
+    for r in 0..k {
+        let row_start = r * bytes_per_row
+        let mut row_packed = []
+        for b in 0..bytes_per_row {
+            row_packed = row_packed + [mt.packed[row_start + b]]
+        }
+        let sc_start = r * groups_per_row
+        let mut sc = []
+        let mut zp = []
+        for g in 0..groups_per_row {
+            sc = sc + [mt.scales[sc_start + g]]
+            zp = zp + [mt.zeros[sc_start + g]]
+        }
+        let dq_row = mk_dequant_packed(row_packed, n, sc, zp, mt.group_size)
+        for c in 0..n {
+            dq_w[r * n + c] = dq_row[c]
+        }
+    }
+    return mk_matmul(a, dq_w, m, k, n)
+}
+
+fn mk_benchmark(w, a, m, k, n, group_size) {
+    let ref_c = mk_matmul(a, w, m, k, n)
+    let mt = mk_quantize_matrix(w, k, n, group_size)
+    let mut dq_w = _mk_zeros(k * n)
+    let groups_per_row = (n + group_size - 1) / group_size
+    let bytes_per_row = (n + 1) / 2
+    for r in 0..k {
+        let row_start = r * bytes_per_row
+        let mut row_packed = []
+        for b in 0..bytes_per_row {
+            row_packed = row_packed + [mt.packed[row_start + b]]
+        }
+        let sc_start = r * groups_per_row
+        let mut sc = []
+        let mut zp = []
+        for g in 0..groups_per_row {
+            sc = sc + [mt.scales[sc_start + g]]
+            zp = zp + [mt.zeros[sc_start + g]]
+        }
+        let dq_row = mk_dequant_packed(row_packed, n, sc, zp, group_size)
+        for c in 0..n {
+            dq_w[r * n + c] = dq_row[c]
+        }
+    }
+    let quant_c = mk_matmul(a, dq_w, m, k, n)
+    let mse_val = mk_mse(ref_c, quant_c)
+    let max_err_val = mk_max_error(ref_c, quant_c)
+    let snr_val = mk_snr_db(ref_c, quant_c)
+    let speedup_val = mk_estimated_speedup(k, n, group_size)
+    return MarlinBench {
+        mse: mse_val,
+        max_err: max_err_val,
+        snr_db: snr_val,
+        speedup: speedup_val
+    }
+}
+
+fn mk_default_meta() {
+    return MarlinMeta {
+        tile_m: 16,
+        tile_n: 16,
+        tile_k: 64,
+        group_size: 64
+    }
+}
+
+// ===================================================================
+//  Test data generators
+// ===================================================================
+
+// Deterministic pseudo-random for reproducible tests
+fn mk_test_rand(seed, idx) {
+    let mut h = (seed + 1) * 2654435761 + idx * 1315423911
+    h = h % 1000003
+    if h < 0 { h = 0 - h }
+    return to_float(h % 1000) / 1000.0 - 0.5
+}
+
+fn mk_test_matrix(rows, cols, seed) {
+    let mut m = []
+    for i in 0..(rows * cols) {
+        m = m + [mk_test_rand(seed, i)]
+    }
+    return m
+}
+
+// ===================================================================
+//  TESTS
+// ===================================================================
+
+// ── 1. INT4 Packing ─────────────────────────────────────────────
+
+// T01: pack_nibbles basic
+let packed01 = mk_pack_nibbles(3, 12)
+check("T01 pack_nibbles(3,12) = 3+12*16 = 195", packed01 == 195)
+
+// T02: unpack_lo extracts low nibble
+check("T02 unpack_lo(195) = 3", mk_unpack_lo(195) == 3)
+
+// T03: unpack_hi extracts high nibble
+check("T03 unpack_hi(195) = 12", mk_unpack_hi(195) == 12)
+
+// T04: pack/unpack roundtrip
+for lo_test in 0..16 {
+    for hi_test in 0..16 {
+        let p = mk_pack_nibbles(lo_test, hi_test)
+        if mk_unpack_lo(p) != lo_test {
+            check("T04 pack/unpack roundtrip", false)
+        }
+        if mk_unpack_hi(p) != hi_test {
+            check("T04 pack/unpack roundtrip", false)
+        }
+    }
+}
+check("T04 pack/unpack roundtrip all 256 pairs", true)
+
+// T05: pack_array even length
+let vals05 = [1, 14, 7, 8]
+let packed05 = mk_pack_array(vals05)
+check("T05 pack_array even len=2 bytes", len(packed05) == 2)
+
+// T06: pack_array odd length
+let vals06 = [3, 10, 5]
+let packed06 = mk_pack_array(vals06)
+check("T06 pack_array odd len=2 bytes", len(packed06) == 2)
+
+// T07: unpack_array roundtrip
+let vals07 = [0, 15, 7, 8, 3, 12, 1, 9]
+let packed07 = mk_pack_array(vals07)
+let unpacked07 = mk_unpack_array(packed07, 8)
+let mut t07_ok = true
+for i in 0..8 {
+    if unpacked07[i] != vals07[i] { t07_ok = false }
+}
+check("T07 unpack_array roundtrip 8 values", t07_ok)
+
+// ── 2. Dequantization ───────────────────────────────────────────
+
+// T08: dequant zero-point centered (zp=8 -> q=8 gives 0.0)
+let dq08 = mk_dequant_value(8, 0.1, 8)
+check("T08 dequant(8, 0.1, 8) = 0.0", approx(dq08, 0.0, 0.001))
+
+// T09: dequant with offset zero-point
+let dq09 = mk_dequant_value(15, 0.5, 8)
+check("T09 dequant(15, 0.5, 8) = 3.5", approx(dq09, 3.5, 0.001))
+
+// T10: dequant_array per-group
+let int4_10 = [0, 8, 15, 4]
+let scales_10 = [0.1, 0.2]
+let zeros_10 = [8, 5]
+let dq10 = mk_dequant_array(int4_10, scales_10, zeros_10, 2)
+// group 0: scale=0.1, zp=8 -> val[0]=0.1*(0-8)=-0.8, val[1]=0.1*(8-8)=0.0
+// group 1: scale=0.2, zp=5 -> val[2]=0.2*(15-5)=2.0, val[3]=0.2*(4-5)=-0.2
+check("T10 dequant_array[0] = -0.8", approx(dq10[0], -0.8, 0.001))
+check("T10b dequant_array[2] = 2.0", approx(dq10[2], 2.0, 0.001))
+
+// T11: dequant_packed roundtrip
+let vals11 = [3, 12, 7, 10]
+let packed11 = mk_pack_array(vals11)
+let dq11 = mk_dequant_packed(packed11, 4, [1.0], [0], 4)
+check("T11 dequant_packed[0] = 3.0", approx(dq11[0], 3.0, 0.001))
+check("T11b dequant_packed[1] = 12.0", approx(dq11[1], 12.0, 0.001))
+
+// ── 3. Tiled GEMM ───────────────────────────────────────────────
+
+// T12: matmul with identity
+// A = [[1,0],[0,1]], B = [[3,4],[5,6]]
+let a12 = [1.0, 0.0, 0.0, 1.0]
+let b12 = [3.0, 4.0, 5.0, 6.0]
+let c12 = mk_matmul(a12, b12, 2, 2, 2)
+check("T12 matmul identity C[0,0]=3", approx(c12[0], 3.0, 0.001))
+check("T12b matmul identity C[1,1]=6", approx(c12[3], 6.0, 0.001))
+
+// T13: matmul known result
+// A = [[1,2],[3,4]], B = [[5,6],[7,8]]
+// C = [[19,22],[43,50]]
+let a13 = [1.0, 2.0, 3.0, 4.0]
+let b13 = [5.0, 6.0, 7.0, 8.0]
+let c13 = mk_matmul(a13, b13, 2, 2, 2)
+check("T13 matmul C[0,0]=19", approx(c13[0], 19.0, 0.001))
+check("T13b matmul C[1,1]=50", approx(c13[3], 50.0, 0.001))
+
+// T14: tiled matmul matches standard
+let a14 = mk_test_matrix(4, 4, 42)
+let b14 = mk_test_matrix(4, 4, 99)
+let c14_std = mk_matmul(a14, b14, 4, 4, 4)
+let c14_tiled = mk_tiled_matmul(a14, b14, 4, 4, 4, 2, 2, 2)
+let mut t14_ok = true
+for i in 0..16 {
+    if fabs(c14_std[i] - c14_tiled[i]) > 0.001 { t14_ok = false }
+}
+check("T14 tiled matmul matches standard (tile=2)", t14_ok)
+
+// T15: tiled matmul small tiles (1x1x1 = scalar)
+let c15_tiled = mk_tiled_matmul(a14, b14, 4, 4, 4, 1, 1, 1)
+let mut t15_ok = true
+for i in 0..16 {
+    if fabs(c14_std[i] - c15_tiled[i]) > 0.001 { t15_ok = false }
+}
+check("T15 tiled matmul tile=1 matches standard", t15_ok)
+
+// ── 4. Group Quantization ────────────────────────────────────────
+
+// T16: group_params min/max captures range
+let gp_vals = [0.0, -1.0, 2.0, 0.5, 1.0, -0.5, 0.3, 0.7]
+let gp16 = mk_group_params(gp_vals, 0, 8)
+check("T16 group_params scale > 0", gp16[0] > 0.0)
+
+// T17: group_params zero-point in [0,15]
+check("T17 zero_point >= 0", gp16[1] >= 0)
+check("T17b zero_point <= 15", gp16[1] <= 15)
+
+// T18: group_quantize all values in [0,15]
+let vals18 = [-1.0, 0.0, 0.5, 1.0, -0.5, 2.0, -2.0, 1.5]
+let gq18 = mk_group_quantize(vals18, 4)
+let qvals18 = gq18[0]
+let mut t18_ok = true
+for i in 0..8 {
+    if qvals18[i] < 0 { t18_ok = false }
+    if qvals18[i] > 15 { t18_ok = false }
+}
+check("T18 group_quantize values in [0,15]", t18_ok)
+
+// T19: group_quantize roundtrip accuracy
+let scales18 = gq18[1]
+let zeros18 = gq18[2]
+let dq18 = mk_dequant_array(qvals18, scales18, zeros18, 4)
+let mut max_err_19 = 0.0
+for i in 0..8 {
+    let e = fabs(vals18[i] - dq18[i])
+    if e > max_err_19 { max_err_19 = e }
+}
+// With 4-bit quantization, max error should be bounded by scale
+check("T19 group_quantize roundtrip max error < 1.0", max_err_19 < 1.0)
+
+// ── 5. Matrix Quantization ──────────────────────────────────────
+
+// T20: quantize_matrix produces valid tensor
+let w20 = mk_test_matrix(4, 8, 123)
+let mt20 = mk_quantize_matrix(w20, 4, 8, 4)
+check("T20 quantize_matrix rows=4", mt20.rows == 4)
+check("T20b quantize_matrix cols=8", mt20.cols == 8)
+
+// T21: packed size correct
+let expected_bytes_per_row = (8 + 1) / 2
+let expected_total = 4 * expected_bytes_per_row
+check("T21 packed size = 4*4=16 bytes", len(mt20.packed) == expected_total)
+
+// ── 6. Permutation ──────────────────────────────────────────────
+
+// T22: build_permutation covers all indices
+let perm22 = mk_build_permutation(8, 4)
+check("T22 permutation length = cols", len(perm22) == 8)
+
+// T23: permutation has no duplicates (all unique)
+let mut seen23 = _mk_zeros_int(8)
+let mut t23_ok = true
+for i in 0..8 {
+    let idx = perm22[i]
+    if idx < 0 { t23_ok = false }
+    if idx >= 8 { t23_ok = false }
+    if t23_ok { seen23[idx] = seen23[idx] + 1 }
+}
+for i in 0..8 {
+    if seen23[i] != 1 { t23_ok = false }
+}
+check("T23 permutation no duplicates", t23_ok)
+
+// T24: apply_perm + inv_perm roundtrip
+let vals24 = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+let permuted24 = mk_apply_perm(vals24, perm22)
+let restored24 = mk_apply_inv_perm(permuted24, perm22)
+let mut t24_ok = true
+for i in 0..8 {
+    if fabs(vals24[i] - restored24[i]) > 0.001 { t24_ok = false }
+}
+check("T24 perm + inv_perm roundtrip", t24_ok)
+
+// T25: quantize_matrix_perm produces valid tensor with permutation
+let mt25 = mk_quantize_matrix_perm(w20, 4, 8, 4, 4)
+check("T25 quantize_matrix_perm rows=4", mt25.rows == 4)
+check("T25b perm length = cols", len(mt25.perm) == 8)
+
+// ── 7. Async Pipeline ───────────────────────────────────────────
+
+// T26: pipeline_init state
+let pipe26 = mk_pipeline_init(4)
+check("T26 pipeline stage=0", pipe26.stage == 0)
+check("T26b pipeline done=false", pipe26.done == false)
+
+// T27: pipeline_step advances stage
+let tile_packed = mk_pack_array([5, 10, 3, 8])
+let pipe27 = mk_pipeline_step(pipe26, tile_packed, 4, [1.0], [0], 4, [1.0, 2.0], [])
+check("T27 pipeline stage=1 after step", pipe27.stage == 1)
+
+// ── 8. Memory Layout ────────────────────────────────────────────
+
+// T28: memory_footprint positive
+let fp28 = mk_memory_footprint(64, 128, 64)
+check("T28 packed_bytes > 0", fp28[0] > 0)
+check("T28b total > packed", fp28[3] > fp28[0])
+
+// T29: compression ratio > 1 (always smaller than FP32)
+let ratio29 = mk_compression_ratio(64, 128, 64)
+check("T29 compression ratio > 1", ratio29 > 1.0)
+
+// T30: tile_padding correct
+check("T30a tile_padding(128,64) = 0 (aligned)", mk_tile_padding(128, 64) == 0)
+check("T30b tile_padding(100,64) = 28", mk_tile_padding(100, 64) == 28)
+check("T30c is_tile_aligned(128,64) = true", mk_is_tile_aligned(128, 64) == true)
+
+// ── 9. Benchmark ─────────────────────────────────────────────────
+
+// T31: MSE zero for identical arrays
+let id31 = [1.0, 2.0, 3.0, 4.0]
+check("T31 mse identical = 0", approx(mk_mse(id31, id31), 0.0, 1.0e-10))
+
+// T32: MSE positive for different arrays
+let diff32 = [1.1, 2.1, 3.1, 4.1]
+check("T32 mse different > 0", mk_mse(id31, diff32) > 0.0)
+
+// T33: SNR high for close values
+let snr33 = mk_snr_db(id31, diff32)
+check("T33 snr_db > 0 for close values", snr33 > 0.0)
+
+// T34: benchmark returns valid results
+let w34 = mk_test_matrix(4, 4, 77)
+let a34 = mk_test_matrix(2, 4, 88)
+let bench34 = mk_benchmark(w34, a34, 2, 4, 4, 4)
+check("T34 benchmark mse >= 0", bench34.mse >= 0.0)
+check("T34b benchmark speedup > 1", bench34.speedup > 1.0)
+check("T34c benchmark snr_db > 0", bench34.snr_db > 0.0)
+
+// T35: forward matches reference approximately
+let mt35 = mk_quantize_matrix(w34, 4, 4, 4)
+let fwd35 = mk_forward(a34, mt35, 2, 4, 4)
+let ref35 = mk_matmul(a34, w34, 2, 4, 4)
+let mse35 = mk_mse(ref35, fwd35)
+check("T35 forward vs ref MSE < 1.0 (quantization noise)", mse35 < 1.0)
+
+// ===================================================================
+//  Summary
+// ===================================================================
+println("")
+println("=== marlin_kernel test summary ===")
+println("PASS: " + str(pass_count))
+println("FAIL: " + str(fail_count))
+println("TOTAL: " + str(pass_count + fail_count))

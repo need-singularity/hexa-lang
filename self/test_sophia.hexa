@@ -1,0 +1,654 @@
+// ===================================================================
+//  test_sophia.hexa — Sophia Optimizer verification (#145)
+//
+//  Tests (35):
+//    T1  clip_scalar(0.5, 1.0) = 0.5 (no clip)
+//    T2  clip_scalar(2.0, 1.0) = 1.0 (upper clip)
+//    T3  clip_scalar(-3.0, 1.0) = -1.0 (lower clip)
+//    T4  default optimizer has correct lr
+//    T5  default optimizer has correct beta1
+//    T6  default optimizer has correct beta2
+//    T7  default optimizer has correct rho
+//    T8  default optimizer has correct weight_decay
+//    T9  default optimizer has correct hessian_interval
+//    T10 init_state has zero m
+//    T11 init_state has zero h
+//    T12 rademacher vector entries are +1 or -1
+//    T13 rademacher different seeds produce different vectors
+//    T14 hutchinson estimator: u * hvp
+//    T15 gnb estimator: mean of squared per-sample grads
+//    T16 single sophia step reduces quadratic loss
+//    T17 gradient EMA update: m = b1*m + (1-b1)*g
+//    T18 hessian EMA updated on interval step
+//    T19 hessian EMA NOT updated on non-interval step
+//    T20 rho clipping prevents division by near-zero
+//    T21 weight decay shrinks parameters
+//    T22 clipped update bounded by max_clip
+//    T23 sophia-G step same interface as sophia-H
+//    T24 lr warmup at step 0 is 0
+//    T25 lr warmup at midpoint is half
+//    T26 lr warmup at end is base_lr
+//    T27 cosine lr at step 0 is base_lr
+//    T28 cosine lr at end is min_lr
+//    T29 gradient clipping reduces norm
+//    T30 gradient clipping preserves direction
+//    T31 scheduled step integrates warmup lr
+//    T32 multiple steps converge on quadratic
+//    T33 sophia vs adamw both reduce loss
+//    T34 ill-conditioned quadratic: sophia uses curvature
+//    T35 quadratic hessian diag is all ones
+//
+//  Run: cargo run --release -- self/test_sophia.hexa
+// ===================================================================
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ===================================================================
+//  Inlined from sophia.hexa
+// ===================================================================
+
+fn sophia_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn sophia_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..40 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn sophia_cos(x) {
+    let pi = 3.141592653589793
+    let mut v = x
+    while v > pi { v = v - 2.0 * pi }
+    while v < 0.0 - pi { v = v + 2.0 * pi }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..20 {
+        term = 0.0 - term * v * v / to_float(2 * i * (2 * i - 1))
+        result = result + term
+    }
+    return result
+}
+
+fn sophia_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn sophia_ones(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [1.0] }
+    return v
+}
+
+fn sophia_max_f(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn sophia_min_f(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn sophia_clip_scalar(x, bound) {
+    if x > bound { return bound }
+    if x < 0.0 - bound { return 0.0 - bound }
+    return x
+}
+
+fn sophia_rademacher(dim, seed) {
+    let mut v = sophia_zeros(dim)
+    let mut s = seed
+    if s <= 0 { s = 42 }
+    for i in 0..dim {
+        s = (s * 1103515245 + 12345) % 2147483648
+        if s % 2 == 0 {
+            v[i] = 1.0
+        } else {
+            v[i] = 0.0 - 1.0
+        }
+    }
+    return v
+}
+
+fn sophia_hutchinson_estimator(grads, hvp, u) {
+    let dim = len(grads)
+    let mut hhat = sophia_zeros(dim)
+    for i in 0..dim {
+        hhat[i] = u[i] * hvp[i]
+    }
+    return hhat
+}
+
+fn sophia_gnb_estimator(per_sample_grads, n_samples) {
+    if n_samples <= 0 { return [] }
+    let dim = len(per_sample_grads[0])
+    let mut hhat = sophia_zeros(dim)
+    for b in 0..n_samples {
+        let g_b = per_sample_grads[b]
+        for i in 0..dim {
+            hhat[i] = hhat[i] + g_b[i] * g_b[i]
+        }
+    }
+    let inv_b = 1.0 / to_float(n_samples)
+    for i in 0..dim {
+        hhat[i] = hhat[i] * inv_b
+    }
+    return hhat
+}
+
+fn sophia_create(lr, beta1, beta2, rho, weight_decay, hessian_interval) {
+    return #{
+        "lr": lr,
+        "beta1": beta1,
+        "beta2": beta2,
+        "rho": rho,
+        "weight_decay": weight_decay,
+        "hessian_interval": hessian_interval,
+        "max_clip": 1.0
+    }
+}
+
+fn sophia_create_default() {
+    return sophia_create(0.0001, 0.965, 0.99, 0.04, 0.1, 10)
+}
+
+fn sophia_init_state(dim) {
+    return #{
+        "m": sophia_zeros(dim),
+        "h": sophia_zeros(dim),
+        "step": 0
+    }
+}
+
+fn sophia_step_h(opt, params, grads, hessian_diag, state, step) {
+    let lr = opt["lr"]
+    let b1 = opt["beta1"]
+    let b2 = opt["beta2"]
+    let rho = opt["rho"]
+    let wd = opt["weight_decay"]
+    let max_clip = opt["max_clip"]
+    let k = opt["hessian_interval"]
+    let dim = len(params)
+    let m = state["m"]
+    let h = state["h"]
+
+    let mut new_m = sophia_zeros(dim)
+    let mut new_h = sophia_zeros(dim)
+    let mut new_params = sophia_zeros(dim)
+
+    for i in 0..dim {
+        new_m[i] = b1 * m[i] + (1.0 - b1) * grads[i]
+    }
+
+    let update_hessian = (step % k) == 0
+    if update_hessian && len(hessian_diag) == dim {
+        for i in 0..dim {
+            new_h[i] = b2 * h[i] + (1.0 - b2) * sophia_abs(hessian_diag[i])
+        }
+    } else {
+        for i in 0..dim {
+            new_h[i] = h[i]
+        }
+    }
+
+    for i in 0..dim {
+        let denom = sophia_max_f(new_h[i], rho)
+        let ratio = new_m[i] / denom
+        let clipped = sophia_clip_scalar(ratio, max_clip)
+        new_params[i] = params[i] - lr * (clipped + wd * params[i])
+    }
+
+    let new_state = #{
+        "m": new_m,
+        "h": new_h,
+        "step": step + 1
+    }
+    return [new_params, new_state]
+}
+
+fn sophia_step_g(opt, params, grads, gnb_diag, state, step) {
+    return sophia_step_h(opt, params, grads, gnb_diag, state, step)
+}
+
+fn sophia_lr_warmup(base_lr, step, warmup_steps) {
+    if warmup_steps <= 0 { return base_lr }
+    if step >= warmup_steps { return base_lr }
+    return base_lr * to_float(step) / to_float(warmup_steps)
+}
+
+fn sophia_lr_cosine(base_lr, step, total_steps, min_lr) {
+    if step >= total_steps { return min_lr }
+    if step <= 0 { return base_lr }
+    let pi = 3.141592653589793
+    let progress = to_float(step) / to_float(total_steps)
+    let cosine_decay = 0.5 * (1.0 + sophia_cos(pi * progress))
+    return min_lr + (base_lr - min_lr) * cosine_decay
+}
+
+fn sophia_lr_schedule(base_lr, step, warmup_steps, total_steps, min_lr) {
+    if step < warmup_steps {
+        return sophia_lr_warmup(base_lr, step, warmup_steps)
+    }
+    let decay_step = step - warmup_steps
+    let decay_total = total_steps - warmup_steps
+    return sophia_lr_cosine(base_lr, decay_step, decay_total, min_lr)
+}
+
+fn sophia_grad_norm(grads) {
+    let mut norm_sq = 0.0
+    let n = len(grads)
+    for i in 0..n {
+        norm_sq = norm_sq + grads[i] * grads[i]
+    }
+    return sophia_sqrt(norm_sq)
+}
+
+fn sophia_clip_global_norm(grads, max_norm) {
+    let norm = sophia_grad_norm(grads)
+    if norm <= max_norm { return grads }
+    let scale = max_norm / norm
+    let n = len(grads)
+    let mut clipped = sophia_zeros(n)
+    for i in 0..n {
+        clipped[i] = grads[i] * scale
+    }
+    return clipped
+}
+
+fn sophia_step_scheduled(opt, params, grads, hessian_diag, state, step, warmup, total, min_lr, max_grad_norm) {
+    let base_lr = opt["lr"]
+    let scheduled_lr = sophia_lr_schedule(base_lr, step, warmup, total, min_lr)
+    let scheduled_opt = #{
+        "lr": scheduled_lr,
+        "beta1": opt["beta1"],
+        "beta2": opt["beta2"],
+        "rho": opt["rho"],
+        "weight_decay": opt["weight_decay"],
+        "hessian_interval": opt["hessian_interval"],
+        "max_clip": opt["max_clip"]
+    }
+    let clipped_grads = sophia_clip_global_norm(grads, max_grad_norm)
+    return sophia_step_h(scheduled_opt, params, clipped_grads, hessian_diag, state, step)
+}
+
+fn sophia_quadratic_loss(params) {
+    let mut loss = 0.0
+    let n = len(params)
+    for i in 0..n {
+        loss = loss + 0.5 * params[i] * params[i]
+    }
+    return loss
+}
+
+fn sophia_quadratic_grad(params) {
+    let n = len(params)
+    let mut g = sophia_zeros(n)
+    for i in 0..n {
+        g[i] = params[i]
+    }
+    return g
+}
+
+fn sophia_quadratic_hessian_diag(params) {
+    let n = len(params)
+    return sophia_ones(n)
+}
+
+fn sophia_ill_cond_loss(params, scales) {
+    let mut loss = 0.0
+    let n = len(params)
+    for i in 0..n {
+        loss = loss + 0.5 * scales[i] * params[i] * params[i]
+    }
+    return loss
+}
+
+fn sophia_ill_cond_grad(params, scales) {
+    let n = len(params)
+    let mut g = sophia_zeros(n)
+    for i in 0..n {
+        g[i] = scales[i] * params[i]
+    }
+    return g
+}
+
+fn sophia_ill_cond_hessian_diag(scales) {
+    let n = len(scales)
+    let mut h = sophia_zeros(n)
+    for i in 0..n {
+        h[i] = scales[i]
+    }
+    return h
+}
+
+fn sophia_adamw_step(params, grads, m, v, lr, b1, b2, eps, wd, t) {
+    let dim = len(params)
+    let mut new_params = sophia_zeros(dim)
+    let mut new_m = sophia_zeros(dim)
+    let mut new_v = sophia_zeros(dim)
+
+    let mut b1_pow = 1.0
+    let mut b2_pow = 1.0
+    for _i in 0..t {
+        b1_pow = b1_pow * b1
+        b2_pow = b2_pow * b2
+    }
+    let b1_corr = 1.0 - b1_pow
+    let b2_corr = 1.0 - b2_pow
+
+    for i in 0..dim {
+        new_m[i] = b1 * m[i] + (1.0 - b1) * grads[i]
+        new_v[i] = b2 * v[i] + (1.0 - b2) * grads[i] * grads[i]
+        let m_hat = new_m[i] / b1_corr
+        let v_hat = new_v[i] / b2_corr
+        new_params[i] = params[i] - lr * (m_hat / (sophia_sqrt(v_hat) + eps) + wd * params[i])
+    }
+
+    return [new_params, new_m, new_v]
+}
+
+fn sophia_compare(init_params, n_steps) {
+    let dim = len(init_params)
+
+    let sopt = sophia_create(0.001, 0.965, 0.99, 0.04, 0.0, 1)
+    let mut s_params = sophia_zeros(dim)
+    for i in 0..dim { s_params[i] = init_params[i] }
+    let mut s_state = sophia_init_state(dim)
+
+    let mut a_params = sophia_zeros(dim)
+    for i in 0..dim { a_params[i] = init_params[i] }
+    let mut a_m = sophia_zeros(dim)
+    let mut a_v = sophia_zeros(dim)
+
+    for step in 0..n_steps {
+        let sg = sophia_quadratic_grad(s_params)
+        let sh = sophia_quadratic_hessian_diag(s_params)
+        let s_result = sophia_step_h(sopt, s_params, sg, sh, s_state, step)
+        s_params = s_result[0]
+        s_state = s_result[1]
+
+        let ag = sophia_quadratic_grad(a_params)
+        let a_result = sophia_adamw_step(
+            a_params, ag, a_m, a_v,
+            0.01, 0.9, 0.999, 1.0e-8, 0.0, step + 1
+        )
+        a_params = a_result[0]
+        a_m = a_result[1]
+        a_v = a_result[2]
+    }
+
+    let s_loss = sophia_quadratic_loss(s_params)
+    let a_loss = sophia_quadratic_loss(a_params)
+    return [s_loss, a_loss]
+}
+
+fn sophia_memory_usage(dim, n_params) {
+    let total_dim = dim * n_params
+    let bytes_per_float = 8
+    let sophia_bytes = total_dim * bytes_per_float * 2
+    let adam_bytes = total_dim * bytes_per_float * 2
+    return [sophia_bytes, adam_bytes]
+}
+
+// ===================================================================
+//  TESTS
+// ===================================================================
+
+// T1: clip_scalar no-op when within bound
+check("T1 clip_scalar(0.5, 1.0) = 0.5", approx(sophia_clip_scalar(0.5, 1.0), 0.5, 1.0e-10))
+
+// T2: clip_scalar upper bound
+check("T2 clip_scalar(2.0, 1.0) = 1.0", approx(sophia_clip_scalar(2.0, 1.0), 1.0, 1.0e-10))
+
+// T3: clip_scalar lower bound
+check("T3 clip_scalar(-3.0, 1.0) = -1.0", approx(sophia_clip_scalar(-3.0, 1.0), -1.0, 1.0e-10))
+
+// T4-T9: default optimizer config
+let opt_def = sophia_create_default()
+check("T4 default lr = 0.0001", approx(opt_def["lr"], 0.0001, 1.0e-8))
+check("T5 default beta1 = 0.965", approx(opt_def["beta1"], 0.965, 1.0e-8))
+check("T6 default beta2 = 0.99", approx(opt_def["beta2"], 0.99, 1.0e-8))
+check("T7 default rho = 0.04", approx(opt_def["rho"], 0.04, 1.0e-8))
+check("T8 default weight_decay = 0.1", approx(opt_def["weight_decay"], 0.1, 1.0e-8))
+check("T9 default hessian_interval = 10", opt_def["hessian_interval"] == 10)
+
+// T10: init state has zero m
+let st0 = sophia_init_state(4)
+let m0 = st0["m"]
+let mut all_zero_m = true
+for i in 0..4 {
+    if fabs(m0[i]) > 1.0e-10 { all_zero_m = false }
+}
+check("T10 init m is all zeros", all_zero_m)
+
+// T11: init state has zero h
+let h0 = st0["h"]
+let mut all_zero_h = true
+for i in 0..4 {
+    if fabs(h0[i]) > 1.0e-10 { all_zero_h = false }
+}
+check("T11 init h is all zeros", all_zero_h)
+
+// T12: rademacher vector entries are +1 or -1
+let rad = sophia_rademacher(8, 123)
+let mut rad_ok = true
+for i in 0..8 {
+    if fabs(rad[i]) < 0.5 { rad_ok = false }
+    if fabs(rad[i]) > 1.5 { rad_ok = false }
+}
+check("T12 rademacher entries are +/-1", rad_ok)
+
+// T13: different seeds produce different vectors
+let rad2 = sophia_rademacher(8, 456)
+let mut rad_diff = false
+for i in 0..8 {
+    if fabs(rad[i] - rad2[i]) > 0.5 { rad_diff = true }
+}
+check("T13 different seeds -> different rademacher", rad_diff)
+
+// T14: hutchinson estimator: hhat = u * hvp
+let u14 = [1.0, -1.0, 1.0]
+let hvp14 = [2.0, 3.0, -1.0]
+let grads14 = [1.0, 1.0, 1.0]
+let hh14 = sophia_hutchinson_estimator(grads14, hvp14, u14)
+// hhat = [1*2, -1*3, 1*(-1)] = [2, -3, -1]
+check("T14 hutchinson: u*hvp[0]=2.0", approx(hh14[0], 2.0, 1.0e-10))
+check("T14b hutchinson: u*hvp[1]=-3.0", approx(hh14[1], -3.0, 1.0e-10))
+
+// T15: gnb estimator: mean of squared per-sample grads
+let psg = [[1.0, 2.0], [3.0, 0.0]]
+let gnb = sophia_gnb_estimator(psg, 2)
+// hhat[0] = (1^2 + 3^2)/2 = (1+9)/2 = 5.0
+// hhat[1] = (2^2 + 0^2)/2 = 4/2 = 2.0
+check("T15 gnb[0] = 5.0", approx(gnb[0], 5.0, 1.0e-10))
+check("T15b gnb[1] = 2.0", approx(gnb[1], 2.0, 1.0e-10))
+
+// T16: single sophia step reduces quadratic loss
+let p16 = [3.0, -2.0, 1.0, -4.0]
+let loss_before = sophia_quadratic_loss(p16)
+let g16 = sophia_quadratic_grad(p16)
+let h16 = sophia_quadratic_hessian_diag(p16)
+let opt16 = sophia_create(0.1, 0.965, 0.99, 0.04, 0.0, 1)
+let s16 = sophia_init_state(4)
+let result16 = sophia_step_h(opt16, p16, g16, h16, s16, 0)
+let loss_after = sophia_quadratic_loss(result16[0])
+check("T16 single step reduces quadratic loss", loss_after < loss_before)
+
+// T17: gradient EMA update: m = b1*m + (1-b1)*g
+let p17 = [5.0]
+let g17 = [10.0]
+let h17 = [1.0]
+let opt17 = sophia_create(0.01, 0.9, 0.99, 0.04, 0.0, 1)
+let s17 = sophia_init_state(1)
+let result17 = sophia_step_h(opt17, p17, g17, h17, s17, 0)
+let new_m17 = result17[1]["m"]
+// m = 0.9 * 0 + 0.1 * 10 = 1.0
+check("T17 gradient EMA: m = (1-b1)*g = 1.0", approx(new_m17[0], 1.0, 1.0e-10))
+
+// T18: hessian EMA updated on interval step (step 0, k=1 -> update)
+let new_h18 = result17[1]["h"]
+// h = 0.99 * 0 + 0.01 * |1.0| = 0.01
+check("T18 hessian EMA updated on interval step", approx(new_h18[0], 0.01, 1.0e-10))
+
+// T19: hessian EMA NOT updated on non-interval step
+let opt19 = sophia_create(0.01, 0.9, 0.99, 0.04, 0.0, 5)
+let s19 = sophia_init_state(1)
+// step=1, k=5 -> 1%5 != 0, no hessian update
+let result19 = sophia_step_h(opt19, [5.0], [10.0], [1.0], s19, 1)
+let new_h19 = result19[1]["h"]
+// h stays 0 since step 1 % 5 != 0
+check("T19 hessian EMA NOT updated on non-interval step", approx(new_h19[0], 0.0, 1.0e-10))
+
+// T20: rho clipping prevents division by near-zero Hessian
+// When h=0 and rho=0.04, denom = max(0, 0.04) = 0.04
+let opt20 = sophia_create(0.1, 0.0, 0.99, 0.04, 0.0, 100)
+// b1=0 so m = g directly, step=1 so no hessian update, h=0
+// ratio = g / rho = 10.0 / 0.04 = 250 -> clipped to 1.0
+// p = 5.0 - 0.1 * 1.0 = 4.9
+let s20 = sophia_init_state(1)
+let result20 = sophia_step_h(opt20, [5.0], [10.0], [], s20, 1)
+check("T20 rho clips large ratio: p = 4.9", approx(result20[0][0], 4.9, 1.0e-6))
+
+// T21: weight decay shrinks parameters
+let opt21 = sophia_create(0.1, 0.9, 0.99, 0.04, 0.5, 100)
+let s21 = sophia_init_state(1)
+// grad=0, m=0, update = clip(0/0.04, 1) = 0, but wd*p = 0.5*10 = 5
+// p = 10 - 0.1 * (0 + 5) = 10 - 0.5 = 9.5
+let result21 = sophia_step_h(opt21, [10.0], [0.0], [], s21, 1)
+check("T21 weight decay shrinks params", result21[0][0] < 10.0)
+
+// T22: clipped update bounded by max_clip
+// With large gradient and low hessian, ratio should be clipped
+let opt22 = sophia_create(1.0, 0.0, 0.99, 0.001, 0.0, 100)
+let s22 = sophia_init_state(1)
+// b1=0 -> m=g=100.0, h=0 (no update at step 1), denom=max(0, 0.001)=0.001
+// ratio = 100/0.001 = 100000, clipped to 1.0
+// p = 5.0 - 1.0 * 1.0 = 4.0
+let result22 = sophia_step_h(opt22, [5.0], [100.0], [], s22, 1)
+check("T22 clipped update bounded: p = 4.0", approx(result22[0][0], 4.0, 1.0e-6))
+
+// T23: sophia-G step same interface as sophia-H
+let opt23 = sophia_create(0.1, 0.965, 0.99, 0.04, 0.0, 1)
+let s23 = sophia_init_state(2)
+let result23h = sophia_step_h(opt23, [3.0, -2.0], [3.0, -2.0], [1.0, 1.0], s23, 0)
+let result23g = sophia_step_g(opt23, [3.0, -2.0], [3.0, -2.0], [1.0, 1.0], s23, 0)
+check("T23 sophia-G = sophia-H same result", approx(result23h[0][0], result23g[0][0], 1.0e-10))
+
+// T24: lr warmup at step 0 is 0
+let w24 = sophia_lr_warmup(0.001, 0, 100)
+check("T24 warmup at step=0 is 0", approx(w24, 0.0, 1.0e-10))
+
+// T25: lr warmup at midpoint is half
+let w25 = sophia_lr_warmup(0.001, 50, 100)
+check("T25 warmup at step=50/100 is 0.0005", approx(w25, 0.0005, 1.0e-8))
+
+// T26: lr warmup at end returns base_lr
+let w26 = sophia_lr_warmup(0.001, 100, 100)
+check("T26 warmup at end = base_lr", approx(w26, 0.001, 1.0e-8))
+
+// T27: cosine lr at step 0 is base_lr
+let c27 = sophia_lr_cosine(0.001, 0, 1000, 0.0)
+check("T27 cosine lr at step=0 is base_lr", approx(c27, 0.001, 1.0e-8))
+
+// T28: cosine lr at end is min_lr
+let c28 = sophia_lr_cosine(0.001, 1000, 1000, 0.0001)
+check("T28 cosine lr at end = min_lr", approx(c28, 0.0001, 1.0e-8))
+
+// T29: gradient clipping reduces norm
+let big_grad = [3.0, 4.0]
+let clipped29 = sophia_clip_global_norm(big_grad, 1.0)
+let norm29 = sophia_grad_norm(clipped29)
+check("T29 clipped norm <= max_norm", norm29 <= 1.0 + 1.0e-6)
+
+// T30: gradient clipping preserves direction
+let r30 = clipped29[0] / clipped29[1]
+let r30_orig = 3.0 / 4.0
+check("T30 clipping preserves direction", approx(r30, r30_orig, 1.0e-6))
+
+// T31: scheduled step integrates warmup lr + grad clipping
+let opt31 = sophia_create(0.01, 0.965, 0.99, 0.04, 0.0, 1)
+let s31 = sophia_init_state(1)
+// step=5, warmup=100 -> lr = 0.01 * 5/100 = 0.0005
+let result31 = sophia_step_scheduled(opt31, [5.0], [5.0], [1.0], s31, 5, 100, 1000, 0.0, 10.0)
+// lr=0.0005, b1=0.965, m=0.035*5.0=0.175
+// h updated at step 5 (5%1==0): h=0.01*|1.0|=0.01
+// denom = max(0.01, 0.04) = 0.04, ratio = 0.175/0.04 = 4.375, clipped to 1.0
+// p = 5.0 - 0.0005 * 1.0 = 4.9995
+check("T31 scheduled step warmup lr", approx(result31[0][0], 4.9995, 1.0e-4))
+
+// T32: multiple steps converge on quadratic
+let mut p32 = [5.0, -3.0, 7.0, -1.0]
+let opt32 = sophia_create(0.01, 0.965, 0.99, 0.04, 0.0, 1)
+let mut s32 = sophia_init_state(4)
+let loss32_init = sophia_quadratic_loss(p32)
+for step32 in 0..500 {
+    let g32 = sophia_quadratic_grad(p32)
+    let h32 = sophia_quadratic_hessian_diag(p32)
+    let r32 = sophia_step_h(opt32, p32, g32, h32, s32, step32)
+    p32 = r32[0]
+    s32 = r32[1]
+}
+let loss32_final = sophia_quadratic_loss(p32)
+check("T32 500 steps converge: loss drops >90%", loss32_final < loss32_init * 0.1)
+
+// T33: sophia vs adamw both reduce loss
+let init33 = [3.0, -2.0, 4.0, -1.0]
+let cmp33 = sophia_compare(init33, 100)
+let init33_loss = sophia_quadratic_loss(init33)
+check("T33 Sophia reduces loss", cmp33[0] < init33_loss)
+check("T33b AdamW reduces loss", cmp33[1] < init33_loss)
+
+// T34: ill-conditioned quadratic — sophia uses curvature info
+// scales: [10, 0.1] -> different curvature in each dimension
+let scales34 = [10.0, 0.1]
+let mut sp34 = [1.0, 1.0]
+let opt34 = sophia_create(0.005, 0.965, 0.99, 0.01, 0.0, 1)
+let mut ss34 = sophia_init_state(2)
+for step34 in 0..300 {
+    let g34 = sophia_ill_cond_grad(sp34, scales34)
+    let h34 = sophia_ill_cond_hessian_diag(scales34)
+    let r34 = sophia_step_h(opt34, sp34, g34, h34, ss34, step34)
+    sp34 = r34[0]
+    ss34 = r34[1]
+}
+let loss34 = sophia_ill_cond_loss(sp34, scales34)
+let loss34_init = sophia_ill_cond_loss([1.0, 1.0], scales34)
+check("T34 ill-conditioned: sophia reduces loss", loss34 < loss34_init * 0.5)
+
+// T35: quadratic hessian diag is all ones
+let hdiag35 = sophia_quadratic_hessian_diag([1.0, 2.0, 3.0])
+let mut hdiag_ok = true
+for i in 0..3 {
+    if fabs(hdiag35[i] - 1.0) > 1.0e-10 { hdiag_ok = false }
+}
+check("T35 quadratic hessian diag = all ones", hdiag_ok)
+
+// ===================================================================
+println("")
+println("=== sophia test summary ===")
+println("PASS: " + str(pass_count))
+println("FAIL: " + str(fail_count))
+println("TOTAL: " + str(pass_count + fail_count))

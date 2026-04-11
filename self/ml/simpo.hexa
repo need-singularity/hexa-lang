@@ -1,5 +1,6 @@
 // ═══════════════════════════════════════════════════════════════════
-//  self/ml/simpo.hexa — Simple Preference Optimization (Reference-Free)
+//  self/ml/simpo.hexa — SimPO: Simple Preference Optimization
+//                       (Reference-Free Margin DPO)
 //
 //  SimPO eliminates the reference model entirely (unlike DPO which needs
 //  a frozen pi_ref copy). Instead it length-normalizes the policy's own
@@ -17,30 +18,47 @@
 //  Reference: Meng et al., "SimPO: Simple Preference Optimization with
 //             a Reference-Free Reward" (NeurIPS 2024)
 //
+//  Implements (#124):
+//    1. Length-normalized log probability reward (avg log prob per token)
+//    2. Margin term (gamma) between chosen and rejected
+//    3. SimPO loss function: sigmoid(-beta*(rw - rl - gamma))
+//    4. Preference dataset loader (chosen/rejected pairs)
+//    5. Configurable beta (temperature) and gamma (margin) parameters
+//    6. Training loop with SimPO loss
+//    7. Reward tracking and logging (chosen reward, rejected reward, margin)
+//    8. Comparison with standard DPO (optional reference model mode)
+//
 //  API:
 //    simpo_sigmoid(x)                              -> float
 //    simpo_log_sigmoid(x)                          -> float
+//    simpo_softplus(x)                             -> float
 //    simpo_length_normalize(log_p, length)         -> float
 //    simpo_reward(log_p, length, beta)             -> float
-//    simpo_loss(log_p_w, log_p_l, len_w, len_l,
+//    simpo_loss(lp_w, lp_l, len_w, len_l,
 //               beta, gamma)                       -> float
-//    simpo_loss_grad_lp_w(log_p_w, log_p_l,
-//                         len_w, len_l,
-//                         beta, gamma)             -> float
-//    simpo_loss_grad_lp_l(log_p_w, log_p_l,
-//                         len_w, len_l,
-//                         beta, gamma)             -> float
-//    simpo_reward_margin(log_p_w, log_p_l,
-//                        len_w, len_l, beta)       -> float
-//    simpo_preference_accuracy(log_p_w, log_p_l,
-//                              len_w, len_l)       -> float
+//    simpo_loss_grad_lp_w(...)                     -> float
+//    simpo_loss_grad_lp_l(...)                     -> float
+//    simpo_reward_margin(...)                      -> float
+//    simpo_preference_accuracy(...)                -> float
 //    simpo_batch_loss(batch, beta, gamma)          -> float
-//    simpo_train_step(log_p_w, log_p_l, len_w,
-//                     len_l, beta, gamma, lr)      -> [float,float,float]
-//    simpo_train(batch, n_steps, lr, beta, gamma)  -> [float]
-//    simpo_dpo_vs_simpo(log_p_w, log_p_l, ref_w,
-//                       ref_l, len_w, len_l,
-//                       beta, gamma)               -> [float, float]
+//    simpo_train_step(...)                         -> [loss,lp_w,lp_l]
+//    simpo_train(batch, n_steps, lr, beta, gamma)  -> [loss,lp_w,lp_l]
+//    simpo_dpo_vs_simpo(...)                       -> [dpo_loss, simpo_loss]
+//    simpo_make_config(beta, gamma, lr)            -> [beta, gamma, lr]
+//    simpo_make_pair(lp_w, lp_l, len_w, len_l)    -> [lp_w, lp_l, len_w, len_l]
+//    simpo_make_dataset(pairs)                     -> dataset
+//    simpo_dataset_len(ds)                         -> int
+//    simpo_dataset_get(ds, i)                      -> pair
+//    simpo_dataset_stats(ds, beta)                 -> [avg_rw, avg_rl, avg_margin, acc]
+//    simpo_train_epoch(ds, beta, gamma, lr)        -> [avg_loss, updated_ds]
+//    simpo_train_loop(ds, n_epochs, beta, gamma, lr) -> [losses, final_ds]
+//    simpo_reward_tracker_new()                    -> tracker
+//    simpo_reward_tracker_record(tr, rw, rl)       -> tracker
+//    simpo_reward_tracker_stats(tr)                -> [avg_rw, avg_rl, avg_margin, count]
+//    simpo_dpo_loss_ref(lp_w, lp_l, ref_w, ref_l, beta) -> float
+//    simpo_compare_dpo_simpo(pair, ref_w, ref_l, beta, gamma) -> [dpo_loss, simpo_loss, diff]
+//    simpo_token_log_probs(token_logits)           -> float
+//    simpo_avg_token_log_prob(token_log_probs)     -> float
 //
 //  AI-NATIVE attrs:
 //    @pure  — no side effects
@@ -85,6 +103,16 @@ fn simpo_log(x) {
     return to_float(count) + ln_v
 }
 
+fn simpo_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
 // ═══════════════════════════════════════════════════════════════════
 //  Sigmoid and log-sigmoid (numerically stable)
 // ═══════════════════════════════════════════════════════════════════
@@ -102,6 +130,14 @@ fn simpo_log_sigmoid(x) {
     if neg_x > 20.0 { return 0.0 - neg_x }
     if neg_x < -20.0 { return 0.0 }
     return 0.0 - simpo_log(1.0 + simpo_exp(neg_x))
+}
+
+@pure
+fn simpo_softplus(x) {
+    // log(1 + exp(x)), stable
+    if x > 20.0 { return x }
+    if x < -20.0 { return 0.0 }
+    return simpo_log(1.0 + simpo_exp(x))
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -226,11 +262,6 @@ fn simpo_batch_loss(batch, beta, gamma) {
 //  Single SGD step on (log_p_w, log_p_l) toy scalars
 //
 //  Returns [loss, new_log_p_w, new_log_p_l]
-//
-//  This is the "Hexa bare-metal" training step: takes two scalars
-//  (the aggregate log-probs from a forward pass) and pushes them in
-//  opposite directions by their analytic gradients. Used by tests and
-//  by simpo_train() as the update primitive.
 // ═══════════════════════════════════════════════════════════════════
 @hot
 fn simpo_train_step(log_p_w, log_p_l, len_w, len_l, beta, gamma, lr) {
@@ -285,4 +316,385 @@ fn simpo_dpo_vs_simpo(log_p_w, log_p_l, ref_w, ref_l, len_w, len_l, beta, gamma)
     return [dpo_l, simpo_l]
 }
 
-println("[simpo] loaded — reference-free, length-normalized, margin-gated")
+// ═══════════════════════════════════════════════════════════════════
+//  #124 NEW — Configuration Builder
+//
+//  Creates a config object as [beta, gamma, lr] for reuse.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn simpo_make_config(beta, gamma, lr) {
+    return [beta, gamma, lr]
+}
+
+@pure
+fn simpo_config_beta(cfg) { return cfg[0] }
+
+@pure
+fn simpo_config_gamma(cfg) { return cfg[1] }
+
+@pure
+fn simpo_config_lr(cfg) { return cfg[2] }
+
+// ═══════════════════════════════════════════════════════════════════
+//  #124 NEW — Preference Pair Constructor
+//
+//  A pair is [log_p_w, log_p_l, len_w, len_l]
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn simpo_make_pair(lp_w, lp_l, len_w, len_l) {
+    return [lp_w, lp_l, len_w, len_l]
+}
+
+@pure
+fn simpo_pair_lp_w(pair) { return pair[0] }
+
+@pure
+fn simpo_pair_lp_l(pair) { return pair[1] }
+
+@pure
+fn simpo_pair_len_w(pair) { return pair[2] }
+
+@pure
+fn simpo_pair_len_l(pair) { return pair[3] }
+
+// ═══════════════════════════════════════════════════════════════════
+//  #124 NEW — Preference Dataset Loader
+//
+//  A dataset is an array of pairs. Each pair: [lp_w, lp_l, len_w, len_l]
+//  Provides: make, len, get, stats, shuffle_seed, split
+// ═══════════════════════════════════════════════════════════════════
+
+fn simpo_make_dataset(pairs) {
+    return pairs
+}
+
+fn simpo_dataset_len(ds) {
+    return len(ds)
+}
+
+fn simpo_dataset_get(ds, i) {
+    return ds[i]
+}
+
+// Dataset statistics: average chosen/rejected rewards, margin, accuracy
+@pure
+fn simpo_dataset_stats(ds, beta) {
+    let n = len(ds)
+    if n == 0 { return [0.0, 0.0, 0.0, 0.0] }
+    let mut sum_rw = 0.0
+    let mut sum_rl = 0.0
+    let mut sum_margin = 0.0
+    let mut correct = 0
+    for i in 0..n {
+        let p = ds[i]
+        let rw = simpo_reward(p[0], p[2], beta)
+        let rl = simpo_reward(p[1], p[3], beta)
+        sum_rw = sum_rw + rw
+        sum_rl = sum_rl + rl
+        sum_margin = sum_margin + (rw - rl)
+        if rw > rl { correct = correct + 1 }
+    }
+    let nf = to_float(n)
+    return [sum_rw / nf, sum_rl / nf, sum_margin / nf, to_float(correct) / nf]
+}
+
+// Deterministic shuffle using a seed (Fisher-Yates via hash)
+fn simpo_dataset_shuffle(ds, seed) {
+    let n = len(ds)
+    if n <= 1 { return ds }
+    // Build index permutation
+    let mut indices = []
+    for i in 0..n { indices = indices + [i] }
+    let mut s = seed
+    let mut i = n - 1
+    while i > 0 {
+        s = (s * 1103515245 + 12345) % 2147483647
+        if s < 0 { s = 0 - s }
+        let j = s % (i + 1)
+        // swap indices[i] and indices[j]
+        let tmp = indices[i]
+        indices[i] = indices[j]
+        indices[j] = tmp
+        i = i - 1
+    }
+    // Build shuffled dataset
+    let mut result = []
+    for i in 0..n {
+        result = result + [ds[indices[i]]]
+    }
+    return result
+}
+
+// Split dataset into train portion at given ratio (0..1)
+fn simpo_dataset_split_train(ds, train_ratio) {
+    let n = len(ds)
+    let split_idx = to_int(to_float(n) * train_ratio)
+    let mut train = []
+    for i in 0..split_idx {
+        train = train + [ds[i]]
+    }
+    return train
+}
+
+// Split dataset into val portion at given ratio (0..1)
+fn simpo_dataset_split_val(ds, train_ratio) {
+    let n = len(ds)
+    let split_idx = to_int(to_float(n) * train_ratio)
+    let mut val = []
+    for i in split_idx..n {
+        val = val + [ds[i]]
+    }
+    return val
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  #124 NEW — Token-level Log-Probability Computation
+//
+//  Computes per-token log probs from logits and averages them.
+// ═══════════════════════════════════════════════════════════════════
+
+// Softmax for a single token's logit vector
+@pure
+fn simpo_softmax(logits) {
+    let n = len(logits)
+    let mut mx = logits[0]
+    for i in 1..n {
+        if logits[i] > mx { mx = logits[i] }
+    }
+    let mut exps = []
+    let mut z = 0.0
+    for i in 0..n {
+        let e = simpo_exp(logits[i] - mx)
+        exps = exps + [e]
+        z = z + e
+    }
+    let mut out = []
+    for i in 0..n {
+        out = out + [exps[i] / z]
+    }
+    return out
+}
+
+// Log-probability of a specific token given logits
+@pure
+fn simpo_token_log_prob(logits, token_id) {
+    let probs = simpo_softmax(logits)
+    let p = probs[token_id]
+    return simpo_log(p)
+}
+
+// Average log-probability over a sequence of token log-probs
+@pure
+fn simpo_avg_token_log_prob(token_log_probs) {
+    let n = len(token_log_probs)
+    if n == 0 { return 0.0 }
+    let mut total = 0.0
+    for i in 0..n {
+        total = total + token_log_probs[i]
+    }
+    return total / to_float(n)
+}
+
+// Sum of token log-probs (total sequence log-prob)
+@pure
+fn simpo_sum_token_log_prob(token_log_probs) {
+    let mut total = 0.0
+    for i in 0..len(token_log_probs) {
+        total = total + token_log_probs[i]
+    }
+    return total
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  #124 NEW — Training Epoch (over full dataset)
+//
+//  Split into two functions to avoid mixed-type arrays:
+//    simpo_train_epoch_loss   -> float (avg loss)
+//    simpo_train_epoch_update -> updated dataset (nested array)
+// ═══════════════════════════════════════════════════════════════════
+fn simpo_train_epoch_loss(ds, beta, gamma, lr) {
+    let n = len(ds)
+    if n == 0 { return 0.0 }
+    let mut total_loss = 0.0
+    for i in 0..n {
+        let p = ds[i]
+        let loss = simpo_loss(p[0], p[1], p[2], p[3], beta, gamma)
+        total_loss = total_loss + loss
+    }
+    return total_loss / to_float(n)
+}
+
+fn simpo_train_epoch_update(ds, beta, gamma, lr) {
+    let n = len(ds)
+    if n == 0 { return ds }
+    let mut updated = []
+    for i in 0..n {
+        let p = ds[i]
+        let r = simpo_train_step(p[0], p[1], p[2], p[3], beta, gamma, lr)
+        updated = updated + [[r[1], r[2], p[2], p[3]]]
+    }
+    return updated
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  #124 NEW — Multi-Epoch Training Loop with Loss History
+//
+//  Split into two functions:
+//    simpo_train_loop_losses -> loss history (flat float array)
+//    simpo_train_loop_update -> final dataset (nested array)
+// ═══════════════════════════════════════════════════════════════════
+fn simpo_train_loop_losses(ds, n_epochs, beta, gamma, lr) {
+    let mut current_ds = ds
+    let mut losses = []
+    for _e in 0..n_epochs {
+        let loss = simpo_train_epoch_loss(current_ds, beta, gamma, lr)
+        losses = losses + [loss]
+        current_ds = simpo_train_epoch_update(current_ds, beta, gamma, lr)
+    }
+    return losses
+}
+
+fn simpo_train_loop_update(ds, n_epochs, beta, gamma, lr) {
+    let mut current_ds = ds
+    for _e in 0..n_epochs {
+        current_ds = simpo_train_epoch_update(current_ds, beta, gamma, lr)
+    }
+    return current_ds
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  #124 NEW — Reward Tracker
+//
+//  Accumulates chosen/rejected rewards for logging.
+//  tracker = [sum_rw, sum_rl, count]
+// ═══════════════════════════════════════════════════════════════════
+fn simpo_reward_tracker_new() {
+    return [0.0, 0.0, 0]
+}
+
+fn simpo_reward_tracker_record(tracker, rw, rl) {
+    return [tracker[0] + rw, tracker[1] + rl, tracker[2] + 1]
+}
+
+fn simpo_reward_tracker_stats(tracker) {
+    let count = tracker[2]
+    if count == 0 { return [0.0, 0.0, 0.0, 0] }
+    let nf = to_float(count)
+    let avg_rw = tracker[0] / nf
+    let avg_rl = tracker[1] / nf
+    let avg_margin = avg_rw - avg_rl
+    return [avg_rw, avg_rl, avg_margin, count]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  #124 NEW — Standard DPO Loss (reference model required)
+//
+//  For comparison: L_dpo = -log sigma(beta * (lp_w - ref_w - lp_l + ref_l))
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn simpo_dpo_loss_ref(lp_w, lp_l, ref_w, ref_l, beta) {
+    let log_ratio_w = lp_w - ref_w
+    let log_ratio_l = lp_l - ref_l
+    let logit = beta * (log_ratio_w - log_ratio_l)
+    return 0.0 - simpo_log_sigmoid(logit)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  #124 NEW — Head-to-Head: DPO vs SimPO on a single pair
+//
+//  Returns [dpo_loss, simpo_loss, abs_diff]
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn simpo_compare_dpo_simpo(pair, ref_w, ref_l, beta, gamma) {
+    let lp_w = pair[0]
+    let lp_l = pair[1]
+    let len_w = pair[2]
+    let len_l = pair[3]
+    let d = simpo_dpo_loss_ref(lp_w, lp_l, ref_w, ref_l, beta)
+    let s = simpo_loss(lp_w, lp_l, len_w, len_l, beta, gamma)
+    let diff = d - s
+    let mut abs_diff = diff
+    if abs_diff < 0.0 { abs_diff = 0.0 - abs_diff }
+    return [d, s, abs_diff]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  #124 NEW — Batch Preference Accuracy
+//
+//  Returns fraction of pairs where chosen reward > rejected reward
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn simpo_batch_accuracy(ds, beta) {
+    let n = len(ds)
+    if n == 0 { return 0.0 }
+    let mut correct = 0
+    for i in 0..n {
+        let p = ds[i]
+        let rw = simpo_reward(p[0], p[2], beta)
+        let rl = simpo_reward(p[1], p[3], beta)
+        if rw > rl { correct = correct + 1 }
+    }
+    return to_float(correct) / to_float(n)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  #124 NEW — Gradient Norm (for monitoring training stability)
+//
+//  Returns sqrt(grad_w^2 + grad_l^2)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn simpo_grad_norm(lp_w, lp_l, len_w, len_l, beta, gamma) {
+    let gw = simpo_loss_grad_lp_w(lp_w, lp_l, len_w, len_l, beta, gamma)
+    let gl = simpo_loss_grad_lp_l(lp_w, lp_l, len_w, len_l, beta, gamma)
+    return simpo_sqrt(gw * gw + gl * gl)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  #124 NEW — Loss with Gradient Clipping
+//
+//  Clips gradient magnitude before applying update.
+//  Returns [loss, new_lp_w, new_lp_l]
+// ═══════════════════════════════════════════════════════════════════
+fn simpo_train_step_clipped(lp_w, lp_l, len_w, len_l, beta, gamma, lr, max_grad) {
+    let loss = simpo_loss(lp_w, lp_l, len_w, len_l, beta, gamma)
+    let mut gw = simpo_loss_grad_lp_w(lp_w, lp_l, len_w, len_l, beta, gamma)
+    let mut gl = simpo_loss_grad_lp_l(lp_w, lp_l, len_w, len_l, beta, gamma)
+    let gnorm = simpo_sqrt(gw * gw + gl * gl)
+    if gnorm > max_grad {
+        let scale = max_grad / gnorm
+        gw = gw * scale
+        gl = gl * scale
+    }
+    return [loss, lp_w - lr * gw, lp_l - lr * gl]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  #124 NEW — Reward Gap Target Check
+//
+//  Checks whether the reward margin exceeds gamma (the target).
+//  Returns 1.0 if margin > gamma, else 0.0.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn simpo_margin_exceeds_target(lp_w, lp_l, len_w, len_l, beta, gamma) {
+    let margin = simpo_reward_margin(lp_w, lp_l, len_w, len_l, beta)
+    if margin > gamma { return 1.0 }
+    return 0.0
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  #124 NEW — SimPO with Label Smoothing
+//
+//  Smoothed loss = (1 - eps) * L(margin) + eps * L(-margin)
+//  Prevents overconfident separation.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn simpo_loss_smooth(lp_w, lp_l, len_w, len_l, beta, gamma, epsilon) {
+    let r_w = simpo_reward(lp_w, len_w, beta)
+    let r_l = simpo_reward(lp_l, len_l, beta)
+    let margin = r_w - r_l - gamma
+    let loss_main = 0.0 - simpo_log_sigmoid(margin)
+    let loss_flip = 0.0 - simpo_log_sigmoid(0.0 - margin)
+    return (1.0 - epsilon) * loss_main + epsilon * loss_flip
+}
+
+println("[simpo] loaded — reference-free, length-normalized, margin-gated, dataset+tracker+dpo-compare")

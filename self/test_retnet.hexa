@@ -1,0 +1,1155 @@
+// ===================================================================
+//  test_retnet.hexa — RetNet (Retentive Network) verification
+//
+//  ML roadmap #140 — Retention-based dual parallel+recurrent mode
+//
+//  Tests (35):
+//    T1  ret_zeros correct length
+//    T2  ret_ones all 1.0
+//    T3  ret_vec_add element-wise
+//    T4  ret_dot product
+//    T5  ret_sigmoid bounds [0,1]
+//    T6  ret_sigmoid(0) ~ 0.5
+//    T7  ret_exp(0) = 1.0
+//    T8  ret_swish(0) = 0
+//    T9  ret_swish positive output for positive input
+//    T10 layer_norm mean ~ 0
+//    T11 layer_norm std ~ 1
+//    T12 build_decay_matrix lower-triangular
+//    T13 build_decay_matrix diagonal = 1.0
+//    T14 build_decay_matrix gamma decay
+//    T15 compute_gamma multi-scale in (0,1)
+//    T16 compute_gamma strictly increasing
+//    T17 retention_parallel output shape
+//    T18 retention_parallel causal (position 0 independent of future)
+//    T19 retention_recurrent_step output dim
+//    T20 retention_recurrent_step state update non-zero
+//    T21 parallel vs recurrent equivalence
+//    T22 chunkwise output shape
+//    T23 chunkwise vs recurrent closeness
+//    T24 multi-scale retention create correct n_heads
+//    T25 msr_parallel output shape
+//    T26 msr_recurrent_step output dim
+//    T27 gated retention output bounded
+//    T28 retnet_block_parallel output shape
+//    T29 retnet_block residual (non-zero output)
+//    T30 retnet_stack creation
+//    T31 retnet_stack_parallel output shape
+//    T32 retnet_stack_recurrent output shape
+//    T33 retnet_generate produces n_gen tokens
+//    T34 retnet_generate deterministic
+//    T35 retnet_param_count > 0
+//
+//  Run: cargo run --release -- self/test_retnet.hexa
+// ===================================================================
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ===================================================================
+//  Inlined RetNet implementation
+// ===================================================================
+
+// -- math helpers --
+
+fn ret_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn ret_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 { g = (g + x / g) / 2.0 }
+    return g
+}
+
+fn ret_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn ret_log(x) {
+    if x <= 0.0 { return -20.0 }
+    let mut y = 0.0
+    let mut t = (x - 1.0) / (x + 1.0)
+    let t2 = t * t
+    let mut term = t
+    for i in 0..15 {
+        y = y + term / to_float(2 * i + 1)
+        term = term * t2
+    }
+    return 2.0 * y
+}
+
+fn ret_sigmoid(x) {
+    if x > 20.0 { return 1.0 }
+    if x < -20.0 { return 0.0 }
+    return 1.0 / (1.0 + ret_exp(0.0 - x))
+}
+
+fn ret_swish(x) {
+    return x * ret_sigmoid(x)
+}
+
+fn ret_pow(base, exp_val) {
+    if base <= 0.0 { return 0.0 }
+    return ret_exp(exp_val * ret_log(base))
+}
+
+fn ret_max(a, b) { if a > b { return a } return b }
+fn ret_min(a, b) { if a < b { return a } return b }
+
+// -- vector utilities --
+
+fn ret_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn ret_ones(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [1.0] }
+    return v
+}
+
+fn ret_vec_add(a, b) {
+    let n = len(a)
+    let mut out = []
+    for i in 0..n { out = out + [a[i] + b[i]] }
+    return out
+}
+
+fn ret_vec_sub(a, b) {
+    let n = len(a)
+    let mut out = []
+    for i in 0..n { out = out + [a[i] - b[i]] }
+    return out
+}
+
+fn ret_vec_mul(a, b) {
+    let n = len(a)
+    let mut out = []
+    for i in 0..n { out = out + [a[i] * b[i]] }
+    return out
+}
+
+fn ret_vec_scale(v, s) {
+    let n = len(v)
+    let mut out = []
+    for i in 0..n { out = out + [v[i] * s] }
+    return out
+}
+
+fn ret_dot(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    for i in 0..n { s = s + a[i] * b[i] }
+    return s
+}
+
+fn ret_vec_swish(v) {
+    let n = len(v)
+    let mut out = []
+    for i in 0..n { out = out + [ret_swish(v[i])] }
+    return out
+}
+
+fn ret_vec_sigmoid(v) {
+    let n = len(v)
+    let mut out = []
+    for i in 0..n { out = out + [ret_sigmoid(v[i])] }
+    return out
+}
+
+// -- matrix utilities --
+
+fn ret_mat_zeros(rows, cols) {
+    let mut m = []
+    for _r in 0..rows { m = m + [ret_zeros(cols)] }
+    return m
+}
+
+fn ret_mat_vec(mat, v) {
+    let rows = len(mat)
+    let mut out = []
+    for r in 0..rows { out = out + [ret_dot(mat[r], v)] }
+    return out
+}
+
+fn ret_outer(a, b) {
+    let ra = len(a)
+    let cb = len(b)
+    let mut m = []
+    for i in 0..ra {
+        let mut row = []
+        for j in 0..cb {
+            row = row + [a[i] * b[j]]
+        }
+        m = m + [row]
+    }
+    return m
+}
+
+fn ret_mat_add(a, b) {
+    let rows = len(a)
+    let mut m = []
+    for r in 0..rows {
+        m = m + [ret_vec_add(a[r], b[r])]
+    }
+    return m
+}
+
+fn ret_mat_scale(mat, s) {
+    let rows = len(mat)
+    let mut m = []
+    for r in 0..rows {
+        m = m + [ret_vec_scale(mat[r], s)]
+    }
+    return m
+}
+
+fn ret_init_weight(rows, cols, seed) {
+    let scale = 1.0 / ret_sqrt(to_float(cols))
+    let mut m = []
+    for r in 0..rows {
+        let mut row = []
+        for c in 0..cols {
+            let h = (r * 137 + c * 311 + seed * 7919) % 10007
+            let val = (to_float(h) / 10007.0 - 0.5) * 2.0 * scale
+            row = row + [val]
+        }
+        m = m + [row]
+    }
+    return m
+}
+
+fn ret_init_vec(dim, seed) {
+    let scale = 1.0 / ret_sqrt(to_float(dim))
+    let mut v = []
+    for i in 0..dim {
+        let h = (i * 251 + seed * 6173) % 10007
+        let val = (to_float(h) / 10007.0 - 0.5) * 2.0 * scale
+        v = v + [val]
+    }
+    return v
+}
+
+// -- LayerNorm --
+
+struct RetLayerNorm {
+    dim: int,
+    gamma: array,
+    beta: array,
+    eps: float
+}
+
+fn create_ret_layer_norm(dim) {
+    return RetLayerNorm {
+        dim: dim,
+        gamma: ret_ones(dim),
+        beta: ret_zeros(dim),
+        eps: 1.0e-5
+    }
+}
+
+fn ret_layer_norm_forward(ln, x) {
+    let n = ln.dim
+    let mut mean = 0.0
+    for i in 0..n { mean = mean + x[i] }
+    mean = mean / to_float(n)
+    let mut var = 0.0
+    for i in 0..n {
+        let d = x[i] - mean
+        var = var + d * d
+    }
+    var = var / to_float(n)
+    let inv_std = 1.0 / ret_sqrt(var + ln.eps)
+    let mut out = []
+    for i in 0..n {
+        let normed = (x[i] - mean) * inv_std
+        out = out + [ln.gamma[i] * normed + ln.beta[i]]
+    }
+    return out
+}
+
+// -- Decay matrix --
+
+fn build_decay_matrix(seq_len, gamma) {
+    let mut d_mat = []
+    for i in 0..seq_len {
+        let mut row = []
+        for j in 0..seq_len {
+            if j > i {
+                row = row + [0.0]
+            } else {
+                let dist = i - j
+                row = row + [ret_pow(gamma, to_float(dist))]
+            }
+        }
+        d_mat = d_mat + [row]
+    }
+    return d_mat
+}
+
+// -- Multi-scale gamma --
+
+fn compute_gamma(head_idx) {
+    let exponent = 0.0 - to_float(5 + head_idx)
+    let two_pow = ret_pow(2.0, exponent)
+    return 1.0 - two_pow
+}
+
+fn compute_gammas(n_heads) {
+    let mut gammas = []
+    for h in 0..n_heads {
+        gammas = gammas + [compute_gamma(h)]
+    }
+    return gammas
+}
+
+// -- Retention Head --
+
+struct RetentionHead {
+    head_dim: int,
+    gamma: float,
+    W_q: array,
+    W_k: array,
+    W_v: array
+}
+
+fn create_retention_head(head_dim, gamma, seed) {
+    return RetentionHead {
+        head_dim: head_dim,
+        gamma: gamma,
+        W_q: ret_init_weight(head_dim, head_dim, seed + 1),
+        W_k: ret_init_weight(head_dim, head_dim, seed + 2),
+        W_v: ret_init_weight(head_dim, head_dim, seed + 3)
+    }
+}
+
+fn retention_parallel(head, xs) {
+    let seq_len = len(xs)
+    let d = head.head_dim
+    let mut qs = []
+    let mut ks = []
+    let mut vs = []
+    for t in 0..seq_len {
+        qs = qs + [ret_mat_vec(head.W_q, xs[t])]
+        ks = ks + [ret_mat_vec(head.W_k, xs[t])]
+        vs = vs + [ret_mat_vec(head.W_v, xs[t])]
+    }
+    let d_mat = build_decay_matrix(seq_len, head.gamma)
+    let mut outputs = []
+    for i in 0..seq_len {
+        let mut out = ret_zeros(d)
+        for j in 0..seq_len {
+            let qk = ret_dot(qs[i], ks[j])
+            let weight = d_mat[i][j] * qk
+            out = ret_vec_add(out, ret_vec_scale(vs[j], weight))
+        }
+        outputs = outputs + [out]
+    }
+    return outputs
+}
+
+fn retention_recurrent_step(head, x, state) {
+    let d = head.head_dim
+    let q = ret_mat_vec(head.W_q, x)
+    let k = ret_mat_vec(head.W_k, x)
+    let v = ret_mat_vec(head.W_v, x)
+    let new_state = ret_mat_add(
+        ret_mat_scale(state, head.gamma),
+        ret_outer(v, k)
+    )
+    let output = ret_mat_vec(new_state, q)
+    return [output, new_state]
+}
+
+fn retention_recurrent(head, xs) {
+    let seq_len = len(xs)
+    let d = head.head_dim
+    let mut state = ret_mat_zeros(d, d)
+    let mut outputs = []
+    for t in 0..seq_len {
+        let res = retention_recurrent_step(head, xs[t], state)
+        outputs = outputs + [res[0]]
+        state = res[1]
+    }
+    return outputs
+}
+
+// -- Chunkwise --
+
+fn retention_chunkwise(head, xs, chunk_size) {
+    let seq_len = len(xs)
+    let d = head.head_dim
+    let gamma = head.gamma
+    let mut state = ret_mat_zeros(d, d)
+    let mut outputs = []
+
+    let mut pos = 0
+    for _chunk_idx in 0..((seq_len + chunk_size - 1) / chunk_size) {
+        let c_end = ret_min(pos + chunk_size, seq_len)
+        let c_len = c_end - pos
+
+        let mut chunk_xs = []
+        for i in 0..c_len {
+            chunk_xs = chunk_xs + [xs[pos + i]]
+        }
+
+        let mut qs = []
+        let mut ks = []
+        let mut vs = []
+        for i in 0..c_len {
+            qs = qs + [ret_mat_vec(head.W_q, chunk_xs[i])]
+            ks = ks + [ret_mat_vec(head.W_k, chunk_xs[i])]
+            vs = vs + [ret_mat_vec(head.W_v, chunk_xs[i])]
+        }
+
+        let d_inner = build_decay_matrix(c_len, gamma)
+        let mut inner_outs = []
+        for i in 0..c_len {
+            let mut out = ret_zeros(d)
+            for j in 0..c_len {
+                let qk = ret_dot(qs[i], ks[j])
+                let weight = d_inner[i][j] * qk
+                out = ret_vec_add(out, ret_vec_scale(vs[j], weight))
+            }
+            inner_outs = inner_outs + [out]
+        }
+
+        for i in 0..c_len {
+            let decay_cross = ret_pow(gamma, to_float(i + 1))
+            let cross_out = ret_vec_scale(ret_mat_vec(state, qs[i]), decay_cross)
+            let combined = ret_vec_add(inner_outs[i], cross_out)
+            outputs = outputs + [combined]
+        }
+
+        let gamma_c = ret_pow(gamma, to_float(c_len))
+        state = ret_mat_scale(state, gamma_c)
+        for j in 0..c_len {
+            let decay_j = ret_pow(gamma, to_float(c_len - 1 - j))
+            let vk_outer = ret_outer(vs[j], ks[j])
+            state = ret_mat_add(state, ret_mat_scale(vk_outer, decay_j))
+        }
+
+        pos = pos + c_len
+    }
+    return outputs
+}
+
+// -- Multi-Scale Retention --
+
+struct MultiScaleRetention {
+    d_model: int,
+    n_heads: int,
+    head_dim: int,
+    heads: array,
+    gammas: array,
+    W_o: array,
+    W_g: array
+}
+
+fn create_multi_scale_retention(d_model, n_heads, seed) {
+    let head_dim = d_model / n_heads
+    let gammas = compute_gammas(n_heads)
+    let mut heads = []
+    for h in 0..n_heads {
+        heads = heads + [create_retention_head(head_dim, gammas[h], seed + h * 100)]
+    }
+    return MultiScaleRetention {
+        d_model: d_model,
+        n_heads: n_heads,
+        head_dim: head_dim,
+        heads: heads,
+        gammas: gammas,
+        W_o: ret_init_weight(d_model, d_model, seed + 900),
+        W_g: ret_init_weight(d_model, d_model, seed + 950)
+    }
+}
+
+fn split_heads(x, n_heads, head_dim) {
+    let mut parts = []
+    for h in 0..n_heads {
+        let mut part = []
+        for i in 0..head_dim {
+            part = part + [x[h * head_dim + i]]
+        }
+        parts = parts + [part]
+    }
+    return parts
+}
+
+fn concat_heads(parts, n_heads, head_dim) {
+    let mut out = []
+    for h in 0..n_heads {
+        for i in 0..head_dim {
+            out = out + [parts[h][i]]
+        }
+    }
+    return out
+}
+
+fn msr_parallel(msr, xs) {
+    let seq_len = len(xs)
+    let nh = msr.n_heads
+    let hd = msr.head_dim
+
+    let mut head_inputs = []
+    for h in 0..nh {
+        let mut h_seq = []
+        for t in 0..seq_len {
+            let parts = split_heads(xs[t], nh, hd)
+            h_seq = h_seq + [parts[h]]
+        }
+        head_inputs = head_inputs + [h_seq]
+    }
+
+    let mut head_outputs = []
+    for h in 0..nh {
+        head_outputs = head_outputs + [retention_parallel(msr.heads[h], head_inputs[h])]
+    }
+
+    let mut outputs = []
+    for t in 0..seq_len {
+        let mut parts = []
+        for h in 0..nh {
+            parts = parts + [head_outputs[h][t]]
+        }
+        let cat = concat_heads(parts, nh, hd)
+        let gate = ret_vec_swish(ret_mat_vec(msr.W_g, xs[t]))
+        let proj = ret_mat_vec(msr.W_o, cat)
+        outputs = outputs + [ret_vec_mul(gate, proj)]
+    }
+    return outputs
+}
+
+fn msr_recurrent_step(msr, x, states) {
+    let nh = msr.n_heads
+    let hd = msr.head_dim
+    let parts = split_heads(x, nh, hd)
+
+    let mut head_outs = []
+    let mut new_states = []
+    for h in 0..nh {
+        let res = retention_recurrent_step(msr.heads[h], parts[h], states[h])
+        head_outs = head_outs + [res[0]]
+        new_states = new_states + [res[1]]
+    }
+
+    let cat = concat_heads(head_outs, nh, hd)
+    let gate = ret_vec_swish(ret_mat_vec(msr.W_g, x))
+    let proj = ret_mat_vec(msr.W_o, cat)
+    let output = ret_vec_mul(gate, proj)
+    return [output, new_states]
+}
+
+fn msr_recurrent(msr, xs) {
+    let seq_len = len(xs)
+    let nh = msr.n_heads
+    let hd = msr.head_dim
+    let mut states = []
+    for h in 0..nh {
+        states = states + [ret_mat_zeros(hd, hd)]
+    }
+    let mut outputs = []
+    for t in 0..seq_len {
+        let res = msr_recurrent_step(msr, xs[t], states)
+        outputs = outputs + [res[0]]
+        states = res[1]
+    }
+    return outputs
+}
+
+fn msr_chunkwise(msr, xs, chunk_size) {
+    let seq_len = len(xs)
+    let nh = msr.n_heads
+    let hd = msr.head_dim
+
+    let mut head_inputs = []
+    for h in 0..nh {
+        let mut h_seq = []
+        for t in 0..seq_len {
+            let parts = split_heads(xs[t], nh, hd)
+            h_seq = h_seq + [parts[h]]
+        }
+        head_inputs = head_inputs + [h_seq]
+    }
+
+    let mut head_outputs = []
+    for h in 0..nh {
+        head_outputs = head_outputs + [retention_chunkwise(msr.heads[h], head_inputs[h], chunk_size)]
+    }
+
+    let mut outputs = []
+    for t in 0..seq_len {
+        let mut parts = []
+        for h in 0..nh {
+            parts = parts + [head_outputs[h][t]]
+        }
+        let cat = concat_heads(parts, nh, hd)
+        let gate = ret_vec_swish(ret_mat_vec(msr.W_g, xs[t]))
+        let proj = ret_mat_vec(msr.W_o, cat)
+        outputs = outputs + [ret_vec_mul(gate, proj)]
+    }
+    return outputs
+}
+
+// -- RetNet Block --
+
+struct RetNetBlock {
+    d_model: int,
+    ff_dim: int,
+    ln1: RetLayerNorm,
+    ln2: RetLayerNorm,
+    msr: MultiScaleRetention,
+    W_ff1: array,
+    W_ff2: array
+}
+
+fn create_retnet_block(d_model, n_heads, ff_dim, seed) {
+    return RetNetBlock {
+        d_model: d_model,
+        ff_dim: ff_dim,
+        ln1: create_ret_layer_norm(d_model),
+        ln2: create_ret_layer_norm(d_model),
+        msr: create_multi_scale_retention(d_model, n_heads, seed),
+        W_ff1: ret_init_weight(ff_dim, d_model, seed + 2000),
+        W_ff2: ret_init_weight(d_model, ff_dim, seed + 2100)
+    }
+}
+
+fn retnet_ffn(blk, x) {
+    let hidden = ret_vec_swish(ret_mat_vec(blk.W_ff1, x))
+    return ret_mat_vec(blk.W_ff2, hidden)
+}
+
+fn retnet_block_parallel(blk, xs) {
+    let seq_len = len(xs)
+    let mut normed1 = []
+    for t in 0..seq_len {
+        normed1 = normed1 + [ret_layer_norm_forward(blk.ln1, xs[t])]
+    }
+    let msr_out = msr_parallel(blk.msr, normed1)
+    let mut x2 = []
+    for t in 0..seq_len {
+        x2 = x2 + [ret_vec_add(xs[t], msr_out[t])]
+    }
+    let mut outputs = []
+    for t in 0..seq_len {
+        let normed2 = ret_layer_norm_forward(blk.ln2, x2[t])
+        let ffn_out = retnet_ffn(blk, normed2)
+        outputs = outputs + [ret_vec_add(x2[t], ffn_out)]
+    }
+    return outputs
+}
+
+fn retnet_block_recurrent_step(blk, x, states) {
+    let normed1 = ret_layer_norm_forward(blk.ln1, x)
+    let msr_res = msr_recurrent_step(blk.msr, normed1, states)
+    let x2 = ret_vec_add(x, msr_res[0])
+    let new_states = msr_res[1]
+    let normed2 = ret_layer_norm_forward(blk.ln2, x2)
+    let ffn_out = retnet_ffn(blk, normed2)
+    let x3 = ret_vec_add(x2, ffn_out)
+    return [x3, new_states]
+}
+
+// -- RetNet State --
+
+struct RetNetState {
+    n_layers: int,
+    n_heads: int,
+    head_dim: int,
+    layer_states: array
+}
+
+fn create_retnet_state(n_layers, n_heads, head_dim) {
+    let mut ls = []
+    for _l in 0..n_layers {
+        let mut hs = []
+        for _h in 0..n_heads {
+            hs = hs + [ret_mat_zeros(head_dim, head_dim)]
+        }
+        ls = ls + [hs]
+    }
+    return RetNetState {
+        n_layers: n_layers,
+        n_heads: n_heads,
+        head_dim: head_dim,
+        layer_states: ls
+    }
+}
+
+// -- Multi-layer Stack --
+
+struct RetNetStack {
+    n_layers: int,
+    d_model: int,
+    n_heads: int,
+    ff_dim: int,
+    blocks: array,
+    ln_out: RetLayerNorm
+}
+
+fn create_retnet_stack(n_layers, d_model, n_heads, ff_dim, seed) {
+    let mut blocks = []
+    for l in 0..n_layers {
+        blocks = blocks + [create_retnet_block(d_model, n_heads, ff_dim, seed + l * 5000)]
+    }
+    return RetNetStack {
+        n_layers: n_layers,
+        d_model: d_model,
+        n_heads: n_heads,
+        ff_dim: ff_dim,
+        blocks: blocks,
+        ln_out: create_ret_layer_norm(d_model)
+    }
+}
+
+fn retnet_stack_parallel(stack, xs) {
+    let mut h = xs
+    for l in 0..stack.n_layers {
+        h = retnet_block_parallel(stack.blocks[l], h)
+    }
+    let seq_len = len(h)
+    let mut outputs = []
+    for t in 0..seq_len {
+        outputs = outputs + [ret_layer_norm_forward(stack.ln_out, h[t])]
+    }
+    return outputs
+}
+
+fn retnet_stack_recurrent_step(stack, x, state) {
+    let mut h = x
+    let mut new_ls = []
+    for l in 0..stack.n_layers {
+        let res = retnet_block_recurrent_step(stack.blocks[l], h, state.layer_states[l])
+        h = res[0]
+        new_ls = new_ls + [res[1]]
+    }
+    let out = ret_layer_norm_forward(stack.ln_out, h)
+    let new_state = RetNetState {
+        n_layers: state.n_layers,
+        n_heads: state.n_heads,
+        head_dim: state.head_dim,
+        layer_states: new_ls
+    }
+    return [out, new_state]
+}
+
+fn retnet_stack_recurrent(stack, xs) {
+    let seq_len = len(xs)
+    let n_heads = stack.n_heads
+    let head_dim = stack.d_model / n_heads
+    let mut state = create_retnet_state(stack.n_layers, n_heads, head_dim)
+    let mut outputs = []
+    for t in 0..seq_len {
+        let res = retnet_stack_recurrent_step(stack, xs[t], state)
+        outputs = outputs + [res[0]]
+        state = res[1]
+    }
+    return outputs
+}
+
+// -- Embedding / Unembedding --
+
+fn ret_embed(token_id, d_model, seed) {
+    let mut v = []
+    for i in 0..d_model {
+        let h = (token_id * 137 + i * 311 + seed) % 10007
+        let val = (to_float(h) / 10007.0 - 0.5) * 0.1
+        v = v + [val]
+    }
+    return v
+}
+
+fn ret_unembed(h, vocab_size, d_model, seed) {
+    let mut logits = []
+    for v in 0..vocab_size {
+        let mut score = 0.0
+        for i in 0..d_model {
+            let w_h = (v * 137 + i * 311 + seed + 999) % 10007
+            let w = (to_float(w_h) / 10007.0 - 0.5) * 0.1
+            score = score + h[i] * w
+        }
+        logits = logits + [score]
+    }
+    return logits
+}
+
+fn ret_embed_seq(token_ids, d_model, seed) {
+    let n = len(token_ids)
+    let mut xs = []
+    for t in 0..n {
+        xs = xs + [ret_embed(token_ids[t], d_model, seed)]
+    }
+    return xs
+}
+
+// -- Softmax / Argmax --
+
+fn ret_softmax(logits) {
+    let n = len(logits)
+    let mut mx = logits[0]
+    for i in 1..n { if logits[i] > mx { mx = logits[i] } }
+    let mut exps = ret_zeros(n)
+    let mut z = 0.0
+    for i in 0..n {
+        exps[i] = ret_exp(logits[i] - mx)
+        z = z + exps[i]
+    }
+    let mut out = ret_zeros(n)
+    for i in 0..n { out[i] = exps[i] / z }
+    return out
+}
+
+fn ret_argmax(logits) {
+    let n = len(logits)
+    let mut best = 0
+    let mut best_v = logits[0]
+    for i in 1..n {
+        if logits[i] > best_v {
+            best_v = logits[i]
+            best = i
+        }
+    }
+    return best
+}
+
+// -- Generation --
+
+fn retnet_generate(stack, start_tokens, n_gen, vocab_size, emb_seed) {
+    let d = stack.d_model
+    let n_heads = stack.n_heads
+    let head_dim = d / n_heads
+    let mut state = create_retnet_state(stack.n_layers, n_heads, head_dim)
+    let n_prompt = len(start_tokens)
+    let mut last_out = ret_zeros(d)
+    for t in 0..n_prompt {
+        let emb = ret_embed(start_tokens[t], d, emb_seed)
+        let res = retnet_stack_recurrent_step(stack, emb, state)
+        last_out = res[0]
+        state = res[1]
+    }
+    let mut generated = []
+    for _g in 0..n_gen {
+        let logits = ret_unembed(last_out, vocab_size, d, emb_seed)
+        let next_id = ret_argmax(logits)
+        generated = generated + [next_id]
+        let emb = ret_embed(next_id, d, emb_seed)
+        let res = retnet_stack_recurrent_step(stack, emb, state)
+        last_out = res[0]
+        state = res[1]
+    }
+    return generated
+}
+
+// -- Training --
+
+fn retnet_train_forward(stack, token_ids, vocab_size, emb_seed) {
+    let d = stack.d_model
+    let seq_len = len(token_ids)
+    let xs = ret_embed_seq(token_ids, d, emb_seed)
+    let outs = retnet_stack_parallel(stack, xs)
+    let mut all_logits = []
+    for t in 0..seq_len {
+        let logits = ret_unembed(outs[t], vocab_size, d, emb_seed)
+        all_logits = all_logits + [logits]
+    }
+    return all_logits
+}
+
+fn ret_cross_entropy(logits, target) {
+    let probs = ret_softmax(logits)
+    let p = probs[target]
+    let safe_p = if p < 1.0e-10 { 1.0e-10 } else { p }
+    return 0.0 - ret_log(safe_p)
+}
+
+fn retnet_param_count(stack) {
+    let d = stack.d_model
+    let nh = stack.n_heads
+    let hd = d / nh
+    let ff = stack.ff_dim
+    let n = stack.n_layers
+    let head_params = 3 * hd * hd
+    let msr_params = nh * head_params + 2 * d * d
+    let ffn_params = ff * d + d * ff
+    let ln_params = 4 * d
+    let per_block = msr_params + ffn_params + ln_params
+    let total = n * per_block + 2 * d
+    return total
+}
+
+// ===================================================================
+//  TESTS — small dimensions for speed
+// ===================================================================
+
+let DIM = 8
+let N_HEADS = 2
+let HEAD_DIM = DIM / N_HEADS
+let FF_DIM = 16
+let VOCAB = 10
+let SEED = 42
+let EMB_SEED = 77
+
+// T1: ret_zeros correct length
+let z8 = ret_zeros(DIM)
+check("T1 ret_zeros length", len(z8) == DIM)
+
+// T2: ret_ones all 1.0
+let o8 = ret_ones(DIM)
+let mut all_one = true
+for i in 0..DIM {
+    if fabs(o8[i] - 1.0) > 0.001 { all_one = false }
+}
+check("T2 ret_ones all 1.0", all_one)
+
+// T3: ret_vec_add element-wise
+let va = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+let vb = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+let vc = ret_vec_add(va, vb)
+check("T3 vec_add correct", approx(vc[0], 1.1, 0.001) && approx(vc[7], 8.8, 0.001))
+
+// T4: ret_dot product
+let d1 = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+let d2 = [3.0, 5.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+check("T4 dot product", approx(ret_dot(d1, d2), 3.0, 0.001))
+
+// T5: ret_sigmoid bounds [0,1]
+let sig_pos = ret_sigmoid(100.0)
+let sig_neg = ret_sigmoid(-100.0)
+check("T5 sigmoid bounds [0,1]", sig_pos <= 1.0 && sig_pos >= 0.99 && sig_neg >= 0.0 && sig_neg <= 0.01)
+
+// T6: ret_sigmoid(0) ~ 0.5
+check("T6 sigmoid(0) ~ 0.5", approx(ret_sigmoid(0.0), 0.5, 0.01))
+
+// T7: ret_exp(0) = 1.0
+check("T7 exp(0) = 1.0", approx(ret_exp(0.0), 1.0, 0.001))
+
+// T8: ret_swish(0) = 0
+check("T8 swish(0) = 0", approx(ret_swish(0.0), 0.0, 0.001))
+
+// T9: ret_swish positive for positive input
+// swish(2.0) = 2.0 * sigmoid(2.0) ~ 2.0 * 0.88 ~ 1.76
+let sw2 = ret_swish(2.0)
+check("T9 swish(2.0) > 0", sw2 > 1.5 && sw2 < 2.0)
+
+// T10: layer_norm mean ~ 0
+let ln = create_ret_layer_norm(DIM)
+let ln_input = [1.0, 3.0, 5.0, 2.0, 4.0, 6.0, 0.5, 3.5]
+let ln_out = ret_layer_norm_forward(ln, ln_input)
+let mut ln_mean = 0.0
+for i in 0..DIM { ln_mean = ln_mean + ln_out[i] }
+ln_mean = ln_mean / to_float(DIM)
+check("T10 layer_norm mean ~ 0", fabs(ln_mean) < 0.01)
+
+// T11: layer_norm std ~ 1
+let mut ln_var = 0.0
+for i in 0..DIM {
+    let dd = ln_out[i] - ln_mean
+    ln_var = ln_var + dd * dd
+}
+ln_var = ln_var / to_float(DIM)
+check("T11 layer_norm std ~ 1", fabs(ret_sqrt(ln_var) - 1.0) < 0.1)
+
+// T12: build_decay_matrix lower-triangular
+let dm = build_decay_matrix(4, 0.9)
+let mut is_lower = true
+for i in 0..4 {
+    for j in 0..4 {
+        if j > i && fabs(dm[i][j]) > 1.0e-10 { is_lower = false }
+    }
+}
+check("T12 decay_matrix lower-triangular", is_lower)
+
+// T13: build_decay_matrix diagonal = 1.0 (gamma^0 = 1)
+let mut diag_ok = true
+for i in 0..4 {
+    if fabs(dm[i][i] - 1.0) > 0.01 { diag_ok = false }
+}
+check("T13 decay_matrix diagonal = 1.0", diag_ok)
+
+// T14: build_decay_matrix gamma decay
+// D[2][0] = gamma^2, D[3][0] = gamma^3
+check("T14 decay_matrix gamma decay", approx(dm[2][0], 0.81, 0.02) && approx(dm[3][0], 0.729, 0.02))
+
+// T15: compute_gamma multi-scale in (0,1)
+let gammas = compute_gammas(4)
+let mut gammas_valid = true
+for h in 0..4 {
+    if gammas[h] <= 0.0 { gammas_valid = false }
+    if gammas[h] >= 1.0 { gammas_valid = false }
+}
+check("T15 compute_gamma in (0,1)", gammas_valid)
+
+// T16: compute_gamma strictly increasing
+let mut gammas_increasing = true
+for h in 1..4 {
+    if gammas[h] <= gammas[h - 1] { gammas_increasing = false }
+}
+check("T16 compute_gamma strictly increasing", gammas_increasing)
+
+// T17: retention_parallel output shape
+let rh = create_retention_head(HEAD_DIM, 0.9, SEED)
+let rh_input = [ret_init_vec(HEAD_DIM, 10), ret_init_vec(HEAD_DIM, 11), ret_init_vec(HEAD_DIM, 12)]
+let par_out = retention_parallel(rh, rh_input)
+check("T17 retention_parallel shape", len(par_out) == 3 && len(par_out[0]) == HEAD_DIM)
+
+// T18: retention_parallel causal (position 0 only depends on itself)
+// Changing position 2 should not change output at position 0
+let rh_input2 = [ret_init_vec(HEAD_DIM, 10), ret_init_vec(HEAD_DIM, 11), ret_init_vec(HEAD_DIM, 99)]
+let par_out2 = retention_parallel(rh, rh_input2)
+let mut causal_ok = true
+for i in 0..HEAD_DIM {
+    if fabs(par_out[0][i] - par_out2[0][i]) > 1.0e-10 { causal_ok = false }
+}
+check("T18 retention_parallel causal", causal_ok)
+
+// T19: retention_recurrent_step output dim
+let rec_x = ret_init_vec(HEAD_DIM, 20)
+let rec_state0 = ret_mat_zeros(HEAD_DIM, HEAD_DIM)
+let rec_res = retention_recurrent_step(rh, rec_x, rec_state0)
+check("T19 recurrent_step output dim", len(rec_res[0]) == HEAD_DIM)
+
+// T20: retention_recurrent_step state update non-zero
+let new_st = rec_res[1]
+let mut st_nonzero = false
+for i in 0..HEAD_DIM {
+    for j in 0..HEAD_DIM {
+        if fabs(new_st[i][j]) > 1.0e-10 { st_nonzero = true }
+    }
+}
+check("T20 recurrent_step state non-zero", st_nonzero)
+
+// T21: parallel vs recurrent equivalence
+// Both should produce the same outputs for same input
+let eq_input = [ret_init_vec(HEAD_DIM, 30), ret_init_vec(HEAD_DIM, 31), ret_init_vec(HEAD_DIM, 32)]
+let eq_par = retention_parallel(rh, eq_input)
+let eq_rec = retention_recurrent(rh, eq_input)
+let mut max_diff21 = 0.0
+for t in 0..3 {
+    for i in 0..HEAD_DIM {
+        let diff = fabs(eq_par[t][i] - eq_rec[t][i])
+        if diff > max_diff21 { max_diff21 = diff }
+    }
+}
+check("T21 parallel == recurrent (max_diff < 0.01)", max_diff21 < 0.01)
+
+// T22: chunkwise output shape
+let cw_input = [ret_init_vec(HEAD_DIM, 40), ret_init_vec(HEAD_DIM, 41), ret_init_vec(HEAD_DIM, 42), ret_init_vec(HEAD_DIM, 43)]
+let cw_out = retention_chunkwise(rh, cw_input, 2)
+check("T22 chunkwise shape", len(cw_out) == 4 && len(cw_out[0]) == HEAD_DIM)
+
+// T23: chunkwise vs recurrent closeness
+let cw_rec = retention_recurrent(rh, cw_input)
+let mut max_diff23 = 0.0
+for t in 0..4 {
+    for i in 0..HEAD_DIM {
+        let diff = fabs(cw_out[t][i] - cw_rec[t][i])
+        if diff > max_diff23 { max_diff23 = diff }
+    }
+}
+check("T23 chunkwise ~ recurrent (max_diff < 0.01)", max_diff23 < 0.01)
+
+// T24: multi-scale retention creation
+let msr = create_multi_scale_retention(DIM, N_HEADS, SEED)
+check("T24 MSR n_heads", msr.n_heads == N_HEADS && msr.head_dim == HEAD_DIM)
+
+// T25: msr_parallel output shape
+let msr_xs = [ret_init_vec(DIM, 50), ret_init_vec(DIM, 51), ret_init_vec(DIM, 52)]
+let msr_out = msr_parallel(msr, msr_xs)
+check("T25 msr_parallel shape", len(msr_out) == 3 && len(msr_out[0]) == DIM)
+
+// T26: msr_recurrent_step output dim
+let msr_states0 = []
+let mut msr_st_init = []
+for _h in 0..N_HEADS {
+    msr_st_init = msr_st_init + [ret_mat_zeros(HEAD_DIM, HEAD_DIM)]
+}
+let msr_rec_res = msr_recurrent_step(msr, ret_init_vec(DIM, 60), msr_st_init)
+check("T26 msr_recurrent_step dim", len(msr_rec_res[0]) == DIM)
+
+// T27: gated retention output bounded
+// Gate via swish should keep values reasonable
+let msr_out0 = msr_out[0]
+let mut msr_bounded = true
+for i in 0..DIM {
+    if fabs(msr_out0[i]) > 100.0 { msr_bounded = false }
+}
+check("T27 gated retention bounded", msr_bounded)
+
+// T28: retnet_block_parallel output shape
+let blk = create_retnet_block(DIM, N_HEADS, FF_DIM, SEED)
+let blk_xs = [ret_init_vec(DIM, 70), ret_init_vec(DIM, 71)]
+let blk_out = retnet_block_parallel(blk, blk_xs)
+check("T28 block_parallel shape", len(blk_out) == 2 && len(blk_out[0]) == DIM)
+
+// T29: retnet_block residual (non-zero output)
+let mut blk_nz = false
+for i in 0..DIM {
+    if fabs(blk_out[0][i]) > 1.0e-10 { blk_nz = true }
+}
+check("T29 block residual non-zero", blk_nz)
+
+// T30: retnet_stack creation
+let stack = create_retnet_stack(2, DIM, N_HEADS, FF_DIM, SEED)
+check("T30 stack creation", stack.n_layers == 2 && len(stack.blocks) == 2)
+
+// T31: retnet_stack_parallel output shape
+let stk_xs = ret_embed_seq([0, 1, 2, 3], DIM, EMB_SEED)
+let stk_par = retnet_stack_parallel(stack, stk_xs)
+check("T31 stack_parallel shape", len(stk_par) == 4 && len(stk_par[0]) == DIM)
+
+// T32: retnet_stack_recurrent output shape
+let stk_rec = retnet_stack_recurrent(stack, stk_xs)
+check("T32 stack_recurrent shape", len(stk_rec) == 4 && len(stk_rec[0]) == DIM)
+
+// T33: retnet_generate produces n_gen tokens
+let gen_tokens = retnet_generate(stack, [0, 1, 2], 5, VOCAB, EMB_SEED)
+check("T33 generate produces 5 tokens", len(gen_tokens) == 5)
+
+// T34: retnet_generate deterministic
+let gen_tokens2 = retnet_generate(stack, [0, 1, 2], 5, VOCAB, EMB_SEED)
+let mut gen_match = true
+for i in 0..5 {
+    if gen_tokens[i] != gen_tokens2[i] { gen_match = false }
+}
+check("T34 generate deterministic", gen_match)
+
+// T35: retnet_param_count > 0
+let pc = retnet_param_count(stack)
+check("T35 param_count > 0", pc > 0)
+
+// ===================================================================
+println("")
+println("=== RetNet test summary ===")
+println("PASS: " + str(pass_count))
+println("FAIL: " + str(fail_count))
+println("TOTAL: " + str(pass_count + fail_count))

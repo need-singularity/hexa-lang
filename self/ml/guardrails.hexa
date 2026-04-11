@@ -1,0 +1,646 @@
+// ===================================================================
+//  self/ml/guardrails.hexa — Guardrails: Input/Output Safety Filtering
+//
+//  Implements:
+//    1. Input filter      — check user input before model processing
+//    2. Output filter     — check model output before returning to user
+//    3. Keyword blocklist — configurable blocked words/phrases
+//    4. Regex patterns    — match against dangerous patterns
+//    5. Toxicity scorer   — score text toxicity via keyword density
+//    6. PII detector      — detect emails, phones, SSNs, credit cards, IPs
+//    7. Topic classifier  — classify text into allowed/blocked topics
+//    8. Guardrail chain   — compose multiple filters, short-circuit on violation
+//    9. Configuration     — enable/disable individual filters, set thresholds
+//
+//  API:
+//    gr_config(opts)                    -> config map
+//    gr_keyword_check(text, blocklist)  -> #{blocked, matched}
+//    gr_pattern_check(text, patterns)   -> #{blocked, matched}
+//    gr_toxicity_score(text, keywords)  -> float [0..1]
+//    gr_pii_detect(text)               -> #{found, types}
+//    gr_topic_classify(text, topics)    -> #{topic, blocked}
+//    gr_filter_input(text, config)      -> #{pass, reason, details}
+//    gr_filter_output(text, config)     -> #{pass, reason, details}
+//    gr_chain(text, filters)            -> #{pass, reason, stage}
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+//    @hot   — called per-request in serving pipeline
+// ===================================================================
+
+// ── helpers ─────────────────────────────────────────────────────
+
+@pure
+fn gr_to_lower(s) {
+    return s.to_lower()
+}
+
+@pure
+fn gr_max(a, b) {
+    if a > b { return a }
+    return b
+}
+
+@pure
+fn gr_min(a, b) {
+    if a < b { return a }
+    return b
+}
+
+// ===================================================================
+//  1. Configuration — enable/disable filters, set thresholds
+//
+//  Returns a config map with all filter settings.
+//  opts keys: keyword_enabled, pattern_enabled, toxicity_enabled,
+//             pii_enabled, topic_enabled, toxicity_threshold,
+//             blocklist, patterns, toxic_keywords, blocked_topics,
+//             allowed_topics, max_input_len, max_output_len
+// ===================================================================
+@pure
+fn gr_config(opts) {
+    let mut cfg = #{
+        "keyword_enabled": true,
+        "pattern_enabled": true,
+        "toxicity_enabled": true,
+        "pii_enabled": true,
+        "topic_enabled": true,
+        "toxicity_threshold": 0.3,
+        "blocklist": [],
+        "patterns": [],
+        "toxic_keywords": [],
+        "blocked_topics": [],
+        "allowed_topics": [],
+        "max_input_len": 8192,
+        "max_output_len": 16384
+    }
+    let ks = keys(opts)
+    for i in 0..len(ks) {
+        cfg[ks[i]] = opts[ks[i]]
+    }
+    return cfg
+}
+
+// Default config with sensible defaults
+@pure
+fn gr_default_config() {
+    return gr_config(#{
+        "blocklist": ["hack the system", "ignore instructions", "bypass safety"],
+        "patterns": ["ignore all previous", "you are now", "pretend you are", "act as if"],
+        "toxic_keywords": ["hate", "kill", "destroy", "attack", "violent", "abuse", "threat"],
+        "blocked_topics": ["weapons", "illegal", "exploit"],
+        "allowed_topics": ["science", "math", "coding", "general"]
+    })
+}
+
+// ===================================================================
+//  2. Keyword Blocklist — exact and substring matching
+//
+//  text: input string
+//  blocklist: array of blocked words/phrases
+//
+//  Returns: #{blocked: bool, matched: array of matched keywords}
+// ===================================================================
+@pure @hot
+fn gr_keyword_check(text, blocklist) {
+    let lower = gr_to_lower(text)
+    let mut matched = []
+    for i in 0..len(blocklist) {
+        let kw = gr_to_lower(blocklist[i])
+        if lower.contains(kw) {
+            matched = matched + [blocklist[i]]
+        }
+    }
+    let mut blocked = false
+    if len(matched) > 0 { blocked = true }
+    return #{"blocked": blocked, "matched": matched}
+}
+
+// Exact word match (splits on spaces, checks whole words)
+@pure
+fn gr_keyword_exact_check(text, blocklist) {
+    let lower = gr_to_lower(text)
+    let words = lower.split(" ")
+    let mut matched = []
+    for i in 0..len(blocklist) {
+        let kw = gr_to_lower(blocklist[i])
+        for j in 0..len(words) {
+            if words[j] == kw {
+                matched = matched + [blocklist[i]]
+                break
+            }
+        }
+    }
+    let mut blocked = false
+    if len(matched) > 0 { blocked = true }
+    return #{"blocked": blocked, "matched": matched}
+}
+
+// ===================================================================
+//  3. Regex-like Pattern Filter — substring pattern matching
+//
+//  Matches text against an array of dangerous patterns.
+//  Uses substring matching (case-insensitive).
+//
+//  Returns: #{blocked: bool, matched: array of matched patterns}
+// ===================================================================
+@pure @hot
+fn gr_pattern_check(text, patterns) {
+    let lower = gr_to_lower(text)
+    let mut matched = []
+    for i in 0..len(patterns) {
+        let pat = gr_to_lower(patterns[i])
+        if lower.contains(pat) {
+            matched = matched + [patterns[i]]
+        }
+    }
+    let mut blocked = false
+    if len(matched) > 0 { blocked = true }
+    return #{"blocked": blocked, "matched": matched}
+}
+
+// ===================================================================
+//  4. Toxicity Scorer — keyword density scoring
+//
+//  Scores text toxicity based on the density of toxic keywords.
+//  Score = (count of toxic keyword occurrences) / (total word count)
+//  Clamped to [0.0, 1.0].
+//
+//  Returns: float score in [0.0, 1.0]
+// ===================================================================
+@pure @hot
+fn gr_toxicity_score(text, toxic_keywords) {
+    let lower = gr_to_lower(text)
+    let words = lower.split(" ")
+    let total = len(words)
+    if total == 0 { return 0.0 }
+    let mut hits = 0
+    for i in 0..len(toxic_keywords) {
+        let kw = gr_to_lower(toxic_keywords[i])
+        for j in 0..total {
+            if words[j] == kw {
+                hits = hits + 1
+            }
+        }
+    }
+    let score = to_float(hits) / to_float(total)
+    if score > 1.0 { return 1.0 }
+    return score
+}
+
+// Extended toxicity scorer with substring matching
+@pure
+fn gr_toxicity_score_substr(text, toxic_keywords) {
+    let lower = gr_to_lower(text)
+    let words = lower.split(" ")
+    let total = len(words)
+    if total == 0 { return 0.0 }
+    let mut hits = 0
+    for i in 0..len(toxic_keywords) {
+        let kw = gr_to_lower(toxic_keywords[i])
+        if lower.contains(kw) {
+            hits = hits + 1
+        }
+    }
+    let score = to_float(hits) / to_float(total)
+    if score > 1.0 { return 1.0 }
+    return score
+}
+
+// ===================================================================
+//  5. PII Detector — detect personal identifiable information
+//
+//  Detects: emails, phone numbers, SSNs, credit cards, IP addresses.
+//  Uses character-level pattern matching (no regex engine needed).
+//
+//  Returns: #{found: bool, types: array of detected PII types,
+//            count: int}
+// ===================================================================
+
+// Helper: check if char is a digit
+@pure
+fn gr_is_digit(c) {
+    let code = to_int(c)
+    // '0' = 48, '9' = 57
+    if code >= 48 {
+        if code <= 57 { return true }
+    }
+    return false
+}
+
+// Helper: check if char is alphanumeric or in allowed set
+@pure
+fn gr_is_alnum(c) {
+    let code = to_int(c)
+    // '0'-'9' = 48-57, 'A'-'Z' = 65-90, 'a'-'z' = 97-122
+    if code >= 48 {
+        if code <= 57 { return true }
+    }
+    if code >= 65 {
+        if code <= 90 { return true }
+    }
+    if code >= 97 {
+        if code <= 122 { return true }
+    }
+    return false
+}
+
+// Helper: check char code
+@pure
+fn gr_char_code(c) { return to_int(c) }
+
+// Detect email pattern: word@word.word
+// Uses char codes: @ = 64, . = 46
+@pure
+fn gr_detect_email(text) {
+    if !text.contains("@") { return false }
+    if !text.contains(".") { return false }
+    let at_pos = text.index_of("@")
+    if at_pos < 1 { return false }
+    // check char before @ is alnum
+    let chars = text.chars()
+    let n = len(chars)
+    if !gr_is_alnum(chars[at_pos - 1]) { return false }
+    // look for dot after @ (at least 2 chars after @)
+    let after_at = text.substring(at_pos + 1, n)
+    if !after_at.contains(".") { return false }
+    let dot_pos = after_at.index_of(".")
+    if dot_pos < 1 { return false }
+    // check there's text after the dot
+    if dot_pos + 1 >= len(after_at) { return false }
+    let after_dot_chars = after_at.chars()
+    if gr_is_alnum(after_dot_chars[dot_pos + 1]) { return true }
+    return false
+}
+
+// Detect phone numbers: sequences of 10+ digits (with optional dashes/spaces)
+// Uses char codes: '-' = 45, ' ' = 32, '(' = 40, ')' = 41, '+' = 43
+@pure
+fn gr_detect_phone(text) {
+    let chars = text.chars()
+    let n = len(chars)
+    let mut digit_count = 0
+    for i in 0..n {
+        let code = to_int(chars[i])
+        if gr_is_digit(chars[i]) {
+            digit_count = digit_count + 1
+        } else {
+            // skip phone-related separators: - space ( ) +
+            if code == 45 { /* dash - skip */ }
+            else {
+                if code == 32 { /* space - skip */ }
+                else {
+                    if code == 40 { /* ( - skip */ }
+                    else {
+                        if code == 41 { /* ) - skip */ }
+                        else {
+                            if code == 43 { /* + - skip */ }
+                            else {
+                                if digit_count >= 10 { return true }
+                                digit_count = 0
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if digit_count >= 10 { return true }
+    return false
+}
+
+// Detect SSN: ###-##-#### pattern
+// Uses char code: '-' = 45
+@pure
+fn gr_detect_ssn(text) {
+    let chars = text.chars()
+    let n = len(chars)
+    if n < 11 { return false }
+    for i in 0..(n - 10) {
+        let mut ok = true
+        // first 3 digits
+        if !gr_is_digit(chars[i]) { ok = false }
+        if ok { if !gr_is_digit(chars[i + 1]) { ok = false } }
+        if ok { if !gr_is_digit(chars[i + 2]) { ok = false } }
+        // dash (code 45)
+        if ok { if to_int(chars[i + 3]) != 45 { ok = false } }
+        // 2 digits
+        if ok { if !gr_is_digit(chars[i + 4]) { ok = false } }
+        if ok { if !gr_is_digit(chars[i + 5]) { ok = false } }
+        // dash (code 45)
+        if ok { if to_int(chars[i + 6]) != 45 { ok = false } }
+        // 4 digits
+        if ok { if !gr_is_digit(chars[i + 7]) { ok = false } }
+        if ok { if !gr_is_digit(chars[i + 8]) { ok = false } }
+        if ok { if !gr_is_digit(chars[i + 9]) { ok = false } }
+        if ok { if !gr_is_digit(chars[i + 10]) { ok = false } }
+        if ok { return true }
+    }
+    return false
+}
+
+// Detect credit card: 4 groups of 4 digits (separated by spaces or dashes)
+@pure
+fn gr_detect_credit_card(text) {
+    let chars = text.chars()
+    let n = len(chars)
+    if n < 15 { return false }
+    // count consecutive digit sequences
+    let mut digit_runs = []
+    let mut run_len = 0
+    for i in 0..n {
+        if gr_is_digit(chars[i]) {
+            run_len = run_len + 1
+        } else {
+            if run_len > 0 {
+                digit_runs = digit_runs + [run_len]
+                run_len = 0
+            }
+        }
+    }
+    if run_len > 0 { digit_runs = digit_runs + [run_len] }
+    // Check for 16 consecutive digits (no separator)
+    for i in 0..len(digit_runs) {
+        if digit_runs[i] >= 16 { return true }
+    }
+    // Check for 4-4-4-4 pattern
+    if len(digit_runs) >= 4 {
+        for i in 0..(len(digit_runs) - 3) {
+            if digit_runs[i] == 4 {
+                if digit_runs[i + 1] == 4 {
+                    if digit_runs[i + 2] == 4 {
+                        if digit_runs[i + 3] == 4 {
+                            return true
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return false
+}
+
+// Detect IP addresses: ###.###.###.### where each octet is 0-255
+@pure
+fn gr_detect_ip(text) {
+    let parts = text.split(" ")
+    for i in 0..len(parts) {
+        let candidate = parts[i]
+        let octets = candidate.split(".")
+        if len(octets) == 4 {
+            let mut valid = true
+            for j in 0..4 {
+                let oct = octets[j]
+                if len(oct) == 0 { valid = false }
+                if valid {
+                    if len(oct) > 3 { valid = false }
+                }
+                if valid {
+                    let chars_o = oct.chars()
+                    for k in 0..len(chars_o) {
+                        if !gr_is_digit(chars_o[k]) { valid = false }
+                    }
+                }
+                if valid {
+                    if len(oct) > 0 {
+                        let val = to_int(oct)
+                        if val < 0 { valid = false }
+                        if val > 255 { valid = false }
+                    }
+                }
+            }
+            if valid { return true }
+        }
+    }
+    return false
+}
+
+// Combined PII detector
+@pure @hot
+fn gr_pii_detect(text) {
+    let mut types_found = []
+    let mut count = 0
+    if gr_detect_email(text) {
+        types_found = types_found + ["email"]
+        count = count + 1
+    }
+    if gr_detect_phone(text) {
+        types_found = types_found + ["phone"]
+        count = count + 1
+    }
+    if gr_detect_ssn(text) {
+        types_found = types_found + ["ssn"]
+        count = count + 1
+    }
+    if gr_detect_credit_card(text) {
+        types_found = types_found + ["credit_card"]
+        count = count + 1
+    }
+    if gr_detect_ip(text) {
+        types_found = types_found + ["ip_address"]
+        count = count + 1
+    }
+    let mut found = false
+    if count > 0 { found = true }
+    return #{"found": found, "types": types_found, "count": count}
+}
+
+// ===================================================================
+//  6. Topic Classifier — classify text into allowed/blocked topics
+//
+//  Each topic is #{name, keywords} where keywords is an array.
+//  Scores each topic by keyword frequency, returns best match.
+//
+//  Returns: #{topic: string, score: float, blocked: bool}
+// ===================================================================
+@pure @hot
+fn gr_topic_classify(text, topics, blocked_topics) {
+    let lower = gr_to_lower(text)
+    let words = lower.split(" ")
+    let total = len(words)
+    if total == 0 {
+        return #{"topic": "unknown", "score": 0.0, "blocked": false}
+    }
+    let mut best_topic = "unknown"
+    let mut best_score = 0.0
+    for i in 0..len(topics) {
+        let t = topics[i]
+        let mut hits = 0
+        for j in 0..len(t.keywords) {
+            let kw = gr_to_lower(t.keywords[j])
+            if lower.contains(kw) {
+                hits = hits + 1
+            }
+        }
+        let score = to_float(hits) / to_float(total)
+        if score > best_score {
+            best_score = score
+            best_topic = t.name
+        }
+    }
+    // check if best topic is blocked
+    let mut blocked = false
+    for i in 0..len(blocked_topics) {
+        if gr_to_lower(blocked_topics[i]) == gr_to_lower(best_topic) {
+            blocked = true
+        }
+    }
+    return #{"topic": best_topic, "score": best_score, "blocked": blocked}
+}
+
+// ===================================================================
+//  7. Input Filter — full input check pipeline
+//
+//  Runs all enabled checks against input text.
+//
+//  Returns: #{pass: bool, reason: string, details: map}
+// ===================================================================
+@hot
+fn gr_filter_input(text, config) {
+    // Length check
+    if len(text) > config["max_input_len"] {
+        return #{"pass": false, "reason": "input_too_long", "details": #{}}
+    }
+    // Keyword blocklist
+    if config["keyword_enabled"] {
+        let kw_result = gr_keyword_check(text, config["blocklist"])
+        if kw_result["blocked"] {
+            return #{"pass": false, "reason": "keyword_blocked", "details": kw_result}
+        }
+    }
+    // Pattern check (injection attempts)
+    if config["pattern_enabled"] {
+        let pat_result = gr_pattern_check(text, config["patterns"])
+        if pat_result["blocked"] {
+            return #{"pass": false, "reason": "pattern_blocked", "details": pat_result}
+        }
+    }
+    // Toxicity check
+    if config["toxicity_enabled"] {
+        let tox = gr_toxicity_score(text, config["toxic_keywords"])
+        if tox >= config["toxicity_threshold"] {
+            return #{"pass": false, "reason": "toxic_content", "details": #{"score": tox}}
+        }
+    }
+    // PII check
+    if config["pii_enabled"] {
+        let pii = gr_pii_detect(text)
+        if pii["found"] {
+            return #{"pass": false, "reason": "pii_detected", "details": pii}
+        }
+    }
+    return #{"pass": true, "reason": "ok", "details": #{}}
+}
+
+// ===================================================================
+//  8. Output Filter — full output check pipeline
+//
+//  Runs all enabled checks against model output.
+//
+//  Returns: #{pass: bool, reason: string, details: map}
+// ===================================================================
+@hot
+fn gr_filter_output(text, config) {
+    // Length check
+    if len(text) > config["max_output_len"] {
+        return #{"pass": false, "reason": "output_too_long", "details": #{}}
+    }
+    // Keyword blocklist (output can also contain blocked content)
+    if config["keyword_enabled"] {
+        let kw_result = gr_keyword_check(text, config["blocklist"])
+        if kw_result["blocked"] {
+            return #{"pass": false, "reason": "keyword_blocked", "details": kw_result}
+        }
+    }
+    // Toxicity check
+    if config["toxicity_enabled"] {
+        let tox = gr_toxicity_score(text, config["toxic_keywords"])
+        if tox >= config["toxicity_threshold"] {
+            return #{"pass": false, "reason": "toxic_content", "details": #{"score": tox}}
+        }
+    }
+    // PII check (prevent leaking PII in output)
+    if config["pii_enabled"] {
+        let pii = gr_pii_detect(text)
+        if pii["found"] {
+            return #{"pass": false, "reason": "pii_detected", "details": pii}
+        }
+    }
+    return #{"pass": true, "reason": "ok", "details": #{}}
+}
+
+// ===================================================================
+//  9. Guardrail Chain — compose multiple filters with short-circuit
+//
+//  Each filter is #{name: string, fn_type: string, ...params}.
+//  fn_type: "keyword" | "pattern" | "toxicity" | "pii" | "topic"
+//
+//  Short-circuits on first violation.
+//
+//  Returns: #{pass: bool, reason: string, stage: string}
+// ===================================================================
+@hot
+fn gr_chain(text, filters) {
+    for i in 0..len(filters) {
+        let f = filters[i]
+        let stage_name = f["name"]
+        let ftype = f["type"]
+        if ftype == "keyword" {
+            let res = gr_keyword_check(text, f["blocklist"])
+            if res["blocked"] {
+                return #{"pass": false, "reason": "keyword_blocked", "stage": stage_name}
+            }
+        }
+        if ftype == "pattern" {
+            let res = gr_pattern_check(text, f["patterns"])
+            if res["blocked"] {
+                return #{"pass": false, "reason": "pattern_blocked", "stage": stage_name}
+            }
+        }
+        if ftype == "toxicity" {
+            let score = gr_toxicity_score(text, f["keywords"])
+            if score >= f["threshold"] {
+                return #{"pass": false, "reason": "toxic_content", "stage": stage_name}
+            }
+        }
+        if ftype == "pii" {
+            let pii = gr_pii_detect(text)
+            if pii["found"] {
+                return #{"pass": false, "reason": "pii_detected", "stage": stage_name}
+            }
+        }
+        if ftype == "topic" {
+            let tc = gr_topic_classify(text, f["topics"], f["blocked_topics"])
+            if tc["blocked"] {
+                return #{"pass": false, "reason": "topic_blocked", "stage": stage_name}
+            }
+        }
+    }
+    return #{"pass": true, "reason": "ok", "stage": "all_passed"}
+}
+
+// ===================================================================
+//  PII redaction — mask detected PII
+//
+//  Returns text with PII types replaced by placeholders.
+// ===================================================================
+@pure
+fn gr_redact_email(text) {
+    // Simple: replace @ with [at], mask username portion
+    if !gr_detect_email(text) { return text }
+    return text.replace("@", "[REDACTED-EMAIL]@")
+}
+
+@pure
+fn gr_pii_summary(text) {
+    let pii = gr_pii_detect(text)
+    if !pii["found"] { return "No PII detected" }
+    let types = pii["types"]
+    let mut summary = "PII found: "
+    for i in 0..len(types) {
+        if i > 0 { summary = summary + ", " }
+        summary = summary + types[i]
+    }
+    return summary
+}
+
+println("[guardrails] loaded — input/output filter + keyword blocklist + pattern match + toxicity + PII + topic + chain")

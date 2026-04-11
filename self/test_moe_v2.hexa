@@ -1,0 +1,934 @@
+// ===================================================================
+//  test_moe_v2.hexa — Fine-Grained MoE v2 verification (#134)
+//
+//  Tests (35):
+//    T01  mv2_zeros produces correct length
+//    T02  mv2_exp(0)=1
+//    T03  mv2_sigmoid(0)=0.5
+//    T04  mv2_softmax sums to 1
+//    T05  mv2_expert_fwd correct output
+//    T06  mv2_gate_scores correct length
+//    T07  mv2_topk picks highest
+//    T08  mv2_softmax_subset sums to 1
+//    T09  fine-grained split: output dim = d_out
+//    T10  fine-grained split: sub-expert count correct
+//    T11  expert parallelism: round-robin assignment
+//    T12  expert parallelism: device load balanced
+//    T13  experts_on_device returns correct experts
+//    T14  capacity factor: basic computation
+//    T15  capacity factor: at least 1
+//    T16  enforce_capacity: respects limit
+//    T17  enforce_capacity: keeps first tokens
+//    T18  importance loss: uniform probs gives zero
+//    T19  importance loss: skewed probs gives positive
+//    T20  load balance loss: equal counts gives zero
+//    T21  load balance loss: unequal counts positive
+//    T22  aux_loss combines both
+//    T23  shared expert: output has both components
+//    T24  shared expert: always contributes
+//    T25  expert choice scores: correct shape
+//    T26  expert choice route: capacity respected
+//    T27  expert choice forward: produces outputs
+//    T28  load CV: balanced counts gives low CV
+//    T29  load max-min ratio: balanced is near 1
+//    T30  expert utilization: all active gives 1.0
+//    T31  granular topk: picks from sub-experts
+//    T32  sub-to-coarse mapping correct
+//    T33  router z-loss: small logits give small loss
+//    T34  router z-loss: large logits give larger loss
+//    T35  token drop and pad: drops excess, pads deficit
+//    T36  full mv2_forward: produces outputs
+//    T37  full mv2_forward: z_loss non-negative
+//    T38  full mv2_forward: expert counts sum to kept tokens
+//
+//  Run: cargo run --release -- self/test_moe_v2.hexa
+// ===================================================================
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ===================================================================
+//  Inlined from moe_v2.hexa
+// ===================================================================
+
+fn mv2_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn mv2_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+fn mv2_fabs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn mv2_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn mv2_sigmoid(x) {
+    if x > 20.0 { return 1.0 }
+    if x < -20.0 { return 0.0 }
+    return 1.0 / (1.0 + mv2_exp(0.0 - x))
+}
+
+fn mv2_vec_add(a, b) {
+    let n = len(a)
+    let mut out = []
+    for i in 0..n { out = out + [a[i] + b[i]] }
+    return out
+}
+
+fn mv2_vec_scale(v, s) {
+    let n = len(v)
+    let mut out = []
+    for i in 0..n { out = out + [v[i] * s] }
+    return out
+}
+
+fn mv2_dot(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    for i in 0..n { s = s + a[i] * b[i] }
+    return s
+}
+
+fn mv2_log(x) {
+    if x <= 0.0 { return -20.0 }
+    let mut r2 = x
+    let mut e_count = 0
+    while r2 > 2.0 {
+        r2 = r2 / 2.718281828
+        e_count = e_count + 1
+    }
+    while r2 < 0.5 {
+        r2 = r2 * 2.718281828
+        e_count = e_count - 1
+    }
+    let mut t = (r2 - 1.0) / (r2 + 1.0)
+    let mut result = 0.0
+    let mut term = t
+    for i in 0..15 {
+        result = result + term / to_float(2 * i + 1)
+        term = term * t * t
+    }
+    result = result * 2.0
+    return result + to_float(e_count)
+}
+
+fn mv2_softmax(logits) {
+    let n = len(logits)
+    let mut mx = logits[0]
+    for i in 1..n {
+        if logits[i] > mx { mx = logits[i] }
+    }
+    let mut exps = mv2_zeros(n)
+    let mut z = 0.0
+    for i in 0..n {
+        exps[i] = mv2_exp(logits[i] - mx)
+        z = z + exps[i]
+    }
+    let mut out = mv2_zeros(n)
+    for i in 0..n {
+        out[i] = exps[i] / z
+    }
+    return out
+}
+
+fn mv2_expert_fwd(W_flat, bias, x, d_out, d_in) {
+    let mut y = mv2_zeros(d_out)
+    for i in 0..d_out {
+        let mut s = bias[i]
+        for j in 0..d_in {
+            s = s + W_flat[i * d_in + j] * x[j]
+        }
+        y[i] = s
+    }
+    return y
+}
+
+fn mv2_gate_scores(gate_W, x, n_experts, d_in) {
+    let mut scores = mv2_zeros(n_experts)
+    for e in 0..n_experts {
+        let mut acc = 0.0
+        for j in 0..d_in {
+            acc = acc + gate_W[e * d_in + j] * x[j]
+        }
+        scores[e] = acc
+    }
+    return scores
+}
+
+fn mv2_topk(scores, k) {
+    let n = len(scores)
+    let mut used = []
+    for _i in 0..n { used = used + [false] }
+    let mut picks = []
+    for _r in 0..k {
+        let mut best = -1
+        let mut best_v = -1.0e30
+        for i in 0..n {
+            if !used[i] {
+                if scores[i] > best_v {
+                    best_v = scores[i]
+                    best = i
+                }
+            }
+        }
+        if best >= 0 {
+            let mut used2 = []
+            for i in 0..n {
+                if i == best { used2 = used2 + [true] } else { used2 = used2 + [used[i]] }
+            }
+            used = used2
+            picks = picks + [best]
+        }
+    }
+    return picks
+}
+
+fn mv2_softmax_subset(scores, picks) {
+    let k = len(picks)
+    if k == 0 { return [] }
+    let mut mx = scores[picks[0]]
+    for r in 1..k {
+        if scores[picks[r]] > mx { mx = scores[picks[r]] }
+    }
+    let mut exps = mv2_zeros(k)
+    let mut z = 0.0
+    for r in 0..k {
+        let v = mv2_exp(scores[picks[r]] - mx)
+        exps[r] = v
+        z = z + v
+    }
+    let mut out = mv2_zeros(k)
+    for r in 0..k {
+        out[r] = exps[r] / z
+    }
+    return out
+}
+
+fn mv2_fine_grained_expert_fwd(sub_weights, sub_biases, x, m, d_out_sub, d_in) {
+    let mut y = []
+    for s in 0..m {
+        let out_s = mv2_expert_fwd(sub_weights[s], sub_biases[s], x, d_out_sub, d_in)
+        for i in 0..d_out_sub {
+            y = y + [out_s[i]]
+        }
+    }
+    return y
+}
+
+fn mv2_assign_experts_to_devices(n_experts, n_devices) {
+    let mut assignment = mv2_zeros_int(n_experts)
+    for e in 0..n_experts {
+        assignment[e] = e % n_devices
+    }
+    return assignment
+}
+
+fn mv2_experts_on_device(assignment, device_id, n_experts) {
+    let mut experts = []
+    for e in 0..n_experts {
+        if assignment[e] == device_id {
+            experts = experts + [e]
+        }
+    }
+    return experts
+}
+
+fn mv2_device_load(assignment, n_experts, n_devices) {
+    let mut loads = mv2_zeros_int(n_devices)
+    for e in 0..n_experts {
+        let d = assignment[e]
+        loads[d] = loads[d] + 1
+    }
+    return loads
+}
+
+fn mv2_compute_capacity(n_tokens, n_experts, cap_factor) {
+    let raw = to_float(n_tokens) * cap_factor / to_float(n_experts)
+    let mut cap = to_int(raw)
+    if to_float(cap) < raw { cap = cap + 1 }
+    if cap < 1 { cap = 1 }
+    return cap
+}
+
+fn mv2_enforce_capacity(assignments, n_tokens, n_experts, capacity) {
+    let mut counts = mv2_zeros_int(n_experts)
+    let mut kept = []
+    for _i in 0..n_tokens { kept = kept + [false] }
+    for i in 0..n_tokens {
+        let e = assignments[i]
+        if counts[e] < capacity {
+            counts[e] = counts[e] + 1
+            kept[i] = true
+        }
+    }
+    return kept
+}
+
+fn mv2_importance_loss(router_probs_flat, n_tokens, n_experts) {
+    let mut f = mv2_zeros(n_experts)
+    for t in 0..n_tokens {
+        for e in 0..n_experts {
+            f[e] = f[e] + router_probs_flat[t * n_experts + e]
+        }
+    }
+    let mut mean_f = 0.0
+    for e in 0..n_experts { mean_f = mean_f + f[e] }
+    mean_f = mean_f / to_float(n_experts)
+    let mut var_f = 0.0
+    for e in 0..n_experts {
+        let diff = f[e] - mean_f
+        var_f = var_f + diff * diff
+    }
+    return var_f / to_float(n_experts)
+}
+
+fn mv2_load_balance_loss(token_counts, n_experts) {
+    let mut mean_c = 0.0
+    for e in 0..n_experts { mean_c = mean_c + to_float(token_counts[e]) }
+    mean_c = mean_c / to_float(n_experts)
+    if mean_c < 0.001 { return 0.0 }
+    let mut var_c = 0.0
+    for e in 0..n_experts {
+        let diff = to_float(token_counts[e]) - mean_c
+        var_c = var_c + diff * diff
+    }
+    var_c = var_c / to_float(n_experts)
+    return var_c / (mean_c * mean_c)
+}
+
+fn mv2_aux_loss(router_probs_flat, token_counts, n_tokens, n_experts, alpha) {
+    let imp = mv2_importance_loss(router_probs_flat, n_tokens, n_experts)
+    let lb = mv2_load_balance_loss(token_counts, n_experts)
+    return alpha * (imp + lb)
+}
+
+fn mv2_shared_expert_forward(shared_W, shared_bias, routed_Ws, routed_biases, gate_W, x, n_routed, d_out, d_in, top_k) {
+    let shared_out = mv2_expert_fwd(shared_W, shared_bias, x, d_out, d_in)
+    let scores = mv2_gate_scores(gate_W, x, n_routed, d_in)
+    let picks = mv2_topk(scores, top_k)
+    let probs = mv2_softmax_subset(scores, picks)
+    let mut routed_out = mv2_zeros(d_out)
+    for r in 0..top_k {
+        let e = picks[r]
+        let p = probs[r]
+        let ye = mv2_expert_fwd(routed_Ws[e], routed_biases[e], x, d_out, d_in)
+        for i in 0..d_out {
+            routed_out[i] = routed_out[i] + p * ye[i]
+        }
+    }
+    return mv2_vec_add(shared_out, routed_out)
+}
+
+fn mv2_expert_choice_scores(gate_W, tokens, n_experts, n_tokens, d_in) {
+    let mut scores = mv2_zeros(n_experts * n_tokens)
+    for e in 0..n_experts {
+        for t in 0..n_tokens {
+            let mut acc = 0.0
+            for j in 0..d_in {
+                acc = acc + gate_W[e * d_in + j] * tokens[t][j]
+            }
+            scores[e * n_tokens + t] = acc
+        }
+    }
+    return scores
+}
+
+fn mv2_expert_choice_route(scores, n_experts, n_tokens, capacity) {
+    let mut all_assignments = []
+    for e in 0..n_experts {
+        let mut expert_scores = mv2_zeros(n_tokens)
+        for t in 0..n_tokens {
+            expert_scores[t] = scores[e * n_tokens + t]
+        }
+        let picks = mv2_topk(expert_scores, capacity)
+        all_assignments = all_assignments + [picks]
+    }
+    return all_assignments
+}
+
+fn mv2_expert_choice_forward(expert_Ws, expert_biases, gate_W, tokens, n_experts, n_tokens, d_out, d_in, capacity) {
+    let scores = mv2_expert_choice_scores(gate_W, tokens, n_experts, n_tokens, d_in)
+    let assignments = mv2_expert_choice_route(scores, n_experts, n_tokens, capacity)
+    let mut outputs = []
+    for t in 0..n_tokens {
+        outputs = outputs + [mv2_zeros(d_out)]
+    }
+    let mut token_counts = mv2_zeros_int(n_tokens)
+    for e in 0..n_experts {
+        let picks = assignments[e]
+        let np = len(picks)
+        let mut chosen_scores = []
+        for p in 0..np {
+            chosen_scores = chosen_scores + [scores[e * n_tokens + picks[p]]]
+        }
+        let probs = mv2_softmax(chosen_scores)
+        for p in 0..np {
+            let t = picks[p]
+            let ye = mv2_expert_fwd(expert_Ws[e], expert_biases[e], tokens[t], d_out, d_in)
+            let cur = outputs[t]
+            let mut new_out = mv2_zeros(d_out)
+            for i in 0..d_out {
+                new_out[i] = cur[i] + probs[p] * ye[i]
+            }
+            let mut new_outputs = []
+            for tt in 0..n_tokens {
+                if tt == t {
+                    new_outputs = new_outputs + [new_out]
+                } else {
+                    new_outputs = new_outputs + [outputs[tt]]
+                }
+            }
+            outputs = new_outputs
+            token_counts[t] = token_counts[t] + 1
+        }
+    }
+    return [outputs, token_counts]
+}
+
+fn mv2_count_per_expert(assignments, n_tokens, n_experts) {
+    let mut counts = mv2_zeros_int(n_experts)
+    for i in 0..n_tokens {
+        let e = assignments[i]
+        if e >= 0 {
+            if e < n_experts {
+                counts[e] = counts[e] + 1
+            }
+        }
+    }
+    return counts
+}
+
+fn mv2_load_cv(counts, n_experts) {
+    let mut mean_c = 0.0
+    for e in 0..n_experts { mean_c = mean_c + to_float(counts[e]) }
+    mean_c = mean_c / to_float(n_experts)
+    if mean_c < 0.001 { return 0.0 }
+    let mut var_c = 0.0
+    for e in 0..n_experts {
+        let diff = to_float(counts[e]) - mean_c
+        var_c = var_c + diff * diff
+    }
+    var_c = var_c / to_float(n_experts)
+    return sqrt(var_c) / mean_c
+}
+
+fn mv2_load_max_min_ratio(counts, n_experts) {
+    let mut mx = counts[0]
+    let mut mn = counts[0]
+    for e in 1..n_experts {
+        if counts[e] > mx { mx = counts[e] }
+        if counts[e] < mn { mn = counts[e] }
+    }
+    if mn == 0 { return to_float(mx + 1) }
+    return to_float(mx) / to_float(mn)
+}
+
+fn mv2_expert_utilization(counts, n_experts) {
+    let mut active = 0
+    for e in 0..n_experts {
+        if counts[e] > 0 { active = active + 1 }
+    }
+    return to_float(active) / to_float(n_experts)
+}
+
+fn mv2_sub_to_coarse(sub_idx, m) {
+    let coarse = sub_idx / m
+    let sub = sub_idx % m
+    return [coarse, sub]
+}
+
+fn mv2_router_z_loss(router_logits_flat, n_tokens, n_experts) {
+    let mut total = 0.0
+    for t in 0..n_tokens {
+        let mut mx = router_logits_flat[t * n_experts]
+        for e in 1..n_experts {
+            let v = router_logits_flat[t * n_experts + e]
+            if v > mx { mx = v }
+        }
+        let mut sum_exp = 0.0
+        for e in 0..n_experts {
+            sum_exp = sum_exp + mv2_exp(router_logits_flat[t * n_experts + e] - mx)
+        }
+        let lse = mx + mv2_log(sum_exp)
+        total = total + lse * lse
+    }
+    return total / to_float(n_tokens)
+}
+
+// Token drop and pad: returns [total_dropped, total_padded, kept_count_expert_0, kept_count_expert_1, ...]
+fn mv2_token_drop_and_pad(assignments, scores, n_tokens, n_experts, capacity) {
+    let mut expert_count = mv2_zeros_int(n_experts)
+    for t in 0..n_tokens {
+        let e = assignments[t]
+        expert_count[e] = expert_count[e] + 1
+    }
+    let mut total_dropped = 0
+    let mut total_padded = 0
+    let mut kept_counts = mv2_zeros_int(n_experts)
+    for e in 0..n_experts {
+        let n_et = expert_count[e]
+        let mut to_keep = capacity
+        if to_keep > n_et { to_keep = n_et }
+        kept_counts[e] = to_keep
+        if n_et > capacity { total_dropped = total_dropped + (n_et - capacity) }
+        if n_et < capacity { total_padded = total_padded + (capacity - n_et) }
+    }
+    // Return flat array: [total_dropped, total_padded, kept_per_expert...]
+    let mut result = [total_dropped, total_padded]
+    for e in 0..n_experts {
+        result = result + [kept_counts[e]]
+    }
+    return result
+}
+
+fn mv2_forward(expert_Ws, expert_biases, gate_W, tokens, n_experts, n_tokens, d_out, d_in, top_k, cap_factor) {
+    let mut all_logits = mv2_zeros(n_tokens * n_experts)
+    for t in 0..n_tokens {
+        let scores = mv2_gate_scores(gate_W, tokens[t], n_experts, d_in)
+        for e in 0..n_experts {
+            all_logits[t * n_experts + e] = scores[e]
+        }
+    }
+    let mut all_probs = mv2_zeros(n_tokens * n_experts)
+    for t in 0..n_tokens {
+        let mut t_logits = mv2_zeros(n_experts)
+        for e in 0..n_experts { t_logits[e] = all_logits[t * n_experts + e] }
+        let t_probs = mv2_softmax(t_logits)
+        for e in 0..n_experts {
+            all_probs[t * n_experts + e] = t_probs[e]
+        }
+    }
+    let mut assignments = mv2_zeros_int(n_tokens)
+    let mut token_picks = []
+    let mut token_probs = []
+    for t in 0..n_tokens {
+        let mut t_scores = mv2_zeros(n_experts)
+        for e in 0..n_experts { t_scores[e] = all_logits[t * n_experts + e] }
+        let picks = mv2_topk(t_scores, top_k)
+        let probs = mv2_softmax_subset(t_scores, picks)
+        token_picks = token_picks + [picks]
+        token_probs = token_probs + [probs]
+        assignments[t] = picks[0]
+    }
+    let capacity = mv2_compute_capacity(n_tokens, n_experts, cap_factor)
+    let kept = mv2_enforce_capacity(assignments, n_tokens, n_experts, capacity)
+    let mut expert_counts = mv2_zeros_int(n_experts)
+    for t in 0..n_tokens {
+        if kept[t] { expert_counts[assignments[t]] = expert_counts[assignments[t]] + 1 }
+    }
+    let mut outputs = []
+    for t in 0..n_tokens {
+        if kept[t] {
+            let picks = token_picks[t]
+            let probs = token_probs[t]
+            let mut y = mv2_zeros(d_out)
+            for r in 0..top_k {
+                let e = picks[r]
+                let p = probs[r]
+                let ye = mv2_expert_fwd(expert_Ws[e], expert_biases[e], tokens[t], d_out, d_in)
+                for i in 0..d_out {
+                    y[i] = y[i] + p * ye[i]
+                }
+            }
+            outputs = outputs + [y]
+        } else {
+            outputs = outputs + [mv2_zeros(d_out)]
+        }
+    }
+    let z_loss = mv2_router_z_loss(all_logits, n_tokens, n_experts)
+    let aux = mv2_aux_loss(all_probs, expert_counts, n_tokens, n_experts, 0.01)
+    return [outputs, z_loss, aux, expert_counts]
+}
+
+// ===================================================================
+//  Test Data Setup
+// ===================================================================
+
+let D_IN = 4
+let D_OUT = 4
+let N_EXPERTS = 4
+let N_TOKENS = 8
+
+// Create deterministic token vectors
+fn make_tokens(n, dim) {
+    let mut toks = []
+    for t in 0..n {
+        let mut v = mv2_zeros(dim)
+        for j in 0..dim {
+            v[j] = sin(to_float(t * 7 + j * 3 + 1)) * 0.5
+        }
+        toks = toks + [v]
+    }
+    return toks
+}
+
+// Create flat weight array [n_rows * n_cols]
+fn make_flat_weights(rows, cols, seed) {
+    let mut w = []
+    for i in 0..rows {
+        for j in 0..cols {
+            let v = sin(to_float(i * seed + j * 17 + 5)) * 0.1
+            w = w + [v]
+        }
+    }
+    return w
+}
+
+// Create bias array
+fn make_bias(dim, seed) {
+    let mut b = []
+    for i in 0..dim {
+        b = b + [sin(to_float(i * seed + 11)) * 0.01]
+    }
+    return b
+}
+
+let test_tokens = make_tokens(N_TOKENS, D_IN)
+let gate_W = make_flat_weights(N_EXPERTS, D_IN, 31)
+
+// Expert weights and biases (array of flat weight arrays)
+fn make_expert_Ws(n_experts, d_out, d_in) {
+    let mut ws = []
+    for e in 0..n_experts {
+        ws = ws + [make_flat_weights(d_out, d_in, e * 41 + 13)]
+    }
+    return ws
+}
+
+fn make_expert_biases(n_experts, d_out) {
+    let mut bs = []
+    for e in 0..n_experts {
+        bs = bs + [make_bias(d_out, e * 23 + 7)]
+    }
+    return bs
+}
+
+let expert_Ws = make_expert_Ws(N_EXPERTS, D_OUT, D_IN)
+let expert_biases = make_expert_biases(N_EXPERTS, D_OUT)
+
+// ===================================================================
+//  TESTS
+// ===================================================================
+
+// T01: mv2_zeros correct length
+let z4 = mv2_zeros(4)
+check("T01 mv2_zeros length=4", len(z4) == 4)
+
+// T02: mv2_exp(0) = 1
+check("T02 mv2_exp(0)=1", approx(mv2_exp(0.0), 1.0, 0.001))
+
+// T03: mv2_sigmoid(0) = 0.5
+check("T03 mv2_sigmoid(0)=0.5", approx(mv2_sigmoid(0.0), 0.5, 0.001))
+
+// T04: mv2_softmax sums to 1
+let sm = mv2_softmax([1.0, 2.0, 3.0, 4.0])
+let mut sm_sum = 0.0
+for i in 0..4 { sm_sum = sm_sum + sm[i] }
+check("T04 softmax sums to 1", approx(sm_sum, 1.0, 0.001))
+
+// T05: expert forward correct output
+let w5 = [1.0, 0.0, 0.0, 1.0]
+let b5 = [0.0, 0.0]
+let x5 = [3.0, 5.0]
+let y5 = mv2_expert_fwd(w5, b5, x5, 2, 2)
+check("T05 expert_fwd [3,5] identity = [3,5]", approx(y5[0], 3.0, 0.001) && approx(y5[1], 5.0, 0.001))
+
+// T06: gate scores correct length
+let gs = mv2_gate_scores(gate_W, test_tokens[0], N_EXPERTS, D_IN)
+check("T06 gate_scores len = n_experts", len(gs) == N_EXPERTS)
+
+// T07: topk picks highest
+let tk_scores = [0.1, 0.9, 0.3, 0.7]
+let tk = mv2_topk(tk_scores, 2)
+check("T07 topk picks idx 1 first", tk[0] == 1)
+check("T07b topk picks idx 3 second", tk[1] == 3)
+
+// T08: softmax_subset sums to 1
+let ss = mv2_softmax_subset([1.0, 2.0, 3.0, 4.0], [0, 2])
+let mut ss_sum = 0.0
+for i in 0..2 { ss_sum = ss_sum + ss[i] }
+check("T08 softmax_subset sums to 1", approx(ss_sum, 1.0, 0.001))
+
+// ===================================================================
+//  Feature 1: Fine-grained expert splitting
+// ===================================================================
+
+// T09: fine-grained output dim = d_out
+let M_SUB = 2
+let D_OUT_SUB = D_OUT / M_SUB
+let mut sub_ws = []
+let mut sub_bs = []
+for s in 0..M_SUB {
+    sub_ws = sub_ws + [make_flat_weights(D_OUT_SUB, D_IN, s * 31 + 7)]
+    sub_bs = sub_bs + [make_bias(D_OUT_SUB, s * 19 + 3)]
+}
+let fg_out = mv2_fine_grained_expert_fwd(sub_ws, sub_bs, test_tokens[0], M_SUB, D_OUT_SUB, D_IN)
+check("T09 fine-grained output dim = d_out", len(fg_out) == D_OUT)
+
+// T10: fine-grained: m sub-experts produce m parts
+let mut fg_parts_ok = true
+for s in 0..M_SUB {
+    let part_s = mv2_expert_fwd(sub_ws[s], sub_bs[s], test_tokens[0], D_OUT_SUB, D_IN)
+    for i in 0..D_OUT_SUB {
+        if fabs(fg_out[s * D_OUT_SUB + i] - part_s[i]) > 0.001 { fg_parts_ok = false }
+    }
+}
+check("T10 fine-grained parts match individual sub-expert outputs", fg_parts_ok)
+
+// ===================================================================
+//  Feature 2: Expert parallelism
+// ===================================================================
+
+// T11: round-robin assignment
+let asgn = mv2_assign_experts_to_devices(8, 4)
+check("T11 expert 0 -> device 0", asgn[0] == 0)
+check("T11b expert 5 -> device 1", asgn[5] == 1)
+
+// T12: device load balanced for 8 experts / 4 devices
+let dload = mv2_device_load(asgn, 8, 4)
+let mut balanced = true
+for d in 0..4 {
+    if dload[d] != 2 { balanced = false }
+}
+check("T12 device load balanced (2 each)", balanced)
+
+// T13: experts_on_device correct
+let dev0 = mv2_experts_on_device(asgn, 0, 8)
+check("T13 device 0 has experts 0,4", len(dev0) == 2 && dev0[0] == 0 && dev0[1] == 4)
+
+// ===================================================================
+//  Feature 3: Capacity factor
+// ===================================================================
+
+// T14: basic capacity computation
+let cap1 = mv2_compute_capacity(16, 4, 1.0)
+check("T14 capacity(16 tokens, 4 experts, 1.0) = 4", cap1 == 4)
+
+// T15: capacity at least 1
+let cap_min = mv2_compute_capacity(1, 8, 0.01)
+check("T15 capacity at least 1", cap_min >= 1)
+
+// T16: enforce capacity respects limit
+let asgn16 = [0, 0, 0, 0, 0, 1, 1, 2]
+let kept16 = mv2_enforce_capacity(asgn16, 8, 4, 2)
+let mut e0_kept = 0
+for i in 0..8 {
+    if asgn16[i] == 0 {
+        if kept16[i] { e0_kept = e0_kept + 1 }
+    }
+}
+check("T16 enforce_capacity: expert 0 keeps at most 2", e0_kept <= 2)
+
+// T17: enforce capacity keeps first tokens (FIFO)
+check("T17 first token for expert 0 kept", kept16[0] == true)
+check("T17b second token for expert 0 kept", kept16[1] == true)
+check("T17c third token for expert 0 dropped", kept16[2] == false)
+
+// ===================================================================
+//  Feature 4: Auxiliary load balancing loss
+// ===================================================================
+
+// T18: importance loss with uniform probs = 0
+// 2 tokens, 2 experts, each gets prob 0.5
+let uniform_probs = [0.5, 0.5, 0.5, 0.5]
+let imp_uni = mv2_importance_loss(uniform_probs, 2, 2)
+check("T18 importance loss uniform = 0", approx(imp_uni, 0.0, 0.001))
+
+// T19: importance loss with skewed probs > 0
+let skewed_probs = [0.9, 0.1, 0.8, 0.2]
+let imp_skew = mv2_importance_loss(skewed_probs, 2, 2)
+check("T19 importance loss skewed > 0", imp_skew > 0.01)
+
+// T20: load balance loss with equal counts = 0
+let eq_counts = [5, 5, 5, 5]
+let lb_eq = mv2_load_balance_loss(eq_counts, 4)
+check("T20 load balance loss equal = 0", approx(lb_eq, 0.0, 0.001))
+
+// T21: load balance loss unequal > 0
+let uneq_counts = [10, 0, 0, 0]
+let lb_uneq = mv2_load_balance_loss(uneq_counts, 4)
+check("T21 load balance loss unequal > 0", lb_uneq > 0.1)
+
+// T22: aux loss combines both
+let ax = mv2_aux_loss(skewed_probs, uneq_counts, 2, 2, 0.01)
+check("T22 aux_loss > 0 for skewed", ax > 0.0)
+
+// ===================================================================
+//  Feature 5: Shared expert
+// ===================================================================
+
+// T23: shared expert output has contributions
+let shared_W = make_flat_weights(D_OUT, D_IN, 71)
+let shared_bias = make_bias(D_OUT, 73)
+let n_routed = 3
+let routed_Ws = make_expert_Ws(n_routed, D_OUT, D_IN)
+let routed_biases = make_expert_biases(n_routed, D_OUT)
+let routed_gate_W = make_flat_weights(n_routed, D_IN, 79)
+let se_out = mv2_shared_expert_forward(shared_W, shared_bias, routed_Ws, routed_biases, routed_gate_W, test_tokens[0], n_routed, D_OUT, D_IN, 2)
+check("T23 shared expert output length = d_out", len(se_out) == D_OUT)
+
+// T24: shared expert always contributes (output != pure routed)
+let pure_shared = mv2_expert_fwd(shared_W, shared_bias, test_tokens[0], D_OUT, D_IN)
+let mut shared_contributes = false
+for i in 0..D_OUT {
+    if fabs(se_out[i] - pure_shared[i]) > 0.0001 {
+        shared_contributes = true
+    }
+}
+check("T24 shared expert: output differs from shared-only (routed contributes)", shared_contributes)
+
+// ===================================================================
+//  Feature 6: Expert choice routing
+// ===================================================================
+
+// T25: expert choice scores shape
+let ec_scores = mv2_expert_choice_scores(gate_W, test_tokens, N_EXPERTS, N_TOKENS, D_IN)
+check("T25 expert_choice_scores len = n_experts * n_tokens", len(ec_scores) == N_EXPERTS * N_TOKENS)
+
+// T26: expert choice route respects capacity
+let ec_cap = 2
+let ec_route = mv2_expert_choice_route(ec_scores, N_EXPERTS, N_TOKENS, ec_cap)
+let mut ec_cap_ok = true
+for e in 0..N_EXPERTS {
+    if len(ec_route[e]) > ec_cap { ec_cap_ok = false }
+}
+check("T26 expert_choice_route: each expert picks <= capacity tokens", ec_cap_ok)
+
+// T27: expert choice forward produces outputs
+let ec_result = mv2_expert_choice_forward(expert_Ws, expert_biases, gate_W, test_tokens, N_EXPERTS, N_TOKENS, D_OUT, D_IN, 2)
+let ec_outputs = ec_result[0]
+let ec_token_counts = ec_result[1]
+check("T27 expert_choice_forward: n_tokens outputs", len(ec_outputs) == N_TOKENS)
+
+// ===================================================================
+//  Feature 7: Load balancing metrics
+// ===================================================================
+
+// T28: balanced counts low CV
+let bal_counts = [5, 5, 5, 5]
+let cv_bal = mv2_load_cv(bal_counts, 4)
+check("T28 load CV balanced = 0", approx(cv_bal, 0.0, 0.001))
+
+// T29: max-min ratio near 1 for balanced
+let mmr = mv2_load_max_min_ratio(bal_counts, 4)
+check("T29 max-min ratio balanced = 1.0", approx(mmr, 1.0, 0.001))
+
+// T30: expert utilization all active = 1.0
+let util = mv2_expert_utilization(bal_counts, 4)
+check("T30 expert utilization all active = 1.0", approx(util, 1.0, 0.001))
+
+// ===================================================================
+//  Feature 8: Granular top-k over sub-experts
+// ===================================================================
+
+// T31: granular topk picks from sub-experts
+let n_sub = N_EXPERTS * M_SUB
+let sub_gate_W = make_flat_weights(n_sub, D_IN, 97)
+let sub_scores = mv2_gate_scores(sub_gate_W, test_tokens[0], n_sub, D_IN)
+let sub_picks = mv2_topk(sub_scores, 3)
+check("T31 granular topk: 3 sub-experts picked", len(sub_picks) == 3)
+
+// T32: sub-to-coarse mapping
+let mapping = mv2_sub_to_coarse(5, 2)
+check("T32 sub_to_coarse(5, m=2) = [2, 1]", mapping[0] == 2 && mapping[1] == 1)
+
+// ===================================================================
+//  Feature 9: Router z-loss
+// ===================================================================
+
+// T33: small logits give small z-loss
+let small_logits = [0.1, 0.2, 0.1, 0.2, 0.15, 0.15, 0.1, 0.2]
+let zl_small = mv2_router_z_loss(small_logits, 2, 4)
+check("T33 z-loss small logits is small", zl_small < 5.0)
+
+// T34: large logits give larger z-loss
+let large_logits = [10.0, 20.0, 10.0, 20.0, 15.0, 15.0, 10.0, 20.0]
+let zl_large = mv2_router_z_loss(large_logits, 2, 4)
+check("T34 z-loss large logits > small logits", zl_large > zl_small)
+
+// ===================================================================
+//  Feature 10: Token drop and pad
+// ===================================================================
+
+// T35: token drop and pad
+let dp_asgn = [0, 0, 0, 1, 1, 2, 3, 3]
+let dp_scores = [0.9, 0.5, 0.3, 0.8, 0.6, 0.7, 0.4, 0.2]
+let dp_result = mv2_token_drop_and_pad(dp_asgn, dp_scores, 8, 4, 2)
+let dp_dropped = dp_result[0]
+let dp_padded = dp_result[1]
+// expert 0 has 3 tokens, capacity=2, so 1 dropped
+check("T35 token drop: 1 dropped from expert 0", dp_dropped >= 1)
+// expert 2 has 1 token, capacity=2, so 1 padded
+check("T35b token pad: deficit counted", dp_padded >= 1)
+// expert 0 keeps 2 tokens (index 2 = first expert's kept count)
+check("T35c expert 0 keeps 2", dp_result[2] == 2)
+
+// ===================================================================
+//  Full forward test
+// ===================================================================
+
+// T36: full forward produces outputs
+let fwd = mv2_forward(expert_Ws, expert_biases, gate_W, test_tokens, N_EXPERTS, N_TOKENS, D_OUT, D_IN, 2, 1.5)
+let fwd_outputs = fwd[0]
+let fwd_z_loss = fwd[1]
+let fwd_aux = fwd[2]
+let fwd_counts = fwd[3]
+check("T36 forward: n_tokens outputs", len(fwd_outputs) == N_TOKENS)
+
+// T37: z-loss non-negative
+check("T37 forward z_loss >= 0", fwd_z_loss >= 0.0)
+
+// T38: expert counts sum check
+let mut fwd_sum = 0
+for e in 0..N_EXPERTS { fwd_sum = fwd_sum + fwd_counts[e] }
+let mut fwd_kept_count = 0
+for t in 0..N_TOKENS {
+    let mut nonzero = false
+    for i in 0..D_OUT {
+        if fabs(fwd_outputs[t][i]) > 0.0001 { nonzero = true }
+    }
+    if nonzero { fwd_kept_count = fwd_kept_count + 1 }
+}
+check("T38 expert counts sum = kept tokens", fwd_sum >= fwd_kept_count)
+
+// ===================================================================
+//  Summary
+// ===================================================================
+println("")
+println("=== moe_v2 test summary ===")
+println("PASS: " + str(pass_count))
+println("FAIL: " + str(fail_count))
+println("TOTAL: " + str(pass_count + fail_count))

@@ -1,0 +1,806 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/prompt_compression.hexa — Prompt Compression (#158)
+//
+//  Reduces input token count while preserving key information.
+//
+//  Implements:
+//    1. Token importance scorer   — entropy, TF-IDF, perplexity contribution
+//    2. Selective pruning         — remove low-importance tokens
+//    3. Summary compression       — extractive compression of long passages
+//    4. Iterative refinement      — multi-round compression with quality check
+//    5. Budget allocation         — distribute token budget across sections
+//    6. Information retention     — measure surviving key information
+//    7. Context distillation      — distill long context into compact form
+//    8. Compression ratio control — guarantee target compression ratio
+//
+//  API (pure):
+//    pc_entropy(probs)                     -> float
+//    pc_token_entropy_scores(prob_matrix)  -> [float]
+//    pc_tf(tokens, vocab_size)             -> [float]
+//    pc_idf(doc_freqs, n_docs)             -> [float]
+//    pc_tfidf_scores(tokens, tf, idf)      -> [float]
+//    pc_perplexity_contrib(log_probs)      -> [float]
+//    pc_importance_composite(e, t, p, we, wt, wp) -> [float]
+//    pc_prune_by_threshold(tokens, scores, threshold) -> [pruned, kept_idx]
+//    pc_prune_topk(tokens, scores, k)      -> [pruned, kept_idx]
+//    pc_sentence_scores(tokens, scores, boundaries) -> [float]
+//    pc_extractive_compress(tokens, scores, boundaries, n_sents) -> [compressed]
+//    pc_quality_score(orig_scores, kept_idx) -> float
+//    pc_iterative_compress(tokens, scores, target_ratio, max_rounds, min_quality) -> [result, kept_idx]
+//    pc_section_budgets(section_lengths, section_importances, total_budget) -> [int]
+//    pc_compress_sections(sections, section_scores, budgets) -> [compressed]
+//    pc_retention_score(orig_scores, kept_idx, top_k) -> float
+//    pc_recall_at_k(orig_scores, kept_idx, k) -> float
+//    pc_distill_context(tokens, scores, ratio) -> [distilled]
+//    pc_distill_with_anchors(tokens, scores, anchors, ratio) -> [distilled]
+//    pc_compress_to_ratio(tokens, scores, target_ratio) -> [compressed, actual_ratio]
+//    pc_compress_exact(tokens, scores, target_count) -> [compressed]
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+//    @hot   — called during inference
+// ═══════════════════════════════════════════════════════════════════
+
+// ── helpers ──────────────────────────────────────────────────────
+
+fn pc_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn pc_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn pc_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn pc_log(x) {
+    if x <= 0.0 { return -30.0 }
+    let mut v = x
+    let mut count = 0
+    while v > 2.0 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    // ln(v) for v near 1 via Taylor: ln(1+u) = u - u^2/2 + u^3/3 - ...
+    let u = v - 1.0
+    let mut s = 0.0
+    let mut p = u
+    for i in 1..25 {
+        if i % 2 == 1 {
+            s = s + p / to_float(i)
+        } else {
+            s = s - p / to_float(i)
+        }
+        p = p * u
+    }
+    return s + to_float(count)
+}
+
+fn pc_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn pc_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+fn pc_min_f(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn pc_max_f(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn pc_min_i(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn pc_max_i(a, b) {
+    if a > b { return a }
+    return b
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  1. Token Importance Scorer
+//
+//  Entropy: H(p) = -sum(p_i * log(p_i))
+//  Tokens with high local entropy are in uncertain/informative positions.
+//
+//  TF-IDF: classic term frequency * inverse document frequency.
+//
+//  Perplexity contribution: -log(p(token)) measures surprise.
+//  Higher surprise = more informative token.
+// ═══════════════════════════════════════════════════════════════════
+
+// Shannon entropy of a probability distribution
+@pure
+fn pc_entropy(probs) {
+    let n = len(probs)
+    let mut h = 0.0
+    for i in 0..n {
+        if probs[i] > 1.0e-12 {
+            h = h - probs[i] * pc_log(probs[i])
+        }
+    }
+    return h
+}
+
+// Per-token entropy scores from a probability matrix
+// prob_matrix: array of arrays, each row is softmax distribution at that position
+// Returns: array of entropy values (one per token position)
+@pure
+fn pc_token_entropy_scores(prob_matrix) {
+    let n = len(prob_matrix)
+    let mut scores = pc_zeros(n)
+    for i in 0..n {
+        scores[i] = pc_entropy(prob_matrix[i])
+    }
+    return scores
+}
+
+// Term frequency: count of each token in the sequence, normalized
+// Returns: array of size vocab_size with tf values
+@pure
+fn pc_tf(tokens, vocab_size) {
+    let n = len(tokens)
+    let mut counts = pc_zeros(vocab_size)
+    for i in 0..n {
+        let t = tokens[i]
+        if t >= 0 {
+            if t < vocab_size {
+                counts[t] = counts[t] + 1.0
+            }
+        }
+    }
+    if n > 0 {
+        let nf = to_float(n)
+        for i in 0..vocab_size {
+            counts[i] = counts[i] / nf
+        }
+    }
+    return counts
+}
+
+// Inverse document frequency: log(N / df_i)
+// doc_freqs: array of document frequencies per token
+// n_docs: total number of documents
+@pure
+fn pc_idf(doc_freqs, n_docs) {
+    let v = len(doc_freqs)
+    let mut result = pc_zeros(v)
+    let nf = to_float(n_docs)
+    for i in 0..v {
+        let df = doc_freqs[i]
+        if df > 0.0 {
+            result[i] = pc_log(nf / df)
+        } else {
+            result[i] = pc_log(nf)
+        }
+    }
+    return result
+}
+
+// Per-token TF-IDF scores
+// tokens: token id sequence
+// tf: term frequency array (vocab_size)
+// idf: inverse document frequency array (vocab_size)
+// Returns: per-position tfidf score
+@pure
+fn pc_tfidf_scores(tokens, tf, idf) {
+    let n = len(tokens)
+    let mut scores = pc_zeros(n)
+    for i in 0..n {
+        let t = tokens[i]
+        if t >= 0 {
+            if t < len(tf) {
+                scores[i] = tf[t] * idf[t]
+            }
+        }
+    }
+    return scores
+}
+
+// Perplexity contribution per token: -log(p(token_i))
+// log_probs: array of log-probabilities for each token
+// Returns: per-token surprise (higher = more informative)
+@pure
+fn pc_perplexity_contrib(log_probs) {
+    let n = len(log_probs)
+    let mut scores = pc_zeros(n)
+    for i in 0..n {
+        scores[i] = 0.0 - log_probs[i]
+    }
+    return scores
+}
+
+// Composite importance score: weighted combination of entropy, tfidf, perplexity
+@pure
+fn pc_importance_composite(entropy_scores, tfidf_scores, perp_scores, w_e, w_t, w_p) {
+    let n = len(entropy_scores)
+    let mut scores = pc_zeros(n)
+    for i in 0..n {
+        scores[i] = w_e * entropy_scores[i] + w_t * tfidf_scores[i] + w_p * perp_scores[i]
+    }
+    return scores
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  2. Selective Pruning
+//
+//  Remove tokens below importance threshold or keep top-k tokens.
+//  Preserves ordering of remaining tokens.
+// ═══════════════════════════════════════════════════════════════════
+
+// Prune tokens with importance below threshold
+// Returns: [pruned_tokens, kept_indices]
+@pure @hot
+fn pc_prune_by_threshold(tokens, scores, threshold) {
+    let n = len(tokens)
+    let mut pruned = []
+    let mut kept = []
+    for i in 0..n {
+        if scores[i] >= threshold {
+            pruned = pruned + [tokens[i]]
+            kept = kept + [i]
+        }
+    }
+    return [pruned, kept]
+}
+
+// Keep top-k tokens by importance, preserving order
+// Returns: [pruned_tokens, kept_indices]
+@pure @hot
+fn pc_prune_topk(tokens, scores, k) {
+    let n = len(tokens)
+    let mut actual_k = k
+    if actual_k > n { actual_k = n }
+    if actual_k <= 0 { return [[], []] }
+
+    // Find the k-th largest score as threshold
+    // Collect all scores, sort descending, pick k-th
+    let mut sorted_scores = pc_zeros(n)
+    for i in 0..n {
+        sorted_scores[i] = scores[i]
+    }
+    // Simple selection: bubble the top k
+    for i in 0..actual_k {
+        let mut best_j = i
+        for j in (i + 1)..n {
+            if sorted_scores[j] > sorted_scores[best_j] {
+                best_j = j
+            }
+        }
+        if best_j != i {
+            let tmp = sorted_scores[i]
+            sorted_scores[i] = sorted_scores[best_j]
+            sorted_scores[best_j] = tmp
+        }
+    }
+    let threshold = sorted_scores[actual_k - 1]
+
+    // Keep tokens with score >= threshold, in original order
+    let mut pruned = []
+    let mut kept = []
+    let mut count = 0
+    for i in 0..n {
+        if count < actual_k {
+            if scores[i] >= threshold {
+                pruned = pruned + [tokens[i]]
+                kept = kept + [i]
+                count = count + 1
+            }
+        }
+    }
+    return [pruned, kept]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  3. Summary Compression (Extractive)
+//
+//  Split token stream into sentences (by boundary markers),
+//  score each sentence by average token importance,
+//  select top-n sentences.
+// ═══════════════════════════════════════════════════════════════════
+
+// Compute average importance per sentence
+// boundaries: array of sentence-end indices (exclusive)
+// e.g., boundaries = [5, 12, 20] means sentences are tokens[0..5], [5..12], [12..20]
+@pure
+fn pc_sentence_scores(scores, boundaries) {
+    let n_sents = len(boundaries)
+    let mut sent_scores = pc_zeros(n_sents)
+    let mut prev = 0
+    for s in 0..n_sents {
+        let end = boundaries[s]
+        let mut total = 0.0
+        let mut cnt = 0
+        for i in prev..end {
+            if i < len(scores) {
+                total = total + scores[i]
+                cnt = cnt + 1
+            }
+        }
+        if cnt > 0 {
+            sent_scores[s] = total / to_float(cnt)
+        }
+        prev = end
+    }
+    return sent_scores
+}
+
+// Extractive compression: select top n_sents sentences by score, in order
+// Returns: array of token ids from selected sentences
+@pure
+fn pc_extractive_compress(tokens, scores, boundaries, n_sents) {
+    let total_sents = len(boundaries)
+    let mut actual_n = n_sents
+    if actual_n > total_sents { actual_n = total_sents }
+
+    let sent_scores = pc_sentence_scores(scores, boundaries)
+
+    // Find top-n sentence indices
+    let mut selected = []
+    let mut used = pc_zeros_int(total_sents)
+    for _k in 0..actual_n {
+        let mut best_idx = -1
+        let mut best_val = -999.0
+        for s in 0..total_sents {
+            if used[s] == 0 {
+                if sent_scores[s] > best_val {
+                    best_val = sent_scores[s]
+                    best_idx = s
+                }
+            }
+        }
+        if best_idx >= 0 {
+            selected = selected + [best_idx]
+            used[best_idx] = 1
+        }
+    }
+
+    // Sort selected indices to preserve document order
+    for i in 0..len(selected) {
+        for j in (i + 1)..len(selected) {
+            if selected[j] < selected[i] {
+                let tmp = selected[i]
+                selected[i] = selected[j]
+                selected[j] = tmp
+            }
+        }
+    }
+
+    // Collect tokens from selected sentences
+    let mut result = []
+    for si in 0..len(selected) {
+        let s = selected[si]
+        let mut start = 0
+        if s > 0 { start = boundaries[s - 1] }
+        let end = boundaries[s]
+        for i in start..end {
+            if i < len(tokens) {
+                result = result + [tokens[i]]
+            }
+        }
+    }
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  4. Iterative Refinement
+//
+//  Compress in multiple rounds. Each round prunes the lowest-scoring
+//  fraction. Stop when target ratio reached or quality drops too low.
+// ═══════════════════════════════════════════════════════════════════
+
+// Quality score: fraction of total importance retained
+@pure
+fn pc_quality_score(orig_scores, kept_idx) {
+    let n = len(orig_scores)
+    if n == 0 { return 0.0 }
+    let mut total = 0.0
+    for i in 0..n {
+        total = total + orig_scores[i]
+    }
+    if total <= 0.0 { return 0.0 }
+    let mut kept_total = 0.0
+    for j in 0..len(kept_idx) {
+        let idx = kept_idx[j]
+        if idx >= 0 {
+            if idx < n {
+                kept_total = kept_total + orig_scores[idx]
+            }
+        }
+    }
+    return kept_total / total
+}
+
+// Iterative compression: prune in rounds until target_ratio or min_quality
+// target_ratio: desired output/input ratio (e.g. 0.5 = 50%)
+// Returns: [compressed_tokens, kept_indices]
+@pure
+fn pc_iterative_compress(tokens, scores, target_ratio, max_rounds, min_quality) {
+    let n = len(tokens)
+    let target_len = to_int(to_float(n) * target_ratio)
+
+    let mut cur_tokens = []
+    let mut cur_scores = []
+    let mut cur_idx = []
+    for i in 0..n {
+        cur_tokens = cur_tokens + [tokens[i]]
+        cur_scores = cur_scores + [scores[i]]
+        cur_idx = cur_idx + [i]
+    }
+
+    for _round in 0..max_rounds {
+        let cur_len = len(cur_tokens)
+        if cur_len <= target_len { return [cur_tokens, cur_idx] }
+
+        // Remove bottom 20% of current tokens each round
+        let prune_count = pc_max_i(1, to_int(to_float(cur_len) * 0.2))
+        let keep_count = cur_len - prune_count
+        if keep_count <= 0 { return [cur_tokens, cur_idx] }
+
+        let result = pc_prune_topk(cur_tokens, cur_scores, keep_count)
+        let new_tokens = result[0]
+        let local_kept = result[1]
+
+        // Map local kept indices back to original indices
+        let mut new_idx = []
+        let mut new_scores_arr = []
+        for j in 0..len(local_kept) {
+            let li = local_kept[j]
+            new_idx = new_idx + [cur_idx[li]]
+            new_scores_arr = new_scores_arr + [cur_scores[li]]
+        }
+
+        // Check quality
+        let q = pc_quality_score(scores, new_idx)
+        if q < min_quality { return [cur_tokens, cur_idx] }
+
+        cur_tokens = new_tokens
+        cur_scores = new_scores_arr
+        cur_idx = new_idx
+    }
+
+    return [cur_tokens, cur_idx]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  5. Budget Allocation
+//
+//  Given a target token count, distribute it across sections
+//  proportionally to their importance.
+// ═══════════════════════════════════════════════════════════════════
+
+// Allocate token budget across sections
+// section_lengths: array of original lengths per section
+// section_importances: array of importance scores per section
+// total_budget: total allowed token count
+// Returns: array of allocated counts per section
+@pure
+fn pc_section_budgets(section_lengths, section_importances, total_budget) {
+    let n = len(section_lengths)
+    let mut total_imp = 0.0
+    for i in 0..n {
+        total_imp = total_imp + section_importances[i]
+    }
+    if total_imp <= 0.0 {
+        // Equal split
+        let per = total_budget / n
+        let mut result = pc_zeros_int(n)
+        for i in 0..n { result[i] = per }
+        return result
+    }
+
+    let mut budgets = pc_zeros_int(n)
+    let mut allocated = 0
+    for i in 0..n {
+        let frac = section_importances[i] / total_imp
+        let mut b = to_int(frac * to_float(total_budget))
+        // Don't exceed section length
+        if b > section_lengths[i] { b = section_lengths[i] }
+        budgets[i] = b
+        allocated = allocated + b
+    }
+
+    // Distribute remainder to highest importance sections
+    let mut remaining = total_budget - allocated
+    while remaining > 0 {
+        let mut best_i = -1
+        let mut best_imp = -1.0
+        for i in 0..n {
+            if budgets[i] < section_lengths[i] {
+                if section_importances[i] > best_imp {
+                    best_imp = section_importances[i]
+                    best_i = i
+                }
+            }
+        }
+        if best_i < 0 { remaining = 0 } else {
+            budgets[best_i] = budgets[best_i] + 1
+            remaining = remaining - 1
+        }
+    }
+
+    return budgets
+}
+
+// Compress sections according to allocated budgets
+// sections: array of arrays (each section is array of token ids)
+// section_scores: array of arrays (importance per token per section)
+// budgets: array of ints (allowed tokens per section)
+// Returns: concatenated compressed tokens
+@pure
+fn pc_compress_sections(sections, section_scores, budgets) {
+    let n = len(sections)
+    let mut result = []
+    for i in 0..n {
+        let sec = sections[i]
+        let sc = section_scores[i]
+        let b = budgets[i]
+        if b >= len(sec) {
+            // Keep all
+            for j in 0..len(sec) {
+                result = result + [sec[j]]
+            }
+        } else {
+            let pruned = pc_prune_topk(sec, sc, b)
+            let kept = pruned[0]
+            for j in 0..len(kept) {
+                result = result + [kept[j]]
+            }
+        }
+    }
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  6. Information Retention Metric
+//
+//  Measures how much key information survives compression.
+//  Focuses on top-k most important tokens.
+// ═══════════════════════════════════════════════════════════════════
+
+// Retention score: fraction of top-k important tokens retained
+// orig_scores: original importance scores
+// kept_idx: indices of retained tokens
+// top_k: how many top tokens to check
+@pure
+fn pc_retention_score(orig_scores, kept_idx, top_k) {
+    let n = len(orig_scores)
+    if n == 0 { return 0.0 }
+    let mut actual_k = top_k
+    if actual_k > n { actual_k = n }
+
+    // Find top-k indices by score
+    let mut top_indices = pc_zeros_int(actual_k)
+    let mut used = pc_zeros_int(n)
+    for k in 0..actual_k {
+        let mut best_j = -1
+        let mut best_v = -999.0
+        for j in 0..n {
+            if used[j] == 0 {
+                if orig_scores[j] > best_v {
+                    best_v = orig_scores[j]
+                    best_j = j
+                }
+            }
+        }
+        if best_j >= 0 {
+            top_indices[k] = best_j
+            used[best_j] = 1
+        }
+    }
+
+    // Check how many top-k are in kept_idx
+    let mut retained = 0
+    for k in 0..actual_k {
+        let ti = top_indices[k]
+        for j in 0..len(kept_idx) {
+            if kept_idx[j] == ti {
+                retained = retained + 1
+            }
+        }
+    }
+
+    return to_float(retained) / to_float(actual_k)
+}
+
+// Recall@k: fraction of top-k original tokens that appear in kept set
+@pure
+fn pc_recall_at_k(orig_scores, kept_idx, k) {
+    return pc_retention_score(orig_scores, kept_idx, k)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  7. Context Distillation
+//
+//  Distill long context into a compact representation by
+//  keeping the most informative tokens at target ratio.
+// ═══════════════════════════════════════════════════════════════════
+
+// Basic distillation: keep top fraction of tokens by importance
+// ratio: target output/input ratio (e.g. 0.3 = keep 30%)
+// Returns: distilled token array
+@pure
+fn pc_distill_context(tokens, scores, ratio) {
+    let n = len(tokens)
+    let keep = pc_max_i(1, to_int(to_float(n) * ratio))
+    let result = pc_prune_topk(tokens, scores, keep)
+    return result[0]
+}
+
+// Distillation with anchor tokens (always kept)
+// anchors: array of token indices that must be preserved
+// ratio: target ratio applied to non-anchor tokens
+// Returns: distilled token array (anchors + top non-anchors)
+@pure
+fn pc_distill_with_anchors(tokens, scores, anchors, ratio) {
+    let n = len(tokens)
+    let n_anchors = len(anchors)
+
+    // Build anchor set
+    let mut is_anchor = pc_zeros_int(n)
+    for i in 0..n_anchors {
+        let a = anchors[i]
+        if a >= 0 {
+            if a < n {
+                is_anchor[a] = 1
+            }
+        }
+    }
+
+    // Separate non-anchor tokens
+    let mut non_anchor_tokens = []
+    let mut non_anchor_scores = []
+    let mut non_anchor_idx = []
+    for i in 0..n {
+        if is_anchor[i] == 0 {
+            non_anchor_tokens = non_anchor_tokens + [tokens[i]]
+            non_anchor_scores = non_anchor_scores + [scores[i]]
+            non_anchor_idx = non_anchor_idx + [i]
+        }
+    }
+
+    // Determine how many non-anchors to keep
+    let total_budget = pc_max_i(n_anchors, to_int(to_float(n) * ratio))
+    let non_anchor_budget = pc_max_i(0, total_budget - n_anchors)
+
+    // Select top non-anchors
+    let pruned = pc_prune_topk(non_anchor_tokens, non_anchor_scores, non_anchor_budget)
+    let kept_local = pruned[1]
+
+    // Merge anchor indices and kept non-anchor indices, then sort
+    let mut all_kept = []
+    for i in 0..n_anchors {
+        let a = anchors[i]
+        if a >= 0 {
+            if a < n {
+                all_kept = all_kept + [a]
+            }
+        }
+    }
+    for j in 0..len(kept_local) {
+        let li = kept_local[j]
+        all_kept = all_kept + [non_anchor_idx[li]]
+    }
+
+    // Sort to preserve order
+    for i in 0..len(all_kept) {
+        for j in (i + 1)..len(all_kept) {
+            if all_kept[j] < all_kept[i] {
+                let tmp = all_kept[i]
+                all_kept[i] = all_kept[j]
+                all_kept[j] = tmp
+            }
+        }
+    }
+
+    // Collect tokens
+    let mut result = []
+    for i in 0..len(all_kept) {
+        result = result + [tokens[all_kept[i]]]
+    }
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  8. Compression Ratio Control
+//
+//  Guarantee a specific compression ratio by selecting exactly
+//  the right number of tokens.
+// ═══════════════════════════════════════════════════════════════════
+
+// Compress to target ratio, return compressed tokens
+@pure @hot
+fn pc_compress_to_ratio(tokens, scores, target_ratio) {
+    let n = len(tokens)
+    if n == 0 { return [] }
+    let target_count = pc_max_i(1, to_int(to_float(n) * target_ratio))
+    let result = pc_prune_topk(tokens, scores, target_count)
+    return result[0]
+}
+
+// Compute actual compression ratio after compression
+@pure
+fn pc_actual_ratio(orig_len, compressed_len) {
+    if orig_len <= 0 { return 1.0 }
+    return to_float(compressed_len) / to_float(orig_len)
+}
+
+// Compress to exact token count
+@pure @hot
+fn pc_compress_exact(tokens, scores, target_count) {
+    let n = len(tokens)
+    if target_count >= n { return tokens }
+    let actual_target = pc_max_i(1, target_count)
+    let result = pc_prune_topk(tokens, scores, actual_target)
+    return result[0]
+}
+
+// Normalize scores to [0, 1] range
+@pure
+fn pc_normalize_scores(scores) {
+    let n = len(scores)
+    if n == 0 { return [] }
+    let mut mn = scores[0]
+    let mut mx = scores[0]
+    for i in 1..n {
+        if scores[i] < mn { mn = scores[i] }
+        if scores[i] > mx { mx = scores[i] }
+    }
+    let rng = mx - mn
+    if rng < 1.0e-12 {
+        let mut result = pc_zeros(n)
+        for i in 0..n { result[i] = 0.5 }
+        return result
+    }
+    let mut result = pc_zeros(n)
+    for i in 0..n {
+        result[i] = (scores[i] - mn) / rng
+    }
+    return result
+}
+
+// Average score of an array
+@pure
+fn pc_mean(arr) {
+    let n = len(arr)
+    if n == 0 { return 0.0 }
+    let mut s = 0.0
+    for i in 0..n { s = s + arr[i] }
+    return s / to_float(n)
+}
+
+println("[prompt_compression] loaded — token importance + pruning + extractive + iterative + budget + retention + distill + ratio control")

@@ -1,0 +1,677 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/continuous_batching_v2.hexa — Continuous Batching v2
+//  with Preemption + KV Cache Swap
+//
+//  Builds on vLLM continuous batching ideas with:
+//    1. Request queue        — FIFO with priority support
+//    2. Iteration scheduler  — prefill vs decode per iteration
+//    3. Preemption policy    — evict lower-priority / longest-running
+//    4. KV cache swap        — save preempted KV to CPU, restore later
+//    5. Dynamic batching     — insert new requests mid-generation
+//    6. Priority queue       — SLA-aware with deadline support
+//    7. SLA deadline tracker — flag approaching-deadline requests
+//    8. Throughput tracker   — tokens/sec, latency, wait, preemptions
+//
+//  API:
+//    cb2_create(max_batch, max_kv_slots)             -> state
+//    cb2_add_request(s, req_id, prompt_len, max_gen, priority, deadline)
+//    cb2_peek_queue(s)                               -> req | nil
+//    cb2_queue_size(s)                               -> int
+//    cb2_schedule_iteration(s, cur_time)             -> state
+//    cb2_preempt(s, target_rid)                      -> state
+//    cb2_swap_out(s, rid)                            -> state
+//    cb2_swap_in(s, rid)                             -> state
+//    cb2_run_step(s, cur_time)                       -> state
+//    cb2_run_until_done(s, max_steps)                -> state
+//    cb2_check_deadlines(s, cur_time)                -> state
+//    cb2_stats(s)                                    -> map
+//    cb2_throughput(s)                               -> map
+//
+//  AI-NATIVE:
+//    @pure   math / policy
+//    @hot    per-iteration scheduler
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Phase constants ──────────────────────────────────────────────
+fn cb2_phase_queued()    { return 0 }
+fn cb2_phase_prefill()   { return 1 }
+fn cb2_phase_decode()    { return 2 }
+fn cb2_phase_preempted() { return 3 }
+fn cb2_phase_swapped()   { return 4 }
+fn cb2_phase_done()      { return 5 }
+
+// ═══════════════════════════════════════════════════════════════════
+//  Request — per-request state
+// ═══════════════════════════════════════════════════════════════════
+fn cb2_new_request(req_id, prompt_len, max_gen, priority, deadline) {
+    return #{
+        "req_id": req_id,
+        "prompt_len": prompt_len,
+        "max_gen": max_gen,
+        "priority": priority,
+        "deadline": deadline,
+        "phase": cb2_phase_queued(),
+        "tokens_generated": 0,
+        "kv_slots_used": 0,
+        "enqueue_time": 0,
+        "start_time": 0,
+        "finish_time": 0,
+        "was_preempted": 0,
+        "preempt_count": 0
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  CPU swap store — simulates CPU memory for swapped KV caches
+// ═══════════════════════════════════════════════════════════════════
+fn cb2_new_swap_entry(rid, kv_size, tokens_done) {
+    return #{"rid": rid, "kv_size": kv_size, "tokens_done": tokens_done}
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Throughput tracker
+// ═══════════════════════════════════════════════════════════════════
+fn cb2_new_tracker() {
+    return #{
+        "total_tokens": 0,
+        "total_requests_done": 0,
+        "total_preemptions": 0,
+        "total_swaps_out": 0,
+        "total_swaps_in": 0,
+        "total_latency": 0,
+        "total_wait_time": 0,
+        "max_latency": 0,
+        "max_wait_time": 0
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  State — the scheduler's full mutable state
+// ═══════════════════════════════════════════════════════════════════
+fn cb2_create(max_batch, max_kv_slots) {
+    return #{
+        "max_batch": max_batch,
+        "max_kv_slots": max_kv_slots,
+        "queue": [],
+        "running": [],
+        "swapped": [],
+        "completed": [],
+        "kv_used": 0,
+        "step": 0,
+        "tracker": cb2_new_tracker()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Priority queue helpers — higher priority value = higher priority
+//  Insert maintains sorted order (descending priority, FIFO within
+//  same priority by keeping insertion order).
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cb2_insert_sorted(queue, req) {
+    let n = len(queue)
+    if n == 0 { return [req] }
+    let mut result = []
+    let mut inserted = false
+    for i in 0..n {
+        if inserted == false {
+            if req["priority"] > queue[i]["priority"] {
+                result = result + [req]
+                inserted = true
+            }
+        }
+        result = result + [queue[i]]
+    }
+    if inserted == false {
+        result = result + [req]
+    }
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Add request — enqueue with priority insertion
+// ═══════════════════════════════════════════════════════════════════
+fn cb2_add_request(s, req_id, prompt_len, max_gen, priority, deadline) {
+    let mut req = cb2_new_request(req_id, prompt_len, max_gen, priority, deadline)
+    req["enqueue_time"] = s["step"]
+    let new_queue = cb2_insert_sorted(s["queue"], req)
+    let mut s2 = s
+    s2["queue"] = new_queue
+    return s2
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Queue introspection
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cb2_queue_size(s) {
+    return len(s["queue"])
+}
+
+@pure
+fn cb2_peek_queue(s) {
+    if len(s["queue"]) == 0 { return #{} }
+    return s["queue"][0]
+}
+
+@pure
+fn cb2_running_count(s) {
+    return len(s["running"])
+}
+
+@pure
+fn cb2_completed_count(s) {
+    return len(s["completed"])
+}
+
+@pure
+fn cb2_swapped_count(s) {
+    return len(s["swapped"])
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  KV slot accounting
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cb2_kv_free(s) {
+    return s["max_kv_slots"] - s["kv_used"]
+}
+
+@pure
+fn cb2_kv_needed_for_req(req) {
+    // prefill needs prompt_len slots, decode needs 1 more per step
+    if req["phase"] == cb2_phase_queued() {
+        return req["prompt_len"]
+    }
+    // for decode phase, need 1 additional slot
+    return 1
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Find the lowest-priority running request (for preemption).
+//  Among equal priority, pick the one with the most tokens generated
+//  (longest-running heuristic).
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cb2_find_preempt_victim(running) {
+    let n = len(running)
+    if n == 0 { return -1 }
+    let mut victim_idx = 0
+    let mut victim_pri = running[0]["priority"]
+    let mut victim_gen = running[0]["tokens_generated"]
+    for i in 1..n {
+        let r = running[i]
+        let dominated = false
+        if r["priority"] < victim_pri {
+            victim_idx = i
+            victim_pri = r["priority"]
+            victim_gen = r["tokens_generated"]
+        }
+        if r["priority"] == victim_pri {
+            if r["tokens_generated"] > victim_gen {
+                victim_idx = i
+                victim_gen = r["tokens_generated"]
+            }
+        }
+    }
+    return victim_idx
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Preempt a specific running request by index — move to preempted,
+//  free its KV slots.
+// ═══════════════════════════════════════════════════════════════════
+fn cb2_preempt_at(s, idx) {
+    let running = s["running"]
+    let n = len(running)
+    if idx < 0 { return s }
+    if idx >= n { return s }
+    let victim = running[idx]
+    let freed = victim["kv_slots_used"]
+    let mut new_running = []
+    for i in 0..n {
+        if i != idx {
+            new_running = new_running + [running[i]]
+        }
+    }
+    let mut preempted_req = victim
+    preempted_req["phase"] = cb2_phase_preempted()
+    preempted_req["was_preempted"] = 1
+    preempted_req["preempt_count"] = preempted_req["preempt_count"] + 1
+    let mut s2 = s
+    s2["running"] = new_running
+    s2["kv_used"] = s["kv_used"] - freed
+    // re-insert into queue with boosted priority for fairness
+    s2["queue"] = cb2_insert_sorted(s2["queue"], preempted_req)
+    let mut t = s2["tracker"]
+    t["total_preemptions"] = t["total_preemptions"] + 1
+    s2["tracker"] = t
+    return s2
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Preempt by request ID (public API)
+// ═══════════════════════════════════════════════════════════════════
+fn cb2_preempt(s, target_rid) {
+    let running = s["running"]
+    let n = len(running)
+    for i in 0..n {
+        if running[i]["req_id"] == target_rid {
+            return cb2_preempt_at(s, i)
+        }
+    }
+    return s
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  KV Cache Swap Out — move a running request's KV to CPU memory
+//  Frees GPU KV slots, stores metadata in swapped list.
+// ═══════════════════════════════════════════════════════════════════
+fn cb2_swap_out(s, rid) {
+    let running = s["running"]
+    let n = len(running)
+    let mut found_idx = -1
+    for i in 0..n {
+        if running[i]["req_id"] == rid {
+            found_idx = i
+        }
+    }
+    if found_idx < 0 { return s }
+    let victim = running[found_idx]
+    let kv_size = victim["kv_slots_used"]
+    let swap_entry = cb2_new_swap_entry(rid, kv_size, victim["tokens_generated"])
+    let mut swapped_req = victim
+    swapped_req["phase"] = cb2_phase_swapped()
+    swapped_req["kv_slots_used"] = 0
+    let mut new_running = []
+    for i in 0..n {
+        if i != found_idx {
+            new_running = new_running + [running[i]]
+        }
+    }
+    let mut s2 = s
+    s2["running"] = new_running
+    s2["swapped"] = s["swapped"] + [swapped_req]
+    s2["kv_used"] = s["kv_used"] - kv_size
+    let mut t = s2["tracker"]
+    t["total_swaps_out"] = t["total_swaps_out"] + 1
+    s2["tracker"] = t
+    return s2
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  KV Cache Swap In — restore a swapped request back to running
+//  Re-allocates GPU KV slots and resumes decode.
+// ═══════════════════════════════════════════════════════════════════
+fn cb2_swap_in(s, rid) {
+    let swapped = s["swapped"]
+    let n = len(swapped)
+    let mut found_idx = -1
+    for i in 0..n {
+        if swapped[i]["req_id"] == rid {
+            found_idx = i
+        }
+    }
+    if found_idx < 0 { return s }
+    let mut restored = swapped[found_idx]
+    // Restore KV slots: prompt_len + tokens already generated
+    let needed_kv = restored["prompt_len"] + restored["tokens_generated"]
+    if cb2_kv_free(s) < needed_kv { return s }
+    restored["phase"] = cb2_phase_decode()
+    restored["kv_slots_used"] = needed_kv
+    let mut new_swapped = []
+    for i in 0..n {
+        if i != found_idx {
+            new_swapped = new_swapped + [swapped[i]]
+        }
+    }
+    let mut s2 = s
+    s2["running"] = s["running"] + [restored]
+    s2["swapped"] = new_swapped
+    s2["kv_used"] = s["kv_used"] + needed_kv
+    let mut t = s2["tracker"]
+    t["total_swaps_in"] = t["total_swaps_in"] + 1
+    s2["tracker"] = t
+    return s2
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  SLA Deadline Checking — boost priority of requests near deadline
+// ═══════════════════════════════════════════════════════════════════
+fn cb2_check_deadlines(s, cur_time) {
+    let mut new_queue = []
+    let q = s["queue"]
+    let nq = len(q)
+    for i in 0..nq {
+        let mut r = q[i]
+        if r["deadline"] > 0 {
+            let remaining = r["deadline"] - cur_time
+            // If within 20% of deadline, boost priority by 100
+            if remaining >= 0 {
+                let total_budget = r["deadline"] - r["enqueue_time"]
+                if total_budget > 0 {
+                    let fraction_left = to_float(remaining) / to_float(total_budget)
+                    if fraction_left <= 0.2 {
+                        r["priority"] = r["priority"] + 100
+                    }
+                }
+            }
+        }
+        new_queue = new_queue + [r]
+    }
+    // Also boost running requests near deadline
+    let mut new_running = []
+    let running = s["running"]
+    let nr = len(running)
+    for i in 0..nr {
+        let mut r = running[i]
+        if r["deadline"] > 0 {
+            let remaining = r["deadline"] - cur_time
+            if remaining >= 0 {
+                let total_budget = r["deadline"] - r["enqueue_time"]
+                if total_budget > 0 {
+                    let fraction_left = to_float(remaining) / to_float(total_budget)
+                    if fraction_left <= 0.2 {
+                        r["priority"] = r["priority"] + 100
+                    }
+                }
+            }
+        }
+        new_running = new_running + [r]
+    }
+    // Re-sort queue by priority
+    let mut sorted_queue = []
+    for i in 0..len(new_queue) {
+        sorted_queue = cb2_insert_sorted(sorted_queue, new_queue[i])
+    }
+    let mut s2 = s
+    s2["queue"] = sorted_queue
+    s2["running"] = new_running
+    return s2
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Admit requests from queue into running (prefill phase).
+//  Respects max_batch and kv slot limits.
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn cb2_admit(s) {
+    let mut s2 = s
+    let mut keep_going = true
+    while keep_going {
+        let nq = len(s2["queue"])
+        let nr = len(s2["running"])
+        if nq == 0 {
+            keep_going = false
+        } else {
+            if nr >= s2["max_batch"] {
+                keep_going = false
+            } else {
+                let head = s2["queue"][0]
+                let needed = head["prompt_len"]
+                if needed > cb2_kv_free(s2) {
+                    keep_going = false
+                } else {
+                    // Pop from queue
+                    let mut new_queue = []
+                    for j in 1..nq {
+                        new_queue = new_queue + [s2["queue"][j]]
+                    }
+                    let mut admitted = head
+                    admitted["phase"] = cb2_phase_prefill()
+                    admitted["kv_slots_used"] = needed
+                    admitted["start_time"] = s2["step"]
+                    s2["queue"] = new_queue
+                    s2["running"] = s2["running"] + [admitted]
+                    s2["kv_used"] = s2["kv_used"] + needed
+                }
+            }
+        }
+    }
+    return s2
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Prefill phase — transition prefill requests to decode
+// ═══════════════════════════════════════════════════════════════════
+fn cb2_prefill_phase(s) {
+    let running = s["running"]
+    let n = len(running)
+    let mut new_running = []
+    for i in 0..n {
+        let mut r = running[i]
+        if r["phase"] == cb2_phase_prefill() {
+            r["phase"] = cb2_phase_decode()
+        }
+        new_running = new_running + [r]
+    }
+    let mut s2 = s
+    s2["running"] = new_running
+    return s2
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Decode phase — each decode request produces one token
+// ═══════════════════════════════════════════════════════════════════
+fn cb2_decode_phase(s) {
+    let running = s["running"]
+    let n = len(running)
+    let mut new_running = []
+    let mut new_completed = s["completed"]
+    let mut tokens_this_step = 0
+    let mut freed_kv = 0
+    let mut total_latency_add = 0
+    let mut total_wait_add = 0
+    let mut max_lat = s["tracker"]["max_latency"]
+    let mut max_wait = s["tracker"]["max_wait_time"]
+    for i in 0..n {
+        let mut r = running[i]
+        if r["phase"] == cb2_phase_decode() {
+            r["tokens_generated"] = r["tokens_generated"] + 1
+            r["kv_slots_used"] = r["kv_slots_used"] + 1
+            tokens_this_step = tokens_this_step + 1
+            // Check completion
+            if r["tokens_generated"] >= r["max_gen"] {
+                r["phase"] = cb2_phase_done()
+                r["finish_time"] = s["step"]
+                let latency = r["finish_time"] - r["enqueue_time"]
+                let wait = r["start_time"] - r["enqueue_time"]
+                total_latency_add = total_latency_add + latency
+                total_wait_add = total_wait_add + wait
+                if latency > max_lat { max_lat = latency }
+                if wait > max_wait { max_wait = wait }
+                freed_kv = freed_kv + r["kv_slots_used"]
+                new_completed = new_completed + [r]
+            } else {
+                new_running = new_running + [r]
+            }
+        } else {
+            new_running = new_running + [r]
+        }
+    }
+    let mut s2 = s
+    s2["running"] = new_running
+    s2["completed"] = new_completed
+    s2["kv_used"] = s["kv_used"] - freed_kv + tokens_this_step
+    let mut t = s2["tracker"]
+    t["total_tokens"] = t["total_tokens"] + tokens_this_step
+    t["total_requests_done"] = t["total_requests_done"] + len(new_completed) - len(s["completed"])
+    t["total_latency"] = t["total_latency"] + total_latency_add
+    t["total_wait_time"] = t["total_wait_time"] + total_wait_add
+    t["max_latency"] = max_lat
+    t["max_wait_time"] = max_wait
+    s2["tracker"] = t
+    return s2
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Preemption pass — if KV is over-committed after decode, preempt
+//  lowest-priority running requests until within budget.
+// ═══════════════════════════════════════════════════════════════════
+fn cb2_preemption_pass(s) {
+    let mut s2 = s
+    let mut safety = 0
+    while s2["kv_used"] > s2["max_kv_slots"] {
+        if safety > 100 { return s2 }
+        let n = len(s2["running"])
+        if n == 0 { return s2 }
+        let victim_idx = cb2_find_preempt_victim(s2["running"])
+        if victim_idx < 0 { return s2 }
+        s2 = cb2_preempt_at(s2, victim_idx)
+        safety = safety + 1
+    }
+    return s2
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Full iteration step: admit -> prefill -> decode -> preemption
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn cb2_run_step(s, cur_time) {
+    let mut s2 = cb2_check_deadlines(s, cur_time)
+    s2 = cb2_admit(s2)
+    s2 = cb2_prefill_phase(s2)
+    s2 = cb2_decode_phase(s2)
+    s2 = cb2_preemption_pass(s2)
+    s2["step"] = s2["step"] + 1
+    return s2
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Run until all requests finished or max_steps reached
+// ═══════════════════════════════════════════════════════════════════
+fn cb2_run_until_done(s, max_steps) {
+    let mut cur = s
+    for _i in 0..max_steps {
+        let nq = len(cur["queue"])
+        let nr = len(cur["running"])
+        let ns = len(cur["swapped"])
+        if nq == 0 {
+            if nr == 0 {
+                if ns == 0 {
+                    return cur
+                }
+            }
+        }
+        cur = cb2_run_step(cur, cur["step"])
+    }
+    return cur
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Dynamic batching — add request mid-generation, immediately
+//  considered on next iteration.
+// ═══════════════════════════════════════════════════════════════════
+fn cb2_add_mid_generation(s, req_id, prompt_len, max_gen, priority, deadline) {
+    return cb2_add_request(s, req_id, prompt_len, max_gen, priority, deadline)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Stats / Throughput reporting
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cb2_stats(s) {
+    return #{
+        "queue_size": len(s["queue"]),
+        "running_count": len(s["running"]),
+        "swapped_count": len(s["swapped"]),
+        "completed_count": len(s["completed"]),
+        "kv_used": s["kv_used"],
+        "kv_free": cb2_kv_free(s),
+        "step": s["step"],
+        "total_tokens": s["tracker"]["total_tokens"],
+        "total_preemptions": s["tracker"]["total_preemptions"]
+    }
+}
+
+@pure
+fn cb2_throughput(s) {
+    let t = s["tracker"]
+    let steps = s["step"]
+    let mut tok_per_step = 0.0
+    if steps > 0 {
+        tok_per_step = to_float(t["total_tokens"]) / to_float(steps)
+    }
+    let mut avg_latency = 0.0
+    if t["total_requests_done"] > 0 {
+        avg_latency = to_float(t["total_latency"]) / to_float(t["total_requests_done"])
+    }
+    let mut avg_wait = 0.0
+    if t["total_requests_done"] > 0 {
+        avg_wait = to_float(t["total_wait_time"]) / to_float(t["total_requests_done"])
+    }
+    return #{
+        "tokens_per_step": tok_per_step,
+        "avg_latency": avg_latency,
+        "avg_wait_time": avg_wait,
+        "max_latency": t["max_latency"],
+        "max_wait_time": t["max_wait_time"],
+        "total_tokens": t["total_tokens"],
+        "total_preemptions": t["total_preemptions"],
+        "total_swaps_out": t["total_swaps_out"],
+        "total_swaps_in": t["total_swaps_in"],
+        "total_requests_done": t["total_requests_done"]
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Find a request by ID in running / queue / swapped
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cb2_find_request(s, rid) {
+    let running = s["running"]
+    for i in 0..len(running) {
+        if running[i]["req_id"] == rid { return running[i] }
+    }
+    let queue = s["queue"]
+    for i in 0..len(queue) {
+        if queue[i]["req_id"] == rid { return queue[i] }
+    }
+    let swapped = s["swapped"]
+    for i in 0..len(swapped) {
+        if swapped[i]["req_id"] == rid { return swapped[i] }
+    }
+    let completed = s["completed"]
+    for i in 0..len(completed) {
+        if completed[i]["req_id"] == rid { return completed[i] }
+    }
+    return #{}
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Utility: count requests by phase across all lists
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cb2_count_by_phase(s, phase) {
+    let mut count = 0
+    let running = s["running"]
+    for i in 0..len(running) {
+        if running[i]["phase"] == phase { count = count + 1 }
+    }
+    let queue = s["queue"]
+    for i in 0..len(queue) {
+        if queue[i]["phase"] == phase { count = count + 1 }
+    }
+    return count
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Preempt to make room — evict lowest-priority until `needed` KV
+//  slots are free. Returns updated state.
+// ═══════════════════════════════════════════════════════════════════
+fn cb2_preempt_for_room(s, needed) {
+    let mut s2 = s
+    let mut safety = 0
+    while cb2_kv_free(s2) < needed {
+        if safety > 100 { return s2 }
+        let n = len(s2["running"])
+        if n == 0 { return s2 }
+        let victim_idx = cb2_find_preempt_victim(s2["running"])
+        if victim_idx < 0 { return s2 }
+        s2 = cb2_preempt_at(s2, victim_idx)
+        safety = safety + 1
+    }
+    return s2
+}
+
+println("[continuous_batching_v2] loaded — preemption + swap + SLA + priority queue + throughput tracker")

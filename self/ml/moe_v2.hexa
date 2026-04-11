@@ -1,0 +1,732 @@
+// ===================================================================
+//  self/ml/moe_v2.hexa — Fine-Grained MoE v2 (ML #134)
+//
+//  Extends base MoE with:
+//    1. Fine-grained expert splitting (m sub-experts per expert)
+//    2. Expert parallelism simulation (device assignment)
+//    3. Capacity factor (max tokens per expert)
+//    4. Auxiliary load balancing loss (importance + load)
+//    5. Shared expert (always active for all tokens)
+//    6. Expert choice routing (experts choose tokens)
+//    7. Load balancing metrics and monitoring
+//    8. Granular top-k over fine-grained sub-experts
+//    9. Router z-loss for stability
+//   10. Token drop and padding for fixed capacity
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects (math kernels)
+//    @hot   — performance-critical path
+//    @fuse  — fused gate+expert compute
+//    @lazy  — skip unselected experts
+// ===================================================================
+
+// ===================================================================
+//  Vector Utilities
+// ===================================================================
+
+fn mv2_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn mv2_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+fn mv2_fabs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn mv2_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn mv2_sigmoid(x) {
+    if x > 20.0 { return 1.0 }
+    if x < -20.0 { return 0.0 }
+    return 1.0 / (1.0 + mv2_exp(0.0 - x))
+}
+
+fn mv2_vec_add(a, b) {
+    let n = len(a)
+    let mut out = []
+    for i in 0..n { out = out + [a[i] + b[i]] }
+    return out
+}
+
+fn mv2_vec_scale(v, s) {
+    let n = len(v)
+    let mut out = []
+    for i in 0..n { out = out + [v[i] * s] }
+    return out
+}
+
+fn mv2_dot(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    for i in 0..n { s = s + a[i] * b[i] }
+    return s
+}
+
+fn mv2_log(x) {
+    if x <= 0.0 { return -20.0 }
+    // Newton-based ln approximation
+    let mut y = x
+    let mut count = 0
+    while y > 2.0 { y = y / 2.718281828 }
+    while y < 0.5 { y = y * 2.718281828 }
+    // series around 1: ln(y) = (y-1) - (y-1)^2/2 + ...
+    let mut t = (y - 1.0) / (y + 1.0)
+    let mut result = 0.0
+    let mut term = t
+    for i in 0..15 {
+        result = result + term / to_float(2 * i + 1)
+        term = term * t * t
+    }
+    result = result * 2.0
+    // adjust for the scaling we did
+    let mut adj = 0.0
+    let mut tmp = x
+    while tmp > 2.0 { tmp = tmp / 2.718281828 }
+    while tmp < 0.5 { tmp = tmp * 2.718281828 }
+    // recompute: how many times did we divide/multiply by e?
+    let mut r2 = x
+    let mut e_count = 0
+    while r2 > 2.0 {
+        r2 = r2 / 2.718281828
+        e_count = e_count + 1
+    }
+    while r2 < 0.5 {
+        r2 = r2 * 2.718281828
+        e_count = e_count - 1
+    }
+    return result + to_float(e_count)
+}
+
+// ===================================================================
+//  Softmax
+// ===================================================================
+@pure
+fn mv2_softmax(logits) {
+    let n = len(logits)
+    let mut mx = logits[0]
+    for i in 1..n {
+        if logits[i] > mx { mx = logits[i] }
+    }
+    let mut exps = mv2_zeros(n)
+    let mut z = 0.0
+    for i in 0..n {
+        exps[i] = mv2_exp(logits[i] - mx)
+        z = z + exps[i]
+    }
+    let mut out = mv2_zeros(n)
+    for i in 0..n {
+        out[i] = exps[i] / z
+    }
+    return out
+}
+
+// ===================================================================
+//  1. Expert Forward (single expert, linear: W @ x + b)
+//     W stored as flat array [d_out * d_in], row-major
+// ===================================================================
+@pure
+fn mv2_expert_fwd(W_flat, bias, x, d_out, d_in) {
+    let mut y = mv2_zeros(d_out)
+    for i in 0..d_out {
+        let mut s = bias[i]
+        for j in 0..d_in {
+            s = s + W_flat[i * d_in + j] * x[j]
+        }
+        y[i] = s
+    }
+    return y
+}
+
+// ===================================================================
+//  Gate: router scores for each expert
+//  gate_W: flat [n_experts * d_in]
+// ===================================================================
+@pure
+fn mv2_gate_scores(gate_W, x, n_experts, d_in) {
+    let mut scores = mv2_zeros(n_experts)
+    for e in 0..n_experts {
+        let mut acc = 0.0
+        for j in 0..d_in {
+            acc = acc + gate_W[e * d_in + j] * x[j]
+        }
+        scores[e] = acc
+    }
+    return scores
+}
+
+// ===================================================================
+//  Top-k selection (returns indices)
+// ===================================================================
+fn mv2_topk(scores, k) {
+    let n = len(scores)
+    let mut used = []
+    for _i in 0..n { used = used + [false] }
+    let mut picks = []
+    for _r in 0..k {
+        let mut best = -1
+        let mut best_v = -1.0e30
+        for i in 0..n {
+            if !used[i] {
+                if scores[i] > best_v {
+                    best_v = scores[i]
+                    best = i
+                }
+            }
+        }
+        if best >= 0 {
+            let mut used2 = []
+            for i in 0..n {
+                if i == best { used2 = used2 + [true] } else { used2 = used2 + [used[i]] }
+            }
+            used = used2
+            picks = picks + [best]
+        }
+    }
+    return picks
+}
+
+// ===================================================================
+//  Softmax over subset of indices
+// ===================================================================
+@pure
+fn mv2_softmax_subset(scores, picks) {
+    let k = len(picks)
+    if k == 0 { return [] }
+    let mut mx = scores[picks[0]]
+    for r in 1..k {
+        if scores[picks[r]] > mx { mx = scores[picks[r]] }
+    }
+    let mut exps = mv2_zeros(k)
+    let mut z = 0.0
+    for r in 0..k {
+        let v = mv2_exp(scores[picks[r]] - mx)
+        exps[r] = v
+        z = z + v
+    }
+    let mut out = mv2_zeros(k)
+    for r in 0..k {
+        out[r] = exps[r] / z
+    }
+    return out
+}
+
+// ===================================================================
+//  1. Fine-Grained Expert Splitting
+//
+//  Split each of n_experts into m sub-experts.
+//  Total sub-experts = n_experts * m.
+//  Each sub-expert has d_out/m output dimensions.
+//  Final output: concatenate sub-expert outputs.
+// ===================================================================
+
+// Create sub-expert weights: returns flat array of weights for sub-expert
+fn mv2_create_sub_expert_weights(expert_id, sub_id, d_out_sub, d_in) {
+    let mut w = []
+    for i in 0..d_out_sub {
+        for j in 0..d_in {
+            let seed_val = (expert_id + 1) * 1337 + (sub_id + 1) * 997 + i * 31 + j * 7
+            let v = sin(to_float(seed_val)) * 0.1
+            w = w + [v]
+        }
+    }
+    return w
+}
+
+fn mv2_create_sub_expert_bias(expert_id, sub_id, d_out_sub) {
+    let mut b = []
+    for i in 0..d_out_sub {
+        let seed_val = (expert_id + 1) * 571 + (sub_id + 1) * 113 + i * 13
+        b = b + [sin(to_float(seed_val)) * 0.01]
+    }
+    return b
+}
+
+// Fine-grained forward: run m sub-experts for a single coarse expert,
+// concatenate outputs to get d_out total.
+// sub_weights: array of flat weight arrays [m][d_out_sub * d_in]
+// sub_biases: array of bias arrays [m][d_out_sub]
+@pure
+fn mv2_fine_grained_expert_fwd(sub_weights, sub_biases, x, m, d_out_sub, d_in) {
+    let mut y = []
+    for s in 0..m {
+        let out_s = mv2_expert_fwd(sub_weights[s], sub_biases[s], x, d_out_sub, d_in)
+        for i in 0..d_out_sub {
+            y = y + [out_s[i]]
+        }
+    }
+    return y
+}
+
+// ===================================================================
+//  2. Expert Parallelism Simulation
+//
+//  Assign experts to virtual devices. Track which device processes
+//  which expert. Returns device assignment map.
+// ===================================================================
+
+fn mv2_assign_experts_to_devices(n_experts, n_devices) {
+    // Round-robin assignment
+    let mut assignment = mv2_zeros_int(n_experts)
+    for e in 0..n_experts {
+        assignment[e] = e % n_devices
+    }
+    return assignment
+}
+
+fn mv2_experts_on_device(assignment, device_id, n_experts) {
+    let mut experts = []
+    for e in 0..n_experts {
+        if assignment[e] == device_id {
+            experts = experts + [e]
+        }
+    }
+    return experts
+}
+
+// Count experts per device
+fn mv2_device_load(assignment, n_experts, n_devices) {
+    let mut loads = mv2_zeros_int(n_devices)
+    for e in 0..n_experts {
+        let d = assignment[e]
+        loads[d] = loads[d] + 1
+    }
+    return loads
+}
+
+// ===================================================================
+//  3. Capacity Factor
+//
+//  Limit tokens per expert: capacity = ceil(n_tokens * cap_factor / n_experts)
+//  Tokens beyond capacity are dropped.
+// ===================================================================
+
+fn mv2_compute_capacity(n_tokens, n_experts, cap_factor) {
+    let raw = to_float(n_tokens) * cap_factor / to_float(n_experts)
+    let mut cap = to_int(raw)
+    if to_float(cap) < raw { cap = cap + 1 }
+    if cap < 1 { cap = 1 }
+    return cap
+}
+
+// Given token-to-expert assignments, enforce capacity limit.
+// assignments: array of expert ids (one per token)
+// Returns: array of booleans (true = kept, false = dropped)
+fn mv2_enforce_capacity(assignments, n_tokens, n_experts, capacity) {
+    let mut counts = mv2_zeros_int(n_experts)
+    let mut kept = []
+    for _i in 0..n_tokens { kept = kept + [false] }
+    for i in 0..n_tokens {
+        let e = assignments[i]
+        if counts[e] < capacity {
+            counts[e] = counts[e] + 1
+            kept[i] = true
+        }
+    }
+    return kept
+}
+
+// ===================================================================
+//  4. Auxiliary Load Balancing Loss
+//
+//  Two components:
+//    (a) Importance loss: variance of sum of router probs per expert
+//    (b) Load balance loss: variance of token counts per expert
+//
+//  Total aux_loss = alpha * (importance_loss + load_loss)
+// ===================================================================
+
+// Importance loss: Σ_e (f_e - mean_f)^2
+// where f_e = Σ_t router_prob(t, e) for all tokens t
+@pure
+fn mv2_importance_loss(router_probs_flat, n_tokens, n_experts) {
+    // router_probs_flat: flat [n_tokens * n_experts]
+    let mut f = mv2_zeros(n_experts)
+    for t in 0..n_tokens {
+        for e in 0..n_experts {
+            f[e] = f[e] + router_probs_flat[t * n_experts + e]
+        }
+    }
+    let mut mean_f = 0.0
+    for e in 0..n_experts { mean_f = mean_f + f[e] }
+    mean_f = mean_f / to_float(n_experts)
+    let mut var_f = 0.0
+    for e in 0..n_experts {
+        let diff = f[e] - mean_f
+        var_f = var_f + diff * diff
+    }
+    return var_f / to_float(n_experts)
+}
+
+// Load balance loss: CV^2 of token counts per expert
+@pure
+fn mv2_load_balance_loss(token_counts, n_experts) {
+    let mut mean_c = 0.0
+    for e in 0..n_experts { mean_c = mean_c + to_float(token_counts[e]) }
+    mean_c = mean_c / to_float(n_experts)
+    if mean_c < 0.001 { return 0.0 }
+    let mut var_c = 0.0
+    for e in 0..n_experts {
+        let diff = to_float(token_counts[e]) - mean_c
+        var_c = var_c + diff * diff
+    }
+    var_c = var_c / to_float(n_experts)
+    return var_c / (mean_c * mean_c)
+}
+
+// Combined auxiliary loss
+@pure
+fn mv2_aux_loss(router_probs_flat, token_counts, n_tokens, n_experts, alpha) {
+    let imp = mv2_importance_loss(router_probs_flat, n_tokens, n_experts)
+    let lb = mv2_load_balance_loss(token_counts, n_experts)
+    return alpha * (imp + lb)
+}
+
+// ===================================================================
+//  5. Shared Expert
+//
+//  One expert always active for all tokens.
+//  Output = shared_expert(x) + sum(routed experts weighted)
+// ===================================================================
+
+// Shared + routed forward for a single token
+@fuse
+fn mv2_shared_expert_forward(shared_W, shared_bias, routed_Ws, routed_biases, gate_W, x, n_routed, d_out, d_in, top_k) {
+    // Shared expert always runs
+    let shared_out = mv2_expert_fwd(shared_W, shared_bias, x, d_out, d_in)
+    // Route among routed experts
+    let scores = mv2_gate_scores(gate_W, x, n_routed, d_in)
+    let picks = mv2_topk(scores, top_k)
+    let probs = mv2_softmax_subset(scores, picks)
+    let mut routed_out = mv2_zeros(d_out)
+    for r in 0..top_k {
+        let e = picks[r]
+        let p = probs[r]
+        let ye = mv2_expert_fwd(routed_Ws[e], routed_biases[e], x, d_out, d_in)
+        for i in 0..d_out {
+            routed_out[i] = routed_out[i] + p * ye[i]
+        }
+    }
+    // Combine: shared + routed
+    return mv2_vec_add(shared_out, routed_out)
+}
+
+// ===================================================================
+//  6. Expert Choice Routing
+//
+//  Instead of tokens choosing experts, experts choose their top-c tokens.
+//  score_matrix: [n_experts * n_tokens] (experts score all tokens)
+//  Each expert picks top-c tokens (c = capacity).
+// ===================================================================
+
+// Build score matrix: experts score each token
+@pure
+fn mv2_expert_choice_scores(gate_W, tokens, n_experts, n_tokens, d_in) {
+    // score_matrix: flat [n_experts * n_tokens]
+    let mut scores = mv2_zeros(n_experts * n_tokens)
+    for e in 0..n_experts {
+        for t in 0..n_tokens {
+            let mut acc = 0.0
+            for j in 0..d_in {
+                acc = acc + gate_W[e * d_in + j] * tokens[t][j]
+            }
+            scores[e * n_tokens + t] = acc
+        }
+    }
+    return scores
+}
+
+// Expert choice: each expert picks top-c tokens
+fn mv2_expert_choice_route(scores, n_experts, n_tokens, capacity) {
+    // Returns: assignments[e] = array of token indices chosen by expert e
+    let mut all_assignments = []
+    for e in 0..n_experts {
+        let mut expert_scores = mv2_zeros(n_tokens)
+        for t in 0..n_tokens {
+            expert_scores[t] = scores[e * n_tokens + t]
+        }
+        let picks = mv2_topk(expert_scores, capacity)
+        all_assignments = all_assignments + [picks]
+    }
+    return all_assignments
+}
+
+// Expert choice forward: each expert processes its chosen tokens
+@lazy
+fn mv2_expert_choice_forward(expert_Ws, expert_biases, gate_W, tokens, n_experts, n_tokens, d_out, d_in, capacity) {
+    let scores = mv2_expert_choice_scores(gate_W, tokens, n_experts, n_tokens, d_in)
+    let assignments = mv2_expert_choice_route(scores, n_experts, n_tokens, capacity)
+    // Build output: accumulate expert outputs per token
+    let mut outputs = []
+    for t in 0..n_tokens {
+        outputs = outputs + [mv2_zeros(d_out)]
+    }
+    let mut token_counts = mv2_zeros_int(n_tokens)
+    for e in 0..n_experts {
+        let picks = assignments[e]
+        let np = len(picks)
+        // softmax over chosen token scores
+        let mut chosen_scores = []
+        for p in 0..np {
+            chosen_scores = chosen_scores + [scores[e * n_tokens + picks[p]]]
+        }
+        let probs = mv2_softmax(chosen_scores)
+        for p in 0..np {
+            let t = picks[p]
+            let ye = mv2_expert_fwd(expert_Ws[e], expert_biases[e], tokens[t], d_out, d_in)
+            let cur = outputs[t]
+            let mut new_out = mv2_zeros(d_out)
+            for i in 0..d_out {
+                new_out[i] = cur[i] + probs[p] * ye[i]
+            }
+            // rebuild outputs array with updated token
+            let mut new_outputs = []
+            for tt in 0..n_tokens {
+                if tt == t {
+                    new_outputs = new_outputs + [new_out]
+                } else {
+                    new_outputs = new_outputs + [outputs[tt]]
+                }
+            }
+            outputs = new_outputs
+            token_counts[t] = token_counts[t] + 1
+        }
+    }
+    return [outputs, token_counts]
+}
+
+// ===================================================================
+//  7. Load Balancing Metrics and Monitoring
+// ===================================================================
+
+// Compute per-expert token counts from assignments
+fn mv2_count_per_expert(assignments, n_tokens, n_experts) {
+    let mut counts = mv2_zeros_int(n_experts)
+    for i in 0..n_tokens {
+        let e = assignments[i]
+        if e >= 0 {
+            if e < n_experts {
+                counts[e] = counts[e] + 1
+            }
+        }
+    }
+    return counts
+}
+
+// Coefficient of variation for load balance
+@pure
+fn mv2_load_cv(counts, n_experts) {
+    let mut mean_c = 0.0
+    for e in 0..n_experts { mean_c = mean_c + to_float(counts[e]) }
+    mean_c = mean_c / to_float(n_experts)
+    if mean_c < 0.001 { return 0.0 }
+    let mut var_c = 0.0
+    for e in 0..n_experts {
+        let diff = to_float(counts[e]) - mean_c
+        var_c = var_c + diff * diff
+    }
+    var_c = var_c / to_float(n_experts)
+    return sqrt(var_c) / mean_c
+}
+
+// Max-to-min ratio
+fn mv2_load_max_min_ratio(counts, n_experts) {
+    let mut mx = counts[0]
+    let mut mn = counts[0]
+    for e in 1..n_experts {
+        if counts[e] > mx { mx = counts[e] }
+        if counts[e] < mn { mn = counts[e] }
+    }
+    if mn == 0 { return to_float(mx + 1) }
+    return to_float(mx) / to_float(mn)
+}
+
+// Expert utilization: fraction of experts with > 0 tokens
+fn mv2_expert_utilization(counts, n_experts) {
+    let mut active = 0
+    for e in 0..n_experts {
+        if counts[e] > 0 { active = active + 1 }
+    }
+    return to_float(active) / to_float(n_experts)
+}
+
+// ===================================================================
+//  8. Granular Top-k over Fine-Grained Sub-Experts
+//
+//  Instead of picking top-k coarse experts, pick top-k from
+//  n_experts * m sub-experts, then map back to coarse experts.
+// ===================================================================
+
+// Gate scores for all sub-experts
+@pure
+fn mv2_sub_expert_gate_scores(gate_W, x, n_sub_experts, d_in) {
+    return mv2_gate_scores(gate_W, x, n_sub_experts, d_in)
+}
+
+// Pick top-k sub-experts; return sub-expert indices
+fn mv2_granular_topk(gate_W, x, n_experts, m, d_in, k) {
+    let n_sub = n_experts * m
+    let scores = mv2_sub_expert_gate_scores(gate_W, x, n_sub, d_in)
+    let picks = mv2_topk(scores, k)
+    return [picks, scores]
+}
+
+// Map sub-expert index to (coarse_expert, sub_index)
+fn mv2_sub_to_coarse(sub_idx, m) {
+    let coarse = sub_idx / m
+    let sub = sub_idx % m
+    return [coarse, sub]
+}
+
+// ===================================================================
+//  9. Router Z-Loss for Stability
+//
+//  z_loss = (1/n) * sum_t log(sum_e exp(router_logit(t,e)))^2
+//  Penalizes large router logits to prevent overflow.
+// ===================================================================
+@pure
+fn mv2_router_z_loss(router_logits_flat, n_tokens, n_experts) {
+    let mut total = 0.0
+    for t in 0..n_tokens {
+        // log-sum-exp for this token
+        let mut mx = router_logits_flat[t * n_experts]
+        for e in 1..n_experts {
+            let v = router_logits_flat[t * n_experts + e]
+            if v > mx { mx = v }
+        }
+        let mut sum_exp = 0.0
+        for e in 0..n_experts {
+            sum_exp = sum_exp + mv2_exp(router_logits_flat[t * n_experts + e] - mx)
+        }
+        let lse = mx + mv2_log(sum_exp)
+        total = total + lse * lse
+    }
+    return total / to_float(n_tokens)
+}
+
+// ===================================================================
+//  10. Token Drop and Padding for Fixed Capacity
+//
+//  For each expert, keep at most `capacity` tokens.
+//  If fewer tokens routed, pad with zero vectors.
+//  Returns: (kept_tokens_per_expert, dropped_count, padded_count)
+// ===================================================================
+
+// Token drop and pad: returns [total_dropped, total_padded, kept_count_expert_0, ...]
+fn mv2_token_drop_and_pad(assignments, scores, n_tokens, n_experts, capacity) {
+    let mut expert_count = mv2_zeros_int(n_experts)
+    for t in 0..n_tokens {
+        let e = assignments[t]
+        expert_count[e] = expert_count[e] + 1
+    }
+    let mut total_dropped = 0
+    let mut total_padded = 0
+    let mut kept_counts = mv2_zeros_int(n_experts)
+    for e in 0..n_experts {
+        let n_et = expert_count[e]
+        let mut to_keep = capacity
+        if to_keep > n_et { to_keep = n_et }
+        kept_counts[e] = to_keep
+        if n_et > capacity { total_dropped = total_dropped + (n_et - capacity) }
+        if n_et < capacity { total_padded = total_padded + (capacity - n_et) }
+    }
+    let mut result = [total_dropped, total_padded]
+    for e in 0..n_experts {
+        result = result + [kept_counts[e]]
+    }
+    return result
+}
+
+// ===================================================================
+//  Standard MoE v2 Forward (with all features)
+//
+//  Combines: top-k routing, capacity, load balance, z-loss
+// ===================================================================
+@fuse @hot
+fn mv2_forward(expert_Ws, expert_biases, gate_W, tokens, n_experts, n_tokens, d_out, d_in, top_k, cap_factor) {
+    // 1. Compute router logits for all tokens
+    let mut all_logits = mv2_zeros(n_tokens * n_experts)
+    for t in 0..n_tokens {
+        let scores = mv2_gate_scores(gate_W, tokens[t], n_experts, d_in)
+        for e in 0..n_experts {
+            all_logits[t * n_experts + e] = scores[e]
+        }
+    }
+    // 2. Router probs (softmax per token)
+    let mut all_probs = mv2_zeros(n_tokens * n_experts)
+    for t in 0..n_tokens {
+        let mut t_logits = mv2_zeros(n_experts)
+        for e in 0..n_experts { t_logits[e] = all_logits[t * n_experts + e] }
+        let t_probs = mv2_softmax(t_logits)
+        for e in 0..n_experts {
+            all_probs[t * n_experts + e] = t_probs[e]
+        }
+    }
+    // 3. Top-k routing per token
+    let mut assignments = mv2_zeros_int(n_tokens)
+    let mut token_picks = []
+    let mut token_probs = []
+    for t in 0..n_tokens {
+        let mut t_scores = mv2_zeros(n_experts)
+        for e in 0..n_experts { t_scores[e] = all_logits[t * n_experts + e] }
+        let picks = mv2_topk(t_scores, top_k)
+        let probs = mv2_softmax_subset(t_scores, picks)
+        token_picks = token_picks + [picks]
+        token_probs = token_probs + [probs]
+        assignments[t] = picks[0]
+    }
+    // 4. Capacity enforcement
+    let capacity = mv2_compute_capacity(n_tokens, n_experts, cap_factor)
+    let kept = mv2_enforce_capacity(assignments, n_tokens, n_experts, capacity)
+    // 5. Expert counts
+    let mut expert_counts = mv2_zeros_int(n_experts)
+    for t in 0..n_tokens {
+        if kept[t] { expert_counts[assignments[t]] = expert_counts[assignments[t]] + 1 }
+    }
+    // 6. Forward pass
+    let mut outputs = []
+    for t in 0..n_tokens {
+        if kept[t] {
+            let picks = token_picks[t]
+            let probs = token_probs[t]
+            let mut y = mv2_zeros(d_out)
+            for r in 0..top_k {
+                let e = picks[r]
+                let p = probs[r]
+                let ye = mv2_expert_fwd(expert_Ws[e], expert_biases[e], tokens[t], d_out, d_in)
+                for i in 0..d_out {
+                    y[i] = y[i] + p * ye[i]
+                }
+            }
+            outputs = outputs + [y]
+        } else {
+            // Dropped token: zero output
+            outputs = outputs + [mv2_zeros(d_out)]
+        }
+    }
+    // 7. Compute losses
+    let z_loss = mv2_router_z_loss(all_logits, n_tokens, n_experts)
+    let aux = mv2_aux_loss(all_probs, expert_counts, n_tokens, n_experts, 0.01)
+    return [outputs, z_loss, aux, expert_counts]
+}
+
+println("[moe_v2] loaded — fine-grained MoE v2 with 10 features")

@@ -1,0 +1,701 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/curriculum_v2.hexa — Curriculum v2: Multi-Objective (#152)
+//
+//  Extends curriculum learning with multi-objective sample selection,
+//  Pareto frontier, dynamic weighting, task-aware pacing, domain
+//  balancing, anti-stale mechanism, auto-difficulty, progress matrix.
+//
+//  Components:
+//    1. Multi-objective scorer   — score across difficulty/domain/quality
+//    2. Pareto frontier          — non-dominated sample sets
+//    3. Dynamic weighting        — adjust objective weights from progress
+//    4. Task-aware pacing        — per-domain pacing schedules
+//    5. Domain balancer          — balanced sampling across domains
+//    6. Anti-stale mechanism     — prevent samples stuck unsampled
+//    7. Auto-difficulty          — calibrate thresholds from loss stats
+//    8. Progress matrix          — per-domain, per-difficulty tracking
+//
+//  API (pure):
+//    cv2_multi_score(losses, lengths, qualities)          -> [[float]]
+//    cv2_normalize_col(matrix, col)                       -> [[float]]
+//    cv2_weighted_score(matrix, weights)                  -> [float]
+//    cv2_dominates(a, b)                                  -> bool
+//    cv2_pareto_frontier(matrix)                          -> [int]
+//    cv2_pareto_rank(matrix)                              -> [int]
+//    cv2_dynamic_weight_update(weights, progress, lr)     -> [float]
+//    cv2_task_pace(step, total, mode)                     -> float
+//    cv2_multi_task_paces(step, total, modes)             -> [float]
+//    cv2_domain_counts(domains, n_domains)                -> [int]
+//    cv2_domain_balance_weights(domains, n_domains)       -> [float]
+//    cv2_balanced_sample(domains, n_domains, batch_size, seed) -> [int]
+//    cv2_anti_stale_boost(last_seen, current_step, decay) -> [float]
+//    cv2_apply_stale_boost(scores, boosts)                -> [float]
+//    cv2_auto_difficulty_thresholds(losses, n_buckets)    -> [float]
+//    cv2_loss_percentile(losses, p)                       -> float
+//    cv2_progress_matrix_new(n_domains, n_levels)         -> [[float]]
+//    cv2_progress_update(matrix, domain, level, loss)     -> [[float]]
+//    cv2_progress_get(matrix, domain, level)              -> float
+//    cv2_weakest_domain(matrix)                           -> int
+//    cv2_weakest_cell(matrix, n_domains, n_levels)        -> [int]
+//    cv2_full_step(losses, lengths, qualities, domains,
+//                  n_domains, weights, step, total,
+//                  pace_modes, last_seen, progress,
+//                  batch_size, seed)                       -> result
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+//    @hot   — called every training step
+// ═══════════════════════════════════════════════════════════════════
+
+// ── math helpers (cv2_ prefix) ──────────────────────────────────
+
+fn cv2_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn cv2_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn cv2_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn cv2_log(x) {
+    if x <= 0.0 { return -30.0 }
+    let mut v = x
+    let mut count = 0
+    while v > 2.0 { v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.5 { v = v * 2.718281828
+        count = count - 1
+    }
+    let d = v - 1.0
+    return to_float(count) + d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+}
+
+fn cv2_floor(x) {
+    let i = to_int(x)
+    if to_float(i) > x { return i - 1 }
+    return i
+}
+
+fn cv2_min(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn cv2_max(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn cv2_clamp(x, lo, hi) {
+    if x < lo { return lo }
+    if x > hi { return hi }
+    return x
+}
+
+fn cv2_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn cv2_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+fn cv2_hash(seed, i) {
+    let h = ((seed * 2654435761 + i * 1315423911) % 10007)
+    if h < 0 { return 0 - h }
+    return h
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  1. Multi-Objective Scorer
+//
+//  Score each sample across 3 dimensions: difficulty (loss),
+//  complexity (length), quality. Returns Nx3 matrix as flat array
+//  of rows: [[d0,l0,q0], [d1,l1,q1], ...]
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cv2_multi_score(losses, lengths, qualities) {
+    let n = len(losses)
+    let mut matrix = []
+    for i in 0..n {
+        let row = [losses[i], to_float(lengths[i]), qualities[i]]
+        matrix = matrix + [row]
+    }
+    return matrix
+}
+
+// Normalize a single column of the score matrix to [0,1]
+@pure
+fn cv2_normalize_col(matrix, col) {
+    let n = len(matrix)
+    if n == 0 { return [] }
+    let mut lo = matrix[0][col]
+    let mut hi = matrix[0][col]
+    for i in 1..n {
+        if matrix[i][col] < lo { lo = matrix[i][col] }
+        if matrix[i][col] > hi { hi = matrix[i][col] }
+    }
+    let range = hi - lo
+    let mut out = []
+    for i in 0..n {
+        let mut row = []
+        for c in 0..len(matrix[i]) {
+            if c == col {
+                if range < 1.0e-10 {
+                    row = row + [0.5]
+                } else {
+                    row = row + [(matrix[i][c] - lo) / range]
+                }
+            } else {
+                row = row + [matrix[i][c]]
+            }
+        }
+        out = out + [row]
+    }
+    return out
+}
+
+// Normalize all columns of the matrix
+@pure
+fn cv2_normalize_all(matrix) {
+    if len(matrix) == 0 { return [] }
+    let n_cols = len(matrix[0])
+    let mut m = matrix
+    for c in 0..n_cols {
+        m = cv2_normalize_col(m, c)
+    }
+    return m
+}
+
+// Compute weighted composite score from multi-objective matrix
+// weights = [w_diff, w_len, w_quality]
+@pure
+fn cv2_weighted_score(matrix, weights) {
+    let n = len(matrix)
+    let mut scores = cv2_zeros(n)
+    for i in 0..n {
+        let mut s = 0.0
+        let n_w = len(weights)
+        for j in 0..n_w {
+            s = s + weights[j] * matrix[i][j]
+        }
+        scores[i] = s
+    }
+    return scores
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  2. Pareto Frontier
+//
+//  Point a dominates b if a[j] <= b[j] for all j, with at least
+//  one strict inequality. Non-dominated points form the frontier.
+//  (We minimize all objectives for difficulty ordering.)
+// ═══════════════════════════════════════════════════════════════════
+
+// Returns true if point a dominates point b (a <= b all dims, a < b at least one)
+@pure
+fn cv2_dominates(a, b) {
+    let n = len(a)
+    let mut all_leq = true
+    let mut any_lt = false
+    for i in 0..n {
+        if a[i] > b[i] { all_leq = false }
+        if a[i] < b[i] { any_lt = true }
+    }
+    return all_leq && any_lt
+}
+
+// Find indices of non-dominated points (Pareto frontier)
+@pure
+fn cv2_pareto_frontier(matrix) {
+    let n = len(matrix)
+    let mut on_frontier = []
+    for _i in 0..n { on_frontier = on_frontier + [true] }
+    for i in 0..n {
+        if on_frontier[i] {
+            for j in 0..n {
+                if i != j && on_frontier[j] {
+                    if cv2_dominates(matrix[i], matrix[j]) {
+                        on_frontier[j] = false
+                    }
+                }
+            }
+        }
+    }
+    let mut frontier = []
+    for i in 0..n {
+        if on_frontier[i] {
+            frontier = frontier + [i]
+        }
+    }
+    return frontier
+}
+
+// Assign Pareto ranks: rank 0 = frontier, rank 1 = frontier of remainder, etc.
+@pure
+fn cv2_pareto_rank(matrix) {
+    let n = len(matrix)
+    let mut ranks = cv2_zeros_int(n)
+    let mut assigned = []
+    for _i in 0..n { assigned = assigned + [false] }
+    let mut current_rank = 0
+    let mut remaining = n
+    while remaining > 0 {
+        // Build sub-matrix of unassigned
+        let mut sub_indices = []
+        for i in 0..n {
+            if !assigned[i] {
+                sub_indices = sub_indices + [i]
+            }
+        }
+        let mut sub_matrix = []
+        for i in 0..len(sub_indices) {
+            sub_matrix = sub_matrix + [matrix[sub_indices[i]]]
+        }
+        // Find frontier within sub
+        let sub_frontier = cv2_pareto_frontier(sub_matrix)
+        for i in 0..len(sub_frontier) {
+            let orig_idx = sub_indices[sub_frontier[i]]
+            ranks[orig_idx] = current_rank
+            assigned[orig_idx] = true
+            remaining = remaining - 1
+        }
+        current_rank = current_rank + 1
+    }
+    return ranks
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  3. Dynamic Weighting
+//
+//  Adjust objective weights based on training progress per objective.
+//  Objectives with less progress get higher weight.
+//  progress = [p0, p1, ...] each in [0,1]
+//  weights' = softmax(weights - lr * progress)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cv2_dynamic_weight_update(weights, progress, lr) {
+    let n = len(weights)
+    // Adjust: shift weight inversely with progress
+    let mut adjusted = cv2_zeros(n)
+    for i in 0..n {
+        adjusted[i] = weights[i] - lr * progress[i]
+    }
+    // Softmax normalization
+    let mut max_v = adjusted[0]
+    for i in 1..n {
+        if adjusted[i] > max_v { max_v = adjusted[i] }
+    }
+    let mut exp_sum = 0.0
+    let mut exps = cv2_zeros(n)
+    for i in 0..n {
+        exps[i] = cv2_exp(adjusted[i] - max_v)
+        exp_sum = exp_sum + exps[i]
+    }
+    let mut out = cv2_zeros(n)
+    if exp_sum < 1.0e-10 {
+        for i in 0..n { out[i] = 1.0 / to_float(n) }
+        return out
+    }
+    for i in 0..n {
+        out[i] = exps[i] / exp_sum
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  4. Task-Aware Pacing
+//
+//  Different pacing modes per task/domain.
+//  mode: 0=linear, 1=sqrt, 2=step, 3=exp
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cv2_task_pace(step, total, mode) {
+    if total <= 0 { return 1.0 }
+    let ratio = to_float(step) / to_float(total)
+    if mode == 0 {
+        return cv2_clamp(ratio, 0.0, 1.0)
+    }
+    if mode == 1 {
+        return cv2_clamp(cv2_sqrt(cv2_min(ratio, 1.0)), 0.0, 1.0)
+    }
+    if mode == 2 {
+        let n_stages = 5
+        let stage_len = total / n_stages
+        if stage_len <= 0 { return 1.0 }
+        let cur_stage = step / stage_len
+        let s = cv2_min(cur_stage + 1, n_stages)
+        return to_float(s) / to_float(n_stages)
+    }
+    if mode == 3 {
+        let gamma = 3.0
+        let c = 1.0 - cv2_exp(0.0 - gamma * ratio)
+        return cv2_clamp(c, 0.0, 1.0)
+    }
+    return cv2_clamp(ratio, 0.0, 1.0)
+}
+
+// Compute pacing values for multiple tasks, each with its own mode
+@pure
+fn cv2_multi_task_paces(step, total, modes) {
+    let n = len(modes)
+    let mut paces = cv2_zeros(n)
+    for i in 0..n {
+        paces[i] = cv2_task_pace(step, total, modes[i])
+    }
+    return paces
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  5. Domain Balancer
+//
+//  Track sample counts per domain and produce inverse-frequency
+//  weights so underrepresented domains get sampled more.
+// ═══════════════════════════════════════════════════════════════════
+
+// Count how many samples belong to each domain
+@pure
+fn cv2_domain_counts(domains, n_domains) {
+    let mut counts = cv2_zeros_int(n_domains)
+    let n = len(domains)
+    for i in 0..n {
+        let d = domains[i]
+        if d >= 0 && d < n_domains {
+            counts[d] = counts[d] + 1
+        }
+    }
+    return counts
+}
+
+// Compute balance weights: inverse frequency, normalized
+@pure
+fn cv2_domain_balance_weights(domains, n_domains) {
+    let counts = cv2_domain_counts(domains, n_domains)
+    let n = len(domains)
+    let mut weights = cv2_zeros(n_domains)
+    let mut total_w = 0.0
+    for d in 0..n_domains {
+        if counts[d] > 0 {
+            weights[d] = to_float(n) / to_float(counts[d])
+        } else {
+            weights[d] = 1.0
+        }
+        total_w = total_w + weights[d]
+    }
+    // Normalize
+    if total_w > 1.0e-10 {
+        for d in 0..n_domains {
+            weights[d] = weights[d] / total_w
+        }
+    }
+    return weights
+}
+
+// Sample batch_size indices with domain-balanced weighting
+@pure
+fn cv2_balanced_sample(domains, n_domains, batch_size, seed) {
+    let bal_weights = cv2_domain_balance_weights(domains, n_domains)
+    let n = len(domains)
+    let mut batch = []
+    for b in 0..batch_size {
+        // Pick domain proportional to balance weights via hash
+        let h = cv2_hash(seed, b)
+        let frac = to_float(h % 10000) / 10000.0
+        let mut cumul = 0.0
+        let mut picked_domain = 0
+        for d in 0..n_domains {
+            cumul = cumul + bal_weights[d]
+            if frac < cumul {
+                picked_domain = d
+                break
+            }
+        }
+        // Pick a sample from that domain
+        let mut domain_samples = []
+        for i in 0..n {
+            if domains[i] == picked_domain {
+                domain_samples = domain_samples + [i]
+            }
+        }
+        if len(domain_samples) > 0 {
+            let h2 = cv2_hash(seed + 7919, b)
+            let idx = h2 % len(domain_samples)
+            batch = batch + [domain_samples[idx]]
+        }
+    }
+    return batch
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  6. Anti-Stale Mechanism
+//
+//  Samples not seen for many steps get a boost to their priority
+//  score, preventing them from being permanently skipped.
+//  boost = decay * (current_step - last_seen[i])
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cv2_anti_stale_boost(last_seen, current_step, decay) {
+    let n = len(last_seen)
+    let mut boosts = cv2_zeros(n)
+    for i in 0..n {
+        let age = current_step - last_seen[i]
+        if age > 0 {
+            boosts[i] = decay * to_float(age)
+        } else {
+            boosts[i] = 0.0
+        }
+    }
+    return boosts
+}
+
+// Apply stale boost: higher boost -> sample scores higher priority
+// For curriculum ordering, we subtract boost from difficulty so stale
+// samples appear easier (get picked sooner).
+@pure
+fn cv2_apply_stale_boost(scores, boosts) {
+    let n = len(scores)
+    let mut out = cv2_zeros(n)
+    for i in 0..n {
+        out[i] = scores[i] - boosts[i]
+        if out[i] < 0.0 { out[i] = 0.0 }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  7. Auto-Difficulty
+//
+//  Automatically compute difficulty thresholds from loss statistics
+//  using percentile-based bucketing.
+// ═══════════════════════════════════════════════════════════════════
+
+// Sort an array of floats ascending (returns sorted copy)
+@pure
+fn cv2_sort_floats(arr) {
+    let n = len(arr)
+    let mut sorted = cv2_zeros(n)
+    for i in 0..n { sorted[i] = arr[i] }
+    // Selection sort
+    for i in 0..n {
+        let mut best = i
+        for j in (i + 1)..n {
+            if sorted[j] < sorted[best] { best = j }
+        }
+        if best != i {
+            let tmp = sorted[i]
+            sorted[i] = sorted[best]
+            sorted[best] = tmp
+        }
+    }
+    return sorted
+}
+
+// Compute percentile value from sorted array
+@pure
+fn cv2_loss_percentile(losses, p) {
+    let sorted = cv2_sort_floats(losses)
+    let n = len(sorted)
+    if n == 0 { return 0.0 }
+    let idx_f = p * to_float(n - 1)
+    let idx = cv2_floor(idx_f)
+    if idx < 0 { return sorted[0] }
+    if idx >= n - 1 { return sorted[n - 1] }
+    // Linear interpolation
+    let frac = idx_f - to_float(idx)
+    return sorted[idx] * (1.0 - frac) + sorted[idx + 1] * frac
+}
+
+// Auto-generate thresholds: split losses into n_buckets equal-frequency bands
+// Returns n_buckets-1 threshold values
+@pure
+fn cv2_auto_difficulty_thresholds(losses, n_buckets) {
+    if n_buckets <= 1 { return [] }
+    let mut thresholds = []
+    for b in 1..n_buckets {
+        let p = to_float(b) / to_float(n_buckets)
+        let t = cv2_loss_percentile(losses, p)
+        thresholds = thresholds + [t]
+    }
+    return thresholds
+}
+
+// Assign a sample to a bucket given auto thresholds
+@pure
+fn cv2_auto_assign_bucket(score, thresholds) {
+    let n = len(thresholds)
+    for i in 0..n {
+        if score <= thresholds[i] { return i }
+    }
+    return n
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  8. Progress Matrix
+//
+//  Track learning progress per (domain, difficulty_level).
+//  Matrix dimensions: n_domains x n_levels
+//  Each cell holds an EMA of recent loss for that combination.
+// ═══════════════════════════════════════════════════════════════════
+
+// Create a new progress matrix (n_domains x n_levels), initialized to 1.0
+@pure
+fn cv2_progress_matrix_new(n_domains, n_levels) {
+    let mut matrix = []
+    for _d in 0..n_domains {
+        let mut row = []
+        for _l in 0..n_levels { row = row + [1.0] }
+        matrix = matrix + [row]
+    }
+    return matrix
+}
+
+// Update a cell with EMA: new = 0.9 * old + 0.1 * loss
+@pure
+fn cv2_progress_update(matrix, domain, level, loss) {
+    let n_d = len(matrix)
+    let mut out = []
+    for d in 0..n_d {
+        let n_l = len(matrix[d])
+        let mut row = []
+        for l in 0..n_l {
+            if d == domain && l == level {
+                let updated = 0.9 * matrix[d][l] + 0.1 * loss
+                row = row + [updated]
+            } else {
+                row = row + [matrix[d][l]]
+            }
+        }
+        out = out + [row]
+    }
+    return out
+}
+
+// Get the current progress value for a (domain, level) cell
+@pure
+fn cv2_progress_get(matrix, domain, level) {
+    return matrix[domain][level]
+}
+
+// Find the domain with highest average loss (weakest)
+@pure
+fn cv2_weakest_domain(matrix) {
+    let n_d = len(matrix)
+    let mut worst_d = 0
+    let mut worst_avg = 0.0
+    for d in 0..n_d {
+        let n_l = len(matrix[d])
+        let mut s = 0.0
+        for l in 0..n_l { s = s + matrix[d][l] }
+        let avg = s / to_float(n_l)
+        if d == 0 || avg > worst_avg {
+            worst_avg = avg
+            worst_d = d
+        }
+    }
+    return worst_d
+}
+
+// Find the (domain, level) cell with the highest loss
+@pure
+fn cv2_weakest_cell(matrix, n_domains, n_levels) {
+    let mut worst_d = 0
+    let mut worst_l = 0
+    let mut worst_v = 0.0
+    let mut first = true
+    for d in 0..n_domains {
+        for l in 0..n_levels {
+            let v = matrix[d][l]
+            if first || v > worst_v {
+                worst_v = v
+                worst_d = d
+                worst_l = l
+                first = false
+            }
+        }
+    }
+    return [worst_d, worst_l]
+}
+
+// Sum all cells in the progress matrix
+@pure
+fn cv2_progress_total_loss(matrix) {
+    let n_d = len(matrix)
+    let mut total = 0.0
+    for d in 0..n_d {
+        let n_l = len(matrix[d])
+        for l in 0..n_l {
+            total = total + matrix[d][l]
+        }
+    }
+    return total
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Full Curriculum v2 Step
+//
+//  Combines all components into a single training step:
+//  1. Multi-score -> normalize -> weighted score
+//  2. Anti-stale boost
+//  3. Domain-balanced sampling
+//  4. Progress matrix update
+//  Returns: [avg_score, n_selected, weakest_domain]
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn cv2_full_step(losses, lengths, qualities, domains, n_domains, weights, step, total, pace_modes, last_seen, progress, batch_size, seed) {
+    // 1. Multi-score and normalize
+    let matrix = cv2_multi_score(losses, lengths, qualities)
+    let norm = cv2_normalize_all(matrix)
+    let scores = cv2_weighted_score(norm, weights)
+
+    // 2. Anti-stale
+    let boosts = cv2_anti_stale_boost(last_seen, step, 0.01)
+    let adjusted = cv2_apply_stale_boost(scores, boosts)
+
+    // 3. Domain-balanced sample
+    let batch = cv2_balanced_sample(domains, n_domains, batch_size, seed)
+    let n_selected = len(batch)
+
+    // 4. Compute avg score of batch
+    let mut total_score = 0.0
+    for i in 0..n_selected {
+        let idx = batch[i]
+        total_score = total_score + adjusted[idx]
+    }
+    let mut avg_score = 0.0
+    if n_selected > 0 {
+        avg_score = total_score / to_float(n_selected)
+    }
+
+    // 5. Weakest domain
+    let wd = cv2_weakest_domain(progress)
+
+    return [avg_score, to_float(n_selected), to_float(wd)]
+}
+
+println("[curriculum_v2] loaded — multi-objective scorer + pareto frontier + dynamic weighting + task-aware pacing + domain balancer + anti-stale + auto-difficulty + progress matrix")

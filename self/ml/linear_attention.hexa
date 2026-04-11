@@ -1,44 +1,38 @@
-// ═══════════════════════════════════════════════════════════════
-//  self/ml/linear_attention.hexa — Linear Attention (Performer/Linformer)
+// ===================================================================
+//  self/ml/linear_attention.hexa — Linear Attention with Kernel Feature Maps
 //
-//  Implements O(N) attention approximations for long-sequence efficiency:
-//    1. Performer  — FAVOR+ random feature map φ(x) that satisfies
-//                    E[φ(q)·φ(k)] ≈ exp(q·k), enabling the reformulation
-//                    Attn(Q,K,V) = φ(Q)·(φ(K)^T·V) / (φ(Q)·φ(K)^T·1)
-//                    which is O(N·d·r) instead of O(N²·d).
-//    2. Linformer  — projects K,V along the sequence axis with learned
-//                    low-rank matrices E,F ∈ R^{k×N} so softmax runs on
-//                    O(N·k·d) instead of O(N²·d).
+//  O(N) attention via kernel feature map decomposition:
+//    Attn(Q,K,V) = phi(Q) * (phi(K)^T * V) / (phi(Q) * sum(phi(K)))
 //
-//  Two feature maps for Performer:
-//    A) Trig (cosine/sine) map   — the original Performer-style positive
-//       orthogonal random features:
-//         φ(x) = exp(-‖x‖²/2) * √(1/m) * [cos(w_i·x); sin(w_i·x)]
-//       Unbiased estimator of softmax kernel exp(q·k) when w_i ~ N(0,I).
-//    B) Positive exponential map (FAVOR+):
-//         φ(x) = exp(-‖x‖²/2) * √(1/m) * exp(w_i·x)
-//       Non-negative, reduces variance on attention softmax.
-//
-//  O(N) algorithm (un-normalized numerator):
-//     K̃V_sum[d'][d] = Σ_j φ(K_j)[d'] * V_j[d]      (r × d matrix)
-//     K̃_sum[d']    = Σ_j φ(K_j)[d']                (r vector)
-//     Out_i[d]     = (φ(Q_i)·K̃V_sum)[d] / (φ(Q_i)·K̃_sum)
+//  Components:
+//    1. Feature maps phi: elu+1, relu, 1+elu, RFF (Random Fourier Features),
+//       ORF (Orthogonal Random Features)
+//    2. Non-causal linear attention: phi(Q) * S / (phi(Q) * z)
+//    3. Causal linear attention: cumulative sum S_i = S_{i-1} + phi(k_i)^T*v_i
+//    4. Recurrent form: O(1) per step generation with state matrix
+//    5. Chunked linear attention: chunk-wise processing for memory efficiency
+//    6. Kernel variants: elu+1, relu, 1+elu, RFF/ORF
+//    7. Gated linear attention: sigmoid gate on output
+//    8. Normalization: denominator tracking for stability
+//    9. Performer FAVOR+ (trig + positive exp feature maps)
+//   10. Linformer low-rank projection
+//   11. Multi-head linear attention
 //
 //  AI-NATIVE attrs:
 //    @pure     — deterministic given seed
 //    @hot      — called per forward step
 //    @parallel — outer query loop is embarrassingly parallel
-// ═══════════════════════════════════════════════════════════════
+// ===================================================================
 
-// ── helpers ──────────────────────────────────────────────────
+// ===================================================================
+//  Helpers
+// ===================================================================
 
 fn la_zeros_2d(r, c) {
     let mut m = []
     for _i in 0..r {
         let mut row = []
-        for _j in 0..c {
-            row = row + [0.0]
-        }
+        for _j in 0..c { row = row + [0.0] }
         m = m + [row]
     }
     return m
@@ -46,9 +40,13 @@ fn la_zeros_2d(r, c) {
 
 fn la_zeros_1d(n) {
     let mut v = []
-    for _i in 0..n {
-        v = v + [0.0]
-    }
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn la_ones_1d(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [1.0] }
     return v
 }
 
@@ -62,12 +60,51 @@ fn la_max_f(a, b) {
     return b
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  Deterministic PRNG (LCG) — seedable pseudo-random for
-//  reproducible feature matrices.
-// ═══════════════════════════════════════════════════════════════
+fn la_min_i(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn la_vec_add(a, b) {
+    let n = len(a)
+    let mut out = []
+    for i in 0..n { out = out + [a[i] + b[i]] }
+    return out
+}
+
+fn la_vec_scale(v, s) {
+    let n = len(v)
+    let mut out = []
+    for i in 0..n { out = out + [v[i] * s] }
+    return out
+}
+
+fn la_vec_mul(a, b) {
+    let n = len(a)
+    let mut out = []
+    for i in 0..n { out = out + [a[i] * b[i]] }
+    return out
+}
+
+fn la_dot(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    for i in 0..n { s = s + a[i] * b[i] }
+    return s
+}
+
+fn la_mat_add_2d(a, b) {
+    let rows = len(a)
+    let mut out = []
+    for r in 0..rows { out = out + [la_vec_add(a[r], b[r])] }
+    return out
+}
+
+// ===================================================================
+//  Deterministic PRNG (LCG)
+// ===================================================================
+
 fn la_lcg_next(state) {
-    // Numerical Recipes LCG: xn+1 = (a*xn + c) mod 2^31
     let a = 1103515245
     let c = 12345
     let m = 2147483648
@@ -76,14 +113,11 @@ fn la_lcg_next(state) {
 }
 
 fn la_rand_uniform(state) {
-    // Returns (new_state, uniform in [0,1))
     let nxt = la_lcg_next(state)
     let u = (nxt * 1.0) / 2147483648.0
     return [nxt, u]
 }
 
-// Box-Muller transform: two uniforms -> one standard normal.
-// To avoid log(0), clamp u1.
 fn la_box_muller(u1, u2) {
     let mut x = u1
     if x < 1.0e-9 { x = 1.0e-9 }
@@ -93,7 +127,6 @@ fn la_box_muller(u1, u2) {
     return r * cos(theta)
 }
 
-// Draw next standard-normal variate from LCG state.
 fn la_rand_normal(state) {
     let r1 = la_rand_uniform(state)
     let s1 = r1[0]
@@ -105,10 +138,10 @@ fn la_rand_normal(state) {
     return [s2, z]
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  Random feature matrix W ∈ R^{m × d} with entries ~ N(0,1).
-//  Each row is a projection vector.
-// ═══════════════════════════════════════════════════════════════
+// ===================================================================
+//  Random feature matrix W in R^{m x d}
+// ===================================================================
+
 @pure
 fn la_random_projection(m, d, seed) {
     let mut W = la_zeros_2d(m, d)
@@ -123,71 +156,164 @@ fn la_random_projection(m, d, seed) {
     return W
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  Trig feature map (Performer original).
-//  φ(x)[2i]   = exp(-‖x‖²/2) * √(1/m) * cos(w_i·x)
-//  φ(x)[2i+1] = exp(-‖x‖²/2) * √(1/m) * sin(w_i·x)
-//  Length of φ(x) = 2·m.
-//  Satisfies E[φ(q)·φ(k)] = exp(q·k) under w ~ N(0,I).
-// ═══════════════════════════════════════════════════════════════
+// Pseudo-random init weight for projections
+fn la_init_weight(rows, cols, seed) {
+    let scale = 1.0 / sqrt(cols * 1.0)
+    let mut m = []
+    for r in 0..rows {
+        let mut row = []
+        for c in 0..cols {
+            let h = (r * 137 + c * 311 + seed * 7919) % 10007
+            let val = (to_float(h) / 10007.0 - 0.5) * 2.0 * scale
+            row = row + [val]
+        }
+        m = m + [row]
+    }
+    return m
+}
+
+fn la_init_vec(dim, seed) {
+    let scale = 1.0 / sqrt(dim * 1.0)
+    let mut v = []
+    for i in 0..dim {
+        let h = (i * 251 + seed * 6173) % 10007
+        let val = (to_float(h) / 10007.0 - 0.5) * 2.0 * scale
+        v = v + [val]
+    }
+    return v
+}
+
+fn la_sigmoid(x) {
+    if x > 20.0 { return 1.0 }
+    if x < -20.0 { return 0.0 }
+    return 1.0 / (1.0 + exp(0.0 - x))
+}
+
+// ===================================================================
+//  1. Feature Maps phi
+//
+//  Transform Q,K through kernel function so that
+//    <phi(q), phi(k)> approximates the kernel k(q, k).
+// ===================================================================
+
+// elu+1: phi(x) = elu(x) + 1  (always > 0)
+@pure @hot
+fn phi_elu_plus1(v) {
+    let n = len(v)
+    let mut out = []
+    for i in 0..n {
+        let x = v[i]
+        let e = if x >= 0.0 { x } else { exp(x) - 1.0 }
+        out = out + [e + 1.0]
+    }
+    return out
+}
+
+// relu: phi(x) = max(0, x)
+@pure @hot
+fn phi_relu(v) {
+    let n = len(v)
+    let mut out = []
+    for i in 0..n {
+        let x = v[i]
+        out = out + [if x > 0.0 { x } else { 0.0 }]
+    }
+    return out
+}
+
+// 1+elu: phi(x) = 1 + elu(x) (same formula as elu+1, explicit name)
+@pure @hot
+fn phi_one_plus_elu(v) {
+    return phi_elu_plus1(v)
+}
+
+// ===================================================================
+//  Performer feature maps (FAVOR+)
+// ===================================================================
+
+// Trig feature map: phi(x)[2i] = exp(-||x||^2/2)*sqrt(1/m)*cos(w_i.x)
+//                   phi(x)[2i+1] = ...sin(w_i.x)
+// Output length = 2*m
 @pure
 fn la_feature_map_trig(x, W) {
     let m = len(W)
     let d = len(W[0])
-
-    // ‖x‖²
     let mut norm_sq = 0.0
-    for k in 0..d {
-        norm_sq = norm_sq + x[k] * x[k]
-    }
+    for k in 0..d { norm_sq = norm_sq + x[k] * x[k] }
     let envelope = exp(0.0 - 0.5 * norm_sq)
     let scale = 1.0 / sqrt(m * 1.0)
-
     let mut phi = la_zeros_1d(2 * m)
     for i in 0..m {
         let mut dot = 0.0
-        for k in 0..d {
-            dot = dot + W[i][k] * x[k]
-        }
+        for k in 0..d { dot = dot + W[i][k] * x[k] }
         phi[2 * i]     = envelope * scale * cos(dot)
         phi[2 * i + 1] = envelope * scale * sin(dot)
     }
     return phi
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  Positive exponential feature map (FAVOR+).
-//  φ(x)[i] = exp(-‖x‖²/2) * √(1/m) * exp(w_i·x)
-//  Length of φ(x) = m. Non-negative by construction.
-// ═══════════════════════════════════════════════════════════════
+// Positive exponential (FAVOR+): phi(x)[i] = exp(-||x||^2/2)*sqrt(1/m)*exp(w_i.x)
+// Output length = m. Non-negative.
 @pure
 fn la_feature_map_pos(x, W) {
     let m = len(W)
     let d = len(W[0])
-
     let mut norm_sq = 0.0
-    for k in 0..d {
-        norm_sq = norm_sq + x[k] * x[k]
-    }
+    for k in 0..d { norm_sq = norm_sq + x[k] * x[k] }
     let envelope = exp(0.0 - 0.5 * norm_sq)
     let scale = 1.0 / sqrt(m * 1.0)
-
     let mut phi = la_zeros_1d(m)
     for i in 0..m {
         let mut dot = 0.0
-        for k in 0..d {
-            dot = dot + W[i][k] * x[k]
-        }
+        for k in 0..d { dot = dot + W[i][k] * x[k] }
         phi[i] = envelope * scale * exp(dot)
     }
     return phi
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  Apply feature map φ row-wise to a matrix X ∈ R^{S×d}.
-//  use_trig: true  -> trig map (output [S, 2m])
-//            false -> positive map (output [S, m])
-// ═══════════════════════════════════════════════════════════════
+// Random Fourier Features (RFF):
+// phi(x) = sqrt(2/m) * [cos(w1.x + b1), cos(w2.x + b2), ...]
+// w_matrix: (n_feat x d), b_vec: (n_feat)
+@pure @hot
+fn phi_rff(v, w_matrix, b_vec) {
+    let n_feat = len(w_matrix)
+    let d = len(v)
+    let scale = sqrt(2.0 / to_float(n_feat))
+    let mut out = []
+    for i in 0..n_feat {
+        let mut proj = 0.0
+        for k in 0..d { proj = proj + w_matrix[i][k] * v[k] }
+        out = out + [scale * cos(proj + b_vec[i])]
+    }
+    return out
+}
+
+// ORF same API as RFF (caller provides orthogonalized matrix)
+@pure @hot
+fn phi_orf(v, w_matrix, b_vec) {
+    return phi_rff(v, w_matrix, b_vec)
+}
+
+// ===================================================================
+//  Generic feature map dispatcher
+//  kind: "elu_plus1", "relu", "one_plus_elu", "rff", "orf",
+//        "trig", "pos"
+//  params: for rff/orf/trig/pos -> [w_matrix, b_vec_or_ignored]
+// ===================================================================
+
+@pure
+fn apply_phi(v, kind, params) {
+    if kind == "elu_plus1" { return phi_elu_plus1(v) }
+    if kind == "relu" { return phi_relu(v) }
+    if kind == "one_plus_elu" { return phi_one_plus_elu(v) }
+    if kind == "rff" { return phi_rff(v, params[0], params[1]) }
+    if kind == "orf" { return phi_orf(v, params[0], params[1]) }
+    if kind == "trig" { return la_feature_map_trig(v, params[0]) }
+    if kind == "pos" { return la_feature_map_pos(v, params[0]) }
+    return phi_elu_plus1(v)
+}
+
+// Apply feature map row-wise to matrix X [S x d]
 fn la_apply_feature_map(X, W, use_trig) {
     let S = len(X)
     let mut out = []
@@ -201,26 +327,370 @@ fn la_apply_feature_map(X, W, use_trig) {
     return out
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  Naive softmax attention — reference implementation for variance
-//  testing.  Scales Q by 1/√d so that Performer's kernel
-//  exp(q'·k') approximates softmax(q·k/√d).
-// ═══════════════════════════════════════════════════════════════
+// ===================================================================
+//  RFF/ORF parameter constructors
+// ===================================================================
+
+fn create_rff_params(d_in, n_features, seed) {
+    let w_mat = la_random_projection(n_features, d_in, seed)
+    let mut b_vec = []
+    let pi2 = 6.283185307179586
+    for i in 0..n_features {
+        let h = (i * 311 + seed * 4231) % 10007
+        let val = to_float(h) / 10007.0 * pi2
+        b_vec = b_vec + [val]
+    }
+    return [w_mat, b_vec]
+}
+
+fn create_orf_params(d_in, n_features, seed) {
+    let raw = la_random_projection(n_features, d_in, seed + 5000)
+    let mut ortho = []
+    for i in 0..n_features {
+        let mut row = la_zeros_1d(d_in)
+        for j in 0..d_in { row[j] = raw[i][j] }
+        for p in 0..i {
+            let prev = ortho[p]
+            let dp = la_dot(row, prev)
+            for j in 0..d_in { row[j] = row[j] - dp * prev[j] }
+        }
+        let norm = sqrt(la_dot(row, row))
+        let safe_norm = if norm < 1.0e-10 { 1.0e-10 } else { norm }
+        let sc = sqrt(d_in * 1.0) / safe_norm
+        for j in 0..d_in { row[j] = row[j] * sc }
+        ortho = ortho + [row]
+    }
+    let mut b_vec = []
+    let pi2 = 6.283185307179586
+    for i in 0..n_features {
+        let h = (i * 311 + (seed + 5000) * 4231) % 10007
+        b_vec = b_vec + [to_float(h) / 10007.0 * pi2]
+    }
+    return [ortho, b_vec]
+}
+
+// ===================================================================
+//  2. Non-Causal Linear Attention
+//
+//  Attn_i = phi(Q_i) * S / (phi(Q_i) * z)
+//  S = sum_j phi(K_j)^T * V_j    (d_feat x d_v)
+//  z = sum_j phi(K_j)             (d_feat)
+// ===================================================================
+
+@pure
+fn linear_attention_noncausal(qs, ks, vs, phi_kind, phi_params) {
+    let seq_len = len(qs)
+    if seq_len == 0 { return [] }
+    let d_v = len(vs[0])
+    let mut phi_ks = []
+    let mut phi_qs = []
+    for i in 0..seq_len {
+        phi_ks = phi_ks + [apply_phi(ks[i], phi_kind, phi_params)]
+        phi_qs = phi_qs + [apply_phi(qs[i], phi_kind, phi_params)]
+    }
+    let d_feat = len(phi_ks[0])
+    // S = sum_j phi(K_j)^T * V_j
+    let mut s_mat = la_zeros_2d(d_feat, d_v)
+    let mut z_vec = la_zeros_1d(d_feat)
+    for j in 0..seq_len {
+        for f in 0..d_feat {
+            z_vec[f] = z_vec[f] + phi_ks[j][f]
+            for dv in 0..d_v {
+                s_mat[f][dv] = s_mat[f][dv] + phi_ks[j][f] * vs[j][dv]
+            }
+        }
+    }
+    let mut outputs = []
+    for i in 0..seq_len {
+        let mut out_v = la_zeros_1d(d_v)
+        for f in 0..d_feat {
+            for dv in 0..d_v {
+                out_v[dv] = out_v[dv] + phi_qs[i][f] * s_mat[f][dv]
+            }
+        }
+        let denom = la_dot(phi_qs[i], z_vec)
+        let safe_denom = if la_fabs(denom) < 1.0e-8 { 1.0e-8 } else { denom }
+        outputs = outputs + [la_vec_scale(out_v, 1.0 / safe_denom)]
+    }
+    return outputs
+}
+
+// ===================================================================
+//  3. Causal Linear Attention (cumulative sum)
+//
+//  S_i = S_{i-1} + phi(K_i)^T * V_i
+//  z_i = z_{i-1} + phi(K_i)
+//  O_i = (phi(Q_i) * S_i) / (phi(Q_i) . z_i)
+// ===================================================================
+
+@pure
+fn linear_attention_causal(qs, ks, vs, phi_kind, phi_params) {
+    let seq_len = len(qs)
+    if seq_len == 0 { return [] }
+    let d_v = len(vs[0])
+    let mut phi_ks = []
+    let mut phi_qs = []
+    for i in 0..seq_len {
+        phi_ks = phi_ks + [apply_phi(ks[i], phi_kind, phi_params)]
+        phi_qs = phi_qs + [apply_phi(qs[i], phi_kind, phi_params)]
+    }
+    let d_feat = len(phi_ks[0])
+    let mut s_mat = la_zeros_2d(d_feat, d_v)
+    let mut z_vec = la_zeros_1d(d_feat)
+    let mut outputs = []
+    for i in 0..seq_len {
+        // Update state with position i (causal: include self)
+        for f in 0..d_feat {
+            z_vec[f] = z_vec[f] + phi_ks[i][f]
+            for dv in 0..d_v {
+                s_mat[f][dv] = s_mat[f][dv] + phi_ks[i][f] * vs[i][dv]
+            }
+        }
+        let mut out_v = la_zeros_1d(d_v)
+        for f in 0..d_feat {
+            for dv in 0..d_v {
+                out_v[dv] = out_v[dv] + phi_qs[i][f] * s_mat[f][dv]
+            }
+        }
+        let denom = la_dot(phi_qs[i], z_vec)
+        let safe_denom = if la_fabs(denom) < 1.0e-8 { 1.0e-8 } else { denom }
+        outputs = outputs + [la_vec_scale(out_v, 1.0 / safe_denom)]
+    }
+    return outputs
+}
+
+// ===================================================================
+//  4. Recurrent Form: O(1) per step for generation
+//
+//  State: (S, z) where S is (d_feat x d_v), z is (d_feat)
+//  Step: S <- S + phi(k)^T * v, z <- z + phi(k)
+//        output = (phi(q) * S) / (phi(q) . z)
+// ===================================================================
+
+struct LinearAttnState {
+    d_feat: int,
+    d_v: int,
+    s_mat: array,
+    z_vec: array
+}
+
+fn create_linear_attn_state(d_feat, d_v) {
+    return LinearAttnState {
+        d_feat: d_feat,
+        d_v: d_v,
+        s_mat: la_zeros_2d(d_feat, d_v),
+        z_vec: la_zeros_1d(d_feat)
+    }
+}
+
+// Single recurrent step: O(d_feat * d_v)
+// Returns: [output_vec, new_state]
+@pure @hot
+fn linear_attn_recurrent_step(state, q, k, v, phi_kind, phi_params) {
+    let phi_q = apply_phi(q, phi_kind, phi_params)
+    let phi_k = apply_phi(k, phi_kind, phi_params)
+    let d_feat = state.d_feat
+    let d_v = state.d_v
+    // Update state
+    let mut new_s = la_zeros_2d(d_feat, d_v)
+    let mut new_z = la_zeros_1d(d_feat)
+    for f in 0..d_feat {
+        new_z[f] = state.z_vec[f] + phi_k[f]
+        for dv in 0..d_v {
+            new_s[f][dv] = state.s_mat[f][dv] + phi_k[f] * v[dv]
+        }
+    }
+    // Compute output
+    let mut out_v = la_zeros_1d(d_v)
+    for f in 0..d_feat {
+        for dv in 0..d_v {
+            out_v[dv] = out_v[dv] + phi_q[f] * new_s[f][dv]
+        }
+    }
+    let denom = la_dot(phi_q, new_z)
+    let safe_denom = if la_fabs(denom) < 1.0e-8 { 1.0e-8 } else { denom }
+    let output = la_vec_scale(out_v, 1.0 / safe_denom)
+    let new_state = LinearAttnState {
+        d_feat: d_feat,
+        d_v: d_v,
+        s_mat: new_s,
+        z_vec: new_z
+    }
+    return [output, new_state]
+}
+
+// ===================================================================
+//  5. Chunked Linear Attention
+//
+//  Process in chunks of size C. Within each chunk: local causal sum.
+//  Between chunks: propagate cumulative state.
+// ===================================================================
+
+@pure
+fn linear_attention_chunked(qs, ks, vs, phi_kind, phi_params, chunk_size) {
+    let seq_len = len(qs)
+    if seq_len == 0 { return [] }
+    let d_v = len(vs[0])
+    let mut phi_ks = []
+    let mut phi_qs = []
+    for i in 0..seq_len {
+        phi_ks = phi_ks + [apply_phi(ks[i], phi_kind, phi_params)]
+        phi_qs = phi_qs + [apply_phi(qs[i], phi_kind, phi_params)]
+    }
+    let d_feat = len(phi_ks[0])
+    let mut global_s = la_zeros_2d(d_feat, d_v)
+    let mut global_z = la_zeros_1d(d_feat)
+    let mut outputs = []
+    let n_chunks = (seq_len + chunk_size - 1) / chunk_size
+    let mut start = 0
+    for _chunk_idx in 0..n_chunks {
+        let end = la_min_i(start + chunk_size, seq_len)
+        let c_len = end - start
+        let mut local_s = la_zeros_2d(d_feat, d_v)
+        let mut local_z = la_zeros_1d(d_feat)
+        for ci in 0..c_len {
+            let pos = start + ci
+            for f in 0..d_feat {
+                local_z[f] = local_z[f] + phi_ks[pos][f]
+                for dv in 0..d_v {
+                    local_s[f][dv] = local_s[f][dv] + phi_ks[pos][f] * vs[pos][dv]
+                }
+            }
+            // total = global + local
+            let mut out_v = la_zeros_1d(d_v)
+            for f in 0..d_feat {
+                for dv in 0..d_v {
+                    out_v[dv] = out_v[dv] + phi_qs[pos][f] * (global_s[f][dv] + local_s[f][dv])
+                }
+            }
+            let mut denom = 0.0
+            for f in 0..d_feat {
+                denom = denom + phi_qs[pos][f] * (global_z[f] + local_z[f])
+            }
+            let safe_denom = if la_fabs(denom) < 1.0e-8 { 1.0e-8 } else { denom }
+            outputs = outputs + [la_vec_scale(out_v, 1.0 / safe_denom)]
+        }
+        global_s = la_mat_add_2d(global_s, local_s)
+        global_z = la_vec_add(global_z, local_z)
+        start = end
+    }
+    return outputs
+}
+
+// ===================================================================
+//  7. Gated Linear Attention
+//
+//  output_i = sigmoid(W_g * x_i + b_g) * LinearAttn(Q, K, V)_i
+// ===================================================================
+
+struct GatedLinearAttn {
+    d_model: int,
+    d_k: int,
+    d_v: int,
+    W_q: array,
+    W_k: array,
+    W_v: array,
+    W_g: array,
+    b_g: array,
+    W_o: array,
+    phi_kind: string,
+    phi_params: array
+}
+
+fn create_gated_linear_attn(d_model, d_k, d_v, phi_kind, seed) {
+    let mut pp = []
+    if phi_kind == "rff" {
+        pp = create_rff_params(d_k, d_k, seed + 800)
+    }
+    return GatedLinearAttn {
+        d_model: d_model,
+        d_k: d_k,
+        d_v: d_v,
+        W_q: la_init_weight(d_k, d_model, seed + 1),
+        W_k: la_init_weight(d_k, d_model, seed + 2),
+        W_v: la_init_weight(d_v, d_model, seed + 3),
+        W_g: la_init_weight(d_v, d_model, seed + 4),
+        b_g: la_zeros_1d(d_v),
+        W_o: la_init_weight(d_model, d_v, seed + 5),
+        phi_kind: phi_kind,
+        phi_params: pp
+    }
+}
+
+fn la_mat_vec(mat, v) {
+    let rows = len(mat)
+    let mut out = []
+    for r in 0..rows { out = out + [la_dot(mat[r], v)] }
+    return out
+}
+
+fn gated_linear_attn_forward(gla, xs) {
+    let seq_len = len(xs)
+    if seq_len == 0 { return [] }
+    let mut qs = []
+    let mut ks = []
+    let mut vs = []
+    let mut gs = []
+    for i in 0..seq_len {
+        qs = qs + [la_mat_vec(gla.W_q, xs[i])]
+        ks = ks + [la_mat_vec(gla.W_k, xs[i])]
+        vs = vs + [la_mat_vec(gla.W_v, xs[i])]
+        let g_raw = la_vec_add(la_mat_vec(gla.W_g, xs[i]), gla.b_g)
+        let gn = len(g_raw)
+        let mut g_sig = []
+        for gi in 0..gn { g_sig = g_sig + [la_sigmoid(g_raw[gi])] }
+        gs = gs + [g_sig]
+    }
+    let attn_outs = linear_attention_causal(qs, ks, vs, gla.phi_kind, gla.phi_params)
+    let mut outputs = []
+    for i in 0..seq_len {
+        let gated = la_vec_mul(gs[i], attn_outs[i])
+        let projected = la_mat_vec(gla.W_o, gated)
+        outputs = outputs + [projected]
+    }
+    return outputs
+}
+
+// ===================================================================
+//  8. Normalization: denominator tracking
+// ===================================================================
+
+@pure
+fn la_causal_denoms(qs, ks, phi_kind, phi_params) {
+    let seq_len = len(qs)
+    let mut phi_ks = []
+    let mut phi_qs = []
+    for i in 0..seq_len {
+        phi_ks = phi_ks + [apply_phi(ks[i], phi_kind, phi_params)]
+        phi_qs = phi_qs + [apply_phi(qs[i], phi_kind, phi_params)]
+    }
+    let d_feat = len(phi_ks[0])
+    let mut z_vec = la_zeros_1d(d_feat)
+    let mut denoms = []
+    for i in 0..seq_len {
+        z_vec = la_vec_add(z_vec, phi_ks[i])
+        let d = la_dot(phi_qs[i], z_vec)
+        denoms = denoms + [d]
+    }
+    return denoms
+}
+
+// ===================================================================
+//  Naive softmax attention — reference
+// ===================================================================
+
 fn la_naive_attention(Q, K, V) {
     let S = len(Q)
     let d = len(Q[0])
     let dv = len(V[0])
     let inv_sqrt_d = 1.0 / sqrt(d * 1.0)
-
     let mut out = la_zeros_2d(S, dv)
     for i in 0..S {
         let mut scores = la_zeros_1d(S)
         let mut mx = 0.0 - 1.0e30
         for j in 0..S {
             let mut dot = 0.0
-            for k in 0..d {
-                dot = dot + Q[i][k] * K[j][k]
-            }
+            for k in 0..d { dot = dot + Q[i][k] * K[j][k] }
             let s = dot * inv_sqrt_d
             scores[j] = s
             if s > mx { mx = s }
@@ -234,113 +704,23 @@ fn la_naive_attention(Q, K, V) {
         }
         for k in 0..dv {
             let mut acc = 0.0
-            for j in 0..S {
-                acc = acc + exps[j] * V[j][k]
-            }
+            for j in 0..S { acc = acc + exps[j] * V[j][k] }
             out[i][k] = acc / sum_exp
         }
     }
     return out
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  Performer / FAVOR+ linear attention.
-//
-//  Step 1:  Scale Q by (1/d)^{1/4}, K by (1/d)^{1/4}.
-//           This places the softmax temperature 1/√d inside the
-//           kernel: φ(Q')·φ(K') approximates exp((q·k)/√d).
-//  Step 2:  Compute feature rows Q' = φ(Q), K' = φ(K).
-//  Step 3:  Accumulate K̃V (r×d_v) = K'^T · V   — O(N·r·d_v)
-//           Accumulate K̃  (r)     = Σ K'_j    — O(N·r)
-//  Step 4:  For each i:
-//              numer = Q'_i · K̃V   (d_v)
-//              denom = Q'_i · K̃    (scalar, clamped)
-//              out_i = numer / denom
-//           Total O(N·(r·d_v + r)) = O(N).
-// ═══════════════════════════════════════════════════════════════
+// ===================================================================
+//  9. Performer FAVOR+ linear attention
+// ===================================================================
+
 @hot @parallel
 fn linear_attention_performer(Q, K, V, W, use_trig) {
     let S  = len(Q)
     let d  = len(Q[0])
     let dv = len(V[0])
     let scale = pow(d * 1.0, 0.0 - 0.25)
-
-    // Scale Q and K
-    let mut Qs = la_zeros_2d(S, d)
-    let mut Ks = la_zeros_2d(S, d)
-    for i in 0..S {
-        for k in 0..d {
-            Qs[i][k] = Q[i][k] * scale
-            Ks[i][k] = K[i][k] * scale
-        }
-    }
-
-    // Feature-map the scaled Q, K
-    let Qp = la_apply_feature_map(Qs, W, use_trig)
-    let Kp = la_apply_feature_map(Ks, W, use_trig)
-    let r  = len(Qp[0])   // 2m for trig, m for positive
-
-    // KV_sum[r][dv]
-    let mut KV_sum = la_zeros_2d(r, dv)
-    // K_sum[r]
-    let mut K_sum = la_zeros_1d(r)
-    for j in 0..S {
-        for a in 0..r {
-            let ka = Kp[j][a]
-            K_sum[a] = K_sum[a] + ka
-            for b in 0..dv {
-                KV_sum[a][b] = KV_sum[a][b] + ka * V[j][b]
-            }
-        }
-    }
-
-    let mut out = la_zeros_2d(S, dv)
-    for i in 0..S {
-        // numer = Qp_i · KV_sum   (dv)
-        let mut numer = la_zeros_1d(dv)
-        for a in 0..r {
-            let qa = Qp[i][a]
-            for b in 0..dv {
-                numer[b] = numer[b] + qa * KV_sum[a][b]
-            }
-        }
-        // denom = Qp_i · K_sum   (scalar)
-        let mut denom = 0.0
-        for a in 0..r {
-            denom = denom + Qp[i][a] * K_sum[a]
-        }
-        // Stabilize: clamp absolute value away from 0.
-        let sign_denom = denom
-        let mut safe = denom
-        if la_fabs(safe) < 1.0e-12 {
-            if sign_denom < 0.0 {
-                safe = 0.0 - 1.0e-12
-            } else {
-                safe = 1.0e-12
-            }
-        }
-        for b in 0..dv {
-            out[i][b] = numer[b] / safe
-        }
-    }
-    return out
-}
-
-// ═══════════════════════════════════════════════════════════════
-//  Causal Performer linear attention.
-//
-//  For autoregressive decoding we cannot pre-accumulate over all j.
-//  Instead we stream K,V: for each position i we fold K_i,V_i into
-//  running KV_sum and K_sum *before* reading out_i.  This preserves
-//  O(N·r·d_v) cost while respecting the causal mask j ≤ i.
-// ═══════════════════════════════════════════════════════════════
-@hot
-fn linear_attention_performer_causal(Q, K, V, W, use_trig) {
-    let S  = len(Q)
-    let d  = len(Q[0])
-    let dv = len(V[0])
-    let scale = pow(d * 1.0, 0.0 - 0.25)
-
     let mut Qs = la_zeros_2d(S, d)
     let mut Ks = la_zeros_2d(S, d)
     for i in 0..S {
@@ -352,65 +732,82 @@ fn linear_attention_performer_causal(Q, K, V, W, use_trig) {
     let Qp = la_apply_feature_map(Qs, W, use_trig)
     let Kp = la_apply_feature_map(Ks, W, use_trig)
     let r  = len(Qp[0])
-
     let mut KV_sum = la_zeros_2d(r, dv)
-    let mut K_sum  = la_zeros_1d(r)
-    let mut out    = la_zeros_2d(S, dv)
-
-    for i in 0..S {
-        // fold in position i (causal: j ≤ i)
+    let mut K_sum = la_zeros_1d(r)
+    for j in 0..S {
         for a in 0..r {
-            let ka = Kp[i][a]
+            let ka = Kp[j][a]
             K_sum[a] = K_sum[a] + ka
-            for b in 0..dv {
-                KV_sum[a][b] = KV_sum[a][b] + ka * V[i][b]
-            }
+            for b in 0..dv { KV_sum[a][b] = KV_sum[a][b] + ka * V[j][b] }
         }
-        // read out_i
+    }
+    let mut out = la_zeros_2d(S, dv)
+    for i in 0..S {
         let mut numer = la_zeros_1d(dv)
         for a in 0..r {
             let qa = Qp[i][a]
-            for b in 0..dv {
-                numer[b] = numer[b] + qa * KV_sum[a][b]
-            }
+            for b in 0..dv { numer[b] = numer[b] + qa * KV_sum[a][b] }
         }
         let mut denom = 0.0
-        for a in 0..r {
-            denom = denom + Qp[i][a] * K_sum[a]
-        }
-        let sign_denom = denom
+        for a in 0..r { denom = denom + Qp[i][a] * K_sum[a] }
         let mut safe = denom
         if la_fabs(safe) < 1.0e-12 {
-            if sign_denom < 0.0 {
-                safe = 0.0 - 1.0e-12
-            } else {
-                safe = 1.0e-12
-            }
+            if denom < 0.0 { safe = 0.0 - 1.0e-12 } else { safe = 1.0e-12 }
         }
-        for b in 0..dv {
-            out[i][b] = numer[b] / safe
-        }
+        for b in 0..dv { out[i][b] = numer[b] / safe }
     }
     return out
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  Linformer — low-rank sequence projection.
-//
-//  Given projection matrices E ∈ R^{k×S}, F ∈ R^{k×S}:
-//     K̂ = E · K    (k × d)
-//     V̂ = F · V    (k × d_v)
-//  Then softmax attention runs on Q (S×d) × K̂^T (d×k) which costs
-//  O(N·k·d) instead of O(N²·d).
-//
-//  This implementation exposes:
-//    la_linformer_random_projection(k, S, seed)   — build a random E
-//    linear_attention_linformer(Q, K, V, E, F)    — forward
-// ═══════════════════════════════════════════════════════════════
+// Causal Performer
+@hot
+fn linear_attention_performer_causal(Q, K, V, W, use_trig) {
+    let S  = len(Q)
+    let d  = len(Q[0])
+    let dv = len(V[0])
+    let scale = pow(d * 1.0, 0.0 - 0.25)
+    let mut Qs = la_zeros_2d(S, d)
+    let mut Ks = la_zeros_2d(S, d)
+    for i in 0..S {
+        for k in 0..d {
+            Qs[i][k] = Q[i][k] * scale
+            Ks[i][k] = K[i][k] * scale
+        }
+    }
+    let Qp = la_apply_feature_map(Qs, W, use_trig)
+    let Kp = la_apply_feature_map(Ks, W, use_trig)
+    let r  = len(Qp[0])
+    let mut KV_sum = la_zeros_2d(r, dv)
+    let mut K_sum  = la_zeros_1d(r)
+    let mut out    = la_zeros_2d(S, dv)
+    for i in 0..S {
+        for a in 0..r {
+            let ka = Kp[i][a]
+            K_sum[a] = K_sum[a] + ka
+            for b in 0..dv { KV_sum[a][b] = KV_sum[a][b] + ka * V[i][b] }
+        }
+        let mut numer = la_zeros_1d(dv)
+        for a in 0..r {
+            let qa = Qp[i][a]
+            for b in 0..dv { numer[b] = numer[b] + qa * KV_sum[a][b] }
+        }
+        let mut denom = 0.0
+        for a in 0..r { denom = denom + Qp[i][a] * K_sum[a] }
+        let mut safe = denom
+        if la_fabs(safe) < 1.0e-12 {
+            if denom < 0.0 { safe = 0.0 - 1.0e-12 } else { safe = 1.0e-12 }
+        }
+        for b in 0..dv { out[i][b] = numer[b] / safe }
+    }
+    return out
+}
+
+// ===================================================================
+//  10. Linformer — low-rank sequence projection
+// ===================================================================
 
 @pure
 fn la_linformer_random_projection(k, S, seed) {
-    // Gaussian projection with 1/√k scaling (Johnson-Lindenstrauss style).
     let mut P = la_zeros_2d(k, S)
     let mut state = seed
     let inv = 1.0 / sqrt(k * 1.0)
@@ -429,42 +826,33 @@ fn linear_attention_linformer(Q, K, V, E, F) {
     let S  = len(Q)
     let d  = len(Q[0])
     let dv = len(V[0])
-    let k  = len(E)      // E: [k, S], F: [k, S]
+    let k  = len(E)
     let inv_sqrt_d = 1.0 / sqrt(d * 1.0)
-
-    // K_hat = E · K     (k × d)
+    // K_hat = E * K  (k x d)
     let mut K_hat = la_zeros_2d(k, d)
     for a in 0..k {
         for j in 0..d {
             let mut acc = 0.0
-            for s in 0..S {
-                acc = acc + E[a][s] * K[s][j]
-            }
+            for s in 0..S { acc = acc + E[a][s] * K[s][j] }
             K_hat[a][j] = acc
         }
     }
-    // V_hat = F · V     (k × dv)
+    // V_hat = F * V  (k x dv)
     let mut V_hat = la_zeros_2d(k, dv)
     for a in 0..k {
         for j in 0..dv {
             let mut acc = 0.0
-            for s in 0..S {
-                acc = acc + F[a][s] * V[s][j]
-            }
+            for s in 0..S { acc = acc + F[a][s] * V[s][j] }
             V_hat[a][j] = acc
         }
     }
-
-    // scores = Q · K_hat^T · (1/√d)      (S × k)
     let mut out = la_zeros_2d(S, dv)
     for i in 0..S {
         let mut scores = la_zeros_1d(k)
         let mut mx = 0.0 - 1.0e30
         for a in 0..k {
             let mut dot = 0.0
-            for j in 0..d {
-                dot = dot + Q[i][j] * K_hat[a][j]
-            }
+            for j in 0..d { dot = dot + Q[i][j] * K_hat[a][j] }
             let s = dot * inv_sqrt_d
             scores[a] = s
             if s > mx { mx = s }
@@ -476,22 +864,68 @@ fn linear_attention_linformer(Q, K, V, E, F) {
             exps[a] = e
             sum_exp = sum_exp + e
         }
-        // out_i = (softmax · V_hat)
         for j in 0..dv {
             let mut acc = 0.0
-            for a in 0..k {
-                acc = acc + exps[a] * V_hat[a][j]
-            }
+            for a in 0..k { acc = acc + exps[a] * V_hat[a][j] }
             out[i][j] = acc / sum_exp
         }
     }
     return out
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  Utility: Frobenius-norm distance between two matrices — for
-//  numerical approximation tests.
-// ═══════════════════════════════════════════════════════════════
+// ===================================================================
+//  11. Multi-head Linear Attention
+// ===================================================================
+
+struct MultiHeadLinearAttn {
+    d_model: int,
+    n_heads: int,
+    d_k: int,
+    d_v: int,
+    heads: array,
+    W_o: array
+}
+
+fn create_multi_head_linear_attn(d_model, n_heads, phi_kind, seed) {
+    let d_k = d_model / n_heads
+    let d_v = d_k
+    let mut heads = []
+    for h in 0..n_heads {
+        heads = heads + [create_gated_linear_attn(d_model, d_k, d_v, phi_kind, seed + h * 100)]
+    }
+    return MultiHeadLinearAttn {
+        d_model: d_model,
+        n_heads: n_heads,
+        d_k: d_k,
+        d_v: d_v,
+        heads: heads,
+        W_o: la_init_weight(d_model, d_model, seed + 900)
+    }
+}
+
+fn multi_head_linear_attn_forward(mha, xs) {
+    let seq_len = len(xs)
+    if seq_len == 0 { return [] }
+    let n_heads = mha.n_heads
+    let mut head_outputs = []
+    for h in 0..n_heads {
+        head_outputs = head_outputs + [gated_linear_attn_forward(mha.heads[h], xs)]
+    }
+    let mut outputs = []
+    for t in 0..seq_len {
+        let mut combined = la_zeros_1d(mha.d_model)
+        for h in 0..n_heads {
+            combined = la_vec_add(combined, head_outputs[h][t])
+        }
+        outputs = outputs + [la_mat_vec(mha.W_o, combined)]
+    }
+    return outputs
+}
+
+// ===================================================================
+//  Frobenius norm diff
+// ===================================================================
+
 fn la_frob_diff(A, B) {
     let rows = len(A)
     let mut acc = 0.0
@@ -504,3 +938,17 @@ fn la_frob_diff(A, B) {
     }
     return sqrt(acc)
 }
+
+// ===================================================================
+//  Parameter count
+// ===================================================================
+
+fn la_param_count(d_model, n_heads) {
+    let d_k = d_model / n_heads
+    let d_v = d_k
+    let per_head = d_k * d_model + d_k * d_model + d_v * d_model + d_v * d_model + d_v + d_model * d_v
+    let total = n_heads * per_head + d_model * d_model
+    return total
+}
+
+println("[linear_attention] loaded — phi feature maps + causal/noncausal + recurrent + chunked + gated + performer + linformer + multi-head")

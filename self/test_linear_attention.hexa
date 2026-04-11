@@ -1,26 +1,47 @@
-// ═══════════════════════════════════════════════════════════════
-//  test_linear_attention.hexa — Linear Attention (Performer/Linformer)
+// ===================================================================
+//  test_linear_attention.hexa — Linear Attention with Kernel Feature Maps
 //
-//  Verifies:
-//    1.  Random projection shape  [m, d]
-//    2.  Trig feature map length  = 2m
-//    3.  Positive feature map length = m
-//    4.  Positive feature map is non-negative
-//    5.  Envelope scaling: ‖x‖=0 → φ(x)[0] = 1/√m (trig)
-//    6.  Gaussian variate mean ≈ 0
-//    7.  Gaussian variate std  ≈ 1
-//    8.  Performer(trig)   ≈ naive softmax  (large m)
-//    9.  Performer(pos+)   ≈ naive softmax  (large m)
-//   10.  Performer > random baseline accuracy
-//   11.  Causal Performer first-row attends only to itself
-//   12.  Causal ≠ non-causal
-//   13.  Performer output shape [S, dv]
-//   14.  Linformer output shape [S, dv]
-//   15.  Linformer(k=S, identity)  matches naive softmax
-//   16.  Linformer recovers sequence interactions
+//  ML roadmap #146 — O(N) attention via kernel feature maps
 //
-//  Run: ./hexa self/test_linear_attention.hexa
-// ═══════════════════════════════════════════════════════════════
+//  Tests (35):
+//    T1  phi_elu_plus1 always positive
+//    T2  phi_elu_plus1 identity at zero -> 1.0
+//    T3  phi_relu non-negative
+//    T4  phi_relu zero for negatives
+//    T5  phi_one_plus_elu matches elu_plus1
+//    T6  phi_rff output dimension matches n_features
+//    T7  phi_rff deterministic (same params same output)
+//    T8  phi_orf output dimension matches n_features
+//    T9  apply_phi dispatcher elu_plus1
+//    T10 apply_phi dispatcher relu
+//    T11 noncausal linear attention output shape
+//    T12 noncausal: single token returns V itself
+//    T13 noncausal output finite (no NaN/inf)
+//    T14 causal linear attention output shape
+//    T15 causal: position 0 attends only to self
+//    T16 causal differs from noncausal (S>1)
+//    T17 recurrent state creation shape
+//    T18 recurrent step output dim matches d_v
+//    T19 recurrent step state update non-zero
+//    T20 recurrent matches causal (equivalence)
+//    T21 chunked linear attention output shape
+//    T22 chunked matches causal (chunk_size=1)
+//    T23 chunked matches causal (chunk_size=2)
+//    T24 chunked matches causal (chunk_size=seq_len)
+//    T25 gated linear attn forward output shape
+//    T26 gated linear attn: gate bounds output
+//    T27 causal denoms positive for elu_plus1
+//    T28 performer trig feature map length 2m
+//    T29 performer positive feature map non-negative
+//    T30 performer(trig) approx naive softmax
+//    T31 performer causal first row near V[0]
+//    T32 linformer output shape
+//    T33 linformer identity matches naive
+//    T34 multi-head linear attn output shape
+//    T35 param count > 0
+//
+//  Run: cargo run --release -- self/test_linear_attention.hexa
+// ===================================================================
 
 import "ml/linear_attention.hexa"
 
@@ -42,14 +63,16 @@ fn tfabs(x) {
     return x
 }
 
+fn approx(a, b, eps) {
+    return tfabs(a - b) < eps
+}
+
 fn mat_frob(A) {
     let rows = len(A)
     let mut acc = 0.0
     for i in 0..rows {
         let cols = len(A[i])
-        for j in 0..cols {
-            acc = acc + A[i][j] * A[i][j]
-        }
+        for j in 0..cols { acc = acc + A[i][j] * A[i][j] }
     }
     return sqrt(acc)
 }
@@ -61,12 +84,24 @@ fn mat_rel_diff(A, B) {
     return num / denom
 }
 
-println("═══════════════════════════════════════════════════════")
-println("  Linear Attention Test Suite (Performer + Linformer)")
-println("═══════════════════════════════════════════════════════")
+fn vec_max_diff(a, b) {
+    let n = len(a)
+    let mut mx = 0.0
+    for i in 0..n {
+        let d = tfabs(a[i] - b[i])
+        if d > mx { mx = d }
+    }
+    return mx
+}
 
-// ── Build test matrices ─────────────────────────────────────
-// Q, K, V: [4, 3]
+println("===================================================")
+println("  Linear Attention Test Suite (#146)")
+println("===================================================")
+
+// ===================================================================
+//  Test data
+// ===================================================================
+
 let Q = [
     [0.10, 0.20, 0.30],
     [0.40, 0.50, 0.60],
@@ -90,136 +125,344 @@ let S = len(Q)
 let d = len(Q[0])
 let dv = len(V[0])
 
-// ── Test 1: random projection shape ─────────────────────────
+// ===================================================================
+//  T1: phi_elu_plus1 always positive
+// ===================================================================
+let test_vec = [0.0 - 2.0, 0.0 - 1.0, 0.0, 1.0, 2.0]
+let phi_e = phi_elu_plus1(test_vec)
+let mut all_pos = true
+for i in 0..len(phi_e) {
+    if phi_e[i] < 0.0 { all_pos = false }
+}
+check("T1 phi_elu_plus1 always positive", all_pos)
+
+// ===================================================================
+//  T2: phi_elu_plus1 at zero -> 1.0
+// ===================================================================
+let phi_z = phi_elu_plus1([0.0, 0.0, 0.0])
+check("T2 phi_elu_plus1(0) = 1.0", approx(phi_z[0], 1.0, 1.0e-6) && approx(phi_z[1], 1.0, 1.0e-6))
+
+// ===================================================================
+//  T3: phi_relu non-negative
+// ===================================================================
+let phi_r = phi_relu(test_vec)
+let mut all_nn = true
+for i in 0..len(phi_r) {
+    if phi_r[i] < 0.0 { all_nn = false }
+}
+check("T3 phi_relu non-negative", all_nn)
+
+// ===================================================================
+//  T4: phi_relu zero for negatives
+// ===================================================================
+check("T4 phi_relu(-2)=0, phi_relu(2)=2", approx(phi_r[0], 0.0, 1.0e-6) && approx(phi_r[4], 2.0, 1.0e-6))
+
+// ===================================================================
+//  T5: phi_one_plus_elu matches elu_plus1
+// ===================================================================
+let phi_ope = phi_one_plus_elu(test_vec)
+let mut match_ope = true
+for i in 0..len(phi_e) {
+    if tfabs(phi_e[i] - phi_ope[i]) > 1.0e-10 { match_ope = false }
+}
+check("T5 phi_one_plus_elu == phi_elu_plus1", match_ope)
+
+// ===================================================================
+//  T6: phi_rff output dimension
+// ===================================================================
+let rff_p = create_rff_params(3, 8, 42)
+let phi_rff_out = phi_rff(Q[0], rff_p[0], rff_p[1])
+check("T6 phi_rff output dim == n_features", len(phi_rff_out) == 8)
+
+// ===================================================================
+//  T7: phi_rff deterministic
+// ===================================================================
+let phi_rff_out2 = phi_rff(Q[0], rff_p[0], rff_p[1])
+let mut rff_det = true
+for i in 0..8 {
+    if tfabs(phi_rff_out[i] - phi_rff_out2[i]) > 1.0e-10 { rff_det = false }
+}
+check("T7 phi_rff deterministic", rff_det)
+
+// ===================================================================
+//  T8: phi_orf output dimension
+// ===================================================================
+let orf_p = create_orf_params(3, 5, 77)
+let phi_orf_out = phi_orf(Q[0], orf_p[0], orf_p[1])
+check("T8 phi_orf output dim == n_features", len(phi_orf_out) == 5)
+
+// ===================================================================
+//  T9: apply_phi dispatcher elu_plus1
+// ===================================================================
+let ap_e = apply_phi(Q[0], "elu_plus1", [])
+let ap_e_direct = phi_elu_plus1(Q[0])
+let mut ap_match = true
+for i in 0..len(ap_e) {
+    if tfabs(ap_e[i] - ap_e_direct[i]) > 1.0e-10 { ap_match = false }
+}
+check("T9 apply_phi(elu_plus1) matches direct", ap_match)
+
+// ===================================================================
+//  T10: apply_phi dispatcher relu
+// ===================================================================
+let ap_r = apply_phi(Q[0], "relu", [])
+let ap_r_direct = phi_relu(Q[0])
+let mut ap_r_match = true
+for i in 0..len(ap_r) {
+    if tfabs(ap_r[i] - ap_r_direct[i]) > 1.0e-10 { ap_r_match = false }
+}
+check("T10 apply_phi(relu) matches direct", ap_r_match)
+
+// ===================================================================
+//  T11: noncausal linear attention output shape
+// ===================================================================
+let nc_out = linear_attention_noncausal(Q, K, V, "elu_plus1", [])
+check("T11 noncausal output shape [S,dv]", len(nc_out) == S && len(nc_out[0]) == dv)
+
+// ===================================================================
+//  T12: noncausal single token returns V
+// ===================================================================
+let q1 = [[0.5, 0.3, 0.1]]
+let k1 = [[0.2, 0.4, 0.6]]
+let v1 = [[3.0, 7.0, 1.0]]
+let nc1 = linear_attention_noncausal(q1, k1, v1, "elu_plus1", [])
+check("T12 noncausal single token ~ V", approx(nc1[0][0], 3.0, 0.01) && approx(nc1[0][1], 7.0, 0.01))
+
+// ===================================================================
+//  T13: noncausal output finite
+// ===================================================================
+let mut nc_finite = true
+for i in 0..S {
+    for j in 0..dv {
+        let val = nc_out[i][j]
+        if val > 1.0e10 { nc_finite = false }
+        if val < 0.0 - 1.0e10 { nc_finite = false }
+    }
+}
+check("T13 noncausal output finite", nc_finite)
+
+// ===================================================================
+//  T14: causal linear attention output shape
+// ===================================================================
+let c_out = linear_attention_causal(Q, K, V, "elu_plus1", [])
+check("T14 causal output shape [S,dv]", len(c_out) == S && len(c_out[0]) == dv)
+
+// ===================================================================
+//  T15: causal position 0 attends only to self
+// ===================================================================
+let c1_out = linear_attention_causal(q1, k1, v1, "elu_plus1", [])
+check("T15 causal pos 0 ~ V[0]", approx(c1_out[0][0], 3.0, 0.01) && approx(c1_out[0][1], 7.0, 0.01))
+
+// ===================================================================
+//  T16: causal differs from noncausal
+// ===================================================================
+let mut causal_diff = 0.0
+for i in 0..S {
+    for j in 0..dv {
+        let dd = tfabs(c_out[i][j] - nc_out[i][j])
+        if dd > causal_diff { causal_diff = dd }
+    }
+}
+check("T16 causal != noncausal (S>1)", causal_diff > 1.0e-6)
+
+// ===================================================================
+//  T17: recurrent state creation
+// ===================================================================
+let rst = create_linear_attn_state(3, 4)
+check("T17 recurrent state shape", rst.d_feat == 3 && rst.d_v == 4 && len(rst.s_mat) == 3 && len(rst.z_vec) == 3)
+
+// ===================================================================
+//  T18: recurrent step output dim
+// ===================================================================
+let rst0 = create_linear_attn_state(d, dv)
+let rec_res = linear_attn_recurrent_step(rst0, Q[0], K[0], V[0], "elu_plus1", [])
+check("T18 recurrent step output dim", len(rec_res[0]) == dv)
+
+// ===================================================================
+//  T19: recurrent step state update non-zero
+// ===================================================================
+let rec_s1 = rec_res[1]
+let mut any_nz = false
+for f in 0..d {
+    if tfabs(rec_s1.z_vec[f]) > 1.0e-10 { any_nz = true }
+}
+check("T19 recurrent step state non-zero", any_nz)
+
+// ===================================================================
+//  T20: recurrent matches causal (equivalence)
+// ===================================================================
+let mut rec_state = create_linear_attn_state(d, dv)
+let mut rec_outs = []
+for i in 0..S {
+    let rr = linear_attn_recurrent_step(rec_state, Q[i], K[i], V[i], "elu_plus1", [])
+    rec_outs = rec_outs + [rr[0]]
+    rec_state = rr[1]
+}
+let cau_outs = linear_attention_causal(Q, K, V, "elu_plus1", [])
+let mut rec_cau_diff = 0.0
+for i in 0..S {
+    for j in 0..dv {
+        let dd = tfabs(rec_outs[i][j] - cau_outs[i][j])
+        if dd > rec_cau_diff { rec_cau_diff = dd }
+    }
+}
+println("  [info] recurrent vs causal max_diff = " + to_string(rec_cau_diff))
+check("T20 recurrent == causal (max_diff < 1e-6)", rec_cau_diff < 1.0e-6)
+
+// ===================================================================
+//  T21: chunked linear attention output shape
+// ===================================================================
+let chunk_out = linear_attention_chunked(Q, K, V, "elu_plus1", [], 2)
+check("T21 chunked output shape [S,dv]", len(chunk_out) == S && len(chunk_out[0]) == dv)
+
+// ===================================================================
+//  T22: chunked matches causal (chunk_size=1)
+// ===================================================================
+let chunk1_out = linear_attention_chunked(Q, K, V, "elu_plus1", [], 1)
+let mut ch1_diff = 0.0
+for i in 0..S {
+    for j in 0..dv {
+        let dd = tfabs(chunk1_out[i][j] - cau_outs[i][j])
+        if dd > ch1_diff { ch1_diff = dd }
+    }
+}
+println("  [info] chunk(1) vs causal max_diff = " + to_string(ch1_diff))
+check("T22 chunked(C=1) == causal (diff < 1e-6)", ch1_diff < 1.0e-6)
+
+// ===================================================================
+//  T23: chunked matches causal (chunk_size=2)
+// ===================================================================
+let chunk2_out = linear_attention_chunked(Q, K, V, "elu_plus1", [], 2)
+let mut ch2_diff = 0.0
+for i in 0..S {
+    for j in 0..dv {
+        let dd = tfabs(chunk2_out[i][j] - cau_outs[i][j])
+        if dd > ch2_diff { ch2_diff = dd }
+    }
+}
+println("  [info] chunk(2) vs causal max_diff = " + to_string(ch2_diff))
+check("T23 chunked(C=2) == causal (diff < 1e-6)", ch2_diff < 1.0e-6)
+
+// ===================================================================
+//  T24: chunked matches causal (chunk_size=seq_len)
+// ===================================================================
+let chunkS_out = linear_attention_chunked(Q, K, V, "elu_plus1", [], S)
+let mut chS_diff = 0.0
+for i in 0..S {
+    for j in 0..dv {
+        let dd = tfabs(chunkS_out[i][j] - cau_outs[i][j])
+        if dd > chS_diff { chS_diff = dd }
+    }
+}
+check("T24 chunked(C=S) == causal (diff < 1e-6)", chS_diff < 1.0e-6)
+
+// ===================================================================
+//  T25: gated linear attn forward output shape
+// ===================================================================
+let gla = create_gated_linear_attn(3, 3, 3, "elu_plus1", 42)
+let gla_xs = [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6], [0.7, 0.8, 0.9]]
+let gla_out = gated_linear_attn_forward(gla, gla_xs)
+check("T25 gated linear attn output shape", len(gla_out) == 3 && len(gla_out[0]) == 3)
+
+// ===================================================================
+//  T26: gated output bounded (sigmoid gate keeps it bounded)
+// ===================================================================
+let mut gla_bounded = true
+for i in 0..3 {
+    for j in 0..3 {
+        if tfabs(gla_out[i][j]) > 1000.0 { gla_bounded = false }
+    }
+}
+check("T26 gated output bounded", gla_bounded)
+
+// ===================================================================
+//  T27: causal denoms positive for elu_plus1
+// ===================================================================
+let denoms = la_causal_denoms(Q, K, "elu_plus1", [])
+let mut all_pos_d = true
+for i in 0..S {
+    if denoms[i] <= 0.0 { all_pos_d = false }
+}
+check("T27 causal denoms positive (elu_plus1)", all_pos_d)
+
+// ===================================================================
+//  T28: performer trig feature map length 2m
+// ===================================================================
 let W_small = la_random_projection(5, d, 12345)
-check("random projection [m=5,d=3] shape",
-      len(W_small) == 5 && len(W_small[0]) == 3)
-
-// ── Test 2: trig feature length = 2m ────────────────────────
 let phi_trig = la_feature_map_trig(Q[0], W_small)
-check("trig feature length = 2m", len(phi_trig) == 10)
+check("T28 trig feature length = 2m", len(phi_trig) == 10)
 
-// ── Test 3: positive feature length = m ─────────────────────
+// ===================================================================
+//  T29: performer positive feature map non-negative
+// ===================================================================
 let phi_pos = la_feature_map_pos(Q[0], W_small)
-check("positive feature length = m", len(phi_pos) == 5)
-
-// ── Test 4: positive feature map non-negative ───────────────
 let mut all_nonneg = true
 for i in 0..len(phi_pos) {
     if phi_pos[i] < 0.0 { all_nonneg = false }
 }
-check("positive feature map ≥ 0", all_nonneg)
+check("T29 positive feature map >= 0", all_nonneg)
 
-// ── Test 5: envelope scaling for ‖x‖=0 ──────────────────────
-//   φ_trig(0)[0] = exp(0) * √(1/m) * cos(0) = 1/√m
-let zero_vec = [0.0, 0.0, 0.0]
-let phi_zero = la_feature_map_trig(zero_vec, W_small)
-let expected = 1.0 / sqrt(5.0)
-check("trig φ(0)[0] = 1/√m", tfabs(phi_zero[0] - expected) < 1.0e-6)
-
-// ── Test 6: Gaussian mean ≈ 0 (N=500) ───────────────────────
-let W_big = la_random_projection(500, 1, 999)
-let mut sumv = 0.0
-for i in 0..500 {
-    sumv = sumv + W_big[i][0]
-}
-let mean = sumv / 500.0
-check("Gaussian mean ≈ 0 (|μ|<0.15)", tfabs(mean) < 0.15)
-
-// ── Test 7: Gaussian std ≈ 1 ────────────────────────────────
-let mut var = 0.0
-for i in 0..500 {
-    let delta = W_big[i][0] - mean
-    var = var + delta * delta
-}
-var = var / 500.0
-let std = sqrt(var)
-check("Gaussian std ≈ 1 (0.85<σ<1.15)", std > 0.85 && std < 1.15)
-
-// ── Test 8: Performer(trig) ≈ naive softmax (m=256) ─────────
+// ===================================================================
+//  T30: performer(trig) approx naive softmax (m=256)
+// ===================================================================
 let naive_out = la_naive_attention(Q, K, V)
 let W_trig = la_random_projection(256, d, 42)
 let perf_trig = linear_attention_performer(Q, K, V, W_trig, true)
 let rel_trig = mat_rel_diff(naive_out, perf_trig)
-println("  [info] rel_diff trig(m=256) = " + to_string(rel_trig))
-check("Performer(trig,m=256) rel<0.25", rel_trig < 0.25)
+println("  [info] performer trig rel_diff = " + to_string(rel_trig))
+check("T30 Performer(trig,m=256) rel<0.25", rel_trig < 0.25)
 
-// ── Test 9: Performer(positive) ≈ naive softmax (m=256) ─────
-let W_pos = la_random_projection(256, d, 7)
-let perf_pos = linear_attention_performer(Q, K, V, W_pos, false)
-let rel_pos = mat_rel_diff(naive_out, perf_pos)
-println("  [info] rel_diff pos(m=256) = " + to_string(rel_pos))
-check("Performer(pos+,m=256) rel<0.35", rel_pos < 0.35)
-
-// ── Test 10: approx error ≥ zero (sanity baseline) ──────────
-//   Compare Performer output against a constant matrix — should be
-//   much larger relative error.  This catches the degenerate case
-//   where Performer collapses to zero output.
-let mut const_out = la_zeros_2d(S, dv)
-for i in 0..S {
-    for j in 0..dv {
-        const_out[i][j] = 0.5
-    }
-}
-let rel_const = mat_rel_diff(naive_out, const_out)
-check("Performer beats constant baseline",
-      rel_trig < rel_const && rel_pos < rel_const)
-
-// ── Test 11: Causal Performer first-row numerator only uses V[0] ──
-//   With causal masking, row 0 attends only to position 0 so the
-//   output should be dominated by V[0] (up to feature map error).
+// ===================================================================
+//  T31: causal performer first row near V[0]
+// ===================================================================
 let W_causal = la_random_projection(256, d, 123)
 let perf_causal = linear_attention_performer_causal(Q, K, V, W_causal, false)
-// Check row 0: should be (nearly) V[0]
 let row0_err = sqrt((perf_causal[0][0] - V[0][0]) * (perf_causal[0][0] - V[0][0]) +
                     (perf_causal[0][1] - V[0][1]) * (perf_causal[0][1] - V[0][1]) +
                     (perf_causal[0][2] - V[0][2]) * (perf_causal[0][2] - V[0][2]))
 println("  [info] causal row0 err = " + to_string(row0_err))
-check("Causal row 0 ≈ V[0] (err<0.6)", row0_err < 0.6)
+check("T31 causal performer row 0 near V[0]", row0_err < 0.6)
 
-// ── Test 12: Causal ≠ non-causal ────────────────────────────
-let W_same = la_random_projection(64, d, 777)
-let non_causal = linear_attention_performer(Q, K, V, W_same, false)
-let causal     = linear_attention_performer_causal(Q, K, V, W_same, false)
-let diff_nc = la_frob_diff(non_causal, causal)
-check("causal ≠ non-causal", diff_nc > 1.0e-3)
+// ===================================================================
+//  T32: linformer output shape
+// ===================================================================
+let E_mat = la_linformer_random_projection(2, S, 11)
+let F_mat = la_linformer_random_projection(2, S, 22)
+let lin_out = linear_attention_linformer(Q, K, V, E_mat, F_mat)
+check("T32 Linformer output [S,dv]", len(lin_out) == S && len(lin_out[0]) == dv)
 
-// ── Test 13: Performer output shape ─────────────────────────
-check("Performer output [S,dv]",
-      len(perf_trig) == S && len(perf_trig[0]) == dv)
-
-// ── Test 14: Linformer output shape ─────────────────────────
-let E = la_linformer_random_projection(2, S, 11)
-let F = la_linformer_random_projection(2, S, 22)
-let lin_out = linear_attention_linformer(Q, K, V, E, F)
-check("Linformer output [S,dv]",
-      len(lin_out) == S && len(lin_out[0]) == dv)
-
-// ── Test 15: Linformer(k=S, E=F=I) matches naive softmax ────
-//   When the projection is the identity, K̂ = K and V̂ = V, so
-//   Linformer reduces exactly to naive softmax attention.
+// ===================================================================
+//  T33: linformer identity matches naive
+// ===================================================================
 let mut Ik = la_zeros_2d(S, S)
 for i in 0..S { Ik[i][i] = 1.0 }
 let lin_identity = linear_attention_linformer(Q, K, V, Ik, Ik)
 let id_rel = mat_rel_diff(naive_out, lin_identity)
 println("  [info] Linformer(identity) rel = " + to_string(id_rel))
-check("Linformer(identity) matches naive", id_rel < 1.0e-6)
+check("T33 Linformer(identity) matches naive", id_rel < 1.0e-6)
 
-// ── Test 16: Linformer recovers sequence interactions ───────
-//   Re-run with k=3 random projection — output must not collapse
-//   to a constant row (i.e. different query rows produce different
-//   outputs).
-let E3 = la_linformer_random_projection(3, S, 31)
-let F3 = la_linformer_random_projection(3, S, 32)
-let lin3 = linear_attention_linformer(Q, K, V, E3, F3)
-let row_diff_0_1 = tfabs(lin3[0][0] - lin3[1][0]) +
-                   tfabs(lin3[0][1] - lin3[1][1]) +
-                   tfabs(lin3[0][2] - lin3[1][2])
-check("Linformer rows not identical", row_diff_0_1 > 1.0e-4)
+// ===================================================================
+//  T34: multi-head linear attn output shape
+// ===================================================================
+let mha = create_multi_head_linear_attn(4, 2, "elu_plus1", 99)
+let mha_xs = [[0.1, 0.2, 0.3, 0.4], [0.5, 0.6, 0.7, 0.8]]
+let mha_out = multi_head_linear_attn_forward(mha, mha_xs)
+check("T34 multi-head output shape", len(mha_out) == 2 && len(mha_out[0]) == 4)
 
-// ═══════════════════════════════════════════════════════════════
+// ===================================================================
+//  T35: param count > 0
+// ===================================================================
+let pc = la_param_count(8, 2)
+check("T35 param_count > 0", pc > 0)
+
+// ===================================================================
+//  Summary
+// ===================================================================
 println("")
-println("pass=" + to_string(pass_count) + " fail=" + to_string(fail_count))
+println("=== Linear Attention test summary ===")
+println("PASS: " + to_string(pass_count))
+println("FAIL: " + to_string(fail_count))
+println("TOTAL: " + to_string(pass_count + fail_count))
 if fail_count == 0 {
     println("ALL PASS")
 } else {

@@ -1,0 +1,551 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/data_packing.hexa — Multi-Sample Sequence Packing
+//
+//  Packs variable-length samples into fixed-length bins (sequences)
+//  to maximise GPU utilisation by reducing wasted padding tokens.
+//
+//  Components:
+//    1. Bin packing          — pack samples into fixed-length bins
+//    2. First-fit-decreasing — sort descending, assign to first bin
+//    3. Attention mask       — block-diagonal mask per document
+//    4. Cross-contamination  — verify no attention leaks between docs
+//    5. Padding ratio        — measure wasted padding vs packed tokens
+//    6. Variable-length cat  — concatenate samples with separators
+//    7. Separator tokens     — insert special tokens between documents
+//    8. Packing efficiency   — utilisation, samples-per-seq, pad %
+//
+//  API (all pure, no global mutable state):
+//    dp_sort_desc(lengths)                          -> [int]
+//    dp_argsort_desc(lengths)                       -> [int]
+//    dp_first_fit_dec(lengths, max_len)             -> [[int]]
+//    dp_pack_samples(samples, max_len, sep_tok)     -> [[int]]
+//    dp_build_mask(bin_layout, max_len)             -> [[int]]
+//    dp_verify_no_leak(mask, bin_layout, max_len)   -> bool
+//    dp_padding_ratio(bins, max_len)                -> float
+//    dp_utilisation(bins, max_len)                   -> float
+//    dp_samples_per_seq(bins)                        -> float
+//    dp_concat_with_sep(samples, sep_tok)            -> [int]
+//    dp_new_bin()                                    -> bin
+//    dp_bin_remaining(bin, max_len)                  -> int
+//    dp_add_to_bin(bin, sample_idx, sample_len)      -> bin
+//    dp_pad_sequence(seq, max_len, pad_tok)          -> [int]
+//    dp_pack_full(samples, max_len, sep_tok, pad_tok)-> result
+//    dp_efficiency_report(result)                    -> map
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+//    @hot   — inner loops on packing path
+// ═══════════════════════════════════════════════════════════════════
+
+// ── helpers ──────────────────────────────────────────────────────
+
+fn dp_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+fn dp_ones_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [1] }
+    return v
+}
+
+fn dp_zeros_float(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn dp_make_row(cols, val) {
+    let mut row = []
+    for _c in 0..cols { row = row + [val] }
+    return row
+}
+
+fn dp_make_matrix(rows, cols, val) {
+    let mut m = []
+    for _r in 0..rows {
+        m = m + [dp_make_row(cols, val)]
+    }
+    return m
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Sorting — descending order by value
+// ═══════════════════════════════════════════════════════════════════
+
+// Sort an array of ints in descending order (selection sort, O(n^2) ok
+// for typical bin-packing batch sizes)
+@pure
+fn dp_sort_desc(lengths) {
+    let n = len(lengths)
+    let mut arr = []
+    for i in 0..n { arr = arr + [lengths[i]] }
+    for i in 0..n {
+        let mut best = i
+        for j in (i + 1)..n {
+            if arr[j] > arr[best] { best = j }
+        }
+        if best != i {
+            let tmp = arr[i]
+            arr[i] = arr[best]
+            arr[best] = tmp
+        }
+    }
+    return arr
+}
+
+// Return indices that would sort the array descending
+@pure
+fn dp_argsort_desc(lengths) {
+    let n = len(lengths)
+    let mut idxs = []
+    for i in 0..n { idxs = idxs + [i] }
+    for i in 0..n {
+        let mut best = i
+        for j in (i + 1)..n {
+            if lengths[idxs[j]] > lengths[idxs[best]] { best = j }
+        }
+        if best != i {
+            let tmp = idxs[i]
+            idxs[i] = idxs[best]
+            idxs[best] = tmp
+        }
+    }
+    return idxs
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Bin representation
+//
+//  A bin is a map:
+//    #{ "items": [sample_indices], "used": total_tokens_used }
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn dp_new_bin() {
+    return #{ "items": [], "used": 0 }
+}
+
+@pure
+fn dp_bin_remaining(bin, max_len) {
+    return max_len - bin["used"]
+}
+
+@pure
+fn dp_add_to_bin(bin, sample_idx, sample_len) {
+    let new_items = bin["items"] + [sample_idx]
+    let new_used = bin["used"] + sample_len
+    return #{ "items": new_items, "used": new_used }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  First-Fit-Decreasing Bin Packing
+//
+//  1. Sort samples by length descending (argsort)
+//  2. For each sample, find the first bin where it fits
+//  3. If no bin fits, open a new bin
+//
+//  lengths: array of sample lengths (including separator overhead)
+//  max_len: maximum tokens per packed sequence
+//
+//  Returns: array of bins (each bin = map with "items" and "used")
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn dp_first_fit_dec(lengths, max_len) {
+    let n = len(lengths)
+    let order = dp_argsort_desc(lengths)
+    let mut bins = []
+
+    for oi in 0..n {
+        let idx = order[oi]
+        let slen = lengths[idx]
+        // skip samples that exceed max_len (cannot fit anywhere)
+        if slen > max_len { continue }
+
+        let mut placed = false
+        for b in 0..len(bins) {
+            if dp_bin_remaining(bins[b], max_len) >= slen {
+                bins[b] = dp_add_to_bin(bins[b], idx, slen)
+                placed = true
+                break
+            }
+        }
+        if !placed {
+            let mut nb = dp_new_bin()
+            nb = dp_add_to_bin(nb, idx, slen)
+            bins = bins + [nb]
+        }
+    }
+    return bins
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Separator Token Handling
+//
+//  Insert a separator token between concatenated documents.
+//  The effective length of a sample when packed = sample_len + 1
+//  (for the separator), except the first sample in a bin which
+//  needs no leading separator.
+//
+//  dp_effective_lengths: compute the lengths with separator overhead
+//  dp_concat_with_sep: concatenate token arrays with separator
+// ═══════════════════════════════════════════════════════════════════
+
+// Compute effective lengths: each sample needs +1 for separator
+// except we budget it uniformly (the bin packing accounts for it)
+@pure
+fn dp_effective_lengths(sample_lengths, sep_overhead) {
+    let n = len(sample_lengths)
+    let mut eff = []
+    for i in 0..n {
+        eff = eff + [sample_lengths[i] + sep_overhead]
+    }
+    return eff
+}
+
+// Concatenate sample token arrays with a separator token between them
+@pure
+fn dp_concat_with_sep(samples, sep_tok) {
+    let n = len(samples)
+    if n == 0 { return [] }
+    let mut result = []
+    for i in 0..n {
+        if i > 0 {
+            result = result + [sep_tok]
+        }
+        let sample = samples[i]
+        for j in 0..len(sample) {
+            result = result + [sample[j]]
+        }
+    }
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Pad Sequence — fill up to max_len with pad_tok
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn dp_pad_sequence(seq, max_len, pad_tok) {
+    let mut result = []
+    for i in 0..len(seq) {
+        result = result + [seq[i]]
+    }
+    let remaining = max_len - len(seq)
+    for _p in 0..remaining {
+        result = result + [pad_tok]
+    }
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Attention Mask — Block-Diagonal per Document
+//
+//  Given the layout of documents within a packed sequence,
+//  build a 2D attention mask where:
+//    mask[i][j] = 1  iff token i and token j belong to same document
+//    mask[i][j] = 0  otherwise (cross-contamination prevention)
+//
+//  doc_boundaries: array of [start, end] pairs for each document
+//  max_len: total sequence length (including padding)
+//
+//  Padding tokens attend to nothing (all 0).
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn dp_build_mask(doc_boundaries, max_len) {
+    let mut mask = dp_make_matrix(max_len, max_len, 0)
+    let ndocs = len(doc_boundaries)
+    for d in 0..ndocs {
+        let start = doc_boundaries[d][0]
+        let end_pos = doc_boundaries[d][1]
+        for i in start..end_pos {
+            for j in start..end_pos {
+                mask[i][j] = 1
+            }
+        }
+    }
+    return mask
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Cross-Contamination Verification
+//
+//  Given the mask and document boundaries, verify that NO pair of
+//  tokens from different documents has mask[i][j] = 1.
+//  Returns true if the mask is clean (no leakage).
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn dp_verify_no_leak(mask, doc_boundaries, max_len) {
+    let ndocs = len(doc_boundaries)
+    // For each pair of different documents, ensure no cross-attention
+    for d1 in 0..ndocs {
+        let s1 = doc_boundaries[d1][0]
+        let e1 = doc_boundaries[d1][1]
+        for d2 in (d1 + 1)..ndocs {
+            let s2 = doc_boundaries[d2][0]
+            let e2 = doc_boundaries[d2][1]
+            // check every token pair between doc d1 and doc d2
+            for i in s1..e1 {
+                for j in s2..e2 {
+                    if mask[i][j] != 0 { return false }
+                    if mask[j][i] != 0 { return false }
+                }
+            }
+        }
+    }
+    return true
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Padding Ratio — fraction of total tokens that are padding
+//
+//  bins: array of bin maps from dp_first_fit_dec
+//  max_len: max sequence length
+//
+//  padding_ratio = total_pad / (num_bins * max_len)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn dp_padding_ratio(bins, max_len) {
+    let nb = len(bins)
+    if nb == 0 { return 0.0 }
+    let total_capacity = nb * max_len
+    let mut total_used = 0
+    for b in 0..nb {
+        total_used = total_used + bins[b]["used"]
+    }
+    let total_pad = total_capacity - total_used
+    return to_float(total_pad) / to_float(total_capacity)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Utilisation — fraction of total tokens that are real data
+//
+//  utilisation = 1.0 - padding_ratio
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn dp_utilisation(bins, max_len) {
+    return 1.0 - dp_padding_ratio(bins, max_len)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Samples Per Sequence — average number of samples per bin
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn dp_samples_per_seq(bins) {
+    let nb = len(bins)
+    if nb == 0 { return 0.0 }
+    let mut total_items = 0
+    for b in 0..nb {
+        total_items = total_items + len(bins[b]["items"])
+    }
+    return to_float(total_items) / to_float(nb)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Total samples packed
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn dp_total_samples(bins) {
+    let mut total = 0
+    for b in 0..len(bins) {
+        total = total + len(bins[b]["items"])
+    }
+    return total
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Full Packing Pipeline
+//
+//  Given raw samples (arrays of token IDs), a max sequence length,
+//  a separator token, and a padding token:
+//
+//  1. Compute effective lengths (sample_len + 1 for separator)
+//  2. Run first-fit-decreasing bin packing
+//  3. For each bin, concatenate samples with separators
+//  4. Pad to max_len
+//  5. Build attention mask with document boundaries
+//
+//  Returns a map:
+//    #{ "packed_seqs": [[int]], "masks": [[[int]]], "bins": [bin],
+//       "boundaries": [[[int,int]]], "num_bins": int }
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn dp_pack_full(samples, max_len, sep_tok, pad_tok) {
+    let n = len(samples)
+    // compute sample lengths
+    let mut raw_lens = []
+    for i in 0..n {
+        raw_lens = raw_lens + [len(samples[i])]
+    }
+
+    // effective lengths: each sample adds 1 for separator overhead
+    let eff_lens = dp_effective_lengths(raw_lens, 1)
+
+    // bin packing
+    let bins = dp_first_fit_dec(eff_lens, max_len)
+    let nb = len(bins)
+
+    // build packed sequences, masks, boundaries
+    let mut packed_seqs = []
+    let mut all_masks = []
+    let mut all_boundaries = []
+
+    for b in 0..nb {
+        let bin = bins[b]
+        let items = bin["items"]
+        let ni = len(items)
+
+        // gather samples in this bin
+        let mut bin_samples = []
+        for k in 0..ni {
+            bin_samples = bin_samples + [samples[items[k]]]
+        }
+
+        // concatenate with separator
+        let concat = dp_concat_with_sep(bin_samples, sep_tok)
+
+        // pad to max_len
+        let padded = dp_pad_sequence(concat, max_len, pad_tok)
+
+        // compute document boundaries within the packed sequence
+        let mut boundaries = []
+        let mut pos = 0
+        for k in 0..ni {
+            let slen = len(samples[items[k]])
+            if k > 0 {
+                pos = pos + 1  // skip separator
+            }
+            boundaries = boundaries + [[pos, pos + slen]]
+            pos = pos + slen
+        }
+
+        // build attention mask
+        let mask = dp_build_mask(boundaries, max_len)
+
+        packed_seqs = packed_seqs + [padded]
+        all_masks = all_masks + [mask]
+        all_boundaries = all_boundaries + [boundaries]
+    }
+
+    return #{ "packed_seqs": packed_seqs, "masks": all_masks,
+              "bins": bins, "boundaries": all_boundaries,
+              "num_bins": nb }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Efficiency Report
+//
+//  Given the result from dp_pack_full, compute summary metrics.
+//  Returns a map with: utilisation, padding_pct, samples_per_seq,
+//  total_samples, num_bins
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn dp_efficiency_report(result, max_len) {
+    let bins = result["bins"]
+    let util = dp_utilisation(bins, max_len)
+    let pad_pct = dp_padding_ratio(bins, max_len) * 100.0
+    let sps = dp_samples_per_seq(bins)
+    let ts = dp_total_samples(bins)
+    let nb = result["num_bins"]
+    return #{ "utilisation": util, "padding_pct": pad_pct,
+              "samples_per_seq": sps, "total_samples": ts,
+              "num_bins": nb }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Naive Packing Baseline — one sample per sequence (for comparison)
+//
+//  Returns padding ratio if each sample is padded individually.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn dp_naive_padding_ratio(sample_lengths, max_len) {
+    let n = len(sample_lengths)
+    if n == 0 { return 0.0 }
+    let mut total_used = 0
+    let mut total_cap = 0
+    for i in 0..n {
+        let slen = sample_lengths[i]
+        if slen <= max_len {
+            total_used = total_used + slen
+            total_cap = total_cap + max_len
+        }
+    }
+    if total_cap == 0 { return 0.0 }
+    return to_float(total_cap - total_used) / to_float(total_cap)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Pack with custom separator length
+//
+//  Sometimes the separator is more than 1 token (e.g. [SEP][CLS]).
+//  This variant takes sep_len as an explicit parameter.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn dp_first_fit_dec_custom_sep(lengths, max_len, sep_len) {
+    let eff = dp_effective_lengths(lengths, sep_len)
+    return dp_first_fit_dec(eff, max_len)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Greedy best-fit variant — assign to the bin with least remaining
+//  space that still fits (tighter packing at cost of more scanning)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn dp_best_fit_dec(lengths, max_len) {
+    let n = len(lengths)
+    let order = dp_argsort_desc(lengths)
+    let mut bins = []
+
+    for oi in 0..n {
+        let idx = order[oi]
+        let slen = lengths[idx]
+        if slen > max_len { continue }
+
+        let mut best_b = -1
+        let mut best_rem = max_len + 1
+        for b in 0..len(bins) {
+            let rem = dp_bin_remaining(bins[b], max_len)
+            if rem >= slen {
+                if rem < best_rem {
+                    best_rem = rem
+                    best_b = b
+                }
+            }
+        }
+        if best_b >= 0 {
+            bins[best_b] = dp_add_to_bin(bins[best_b], idx, slen)
+        } else {
+            let mut nb = dp_new_bin()
+            nb = dp_add_to_bin(nb, idx, slen)
+            bins = bins + [nb]
+        }
+    }
+    return bins
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Mask helpers
+// ═══════════════════════════════════════════════════════════════════
+
+// Check if padding tokens have all-zero mask rows
+@pure
+fn dp_verify_pad_masked(mask, content_len, max_len) {
+    for i in content_len..max_len {
+        for j in 0..max_len {
+            if mask[i][j] != 0 { return false }
+        }
+    }
+    return true
+}
+
+// Check that mask diagonal within content region is all 1
+@pure
+fn dp_verify_diag_ones(mask, content_len) {
+    for i in 0..content_len {
+        if mask[i][i] != 1 { return false }
+    }
+    return true
+}
+
+println("[data_packing] loaded — bin packing + FFD + attention mask + efficiency metrics")

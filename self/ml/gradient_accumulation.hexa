@@ -1,162 +1,473 @@
-// ===================================================================
-//  gradient_accumulation.hexa — Gradient Accumulation for Training
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/gradient_accumulation.hexa — Gradient Accumulation
 //
-//  Accumulate gradients over multiple micro-batches before
-//  performing an optimizer step. Enables large effective batch sizes
-//  on memory-constrained hardware.
+//  Simulates large-batch training by splitting a batch into smaller
+//  micro-batches, accumulating gradients across them, and triggering
+//  an optimizer step only after all micro-batches are processed.
+//
+//  This technique enables training with effective batch sizes that
+//  exceed GPU memory limits by:
+//    - Processing one micro-batch at a time
+//    - Summing gradients in an accumulation buffer
+//    - Normalizing loss by accumulation_steps for correct gradient scale
+//    - Stepping optimizer only at synchronization points
+//
+//  Components:
+//    1. Config              — accumulation_steps, micro_batch_size, etc.
+//    2. Micro-batch split   — divide data into micro-batches
+//    3. Gradient buffer     — accumulate gradients across micro-batches
+//    4. Loss normalization  — divide loss by accumulation_steps
+//    5. Effective batch size — micro_batch_size * accum_steps * num_devices
+//    6. Sync point          — trigger optimizer at end of accumulation
+//    7. no_sync context     — skip DDP grad sync during accumulation
+//    8. Progress tracking   — current micro-batch step
+//    9. Memory comparison   — with/without accumulation
+//   10. LR scheduler        — step per effective batch, not micro-batch
 //
 //  API:
-//    create_accumulator(steps)         -> GradAccumulator
-//    accumulate(acc, grad)             -> GradAccumulator (updated)
-//    should_step(acc)                  -> bool
-//    get_accumulated(acc)              -> array (averaged gradients)
-//    reset(acc)                        -> GradAccumulator (zeroed)
+//    ga_new_config(micro_bs, accum_steps, num_devices, lr) -> config
+//    ga_effective_batch_size(config)                       -> int
+//    ga_split_batch(data, micro_bs)                        -> [[float]]
+//    ga_new_buffer(param_count)                            -> buffer
+//    ga_zero_grad(buffer)                                  -> buffer
+//    ga_accumulate(buffer, grads)                          -> buffer
+//    ga_normalize_loss(loss, accum_steps)                  -> float
+//    ga_normalize_grads(buffer, accum_steps)               -> buffer
+//    ga_should_step(micro_step, accum_steps)               -> bool
+//    ga_no_sync(micro_step, accum_steps)                   -> bool
+//    ga_new_state(config, param_count)                     -> state
+//    ga_step(state, micro_grads, micro_loss)               -> state
+//    ga_get_progress(state)                                -> [step, accum_steps]
+//    ga_is_accumulating(state)                             -> bool
+//    ga_memory_without_accum(batch_size, param_count)      -> int
+//    ga_memory_with_accum(micro_bs, param_count)           -> int
+//    ga_memory_savings(batch_size, micro_bs, param_count)  -> float
+//    ga_lr_schedule_step(state)                            -> int
+//    ga_cosine_lr(base_lr, step, total_steps)              -> float
+//    ga_apply_update(params, grads, lr)                    -> [float]
+//    ga_full_train_step(state, all_micro_grads, all_micro_losses) -> state
+//    ga_grad_norm(grads)                                   -> float
+//    ga_clip_grads(grads, max_norm)                        -> [float]
+//    ga_mock_forward_backward(data, param_count)           -> [grads, loss]
+//    ga_total_train_steps(total_samples, config)           -> int
 //
-//  Uses no external imports -- pure hexa.
-// ===================================================================
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+//    @hot   — called every training step
+// ═══════════════════════════════════════════════════════════════════
 
-// ── Structs ─────────────────────────────────────────────────────
+// ── math helpers (prefixed ga_ to avoid collision) ──────────────
 
-struct GradAccumulator {
-    accumulation_steps: int,
-    current_step: int,
-    accumulated_grads: array,
-    total_steps_done: int,
-    num_optimizer_steps: int,
-    is_initialized: bool
+@pure
+fn ga_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
 }
 
-// ── Create Accumulator ──────────────────────────────────────────
+@pure
+fn ga_cos_approx(x) {
+    let pi = 3.141592653589793
+    let two_pi = 6.283185307179586
+    let mut v = x
+    for _i in 0..20 {
+        if v > pi { v = v - two_pi }
+        if v < 0.0 - pi { v = v + two_pi }
+    }
+    let v2 = v * v
+    let v4 = v2 * v2
+    let v6 = v4 * v2
+    let v8 = v6 * v2
+    return 1.0 - v2 / 2.0 + v4 / 24.0 - v6 / 720.0 + v8 / 40320.0
+}
 
-fn create_accumulator(steps) {
-    if steps < 1 {
-        println("[grad_accum] WARNING: steps must be >= 1, defaulting to 1")
-        return GradAccumulator {
-            accumulation_steps: 1,
-            current_step: 0,
-            accumulated_grads: [],
-            total_steps_done: 0,
-            num_optimizer_steps: 0,
-            is_initialized: false
+@pure
+fn ga_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+@pure
+fn ga_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+@pure
+fn ga_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  1. Config — accumulation parameters
+//
+//  Stores micro_batch_size, accumulation_steps, num_devices, lr.
+//  Encoded as array: [micro_bs, accum_steps, num_devices, lr]
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ga_new_config(micro_bs, accum_steps, num_devices, lr) {
+    return [to_float(micro_bs), to_float(accum_steps), to_float(num_devices), lr]
+}
+
+@pure
+fn ga_config_micro_bs(config) {
+    return to_int(config[0])
+}
+
+@pure
+fn ga_config_accum_steps(config) {
+    return to_int(config[1])
+}
+
+@pure
+fn ga_config_num_devices(config) {
+    return to_int(config[2])
+}
+
+@pure
+fn ga_config_lr(config) {
+    return config[3]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  5. Effective batch size
+//
+//  effective_batch_size = micro_batch_size * accumulation_steps * num_devices
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ga_effective_batch_size(config) {
+    let mbs = ga_config_micro_bs(config)
+    let acc = ga_config_accum_steps(config)
+    let dev = ga_config_num_devices(config)
+    return mbs * acc * dev
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  2. Micro-batch splitting
+//
+//  Divides a flat data array into chunks of micro_batch_size.
+//  Last chunk may be smaller if data doesn't divide evenly.
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ga_split_batch(data, micro_bs) {
+    let n = len(data)
+    if n == 0 { return [] }
+    if micro_bs <= 0 { return [] }
+    let mut batches = []
+    let mut start = 0
+    for _i in 0..n {
+        if start >= n { break }
+        let mut end_idx = start + micro_bs
+        if end_idx > n { end_idx = n }
+        let mut chunk = []
+        for j in start..end_idx {
+            chunk = chunk + [data[j]]
         }
+        batches = batches + [chunk]
+        start = end_idx
     }
-    return GradAccumulator {
-        accumulation_steps: steps,
-        current_step: 0,
-        accumulated_grads: [],
-        total_steps_done: 0,
-        num_optimizer_steps: 0,
-        is_initialized: false
-    }
+    return batches
 }
 
-// ── Accumulate ──────────────────────────────────────────────────
-// Add gradient to the accumulation buffer.
-// On first call, initializes buffer from gradient shape.
+// ═══════════════════════════════════════════════════════════════════
+//  3. Gradient accumulation buffer
+//
+//  A flat array of floats representing accumulated gradients.
+// ═══════════════════════════════════════════════════════════════════
 
-fn accumulate(acc, grad) {
-    let n = len(grad)
-
-    if !acc.is_initialized {
-        // First accumulation: initialize buffer with this gradient
-        let mut init_grads = []
-        let mut i = 0
-        while i < n {
-            init_grads = init_grads + [grad[i]]
-            i = i + 1
-        }
-        return GradAccumulator {
-            accumulation_steps: acc.accumulation_steps,
-            current_step: 1,
-            accumulated_grads: init_grads,
-            total_steps_done: acc.total_steps_done + 1,
-            num_optimizer_steps: acc.num_optimizer_steps,
-            is_initialized: true
-        }
-    }
-
-    // Add gradient element-wise to accumulated buffer
-    let an = len(acc.accumulated_grads)
-    let mut new_grads = []
-    let mut i = 0
-    while i < an {
-        let gi = i % n
-        new_grads = new_grads + [acc.accumulated_grads[i] + grad[gi]]
-        i = i + 1
-    }
-
-    return GradAccumulator {
-        accumulation_steps: acc.accumulation_steps,
-        current_step: acc.current_step + 1,
-        accumulated_grads: new_grads,
-        total_steps_done: acc.total_steps_done + 1,
-        num_optimizer_steps: acc.num_optimizer_steps,
-        is_initialized: true
-    }
+@pure
+fn ga_new_buffer(param_count) {
+    return ga_zeros(param_count)
 }
 
-// ── Should Step ─────────────────────────────────────────────────
-// Returns true when accumulation_steps micro-batches have been accumulated.
-
-fn should_step(acc) {
-    return acc.current_step >= acc.accumulation_steps
+@pure
+fn ga_zero_grad(buffer) {
+    let n = len(buffer)
+    return ga_zeros(n)
 }
 
-// ── Get Accumulated ─────────────────────────────────────────────
-// Return the averaged accumulated gradients (divide by accumulation_steps).
-
-fn get_accumulated(acc) {
-    let n = len(acc.accumulated_grads)
-    let divisor = to_float(acc.accumulation_steps)
-    let mut out = []
-    let mut i = 0
-    while i < n {
-        out = out + [acc.accumulated_grads[i] / divisor]
-        i = i + 1
+@pure @hot
+fn ga_accumulate(buffer, grads) {
+    let n = len(buffer)
+    let mut out = ga_zeros(n)
+    for i in 0..n {
+        out[i] = buffer[i] + grads[i]
     }
     return out
 }
 
-// ── Reset ───────────────────────────────────────────────────────
-// Zero the accumulation buffer and reset step counter.
-// Keeps track of total optimizer steps done.
+// ═══════════════════════════════════════════════════════════════════
+//  4. Loss normalization
+//
+//  Divide loss by accumulation_steps for correct gradient scale.
+// ═══════════════════════════════════════════════════════════════════
 
-fn reset(acc) {
-    let n = len(acc.accumulated_grads)
-    let mut zeros = []
-    let mut i = 0
-    while i < n {
-        zeros = zeros + [0.0]
-        i = i + 1
+@pure
+fn ga_normalize_loss(loss, accum_steps) {
+    if accum_steps <= 0 { return loss }
+    return loss / to_float(accum_steps)
+}
+
+@pure
+fn ga_normalize_grads(buffer, accum_steps) {
+    let n = len(buffer)
+    let scale = 1.0 / to_float(accum_steps)
+    let mut out = ga_zeros(n)
+    for i in 0..n {
+        out[i] = buffer[i] * scale
     }
-    return GradAccumulator {
-        accumulation_steps: acc.accumulation_steps,
-        current_step: 0,
-        accumulated_grads: zeros,
-        total_steps_done: acc.total_steps_done,
-        num_optimizer_steps: acc.num_optimizer_steps + 1,
-        is_initialized: true
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  6. Sync point — should we step the optimizer?
+//
+//  Optimizer step happens when micro_step == accum_steps - 1.
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ga_should_step(micro_step, accum_steps) {
+    return micro_step == accum_steps - 1
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  7. no_sync context — skip DDP gradient sync during accumulation
+//
+//  Returns true if we should skip sync (not the last step).
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ga_no_sync(micro_step, accum_steps) {
+    return micro_step < accum_steps - 1
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  8. Training state — full accumulation state machine
+//
+//  Stored as map with config, buffer, micro_step, global_step, etc.
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ga_new_state(config, param_count) {
+    return #{
+        "config": config,
+        "buffer": ga_new_buffer(param_count),
+        "micro_step": 0,
+        "global_step": 0,
+        "total_loss": 0.0,
+        "param_count": param_count
     }
 }
 
-// ── Effective Batch Size ────────────────────────────────────────
-
-fn effective_batch_size(micro_batch, accumulation_steps) {
-    return micro_batch * accumulation_steps
+@pure
+fn ga_get_progress(state) {
+    let accum = ga_config_accum_steps(state["config"])
+    return [state["micro_step"], accum]
 }
 
-// ── Gradient Sync Check ─────────────────────────────────────────
-// In distributed training, gradient sync should only happen when
-// accumulation is complete (should_step returns true).
-
-fn should_sync(acc) {
-    return should_step(acc)
+@pure
+fn ga_is_accumulating(state) {
+    let accum = ga_config_accum_steps(state["config"])
+    let ms = state["micro_step"]
+    if ms > 0 {
+        if ms < accum { return true }
+    }
+    return false
 }
 
-// ── Summary ─────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════
+//  Process a single micro-batch step
+//
+//  Accumulates gradients, tracks loss. On the last micro-batch
+//  normalizes grads and bumps global_step.
+// ═══════════════════════════════════════════════════════════════════
 
-fn grad_accum_summary(acc) {
-    println("[grad_accum] steps=" + str(acc.accumulation_steps) + " current=" + str(acc.current_step) + " total=" + str(acc.total_steps_done) + " optimizer_steps=" + str(acc.num_optimizer_steps))
+@hot
+fn ga_step(state, micro_grads, micro_loss) {
+    let config = state["config"]
+    let accum_steps = ga_config_accum_steps(config)
+    let param_count = state["param_count"]
+
+    let norm_loss = ga_normalize_loss(micro_loss, accum_steps)
+    let new_buffer = ga_accumulate(state["buffer"], micro_grads)
+    let new_total_loss = state["total_loss"] + norm_loss
+    let new_micro = state["micro_step"] + 1
+
+    if new_micro >= accum_steps {
+        let final_grads = ga_normalize_grads(new_buffer, accum_steps)
+        return #{
+            "config": config,
+            "buffer": ga_new_buffer(param_count),
+            "micro_step": 0,
+            "global_step": state["global_step"] + 1,
+            "total_loss": 0.0,
+            "param_count": param_count,
+            "last_grads": final_grads,
+            "last_loss": new_total_loss
+        }
+    }
+
+    return #{
+        "config": config,
+        "buffer": new_buffer,
+        "micro_step": new_micro,
+        "global_step": state["global_step"],
+        "total_loss": new_total_loss,
+        "param_count": param_count
+    }
 }
 
-println("[gradient_accumulation] loaded — accumulate + step check + reset + effective batch size")
+// ═══════════════════════════════════════════════════════════════════
+//  9. Memory comparison — with/without accumulation
+//
+//  Simplified memory model (units = parameter-sized slots):
+//    Without accumulation: batch_size * param_count + 2 * param_count
+//    With accumulation:    micro_bs * param_count + 2 * param_count
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ga_memory_without_accum(batch_size, param_count) {
+    return batch_size * param_count + param_count + param_count
+}
+
+@pure
+fn ga_memory_with_accum(micro_bs, param_count) {
+    return micro_bs * param_count + param_count + param_count
+}
+
+@pure
+fn ga_memory_savings(batch_size, micro_bs, param_count) {
+    let without = ga_memory_without_accum(batch_size, param_count)
+    let with_acc = ga_memory_with_accum(micro_bs, param_count)
+    if without == 0 { return 0.0 }
+    return 1.0 - to_float(with_acc) / to_float(without)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  10. LR scheduler integration
+//
+//  Step per effective batch (global_step), NOT per micro-batch.
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ga_lr_schedule_step(state) {
+    return state["global_step"]
+}
+
+@pure
+fn ga_cosine_lr(base_lr, step, total_steps) {
+    if total_steps <= 0 { return base_lr }
+    if step >= total_steps { return 0.0 }
+    let pi = 3.141592653589793
+    let progress = to_float(step) / to_float(total_steps)
+    let decay = 0.5 * (1.0 + ga_cos_approx(pi * progress))
+    return base_lr * decay
+}
+
+@pure
+fn ga_warmup_cosine_lr(base_lr, step, warmup_steps, total_steps) {
+    if step < warmup_steps {
+        if warmup_steps == 0 { return base_lr }
+        return base_lr * to_float(step) / to_float(warmup_steps)
+    }
+    let decay_steps = total_steps - warmup_steps
+    let decay_step = step - warmup_steps
+    return ga_cosine_lr(base_lr, decay_step, decay_steps)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  SGD update — apply accumulated gradients to parameters
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ga_apply_update(params, grads, lr) {
+    let n = len(params)
+    let mut out = ga_zeros(n)
+    for i in 0..n {
+        out[i] = params[i] - lr * grads[i]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Full training step — process all micro-batches in one call
+// ═══════════════════════════════════════════════════════════════════
+
+@hot
+fn ga_full_train_step(state, all_micro_grads, all_micro_losses) {
+    let n = len(all_micro_grads)
+    let mut s = state
+    for i in 0..n {
+        s = ga_step(s, all_micro_grads[i], all_micro_losses[i])
+    }
+    return s
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Gradient clipping — clip by global norm
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ga_grad_norm(grads) {
+    let n = len(grads)
+    let mut sum_sq = 0.0
+    for i in 0..n {
+        sum_sq = sum_sq + grads[i] * grads[i]
+    }
+    return ga_sqrt(sum_sq)
+}
+
+@pure
+fn ga_clip_grads(grads, max_norm) {
+    let norm = ga_grad_norm(grads)
+    if norm <= max_norm { return grads }
+    let scale = max_norm / norm
+    let n = len(grads)
+    let mut out = ga_zeros(n)
+    for i in 0..n {
+        out[i] = grads[i] * scale
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Mock forward/backward — for testing
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ga_mock_forward_backward(data, param_count) {
+    let n = len(data)
+    let mut grads = ga_zeros(param_count)
+    let mut loss = 0.0
+    for i in 0..n {
+        loss = loss + data[i] * data[i]
+        for p in 0..param_count {
+            grads[p] = grads[p] + data[i] * to_float(p + 1) * 0.01
+        }
+    }
+    if n > 0 { loss = loss / to_float(n) }
+    return [grads, loss]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Effective training steps counter
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ga_total_train_steps(total_samples, config) {
+    let ebs = ga_effective_batch_size(config)
+    if ebs <= 0 { return 0 }
+    return total_samples / ebs
+}
+
+println("[gradient_accumulation] loaded — micro-batch split + grad buffer + sync point + LR schedule")

@@ -1,0 +1,758 @@
+// ===================================================================
+//  self/ml/fp8_training.hexa — FP8 Mixed-Precision Training
+//
+//  Implements FP8 (8-bit floating point) mixed-precision training:
+//    1. FP8 format representation (E4M3 for forward, E5M2 for backward)
+//    2. Cast to/from FP8 with saturation and NaN handling
+//    3. Per-tensor amax (absolute max) history tracking
+//    4. Dynamic scale factor computation from amax history
+//    5. Delayed scaling strategy
+//    6. FP8 matrix multiply simulation (quantize -> matmul -> dequantize)
+//    7. Mixed precision training context (autocast-like)
+//    8. Loss scaling (dynamic loss scaler with overflow detection)
+//    9. Per-tensor vs per-channel scaling options
+//
+//  FP8 formats (IEEE proposed):
+//    E4M3: 1 sign + 4 exponent + 3 mantissa, range ~[-448, 448]
+//           bias = 7, used for forward activations/weights
+//    E5M2: 1 sign + 5 exponent + 2 mantissa, range ~[-57344, 57344]
+//           bias = 15, used for backward gradients
+//
+//  API:
+//    fp8_format_info(fmt)             -> [maxval, minval_pos, name]
+//    fp8_cast(val, fmt, scale)        -> quantized float
+//    fp8_dequant(val, scale)          -> dequantized float
+//    fp8_cast_tensor(tensor, fmt, scale) -> [quantized tensor]
+//    fp8_dequant_tensor(tensor, scale)   -> [dequantized tensor]
+//    fp8_amax(tensor)                 -> float (absolute max)
+//    fp8_amax_history_update(history, new_amax) -> updated history
+//    fp8_compute_scale(amax_history, fmt) -> scale factor
+//    fp8_delayed_scaling_init(history_len) -> state
+//    fp8_delayed_scaling_step(state, tensor, fmt) -> [scaled_tensor, state]
+//    fp8_matmul(a, b, a_scale, b_scale, m, k, n) -> [result]
+//    fp8_mixed_precision_forward(x, w, fmt_act, fmt_w) -> [out, scales]
+//    fp8_loss_scaler_init(init_scale, growth_interval) -> scaler
+//    fp8_loss_scaler_step(scaler, grad_norm) -> [scaled, scaler]
+//    fp8_per_channel_scales(tensor, dim, fmt) -> [scales]
+//    fp8_per_channel_quantize(tensor, dim, scales, fmt) -> [quantized]
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+//    @hot   — performance critical path
+// ===================================================================
+
+// ── helpers ─────────────────────────────────────────────────────
+
+fn fp8_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn fp8_max_f(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn fp8_min_f(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn fp8_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn fp8_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+fn fp8_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn fp8_log2(x) {
+    if x <= 0.0 { return -999.0 }
+    // Newton iteration for log2
+    let ln2 = 0.6931471805599453
+    let mut v = x
+    let mut exp_part = 0
+    while v >= 2.0 {
+        v = v / 2.0
+        exp_part = exp_part + 1
+    }
+    while v < 1.0 {
+        v = v * 2.0
+        exp_part = exp_part - 1
+    }
+    // v is in [1, 2), compute log2(v) via series
+    let t = v - 1.0
+    let mut result = 0.0
+    let mut term = t
+    for i in 1..20 {
+        if i % 2 == 1 {
+            result = result + term / to_float(i)
+        } else {
+            result = result - term / to_float(i)
+        }
+        term = term * t
+    }
+    return to_float(exp_part) + result / ln2
+}
+
+fn fp8_pow2(x) {
+    // 2^x via exp(x * ln2)
+    let ln2 = 0.6931471805599453
+    let v = x * ln2
+    let mut clamped = v
+    if clamped > 30.0 { clamped = 30.0 }
+    if clamped < -30.0 { clamped = -30.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * clamped / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn fp8_floor(x) {
+    let i = to_int(x)
+    if to_float(i) > x { return to_float(i - 1) }
+    return to_float(i)
+}
+
+// ===================================================================
+//  FP8 Format Constants
+//
+//  E4M3: 4 exponent bits, 3 mantissa bits
+//    max = 448.0, min_positive ~ 2^-9 = 0.001953125
+//    No inf/nan in standard E4M3 (all codes are finite)
+//  E5M2: 5 exponent bits, 2 mantissa bits
+//    max = 57344.0, min_positive ~ 2^-16
+//    Has inf/nan
+//
+//  Format codes: 0 = E4M3, 1 = E5M2
+// ===================================================================
+
+@pure
+fn fp8_format_info(fmt) {
+    if fmt == 0 {
+        // E4M3: maxval=448, min_pos~1.953125e-3
+        return [448.0, 0.001953125]
+    }
+    // E5M2: maxval=57344, min_pos~6.103515625e-5
+    return [57344.0, 0.00006103515625]
+}
+
+@pure
+fn fp8_maxval(fmt) {
+    let info = fp8_format_info(fmt)
+    return info[0]
+}
+
+@pure
+fn fp8_minval_pos(fmt) {
+    let info = fp8_format_info(fmt)
+    return info[1]
+}
+
+// ===================================================================
+//  FP8 Format Name
+// ===================================================================
+@pure
+fn fp8_format_name(fmt) {
+    if fmt == 0 { return "E4M3" }
+    return "E5M2"
+}
+
+// ===================================================================
+//  Cast to FP8 — quantize a single float value
+//
+//  Applies: val_fp8 = clamp(val * scale, -maxval, maxval)
+//  Then rounds to FP8 representable value.
+//
+//  NaN handling: NaN (detected as val != val is not available,
+//  so we check for extremely large values) returns 0.
+//
+//  Saturation: clamp to [-maxval, maxval]
+// ===================================================================
+@pure @hot
+fn fp8_cast(val, fmt, scale) {
+    // NaN guard: if value is unreasonably large, treat as overflow
+    if val > 1.0e30 { return fp8_maxval(fmt) }
+    if val < -1.0e30 { return 0.0 - fp8_maxval(fmt) }
+
+    let scaled = val * scale
+    let mx = fp8_maxval(fmt)
+
+    // Saturation clamp
+    let mut clamped = scaled
+    if clamped > mx { clamped = mx }
+    if clamped < 0.0 - mx { clamped = 0.0 - mx }
+
+    // Simulate FP8 quantization by rounding to representable grid
+    // E4M3 has 3 mantissa bits -> 8 levels per power of 2
+    // E5M2 has 2 mantissa bits -> 4 levels per power of 2
+    let abs_v = fp8_abs(clamped)
+    let min_pos = fp8_minval_pos(fmt)
+    if abs_v < min_pos { return 0.0 }
+
+    let mut mantissa_bits = 3
+    if fmt == 1 { mantissa_bits = 2 }
+    let levels = fp8_pow2(to_float(mantissa_bits))
+
+    // Find the power-of-2 exponent
+    let log_v = fp8_log2(abs_v)
+    let exponent = fp8_floor(log_v)
+    let base = fp8_pow2(exponent)
+    let step = base / levels
+
+    // Quantize: round to nearest step
+    let mut q = 0.0
+    if step > 0.0 {
+        let ratio = abs_v / step
+        let rounded = fp8_floor(ratio + 0.5)
+        q = rounded * step
+    } else {
+        q = abs_v
+    }
+
+    // Re-clamp after rounding
+    if q > mx { q = mx }
+
+    if clamped < 0.0 { return 0.0 - q }
+    return q
+}
+
+// ===================================================================
+//  Dequantize — convert FP8 value back to full precision
+//
+//  val_dequant = fp8_val / scale
+// ===================================================================
+@pure @hot
+fn fp8_dequant(val, scale) {
+    if scale == 0.0 { return 0.0 }
+    return val / scale
+}
+
+// ===================================================================
+//  Tensor-level Cast / Dequantize
+// ===================================================================
+@pure @hot
+fn fp8_cast_tensor(tensor, fmt, scale) {
+    let n = len(tensor)
+    let mut out = fp8_zeros(n)
+    for i in 0..n {
+        out[i] = fp8_cast(tensor[i], fmt, scale)
+    }
+    return out
+}
+
+@pure @hot
+fn fp8_dequant_tensor(tensor, scale) {
+    let n = len(tensor)
+    let mut out = fp8_zeros(n)
+    for i in 0..n {
+        out[i] = fp8_dequant(tensor[i], scale)
+    }
+    return out
+}
+
+// ===================================================================
+//  Absolute Max (amax) — find the absolute max value in a tensor
+//
+//  Used for computing scale factors.
+// ===================================================================
+@pure
+fn fp8_amax(tensor) {
+    let n = len(tensor)
+    if n == 0 { return 0.0 }
+    let mut mx = 0.0
+    for i in 0..n {
+        let a = fp8_abs(tensor[i])
+        if a > mx { mx = a }
+    }
+    return mx
+}
+
+// ===================================================================
+//  Amax History Tracking
+//
+//  Maintains a sliding window of recent amax values.
+//  Used by delayed scaling to compute a robust scale factor.
+//
+//  history: array of floats (fixed length)
+//  Returns: updated history (shift left, append new)
+// ===================================================================
+@pure
+fn fp8_amax_history_update(history, new_amax) {
+    let n = len(history)
+    let mut out = fp8_zeros(n)
+    // Shift left: drop oldest, append new
+    for i in 0..(n - 1) {
+        out[i] = history[i + 1]
+    }
+    out[n - 1] = new_amax
+    return out
+}
+
+// Max of the amax history
+@pure
+fn fp8_amax_history_max(history) {
+    let n = len(history)
+    let mut mx = 0.0
+    for i in 0..n {
+        if history[i] > mx { mx = history[i] }
+    }
+    return mx
+}
+
+// ===================================================================
+//  Scale Factor Computation
+//
+//  scale = fp8_maxval(fmt) / (amax_max * safety_margin)
+//
+//  If amax is 0 (all zeros tensor), returns 1.0
+//  safety_margin default = 1.0 (no margin)
+// ===================================================================
+@pure
+fn fp8_compute_scale(amax_val, fmt) {
+    if amax_val <= 0.0 { return 1.0 }
+    let mx = fp8_maxval(fmt)
+    return mx / amax_val
+}
+
+@pure
+fn fp8_compute_scale_with_margin(amax_val, fmt, margin) {
+    if amax_val <= 0.0 { return 1.0 }
+    let mx = fp8_maxval(fmt)
+    return mx / (amax_val * margin)
+}
+
+// Compute scale from full history
+@pure
+fn fp8_compute_scale_from_history(history, fmt) {
+    let amax_max = fp8_amax_history_max(history)
+    return fp8_compute_scale(amax_max, fmt)
+}
+
+// ===================================================================
+//  Delayed Scaling Strategy
+//
+//  State: { history: [float], scale: float, fmt: int }
+//  On each step:
+//    1. Quantize using PREVIOUS scale (delayed)
+//    2. Record current amax into history
+//    3. Compute new scale from history (for NEXT step)
+//
+//  This avoids a synchronization point within the step.
+// ===================================================================
+
+fn fp8_delayed_scaling_init(history_len, fmt) {
+    let mut history = fp8_zeros(history_len)
+    return [history, 1.0, fmt]
+}
+
+// Returns: [quantized_tensor, updated_state]
+@hot
+fn fp8_delayed_scaling_step(state, tensor) {
+    let history = state[0]
+    let scale = state[1]
+    let fmt = state[2]
+
+    // 1. Quantize with current (delayed) scale
+    let quantized = fp8_cast_tensor(tensor, fmt, scale)
+
+    // 2. Record new amax
+    let new_amax = fp8_amax(tensor)
+    let new_history = fp8_amax_history_update(history, new_amax)
+
+    // 3. Compute new scale for next step
+    let new_scale = fp8_compute_scale_from_history(new_history, fmt)
+
+    let new_state = [new_history, new_scale, fmt]
+    return [quantized, new_state]
+}
+
+// ===================================================================
+//  FP8 Matrix Multiply Simulation
+//
+//  Simulates: C = dequant(fp8(A * scale_a) @ fp8(B * scale_b))
+//  Where A is [m x k] and B is [k x n], stored as flat arrays.
+//
+//  Steps:
+//    1. Quantize A and B to FP8
+//    2. Perform matmul in FP8 (simulated as float but clamped)
+//    3. Dequantize result
+// ===================================================================
+@hot
+fn fp8_matmul(a, b, scale_a, scale_b, m, k, n) {
+    let fmt_fwd = 0  // E4M3 for forward pass
+    // Quantize inputs
+    let a_q = fp8_cast_tensor(a, fmt_fwd, scale_a)
+    let b_q = fp8_cast_tensor(b, fmt_fwd, scale_b)
+
+    // Matmul: C[i,j] = sum_p A[i,p] * B[p,j]
+    let out_size = m * n
+    let mut c = fp8_zeros(out_size)
+    for i in 0..m {
+        for j in 0..n {
+            let mut acc = 0.0
+            for p in 0..k {
+                let a_val = a_q[i * k + p]
+                let b_val = b_q[p * n + j]
+                acc = acc + a_val * b_val
+            }
+            c[i * n + j] = acc
+        }
+    }
+
+    // Dequantize: divide by combined scale
+    let combined_scale = scale_a * scale_b
+    let result = fp8_dequant_tensor(c, combined_scale)
+    return result
+}
+
+// ===================================================================
+//  Mixed Precision Forward Pass
+//
+//  Quantizes activations and weights to FP8, does matmul,
+//  and returns the result plus scale info for backward.
+//
+//  x: [batch x in_dim], w: [in_dim x out_dim] (flat arrays)
+//  fmt_act: format for activations (typically 0 = E4M3)
+//  fmt_w: format for weights (typically 0 = E4M3)
+//
+//  Returns: [output, act_scale, w_scale]
+// ===================================================================
+@hot
+fn fp8_mixed_precision_forward(x, w, batch, in_dim, out_dim, fmt_act, fmt_w) {
+    // Compute scale factors from tensor amax
+    let x_amax = fp8_amax(x)
+    let w_amax = fp8_amax(w)
+    let x_scale = fp8_compute_scale(x_amax, fmt_act)
+    let w_scale = fp8_compute_scale(w_amax, fmt_w)
+
+    // FP8 matmul
+    let out = fp8_matmul(x, w, x_scale, w_scale, batch, in_dim, out_dim)
+    return [out, x_scale, w_scale]
+}
+
+// ===================================================================
+//  Mixed Precision Backward Pass (gradient computation)
+//
+//  Quantizes gradients to E5M2 format for backward pass.
+//  grad_out: [batch x out_dim], w: [in_dim x out_dim]
+//
+//  Returns: [grad_input, grad_scale]
+// ===================================================================
+@hot
+fn fp8_mixed_precision_backward(grad_out, w, batch, in_dim, out_dim) {
+    let fmt_grad = 1  // E5M2 for gradients
+    let fmt_w = 0     // E4M3 for weights
+
+    let grad_amax = fp8_amax(grad_out)
+    let w_amax = fp8_amax(w)
+    let grad_scale = fp8_compute_scale(grad_amax, fmt_grad)
+    let w_scale = fp8_compute_scale(w_amax, fmt_w)
+
+    // grad_input = grad_out @ W^T
+    // grad_out is [batch x out_dim], W is [in_dim x out_dim]
+    // W^T is [out_dim x in_dim]
+    // grad_input is [batch x in_dim]
+    let grad_q = fp8_cast_tensor(grad_out, fmt_grad, grad_scale)
+    let w_q = fp8_cast_tensor(w, fmt_w, w_scale)
+
+    let gi_size = batch * in_dim
+    let mut grad_input = fp8_zeros(gi_size)
+    for i in 0..batch {
+        for j in 0..in_dim {
+            let mut acc = 0.0
+            for p in 0..out_dim {
+                let g_val = grad_q[i * out_dim + p]
+                let w_val = w_q[j * out_dim + p]
+                acc = acc + g_val * w_val
+            }
+            grad_input[i * in_dim + j] = acc
+        }
+    }
+
+    let combined_scale = grad_scale * w_scale
+    let result = fp8_dequant_tensor(grad_input, combined_scale)
+    return [result, grad_scale]
+}
+
+// ===================================================================
+//  Dynamic Loss Scaler
+//
+//  Implements dynamic loss scaling for FP8 training:
+//    - Start with an initial scale (e.g. 2^15)
+//    - If no overflow for growth_interval steps, double the scale
+//    - If overflow detected, halve the scale and reset counter
+//
+//  State: [current_scale, growth_counter, growth_interval,
+//          overflow_count, step_count]
+// ===================================================================
+
+fn fp8_loss_scaler_init(init_scale, growth_interval) {
+    // [scale, counter, interval, overflow_count, total_steps]
+    return [init_scale, 0, growth_interval, 0, 0]
+}
+
+// Check if any value in tensor indicates overflow
+// (NaN-like or extremely large values)
+@pure
+fn fp8_has_overflow(tensor, threshold) {
+    let n = len(tensor)
+    for i in 0..n {
+        if fp8_abs(tensor[i]) > threshold { return true }
+    }
+    return false
+}
+
+// Check if gradient norm indicates overflow
+@pure
+fn fp8_grad_overflow(grad_norm, threshold) {
+    return grad_norm > threshold
+}
+
+// Scale gradients by loss scale
+@pure @hot
+fn fp8_scale_grads(grads, loss_scale) {
+    let n = len(grads)
+    let mut out = fp8_zeros(n)
+    let inv_scale = 1.0 / loss_scale
+    for i in 0..n {
+        out[i] = grads[i] * inv_scale
+    }
+    return out
+}
+
+// Update loss scaler state
+// Returns: [should_step, scale, counter, interval, overflow_count, step_count]
+//   should_step: 1=ok, 0=skip (overflow)
+fn fp8_loss_scaler_step(scaler, grad_norm) {
+    let scale = scaler[0]
+    let counter = scaler[1]
+    let interval = scaler[2]
+    let overflow_count = scaler[3]
+    let step_count = scaler[4]
+
+    let overflow_thresh = 65504.0  // FP16 max as overflow indicator
+    let has_overflow = fp8_grad_overflow(grad_norm, overflow_thresh)
+
+    if has_overflow {
+        // Overflow: halve scale, reset counter, skip step
+        let new_scale = fp8_max_f(scale / 2.0, 1.0)
+        return [0, new_scale, 0, interval, overflow_count + 1, step_count + 1]
+    }
+
+    // No overflow: increment counter
+    let new_counter = counter + 1
+    if new_counter >= interval {
+        // Growth: double scale, reset counter
+        let new_scale = fp8_min_f(scale * 2.0, 1073741824.0)
+        return [1, new_scale, 0, interval, overflow_count, step_count + 1]
+    }
+
+    return [1, scale, new_counter, interval, overflow_count, step_count + 1]
+}
+
+// ===================================================================
+//  Per-Channel Scaling
+//
+//  Instead of a single scale per tensor, compute one scale per
+//  channel (row or column) for finer granularity.
+//
+//  tensor: flat array [rows x cols]
+//  dim: 0 = per-row, 1 = per-col
+// ===================================================================
+
+// Compute per-channel amax values
+@pure
+fn fp8_per_channel_amax(tensor, rows, cols, dim) {
+    if dim == 0 {
+        // Per-row amax
+        let mut amaxes = fp8_zeros(rows)
+        for r in 0..rows {
+            let mut mx = 0.0
+            for c in 0..cols {
+                let a = fp8_abs(tensor[r * cols + c])
+                if a > mx { mx = a }
+            }
+            amaxes[r] = mx
+        }
+        return amaxes
+    }
+    // Per-column amax
+    let mut amaxes = fp8_zeros(cols)
+    for c in 0..cols {
+        let mut mx = 0.0
+        for r in 0..rows {
+            let a = fp8_abs(tensor[r * cols + c])
+            if a > mx { mx = a }
+        }
+        amaxes[c] = mx
+    }
+    return amaxes
+}
+
+// Compute per-channel scales from amax values
+@pure
+fn fp8_per_channel_scales(amaxes, fmt) {
+    let n = len(amaxes)
+    let mut scales = fp8_zeros(n)
+    for i in 0..n {
+        scales[i] = fp8_compute_scale(amaxes[i], fmt)
+    }
+    return scales
+}
+
+// Quantize tensor per-channel
+@pure @hot
+fn fp8_per_channel_quantize(tensor, rows, cols, dim, scales, fmt) {
+    let total = rows * cols
+    let mut out = fp8_zeros(total)
+
+    if dim == 0 {
+        // Per-row scaling
+        for r in 0..rows {
+            for c in 0..cols {
+                let idx = r * cols + c
+                out[idx] = fp8_cast(tensor[idx], fmt, scales[r])
+            }
+        }
+    } else {
+        // Per-column scaling
+        for r in 0..rows {
+            for c in 0..cols {
+                let idx = r * cols + c
+                out[idx] = fp8_cast(tensor[idx], fmt, scales[c])
+            }
+        }
+    }
+    return out
+}
+
+// Dequantize tensor per-channel
+@pure @hot
+fn fp8_per_channel_dequantize(tensor, rows, cols, dim, scales) {
+    let total = rows * cols
+    let mut out = fp8_zeros(total)
+
+    if dim == 0 {
+        // Per-row dequant
+        for r in 0..rows {
+            for c in 0..cols {
+                let idx = r * cols + c
+                out[idx] = fp8_dequant(tensor[idx], scales[r])
+            }
+        }
+    } else {
+        // Per-column dequant
+        for r in 0..rows {
+            for c in 0..cols {
+                let idx = r * cols + c
+                out[idx] = fp8_dequant(tensor[idx], scales[c])
+            }
+        }
+    }
+    return out
+}
+
+// ===================================================================
+//  Tensor Norm — L2 norm of a flat tensor
+// ===================================================================
+@pure
+fn fp8_tensor_norm(tensor) {
+    let n = len(tensor)
+    let mut s = 0.0
+    for i in 0..n {
+        s = s + tensor[i] * tensor[i]
+    }
+    return fp8_sqrt(s)
+}
+
+// ===================================================================
+//  Quantization Error — MSE between original and quantized tensor
+// ===================================================================
+@pure
+fn fp8_quant_error(original, quantized) {
+    let n = len(original)
+    if n == 0 { return 0.0 }
+    let mut s = 0.0
+    for i in 0..n {
+        let d = original[i] - quantized[i]
+        s = s + d * d
+    }
+    return s / to_float(n)
+}
+
+// ===================================================================
+//  Mixed Precision Training Context
+//
+//  Bundles forward/backward state for one training step:
+//    - Delayed scaling states for activations, weights, gradients
+//    - Loss scaler
+//
+//  context: [act_state, w_state, grad_state, loss_scaler]
+// ===================================================================
+
+fn fp8_training_context_init(history_len, loss_scale, growth_interval) {
+    let act_state = fp8_delayed_scaling_init(history_len, 0)   // E4M3
+    let w_state = fp8_delayed_scaling_init(history_len, 0)     // E4M3
+    let grad_state = fp8_delayed_scaling_init(history_len, 1)  // E5M2
+    let loss_scaler = fp8_loss_scaler_init(loss_scale, growth_interval)
+    return [act_state, w_state, grad_state, loss_scaler]
+}
+
+// Training step: forward with delayed scaling context
+// Returns: [output, updated_context]
+fn fp8_training_step_forward(ctx, x, w, batch, in_dim, out_dim) {
+    let act_state = ctx[0]
+    let w_state = ctx[1]
+    let grad_state = ctx[2]
+    let loss_scaler = ctx[3]
+
+    // Delayed scaling for activations
+    let act_result = fp8_delayed_scaling_step(act_state, x)
+    let x_q = act_result[0]
+    let new_act_state = act_result[1]
+
+    // Delayed scaling for weights
+    let w_result = fp8_delayed_scaling_step(w_state, w)
+    let w_q = w_result[0]
+    let new_w_state = w_result[1]
+
+    // Matmul of quantized tensors
+    let act_scale = new_act_state[1]
+    let w_scale = new_w_state[1]
+
+    let out_size = batch * out_dim
+    let mut out = fp8_zeros(out_size)
+    for i in 0..batch {
+        for j in 0..out_dim {
+            let mut acc = 0.0
+            for p in 0..in_dim {
+                acc = acc + x_q[i * in_dim + p] * w_q[p * out_dim + j]
+            }
+            out[i * out_dim + j] = acc
+        }
+    }
+
+    let new_ctx = [new_act_state, new_w_state, grad_state, loss_scaler]
+    return [out, new_ctx]
+}
+
+println("[fp8_training] loaded — E4M3/E5M2 cast + amax + delayed scaling + fp8 matmul + loss scaler + per-channel")

@@ -1,0 +1,682 @@
+// ===================================================================
+//  self/ml/sliding_window_attention.hexa — Sliding Window Attention
+//
+//  Efficient long sequence processing via local windowed attention.
+//  Each token attends only to a bounded neighborhood (window_size W),
+//  reducing O(N^2) full attention to O(N*W).
+//
+//  Implements:
+//    1. Window mask builder       — causal attention mask limited to W
+//    2. Causal sliding window     — each token attends to at most W prev
+//    3. Dilated sliding window    — skip every d-th for larger receptive
+//    4. Global tokens             — CLS/first token attends everywhere
+//    5. Local + global combine    — merge local window + global scores
+//    6. Variable window per layer — configurable W per layer
+//    7. Chunked computation       — overlapping chunks for long seqs
+//    8. KV cache with eviction    — keep only last W entries
+//    9. Effective receptive field  — across stacked layers
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+//    @hot   — inner-loop performance-critical
+// ===================================================================
+
+// ── helpers ─────────────────────────────────────────────────────
+
+fn swa_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn swa_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+fn swa_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn swa_abs_int(x) {
+    if x < 0 { return 0 - x }
+    return x
+}
+
+fn swa_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 { g = (g + x / g) / 2.0 }
+    return g
+}
+
+fn swa_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn swa_min(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn swa_max(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn swa_min_int(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn swa_max_int(a, b) {
+    if a > b { return a }
+    return b
+}
+
+// ===================================================================
+//  1. Window Mask Builder
+//
+//  Creates a seq_len x seq_len mask where mask[i][j] = 1.0 means
+//  position i can attend to position j. Causal + window constraint:
+//    mask[i][j] = 1.0 if j <= i AND i - j < window_size
+//
+//  Returns: 2D array [seq_len][seq_len] of 0.0/1.0
+// ===================================================================
+@pure
+fn swa_build_window_mask(seq_len, window_size) {
+    let mut mask = []
+    for i in 0..seq_len {
+        let mut row = swa_zeros(seq_len)
+        let start = swa_max_int(0, i - window_size + 1)
+        for j in start..(i + 1) {
+            row[j] = 1.0
+        }
+        mask = mask + [row]
+    }
+    return mask
+}
+
+// ===================================================================
+//  2. Causal Sliding Window Attention
+//
+//  Given Q, K, V matrices (each [seq_len][dim]), compute attention
+//  scores only within the causal window of size W.
+//
+//  score[i][j] = Q[i] . K[j] / sqrt(dim)  if j in [i-W+1, i]
+//  attn[i]     = sum_j softmax(score[i][j]) * V[j]
+//
+//  Returns: [seq_len][dim] output
+// ===================================================================
+@pure @hot
+fn swa_causal_window(queries, keys, values, window_size) {
+    let seq_len = len(queries)
+    if seq_len == 0 { return [] }
+    let dim = len(queries[0])
+    let scale = 1.0 / swa_sqrt(to_float(dim))
+    let mut output = []
+
+    for i in 0..seq_len {
+        let start = swa_max_int(0, i - window_size + 1)
+        let end = i + 1
+
+        // compute scores for positions in window
+        let window_len = end - start
+        let mut scores = swa_zeros(window_len)
+        for widx in 0..window_len {
+            let j = start + widx
+            let mut dot = 0.0
+            for d in 0..dim {
+                dot = dot + queries[i][d] * keys[j][d]
+            }
+            scores[widx] = dot * scale
+        }
+
+        // softmax over window scores
+        let mut mx = scores[0]
+        for widx in 1..window_len {
+            if scores[widx] > mx { mx = scores[widx] }
+        }
+        let mut exps = swa_zeros(window_len)
+        let mut z = 0.0
+        for widx in 0..window_len {
+            exps[widx] = swa_exp(scores[widx] - mx)
+            z = z + exps[widx]
+        }
+        if z < 1.0e-12 { z = 1.0e-12 }
+
+        // weighted sum of values
+        let mut out_vec = swa_zeros(dim)
+        for widx in 0..window_len {
+            let w = exps[widx] / z
+            let j = start + widx
+            for d in 0..dim {
+                out_vec[d] = out_vec[d] + w * values[j][d]
+            }
+        }
+        output = output + [out_vec]
+    }
+    return output
+}
+
+// ===================================================================
+//  3. Dilated Sliding Window
+//
+//  Instead of attending to W consecutive positions, skip every d-th
+//  position. Effective receptive field = W * d.
+//
+//  Positions attended by token i:
+//    { j : j <= i, (i - j) % dilation == 0, (i - j) / dilation < W }
+//
+//  Returns: [seq_len][dim] output
+// ===================================================================
+@pure
+fn swa_build_dilated_mask(seq_len, window_size, dilation) {
+    let mut mask = []
+    for i in 0..seq_len {
+        let mut row = swa_zeros(seq_len)
+        let mut count = 0
+        let mut j = i
+        while j >= 0 {
+            if count < window_size {
+                row[j] = 1.0
+                count = count + 1
+            }
+            j = j - dilation
+        }
+        mask = mask + [row]
+    }
+    return mask
+}
+
+@pure @hot
+fn swa_dilated_window(queries, keys, values, window_size, dilation) {
+    let seq_len = len(queries)
+    if seq_len == 0 { return [] }
+    let dim = len(queries[0])
+    let scale = 1.0 / swa_sqrt(to_float(dim))
+    let mut output = []
+
+    for i in 0..seq_len {
+        // collect positions in dilated window
+        let mut positions = []
+        let mut count = 0
+        let mut j = i
+        while j >= 0 {
+            if count < window_size {
+                positions = positions + [j]
+                count = count + 1
+            }
+            j = j - dilation
+        }
+
+        let n_pos = len(positions)
+        if n_pos == 0 {
+            output = output + [swa_zeros(dim)]
+            continue
+        }
+
+        // compute scores
+        let mut scores = swa_zeros(n_pos)
+        for pidx in 0..n_pos {
+            let pj = positions[pidx]
+            let mut dot = 0.0
+            for d in 0..dim {
+                dot = dot + queries[i][d] * keys[pj][d]
+            }
+            scores[pidx] = dot * scale
+        }
+
+        // softmax
+        let mut mx = scores[0]
+        for pidx in 1..n_pos {
+            if scores[pidx] > mx { mx = scores[pidx] }
+        }
+        let mut exps = swa_zeros(n_pos)
+        let mut z = 0.0
+        for pidx in 0..n_pos {
+            exps[pidx] = swa_exp(scores[pidx] - mx)
+            z = z + exps[pidx]
+        }
+        if z < 1.0e-12 { z = 1.0e-12 }
+
+        let mut out_vec = swa_zeros(dim)
+        for pidx in 0..n_pos {
+            let w = exps[pidx] / z
+            let pj = positions[pidx]
+            for d in 0..dim {
+                out_vec[d] = out_vec[d] + w * values[pj][d]
+            }
+        }
+        output = output + [out_vec]
+    }
+    return output
+}
+
+// ===================================================================
+//  4. Global Tokens
+//
+//  Build a mask where global_positions attend to ALL positions and
+//  ALL positions can attend to global_positions (within causal).
+//
+//  global_indices: array of positions that are global (e.g. [0])
+//  Returns: [seq_len][seq_len] mask (1.0 / 0.0)
+// ===================================================================
+@pure
+fn swa_build_global_mask(seq_len, global_indices) {
+    let mut mask = []
+    // build lookup set for global positions
+    let mut is_global = swa_zeros_int(seq_len)
+    let ng = len(global_indices)
+    for gi in 0..ng {
+        let idx = global_indices[gi]
+        if idx >= 0 {
+            if idx < seq_len {
+                is_global[idx] = 1
+            }
+        }
+    }
+
+    for i in 0..seq_len {
+        let mut row = swa_zeros(seq_len)
+        if is_global[i] == 1 {
+            // global token attends to all positions <= i (causal)
+            for j in 0..(i + 1) {
+                row[j] = 1.0
+            }
+        } else {
+            // non-global token can attend to global positions <= i
+            for j in 0..(i + 1) {
+                if is_global[j] == 1 {
+                    row[j] = 1.0
+                }
+            }
+        }
+        mask = mask + [row]
+    }
+    return mask
+}
+
+// ===================================================================
+//  5. Local + Global Combine
+//
+//  Merge a local window mask and a global mask via element-wise OR.
+//  Then run attention using the combined mask.
+//
+//  Returns combined mask [seq_len][seq_len]
+// ===================================================================
+@pure
+fn swa_combine_masks(local_mask, global_mask) {
+    let seq_len = len(local_mask)
+    let mut combined = []
+    for i in 0..seq_len {
+        let mut row = swa_zeros(seq_len)
+        for j in 0..seq_len {
+            if local_mask[i][j] > 0.5 {
+                row[j] = 1.0
+            } else {
+                if global_mask[i][j] > 0.5 {
+                    row[j] = 1.0
+                }
+            }
+        }
+        combined = combined + [row]
+    }
+    return combined
+}
+
+// Masked attention using an arbitrary mask
+@pure @hot
+fn swa_masked_attention(queries, keys, values, mask) {
+    let seq_len = len(queries)
+    if seq_len == 0 { return [] }
+    let dim = len(queries[0])
+    let scale = 1.0 / swa_sqrt(to_float(dim))
+    let neg_inf = -1.0e9
+    let mut output = []
+
+    for i in 0..seq_len {
+        let mut scores = swa_zeros(seq_len)
+        for j in 0..seq_len {
+            if mask[i][j] > 0.5 {
+                let mut dot = 0.0
+                for d in 0..dim {
+                    dot = dot + queries[i][d] * keys[j][d]
+                }
+                scores[j] = dot * scale
+            } else {
+                scores[j] = neg_inf
+            }
+        }
+
+        // softmax
+        let mut mx = neg_inf
+        for j in 0..seq_len {
+            if scores[j] > mx { mx = scores[j] }
+        }
+        let mut exps = swa_zeros(seq_len)
+        let mut z = 0.0
+        for j in 0..seq_len {
+            exps[j] = swa_exp(scores[j] - mx)
+            z = z + exps[j]
+        }
+        if z < 1.0e-12 { z = 1.0e-12 }
+
+        let mut out_vec = swa_zeros(dim)
+        for j in 0..seq_len {
+            let w = exps[j] / z
+            for d in 0..dim {
+                out_vec[d] = out_vec[d] + w * values[j][d]
+            }
+        }
+        output = output + [out_vec]
+    }
+    return output
+}
+
+// Full local + global attention pipeline
+@pure
+fn swa_local_global_attention(queries, keys, values, window_size, global_indices) {
+    let seq_len = len(queries)
+    let local_mask = swa_build_window_mask(seq_len, window_size)
+    let global_mask = swa_build_global_mask(seq_len, global_indices)
+    let combined = swa_combine_masks(local_mask, global_mask)
+    return swa_masked_attention(queries, keys, values, combined)
+}
+
+// ===================================================================
+//  6. Variable Window Size Per Layer
+//
+//  Each layer can have a different window size. Given an array of
+//  window sizes (one per layer), return config and apply attention
+//  for a specific layer index.
+//
+//  layer_windows: [w0, w1, w2, ...]
+//  Returns window_size for the given layer
+// ===================================================================
+@pure
+fn swa_get_layer_window(layer_windows, layer_idx) {
+    let n = len(layer_windows)
+    if layer_idx < 0 { return layer_windows[0] }
+    if layer_idx >= n { return layer_windows[n - 1] }
+    return layer_windows[layer_idx]
+}
+
+// Create a schedule: linearly increasing window sizes across layers
+@pure
+fn swa_linear_window_schedule(n_layers, min_window, max_window) {
+    let mut schedule = []
+    if n_layers <= 1 {
+        return [min_window]
+    }
+    for l in 0..n_layers {
+        let frac = to_float(l) / to_float(n_layers - 1)
+        let w = min_window + to_int(frac * to_float(max_window - min_window))
+        schedule = schedule + [w]
+    }
+    return schedule
+}
+
+// Create a schedule: exponentially growing windows
+@pure
+fn swa_exponential_window_schedule(n_layers, base_window) {
+    let mut schedule = []
+    for l in 0..n_layers {
+        let mut w = base_window
+        for _p in 0..l { w = w * 2 }
+        schedule = schedule + [w]
+    }
+    return schedule
+}
+
+// Apply per-layer windowed attention
+@pure
+fn swa_per_layer_attention(queries, keys, values, layer_windows, layer_idx) {
+    let w = swa_get_layer_window(layer_windows, layer_idx)
+    return swa_causal_window(queries, keys, values, w)
+}
+
+// ===================================================================
+//  7. Chunked Computation
+//
+//  Process long sequences by splitting into overlapping chunks.
+//  Each chunk has size chunk_size with overlap of window_size - 1.
+//  Only the non-overlapping portion of each chunk is kept in output.
+//
+//  Returns: [seq_len][dim] output
+// ===================================================================
+@pure
+fn swa_chunked_attention(queries, keys, values, window_size, chunk_size) {
+    let seq_len = len(queries)
+    if seq_len == 0 { return [] }
+    let dim = len(queries[0])
+
+    // overlap = window_size - 1 (to ensure continuity)
+    let overlap = window_size - 1
+    let stride = chunk_size - overlap
+    let effective_stride = swa_max_int(stride, 1)
+
+    let mut output = []
+    for _i in 0..seq_len { output = output + [swa_zeros(dim)] }
+
+    let mut pos = 0
+    while pos < seq_len {
+        let chunk_end = swa_min_int(pos + chunk_size, seq_len)
+        let actual_chunk = chunk_end - pos
+
+        // extract chunk
+        let mut chunk_q = []
+        let mut chunk_k = []
+        let mut chunk_v = []
+        for ci in 0..actual_chunk {
+            chunk_q = chunk_q + [queries[pos + ci]]
+            chunk_k = chunk_k + [keys[pos + ci]]
+            chunk_v = chunk_v + [values[pos + ci]]
+        }
+
+        // run causal window attention on chunk
+        let chunk_out = swa_causal_window(chunk_q, chunk_k, chunk_v, window_size)
+
+        // copy valid output positions (skip overlap from previous chunk)
+        let valid_start = 0
+        let mut valid_end = actual_chunk
+        if pos + actual_chunk < seq_len {
+            valid_end = swa_min_int(effective_stride, actual_chunk)
+        }
+        // first chunk: take all; subsequent: skip overlap prefix
+        let copy_start = valid_start
+        if pos > 0 {
+            // skip overlap positions from this chunk (already covered)
+            let skip = swa_min_int(overlap, actual_chunk)
+            for ci in skip..actual_chunk {
+                let global_idx = pos + ci
+                if global_idx < seq_len {
+                    output[global_idx] = chunk_out[ci]
+                }
+            }
+        } else {
+            for ci in 0..actual_chunk {
+                output[ci] = chunk_out[ci]
+            }
+        }
+
+        pos = pos + effective_stride
+    }
+    return output
+}
+
+// ===================================================================
+//  8. KV Cache with Window Eviction
+//
+//  Maintains a bounded KV cache of at most W entries.
+//  When new KV pairs arrive, oldest entries beyond W are evicted.
+//
+//  Cache: [keys_list, values_list]
+//  Returns updated cache and attention output for new query
+// ===================================================================
+@pure
+fn swa_kv_cache_create() {
+    return [[], []]
+}
+
+@pure
+fn swa_kv_cache_size(cache) {
+    return len(cache[0])
+}
+
+// Append a new KV pair and evict if beyond window_size
+@pure
+fn swa_kv_cache_append(cache, new_key, new_value, window_size) {
+    let mut cached_keys = cache[0] + [new_key]
+    let mut cached_vals = cache[1] + [new_value]
+    let n = len(cached_keys)
+
+    // evict oldest if over window
+    if n > window_size {
+        let drop_count = n - window_size
+        let mut new_keys = []
+        let mut new_vals = []
+        for i in drop_count..n {
+            new_keys = new_keys + [cached_keys[i]]
+            new_vals = new_vals + [cached_vals[i]]
+        }
+        cached_keys = new_keys
+        cached_vals = new_vals
+    }
+    return [cached_keys, cached_vals]
+}
+
+// Compute attention for a single query against the cached KV
+@pure @hot
+fn swa_kv_cache_attend(cache, query) {
+    let cached_keys = cache[0]
+    let cached_vals = cache[1]
+    let n = len(cached_keys)
+    if n == 0 { return query }
+    let dim = len(query)
+    let scale = 1.0 / swa_sqrt(to_float(dim))
+
+    // scores
+    let mut scores = swa_zeros(n)
+    for j in 0..n {
+        let mut dot = 0.0
+        for d in 0..dim {
+            dot = dot + query[d] * cached_keys[j][d]
+        }
+        scores[j] = dot * scale
+    }
+
+    // softmax
+    let mut mx = scores[0]
+    for j in 1..n {
+        if scores[j] > mx { mx = scores[j] }
+    }
+    let mut exps = swa_zeros(n)
+    let mut z = 0.0
+    for j in 0..n {
+        exps[j] = swa_exp(scores[j] - mx)
+        z = z + exps[j]
+    }
+    if z < 1.0e-12 { z = 1.0e-12 }
+
+    let mut out = swa_zeros(dim)
+    for j in 0..n {
+        let w = exps[j] / z
+        for d in 0..dim {
+            out[d] = out[d] + w * cached_vals[j][d]
+        }
+    }
+    return out
+}
+
+// Full incremental decoding with KV cache eviction
+@pure
+fn swa_kv_cache_decode(queries, keys, values, window_size) {
+    let seq_len = len(queries)
+    let mut cache = swa_kv_cache_create()
+    let mut output = []
+    for i in 0..seq_len {
+        cache = swa_kv_cache_append(cache, keys[i], values[i], window_size)
+        let out = swa_kv_cache_attend(cache, queries[i])
+        output = output + [out]
+    }
+    return output
+}
+
+// ===================================================================
+//  9. Effective Receptive Field
+//
+//  For stacked layers each with window W, after L layers the
+//  effective receptive field at the top layer is:
+//    ERF = 1 + L * (W - 1)   (for uniform window)
+//
+//  For variable windows [w0, w1, ...]:
+//    ERF = 1 + sum(wi - 1)
+//
+//  For dilated windows with dilation d per layer:
+//    ERF = 1 + sum((wi - 1) * di)
+// ===================================================================
+@pure
+fn swa_erf_uniform(n_layers, window_size) {
+    return 1 + n_layers * (window_size - 1)
+}
+
+@pure
+fn swa_erf_variable(layer_windows) {
+    let n = len(layer_windows)
+    let mut erf = 1
+    for i in 0..n {
+        erf = erf + layer_windows[i] - 1
+    }
+    return erf
+}
+
+@pure
+fn swa_erf_dilated(layer_windows, layer_dilations) {
+    let n = len(layer_windows)
+    let mut erf = 1
+    for i in 0..n {
+        erf = erf + (layer_windows[i] - 1) * layer_dilations[i]
+    }
+    return erf
+}
+
+// ===================================================================
+//  Utility: count nonzero entries in a mask row
+// ===================================================================
+@pure
+fn swa_mask_row_count(mask, row_idx) {
+    let row = mask[row_idx]
+    let n = len(row)
+    let mut count = 0
+    for j in 0..n {
+        if row[j] > 0.5 { count = count + 1 }
+    }
+    return count
+}
+
+// Count total nonzero entries in mask
+@pure
+fn swa_mask_total_nonzero(mask) {
+    let seq_len = len(mask)
+    let mut total = 0
+    for i in 0..seq_len {
+        total = total + swa_mask_row_count(mask, i)
+    }
+    return total
+}
+
+println("[sliding_window_attention] loaded — window mask + causal + dilated + global + chunked + KV cache + ERF")

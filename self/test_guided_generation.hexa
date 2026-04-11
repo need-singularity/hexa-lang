@@ -1,0 +1,1132 @@
+// ===================================================================
+//  test_guided_generation.hexa — Guided Generation verification (#126)
+//
+//  Tests (35):
+//    T1  grammar_new returns map with _start
+//    T2  grammar_add_rule single alternative
+//    T3  grammar_add_rule multiple alternatives
+//    T4  is_nonterminal true for added rule
+//    T5  is_nonterminal false for terminal
+//    T6  grammar_nonterminals lists all
+//    T7  parse_grammar simple S -> a b
+//    T8  parse_grammar with alternatives S -> a | b
+//    T9  parse_grammar multi-line
+//    T10 first_set terminal returns itself
+//    T11 first_set nonterminal expands
+//    T12 valid_next_tokens from initial state
+//    T13 build_vocab correct mapping
+//    T14 compute_mask marks correct tokens
+//    T15 apply_mask blocks disallowed tokens
+//    T16 apply_bias adds bonus to allowed
+//    T17 json_schema string type
+//    T18 json_schema boolean type has two alts
+//    T19 json_schema object type
+//    T20 json_schema array type
+//    T21 regex literal concatenation
+//    T22 regex alternation
+//    T23 regex char class
+//    T24 regex optional (?)
+//    T25 regex star (*)
+//    T26 regex plus (+)
+//    T27 init_state creates stacks from start
+//    T28 advance consumes matching token
+//    T29 advance rejects wrong token
+//    T30 validate_sequence accepts valid
+//    T31 validate_sequence rejects invalid
+//    T32 choices_to_grammar creates alternatives
+//    T33 validate_choice matches correct choice
+//    T34 constrained generation respects grammar
+//    T35 beam search produces valid sequence
+//
+//  Run: cargo run --release -- self/test_guided_generation.hexa
+// ===================================================================
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+
+// ── inlined from guided_generation.hexa ────────────────────────
+
+fn gg_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn gg_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn gg_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+fn gg_ones_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [1] }
+    return v
+}
+
+fn gg_fill_int(n, val) {
+    let mut v = []
+    for _i in 0..n { v = v + [val] }
+    return v
+}
+
+fn gg_min_int(a, b) {
+    if a <= b { return a }
+    return b
+}
+
+fn gg_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn gg_softmax(logits) {
+    let n = len(logits)
+    let mut mx = logits[0]
+    for i in 1..n {
+        if logits[i] > mx { mx = logits[i] }
+    }
+    let mut exps = gg_zeros(n)
+    let mut z = 0.0
+    for i in 0..n {
+        exps[i] = gg_exp(logits[i] - mx)
+        z = z + exps[i]
+    }
+    let mut out = gg_zeros(n)
+    for i in 0..n { out[i] = exps[i] / z }
+    return out
+}
+
+fn gg_argmax(logits) {
+    let n = len(logits)
+    let mut best = 0
+    let mut best_v = logits[0]
+    for i in 1..n {
+        if logits[i] > best_v {
+            best_v = logits[i]
+            best = i
+        }
+    }
+    return best
+}
+
+// ── Grammar representation ──────────────────────────────────
+
+fn gg_grammar_new() {
+    return #{"_start": "S"}
+}
+
+fn gg_grammar_add_rule(grammar, nonterminal, alternative) {
+    let key = "rule_" + nonterminal
+    if has_key(grammar, key) {
+        let existing = grammar[key]
+        let mut new_alts = []
+        for i in 0..len(existing) {
+            new_alts = new_alts + [existing[i]]
+        }
+        new_alts = new_alts + [alternative]
+        grammar[key] = new_alts
+    } else {
+        grammar[key] = [alternative]
+    }
+    return grammar
+}
+
+fn gg_grammar_get(grammar, nonterminal) {
+    let key = "rule_" + nonterminal
+    if has_key(grammar, key) {
+        return grammar[key]
+    }
+    return []
+}
+
+fn gg_is_nonterminal(grammar, sym) {
+    let key = "rule_" + sym
+    return has_key(grammar, key)
+}
+
+fn gg_grammar_start(grammar) {
+    return grammar["_start"]
+}
+
+fn gg_grammar_set_start(grammar, start) {
+    grammar["_start"] = start
+    return grammar
+}
+
+fn gg_grammar_nonterminals(grammar) {
+    let all_keys = keys(grammar)
+    let mut nts = []
+    for i in 0..len(all_keys) {
+        let k = all_keys[i]
+        if k.starts_with("rule_") {
+            nts = nts + [k.substring(5, len(k))]
+        }
+    }
+    return nts
+}
+
+// ── Grammar parser ──────────────────────────────────────────
+
+fn gg_split_alternatives(rhs) {
+    let parts = rhs.split("|")
+    let mut alts = []
+    for i in 0..len(parts) {
+        let trimmed = parts[i].trim()
+        if len(trimmed) > 0 {
+            alts = alts + [trimmed]
+        }
+    }
+    return alts
+}
+
+fn gg_split_symbols(alt_str) {
+    let parts = alt_str.split(" ")
+    let mut syms = []
+    for i in 0..len(parts) {
+        let trimmed = parts[i].trim()
+        if len(trimmed) > 0 {
+            syms = syms + [trimmed]
+        }
+    }
+    return syms
+}
+
+fn gg_parse_grammar(text) {
+    let mut grammar = gg_grammar_new()
+    let lines = text.split("\n")
+    let mut first_nt = ""
+    for li in 0..len(lines) {
+        let line = lines[li].trim()
+        if len(line) == 0 { continue }
+        let parts = line.split("->")
+        if len(parts) < 2 { continue }
+        let nt = parts[0].trim()
+        let mut rhs = parts[1]
+        for pi in 2..len(parts) {
+            rhs = rhs + "->" + parts[pi]
+        }
+        rhs = rhs.trim()
+        if len(first_nt) == 0 { first_nt = nt }
+        let alts = gg_split_alternatives(rhs)
+        for ai in 0..len(alts) {
+            let syms = gg_split_symbols(alts[ai])
+            grammar = gg_grammar_add_rule(grammar, nt, syms)
+        }
+    }
+    if len(first_nt) > 0 {
+        grammar = gg_grammar_set_start(grammar, first_nt)
+    }
+    return grammar
+}
+
+// ── First set / token mask ──────────────────────────────────
+
+fn gg_first_set(grammar, symbol, visited) {
+    if !gg_is_nonterminal(grammar, symbol) {
+        return [symbol]
+    }
+    for vi in 0..len(visited) {
+        if visited[vi] == symbol { return [] }
+    }
+    let new_visited = visited + [symbol]
+    let alts = gg_grammar_get(grammar, symbol)
+    let mut firsts = []
+    for ai in 0..len(alts) {
+        let alt = alts[ai]
+        if len(alt) > 0 {
+            let sub_firsts = gg_first_set(grammar, alt[0], new_visited)
+            for fi in 0..len(sub_firsts) {
+                let mut found = false
+                for ei in 0..len(firsts) {
+                    if firsts[ei] == sub_firsts[fi] { found = true }
+                }
+                if !found {
+                    firsts = firsts + [sub_firsts[fi]]
+                }
+            }
+        }
+    }
+    return firsts
+}
+
+fn gg_valid_next_tokens(grammar, parse_stack) {
+    if len(parse_stack) == 0 {
+        return []
+    }
+    let top = parse_stack[0]
+    return gg_first_set(grammar, top, [])
+}
+
+fn gg_build_vocab(tokens) {
+    let mut vm = #{}
+    for i in 0..len(tokens) {
+        vm[tokens[i]] = i
+    }
+    return vm
+}
+
+fn gg_compute_mask(valid_tokens, vocab_map, vocab_size) {
+    let mut mask = gg_zeros_int(vocab_size)
+    for ti in 0..len(valid_tokens) {
+        let tok = valid_tokens[ti]
+        if has_key(vocab_map, tok) {
+            let idx = vocab_map[tok]
+            mask[idx] = 1
+        }
+    }
+    return mask
+}
+
+fn gg_apply_mask(logits, mask) {
+    let n = len(logits)
+    let mut out = gg_zeros(n)
+    let neg_inf = -1000000000.0
+    for i in 0..n {
+        if mask[i] == 1 {
+            out[i] = logits[i]
+        } else {
+            out[i] = neg_inf
+        }
+    }
+    return out
+}
+
+fn gg_apply_bias(logits, mask, bonus, penalty) {
+    let n = len(logits)
+    let mut out = gg_zeros(n)
+    for i in 0..n {
+        if mask[i] == 1 {
+            out[i] = logits[i] + bonus
+        } else {
+            out[i] = logits[i] + penalty
+        }
+    }
+    return out
+}
+
+// ── JSON schema to grammar ──────────────────────────────────
+
+fn gg_json_type_to_rules(grammar, nt_name, schema_type) {
+    if schema_type == "string" {
+        grammar = gg_grammar_add_rule(grammar, nt_name, ["QUOTE", "STR_CONTENT", "QUOTE"])
+        return grammar
+    }
+    if schema_type == "number" {
+        grammar = gg_grammar_add_rule(grammar, nt_name, ["NUMBER"])
+        return grammar
+    }
+    if schema_type == "integer" {
+        grammar = gg_grammar_add_rule(grammar, nt_name, ["INTEGER"])
+        return grammar
+    }
+    if schema_type == "boolean" {
+        grammar = gg_grammar_add_rule(grammar, nt_name, ["TRUE"])
+        grammar = gg_grammar_add_rule(grammar, nt_name, ["FALSE"])
+        return grammar
+    }
+    if schema_type == "null" {
+        grammar = gg_grammar_add_rule(grammar, nt_name, ["NULL"])
+        return grammar
+    }
+    if schema_type == "array" {
+        grammar = gg_grammar_add_rule(grammar, nt_name, ["LBRACKET", "ARRAY_ITEMS", "RBRACKET"])
+        return grammar
+    }
+    grammar = gg_grammar_add_rule(grammar, nt_name, ["QUOTE", "STR_CONTENT", "QUOTE"])
+    return grammar
+}
+
+fn gg_json_schema_to_grammar(schema) {
+    let mut grammar = gg_grammar_new()
+    let stype = schema["type"]
+
+    if stype == "object" {
+        grammar = gg_grammar_add_rule(grammar, "S", ["LBRACE", "PROPS", "RBRACE"])
+        if has_key(schema, "properties") {
+            let props = schema["properties"]
+            let prop_keys = keys(props)
+            let n_props = len(prop_keys)
+            if n_props == 0 {
+                grammar = gg_grammar_add_rule(grammar, "PROPS", ["EMPTY"])
+            } else {
+                let mut chain = []
+                for pi in 0..n_props {
+                    let pname = prop_keys[pi]
+                    let prop_nt = "PROP_" + str(pi)
+                    if pi > 0 {
+                        chain = chain + ["COMMA"]
+                    }
+                    chain = chain + [prop_nt]
+                    let val_nt = "VAL_" + str(pi)
+                    grammar = gg_grammar_add_rule(grammar, prop_nt, ["QUOTE", "KEY_" + pname, "QUOTE", "COLON", val_nt])
+                    let prop_schema = props[pname]
+                    let ptype = prop_schema["type"]
+                    grammar = gg_json_type_to_rules(grammar, val_nt, ptype)
+                }
+                grammar = gg_grammar_add_rule(grammar, "PROPS", chain)
+            }
+        } else {
+            grammar = gg_grammar_add_rule(grammar, "PROPS", ["EMPTY"])
+        }
+    } else if stype == "array" {
+        grammar = gg_grammar_add_rule(grammar, "S", ["LBRACKET", "ITEMS", "RBRACKET"])
+        if has_key(schema, "items") {
+            let item_schema = schema["items"]
+            let itype = item_schema["type"]
+            grammar = gg_json_type_to_rules(grammar, "ITEM", itype)
+            grammar = gg_grammar_add_rule(grammar, "ITEMS", ["ITEM"])
+            grammar = gg_grammar_add_rule(grammar, "ITEMS", ["ITEM", "COMMA", "ITEMS"])
+        } else {
+            grammar = gg_grammar_add_rule(grammar, "ITEMS", ["EMPTY"])
+        }
+    } else {
+        grammar = gg_json_type_to_rules(grammar, "S", stype)
+    }
+    return grammar
+}
+
+// ── Regex to grammar ────────────────────────────────────────
+
+fn gg_regex_to_grammar(pattern) {
+    let mut grammar = gg_grammar_new()
+    let raw_chars = pattern.chars()
+    let n = len(raw_chars)
+    // Convert char array to string array for reliable comparison
+    let mut chars = []
+    for _ci in 0..n {
+        chars = chars + [to_string(raw_chars[_ci])]
+    }
+
+    let mut has_pipe = false
+    let mut bracket_depth = 0
+    for ci in 0..n {
+        let c = chars[ci]
+        if c == "[" { bracket_depth = bracket_depth + 1 }
+        if c == "]" { bracket_depth = bracket_depth - 1 }
+        if c == "|" {
+            if bracket_depth == 0 { has_pipe = true }
+        }
+    }
+
+    if has_pipe {
+        let mut alts = []
+        let mut current = ""
+        let mut bd = 0
+        for ci in 0..n {
+            let c = chars[ci]
+            if c == "[" { bd = bd + 1 }
+            if c == "]" { bd = bd - 1 }
+            if c == "|" {
+                if bd == 0 {
+                    alts = alts + [current]
+                    current = ""
+                } else {
+                    current = current + c
+                }
+            } else {
+                current = current + c
+            }
+        }
+        alts = alts + [current]
+
+        for ai in 0..len(alts) {
+            let alt = alts[ai].trim()
+            let alt_raw = alt.chars()
+            let mut syms = []
+            for si in 0..len(alt_raw) {
+                syms = syms + [to_string(alt_raw[si])]
+            }
+            if len(syms) > 0 {
+                grammar = gg_grammar_add_rule(grammar, "S", syms)
+            }
+        }
+        return grammar
+    }
+
+    let mut syms = []
+    let mut nt_counter = 0
+    let mut ci = 0
+    while ci < n {
+        let c = chars[ci]
+
+        if c == "[" {
+            let class_nt = "CC_" + str(nt_counter)
+            nt_counter = nt_counter + 1
+            ci = ci + 1
+            while ci < n {
+                let cc = chars[ci]
+                if cc == "]" { break }
+                grammar = gg_grammar_add_rule(grammar, class_nt, [cc])
+                ci = ci + 1
+            }
+            ci = ci + 1
+            if ci < n {
+                let q = chars[ci]
+                if q == "?" {
+                    let opt_nt = "OPT_" + str(nt_counter)
+                    nt_counter = nt_counter + 1
+                    grammar = gg_grammar_add_rule(grammar, opt_nt, [class_nt])
+                    grammar = gg_grammar_add_rule(grammar, opt_nt, ["EMPTY"])
+                    syms = syms + [opt_nt]
+                    ci = ci + 1
+                } else if q == "*" {
+                    let star_nt = "STAR_" + str(nt_counter)
+                    nt_counter = nt_counter + 1
+                    grammar = gg_grammar_add_rule(grammar, star_nt, [class_nt, star_nt])
+                    grammar = gg_grammar_add_rule(grammar, star_nt, ["EMPTY"])
+                    syms = syms + [star_nt]
+                    ci = ci + 1
+                } else if q == "+" {
+                    let plus_nt = "PLUS_" + str(nt_counter)
+                    nt_counter = nt_counter + 1
+                    grammar = gg_grammar_add_rule(grammar, plus_nt, [class_nt])
+                    grammar = gg_grammar_add_rule(grammar, plus_nt, [class_nt, plus_nt])
+                    syms = syms + [plus_nt]
+                    ci = ci + 1
+                } else {
+                    syms = syms + [class_nt]
+                }
+            } else {
+                syms = syms + [class_nt]
+            }
+        } else {
+            let literal = c
+            ci = ci + 1
+            if ci < n {
+                let q = chars[ci]
+                if q == "?" {
+                    let opt_nt = "OPT_" + str(nt_counter)
+                    nt_counter = nt_counter + 1
+                    grammar = gg_grammar_add_rule(grammar, opt_nt, [literal])
+                    grammar = gg_grammar_add_rule(grammar, opt_nt, ["EMPTY"])
+                    syms = syms + [opt_nt]
+                    ci = ci + 1
+                } else if q == "*" {
+                    let star_nt = "STAR_" + str(nt_counter)
+                    nt_counter = nt_counter + 1
+                    grammar = gg_grammar_add_rule(grammar, star_nt, [literal, star_nt])
+                    grammar = gg_grammar_add_rule(grammar, star_nt, ["EMPTY"])
+                    syms = syms + [star_nt]
+                    ci = ci + 1
+                } else if q == "+" {
+                    let plus_nt = "PLUS_" + str(nt_counter)
+                    nt_counter = nt_counter + 1
+                    grammar = gg_grammar_add_rule(grammar, plus_nt, [literal])
+                    grammar = gg_grammar_add_rule(grammar, plus_nt, [literal, plus_nt])
+                    syms = syms + [plus_nt]
+                    ci = ci + 1
+                } else {
+                    syms = syms + [literal]
+                }
+            } else {
+                syms = syms + [literal]
+            }
+        }
+    }
+
+    if len(syms) > 0 {
+        grammar = gg_grammar_add_rule(grammar, "S", syms)
+    }
+    return grammar
+}
+
+// ── Incremental parse state tracker ─────────────────────────
+
+fn gg_init_state(grammar) {
+    let start = gg_grammar_start(grammar)
+    let alts = gg_grammar_get(grammar, start)
+    let mut stacks = []
+    for ai in 0..len(alts) {
+        stacks = stacks + [alts[ai]]
+    }
+    return stacks
+}
+
+fn gg_expand_stack(grammar, stack, depth) {
+    if len(stack) == 0 { return [stack] }
+    if depth > 10 { return [stack] }
+
+    let top = stack[0]
+    let mut rest = []
+    for i in 1..len(stack) {
+        rest = rest + [stack[i]]
+    }
+
+    if gg_is_nonterminal(grammar, top) {
+        let alts = gg_grammar_get(grammar, top)
+        let mut expanded = []
+        for ai in 0..len(alts) {
+            let alt = alts[ai]
+            let mut new_stack = []
+            for si in 0..len(alt) {
+                if alt[si] != "EMPTY" {
+                    new_stack = new_stack + [alt[si]]
+                }
+            }
+            for ri in 0..len(rest) {
+                new_stack = new_stack + [rest[ri]]
+            }
+            let sub = gg_expand_stack(grammar, new_stack, depth + 1)
+            for si in 0..len(sub) {
+                expanded = expanded + [sub[si]]
+            }
+        }
+        return expanded
+    }
+    return [stack]
+}
+
+fn gg_expand_all(grammar, stacks) {
+    let mut result = []
+    for si in 0..len(stacks) {
+        let expanded = gg_expand_stack(grammar, stacks[si], 0)
+        for ei in 0..len(expanded) {
+            result = result + [expanded[ei]]
+        }
+    }
+    return result
+}
+
+fn gg_advance(grammar, stacks, token) {
+    let expanded = gg_expand_all(grammar, stacks)
+    let mut new_stacks = []
+    for si in 0..len(expanded) {
+        let stack = expanded[si]
+        if len(stack) == 0 { continue }
+        let top = stack[0]
+        if top == token {
+            let mut rest = []
+            for i in 1..len(stack) {
+                rest = rest + [stack[i]]
+            }
+            new_stacks = new_stacks + [rest]
+        }
+    }
+    return new_stacks
+}
+
+fn gg_get_valid_tokens(grammar, stacks) {
+    let expanded = gg_expand_all(grammar, stacks)
+    let mut tokens = []
+    for si in 0..len(expanded) {
+        let stack = expanded[si]
+        if len(stack) > 0 {
+            let top = stack[0]
+            if !gg_is_nonterminal(grammar, top) {
+                let mut found = false
+                for ti in 0..len(tokens) {
+                    if tokens[ti] == top { found = true }
+                }
+                if !found {
+                    tokens = tokens + [top]
+                }
+            }
+        }
+    }
+    for si in 0..len(expanded) {
+        if len(expanded[si]) == 0 {
+            let mut found = false
+            for ti in 0..len(tokens) {
+                if tokens[ti] == "EOS" { found = true }
+            }
+            if !found {
+                tokens = tokens + ["EOS"]
+            }
+        }
+    }
+    return tokens
+}
+
+fn gg_can_accept(grammar, stacks) {
+    let expanded = gg_expand_all(grammar, stacks)
+    for si in 0..len(expanded) {
+        if len(expanded[si]) == 0 { return true }
+    }
+    return false
+}
+
+fn gg_validate_sequence(grammar, token_seq) {
+    let mut stacks = gg_init_state(grammar)
+    for ti in 0..len(token_seq) {
+        stacks = gg_advance(grammar, stacks, token_seq[ti])
+        if len(stacks) == 0 { return false }
+    }
+    return gg_can_accept(grammar, stacks)
+}
+
+// ── Choice / enum ───────────────────────────────────────────
+
+fn gg_choices_to_grammar(choices) {
+    let mut grammar = gg_grammar_new()
+    for ci in 0..len(choices) {
+        let choice = choices[ci]
+        grammar = gg_grammar_add_rule(grammar, "S", choice)
+    }
+    return grammar
+}
+
+fn gg_validate_choice(token_seq, choices) {
+    for ci in 0..len(choices) {
+        let choice = choices[ci]
+        if len(choice) == len(token_seq) {
+            let mut match_all = true
+            for ti in 0..len(choice) {
+                if choice[ti] != token_seq[ti] { match_all = false }
+            }
+            if match_all { return true }
+        }
+    }
+    return false
+}
+
+// ── Constrained generation ──────────────────────────────────
+
+fn gg_generate_constrained(logits_fn, token_list, grammar, max_tokens) {
+    let vocab_map = gg_build_vocab(token_list)
+    let vocab_size = len(token_list)
+    let mut stacks = gg_init_state(grammar)
+    let mut generated_ids = []
+    let mut generated_names = []
+
+    for step in 0..max_tokens {
+        let valid = gg_get_valid_tokens(grammar, stacks)
+        if len(valid) == 0 { break }
+
+        let mut only_eos = true
+        for vi in 0..len(valid) {
+            if valid[vi] != "EOS" { only_eos = false }
+        }
+        if only_eos { break }
+
+        let mut valid_no_eos = []
+        for vi in 0..len(valid) {
+            if valid[vi] != "EOS" {
+                valid_no_eos = valid_no_eos + [valid[vi]]
+            }
+        }
+
+        let mask = gg_compute_mask(valid_no_eos, vocab_map, vocab_size)
+        let raw_logits = logits_fn(step)
+        let masked_logits = gg_apply_mask(raw_logits, mask)
+        let best = gg_argmax(masked_logits)
+        let tok_name = token_list[best]
+
+        generated_ids = generated_ids + [best]
+        generated_names = generated_names + [tok_name]
+
+        stacks = gg_advance(grammar, stacks, tok_name)
+        if len(stacks) == 0 { break }
+    }
+
+    return #{"ids": generated_ids, "names": generated_names}
+}
+
+fn gg_beam_search(logits_fn, token_list, grammar, max_tokens, beam_width) {
+    let vocab_map = gg_build_vocab(token_list)
+    let vocab_size = len(token_list)
+
+    let init_stacks = gg_init_state(grammar)
+    let mut b_stacks_arr = [init_stacks]
+    let mut b_ids_arr = [[]]
+    let mut b_names_arr = [[]]
+    let mut b_scores_arr = [0.0]
+
+    for step in 0..max_tokens {
+        let mut c_stacks = []
+        let mut c_ids = []
+        let mut c_names = []
+        let mut c_scores = []
+
+        for bi in 0..len(b_stacks_arr) {
+            let bst = b_stacks_arr[bi]
+            let bid = b_ids_arr[bi]
+            let bnm = b_names_arr[bi]
+            let bsc = b_scores_arr[bi]
+
+            let valid = gg_get_valid_tokens(grammar, bst)
+            if len(valid) == 0 { continue }
+
+            let mut can_end = false
+            for vi in 0..len(valid) {
+                if valid[vi] == "EOS" { can_end = true }
+            }
+            if can_end {
+                c_stacks = c_stacks + [bst]
+                c_ids = c_ids + [bid]
+                c_names = c_names + [bnm]
+                c_scores = c_scores + [bsc]
+            }
+
+            let mut valid_no_eos = []
+            for vi in 0..len(valid) {
+                if valid[vi] != "EOS" {
+                    valid_no_eos = valid_no_eos + [valid[vi]]
+                }
+            }
+            if len(valid_no_eos) == 0 { continue }
+
+            let mask = gg_compute_mask(valid_no_eos, vocab_map, vocab_size)
+            let raw_logits = logits_fn(step)
+            let probs = gg_softmax(raw_logits)
+
+            for vi in 0..len(valid_no_eos) {
+                let tok = valid_no_eos[vi]
+                if has_key(vocab_map, tok) {
+                    let tid = vocab_map[tok]
+                    let tok_score = probs[tid]
+                    let mut log_score = -20.0
+                    if tok_score > 1.0e-10 {
+                        let mut ls = 0.0
+                        let mut x = tok_score
+                        while x < 1.0 {
+                            ls = ls - 1.0
+                            x = x * 2.718281828
+                        }
+                        while x > 2.718281828 {
+                            ls = ls + 1.0
+                            x = x / 2.718281828
+                        }
+                        log_score = ls + (x - 1.0) - (x - 1.0) * (x - 1.0) / 2.0
+                    }
+                    let new_stacks = gg_advance(grammar, bst, tok)
+                    if len(new_stacks) > 0 {
+                        c_stacks = c_stacks + [new_stacks]
+                        c_ids = c_ids + [bid + [tid]]
+                        c_names = c_names + [bnm + [tok]]
+                        c_scores = c_scores + [bsc + log_score]
+                    }
+                }
+            }
+        }
+
+        if len(c_scores) == 0 { break }
+
+        let nc = len(c_scores)
+        let mut new_stacks_arr = []
+        let mut new_ids_arr = []
+        let mut new_names_arr = []
+        let mut new_scores_arr = []
+        let mut used = gg_zeros_int(nc)
+        let keep = gg_min_int(beam_width, nc)
+        for _k in 0..keep {
+            let mut best_idx = -1
+            let mut best_score = -999999.0
+            for cci in 0..nc {
+                if used[cci] == 0 {
+                    if c_scores[cci] > best_score {
+                        best_score = c_scores[cci]
+                        best_idx = cci
+                    }
+                }
+            }
+            if best_idx >= 0 {
+                used[best_idx] = 1
+                new_stacks_arr = new_stacks_arr + [c_stacks[best_idx]]
+                new_ids_arr = new_ids_arr + [c_ids[best_idx]]
+                new_names_arr = new_names_arr + [c_names[best_idx]]
+                new_scores_arr = new_scores_arr + [c_scores[best_idx]]
+            }
+        }
+        b_stacks_arr = new_stacks_arr
+        b_ids_arr = new_ids_arr
+        b_names_arr = new_names_arr
+        b_scores_arr = new_scores_arr
+    }
+
+    if len(b_scores_arr) == 0 {
+        return #{"ids": [], "names": [], "score": -999999.0}
+    }
+    return #{"ids": b_ids_arr[0], "names": b_names_arr[0], "score": b_scores_arr[0]}
+}
+
+fn gg_grammar_to_string(grammar) {
+    let nts = gg_grammar_nonterminals(grammar)
+    let mut result = ""
+    for ni in 0..len(nts) {
+        let nt = nts[ni]
+        let alts = gg_grammar_get(grammar, nt)
+        let mut alt_strs = []
+        for ai in 0..len(alts) {
+            let alt = alts[ai]
+            let mut s = ""
+            for si in 0..len(alt) {
+                if si > 0 { s = s + " " }
+                s = s + alt[si]
+            }
+            alt_strs = alt_strs + [s]
+        }
+        result = result + nt + " -> " + alt_strs.join(" | ") + "\n"
+    }
+    return result
+}
+
+// ===================================================================
+//  TESTS
+// ===================================================================
+
+// T1: grammar_new returns map with _start = "S"
+let g1 = gg_grammar_new()
+check("T1 grammar_new has _start=S", g1["_start"] == "S")
+
+// T2: grammar_add_rule single alternative
+let mut g2 = gg_grammar_new()
+g2 = gg_grammar_add_rule(g2, "S", ["a", "b"])
+let alts2 = gg_grammar_get(g2, "S")
+check("T2 single rule has 1 alt", len(alts2) == 1)
+
+// T3: grammar_add_rule multiple alternatives
+let mut g3 = gg_grammar_new()
+g3 = gg_grammar_add_rule(g3, "S", ["a"])
+g3 = gg_grammar_add_rule(g3, "S", ["b"])
+let alts3 = gg_grammar_get(g3, "S")
+check("T3 two rules have 2 alts", len(alts3) == 2)
+
+// T4: is_nonterminal true
+check("T4 is_nonterminal true for S", gg_is_nonterminal(g3, "S"))
+
+// T5: is_nonterminal false for terminal
+check("T5 is_nonterminal false for terminal", !gg_is_nonterminal(g3, "a"))
+
+// T6: grammar_nonterminals lists all
+let mut g6 = gg_grammar_new()
+g6 = gg_grammar_add_rule(g6, "S", ["A"])
+g6 = gg_grammar_add_rule(g6, "A", ["x"])
+let nts6 = gg_grammar_nonterminals(g6)
+check("T6 nonterminals count >= 2", len(nts6) >= 2)
+
+// T7: parse_grammar simple S -> a b
+let g7 = gg_parse_grammar("S -> a b")
+let alts7 = gg_grammar_get(g7, "S")
+check("T7 parsed S -> a b has 1 alt", len(alts7) == 1)
+check("T7b first sym is a", alts7[0][0] == "a")
+check("T7c second sym is b", alts7[0][1] == "b")
+
+// T8: parse_grammar with alternatives
+let g8 = gg_parse_grammar("S -> a | b")
+let alts8 = gg_grammar_get(g8, "S")
+check("T8 parsed S -> a | b has 2 alts", len(alts8) == 2)
+
+// T9: parse_grammar multi-line
+let g9 = gg_parse_grammar("S -> a A\nA -> c")
+let alts9s = gg_grammar_get(g9, "S")
+let alts9a = gg_grammar_get(g9, "A")
+check("T9 S has 1 alt", len(alts9s) == 1)
+check("T9b A has 1 alt", len(alts9a) == 1)
+check("T9c start is S", gg_grammar_start(g9) == "S")
+
+// T10: first_set terminal returns itself
+let fs10 = gg_first_set(g9, "c", [])
+check("T10 first_set of terminal c = [c]", len(fs10) == 1)
+check("T10b value is c", fs10[0] == "c")
+
+// T11: first_set nonterminal expands
+let fs11 = gg_first_set(g9, "A", [])
+check("T11 first_set of A = [c]", len(fs11) == 1)
+check("T11b value is c", fs11[0] == "c")
+
+// T12: valid_next_tokens from initial state
+// S -> a A, so first token must be "a"
+let stack12 = ["S"]
+let valid12 = gg_valid_next_tokens(g9, stack12)
+check("T12 valid next from [S] includes a", len(valid12) >= 1)
+let mut found_a = false
+for i in 0..len(valid12) { if valid12[i] == "a" { found_a = true } }
+check("T12b a is in valid tokens", found_a)
+
+// T13: build_vocab correct mapping
+let vocab13 = gg_build_vocab(["a", "b", "c", "d"])
+check("T13 vocab a=0", vocab13["a"] == 0)
+check("T13b vocab d=3", vocab13["d"] == 3)
+
+// T14: compute_mask marks correct tokens
+let mask14 = gg_compute_mask(["a", "c"], vocab13, 4)
+check("T14 mask[0] (a) = 1", mask14[0] == 1)
+check("T14b mask[1] (b) = 0", mask14[1] == 0)
+check("T14c mask[2] (c) = 1", mask14[2] == 1)
+
+// T15: apply_mask blocks disallowed tokens
+let logits15 = [1.0, 2.0, 3.0, 4.0]
+let masked15 = gg_apply_mask(logits15, mask14)
+check("T15 allowed logit unchanged", fabs(masked15[0] - 1.0) < 0.01)
+check("T15b blocked logit is neg_inf", masked15[1] < -999999.0)
+
+// T16: apply_bias adds bonus/penalty
+let bias16 = gg_apply_bias(logits15, mask14, 10.0, -10.0)
+check("T16 allowed gets bonus", fabs(bias16[0] - 11.0) < 0.01)
+check("T16b blocked gets penalty", fabs(bias16[1] - (0.0 - 8.0)) < 0.01)
+
+// T17: json_schema string type
+let schema17 = #{"type": "string"}
+let g17 = gg_json_schema_to_grammar(schema17)
+let alts17 = gg_grammar_get(g17, "S")
+check("T17 string schema has 1 alt", len(alts17) == 1)
+check("T17b starts with QUOTE", alts17[0][0] == "QUOTE")
+
+// T18: json_schema boolean type has two alternatives
+let schema18 = #{"type": "boolean"}
+let g18 = gg_json_schema_to_grammar(schema18)
+let alts18 = gg_grammar_get(g18, "S")
+check("T18 boolean has 2 alts (TRUE/FALSE)", len(alts18) == 2)
+
+// T19: json_schema object type
+let schema19 = #{
+    "type": "object",
+    "properties": #{
+        "name": #{"type": "string"},
+        "age": #{"type": "number"}
+    }
+}
+let g19 = gg_json_schema_to_grammar(schema19)
+let alts19 = gg_grammar_get(g19, "S")
+check("T19 object schema S starts with LBRACE", alts19[0][0] == "LBRACE")
+// Should have PROPS nonterminal
+check("T19b S has PROPS", gg_is_nonterminal(g19, "PROPS"))
+
+// T20: json_schema array type
+let schema20 = #{
+    "type": "array",
+    "items": #{"type": "number"}
+}
+let g20 = gg_json_schema_to_grammar(schema20)
+let alts20 = gg_grammar_get(g20, "S")
+check("T20 array schema S starts with LBRACKET", alts20[0][0] == "LBRACKET")
+
+// T21: regex literal concatenation
+let g21 = gg_regex_to_grammar("abc")
+let alts21 = gg_grammar_get(g21, "S")
+check("T21 regex abc has 1 alt with 3 syms", len(alts21) == 1)
+check("T21b first sym is a", alts21[0][0] == "a")
+check("T21c third sym is c", alts21[0][2] == "c")
+
+// T22: regex alternation
+let g22 = gg_regex_to_grammar("a|b|c")
+let alts22 = gg_grammar_get(g22, "S")
+check("T22 regex a|b|c has 3 alts", len(alts22) == 3)
+
+// T23: regex char class [abc]
+let g23 = gg_regex_to_grammar("[abc]")
+// Should create a char class nonterminal CC_0 with 3 alternatives
+check("T23 regex [abc] has CC_0", gg_is_nonterminal(g23, "CC_0"))
+let cc_alts = gg_grammar_get(g23, "CC_0")
+check("T23b CC_0 has 3 alts", len(cc_alts) == 3)
+
+// T24: regex optional (?)
+let g24 = gg_regex_to_grammar("a?")
+// Should have OPT_0 nonterminal with 2 alternatives (a, EMPTY)
+check("T24 regex a? has OPT_0", gg_is_nonterminal(g24, "OPT_0"))
+let opt_alts = gg_grammar_get(g24, "OPT_0")
+check("T24b OPT_0 has 2 alts", len(opt_alts) == 2)
+
+// T25: regex star (*)
+let g25 = gg_regex_to_grammar("a*")
+check("T25 regex a* has STAR_0", gg_is_nonterminal(g25, "STAR_0"))
+let star_alts = gg_grammar_get(g25, "STAR_0")
+check("T25b STAR_0 has 2 alts (recursive + empty)", len(star_alts) == 2)
+
+// T26: regex plus (+)
+let g26 = gg_regex_to_grammar("a+")
+check("T26 regex a+ has PLUS_0", gg_is_nonterminal(g26, "PLUS_0"))
+let plus_alts = gg_grammar_get(g26, "PLUS_0")
+check("T26b PLUS_0 has 2 alts (single + recursive)", len(plus_alts) == 2)
+
+// T27: init_state creates stacks from start
+// Grammar: S -> a b | c
+let g27 = gg_parse_grammar("S -> a b | c")
+let state27 = gg_init_state(g27)
+check("T27 init_state has 2 stacks", len(state27) == 2)
+
+// T28: advance consumes matching token
+// Grammar: S -> x y
+let g28 = gg_parse_grammar("S -> x y")
+let state28 = gg_init_state(g28)
+let after28 = gg_advance(g28, state28, "x")
+check("T28 advance with x succeeds", len(after28) > 0)
+// After consuming x, next should be y
+let valid28 = gg_get_valid_tokens(g28, after28)
+let mut has_y = false
+for i in 0..len(valid28) { if valid28[i] == "y" { has_y = true } }
+check("T28b after x, y is valid", has_y)
+
+// T29: advance rejects wrong token
+let bad29 = gg_advance(g28, state28, "z")
+check("T29 advance with z fails (empty stacks)", len(bad29) == 0)
+
+// T30: validate_sequence accepts valid
+let g30 = gg_parse_grammar("S -> hello world")
+check("T30 validate hello world = true", gg_validate_sequence(g30, ["hello", "world"]))
+
+// T31: validate_sequence rejects invalid
+check("T31 validate hello foo = false", !gg_validate_sequence(g30, ["hello", "foo"]))
+
+// T32: choices_to_grammar creates alternatives
+let choices32 = [["yes"], ["no"], ["maybe"]]
+let g32 = gg_choices_to_grammar(choices32)
+let alts32 = gg_grammar_get(g32, "S")
+check("T32 choices grammar has 3 alts", len(alts32) == 3)
+
+// T33: validate_choice matches correct choice
+check("T33 validate_choice yes = true", gg_validate_choice(["yes"], choices32))
+check("T33b validate_choice nope = false", !gg_validate_choice(["nope"], choices32))
+
+// T34: constrained generation respects grammar
+// Grammar: S -> a b | a c
+// Vocab: [a, b, c, d]
+// Mock logits that prefer d (index 3) but grammar should force a then b or c
+let g34 = gg_parse_grammar("S -> a b | a c")
+let vocab34 = ["a", "b", "c", "d"]
+
+fn mock_logits_34(step) {
+    // Prefer d (idx=3), then c (idx=2), then b (idx=1), then a (idx=0)
+    return [0.1, 0.2, 0.3, 5.0]
+}
+
+let result34 = gg_generate_constrained(mock_logits_34, vocab34, g34, 10)
+let gen_names34 = result34["names"]
+check("T34 constrained gen starts with a", gen_names34[0] == "a")
+// Second token must be b or c (not d)
+let second34 = gen_names34[1]
+check("T34b second token is b or c (not d)", second34 == "b" || second34 == "c")
+// Must be exactly 2 tokens
+check("T34c exactly 2 tokens generated", len(gen_names34) == 2)
+
+// T35: beam search produces valid sequence
+let result35 = gg_beam_search(mock_logits_34, vocab34, g34, 10, 3)
+let beam_names35 = result35["names"]
+check("T35 beam search produces valid seq", len(beam_names35) == 2)
+check("T35b beam starts with a", beam_names35[0] == "a")
+let beam_second = beam_names35[1]
+check("T35c beam second is b or c", beam_second == "b" || beam_second == "c")
+
+// ===================================================================
+println("")
+println("=== guided_generation test summary ===")
+println("PASS: " + str(pass_count))
+println("FAIL: " + str(fail_count))
+println("TOTAL: " + str(pass_count + fail_count))

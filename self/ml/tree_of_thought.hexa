@@ -1,0 +1,616 @@
+// ===================================================================
+//  self/ml/tree_of_thought.hexa — Tree of Thought (Yao et al. 2023)
+//
+//  Structured reasoning with BFS/DFS exploration of thought trees.
+//  Each node represents a reasoning step; the tree is explored via
+//  breadth-first or depth-first search with pruning and backtracking.
+//
+//  Public API:
+//    tot_make_node(id, parent_id, depth, state, thought, score)
+//    tot_make_tree(root_state)
+//    tot_add_child(tree, parent_id, state, thought, score)
+//    tot_get_node(tree, node_id)
+//    tot_get_children(tree, node_id)
+//    tot_evaluate_node(node, eval_fn)
+//    tot_vote_evaluate(node, eval_fns)
+//    tot_generate_thoughts(state, gen_fn, k)
+//    tot_prune_topk(nodes, k)
+//    tot_bfs(tree, gen_fn, eval_fn, max_depth, beam_width)
+//    tot_dfs(tree, gen_fn, eval_fn, max_depth, budget)
+//    tot_extract_path(tree, node_id)
+//    tot_best_leaf(tree)
+//    tot_budget_check(budget, used)
+//    tot_is_dead_end(node, threshold)
+//    tot_multi_step(tree, gen_fn, eval_fn, steps, beam)
+//    tot_backtrack(tree, node_id)
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+//    @hot   — inner-loop calls
+// ===================================================================
+
+// ===================================================================
+//  Helpers
+// ===================================================================
+
+fn tot_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn tot_max_float(a, b) {
+    if a >= b { return a }
+    return b
+}
+
+fn tot_min_int(a, b) {
+    if a <= b { return a }
+    return b
+}
+
+// ===================================================================
+//  Thought Node
+//
+//  Each node stores:
+//    id        — unique integer
+//    parent_id — parent node id (-1 for root)
+//    depth     — distance from root
+//    state     — problem state at this point (array of ints)
+//    thought   — description of the reasoning step (string)
+//    score     — evaluation score (float, higher = better)
+//    children  — array of child node ids
+// ===================================================================
+
+struct ThoughtNode {
+    id: int,
+    parent_id: int,
+    depth: int,
+    state: array,
+    thought: string,
+    score: float,
+    children: array
+}
+
+@pure
+fn tot_make_node(id, parent_id, depth, state, thought, score) {
+    return ThoughtNode {
+        id: id,
+        parent_id: parent_id,
+        depth: depth,
+        state: state,
+        thought: thought,
+        score: score,
+        children: []
+    }
+}
+
+// ===================================================================
+//  Thought Tree
+//
+//  The tree is stored as a flat array of ThoughtNode.
+//  tree.nodes[0] is always the root.
+//  tree.next_id tracks the next available node id.
+// ===================================================================
+
+struct ThoughtTree {
+    nodes: array,
+    next_id: int
+}
+
+fn tot_make_tree(root_state) {
+    let root = tot_make_node(0, -1, 0, root_state, "root", 0.0)
+    return ThoughtTree {
+        nodes: [root],
+        next_id: 1
+    }
+}
+
+// ===================================================================
+//  Node access
+// ===================================================================
+
+@pure @hot
+fn tot_get_node(tree, node_id) {
+    return tree.nodes[node_id]
+}
+
+@pure
+fn tot_get_children(tree, node_id) {
+    let node = tree.nodes[node_id]
+    let mut result = []
+    for i in 0..len(node.children) {
+        let cid = node.children[i]
+        result = result + [tree.nodes[cid]]
+    }
+    return result
+}
+
+fn tot_node_count(tree) {
+    return len(tree.nodes)
+}
+
+// ===================================================================
+//  Add child to tree
+//
+//  Creates a new node, appends it to the flat store, and updates
+//  the parent's children list.  Returns [updated_tree, new_node_id].
+// ===================================================================
+
+fn tot_add_child(tree, parent_id, state, thought, score) {
+    let nid = tree.next_id
+    let parent = tree.nodes[parent_id]
+    let child = tot_make_node(nid, parent_id, parent.depth + 1, state, thought, score)
+
+    // rebuild nodes array with child appended
+    let mut new_nodes = []
+    for i in 0..len(tree.nodes) {
+        if i == parent_id {
+            // update parent's children list
+            let p = tree.nodes[i]
+            let updated_parent = ThoughtNode {
+                id: p.id,
+                parent_id: p.parent_id,
+                depth: p.depth,
+                state: p.state,
+                thought: p.thought,
+                score: p.score,
+                children: p.children + [nid]
+            }
+            new_nodes = new_nodes + [updated_parent]
+        } else {
+            new_nodes = new_nodes + [tree.nodes[i]]
+        }
+    }
+    new_nodes = new_nodes + [child]
+
+    let new_tree = ThoughtTree {
+        nodes: new_nodes,
+        next_id: nid + 1
+    }
+    return [new_tree, nid]
+}
+
+// ===================================================================
+//  Evaluator — score a thought node
+//
+//  eval_fn(state) -> float   (value function)
+//  Scores the node and returns an updated node with the new score.
+// ===================================================================
+
+@pure
+fn tot_evaluate_node(node, eval_fn) {
+    let s = eval_fn(node.state)
+    return ThoughtNode {
+        id: node.id,
+        parent_id: node.parent_id,
+        depth: node.depth,
+        state: node.state,
+        thought: node.thought,
+        score: s,
+        children: node.children
+    }
+}
+
+// ===================================================================
+//  Vote-based Evaluator
+//
+//  Multiple evaluators vote; the final score is the average.
+//  eval_fns is an array of functions, each: state -> float
+// ===================================================================
+
+@pure
+fn tot_vote_evaluate(node, eval_fns) {
+    let n = len(eval_fns)
+    if n == 0 { return node }
+    let mut total = 0.0
+    for i in 0..n {
+        let f = eval_fns[i]
+        total = total + f(node.state)
+    }
+    let avg = total / to_float(n)
+    return ThoughtNode {
+        id: node.id,
+        parent_id: node.parent_id,
+        depth: node.depth,
+        state: node.state,
+        thought: node.thought,
+        score: avg,
+        children: node.children
+    }
+}
+
+// ===================================================================
+//  Thought Generator
+//
+//  gen_fn(state) -> array of [state, thought_text, score] triples
+//  Produces k candidate next thoughts from the current state.
+// ===================================================================
+
+@pure
+fn tot_generate_thoughts(state, gen_fn, k) {
+    let all = gen_fn(state)
+    let n = len(all)
+    let limit = tot_min_int(k, n)
+    let mut result = []
+    for i in 0..limit {
+        result = result + [all[i]]
+    }
+    return result
+}
+
+// ===================================================================
+//  Pruning — keep only top-k nodes by score (beam search style)
+//
+//  Uses simple selection: repeatedly find and extract the max.
+// ===================================================================
+
+@pure
+fn tot_prune_topk(nodes, k) {
+    let n = len(nodes)
+    if n <= k { return nodes }
+
+    // Build (score, index) pairs and sort by score descending
+    let mut selected = []
+    let mut used = []
+    for _i in 0..n {
+        used = used + [0]
+    }
+
+    let limit = tot_min_int(k, n)
+    for _step in 0..limit {
+        let mut best_idx = -1
+        let mut best_score = -999999.0
+        for j in 0..n {
+            if used[j] == 0 {
+                if nodes[j].score > best_score {
+                    best_score = nodes[j].score
+                    best_idx = j
+                }
+            }
+        }
+        if best_idx >= 0 {
+            used[best_idx] = 1
+            selected = selected + [nodes[best_idx]]
+        }
+    }
+    return selected
+}
+
+// ===================================================================
+//  Dead end detection
+//
+//  A node is a dead end if its score is below the threshold.
+// ===================================================================
+
+@pure
+fn tot_is_dead_end(node, threshold) {
+    return node.score < threshold
+}
+
+// ===================================================================
+//  Budget controller
+//
+//  Returns true if we still have budget remaining.
+// ===================================================================
+
+@pure
+fn tot_budget_check(budget, used) {
+    return used < budget
+}
+
+// ===================================================================
+//  Backtracking — return to parent node
+//
+//  Given a node_id, returns the parent node (or the node itself
+//  if it is the root).
+// ===================================================================
+
+@pure
+fn tot_backtrack(tree, node_id) {
+    let node = tree.nodes[node_id]
+    if node.parent_id < 0 { return node }
+    return tree.nodes[node.parent_id]
+}
+
+// ===================================================================
+//  Solution Path Extraction
+//
+//  Trace the path from a given node back to the root.
+//  Returns array of node ids from root to the given node.
+// ===================================================================
+
+@pure
+fn tot_extract_path(tree, node_id) {
+    let mut path = []
+    let mut cur = node_id
+    // Walk up to root collecting ids
+    let mut steps = 0
+    let max_steps = len(tree.nodes) + 1
+    while cur >= 0 {
+        if steps >= max_steps { break }
+        path = path + [cur]
+        let node = tree.nodes[cur]
+        cur = node.parent_id
+        steps = steps + 1
+    }
+    // Reverse the path (root first)
+    let n = len(path)
+    let mut reversed = []
+    for i in 0..n {
+        reversed = reversed + [path[n - 1 - i]]
+    }
+    return reversed
+}
+
+// ===================================================================
+//  Best Leaf — find the leaf node with the highest score
+//
+//  A leaf is a node with no children.
+// ===================================================================
+
+@pure
+fn tot_best_leaf(tree) {
+    let n = len(tree.nodes)
+    let mut best_id = 0
+    let mut best_score = -999999.0
+    for i in 0..n {
+        let node = tree.nodes[i]
+        if len(node.children) == 0 {
+            if node.score > best_score {
+                best_score = node.score
+                best_id = i
+            }
+        }
+    }
+    return tree.nodes[best_id]
+}
+
+// ===================================================================
+//  BFS Expansion — Breadth-First Search
+//
+//  At each depth level:
+//    1. Generate candidate thoughts for each frontier node
+//    2. Evaluate candidates
+//    3. Prune to beam_width best nodes
+//  Continues until max_depth is reached.
+//
+//  Returns the updated tree.
+// ===================================================================
+
+fn tot_bfs(tree, gen_fn, eval_fn, max_depth, beam_width) {
+    let mut t = tree
+    // frontier starts as just the root
+    let mut frontier = [0]
+
+    for _d in 0..max_depth {
+        let mut candidates = []
+        let mut candidate_parents = []
+
+        // generate children for each frontier node
+        for fi in 0..len(frontier) {
+            let pid = frontier[fi]
+            let parent = tot_get_node(t, pid)
+            let thoughts = tot_generate_thoughts(parent.state, gen_fn, beam_width)
+            for ti in 0..len(thoughts) {
+                let triple = thoughts[ti]
+                // triple = [state, thought_text, score]
+                candidates = candidates + [triple]
+                candidate_parents = candidate_parents + [pid]
+            }
+        }
+
+        if len(candidates) == 0 { break }
+
+        // Evaluate and sort candidates — pick top beam_width
+        // Build scored list: [score, index]
+        let mut scored = []
+        for ci in 0..len(candidates) {
+            let cand = candidates[ci]
+            let s = eval_fn(cand[0])
+            scored = scored + [s]
+        }
+
+        // Select top-k indices
+        let nc = len(candidates)
+        let limit = tot_min_int(beam_width, nc)
+        let mut used = []
+        for _i in 0..nc {
+            used = used + [0]
+        }
+
+        let mut new_frontier = []
+        for _step in 0..limit {
+            let mut best_idx = -1
+            let mut best_s = -999999.0
+            for j in 0..nc {
+                if used[j] == 0 {
+                    if scored[j] > best_s {
+                        best_s = scored[j]
+                        best_idx = j
+                    }
+                }
+            }
+            if best_idx < 0 { break }
+            used[best_idx] = 1
+
+            let cand = candidates[best_idx]
+            let pid = candidate_parents[best_idx]
+            let result = tot_add_child(t, pid, cand[0], cand[1], best_s)
+            t = result[0]
+            let nid = result[1]
+            new_frontier = new_frontier + [nid]
+        }
+
+        frontier = new_frontier
+    }
+    return t
+}
+
+// ===================================================================
+//  DFS Expansion — Depth-First Search with backtracking
+//
+//  Explores one branch at a time to max_depth.
+//  Uses a stack (array). Backtracks when dead end or max depth.
+//  Stops after `budget` node expansions.
+//
+//  Returns the updated tree.
+// ===================================================================
+
+fn tot_dfs(tree, gen_fn, eval_fn, max_depth, budget) {
+    let mut t = tree
+    let mut stack = [0]
+    let mut used_budget = 0
+
+    while len(stack) > 0 {
+        if used_budget >= budget { break }
+
+        // Pop from stack
+        let top = stack[len(stack) - 1]
+        let mut new_stack = []
+        for si in 0..(len(stack) - 1) {
+            new_stack = new_stack + [stack[si]]
+        }
+        stack = new_stack
+
+        let node = tot_get_node(t, top)
+
+        // Don't expand beyond max depth
+        if node.depth >= max_depth { continue }
+
+        // Generate children
+        let thoughts = tot_generate_thoughts(node.state, gen_fn, 3)
+        for ti in 0..len(thoughts) {
+            if used_budget >= budget { break }
+            let triple = thoughts[ti]
+            let s = eval_fn(triple[0])
+            let result = tot_add_child(t, top, triple[0], triple[1], s)
+            t = result[0]
+            let nid = result[1]
+            used_budget = used_budget + 1
+
+            // Only push to stack if not a dead end
+            if s >= 0.0 {
+                stack = stack + [nid]
+            }
+        }
+    }
+    return t
+}
+
+// ===================================================================
+//  Multi-step Reasoning
+//
+//  Run BFS for a given number of steps, chaining thought across
+//  multiple rounds. Each step deepens the tree by one level.
+//  Returns the final tree.
+// ===================================================================
+
+fn tot_multi_step(tree, gen_fn, eval_fn, steps, beam) {
+    let mut t = tree
+    // Run BFS one level at a time for `steps` iterations
+    for _s in 0..steps {
+        // Find current leaves (frontier)
+        let n = len(t.nodes)
+        let mut frontier = []
+        for i in 0..n {
+            let node = t.nodes[i]
+            if len(node.children) == 0 {
+                frontier = frontier + [i]
+            }
+        }
+
+        if len(frontier) == 0 { break }
+
+        // Prune frontier to beam width by score
+        let mut frontier_nodes = []
+        for fi in 0..len(frontier) {
+            frontier_nodes = frontier_nodes + [t.nodes[frontier[fi]]]
+        }
+        let pruned = tot_prune_topk(frontier_nodes, beam)
+
+        // Expand each pruned frontier node
+        for pi in 0..len(pruned) {
+            let pnode = pruned[pi]
+            let thoughts = tot_generate_thoughts(pnode.state, gen_fn, beam)
+            for ti in 0..len(thoughts) {
+                let triple = thoughts[ti]
+                let s = eval_fn(triple[0])
+                let result = tot_add_child(t, pnode.id, triple[0], triple[1], s)
+                t = result[0]
+            }
+        }
+    }
+    return t
+}
+
+// ===================================================================
+//  Update node score in tree
+//
+//  Returns a new tree with the node's score updated.
+// ===================================================================
+
+fn tot_update_score(tree, node_id, new_score) {
+    let mut new_nodes = []
+    for i in 0..len(tree.nodes) {
+        if i == node_id {
+            let old = tree.nodes[i]
+            let updated = ThoughtNode {
+                id: old.id,
+                parent_id: old.parent_id,
+                depth: old.depth,
+                state: old.state,
+                thought: old.thought,
+                score: new_score,
+                children: old.children
+            }
+            new_nodes = new_nodes + [updated]
+        } else {
+            new_nodes = new_nodes + [tree.nodes[i]]
+        }
+    }
+    return ThoughtTree {
+        nodes: new_nodes,
+        next_id: tree.next_id
+    }
+}
+
+// ===================================================================
+//  Tree statistics
+// ===================================================================
+
+@pure
+fn tot_max_depth(tree) {
+    let n = len(tree.nodes)
+    let mut mx = 0
+    for i in 0..n {
+        if tree.nodes[i].depth > mx {
+            mx = tree.nodes[i].depth
+        }
+    }
+    return mx
+}
+
+@pure
+fn tot_leaf_count(tree) {
+    let n = len(tree.nodes)
+    let mut count = 0
+    for i in 0..n {
+        if len(tree.nodes[i].children) == 0 {
+            count = count + 1
+        }
+    }
+    return count
+}
+
+@pure
+fn tot_avg_score(tree) {
+    let n = len(tree.nodes)
+    if n == 0 { return 0.0 }
+    let mut total = 0.0
+    for i in 0..n {
+        total = total + tree.nodes[i].score
+    }
+    return total / to_float(n)
+}
+
+println("[tree_of_thought] loaded — BFS/DFS exploration + pruning + backtracking + multi-step reasoning")

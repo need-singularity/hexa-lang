@@ -1,0 +1,704 @@
+// ===================================================================
+//  self/ml/aqlm.hexa — AQLM: Additive Quantization for LLMs (#141)
+//
+//  Implements Additive Quantization with codebooks for ultra-low-bit
+//  (2-bit effective) weight compression. Each weight vector is
+//  approximated as a sum of M codebook entries:
+//    w ≈ C1[i1] + C2[i2] + ... + CM[iM]
+//
+//  Reference: Egiazarian et al. 2024 "AQLM: Extreme Compression of
+//  LLMs via Additive Quantization"
+//
+//  Components:
+//    1. Codebook initialization   — M codebooks of K entries, d-dim
+//    2. Beam search quantization  — find best code combos (beam width B)
+//    3. Additive codes            — weight ≈ sum of codebook entries
+//    4. Residual coding           — encode residual after each codebook
+//    5. Codebook lookup           — fast decode from code indices
+//    6. Dequantize                — reconstruct full weight matrix
+//    7. Fine-tune codebooks       — optimize codebooks post-quantization
+//    8. Memory estimator          — compute memory savings vs FP32
+//
+//  API:
+//    aqlm_init_codebooks(M, K, d, seed)
+//    aqlm_quantize_vector(w, codebooks, beam_width)
+//    aqlm_quantize_matrix(W, rows, cols, codebooks, beam_width)
+//    aqlm_residual_encode(w, codebooks)
+//    aqlm_lookup(codebooks, codes)
+//    aqlm_dequantize(qt)
+//    aqlm_finetune_codebooks(W, rows, cols, qt, lr, steps)
+//    aqlm_memory_estimate(rows, cols, M, K, d)
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+//    @hot   — called during inference
+// ===================================================================
+
+// ── Math helpers ─────────────────────────────────────────────────
+
+fn _aq_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn _aq_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn _aq_max(a, b) {
+    if a >= b { return a }
+    return b
+}
+
+fn _aq_min(a, b) {
+    if a <= b { return a }
+    return b
+}
+
+fn _aq_clamp(v, lo, hi) {
+    if v < lo { return lo }
+    if v > hi { return hi }
+    return v
+}
+
+fn _aq_log2(x) {
+    if x <= 0.0 { return 0.0 }
+    // Newton's method: log2(x) = ln(x) / ln(2)
+    // ln via series: ln(x) near 1 = (x-1) - (x-1)^2/2 + ...
+    // Use repeated halving for larger x
+    let mut v = x
+    let mut shift = 0.0
+    for _i in 0..30 {
+        if v >= 2.0 {
+            v = v / 2.0
+            shift = shift + 1.0
+        }
+    }
+    for _i in 0..30 {
+        if v < 1.0 {
+            v = v * 2.0
+            shift = shift - 1.0
+        }
+    }
+    // v is now in [1, 2), use series for ln(v)
+    let t = v - 1.0
+    let mut ln_v = 0.0
+    let mut term = t
+    for i in 1..20 {
+        if i % 2 == 1 {
+            ln_v = ln_v + term / to_float(i)
+        } else {
+            ln_v = ln_v - term / to_float(i)
+        }
+        term = term * t
+    }
+    let ln2 = 0.6931471805599453
+    return shift + ln_v / ln2
+}
+
+// ── Array helpers ────────────────────────────────────────────────
+
+fn _aq_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn _aq_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+fn _aq_fill(n, val) {
+    let mut v = []
+    for _i in 0..n { v = v + [val] }
+    return v
+}
+
+// Simple pseudo-random number generator (LCG)
+fn _aq_rand_seed(seed, idx) {
+    let mut h = (seed + 1) * 2654435761 + idx * 1315423911
+    h = h % 1000003
+    if h < 0 { h = 0 - h }
+    return to_float(h) / 1000003.0
+}
+
+// ===================================================================
+//  Structs
+// ===================================================================
+
+struct AQLMCodebook {
+    entries: array,     // flat: K * d floats
+    K: int,             // number of entries
+    d: int              // dimension per entry
+}
+
+struct AQLMCodes {
+    indices: array,     // flat: n_vectors * M ints (code index per codebook)
+    n_vectors: int,
+    M: int
+}
+
+struct AQLMTensor {
+    codebooks: array,   // array of AQLMCodebook
+    codes: array,       // AQLMCodes (for whole matrix)
+    rows: int,
+    cols: int,
+    M: int,
+    K: int,
+    d: int
+}
+
+// ===================================================================
+//  1. Codebook Initialization
+//
+//  Create M codebooks, each with K entries of dimension d.
+//  Initialize with scaled pseudo-random values for good spread.
+// ===================================================================
+@pure
+fn aqlm_init_codebooks(M, K, d, seed) {
+    let mut codebooks = []
+    for m in 0..M {
+        let mut entries = _aq_zeros(K * d)
+        for k in 0..K {
+            for j in 0..d {
+                let idx = k * d + j
+                // spread: centered around 0, range [-0.5, 0.5] scaled by 1/sqrt(M)
+                let r = _aq_rand_seed(seed + m * 1000 + k, j)
+                let scale = 1.0 / _aq_sqrt(to_float(M))
+                entries[idx] = (r - 0.5) * scale
+            }
+        }
+        let cb = AQLMCodebook { entries: entries, K: K, d: d }
+        codebooks = codebooks + [cb]
+    }
+    return codebooks
+}
+
+// Get entry k from codebook cb (returns d-dimensional vector)
+@pure
+fn aqlm_get_entry(cb, k) {
+    let mut entry = _aq_zeros(cb.d)
+    let base = k * cb.d
+    for j in 0..cb.d {
+        entry[j] = cb.entries[base + j]
+    }
+    return entry
+}
+
+// ===================================================================
+//  2. Beam Search Quantization
+//
+//  For a d-dimensional weight vector w, find the best combination
+//  of code indices (i1, i2, ..., iM) that minimizes:
+//    ||w - (C1[i1] + C2[i2] + ... + CM[iM])||^2
+//
+//  Uses beam search with width B to avoid exhaustive search over K^M.
+//  Each beam entry: (indices_so_far, partial_sum, cost)
+// ===================================================================
+
+// Compute squared L2 distance between two d-dimensional vectors
+@pure
+fn _aq_dist_sq(a, b, d) {
+    let mut s = 0.0
+    for j in 0..d {
+        let diff = a[j] - b[j]
+        s = s + diff * diff
+    }
+    return s
+}
+
+// Add two d-dimensional vectors
+@pure
+fn _aq_vec_add(a, b, d) {
+    let mut out = _aq_zeros(d)
+    for j in 0..d {
+        out[j] = a[j] + b[j]
+    }
+    return out
+}
+
+// Subtract two d-dimensional vectors: a - b
+@pure
+fn _aq_vec_sub(a, b, d) {
+    let mut out = _aq_zeros(d)
+    for j in 0..d {
+        out[j] = a[j] - b[j]
+    }
+    return out
+}
+
+// Beam search quantization for a single vector
+@pure
+fn aqlm_quantize_vector(w, codebooks, beam_width) {
+    let M = len(codebooks)
+    let d = codebooks[0].d
+    let K = codebooks[0].K
+
+    // Initial beam: single entry with zero partial sum
+    let mut beam_sums = [_aq_zeros(d)]
+    let mut beam_indices = [[]]
+    let mut beam_costs = [0.0]
+
+    for m in 0..M {
+        let cb = codebooks[m]
+        let n_beam = len(beam_costs)
+        let mut new_sums = []
+        let mut new_indices = []
+        let mut new_costs = []
+
+        for b in 0..n_beam {
+            let cur_sum = beam_sums[b]
+            let cur_idx = beam_indices[b]
+
+            for k in 0..K {
+                let entry = aqlm_get_entry(cb, k)
+                let candidate = _aq_vec_add(cur_sum, entry, d)
+                let cost = _aq_dist_sq(w, candidate, d)
+
+                new_sums = new_sums + [candidate]
+                new_indices = new_indices + [cur_idx + [k]]
+                new_costs = new_costs + [cost]
+            }
+        }
+
+        // Select top beam_width candidates (by lowest cost)
+        let n_cands = len(new_costs)
+        let actual_bw = _aq_min(beam_width, n_cands)
+
+        // Simple selection sort for top-B (small beam widths)
+        let mut selected = _aq_zeros_int(n_cands)
+        let mut sel_sums = []
+        let mut sel_indices = []
+        let mut sel_costs = []
+
+        for _s in 0..actual_bw {
+            let mut best_j = -1
+            let mut best_c = 1.0e30
+            for j in 0..n_cands {
+                if selected[j] == 0 {
+                    if new_costs[j] < best_c {
+                        best_c = new_costs[j]
+                        best_j = j
+                    }
+                }
+            }
+            if best_j >= 0 {
+                selected[best_j] = 1
+                sel_sums = sel_sums + [new_sums[best_j]]
+                sel_indices = sel_indices + [new_indices[best_j]]
+                sel_costs = sel_costs + [new_costs[best_j]]
+            }
+        }
+
+        beam_sums = sel_sums
+        beam_indices = sel_indices
+        beam_costs = sel_costs
+    }
+
+    // Return best (lowest cost) result
+    let mut best_idx = 0
+    let mut best_cost = beam_costs[0]
+    for i in 1..len(beam_costs) {
+        if beam_costs[i] < best_cost {
+            best_cost = beam_costs[i]
+            best_idx = i
+        }
+    }
+    return beam_indices[best_idx]
+}
+
+// ===================================================================
+//  3. Additive Codes — reconstruct from sum of codebook entries
+//
+//  Given code indices [i1, i2, ..., iM], compute:
+//    w_hat = C1[i1] + C2[i2] + ... + CM[iM]
+// ===================================================================
+@pure @hot
+fn aqlm_lookup(codebooks, codes) {
+    let M = len(codebooks)
+    let d = codebooks[0].d
+    let mut result = _aq_zeros(d)
+    for m in 0..M {
+        let entry = aqlm_get_entry(codebooks[m], codes[m])
+        for j in 0..d {
+            result[j] = result[j] + entry[j]
+        }
+    }
+    return result
+}
+
+// ===================================================================
+//  4. Residual Coding
+//
+//  For each codebook m, find the best entry to encode the residual
+//  after subtracting the sum of entries from codebooks 0..m-1.
+//  Greedy (beam_width=1) variant for fast encoding.
+// ===================================================================
+@pure
+fn aqlm_residual_encode(w, codebooks) {
+    let M = len(codebooks)
+    let d = codebooks[0].d
+    let mut residual = _aq_zeros(d)
+    for j in 0..d {
+        residual[j] = w[j]
+    }
+    let mut codes = []
+
+    for m in 0..M {
+        let cb = codebooks[m]
+        let mut best_k = 0
+        let mut best_dist = 1.0e30
+
+        for k in 0..cb.K {
+            let entry = aqlm_get_entry(cb, k)
+            let dist = _aq_dist_sq(residual, entry, d)
+            if dist < best_dist {
+                best_dist = dist
+                best_k = k
+            }
+        }
+
+        codes = codes + [best_k]
+        // Update residual: subtract chosen entry
+        let chosen = aqlm_get_entry(cb, best_k)
+        for j in 0..d {
+            residual[j] = residual[j] - chosen[j]
+        }
+    }
+    return codes
+}
+
+// ===================================================================
+//  5. Quantize entire weight matrix
+//
+//  W: flat row-major [rows * cols], organized as rows vectors of
+//  dimension d = cols / group_size (or cols if no grouping).
+//  For simplicity, we treat each contiguous d-element sub-vector.
+//
+//  Returns AQLMTensor
+// ===================================================================
+@pure
+fn aqlm_quantize_matrix(W, rows, cols, codebooks, beam_width) {
+    let M = len(codebooks)
+    let K = codebooks[0].K
+    let d = codebooks[0].d
+
+    // Number of d-element vectors per row
+    let vecs_per_row = cols / d
+    let n_vectors = rows * vecs_per_row
+
+    let mut all_indices = []
+
+    for r in 0..rows {
+        for v in 0..vecs_per_row {
+            // Extract sub-vector
+            let mut w = _aq_zeros(d)
+            let base = r * cols + v * d
+            for j in 0..d {
+                w[j] = W[base + j]
+            }
+            // Quantize this sub-vector
+            let codes = aqlm_quantize_vector(w, codebooks, beam_width)
+            for m in 0..M {
+                all_indices = all_indices + [codes[m]]
+            }
+        }
+    }
+
+    let qt = AQLMTensor {
+        codebooks: codebooks,
+        codes: all_indices,
+        rows: rows,
+        cols: cols,
+        M: M,
+        K: K,
+        d: d
+    }
+    return qt
+}
+
+// ===================================================================
+//  6. Dequantize — reconstruct full weight matrix from codes
+// ===================================================================
+@pure @hot
+fn aqlm_dequantize(qt) {
+    let rows = qt.rows
+    let cols = qt.cols
+    let M = qt.M
+    let d = qt.d
+    let vecs_per_row = cols / d
+
+    let mut W_hat = _aq_zeros(rows * cols)
+
+    for r in 0..rows {
+        for v in 0..vecs_per_row {
+            let vec_idx = r * vecs_per_row + v
+            // Gather M codes for this vector
+            let mut codes = _aq_zeros_int(M)
+            for m in 0..M {
+                codes[m] = qt.codes[vec_idx * M + m]
+            }
+            // Lookup and sum
+            let reconstructed = aqlm_lookup(qt.codebooks, codes)
+            let base = r * cols + v * d
+            for j in 0..d {
+                W_hat[base + j] = reconstructed[j]
+            }
+        }
+    }
+    return W_hat
+}
+
+// ===================================================================
+//  7. Fine-tune Codebooks
+//
+//  After initial quantization, optimize codebook entries to reduce
+//  reconstruction error. For each step:
+//    - For each vector, compute gradient of ||w - sum(entries)||^2
+//      w.r.t. each active codebook entry
+//    - Update entries via gradient descent
+//
+//  Returns updated codebooks (new array)
+// ===================================================================
+@pure
+fn aqlm_finetune_codebooks(W, rows, cols, qt, lr, steps) {
+    let M = qt.M
+    let K = qt.K
+    let d = qt.d
+    let vecs_per_row = cols / d
+    let n_vectors = rows * vecs_per_row
+
+    // Deep copy codebooks
+    let mut codebooks = []
+    for m in 0..M {
+        let old_cb = qt.codebooks[m]
+        let mut new_entries = _aq_zeros(K * d)
+        for i in 0..(K * d) {
+            new_entries[i] = old_cb.entries[i]
+        }
+        let cb = AQLMCodebook { entries: new_entries, K: K, d: d }
+        codebooks = codebooks + [cb]
+    }
+
+    for _step in 0..steps {
+        // Accumulate gradients per codebook entry
+        let mut grads = []
+        let mut counts = []
+        for m in 0..M {
+            grads = grads + [_aq_zeros(K * d)]
+            counts = counts + [_aq_zeros_int(K)]
+        }
+
+        for vi in 0..n_vectors {
+            // Get original weight sub-vector
+            let row = vi / vecs_per_row
+            let v = vi % vecs_per_row
+            let base = row * cols + v * d
+
+            let mut w = _aq_zeros(d)
+            for j in 0..d {
+                w[j] = W[base + j]
+            }
+
+            // Get codes for this vector
+            let mut codes = _aq_zeros_int(M)
+            for m in 0..M {
+                codes[m] = qt.codes[vi * M + m]
+            }
+
+            // Compute reconstruction
+            let w_hat = aqlm_lookup(codebooks, codes)
+
+            // Gradient for each active entry: -2 * (w - w_hat)
+            // We use the negative gradient direction (descent)
+            for m in 0..M {
+                let k = codes[m]
+                let g = grads[m]
+                let c = counts[m]
+                for j in 0..d {
+                    let grad_j = -2.0 * (w[j] - w_hat[j])
+                    g[k * d + j] = g[k * d + j] + grad_j
+                }
+                c[k] = c[k] + 1
+            }
+        }
+
+        // Update codebook entries
+        for m in 0..M {
+            let cb = codebooks[m]
+            let g = grads[m]
+            let c = counts[m]
+            for k in 0..K {
+                if c[k] > 0 {
+                    let scale = lr / to_float(c[k])
+                    for j in 0..d {
+                        let idx = k * d + j
+                        cb.entries[idx] = cb.entries[idx] - scale * g[idx]
+                    }
+                }
+            }
+        }
+    }
+
+    return codebooks
+}
+
+// ===================================================================
+//  8. Memory Estimator
+//
+//  Compute memory usage and compression ratio for AQLM vs FP32.
+//
+//  AQLM storage:
+//    - Codebooks: M * K * d * 32 bits (FP32 entries)
+//    - Codes:     n_vectors * M * ceil(log2(K)) bits
+//  FP32 storage:
+//    - rows * cols * 32 bits
+//
+//  Returns: [fp32_bytes, aqlm_bytes, compression_ratio, bits_per_weight]
+// ===================================================================
+@pure
+fn aqlm_memory_estimate(rows, cols, M, K, d) {
+    let fp32_bytes = rows * cols * 4
+
+    // Codebook storage: M codebooks * K entries * d floats * 4 bytes
+    let codebook_bytes = M * K * d * 4
+
+    // Number of sub-vectors
+    let n_vectors = (rows * cols) / d
+
+    // Bits per code index: ceil(log2(K))
+    let bits_per_code = _aq_max(1.0, _aq_log2(to_float(K)))
+    let mut bits_ceil = to_int(bits_per_code)
+    if to_float(bits_ceil) < bits_per_code {
+        bits_ceil = bits_ceil + 1
+    }
+
+    // Code storage: n_vectors * M codes * bits_per_code
+    let code_bits = n_vectors * M * bits_ceil
+    let code_bytes = (code_bits + 7) / 8
+
+    let aqlm_bytes = codebook_bytes + code_bytes
+
+    let mut compression_ratio = 0.0
+    if aqlm_bytes > 0 {
+        compression_ratio = to_float(fp32_bytes) / to_float(aqlm_bytes)
+    }
+
+    // Effective bits per weight
+    let total_bits = codebook_bytes * 8 + code_bits
+    let mut bits_per_weight = 0.0
+    if rows * cols > 0 {
+        bits_per_weight = to_float(total_bits) / to_float(rows * cols)
+    }
+
+    return [fp32_bytes, aqlm_bytes, compression_ratio, bits_per_weight]
+}
+
+// ===================================================================
+//  Error Statistics
+//
+//  Compute reconstruction error metrics.
+//  Returns: [mse, max_err, snr_db]
+// ===================================================================
+@pure
+fn aqlm_error_stats(W, W_hat, n) {
+    let mut sum_sq_err = 0.0
+    let mut max_err = 0.0
+    let mut sum_sq_orig = 0.0
+
+    for i in 0..n {
+        let err = _aq_abs(W[i] - W_hat[i])
+        sum_sq_err = sum_sq_err + err * err
+        if err > max_err { max_err = err }
+        sum_sq_orig = sum_sq_orig + W[i] * W[i]
+    }
+
+    let mse = sum_sq_err / to_float(n)
+    let mut snr = 0.0
+    if sum_sq_err > 1.0e-15 {
+        snr = 10.0 * _aq_log2(sum_sq_orig / sum_sq_err) / _aq_log2(10.0)
+    }
+
+    return [mse, max_err, snr]
+}
+
+// ===================================================================
+//  Batch residual encode (for convenience)
+// ===================================================================
+@pure
+fn aqlm_residual_encode_matrix(W, rows, cols, codebooks) {
+    let M = len(codebooks)
+    let d = codebooks[0].d
+    let vecs_per_row = cols / d
+    let mut all_indices = []
+
+    for r in 0..rows {
+        for v in 0..vecs_per_row {
+            let mut w = _aq_zeros(d)
+            let base = r * cols + v * d
+            for j in 0..d {
+                w[j] = W[base + j]
+            }
+            let codes = aqlm_residual_encode(w, codebooks)
+            for m in 0..M {
+                all_indices = all_indices + [codes[m]]
+            }
+        }
+    }
+
+    let qt = AQLMTensor {
+        codebooks: codebooks,
+        codes: all_indices,
+        rows: rows,
+        cols: cols,
+        M: M,
+        K: codebooks[0].K,
+        d: d
+    }
+    return qt
+}
+
+// ===================================================================
+//  Forward pass: y = dequantized_W * x (matrix-vector multiply)
+//
+//  x: [cols] input vector
+//  Returns: [rows] output vector
+// ===================================================================
+@pure @hot
+fn aqlm_forward(qt, x) {
+    let rows = qt.rows
+    let cols = qt.cols
+    let M = qt.M
+    let d = qt.d
+    let vecs_per_row = cols / d
+
+    let mut y = _aq_zeros(rows)
+
+    for r in 0..rows {
+        let mut dot = 0.0
+        for v in 0..vecs_per_row {
+            let vec_idx = r * vecs_per_row + v
+            let mut codes = _aq_zeros_int(M)
+            for m in 0..M {
+                codes[m] = qt.codes[vec_idx * M + m]
+            }
+            let reconstructed = aqlm_lookup(qt.codebooks, codes)
+            let x_base = v * d
+            for j in 0..d {
+                dot = dot + reconstructed[j] * x[x_base + j]
+            }
+        }
+        y[r] = dot
+    }
+    return y
+}
+
+println("[aqlm] loaded — additive codebook quantization 2-bit LLM")

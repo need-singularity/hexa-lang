@@ -1,0 +1,813 @@
+// ═══════════════════════════════════════════════════════════════
+//  adalora.hexa — AdaLoRA: SVD-based Rank-Adaptive LoRA
+//
+//  Ref:  Zhang et al. 2023 — "AdaLoRA: Adaptive Budget Allocation
+//        for Parameter-Efficient Fine-Tuning"
+//
+//  Core idea — reparametrize LoRA with SVD decomposition:
+//    delta_W = P * diag(Lambda) * Q
+//    where P [d x r]       — left singular vectors (trainable)
+//          Lambda [r]      — singular values (trainable)
+//          Q [r x k]       — right singular vectors (trainable)
+//
+//  Key innovations over standard LoRA:
+//    1. SVD parametrization allows pruning individual singular
+//       values (and their vectors) to reduce rank adaptively
+//    2. Importance scoring: sensitivity-based metric for each
+//       singular triplet (p_i, lambda_i, q_i)
+//    3. Global budget controller: total parameter budget across
+//       all layers, allocated by importance
+//    4. Pruning schedule: cubic schedule that gradually reduces
+//       less important ranks during training
+//    5. Orthogonal regularization: keeps P^T P ~ I and Q Q^T ~ I
+//
+//  AI-NATIVE:
+//    @pure    — math kernels
+//    @hot     — forward / train inner loop
+//
+//  Pitfalls honored (HX3):
+//    - no semicolons
+//    - no complex-index-assignment
+//    - struct fields via rebuild
+// ═══════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 1: Core math helpers
+// ═══════════════════════════════════════════════════════════════
+
+fn ada_zeros1(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn ada_zeros2(rows, cols) {
+    let mut r = []
+    for _i in 0..rows { r = r + [ada_zeros1(cols)] }
+    return r
+}
+
+fn ada_ones1(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [1.0] }
+    return v
+}
+
+fn ada_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// deterministic LCG init (Kaiming-like)
+fn ada_kaiming(rows, cols, seed) {
+    let mut s = seed
+    let scale = 1.0 / sqrt(to_float(cols))
+    let mut r = []
+    for _i in 0..rows {
+        let mut row = []
+        for _j in 0..cols {
+            s = (s * 1103515245 + 12345) % 2147483647
+            let v = (to_float(s % 2000) - 1000.0) / 1000.0 * scale
+            row = row + [v]
+        }
+        r = r + [row]
+    }
+    return r
+}
+
+// deterministic orthogonal-ish init via Gram-Schmidt
+fn ada_ortho_init(rows, cols, seed) {
+    let raw = ada_kaiming(rows, cols, seed)
+    // Gram-Schmidt on rows (make row vectors orthogonal)
+    let mut result = []
+    for i in 0..rows {
+        let mut v = []
+        for j in 0..cols { v = v + [raw[i][j]] }
+        // subtract projections onto previous rows
+        for k in 0..i {
+            let mut dot_vr = 0.0
+            let mut dot_rr = 0.0
+            for j in 0..cols {
+                dot_vr = dot_vr + v[j] * result[k][j]
+                dot_rr = dot_rr + result[k][j] * result[k][j]
+            }
+            if dot_rr > 1.0e-12 {
+                let scale = dot_vr / dot_rr
+                let mut v2 = []
+                for j in 0..cols {
+                    v2 = v2 + [v[j] - scale * result[k][j]]
+                }
+                v = v2
+            }
+        }
+        // normalize
+        let mut norm = 0.0
+        for j in 0..cols { norm = norm + v[j] * v[j] }
+        norm = sqrt(norm + 1.0e-12)
+        let mut normed = []
+        for j in 0..cols { normed = normed + [v[j] / norm] }
+        result = result + [normed]
+    }
+    return result
+}
+
+// ── matvec: y[m] = W[m,n] @ x[n] ─────────────────────────────
+@pure
+fn ada_matvec(w, x, m, n) {
+    let mut y = []
+    for i in 0..m {
+        let mut s = 0.0
+        for j in 0..n { s = s + w[i][j] * x[j] }
+        y = y + [s]
+    }
+    return y
+}
+
+// ── matmul: C[m,n] = A[m,k] @ B[k,n] ─────────────────────────
+@pure
+fn ada_matmul(a, b, m, k, n) {
+    let mut c = []
+    for i in 0..m {
+        let mut row = []
+        for j in 0..n {
+            let mut s = 0.0
+            for p in 0..k { s = s + a[i][p] * b[p][j] }
+            row = row + [s]
+        }
+        c = c + [row]
+    }
+    return c
+}
+
+// ── transpose: B[n,m] = A[m,n]^T ──────────────────────────────
+@pure
+fn ada_transpose(a, m, n) {
+    let mut r = []
+    for j in 0..n {
+        let mut row = []
+        for i in 0..m { row = row + [a[i][j]] }
+        r = r + [row]
+    }
+    return r
+}
+
+// ── diag_scale: scale rows of M[r,k] by lambda[r] ─────────────
+// result[i][j] = lambda[i] * M[i][j]
+@pure
+fn ada_diag_scale_rows(lambda, mat, r, cols) {
+    let mut out = []
+    for i in 0..r {
+        let mut row = []
+        for j in 0..cols {
+            row = row + [lambda[i] * mat[i][j]]
+        }
+        out = out + [row]
+    }
+    return out
+}
+
+// ── diag_scale_cols: scale cols of M[d,r] by lambda[r] ─────────
+// result[i][j] = M[i][j] * lambda[j]
+@pure
+fn ada_diag_scale_cols(mat, lambda, rows, r) {
+    let mut out = []
+    for i in 0..rows {
+        let mut row = []
+        for j in 0..r {
+            row = row + [mat[i][j] * lambda[j]]
+        }
+        out = out + [row]
+    }
+    return out
+}
+
+// ── frobenius norm of matrix ───────────────────────────────────
+@pure
+fn ada_frob_norm(mat, rows, cols) {
+    let mut s = 0.0
+    for i in 0..rows {
+        for j in 0..cols {
+            s = s + mat[i][j] * mat[i][j]
+        }
+    }
+    return sqrt(s)
+}
+
+// ── row norms ──────────────────────────────────────────────────
+@pure
+fn ada_row_norms(mat, rows, cols) {
+    let mut norms = []
+    for i in 0..rows {
+        let mut s = 0.0
+        for j in 0..cols { s = s + mat[i][j] * mat[i][j] }
+        norms = norms + [sqrt(s + 1.0e-12)]
+    }
+    return norms
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 2: AdaLoRA adapter struct
+//
+//  SVD parametrization: delta_W = P * diag(Lambda) * Q
+//    P:      [d x r]     left singular vectors
+//    Lambda: [r]          singular values
+//    Q:      [r x k]     right singular vectors
+//    mask:   [r]          binary mask (1=active, 0=pruned)
+// ═══════════════════════════════════════════════════════════════
+
+struct AdaLoraAdapter {
+    p: array,
+    lambda: array,
+    q: array,
+    mask: array,
+    d: int,
+    k: int,
+    r: int
+}
+
+fn make_adalora_adapter(d, k, r, seed) {
+    // P [d x r]: orthogonal columns (left singular vectors)
+    // init r orthogonal rows of dim d, then transpose to get d x r
+    let p_rows = ada_ortho_init(r, d, seed)
+    let p = ada_transpose(p_rows, r, d)
+    // Q [r x k]: orthogonal rows (right singular vectors)
+    let q = ada_ortho_init(r, k, seed + 1000)
+    let lambda = ada_ones1(r)
+    let mut mask = []
+    for _i in 0..r { mask = mask + [1] }
+    AdaLoraAdapter {
+        p: p,
+        lambda: lambda,
+        q: q,
+        mask: mask,
+        d: d,
+        k: k,
+        r: r
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 3: SVD Forward
+//
+//  delta_W = P * diag(mask * Lambda) * Q
+//  y = (W + alpha/r * delta_W) @ x
+//
+//  Steps:
+//    1. effective_lambda[i] = mask[i] * lambda[i]
+//    2. scaled_Q = diag(effective_lambda) * Q    [r x k]
+//    3. delta_W = P @ scaled_Q                   [d x k]
+//    4. y = W @ x + (alpha/r) * delta_W @ x
+// ═══════════════════════════════════════════════════════════════
+
+@pure @hot
+fn adalora_delta(adapter: AdaLoraAdapter) {
+    let r = adapter.r
+    let d = adapter.d
+    let k = adapter.k
+    // effective lambda = mask * lambda
+    let mut eff_lambda = []
+    for i in 0..r {
+        eff_lambda = eff_lambda + [to_float(adapter.mask[i]) * adapter.lambda[i]]
+    }
+    // scaled_Q[i][j] = eff_lambda[i] * Q[i][j]
+    let scaled_q = ada_diag_scale_rows(eff_lambda, adapter.q, r, k)
+    // delta_W = P @ scaled_Q  [d x k]
+    let delta_w = ada_matmul(adapter.p, scaled_q, d, r, k)
+    return delta_w
+}
+
+@pure @hot
+fn adalora_forward(w, adapter: AdaLoraAdapter, x, alpha) {
+    let d = adapter.d
+    let k = adapter.k
+    let r = adapter.r
+    let scale = to_float(alpha) / to_float(r)
+    // base output
+    let y_base = ada_matvec(w, x, d, k)
+    // delta output
+    let delta_w = adalora_delta(adapter)
+    let y_delta = ada_matvec(delta_w, x, d, k)
+    // combine
+    let mut y = []
+    for i in 0..d {
+        y = y + [y_base[i] + scale * y_delta[i]]
+    }
+    return y
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 4: Importance Score Computation
+//
+//  For each singular triplet (p_i, lambda_i, q_i), importance is:
+//    S_i = |lambda_i| * (||p_i|| * ||q_i||)
+//  where p_i is i-th column of P and q_i is i-th row of Q.
+//
+//  This captures both the magnitude of the singular value and
+//  the scale of its associated vectors.
+//
+//  Sensitivity-based variant adds gradient magnitude:
+//    S_i = |lambda_i| * ||p_i|| * ||q_i|| + |grad_lambda_i|
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn adalora_importance(adapter: AdaLoraAdapter) {
+    let r = adapter.r
+    let d = adapter.d
+    let k = adapter.k
+    let mut scores = []
+    for i in 0..r {
+        // ||p_i||: norm of i-th column of P [d x r]
+        let mut pn = 0.0
+        for row in 0..d {
+            pn = pn + adapter.p[row][i] * adapter.p[row][i]
+        }
+        pn = sqrt(pn + 1.0e-12)
+        // ||q_i||: norm of i-th row of Q [r x k]
+        let mut qn = 0.0
+        for col in 0..k {
+            qn = qn + adapter.q[i][col] * adapter.q[i][col]
+        }
+        qn = sqrt(qn + 1.0e-12)
+        // importance = |lambda_i| * ||p_i|| * ||q_i|| (if active)
+        let s = ada_abs(adapter.lambda[i]) * pn * qn * to_float(adapter.mask[i])
+        scores = scores + [s]
+    }
+    return scores
+}
+
+// Sensitivity-enhanced importance: adds simulated gradient magnitude
+@pure
+fn adalora_importance_with_grad(adapter: AdaLoraAdapter, grad_lambda) {
+    let base = adalora_importance(adapter)
+    let r = adapter.r
+    let mut scores = []
+    for i in 0..r {
+        scores = scores + [base[i] + ada_abs(grad_lambda[i])]
+    }
+    return scores
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 5: Rank Allocation Across Layers
+//
+//  Given a list of adapters (one per layer) and a total budget
+//  (total number of active singular values), allocate ranks
+//  proportional to importance scores.
+//
+//  Algorithm:
+//    1. Compute importance scores for all adapters
+//    2. Flatten all scores into a global list
+//    3. Sort (find threshold) to keep top-budget entries
+//    4. Set masks: 1 if score >= threshold, 0 otherwise
+// ═══════════════════════════════════════════════════════════════
+
+// Collect all importance scores across layers into flat list
+@pure
+fn adalora_global_scores(adapters) {
+    let n_layers = len(adapters)
+    let mut all_scores = []
+    for l in 0..n_layers {
+        let scores = adalora_importance(adapters[l])
+        let r = len(scores)
+        for i in 0..r {
+            all_scores = all_scores + [scores[i]]
+        }
+    }
+    return all_scores
+}
+
+// Find k-th largest value in array (selection for threshold)
+@pure
+fn ada_kth_largest(arr, k) {
+    let n = len(arr)
+    if k <= 0 { return 999999.0 }
+    if k >= n { return -1.0 }
+    // simple sort descending, pick k-th
+    let mut sorted = []
+    for i in 0..n { sorted = sorted + [arr[i]] }
+    // bubble sort descending (small arrays in practice)
+    for i in 0..n {
+        for j in 0..(n - 1) {
+            if sorted[j] < sorted[j + 1] {
+                let tmp = sorted[j]
+                let mut new_sorted = []
+                for x in 0..n {
+                    if x == j {
+                        new_sorted = new_sorted + [sorted[j + 1]]
+                    } else {
+                        if x == j + 1 {
+                            new_sorted = new_sorted + [tmp]
+                        } else {
+                            new_sorted = new_sorted + [sorted[x]]
+                        }
+                    }
+                }
+                sorted = new_sorted
+            }
+        }
+    }
+    return sorted[k - 1]
+}
+
+// Allocate ranks: returns list of updated adapters with masks set
+fn adalora_allocate_ranks(adapters, budget) {
+    let n_layers = len(adapters)
+    // gather all scores
+    let all_scores = adalora_global_scores(adapters)
+    let total = len(all_scores)
+    let mut actual_budget = budget
+    if actual_budget > total { actual_budget = total }
+    // find threshold
+    let threshold = ada_kth_largest(all_scores, actual_budget)
+    // apply masks
+    let mut updated = []
+    for l in 0..n_layers {
+        let ad = adapters[l]
+        let scores = adalora_importance(ad)
+        let r = ad.r
+        let mut new_mask = []
+        for i in 0..r {
+            if scores[i] >= threshold {
+                new_mask = new_mask + [1]
+            } else {
+                new_mask = new_mask + [0]
+            }
+        }
+        let new_ad = AdaLoraAdapter {
+            p: ad.p,
+            lambda: ad.lambda,
+            q: ad.q,
+            mask: new_mask,
+            d: ad.d,
+            k: ad.k,
+            r: ad.r
+        }
+        updated = updated + [new_ad]
+    }
+    return updated
+}
+
+// Count active ranks in a single adapter
+@pure
+fn adalora_active_rank(adapter: AdaLoraAdapter) {
+    let mut count = 0
+    for i in 0..adapter.r {
+        if adapter.mask[i] == 1 { count = count + 1 }
+    }
+    return count
+}
+
+// Count total active ranks across all adapters
+@pure
+fn adalora_total_active(adapters) {
+    let n = len(adapters)
+    let mut total = 0
+    for i in 0..n {
+        total = total + adalora_active_rank(adapters[i])
+    }
+    return total
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 6: Pruning Schedule
+//
+//  Cubic schedule (from the paper):
+//    At step t during warmup [t_i, t_f]:
+//      budget(t) = b_final + (b_init - b_final) * (1 - (t - t_i)/(t_f - t_i))^3
+//
+//  This gradually reduces from initial budget to final budget.
+//  Before t_i: use b_init. After t_f: use b_final.
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn adalora_cubic_schedule(step, t_start, t_end, b_init, b_final) {
+    if step < t_start { return b_init }
+    if step >= t_end { return b_final }
+    let progress = to_float(step - t_start) / to_float(t_end - t_start)
+    let remaining = 1.0 - progress
+    let cubic = remaining * remaining * remaining
+    let budget_f = to_float(b_final) + (to_float(b_init) - to_float(b_final)) * cubic
+    return to_int(budget_f)
+}
+
+// Linear schedule alternative
+@pure
+fn adalora_linear_schedule(step, t_start, t_end, b_init, b_final) {
+    if step < t_start { return b_init }
+    if step >= t_end { return b_final }
+    let progress = to_float(step - t_start) / to_float(t_end - t_start)
+    let budget_f = to_float(b_init) + (to_float(b_final) - to_float(b_init)) * progress
+    return to_int(budget_f)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 7: Budget Controller
+//
+//  Manages the global parameter budget across all layers.
+//  Tracks total params, enforces constraints, and schedules
+//  pruning steps.
+// ═══════════════════════════════════════════════════════════════
+
+struct BudgetController {
+    b_init: int,
+    b_final: int,
+    t_start: int,
+    t_end: int,
+    current_step: int
+}
+
+fn make_budget_controller(b_init, b_final, t_start, t_end) {
+    BudgetController {
+        b_init: b_init,
+        b_final: b_final,
+        t_start: t_start,
+        t_end: t_end,
+        current_step: 0
+    }
+}
+
+fn budget_get_current(ctrl: BudgetController) {
+    return adalora_cubic_schedule(
+        ctrl.current_step, ctrl.t_start, ctrl.t_end,
+        ctrl.b_init, ctrl.b_final
+    )
+}
+
+fn budget_step(ctrl: BudgetController, adapters) {
+    let new_step = ctrl.current_step + 1
+    let new_ctrl = BudgetController {
+        b_init: ctrl.b_init,
+        b_final: ctrl.b_final,
+        t_start: ctrl.t_start,
+        t_end: ctrl.t_end,
+        current_step: new_step
+    }
+    let budget = budget_get_current(new_ctrl)
+    let updated_adapters = adalora_allocate_ranks(adapters, budget)
+    return [new_ctrl, updated_adapters]
+}
+
+// Compute total trainable parameters for one adapter
+@pure
+fn adalora_param_count(adapter: AdaLoraAdapter) {
+    let active = adalora_active_rank(adapter)
+    // P: d * active + Lambda: active + Q: active * k
+    return adapter.d * active + active + active * adapter.k
+}
+
+// Total params across all adapters
+@pure
+fn adalora_total_params(adapters) {
+    let n = len(adapters)
+    let mut total = 0
+    for i in 0..n {
+        total = total + adalora_param_count(adapters[i])
+    }
+    return total
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 8: Orthogonal Regularization Loss
+//
+//  To keep P and Q close to orthogonal matrices:
+//    L_ortho(P) = ||P^T P - I||_F^2   (for P [d x r])
+//    L_ortho(Q) = ||Q Q^T - I||_F^2   (for Q [r x k])
+//
+//  Total regularization for adapter:
+//    L = coeff * (L_ortho(P) + L_ortho(Q))
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn adalora_ortho_loss_p(adapter: AdaLoraAdapter) {
+    let d = adapter.d
+    let r = adapter.r
+    // P^T P should be I [r x r]
+    // P^T[i][j] = P[j][i], so (P^T P)[i][j] = sum_k P[k][i]*P[k][j]
+    let mut loss = 0.0
+    for i in 0..r {
+        for j in 0..r {
+            let mut dot = 0.0
+            for kk in 0..d {
+                dot = dot + adapter.p[kk][i] * adapter.p[kk][j]
+            }
+            let mut target = 0.0
+            if i == j { target = 1.0 }
+            let diff = dot - target
+            loss = loss + diff * diff
+        }
+    }
+    return loss
+}
+
+@pure
+fn adalora_ortho_loss_q(adapter: AdaLoraAdapter) {
+    let r = adapter.r
+    let k = adapter.k
+    // Q Q^T should be I [r x r]
+    // (Q Q^T)[i][j] = sum_c Q[i][c]*Q[j][c]
+    let mut loss = 0.0
+    for i in 0..r {
+        for j in 0..r {
+            let mut dot = 0.0
+            for c in 0..k {
+                dot = dot + adapter.q[i][c] * adapter.q[j][c]
+            }
+            let mut target = 0.0
+            if i == j { target = 1.0 }
+            let diff = dot - target
+            loss = loss + diff * diff
+        }
+    }
+    return loss
+}
+
+@pure
+fn adalora_ortho_loss(adapter: AdaLoraAdapter, coeff) {
+    let lp = adalora_ortho_loss_p(adapter)
+    let lq = adalora_ortho_loss_q(adapter)
+    return coeff * (lp + lq)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 9: Merge Back to Base Weights
+//
+//  W_merged = W + (alpha/r) * P * diag(mask * Lambda) * Q
+//
+//  After merging, the adapter can be discarded and inference
+//  runs at full speed with no overhead.
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn adalora_merge(w, adapter: AdaLoraAdapter, alpha) {
+    let d = adapter.d
+    let k = adapter.k
+    let r = adapter.r
+    let scale = to_float(alpha) / to_float(r)
+    let delta_w = adalora_delta(adapter)
+    let mut merged = []
+    for i in 0..d {
+        let mut row = []
+        for j in 0..k {
+            row = row + [w[i][j] + scale * delta_w[i][j]]
+        }
+        merged = merged + [row]
+    }
+    return merged
+}
+
+// Verify merge correctness: forward with merged W should equal
+// forward with adapter
+@pure
+fn adalora_verify_merge(w, adapter: AdaLoraAdapter, x, alpha) {
+    let y_adapter = adalora_forward(w, adapter, x, alpha)
+    let w_merged = adalora_merge(w, adapter, alpha)
+    let d = adapter.d
+    let k = adapter.k
+    let y_merged = ada_matvec(w_merged, x, d, k)
+    // compute max diff
+    let mut max_diff = 0.0
+    for i in 0..d {
+        let diff = ada_abs(y_adapter[i] - y_merged[i])
+        if diff > max_diff { max_diff = diff }
+    }
+    return max_diff
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 10: Layer-wise Rank Configuration
+//
+//  Different layers can have different initial ranks.
+//  The adaptive adjustment then prunes from these starting points.
+// ═══════════════════════════════════════════════════════════════
+
+// Create multiple adapters with different ranks per layer
+fn make_adalora_layers(n_layers, d, k, ranks, seed) {
+    let mut adapters = []
+    for l in 0..n_layers {
+        let r = ranks[l]
+        let ad = make_adalora_adapter(d, k, r, seed + l * 100)
+        adapters = adapters + [ad]
+    }
+    return adapters
+}
+
+// Get per-layer rank report
+@pure
+fn adalora_rank_report(adapters) {
+    let n = len(adapters)
+    let mut report = []
+    for i in 0..n {
+        let total = adapters[i].r
+        let active = adalora_active_rank(adapters[i])
+        report = report + [[total, active]]
+    }
+    return report
+}
+
+// Update a single adapter's mask manually (layer-wise control)
+fn adalora_set_mask(adapter: AdaLoraAdapter, new_mask) {
+    return AdaLoraAdapter {
+        p: adapter.p,
+        lambda: adapter.lambda,
+        q: adapter.q,
+        mask: new_mask,
+        d: adapter.d,
+        k: adapter.k,
+        r: adapter.r
+    }
+}
+
+// Prune a specific number of least-important ranks in one adapter
+fn adalora_prune_n(adapter: AdaLoraAdapter, n_prune) {
+    let scores = adalora_importance(adapter)
+    let r = adapter.r
+    // find indices of n_prune lowest-scoring active entries
+    let mut pruned = 0
+    let mut new_mask = []
+    for i in 0..r { new_mask = new_mask + [adapter.mask[i]] }
+    for _p in 0..n_prune {
+        let mut min_score = 999999.0
+        let mut min_idx = -1
+        for i in 0..r {
+            if new_mask[i] == 1 {
+                if scores[i] < min_score {
+                    min_score = scores[i]
+                    min_idx = i
+                }
+            }
+        }
+        if min_idx >= 0 {
+            let mut updated_mask = []
+            for i in 0..r {
+                if i == min_idx {
+                    updated_mask = updated_mask + [0]
+                } else {
+                    updated_mask = updated_mask + [new_mask[i]]
+                }
+            }
+            new_mask = updated_mask
+            pruned = pruned + 1
+        }
+    }
+    return adalora_set_mask(adapter, new_mask)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 11: Training step simulation
+//
+//  Simulated gradient descent on lambda with importance-based
+//  rank pruning at each step.
+// ═══════════════════════════════════════════════════════════════
+
+fn adalora_train_step(w, adapter: AdaLoraAdapter, x, target, lr, alpha) {
+    let d = adapter.d
+    let k = adapter.k
+    let r = adapter.r
+    // forward
+    let y = adalora_forward(w, adapter, x, alpha)
+    // compute loss gradient on output
+    let mut grad_y = []
+    for i in 0..d {
+        grad_y = grad_y + [y[i] - target[i]]
+    }
+    // approximate gradient on lambda: grad_lambda[i] ~ sum contribution
+    let scale = to_float(alpha) / to_float(r)
+    let mut grad_lambda = []
+    for i in 0..r {
+        if adapter.mask[i] == 1 {
+            // simplified: grad_lambda[i] = scale * p_i^T @ grad_y * q_i @ x
+            let mut p_dot = 0.0
+            for row in 0..d {
+                p_dot = p_dot + adapter.p[row][i] * grad_y[row]
+            }
+            let mut q_dot = 0.0
+            for col in 0..k {
+                q_dot = q_dot + adapter.q[i][col] * x[col]
+            }
+            grad_lambda = grad_lambda + [scale * p_dot * q_dot]
+        } else {
+            grad_lambda = grad_lambda + [0.0]
+        }
+    }
+    // update lambda
+    let mut new_lambda = []
+    for i in 0..r {
+        new_lambda = new_lambda + [adapter.lambda[i] - lr * grad_lambda[i]]
+    }
+    let updated = AdaLoraAdapter {
+        p: adapter.p,
+        lambda: new_lambda,
+        q: adapter.q,
+        mask: adapter.mask,
+        d: adapter.d,
+        k: adapter.k,
+        r: adapter.r
+    }
+    // compute loss
+    let mut loss = 0.0
+    for i in 0..d { loss = loss + grad_y[i] * grad_y[i] }
+    loss = loss / to_float(d)
+    return [updated, loss]
+}
+
+println("[adalora] loaded — SVD rank-adaptive LoRA + importance scoring + budget control + ortho reg + merge")

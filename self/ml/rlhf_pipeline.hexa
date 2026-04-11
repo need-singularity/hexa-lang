@@ -1,0 +1,816 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/rlhf_pipeline.hexa — RLHF Pipeline
+//
+//  Christiano et al. "Deep RL from Human Preferences" (2017)
+//  Ouyang et al. "Training language models to follow instructions
+//                  with human feedback" (InstructGPT, 2022)
+//
+//  Implements:
+//    1. Reward model         — transformer-based with scalar reward head
+//    2. Reward head          — linear projection hidden -> scalar
+//    3. Preference dataset   — (chosen, rejected) pairs with labels
+//    4. Reward model training — Bradley-Terry loss on preference pairs
+//    5. PPO rollout          — generate responses, score with reward model
+//    6. Reward scoring       — batch score generated responses
+//    7. KL penalty           — KL(policy || reference) divergence
+//    8. Full RLHF loop       — generate -> reward -> PPO update -> repeat
+//    9. Reward normalization  — running mean/var baseline
+//
+//  API (pure, no BLAS):
+//    rlhf_reward_head(hidden, w, bias)                    -> float
+//    rlhf_reward_model_forward(tokens, embed, attn_w, attn_b,
+//                               ff_w, ff_b, rw_w, rw_b)  -> float
+//    rlhf_preference_create()                             -> dataset
+//    rlhf_preference_add(ds, chosen, rejected)            -> dataset
+//    rlhf_bradley_terry_loss(r_chosen, r_rejected)        -> float
+//    rlhf_reward_train_step(ds, embed, attn_w, attn_b,
+//                            ff_w, ff_b, rw_w, rw_b, lr) -> loss
+//    rlhf_ppo_rollout(policy_logits, reward_scores)       -> rollout
+//    rlhf_reward_score_batch(responses, embed, attn_w,
+//                             attn_b, ff_w, ff_b, rw_w, rw_b) -> [float]
+//    rlhf_kl_penalty(log_policy, log_ref, beta)           -> float
+//    rlhf_kl_penalty_batch(log_pols, log_refs, beta)      -> float
+//    rlhf_loop_step(policy_lp, ref_lp, rewards, advs,
+//                    eps, lr, kl_beta)                     -> result
+//    rlhf_reward_normalize(rewards, mean, var)            -> [float]
+//    rlhf_reward_baseline(rewards, baseline)              -> [float]
+//    rlhf_running_stats(old_m, old_v, old_c, batch)       -> [m,v,c]
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+//    @hot   — called every RL step
+// ═══════════════════════════════════════════════════════════════════
+
+let RLHF_EPS = 1.0e-8
+let RLHF_CLIP_EPS = 0.2
+let RLHF_KL_BETA = 0.1
+let RLHF_GAMMA = 0.99
+let RLHF_LAMBDA = 0.95
+
+// ── numeric helpers (self-contained, no module coupling) ─────────
+
+@pure
+fn rlhf_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+@pure
+fn rlhf_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+@pure
+fn rlhf_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+@pure
+fn rlhf_log(x) {
+    if x <= 0.0 { return -20.0 }
+    let mut v = x
+    let mut shift = 0.0
+    for _i in 0..20 {
+        if v > 2.0 {
+            v = v / 2.718281828
+            shift = shift + 1.0
+        }
+    }
+    for _i in 0..20 {
+        if v < 0.5 {
+            v = v * 2.718281828
+            shift = shift - 1.0
+        }
+    }
+    let y = (v - 1.0) / (v + 1.0)
+    let y2 = y * y
+    let mut s = y
+    let mut t = y
+    for k in 1..15 {
+        t = t * y2
+        s = s + t / to_float(2 * k + 1)
+    }
+    return 2.0 * s + shift
+}
+
+@pure
+fn rlhf_min(a, b) {
+    if a < b { return a }
+    return b
+}
+
+@pure
+fn rlhf_max(a, b) {
+    if a > b { return a }
+    return b
+}
+
+@pure
+fn rlhf_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+@pure
+fn rlhf_mean(arr) {
+    let n = len(arr)
+    if n == 0 { return 0.0 }
+    let mut s = 0.0
+    for i in 0..n { s = s + arr[i] }
+    return s / to_float(n)
+}
+
+@pure
+fn rlhf_std(arr) {
+    let n = len(arr)
+    if n < 2 { return 0.0 }
+    let m = rlhf_mean(arr)
+    let mut ss = 0.0
+    for i in 0..n {
+        let d = arr[i] - m
+        ss = ss + d * d
+    }
+    return rlhf_sqrt(ss / to_float(n))
+}
+
+@pure
+fn rlhf_sum(arr) {
+    let mut s = 0.0
+    for i in 0..len(arr) { s = s + arr[i] }
+    return s
+}
+
+@pure
+fn rlhf_sigmoid(x) {
+    if x > 20.0 { return 1.0 }
+    if x < -20.0 { return 0.0 }
+    return 1.0 / (1.0 + rlhf_exp(0.0 - x))
+}
+
+@pure
+fn rlhf_log_sigmoid(x) {
+    // log(sigmoid(x)) = x - log(1 + exp(x)) = -softplus(-x)
+    if x > 20.0 { return 0.0 }
+    if x < -20.0 { return x }
+    return 0.0 - rlhf_log(1.0 + rlhf_exp(0.0 - x))
+}
+
+@pure
+fn rlhf_softplus(x) {
+    if x > 20.0 { return x }
+    if x < -20.0 { return 0.0 }
+    return rlhf_log(1.0 + rlhf_exp(x))
+}
+
+@pure
+fn rlhf_softmax(logits) {
+    let n = len(logits)
+    let mut mx = logits[0]
+    for i in 1..n {
+        if logits[i] > mx { mx = logits[i] }
+    }
+    let mut exps = rlhf_zeros(n)
+    let mut z = 0.0
+    for i in 0..n {
+        exps[i] = rlhf_exp(logits[i] - mx)
+        z = z + exps[i]
+    }
+    let mut out = rlhf_zeros(n)
+    for i in 0..n {
+        out[i] = exps[i] / z
+    }
+    return out
+}
+
+@pure
+fn rlhf_log_softmax(logits) {
+    let n = len(logits)
+    let mut mx = logits[0]
+    for i in 1..n {
+        if logits[i] > mx { mx = logits[i] }
+    }
+    let mut z = 0.0
+    for i in 0..n {
+        z = z + rlhf_exp(logits[i] - mx)
+    }
+    let log_z = rlhf_log(z) + mx
+    let mut out = rlhf_zeros(n)
+    for i in 0..n {
+        out[i] = logits[i] - log_z
+    }
+    return out
+}
+
+// dot product of two vectors
+@pure
+fn rlhf_dot(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    for i in 0..n { s = s + a[i] * b[i] }
+    return s
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  1. Reward Head — linear projection from hidden state to scalar
+//     reward = dot(hidden, w) + bias
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn rlhf_reward_head(hidden, w, bias) {
+    return rlhf_dot(hidden, w) + bias
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  2. Reward Model Forward Pass
+//     Simplified transformer: embed -> attention -> feedforward -> reward head
+//     Input: token indices (as float), returns scalar reward
+//
+//     Steps:
+//       a. Lookup embeddings (gather rows from embed matrix)
+//       b. Self-attention: Q=K=V=embed, scores = softmax(QK^T / sqrt(d))
+//       c. Feedforward: ReLU(x * ff_w + ff_b)
+//       d. Mean pool over sequence
+//       e. Reward head: dot(pooled, rw_w) + rw_b
+// ═══════════════════════════════════════════════════════════════════
+
+// Embed tokens: tokens is [seq_len] of float indices, embed is [vocab_size][dim]
+@pure
+fn rlhf_embed_tokens(tokens, embed) {
+    let seq_len = len(tokens)
+    let dim = len(embed[0])
+    let mut out = []
+    for i in 0..seq_len {
+        let idx = to_int(tokens[i])
+        out = out + [embed[idx]]
+    }
+    return out
+}
+
+// Simplified single-head self-attention
+// x is [seq_len][dim], attn_w is [dim][dim], attn_b is [dim]
+// Returns [seq_len][dim]
+@pure
+fn rlhf_self_attention(x, attn_w, attn_b) {
+    let seq_len = len(x)
+    let dim = len(x[0])
+    let scale = rlhf_sqrt(to_float(dim))
+
+    // Compute attention scores: score[i][j] = dot(x[i], x[j]) / sqrt(d)
+    let mut scores = []
+    for i in 0..seq_len {
+        let mut row = rlhf_zeros(seq_len)
+        for j in 0..seq_len {
+            row[j] = rlhf_dot(x[i], x[j]) / scale
+        }
+        // softmax over row
+        let probs = rlhf_softmax(row)
+        scores = scores + [probs]
+    }
+
+    // weighted sum: out[i] = sum_j scores[i][j] * x[j] + attn_b
+    let mut out = []
+    for i in 0..seq_len {
+        let mut vec = rlhf_zeros(dim)
+        for j in 0..seq_len {
+            for d in 0..dim {
+                vec[d] = vec[d] + scores[i][j] * x[j][d]
+            }
+        }
+        // project through attn_w and add bias
+        let mut proj = rlhf_zeros(dim)
+        for d in 0..dim {
+            let mut val = attn_b[d]
+            for k in 0..dim {
+                val = val + vec[k] * attn_w[k][d]
+            }
+            proj[d] = val
+        }
+        out = out + [proj]
+    }
+    return out
+}
+
+// Feedforward with ReLU: out = ReLU(x * ff_w + ff_b)
+// x is [seq_len][dim], ff_w is [dim][dim], ff_b is [dim]
+@pure
+fn rlhf_feedforward(x, ff_w, ff_b) {
+    let seq_len = len(x)
+    let dim = len(x[0])
+    let mut out = []
+    for i in 0..seq_len {
+        let mut vec = rlhf_zeros(dim)
+        for d in 0..dim {
+            let mut val = ff_b[d]
+            for k in 0..dim {
+                val = val + x[i][k] * ff_w[k][d]
+            }
+            // ReLU
+            if val < 0.0 { val = 0.0 }
+            vec[d] = val
+        }
+        out = out + [vec]
+    }
+    return out
+}
+
+// Mean pool over sequence: [seq_len][dim] -> [dim]
+@pure
+fn rlhf_mean_pool(x) {
+    let seq_len = len(x)
+    let dim = len(x[0])
+    let mut out = rlhf_zeros(dim)
+    for i in 0..seq_len {
+        for d in 0..dim {
+            out[d] = out[d] + x[i][d]
+        }
+    }
+    for d in 0..dim {
+        out[d] = out[d] / to_float(seq_len)
+    }
+    return out
+}
+
+// Full reward model forward: tokens -> scalar reward
+@pure
+fn rlhf_reward_model_forward(tokens, embed, attn_w, attn_b, ff_w, ff_b, rw_w, rw_b) {
+    let x = rlhf_embed_tokens(tokens, embed)
+    let attn_out = rlhf_self_attention(x, attn_w, attn_b)
+    let ff_out = rlhf_feedforward(attn_out, ff_w, ff_b)
+    let pooled = rlhf_mean_pool(ff_out)
+    return rlhf_reward_head(pooled, rw_w, rw_b)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  3. Preference Dataset
+//     Stores (chosen, rejected) pairs for reward model training
+// ═══════════════════════════════════════════════════════════════════
+
+fn rlhf_preference_create() {
+    return #{
+        "chosen": [],
+        "rejected": [],
+        "size": 0
+    }
+}
+
+fn rlhf_preference_add(ds, chosen, rejected) {
+    let mut d = ds
+    d["chosen"] = d["chosen"] + [chosen]
+    d["rejected"] = d["rejected"] + [rejected]
+    d["size"] = d["size"] + 1
+    return d
+}
+
+fn rlhf_preference_size(ds) {
+    return ds["size"]
+}
+
+fn rlhf_preference_get_chosen(ds, idx) {
+    return ds["chosen"][idx]
+}
+
+fn rlhf_preference_get_rejected(ds, idx) {
+    return ds["rejected"][idx]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  4. Reward Model Training — Bradley-Terry loss
+//     L = -log sigmoid(r_chosen - r_rejected)
+//     This is the standard preference learning objective.
+// ═══════════════════════════════════════════════════════════════════
+
+@pure @hot
+fn rlhf_bradley_terry_loss(r_chosen, r_rejected) {
+    // -log(sigmoid(r_chosen - r_rejected))
+    return 0.0 - rlhf_log_sigmoid(r_chosen - r_rejected)
+}
+
+// Batch Bradley-Terry loss over dataset
+@pure
+fn rlhf_bradley_terry_batch(r_chosen_arr, r_rejected_arr) {
+    let n = len(r_chosen_arr)
+    if n == 0 { return 0.0 }
+    let mut total = 0.0
+    for i in 0..n {
+        total = total + rlhf_bradley_terry_loss(r_chosen_arr[i], r_rejected_arr[i])
+    }
+    return total / to_float(n)
+}
+
+// Bradley-Terry gradient w.r.t. r_chosen
+// d/dr_chosen [-log sigmoid(r_c - r_r)] = sigmoid(r_r - r_c) - 0
+//  = 1 - sigmoid(r_c - r_r)
+@pure
+fn rlhf_bt_grad(r_chosen, r_rejected) {
+    return rlhf_sigmoid(r_rejected - r_chosen)
+}
+
+// Preference accuracy: fraction of pairs where r_chosen > r_rejected
+@pure
+fn rlhf_preference_accuracy(r_chosen_arr, r_rejected_arr) {
+    let n = len(r_chosen_arr)
+    if n == 0 { return 0.0 }
+    let mut correct = 0
+    for i in 0..n {
+        if r_chosen_arr[i] > r_rejected_arr[i] {
+            correct = correct + 1
+        }
+    }
+    return to_float(correct) / to_float(n)
+}
+
+// Simplified reward model training step
+// Updates reward head weights based on Bradley-Terry gradient
+// Returns [loss, accuracy]
+@pure
+fn rlhf_reward_train_step(r_chosen_arr, r_rejected_arr, rw_w, rw_b, lr) {
+    let n = len(r_chosen_arr)
+    if n == 0 { return [0.0, 0.0] }
+    let loss = rlhf_bradley_terry_batch(r_chosen_arr, r_rejected_arr)
+    let acc = rlhf_preference_accuracy(r_chosen_arr, r_rejected_arr)
+
+    // Compute average gradient
+    let mut avg_grad = 0.0
+    for i in 0..n {
+        avg_grad = avg_grad + rlhf_bt_grad(r_chosen_arr[i], r_rejected_arr[i])
+    }
+    avg_grad = avg_grad / to_float(n)
+
+    // Update reward head bias (simplified single-param update)
+    let new_b = rw_b + lr * avg_grad
+    return [loss, acc, new_b]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  5. PPO Rollout — generate responses, score with reward model
+//     Stores policy log probs, values, rewards for PPO update
+// ═══════════════════════════════════════════════════════════════════
+
+fn rlhf_ppo_rollout_create() {
+    return #{
+        "log_probs": [],
+        "ref_log_probs": [],
+        "rewards": [],
+        "values": [],
+        "advantages": [],
+        "size": 0
+    }
+}
+
+fn rlhf_ppo_rollout_add(buf, log_prob, ref_log_prob, reward, value) {
+    let mut b = buf
+    b["log_probs"] = b["log_probs"] + [log_prob]
+    b["ref_log_probs"] = b["ref_log_probs"] + [ref_log_prob]
+    b["rewards"] = b["rewards"] + [reward]
+    b["values"] = b["values"] + [value]
+    b["size"] = b["size"] + 1
+    return b
+}
+
+fn rlhf_ppo_rollout_size(buf) {
+    return buf["size"]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  6. Reward Scoring — batch score generated responses
+//     Given hidden states from responses, compute scalar rewards
+// ═══════════════════════════════════════════════════════════════════
+
+// Score a batch of hidden states through reward head
+@pure
+fn rlhf_reward_score_batch(hidden_states, rw_w, rw_b) {
+    let n = len(hidden_states)
+    let mut scores = rlhf_zeros(n)
+    for i in 0..n {
+        scores[i] = rlhf_reward_head(hidden_states[i], rw_w, rw_b)
+    }
+    return scores
+}
+
+// Score with reward model (simplified: tokens -> reward)
+@pure
+fn rlhf_score_responses(responses, embed, attn_w, attn_b, ff_w, ff_b, rw_w, rw_b) {
+    let n = len(responses)
+    let mut scores = rlhf_zeros(n)
+    for i in 0..n {
+        scores[i] = rlhf_reward_model_forward(responses[i], embed, attn_w, attn_b, ff_w, ff_b, rw_w, rw_b)
+    }
+    return scores
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  7. KL Penalty — KL(policy || reference)
+//     KL = exp(log_pol - log_ref) * (log_pol - log_ref) - (exp(log_pol - log_ref) - 1)
+//     Simplified: KL approx = 0.5 * (log_pol - log_ref)^2
+//     Or exact:   KL = exp(d) - d - 1  where d = log_ref - log_pol  (KL(ref||pol))
+//     We use KL(pol||ref): d = log_pol - log_ref
+//       KL = exp(-d) + d - 1
+// ═══════════════════════════════════════════════════════════════════
+
+@pure @hot
+fn rlhf_kl_penalty(log_policy, log_ref, beta) {
+    let d = log_policy - log_ref
+    // KL(pol || ref) = exp(-d) + d - 1  (always >= 0)
+    let kl = rlhf_exp(0.0 - d) + d - 1.0
+    return beta * kl
+}
+
+// Batch KL penalty
+@pure
+fn rlhf_kl_penalty_batch(log_pols, log_refs, beta) {
+    let n = len(log_pols)
+    if n == 0 { return 0.0 }
+    let mut total = 0.0
+    for i in 0..n {
+        total = total + rlhf_kl_penalty(log_pols[i], log_refs[i], beta)
+    }
+    return total / to_float(n)
+}
+
+// KL-adjusted reward: r_kl = reward - beta * KL(pol||ref)
+@pure
+fn rlhf_kl_adjusted_reward(reward, log_policy, log_ref, beta) {
+    let d = log_policy - log_ref
+    let kl = rlhf_exp(0.0 - d) + d - 1.0
+    return reward - beta * kl
+}
+
+// Batch KL-adjusted rewards
+@pure
+fn rlhf_kl_adjusted_rewards(rewards, log_pols, log_refs, beta) {
+    let n = len(rewards)
+    let mut out = rlhf_zeros(n)
+    for i in 0..n {
+        out[i] = rlhf_kl_adjusted_reward(rewards[i], log_pols[i], log_refs[i], beta)
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  8. Full RLHF Loop Step
+//     generate -> reward -> PPO update -> repeat
+//
+//     Given:
+//       policy_lp: current policy log probs [n]
+//       ref_lp:    reference policy log probs [n]
+//       rewards:   raw reward scores [n]
+//       advs:      advantages [n]
+//       eps:       PPO clip epsilon
+//       lr:        learning rate
+//       kl_beta:   KL penalty coefficient
+//
+//     Returns: #{updated_lp, kl, loss, kl_reward}
+// ═══════════════════════════════════════════════════════════════════
+
+// PPO ratio
+@pure
+fn rlhf_ppo_ratio(log_new, log_old) {
+    return rlhf_exp(log_new - log_old)
+}
+
+// PPO clip ratio
+@pure
+fn rlhf_ppo_clip_ratio(ratio, eps) {
+    let lo = 1.0 - eps
+    let hi = 1.0 + eps
+    if ratio < lo { return lo }
+    if ratio > hi { return hi }
+    return ratio
+}
+
+// PPO surrogate loss for single sample
+@pure
+fn rlhf_ppo_surrogate(log_new, log_old, advantage, eps) {
+    let r = rlhf_ppo_ratio(log_new, log_old)
+    let clipped_r = rlhf_ppo_clip_ratio(r, eps)
+    let unclipped = r * advantage
+    let clipped = clipped_r * advantage
+    return rlhf_min(unclipped, clipped)
+}
+
+// GAE-lambda computation
+@pure
+fn rlhf_gae(rewards, values, gamma, lam) {
+    let n = len(rewards)
+    let mut advs = rlhf_zeros(n)
+    let mut last_gae = 0.0
+    let mut idx = n - 1
+    for _i in 0..n {
+        let mut next_val = 0.0
+        if idx < n - 1 {
+            next_val = values[idx + 1]
+        }
+        let delta = rewards[idx] + gamma * next_val - values[idx]
+        last_gae = delta + gamma * lam * last_gae
+        advs[idx] = last_gae
+        idx = idx - 1
+    }
+    return advs
+}
+
+// Normalize advantages
+@pure
+fn rlhf_normalize_advantages(advs) {
+    let n = len(advs)
+    if n < 2 { return advs }
+    let m = rlhf_mean(advs)
+    let s = rlhf_std(advs)
+    let mut out = rlhf_zeros(n)
+    for i in 0..n {
+        out[i] = (advs[i] - m) / (s + RLHF_EPS)
+    }
+    return out
+}
+
+// PPO update step with gradient
+@pure
+fn rlhf_ppo_update(log_new_arr, log_old_arr, advs, eps, lr) {
+    let n = len(log_new_arr)
+    let mut updated = rlhf_zeros(n)
+    for i in 0..n {
+        let r = rlhf_ppo_ratio(log_new_arr[i], log_old_arr[i])
+        let mut grad = advs[i]
+        if r < 1.0 - eps {
+            if advs[i] < 0.0 { grad = 0.0 }
+        }
+        if r > 1.0 + eps {
+            if advs[i] > 0.0 { grad = 0.0 }
+        }
+        updated[i] = log_new_arr[i] + lr * grad
+    }
+    return updated
+}
+
+// Full RLHF loop step
+// Returns #{ "updated_lp", "kl", "surrogate_loss", "kl_rewards" }
+fn rlhf_loop_step(policy_lp, ref_lp, rewards, values, eps, lr, kl_beta) {
+    let n = len(policy_lp)
+
+    // Step 1: KL-adjusted rewards
+    let kl_rewards = rlhf_kl_adjusted_rewards(rewards, policy_lp, ref_lp, kl_beta)
+
+    // Step 2: Compute advantages with GAE
+    let advs = rlhf_gae(kl_rewards, values, RLHF_GAMMA, RLHF_LAMBDA)
+    let norm_advs = rlhf_normalize_advantages(advs)
+
+    // Step 3: PPO update
+    let updated = rlhf_ppo_update(policy_lp, policy_lp, norm_advs, eps, lr)
+
+    // Step 4: Compute metrics
+    let mut surr_total = 0.0
+    for i in 0..n {
+        surr_total = surr_total + rlhf_ppo_surrogate(updated[i], policy_lp[i], norm_advs[i], eps)
+    }
+    let surr_loss = surr_total / to_float(n)
+
+    let kl = rlhf_kl_penalty_batch(policy_lp, ref_lp, 1.0)
+
+    return #{
+        "updated_lp": updated,
+        "kl": kl,
+        "surrogate_loss": surr_loss,
+        "kl_rewards": kl_rewards
+    }
+}
+
+// Multi-step RLHF loop (runs multiple PPO epochs on the same batch)
+fn rlhf_loop_multi(policy_lp, ref_lp, rewards, values, eps, lr, kl_beta, epochs) {
+    let mut current_lp = rlhf_zeros(len(policy_lp))
+    for i in 0..len(policy_lp) { current_lp[i] = policy_lp[i] }
+
+    let kl_rewards = rlhf_kl_adjusted_rewards(rewards, policy_lp, ref_lp, kl_beta)
+    let advs = rlhf_gae(kl_rewards, values, RLHF_GAMMA, RLHF_LAMBDA)
+    let norm_advs = rlhf_normalize_advantages(advs)
+
+    let old_lp = rlhf_zeros(len(policy_lp))
+    for i in 0..len(policy_lp) { current_lp[i] = policy_lp[i] }
+
+    for _e in 0..epochs {
+        current_lp = rlhf_ppo_update(current_lp, policy_lp, norm_advs, eps, lr)
+    }
+
+    let kl = rlhf_kl_penalty_batch(current_lp, ref_lp, 1.0)
+    return #{
+        "updated_lp": current_lp,
+        "kl": kl,
+        "epochs": epochs
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  9. Reward Normalization and Baseline
+//     Running mean/var for reward normalization
+//     Baseline subtraction for variance reduction
+// ═══════════════════════════════════════════════════════════════════
+
+// Normalize rewards using running statistics
+@pure
+fn rlhf_reward_normalize(rewards, run_mean, run_var) {
+    let n = len(rewards)
+    let mut out = rlhf_zeros(n)
+    let std_val = rlhf_sqrt(run_var + RLHF_EPS)
+    for i in 0..n {
+        out[i] = (rewards[i] - run_mean) / std_val
+    }
+    return out
+}
+
+// Subtract baseline from rewards
+@pure
+fn rlhf_reward_baseline(rewards, baseline) {
+    let n = len(rewards)
+    let mut out = rlhf_zeros(n)
+    for i in 0..n {
+        out[i] = rewards[i] - baseline
+    }
+    return out
+}
+
+// Running statistics update (Welford online algorithm)
+@pure
+fn rlhf_running_stats(old_mean, old_var, old_count, batch) {
+    let n = len(batch)
+    if n == 0 { return [old_mean, old_var, old_count] }
+    let batch_mean = rlhf_mean(batch)
+    let mut batch_var = 0.0
+    for i in 0..n {
+        let d = batch[i] - batch_mean
+        batch_var = batch_var + d * d
+    }
+    batch_var = batch_var / to_float(n)
+    let new_count = old_count + to_float(n)
+    let delta = batch_mean - old_mean
+    let new_mean = old_mean + delta * to_float(n) / new_count
+    let m_a = old_var * old_count
+    let m_b = batch_var * to_float(n)
+    let m2 = m_a + m_b + delta * delta * old_count * to_float(n) / new_count
+    let new_var = m2 / new_count
+    return [new_mean, new_var, new_count]
+}
+
+// Adaptive KL coefficient
+@pure
+fn rlhf_adaptive_kl_beta(beta, kl, kl_target) {
+    if kl > 1.5 * kl_target {
+        return beta * 2.0
+    }
+    if kl < kl_target / 1.5 {
+        return beta / 2.0
+    }
+    return beta
+}
+
+// Reward clipping (cap extreme rewards)
+@pure
+fn rlhf_reward_clip(rewards, clip_range) {
+    let n = len(rewards)
+    let mut out = rlhf_zeros(n)
+    for i in 0..n {
+        let mut r = rewards[i]
+        if r > clip_range { r = clip_range }
+        if r < 0.0 - clip_range { r = 0.0 - clip_range }
+        out[i] = r
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Reward margin — measures separation between chosen and rejected
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn rlhf_reward_margin(r_chosen_arr, r_rejected_arr) {
+    let n = len(r_chosen_arr)
+    if n == 0 { return 0.0 }
+    let mut total = 0.0
+    for i in 0..n {
+        total = total + (r_chosen_arr[i] - r_rejected_arr[i])
+    }
+    return total / to_float(n)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  RLHF combined objective
+//  L_rlhf = -E[r(x)] + beta * KL(pi || pi_ref)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn rlhf_combined_objective(mean_reward, kl, beta) {
+    return (0.0 - mean_reward) + beta * kl
+}
+
+println("[rlhf_pipeline] loaded — RLHF: reward model + Bradley-Terry + PPO + KL penalty + normalization")

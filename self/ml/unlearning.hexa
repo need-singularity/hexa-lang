@@ -1,0 +1,680 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/unlearning.hexa — Machine Unlearning (#138)
+//
+//  Gradient ascent based knowledge deletion (Jang et al., Maini et al.)
+//
+//  Implements:
+//    1. Forget set definition    — specify data/knowledge to unlearn
+//    2. Gradient ascent          — maximize loss on forget data
+//    3. Retain set KL divergence — maintain performance on kept data
+//    4. Combined loss            — balance forget + retain + KL
+//    5. GDR metric               — Gradient-based Data Removal effectiveness
+//    6. Membership inference     — test if model still remembers forget data
+//    7. Locality check           — verify unrelated knowledge preserved
+//    8. Selective unlearning     — target specific facts/entities
+//    9. Layer-wise control       — different unlearning rates per layer
+//   10. Verification suite       — comprehensive removal checks
+//
+//  API:
+//    ul_make_forget_set(indices, n_total)       -> [int] mask
+//    ul_make_retain_set(forget_mask)             -> [int] mask
+//    ul_compute_loss(weights, data, targets)     -> float
+//    ul_gradient(weights, data, targets)         -> [float]
+//    ul_gradient_ascent_step(w, grad, lr)        -> [float]
+//    ul_gradient_descent_step(w, grad, lr)       -> [float]
+//    ul_kl_divergence(p, q)                      -> float
+//    ul_combined_loss(w, forget_d, forget_t, retain_d, retain_t, alpha, beta) -> float
+//    ul_unlearn_step(w, fd, ft, rd, rt, lr, alpha, beta) -> [float]
+//    ul_gdr_metric(w_orig, w_unlearned, forget_d, forget_t) -> float
+//    ul_membership_inference(w, data, targets, threshold) -> [int]
+//    ul_locality_score(w_orig, w_new, test_d, test_t) -> float
+//    ul_selective_mask(entity_ids, all_ids)      -> [int]
+//    ul_layer_rates(n_layers, base_lr, decay)    -> [float]
+//    ul_layerwise_step(layers, grads, rates)     -> [[float]]
+//    ul_verify_forgotten(w, forget_d, forget_t, threshold) -> int
+//    ul_verify_retained(w, retain_d, retain_t, max_loss) -> int
+//    ul_verify_locality(w_orig, w_new, test_d, test_t, max_drift) -> int
+//    ul_full_verify(w_orig, w_new, fd, ft, rd, rt, td, tt) -> [int]
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+//    @hot   — called during unlearning loop
+// ═══════════════════════════════════════════════════════════════════
+
+// ── helpers ──────────────────────────────────────────────────────
+
+fn ul_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn ul_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn ul_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn ul_log(x) {
+    if x <= 0.0 { return -30.0 }
+    let mut v = x
+    let mut count = 0
+    while v > 2.0 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    // ln(v) for v near 1 via Taylor series: ln(1+u) = u - u^2/2 + u^3/3 - ...
+    let u = v - 1.0
+    let mut s = 0.0
+    let mut term = u
+    for i in 1..25 {
+        s = s + term / to_float(i)
+        term = 0.0 - term * u
+    }
+    return s + to_float(count)
+}
+
+fn ul_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn ul_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+fn ul_ones(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [1.0] }
+    return v
+}
+
+fn ul_dot(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    for i in 0..n {
+        s = s + a[i] * b[i]
+    }
+    return s
+}
+
+fn ul_sum(a) {
+    let mut s = 0.0
+    for i in 0..len(a) {
+        s = s + a[i]
+    }
+    return s
+}
+
+fn ul_mean(a) {
+    let n = len(a)
+    if n == 0 { return 0.0 }
+    return ul_sum(a) / to_float(n)
+}
+
+fn ul_softmax(logits) {
+    let n = len(logits)
+    let mut mx = logits[0]
+    for i in 1..n {
+        if logits[i] > mx { mx = logits[i] }
+    }
+    let mut exps = ul_zeros(n)
+    let mut z = 0.0
+    for i in 0..n {
+        exps[i] = ul_exp(logits[i] - mx)
+        z = z + exps[i]
+    }
+    let mut out = ul_zeros(n)
+    for i in 0..n {
+        out[i] = exps[i] / z
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  1. Forget Set Definition
+//
+//  Create a binary mask: 1 = forget, 0 = retain.
+//  forget_indices: array of integer indices to forget
+//  n_total: total number of data points
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ul_make_forget_set(forget_indices, n_total) {
+    let mut mask = ul_zeros_int(n_total)
+    for i in 0..len(forget_indices) {
+        let idx = forget_indices[i]
+        if idx >= 0 {
+            if idx < n_total {
+                mask[idx] = 1
+            }
+        }
+    }
+    return mask
+}
+
+// Derive retain mask as complement of forget mask
+@pure
+fn ul_make_retain_set(forget_mask) {
+    let n = len(forget_mask)
+    let mut retain = ul_zeros_int(n)
+    for i in 0..n {
+        if forget_mask[i] == 0 {
+            retain[i] = 1
+        }
+    }
+    return retain
+}
+
+// Filter data by mask: return indices where mask[i] == 1
+@pure
+fn ul_filter_by_mask(mask) {
+    let mut out = []
+    for i in 0..len(mask) {
+        if mask[i] == 1 {
+            out = out + [i]
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  2. Gradient Ascent on Forget Set
+//
+//  Simple linear model: prediction = dot(weights, data)
+//  Loss = (prediction - target)^2  (MSE, single sample)
+//  Gradient = 2 * (pred - target) * data
+//
+//  Gradient ASCENT: w = w + lr * grad  (maximizes loss)
+//  Gradient DESCENT: w = w - lr * grad (minimizes loss)
+// ═══════════════════════════════════════════════════════════════════
+
+// Forward pass: dot product
+@pure
+fn ul_forward(weights, data) {
+    return ul_dot(weights, data)
+}
+
+// MSE loss for single sample
+@pure
+fn ul_loss_single(weights, data, target) {
+    let pred = ul_forward(weights, data)
+    let diff = pred - target
+    return diff * diff
+}
+
+// Average loss over multiple samples
+@pure
+fn ul_compute_loss(weights, data_batch, targets) {
+    let n = len(targets)
+    if n == 0 { return 0.0 }
+    let mut total = 0.0
+    for i in 0..n {
+        total = total + ul_loss_single(weights, data_batch[i], targets[i])
+    }
+    return total / to_float(n)
+}
+
+// Gradient for single sample: 2 * (pred - target) * data_i
+@pure
+fn ul_gradient_single(weights, data, target) {
+    let pred = ul_forward(weights, data)
+    let diff = pred - target
+    let d = len(weights)
+    let mut grad = ul_zeros(d)
+    for i in 0..d {
+        grad[i] = 2.0 * diff * data[i]
+    }
+    return grad
+}
+
+// Average gradient over a batch
+@pure
+fn ul_gradient(weights, data_batch, targets) {
+    let n = len(targets)
+    let d = len(weights)
+    let mut avg_grad = ul_zeros(d)
+    if n == 0 { return avg_grad }
+    for i in 0..n {
+        let g = ul_gradient_single(weights, data_batch[i], targets[i])
+        for j in 0..d {
+            avg_grad[j] = avg_grad[j] + g[j]
+        }
+    }
+    for j in 0..d {
+        avg_grad[j] = avg_grad[j] / to_float(n)
+    }
+    return avg_grad
+}
+
+// Gradient ascent step: w = w + lr * grad (maximize loss, i.e. unlearn)
+@hot
+fn ul_gradient_ascent_step(weights, grad, lr) {
+    let d = len(weights)
+    let mut w_new = ul_zeros(d)
+    for i in 0..d {
+        w_new[i] = weights[i] + lr * grad[i]
+    }
+    return w_new
+}
+
+// Gradient descent step: w = w - lr * grad (minimize loss, i.e. retain)
+@hot
+fn ul_gradient_descent_step(weights, grad, lr) {
+    let d = len(weights)
+    let mut w_new = ul_zeros(d)
+    for i in 0..d {
+        w_new[i] = weights[i] - lr * grad[i]
+    }
+    return w_new
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  3. Retain Set KL Divergence
+//
+//  KL(P || Q) = sum_i P(i) * log(P(i) / Q(i))
+//  Used to ensure the model's output distribution on retain data
+//  stays close to the original model.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ul_kl_divergence(p, q) {
+    let n = len(p)
+    let mut kl = 0.0
+    for i in 0..n {
+        let pi = p[i]
+        let qi = q[i]
+        if pi > 1.0e-10 {
+            let mut qi_safe = qi
+            if qi_safe < 1.0e-10 { qi_safe = 1.0e-10 }
+            kl = kl + pi * (ul_log(pi) - ul_log(qi_safe))
+        }
+    }
+    if kl < 0.0 { kl = 0.0 }
+    return kl
+}
+
+// Compute KL between original and new model predictions on retain data
+@pure
+fn ul_retain_kl(w_orig, w_new, retain_data) {
+    let n = len(retain_data)
+    if n == 0 { return 0.0 }
+    let mut total_kl = 0.0
+    for i in 0..n {
+        let logits_orig = ul_zeros(2)
+        let logits_new = ul_zeros(2)
+        let pred_orig = ul_forward(w_orig, retain_data[i])
+        let pred_new = ul_forward(w_new, retain_data[i])
+        // Create 2-class distribution from scalar predictions
+        let p = ul_softmax([pred_orig, 0.0 - pred_orig])
+        let q = ul_softmax([pred_new, 0.0 - pred_new])
+        total_kl = total_kl + ul_kl_divergence(p, q)
+    }
+    return total_kl / to_float(n)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  4. Combined Loss
+//
+//  L_total = -alpha * L_forget + beta * L_retain + gamma * KL
+//
+//  Negative forget loss = gradient ascent (maximize forget loss)
+//  Positive retain loss = gradient descent (minimize retain loss)
+//  KL term = keep distributions close
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ul_combined_loss(w, forget_data, forget_targets, retain_data, retain_targets, alpha, beta) {
+    let l_forget = ul_compute_loss(w, forget_data, forget_targets)
+    let l_retain = ul_compute_loss(w, retain_data, retain_targets)
+    // We want to MAXIMIZE forget loss and MINIMIZE retain loss
+    // combined = -alpha * forget_loss + beta * retain_loss
+    return (0.0 - alpha) * l_forget + beta * l_retain
+}
+
+// Combined loss with KL term
+@pure
+fn ul_combined_loss_kl(w_orig, w_new, forget_data, forget_targets, retain_data, retain_targets, alpha, beta, gamma) {
+    let l_forget = ul_compute_loss(w_new, forget_data, forget_targets)
+    let l_retain = ul_compute_loss(w_new, retain_data, retain_targets)
+    let kl = ul_retain_kl(w_orig, w_new, retain_data)
+    return (0.0 - alpha) * l_forget + beta * l_retain + gamma * kl
+}
+
+// One unlearning step: gradient ascent on forget, descent on retain
+@hot
+fn ul_unlearn_step(w, forget_data, forget_targets, retain_data, retain_targets, lr, alpha, beta) {
+    let d = len(w)
+    // Gradient on forget data (ascent: add gradient)
+    let grad_forget = ul_gradient(w, forget_data, forget_targets)
+    // Gradient on retain data (descent: subtract gradient)
+    let grad_retain = ul_gradient(w, retain_data, retain_targets)
+    let mut w_new = ul_zeros(d)
+    for i in 0..d {
+        // ascent on forget + descent on retain
+        w_new[i] = w[i] + lr * alpha * grad_forget[i] - lr * beta * grad_retain[i]
+    }
+    return w_new
+}
+
+// Multi-step unlearning loop
+fn ul_unlearn_loop(w, forget_data, forget_targets, retain_data, retain_targets, lr, alpha, beta, n_steps) {
+    let mut w_cur = w
+    for _step in 0..n_steps {
+        w_cur = ul_unlearn_step(w_cur, forget_data, forget_targets, retain_data, retain_targets, lr, alpha, beta)
+    }
+    return w_cur
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  5. GDR (Gradient-based Data Removal) Metric
+//
+//  Measures how much the model's loss on forget data increased
+//  after unlearning. Higher = better unlearning.
+//
+//  GDR = (L_forget_after - L_forget_before) / (L_forget_before + eps)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ul_gdr_metric(w_orig, w_unlearned, forget_data, forget_targets) {
+    let loss_before = ul_compute_loss(w_orig, forget_data, forget_targets)
+    let loss_after = ul_compute_loss(w_unlearned, forget_data, forget_targets)
+    let eps = 1.0e-8
+    let denom = loss_before + eps
+    return (loss_after - loss_before) / denom
+}
+
+// Normalized GDR in [0, 1] range via sigmoid
+@pure
+fn ul_gdr_normalized(w_orig, w_unlearned, forget_data, forget_targets) {
+    let raw = ul_gdr_metric(w_orig, w_unlearned, forget_data, forget_targets)
+    // sigmoid(raw) to normalize
+    return 1.0 / (1.0 + ul_exp(0.0 - raw))
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  6. Membership Inference Attack
+//
+//  Tests whether the model still "remembers" specific data points.
+//  If the loss on a data point is low, it's likely still memorized.
+//
+//  Returns array of 0/1: 1 = still remembered (attack succeeds)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ul_membership_inference(weights, data_batch, targets, threshold) {
+    let n = len(targets)
+    let mut results = ul_zeros_int(n)
+    for i in 0..n {
+        let loss = ul_loss_single(weights, data_batch[i], targets[i])
+        // Low loss = model remembers this data = attack succeeds
+        if loss < threshold {
+            results[i] = 1
+        }
+    }
+    return results
+}
+
+// Membership inference rate: fraction of data still "remembered"
+@pure
+fn ul_membership_rate(weights, data_batch, targets, threshold) {
+    let results = ul_membership_inference(weights, data_batch, targets, threshold)
+    let n = len(results)
+    if n == 0 { return 0.0 }
+    let mut count = 0
+    for i in 0..n {
+        if results[i] == 1 { count = count + 1 }
+    }
+    return to_float(count) / to_float(n)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  7. Locality Check
+//
+//  Verify that unrelated knowledge is preserved after unlearning.
+//  Compare loss on test data before and after unlearning.
+//  Low drift = good locality.
+//
+//  Returns: relative change in loss (0 = perfect preservation)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ul_locality_score(w_orig, w_new, test_data, test_targets) {
+    let loss_orig = ul_compute_loss(w_orig, test_data, test_targets)
+    let loss_new = ul_compute_loss(w_new, test_data, test_targets)
+    let eps = 1.0e-8
+    return ul_abs(loss_new - loss_orig) / (loss_orig + eps)
+}
+
+// Per-sample locality: check which test samples drifted significantly
+@pure
+fn ul_locality_per_sample(w_orig, w_new, test_data, test_targets, max_drift) {
+    let n = len(test_targets)
+    let mut preserved = ul_zeros_int(n)
+    for i in 0..n {
+        let loss_orig = ul_loss_single(w_orig, test_data[i], test_targets[i])
+        let loss_new = ul_loss_single(w_new, test_data[i], test_targets[i])
+        let eps = 1.0e-8
+        let drift = ul_abs(loss_new - loss_orig) / (loss_orig + eps)
+        if drift < max_drift {
+            preserved[i] = 1
+        }
+    }
+    return preserved
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  8. Selective Unlearning
+//
+//  Target specific facts/entities for unlearning rather than
+//  entire domains. Build a mask from entity IDs.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ul_selective_mask(entity_ids, all_ids) {
+    let n = len(all_ids)
+    let mut mask = ul_zeros_int(n)
+    for i in 0..n {
+        for j in 0..len(entity_ids) {
+            if all_ids[i] == entity_ids[j] {
+                mask[i] = 1
+            }
+        }
+    }
+    return mask
+}
+
+// Selective unlearning step: only unlearn on masked samples
+@hot
+fn ul_selective_unlearn_step(w, all_data, all_targets, select_mask, lr) {
+    let d = len(w)
+    let n = len(all_targets)
+    let mut grad_sum = ul_zeros(d)
+    let mut count = 0
+    for i in 0..n {
+        if select_mask[i] == 1 {
+            let g = ul_gradient_single(w, all_data[i], all_targets[i])
+            for j in 0..d {
+                grad_sum[j] = grad_sum[j] + g[j]
+            }
+            count = count + 1
+        }
+    }
+    if count == 0 { return w }
+    let mut w_new = ul_zeros(d)
+    for i in 0..d {
+        // Ascent on selected samples only
+        w_new[i] = w[i] + lr * grad_sum[i] / to_float(count)
+    }
+    return w_new
+}
+
+// Count entities targeted
+@pure
+fn ul_count_selected(mask) {
+    let mut c = 0
+    for i in 0..len(mask) {
+        if mask[i] == 1 { c = c + 1 }
+    }
+    return c
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  9. Layer-wise Control
+//
+//  Apply different unlearning rates per layer. Deeper layers
+//  (closer to output) typically need higher rates.
+//
+//  layer_rates = base_lr * decay^(n_layers - 1 - layer_idx)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ul_layer_rates(n_layers, base_lr, decay) {
+    let mut rates = ul_zeros(n_layers)
+    for i in 0..n_layers {
+        // Deeper layers get higher rate
+        let exp = to_float(n_layers - 1 - i)
+        let mut factor = 1.0
+        for _j in 0..to_int(exp) {
+            factor = factor * decay
+        }
+        rates[i] = base_lr * factor
+    }
+    return rates
+}
+
+// Apply layer-wise gradient ascent: each layer has its own rate
+// layers: array of weight arrays (one per layer)
+// grads: array of gradient arrays (one per layer)
+// rates: array of learning rates (one per layer)
+@hot
+fn ul_layerwise_step(layers, grads, rates) {
+    let n = len(layers)
+    let mut new_layers = []
+    for i in 0..n {
+        let d = len(layers[i])
+        let mut new_w = ul_zeros(d)
+        for j in 0..d {
+            new_w[j] = layers[i][j] + rates[i] * grads[i][j]
+        }
+        new_layers = new_layers + [new_w]
+    }
+    return new_layers
+}
+
+// Compute gradient for each layer independently
+@pure
+fn ul_layerwise_gradients(layers, data, target) {
+    let n = len(layers)
+    let mut grads = []
+    for i in 0..n {
+        let g = ul_gradient_single(layers[i], data, target)
+        grads = grads + [g]
+    }
+    return grads
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  10. Unlearning Verification Suite
+//
+//  Comprehensive checks that knowledge is removed:
+//    - forget data loss increased
+//    - retain data loss stable
+//    - locality preserved
+//    - membership inference fails on forget data
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ul_verify_forgotten(w, forget_data, forget_targets, threshold) {
+    let loss = ul_compute_loss(w, forget_data, forget_targets)
+    // High loss = knowledge forgotten
+    if loss >= threshold { return 1 }
+    return 0
+}
+
+@pure
+fn ul_verify_retained(w, retain_data, retain_targets, max_loss) {
+    let loss = ul_compute_loss(w, retain_data, retain_targets)
+    // Low loss = knowledge retained
+    if loss <= max_loss { return 1 }
+    return 0
+}
+
+@pure
+fn ul_verify_locality(w_orig, w_new, test_data, test_targets, max_drift) {
+    let drift = ul_locality_score(w_orig, w_new, test_data, test_targets)
+    if drift <= max_drift { return 1 }
+    return 0
+}
+
+@pure
+fn ul_verify_no_memorization(w, forget_data, forget_targets, threshold) {
+    let rate = ul_membership_rate(w, forget_data, forget_targets, threshold)
+    // Low membership rate = good unlearning
+    if rate < 0.5 { return 1 }
+    return 0
+}
+
+// Full verification: returns [forgotten, retained, local, no_mem]
+@pure
+fn ul_full_verify(w_orig, w_new, forget_data, forget_targets, retain_data, retain_targets, test_data, test_targets) {
+    let forgotten = ul_verify_forgotten(w_new, forget_data, forget_targets, 1.0)
+    let retained = ul_verify_retained(w_new, retain_data, retain_targets, 5.0)
+    let local = ul_verify_locality(w_orig, w_new, test_data, test_targets, 2.0)
+    let no_mem = ul_verify_no_memorization(w_new, forget_data, forget_targets, 0.5)
+    return [forgotten, retained, local, no_mem]
+}
+
+// Summary score: fraction of verification checks passed
+@pure
+fn ul_verify_score(verify_results) {
+    let n = len(verify_results)
+    if n == 0 { return 0.0 }
+    let mut passed = 0
+    for i in 0..n {
+        if verify_results[i] == 1 { passed = passed + 1 }
+    }
+    return to_float(passed) / to_float(n)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Utility: Weight distance (L2 norm of difference)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ul_weight_distance(w1, w2) {
+    let d = len(w1)
+    let mut s = 0.0
+    for i in 0..d {
+        let diff = w1[i] - w2[i]
+        s = s + diff * diff
+    }
+    return ul_sqrt(s)
+}
+
+// Cosine similarity between two weight vectors
+@pure
+fn ul_cosine_sim(a, b) {
+    let dot_ab = ul_dot(a, b)
+    let norm_a = ul_sqrt(ul_dot(a, a))
+    let norm_b = ul_sqrt(ul_dot(b, b))
+    let denom = norm_a * norm_b
+    if denom < 1.0e-10 { return 0.0 }
+    return dot_ab / denom
+}
+
+println("[unlearning] loaded — gradient ascent + KL retain + GDR + membership inference + layer-wise control")

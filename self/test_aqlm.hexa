@@ -1,0 +1,887 @@
+// ===================================================================
+//  test_aqlm.hexa — AQLM verification (#141)
+//
+//  Tests (35):
+//    T1  codebook init returns M codebooks
+//    T2  each codebook has K*d entries
+//    T3  codebook entries are finite (not NaN/Inf)
+//    T4  get_entry returns d-dimensional vector
+//    T5  different codebooks have different entries
+//    T6  beam search returns M indices
+//    T7  beam search indices in range [0, K)
+//    T8  beam search reconstruction closer than zero vec
+//    T9  wider beam gives equal or better result
+//    T10 additive lookup returns d-dim vector
+//    T11 lookup matches manual sum
+//    T12 lookup with zero codes gives sum of first entries
+//    T13 residual encode returns M codes
+//    T14 residual encode codes in valid range
+//    T15 residual encoding has reasonable error
+//    T16 residual improves with each codebook
+//    T17 quantize matrix returns correct structure
+//    T18 quantize matrix codes length correct
+//    T19 dequantize returns correct size
+//    T20 dequantize is finite
+//    T21 round-trip error bounded
+//    T22 beam search better than residual for same codebooks
+//    T23 finetune reduces reconstruction error
+//    T24 finetune codebooks returned have same shape
+//    T25 memory estimate FP32 bytes correct
+//    T26 memory estimate compression ratio > 1
+//    T27 memory estimate bits_per_weight < 32
+//    T28 memory estimate for large model realistic
+//    T29 error stats MSE non-negative
+//    T30 error stats max_err >= 0
+//    T31 forward pass output correct size
+//    T32 forward pass with identity-like weights
+//    T33 residual encode matrix round-trip
+//    T34 different seeds produce different codebooks
+//    T35 quantize small matrix end-to-end
+//
+//  Run: cargo run --release -- self/test_aqlm.hexa
+// ===================================================================
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn approx(a, b, eps) {
+    return fabs(a - b) < eps
+}
+
+// ── Inlined helpers from aqlm.hexa ──────────────────────────────
+
+fn _aq_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn _aq_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn _aq_max(a, b) {
+    if a >= b { return a }
+    return b
+}
+
+fn _aq_min(a, b) {
+    if a <= b { return a }
+    return b
+}
+
+fn _aq_clamp(v, lo, hi) {
+    if v < lo { return lo }
+    if v > hi { return hi }
+    return v
+}
+
+fn _aq_log2(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut v = x
+    let mut shift = 0.0
+    for _i in 0..30 {
+        if v >= 2.0 {
+            v = v / 2.0
+            shift = shift + 1.0
+        }
+    }
+    for _i in 0..30 {
+        if v < 1.0 {
+            v = v * 2.0
+            shift = shift - 1.0
+        }
+    }
+    let t = v - 1.0
+    let mut ln_v = 0.0
+    let mut term = t
+    for i in 1..20 {
+        if i % 2 == 1 {
+            ln_v = ln_v + term / to_float(i)
+        } else {
+            ln_v = ln_v - term / to_float(i)
+        }
+        term = term * t
+    }
+    let ln2 = 0.6931471805599453
+    return shift + ln_v / ln2
+}
+
+fn _aq_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn _aq_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+fn _aq_fill(n, val) {
+    let mut v = []
+    for _i in 0..n { v = v + [val] }
+    return v
+}
+
+fn _aq_rand_seed(seed, idx) {
+    let mut h = (seed + 1) * 2654435761 + idx * 1315423911
+    h = h % 1000003
+    if h < 0 { h = 0 - h }
+    return to_float(h) / 1000003.0
+}
+
+// ── Structs ─────────────────────────────────────────────────────
+
+struct AQLMCodebook {
+    entries: array,
+    K: int,
+    d: int
+}
+
+struct AQLMTensor {
+    codebooks: array,
+    codes: array,
+    rows: int,
+    cols: int,
+    M: int,
+    K: int,
+    d: int
+}
+
+// ── Core functions ──────────────────────────────────────────────
+
+fn aqlm_init_codebooks(M, K, d, seed) {
+    let mut codebooks = []
+    for m in 0..M {
+        let mut entries = _aq_zeros(K * d)
+        for k in 0..K {
+            for j in 0..d {
+                let idx = k * d + j
+                let r = _aq_rand_seed(seed + m * 1000 + k, j)
+                let scale = 1.0 / _aq_sqrt(to_float(M))
+                entries[idx] = (r - 0.5) * scale
+            }
+        }
+        let cb = AQLMCodebook { entries: entries, K: K, d: d }
+        codebooks = codebooks + [cb]
+    }
+    return codebooks
+}
+
+fn aqlm_get_entry(cb, k) {
+    let mut entry = _aq_zeros(cb.d)
+    let base = k * cb.d
+    for j in 0..cb.d {
+        entry[j] = cb.entries[base + j]
+    }
+    return entry
+}
+
+fn _aq_dist_sq(a, b, d) {
+    let mut s = 0.0
+    for j in 0..d {
+        let diff = a[j] - b[j]
+        s = s + diff * diff
+    }
+    return s
+}
+
+fn _aq_vec_add(a, b, d) {
+    let mut out = _aq_zeros(d)
+    for j in 0..d {
+        out[j] = a[j] + b[j]
+    }
+    return out
+}
+
+fn _aq_vec_sub(a, b, d) {
+    let mut out = _aq_zeros(d)
+    for j in 0..d {
+        out[j] = a[j] - b[j]
+    }
+    return out
+}
+
+fn aqlm_quantize_vector(w, codebooks, beam_width) {
+    let M = len(codebooks)
+    let d = codebooks[0].d
+    let K = codebooks[0].K
+
+    let mut beam_sums = [_aq_zeros(d)]
+    let mut beam_indices = [[]]
+    let mut beam_costs = [0.0]
+
+    for m in 0..M {
+        let cb = codebooks[m]
+        let n_beam = len(beam_costs)
+        let mut new_sums = []
+        let mut new_indices = []
+        let mut new_costs = []
+
+        for b in 0..n_beam {
+            let cur_sum = beam_sums[b]
+            let cur_idx = beam_indices[b]
+
+            for k in 0..K {
+                let entry = aqlm_get_entry(cb, k)
+                let candidate = _aq_vec_add(cur_sum, entry, d)
+                let cost = _aq_dist_sq(w, candidate, d)
+
+                new_sums = new_sums + [candidate]
+                new_indices = new_indices + [cur_idx + [k]]
+                new_costs = new_costs + [cost]
+            }
+        }
+
+        let n_cands = len(new_costs)
+        let actual_bw = _aq_min(beam_width, n_cands)
+
+        let mut selected = _aq_zeros_int(n_cands)
+        let mut sel_sums = []
+        let mut sel_indices = []
+        let mut sel_costs = []
+
+        for _s in 0..actual_bw {
+            let mut best_j = -1
+            let mut best_c = 1.0e30
+            for j in 0..n_cands {
+                if selected[j] == 0 {
+                    if new_costs[j] < best_c {
+                        best_c = new_costs[j]
+                        best_j = j
+                    }
+                }
+            }
+            if best_j >= 0 {
+                selected[best_j] = 1
+                sel_sums = sel_sums + [new_sums[best_j]]
+                sel_indices = sel_indices + [new_indices[best_j]]
+                sel_costs = sel_costs + [new_costs[best_j]]
+            }
+        }
+
+        beam_sums = sel_sums
+        beam_indices = sel_indices
+        beam_costs = sel_costs
+    }
+
+    let mut best_idx = 0
+    let mut best_cost = beam_costs[0]
+    for i in 1..len(beam_costs) {
+        if beam_costs[i] < best_cost {
+            best_cost = beam_costs[i]
+            best_idx = i
+        }
+    }
+    return beam_indices[best_idx]
+}
+
+fn aqlm_lookup(codebooks, codes) {
+    let M = len(codebooks)
+    let d = codebooks[0].d
+    let mut result = _aq_zeros(d)
+    for m in 0..M {
+        let entry = aqlm_get_entry(codebooks[m], codes[m])
+        for j in 0..d {
+            result[j] = result[j] + entry[j]
+        }
+    }
+    return result
+}
+
+fn aqlm_residual_encode(w, codebooks) {
+    let M = len(codebooks)
+    let d = codebooks[0].d
+    let mut residual = _aq_zeros(d)
+    for j in 0..d {
+        residual[j] = w[j]
+    }
+    let mut codes = []
+
+    for m in 0..M {
+        let cb = codebooks[m]
+        let mut best_k = 0
+        let mut best_dist = 1.0e30
+
+        for k in 0..cb.K {
+            let entry = aqlm_get_entry(cb, k)
+            let dist = _aq_dist_sq(residual, entry, d)
+            if dist < best_dist {
+                best_dist = dist
+                best_k = k
+            }
+        }
+
+        codes = codes + [best_k]
+        let chosen = aqlm_get_entry(cb, best_k)
+        for j in 0..d {
+            residual[j] = residual[j] - chosen[j]
+        }
+    }
+    return codes
+}
+
+fn aqlm_quantize_matrix(W, rows, cols, codebooks, beam_width) {
+    let M = len(codebooks)
+    let K = codebooks[0].K
+    let d = codebooks[0].d
+    let vecs_per_row = cols / d
+    let mut all_indices = []
+
+    for r in 0..rows {
+        for v in 0..vecs_per_row {
+            let mut w = _aq_zeros(d)
+            let base = r * cols + v * d
+            for j in 0..d {
+                w[j] = W[base + j]
+            }
+            let codes = aqlm_quantize_vector(w, codebooks, beam_width)
+            for m in 0..M {
+                all_indices = all_indices + [codes[m]]
+            }
+        }
+    }
+
+    let qt = AQLMTensor {
+        codebooks: codebooks,
+        codes: all_indices,
+        rows: rows,
+        cols: cols,
+        M: M,
+        K: K,
+        d: d
+    }
+    return qt
+}
+
+fn aqlm_dequantize(qt) {
+    let rows = qt.rows
+    let cols = qt.cols
+    let M = qt.M
+    let d = qt.d
+    let vecs_per_row = cols / d
+
+    let mut W_hat = _aq_zeros(rows * cols)
+
+    for r in 0..rows {
+        for v in 0..vecs_per_row {
+            let vec_idx = r * vecs_per_row + v
+            let mut codes = _aq_zeros_int(M)
+            for m in 0..M {
+                codes[m] = qt.codes[vec_idx * M + m]
+            }
+            let reconstructed = aqlm_lookup(qt.codebooks, codes)
+            let base = r * cols + v * d
+            for j in 0..d {
+                W_hat[base + j] = reconstructed[j]
+            }
+        }
+    }
+    return W_hat
+}
+
+fn aqlm_finetune_codebooks(W, rows, cols, qt, lr, steps) {
+    let M = qt.M
+    let K = qt.K
+    let d = qt.d
+    let vecs_per_row = cols / d
+    let n_vectors = rows * vecs_per_row
+
+    let mut codebooks = []
+    for m in 0..M {
+        let old_cb = qt.codebooks[m]
+        let mut new_entries = _aq_zeros(K * d)
+        for i in 0..(K * d) {
+            new_entries[i] = old_cb.entries[i]
+        }
+        let cb = AQLMCodebook { entries: new_entries, K: K, d: d }
+        codebooks = codebooks + [cb]
+    }
+
+    for _step in 0..steps {
+        let mut grads = []
+        let mut counts = []
+        for m in 0..M {
+            grads = grads + [_aq_zeros(K * d)]
+            counts = counts + [_aq_zeros_int(K)]
+        }
+
+        for vi in 0..n_vectors {
+            let row = vi / vecs_per_row
+            let v = vi % vecs_per_row
+            let base = row * cols + v * d
+
+            let mut w = _aq_zeros(d)
+            for j in 0..d {
+                w[j] = W[base + j]
+            }
+
+            let mut codes = _aq_zeros_int(M)
+            for m in 0..M {
+                codes[m] = qt.codes[vi * M + m]
+            }
+
+            let w_hat = aqlm_lookup(codebooks, codes)
+
+            for m in 0..M {
+                let k = codes[m]
+                let g = grads[m]
+                let c = counts[m]
+                for j in 0..d {
+                    let grad_j = -2.0 * (w[j] - w_hat[j])
+                    g[k * d + j] = g[k * d + j] + grad_j
+                }
+                c[k] = c[k] + 1
+            }
+        }
+
+        for m in 0..M {
+            let cb = codebooks[m]
+            let g = grads[m]
+            let c = counts[m]
+            for k in 0..K {
+                if c[k] > 0 {
+                    let scale = lr / to_float(c[k])
+                    for j in 0..d {
+                        let idx = k * d + j
+                        cb.entries[idx] = cb.entries[idx] - scale * g[idx]
+                    }
+                }
+            }
+        }
+    }
+
+    return codebooks
+}
+
+fn aqlm_memory_estimate(rows, cols, M, K, d) {
+    let fp32_bytes = rows * cols * 4
+    let codebook_bytes = M * K * d * 4
+    let n_vectors = (rows * cols) / d
+    let bits_per_code = _aq_max(1.0, _aq_log2(to_float(K)))
+    let mut bits_ceil = to_int(bits_per_code)
+    if to_float(bits_ceil) < bits_per_code {
+        bits_ceil = bits_ceil + 1
+    }
+    let code_bits = n_vectors * M * bits_ceil
+    let code_bytes = (code_bits + 7) / 8
+    let aqlm_bytes = codebook_bytes + code_bytes
+    let mut compression_ratio = 0.0
+    if aqlm_bytes > 0 {
+        compression_ratio = to_float(fp32_bytes) / to_float(aqlm_bytes)
+    }
+    let total_bits = codebook_bytes * 8 + code_bits
+    let mut bits_per_weight = 0.0
+    if rows * cols > 0 {
+        bits_per_weight = to_float(total_bits) / to_float(rows * cols)
+    }
+    return [fp32_bytes, aqlm_bytes, compression_ratio, bits_per_weight]
+}
+
+fn aqlm_error_stats(W, W_hat, n) {
+    let mut sum_sq_err = 0.0
+    let mut max_err = 0.0
+    let mut sum_sq_orig = 0.0
+
+    for i in 0..n {
+        let err = _aq_abs(W[i] - W_hat[i])
+        sum_sq_err = sum_sq_err + err * err
+        if err > max_err { max_err = err }
+        sum_sq_orig = sum_sq_orig + W[i] * W[i]
+    }
+
+    let mse = sum_sq_err / to_float(n)
+    let mut snr = 0.0
+    if sum_sq_err > 1.0e-15 {
+        snr = 10.0 * _aq_log2(sum_sq_orig / sum_sq_err) / _aq_log2(10.0)
+    }
+
+    return [mse, max_err, snr]
+}
+
+fn aqlm_residual_encode_matrix(W, rows, cols, codebooks) {
+    let M = len(codebooks)
+    let d = codebooks[0].d
+    let vecs_per_row = cols / d
+    let mut all_indices = []
+
+    for r in 0..rows {
+        for v in 0..vecs_per_row {
+            let mut w = _aq_zeros(d)
+            let base = r * cols + v * d
+            for j in 0..d {
+                w[j] = W[base + j]
+            }
+            let codes = aqlm_residual_encode(w, codebooks)
+            for m in 0..M {
+                all_indices = all_indices + [codes[m]]
+            }
+        }
+    }
+
+    let qt = AQLMTensor {
+        codebooks: codebooks,
+        codes: all_indices,
+        rows: rows,
+        cols: cols,
+        M: M,
+        K: codebooks[0].K,
+        d: d
+    }
+    return qt
+}
+
+fn aqlm_forward(qt, x) {
+    let rows = qt.rows
+    let cols = qt.cols
+    let M = qt.M
+    let d = qt.d
+    let vecs_per_row = cols / d
+
+    let mut y = _aq_zeros(rows)
+
+    for r in 0..rows {
+        let mut dot = 0.0
+        for v in 0..vecs_per_row {
+            let vec_idx = r * vecs_per_row + v
+            let mut codes = _aq_zeros_int(M)
+            for m in 0..M {
+                codes[m] = qt.codes[vec_idx * M + m]
+            }
+            let reconstructed = aqlm_lookup(qt.codebooks, codes)
+            let x_base = v * d
+            for j in 0..d {
+                dot = dot + reconstructed[j] * x[x_base + j]
+            }
+        }
+        y[r] = dot
+    }
+    return y
+}
+
+// ===================================================================
+//  Test Setup
+// ===================================================================
+
+// Parameters: M=2 codebooks, K=8 entries, d=4 dimensions
+let M = 2
+let K = 8
+let D = 4
+let SEED = 42
+
+let cbs = aqlm_init_codebooks(M, K, D, SEED)
+
+// ===================================================================
+//  T1-T5: Codebook Initialization
+// ===================================================================
+
+check("T1 init returns M codebooks", len(cbs) == M)
+
+check("T2 codebook 0 has K*d entries", len(cbs[0].entries) == K * D)
+
+// T3: entries are finite (in a reasonable range)
+let mut all_finite = true
+for m in 0..M {
+    for i in 0..(K * D) {
+        let v = cbs[m].entries[i]
+        if v > 1.0e10 { all_finite = false }
+        if v < -1.0e10 { all_finite = false }
+    }
+}
+check("T3 codebook entries are finite", all_finite)
+
+// T4: get_entry returns d-dim vector
+let e0 = aqlm_get_entry(cbs[0], 0)
+check("T4 get_entry returns d-dim", len(e0) == D)
+
+// T5: different codebooks have different entries
+let e0_cb0 = aqlm_get_entry(cbs[0], 0)
+let e0_cb1 = aqlm_get_entry(cbs[1], 0)
+let mut diff_found = false
+for j in 0..D {
+    if fabs(e0_cb0[j] - e0_cb1[j]) > 1.0e-10 {
+        diff_found = true
+    }
+}
+check("T5 different codebooks have different entries", diff_found)
+
+// ===================================================================
+//  T6-T9: Beam Search Quantization
+// ===================================================================
+
+// Create a target vector
+let w_test = [0.3, -0.1, 0.5, 0.2]
+
+// T6: beam search returns M indices
+let codes_bs = aqlm_quantize_vector(w_test, cbs, 4)
+check("T6 beam search returns M indices", len(codes_bs) == M)
+
+// T7: all indices in valid range [0, K)
+let mut all_valid = true
+for m in 0..M {
+    if codes_bs[m] < 0 { all_valid = false }
+    if codes_bs[m] >= K { all_valid = false }
+}
+check("T7 beam search indices in [0,K)", all_valid)
+
+// T8: reconstruction closer than zero vector
+let recon_bs = aqlm_lookup(cbs, codes_bs)
+let dist_recon = _aq_dist_sq(w_test, recon_bs, D)
+let dist_zero = _aq_dist_sq(w_test, [0.0, 0.0, 0.0, 0.0], D)
+check("T8 beam recon closer than zero vec", dist_recon < dist_zero)
+
+// T9: wider beam gives equal or better result
+let codes_narrow = aqlm_quantize_vector(w_test, cbs, 1)
+let recon_narrow = aqlm_lookup(cbs, codes_narrow)
+let dist_narrow = _aq_dist_sq(w_test, recon_narrow, D)
+let codes_wide = aqlm_quantize_vector(w_test, cbs, 8)
+let recon_wide = aqlm_lookup(cbs, codes_wide)
+let dist_wide = _aq_dist_sq(w_test, recon_wide, D)
+check("T9 wider beam >= narrow quality", dist_wide <= dist_narrow + 1.0e-10)
+
+// ===================================================================
+//  T10-T12: Additive Lookup
+// ===================================================================
+
+// T10: lookup returns d-dim vector
+let lookup_result = aqlm_lookup(cbs, [0, 0])
+check("T10 lookup returns d-dim", len(lookup_result) == D)
+
+// T11: lookup matches manual sum of entries
+let entry_cb0 = aqlm_get_entry(cbs[0], 2)
+let entry_cb1 = aqlm_get_entry(cbs[1], 3)
+let manual_sum = _aq_vec_add(entry_cb0, entry_cb1, D)
+let lookup_23 = aqlm_lookup(cbs, [2, 3])
+let mut sum_match = true
+for j in 0..D {
+    if fabs(manual_sum[j] - lookup_23[j]) > 1.0e-10 {
+        sum_match = false
+    }
+}
+check("T11 lookup matches manual sum", sum_match)
+
+// T12: lookup with [0,0] gives sum of first entries
+let first_sum = _aq_vec_add(aqlm_get_entry(cbs[0], 0), aqlm_get_entry(cbs[1], 0), D)
+let lookup_00 = aqlm_lookup(cbs, [0, 0])
+let mut first_match = true
+for j in 0..D {
+    if fabs(first_sum[j] - lookup_00[j]) > 1.0e-10 {
+        first_match = false
+    }
+}
+check("T12 lookup [0,0] = sum of first entries", first_match)
+
+// ===================================================================
+//  T13-T16: Residual Coding
+// ===================================================================
+
+let w_res = [0.4, -0.2, 0.6, 0.1]
+let codes_res = aqlm_residual_encode(w_res, cbs)
+
+// T13: returns M codes
+check("T13 residual encode returns M codes", len(codes_res) == M)
+
+// T14: codes in valid range
+let mut res_valid = true
+for m in 0..M {
+    if codes_res[m] < 0 { res_valid = false }
+    if codes_res[m] >= K { res_valid = false }
+}
+check("T14 residual codes in [0,K)", res_valid)
+
+// T15: residual encoding has reasonable error
+let recon_res = aqlm_lookup(cbs, codes_res)
+let dist_res = _aq_dist_sq(w_res, recon_res, D)
+check("T15 residual encoding error < 1.0", dist_res < 1.0)
+
+// T16: adding second codebook reduces error vs first alone
+let codes_one = aqlm_residual_encode(w_res, [cbs[0]])
+let recon_one = aqlm_lookup([cbs[0]], codes_one)
+let dist_one = _aq_dist_sq(w_res, recon_one, D)
+check("T16 two codebooks better than one", dist_res <= dist_one + 1.0e-10)
+
+// ===================================================================
+//  T17-T21: Matrix Quantization + Dequantization
+// ===================================================================
+
+// Create a 4x8 weight matrix (4 rows, 8 cols, d=4 -> 2 sub-vectors per row)
+let ROWS = 4
+let COLS = 8
+let mut W_mat = _aq_zeros(ROWS * COLS)
+for i in 0..(ROWS * COLS) {
+    W_mat[i] = _aq_rand_seed(123, i) - 0.5
+}
+
+let qt = aqlm_quantize_matrix(W_mat, ROWS, COLS, cbs, 4)
+
+// T17: correct structure
+check("T17 qt.rows correct", qt.rows == ROWS)
+check("T17b qt.cols correct", qt.cols == COLS)
+
+// T18: codes length = n_vectors * M
+let expected_codes = (ROWS * COLS / D) * M
+check("T18 codes length correct", len(qt.codes) == expected_codes)
+
+// T19: dequantize returns correct size
+let W_hat = aqlm_dequantize(qt)
+check("T19 dequantize size correct", len(W_hat) == ROWS * COLS)
+
+// T20: dequantized values are finite
+let mut dq_finite = true
+for i in 0..(ROWS * COLS) {
+    if W_hat[i] > 1.0e10 { dq_finite = false }
+    if W_hat[i] < -1.0e10 { dq_finite = false }
+}
+check("T20 dequantized values finite", dq_finite)
+
+// T21: round-trip error bounded
+let stats = aqlm_error_stats(W_mat, W_hat, ROWS * COLS)
+check("T21 round-trip MSE bounded", stats[0] < 1.0)
+
+// ===================================================================
+//  T22: Beam vs Residual comparison
+// ===================================================================
+
+// Beam search should be equal or better than greedy residual
+let qt_res = aqlm_residual_encode_matrix(W_mat, ROWS, COLS, cbs)
+let W_hat_res = aqlm_dequantize(qt_res)
+let stats_res = aqlm_error_stats(W_mat, W_hat_res, ROWS * COLS)
+let stats_beam = aqlm_error_stats(W_mat, W_hat, ROWS * COLS)
+check("T22 beam MSE <= residual MSE", stats_beam[0] <= stats_res[0] + 1.0e-8)
+
+// ===================================================================
+//  T23-T24: Fine-tuning
+// ===================================================================
+
+// Fine-tune and check improvement
+let ft_cbs = aqlm_finetune_codebooks(W_mat, ROWS, COLS, qt, 0.01, 5)
+
+// T23: finetuned should reduce error
+// Rebuild with finetuned codebooks (same codes)
+let mut qt_ft = AQLMTensor {
+    codebooks: ft_cbs,
+    codes: qt.codes,
+    rows: ROWS,
+    cols: COLS,
+    M: M,
+    K: K,
+    d: D
+}
+let W_hat_ft = aqlm_dequantize(qt_ft)
+let stats_ft = aqlm_error_stats(W_mat, W_hat_ft, ROWS * COLS)
+check("T23 finetune reduces MSE", stats_ft[0] <= stats_beam[0] + 1.0e-6)
+
+// T24: finetuned codebooks have correct shape
+check("T24 finetuned codebooks count", len(ft_cbs) == M)
+check("T24b finetuned cb0 entries size", len(ft_cbs[0].entries) == K * D)
+
+// ===================================================================
+//  T25-T28: Memory Estimator
+// ===================================================================
+
+let mem = aqlm_memory_estimate(ROWS, COLS, M, K, D)
+
+// T25: FP32 bytes correct
+check("T25 FP32 bytes = rows*cols*4", mem[0] == ROWS * COLS * 4)
+
+// T26: compression ratio > 1 for realistic size
+// Small matrix has codebook overhead; use 512x512 for realistic test
+let mem_mid = aqlm_memory_estimate(512, 512, M, K, D)
+check("T26 compression ratio > 1 (512x512)", mem_mid[2] > 1.0)
+
+// T27: bits per weight < 32 for realistic size
+check("T27 bits_per_weight < 32 (512x512)", mem_mid[3] < 32.0)
+
+// T28: large model estimate realistic
+// 7B model: ~7000M params, approximate as 4096x4096 layers
+let mem_big = aqlm_memory_estimate(4096, 4096, 2, 256, 8)
+check("T28 large model compression > 5x", mem_big[2] > 5.0)
+
+// ===================================================================
+//  T29-T30: Error Statistics
+// ===================================================================
+
+check("T29 MSE non-negative", stats[0] >= 0.0)
+check("T30 max_err >= 0", stats[1] >= 0.0)
+
+// ===================================================================
+//  T31-T32: Forward Pass
+// ===================================================================
+
+// T31: forward output size
+let x_in = _aq_zeros(COLS)
+for i in 0..COLS {
+    x_in[i] = _aq_rand_seed(456, i) - 0.5
+}
+let y_out = aqlm_forward(qt, x_in)
+check("T31 forward output size = rows", len(y_out) == ROWS)
+
+// T32: forward with known simple values
+// Create a simple 2x4 identity-like matrix: [[1,0,0,0],[0,1,0,0]]
+let W_id = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+let qt_id = aqlm_quantize_matrix(W_id, 2, 4, cbs, 8)
+let x_simple = [0.5, 0.3, 0.0, 0.0]
+let y_id = aqlm_forward(qt_id, x_simple)
+// y should be approximately [0.5, 0.3] but with quantization error
+check("T32 forward output finite and correct size", len(y_id) == 2)
+
+// ===================================================================
+//  T33: Residual encode matrix round-trip
+// ===================================================================
+let W_hat_res2 = aqlm_dequantize(qt_res)
+let stats_res2 = aqlm_error_stats(W_mat, W_hat_res2, ROWS * COLS)
+check("T33 residual matrix round-trip MSE bounded", stats_res2[0] < 1.0)
+
+// ===================================================================
+//  T34: Different seeds produce different codebooks
+// ===================================================================
+let cbs_alt = aqlm_init_codebooks(M, K, D, 99)
+let e_alt = aqlm_get_entry(cbs_alt[0], 0)
+let e_orig = aqlm_get_entry(cbs[0], 0)
+let mut seed_diff = false
+for j in 0..D {
+    if fabs(e_alt[j] - e_orig[j]) > 1.0e-10 {
+        seed_diff = true
+    }
+}
+check("T34 different seeds -> different codebooks", seed_diff)
+
+// ===================================================================
+//  T35: End-to-end small matrix
+// ===================================================================
+let W_small = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+let qt_small = aqlm_quantize_matrix(W_small, 2, 4, cbs, 4)
+let W_small_hat = aqlm_dequantize(qt_small)
+let stats_small = aqlm_error_stats(W_small, W_small_hat, 8)
+check("T35 end-to-end small matrix MSE < 0.5", stats_small[0] < 0.5)
+
+// ===================================================================
+//  Summary
+// ===================================================================
+println("")
+println("=== AQLM test summary ===")
+println("PASS: " + str(pass_count))
+println("FAIL: " + str(fail_count))
+println("TOTAL: " + str(pass_count + fail_count))

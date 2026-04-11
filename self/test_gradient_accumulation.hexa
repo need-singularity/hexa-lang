@@ -1,21 +1,50 @@
-// ===================================================================
-//  test_gradient_accumulation.hexa — Gradient Accumulation Tests
+// ═══════════════════════════════════════════════════════════════
+//  test_gradient_accumulation.hexa — Gradient Accumulation (#139)
 //
-//  Validates:
-//    1. create_accumulator initialization
-//    2. accumulate adds gradients
-//    3. should_step returns false before N steps
-//    4. should_step returns true at N steps
-//    5. get_accumulated returns averaged gradients
-//    6. reset zeroes the buffer
-//    7. effective_batch_size calculation
-//    8. Multi-round accumulation
-//    9. Gradient sync timing
-//   10. Step counter tracking
+//  Tests (35):
+//    T1  config stores micro_batch_size
+//    T2  config stores accumulation_steps
+//    T3  config stores num_devices
+//    T4  config stores learning rate
+//    T5  effective batch size = micro_bs * accum * devices
+//    T6  effective batch size multi-device
+//    T7  split batch: correct number of chunks
+//    T8  split batch: chunk sizes correct
+//    T9  split batch: uneven split has smaller last chunk
+//    T10 split batch: empty data returns empty
+//    T11 new buffer is all zeros
+//    T12 zero_grad resets buffer
+//    T13 accumulate adds gradients element-wise
+//    T14 accumulate twice sums both
+//    T15 normalize_loss divides by accum_steps
+//    T16 normalize_loss accum=1 returns same
+//    T17 normalize_grads scales buffer
+//    T18 should_step true at last micro-step
+//    T19 should_step false at intermediate step
+//    T20 no_sync true during accumulation
+//    T21 no_sync false at last step
+//    T22 new_state initializes correctly
+//    T23 ga_step accumulates mid-window
+//    T24 ga_step triggers optimizer at window end
+//    T25 global_step increments after full accumulation
+//    T26 progress tracking returns correct step
+//    T27 is_accumulating true mid-window
+//    T28 is_accumulating false at start
+//    T29 memory savings positive for smaller micro-batch
+//    T30 memory with accum < memory without accum
+//    T31 lr_schedule_step equals global_step
+//    T32 cosine_lr at step 0 equals base_lr
+//    T33 cosine_lr at final step is near 0
+//    T34 apply_update decreases params with positive grads
+//    T35 full_train_step processes all micro-batches
+//    T36 grad_norm computes L2 norm
+//    T37 clip_grads reduces norm to max_norm
+//    T38 clip_grads no-op when norm < max
+//    T39 warmup_cosine_lr starts at 0 and ramps up
+//    T40 total_train_steps correct count
 //
-//  Execution: ./hexa self/test_gradient_accumulation.hexa
-//  Minimum 8 check() statements.
-// ===================================================================
+//  Run: cargo run --release -- self/test_gradient_accumulation.hexa
+// ═══════════════════════════════════════════════════════════════
 
 let mut pass_count = 0
 let mut fail_count = 0
@@ -30,243 +59,448 @@ fn check(name, cond) {
     }
 }
 
-fn fabs(x) {
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ── inlined from gradient_accumulation.hexa ─────────────────
+
+fn ga_abs(x) {
     if x < 0.0 { return 0.0 - x }
     return x
 }
 
-// ===================================================================
-//  Inline module (self-contained test)
-// ===================================================================
-
-struct GradAccumulator {
-    accumulation_steps: int,
-    current_step: int,
-    accumulated_grads: array,
-    total_steps_done: int,
-    num_optimizer_steps: int,
-    is_initialized: bool
+fn ga_cos_approx(x) {
+    let pi = 3.141592653589793
+    let two_pi = 6.283185307179586
+    let mut v = x
+    for _i in 0..20 {
+        if v > pi { v = v - two_pi }
+        if v < 0.0 - pi { v = v + two_pi }
+    }
+    let v2 = v * v
+    let v4 = v2 * v2
+    let v6 = v4 * v2
+    let v8 = v6 * v2
+    return 1.0 - v2 / 2.0 + v4 / 24.0 - v6 / 720.0 + v8 / 40320.0
 }
 
-fn create_accumulator(steps) {
-    if steps < 1 {
-        return GradAccumulator {
-            accumulation_steps: 1,
-            current_step: 0,
-            accumulated_grads: [],
-            total_steps_done: 0,
-            num_optimizer_steps: 0,
-            is_initialized: false
+fn ga_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn ga_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn ga_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+fn ga_new_config(micro_bs, accum_steps, num_devices, lr) {
+    return [to_float(micro_bs), to_float(accum_steps), to_float(num_devices), lr]
+}
+
+fn ga_config_micro_bs(config) { return to_int(config[0]) }
+fn ga_config_accum_steps(config) { return to_int(config[1]) }
+fn ga_config_num_devices(config) { return to_int(config[2]) }
+fn ga_config_lr(config) { return config[3] }
+
+fn ga_effective_batch_size(config) {
+    let mbs = ga_config_micro_bs(config)
+    let acc = ga_config_accum_steps(config)
+    let dev = ga_config_num_devices(config)
+    return mbs * acc * dev
+}
+
+fn ga_split_batch(data, micro_bs) {
+    let n = len(data)
+    if n == 0 { return [] }
+    if micro_bs <= 0 { return [] }
+    let mut batches = []
+    let mut start = 0
+    for _i in 0..n {
+        if start >= n { break }
+        let mut end_idx = start + micro_bs
+        if end_idx > n { end_idx = n }
+        let mut chunk = []
+        for j in start..end_idx {
+            chunk = chunk + [data[j]]
         }
+        batches = batches + [chunk]
+        start = end_idx
     }
-    return GradAccumulator {
-        accumulation_steps: steps,
-        current_step: 0,
-        accumulated_grads: [],
-        total_steps_done: 0,
-        num_optimizer_steps: 0,
-        is_initialized: false
-    }
+    return batches
 }
 
-fn accumulate(acc, grad) {
-    let n = len(grad)
-    if !acc.is_initialized {
-        let mut init_grads = []
-        let mut i = 0
-        while i < n {
-            init_grads = init_grads + [grad[i]]
-            i = i + 1
-        }
-        return GradAccumulator {
-            accumulation_steps: acc.accumulation_steps,
-            current_step: 1,
-            accumulated_grads: init_grads,
-            total_steps_done: acc.total_steps_done + 1,
-            num_optimizer_steps: acc.num_optimizer_steps,
-            is_initialized: true
-        }
-    }
-    let an = len(acc.accumulated_grads)
-    let mut new_grads = []
-    let mut i = 0
-    while i < an {
-        let gi = i % n
-        new_grads = new_grads + [acc.accumulated_grads[i] + grad[gi]]
-        i = i + 1
-    }
-    return GradAccumulator {
-        accumulation_steps: acc.accumulation_steps,
-        current_step: acc.current_step + 1,
-        accumulated_grads: new_grads,
-        total_steps_done: acc.total_steps_done + 1,
-        num_optimizer_steps: acc.num_optimizer_steps,
-        is_initialized: true
-    }
+fn ga_new_buffer(param_count) { return ga_zeros(param_count) }
+
+fn ga_zero_grad(buffer) {
+    let n = len(buffer)
+    return ga_zeros(n)
 }
 
-fn should_step(acc) {
-    return acc.current_step >= acc.accumulation_steps
-}
-
-fn get_accumulated(acc) {
-    let n = len(acc.accumulated_grads)
-    let divisor = to_float(acc.accumulation_steps)
-    let mut out = []
-    let mut i = 0
-    while i < n {
-        out = out + [acc.accumulated_grads[i] / divisor]
-        i = i + 1
+fn ga_accumulate(buffer, grads) {
+    let n = len(buffer)
+    let mut out = ga_zeros(n)
+    for i in 0..n {
+        out[i] = buffer[i] + grads[i]
     }
     return out
 }
 
-fn reset(acc) {
-    let n = len(acc.accumulated_grads)
-    let mut zeros = []
-    let mut i = 0
-    while i < n {
-        zeros = zeros + [0.0]
-        i = i + 1
+fn ga_normalize_loss(loss, accum_steps) {
+    if accum_steps <= 0 { return loss }
+    return loss / to_float(accum_steps)
+}
+
+fn ga_normalize_grads(buffer, accum_steps) {
+    let n = len(buffer)
+    let scale = 1.0 / to_float(accum_steps)
+    let mut out = ga_zeros(n)
+    for i in 0..n {
+        out[i] = buffer[i] * scale
     }
-    return GradAccumulator {
-        accumulation_steps: acc.accumulation_steps,
-        current_step: 0,
-        accumulated_grads: zeros,
-        total_steps_done: acc.total_steps_done,
-        num_optimizer_steps: acc.num_optimizer_steps + 1,
-        is_initialized: true
+    return out
+}
+
+fn ga_should_step(micro_step, accum_steps) {
+    return micro_step == accum_steps - 1
+}
+
+fn ga_no_sync(micro_step, accum_steps) {
+    return micro_step < accum_steps - 1
+}
+
+fn ga_new_state(config, param_count) {
+    return #{
+        "config": config,
+        "buffer": ga_new_buffer(param_count),
+        "micro_step": 0,
+        "global_step": 0,
+        "total_loss": 0.0,
+        "param_count": param_count
     }
 }
 
-fn effective_batch_size(micro_batch, accumulation_steps) {
-    return micro_batch * accumulation_steps
+fn ga_get_progress(state) {
+    let accum = ga_config_accum_steps(state["config"])
+    return [state["micro_step"], accum]
 }
 
-fn should_sync(acc) {
-    return should_step(acc)
+fn ga_is_accumulating(state) {
+    let accum = ga_config_accum_steps(state["config"])
+    let ms = state["micro_step"]
+    if ms > 0 {
+        if ms < accum { return true }
+    }
+    return false
 }
 
-// ===================================================================
+fn ga_step(state, micro_grads, micro_loss) {
+    let config = state["config"]
+    let accum_steps = ga_config_accum_steps(config)
+    let param_count = state["param_count"]
+
+    let norm_loss = ga_normalize_loss(micro_loss, accum_steps)
+    let new_buffer = ga_accumulate(state["buffer"], micro_grads)
+    let new_total_loss = state["total_loss"] + norm_loss
+    let new_micro = state["micro_step"] + 1
+
+    if new_micro >= accum_steps {
+        let final_grads = ga_normalize_grads(new_buffer, accum_steps)
+        return #{
+            "config": config,
+            "buffer": ga_new_buffer(param_count),
+            "micro_step": 0,
+            "global_step": state["global_step"] + 1,
+            "total_loss": 0.0,
+            "param_count": param_count,
+            "last_grads": final_grads,
+            "last_loss": new_total_loss
+        }
+    }
+
+    return #{
+        "config": config,
+        "buffer": new_buffer,
+        "micro_step": new_micro,
+        "global_step": state["global_step"],
+        "total_loss": new_total_loss,
+        "param_count": param_count
+    }
+}
+
+fn ga_memory_without_accum(batch_size, param_count) {
+    return batch_size * param_count + param_count + param_count
+}
+
+fn ga_memory_with_accum(micro_bs, param_count) {
+    return micro_bs * param_count + param_count + param_count
+}
+
+fn ga_memory_savings(batch_size, micro_bs, param_count) {
+    let without = ga_memory_without_accum(batch_size, param_count)
+    let with_acc = ga_memory_with_accum(micro_bs, param_count)
+    if without == 0 { return 0.0 }
+    return 1.0 - to_float(with_acc) / to_float(without)
+}
+
+fn ga_lr_schedule_step(state) { return state["global_step"] }
+
+fn ga_cosine_lr(base_lr, step, total_steps) {
+    if total_steps <= 0 { return base_lr }
+    if step >= total_steps { return 0.0 }
+    let pi = 3.141592653589793
+    let progress = to_float(step) / to_float(total_steps)
+    let decay = 0.5 * (1.0 + ga_cos_approx(pi * progress))
+    return base_lr * decay
+}
+
+fn ga_warmup_cosine_lr(base_lr, step, warmup_steps, total_steps) {
+    if step < warmup_steps {
+        if warmup_steps == 0 { return base_lr }
+        return base_lr * to_float(step) / to_float(warmup_steps)
+    }
+    let decay_steps = total_steps - warmup_steps
+    let decay_step = step - warmup_steps
+    return ga_cosine_lr(base_lr, decay_step, decay_steps)
+}
+
+fn ga_apply_update(params, grads, lr) {
+    let n = len(params)
+    let mut out = ga_zeros(n)
+    for i in 0..n {
+        out[i] = params[i] - lr * grads[i]
+    }
+    return out
+}
+
+fn ga_full_train_step(state, all_micro_grads, all_micro_losses) {
+    let n = len(all_micro_grads)
+    let mut s = state
+    for i in 0..n {
+        s = ga_step(s, all_micro_grads[i], all_micro_losses[i])
+    }
+    return s
+}
+
+fn ga_grad_norm(grads) {
+    let n = len(grads)
+    let mut sum_sq = 0.0
+    for i in 0..n {
+        sum_sq = sum_sq + grads[i] * grads[i]
+    }
+    return ga_sqrt(sum_sq)
+}
+
+fn ga_clip_grads(grads, max_norm) {
+    let norm = ga_grad_norm(grads)
+    if norm <= max_norm { return grads }
+    let scale = max_norm / norm
+    let n = len(grads)
+    let mut out = ga_zeros(n)
+    for i in 0..n {
+        out[i] = grads[i] * scale
+    }
+    return out
+}
+
+fn ga_mock_forward_backward(data, param_count) {
+    let n = len(data)
+    let mut grads = ga_zeros(param_count)
+    let mut loss = 0.0
+    for i in 0..n {
+        loss = loss + data[i] * data[i]
+        for p in 0..param_count {
+            grads[p] = grads[p] + data[i] * to_float(p + 1) * 0.01
+        }
+    }
+    if n > 0 { loss = loss / to_float(n) }
+    return [grads, loss]
+}
+
+fn ga_total_train_steps(total_samples, config) {
+    let ebs = ga_effective_batch_size(config)
+    if ebs <= 0 { return 0 }
+    return total_samples / ebs
+}
+
+// ═══════════════════════════════════════════════════════════════
 //  TESTS
-// ===================================================================
+// ═══════════════════════════════════════════════════════════════
 
-println("===================================================")
-println("  Gradient Accumulation Test Suite")
-println("===================================================")
+// ── T1-T4: Config ──
 
-// -- 1. create_accumulator --
-println("")
-println("=== Creation ===")
-let acc0 = create_accumulator(4)
-check("create: accumulation_steps set", acc0.accumulation_steps == 4)
-check("create: current_step is 0", acc0.current_step == 0)
-check("create: not initialized", acc0.is_initialized == false)
+let cfg = ga_new_config(4, 8, 2, 0.001)
 
-// -- 2. accumulate adds gradients --
-println("")
-println("=== Accumulation ===")
+check("T1 config micro_batch_size=4", ga_config_micro_bs(cfg) == 4)
+check("T2 config accum_steps=8", ga_config_accum_steps(cfg) == 8)
+check("T3 config num_devices=2", ga_config_num_devices(cfg) == 2)
+check("T4 config lr=0.001", approx(ga_config_lr(cfg), 0.001, 1.0e-9))
+
+// ── T5-T6: Effective batch size ──
+
+check("T5 effective_bs = 4*8*2 = 64", ga_effective_batch_size(cfg) == 64)
+
+let cfg2 = ga_new_config(16, 4, 8, 0.01)
+check("T6 effective_bs multi-device = 16*4*8 = 512", ga_effective_batch_size(cfg2) == 512)
+
+// ── T7-T10: Micro-batch splitting ──
+
+let data12 = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]
+let chunks4 = ga_split_batch(data12, 4)
+check("T7 split 12 items by 4 -> 3 chunks", len(chunks4) == 3)
+check("T8 each chunk has 4 items", len(chunks4[0]) == 4 && len(chunks4[1]) == 4 && len(chunks4[2]) == 4)
+
+let data10 = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+let chunks4b = ga_split_batch(data10, 4)
+check("T9 uneven split: last chunk smaller", len(chunks4b) == 3 && len(chunks4b[2]) == 2)
+
+let empty_split = ga_split_batch([], 4)
+check("T10 split empty data -> empty", len(empty_split) == 0)
+
+// ── T11-T12: Buffer ──
+
+let buf4 = ga_new_buffer(4)
+check("T11 new buffer all zeros", buf4[0] == 0.0 && buf4[1] == 0.0 && buf4[2] == 0.0 && buf4[3] == 0.0)
+
+let filled = [1.0, 2.0, 3.0, 4.0]
+let zeroed = ga_zero_grad(filled)
+check("T12 zero_grad resets to zeros", zeroed[0] == 0.0 && zeroed[1] == 0.0 && zeroed[2] == 0.0 && zeroed[3] == 0.0)
+
+// ── T13-T14: Accumulate ──
+
+let buf = ga_new_buffer(3)
 let g1 = [1.0, 2.0, 3.0]
-let acc1 = accumulate(acc0, g1)
-check("accumulate: step incremented to 1", acc1.current_step == 1)
-check("accumulate: is_initialized", acc1.is_initialized == true)
-check("accumulate: grads stored", fabs(acc1.accumulated_grads[0] - 1.0) < 0.001)
+let acc1 = ga_accumulate(buf, g1)
+check("T13 accumulate adds grads", approx(acc1[0], 1.0, 1.0e-9) && approx(acc1[1], 2.0, 1.0e-9) && approx(acc1[2], 3.0, 1.0e-9))
 
-// Accumulate second gradient
-let g2 = [0.5, 1.0, 1.5]
-let acc2 = accumulate(acc1, g2)
-check("accumulate: step incremented to 2", acc2.current_step == 2)
-check("accumulate: grads summed", fabs(acc2.accumulated_grads[0] - 1.5) < 0.001)
-check("accumulate: grads[1] summed", fabs(acc2.accumulated_grads[1] - 3.0) < 0.001)
+let g2 = [0.5, 1.5, 2.5]
+let acc2 = ga_accumulate(acc1, g2)
+check("T14 accumulate twice sums both", approx(acc2[0], 1.5, 1.0e-9) && approx(acc2[1], 3.5, 1.0e-9) && approx(acc2[2], 5.5, 1.0e-9))
 
-// -- 3. should_step: false before N --
+// ── T15-T17: Normalization ──
+
+check("T15 normalize_loss 4.0/4 = 1.0", approx(ga_normalize_loss(4.0, 4), 1.0, 1.0e-9))
+check("T16 normalize_loss accum=1 same", approx(ga_normalize_loss(3.5, 1), 3.5, 1.0e-9))
+
+let norm_buf = ga_normalize_grads([8.0, 4.0, 2.0], 4)
+check("T17 normalize_grads /4", approx(norm_buf[0], 2.0, 1.0e-9) && approx(norm_buf[1], 1.0, 1.0e-9) && approx(norm_buf[2], 0.5, 1.0e-9))
+
+// ── T18-T19: Should step ──
+
+check("T18 should_step at last micro (step 3 of 4)", ga_should_step(3, 4) == true)
+check("T19 should_step false at step 1 of 4", ga_should_step(1, 4) == false)
+
+// ── T20-T21: no_sync ──
+
+check("T20 no_sync true at step 0 of 4", ga_no_sync(0, 4) == true)
+check("T21 no_sync false at step 3 of 4 (last)", ga_no_sync(3, 4) == false)
+
+// ── T22: New state ──
+
+let cfg_s = ga_new_config(2, 4, 1, 0.01)
+let st = ga_new_state(cfg_s, 3)
+check("T22 new_state micro_step=0, global=0", st["micro_step"] == 0 && st["global_step"] == 0)
+
+// ── T23-T25: ga_step state machine ──
+
+let grads_a = [1.0, 2.0, 3.0]
+let st1 = ga_step(st, grads_a, 4.0)
+check("T23 step mid-window: micro_step=1", st1["micro_step"] == 1)
+
+let grads_b = [2.0, 3.0, 4.0]
+let st2 = ga_step(st1, grads_b, 8.0)
+let grads_c = [0.5, 0.5, 0.5]
+let st3 = ga_step(st2, grads_c, 2.0)
+let grads_d = [0.5, 0.5, 0.5]
+let st4 = ga_step(st3, grads_d, 6.0)
+
+check("T24 step at window end: micro_step resets to 0", st4["micro_step"] == 0)
+check("T25 global_step incremented to 1", st4["global_step"] == 1)
+
+// ── T26-T28: Progress / is_accumulating ──
+
+let prog = ga_get_progress(st2)
+check("T26 progress shows step 2 of 4", prog[0] == 2 && prog[1] == 4)
+check("T27 is_accumulating true mid-window", ga_is_accumulating(st2) == true)
+check("T28 is_accumulating false at start", ga_is_accumulating(st) == false)
+
+// ── T29-T30: Memory comparison ──
+
+let savings = ga_memory_savings(64, 4, 1000)
+check("T29 memory savings > 0 for smaller micro-batch", savings > 0.0)
+
+let mem_full = ga_memory_without_accum(64, 1000)
+let mem_acc = ga_memory_with_accum(4, 1000)
+check("T30 memory with accum < without", mem_acc < mem_full)
+
+// ── T31: LR schedule step ──
+
+check("T31 lr_schedule_step = global_step", ga_lr_schedule_step(st4) == 1)
+
+// ── T32-T33: Cosine LR ──
+
+let lr0 = ga_cosine_lr(0.01, 0, 100)
+check("T32 cosine_lr step=0 equals base", approx(lr0, 0.01, 1.0e-6))
+
+let lr_end = ga_cosine_lr(0.01, 100, 100)
+check("T33 cosine_lr at end = 0", approx(lr_end, 0.0, 1.0e-6))
+
+// ── T34: Apply update ──
+
+let params = [1.0, 2.0, 3.0]
+let grads_up = [0.1, 0.2, 0.3]
+let updated = ga_apply_update(params, grads_up, 0.1)
+check("T34 update decreases params", updated[0] < params[0] && updated[1] < params[1] && updated[2] < params[2])
+
+// ── T35: Full train step ──
+
+let cfg_f = ga_new_config(2, 3, 1, 0.01)
+let st_f = ga_new_state(cfg_f, 2)
+let mg = [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]
+let ml = [1.0, 2.0, 3.0]
+let st_done = ga_full_train_step(st_f, mg, ml)
+check("T35 full_train_step completes one global step", st_done["global_step"] == 1 && st_done["micro_step"] == 0)
+
+// ── T36-T38: Gradient clipping ──
+
+let gv = [3.0, 4.0]
+let norm = ga_grad_norm(gv)
+check("T36 grad_norm [3,4] = 5", approx(norm, 5.0, 0.01))
+
+let clipped = ga_clip_grads(gv, 2.5)
+let clip_norm = ga_grad_norm(clipped)
+check("T37 clip_grads reduces norm to max", approx(clip_norm, 2.5, 0.01))
+
+let small_g = [0.1, 0.1]
+let not_clipped = ga_clip_grads(small_g, 10.0)
+check("T38 clip no-op when norm < max", approx(not_clipped[0], 0.1, 1.0e-9) && approx(not_clipped[1], 0.1, 1.0e-9))
+
+// ── T39: Warmup cosine LR ──
+
+let lr_w0 = ga_warmup_cosine_lr(0.01, 0, 10, 100)
+check("T39 warmup starts at 0", approx(lr_w0, 0.0, 1.0e-9))
+
+// ── T40: Total train steps ──
+
+let cfg_t = ga_new_config(4, 8, 1, 0.001)
+let total_steps = ga_total_train_steps(256, cfg_t)
+check("T40 total_train_steps 256/(4*8*1)=8", total_steps == 8)
+
+// ═══════════════════════════════════════════════════════════════
 println("")
-println("=== Step Check ===")
-check("should_step: false at step 2 of 4", should_step(acc2) == false)
-
-// -- 4. should_step: true at N --
-let g3 = [0.2, 0.3, 0.4]
-let acc3 = accumulate(acc2, g3)
-let g4 = [0.3, 0.7, 0.1]
-let acc4 = accumulate(acc3, g4)
-check("should_step: true at step 4 of 4", should_step(acc4) == true)
-
-// -- 5. get_accumulated: averaged --
-println("")
-println("=== Get Accumulated ===")
-let avg = get_accumulated(acc4)
-// Sum: 1.0+0.5+0.2+0.3 = 2.0, avg = 2.0/4 = 0.5
-check("get_accumulated: avg[0] = sum/4", fabs(avg[0] - 0.5) < 0.001)
-// Sum: 2.0+1.0+0.3+0.7 = 4.0, avg = 4.0/4 = 1.0
-check("get_accumulated: avg[1] = sum/4", fabs(avg[1] - 1.0) < 0.001)
-
-// -- 6. reset zeroes buffer --
-println("")
-println("=== Reset ===")
-let acc5 = reset(acc4)
-check("reset: current_step is 0", acc5.current_step == 0)
-check("reset: grads zeroed", fabs(acc5.accumulated_grads[0]) < 0.001)
-check("reset: optimizer_steps incremented", acc5.num_optimizer_steps == 1)
-
-// -- 7. effective_batch_size --
-println("")
-println("=== Effective Batch Size ===")
-let ebs = effective_batch_size(8, 4)
-check("effective_batch_size: 8*4=32", ebs == 32)
-
-let ebs2 = effective_batch_size(16, 8)
-check("effective_batch_size: 16*8=128", ebs2 == 128)
-
-// -- 8. Multi-round accumulation --
-println("")
-println("=== Multi-Round ===")
-let mut ma = create_accumulator(2)
-// Round 1
-let mg1 = [1.0, 1.0]
-ma = accumulate(ma, mg1)
-ma = accumulate(ma, mg1)
-check("round1: should_step true", should_step(ma) == true)
-let mr1 = get_accumulated(ma)
-check("round1: averaged correctly", fabs(mr1[0] - 1.0) < 0.001)
-
-ma = reset(ma)
-check("round1: reset done", ma.current_step == 0)
-
-// Round 2
-let mg2 = [2.0, 3.0]
-ma = accumulate(ma, mg2)
-ma = accumulate(ma, mg2)
-let mr2 = get_accumulated(ma)
-check("round2: averaged correctly", fabs(mr2[0] - 2.0) < 0.001)
-
-// -- 9. Gradient sync timing --
-println("")
-println("=== Sync Timing ===")
-let sa = create_accumulator(3)
-let sa1 = accumulate(sa, [1.0])
-check("sync: no sync at step 1", should_sync(sa1) == false)
-let sa2 = accumulate(sa1, [1.0])
-check("sync: no sync at step 2", should_sync(sa2) == false)
-let sa3 = accumulate(sa2, [1.0])
-check("sync: sync at step 3", should_sync(sa3) == true)
-
-// -- 10. Step counter tracking --
-println("")
-println("=== Counter Tracking ===")
-check("total_steps: tracks all micro-batches", acc4.total_steps_done == 4)
-let acc_r = reset(acc4)
-let acc_new = accumulate(acc_r, [1.0, 2.0, 3.0])
-check("total_steps: preserved across reset", acc_new.total_steps_done == 5)
-
-// ===================================================================
-//  Summary
-// ===================================================================
-println("")
-println("=== Gradient Accumulation Tests Summary ===")
-println("pass=" + str(pass_count) + " fail=" + str(fail_count))
-if fail_count == 0 {
-    println("ALL PASS")
-} else {
-    println("FAILED")
-}
-println(str(pass_count) + " passed")
+println("=== gradient_accumulation test summary ===")
+println("PASS: " + str(pass_count))
+println("FAIL: " + str(fail_count))
+println("TOTAL: " + str(pass_count + fail_count))

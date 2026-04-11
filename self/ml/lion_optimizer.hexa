@@ -1,0 +1,531 @@
+// ===================================================================
+//  self/ml/lion_optimizer.hexa — Lion (EvoLved Sign Momentum)
+//
+//  Chen et al. 2023 — "Symbolic Discovery of Optimization Algorithms"
+//
+//  Lion is simpler and more memory-efficient than Adam/AdamW:
+//    - Update direction = sign(beta1 * m + (1 - beta1) * g)
+//    - Momentum update  = beta2 * m + (1 - beta2) * g  (after step)
+//    - Only stores 1st moment (no 2nd moment like Adam)
+//    - Decoupled weight decay applied to parameters directly
+//    - Uniform update magnitude (sign) — acts like regularizer
+//
+//  Public API:
+//    lion_create(lr, beta1, beta2, weight_decay)   -> optimizer state
+//    lion_create_default()                          -> defaults
+//    lion_init_param_state(dim)                     -> momentum buffer
+//    lion_step(opt, params, grads, state)           -> [new_params, new_state]
+//    lion_sign(x)                                   -> 1.0 / -1.0 / 0.0
+//    lion_lr_warmup(base_lr, step, warmup_steps)    -> float
+//    lion_lr_cosine(base_lr, step, total, min_lr)   -> float
+//    lion_lr_linear(base_lr, step, total, min_lr)   -> float
+//    lion_clip_global_norm(grads, max_norm)          -> clipped grads
+//    lion_create_param_group(lr, beta1, beta2, wd)  -> group config
+//    lion_step_group(group, params, grads, state)    -> [new_params, new_state]
+//    lion_adamw_step(params, grads, m, v, lr, b1, b2, eps, wd, t)
+//    lion_compare(params, grads, n_steps)            -> [lion_loss, adamw_loss]
+//    lion_memory_usage(dim, n_params)                -> [lion_bytes, adam_bytes]
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+//    @hot   — performance-critical path
+// ===================================================================
+
+// ===================================================================
+//  Math helpers
+// ===================================================================
+
+fn lion_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn lion_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..40 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn lion_cos(x) {
+    // Taylor series cos(x), reduce to [-pi, pi]
+    let pi = 3.141592653589793
+    let mut v = x
+    // rough reduction
+    while v > pi { v = v - 2.0 * pi }
+    while v < 0.0 - pi { v = v + 2.0 * pi }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..20 {
+        term = 0.0 - term * v * v / to_float(2 * i * (2 * i - 1))
+        result = result + term
+    }
+    return result
+}
+
+fn lion_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn lion_max_f(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn lion_min_f(a, b) {
+    if a < b { return a }
+    return b
+}
+
+// ===================================================================
+//  sign function — core of Lion
+//
+//  Returns +1.0, -1.0, or 0.0
+// ===================================================================
+@pure
+fn lion_sign(x) {
+    if x > 0.0 { return 1.0 }
+    if x < 0.0 { return -1.0 }
+    return 0.0
+}
+
+// ===================================================================
+//  Create optimizer config
+//
+//  Lion defaults (from paper):
+//    lr = 1e-4  (3-10x smaller than Adam)
+//    beta1 = 0.9
+//    beta2 = 0.99
+//    weight_decay = 1e-2
+// ===================================================================
+@pure
+fn lion_create(lr, beta1, beta2, weight_decay) {
+    return #{
+        "lr": lr,
+        "beta1": beta1,
+        "beta2": beta2,
+        "weight_decay": weight_decay,
+        "step": 0
+    }
+}
+
+@pure
+fn lion_create_default() {
+    return lion_create(0.0001, 0.9, 0.99, 0.01)
+}
+
+// ===================================================================
+//  Parameter state — momentum buffer
+//
+//  Lion only needs 1st moment (m), unlike Adam which needs m AND v.
+//  This is the key memory advantage: 50% less optimizer state.
+// ===================================================================
+@pure
+fn lion_init_param_state(dim) {
+    return #{ "m": lion_zeros(dim) }
+}
+
+// ===================================================================
+//  Lion update step
+//
+//  Algorithm:
+//    1. Compute interpolated direction: c = beta1 * m + (1 - beta1) * g
+//    2. Update params: p = p - lr * (sign(c) + weight_decay * p)
+//    3. Update momentum: m = beta2 * m + (1 - beta2) * g
+//
+//  Key insight: the sign() in step 2 makes update magnitude uniform,
+//  which provides implicit regularization.
+// ===================================================================
+@hot
+fn lion_step(opt, params, grads, state) {
+    let lr = opt["lr"]
+    let b1 = opt["beta1"]
+    let b2 = opt["beta2"]
+    let wd = opt["weight_decay"]
+    let dim = len(params)
+    let m = state["m"]
+
+    let mut new_params = lion_zeros(dim)
+    let mut new_m = lion_zeros(dim)
+
+    for i in 0..dim {
+        // Step 1: interpolated direction for update
+        let c = b1 * m[i] + (1.0 - b1) * grads[i]
+
+        // Step 2: parameter update with sign and weight decay
+        let update = lion_sign(c) + wd * params[i]
+        new_params[i] = params[i] - lr * update
+
+        // Step 3: EMA momentum update (uses different beta!)
+        new_m[i] = b2 * m[i] + (1.0 - b2) * grads[i]
+    }
+
+    let new_state = #{ "m": new_m }
+    return [new_params, new_state]
+}
+
+// ===================================================================
+//  Learning rate scheduling
+//
+//  Lion typically uses 3-10x smaller lr than Adam.
+//  Warmup + decay is standard practice.
+// ===================================================================
+
+// Linear warmup from 0 to base_lr
+@pure
+fn lion_lr_warmup(base_lr, step, warmup_steps) {
+    if warmup_steps <= 0 { return base_lr }
+    if step >= warmup_steps { return base_lr }
+    return base_lr * to_float(step) / to_float(warmup_steps)
+}
+
+// Cosine annealing after warmup
+@pure
+fn lion_lr_cosine(base_lr, step, total_steps, min_lr) {
+    if step >= total_steps { return min_lr }
+    if step <= 0 { return base_lr }
+    let pi = 3.141592653589793
+    let progress = to_float(step) / to_float(total_steps)
+    let cosine_decay = 0.5 * (1.0 + lion_cos(pi * progress))
+    return min_lr + (base_lr - min_lr) * cosine_decay
+}
+
+// Linear decay after warmup
+@pure
+fn lion_lr_linear(base_lr, step, total_steps, min_lr) {
+    if step >= total_steps { return min_lr }
+    if step <= 0 { return base_lr }
+    let progress = to_float(step) / to_float(total_steps)
+    return base_lr + (min_lr - base_lr) * progress
+}
+
+// Combined warmup + cosine decay schedule
+@pure
+fn lion_lr_schedule_cosine(base_lr, step, warmup_steps, total_steps, min_lr) {
+    if step < warmup_steps {
+        return lion_lr_warmup(base_lr, step, warmup_steps)
+    }
+    let decay_step = step - warmup_steps
+    let decay_total = total_steps - warmup_steps
+    return lion_lr_cosine(base_lr, decay_step, decay_total, min_lr)
+}
+
+// Combined warmup + linear decay schedule
+@pure
+fn lion_lr_schedule_linear(base_lr, step, warmup_steps, total_steps, min_lr) {
+    if step < warmup_steps {
+        return lion_lr_warmup(base_lr, step, warmup_steps)
+    }
+    let decay_step = step - warmup_steps
+    let decay_total = total_steps - warmup_steps
+    return lion_lr_linear(base_lr, decay_step, decay_total, min_lr)
+}
+
+// ===================================================================
+//  Gradient clipping — global norm
+//
+//  Computes sqrt(sum of squares) of all gradient values,
+//  then scales down if exceeding max_norm.
+// ===================================================================
+@pure
+fn lion_grad_norm(grads) {
+    let mut norm_sq = 0.0
+    let n = len(grads)
+    for i in 0..n {
+        norm_sq = norm_sq + grads[i] * grads[i]
+    }
+    return lion_sqrt(norm_sq)
+}
+
+@pure
+fn lion_clip_global_norm(grads, max_norm) {
+    let norm = lion_grad_norm(grads)
+    if norm <= max_norm { return grads }
+    let scale = max_norm / norm
+    let n = len(grads)
+    let mut clipped = lion_zeros(n)
+    for i in 0..n {
+        clipped[i] = grads[i] * scale
+    }
+    return clipped
+}
+
+// Multi-tensor gradient clipping (flat list of all param grads)
+@pure
+fn lion_clip_multi_norm(grad_list, max_norm) {
+    // grad_list is array of arrays, compute global norm across all
+    let mut total_sq = 0.0
+    let ng = len(grad_list)
+    for g in 0..ng {
+        let grad = grad_list[g]
+        let n = len(grad)
+        for i in 0..n {
+            total_sq = total_sq + grad[i] * grad[i]
+        }
+    }
+    let total_norm = lion_sqrt(total_sq)
+    if total_norm <= max_norm { return grad_list }
+    let scale = max_norm / total_norm
+    let mut result = []
+    for g in 0..ng {
+        let grad = grad_list[g]
+        let n = len(grad)
+        let mut clipped = lion_zeros(n)
+        for i in 0..n {
+            clipped[i] = grad[i] * scale
+        }
+        result = result + [clipped]
+    }
+    return result
+}
+
+// ===================================================================
+//  Parameter groups — different hyperparams per group
+//
+//  Typical usage: smaller wd for bias/norm layers, higher lr for head.
+// ===================================================================
+@pure
+fn lion_create_param_group(lr, beta1, beta2, weight_decay) {
+    return #{
+        "lr": lr,
+        "beta1": beta1,
+        "beta2": beta2,
+        "weight_decay": weight_decay
+    }
+}
+
+// Step with per-group hyperparameters
+@hot
+fn lion_step_group(group, params, grads, state) {
+    let opt = #{
+        "lr": group["lr"],
+        "beta1": group["beta1"],
+        "beta2": group["beta2"],
+        "weight_decay": group["weight_decay"],
+        "step": 0
+    }
+    return lion_step(opt, params, grads, state)
+}
+
+// Step multiple param groups at once
+// groups: [{group, params, grads, state}] as parallel arrays
+fn lion_step_all_groups(groups, params_list, grads_list, states_list) {
+    let ng = len(groups)
+    let mut new_params_list = []
+    let mut new_states_list = []
+    for g in 0..ng {
+        let result = lion_step_group(groups[g], params_list[g], grads_list[g], states_list[g])
+        new_params_list = new_params_list + [result[0]]
+        new_states_list = new_states_list + [result[1]]
+    }
+    return [new_params_list, new_states_list]
+}
+
+// ===================================================================
+//  AdamW step — for comparison with Lion
+//
+//  Standard AdamW update rule:
+//    m = b1*m + (1-b1)*g
+//    v = b2*v + (1-b2)*g^2
+//    m_hat = m / (1 - b1^t)
+//    v_hat = v / (1 - b2^t)
+//    p = p - lr * (m_hat / (sqrt(v_hat) + eps) + wd * p)
+// ===================================================================
+@hot
+fn lion_adamw_step(params, grads, m, v, lr, b1, b2, eps, wd, t) {
+    let dim = len(params)
+    let mut new_params = lion_zeros(dim)
+    let mut new_m = lion_zeros(dim)
+    let mut new_v = lion_zeros(dim)
+
+    // Bias correction factors
+    let mut b1_pow = 1.0
+    let mut b2_pow = 1.0
+    for _i in 0..t {
+        b1_pow = b1_pow * b1
+        b2_pow = b2_pow * b2
+    }
+    let b1_corr = 1.0 - b1_pow
+    let b2_corr = 1.0 - b2_pow
+
+    for i in 0..dim {
+        // Moment updates
+        new_m[i] = b1 * m[i] + (1.0 - b1) * grads[i]
+        new_v[i] = b2 * v[i] + (1.0 - b2) * grads[i] * grads[i]
+
+        // Bias-corrected moments
+        let m_hat = new_m[i] / b1_corr
+        let v_hat = new_v[i] / b2_corr
+
+        // Update with decoupled weight decay
+        new_params[i] = params[i] - lr * (m_hat / (lion_sqrt(v_hat) + eps) + wd * params[i])
+    }
+
+    return [new_params, new_m, new_v]
+}
+
+// ===================================================================
+//  Simple quadratic objective for comparison
+//
+//  f(x) = 0.5 * sum(x_i^2)  -> gradient g_i = x_i
+//  Minimum at origin.
+// ===================================================================
+@pure
+fn lion_quadratic_loss(params) {
+    let mut loss = 0.0
+    let n = len(params)
+    for i in 0..n {
+        loss = loss + 0.5 * params[i] * params[i]
+    }
+    return loss
+}
+
+@pure
+fn lion_quadratic_grad(params) {
+    // gradient of 0.5 * x^2 is just x
+    let n = len(params)
+    let mut g = lion_zeros(n)
+    for i in 0..n {
+        g[i] = params[i]
+    }
+    return g
+}
+
+// ===================================================================
+//  Comparison: Lion vs AdamW on quadratic objective
+//
+//  Runs n_steps of each optimizer from the same initial point.
+//  Returns [lion_final_loss, adamw_final_loss]
+// ===================================================================
+fn lion_compare(init_params, n_steps) {
+    let dim = len(init_params)
+
+    // Lion setup
+    let lion_opt = lion_create(0.001, 0.9, 0.99, 0.0)
+    let mut lion_params = lion_zeros(dim)
+    for i in 0..dim { lion_params[i] = init_params[i] }
+    let mut lion_state = lion_init_param_state(dim)
+
+    // AdamW setup
+    let adamw_lr = 0.01
+    let mut adamw_params = lion_zeros(dim)
+    for i in 0..dim { adamw_params[i] = init_params[i] }
+    let mut adamw_m = lion_zeros(dim)
+    let mut adamw_v = lion_zeros(dim)
+
+    for step in 0..n_steps {
+        // Lion step
+        let lion_g = lion_quadratic_grad(lion_params)
+        let lion_result = lion_step(lion_opt, lion_params, lion_g, lion_state)
+        lion_params = lion_result[0]
+        lion_state = lion_result[1]
+
+        // AdamW step
+        let adamw_g = lion_quadratic_grad(adamw_params)
+        let adamw_result = lion_adamw_step(
+            adamw_params, adamw_g, adamw_m, adamw_v,
+            adamw_lr, 0.9, 0.999, 1.0e-8, 0.0, step + 1
+        )
+        adamw_params = adamw_result[0]
+        adamw_m = adamw_result[1]
+        adamw_v = adamw_result[2]
+    }
+
+    let lion_loss = lion_quadratic_loss(lion_params)
+    let adamw_loss = lion_quadratic_loss(adamw_params)
+    return [lion_loss, adamw_loss]
+}
+
+// ===================================================================
+//  Memory efficiency tracking
+//
+//  Lion: 1 momentum buffer per parameter  -> dim * 8 bytes (float64)
+//  Adam: 2 buffers (m + v) per parameter  -> dim * 16 bytes
+//  Savings = 50% of optimizer state memory
+// ===================================================================
+@pure
+fn lion_memory_usage(dim, n_params) {
+    let total_dim = dim * n_params
+    let bytes_per_float = 8
+    let lion_bytes = total_dim * bytes_per_float       // only m
+    let adam_bytes = total_dim * bytes_per_float * 2   // m + v
+    let savings_pct = 50.0
+    return [lion_bytes, adam_bytes, savings_pct]
+}
+
+// Detailed memory breakdown
+@pure
+fn lion_memory_breakdown(dim, n_params) {
+    let total_dim = dim * n_params
+    let bytes_per_float = 8
+    let param_bytes = total_dim * bytes_per_float
+    let lion_state_bytes = total_dim * bytes_per_float
+    let adam_state_bytes = total_dim * bytes_per_float * 2
+    let lion_total = param_bytes + lion_state_bytes
+    let adam_total = param_bytes + adam_state_bytes
+    return #{
+        "param_bytes": param_bytes,
+        "lion_state_bytes": lion_state_bytes,
+        "adam_state_bytes": adam_state_bytes,
+        "lion_total": lion_total,
+        "adam_total": adam_total,
+        "savings_bytes": adam_state_bytes - lion_state_bytes,
+        "savings_pct": 50.0
+    }
+}
+
+// ===================================================================
+//  Rosenbrock objective (harder landscape for optimizer comparison)
+//
+//  f(x) = sum_{i=0}^{n-2} [ 100*(x_{i+1} - x_i^2)^2 + (1 - x_i)^2 ]
+//  Minimum at (1, 1, ..., 1)
+// ===================================================================
+@pure
+fn lion_rosenbrock_loss(params) {
+    let n = len(params)
+    let mut loss = 0.0
+    for i in 0..(n - 1) {
+        let a = params[i + 1] - params[i] * params[i]
+        let b = 1.0 - params[i]
+        loss = loss + 100.0 * a * a + b * b
+    }
+    return loss
+}
+
+@pure
+fn lion_rosenbrock_grad(params) {
+    let n = len(params)
+    let mut g = lion_zeros(n)
+    for i in 0..(n - 1) {
+        let diff = params[i + 1] - params[i] * params[i]
+        // df/dx_i
+        g[i] = g[i] + (0.0 - 400.0) * params[i] * diff + 2.0 * (params[i] - 1.0)
+        // df/dx_{i+1}
+        g[i + 1] = g[i + 1] + 200.0 * diff
+    }
+    return g
+}
+
+// ===================================================================
+//  Lion with lr schedule integration (convenience step)
+// ===================================================================
+@hot
+fn lion_step_scheduled(opt, params, grads, state, step, warmup, total, min_lr) {
+    let base_lr = opt["lr"]
+    let scheduled_lr = lion_lr_schedule_cosine(base_lr, step, warmup, total, min_lr)
+    let scheduled_opt = #{
+        "lr": scheduled_lr,
+        "beta1": opt["beta1"],
+        "beta2": opt["beta2"],
+        "weight_decay": opt["weight_decay"],
+        "step": step
+    }
+    return lion_step(scheduled_opt, params, grads, state)
+}
+
+println("[lion_optimizer] loaded — sign momentum + EMA + weight decay + lr schedule + grad clip + param groups + comparison")

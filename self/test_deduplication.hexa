@@ -1,0 +1,831 @@
+// ═══════════════════════════════════════════════════════════════
+//  test_deduplication.hexa — MinHash+LSH Deduplication (#127)
+//
+//  Tests (35):
+//    T01 char shingle non-empty
+//    T02 char shingle correct length range
+//    T03 char shingle dedup (repeated chars)
+//    T04 word shingle non-empty
+//    T05 word shingle count for k=2
+//    T06 hash deterministic
+//    T07 hash different strings differ
+//    T08 hash_fnv deterministic
+//    T09 hash_family different seeds differ
+//    T10 minhash sig length = num_hashes
+//    T11 identical docs minhash_jaccard = 1.0
+//    T12 different docs minhash_jaccard < 1.0
+//    T13 jaccard_exact self = 1.0
+//    T14 jaccard_exact similar > different
+//    T15 lsh_buckets length = bands
+//    T16 lsh identical docs same buckets
+//    T17 lsh_candidate_pairs finds identical pair
+//    T18 union-find make correct size
+//    T19 union-find same root after union
+//    T20 union-find separate components
+//    T21 exact dedup flags identical docs
+//    T22 exact dedup keeps unique docs
+//    T23 exact dedup texts removes dups
+//    T24 fuzzy dedup clusters near-dups
+//    T25 fuzzy dedup texts reduces count
+//    T26 simhash deterministic
+//    T27 simhash identical = distance 0
+//    T28 simhash similar < different distance
+//    T29 simhash_similarity range [0, 1]
+//    T30 stream new empty state
+//    T31 stream add unique returns not-dup
+//    T32 stream add exact dup returns dup
+//    T33 stream add fuzzy dup returns dup
+//    T34 full pipeline removes dups
+//    T35 lsh_probability curve monotonic
+//    T36 config accessors correct
+//    T37 containment self = 1.0
+//    T38 stats returns valid counts
+//    T39 weighted minhash sig length
+//    T40 dd_count_clusters accurate
+//
+//  Run: cargo run --release -- self/test_deduplication.hexa
+// ═══════════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ── inlined from deduplication.hexa ─────────────────────────
+
+fn dd_abs(x) {
+    if x < 0 { return 0 - x }
+    return x
+}
+
+fn dd_abs_f(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn dd_min(a, b) { if a < b { return a } return b }
+fn dd_max(a, b) { if a > b { return a } return b }
+
+fn dd_config(num_hashes, bands, rows, threshold, shingle_k) {
+    return [num_hashes, bands, rows, threshold, shingle_k]
+}
+
+fn dd_config_default() {
+    return dd_config(64, 16, 4, 0.5, 3)
+}
+
+fn dd_cfg_num_hashes(cfg) { return cfg[0] }
+fn dd_cfg_bands(cfg) { return cfg[1] }
+fn dd_cfg_rows(cfg) { return cfg[2] }
+fn dd_cfg_threshold(cfg) { return cfg[3] }
+fn dd_cfg_shingle_k(cfg) { return cfg[4] }
+
+fn dd_hash(s) {
+    let n = len(s)
+    let mut h = 5381
+    for i in 0..n {
+        let c = char_code(s, i)
+        h = h * 33 + c
+        if h > 1000000000 { h = h % 1000000007 }
+        if h < -1000000000 { h = (0 - h) % 1000000007 }
+    }
+    if h < 0 { h = 0 - h }
+    return h
+}
+
+fn dd_hash_fnv(s) {
+    let n = len(s)
+    let mut h = 2166136261
+    for i in 0..n {
+        let c = char_code(s, i)
+        h = h ^ c
+        h = h * 16777619
+        if h > 1000000000 { h = h % 1000000007 }
+        if h < -1000000000 { h = (0 - h) % 1000000007 }
+    }
+    if h < 0 { h = 0 - h }
+    return h
+}
+
+fn dd_hash_family(val, seed) {
+    let a = seed * 1103515245 + 12345
+    let b = seed * 214013 + 2531011
+    let p = 1000000007
+    let mut h = a * val + b
+    if h < 0 { h = 0 - h }
+    h = h % p
+    return h
+}
+
+fn dd_char_shingle(text, k) {
+    let n = len(text)
+    let mut shingles = []
+    if n < k { return [text] }
+    for i in 0..(n - k + 1) {
+        let mut s = ""
+        for j in 0..k {
+            s = s + text[i + j]
+        }
+        let mut found = false
+        for si in 0..len(shingles) {
+            if shingles[si] == s { found = true }
+        }
+        if !found {
+            shingles = shingles + [s]
+        }
+    }
+    return shingles
+}
+
+fn dd_word_shingle(text, k) {
+    let words = text.split(" ")
+    let nw = len(words)
+    let mut shingles = []
+    if nw < k {
+        return [text]
+    }
+    for i in 0..(nw - k + 1) {
+        let mut s = ""
+        for j in 0..k {
+            if j > 0 { s = s + " " }
+            s = s + words[i + j]
+        }
+        let mut found = false
+        for si in 0..len(shingles) {
+            if shingles[si] == s { found = true }
+        }
+        if !found {
+            shingles = shingles + [s]
+        }
+    }
+    return shingles
+}
+
+fn dd_minhash_sig(shingles, num_hashes) {
+    let n_sh = len(shingles)
+    let mut sig = []
+    for hi in 0..num_hashes {
+        let mut min_val = 2000000000
+        for si in 0..n_sh {
+            let sh = dd_hash(shingles[si])
+            let hv = dd_hash_family(sh, hi + 1)
+            if hv < min_val { min_val = hv }
+        }
+        sig = sig + [min_val]
+    }
+    return sig
+}
+
+fn dd_lsh_band_key(sig, band, rows) {
+    let start = band * rows
+    let mut h = 0
+    for i in 0..rows {
+        let idx = start + i
+        if idx < len(sig) {
+            h = h * 31 + sig[idx]
+            if h > 1000000000 { h = h % 1000000007 }
+            if h < -1000000000 { h = (0 - h) % 1000000007 }
+        }
+    }
+    if h < 0 { h = 0 - h }
+    return h
+}
+
+fn dd_lsh_buckets(sig, bands, rows) {
+    let mut keys = []
+    for b in 0..bands {
+        keys = keys + [dd_lsh_band_key(sig, b, rows)]
+    }
+    return keys
+}
+
+fn dd_lsh_candidate_pairs(sigs, bands, rows) {
+    let n = len(sigs)
+    let mut all_keys = []
+    for i in 0..n {
+        all_keys = all_keys + [dd_lsh_buckets(sigs[i], bands, rows)]
+    }
+    let mut pairs = []
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let mut matched = false
+            for b in 0..bands {
+                if all_keys[i][b] == all_keys[j][b] {
+                    matched = true
+                }
+            }
+            if matched {
+                pairs = pairs + [[i, j]]
+            }
+        }
+    }
+    return pairs
+}
+
+fn dd_jaccard_exact(set_a, set_b) {
+    let na = len(set_a)
+    let nb = len(set_b)
+    let mut inter = 0
+    for i in 0..na {
+        for j in 0..nb {
+            if set_a[i] == set_b[j] { inter = inter + 1 }
+        }
+    }
+    let union_size = na + nb - inter
+    if union_size == 0 { return 1.0 }
+    return to_float(inter) / to_float(union_size)
+}
+
+fn dd_jaccard_minhash(sig_a, sig_b) {
+    let n = len(sig_a)
+    if n == 0 { return 0.0 }
+    let mut agree = 0
+    for i in 0..n {
+        if sig_a[i] == sig_b[i] { agree = agree + 1 }
+    }
+    return to_float(agree) / to_float(n)
+}
+
+fn dd_uf_make(n) {
+    let mut parent = []
+    let mut rank = []
+    for i in 0..n {
+        parent = parent + [i]
+        rank = rank + [0]
+    }
+    return [parent, rank]
+}
+
+fn dd_uf_find(parent, x) {
+    let mut cur = x
+    while parent[cur] != cur {
+        let gp = parent[parent[cur]]
+        parent[cur] = gp
+        cur = gp
+    }
+    return cur
+}
+
+fn dd_uf_union(parent, rank, a, b) {
+    let ra = dd_uf_find(parent, a)
+    let rb = dd_uf_find(parent, b)
+    if ra == rb { return [parent, rank] }
+    if rank[ra] < rank[rb] {
+        parent[ra] = rb
+    } else {
+        if rank[ra] > rank[rb] {
+            parent[rb] = ra
+        } else {
+            parent[rb] = ra
+            rank[ra] = rank[ra] + 1
+        }
+    }
+    return [parent, rank]
+}
+
+fn dd_exact_dedup(texts) {
+    let n = len(texts)
+    let mut seen_hashes = []
+    let mut flags = []
+    for i in 0..n {
+        let h = dd_hash(texts[i])
+        let mut is_dup = false
+        for j in 0..len(seen_hashes) {
+            if seen_hashes[j] == h { is_dup = true }
+        }
+        if is_dup {
+            flags = flags + [0]
+        } else {
+            seen_hashes = seen_hashes + [h]
+            flags = flags + [1]
+        }
+    }
+    return flags
+}
+
+fn dd_exact_dedup_texts(texts) {
+    let flags = dd_exact_dedup(texts)
+    let n = len(texts)
+    let mut result = []
+    for i in 0..n {
+        if flags[i] == 1 {
+            result = result + [texts[i]]
+        }
+    }
+    return result
+}
+
+fn dd_fuzzy_dedup(texts, cfg) {
+    let num_hashes = dd_cfg_num_hashes(cfg)
+    let bands = dd_cfg_bands(cfg)
+    let rows = dd_cfg_rows(cfg)
+    let threshold = dd_cfg_threshold(cfg)
+    let k = dd_cfg_shingle_k(cfg)
+    let n = len(texts)
+    let mut shingle_sets = []
+    for i in 0..n {
+        shingle_sets = shingle_sets + [dd_char_shingle(texts[i], k)]
+    }
+    let mut sigs = []
+    for i in 0..n {
+        sigs = sigs + [dd_minhash_sig(shingle_sets[i], num_hashes)]
+    }
+    let candidates = dd_lsh_candidate_pairs(sigs, bands, rows)
+    let uf = dd_uf_make(n)
+    let mut parent = uf[0]
+    let mut rank = uf[1]
+    for ci in 0..len(candidates) {
+        let a = candidates[ci][0]
+        let b = candidates[ci][1]
+        let sim = dd_jaccard_minhash(sigs[a], sigs[b])
+        if sim >= threshold {
+            let result = dd_uf_union(parent, rank, a, b)
+            parent = result[0]
+            rank = result[1]
+        }
+    }
+    let mut clusters = []
+    for i in 0..n {
+        clusters = clusters + [dd_uf_find(parent, i)]
+    }
+    return clusters
+}
+
+fn dd_fuzzy_dedup_texts(texts, cfg) {
+    let clusters = dd_fuzzy_dedup(texts, cfg)
+    let n = len(texts)
+    let mut seen = []
+    let mut result = []
+    for i in 0..n {
+        let cid = clusters[i]
+        let mut found = false
+        for j in 0..len(seen) {
+            if seen[j] == cid { found = true }
+        }
+        if !found {
+            seen = seen + [cid]
+            result = result + [texts[i]]
+        }
+    }
+    return result
+}
+
+fn dd_simhash(text, k) {
+    let shingles = dd_char_shingle(text, k)
+    let n_sh = len(shingles)
+    let num_bits = 32
+    let mut votes = []
+    for _b in 0..num_bits {
+        votes = votes + [0]
+    }
+    for si in 0..n_sh {
+        let h = dd_hash(shingles[si])
+        let mut bit_val = h
+        for b in 0..num_bits {
+            if bit_val % 2 == 1 {
+                votes[b] = votes[b] + 1
+            } else {
+                votes[b] = votes[b] - 1
+            }
+            bit_val = bit_val / 2
+        }
+    }
+    let mut fp = 0
+    let mut power = 1
+    for b in 0..num_bits {
+        if votes[b] >= 0 {
+            fp = fp + power
+        }
+        power = power * 2
+    }
+    return fp
+}
+
+fn dd_simhash_distance(a, b) {
+    let mut xor_val = a ^ b
+    if xor_val < 0 { xor_val = 0 - xor_val }
+    let mut dist = 0
+    let mut v = xor_val
+    while v > 0 {
+        dist = dist + (v % 2)
+        v = v / 2
+    }
+    return dist
+}
+
+fn dd_simhash_similarity(a, b) {
+    let dist = dd_simhash_distance(a, b)
+    return 1.0 - to_float(dist) / 32.0
+}
+
+// Streaming dedup uses module-level mutable state
+let mut _stream_hashes = []
+let mut _stream_sigs = []
+let mut _stream_cfg = dd_config(20, 5, 4, 0.5, 3)
+let mut _stream_count = 0
+
+fn dd_stream_new(cfg) {
+    _stream_hashes = []
+    _stream_sigs = []
+    _stream_cfg = cfg
+    _stream_count = 0
+}
+
+fn dd_stream_add(text) {
+    let threshold = dd_cfg_threshold(_stream_cfg)
+    let num_hashes = dd_cfg_num_hashes(_stream_cfg)
+    let bands = dd_cfg_bands(_stream_cfg)
+    let rows = dd_cfg_rows(_stream_cfg)
+    let k = dd_cfg_shingle_k(_stream_cfg)
+    // Step 1: exact dedup check
+    let h = dd_hash(text)
+    for i in 0..len(_stream_hashes) {
+        if _stream_hashes[i] == h {
+            return 1
+        }
+    }
+    // Step 2: fuzzy dedup check
+    let shingles = dd_char_shingle(text, k)
+    let sig = dd_minhash_sig(shingles, num_hashes)
+    let buckets = dd_lsh_buckets(sig, bands, rows)
+    for i in 0..len(_stream_sigs) {
+        let existing_sig = _stream_sigs[i]
+        let existing_buckets = dd_lsh_buckets(existing_sig, bands, rows)
+        let mut band_match = false
+        for b in 0..bands {
+            if buckets[b] == existing_buckets[b] {
+                band_match = true
+            }
+        }
+        if band_match {
+            let sim = dd_jaccard_minhash(sig, existing_sig)
+            if sim >= threshold {
+                return 1
+            }
+        }
+    }
+    // Not a duplicate — add
+    _stream_hashes = _stream_hashes + [h]
+    _stream_sigs = _stream_sigs + [sig]
+    _stream_count = _stream_count + 1
+    return 0
+}
+
+fn dd_stream_count() {
+    return _stream_count
+}
+
+fn dd_lsh_probability(similarity, bands, rows) {
+    let mut sr = 1.0
+    for _i in 0..rows {
+        sr = sr * similarity
+    }
+    let one_minus_sr = 1.0 - sr
+    let mut result = 1.0
+    for _i in 0..bands {
+        result = result * one_minus_sr
+    }
+    return 1.0 - result
+}
+
+fn dd_dedup_pipeline(texts, cfg) {
+    let exact_unique = dd_exact_dedup_texts(texts)
+    let fuzzy_unique = dd_fuzzy_dedup_texts(exact_unique, cfg)
+    return fuzzy_unique
+}
+
+fn dd_count_clusters(clusters) {
+    let n = len(clusters)
+    let mut unique = []
+    for i in 0..n {
+        let mut found = false
+        for j in 0..len(unique) {
+            if unique[j] == clusters[i] { found = true }
+        }
+        if !found {
+            unique = unique + [clusters[i]]
+        }
+    }
+    return len(unique)
+}
+
+fn dd_stats(texts, cfg) {
+    let n_total = len(texts)
+    let exact_flags = dd_exact_dedup(texts)
+    let mut n_exact_dup = 0
+    for i in 0..n_total {
+        if exact_flags[i] == 0 { n_exact_dup = n_exact_dup + 1 }
+    }
+    let exact_unique = dd_exact_dedup_texts(texts)
+    let clusters = dd_fuzzy_dedup(exact_unique, cfg)
+    let n_clusters = dd_count_clusters(clusters)
+    return [n_total, n_exact_dup, n_clusters, len(dd_dedup_pipeline(texts, cfg))]
+}
+
+// Weighted MinHash: takes parallel arrays of shingles and weights
+fn dd_weighted_minhash(shingles, weights, num_hashes) {
+    let n_sw = len(shingles)
+    let mut sig = []
+    for hi in 0..num_hashes {
+        let mut min_val = 2000000000
+        for si in 0..n_sw {
+            let sh = dd_hash(shingles[si])
+            let hv = dd_hash_family(sh, hi + 1)
+            let mut effective = hv
+            if weights[si] > 1 {
+                effective = hv / weights[si]
+            }
+            if effective < min_val { min_val = effective }
+        }
+        sig = sig + [min_val]
+    }
+    return sig
+}
+
+fn dd_containment(set_a, set_b) {
+    let na = len(set_a)
+    if na == 0 { return 0.0 }
+    let mut inter = 0
+    for i in 0..na {
+        for j in 0..len(set_b) {
+            if set_a[i] == set_b[j] { inter = inter + 1 }
+        }
+    }
+    return to_float(inter) / to_float(na)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  TEST DATA
+// ═══════════════════════════════════════════════════════════════
+
+let doc_a = "the quick brown fox jumps over the lazy dog near the river"
+let doc_b = "the quick brown fox jumps over the lazy cat near the river"
+let doc_c = "lorem ipsum dolor sit amet consectetur adipiscing elit sed do"
+let doc_d = "the quick brown fox jumps over the lazy dog near the river"
+let doc_e = "completely different text about machine learning algorithms"
+
+// Use smaller configs for test speed
+let test_cfg = dd_config(20, 5, 4, 0.5, 3)
+
+// ═══════════════════════════════════════════════════════════════
+//  T01-T03: Character Shingling
+// ═══════════════════════════════════════════════════════════════
+
+let sh_a = dd_char_shingle(doc_a, 3)
+check("T01 char shingle non-empty", len(sh_a) > 0)
+check("T02 char shingle length <= n-k+1", len(sh_a) <= len(doc_a) - 3 + 1)
+
+let sh_repeat = dd_char_shingle("aaaa", 2)
+check("T03 char shingle dedup (aaaa,k=2) = 1", len(sh_repeat) == 1)
+
+// ═══════════════════════════════════════════════════════════════
+//  T04-T05: Word Shingling
+// ═══════════════════════════════════════════════════════════════
+
+let wsh_a = dd_word_shingle(doc_a, 2)
+check("T04 word shingle non-empty", len(wsh_a) > 0)
+
+let words_a = doc_a.split(" ")
+let expected_wsh = len(words_a) - 2 + 1
+check("T05 word shingle k=2 count correct", len(wsh_a) <= expected_wsh)
+
+// ═══════════════════════════════════════════════════════════════
+//  T06-T09: Hash Functions
+// ═══════════════════════════════════════════════════════════════
+
+let h1 = dd_hash("hello world")
+let h2 = dd_hash("hello world")
+check("T06 hash deterministic", h1 == h2)
+
+let h3 = dd_hash("goodbye world")
+check("T07 hash different strings differ", h1 != h3)
+
+let hf1 = dd_hash_fnv("test string")
+let hf2 = dd_hash_fnv("test string")
+check("T08 hash_fnv deterministic", hf1 == hf2)
+
+let hfam1 = dd_hash_family(12345, 1)
+let hfam2 = dd_hash_family(12345, 2)
+check("T09 hash_family different seeds differ", hfam1 != hfam2)
+
+// ═══════════════════════════════════════════════════════════════
+//  T10-T12: MinHash Signature
+// ═══════════════════════════════════════════════════════════════
+
+let sig_a = dd_minhash_sig(sh_a, 20)
+check("T10 minhash sig length = 20", len(sig_a) == 20)
+
+let sh_d = dd_char_shingle(doc_d, 3)
+let sig_d = dd_minhash_sig(sh_d, 20)
+let mj_identical = dd_jaccard_minhash(sig_a, sig_d)
+check("T11 identical docs minhash_jaccard = 1.0", approx(mj_identical, 1.0, 0.001))
+
+let sh_c = dd_char_shingle(doc_c, 3)
+let sig_c = dd_minhash_sig(sh_c, 20)
+let mj_diff = dd_jaccard_minhash(sig_a, sig_c)
+check("T12 different docs minhash_jaccard < 1.0", mj_diff < 1.0)
+
+// ═══════════════════════════════════════════════════════════════
+//  T13-T14: Exact Jaccard Similarity
+// ═══════════════════════════════════════════════════════════════
+
+let j_self = dd_jaccard_exact(sh_a, sh_a)
+check("T13 jaccard_exact self = 1.0", approx(j_self, 1.0, 0.001))
+
+let sh_b = dd_char_shingle(doc_b, 3)
+let j_sim = dd_jaccard_exact(sh_a, sh_b)
+let j_diff = dd_jaccard_exact(sh_a, sh_c)
+check("T14 jaccard_exact similar > different", j_sim > j_diff)
+
+// ═══════════════════════════════════════════════════════════════
+//  T15-T17: LSH Banding
+// ═══════════════════════════════════════════════════════════════
+
+let bk = dd_lsh_buckets(sig_a, 5, 4)
+check("T15 lsh_buckets length = bands", len(bk) == 5)
+
+let bk_d = dd_lsh_buckets(sig_d, 5, 4)
+let mut all_same = true
+for i in 0..5 {
+    if bk[i] != bk_d[i] { all_same = false }
+}
+check("T16 lsh identical docs same buckets", all_same)
+
+let sigs_test = [sig_a, dd_minhash_sig(sh_b, 20), sig_c, sig_d]
+let cands = dd_lsh_candidate_pairs(sigs_test, 5, 4)
+let mut found_03 = false
+for ci in 0..len(cands) {
+    if cands[ci][0] == 0 {
+        if cands[ci][1] == 3 { found_03 = true }
+    }
+}
+check("T17 lsh_candidate_pairs finds identical pair (0,3)", found_03)
+
+// ═══════════════════════════════════════════════════════════════
+//  T18-T20: Union-Find
+// ═══════════════════════════════════════════════════════════════
+
+let uf = dd_uf_make(5)
+let uf_parent = uf[0]
+let uf_rank = uf[1]
+check("T18 union-find make size = 5", len(uf_parent) == 5)
+
+let res1 = dd_uf_union(uf_parent, uf_rank, 0, 1)
+let p1 = res1[0]
+let r1 = res1[1]
+let root0 = dd_uf_find(p1, 0)
+let root1 = dd_uf_find(p1, 1)
+check("T19 union-find same root after union", root0 == root1)
+
+let root3 = dd_uf_find(p1, 3)
+check("T20 union-find separate components", root0 != root3)
+
+// ═══════════════════════════════════════════════════════════════
+//  T21-T23: Exact Dedup
+// ═══════════════════════════════════════════════════════════════
+
+let exact_texts = [doc_a, doc_b, doc_c, doc_d, doc_e]
+let eflags = dd_exact_dedup(exact_texts)
+// doc_a == doc_d, so flag[3] should be 0 (duplicate)
+check("T21 exact dedup flags duplicate (doc_d)", eflags[3] == 0)
+check("T22 exact dedup keeps unique docs", eflags[0] == 1)
+
+let exact_result = dd_exact_dedup_texts(exact_texts)
+check("T23 exact dedup texts removes 1 dup", len(exact_result) == 4)
+
+// ═══════════════════════════════════════════════════════════════
+//  T24-T25: Fuzzy Dedup
+// ═══════════════════════════════════════════════════════════════
+
+let fuzzy_texts = [doc_a, doc_b, doc_c, doc_e]
+let clusters = dd_fuzzy_dedup(fuzzy_texts, test_cfg)
+// doc_a and doc_b are near-duplicates, should share cluster
+let c_a = clusters[0]
+let c_b = clusters[1]
+let c_c = clusters[2]
+check("T24 fuzzy dedup clusters near-dups (a,b same)", c_a == c_b)
+
+let fuzzy_result = dd_fuzzy_dedup_texts(fuzzy_texts, test_cfg)
+check("T25 fuzzy dedup texts reduces count", len(fuzzy_result) < len(fuzzy_texts))
+
+// ═══════════════════════════════════════════════════════════════
+//  T26-T29: SimHash
+// ═══════════════════════════════════════════════════════════════
+
+let sh_fp1 = dd_simhash(doc_a, 3)
+let sh_fp2 = dd_simhash(doc_a, 3)
+check("T26 simhash deterministic", sh_fp1 == sh_fp2)
+
+let dist_same = dd_simhash_distance(sh_fp1, sh_fp2)
+check("T27 simhash identical = distance 0", dist_same == 0)
+
+let sh_fp_b = dd_simhash(doc_b, 3)
+let sh_fp_c = dd_simhash(doc_c, 3)
+let dist_sim = dd_simhash_distance(sh_fp1, sh_fp_b)
+let dist_diff = dd_simhash_distance(sh_fp1, sh_fp_c)
+check("T28 simhash similar < different distance", dist_sim <= dist_diff)
+
+let sim_val = dd_simhash_similarity(sh_fp1, sh_fp_b)
+check("T29 simhash_similarity in [0, 1]", sim_val >= 0.0)
+check("T29b simhash_similarity <= 1.0", sim_val <= 1.0)
+
+// ═══════════════════════════════════════════════════════════════
+//  T30-T33: Streaming Dedup
+// ═══════════════════════════════════════════════════════════════
+
+let stream_cfg = dd_config(20, 5, 4, 0.5, 3)
+dd_stream_new(stream_cfg)
+check("T30 stream new empty count = 0", dd_stream_count() == 0)
+
+let is_dup1 = dd_stream_add(doc_a)
+check("T31 stream add unique returns not-dup", is_dup1 == 0)
+
+// Add exact duplicate
+let is_dup2 = dd_stream_add(doc_d)
+check("T32 stream add exact dup returns dup", is_dup2 == 1)
+
+// Add near-duplicate (doc_b is similar to doc_a)
+let is_dup3 = dd_stream_add(doc_b)
+check("T33 stream add fuzzy dup returns dup", is_dup3 == 1)
+
+// ═══════════════════════════════════════════════════════════════
+//  T34: Full Pipeline
+// ═══════════════════════════════════════════════════════════════
+
+let all_texts = [doc_a, doc_b, doc_c, doc_d, doc_e, doc_a]
+let pipeline_result = dd_dedup_pipeline(all_texts, test_cfg)
+check("T34 pipeline removes dups", len(pipeline_result) < len(all_texts))
+
+// ═══════════════════════════════════════════════════════════════
+//  T35: LSH Probability Curve
+// ═══════════════════════════════════════════════════════════════
+
+let p_low = dd_lsh_probability(0.2, 10, 4)
+let p_mid = dd_lsh_probability(0.5, 10, 4)
+let p_high = dd_lsh_probability(0.9, 10, 4)
+check("T35 lsh_probability monotonic (low < mid)", p_low < p_mid)
+check("T35b lsh_probability monotonic (mid < high)", p_mid < p_high)
+
+// ═══════════════════════════════════════════════════════════════
+//  T36: Config Accessors
+// ═══════════════════════════════════════════════════════════════
+
+let cfg = dd_config(100, 20, 5, 0.7, 4)
+check("T36 cfg num_hashes = 100", dd_cfg_num_hashes(cfg) == 100)
+check("T36b cfg bands = 20", dd_cfg_bands(cfg) == 20)
+check("T36c cfg rows = 5", dd_cfg_rows(cfg) == 5)
+check("T36d cfg threshold = 0.7", approx(dd_cfg_threshold(cfg), 0.7, 0.001))
+check("T36e cfg shingle_k = 4", dd_cfg_shingle_k(cfg) == 4)
+
+// ═══════════════════════════════════════════════════════════════
+//  T37: Containment
+// ═══════════════════════════════════════════════════════════════
+
+let cont_self = dd_containment(sh_a, sh_a)
+check("T37 containment self = 1.0", approx(cont_self, 1.0, 0.001))
+
+// ═══════════════════════════════════════════════════════════════
+//  T38: Stats
+// ═══════════════════════════════════════════════════════════════
+
+let stats = dd_stats(all_texts, test_cfg)
+check("T38 stats n_total correct", stats[0] == len(all_texts))
+check("T38b stats n_exact_dup > 0", stats[1] > 0)
+
+// ═══════════════════════════════════════════════════════════════
+//  T39: Weighted MinHash
+// ═══════════════════════════════════════════════════════════════
+
+let sw_shingles = ["the", "fox", "dog", "cat"]
+let sw_weights = [5, 3, 2, 1]
+let wsig = dd_weighted_minhash(sw_shingles, sw_weights, 10)
+check("T39 weighted minhash sig length = 10", len(wsig) == 10)
+
+// ═══════════════════════════════════════════════════════════════
+//  T40: Count Clusters
+// ═══════════════════════════════════════════════════════════════
+
+let test_clusters = [0, 0, 1, 2, 1, 0]
+let nc = dd_count_clusters(test_clusters)
+check("T40 count_clusters = 3", nc == 3)
+
+// ═══════════════════════════════════════════════════════════════
+println("")
+println("=== Deduplication test summary ===")
+println("PASS: " + str(pass_count))
+println("FAIL: " + str(fail_count))
+println("TOTAL: " + str(pass_count + fail_count))
+if fail_count == 0 {
+    println("ALL PASS")
+}

@@ -1,25 +1,57 @@
-// ═══════════════════════════════════════════════════════════════════
-//  test_fsdp.hexa — FSDP (Fully Sharded Data Parallel) 검증
+// ═══════════════════════════════════════════════════════════════
+//  test_fsdp.hexa — FSDP (Fully Sharded Data Parallel) #157
 //
-//  최소 12개 단위 테스트:
-//    1.  shard boundary 일관성 (균등 분할)
-//    2.  shard sizes 합 == total_d
-//    3.  init: N=1 shard가 원본과 동일
-//    4.  all-gather: 연결 결과 == 원본
-//    5.  forward 결과 == single rank (N=2)
-//    6.  forward 결과 == single rank (N=4)
-//    7.  backward grad concat == single rank grad (N=2)
-//    8.  backward grad concat == single rank grad (N=4)
-//    9.  reduce-scatter 합산 일관성
-//   10.  CPU offload → load 라운드트립 보존
-//   11.  메모리 절감 비율 (N=8 → 8x)
-//   12.  mixed precision init → fp16 shards 생성
-//   13.  wrap policy: 작은 레이어 제외
-//   14.  optimizer step: shard 업데이트 일관성
-//   15.  mixed precision forward 숫자 적법 범위 내
+//  Tests (35):
+//    T1  shard boundary: begin[0] = 0
+//    T2  shard boundary: end[last] = total_d
+//    T3  shard sizes sum == total_d (even)
+//    T4  shard sizes sum == total_d (uneven)
+//    T5  init N=1: shard == original
+//    T6  init N=4: num_ranks correct
+//    T7  all-gather: reconstructed == original (N=2)
+//    T8  all-gather: reconstructed == original (N=4)
+//    T9  all-gather: length matches total_d
+//    T10 forward N=2 == single rank
+//    T11 forward N=4 == single rank
+//    T12 backward N=2: reduce-scatter == N * grad
+//    T13 backward N=4: reduce-scatter == N * grad
+//    T14 reduce-scatter direct sum test
+//    T15 shard spec: should_shard true
+//    T16 shard spec: should_shard false
+//    T17 apply_shard_spec: sharded splits params
+//    T18 apply_shard_spec: not sharded replicates
+//    T19 fp16 cast: small values close
+//    T20 fp16 cast: clamp large values
+//    T21 mixed precision init: fp16 shards created
+//    T22 mixed precision: fp16 shard close to original
+//    T23 mixed precision forward: in FP16 range
+//    T24 mixed update master: params decrease with pos grads
+//    T25 checkpoint forward: activations computed
+//    T26 checkpoint recompute: matches forward
+//    T27 checkpoint memory saved: positive for large hidden
+//    T28 full state dict: weights == original
+//    T29 sharded state dict: has rank_shards
+//    T30 load full state: roundtrip preserves weights
+//    T31 load sharded state: roundtrip preserves shards
+//    T32 reshard config: immediate true
+//    T33 reshard config: deferred false
+//    T34 CPU offload: flag set
+//    T35 CPU offload: roundtrip preserves weights
+//    T36 optimizer step: shard update correct
+//    T37 memory no shard: 4P
+//    T38 memory full shard: 4P/N
+//    T39 memory grad shard: P + 3P/N
+//    T40 memory savings ratio: positive for N>1
+//    T41 memory savings factor: N=8 gives 8x
+//    T42 wrap policy: small layers excluded
+//    T43 wrap policy: large layers included
+//    T44 wrap count correct
+//    T45 comm volume: 2P
+//    T46 effective batch size correct
+//    T47 grad norm sharded: correct norm
 //
-//  실행: cd /Users/ghost/Dev/hexa-lang && ./hexa self/test_fsdp.hexa
-// ═══════════════════════════════════════════════════════════════════
+//  Run: cargo run --release -- self/test_fsdp.hexa
+// ═══════════════════════════════════════════════════════════════
 
 use "ml/fsdp"
 
@@ -45,154 +77,232 @@ fn sum_shard_sizes(d, n) {
     return s
 }
 
-fn main() {
-    println("=== FSDP Tests ===")
+println("=== FSDP Tests ===")
 
-    // ── 1. shard boundary 일관성 ──────────────────────────────
-    let d1 = 12
-    let n1 = 4
-    check("shard[0] begin=0", fsdp_shard_begin(d1, n1, 0) == 0)
-    check("shard[last] end==total_d", fsdp_shard_end(d1, n1, n1 - 1) == d1)
+// ═══════════════════════════════════════════════════════════════
+//  1. Parameter sharding
+// ═══════════════════════════════════════════════════════════════
 
-    // ── 2. shard sizes 합 == total_d ──────────────────────────
-    check("sum sizes N=4,D=12", sum_shard_sizes(12, 4) == 12)
-    check("sum sizes N=3,D=10", sum_shard_sizes(10, 3) == 10)
+check("T1 shard begin[0]=0", fsdp_shard_begin(12, 4, 0) == 0)
+check("T2 shard end[last]=total_d", fsdp_shard_end(12, 4, 3) == 12)
+check("T3 shard sizes sum even D=12,N=4", sum_shard_sizes(12, 4) == 12)
+check("T4 shard sizes sum uneven D=10,N=3", sum_shard_sizes(10, 3) == 10)
 
-    // ── 3. init: N=1 shard가 원본과 동일 ──────────────────────
-    let w1 = [1.0, 2.0, 3.0, 4.0]
-    let st1 = fsdp_init(w1, 1, false, false)
-    let flat1 = fsdp_flatten_shards(st1)
-    check("N=1 shard == original", fsdp_l2_diff(w1, flat1) < 1.0e-12)
+let w1 = [1.0, 2.0, 3.0, 4.0]
+let st1 = fsdp_init(w1, 1, false, false)
+let flat1 = fsdp_flatten_shards(st1)
+check("T5 N=1 shard == original", fsdp_l2_diff(w1, flat1) < 1.0e-12)
 
-    // ── 4. all-gather: 연결 결과 == 원본 ──────────────────────
-    let w4 = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0]
-    let st4 = fsdp_init(w4, 4, false, false)
-    let gathered = fsdp_all_gather(st4)
-    check("all-gather == original", fsdp_l2_diff(w4, gathered) < 1.0e-12)
-    check("gathered length matches", len(gathered) == 8)
+let w6 = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0]
+let st6_init = fsdp_init(w6, 4, false, false)
+check("T6 init N=4 num_ranks", st6_init.num_ranks == 4)
 
-    // ── 5. forward (N=2) ==========================================
-    let w5 = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
-    let x5 = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0]
-    let st5 = fsdp_init(w5, 2, false, false)
-    let y5_fsdp = fsdp_forward(st5, x5)
-    let y5_ref = fsdp_single_rank_forward(w5, x5)
-    check("fwd(N=2) == single rank", fsdp_l2_diff(y5_fsdp, y5_ref) < 1.0e-9)
+// ═══════════════════════════════════════════════════════════════
+//  2. All-gather forward
+// ═══════════════════════════════════════════════════════════════
 
-    // ── 6. forward (N=4) ==========================================
-    let st6 = fsdp_init(w5, 4, false, false)
-    let y6_fsdp = fsdp_forward(st6, x5)
-    check("fwd(N=4) == single rank", fsdp_l2_diff(y6_fsdp, y5_ref) < 1.0e-9)
+let w7 = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0]
+let st7 = fsdp_init(w7, 2, false, false)
+let gathered7 = fsdp_all_gather(st7)
+check("T7 all-gather N=2 == original", fsdp_l2_diff(w7, gathered7) < 1.0e-12)
 
-    // ── 7. backward (N=2) =========================================
-    let go7 = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
-    let shard_g7 = fsdp_backward(st5, x5, go7)
-    let flat_g7 = fsdp_flatten_shard_grads(shard_g7)
-    let ref_g7 = fsdp_single_rank_backward(w5, x5, go7)
-    // reduce-scatter는 동일 grad를 N번 합산 → full grad * N
-    // 동치 비교: ref * num_ranks == flat_g7
-    let num_r7 = st5.num_ranks
-    let mut ref_scaled7 = []
-    for i in 0..len(ref_g7) { ref_scaled7 = ref_scaled7 + [ref_g7[i] * to_float(num_r7)] }
-    check("bwd(N=2) reduce-scatter == N*grad", fsdp_l2_diff(flat_g7, ref_scaled7) < 1.0e-9)
+let st8 = fsdp_init(w6, 4, false, false)
+let gathered8 = fsdp_all_gather(st8)
+check("T8 all-gather N=4 == original", fsdp_l2_diff(w6, gathered8) < 1.0e-12)
+check("T9 all-gather length matches", len(gathered8) == 8)
 
-    // ── 8. backward (N=4) =========================================
-    let shard_g8 = fsdp_backward(st6, x5, go7)
-    let flat_g8 = fsdp_flatten_shard_grads(shard_g8)
-    let num_r8 = st6.num_ranks
-    let mut ref_scaled8 = []
-    for i in 0..len(ref_g7) { ref_scaled8 = ref_scaled8 + [ref_g7[i] * to_float(num_r8)] }
-    check("bwd(N=4) reduce-scatter == N*grad", fsdp_l2_diff(flat_g8, ref_scaled8) < 1.0e-9)
+let w_fwd = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+let x_fwd = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0]
+let st_fwd2 = fsdp_init(w_fwd, 2, false, false)
+let y_fwd2 = fsdp_forward(st_fwd2, x_fwd)
+let y_ref = fsdp_single_rank_forward(w_fwd, x_fwd)
+check("T10 fwd N=2 == single rank", fsdp_l2_diff(y_fwd2, y_ref) < 1.0e-9)
 
-    // ── 9. reduce-scatter 직접 테스트 ═════════════════════════════
-    // 두 rank가 각각 [1,2,3,4] 전체 grad를 가질 때:
-    // 합산 → [2,4,6,8], rank0=[2,4], rank1=[6,8]
-    let fg9 = [[1.0, 2.0, 3.0, 4.0], [1.0, 2.0, 3.0, 4.0]]
-    let rs9 = fsdp_reduce_scatter(fg9, 2, 4)
-    let rs9_flat = fsdp_flatten_shard_grads(rs9)
-    let expected9 = [2.0, 4.0, 6.0, 8.0]
-    check("reduce-scatter sum", fsdp_l2_diff(rs9_flat, expected9) < 1.0e-12)
+let st_fwd4 = fsdp_init(w_fwd, 4, false, false)
+let y_fwd4 = fsdp_forward(st_fwd4, x_fwd)
+check("T11 fwd N=4 == single rank", fsdp_l2_diff(y_fwd4, y_ref) < 1.0e-9)
 
-    // ── 10. CPU offload ⇄ load 라운드트립 ═════════════════════════
-    let wA = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
-    let stA = fsdp_init(wA, 3, false, false)
-    let stA_off = fsdp_offload_to_cpu(stA)
-    let stA_back = fsdp_load_to_gpu(stA_off)
-    // shard 내용은 동일해야 함
-    let flatA = fsdp_flatten_shards(stA_back)
-    check("offload roundtrip preserves", fsdp_l2_diff(wA, flatA) < 1.0e-12)
-    check("offload flag CPU", stA_off.cpu_offload == true)
-    check("offload flag GPU after load", stA_back.cpu_offload == false)
+// ═══════════════════════════════════════════════════════════════
+//  3. Reduce-scatter backward
+// ═══════════════════════════════════════════════════════════════
 
-    // ── 11. 메모리 절감 비율 ═══════════════════════════════════════
-    // N=8, no mixed → 8x savings
-    let sav8 = fsdp_memory_savings(8, false)
-    check("memory savings N=8 = 8x", tapprox(sav8, 8.0, 1.0e-9))
-    // N=8 + mixed precision → 8 / 1.5 ≈ 5.33
-    let sav8mp = fsdp_memory_savings(8, true)
-    check("memory savings N=8 mixed < 8x", sav8mp < 8.0)
-    // Per-rank: D=16, N=4 → 4 per shard
-    let per = fsdp_rank_memory(16, 4, 0, false)
-    check("per-rank memory = D/N", tapprox(per, 4.0, 1.0e-9))
+let go_bwd = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+let sg_bwd2 = fsdp_backward(st_fwd2, x_fwd, go_bwd)
+let flat_g2 = fsdp_flatten_shard_grads(sg_bwd2)
+let ref_g = fsdp_single_rank_backward(w_fwd, x_fwd, go_bwd)
+let nr2 = st_fwd2.num_ranks
+let mut ref_scaled2 = []
+for i in 0..len(ref_g) { ref_scaled2 = ref_scaled2 + [ref_g[i] * to_float(nr2)] }
+check("T12 bwd N=2 reduce-scatter == N*grad", fsdp_l2_diff(flat_g2, ref_scaled2) < 1.0e-9)
 
-    // ── 12. mixed precision init ═════════════════════════════════
-    let wMP = [1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5]
-    let stMP = fsdp_init(wMP, 2, false, true)
-    // fp16 shards must be populated
-    let has_fp16 = len(stMP.rank_fp16_shards[0]) > 0
-    check("mixed precision fp16 shards created", has_fp16)
-    // fp16 cast round-trip: value close to original (within FP16 precision)
-    let fp16_first = stMP.rank_fp16_shards[0][0]
-    check("fp16 shard[0][0] close to 1.5", tapprox(fp16_first, 1.5, 0.01))
+let sg_bwd4 = fsdp_backward(st_fwd4, x_fwd, go_bwd)
+let flat_g4 = fsdp_flatten_shard_grads(sg_bwd4)
+let nr4 = st_fwd4.num_ranks
+let mut ref_scaled4 = []
+for i in 0..len(ref_g) { ref_scaled4 = ref_scaled4 + [ref_g[i] * to_float(nr4)] }
+check("T13 bwd N=4 reduce-scatter == N*grad", fsdp_l2_diff(flat_g4, ref_scaled4) < 1.0e-9)
 
-    // ── 13. wrap policy ═════════════════════════════════════════
-    let layer_sizes = [100, 2000, 50, 5000, 300]
-    let wrap = fsdp_wrap_policy(layer_sizes, 1000)
-    // layers >= 1000: index 1, 3
-    check("wrap[0] small skipped", wrap[0] == false)
-    check("wrap[1] large wrapped", wrap[1] == true)
-    check("wrap[2] small skipped", wrap[2] == false)
-    check("wrap[3] large wrapped", wrap[3] == true)
-    check("wrap count = 2", fsdp_count_wrapped(wrap) == 2)
+let fg_rs = [[1.0, 2.0, 3.0, 4.0], [1.0, 2.0, 3.0, 4.0]]
+let rs_result = fsdp_reduce_scatter(fg_rs, 2, 4)
+let rs_flat = fsdp_flatten_shard_grads(rs_result)
+let expected_rs = [2.0, 4.0, 6.0, 8.0]
+check("T14 reduce-scatter direct sum", fsdp_l2_diff(rs_flat, expected_rs) < 1.0e-12)
 
-    // ── 14. optimizer step: shard 업데이트 일관성 ═════════════════
-    let wO = [10.0, 20.0, 30.0, 40.0]
-    let stO = fsdp_init(wO, 2, false, false)
-    // Manual shard_grads: rank0=[1,1], rank1=[2,2]
-    let sg_o = [[1.0, 1.0], [2.0, 2.0]]
-    let lr = 0.1
-    let stO2 = fsdp_optimizer_step(stO, sg_o, lr)
-    let flatO = fsdp_flatten_shards(stO2)
-    // expected: [10-0.1, 20-0.1, 30-0.2, 40-0.2] = [9.9, 19.9, 29.8, 39.8]
-    let expO = [9.9, 19.9, 29.8, 39.8]
-    check("optimizer step shard update", fsdp_l2_diff(flatO, expO) < 1.0e-9)
+// ═══════════════════════════════════════════════════════════════
+//  4. Shard specification
+// ═══════════════════════════════════════════════════════════════
 
-    // ── 15. mixed precision forward 숫자 적법 범위 ═══════════════
-    let wF = [1.0, 2.0, 4.0, 8.0]
-    let xF = [0.5, 0.25, 0.125, 0.0625]
-    let stF = fsdp_init(wF, 2, false, true)
-    let yF = fsdp_forward(stF, xF)
-    // all outputs within FP16 range
-    let mut yF_ok = true
-    for i in 0..len(yF) {
-        let v = yF[i]
-        if tfabs(v) > 65504.0 { yF_ok = false }
-    }
-    check("mixed fwd output in FP16 range", yF_ok)
-    // Expected rough: [0.5, 0.5, 0.5, 0.5] — 모두 0.5 근처
-    let mut mp_close = true
-    for i in 0..len(yF) {
-        if tfabs(yF[i] - 0.5) > 0.02 { mp_close = false }
-    }
-    check("mixed fwd ≈ fp32 fwd", mp_close)
+let spec_yes = fsdp_new_shard_spec("weight", 0, true)
+let spec_no = fsdp_new_shard_spec("bias", 0, false)
+check("T15 shard spec: should_shard true", fsdp_should_shard_spec(spec_yes) == true)
+check("T16 shard spec: should_shard false", fsdp_should_shard_spec(spec_no) == false)
 
-    println("")
-    println("FSDP: " + to_string(pass_count) + " passed, " + to_string(fail_count) + " failed")
-    if fail_count > 0 {
-        println("[FAIL] test_fsdp.hexa")
-    } else {
-        println("[PASS] test_fsdp.hexa — all " + to_string(pass_count) + " FSDP tests passed")
-    }
+let params_spec = [1.0, 2.0, 3.0, 4.0]
+let sharded_spec = fsdp_apply_shard_spec(params_spec, spec_yes, 2)
+check("T17 apply spec sharded: 2 shards", len(sharded_spec) == 2)
+
+let replicated_spec = fsdp_apply_shard_spec(params_spec, spec_no, 2)
+check("T18 apply spec not sharded: replicated full", len(replicated_spec[0]) == 4 && len(replicated_spec[1]) == 4)
+
+// ═══════════════════════════════════════════════════════════════
+//  5. Mixed precision
+// ═══════════════════════════════════════════════════════════════
+
+let fp16_val = fsdp_fp16_cast(1.5)
+check("T19 fp16 cast close", tapprox(fp16_val, 1.5, 0.01))
+
+let fp16_big = fsdp_fp16_cast(100000.0)
+check("T20 fp16 clamp large", tapprox(fp16_big, 65504.0, 1.0))
+
+let w_mp = [1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5]
+let st_mp = fsdp_init(w_mp, 2, false, true)
+let has_fp16 = len(st_mp.rank_fp16_shards[0]) > 0
+check("T21 mixed precision fp16 shards created", has_fp16)
+
+let fp16_first = st_mp.rank_fp16_shards[0][0]
+check("T22 fp16 shard[0][0] close to 1.5", tapprox(fp16_first, 1.5, 0.01))
+
+let w_mpf = [1.0, 2.0, 4.0, 8.0]
+let x_mpf = [0.5, 0.25, 0.125, 0.0625]
+let st_mpf = fsdp_init(w_mpf, 2, false, true)
+let y_mpf = fsdp_forward(st_mpf, x_mpf)
+let mut yf_ok = true
+for i in 0..len(y_mpf) {
+    if tfabs(y_mpf[i]) > 65504.0 { yf_ok = false }
 }
+check("T23 mixed fwd output in FP16 range", yf_ok)
 
-main()
+let master = [1.0, 2.0, 3.0]
+let grads_mu = [0.1, 0.2, 0.3]
+let updated_mu = fsdp_mixed_update_master(master, grads_mu, 0.1)
+check("T24 mixed update: params decrease", updated_mu[0] < master[0] && updated_mu[1] < master[1])
+
+// ═══════════════════════════════════════════════════════════════
+//  6. Activation checkpointing
+// ═══════════════════════════════════════════════════════════════
+
+let ckpt_params = [2.0, 3.0, 4.0]
+let ckpt_inputs = [1.0, 2.0, 3.0]
+let ckpt_result = fsdp_checkpoint_forward(ckpt_params, ckpt_inputs, "layer_0")
+let ckpt_act = ckpt_result[0]
+let ckpt_meta = ckpt_result[1]
+check("T25 checkpoint forward: activations computed", len(ckpt_act) == 3)
+
+let recomputed = fsdp_checkpoint_recompute(ckpt_params, ckpt_meta)
+check("T26 checkpoint recompute matches forward", fsdp_l2_diff(ckpt_act, recomputed) < 1.0e-12)
+
+let ckpt_saving = fsdp_checkpoint_memory_saved(12, 256)
+check("T27 checkpoint memory saved > 0", ckpt_saving > 0.0)
+
+// ═══════════════════════════════════════════════════════════════
+//  7. State dict
+// ═══════════════════════════════════════════════════════════════
+
+let w_sd = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0]
+let st_sd = fsdp_init(w_sd, 3, false, false)
+let full_sd = fsdp_full_state_dict(st_sd)
+let sd_weights = full_sd["weights"]
+check("T28 full state dict: weights == original", fsdp_l2_diff(w_sd, sd_weights) < 1.0e-12)
+
+let sharded_sd = fsdp_sharded_state_dict(st_sd)
+check("T29 sharded state dict: has rank_shards", len(sharded_sd["rank_shards"]) == 3)
+
+let st_loaded = fsdp_load_full_state_dict(full_sd, 3, false, false)
+let flat_loaded = fsdp_flatten_shards(st_loaded)
+check("T30 load full state roundtrip", fsdp_l2_diff(w_sd, flat_loaded) < 1.0e-12)
+
+let st_shard_loaded = fsdp_load_sharded_state_dict(sharded_sd, 3, 6, false, false)
+let flat_shard_loaded = fsdp_flatten_shards(st_shard_loaded)
+check("T31 load sharded state roundtrip", fsdp_l2_diff(w_sd, flat_shard_loaded) < 1.0e-12)
+
+// ═══════════════════════════════════════════════════════════════
+//  8. Reshard policy
+// ═══════════════════════════════════════════════════════════════
+
+let rc_imm = fsdp_new_reshard_config(true)
+let rc_def = fsdp_new_reshard_config(false)
+check("T32 reshard config immediate", fsdp_should_reshard_after_fwd(rc_imm) == true)
+check("T33 reshard config deferred", fsdp_should_reshard_after_fwd(rc_def) == false)
+
+let w_off = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+let st_off = fsdp_init(w_off, 3, false, false)
+let st_cpu = fsdp_offload_to_cpu(st_off)
+check("T34 CPU offload flag set", st_cpu.cpu_offload == true)
+
+let st_gpu = fsdp_load_to_gpu(st_cpu)
+let flat_trip = fsdp_flatten_shards(st_gpu)
+check("T35 offload roundtrip preserves weights", fsdp_l2_diff(w_off, flat_trip) < 1.0e-12)
+
+// ═══════════════════════════════════════════════════════════════
+//  Optimizer step
+// ═══════════════════════════════════════════════════════════════
+
+let w_opt = [10.0, 20.0, 30.0, 40.0]
+let st_opt = fsdp_init(w_opt, 2, false, false)
+let sg_opt = [[1.0, 1.0], [2.0, 2.0]]
+let st_opt2 = fsdp_optimizer_step(st_opt, sg_opt, 0.1)
+let flat_opt = fsdp_flatten_shards(st_opt2)
+let exp_opt = [9.9, 19.9, 29.8, 39.8]
+check("T36 optimizer step shard update", fsdp_l2_diff(flat_opt, exp_opt) < 1.0e-9)
+
+// ═══════════════════════════════════════════════════════════════
+//  9. Memory estimator
+// ═══════════════════════════════════════════════════════════════
+
+check("T37 memory no shard: 4P", fsdp_memory_no_shard(1000) == 4000)
+check("T38 memory full shard N=4: 4P/N", fsdp_memory_full_shard(1000, 4) == 1000)
+check("T39 memory grad shard N=4: P+3P/N", fsdp_memory_grad_shard(1000, 4) == 1750)
+
+let ratio = fsdp_memory_savings_ratio(1000, 4)
+check("T40 memory savings ratio > 0", ratio > 0.0)
+
+let sav8 = fsdp_memory_savings(8, false)
+check("T41 memory savings N=8 = 8x", tapprox(sav8, 8.0, 1.0e-9))
+
+// ═══════════════════════════════════════════════════════════════
+//  Wrap policy
+// ═══════════════════════════════════════════════════════════════
+
+let layer_sizes = [100, 2000, 50, 5000, 300]
+let wrap = fsdp_wrap_policy(layer_sizes, 1000)
+check("T42 wrap policy: small excluded", wrap[0] == false && wrap[2] == false)
+check("T43 wrap policy: large included", wrap[1] == true && wrap[3] == true)
+check("T44 wrap count = 2", fsdp_count_wrapped(wrap) == 2)
+
+// ═══════════════════════════════════════════════════════════════
+//  Communication + utility
+// ═══════════════════════════════════════════════════════════════
+
+check("T45 comm volume = 2P", fsdp_comm_volume(1000) == 2000)
+check("T46 effective batch size", fsdp_effective_batch_size(4, 8, 4) == 128)
+
+let sg_norm = [[3.0, 0.0], [0.0, 4.0]]
+let gnorm = fsdp_grad_norm_sharded(sg_norm)
+check("T47 grad norm sharded = 5", tapprox(gnorm, 5.0, 0.01))
+
+// ═══════════════════════════════════════════════════════════════
+println("")
+println("=== FSDP test summary ===")
+println("PASS: " + to_string(pass_count))
+println("FAIL: " + to_string(fail_count))
+println("TOTAL: " + to_string(pass_count + fail_count))

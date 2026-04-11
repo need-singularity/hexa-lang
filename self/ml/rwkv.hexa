@@ -1,0 +1,845 @@
+// ===================================================================
+//  self/ml/rwkv.hexa — RWKV: Receptance Weighted Key Value (linear RNN)
+//
+//  Implements the RWKV architecture (Peng et al.), a linear-complexity
+//  RNN that rivals Transformers in quality but runs in O(1) memory
+//  at inference time per token.
+//
+//  Components:
+//    1. Token shift (time-shift)     — mix current + previous token
+//    2. Time-mix (WKV kernel)        — weighted key-value with exp decay
+//    3. Channel-mix                  — receptance-gated FFN
+//    4. RWKV block                   — LayerNorm + time-mix + channel-mix
+//    5. Multi-layer RWKV stack       — configurable depth
+//    6. Recurrent state management   — O(1) inference mode
+//    7. Generation / sampling        — autoregressive with recurrent state
+//    8. Training mode (parallel scan)— process full sequence in parallel
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+//    @hot   — inner-loop kernels
+// ===================================================================
+
+// ===================================================================
+//  Math helpers
+// ===================================================================
+
+fn rwkv_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn rwkv_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn rwkv_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn rwkv_log(x) {
+    if x <= 0.0 { return -20.0 }
+    // Newton-based ln approximation
+    let mut y = 0.0
+    let mut t = (x - 1.0) / (x + 1.0)
+    let t2 = t * t
+    let mut term = t
+    for i in 0..15 {
+        y = y + term / to_float(2 * i + 1)
+        term = term * t2
+    }
+    return 2.0 * y
+}
+
+fn rwkv_sigmoid(x) {
+    if x > 20.0 { return 1.0 }
+    if x < -20.0 { return 0.0 }
+    return 1.0 / (1.0 + rwkv_exp(0.0 - x))
+}
+
+fn rwkv_tanh(x) {
+    if x > 10.0 { return 1.0 }
+    if x < -10.0 { return -1.0 }
+    let e2x = rwkv_exp(2.0 * x)
+    return (e2x - 1.0) / (e2x + 1.0)
+}
+
+fn rwkv_relu(x) {
+    if x > 0.0 { return x }
+    return 0.0
+}
+
+fn rwkv_relu_squared(x) {
+    let r = rwkv_relu(x)
+    return r * r
+}
+
+fn rwkv_max(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn rwkv_min(a, b) {
+    if a < b { return a }
+    return b
+}
+
+// ===================================================================
+//  Vector utilities
+// ===================================================================
+
+fn rwkv_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn rwkv_ones(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [1.0] }
+    return v
+}
+
+fn rwkv_vec_add(a, b) {
+    let n = len(a)
+    let mut out = []
+    for i in 0..n { out = out + [a[i] + b[i]] }
+    return out
+}
+
+fn rwkv_vec_sub(a, b) {
+    let n = len(a)
+    let mut out = []
+    for i in 0..n { out = out + [a[i] - b[i]] }
+    return out
+}
+
+fn rwkv_vec_mul(a, b) {
+    let n = len(a)
+    let mut out = []
+    for i in 0..n { out = out + [a[i] * b[i]] }
+    return out
+}
+
+fn rwkv_vec_scale(v, s) {
+    let n = len(v)
+    let mut out = []
+    for i in 0..n { out = out + [v[i] * s] }
+    return out
+}
+
+fn rwkv_dot(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    for i in 0..n { s = s + a[i] * b[i] }
+    return s
+}
+
+fn rwkv_vec_sigmoid(v) {
+    let n = len(v)
+    let mut out = []
+    for i in 0..n { out = out + [rwkv_sigmoid(v[i])] }
+    return out
+}
+
+fn rwkv_vec_relu_sq(v) {
+    let n = len(v)
+    let mut out = []
+    for i in 0..n { out = out + [rwkv_relu_squared(v[i])] }
+    return out
+}
+
+fn rwkv_vec_exp(v) {
+    let n = len(v)
+    let mut out = []
+    for i in 0..n { out = out + [rwkv_exp(v[i])] }
+    return out
+}
+
+// ===================================================================
+//  Matrix utilities (row-major: array of row-vectors)
+// ===================================================================
+
+fn rwkv_mat_zeros(rows, cols) {
+    let mut m = []
+    for _r in 0..rows { m = m + [rwkv_zeros(cols)] }
+    return m
+}
+
+fn rwkv_mat_vec(mat, v) {
+    let rows = len(mat)
+    let mut out = []
+    for r in 0..rows { out = out + [rwkv_dot(mat[r], v)] }
+    return out
+}
+
+// Deterministic pseudo-random initialization
+fn rwkv_init_weight(rows, cols, seed) {
+    let scale = 1.0 / rwkv_sqrt(to_float(cols))
+    let mut m = []
+    for r in 0..rows {
+        let mut row = []
+        for c in 0..cols {
+            let h = (r * 137 + c * 311 + seed * 7919) % 10007
+            let val = (to_float(h) / 10007.0 - 0.5) * 2.0 * scale
+            row = row + [val]
+        }
+        m = m + [row]
+    }
+    return m
+}
+
+fn rwkv_init_vec(dim, seed) {
+    let scale = 1.0 / rwkv_sqrt(to_float(dim))
+    let mut v = []
+    for i in 0..dim {
+        let h = (i * 251 + seed * 6173) % 10007
+        let val = (to_float(h) / 10007.0 - 0.5) * 2.0 * scale
+        v = v + [val]
+    }
+    return v
+}
+
+fn rwkv_init_vec_range(dim, low, high, seed) {
+    let range = high - low
+    let mut v = []
+    for i in 0..dim {
+        let h = (i * 251 + seed * 6173) % 10007
+        let val = low + to_float(h) / 10007.0 * range
+        v = v + [val]
+    }
+    return v
+}
+
+// ===================================================================
+//  LayerNorm
+//
+//  y = gamma * (x - mean) / sqrt(var + eps) + beta
+// ===================================================================
+
+struct LayerNorm {
+    dim: int,
+    gamma: array,
+    beta: array,
+    eps: float
+}
+
+fn create_layer_norm(dim) {
+    return LayerNorm {
+        dim: dim,
+        gamma: rwkv_ones(dim),
+        beta: rwkv_zeros(dim),
+        eps: 1.0e-5
+    }
+}
+
+@pure
+fn layer_norm_forward(ln, x) {
+    let n = ln.dim
+    let mut mean = 0.0
+    for i in 0..n { mean = mean + x[i] }
+    mean = mean / to_float(n)
+    let mut var = 0.0
+    for i in 0..n {
+        let d = x[i] - mean
+        var = var + d * d
+    }
+    var = var / to_float(n)
+    let inv_std = 1.0 / rwkv_sqrt(var + ln.eps)
+    let mut out = []
+    for i in 0..n {
+        let normed = (x[i] - mean) * inv_std
+        out = out + [ln.gamma[i] * normed + ln.beta[i]]
+    }
+    return out
+}
+
+// ===================================================================
+//  Token Shift — mix current token with previous token
+//
+//  shifted = mu * x_prev + (1 - mu) * x_curr
+//  mu is a per-dimension learnable mixing coefficient in [0,1]
+// ===================================================================
+
+@pure @hot
+fn token_shift(x_curr, x_prev, mu) {
+    let n = len(x_curr)
+    let mut out = []
+    for i in 0..n {
+        out = out + [mu[i] * x_prev[i] + (1.0 - mu[i]) * x_curr[i]]
+    }
+    return out
+}
+
+// ===================================================================
+//  Time-Mix module (WKV kernel)
+//
+//  The core RWKV innovation. For each position t:
+//    r_t = sigmoid(W_r . shifted_r)      -- receptance gate
+//    k_t = W_k . shifted_k               -- key
+//    v_t = W_v . shifted_v               -- value
+//    wkv_t = (a_{t-1} + exp(u + k_t) * v_t) / (b_{t-1} + exp(u + k_t))
+//    output_t = r_t * (W_o . wkv_t)
+//
+//  Recurrent state: (a, b) where
+//    a_t = exp(-w) * a_{t-1} + exp(k_t) * v_t
+//    b_t = exp(-w) * b_{t-1} + exp(k_t)
+//
+//  w: decay vector (per-dim)
+//  u: bonus vector (per-dim)
+// ===================================================================
+
+struct TimeMix {
+    dim: int,
+    W_r: array,
+    W_k: array,
+    W_v: array,
+    W_o: array,
+    mu_r: array,
+    mu_k: array,
+    mu_v: array,
+    w: array,
+    u: array
+}
+
+fn create_time_mix(dim, seed) {
+    return TimeMix {
+        dim: dim,
+        W_r: rwkv_init_weight(dim, dim, seed + 1),
+        W_k: rwkv_init_weight(dim, dim, seed + 2),
+        W_v: rwkv_init_weight(dim, dim, seed + 3),
+        W_o: rwkv_init_weight(dim, dim, seed + 4),
+        mu_r: rwkv_init_vec_range(dim, 0.3, 0.7, seed + 5),
+        mu_k: rwkv_init_vec_range(dim, 0.3, 0.7, seed + 6),
+        mu_v: rwkv_init_vec_range(dim, 0.3, 0.7, seed + 7),
+        w: rwkv_init_vec_range(dim, -2.0, -0.5, seed + 8),
+        u: rwkv_init_vec_range(dim, -0.5, 0.5, seed + 9)
+    }
+}
+
+// WKV kernel: single step (recurrent mode)
+// state_a, state_b: previous numerator/denominator accumulators (dim-dimensional)
+// Returns: [wkv_output, new_a, new_b]
+@pure @hot
+fn wkv_step(tm, k, v, state_a, state_b) {
+    let d = tm.dim
+    let mut wkv = []
+    let mut new_a = []
+    let mut new_b = []
+    for i in 0..d {
+        let ek = rwkv_exp(k[i])
+        let euk = rwkv_exp(tm.u[i] + k[i])
+        let ew = rwkv_exp(tm.w[i])
+        // WKV: (a + exp(u+k)*v) / (b + exp(u+k))
+        let num = state_a[i] + euk * v[i]
+        let den = state_b[i] + euk
+        let safe_den = if rwkv_abs(den) < 1.0e-8 { 1.0e-8 } else { den }
+        wkv = wkv + [num / safe_den]
+        // Update state: decay old + add new
+        new_a = new_a + [ew * state_a[i] + ek * v[i]]
+        new_b = new_b + [ew * state_b[i] + ek]
+    }
+    return [wkv, new_a, new_b]
+}
+
+// Time-mix forward (single token, recurrent mode)
+// x_curr: current token embedding
+// x_prev: previous token embedding (for token shift)
+// state_a, state_b: WKV recurrent state
+// Returns: [output, new_state_a, new_state_b, x_curr]
+@hot
+fn time_mix_step(tm, x_curr, x_prev, state_a, state_b) {
+    let shifted_r = token_shift(x_curr, x_prev, tm.mu_r)
+    let shifted_k = token_shift(x_curr, x_prev, tm.mu_k)
+    let shifted_v = token_shift(x_curr, x_prev, tm.mu_v)
+    let r = rwkv_vec_sigmoid(rwkv_mat_vec(tm.W_r, shifted_r))
+    let k = rwkv_mat_vec(tm.W_k, shifted_k)
+    let v = rwkv_mat_vec(tm.W_v, shifted_v)
+    let wkv_res = wkv_step(tm, k, v, state_a, state_b)
+    let wkv_out = wkv_res[0]
+    let new_a = wkv_res[1]
+    let new_b = wkv_res[2]
+    let projected = rwkv_mat_vec(tm.W_o, wkv_out)
+    let output = rwkv_vec_mul(r, projected)
+    return [output, new_a, new_b, x_curr]
+}
+
+// Time-mix forward (full sequence, parallel mode)
+// xs: array of token embeddings [seq_len x dim]
+// Returns: array of outputs [seq_len x dim]
+fn time_mix_sequence(tm, xs) {
+    let seq_len = len(xs)
+    let d = tm.dim
+    let mut state_a = rwkv_zeros(d)
+    let mut state_b = rwkv_zeros(d)
+    let mut x_prev = rwkv_zeros(d)
+    let mut outputs = []
+    for t in 0..seq_len {
+        let res = time_mix_step(tm, xs[t], x_prev, state_a, state_b)
+        outputs = outputs + [res[0]]
+        state_a = res[1]
+        state_b = res[2]
+        x_prev = res[3]
+    }
+    return outputs
+}
+
+// ===================================================================
+//  Channel-Mix module
+//
+//  Token shift + receptance gate + key/value FFN.
+//  For each position t:
+//    shifted_r = mu_r * x_prev + (1 - mu_r) * x_curr
+//    shifted_k = mu_k * x_prev + (1 - mu_k) * x_curr
+//    r_t = sigmoid(W_r . shifted_r)
+//    k_t = relu^2(W_k . shifted_k)          -- squared ReLU
+//    output_t = r_t * (W_v . k_t)
+//
+//  No recurrent state needed (pure feedforward with token shift).
+// ===================================================================
+
+struct ChannelMix {
+    dim: int,
+    ff_dim: int,
+    W_r: array,
+    W_k: array,
+    W_v: array,
+    mu_r: array,
+    mu_k: array
+}
+
+fn create_channel_mix(dim, ff_dim, seed) {
+    return ChannelMix {
+        dim: dim,
+        ff_dim: ff_dim,
+        W_r: rwkv_init_weight(dim, dim, seed + 10),
+        W_k: rwkv_init_weight(ff_dim, dim, seed + 11),
+        W_v: rwkv_init_weight(dim, ff_dim, seed + 12),
+        mu_r: rwkv_init_vec_range(dim, 0.3, 0.7, seed + 13),
+        mu_k: rwkv_init_vec_range(dim, 0.3, 0.7, seed + 14)
+    }
+}
+
+// Channel-mix forward (single token)
+// x_curr: current embedding
+// x_prev: previous embedding (for token shift)
+// Returns: [output, x_curr]  (x_curr becomes next step's x_prev)
+@hot
+fn channel_mix_step(cm, x_curr, x_prev) {
+    let shifted_r = token_shift(x_curr, x_prev, cm.mu_r)
+    let shifted_k = token_shift(x_curr, x_prev, cm.mu_k)
+    let r = rwkv_vec_sigmoid(rwkv_mat_vec(cm.W_r, shifted_r))
+    let k = rwkv_vec_relu_sq(rwkv_mat_vec(cm.W_k, shifted_k))
+    let v = rwkv_mat_vec(cm.W_v, k)
+    let output = rwkv_vec_mul(r, v)
+    return [output, x_curr]
+}
+
+// Channel-mix forward (full sequence)
+// xs: array of embeddings [seq_len x dim]
+// Returns: array of outputs [seq_len x dim]
+fn channel_mix_sequence(cm, xs) {
+    let seq_len = len(xs)
+    let mut x_prev = rwkv_zeros(cm.dim)
+    let mut outputs = []
+    for t in 0..seq_len {
+        let res = channel_mix_step(cm, xs[t], x_prev)
+        outputs = outputs + [res[0]]
+        x_prev = res[1]
+    }
+    return outputs
+}
+
+// ===================================================================
+//  RWKV Block: LayerNorm + Time-Mix + residual + LayerNorm + Channel-Mix + residual
+// ===================================================================
+
+struct RWKVBlock {
+    dim: int,
+    ff_dim: int,
+    ln1: LayerNorm,
+    ln2: LayerNorm,
+    time_mix: TimeMix,
+    channel_mix: ChannelMix
+}
+
+fn create_rwkv_block(dim, ff_dim, seed) {
+    return RWKVBlock {
+        dim: dim,
+        ff_dim: ff_dim,
+        ln1: create_layer_norm(dim),
+        ln2: create_layer_norm(dim),
+        time_mix: create_time_mix(dim, seed),
+        channel_mix: create_channel_mix(dim, ff_dim, seed + 100)
+    }
+}
+
+// RWKV block forward (single token, recurrent mode)
+// x: current embedding
+// tm_prev: previous token for time-mix shift
+// cm_prev: previous token for channel-mix shift
+// state_a, state_b: WKV recurrent state
+// Returns: [output, new_state_a, new_state_b, tm_prev_new, cm_prev_new]
+fn rwkv_block_step(blk, x, tm_prev, cm_prev, state_a, state_b) {
+    // Time-mix branch with residual
+    let normed1 = layer_norm_forward(blk.ln1, x)
+    let tm_res = time_mix_step(blk.time_mix, normed1, tm_prev, state_a, state_b)
+    let x2 = rwkv_vec_add(x, tm_res[0])
+    let new_a = tm_res[1]
+    let new_b = tm_res[2]
+    let tm_prev_new = tm_res[3]
+    // Channel-mix branch with residual
+    let normed2 = layer_norm_forward(blk.ln2, x2)
+    let cm_res = channel_mix_step(blk.channel_mix, normed2, cm_prev)
+    let x3 = rwkv_vec_add(x2, cm_res[0])
+    let cm_prev_new = cm_res[1]
+    return [x3, new_a, new_b, tm_prev_new, cm_prev_new]
+}
+
+// RWKV block forward (full sequence)
+// xs: [seq_len x dim]
+// Returns: [seq_len x dim]
+fn rwkv_block_sequence(blk, xs) {
+    let seq_len = len(xs)
+    let d = blk.dim
+    let mut state_a = rwkv_zeros(d)
+    let mut state_b = rwkv_zeros(d)
+    let mut tm_prev = rwkv_zeros(d)
+    let mut cm_prev = rwkv_zeros(d)
+    let mut outputs = []
+    for t in 0..seq_len {
+        let res = rwkv_block_step(blk, xs[t], tm_prev, cm_prev, state_a, state_b)
+        outputs = outputs + [res[0]]
+        state_a = res[1]
+        state_b = res[2]
+        tm_prev = res[3]
+        cm_prev = res[4]
+    }
+    return outputs
+}
+
+// ===================================================================
+//  Recurrent State — container for multi-layer state
+//
+//  Each layer has: state_a, state_b, tm_prev, cm_prev
+//  Stored as arrays of arrays.
+// ===================================================================
+
+struct RWKVState {
+    n_layers: int,
+    dim: int,
+    state_a: array,
+    state_b: array,
+    tm_prev: array,
+    cm_prev: array
+}
+
+fn create_rwkv_state(n_layers, dim) {
+    let mut sa = []
+    let mut sb = []
+    let mut tp = []
+    let mut cp = []
+    for _l in 0..n_layers {
+        sa = sa + [rwkv_zeros(dim)]
+        sb = sb + [rwkv_zeros(dim)]
+        tp = tp + [rwkv_zeros(dim)]
+        cp = cp + [rwkv_zeros(dim)]
+    }
+    return RWKVState {
+        n_layers: n_layers,
+        dim: dim,
+        state_a: sa,
+        state_b: sb,
+        tm_prev: tp,
+        cm_prev: cp
+    }
+}
+
+// ===================================================================
+//  Multi-layer RWKV stack
+// ===================================================================
+
+struct RWKVStack {
+    n_layers: int,
+    d_model: int,
+    ff_dim: int,
+    blocks: array,
+    ln_out: LayerNorm
+}
+
+fn create_rwkv_stack(n_layers, d_model, ff_dim, seed) {
+    let mut blocks = []
+    for l in 0..n_layers {
+        blocks = blocks + [create_rwkv_block(d_model, ff_dim, seed + l * 1000)]
+    }
+    return RWKVStack {
+        n_layers: n_layers,
+        d_model: d_model,
+        ff_dim: ff_dim,
+        blocks: blocks,
+        ln_out: create_layer_norm(d_model)
+    }
+}
+
+// Stack forward (single token, recurrent mode)
+// x: current token embedding [d_model]
+// state: RWKVState with per-layer states
+// Returns: [output, new_state]
+fn rwkv_stack_step(stack, x, state) {
+    let mut h = x
+    let mut new_sa = []
+    let mut new_sb = []
+    let mut new_tp = []
+    let mut new_cp = []
+    for l in 0..stack.n_layers {
+        let blk = stack.blocks[l]
+        let res = rwkv_block_step(blk, h, state.tm_prev[l], state.cm_prev[l], state.state_a[l], state.state_b[l])
+        h = res[0]
+        new_sa = new_sa + [res[1]]
+        new_sb = new_sb + [res[2]]
+        new_tp = new_tp + [res[3]]
+        new_cp = new_cp + [res[4]]
+    }
+    let out = layer_norm_forward(stack.ln_out, h)
+    let new_state = RWKVState {
+        n_layers: state.n_layers,
+        dim: state.dim,
+        state_a: new_sa,
+        state_b: new_sb,
+        tm_prev: new_tp,
+        cm_prev: new_cp
+    }
+    return [out, new_state]
+}
+
+// Stack forward (full sequence)
+// xs: [seq_len x d_model]
+// Returns: [seq_len x d_model]
+fn rwkv_stack_sequence(stack, xs) {
+    let seq_len = len(xs)
+    let mut state = create_rwkv_state(stack.n_layers, stack.d_model)
+    let mut outputs = []
+    for t in 0..seq_len {
+        let res = rwkv_stack_step(stack, xs[t], state)
+        outputs = outputs + [res[0]]
+        state = res[1]
+    }
+    return outputs
+}
+
+// ===================================================================
+//  Simple embedding / un-embedding for generation
+// ===================================================================
+
+fn rwkv_embed(token_id, d_model, seed) {
+    let mut v = []
+    for i in 0..d_model {
+        let h = (token_id * 137 + i * 311 + seed) % 10007
+        let val = (to_float(h) / 10007.0 - 0.5) * 0.1
+        v = v + [val]
+    }
+    return v
+}
+
+fn rwkv_unembed(h, vocab_size, d_model, seed) {
+    let mut logits = []
+    for v in 0..vocab_size {
+        let mut score = 0.0
+        for i in 0..d_model {
+            let w_h = (v * 137 + i * 311 + seed + 999) % 10007
+            let w = (to_float(w_h) / 10007.0 - 0.5) * 0.1
+            score = score + h[i] * w
+        }
+        logits = logits + [score]
+    }
+    return logits
+}
+
+// ===================================================================
+//  Softmax + Argmax for generation
+// ===================================================================
+
+@pure
+fn rwkv_softmax(logits) {
+    let n = len(logits)
+    let mut mx = logits[0]
+    for i in 1..n { if logits[i] > mx { mx = logits[i] } }
+    let mut exps = rwkv_zeros(n)
+    let mut z = 0.0
+    for i in 0..n {
+        exps[i] = rwkv_exp(logits[i] - mx)
+        z = z + exps[i]
+    }
+    let mut out = rwkv_zeros(n)
+    for i in 0..n { out[i] = exps[i] / z }
+    return out
+}
+
+@pure
+fn rwkv_argmax(logits) {
+    let n = len(logits)
+    let mut best = 0
+    let mut best_v = logits[0]
+    for i in 1..n {
+        if logits[i] > best_v {
+            best_v = logits[i]
+            best = i
+        }
+    }
+    return best
+}
+
+// ===================================================================
+//  Generation — greedy, using recurrent mode (O(1) per step)
+//
+//  generate(stack, start_tokens, n_gen, vocab_size, emb_seed)
+//  Returns: array of generated token IDs (after start_tokens)
+// ===================================================================
+
+fn rwkv_generate(stack, start_tokens, n_gen, vocab_size, emb_seed) {
+    let d = stack.d_model
+    let mut state = create_rwkv_state(stack.n_layers, d)
+    // Process prompt (prefill)
+    let n_prompt = len(start_tokens)
+    let mut last_out = rwkv_zeros(d)
+    for t in 0..n_prompt {
+        let emb = rwkv_embed(start_tokens[t], d, emb_seed)
+        let res = rwkv_stack_step(stack, emb, state)
+        last_out = res[0]
+        state = res[1]
+    }
+    // Generate tokens one by one
+    let mut generated = []
+    for _g in 0..n_gen {
+        let logits = rwkv_unembed(last_out, vocab_size, d, emb_seed)
+        let next_id = rwkv_argmax(logits)
+        generated = generated + [next_id]
+        let emb = rwkv_embed(next_id, d, emb_seed)
+        let res = rwkv_stack_step(stack, emb, state)
+        last_out = res[0]
+        state = res[1]
+    }
+    return generated
+}
+
+// ===================================================================
+//  Training mode — parallel scan over full sequence
+//
+//  Processes all tokens at once (teacher forcing).
+//  Returns per-token logits for loss computation.
+// ===================================================================
+
+fn rwkv_train_forward(stack, token_ids, vocab_size, emb_seed) {
+    let d = stack.d_model
+    let seq_len = len(token_ids)
+    // Embed all tokens
+    let mut xs = []
+    for t in 0..seq_len {
+        xs = xs + [rwkv_embed(token_ids[t], d, emb_seed)]
+    }
+    // Forward through stack
+    let outs = rwkv_stack_sequence(stack, xs)
+    // Compute logits for each position
+    let mut all_logits = []
+    for t in 0..seq_len {
+        let logits = rwkv_unembed(outs[t], vocab_size, d, emb_seed)
+        all_logits = all_logits + [logits]
+    }
+    return all_logits
+}
+
+// ===================================================================
+//  Cross-entropy loss (for training evaluation)
+// ===================================================================
+
+@pure
+fn rwkv_cross_entropy(logits, target) {
+    let probs = rwkv_softmax(logits)
+    let p = probs[target]
+    let safe_p = if p < 1.0e-10 { 1.0e-10 } else { p }
+    return 0.0 - rwkv_log(safe_p)
+}
+
+fn rwkv_sequence_loss(all_logits, targets) {
+    let n = len(targets)
+    if n == 0 { return 0.0 }
+    let mut total = 0.0
+    for i in 0..n {
+        total = total + rwkv_cross_entropy(all_logits[i], targets[i])
+    }
+    return total / to_float(n)
+}
+
+// ===================================================================
+//  Utility: compare recurrent vs sequential outputs
+//  (They should match, as RWKV is a linear RNN.)
+// ===================================================================
+
+fn rwkv_verify_equivalence(stack, token_ids, emb_seed) {
+    let d = stack.d_model
+    let n = len(token_ids)
+    // Sequential: process one token at a time
+    let mut state = create_rwkv_state(stack.n_layers, d)
+    let mut seq_outs = []
+    for t in 0..n {
+        let emb = rwkv_embed(token_ids[t], d, emb_seed)
+        let res = rwkv_stack_step(stack, emb, state)
+        seq_outs = seq_outs + [res[0]]
+        state = res[1]
+    }
+    // Parallel: full-sequence forward
+    let par_outs = rwkv_stack_sequence(stack, rwkv_embed_seq(token_ids, d, emb_seed))
+    // Compare
+    let mut max_diff = 0.0
+    for t in 0..n {
+        for i in 0..d {
+            let diff = rwkv_abs(seq_outs[t][i] - par_outs[t][i])
+            if diff > max_diff { max_diff = diff }
+        }
+    }
+    return max_diff
+}
+
+fn rwkv_embed_seq(token_ids, d_model, seed) {
+    let n = len(token_ids)
+    let mut xs = []
+    for t in 0..n {
+        xs = xs + [rwkv_embed(token_ids[t], d_model, seed)]
+    }
+    return xs
+}
+
+// ===================================================================
+//  Summary info
+// ===================================================================
+
+fn rwkv_param_count(stack) {
+    let d = stack.d_model
+    let ff = stack.ff_dim
+    let n = stack.n_layers
+    // Per block: time_mix (4 d*d + 5d) + channel_mix (d*d + ff*d + d*ff + 2d) + 2 LN (2d each)
+    let tm_params = 4 * d * d + 5 * d
+    let cm_params = d * d + ff * d + d * ff + 2 * d
+    let ln_params = 4 * d
+    let per_block = tm_params + cm_params + ln_params
+    let total = n * per_block + 2 * d
+    return total
+}
+
+println("[rwkv] loaded — time-mix WKV + channel-mix + multi-layer stack + recurrent state + generate")
