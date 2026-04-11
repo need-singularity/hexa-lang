@@ -1,0 +1,664 @@
+// ===================================================================
+//  self/ml/differential_attention.hexa — Differential Attention
+//
+//  Microsoft Research "Differential Transformer" (2024):
+//  Cancels attention noise by computing the *difference* of two
+//  softmax distributions — one captures signal, the other captures
+//  the noise floor. The residual is a cleaner attention map.
+//
+//  Core formula (per head pair h):
+//    Q -> [Q1, Q2]  via split along head_dim
+//    K -> [K1, K2]  via split along head_dim
+//    A1 = softmax(Q1 * K1^T / sqrt(d/2))
+//    A2 = softmax(Q2 * K2^T / sqrt(d/2))
+//    A_diff = A1 - lambda * A2       (noise cancellation)
+//    head_out = GroupNorm( A_diff * V )
+//    output = concat(all heads) * W_o
+//
+//  Lambda is a learnable scalar per head pair, initialized ~0.5 via
+//    lambda = exp(lambda1) - exp(lambda2) + lambda_init
+//  so that the init is near 0.5 and gradient flows through exp().
+//
+//  Architecture:
+//    DiffAttnConfig     — hyperparams (d_model, n_heads, head_dim)
+//    DiffAttnWeights    — W_q, W_k, W_v, W_o, lambda params, group norm
+//    diff_attn_forward  — full multi-head differential attention pass
+//
+//  Reference: Ye et al., "Differential Transformer" (2024),
+//             arXiv:2410.05258
+//
+//  AI-NATIVE attrs:
+//    @pure     — no side effects in math helpers
+//    @hot      — called every forward step
+//    @parallel — head loop independent
+// ===================================================================
+
+// ── Config struct ────────────────────────────────────────────────
+struct DiffAttnConfig {
+    d_model: int,
+    n_heads: int,
+    head_dim: int,
+    lambda_init: float,
+    group_norm_eps: float
+}
+
+// ── Weight struct ────────────────────────────────────────────────
+// W_q, W_k, W_v: [n_heads * head_dim, d_model]  (stored as 2D)
+// W_o:           [d_model, n_heads * (head_dim / 2)]
+// lambda1, lambda2: [n_heads] each  (scalar per head pair)
+// gn_gamma, gn_beta: [head_dim / 2] group norm affine per sub-head
+struct DiffAttnWeights {
+    w_q: array,
+    w_k: array,
+    w_v: array,
+    w_o: array,
+    lambda1: array,
+    lambda2: array,
+    gn_gamma: array,
+    gn_beta: array
+}
+
+// ===================================================================
+//  Helpers (prefixed da_ to avoid collision)
+// ===================================================================
+
+fn da_zeros(n) {
+    let mut v = []
+    for _i in 0..n {
+        v = v + [0.0]
+    }
+    return v
+}
+
+fn da_zeros_2d(r, c) {
+    let mut m = []
+    for _i in 0..r {
+        let mut row = []
+        for _j in 0..c {
+            row = row + [0.0]
+        }
+        m = m + [row]
+    }
+    return m
+}
+
+fn da_fabs(x) {
+    if x < 0.0 {
+        return 0.0 - x
+    }
+    return x
+}
+
+fn da_max_f(a, b) {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+// Deterministic PRNG (LCG) for weight init
+let mut _da_rng_state = 77777
+
+fn da_rand_f() {
+    _da_rng_state = (_da_rng_state * 1664525 + 1013904223) % 2147483648
+    return to_float(_da_rng_state) / 2147483648.0 - 0.5
+}
+
+fn da_rand_seed(s) {
+    _da_rng_state = s
+}
+
+// ===================================================================
+//  Matrix-vector multiply: W [rows, cols] * vec [cols] -> y [rows]
+// ===================================================================
+@hot
+fn da_matvec(W, vec, rows, cols) {
+    let mut out = []
+    let mut i = 0
+    while i < rows {
+        let mut dot = 0.0
+        let mut j = 0
+        while j < cols {
+            dot = dot + W[i][j] * vec[j]
+            j = j + 1
+        }
+        out = out + [dot]
+        i = i + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  Dot product of two arrays (equal length)
+// ===================================================================
+@pure
+fn da_dot(a, b, n) {
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + a[i] * b[i]
+        i = i + 1
+    }
+    return s
+}
+
+// ===================================================================
+//  Softmax over 1D array of length n
+// ===================================================================
+@pure
+fn da_softmax(scores, n) {
+    let mut mx = scores[0]
+    let mut i = 1
+    while i < n {
+        if scores[i] > mx {
+            mx = scores[i]
+        }
+        i = i + 1
+    }
+    let mut exps = []
+    let mut sum_e = 0.0
+    i = 0
+    while i < n {
+        let e = exp(scores[i] - mx)
+        exps = exps + [e]
+        sum_e = sum_e + e
+        i = i + 1
+    }
+    let inv = 1.0 / sum_e
+    let mut result = []
+    i = 0
+    while i < n {
+        result = result + [exps[i] * inv]
+        i = i + 1
+    }
+    return result
+}
+
+// ===================================================================
+//  Group normalization on a 1D vector of length n
+//  gn(x) = gamma * (x - mean) / sqrt(var + eps) + beta
+// ===================================================================
+@pure
+fn da_group_norm(x, gamma, beta, n, eps) {
+    // Compute mean
+    let mut sum_v = 0.0
+    let mut i = 0
+    while i < n {
+        sum_v = sum_v + x[i]
+        i = i + 1
+    }
+    let mean_v = sum_v / to_float(n)
+
+    // Compute variance
+    let mut var_v = 0.0
+    i = 0
+    while i < n {
+        let diff = x[i] - mean_v
+        var_v = var_v + diff * diff
+        i = i + 1
+    }
+    var_v = var_v / to_float(n)
+
+    let inv_std = 1.0 / sqrt(var_v + eps)
+
+    let mut out = []
+    i = 0
+    while i < n {
+        out = out + [gamma[i] * (x[i] - mean_v) * inv_std + beta[i]]
+        i = i + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  Random matrix init (Kaiming-like scale)
+// ===================================================================
+fn da_rand_matrix(rows, cols) {
+    let scale = sqrt(2.0 / to_float(cols))
+    let mut M = []
+    let mut i = 0
+    while i < rows {
+        let mut row = []
+        let mut j = 0
+        while j < cols {
+            row = row + [da_rand_f() * scale]
+            j = j + 1
+        }
+        M = M + [row]
+        i = i + 1
+    }
+    return M
+}
+
+// ===================================================================
+//  Create default DiffAttn config
+//  head_dim must be even (split into two halves for Q1/Q2, K1/K2)
+// ===================================================================
+fn diff_attn_config_new(d_model, n_heads, head_dim) {
+    return DiffAttnConfig {
+        d_model: d_model,
+        n_heads: n_heads,
+        head_dim: head_dim,
+        lambda_init: 0.8,
+        group_norm_eps: 1.0e-5
+    }
+}
+
+// ===================================================================
+//  Initialize random DiffAttn weights
+//  lambda1, lambda2 init: small values so exp(l1)-exp(l2)+init ~ init
+// ===================================================================
+fn diff_attn_weights_init(cfg: DiffAttnConfig) {
+    let total_qk = cfg.n_heads * cfg.head_dim
+    let half_dim = cfg.head_dim / 2
+    let total_v = cfg.n_heads * half_dim
+
+    // lambda1, lambda2 initialized near 0 so effective lambda ~ lambda_init
+    let mut l1 = []
+    let mut l2 = []
+    for _h in 0..cfg.n_heads {
+        l1 = l1 + [0.1 * da_rand_f()]
+        l2 = l2 + [0.1 * da_rand_f()]
+    }
+
+    // Group norm: gamma=1, beta=0
+    let mut gn_g = []
+    let mut gn_b = []
+    for _i in 0..half_dim {
+        gn_g = gn_g + [1.0]
+        gn_b = gn_b + [0.0]
+    }
+
+    return DiffAttnWeights {
+        w_q: da_rand_matrix(total_qk, cfg.d_model),
+        w_k: da_rand_matrix(total_qk, cfg.d_model),
+        w_v: da_rand_matrix(total_v, cfg.d_model),
+        w_o: da_rand_matrix(cfg.d_model, total_v),
+        lambda1: l1,
+        lambda2: l2,
+        gn_gamma: gn_g,
+        gn_beta: gn_b
+    }
+}
+
+// ===================================================================
+//  Compute effective lambda for head h:
+//    lambda_h = exp(lambda1[h]) - exp(lambda2[h]) + lambda_init
+//  This ensures gradient flows through exp and init is ~lambda_init.
+// ===================================================================
+@pure
+fn diff_attn_lambda(weights: DiffAttnWeights, h, lambda_init) {
+    return exp(weights.lambda1[h]) - exp(weights.lambda2[h]) + lambda_init
+}
+
+// ===================================================================
+//  Slice helper: extract sub-array a[start..start+len]
+// ===================================================================
+fn da_slice(a, start, length) {
+    let mut out = []
+    let mut i = 0
+    while i < length {
+        out = out + [a[start + i]]
+        i = i + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  Single-head differential attention scores
+//
+//  Given Q [head_dim], K_cache [ctx_len][head_dim], V_cache [ctx_len][half_dim]:
+//    Split Q -> Q1 [half], Q2 [half]
+//    For each cached K_t [head_dim]: split -> K1_t [half], K2_t [half]
+//    A1 = softmax( [Q1 . K1_t / scale] for t )
+//    A2 = softmax( [Q2 . K2_t / scale] for t )
+//    A_diff = A1 - lambda * A2
+//    out = A_diff * V -> [half_dim]
+//
+//  Returns: attention output [half_dim]
+// ===================================================================
+@hot
+fn diff_attn_head(q_vec, k_cache, v_cache, ctx_len, half_dim, lambda_val) {
+    let scale = 1.0 / sqrt(to_float(half_dim))
+
+    // Split Q into Q1, Q2
+    let q1 = da_slice(q_vec, 0, half_dim)
+    let q2 = da_slice(q_vec, half_dim, half_dim)
+
+    // Compute scores for A1 (Q1*K1) and A2 (Q2*K2)
+    let mut scores1 = []
+    let mut scores2 = []
+    let mut t = 0
+    while t < ctx_len {
+        let k_t = k_cache[t]
+        // K1 = first half, K2 = second half
+        let mut dot1 = 0.0
+        let mut dot2 = 0.0
+        let mut d = 0
+        while d < half_dim {
+            dot1 = dot1 + q1[d] * k_t[d]
+            dot2 = dot2 + q2[d] * k_t[half_dim + d]
+            d = d + 1
+        }
+        scores1 = scores1 + [dot1 * scale]
+        scores2 = scores2 + [dot2 * scale]
+        t = t + 1
+    }
+
+    // Two softmax distributions
+    let a1 = da_softmax(scores1, ctx_len)
+    let a2 = da_softmax(scores2, ctx_len)
+
+    // Differential: A_diff = A1 - lambda * A2
+    let mut a_diff = []
+    t = 0
+    while t < ctx_len {
+        a_diff = a_diff + [a1[t] - lambda_val * a2[t]]
+        t = t + 1
+    }
+
+    // Weighted sum over V: out[d] = sum_t a_diff[t] * V_cache[t][d]
+    let mut out = []
+    let mut d = 0
+    while d < half_dim {
+        let mut acc = 0.0
+        t = 0
+        while t < ctx_len {
+            acc = acc + a_diff[t] * v_cache[t][d]
+            t = t + 1
+        }
+        out = out + [acc]
+        d = d + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  Compute raw differential attention scores (A1 - lambda * A2)
+//  Exposed for testing/analysis. Returns array [ctx_len].
+// ===================================================================
+fn diff_attn_scores(q_vec, k_cache, ctx_len, half_dim, lambda_val) {
+    let scale = 1.0 / sqrt(to_float(half_dim))
+    let q1 = da_slice(q_vec, 0, half_dim)
+    let q2 = da_slice(q_vec, half_dim, half_dim)
+
+    let mut scores1 = []
+    let mut scores2 = []
+    let mut t = 0
+    while t < ctx_len {
+        let k_t = k_cache[t]
+        let mut dot1 = 0.0
+        let mut dot2 = 0.0
+        let mut d = 0
+        while d < half_dim {
+            dot1 = dot1 + q1[d] * k_t[d]
+            dot2 = dot2 + q2[d] * k_t[half_dim + d]
+            d = d + 1
+        }
+        scores1 = scores1 + [dot1 * scale]
+        scores2 = scores2 + [dot2 * scale]
+        t = t + 1
+    }
+
+    let a1 = da_softmax(scores1, ctx_len)
+    let a2 = da_softmax(scores2, ctx_len)
+
+    let mut a_diff = []
+    t = 0
+    while t < ctx_len {
+        a_diff = a_diff + [a1[t] - lambda_val * a2[t]]
+        t = t + 1
+    }
+    return a_diff
+}
+
+// ===================================================================
+//  KV cache: stores per-position K [head_dim] and V [half_dim] per head
+//  Layout: k_cache[head][pos] = array [head_dim]
+//          v_cache[head][pos] = array [half_dim]
+// ===================================================================
+struct DiffAttnCache {
+    k_data: array,
+    v_data: array,
+    seq_len: int,
+    max_len: int,
+    n_heads: int
+}
+
+fn diff_attn_cache_new(max_len, n_heads) {
+    let mut kd = []
+    let mut vd = []
+    for _h in 0..n_heads {
+        let mut kh = []
+        let mut vh = []
+        for _p in 0..max_len {
+            kh = kh + [[]]
+            vh = vh + [[]]
+        }
+        kd = kd + [kh]
+        vd = vd + [vh]
+    }
+    return DiffAttnCache {
+        k_data: kd,
+        v_data: vd,
+        seq_len: 0,
+        max_len: max_len,
+        n_heads: n_heads
+    }
+}
+
+// ===================================================================
+//  Cache append: write K,V for all heads at position pos
+//  k_heads: [n_heads][head_dim], v_heads: [n_heads][half_dim]
+//
+//  Note: complex index assignment (a[i][j]=v) not supported in hexa,
+//  so we rebuild the affected rows.
+// ===================================================================
+fn diff_attn_cache_write(cache: DiffAttnCache, pos, k_heads, v_heads) {
+    let n_heads = cache.n_heads
+    let max_len = cache.max_len
+
+    let mut new_kd = []
+    let mut new_vd = []
+    let mut h = 0
+    while h < n_heads {
+        // rebuild k_data[h]: replace row at pos
+        let mut new_kh = []
+        let mut p = 0
+        while p < max_len {
+            if p == pos {
+                new_kh = new_kh + [k_heads[h]]
+            } else {
+                new_kh = new_kh + [cache.k_data[h][p]]
+            }
+            p = p + 1
+        }
+        new_kd = new_kd + [new_kh]
+
+        // rebuild v_data[h]: replace row at pos
+        let mut new_vh = []
+        p = 0
+        while p < max_len {
+            if p == pos {
+                new_vh = new_vh + [v_heads[h]]
+            } else {
+                new_vh = new_vh + [cache.v_data[h][p]]
+            }
+            p = p + 1
+        }
+        new_vd = new_vd + [new_vh]
+        h = h + 1
+    }
+
+    let mut new_seq = cache.seq_len
+    if pos + 1 > new_seq {
+        new_seq = pos + 1
+    }
+
+    return DiffAttnCache {
+        k_data: new_kd,
+        v_data: new_vd,
+        seq_len: new_seq,
+        max_len: max_len,
+        n_heads: n_heads
+    }
+}
+
+// ===================================================================
+//  Full Differential Attention forward pass (single token at pos)
+//
+//  x:       input [d_model]
+//  pos:     sequence position
+//  cache:   DiffAttnCache
+//  weights: DiffAttnWeights
+//  cfg:     DiffAttnConfig
+//
+//  Returns: [output [d_model], updated_cache]
+// ===================================================================
+@hot @parallel
+fn diff_attn_forward(x, pos, cache: DiffAttnCache, weights: DiffAttnWeights, cfg: DiffAttnConfig) {
+    let n_heads = cfg.n_heads
+    let head_dim = cfg.head_dim
+    let half_dim = head_dim / 2
+    let d_model = cfg.d_model
+    let total_qk = n_heads * head_dim
+    let total_v = n_heads * half_dim
+
+    // -- Q, K, V projections --
+    let q_flat = da_matvec(weights.w_q, x, total_qk, d_model)
+    let k_flat = da_matvec(weights.w_k, x, total_qk, d_model)
+    let v_flat = da_matvec(weights.w_v, x, total_v, d_model)
+
+    // -- Split per head and store in cache --
+    let mut k_heads = []
+    let mut v_heads = []
+    let mut h = 0
+    while h < n_heads {
+        k_heads = k_heads + [da_slice(k_flat, h * head_dim, head_dim)]
+        v_heads = v_heads + [da_slice(v_flat, h * half_dim, half_dim)]
+        h = h + 1
+    }
+
+    let updated_cache = diff_attn_cache_write(cache, pos, k_heads, v_heads)
+    let ctx_len = pos + 1
+
+    // -- Per-head differential attention --
+    let mut concat_out = []
+    h = 0
+    while h < n_heads {
+        // Extract Q for this head
+        let q_h = da_slice(q_flat, h * head_dim, head_dim)
+
+        // Gather K cache and V cache for this head up to ctx_len
+        let mut kc = []
+        let mut vc = []
+        let mut t = 0
+        while t < ctx_len {
+            kc = kc + [updated_cache.k_data[h][t]]
+            vc = vc + [updated_cache.v_data[h][t]]
+            t = t + 1
+        }
+
+        // Compute effective lambda
+        let lam = diff_attn_lambda(weights, h, cfg.lambda_init)
+
+        // Differential attention for this head
+        let head_out_raw = diff_attn_head(q_h, kc, vc, ctx_len, half_dim, lam)
+
+        // Group normalization per head
+        let head_out = da_group_norm(head_out_raw, weights.gn_gamma, weights.gn_beta, half_dim, cfg.group_norm_eps)
+
+        // Concat
+        concat_out = concat_out + head_out
+        h = h + 1
+    }
+
+    // -- Output projection --
+    let out = da_matvec(weights.w_o, concat_out, d_model, total_v)
+
+    return [out, updated_cache]
+}
+
+// ===================================================================
+//  Prefill: multiple tokens at once
+//  xs: array of input vectors [d_model], length seq_len
+//  Returns: [outputs array, updated_cache]
+// ===================================================================
+@hot
+fn diff_attn_prefill(xs, cache: DiffAttnCache, weights: DiffAttnWeights, cfg: DiffAttnConfig) {
+    let seq_len = len(xs)
+    let mut cur_cache = cache
+    let mut outputs = []
+    let mut t = 0
+    while t < seq_len {
+        let result = diff_attn_forward(xs[t], t, cur_cache, weights, cfg)
+        outputs = outputs + [result[0]]
+        cur_cache = result[1]
+        t = t + 1
+    }
+    return [outputs, cur_cache]
+}
+
+// ===================================================================
+//  L2 loss: sum of squares (for gradient checking)
+// ===================================================================
+@pure
+fn da_l2_loss(output) {
+    let n = len(output)
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + output[i] * output[i]
+        i = i + 1
+    }
+    return s
+}
+
+// ===================================================================
+//  Noise reduction ratio: measures how much the differential
+//  mechanism suppresses uniform attention (noise floor).
+//  For uniform K (all same): A1==A2==uniform, so A_diff ~ (1-lambda)*uniform
+//  vs standard attention which gives 1*uniform. Ratio = 1-lambda.
+//
+//  Returns ratio in [0,1] where lower = more noise suppressed.
+// ===================================================================
+@pure
+fn diff_attn_noise_ratio(lambda_val) {
+    return da_fabs(1.0 - lambda_val)
+}
+
+// ===================================================================
+//  Effective lambda stats across all heads
+//  Returns: [min_lambda, max_lambda, mean_lambda]
+// ===================================================================
+fn diff_attn_lambda_stats(weights: DiffAttnWeights, cfg: DiffAttnConfig) {
+    let n = cfg.n_heads
+    let mut mn = 1.0e30
+    let mut mx = 0.0 - 1.0e30
+    let mut sm = 0.0
+    let mut h = 0
+    while h < n {
+        let lam = diff_attn_lambda(weights, h, cfg.lambda_init)
+        if lam < mn { mn = lam }
+        if lam > mx { mx = lam }
+        sm = sm + lam
+        h = h + 1
+    }
+    return [mn, mx, sm / to_float(n)]
+}
+
+// ===================================================================
+//  Sum of differential attention weights (should be ~1-lambda for
+//  well-behaved heads, can be negative/positive).
+//  Useful for verifying the cancellation property.
+// ===================================================================
+@pure
+fn da_attn_weight_sum(a_diff, ctx_len) {
+    let mut s = 0.0
+    let mut i = 0
+    while i < ctx_len {
+        s = s + a_diff[i]
+        i = i + 1
+    }
+    return s
+}

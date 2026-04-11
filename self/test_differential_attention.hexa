@@ -1,0 +1,391 @@
+// ===================================================================
+//  test_differential_attention.hexa — Differential Attention tests
+//
+//  Covers:
+//    T01  Config creation and field values
+//    T02  Weights init: w_q dimension
+//    T03  Weights init: w_k dimension
+//    T04  Weights init: w_v dimension (half_dim per head)
+//    T05  Weights init: w_o dimension
+//    T06  Weights init: lambda arrays length = n_heads
+//    T07  Weights init: group norm gamma length = half_dim
+//    T08  Effective lambda near lambda_init at initialization
+//    T09  Softmax sums to 1.0
+//    T10  Softmax max element gets highest weight
+//    T11  Group norm output has zero mean (beta=0)
+//    T12  Group norm output has unit variance (gamma=1, beta=0)
+//    T13  Forward output dimension = d_model
+//    T14  Forward output non-zero
+//    T15  Cache seq_len advances after forward
+//    T16  Cache stores correct K vectors
+//    T17  Dual softmax: A1 sums to 1, A2 sums to 1
+//    T18  Differential cancellation: A1 - lambda*A2 sums to ~(1-lambda)
+//    T19  Noise suppression with uniform keys
+//    T20  Different positions produce different outputs
+//    T21  Deterministic: same input, same output
+//    T22  Prefill output count matches input count
+//    T23  Prefill output dimensions correct
+//    T24  Prefill cache seq_len matches input length
+//    T25  Multi-token context changes output vs single token
+//    T26  Lambda stats: min <= mean <= max
+//    T27  Noise ratio with lambda=1 is 0 (full cancel)
+//    T28  Noise ratio with lambda=0 is 1 (no cancel)
+//    T29  L2 loss positive for non-zero input
+//    T30  da_slice extracts correct sub-array
+//
+//  Run: ./hexa self/test_differential_attention.hexa
+// ===================================================================
+
+use "ml/differential_attention"
+
+let mut PASS = 0
+let mut FAIL = 0
+
+fn check(label, cond) {
+    if cond {
+        PASS = PASS + 1
+        println("[PASS] " + label)
+    } else {
+        FAIL = FAIL + 1
+        println("[FAIL] " + label)
+    }
+}
+
+fn t_abs(x) {
+    if x < 0.0 {
+        return 0.0 - x
+    }
+    return x
+}
+
+fn t_vec_norm(v) {
+    let mut s = 0.0
+    let mut i = 0
+    while i < len(v) {
+        s = s + v[i] * v[i]
+        i = i + 1
+    }
+    return sqrt(s)
+}
+
+fn t_vec_close(a, b, eps) {
+    if len(a) != len(b) {
+        return false
+    }
+    let mut i = 0
+    while i < len(a) {
+        if t_abs(a[i] - b[i]) > eps {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn t_vec_sum(v) {
+    let mut s = 0.0
+    let mut i = 0
+    while i < len(v) {
+        s = s + v[i]
+        i = i + 1
+    }
+    return s
+}
+
+fn t_vec_mean(v) {
+    return t_vec_sum(v) / to_float(len(v))
+}
+
+fn t_vec_var(v) {
+    let m = t_vec_mean(v)
+    let mut s = 0.0
+    let mut i = 0
+    while i < len(v) {
+        let d = v[i] - m
+        s = s + d * d
+        i = i + 1
+    }
+    return s / to_float(len(v))
+}
+
+println("===================================================================")
+println("  Differential Attention Test Suite")
+println("===================================================================")
+
+// ── Setup ────────────────────────────────────────────────────────
+let d_model = 16
+let n_heads = 2
+let head_dim = 8
+let half_dim = head_dim / 2
+let total_qk = n_heads * head_dim
+let total_v = n_heads * half_dim
+
+da_rand_seed(42)
+let cfg = diff_attn_config_new(d_model, n_heads, head_dim)
+let weights = diff_attn_weights_init(cfg)
+
+// Deterministic input vector
+let mut x = []
+for i in 0..d_model {
+    x = x + [0.1 * to_float(i + 1)]
+}
+
+// ── T01: Config creation ─────────────────────────────────────────
+check("T01 config d_model", cfg.d_model == d_model)
+
+// ── T02: w_q dimension [n_heads*head_dim, d_model] ──────────────
+check("T02 w_q rows = n_heads*head_dim", len(weights.w_q) == total_qk)
+
+// ── T03: w_k dimension ──────────────────────────────────────────
+check("T03 w_k rows = n_heads*head_dim", len(weights.w_k) == total_qk)
+
+// ── T04: w_v dimension (half_dim per head) ──────────────────────
+check("T04 w_v rows = n_heads*half_dim", len(weights.w_v) == total_v)
+
+// ── T05: w_o dimension ──────────────────────────────────────────
+check("T05 w_o rows = d_model", len(weights.w_o) == d_model)
+
+// ── T06: lambda arrays length = n_heads ─────────────────────────
+check("T06 lambda1 len = n_heads", len(weights.lambda1) == n_heads)
+
+// ── T07: group norm gamma length = half_dim ─────────────────────
+check("T07 gn_gamma len = half_dim", len(weights.gn_gamma) == half_dim)
+
+// ── T08: effective lambda near lambda_init ──────────────────────
+// With small random init of lambda1,lambda2 near 0:
+// exp(~0) - exp(~0) + 0.8 ~ 0.8
+let lam0 = diff_attn_lambda(weights, 0, cfg.lambda_init)
+check("T08 lambda[0] near lambda_init (0.8)", t_abs(lam0 - 0.8) < 0.3)
+
+// ── T09: Softmax sums to 1.0 ───────────────────────────────────
+let test_scores = [1.0, 2.0, 3.0, 0.5]
+let sm = da_softmax(test_scores, 4)
+let sm_sum = t_vec_sum(sm)
+check("T09 softmax sums to 1.0", t_abs(sm_sum - 1.0) < 1.0e-10)
+
+// ── T10: Softmax max element gets highest weight ────────────────
+// scores[2]=3.0 is largest -> sm[2] should be largest
+let mut sm_max_idx = 0
+let mut sm_max_val = sm[0]
+for i in 1..4 {
+    if sm[i] > sm_max_val {
+        sm_max_val = sm[i]
+        sm_max_idx = i
+    }
+}
+check("T10 softmax argmax = index of max score", sm_max_idx == 2)
+
+// ── T11: Group norm output has ~zero mean (beta=0, gamma=1) ────
+let gn_input = [1.0, 3.0, 5.0, 7.0]
+let gn_gamma = [1.0, 1.0, 1.0, 1.0]
+let gn_beta = [0.0, 0.0, 0.0, 0.0]
+let gn_out = da_group_norm(gn_input, gn_gamma, gn_beta, 4, 1.0e-5)
+let gn_mean = t_vec_mean(gn_out)
+check("T11 group_norm mean ~0 (beta=0)", t_abs(gn_mean) < 1.0e-6)
+
+// ── T12: Group norm output has ~unit variance ──────────────────
+let gn_var = t_vec_var(gn_out)
+check("T12 group_norm var ~1 (gamma=1)", t_abs(gn_var - 1.0) < 0.01)
+
+// ── T13: Forward output dimension = d_model ─────────────────────
+let cache0 = diff_attn_cache_new(32, n_heads)
+let result0 = diff_attn_forward(x, 0, cache0, weights, cfg)
+let out0 = result0[0]
+check("T13 forward output dim = d_model", len(out0) == d_model)
+
+// ── T14: Forward output non-zero ────────────────────────────────
+let out0_norm = t_vec_norm(out0)
+check("T14 forward output non-zero", out0_norm > 1.0e-8)
+
+// ── T15: Cache seq_len advances ─────────────────────────────────
+let cache1 = result0[1]
+check("T15 cache seq_len=1 after pos=0", cache1.seq_len == 1)
+
+// ── T16: Cache stores correct K ─────────────────────────────────
+// Recompute K projection manually and compare with cached K[0][0]
+let k_flat = da_matvec(weights.w_k, x, total_qk, d_model)
+let k_h0_expected = da_slice(k_flat, 0, head_dim)
+let k_h0_cached = cache1.k_data[0][0]
+check("T16 cache stores correct K[h=0]", t_vec_close(k_h0_cached, k_h0_expected, 1.0e-10))
+
+// ── T17: Dual softmax: A1 sums to 1, A2 sums to 1 ──────────────
+// Build Q and K for head 0, compute scores manually
+let q_flat_manual = da_matvec(weights.w_q, x, total_qk, d_model)
+let q_h0 = da_slice(q_flat_manual, 0, head_dim)
+let q1 = da_slice(q_h0, 0, half_dim)
+let q2 = da_slice(q_h0, half_dim, half_dim)
+// With single token, both A1 and A2 should be [1.0]
+// Use 2 tokens to be more interesting
+let mut x2 = []
+for i in 0..d_model {
+    x2 = x2 + [0.2 * to_float(i + 3)]
+}
+let cache2a = diff_attn_cache_new(32, n_heads)
+let r2a = diff_attn_forward(x, 0, cache2a, weights, cfg)
+let r2b = diff_attn_forward(x2, 1, r2a[1], weights, cfg)
+let cache_2tok = r2b[1]
+
+// Gather K for head 0
+let k0_t0 = cache_2tok.k_data[0][0]
+let k0_t1 = cache_2tok.k_data[0][1]
+let k_cache_h0 = [k0_t0, k0_t1]
+
+// Build Q for head 0 on x2
+let q_flat2 = da_matvec(weights.w_q, x2, total_qk, d_model)
+let q_h0_2 = da_slice(q_flat2, 0, head_dim)
+let q1_2 = da_slice(q_h0_2, 0, half_dim)
+let q2_2 = da_slice(q_h0_2, half_dim, half_dim)
+
+// Compute A1, A2 manually
+let scale_val = 1.0 / sqrt(to_float(half_dim))
+let mut s1 = []
+let mut s2 = []
+for t in 0..2 {
+    let kt = k_cache_h0[t]
+    let mut d1 = 0.0
+    let mut d2_val = 0.0
+    for d in 0..half_dim {
+        d1 = d1 + q1_2[d] * kt[d]
+        d2_val = d2_val + q2_2[d] * kt[half_dim + d]
+    }
+    s1 = s1 + [d1 * scale_val]
+    s2 = s2 + [d2_val * scale_val]
+}
+let a1 = da_softmax(s1, 2)
+let a2 = da_softmax(s2, 2)
+let a1_sum = t_vec_sum(a1)
+let a2_sum = t_vec_sum(a2)
+check("T17 A1 sums to 1 AND A2 sums to 1", t_abs(a1_sum - 1.0) < 1.0e-10 && t_abs(a2_sum - 1.0) < 1.0e-10)
+
+// ── T18: Differential A1 - lambda*A2 sums to ~(1 - lambda) ─────
+let lam_h0 = diff_attn_lambda(weights, 0, cfg.lambda_init)
+let a_diff_manual = [a1[0] - lam_h0 * a2[0], a1[1] - lam_h0 * a2[1]]
+let a_diff_sum = t_vec_sum(a_diff_manual)
+let expected_sum = 1.0 - lam_h0
+check("T18 A_diff sums to ~(1-lambda)", t_abs(a_diff_sum - expected_sum) < 1.0e-8)
+
+// ── T19: Noise suppression with uniform keys ────────────────────
+// When all keys are identical, A1==A2==uniform -> A_diff = (1-lambda)*uniform
+// With lambda~0.8, noise ratio ~ 0.2 (80% suppression)
+let nr = diff_attn_noise_ratio(lam_h0)
+check("T19 noise ratio < 0.5 (lambda near 0.8)", nr < 0.5)
+
+// ── T20: Different inputs at pos=1 (2-token context) differ ─────
+// With 2+ tokens, softmax is non-trivial and different Q/K/V create
+// genuinely different attention patterns via the differential mechanism.
+let cache_pa = diff_attn_cache_new(32, n_heads)
+let rpa0 = diff_attn_forward(x, 0, cache_pa, weights, cfg)
+let rpa1 = diff_attn_forward(x2, 1, rpa0[1], weights, cfg)
+let out_pa = rpa1[0]
+
+let mut x3 = []
+for i in 0..d_model {
+    x3 = x3 + [0.5 * to_float(i + 7)]
+}
+let cache_pb = diff_attn_cache_new(32, n_heads)
+let rpb0 = diff_attn_forward(x, 0, cache_pb, weights, cfg)
+let rpb1 = diff_attn_forward(x3, 1, rpb0[1], weights, cfg)
+let out_pb = rpb1[0]
+
+let mut inp_diff = false
+for i in 0..d_model {
+    if t_abs(out_pa[i] - out_pb[i]) > 1.0e-10 {
+        inp_diff = true
+    }
+}
+check("T20 different inputs at pos=1 -> different outputs", inp_diff)
+
+// ── T21: Deterministic: same input, same output ─────────────────
+let cache_d1 = diff_attn_cache_new(32, n_heads)
+let cache_d2 = diff_attn_cache_new(32, n_heads)
+let rd1 = diff_attn_forward(x, 0, cache_d1, weights, cfg)
+let rd2 = diff_attn_forward(x, 0, cache_d2, weights, cfg)
+check("T21 deterministic forward", t_vec_close(rd1[0], rd2[0], 1.0e-12))
+
+// ── T22: Prefill output count ───────────────────────────────────
+let mut xs = []
+for i in 0..4 {
+    let mut xi = []
+    for j in 0..d_model {
+        xi = xi + [0.1 * to_float(i * d_model + j + 1)]
+    }
+    xs = xs + [xi]
+}
+let cache_pf = diff_attn_cache_new(32, n_heads)
+let pf_result = diff_attn_prefill(xs, cache_pf, weights, cfg)
+let pf_outs = pf_result[0]
+check("T22 prefill output count = 4", len(pf_outs) == 4)
+
+// ── T23: Prefill output dimensions ──────────────────────────────
+let mut pf_dims_ok = true
+for i in 0..4 {
+    if len(pf_outs[i]) != d_model {
+        pf_dims_ok = false
+    }
+}
+check("T23 prefill outputs all dim=d_model", pf_dims_ok)
+
+// ── T24: Prefill cache seq_len ──────────────────────────────────
+let pf_cache = pf_result[1]
+check("T24 prefill cache seq_len=4", pf_cache.seq_len == 4)
+
+// ── T25: Multi-token context changes attention distribution ──────
+// At pos=2 with [x, x2, x] vs pos=2 with [x3, x2, x], the output
+// differs because the cached K/V at pos=0 changes the softmax weights.
+let cache_mt_a = diff_attn_cache_new(32, n_heads)
+let rmt_a0 = diff_attn_forward(x, 0, cache_mt_a, weights, cfg)
+let rmt_a1 = diff_attn_forward(x2, 1, rmt_a0[1], weights, cfg)
+let rmt_a2 = diff_attn_forward(x, 2, rmt_a1[1], weights, cfg)
+let out_ctx_a = rmt_a2[0]
+
+let mut x3b = []
+for i in 0..d_model {
+    x3b = x3b + [0.9 * to_float(i + 2)]
+}
+let cache_mt_b = diff_attn_cache_new(32, n_heads)
+let rmt_b0 = diff_attn_forward(x3b, 0, cache_mt_b, weights, cfg)
+let rmt_b1 = diff_attn_forward(x2, 1, rmt_b0[1], weights, cfg)
+let rmt_b2 = diff_attn_forward(x, 2, rmt_b1[1], weights, cfg)
+let out_ctx_b = rmt_b2[0]
+
+let mut ctx_diff = false
+for i in 0..d_model {
+    if t_abs(out_ctx_a[i] - out_ctx_b[i]) > 1.0e-10 {
+        ctx_diff = true
+    }
+}
+check("T25 different context history -> different outputs", ctx_diff)
+
+// ── T26: Lambda stats: min <= mean <= max ───────────────────────
+let lstats = diff_attn_lambda_stats(weights, cfg)
+let lam_min = lstats[0]
+let lam_max = lstats[1]
+let lam_mean = lstats[2]
+check("T26 lambda: min <= mean <= max", lam_min <= lam_mean && lam_mean <= lam_max)
+
+// ── T27: Noise ratio with lambda=1 is 0 (full cancellation) ────
+let nr1 = diff_attn_noise_ratio(1.0)
+check("T27 noise_ratio(lambda=1) = 0", t_abs(nr1) < 1.0e-10)
+
+// ── T28: Noise ratio with lambda=0 is 1 (no cancellation) ──────
+let nr0 = diff_attn_noise_ratio(0.0)
+check("T28 noise_ratio(lambda=0) = 1", t_abs(nr0 - 1.0) < 1.0e-10)
+
+// ── T29: L2 loss positive for non-zero input ────────────────────
+let loss_val = da_l2_loss(out0)
+check("T29 L2 loss > 0 for non-zero output", loss_val > 0.0)
+
+// ── T30: da_slice extracts correct sub-array ────────────────────
+let test_arr = [10.0, 20.0, 30.0, 40.0, 50.0]
+let sliced = da_slice(test_arr, 1, 3)
+check("T30 da_slice([10..50], 1, 3) = [20,30,40]", len(sliced) == 3 && t_abs(sliced[0] - 20.0) < 1.0e-10 && t_abs(sliced[1] - 30.0) < 1.0e-10 && t_abs(sliced[2] - 40.0) < 1.0e-10)
+
+// ===================================================================
+println("")
+println("pass=" + to_string(PASS) + " fail=" + to_string(FAIL))
+if FAIL == 0 {
+    println("ALL PASS")
+} else {
+    println("SOME TESTS FAILED")
+}
+println(to_string(PASS) + " passed")
