@@ -1,0 +1,254 @@
+// ===================================================================
+//  test_gpu_memory_manager.hexa — Unit tests for GPU Memory Manager (#240)
+//
+//  Tests:
+//    - Slab class lookup / rounding
+//    - alloc fresh / free / reuse path
+//    - Paging via next_offset, OOM detection
+//    - Fragmentation ratio + utilization
+//    - Defragmentation compaction
+//    - Buddy helpers (pow2, buddy offset)
+//    - Peak usage tracking
+//
+//  Run: PATH=/Users/ghost/.cargo/bin:$PATH ./hexa self/test_gpu_memory_manager.hexa
+//
+//  ML roadmap #240 — GPU Memory Manager
+// ===================================================================
+
+import "ml/gpu_memory_manager.hexa"
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn gmm_test_fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn gmm_test_approx(a, b, eps) { return gmm_test_fabs(a - b) < eps }
+
+fn check(idx, name, cond) {
+    if cond {
+        println("[PASS] #" + str(idx) + " " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] #" + str(idx) + " " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+println("=== GPU Memory Manager (#240) Tests ===")
+
+// ═══════════════════════════════════════════════════════════════
+//  #1-#6 — Slab class lookup
+// ═══════════════════════════════════════════════════════════════
+
+check(1, "find_slab_class(16) = 0 (smallest)", gmm_find_slab_class(16) == 0)
+check(2, "find_slab_class(17) = 1 (rounds up to 32)",
+    gmm_find_slab_class(17) == 1)
+check(3, "find_slab_class(1024) = 6",
+    gmm_find_slab_class(1024) == 6)
+check(4, "find_slab_class(2M) = -1 (oversized)",
+    gmm_find_slab_class(2097152) == -1)
+
+check(5, "slab_size(0) = 16", gmm_slab_size(0) == 16)
+check(6, "slab_size(3) = 128", gmm_slab_size(3) == 128)
+
+// ═══════════════════════════════════════════════════════════════
+//  #7-#9 — Pool initialization
+// ═══════════════════════════════════════════════════════════════
+
+let pool0 = gmm_init(4096)
+check(7, "init pool size", pool0.pool_size == 4096)
+check(8, "init next_id starts at 1", pool0.next_id == 1)
+check(9, "init zero usage and counters",
+    pool0.current_usage == 0
+    && pool0.alloc_count == 0
+    && pool0.free_count == 0
+    && pool0.peak_usage == 0
+    && gmm_active_count(pool0) == 0)
+
+// ═══════════════════════════════════════════════════════════════
+//  #10-#14 — Fresh allocations and usage tracking
+// ═══════════════════════════════════════════════════════════════
+
+let r1 = gmm_alloc(pool0, 10)   // -> class 16
+let a1 = r1[0]
+let p1 = r1[1]
+check(10, "alloc 10 bytes -> slab class 16, id 1",
+    a1.size == 16 && a1.slab_class == 0 && a1.id == 1 && a1.active)
+
+check(11, "alloc offset 0, usage 16",
+    a1.offset == 0
+    && p1.current_usage == 16
+    && p1.peak_usage == 16
+    && p1.alloc_count == 1
+    && gmm_active_count(p1) == 1)
+
+let r2 = gmm_alloc(p1, 60)  // -> class 64
+let a2 = r2[0]
+let p2 = r2[1]
+check(12, "alloc 60 -> class 64, offset 16, id 2",
+    a2.size == 64 && a2.slab_class == 2 && a2.offset == 16 && a2.id == 2)
+
+check(13, "pool usage 16+64 = 80, peak 80, active 2",
+    p2.current_usage == 80
+    && p2.peak_usage == 80
+    && gmm_active_count(p2) == 2)
+
+// Utilization = 80 / 4096
+check(14, "utilization = 80/4096",
+    gmm_test_approx(gmm_utilization(p2), 80.0 / 4096.0, 1.0e-6))
+
+// ═══════════════════════════════════════════════════════════════
+//  #15-#18 — Free and slab reuse
+// ═══════════════════════════════════════════════════════════════
+
+let p3 = gmm_free(p2, a1.id)
+check(15, "free id=1 drops usage to 64, free_count=1",
+    p3.current_usage == 64
+    && p3.free_count == 1
+    && gmm_active_count(p3) == 1
+    && p3.peak_usage == 80)  // peak stays
+
+// Now alloc something that fits in the 16-byte slab — should reuse
+let r3 = gmm_alloc(p3, 12)  // -> class 16
+let a3 = r3[0]
+let p4 = r3[1]
+check(16, "re-alloc 12 bytes reuses class-16 slab (offset 0)",
+    a3.slab_class == 0 && a3.offset == 0 && a3.size == 16)
+
+check(17, "reuse path: next_offset unchanged",
+    p4.next_offset == p2.next_offset)
+
+check(18, "free unknown id is idempotent",
+    gmm_free(p4, 9999).current_usage == p4.current_usage)
+
+// ═══════════════════════════════════════════════════════════════
+//  #19-#21 — Fragmentation + utilization
+// ═══════════════════════════════════════════════════════════════
+
+// Fragmentation with no holes == 0
+let fresh = gmm_init(4096)
+check(19, "fragmentation on empty pool = 0",
+    gmm_test_approx(gmm_fragmentation_ratio(fresh), 0.0, 1.0e-9))
+
+// Allocate a few blocks, free the middle one to create a hole
+let ra = gmm_alloc(fresh, 16)
+let rb = gmm_alloc(ra[1], 32)
+let rc = gmm_alloc(rb[1], 64)
+let after_frees = gmm_free(rc[1], rb[0].id)   // free middle
+let frag = gmm_fragmentation_ratio(after_frees)
+check(20, "fragmentation > 0 with free hole", frag > 0.0)
+check(21, "fragmentation < 1.0", frag < 1.0)
+
+// ═══════════════════════════════════════════════════════════════
+//  #22-#23 — Peak usage tracking
+// ═══════════════════════════════════════════════════════════════
+
+check(22, "peak_usage >= current_usage",
+    gmm_peak_usage(after_frees) >= after_frees.current_usage)
+
+// Allocate many small blocks and observe peak increases
+let mut big = gmm_init(65536)
+let mut k = 0
+while k < 20 {
+    let rx = gmm_alloc(big, 16)
+    big = rx[1]
+    k = k + 1
+}
+check(23, "peak after 20 allocs == 20 * 16",
+    gmm_peak_usage(big) == 20 * 16)
+
+// ═══════════════════════════════════════════════════════════════
+//  #24-#27 — Defragmentation compaction
+// ═══════════════════════════════════════════════════════════════
+
+// Build a pool with 3 allocations, free the middle, then defrag.
+let mut fp = gmm_init(4096)
+let fr1 = gmm_alloc(fp, 16)
+fp = fr1[1]
+let fid1 = fr1[0].id
+let fr2 = gmm_alloc(fp, 32)
+fp = fr2[1]
+let fid2 = fr2[0].id
+let fr3 = gmm_alloc(fp, 64)
+fp = fr3[1]
+let fid3 = fr3[0].id
+
+fp = gmm_free(fp, fid2)
+let before_next = fp.next_offset
+let defragged = gmm_defrag(fp)
+check(24, "defrag reduces next_offset (compaction happened)",
+    defragged.next_offset < before_next)
+
+// Only 2 active allocations should remain
+check(25, "defrag preserves active allocation count",
+    gmm_active_count(defragged) == 2)
+
+// All free lists cleared after defrag
+let mut fl_cleared = true
+let mut fi = 0
+while fi < GMM_NUM_SLAB_CLASSES {
+    if len(defragged.free_lists[fi]) != 0 { fl_cleared = false }
+    fi = fi + 1
+}
+check(26, "defrag clears all free lists", fl_cleared)
+
+// Surviving allocations are contiguous starting at offset 0
+let mut off_expected = 0
+let mut contig_ok = true
+let mut ai = 0
+while ai < len(defragged.allocations) {
+    let a = defragged.allocations[ai]
+    if a.active {
+        if a.offset != off_expected { contig_ok = false }
+        off_expected = off_expected + a.size
+    }
+    ai = ai + 1
+}
+check(27, "defrag yields contiguous active allocations starting at 0",
+    contig_ok)
+
+// ═══════════════════════════════════════════════════════════════
+//  #28-#30 — Paging / OOM
+// ═══════════════════════════════════════════════════════════════
+
+// Tiny pool, oversize allocation should OOM
+let small_pool = gmm_init(32)
+let rx_over = gmm_alloc(small_pool, 48)  // requests 48 > 32
+let oom_alloc = rx_over[0]
+check(28, "OOM returns id=-1 null alloc",
+    oom_alloc.id == -1 && !oom_alloc.active)
+
+check(29, "OOM leaves pool unchanged",
+    rx_over[1].current_usage == 0 && rx_over[1].alloc_count == 0)
+
+// Sequential alloc advances page offset monotonically
+let mut pg = gmm_init(4096)
+let mut last_off = 0
+let mut monotonic = true
+let mut pgi = 0
+while pgi < 5 {
+    let rp = gmm_alloc(pg, 16 + pgi)
+    pg = rp[1]
+    if rp[0].offset < last_off { monotonic = false }
+    last_off = rp[0].offset
+    pgi = pgi + 1
+}
+check(30, "sequential alloc offsets monotonic", monotonic)
+
+// ═══════════════════════════════════════════════════════════════
+//  #31-#34 — Buddy system helpers
+// ═══════════════════════════════════════════════════════════════
+
+check(31, "next_pow2(7)=8", gmm_next_pow2(7) == 8)
+check(32, "next_pow2(33)=64", gmm_next_pow2(33) == 64)
+check(33, "is_pow2(16) true, is_pow2(24) false",
+    gmm_is_pow2(16) && !gmm_is_pow2(24))
+check(34, "buddy_offset(0, 256) = 256 and (256, 256) = 0",
+    gmm_buddy_offset(0, 256) == 256
+    && gmm_buddy_offset(256, 256) == 0)
+
+// ── summary ─────────────────────────────────────────────────────
+println("")
+println("=== GPU Memory Manager test summary ===")
+println("PASS: " + str(pass_count))
+println("FAIL: " + str(fail_count))
+println("TOTAL: " + str(pass_count + fail_count))

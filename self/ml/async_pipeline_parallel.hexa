@@ -1,0 +1,389 @@
+// ===================================================================
+//  async_pipeline_parallel.hexa — Interleaved Microbatch Scheduling
+//
+//  Pure .hexa CPU simulation of advanced pipeline parallelism with:
+//    - 1F1B schedule: one-forward-one-backward steady state
+//    - Microbatch splitting: divide batch into M microbatches
+//    - Pipeline stages: assign consecutive layers to stages
+//    - Bubble ratio computation and measurement
+//    - Chimera schedule: bidirectional pipeline for less bubble
+//    - Activation stashing: store activations per microbatch for backward
+//
+//  This extends the basic pipeline_parallel module with async scheduling
+//  and chimera bidirectional pipelining.
+//
+//  ML roadmap #242 — Async Pipeline Parallel
+// ===================================================================
+
+// ── Stage assignment ────────────────────────────────────────
+
+struct AppStageConfig {
+    num_stages: int,
+    num_layers: int,
+    num_micro: int,
+    layer_bounds: array
+}
+
+fn app_init(num_stages, num_layers, num_micro) {
+    let mut bounds = []
+    let mut s = 0
+    while s < num_stages {
+        let begin = (num_layers * s) / num_stages
+        let end = (num_layers * (s + 1)) / num_stages
+        bounds = bounds.push([begin, end])
+        s = s + 1
+    }
+    AppStageConfig {
+        num_stages: num_stages,
+        num_layers: num_layers,
+        num_micro: num_micro,
+        layer_bounds: bounds
+    }
+}
+
+fn app_stage_begin(cfg, stage) {
+    let b = cfg.layer_bounds[stage]
+    b[0]
+}
+
+fn app_stage_end(cfg, stage) {
+    let b = cfg.layer_bounds[stage]
+    b[1]
+}
+
+// ── Toy linear model forward/backward ───────────────────────
+
+fn app_stage_forward(x, weights, layer_begin, layer_end) {
+    let mut y = x
+    let mut l = layer_begin
+    while l < layer_end {
+        y = y + weights[l]
+        l = l + 1
+    }
+    y
+}
+
+fn app_stage_backward(grad_out, layer_begin, layer_end) {
+    let num_layers = layer_end - layer_begin
+    let mut w_grads = []
+    let mut l = 0
+    while l < num_layers {
+        w_grads = w_grads.push(grad_out)
+        l = l + 1
+    }
+    return [grad_out, w_grads]
+}
+
+// ── Microbatch splitting ────────────────────────────────────
+
+fn app_split_batch(batch_data, num_micro) {
+    let total = len(batch_data)
+    let micro_size = total / num_micro
+    let mut micros = []
+    let mut m = 0
+    while m < num_micro {
+        let mut micro = []
+        let mut i = 0
+        while i < micro_size {
+            micro = micro.push(batch_data[m * micro_size + i])
+            i = i + 1
+        }
+        micros = micros.push(micro)
+        m = m + 1
+    }
+    micros
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  1F1B Schedule Builder
+//
+//  Generates a list of [stage, kind, micro_id, step] events.
+//  kind: 0 = forward, 1 = backward
+//  Steady state: after warmup forwards, alternate 1 backward + 1 forward
+// ═══════════════════════════════════════════════════════════════
+
+fn app_build_1f1b(num_stages, num_micro) {
+    let P = num_stages
+    let M = num_micro
+    let mut events = []
+
+    // Per-stage tracking
+    let mut next_f = []
+    let mut next_b = []
+    let mut s = 0
+    while s < P {
+        next_f = next_f.push(0)
+        next_b = next_b.push(0)
+        s = s + 1
+    }
+
+    let target = P * M
+    let mut step = 0
+    let mut done_f = 0
+    let mut done_b = 0
+
+    while done_f + done_b < 2 * target {
+        let mut ss = P - 1
+        while ss >= 0 {
+            let nf = next_f[ss]
+            let nb = next_b[ss]
+
+            // Check backward eligibility
+            let mut can_b = false
+            if nb < M {
+                if nf > nb {
+                    if ss == P - 1 {
+                        can_b = true
+                    } else {
+                        if next_b[ss + 1] > nb {
+                            can_b = true
+                        }
+                    }
+                }
+            }
+
+            // Check forward eligibility
+            let mut can_f = false
+            if nf < M {
+                if ss == 0 {
+                    can_f = true
+                } else {
+                    if next_f[ss - 1] > nf {
+                        can_f = true
+                    }
+                }
+            }
+
+            // Prefer backward when available (1F1B policy)
+            let mut did = false
+            if can_b {
+                events = events.push([ss, 1, nb, step])
+                next_b[ss] = nb + 1
+                done_b = done_b + 1
+                did = true
+            }
+            if !did {
+                if can_f {
+                    events = events.push([ss, 0, nf, step])
+                    next_f[ss] = nf + 1
+                    done_f = done_f + 1
+                    did = true
+                }
+            }
+
+            ss = ss - 1
+        }
+        step = step + 1
+        if step > 4 * target + 8 { break }
+    }
+    events
+}
+
+// ── Bubble ratio ────────────────────────────────────────────
+
+fn app_bubble_ratio(num_stages, num_micro) {
+    let p = to_float(num_stages)
+    let m = to_float(num_micro)
+    let den = m + p - 1.0
+    if den <= 0.0 { return 0.0 }
+    (p - 1.0) / den
+}
+
+fn app_bubble_ratio_measured(events, num_stages, num_micro) {
+    // Count distinct time steps from the event list
+    let n = len(events)
+    if n == 0 { return 0.0 }
+
+    // Find max step to determine total wall-clock steps
+    let mut max_step = 0
+    let mut i = 0
+    while i < n {
+        let e = events[i]
+        if e[3] > max_step {
+            max_step = e[3]
+        }
+        i = i + 1
+    }
+    let total_steps = max_step + 1
+    let total_possible = total_steps * num_stages
+    if total_possible == 0 { return 0.0 }
+    1.0 - to_float(n) / to_float(total_possible)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  1F1B Executor with Activation Stashing
+// ═══════════════════════════════════════════════════════════════
+
+struct AppResult {
+    outputs: array,
+    weight_grads: array,
+    bubble_ratio: float,
+    events_run: int
+}
+
+fn app_run_1f1b(cfg, inputs, weights) {
+    let P = cfg.num_stages
+    let M = cfg.num_micro
+    let L = cfg.num_layers
+    let events = app_build_1f1b(P, M)
+
+    // Activation stash: per-stage, per-microbatch storage
+    // stash[stage][micro] = intermediate activation
+    let mut stash = []
+    let mut s = 0
+    while s < P {
+        let mut micro_stash = []
+        let mut m = 0
+        while m < M {
+            micro_stash = micro_stash.push(0.0)
+            m = m + 1
+        }
+        stash = stash.push(micro_stash)
+        s = s + 1
+    }
+
+    // Inter-stage buffers
+    let mut fwd_buf = []
+    let mut bwd_buf = []
+    let mut m = 0
+    while m < M {
+        fwd_buf = fwd_buf.push(0.0)
+        bwd_buf = bwd_buf.push(0.0)
+        m = m + 1
+    }
+
+    let mut outputs = []
+    let mut wgrad = []
+    m = 0
+    while m < M { outputs = outputs.push(0.0); m = m + 1 }
+    let mut l = 0
+    while l < L { wgrad = wgrad.push(0.0); l = l + 1 }
+
+    let n_events = len(events)
+    let mut ei = 0
+    while ei < n_events {
+        let e = events[ei]
+        let stage = e[0]
+        let kind = e[1]
+        let mid = e[2]
+
+        let lb = app_stage_begin(cfg, stage)
+        let le = app_stage_end(cfg, stage)
+
+        if kind == 0 {
+            // Forward
+            let mut x = 0.0
+            if stage == 0 {
+                x = inputs[mid]
+            } else {
+                x = fwd_buf[mid]
+            }
+
+            // Stash input activation for backward
+            stash[stage][mid] = x
+
+            let y = app_stage_forward(x, weights, lb, le)
+
+            if stage == P - 1 {
+                outputs[mid] = y
+                bwd_buf[mid] = 1.0
+            } else {
+                fwd_buf[mid] = y
+            }
+        }
+
+        if kind == 1 {
+            // Backward
+            let grad_out = bwd_buf[mid]
+            let back = app_stage_backward(grad_out, lb, le)
+            let grad_in = back[0]
+            let w_grads = back[1]
+
+            // Accumulate weight grads
+            let mut ll = lb
+            let mut k = 0
+            while ll < le {
+                wgrad[ll] = wgrad[ll] + w_grads[k]
+                ll = ll + 1
+                k = k + 1
+            }
+
+            if stage > 0 {
+                bwd_buf[mid] = grad_in
+            }
+        }
+
+        ei = ei + 1
+    }
+
+    let bubble = app_bubble_ratio_measured(events, P, M)
+
+    AppResult {
+        outputs: outputs,
+        weight_grads: wgrad,
+        bubble_ratio: bubble,
+        events_run: n_events
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Chimera Schedule — Bidirectional Pipeline
+//
+//  Two pipeline directions run simultaneously:
+//    - Forward direction: stages 0 -> 1 -> ... -> P-1
+//    - Backward direction: stages P-1 -> P-2 -> ... -> 0
+//  Half the microbatches go in each direction.
+//  This reduces bubble by overlapping both directions.
+// ═══════════════════════════════════════════════════════════════
+
+fn app_build_chimera(num_stages, num_micro) {
+    // Split microbatches: first half goes forward, second half goes backward
+    let half = num_micro / 2
+    let mut events = []
+
+    // Build forward direction schedule for first half
+    let fwd_events = app_build_1f1b(num_stages, half)
+    let mut i = 0
+    while i < len(fwd_events) {
+        let e = fwd_events[i]
+        // Mark as direction 0 (forward)
+        events = events.push([e[0], e[1], e[2], e[3], 0])
+        i = i + 1
+    }
+
+    // Build reversed direction schedule for second half
+    // Reverse stage order: stage s -> (P-1-s)
+    let bwd_events = app_build_1f1b(num_stages, num_micro - half)
+    i = 0
+    while i < len(bwd_events) {
+        let e = bwd_events[i]
+        let reversed_stage = num_stages - 1 - e[0]
+        events = events.push([reversed_stage, e[1], e[2] + half, e[3], 1])
+        i = i + 1
+    }
+
+    events
+}
+
+fn app_chimera_bubble_ratio(num_stages, num_micro) {
+    // Chimera roughly halves the bubble compared to 1F1B
+    let standard = app_bubble_ratio(num_stages, num_micro)
+    standard * 0.5
+}
+
+// ── Throughput scaling estimate ─────────────────────────────
+
+fn app_throughput_scaling(num_stages, num_micro) {
+    // Ideal linear scaling minus bubble overhead
+    let efficiency = 1.0 - app_bubble_ratio(num_stages, num_micro)
+    to_float(num_stages) * efficiency
+}
+
+// ── Reference single forward ────────────────────────────────
+
+fn app_single_forward(x, weights) {
+    let L = len(weights)
+    app_stage_forward(x, weights, 0, L)
+}
+
+println("[async_pipeline_parallel] module loaded — 1F1B + chimera scheduling ready")

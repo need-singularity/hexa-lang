@@ -1,0 +1,422 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/capsule_network.hexa — Capsule Network (#236)
+//
+//  Part-whole relationship capsule routing — dynamic routing by agreement.
+//    1. Primary capsules:  conv -> groups of vectors (pose + activation)
+//    2. Squash activation: ||v||^2 / (1 + ||v||^2) * v / ||v||
+//    3. Dynamic routing:   iterative agreement (3 iterations)
+//    4. Coupling coeffs:   softmax over routing logits
+//    5. Prediction vectors: W_ij @ u_i for each capsule pair
+//    6. Reconstruction:    from digit capsule to image
+//
+//  API:
+//    cap_squash(v)                              -> [float]
+//    cap_softmax(logits)                        -> [float]
+//    cap_coupling_coeffs(logits, n_out)         -> [[float]]
+//    cap_prediction_vectors(capsules, weights)   -> [[float]]
+//    cap_dynamic_routing(capsules, weights, iters) -> [capsule]
+//    cap_primary_capsules(input, weights, n_caps, cap_dim) -> [[float]]
+//    cap_capsule_norm(v)                        -> float
+//    cap_reconstruct(capsule, decoder_weights)  -> [float]
+//    cap_margin_loss(v_norms, labels, m_plus, m_minus, lambda) -> float
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+//    @hot   — called every training step
+// ═══════════════════════════════════════════════════════════════════
+
+// ── helpers ──────────────────────────────────────────────────────
+
+fn cap_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn cap_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn cap_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn cap_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn cap_hash(seed, i, j) {
+    let h = ((seed * 2654435761 + i * 1315423911 + j * 731) % 10007)
+    return to_float(h) / 10007.0 - 0.5
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (1) Capsule Norm — L2 norm of a vector
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cap_capsule_norm(v) {
+    let n = len(v)
+    let mut s = 0.0
+    for i in 0..n {
+        s = s + v[i] * v[i]
+    }
+    return cap_sqrt(s)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (2) Squash Activation
+//
+//  squash(v) = ||v||^2 / (1 + ||v||^2) * v / ||v||
+//  Output norm is always in [0, 1), representing probability.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cap_squash(v) {
+    let n = len(v)
+    let mut sq_norm = 0.0
+    for i in 0..n {
+        sq_norm = sq_norm + v[i] * v[i]
+    }
+    let norm = cap_sqrt(sq_norm)
+    if norm < 1.0e-10 { return cap_zeros(n) }
+    let scale = sq_norm / (1.0 + sq_norm) / norm
+    let mut out = cap_zeros(n)
+    for i in 0..n {
+        out[i] = v[i] * scale
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (3) Softmax for Coupling Coefficients
+//
+//  Standard softmax over a vector of routing logits.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cap_softmax(logits) {
+    let n = len(logits)
+    let mut m = logits[0]
+    for i in 1..n {
+        if logits[i] > m { m = logits[i] }
+    }
+    let mut exps = cap_zeros(n)
+    let mut z = 0.0
+    for i in 0..n {
+        exps[i] = cap_exp(logits[i] - m)
+        z = z + exps[i]
+    }
+    let mut out = cap_zeros(n)
+    for i in 0..n {
+        out[i] = exps[i] / z
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (4) Coupling Coefficients
+//
+//  For each input capsule i, compute softmax over all output capsules j.
+//  b_ij: [n_in, n_out] routing logits
+//  Returns c_ij: [n_in][n_out] coupling coefficients (each row sums to 1)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cap_coupling_coeffs(b_ij, n_in, n_out) {
+    let mut coeffs = []
+    for i in 0..n_in {
+        let mut row = cap_zeros(n_out)
+        for j in 0..n_out {
+            row[j] = b_ij[i * n_out + j]
+        }
+        let sm = cap_softmax(row)
+        coeffs = coeffs + [sm]
+    }
+    return coeffs
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (5) Prediction Vectors
+//
+//  u_hat_ji = W_ij @ u_i
+//  For each input capsule i and output capsule j, transform i's pose
+//  weights: [n_in][n_out][out_dim][in_dim]
+//  capsules: [n_in][in_dim]
+//  Returns: [n_in][n_out][out_dim]
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cap_matmul_vec(mat, vec) {
+    let rows = len(mat)
+    let cols = len(vec)
+    let mut out = cap_zeros(rows)
+    for r in 0..rows {
+        let mut s = 0.0
+        for c in 0..cols {
+            s = s + mat[r][c] * vec[c]
+        }
+        out[r] = s
+    }
+    return out
+}
+
+@pure
+fn cap_prediction_vectors(capsules, weights, n_in, n_out) {
+    // weights flat: [n_in * n_out] of matrices [out_dim][in_dim]
+    // capsules: [n_in][in_dim]
+    // Returns: [n_in][n_out][out_dim]
+    let mut preds = []
+    for i in 0..n_in {
+        let mut row = []
+        for j in 0..n_out {
+            let w = weights[i * n_out + j]
+            let u_hat = cap_matmul_vec(w, capsules[i])
+            row = row + [u_hat]
+        }
+        preds = preds + [row]
+    }
+    return preds
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (6) Dynamic Routing by Agreement
+//
+//  For `iters` iterations:
+//    1. c_ij = softmax(b_ij)  (coupling coefficients)
+//    2. s_j = sum_i(c_ij * u_hat_ji)  (weighted sum)
+//    3. v_j = squash(s_j)  (output capsules)
+//    4. b_ij += u_hat_ji . v_j  (agreement update)
+//
+//  Returns: output capsules [n_out][out_dim]
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn cap_dynamic_routing(capsules, weights, n_in, n_out, out_dim, iters) {
+    // Compute prediction vectors
+    let preds = cap_prediction_vectors(capsules, weights, n_in, n_out)
+
+    // Initialize routing logits to zero
+    let mut b_ij = cap_zeros(n_in * n_out)
+
+    let mut v_out = []
+    for _j in 0..n_out {
+        v_out = v_out + [cap_zeros(out_dim)]
+    }
+
+    for _iter in 0..iters {
+        // Step 1: coupling coefficients
+        let coeffs = cap_coupling_coeffs(b_ij, n_in, n_out)
+
+        // Step 2: weighted sum s_j = sum_i(c_ij * u_hat_ji)
+        let mut s = []
+        for _j in 0..n_out {
+            s = s + [cap_zeros(out_dim)]
+        }
+        for i in 0..n_in {
+            for j in 0..n_out {
+                let c = coeffs[i][j]
+                for d in 0..out_dim {
+                    s[j][d] = s[j][d] + c * preds[i][j][d]
+                }
+            }
+        }
+
+        // Step 3: squash
+        for j in 0..n_out {
+            v_out[j] = cap_squash(s[j])
+        }
+
+        // Step 4: agreement update (skip on last iteration)
+        if _iter < iters - 1 {
+            for i in 0..n_in {
+                for j in 0..n_out {
+                    let mut agreement = 0.0
+                    for d in 0..out_dim {
+                        agreement = agreement + preds[i][j][d] * v_out[j][d]
+                    }
+                    b_ij[i * n_out + j] = b_ij[i * n_out + j] + agreement
+                }
+            }
+        }
+    }
+
+    return v_out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (7) Primary Capsules
+//
+//  Convert flat input (e.g., from conv layer) into groups of capsule
+//  vectors using a simple linear transform + reshape.
+//  input: [flat_dim], weights: [n_caps * cap_dim, flat_dim]
+//  Returns: [n_caps][cap_dim] after squash
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cap_primary_capsules(input, weights, n_caps, cap_dim) {
+    let flat_dim = len(input)
+    let total = n_caps * cap_dim
+    // Linear transform
+    let mut h = cap_zeros(total)
+    for i in 0..total {
+        let mut s = 0.0
+        for j in 0..flat_dim {
+            s = s + weights[i][j] * input[j]
+        }
+        h[i] = s
+    }
+    // Reshape into capsules and squash
+    let mut caps = []
+    for c in 0..n_caps {
+        let base = c * cap_dim
+        let mut vec = cap_zeros(cap_dim)
+        for d in 0..cap_dim {
+            vec[d] = h[base + d]
+        }
+        caps = caps + [cap_squash(vec)]
+    }
+    return caps
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (8) Reconstruction Decoder
+//
+//  From a digit capsule vector, reconstruct the original input
+//  using a multi-layer decoder (linear layers with ReLU).
+//  capsule: [cap_dim], decoder_weights: list of [out][in] matrices
+//  Returns: [output_dim] reconstructed values
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cap_relu(x) {
+    if x > 0.0 { return x }
+    return 0.0
+}
+
+@pure
+fn cap_reconstruct(capsule, decoder_weights) {
+    let n_layers = len(decoder_weights)
+    let mut h = capsule
+    for l in 0..n_layers {
+        let out_dim = len(decoder_weights[l])
+        let in_dim = len(h)
+        let mut next = cap_zeros(out_dim)
+        for i in 0..out_dim {
+            let mut s = 0.0
+            for j in 0..in_dim {
+                s = s + decoder_weights[l][i][j] * h[j]
+            }
+            // ReLU for all layers except last (last is linear for pixel values)
+            if l < n_layers - 1 {
+                next[i] = cap_relu(s)
+            } else {
+                next[i] = s
+            }
+        }
+        h = next
+    }
+    return h
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (9) Margin Loss
+//
+//  For classification: encourages correct capsule to be long,
+//  others to be short.
+//  L_k = T_k * max(0, m_plus - ||v_k||)^2
+//      + lambda * (1 - T_k) * max(0, ||v_k|| - m_minus)^2
+//
+//  v_norms: [n_classes] (norms of digit capsules)
+//  labels: [n_classes] (one-hot)
+//  Returns: total margin loss
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn cap_margin_loss(v_norms, labels, m_plus, m_minus, lambda) {
+    let n = len(v_norms)
+    let mut total = 0.0
+    for k in 0..n {
+        let vn = v_norms[k]
+        let tk = labels[k]
+        let mut pos = m_plus - vn
+        if pos < 0.0 { pos = 0.0 }
+        let mut neg = vn - m_minus
+        if neg < 0.0 { neg = 0.0 }
+        total = total + tk * pos * pos + lambda * (1.0 - tk) * neg * neg
+    }
+    return total
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (10) Reconstruction Loss — MSE between original and reconstructed
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cap_reconstruction_loss(original, reconstructed) {
+    let n = len(original)
+    let mut mse = 0.0
+    for i in 0..n {
+        let diff = original[i] - reconstructed[i]
+        mse = mse + diff * diff
+    }
+    return mse / to_float(n)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (11) Total Capsule Loss = margin_loss + alpha * reconstruction_loss
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn cap_total_loss(v_norms, labels, m_plus, m_minus, lambda, original, reconstructed, alpha) {
+    let ml = cap_margin_loss(v_norms, labels, m_plus, m_minus, lambda)
+    let rl = cap_reconstruction_loss(original, reconstructed)
+    return ml + alpha * rl
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (12) Dot product helper
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cap_dot(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    for i in 0..n {
+        s = s + a[i] * b[i]
+    }
+    return s
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (13) Vector add
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cap_vec_add(a, b) {
+    let n = len(a)
+    let mut out = cap_zeros(n)
+    for i in 0..n {
+        out[i] = a[i] + b[i]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (14) Vector scale
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cap_vec_scale(v, s) {
+    let n = len(v)
+    let mut out = cap_zeros(n)
+    for i in 0..n {
+        out[i] = v[i] * s
+    }
+    return out
+}
+
+println("[capsule_network] loaded — squash + dynamic routing + coupling + prediction + reconstruction + margin loss")

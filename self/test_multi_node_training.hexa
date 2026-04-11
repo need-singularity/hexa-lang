@@ -1,0 +1,294 @@
+// ===================================================================
+//  test_multi_node_training.hexa — Unit tests for Multi-Node Training (#241)
+//
+//  Tests:
+//    - Ring topology / auto topology selection
+//    - Ring allreduce avg (naive + chunked) vs reference
+//    - Tree allreduce avg equivalence
+//    - Latency step counts (ring O(N), tree O(log N))
+//    - Gradient sync SGD step (params update)
+//    - Async local SGD + periodic param sync
+//    - World size > 1, sync barrier semantics
+//
+//  Run: PATH=/Users/ghost/.cargo/bin:$PATH ./hexa self/test_multi_node_training.hexa
+//
+//  ML roadmap #241 — Multi-Node Training
+// ===================================================================
+
+import "ml/multi_node_training.hexa"
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn mnt_test_fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn mnt_test_approx(a, b, eps) { return mnt_test_fabs(a - b) < eps }
+
+fn check(idx, name, cond) {
+    if cond {
+        println("[PASS] #" + str(idx) + " " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] #" + str(idx) + " " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn mnt_arrays_near(a, b, tol) {
+    if len(a) != len(b) { return false }
+    let n = len(a)
+    let mut i = 0
+    while i < n {
+        if !mnt_test_approx(a[i], b[i], tol) { return false }
+        i = i + 1
+    }
+    true
+}
+
+println("=== Multi-Node Training (#241) Tests ===")
+
+// ── Fixtures ────────────────────────────────────────────────────
+let WORLD_SIZE = 4
+let PARAM_SIZE = 8
+
+// Per-node gradients: node n has constant value (n+1).0 repeated PARAM_SIZE times
+let mut grads = []
+let mut n_init = 0
+while n_init < WORLD_SIZE {
+    let mut g = []
+    let mut i = 0
+    while i < PARAM_SIZE {
+        g = g.push(to_float(n_init + 1))
+        i = i + 1
+    }
+    grads = grads.push(g)
+    n_init = n_init + 1
+}
+
+// Expected average: (1+2+3+4)/4 = 2.5
+let mut expected_avg = []
+let mut i_init = 0
+while i_init < PARAM_SIZE {
+    expected_avg = expected_avg.push(2.5)
+    i_init = i_init + 1
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  #1-#4 — Array helpers + config
+// ═══════════════════════════════════════════════════════════════
+
+let z = mnt_zeros(5)
+check(1, "mnt_zeros length and values",
+    len(z) == 5 && mnt_test_approx(z[0], 0.0, 1.0e-9) && mnt_test_approx(z[4], 0.0, 1.0e-9))
+
+let cp = mnt_copy([1.0, 2.0, 3.0])
+check(2, "mnt_copy makes an equal array",
+    len(cp) == 3 && mnt_test_approx(cp[0], 1.0, 1.0e-9) && mnt_test_approx(cp[2], 3.0, 1.0e-9))
+
+let cfg = mnt_config(WORLD_SIZE, PARAM_SIZE, 0.1)
+check(3, "mnt_config world size > 1",
+    cfg.num_nodes == WORLD_SIZE && cfg.num_nodes > 1)
+
+check(4, "mnt_config default topology is ring, sync_every=1",
+    cfg.topology == "ring" && cfg.sync_every == 1)
+
+// ═══════════════════════════════════════════════════════════════
+//  #5-#7 — Topology discovery + latency
+// ═══════════════════════════════════════════════════════════════
+
+check(5, "auto topology 4 nodes -> ring",
+    mnt_auto_topology(4) == "ring")
+
+check(6, "auto topology 16 nodes -> tree",
+    mnt_auto_topology(16) == "tree")
+
+// Ring latency = 2*(N-1) steps
+check(7, "ring_latency_steps(4) = 6",
+    mnt_ring_latency_steps(4) == 6)
+
+// Tree latency should be <= ring latency for large N
+check(8, "tree_latency_steps(8) <= ring_latency_steps(8)",
+    mnt_tree_latency_steps(8) <= mnt_ring_latency_steps(8))
+
+check(9, "tree_latency_steps(16) < ring_latency_steps(16)",
+    mnt_tree_latency_steps(16) < mnt_ring_latency_steps(16))
+
+// ═══════════════════════════════════════════════════════════════
+//  #10-#13 — Ring AllReduce gradient averaging
+// ═══════════════════════════════════════════════════════════════
+
+let ring_avg = mnt_ring_allreduce_avg(grads, WORLD_SIZE)
+check(10, "ring allreduce result length = WORLD_SIZE",
+    len(ring_avg) == WORLD_SIZE)
+
+check(11, "ring allreduce rank0 matches expected avg",
+    mnt_arrays_near(ring_avg[0], expected_avg, 1.0e-6))
+
+// All ranks identical after allreduce (gradient sync barrier)
+let mut sync_ok = true
+let mut sr = 1
+while sr < WORLD_SIZE {
+    if !mnt_arrays_near(ring_avg[sr], ring_avg[0], 1.0e-9) {
+        sync_ok = false
+    }
+    sr = sr + 1
+}
+check(12, "ring allreduce sync barrier: all ranks identical", sync_ok)
+
+// ═══════════════════════════════════════════════════════════════
+//  #13-#15 — Chunked ring allreduce matches naive
+// ═══════════════════════════════════════════════════════════════
+
+let chunked = mnt_ring_allreduce_chunked(grads, WORLD_SIZE)
+check(13, "chunked ring allreduce rank0 matches naive avg",
+    mnt_arrays_near(chunked[0], expected_avg, 1.0e-5))
+
+check(14, "chunked ring allreduce rank3 matches naive avg",
+    mnt_arrays_near(chunked[3], expected_avg, 1.0e-5))
+
+// Chunked and non-chunked should agree
+check(15, "chunked == non-chunked ring allreduce",
+    mnt_arrays_near(chunked[0], ring_avg[0], 1.0e-5))
+
+// ═══════════════════════════════════════════════════════════════
+//  #16-#18 — Tree AllReduce equivalence
+// ═══════════════════════════════════════════════════════════════
+
+let tree_avg = mnt_tree_allreduce_avg(grads, WORLD_SIZE)
+check(16, "tree allreduce rank0 matches expected",
+    mnt_arrays_near(tree_avg[0], expected_avg, 1.0e-6))
+
+// All ranks after tree allreduce should hold the same averaged gradient
+let mut tree_sync_ok = true
+let mut tsr = 0
+while tsr < WORLD_SIZE {
+    if !mnt_arrays_near(tree_avg[tsr], expected_avg, 1.0e-6) {
+        tree_sync_ok = false
+    }
+    tsr = tsr + 1
+}
+check(17, "tree allreduce sync: all ranks hold averaged grad", tree_sync_ok)
+
+// Ring and tree should agree numerically for the same input
+check(18, "ring allreduce == tree allreduce on rank0",
+    mnt_arrays_near(ring_avg[0], tree_avg[0], 1.0e-5))
+
+// ═══════════════════════════════════════════════════════════════
+//  #19-#21 — Vector helpers used by SGD
+// ═══════════════════════════════════════════════════════════════
+
+let va = [1.0, 2.0, 3.0]
+let vb = [0.1, 0.2, 0.3]
+let vab = mnt_add(va, vb)
+check(19, "mnt_add elementwise",
+    mnt_test_approx(vab[0], 1.1, 1.0e-9)
+    && mnt_test_approx(vab[1], 2.2, 1.0e-9)
+    && mnt_test_approx(vab[2], 3.3, 1.0e-9))
+
+let vsub = mnt_sub(va, vb)
+check(20, "mnt_sub elementwise",
+    mnt_test_approx(vsub[0], 0.9, 1.0e-9))
+
+let vscale = mnt_scale(va, 0.5)
+check(21, "mnt_scale by 0.5",
+    mnt_test_approx(vscale[0], 0.5, 1.0e-9)
+    && mnt_test_approx(vscale[2], 1.5, 1.0e-9))
+
+// ═══════════════════════════════════════════════════════════════
+//  #22-#24 — Sync step (allreduce + SGD update)
+// ═══════════════════════════════════════════════════════════════
+
+// Per-node parameters: all start at 10.0
+let mut params = []
+let mut pn = 0
+while pn < WORLD_SIZE {
+    let mut p = []
+    let mut i = 0
+    while i < PARAM_SIZE {
+        p = p.push(10.0)
+        i = i + 1
+    }
+    params = params.push(p)
+    pn = pn + 1
+}
+
+let new_params = mnt_sync_step(params, grads, cfg)
+check(22, "sync step yields one param vector per node",
+    len(new_params) == WORLD_SIZE)
+
+// Expected: p - lr * avg_grad = 10 - 0.1*2.5 = 9.75
+check(23, "sync step SGD update value",
+    mnt_test_approx(new_params[0][0], 9.75, 1.0e-6)
+    && mnt_test_approx(new_params[0][PARAM_SIZE - 1], 9.75, 1.0e-6))
+
+// All nodes hold identical params after sync
+let mut sync_eq = true
+let mut se = 1
+while se < WORLD_SIZE {
+    if !mnt_arrays_near(new_params[se], new_params[0], 1.0e-9) {
+        sync_eq = false
+    }
+    se = se + 1
+}
+check(24, "sync step leaves all nodes with equal params", sync_eq)
+
+// ═══════════════════════════════════════════════════════════════
+//  #25-#27 — Tree topology sync step
+// ═══════════════════════════════════════════════════════════════
+
+let tree_cfg = MntConfig {
+    num_nodes: WORLD_SIZE,
+    param_size: PARAM_SIZE,
+    lr: 0.1,
+    sync_every: 1,
+    topology: "tree"
+}
+
+let tree_step = mnt_sync_step(params, grads, tree_cfg)
+check(25, "tree sync step matches ring sync step",
+    mnt_arrays_near(tree_step[0], new_params[0], 1.0e-5))
+
+check(26, "tree sync step all nodes identical",
+    mnt_arrays_near(tree_step[0], tree_step[3], 1.0e-9))
+
+// ═══════════════════════════════════════════════════════════════
+//  #27-#30 — Async local SGD with periodic sync
+// ═══════════════════════════════════════════════════════════════
+
+let initial = [1.0, 1.0, 1.0, 1.0]
+let async_cfg = mnt_config_async(WORLD_SIZE, 4, 0.1, 3)  // sync every 3 steps
+let state0 = mnt_async_init(initial, WORLD_SIZE)
+check(27, "async_init: all nodes hold copy of initial params",
+    len(state0.params) == WORLD_SIZE
+    && state0.step_count == 0
+    && state0.sync_count == 0)
+
+// Per-node local gradients (varied per node so params diverge on non-sync)
+let local_grads = [
+    [0.1, 0.1, 0.1, 0.1],
+    [0.2, 0.2, 0.2, 0.2],
+    [0.3, 0.3, 0.3, 0.3],
+    [0.4, 0.4, 0.4, 0.4]
+]
+
+// Step 1: no sync (1 % 3 != 0) — params diverge
+let state1 = mnt_async_step(state0, local_grads, async_cfg)
+check(28, "async step 1: step_count incremented, no sync",
+    state1.step_count == 1 && state1.sync_count == 0)
+
+// Nodes should be different after local step (since grads differ)
+let diverged = !mnt_arrays_near(state1.params[0], state1.params[3], 1.0e-6)
+check(29, "async step 1: nodes diverged under different local grads", diverged)
+
+// Step 3 triggers sync (3 % 3 == 0)
+let state2 = mnt_async_step(state1, local_grads, async_cfg)
+let state3 = mnt_async_step(state2, local_grads, async_cfg)
+check(30, "async step 3 triggers sync barrier",
+    state3.sync_count == 1
+    && mnt_arrays_near(state3.params[0], state3.params[3], 1.0e-9))
+
+// ── summary ─────────────────────────────────────────────────────
+println("")
+println("=== Multi-Node Training test summary ===")
+println("PASS: " + str(pass_count))
+println("FAIL: " + str(fail_count))
+println("TOTAL: " + str(pass_count + fail_count))

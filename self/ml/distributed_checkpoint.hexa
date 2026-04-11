@@ -1,0 +1,573 @@
+// ===================================================================
+//  distributed_checkpoint.hexa — Async Distributed Checkpoint Save/Restore
+//
+//  Pure .hexa CPU simulation of distributed checkpointing with:
+//    - Shard mapping: assign model parameters to checkpoint shards
+//    - Async save: background write simulation without blocking training
+//    - Parallel restore: load shards in parallel across workers
+//    - Delta checkpoint: only save changed parameters since last checkpoint
+//    - Consistency: barrier + version counter for consistent snapshots
+//
+//  All I/O is simulated in-memory. Each "shard" is a flat array
+//  stored in a checkpoint object. No actual files are written.
+//
+//  ML roadmap #243 — Distributed Checkpoint
+// ===================================================================
+
+// ── Array helpers ────────────────────────────────────────────
+
+fn dcp_zeros(n) {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    out
+}
+
+fn dcp_copy(src) {
+    let n = len(src)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(src[i])
+        i = i + 1
+    }
+    out
+}
+
+fn dcp_slice(src, begin, end) {
+    let mut out = []
+    let mut i = begin
+    while i < end {
+        out = out.push(src[i])
+        i = i + 1
+    }
+    out
+}
+
+fn dcp_arrays_equal(a, b) {
+    if len(a) != len(b) { return false }
+    let n = len(a)
+    let mut i = 0
+    while i < n {
+        let diff = a[i] - b[i]
+        if diff > 0.0001 { return false }
+        if diff < -0.0001 { return false }
+        i = i + 1
+    }
+    true
+}
+
+// ── Shard mapping ───────────────────────────────────────────
+
+struct DcpShardMap {
+    num_shards: int,
+    param_size: int,
+    shard_bounds: array
+}
+
+fn dcp_create_shard_map(param_size, num_shards) {
+    let mut bounds = []
+    let mut s = 0
+    while s < num_shards {
+        let begin = (param_size * s) / num_shards
+        let end = (param_size * (s + 1)) / num_shards
+        bounds = bounds.push([begin, end])
+        s = s + 1
+    }
+    DcpShardMap {
+        num_shards: num_shards,
+        param_size: param_size,
+        shard_bounds: bounds
+    }
+}
+
+fn dcp_shard_begin(smap, shard_idx) {
+    let b = smap.shard_bounds[shard_idx]
+    b[0]
+}
+
+fn dcp_shard_end(smap, shard_idx) {
+    let b = smap.shard_bounds[shard_idx]
+    b[1]
+}
+
+fn dcp_shard_size(smap, shard_idx) {
+    dcp_shard_end(smap, shard_idx) - dcp_shard_begin(smap, shard_idx)
+}
+
+// Extract shard from full params
+fn dcp_extract_shard(params, smap, shard_idx) {
+    let begin = dcp_shard_begin(smap, shard_idx)
+    let end = dcp_shard_end(smap, shard_idx)
+    dcp_slice(params, begin, end)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Checkpoint — in-memory storage
+// ═══════════════════════════════════════════════════════════════
+
+struct DcpCheckpoint {
+    version: int,
+    shards: array,
+    shard_map: DcpShardMap,
+    is_delta: bool,
+    changed_mask: array,
+    timestamp: int
+}
+
+// ── Full checkpoint save ────────────────────────────────────
+
+fn dcp_save_full(params, smap, version) {
+    let mut shards = []
+    let mut s = 0
+    while s < smap.num_shards {
+        shards = shards.push(dcp_extract_shard(params, smap, s))
+        s = s + 1
+    }
+
+    // All shards are present in a full checkpoint
+    let mut mask = []
+    s = 0
+    while s < smap.num_shards {
+        mask = mask.push(true)
+        s = s + 1
+    }
+
+    DcpCheckpoint {
+        version: version,
+        shards: shards,
+        shard_map: smap,
+        is_delta: false,
+        changed_mask: mask,
+        timestamp: version
+    }
+}
+
+// ── Full checkpoint restore ─────────────────────────────────
+
+fn dcp_restore_full(ckpt) {
+    let smap = ckpt.shard_map
+    let mut params = dcp_zeros(smap.param_size)
+
+    let mut s = 0
+    while s < smap.num_shards {
+        let shard = ckpt.shards[s]
+        let begin = dcp_shard_begin(smap, s)
+        let slen = len(shard)
+        let mut i = 0
+        while i < slen {
+            params[begin + i] = shard[i]
+            i = i + 1
+        }
+        s = s + 1
+    }
+    params
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Delta Checkpoint — only save changed shards
+// ═══════════════════════════════════════════════════════════════
+
+fn dcp_compute_changed_mask(old_params, new_params, smap) {
+    let mut mask = []
+    let mut s = 0
+    while s < smap.num_shards {
+        let begin = dcp_shard_begin(smap, s)
+        let end = dcp_shard_end(smap, s)
+        let mut changed = false
+        let mut i = begin
+        while i < end {
+            let diff = new_params[i] - old_params[i]
+            if diff > 0.0001 { changed = true }
+            if diff < -0.0001 { changed = true }
+            i = i + 1
+        }
+        mask = mask.push(changed)
+        s = s + 1
+    }
+    mask
+}
+
+fn dcp_save_delta(old_params, new_params, smap, version) {
+    let mask = dcp_compute_changed_mask(old_params, new_params, smap)
+
+    let mut shards = []
+    let mut s = 0
+    while s < smap.num_shards {
+        if mask[s] {
+            shards = shards.push(dcp_extract_shard(new_params, smap, s))
+        } else {
+            shards = shards.push([])
+        }
+        s = s + 1
+    }
+
+    DcpCheckpoint {
+        version: version,
+        shards: shards,
+        shard_map: smap,
+        is_delta: true,
+        changed_mask: mask,
+        timestamp: version
+    }
+}
+
+fn dcp_delta_changed_count(ckpt) {
+    let mut count = 0
+    let mut i = 0
+    while i < len(ckpt.changed_mask) {
+        if ckpt.changed_mask[i] {
+            count = count + 1
+        }
+        i = i + 1
+    }
+    count
+}
+
+// Apply delta checkpoint on top of base params
+fn dcp_apply_delta(base_params, delta_ckpt) {
+    let smap = delta_ckpt.shard_map
+    let mut params = dcp_copy(base_params)
+
+    let mut s = 0
+    while s < smap.num_shards {
+        if delta_ckpt.changed_mask[s] {
+            let shard = delta_ckpt.shards[s]
+            let begin = dcp_shard_begin(smap, s)
+            let slen = len(shard)
+            let mut i = 0
+            while i < slen {
+                params[begin + i] = shard[i]
+                i = i + 1
+            }
+        }
+        s = s + 1
+    }
+    params
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Async Save — simulated background write
+//
+//  In real systems this would be a separate thread. Here we
+//  simulate by tracking save state and "completing" immediately.
+// ═══════════════════════════════════════════════════════════════
+
+struct DcpAsyncSave {
+    checkpoint: DcpCheckpoint,
+    status: string,
+    save_id: int
+}
+
+fn dcp_async_save_start(params, smap, version) {
+    let ckpt = dcp_save_full(params, smap, version)
+    DcpAsyncSave {
+        checkpoint: ckpt,
+        status: "in_progress",
+        save_id: version
+    }
+}
+
+fn dcp_async_save_complete(save_op) {
+    DcpAsyncSave {
+        checkpoint: save_op.checkpoint,
+        status: "done",
+        save_id: save_op.save_id
+    }
+}
+
+fn dcp_async_save_is_done(save_op) {
+    save_op.status == "done"
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Parallel Restore — load shards in parallel across workers
+//
+//  Worker w loads shard w from checkpoint, then allgather to
+//  reconstruct full params on all workers.
+// ═══════════════════════════════════════════════════════════════
+
+fn dcp_parallel_restore(ckpt, num_workers) {
+    let smap = ckpt.shard_map
+
+    // Each worker loads its assigned shard
+    // For simplicity: worker w loads shard (w % num_shards)
+    let mut worker_shards = []
+    let mut w = 0
+    while w < num_workers {
+        let shard_idx = w % smap.num_shards
+        let shard = ckpt.shards[shard_idx]
+        worker_shards = worker_shards.push(shard)
+        w = w + 1
+    }
+
+    // Reconstruct full params from checkpoint (same as dcp_restore_full)
+    let full_params = dcp_restore_full(ckpt)
+
+    // Broadcast to all workers
+    let mut result = []
+    w = 0
+    while w < num_workers {
+        result = result.push(dcp_copy(full_params))
+        w = w + 1
+    }
+    result
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Version Tracking — consistency barrier
+// ═══════════════════════════════════════════════════════════════
+
+struct DcpVersionTracker {
+    current_version: int,
+    checkpoints: array,
+    max_kept: int
+}
+
+fn dcp_tracker_new(max_kept) {
+    DcpVersionTracker {
+        current_version: 0,
+        checkpoints: [],
+        max_kept: max_kept
+    }
+}
+
+fn dcp_tracker_save(tracker, params, smap) {
+    let new_version = tracker.current_version + 1
+    let ckpt = dcp_save_full(params, smap, new_version)
+
+    let mut new_ckpts = tracker.checkpoints + [ckpt]
+
+    // Evict oldest if over limit
+    if len(new_ckpts) > tracker.max_kept {
+        let mut trimmed = []
+        let mut i = 1
+        while i < len(new_ckpts) {
+            trimmed = trimmed.push(new_ckpts[i])
+            i = i + 1
+        }
+        new_ckpts = trimmed
+    }
+
+    let new_tracker = DcpVersionTracker {
+        current_version: new_version,
+        checkpoints: new_ckpts,
+        max_kept: tracker.max_kept
+    }
+    return [ckpt, new_tracker]
+}
+
+fn dcp_tracker_latest(tracker) {
+    let n = len(tracker.checkpoints)
+    if n == 0 { return -1 }
+    let ckpt = tracker.checkpoints[n - 1]
+    ckpt.version
+}
+
+fn dcp_tracker_get(tracker, version) {
+    let mut i = 0
+    while i < len(tracker.checkpoints) {
+        let ckpt = tracker.checkpoints[i]
+        if ckpt.version == version {
+            return ckpt
+        }
+        i = i + 1
+    }
+    // Not found — return empty checkpoint
+    let smap = dcp_create_shard_map(0, 1)
+    DcpCheckpoint {
+        version: -1,
+        shards: [],
+        shard_map: smap,
+        is_delta: false,
+        changed_mask: [],
+        timestamp: -1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Task #243 dckpt_* wrappers
+//
+//  Provides the exact API surface listed in the roadmap:
+//    dckpt_create(world_size, rank)
+//    dckpt_shard_state(state, n_shards)
+//    dckpt_save_shard(ckpt, shard_idx, shard_data, version)
+//    dckpt_load_shard(ckpt, shard_idx)
+//    dckpt_async_flush(ckpt)
+//    dckpt_recover(ckpt, missing_ranks)
+//
+//  State is kept as a dict (dict fields: "params", "shards",
+//  "world_size", "rank", "version", "flushed"). Lower-level
+//  dcp_* primitives above are used verbatim to keep one source
+//  of truth.
+// ═══════════════════════════════════════════════════════════════
+
+// Create a checkpoint context for a given worker.
+fn dckpt_create(world_size, rank) {
+    return #{
+        "world_size": world_size,
+        "rank": rank,
+        "version": 0,
+        "shards": [],
+        "mask": [],
+        "flushed": false,
+        "param_size": 0
+    }
+}
+
+// Split a flat parameter array into n_shards equal slices.
+// Returns a list of slice arrays (each shard is a flat array).
+fn dckpt_shard_state(state, n_shards) {
+    let param_size = len(state)
+    let smap = dcp_create_shard_map(param_size, n_shards)
+    let mut shards = []
+    let mut s = 0
+    while s < n_shards {
+        shards = shards.push(dcp_extract_shard(state, smap, s))
+        s = s + 1
+    }
+    return shards
+}
+
+// Store one shard under the given shard_idx inside a ckpt dict.
+// Expands the shards list as needed and records the version.
+fn dckpt_save_shard(ckpt, shard_idx, shard_data, version) {
+    let world_size = ckpt["world_size"]
+    let rank = ckpt["rank"]
+    // Extend the shards list to at least shard_idx + 1 entries.
+    let mut shards = ckpt["shards"]
+    let mut mask = ckpt["mask"]
+    while len(shards) <= shard_idx {
+        shards = shards.push([])
+        mask = mask.push(false)
+    }
+    shards[shard_idx] = shard_data
+    mask[shard_idx] = true
+    return #{
+        "world_size": world_size,
+        "rank": rank,
+        "version": version,
+        "shards": shards,
+        "mask": mask,
+        "flushed": false,
+        "param_size": ckpt["param_size"]
+    }
+}
+
+// Retrieve a single shard by index.
+fn dckpt_load_shard(ckpt, shard_idx) {
+    let shards = ckpt["shards"]
+    if shard_idx < 0 { return [] }
+    if shard_idx >= len(shards) { return [] }
+    return shards[shard_idx]
+}
+
+// Mark the ckpt as flushed (simulated async flush).
+fn dckpt_async_flush(ckpt) {
+    return #{
+        "world_size": ckpt["world_size"],
+        "rank": ckpt["rank"],
+        "version": ckpt["version"],
+        "shards": ckpt["shards"],
+        "mask": ckpt["mask"],
+        "flushed": true,
+        "param_size": ckpt["param_size"]
+    }
+}
+
+// Recover by filling in shards that are missing.
+// `missing_ranks` is a list of shard indices considered missing.
+// For every missing index we substitute a zero-filled shard of the
+// same length as the first healthy shard (falling back to [] if
+// none). Returns a new ckpt dict.
+fn dckpt_recover(ckpt, missing_ranks) {
+    let mut shards = ckpt["shards"]
+    let mut mask = ckpt["mask"]
+
+    // Find shard length from the first healthy entry.
+    let mut shard_len = 0
+    let n = len(shards)
+    let mut k = 0
+    while k < n {
+        if mask[k] {
+            shard_len = len(shards[k])
+            k = n
+        } else {
+            k = k + 1
+        }
+    }
+
+    // Build a zero vector of the correct length.
+    let mut zero_shard = []
+    let mut z = 0
+    while z < shard_len {
+        zero_shard = zero_shard.push(0.0)
+        z = z + 1
+    }
+
+    // Iterate missing_ranks, mark them recovered.
+    let nm = len(missing_ranks)
+    let mut i = 0
+    while i < nm {
+        let idx = missing_ranks[i]
+        while len(shards) <= idx {
+            shards = shards.push([])
+            mask = mask.push(false)
+        }
+        shards[idx] = zero_shard
+        mask[idx] = true
+        i = i + 1
+    }
+
+    return #{
+        "world_size": ckpt["world_size"],
+        "rank": ckpt["rank"],
+        "version": ckpt["version"],
+        "shards": shards,
+        "mask": mask,
+        "flushed": ckpt["flushed"],
+        "param_size": ckpt["param_size"]
+    }
+}
+
+// Return the total number of shards currently recorded.
+fn dckpt_num_shards(ckpt) {
+    return len(ckpt["shards"])
+}
+
+// Count how many shards are present (mask == true).
+fn dckpt_present_count(ckpt) {
+    let mask = ckpt["mask"]
+    let n = len(mask)
+    let mut c = 0
+    let mut i = 0
+    while i < n {
+        if mask[i] { c = c + 1 }
+        i = i + 1
+    }
+    return c
+}
+
+// Assemble the full parameter vector back out of the in-memory shards.
+fn dckpt_assemble(ckpt) {
+    let shards = ckpt["shards"]
+    let n = len(shards)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let s = shards[i]
+        let slen = len(s)
+        let mut j = 0
+        while j < slen {
+            out = out.push(s[j])
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+println("[distributed_checkpoint] module loaded — async sharded save/restore ready")

@@ -1,0 +1,225 @@
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/diffusion_policy.hexa — Diffusion Policy (DDPM)
+//
+//  Action-space diffusion for decision-making.
+//  DDPM-style action denoising conditioned on state.
+//
+//  Implements:
+//    1. Linear beta schedule    — beta_t linearly from beta_start to beta_end
+//    2. Alpha/alpha_bar compute — alpha_t = 1-beta_t, alpha_bar = cumulative product
+//    3. Forward process         — q(x_t | x_0) = sqrt(alpha_bar)*x_0 + sqrt(1-alpha_bar)*eps
+//    4. Denoising network       — predict noise given noisy action + state
+//    5. Reverse process         — DDPM sampling from x_T to x_0
+//    6. Conditional generation  — state-conditioned action denoising
+//
+//  API:
+//    dp_linear_beta_schedule(T, beta_start, beta_end)
+//    dp_compute_alphas(betas, T)
+//    dp_compute_alpha_bars(alphas, T)
+//    dp_forward_diffuse(x0, alpha_bar_t, noise, d)
+//    dp_denoise_predict(noisy, state, W_n, W_s, b, d_act, d_state)
+//    dp_reverse_step(x_t, predicted_noise, beta_t, alpha_t, alpha_bar_t, d)
+//    dp_sample(state, T, betas, alphas, alpha_bars, W_n, W_s, b, d_act, d_state)
+//
+//  AI-NATIVE attrs:
+//    @pure     — noise schedule is deterministic
+//    @hot      — called every denoising step
+//    @fuse     — forward+reverse pipeline
+// ═══════════════════════════════════════════════════════════════
+
+// ── helpers ──────────────────────────────────────────────────
+
+fn dp_zeros(d) {
+    let mut v = []
+    for _i in 0..d {
+        v = v + [0.0]
+    }
+    return v
+}
+
+fn dp_fabs(x) {
+    if x < 0.0 {
+        return 0.0 - x
+    }
+    return x
+}
+
+// simple pseudo-random (LCG seeded)
+let mut DP_SEED = 42
+fn dp_set_seed(s) {
+    DP_SEED = s
+}
+
+fn dp_rand_uniform() {
+    // LCG: seed = (seed * 1103515245 + 12345) mod 2^31
+    DP_SEED = (DP_SEED * 1103515245 + 12345) % 2147483648
+    if DP_SEED < 0 {
+        DP_SEED = 0 - DP_SEED
+    }
+    return (DP_SEED * 1.0) / 2147483648.0
+}
+
+// Box-Muller for Gaussian noise
+fn dp_rand_normal() {
+    let u1 = dp_rand_uniform() * 0.998 + 0.001
+    let u2 = dp_rand_uniform()
+    let r = sqrt(0.0 - 2.0 * log(u1))
+    let theta = 2.0 * 3.14159265358979 * u2
+    return r * cos(theta)
+}
+
+fn dp_rand_normal_vec(d) {
+    let mut v = dp_zeros(d)
+    for i in 0..d {
+        v[i] = dp_rand_normal()
+    }
+    return v
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Linear beta schedule: beta_t = beta_start + t*(beta_end-beta_start)/(T-1)
+//  Returns: [T] array of beta values
+// ═══════════════════════════════════════════════════════════════
+@pure
+fn dp_linear_beta_schedule(T, beta_start, beta_end) {
+    let mut betas = []
+    for t in 0..T {
+        let mut beta = beta_start
+        if T > 1 {
+            beta = beta_start + (t * 1.0) * (beta_end - beta_start) / ((T - 1) * 1.0)
+        }
+        betas = betas + [beta]
+    }
+    return betas
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Compute alphas: alpha_t = 1 - beta_t
+// ═══════════════════════════════════════════════════════════════
+@pure
+fn dp_compute_alphas(betas, T) {
+    let mut alphas = []
+    for t in 0..T {
+        alphas = alphas + [1.0 - betas[t]]
+    }
+    return alphas
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Compute alpha_bar: cumulative product of alphas
+//  alpha_bar_t = prod_{s=0}^{t} alpha_s
+// ═══════════════════════════════════════════════════════════════
+@pure
+fn dp_compute_alpha_bars(alphas, T) {
+    let mut alpha_bars = []
+    let mut prod = 1.0
+    for t in 0..T {
+        prod = prod * alphas[t]
+        alpha_bars = alpha_bars + [prod]
+    }
+    return alpha_bars
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Forward diffusion: q(x_t | x_0)
+//  x_t = sqrt(alpha_bar_t) * x_0 + sqrt(1 - alpha_bar_t) * noise
+// ═══════════════════════════════════════════════════════════════
+@pure @hot
+fn dp_forward_diffuse(x0, alpha_bar_t, noise, d) {
+    let sqrt_ab = sqrt(alpha_bar_t)
+    let sqrt_1_ab = sqrt(1.0 - alpha_bar_t)
+    let mut x_t = dp_zeros(d)
+    for i in 0..d {
+        x_t[i] = sqrt_ab * x0[i] + sqrt_1_ab * noise[i]
+    }
+    return x_t
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Simple denoising network: predict noise from noisy action + state
+//  noise_pred = W_n @ noisy + W_s @ state + b
+//  W_n: [d_act][d_act], W_s: [d_act][d_state], b: [d_act]
+// ═══════════════════════════════════════════════════════════════
+@hot
+fn dp_denoise_predict(noisy, state, W_n, W_s, b, d_act, d_state) {
+    let mut pred = dp_zeros(d_act)
+    for i in 0..d_act {
+        let mut acc = b[i]
+        for j in 0..d_act {
+            acc = acc + W_n[i][j] * noisy[j]
+        }
+        for j in 0..d_state {
+            acc = acc + W_s[i][j] * state[j]
+        }
+        pred[i] = acc
+    }
+    return pred
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  DDPM reverse step:
+//  x_{t-1} = (1/sqrt(alpha_t)) * (x_t - (beta_t/sqrt(1-alpha_bar_t)) * eps_pred) + sigma_t * z
+//  sigma_t = sqrt(beta_t)  (simplified DDPM variance)
+// ═══════════════════════════════════════════════════════════════
+@hot
+fn dp_reverse_step(x_t, predicted_noise, beta_t, alpha_t, alpha_bar_t, noise_z, d) {
+    let inv_sqrt_alpha = 1.0 / sqrt(alpha_t)
+    let coeff = beta_t / sqrt(1.0 - alpha_bar_t)
+    let sigma = sqrt(beta_t)
+    let mut x_prev = dp_zeros(d)
+    for i in 0..d {
+        x_prev[i] = inv_sqrt_alpha * (x_t[i] - coeff * predicted_noise[i]) + sigma * noise_z[i]
+    }
+    return x_prev
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  DDPM reverse step (no noise, for final step t=0)
+// ═══════════════════════════════════════════════════════════════
+@hot
+fn dp_reverse_step_deterministic(x_t, predicted_noise, beta_t, alpha_t, alpha_bar_t, d) {
+    let inv_sqrt_alpha = 1.0 / sqrt(alpha_t)
+    let coeff = beta_t / sqrt(1.0 - alpha_bar_t)
+    let mut x_prev = dp_zeros(d)
+    for i in 0..d {
+        x_prev[i] = inv_sqrt_alpha * (x_t[i] - coeff * predicted_noise[i])
+    }
+    return x_prev
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Full DDPM sampling loop: generate action from noise
+//  Starts with x_T ~ N(0,I) and denoises to x_0
+// ═══════════════════════════════════════════════════════════════
+@hot
+fn dp_sample(state, T, betas, alphas, alpha_bars, W_n, W_s, b, d_act, d_state) {
+    // start from random noise
+    let mut x = dp_rand_normal_vec(d_act)
+
+    // reverse iterate from t=T-1 to t=0
+    let mut t = T - 1
+    for _step in 0..T {
+        let noise_pred = dp_denoise_predict(x, state, W_n, W_s, b, d_act, d_state)
+        // for t>0 add noise, for t=0 use zero noise (deterministic final step)
+        let mut z = dp_zeros(d_act)
+        if t > 0 {
+            z = dp_rand_normal_vec(d_act)
+        }
+        x = dp_reverse_step(x, noise_pred, betas[t], alphas[t], alpha_bars[t], z, d_act)
+        t = t - 1
+    }
+    return x
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Compute noise MSE loss between predicted and actual noise
+// ═══════════════════════════════════════════════════════════════
+@pure
+fn dp_noise_loss(noise_pred, noise_actual, d) {
+    let mut mse = 0.0
+    for i in 0..d {
+        let diff = noise_pred[i] - noise_actual[i]
+        mse = mse + diff * diff
+    }
+    return mse / (d * 1.0)
+}

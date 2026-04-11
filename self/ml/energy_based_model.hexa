@@ -1,0 +1,430 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/energy_based_model.hexa — Energy-Based Models (#233)
+//
+//  EBM structured prediction — contrastive divergence + MCMC sampling.
+//
+//  Implements:
+//    1. Energy function: E(x) = -f_theta(x), f is a neural network
+//    2. Contrastive divergence: CD-k with k steps of MCMC
+//    3. Langevin MCMC: sample from energy via gradient descent on E
+//    4. Persistent contrastive divergence: maintain replay buffer
+//    5. Conditional EBM: E(x, y) for structured prediction
+//    6. Partition function estimation + free energy
+//
+//  API (pure):
+//    ebm_zeros(n)                                       -> [float]
+//    ebm_dot(a, b)                                      -> float
+//    ebm_norm(v)                                        -> float
+//    ebm_scale(v, s)                                    -> [float]
+//    ebm_add(a, b)                                      -> [float]
+//    ebm_sub(a, b)                                      -> [float]
+//    ebm_energy_mlp(x, w1, b1, w2, b2)                 -> float
+//    ebm_energy_grad(x, w1, b1, w2, b2, eps)           -> [float]
+//    ebm_langevin_mcmc(x_init, w1, b1, w2, b2,
+//                      step_size, n_steps, seed)        -> [float]
+//    ebm_cd_gradient(x_data, w1, b1, w2, b2,
+//                    k, step_size, seed)                -> float
+//    ebm_pcd_step(x_data, replay, w1, b1, w2, b2,
+//                 k, step_size, seed)                   -> result
+//    ebm_cond_energy(x, y, wx, bx, wy, by, wj, bj)    -> float
+//    ebm_cond_energy_grad_x(x, y, wx, bx, wy, by,
+//                           wj, bj, eps)               -> [float]
+//    ebm_prob_ratio(e1, e2)                             -> float
+//    ebm_free_energy(energies)                          -> float
+//    ebm_acceptance_rate(energies)                      -> float
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+//    @hot   — called every training step
+// ═══════════════════════════════════════════════════════════════════
+
+// ── helpers ──────────────────────────────────────────────────────
+
+fn ebm_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn ebm_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn ebm_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn ebm_log(x) {
+    if x <= 0.0 { return -20.0 }
+    let mut y = 0.0
+    if x > 1.0 { y = x / 2.0 }
+    if x > 10.0 { y = 2.3 }
+    for _i in 0..60 {
+        let ey = ebm_exp(y)
+        if ey < 1.0e-15 { y = y + 1.0 } else {
+            y = y + (x - ey) / ey
+        }
+    }
+    return y
+}
+
+fn ebm_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Vector Operations
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ebm_dot(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    for i in 0..n {
+        s = s + a[i] * b[i]
+    }
+    return s
+}
+
+@pure
+fn ebm_norm(v) {
+    return ebm_sqrt(ebm_dot(v, v))
+}
+
+@pure
+fn ebm_scale(v, s) {
+    let n = len(v)
+    let mut out = ebm_zeros(n)
+    for i in 0..n {
+        out[i] = v[i] * s
+    }
+    return out
+}
+
+@pure
+fn ebm_add(a, b) {
+    let n = len(a)
+    let mut out = ebm_zeros(n)
+    for i in 0..n {
+        out[i] = a[i] + b[i]
+    }
+    return out
+}
+
+@pure
+fn ebm_sub(a, b) {
+    let n = len(a)
+    let mut out = ebm_zeros(n)
+    for i in 0..n {
+        out[i] = a[i] - b[i]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Pseudo-random noise generation (deterministic)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ebm_pseudo_noise(n, seed) {
+    let mut out = ebm_zeros(n)
+    for i in 0..n {
+        let mut h = (seed + 1) * 2654435761 + (i + 1) * 1315423911
+        h = h % 1000003
+        if h < 0 { h = 0 - h }
+        let u = to_float(h % 10000) / 10000.0
+        out[i] = (u - 0.5) * 3.46
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  1. Energy Function — MLP-based
+//
+//  E(x) = -f_theta(x) where f is a 2-layer MLP.
+//  f(x) = w2 * tanh(w1 * x + b1) + b2 (scalar output)
+//  E(x) = -f(x)
+//
+//  w1: [hidden x dim] flat, b1: [hidden]
+//  w2: [1 x hidden] flat, b2: [1]  (scalar output)
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ebm_tanh(x) {
+    let e2x = ebm_exp(2.0 * x)
+    if e2x > 1.0e15 { return 1.0 }
+    return (e2x - 1.0) / (e2x + 1.0)
+}
+
+@pure @hot
+fn ebm_energy_mlp(x, w1, b1, w2, b2) {
+    let dim = len(x)
+    let hidden_dim = len(b1)
+
+    // Layer 1: hidden = tanh(W1 * x + b1)
+    let mut hidden = ebm_zeros(hidden_dim)
+    for i in 0..hidden_dim {
+        let mut s = b1[i]
+        for j in 0..dim {
+            s = s + w1[i * dim + j] * x[j]
+        }
+        hidden[i] = ebm_tanh(s)
+    }
+
+    // Layer 2: scalar output = W2 * hidden + b2
+    let mut f_val = b2[0]
+    for j in 0..hidden_dim {
+        f_val = f_val + w2[j] * hidden[j]
+    }
+
+    // Energy = -f(x)
+    return 0.0 - f_val
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Energy Gradient (numerical, for Langevin MCMC)
+//
+//  grad_x E(x) via finite differences
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ebm_energy_grad(x, w1, b1, w2, b2, eps) {
+    let dim = len(x)
+    let mut grad = ebm_zeros(dim)
+    for i in 0..dim {
+        let mut x_plus = ebm_zeros(dim)
+        let mut x_minus = ebm_zeros(dim)
+        for j in 0..dim {
+            x_plus[j] = x[j]
+            x_minus[j] = x[j]
+        }
+        x_plus[i] = x_plus[i] + eps
+        x_minus[i] = x_minus[i] - eps
+        let e_plus = ebm_energy_mlp(x_plus, w1, b1, w2, b2)
+        let e_minus = ebm_energy_mlp(x_minus, w1, b1, w2, b2)
+        grad[i] = (e_plus - e_minus) / (2.0 * eps)
+    }
+    return grad
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  3. Langevin MCMC Sampling
+//
+//  x_{t+1} = x_t - step_size/2 * grad_x E(x_t) + sqrt(step_size) * z
+//  Descends the energy landscape with noise for exploration.
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn ebm_langevin_mcmc(x_init, w1, b1, w2, b2, step_size, n_steps, seed) {
+    let dim = len(x_init)
+    let mut x = ebm_zeros(dim)
+    for i in 0..dim { x[i] = x_init[i] }
+
+    let half_ss = step_size / 2.0
+    let sqrt_ss = ebm_sqrt(step_size)
+
+    for step in 0..n_steps {
+        let grad = ebm_energy_grad(x, w1, b1, w2, b2, 0.001)
+        let noise = ebm_pseudo_noise(dim, seed + step * 100)
+        for i in 0..dim {
+            x[i] = x[i] - half_ss * grad[i] + sqrt_ss * noise[i]
+        }
+    }
+    return x
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  2. Contrastive Divergence (CD-k)
+//
+//  CD gradient: grad_theta = E_data[grad E(x)] - E_model[grad E(x)]
+//  Approximate E_model by running k steps of MCMC from data.
+//  Returns: CD gradient estimate (scalar energy difference)
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn ebm_cd_gradient(x_data, w1, b1, w2, b2, k, step_size, seed) {
+    // Energy of real data
+    let e_data = ebm_energy_mlp(x_data, w1, b1, w2, b2)
+
+    // Run k steps of MCMC from data to get "negative sample"
+    let x_neg = ebm_langevin_mcmc(x_data, w1, b1, w2, b2, step_size, k, seed)
+    let e_neg = ebm_energy_mlp(x_neg, w1, b1, w2, b2)
+
+    // CD gradient direction: push down data energy, push up model energy
+    // grad = E(x_data) - E(x_neg) (want to minimize data energy, maximize model)
+    return e_data - e_neg
+}
+
+// CD gradient for a batch
+@pure
+fn ebm_cd_gradient_batch(x_batch, w1, b1, w2, b2, k, step_size, seed) {
+    let n = len(x_batch)
+    if n == 0 { return 0.0 }
+    let mut total = 0.0
+    for i in 0..n {
+        total = total + ebm_cd_gradient(x_batch[i], w1, b1, w2, b2, k, step_size, seed + i * 1000)
+    }
+    return total / to_float(n)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  4. Persistent Contrastive Divergence (PCD)
+//
+//  Maintains a replay buffer of persistent chains.
+//  Returns: [cd_grad, updated_replay_sample]
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ebm_pcd_step(x_data, replay_sample, w1, b1, w2, b2, k, step_size, seed) {
+    let e_data = ebm_energy_mlp(x_data, w1, b1, w2, b2)
+
+    // Continue MCMC chain from replay buffer (persistent chain)
+    let x_neg = ebm_langevin_mcmc(replay_sample, w1, b1, w2, b2, step_size, k, seed)
+    let e_neg = ebm_energy_mlp(x_neg, w1, b1, w2, b2)
+
+    let cd_grad = e_data - e_neg
+    // Return both the gradient and the updated replay sample
+    return [cd_grad, x_neg]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  5. Conditional EBM: E(x, y)
+//
+//  Two separate encoders for x and y, combined via joint layer.
+//  E(x, y) = -(wj * tanh(wx_out + wy_out) + bj)
+//
+//  wx: [hx x dim_x] flat, bx: [hx]
+//  wy: [hy x dim_y] flat, by: [hy]   (hx == hy required)
+//  wj: [1 x hx] flat, bj: [1]
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn ebm_cond_energy(x, y, wx, bx, wy, by, wj, bj) {
+    let dim_x = len(x)
+    let dim_y = len(y)
+    let hidden_dim = len(bx)
+
+    // Encode x: hx = tanh(Wx * x + bx)
+    let mut hx = ebm_zeros(hidden_dim)
+    for i in 0..hidden_dim {
+        let mut s = bx[i]
+        for j in 0..dim_x {
+            s = s + wx[i * dim_x + j] * x[j]
+        }
+        hx[i] = ebm_tanh(s)
+    }
+
+    // Encode y: hy = tanh(Wy * y + by)
+    let mut hy = ebm_zeros(hidden_dim)
+    for i in 0..hidden_dim {
+        let mut s = by[i]
+        for j in 0..dim_y {
+            s = s + wy[i * dim_y + j] * y[j]
+        }
+        hy[i] = ebm_tanh(s)
+    }
+
+    // Joint: combine and score
+    let mut joint = ebm_zeros(hidden_dim)
+    for i in 0..hidden_dim {
+        joint[i] = ebm_tanh(hx[i] + hy[i])
+    }
+
+    let mut f_val = bj[0]
+    for j in 0..hidden_dim {
+        f_val = f_val + wj[j] * joint[j]
+    }
+
+    return 0.0 - f_val
+}
+
+// Conditional energy gradient w.r.t. x (for conditional sampling)
+@pure
+fn ebm_cond_energy_grad_x(x, y, wx, bx, wy, by, wj, bj, eps) {
+    let dim = len(x)
+    let mut grad = ebm_zeros(dim)
+    for i in 0..dim {
+        let mut x_plus = ebm_zeros(dim)
+        let mut x_minus = ebm_zeros(dim)
+        for j in 0..dim {
+            x_plus[j] = x[j]
+            x_minus[j] = x[j]
+        }
+        x_plus[i] = x_plus[i] + eps
+        x_minus[i] = x_minus[i] - eps
+        let e_plus = ebm_cond_energy(x_plus, y, wx, bx, wy, by, wj, bj)
+        let e_minus = ebm_cond_energy(x_minus, y, wx, bx, wy, by, wj, bj)
+        grad[i] = (e_plus - e_minus) / (2.0 * eps)
+    }
+    return grad
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Utility Functions
+// ═══════════════════════════════════════════════════════════════════
+
+// Boltzmann probability ratio: p(x1)/p(x2) = exp(-(E1-E2))
+@pure
+fn ebm_prob_ratio(e1, e2) {
+    return ebm_exp(0.0 - (e1 - e2))
+}
+
+// Free energy: F = -log(sum(exp(-E_i)))  (log-sum-exp with stability)
+@pure
+fn ebm_free_energy(energies) {
+    let n = len(energies)
+    if n == 0 { return 0.0 }
+    // Find min energy for numerical stability
+    let mut min_e = energies[0]
+    for i in 1..n {
+        if energies[i] < min_e { min_e = energies[i] }
+    }
+    let mut sum_exp = 0.0
+    for i in 0..n {
+        sum_exp = sum_exp + ebm_exp(0.0 - (energies[i] - min_e))
+    }
+    return min_e - ebm_log(sum_exp)
+}
+
+// Acceptance rate: fraction of energy differences < 0 (lower energy accepted)
+@pure
+fn ebm_acceptance_rate(energies) {
+    let n = len(energies)
+    if n < 2 { return 1.0 }
+    let mut accepted = 0
+    for i in 1..n {
+        if energies[i] <= energies[i - 1] {
+            accepted = accepted + 1
+        }
+    }
+    return to_float(accepted) / to_float(n - 1)
+}
+
+// Energy variance across a set of samples
+@pure
+fn ebm_energy_variance(energies) {
+    let n = len(energies)
+    if n < 2 { return 0.0 }
+    let mut mean = 0.0
+    for i in 0..n { mean = mean + energies[i] }
+    mean = mean / to_float(n)
+    let mut var = 0.0
+    for i in 0..n {
+        let d = energies[i] - mean
+        var = var + d * d
+    }
+    return var / to_float(n)
+}
+
+println("[energy_based_model] loaded — EBM + CD-k + Langevin MCMC + PCD + conditional EBM")

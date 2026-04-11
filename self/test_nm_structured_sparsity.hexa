@@ -1,0 +1,159 @@
+// ═══════════════════════════════════════════════════════════════════
+//  test_nm_structured_sparsity.hexa — N:M Structured Sparsity tests
+//
+//  Validates:
+//    1.  2:4 mask has exactly 2 non-zeros per group of 4
+//    2.  4:8 mask has exactly 4 non-zeros per group of 8
+//    3.  Mask selects top-N by magnitude
+//    4.  Apply mask zeros out correct positions
+//    5.  Sparse matmul matches dense matmul with mask
+//    6.  Cubic schedule: step=0 -> initial
+//    7.  Cubic schedule: step=total -> final
+//    8.  Cubic schedule: monotonic
+//    9.  Gradual prune: early step keeps all weights
+//   10.  Gradual prune: final step enforces N:M
+//   11.  Gradient regrowth: mask from gradient magnitudes
+//   12.  Validate mask: correct pattern
+//   13.  Validate mask: wrong pattern detected
+//   14.  Compute sparsity: 2:4 -> 0.5
+//   15.  Compute sparsity: 4:8 -> 0.5
+//   16.  Multi-row mask consistency
+//
+//  Run: ./hexa self/test_nm_structured_sparsity.hexa
+// ═══════════════════════════════════════════════════════════════════
+
+import "ml/nm_structured_sparsity.hexa"
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("PASS " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("FAIL " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ═══════════ Tests ═════════════════════════════════════════════
+
+fn main() {
+    println("=== N:M Structured Sparsity Tests ===")
+
+    // --- Test 1: 2:4 mask validity ---
+    let w1 = [[4.0, 1.0, 3.0, 2.0, 8.0, 5.0, 7.0, 6.0]]
+    let mask1 = nm_generate_mask(w1, 2, 4)
+    check("2:4 mask valid", nm_validate_mask(mask1, 2, 4))
+
+    // --- Test 2: 4:8 mask validity ---
+    let w2 = [[1.0, 8.0, 3.0, 6.0, 2.0, 7.0, 4.0, 5.0]]
+    let mask2 = nm_generate_mask(w2, 4, 8)
+    check("4:8 mask valid", nm_validate_mask(mask2, 4, 8))
+
+    // --- Test 3: Mask selects top-N by magnitude ---
+    // Group [4.0, 1.0, 3.0, 2.0]: top-2 are indices 0 (4.0) and 2 (3.0)
+    check("2:4 top-N idx0 kept", mask1[0][0] == 1)
+    check("2:4 top-N idx2 kept", mask1[0][2] == 1)
+    check("2:4 bottom idx1 pruned", mask1[0][1] == 0)
+    check("2:4 bottom idx3 pruned", mask1[0][3] == 0)
+
+    // --- Test 4: Apply mask zeros correct positions ---
+    let masked = nm_apply_mask(w1, mask1)
+    let mut zeros_ok = true
+    for j in 0..8 {
+        if mask1[0][j] == 0 {
+            if fabs(masked[0][j]) > 1.0e-10 { zeros_ok = false }
+        }
+        if mask1[0][j] == 1 {
+            if fabs(masked[0][j] - w1[0][j]) > 1.0e-10 { zeros_ok = false }
+        }
+    }
+    check("Apply mask correctness", zeros_ok)
+
+    // --- Test 5: Sparse matmul matches masked dense ---
+    let w3 = [[2.0, 0.0, 3.0, 0.0], [0.0, 4.0, 0.0, 1.0]]
+    let mask3 = [[1, 0, 1, 0], [0, 1, 0, 1]]
+    let inp = [1.0, 2.0, 3.0, 4.0]
+    let y_sparse = nm_sparse_matmul(w3, mask3, inp)
+    // Row 0: 2*1 + 3*3 = 11.0
+    // Row 1: 4*2 + 1*4 = 12.0
+    check("Sparse matmul row0", approx(y_sparse[0], 11.0, 0.001))
+    check("Sparse matmul row1", approx(y_sparse[1], 12.0, 0.001))
+
+    // --- Test 6: Cubic schedule step=0 -> initial ---
+    let cs0 = nm_cubic_schedule(0, 100, 1.0, 0.5)
+    check("Cubic step=0 -> initial", approx(cs0, 1.0, 0.001))
+
+    // --- Test 7: Cubic schedule step=total -> final ---
+    let cs_end = nm_cubic_schedule(100, 100, 1.0, 0.5)
+    check("Cubic step=T -> final", approx(cs_end, 0.5, 0.001))
+
+    // --- Test 8: Cubic schedule monotonic ---
+    let cs_25 = nm_cubic_schedule(25, 100, 1.0, 0.5)
+    let cs_75 = nm_cubic_schedule(75, 100, 1.0, 0.5)
+    check("Cubic monotonic (decreasing to final)", cs_75 < cs_25)
+
+    // --- Test 9: Gradual prune early step keeps all ---
+    let w4 = [[5.0, 1.0, 3.0, 2.0]]
+    let gp_early = nm_gradual_prune(w4, 0, 100, 2, 4)
+    // step=0 -> frac=1.0, should keep all
+    let mut all_kept = true
+    for j in 0..4 {
+        if fabs(gp_early[0][j] - w4[0][j]) > 1.0e-10 { all_kept = false }
+    }
+    check("Gradual prune early keeps all", all_kept)
+
+    // --- Test 10: Gradual prune final step enforces N:M ---
+    let gp_final = nm_gradual_prune(w4, 100, 100, 2, 4)
+    let gp_mask = nm_generate_mask(gp_final, 2, 4)
+    check("Gradual prune final enforces 2:4", nm_validate_mask(gp_mask, 2, 4))
+
+    // --- Test 11: Gradient regrowth uses gradient magnitude ---
+    let weights5 = [[0.1, 0.2, 0.3, 0.4]]
+    let grads5 = [[4.0, 1.0, 3.0, 2.0]]
+    let regrown = nm_gradient_regrowth(weights5, grads5, 2, 4)
+    // Gradient top-2: indices 0 (4.0) and 2 (3.0)
+    check("Regrowth idx0 from grad", regrown[0][0] == 1)
+    check("Regrowth idx2 from grad", regrown[0][2] == 1)
+
+    // --- Test 12: Validate mask correct pattern ---
+    let good_mask = [[1, 0, 1, 0, 0, 1, 1, 0]]
+    check("Validate correct 2:4", nm_validate_mask(good_mask, 2, 4))
+
+    // --- Test 13: Validate mask wrong pattern ---
+    let bad_mask = [[1, 1, 1, 0, 0, 1, 1, 0]]
+    check("Validate bad 3-of-4 detected", !nm_validate_mask(bad_mask, 2, 4))
+
+    // --- Test 14: Sparsity 2:4 -> 0.5 ---
+    let sp1 = nm_compute_sparsity(good_mask)
+    check("Sparsity 2:4 = 0.5", approx(sp1, 0.5, 0.001))
+
+    // --- Test 15: Sparsity 4:8 ---
+    let mask_48 = nm_generate_mask(w2, 4, 8)
+    let sp2 = nm_compute_sparsity(mask_48)
+    check("Sparsity 4:8 = 0.5", approx(sp2, 0.5, 0.001))
+
+    // --- Test 16: Multi-row mask consistency ---
+    let w6 = [[4.0, 1.0, 3.0, 2.0], [2.0, 3.0, 1.0, 4.0], [1.0, 4.0, 2.0, 3.0]]
+    let mask6 = nm_generate_mask(w6, 2, 4)
+    check("Multi-row all valid 2:4", nm_validate_mask(mask6, 2, 4))
+    // Row 0: top-2 by mag = indices 0,2; Row 1: indices 1,3; Row 2: indices 1,3
+    check("Row1 top idx3", mask6[1][3] == 1)
+    check("Row2 top idx1", mask6[2][1] == 1)
+
+    println("")
+    println("nm_structured_sparsity: " + to_string(pass_count) + " passed, " + to_string(fail_count) + " failed")
+    if fail_count == 0 {
+        println("ALL PASS")
+    } else {
+        println("FAILED")
+    }
+    println(to_string(pass_count) + " passed")
+}
+
+main()
