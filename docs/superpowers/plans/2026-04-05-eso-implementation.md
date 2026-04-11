@@ -725,12 +725,12 @@ Expected: Build OK, no warnings
 
 - [ ] **Step 4: Test Fixed mode (no regression)**
 
-Run: `./target/release/hexa examples/bench_suite.hexa 2>&1 | head -5`
+Run: `./hexa examples/bench_suite.hexa 2>&1 | head -5`
 Expected: Output starts with `8422360000`
 
 - [ ] **Step 5: Test Adaptive mode**
 
-Run: `HEXA_ESO=adaptive ./target/release/hexa examples/bench_suite.hexa 2>&1 | head -5`
+Run: `HEXA_ESO=adaptive ./hexa examples/bench_suite.hexa 2>&1 | head -5`
 Expected: Output starts with `8422360000`, includes `[eso] policy=adaptive`
 
 - [ ] **Step 6: Commit**
@@ -833,7 +833,7 @@ Expected: Build succeeds
 
 - [ ] **Step 6: Run eso-tune smoke**
 
-Run: `./target/release/hexa --eso-tune examples/bench_suite.hexa 2>&1 | tail -15`
+Run: `./hexa --eso-tune examples/bench_suite.hexa 2>&1 | tail -15`
 Expected: 10 lines `[eso-tune] round=...` + final `best_round=...`
 
 - [ ] **Step 7: Commit**
@@ -923,7 +923,7 @@ Expected: Build OK
 
 - [ ] **Step 5: Run tune and verify JSON written**
 
-Run: `./target/release/hexa --eso-tune examples/bench_suite.hexa 2>&1 | tail -3 && cat config/eso_metrics.json | head -5`
+Run: `./hexa --eso-tune examples/bench_suite.hexa 2>&1 | tail -3 && cat config/eso_metrics.json | head -5`
 Expected: `wrote config/eso_metrics.json` + JSON content starts with `{"_meta":`
 
 - [ ] **Step 6: Commit**
@@ -1064,12 +1064,12 @@ Expected: All tests PASS, count >= 798 + 14 new = 812+
 
 - [ ] **Step 2: Run benchmark correctness check**
 
-Run: `./target/release/hexa examples/bench_suite.hexa 2>&1 | head -1`
+Run: `./hexa examples/bench_suite.hexa 2>&1 | head -1`
 Expected: `8422360000`
 
 - [ ] **Step 3: Run HEXA_ESO=adaptive correctness check**
 
-Run: `HEXA_ESO=adaptive ./target/release/hexa examples/bench_suite.hexa 2>&1 | head -1`
+Run: `HEXA_ESO=adaptive ./hexa examples/bench_suite.hexa 2>&1 | head -1`
 Expected: `8422360000`
 
 - [ ] **Step 4: Check config/eso_metrics.json exists and valid JSON**

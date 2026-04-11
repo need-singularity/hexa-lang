@@ -2054,12 +2054,12 @@ Expected: compiles (may have warnings)
 
 - [ ] **Step 2: Run PTY test**
 
-Run: `cd /Users/ghost/Dev/hexa-lang && ./target/release/hexa examples/test_void_sys.hexa`
+Run: `cd /Users/ghost/Dev/hexa-lang && ./hexa examples/test_void_sys.hexa`
 Expected: All PTY tests pass
 
 - [ ] **Step 3: Run VOID terminal**
 
-Run: `cd /Users/ghost/Dev/hexa-lang && ./target/release/hexa void/src/main.hexa`
+Run: `cd /Users/ghost/Dev/hexa-lang && ./hexa void/src/main.hexa`
 Expected: Window opens, shell prompt visible, keyboard input works
 
 - [ ] **Step 4: Fix any compilation or runtime errors**
