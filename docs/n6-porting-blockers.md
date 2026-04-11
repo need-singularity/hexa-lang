@@ -18,9 +18,11 @@
 
 ### 1. 원격 gate 바이너리 구버전
 
-원격 Ubuntu gate (`/tmp/hexa-build/hexa-lang/target/release/hexa`)가 로컬보다 뒤처짐.
+원격 Ubuntu gate (`/tmp/hexa-build/hexa-lang/hexa`)가 로컬보다 뒤처짐.
 로컬에서 통과하는 B-30(mut reassign), B-34(destructure), B-17(+=) 등이 원격에서 실패.
-→ **gate 바이너리 재빌드 필요** (`ssh ubu "cd /tmp/hexa-build/hexa-lang && cargo build --release"`)
+→ **gate 바이너리 재빌드 필요** (2026-04-11 이후: src/ 삭제, cargo 제거됨.
+   `ssh ubu "cd /tmp/hexa-build/hexa-lang && ./hexa build_hexa.hexa"` 또는
+   precompiled 바이너리 rsync 배포.)
 
 ### 2. ~~codegen_c2 math 함수 누락~~ ✅ RESOLVED (ready 226e337)
 
