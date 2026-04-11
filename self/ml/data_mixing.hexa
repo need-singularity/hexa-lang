@@ -1,0 +1,399 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/data_mixing.hexa — Domain Weight Optimization (Data Mixing)
+//
+//  Paper: "DoReMi: Optimizing Data Mixtures Speeds Up Language Model
+//          Pretraining", Xie et al. 2023
+//
+//  Core idea: dynamically adjust domain sampling weights based on
+//  per-domain excess loss relative to a reference (proxy) model.
+//  Domains where the main model underperforms the proxy receive
+//  higher weight — the optimizer routes more data from those
+//  domains into future training batches.
+//
+//  Components:
+//    1. Domain definition   — named domains with initial weights
+//    2. Domain loss tracker — per-domain running average loss
+//    3. Proxy model reference — baseline loss per domain
+//    4. DoReMi weight update — excess loss -> exponentiated gradient
+//    5. Mixing weight scheduler — update weights over time
+//    6. Batch sampler       — sample from domains proportional to w
+//    7. Weight normalization — sum to 1.0
+//    8. History / logging   — weight evolution over steps
+//
+//  API (pure, no global mutable state):
+//    dm_new_domain(name, initial_weight)                -> domain
+//    dm_new_mixer(domains)                              -> mixer
+//    dm_get_weights(mixer)                              -> [float]
+//    dm_get_domain_names(mixer)                         -> [string]
+//    dm_record_loss(mixer, domain_idx, loss)            -> mixer'
+//    dm_set_proxy_losses(mixer, proxy_losses)           -> mixer'
+//    dm_compute_excess_loss(mixer)                      -> [float]
+//    dm_update_weights(mixer, lr, step)                 -> mixer'
+//    dm_normalize_weights(weights)                      -> [float]
+//    dm_sample_domain(mixer, seed)                      -> int
+//    dm_sample_batch(mixer, batch_size, seed)           -> [int]
+//    dm_get_history(mixer)                              -> [[float]]
+//    dm_snapshot_weights(mixer)                         -> mixer'
+//    dm_smoothed_weights(mixer, alpha)                  -> [float]
+//    dm_entropy(weights)                                -> float
+//    dm_kl_from_uniform(weights)                        -> float
+//    dm_clamp_weights(weights, min_w, max_w)            -> [float]
+//    dm_ema_loss(old, new_val, decay)                   -> float
+//    dm_total_samples(mixer)                            -> int
+//    dm_domain_sample_counts(mixer, batch)              -> [int]
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects, functional core
+//    @hot   — called every training step
+// ═══════════════════════════════════════════════════════════════════
+
+// ── math helpers (prefixed dm_ to avoid collision) ──────────────
+
+fn dm_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn dm_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn dm_log(x) {
+    if x <= 0.0 { return -30.0 }
+    let mut v = x
+    let mut count = 0
+    while v > 2.0 { v = v / 2.718281828; count = count + 1 }
+    while v < 0.5 { v = v * 2.718281828; count = count - 1 }
+    let d = v - 1.0
+    return to_float(count) + d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+}
+
+fn dm_max(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn dm_min(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn dm_hash(seed, i) {
+    let h = ((seed * 2654435761 + i * 1315423911 + 7919) % 100003)
+    if h < 0 { return 0 - h }
+    return h
+}
+
+fn dm_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn dm_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Domain definition
+//
+//  A domain is a map with name and initial weight.
+// ═══════════════════════════════════════════════════════════════════
+
+fn dm_new_domain(name, initial_weight) {
+    let d = #{}
+    d["name"] = name
+    d["weight"] = initial_weight
+    return d
+}
+
+fn dm_domain_name(domain) { return domain["name"] }
+fn dm_domain_weight(domain) { return domain["weight"] }
+
+// ═══════════════════════════════════════════════════════════════════
+//  Mixer — central state for data mixing
+//
+//  Fields:
+//    names         — [string] domain names
+//    weights       — [float] current mixing weights (sum=1)
+//    losses        — [float] running average per-domain loss
+//    proxy_losses  — [float] reference model per-domain loss
+//    loss_counts   — [int] number of loss observations per domain
+//    history       — [[float]] snapshots of weight evolution
+//    total_samples — int total batches sampled
+//    step          — int current update step
+// ═══════════════════════════════════════════════════════════════════
+
+fn dm_new_mixer(domains) {
+    let n = len(domains)
+    let mut names = []
+    let mut weights = dm_zeros(n)
+    let mut wsum = 0.0
+    for i in 0..n {
+        names = names + [dm_domain_name(domains[i])]
+        weights[i] = dm_domain_weight(domains[i])
+        wsum = wsum + dm_domain_weight(domains[i])
+    }
+    // normalize initial weights
+    if wsum > 0.0 {
+        for i in 0..n { weights[i] = weights[i] / wsum }
+    }
+    let mixer = #{}
+    mixer["names"] = names
+    mixer["weights"] = weights
+    mixer["losses"] = dm_zeros(n)
+    mixer["proxy_losses"] = dm_zeros(n)
+    mixer["loss_counts"] = dm_zeros_int(n)
+    mixer["history"] = []
+    mixer["total_samples"] = 0
+    mixer["step"] = 0
+    mixer["n"] = n
+    return mixer
+}
+
+fn dm_get_n(mixer) { return mixer["n"] }
+fn dm_get_weights(mixer) { return mixer["weights"] }
+fn dm_get_domain_names(mixer) { return mixer["names"] }
+fn dm_get_losses(mixer) { return mixer["losses"] }
+fn dm_get_proxy_losses(mixer) { return mixer["proxy_losses"] }
+fn dm_get_history(mixer) { return mixer["history"] }
+fn dm_get_step(mixer) { return mixer["step"] }
+
+// ═══════════════════════════════════════════════════════════════════
+//  Weight normalization — sum to 1.0
+// ═══════════════════════════════════════════════════════════════════
+@pure fn dm_normalize_weights(weights) {
+    let n = len(weights)
+    let mut s = 0.0
+    for i in 0..n { s = s + weights[i] }
+    let mut out = dm_zeros(n)
+    if s > 0.0 {
+        for i in 0..n { out[i] = weights[i] / s }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Clamp weights to [min_w, max_w] then renormalize
+// ═══════════════════════════════════════════════════════════════════
+@pure fn dm_clamp_weights(weights, min_w, max_w) {
+    let n = len(weights)
+    let mut out = dm_zeros(n)
+    for i in 0..n {
+        let mut w = weights[i]
+        if w < min_w { w = min_w }
+        if w > max_w { w = max_w }
+        out[i] = w
+    }
+    return dm_normalize_weights(out)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  EMA loss tracking
+// ═══════════════════════════════════════════════════════════════════
+@pure fn dm_ema_loss(old_loss, new_loss, decay) {
+    return decay * old_loss + (1.0 - decay) * new_loss
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Record loss — per-domain running average via EMA
+// ═══════════════════════════════════════════════════════════════════
+@hot fn dm_record_loss(mixer, domain_idx, loss) {
+    let n = dm_get_n(mixer)
+    if domain_idx < 0 { return mixer }
+    if domain_idx >= n { return mixer }
+    let decay = 0.9
+    if mixer["loss_counts"][domain_idx] == 0 {
+        mixer["losses"][domain_idx] = loss
+    } else {
+        mixer["losses"][domain_idx] = dm_ema_loss(mixer["losses"][domain_idx], loss, decay)
+    }
+    mixer["loss_counts"][domain_idx] = mixer["loss_counts"][domain_idx] + 1
+    return mixer
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Set proxy (reference) model losses
+// ═══════════════════════════════════════════════════════════════════
+fn dm_set_proxy_losses(mixer, proxy_losses) {
+    let n = dm_get_n(mixer)
+    let m = len(proxy_losses)
+    let limit = dm_min(n, m)
+    for i in 0..limit { mixer["proxy_losses"][i] = proxy_losses[i] }
+    return mixer
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Compute excess loss: max(0, domain_loss - proxy_loss)
+//
+//  DoReMi signal: domains where the main model is worse than the
+//  proxy get positive excess — they need more data.
+// ═══════════════════════════════════════════════════════════════════
+@pure fn dm_compute_excess_loss(mixer) {
+    let n = dm_get_n(mixer)
+    let mut excess = dm_zeros(n)
+    for i in 0..n {
+        let e = mixer["losses"][i] - mixer["proxy_losses"][i]
+        excess[i] = dm_max(0.0, e)
+    }
+    return excess
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  DoReMi weight update — exponentiated gradient ascent
+//
+//  w_i <- w_i * exp(lr * excess_i)  then normalize
+//
+//  Domains with higher excess loss get exponentially upweighted.
+// ═══════════════════════════════════════════════════════════════════
+@hot fn dm_update_weights(mixer, lr, step) {
+    let n = dm_get_n(mixer)
+    let excess = dm_compute_excess_loss(mixer)
+    let mut new_w = dm_zeros(n)
+    for i in 0..n {
+        new_w[i] = mixer["weights"][i] * dm_exp(lr * excess[i])
+    }
+    let normed = dm_normalize_weights(new_w)
+    for i in 0..n { mixer["weights"][i] = normed[i] }
+    mixer["step"] = step
+    return mixer
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Mixing weight scheduler — update with step-aware learning rate
+//
+//  Linear warmup for stability, then constant lr.
+// ═══════════════════════════════════════════════════════════════════
+@hot fn dm_scheduled_update(mixer, base_lr, step, warmup_steps) {
+    let mut effective_lr = base_lr
+    if step < warmup_steps {
+        effective_lr = base_lr * to_float(step + 1) / to_float(warmup_steps)
+    }
+    return dm_update_weights(mixer, effective_lr, step)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Batch sampler — sample domain index proportional to weights
+//
+//  Uses inverse CDF: draw uniform r in [0,1), walk cumulative
+//  weights until exceeded.
+// ═══════════════════════════════════════════════════════════════════
+@hot fn dm_sample_domain(mixer, seed) {
+    let n = dm_get_n(mixer)
+    let h = dm_hash(seed, 0)
+    let r = to_float(h % 10000) / 10000.0
+    let mut cumsum = 0.0
+    for i in 0..n {
+        cumsum = cumsum + mixer["weights"][i]
+        if r < cumsum { return i }
+    }
+    return n - 1
+}
+
+@hot fn dm_sample_batch(mixer, batch_size, seed) {
+    let mut batch = []
+    for i in 0..batch_size {
+        let idx = dm_sample_domain(mixer, seed + i * 37)
+        batch = batch + [idx]
+    }
+    mixer["total_samples"] = mixer["total_samples"] + batch_size
+    let result = #{}
+    result["batch"] = batch
+    result["mixer"] = mixer
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Total samples counter
+// ═══════════════════════════════════════════════════════════════════
+fn dm_total_samples(mixer) { return mixer["total_samples"] }
+
+// ═══════════════════════════════════════════════════════════════════
+//  Count per-domain occurrences in a batch
+// ═══════════════════════════════════════════════════════════════════
+@pure fn dm_domain_sample_counts(mixer, batch) {
+    let n = dm_get_n(mixer)
+    let mut counts = dm_zeros_int(n)
+    let bs = len(batch)
+    for i in 0..bs {
+        let idx = batch[i]
+        if idx >= 0 {
+            if idx < n {
+                counts[idx] = counts[idx] + 1
+            }
+        }
+    }
+    return counts
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Snapshot / History — record current weights for evolution log
+// ═══════════════════════════════════════════════════════════════════
+fn dm_snapshot_weights(mixer) {
+    let n = dm_get_n(mixer)
+    let mut snap = dm_zeros(n)
+    for i in 0..n { snap[i] = mixer["weights"][i] }
+    mixer["history"] = mixer["history"] + [snap]
+    return mixer
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Smoothed weights — EMA between current and uniform
+// ═══════════════════════════════════════════════════════════════════
+@pure fn dm_smoothed_weights(mixer, alpha) {
+    let n = dm_get_n(mixer)
+    let uniform = 1.0 / to_float(n)
+    let mut out = dm_zeros(n)
+    for i in 0..n {
+        out[i] = alpha * mixer["weights"][i] + (1.0 - alpha) * uniform
+    }
+    return dm_normalize_weights(out)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Entropy of weight distribution (higher = more uniform)
+// ═══════════════════════════════════════════════════════════════════
+@pure fn dm_entropy(weights) {
+    let n = len(weights)
+    let mut h = 0.0
+    for i in 0..n {
+        if weights[i] > 1.0e-10 {
+            h = h - weights[i] * dm_log(weights[i])
+        }
+    }
+    return h
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  KL divergence from uniform distribution
+//
+//  KL(w || u) = sum w_i * log(w_i * n)
+//  Lower = closer to uniform.
+// ═══════════════════════════════════════════════════════════════════
+@pure fn dm_kl_from_uniform(weights) {
+    let n = len(weights)
+    let nf = to_float(n)
+    let mut kl = 0.0
+    for i in 0..n {
+        if weights[i] > 1.0e-10 {
+            kl = kl + weights[i] * dm_log(weights[i] * nf)
+        }
+    }
+    return kl
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  EOF data_mixing.hexa
+// ═══════════════════════════════════════════════════════════════════

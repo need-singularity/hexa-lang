@@ -1,0 +1,568 @@
+// ═══════════════════════════════════════════════════════════════════
+//  test_data_mixing.hexa — Data Mixing / Domain Weight Optimization
+//
+//  Tests:
+//    T01. dm_new_domain: name and weight fields
+//    T02. dm_new_mixer: creates N domains
+//    T03. initial weights normalized to sum=1
+//    T04. dm_get_domain_names returns correct names
+//    T05. dm_normalize_weights: sum=1 invariant
+//    T06. dm_normalize_weights: zero vector safe
+//    T07. dm_clamp_weights: min floor enforced
+//    T08. dm_clamp_weights: max cap enforced
+//    T09. dm_ema_loss: decay=0 -> pure new
+//    T10. dm_ema_loss: decay=1 -> pure old
+//    T11. dm_record_loss: first observation sets loss
+//    T12. dm_record_loss: EMA updates on second observation
+//    T13. dm_record_loss: out-of-range domain_idx safe
+//    T14. dm_set_proxy_losses: sets reference values
+//    T15. dm_compute_excess_loss: positive when model > proxy
+//    T16. dm_compute_excess_loss: zero when model <= proxy
+//    T17. dm_update_weights: excess domain upweighted
+//    T18. dm_update_weights: zero excess preserves weights
+//    T19. dm_scheduled_update: warmup reduces effective lr
+//    T20. dm_sample_domain: returns valid index
+//    T21. dm_sample_batch: correct batch size
+//    T22. dm_domain_sample_counts: sum = batch_size
+//    T23. dm_snapshot_weights: history grows
+//    T24. dm_smoothed_weights: alpha=1 returns current
+//    T25. dm_smoothed_weights: alpha=0 returns uniform
+//    T26. dm_entropy: uniform distribution = max entropy
+//    T27. dm_entropy: peaked distribution < max entropy
+//    T28. dm_kl_from_uniform: uniform = 0
+//    T29. dm_kl_from_uniform: peaked > 0
+//    T30. dm_total_samples: tracks cumulative
+//    T31. weight evolution: repeated updates shift toward high-loss domain
+//    T32. dm_sample_batch: high-weight domain sampled more
+//
+//  실행: ./hexa self/test_data_mixing.hexa
+// ═══════════════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ═══════════ data_mixing.hexa inlined ═══════════════════════════
+
+fn dm_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn dm_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn dm_log(x) {
+    if x <= 0.0 { return -30.0 }
+    let mut v = x
+    let mut count = 0
+    while v > 2.0 { v = v / 2.718281828; count = count + 1 }
+    while v < 0.5 { v = v * 2.718281828; count = count - 1 }
+    let d = v - 1.0
+    return to_float(count) + d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+}
+
+fn dm_max(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn dm_min(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn dm_hash(seed, i) {
+    let h = ((seed * 2654435761 + i * 1315423911 + 7919) % 100003)
+    if h < 0 { return 0 - h }
+    return h
+}
+
+fn dm_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn dm_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+fn dm_new_domain(name, initial_weight) {
+    let d = #{}
+    d["name"] = name
+    d["weight"] = initial_weight
+    return d
+}
+
+fn dm_domain_name(domain) { return domain["name"] }
+fn dm_domain_weight(domain) { return domain["weight"] }
+
+fn dm_new_mixer(domains) {
+    let n = len(domains)
+    let mut names = []
+    let mut weights = dm_zeros(n)
+    let mut wsum = 0.0
+    for i in 0..n {
+        names = names + [dm_domain_name(domains[i])]
+        weights[i] = dm_domain_weight(domains[i])
+        wsum = wsum + dm_domain_weight(domains[i])
+    }
+    if wsum > 0.0 {
+        for i in 0..n { weights[i] = weights[i] / wsum }
+    }
+    let mixer = #{}
+    mixer["names"] = names
+    mixer["weights"] = weights
+    mixer["losses"] = dm_zeros(n)
+    mixer["proxy_losses"] = dm_zeros(n)
+    mixer["loss_counts"] = dm_zeros_int(n)
+    mixer["history"] = []
+    mixer["total_samples"] = 0
+    mixer["step"] = 0
+    mixer["n"] = n
+    return mixer
+}
+
+fn dm_get_n(mixer) { return mixer["n"] }
+fn dm_get_weights(mixer) { return mixer["weights"] }
+fn dm_get_domain_names(mixer) { return mixer["names"] }
+fn dm_get_losses(mixer) { return mixer["losses"] }
+fn dm_get_proxy_losses(mixer) { return mixer["proxy_losses"] }
+fn dm_get_history(mixer) { return mixer["history"] }
+fn dm_get_step(mixer) { return mixer["step"] }
+
+fn dm_normalize_weights(weights) {
+    let n = len(weights)
+    let mut s = 0.0
+    for i in 0..n { s = s + weights[i] }
+    let mut out = dm_zeros(n)
+    if s > 0.0 {
+        for i in 0..n { out[i] = weights[i] / s }
+    }
+    return out
+}
+
+fn dm_clamp_weights(weights, min_w, max_w) {
+    let n = len(weights)
+    let mut out = dm_zeros(n)
+    for i in 0..n {
+        let mut w = weights[i]
+        if w < min_w { w = min_w }
+        if w > max_w { w = max_w }
+        out[i] = w
+    }
+    return dm_normalize_weights(out)
+}
+
+fn dm_ema_loss(old_loss, new_loss, decay) {
+    return decay * old_loss + (1.0 - decay) * new_loss
+}
+
+fn dm_record_loss(mixer, domain_idx, loss) {
+    let n = dm_get_n(mixer)
+    if domain_idx < 0 { return mixer }
+    if domain_idx >= n { return mixer }
+    let decay = 0.9
+    if mixer["loss_counts"][domain_idx] == 0 {
+        mixer["losses"][domain_idx] = loss
+    } else {
+        mixer["losses"][domain_idx] = dm_ema_loss(mixer["losses"][domain_idx], loss, decay)
+    }
+    mixer["loss_counts"][domain_idx] = mixer["loss_counts"][domain_idx] + 1
+    return mixer
+}
+
+fn dm_set_proxy_losses(mixer, proxy_losses) {
+    let n = dm_get_n(mixer)
+    let m = len(proxy_losses)
+    let limit = dm_min(n, m)
+    for i in 0..limit { mixer["proxy_losses"][i] = proxy_losses[i] }
+    return mixer
+}
+
+fn dm_compute_excess_loss(mixer) {
+    let n = dm_get_n(mixer)
+    let mut excess = dm_zeros(n)
+    for i in 0..n {
+        let e = mixer["losses"][i] - mixer["proxy_losses"][i]
+        excess[i] = dm_max(0.0, e)
+    }
+    return excess
+}
+
+fn dm_update_weights(mixer, lr, step) {
+    let n = dm_get_n(mixer)
+    let excess = dm_compute_excess_loss(mixer)
+    let mut new_w = dm_zeros(n)
+    for i in 0..n {
+        new_w[i] = mixer["weights"][i] * dm_exp(lr * excess[i])
+    }
+    let normed = dm_normalize_weights(new_w)
+    for i in 0..n { mixer["weights"][i] = normed[i] }
+    mixer["step"] = step
+    return mixer
+}
+
+fn dm_scheduled_update(mixer, base_lr, step, warmup_steps) {
+    let mut effective_lr = base_lr
+    if step < warmup_steps {
+        effective_lr = base_lr * to_float(step + 1) / to_float(warmup_steps)
+    }
+    return dm_update_weights(mixer, effective_lr, step)
+}
+
+fn dm_sample_domain(mixer, seed) {
+    let n = dm_get_n(mixer)
+    let h = dm_hash(seed, 0)
+    let r = to_float(h % 10000) / 10000.0
+    let mut cumsum = 0.0
+    for i in 0..n {
+        cumsum = cumsum + mixer["weights"][i]
+        if r < cumsum { return i }
+    }
+    return n - 1
+}
+
+fn dm_sample_batch(mixer, batch_size, seed) {
+    let mut batch = []
+    for i in 0..batch_size {
+        let idx = dm_sample_domain(mixer, seed + i * 37)
+        batch = batch + [idx]
+    }
+    mixer["total_samples"] = mixer["total_samples"] + batch_size
+    let result = #{}
+    result["batch"] = batch
+    result["mixer"] = mixer
+    return result
+}
+
+fn dm_total_samples(mixer) { return mixer["total_samples"] }
+
+fn dm_domain_sample_counts(mixer, batch) {
+    let n = dm_get_n(mixer)
+    let mut counts = dm_zeros_int(n)
+    let bs = len(batch)
+    for i in 0..bs {
+        let idx = batch[i]
+        if idx >= 0 {
+            if idx < n {
+                counts[idx] = counts[idx] + 1
+            }
+        }
+    }
+    return counts
+}
+
+fn dm_snapshot_weights(mixer) {
+    let n = dm_get_n(mixer)
+    let mut snap = dm_zeros(n)
+    for i in 0..n { snap[i] = mixer["weights"][i] }
+    mixer["history"] = mixer["history"] + [snap]
+    return mixer
+}
+
+fn dm_smoothed_weights(mixer, alpha) {
+    let n = dm_get_n(mixer)
+    let uniform = 1.0 / to_float(n)
+    let mut out = dm_zeros(n)
+    for i in 0..n {
+        out[i] = alpha * mixer["weights"][i] + (1.0 - alpha) * uniform
+    }
+    return dm_normalize_weights(out)
+}
+
+fn dm_entropy(weights) {
+    let n = len(weights)
+    let mut h = 0.0
+    for i in 0..n {
+        if weights[i] > 1.0e-10 {
+            h = h - weights[i] * dm_log(weights[i])
+        }
+    }
+    return h
+}
+
+fn dm_kl_from_uniform(weights) {
+    let n = len(weights)
+    let nf = to_float(n)
+    let mut kl = 0.0
+    for i in 0..n {
+        if weights[i] > 1.0e-10 {
+            kl = kl + weights[i] * dm_log(weights[i] * nf)
+        }
+    }
+    return kl
+}
+
+// ═══════════ helper: build a 3-domain mixer ═════════════════════
+
+fn build_3_domains() {
+    let d0 = dm_new_domain("code", 1.0)
+    let d1 = dm_new_domain("wiki", 1.0)
+    let d2 = dm_new_domain("books", 1.0)
+    return [d0, d1, d2]
+}
+
+fn build_unequal_domains() {
+    let d0 = dm_new_domain("code", 2.0)
+    let d1 = dm_new_domain("wiki", 1.0)
+    let d2 = dm_new_domain("books", 1.0)
+    return [d0, d1, d2]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  TESTS
+// ═══════════════════════════════════════════════════════════════════
+
+// T01: dm_new_domain fields
+let dom1 = dm_new_domain("code", 0.5)
+check("T01 domain name", dm_domain_name(dom1) == "code")
+check("T01 domain weight", approx(dm_domain_weight(dom1), 0.5, 0.001))
+
+// T02: dm_new_mixer creates N domains
+let mx2 = dm_new_mixer(build_3_domains())
+check("T02 mixer has 3 domains", dm_get_n(mx2) == 3)
+
+// T03: initial weights normalized to sum=1
+let w3 = dm_get_weights(mx2)
+let mut sum3 = 0.0
+for i in 0..3 { sum3 = sum3 + w3[i] }
+check("T03 initial weights sum=1", approx(sum3, 1.0, 0.001))
+
+// T04: domain names
+let names4 = dm_get_domain_names(mx2)
+check("T04 name[0]=code", names4[0] == "code")
+check("T04 name[1]=wiki", names4[1] == "wiki")
+check("T04 name[2]=books", names4[2] == "books")
+
+// T05: normalize_weights sum=1
+let raw5 = [3.0, 1.0, 1.0]
+let normed5 = dm_normalize_weights(raw5)
+let mut sum5 = 0.0
+for i in 0..3 { sum5 = sum5 + normed5[i] }
+check("T05 normalized sum=1", approx(sum5, 1.0, 0.001))
+check("T05 first weight=0.6", approx(normed5[0], 0.6, 0.001))
+
+// T06: normalize_weights zero vector safe (no division by zero)
+let zero6 = [0.0, 0.0, 0.0]
+let normed6 = dm_normalize_weights(zero6)
+check("T06 zero vector safe", approx(normed6[0], 0.0, 0.001))
+
+// T07: clamp_weights min floor
+let low7 = [0.01, 0.01, 0.98]
+let clamped7 = dm_clamp_weights(low7, 0.1, 0.8)
+check("T07 min floor enforced", clamped7[0] >= 0.099)
+check("T07 still sums to 1", approx(clamped7[0] + clamped7[1] + clamped7[2], 1.0, 0.001))
+
+// T08: clamp_weights max cap reduces dominant weight
+let high8 = [0.95, 0.025, 0.025]
+let clamped8 = dm_clamp_weights(high8, 0.0, 0.5)
+check("T08 max cap reduces dominant", clamped8[0] < 0.95)
+
+// T09: ema_loss decay=0 -> pure new
+let ema9 = dm_ema_loss(5.0, 2.0, 0.0)
+check("T09 ema decay=0 pure new", approx(ema9, 2.0, 0.001))
+
+// T10: ema_loss decay=1 -> pure old
+let ema10 = dm_ema_loss(5.0, 2.0, 1.0)
+check("T10 ema decay=1 pure old", approx(ema10, 5.0, 0.001))
+
+// T11: record_loss first observation
+let mut mx11 = dm_new_mixer(build_3_domains())
+mx11 = dm_record_loss(mx11, 0, 3.5)
+let losses11 = dm_get_losses(mx11)
+check("T11 first loss recorded", approx(losses11[0], 3.5, 0.001))
+
+// T12: record_loss EMA on second observation
+mx11 = dm_record_loss(mx11, 0, 1.5)
+let losses12 = dm_get_losses(mx11)
+// EMA: 0.9*3.5 + 0.1*1.5 = 3.15 + 0.15 = 3.30
+check("T12 EMA second observation", approx(losses12[0], 3.3, 0.01))
+
+// T13: record_loss out-of-range safe
+let mut mx13 = dm_new_mixer(build_3_domains())
+mx13 = dm_record_loss(mx13, -1, 5.0)
+mx13 = dm_record_loss(mx13, 99, 5.0)
+let losses13 = dm_get_losses(mx13)
+check("T13 out-of-range safe", approx(losses13[0], 0.0, 0.001))
+
+// T14: set_proxy_losses
+let mut mx14 = dm_new_mixer(build_3_domains())
+mx14 = dm_set_proxy_losses(mx14, [1.0, 2.0, 1.5])
+let pl14 = dm_get_proxy_losses(mx14)
+check("T14 proxy loss[0]=1.0", approx(pl14[0], 1.0, 0.001))
+check("T14 proxy loss[1]=2.0", approx(pl14[1], 2.0, 0.001))
+
+// T15: compute_excess_loss positive when model > proxy
+let mut mx15 = dm_new_mixer(build_3_domains())
+mx15 = dm_record_loss(mx15, 0, 5.0)
+mx15 = dm_record_loss(mx15, 1, 3.0)
+mx15 = dm_record_loss(mx15, 2, 1.0)
+mx15 = dm_set_proxy_losses(mx15, [2.0, 2.0, 2.0])
+let excess15 = dm_compute_excess_loss(mx15)
+check("T15 excess[0]=3.0 (5-2)", approx(excess15[0], 3.0, 0.01))
+check("T15 excess[1]=1.0 (3-2)", approx(excess15[1], 1.0, 0.01))
+
+// T16: excess loss zero when model <= proxy
+check("T16 excess[2]=0 (1<=2)", approx(excess15[2], 0.0, 0.01))
+
+// T17: update_weights excess domain upweighted
+let mut mx17 = dm_new_mixer(build_3_domains())
+mx17 = dm_record_loss(mx17, 0, 5.0)
+mx17 = dm_record_loss(mx17, 1, 1.0)
+mx17 = dm_record_loss(mx17, 2, 1.0)
+mx17 = dm_set_proxy_losses(mx17, [1.0, 1.0, 1.0])
+let w17_before = dm_get_weights(mx17)[0]
+mx17 = dm_update_weights(mx17, 1.0, 1)
+let w17_after = dm_get_weights(mx17)[0]
+check("T17 high-loss domain upweighted", w17_after > w17_before)
+
+// T18: update_weights zero excess preserves (all equal)
+let mut mx18 = dm_new_mixer(build_3_domains())
+mx18 = dm_record_loss(mx18, 0, 2.0)
+mx18 = dm_record_loss(mx18, 1, 2.0)
+mx18 = dm_record_loss(mx18, 2, 2.0)
+mx18 = dm_set_proxy_losses(mx18, [2.0, 2.0, 2.0])
+mx18 = dm_update_weights(mx18, 1.0, 1)
+let w18 = dm_get_weights(mx18)
+check("T18 zero excess preserves equal", approx(w18[0], w18[1], 0.01))
+
+// T19: scheduled_update warmup reduces effective lr
+let mut mx19a = dm_new_mixer(build_3_domains())
+mx19a = dm_record_loss(mx19a, 0, 5.0)
+mx19a = dm_set_proxy_losses(mx19a, [1.0, 0.0, 0.0])
+let mut mx19b = dm_new_mixer(build_3_domains())
+mx19b = dm_record_loss(mx19b, 0, 5.0)
+mx19b = dm_set_proxy_losses(mx19b, [1.0, 0.0, 0.0])
+mx19a = dm_scheduled_update(mx19a, 1.0, 0, 10)  // step 0, warmup 10 -> lr=0.1
+mx19b = dm_scheduled_update(mx19b, 1.0, 10, 10) // step 10, past warmup -> lr=1.0
+let w19a = dm_get_weights(mx19a)[0]
+let w19b = dm_get_weights(mx19b)[0]
+// full lr should shift weight more
+let diff19a = dm_abs(w19a - 1.0 / 3.0)
+let diff19b = dm_abs(w19b - 1.0 / 3.0)
+check("T19 warmup reduces weight shift", diff19a < diff19b)
+
+// T20: sample_domain returns valid index
+let mut mx20 = dm_new_mixer(build_3_domains())
+let idx20 = dm_sample_domain(mx20, 42)
+check("T20 sample_domain valid index", idx20 >= 0)
+check("T20 sample_domain < n", idx20 < 3)
+
+// T21: sample_batch correct size
+let mut mx21 = dm_new_mixer(build_3_domains())
+let res21 = dm_sample_batch(mx21, 10, 123)
+let batch21 = res21["batch"]
+mx21 = res21["mixer"]
+check("T21 batch size=10", len(batch21) == 10)
+
+// T22: domain_sample_counts sum = batch_size
+let counts22 = dm_domain_sample_counts(mx21, batch21)
+let sum22 = counts22[0] + counts22[1] + counts22[2]
+check("T22 counts sum=batch_size", sum22 == 10)
+
+// T23: snapshot_weights history grows
+let mut mx23 = dm_new_mixer(build_3_domains())
+mx23 = dm_snapshot_weights(mx23)
+mx23 = dm_snapshot_weights(mx23)
+let hist23 = dm_get_history(mx23)
+check("T23 history length=2", len(hist23) == 2)
+check("T23 snapshot has 3 values", len(hist23[0]) == 3)
+
+// T24: smoothed_weights alpha=1 returns current
+let mut mx24 = dm_new_mixer(build_unequal_domains())
+let sm24 = dm_smoothed_weights(mx24, 1.0)
+let w24 = dm_get_weights(mx24)
+check("T24 alpha=1 returns current", approx(sm24[0], w24[0], 0.001))
+
+// T25: smoothed_weights alpha=0 returns uniform
+let sm25 = dm_smoothed_weights(mx24, 0.0)
+check("T25 alpha=0 uniform", approx(sm25[0], 1.0 / 3.0, 0.001))
+check("T25 alpha=0 uniform all equal", approx(sm25[0], sm25[1], 0.001))
+
+// T26: entropy of uniform = max entropy = ln(n)
+let uniform_w = [1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0]
+let ent26 = dm_entropy(uniform_w)
+let max_ent = dm_log(3.0)
+check("T26 uniform max entropy", approx(ent26, max_ent, 0.05))
+
+// T27: entropy of peaked < max
+let peaked_w = [0.9, 0.05, 0.05]
+let ent27 = dm_entropy(peaked_w)
+check("T27 peaked < max entropy", ent27 < ent26)
+
+// T28: kl_from_uniform: uniform = 0
+let kl28 = dm_kl_from_uniform(uniform_w)
+check("T28 KL uniform=0", approx(kl28, 0.0, 0.05))
+
+// T29: kl_from_uniform: peaked > 0
+let kl29 = dm_kl_from_uniform(peaked_w)
+check("T29 KL peaked>0", kl29 > 0.0)
+
+// T30: total_samples tracks cumulative
+let mut mx30 = dm_new_mixer(build_3_domains())
+let res30a = dm_sample_batch(mx30, 5, 1)
+mx30 = res30a["mixer"]
+let res30b = dm_sample_batch(mx30, 7, 2)
+mx30 = res30b["mixer"]
+check("T30 total_samples=12", dm_total_samples(mx30) == 12)
+
+// T31: weight evolution — repeated updates shift toward high-loss domain
+let mut mx31 = dm_new_mixer(build_3_domains())
+mx31 = dm_set_proxy_losses(mx31, [1.0, 1.0, 1.0])
+// Domain 0 consistently has higher loss
+for _step in 0..10 {
+    mx31 = dm_record_loss(mx31, 0, 5.0)
+    mx31 = dm_record_loss(mx31, 1, 1.0)
+    mx31 = dm_record_loss(mx31, 2, 1.0)
+    mx31 = dm_update_weights(mx31, 0.5, _step)
+}
+let w31 = dm_get_weights(mx31)
+check("T31 high-loss domain dominates after 10 updates", w31[0] > w31[1])
+check("T31 high-loss domain > 0.5", w31[0] > 0.5)
+
+// T32: high-weight domain sampled more in batch
+let mut mx32 = dm_new_mixer(build_3_domains())
+// Manually set weights to heavily favor domain 0
+mx32["weights"][0] = 0.8
+mx32["weights"][1] = 0.1
+mx32["weights"][2] = 0.1
+let res32 = dm_sample_batch(mx32, 100, 7777)
+let batch32 = res32["batch"]
+mx32 = res32["mixer"]
+let counts32 = dm_domain_sample_counts(mx32, batch32)
+check("T32 high-weight domain sampled most", counts32[0] > counts32[1])
+check("T32 high-weight domain > 50 of 100", counts32[0] > 50)
+
+// ═══════════════════════════════════════════════════════════════════
+println("")
+println("=== data_mixing test summary ===")
+println("PASS: " + str(pass_count))
+println("FAIL: " + str(fail_count))
+println("TOTAL: " + str(pass_count + fail_count))
