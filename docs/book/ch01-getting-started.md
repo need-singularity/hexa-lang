@@ -169,12 +169,13 @@ $ hexa --test my_tests.hexa
 2/2 proofs passed
 ```
 
-## JIT Compilation
+## Native Compilation
 
-For performance-critical code, use the `--native` flag to enable Cranelift JIT (818x faster than tree-walk interpretation):
+For performance-critical code, use `hexa build` to compile via the self-host C codegen path (600~1300x faster than tree-walk interpretation):
 
 ```bash
-$ hexa --native fibonacci.hexa
+$ hexa build fibonacci.hexa
+$ ./fibonacci
 ```
 
 ## What Next?

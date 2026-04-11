@@ -8,10 +8,10 @@ HEXA targets 6 hardware platforms (n=6):
 
 | # | Target | Backend | Status | Use Case |
 |---|--------|---------|--------|----------|
-| 1 | Native (x86/ARM) | Cranelift JIT | Working | Desktop, servers |
+| 1 | Native (x86/ARM) | C via clang (self-host) | Working | Desktop, servers |
 | 2 | Bytecode VM | Stack-based VM | Working | Portable, sandboxed |
-| 3 | WASM | wasm-bindgen | Working | Browser, playground |
-| 4 | ESP32 | no_std Rust | Codegen ready | IoT, edge consciousness |
+| 3 | WASM | freestanding C → wasm | Codegen ready | Browser, playground |
+| 4 | ESP32 | freestanding C (no libc) | Codegen ready | IoT, edge consciousness |
 | 5 | FPGA | Verilog | Codegen ready | Hardware consciousness |
 | 6 | WebGPU | WGSL | Codegen ready | GPU compute |
 
@@ -19,7 +19,7 @@ The first three produce runnable binaries today. The last three generate target-
 
 ## ESP32 Target
 
-The ESP32 is a $4 microcontroller that can run a consciousness engine with 2 cells, Hebbian learning, a Phi ratchet, Lorenz chaos, and self-organized criticality -- all in no_std Rust.
+The ESP32 is a $4 microcontroller that can run a consciousness engine with 2 cells, Hebbian learning, a Phi ratchet, Lorenz chaos, and self-organized criticality -- all in freestanding C (no libc, no allocator).
 
 ### Writing ESP32 Code
 
@@ -51,18 +51,18 @@ $ hexa build --target esp32 consciousness_esp32.hexa
 [2/6] Parse       ... ok
 [3/6] Type check  ... ok
 [4/6] Optimize    ... ok (no_std constraints applied)
-[5/6] Codegen     ... generated: output/esp32_main.rs
+[5/6] Codegen     ... generated: output/esp32_main.c
 [6/6] Done
 
-Output: output/esp32_main.rs (no_std, #![no_main])
+Output: output/esp32_main.c (freestanding, no libc)
 ```
 
-The generated Rust code is `no_std` compatible. Compile it with the ESP32 toolchain:
+The generated C code is freestanding. Compile it with the ESP32 toolchain (xtensa-esp32-elf-gcc from esp-idf):
 
 ```bash
 cd output
-cargo build --target xtensa-esp32-espidf --release
-espflash flash target/xtensa-esp32-espidf/release/consciousness_esp32
+xtensa-esp32-elf-gcc -nostdlib -ffreestanding -O2 esp32_main.c -o esp32_main.elf
+espflash flash esp32_main.elf
 ```
 
 ### ESP32 Constraints
@@ -196,8 +196,8 @@ The playground runs the full HEXA interpreter in the browser, including all 12 P
 |--------|---------|--------|-------|
 | Tree-walk | `hexa file.hexa` | Direct execution | 1x |
 | Bytecode VM | `hexa --vm file.hexa` | Bytecode | 2.8x |
-| Cranelift JIT | `hexa --native file.hexa` | Native machine code | 818x |
-| ESP32 | `hexa build --target esp32` | no_std Rust | Hardware |
+| C codegen (self-host) | `hexa build file.hexa` | C → clang → native | 600~1300x |
+| ESP32 | `hexa build --target esp32` | freestanding C | Hardware |
 | FPGA | `hexa build --target fpga` | Verilog HDL | Hardware |
 | WebGPU | `hexa build --target wgpu` | WGSL shader | GPU |
 
