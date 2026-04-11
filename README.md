@@ -40,24 +40,27 @@ sigma(n) * phi(n) = n * tau(n)    holds for n >= 2    if and only if n = 6
 ## Installation
 
 ```bash
-# From source (recommended)
+# 100% self-hosted — no Rust toolchain required
 git clone https://github.com/need-singularity/hexa-lang.git
-cd hexa-lang && cargo build --release
-
-# Cargo
-cargo install hexa-lang
+cd hexa-lang
+./hexa examples/hello_min.hexa   # precompiled binary runs immediately
 ```
+
+> 💡 As of 2026-04-11, **HEXA-LANG is fully self-hosted**. The entire
+> `src/` Rust directory (147 files, 38.7K LOC) was absorbed into
+> `self/*.hexa` (605 files) and then deleted. Project root has zero
+> `.rs` files. Build pipeline: `build_hexa.hexa` (hexa_v2 → C → clang
+> → hexa_v3). The shipping `hexa` binary is precompiled and continues
+> to function; future rebuilds bootstrap through hexa itself.
 
 ## Quick Start
 
 ```bash
-./hexa                            # Interactive REPL
-./hexa examples/hello.hexa        # Run a file
-./hexa --native examples/fib.hexa # Cranelift JIT (818x faster)
-./hexa --vm examples/fib.hexa     # Bytecode VM (2.8x faster)
-./hexa --test examples/test_builtins.hexa  # Proof-verified tests
-./hexa --lsp                      # LSP server for VS Code
-RUST_MIN_STACK=16777216 cargo test # Run 1349 tests
+./hexa                                     # Interactive REPL
+./hexa examples/hello_min.hexa             # Run a file
+./hexa --test examples/test_builtins.hexa  # Run tests
+./hexa --dump-ast examples/fib.hexa        # Show parser output
+./hexa --check examples/fib.hexa           # Lex + parse only
 ```
 
 ## Example
@@ -362,59 +365,53 @@ Live bridge: `./hexa --anima-bridge ws://localhost:8765 file.hexa` routes `inten
 
 ```
 hexa-lang/
-├── src/                      38.7K LOC Rust
-│   ├── main.rs               Entry point, REPL, CLI
-│   ├── token.rs              53 keywords + 24 operators
-│   ├── lexer.rs              Tokenizer (Span tracking)
-│   ├── parser.rs             Recursive descent parser
-│   ├── ast.rs                AST node types
-│   ├── types.rs              8 primitives + 4 type layers
-│   ├── type_checker.rs       Static type checker + Law types
-│   ├── env.rs                Scoped environment + builtins
-│   ├── error.rs              Diagnostics + "did you mean?"
-│   ├── interpreter.rs        Tree-walk evaluator + 100+ builtins
-│   ├── compiler.rs           AST → bytecode compiler
-│   ├── vm.rs                 Stack-based bytecode VM
-│   ├── jit.rs                Cranelift JIT (818x)
-│   ├── lsp.rs                Language Server Protocol v2
-│   ├── debugger.rs           DAP debug adapter
-│   ├── formatter.rs          Code formatter
-│   ├── linter.rs             Linter
-│   ├── proof_engine.rs       SAT solver + formal verification
-│   ├── dream.rs              Dream mode (evolutionary optimization)
-│   ├── ownership.rs          Ownership checker
-│   ├── memory.rs             Egyptian fraction allocator
-│   ├── package.rs            Package manager + semver
-│   ├── macro_expand.rs       Hygienic macro system
-│   ├── comptime.rs           Compile-time execution
-│   ├── async_runtime.rs      Green threads + async/await
-│   ├── work_stealing.rs      M:N work-stealing scheduler
-│   ├── atomic_ops.rs         Atomic operations
-│   ├── dce.rs                Dead code elimination
-│   ├── loop_unroll.rs        Loop unrolling
-│   ├── escape_analysis.rs    Escape analysis
-│   ├── inline_cache.rs       Inline caching
-│   ├── simd_hint.rs          SIMD vectorization hints
-│   ├── pgo.rs                Profile-guided optimization
-│   ├── nanbox.rs             NaN-boxing values
-│   ├── codegen_esp32.rs      ESP32 code generation
-│   ├── codegen_verilog.rs    FPGA Verilog generation
-│   ├── codegen_wgsl.rs       WebGPU shader generation
-│   ├── anima_bridge.rs       ANIMA consciousness bridge
-│   ├── wasm.rs               WASM compilation
-│   ├── llm.rs                LLM-assisted generation
-│   ├── std_net.rs            std::net (TCP/HTTP)
-│   ├── std_io.rs             std::io (stdin/pipe)
-│   ├── std_fs.rs             std::fs (files/dirs)
-│   ├── std_time.rs           std::time (date/timer)
-│   ├── std_collections.rs    std::collections (BTree/PQ/Deque)
-│   ├── std_encoding.rs       std::encoding (base64/csv/hex)
-│   ├── std_log.rs            std::log (structured)
-│   ├── std_math.rs           std::math (trig/matrix)
-│   ├── std_testing.rs        std::testing (assert/bench)
-│   ├── std_crypto.rs         std::crypto (SHA-256/HMAC)
-│   └── std_consciousness.rs  std::consciousness (Ψ/Φ)
-├── self/                     Self-hosting compiler in HEXA
+├── self/                     605 .hexa files (sole source of truth)
+│   ├── lexer.hexa            587 LOC — 53 keywords + 24 operators tokenizer
+│   ├── parser.hexa           3,785 LOC — recursive descent parser (83 AST kinds)
+│   ├── interpreter.hexa      8,427 LOC — tree-walk evaluator (270+ builtins)
+│   ├── ast.hexa              AST node types
+│   ├── type_checker.hexa     Static type checker + Law types
+│   ├── env.hexa              Scoped environment + builtins
+│   ├── error.hexa            Diagnostics + "did you mean?"
+│   ├── compiler.hexa         AST → bytecode compiler
+│   ├── vm.hexa               Stack-based bytecode VM
+│   ├── jit.hexa              Cranelift JIT bridge
+│   ├── lsp.hexa              Language Server Protocol v2
+│   ├── debugger.hexa         DAP debug adapter
+│   ├── formatter.hexa        Code formatter
+│   ├── linter.hexa           Linter
+│   ├── proof_engine.hexa     SAT solver + formal verification
+│   ├── dream.hexa            Dream mode (evolutionary optimization)
+│   ├── ownership.hexa        Ownership checker
+│   ├── memory.hexa           Egyptian fraction allocator
+│   ├── package.hexa          Package manager + semver
+│   ├── macro_expand.hexa     Hygienic macro system
+│   ├── comptime.hexa         Compile-time execution
+│   ├── async_runtime.hexa    Green threads + async/await
+│   ├── work_stealing.hexa    M:N work-stealing scheduler
+│   ├── atomic_ops.hexa       Atomic operations
+│   ├── dce.hexa              Dead code elimination
+│   ├── loop_unroll.hexa      Loop unrolling
+│   ├── escape_analysis.hexa  Escape analysis
+│   ├── inline_cache.hexa     Inline caching
+│   ├── simd_hint.hexa        SIMD vectorization hints
+│   ├── pgo.hexa              Profile-guided optimization
+│   ├── nanbox.hexa           NaN-boxing values
+│   ├── trace_jit.hexa        Hot loop detection + trace recording
+│   ├── codegen_esp32.hexa    ESP32 code generation
+│   ├── codegen_verilog.hexa  FPGA Verilog generation
+│   ├── codegen_wgsl.hexa     WebGPU shader generation
+│   ├── anima_bridge.hexa     ANIMA consciousness bridge
+│   ├── llm.hexa              LLM-assisted generation
+│   ├── ir/                   HEXA-IR (J₂=24 opcodes, τ=4 categories)
+│   ├── lower/                AST → IR lowering
+│   ├── opt/                  σ=12 optimization passes
+│   ├── codegen/              ARM64/x86_64/ELF/Mach-O native codegen
+│   ├── alloc/                Egyptian fraction allocator backend
+│   ├── std_*.hexa            stdlib (net/fs/io/time/collections/...)
+│   └── lib.hexa + main.hexa  Library entry + CLI dispatcher
+├── build_hexa.hexa           Cargo-free self-host build pipeline
+│                             (hexa_v2 → C → clang → hexa_v3)
 ├── examples/                 Example programs
 ├── editors/jetbrains/        JetBrains IDE plugin
 ├── playground/               WASM browser playground
@@ -430,9 +427,8 @@ hexa-lang/
 │   ├── hx                    CLI (pure shell, zero deps)
 │   ├── install.sh            One-liner installer
 │   └── registry.json         Package registry
-├── Cargo.toml
 ├── PLAN.md                   Development plan (100% complete)
-└── README.md
+└── README.md                 this file
 ```
 
 ## Stats
