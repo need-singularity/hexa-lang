@@ -1,0 +1,355 @@
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/physics_informed_nn.hexa — Physics-Informed NN (#251)
+//
+//  PDE residual loss training (PINN).
+//    loss = lambda_data * MSE(u_pred, u_data)
+//         + lambda_pde  * ||PDE residual||^2
+//
+//  Implements:
+//    1. Small MLP surrogate u_theta(x, t) (2->H->1)
+//    2. Analytic forward (dense MLP)
+//    3. Finite-difference derivatives (central) for PDE residuals
+//    4. Heat equation residual:  du/dt - nu * d2u/dx2
+//    5. Burgers residual:        du/dt + u * du/dx - nu * d2u/dx2
+//    6. Total loss + simple SGD step on 2-layer MLP
+//    7. Train loop demonstrating residual minimization
+//
+//  AI-NATIVE attrs:
+//    @pure — no side effects
+//    @hot  — called per residual point
+// ═══════════════════════════════════════════════════════════════
+
+// ── scalar helpers ───────────────────────────────────────────
+
+fn pinn_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn pinn_max(a, b) {
+    if a > b { return a }
+    return b
+}
+
+// Stable tanh via exp
+@pure
+fn pinn_tanh(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = 0.0 - 20.0 }
+    let e2 = exp(2.0 * v)
+    return (e2 - 1.0) / (e2 + 1.0)
+}
+
+// dtanh/dx = 1 - tanh(x)^2
+@pure
+fn pinn_dtanh(x) {
+    let t = pinn_tanh(x)
+    return 1.0 - t * t
+}
+
+// Deterministic pseudo-random for weight init in [-r, r]
+fn pinn_hash(seed, i, j) {
+    let h = (seed * 2654435761 + i * 1315423911 + j * 731) % 10007
+    return to_float(h) / 10007.0 - 0.5
+}
+
+fn pinn_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn pinn_zeros2d(m, n) {
+    let mut w = []
+    for _i in 0..m {
+        w = w + [pinn_zeros(n)]
+    }
+    return w
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  (1) Model struct: 2 -> H -> 1 MLP with tanh
+//
+//   u(x, t) = W2 @ tanh(W1 @ [x, t] + b1) + b2
+//
+//  Parameters stored as dict for ease of update.
+// ═══════════════════════════════════════════════════════════════
+fn pinn_init_mlp(hidden, seed) {
+    let mut W1 = pinn_zeros2d(hidden, 2)
+    let mut b1 = pinn_zeros(hidden)
+    let mut W2 = pinn_zeros2d(1, hidden)
+    let mut b2 = pinn_zeros(1)
+
+    let scale = 0.5
+    for i in 0..hidden {
+        for j in 0..2 {
+            W1[i][j] = scale * pinn_hash(seed, i, j)
+        }
+        b1[i] = 0.1 * pinn_hash(seed + 7, i, 0)
+    }
+    for i in 0..hidden {
+        W2[0][i] = scale * pinn_hash(seed + 13, 0, i)
+    }
+    b2[0] = 0.0
+
+    let params = #{
+        "W1": W1,
+        "b1": b1,
+        "W2": W2,
+        "b2": b2,
+        "hidden": hidden
+    }
+    return params
+}
+
+// Forward pass — returns u (scalar) given x, t
+@hot
+fn pinn_forward(params, x, t) {
+    let hidden = params["hidden"]
+    let W1 = params["W1"]
+    let b1 = params["b1"]
+    let W2 = params["W2"]
+    let b2 = params["b2"]
+
+    // hidden = tanh(W1 @ [x,t] + b1)
+    let mut h = pinn_zeros(hidden)
+    for i in 0..hidden {
+        let z = W1[i][0] * x + W1[i][1] * t + b1[i]
+        h[i] = pinn_tanh(z)
+    }
+    let mut u = b2[0]
+    for i in 0..hidden {
+        u = u + W2[0][i] * h[i]
+    }
+    return u
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  (2) Finite-difference derivatives (central)
+//
+//  du/dx ≈ (u(x+h,t) - u(x-h,t)) / (2h)
+//  du/dt ≈ (u(x,t+h) - u(x,t-h)) / (2h)
+//  d2u/dx2 ≈ (u(x+h,t) - 2 u(x,t) + u(x-h,t)) / h^2
+// ═══════════════════════════════════════════════════════════════
+fn pinn_du_dx(params, x, t, eps_h) {
+    let xp = x + eps_h
+    let xm = x - eps_h
+    let up = pinn_forward(params, xp, t)
+    let um = pinn_forward(params, xm, t)
+    let denom = 2.0 * eps_h
+    return (up - um) / denom
+}
+
+fn pinn_du_dt(params, x, t, eps_h) {
+    let tp = t + eps_h
+    let tm = t - eps_h
+    let up = pinn_forward(params, x, tp)
+    let um = pinn_forward(params, x, tm)
+    let denom = 2.0 * eps_h
+    return (up - um) / denom
+}
+
+fn pinn_d2u_dx2(params, x, t, eps_h) {
+    let xp = x + eps_h
+    let xm = x - eps_h
+    let up = pinn_forward(params, xp, t)
+    let u0 = pinn_forward(params, x, t)
+    let um = pinn_forward(params, xm, t)
+    let denom = eps_h * eps_h
+    return (up - 2.0 * u0 + um) / denom
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  (3) PDE residuals
+// ═══════════════════════════════════════════════════════════════
+
+// Heat equation: du/dt - nu * d2u/dx2 = 0
+@pure
+fn pinn_heat_residual(params, x, t, nu, eps_h) {
+    let dt = pinn_du_dt(params, x, t, eps_h)
+    let dxx = pinn_d2u_dx2(params, x, t, eps_h)
+    return dt - nu * dxx
+}
+
+// Burgers' equation: du/dt + u*du/dx - nu * d2u/dx2 = 0
+@pure
+fn pinn_burgers_residual(params, x, t, nu, eps_h) {
+    let u = pinn_forward(params, x, t)
+    let dt = pinn_du_dt(params, x, t, eps_h)
+    let dx = pinn_du_dx(params, x, t, eps_h)
+    let dxx = pinn_d2u_dx2(params, x, t, eps_h)
+    return dt + u * dx - nu * dxx
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  (4) Loss components
+//    MSE data loss on (x_i, t_i, u_i)
+//    PDE residual loss on collocation points (x_j, t_j)
+// ═══════════════════════════════════════════════════════════════
+fn pinn_data_loss(params, xs, ts, us) {
+    let n = len(xs)
+    if n == 0 { return 0.0 }
+    let mut acc = 0.0
+    for i in 0..n {
+        let pred = pinn_forward(params, xs[i], ts[i])
+        let e = pred - us[i]
+        acc = acc + e * e
+    }
+    return acc / to_float(n)
+}
+
+fn pinn_heat_pde_loss(params, xs, ts, nu, eps_h) {
+    let n = len(xs)
+    if n == 0 { return 0.0 }
+    let mut acc = 0.0
+    for i in 0..n {
+        let r = pinn_heat_residual(params, xs[i], ts[i], nu, eps_h)
+        acc = acc + r * r
+    }
+    return acc / to_float(n)
+}
+
+fn pinn_burgers_pde_loss(params, xs, ts, nu, eps_h) {
+    let n = len(xs)
+    if n == 0 { return 0.0 }
+    let mut acc = 0.0
+    for i in 0..n {
+        let r = pinn_burgers_residual(params, xs[i], ts[i], nu, eps_h)
+        acc = acc + r * r
+    }
+    return acc / to_float(n)
+}
+
+fn pinn_total_loss(params, xs_d, ts_d, us_d, xs_p, ts_p, nu, eps_h, lambda_data, lambda_pde) {
+    let ld = pinn_data_loss(params, xs_d, ts_d, us_d)
+    let lp = pinn_heat_pde_loss(params, xs_p, ts_p, nu, eps_h)
+    return lambda_data * ld + lambda_pde * lp
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  (5) Finite-difference parameter gradient + SGD step
+//
+//  For each scalar parameter p, grad = (L(p+eps) - L(p-eps)) / (2*eps).
+//  Small MLP (hidden ~ 4), fd gradient is tractable.
+// ═══════════════════════════════════════════════════════════════
+fn pinn_perturb_scalar(params, key, i, j, delta) {
+    // returns new params with params[key][i][j] += delta (or 1d if j<0)
+    let hidden = params["hidden"]
+    let W1 = params["W1"]
+    let b1 = params["b1"]
+    let W2 = params["W2"]
+    let b2 = params["b2"]
+
+    // deep copy
+    let mut W1c = pinn_zeros2d(hidden, 2)
+    for ii in 0..hidden {
+        for jj in 0..2 {
+            W1c[ii][jj] = W1[ii][jj]
+        }
+    }
+    let mut b1c = pinn_zeros(hidden)
+    for ii in 0..hidden { b1c[ii] = b1[ii] }
+    let mut W2c = pinn_zeros2d(1, hidden)
+    for ii in 0..hidden { W2c[0][ii] = W2[0][ii] }
+    let mut b2c = pinn_zeros(1)
+    b2c[0] = b2[0]
+
+    if key == "W1" {
+        W1c[i][j] = W1c[i][j] + delta
+    }
+    if key == "b1" {
+        b1c[i] = b1c[i] + delta
+    }
+    if key == "W2" {
+        W2c[0][i] = W2c[0][i] + delta
+    }
+    if key == "b2" {
+        b2c[0] = b2c[0] + delta
+    }
+
+    let new_params = #{
+        "W1": W1c,
+        "b1": b1c,
+        "W2": W2c,
+        "b2": b2c,
+        "hidden": hidden
+    }
+    return new_params
+}
+
+fn pinn_sgd_step(params, xs_d, ts_d, us_d, xs_p, ts_p, nu, eps_h, lambda_data, lambda_pde, lr, eps) {
+    let hidden = params["hidden"]
+
+    // collect grads for each param scalar
+    let mut gW1 = pinn_zeros2d(hidden, 2)
+    let mut gb1 = pinn_zeros(hidden)
+    let mut gW2 = pinn_zeros2d(1, hidden)
+    let mut gb2 = pinn_zeros(1)
+
+    for i in 0..hidden {
+        for j in 0..2 {
+            let pp = pinn_perturb_scalar(params, "W1", i, j, eps)
+            let pm = pinn_perturb_scalar(params, "W1", i, j, 0.0 - eps)
+            let lp = pinn_total_loss(pp, xs_d, ts_d, us_d, xs_p, ts_p, nu, eps_h, lambda_data, lambda_pde)
+            let lm = pinn_total_loss(pm, xs_d, ts_d, us_d, xs_p, ts_p, nu, eps_h, lambda_data, lambda_pde)
+            gW1[i][j] = (lp - lm) / (2.0 * eps)
+        }
+        let pp = pinn_perturb_scalar(params, "b1", i, 0, eps)
+        let pm = pinn_perturb_scalar(params, "b1", i, 0, 0.0 - eps)
+        let lp = pinn_total_loss(pp, xs_d, ts_d, us_d, xs_p, ts_p, nu, eps_h, lambda_data, lambda_pde)
+        let lm = pinn_total_loss(pm, xs_d, ts_d, us_d, xs_p, ts_p, nu, eps_h, lambda_data, lambda_pde)
+        gb1[i] = (lp - lm) / (2.0 * eps)
+    }
+    for i in 0..hidden {
+        let pp = pinn_perturb_scalar(params, "W2", i, 0, eps)
+        let pm = pinn_perturb_scalar(params, "W2", i, 0, 0.0 - eps)
+        let lp = pinn_total_loss(pp, xs_d, ts_d, us_d, xs_p, ts_p, nu, eps_h, lambda_data, lambda_pde)
+        let lm = pinn_total_loss(pm, xs_d, ts_d, us_d, xs_p, ts_p, nu, eps_h, lambda_data, lambda_pde)
+        gW2[0][i] = (lp - lm) / (2.0 * eps)
+    }
+    let pp0 = pinn_perturb_scalar(params, "b2", 0, 0, eps)
+    let pm0 = pinn_perturb_scalar(params, "b2", 0, 0, 0.0 - eps)
+    let lp0 = pinn_total_loss(pp0, xs_d, ts_d, us_d, xs_p, ts_p, nu, eps_h, lambda_data, lambda_pde)
+    let lm0 = pinn_total_loss(pm0, xs_d, ts_d, us_d, xs_p, ts_p, nu, eps_h, lambda_data, lambda_pde)
+    gb2[0] = (lp0 - lm0) / (2.0 * eps)
+
+    // apply SGD update
+    let W1 = params["W1"]
+    let b1 = params["b1"]
+    let W2 = params["W2"]
+    let b2 = params["b2"]
+    let mut W1n = pinn_zeros2d(hidden, 2)
+    let mut b1n = pinn_zeros(hidden)
+    let mut W2n = pinn_zeros2d(1, hidden)
+    let mut b2n = pinn_zeros(1)
+    for i in 0..hidden {
+        for j in 0..2 {
+            W1n[i][j] = W1[i][j] - lr * gW1[i][j]
+        }
+        b1n[i] = b1[i] - lr * gb1[i]
+        W2n[0][i] = W2[0][i] - lr * gW2[0][i]
+    }
+    b2n[0] = b2[0] - lr * gb2[0]
+
+    let new_params = #{
+        "W1": W1n,
+        "b1": b1n,
+        "W2": W2n,
+        "b2": b2n,
+        "hidden": hidden
+    }
+    return new_params
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  (6) Training loop
+// ═══════════════════════════════════════════════════════════════
+fn pinn_train(params, xs_d, ts_d, us_d, xs_p, ts_p, nu, eps_h, lambda_data, lambda_pde, lr, n_iters) {
+    let mut p = params
+    let eps = 1.0e-3
+    for _it in 0..n_iters {
+        p = pinn_sgd_step(p, xs_d, ts_d, us_d, xs_p, ts_p, nu, eps_h, lambda_data, lambda_pde, lr, eps)
+    }
+    return p
+}

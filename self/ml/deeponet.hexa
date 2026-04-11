@@ -1,0 +1,234 @@
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/deeponet.hexa — Neural Operator DeepONet (#261)
+//
+//  Branch-trunk function→function operator learning (Lu et al. 2021).
+//
+//  Architecture:
+//    1. Branch network: u(x_sensor_1..m) ∈ R^m → b ∈ R^p
+//    2. Trunk network:  y ∈ R^d → t ∈ R^p
+//    3. Output: G(u)(y) = Σ b_k * t_k + b_0 (bias)
+//
+//  Both branch and trunk are small MLPs with tanh activations.
+//  Training: MSE loss G(u)(y) vs true u*(y).
+//
+//  Implements:
+//    1. MLP forward (hidden-layer tanh)
+//    2. Branch-trunk DeepONet forward
+//    3. Branch-trunk MLP init
+//    4. Batch-evaluation: G(u)(y_batch) for multiple query points
+//    5. Integral operator demo data generator (antiderivative)
+//    6. MSE loss on a (u, y, G) batch
+//
+//  AI-NATIVE attrs:
+//    @pure — stateless forward
+// ═══════════════════════════════════════════════════════════════
+
+// ── helpers ───────────────────────────────────────────────────
+fn don_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn don_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn don_zeros2d(m, n) {
+    let mut w = []
+    for _i in 0..m { w = w + [don_zeros(n)] }
+    return w
+}
+
+fn don_hash(seed, i, j) {
+    let h = (seed * 2654435761 + i * 1315423911 + j * 731) % 10007
+    return to_float(h) / 10007.0 - 0.5
+}
+
+@pure
+fn don_tanh(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < (0.0 - 20.0) { v = 0.0 - 20.0 }
+    let e2 = exp(2.0 * v)
+    return (e2 - 1.0) / (e2 + 1.0)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  (1) 2-layer MLP: in_dim → hidden → out_dim
+//    Uses tanh activation on hidden only (linear output).
+// ═══════════════════════════════════════════════════════════════
+fn don_init_mlp(in_dim, hidden, out_dim, seed) {
+    let mut W1 = don_zeros2d(hidden, in_dim)
+    let mut b1 = don_zeros(hidden)
+    let mut W2 = don_zeros2d(out_dim, hidden)
+    let mut b2 = don_zeros(out_dim)
+    for i in 0..hidden {
+        for j in 0..in_dim {
+            W1[i][j] = 0.5 * don_hash(seed, i, j)
+        }
+        b1[i] = 0.1 * don_hash(seed + 3, i, 0)
+    }
+    for i in 0..out_dim {
+        for j in 0..hidden {
+            W2[i][j] = 0.5 * don_hash(seed + 5, i, j)
+        }
+        b2[i] = 0.1 * don_hash(seed + 7, i, 0)
+    }
+    let mlp = #{
+        "W1": W1,
+        "b1": b1,
+        "W2": W2,
+        "b2": b2,
+        "in_dim": in_dim,
+        "hidden": hidden,
+        "out_dim": out_dim
+    }
+    return mlp
+}
+
+@pure
+fn don_mlp_forward(mlp, x) {
+    let in_dim = mlp["in_dim"]
+    let hidden = mlp["hidden"]
+    let out_dim = mlp["out_dim"]
+    let W1 = mlp["W1"]
+    let b1 = mlp["b1"]
+    let W2 = mlp["W2"]
+    let b2 = mlp["b2"]
+
+    let mut h = don_zeros(hidden)
+    for i in 0..hidden {
+        let mut acc = b1[i]
+        for j in 0..in_dim {
+            acc = acc + W1[i][j] * x[j]
+        }
+        h[i] = don_tanh(acc)
+    }
+
+    let mut out = don_zeros(out_dim)
+    for i in 0..out_dim {
+        let mut acc = b2[i]
+        for j in 0..hidden {
+            acc = acc + W2[i][j] * h[j]
+        }
+        out[i] = acc
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  (2) DeepONet: branch + trunk + bias
+//  forward(u, y) = dot(branch(u), trunk(y)) + bias
+// ═══════════════════════════════════════════════════════════════
+fn don_init(sensor_dim, query_dim, hidden_b, hidden_t, p, seed) {
+    let branch = don_init_mlp(sensor_dim, hidden_b, p, seed)
+    let trunk = don_init_mlp(query_dim, hidden_t, p, seed + 100)
+    let net = #{
+        "branch": branch,
+        "trunk": trunk,
+        "bias": 0.0,
+        "p": p,
+        "sensor_dim": sensor_dim,
+        "query_dim": query_dim
+    }
+    return net
+}
+
+@pure
+fn don_forward(net, u, y) {
+    let branch = net["branch"]
+    let trunk = net["trunk"]
+    let p = net["p"]
+    let bias = net["bias"]
+    let b_vec = don_mlp_forward(branch, u)
+    let t_vec = don_mlp_forward(trunk, y)
+    let mut s = bias
+    for k in 0..p {
+        s = s + b_vec[k] * t_vec[k]
+    }
+    return s
+}
+
+// Batch over query points y_batch (returns [n_query])
+fn don_forward_batch(net, u, y_batch) {
+    let nq = len(y_batch)
+    let mut out = don_zeros(nq)
+    for i in 0..nq {
+        out[i] = don_forward(net, u, y_batch[i])
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  (3) MSE loss on (u, y_batch, g_batch)
+//    g_batch[i] = true G(u)(y_batch[i])
+// ═══════════════════════════════════════════════════════════════
+fn don_mse_loss(net, u, y_batch, g_batch) {
+    let n = len(y_batch)
+    if n == 0 { return 0.0 }
+    let mut acc = 0.0
+    for i in 0..n {
+        let pred = don_forward(net, u, y_batch[i])
+        let e = pred - g_batch[i]
+        acc = acc + e * e
+    }
+    return acc / to_float(n)
+}
+
+// Multi-input batch: many functions (u_k, y_k_batch, g_k_batch)
+fn don_mse_loss_dataset(net, us, y_batches, g_batches) {
+    let K = len(us)
+    if K == 0 { return 0.0 }
+    let mut total = 0.0
+    for k in 0..K {
+        total = total + don_mse_loss(net, us[k], y_batches[k], g_batches[k])
+    }
+    return total / to_float(K)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  (4) Antiderivative integral operator demo
+//
+//  G(u)(y) = ∫_0^y u(x) dx
+//
+//  For sensors at fixed grid {x_1,..,x_m} with u discretized, this is a
+//  simple test case to verify the DeepONet setup works.
+// ═══════════════════════════════════════════════════════════════
+fn don_antiderivative(u, y, x_grid) {
+    // Trapezoidal rule up to y
+    let m = len(x_grid)
+    if m == 0 { return 0.0 }
+    if y <= x_grid[0] { return 0.0 }
+
+    let mut acc = 0.0
+    let mut i = 0
+    for _guard in 0..m {
+        if i + 1 >= m { return acc }
+        let x_a = x_grid[i]
+        let x_b = x_grid[i + 1]
+        if y >= x_b {
+            acc = acc + 0.5 * (u[i] + u[i + 1]) * (x_b - x_a)
+            i = i + 1
+        } else {
+            // partial segment x_a .. y
+            let u_a = u[i]
+            let u_b = u[i + 1]
+            let span = x_b - x_a
+            let frac = (y - x_a) / span
+            let u_y = u_a + frac * (u_b - u_a)
+            acc = acc + 0.5 * (u_a + u_y) * (y - x_a)
+            return acc
+        }
+    }
+    return acc
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  (5) Simple FD parameter perturbation for training (small branch/trunk)
+//  Intended for hidden=4, p=4: tractable FD loop.
+// ═══════════════════════════════════════════════════════════════
+fn don_loss_scalar(net, u, y_batch, g_batch) {
+    return don_mse_loss(net, u, y_batch, g_batch)
+}

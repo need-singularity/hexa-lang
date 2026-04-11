@@ -1,0 +1,283 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/dp_sgd.hexa — Differentially Private SGD (#257)
+//
+//  Per-sample clipped gradients + Gaussian noise:
+//      g_i        = ∇ℓ(x_i; W)
+//      ĝ_i        = g_i * min(1, C / ||g_i||)
+//      g_batch    = (1/B) * ( Σ_i ĝ_i + N(0, σ²C²·I) )
+//      W         <- W - η * g_batch
+//
+//  Simplified RDP accountant (subsampled Gaussian): Opacus-style
+//  analytic bound
+//      ε(α) ≈ α / (2 σ²) * q² * steps,  α > 1
+//  choose α that minimises ε(α) + log(1/δ) / (α-1).
+//
+//  API:
+//    dps_l2_norm(v)                              -> float
+//    dps_per_sample_grad(W, x, y)                -> [[float]]    (simple linear MSE model)
+//    dps_clip_grad(grad, C)                      -> [[float]]
+//    dps_gauss_noise_2d(rows, cols, sigma, seed) -> [[float]]
+//    dps_train_step(W, X, Y, lr, C, sigma, seed) -> [[float]]
+//    dps_rdp_eps(q, sigma, steps, delta)         -> float
+//    dps_loss_mse(W, X, Y)                       -> float
+//
+//  AI-NATIVE attrs:
+//    @pure
+//    @hot   — called every step
+// ═══════════════════════════════════════════════════════════════════
+
+fn dps_abs(x) { if x < 0.0 { return 0.0 - x } return x }
+
+fn dps_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 { g = (g + x / g) / 2.0 }
+    return g
+}
+
+fn dps_log(x) {
+    if x <= 0.0 { return -30.0 }
+    let mut v = x
+    let mut count = 0
+    while v > 2.0 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    let d = v - 1.0
+    let ln_v = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_v
+}
+
+fn dps_zeros_2d(r, c) {
+    let mut m = []
+    for _i in 0..r {
+        let mut row = []
+        for _j in 0..c { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+fn dps_copy_2d(w) {
+    let rows = len(w)
+    let cols = len(w[0])
+    let mut out = []
+    for i in 0..rows {
+        let mut row = []
+        for j in 0..cols { row = row + [w[i][j]] }
+        out = out + [row]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (1) Matrix L2 norm
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn dps_l2_norm(g) {
+    let rows = len(g)
+    let cols = len(g[0])
+    let mut s = 0.0
+    for i in 0..rows {
+        for j in 0..cols {
+            s = s + g[i][j] * g[i][j]
+        }
+    }
+    return dps_sqrt(s)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (2) Per-sample gradient for a linear MSE model
+//       y_hat = W x          L_i = 0.5 * ||y_hat - y_i||²
+//       ∇_W L_i = (y_hat - y_i) ⊗ x_i
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn dps_per_sample_grad(W, x, y) {
+    let rows = len(W)
+    let cols = len(W[0])
+    // forward
+    let mut y_hat = []
+    for i in 0..rows {
+        let mut s = 0.0
+        for j in 0..cols { s = s + W[i][j] * x[j] }
+        y_hat = y_hat + [s]
+    }
+    // gradient = (y_hat - y) outer x
+    let mut grad = dps_zeros_2d(rows, cols)
+    for i in 0..rows {
+        let err = y_hat[i] - y[i]
+        for j in 0..cols {
+            grad[i][j] = err * x[j]
+        }
+    }
+    return grad
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (3) Clip gradient matrix to L2 ball of radius C
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn dps_clip_grad(g, C) {
+    let rows = len(g)
+    let cols = len(g[0])
+    let nrm = dps_l2_norm(g)
+    if nrm <= C { return dps_copy_2d(g) }
+    let scale = C / nrm
+    let mut out = dps_zeros_2d(rows, cols)
+    for i in 0..rows {
+        for j in 0..cols {
+            out[i][j] = g[i][j] * scale
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (4) Gaussian noise via Box–Muller (deterministic LCG seed)
+// ═══════════════════════════════════════════════════════════════════
+fn dps_lcg(state) {
+    let s = (state * 1103515245 + 12345) % 2147483648
+    return s
+}
+
+fn dps_uniform01(state) {
+    let s2 = dps_lcg(state)
+    let u = to_float(s2) / 2147483648.0
+    return [u, s2]
+}
+
+fn dps_gauss_pair(state) {
+    let p1 = dps_uniform01(state)
+    let mut u1 = p1[0]
+    let s1 = p1[1]
+    if u1 < 1.0e-9 { u1 = 1.0e-9 }
+    let p2 = dps_uniform01(s1)
+    let u2 = p2[0]
+    let s2 = p2[1]
+    // Box-Muller
+    let r = dps_sqrt(-2.0 * dps_log(u1))
+    // Approximate cos/sin(2π u2) with Taylor
+    let theta = 6.2831853 * u2
+    let c = dps_cos(theta)
+    let s = dps_sin(theta)
+    let z0 = r * c
+    let z1 = r * s
+    return [z0, z1, to_float(s2)]
+}
+
+fn dps_cos(x) {
+    // Wrap to [-π, π]
+    let mut v = x
+    while v > 3.14159265 { v = v - 6.2831853 }
+    while v < -3.14159265 { v = v + 6.2831853 }
+    let v2 = v * v
+    return 1.0 - v2 / 2.0 + v2 * v2 / 24.0 - v2 * v2 * v2 / 720.0
+}
+
+fn dps_sin(x) {
+    let mut v = x
+    while v > 3.14159265 { v = v - 6.2831853 }
+    while v < -3.14159265 { v = v + 6.2831853 }
+    let v2 = v * v
+    return v - v * v2 / 6.0 + v * v2 * v2 / 120.0 - v * v2 * v2 * v2 / 5040.0
+}
+
+fn dps_gauss_noise_2d(rows, cols, sigma, seed) {
+    let mut state = seed
+    if state <= 0 { state = 1 }
+    let mut out = dps_zeros_2d(rows, cols)
+    let mut have = 0.0
+    let mut have_flag = false
+    for i in 0..rows {
+        for j in 0..cols {
+            if have_flag {
+                out[i][j] = have * sigma
+                have_flag = false
+            } else {
+                let g = dps_gauss_pair(state)
+                out[i][j] = g[0] * sigma
+                have = g[1]
+                have_flag = true
+                state = int(g[2])
+                if state <= 0 { state = 1 }
+            }
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (5) DP-SGD step
+//
+//      g_batch = (1/B) * (Σ clip(g_i) + N(0, σ²C²·I))
+//      W      -= η g_batch
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn dps_train_step(W, X, Y, lr, C, sigma, seed) {
+    let B = len(X)
+    let rows = len(W)
+    let cols = len(W[0])
+    let mut acc = dps_zeros_2d(rows, cols)
+    for b in 0..B {
+        let g = dps_per_sample_grad(W, X[b], Y[b])
+        let g_clipped = dps_clip_grad(g, C)
+        for i in 0..rows {
+            for j in 0..cols {
+                acc[i][j] = acc[i][j] + g_clipped[i][j]
+            }
+        }
+    }
+    let noise = dps_gauss_noise_2d(rows, cols, sigma * C, seed)
+    let Bf = to_float(B)
+    let mut new_W = dps_copy_2d(W)
+    for i in 0..rows {
+        for j in 0..cols {
+            let g_batch = (acc[i][j] + noise[i][j]) / Bf
+            new_W[i][j] = new_W[i][j] - lr * g_batch
+        }
+    }
+    return new_W
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (6) RDP accountant — ε(δ) bound via subsampled Gaussian (α=2)
+//
+//      Simplified: ε ≈ q² steps / σ²  +  log(1/δ)
+//  Good enough for unit-test monotonicity checks.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn dps_rdp_eps(q, sigma, steps, delta) {
+    if sigma <= 0.0 { return 1.0e9 }
+    let s2 = sigma * sigma
+    let qsq = q * q
+    let core = qsq * to_float(steps) / s2
+    let log_term = dps_log(1.0 / delta)
+    return core + log_term
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (7) MSE loss helper
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn dps_loss_mse(W, X, Y) {
+    let B = len(X)
+    let rows = len(W)
+    let cols = len(W[0])
+    let mut total = 0.0
+    for b in 0..B {
+        let mut ss = 0.0
+        for i in 0..rows {
+            let mut yhat = 0.0
+            for j in 0..cols { yhat = yhat + W[i][j] * X[b][j] }
+            let d = yhat - Y[b][i]
+            ss = ss + d * d
+        }
+        total = total + 0.5 * ss
+    }
+    return total / to_float(B)
+}
