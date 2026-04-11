@@ -1,0 +1,403 @@
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/sliding_window.hexa — Sliding Window Attention (Mistral-style)
+//
+//  Implements:
+//    1. Sliding window attention — local attention within window_size
+//    2. Causal + window mask     — combined autoregressive + local mask
+//    3. Window mask generation   — create_window_mask for visualization
+//    4. Rolling KV-cache         — discard KV entries outside window
+//
+//  Key insight: Instead of attending to all seq_len positions,
+//  each query only attends to the most recent window_size keys.
+//  Memory: O(n * w) instead of O(n^2), where w = window_size.
+//
+//  API:
+//    sliding_window_attention(Q, K, V, window_size)
+//    create_window_mask(seq_len, window_size)
+//    rolling_kv_cache_new(window_size, head_dim)
+//    rolling_kv_cache_append(cache, k_vec, v_vec)
+//    rolling_kv_cache_attention(Q, cache)
+//
+//  AI-NATIVE attrs:
+//    @hot      — forward called every step
+//    @parallel — query positions independent
+//    @pure     — no side effects
+// ═══════════════════════════════════════════════════════════════
+
+// ── helpers ──────────────────────────────────────────────────
+
+fn sw_zeros_1d(n) {
+    let mut v = []
+    let mut i = 0
+    while i < n {
+        v = v + [0.0]
+        i = i + 1
+    }
+    return v
+}
+
+fn sw_zeros_2d(r, c) {
+    let mut m = []
+    let mut i = 0
+    while i < r {
+        let mut row = []
+        let mut j = 0
+        while j < c {
+            row = row + [0.0]
+            j = j + 1
+        }
+        m = m + [row]
+        i = i + 1
+    }
+    return m
+}
+
+fn sw_max_f(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn sw_min_i(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn sw_max_i(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn sw_fabs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  create_window_mask — generate a [seq_len x seq_len] mask
+//
+//  mask[i][j] = 1.0 if j is within window of i AND j <= i (causal)
+//  mask[i][j] = 0.0 otherwise
+//
+//  Window condition: i - window_size < j <= i
+//  Combined with causal: j <= i AND j > i - window_size
+// ═══════════════════════════════════════════════════════════════
+@pure
+fn create_window_mask(seq_len, window_size) {
+    let mut mask = sw_zeros_2d(seq_len, seq_len)
+    let mut i = 0
+    while i < seq_len {
+        let start = sw_max_i(0, i - window_size + 1)
+        let mut j = start
+        while j <= i {
+            mask[i][j] = 1.0
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return mask
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  create_noncausal_window_mask — window mask without causal constraint
+//
+//  mask[i][j] = 1.0 if |i - j| < window_size
+// ═══════════════════════════════════════════════════════════════
+@pure
+fn create_noncausal_window_mask(seq_len, window_size) {
+    let mut mask = sw_zeros_2d(seq_len, seq_len)
+    let mut i = 0
+    while i < seq_len {
+        let start = sw_max_i(0, i - window_size + 1)
+        let end = sw_min_i(seq_len - 1, i + window_size - 1)
+        let mut j = start
+        while j <= end {
+            mask[i][j] = 1.0
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return mask
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  sliding_window_attention — single-head sliding window with causal mask
+//
+//  Q : [seq_len, head_dim]
+//  K : [seq_len, head_dim]
+//  V : [seq_len, head_dim]
+//  window_size : int — local attention window
+//
+//  Each query position i only attends to keys in range
+//  [max(0, i - window_size + 1) .. i]
+//
+//  Returns: [seq_len, head_dim]
+// ═══════════════════════════════════════════════════════════════
+@hot @parallel
+fn sliding_window_attention(Q, K, V, window_size) {
+    let seq_len = len(Q)
+    let head_dim = len(Q[0])
+    let scale = 1.0 / sqrt(head_dim * 1.0)
+
+    let mut out = sw_zeros_2d(seq_len, head_dim)
+
+    let mut qi = 0
+    while qi < seq_len {
+        let win_start = sw_max_i(0, qi - window_size + 1)
+
+        // online softmax over the window
+        let mut m_val = 0.0 - 1.0e30
+        let mut l_val = 0.0
+        let mut acc = sw_zeros_1d(head_dim)
+
+        let mut kj = win_start
+        while kj <= qi {
+            // dot product Q[qi] . K[kj]
+            let mut dot = 0.0
+            let mut d = 0
+            while d < head_dim {
+                dot = dot + Q[qi][d] * K[kj][d]
+                d = d + 1
+            }
+            let score = dot * scale
+
+            // online softmax update
+            let m_old = m_val
+            let m_new = sw_max_f(m_old, score)
+            let alpha = exp(m_old - m_new)
+            let p = exp(score - m_new)
+            let l_new = l_val * alpha + p
+
+            d = 0
+            while d < head_dim {
+                acc[d] = acc[d] * alpha + p * V[kj][d]
+                d = d + 1
+            }
+            m_val = m_new
+            l_val = l_new
+            kj = kj + 1
+        }
+
+        // normalize
+        if l_val > 0.0 {
+            let inv_l = 1.0 / l_val
+            let mut d = 0
+            while d < head_dim {
+                out[qi][d] = acc[d] * inv_l
+                d = d + 1
+            }
+        }
+        qi = qi + 1
+    }
+
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Multi-head sliding window attention
+//
+//  Q : [seq_len, num_heads * head_dim]
+//  K : [seq_len, num_heads * head_dim]
+//  V : [seq_len, num_heads * head_dim]
+//  window_size, num_heads : int
+//
+//  Returns: [seq_len, num_heads * head_dim]
+// ═══════════════════════════════════════════════════════════════
+@hot @parallel
+fn sliding_window_mh_attention(Q, K, V, window_size, num_heads) {
+    let seq_len = len(Q)
+    let total_dim = len(Q[0])
+    let head_dim = total_dim / num_heads
+    let scale = 1.0 / sqrt(head_dim * 1.0)
+
+    let mut out = sw_zeros_2d(seq_len, total_dim)
+
+    let mut qi = 0
+    while qi < seq_len {
+        let win_start = sw_max_i(0, qi - window_size + 1)
+
+        let mut h = 0
+        while h < num_heads {
+            let h_base = h * head_dim
+
+            let mut m_val = 0.0 - 1.0e30
+            let mut l_val = 0.0
+            let mut acc = sw_zeros_1d(head_dim)
+
+            let mut kj = win_start
+            while kj <= qi {
+                let mut dot = 0.0
+                let mut d = 0
+                while d < head_dim {
+                    dot = dot + Q[qi][h_base + d] * K[kj][h_base + d]
+                    d = d + 1
+                }
+                let score = dot * scale
+
+                let m_old = m_val
+                let m_new = sw_max_f(m_old, score)
+                let alpha = exp(m_old - m_new)
+                let p = exp(score - m_new)
+                let l_new = l_val * alpha + p
+
+                d = 0
+                while d < head_dim {
+                    acc[d] = acc[d] * alpha + p * V[kj][h_base + d]
+                    d = d + 1
+                }
+                m_val = m_new
+                l_val = l_new
+                kj = kj + 1
+            }
+
+            if l_val > 0.0 {
+                let inv_l = 1.0 / l_val
+                let mut d = 0
+                while d < head_dim {
+                    out[qi][h_base + d] = acc[d] * inv_l
+                    d = d + 1
+                }
+            }
+            h = h + 1
+        }
+        qi = qi + 1
+    }
+
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Rolling KV-Cache — circular buffer for sliding window
+//
+//  Only stores the last window_size tokens.
+//  When full, overwrites oldest entry (ring buffer).
+// ═══════════════════════════════════════════════════════════════
+
+struct RollingKVCache {
+    keys: array,
+    values: array,
+    window_size: int,
+    head_dim: int,
+    count: int,
+    write_pos: int
+}
+
+fn rolling_kv_cache_new(window_size, head_dim) {
+    let mut keys = []
+    let mut values = []
+    let mut i = 0
+    while i < window_size {
+        keys = keys + [sw_zeros_1d(head_dim)]
+        values = values + [sw_zeros_1d(head_dim)]
+        i = i + 1
+    }
+    return RollingKVCache {
+        keys: keys,
+        values: values,
+        window_size: window_size,
+        head_dim: head_dim,
+        count: 0,
+        write_pos: 0
+    }
+}
+
+fn rolling_kv_cache_append(cache, k_vec, v_vec) {
+    let pos = cache.write_pos % cache.window_size
+    // Rebuild keys/values arrays to avoid complex index assignment
+    let mut new_keys = []
+    let mut new_vals = []
+    let mut i = 0
+    while i < cache.window_size {
+        if i == pos {
+            new_keys = new_keys + [k_vec]
+            new_vals = new_vals + [v_vec]
+        } else {
+            new_keys = new_keys + [cache.keys[i]]
+            new_vals = new_vals + [cache.values[i]]
+        }
+        i = i + 1
+    }
+    let new_count = cache.count + 1
+    let effective = sw_min_i(new_count, cache.window_size)
+    return RollingKVCache {
+        keys: new_keys,
+        values: new_vals,
+        window_size: cache.window_size,
+        head_dim: cache.head_dim,
+        count: effective,
+        write_pos: cache.write_pos + 1
+    }
+}
+
+// ── attend Q against cached KV in rolling buffer ─────────────
+// Q : [1, head_dim] (single decode query)
+// Returns: [1, head_dim]
+@hot
+fn rolling_kv_cache_attention(Q, cache) {
+    let head_dim = cache.head_dim
+    let n_cached = cache.count
+    let scale = 1.0 / sqrt(head_dim * 1.0)
+
+    let mut m_val = 0.0 - 1.0e30
+    let mut l_val = 0.0
+    let mut acc = sw_zeros_1d(head_dim)
+
+    // oldest entry position in the ring buffer
+    let mut start = 0
+    if cache.write_pos > cache.window_size {
+        start = cache.write_pos % cache.window_size
+    }
+
+    let mut t = 0
+    while t < n_cached {
+        let idx = (start + t) % cache.window_size
+        let k_vec = cache.keys[idx]
+        let v_vec = cache.values[idx]
+
+        let mut dot = 0.0
+        let mut d = 0
+        while d < head_dim {
+            dot = dot + Q[0][d] * k_vec[d]
+            d = d + 1
+        }
+        let score = dot * scale
+
+        let m_old = m_val
+        let m_new = sw_max_f(m_old, score)
+        let alpha = exp(m_old - m_new)
+        let p = exp(score - m_new)
+        let l_new = l_val * alpha + p
+
+        d = 0
+        while d < head_dim {
+            acc[d] = acc[d] * alpha + p * v_vec[d]
+            d = d + 1
+        }
+        m_val = m_new
+        l_val = l_new
+        t = t + 1
+    }
+
+    let mut out_row = sw_zeros_1d(head_dim)
+    if l_val > 0.0 {
+        let inv_l = 1.0 / l_val
+        let mut d = 0
+        while d < head_dim {
+            out_row[d] = acc[d] * inv_l
+            d = d + 1
+        }
+    }
+
+    return [out_row]
+}
+
+// ── get the number of valid cached entries ───────────────────
+fn rolling_kv_cache_size(cache) {
+    return cache.count
+}
+
+// ── reset rolling cache ──────────────────────────────────────
+fn rolling_kv_cache_reset(cache) {
+    return rolling_kv_cache_new(cache.window_size, cache.head_dim)
+}
+
+println("[sliding_window] module loaded — Mistral-style sliding window attention + rolling KV-cache")

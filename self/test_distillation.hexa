@@ -1,0 +1,260 @@
+// ═══════════════════════════════════════════════════════════════════
+//  test_distillation.hexa — Knowledge Distillation 검증
+//
+//  검증:
+//    1.  Soft targets sum = 1.0
+//    2.  Temperature scaling: higher T -> softer distribution
+//    3.  KL divergence: identical distributions = 0
+//    4.  KL divergence: different distributions > 0
+//    5.  Cross entropy: correct class -> low loss
+//    6.  Cross entropy: wrong class -> high loss
+//    7.  Distill loss: alpha=0 -> pure CE
+//    8.  Distill loss: alpha=1 -> pure KL
+//    9.  Student forward output dimension
+//   10.  Distill train step: loss decreases
+//   11.  Soft targets: T=1 vs T=10 entropy comparison
+//   12.  Combined loss non-negative
+//
+//  실행: ./hexa self/test_distillation.hexa
+// ═══════════════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ═══════════ Knowledge Distillation 인라인 ══════════════════════
+
+fn kd_abs(x) { if x < 0.0 { return 0.0 - x } return x }
+
+fn kd_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 { term = term * v / to_float(i); result = result + term }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn kd_log(x) {
+    if x <= 0.0 { return -30.0 }
+    let mut v = x
+    let mut count = 0
+    while v > 2.0 { v = v / 2.718281828; count = count + 1 }
+    while v < 0.5 { v = v * 2.718281828; count = count - 1 }
+    let d = v - 1.0
+    return to_float(count) + d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+}
+
+fn kd_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn kd_hash(seed, i, j) {
+    let h = ((seed * 2654435761 + i * 1315423911 + j * 731) % 10007)
+    return to_float(h) / 10007.0 - 0.5
+}
+
+fn softmax_with_temp(logits, temp) {
+    let n = len(logits)
+    let mut scaled = kd_zeros(n)
+    for i in 0..n { scaled[i] = logits[i] / temp }
+    let mut m = scaled[0]
+    for i in 1..n { if scaled[i] > m { m = scaled[i] } }
+    let mut exps = kd_zeros(n)
+    let mut z = 0.0
+    for i in 0..n { exps[i] = kd_exp(scaled[i] - m); z = z + exps[i] }
+    let mut out = kd_zeros(n)
+    for i in 0..n { out[i] = exps[i] / z }
+    return out
+}
+
+fn soft_targets(logits, temp) { return softmax_with_temp(logits, temp) }
+
+fn kl_divergence(p, q) {
+    let n = len(p)
+    let mut kl = 0.0
+    for i in 0..n {
+        if p[i] > 1.0e-10 {
+            let ratio = p[i] / (q[i] + 1.0e-10)
+            kl = kl + p[i] * kd_log(ratio)
+        }
+    }
+    return kl
+}
+
+fn cross_entropy_loss(logits, target_idx) {
+    let probs = softmax_with_temp(logits, 1.0)
+    let p = probs[target_idx]
+    if p > 1.0e-10 { return 0.0 - kd_log(p) }
+    return 30.0
+}
+
+fn teacher_forward(weights, input) {
+    let out_dim = len(weights)
+    let in_dim = len(input)
+    let mut logits = kd_zeros(out_dim)
+    for i in 0..out_dim {
+        let mut s = 0.0
+        for j in 0..in_dim { s = s + weights[i][j] * input[j] }
+        logits[i] = s
+    }
+    return logits
+}
+
+fn student_forward(weights, input) {
+    let out_dim = len(weights)
+    let in_dim = len(input)
+    let mut logits = kd_zeros(out_dim)
+    for i in 0..out_dim {
+        let mut s = 0.0
+        for j in 0..in_dim { s = s + weights[i][j] * input[j] }
+        logits[i] = s
+    }
+    return logits
+}
+
+fn distill_loss(student_logits, teacher_logits, temp, alpha) {
+    let teacher_soft = soft_targets(teacher_logits, temp)
+    let student_soft = soft_targets(student_logits, temp)
+    let kl = kl_divergence(teacher_soft, student_soft)
+    let kl_loss = alpha * temp * temp * kl
+    let mut target_idx = 0
+    let mut max_val = teacher_logits[0]
+    for i in 1..len(teacher_logits) {
+        if teacher_logits[i] > max_val { max_val = teacher_logits[i]; target_idx = i }
+    }
+    let ce = cross_entropy_loss(student_logits, target_idx)
+    let ce_loss = (1.0 - alpha) * ce
+    return kl_loss + ce_loss
+}
+
+fn distill_train_step(student, teacher, input, temp, alpha, lr) {
+    let out_dim = len(student)
+    let in_dim = len(student[0])
+    let eps = 1.0e-4
+    let teacher_logits = teacher_forward(teacher, input)
+    let student_logits = student_forward(student, input)
+    let loss0 = distill_loss(student_logits, teacher_logits, temp, alpha)
+    let mut new_student = []
+    for i in 0..out_dim {
+        let mut row = kd_zeros(in_dim)
+        for j in 0..in_dim { row[j] = student[i][j] }
+        new_student = new_student + [row]
+    }
+    for i in 0..out_dim {
+        for j in 0..in_dim {
+            let orig = new_student[i][j]
+            new_student[i][j] = orig + eps
+            let logits_p = student_forward(new_student, input)
+            let loss_p = distill_loss(logits_p, teacher_logits, temp, alpha)
+            let grad = (loss_p - loss0) / eps
+            new_student[i][j] = orig - lr * grad
+        }
+    }
+    return new_student
+}
+
+// ═══════════ 테스트 ═════════════════════════════════════════════
+
+fn main() {
+    println("=== Knowledge Distillation Tests ===")
+
+    // 1. Soft targets sum = 1.0
+    let logits1 = [2.0, 1.0, 0.5, -1.0]
+    let st1 = soft_targets(logits1, 1.0)
+    let mut sum1 = 0.0
+    for i in 0..4 { sum1 = sum1 + st1[i] }
+    check("Soft targets sum=1", approx(sum1, 1.0, 0.001))
+
+    // 2. Temperature scaling: T=10 -> more uniform
+    let st_cold = soft_targets(logits1, 1.0)
+    let st_hot = soft_targets(logits1, 10.0)
+    // Entropy proxy: max prob should be lower with higher T
+    let mut max_cold = 0.0
+    let mut max_hot = 0.0
+    for i in 0..4 {
+        if st_cold[i] > max_cold { max_cold = st_cold[i] }
+        if st_hot[i] > max_hot { max_hot = st_hot[i] }
+    }
+    check("Higher temp -> softer dist", max_hot < max_cold)
+
+    // 3. KL divergence: identical = 0
+    let p1 = [0.7, 0.2, 0.1]
+    let kl_same = kl_divergence(p1, p1)
+    check("KL identical=0", approx(kl_same, 0.0, 0.001))
+
+    // 4. KL divergence: different > 0
+    let q1 = [0.3, 0.4, 0.3]
+    let kl_diff = kl_divergence(p1, q1)
+    check("KL different>0", kl_diff > 0.0)
+
+    // 5. CE: correct class -> low loss
+    let logits_correct = [5.0, 0.0, 0.0]  // class 0 dominates
+    let ce_correct = cross_entropy_loss(logits_correct, 0)
+    check("CE correct class low", ce_correct < 1.0)
+
+    // 6. CE: wrong class -> high loss
+    let ce_wrong = cross_entropy_loss(logits_correct, 2)
+    check("CE wrong class high", ce_wrong > ce_correct)
+
+    // 7. Distill loss alpha=0 -> pure CE (KL weight = 0)
+    let s_logits = [1.0, 2.0, 0.5]
+    let t_logits = [3.0, 1.0, 0.5]
+    let loss_a0 = distill_loss(s_logits, t_logits, 2.0, 0.0)
+    // target = argmax of teacher = index 0
+    let ce_only = cross_entropy_loss(s_logits, 0)
+    check("alpha=0 pure CE", approx(loss_a0, ce_only, 0.01))
+
+    // 8. Distill loss alpha=1 -> pure KL (CE weight = 0)
+    let loss_a1 = distill_loss(s_logits, t_logits, 2.0, 1.0)
+    check("alpha=1 pure KL (>0)", loss_a1 > 0.0)
+
+    // 9. Student forward output dimension
+    let student_w = [[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]]
+    let input = [1.0, 0.5]
+    let s_out = student_forward(student_w, input)
+    check("Student forward dim=3", len(s_out) == 3)
+
+    // 10. Distill train step: loss decreases
+    let teacher_w = [[2.0, 1.0], [0.5, 1.5], [1.0, 0.5]]
+    let student_init = [[0.1, -0.3], [-0.2, 0.1], [0.4, -0.1]]
+    let inp10 = [1.0, 0.5]
+    let loss_before = distill_loss(student_forward(student_init, inp10), teacher_forward(teacher_w, inp10), 4.0, 0.5)
+    let student_updated = distill_train_step(student_init, teacher_w, inp10, 4.0, 0.5, 0.01)
+    let loss_after = distill_loss(student_forward(student_updated, inp10), teacher_forward(teacher_w, inp10), 4.0, 0.5)
+    check("Train step reduces loss", loss_after < loss_before)
+
+    // 11. Soft targets T=1 vs T=10: entropy comparison
+    let mut ent_cold = 0.0
+    let mut ent_hot = 0.0
+    for i in 0..4 {
+        if st_cold[i] > 1.0e-10 { ent_cold = ent_cold - st_cold[i] * kd_log(st_cold[i]) }
+        if st_hot[i] > 1.0e-10 { ent_hot = ent_hot - st_hot[i] * kd_log(st_hot[i]) }
+    }
+    check("Higher temp higher entropy", ent_hot > ent_cold)
+
+    // 12. Combined loss non-negative
+    let loss_combined = distill_loss(s_logits, t_logits, 5.0, 0.5)
+    check("Combined loss >= 0", loss_combined >= 0.0)
+
+    println("")
+    println("Distillation: " + str(pass_count) + " passed, " + str(fail_count) + " failed")
+}
+
+main()

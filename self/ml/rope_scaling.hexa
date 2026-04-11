@@ -1,0 +1,383 @@
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/rope_scaling.hexa — RoPE Scaling + ALiBi Positional Encoding
+//
+//  Implements:
+//    1. Standard RoPE         — base rotary position embedding
+//    2. NTK-aware RoPE        — base frequency scaling for extended contexts
+//    3. YaRN                  — NTK + frequency decomposition (high-freq keep, low-freq scale)
+//    4. ALiBi                 — linear attention bias (no positional embedding needed)
+//
+//  API:
+//    rope_standard(pos, dim, base)           -> [dim] rotary embeddings
+//    rope_ntk_scaled(pos, dim, scale_factor) -> [dim] NTK-scaled embeddings
+//    yarn_rope(pos, dim, scale, alpha, beta) -> [dim] YaRN embeddings
+//    alibi_bias(seq_len, num_heads)          -> [num_heads, seq_len, seq_len] bias matrix
+//    apply_rope_to_vec(vec, freqs)           -> [dim] rotated vector
+//
+//  AI-NATIVE attrs:
+//    @memoize — frequency tables cached per (dim, base)
+//    @pure    — math kernels
+//    @hot     — called every forward step
+// ═══════════════════════════════════════════════════════════════
+
+// ── helpers ──────────────────────────────────────────────────
+
+fn rs_zeros_1d(n) {
+    let mut v = []
+    let mut i = 0
+    while i < n {
+        v = v + [0.0]
+        i = i + 1
+    }
+    return v
+}
+
+fn rs_zeros_2d(r, c) {
+    let mut m = []
+    let mut i = 0
+    while i < r {
+        let mut row = []
+        let mut j = 0
+        while j < c {
+            row = row + [0.0]
+            j = j + 1
+        }
+        m = m + [row]
+        i = i + 1
+    }
+    return m
+}
+
+fn rs_fabs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn rs_max_f(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn rs_min_f(a, b) {
+    if a < b { return a }
+    return b
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Standard RoPE — compute rotary frequencies
+//
+//  freq[i] = 1 / (base ^ (2i / dim))  for i in 0..dim/2
+//  angle = pos * freq[i]
+//  Returns: [dim] — pairs of (cos(angle), sin(angle)) interleaved
+// ═══════════════════════════════════════════════════════════════
+@pure
+fn rope_frequencies(dim, base) {
+    let half = dim / 2
+    let mut freqs = []
+    let mut i = 0
+    while i < half {
+        let exponent = 2.0 * (i * 1.0) / (dim * 1.0)
+        let freq = 1.0 / pow(base, exponent)
+        freqs = freqs + [freq]
+        i = i + 1
+    }
+    return freqs
+}
+
+@pure @hot
+fn rope_standard(pos, dim, base) {
+    let freqs = rope_frequencies(dim, base)
+    let half = dim / 2
+    let mut result = []
+    let mut i = 0
+    while i < half {
+        let angle = (pos * 1.0) * freqs[i]
+        let c = cos(angle)
+        let s = sin(angle)
+        result = result + [c, s]
+        i = i + 1
+    }
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  NTK-aware RoPE Scaling
+//
+//  Key idea: scale the base frequency instead of interpolating positions.
+//  new_base = base * scale_factor ^ (dim / (dim - 2))
+//
+//  This preserves high-frequency components while extending context.
+//  From: "NTK-Aware Scaled RoPE" (Reddit/bloc97, 2023)
+// ═══════════════════════════════════════════════════════════════
+@pure
+fn ntk_scaled_base(base, dim, scale_factor) {
+    let exponent = (dim * 1.0) / ((dim - 2) * 1.0)
+    return base * pow(scale_factor * 1.0, exponent)
+}
+
+@pure @hot
+fn rope_ntk_scaled(pos, dim, scale_factor) {
+    let base = 10000.0
+    let new_base = ntk_scaled_base(base, dim, scale_factor)
+    return rope_standard(pos, dim, new_base)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  YaRN — Yet another RoPE extensioN
+//
+//  Combines NTK scaling with frequency-dependent interpolation:
+//    - High frequencies (short wavelengths): no interpolation (keep as-is)
+//    - Low frequencies (long wavelengths): full interpolation
+//    - Middle range: linear ramp between the two
+//
+//  Parameters:
+//    scale  : context extension ratio (e.g. 4.0 for 4K -> 16K)
+//    alpha  : high-frequency boundary (default 1.0)
+//    beta   : low-frequency boundary  (default 32.0)
+//
+//  For each frequency dimension i:
+//    wavelength = 2 * pi * base^(2i/dim)
+//    if wavelength < alpha * original_ctx -> no scaling (t=1)
+//    if wavelength > beta * original_ctx  -> full scaling (t=0)
+//    else -> linear interpolation t
+//    effective_freq = freq * (1-t) + freq/scale * t ... inverted:
+//    effective_freq = freq * lerp(1.0, 1.0/scale, t)
+// ═══════════════════════════════════════════════════════════════
+@pure @hot
+fn yarn_rope(pos, dim, scale, alpha, beta) {
+    let base = 10000.0
+    let half = dim / 2
+    let pi = 3.14159265358979
+    let original_ctx = 4096.0
+
+    // NTK base scaling component
+    let ntk_base = ntk_scaled_base(base, dim, scale)
+
+    let mut result = []
+    let mut i = 0
+    while i < half {
+        let exponent = 2.0 * (i * 1.0) / (dim * 1.0)
+        let freq_base = 1.0 / pow(base, exponent)
+        let wavelength = 2.0 * pi / freq_base
+
+        // Compute interpolation factor t
+        let low_thresh = alpha * original_ctx
+        let high_thresh = beta * original_ctx
+        let mut t = 0.0
+        if wavelength < low_thresh {
+            t = 1.0   // high frequency — no interpolation
+        } else {
+            if wavelength > high_thresh {
+                t = 0.0   // low frequency — full interpolation
+            } else {
+                // linear ramp
+                t = (high_thresh - wavelength) / (high_thresh - low_thresh)
+            }
+        }
+
+        // Blend: freq * (t * 1.0 + (1-t) * 1/scale)
+        let freq_ntk = 1.0 / pow(ntk_base, exponent)
+        let effective_freq = freq_base * t + freq_ntk * (1.0 - t)
+
+        let angle = (pos * 1.0) * effective_freq
+        let c = cos(angle)
+        let s = sin(angle)
+        result = result + [c, s]
+        i = i + 1
+    }
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Apply rotary embeddings to a vector
+//
+//  vec: [dim] — input vector
+//  freqs: [dim] — interleaved (cos, sin) pairs from rope_* functions
+//  Returns: [dim] — rotated vector
+//
+//  For each pair (vec[2i], vec[2i+1]):
+//    out[2i]   = vec[2i] * cos - vec[2i+1] * sin
+//    out[2i+1] = vec[2i] * sin + vec[2i+1] * cos
+// ═══════════════════════════════════════════════════════════════
+@pure @hot
+fn apply_rope_to_vec(vec, freqs) {
+    let dim = len(vec)
+    let half = dim / 2
+    let mut out = []
+    let mut i = 0
+    while i < half {
+        let x0 = vec[2 * i]
+        let x1 = vec[2 * i + 1]
+        let c = freqs[2 * i]
+        let s = freqs[2 * i + 1]
+        out = out + [x0 * c - x1 * s]
+        out = out + [x0 * s + x1 * c]
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  ALiBi — Attention with Linear Biases
+//
+//  Key idea: No positional embedding at all. Instead, add a linear
+//  bias to attention scores based on distance between query and key.
+//
+//  bias[h][i][j] = -slope[h] * |i - j|
+//
+//  Slopes are geometric: slope[h] = 2^(-8h/H)  for h in 0..H
+//  (From: Press et al. 2022 "Train Short, Test Long")
+//
+//  Returns: [num_heads][seq_len][seq_len] bias tensor (add to attn scores)
+// ═══════════════════════════════════════════════════════════════
+@pure
+fn alibi_slopes(num_heads) {
+    // slope[h] = 2^(-8 * (h+1) / num_heads)
+    let mut slopes = []
+    let mut h = 0
+    while h < num_heads {
+        let exponent = (0.0 - 8.0) * ((h + 1) * 1.0) / (num_heads * 1.0)
+        let slope = pow(2.0, exponent)
+        slopes = slopes + [slope]
+        h = h + 1
+    }
+    return slopes
+}
+
+@pure
+fn alibi_bias(seq_len, num_heads) {
+    let slopes = alibi_slopes(num_heads)
+    let mut bias = []
+    let mut h = 0
+    while h < num_heads {
+        let mut head_bias = []
+        let mut i = 0
+        while i < seq_len {
+            let mut row = []
+            let mut j = 0
+            while j < seq_len {
+                let dist = i - j
+                let abs_dist = if dist < 0 { 0 - dist } else { dist }
+                let b = (0.0 - slopes[h]) * (abs_dist * 1.0)
+                row = row + [b]
+                j = j + 1
+            }
+            head_bias = head_bias + [row]
+            i = i + 1
+        }
+        bias = bias + [head_bias]
+        h = h + 1
+    }
+    return bias
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  ALiBi causal bias — only for causal attention (j > i => -inf)
+// ═══════════════════════════════════════════════════════════════
+@pure
+fn alibi_causal_bias(seq_len, num_heads) {
+    let slopes = alibi_slopes(num_heads)
+    let mut bias = []
+    let mut h = 0
+    while h < num_heads {
+        let mut head_bias = []
+        let mut i = 0
+        while i < seq_len {
+            let mut row = []
+            let mut j = 0
+            while j < seq_len {
+                if j > i {
+                    row = row + [0.0 - 1.0e30]
+                } else {
+                    let dist = i - j
+                    let b = (0.0 - slopes[h]) * (dist * 1.0)
+                    row = row + [b]
+                }
+                j = j + 1
+            }
+            head_bias = head_bias + [row]
+            i = i + 1
+        }
+        bias = bias + [head_bias]
+        h = h + 1
+    }
+    return bias
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Attention with ALiBi bias applied
+//
+//  Q : [seq_len, dim]
+//  K : [seq_len, dim]
+//  V : [seq_len, dim]
+//  num_heads : number of attention heads
+//  head_dim = dim / num_heads
+//
+//  Returns: [seq_len, dim]
+// ═══════════════════════════════════════════════════════════════
+@hot @parallel
+fn alibi_attention(Q, K, V, num_heads) {
+    let seq_len = len(Q)
+    let dim = len(Q[0])
+    let head_dim = dim / num_heads
+    let scale = 1.0 / sqrt(head_dim * 1.0)
+    let slopes = alibi_slopes(num_heads)
+
+    let mut out = rs_zeros_2d(seq_len, dim)
+
+    let mut qi = 0
+    while qi < seq_len {
+        let mut h = 0
+        while h < num_heads {
+            let q_base = h * head_dim
+
+            let mut m_val = 0.0 - 1.0e30
+            let mut l_val = 0.0
+            let mut acc = rs_zeros_1d(head_dim)
+
+            let mut kj = 0
+            while kj < seq_len {
+                let mut dot = 0.0
+                let mut d = 0
+                while d < head_dim {
+                    dot = dot + Q[qi][q_base + d] * K[kj][q_base + d]
+                    d = d + 1
+                }
+                // add ALiBi bias
+                let dist = qi - kj
+                let abs_dist = if dist < 0 { 0 - dist } else { dist }
+                let score = dot * scale + (0.0 - slopes[h]) * (abs_dist * 1.0)
+
+                let m_old = m_val
+                let m_new = rs_max_f(m_old, score)
+                let alpha = exp(m_old - m_new)
+                let p = exp(score - m_new)
+                let l_new = l_val * alpha + p
+
+                d = 0
+                while d < head_dim {
+                    acc[d] = acc[d] * alpha + p * V[kj][q_base + d]
+                    d = d + 1
+                }
+                m_val = m_new
+                l_val = l_new
+                kj = kj + 1
+            }
+
+            if l_val > 0.0 {
+                let inv_l = 1.0 / l_val
+                let mut d = 0
+                while d < head_dim {
+                    out[qi][q_base + d] = acc[d] * inv_l
+                    d = d + 1
+                }
+            }
+            h = h + 1
+        }
+        qi = qi + 1
+    }
+
+    return out
+}
+
+println("[rope_scaling] module loaded — NTK-RoPE / YaRN / ALiBi positional encoding")

@@ -1,0 +1,293 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/pruning.hexa — Neural Network Pruning
+//
+//  Implements:
+//    1. Magnitude pruning     — zero out bottom N% weights by abs value
+//    2. Structured pruning    — remove entire neurons/channels (L1 norm)
+//    3. Fine-tune recovery    — retrain remaining weights after pruning
+//    4. Sparsity schedule     — cubic schedule for gradual pruning
+//
+//  API (pure):
+//    magnitude_prune(weights, sparsity)           -> [[float]]
+//    structured_prune(weights, ratio)             -> [[float]]
+//    compute_sparsity(weights)                    -> float
+//    cubic_schedule(step, total_steps, initial, final) -> float
+//    l1_norm_rows(weights)                        -> [float]
+//    prune_rows(weights, mask)                    -> [[float]]
+//    fine_tune_step(weights, input, target, lr)   -> [[float]]
+//    iterative_prune(weights, input, target, steps, final_sparsity, lr)
+//                                                 -> [[float]]
+//
+//  AI-NATIVE attrs:
+//    @pure     — no side effects
+//    @parallel — per-row pruning is independent
+// ═══════════════════════════════════════════════════════════════════
+
+// ── helpers ──────────────────────────────────────────────────────
+
+fn pr_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn pr_zeros_1d(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn pr_zeros_2d(r, c) {
+    let mut m = []
+    for _i in 0..r {
+        let mut row = []
+        for _j in 0..c { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+fn pr_copy_2d(w) {
+    let rows = len(w)
+    let cols = len(w[0])
+    let mut out = []
+    for i in 0..rows {
+        let mut row = []
+        for j in 0..cols {
+            row = row + [w[i][j]]
+        }
+        out = out + [row]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Magnitude Pruning
+//
+//  Zero out the bottom `sparsity` fraction of weights by absolute value.
+//  sparsity = 0.5 means 50% of weights become zero.
+// ═══════════════════════════════════════════════════════════════════
+@pure @parallel
+fn magnitude_prune(weights, sparsity) {
+    let rows = len(weights)
+    let cols = len(weights[0])
+    let total = rows * cols
+    let num_prune = int(to_float(total) * sparsity)
+    if num_prune <= 0 { return pr_copy_2d(weights) }
+    if num_prune >= total { return pr_zeros_2d(rows, cols) }
+
+    // Collect all magnitudes
+    let mut mags = []
+    for i in 0..rows {
+        for j in 0..cols {
+            mags = mags + [pr_abs(weights[i][j])]
+        }
+    }
+
+    // Sort ascending (insertion sort)
+    let mut sorted = []
+    for i in 0..total { sorted = sorted + [mags[i]] }
+    for i in 0..total {
+        for j in (i+1)..total {
+            if sorted[j] < sorted[i] {
+                let tmp = sorted[i]
+                sorted[i] = sorted[j]
+                sorted[j] = tmp
+            }
+        }
+    }
+
+    // Threshold: magnitude at num_prune position
+    let threshold = sorted[num_prune - 1]
+
+    // Apply mask
+    let mut out = pr_copy_2d(weights)
+    let mut pruned = 0
+    for i in 0..rows {
+        for j in 0..cols {
+            if pr_abs(out[i][j]) <= threshold {
+                if pruned < num_prune {
+                    out[i][j] = 0.0
+                    pruned = pruned + 1
+                }
+            }
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Compute Sparsity — fraction of zero weights
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn compute_sparsity(weights) {
+    let rows = len(weights)
+    let cols = len(weights[0])
+    let total = rows * cols
+    let mut zeros = 0
+    for i in 0..rows {
+        for j in 0..cols {
+            if pr_abs(weights[i][j]) < 1.0e-10 {
+                zeros = zeros + 1
+            }
+        }
+    }
+    return to_float(zeros) / to_float(total)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  L1 Norm per Row — for structured pruning
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn l1_norm_rows(weights) {
+    let rows = len(weights)
+    let cols = len(weights[0])
+    let mut norms = []
+    for i in 0..rows {
+        let mut s = 0.0
+        for j in 0..cols {
+            s = s + pr_abs(weights[i][j])
+        }
+        norms = norms + [s]
+    }
+    return norms
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Structured Pruning — remove entire rows (neurons/channels)
+//
+//  Remove bottom `ratio` fraction of rows by L1 norm.
+//  Removed rows are zeroed out (preserving shape).
+// ═══════════════════════════════════════════════════════════════════
+@pure @parallel
+fn structured_prune(weights, ratio) {
+    let rows = len(weights)
+    let cols = len(weights[0])
+    let num_prune = int(to_float(rows) * ratio)
+    if num_prune <= 0 { return pr_copy_2d(weights) }
+    if num_prune >= rows { return pr_zeros_2d(rows, cols) }
+
+    let norms = l1_norm_rows(weights)
+
+    // Find threshold norm: sort norms ascending
+    let mut sorted_norms = []
+    for i in 0..rows { sorted_norms = sorted_norms + [norms[i]] }
+    for i in 0..rows {
+        for j in (i+1)..rows {
+            if sorted_norms[j] < sorted_norms[i] {
+                let tmp = sorted_norms[i]
+                sorted_norms[i] = sorted_norms[j]
+                sorted_norms[j] = tmp
+            }
+        }
+    }
+    let threshold = sorted_norms[num_prune - 1]
+
+    // Zero out rows with norm <= threshold
+    let mut out = pr_copy_2d(weights)
+    let mut pruned = 0
+    for i in 0..rows {
+        if norms[i] <= threshold {
+            if pruned < num_prune {
+                for j in 0..cols {
+                    out[i][j] = 0.0
+                }
+                pruned = pruned + 1
+            }
+        }
+    }
+    return out
+}
+
+// Apply explicit boolean mask to rows
+@pure
+fn prune_rows(weights, mask) {
+    let rows = len(weights)
+    let cols = len(weights[0])
+    let mut out = pr_copy_2d(weights)
+    for i in 0..rows {
+        if !mask[i] {
+            for j in 0..cols {
+                out[i][j] = 0.0
+            }
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Cubic Sparsity Schedule
+//
+//  s(t) = s_f + (s_i - s_f) * (1 - t/T)^3
+//  Starts slow, accelerates in the middle, slows at end.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cubic_schedule(step, total_steps, initial, final_s) {
+    if step >= total_steps { return final_s }
+    if step <= 0 { return initial }
+    let ratio = 1.0 - to_float(step) / to_float(total_steps)
+    let cube = ratio * ratio * ratio
+    return final_s + (initial - final_s) * cube
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Fine-tune Step — retrain after pruning
+//
+//  Simple SGD step preserving zero mask:
+//    1. Forward: y = W @ x
+//    2. Loss: MSE vs target
+//    3. Gradient: dW = (y - target) outer x / n
+//    4. Update: W -= lr * dW (but keep pruned weights at zero)
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn fine_tune_step(weights, input, target, lr) {
+    let rows = len(weights)
+    let cols = len(weights[0])
+
+    // Forward
+    let mut y = pr_zeros_1d(rows)
+    for i in 0..rows {
+        let mut s = 0.0
+        for j in 0..cols {
+            s = s + weights[i][j] * input[j]
+        }
+        y[i] = s
+    }
+
+    // Error
+    let mut err = pr_zeros_1d(rows)
+    for i in 0..rows {
+        err[i] = y[i] - target[i]
+    }
+
+    // Gradient update (preserve sparsity)
+    let mut out = pr_copy_2d(weights)
+    for i in 0..rows {
+        for j in 0..cols {
+            if pr_abs(weights[i][j]) > 1.0e-10 {
+                // Only update non-zero weights
+                let grad = err[i] * input[j] / to_float(rows)
+                out[i][j] = out[i][j] - lr * grad
+            }
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Iterative Pruning — gradual pruning with fine-tuning
+//
+//  For each step:
+//    1. Compute target sparsity via cubic schedule
+//    2. Prune to target sparsity
+//    3. Fine-tune one step
+// ═══════════════════════════════════════════════════════════════════
+fn iterative_prune(weights, input, target, steps, final_sparsity, lr) {
+    let initial_sparsity = compute_sparsity(weights)
+    let mut w = pr_copy_2d(weights)
+    for s in 0..steps {
+        let target_s = cubic_schedule(s + 1, steps, initial_sparsity, final_sparsity)
+        w = magnitude_prune(w, target_s)
+        w = fine_tune_step(w, input, target, lr)
+    }
+    return w
+}

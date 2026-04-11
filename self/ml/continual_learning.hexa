@@ -1,0 +1,332 @@
+// ===================================================================
+//  self/ml/continual_learning.hexa — Continual Learning Framework
+//
+//  Pure Hexa implementation of continual/lifelong learning strategies.
+//
+//  Components:
+//    1. EWC (Elastic Weight Consolidation)
+//       — Fisher information matrix estimates parameter importance
+//       — Penalizes changes to important weights from previous tasks
+//    2. SI (Synaptic Intelligence)
+//       — Online importance tracking during training
+//       — Accumulates path integral of gradient * parameter change
+//    3. Replay Buffer
+//       — Stores samples from previous tasks for rehearsal
+//       — Random sampling for experience replay
+//    4. Task Boundary Detection
+//       — Monitors loss trajectory for sudden changes
+//       — Detects task switches via loss spike detection
+//
+//  Public API:
+//    create_ewc(model_weights, fisher, lambda)
+//    ewc_loss(model_weights, ewc_state)
+//    update_fisher(ewc_state, gradients)
+//    create_si(model_weights, xi)
+//    si_pre_update(si_state, gradients)
+//    si_post_update(si_state, model_weights)
+//    si_loss(model_weights, si_state)
+//    create_replay_buffer(capacity)
+//    replay_add(buffer, sample)
+//    replay_sample(buffer, n)
+//    detect_boundary(loss_history, threshold)
+//    detect_boundary_window(loss_history, window, threshold)
+//
+//  Conventions:
+//    - Uses #{} map literals (no {k:v} inside if blocks)
+//    - model_weights: flat array of floats
+//    - fisher: flat array of floats (same size as weights)
+// ===================================================================
+
+// ===================================================================
+//  Math helpers
+// ===================================================================
+fn _cl_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn _cl_max(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn _cl_min(a, b) {
+    if a < b { return a }
+    return b
+}
+
+// ===================================================================
+//  EWC — Elastic Weight Consolidation
+// ===================================================================
+
+// Create EWC state
+// model_weights: array of floats (snapshot of optimal weights for prev task)
+// fisher: array of floats (Fisher information diagonal estimates)
+// lambda: float (regularization strength)
+fn create_ewc(model_weights, fisher, lambda) {
+    let state = #{}
+    // store a copy of the optimal weights
+    let n = len(model_weights)
+    let mut star_weights = []
+    let mut i = 0
+    while i < n {
+        star_weights = star_weights + [model_weights[i]]
+        i = i + 1
+    }
+    state["star_weights"] = star_weights
+    state["fisher"] = fisher
+    state["lambda"] = lambda
+    state["n"] = n
+    return state
+}
+
+// Compute EWC penalty: lambda/2 * sum(F_i * (theta_i - theta*_i)^2)
+fn ewc_loss(model_weights, ewc_state) {
+    let star = ewc_state["star_weights"]
+    let fisher = ewc_state["fisher"]
+    let lambda = ewc_state["lambda"]
+    let n = ewc_state["n"]
+
+    let mut loss = 0.0
+    let mut i = 0
+    while i < n {
+        let diff = model_weights[i] - star[i]
+        loss = loss + fisher[i] * diff * diff
+        i = i + 1
+    }
+    return lambda / 2.0 * loss
+}
+
+// Update Fisher information using squared gradients (diagonal approximation)
+// Exponential moving average: F_new = alpha * F_old + (1-alpha) * grad^2
+fn update_fisher(ewc_state, gradients, alpha) {
+    let fisher = ewc_state["fisher"]
+    let n = ewc_state["n"]
+    let mut new_fisher = []
+    let mut i = 0
+    while i < n {
+        let f = alpha * fisher[i] + (1.0 - alpha) * gradients[i] * gradients[i]
+        new_fisher = new_fisher + [f]
+        i = i + 1
+    }
+    ewc_state["fisher"] = new_fisher
+    return ewc_state
+}
+
+// ===================================================================
+//  SI — Synaptic Intelligence
+// ===================================================================
+
+// Create SI state
+// model_weights: initial weights snapshot
+// xi: damping constant (small positive, e.g. 0.1)
+fn create_si(model_weights, xi) {
+    let state = #{}
+    let n = len(model_weights)
+
+    let mut prev_weights = []
+    let mut omega = []
+    let mut running_sum = []
+    let mut i = 0
+    while i < n {
+        prev_weights = prev_weights + [model_weights[i]]
+        omega = omega + [0.0]
+        running_sum = running_sum + [0.0]
+        i = i + 1
+    }
+
+    state["prev_weights"] = prev_weights
+    state["omega"] = omega
+    state["running_sum"] = running_sum
+    state["xi"] = xi
+    state["n"] = n
+    return state
+}
+
+// Call before parameter update: accumulate gradient * delta contribution
+fn si_pre_update(si_state, gradients) {
+    let n = si_state["n"]
+    let running = si_state["running_sum"]
+    let mut i = 0
+    while i < n {
+        // running_sum accumulates -grad * delta (will be combined in post_update)
+        running[i] = running[i] + gradients[i]
+        i = i + 1
+    }
+    si_state["running_sum"] = running
+    return si_state
+}
+
+// Call after parameter update: finalize importance
+fn si_post_update(si_state, model_weights) {
+    let n = si_state["n"]
+    let prev = si_state["prev_weights"]
+    let running = si_state["running_sum"]
+    let omega = si_state["omega"]
+    let xi = si_state["xi"]
+
+    let mut i = 0
+    while i < n {
+        let delta = model_weights[i] - prev[i]
+        let contribution = running[i] * delta
+        // omega += max(0, -contribution) / (delta^2 + xi)
+        let denom = delta * delta + xi
+        let val = if contribution < 0.0 { 0.0 - contribution } else { 0.0 }
+        omega[i] = omega[i] + val / denom
+        prev[i] = model_weights[i]
+        running[i] = 0.0
+        i = i + 1
+    }
+
+    si_state["prev_weights"] = prev
+    si_state["omega"] = omega
+    si_state["running_sum"] = running
+    return si_state
+}
+
+// Compute SI penalty: sum(omega_i * (theta_i - theta*_i)^2)
+fn si_loss(model_weights, si_state) {
+    let n = si_state["n"]
+    let prev = si_state["prev_weights"]
+    let omega = si_state["omega"]
+
+    let mut loss = 0.0
+    let mut i = 0
+    while i < n {
+        let diff = model_weights[i] - prev[i]
+        loss = loss + omega[i] * diff * diff
+        i = i + 1
+    }
+    return loss
+}
+
+// ===================================================================
+//  Replay Buffer
+// ===================================================================
+
+fn create_replay_buffer(capacity) {
+    let buf = #{}
+    buf["capacity"] = capacity
+    buf["data"] = []
+    buf["size"] = 0
+    buf["write_pos"] = 0
+    return buf
+}
+
+// Add a sample (any value) to the buffer (circular)
+fn replay_add(buffer, sample) {
+    let data = buffer["data"]
+    let capacity = buffer["capacity"]
+    let size = buffer["size"]
+
+    if size < capacity {
+        buffer["data"] = data + [sample]
+        buffer["size"] = size + 1
+    } else {
+        // overwrite oldest
+        let pos = buffer["write_pos"]
+        data[pos] = sample
+        buffer["data"] = data
+        buffer["write_pos"] = (pos + 1) % capacity
+    }
+    return buffer
+}
+
+// Sample n items from the buffer (deterministic pseudo-random via index spreading)
+fn replay_sample(buffer, n) {
+    let data = buffer["data"]
+    let size = buffer["size"]
+    if size == 0 { return [] }
+
+    let actual_n = if n < size { n } else { size }
+    let mut samples = []
+    let step = if size > actual_n { size / actual_n } else { 1 }
+    let mut idx = 0
+    let mut count = 0
+    while count < actual_n {
+        samples = samples + [data[idx % size]]
+        idx = idx + step
+        count = count + 1
+    }
+    return samples
+}
+
+// ===================================================================
+//  Task Boundary Detection
+// ===================================================================
+
+// Detect if there is a task boundary in the loss history
+// Looks for sudden increase in loss (spike)
+// Returns index of boundary, or -1 if none detected
+fn detect_boundary(loss_history, threshold) {
+    let n = len(loss_history)
+    if n < 2 { return 0 - 1 }
+
+    let mut i = 1
+    while i < n {
+        let diff = loss_history[i] - loss_history[i - 1]
+        if diff > threshold {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// Windowed boundary detection: compare moving averages
+fn detect_boundary_window(loss_history, window, threshold) {
+    let n = len(loss_history)
+    if n < window * 2 { return 0 - 1 }
+
+    let mut i = window
+    while i < n - window + 1 {
+        // compute average of previous window
+        let mut prev_avg = 0.0
+        let mut j = i - window
+        while j < i {
+            prev_avg = prev_avg + loss_history[j]
+            j = j + 1
+        }
+        prev_avg = prev_avg / (window * 1.0)
+
+        // compute average of current window
+        let mut curr_avg = 0.0
+        j = i
+        while j < i + window {
+            curr_avg = curr_avg + loss_history[j]
+            j = j + 1
+        }
+        curr_avg = curr_avg / (window * 1.0)
+
+        let diff = curr_avg - prev_avg
+        if diff > threshold {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// ===================================================================
+//  Continual learning training helper
+//  Combines EWC + replay for a single training step
+// ===================================================================
+fn continual_train_step(model_weights, gradients, ewc_state, replay_buf, lr) {
+    let n = len(model_weights)
+
+    // compute EWC gradient penalty
+    let star = ewc_state["star_weights"]
+    let fisher = ewc_state["fisher"]
+    let lambda = ewc_state["lambda"]
+
+    let mut i = 0
+    while i < n {
+        // total gradient = task_gradient + lambda * F_i * (theta - theta*)
+        let ewc_grad = lambda * fisher[i] * (model_weights[i] - star[i])
+        model_weights[i] = model_weights[i] - lr * (gradients[i] + ewc_grad)
+        i = i + 1
+    }
+    return model_weights
+}
+
+println("[continual_learning] module loaded")

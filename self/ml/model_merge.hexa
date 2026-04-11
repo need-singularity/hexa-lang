@@ -1,0 +1,347 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/model_merge.hexa — Model Merging (TIES / DARE / SLERP)
+//
+//  Implements:
+//    1. TIES  — Trim (magnitude pruning) + Elect (sign consensus) + Merge (weighted avg)
+//    2. DARE  — Random Drop (mask) + Rescale + Merge
+//    3. SLERP — Spherical Linear Interpolation (2 models)
+//
+//  API (pure):
+//    ties_merge(models, weights, density)       -> [float]
+//    dare_merge(models, weights, drop_rate)     -> [float]
+//    slerp_merge(model_a, model_b, t)           -> [float]
+//    magnitude_trim(delta, density)             -> [float]
+//    sign_elect(deltas)                         -> [float]
+//    weighted_merge(trimmed, weights)           -> [float]
+//    dare_mask(delta, drop_rate, seed)          -> [float]
+//    dare_rescale(masked, drop_rate)            -> [float]
+//    vector_norm(v)                             -> float
+//    vector_dot(a, b)                           -> float
+//
+//  AI-NATIVE attrs:
+//    @pure     — no side effects
+//    @parallel — per-parameter independent
+// ═══════════════════════════════════════════════════════════════════
+
+// ── helpers ──────────────────────────────────────────────────────
+
+fn mm_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn mm_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0e-10 { g = 1.0e-5 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn mm_cos_approx(angle) {
+    // Taylor series for cos(x) around 0
+    let mut result = 1.0
+    let mut term = 1.0
+    for k in 1..12 {
+        term = 0.0 - term * angle * angle / to_float((2 * k - 1) * (2 * k))
+        result = result + term
+    }
+    return result
+}
+
+fn mm_sin_approx(angle) {
+    let mut result = angle
+    let mut term = angle
+    for k in 1..12 {
+        term = 0.0 - term * angle * angle / to_float((2 * k) * (2 * k + 1))
+        result = result + term
+    }
+    return result
+}
+
+fn mm_acos(x) {
+    // Approximate acos via atan2-style
+    // acos(x) = pi/2 - asin(x), asin via polynomial
+    let mut v = x
+    if v > 1.0 { v = 1.0 }
+    if v < -1.0 { v = -1.0 }
+    // Polynomial approximation for acos
+    let pi = 3.14159265358979
+    let x2 = v * v
+    let asin_v = v + v * x2 * (1.0/6.0 + x2 * (3.0/40.0 + x2 * (15.0/336.0)))
+    return pi / 2.0 - asin_v
+}
+
+fn mm_hash(seed, i) {
+    let h = ((seed * 2654435761 + i * 1315423911) % 10007)
+    return to_float(h) / 10007.0
+}
+
+fn mm_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Vector operations
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn vector_dot(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    for i in 0..n { s = s + a[i] * b[i] }
+    return s
+}
+
+@pure
+fn vector_norm(v) {
+    return mm_sqrt(vector_dot(v, v))
+}
+
+fn vector_normalize(v) {
+    let n = len(v)
+    let norm = vector_norm(v)
+    if norm < 1.0e-10 { return v }
+    let mut out = mm_zeros(n)
+    for i in 0..n { out[i] = v[i] / norm }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  TIES — Trim + Elect + Merge
+//
+//  1. For each model, compute delta = model - base (here models are deltas)
+//  2. Trim: keep only top-density% parameters by magnitude
+//  3. Elect: for each param position, pick the majority sign
+//  4. Merge: weighted average of trimmed+elected deltas
+// ═══════════════════════════════════════════════════════════════════
+
+// Trim: zero out parameters below magnitude threshold (keep top density%)
+@pure @parallel
+fn magnitude_trim(delta, density) {
+    let n = len(delta)
+    let keep = int(to_float(n) * density)
+    if keep >= n { return delta }
+    if keep <= 0 { return mm_zeros(n) }
+
+    // Find magnitude threshold by sorting magnitudes
+    let mut mags = []
+    for i in 0..n { mags = mags + [mm_abs(delta[i])] }
+
+    // Simple selection: find the k-th largest magnitude
+    // Sort magnitudes descending (insertion sort, small n)
+    let mut sorted_mags = []
+    for i in 0..n { sorted_mags = sorted_mags + [mags[i]] }
+    for i in 0..n {
+        for j in (i+1)..n {
+            if sorted_mags[j] > sorted_mags[i] {
+                let tmp = sorted_mags[i]
+                sorted_mags[i] = sorted_mags[j]
+                sorted_mags[j] = tmp
+            }
+        }
+    }
+    let threshold = sorted_mags[keep - 1]
+
+    // Zero out below threshold
+    let mut out = mm_zeros(n)
+    for i in 0..n {
+        if mm_abs(delta[i]) >= threshold {
+            out[i] = delta[i]
+        }
+    }
+    return out
+}
+
+// Elect: for each parameter position, determine majority sign across models
+@pure
+fn sign_elect(deltas) {
+    let num_models = len(deltas)
+    let n = len(deltas[0])
+    let mut elected = mm_zeros(n)
+    for i in 0..n {
+        let mut pos_sum = 0.0
+        let mut neg_sum = 0.0
+        let mut pos_count = 0
+        let mut neg_count = 0
+        for m in 0..num_models {
+            if deltas[m][i] > 0.0 {
+                pos_sum = pos_sum + deltas[m][i]
+                pos_count = pos_count + 1
+            }
+            if deltas[m][i] < 0.0 {
+                neg_sum = neg_sum + deltas[m][i]
+                neg_count = neg_count + 1
+            }
+        }
+        // Majority sign wins
+        if pos_count >= neg_count {
+            elected[i] = 1.0
+        } else {
+            elected[i] = -1.0
+        }
+    }
+    return elected
+}
+
+// Weighted merge of trimmed deltas with sign agreement
+@pure
+fn weighted_merge(trimmed, weights) {
+    let num_models = len(trimmed)
+    let n = len(trimmed[0])
+    let mut result = mm_zeros(n)
+    let mut total_w = 0.0
+    for m in 0..num_models { total_w = total_w + weights[m] }
+    for i in 0..n {
+        let mut s = 0.0
+        for m in 0..num_models {
+            s = s + trimmed[m][i] * weights[m]
+        }
+        result[i] = s / total_w
+    }
+    return result
+}
+
+// Full TIES merge pipeline
+@pure
+fn ties_merge(models, weights, density) {
+    let num_models = len(models)
+    let n = len(models[0])
+
+    // Step 1: Trim each model delta by magnitude
+    let mut trimmed = []
+    for m in 0..num_models {
+        let t = magnitude_trim(models[m], density)
+        trimmed = trimmed + [t]
+    }
+
+    // Step 2: Elect sign consensus
+    let signs = sign_elect(trimmed)
+
+    // Step 3: Apply sign mask — zero out parameters that disagree with consensus
+    let mut masked = []
+    for m in 0..num_models {
+        let mut v = mm_zeros(n)
+        for i in 0..n {
+            if signs[i] > 0.0 {
+                if trimmed[m][i] > 0.0 { v[i] = trimmed[m][i] }
+            } else {
+                if trimmed[m][i] < 0.0 { v[i] = trimmed[m][i] }
+            }
+        }
+        masked = masked + [v]
+    }
+
+    // Step 4: Weighted average
+    return weighted_merge(masked, weights)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  DARE — Drop And REscale
+//
+//  1. For each model delta, randomly drop (1-drop_rate) of parameters
+//  2. Rescale remaining by 1/(1-drop_rate)
+//  3. Weighted merge
+// ═══════════════════════════════════════════════════════════════════
+
+// Apply random drop mask
+@pure
+fn dare_mask(delta, drop_rate, seed) {
+    let n = len(delta)
+    let mut out = mm_zeros(n)
+    for i in 0..n {
+        let r = mm_hash(seed, i)
+        if r >= drop_rate {
+            out[i] = delta[i]
+        }
+    }
+    return out
+}
+
+// Rescale to compensate for dropped parameters
+@pure
+fn dare_rescale(masked, drop_rate) {
+    let n = len(masked)
+    let scale = if drop_rate < 0.999 { 1.0 / (1.0 - drop_rate) } else { 1.0 }
+    let mut out = mm_zeros(n)
+    for i in 0..n {
+        out[i] = masked[i] * scale
+    }
+    return out
+}
+
+// Full DARE merge pipeline
+@pure
+fn dare_merge(models, weights, drop_rate) {
+    let num_models = len(models)
+    let n = len(models[0])
+
+    // Drop + rescale each model
+    let mut processed = []
+    for m in 0..num_models {
+        let seed = (m + 1) * 42
+        let masked = dare_mask(models[m], drop_rate, seed)
+        let rescaled = dare_rescale(masked, drop_rate)
+        processed = processed + [rescaled]
+    }
+
+    // Weighted merge
+    return weighted_merge(processed, weights)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  SLERP — Spherical Linear Interpolation
+//
+//  slerp(a, b, t) = sin((1-t)*omega)/sin(omega) * a + sin(t*omega)/sin(omega) * b
+//  where omega = arccos(dot(a_norm, b_norm))
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn slerp_merge(model_a, model_b, t) {
+    let n = len(model_a)
+    let norm_a = vector_norm(model_a)
+    let norm_b = vector_norm(model_b)
+
+    if norm_a < 1.0e-10 { return model_b }
+    if norm_b < 1.0e-10 { return model_a }
+
+    // Normalize
+    let mut a_n = mm_zeros(n)
+    let mut b_n = mm_zeros(n)
+    for i in 0..n {
+        a_n[i] = model_a[i] / norm_a
+        b_n[i] = model_b[i] / norm_b
+    }
+
+    // Angle between vectors
+    let mut dot = 0.0
+    for i in 0..n { dot = dot + a_n[i] * b_n[i] }
+    // Clamp dot to [-1, 1]
+    if dot > 1.0 { dot = 1.0 }
+    if dot < -1.0 { dot = -1.0 }
+
+    let omega = mm_acos(dot)
+
+    // If vectors are nearly parallel, fall back to lerp
+    if mm_abs(omega) < 1.0e-6 {
+        let mut out = mm_zeros(n)
+        for i in 0..n {
+            out[i] = (1.0 - t) * model_a[i] + t * model_b[i]
+        }
+        return out
+    }
+
+    let sin_omega = mm_sin_approx(omega)
+    let w1 = mm_sin_approx((1.0 - t) * omega) / sin_omega
+    let w2 = mm_sin_approx(t * omega) / sin_omega
+
+    // Interpolate in original scale
+    let target_norm = (1.0 - t) * norm_a + t * norm_b
+    let mut out = mm_zeros(n)
+    for i in 0..n {
+        out[i] = (w1 * a_n[i] + w2 * b_n[i]) * target_norm
+    }
+    return out
+}

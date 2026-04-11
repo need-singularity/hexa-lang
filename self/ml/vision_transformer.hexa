@@ -1,0 +1,451 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/vision_transformer.hexa — Vision Transformer (ViT) + CLIP
+//
+//  Implements:
+//    1. Patch embedding  — split image into NxN patches, linear project
+//    2. ViT encoder      — [CLS] + patch tokens -> transformer blocks -> class
+//    3. CLIP contrastive — image emb + text emb -> cosine sim -> contrastive loss
+//
+//  API (pure):
+//    patch_embed(image, patch_size, d_model)      -> [[float]]
+//    vit_forward(patches, num_layers, num_heads)   -> [float]
+//    clip_loss(image_emb, text_emb, temperature)   -> float
+//    create_vit(img_size, patch_size, d_model, num_layers, num_heads) -> ViT
+//    vit_classify(vit, image, num_classes)          -> [float]
+//    cosine_similarity(a, b)                        -> float
+//    contrastive_matrix(image_embs, text_embs, temp) -> [[float]]
+//
+//  AI-NATIVE attrs:
+//    @pure     — no side effects
+//    @parallel — patch embedding is independent
+//    @hot      — called every forward step
+// ═══════════════════════════════════════════════════════════════════
+
+// ── helpers ──────────────────────────────────────────────────────
+
+fn vit_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn vit_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn vit_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn vit_log(x) {
+    if x <= 0.0 { return -30.0 }
+    let mut v = x
+    let mut count = 0
+    while v > 2.0 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    let d = v - 1.0
+    let ln_v = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_v
+}
+
+fn vit_zeros_1d(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn vit_zeros_2d(r, c) {
+    let mut m = []
+    for _i in 0..r {
+        let mut row = []
+        for _j in 0..c { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+fn vit_hash(seed, i, j) {
+    let h = ((seed * 2654435761 + i * 1315423911 + j * 731) % 10007)
+    return to_float(h) / 10007.0 - 0.5
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Patch Embedding
+//
+//  image: [H, W] (grayscale 2D)  or [H, W, C] flattened to [H*W]
+//  patch_size: N  (NxN patches)
+//  d_model: projection dimension
+//
+//  Returns: [num_patches, d_model]
+// ═══════════════════════════════════════════════════════════════════
+@pure @parallel
+fn patch_embed(image, patch_size, d_model) {
+    let H = len(image)
+    let W = len(image[0])
+    let num_patches_h = H / patch_size
+    let num_patches_w = W / patch_size
+    let patch_dim = patch_size * patch_size
+
+    // projection weight: [d_model, patch_dim]
+    let mut proj_w = vit_zeros_2d(d_model, patch_dim)
+    for i in 0..d_model {
+        for j in 0..patch_dim {
+            proj_w[i][j] = vit_hash(17, i, j) * 0.1
+        }
+    }
+
+    let mut patches = []
+    for ph in 0..num_patches_h {
+        for pw in 0..num_patches_w {
+            // extract patch
+            let mut flat_patch = []
+            for i in 0..patch_size {
+                for j in 0..patch_size {
+                    let row = ph * patch_size + i
+                    let col = pw * patch_size + j
+                    flat_patch = flat_patch + [image[row][col]]
+                }
+            }
+            // linear projection: proj_w @ flat_patch
+            let mut emb = vit_zeros_1d(d_model)
+            for i in 0..d_model {
+                let mut s = 0.0
+                for j in 0..patch_dim {
+                    s = s + proj_w[i][j] * flat_patch[j]
+                }
+                emb[i] = s
+            }
+            patches = patches + [emb]
+        }
+    }
+    return patches
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Positional Embedding — learnable (init = sinusoidal-like)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn positional_embedding(num_tokens, d_model) {
+    let mut pe = vit_zeros_2d(num_tokens, d_model)
+    for pos in 0..num_tokens {
+        for i in 0..d_model {
+            let angle = to_float(pos) / (10000.0 * to_float(i + 1) / to_float(d_model))
+            // sin/cos approx via Taylor
+            let mut sin_val = angle
+            let mut term = angle
+            for k in 1..8 {
+                term = 0.0 - term * angle * angle / to_float((2 * k) * (2 * k + 1))
+                sin_val = sin_val + term
+            }
+            pe[pos][i] = sin_val * 0.1
+        }
+    }
+    return pe
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Layer Norm
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn vit_layer_norm(x, d) {
+    let mut mean = 0.0
+    for i in 0..d { mean = mean + x[i] }
+    mean = mean / to_float(d)
+    let mut var = 0.0
+    for i in 0..d {
+        let diff = x[i] - mean
+        var = var + diff * diff
+    }
+    var = var / to_float(d)
+    let std = vit_sqrt(var + 1.0e-5)
+    let mut out = vit_zeros_1d(d)
+    for i in 0..d {
+        out[i] = (x[i] - mean) / std
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Self-Attention (multi-head)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn vit_softmax(scores, n) {
+    let mut m = scores[0]
+    for i in 1..n {
+        if scores[i] > m { m = scores[i] }
+    }
+    let mut exps = vit_zeros_1d(n)
+    let mut z = 0.0
+    for i in 0..n {
+        exps[i] = vit_exp(scores[i] - m)
+        z = z + exps[i]
+    }
+    for i in 0..n {
+        exps[i] = exps[i] / z
+    }
+    return exps
+}
+
+@pure
+fn vit_self_attention(tokens, num_tokens, d_model, num_heads) {
+    let head_dim = d_model / num_heads
+
+    // Simple single-head attention for prototype (scales to multi-head)
+    // Q = tokens, K = tokens, V = tokens (self-attention)
+    let scale = 1.0 / vit_sqrt(to_float(d_model))
+
+    // Compute attention scores
+    let mut attn_out = vit_zeros_2d(num_tokens, d_model)
+    for h in 0..num_heads {
+        let start = h * head_dim
+        for i in 0..num_tokens {
+            // scores[j] = Q[i] . K[j] / sqrt(d)
+            let mut scores = vit_zeros_1d(num_tokens)
+            for j in 0..num_tokens {
+                let mut s = 0.0
+                for k in 0..head_dim {
+                    s = s + tokens[i][start + k] * tokens[j][start + k]
+                }
+                scores[j] = s * scale
+            }
+            let weights = vit_softmax(scores, num_tokens)
+            // weighted sum of V
+            for k in 0..head_dim {
+                let mut v = 0.0
+                for j in 0..num_tokens {
+                    v = v + weights[j] * tokens[j][start + k]
+                }
+                attn_out[i][start + k] = v
+            }
+        }
+    }
+    return attn_out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  FFN (feed-forward network)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn vit_ffn(x, d_model) {
+    let d_ff = d_model * 4
+    // up projection + GELU approx + down projection
+    let mut hidden = vit_zeros_1d(d_ff)
+    for i in 0..d_ff {
+        let mut s = 0.0
+        for j in 0..d_model {
+            s = s + vit_hash(31, i, j) * 0.1 * x[j]
+        }
+        // GELU approx: x * sigmoid(1.702 * x)
+        let sig = 1.0 / (1.0 + vit_exp(0.0 - 1.702 * s))
+        hidden[i] = s * sig
+    }
+    // down
+    let mut out = vit_zeros_1d(d_model)
+    for i in 0..d_model {
+        let mut s = 0.0
+        for j in 0..d_ff {
+            s = s + vit_hash(47, i, j) * 0.1 * hidden[j]
+        }
+        out[i] = s
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  ViT Forward — full transformer encoder
+//
+//  patches:    [num_patches, d_model]
+//  num_layers: number of transformer blocks
+//  num_heads:  number of attention heads
+//
+//  Returns: [d_model] — CLS token representation
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn vit_forward(patches, num_layers, num_heads) {
+    let num_patches = len(patches)
+    let d_model = len(patches[0])
+    let num_tokens = num_patches + 1  // +1 for CLS
+
+    // Prepend CLS token (zeros)
+    let mut tokens = [vit_zeros_1d(d_model)]
+    for i in 0..num_patches {
+        tokens = tokens + [patches[i]]
+    }
+
+    // Add positional embedding
+    let pe = positional_embedding(num_tokens, d_model)
+    for i in 0..num_tokens {
+        for j in 0..d_model {
+            tokens[i][j] = tokens[i][j] + pe[i][j]
+        }
+    }
+
+    // Transformer blocks
+    for _layer in 0..num_layers {
+        // Layer norm + self attention + residual
+        let mut normed = []
+        for i in 0..num_tokens {
+            normed = normed + [vit_layer_norm(tokens[i], d_model)]
+        }
+        let attn_out = vit_self_attention(normed, num_tokens, d_model, num_heads)
+        for i in 0..num_tokens {
+            for j in 0..d_model {
+                tokens[i][j] = tokens[i][j] + attn_out[i][j]
+            }
+        }
+        // Layer norm + FFN + residual
+        for i in 0..num_tokens {
+            let normed_i = vit_layer_norm(tokens[i], d_model)
+            let ffn_out = vit_ffn(normed_i, d_model)
+            for j in 0..d_model {
+                tokens[i][j] = tokens[i][j] + ffn_out[j]
+            }
+        }
+    }
+
+    // Return CLS token (index 0) after final layer norm
+    return vit_layer_norm(tokens[0], d_model)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Cosine Similarity
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cosine_similarity(a, b) {
+    let d = len(a)
+    let mut dot = 0.0
+    let mut norm_a = 0.0
+    let mut norm_b = 0.0
+    for i in 0..d {
+        dot = dot + a[i] * b[i]
+        norm_a = norm_a + a[i] * a[i]
+        norm_b = norm_b + b[i] * b[i]
+    }
+    let denom = vit_sqrt(norm_a) * vit_sqrt(norm_b)
+    if denom < 1.0e-8 { return 0.0 }
+    return dot / denom
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  CLIP Contrastive Loss
+//
+//  image_emb: [batch, d]
+//  text_emb:  [batch, d]
+//  temperature: float (learnable, typically ~0.07)
+//
+//  loss = -0.5 * (mean(log(softmax(sim/temp)[i,i])) for image + text)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn clip_loss(image_emb, text_emb, temperature) {
+    let batch = len(image_emb)
+    let d = len(image_emb[0])
+
+    // Compute similarity matrix
+    let mut sim = vit_zeros_2d(batch, batch)
+    for i in 0..batch {
+        for j in 0..batch {
+            sim[i][j] = cosine_similarity(image_emb[i], text_emb[j]) / temperature
+        }
+    }
+
+    // Cross entropy loss along rows (image->text) and cols (text->image)
+    let mut loss_i2t = 0.0
+    let mut loss_t2i = 0.0
+    for i in 0..batch {
+        // image->text: softmax over row i, target = i
+        let row_sm = vit_softmax(sim[i], batch)
+        if row_sm[i] > 1.0e-10 {
+            loss_i2t = loss_i2t - vit_log(row_sm[i])
+        } else {
+            loss_i2t = loss_i2t + 30.0
+        }
+
+        // text->image: softmax over column i, target = i
+        let mut col = vit_zeros_1d(batch)
+        for j in 0..batch {
+            col[j] = sim[j][i]
+        }
+        let col_sm = vit_softmax(col, batch)
+        if col_sm[i] > 1.0e-10 {
+            loss_t2i = loss_t2i - vit_log(col_sm[i])
+        } else {
+            loss_t2i = loss_t2i + 30.0
+        }
+    }
+
+    return (loss_i2t + loss_t2i) / (2.0 * to_float(batch))
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Contrastive similarity matrix (for inspection)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn contrastive_matrix(image_embs, text_embs, temp) {
+    let batch = len(image_embs)
+    let mut sim = vit_zeros_2d(batch, batch)
+    for i in 0..batch {
+        for j in 0..batch {
+            sim[i][j] = cosine_similarity(image_embs[i], text_embs[j]) / temp
+        }
+    }
+    return sim
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  ViT struct + classify
+// ═══════════════════════════════════════════════════════════════════
+struct ViT {
+    img_size: int,
+    patch_size: int,
+    d_model: int,
+    num_layers: int,
+    num_heads: int,
+    num_patches: int
+}
+
+fn create_vit(img_size, patch_size, d_model, num_layers, num_heads) {
+    let np = (img_size / patch_size) * (img_size / patch_size)
+    return ViT {
+        img_size: img_size,
+        patch_size: patch_size,
+        d_model: d_model,
+        num_layers: num_layers,
+        num_heads: num_heads,
+        num_patches: np
+    }
+}
+
+fn vit_classify(vit, image, num_classes) {
+    let patches = patch_embed(image, vit.patch_size, vit.d_model)
+    let cls_token = vit_forward(patches, vit.num_layers, vit.num_heads)
+    // classification head: linear projection
+    let mut logits = vit_zeros_1d(num_classes)
+    for c in 0..num_classes {
+        let mut s = 0.0
+        for j in 0..vit.d_model {
+            s = s + vit_hash(53, c, j) * 0.1 * cls_token[j]
+        }
+        logits[c] = s
+    }
+    return logits
+}

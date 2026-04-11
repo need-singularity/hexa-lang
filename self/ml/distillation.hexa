@@ -1,0 +1,264 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/distillation.hexa — Knowledge Distillation
+//
+//  Implements:
+//    1. Teacher forward    — extract soft logits from large model
+//    2. KL divergence loss — student vs teacher distribution comparison
+//    3. Temperature scaling — softmax temperature for distribution smoothing
+//    4. Combined loss      — alpha * KL + (1-alpha) * CE
+//    5. Distill train step — single gradient update step
+//
+//  API (pure):
+//    soft_targets(logits, temp)                               -> [float]
+//    distill_loss(student_logits, teacher_logits, temp, alpha) -> float
+//    distill_train_step(student, teacher, input, temp, alpha, lr) -> student'
+//    kl_divergence(p, q)                                      -> float
+//    cross_entropy_loss(logits, target_idx)                    -> float
+//    softmax_with_temp(logits, temp)                           -> [float]
+//    teacher_forward(weights, input)                           -> [float]
+//    student_forward(weights, input)                           -> [float]
+//
+//  AI-NATIVE attrs:
+//    @pure     — no side effects
+//    @hot      — called every training step
+// ═══════════════════════════════════════════════════════════════════
+
+// ── helpers ──────────────────────────────────────────────────────
+
+fn kd_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn kd_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn kd_log(x) {
+    if x <= 0.0 { return -30.0 }
+    let mut v = x
+    let mut count = 0
+    while v > 2.0 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    let d = v - 1.0
+    let ln_v = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_v
+}
+
+fn kd_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn kd_hash(seed, i, j) {
+    let h = ((seed * 2654435761 + i * 1315423911 + j * 731) % 10007)
+    return to_float(h) / 10007.0 - 0.5
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Softmax with Temperature
+//
+//  softmax(x/T) — higher T produces softer distribution
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn softmax_with_temp(logits, temp) {
+    let n = len(logits)
+    let mut scaled = kd_zeros(n)
+    for i in 0..n {
+        scaled[i] = logits[i] / temp
+    }
+    // max for numerical stability
+    let mut m = scaled[0]
+    for i in 1..n {
+        if scaled[i] > m { m = scaled[i] }
+    }
+    let mut exps = kd_zeros(n)
+    let mut z = 0.0
+    for i in 0..n {
+        exps[i] = kd_exp(scaled[i] - m)
+        z = z + exps[i]
+    }
+    let mut out = kd_zeros(n)
+    for i in 0..n {
+        out[i] = exps[i] / z
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Soft Targets — temperature-scaled softmax of logits
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn soft_targets(logits, temp) {
+    return softmax_with_temp(logits, temp)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  KL Divergence — KL(P || Q) = sum(P * log(P/Q))
+//
+//  P = teacher distribution, Q = student distribution
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn kl_divergence(p, q) {
+    let n = len(p)
+    let mut kl = 0.0
+    for i in 0..n {
+        if p[i] > 1.0e-10 {
+            let ratio = p[i] / (q[i] + 1.0e-10)
+            kl = kl + p[i] * kd_log(ratio)
+        }
+    }
+    return kl
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Cross Entropy Loss — CE = -log(softmax(logits)[target])
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cross_entropy_loss(logits, target_idx) {
+    let probs = softmax_with_temp(logits, 1.0)
+    let p = probs[target_idx]
+    if p > 1.0e-10 {
+        return 0.0 - kd_log(p)
+    }
+    return 30.0
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Teacher / Student Forward — mock linear models
+//
+//  weights: [out_dim, in_dim]
+//  input:   [in_dim]
+//  returns: [out_dim] logits
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn teacher_forward(weights, input) {
+    let out_dim = len(weights)
+    let in_dim = len(input)
+    let mut logits = kd_zeros(out_dim)
+    for i in 0..out_dim {
+        let mut s = 0.0
+        for j in 0..in_dim {
+            s = s + weights[i][j] * input[j]
+        }
+        logits[i] = s
+    }
+    return logits
+}
+
+@pure
+fn student_forward(weights, input) {
+    let out_dim = len(weights)
+    let in_dim = len(input)
+    let mut logits = kd_zeros(out_dim)
+    for i in 0..out_dim {
+        let mut s = 0.0
+        for j in 0..in_dim {
+            s = s + weights[i][j] * input[j]
+        }
+        logits[i] = s
+    }
+    return logits
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Distillation Loss — combined KL + CE
+//
+//  loss = alpha * T^2 * KL(teacher_soft || student_soft) + (1-alpha) * CE
+//
+//  T^2 scaling compensates for the gradient magnitude reduction
+//  when using temperature-scaled softmax.
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn distill_loss(student_logits, teacher_logits, temp, alpha) {
+    // Soft probability distributions
+    let teacher_soft = soft_targets(teacher_logits, temp)
+    let student_soft = soft_targets(student_logits, temp)
+
+    // KL divergence loss (scaled by T^2)
+    let kl = kl_divergence(teacher_soft, student_soft)
+    let kl_loss = alpha * temp * temp * kl
+
+    // Hard target CE loss (temp=1, assume target is argmax of teacher)
+    let mut target_idx = 0
+    let mut max_val = teacher_logits[0]
+    for i in 1..len(teacher_logits) {
+        if teacher_logits[i] > max_val {
+            max_val = teacher_logits[i]
+            target_idx = i
+        }
+    }
+    let ce = cross_entropy_loss(student_logits, target_idx)
+    let ce_loss = (1.0 - alpha) * ce
+
+    return kl_loss + ce_loss
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Distillation Train Step
+//
+//  Single gradient descent step on the student model:
+//    1. Forward both teacher and student
+//    2. Compute distillation loss
+//    3. Numerical gradient (finite differences)
+//    4. Update student weights
+//
+//  student: [out_dim, in_dim]
+//  teacher: [out_dim, in_dim]
+//  input:   [in_dim]
+//  Returns: updated student weights
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn distill_train_step(student, teacher, input, temp, alpha, lr) {
+    let out_dim = len(student)
+    let in_dim = len(student[0])
+    let eps = 1.0e-4
+
+    // Teacher logits (fixed)
+    let teacher_logits = teacher_forward(teacher, input)
+
+    // Current loss
+    let student_logits = student_forward(student, input)
+    let loss0 = distill_loss(student_logits, teacher_logits, temp, alpha)
+
+    // Gradient via finite differences + update
+    let mut new_student = []
+    for i in 0..out_dim {
+        let mut row = kd_zeros(in_dim)
+        for j in 0..in_dim {
+            row[j] = student[i][j]
+        }
+        new_student = new_student + [row]
+    }
+
+    for i in 0..out_dim {
+        for j in 0..in_dim {
+            // Perturb
+            let orig = new_student[i][j]
+            new_student[i][j] = orig + eps
+            let logits_p = student_forward(new_student, input)
+            let loss_p = distill_loss(logits_p, teacher_logits, temp, alpha)
+            let grad = (loss_p - loss0) / eps
+            new_student[i][j] = orig - lr * grad
+        }
+    }
+
+    return new_student
+}

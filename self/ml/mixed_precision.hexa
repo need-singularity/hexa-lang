@@ -1,0 +1,283 @@
+// ===================================================================
+//  mixed_precision.hexa — Mixed Precision Training (FP16/FP32)
+//
+//  FP16 forward/backward + FP32 master weights + dynamic loss scaling.
+//
+//  API:
+//    create_mp_state(weights)          -> MixedPrecisionState
+//    mp_forward(state, input)          -> array (FP16 output)
+//    mp_backward(state, grad)          -> array (FP16 gradient)
+//    mp_optimizer_step(state, lr)      -> MixedPrecisionState (updated)
+//    check_overflow(grad)              -> bool
+//
+//  Uses no external imports -- pure hexa.
+// ===================================================================
+
+// ── Structs ─────────────────────────────────────────────────────
+
+struct MixedPrecisionState {
+    master_weights: array,
+    fp16_weights: array,
+    fp16_grads: array,
+    loss_scale: float,
+    scale_factor: float,
+    backoff_factor: float,
+    growth_factor: float,
+    growth_interval: int,
+    steps_since_last_overflow: int,
+    overflow_count: int,
+    step_count: int
+}
+
+// ── Math helpers ────────────────────────────────────────────────
+
+fn _mp_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn _mp_clamp(v, lo, hi) {
+    if v < lo { return lo }
+    if v > hi { return hi }
+    return v
+}
+
+// ── FP16 simulation ─────────────────────────────────────────────
+// Simulate FP16 precision by truncating to ~3.3 decimal digits
+// FP16 range: 6.1e-5 to 65504, 10-bit mantissa
+
+fn _to_fp16(val) {
+    if val == 0.0 { return 0.0 }
+    let mut v = val
+    let mut sign_neg = false
+    if v < 0.0 {
+        sign_neg = true
+        v = 0.0 - v
+    }
+    // Overflow check
+    if v > 65504.0 {
+        if sign_neg { return -65504.0 }
+        return 65504.0
+    }
+    // Underflow check (flush to zero)
+    if v < 0.00006103515625 {
+        return 0.0
+    }
+    // Find exponent
+    let mut exp = 0
+    let mut m = v
+    if m >= 2.0 {
+        while m >= 2.0 {
+            m = m / 2.0
+            exp = exp + 1
+        }
+    } else {
+        while m < 1.0 {
+            m = m * 2.0
+            exp = exp - 1
+        }
+    }
+    // Truncate mantissa to 10 bits
+    let frac = m - 1.0
+    let mant10 = int(frac * 1024.0 + 0.5)
+    let mut mc = mant10
+    if mc > 1023 { mc = 1023 }
+    let result = (1.0 + to_float(mc) / 1024.0) * pow(2.0, to_float(exp))
+    if sign_neg { return 0.0 - result }
+    return result
+}
+
+fn _array_to_fp16(arr) {
+    let n = len(arr)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [_to_fp16(arr[i])]
+        i = i + 1
+    }
+    return out
+}
+
+// ── Overflow detection ──────────────────────────────────────────
+
+fn check_overflow(grad) {
+    let n = len(grad)
+    let mut i = 0
+    while i < n {
+        let v = _mp_abs(grad[i])
+        // NaN check: NaN != NaN
+        if v != v { return true }
+        // Inf / FP16 overflow
+        if v > 65504.0 { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ── Create state ────────────────────────────────────────────────
+
+fn create_mp_state(weights) {
+    let fp16_w = _array_to_fp16(weights)
+    let n = len(weights)
+    let mut zeros = []
+    let mut i = 0
+    while i < n {
+        zeros = zeros + [0.0]
+        i = i + 1
+    }
+    return MixedPrecisionState {
+        master_weights: weights,
+        fp16_weights: fp16_w,
+        fp16_grads: zeros,
+        loss_scale: 1024.0,
+        scale_factor: 1024.0,
+        backoff_factor: 0.5,
+        growth_factor: 2.0,
+        growth_interval: 200,
+        steps_since_last_overflow: 0,
+        overflow_count: 0,
+        step_count: 0
+    }
+}
+
+// ── FP16 Forward ────────────────────────────────────────────────
+// Simulate forward pass: output = input * weight (element-wise for demo)
+// All computation in FP16 precision
+
+fn mp_forward(state, input) {
+    let n = len(input)
+    let wn = len(state.fp16_weights)
+    let sz = n
+    if wn < sz { let sz = wn }
+    let mut output = []
+    let mut i = 0
+    while i < n {
+        let wi = i % wn
+        let val = _to_fp16(input[i] * state.fp16_weights[wi])
+        output = output + [val]
+        i = i + 1
+    }
+    return output
+}
+
+// ── FP16 Backward ───────────────────────────────────────────────
+// Scale gradients by loss_scale, compute in FP16, then unscale
+
+fn mp_backward(state, grad) {
+    let n = len(grad)
+    let mut scaled_grad = []
+    let mut i = 0
+    while i < n {
+        scaled_grad = scaled_grad + [_to_fp16(grad[i] * state.loss_scale)]
+        i = i + 1
+    }
+    // Unscale back
+    let mut unscaled = []
+    i = 0
+    while i < n {
+        unscaled = unscaled + [_to_fp16(scaled_grad[i] / state.loss_scale)]
+        i = i + 1
+    }
+    return unscaled
+}
+
+// ── FP32 Optimizer Step ─────────────────────────────────────────
+// Update master weights in FP32, then cast back to FP16
+
+fn mp_optimizer_step(state, lr) {
+    let n = len(state.master_weights)
+    let gn = len(state.fp16_grads)
+    let has_overflow = check_overflow(state.fp16_grads)
+
+    let mut new_scale = state.loss_scale
+    let mut new_steps = state.steps_since_last_overflow
+    let mut new_overflow = state.overflow_count
+
+    if has_overflow {
+        // Overflow detected: skip update, reduce scale
+        new_scale = state.loss_scale * state.backoff_factor
+        if new_scale < 1.0 { new_scale = 1.0 }
+        new_steps = 0
+        new_overflow = state.overflow_count + 1
+        return MixedPrecisionState {
+            master_weights: state.master_weights,
+            fp16_weights: state.fp16_weights,
+            fp16_grads: state.fp16_grads,
+            loss_scale: new_scale,
+            scale_factor: state.scale_factor,
+            backoff_factor: state.backoff_factor,
+            growth_factor: state.growth_factor,
+            growth_interval: state.growth_interval,
+            steps_since_last_overflow: new_steps,
+            overflow_count: new_overflow,
+            step_count: state.step_count + 1
+        }
+    }
+
+    // No overflow: update master weights in FP32
+    let mut new_weights = []
+    let mut i = 0
+    while i < n {
+        let gi = i % gn
+        let g = state.fp16_grads[gi]
+        let w = state.master_weights[i] - lr * g
+        new_weights = new_weights + [w]
+        i = i + 1
+    }
+
+    // Cast updated FP32 weights to FP16
+    let new_fp16 = _array_to_fp16(new_weights)
+
+    // Growth: increase scale if no overflow for growth_interval steps
+    new_steps = state.steps_since_last_overflow + 1
+    if new_steps >= state.growth_interval {
+        new_scale = state.loss_scale * state.growth_factor
+        if new_scale > 65504.0 { new_scale = 65504.0 }
+        new_steps = 0
+    }
+
+    let mut zeros = []
+    i = 0
+    while i < gn {
+        zeros = zeros + [0.0]
+        i = i + 1
+    }
+
+    return MixedPrecisionState {
+        master_weights: new_weights,
+        fp16_weights: new_fp16,
+        fp16_grads: zeros,
+        loss_scale: new_scale,
+        scale_factor: state.scale_factor,
+        backoff_factor: state.backoff_factor,
+        growth_factor: state.growth_factor,
+        growth_interval: state.growth_interval,
+        steps_since_last_overflow: new_steps,
+        overflow_count: new_overflow,
+        step_count: state.step_count + 1
+    }
+}
+
+// ── Utility ─────────────────────────────────────────────────────
+
+fn mp_set_grads(state, grads) {
+    return MixedPrecisionState {
+        master_weights: state.master_weights,
+        fp16_weights: state.fp16_weights,
+        fp16_grads: grads,
+        loss_scale: state.loss_scale,
+        scale_factor: state.scale_factor,
+        backoff_factor: state.backoff_factor,
+        growth_factor: state.growth_factor,
+        growth_interval: state.growth_interval,
+        steps_since_last_overflow: state.steps_since_last_overflow,
+        overflow_count: state.overflow_count,
+        step_count: state.step_count
+    }
+}
+
+fn mp_summary(state) {
+    println("[mixed_precision] step=" + str(state.step_count) + " loss_scale=" + str(state.loss_scale) + " overflows=" + str(state.overflow_count))
+}
+
+println("[mixed_precision] loaded — FP16 forward/backward + FP32 master weights + dynamic loss scaling")

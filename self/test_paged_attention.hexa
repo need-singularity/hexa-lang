@@ -1,0 +1,180 @@
+// ═══════════════════════════════════════════════════════════════
+//  test_paged_attention.hexa — PagedAttention correctness tests
+//
+//  Verifies:
+//    1. Block table creation and allocation
+//    2. Free list management
+//    3. KV block read/write
+//    4. Paged attention forward correctness
+//    5. Copy-on-write fork and isolation
+//    6. Edge cases: single block, full allocation
+//
+//  Run: ./hexa self/test_paged_attention.hexa
+// ═══════════════════════════════════════════════════════════════
+
+import "ml/paged_attention.hexa"
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+println("═══════════════════════════════════════════════════════")
+println("  PagedAttention Test Suite")
+println("═══════════════════════════════════════════════════════")
+
+// ── Test 1: create_block_table initial state ─────────────────
+let table0 = create_block_table(8, 4)
+check("create_block_table: 8 blocks", table0.num_blocks == 8)
+check("create_block_table: free=8", num_free_blocks(table0) == 8)
+
+// ── Test 2: allocate_block ──────────────────────────────────
+let r1 = allocate_block(table0)
+let t1 = r1[0]
+let pid1 = r1[1]
+check("allocate_block: phys_id >= 0", pid1 >= 0)
+check("allocate_block: free=7", num_free_blocks(t1) == 7)
+
+// ── Test 3: allocate multiple blocks ────────────────────────
+let r2 = allocate_block(t1)
+let t2 = r2[0]
+let pid2 = r2[1]
+check("allocate 2nd: different phys_id", pid2 != pid1)
+check("allocate 2nd: free=6", num_free_blocks(t2) == 6)
+
+// ── Test 4: free_block returns block to free list ───────────
+let t3 = free_block(t2, pid1)
+check("free_block: free=7", num_free_blocks(t3) == 7)
+
+// ── Test 5: create kv_blocks and write/read ─────────────────
+let block_size = 4
+let head_dim = 2
+let mut blocks = create_kv_blocks(8, block_size, head_dim)
+let k0 = [1.0, 2.0]
+let v0 = [10.0, 20.0]
+blocks = write_kv_to_block(blocks, pid2, 0, k0, v0, head_dim)
+let k_read = read_k_from_block(blocks, pid2, 0, head_dim)
+let v_read = read_v_from_block(blocks, pid2, 0, head_dim, block_size)
+let k_ok = fabs(k_read[0] - 1.0) < 1.0e-6
+let v_ok = fabs(v_read[0] - 10.0) < 1.0e-6
+check("write/read KV block: keys correct", k_ok && fabs(k_read[1] - 2.0) < 1.0e-6)
+check("write/read KV block: values correct", v_ok && fabs(v_read[1] - 20.0) < 1.0e-6)
+
+// ── Test 6: paged_attention_forward single token ─────────────
+// Set up: 1 block, 1 token, Q=[1,2], K=[1,2], V=[10,20]
+let mut tab = create_block_table(4, 2)
+let ra = allocate_block(tab)
+tab = ra[0]
+let phys0 = ra[1]
+let bs = 2
+let hd = 2
+let mut kvb = create_kv_blocks(4, bs, hd)
+kvb = write_kv_to_block(kvb, phys0, 0, [1.0, 0.0], [5.0, 3.0], hd)
+
+let Q1 = [[1.0, 0.0]]
+let out1 = paged_attention_forward(Q1, tab, kvb, 1, bs, hd)
+// single KV token -> output = V[0] = [5.0, 3.0]
+check("paged_attn single token: out=V[0]", fabs(out1[0][0] - 5.0) < 1.0e-5 && fabs(out1[0][1] - 3.0) < 1.0e-5)
+
+// ── Test 7: paged_attention_forward 2 tokens in 1 block ──────
+kvb = write_kv_to_block(kvb, phys0, 1, [0.0, 1.0], [1.0, 7.0], hd)
+let Q2 = [[1.0, 0.0]]
+let out2 = paged_attention_forward(Q2, tab, kvb, 2, bs, hd)
+// Q=[1,0] dot K=[1,0]=1.0, Q=[1,0] dot K=[0,1]=0.0
+// softmax-weighted: mostly V[0]=[5,3]
+let q_dot_0 = 1.0 / sqrt(2.0)
+let q_dot_1 = 0.0
+let e0 = exp(q_dot_0)
+let e1 = exp(q_dot_1)
+let w0 = e0 / (e0 + e1)
+let w1 = e1 / (e0 + e1)
+let expected_0 = w0 * 5.0 + w1 * 1.0
+let expected_1 = w0 * 3.0 + w1 * 7.0
+check("paged_attn 2 tokens: dim0 correct", fabs(out2[0][0] - expected_0) < 1.0e-4)
+check("paged_attn 2 tokens: dim1 correct", fabs(out2[0][1] - expected_1) < 1.0e-4)
+
+// ── Test 8: fork_block_table — cow sharing ──────────────────
+let mut orig_tab = create_block_table(8, 4)
+let ra2 = allocate_block(orig_tab)
+orig_tab = ra2[0]
+let orig_pid = ra2[1]
+let forked = fork_block_table(orig_tab)
+// ref count should be 2 for the shared block
+check("fork: ref_count=2 on shared block", forked.ref_count[orig_pid] == 2)
+check("fork: cow_flag=1 on shared block", forked.cow_flag[orig_pid] == 1)
+
+// ── Test 9: free_all_blocks ─────────────────────────────────
+let mut tab4 = create_block_table(4, 2)
+let r_a = allocate_block(tab4)
+tab4 = r_a[0]
+let r_b = allocate_block(tab4)
+tab4 = r_b[0]
+check("before free_all: free=2", num_free_blocks(tab4) == 2)
+tab4 = free_all_blocks(tab4)
+check("after free_all: free=4", num_free_blocks(tab4) == 4)
+
+// ── Test 10: exhaust all blocks ─────────────────────────────
+let mut small_tab = create_block_table(2, 1)
+let rx = allocate_block(small_tab)
+small_tab = rx[0]
+let ry = allocate_block(small_tab)
+small_tab = ry[0]
+check("exhaust: free=0", num_free_blocks(small_tab) == 0)
+// next alloc should return -1
+let rz = allocate_block(small_tab)
+let failed_pid = rz[1]
+check("exhaust: alloc returns -1", failed_pid == -1)
+
+// ── Test 11: multi-block paged attention ────────────────────
+// 2 blocks, block_size=2, 3 tokens across 2 blocks
+let mut mtab = create_block_table(4, 2)
+let m1 = allocate_block(mtab)
+mtab = m1[0]
+let mp1 = m1[1]
+let m2 = allocate_block(mtab)
+mtab = m2[0]
+let mp2 = m2[1]
+let mbs = 2
+let mhd = 2
+let mut mkvb = create_kv_blocks(4, mbs, mhd)
+mkvb = write_kv_to_block(mkvb, mp1, 0, [1.0, 0.0], [1.0, 0.0], mhd)
+mkvb = write_kv_to_block(mkvb, mp1, 1, [0.0, 1.0], [0.0, 1.0], mhd)
+mkvb = write_kv_to_block(mkvb, mp2, 0, [1.0, 1.0], [0.5, 0.5], mhd)
+let QM = [[1.0, 1.0]]
+let outm = paged_attention_forward(QM, mtab, mkvb, 3, mbs, mhd)
+// Q=[1,1] dots: K[0]=[1,0]->1, K[1]=[0,1]->1, K[2]=[1,1]->2
+// all scaled by 1/sqrt(2)
+let s0 = 1.0 / sqrt(2.0)
+let s1 = 1.0 / sqrt(2.0)
+let s2 = 2.0 / sqrt(2.0)
+let e_0 = exp(s0)
+let e_1 = exp(s1)
+let e_2 = exp(s2)
+let total_e = e_0 + e_1 + e_2
+let exp_d0 = e_0 * 1.0 / total_e + e_1 * 0.0 / total_e + e_2 * 0.5 / total_e
+let exp_d1 = e_0 * 0.0 / total_e + e_1 * 1.0 / total_e + e_2 * 0.5 / total_e
+check("multi-block paged_attn: dim0", fabs(outm[0][0] - exp_d0) < 1.0e-4)
+check("multi-block paged_attn: dim1", fabs(outm[0][1] - exp_d1) < 1.0e-4)
+
+// ═══════════════════════════════════════════════════════════════
+println("")
+println("pass=" + to_string(pass_count) + " fail=" + to_string(fail_count))
+if fail_count == 0 {
+    println("ALL PASS")
+} else {
+    println("FAILED")
+}
+println(to_string(pass_count) + " passed")

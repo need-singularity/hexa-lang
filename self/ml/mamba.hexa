@@ -1,0 +1,400 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/mamba.hexa — SSM / Mamba (State Space Model)
+//
+//  Implements:
+//    1. S4 block      — state space (A,B,C,D) matrices + ZOH discretization
+//    2. Selective scan — input-dependent gate for selective state update
+//    3. Mamba block    — conv1d -> SSM -> output gate
+//
+//  API (pure):
+//    create_ssm(d_model, d_state)                    -> SSM
+//    ssm_forward(ssm, x)                             -> [float]
+//    selective_scan(x, A, B, C, delta)                -> [float]
+//    mamba_block(x, conv, ssm)                        -> [float]
+//    discretize_zoh(A, B, delta)                      -> [Ad, Bd]
+//    conv1d_forward(x, kernel, d_model)               -> [[float]]
+//    create_mamba_block(d_model, d_state, conv_width) -> MambaBlock
+//    mamba_forward(block, x)                          -> [float]
+//
+//  AI-NATIVE attrs:
+//    @pure     — no side effects
+//    @fuse     — loop body fused
+//    @hot      — called every forward step
+// ═══════════════════════════════════════════════════════════════════
+
+// ── helpers ──────────────────────────────────────────────────────
+
+fn mamba_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn mamba_exp(x) {
+    // Taylor series exp for small |x|, clamped
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn mamba_sigmoid(x) {
+    return 1.0 / (1.0 + mamba_exp(0.0 - x))
+}
+
+fn mamba_zeros_1d(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn mamba_zeros_2d(r, c) {
+    let mut m = []
+    for _i in 0..r {
+        let mut row = []
+        for _j in 0..c { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+fn mamba_ones_1d(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [1.0] }
+    return v
+}
+
+// ── deterministic pseudo-random for init ────────────────────────
+fn mamba_hash(seed, i, j) {
+    let h = ((seed * 2654435761 + i * 1315423911 + j * 731) % 10007)
+    let hf = to_float(h) / 10007.0 - 0.5
+    return hf
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  SSM struct
+// ═══════════════════════════════════════════════════════════════════
+struct SSM {
+    d_model: int,
+    d_state: int,
+    A: array,       // [d_state, d_state] — state transition
+    B: array,       // [d_state, d_model] — input projection
+    C: array,       // [d_model, d_state] — output projection
+    D: array        // [d_model]          — skip connection
+}
+
+// ── create_ssm ──────────────────────────────────────────────────
+@pure
+fn create_ssm(d_model, d_state) {
+    // A: HiPPO-style diagonal initialization (-1, -2, ..., -N)
+    let mut A = mamba_zeros_2d(d_state, d_state)
+    for i in 0..d_state {
+        A[i][i] = 0.0 - to_float(i + 1)
+    }
+    // B: small random
+    let mut B = mamba_zeros_2d(d_state, d_model)
+    for i in 0..d_state {
+        for j in 0..d_model {
+            B[i][j] = mamba_hash(42, i, j) * 0.1
+        }
+    }
+    // C: small random
+    let mut C = mamba_zeros_2d(d_model, d_state)
+    for i in 0..d_model {
+        for j in 0..d_state {
+            C[i][j] = mamba_hash(73, i, j) * 0.1
+        }
+    }
+    // D: ones (skip connection)
+    let D = mamba_ones_1d(d_model)
+
+    return SSM {
+        d_model: d_model,
+        d_state: d_state,
+        A: A,
+        B: B,
+        C: C,
+        D: D
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Discretization — Zero-Order Hold (ZOH)
+//
+//  Ad = exp(A * delta)     (diagonal approx: Ad[i][i] = exp(A[i][i]*delta))
+//  Bd = (Ad - I) * A^{-1} * B   (diagonal approx)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn discretize_zoh(A, B, delta) {
+    let d_state = len(A)
+    let d_model = len(B[0])
+    // Ad: exp(A*delta) diagonal
+    let mut Ad = mamba_zeros_2d(d_state, d_state)
+    for i in 0..d_state {
+        Ad[i][i] = mamba_exp(A[i][i] * delta)
+    }
+    // Bd: (Ad - I) * A^{-1} * B  diagonal simplification
+    //   Bd[i][j] = (exp(Aii*dt)-1) / Aii * B[i][j]
+    let mut Bd = mamba_zeros_2d(d_state, d_model)
+    for i in 0..d_state {
+        let a_ii = A[i][i]
+        let factor = if mamba_abs(a_ii) < 1.0e-8 {
+            delta
+        } else {
+            (mamba_exp(a_ii * delta) - 1.0) / a_ii
+        }
+        for j in 0..d_model {
+            Bd[i][j] = factor * B[i][j]
+        }
+    }
+    return [Ad, Bd]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  SSM forward — single time step
+//
+//  h_{t+1} = Ad * h_t + Bd * x_t
+//  y_t     = C * h_t + D * x_t
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn ssm_forward(ssm, x) {
+    let d_model = ssm.d_model
+    let d_state = ssm.d_state
+    let delta = 1.0  // default step size
+
+    let disc = discretize_zoh(ssm.A, ssm.B, delta)
+    let Ad = disc[0]
+    let Bd = disc[1]
+
+    // initial state = zeros
+    let mut h = mamba_zeros_1d(d_state)
+
+    // single step: h = Ad*h + Bd*x
+    let mut h_new = mamba_zeros_1d(d_state)
+    for i in 0..d_state {
+        let mut s = 0.0
+        // Ad*h (diagonal)
+        s = s + Ad[i][i] * h[i]
+        // Bd*x
+        for j in 0..d_model {
+            s = s + Bd[i][j] * x[j]
+        }
+        h_new[i] = s
+    }
+
+    // y = C*h_new + D*x
+    let mut y = mamba_zeros_1d(d_model)
+    for i in 0..d_model {
+        let mut s = 0.0
+        for j in 0..d_state {
+            s = s + ssm.C[i][j] * h_new[j]
+        }
+        y[i] = s + ssm.D[i] * x[i]
+    }
+    return y
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Selective Scan — input-dependent delta gating
+//
+//  For each time step t in sequence:
+//    delta_t = softplus(delta[t])
+//    Ad_t = exp(A * delta_t)  (diagonal)
+//    Bd_t = (Ad_t - I)/A * B
+//    h_{t+1} = Ad_t * h_t + Bd_t * x_t
+//    y_t = C * h_t
+//
+//  x:     [seq_len, d_model]
+//  A:     [d_state, d_state]
+//  B:     [d_state, d_model]
+//  C:     [d_model, d_state]
+//  delta: [seq_len]  (per-step gate)
+//  returns: [seq_len, d_model]
+// ═══════════════════════════════════════════════════════════════════
+@pure @fuse
+fn selective_scan(x, A, B, C, delta) {
+    let seq_len = len(x)
+    let d_model = len(x[0])
+    let d_state = len(A)
+
+    let mut h = mamba_zeros_1d(d_state)
+    let mut output = []
+
+    for t in 0..seq_len {
+        // softplus on delta
+        let dt = if delta[t] > 20.0 { delta[t] } else {
+            let e = mamba_exp(delta[t])
+            if e > 1.0e-8 {
+                let v = e + 1.0
+                // ln(1+exp(x)) approx
+                let mut ln_v = 0.0
+                let mut vv = v
+                // simple ln via iteration
+                let mut count = 0
+                while vv > 2.0 {
+                    vv = vv / 2.718281828
+                    count = count + 1
+                }
+                ln_v = to_float(count) + (vv - 1.0) - (vv - 1.0) * (vv - 1.0) / 2.0 + (vv - 1.0) * (vv - 1.0) * (vv - 1.0) / 3.0
+                ln_v
+            } else {
+                0.0
+            }
+        }
+
+        // discretize with dt
+        let mut h_new = mamba_zeros_1d(d_state)
+        for i in 0..d_state {
+            let a_ii = A[i][i]
+            let ad = mamba_exp(a_ii * dt)
+            let bd_factor = if mamba_abs(a_ii) < 1.0e-8 { dt } else { (ad - 1.0) / a_ii }
+            let mut bx = 0.0
+            for j in 0..d_model {
+                bx = bx + B[i][j] * x[t][j]
+            }
+            h_new[i] = ad * h[i] + bd_factor * bx
+        }
+
+        // y_t = C * h_new
+        let mut yt = mamba_zeros_1d(d_model)
+        for i in 0..d_model {
+            let mut s = 0.0
+            for j in 0..d_state {
+                s = s + C[i][j] * h_new[j]
+            }
+            yt[i] = s
+        }
+        output = output + [yt]
+        h = h_new
+    }
+    return output
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Conv1d — causal 1D convolution
+//
+//  x:      [seq_len, d_model]
+//  kernel: [conv_width, d_model]  (per-channel depthwise)
+//  returns: [seq_len, d_model]
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn conv1d_forward(x, kernel, d_model) {
+    let seq_len = len(x)
+    let conv_w = len(kernel)
+    let mut out = []
+    for t in 0..seq_len {
+        let mut row = mamba_zeros_1d(d_model)
+        for k in 0..conv_w {
+            let idx = t - k
+            if idx >= 0 {
+                for d in 0..d_model {
+                    row[d] = row[d] + kernel[k][d] * x[idx][d]
+                }
+            }
+        }
+        out = out + [row]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Mamba Block — conv1d -> SSM -> output gate
+//
+//  Full block:
+//    z = linear_z(x)       (gate branch)
+//    x' = linear_in(x)     (main branch)
+//    x'' = silu(conv1d(x'))
+//    y = selective_scan(x'', A, B, C, delta)
+//    out = y * silu(z)      (gated output)
+// ═══════════════════════════════════════════════════════════════════
+
+fn mamba_silu(x) {
+    return x * mamba_sigmoid(x)
+}
+
+struct MambaBlock {
+    d_model: int,
+    d_state: int,
+    conv_width: int,
+    ssm: SSM,
+    conv_kernel: array,     // [conv_width, d_model]
+    delta_bias: array       // [1] per-step delta bias
+}
+
+fn create_mamba_block(d_model, d_state, conv_width) {
+    let ssm = create_ssm(d_model, d_state)
+    // conv kernel init
+    let mut kernel = []
+    for k in 0..conv_width {
+        let mut row = []
+        for d in 0..d_model {
+            row = row + [mamba_hash(99, k, d) * 0.3 + 0.5]
+        }
+        kernel = kernel + [row]
+    }
+    let delta_bias = [0.5]
+    return MambaBlock {
+        d_model: d_model,
+        d_state: d_state,
+        conv_width: conv_width,
+        ssm: ssm,
+        conv_kernel: kernel,
+        delta_bias: delta_bias
+    }
+}
+
+@hot
+fn mamba_block(x, conv_kernel, ssm) {
+    let seq_len = len(x)
+    let d_model = ssm.d_model
+
+    // conv1d
+    let conv_out = conv1d_forward(x, conv_kernel, d_model)
+
+    // silu activation
+    let mut activated = []
+    for t in 0..seq_len {
+        let mut row = mamba_zeros_1d(d_model)
+        for d in 0..d_model {
+            row[d] = mamba_silu(conv_out[t][d])
+        }
+        activated = activated + [row]
+    }
+
+    // delta: use input magnitude as gate signal
+    let mut delta = []
+    for t in 0..seq_len {
+        let mut s = 0.0
+        for d in 0..d_model {
+            s = s + x[t][d] * x[t][d]
+        }
+        delta = delta + [s / to_float(d_model)]
+    }
+
+    // selective scan
+    let y = selective_scan(activated, ssm.A, ssm.B, ssm.C, delta)
+
+    // gate: silu(x) element-wise, then multiply with y
+    let mut out = []
+    for t in 0..seq_len {
+        let mut row = mamba_zeros_1d(d_model)
+        for d in 0..d_model {
+            let gate = mamba_silu(x[t][d])
+            row[d] = y[t][d] * gate
+        }
+        out = out + [row]
+    }
+    return out
+}
+
+// Full mamba_forward using MambaBlock struct
+@hot
+fn mamba_forward(block, x) {
+    return mamba_block(x, block.conv_kernel, block.ssm)
+}

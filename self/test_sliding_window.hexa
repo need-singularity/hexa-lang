@@ -1,0 +1,160 @@
+// ═══════════════════════════════════════════════════════════════
+//  test_sliding_window.hexa — Sliding Window Attention tests
+//
+//  Verifies:
+//    1. Window mask generation (causal + window)
+//    2. Sliding window attention matches full attention for small window
+//    3. Window=seq_len degrades to full causal attention
+//    4. Rolling KV-cache append and eviction
+//    5. Rolling cache attention correctness
+//    6. Edge cases: window=1, single token
+//
+//  Run: ./hexa self/test_sliding_window.hexa
+// ═══════════════════════════════════════════════════════════════
+
+import "ml/sliding_window.hexa"
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn approx_eq(a, b, eps) {
+    return fabs(a - b) < eps
+}
+
+println("═══════════════════════════════════════════════════════")
+println("  Sliding Window Attention Test Suite")
+println("═══════════════════════════════════════════════════════")
+
+let eps = 1.0e-5
+
+// ── Test 1: create_window_mask shape ────────────────────────
+let mask = create_window_mask(4, 2)
+check("mask shape: 4x4", len(mask) == 4 && len(mask[0]) == 4)
+
+// ── Test 2: mask[0][0] = 1 (self-attend) ────────────────────
+check("mask[0][0] = 1.0", approx_eq(mask[0][0], 1.0, eps))
+
+// ── Test 3: mask causal — mask[0][1] = 0 (future) ──────────
+check("mask[0][1] = 0.0 (future)", approx_eq(mask[0][1], 0.0, eps))
+
+// ── Test 4: mask window — mask[3][0] = 0 (outside window) ──
+// window=2: pos 3 attends to {2,3}, not {0,1}
+check("mask[3][0] = 0.0 (outside window)", approx_eq(mask[3][0], 0.0, eps))
+check("mask[3][2] = 1.0 (inside window)", approx_eq(mask[3][2], 1.0, eps))
+check("mask[3][3] = 1.0 (self)", approx_eq(mask[3][3], 1.0, eps))
+
+// ── Test 5: window=1 — each position only attends to itself ─
+let Q_s1 = [
+    [1.0, 0.0],
+    [0.0, 1.0],
+    [0.5, 0.5]
+]
+let K_s1 = [
+    [0.5, 0.5],
+    [1.0, 0.0],
+    [0.0, 1.0]
+]
+let V_s1 = [
+    [10.0, 20.0],
+    [30.0, 40.0],
+    [50.0, 60.0]
+]
+let out_w1 = sliding_window_attention(Q_s1, K_s1, V_s1, 1)
+// window=1: each pos attends only to itself -> output = V[i]
+check("window=1: out[0]=V[0]", approx_eq(out_w1[0][0], 10.0, eps) && approx_eq(out_w1[0][1], 20.0, eps))
+check("window=1: out[1]=V[1]", approx_eq(out_w1[1][0], 30.0, eps) && approx_eq(out_w1[1][1], 40.0, eps))
+check("window=1: out[2]=V[2]", approx_eq(out_w1[2][0], 50.0, eps) && approx_eq(out_w1[2][1], 60.0, eps))
+
+// ── Test 6: window >= seq_len equals full causal ────────────
+// compute full causal attention manually
+let Q = [
+    [0.1, 0.2],
+    [0.3, 0.4],
+    [0.5, 0.6]
+]
+let K = [
+    [0.2, 0.1],
+    [0.4, 0.3],
+    [0.6, 0.5]
+]
+let V = [
+    [1.0, 0.0],
+    [0.0, 1.0],
+    [0.5, 0.5]
+]
+let out_full = sliding_window_attention(Q, K, V, 100)
+// Compute naive causal for comparison
+let scale = 1.0 / sqrt(2.0)
+// row 0: only pos 0
+// row 0 output = V[0] = [1.0, 0.0]
+check("full_window row0 = V[0]", approx_eq(out_full[0][0], 1.0, eps) && approx_eq(out_full[0][1], 0.0, eps))
+// row 2 with window=100 should attend to all 3 positions (full causal)
+let out_small = sliding_window_attention(Q, K, V, 3)
+check("window=seq_len matches full", approx_eq(out_full[2][0], out_small[2][0], eps) && approx_eq(out_full[2][1], out_small[2][1], eps))
+
+// ── Test 7: sliding window with window=2 ────────────────────
+let out_w2 = sliding_window_attention(Q, K, V, 2)
+// row 0: attends to {0} -> V[0]
+check("window=2 row0 = V[0]", approx_eq(out_w2[0][0], 1.0, eps) && approx_eq(out_w2[0][1], 0.0, eps))
+// row 2: attends to {1, 2} only (not 0)
+// This should differ from full causal row 2 (which includes pos 0)
+let out_full_r2 = out_full[2]
+let differs = fabs(out_w2[2][0] - out_full_r2[0]) > 0.001 || fabs(out_w2[2][1] - out_full_r2[1]) > 0.001
+check("window=2 row2 differs from full causal", differs)
+
+// ── Test 8: rolling KV cache basic ──────────────────────────
+let mut rkv = rolling_kv_cache_new(3, 2)
+check("rolling cache init: size=0", rolling_kv_cache_size(rkv) == 0)
+rkv = rolling_kv_cache_append(rkv, [1.0, 0.0], [10.0, 20.0])
+check("rolling cache after 1 append: size=1", rolling_kv_cache_size(rkv) == 1)
+
+// ── Test 9: rolling KV cache attention ──────────────────────
+let q_single = [[1.0, 0.0]]
+let rkv_out = rolling_kv_cache_attention(q_single, rkv)
+// single cached entry -> output = V[0] = [10.0, 20.0]
+check("rolling cache attn: out=V[0]", approx_eq(rkv_out[0][0], 10.0, eps) && approx_eq(rkv_out[0][1], 20.0, eps))
+
+// ── Test 10: rolling cache eviction ─────────────────────────
+// window=3, append 4 entries -> oldest evicted
+rkv = rolling_kv_cache_append(rkv, [0.0, 1.0], [30.0, 40.0])
+rkv = rolling_kv_cache_append(rkv, [1.0, 1.0], [50.0, 60.0])
+check("rolling cache after 3: size=3", rolling_kv_cache_size(rkv) == 3)
+rkv = rolling_kv_cache_append(rkv, [0.5, 0.5], [70.0, 80.0])
+// window=3, so oldest entry (first one) should be evicted
+check("rolling cache after 4: still size=3", rolling_kv_cache_size(rkv) == 3)
+
+// ── Test 11: noncausal window mask ──────────────────────────
+let nc_mask = create_noncausal_window_mask(4, 2)
+// pos 1 should attend to {0,1,2}
+check("noncausal mask[1][0] = 1", approx_eq(nc_mask[1][0], 1.0, eps))
+check("noncausal mask[1][2] = 1", approx_eq(nc_mask[1][2], 1.0, eps))
+check("noncausal mask[1][3] = 0", approx_eq(nc_mask[1][3], 0.0, eps))
+
+// ── Test 12: rolling cache reset ────────────────────────────
+let rkv_reset = rolling_kv_cache_reset(rkv)
+check("rolling cache reset: size=0", rolling_kv_cache_size(rkv_reset) == 0)
+
+// ═══════════════════════════════════════════════════════════════
+println("")
+println("pass=" + to_string(pass_count) + " fail=" + to_string(fail_count))
+if fail_count == 0 {
+    println("ALL PASS")
+} else {
+    println("FAILED")
+}
+println(to_string(pass_count) + " passed")

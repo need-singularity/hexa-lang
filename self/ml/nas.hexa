@@ -1,0 +1,414 @@
+// ===================================================================
+//  self/ml/nas.hexa — Neural Architecture Search (NAS)
+//
+//  Pure Hexa implementation of automated architecture search.
+//
+//  Components:
+//    1. Search Space   — define available layer types, sizes, connections
+//    2. Controller     — random or evolutionary architecture generation
+//    3. Evaluator      — build architecture, train briefly, measure metric
+//    4. Pareto Front   — multi-objective optimization (accuracy vs FLOPs)
+//
+//  Public API:
+//    create_search_space(options)
+//    sample_architecture(space)
+//    mutate_architecture(arch, space)
+//    crossover_architectures(arch1, arch2)
+//    evaluate_architecture(arch, data)
+//    evaluate_flops(arch)
+//    pareto_front(results)
+//    best_architecture(results, metric)
+//    run_evolution(space, data, pop_size, generations)
+//    run_random_search(space, data, n_samples)
+//
+//  Conventions:
+//    - Uses #{} map literals (no {k:v} inside if blocks)
+//    - Architecture = array of layer specs (maps)
+//    - Layer spec = { "type": str, "size": int, "activation": str }
+// ===================================================================
+
+// ===================================================================
+//  Math helpers
+// ===================================================================
+fn _nas_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn _nas_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut guess = x / 2.0
+    if guess < 0.001 { guess = 0.001 }
+    let mut i = 0
+    while i < 15 {
+        guess = (guess + x / guess) / 2.0
+        i = i + 1
+    }
+    return guess
+}
+
+// Simple pseudo-random (LCG)
+let mut _nas_seed = 42
+fn _nas_rand() {
+    _nas_seed = (_nas_seed * 1103515245 + 12345) % 2147483647
+    if _nas_seed < 0 { _nas_seed = 0 - _nas_seed }
+    return _nas_seed
+}
+
+fn _nas_rand_int(low, high) {
+    let r = _nas_rand()
+    return low + r % (high - low + 1)
+}
+
+fn _nas_rand_choice(arr) {
+    let n = len(arr)
+    let idx = _nas_rand_int(0, n - 1)
+    return arr[idx]
+}
+
+// ===================================================================
+//  Search Space
+// ===================================================================
+
+// options map should contain:
+//   layer_types: ["linear", "conv1d", "attention", ...]
+//   sizes: [64, 128, 256, 512, ...]
+//   activations: ["relu", "gelu", "swish", ...]
+//   min_layers: int
+//   max_layers: int
+fn create_search_space(options) {
+    let space = #{}
+    space["layer_types"] = options["layer_types"]
+    space["sizes"] = options["sizes"]
+    space["activations"] = options["activations"]
+    space["min_layers"] = options["min_layers"]
+    space["max_layers"] = options["max_layers"]
+    return space
+}
+
+// ===================================================================
+//  Sample a random architecture from the search space
+//  Returns array of layer specs
+// ===================================================================
+fn sample_architecture(space) {
+    let min_l = space["min_layers"]
+    let max_l = space["max_layers"]
+    let n_layers = _nas_rand_int(min_l, max_l)
+
+    let types = space["layer_types"]
+    let sizes = space["sizes"]
+    let acts = space["activations"]
+
+    let mut arch = []
+    let mut i = 0
+    while i < n_layers {
+        let layer = #{}
+        layer["type"] = _nas_rand_choice(types)
+        layer["size"] = _nas_rand_choice(sizes)
+        layer["activation"] = _nas_rand_choice(acts)
+        arch = arch + [layer]
+        i = i + 1
+    }
+    return arch
+}
+
+// ===================================================================
+//  Mutate an architecture (change one random layer)
+// ===================================================================
+fn mutate_architecture(arch, space) {
+    let n = len(arch)
+    if n == 0 { return arch }
+
+    let idx = _nas_rand_int(0, n - 1)
+    let types = space["layer_types"]
+    let sizes = space["sizes"]
+    let acts = space["activations"]
+
+    // decide what to mutate
+    let what = _nas_rand_int(0, 2)
+
+    let mut new_arch = []
+    let mut i = 0
+    while i < n {
+        if i == idx {
+            let layer = #{}
+            if what == 0 {
+                layer["type"] = _nas_rand_choice(types)
+                layer["size"] = arch[i]["size"]
+                layer["activation"] = arch[i]["activation"]
+            } else {
+                layer["type"] = arch[i]["type"]
+                if what == 1 {
+                    layer["size"] = _nas_rand_choice(sizes)
+                    layer["activation"] = arch[i]["activation"]
+                } else {
+                    layer["size"] = arch[i]["size"]
+                    layer["activation"] = _nas_rand_choice(acts)
+                }
+            }
+            new_arch = new_arch + [layer]
+        } else {
+            new_arch = new_arch + [arch[i]]
+        }
+        i = i + 1
+    }
+    return new_arch
+}
+
+// ===================================================================
+//  Crossover two architectures (uniform crossover)
+// ===================================================================
+fn crossover_architectures(arch1, arch2) {
+    let n1 = len(arch1)
+    let n2 = len(arch2)
+    let n = if n1 < n2 { n1 } else { n2 }
+
+    let mut child = []
+    let mut i = 0
+    while i < n {
+        let pick = _nas_rand_int(0, 1)
+        if pick == 0 {
+            child = child + [arch1[i]]
+        } else {
+            child = child + [arch2[i]]
+        }
+        i = i + 1
+    }
+
+    // if parent1 is longer, maybe add remaining layers
+    while i < n1 {
+        let pick = _nas_rand_int(0, 1)
+        if pick == 0 {
+            child = child + [arch1[i]]
+        }
+        i = i + 1
+    }
+
+    return child
+}
+
+// ===================================================================
+//  Evaluate architecture (simplified metric estimation)
+//  data: map with "input_size" and "output_size" (integers)
+//  Returns map with "accuracy" (simulated) and "flops"
+// ===================================================================
+fn evaluate_architecture(arch, data) {
+    let n_layers = len(arch)
+    let input_size = data["input_size"]
+    let output_size = data["output_size"]
+
+    // estimate FLOPs: sum of layer_in * layer_out for linear layers
+    let mut flops = 0
+    let mut prev_size = input_size
+    let mut i = 0
+    while i < n_layers {
+        let layer_size = arch[i]["size"]
+        let layer_type = arch[i]["type"]
+        if layer_type == "linear" {
+            flops = flops + prev_size * layer_size * 2
+        }
+        if layer_type == "conv1d" {
+            flops = flops + prev_size * layer_size * 3 * 2
+        }
+        if layer_type == "attention" {
+            flops = flops + layer_size * layer_size * 4
+        }
+        prev_size = layer_size
+        i = i + 1
+    }
+    // output projection
+    flops = flops + prev_size * output_size * 2
+
+    // simulate accuracy based on architecture capacity
+    // deeper and wider = better, but diminishing returns
+    let mut total_params = 0
+    prev_size = input_size
+    i = 0
+    while i < n_layers {
+        total_params = total_params + prev_size * arch[i]["size"]
+        prev_size = arch[i]["size"]
+        i = i + 1
+    }
+    total_params = total_params + prev_size * output_size
+
+    // simulated accuracy: saturating function of params
+    // accuracy ~ 1 - 1/(1 + params/1000)
+    let param_score = (total_params * 1.0) / (total_params * 1.0 + 1000.0)
+    // add small random noise
+    let noise = (_nas_rand() % 100) * 1.0 / 10000.0
+    let accuracy = param_score * 0.95 + noise
+
+    let result = #{}
+    result["accuracy"] = accuracy
+    result["flops"] = flops
+    result["params"] = total_params
+    result["n_layers"] = n_layers
+    return result
+}
+
+// Compute estimated FLOPs for an architecture
+fn evaluate_flops(arch) {
+    let n = len(arch)
+    let mut flops = 0
+    let mut prev = 64
+    let mut i = 0
+    while i < n {
+        let s = arch[i]["size"]
+        flops = flops + prev * s * 2
+        prev = s
+        i = i + 1
+    }
+    return flops
+}
+
+// ===================================================================
+//  Pareto Front — find non-dominated solutions
+//  results: array of maps, each with "accuracy" and "flops"
+//  Returns indices of Pareto-optimal solutions
+// ===================================================================
+fn pareto_front(results) {
+    let n = len(results)
+    let mut front = []
+
+    let mut i = 0
+    while i < n {
+        let mut dominated = false
+        let acc_i = results[i]["accuracy"]
+        let flops_i = results[i]["flops"]
+
+        let mut j = 0
+        while j < n {
+            if i != j {
+                let acc_j = results[j]["accuracy"]
+                let flops_j = results[j]["flops"]
+                // j dominates i if j has >= accuracy and <= flops (strictly better in at least one)
+                if acc_j >= acc_i {
+                    if flops_j <= flops_i {
+                        if acc_j > acc_i {
+                            dominated = true
+                            j = n
+                        }
+                        if flops_j < flops_i {
+                            dominated = true
+                            j = n
+                        }
+                    }
+                }
+            }
+            j = j + 1
+        }
+
+        if dominated == false {
+            front = front + [i]
+        }
+        i = i + 1
+    }
+    return front
+}
+
+// ===================================================================
+//  Best architecture by a single metric
+//  results: array of maps with metric values
+//  metric: string key (e.g. "accuracy")
+//  Returns index of best result
+// ===================================================================
+fn best_architecture(results, metric) {
+    let n = len(results)
+    if n == 0 { return 0 - 1 }
+
+    let mut best_idx = 0
+    let mut best_val = results[0][metric]
+    let mut i = 1
+    while i < n {
+        let val = results[i][metric]
+        if val > best_val {
+            best_val = val
+            best_idx = i
+        }
+        i = i + 1
+    }
+    return best_idx
+}
+
+// ===================================================================
+//  Evolutionary search
+// ===================================================================
+fn run_evolution(space, data, pop_size, generations) {
+    // initialize population
+    let mut population = []
+    let mut pop_results = []
+    let mut pi = 0
+    while pi < pop_size {
+        let arch = sample_architecture(space)
+        let result = evaluate_architecture(arch, data)
+        population = population + [arch]
+        pop_results = pop_results + [result]
+        pi = pi + 1
+    }
+
+    let mut gen = 0
+    while gen < generations {
+        // tournament selection + mutation
+        let mut new_pop = []
+        let mut new_results = []
+        let mut ni = 0
+        while ni < pop_size {
+            // tournament: pick 2 random, keep better
+            let idx1 = _nas_rand_int(0, pop_size - 1)
+            let idx2 = _nas_rand_int(0, pop_size - 1)
+            let parent_idx = if pop_results[idx1]["accuracy"] > pop_results[idx2]["accuracy"] { idx1 } else { idx2 }
+            let parent = population[parent_idx]
+
+            // mutate or crossover
+            let action = _nas_rand_int(0, 2)
+            let mut child = parent
+            if action == 0 {
+                child = mutate_architecture(parent, space)
+            }
+            if action == 1 {
+                let idx3 = _nas_rand_int(0, pop_size - 1)
+                child = crossover_architectures(parent, population[idx3])
+            }
+            // action==2: keep parent as-is (elitism)
+
+            let result = evaluate_architecture(child, data)
+            new_pop = new_pop + [child]
+            new_results = new_results + [result]
+            ni = ni + 1
+        }
+        population = new_pop
+        pop_results = new_results
+        gen = gen + 1
+    }
+
+    // return best results and architectures
+    let output = #{}
+    output["population"] = population
+    output["results"] = pop_results
+    output["best_idx"] = best_architecture(pop_results, "accuracy")
+    return output
+}
+
+// ===================================================================
+//  Random search
+// ===================================================================
+fn run_random_search(space, data, n_samples) {
+    let mut architectures = []
+    let mut results = []
+    let mut i = 0
+    while i < n_samples {
+        let arch = sample_architecture(space)
+        let result = evaluate_architecture(arch, data)
+        architectures = architectures + [arch]
+        results = results + [result]
+        i = i + 1
+    }
+
+    let output = #{}
+    output["architectures"] = architectures
+    output["results"] = results
+    output["best_idx"] = best_architecture(results, "accuracy")
+    return output
+}
+
+println("[nas] module loaded")

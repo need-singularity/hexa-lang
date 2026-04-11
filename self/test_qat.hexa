@@ -1,0 +1,338 @@
+// ===================================================================
+//  test_qat.hexa — Quantization-Aware Training Tests
+//
+//  Validates:
+//    1. fake_quantize round-trip
+//    2. calibrate_scale min/max detection
+//    3. calibrate_scale correct scale/zero_point
+//    4. qat_forward with INT8
+//    5. qat_forward with INT4
+//    6. qat_backward STE identity
+//    7. INT8 vs INT4 precision difference
+//    8. Per-channel calibration
+//    9. Fake quantize preserves sign
+//   10. QAT error measurement
+//   11. STE masked backward
+//   12. Empty tensor edge case
+//
+//  Execution: ./hexa self/test_qat.hexa
+//  Minimum 10 check() statements.
+// ===================================================================
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn fmax(a, b) {
+    if a >= b { return a }
+    return b
+}
+
+// ===================================================================
+//  Inline module (self-contained test)
+// ===================================================================
+
+struct CalibrationResult {
+    scale: float,
+    zero_point: int,
+    min_val: float,
+    max_val: float,
+    bits: int
+}
+
+fn _qat_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn _qat_clamp(v, lo, hi) {
+    if v < lo { return lo }
+    if v > hi { return hi }
+    return v
+}
+
+fn _qat_round(x) {
+    if x >= 0.0 { return int(x + 0.5) }
+    return int(x - 0.5)
+}
+
+fn fake_quantize(tensor, bits, scale, zero_point) {
+    let qmin = 0
+    let qmax = (1 * pow(2, bits)) - 1
+    let n = len(tensor)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let q = _qat_clamp(_qat_round(tensor[i] / scale) + zero_point, qmin, qmax)
+        let dequant = to_float(q - zero_point) * scale
+        out = out + [dequant]
+        i = i + 1
+    }
+    return out
+}
+
+fn calibrate_scale(tensor, bits) {
+    let n = len(tensor)
+    if n == 0 {
+        return CalibrationResult {
+            scale: 1.0,
+            zero_point: 0,
+            min_val: 0.0,
+            max_val: 0.0,
+            bits: bits
+        }
+    }
+    let mut min_val = tensor[0]
+    let mut max_val = tensor[0]
+    let mut i = 1
+    while i < n {
+        if tensor[i] < min_val { min_val = tensor[i] }
+        if tensor[i] > max_val { max_val = tensor[i] }
+        i = i + 1
+    }
+    let qmin = 0.0
+    let qmax = to_float(pow(2, bits) - 1)
+    let mut range = max_val - min_val
+    if range < 0.0001 { range = 0.0001 }
+    let scale = range / qmax
+    let zero_point = _qat_round(0.0 - min_val / scale)
+    let zp_clamped = _qat_clamp(zero_point, 0, int(qmax))
+    return CalibrationResult {
+        scale: scale,
+        zero_point: zp_clamped,
+        min_val: min_val,
+        max_val: max_val,
+        bits: bits
+    }
+}
+
+fn calibrate_per_channel(tensor, channels, ch_size, bits) {
+    let mut results = []
+    let mut ch = 0
+    while ch < channels {
+        let base = ch * ch_size
+        let mut ch_data = []
+        let mut j = 0
+        while j < ch_size {
+            ch_data = ch_data + [tensor[base + j]]
+            j = j + 1
+        }
+        results = results + [calibrate_scale(ch_data, bits)]
+        ch = ch + 1
+    }
+    return results
+}
+
+fn qat_forward(weights, input, bits) {
+    let calib = calibrate_scale(weights, bits)
+    let fake_w = fake_quantize(weights, bits, calib.scale, calib.zero_point)
+    let n = len(input)
+    let wn = len(fake_w)
+    let mut output = []
+    let mut i = 0
+    while i < n {
+        let wi = i % wn
+        output = output + [fake_w[wi] * input[i]]
+        i = i + 1
+    }
+    return output
+}
+
+fn qat_backward(grad, bits) {
+    let n = len(grad)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [grad[i]]
+        i = i + 1
+    }
+    return out
+}
+
+fn qat_backward_masked(grad, original, calib) {
+    let n = len(grad)
+    let qmax = to_float(pow(2, calib.bits) - 1)
+    let lo = to_float(0 - calib.zero_point) * calib.scale
+    let hi = to_float(int(qmax) - calib.zero_point) * calib.scale
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let oi = i % len(original)
+        let v = original[oi]
+        if v >= lo {
+            if v <= hi {
+                out = out + [grad[i]]
+            } else {
+                out = out + [0.0]
+            }
+        } else {
+            out = out + [0.0]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn qat_error(original, bits) {
+    let calib = calibrate_scale(original, bits)
+    let fq = fake_quantize(original, bits, calib.scale, calib.zero_point)
+    let n = len(original)
+    let mut mse = 0.0
+    let mut i = 0
+    while i < n {
+        let diff = original[i] - fq[i]
+        mse = mse + diff * diff
+        i = i + 1
+    }
+    return mse / to_float(n)
+}
+
+// ===================================================================
+//  TESTS
+// ===================================================================
+
+println("===================================================")
+println("  Quantization-Aware Training Test Suite")
+println("===================================================")
+
+// -- 1. fake_quantize round-trip --
+println("")
+println("=== Fake Quantize ===")
+let data1 = [0.5, -0.3, 1.0, -1.0, 0.0]
+let calib1 = calibrate_scale(data1, 8)
+let fq1 = fake_quantize(data1, 8, calib1.scale, calib1.zero_point)
+check("fake_quantize: output same length", len(fq1) == 5)
+let mut max_err = 0.0
+let mut i = 0
+while i < 5 {
+    let e = fabs(data1[i] - fq1[i])
+    if e > max_err { max_err = e }
+    i = i + 1
+}
+check("fake_quantize: INT8 error small", max_err < 0.02)
+
+// -- 2. calibrate_scale min/max --
+println("")
+println("=== Calibration ===")
+let data2 = [-2.0, -1.0, 0.0, 1.0, 3.0]
+let calib2 = calibrate_scale(data2, 8)
+check("calibrate: min_val correct", calib2.min_val == -2.0)
+check("calibrate: max_val correct", calib2.max_val == 3.0)
+
+// -- 3. calibrate_scale correct range --
+let expected_range = 3.0 - (-2.0)
+let expected_scale = expected_range / 255.0
+check("calibrate: scale correct", fabs(calib2.scale - expected_scale) < 0.001)
+
+// -- 4. qat_forward INT8 --
+println("")
+println("=== QAT Forward ===")
+let weights = [0.5, -0.3, 0.8, -0.1]
+let input = [1.0, 2.0, 3.0, 4.0]
+let out8 = qat_forward(weights, input, 8)
+check("qat_forward INT8: output length", len(out8) == 4)
+
+// -- 5. qat_forward INT4 --
+let out4 = qat_forward(weights, input, 4)
+check("qat_forward INT4: output length", len(out4) == 4)
+
+// INT4 should have more error than INT8
+let mut err8 = 0.0
+let mut err4 = 0.0
+i = 0
+while i < 4 {
+    let exact = weights[i] * input[i]
+    err8 = err8 + fabs(out8[i] - exact)
+    err4 = err4 + fabs(out4[i] - exact)
+    i = i + 1
+}
+check("qat_forward: INT4 error >= INT8 error", err4 >= err8 - 0.001)
+
+// -- 6. qat_backward STE --
+println("")
+println("=== STE Backward ===")
+let grad = [0.1, -0.2, 0.3, -0.4]
+let bwd8 = qat_backward(grad, 8)
+let mut ste_match = true
+i = 0
+while i < 4 {
+    if fabs(bwd8[i] - grad[i]) > 0.0001 {
+        ste_match = false
+    }
+    i = i + 1
+}
+check("qat_backward: STE preserves gradient", ste_match)
+
+// -- 7. INT8 vs INT4 precision --
+println("")
+println("=== Precision Comparison ===")
+let test_data = [0.1, -0.2, 0.5, -0.8, 1.0, -1.0, 0.3, -0.4]
+let mse8 = qat_error(test_data, 8)
+let mse4 = qat_error(test_data, 4)
+check("precision: INT8 MSE < INT4 MSE", mse8 < mse4)
+
+// -- 8. Per-channel calibration --
+println("")
+println("=== Per-channel ===")
+let multi_ch = [0.1, 0.2, 0.3, 0.4, -1.0, -0.5, 0.0, 0.5]
+let per_ch = calibrate_per_channel(multi_ch, 2, 4, 8)
+check("per_channel: 2 channels calibrated", len(per_ch) == 2)
+check("per_channel: ch0 min correct", per_ch[0].min_val == 0.1)
+check("per_channel: ch1 min correct", per_ch[1].min_val == -1.0)
+
+// -- 9. fake_quantize preserves sign --
+println("")
+println("=== Sign Preservation ===")
+let signed_data = [-1.0, -0.5, 0.0, 0.5, 1.0]
+let calib_s = calibrate_scale(signed_data, 8)
+let fq_s = fake_quantize(signed_data, 8, calib_s.scale, calib_s.zero_point)
+let mut sign_ok = true
+if fq_s[0] >= 0.0 { sign_ok = false }
+if fq_s[1] >= 0.0 { sign_ok = false }
+if fq_s[3] <= 0.0 { sign_ok = false }
+if fq_s[4] <= 0.0 { sign_ok = false }
+check("sign: negative stays negative, positive stays positive", sign_ok)
+
+// -- 10. QAT error measurement --
+println("")
+println("=== Error Measurement ===")
+let err_data = [0.1, 0.2, 0.3, 0.4, 0.5]
+let err_8 = qat_error(err_data, 8)
+check("qat_error: INT8 MSE small", err_8 < 0.01)
+
+// -- 11. STE masked backward --
+let calib_m = calibrate_scale(signed_data, 8)
+let grad_m = [1.0, 1.0, 1.0, 1.0, 1.0]
+let bwd_m = qat_backward_masked(grad_m, signed_data, calib_m)
+check("ste_masked: in-range values pass gradient", fabs(bwd_m[2] - 1.0) < 0.001)
+
+// -- 12. Empty tensor edge case --
+let calib_empty = calibrate_scale([], 8)
+check("edge: empty tensor returns default scale", calib_empty.scale == 1.0)
+
+// ===================================================================
+//  Summary
+// ===================================================================
+println("")
+println("=== QAT Tests Summary ===")
+println("pass=" + str(pass_count) + " fail=" + str(fail_count))
+if fail_count == 0 {
+    println("ALL PASS")
+} else {
+    println("FAILED")
+}
+println(str(pass_count) + " passed")

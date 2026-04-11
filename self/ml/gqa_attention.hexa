@@ -1,0 +1,284 @@
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/gqa_attention.hexa — Grouped-Query / Multi-Query Attention
+//
+//  Implements:
+//    1. GQA — num_kv_heads < num_heads, KV shared per group
+//    2. MQA — num_kv_heads = 1, single KV shared across all heads
+//    3. repeat_kv — expand KV to match num_heads
+//    4. Standard multi-head attention as special case (num_kv_heads == num_heads)
+//
+//  Shape convention (flat 1D per token, multi-head interleaved):
+//    Q : [seq_len, num_heads * head_dim]
+//    K : [seq_len, num_kv_heads * head_dim]
+//    V : [seq_len, num_kv_heads * head_dim]
+//    out: [seq_len, num_heads * head_dim]
+//
+//  AI-NATIVE attrs:
+//    @hot      — forward called every step
+//    @parallel — query positions independent
+//    @pure     — no side effects
+// ═══════════════════════════════════════════════════════════════
+
+// ── helpers ──────────────────────────────────────────────────
+
+fn gqa_zeros_1d(n) {
+    let mut v = []
+    let mut i = 0
+    while i < n {
+        v = v + [0.0]
+        i = i + 1
+    }
+    return v
+}
+
+fn gqa_zeros_2d(r, c) {
+    let mut m = []
+    let mut i = 0
+    while i < r {
+        let mut row = []
+        let mut j = 0
+        while j < c {
+            row = row + [0.0]
+            j = j + 1
+        }
+        m = m + [row]
+        i = i + 1
+    }
+    return m
+}
+
+fn gqa_max_f(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn gqa_fabs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  repeat_kv — repeat KV heads to match query heads
+//
+//  Input:  kv_row [num_kv_heads * head_dim]
+//  Output: expanded [num_heads * head_dim]
+//
+//  Each KV head is repeated (num_heads / num_kv_heads) times.
+//  e.g. num_heads=32, num_kv_heads=8 -> each KV head repeated 4x
+// ═══════════════════════════════════════════════════════════════
+@pure
+fn repeat_kv(kv_row, num_heads, num_kv_heads, head_dim) {
+    let ratio = num_heads / num_kv_heads
+    let mut expanded = []
+    let mut kv_h = 0
+    while kv_h < num_kv_heads {
+        let kv_base = kv_h * head_dim
+        let mut r = 0
+        while r < ratio {
+            let mut d = 0
+            while d < head_dim {
+                expanded = expanded + [kv_row[kv_base + d]]
+                d = d + 1
+            }
+            r = r + 1
+        }
+        kv_h = kv_h + 1
+    }
+    return expanded
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  repeat_kv_2d — repeat KV heads for entire sequence
+//
+//  Input:  KV [seq_len, num_kv_heads * head_dim]
+//  Output: [seq_len, num_heads * head_dim]
+// ═══════════════════════════════════════════════════════════════
+@pure
+fn repeat_kv_2d(KV, num_heads, num_kv_heads, head_dim) {
+    let seq_len = len(KV)
+    let mut result = []
+    let mut i = 0
+    while i < seq_len {
+        let expanded = repeat_kv(KV[i], num_heads, num_kv_heads, head_dim)
+        result = result + [expanded]
+        i = i + 1
+    }
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  GQA Attention — Grouped-Query Attention
+//
+//  Q : [seq_len, num_heads * head_dim]
+//  K : [seq_len, num_kv_heads * head_dim]
+//  V : [seq_len, num_kv_heads * head_dim]
+//  num_heads : total query heads
+//  num_kv_heads : KV heads (fewer than query heads)
+//
+//  GQA ratio = num_heads / num_kv_heads
+//  Each group of (ratio) query heads shares one KV head.
+//
+//  Returns: [seq_len, num_heads * head_dim]
+// ═══════════════════════════════════════════════════════════════
+@hot @parallel
+fn gqa_attention(Q, K, V, num_heads, num_kv_heads) {
+    let seq_len = len(Q)
+    let total_q_dim = len(Q[0])
+    let head_dim = total_q_dim / num_heads
+    let ratio = num_heads / num_kv_heads
+    let scale = 1.0 / sqrt(head_dim * 1.0)
+
+    let out_dim = num_heads * head_dim
+    let mut out = gqa_zeros_2d(seq_len, out_dim)
+
+    let mut qi = 0
+    while qi < seq_len {
+        // for each query head
+        let mut h = 0
+        while h < num_heads {
+            let kv_h = h / ratio
+            let q_base = h * head_dim
+            let k_base_dim = kv_h * head_dim
+
+            // compute attention scores for this head across all KV positions
+            let mut m_val = 0.0 - 1.0e30
+            let mut l_val = 0.0
+            let mut acc = gqa_zeros_1d(head_dim)
+
+            let mut kj = 0
+            while kj < seq_len {
+                // dot product Q[qi, h] . K[kj, kv_h]
+                let mut dot = 0.0
+                let mut d = 0
+                while d < head_dim {
+                    dot = dot + Q[qi][q_base + d] * K[kj][k_base_dim + d]
+                    d = d + 1
+                }
+                let score = dot * scale
+
+                // online softmax
+                let m_old = m_val
+                let m_new = gqa_max_f(m_old, score)
+                let alpha = exp(m_old - m_new)
+                let p = exp(score - m_new)
+                let l_new = l_val * alpha + p
+
+                d = 0
+                while d < head_dim {
+                    acc[d] = acc[d] * alpha + p * V[kj][k_base_dim + d]
+                    d = d + 1
+                }
+                m_val = m_new
+                l_val = l_new
+                kj = kj + 1
+            }
+
+            // normalize and write output
+            if l_val > 0.0 {
+                let inv_l = 1.0 / l_val
+                let mut d = 0
+                while d < head_dim {
+                    out[qi][q_base + d] = acc[d] * inv_l
+                    d = d + 1
+                }
+            }
+            h = h + 1
+        }
+        qi = qi + 1
+    }
+
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  MQA Attention — Multi-Query Attention (num_kv_heads = 1)
+//
+//  Special case of GQA where all query heads share a single KV head.
+//  K, V : [seq_len, head_dim]  (single head)
+//
+//  Returns: [seq_len, num_heads * head_dim]
+// ═══════════════════════════════════════════════════════════════
+@hot @parallel
+fn mqa_attention(Q, K, V, num_heads) {
+    return gqa_attention(Q, K, V, num_heads, 1)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Standard multi-head attention — reference (num_kv_heads == num_heads)
+//
+//  Calls GQA with ratio = 1. Used as correctness baseline.
+// ═══════════════════════════════════════════════════════════════
+@pure
+fn mha_attention(Q, K, V, num_heads) {
+    return gqa_attention(Q, K, V, num_heads, num_heads)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  GQA causal — with autoregressive mask (j > i => skip)
+// ═══════════════════════════════════════════════════════════════
+@hot @parallel
+fn gqa_attention_causal(Q, K, V, num_heads, num_kv_heads) {
+    let seq_len = len(Q)
+    let total_q_dim = len(Q[0])
+    let head_dim = total_q_dim / num_heads
+    let ratio = num_heads / num_kv_heads
+    let scale = 1.0 / sqrt(head_dim * 1.0)
+
+    let out_dim = num_heads * head_dim
+    let mut out = gqa_zeros_2d(seq_len, out_dim)
+
+    let mut qi = 0
+    while qi < seq_len {
+        let mut h = 0
+        while h < num_heads {
+            let kv_h = h / ratio
+            let q_base = h * head_dim
+            let k_base_dim = kv_h * head_dim
+
+            let mut m_val = 0.0 - 1.0e30
+            let mut l_val = 0.0
+            let mut acc = gqa_zeros_1d(head_dim)
+
+            let mut kj = 0
+            while kj <= qi {
+                let mut dot = 0.0
+                let mut d = 0
+                while d < head_dim {
+                    dot = dot + Q[qi][q_base + d] * K[kj][k_base_dim + d]
+                    d = d + 1
+                }
+                let score = dot * scale
+
+                let m_old = m_val
+                let m_new = gqa_max_f(m_old, score)
+                let alpha = exp(m_old - m_new)
+                let p = exp(score - m_new)
+                let l_new = l_val * alpha + p
+
+                d = 0
+                while d < head_dim {
+                    acc[d] = acc[d] * alpha + p * V[kj][k_base_dim + d]
+                    d = d + 1
+                }
+                m_val = m_new
+                l_val = l_new
+                kj = kj + 1
+            }
+
+            if l_val > 0.0 {
+                let inv_l = 1.0 / l_val
+                let mut d = 0
+                while d < head_dim {
+                    out[qi][q_base + d] = acc[d] * inv_l
+                    d = d + 1
+                }
+            }
+            h = h + 1
+        }
+        qi = qi + 1
+    }
+
+    return out
+}
+
+println("[gqa_attention] module loaded — GQA/MQA/MHA attention")
