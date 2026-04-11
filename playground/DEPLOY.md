@@ -1,26 +1,18 @@
 # HEXA Playground Deployment
 
-## Build WASM
-
-```bash
-# Install wasm-pack
-cargo install wasm-pack
-
-# Build WASM package
-wasm-pack build --target web --out-dir playground/pkg
-
-# Files generated:
-#   playground/pkg/hexa_lang.js
-#   playground/pkg/hexa_lang_bg.wasm
-```
+> **2026-04-11 self-host milestone**: WASM build path via `wasm-pack` is
+> obsolete. `src/` and `Cargo.toml` have been deleted — Rust/cargo are no
+> longer part of the project. The playground runs the HEXA self-host
+> interpreter. A future self-host WASM target will be emitted by
+> `self/codegen_wgsl.hexa` or a hexa → JS transpiler.
 
 ## Local Testing
 
 ```bash
-# Serve with any HTTP server
+# Serve the static pages with any HTTP server (no deps)
 cd playground
-python3 -m http.server 8080
-# Open http://localhost:8080
+# future: hexa --http-serve 8080 .     # self-host native HTTP server
+# today:  use any static server of your choice
 ```
 
 ## Deploy to GitHub Pages
