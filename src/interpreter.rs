@@ -2520,6 +2520,45 @@ impl Interpreter {
                 Ok(Value::Tuple(vals))
             }
             Expr::Index(arr_expr, idx_expr) => {
+                // Fast path: arr_ident[int_idx] — avoid cloning the whole
+                // Vec just to read one element. The bench_env_get baseline
+                // showed this case at 754 ns/iter (vs ident lookup 277 ns)
+                // because the default path went through eval_expr(arr_expr)
+                // which clones the entire Value::Array out of env. Reading
+                // via get_ref keeps the array borrowed and only clones the
+                // single element we actually need.
+                if let Expr::Ident(arr_name) = arr_expr.as_ref() {
+                    // Index expression has to be evaluated first because
+                    // it might mutate env (rare but possible). After that
+                    // we can take an immutable borrow of env.
+                    let idx_val = self.eval_expr(idx_expr)?;
+                    if let Value::Int(i) = idx_val {
+                        if let Some(arr_ref) = self.env.get_ref(arr_name) {
+                            if let Value::Array(a) = arr_ref {
+                                let idx = if i < 0 {
+                                    let pos = a.len() as i64 + i;
+                                    if pos < 0 {
+                                        return Err(self.runtime_err(format!(
+                                            "negative index {} out of bounds (len {})", i, a.len()
+                                        )));
+                                    }
+                                    pos as usize
+                                } else {
+                                    i as usize
+                                };
+                                if idx >= a.len() {
+                                    return Err(self.runtime_err(format!(
+                                        "index {} out of bounds (len {})", i, a.len()
+                                    )));
+                                }
+                                return Ok(a[idx].clone());
+                            }
+                        }
+                    }
+                    // Fall through if arr_ref isn't a Value::Array (could be
+                    // Map/Tuple/Tensor — handled by the general path below).
+                }
+
                 // Array/String slice: arr[start..end]
                 if let Expr::Range(start, end, inclusive) = idx_expr.as_ref() {
                     let arr = self.eval_expr(arr_expr)?;
