@@ -1,0 +1,292 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/controlnet.hexa — ControlNet Conditional Diffusion (#259)
+//
+//  Conditional control of diffusion model via auxiliary control branch.
+//
+//  Simplified CPU-mini design:
+//    - Target space: 2D scalar field (flattened to vector of size H*W)
+//    - Condition: control map (e.g. edge/depth/pose flattened to vector)
+//    - Base branch: small MLP denoiser ε_θ(x, t)
+//    - Control branch: MLP that conditions on (x, t, c)
+//    - Final prediction: ε_θ(x, t) + control_branch(c) * gate
+//    - Zero-initialized control→out projection (stable bootstrap)
+//
+//  Loss: MSE between predicted noise and true noise.
+//  Condition examples:
+//    - edge map: |∇x|
+//    - depth map: z coordinate
+//    - pose: keypoint impulse map
+//
+//  API (pure):
+//    cn_zeros / cn_sqrt / cn_exp
+//    cn_edge_map(x, H, W)                     -> [float]  (simple gradient magnitude)
+//    cn_depth_map(x, H, W)                    -> [float]  (returns identity as fake depth)
+//    cn_pose_map(H, W, positions)             -> [float]  (sparse impulses)
+//    cn_base_forward(x, t, w1, b1, w2, b2)   -> [float]
+//    cn_control_forward(x, t, c, w1, b1, w2, b2) -> [float]
+//    cn_combined_forward(x, t, c, base_w, ctl_w, gate) -> [float]
+//    cn_diffusion_loss(pred, target)         -> float
+//    cn_sample(x_noise, t_steps, base_w, ctl_w, c, gate) -> [float]
+//    cn_conditioning_strength(out_with, out_without) -> float
+//
+//  AI-NATIVE:
+//    @pure / @hot
+// ═══════════════════════════════════════════════════════════════════
+
+fn cn_abs(x) { if x < 0.0 { return 0.0 - x } return x }
+
+fn cn_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..25 { g = (g + x / g) / 2.0 }
+    return g
+}
+
+fn cn_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..25 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn cn_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+@pure
+fn cn_gelu(x) {
+    let e2x = cn_exp(2.0 * x)
+    if e2x > 1.0e15 { return x }
+    let t = (e2x - 1.0) / (e2x + 1.0)
+    return 0.5 * x * (1.0 + t)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  1. Edge map — simple gradient magnitude on H×W grid
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cn_edge_map(x, H, W) {
+    let mut out = cn_zeros(H * W)
+    for i in 0..H {
+        for j in 0..W {
+            let idx = i * W + j
+            let mut dx = 0.0
+            let mut dy = 0.0
+            if j + 1 < W { dx = x[i * W + (j + 1)] - x[idx] }
+            if i + 1 < H { dy = x[(i + 1) * W + j] - x[idx] }
+            out[idx] = cn_sqrt(dx * dx + dy * dy)
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  2. Depth map — trivial identity surrogate (real depth needs 3D)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cn_depth_map(x, H, W) {
+    let n = H * W
+    let mut out = cn_zeros(n)
+    for i in 0..n { out[i] = x[i] }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  3. Pose map — sparse impulses at given (i,j) positions
+//  positions: list of [i, j] pairs
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cn_pose_map(H, W, positions) {
+    let mut out = cn_zeros(H * W)
+    let n = len(positions)
+    for k in 0..n {
+        let p = positions[k]
+        let i = p[0]
+        let j = p[1]
+        if i >= 0 && i < H && j >= 0 && j < W {
+            out[i * W + j] = 1.0
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  4. Base MLP denoiser: ε_θ(x, t)
+//
+//  Input: [x; t] (dim = n + 1)
+//  Output: predicted noise same shape as x
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cn_base_forward(x, t_val, w1, b1, w2, b2) {
+    let d = len(x)
+    let in_dim = d + 1
+    let mut input = cn_zeros(in_dim)
+    for i in 0..d { input[i] = x[i] }
+    input[d] = t_val
+
+    let hidden_dim = len(b1)
+    let out_dim = len(b2)
+
+    let mut hid = cn_zeros(hidden_dim)
+    for i in 0..hidden_dim {
+        let mut s = b1[i]
+        for j in 0..in_dim {
+            s = s + w1[i * in_dim + j] * input[j]
+        }
+        hid[i] = cn_gelu(s)
+    }
+
+    let mut out = cn_zeros(out_dim)
+    for i in 0..out_dim {
+        let mut s = b2[i]
+        for j in 0..hidden_dim {
+            s = s + w2[i * hidden_dim + j] * hid[j]
+        }
+        out[i] = s
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  5. Control MLP: ε_c(x, t, c)
+//
+//  Input: [x; t; c] (dim = n + 1 + n_c)
+//  Output: additive correction of same shape as x
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cn_control_forward(x, t_val, c, w1, b1, w2, b2) {
+    let d = len(x)
+    let n_c = len(c)
+    let in_dim = d + 1 + n_c
+    let mut input = cn_zeros(in_dim)
+    for i in 0..d { input[i] = x[i] }
+    input[d] = t_val
+    for i in 0..n_c { input[d + 1 + i] = c[i] }
+
+    let hidden_dim = len(b1)
+    let out_dim = len(b2)
+
+    let mut hid = cn_zeros(hidden_dim)
+    for i in 0..hidden_dim {
+        let mut s = b1[i]
+        for j in 0..in_dim {
+            s = s + w1[i * in_dim + j] * input[j]
+        }
+        hid[i] = cn_gelu(s)
+    }
+
+    let mut out = cn_zeros(out_dim)
+    for i in 0..out_dim {
+        let mut s = b2[i]
+        for j in 0..hidden_dim {
+            s = s + w2[i * hidden_dim + j] * hid[j]
+        }
+        out[i] = s
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  6. Combined forward: ε(x,t,c) = base(x,t) + gate * control(x,t,c)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cn_combined_forward(x, t_val, c,
+                       base_w1, base_b1, base_w2, base_b2,
+                       ctl_w1, ctl_b1, ctl_w2, ctl_b2,
+                       gate) {
+    let base_eps = cn_base_forward(x, t_val, base_w1, base_b1, base_w2, base_b2)
+    let ctl_eps = cn_control_forward(x, t_val, c, ctl_w1, ctl_b1, ctl_w2, ctl_b2)
+    let d = len(base_eps)
+    let mut out = cn_zeros(d)
+    for i in 0..d {
+        out[i] = base_eps[i] + gate * ctl_eps[i]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  7. Diffusion loss (MSE between predicted and true noise)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cn_diffusion_loss(pred, target) {
+    let n = len(pred)
+    if n == 0 { return 0.0 }
+    let mut s = 0.0
+    for i in 0..n {
+        let d = pred[i] - target[i]
+        s = s + d * d
+    }
+    return s / to_float(n)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  8. Simple Euler-style reverse sampling
+//
+//  Iterate t from 1 → 0, remove predicted noise.
+//  x_{t-dt} = x_t - dt * ε_combined(x_t, t, c)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cn_sample(x_noise, n_steps,
+             base_w1, base_b1, base_w2, base_b2,
+             ctl_w1, ctl_b1, ctl_w2, ctl_b2,
+             c, gate) {
+    let d = len(x_noise)
+    let mut x = cn_zeros(d)
+    for i in 0..d { x[i] = x_noise[i] }
+    let dt = 1.0 / to_float(n_steps)
+    for step in 0..n_steps {
+        let t = 1.0 - to_float(step) * dt
+        let eps = cn_combined_forward(x, t, c,
+            base_w1, base_b1, base_w2, base_b2,
+            ctl_w1, ctl_b1, ctl_w2, ctl_b2,
+            gate)
+        for i in 0..d {
+            x[i] = x[i] - dt * eps[i]
+        }
+    }
+    return x
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  9. Conditioning strength — how much the control branch influences output
+//
+//  = ||eps(x,t,c) - eps(x,t)|| / (||eps(x,t)|| + 1e-8)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cn_conditioning_strength(out_with, out_without) {
+    let n = len(out_with)
+    let mut diff_sq = 0.0
+    let mut base_sq = 0.0
+    for i in 0..n {
+        let d = out_with[i] - out_without[i]
+        diff_sq = diff_sq + d * d
+        base_sq = base_sq + out_without[i] * out_without[i]
+    }
+    return cn_sqrt(diff_sq) / (cn_sqrt(base_sq) + 1.0e-8)
+}
+
+// pseudo noise helper
+@pure
+fn cn_pseudo_gauss(n, seed) {
+    let mut out = cn_zeros(n)
+    for i in 0..n {
+        let mut h = (seed + 1) * 2654435761 + (i + 1) * 1315423911
+        h = h % 1000003
+        if h < 0 { h = 0 - h }
+        let u = to_float(h % 10000) / 10000.0
+        out[i] = (u - 0.5) * 3.46
+    }
+    return out
+}
+
+println("[controlnet] loaded — conditional diffusion base+control branches + edge/depth/pose conditions")
