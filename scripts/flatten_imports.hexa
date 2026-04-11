@@ -1,0 +1,198 @@
+// scripts/flatten_imports.hexa — concatenate a .hexa file's `use "module"` graph
+// into a single flat .hexa file.
+//
+// Usage:
+//   hexa scripts/flatten_imports.hexa <target.hexa> <output.hexa>
+//
+// Why:
+//   self/codegen_c2.hexa (the C backend) treats `use "..."` directives as
+//   comments — it does not resolve them. To compile e.g. self/ml/train_gpu.hexa
+//   via the C path we manually concat all transitively-used .hexa files into
+//   one source file first.
+//
+// Resolution rules (intentionally simple):
+//   * Only `use "name"` (string form) is recognized; no module paths/aliases.
+//   * `name` is resolved as `<target_dir>/<name>.hexa` (same directory).
+//   * Recursive; topological order with leaves emitted first.
+//   * Cycles are detected and reported as a fatal error.
+//   * `use "..."` lines are stripped from the emitted output so the flattened
+//     file is a clean single-translation-unit hexa source.
+//
+// AI-native: pure hexa, no shell. Builtins only: read_file, write_file,
+// file_exists, argv, println, exit. High-level string ops (.split / .trim /
+// .starts_with / .substring / .index_of) are used to keep parsing O(N).
+
+// ── 경로 헬퍼 (split-based) ─────────────────────────────────
+
+fn fl_dirname(path) {
+    let parts = path.split("/")
+    let n = len(parts)
+    if n <= 1 { return "." }
+    let mut out = []
+    let mut i = 0
+    while i < n - 1 {
+        out = out.push(parts[i])
+        i = i + 1
+    }
+    return out.join("/")
+}
+
+fn fl_basename(path) {
+    let parts = path.split("/")
+    return parts[len(parts) - 1]
+}
+
+fn fl_contains(list, needle) {
+    let n = len(list)
+    let mut i = 0
+    while i < n {
+        if list[i] == needle { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ── `use "name"` 파싱 (한 줄) ───────────────────────────────
+//
+// 빠른 경로: line.trim().starts_with("use \"") 인지 본다.
+// 매칭되면 두 따옴표 사이의 substring 을 반환. 아니면 "" 반환.
+// 모든 `use` 식별자/경로는 ASCII 라고 가정한다.
+
+fn fl_parse_use(line) {
+    let t = line.trim()
+    if !t.starts_with("use \"") { return "" }
+    // t = `use "name"...`
+    let rest = t.substring(5, len(t))
+    let q = rest.index_of("\"")
+    if q < 0 { return "" }
+    return rest.substring(0, q)
+}
+
+// ── 한 파일에서 use 라인 제거 ───────────────────────────────
+//
+// 주의: per-line iteration 만 한다. 라인 단위는 길어봐야 수백 바이트라
+// O(N) 누적도 안전. 각 라인의 trim/starts_with 는 builtin 으로 처리된다.
+
+fn fl_strip_uses(src) {
+    let lines = src.split("\n")
+    let n = len(lines)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let line = lines[i]
+        let dep = fl_parse_use(line)
+        if dep == "" {
+            out = out.push(line)
+        } else {
+            out = out.push("// [flatten_imports] stripped: use \"" + dep + "\"")
+        }
+        i = i + 1
+    }
+    return out.join("\n")
+}
+
+// ── 한 파일에서 use 의존성 목록 추출 ────────────────────────
+
+fn fl_collect_uses(src) {
+    let lines = src.split("\n")
+    let n = len(lines)
+    let mut deps = []
+    let mut i = 0
+    while i < n {
+        let dep = fl_parse_use(lines[i])
+        if dep != "" {
+            deps = deps.push(dep)
+        }
+        i = i + 1
+    }
+    return deps
+}
+
+// ── 재귀 walk: 토포 정렬 (leaves first) ─────────────────────
+
+let mut g_order = []      // emitted abs paths, leaves first
+let mut g_visited = []    // fully walked
+let mut g_onstack = []    // current dfs stack (cycle detect)
+let mut g_base_dir = "."
+
+fn fl_walk(file_abs) {
+    if fl_contains(g_visited, file_abs) { return 0 }
+    if fl_contains(g_onstack, file_abs) {
+        println("[flatten_imports] FATAL cycle at: " + file_abs)
+        exit(1)
+    }
+    g_onstack = g_onstack.push(file_abs)
+
+    let src = read_file(file_abs)
+    let deps = fl_collect_uses(src)
+    let dn = len(deps)
+    let mut i = 0
+    while i < dn {
+        let dep_path = g_base_dir + "/" + deps[i] + ".hexa"
+        if file_exists(dep_path) {
+            fl_walk(dep_path)
+        } else {
+            println("[flatten_imports] WARN dep not found: " + deps[i] + " (" + dep_path + ")")
+        }
+        i = i + 1
+    }
+
+    g_visited = g_visited.push(file_abs)
+    g_order = g_order.push(file_abs)
+    // pop from onstack
+    let mut new_stack = []
+    let m = len(g_onstack)
+    let mut j = 0
+    while j < m {
+        if g_onstack[j] != file_abs {
+            new_stack = new_stack.push(g_onstack[j])
+        }
+        j = j + 1
+    }
+    g_onstack = new_stack
+    return 0
+}
+
+// ── 메인 ────────────────────────────────────────────────────
+
+let args = argv()
+// argv layout when run via `hexa script.hexa a b`:
+//   [0]=hexa  [1]=script  [2]=target  [3]=output
+if len(args) < 4 {
+    println("usage: hexa scripts/flatten_imports.hexa <target.hexa> <output.hexa>")
+    exit(2)
+}
+
+let target = args[2]
+let output = args[3]
+
+if !file_exists(target) {
+    println("[flatten_imports] FATAL target not found: " + target)
+    exit(1)
+}
+
+g_base_dir = fl_dirname(target)
+fl_walk(target)
+
+let mut buf = []
+buf = buf.push("// === FLATTENED by scripts/flatten_imports.hexa ===")
+buf = buf.push("// target: " + target)
+buf = buf.push("// files:  " + str(len(g_order)))
+buf = buf.push("")
+
+let m = len(g_order)
+let mut i = 0
+while i < m {
+    let f = g_order[i]
+    let body = read_file(f)
+    let stripped = fl_strip_uses(body)
+    buf = buf.push("")
+    buf = buf.push("// ----- BEGIN " + fl_basename(f) + " -----")
+    buf = buf.push(stripped)
+    buf = buf.push("// ----- END " + fl_basename(f) + " -----")
+    i = i + 1
+}
+
+let flat = buf.join("\n")
+write_file(output, flat)
+println("[flatten_imports] wrote " + output + " (" + str(len(g_order)) + " files)")
