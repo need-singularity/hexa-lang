@@ -2532,31 +2532,73 @@ impl Interpreter {
                     // it might mutate env (rare but possible). After that
                     // we can take an immutable borrow of env.
                     let idx_val = self.eval_expr(idx_expr)?;
-                    if let Value::Int(i) = idx_val {
-                        if let Some(arr_ref) = self.env.get_ref(arr_name) {
-                            if let Value::Array(a) = arr_ref {
-                                let idx = if i < 0 {
-                                    let pos = a.len() as i64 + i;
-                                    if pos < 0 {
-                                        return Err(self.runtime_err(format!(
-                                            "negative index {} out of bounds (len {})", i, a.len()
-                                        )));
+                    match idx_val {
+                        Value::Int(i) => {
+                            if let Some(obj_ref) = self.env.get_ref(arr_name) {
+                                match obj_ref {
+                                    Value::Array(a) => {
+                                        let idx = if i < 0 {
+                                            let pos = a.len() as i64 + i;
+                                            if pos < 0 {
+                                                return Err(self.runtime_err(format!(
+                                                    "negative index {} out of bounds (len {})", i, a.len()
+                                                )));
+                                            }
+                                            pos as usize
+                                        } else {
+                                            i as usize
+                                        };
+                                        if idx >= a.len() {
+                                            return Err(self.runtime_err(format!(
+                                                "index {} out of bounds (len {})", i, a.len()
+                                            )));
+                                        }
+                                        return Ok(a[idx].clone());
                                     }
-                                    pos as usize
-                                } else {
-                                    i as usize
-                                };
-                                if idx >= a.len() {
-                                    return Err(self.runtime_err(format!(
-                                        "index {} out of bounds (len {})", i, a.len()
-                                    )));
+                                    Value::Tuple(t) => {
+                                        let idx = i as usize;
+                                        if idx >= t.len() {
+                                            return Err(self.runtime_err(format!(
+                                                "tuple index {} out of bounds (len {})", i, t.len()
+                                            )));
+                                        }
+                                        return Ok(t[idx].clone());
+                                    }
+                                    Value::Tensor(t) => {
+                                        let idx = if i < 0 {
+                                            let pos = t.data.len() as i64 + i;
+                                            if pos < 0 {
+                                                return Err(self.runtime_err(format!(
+                                                    "tensor index {} out of bounds (len {})", i, t.data.len()
+                                                )));
+                                            }
+                                            pos as usize
+                                        } else {
+                                            i as usize
+                                        };
+                                        if idx >= t.data.len() {
+                                            return Err(self.runtime_err(format!(
+                                                "tensor index {} out of bounds (len {})", i, t.data.len()
+                                            )));
+                                        }
+                                        return Ok(Value::Float(t.data[idx]));
+                                    }
+                                    _ => { /* fall through */ }
                                 }
-                                return Ok(a[idx].clone());
                             }
                         }
+                        Value::Str(ref k) => {
+                            // map["key"] fast path
+                            if let Some(obj_ref) = self.env.get_ref(arr_name) {
+                                if let Value::Map(m) = obj_ref {
+                                    return m.get(k).cloned().ok_or_else(|| {
+                                        self.runtime_err(format!("map key '{}' not found", k))
+                                    });
+                                }
+                            }
+                        }
+                        _ => { /* fall through */ }
                     }
-                    // Fall through if arr_ref isn't a Value::Array (could be
-                    // Map/Tuple/Tensor — handled by the general path below).
                 }
 
                 // Array/String slice: arr[start..end]
