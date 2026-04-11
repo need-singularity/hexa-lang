@@ -4,10 +4,7 @@
 
 ## ⛔ 규칙 준수 (필수)
 
-모든 작업 전 아래 규칙 파일을 읽고 준수할 것. 위반 시 즉시 수정.
-
-- **공통**: `shared/rules/common.json` — R0~R27, AI-NATIVE 원칙
-- **프로젝트**: `shared/rules/hexa-lang.json` — HX1~HX6
+작업 시작 전 `shared/rules/common.json` + `shared/rules/hexa-lang.json` 을 읽고 전 규칙 준수. 위반 시 즉시 수정.
 
 ## ref
 
