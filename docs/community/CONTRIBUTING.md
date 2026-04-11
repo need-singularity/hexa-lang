@@ -1,80 +1,90 @@
 # Contributing to HEXA-LANG
 
-Thank you for your interest in contributing to HEXA-LANG. This guide covers everything from setting up the development environment to submitting a pull request.
+Thank you for your interest in contributing to HEXA-LANG. This guide covers
+everything from setting up the development environment to submitting a pull
+request.
+
+> **2026-04-11 self-host milestone**: HEXA-LANG is now fully self-hosted.
+> `src/` and `Cargo.toml` have been deleted. The precompiled `./hexa`
+> binary is the runtime; rebuilds bootstrap via `build_hexa.hexa`.
 
 ## Development Setup
 
 ### Prerequisites
 
-- **Rust** (stable, 1.75+): `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
 - **Git**: any recent version
+- **clang** (only for rebuild; runtime uses the precompiled binary)
+- **bash**: for package manager scripts
 
-### Building from Source
+No Rust, no cargo, no python required.
+
+### Running from Source
 
 ```bash
 git clone https://github.com/need-singularity/hexa-lang.git
 cd hexa-lang
-cargo build --release
+./hexa examples/hello_min.hexa        # precompiled binary runs immediately
 ```
 
 ### Running Tests
 
 ```bash
-# Run all Rust tests
-cargo test
+# Self-host regression suite (205/205 should PASS)
+./hexa self/test_interp.hexa
+./hexa self/test_interp_e2e.hexa
+./hexa self/test_interp_match.hexa
+./hexa self/test_interp_valuesystem.hexa
 
-# Run HEXA proof tests
-./target/release/hexa --test examples/test_builtins.hexa
-
-# Run a specific test module
-cargo test -- lexer
-cargo test -- parser
-cargo test -- interpreter
+# Individual example tests
+./hexa --test examples/test_builtins.hexa
 ```
 
 ### Project Structure
 
 ```
 hexa-lang/
-  src/
-    main.rs           Entry point, REPL, CLI
-    lexer.rs          Tokenizer (53 keywords, 24 operators)
-    parser.rs         Recursive descent parser
-    ast.rs            AST node types
-    types.rs          8 primitive types + 4 type layers
-    type_checker.rs   Static type checker
-    interpreter.rs    Tree-walk evaluator + 50+ builtins
-    compiler.rs       AST to bytecode compiler
-    vm.rs             Stack-based bytecode VM
-    jit.rs            Cranelift JIT backend
-    proof_engine.rs   Proof/verify block execution
-    memory.rs         Egyptian fraction allocator
-    std_*.rs          Standard library modules (12 files)
-    codegen_esp32.rs  ESP32 code generation
-    codegen_verilog.rs  FPGA code generation
-    codegen_wgsl.rs   WebGPU code generation
-    ...               (51 source files total)
+  self/               605 .hexa files — sole source of truth
+    lexer.hexa        Tokenizer (53 keywords, 24 operators)
+    parser.hexa       Recursive descent parser (83 AST kinds)
+    interpreter.hexa  Tree-walk evaluator (270+ builtins)
+    ast.hexa          AST node types
+    type_checker.hexa Static type checker + Law types
+    compiler.hexa     AST → bytecode compiler
+    vm.hexa           Stack-based bytecode VM
+    jit.hexa          Cranelift JIT bridge
+    trace_jit.hexa    Hot loop detection + trace recording
+    proof_engine.hexa SAT/SMT proof engine
+    memory.hexa       Egyptian fraction allocator
+    ir/               HEXA-IR (J₂=24 opcodes, τ=4 categories)
+    codegen/          ARM64/x86_64/ELF/Mach-O native codegen
+    std_*.hexa        Standard library modules (14 files)
+    lib.hexa          Library entry (module registry + run_source API)
+    main.hexa         CLI dispatcher
   examples/           Example HEXA programs
   docs/               Documentation, book, specs
-  self/               Self-hosted lexer and parser
-  playground/         WASM playground
-  editors/            Editor support (VS Code)
+  playground/         Browser playground (static pages)
+  editors/            Editor support (VS Code, JetBrains)
+  pkg/hx              Pure-bash package manager (zero deps)
+  hexa.toml           Self-host package manifest (replaces Cargo.toml)
+  build_hexa.hexa     hexa_v2 → C → clang → hexa_v3 bootstrap
+  hexa                Precompiled binary (the runtime)
 ```
 
 ## Coding Style
 
-### Rust
+### Hexa
 
-- Follow standard Rust conventions (`cargo fmt`, `cargo clippy`)
-- All public functions need doc comments
-- Tests go in the same file as the code they test (`#[cfg(test)]`)
-- No `unwrap()` in production code -- use `?` or explicit error handling
+- Follow the self-host conventions in `self/*.hexa`
+- All public functions need doc comments (triple `//` or `/** */`)
+- Tests use `self/test_*.hexa` pattern runnable via `./hexa`
+- Prefer `try { ... } catch e { ... }` over raw `exit(1)`
+- Module state uses `pub let mut` to support cross-module `import`
 
 ### HEXA Examples
 
-- Every example should be runnable: `hexa examples/your_example.hexa`
+- Every example should be runnable: `./hexa examples/your_example.hexa`
 - Include comments explaining the n=6 connection
-- Use proof blocks to verify assertions
+- Use proof blocks (`proof { ... }`) to verify assertions
 
 ### n=6 Principle
 
@@ -91,8 +101,8 @@ Example: "Adding a 5th error class is justified because sopfr(6) = 5."
 1. **Fork** the repository on GitHub
 2. **Create a branch**: `git checkout -b feature/your-feature`
 3. **Write code** following the coding style above
-4. **Add tests** -- every new feature needs tests
-5. **Run the full test suite**: `cargo test`
+4. **Add tests** — every new feature needs tests in `self/test_*.hexa`
+5. **Run the full regression suite**: all 205/205 must PASS
 6. **Commit** with a clear message: `feat: add X (maps to tau(6) = 4)`
 7. **Push** and open a Pull Request
 
@@ -109,11 +119,11 @@ Types: `feat`, `fix`, `docs`, `test`, `refactor`, `perf`, `chore`
 
 ### PR Checklist
 
-- [ ] `cargo test` passes
-- [ ] `cargo clippy` has no warnings
-- [ ] New features have tests
+- [ ] All 4 self/test_interp*.hexa files PASS (205/205 total)
+- [ ] New features have tests in self/test_*.hexa
 - [ ] Documentation updated if needed
 - [ ] n=6 derivation explained (for design changes)
+- [ ] No new external dependencies (see `hexa.toml` — dependencies = empty)
 
 ## What to Contribute
 
