@@ -1,0 +1,567 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/code_sandbox.hexa — Code Sandbox Executor (ML #69)
+//
+//  Mini-language interpreter for LLM-generated code with:
+//    1. AST allowlist  — only safe operations permitted
+//    2. Exec timeout   — step counter, hard-capped
+//    3. Stdout capture — internal buffer, no external IO
+//    4. Result type    — ok / err / timeout / denied
+//    5. Deterministic  — no system calls, pure in-memory eval
+//
+//  Encoding: uses #{} maps for both AST nodes and sandbox state.
+//  Avoids Hexa's homogeneous-array typing limitation for mixed types.
+//
+//  Supported mini-lang:
+//    Expressions: int / str literal, var, binop, unary, call
+//    BinOps:      add sub mul div mod eq ne lt gt le ge and or
+//    UnaryOps:    neg not
+//    Calls (allowlist): print, println, len, str_cast, int_cast, abs, min, max
+//    Statements:  let, asn, if, while, ret, exp
+//
+//  Rules:
+//    R1/HX4 SELF-HOST FIRST — 순수 .hexa, Rust/FFI 없음
+//    R2     하드코딩 금지 — allowlist는 런타임 함수로 선언
+//    HX3    pitfalls 준수 — 세미콜론 금지, 동형 배열, 구조체 리터럴 괄호
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Result status tags ──────────────────────────────────────────
+
+fn cs_tag_ok()      { return "ok" }
+fn cs_tag_err()     { return "err" }
+fn cs_tag_timeout() { return "timeout" }
+fn cs_tag_denied()  { return "denied" }
+
+// ── AST builders — return map nodes ─────────────────────────────
+
+fn cs_lit_int(v) {
+    return #{"tag": "int", "ival": v}
+}
+
+fn cs_lit_str(v) {
+    return #{"tag": "str", "sval": v}
+}
+
+fn cs_var(name) {
+    return #{"tag": "var", "sval": name}
+}
+
+fn cs_bin(op, a, b) {
+    return #{"tag": "bin", "op": op, "left": a, "right": b}
+}
+
+fn cs_un(op, a) {
+    return #{"tag": "un", "op": op, "left": a}
+}
+
+fn cs_call(fname, args) {
+    return #{"tag": "call", "fname": fname, "args": args}
+}
+
+fn cs_let(name, expr) {
+    return #{"tag": "let", "name": name, "expr": expr}
+}
+
+fn cs_asn(name, expr) {
+    return #{"tag": "asn", "name": name, "expr": expr}
+}
+
+fn cs_if(cond, then_blk, else_blk) {
+    return #{"tag": "if", "expr": cond, "then": then_blk, "else": else_blk}
+}
+
+fn cs_while(cond, body) {
+    return #{"tag": "while", "expr": cond, "body": body}
+}
+
+fn cs_ret(expr) {
+    return #{"tag": "ret", "expr": expr}
+}
+
+fn cs_exp(expr) {
+    return #{"tag": "exp", "expr": expr}
+}
+
+// ── Sandbox state (map) ─────────────────────────────────────────
+
+fn cs_new_sandbox(max_steps) {
+    return #{
+        "max_steps": max_steps,
+        "steps": 0,
+        "vars_k": [],
+        "vars_v": [],
+        "stdout_buf": [],
+        "returned": 0,
+        "ret_val": 0,
+        "err_msg": "",
+        "status": cs_tag_ok()
+    }
+}
+
+// ── Variable env — parallel arrays ──────────────────────────────
+
+fn cs_var_lookup_found(sb, name) {
+    let n = len(sb["vars_k"])
+    let mut i = n - 1
+    while i >= 0 {
+        if sb["vars_k"][i] == name { return 1 }
+        i = i - 1
+    }
+    return 0
+}
+
+fn cs_var_lookup_value(sb, name) {
+    let n = len(sb["vars_k"])
+    let mut i = n - 1
+    while i >= 0 {
+        if sb["vars_k"][i] == name { return sb["vars_v"][i] }
+        i = i - 1
+    }
+    return 0
+}
+
+fn cs_var_set(sb, name, val) {
+    let mut s = sb
+    let n = len(s["vars_k"])
+    let mut i = 0
+    let mut updated = 0
+    while i < n {
+        if s["vars_k"][i] == name {
+            s["vars_v"][i] = val
+            updated = 1
+            i = n
+        } else {
+            i = i + 1
+        }
+    }
+    if updated == 0 {
+        s["vars_k"] = s["vars_k"] + [name]
+        s["vars_v"] = s["vars_v"] + [val]
+    }
+    return s
+}
+
+fn cs_var_declare(sb, name, val) {
+    let mut s = sb
+    s["vars_k"] = s["vars_k"] + [name]
+    s["vars_v"] = s["vars_v"] + [val]
+    return s
+}
+
+// ── Stdout capture ──────────────────────────────────────────────
+
+fn cs_stdout_append(sb, val) {
+    let mut s = sb
+    s["stdout_buf"] = s["stdout_buf"] + [val]
+    return s
+}
+
+fn cs_stdout_text(sb) {
+    let buf = sb["stdout_buf"]
+    let n = len(buf)
+    let mut out = ""
+    let mut i = 0
+    while i < n {
+        out = out + buf[i]
+        i = i + 1
+    }
+    return out
+}
+
+// ── Allowlist — whitelist, deny-by-default ──────────────────────
+
+fn cs_allowed_op(op) {
+    if op == "add" { return true }
+    if op == "sub" { return true }
+    if op == "mul" { return true }
+    if op == "div" { return true }
+    if op == "mod" { return true }
+    if op == "eq"  { return true }
+    if op == "ne"  { return true }
+    if op == "lt"  { return true }
+    if op == "gt"  { return true }
+    if op == "le"  { return true }
+    if op == "ge"  { return true }
+    if op == "and" { return true }
+    if op == "or"  { return true }
+    if op == "neg" { return true }
+    if op == "not" { return true }
+    return false
+}
+
+fn cs_allowed_call(fname) {
+    if fname == "print"    { return true }
+    if fname == "println"  { return true }
+    if fname == "len"      { return true }
+    if fname == "str_cast" { return true }
+    if fname == "int_cast" { return true }
+    if fname == "abs"      { return true }
+    if fname == "min"      { return true }
+    if fname == "max"      { return true }
+    return false
+}
+
+// Explicit denylist — named risky ops for audit. Anything not in
+// cs_allowed_call is denied by default regardless.
+fn cs_denied_call(fname) {
+    if fname == "exec"       { return true }
+    if fname == "read_file"  { return true }
+    if fname == "write_file" { return true }
+    if fname == "http_get"   { return true }
+    if fname == "http_post"  { return true }
+    if fname == "env_var"    { return true }
+    if fname == "exit"       { return true }
+    if fname == "spawn"      { return true }
+    return false
+}
+
+// ── Result type (map) ───────────────────────────────────────────
+
+fn cs_result_ok(v, out, steps) {
+    return #{"status": cs_tag_ok(), "value": v, "stdout": out, "steps": steps, "error": ""}
+}
+fn cs_result_err(msg, out, steps) {
+    return #{"status": cs_tag_err(), "value": 0, "stdout": out, "steps": steps, "error": msg}
+}
+fn cs_result_timeout(out, steps) {
+    return #{"status": cs_tag_timeout(), "value": 0, "stdout": out, "steps": steps, "error": "step limit exceeded"}
+}
+fn cs_result_denied(reason, out, steps) {
+    return #{"status": cs_tag_denied(), "value": 0, "stdout": out, "steps": steps, "error": reason}
+}
+
+// ── Binop / unop ────────────────────────────────────────────────
+
+fn cs_do_bin(op, a, b) {
+    if op == "add" { return a + b }
+    if op == "sub" { return a - b }
+    if op == "mul" { return a * b }
+    if op == "div" {
+        if b == 0 { return 0 }
+        return a / b
+    }
+    if op == "mod" {
+        if b == 0 { return 0 }
+        return a % b
+    }
+    if op == "eq" {
+        if a == b { return 1 }
+        return 0
+    }
+    if op == "ne" {
+        if a != b { return 1 }
+        return 0
+    }
+    if op == "lt" {
+        if a < b { return 1 }
+        return 0
+    }
+    if op == "gt" {
+        if a > b { return 1 }
+        return 0
+    }
+    if op == "le" {
+        if a <= b { return 1 }
+        return 0
+    }
+    if op == "ge" {
+        if a >= b { return 1 }
+        return 0
+    }
+    if op == "and" {
+        if a != 0 {
+            if b != 0 { return 1 }
+        }
+        return 0
+    }
+    if op == "or" {
+        if a != 0 { return 1 }
+        if b != 0 { return 1 }
+        return 0
+    }
+    return 0
+}
+
+fn cs_do_un(op, a) {
+    if op == "neg" { return 0 - a }
+    if op == "not" {
+        if a == 0 { return 1 }
+        return 0
+    }
+    return 0
+}
+
+// ── Builtin calls (allowlist only). Returns updated sb. ─────────
+//   Result value stored in sb["_call_ret"] (single-word scratchpad).
+
+fn cs_do_call(sb, fname, argvals) {
+    let mut s = sb
+    if fname == "print" {
+        let n = len(argvals)
+        let mut i = 0
+        while i < n {
+            s = cs_stdout_append(s, str(argvals[i]))
+            i = i + 1
+        }
+        s["_call_ret"] = 0
+        return s
+    }
+    if fname == "println" {
+        let n = len(argvals)
+        let mut i = 0
+        while i < n {
+            s = cs_stdout_append(s, str(argvals[i]))
+            i = i + 1
+        }
+        s = cs_stdout_append(s, "\n")
+        s["_call_ret"] = 0
+        return s
+    }
+    if fname == "len" {
+        if len(argvals) == 0 { s["_call_ret"] = 0; return s }
+        s["_call_ret"] = len(argvals[0])
+        return s
+    }
+    if fname == "str_cast" {
+        if len(argvals) == 0 { s["_call_ret"] = ""; return s }
+        s["_call_ret"] = str(argvals[0])
+        return s
+    }
+    if fname == "int_cast" {
+        if len(argvals) == 0 { s["_call_ret"] = 0; return s }
+        s["_call_ret"] = to_int(argvals[0])
+        return s
+    }
+    if fname == "abs" {
+        if len(argvals) == 0 { s["_call_ret"] = 0; return s }
+        let v = argvals[0]
+        if v < 0 { s["_call_ret"] = 0 - v; return s }
+        s["_call_ret"] = v
+        return s
+    }
+    if fname == "min" {
+        if len(argvals) < 2 { s["_call_ret"] = 0; return s }
+        let a = argvals[0]
+        let b = argvals[1]
+        if a < b { s["_call_ret"] = a; return s }
+        s["_call_ret"] = b
+        return s
+    }
+    if fname == "max" {
+        if len(argvals) < 2 { s["_call_ret"] = 0; return s }
+        let a = argvals[0]
+        let b = argvals[1]
+        if a > b { s["_call_ret"] = a; return s }
+        s["_call_ret"] = b
+        return s
+    }
+    s["_call_ret"] = 0
+    return s
+}
+
+// ── Step tracking — sandbox-only (updates sb, returns sb) ───────
+
+fn cs_tick(sb) {
+    let mut s = sb
+    s["steps"] = s["steps"] + 1
+    if s["steps"] > s["max_steps"] {
+        s["status"] = cs_tag_timeout()
+    }
+    return s
+}
+
+// ── Expression evaluator — returns sb (result in sb["_eval_ret"]) ─
+
+fn cs_eval_expr(sb, e) {
+    let mut s = cs_tick(sb)
+    if s["status"] != cs_tag_ok() {
+        s["_eval_ret"] = 0
+        return s
+    }
+    let tag = e["tag"]
+    if tag == "int" {
+        s["_eval_ret"] = e["ival"]
+        return s
+    }
+    if tag == "str" {
+        s["_eval_ret"] = e["sval"]
+        return s
+    }
+    if tag == "var" {
+        let name = e["sval"]
+        if cs_var_lookup_found(s, name) == 0 {
+            s["status"] = cs_tag_err()
+            s["err_msg"] = "undefined var: " + name
+            s["_eval_ret"] = 0
+            return s
+        }
+        s["_eval_ret"] = cs_var_lookup_value(s, name)
+        return s
+    }
+    if tag == "bin" {
+        let op = e["op"]
+        if cs_allowed_op(op) == false {
+            s["status"] = cs_tag_denied()
+            s["err_msg"] = "denied op: " + op
+            s["_eval_ret"] = 0
+            return s
+        }
+        s = cs_eval_expr(s, e["left"])
+        if s["status"] != cs_tag_ok() {
+            s["_eval_ret"] = 0
+            return s
+        }
+        let lv = s["_eval_ret"]
+        s = cs_eval_expr(s, e["right"])
+        if s["status"] != cs_tag_ok() {
+            s["_eval_ret"] = 0
+            return s
+        }
+        let rv = s["_eval_ret"]
+        s["_eval_ret"] = cs_do_bin(op, lv, rv)
+        return s
+    }
+    if tag == "un" {
+        let op = e["op"]
+        if cs_allowed_op(op) == false {
+            s["status"] = cs_tag_denied()
+            s["err_msg"] = "denied op: " + op
+            s["_eval_ret"] = 0
+            return s
+        }
+        s = cs_eval_expr(s, e["left"])
+        if s["status"] != cs_tag_ok() {
+            s["_eval_ret"] = 0
+            return s
+        }
+        let iv = s["_eval_ret"]
+        s["_eval_ret"] = cs_do_un(op, iv)
+        return s
+    }
+    if tag == "call" {
+        let fname = e["fname"]
+        if cs_allowed_call(fname) == false {
+            s["status"] = cs_tag_denied()
+            s["err_msg"] = "denied call: " + fname
+            s["_eval_ret"] = 0
+            return s
+        }
+        let raw_args = e["args"]
+        let mut argvals = []
+        let mut i = 0
+        let n = len(raw_args)
+        while i < n {
+            s = cs_eval_expr(s, raw_args[i])
+            if s["status"] != cs_tag_ok() {
+                s["_eval_ret"] = 0
+                return s
+            }
+            argvals = argvals + [s["_eval_ret"]]
+            i = i + 1
+        }
+        s = cs_do_call(s, fname, argvals)
+        s["_eval_ret"] = s["_call_ret"]
+        return s
+    }
+    s["status"] = cs_tag_err()
+    s["err_msg"] = "unknown expr tag: " + tag
+    s["_eval_ret"] = 0
+    return s
+}
+
+// ── Statement executor ──────────────────────────────────────────
+
+fn cs_exec_stmt(sb, stmt) {
+    let mut s = cs_tick(sb)
+    if s["status"] != cs_tag_ok() { return s }
+    if s["returned"] != 0 { return s }
+    let tag = stmt["tag"]
+    if tag == "let" {
+        s = cs_eval_expr(s, stmt["expr"])
+        if s["status"] != cs_tag_ok() { return s }
+        s = cs_var_declare(s, stmt["name"], s["_eval_ret"])
+        return s
+    }
+    if tag == "asn" {
+        s = cs_eval_expr(s, stmt["expr"])
+        if s["status"] != cs_tag_ok() { return s }
+        if cs_var_lookup_found(s, stmt["name"]) == 0 {
+            s["status"] = cs_tag_err()
+            s["err_msg"] = "assign to undeclared: " + stmt["name"]
+            return s
+        }
+        s = cs_var_set(s, stmt["name"], s["_eval_ret"])
+        return s
+    }
+    if tag == "if" {
+        s = cs_eval_expr(s, stmt["expr"])
+        if s["status"] != cs_tag_ok() { return s }
+        if s["_eval_ret"] != 0 {
+            s = cs_exec_block(s, stmt["then"])
+        } else {
+            s = cs_exec_block(s, stmt["else"])
+        }
+        return s
+    }
+    if tag == "while" {
+        let mut guard = 0
+        let hard_cap = s["max_steps"]
+        while guard < hard_cap {
+            if s["status"] != cs_tag_ok() { return s }
+            if s["returned"] != 0 { return s }
+            s = cs_eval_expr(s, stmt["expr"])
+            if s["status"] != cs_tag_ok() { return s }
+            if s["_eval_ret"] == 0 { return s }
+            s = cs_exec_block(s, stmt["body"])
+            guard = guard + 1
+        }
+        s["status"] = cs_tag_timeout()
+        s["err_msg"] = "while loop cap"
+        return s
+    }
+    if tag == "ret" {
+        s = cs_eval_expr(s, stmt["expr"])
+        if s["status"] != cs_tag_ok() { return s }
+        s["ret_val"] = s["_eval_ret"]
+        s["returned"] = 1
+        return s
+    }
+    if tag == "exp" {
+        s = cs_eval_expr(s, stmt["expr"])
+        return s
+    }
+    s["status"] = cs_tag_err()
+    s["err_msg"] = "unknown stmt tag: " + tag
+    return s
+}
+
+fn cs_exec_block(sb, stmts) {
+    let mut s = sb
+    let n = len(stmts)
+    let mut i = 0
+    while i < n {
+        if s["status"] != cs_tag_ok() { return s }
+        if s["returned"] != 0 { return s }
+        s = cs_exec_stmt(s, stmts[i])
+        i = i + 1
+    }
+    return s
+}
+
+// ── Top-level runner ────────────────────────────────────────────
+
+fn cs_run(sb, program) {
+    let mut s = cs_exec_block(sb, program)
+    let out = cs_stdout_text(s)
+    let status = s["status"]
+    let steps = s["steps"]
+    if status == cs_tag_timeout() {
+        return cs_result_timeout(out, steps)
+    }
+    if status == cs_tag_denied() {
+        return cs_result_denied(s["err_msg"], out, steps)
+    }
+    if status == cs_tag_err() {
+        return cs_result_err(s["err_msg"], out, steps)
+    }
+    return cs_result_ok(s["ret_val"], out, steps)
+}
