@@ -1,0 +1,311 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/sparsegpt_wanda.hexa — SparseGPT / Wanda Pruning (#255)
+//
+//  1-shot 50% weight removal without retraining using calibration data.
+//  Wanda (Weights AND Activations) score:
+//      score_ij = |w_ij| * ||X_j||_2
+//  where ||X_j||_2 is the L2 norm of the j-th input feature across the
+//  calibration batch.  Keep the top-k per row (or globally), zero the
+//  rest.  Only ONE forward pass over the calibration set is needed — no
+//  gradients, no retraining.
+//
+//  SparseGPT is the OBS-based refinement (inverse-Hessian) — we
+//  implement the simplified per-row variant: sort rows by the same
+//  Wanda score but also compute a quick column-wise Hessian diagonal
+//  (sum x_j^2) which Wanda uses directly.
+//
+//  API:
+//    sgw_input_norms(X)                               -> [float]
+//    sgw_wanda_score(W, col_norms)                    -> [[float]]
+//    sgw_prune_per_row(W, X, sparsity)                -> { W', mask }
+//    sgw_prune_unstructured(W, X, sparsity)           -> { W', mask }
+//    sgw_calibrate_and_prune(W, X_list, sparsity)     -> { W', stats }
+//    sgw_reconstruction_error(W, W_pruned, X)         -> float
+//    sgw_layer_sparsity(W_pruned)                     -> float
+//
+//  NOTE: module prefix `sgw_` to avoid conflict with existing
+//  pruning.hexa (`pr_*`).
+// ═══════════════════════════════════════════════════════════════════
+
+// ── helpers ──────────────────────────────────────────────────────
+
+fn sgw_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn sgw_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn sgw_zeros_1d(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn sgw_zeros_2d(r, c) {
+    let mut m = []
+    for _i in 0..r {
+        let mut row = []
+        for _j in 0..c { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+fn sgw_copy_2d(w) {
+    let rows = len(w)
+    let cols = len(w[0])
+    let mut out = []
+    for i in 0..rows {
+        let mut row = []
+        for j in 0..cols { row = row + [w[i][j]] }
+        out = out + [row]
+    }
+    return out
+}
+
+fn sgw_sort_asc(a) {
+    let n = len(a)
+    let mut s = []
+    for i in 0..n { s = s + [a[i]] }
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if s[j] < s[i] {
+                let tmp = s[i]
+                s[i] = s[j]
+                s[j] = tmp
+            }
+        }
+    }
+    return s
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (1) Input Feature Norms  (Wanda activation statistic)
+//
+//  X is a calibration batch of shape [n_samples][n_features].
+//  Returns ||X[:,j]||_2 for each column j.  Only ONE forward pass
+//  through the calibration data is needed — activations are collected
+//  once, then used to score every weight row.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn sgw_input_norms(X) {
+    let n_samples = len(X)
+    if n_samples == 0 { return [] }
+    let n_feats = len(X[0])
+    let mut sq = sgw_zeros_1d(n_feats)
+    for i in 0..n_samples {
+        for j in 0..n_feats {
+            let v = X[i][j]
+            sq[j] = sq[j] + v * v
+        }
+    }
+    let mut out = sgw_zeros_1d(n_feats)
+    for j in 0..n_feats {
+        out[j] = sgw_sqrt(sq[j])
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (2) Wanda Score Matrix  |W_ij| * ||X_j||
+// ═══════════════════════════════════════════════════════════════════
+@pure @parallel
+fn sgw_wanda_score(W, col_norms) {
+    let rows = len(W)
+    let cols = len(W[0])
+    let mut S = sgw_zeros_2d(rows, cols)
+    for i in 0..rows {
+        for j in 0..cols {
+            S[i][j] = sgw_abs(W[i][j]) * col_norms[j]
+        }
+    }
+    return S
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (3) Per-Row Wanda Pruning  (Wanda default)
+//
+//  For each row i, keep top (1-sparsity) * cols entries by score,
+//  zero the rest.  Also returns the boolean mask.
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn sgw_prune_per_row(W, X, sparsity) {
+    let rows = len(W)
+    let cols = len(W[0])
+    let col_norms = sgw_input_norms(X)
+    let scores = sgw_wanda_score(W, col_norms)
+
+    let num_keep_f = to_float(cols) * (1.0 - sparsity)
+    let mut num_keep = int(num_keep_f)
+    if num_keep < 0 { num_keep = 0 }
+    if num_keep > cols { num_keep = cols }
+    let num_prune = cols - num_keep
+
+    let mut W_out = sgw_copy_2d(W)
+    let mut mask = []
+    for _i in 0..rows {
+        let mut mrow = []
+        for _j in 0..cols { mrow = mrow + [true] }
+        mask = mask + [mrow]
+    }
+
+    for i in 0..rows {
+        // threshold by sorting row scores ascending
+        let mut row_scores = []
+        for j in 0..cols { row_scores = row_scores + [scores[i][j]] }
+        let sorted = sgw_sort_asc(row_scores)
+        if num_prune <= 0 {
+            // nothing to prune
+        } else {
+            let thr = sorted[num_prune - 1]
+            let mut pruned_here = 0
+            for j in 0..cols {
+                if scores[i][j] <= thr {
+                    if pruned_here < num_prune {
+                        W_out[i][j] = 0.0
+                        mask[i][j] = false
+                        pruned_here = pruned_here + 1
+                    }
+                }
+            }
+        }
+    }
+
+    return #{
+        "W": W_out,
+        "mask": mask,
+        "col_norms": col_norms,
+        "scores": scores
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (4) Unstructured (global) Wanda Pruning
+//
+//  Same score, but global top-k — stronger compression because big
+//  columns dominate.  Returns same struct shape.
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn sgw_prune_unstructured(W, X, sparsity) {
+    let rows = len(W)
+    let cols = len(W[0])
+    let total = rows * cols
+    let col_norms = sgw_input_norms(X)
+    let scores = sgw_wanda_score(W, col_norms)
+
+    let num_prune_f = to_float(total) * sparsity
+    let mut num_prune = int(num_prune_f)
+    if num_prune < 0 { num_prune = 0 }
+    if num_prune > total { num_prune = total }
+
+    let mut flat = []
+    for i in 0..rows {
+        for j in 0..cols { flat = flat + [scores[i][j]] }
+    }
+    let sorted = sgw_sort_asc(flat)
+
+    let mut W_out = sgw_copy_2d(W)
+    let mut mask = []
+    for _i in 0..rows {
+        let mut mrow = []
+        for _j in 0..cols { mrow = mrow + [true] }
+        mask = mask + [mrow]
+    }
+
+    if num_prune > 0 {
+        let thr = sorted[num_prune - 1]
+        let mut pruned_so_far = 0
+        for i in 0..rows {
+            for j in 0..cols {
+                if scores[i][j] <= thr {
+                    if pruned_so_far < num_prune {
+                        W_out[i][j] = 0.0
+                        mask[i][j] = false
+                        pruned_so_far = pruned_so_far + 1
+                    }
+                }
+            }
+        }
+    }
+
+    return #{
+        "W": W_out,
+        "mask": mask,
+        "col_norms": col_norms,
+        "scores": scores
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (5) Calibrate + Prune — end to end
+//
+//  X_list is treated the same as X (already stacked).  Returns the
+//  pruned weight and simple statistics.
+// ═══════════════════════════════════════════════════════════════════
+fn sgw_calibrate_and_prune(W, X_list, sparsity) {
+    let result = sgw_prune_per_row(W, X_list, sparsity)
+    let W_pruned = result["W"]
+    let final_sparsity = sgw_layer_sparsity(W_pruned)
+    return #{
+        "W": W_pruned,
+        "mask": result["mask"],
+        "col_norms": result["col_norms"],
+        "achieved_sparsity": final_sparsity
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (6) Reconstruction Error  ||W X - W' X||_2 / ||W X||_2
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn sgw_reconstruction_error(W, W_pruned, X) {
+    let rows = len(W)
+    let cols = len(W[0])
+    let n = len(X)
+    let mut num = 0.0
+    let mut den = 0.0
+    for s in 0..n {
+        for i in 0..rows {
+            let mut y_full = 0.0
+            let mut y_prn = 0.0
+            for j in 0..cols {
+                y_full = y_full + W[i][j] * X[s][j]
+                y_prn = y_prn + W_pruned[i][j] * X[s][j]
+            }
+            let d = y_full - y_prn
+            num = num + d * d
+            den = den + y_full * y_full
+        }
+    }
+    if den < 1.0e-12 { return 0.0 }
+    return sgw_sqrt(num) / sgw_sqrt(den)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (7) Measured sparsity of a pruned layer
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn sgw_layer_sparsity(W) {
+    let rows = len(W)
+    let cols = len(W[0])
+    let total = rows * cols
+    if total == 0 { return 0.0 }
+    let mut zeros = 0
+    for i in 0..rows {
+        for j in 0..cols {
+            if sgw_abs(W[i][j]) < 1.0e-10 {
+                zeros = zeros + 1
+            }
+        }
+    }
+    return to_float(zeros) / to_float(total)
+}

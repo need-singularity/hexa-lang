@@ -1,0 +1,310 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/randomized_smoothing.hexa — Randomized Smoothing (#258)
+//
+//  Certifiably robust classifier via Gaussian noise.
+//
+//      f         : R^d -> {1..K}  base classifier
+//      g(x) = arg max_c  P_ε (f(x+ε) = c),  ε ~ N(0, σ² I)
+//
+//  Given an input x, we approximate p_A (the probability of the top
+//  class) via Monte Carlo with n samples and get a 1-α lower bound
+//  p_A_lo using a simple Clopper–Pearson-style normal approximation.
+//  The certified radius is
+//
+//      r = σ · Φ⁻¹(p_A_lo)
+//
+//  where Φ⁻¹ is the standard normal inverse CDF (Beasley–Springer
+//  approximation).
+//
+//  We keep the "base classifier" as a pluggable linear decision rule
+//  (argmax over W·x) so the module is fully self-contained.
+//
+//  API:
+//    rs_linear_predict(W, x)                   -> int
+//    rs_counts_under_noise(W, x, sigma, n, seed) -> [int]   length K
+//    rs_majority_class(counts)                 -> int
+//    rs_lower_bound(k_top, n, alpha)           -> float
+//    rs_norm_cdf(x)                            -> float
+//    rs_norm_ppf(p)                            -> float
+//    rs_certify(W, x, sigma, n, alpha, seed)   -> #{class, radius, pA_lo}
+//
+//  AI-NATIVE attrs:
+//    @pure  — deterministic (seeded noise)
+//    @hot   — Monte Carlo loop
+// ═══════════════════════════════════════════════════════════════════
+
+fn rs_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 { g = (g + x / g) / 2.0 }
+    return g
+}
+
+fn rs_log(x) {
+    if x <= 0.0 { return -30.0 }
+    let mut v = x
+    let mut count = 0
+    while v > 2.0 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    let d = v - 1.0
+    let ln_v = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_v
+}
+
+fn rs_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn rs_cos(x) {
+    let mut v = x
+    while v > 3.14159265 { v = v - 6.2831853 }
+    while v < -3.14159265 { v = v + 6.2831853 }
+    let v2 = v * v
+    return 1.0 - v2 / 2.0 + v2 * v2 / 24.0 - v2 * v2 * v2 / 720.0
+}
+
+fn rs_sin(x) {
+    let mut v = x
+    while v > 3.14159265 { v = v - 6.2831853 }
+    while v < -3.14159265 { v = v + 6.2831853 }
+    let v2 = v * v
+    return v - v * v2 / 6.0 + v * v2 * v2 / 120.0 - v * v2 * v2 * v2 / 5040.0
+}
+
+fn rs_zeros_i(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+fn rs_zeros_f(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+// ── seeded LCG + box-muller ─────────────────────────────────────
+fn rs_lcg(state) {
+    return (state * 1103515245 + 12345) % 2147483648
+}
+
+fn rs_uniform(state) {
+    let s = rs_lcg(state)
+    return [to_float(s) / 2147483648.0, to_float(s)]
+}
+
+fn rs_gauss_pair(state) {
+    let p1 = rs_uniform(state)
+    let mut u1 = p1[0]
+    let s1 = p1[1]
+    if u1 < 1.0e-9 { u1 = 1.0e-9 }
+    let p2 = rs_uniform(int(s1))
+    let u2 = p2[0]
+    let s2 = p2[1]
+    let r = rs_sqrt(-2.0 * rs_log(u1))
+    let theta = 6.2831853 * u2
+    let z0 = r * rs_cos(theta)
+    let z1 = r * rs_sin(theta)
+    return [z0, z1, s2]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (1) Linear base classifier  — argmax over W·x
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn rs_linear_predict(W, x) {
+    let K = len(W)
+    let D = len(x)
+    let mut best = -1.0e18
+    let mut best_idx = 0
+    for k in 0..K {
+        let mut s = 0.0
+        for j in 0..D { s = s + W[k][j] * x[j] }
+        if s > best {
+            best = s
+            best_idx = k
+        }
+    }
+    return best_idx
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (2) Count class predictions under Gaussian noise
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn rs_counts_under_noise(W, x, sigma, n, seed) {
+    let K = len(W)
+    let D = len(x)
+    let mut counts = rs_zeros_i(K)
+    let mut state = seed
+    if state <= 0 { state = 1 }
+    let mut trial = 0
+    while trial < n {
+        // Generate D noise values (two at a time)
+        let mut noisy = rs_zeros_f(D)
+        let mut j = 0
+        while j < D {
+            let g = rs_gauss_pair(state)
+            state = int(g[2])
+            if state <= 0 { state = 1 }
+            noisy[j] = x[j] + g[0] * sigma
+            if j + 1 < D {
+                noisy[j + 1] = x[j + 1] + g[1] * sigma
+            }
+            j = j + 2
+        }
+        let c = rs_linear_predict(W, noisy)
+        counts[c] = counts[c] + 1
+        trial = trial + 1
+    }
+    return counts
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (3) Majority class
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn rs_majority_class(counts) {
+    let K = len(counts)
+    let mut best = counts[0]
+    let mut idx = 0
+    for k in 1..K {
+        if counts[k] > best {
+            best = counts[k]
+            idx = k
+        }
+    }
+    return idx
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (4) Lower confidence bound on p_A.
+//
+//  For k successes out of n at confidence 1-α we use the Normal
+//  approximation with continuity correction:
+//      p_lo ≈ p̂ - z_{1-α} √(p̂(1-p̂)/n)
+//  z_{1-α} computed via rs_norm_ppf(1-α).  Floored to 0.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn rs_lower_bound(k_top, n, alpha) {
+    if n <= 0 { return 0.0 }
+    let p_hat = to_float(k_top) / to_float(n)
+    let z = rs_norm_ppf(1.0 - alpha)
+    let se = rs_sqrt(p_hat * (1.0 - p_hat) / to_float(n))
+    let lo = p_hat - z * se
+    if lo < 0.0 { return 0.0 }
+    if lo > 1.0 { return 1.0 }
+    return lo
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (5) Normal CDF via Abramowitz & Stegun 7.1.26 approximation
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn rs_norm_cdf(x) {
+    let a1 = 0.254829592
+    let a2 = -0.284496736
+    let a3 = 1.421413741
+    let a4 = -1.453152027
+    let a5 = 1.061405429
+    let p = 0.3275911
+    let sign = if x < 0.0 { -1.0 } else { 1.0 }
+    let ax = if x < 0.0 { 0.0 - x } else { x }
+    let z = ax / 1.4142135623
+    let t = 1.0 / (1.0 + p * z)
+    let poly = (((a5 * t + a4) * t + a3) * t + a2) * t + a1
+    let erf = 1.0 - poly * t * rs_exp(-z * z)
+    return 0.5 * (1.0 + sign * erf)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (6) Inverse normal (Beasley–Springer, simplified)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn rs_norm_ppf(p) {
+    if p <= 0.0 { return -10.0 }
+    if p >= 1.0 { return 10.0 }
+    // Acklam-esque approximation, pared down
+    let a1 = -3.969683028665376e1
+    let a2 =  2.209460984245205e2
+    let a3 = -2.759285104469687e2
+    let a4 =  1.383577518672690e2
+    let a5 = -3.066479806614716e1
+    let a6 =  2.506628277459239e0
+    let b1 = -5.447609879822406e1
+    let b2 =  1.615858368580409e2
+    let b3 = -1.556989798598866e2
+    let b4 =  6.680131188771972e1
+    let b5 = -1.328068155288572e1
+    let c1 = -7.784894002430293e-3
+    let c2 = -3.223964580411365e-1
+    let c3 = -2.400758277161838e0
+    let c4 = -2.549732539343734e0
+    let c5 =  4.374664141464968e0
+    let c6 =  2.938163982698783e0
+    let d1 =  7.784695709041462e-3
+    let d2 =  3.224671290700398e-1
+    let d3 =  2.445134137142996e0
+    let d4 =  3.754408661907416e0
+    let p_low = 0.02425
+    let p_high = 1.0 - p_low
+    let mut q = 0.0
+    let mut r = 0.0
+    let mut result = 0.0
+    if p < p_low {
+        q = rs_sqrt(-2.0 * rs_log(p))
+        result = (((((c1 * q + c2) * q + c3) * q + c4) * q + c5) * q + c6) / ((((d1 * q + d2) * q + d3) * q + d4) * q + 1.0)
+    } else {
+        if p > p_high {
+            q = rs_sqrt(-2.0 * rs_log(1.0 - p))
+            result = 0.0 - (((((c1 * q + c2) * q + c3) * q + c4) * q + c5) * q + c6) / ((((d1 * q + d2) * q + d3) * q + d4) * q + 1.0)
+        } else {
+            q = p - 0.5
+            r = q * q
+            result = (((((a1 * r + a2) * r + a3) * r + a4) * r + a5) * r + a6) * q / (((((b1 * r + b2) * r + b3) * r + b4) * r + b5) * r + 1.0)
+        }
+    }
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (7) Certify (class, radius)  — full Cohen et al. pipeline
+// ═══════════════════════════════════════════════════════════════════
+fn rs_certify(W, x, sigma, n, alpha, seed) {
+    let counts = rs_counts_under_noise(W, x, sigma, n, seed)
+    let cls = rs_majority_class(counts)
+    let k_top = counts[cls]
+    let p_lo = rs_lower_bound(k_top, n, alpha)
+    if p_lo <= 0.5 {
+        return #{
+            "class": -1,
+            "radius": 0.0,
+            "pA_lo": p_lo,
+            "counts": counts
+        }
+    }
+    let radius = sigma * rs_norm_ppf(p_lo)
+    return #{
+        "class": cls,
+        "radius": radius,
+        "pA_lo": p_lo,
+        "counts": counts
+    }
+}

@@ -1,0 +1,143 @@
+// ═══════════════════════════════════════════════════════════════════
+//  test_mech_interp_circuits.hexa — Mech Interp Circuits (#263)
+//
+//  Build a tiny transformer-like DAG with 2 "heads" and 1 "output"
+//  sum, then run path patching to recover the circuit.
+//
+//  Run: PATH=/Users/ghost/.cargo/bin:$PATH ./hexa self/test_mech_interp_circuits.hexa
+// ═══════════════════════════════════════════════════════════════════
+
+import "ml/mech_interp_circuits.hexa"
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs_(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx_(a, b, eps) { return fabs_(a - b) < eps }
+
+println("=== Mech Interp Circuits (#263) Tests ===")
+
+// ── Build model ──────────────────────────────────────────────────
+// input nodes: x0, x1
+// h0 (head):   W0 · x0        (depends on x0 ONLY)
+// h1 (head):   W1 · x1        (depends on x1 ONLY)
+// out (sum):   h0 + h1
+//
+// Target logit = out[0]  (class 0)
+//
+// Designed so that if we corrupt x0, patching h0 brings the large
+// delta; patching h1 should have zero delta (h1 does not read x0).
+
+let W0 = [
+    [2.0, 0.0],
+    [0.0, 2.0]
+]
+let W1 = [
+    [1.0, 0.0],
+    [0.0, 1.0]
+]
+
+let defs = [
+    #{ "id": "x0", "kind": "input", "srcs": [], "W": [] },
+    #{ "id": "x1", "kind": "input", "srcs": [], "W": [] },
+    #{ "id": "h0", "kind": "head",  "srcs": ["x0"], "W": W0 },
+    #{ "id": "h1", "kind": "head",  "srcs": ["x1"], "W": W1 },
+    #{ "id": "out","kind": "sum",   "srcs": ["h0", "h1"], "W": [] }
+]
+let model = mi_build_model(defs)
+
+let clean_x = #{
+    "x0": [1.0, 0.0],
+    "x1": [0.0, 1.0]
+}
+let corrupt_x = #{
+    "x0": [-1.0, 0.0],   // flipped
+    "x1": [0.0,  1.0]    // unchanged
+}
+
+// ── T1 clean forward shape ──────────────────────────────────────
+let cache_c = mi_forward(model, clean_x)
+let out_c = cache_c["out"]
+check("T1 out len=2", len(out_c) == 2)
+// out[0] = 2*1 + 1*0 = 2.0
+check("T1 out[0]=2", approx_(out_c[0], 2.0, 1.0e-6))
+// out[1] = 2*0 + 1*1 = 1.0
+check("T1 out[1]=1", approx_(out_c[1], 1.0, 1.0e-6))
+
+// ── T2 corrupt forward shape ────────────────────────────────────
+let cache_k = mi_forward(model, corrupt_x)
+let out_k = cache_k["out"]
+// out[0] = 2*(-1) + 1*0 = -2.0
+check("T2 corrupt out[0]=-2", approx_(out_k[0], -2.0, 1.0e-6))
+
+// ── T3 logit accessor ───────────────────────────────────────────
+check("T3 logit match", approx_(mi_logit(cache_c, "out", 0), 2.0, 1.0e-6))
+
+// ── T4 patch h0 -> expect delta = clean - patched ──────────────
+//   clean  out[0] = 2
+//   patch h0 with corrupt h0 = -2 -> out[0] = -2 + 1*0 = -2
+//   delta = 2 - (-2) = 4.0
+let delta_h0 = mi_patch_edge(model, clean_x, corrupt_x, "h0", "out", 0)
+check("T4 delta h0 = 4", approx_(delta_h0, 4.0, 1.0e-6))
+
+// ── T5 patch h1 -> delta = 0 (unchanged) ────────────────────────
+let delta_h1 = mi_patch_edge(model, clean_x, corrupt_x, "h1", "out", 0)
+check("T5 delta h1 = 0", approx_(delta_h1, 0.0, 1.0e-6))
+
+// ── T6 patch x0 -> same as h0 because h0 is pure function ──────
+let delta_x0 = mi_patch_edge(model, clean_x, corrupt_x, "x0", "out", 0)
+check("T6 delta x0 != 0", fabs_(delta_x0) > 0.0)
+
+// ── T7 rank_edges puts h0 at top ───────────────────────────────
+let ranked = mi_rank_edges(model, clean_x, corrupt_x, "out", 0)
+// ranked is sorted by abs delta desc, target excluded
+// expected top: h0 or x0 (both big), then the other, then h1 and x1 near 0
+let top_edge = ranked[0]["edge"]
+check("T7 top edge has largest abs", top_edge == "h0" || top_edge == "x0")
+
+// ── T8 h1 delta == 0 in ranked ─────────────────────────────────
+let mut h1_abs = -1.0
+for i in 0..len(ranked) {
+    if ranked[i]["edge"] == "h1" { h1_abs = ranked[i]["abs"] }
+}
+check("T8 h1 abs ≈ 0", approx_(h1_abs, 0.0, 1.0e-6))
+
+// ── T9 top_k_circuit returns K edges ───────────────────────────
+let circuit = mi_top_k_circuit(ranked, 2)
+check("T9 top2 length", len(circuit) == 2)
+
+// ── T10 top_k_circuit excludes h1 (irrelevant) ─────────────────
+let mut h1_in_top2 = false
+for i in 0..len(circuit) {
+    if circuit[i] == "h1" { h1_in_top2 = true }
+}
+check("T10 h1 not in circuit", !h1_in_top2)
+
+// ── T11 patching target-equivalent node yields expected sign ───
+// delta should equal clean_logit - patched_logit; with clean_x==corrupt_x
+// result should be 0 everywhere.
+let same_corrupt = #{
+    "x0": [1.0, 0.0],
+    "x1": [0.0, 1.0]
+}
+let d_same = mi_patch_edge(model, clean_x, same_corrupt, "h0", "out", 0)
+check("T11 same inputs -> delta=0", approx_(d_same, 0.0, 1.0e-6))
+
+// ── T12 rank length = |nodes| - 1 (target excluded) ────────────
+check("T12 ranked len", len(ranked) == 4)
+
+println("")
+println("=== Mech Interp Circuits test summary ===")
+println("PASS: " + str(pass_count))
+println("FAIL: " + str(fail_count))
+println("TOTAL: " + str(pass_count + fail_count))
