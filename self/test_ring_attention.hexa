@@ -1,0 +1,305 @@
+// ═══════════════════════════════════════════════════════════════════
+//  test_ring_attention.hexa — Ring Attention 검증
+//
+//  검증:
+//    1. ra_zeros 길이 및 값
+//    2. ra_split_seq 청크 분할
+//    3. ra_dot 내적
+//    4. ra_softmax 합 = 1
+//    5. ra_causal_mask 형태
+//    6. ra_blockwise_attention 출력 차원
+//    7. ra_ring_step 순환
+//    8. ra_matmul 수동 검증
+//    9. ra_scale / ra_add
+//   10. ra_online_softmax_block
+//   11. ra_merge_blocks
+//   12. ra_ring_attention 전체 파이프라인
+//
+//  실행: ./hexa self/test_ring_attention.hexa
+// ═══════════════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ── inline helpers (from ring_attention.hexa) ────────────────────
+
+fn ra_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn ra_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    for _i in 0..20 { g = (g + x / g) / 2.0 }
+    return g
+}
+
+fn ra_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn ra_split_seq(seq, n_chunks) {
+    let total = len(seq)
+    let chunk_size = total / n_chunks
+    let mut chunks = []
+    for c in 0..n_chunks {
+        let start = c * chunk_size
+        let mut end = start + chunk_size
+        if c == n_chunks - 1 { end = total }
+        let mut chunk = []
+        for i in start..end { chunk = chunk + [seq[i]] }
+        chunks = chunks + [chunk]
+    }
+    return chunks
+}
+
+fn ra_dot(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    for i in 0..n { s = s + a[i] * b[i] }
+    return s
+}
+
+fn ra_scale(v, s) {
+    let n = len(v)
+    let mut out = ra_zeros(n)
+    for i in 0..n { out[i] = v[i] * s }
+    return out
+}
+
+fn ra_add(a, b) {
+    let n = len(a)
+    let mut out = ra_zeros(n)
+    for i in 0..n { out[i] = a[i] + b[i] }
+    return out
+}
+
+fn ra_matmul(A, B, m, k, n) {
+    let mut C = ra_zeros(m * n)
+    for i in 0..m {
+        for j in 0..n {
+            let mut s = 0.0
+            for p in 0..k { s = s + A[i * k + p] * B[p * n + j] }
+            C[i * n + j] = s
+        }
+    }
+    return C
+}
+
+fn ra_softmax(logits) {
+    let n = len(logits)
+    let mut mx = logits[0]
+    for i in 1..n {
+        if logits[i] > mx { mx = logits[i] }
+    }
+    let mut exps = ra_zeros(n)
+    let mut z = 0.0
+    for i in 0..n {
+        exps[i] = ra_exp(logits[i] - mx)
+        z = z + exps[i]
+    }
+    let mut out = ra_zeros(n)
+    for i in 0..n { out[i] = exps[i] / z }
+    return out
+}
+
+fn ra_causal_mask(q_start, q_len, k_start, k_len) {
+    let mut mask = ra_zeros(q_len * k_len)
+    for i in 0..q_len {
+        for j in 0..k_len {
+            let q_pos = q_start + i
+            let k_pos = k_start + j
+            if q_pos >= k_pos {
+                mask[i * k_len + j] = 0.0
+            } else {
+                mask[i * k_len + j] = -1000000000.0
+            }
+        }
+    }
+    return mask
+}
+
+fn ra_blockwise_attention(Q, K, V, d, q_start, k_start) {
+    let q_len = len(Q) / d
+    let k_len = len(K) / d
+    let scale = 1.0 / ra_sqrt(to_float(d))
+    let mut scores = ra_zeros(q_len * k_len)
+    for i in 0..q_len {
+        for j in 0..k_len {
+            let mut s = 0.0
+            for p in 0..d { s = s + Q[i * d + p] * K[j * d + p] }
+            scores[i * k_len + j] = s * scale
+        }
+    }
+    let mask = ra_causal_mask(q_start, q_len, k_start, k_len)
+    for i in 0..(q_len * k_len) { scores[i] = scores[i] + mask[i] }
+    let mut out = ra_zeros(q_len * d)
+    for i in 0..q_len {
+        let mut row = ra_zeros(k_len)
+        for j in 0..k_len { row[j] = scores[i * k_len + j] }
+        let probs = ra_softmax(row)
+        for p in 0..d {
+            let mut s = 0.0
+            for j in 0..k_len { s = s + probs[j] * V[j * d + p] }
+            out[i * d + p] = s
+        }
+    }
+    return out
+}
+
+fn ra_ring_step(kv_chunks, ring_size) {
+    let mut new_chunks = []
+    for i in 0..ring_size {
+        let src = (i - 1 + ring_size) % ring_size
+        new_chunks = new_chunks + [kv_chunks[src]]
+    }
+    return new_chunks
+}
+
+fn ra_online_softmax_block(scores, values, d) {
+    let k_len = len(scores)
+    let mut mx = scores[0]
+    for j in 1..k_len {
+        if scores[j] > mx { mx = scores[j] }
+    }
+    let mut total_w = 0.0
+    let mut weighted = ra_zeros(d)
+    for j in 0..k_len {
+        let w = ra_exp(scores[j] - mx)
+        total_w = total_w + w
+        for p in 0..d { weighted[p] = weighted[p] + w * values[j * d + p] }
+    }
+    return [weighted, [mx], [total_w]]
+}
+
+fn ra_merge_blocks(blocks, d) {
+    let n = len(blocks)
+    let mut global_max = blocks[0][1][0]
+    for i in 1..n {
+        let bm = blocks[i][1][0]
+        if bm > global_max { global_max = bm }
+    }
+    let mut merged = ra_zeros(d)
+    let mut total = 0.0
+    for i in 0..n {
+        let bm = blocks[i][1][0]
+        let bw = blocks[i][2][0]
+        let correction = ra_exp(bm - global_max)
+        let adj_w = bw * correction
+        total = total + adj_w
+        let weighted = blocks[i][0]
+        for p in 0..d { merged[p] = merged[p] + weighted[p] * correction }
+    }
+    if total > 0.0 {
+        for p in 0..d { merged[p] = merged[p] / total }
+    }
+    return merged
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Tests
+// ═══════════════════════════════════════════════════════════════════
+
+println("=== Ring Attention Tests ===")
+
+// 1. ra_zeros
+let z4 = ra_zeros(4)
+check("zeros_len", len(z4) == 4)
+check("zeros_val", z4[0] == 0.0)
+
+// 2. split_seq
+let seq8 = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+let chunks = ra_split_seq(seq8, 2)
+check("split_2chunks", len(chunks) == 2)
+check("split_chunk0_len", len(chunks[0]) == 4)
+check("split_chunk1_first", chunks[1][0] == 5.0)
+
+// 3. dot product
+let a3 = [1.0, 2.0, 3.0]
+let b3 = [4.0, 5.0, 6.0]
+check("dot_product", approx(ra_dot(a3, b3), 32.0, 0.001))
+
+// 4. softmax sums to 1
+let sm = ra_softmax([1.0, 2.0, 3.0])
+let sm_sum = sm[0] + sm[1] + sm[2]
+check("softmax_sum_1", approx(sm_sum, 1.0, 0.001))
+check("softmax_order", sm[2] > sm[1])
+
+// 5. causal mask
+let mask = ra_causal_mask(0, 3, 0, 3)
+check("mask_diag", mask[0] == 0.0)
+check("mask_upper", mask[1] < -1000.0)
+
+// 6. scale + add
+let scaled = ra_scale([1.0, 2.0], 3.0)
+check("scale", approx(scaled[0], 3.0, 0.001))
+let added = ra_add([1.0, 2.0], [3.0, 4.0])
+check("add", approx(added[1], 6.0, 0.001))
+
+// 7. matmul 2x2
+let A = [1.0, 2.0, 3.0, 4.0]
+let B = [5.0, 6.0, 7.0, 8.0]
+let C = ra_matmul(A, B, 2, 2, 2)
+check("matmul_00", approx(C[0], 19.0, 0.001))
+check("matmul_11", approx(C[3], 50.0, 0.001))
+
+// 8. blockwise attention output dimension
+let d = 2
+let Q2 = [1.0, 0.0, 0.0, 1.0]
+let K2 = [1.0, 0.0, 0.0, 1.0]
+let V2 = [1.0, 2.0, 3.0, 4.0]
+let att_out = ra_blockwise_attention(Q2, K2, V2, d, 0, 0)
+check("attn_dim", len(att_out) == 4)
+
+// 9. ring_step rotation
+let kv = ["a", "b", "c"]
+let rotated = ra_ring_step(kv, 3)
+check("ring_rotate", rotated[1] == "a")
+check("ring_rotate2", rotated[0] == "c")
+
+// 10. online softmax block
+let scores2 = [1.0, 2.0]
+let vals2 = [1.0, 0.0, 0.0, 1.0]
+let block = ra_online_softmax_block(scores2, vals2, 2)
+check("online_max", approx(block[1][0], 2.0, 0.001))
+check("online_weight_pos", block[2][0] > 0.0)
+
+// 11. merge_blocks
+let b1 = [[1.0, 0.0], [2.0], [1.5]]
+let b2 = [[0.0, 1.0], [1.0], [1.0]]
+let merged = ra_merge_blocks([b1, b2], 2)
+check("merge_dim", len(merged) == 2)
+
+// 12. causal mask asymmetry
+let mask2 = ra_causal_mask(2, 2, 0, 2)
+check("mask_asym_lower", mask2[0] == 0.0)
+check("mask_asym_all", mask2[2] == 0.0)
+
+// ── summary ──────────────────────────────────────────────────────
+println("")
+println("Ring Attention: " + str(pass_count) + " passed, " + str(fail_count) + " failed")

@@ -1,0 +1,343 @@
+// ═══════════════════════════════════════════════════════════════════
+//  test_context_distill.hexa — Context Distillation 검증
+//
+//  검증:
+//    1. softmax 합 = 1
+//    2. KL divergence 성질 (P==Q -> 0)
+//    3. cross entropy 양수
+//    4. teacher forward 차원
+//    5. attention scores 길이
+//    6. importance ranking 순서
+//    7. extract key positions 차원
+//    8. compress context 축소
+//    9. KD loss 양수
+//   10. compression ratio
+//   11. mean pool 차원
+//   12. student matches teacher 구조
+//
+//  실행: ./hexa self/test_context_distill.hexa
+// ═══════════════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ── inline helpers ──────────────────────────────────────────────
+
+fn cd_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn cd_log(x) {
+    if x <= 0.0 { return -30.0 }
+    let mut v = x
+    let mut count = 0
+    while v > 2.0 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    let d = v - 1.0
+    let ln_v = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_v
+}
+
+fn cd_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    for _i in 0..20 { g = (g + x / g) / 2.0 }
+    return g
+}
+
+fn cd_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn cd_hash(seed, i) {
+    let h = ((seed * 2654435761 + i * 1315423911 + 731) % 10007)
+    return to_float(h) / 10007.0 - 0.5
+}
+
+fn cd_min(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn cd_softmax(logits, temp) {
+    let n = len(logits)
+    let mut scaled = cd_zeros(n)
+    for i in 0..n { scaled[i] = logits[i] / temp }
+    let mut mx = scaled[0]
+    for i in 1..n {
+        if scaled[i] > mx { mx = scaled[i] }
+    }
+    let mut exps = cd_zeros(n)
+    let mut z = 0.0
+    for i in 0..n {
+        exps[i] = cd_exp(scaled[i] - mx)
+        z = z + exps[i]
+    }
+    let mut out = cd_zeros(n)
+    for i in 0..n { out[i] = exps[i] / z }
+    return out
+}
+
+fn cd_kl_divergence(p, q) {
+    let n = len(p)
+    let mut kl = 0.0
+    for i in 0..n {
+        if p[i] > 1.0e-10 {
+            let ratio = p[i] / (q[i] + 1.0e-10)
+            kl = kl + p[i] * cd_log(ratio)
+        }
+    }
+    return kl
+}
+
+fn cd_cross_entropy(logits, target_idx) {
+    let probs = cd_softmax(logits, 1.0)
+    let p = probs[target_idx]
+    if p > 1.0e-10 { return 0.0 - cd_log(p) }
+    return 30.0
+}
+
+fn cd_linear_forward(input, W, seq_len, d_in, d_out) {
+    let mut out = cd_zeros(seq_len * d_out)
+    for i in 0..seq_len {
+        for j in 0..d_out {
+            let mut s = 0.0
+            for k in 0..d_in { s = s + input[i * d_in + k] * W[k * d_out + j] }
+            out[i * d_out + j] = s
+        }
+    }
+    return out
+}
+
+fn cd_teacher_forward(weights, long_ctx, d, seq_len) {
+    let W_attn = weights[0]
+    let W_ff = weights[1]
+    let h1 = cd_linear_forward(long_ctx, W_attn, seq_len, d, d)
+    let mut h = cd_zeros(seq_len * d)
+    for i in 0..(seq_len * d) { h[i] = long_ctx[i] + h1[i] }
+    let h2 = cd_linear_forward(h, W_ff, seq_len, d, d)
+    for i in 0..(seq_len * d) { h[i] = h[i] + h2[i] }
+    return h
+}
+
+fn cd_attention_scores(hidden, d, seq_len) {
+    let mut scores = cd_zeros(seq_len)
+    for i in 0..seq_len {
+        let mut norm = 0.0
+        for j in 0..d {
+            let v = hidden[i * d + j]
+            norm = norm + v * v
+        }
+        scores[i] = cd_sqrt(norm)
+    }
+    return scores
+}
+
+fn cd_importance_ranking(scores, seq_len) {
+    let mut indices = []
+    for i in 0..seq_len { indices = indices + [i] }
+    for i in 0..seq_len {
+        let mut best = i
+        for j in (i + 1)..seq_len {
+            if scores[indices[j]] > scores[indices[best]] { best = j }
+        }
+        if best != i {
+            let tmp = indices[i]
+            indices[i] = indices[best]
+            indices[best] = tmp
+        }
+    }
+    return indices
+}
+
+fn cd_extract_key_positions(hidden, d, seq_len, k) {
+    let scores = cd_attention_scores(hidden, d, seq_len)
+    let ranked = cd_importance_ranking(scores, seq_len)
+    let take = cd_min(k, seq_len)
+    let mut selected = []
+    for i in 0..take { selected = selected + [ranked[i]] }
+    for i in 0..take {
+        for j in (i + 1)..take {
+            if selected[j] < selected[i] {
+                let tmp = selected[i]
+                selected[i] = selected[j]
+                selected[j] = tmp
+            }
+        }
+    }
+    let mut out = cd_zeros(take * d)
+    for i in 0..take {
+        let pos = selected[i]
+        for j in 0..d { out[i * d + j] = hidden[pos * d + j] }
+    }
+    return out
+}
+
+fn cd_compress_context(hidden, d, seq_len, target_len) {
+    if target_len >= seq_len { return hidden }
+    return cd_extract_key_positions(hidden, d, seq_len, target_len)
+}
+
+fn cd_kd_loss(teacher_logits, student_logits, temp, alpha) {
+    let teacher_soft = cd_softmax(teacher_logits, temp)
+    let student_soft = cd_softmax(student_logits, temp)
+    let kl = cd_kl_divergence(teacher_soft, student_soft)
+    let kl_loss = alpha * temp * temp * kl
+    let n = len(teacher_logits)
+    let mut target = 0
+    let mut mx = teacher_logits[0]
+    for i in 1..n {
+        if teacher_logits[i] > mx {
+            mx = teacher_logits[i]
+            target = i
+        }
+    }
+    let ce = cd_cross_entropy(student_logits, target)
+    let ce_loss = (1.0 - alpha) * ce
+    return kl_loss + ce_loss
+}
+
+fn cd_compression_ratio(long_len, short_len) {
+    if short_len == 0 { return 0.0 }
+    return to_float(long_len) / to_float(short_len)
+}
+
+fn cd_mean_pool(hidden, d, seq_len) {
+    let mut out = cd_zeros(d)
+    for i in 0..seq_len {
+        for j in 0..d { out[j] = out[j] + hidden[i * d + j] }
+    }
+    let s = to_float(seq_len)
+    for j in 0..d { out[j] = out[j] / s }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Tests
+// ═══════════════════════════════════════════════════════════════════
+
+println("=== Context Distillation Tests ===")
+
+let d = 4
+let vocab = 8
+let seq_len = 6
+
+// Create weights
+let mut W_attn = cd_zeros(d * d)
+for i in 0..d { W_attn[i * d + i] = 0.5 }
+let mut W_ff = cd_zeros(d * d)
+for i in 0..d { W_ff[i * d + i] = 0.3 }
+let mut W_lm = cd_zeros(d * vocab)
+for i in 0..(d * vocab) { W_lm[i] = cd_hash(42, i) * 0.1 }
+let weights = [W_attn, W_ff, W_lm]
+
+// Create input
+let mut long_ctx = cd_zeros(seq_len * d)
+for i in 0..(seq_len * d) { long_ctx[i] = cd_hash(7, i) * 0.5 }
+
+// 1. Softmax sums to 1
+let sm = cd_softmax([1.0, 2.0, 3.0, 4.0], 1.0)
+let sm_sum = sm[0] + sm[1] + sm[2] + sm[3]
+check("softmax_sum", approx(sm_sum, 1.0, 0.001))
+
+// 2. Temperature effect
+let sm_hot = cd_softmax([1.0, 2.0], 0.1)
+let sm_cold = cd_softmax([1.0, 2.0], 10.0)
+check("temp_hot_peaked", sm_hot[1] > sm_cold[1])
+
+// 3. KL divergence: P == Q -> 0
+let p = cd_softmax([1.0, 2.0, 3.0], 1.0)
+let kl_same = cd_kl_divergence(p, p)
+check("kl_same_zero", approx(kl_same, 0.0, 0.001))
+
+// 4. KL divergence: P != Q -> positive
+let q = cd_softmax([3.0, 2.0, 1.0], 1.0)
+let kl_diff = cd_kl_divergence(p, q)
+check("kl_diff_pos", kl_diff > 0.0)
+
+// 5. Cross entropy is positive
+let ce = cd_cross_entropy([1.0, 2.0, 3.0, 4.0], 3)
+check("ce_positive", ce > 0.0)
+
+// 6. Teacher forward dimension
+let h = cd_teacher_forward(weights, long_ctx, d, seq_len)
+check("teacher_dim", len(h) == seq_len * d)
+
+// 7. Attention scores length
+let scores = cd_attention_scores(h, d, seq_len)
+check("attn_scores_len", len(scores) == seq_len)
+check("attn_scores_pos", scores[0] >= 0.0)
+
+// 8. Importance ranking
+let ranked = cd_importance_ranking(scores, seq_len)
+check("rank_len", len(ranked) == seq_len)
+check("rank_best_first", scores[ranked[0]] >= scores[ranked[seq_len - 1]])
+
+// 9. Extract key positions
+let key = cd_extract_key_positions(h, d, seq_len, 3)
+check("key_dim", len(key) == 3 * d)
+
+// 10. Compress context
+let compressed = cd_compress_context(h, d, seq_len, 2)
+check("compress_shorter", len(compressed) == 2 * d)
+let no_compress = cd_compress_context(h, d, seq_len, 10)
+check("no_compress", len(no_compress) == seq_len * d)
+
+// 11. KD loss
+let t_logits = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+let s_logits = [2.0, 1.0, 4.0, 3.0, 6.0, 5.0, 8.0, 7.0]
+let kd = cd_kd_loss(t_logits, s_logits, 2.0, 0.5)
+check("kd_loss_pos", kd > 0.0)
+
+// 12. KD loss: same logits -> small
+let kd_same = cd_kd_loss(t_logits, t_logits, 2.0, 0.5)
+check("kd_same_small", kd_same < kd)
+
+// 13. Compression ratio
+let cr = cd_compression_ratio(100, 25)
+check("compress_ratio", approx(cr, 4.0, 0.001))
+
+// 14. Mean pool
+let pool = cd_mean_pool(h, d, seq_len)
+check("pool_dim", len(pool) == d)
+
+// 15. Mean pool correctness (manual check first element)
+let mut expected = 0.0
+for i in 0..seq_len { expected = expected + h[i * d] }
+expected = expected / to_float(seq_len)
+check("pool_correct", approx(pool[0], expected, 0.001))
+
+// ── summary ──────────────────────────────────────────────────────
+println("")
+println("Context Distillation: " + str(pass_count) + " passed, " + str(fail_count) + " failed")

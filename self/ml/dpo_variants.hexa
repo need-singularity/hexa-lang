@@ -1,0 +1,298 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/dpo_variants.hexa — DPO Variant Alignment Algorithms
+//
+//  Implements three post-DPO alignment methods:
+//    1. IPO  — Identity Preference Optimization (log-ratio bounded loss)
+//    2. KTO  — Kahneman-Tversky Optimization (single-sided preference)
+//    3. ORPO — Odds-Ratio Preference Optimization (odds-ratio penalty)
+//
+//  Reference: dpo.hexa for standard DPO pipeline
+//
+//  API:
+//    dv_log_sigmoid(x)                               -> float
+//    dv_sigmoid(x)                                   -> float
+//    dv_ipo_loss(log_ratio_w, log_ratio_l, tau)      -> float
+//    dv_kto_loss_chosen(log_ratio, beta, kl_ref)     -> float
+//    dv_kto_loss_rejected(log_ratio, beta, kl_ref)   -> float
+//    dv_kto_loss(log_ratio_w, log_ratio_l, beta)     -> float
+//    dv_orpo_loss(log_p_w, log_p_l, beta)            -> float
+//    dv_log_prob_sequence(logits, targets, vocab)     -> float
+//    dv_softmax(logits)                              -> [float]
+//    dv_compute_log_ratios(policy_lp_w, policy_lp_l,
+//                          ref_lp_w, ref_lp_l)       -> [float, float]
+//    dv_combined_loss(log_ratio_w, log_ratio_l,
+//                     log_p_w, log_p_l, method, beta) -> float
+//
+//  AI-NATIVE attrs:
+//    @pure     — no side effects
+//    @hot      — called every training step
+// ═══════════════════════════════════════════════════════════════════
+
+// ── helpers ──────────────────────────────────────────────────────
+
+fn dv_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn dv_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn dv_log(x) {
+    if x <= 0.0 { return -30.0 }
+    let mut v = x
+    let mut count = 0
+    while v > 2.0 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    let d = v - 1.0
+    let ln_v = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_v
+}
+
+fn dv_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn dv_hash(seed, i) {
+    let h = ((seed * 2654435761 + i * 1315423911 + 731) % 10007)
+    return to_float(h) / 10007.0 - 0.5
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Sigmoid and log-sigmoid
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn dv_sigmoid(x) {
+    if x > 20.0 { return 1.0 }
+    if x < -20.0 { return 0.0 }
+    return 1.0 / (1.0 + dv_exp(0.0 - x))
+}
+
+@pure
+fn dv_log_sigmoid(x) {
+    // log(sigmoid(x)) = -softplus(-x)
+    let neg_x = 0.0 - x
+    if neg_x > 20.0 { return 0.0 - neg_x }
+    if neg_x < -20.0 { return 0.0 }
+    return 0.0 - dv_log(1.0 + dv_exp(neg_x))
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Softmax (numerically stable)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn dv_softmax(logits) {
+    let n = len(logits)
+    let mut mx = logits[0]
+    for i in 1..n {
+        if logits[i] > mx { mx = logits[i] }
+    }
+    let mut exps = dv_zeros(n)
+    let mut z = 0.0
+    for i in 0..n {
+        exps[i] = dv_exp(logits[i] - mx)
+        z = z + exps[i]
+    }
+    let mut out = dv_zeros(n)
+    for i in 0..n { out[i] = exps[i] / z }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Log-probability of a target sequence given logits
+//  logits: [seq_len x vocab] flat, targets: [seq_len] token ids
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn dv_log_prob_sequence(logits, targets, vocab) {
+    let seq_len = len(targets)
+    let mut total = 0.0
+    for t in 0..seq_len {
+        // extract logits for position t
+        let mut row = dv_zeros(vocab)
+        for v in 0..vocab { row[v] = logits[t * vocab + v] }
+        let probs = dv_softmax(row)
+        let target = targets[t]
+        let p = probs[target]
+        if p > 1.0e-10 {
+            total = total + dv_log(p)
+        } else {
+            total = total + -30.0
+        }
+    }
+    return total
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Compute log-ratios: log(pi/pi_ref) for chosen and rejected
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn dv_compute_log_ratios(policy_lp_w, policy_lp_l, ref_lp_w, ref_lp_l) {
+    let log_ratio_w = policy_lp_w - ref_lp_w
+    let log_ratio_l = policy_lp_l - ref_lp_l
+    return [log_ratio_w, log_ratio_l]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  IPO — Identity Preference Optimization
+//
+//  L_IPO = (log_ratio_w - log_ratio_l - 1/(2*tau))^2
+//
+//  Key insight: bounded log-ratio target prevents overconfidence.
+//  tau controls the bound width (larger tau = more regularization).
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn dv_ipo_loss(log_ratio_w, log_ratio_l, tau) {
+    let diff = log_ratio_w - log_ratio_l
+    let target = 1.0 / (2.0 * tau)
+    let gap = diff - target
+    return gap * gap
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  KTO — Kahneman-Tversky Optimization
+//
+//  Single-sided: works with unpaired data (only chosen OR rejected)
+//
+//  For chosen:   L_w = 1 - sigmoid(beta * (log_ratio_w - kl_ref))
+//  For rejected: L_l = 1 - sigmoid(beta * (kl_ref - log_ratio_l))
+//
+//  kl_ref: reference KL term for normalization (estimated from batch)
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn dv_kto_loss_chosen(log_ratio, beta, kl_ref) {
+    let x = beta * (log_ratio - kl_ref)
+    return 1.0 - dv_sigmoid(x)
+}
+
+@pure @hot
+fn dv_kto_loss_rejected(log_ratio, beta, kl_ref) {
+    let x = beta * (kl_ref - log_ratio)
+    return 1.0 - dv_sigmoid(x)
+}
+
+// Combined KTO loss (when we have both chosen and rejected)
+@pure @hot
+fn dv_kto_loss(log_ratio_w, log_ratio_l, beta) {
+    // Estimate KL reference as average of log-ratios
+    let kl_ref = (dv_abs(log_ratio_w) + dv_abs(log_ratio_l)) / 2.0
+    let l_w = dv_kto_loss_chosen(log_ratio_w, beta, kl_ref)
+    let l_l = dv_kto_loss_rejected(log_ratio_l, beta, kl_ref)
+    return (l_w + l_l) / 2.0
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  ORPO — Odds-Ratio Preference Optimization
+//
+//  No reference model needed. Uses odds ratio of chosen vs rejected.
+//
+//  odds(y|x) = P(y|x) / (1 - P(y|x))
+//  L_ORPO = -log sigmoid(log(odds(y_w|x) / odds(y_l|x)))
+//         = -log sigmoid(log_p_w - log(1-exp(log_p_w))
+//                       - log_p_l + log(1-exp(log_p_l)))
+//
+//  log_p_w, log_p_l: log-probabilities of chosen/rejected sequences
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn dv_log_odds(log_p) {
+    // log_odds = log_p - log(1 - exp(log_p))
+    let p = dv_exp(log_p)
+    let one_minus_p = 1.0 - p
+    if one_minus_p < 1.0e-10 { return 30.0 }
+    return log_p - dv_log(one_minus_p)
+}
+
+@pure @hot
+fn dv_orpo_loss(log_p_w, log_p_l, beta) {
+    let log_odds_w = dv_log_odds(log_p_w)
+    let log_odds_l = dv_log_odds(log_p_l)
+    let log_odds_ratio = log_odds_w - log_odds_l
+
+    // NLL component (average negative log-prob of chosen)
+    let nll = 0.0 - log_p_w
+
+    // ORPO penalty: -log sigmoid(log_odds_ratio)
+    let orpo_penalty = 0.0 - dv_log_sigmoid(log_odds_ratio)
+
+    return nll + beta * orpo_penalty
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Combined loss dispatcher — select method by name
+//  method: 0 = IPO, 1 = KTO, 2 = ORPO
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn dv_combined_loss(log_ratio_w, log_ratio_l, log_p_w, log_p_l, method, beta) {
+    if method == 0 {
+        // IPO with tau = 1/beta
+        let tau = 1.0 / beta
+        return dv_ipo_loss(log_ratio_w, log_ratio_l, tau)
+    }
+    if method == 1 {
+        // KTO
+        return dv_kto_loss(log_ratio_w, log_ratio_l, beta)
+    }
+    if method == 2 {
+        // ORPO
+        return dv_orpo_loss(log_p_w, log_p_l, beta)
+    }
+    return 0.0
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Standard DPO loss for comparison
+//  L = -log sigmoid(beta * (log_ratio_w - log_ratio_l))
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn dv_dpo_loss(log_ratio_w, log_ratio_l, beta) {
+    let logit = beta * (log_ratio_w - log_ratio_l)
+    return 0.0 - dv_log_sigmoid(logit)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Gradient of IPO loss w.r.t. log_ratio_w
+//  dL/d(log_ratio_w) = 2 * (log_ratio_w - log_ratio_l - 1/(2*tau))
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn dv_ipo_grad_w(log_ratio_w, log_ratio_l, tau) {
+    let diff = log_ratio_w - log_ratio_l
+    let target = 1.0 / (2.0 * tau)
+    return 2.0 * (diff - target)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Reward margin: how much the model prefers chosen over rejected
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn dv_reward_margin(log_ratio_w, log_ratio_l, beta) {
+    return beta * (log_ratio_w - log_ratio_l)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Accuracy: does the model prefer chosen? (margin > 0)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn dv_preference_accuracy(log_ratio_w, log_ratio_l) {
+    if log_ratio_w > log_ratio_l { return 1.0 }
+    return 0.0
+}
+
+println("[dpo_variants] loaded — IPO (bounded) + KTO (single-sided) + ORPO (odds-ratio)")

@@ -1,0 +1,342 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/sparse_upcycling.hexa — Dense-to-MoE Sparse Upcycling
+//
+//  Converts a pretrained dense model into a Mixture-of-Experts (MoE)
+//  model with minimal quality loss by:
+//    1. Replicating the existing FFN weights into N experts
+//    2. Adding noise to break symmetry
+//    3. Initializing a uniform router
+//    4. Fine-tuning with a cosine schedule + load-balancing loss
+//
+//  Reference: moe_active.hexa for MoE routing primitives
+//
+//  API:
+//    su_replicate_expert(ffn_w, noise_scale, seed)    -> [float]
+//    su_create_experts(ffn_w, n_experts, noise_scale) -> [[float]]
+//    su_init_router(d, n_experts)                     -> [float]
+//    su_router_scores(x, W_gate, d, n_experts)        -> [float]
+//    su_topk(scores, k)                               -> [[int], [float]]
+//    su_expert_forward(x, W_expert, d_in, d_out)      -> [float]
+//    su_moe_forward(x, W_gate, experts, d, n_exp, k)  -> [float]
+//    su_load_balance_loss(router_probs, n_experts)     -> float
+//    su_cosine_lr(base_lr, step, total_steps)          -> float
+//    su_upcycle(dense_ffn, d, n_experts, top_k)        -> model
+//    su_finetune_step(model, x, d, lr, step, total)    -> model
+//
+//  AI-NATIVE attrs:
+//    @pure     — no side effects
+//    @hot      — called every training step
+// ═══════════════════════════════════════════════════════════════════
+
+// ── helpers ──────────────────────────────────────────────────────
+
+fn su_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn su_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn su_cos(x) {
+    // Taylor series cos
+    let mut v = x
+    // Normalize to [-pi, pi]
+    let pi = 3.14159265358979
+    while v > pi { v = v - 2.0 * pi }
+    while v < 0.0 - pi { v = v + 2.0 * pi }
+    let x2 = v * v
+    let mut result = 1.0 - x2 / 2.0 + x2 * x2 / 24.0 - x2 * x2 * x2 / 720.0
+    return result
+}
+
+fn su_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn su_hash(seed, i) {
+    let h = ((seed * 2654435761 + i * 1315423911 + 731) % 10007)
+    return to_float(h) / 10007.0 - 0.5
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Expert replication — copy FFN weights + add noise for symmetry breaking
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn su_replicate_expert(ffn_w, noise_scale, seed) {
+    let n = len(ffn_w)
+    let mut expert = su_zeros(n)
+    for i in 0..n {
+        let noise = su_hash(seed, i) * noise_scale
+        expert[i] = ffn_w[i] + noise
+    }
+    return expert
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Create N experts from dense FFN
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn su_create_experts(ffn_w, n_experts, noise_scale) {
+    let mut experts = []
+    for e in 0..n_experts {
+        let seed = 42 + e * 7
+        let expert = su_replicate_expert(ffn_w, noise_scale, seed)
+        experts = experts + [expert]
+    }
+    return experts
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Router initialization — uniform small weights
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn su_init_router(d, n_experts) {
+    let total = n_experts * d
+    let scale = 0.01
+    let mut W_gate = su_zeros(total)
+    for i in 0..total {
+        W_gate[i] = su_hash(123, i) * scale
+    }
+    return W_gate
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Router scores: linear gate  scores[e] = sum_j W_gate[e,j] * x[j]
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn su_router_scores(x, W_gate, d, n_experts) {
+    let mut out = []
+    for e in 0..n_experts {
+        let mut acc = 0.0
+        for j in 0..d {
+            acc = acc + W_gate[e * d + j] * x[j]
+        }
+        out = out + [acc]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Softmax
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn su_softmax(scores) {
+    let n = len(scores)
+    let mut mx = scores[0]
+    for i in 1..n {
+        if scores[i] > mx { mx = scores[i] }
+    }
+    let mut exps = su_zeros(n)
+    let mut z = 0.0
+    for i in 0..n {
+        exps[i] = su_exp(scores[i] - mx)
+        z = z + exps[i]
+    }
+    let mut out = su_zeros(n)
+    for i in 0..n { out[i] = exps[i] / z }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Top-k selection with softmax weights
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn su_topk(scores, k) {
+    let n = len(scores)
+    let mut taken = []
+    for _i in 0..n { taken = taken + [false] }
+    let mut idxs = []
+    let mut vals = []
+    for _r in 0..k {
+        let mut best_i = -1
+        let mut best_v = -1.0e30
+        for i in 0..n {
+            if !taken[i] {
+                if scores[i] > best_v {
+                    best_i = i
+                    best_v = scores[i]
+                }
+            }
+        }
+        taken[best_i] = true
+        idxs = idxs + [best_i]
+        vals = vals + [best_v]
+    }
+    // softmax over selected
+    let weights = su_softmax(vals)
+    return [idxs, weights]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Single expert forward: y = W_expert @ x  (row-major [d_out x d_in])
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn su_expert_forward(x, W_expert, d_in, d_out) {
+    let mut out = su_zeros(d_out)
+    for i in 0..d_out {
+        let mut acc = 0.0
+        for j in 0..d_in {
+            acc = acc + W_expert[i * d_in + j] * x[j]
+        }
+        out[i] = acc
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  MoE forward: route -> top-k -> gather -> weighted sum
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn su_moe_forward(x, W_gate, experts, d, n_experts, top_k) {
+    let scores = su_router_scores(x, W_gate, d, n_experts)
+    let tk = su_topk(scores, top_k)
+    let idxs = tk[0]
+    let weights = tk[1]
+
+    let mut y = su_zeros(d)
+    for s in 0..top_k {
+        let eid = idxs[s]
+        let w_s = weights[s]
+        let ye = su_expert_forward(x, experts[eid], d, d)
+        for j in 0..d { y[j] = y[j] + w_s * ye[j] }
+    }
+    return y
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Load balancing loss — penalizes uneven expert usage
+//  L_balance = n_experts * sum(f_e * P_e) where
+//    f_e = fraction of tokens routed to expert e
+//    P_e = mean router probability for expert e
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn su_load_balance_loss(router_probs, n_experts) {
+    // router_probs: [n_tokens x n_experts] flat
+    let n_tokens = len(router_probs) / n_experts
+    let mut freq = su_zeros(n_experts)
+    let mut prob_sum = su_zeros(n_experts)
+
+    for t in 0..n_tokens {
+        // find argmax for this token
+        let mut best_e = 0
+        let mut best_v = router_probs[t * n_experts]
+        for e in 1..n_experts {
+            let v = router_probs[t * n_experts + e]
+            if v > best_v {
+                best_v = v
+                best_e = e
+            }
+        }
+        freq[best_e] = freq[best_e] + 1.0
+        for e in 0..n_experts {
+            prob_sum[e] = prob_sum[e] + router_probs[t * n_experts + e]
+        }
+    }
+
+    let n_f = to_float(n_tokens)
+    let mut loss = 0.0
+    for e in 0..n_experts {
+        let f_e = freq[e] / n_f
+        let p_e = prob_sum[e] / n_f
+        loss = loss + f_e * p_e
+    }
+    return to_float(n_experts) * loss
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Cosine learning rate schedule with warmup
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn su_cosine_lr(base_lr, step, total_steps) {
+    let pi = 3.14159265358979
+    let progress = to_float(step) / to_float(total_steps)
+    let decay = 0.5 * (1.0 + su_cos(pi * progress))
+    return base_lr * decay
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Dense forward — original non-MoE FFN
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn su_dense_forward(x, ffn_w, d) {
+    return su_expert_forward(x, ffn_w, d, d)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Upcycle — convert dense model to MoE
+//  Returns [experts, W_gate]
+// ═══════════════════════════════════════════════════════════════════
+fn su_upcycle(dense_ffn, d, n_experts, noise_scale) {
+    let experts = su_create_experts(dense_ffn, n_experts, noise_scale)
+    let W_gate = su_init_router(d, n_experts)
+    return [experts, W_gate]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Fine-tune step — one gradient step on the upcycled model
+//  Returns updated [experts, W_gate]
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn su_finetune_step(model, x, d, n_experts, top_k, lr, step, total_steps) {
+    let experts = model[0]
+    let W_gate = model[1]
+    let actual_lr = su_cosine_lr(lr, step, total_steps)
+
+    // Forward
+    let y = su_moe_forward(x, W_gate, experts, d, n_experts, top_k)
+
+    // Simple perturbation-based gate update
+    let eps = 1.0e-4
+    let gate_size = n_experts * d
+    for i in 0..gate_size {
+        let orig = W_gate[i]
+        W_gate[i] = orig + eps
+        let y_p = su_moe_forward(x, W_gate, experts, d, n_experts, top_k)
+        let mut diff = 0.0
+        for j in 0..d { diff = diff + (y_p[j] - y[j]) * (y_p[j] - y[j]) }
+        W_gate[i] = orig - actual_lr * diff / eps
+    }
+
+    return [experts, W_gate]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Compute expert utilization — what fraction of tokens each expert gets
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn su_expert_utilization(router_probs, n_experts) {
+    let n_tokens = len(router_probs) / n_experts
+    let mut counts = su_zeros(n_experts)
+    for t in 0..n_tokens {
+        let mut best_e = 0
+        let mut best_v = router_probs[t * n_experts]
+        for e in 1..n_experts {
+            let v = router_probs[t * n_experts + e]
+            if v > best_v {
+                best_v = v
+                best_e = e
+            }
+        }
+        counts[best_e] = counts[best_e] + 1.0
+    }
+    let n_f = to_float(n_tokens)
+    let mut util = su_zeros(n_experts)
+    for e in 0..n_experts { util[e] = counts[e] / n_f }
+    return util
+}
+
+println("[sparse_upcycling] loaded — dense-to-MoE upcycling + router init + cosine schedule + load-balance loss")

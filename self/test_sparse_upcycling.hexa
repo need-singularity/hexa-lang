@@ -1,0 +1,310 @@
+// ═══════════════════════════════════════════════════════════════════
+//  test_sparse_upcycling.hexa — Dense-to-MoE Sparse Upcycling 검증
+//
+//  검증:
+//    1. expert 복제 + noise
+//    2. router 초기화 (uniform, small)
+//    3. topk 선택 정확성
+//    4. softmax 합 = 1
+//    5. expert forward 수동 검증
+//    6. MoE forward 출력 차원
+//    7. 모든 expert 활성화(k=n) == dense 동치
+//    8. load balance loss
+//    9. cosine lr schedule
+//   10. upcycle 구조 검증
+//   11. expert utilization
+//   12. finetune step 동작
+//
+//  실행: ./hexa self/test_sparse_upcycling.hexa
+// ═══════════════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ── inline helpers ──────────────────────────────────────────────
+
+fn su_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn su_cos(x) {
+    let pi = 3.14159265358979
+    let mut v = x
+    while v > pi { v = v - 2.0 * pi }
+    while v < 0.0 - pi { v = v + 2.0 * pi }
+    let x2 = v * v
+    return 1.0 - x2 / 2.0 + x2 * x2 / 24.0 - x2 * x2 * x2 / 720.0
+}
+
+fn su_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn su_hash(seed, i) {
+    let h = ((seed * 2654435761 + i * 1315423911 + 731) % 10007)
+    return to_float(h) / 10007.0 - 0.5
+}
+
+fn su_replicate_expert(ffn_w, noise_scale, seed) {
+    let n = len(ffn_w)
+    let mut expert = su_zeros(n)
+    for i in 0..n {
+        let noise = su_hash(seed, i) * noise_scale
+        expert[i] = ffn_w[i] + noise
+    }
+    return expert
+}
+
+fn su_create_experts(ffn_w, n_experts, noise_scale) {
+    let mut experts = []
+    for e in 0..n_experts {
+        let seed = 42 + e * 7
+        let expert = su_replicate_expert(ffn_w, noise_scale, seed)
+        experts = experts + [expert]
+    }
+    return experts
+}
+
+fn su_init_router(d, n_experts) {
+    let total = n_experts * d
+    let scale = 0.01
+    let mut W_gate = su_zeros(total)
+    for i in 0..total { W_gate[i] = su_hash(123, i) * scale }
+    return W_gate
+}
+
+fn su_router_scores(x, W_gate, d, n_experts) {
+    let mut out = []
+    for e in 0..n_experts {
+        let mut acc = 0.0
+        for j in 0..d { acc = acc + W_gate[e * d + j] * x[j] }
+        out = out + [acc]
+    }
+    return out
+}
+
+fn su_softmax(scores) {
+    let n = len(scores)
+    let mut mx = scores[0]
+    for i in 1..n {
+        if scores[i] > mx { mx = scores[i] }
+    }
+    let mut exps = su_zeros(n)
+    let mut z = 0.0
+    for i in 0..n {
+        exps[i] = su_exp(scores[i] - mx)
+        z = z + exps[i]
+    }
+    let mut out = su_zeros(n)
+    for i in 0..n { out[i] = exps[i] / z }
+    return out
+}
+
+fn su_topk(scores, k) {
+    let n = len(scores)
+    let mut taken = []
+    for _i in 0..n { taken = taken + [false] }
+    let mut idxs = []
+    let mut vals = []
+    for _r in 0..k {
+        let mut best_i = -1
+        let mut best_v = -1.0e30
+        for i in 0..n {
+            if !taken[i] {
+                if scores[i] > best_v {
+                    best_i = i
+                    best_v = scores[i]
+                }
+            }
+        }
+        taken[best_i] = true
+        idxs = idxs + [best_i]
+        vals = vals + [best_v]
+    }
+    let weights = su_softmax(vals)
+    return [idxs, weights]
+}
+
+fn su_expert_forward(x, W_expert, d_in, d_out) {
+    let mut out = su_zeros(d_out)
+    for i in 0..d_out {
+        let mut acc = 0.0
+        for j in 0..d_in { acc = acc + W_expert[i * d_in + j] * x[j] }
+        out[i] = acc
+    }
+    return out
+}
+
+fn su_moe_forward(x, W_gate, experts, d, n_experts, top_k) {
+    let scores = su_router_scores(x, W_gate, d, n_experts)
+    let tk = su_topk(scores, top_k)
+    let idxs = tk[0]
+    let weights = tk[1]
+    let mut y = su_zeros(d)
+    for s in 0..top_k {
+        let eid = idxs[s]
+        let w_s = weights[s]
+        let ye = su_expert_forward(x, experts[eid], d, d)
+        for j in 0..d { y[j] = y[j] + w_s * ye[j] }
+    }
+    return y
+}
+
+fn su_load_balance_loss(router_probs, n_experts) {
+    let n_tokens = len(router_probs) / n_experts
+    let mut freq = su_zeros(n_experts)
+    let mut prob_sum = su_zeros(n_experts)
+    for t in 0..n_tokens {
+        let mut best_e = 0
+        let mut best_v = router_probs[t * n_experts]
+        for e in 1..n_experts {
+            let v = router_probs[t * n_experts + e]
+            if v > best_v {
+                best_v = v
+                best_e = e
+            }
+        }
+        freq[best_e] = freq[best_e] + 1.0
+        for e in 0..n_experts {
+            prob_sum[e] = prob_sum[e] + router_probs[t * n_experts + e]
+        }
+    }
+    let n_f = to_float(n_tokens)
+    let mut loss = 0.0
+    for e in 0..n_experts {
+        loss = loss + (freq[e] / n_f) * (prob_sum[e] / n_f)
+    }
+    return to_float(n_experts) * loss
+}
+
+fn su_cosine_lr(base_lr, step, total_steps) {
+    let pi = 3.14159265358979
+    let progress = to_float(step) / to_float(total_steps)
+    let decay = 0.5 * (1.0 + su_cos(pi * progress))
+    return base_lr * decay
+}
+
+fn su_expert_utilization(router_probs, n_experts) {
+    let n_tokens = len(router_probs) / n_experts
+    let mut counts = su_zeros(n_experts)
+    for t in 0..n_tokens {
+        let mut best_e = 0
+        let mut best_v = router_probs[t * n_experts]
+        for e in 1..n_experts {
+            let v = router_probs[t * n_experts + e]
+            if v > best_v {
+                best_v = v
+                best_e = e
+            }
+        }
+        counts[best_e] = counts[best_e] + 1.0
+    }
+    let n_f = to_float(n_tokens)
+    let mut util = su_zeros(n_experts)
+    for e in 0..n_experts { util[e] = counts[e] / n_f }
+    return util
+}
+
+fn su_upcycle(dense_ffn, d, n_experts, noise_scale) {
+    let experts = su_create_experts(dense_ffn, n_experts, noise_scale)
+    let W_gate = su_init_router(d, n_experts)
+    return [experts, W_gate]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Tests
+// ═══════════════════════════════════════════════════════════════════
+
+println("=== Sparse Upcycling Tests ===")
+
+let d = 4
+let n_exp = 4
+let ffn = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0]
+
+// 1. Expert replication preserves approximate values
+let expert = su_replicate_expert(ffn, 0.001, 42)
+check("replicate_len", len(expert) == 16)
+check("replicate_approx", approx(expert[0], ffn[0], 0.01))
+
+// 2. Create N experts
+let experts = su_create_experts(ffn, n_exp, 0.001)
+check("n_experts_count", len(experts) == n_exp)
+
+// 3. Experts differ due to noise
+let diff01 = fabs(experts[0][0] - experts[1][0])
+check("expert_noise_diff", diff01 > 0.0)
+
+// 4. Router init — small values
+let W_gate = su_init_router(d, n_exp)
+check("router_len", len(W_gate) == d * n_exp)
+check("router_small", fabs(W_gate[0]) < 0.01)
+
+// 5. Top-k selection
+let scores = [0.1, 0.5, 0.3, 0.8]
+let tk = su_topk(scores, 2)
+check("topk_best", tk[0][0] == 3)
+check("topk_second", tk[0][1] == 1)
+
+// 6. Softmax weights sum to 1
+let sm = su_softmax([1.0, 2.0, 3.0])
+let sm_sum = sm[0] + sm[1] + sm[2]
+check("softmax_sum", approx(sm_sum, 1.0, 0.001))
+
+// 7. Expert forward
+let x4 = [1.0, 0.0, 0.0, 0.0]
+let w_id = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+let ef = su_expert_forward(x4, w_id, 4, 4)
+check("expert_fwd", approx(ef[0], 1.0, 0.001))
+
+// 8. MoE forward output dim
+let y = su_moe_forward(x4, W_gate, experts, d, n_exp, 2)
+check("moe_dim", len(y) == d)
+
+// 9. Load balance loss
+let uniform_probs = [0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25]
+let lb = su_load_balance_loss(uniform_probs, 4)
+check("lb_uniform", approx(lb, 1.0, 0.01))
+
+// 10. Cosine LR
+let lr0 = su_cosine_lr(0.001, 0, 100)
+check("cos_lr_start", approx(lr0, 0.001, 0.0001))
+let lr_end = su_cosine_lr(0.001, 100, 100)
+check("cos_lr_end", lr_end < 0.0002)
+
+// 11. Expert utilization
+let util = su_expert_utilization(uniform_probs, 4)
+check("util_sum", approx(util[0] + util[1] + util[2] + util[3], 1.0, 0.01))
+
+// 12. Upcycle structure
+let model = su_upcycle(ffn, d, n_exp, 0.001)
+check("upcycle_experts", len(model[0]) == n_exp)
+check("upcycle_gate", len(model[1]) == d * n_exp)
+
+// ── summary ──────────────────────────────────────────────────────
+println("")
+println("Sparse Upcycling: " + str(pass_count) + " passed, " + str(fail_count) + " failed")

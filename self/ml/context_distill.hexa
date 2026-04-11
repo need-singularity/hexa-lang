@@ -1,0 +1,403 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/context_distill.hexa — Context Distillation
+//
+//  Compresses long-context knowledge into short prompts:
+//    1. Teacher forward on long context -> extract key information
+//    2. Generate compressed student prompt
+//    3. Student forward on short prompt
+//    4. KD loss between teacher and student logits
+//    5. Train student to match teacher with shorter input
+//
+//  Reference: distillation.hexa for standard KD primitives
+//
+//  API:
+//    cd_teacher_forward(weights, long_ctx, d)          -> [float]
+//    cd_extract_key_positions(hidden, d, k)             -> [float]
+//    cd_compress_context(hidden, d, seq_len, target_len)-> [float]
+//    cd_student_forward(weights, short_ctx, d)          -> [float]
+//    cd_kd_loss(teacher_logits, student_logits, temp)   -> float
+//    cd_softmax(logits, temp)                           -> [float]
+//    cd_kl_divergence(p, q)                             -> float
+//    cd_context_distill_step(teacher_w, student_w,
+//        long_ctx, d, target_len, temp, alpha, lr)      -> [float]
+//    cd_attention_scores(hidden, d, seq_len)             -> [float]
+//    cd_importance_ranking(scores, seq_len)              -> [int]
+//
+//  AI-NATIVE attrs:
+//    @pure     — no side effects
+//    @hot      — called every training step
+// ═══════════════════════════════════════════════════════════════════
+
+// ── helpers ──────────────────────────────────────────────────────
+
+fn cd_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn cd_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn cd_log(x) {
+    if x <= 0.0 { return -30.0 }
+    let mut v = x
+    let mut count = 0
+    while v > 2.0 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    let d = v - 1.0
+    let ln_v = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_v
+}
+
+fn cd_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    for _i in 0..20 { g = (g + x / g) / 2.0 }
+    return g
+}
+
+fn cd_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn cd_hash(seed, i) {
+    let h = ((seed * 2654435761 + i * 1315423911 + 731) % 10007)
+    return to_float(h) / 10007.0 - 0.5
+}
+
+fn cd_min(a, b) {
+    if a < b { return a }
+    return b
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Softmax with temperature
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cd_softmax(logits, temp) {
+    let n = len(logits)
+    let mut scaled = cd_zeros(n)
+    for i in 0..n { scaled[i] = logits[i] / temp }
+    let mut mx = scaled[0]
+    for i in 1..n {
+        if scaled[i] > mx { mx = scaled[i] }
+    }
+    let mut exps = cd_zeros(n)
+    let mut z = 0.0
+    for i in 0..n {
+        exps[i] = cd_exp(scaled[i] - mx)
+        z = z + exps[i]
+    }
+    let mut out = cd_zeros(n)
+    for i in 0..n { out[i] = exps[i] / z }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  KL Divergence: KL(P || Q) = sum(P * log(P/Q))
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cd_kl_divergence(p, q) {
+    let n = len(p)
+    let mut kl = 0.0
+    for i in 0..n {
+        if p[i] > 1.0e-10 {
+            let ratio = p[i] / (q[i] + 1.0e-10)
+            kl = kl + p[i] * cd_log(ratio)
+        }
+    }
+    return kl
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Cross-entropy loss
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cd_cross_entropy(logits, target_idx) {
+    let probs = cd_softmax(logits, 1.0)
+    let p = probs[target_idx]
+    if p > 1.0e-10 { return 0.0 - cd_log(p) }
+    return 30.0
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Linear forward: input[seq x d] @ W[d x d_out] -> [seq x d_out]
+//  (mock transformer layer)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cd_linear_forward(input, W, seq_len, d_in, d_out) {
+    let mut out = cd_zeros(seq_len * d_out)
+    for i in 0..seq_len {
+        for j in 0..d_out {
+            let mut s = 0.0
+            for k in 0..d_in {
+                s = s + input[i * d_in + k] * W[k * d_out + j]
+            }
+            out[i * d_out + j] = s
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Teacher forward — processes long context
+//  weights: [W_attn (d x d), W_ff (d x d), W_lm (d x vocab)]
+//  long_ctx: [seq_len x d] flat
+//  Returns hidden states [seq_len x d]
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cd_teacher_forward(weights, long_ctx, d, seq_len) {
+    let W_attn = weights[0]
+    let W_ff = weights[1]
+    // Attention layer
+    let h1 = cd_linear_forward(long_ctx, W_attn, seq_len, d, d)
+    // Residual
+    let mut h = cd_zeros(seq_len * d)
+    for i in 0..(seq_len * d) { h[i] = long_ctx[i] + h1[i] }
+    // FFN layer
+    let h2 = cd_linear_forward(h, W_ff, seq_len, d, d)
+    // Residual
+    for i in 0..(seq_len * d) { h[i] = h[i] + h2[i] }
+    return h
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Teacher logits — from hidden to vocab distribution
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cd_teacher_logits(weights, long_ctx, d, seq_len, vocab) {
+    let h = cd_teacher_forward(weights, long_ctx, d, seq_len)
+    let W_lm = weights[2]
+    // Last position logits
+    let last_pos = seq_len - 1
+    let mut h_last = cd_zeros(d)
+    for i in 0..d { h_last[i] = h[last_pos * d + i] }
+    // h_last @ W_lm -> [vocab]
+    let mut logits = cd_zeros(vocab)
+    for v in 0..vocab {
+        let mut s = 0.0
+        for j in 0..d { s = s + h_last[j] * W_lm[j * vocab + v] }
+        logits[v] = s
+    }
+    return logits
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Attention-based importance scores for each position
+//  Higher score = more important position
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cd_attention_scores(hidden, d, seq_len) {
+    // Score each position by its L2 norm (proxy for information content)
+    let mut scores = cd_zeros(seq_len)
+    for i in 0..seq_len {
+        let mut norm = 0.0
+        for j in 0..d {
+            let v = hidden[i * d + j]
+            norm = norm + v * v
+        }
+        scores[i] = cd_sqrt(norm)
+    }
+    return scores
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Importance ranking — sort positions by importance (descending)
+//  Returns sorted indices
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cd_importance_ranking(scores, seq_len) {
+    let mut indices = []
+    for i in 0..seq_len { indices = indices + [i] }
+    // Selection sort (descending)
+    for i in 0..seq_len {
+        let mut best = i
+        for j in (i + 1)..seq_len {
+            if scores[indices[j]] > scores[indices[best]] { best = j }
+        }
+        if best != i {
+            let tmp = indices[i]
+            indices[i] = indices[best]
+            indices[best] = tmp
+        }
+    }
+    return indices
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Extract top-k most important positions from hidden states
+//  Returns [k x d] flat
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cd_extract_key_positions(hidden, d, seq_len, k) {
+    let scores = cd_attention_scores(hidden, d, seq_len)
+    let ranked = cd_importance_ranking(scores, seq_len)
+    // Take top-k and sort by original position (preserve order)
+    let mut selected = []
+    let take = cd_min(k, seq_len)
+    for i in 0..take { selected = selected + [ranked[i]] }
+    // Sort selected positions in original order
+    for i in 0..take {
+        for j in (i + 1)..take {
+            if selected[j] < selected[i] {
+                let tmp = selected[i]
+                selected[i] = selected[j]
+                selected[j] = tmp
+            }
+        }
+    }
+    // Extract hidden states at selected positions
+    let mut out = cd_zeros(take * d)
+    for i in 0..take {
+        let pos = selected[i]
+        for j in 0..d {
+            out[i * d + j] = hidden[pos * d + j]
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Compress context — take long hidden states, produce short ones
+//  Uses importance-based selection + optional averaging
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cd_compress_context(hidden, d, seq_len, target_len) {
+    if target_len >= seq_len {
+        // No compression needed
+        return hidden
+    }
+    return cd_extract_key_positions(hidden, d, seq_len, target_len)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Student forward — processes short compressed context
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cd_student_forward(weights, short_ctx, d, seq_len) {
+    return cd_teacher_forward(weights, short_ctx, d, seq_len)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Student logits
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cd_student_logits(weights, short_ctx, d, seq_len, vocab) {
+    return cd_teacher_logits(weights, short_ctx, d, seq_len, vocab)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  KD Loss — combined KL + CE
+//  loss = alpha * T^2 * KL(teacher || student) + (1-alpha) * CE
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn cd_kd_loss(teacher_logits, student_logits, temp, alpha) {
+    let teacher_soft = cd_softmax(teacher_logits, temp)
+    let student_soft = cd_softmax(student_logits, temp)
+    let kl = cd_kl_divergence(teacher_soft, student_soft)
+    let kl_loss = alpha * temp * temp * kl
+
+    // Hard target CE (teacher argmax)
+    let n = len(teacher_logits)
+    let mut target = 0
+    let mut mx = teacher_logits[0]
+    for i in 1..n {
+        if teacher_logits[i] > mx {
+            mx = teacher_logits[i]
+            target = i
+        }
+    }
+    let ce = cd_cross_entropy(student_logits, target)
+    let ce_loss = (1.0 - alpha) * ce
+
+    return kl_loss + ce_loss
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Compression ratio — how much shorter the student context is
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cd_compression_ratio(long_len, short_len) {
+    if short_len == 0 { return 0.0 }
+    return to_float(long_len) / to_float(short_len)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Context distillation training step
+//
+//  1. Teacher forward on long context
+//  2. Compress to short context
+//  3. Student forward on short context
+//  4. Compute KD loss
+//  5. Update student weights (numerical gradient)
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn cd_context_distill_step(teacher_w, student_w, long_ctx, d, seq_len, target_len, vocab, temp, alpha, lr) {
+    // Teacher logits (frozen)
+    let t_logits = cd_teacher_logits(teacher_w, long_ctx, d, seq_len, vocab)
+
+    // Compress context for student
+    let t_hidden = cd_teacher_forward(teacher_w, long_ctx, d, seq_len)
+    let short_ctx = cd_compress_context(t_hidden, d, seq_len, target_len)
+
+    // Student logits
+    let s_logits = cd_student_logits(student_w, short_ctx, d, target_len, vocab)
+
+    // KD loss
+    let loss = cd_kd_loss(t_logits, s_logits, temp, alpha)
+
+    // Numerical gradient on student W_attn
+    let eps = 1.0e-4
+    let W_attn = student_w[0]
+    let n = len(W_attn)
+    let stride = n / 32
+    let mut i = 0
+    while i < n {
+        let orig = W_attn[i]
+        W_attn[i] = orig + eps
+        let s_logits_p = cd_student_logits(student_w, short_ctx, d, target_len, vocab)
+        let loss_p = cd_kd_loss(t_logits, s_logits_p, temp, alpha)
+        let grad = (loss_p - loss) / eps
+        W_attn[i] = orig - lr * grad
+        i = i + stride
+    }
+
+    return [loss, t_logits, s_logits]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Mean pooling — average hidden states across positions
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cd_mean_pool(hidden, d, seq_len) {
+    let mut out = cd_zeros(d)
+    for i in 0..seq_len {
+        for j in 0..d {
+            out[j] = out[j] + hidden[i * d + j]
+        }
+    }
+    let s = to_float(seq_len)
+    for j in 0..d { out[j] = out[j] / s }
+    return out
+}
+
+println("[context_distill] loaded — long-context teacher -> short-context student + importance ranking + KD loss")
