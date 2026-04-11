@@ -91,7 +91,7 @@ NEXUS-6의 6개 **Consciousness/Omega 렌즈** 활용:
 | QualiaLens | 코드의 "질감" — 가독성/우아함 메트릭 |
 
 **작업:**
-1. `src/anima_bridge.rs` → 6개 의식 렌즈 결과 수신 확장
+1. `self/anima_bridge.hexa` → 6개 의식 렌즈 결과 수신 확장
 2. `consciousness {}` 블록 실행 시 자동 6렌즈 스캔
 3. Law 22 검증에 PhiDynamicsLens 통합
 
@@ -132,7 +132,7 @@ HEXA dream mode                 NEXUS-6 Ouroboros
 2. NEXUS-6 lens_forge에 HEXA-specific 렌즈 생성 요청
 3. 공진화: dream 결과 → NEXUS-6 학습 → 렌즈 개선 → dream 성능 향상
 
-**산출물:** `src/dream.rs` ↔ NEXUS-6 ouroboros 양방향 연동
+**산출물:** `self/dream.hexa` ↔ NEXUS-6 ouroboros 양방향 연동
 
 ---
 

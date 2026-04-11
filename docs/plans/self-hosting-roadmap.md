@@ -1,5 +1,9 @@
 # HEXA Self-Hosting Roadmap — Rust 완전 편입
 
+> ✅ **달성 완료 (2026-04-11)** — src/*.rs 147개 전체 self/*.hexa로 흡수, src/ 디렉토리 + Cargo.toml + Cargo.lock + .cargo/config.toml + cranelift + wasm-bindgen 의존 0건. 프로젝트 전체 .rs=0 .py=0. 빌드 파이프라인은 build_hexa.hexa(self-host) → C → clang.
+>
+> 아래 본문은 역사적 기록 (2026-04-07~04-11 진행 과정).
+>
 > 목표: Rust 컴파일러(src/*.rs 99K LOC) → Hexa 자기 호스팅 컴파일러로 완전 전환
 > 시작: 2026-04-07
 > 기존 부트스트랩: self/ (7파일, 7,872 LOC, 16 테스트 통과)

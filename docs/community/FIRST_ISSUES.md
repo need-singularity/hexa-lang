@@ -10,7 +10,7 @@ Each issue is self-contained, well-scoped, and teaches you a different part of t
 
 **Paradigm**: Imperative
 **Difficulty**: Easy
-**File**: `src/interpreter.rs`
+**File**: `self/interpreter.hexa`
 **n=6 connection**: Control flow group has 6 keywords (n=6). `break` and `continue` are common loop control additions.
 
 **What to do:**
@@ -39,7 +39,7 @@ for i in 1..10 {
 
 **Paradigm**: Functional
 **Difficulty**: Easy
-**File**: `src/interpreter.rs` (array method dispatch)
+**File**: `self/interpreter.hexa` (array method dispatch)
 **n=6 connection**: Array methods are part of the functional paradigm toolkit.
 
 **What to do:**
@@ -67,7 +67,7 @@ assert len(zipped) == 3
 
 **Paradigm**: Object-oriented
 **Difficulty**: Medium
-**File**: `src/interpreter.rs` (enum handling)
+**File**: `self/interpreter.hexa` (enum handling)
 **n=6 connection**: Display is one of the derive macros, tied to the type system (tau(6) = 4 layers).
 
 **What to do:**
@@ -93,7 +93,7 @@ println(c.to_string())   // "Red"
 
 **Paradigm**: Concurrent
 **Difficulty**: Medium
-**File**: `src/interpreter.rs` (channel implementation)
+**File**: `self/interpreter.hexa` (channel implementation)
 **n=6 connection**: Concurrency group has 4 keywords (tau(6) = 4). Buffered channels are a natural extension.
 
 **What to do:**
@@ -130,7 +130,7 @@ for i in 1..=6 {
 
 **Paradigm**: Logic/Proof
 **Difficulty**: Medium
-**File**: `src/proof_engine.rs`, `src/interpreter.rs`
+**File**: `self/proof_engine.hexa`, `self/interpreter.hexa`
 **n=6 connection**: Proof group has 4 keywords (tau(6) = 4): proof, assert, invariant, theorem. `invariant` is recognized but not yet fully implemented.
 
 **What to do:**
@@ -162,7 +162,7 @@ println(balance)         // 50
 
 **Paradigm**: AI-native
 **Difficulty**: Easy
-**File**: `src/llm.rs`
+**File**: `self/llm.hexa`
 **n=6 connection**: AI group has 4 keywords (tau(6) = 4). Better error messages improve the LLM fallback experience.
 
 **What to do:**
@@ -170,9 +170,9 @@ println(balance)         // 50
 - Include: what was attempted, why it failed, and what the user can do
 
 **Steps:**
-1. Read `src/llm.rs` to understand the LLM integration
+1. Read `self/llm.hexa` to understand the LLM integration
 2. Identify error paths (no API key, network timeout, invalid response)
-3. Add structured error messages using the same format as `src/error.rs`
+3. Add structured error messages using the same format as `self/error.hexa`
 4. Include "did you mean?" suggestions when appropriate
 
 **Test your work:**
