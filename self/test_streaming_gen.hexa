@@ -1,0 +1,274 @@
+// ===================================================================
+//  test_streaming_gen.hexa — Streaming Generation (#70) test suite
+//
+//  Verifies self/ml/streaming_gen.hexa:
+//    1. create_channel invariants (capacity, watermarks)
+//    2. push/pop FIFO ordering
+//    3. high watermark backpressure (push rejected w/ blocked flag)
+//    4. low watermark unblock on drain
+//    5. try_push drops when capacity full
+//    6. cancel aborts both push and pop paths
+//    7. close prevents further pushes but allows pops
+//    8. subscriber fan-out notify count
+//    9. stats counters (produced/consumed/dropped/block_events)
+//   10. partial decoder feed emits correct delta + accumulates emitted
+//   11. decoder EOS marker
+//   12. stream_generate happy path w/ subscribers
+//   13. stream_generate backpressure + drain loop
+//   14. stream_generate cancel short-circuit
+//
+//  Run: ./hexa self/test_streaming_gen.hexa
+//  Expected: all [PASS], exit non-zero on any [FAIL].
+// ===================================================================
+
+import "ml/streaming_gen.hexa"
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+println("===================================================================")
+println("  Streaming Generation (#70) Test Suite")
+println("===================================================================")
+
+// ===================================================================
+//  T1: create_channel basic invariants
+// ===================================================================
+let ch0 = create_channel(10, 8, 3)
+check("T1 capacity=10",      ch0.capacity == 10)
+check("T1 high_watermark=8", ch0.high_watermark == 8)
+check("T1 low_watermark=3",  ch0.low_watermark == 3)
+check("T1 initial empty",    channel_len(ch0) == 0)
+check("T1 not cancelled",    channel_is_cancelled(ch0) == false)
+
+// ===================================================================
+//  T2: push / pop FIFO ordering
+// ===================================================================
+let r1 = channel_push(ch0, 10)
+let ch1 = r1[1]
+let r2 = channel_push(ch1, 20)
+let ch2 = r2[1]
+let r3 = channel_push(ch2, 30)
+let ch3 = r3[1]
+check("T2 push1 ok",    r1[0] == true)
+check("T2 push2 ok",    r2[0] == true)
+check("T2 push3 ok",    r3[0] == true)
+check("T2 len after 3 pushes", channel_len(ch3) == 3)
+
+let p1 = channel_pop(ch3)
+check("T2 pop1 ok",       p1[0] == true)
+check("T2 pop1 FIFO=10",  p1[1] == 10)
+let p2 = channel_pop(p1[2])
+check("T2 pop2 FIFO=20",  p2[1] == 20)
+let p3 = channel_pop(p2[2])
+check("T2 pop3 FIFO=30",  p3[1] == 30)
+let p_empty = channel_pop(p3[2])
+check("T2 pop empty = !ok", p_empty[0] == false)
+
+// ===================================================================
+//  T3: high watermark backpressure
+// ===================================================================
+// capacity=5, high=3, low=1 — push 3 fills, 4th blocks
+let chA = create_channel(5, 3, 1)
+let a1 = channel_push(chA, 1)
+let a2 = channel_push(a1[1], 2)
+let a3 = channel_push(a2[1], 3)
+check("T3 push up to high ok",  a3[0] == true)
+check("T3 len=3 at high",       channel_len(a3[1]) == 3)
+check("T3 is_full at high",     channel_is_full(a3[1]) == true)
+
+let a4 = channel_push(a3[1], 4)
+check("T3 4th push rejected",      a4[0] == false)
+check("T3 blocked flag set",       channel_is_blocked(a4[1]) == true)
+check("T3 block_events incremented", a4[1].block_events == 1)
+check("T3 len unchanged on block",   channel_len(a4[1]) == 3)
+
+// ===================================================================
+//  T4: low watermark unblock on drain
+// ===================================================================
+// After draining from 3 down to 1 (low), blocked flag should clear.
+let d1 = channel_pop(a4[1])
+let d2 = channel_pop(d1[2])
+check("T4 after 2 pops len=1 (low)",   channel_len(d2[2]) == 1)
+check("T4 is_drained at low",          channel_is_drained(d2[2]) == true)
+check("T4 blocked cleared after drain", channel_is_blocked(d2[2]) == false)
+
+// ===================================================================
+//  T5: try_push drops on capacity overflow
+// ===================================================================
+// capacity=2, high=2, low=1
+let chB = create_channel(2, 2, 1)
+let t1 = channel_try_push(chB, 100)
+let t2 = channel_try_push(t1[1], 200)
+let t3 = channel_try_push(t2[1], 300)
+check("T5 try_push1 ok", t1[0] == true)
+check("T5 try_push2 ok", t2[0] == true)
+check("T5 try_push3 dropped", t3[0] == false)
+check("T5 dropped counter = 1", t3[1].dropped == 1)
+
+// ===================================================================
+//  T6: cancel aborts push
+// ===================================================================
+let chC = create_channel(10, 8, 3)
+let cc = channel_cancel(chC)
+check("T6 cancelled flag set", channel_is_cancelled(cc) == true)
+let cp = channel_push(cc, 42)
+check("T6 push on cancelled = false", cp[0] == false)
+let ct = channel_try_push(cc, 42)
+check("T6 try_push on cancelled = false", ct[0] == false)
+
+// ===================================================================
+//  T7: close prevents push but not pop
+// ===================================================================
+let chD = create_channel(10, 8, 3)
+let d_push = channel_push(chD, 7)
+let d_closed = channel_close(d_push[1])
+check("T7 closed flag", channel_is_closed(d_closed) == true)
+let d_after_close = channel_push(d_closed, 8)
+check("T7 push after close = false", d_after_close[0] == false)
+let d_pop = channel_pop(d_closed)
+check("T7 pop after close still ok", d_pop[0] == true)
+check("T7 pop value = 7",             d_pop[1] == 7)
+
+// ===================================================================
+//  T8: subscriber fan-out
+//
+//  NOTE: Hexa closures capture by value → cannot mutate outer state.
+//  We inspect the returned channel's last_delta / notify_count fields.
+// ===================================================================
+let cbA = |s| { return s }
+let cbB = |s| { return s + "!" }
+let chE = create_channel(10, 8, 3)
+let chE1 = channel_subscribe(chE, cbA)
+let chE2 = channel_subscribe(chE1, cbB)
+check("T8 subscribe count=2",  len(chE2.subscribers) == 2)
+let nres1 = channel_notify(chE2, "hello")
+check("T8 fan-out count = 2",  nres1[0] == 2)
+check("T8 last_delta=hello",   nres1[1].last_delta == "hello")
+check("T8 notify_count=1",     nres1[1].notify_count == 1)
+let nres2 = channel_notify(nres1[1], "world")
+check("T8 second fan-out = 2", nres2[0] == 2)
+check("T8 last_delta=world",   nres2[1].last_delta == "world")
+check("T8 notify_count=2",     nres2[1].notify_count == 2)
+
+// ===================================================================
+//  T9: stats counters
+// ===================================================================
+let chF = create_channel(5, 3, 1)
+let f1 = channel_push(chF, 1)
+let f2 = channel_push(f1[1], 2)
+let f3 = channel_push(f2[1], 3)
+let f4 = channel_push(f3[1], 4)   // blocked (len=3 == high)
+let fp = channel_pop(f3[1])        // consume 1
+let stats = channel_stats(fp[2])
+check("T9 produced = 3",  stats[0] == 3)
+check("T9 consumed = 1",  stats[1] == 1)
+check("T9 dropped  = 0",  stats[2] == 0)
+// block_events on fp[2] is 0 because we used f3[1] for the pop path.
+// Verify block_events on the rejected branch f4[1].
+check("T9 block_events=1 on rejected branch", f4[1].block_events == 1)
+
+// ===================================================================
+//  T10: partial decoder feed deltas
+// ===================================================================
+let dec0 = create_decoder()
+// 'H' = 72 → token_id = 75
+// 'i' = 105 → token_id = 108
+let fd_h = decoder_feed(dec0, 75)
+let dec1 = fd_h[1]
+check("T10 feed 'H' delta", fd_h[0] == "H")
+check("T10 emitted='H'",    dec1.emitted == "H")
+
+let fd_i = decoder_feed(dec1, 108)
+let dec2 = fd_i[1]
+check("T10 feed 'i' delta", fd_i[0] == "i")
+check("T10 emitted='Hi'",   dec2.emitted == "Hi")
+check("T10 token_count=2",  dec2.token_count == 2)
+
+// ===================================================================
+//  T11: decoder EOS marker
+// ===================================================================
+let fd_eos = decoder_feed(dec2, 2)
+let dec_eos = fd_eos[1]
+check("T11 EOS delta empty", fd_eos[0] == "")
+check("T11 eos_seen=true",   dec_eos.eos_seen == true)
+check("T11 emitted stable",  dec_eos.emitted == "Hi")
+
+// ===================================================================
+//  T12: stream_generate happy path
+//
+//  Token list: 'A'=65→68, 'B'=66→69, 'C'=67→70, then EOS=2
+//  Expected: admitted=3, eos=true, decoder emitted="ABC".
+// ===================================================================
+let src_list = [68, 69, 70, 2]
+let cb_pt = |s| { return s }
+let ch_g = create_channel(10, 8, 3)
+let ch_g1 = channel_subscribe(ch_g, cb_pt)
+let dec_g = create_decoder()
+
+let out = stream_generate(ch_g1, dec_g, src_list, 16)
+let summary = out[2]
+let ch_g_final = out[0]
+let dec_g_final = out[1]
+check("T12 admitted=3",         summary[0] == 3)
+check("T12 blocked=0",          summary[1] == 0)
+check("T12 cancelled=false",    summary[2] == false)
+check("T12 eos=true",           summary[3] == true)
+check("T12 decoder emitted=ABC", dec_g_final.emitted == "ABC")
+check("T12 last_delta=C",       ch_g_final.last_delta == "C")
+check("T12 history len=3",      len(ch_g_final.history) == 3)
+check("T12 channel closed",     channel_is_closed(ch_g_final) == true)
+
+// ===================================================================
+//  T13: stream_generate backpressure + drain loop
+//
+//  Small channel (capacity=3, high=2, low=1) forces backpressure.
+//  Built-in drain pops one element on each block.
+// ===================================================================
+let src_list2 = [68, 69, 70, 71, 72, 2]   // 'A'..'E' + EOS
+let ch_bp = create_channel(3, 2, 1)
+let ch_bp1 = channel_subscribe(ch_bp, cb_pt)
+let dec_bp = create_decoder()
+
+let out2 = stream_generate(ch_bp1, dec_bp, src_list2, 32)
+let sum2 = out2[2]
+let dec_bp_final = out2[1]
+check("T13 all 5 admitted",         sum2[0] == 5)
+check("T13 at least one blocked",   sum2[1] >= 1)
+check("T13 eos reached",            sum2[3] == true)
+check("T13 decoder emitted=ABCDE",  dec_bp_final.emitted == "ABCDE")
+
+// ===================================================================
+//  T14: stream_generate cancel short-circuit
+//
+//  token_ids contains -1 at index 1 → channel cancelled mid-stream.
+// ===================================================================
+let c_list = [68, -1, 70, 2]
+let ch_c = create_channel(10, 8, 3)
+let dec_c = create_decoder()
+let out3 = stream_generate(ch_c, dec_c, c_list, 16)
+let sum3 = out3[2]
+let ch_c_final = out3[0]
+check("T14 admitted=1 before cancel", sum3[0] == 1)
+check("T14 cancelled=true",           sum3[2] == true)
+check("T14 channel cancelled flag",   channel_is_cancelled(ch_c_final) == true)
+
+// ===================================================================
+//  Summary
+// ===================================================================
+println("===================================================================")
+println("  Results: " + str(pass_count) + " passed / " + str(fail_count) + " failed")
+println("===================================================================")
+
+if fail_count > 0 {
+    exit(1)
+}

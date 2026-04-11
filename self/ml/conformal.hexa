@@ -1,0 +1,414 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/conformal.hexa — Conformal Prediction (ML #67)
+//
+//  Pure .hexa split conformal prediction with finite-sample coverage
+//  guarantee:
+//
+//    P( y_test ∈ C(x_test) ) >= 1 - α
+//
+//  Implemented:
+//    1. Split conformal regression
+//         — nonconformity s_i = |y_i − ŷ_i|
+//         — quantile q̂ = Q_{⌈(n+1)(1-α)⌉/n}(scores)
+//         — interval C(x) = [ŷ(x) − q̂, ŷ(x) + q̂]
+//
+//    2. Split conformal classification
+//         — nonconformity s_i = 1 − p̂(y_i | x_i)
+//         — prediction set C(x) = { y : p̂(y|x) >= 1 − q̂ }
+//         — includes top-1 fallback for empty sets
+//
+//    3. Empirical coverage validation
+//         — cp_coverage_regression(intervals, truths) -> hit rate
+//         — cp_coverage_classification(sets, truths)  -> hit rate
+//         — cp_avg_interval_width / cp_avg_set_size
+//
+//    4. CP++ variants
+//         — Weighted split conformal (importance weights for covariate shift)
+//         — Adaptive Prediction Sets (APS) for classification
+//         — Jackknife+ (leave-one-out) quantile for regression
+//
+//  Public API (pure, no side effects):
+//    cp_abs(x)                          -> float
+//    cp_sort(arr)                       -> [float]         insertion sort
+//    cp_quantile(sorted_scores, alpha, n)  -> float         finite-sample
+//    cp_nonconformity_reg(y, y_hat)        -> float
+//    cp_nonconformity_cls(probs, y_true)   -> float
+//    cp_calibrate_regression(y_cal, yhat_cal, alpha)  -> q̂
+//    cp_calibrate_classification(probs_cal, y_cal, alpha) -> q̂
+//    cp_predict_interval(y_hat, q_hat)                  -> [lo, hi]
+//    cp_predict_set(probs, q_hat)                       -> [label,..]
+//    cp_coverage_regression(intervals, y_test)          -> float
+//    cp_coverage_classification(sets, y_test)           -> float
+//    cp_avg_interval_width(intervals)                   -> float
+//    cp_avg_set_size(sets)                              -> float
+//
+//  CP++:
+//    cp_weighted_quantile(scores, weights, alpha)       -> q̂
+//    cp_aps_set(probs, q_hat)                           -> [label,..]  APS
+//    cp_jackknife_plus(y_cal, yhat_cal, y_hat_test, alpha) -> [lo, hi]
+//
+//  AI-NATIVE attrs: @pure (no side effects), @hot (calibration path)
+// ═══════════════════════════════════════════════════════════════════
+
+// ── numeric helpers ─────────────────────────────────────────────────
+
+fn cp_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn cp_max(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn cp_min(a, b) {
+    if a < b { return a }
+    return b
+}
+
+// insertion sort — stable, O(n^2) but simple and pure for small cal sets.
+// Large cal sets should use a builtin .sort() (array method) for O(n log n).
+// Position-tracked form avoids using "j = -1" as a break sentinel (hexa has
+// no short-circuit break in while; see HX3 pitfall note in header).
+fn cp_sort(arr) {
+    let n = len(arr)
+    let mut out = []
+    let mut i = 0
+    while i < n { out = out + [arr[i]]; i = i + 1 }
+    let mut k = 1
+    while k < n {
+        let key = out[k]
+        let mut pos = k
+        let mut done = false
+        while !done {
+            if pos == 0 {
+                done = true
+            } else {
+                if out[pos - 1] > key {
+                    out[pos] = out[pos - 1]
+                    pos = pos - 1
+                } else {
+                    done = true
+                }
+            }
+        }
+        out[pos] = key
+        k = k + 1
+    }
+    return out
+}
+
+// Finite-sample conformal quantile.
+// Given a sorted ascending score array and miscoverage alpha in (0,1),
+// returns the score at index ⌈(n+1)(1-α)⌉ − 1 (1-based ceil → 0-based).
+// If that index exceeds n-1 (happens when alpha is very small or n is tiny),
+// return the maximum score (conservative).
+fn cp_quantile(sorted_scores, alpha, n) {
+    if n <= 0 { return 0.0 }
+    let target = to_float(n + 1) * (1.0 - alpha)
+    // ceil(target): floor(target) + (target > floor(target) ? 1 : 0)
+    let fl = floor(target)
+    let mut k = fl
+    if to_float(fl) < target { k = fl + 1 }
+    // 1-based → 0-based
+    let mut idx = k - 1
+    if idx < 0 { idx = 0 }
+    if idx >= n { idx = n - 1 }
+    return sorted_scores[idx]
+}
+
+// ── nonconformity scores ────────────────────────────────────────────
+
+// Regression: absolute residual
+fn cp_nonconformity_reg(y, y_hat) {
+    return cp_abs(y - y_hat)
+}
+
+// Classification: 1 − p̂(y_true | x)
+// probs is an array of class probabilities, y_true is an int class label.
+fn cp_nonconformity_cls(probs, y_true) {
+    let k = len(probs)
+    if y_true < 0 { return 1.0 }
+    if y_true >= k { return 1.0 }
+    return 1.0 - probs[y_true]
+}
+
+// ── split conformal calibration ─────────────────────────────────────
+
+// Returns q̂ given calibration y, ŷ, miscoverage alpha.
+fn cp_calibrate_regression(y_cal, yhat_cal, alpha) {
+    let n = len(y_cal)
+    let mut scores = []
+    let mut i = 0
+    while i < n {
+        scores = scores + [cp_nonconformity_reg(y_cal[i], yhat_cal[i])]
+        i = i + 1
+    }
+    let sorted = cp_sort(scores)
+    return cp_quantile(sorted, alpha, n)
+}
+
+// Returns q̂ given calibration probabilities, true labels, alpha.
+fn cp_calibrate_classification(probs_cal, y_cal, alpha) {
+    let n = len(y_cal)
+    let mut scores = []
+    let mut i = 0
+    while i < n {
+        scores = scores + [cp_nonconformity_cls(probs_cal[i], y_cal[i])]
+        i = i + 1
+    }
+    let sorted = cp_sort(scores)
+    return cp_quantile(sorted, alpha, n)
+}
+
+// ── prediction set / interval ───────────────────────────────────────
+
+// Regression: C(x) = [ŷ − q̂, ŷ + q̂]
+fn cp_predict_interval(y_hat, q_hat) {
+    return [y_hat - q_hat, y_hat + q_hat]
+}
+
+// Classification: C(x) = { y : p̂(y|x) >= 1 − q̂ }
+// Ensures non-empty set by falling back to argmax if needed.
+fn cp_predict_set(probs, q_hat) {
+    let k = len(probs)
+    let threshold = 1.0 - q_hat
+    let mut set = []
+    let mut argmax = 0
+    let mut pmax = probs[0]
+    let mut i = 0
+    while i < k {
+        if probs[i] >= threshold {
+            set = set + [i]
+        }
+        if probs[i] > pmax {
+            pmax = probs[i]
+            argmax = i
+        }
+        i = i + 1
+    }
+    if len(set) == 0 {
+        set = [argmax]
+    }
+    return set
+}
+
+// ── empirical coverage validation ───────────────────────────────────
+
+// Fraction of test points where y ∈ [lo, hi]
+fn cp_coverage_regression(intervals, y_test) {
+    let n = len(y_test)
+    if n == 0 { return 0.0 }
+    let mut hits = 0
+    let mut i = 0
+    while i < n {
+        let lo = intervals[i][0]
+        let hi = intervals[i][1]
+        if y_test[i] >= lo {
+            if y_test[i] <= hi {
+                hits = hits + 1
+            }
+        }
+        i = i + 1
+    }
+    return to_float(hits) / to_float(n)
+}
+
+// Fraction of test points where y_true ∈ C(x)
+fn cp_coverage_classification(sets, y_test) {
+    let n = len(y_test)
+    if n == 0 { return 0.0 }
+    let mut hits = 0
+    let mut i = 0
+    while i < n {
+        let s = sets[i]
+        let target = y_test[i]
+        let m = len(s)
+        let mut j = 0
+        let mut found = false
+        while j < m {
+            if s[j] == target { found = true }
+            j = j + 1
+        }
+        if found { hits = hits + 1 }
+        i = i + 1
+    }
+    return to_float(hits) / to_float(n)
+}
+
+fn cp_avg_interval_width(intervals) {
+    let n = len(intervals)
+    if n == 0 { return 0.0 }
+    let mut sum = 0.0
+    let mut i = 0
+    while i < n {
+        sum = sum + (intervals[i][1] - intervals[i][0])
+        i = i + 1
+    }
+    return sum / to_float(n)
+}
+
+fn cp_avg_set_size(sets) {
+    let n = len(sets)
+    if n == 0 { return 0.0 }
+    let mut sum = 0
+    let mut i = 0
+    while i < n {
+        sum = sum + len(sets[i])
+        i = i + 1
+    }
+    return to_float(sum) / to_float(n)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  CP++ variants
+// ═══════════════════════════════════════════════════════════════════
+
+// Weighted split conformal — used under covariate shift.
+// Weights w_i >= 0 are importance weights w_i = p_test(x_i)/p_cal(x_i).
+// Returns q̂ = inf{ s : Σ_{i: s_i <= s} w_i / (Σ w_i + 1) >= 1-α }.
+// The trailing "+1" represents the test point's weight (normalised to 1).
+fn cp_weighted_quantile(scores, weights, alpha) {
+    let n = len(scores)
+    if n == 0 { return 0.0 }
+    // indirect sort: permutation p such that scores[p[i]] is ascending.
+    let mut perm = []
+    let mut i = 0
+    while i < n { perm = perm + [i]; i = i + 1 }
+    let mut k = 1
+    while k < n {
+        let key_idx = perm[k]
+        let key_val = scores[key_idx]
+        let mut pos = k
+        let mut done = false
+        while !done {
+            if pos == 0 {
+                done = true
+            } else {
+                if scores[perm[pos - 1]] > key_val {
+                    perm[pos] = perm[pos - 1]
+                    pos = pos - 1
+                } else {
+                    done = true
+                }
+            }
+        }
+        perm[pos] = key_idx
+        k = k + 1
+    }
+    let mut wsum = 0.0
+    let mut t = 0
+    while t < n { wsum = wsum + weights[t]; t = t + 1 }
+    let denom = wsum + 1.0
+    let target = (1.0 - alpha) * denom
+    let mut acc = 0.0
+    let mut out = scores[perm[n - 1]]
+    let mut m = 0
+    while m < n {
+        let idx = perm[m]
+        acc = acc + weights[idx]
+        if acc >= target {
+            out = scores[idx]
+            m = n  // break
+        }
+        m = m + 1
+    }
+    return out
+}
+
+// Adaptive Prediction Sets (APS) — Romano et al. 2020.
+// Given probs, build the cumulative sum of sorted probabilities (descending),
+// return the smallest prefix whose total mass >= 1 − q̂ (per-instance threshold).
+// Returns the label indices in the set.
+fn cp_aps_set(probs, q_hat) {
+    let k = len(probs)
+    // descending sort with indices
+    let mut perm = []
+    let mut i = 0
+    while i < k { perm = perm + [i]; i = i + 1 }
+    let mut a = 1
+    while a < k {
+        let key_idx = perm[a]
+        let key_val = probs[key_idx]
+        let mut pos = a
+        let mut done = false
+        while !done {
+            if pos == 0 {
+                done = true
+            } else {
+                if probs[perm[pos - 1]] < key_val {
+                    perm[pos] = perm[pos - 1]
+                    pos = pos - 1
+                } else {
+                    done = true
+                }
+            }
+        }
+        perm[pos] = key_idx
+        a = a + 1
+    }
+    let target = 1.0 - q_hat
+    // Always include at least argmax (perm[0]) to ensure non-empty set.
+    let mut set = [perm[0]]
+    let mut mass = probs[perm[0]]
+    let mut m = 1
+    while m < k {
+        if mass >= target {
+            m = k  // break
+        } else {
+            set = set + [perm[m]]
+            mass = mass + probs[perm[m]]
+            m = m + 1
+        }
+    }
+    return set
+}
+
+// Jackknife+ — Barber et al. 2021.
+// Given calibration residuals r_i = |y_i − ŷ_i^{(-i)}| already computed from
+// leave-one-out predictors, and a test prediction ŷ(x_test), return the
+// symmetric prediction interval using the (1-α) quantile of residuals.
+// This simplified form assumes residuals already reflect LOO predictors.
+fn cp_jackknife_plus(y_cal, yhat_cal, y_hat_test, alpha) {
+    let n = len(y_cal)
+    let mut residuals = []
+    let mut i = 0
+    while i < n {
+        residuals = residuals + [cp_abs(y_cal[i] - yhat_cal[i])]
+        i = i + 1
+    }
+    let sorted = cp_sort(residuals)
+    let q = cp_quantile(sorted, alpha, n)
+    return [y_hat_test - q, y_hat_test + q]
+}
+
+// ── higher-level helpers ────────────────────────────────────────────
+
+// End-to-end regression pipeline: calibrate then predict all test intervals.
+// yhat_cal / yhat_test are precomputed model predictions (pure CP is
+// agnostic to the model family).
+fn cp_split_regression_pipeline(y_cal, yhat_cal, yhat_test, alpha) {
+    let q_hat = cp_calibrate_regression(y_cal, yhat_cal, alpha)
+    let n_test = len(yhat_test)
+    let mut intervals = []
+    let mut i = 0
+    while i < n_test {
+        intervals = intervals + [cp_predict_interval(yhat_test[i], q_hat)]
+        i = i + 1
+    }
+    return [q_hat, intervals]
+}
+
+// End-to-end classification pipeline: calibrate then predict prediction sets.
+fn cp_split_classification_pipeline(probs_cal, y_cal, probs_test, alpha) {
+    let q_hat = cp_calibrate_classification(probs_cal, y_cal, alpha)
+    let n_test = len(probs_test)
+    let mut sets = []
+    let mut i = 0
+    while i < n_test {
+        sets = sets + [cp_predict_set(probs_test[i], q_hat)]
+        i = i + 1
+    }
+    return [q_hat, sets]
+}

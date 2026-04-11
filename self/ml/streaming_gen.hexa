@@ -1,0 +1,591 @@
+// ===================================================================
+//  self/ml/streaming_gen.hexa — Streaming Token Generation (#70)
+//
+//  Backpressure-aware token stream channel for interactive LLM UX.
+//  Pure Hexa, self-contained. Complements self/ml/streaming.hexa (SSE).
+//
+//  Core primitives:
+//    StreamChannel        — FIFO buffer + watermarks + flags + stats
+//    create_channel       — build channel with capacity + watermarks
+//    channel_push         — blocking producer side (respects backpressure)
+//    channel_try_push     — non-blocking producer side (drops when full)
+//    channel_pop          — consumer side (returns [ok, tok, ch])
+//    channel_peek         — non-destructive read of oldest element
+//    channel_len          — current buffered token count
+//    channel_is_full      — buffered >= high watermark
+//    channel_is_blocked   — producer currently blocked on full buffer
+//    channel_is_drained   — buffered <= low watermark (unblock signal)
+//    channel_cancel       — set abort flag (both sides must honor)
+//    channel_is_cancelled — check abort flag
+//    channel_subscribe    — register subscriber callback (pull model)
+//    channel_notify       — fan-out notify subscribers with latest token
+//    channel_stats        — produced / consumed / dropped / blocks
+//
+//  Partial decode (incremental detokenize):
+//    create_decoder       — decoder state w/ pending bytes + output
+//    decoder_feed         — push token id; emit string delta
+//    decoder_flush        — drain any remaining partial bytes
+//
+//  High-level driver:
+//    stream_generate      — producer loop; writes to channel with
+//                           backpressure; respects cancel; notifies
+//                           subscribers after each admitted token
+//
+//  Design notes:
+//    - Immutable-style: every mutation returns a new StreamChannel
+//      value (matching semantic_cache.hexa / continuous_batching.hexa).
+//    - Single-threaded cooperative model: "blocking" means the
+//      producer aborts this push and the caller retries later once
+//      buffer has drained below the low watermark.
+//    - Subscribers are closures (|tok_str| { ... }) stored in an
+//      array; notify iterates and calls each.
+//    - partial decode accumulates bytes in a string until a full
+//      printable character arrives (byte-level detokenizer compatible
+//      with streaming.hexa's token_to_str).
+// ===================================================================
+
+// ===================================================================
+//  StreamChannel struct
+//
+//  NOTE on mutability: Hexa closures capture by value and arrays/maps
+//  are not shared across lambdas. We therefore expose all mutation
+//  through explicit [new_channel, ...] return tuples, matching
+//  self/ml/semantic_cache.hexa and self/ml/continuous_batching.hexa.
+//  Subscriber callbacks are stored as an array; channel_notify returns
+//  (count, list_of_deltas) AND the channel records last_delta /
+//  notify_count fields so tests can assert on the channel state.
+// ===================================================================
+struct StreamChannel {
+    buffer: array,          // FIFO of token ids (ints)
+    capacity: int,          // absolute upper bound
+    high_watermark: int,    // producer blocks when len >= high
+    low_watermark: int,     // producer resumes when len <= low
+    blocked: bool,          // producer flagged blocked?
+    cancelled: bool,        // abort flag
+    closed: bool,           // producer finished (EOS/max reached)
+    subscribers: array,     // array of callback closures
+    produced: int,          // total successful pushes
+    consumed: int,          // total pops
+    dropped: int,           // try_push rejections
+    block_events: int,      // number of times producer was blocked
+    last_delta: string,     // most recent decoded string delta (for tests)
+    notify_count: int,      // total channel_notify invocations
+    history: array          // admitted token ids (append-only, for tests)
+}
+
+// ===================================================================
+//  create_channel — build a channel with given capacity/watermarks
+//
+//  Watermark invariants:
+//    0 < low < high <= capacity
+//  Sensible default: high = 0.8*cap, low = 0.3*cap (min 1 each).
+// ===================================================================
+fn create_channel(capacity, high_watermark, low_watermark) {
+    let mut hi = high_watermark
+    let mut lo = low_watermark
+    if hi <= 0 { hi = 1 }
+    if hi > capacity { hi = capacity }
+    if lo <= 0 { lo = 1 }
+    if lo >= hi { lo = hi - 1 }
+    if lo < 0 { lo = 0 }
+    return StreamChannel {
+        buffer: [],
+        capacity: capacity,
+        high_watermark: hi,
+        low_watermark: lo,
+        blocked: false,
+        cancelled: false,
+        closed: false,
+        subscribers: [],
+        produced: 0,
+        consumed: 0,
+        dropped: 0,
+        block_events: 0,
+        last_delta: "",
+        notify_count: 0,
+        history: []
+    }
+}
+
+fn default_channel(capacity) {
+    let mut hi = (capacity * 8) / 10
+    let mut lo = (capacity * 3) / 10
+    if hi < 1 { hi = 1 }
+    if lo < 1 { lo = 1 }
+    if lo >= hi { lo = hi - 1 }
+    if lo < 1 { lo = 1 }
+    return create_channel(capacity, hi, lo)
+}
+
+// ===================================================================
+//  channel_len / introspection
+// ===================================================================
+fn channel_len(ch) {
+    return len(ch.buffer)
+}
+
+fn channel_is_full(ch) {
+    return len(ch.buffer) >= ch.high_watermark
+}
+
+fn channel_is_drained(ch) {
+    return len(ch.buffer) <= ch.low_watermark
+}
+
+fn channel_is_blocked(ch) {
+    return ch.blocked
+}
+
+fn channel_is_cancelled(ch) {
+    return ch.cancelled
+}
+
+fn channel_is_closed(ch) {
+    return ch.closed
+}
+
+// ===================================================================
+//  channel_push — blocking producer push
+//
+//  Returns [ok, new_channel].
+//  ok=false means either cancelled or buffer at high watermark.
+//  When ok=false due to backpressure, new_channel.blocked is set and
+//  block_events is incremented — caller should back off and retry.
+// ===================================================================
+fn channel_push(ch, tok) {
+    if ch.cancelled {
+        return [false, ch]
+    }
+    if ch.closed {
+        return [false, ch]
+    }
+    let cur = len(ch.buffer)
+    if cur >= ch.high_watermark {
+        // Backpressure: flag blocked, do NOT enqueue.
+        let blocked_ch = StreamChannel {
+            buffer: ch.buffer,
+            capacity: ch.capacity,
+            high_watermark: ch.high_watermark,
+            low_watermark: ch.low_watermark,
+            blocked: true,
+            cancelled: ch.cancelled,
+            closed: ch.closed,
+            subscribers: ch.subscribers,
+            produced: ch.produced,
+            consumed: ch.consumed,
+            dropped: ch.dropped,
+            block_events: ch.block_events + 1,
+            last_delta: ch.last_delta,
+            notify_count: ch.notify_count,
+            history: ch.history
+        }
+        return [false, blocked_ch]
+    }
+    let new_buf = ch.buffer + [tok]
+    let new_ch = StreamChannel {
+        buffer: new_buf,
+        capacity: ch.capacity,
+        high_watermark: ch.high_watermark,
+        low_watermark: ch.low_watermark,
+        blocked: false,
+        cancelled: ch.cancelled,
+        closed: ch.closed,
+        subscribers: ch.subscribers,
+        produced: ch.produced + 1,
+        consumed: ch.consumed,
+        dropped: ch.dropped,
+        block_events: ch.block_events,
+        last_delta: ch.last_delta,
+        notify_count: ch.notify_count,
+        history: ch.history + [tok]
+    }
+    return [true, new_ch]
+}
+
+// ===================================================================
+//  channel_try_push — non-blocking producer; drops on overflow
+// ===================================================================
+fn channel_try_push(ch, tok) {
+    if ch.cancelled { return [false, ch] }
+    if ch.closed { return [false, ch] }
+    if len(ch.buffer) >= ch.capacity {
+        let dropped_ch = StreamChannel {
+            buffer: ch.buffer,
+            capacity: ch.capacity,
+            high_watermark: ch.high_watermark,
+            low_watermark: ch.low_watermark,
+            blocked: ch.blocked,
+            cancelled: ch.cancelled,
+            closed: ch.closed,
+            subscribers: ch.subscribers,
+            produced: ch.produced,
+            consumed: ch.consumed,
+            dropped: ch.dropped + 1,
+            block_events: ch.block_events,
+            last_delta: ch.last_delta,
+            notify_count: ch.notify_count,
+            history: ch.history
+        }
+        return [false, dropped_ch]
+    }
+    let new_buf = ch.buffer + [tok]
+    let new_ch = StreamChannel {
+        buffer: new_buf,
+        capacity: ch.capacity,
+        high_watermark: ch.high_watermark,
+        low_watermark: ch.low_watermark,
+        blocked: ch.blocked,
+        cancelled: ch.cancelled,
+        closed: ch.closed,
+        subscribers: ch.subscribers,
+        produced: ch.produced + 1,
+        consumed: ch.consumed,
+        dropped: ch.dropped,
+        block_events: ch.block_events,
+        last_delta: ch.last_delta,
+        notify_count: ch.notify_count,
+        history: ch.history + [tok]
+    }
+    return [true, new_ch]
+}
+
+// ===================================================================
+//  channel_pop — consumer pops oldest element
+//
+//  Returns [ok, tok, new_channel]. ok=false iff buffer empty.
+//  If popping crosses the low watermark, blocked flag is cleared
+//  (producer may resume).
+// ===================================================================
+fn channel_pop(ch) {
+    let n = len(ch.buffer)
+    if n == 0 {
+        return [false, 0, ch]
+    }
+    let tok = ch.buffer[0]
+    let mut new_buf = []
+    let mut i = 1
+    while i < n {
+        new_buf = new_buf + [ch.buffer[i]]
+        i = i + 1
+    }
+    let mut was_blocked = ch.blocked
+    if len(new_buf) <= ch.low_watermark {
+        was_blocked = false
+    }
+    let new_ch = StreamChannel {
+        buffer: new_buf,
+        capacity: ch.capacity,
+        high_watermark: ch.high_watermark,
+        low_watermark: ch.low_watermark,
+        blocked: was_blocked,
+        cancelled: ch.cancelled,
+        closed: ch.closed,
+        subscribers: ch.subscribers,
+        produced: ch.produced,
+        consumed: ch.consumed + 1,
+        dropped: ch.dropped,
+        block_events: ch.block_events,
+        last_delta: ch.last_delta,
+        notify_count: ch.notify_count,
+        history: ch.history
+    }
+    return [true, tok, new_ch]
+}
+
+// ===================================================================
+//  channel_peek — non-destructive read of oldest element
+// ===================================================================
+fn channel_peek(ch) {
+    if len(ch.buffer) == 0 { return [false, 0] }
+    return [true, ch.buffer[0]]
+}
+
+// ===================================================================
+//  channel_cancel — set abort flag
+// ===================================================================
+fn channel_cancel(ch) {
+    return StreamChannel {
+        buffer: ch.buffer,
+        capacity: ch.capacity,
+        high_watermark: ch.high_watermark,
+        low_watermark: ch.low_watermark,
+        blocked: ch.blocked,
+        cancelled: true,
+        closed: ch.closed,
+        subscribers: ch.subscribers,
+        produced: ch.produced,
+        consumed: ch.consumed,
+        dropped: ch.dropped,
+        block_events: ch.block_events,
+        last_delta: ch.last_delta,
+        notify_count: ch.notify_count,
+        history: ch.history
+    }
+}
+
+fn channel_close(ch) {
+    return StreamChannel {
+        buffer: ch.buffer,
+        capacity: ch.capacity,
+        high_watermark: ch.high_watermark,
+        low_watermark: ch.low_watermark,
+        blocked: ch.blocked,
+        cancelled: ch.cancelled,
+        closed: true,
+        subscribers: ch.subscribers,
+        produced: ch.produced,
+        consumed: ch.consumed,
+        dropped: ch.dropped,
+        block_events: ch.block_events,
+        last_delta: ch.last_delta,
+        notify_count: ch.notify_count,
+        history: ch.history
+    }
+}
+
+// ===================================================================
+//  Subscriber callbacks (fan-out)
+//
+//  Subscribers are closures of shape |tok_str| { ... }. Because Hexa
+//  closures are capture-by-value, callbacks cannot mutate caller
+//  state through side effects — so in addition to invoking each
+//  callback, channel_notify records the last delta and notify_count
+//  on the returned channel. Callers that need real side effects
+//  should inspect the returned channel.
+//
+//  Returns [count, new_channel].
+// ===================================================================
+fn channel_subscribe(ch, callback) {
+    let new_subs = ch.subscribers + [callback]
+    return StreamChannel {
+        buffer: ch.buffer,
+        capacity: ch.capacity,
+        high_watermark: ch.high_watermark,
+        low_watermark: ch.low_watermark,
+        blocked: ch.blocked,
+        cancelled: ch.cancelled,
+        closed: ch.closed,
+        subscribers: new_subs,
+        produced: ch.produced,
+        consumed: ch.consumed,
+        dropped: ch.dropped,
+        block_events: ch.block_events,
+        last_delta: ch.last_delta,
+        notify_count: ch.notify_count,
+        history: ch.history
+    }
+}
+
+fn channel_notify(ch, tok_str) {
+    let n = len(ch.subscribers)
+    let mut i = 0
+    while i < n {
+        let cb = ch.subscribers[i]
+        cb(tok_str)
+        i = i + 1
+    }
+    let new_ch = StreamChannel {
+        buffer: ch.buffer,
+        capacity: ch.capacity,
+        high_watermark: ch.high_watermark,
+        low_watermark: ch.low_watermark,
+        blocked: ch.blocked,
+        cancelled: ch.cancelled,
+        closed: ch.closed,
+        subscribers: ch.subscribers,
+        produced: ch.produced,
+        consumed: ch.consumed,
+        dropped: ch.dropped,
+        block_events: ch.block_events,
+        last_delta: tok_str,
+        notify_count: ch.notify_count + 1,
+        history: ch.history
+    }
+    return [n, new_ch]
+}
+
+// ===================================================================
+//  channel_stats — snapshot counters
+// ===================================================================
+fn channel_stats(ch) {
+    return [ch.produced, ch.consumed, ch.dropped, ch.block_events]
+}
+
+// ===================================================================
+//  Partial decode (incremental detokenize)
+//
+//  StreamDecoder: byte-level detokenizer that accumulates token ids
+//  and emits the newly visible string slice as deltas. Works with the
+//  byte_tokenize()/token_to_str() scheme used in self/ml/streaming.hexa
+//  (token_id = byte_value + 3, EOS = 2, BOS = 1).
+// ===================================================================
+struct StreamDecoder {
+    pending: string,    // accumulated raw bytes as string
+    emitted: string,    // total text handed to the consumer so far
+    token_count: int,   // token ids consumed
+    eos_seen: bool
+}
+
+fn create_decoder() {
+    return StreamDecoder {
+        pending: "",
+        emitted: "",
+        token_count: 0,
+        eos_seen: false
+    }
+}
+
+fn sg_token_to_str(token_id) {
+    if token_id <= 2 { return "" }
+    let byte_val = token_id - 3
+    if byte_val >= 32 {
+        if byte_val < 127 {
+            return chr(byte_val)
+        }
+    }
+    return "?"
+}
+
+// decoder_feed — push a single token id. Returns [delta_string, new_decoder]
+fn decoder_feed(dec, token_id) {
+    if token_id == 2 {
+        let eos_dec = StreamDecoder {
+            pending: dec.pending,
+            emitted: dec.emitted,
+            token_count: dec.token_count + 1,
+            eos_seen: true
+        }
+        return ["", eos_dec]
+    }
+    let piece = sg_token_to_str(token_id)
+    let new_pending = dec.pending + piece
+    let new_emitted = dec.emitted + piece
+    let new_dec = StreamDecoder {
+        pending: "",
+        emitted: new_emitted,
+        token_count: dec.token_count + 1,
+        eos_seen: dec.eos_seen
+    }
+    return [piece, new_dec]
+}
+
+// decoder_flush — drain pending bytes (no-op for byte-level scheme)
+fn decoder_flush(dec) {
+    let flushed = dec.pending
+    let new_dec = StreamDecoder {
+        pending: "",
+        emitted: dec.emitted + flushed,
+        token_count: dec.token_count,
+        eos_seen: dec.eos_seen
+    }
+    return [flushed, new_dec]
+}
+
+// ===================================================================
+//  stream_generate — high-level producer loop
+//
+//  Because Hexa lambdas capture by value, we drive the producer with
+//  an explicit token_ids array + starting src_pos instead of a
+//  closure source. Drain is built-in: on backpressure we pop one
+//  element from the channel ourselves (dropping its value) until
+//  the push admits.
+//
+//  Inputs:
+//    ch          initial StreamChannel
+//    dec         initial StreamDecoder
+//    token_ids   array of token ids; EOS (2) terminates, -1 aborts
+//    max_tokens  hard cap on admitted tokens
+//
+//  Behavior:
+//    - Walks token_ids from index 0 up to max_tokens or array end.
+//    - Pushes each admitted token into channel.
+//    - On backpressure (push returns false with blocked flag), pops
+//      one element from the channel and retries. After buffer falls
+//      to or below low_watermark the next push succeeds.
+//    - Respects cancel: drops remaining work, returns summary.
+//    - Notifies subscribers with the decoded delta for each admitted
+//      token (via channel_notify which also updates last_delta).
+//
+//  Returns [final_channel, final_decoder, summary]
+//    summary: [admitted, blocked, cancelled, eos]
+//      admitted  : int — tokens successfully pushed
+//      blocked   : int — total backpressure events observed
+//      cancelled : bool
+//      eos       : bool
+// ===================================================================
+fn stream_generate(ch, dec, token_ids, max_tokens) {
+    let mut cur_ch = ch
+    let mut cur_dec = dec
+    let mut admitted = 0
+    let mut blocked = 0
+    let mut cancelled = false
+    let mut eos = false
+    let mut src_pos = 0
+    let src_len = len(token_ids)
+    let mut done = false
+
+    while done == false {
+        if cur_ch.cancelled {
+            cancelled = true
+            done = true
+        } else {
+            if admitted >= max_tokens {
+                done = true
+            } else {
+                if src_pos >= src_len {
+                    done = true
+                } else {
+                    let tok = token_ids[src_pos]
+                    src_pos = src_pos + 1
+                    if tok == 2 {
+                        // EOS
+                        eos = true
+                        cur_ch = channel_close(cur_ch)
+                        done = true
+                    } else {
+                        if tok < 0 {
+                            // producer requested abort
+                            cancelled = true
+                            cur_ch = channel_cancel(cur_ch)
+                            done = true
+                        } else {
+                            // Backpressure loop: pop until push admits
+                            let mut push_ok = false
+                            let mut retry = 0
+                            while push_ok == false {
+                                let res = channel_push(cur_ch, tok)
+                                push_ok = res[0]
+                                cur_ch = res[1]
+                                if push_ok == false {
+                                    blocked = blocked + 1
+                                    // Drain one element
+                                    let pr = channel_pop(cur_ch)
+                                    if pr[0] == true {
+                                        cur_ch = pr[2]
+                                    }
+                                    retry = retry + 1
+                                    if retry > cur_ch.capacity + 4 {
+                                        cancelled = true
+                                        cur_ch = channel_cancel(cur_ch)
+                                        push_ok = true
+                                    }
+                                } else {
+                                    admitted = admitted + 1
+                                    let fed = decoder_feed(cur_dec, tok)
+                                    let delta = fed[0]
+                                    cur_dec = fed[1]
+                                    let nres = channel_notify(cur_ch, delta)
+                                    cur_ch = nres[1]
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return [cur_ch, cur_dec, [admitted, blocked, cancelled, eos]]
+}
+
+println("[streaming_gen] module loaded")
