@@ -1,0 +1,308 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/fixmatch_ssl.hexa — FixMatch Semi-Supervised (#268)
+//
+//  FixMatch (Sohn et al. 2020):
+//    Labeled loss      : CE(model(x_l), y_l)
+//    Unlabeled path    :
+//      1. weak aug(x_u)    -> probs -> pseudo label ŷ (argmax)
+//      2. if max_prob(probs) >= τ   then keep sample
+//      3. strong aug(x_u)  -> logits
+//      4. CE(logits, ŷ)
+//    Total             : L_l  + λ · L_u
+//
+//  The "model" is kept intentionally simple (linear feat->logits) so
+//  the module is self contained and runnable by the hexa interpreter.
+//
+//  API:
+//    fm_weak_augment(feat, seed)                     -> [float]
+//    fm_strong_augment(feat, seed)                   -> [float]
+//    fm_linear_forward(feat, W)                      -> [float]
+//    fm_softmax(logits)                              -> [float]
+//    fm_argmax(probs)                                -> int
+//    fm_max_prob(probs)                              -> float
+//    fm_cross_entropy(probs, label)                  -> float
+//    fm_pseudo_label(feat_u, W, tau, seed)           -> #{"valid","label","conf"}
+//    fm_labeled_loss(feats_l, labels_l, W)           -> float
+//    fm_unlabeled_loss(feats_u, W, tau, seed)        -> #{"loss","kept"}
+//    fm_total_loss(feats_l, labels_l, feats_u, W, tau, lambda_u, seed) -> float
+//    fm_train_step(W, feats_l, labels_l, feats_u, tau, lambda_u, lr, seed) -> #{"W","loss"}
+// ═══════════════════════════════════════════════════════════════════
+
+fn fm_exp(inp) {
+    let mut v = inp
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn fm_log(inp) {
+    if inp <= 0.0 { return -30.0 }
+    let mut v = inp
+    let mut count = 0
+    while v > 2.0 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    let d = v - 1.0
+    let ln_v = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_v
+}
+
+fn fm_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+// Deterministic pseudo random in [0,1)
+fn fm_hash(seed, idx) {
+    let mut h = (seed + 1) * 2654435761 + (idx + 1) * 1315423911
+    h = h % 1000003
+    if h < 0 { h = 0 - h }
+    return h
+}
+
+fn fm_rand(seed, idx) {
+    let h = fm_hash(seed, idx)
+    return to_float(h % 10000) / 10000.0
+}
+
+// Signed noise ~ (rand - 0.5)*scale
+fn fm_noise(seed, idx, scale) {
+    return (fm_rand(seed, idx) - 0.5) * scale
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  1. Augmentation — weak & strong
+//
+//  weak  : small additive noise (±0.05)
+//  strong: larger noise + sign flips on ~25% of dims
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn fm_weak_augment(feat, seed) {
+    let n = len(feat)
+    let mut out = fm_zeros(n)
+    for i in 0..n {
+        out[i] = feat[i] + fm_noise(seed, i, 0.05)
+    }
+    return out
+}
+
+@pure
+fn fm_strong_augment(feat, seed) {
+    let n = len(feat)
+    let mut out = fm_zeros(n)
+    for i in 0..n {
+        let base = feat[i] + fm_noise(seed + 1000, i, 0.4)
+        let r = fm_rand(seed + 2000, i)
+        if r < 0.25 {
+            out[i] = 0.0 - base
+        } else {
+            out[i] = base
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  2. Linear forward + softmax
+//
+//  W is [K][D]  (K classes, D features).  logits_k = sum_j W[k][j]*x[j]
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn fm_linear_forward(feat, W) {
+    let K = len(W)
+    let D = len(feat)
+    let mut logits = fm_zeros(K)
+    for k in 0..K {
+        let mut s = 0.0
+        for j in 0..D {
+            s = s + W[k][j] * feat[j]
+        }
+        logits[k] = s
+    }
+    return logits
+}
+
+@pure
+fn fm_softmax(logits) {
+    let n = len(logits)
+    let mut mx = logits[0]
+    for i in 1..n {
+        if logits[i] > mx { mx = logits[i] }
+    }
+    let mut exps = fm_zeros(n)
+    let mut z = 0.0
+    for i in 0..n {
+        exps[i] = fm_exp(logits[i] - mx)
+        z = z + exps[i]
+    }
+    let mut out = fm_zeros(n)
+    if z < 1.0e-15 {
+        for i in 0..n { out[i] = 1.0 / to_float(n) }
+    } else {
+        for i in 0..n { out[i] = exps[i] / z }
+    }
+    return out
+}
+
+@pure
+fn fm_argmax(probs) {
+    let n = len(probs)
+    let mut best = 0
+    let mut best_v = probs[0]
+    for i in 1..n {
+        if probs[i] > best_v {
+            best_v = probs[i]
+            best = i
+        }
+    }
+    return best
+}
+
+@pure
+fn fm_max_prob(probs) {
+    let n = len(probs)
+    let mut mx = probs[0]
+    for i in 1..n {
+        if probs[i] > mx { mx = probs[i] }
+    }
+    return mx
+}
+
+// Negative log likelihood
+@pure
+fn fm_cross_entropy(probs, label) {
+    let p = probs[label]
+    let mut q = p
+    if q < 1.0e-12 { q = 1.0e-12 }
+    return 0.0 - fm_log(q)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  3. Pseudo label — weak-aug forward + threshold
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn fm_pseudo_label(feat_u, W, tau, seed) {
+    let weak = fm_weak_augment(feat_u, seed)
+    let probs = fm_softmax(fm_linear_forward(weak, W))
+    let conf = fm_max_prob(probs)
+    let lbl = fm_argmax(probs)
+    let mut ok = 0
+    if conf >= tau { ok = 1 }
+    return #{
+        "valid": ok,
+        "label": lbl,
+        "conf": conf
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  4. Labeled loss (mean cross-entropy)
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn fm_labeled_loss(feats_l, labels_l, W) {
+    let n = len(feats_l)
+    if n == 0 { return 0.0 }
+    let mut total = 0.0
+    for i in 0..n {
+        let probs = fm_softmax(fm_linear_forward(feats_l[i], W))
+        total = total + fm_cross_entropy(probs, labels_l[i])
+    }
+    return total / to_float(n)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  5. Unlabeled loss — strong aug vs pseudo label, mask by conf
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn fm_unlabeled_loss(feats_u, W, tau, seed) {
+    let n = len(feats_u)
+    let mut total = 0.0
+    let mut kept = 0
+    for i in 0..n {
+        let pl = fm_pseudo_label(feats_u[i], W, tau, seed + i)
+        if pl["valid"] == 1 {
+            let strong = fm_strong_augment(feats_u[i], seed + 5000 + i)
+            let probs_s = fm_softmax(fm_linear_forward(strong, W))
+            total = total + fm_cross_entropy(probs_s, pl["label"])
+            kept = kept + 1
+        }
+    }
+    let mut denom = kept
+    if denom == 0 { denom = 1 }
+    return #{
+        "loss": total / to_float(denom),
+        "kept": kept
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  6. Total loss
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn fm_total_loss(feats_l, labels_l, feats_u, W, tau, lambda_u, seed) {
+    let l_sup = fm_labeled_loss(feats_l, labels_l, W)
+    let u = fm_unlabeled_loss(feats_u, W, tau, seed)
+    return l_sup + lambda_u * u["loss"]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  7. Training step — finite-difference gradient on total loss
+// ═══════════════════════════════════════════════════════════════════
+
+@hot
+fn fm_train_step(W, feats_l, labels_l, feats_u, tau, lambda_u, lr, seed) {
+    let K = len(W)
+    let D = len(W[0])
+    let base_loss = fm_total_loss(feats_l, labels_l, feats_u, W, tau, lambda_u, seed)
+    let eps = 0.001
+
+    // Build new W with gradient step
+    let mut new_W = []
+    for k in 0..K {
+        let mut row = fm_zeros(D)
+        for j in 0..D { row[j] = W[k][j] }
+        new_W = new_W + [row]
+    }
+
+    for k in 0..K {
+        for j in 0..D {
+            // Perturb W[k][j]
+            let mut W_plus = []
+            for k2 in 0..K {
+                let mut row2 = fm_zeros(D)
+                for j2 in 0..D { row2[j2] = W[k2][j2] }
+                W_plus = W_plus + [row2]
+            }
+            W_plus[k][j] = W_plus[k][j] + eps
+            let loss_plus = fm_total_loss(feats_l, labels_l, feats_u, W_plus, tau, lambda_u, seed)
+            let g = (loss_plus - base_loss) / eps
+            new_W[k][j] = new_W[k][j] - lr * g
+        }
+    }
+
+    return #{
+        "W": new_W,
+        "loss": base_loss
+    }
+}
+
+println("[fixmatch_ssl] loaded — weak/strong aug + pseudo label + consistency loss")

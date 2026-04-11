@@ -1,0 +1,331 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/once_for_all.hexa — Once-For-All Network (#278)
+//
+//  Once-For-All (Cai et al. 2020) trains a single supernet that
+//  supports many elastic settings:
+//      elastic kernel  (3 / 5 / 7)
+//      elastic depth   (2 / 3 / 4 layers)
+//      elastic width   (0.25 / 0.5 / 0.75 / 1.0 channels)
+//  The "sandwich rule" samples smallest + largest + 2 random subnets
+//  per training step.
+//
+//  Our mini-supernet is fully numerical:
+//      layer i  ≔  y = ReLU( y · w_i + b_i )   (scalar per channel)
+//      kernel   : replicate input over k taps (averaged)
+//      depth    : drop tail layers
+//      width    : scale active channel count
+//
+//  API:
+//    ofa_build_supernet(depth_max, width_max)                -> #{"W","B"}
+//    ofa_kernels()                                           -> [int]
+//    ofa_depths()                                            -> [int]
+//    ofa_widths()                                            -> [float]
+//    ofa_sample_subnet(seed)                                 -> #{"kernel","depth","width_mult"}
+//    ofa_sandwich_batch(seed)                                -> [subnet]   // 4 subnets
+//    ofa_forward_subnet(inp, net, subnet)                    -> [float]
+//    ofa_loss_subnet(inp, target, net, subnet)               -> float
+//    ofa_sandwich_loss(inp, target, net, seed)               -> float
+//    ofa_train_step(inp, target, net, lr, seed)              -> #{"net","loss"}
+//    ofa_count_params(net, subnet)                           -> int
+// ═══════════════════════════════════════════════════════════════════
+
+fn ofa_abs(inp) {
+    if inp < 0.0 { return 0.0 - inp }
+    return inp
+}
+
+fn ofa_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn ofa_zeros_mat(m, n) {
+    let mut M = []
+    for _i in 0..m { M = M + [ofa_zeros(n)] }
+    return M
+}
+
+fn ofa_relu(inp) {
+    if inp < 0.0 { return 0.0 }
+    return inp
+}
+
+fn ofa_hash(seed, idx) {
+    let mut h = (seed + 1) * 2654435761 + (idx + 1) * 1315423911
+    h = h % 1000003
+    if h < 0 { h = 0 - h }
+    return h
+}
+
+fn ofa_rand01(seed, idx) {
+    let h = ofa_hash(seed, idx)
+    return to_float(h % 10000) / 10000.0
+}
+
+fn ofa_rand_int(seed, idx, modulo) {
+    let h = ofa_hash(seed, idx)
+    return h % modulo
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  1. Supernet weights
+//
+//  W: [depth_max][width_max][width_max]   matrix per layer
+//  B: [depth_max][width_max]
+//
+//  For simplicity we initialise deterministically.
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ofa_build_supernet(depth_max, width_max) {
+    let mut W = []
+    let mut B = []
+    for d in 0..depth_max {
+        let mut M = ofa_zeros_mat(width_max, width_max)
+        for i in 0..width_max {
+            for j in 0..width_max {
+                // small deterministic init
+                M[i][j] = 0.1 * to_float(((d + 1) * (i + 1) * (j + 1)) % 7) - 0.3
+            }
+        }
+        W = W + [M]
+        let mut b = ofa_zeros(width_max)
+        for i in 0..width_max {
+            b[i] = 0.01 * to_float(((d + 1) * (i + 2)) % 5)
+        }
+        B = B + [b]
+    }
+    return #{
+        "W": W,
+        "B": B,
+        "depth_max": depth_max,
+        "width_max": width_max
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  2. Elastic choice sets
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ofa_kernels() {
+    return [3, 5, 7]
+}
+
+@pure
+fn ofa_depths() {
+    return [2, 3, 4]
+}
+
+@pure
+fn ofa_widths() {
+    return [0.25, 0.5, 0.75, 1.0]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  3. Subnet sampling
+//
+//  Returns #{"kernel", "depth", "width_mult"}
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ofa_sample_subnet(seed) {
+    let ks = ofa_kernels()
+    let ds = ofa_depths()
+    let ws = ofa_widths()
+    let ki = ofa_rand_int(seed, 0, len(ks))
+    let di = ofa_rand_int(seed, 1, len(ds))
+    let wi = ofa_rand_int(seed, 2, len(ws))
+    return #{
+        "kernel": ks[ki],
+        "depth": ds[di],
+        "width_mult": ws[wi]
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  4. Sandwich rule — smallest, largest, + 2 random
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ofa_sandwich_batch(seed) {
+    let ks = ofa_kernels()
+    let ds = ofa_depths()
+    let ws = ofa_widths()
+    let smallest = #{
+        "kernel": ks[0],
+        "depth": ds[0],
+        "width_mult": ws[0]
+    }
+    let largest = #{
+        "kernel": ks[len(ks) - 1],
+        "depth": ds[len(ds) - 1],
+        "width_mult": ws[len(ws) - 1]
+    }
+    let r1 = ofa_sample_subnet(seed + 100)
+    let r2 = ofa_sample_subnet(seed + 200)
+    return [smallest, largest, r1, r2]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  5. Forward through a chosen subnet
+//
+//  Width mult => active channels = ⌈width_max · wm⌉
+//  Depth      => use first `depth` layers of W
+//  Kernel k   => average inp over k duplicate taps (simulated)
+// ═══════════════════════════════════════════════════════════════════
+
+fn ofa_active_width(width_max, width_mult) {
+    let mut n = int(to_float(width_max) * width_mult + 0.5)
+    if n < 1 { n = 1 }
+    if n > width_max { n = width_max }
+    return n
+}
+
+@pure
+fn ofa_forward_subnet(inp, net, subnet) {
+    let width_max = net["width_max"]
+    let depth = subnet["depth"]
+    let kernel = subnet["kernel"]
+    let active = ofa_active_width(width_max, subnet["width_mult"])
+    // Pad/truncate input to `active` channels
+    let mut h = ofa_zeros(active)
+    let d_in = len(inp)
+    for i in 0..active {
+        if i < d_in { h[i] = inp[i] }
+    }
+    // Kernel taps: average with a cyclic shift of h k times
+    let mut kernel_out = ofa_zeros(active)
+    for i in 0..active {
+        let mut s = 0.0
+        for t in 0..kernel {
+            let idx = (i + t) % active
+            s = s + h[idx]
+        }
+        kernel_out[i] = s / to_float(kernel)
+    }
+    h = kernel_out
+    // Forward through `depth` layers
+    let W = net["W"]
+    let B = net["B"]
+    for d in 0..depth {
+        let mut new_h = ofa_zeros(active)
+        for i in 0..active {
+            let mut s = B[d][i]
+            for j in 0..active {
+                s = s + W[d][i][j] * h[j]
+            }
+            new_h[i] = ofa_relu(s)
+        }
+        h = new_h
+    }
+    return h
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  6. Subnet loss — MSE to target (truncated/padded)
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ofa_loss_subnet(inp, target, net, subnet) {
+    let out = ofa_forward_subnet(inp, net, subnet)
+    let n_out = len(out)
+    let n_tgt = len(target)
+    let mut s = 0.0
+    let mut count = 0
+    for i in 0..n_out {
+        if i < n_tgt {
+            let e = out[i] - target[i]
+            s = s + e * e
+            count = count + 1
+        }
+    }
+    if count == 0 { return 0.0 }
+    return s / to_float(count)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  7. Sandwich loss — average over the 4 sandwich subnets
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ofa_sandwich_loss(inp, target, net, seed) {
+    let batch = ofa_sandwich_batch(seed)
+    let n = len(batch)
+    let mut total = 0.0
+    for i in 0..n {
+        total = total + ofa_loss_subnet(inp, target, net, batch[i])
+    }
+    return total / to_float(n)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  8. Parameter counting for a subnet (depth × active_width²)
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ofa_count_params(net, subnet) {
+    let width_max = net["width_max"]
+    let active = ofa_active_width(width_max, subnet["width_mult"])
+    let depth = subnet["depth"]
+    return depth * active * active + depth * active
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  9. Training step — finite-difference gradient on sandwich loss
+// ═══════════════════════════════════════════════════════════════════
+
+fn ofa_copy_net(net) {
+    let depth_max = net["depth_max"]
+    let width_max = net["width_max"]
+    let W_src = net["W"]
+    let B_src = net["B"]
+    let mut W_dst = []
+    let mut B_dst = []
+    for d in 0..depth_max {
+        let mut M = ofa_zeros_mat(width_max, width_max)
+        for i in 0..width_max {
+            for j in 0..width_max {
+                M[i][j] = W_src[d][i][j]
+            }
+        }
+        W_dst = W_dst + [M]
+        let mut b = ofa_zeros(width_max)
+        for i in 0..width_max { b[i] = B_src[d][i] }
+        B_dst = B_dst + [b]
+    }
+    return #{
+        "W": W_dst,
+        "B": B_dst,
+        "depth_max": depth_max,
+        "width_max": width_max
+    }
+}
+
+@hot
+fn ofa_train_step(inp, target, net, lr, seed) {
+    let depth_max = net["depth_max"]
+    let width_max = net["width_max"]
+    let base = ofa_sandwich_loss(inp, target, net, seed)
+    let eps = 0.001
+    let mut new_net = ofa_copy_net(net)
+    // Gradient on W only (B left alone to keep compute cheap)
+    for d in 0..depth_max {
+        for i in 0..width_max {
+            for j in 0..width_max {
+                let mut perturbed = ofa_copy_net(net)
+                perturbed["W"][d][i][j] = perturbed["W"][d][i][j] + eps
+                let lp = ofa_sandwich_loss(inp, target, perturbed, seed)
+                let g = (lp - base) / eps
+                new_net["W"][d][i][j] = new_net["W"][d][i][j] - lr * g
+            }
+        }
+    }
+    return #{
+        "net": new_net,
+        "loss": base
+    }
+}
+
+println("[once_for_all] loaded — elastic kernel/depth/width supernet + sandwich rule")
