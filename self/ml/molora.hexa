@@ -1,0 +1,557 @@
+// ═══════════════════════════════════════════════════════════════
+//  molora.hexa — MoLoRA: Mixture of LoRA Experts
+//
+//  ML roadmap #191 — MoLoRA
+//
+//  Core idea: instead of a single LoRA adapter or manual adapter
+//  selection, learn a router that dynamically selects top-k LoRA
+//  experts per input. Each expert is a standard LoRA (A, B) pair.
+//  The router produces softmax probabilities over experts and
+//  selects the top-k; the final output is the weighted sum of
+//  expert LoRA deltas plus the base linear output.
+//
+//  Architecture:
+//    - N LoRA experts, each with A_i [rank x dim], B_i [dim x rank]
+//    - Router W_r [n_experts x dim], produces logits per input
+//    - Base weight W_base [dim x dim] (frozen)
+//    - Forward:
+//        1. logits = W_r @ x                          [n_experts]
+//        2. (indices, weights) = top_k_softmax(logits) [top_k]
+//        3. delta = sum_k weights[k] * B[idx[k]] @ (A[idx[k]] @ x)
+//        4. y = W_base @ x + delta
+//
+//  Load-balance loss (Switch Transformer style):
+//    L_aux = n_experts * sum_e( f_e * P_e )
+//    f_e = fraction of inputs routed to expert e
+//    P_e = mean router probability for expert e
+//    Minimizing L_aux encourages uniform expert utilization.
+//
+//  References:
+//    - Dou et al. 2024, "Looped Transformers are Better at Learning
+//      Learning Algorithms" (MoLoRA concept)
+//    - Fedus et al. 2021, "Switch Transformers" (load-balance loss)
+//    - Hu et al. 2022, "LoRA" (low-rank adaptation)
+//
+//  AI-NATIVE:
+//    @pure    — math kernels (forward / routing / loss)
+//    @memoize — scale constants
+//    @hot     — train step inner loop
+//
+//  HX3/memory pitfalls honored:
+//    - no semicolons, no ternary, no continue
+//    - arrays via rebuild (push pattern)
+//    - struct fields via rebuild
+//    - no bit-twiddling / manual-loop micro-opts
+//
+//  L0: src/*.rs untouched. Pure .hexa.
+// ═══════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 1: Math helpers
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn mol_fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+
+fn mol_zeros1(n) {
+    let mut v = []
+    for i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn mol_zeros2(rows, cols) {
+    let mut r = []
+    for i in 0..rows { r = r + [mol_zeros1(cols)] }
+    return r
+}
+
+fn mol_kaiming(rows, cols, seed) {
+    let mut s = seed
+    let scale = 1.0 / sqrt(to_float(cols))
+    let mut r = []
+    for i in 0..rows {
+        let mut row = []
+        for j in 0..cols {
+            s = (s * 1103515245 + 12345) % 2147483647
+            let v = (to_float(s % 2000) - 1000.0) / 1000.0 * scale
+            row = row + [v]
+        }
+        r = r + [row]
+    }
+    return r
+}
+
+// matvec: y[m] = W[m,n] @ x[n]
+@pure
+fn mol_matvec(w, x, m, n) {
+    let mut y = []
+    for i in 0..m {
+        let mut s = 0.0
+        for j in 0..n { s = s + w[i][j] * x[j] }
+        y = y + [s]
+    }
+    return y
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 2: LoRA Expert
+//
+//  Expert stored as struct with A [rank x dim], B [dim x rank].
+//  A: Kaiming init, B: zero init (LoRA convention: start at 0 delta).
+// ═══════════════════════════════════════════════════════════════
+
+struct MoLoraExpert {
+    name: string,
+    a: array,
+    b: array,
+    dim: int,
+    rank: int
+}
+
+fn molora_create_expert(name, dim, rank, seed) {
+    let a = mol_kaiming(rank, dim, seed)
+    let b = mol_zeros2(dim, rank)
+    return MoLoraExpert { name: name, a: a, b: b, dim: dim, rank: rank }
+}
+
+// Expert forward: delta = B @ (A @ x)
+@pure
+fn molora_expert_forward(expert: MoLoraExpert, x, dim) {
+    let ax = mol_matvec(expert.a, x, expert.rank, dim)
+    let bax = mol_matvec(expert.b, ax, dim, expert.rank)
+    return bax
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 3: Router
+//
+//  Router weights W_r: [n_experts x dim]
+//  logits = W_r @ x  => [n_experts]
+//  Top-k selection with softmax over selected subset.
+// ═══════════════════════════════════════════════════════════════
+
+struct MoLoraRouter {
+    w: array,
+    n_experts: int,
+    dim: int
+}
+
+fn molora_create_router(n_experts, dim, seed) {
+    let w = mol_kaiming(n_experts, dim, seed)
+    return MoLoraRouter { w: w, n_experts: n_experts, dim: dim }
+}
+
+// Raw logits for all experts
+@pure
+fn molora_router_logits(router: MoLoraRouter, x, dim) {
+    return mol_matvec(router.w, x, router.n_experts, dim)
+}
+
+// Top-k indices from scores
+@pure
+fn mol_topk_indices(scores, n, k) {
+    let mut used = []
+    for i in 0..n { used = used + [false] }
+    let mut picks = []
+    for r in 0..k {
+        let mut best = 0
+        let mut best_v = -1.0e30
+        let mut found = false
+        for e in 0..n {
+            if !used[e] {
+                if !found {
+                    best = e
+                    best_v = scores[e]
+                    found = true
+                } else {
+                    if scores[e] > best_v {
+                        best_v = scores[e]
+                        best = e
+                    }
+                }
+            }
+        }
+        let mut used2 = []
+        for i in 0..n {
+            if i == best { used2 = used2 + [true] } else { used2 = used2 + [used[i]] }
+        }
+        used = used2
+        picks = picks + [best]
+    }
+    return picks
+}
+
+// Softmax over selected subset indices
+@pure
+fn mol_softmax_subset(scores, picks, k) {
+    let mut m = scores[picks[0]]
+    for r in 1..k {
+        if scores[picks[r]] > m { m = scores[picks[r]] }
+    }
+    let mut exps = []
+    let mut z = 0.0
+    for r in 0..k {
+        let v = exp(scores[picks[r]] - m)
+        exps = exps + [v]
+        z = z + v
+    }
+    let mut out = []
+    for r in 0..k { out = out + [exps[r] / z] }
+    return out
+}
+
+// Full softmax over all experts (for load-balance loss)
+@pure
+fn mol_softmax_all(scores, n) {
+    let mut m = scores[0]
+    for i in 1..n { if scores[i] > m { m = scores[i] } }
+    let mut exps = []
+    let mut z = 0.0
+    for i in 0..n {
+        let v = exp(scores[i] - m)
+        exps = exps + [v]
+        z = z + v
+    }
+    let mut out = []
+    for i in 0..n { out = out + [exps[i] / z] }
+    return out
+}
+
+// Route: returns [top_k_indices, top_k_weights]
+@pure
+fn molora_route(router: MoLoraRouter, x, dim, top_k) {
+    let logits = molora_router_logits(router, x, dim)
+    let picks = mol_topk_indices(logits, router.n_experts, top_k)
+    let weights = mol_softmax_subset(logits, picks, top_k)
+    return [picks, weights]
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 4: MoLoRA Model (struct-based)
+// ═══════════════════════════════════════════════════════════════
+
+struct MoLoraModel {
+    experts: array,
+    router: MoLoraRouter,
+    base_w: array,
+    dim: int,
+    rank: int,
+    n_experts: int,
+    top_k: int,
+    frozen: int
+}
+
+fn molora_create(dim, rank, n_experts, top_k) {
+    let mut experts = []
+    for i in 0..n_experts {
+        let name = "expert_" + to_string(i)
+        let seed = 42 + i * 137
+        let e = molora_create_expert(name, dim, rank, seed)
+        experts = experts + [e]
+    }
+    let router = molora_create_router(n_experts, dim, 7777)
+    let base_w = mol_kaiming(dim, dim, 9999)
+    return MoLoraModel {
+        experts: experts, router: router, base_w: base_w,
+        dim: dim, rank: rank, n_experts: n_experts, top_k: top_k, frozen: 0
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 5: MoLoRA Forward
+//
+//  1. base_out = W_base @ x
+//  2. route(x) -> top-k expert indices + weights
+//  3. delta = sum_k w_k * expert_k_forward(x)
+//  4. y = base_out + delta
+// ═══════════════════════════════════════════════════════════════
+
+@hot
+fn molora_forward(model: MoLoraModel, x, dim) {
+    let base_out = mol_matvec(model.base_w, x, dim, dim)
+
+    let route_result = molora_route(model.router, x, dim, model.top_k)
+    let picks = route_result[0]
+    let weights = route_result[1]
+
+    let mut delta = mol_zeros1(dim)
+    for k in 0..model.top_k {
+        let idx = picks[k]
+        let w_k = weights[k]
+        let expert = model.experts[idx]
+        let expert_out = molora_expert_forward(expert, x, dim)
+        for d in 0..dim {
+            delta[d] = delta[d] + w_k * expert_out[d]
+        }
+    }
+
+    let mut y = []
+    for d in 0..dim { y = y + [base_out[d] + delta[d]] }
+    return y
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 6: Load-balance loss
+//
+//  Encourages uniform expert utilization.
+//    P_e = mean probability for expert e across inputs
+//    f_e = fraction of inputs where expert e is in top-k
+//    L_aux = n_experts * sum_e(f_e * P_e)
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn molora_load_balance_loss(model: MoLoraModel, inputs, n_inputs, dim) {
+    let mut f_counts = mol_zeros1(model.n_experts)
+    let mut p_sum = mol_zeros1(model.n_experts)
+
+    for t in 0..n_inputs {
+        let x = inputs[t]
+        let logits = molora_router_logits(model.router, x, dim)
+        let probs = mol_softmax_all(logits, model.n_experts)
+        let picks = mol_topk_indices(logits, model.n_experts, model.top_k)
+
+        for e in 0..model.n_experts {
+            p_sum[e] = p_sum[e] + probs[e]
+        }
+        for k in 0..model.top_k {
+            let idx = picks[k]
+            f_counts[idx] = f_counts[idx] + 1.0
+        }
+    }
+
+    let n_f = to_float(n_inputs)
+    let mut loss = 0.0
+    for e in 0..model.n_experts {
+        let f_e = f_counts[e] / n_f
+        let p_e = p_sum[e] / n_f
+        loss = loss + f_e * p_e
+    }
+    return to_float(model.n_experts) * loss
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 7: Expert utilization
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn molora_expert_utilization(model: MoLoraModel, inputs, n_inputs, dim) {
+    let mut counts = mol_zeros1(model.n_experts)
+    for t in 0..n_inputs {
+        let x = inputs[t]
+        let logits = molora_router_logits(model.router, x, dim)
+        let picks = mol_topk_indices(logits, model.n_experts, model.top_k)
+        for k in 0..model.top_k {
+            let idx = picks[k]
+            counts[idx] = counts[idx] + 1.0
+        }
+    }
+    return counts
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 8: Training
+//
+//  SGD on experts + router. Base weights optionally frozen.
+// ═══════════════════════════════════════════════════════════════
+
+fn mol_mse_loss(y, target, dim) {
+    let mut s = 0.0
+    for i in 0..dim {
+        let d = y[i] - target[i]
+        s = s + d * d
+    }
+    return s / to_float(dim)
+}
+
+fn mol_mse_grad(y, target, dim) {
+    let mut g = []
+    let inv = 2.0 / to_float(dim)
+    for i in 0..dim { g = g + [(y[i] - target[i]) * inv] }
+    return g
+}
+
+@hot
+fn molora_train_step(model: MoLoraModel, x, target, dim, lr) {
+    let y = molora_forward(model, x, dim)
+    let loss = mol_mse_loss(y, target, dim)
+    let dy = mol_mse_grad(y, target, dim)
+
+    let route_result = molora_route(model.router, x, dim, model.top_k)
+    let picks = route_result[0]
+    let weights = route_result[1]
+
+    // Update active experts
+    let mut new_experts = []
+    for e in 0..model.n_experts {
+        let expert = model.experts[e]
+        let mut is_active = false
+        let mut w_e = 0.0
+        for k in 0..model.top_k {
+            if picks[k] == e {
+                is_active = true
+                w_e = weights[k]
+            }
+        }
+        if is_active {
+            let ax = mol_matvec(expert.a, x, model.rank, dim)
+            let mut new_b = mol_zeros2(dim, model.rank)
+            for i in 0..dim {
+                for j in 0..model.rank {
+                    new_b[i][j] = expert.b[i][j] - lr * w_e * dy[i] * ax[j]
+                }
+            }
+            let mut bdy = mol_zeros1(model.rank)
+            for j in 0..model.rank {
+                let mut s = 0.0
+                for i in 0..dim { s = s + expert.b[i][j] * dy[i] }
+                bdy[j] = s
+            }
+            let mut new_a = mol_zeros2(model.rank, dim)
+            for i in 0..model.rank {
+                for j in 0..dim {
+                    new_a[i][j] = expert.a[i][j] - lr * w_e * bdy[i] * x[j]
+                }
+            }
+            let updated = MoLoraExpert {
+                name: expert.name, a: new_a, b: new_b,
+                dim: dim, rank: model.rank
+            }
+            new_experts = new_experts + [updated]
+        } else {
+            new_experts = new_experts + [expert]
+        }
+    }
+
+    // Update router
+    let rw = model.router.w
+    let mut new_rw = mol_zeros2(model.n_experts, dim)
+    for i in 0..model.n_experts {
+        for j in 0..dim { new_rw[i][j] = rw[i][j] }
+    }
+    for k in 0..model.top_k {
+        let idx = picks[k]
+        let expert_out = molora_expert_forward(model.experts[idx], x, dim)
+        let mut contrib = 0.0
+        for d in 0..dim { contrib = contrib + dy[d] * expert_out[d] }
+        for j in 0..dim {
+            new_rw[idx][j] = new_rw[idx][j] - lr * contrib * x[j]
+        }
+    }
+    let new_router = MoLoraRouter { w: new_rw, n_experts: model.n_experts, dim: dim }
+
+    // Update base weights if not frozen
+    let mut new_base = model.base_w
+    if model.frozen == 0 {
+        new_base = mol_zeros2(dim, dim)
+        for i in 0..dim {
+            for j in 0..dim {
+                new_base[i][j] = model.base_w[i][j] - lr * dy[i] * x[j]
+            }
+        }
+    }
+
+    let new_model = MoLoraModel {
+        experts: new_experts, router: new_router, base_w: new_base,
+        dim: dim, rank: model.rank, n_experts: model.n_experts,
+        top_k: model.top_k, frozen: model.frozen
+    }
+    return [new_model, loss]
+}
+
+// Freeze base weights
+fn molora_freeze_base(model: MoLoraModel) {
+    return MoLoraModel {
+        experts: model.experts, router: model.router, base_w: model.base_w,
+        dim: model.dim, rank: model.rank, n_experts: model.n_experts,
+        top_k: model.top_k, frozen: 1
+    }
+}
+
+// Merge all expert deltas into base weights for deployment
+fn molora_merge_experts(model: MoLoraModel, dim) {
+    let mut merged = mol_zeros2(dim, dim)
+    for i in 0..dim {
+        for j in 0..dim { merged[i][j] = model.base_w[i][j] }
+    }
+    let inv_n = 1.0 / to_float(model.n_experts)
+    for e in 0..model.n_experts {
+        let expert = model.experts[e]
+        for i in 0..dim {
+            for j in 0..dim {
+                let mut s = 0.0
+                for r in 0..model.rank { s = s + expert.b[i][r] * expert.a[r][j] }
+                merged[i][j] = merged[i][j] + inv_n * s
+            }
+        }
+    }
+    return merged
+}
+
+// Dynamically add a new expert
+fn molora_add_expert(model: MoLoraModel, name, dim, rank, seed) {
+    let new_expert = molora_create_expert(name, dim, rank, seed)
+    let new_experts = model.experts + [new_expert]
+    let new_n = model.n_experts + 1
+
+    let mut new_rw = []
+    for i in 0..model.n_experts { new_rw = new_rw + [model.router.w[i]] }
+    let new_row_mat = mol_kaiming(1, dim, seed + 31337)
+    new_rw = new_rw + [new_row_mat[0]]
+    let new_router = MoLoraRouter { w: new_rw, n_experts: new_n, dim: dim }
+
+    return MoLoraModel {
+        experts: new_experts, router: new_router, base_w: model.base_w,
+        dim: dim, rank: rank, n_experts: new_n,
+        top_k: model.top_k, frozen: model.frozen
+    }
+}
+
+// Remove an expert by index
+fn molora_remove_expert(model: MoLoraModel, expert_idx) {
+    let mut new_experts = []
+    let mut new_rw = []
+    for i in 0..model.n_experts {
+        if i != expert_idx {
+            new_experts = new_experts + [model.experts[i]]
+            new_rw = new_rw + [model.router.w[i]]
+        }
+    }
+    let new_n = model.n_experts - 1
+    let new_router = MoLoraRouter { w: new_rw, n_experts: new_n, dim: model.dim }
+
+    return MoLoraModel {
+        experts: new_experts, router: new_router, base_w: model.base_w,
+        dim: model.dim, rank: model.rank, n_experts: new_n,
+        top_k: model.top_k, frozen: model.frozen
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 9: Evaluation
+// ═══════════════════════════════════════════════════════════════
+
+// Total trainable params: experts (A + B each) + router W
+@pure
+fn molora_param_count(model: MoLoraModel) {
+    let expert_params = model.n_experts * 2 * model.rank * model.dim
+    let router_params = model.n_experts * model.dim
+    return expert_params + router_params
+}
+
+// Measure if two inputs route to the same experts
+// Returns fraction of overlap (0.0 = disjoint, 1.0 = identical)
+@pure
+fn molora_expert_overlap(model: MoLoraModel, x1, x2, dim) {
+    let logits1 = molora_router_logits(model.router, x1, dim)
+    let logits2 = molora_router_logits(model.router, x2, dim)
+    let picks1 = mol_topk_indices(logits1, model.n_experts, model.top_k)
+    let picks2 = mol_topk_indices(logits2, model.n_experts, model.top_k)
+
+    let mut overlap = 0
+    for i in 0..model.top_k {
+        for j in 0..model.top_k {
+            if picks1[i] == picks2[j] { overlap = overlap + 1 }
+        }
+    }
+    return to_float(overlap) / to_float(model.top_k)
+}

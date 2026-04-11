@@ -1,0 +1,734 @@
+// ═══════════════════════════════════════════════════════════════
+//  test_molora.hexa — MoLoRA (Mixture of LoRA Experts) tests
+//
+//  Validates:
+//    #1   mol_zeros1 / mol_zeros2 helpers
+//    #2   mol_kaiming shape + deterministic
+//    #3   mol_matvec correctness
+//    #4   molora_create_expert shape
+//    #5   expert B init = zeros (LoRA convention)
+//    #6   expert_forward with B=0 => zero delta
+//    #7   expert_forward output dimension
+//    #8   molora_create_router shape
+//    #9   molora_router_logits output dimension
+//    #10  mol_topk_indices correctness
+//    #11  mol_softmax_subset sums to 1
+//    #12  molora_route returns valid indices + weights
+//    #13  molora_create model structure
+//    #14  molora_forward output dimension
+//    #15  molora_forward deterministic (same input => same output)
+//    #16  molora_forward non-zero output
+//    #17  molora_load_balance_loss non-negative
+//    #18  molora_expert_utilization counts sum to n_inputs * top_k
+//    #19  molora_train_step returns loss > 0
+//    #20  molora_train_step loss decreases over steps
+//    #21  molora_freeze_base sets frozen flag
+//    #22  molora_merge_experts shape
+//    #23  molora_add_expert increases n_experts
+//    #24  molora_remove_expert decreases n_experts
+//    #25  molora_param_count formula
+//    #26  molora_expert_overlap self = 1.0
+//    #27  molora_expert_overlap range [0, 1]
+//    #28  multi-step training convergence
+//    #29  frozen base weights unchanged after train step
+//    #30  different inputs can route to different experts
+//
+//  Rules: pure .hexa, no Rust, HX3 pitfalls honored.
+//  Run: ./hexa self/test_molora.hexa
+// ═══════════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ═══════════════════════════════════════════════════════════════
+//  Inline core (mirror of self/ml/molora.hexa)
+// ═══════════════════════════════════════════════════════════════
+
+fn t_zeros1(n) {
+    let mut v = []
+    for i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn t_zeros2(rows, cols) {
+    let mut r = []
+    for i in 0..rows { r = r + [t_zeros1(cols)] }
+    return r
+}
+
+fn t_kaiming(rows, cols, seed) {
+    let mut s = seed
+    let scale = 1.0 / sqrt(to_float(cols))
+    let mut r = []
+    for i in 0..rows {
+        let mut row = []
+        for j in 0..cols {
+            s = (s * 1103515245 + 12345) % 2147483647
+            let v = (to_float(s % 2000) - 1000.0) / 1000.0 * scale
+            row = row + [v]
+        }
+        r = r + [row]
+    }
+    return r
+}
+
+fn t_matvec(w, x, m, n) {
+    let mut y = []
+    for i in 0..m {
+        let mut s = 0.0
+        for j in 0..n { s = s + w[i][j] * x[j] }
+        y = y + [s]
+    }
+    return y
+}
+
+// ── Structs ─────────────────────────────────────────────────
+
+struct TExpert {
+    name: string,
+    a: array,
+    b: array,
+    dim: int,
+    rank: int
+}
+
+struct TRouter {
+    w: array,
+    n_experts: int,
+    dim: int
+}
+
+struct TModel {
+    experts: array,
+    router: TRouter,
+    base_w: array,
+    dim: int,
+    rank: int,
+    n_experts: int,
+    top_k: int,
+    frozen: int
+}
+
+// ── Expert ──────────────────────────────────────────────────
+
+fn t_create_expert(name, dim, rank, seed) {
+    let a = t_kaiming(rank, dim, seed)
+    let b = t_zeros2(dim, rank)
+    return TExpert { name: name, a: a, b: b, dim: dim, rank: rank }
+}
+
+fn t_expert_forward(expert: TExpert, x, dim) {
+    let ax = t_matvec(expert.a, x, expert.rank, dim)
+    let bax = t_matvec(expert.b, ax, dim, expert.rank)
+    return bax
+}
+
+// ── Router ──────────────────────────────────────────────────
+
+fn t_create_router(n_experts, dim, seed) {
+    let w = t_kaiming(n_experts, dim, seed)
+    return TRouter { w: w, n_experts: n_experts, dim: dim }
+}
+
+fn t_router_logits(router: TRouter, x, dim) {
+    return t_matvec(router.w, x, router.n_experts, dim)
+}
+
+fn t_topk_indices(scores, n, k) {
+    let mut used = []
+    for i in 0..n { used = used + [false] }
+    let mut picks = []
+    for r in 0..k {
+        let mut best = 0
+        let mut best_v = -1.0e30
+        let mut found = false
+        for e in 0..n {
+            if !used[e] {
+                if !found {
+                    best = e
+                    best_v = scores[e]
+                    found = true
+                } else {
+                    if scores[e] > best_v {
+                        best_v = scores[e]
+                        best = e
+                    }
+                }
+            }
+        }
+        let mut used2 = []
+        for i in 0..n {
+            if i == best { used2 = used2 + [true] } else { used2 = used2 + [used[i]] }
+        }
+        used = used2
+        picks = picks + [best]
+    }
+    return picks
+}
+
+fn t_softmax_subset(scores, picks, k) {
+    let mut m = scores[picks[0]]
+    for r in 1..k {
+        if scores[picks[r]] > m { m = scores[picks[r]] }
+    }
+    let mut exps = []
+    let mut z = 0.0
+    for r in 0..k {
+        let v = exp(scores[picks[r]] - m)
+        exps = exps + [v]
+        z = z + v
+    }
+    let mut out = []
+    for r in 0..k { out = out + [exps[r] / z] }
+    return out
+}
+
+fn t_softmax_all(scores, n) {
+    let mut m = scores[0]
+    for i in 1..n { if scores[i] > m { m = scores[i] } }
+    let mut exps = []
+    let mut z = 0.0
+    for i in 0..n {
+        let v = exp(scores[i] - m)
+        exps = exps + [v]
+        z = z + v
+    }
+    let mut out = []
+    for i in 0..n { out = out + [exps[i] / z] }
+    return out
+}
+
+fn t_route(router: TRouter, x, dim, top_k) {
+    let logits = t_router_logits(router, x, dim)
+    let picks = t_topk_indices(logits, router.n_experts, top_k)
+    let weights = t_softmax_subset(logits, picks, top_k)
+    return [picks, weights]
+}
+
+// ── MoLoRA Model ────────────────────────────────────────────
+
+fn t_create_model(dim, rank, n_experts, top_k) {
+    let mut experts = []
+    for i in 0..n_experts {
+        let name = "expert_" + to_string(i)
+        let seed = 42 + i * 137
+        let e = t_create_expert(name, dim, rank, seed)
+        experts = experts + [e]
+    }
+    let router = t_create_router(n_experts, dim, 7777)
+    let base_w = t_kaiming(dim, dim, 9999)
+    return TModel {
+        experts: experts, router: router, base_w: base_w,
+        dim: dim, rank: rank, n_experts: n_experts, top_k: top_k, frozen: 0
+    }
+}
+
+fn t_forward(model: TModel, x, dim) {
+    let base_out = t_matvec(model.base_w, x, dim, dim)
+
+    let route_result = t_route(model.router, x, dim, model.top_k)
+    let picks = route_result[0]
+    let weights = route_result[1]
+
+    let mut delta = t_zeros1(dim)
+    for k in 0..model.top_k {
+        let idx = picks[k]
+        let w_k = weights[k]
+        let expert = model.experts[idx]
+        let expert_out = t_expert_forward(expert, x, dim)
+        for d in 0..dim {
+            delta[d] = delta[d] + w_k * expert_out[d]
+        }
+    }
+
+    let mut y = []
+    for d in 0..dim { y = y + [base_out[d] + delta[d]] }
+    return y
+}
+
+fn t_mse_loss(y, target, dim) {
+    let mut s = 0.0
+    for i in 0..dim {
+        let d = y[i] - target[i]
+        s = s + d * d
+    }
+    return s / to_float(dim)
+}
+
+fn t_mse_grad(y, target, dim) {
+    let mut g = []
+    let inv = 2.0 / to_float(dim)
+    for i in 0..dim { g = g + [(y[i] - target[i]) * inv] }
+    return g
+}
+
+fn t_train_step(model: TModel, x, target, dim, lr) {
+    let y = t_forward(model, x, dim)
+    let loss = t_mse_loss(y, target, dim)
+    let dy = t_mse_grad(y, target, dim)
+
+    let route_result = t_route(model.router, x, dim, model.top_k)
+    let picks = route_result[0]
+    let weights = route_result[1]
+
+    let mut new_experts = []
+    for e in 0..model.n_experts {
+        let expert = model.experts[e]
+        let mut is_active = false
+        let mut w_e = 0.0
+        for k in 0..model.top_k {
+            if picks[k] == e {
+                is_active = true
+                w_e = weights[k]
+            }
+        }
+        if is_active {
+            let ax = t_matvec(expert.a, x, model.rank, dim)
+            let mut new_b = t_zeros2(dim, model.rank)
+            for i in 0..dim {
+                for j in 0..model.rank {
+                    new_b[i][j] = expert.b[i][j] - lr * w_e * dy[i] * ax[j]
+                }
+            }
+            let mut bdy = t_zeros1(model.rank)
+            for j in 0..model.rank {
+                let mut s = 0.0
+                for i in 0..dim { s = s + expert.b[i][j] * dy[i] }
+                bdy[j] = s
+            }
+            let mut new_a = t_zeros2(model.rank, dim)
+            for i in 0..model.rank {
+                for j in 0..dim {
+                    new_a[i][j] = expert.a[i][j] - lr * w_e * bdy[i] * x[j]
+                }
+            }
+            let updated = TExpert {
+                name: expert.name, a: new_a, b: new_b,
+                dim: dim, rank: model.rank
+            }
+            new_experts = new_experts + [updated]
+        } else {
+            new_experts = new_experts + [expert]
+        }
+    }
+
+    let mut new_rw = t_zeros2(model.n_experts, dim)
+    for i in 0..model.n_experts {
+        for j in 0..dim { new_rw[i][j] = model.router.w[i][j] }
+    }
+    for k in 0..model.top_k {
+        let idx = picks[k]
+        let expert_out = t_expert_forward(model.experts[idx], x, dim)
+        let mut contrib = 0.0
+        for d in 0..dim { contrib = contrib + dy[d] * expert_out[d] }
+        for j in 0..dim {
+            new_rw[idx][j] = new_rw[idx][j] - lr * contrib * x[j]
+        }
+    }
+    let new_router = TRouter { w: new_rw, n_experts: model.n_experts, dim: dim }
+
+    let mut new_base = model.base_w
+    if model.frozen == 0 {
+        new_base = t_zeros2(dim, dim)
+        for i in 0..dim {
+            for j in 0..dim {
+                new_base[i][j] = model.base_w[i][j] - lr * dy[i] * x[j]
+            }
+        }
+    }
+
+    let new_model = TModel {
+        experts: new_experts, router: new_router, base_w: new_base,
+        dim: dim, rank: model.rank, n_experts: model.n_experts,
+        top_k: model.top_k, frozen: model.frozen
+    }
+    return [new_model, loss]
+}
+
+fn t_freeze_base(model: TModel) {
+    return TModel {
+        experts: model.experts, router: model.router, base_w: model.base_w,
+        dim: model.dim, rank: model.rank, n_experts: model.n_experts,
+        top_k: model.top_k, frozen: 1
+    }
+}
+
+fn t_merge_experts(model: TModel, dim) {
+    let mut merged = t_zeros2(dim, dim)
+    for i in 0..dim {
+        for j in 0..dim { merged[i][j] = model.base_w[i][j] }
+    }
+    let inv_n = 1.0 / to_float(model.n_experts)
+    for e in 0..model.n_experts {
+        let expert = model.experts[e]
+        for i in 0..dim {
+            for j in 0..dim {
+                let mut s = 0.0
+                for r in 0..model.rank { s = s + expert.b[i][r] * expert.a[r][j] }
+                merged[i][j] = merged[i][j] + inv_n * s
+            }
+        }
+    }
+    return merged
+}
+
+fn t_add_expert(model: TModel, name, dim, rank, seed) {
+    let new_expert = t_create_expert(name, dim, rank, seed)
+    let new_experts = model.experts + [new_expert]
+    let new_n = model.n_experts + 1
+
+    let mut new_rw = []
+    for i in 0..model.n_experts { new_rw = new_rw + [model.router.w[i]] }
+    let new_row_mat = t_kaiming(1, dim, seed + 31337)
+    new_rw = new_rw + [new_row_mat[0]]
+    let new_router = TRouter { w: new_rw, n_experts: new_n, dim: dim }
+
+    return TModel {
+        experts: new_experts, router: new_router, base_w: model.base_w,
+        dim: dim, rank: rank, n_experts: new_n,
+        top_k: model.top_k, frozen: model.frozen
+    }
+}
+
+fn t_remove_expert(model: TModel, expert_idx) {
+    let mut new_experts = []
+    let mut new_rw = []
+    for i in 0..model.n_experts {
+        if i != expert_idx {
+            new_experts = new_experts + [model.experts[i]]
+            new_rw = new_rw + [model.router.w[i]]
+        }
+    }
+    let new_n = model.n_experts - 1
+    let new_router = TRouter { w: new_rw, n_experts: new_n, dim: model.dim }
+    return TModel {
+        experts: new_experts, router: new_router, base_w: model.base_w,
+        dim: model.dim, rank: model.rank, n_experts: new_n,
+        top_k: model.top_k, frozen: model.frozen
+    }
+}
+
+fn t_param_count(model: TModel) {
+    let expert_params = model.n_experts * 2 * model.rank * model.dim
+    let router_params = model.n_experts * model.dim
+    return expert_params + router_params
+}
+
+fn t_expert_overlap(model: TModel, x1, x2, dim) {
+    let logits1 = t_router_logits(model.router, x1, dim)
+    let logits2 = t_router_logits(model.router, x2, dim)
+    let picks1 = t_topk_indices(logits1, model.n_experts, model.top_k)
+    let picks2 = t_topk_indices(logits2, model.n_experts, model.top_k)
+
+    let mut overlap = 0
+    for i in 0..model.top_k {
+        for j in 0..model.top_k {
+            if picks1[i] == picks2[j] { overlap = overlap + 1 }
+        }
+    }
+    return to_float(overlap) / to_float(model.top_k)
+}
+
+fn t_load_balance_loss(model: TModel, inputs, n_inputs, dim) {
+    let mut f_counts = t_zeros1(model.n_experts)
+    let mut p_sum = t_zeros1(model.n_experts)
+
+    for t in 0..n_inputs {
+        let x = inputs[t]
+        let logits = t_router_logits(model.router, x, dim)
+        let probs = t_softmax_all(logits, model.n_experts)
+        let picks = t_topk_indices(logits, model.n_experts, model.top_k)
+
+        for e in 0..model.n_experts {
+            p_sum[e] = p_sum[e] + probs[e]
+        }
+        for k in 0..model.top_k {
+            let idx = picks[k]
+            f_counts[idx] = f_counts[idx] + 1.0
+        }
+    }
+
+    let n_f = to_float(n_inputs)
+    let mut loss = 0.0
+    for e in 0..model.n_experts {
+        let f_e = f_counts[e] / n_f
+        let p_e = p_sum[e] / n_f
+        loss = loss + f_e * p_e
+    }
+    return to_float(model.n_experts) * loss
+}
+
+fn t_expert_utilization(model: TModel, inputs, n_inputs, dim) {
+    let mut counts = t_zeros1(model.n_experts)
+    for t in 0..n_inputs {
+        let x = inputs[t]
+        let logits = t_router_logits(model.router, x, dim)
+        let picks = t_topk_indices(logits, model.n_experts, model.top_k)
+        for k in 0..model.top_k {
+            let idx = picks[k]
+            counts[idx] = counts[idx] + 1.0
+        }
+    }
+    return counts
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Test data
+// ═══════════════════════════════════════════════════════════════
+
+let DIM = 4
+let RANK = 2
+let N_EXPERTS = 4
+let TOP_K = 2
+
+let x1 = [1.0, 0.5, -0.3, 0.8]
+let x2 = [-0.5, 1.0, 0.2, -0.7]
+let x3 = [0.3, -0.8, 0.6, 0.1]
+
+let target1 = [0.5, -0.3, 0.1, 0.7]
+
+// ═══════════════════════════════════════════════════════════════
+//  Tests
+// ═══════════════════════════════════════════════════════════════
+
+// --- #1 zeros helpers ---
+let z1 = t_zeros1(4)
+let z2 = t_zeros2(3, 4)
+check("#1a zeros1 len=4", len(z1) == 4)
+check("#1b zeros1[0]=0", approx(z1[0], 0.0, 1.0e-9))
+check("#1c zeros2 rows=3", len(z2) == 3)
+check("#1d zeros2 cols=4", len(z2[0]) == 4)
+check("#1e zeros2[1][2]=0", approx(z2[1][2], 0.0, 1.0e-9))
+
+// --- #2 kaiming shape + deterministic ---
+let k1 = t_kaiming(3, 4, 42)
+let k2 = t_kaiming(3, 4, 42)
+check("#2a kaiming rows=3", len(k1) == 3)
+check("#2b kaiming cols=4", len(k1[0]) == 4)
+let mut k_eq = true
+for i in 0..3 {
+    for j in 0..4 {
+        if !approx(k1[i][j], k2[i][j], 1.0e-9) { k_eq = false }
+    }
+}
+check("#2c kaiming deterministic", k_eq)
+
+// --- #3 matvec correctness ---
+// [1 2; 3 4] @ [1; 1] = [3; 7]
+let mv_w = [[1.0, 2.0], [3.0, 4.0]]
+let mv_x = [1.0, 1.0]
+let mv_y = t_matvec(mv_w, mv_x, 2, 2)
+check("#3a matvec[0]=3", approx(mv_y[0], 3.0, 1.0e-9))
+check("#3b matvec[1]=7", approx(mv_y[1], 7.0, 1.0e-9))
+
+// --- #4 create_expert shape ---
+let e1 = t_create_expert("test", DIM, RANK, 42)
+check("#4a expert name", e1.name == "test")
+check("#4b expert A rows=rank", len(e1.a) == RANK)
+check("#4c expert A cols=dim", len(e1.a[0]) == DIM)
+check("#4d expert B rows=dim", len(e1.b) == DIM)
+check("#4e expert B cols=rank", len(e1.b[0]) == RANK)
+
+// --- #5 expert B init = zeros ---
+let mut b_zero = true
+for i in 0..DIM {
+    for j in 0..RANK {
+        if !approx(e1.b[i][j], 0.0, 1.0e-9) { b_zero = false }
+    }
+}
+check("#5 expert B init = zeros", b_zero)
+
+// --- #6 expert_forward with B=0 => zero delta ---
+let ef_out = t_expert_forward(e1, x1, DIM)
+let mut ef_zero = true
+for d in 0..DIM {
+    if !approx(ef_out[d], 0.0, 1.0e-9) { ef_zero = false }
+}
+check("#6 expert_forward B=0 => zero delta", ef_zero)
+
+// --- #7 expert_forward output dimension ---
+check("#7 expert_forward output dim", len(ef_out) == DIM)
+
+// --- #8 create_router shape ---
+let r1 = t_create_router(N_EXPERTS, DIM, 123)
+check("#8a router W rows = n_experts", len(r1.w) == N_EXPERTS)
+check("#8b router W cols = dim", len(r1.w[0]) == DIM)
+check("#8c router n_experts", r1.n_experts == N_EXPERTS)
+
+// --- #9 router_logits output dimension ---
+let logits1 = t_router_logits(r1, x1, DIM)
+check("#9 router logits len = n_experts", len(logits1) == N_EXPERTS)
+
+// --- #10 topk_indices correctness ---
+let scores10 = [0.1, 0.9, 0.3, 0.7]
+let picks10 = t_topk_indices(scores10, 4, 2)
+check("#10a top-1 index = 1 (highest)", picks10[0] == 1)
+check("#10b top-2 index = 3 (second)", picks10[1] == 3)
+
+// --- #11 softmax_subset sums to 1 ---
+let sw11 = t_softmax_subset(scores10, picks10, 2)
+let sw_sum = sw11[0] + sw11[1]
+check("#11 softmax subset sum ~ 1.0", approx(sw_sum, 1.0, 1.0e-6))
+
+// --- #12 route returns valid indices + weights ---
+let route12 = t_route(r1, x1, DIM, TOP_K)
+let picks12 = route12[0]
+let weights12 = route12[1]
+check("#12a route returns top_k picks", len(picks12) == TOP_K)
+check("#12b route returns top_k weights", len(weights12) == TOP_K)
+let mut picks_valid = true
+for k in 0..TOP_K {
+    if picks12[k] < 0 { picks_valid = false }
+    if picks12[k] >= N_EXPERTS { picks_valid = false }
+}
+check("#12c route picks in [0, n_experts)", picks_valid)
+let w_sum12 = weights12[0] + weights12[1]
+check("#12d route weights sum ~ 1.0", approx(w_sum12, 1.0, 1.0e-6))
+
+// --- #13 create model structure ---
+let model = t_create_model(DIM, RANK, N_EXPERTS, TOP_K)
+check("#13a model experts count", len(model.experts) == N_EXPERTS)
+check("#13b model dim", model.dim == DIM)
+check("#13c model rank", model.rank == RANK)
+check("#13d model n_experts", model.n_experts == N_EXPERTS)
+check("#13e model top_k", model.top_k == TOP_K)
+check("#13f model not frozen", model.frozen == 0)
+
+// --- #14 forward output dimension ---
+let y14 = t_forward(model, x1, DIM)
+check("#14 forward output dim", len(y14) == DIM)
+
+// --- #15 forward deterministic ---
+let y15a = t_forward(model, x1, DIM)
+let y15b = t_forward(model, x1, DIM)
+let mut det_ok = true
+for d in 0..DIM {
+    if !approx(y15a[d], y15b[d], 1.0e-9) { det_ok = false }
+}
+check("#15 forward deterministic", det_ok)
+
+// --- #16 forward non-zero output ---
+let mut nz = false
+for d in 0..DIM {
+    if fabs(y14[d]) > 1.0e-9 { nz = true }
+}
+check("#16 forward non-zero output", nz)
+
+// --- #17 load_balance_loss non-negative ---
+let inputs17 = [x1, x2, x3]
+let lb_loss = t_load_balance_loss(model, inputs17, 3, DIM)
+check("#17 load_balance_loss >= 0", lb_loss >= 0.0)
+
+// --- #18 expert_utilization counts sum = n_inputs * top_k ---
+let util18 = t_expert_utilization(model, inputs17, 3, DIM)
+let mut util_sum = 0.0
+for e in 0..N_EXPERTS { util_sum = util_sum + util18[e] }
+check("#18 utilization sum = n_inputs * top_k", approx(util_sum, to_float(3 * TOP_K), 1.0e-9))
+
+// --- #19 train_step returns loss > 0 ---
+let res19 = t_train_step(model, x1, target1, DIM, 0.01)
+let model19 = res19[0]
+let loss19 = res19[1]
+check("#19 train_step loss > 0", loss19 > 0.0)
+
+// --- #20 train_step loss decreases ---
+let y20_before = t_forward(model, x1, DIM)
+let loss20_before = t_mse_loss(y20_before, target1, DIM)
+let y20_after = t_forward(model19, x1, DIM)
+let loss20_after = t_mse_loss(y20_after, target1, DIM)
+check("#20 one step reduces loss", loss20_after < loss20_before)
+
+// --- #21 freeze_base sets frozen flag ---
+let frozen_model = t_freeze_base(model)
+check("#21a frozen flag = 1", frozen_model.frozen == 1)
+check("#21b other fields preserved", frozen_model.dim == DIM)
+
+// --- #22 merge_experts shape ---
+let merged = t_merge_experts(model, DIM)
+check("#22a merged rows = dim", len(merged) == DIM)
+check("#22b merged cols = dim", len(merged[0]) == DIM)
+
+// --- #23 add_expert increases n_experts ---
+let model_added = t_add_expert(model, "new_expert", DIM, RANK, 5555)
+check("#23a n_experts increased", model_added.n_experts == N_EXPERTS + 1)
+check("#23b experts array grew", len(model_added.experts) == N_EXPERTS + 1)
+check("#23c router rows grew", len(model_added.router.w) == N_EXPERTS + 1)
+
+// --- #24 remove_expert decreases n_experts ---
+let model_removed = t_remove_expert(model, 1)
+check("#24a n_experts decreased", model_removed.n_experts == N_EXPERTS - 1)
+check("#24b experts array shrunk", len(model_removed.experts) == N_EXPERTS - 1)
+check("#24c router rows shrunk", len(model_removed.router.w) == N_EXPERTS - 1)
+
+// --- #25 param_count formula ---
+// experts: 4 * 2 * 2 * 4 = 64, router: 4 * 4 = 16, total = 80
+let pc = t_param_count(model)
+check("#25 param_count = 80", pc == 80)
+
+// --- #26 expert_overlap self = 1.0 ---
+let ov_self = t_expert_overlap(model, x1, x1, DIM)
+check("#26 self-overlap = 1.0", approx(ov_self, 1.0, 1.0e-9))
+
+// --- #27 expert_overlap range [0, 1] ---
+let ov27 = t_expert_overlap(model, x1, x2, DIM)
+check("#27a overlap >= 0", ov27 >= 0.0)
+check("#27b overlap <= 1", ov27 <= 1.0 + 1.0e-9)
+
+// --- #28 multi-step training convergence ---
+let mut model28 = t_create_model(DIM, RANK, N_EXPERTS, TOP_K)
+let y28_init = t_forward(model28, x1, DIM)
+let loss28_init = t_mse_loss(y28_init, target1, DIM)
+
+let mut step28 = 0
+while step28 < 50 {
+    let res28 = t_train_step(model28, x1, target1, DIM, 0.05)
+    model28 = res28[0]
+    step28 = step28 + 1
+}
+let y28_final = t_forward(model28, x1, DIM)
+let loss28_final = t_mse_loss(y28_final, target1, DIM)
+check("#28a 50 steps reduce loss", loss28_final < loss28_init)
+check("#28b 50 steps loss < 50% init", loss28_final < 0.5 * loss28_init)
+
+// --- #29 frozen base weights unchanged after train step ---
+let frozen29 = t_freeze_base(model)
+let base_before = frozen29.base_w
+let res29 = t_train_step(frozen29, x1, target1, DIM, 0.1)
+let model29 = res29[0]
+let base_after = model29.base_w
+let mut base_unchanged = true
+for i in 0..DIM {
+    for j in 0..DIM {
+        if !approx(base_before[i][j], base_after[i][j], 1.0e-9) { base_unchanged = false }
+    }
+}
+check("#29 frozen base unchanged after step", base_unchanged)
+
+// --- #30 different inputs can route to different experts ---
+let shared_router = t_create_router(N_EXPERTS, DIM, 7777)
+let route30a = t_route(shared_router, x1, DIM, TOP_K)
+let route30b = t_route(shared_router, x2, DIM, TOP_K)
+let picks30a = route30a[0]
+let picks30b = route30b[0]
+let mut any_diff = false
+for k in 0..TOP_K {
+    if picks30a[k] != picks30b[k] { any_diff = true }
+}
+check("#30 different inputs route differently", any_diff)
+
+// ═══════════════════════════════════════════════════════════════
+println("")
+println("molora: " + to_string(pass_count) + " PASS / " + to_string(fail_count) + " FAIL")

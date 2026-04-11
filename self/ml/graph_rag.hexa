@@ -1,0 +1,698 @@
+// ===================================================================
+//  self/ml/graph_rag.hexa — GraphRAG: Knowledge-Graph Enhanced RAG
+//
+//  SSOT: shared/hexa-lang/ml-next-level.json id=190
+//
+//  Knowledge graph enhanced retrieval-augmented generation. Extracts
+//  entities and relations from documents, builds a graph, detects
+//  communities via label propagation, and uses graph structure for
+//  more accurate retrieval than vector-only search.
+//
+//  Data structure (flat arrays, no struct-literal in if blocks):
+//    graph = [nodes, edges, node_names, node_types, communities]
+//      nodes[i]       : node id (== i)
+//      edges          : [[src, dst, relation, weight], ...]
+//      node_names[i]  : string name for node i
+//      node_types[i]  : string type for node i ("entity"/"concept"/etc)
+//      communities[i] : community label for node i
+//
+//  Public API:
+//    grag_create_graph()                          -> graph
+//    grag_add_node(graph, name, node_type)        -> [graph, node_id]
+//    grag_add_edge(graph, src, dst, rel, weight)  -> graph
+//    grag_get_neighbors(graph, node_id)           -> [node_ids]
+//    grag_get_node_name(graph, node_id)           -> string
+//    grag_node_count(graph)                       -> int
+//    grag_edge_count(graph)                       -> int
+//    grag_extract_entities(text)                  -> [entity_names]
+//    grag_extract_relations(text, entities)       -> [[src, rel, dst]]
+//    grag_build_from_documents(docs)              -> graph
+//    grag_label_propagation(graph, max_iter)      -> graph (communities set)
+//    grag_get_communities(graph)                  -> [[community_id, [node_ids]]]
+//    grag_community_summary(graph, community_id)  -> string
+//    grag_local_search(graph, query_ents, depth)  -> [node_ids]
+//    grag_global_search(graph, query)             -> [node_ids]
+//    grag_score_node(graph, node_id, query_ents)  -> float
+//    grag_retrieve(graph, query, top_k)           -> [node_ids]
+//    grag_context_from_nodes(graph, node_ids)     -> string
+//    grag_precision_at_k(retrieved, relevant, k)  -> float
+//    grag_graph_density(graph)                    -> float
+//
+//  Pitfalls avoided (HX3):
+//    - No continue / ternary
+//    - if cond { } not if (cond) { }
+//    - let mut for mutables
+//    - No struct-literal inside if/while head
+//    - Uses .chars() for character-level access (s[i] returns char code)
+// ===================================================================
+
+// ── Helpers (prefixed _grag_ to avoid collision) ─────────────────
+
+fn _grag_min(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn _grag_is_upper_code(code) {
+    // 'A'=65, 'Z'=90
+    if code >= 65 {
+        if code <= 90 { return true }
+    }
+    return false
+}
+
+fn _grag_is_punct_code(code) {
+    // '.'=46, ','=44, '!'=33, '?'=63
+    if code == 46 { return true }
+    if code == 44 { return true }
+    if code == 33 { return true }
+    if code == 63 { return true }
+    return false
+}
+
+fn _grag_arr_contains_int(arr, val) {
+    let n = len(arr)
+    let mut i = 0
+    while i < n {
+        if arr[i] == val { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _grag_arr_contains_str(arr, s) {
+    let n = len(arr)
+    let mut i = 0
+    while i < n {
+        if arr[i] == s { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _grag_strip_punct(w) {
+    // Remove trailing punctuation characters from word
+    let chars = w.chars()
+    let n = len(chars)
+    // Find last non-punct position
+    let mut end = n
+    let mut k = n - 1
+    while k >= 0 {
+        if _grag_is_punct_code(to_int(chars[k])) {
+            end = k
+        } else {
+            k = 0 - 1  // break
+        }
+        k = k - 1
+    }
+    if end == n { return w }
+    if end <= 0 { return "" }
+    return w.substring(0, end)
+}
+
+// ===================================================================
+//  Graph primitives
+// ===================================================================
+
+fn grag_create_graph() {
+    // [nodes, edges, node_names, node_types, communities]
+    return [[], [], [], [], []]
+}
+
+fn grag_add_node(graph, name, node_type) {
+    let nodes = graph[0]
+    let edges = graph[1]
+    let names = graph[2]
+    let types = graph[3]
+    let comms = graph[4]
+    let node_id = len(nodes)
+    let new_nodes = nodes + [node_id]
+    let new_names = names + [name]
+    let new_types = types + [node_type]
+    let new_comms = comms + [node_id]  // initial community = self
+    let new_graph = [new_nodes, edges, new_names, new_types, new_comms]
+    return [new_graph, node_id]
+}
+
+fn grag_add_edge(graph, src, dst, relation, weight) {
+    let nodes = graph[0]
+    let edges = graph[1]
+    let names = graph[2]
+    let types = graph[3]
+    let comms = graph[4]
+    let new_edge = [src, dst, relation, weight]
+    let new_edges = edges + [new_edge]
+    return [nodes, new_edges, names, types, comms]
+}
+
+fn grag_get_neighbors(graph, node_id) {
+    let edges = graph[1]
+    let ne = len(edges)
+    let mut neighbors = []
+    let mut i = 0
+    while i < ne {
+        let e = edges[i]
+        if e[0] == node_id {
+            if _grag_arr_contains_int(neighbors, e[1]) == false {
+                neighbors = neighbors + [e[1]]
+            }
+        }
+        if e[1] == node_id {
+            if _grag_arr_contains_int(neighbors, e[0]) == false {
+                neighbors = neighbors + [e[0]]
+            }
+        }
+        i = i + 1
+    }
+    return neighbors
+}
+
+fn grag_get_node_name(graph, node_id) {
+    let names = graph[2]
+    if node_id < 0 { return "" }
+    if node_id >= len(names) { return "" }
+    return names[node_id]
+}
+
+fn grag_node_count(graph) {
+    return len(graph[0])
+}
+
+fn grag_edge_count(graph) {
+    return len(graph[1])
+}
+
+// ===================================================================
+//  Entity / relation extraction (simulated)
+// ===================================================================
+
+fn grag_extract_entities(text) {
+    // Simple extraction: split by spaces, keep words starting with
+    // an uppercase letter and length >= 2
+    let words = text.split(" ")
+    let nw = len(words)
+    let mut entities = []
+    let mut i = 0
+    while i < nw {
+        let w = words[i]
+        if len(w) >= 2 {
+            let chars = w.chars()
+            let first_code = to_int(chars[0])
+            if _grag_is_upper_code(first_code) {
+                // Strip trailing punctuation
+                let clean = _grag_strip_punct(w)
+                if len(clean) >= 2 {
+                    if _grag_arr_contains_str(entities, clean) == false {
+                        entities = entities + [clean]
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return entities
+}
+
+fn grag_extract_relations(text, entities) {
+    // Simple heuristic: for each pair of entities that co-occur
+    // in the text, extract a relation from the words between them.
+    let ne = len(entities)
+    let mut triples = []
+    let mut i = 0
+    while i < ne {
+        let mut j = i + 1
+        while j < ne {
+            let e1 = entities[i]
+            let e2 = entities[j]
+            let pos1 = text.index_of(e1)
+            let pos2 = text.index_of(e2)
+            if pos1 >= 0 {
+                if pos2 >= 0 {
+                    // Extract words between the two entities
+                    let mut start = pos1 + len(e1)
+                    let mut end = pos2
+                    if pos2 < pos1 {
+                        start = pos2 + len(e2)
+                        end = pos1
+                    }
+                    let mut relation = "related_to"
+                    if start < end {
+                        let between = text.substring(start, end).trim()
+                        if len(between) > 0 {
+                            let bwords = between.split(" ")
+                            if len(bwords) > 0 {
+                                let candidate = bwords[0].to_lower()
+                                if len(candidate) >= 2 {
+                                    relation = candidate
+                                }
+                            }
+                        }
+                    }
+                    let triple = [entities[i], relation, entities[j]]
+                    triples = triples + [triple]
+                }
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return triples
+}
+
+fn _grag_find_or_add_node(graph, name, node_type) {
+    // Return [graph, node_id] — find existing node by name or add new one
+    let names = graph[2]
+    let n = len(names)
+    let mut i = 0
+    while i < n {
+        if names[i] == name {
+            return [graph, i]
+        }
+        i = i + 1
+    }
+    return grag_add_node(graph, name, node_type)
+}
+
+fn grag_build_from_documents(docs) {
+    let ndocs = len(docs)
+    let mut graph = grag_create_graph()
+    let mut di = 0
+    while di < ndocs {
+        let doc = docs[di]
+        let entities = grag_extract_entities(doc)
+        let relations = grag_extract_relations(doc, entities)
+
+        // Add all entities as nodes
+        let ne = len(entities)
+        let mut ei = 0
+        while ei < ne {
+            let result = _grag_find_or_add_node(graph, entities[ei], "entity")
+            graph = result[0]
+            ei = ei + 1
+        }
+
+        // Add all relations as edges
+        let nr = len(relations)
+        let mut ri = 0
+        while ri < nr {
+            let triple = relations[ri]
+            let src_res = _grag_find_or_add_node(graph, triple[0], "entity")
+            graph = src_res[0]
+            let src_id = src_res[1]
+            let dst_res = _grag_find_or_add_node(graph, triple[2], "entity")
+            graph = dst_res[0]
+            let dst_id = dst_res[1]
+            graph = grag_add_edge(graph, src_id, dst_id, triple[1], 1.0)
+            ri = ri + 1
+        }
+        di = di + 1
+    }
+    return graph
+}
+
+// ===================================================================
+//  Community detection — label propagation
+// ===================================================================
+
+fn grag_label_propagation(graph, max_iter) {
+    let nodes = graph[0]
+    let n = len(nodes)
+    if n == 0 { return graph }
+
+    // Initialize: each node's community = node_id
+    let mut labels = []
+    for i in 0..n {
+        labels = labels + [i]
+    }
+
+    let mut iter = 0
+    while iter < max_iter {
+        let mut changed = false
+        let mut ni = 0
+        while ni < n {
+            let neighbors = grag_get_neighbors(graph, ni)
+            let nn = len(neighbors)
+            if nn > 0 {
+                // Count label frequencies among neighbors
+                let mut label_counts = #{}
+                let mut ki = 0
+                while ki < nn {
+                    let nb = neighbors[ki]
+                    let lb = str(labels[nb])
+                    if has_key(label_counts, lb) {
+                        label_counts[lb] = label_counts[lb] + 1
+                    } else {
+                        label_counts[lb] = 1
+                    }
+                    ki = ki + 1
+                }
+                // Find most common label
+                let mut best_label = labels[ni]
+                let mut best_count = 0
+                let mut mi = 0
+                while mi < nn {
+                    let nb = neighbors[mi]
+                    let lb = str(labels[nb])
+                    let cnt = label_counts[lb]
+                    if cnt > best_count {
+                        best_count = cnt
+                        best_label = labels[nb]
+                    }
+                    mi = mi + 1
+                }
+                if best_label != labels[ni] {
+                    labels[ni] = best_label
+                    changed = true
+                }
+            }
+            ni = ni + 1
+        }
+        if changed == false {
+            iter = max_iter  // converged, exit
+        }
+        iter = iter + 1
+    }
+
+    // Write labels back into graph communities
+    let new_graph = [graph[0], graph[1], graph[2], graph[3], labels]
+    return new_graph
+}
+
+fn grag_get_communities(graph) {
+    let comms = graph[4]
+    let n = len(comms)
+    // Collect unique community ids and their members
+    let mut comm_map = #{}
+    let mut comm_ids = []
+    let mut i = 0
+    while i < n {
+        let cid = str(comms[i])
+        if has_key(comm_map, cid) == false {
+            comm_map[cid] = []
+            comm_ids = comm_ids + [comms[i]]
+        }
+        comm_map[cid] = comm_map[cid] + [i]
+        i = i + 1
+    }
+    // Build result array
+    let mut result = []
+    let nc = len(comm_ids)
+    let mut ci = 0
+    while ci < nc {
+        let cid = comm_ids[ci]
+        let members = comm_map[str(cid)]
+        result = result + [[cid, members]]
+        ci = ci + 1
+    }
+    return result
+}
+
+fn grag_community_summary(graph, community_id) {
+    let comms = graph[4]
+    let names = graph[2]
+    let n = len(comms)
+    let mut parts = []
+    let mut i = 0
+    while i < n {
+        if comms[i] == community_id {
+            parts = parts + [names[i]]
+        }
+        i = i + 1
+    }
+    if len(parts) == 0 { return "" }
+    // Join with ", "
+    let mut out = parts[0]
+    let np = len(parts)
+    let mut pi = 1
+    while pi < np {
+        out = out + ", " + parts[pi]
+        pi = pi + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  Graph-enhanced retrieval
+// ===================================================================
+
+fn grag_local_search(graph, query_entities, depth) {
+    // BFS from nodes matching query_entities, up to given depth
+    let names = graph[2]
+    let n = len(names)
+
+    // Find starting node ids by matching entity names
+    let mut frontier = []
+    let mut visited = []
+    let nq = len(query_entities)
+    let mut qi = 0
+    while qi < nq {
+        let qe_lower = query_entities[qi].to_lower()
+        let mut ni = 0
+        while ni < n {
+            if names[ni].to_lower() == qe_lower {
+                if _grag_arr_contains_int(frontier, ni) == false {
+                    frontier = frontier + [ni]
+                    visited = visited + [ni]
+                }
+            }
+            ni = ni + 1
+        }
+        qi = qi + 1
+    }
+
+    // BFS for `depth` steps
+    let mut d = 0
+    while d < depth {
+        let mut next_frontier = []
+        let nf = len(frontier)
+        let mut fi = 0
+        while fi < nf {
+            let neighbors = grag_get_neighbors(graph, frontier[fi])
+            let nn = len(neighbors)
+            let mut ni = 0
+            while ni < nn {
+                let nb = neighbors[ni]
+                if _grag_arr_contains_int(visited, nb) == false {
+                    visited = visited + [nb]
+                    next_frontier = next_frontier + [nb]
+                }
+                ni = ni + 1
+            }
+            fi = fi + 1
+        }
+        frontier = next_frontier
+        d = d + 1
+    }
+    return visited
+}
+
+fn grag_global_search(graph, query) {
+    // Search across all community summaries, return nodes in
+    // communities whose summary contains any query word
+    let communities = grag_get_communities(graph)
+    let query_words = query.to_lower().split(" ")
+    let nc = len(communities)
+    let mut result_nodes = []
+    let mut ci = 0
+    while ci < nc {
+        let comm = communities[ci]
+        let comm_id = comm[0]
+        let members = comm[1]
+        let summary = grag_community_summary(graph, comm_id).to_lower()
+        // Check if any query word appears in summary
+        let nqw = len(query_words)
+        let mut found = false
+        let mut wi = 0
+        while wi < nqw {
+            if summary.contains(query_words[wi]) {
+                found = true
+            }
+            wi = wi + 1
+        }
+        if found {
+            let nm = len(members)
+            let mut mi = 0
+            while mi < nm {
+                if _grag_arr_contains_int(result_nodes, members[mi]) == false {
+                    result_nodes = result_nodes + [members[mi]]
+                }
+                mi = mi + 1
+            }
+        }
+        ci = ci + 1
+    }
+    return result_nodes
+}
+
+fn grag_score_node(graph, node_id, query_entities) {
+    // Relevance score: direct name match + neighbor bonus
+    let name = grag_get_node_name(graph, node_id).to_lower()
+    let nq = len(query_entities)
+    let mut score = 0.0
+
+    // Direct match: +1.0 per matching query entity
+    let mut qi = 0
+    while qi < nq {
+        let qe = query_entities[qi].to_lower()
+        if name.contains(qe) {
+            score = score + 1.0
+        }
+        qi = qi + 1
+    }
+
+    // Neighbor bonus: +0.3 per neighbor that matches a query entity
+    let neighbors = grag_get_neighbors(graph, node_id)
+    let nn = len(neighbors)
+    let mut ni = 0
+    while ni < nn {
+        let nb_name = grag_get_node_name(graph, neighbors[ni]).to_lower()
+        let mut qi2 = 0
+        while qi2 < nq {
+            let qe2 = query_entities[qi2].to_lower()
+            if nb_name.contains(qe2) {
+                score = score + 0.3
+            }
+            qi2 = qi2 + 1
+        }
+        ni = ni + 1
+    }
+
+    // Edge count bonus: more connections = more important
+    let edge_bonus = to_float(nn) * 0.1
+    score = score + edge_bonus
+
+    return score
+}
+
+fn grag_retrieve(graph, query, top_k) {
+    // Top-k nodes by relevance score
+    let query_entities = grag_extract_entities(query)
+    // Also include lowercase query words as fallback
+    let query_words = query.split(" ")
+    let mut all_query = []
+    let nqe = len(query_entities)
+    let mut i = 0
+    while i < nqe {
+        all_query = all_query + [query_entities[i]]
+        i = i + 1
+    }
+    let nqw = len(query_words)
+    i = 0
+    while i < nqw {
+        if _grag_arr_contains_str(all_query, query_words[i]) == false {
+            all_query = all_query + [query_words[i]]
+        }
+        i = i + 1
+    }
+
+    let n = grag_node_count(graph)
+    // Compute scores for all nodes
+    let mut scores = []
+    i = 0
+    while i < n {
+        let sc = grag_score_node(graph, i, all_query)
+        scores = scores + [sc]
+        i = i + 1
+    }
+
+    // Selection sort top-k
+    let k = _grag_min(top_k, n)
+    let mut result = []
+    let mut selected = []
+    let mut ki = 0
+    while ki < k {
+        let mut best_idx = 0 - 1
+        let mut best_score = 0.0 - 1.0
+        let mut si = 0
+        while si < n {
+            if _grag_arr_contains_int(selected, si) == false {
+                if scores[si] > best_score {
+                    best_score = scores[si]
+                    best_idx = si
+                }
+            }
+            si = si + 1
+        }
+        if best_idx >= 0 {
+            result = result + [best_idx]
+            selected = selected + [best_idx]
+        }
+        ki = ki + 1
+    }
+    return result
+}
+
+fn grag_context_from_nodes(graph, node_ids) {
+    // Build context string from nodes and their relations
+    let edges = graph[1]
+    let ne = len(edges)
+    let nn = len(node_ids)
+
+    // Node descriptions
+    let mut parts = []
+    let mut i = 0
+    while i < nn {
+        let nid = node_ids[i]
+        let name = grag_get_node_name(graph, nid)
+        let ntype = graph[3][nid]
+        parts = parts + ["[" + name + " (" + ntype + ")]"]
+        i = i + 1
+    }
+
+    // Relevant edges (both endpoints in node_ids)
+    i = 0
+    while i < ne {
+        let e = edges[i]
+        let src = e[0]
+        let dst = e[1]
+        let rel = e[2]
+        let src_in = _grag_arr_contains_int(node_ids, src)
+        let dst_in = _grag_arr_contains_int(node_ids, dst)
+        if src_in {
+            if dst_in {
+                let src_name = grag_get_node_name(graph, src)
+                let dst_name = grag_get_node_name(graph, dst)
+                parts = parts + [src_name + " -[" + rel + "]-> " + dst_name]
+            }
+        }
+        i = i + 1
+    }
+
+    // Join with newline
+    if len(parts) == 0 { return "" }
+    let mut out = parts[0]
+    let np = len(parts)
+    let mut pi = 1
+    while pi < np {
+        out = out + "\n" + parts[pi]
+        pi = pi + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  Evaluation metrics
+// ===================================================================
+
+fn grag_precision_at_k(retrieved, relevant, k) {
+    let nr = len(retrieved)
+    let eval_k = _grag_min(k, nr)
+    if eval_k <= 0 { return 0.0 }
+    let mut hits = 0
+    let mut i = 0
+    while i < eval_k {
+        if _grag_arr_contains_int(relevant, retrieved[i]) {
+            hits = hits + 1
+        }
+        i = i + 1
+    }
+    return to_float(hits) / to_float(eval_k)
+}
+
+fn grag_graph_density(graph) {
+    let n = grag_node_count(graph)
+    let e = grag_edge_count(graph)
+    if n <= 1 { return 0.0 }
+    let max_edges = n * (n - 1)
+    return to_float(e) / to_float(max_edges)
+}

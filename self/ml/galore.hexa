@@ -1,0 +1,625 @@
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/galore.hexa — GaLore: Gradient Low-Rank Projection
+//
+//  Ref: Zhao et al. 2024, "GaLore: Memory-Efficient LLM Training
+//       by Gradient Low-Rank Projection"
+//
+//  Core idea — instead of maintaining full-rank Adam states (m, v)
+//  for each parameter matrix W [rows x cols], project the gradient
+//  G into a low-rank subspace via truncated SVD:
+//
+//    P = top-r left singular vectors of G    [rows x rank]
+//    G_low = P^T @ G                         [rank x cols]
+//
+//  Run Adam on G_low with compact states:
+//    m, v are [rank x cols]  instead of [rows x cols]
+//
+//  Then project back:
+//    update = P @ adam_update(G_low)          [rows x cols]
+//
+//  Memory savings:
+//    Full Adam:   2 * rows * cols  (for m and v)
+//    GaLore:      2 * rank * (rows + cols) + rows * rank  (projector)
+//    Ratio:       ~(rank / rows) when rank << rows
+//
+//  Periodically re-compute SVD projector (every T steps) to track
+//  the changing gradient subspace during training.
+//
+//  Algorithm:
+//    1. Every T steps: P = SVD_truncated(G, rank)
+//    2. G_low = P^T @ G             [rank x cols]
+//    3. m = beta1 * m + (1-beta1) * G_low
+//    4. v = beta2 * v + (1-beta2) * G_low^2
+//    5. m_hat = m / (1 - beta1^step)
+//    6. v_hat = v / (1 - beta2^step)
+//    7. update_low = m_hat / (sqrt(v_hat) + eps)
+//    8. update = P @ update_low     [rows x cols]
+//
+//  State layout (single flat array<float> — no mixed types):
+//    [rows, cols, rank, step, proj[0..R*K], m[0..K*C], v[0..K*C]]
+//    header = 4 floats,  proj_off = 4,  m_off = 4 + R*K,  v_off = 4 + R*K + K*C
+//
+//  Public API:
+//    galore_svd_power(matrix, rows, cols, rank, n_iter)
+//    galore_project(gradient, projector, rows, cols, rank)
+//    galore_project_back(low_rank_grad, projector, rows, cols, rank)
+//    galore_create_state(rows, cols, rank)
+//    galore_update_projector(state, gradient, n_power_iter)
+//    galore_adam_step(state, gradient, lr, beta1, beta2, eps)
+//    galore_should_reproject(state, interval)
+//    galore_train_step(params, grads, states, lr, beta1, beta2, eps, rank, reproject_interval)
+//    galore_memory_savings(rows, cols, rank)
+//    galore_create_optimizer(param_shapes, rank)
+//
+//  AI-NATIVE:
+//    @pure     — SVD, projection, math kernels
+//    @hot      — adam step inner loop
+//    @memoize  — memory savings ratio (constant per shape)
+//
+//  L0: src/*.rs untouched. Pure .hexa.
+// ═══════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 1: Core math helpers
+// ═══════════════════════════════════════════════════════════════
+
+fn gal_zeros1(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn gal_zeros2(rows, cols) {
+    let mut r = []
+    for _i in 0..rows { r = r + [gal_zeros1(cols)] }
+    return r
+}
+
+fn gal_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn gal_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 { g = (g + x / g) / 2.0 }
+    return g
+}
+
+// ── deterministic LCG init ──────────────────────────────────
+fn gal_rand_matrix(rows, cols, seed) {
+    let mut s = seed
+    let scale = 1.0 / gal_sqrt(to_float(cols))
+    let mut r = []
+    for _i in 0..rows {
+        let mut row = []
+        for _j in 0..cols {
+            s = (s * 1103515245 + 12345) % 2147483647
+            let v = (to_float(s % 2000) - 1000.0) / 1000.0 * scale
+            row = row + [v]
+        }
+        r = r + [row]
+    }
+    return r
+}
+
+// ── matmul: C[m,n] = A[m,k] @ B[k,n] ──────────────────────
+@pure
+fn gal_matmul(a, b, m, k, n) {
+    let mut c = []
+    for i in 0..m {
+        let mut row = []
+        for j in 0..n {
+            let mut s = 0.0
+            for p in 0..k { s = s + a[i][p] * b[p][j] }
+            row = row + [s]
+        }
+        c = c + [row]
+    }
+    return c
+}
+
+// ── transpose: B[j,i] = A[i,j] ─────────────────────────────
+@pure
+fn gal_transpose(a, rows, cols) {
+    let mut t = []
+    for j in 0..cols {
+        let mut row = []
+        for i in 0..rows { row = row + [a[i][j]] }
+        t = t + [row]
+    }
+    return t
+}
+
+// ── dot product ─────────────────────────────────────────────
+@pure
+fn gal_dot(a, b, n) {
+    let mut s = 0.0
+    for i in 0..n { s = s + a[i] * b[i] }
+    return s
+}
+
+// ── vector norm ─────────────────────────────────────────────
+@pure
+fn gal_vec_norm(v, n) {
+    let mut s = 0.0
+    for i in 0..n { s = s + v[i] * v[i] }
+    return gal_sqrt(s)
+}
+
+// ── normalize vector ────────────────────────────────────────
+fn gal_normalize(v, n) {
+    let nrm = gal_vec_norm(v, n)
+    if nrm < 1.0e-12 { return v }
+    let mut out = []
+    for i in 0..n { out = out + [v[i] / nrm] }
+    return out
+}
+
+// ── flatten 2D matrix to 1D ─────────────────────────────────
+fn gal_flatten2d(mat, rows, cols) {
+    let mut flat = []
+    for i in 0..rows {
+        for j in 0..cols {
+            flat = flat + [mat[i][j]]
+        }
+    }
+    return flat
+}
+
+// ── unflatten 1D to 2D ─────────────────────────────────────
+fn gal_unflatten2d(flat, off, rows, cols) {
+    let mut mat = []
+    for i in 0..rows {
+        let mut row = []
+        for j in 0..cols {
+            row = row + [flat[off + i * cols + j]]
+        }
+        mat = mat + [row]
+    }
+    return mat
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 2: Truncated SVD via power iteration
+//
+//  For GaLore we only need the top-r left singular vectors (U).
+//  Power iteration on M = G @ G^T converges to the dominant
+//  eigenvectors. We deflate after each to get rank-r.
+//
+//  Returns [U, S, Vt]:
+//    U  : [rows x rank]  — left singular vectors (projector)
+//    S  : [rank]          — singular values
+//    Vt : [rank x cols]   — right singular vectors (transposed)
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn galore_svd_power(matrix, rows, cols, rank, n_iter) {
+    // Work on a mutable copy for deflation
+    let mut mat = []
+    for i in 0..rows {
+        let mut row = []
+        for j in 0..cols { row = row + [matrix[i][j]] }
+        mat = mat + [row]
+    }
+
+    let mut u_cols = []    // will collect rank vectors of length rows
+    let mut s_vals = []    // singular values
+    let mut vt_rows = []   // will collect rank vectors of length cols
+
+    for _r in 0..rank {
+        // Initialize random vector q [rows]
+        let mut q = []
+        for i in 0..rows {
+            let seed_val = (i + 1) * 7919 + (_r + 1) * 104729
+            let fv = to_float(seed_val % 2000) - 1000.0
+            q = q + [fv / 1000.0]
+        }
+        q = gal_normalize(q, rows)
+
+        // Power iteration: q <- (M @ M^T) @ q, normalize
+        for _it in 0..n_iter {
+            // Step 1: p = M^T @ q   [cols]
+            let mut p = gal_zeros1(cols)
+            for j in 0..cols {
+                let mut s = 0.0
+                for i in 0..rows { s = s + mat[i][j] * q[i] }
+                p[j] = s
+            }
+            // Step 2: q = M @ p   [rows]
+            let mut q_new = gal_zeros1(rows)
+            for i in 0..rows {
+                let mut s = 0.0
+                for j in 0..cols { s = s + mat[i][j] * p[j] }
+                q_new[i] = s
+            }
+            q = gal_normalize(q_new, rows)
+        }
+
+        // Compute singular value: sigma = ||M^T @ q||
+        let mut sv = gal_zeros1(cols)
+        for j in 0..cols {
+            let mut s = 0.0
+            for i in 0..rows { s = s + mat[i][j] * q[i] }
+            sv[j] = s
+        }
+        let sigma = gal_vec_norm(sv, cols)
+        if sigma > 1.0e-12 {
+            sv = gal_normalize(sv, cols)
+        }
+
+        u_cols = u_cols + [q]
+        s_vals = s_vals + [sigma]
+        vt_rows = vt_rows + [sv]
+
+        // Deflate: mat = mat - sigma * q @ v^T
+        for i in 0..rows {
+            for j in 0..cols {
+                mat[i][j] = mat[i][j] - sigma * q[i] * sv[j]
+            }
+        }
+    }
+
+    // Assemble U [rows x rank] from column vectors
+    let mut u_mat = []
+    for i in 0..rows {
+        let mut row = []
+        for ri in 0..rank { row = row + [u_cols[ri][i]] }
+        u_mat = u_mat + [row]
+    }
+
+    // Assemble Vt [rank x cols] from row vectors
+    let mut vt_mat = []
+    for ri in 0..rank {
+        let mut row = []
+        for j in 0..cols { row = row + [vt_rows[ri][j]] }
+        vt_mat = vt_mat + [row]
+    }
+
+    return [u_mat, s_vals, vt_mat]
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 3: Projection operations
+//
+//  project:      G_low = P^T @ G       [rank x cols]
+//  project_back: update = P @ G_low    [rows x cols]
+// ═══════════════════════════════════════════════════════════════
+
+// P is [rows x rank], gradient is [rows x cols]
+// result is [rank x cols]
+@pure
+fn galore_project(gradient, projector, rows, cols, rank) {
+    let pt = gal_transpose(projector, rows, rank)
+    return gal_matmul(pt, gradient, rank, rows, cols)
+}
+
+// low_rank_grad is [rank x cols], projector is [rows x rank]
+// result is [rows x cols]
+@pure
+fn galore_project_back(low_rank_grad, projector, rows, cols, rank) {
+    return gal_matmul(projector, low_rank_grad, rows, rank, cols)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 4: Optimizer state — single flat array<float>
+//
+//  Layout:  [rows, cols, rank, step, proj..., m..., v...]
+//    header     : 4 floats (rows, cols, rank, step)
+//    proj_off   : 4
+//    proj_size  : rows * rank
+//    m_off      : 4 + rows * rank
+//    m_size     : rank * cols
+//    v_off      : 4 + rows * rank + rank * cols
+//    v_size     : rank * cols
+//    total_len  : 4 + rows * rank + 2 * rank * cols
+// ═══════════════════════════════════════════════════════════════
+
+fn galore_create_state(rows, cols, rank) {
+    let mut state = [to_float(rows), to_float(cols), to_float(rank), 0.0]
+
+    // projector: identity-like [rows x rank] flattened
+    for i in 0..rows {
+        for r_idx in 0..rank {
+            if i == r_idx {
+                state = state + [1.0]
+            } else {
+                state = state + [0.0]
+            }
+        }
+    }
+
+    // m zeros [rank * cols]
+    let mv_size = rank * cols
+    for _i in 0..mv_size { state = state + [0.0] }
+
+    // v zeros [rank * cols]
+    for _i in 0..mv_size { state = state + [0.0] }
+
+    return state
+}
+
+// ── State accessors ─────────────────────────────────────────
+fn gal_st_rows(state) { return to_int(state[0]) }
+fn gal_st_cols(state) { return to_int(state[1]) }
+fn gal_st_rank(state) { return to_int(state[2]) }
+fn gal_st_step(state) { return to_int(state[3]) }
+
+fn gal_st_proj_off() { return 4 }
+fn gal_st_m_off(rows, rank) { return 4 + rows * rank }
+fn gal_st_v_off(rows, rank, cols) { return 4 + rows * rank + rank * cols }
+
+// ── Extract projector as 2D [rows x rank] ───────────────────
+fn gal_state_get_projector(state, rows, rank) {
+    let off = gal_st_proj_off()
+    return gal_unflatten2d(state, off, rows, rank)
+}
+
+// ── Extract m as 2D [rank x cols] ───────────────────────────
+fn gal_state_get_m(state, rows, rank, cols) {
+    let off = gal_st_m_off(rows, rank)
+    return gal_unflatten2d(state, off, rank, cols)
+}
+
+// ── Extract v as 2D [rank x cols] ───────────────────────────
+fn gal_state_get_v(state, rows, rank, cols) {
+    let off = gal_st_v_off(rows, rank, cols)
+    return gal_unflatten2d(state, off, rank, cols)
+}
+
+// ── Rebuild state from components ───────────────────────────
+fn gal_pack_state(rows, cols, rank, step, proj2d, m2d, v2d) {
+    let mut state = [to_float(rows), to_float(cols), to_float(rank), to_float(step)]
+    // proj
+    for i in 0..rows {
+        for j in 0..rank {
+            state = state + [proj2d[i][j]]
+        }
+    }
+    // m
+    for i in 0..rank {
+        for j in 0..cols {
+            state = state + [m2d[i][j]]
+        }
+    }
+    // v
+    for i in 0..rank {
+        for j in 0..cols {
+            state = state + [v2d[i][j]]
+        }
+    }
+    return state
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 5: Projector update
+//
+//  Re-compute SVD projector from current gradient.
+//  Called every T steps to track changing gradient subspace.
+// ═══════════════════════════════════════════════════════════════
+
+fn galore_update_projector(state, gradient, n_power_iter) {
+    let rows = gal_st_rows(state)
+    let cols = gal_st_cols(state)
+    let rank = gal_st_rank(state)
+    let step = gal_st_step(state)
+
+    let svd = galore_svd_power(gradient, rows, cols, rank, n_power_iter)
+    let u = svd[0]   // [rows x rank] — new projector
+
+    let m2d = gal_state_get_m(state, rows, rank, cols)
+    let v2d = gal_state_get_v(state, rows, rank, cols)
+
+    return gal_pack_state(rows, cols, rank, step, u, m2d, v2d)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 6: Adam step in low-rank subspace
+//
+//  1. Project gradient: G_low = P^T @ G     [rank x cols]
+//  2. Update m, v in low-rank space
+//  3. Compute bias-corrected Adam update
+//  4. Project back: update = P @ update_low  [rows x cols]
+// ═══════════════════════════════════════════════════════════════
+
+@hot
+fn galore_adam_step(state, gradient, lr, beta1, beta2, eps) {
+    let rows = gal_st_rows(state)
+    let cols = gal_st_cols(state)
+    let rank = gal_st_rank(state)
+    let step = gal_st_step(state) + 1
+
+    // Get projector
+    let proj = gal_state_get_projector(state, rows, rank)
+
+    // Project gradient to low-rank
+    let g_low = galore_project(gradient, proj, rows, cols, rank)
+
+    // Get current m, v as 2D
+    let m_old = gal_state_get_m(state, rows, rank, cols)
+    let v_old = gal_state_get_v(state, rows, rank, cols)
+
+    // Adam update in low-rank subspace
+    let mut m_new = gal_zeros2(rank, cols)
+    let mut v_new = gal_zeros2(rank, cols)
+    let mut update_low = gal_zeros2(rank, cols)
+
+    // Bias correction: (1 - beta^step)
+    let mut b1_pow = 1.0
+    let mut b2_pow = 1.0
+    for _s in 0..step {
+        b1_pow = b1_pow * beta1
+        b2_pow = b2_pow * beta2
+    }
+    let mut bc1 = 1.0 - b1_pow
+    let mut bc2 = 1.0 - b2_pow
+    if gal_abs(bc1) < 1.0e-12 { bc1 = 1.0e-12 }
+    if gal_abs(bc2) < 1.0e-12 { bc2 = 1.0e-12 }
+
+    for i in 0..rank {
+        for j in 0..cols {
+            // m = beta1 * m + (1 - beta1) * g
+            m_new[i][j] = beta1 * m_old[i][j] + (1.0 - beta1) * g_low[i][j]
+            // v = beta2 * v + (1 - beta2) * g^2
+            v_new[i][j] = beta2 * v_old[i][j] + (1.0 - beta2) * g_low[i][j] * g_low[i][j]
+            // bias-corrected
+            let m_hat = m_new[i][j] / bc1
+            let v_hat = v_new[i][j] / bc2
+            // Adam update
+            update_low[i][j] = lr * m_hat / (gal_sqrt(v_hat) + eps)
+        }
+    }
+
+    // Project back to full space
+    let full_update = galore_project_back(update_low, proj, rows, cols, rank)
+
+    // Pack new state
+    let new_state = gal_pack_state(rows, cols, rank, step, proj, m_new, v_new)
+    return [new_state, full_update]
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 7: Re-projection check
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn galore_should_reproject(state, interval) {
+    let step = gal_st_step(state)
+    if interval <= 0 { return false }
+    if step == 0 { return true }
+    if step % interval == 0 { return true }
+    return false
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 8: Full training step for multiple parameters
+//
+//  For each parameter:
+//    1. Optionally re-project (every reproject_interval steps)
+//    2. Run GaLore Adam step
+//    3. Apply update to parameter
+// ═══════════════════════════════════════════════════════════════
+
+fn galore_train_step(params, grads, states, lr, beta1, beta2, eps, rank, reproject_interval) {
+    let n = len(params)
+    let mut new_params = []
+    let mut new_states = []
+
+    for idx in 0..n {
+        let mut st = states[idx]
+        let rows = gal_st_rows(st)
+        let cols = gal_st_cols(st)
+
+        // Re-project if needed
+        if galore_should_reproject(st, reproject_interval) {
+            st = galore_update_projector(st, grads[idx], 10)
+        }
+
+        // Adam step
+        let result = galore_adam_step(st, grads[idx], lr, beta1, beta2, eps)
+        let updated_state = result[0]
+        let update = result[1]
+
+        // Apply update: param = param - update
+        let mut new_param = []
+        for i in 0..rows {
+            let mut row = []
+            for j in 0..cols {
+                row = row + [params[idx][i][j] - update[i][j]]
+            }
+            new_param = new_param + [row]
+        }
+
+        new_params = new_params + [new_param]
+        new_states = new_states + [updated_state]
+    }
+
+    return [new_params, new_states]
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 9: Memory savings computation
+//
+//  Full Adam stores m, v each [rows x cols]:
+//    full_mem = 2 * rows * cols
+//
+//  GaLore stores projector [rows x rank] + m, v each [rank x cols]:
+//    galore_mem = rows * rank + 2 * rank * cols
+//
+//  Savings ratio = galore_mem / full_mem
+// ═══════════════════════════════════════════════════════════════
+
+@memoize
+fn galore_memory_savings(rows, cols, rank) {
+    let full = 2.0 * to_float(rows) * to_float(cols)
+    let proj_mem = to_float(rows) * to_float(rank)
+    let state_mem = 2.0 * to_float(rank) * to_float(cols)
+    let galore_mem = proj_mem + state_mem
+    if full < 1.0e-12 { return 1.0 }
+    return galore_mem / full
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 10: Multi-parameter optimizer creation
+//
+//  Given a list of [rows, cols] shapes and a rank, create
+//  optimizer states for all parameters.
+// ═══════════════════════════════════════════════════════════════
+
+fn galore_create_optimizer(param_shapes, rank) {
+    let n = len(param_shapes)
+    let mut states = []
+    for i in 0..n {
+        let shape = param_shapes[i]
+        let rows = to_int(shape[0])
+        let cols = to_int(shape[1])
+        let mut r = rank
+        // Clamp rank to min(rows, cols)
+        if r > rows { r = rows }
+        if r > cols { r = cols }
+        let st = galore_create_state(rows, cols, r)
+        states = states + [st]
+    }
+    return states
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 11: Frobenius norm (diagnostic)
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn galore_frobenius(mat, rows, cols) {
+    let mut s = 0.0
+    for i in 0..rows {
+        for j in 0..cols {
+            s = s + mat[i][j] * mat[i][j]
+        }
+    }
+    return gal_sqrt(s)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 12: Low-rank gradient approximation quality
+//
+//  Measures ||G - P P^T G|| / ||G||  — reconstruction error.
+//  Lower = better subspace coverage.
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn galore_reconstruction_error(gradient, projector, rows, cols, rank) {
+    let g_low = galore_project(gradient, projector, rows, cols, rank)
+    let g_recon = galore_project_back(g_low, projector, rows, cols, rank)
+    let mut err_sq = 0.0
+    let mut grad_sq = 0.0
+    for i in 0..rows {
+        for j in 0..cols {
+            let diff = gradient[i][j] - g_recon[i][j]
+            err_sq = err_sq + diff * diff
+            grad_sq = grad_sq + gradient[i][j] * gradient[i][j]
+        }
+    }
+    if grad_sq < 1.0e-12 { return 0.0 }
+    return gal_sqrt(err_sq) / gal_sqrt(grad_sq)
+}
