@@ -1,0 +1,165 @@
+// ═══════════════════════════════════════════════════════════════
+//  test_dinov2_ssl.hexa — DINOv2 SSL (#266) tests
+// ═══════════════════════════════════════════════════════════════
+
+import "ml/dinov2_ssl.hexa"
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn approx(a, b, eps) {
+    return fabs(a - b) < eps
+}
+
+println("═══════════════════════════════════════════════════════")
+println("  DINOv2 SSL (#266) Test Suite")
+println("═══════════════════════════════════════════════════════")
+
+// ── Test 1: init shapes ─
+let model = dino_init(8, 16, 6, 42)
+check("input_dim 8", model["input_dim"] == 8)
+check("hidden 16", model["hidden"] == 16)
+check("proj_dim 6", model["proj_dim"] == 6)
+let sW1 = model["s_W1"]
+check("s_W1 rows 8", len(sW1) == 8)
+check("s_W1 cols 16", len(sW1[0]) == 16)
+let sW2 = model["s_W2"]
+check("s_W2 rows 16", len(sW2) == 16)
+check("s_W2 cols 6", len(sW2[0]) == 6)
+
+// ── Test 2: student/teacher identical at init ─
+let tW1 = model["t_W1"]
+let mut same = true
+for i in 0..8 {
+    for j in 0..16 {
+        if fabs(sW1[i][j] - tW1[i][j]) > 1.0e-12 { same = false }
+    }
+}
+check("init student == teacher W1", same)
+
+// ── Test 3: student forward produces proj_dim vector ─
+let inp = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+let so = dino_student_forward(model, inp)
+check("student out len 6", len(so) == 6)
+let to = dino_teacher_forward(model, inp)
+check("teacher out len 6", len(to) == 6)
+
+// ── Test 4: at init, student and teacher produce same output ─
+let mut st_eq = true
+for i in 0..6 {
+    if fabs(so[i] - to[i]) > 1.0e-10 { st_eq = false }
+}
+check("init: student out == teacher out", st_eq)
+
+// ── Test 5: softmax sums to 1 ─
+let logits = [1.0, 2.0, 0.5, -1.0, 3.0, 0.0]
+let probs = dino_softmax(logits, 1.0)
+let mut s = 0.0
+for i in 0..6 { s = s + probs[i] }
+check("softmax sums 1", approx(s, 1.0, 1.0e-10))
+
+// ── Test 6: softmax non-negative ─
+let mut pos = true
+for i in 0..6 { if probs[i] < 0.0 { pos = false } }
+check("softmax non-neg", pos)
+
+// ── Test 7: log-softmax = log(softmax) ─
+let lp = dino_log_softmax(logits, 1.0)
+let mut ls_ok = true
+for i in 0..6 {
+    if fabs(lp[i] - log(probs[i])) > 1.0e-6 { ls_ok = false }
+}
+check("logsoftmax matches log(softmax)", ls_ok)
+
+// ── Test 8: cross entropy = -Σ p log q ─
+let uniform_p = [1.0 / 6.0, 1.0 / 6.0, 1.0 / 6.0, 1.0 / 6.0, 1.0 / 6.0, 1.0 / 6.0]
+let ce_uniform_q = dino_cross_entropy(uniform_p, lp)
+check("CE >= 0", ce_uniform_q >= 0.0)
+
+// ── Test 9: forward pair loss finite & positive ─
+let result = dino_forward_pair(model, inp, 42, 0.1, 0.1)
+let loss = result["loss"]
+check("pair loss >= 0", loss >= 0.0)
+check("pair loss finite", loss < 100.0)
+
+// ── Test 10: two views differ slightly ─
+let v1 = result["v1"]
+let v2 = result["v2"]
+let mut any_diff = false
+for i in 0..8 { if fabs(v1[i] - v2[i]) > 1.0e-6 { any_diff = true } }
+check("v1 != v2 (augment)", any_diff)
+
+// ── Test 11: EMA update keeps teacher close to student (rate=0.9) ─
+// First perturb student by slight change — but easier: copy & compare
+let model2 = dino_ema_update(model, 0.9)
+// teacher should still equal previous teacher (since init equal)
+let tW1_after = model2["t_W1"]
+let mut still_eq = true
+for i in 0..8 {
+    for j in 0..16 {
+        if fabs(tW1_after[i][j] - tW1[i][j]) > 1.0e-10 { still_eq = false }
+    }
+}
+check("EMA with init-equal: teacher unchanged", still_eq)
+
+// ── Test 12: EMA update with student different: teacher moves a bit ─
+// We make a modified model where student weights are perturbed
+let mut model_mod = model
+let mut nsW1 = dino_zeros2d(8, 16)
+for i in 0..8 {
+    for j in 0..16 {
+        nsW1[i][j] = sW1[i][j] + 1.0
+    }
+}
+model_mod["s_W1"] = nsW1
+let model3 = dino_ema_update(model_mod, 0.9)
+let tW1_3 = model3["t_W1"]
+// After EMA, new teacher = 0.9 * old_teacher + 0.1 * new_student
+// Delta from old teacher = 0.1 * (student_new - teacher_old) = 0.1 * 1.0 = 0.1
+let delta = tW1_3[0][0] - tW1[0][0]
+check("EMA moves teacher by (1-m)*delta", approx(delta, 0.1, 1.0e-9))
+
+// ── Test 13: low τt on teacher sharpens target ─
+let t_out = [1.0, 0.5, 0.3, 0.0, 0.2, 0.1]
+let sharp = dino_softmax(t_out, 0.1)
+let soft = dino_softmax(t_out, 10.0)
+// max entry of sharp > max entry of soft
+let mut max_sharp = sharp[0]
+let mut max_soft = soft[0]
+for i in 1..6 {
+    if sharp[i] > max_sharp { max_sharp = sharp[i] }
+    if soft[i] > max_soft { max_soft = soft[i] }
+}
+check("low τ → sharper", max_sharp > max_soft)
+
+// ── Test 14: cos sim of a vector with itself = 1 ─
+let cs = dino_cos_sim([1.0, 2.0, 3.0], [1.0, 2.0, 3.0])
+check("cos_sim(v, v) = 1", approx(cs, 1.0, 1.0e-10))
+
+// ── Test 15: cos sim of orthogonal = 0 ─
+let cs2 = dino_cos_sim([1.0, 0.0], [0.0, 1.0])
+check("cos_sim orthogonal = 0", approx(cs2, 0.0, 1.0e-10))
+
+// ═══════════════════════════════════════════════════════════════
+println("")
+println("pass=" + to_string(pass_count) + " fail=" + to_string(fail_count))
+if fail_count == 0 {
+    println("ALL PASS")
+} else {
+    println("FAILED")
+}

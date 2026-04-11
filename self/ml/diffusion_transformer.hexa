@@ -1,0 +1,452 @@
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/diffusion_transformer.hexa — Diffusion Transformer (#265)
+//
+//  Peebles & Xie 2023 (DiT): Diffusion model with Transformer backbone.
+//  AdaLN (Adaptive LayerNorm) conditions each block on the time step
+//  via learned scale/shift parameters.
+//
+//  CPU mini config:
+//    • 16×16 "latent"  (one channel)
+//    • patch size 4 → 4×4 = 16 tokens
+//    • token dim D = 8
+//    • 2 transformer blocks (attention + MLP with AdaLN)
+//    • sinusoidal time embedding → MLP → 6 AdaLN vectors per block
+//      (shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp)
+//    • final linear → unpatchify → 16×16 noise prediction
+//
+//  API:
+//    dit_init(seed)                       -> dict
+//    dit_patchify(img, patch_size)         -> [[float]]
+//    dit_unpatchify(patches, H, W, patch)  -> [[float]]
+//    dit_time_embed(t, dim)                -> [float]
+//    dit_adaln(feat, shift, scale)         -> [float]
+//    dit_gate(feat, gate)                  -> [float]
+//    dit_attention(tokens)                 -> [[float]]
+//    dit_mlp(tokens, W1, b1, W2, b2)       -> [[float]]
+//    dit_block(tokens, block_params, cond) -> [[float]]
+//    dit_forward(model, img, t)            -> [[float]]  predicted noise
+//
+// ═══════════════════════════════════════════════════════════════
+
+fn dit_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn dit_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn dit_zeros2d(m, n) {
+    let mut w = []
+    for _i in 0..m { w = w + [dit_zeros(n)] }
+    return w
+}
+
+fn dit_hash(seed, i, j) {
+    let h = (seed * 2654435761 + i * 1315423911 + j * 731) % 10007
+    return to_float(h) / 10007.0 - 0.5
+}
+
+fn dit_init_mat(r, c, seed, scale) {
+    let mut M = dit_zeros2d(r, c)
+    for i in 0..r {
+        for j in 0..c { M[i][j] = scale * dit_hash(seed, i, j) }
+    }
+    return M
+}
+
+// ── Linear: din×dout ─
+fn dit_linear(W, b, feat) {
+    let din = len(W)
+    let dout = len(W[0])
+    let mut out = dit_zeros(dout)
+    for j in 0..dout { out[j] = b[j] }
+    for i in 0..din {
+        for j in 0..dout { out[j] = out[j] + W[i][j] * feat[i] }
+    }
+    return out
+}
+
+// ── Patchify a square image grid H×W, patch size P → (H/P * W/P) × P² ─
+fn dit_patchify(img, patch_size) {
+    let H = len(img)
+    let W = len(img[0])
+    let gh = H / patch_size
+    let gw = W / patch_size
+    let N = gh * gw
+    let P2 = patch_size * patch_size
+    let mut out = dit_zeros2d(N, P2)
+    for pi in 0..gh {
+        for pj in 0..gw {
+            let idx = pi * gw + pj
+            for di in 0..patch_size {
+                for dj in 0..patch_size {
+                    out[idx][di * patch_size + dj] = img[pi * patch_size + di][pj * patch_size + dj]
+                }
+            }
+        }
+    }
+    return out
+}
+
+fn dit_unpatchify(patches, H, W, patch_size) {
+    let gh = H / patch_size
+    let gw = W / patch_size
+    let mut img = dit_zeros2d(H, W)
+    for pi in 0..gh {
+        for pj in 0..gw {
+            let idx = pi * gw + pj
+            for di in 0..patch_size {
+                for dj in 0..patch_size {
+                    img[pi * patch_size + di][pj * patch_size + dj] = patches[idx][di * patch_size + dj]
+                }
+            }
+        }
+    }
+    return img
+}
+
+// ── Sinusoidal time embedding ─
+fn dit_time_embed(t, dim) {
+    let mut out = dit_zeros(dim)
+    let half = dim / 2
+    for i in 0..half {
+        let freq = 1.0 / exp(to_float(i) / to_float(half) * 9.21)  // 9.21 ≈ log(10000)
+        let arg = t * freq
+        out[i] = exp(0.0 - arg * arg / 2.0)  // use gaussian-ish - but standard is sin/cos
+    }
+    // Use stable sin/cos approximation via taylor (small arguments)
+    // Replace with straight-forward sin/cos through series
+    for i in 0..half {
+        let freq = 1.0 / exp(to_float(i) / to_float(half) * 9.21)
+        let arg = t * freq
+        out[i] = dit_sin(arg)
+        out[i + half] = dit_cos(arg)
+    }
+    return out
+}
+
+// Hand-rolled sin/cos via Taylor (OK for small |arg|, we'll normalize)
+fn dit_sin(arg_in) {
+    let mut x = arg_in
+    // reduce to [-π, π]
+    let pi = 3.14159265358979
+    let two_pi = 2.0 * pi
+    while x > pi { x = x - two_pi }
+    while x < (0.0 - pi) { x = x + two_pi }
+    // Taylor: x - x³/6 + x⁵/120 - x⁷/5040 + x⁹/362880
+    let x2 = x * x
+    let x3 = x2 * x
+    let x5 = x3 * x2
+    let x7 = x5 * x2
+    let x9 = x7 * x2
+    return x - x3 / 6.0 + x5 / 120.0 - x7 / 5040.0 + x9 / 362880.0
+}
+
+fn dit_cos(arg_in) {
+    let mut x = arg_in
+    let pi = 3.14159265358979
+    let two_pi = 2.0 * pi
+    while x > pi { x = x - two_pi }
+    while x < (0.0 - pi) { x = x + two_pi }
+    let x2 = x * x
+    let x4 = x2 * x2
+    let x6 = x4 * x2
+    let x8 = x4 * x4
+    return 1.0 - x2 / 2.0 + x4 / 24.0 - x6 / 720.0 + x8 / 40320.0
+}
+
+// ── LayerNorm on a token vector (row-wise) ──
+fn dit_layernorm(feat) {
+    let n = len(feat)
+    let mut mean = 0.0
+    for i in 0..n { mean = mean + feat[i] }
+    mean = mean / to_float(n)
+    let mut var = 0.0
+    for i in 0..n {
+        let d = feat[i] - mean
+        var = var + d * d
+    }
+    var = var / to_float(n)
+    let std = sqrt(var + 1.0e-5)
+    let mut out = dit_zeros(n)
+    for i in 0..n { out[i] = (feat[i] - mean) / std }
+    return out
+}
+
+// ── AdaLN modulation: (1 + scale) * layernorm(x) + shift ──
+fn dit_adaln(feat, shift, scale) {
+    let normed = dit_layernorm(feat)
+    let n = len(normed)
+    let mut out = dit_zeros(n)
+    for i in 0..n { out[i] = (1.0 + scale[i]) * normed[i] + shift[i] }
+    return out
+}
+
+// ── Gate: residual multiplier ──
+fn dit_gate(feat, gate) {
+    let n = len(feat)
+    let mut out = dit_zeros(n)
+    for i in 0..n { out[i] = gate[i] * feat[i] }
+    return out
+}
+
+// ── Self-attention (single-head) on tokens [N × D] ──
+// q=k=v via simple linear projections embedded in block params
+fn dit_attention(tokens, Wq, Wk, Wv, Wo) {
+    let N = len(tokens)
+    let D = len(tokens[0])
+    // Q, K, V
+    let mut Q = dit_zeros2d(N, D)
+    let mut K = dit_zeros2d(N, D)
+    let mut V = dit_zeros2d(N, D)
+    let bzero = dit_zeros(D)
+    for i in 0..N {
+        let qi = dit_linear(Wq, bzero, tokens[i])
+        let ki = dit_linear(Wk, bzero, tokens[i])
+        let vi = dit_linear(Wv, bzero, tokens[i])
+        for j in 0..D {
+            Q[i][j] = qi[j]
+            K[i][j] = ki[j]
+            V[i][j] = vi[j]
+        }
+    }
+    // scores [N × N]
+    let scale = 1.0 / sqrt(to_float(D))
+    let mut scores = dit_zeros2d(N, N)
+    for i in 0..N {
+        for j in 0..N {
+            let mut s = 0.0
+            for k in 0..D { s = s + Q[i][k] * K[j][k] }
+            scores[i][j] = s * scale
+        }
+    }
+    // softmax rows
+    let mut attn = dit_zeros2d(N, N)
+    for i in 0..N {
+        let mut mx = scores[i][0]
+        for j in 1..N { if scores[i][j] > mx { mx = scores[i][j] } }
+        let mut sum_e = 0.0
+        for j in 0..N {
+            let e = exp(scores[i][j] - mx)
+            attn[i][j] = e
+            sum_e = sum_e + e
+        }
+        for j in 0..N { attn[i][j] = attn[i][j] / sum_e }
+    }
+    // context = attn · V
+    let mut ctx = dit_zeros2d(N, D)
+    for i in 0..N {
+        for d in 0..D {
+            let mut s = 0.0
+            for j in 0..N { s = s + attn[i][j] * V[j][d] }
+            ctx[i][d] = s
+        }
+    }
+    // output projection
+    let mut out = dit_zeros2d(N, D)
+    for i in 0..N {
+        let oi = dit_linear(Wo, bzero, ctx[i])
+        for d in 0..D { out[i][d] = oi[d] }
+    }
+    return out
+}
+
+// ── Feed-forward MLP applied per token ──
+fn dit_mlp_tokens(tokens, W1, b1, W2, b2) {
+    let N = len(tokens)
+    let D = len(tokens[0])
+    let mut out = dit_zeros2d(N, D)
+    for i in 0..N {
+        let h = dit_linear(W1, b1, tokens[i])
+        // GELU-lite: use tanh approx
+        let H = len(h)
+        let mut a = dit_zeros(H)
+        for j in 0..H {
+            let xj = h[j]
+            // simple GELU: x * sigmoid(1.702 x)
+            let gv = xj / (1.0 + exp(0.0 - 1.702 * xj))
+            a[j] = gv
+        }
+        let o = dit_linear(W2, b2, a)
+        for j in 0..D { out[i][j] = o[j] }
+    }
+    return out
+}
+
+// ── One DiT block with AdaLN ──
+fn dit_block(tokens, params, cond) {
+    let N = len(tokens)
+    let D = len(tokens[0])
+    let shift_msa = cond["shift_msa"]
+    let scale_msa = cond["scale_msa"]
+    let gate_msa = cond["gate_msa"]
+    let shift_mlp = cond["shift_mlp"]
+    let scale_mlp = cond["scale_mlp"]
+    let gate_mlp = cond["gate_mlp"]
+
+    // ── MSA branch ──
+    let mut modulated = dit_zeros2d(N, D)
+    for i in 0..N {
+        let mi = dit_adaln(tokens[i], shift_msa, scale_msa)
+        for d in 0..D { modulated[i][d] = mi[d] }
+    }
+    let attn_out = dit_attention(modulated, params["Wq"], params["Wk"], params["Wv"], params["Wo"])
+    // gated residual
+    let mut stage1 = dit_zeros2d(N, D)
+    for i in 0..N {
+        let gated = dit_gate(attn_out[i], gate_msa)
+        for d in 0..D { stage1[i][d] = tokens[i][d] + gated[d] }
+    }
+
+    // ── MLP branch ──
+    let mut mod2 = dit_zeros2d(N, D)
+    for i in 0..N {
+        let mi = dit_adaln(stage1[i], shift_mlp, scale_mlp)
+        for d in 0..D { mod2[i][d] = mi[d] }
+    }
+    let mlp_out = dit_mlp_tokens(mod2, params["W1"], params["b1"], params["W2"], params["b2"])
+    let mut stage2 = dit_zeros2d(N, D)
+    for i in 0..N {
+        let gated = dit_gate(mlp_out[i], gate_mlp)
+        for d in 0..D { stage2[i][d] = stage1[i][d] + gated[d] }
+    }
+    return stage2
+}
+
+// ── Init one block ──
+fn dit_init_block(D, seed) {
+    let params = #{
+        "Wq": dit_init_mat(D, D, seed + 1, 0.2),
+        "Wk": dit_init_mat(D, D, seed + 2, 0.2),
+        "Wv": dit_init_mat(D, D, seed + 3, 0.2),
+        "Wo": dit_init_mat(D, D, seed + 4, 0.2),
+        "W1": dit_init_mat(D, D * 2, seed + 5, 0.2),
+        "b1": dit_zeros(D * 2),
+        "W2": dit_init_mat(D * 2, D, seed + 6, 0.2),
+        "b2": dit_zeros(D)
+    }
+    return params
+}
+
+// ── Build AdaLN conditioning vectors from time embedding ──
+fn dit_cond(t_emb, W_cond, b_cond, D) {
+    let out = dit_linear(W_cond, b_cond, t_emb)
+    // split into 6 vectors of length D
+    let mut parts = []
+    for k in 0..6 {
+        let mut part = dit_zeros(D)
+        for i in 0..D { part[i] = out[k * D + i] }
+        parts = parts + [part]
+    }
+    let cond = #{
+        "shift_msa": parts[0],
+        "scale_msa": parts[1],
+        "gate_msa": parts[2],
+        "shift_mlp": parts[3],
+        "scale_mlp": parts[4],
+        "gate_mlp": parts[5]
+    }
+    return cond
+}
+
+// ── Full DiT init: 2 blocks, D=8, patch_dim=16 (4×4) ──
+fn dit_init(seed) {
+    let D = 8
+    let patch_size = 4
+    let patch_dim = patch_size * patch_size
+    let t_dim = 16
+    // patch embed W [patch_dim → D]
+    let W_pe = dit_init_mat(patch_dim, D, seed + 10, 0.2)
+    let b_pe = dit_zeros(D)
+    // two blocks
+    let block0 = dit_init_block(D, seed + 100)
+    let block1 = dit_init_block(D, seed + 200)
+    // time MLP: t_dim → t_dim
+    let W_tm = dit_init_mat(t_dim, t_dim, seed + 300, 0.2)
+    let b_tm = dit_zeros(t_dim)
+    // conditioning heads (one per block): t_dim → 6*D
+    let W_cond0 = dit_init_mat(t_dim, 6 * D, seed + 400, 0.1)
+    let b_cond0 = dit_zeros(6 * D)
+    let W_cond1 = dit_init_mat(t_dim, 6 * D, seed + 500, 0.1)
+    let b_cond1 = dit_zeros(6 * D)
+    // final linear: D → patch_dim
+    let W_final = dit_init_mat(D, patch_dim, seed + 600, 0.2)
+    let b_final = dit_zeros(patch_dim)
+
+    let model = #{
+        "D": D,
+        "patch_size": patch_size,
+        "patch_dim": patch_dim,
+        "t_dim": t_dim,
+        "W_pe": W_pe,
+        "b_pe": b_pe,
+        "block0": block0,
+        "block1": block1,
+        "W_tm": W_tm,
+        "b_tm": b_tm,
+        "W_cond0": W_cond0,
+        "b_cond0": b_cond0,
+        "W_cond1": W_cond1,
+        "b_cond1": b_cond1,
+        "W_final": W_final,
+        "b_final": b_final
+    }
+    return model
+}
+
+// ── DiT forward: img [16×16], t scalar → predicted noise [16×16] ──
+fn dit_forward(model, img, t) {
+    let D = model["D"]
+    let patch_size = model["patch_size"]
+    let patch_dim = model["patch_dim"]
+    let t_dim = model["t_dim"]
+    let H = len(img)
+    let W = len(img[0])
+
+    // 1. patchify + embed
+    let patches = dit_patchify(img, patch_size)
+    let N = len(patches)
+    let mut tokens = dit_zeros2d(N, D)
+    for i in 0..N {
+        let e = dit_linear(model["W_pe"], model["b_pe"], patches[i])
+        for d in 0..D { tokens[i][d] = e[d] }
+    }
+    // 2. time embed + MLP
+    let te_raw = dit_time_embed(t, t_dim)
+    let te = dit_linear(model["W_tm"], model["b_tm"], te_raw)
+
+    // 3. block 0
+    let cond0 = dit_cond(te, model["W_cond0"], model["b_cond0"], D)
+    let tokens1 = dit_block(tokens, model["block0"], cond0)
+    // 4. block 1
+    let cond1 = dit_cond(te, model["W_cond1"], model["b_cond1"], D)
+    let tokens2 = dit_block(tokens1, model["block1"], cond1)
+
+    // 5. final linear → patch_dim
+    let mut out_patches = dit_zeros2d(N, patch_dim)
+    for i in 0..N {
+        let o = dit_linear(model["W_final"], model["b_final"], tokens2[i])
+        for j in 0..patch_dim { out_patches[i][j] = o[j] }
+    }
+    // 6. unpatchify
+    let out_img = dit_unpatchify(out_patches, H, W, patch_size)
+    return out_img
+}
+
+// ── Diffusion noise loss: MSE(pred, target_noise) ──
+fn dit_noise_loss(pred, target) {
+    let H = len(pred)
+    let W = len(pred[0])
+    let mut s = 0.0
+    for i in 0..H {
+        for j in 0..W {
+            let d = pred[i][j] - target[i][j]
+            s = s + d * d
+        }
+    }
+    return s / to_float(H * W)
+}
