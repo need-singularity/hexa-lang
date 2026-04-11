@@ -1,5 +1,12 @@
 # crates.io Publish Checklist
 
+> **⚠ OBSOLETE (2026-04-11)**: HEXA-LANG is now fully self-hosted. `src/`
+> and `Cargo.toml` have been deleted. crates.io publication path no
+> longer applies — distribution is via the precompiled `hexa` binary
+> (`pkg/hx` package manager) and the self-host `build_hexa.hexa`
+> bootstrap pipeline. This file is retained as historical reference
+> for the Rust-era publishing workflow.
+
 Pre-flight checklist for publishing hexa-lang to crates.io.
 
 ## Cargo.toml Metadata
