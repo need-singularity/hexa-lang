@@ -26,8 +26,9 @@
 - **HX4** SELF-HOST FIRST — src/ Rust 폐기, 모든 코드 .hexa
 - **HX5** AI-native 알고리즘 교체 의무 — `docs/ai-native.md` 24종 벡터
 - **HX6** 돌파 시 nexus blowup 연동 + growth_bus 기록
+- **HX7** SELF-HOST 경로 전용 — 언어 기능은 `self/codegen_c2.hexa` + `self/runtime.c` + `self/interpreter.hexa` + `self/native/hexa_v2`에만, 프리젠 C 편집은 `.hexanoport` 마커로만
 
-전체 규칙: `shared/rules/common.json` (R0~R27) + `shared/rules/hexa-lang.json` (HX1~HX6)
+전체 규칙: `shared/rules/common.json` (R0~R27) + `shared/rules/hexa-lang.json` (HX1~HX7)
 
 ## L0 Guard (공용)
 
@@ -38,7 +39,7 @@
 | 항목 | 파일 | 내용 |
 |------|------|------|
 | 공통 규칙 | `shared/rules/common.json` | R0~R27 |
-| 프로젝트 규칙 | `shared/rules/hexa-lang.json` | HX1~HX6 |
+| 프로젝트 규칙 | `shared/rules/hexa-lang.json` | HX1~HX7 |
 | 보호 체계 | `shared/rules/lockdown.json` | L0/L1/L2 (src/ L0) |
 | CDO 수렴 | `shared/rules/convergence_ops.json` | 수렴 운영 원칙 |
 | 프로젝트 레지스트리 | `shared/config/projects.json` | 7개 프로젝트 |
