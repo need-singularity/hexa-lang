@@ -1,0 +1,230 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/mahalanobis_ood.hexa — Mahalanobis OOD Detection (#272)
+//
+//  Feature-space OOD detector (Lee et al. 2018).
+//      For each class c compute feature mean μ_c.
+//      Shared tied covariance Σ = (1/N) Σ_i (f_i - μ_{y_i})(f_i - μ_{y_i})^T
+//      Mahalanobis distance:
+//          d(f, c) = (f - μ_c)^T Σ^{-1} (f - μ_c)
+//      OOD score: s(f) = -min_c d(f, c)      (larger = more in-distribution)
+//
+//  Implementation notes:
+//    • We work directly on extracted feature vectors (no backbone
+//      dependency) so the module is self-contained.
+//    • Σ^{-1} computed via Gauss-Jordan elimination with ridge ε·I
+//      regularisation for numerical safety.
+//    • Decision: OOD if min_c d(f, c) > τ  (τ chosen on validation).
+//
+//  API:
+//    mh_mean_by_class(F, Y, K)       -> [[float]]
+//    mh_covariance_tied(F, Y, mu, ridge) -> [[float]]
+//    mh_inv_matrix(M)                -> [[float]]
+//    mh_mahalanobis(vec, mu_c, Σinv) -> float
+//    mh_min_distance(vec, mus, Σinv) -> #{class, dist}
+//    mh_score(vec, mus, Σinv)        -> float
+//    mh_fit(F, Y, K, ridge)          -> #{mus, sigma_inv}
+//    mh_is_ood(vec, model, tau)      -> bool
+//
+//  AI-NATIVE attrs:
+//    @pure
+// ═══════════════════════════════════════════════════════════════════
+
+fn mh_abs(inp) { if inp < 0.0 { return 0.0 - inp } return inp }
+
+fn mh_zeros_f(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn mh_zeros_2d(rows, cols) {
+    let mut m = []
+    for _r in 0..rows {
+        let mut row = []
+        for _c in 0..cols { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+fn mh_eye(n) {
+    let mut m = mh_zeros_2d(n, n)
+    for i in 0..n { m[i][i] = 1.0 }
+    return m
+}
+
+fn mh_copy_2d(M) {
+    let R = len(M)
+    let C = len(M[0])
+    let mut out = mh_zeros_2d(R, C)
+    for r in 0..R {
+        for c in 0..C { out[r][c] = M[r][c] }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (1) class-wise mean
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn mh_mean_by_class(F, Y, K) {
+    let N = len(F)
+    let D = len(F[0])
+    let mut mus = mh_zeros_2d(K, D)
+    let mut cnt = []
+    for _k in 0..K { cnt = cnt + [0] }
+    for i in 0..N {
+        let yi = Y[i]
+        for j in 0..D { mus[yi][j] = mus[yi][j] + F[i][j] }
+        cnt[yi] = cnt[yi] + 1
+    }
+    for k in 0..K {
+        if cnt[k] > 0 {
+            let inv = 1.0 / to_float(cnt[k])
+            for j in 0..D { mus[k][j] = mus[k][j] * inv }
+        }
+    }
+    return mus
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (2) Tied covariance with ridge regularisation
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn mh_covariance_tied(F, Y, mus, ridge) {
+    let N = len(F)
+    let D = len(F[0])
+    let mut cov = mh_zeros_2d(D, D)
+    for i in 0..N {
+        let mu = mus[Y[i]]
+        let mut diff = mh_zeros_f(D)
+        for j in 0..D { diff[j] = F[i][j] - mu[j] }
+        for a in 0..D {
+            for b in 0..D {
+                cov[a][b] = cov[a][b] + diff[a] * diff[b]
+            }
+        }
+    }
+    let inv_n = 1.0 / to_float(N)
+    for a in 0..D {
+        for b in 0..D { cov[a][b] = cov[a][b] * inv_n }
+        cov[a][a] = cov[a][a] + ridge
+    }
+    return cov
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (3) Matrix inverse via Gauss-Jordan
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn mh_inv_matrix(M) {
+    let n = len(M)
+    let mut A = mh_zeros_2d(n, 2 * n)
+    for i in 0..n {
+        for j in 0..n { A[i][j] = M[i][j] }
+        A[i][n + i] = 1.0
+    }
+    for i in 0..n {
+        // Partial pivot
+        let mut pivot_row = i
+        let mut best = mh_abs(A[i][i])
+        for r in (i + 1)..n {
+            let mag = mh_abs(A[r][i])
+            if mag > best {
+                best = mag
+                pivot_row = r
+            }
+        }
+        if pivot_row != i {
+            let tmp = A[i]
+            A[i] = A[pivot_row]
+            A[pivot_row] = tmp
+        }
+        let piv = A[i][i]
+        if mh_abs(piv) < 1.0e-12 { return mh_eye(n) }
+        let inv_p = 1.0 / piv
+        for j in 0..(2 * n) { A[i][j] = A[i][j] * inv_p }
+        for r in 0..n {
+            if r != i {
+                let factor = A[r][i]
+                for j in 0..(2 * n) {
+                    A[r][j] = A[r][j] - factor * A[i][j]
+                }
+            }
+        }
+    }
+    let mut inv = mh_zeros_2d(n, n)
+    for i in 0..n {
+        for j in 0..n { inv[i][j] = A[i][n + j] }
+    }
+    return inv
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (4) d(v, c) = (v - μ_c)^T Σ^-1 (v - μ_c)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn mh_mahalanobis(vec, mu_c, Sinv) {
+    let D = len(vec)
+    let mut diff = mh_zeros_f(D)
+    for j in 0..D { diff[j] = vec[j] - mu_c[j] }
+    let mut tmp = mh_zeros_f(D)
+    for i in 0..D {
+        let mut s = 0.0
+        for j in 0..D { s = s + Sinv[i][j] * diff[j] }
+        tmp[i] = s
+    }
+    let mut out = 0.0
+    for i in 0..D { out = out + diff[i] * tmp[i] }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (5) min-class distance
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn mh_min_distance(vec, mus, Sinv) {
+    let K = len(mus)
+    let mut best = mh_mahalanobis(vec, mus[0], Sinv)
+    let mut idx = 0
+    for k in 1..K {
+        let d = mh_mahalanobis(vec, mus[k], Sinv)
+        if d < best {
+            best = d
+            idx = k
+        }
+    }
+    return #{ "class": idx, "dist": best }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (6) OOD score  = -min_c d  (larger is more ID)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn mh_score(vec, mus, Sinv) {
+    let r = mh_min_distance(vec, mus, Sinv)
+    return 0.0 - r["dist"]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (7) Fit = mean + inv covariance
+// ═══════════════════════════════════════════════════════════════════
+fn mh_fit(F, Y, K, ridge) {
+    let mus = mh_mean_by_class(F, Y, K)
+    let cov = mh_covariance_tied(F, Y, mus, ridge)
+    let sinv = mh_inv_matrix(cov)
+    return #{
+        "mus": mus,
+        "sigma_inv": sinv
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (8) is_ood: distance above threshold
+// ═══════════════════════════════════════════════════════════════════
+fn mh_is_ood(vec, model, tau) {
+    let mus = model["mus"]
+    let sinv = model["sigma_inv"]
+    let r = mh_min_distance(vec, mus, sinv)
+    return r["dist"] > tau
+}

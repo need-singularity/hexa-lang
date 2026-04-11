@@ -1,0 +1,314 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/membership_defense.hexa — Membership Inference Defense (#283)
+//
+//  Defenses against membership inference attacks (Shokri et al.).
+//  Attacker observes model output p(x) and guesses whether x ∈ training
+//  set from confidence gap.  We lower the gap between member and
+//  non-member outputs.
+//
+//  Defenses implemented:
+//    • Temperature softening           p_T[i] ∝ exp(logit_i / T)
+//    • Label smoothing (ε)              target = (1-ε)·onehot + ε/K
+//    • Output perturbation (Gaussian)   p' = normalize(p + N(0,σ²))
+//    • Confidence masking (top-k)       keep top-k, uniform elsewhere
+//    • MemGuard-lite                    cap max confidence at τ
+//
+//  Baseline attacker: predict MEMBER iff max_p(x) > threshold.
+//
+//  API:
+//    md_softmax(logits)                 -> [float]
+//    md_temp_softmax(logits, T)         -> [float]
+//    md_label_smooth(target, K, eps)    -> [float]
+//    md_output_gauss(p, sigma, seed)    -> [float]
+//    md_confidence_mask(p, k)           -> [float]
+//    md_mem_guard(p, tau)               -> [float]
+//    md_attack_predict(p, threshold)    -> bool
+//    md_attack_accuracy(P_mem, P_nonmem, threshold) -> float
+//    md_apply_defense(p, kind, param, seed) -> [float]
+//
+//  AI-NATIVE attrs:
+//    @pure
+// ═══════════════════════════════════════════════════════════════════
+
+fn md_abs(inp) { if inp < 0.0 { return 0.0 - inp } return inp }
+
+fn md_exp(inp) {
+    let mut v = inp
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn md_log(inp) {
+    if inp <= 0.0 { return -30.0 }
+    let mut v = inp
+    let mut count = 0
+    while v > 2.0 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    let d = v - 1.0
+    let ln_v = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_v
+}
+
+fn md_sqrt(inp) {
+    if inp <= 0.0 { return 0.0 }
+    let mut g = inp / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 { g = (g + inp / g) / 2.0 }
+    return g
+}
+
+fn md_zeros_f(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn md_lcg(state) {
+    return (state * 1103515245 + 12345) % 2147483648
+}
+
+fn md_uniform(state) {
+    let s = md_lcg(state)
+    return [to_float(s) / 2147483648.0, to_float(s)]
+}
+
+fn md_gauss_pair(state) {
+    let p1 = md_uniform(state)
+    let mut u1 = p1[0]
+    let s1 = p1[1]
+    if u1 < 1.0e-9 { u1 = 1.0e-9 }
+    let p2 = md_uniform(int(s1))
+    let u2 = p2[0]
+    let s2 = p2[1]
+    let r = md_sqrt(-2.0 * md_log(u1))
+    let theta = 6.2831853 * u2
+    let c = 1.0 - theta * theta / 2.0 + theta * theta * theta * theta / 24.0
+    let z0 = r * c
+    return [z0, s2]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Softmax
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn md_softmax(logits) {
+    let K = len(logits)
+    let mut mx = logits[0]
+    for k in 1..K { if logits[k] > mx { mx = logits[k] } }
+    let mut out = md_zeros_f(K)
+    let mut sum = 0.0
+    for k in 0..K {
+        let e = md_exp(logits[k] - mx)
+        out[k] = e
+        sum = sum + e
+    }
+    if sum <= 0.0 { sum = 1.0e-12 }
+    for k in 0..K { out[k] = out[k] / sum }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (1) Temperature softening
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn md_temp_softmax(logits, T) {
+    let K = len(logits)
+    let mut safeT = T
+    if safeT < 1.0e-6 { safeT = 1.0e-6 }
+    let mut scaled = md_zeros_f(K)
+    for k in 0..K { scaled[k] = logits[k] / safeT }
+    return md_softmax(scaled)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (2) Label smoothing target vector
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn md_label_smooth(target, K, eps) {
+    let base = eps / to_float(K)
+    let mut out = md_zeros_f(K)
+    for k in 0..K { out[k] = base }
+    out[target] = out[target] + (1.0 - eps)
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (3) Output perturbation  p' = normalize(p + N(0,σ²))
+// ═══════════════════════════════════════════════════════════════════
+fn md_output_gauss(p, sigma, seed) {
+    let K = len(p)
+    let mut state = seed
+    if state <= 0 { state = 1 }
+    let mut out = md_zeros_f(K)
+    for k in 0..K {
+        let g = md_gauss_pair(state)
+        state = int(g[1])
+        if state <= 0 { state = 1 }
+        let mut v = p[k] + g[0] * sigma
+        if v < 0.0 { v = 0.0 }
+        out[k] = v
+    }
+    let mut sum = 0.0
+    for k in 0..K { sum = sum + out[k] }
+    if sum <= 0.0 {
+        for k in 0..K { out[k] = 1.0 / to_float(K) }
+        return out
+    }
+    for k in 0..K { out[k] = out[k] / sum }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (4) Confidence masking: keep top-k, uniform elsewhere
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn md_confidence_mask(p, k) {
+    let K = len(p)
+    let mut sorted = md_zeros_f(K)
+    for i in 0..K { sorted[i] = p[i] }
+    // simple selection for threshold (k-th largest)
+    for a in 0..K {
+        for b in (a + 1)..K {
+            if sorted[b] > sorted[a] {
+                let tmp = sorted[a]
+                sorted[a] = sorted[b]
+                sorted[b] = tmp
+            }
+        }
+    }
+    let mut kk = k
+    if kk > K { kk = K }
+    if kk <= 0 { kk = 1 }
+    let cutoff = sorted[kk - 1]
+    let mut out = md_zeros_f(K)
+    let mut kept_sum = 0.0
+    let mut kept_cnt = 0
+    for i in 0..K {
+        if p[i] >= cutoff {
+            out[i] = p[i]
+            kept_sum = kept_sum + p[i]
+            kept_cnt = kept_cnt + 1
+        }
+    }
+    let rest_mass = 1.0 - kept_sum
+    let rest_cnt = K - kept_cnt
+    if rest_cnt > 0 {
+        let share = rest_mass / to_float(rest_cnt)
+        for i in 0..K {
+            if out[i] == 0.0 { out[i] = share }
+        }
+    }
+    // ensure non-negative
+    for i in 0..K { if out[i] < 0.0 { out[i] = 0.0 } }
+    let mut sum = 0.0
+    for i in 0..K { sum = sum + out[i] }
+    if sum <= 0.0 { sum = 1.0 }
+    for i in 0..K { out[i] = out[i] / sum }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (5) MemGuard-lite: cap maximum confidence
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn md_mem_guard(p, tau) {
+    let K = len(p)
+    let mut out = md_zeros_f(K)
+    let mut mx_idx = 0
+    let mut mx_val = p[0]
+    for i in 1..K {
+        if p[i] > mx_val {
+            mx_val = p[i]
+            mx_idx = i
+        }
+    }
+    if mx_val <= tau {
+        for i in 0..K { out[i] = p[i] }
+        return out
+    }
+    let excess = mx_val - tau
+    out[mx_idx] = tau
+    let mut other_sum = 0.0
+    for i in 0..K {
+        if i != mx_idx { other_sum = other_sum + p[i] }
+    }
+    if other_sum <= 0.0 {
+        let share = excess / to_float(K - 1)
+        for i in 0..K {
+            if i != mx_idx { out[i] = share }
+        }
+    } else {
+        for i in 0..K {
+            if i != mx_idx {
+                out[i] = p[i] + excess * (p[i] / other_sum)
+            }
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (6) Baseline attacker: flag MEMBER if max_p > threshold
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn md_attack_predict(p, threshold) {
+    let K = len(p)
+    let mut mx = p[0]
+    for i in 1..K { if p[i] > mx { mx = p[i] } }
+    return mx > threshold
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (7) Attack accuracy on balanced (member, non-member) pool
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn md_attack_accuracy(P_mem, P_nonmem, threshold) {
+    let M = len(P_mem)
+    let N = len(P_nonmem)
+    if M + N == 0 { return 0.0 }
+    let mut correct = 0
+    for i in 0..M {
+        if md_attack_predict(P_mem[i], threshold) { correct = correct + 1 }
+    }
+    for j in 0..N {
+        if md_attack_predict(P_nonmem[j], threshold) == false { correct = correct + 1 }
+    }
+    return to_float(correct) / to_float(M + N)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (8) Unified dispatcher
+// ═══════════════════════════════════════════════════════════════════
+fn md_apply_defense(p, kind, param, seed) {
+    if kind == "temp" {
+        // param = temperature applied on logits = log(p)
+        let K = len(p)
+        let mut logits = md_zeros_f(K)
+        for i in 0..K { logits[i] = md_log(p[i] + 1.0e-12) }
+        return md_temp_softmax(logits, param)
+    }
+    if kind == "gauss" {
+        return md_output_gauss(p, param, seed)
+    }
+    if kind == "topk" {
+        return md_confidence_mask(p, int(param))
+    }
+    if kind == "memguard" {
+        return md_mem_guard(p, param)
+    }
+    return p
+}

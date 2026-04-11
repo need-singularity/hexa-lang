@@ -1,0 +1,330 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/reservoir_esn.hexa — Echo State Network (#285)
+//
+//  Reservoir computing (Jaeger 2001).  Recurrent state is computed
+//  with a fixed random reservoir; only the linear readout is trained.
+//
+//      x(t+1) = (1-α)·x(t) + α·tanh( W_in · u(t) + W_res · x(t) )
+//      y(t)   = W_out · x(t)
+//
+//  Spectral radius of W_res is scaled below 1 (echo-state property).
+//  Readout fit: ridge regression
+//      W_out = Y · X^T · (X · X^T + λ·I)^{-1}
+//  where X stacks the reservoir states.
+//
+//  API:
+//    esn_build(in_dim, res_dim, sparsity, spectral_radius, seed) -> model
+//    esn_step(model, state, inp)        -> [float]  (new state)
+//    esn_run(model, U)                  -> [[float]]  states (T rows)
+//    esn_fit_readout(states, Y, ridge)  -> W_out
+//    esn_predict_seq(model, W_out, U)   -> [[float]]
+//    esn_mse(Y_pred, Y_true)            -> float
+//
+//  AI-NATIVE attrs:
+//    @pure  (after build)
+//    @hot   — reservoir step (dense matmul)
+// ═══════════════════════════════════════════════════════════════════
+
+fn esn_abs(inp) { if inp < 0.0 { return 0.0 - inp } return inp }
+
+fn esn_zeros_f(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn esn_zeros_2d(rows, cols) {
+    let mut m = []
+    for _r in 0..rows {
+        let mut row = []
+        for _c in 0..cols { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+fn esn_eye(n) {
+    let mut m = esn_zeros_2d(n, n)
+    for i in 0..n { m[i][i] = 1.0 }
+    return m
+}
+
+fn esn_tanh(inp) {
+    let mut v = inp
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let e_pos = esn_exp(v)
+    let e_neg = esn_exp(0.0 - v)
+    return (e_pos - e_neg) / (e_pos + e_neg)
+}
+
+fn esn_exp(inp) {
+    let mut v = inp
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn esn_lcg(state) {
+    return (state * 1103515245 + 12345) % 2147483648
+}
+
+fn esn_uniform(state) {
+    let s = esn_lcg(state)
+    return [to_float(s) / 2147483648.0, to_float(s)]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Power-iteration spectral radius estimate
+// ═══════════════════════════════════════════════════════════════════
+fn esn_spectral_radius(M) {
+    let n = len(M)
+    let mut v = esn_zeros_f(n)
+    for i in 0..n { v[i] = 1.0 / to_float(n) }
+    let mut lam = 1.0
+    for _it in 0..50 {
+        let mut nv = esn_zeros_f(n)
+        for i in 0..n {
+            let mut s = 0.0
+            for j in 0..n { s = s + M[i][j] * v[j] }
+            nv[i] = s
+        }
+        let mut nrm = 0.0
+        for i in 0..n { nrm = nrm + nv[i] * nv[i] }
+        nrm = esn_sqrt(nrm)
+        if nrm < 1.0e-12 { return 0.0 }
+        for i in 0..n { nv[i] = nv[i] / nrm }
+        // Rayleigh quotient approx
+        let mut num = 0.0
+        for i in 0..n {
+            let mut s = 0.0
+            for j in 0..n { s = s + M[i][j] * nv[j] }
+            num = num + nv[i] * s
+        }
+        lam = esn_abs(num)
+        v = nv
+    }
+    return lam
+}
+
+fn esn_sqrt(inp) {
+    if inp <= 0.0 { return 0.0 }
+    let mut g = inp / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 { g = (g + inp / g) / 2.0 }
+    return g
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Matrix inverse (Gauss-Jordan)
+// ═══════════════════════════════════════════════════════════════════
+fn esn_inv(M) {
+    let n = len(M)
+    let mut A = esn_zeros_2d(n, 2 * n)
+    for i in 0..n {
+        for j in 0..n { A[i][j] = M[i][j] }
+        A[i][n + i] = 1.0
+    }
+    for i in 0..n {
+        let mut piv_row = i
+        let mut best = esn_abs(A[i][i])
+        for r in (i + 1)..n {
+            let m = esn_abs(A[r][i])
+            if m > best {
+                best = m
+                piv_row = r
+            }
+        }
+        if piv_row != i {
+            let tmp = A[i]
+            A[i] = A[piv_row]
+            A[piv_row] = tmp
+        }
+        let piv = A[i][i]
+        if esn_abs(piv) < 1.0e-12 { return esn_eye(n) }
+        let inv_p = 1.0 / piv
+        for j in 0..(2 * n) { A[i][j] = A[i][j] * inv_p }
+        for r in 0..n {
+            if r != i {
+                let factor = A[r][i]
+                for j in 0..(2 * n) { A[r][j] = A[r][j] - factor * A[i][j] }
+            }
+        }
+    }
+    let mut inv = esn_zeros_2d(n, n)
+    for i in 0..n {
+        for j in 0..n { inv[i][j] = A[i][n + j] }
+    }
+    return inv
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Build model — deterministic by seed
+// ═══════════════════════════════════════════════════════════════════
+fn esn_build(in_dim, res_dim, sparsity, spectral_radius, seed) {
+    let mut state = seed
+    if state <= 0 { state = 1 }
+    // W_in ~ U(-1, 1)
+    let mut W_in = esn_zeros_2d(res_dim, in_dim)
+    for i in 0..res_dim {
+        for j in 0..in_dim {
+            let u = esn_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W_in[i][j] = u[0] * 2.0 - 1.0
+        }
+    }
+    // W_res sparse ~ U(-1,1)
+    let mut W_res = esn_zeros_2d(res_dim, res_dim)
+    for i in 0..res_dim {
+        for j in 0..res_dim {
+            let u_mask = esn_uniform(state)
+            state = int(u_mask[1])
+            if state <= 0 { state = 1 }
+            if u_mask[0] < sparsity {
+                let u_val = esn_uniform(state)
+                state = int(u_val[1])
+                if state <= 0 { state = 1 }
+                W_res[i][j] = u_val[0] * 2.0 - 1.0
+            }
+        }
+    }
+    // Scale to desired spectral radius
+    let rho = esn_spectral_radius(W_res)
+    if rho > 1.0e-9 {
+        let scale = spectral_radius / rho
+        for i in 0..res_dim {
+            for j in 0..res_dim { W_res[i][j] = W_res[i][j] * scale }
+        }
+    }
+    return #{
+        "in_dim": in_dim,
+        "res_dim": res_dim,
+        "leak": 0.3,
+        "W_in": W_in,
+        "W_res": W_res
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Single reservoir step
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn esn_step(model, state, inp) {
+    let W_in = model["W_in"]
+    let W_res = model["W_res"]
+    let leak = model["leak"]
+    let R = model["res_dim"]
+    let I = model["in_dim"]
+    let mut nv = esn_zeros_f(R)
+    for i in 0..R {
+        let mut s = 0.0
+        for j in 0..I { s = s + W_in[i][j] * inp[j] }
+        for j in 0..R { s = s + W_res[i][j] * state[j] }
+        nv[i] = esn_tanh(s)
+    }
+    let mut new_state = esn_zeros_f(R)
+    for i in 0..R { new_state[i] = (1.0 - leak) * state[i] + leak * nv[i] }
+    return new_state
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Run reservoir over a sequence U[T][in_dim] → X[T][res_dim]
+// ═══════════════════════════════════════════════════════════════════
+fn esn_run(model, U) {
+    let nT = len(U)
+    let R = model["res_dim"]
+    let mut state = esn_zeros_f(R)
+    let mut res_states = []
+    for t in 0..nT {
+        state = esn_step(model, state, U[t])
+        res_states = res_states + [state]
+    }
+    return res_states
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Ridge regression readout:
+//    W_out  (out_dim × res_dim) = Y^T · X · (X^T X + λ I)^{-1}
+//  where X has rows = states (T×R), Y has rows = targets (T×O).
+// ═══════════════════════════════════════════════════════════════════
+fn esn_fit_readout(states, Y, ridge) {
+    let nT = len(states)
+    let R = len(states[0])
+    let O = len(Y[0])
+    // Compute A = X^T X  (R×R)
+    let mut A = esn_zeros_2d(R, R)
+    for t in 0..nT {
+        let xt = states[t]
+        for i in 0..R {
+            for j in 0..R { A[i][j] = A[i][j] + xt[i] * xt[j] }
+        }
+    }
+    for i in 0..R { A[i][i] = A[i][i] + ridge }
+    // B = Y^T X  (O×R)
+    let mut B = esn_zeros_2d(O, R)
+    for t in 0..nT {
+        let yt = Y[t]
+        let xt = states[t]
+        for k in 0..O {
+            for j in 0..R { B[k][j] = B[k][j] + yt[k] * xt[j] }
+        }
+    }
+    let A_inv = esn_inv(A)
+    // W_out = B · A_inv  (O×R)
+    let mut W_out = esn_zeros_2d(O, R)
+    for k in 0..O {
+        for j in 0..R {
+            let mut s = 0.0
+            for i in 0..R { s = s + B[k][i] * A_inv[i][j] }
+            W_out[k][j] = s
+        }
+    }
+    return W_out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Predict on a sequence: run reservoir, multiply by W_out
+// ═══════════════════════════════════════════════════════════════════
+fn esn_predict_seq(model, W_out, U) {
+    let states = esn_run(model, U)
+    let nT = len(states)
+    let R = len(states[0])
+    let O = len(W_out)
+    let mut preds = []
+    for t in 0..nT {
+        let mut row = esn_zeros_f(O)
+        for k in 0..O {
+            let mut s = 0.0
+            for j in 0..R { s = s + W_out[k][j] * states[t][j] }
+            row[k] = s
+        }
+        preds = preds + [row]
+    }
+    return preds
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  MSE
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn esn_mse(Y_pred, Y_true) {
+    let nT = len(Y_pred)
+    if nT == 0 { return 0.0 }
+    let O = len(Y_pred[0])
+    let mut s = 0.0
+    for t in 0..nT {
+        for k in 0..O {
+            let d = Y_pred[t][k] - Y_true[t][k]
+            s = s + d * d
+        }
+    }
+    return s / to_float(nT * O)
+}
