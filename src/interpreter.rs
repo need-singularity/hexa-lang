@@ -2652,6 +2652,34 @@ impl Interpreter {
                 }
             }
             Expr::Field(obj, field_name) => {
+                // Fast path: ident.field — avoid cloning the whole Struct/
+                // Map/Intent just to read one field. Same shape as the
+                // arr[i] fast path. The default eval_expr(obj) clones the
+                // entire boxed HashMap; here we hold a borrow and clone
+                // just the single field value.
+                if let Expr::Ident(obj_name) = obj.as_ref() {
+                    if let Some(obj_ref) = self.env.get_ref(obj_name) {
+                        match obj_ref {
+                            Value::Struct(_, fields) => {
+                                return fields.get(field_name).cloned().ok_or_else(|| {
+                                    self.runtime_err(format!("struct has no field '{}'", field_name))
+                                });
+                            }
+                            Value::Map(map) => {
+                                return map.get(field_name).cloned().ok_or_else(|| {
+                                    self.runtime_err(format!("map has no key '{}'", field_name))
+                                });
+                            }
+                            Value::Intent(fields) => {
+                                return fields.get(field_name).cloned().ok_or_else(|| {
+                                    self.runtime_err(format!("intent has no field '{}'", field_name))
+                                });
+                            }
+                            _ => { /* fall through to general path */ }
+                        }
+                    }
+                }
+
                 let obj_val = self.eval_expr(obj)?;
                 match &obj_val {
                     Value::Struct(_, fields) => {
