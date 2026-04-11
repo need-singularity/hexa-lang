@@ -1,0 +1,449 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/progressive_distillation.hexa — Progressive Distillation (#237)
+//
+//  Multi-teacher staged distillation — staged teacher -> student pipeline.
+//    1. Stage 1: full teacher -> intermediate model (2x compression)
+//    2. Stage 2: intermediate -> final student (4x total compression)
+//    3. Temperature annealing: high T early -> low T late
+//    4. Feature matching: intermediate layer alignment via projection
+//    5. Combined loss: alpha*hard + (1-alpha)*soft + beta*feature_match
+//    6. Progressive: gradually increase student difficulty over stages
+//
+//  API:
+//    pd_softmax(logits, temp)                          -> [float]
+//    pd_kl_div(p, q)                                   -> float
+//    pd_cross_entropy(logits, target_idx)               -> float
+//    pd_forward(weights, input)                         -> [float]
+//    pd_feature_loss(s_feats, t_feats)                  -> float
+//    pd_feature_project(feats, proj)                    -> [float]
+//    pd_temp_anneal(base_temp, step, total_steps)       -> float
+//    pd_alpha_schedule(base_alpha, stage, n_stages)     -> float
+//    pd_combined_loss(s_log, t_log, s_feat, t_feat, temp, alpha, beta) -> float
+//    pd_stage_compress(teacher_w, ratio, seed)          -> [[float]]
+//    pd_multi_stage_distill(teacher_w, stages, inputs, config) -> student
+//    pd_eval_accuracy(student, teacher, inputs)          -> float
+//    pd_model_size(weights)                             -> int
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+//    @hot   — called every training step
+// ═══════════════════════════════════════════════════════════════════
+
+// ── helpers ──────────────────────────────────────────────────────
+
+fn pd_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn pd_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn pd_log(x) {
+    if x <= 0.0 { return -30.0 }
+    let mut v = x
+    let mut count = 0
+    while v > 2.0 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    let d = v - 1.0
+    let ln_v = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_v
+}
+
+fn pd_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn pd_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn pd_hash(seed, i, j) {
+    let h = ((seed * 2654435761 + i * 1315423911 + j * 731) % 10007)
+    return to_float(h) / 10007.0 - 0.5
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (1) Softmax with Temperature
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn pd_softmax(logits, temp) {
+    let n = len(logits)
+    let mut t = temp
+    if t < 0.01 { t = 0.01 }
+    let mut scaled = pd_zeros(n)
+    for i in 0..n {
+        scaled[i] = logits[i] / t
+    }
+    let mut m = scaled[0]
+    for i in 1..n {
+        if scaled[i] > m { m = scaled[i] }
+    }
+    let mut exps = pd_zeros(n)
+    let mut z = 0.0
+    for i in 0..n {
+        exps[i] = pd_exp(scaled[i] - m)
+        z = z + exps[i]
+    }
+    let mut out = pd_zeros(n)
+    for i in 0..n {
+        out[i] = exps[i] / z
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (2) KL Divergence
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn pd_kl_div(p, q) {
+    let n = len(p)
+    let mut kl = 0.0
+    for i in 0..n {
+        if p[i] > 1.0e-10 {
+            let ratio = p[i] / (q[i] + 1.0e-10)
+            kl = kl + p[i] * pd_log(ratio)
+        }
+    }
+    if kl < 0.0 { return 0.0 }
+    return kl
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (3) Cross Entropy
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn pd_argmax(vals) {
+    let n = len(vals)
+    let mut best = 0
+    let mut best_v = vals[0]
+    for i in 1..n {
+        if vals[i] > best_v {
+            best_v = vals[i]
+            best = i
+        }
+    }
+    return best
+}
+
+@pure
+fn pd_cross_entropy(logits, target_idx) {
+    let probs = pd_softmax(logits, 1.0)
+    let p = probs[target_idx]
+    if p > 1.0e-10 {
+        return 0.0 - pd_log(p)
+    }
+    return 30.0
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (4) Forward Pass — linear layer
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn pd_forward(weights, input) {
+    let out_dim = len(weights)
+    let in_dim = len(input)
+    let mut logits = pd_zeros(out_dim)
+    for i in 0..out_dim {
+        let mut s = 0.0
+        for j in 0..in_dim {
+            s = s + weights[i][j] * input[j]
+        }
+        logits[i] = s
+    }
+    return logits
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (5) Feature Loss — MSE between feature vectors
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn pd_feature_loss(s_feats, t_feats) {
+    let n = len(s_feats)
+    let mut mse = 0.0
+    for i in 0..n {
+        let diff = s_feats[i] - t_feats[i]
+        mse = mse + diff * diff
+    }
+    return mse / to_float(n)
+}
+
+// Feature projection: project student features to teacher dim
+// proj: [t_dim][s_dim], feats: [s_dim] -> [t_dim]
+@pure
+fn pd_feature_project(feats, proj) {
+    let t_dim = len(proj)
+    let s_dim = len(feats)
+    let mut out = pd_zeros(t_dim)
+    for i in 0..t_dim {
+        let mut s = 0.0
+        for j in 0..s_dim {
+            s = s + proj[i][j] * feats[j]
+        }
+        out[i] = s
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (6) Temperature Annealing
+//
+//  Starts at base_temp (high), linearly decays to 1.0 over total_steps.
+//  High T early = softer targets (more dark knowledge)
+//  Low T late   = sharper targets (harder to match)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn pd_temp_anneal(base_temp, step, total_steps) {
+    if total_steps <= 1 { return base_temp }
+    let progress = to_float(step) / to_float(total_steps - 1)
+    let mut t = base_temp - (base_temp - 1.0) * progress
+    if t < 1.0 { t = 1.0 }
+    return t
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (7) Alpha Schedule — shift from soft to hard loss over stages
+//
+//  Early stages: more soft loss (learn teacher's dark knowledge)
+//  Later stages: more hard loss (match true labels)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn pd_alpha_schedule(base_alpha, stage, n_stages) {
+    if n_stages <= 1 { return base_alpha }
+    let progress = to_float(stage) / to_float(n_stages - 1)
+    let mut a = base_alpha + (1.0 - base_alpha) * progress * 0.5
+    if a > 1.0 { a = 1.0 }
+    return a
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (8) Beta Schedule — feature matching ramp
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn pd_beta_schedule(base_beta, step, total_steps) {
+    if total_steps <= 1 { return base_beta }
+    let progress = to_float(step) / to_float(total_steps - 1)
+    return base_beta * progress
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (9) Combined Loss
+//
+//  loss = alpha * hard_loss + (1-alpha) * T^2 * KL + beta * feature_loss
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn pd_combined_loss(s_logits, t_logits, s_feats, t_feats, temp, alpha, beta) {
+    // Hard loss
+    let target = pd_argmax(t_logits)
+    let hard_loss = pd_cross_entropy(s_logits, target)
+
+    // Soft loss
+    let t_soft = pd_softmax(t_logits, temp)
+    let s_soft = pd_softmax(s_logits, temp)
+    let kl = pd_kl_div(t_soft, s_soft)
+    let soft_loss = temp * temp * kl
+
+    // Feature loss
+    let feat_loss = pd_feature_loss(s_feats, t_feats)
+
+    return alpha * hard_loss + (1.0 - alpha) * soft_loss + beta * feat_loss
+}
+
+// Simpler combined loss without features
+@pure @hot
+fn pd_combined_loss_simple(s_logits, t_logits, temp, alpha) {
+    let target = pd_argmax(t_logits)
+    let hard_loss = pd_cross_entropy(s_logits, target)
+    let t_soft = pd_softmax(t_logits, temp)
+    let s_soft = pd_softmax(s_logits, temp)
+    let kl = pd_kl_div(t_soft, s_soft)
+    let soft_loss = temp * temp * kl
+    return alpha * hard_loss + (1.0 - alpha) * soft_loss
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (10) Model Size — count total parameters
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn pd_model_size(weights) {
+    let out_dim = len(weights)
+    if out_dim == 0 { return 0 }
+    let in_dim = len(weights[0])
+    return out_dim * in_dim
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (11) Stage Compression — create smaller model from teacher
+//
+//  Given teacher [out_dim][in_dim], create student with reduced dims.
+//  ratio: compression factor (2 = half the parameters)
+//  Initializes with scaled teacher weights (knowledge retention).
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn pd_stage_compress(teacher_w, ratio, seed) {
+    let t_out = len(teacher_w)
+    let t_in = len(teacher_w[0])
+    // Reduce output dimension by ratio (keep at least 2)
+    let mut s_out = t_out / ratio
+    if s_out < 2 { s_out = 2 }
+    // Student inherits subset of teacher rows, with noise
+    let mut student = []
+    for i in 0..s_out {
+        let mut row = pd_zeros(t_in)
+        // Map student row to teacher row (uniformly spaced)
+        let mut t_row = i * ratio
+        if t_row >= t_out { t_row = t_out - 1 }
+        for j in 0..t_in {
+            row[j] = teacher_w[t_row][j] + pd_hash(seed, i, j) * 0.1
+        }
+        student = student + [row]
+    }
+    return student
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (12) Training Step — numerical gradient descent
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn pd_train_step(student, teacher, input, temp, alpha, lr) {
+    let out_dim = len(student)
+    let in_dim = len(student[0])
+    let eps = 1.0e-4
+
+    // Teacher may have more outputs than student (staged compression).
+    // Truncate teacher logits to student output dim so loss matches.
+    let t_logits_full = pd_forward(teacher, input)
+    let mut t_logits = pd_zeros(out_dim)
+    let t_len = len(t_logits_full)
+    for i in 0..out_dim {
+        if i < t_len { t_logits[i] = t_logits_full[i] }
+    }
+
+    let s_logits = pd_forward(student, input)
+    let loss0 = pd_combined_loss_simple(s_logits, t_logits, temp, alpha)
+
+    // Copy student
+    let mut tmp = []
+    for i in 0..out_dim {
+        let mut row = pd_zeros(in_dim)
+        for j in 0..in_dim { row[j] = student[i][j] }
+        tmp = tmp + [row]
+    }
+
+    // Compute gradients and update
+    let mut new_student = []
+    for i in 0..out_dim {
+        let mut row = pd_zeros(in_dim)
+        for j in 0..in_dim {
+            let orig = tmp[i][j]
+            tmp[i][j] = orig + eps
+            let logits_p = pd_forward(tmp, input)
+            let loss_p = pd_combined_loss_simple(logits_p, t_logits, temp, alpha)
+            let grad = (loss_p - loss0) / eps
+            row[j] = student[i][j] - lr * grad
+            tmp[i][j] = orig
+        }
+        new_student = new_student + [row]
+    }
+    return new_student
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (13) Multi-Stage Distillation Pipeline
+//
+//  Stage 1: teacher -> intermediate (2x compress)
+//  Stage 2: intermediate -> student (2x more = 4x total)
+//  Each stage trains for `steps_per_stage` steps.
+//
+//  Returns: final student weights
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn pd_multi_stage_distill(teacher_w, inputs, n_stages, steps_per_stage, base_temp, base_alpha, lr) {
+    let mut current_teacher = teacher_w
+    let mut current_student = teacher_w
+    let n_inputs = len(inputs)
+
+    for stage in 0..n_stages {
+        // Compress from current teacher
+        current_student = pd_stage_compress(current_teacher, 2, stage * 1000 + 42)
+
+        // Temperature and alpha for this stage
+        let temp = pd_temp_anneal(base_temp, stage, n_stages)
+        let alpha = pd_alpha_schedule(base_alpha, stage, n_stages)
+
+        // Train for steps_per_stage
+        for step in 0..steps_per_stage {
+            let input_idx = step % n_inputs
+            current_student = pd_train_step(current_student, current_teacher, inputs[input_idx], temp, alpha, lr)
+        }
+
+        // Intermediate becomes the teacher for next stage
+        current_teacher = current_student
+    }
+
+    return current_student
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (14) Evaluation Accuracy
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn pd_eval_accuracy(student_w, teacher_w, inputs) {
+    let n = len(inputs)
+    if n == 0 { return 0.0 }
+    let mut matches = 0
+    for i in 0..n {
+        let s_out = pd_forward(student_w, inputs[i])
+        let t_out = pd_forward(teacher_w, inputs[i])
+        if pd_argmax(s_out) == pd_argmax(t_out) {
+            matches = matches + 1
+        }
+    }
+    return to_float(matches) / to_float(n)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (15) Cosine Similarity — for feature alignment quality
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn pd_cosine_sim(a, b) {
+    let n = len(a)
+    let mut dot = 0.0
+    let mut na = 0.0
+    let mut nb = 0.0
+    for i in 0..n {
+        dot = dot + a[i] * b[i]
+        na = na + a[i] * a[i]
+        nb = nb + b[i] * b[i]
+    }
+    let denom = pd_sqrt(na) * pd_sqrt(nb)
+    if denom < 1.0e-10 { return 0.0 }
+    return dot / denom
+}
+
+println("[progressive_distillation] loaded — staged distill + temp anneal + feature match + combined loss + multi-stage pipeline")

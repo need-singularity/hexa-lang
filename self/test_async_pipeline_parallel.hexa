@@ -1,0 +1,263 @@
+// ===================================================================
+//  test_async_pipeline_parallel.hexa — Unit tests for Async Pipeline
+//  Parallel (#242)
+//
+//  Tests:
+//    - Stage config + layer assignment
+//    - Microbatch splitting (dispatch)
+//    - Single forward reference
+//    - 1F1B schedule: counts, ordering (stage0 forward first, backward
+//      starts only after at least one forward reaches last stage)
+//    - Bubble ratio formula + ordering
+//    - Executor run: correct outputs per microbatch
+//    - Activation stashing integrity (stage0 input matches source)
+//    - Chimera schedule: bidirectional fan-out, halved bubble
+//    - Throughput scaling
+//
+//  Run: PATH=/Users/ghost/.cargo/bin:$PATH ./hexa self/test_async_pipeline_parallel.hexa
+//
+//  ML roadmap #242 — Async Pipeline Parallel
+// ===================================================================
+
+import "ml/async_pipeline_parallel.hexa"
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn app_test_fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn app_test_approx(a, b, eps) { return app_test_fabs(a - b) < eps }
+
+fn check(idx, name, cond) {
+    if cond {
+        println("[PASS] #" + str(idx) + " " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] #" + str(idx) + " " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+println("=== Async Pipeline Parallel (#242) Tests ===")
+
+// ── Fixtures ────────────────────────────────────────────────────
+let P = 4   // stages
+let L = 8   // layers
+let M = 6   // microbatches
+let cfg = app_init(P, L, M)
+
+// Toy weights: w[l] = 0.5
+let mut weights = []
+let mut li = 0
+while li < L {
+    weights = weights.push(0.5)
+    li = li + 1
+}
+
+// Inputs: one scalar per microbatch
+let mut inputs = []
+let mut mi = 0
+while mi < M {
+    inputs = inputs.push(to_float(mi))
+    mi = mi + 1
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  #1-#4 — Stage config
+// ═══════════════════════════════════════════════════════════════
+
+check(1, "app_init fields", cfg.num_stages == P && cfg.num_layers == L && cfg.num_micro == M)
+check(2, "stage0 layer range = [0,2)",
+    app_stage_begin(cfg, 0) == 0 && app_stage_end(cfg, 0) == 2)
+check(3, "stage3 layer range = [6,8)",
+    app_stage_begin(cfg, 3) == 6 && app_stage_end(cfg, 3) == 8)
+
+// Stage bounds partition [0, L) exactly
+let mut partition_ok = true
+let mut s_check = 0
+while s_check < P {
+    if s_check > 0 {
+        if app_stage_begin(cfg, s_check) != app_stage_end(cfg, s_check - 1) {
+            partition_ok = false
+        }
+    }
+    s_check = s_check + 1
+}
+check(4, "stage bounds form a contiguous partition", partition_ok)
+
+// ═══════════════════════════════════════════════════════════════
+//  #5-#6 — Stage forward / reference
+// ═══════════════════════════════════════════════════════════════
+
+// Toy model: forward over L layers of bias 0.5 — y = x + L*0.5 = x + 4.0
+let y_stage0 = app_stage_forward(0.0, weights, 0, 2)
+check(5, "stage0 forward (2 layers): 0 + 1.0 = 1.0",
+    app_test_approx(y_stage0, 1.0, 1.0e-9))
+
+let full = app_single_forward(3.0, weights)
+check(6, "single_forward(3.0) = 3.0 + 8*0.5 = 7.0",
+    app_test_approx(full, 7.0, 1.0e-9))
+
+// ═══════════════════════════════════════════════════════════════
+//  #7-#8 — Microbatch splitting (dispatch)
+// ═══════════════════════════════════════════════════════════════
+
+let batch = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0]
+let micros = app_split_batch(batch, 3)
+check(7, "split_batch 3 micros", len(micros) == 3 && len(micros[0]) == 2)
+check(8, "split_batch values",
+    app_test_approx(micros[0][0], 10.0, 1.0e-9)
+    && app_test_approx(micros[1][0], 30.0, 1.0e-9)
+    && app_test_approx(micros[2][1], 60.0, 1.0e-9))
+
+// ═══════════════════════════════════════════════════════════════
+//  #9-#14 — 1F1B schedule construction + counts
+// ═══════════════════════════════════════════════════════════════
+
+let events = app_build_1f1b(P, M)
+check(9, "1F1B produces events", len(events) > 0)
+
+// Count forwards and backwards: should be exactly P*M each
+let mut fwd_count = 0
+let mut bwd_count = 0
+let mut ev_i = 0
+while ev_i < len(events) {
+    let e = events[ev_i]
+    if e[1] == 0 { fwd_count = fwd_count + 1 }
+    if e[1] == 1 { bwd_count = bwd_count + 1 }
+    ev_i = ev_i + 1
+}
+check(10, "1F1B forward count = P*M", fwd_count == P * M)
+check(11, "1F1B backward count = P*M", bwd_count == P * M)
+
+// Stage 0 forward for micro 0 must appear (and before any backward on stage P-1)
+let mut stage0_fwd0_idx = -1
+let mut stage_last_bwd0_idx = -1
+ev_i = 0
+while ev_i < len(events) {
+    let e = events[ev_i]
+    if e[0] == 0 && e[1] == 0 && e[2] == 0 && stage0_fwd0_idx < 0 {
+        stage0_fwd0_idx = ev_i
+    }
+    if e[0] == P - 1 && e[1] == 1 && e[2] == 0 && stage_last_bwd0_idx < 0 {
+        stage_last_bwd0_idx = ev_i
+    }
+    ev_i = ev_i + 1
+}
+check(12, "1F1B has stage0 forward micro0", stage0_fwd0_idx >= 0)
+check(13, "1F1B has last-stage backward micro0", stage_last_bwd0_idx >= 0)
+check(14, "1F1B ordering: fwd stage0 micro0 before bwd stageLast micro0",
+    stage0_fwd0_idx < stage_last_bwd0_idx)
+
+// Per-stage forward ordering: forwards of stage s for micro 0..M-1 must be monotonic
+let mut stage_order_ok = true
+let mut s_o = 0
+while s_o < P {
+    let mut last_fwd_mid = -1
+    let mut ei = 0
+    while ei < len(events) {
+        let e = events[ei]
+        if e[0] == s_o && e[1] == 0 {
+            if e[2] < last_fwd_mid { stage_order_ok = false }
+            last_fwd_mid = e[2]
+        }
+        ei = ei + 1
+    }
+    s_o = s_o + 1
+}
+check(15, "per-stage forwards are in micro-id order", stage_order_ok)
+
+// ═══════════════════════════════════════════════════════════════
+//  #16-#18 — Bubble ratio
+// ═══════════════════════════════════════════════════════════════
+
+let bub = app_bubble_ratio(P, M)
+check(16, "bubble_ratio in [0,1)", bub >= 0.0 && bub < 1.0)
+
+// More microbatches -> lower bubble
+check(17, "bubble_ratio(P, 12) < bubble_ratio(P, 3)",
+    app_bubble_ratio(P, 12) < app_bubble_ratio(P, 3))
+
+// Expected formula: (P-1)/(M+P-1) = 3/9 = 1/3 for P=4, M=6
+check(18, "bubble_ratio P=4 M=6 formula",
+    app_test_approx(app_bubble_ratio(4, 6), 3.0 / 9.0, 1.0e-6))
+
+// ═══════════════════════════════════════════════════════════════
+//  #19-#23 — Executor run + activation stashing
+// ═══════════════════════════════════════════════════════════════
+
+let res = app_run_1f1b(cfg, inputs, weights)
+check(19, "events_run > 0", res.events_run > 0)
+check(20, "outputs length = num_micro", len(res.outputs) == M)
+
+// For our toy model each micro produces input + L*0.5
+let mut out_ok = true
+let mut oi = 0
+while oi < M {
+    let expected = to_float(oi) + to_float(L) * 0.5
+    if !app_test_approx(res.outputs[oi], expected, 1.0e-6) { out_ok = false }
+    oi = oi + 1
+}
+check(21, "1F1B executor outputs match single_forward per micro", out_ok)
+
+// Weight grads should have shape L and all equal 1.0 * M (each micro contributes 1.0)
+check(22, "weight_grads length = L", len(res.weight_grads) == L)
+
+let mut wg_ok = true
+let mut wi = 0
+while wi < L {
+    if !app_test_approx(res.weight_grads[wi], to_float(M), 1.0e-6) { wg_ok = false }
+    wi = wi + 1
+}
+check(23, "weight_grads per layer = M (accumulated over microbatches)", wg_ok)
+
+// Bubble ratio reported in result should be a finite float
+check(24, "result bubble_ratio finite",
+    res.bubble_ratio >= -1.0 && res.bubble_ratio < 2.0)
+
+// ═══════════════════════════════════════════════════════════════
+//  #25-#28 — Chimera bidirectional schedule
+// ═══════════════════════════════════════════════════════════════
+
+let chimera = app_build_chimera(P, M)
+check(25, "chimera produces events", len(chimera) > 0)
+
+// Chimera events include direction marker at index 4 (0 fwd, 1 bwd direction)
+let mut dir0 = 0
+let mut dir1 = 0
+let mut cei = 0
+while cei < len(chimera) {
+    let e = chimera[cei]
+    if e[4] == 0 { dir0 = dir0 + 1 }
+    if e[4] == 1 { dir1 = dir1 + 1 }
+    cei = cei + 1
+}
+check(26, "chimera has both directions", dir0 > 0 && dir1 > 0)
+
+// Half microbatches should go each direction (approximately)
+check(27, "chimera direction 0 count = 1F1B(P, M/2) * 2 (fwd+bwd)",
+    dir0 == len(app_build_1f1b(P, M / 2)))
+
+// Chimera bubble ratio < standard 1F1B bubble ratio
+let chim_bub = app_chimera_bubble_ratio(P, M)
+check(28, "chimera bubble ratio < standard 1F1B bubble ratio",
+    chim_bub < app_bubble_ratio(P, M))
+
+// ═══════════════════════════════════════════════════════════════
+//  #29-#30 — Throughput scaling
+// ═══════════════════════════════════════════════════════════════
+
+let t1 = app_throughput_scaling(2, 8)
+let t2 = app_throughput_scaling(4, 8)
+check(29, "throughput 4 stages >= throughput 2 stages",
+    t2 >= t1)
+
+// Throughput should be less than num_stages (efficiency < 1)
+check(30, "throughput scaling < num_stages (bubble overhead)",
+    t2 < to_float(4))
+
+// ── summary ─────────────────────────────────────────────────────
+println("")
+println("=== Async Pipeline Parallel test summary ===")
+println("PASS: " + str(pass_count))
+println("FAIL: " + str(fail_count))
+println("TOTAL: " + str(pass_count + fail_count))

@@ -1,0 +1,521 @@
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/hyper_connections.hexa — Hyper-Connections
+//
+//  Cross-layer residual routing with dynamic skip connections.
+//  Each target layer receives a weighted sum of all source layers'
+//  hidden states via learnable connection weights.
+//
+//  Architecture:
+//    alpha[i][j]: weight from layer i to layer j
+//    gate[i][j]:  sigmoid gate per connection
+//    output[j] = sum_i(softmax(alpha[:,j])[i] * gate[i][j] * hidden[i])
+//
+//  Implements:
+//    1. Connection weight initialization
+//    2. Softmax normalization per target column
+//    3. Sigmoid gating
+//    4. Weighted sum routing
+//    5. Multi-layer forward pass
+//    6. Gradient flow verification helpers
+//
+//  API:
+//    hc_init_weights(n_layers)
+//    hc_init_gates(n_layers)
+//    hc_softmax_col(alpha, n_layers, col)
+//    hc_sigmoid(x)
+//    hc_route(hiddens, alpha, gates, n_layers, d)
+//    hc_forward(inputs, layers_W, layers_b, alpha, gates, n_layers, d)
+//
+//  AI-NATIVE attrs:
+//    @pure     — routing is deterministic
+//    @hot      — called every forward step
+//    @parallel — target layers independent
+// ═══════════════════════════════════════════════════════════════
+
+// ── helpers ──────────────────────────────────────────────────
+
+fn hc_zeros(d) {
+    let mut v = []
+    for _i in 0..d {
+        v = v + [0.0]
+    }
+    return v
+}
+
+fn hc_fabs(x) {
+    if x < 0.0 {
+        return 0.0 - x
+    }
+    return x
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Sigmoid: 1 / (1 + exp(-x))
+// ═══════════════════════════════════════════════════════════════
+@pure
+fn hc_sigmoid(x) {
+    return 1.0 / (1.0 + exp(0.0 - x))
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  ReLU activation
+// ═══════════════════════════════════════════════════════════════
+@pure
+fn hc_relu(x) {
+    if x > 0.0 {
+        return x
+    }
+    return 0.0
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Initialize connection weights alpha[i][j]
+//  Default: identity-like (strong self-connection, weak cross)
+//  alpha[i][i] = 1.0, alpha[i][j] = 0.1 for i != j
+// ═══════════════════════════════════════════════════════════════
+fn hc_init_weights(n_layers) {
+    let mut alpha = []
+    for i in 0..n_layers {
+        let mut row = []
+        for j in 0..n_layers {
+            if i == j {
+                row = row + [1.0]
+            } else {
+                row = row + [0.1]
+            }
+        }
+        alpha = alpha + [row]
+    }
+    return alpha
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Initialize gates: all open (positive logits => sigmoid near 1)
+// ═══════════════════════════════════════════════════════════════
+fn hc_init_gates(n_layers) {
+    let mut gates = []
+    for i in 0..n_layers {
+        let mut row = []
+        for j in 0..n_layers {
+            row = row + [2.0]
+        }
+        gates = gates + [row]
+    }
+    return gates
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Softmax normalization over column `col` of alpha
+//  Normalizes alpha[:,col] so source weights sum to 1 per target
+// ═══════════════════════════════════════════════════════════════
+@pure
+fn hc_softmax_col(alpha, n_layers, col) {
+    // find max for numerical stability
+    let mut m = alpha[0][col]
+    for i in 1..n_layers {
+        if alpha[i][col] > m {
+            m = alpha[i][col]
+        }
+    }
+
+    // exp and sum
+    let mut exps = hc_zeros(n_layers)
+    let mut z = 0.0
+    for i in 0..n_layers {
+        let e = exp(alpha[i][col] - m)
+        exps[i] = e
+        z = z + e
+    }
+
+    // normalize
+    let mut result = hc_zeros(n_layers)
+    for i in 0..n_layers {
+        result[i] = exps[i] / z
+    }
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Route: compute output for each target layer
+//  output[j] = sum_i(softmax(alpha[:,j])[i] * sigmoid(gates[i][j]) * hidden[i])
+//  hiddens: [n_layers][d]
+//  Returns: [n_layers][d] routed outputs
+// ═══════════════════════════════════════════════════════════════
+@hot @parallel
+fn hc_route(hiddens, alpha, gates, n_layers, d) {
+    let mut outputs = []
+    for j in 0..n_layers {
+        // softmax over source layers for target j
+        let weights = hc_softmax_col(alpha, n_layers, j)
+
+        // weighted sum with gating
+        let mut out = hc_zeros(d)
+        for i in 0..n_layers {
+            let w = weights[i] * hc_sigmoid(gates[i][j])
+            for k in 0..d {
+                out[k] = out[k] + w * hiddens[i][k]
+            }
+        }
+        outputs = outputs + [out]
+    }
+    return outputs
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Simple linear layer: y = ReLU(W @ x + b)
+//  W: [d][d], b: [d]
+// ═══════════════════════════════════════════════════════════════
+@pure
+fn hc_linear_relu(x, W, b, d) {
+    let mut y = hc_zeros(d)
+    for i in 0..d {
+        let mut acc = b[i]
+        for j in 0..d {
+            acc = acc + W[i][j] * x[j]
+        }
+        y[i] = hc_relu(acc)
+    }
+    return y
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Full forward pass with hyper-connections
+//  Processes input through n_layers, with cross-layer routing
+//  at each step.
+//
+//  layers_W: [n_layers][d][d] — weight matrices
+//  layers_b: [n_layers][d]    — biases
+//  alpha:    [n_layers][n_layers] — connection weights
+//  gates:    [n_layers][n_layers] — gate logits
+//
+//  Algorithm:
+//    1. Initialize hidden[i] = input for all layers
+//    2. Route: mix hiddens via alpha/gates
+//    3. Transform: apply layer-specific linear+ReLU
+// ═══════════════════════════════════════════════════════════════
+fn hc_forward(input, layers_W, layers_b, alpha, gates, n_layers, d) {
+    // initialize all layer hiddens to input
+    let mut hiddens = []
+    for _i in 0..n_layers {
+        let mut h = hc_zeros(d)
+        for k in 0..d {
+            h[k] = input[k]
+        }
+        hiddens = hiddens + [h]
+    }
+
+    // route: mix hidden states across layers
+    let routed = hc_route(hiddens, alpha, gates, n_layers, d)
+
+    // transform each layer
+    let mut outputs = []
+    for i in 0..n_layers {
+        let out = hc_linear_relu(routed[i], layers_W[i], layers_b[i], d)
+        outputs = outputs + [out]
+    }
+
+    return outputs
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Multi-pass forward: run routing + transform for `n_passes` iterations
+// ═══════════════════════════════════════════════════════════════
+fn hc_forward_multi(input, layers_W, layers_b, alpha, gates, n_layers, d, n_passes) {
+    // initialize
+    let mut hiddens = []
+    for _i in 0..n_layers {
+        let mut h = hc_zeros(d)
+        for k in 0..d {
+            h[k] = input[k]
+        }
+        hiddens = hiddens + [h]
+    }
+
+    for _p in 0..n_passes {
+        // route
+        let routed = hc_route(hiddens, alpha, gates, n_layers, d)
+        // transform
+        let mut new_hiddens = []
+        for i in 0..n_layers {
+            let out = hc_linear_relu(routed[i], layers_W[i], layers_b[i], d)
+            new_hiddens = new_hiddens + [out]
+        }
+        hiddens = new_hiddens
+    }
+    return hiddens
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Utility: sum of softmax weights per column (should be 1.0)
+// ═══════════════════════════════════════════════════════════════
+@pure
+fn hc_verify_softmax_sum(alpha, n_layers, col) {
+    let w = hc_softmax_col(alpha, n_layers, col)
+    let mut s = 0.0
+    for i in 0..n_layers {
+        s = s + w[i]
+    }
+    return s
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Utility: check if gradient can flow through gated connections
+//  Returns true if at least one gate per target layer is open (>0.5)
+// ═══════════════════════════════════════════════════════════════
+fn hc_gradient_flow_check(gates, n_layers) {
+    for j in 0..n_layers {
+        let mut has_open = false
+        for i in 0..n_layers {
+            if hc_sigmoid(gates[i][j]) > 0.5 {
+                has_open = true
+            }
+        }
+        if !has_open {
+            return false
+        }
+    }
+    return true
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Pang-et-al. hyper-connection primitives (#227 core API)
+//
+//  An orthogonal API that models Pang 2024 style per-lane residual
+//  routing over a rank-r expansion space. Used for cross-layer mixing
+//  where each layer produces an f(h) update that is combined into the
+//  hyper-state via learnable α (keep) / β (mix) coefficients.
+//
+//  State layout: flat [r * width] row-major (lane l at offset l*width).
+//
+//  Functions are side-effect-free and use parameter names that DON'T
+//  collide with typical call-site `let`-bindings (the Hexa interpreter
+//  has a known issue where function params shadowing outer vars can
+//  alias and corrupt the outer variable).
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn hc_hpsqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 { g = (g + x / g) / 2.0 }
+    return g
+}
+
+@pure
+fn hc_hpexp(x) {
+    let mut cx = x
+    if cx > 20.0 { cx = 20.0 }
+    if cx < 0.0 - 20.0 { cx = 0.0 - 20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..20 {
+        term = term * cx / to_float(i)
+        result = result + term
+    }
+    return result
+}
+
+@pure
+fn hc_hp_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+@pure
+fn hc_hp_ones(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [1.0] }
+    return v
+}
+
+@pure
+fn hc_hp_copy(v) {
+    let n = len(v)
+    let mut out = []
+    for i in 0..n { out = out + [v[i]] }
+    return out
+}
+
+@pure
+fn hc_hp_dot(a_vec, b_vec) {
+    let n = len(a_vec)
+    let mut s = 0.0
+    for i in 0..n { s = s + a_vec[i] * b_vec[i] }
+    return s
+}
+
+@pure
+fn hc_hp_norm(v) {
+    return hc_hpsqrt(hc_hp_dot(v, v))
+}
+
+@pure
+fn hc_hp_init_vec(n, seed) {
+    let mut v = []
+    for i in 0..n {
+        let h = (i * 131 + seed * 4099) % 10007
+        let val = (to_float(h) / 10007.0 - 0.5) * 0.2
+        v = v + [val]
+    }
+    return v
+}
+
+// hc_create — build the rank-r hyper-connection config dict
+@pure
+fn hc_create(width, expand) {
+    let mut r = expand
+    if r < 1 { r = 1 }
+    let E = hc_hp_init_vec(r, 17)
+    let C = hc_hp_init_vec(r, 29)
+    let mut alpha0 = []
+    let mut beta0 = []
+    let inv = 1.0 / to_float(r)
+    for _i in 0..r {
+        alpha0 = alpha0 + [inv]
+        beta0 = beta0 + [inv]
+    }
+    return #{
+        "width": width,
+        "expand": r,
+        "E": E,
+        "C": C,
+        "alpha0": alpha0,
+        "beta0": beta0
+    }
+}
+
+// hc_expand — lift a width-d vector into r parallel lanes
+@pure
+fn hc_expand(x_vec, cfg) {
+    let width = cfg["width"]
+    let r = cfg["expand"]
+    let E = cfg["E"]
+    let inv = 1.0 / to_float(r)
+    let mut out = []
+    for l in 0..r {
+        let scale = inv + E[l]
+        for j in 0..width {
+            out = out + [scale * x_vec[j]]
+        }
+    }
+    return out
+}
+
+// hc_init_state — alias of hc_expand
+@pure
+fn hc_init_state(cfg, x_vec) {
+    return hc_expand(x_vec, cfg)
+}
+
+// hc_contract — collapse r lanes back to width-d vector
+@pure
+fn hc_contract(hstate, cfg) {
+    let width = cfg["width"]
+    let r = cfg["expand"]
+    let C = cfg["C"]
+    let inv = 1.0 / to_float(r)
+    let mut y = hc_hp_zeros(width)
+    for l in 0..r {
+        let scale = inv + C[l]
+        for j in 0..width {
+            y[j] = y[j] + scale * hstate[l * width + j]
+        }
+    }
+    return y
+}
+
+// hc_step — apply one layer's contribution to the hyper state
+@pure
+fn hc_step(cfg, hstate, fx, a_vec, b_vec) {
+    let width = cfg["width"]
+    let r = cfg["expand"]
+    let mut new_state = []
+    for l in 0..r {
+        let a = a_vec[l]
+        let b = b_vec[l]
+        for j in 0..width {
+            let keep = a * hstate[l * width + j]
+            let addx = b * fx[j]
+            new_state = new_state + [keep + addx]
+        }
+    }
+    return new_state
+}
+
+// hc_layer_forward — hc_step with the default alpha0/beta0
+@pure
+fn hc_layer_forward(cfg, hstate, fx) {
+    return hc_step(cfg, hstate, fx, cfg["alpha0"], cfg["beta0"])
+}
+
+// hc_route_seq — apply k layers sequentially to the hyper state
+@pure
+fn hc_route_seq(cfg, hstate, fx_k, alphas, betas, k) {
+    let mut s = hc_hp_copy(hstate)
+    for t in 0..k {
+        s = hc_step(cfg, s, fx_k[t], alphas[t], betas[t])
+    }
+    return s
+}
+
+// hc_dynamic_gate — softmax over lanes given a query vector
+@pure
+fn hc_dynamic_gate(hstate, cfg, w_query) {
+    let width = cfg["width"]
+    let r = cfg["expand"]
+    let mut logits = []
+    for l in 0..r {
+        let mut s = 0.0
+        for j in 0..width {
+            s = s + w_query[j] * hstate[l * width + j]
+        }
+        logits = logits + [s / to_float(width)]
+    }
+    let mut mx = logits[0]
+    for l in 1..r {
+        if logits[l] > mx { mx = logits[l] }
+    }
+    let mut exps = []
+    let mut total = 0.0
+    for l in 0..r {
+        let e = hc_hpexp(logits[l] - mx)
+        exps = exps + [e]
+        total = total + e
+    }
+    if total <= 0.0 { total = 1.0 }
+    let mut out = []
+    for l in 0..r {
+        out = out + [exps[l] / total]
+    }
+    return out
+}
+
+// hc_lane — extract lane l from state as a width-d copy
+@pure
+fn hc_lane(hstate, cfg, l) {
+    let width = cfg["width"]
+    let mut out = []
+    for j in 0..width { out = out + [hstate[l * width + j]] }
+    return out
+}
+
+// hc_state_shape — [r, width] tuple
+@pure
+fn hc_state_shape(cfg) {
+    return [cfg["expand"], cfg["width"]]
+}
+
+// hc_residual_norm — Frobenius (L2) norm of the hyper state
+@pure
+fn hc_residual_norm(hstate) {
+    return hc_hp_norm(hstate)
+}
+
+// hc_param_count — learnable params in the hyper config (= 4*r)
+@pure
+fn hc_param_count(cfg) {
+    let r = cfg["expand"]
+    return 4 * r
+}

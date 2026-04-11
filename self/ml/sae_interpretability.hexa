@@ -1,0 +1,246 @@
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/sae_interpretability.hexa — Sparse Autoencoder (SAE)
+//
+//  Mechanistic interpretability via activation decomposition.
+//
+//  Architecture:
+//    Encoder: x -> ReLU(W_enc @ (x - b_dec) + b_enc) -> latent
+//    Decoder: latent -> W_dec @ latent + b_dec -> x_hat
+//    Loss: MSE(x, x_hat) + lambda * L1(latent)
+//
+//  Feature analysis:
+//    - top-k activation indices per sample
+//    - feature frequency (how often each latent fires)
+//    - cosine similarity between features
+//
+//  API:
+//    sae_encode(x, W_enc, b_enc, b_dec, d_in, d_latent)
+//    sae_decode(latent, W_dec, b_dec, d_in, d_latent)
+//    sae_forward(x, W_enc, b_enc, W_dec, b_dec, d_in, d_latent)
+//    sae_loss(x, x_hat, latent, lambda, d_in, d_latent)
+//    sae_topk_features(latent, d_latent, k)
+//    sae_feature_frequency(latents, n_samples, d_latent)
+//    sae_cosine_similarity(a, b, d)
+//
+//  AI-NATIVE attrs:
+//    @pure     — no side effects
+//    @hot      — called every forward step
+//    @fuse     — encode+decode pipeline
+// ═══════════════════════════════════════════════════════════════
+
+// ── helpers ──────────────────────────────────────────────────
+
+fn sae_zeros_1d(n) {
+    let mut v = []
+    for _i in 0..n {
+        v = v + [0.0]
+    }
+    return v
+}
+
+fn sae_fabs(x) {
+    if x < 0.0 {
+        return 0.0 - x
+    }
+    return x
+}
+
+fn sae_relu(x) {
+    if x > 0.0 {
+        return x
+    }
+    return 0.0
+}
+
+fn sae_max_f(a, b) {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Encoder: x -> ReLU(W_enc @ (x - b_dec) + b_enc)
+//  W_enc: [d_latent][d_in], b_enc: [d_latent], b_dec: [d_in]
+//  Output: latent [d_latent] (overcomplete, e.g. 4x d_in)
+// ═══════════════════════════════════════════════════════════════
+@pure @hot
+fn sae_encode(x, W_enc, b_enc, b_dec, d_in, d_latent) {
+    // subtract decoder bias (centering)
+    let mut centered = sae_zeros_1d(d_in)
+    for i in 0..d_in {
+        centered[i] = x[i] - b_dec[i]
+    }
+
+    // W_enc @ centered + b_enc, then ReLU
+    let mut latent = sae_zeros_1d(d_latent)
+    for j in 0..d_latent {
+        let mut acc = b_enc[j]
+        for i in 0..d_in {
+            acc = acc + W_enc[j][i] * centered[i]
+        }
+        latent[j] = sae_relu(acc)
+    }
+    return latent
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Decoder: latent -> W_dec @ latent + b_dec
+//  W_dec: [d_in][d_latent], b_dec: [d_in]
+//  Output: x_hat [d_in]
+// ═══════════════════════════════════════════════════════════════
+@pure @hot
+fn sae_decode(latent, W_dec, b_dec, d_in, d_latent) {
+    let mut x_hat = sae_zeros_1d(d_in)
+    for i in 0..d_in {
+        let mut acc = b_dec[i]
+        for j in 0..d_latent {
+            acc = acc + W_dec[i][j] * latent[j]
+        }
+        x_hat[i] = acc
+    }
+    return x_hat
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Full forward pass: encode then decode
+//  Returns: {x_hat, latent}  as [x_hat, latent]
+// ═══════════════════════════════════════════════════════════════
+@fuse
+fn sae_forward(x, W_enc, b_enc, W_dec, b_dec, d_in, d_latent) {
+    let latent = sae_encode(x, W_enc, b_enc, b_dec, d_in, d_latent)
+    let x_hat = sae_decode(latent, W_dec, b_dec, d_in, d_latent)
+    return [x_hat, latent]
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Loss: MSE reconstruction + L1 sparsity
+//  loss = (1/d_in) * sum((x - x_hat)^2) + lambda * (1/d_latent) * sum(|latent|)
+// ═══════════════════════════════════════════════════════════════
+@pure
+fn sae_loss(x, x_hat, latent, lambda, d_in, d_latent) {
+    // MSE
+    let mut mse = 0.0
+    for i in 0..d_in {
+        let diff = x[i] - x_hat[i]
+        mse = mse + diff * diff
+    }
+    mse = mse / (d_in * 1.0)
+
+    // L1 sparsity
+    let mut l1 = 0.0
+    for j in 0..d_latent {
+        l1 = l1 + sae_fabs(latent[j])
+    }
+    l1 = l1 / (d_latent * 1.0)
+
+    return mse + lambda * l1
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  MSE-only loss (for decomposition checks)
+// ═══════════════════════════════════════════════════════════════
+@pure
+fn sae_mse_loss(x, x_hat, d_in) {
+    let mut mse = 0.0
+    for i in 0..d_in {
+        let diff = x[i] - x_hat[i]
+        mse = mse + diff * diff
+    }
+    return mse / (d_in * 1.0)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  L1-only loss
+// ═══════════════════════════════════════════════════════════════
+@pure
+fn sae_l1_loss(latent, d_latent) {
+    let mut l1 = 0.0
+    for j in 0..d_latent {
+        l1 = l1 + sae_fabs(latent[j])
+    }
+    return l1 / (d_latent * 1.0)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Top-k feature indices by activation magnitude
+//  Returns: list of k indices with highest |latent[j]|
+// ═══════════════════════════════════════════════════════════════
+fn sae_topk_features(latent, d_latent, k) {
+    let mut used = []
+    for _i in 0..d_latent {
+        used = used + [false]
+    }
+    let mut picks = []
+    for _r in 0..k {
+        let mut best = -1
+        let mut best_v = 0.0 - 1.0
+        for j in 0..d_latent {
+            if !used[j] {
+                let v = sae_fabs(latent[j])
+                if v > best_v {
+                    best_v = v
+                    best = j
+                }
+            }
+        }
+        if best >= 0 {
+            used[best] = true
+            picks = picks + [best]
+        }
+    }
+    return picks
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Feature frequency: fraction of samples where latent[j] > 0
+//  latents: [n_samples][d_latent]
+// ═══════════════════════════════════════════════════════════════
+fn sae_feature_frequency(latents, n_samples, d_latent) {
+    let mut freq = sae_zeros_1d(d_latent)
+    for s in 0..n_samples {
+        for j in 0..d_latent {
+            if latents[s][j] > 0.0 {
+                freq[j] = freq[j] + 1.0
+            }
+        }
+    }
+    for j in 0..d_latent {
+        freq[j] = freq[j] / (n_samples * 1.0)
+    }
+    return freq
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Cosine similarity between two vectors
+// ═══════════════════════════════════════════════════════════════
+@pure
+fn sae_cosine_similarity(a, b, d) {
+    let mut dot = 0.0
+    let mut norm_a = 0.0
+    let mut norm_b = 0.0
+    for i in 0..d {
+        dot = dot + a[i] * b[i]
+        norm_a = norm_a + a[i] * a[i]
+        norm_b = norm_b + b[i] * b[i]
+    }
+    let denom = sqrt(norm_a) * sqrt(norm_b)
+    if denom < 1.0e-12 {
+        return 0.0
+    }
+    return dot / denom
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Sparsity ratio: fraction of latent dims that are zero
+// ═══════════════════════════════════════════════════════════════
+@pure
+fn sae_sparsity_ratio(latent, d_latent) {
+    let mut n_zero = 0
+    for j in 0..d_latent {
+        if latent[j] == 0.0 {
+            n_zero = n_zero + 1
+        }
+    }
+    return (n_zero * 1.0) / (d_latent * 1.0)
+}

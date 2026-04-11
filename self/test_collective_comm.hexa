@@ -1,0 +1,322 @@
+// ===================================================================
+//  test_collective_comm.hexa — Unit tests for Collective Comm Ops (#239)
+//
+//  Verifies AllReduce (naive + ring), AllGather (flat + ring),
+//  ReduceScatter, ring topology helpers, chunking, and bandwidth
+//  metrics. Broadcast is exercised via naive allreduce fan-out since
+//  that is how the module exposes "broadcast to all ranks" semantics.
+//
+//  Run: PATH=/Users/ghost/.cargo/bin:$PATH ./hexa self/test_collective_comm.hexa
+//
+//  ML roadmap #239 — Collective Comm Ops
+// ===================================================================
+
+import "ml/collective_comm.hexa"
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn cc_test_fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn cc_test_approx(a, b, eps) { return cc_test_fabs(a - b) < eps }
+
+fn check(idx, name, cond) {
+    if cond {
+        println("[PASS] #" + str(idx) + " " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] #" + str(idx) + " " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn cc_arrays_near(a, b, tol) {
+    if len(a) != len(b) { return false }
+    let n = len(a)
+    let mut i = 0
+    while i < n {
+        if !cc_test_approx(a[i], b[i], tol) { return false }
+        i = i + 1
+    }
+    true
+}
+
+fn cc_array_sum(a) {
+    let n = len(a)
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + a[i]
+        i = i + 1
+    }
+    s
+}
+
+println("=== Collective Comm Ops (#239) Tests ===")
+
+// ── Fixtures ────────────────────────────────────────────────────
+let N_WORKERS = 4
+let TENSOR_LEN = 8
+
+// Per-rank tensors: rank r has values [r, r+1, ..., r+TENSOR_LEN-1] as float.
+let mut worker_tensors = []
+let mut r = 0
+while r < N_WORKERS {
+    let mut t = []
+    let mut i = 0
+    while i < TENSOR_LEN {
+        t = t.push(to_float(r + i))
+        i = i + 1
+    }
+    worker_tensors = worker_tensors.push(t)
+    r = r + 1
+}
+
+// Expected element-wise sum across ranks:
+// sum[i] = sum_{r=0..N-1}(r + i) = (N*(N-1)/2) + N*i
+let mut expected_sum = []
+let mut i_init = 0
+while i_init < TENSOR_LEN {
+    let s = to_float(N_WORKERS * (N_WORKERS - 1) / 2 + N_WORKERS * i_init)
+    expected_sum = expected_sum.push(s)
+    i_init = i_init + 1
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  #1-#4 — Ring topology helpers
+// ═══════════════════════════════════════════════════════════════
+
+check(1, "cc_ring_next(0,4)=1", cc_ring_next(0, 4) == 1)
+check(2, "cc_ring_next(3,4)=0 wraps", cc_ring_next(3, 4) == 0)
+check(3, "cc_ring_prev(0,4)=3 wraps", cc_ring_prev(0, 4) == 3)
+check(4, "cc_verify_ring(5)", cc_verify_ring(5))
+
+let ring_order_4 = cc_ring_order(4)
+check(5, "cc_ring_order(4) length=4 and ordered",
+    len(ring_order_4) == 4
+    && ring_order_4[0] == 0 && ring_order_4[1] == 1
+    && ring_order_4[2] == 2 && ring_order_4[3] == 3)
+
+// ═══════════════════════════════════════════════════════════════
+//  #6-#8 — Chunking
+// ═══════════════════════════════════════════════════════════════
+
+let chunks = cc_compute_chunks(8, 4)
+check(6, "compute_chunks count=4", len(chunks) == 4)
+
+let c0 = chunks[0]
+let c3 = chunks[3]
+check(7, "chunk[0]=[0,2] chunk[3]=[6,8]",
+    c0[0] == 0 && c0[1] == 2 && c3[0] == 6 && c3[1] == 8)
+
+let sample = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0]
+let chunk_slice = cc_get_chunk(sample, chunks, 1)
+check(8, "get_chunk(1) returns [30.0,40.0]",
+    len(chunk_slice) == 2
+    && cc_test_approx(chunk_slice[0], 30.0, 1.0e-9)
+    && cc_test_approx(chunk_slice[1], 40.0, 1.0e-9))
+
+// cc_set_chunk returns a new tensor with chunk overwritten
+let replaced = cc_set_chunk(sample, chunks, 1, [3.0, 4.0])
+check(9, "set_chunk writes chunk slice, preserves rest",
+    cc_test_approx(replaced[0], 10.0, 1.0e-9)
+    && cc_test_approx(replaced[2], 3.0, 1.0e-9)
+    && cc_test_approx(replaced[3], 4.0, 1.0e-9)
+    && cc_test_approx(replaced[4], 50.0, 1.0e-9))
+
+// ═══════════════════════════════════════════════════════════════
+//  #10-#13 — Naive AllReduce sum / avg & broadcast semantics
+// ═══════════════════════════════════════════════════════════════
+
+let naive_sum_all = cc_allreduce_naive_sum(worker_tensors, N_WORKERS)
+check(10, "naive allreduce sum — one result per rank",
+    len(naive_sum_all) == N_WORKERS)
+
+check(11, "naive allreduce rank0 matches expected sum",
+    cc_arrays_near(naive_sum_all[0], expected_sum, 1.0e-6))
+
+// All ranks hold identical broadcast result
+let mut bcast_ok = true
+let mut rr = 1
+while rr < N_WORKERS {
+    if !cc_arrays_near(naive_sum_all[rr], naive_sum_all[0], 1.0e-9) {
+        bcast_ok = false
+    }
+    rr = rr + 1
+}
+check(12, "naive allreduce broadcast identical across ranks", bcast_ok)
+
+let naive_avg = cc_allreduce_ring_avg(worker_tensors, N_WORKERS)
+let div = to_float(N_WORKERS)
+let mut expected_avg = []
+let mut i_avg = 0
+while i_avg < TENSOR_LEN {
+    expected_avg = expected_avg.push(expected_sum[i_avg] / div)
+    i_avg = i_avg + 1
+}
+check(13, "ring allreduce avg rank0 = sum/N",
+    cc_arrays_near(naive_avg[0], expected_avg, 1.0e-6))
+
+// ═══════════════════════════════════════════════════════════════
+//  #14-#17 — Ring AllReduce matches naive reference
+// ═══════════════════════════════════════════════════════════════
+
+let ring_sum = cc_allreduce_ring_sum(worker_tensors, N_WORKERS)
+check(14, "ring allreduce rank0 matches naive",
+    cc_arrays_near(ring_sum[0], naive_sum_all[0], 1.0e-5))
+
+check(15, "ring allreduce rank1 matches naive",
+    cc_arrays_near(ring_sum[1], naive_sum_all[1], 1.0e-5))
+
+check(16, "ring allreduce rank2 matches naive",
+    cc_arrays_near(ring_sum[2], naive_sum_all[2], 1.0e-5))
+
+check(17, "ring allreduce rank3 matches naive",
+    cc_arrays_near(ring_sum[3], naive_sum_all[3], 1.0e-5))
+
+// ═══════════════════════════════════════════════════════════════
+//  #18-#20 — AllGather (flat concatenation)
+// ═══════════════════════════════════════════════════════════════
+
+let shard_len = 3
+let mut shards = []
+let mut sh_r = 0
+while sh_r < N_WORKERS {
+    let mut s = []
+    let mut j = 0
+    while j < shard_len {
+        s = s.push(to_float(sh_r * 100 + j))
+        j = j + 1
+    }
+    shards = shards.push(s)
+    sh_r = sh_r + 1
+}
+
+let gathered = cc_allgather(shards, N_WORKERS)
+check(18, "allgather rank count",
+    len(gathered) == N_WORKERS
+    && len(gathered[0]) == N_WORKERS * shard_len)
+
+// Slot checks — gathered[0] should hold concatenation in rank order
+check(19, "allgather rank0 concat layout",
+    cc_test_approx(gathered[0][0], 0.0, 1.0e-9)
+    && cc_test_approx(gathered[0][3], 100.0, 1.0e-9)
+    && cc_test_approx(gathered[0][6], 200.0, 1.0e-9)
+    && cc_test_approx(gathered[0][9], 300.0, 1.0e-9))
+
+let mut gather_consistent = true
+let mut gr = 1
+while gr < N_WORKERS {
+    if !cc_arrays_near(gathered[gr], gathered[0], 1.0e-9) {
+        gather_consistent = false
+    }
+    gr = gr + 1
+}
+check(20, "allgather consistent across ranks", gather_consistent)
+
+// ═══════════════════════════════════════════════════════════════
+//  #21-#22 — Ring AllGather vs flat AllGather
+// ═══════════════════════════════════════════════════════════════
+
+let gathered_ring = cc_allgather_ring(shards, N_WORKERS)
+check(21, "allgather_ring matches flat allgather rank0",
+    cc_arrays_near(gathered_ring[0], gathered[0], 1.0e-9))
+
+check(22, "allgather_ring rank3 matches flat allgather rank3",
+    cc_arrays_near(gathered_ring[3], gathered[3], 1.0e-9))
+
+// ═══════════════════════════════════════════════════════════════
+//  #23-#25 — ReduceScatter
+// ═══════════════════════════════════════════════════════════════
+
+let rs = cc_reducescatter(worker_tensors, N_WORKERS)
+let rs_shard_size = TENSOR_LEN / N_WORKERS
+check(23, "reducescatter shard count and length",
+    len(rs) == N_WORKERS && len(rs[0]) == rs_shard_size)
+
+// Shard r should hold expected_sum[r*shard_size .. (r+1)*shard_size)
+let mut rs_ok = true
+let mut rr_rs = 0
+while rr_rs < N_WORKERS {
+    let begin = rr_rs * rs_shard_size
+    let mut k = 0
+    while k < rs_shard_size {
+        if !cc_test_approx(rs[rr_rs][k], expected_sum[begin + k], 1.0e-6) {
+            rs_ok = false
+        }
+        k = k + 1
+    }
+    rr_rs = rr_rs + 1
+}
+check(24, "reducescatter values match expected sum shards", rs_ok)
+
+// Concatenating shards must reconstruct the full allreduce sum
+let mut concat = []
+let mut cr = 0
+while cr < N_WORKERS {
+    let mut ci = 0
+    while ci < rs_shard_size {
+        concat = concat.push(rs[cr][ci])
+        ci = ci + 1
+    }
+    cr = cr + 1
+}
+check(25, "reducescatter concat == full allreduce sum",
+    cc_arrays_near(concat, expected_sum, 1.0e-6))
+
+// ═══════════════════════════════════════════════════════════════
+//  #26-#27 — Bandwidth metrics
+// ═══════════════════════════════════════════════════════════════
+
+// Ring bandwidth volume formula: 2*(N-1)/N * size
+let bw = cc_ring_bandwidth_volume(100, 4)
+check(26, "ring bandwidth volume 4 workers, size 100 -> 150",
+    cc_test_approx(bw, 150.0, 1.0e-6))
+
+check(27, "ring total steps 4 workers = 6",
+    cc_ring_total_steps(4) == 6)
+
+// ═══════════════════════════════════════════════════════════════
+//  #28-#29 — 3-worker ring allreduce (odd N)
+// ═══════════════════════════════════════════════════════════════
+
+let mut wt3 = []
+let mut r3 = 0
+while r3 < 3 {
+    let mut t = []
+    let mut i = 0
+    while i < 6 {
+        t = t.push(to_float(r3 * 10 + i))
+        i = i + 1
+    }
+    wt3 = wt3.push(t)
+    r3 = r3 + 1
+}
+let ring3 = cc_allreduce_ring_sum(wt3, 3)
+let naive3 = cc_allreduce_naive_sum(wt3, 3)
+check(28, "3-worker ring allreduce rank0 matches naive",
+    cc_arrays_near(ring3[0], naive3[0], 1.0e-5))
+
+check(29, "3-worker ring allreduce all ranks consistent",
+    cc_arrays_near(ring3[1], naive3[1], 1.0e-5)
+    && cc_arrays_near(ring3[2], naive3[2], 1.0e-5))
+
+// ═══════════════════════════════════════════════════════════════
+//  #30 — Identity: allreduce(zeros) == zeros (broadcast)
+// ═══════════════════════════════════════════════════════════════
+
+let mut zero_tensors = []
+let mut zr = 0
+while zr < N_WORKERS {
+    zero_tensors = zero_tensors.push(cc_zeros(TENSOR_LEN))
+    zr = zr + 1
+}
+let zero_reduced = cc_allreduce_ring_sum(zero_tensors, N_WORKERS)
+check(30, "allreduce zeros -> zeros",
+    cc_test_approx(cc_array_sum(zero_reduced[0]), 0.0, 1.0e-9))
+
+// ── summary ─────────────────────────────────────────────────────
+println("")
+println("=== Collective Comm test summary ===")
+println("PASS: " + str(pass_count))
+println("FAIL: " + str(fail_count))
+println("TOTAL: " + str(pass_count + fail_count))

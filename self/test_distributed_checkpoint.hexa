@@ -1,0 +1,450 @@
+// ===================================================================
+//  test_distributed_checkpoint.hexa — Distributed Checkpoint (#243)
+//
+//  Exercises both the low-level dcp_* primitives (shard map, full save,
+//  delta save, async simulation, version tracker) and the high-level
+//  task #243 dckpt_* API (create / shard_state / save_shard /
+//  load_shard / async_flush / recover).
+//
+//  Run:
+//    PATH=/Users/ghost/.cargo/bin:$PATH ./hexa self/test_distributed_checkpoint.hexa
+//
+//  ML roadmap #243 — Distributed Checkpoint
+// ===================================================================
+
+import "ml/distributed_checkpoint.hexa"
+
+let mut TESTS_PASSED = 0
+let mut TESTS_FAILED = 0
+
+fn dcp_fabs(x) {
+    if x < 0.0 { -x } else { x }
+}
+
+fn check(name, cond) {
+    if cond {
+        TESTS_PASSED = TESTS_PASSED + 1
+        println("[PASS] " + name)
+    } else {
+        TESTS_FAILED = TESTS_FAILED + 1
+        println("[FAIL] " + name)
+    }
+}
+
+fn check_near(name, got, expected, tol) {
+    let d = dcp_fabs(got - expected)
+    if d < tol {
+        TESTS_PASSED = TESTS_PASSED + 1
+        println("[PASS] " + name)
+    } else {
+        TESTS_FAILED = TESTS_FAILED + 1
+        println("[FAIL] " + name + " got=" + str(got) + " expected=" + str(expected))
+    }
+}
+
+fn arrays_near(a, b, tol) {
+    if len(a) != len(b) { return false }
+    let n = len(a)
+    let mut i = 0
+    while i < n {
+        let d = dcp_fabs(a[i] - b[i])
+        if d > tol { return false }
+        i = i + 1
+    }
+    true
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 1 — Shard mapping (low-level)
+// ═══════════════════════════════════════════════════════════════
+fn test_shard_mapping() {
+    println("[test] 1. Shard mapping")
+    let smap = dcp_create_shard_map(12, 3)
+    check("num_shards", smap.num_shards == 3)
+    check("param_size", smap.param_size == 12)
+
+    check("shard0 begin", dcp_shard_begin(smap, 0) == 0)
+    check("shard0 end", dcp_shard_end(smap, 0) == 4)
+    check("shard1 begin", dcp_shard_begin(smap, 1) == 4)
+    check("shard1 end", dcp_shard_end(smap, 1) == 8)
+    check("shard2 begin", dcp_shard_begin(smap, 2) == 8)
+    check("shard2 end", dcp_shard_end(smap, 2) == 12)
+
+    check("shard0 size", dcp_shard_size(smap, 0) == 4)
+    check("shard1 size", dcp_shard_size(smap, 1) == 4)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 2 — Full save/load roundtrip
+// ═══════════════════════════════════════════════════════════════
+fn test_save_load_roundtrip() {
+    println("[test] 2. Full save/load roundtrip")
+    let params = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]
+    let smap = dcp_create_shard_map(12, 3)
+    let ckpt = dcp_save_full(params, smap, 1)
+
+    check("ckpt version", ckpt.version == 1)
+    check("ckpt num shards", len(ckpt.shards) == 3)
+    check("ckpt not delta", !ckpt.is_delta)
+
+    let restored = dcp_restore_full(ckpt)
+    check("restored len", len(restored) == 12)
+    check("roundtrip match", dcp_arrays_equal(params, restored))
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 3 — Shard extraction
+// ═══════════════════════════════════════════════════════════════
+fn test_shard_extract() {
+    println("[test] 3. Shard extraction")
+    let params = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0]
+    let smap = dcp_create_shard_map(6, 2)
+
+    let s0 = dcp_extract_shard(params, smap, 0)
+    let s1 = dcp_extract_shard(params, smap, 1)
+
+    check("shard0 len", len(s0) == 3)
+    check("shard1 len", len(s1) == 3)
+    check_near("shard0[0]", s0[0], 10.0, 0.001)
+    check_near("shard0[2]", s0[2], 30.0, 0.001)
+    check_near("shard1[0]", s1[0], 40.0, 0.001)
+    check_near("shard1[2]", s1[2], 60.0, 0.001)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 4 — Delta checkpoint correctness
+// ═══════════════════════════════════════════════════════════════
+fn test_delta_correctness() {
+    println("[test] 4. Delta checkpoint correctness")
+    let old_params = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    let new_params = [1.0, 2.0, 3.0, 4.0, 50.0, 60.0]
+    let smap = dcp_create_shard_map(6, 2)
+
+    let delta = dcp_save_delta(old_params, new_params, smap, 2)
+    check("delta is_delta", delta.is_delta)
+    check("delta version", delta.version == 2)
+
+    let changed = dcp_delta_changed_count(delta)
+    check("delta 1 shard changed", changed == 1)
+    check("shard0 not changed", !delta.changed_mask[0])
+    check("shard1 changed", delta.changed_mask[1])
+
+    let applied = dcp_apply_delta(old_params, delta)
+    check("delta apply correct", dcp_arrays_equal(applied, new_params))
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 5 — Delta with no changes
+// ═══════════════════════════════════════════════════════════════
+fn test_delta_no_changes() {
+    println("[test] 5. Delta with no changes")
+    let params = [1.0, 2.0, 3.0, 4.0]
+    let smap = dcp_create_shard_map(4, 2)
+    let delta = dcp_save_delta(params, params, smap, 3)
+    check("no changes count 0", dcp_delta_changed_count(delta) == 0)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 6 — Async save simulation (low-level)
+// ═══════════════════════════════════════════════════════════════
+fn test_async_save() {
+    println("[test] 6. Async save simulation")
+    let params = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    let smap = dcp_create_shard_map(6, 2)
+
+    let save_op = dcp_async_save_start(params, smap, 1)
+    check("save in progress", save_op.status == "in_progress")
+    check("save not done", !dcp_async_save_is_done(save_op))
+
+    let completed = dcp_async_save_complete(save_op)
+    check("save completed", dcp_async_save_is_done(completed))
+    check("save id", completed.save_id == 1)
+
+    let restored = dcp_restore_full(completed.checkpoint)
+    check("async save roundtrip", dcp_arrays_equal(restored, params))
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 7 — Parallel restore integrity
+// ═══════════════════════════════════════════════════════════════
+fn test_parallel_restore() {
+    println("[test] 7. Parallel restore integrity")
+    let params = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0]
+    let smap = dcp_create_shard_map(6, 3)
+    let ckpt = dcp_save_full(params, smap, 1)
+
+    let result = dcp_parallel_restore(ckpt, 3)
+    check("parallel restore num workers", len(result) == 3)
+    check("worker0 correct", dcp_arrays_equal(result[0], params))
+    check("worker1 correct", dcp_arrays_equal(result[1], params))
+    check("worker2 correct", dcp_arrays_equal(result[2], params))
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 8 — Version ordering
+// ═══════════════════════════════════════════════════════════════
+fn test_version_ordering() {
+    println("[test] 8. Version ordering")
+    let mut tracker = dcp_tracker_new(5)
+    let smap = dcp_create_shard_map(4, 2)
+
+    let p1 = [1.0, 2.0, 3.0, 4.0]
+    let r1 = dcp_tracker_save(tracker, p1, smap)
+    let ckpt1 = r1[0]
+    tracker = r1[1]
+
+    let p2 = [5.0, 6.0, 7.0, 8.0]
+    let r2 = dcp_tracker_save(tracker, p2, smap)
+    let ckpt2 = r2[0]
+    tracker = r2[1]
+
+    let p3 = [9.0, 10.0, 11.0, 12.0]
+    let r3 = dcp_tracker_save(tracker, p3, smap)
+    let ckpt3 = r3[0]
+    tracker = r3[1]
+
+    check("version ordering 1 < 2", ckpt1.version < ckpt2.version)
+    check("version ordering 2 < 3", ckpt2.version < ckpt3.version)
+    check("latest version", dcp_tracker_latest(tracker) == 3)
+    check("current version 3", tracker.current_version == 3)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 9 — Version tracker eviction
+// ═══════════════════════════════════════════════════════════════
+fn test_tracker_eviction() {
+    println("[test] 9. Version tracker eviction")
+    let mut tracker = dcp_tracker_new(2)
+    let smap = dcp_create_shard_map(4, 2)
+
+    let mut i = 0
+    while i < 5 {
+        let p = [to_float(i), to_float(i + 1), to_float(i + 2), to_float(i + 3)]
+        let r = dcp_tracker_save(tracker, p, smap)
+        tracker = r[1]
+        i = i + 1
+    }
+
+    check("only 2 kept", len(tracker.checkpoints) == 2)
+    check("latest is 5", dcp_tracker_latest(tracker) == 5)
+
+    let oldest = tracker.checkpoints[0]
+    check("oldest kept is 4", oldest.version == 4)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 10 — Version tracker get
+// ═══════════════════════════════════════════════════════════════
+fn test_tracker_get() {
+    println("[test] 10. Version tracker get")
+    let mut tracker = dcp_tracker_new(5)
+    let smap = dcp_create_shard_map(4, 2)
+
+    let p1 = [1.0, 2.0, 3.0, 4.0]
+    let r1 = dcp_tracker_save(tracker, p1, smap)
+    tracker = r1[1]
+
+    let p2 = [5.0, 6.0, 7.0, 8.0]
+    let r2 = dcp_tracker_save(tracker, p2, smap)
+    tracker = r2[1]
+
+    let got = dcp_tracker_get(tracker, 1)
+    check("get version 1", got.version == 1)
+
+    let restored = dcp_restore_full(got)
+    check("get + restore correct", dcp_arrays_equal(restored, p1))
+
+    let missing = dcp_tracker_get(tracker, 99)
+    check("missing version -1", missing.version == -1)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 11 — Delta chain application
+// ═══════════════════════════════════════════════════════════════
+fn test_delta_chain() {
+    println("[test] 11. Delta chain application")
+    let smap = dcp_create_shard_map(6, 3)
+
+    let p0 = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    let p1 = [1.0, 2.0, 30.0, 40.0, 5.0, 6.0]
+    let p2 = [1.0, 2.0, 30.0, 40.0, 50.0, 60.0]
+
+    let d1 = dcp_save_delta(p0, p1, smap, 1)
+    let d2 = dcp_save_delta(p1, p2, smap, 2)
+
+    let after_d1 = dcp_apply_delta(p0, d1)
+    let after_d2 = dcp_apply_delta(after_d1, d2)
+    check("delta chain correct", dcp_arrays_equal(after_d2, p2))
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 12 — Parallel restore with more workers than shards
+// ═══════════════════════════════════════════════════════════════
+fn test_parallel_restore_more_workers() {
+    println("[test] 12. Parallel restore more workers")
+    let params = [1.0, 2.0, 3.0, 4.0]
+    let smap = dcp_create_shard_map(4, 2)
+    let ckpt = dcp_save_full(params, smap, 1)
+
+    let result = dcp_parallel_restore(ckpt, 4)
+    check("4 workers restore", len(result) == 4)
+    check("w0 correct", dcp_arrays_equal(result[0], params))
+    check("w3 correct", dcp_arrays_equal(result[3], params))
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 13 — dckpt_create initial state
+// ═══════════════════════════════════════════════════════════════
+fn test_dckpt_create() {
+    println("[test] 13. dckpt_create")
+    let ck = dckpt_create(4, 0)
+    check("world_size", ck["world_size"] == 4)
+    check("rank", ck["rank"] == 0)
+    check("version", ck["version"] == 0)
+    check("empty shards", len(ck["shards"]) == 0)
+    check("empty mask", len(ck["mask"]) == 0)
+    check("not flushed", ck["flushed"] == false)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 14 — dckpt_shard_state
+// ═══════════════════════════════════════════════════════════════
+fn test_dckpt_shard_state() {
+    println("[test] 14. dckpt_shard_state")
+    let state = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+    let shards = dckpt_shard_state(state, 4)
+    check("n shards", len(shards) == 4)
+    check("shard0 len", len(shards[0]) == 2)
+    check("shard3 len", len(shards[3]) == 2)
+    check_near("shard0[0]", shards[0][0], 1.0, 1.0e-6)
+    check_near("shard3[1]", shards[3][1], 8.0, 1.0e-6)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 15 — dckpt_save_shard + dckpt_load_shard roundtrip
+// ═══════════════════════════════════════════════════════════════
+fn test_dckpt_save_load() {
+    println("[test] 15. dckpt_save_shard + load_shard")
+    let ck0 = dckpt_create(2, 0)
+    let state = [10.0, 20.0, 30.0, 40.0]
+    let shards = dckpt_shard_state(state, 2)
+
+    let mut ck = ck0
+    ck = dckpt_save_shard(ck, 0, shards[0], 7)
+    ck = dckpt_save_shard(ck, 1, shards[1], 7)
+
+    check("version updated", ck["version"] == 7)
+    check("num shards", dckpt_num_shards(ck) == 2)
+    check("present count", dckpt_present_count(ck) == 2)
+
+    let got0 = dckpt_load_shard(ck, 0)
+    let got1 = dckpt_load_shard(ck, 1)
+    check("loaded shard0 len", len(got0) == 2)
+    check("loaded shard1 len", len(got1) == 2)
+    check_near("loaded shard0[0]", got0[0], 10.0, 1.0e-6)
+    check_near("loaded shard1[1]", got1[1], 40.0, 1.0e-6)
+
+    let oob = dckpt_load_shard(ck, 42)
+    check("oob shard -> []", len(oob) == 0)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 16 — dckpt_async_flush
+// ═══════════════════════════════════════════════════════════════
+fn test_dckpt_async_flush() {
+    println("[test] 16. dckpt_async_flush")
+    let ck0 = dckpt_create(2, 0)
+    let state = [1.0, 2.0, 3.0, 4.0]
+    let shards = dckpt_shard_state(state, 2)
+
+    let mut ck = ck0
+    ck = dckpt_save_shard(ck, 0, shards[0], 1)
+    ck = dckpt_save_shard(ck, 1, shards[1], 1)
+    check("not flushed before", ck["flushed"] == false)
+
+    let flushed = dckpt_async_flush(ck)
+    check("flushed after", flushed["flushed"] == true)
+    check("version retained", flushed["version"] == 1)
+    check("shard count retained", dckpt_num_shards(flushed) == 2)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 17 — dckpt_recover fills missing ranks
+// ═══════════════════════════════════════════════════════════════
+fn test_dckpt_recover() {
+    println("[test] 17. dckpt_recover")
+    let ck0 = dckpt_create(3, 0)
+    let state = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    let shards = dckpt_shard_state(state, 3)
+
+    // Only save 2 of 3 shards — shard index 1 is missing.
+    let mut ck = ck0
+    ck = dckpt_save_shard(ck, 0, shards[0], 1)
+    ck = dckpt_save_shard(ck, 2, shards[2], 1)
+    check("missing shard not present", dckpt_present_count(ck) == 2)
+
+    let recovered = dckpt_recover(ck, [1])
+    check("recovered count", dckpt_present_count(recovered) == 3)
+    let shard1 = dckpt_load_shard(recovered, 1)
+    check("recovered shard len", len(shard1) == 2)
+    check_near("recovered shard zero0", shard1[0], 0.0, 1.0e-9)
+    check_near("recovered shard zero1", shard1[1], 0.0, 1.0e-9)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Test 18 — dckpt_assemble full roundtrip
+// ═══════════════════════════════════════════════════════════════
+fn test_dckpt_assemble() {
+    println("[test] 18. dckpt_assemble")
+    let state = [11.0, 22.0, 33.0, 44.0, 55.0, 66.0]
+    let ck0 = dckpt_create(3, 0)
+    let shards = dckpt_shard_state(state, 3)
+    let mut ck = ck0
+    ck = dckpt_save_shard(ck, 0, shards[0], 10)
+    ck = dckpt_save_shard(ck, 1, shards[1], 10)
+    ck = dckpt_save_shard(ck, 2, shards[2], 10)
+
+    let assembled = dckpt_assemble(ck)
+    check("assembled len", len(assembled) == 6)
+    check("assembled eq state", dcp_arrays_equal(assembled, state))
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Runner
+// ═══════════════════════════════════════════════════════════════
+fn run_all() {
+    println("============================================================")
+    println("  Distributed Checkpoint (#243) Tests")
+    println("============================================================")
+    test_shard_mapping()
+    test_save_load_roundtrip()
+    test_shard_extract()
+    test_delta_correctness()
+    test_delta_no_changes()
+    test_async_save()
+    test_parallel_restore()
+    test_version_ordering()
+    test_tracker_eviction()
+    test_tracker_get()
+    test_delta_chain()
+    test_parallel_restore_more_workers()
+    test_dckpt_create()
+    test_dckpt_shard_state()
+    test_dckpt_save_load()
+    test_dckpt_async_flush()
+    test_dckpt_recover()
+    test_dckpt_assemble()
+
+    println("")
+    println("============================================================")
+    let total = TESTS_PASSED + TESTS_FAILED
+    println("  Results: " + str(TESTS_PASSED) + "/" + str(total) + " passed")
+    if TESTS_FAILED > 0 {
+        println("  FAILED: " + str(TESTS_FAILED) + " tests")
+    } else {
+        println("  ALL PASSED")
+    }
+    println("============================================================")
+}
+
+run_all()
