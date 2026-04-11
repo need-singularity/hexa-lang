@@ -104,6 +104,8 @@ fn tokenize(src) {
                 toks = toks.push(mk("Struct", word))
             } else if word == "enum" {
                 toks = toks.push(mk("Enum", word))
+            } else if word == "extern" {
+                toks = toks.push(mk("Extern", word))
             } else if word == "fn" {
                 toks = toks.push(mk("Fn", word))
             } else if word == "return" {
@@ -227,23 +229,36 @@ fn tokenize(src) {
             toks = toks.push(mk("RSq", c))
             i = i + 1
         } else if c == "@" {
-            // @attr 또는 @attr(args)
+            // @attr or @attr(args). We preserve simple string-literal arg
+            // content so @link("m") becomes Attr value "link:m".
             i = i + 1
             let astart = i
             while i < n && (is_alpha_at(cs, i) || is_digit_s(cs_at(cs, i))) { i = i + 1 }
             let aname = slice_str(cs, astart, i)
-            // 옵션 (args) 균형 skip
+            let mut arg_captured = ""
             if i < n && cs_at(cs, i) == "(" {
+                let arg_start = i + 1
                 let mut depth = 1
                 i = i + 1
                 while i < n && depth > 0 {
                     if cs_at(cs, i) == "(" { depth = depth + 1 }
                     if cs_at(cs, i) == ")" { depth = depth - 1 }
-                    i = i + 1
+                    if depth > 0 { i = i + 1 }
                 }
+                // slice arg body between arg_start and i (exclusive of closing paren)
+                let raw = slice_str(cs, arg_start, i)
+                // strip surrounding quotes/whitespace for string literals like "m"
+                let mut a = 0
+                let mut b = len(raw)
+                while a < b && (raw.substring(a, a + 1) == " " || raw.substring(a, a + 1) == "\"") { a = a + 1 }
+                while b > a && (raw.substring(b - 1, b) == " " || raw.substring(b - 1, b) == "\"") { b = b - 1 }
+                if b > a { arg_captured = raw.substring(a, b) }
+                // consume closing paren
+                if i < n && cs_at(cs, i) == ")" { i = i + 1 }
             }
-            // Attr 토큰 — parser에서 다음 fn에 부착
-            toks = toks.push(mk("Attr", aname))
+            // Store as "name" or "name:arg" depending on whether we captured anything
+            let attr_value = if arg_captured == "" { aname } else { aname + ":" + arg_captured }
+            toks = toks.push(mk("Attr", attr_value))
         } else if c == "%" {
             toks = toks.push(mk("Percent", c))
             i = i + 1
@@ -902,6 +917,92 @@ fn make_tail_return_block(blk) {
     return n_block(new_stmts)
 }
 
+// Parse `extern fn NAME(p: T, ...) -> RET` — no body.
+// Attributes stacked in pending_attrs (e.g. @link("libname")) are consumed.
+// Returns a node with kind "ExternFn" that the codegen maps to a C
+// `extern RET NAME(PARAMS);` declaration and harvests @link targets.
+fn parse_extern_fn() {
+    p_eat("Extern")
+    p_eat("Fn")
+    let name = p_advance().value
+    p_eat("LP")
+    // Encode each param as "name:type" strings in args[], so the codegen
+    // can read both name and type from a single node field.
+    let mut params = []
+    if p_kind() != "RP" {
+        let pn = p_advance().value
+        let mut pt = "int"
+        if p_kind() == "Colon" {
+            p_advance()
+            if p_kind() == "Star" {
+                p_advance()
+                if p_kind() == "Ident" {
+                    pt = "ptr_" + p_advance().value
+                }
+            } else if p_kind() == "Ident" {
+                pt = p_advance().value
+            }
+        }
+        params = params.push(pn + ":" + pt)
+        while p_eat("Comma") {
+            let pn2 = p_advance().value
+            let mut pt2 = "int"
+            if p_kind() == "Colon" {
+                p_advance()
+                if p_kind() == "Star" {
+                    p_advance()
+                    if p_kind() == "Ident" {
+                        pt2 = "ptr_" + p_advance().value
+                    }
+                } else if p_kind() == "Ident" {
+                    pt2 = p_advance().value
+                }
+            }
+            params = params.push(pn2 + ":" + pt2)
+        }
+    }
+    p_eat("RP")
+    let mut ret_annot = "Void"
+    if p_kind() == "Minus" && p_toks[p_pos + 1].kind == "GT" {
+        p_advance()
+        p_advance()
+        if p_kind() == "Star" {
+            p_advance()
+            if p_kind() == "Ident" {
+                ret_annot = "ptr_" + p_advance().value
+            }
+        } else if p_kind() == "Ident" {
+            ret_annot = p_advance().value
+        }
+    }
+    let attrs_str = pending_attrs.join(",")
+    pending_attrs = []
+    return Node {
+        kind: "ExternFn",
+        value: name,
+        op: attrs_str,
+        left: ret_annot,
+        right: "",
+        cond: "",
+        then_b: "",
+        else_b: "",
+        args: params
+    }
+}
+
+// Map a hexa extern type token to a C type for extern fn signatures.
+fn extern_type_to_c(t) {
+    if t == "float" || t == "Float" || t == "double" { return "double" }
+    if t == "int" || t == "Int" || t == "long" { return "long" }
+    if t == "bool" || t == "Bool" { return "int" }
+    // Pointer-to-Void / any struct → void*
+    if t == "ptr_Void" || t == "ptr_void" { return "void*" }
+    if t.substring(0, 4) == "ptr_" { return "void*" }
+    if t == "Void" || t == "void" || t == "" { return "void" }
+    // Fallback: treat as long (raw 64-bit word, works for ints and pointers)
+    return "long"
+}
+
 fn parse_fn() {
     p_eat("Fn")
     let name = p_advance().value
@@ -1021,6 +1122,7 @@ fn parse_stmt() {
         return empty()
     }
     if k == "Fn" { return parse_fn() }
+    if k == "Extern" { return parse_extern_fn() }
     if k == "ProofBlock" || k == "TheoremBlock" {
         // 이름 + 블록 소비, 아무것도 emit하지 않음
         p_advance()
@@ -3640,6 +3742,90 @@ fn emit_program(stmts) {
             }
         }
         i = i + 1
+    }
+    out_parts = out_parts.push("\n")
+    // 1.5) extern fn declarations + @link library harvest
+    //      Hexa `extern fn foo(a: T, b: *Void) -> int` becomes
+    //      `extern long foo(long a, long b);` in C. @link("lib") attributes
+    //      are collected into a comment so the caller can pass -lfoo.
+    let mut linked_libs = []
+    i = 0
+    while i < len(stmts) {
+        let es = stmts[i]
+        if es.kind == "ExternFn" {
+            // params encoded as "name:type" strings in args[]
+            let mut params_c = ""
+            let ep = es.args
+            if len(ep) == 0 {
+                params_c = "void"
+            } else {
+                let mut j = 0
+                while j < len(ep) {
+                    if j > 0 { params_c = params_c + ", " }
+                    // parse "name:type"
+                    let raw = ep[j]
+                    let mut pname = raw
+                    let mut ptype = "int"
+                    let mut ci = 0
+                    let rl = len(raw)
+                    while ci < rl {
+                        if raw.substring(ci, ci + 1) == ":" {
+                            pname = raw.substring(0, ci)
+                            ptype = raw.substring(ci + 1, rl)
+                            ci = rl
+                        }
+                        ci = ci + 1
+                    }
+                    params_c = params_c + extern_type_to_c(ptype) + " " + pname
+                    j = j + 1
+                }
+            }
+            let ret = es.left
+            let ret_c = extern_type_to_c(ret)
+            // Record C prototype for linker; also register in fn_tab so
+            // calls to this symbol downstream don't treat it as unknown.
+            out_parts = out_parts.push("extern " + ret_c + " " + es.value + "(" + params_c + ");\n")
+            fn_register(es.value, if ret == "float" || ret == "Float" { "Float" } else { "Int" })
+            // Harvest @link("libname") from attrs
+            let attrs = es.op
+            if attrs != "" {
+                // attrs is comma-separated: "link:m,hot,link:cublas"
+                let mut ai = 0
+                let mut cur = ""
+                let la = len(attrs)
+                while ai <= la {
+                    let ch = if ai < la { attrs.substring(ai, ai + 1) } else { "," }
+                    if ch == "," {
+                        if cur.substring(0, 5) == "link:" {
+                            let libn = cur.substring(5, len(cur))
+                            // dedupe
+                            let mut found = false
+                            let mut li = 0
+                            while li < len(linked_libs) {
+                                if linked_libs[li] == libn { found = true }
+                                li = li + 1
+                            }
+                            if !found { linked_libs = linked_libs.push(libn) }
+                        }
+                        cur = ""
+                    } else {
+                        cur = cur + ch
+                    }
+                    ai = ai + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    if len(linked_libs) > 0 {
+        out_parts = out_parts.push("/* hexa @link libs: ")
+        let mut li2 = 0
+        while li2 < len(linked_libs) {
+            if li2 > 0 { out_parts = out_parts.push(" ") }
+            out_parts = out_parts.push("-l" + linked_libs[li2])
+            li2 = li2 + 1
+        }
+        out_parts = out_parts.push(" */\n")
     }
     out_parts = out_parts.push("\n")
     // 2) function definitions
