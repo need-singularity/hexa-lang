@@ -1,7 +1,6 @@
 # hexa-lang — HEXA 프로그래밍 언어
 
 commands: shared/config/commands.json — autonomous 블록으로 Claude Code가 작업 중 smash/free/todo/go/keep 자율 판단·실행. ml 명령어: shared/hexa-lang/ml-commands.json (hexa-lang 전용)
-bare-cmd: 사용자가 `/` 없이 입력해도 스킬 실행 — `roi` → Skill(roi), `roi go` → Skill(roi, "go"), `roi scan` → Skill(roi, "scan"), `ml` → Skill(ml), `ml go` → Skill(ml, "go") 등. 단독 키워드면 즉시 스킬 호출.
 rules: shared/rules/common.json (R0~R27) + shared/rules/hexa-lang.json (HX1~HX7)
 L0 Guard: `hexa ~/Dev/nexus/shared/lockdown/l0_guard.hexa <verify|sync|merge|status>`
 
@@ -20,12 +19,10 @@ ref:
   registry  shared/config/projects.json          7프로젝트
   cfg       shared/config/project_config.json    CLI/빌드/DSE
   core      shared/config/core.json              시스템맵+14명령
-  conv      shared/hexa-lang/state.json          CDO+breakthroughs
+  conv      shared/hexa/state.json               CDO+breakthroughs
   roadmap   shared/roadmaps/anima_hexa_common.json  P0~P5
   grammar   shared/hexa-lang/grammar.jsonl       전체 문법+pitfalls
   ai-native docs/ai-native.md                    24종 벡터
   ml        shared/hexa-lang/ml-next-level.json  15+N 다음 레벨
   ml-cmd    shared/hexa-lang/ml-commands.json    ml/ml go/ml next
-  roi       shared/hexa-lang/roi.json            ROI 개선 목록
-  roi-cmd   shared/hexa-lang/roi-commands.json   roi/roi go/roi next/roi scan
   api       shared/CLAUDE.md
