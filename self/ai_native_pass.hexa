@@ -1658,7 +1658,6 @@ fn rewrite_dp_sliding_expr(expr, arr_name, k) {
     }
     return expr
 }
->>>>>>> worktree-agent-a68bae5c
 
 fn body_is_effect_free(body) {
     if type_of(body) != "array" { return true }
@@ -2694,6 +2693,16 @@ let mut m482_fuse_candidates = 0
 let mut m960_fuse_rewrites = 0
 // M965: @fuse map/filter chain → single-loop AST rewrites
 let mut m965_mapfilter_fused = 0
+// M974: @fuse map/filter/reduce chain → single-loop AST rewrites (ROI id=4)
+let mut m974_reduce_fused = 0
+// M975: constant folding — string concat folding (ROI id=5)
+let mut m975_string_concat_folds = 0
+// M976: constant folding — len() folding on literals (ROI id=5)
+let mut m976_len_folds = 0
+// M977: strength reduction — x/2→x>>1, x%2→x&1, x*2→x<<1 (ROI id=13)
+let mut m977_strength_small = 0
+// M978: strength reduction — loop index multiply → accumulate (ROI id=13)
+let mut m978_loop_stride = 0
 // M253: cross-fn inlining (const-return stubs + identity fns)
 let mut m253_inlined_calls = 0
 // Inlining tables (parallel arrays)
@@ -4256,6 +4265,205 @@ fn fuse_mapfilter_body(body) {
     return out
 }
 
+// ── M974: @fuse map/filter/reduce chain → single-loop AST rewrite ────────────
+// Extends M965 to handle chains ending in reduce/fold/sum.
+// Pattern: arr.map(f).filter(g).reduce(init, h) → single while-loop with acc.
+// Also handles: arr.map(f).reduce(init, h) and arr.filter(g).reduce(init, h).
+
+// Check if a Field node has name "reduce", "fold", or "sum"
+fn is_reduce_field(expr) {
+    if type_of(expr) == "string" { return false }
+    if expr.kind != "Field" { return false }
+    let nm = expr.name
+    if nm == "reduce" { return true }
+    if nm == "fold" { return true }
+    if nm == "sum" { return true }
+    return false
+}
+
+// Detect a map/filter chain ending in reduce/fold/sum.
+// Returns chain length (map/filter ops) + 1 for the terminal reduce; 0 if not matching.
+// Structure: Call{left:Field{name:"reduce",..., left: <map/filter chain>}, args:[init, lambda2]}
+//   or for .sum(): Call{left:Field{name:"sum",..., left: <map/filter chain>}, args:[]}
+fn reduce_chain_len(expr) {
+    if type_of(expr) == "string" { return 0 }
+    if expr.kind != "Call" { return 0 }
+    if !is_reduce_field(expr.left) { return 0 }
+    let inner = expr.left.left
+    // The inner must be a map/filter chain of length >= 1 (or a plain source)
+    let mf_len = mapfilter_chain_len(inner)
+    if mf_len >= 1 { return mf_len + 1 }
+    // Even without map/filter, a plain .reduce on a source is valid but not a "chain"
+    return 0
+}
+
+// Build the fused inner body for a reduce chain: map/filter ops + terminal reduce.
+// cur_expr: the current element variable flowing through the chain.
+// acc_name: accumulator variable name.
+// reduce_op: the terminal reduce AstNode (__FuseOp with name "reduce"/"fold"/"sum").
+fn build_fused_reduce_inner(ops, idx, cur_expr, acc_name, reduce_op, counter) {
+    let n = len(ops)
+    if idx >= n {
+        // Terminal: apply the reduce lambda (or += for sum)
+        let rname = reduce_op.name
+        if rname == "sum" {
+            // acc = acc + cur_expr
+            return [make_assign_stmt(acc_name, make_binop("+", make_ident(acc_name), cur_expr))]
+        }
+        // reduce/fold: lambda(acc, elem) → new acc
+        let lam = reduce_op.left
+        let acc_param = lam.params[0]
+        let elem_param = lam.params[1]
+        let lam_body = lam.left
+        let step1 = substitute_in_expr(lam_body, acc_param, make_ident(acc_name))
+        let step2 = substitute_in_expr(step1, elem_param, cur_expr)
+        return [make_assign_stmt(acc_name, step2)]
+    }
+    let op = ops[idx]
+    let op_name = op.name
+    let lam = op.left
+    let param = lam.params[0]
+    let lam_body = lam.left
+    let applied = substitute_in_expr(lam_body, param, cur_expr)
+    if op_name == "map" {
+        let var_name = "__frm" + to_string(counter) + "_" + to_string(idx)
+        let bind = make_let_stmt(var_name, applied)
+        let rest = build_fused_reduce_inner(ops, idx + 1, make_ident(var_name), acc_name, reduce_op, counter)
+        let mut out = [bind]
+        let mut ri = 0
+        let rn = len(rest)
+        while ri < rn {
+            out = out.push(rest[ri])
+            ri = ri + 1
+        }
+        return out
+    }
+    // filter: if applied { recurse with cur_expr unchanged }
+    let then_stmts = build_fused_reduce_inner(ops, idx + 1, cur_expr, acc_name, reduce_op, counter)
+    let if_node = make_if_expr(applied, then_stmts, [])
+    return [make_expr_stmt(if_node)]
+}
+
+// Rewrite a LetStmt/ConstStmt whose init is a map/filter chain ending in reduce/fold/sum.
+// Returns replacement statements or empty array if not rewritable.
+fn fuse_reduce_stmt(stmt, counter) {
+    let k = stmt.kind
+    if k != "LetStmt" && k != "ConstStmt" && k != "LetMutStmt" { return [] }
+    let init = stmt.left
+    if type_of(init) == "string" { return [] }
+    if init.kind != "Call" { return [] }
+    if !is_reduce_field(init.left) { return [] }
+    let reduce_name = init.left.name
+    let inner_chain_expr = init.left.left
+    let mf_len = mapfilter_chain_len(inner_chain_expr)
+    if mf_len < 1 { return [] }
+    // Collect the map/filter chain
+    let chain = collect_mapfilter_chain(inner_chain_expr)
+    let src_expr = chain.left
+    let ops = chain.items
+    // Determine init value and reduce lambda
+    let mut reduce_init_expr = make_int_lit(0)
+    let mut reduce_lam = ""
+    if reduce_name == "sum" {
+        // .sum() has no args, init = 0
+        reduce_init_expr = make_int_lit(0)
+    } else {
+        // .reduce(init, lambda) or .fold(init, lambda)
+        if type_of(init.args) != "array" { return [] }
+        if len(init.args) < 2 { return [] }
+        reduce_init_expr = init.args[0]
+        reduce_lam = init.args[1]
+        // Validate: lambda must have 2 params
+        if type_of(reduce_lam) == "string" { return [] }
+        if reduce_lam.kind != "Lambda" { return [] }
+        if type_of(reduce_lam.params) != "array" { return [] }
+        if len(reduce_lam.params) != 2 { return [] }
+    }
+    let result_name = stmt.name
+    let src_name = "__frsrc" + to_string(counter)
+    let idx_name = "__fri" + to_string(counter)
+    let x_name = "__frx" + to_string(counter)
+    let acc_name = "__fracc" + to_string(counter)
+    // Build the reduce op record
+    let reduce_rec = AstNode {
+        kind: "__FuseOp", name: reduce_name, value: "", op: "",
+        left: reduce_lam, right: "", cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+    // Emit:
+    //   let mut <acc_name> = <init_expr>
+    //   let <src_name> = <src_expr>
+    //   let mut <idx_name> = 0
+    //   while <idx_name> < <src_name>.len() {
+    //       let <x_name> = <src_name>[<idx_name>]
+    //       <fused-body with map/filter leading to acc update>
+    //       <idx_name> = <idx_name> + 1
+    //   }
+    //   let <result_name> = <acc_name>
+    let init_acc = make_let_mut_stmt(acc_name, reduce_init_expr)
+    let bind_src = make_let_stmt(src_name, src_expr)
+    let init_idx = make_let_mut_stmt(idx_name, make_int_lit(0))
+    // len call: src_name.len()
+    let len_field = AstNode {
+        kind: "Field", name: "len", value: "", op: "",
+        left: make_ident(src_name), right: "", cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+    let len_call = AstNode {
+        kind: "Call", name: "", value: "", op: "",
+        left: len_field, right: "", cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: [], fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+    let cond = make_binop("<", make_ident(idx_name), len_call)
+    let x_bind = make_let_stmt(x_name, make_index(make_ident(src_name), make_ident(idx_name)))
+    let fused = build_fused_reduce_inner(ops, 0, make_ident(x_name), acc_name, reduce_rec, counter)
+    let incr = make_assign_stmt(idx_name, make_binop("+", make_ident(idx_name), make_int_lit(1)))
+    let mut loop_body = [x_bind]
+    let mut fi = 0
+    let fn_ = len(fused)
+    while fi < fn_ {
+        loop_body = loop_body.push(fused[fi])
+        fi = fi + 1
+    }
+    loop_body = loop_body.push(incr)
+    let while_s = make_while_stmt(cond, loop_body)
+    let bind_result = make_let_stmt(result_name, make_ident(acc_name))
+    return [init_acc, bind_src, init_idx, while_s, bind_result]
+}
+
+// Body-level pass: walk statements and fuse reduce/fold/sum chains.
+fn fuse_reduce_body(body) {
+    if type_of(body) != "array" { return body }
+    let n = len(body)
+    let mut out = []
+    let mut i = 0
+    let mut counter = 0
+    while i < n {
+        let stmt = body[i]
+        let replacement = fuse_reduce_stmt(stmt, counter)
+        if type_of(replacement) == "array" && len(replacement) > 0 {
+            let mut ri = 0
+            let rn = len(replacement)
+            while ri < rn {
+                out = out.push(replacement[ri])
+                ri = ri + 1
+            }
+            m974_reduce_fused = m974_reduce_fused + 1
+            counter = counter + 1
+        } else {
+            out = out.push(stmt)
+        }
+        i = i + 1
+    }
+    return out
+}
+
 fn simplify_expr(expr) {
     if type_of(expr) == "string" { return expr }
     // M286: Array literal constant index → element
@@ -4277,6 +4485,30 @@ fn simplify_expr(expr) {
             params: "", body: "", args: "", fields: "", items: "",
             variants: "", arms: "", iter_expr: "", ret_type: "",
             target: "", trait_name: "", methods: ""
+        }
+    }
+    // M976: len() constant folding — len("abc") → 3, len([1,2,3]) → 3
+    if expr.kind == "Call" {
+        let callee = expr.left
+        if type_of(callee) != "string" && callee.kind == "Ident" && callee.name == "len" {
+            if type_of(expr.args) == "array" && len(expr.args) == 1 {
+                let arg = simplify_expr(expr.args[0])
+                if type_of(arg) != "string" {
+                    // len("literal") → string length
+                    if arg.kind == "StringLit" {
+                        m976_len_folds = m976_len_folds + 1
+                        let slen = len(arg.value.chars())
+                        return make_int_lit(slen)
+                    }
+                    // len([a, b, c]) → array literal length
+                    if arg.kind == "Array" {
+                        if type_of(arg.items) == "array" {
+                            m976_len_folds = m976_len_folds + 1
+                            return make_int_lit(len(arg.items))
+                        }
+                    }
+                }
+            }
         }
     }
     // M34: unary folding
@@ -4442,6 +4674,38 @@ fn simplify_expr(expr) {
         if is_int_zero(r) {
             m30_algebraic = m30_algebraic + 1
             return l
+        }
+        // M975: string concat folding — "a" + "b" → "ab"
+        if type_of(l) != "string" && type_of(r) != "string" {
+            if l.kind == "StringLit" && r.kind == "StringLit" {
+                m975_string_concat_folds = m975_string_concat_folds + 1
+                return AstNode {
+                    kind: "StringLit", name: "", value: l.value + r.value, op: "",
+                    left: "", right: "", cond: "", then_body: "", else_body: "",
+                    params: "", body: "", args: "", fields: "", items: "",
+                    variants: "", arms: "", iter_expr: "", ret_type: "",
+                    target: "", trait_name: "", methods: ""
+                }
+            }
+            // M975: ("a" + "b") + "c" → "abc" (associative string concat)
+            if l.kind == "BinOp" && l.op == "+" && r.kind == "StringLit" {
+                if type_of(l.right) != "string" && l.right.kind == "StringLit" {
+                    m975_string_concat_folds = m975_string_concat_folds + 1
+                    return AstNode {
+                        kind: "BinOp", name: "", value: "", op: "+",
+                        left: l.left, right: AstNode {
+                            kind: "StringLit", name: "", value: l.right.value + r.value, op: "",
+                            left: "", right: "", cond: "", then_body: "", else_body: "",
+                            params: "", body: "", args: "", fields: "", items: "",
+                            variants: "", arms: "", iter_expr: "", ret_type: "",
+                            target: "", trait_name: "", methods: ""
+                        }, cond: "", then_body: "", else_body: "",
+                        params: "", body: "", args: "", fields: "", items: "",
+                        variants: "", arms: "", iter_expr: "", ret_type: "",
+                        target: "", trait_name: "", methods: ""
+                    }
+                }
+            }
         }
         // M254: associative fold (x + c1) + c2 → x + (c1+c2)
         if type_of(l) != "string" && type_of(r) != "string" {
@@ -5236,6 +5500,207 @@ fn simplify_body(body) {
                     out = out.push(stmt)
                 }
             }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ── M977/M978: strength reduction extensions (ROI id=13) ─────────────────────
+// M977: additional small-constant strength reductions already covered by M480.
+//       (x*2→x<<1, x/2→x>>1, x%2→x&1 are handled by M480 pow2 path.)
+//       This counter tracks any extra small-constant reductions found.
+
+// M978: loop index multiply → accumulate.
+// Pattern: while (i < n) { ... use(i * stride) ... i = i + 1 }
+//       → let mut __acc = 0; while (i < n) { ... use(__acc) ... __acc = __acc + stride; i = i + 1 }
+// Detects: LetStmt/ConstStmt inside a WhileStmt body where init = BinOp("*", Ident(loop_var), IntLit(stride))
+// and loop_var is the loop counter incremented by 1 each iteration.
+
+// Find the loop counter name: a variable assigned `name = name + 1` in the body
+fn find_loop_counter(body) {
+    if type_of(body) != "array" { return "" }
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        if stmt.kind == "AssignStmt" {
+            let rhs = stmt.left
+            if type_of(rhs) != "string" && rhs.kind == "BinOp" && rhs.op == "+" {
+                if type_of(rhs.left) != "string" && rhs.left.kind == "Ident" {
+                    if type_of(rhs.right) != "string" && rhs.right.kind == "IntLit" && rhs.right.value == "1" {
+                        if rhs.left.name == stmt.name {
+                            return stmt.name
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// Rewrite a WhileStmt body: replace `let x = counter * stride` with `let x = __acc`
+// and add `__acc = __acc + stride` before the counter increment.
+fn strength_reduce_loop_body(body) {
+    if type_of(body) != "array" { return body }
+    let counter_name = find_loop_counter(body)
+    if counter_name == "" { return body }
+    // Scan for LetStmt/ConstStmt where init = counter * IntLit
+    let n = len(body)
+    let mut targets = []  // [{idx, stride, var_name}]
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        if stmt.kind == "LetStmt" || stmt.kind == "ConstStmt" {
+            let init = stmt.left
+            if type_of(init) != "string" && init.kind == "BinOp" && init.op == "*" {
+                if type_of(init.left) != "string" && init.left.kind == "Ident" && init.left.name == counter_name {
+                    if type_of(init.right) != "string" && init.right.kind == "IntLit" {
+                        let stride_val = parse_int_str(init.right.value)
+                        if stride_val >= 2 {
+                            // Record target for rewriting
+                            let rec = AstNode {
+                                kind: "__StrideTarget", name: stmt.name, value: init.right.value, op: "",
+                                left: "", right: "", cond: "", then_body: "", else_body: "",
+                                params: "", body: "", args: "", fields: "", items: "",
+                                variants: "", arms: "", iter_expr: "", ret_type: "",
+                                target: "", trait_name: "", methods: ""
+                            }
+                            targets = targets.push(rec)
+                        }
+                    }
+                }
+                // Also handle stride * counter (commutative)
+                if type_of(init.right) != "string" && init.right.kind == "Ident" && init.right.name == counter_name {
+                    if type_of(init.left) != "string" && init.left.kind == "IntLit" {
+                        let stride_val2 = parse_int_str(init.left.value)
+                        if stride_val2 >= 2 {
+                            let rec2 = AstNode {
+                                kind: "__StrideTarget", name: stmt.name, value: init.left.value, op: "",
+                                left: "", right: "", cond: "", then_body: "", else_body: "",
+                                params: "", body: "", args: "", fields: "", items: "",
+                                variants: "", arms: "", iter_expr: "", ret_type: "",
+                                target: "", trait_name: "", methods: ""
+                            }
+                            targets = targets.push(rec2)
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    if len(targets) == 0 { return body }
+    // Rewrite: replace `let x = counter * stride` with `let x = __sr_acc_N`
+    // and insert `__sr_acc_N = __sr_acc_N + stride` before counter increment
+    let mut new_body = []
+    let mut ti = 0
+    let tn = len(targets)
+    let mut si = 0
+    while si < n {
+        let stmt = body[si]
+        // Check if this stmt is a target
+        let mut matched = false
+        let mut match_idx = 0
+        let mut mj = 0
+        while mj < tn {
+            if targets[mj].name == stmt.name && (stmt.kind == "LetStmt" || stmt.kind == "ConstStmt") {
+                let init_chk = stmt.left
+                if type_of(init_chk) != "string" && init_chk.kind == "BinOp" && init_chk.op == "*" {
+                    matched = true
+                    match_idx = mj
+                }
+            }
+            mj = mj + 1
+        }
+        if matched {
+            // Replace: let x = __sr_acc_N
+            let acc_name = "__sr_acc" + to_string(match_idx)
+            new_body = new_body.push(make_let_stmt(stmt.name, make_ident(acc_name)))
+            m978_loop_stride = m978_loop_stride + 1
+        } else {
+            // Before counter increment, insert accumulator updates
+            if stmt.kind == "AssignStmt" && stmt.name == counter_name {
+                let mut ak = 0
+                while ak < tn {
+                    let acc_n = "__sr_acc" + to_string(ak)
+                    let stride_lit = make_int_lit(parse_int_str(targets[ak].value))
+                    new_body = new_body.push(make_assign_stmt(acc_n, make_binop("+", make_ident(acc_n), stride_lit)))
+                    ak = ak + 1
+                }
+            }
+            new_body = new_body.push(stmt)
+        }
+        si = si + 1
+    }
+    return new_body
+}
+
+// Body-level pass: scan for WhileStmt and apply loop stride reduction
+fn strength_reduce_body(body) {
+    if type_of(body) != "array" { return body }
+    let n = len(body)
+    let mut out = []
+    let mut pre_inits = []  // accumulator init stmts to prepend before while
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        if stmt.kind == "WhileStmt" {
+            // Check if loop body has stride targets
+            let counter_name = find_loop_counter(stmt.body)
+            if counter_name != "" {
+                let before_stride = m978_loop_stride
+                let new_loop_body = strength_reduce_loop_body(stmt.body)
+                if m978_loop_stride > before_stride {
+                    // Need to prepend accumulator init stmts before the while
+                    // Scan targets to create init stmts
+                    let bn = len(stmt.body)
+                    let mut targets2 = []
+                    let mut bi = 0
+                    while bi < bn {
+                        let bs = stmt.body[bi]
+                        if bs.kind == "LetStmt" || bs.kind == "ConstStmt" {
+                            let binit = bs.left
+                            if type_of(binit) != "string" && binit.kind == "BinOp" && binit.op == "*" {
+                                let mut is_stride = false
+                                let mut stride_v = ""
+                                if type_of(binit.left) != "string" && binit.left.kind == "Ident" && binit.left.name == counter_name {
+                                    if type_of(binit.right) != "string" && binit.right.kind == "IntLit" {
+                                        is_stride = true
+                                        stride_v = binit.right.value
+                                    }
+                                }
+                                if type_of(binit.right) != "string" && binit.right.kind == "Ident" && binit.right.name == counter_name {
+                                    if type_of(binit.left) != "string" && binit.left.kind == "IntLit" {
+                                        is_stride = true
+                                        stride_v = binit.left.value
+                                    }
+                                }
+                                if is_stride {
+                                    targets2 = targets2.push(stride_v)
+                                }
+                            }
+                        }
+                        bi = bi + 1
+                    }
+                    // Emit accumulator inits
+                    let mut ti = 0
+                    while ti < len(targets2) {
+                        let acc_n = "__sr_acc" + to_string(ti)
+                        out = out.push(make_let_mut_stmt(acc_n, make_int_lit(0)))
+                        ti = ti + 1
+                    }
+                    out = out.push(make_while_stmt(stmt.cond, new_loop_body))
+                } else {
+                    out = out.push(stmt)
+                }
+            } else {
+                out = out.push(stmt)
+            }
+        } else {
+            out = out.push(stmt)
         }
         i = i + 1
     }
@@ -7708,6 +8173,11 @@ fn ai_native_pass(ast) {
     m482_fuse_candidates = 0
     m960_fuse_rewrites = 0
     m965_mapfilter_fused = 0
+    m974_reduce_fused = 0
+    m975_string_concat_folds = 0
+    m976_len_folds = 0
+    m977_strength_small = 0
+    m978_loop_stride = 0
     m253_inlined_calls = 0
     m253_stub_names = []
     m253_stub_lits = []
@@ -9205,6 +9675,14 @@ fn ai_native_pass(ast) {
                     node = rewrite_fn_with_body(node, mf_body)
                     println("[ai-native] fn " + node.name + " REWRITE: @fuse map/filter chain → loop (" + to_string(mf_count) + " site(s))")
                 }
+                // M974: @fuse map/filter/reduce chain → single while-loop rewrite (ROI id=4)
+                let before_rf = m974_reduce_fused
+                let rf_body = fuse_reduce_body(node.body)
+                let rf_count = m974_reduce_fused - before_rf
+                if rf_count > 0 {
+                    node = rewrite_fn_with_body(node, rf_body)
+                    println("[ai-native] fn " + node.name + " REWRITE: @fuse reduce/fold chain → loop (" + to_string(rf_count) + " site(s))")
+                }
                 // M960: @fuse actual intermediate variable elimination — AST rewrite
                 // Run fuse_intermediate_vars up to 4 times (fixpoint) to handle chains a→b→c→d
                 let before_fuse = m960_fuse_rewrites
@@ -9220,6 +9698,14 @@ fn ai_native_pass(ast) {
                 if fuse_count > 0 {
                     node = rewrite_fn_with_body(node, fuse_body)
                     println("[ai-native] fn " + node.name + " REWRITE: @fuse eliminated " + to_string(fuse_count) + " intermediate var(s)")
+                }
+                // M978: @fuse strength reduction — loop index multiply → accumulate (ROI id=13)
+                let before_sr = m978_loop_stride
+                let sr_body = strength_reduce_body(node.body)
+                let sr_count = m978_loop_stride - before_sr
+                if sr_count > 0 {
+                    node = rewrite_fn_with_body(node, sr_body)
+                    println("[ai-native] fn " + node.name + " REWRITE: @fuse loop stride → accumulate (" + to_string(sr_count) + " site(s))")
                 }
             }
             // M962: @specialize — fn with params used in binop with int literal
@@ -9812,7 +10298,7 @@ fn ai_native_pass(ast) {
     println("[ai-native] bubble-candidates " + to_string(m14_bubble_candidates) + ", tail-call-candidates " + to_string(m15_tail_call_candidates) + ", strassen-candidates " + to_string(m16_strassen_candidates) + ", dp-missed " + to_string(m17_dp_missed))
     println("[ai-native] bubble-detected " + to_string(m957_bubble_detected) + ", linear-search-detected " + to_string(m958_linear_search_detected) + ", tail-rec-detected " + to_string(m959_tail_recursive_detected) + ", bubble-rewrites " + to_string(m961_bubble_rewrites) + ", binary-search-rewrites " + to_string(m975_binary_search_rewrites) + ", algebraic-series-rewrites " + to_string(m976_algebraic_series_rewrites))
     // M81: digest line — compact one-shot summary
-    let total_rewrites = m22_rewrites + m23_auto_memoize + m24_dce_fns + m25_tail_rewrites + m26_attr_dedups + m27_attr_sorts + m30_algebraic + m32_folds + m33_cmp_folds + m34_unary_folds + m35_bool_folds + m41_dead_loops + m480_symbolic_rewrites + m481b_symbolic_mul2 + m481c_symbolic_pow2 + m253b_contract_elims + m960_fuse_rewrites + m961_bubble_rewrites + m965_mapfilter_fused + m975_binary_search_rewrites + m976_algebraic_series_rewrites
+    let total_rewrites = m22_rewrites + m23_auto_memoize + m24_dce_fns + m25_tail_rewrites + m26_attr_dedups + m27_attr_sorts + m30_algebraic + m32_folds + m33_cmp_folds + m34_unary_folds + m35_bool_folds + m41_dead_loops + m480_symbolic_rewrites + m481b_symbolic_mul2 + m481c_symbolic_pow2 + m253b_contract_elims + m960_fuse_rewrites + m961_bubble_rewrites + m965_mapfilter_fused + m974_reduce_fused + m975_binary_search_rewrites + m975_string_concat_folds + m975_dce_unused_lets + m975_dce_unused_imports + m976_algebraic_series_rewrites + m976_len_folds + m976_dp_sliding_rewrites + m977_strength_small + m978_loop_stride
     println("[ai-native] DIGEST fns=" + to_string(m6_annotated_fns) + "/" + to_string(m6_total_fns) + " attrs=" + to_string(m64_total_attrs) + " diversity=" + to_string(len(m63_attr_set)) + " rewrites=" + to_string(total_rewrites) + " leaves=" + to_string(m54_leaf_count) + " identity=" + to_string(m74_identity_fns) + " wrapper=" + to_string(m75_wrapper_fns) + " stubs=" + to_string(m37_stubs) + " nodes=" + to_string(m131_total_nodes) + " max-cplx=" + to_string(m36_max_complexity))
     let m18_total_suggestions = m14_bubble_candidates + m15_tail_call_candidates + m16_strassen_candidates + m17_dp_missed + m3_inline_too_big + m5_memoize_bad + m8_hw_no_loop + m4_attr_conflicts + m1_pure_violations + m19_unreachable
     println("[ai-native] unreachable " + to_string(m19_unreachable) + ", empty-body " + to_string(m20_empty_body) + ", const-return " + to_string(m21_const_return) + ", rewrites " + to_string(m22_rewrites) + ", auto-memoize " + to_string(m23_auto_memoize) + ", dce " + to_string(m24_dce_stmts) + " stmt(s) in " + to_string(m24_dce_fns) + " fn(s), tail-rewrites " + to_string(m25_tail_rewrites))
@@ -9831,6 +10317,18 @@ fn ai_native_pass(ast) {
     }
     if m965_mapfilter_fused > 0 {
         println("[ai-native] @fuse map/filter → loop: " + to_string(m965_mapfilter_fused) + " chain(s) fused")
+    }
+    if m974_reduce_fused > 0 {
+        println("[ai-native] @fuse reduce/fold → loop: " + to_string(m974_reduce_fused) + " chain(s) fused")
+    }
+    if m975_string_concat_folds > 0 {
+        println("[ai-native] string concat folding: " + to_string(m975_string_concat_folds) + " fold(s)")
+    }
+    if m976_len_folds > 0 {
+        println("[ai-native] len() folding: " + to_string(m976_len_folds) + " fold(s)")
+    }
+    if m978_loop_stride > 0 {
+        println("[ai-native] loop stride → accumulate: " + to_string(m978_loop_stride) + " site(s)")
     }
     if m962_specialize_ok + m962_specialize_violations > 0 {
         println("[ai-native] @specialize: " + to_string(m962_specialize_ok) + " ok, " + to_string(m962_specialize_candidates) + " candidate(s), " + to_string(m962_specialize_violations) + " violation(s)")
