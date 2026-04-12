@@ -49,6 +49,11 @@ pub let mut env_scopes = [0]   // scope boundary stack
 // top-level fn + let counts (~100) with avg chain length <2.
 pub let mut env_cache = []     // list of 64 buckets; each bucket is [[name, idx], ...]
 pub let mut env_fns = []      // function registry: name -> {params, body}
+// ── O(1) fn_lookup cache (perf) ─────────────────────────
+// Parallel to env_fns: 64 buckets, each a list of [name, env_fns_index].
+// find_fn scans only the name's bucket and picks the entry with the
+// largest index (newest definition = shadowing). Same pattern as env_cache.
+pub let mut fn_cache = []     // list of 64 buckets; each bucket is [[name, idx], ...]
 pub let mut return_flag = false
 pub let mut return_val = val_void()
 pub let mut break_flag = false
@@ -70,14 +75,230 @@ pub let mut call_stack = []    // stack trace: array of function names
 pub let mut gen_buffer = []
 pub let mut gen_active = false
 
+// ═══════════════════════════════════════════════════════════
+//  Numeric dispatch IDs — node kinds
+//  String→int conversion done once at lookup; eval dispatches on int.
+//  ~45 sequential string comparisons → single int comparison per arm.
+// ═══════════════════════════════════════════════════════════
+let NK_UNKNOWN       = 0
+let NK_INT_LIT       = 1
+let NK_FLOAT_LIT     = 2
+let NK_BOOL_LIT      = 3
+let NK_STRING_LIT    = 4
+let NK_CHAR_LIT      = 5
+let NK_IDENT         = 6
+let NK_BIN_OP        = 7
+let NK_UNARY_OP      = 8
+let NK_ARRAY         = 9
+let NK_INDEX         = 10
+let NK_CALL          = 11
+let NK_FIELD         = 12
+let NK_IF_EXPR       = 13
+let NK_LAMBDA        = 14
+let NK_MAP_LIT       = 15
+let NK_RANGE         = 16
+let NK_ASSIGN        = 17
+let NK_TUPLE_LIT     = 18
+let NK_STRUCT_INIT   = 19
+let NK_ENUM_PATH     = 20
+let NK_THROW_EXPR    = 21
+let NK_THROW_STMT    = 22
+let NK_BLOCK         = 23
+let NK_BLOCK_EXPR    = 24
+let NK_TUPLE         = 25
+let NK_TUPLE_EXPR    = 26
+let NK_HANDLE_WITH   = 27
+let NK_EFFECT_CALL   = 28
+let NK_RESUME        = 29
+let NK_RESUME_EXPR   = 30
+let NK_COMPTIME      = 31
+let NK_COMPTIME_EXPR = 32
+let NK_TEMPLATE      = 33
+let NK_TEMPLATE_EXPR = 34
+let NK_INTERP_STR    = 35
+let NK_WILDCARD      = 36
+let NK_ARRAY_PATTERN = 37
+let NK_OWN           = 38
+let NK_MOVE          = 39
+let NK_MOVE_EXPR     = 40
+let NK_BORROW        = 41
+let NK_BORROW_EXPR   = 42
+let NK_AWAIT         = 43
+let NK_AWAIT_EXPR    = 44
+let NK_DYN_CAST      = 45
+let NK_DYN_CAST_EXPR = 46
+let NK_MACRO_INVOC   = 47
+let NK_MACRO_INVOCATION = 48
+let NK_TRY_CATCH_EXPR = 49
+let NK_TRY_CATCH     = 50
+let NK_MATCH_EXPR    = 51
+
+// ── Numeric dispatch IDs — binary operators ─────────────
+let OP_UNKNOWN  = 0
+let OP_ADD      = 1
+let OP_SUB      = 2
+let OP_MUL      = 3
+let OP_DIV      = 4
+let OP_MOD      = 5
+let OP_POW      = 6
+let OP_EQ       = 7
+let OP_NE       = 8
+let OP_LT       = 9
+let OP_GT       = 10
+let OP_LE       = 11
+let OP_GE       = 12
+let OP_AND      = 13
+let OP_OR       = 14
+let OP_BIT_AND  = 15
+let OP_BIT_OR   = 16
+let OP_BIT_XOR  = 17
+let OP_SHL      = 18
+let OP_SHR      = 19
+
+// ── Node-kind string → int conversion (called once per node) ──
+fn node_kind_to_id(kind) {
+    if kind == "IntLit" { return NK_INT_LIT }
+    if kind == "FloatLit" { return NK_FLOAT_LIT }
+    if kind == "BoolLit" { return NK_BOOL_LIT }
+    if kind == "StringLit" { return NK_STRING_LIT }
+    if kind == "CharLit" { return NK_CHAR_LIT }
+    if kind == "Ident" { return NK_IDENT }
+    if kind == "BinOp" { return NK_BIN_OP }
+    if kind == "UnaryOp" { return NK_UNARY_OP }
+    if kind == "Array" { return NK_ARRAY }
+    if kind == "Index" { return NK_INDEX }
+    if kind == "Call" { return NK_CALL }
+    if kind == "Field" { return NK_FIELD }
+    if kind == "IfExpr" { return NK_IF_EXPR }
+    if kind == "Lambda" { return NK_LAMBDA }
+    if kind == "MapLit" { return NK_MAP_LIT }
+    if kind == "Range" { return NK_RANGE }
+    if kind == "Assign" { return NK_ASSIGN }
+    if kind == "TupleLit" { return NK_TUPLE_LIT }
+    if kind == "StructInit" { return NK_STRUCT_INIT }
+    if kind == "EnumPath" { return NK_ENUM_PATH }
+    if kind == "ThrowExpr" { return NK_THROW_EXPR }
+    if kind == "ThrowStmt" { return NK_THROW_STMT }
+    if kind == "Block" { return NK_BLOCK }
+    if kind == "BlockExpr" { return NK_BLOCK_EXPR }
+    if kind == "Tuple" { return NK_TUPLE }
+    if kind == "TupleExpr" { return NK_TUPLE_EXPR }
+    if kind == "HandleWith" { return NK_HANDLE_WITH }
+    if kind == "EffectCall" { return NK_EFFECT_CALL }
+    if kind == "Resume" { return NK_RESUME }
+    if kind == "ResumeExpr" { return NK_RESUME_EXPR }
+    if kind == "Comptime" { return NK_COMPTIME }
+    if kind == "ComptimeExpr" { return NK_COMPTIME_EXPR }
+    if kind == "Template" { return NK_TEMPLATE }
+    if kind == "TemplateExpr" { return NK_TEMPLATE_EXPR }
+    if kind == "InterpolatedString" { return NK_INTERP_STR }
+    if kind == "Wildcard" { return NK_WILDCARD }
+    if kind == "ArrayPattern" { return NK_ARRAY_PATTERN }
+    if kind == "Own" { return NK_OWN }
+    if kind == "Move" { return NK_MOVE }
+    if kind == "MoveExpr" { return NK_MOVE_EXPR }
+    if kind == "Borrow" { return NK_BORROW }
+    if kind == "BorrowExpr" { return NK_BORROW_EXPR }
+    if kind == "Await" { return NK_AWAIT }
+    if kind == "AwaitExpr" { return NK_AWAIT_EXPR }
+    if kind == "DynCast" { return NK_DYN_CAST }
+    if kind == "DynCastExpr" { return NK_DYN_CAST_EXPR }
+    if kind == "MacroInvoc" { return NK_MACRO_INVOC }
+    if kind == "MacroInvocation" { return NK_MACRO_INVOCATION }
+    if kind == "TryCatchExpr" { return NK_TRY_CATCH_EXPR }
+    if kind == "TryCatch" { return NK_TRY_CATCH }
+    if kind == "MatchExpr" { return NK_MATCH_EXPR }
+    return NK_UNKNOWN
+}
+
+// ── Operator string → int conversion (called once per binop node) ──
+fn op_to_id(op) {
+    if op == "+" { return OP_ADD }
+    if op == "-" { return OP_SUB }
+    if op == "*" { return OP_MUL }
+    if op == "/" { return OP_DIV }
+    if op == "%" { return OP_MOD }
+    if op == "**" { return OP_POW }
+    if op == "==" { return OP_EQ }
+    if op == "!=" { return OP_NE }
+    if op == "<" { return OP_LT }
+    if op == ">" { return OP_GT }
+    if op == "<=" { return OP_LE }
+    if op == ">=" { return OP_GE }
+    if op == "&&" { return OP_AND }
+    if op == "||" { return OP_OR }
+    if op == "&" { return OP_BIT_AND }
+    if op == "|" { return OP_BIT_OR }
+    if op == "^" { return OP_BIT_XOR }
+    if op == "<<" { return OP_SHL }
+    if op == ">>" { return OP_SHR }
+    return OP_UNKNOWN
+}
+
+// ── Node-kind ID cache ──────────────────────────────────
+// Maps node kind string → int ID. Populated lazily so the string→int
+// conversion happens at most once per unique kind string, not every eval.
+// Layout: [[kind_string, id_int], ...]
+pub let mut nk_cache = []
+
+fn nk_cached_id(kind) {
+    // Scan cache (typically <52 entries, very short)
+    let mut i = 0
+    while i < len(nk_cache) {
+        if nk_cache[i][0] == kind { return nk_cache[i][1] }
+        i = i + 1
+    }
+    // Miss — compute and store
+    let id = node_kind_to_id(kind)
+    nk_cache = nk_cache.push([kind, id])
+    return id
+}
+
+// ── Operator ID cache ───────────────────────────────────
+pub let mut op_cache = []
+
+fn op_cached_id(op) {
+    let mut i = 0
+    while i < len(op_cache) {
+        if op_cache[i][0] == op { return op_cache[i][1] }
+        i = i + 1
+    }
+    let id = op_to_id(op)
+    op_cache = op_cache.push([op, id])
+    return id
+}
+
 // ── @memo/@memoize/@cache runtime support ───────────────
 // fn_attrs: maps function name -> comma-separated attr string
 pub let mut fn_attrs = []      // [[name, attrs_str], ...]
-// memo_cache: [[fn_name, [[key_str, result_val], ...]], ...]
-pub let mut memo_cache = []
+// ── Optimization #5: pre-parsed attribute flags ─────────
+// Avoids O(m*n) substring matching on every call. Each entry:
+// [name, is_memo (bool), is_pure (bool)]
+// Populated by fn_attrs_set; queried by fn_attr_flag_memo.
+pub let mut fn_attr_flags = []  // [[name, is_memo, is_pure], ...]
+// ── Optimization #6: hash-bucketed memo cache ───────────
+// 64 buckets, each a list of [key, result_val] pairs.
+// Same pattern as env_cache. Replaces linear memo_cache scan.
+pub let mut memo_cache = []    // 64 buckets; each bucket is [[key, val], ...]
 
 fn fn_attrs_set(name, attrs) {
     fn_attrs = fn_attrs.push([name, attrs])
+    // ── Opt #5: parse attribute flags once at define time ──
+    let mut is_memo = false
+    let mut is_pure = false
+    if attrs != "" {
+        if attrs == "memoize" || attrs == "memo" || attrs == "cache" {
+            is_memo = true
+        } else {
+            if contains(attrs, "memoize") { is_memo = true }
+            if contains(attrs, "memo") { is_memo = true }
+            if contains(attrs, "cache") { is_memo = true }
+        }
+        if attrs == "pure" || contains(attrs, "pure") {
+            is_pure = true
+        }
+    }
+    fn_attr_flags = fn_attr_flags.push([name, is_memo, is_pure])
 }
 
 fn fn_attrs_get(name) {
@@ -89,15 +310,18 @@ fn fn_attrs_get(name) {
     return ""
 }
 
-fn has_memo_attr(name) {
-    let attrs = fn_attrs_get(name)
-    if attrs == "" { return false }
-    // Check for memoize, memo, or cache in comma-separated attrs
-    if attrs == "memoize" || attrs == "memo" || attrs == "cache" { return true }
-    if contains(attrs, "memoize") { return true }
-    if contains(attrs, "memo") { return true }
-    if contains(attrs, "cache") { return true }
+// ── Opt #5: O(1) flag check replaces substring matching ──
+fn fn_attr_flag_memo(name) {
+    let mut i = len(fn_attr_flags) - 1
+    while i >= 0 {
+        if fn_attr_flags[i][0] == name { return fn_attr_flags[i][1] }
+        i = i - 1
+    }
     return false
+}
+
+fn has_memo_attr(name) {
+    return fn_attr_flag_memo(name)
 }
 
 fn memo_key_for_args(name, args) {
@@ -112,17 +336,50 @@ fn memo_key_for_args(name, args) {
     return key
 }
 
-fn memo_lookup(key) {
+// ── Opt #6: hash-bucketed memo cache (64 buckets) ────────
+// Same design as env_cache. Hash the key string into a bucket,
+// then linear-scan only that bucket (~len/64 entries on average).
+
+fn memo_hash(key) {
+    let mut h = 0
     let mut i = 0
-    while i < len(memo_cache) {
-        if memo_cache[i][0] == key { return memo_cache[i] }
+    let n = len(key)
+    while i < n {
+        h = h + char_code(key, i)
+        i = i + 1
+    }
+    let mut b = h
+    while b < 0 { b = b + 64 }
+    return b % 64
+}
+
+fn memo_cache_init() {
+    let mut buckets = []
+    let mut i = 0
+    while i < 64 {
+        buckets = buckets.push([])
+        i = i + 1
+    }
+    memo_cache = buckets
+}
+
+fn memo_lookup(key) {
+    if len(memo_cache) != 64 { return "" }
+    let b = memo_hash(key)
+    let bucket = memo_cache[b]
+    let mut i = 0
+    let n = len(bucket)
+    while i < n {
+        if bucket[i][0] == key { return bucket[i] }
         i = i + 1
     }
     return ""
 }
 
 fn memo_store(key, result) {
-    memo_cache = memo_cache.push([key, result])
+    if len(memo_cache) != 64 { memo_cache_init() }
+    let b = memo_hash(key)
+    memo_cache[b] = memo_cache[b].push([key, result])
 }
 
 // ── @specialize inline cache (V8-style IC) ─────────────
@@ -801,6 +1058,37 @@ fn env_rebuild_cache() {
     }
 }
 
+// ── O(1) fn_cache helpers (mirrors env_cache pattern) ────
+// Reuse env_hash for bucket index — same 64-bucket, sum-of-char-codes scheme.
+
+fn fn_cache_init() {
+    let mut buckets = []
+    let mut i = 0
+    while i < 64 {
+        buckets = buckets.push([])
+        i = i + 1
+    }
+    fn_cache = buckets
+}
+
+fn fn_cache_add(name, idx) {
+    if len(fn_cache) != 64 { fn_cache_init() }
+    let b = env_hash(name)
+    fn_cache[b] = fn_cache[b].push([name, idx])
+}
+
+fn fn_rebuild_cache() {
+    fn_cache_init()
+    let mut i = 0
+    let n = len(env_fns)
+    while i < n {
+        let entry = env_fns[i]
+        let b = env_hash(entry[0])
+        fn_cache[b] = fn_cache[b].push([entry[0], i])
+        i = i + 1
+    }
+}
+
 fn env_push_scope() {
     env_scopes = env_scopes.push(len(env_vars))
 }
@@ -927,12 +1215,14 @@ fn eval_expr_at(arr, idx) {
     let k = elem.kind
     if type_of(k) != "string" { return val_void() }
 
-    if k == "IntLit" { return val_int(arr[idx].value.parse_int()) }
-    if k == "FloatLit" { return val_float(arr[idx].value.parse_float()) }
-    if k == "BoolLit" { return val_bool(arr[idx].value == "true") }
-    if k == "StringLit" { return val_str(arr[idx].value) }
-    if k == "CharLit" { return val_str(arr[idx].value) }
-    if k == "Ident" { return env_lookup(arr[idx].name) }
+    // Numeric dispatch for hot-path literals (int compare vs string compare)
+    let kid = nk_cached_id(k)
+    if kid == NK_INT_LIT { return val_int(arr[idx].value.parse_int()) }
+    if kid == NK_FLOAT_LIT { return val_float(arr[idx].value.parse_float()) }
+    if kid == NK_BOOL_LIT { return val_bool(arr[idx].value == "true") }
+    if kid == NK_STRING_LIT { return val_str(arr[idx].value) }
+    if kid == NK_CHAR_LIT { return val_str(arr[idx].value) }
+    if kid == NK_IDENT { return env_lookup(arr[idx].name) }
     // For complex nodes, we need to extract children
     // This is OK because arr[idx].left gives a reference, not a deep copy
     return eval_expr_inner(arr[idx])
@@ -953,20 +1243,23 @@ fn eval_expr_inner(node) {
     let k = node.kind
     if type_of(k) != "string" { return val_void() }
 
-    if k == "IntLit" { return val_int(node.value.parse_int()) }
-    if k == "FloatLit" { return val_float(node.value.parse_float()) }
-    if k == "BoolLit" { return val_bool(node.value == "true") }
-    if k == "StringLit" { return val_str(node.value) }
-    if k == "CharLit" { return val_str(node.value) }
-    if k == "Ident" { return env_lookup(node.name) }
+    // ── Numeric dispatch: convert kind string → int once, compare ints ──
+    let kid = nk_cached_id(k)
 
-    if k == "BinOp" {
+    if kid == NK_INT_LIT { return val_int(node.value.parse_int()) }
+    if kid == NK_FLOAT_LIT { return val_float(node.value.parse_float()) }
+    if kid == NK_BOOL_LIT { return val_bool(node.value == "true") }
+    if kid == NK_STRING_LIT { return val_str(node.value) }
+    if kid == NK_CHAR_LIT { return val_str(node.value) }
+    if kid == NK_IDENT { return env_lookup(node.name) }
+
+    if kid == NK_BIN_OP {
         let lv = eval_expr(node.left)
         let rv = eval_expr(node.right)
         return eval_binop(node.op, lv, rv)
     }
 
-    if k == "UnaryOp" {
+    if kid == NK_UNARY_OP {
         let v = eval_expr(node.left)
         if node.op == "-" {
             if v.tag == "int" { return val_int(-v.int_val) }
@@ -982,7 +1275,7 @@ fn eval_expr_inner(node) {
         return v
     }
 
-    if k == "Array" {
+    if kid == NK_ARRAY {
         let mut items = []
         for item in node.items {
             items = items.push(eval_expr(item))
@@ -990,7 +1283,7 @@ fn eval_expr_inner(node) {
         return val_array(items)
     }
 
-    if k == "Index" {
+    if kid == NK_INDEX {
         // G13: array/string slicing — arr[start..end] or arr[start..=end]
         if type_of(node.right) != "string" && node.right.kind == "Range" {
             let arr_s = eval_expr(node.left)
@@ -1043,7 +1336,7 @@ fn eval_expr_inner(node) {
         return val_void()
     }
 
-    if k == "Call" {
+    if kid == NK_CALL {
         // Inline Call handling (avoid struct copy issue with eval_call)
         let mut call_args = []
         let raw_args = node.args
@@ -1113,7 +1406,7 @@ fn eval_expr_inner(node) {
         return val_void()
     }
 
-    if k == "Field" {
+    if kid == NK_FIELD {
         let obj = eval_expr(node.left)
         let field = node.name
         // Method call is handled in eval_call
@@ -1125,7 +1418,7 @@ fn eval_expr_inner(node) {
         return val_void()
     }
 
-    if k == "IfExpr" {
+    if kid == NK_IF_EXPR {
         let cond = eval_expr(node.cond)
         if is_truthy(cond) {
             return eval_block(node.then_body)
@@ -1136,7 +1429,7 @@ fn eval_expr_inner(node) {
         return val_void()
     }
 
-    if k == "Lambda" {
+    if kid == NK_LAMBDA {
         // Capture current environment for closure
         let mut captured = []
         let mut ci = 0
@@ -1147,7 +1440,7 @@ fn eval_expr_inner(node) {
         return val_closure("__lambda__", node.params, node.left, captured)
     }
 
-    if k == "MapLit" {
+    if kid == NK_MAP_LIT {
         let mut keys = []
         let mut values = []
         let entries = node.items
@@ -1161,7 +1454,7 @@ fn eval_expr_inner(node) {
         return val_map(keys, values)
     }
 
-    if k == "Range" {
+    if kid == NK_RANGE {
         let start = eval_expr(node.left)
         let end_val = eval_expr(node.right)
         let mut items = []
@@ -1173,7 +1466,7 @@ fn eval_expr_inner(node) {
         return val_array(items)
     }
 
-    if k == "Assign" {
+    if kid == NK_ASSIGN {
         let val = eval_expr(node.right)
         if node.left.kind == "Ident" {
             env_set(node.left.name, val)
@@ -1200,7 +1493,7 @@ fn eval_expr_inner(node) {
         return val
     }
 
-    if k == "TupleLit" {
+    if kid == NK_TUPLE_LIT {
         let mut items = []
         for item in node.items {
             items = items.push(eval_expr(item))
@@ -1209,7 +1502,7 @@ fn eval_expr_inner(node) {
     }
 
     // ── StructInit: Name { field: val, ... } ────────────────
-    if k == "StructInit" {
+    if kid == NK_STRUCT_INIT {
         let sname = node.name
         let field_inits = node.fields
         let mut field_map = #{}
@@ -1225,7 +1518,7 @@ fn eval_expr_inner(node) {
     }
 
     // ── EnumPath: EnumName::Variant or EnumName::Variant(data) ──
-    if k == "EnumPath" {
+    if kid == NK_ENUM_PATH {
         let data = node.left
         let mut data_val = ""
         if type_of(data) != "string" || data != "" {
@@ -1235,7 +1528,7 @@ fn eval_expr_inner(node) {
     }
 
     // ── ThrowExpr: throw as expression (returns void, sets throw_flag) ──
-    if k == "ThrowExpr" || k == "ThrowStmt" {
+    if kid == NK_THROW_EXPR || kid == NK_THROW_STMT {
         let err = eval_expr(node.left)
         exec_throw(err)
         return val_void()
@@ -1246,12 +1539,12 @@ fn eval_expr_inner(node) {
     // ═══════════════════════════════════════════════════════
 
     // Block expression: { stmts; final_expr }
-    if k == "Block" || k == "BlockExpr" {
+    if kid == NK_BLOCK || kid == NK_BLOCK_EXPR {
         return eval_block(node.body)
     }
 
     // Tuple expression: (a, b, c) — represented as array of evaluated elements
-    if k == "Tuple" || k == "TupleExpr" {
+    if kid == NK_TUPLE || kid == NK_TUPLE_EXPR {
         let mut items = []
         if type_of(node.elements) == "array" {
             for e in node.elements { items = items.push(eval_expr(e)) }
@@ -1261,7 +1554,7 @@ fn eval_expr_inner(node) {
 
     // HandleWith: handle { body } with { eff.op(...) -> ... }
     //   Note: AST stores effect name in `name` field (not `effect`, which is a keyword)
-    if k == "HandleWith" {
+    if kid == NK_HANDLE_WITH {
         let mut entries = []
         if type_of(node.handlers) == "array" {
             for h in node.handlers {
@@ -1276,7 +1569,7 @@ fn eval_expr_inner(node) {
     }
 
     // EffectCall: eff.op(args) — AST uses `name` for effect identifier
-    if k == "EffectCall" {
+    if kid == NK_EFFECT_CALL {
         let mut eargs = []
         if type_of(node.args) == "array" {
             for a in node.args { eargs = eargs.push(eval_expr(a)) }
@@ -1285,7 +1578,7 @@ fn eval_expr_inner(node) {
     }
 
     // Resume: inside an effect handler, set the resume value (parser: .left)
-    if k == "Resume" || k == "ResumeExpr" {
+    if kid == NK_RESUME || kid == NK_RESUME_EXPR {
         let v = eval_expr(node.left)
         resume_value = v
         resume_set = true
@@ -1293,13 +1586,13 @@ fn eval_expr_inner(node) {
     }
 
     // Comptime expression: evaluate at compile time (here just eval normally)
-    if k == "Comptime" || k == "ComptimeExpr" {
+    if kid == NK_COMPTIME || kid == NK_COMPTIME_EXPR {
         return eval_expr(node.expr)
     }
 
     // Template / string interpolation: concatenate parts
     //   parts: array of {kind: "lit", value} | {kind: "expr", expr}
-    if k == "Template" || k == "TemplateExpr" || k == "InterpolatedString" {
+    if kid == NK_TEMPLATE || kid == NK_TEMPLATE_EXPR || kid == NK_INTERP_STR {
         let mut out = ""
         if type_of(node.parts) == "array" {
             for p in node.parts {
@@ -1315,17 +1608,17 @@ fn eval_expr_inner(node) {
     }
 
     // Wildcard / ArrayPattern: only meaningful in patterns; in expr context yields void
-    if k == "Wildcard" || k == "ArrayPattern" {
+    if kid == NK_WILDCARD || kid == NK_ARRAY_PATTERN {
         return val_void()
     }
 
     // Own / Move / Borrow: ownership annotations have no runtime effect
-    if k == "Own" || k == "Move" || k == "MoveExpr" || k == "Borrow" || k == "BorrowExpr" {
+    if kid == NK_OWN || kid == NK_MOVE || kid == NK_MOVE_EXPR || kid == NK_BORROW || kid == NK_BORROW_EXPR {
         return eval_expr(node.expr)
     }
 
     // Await: in single-thread interpreter, await is identity (already-resolved)
-    if k == "Await" || k == "AwaitExpr" {
+    if kid == NK_AWAIT || kid == NK_AWAIT_EXPR {
         let v = eval_expr(node.expr)
         // If it's a future struct, extract value; else passthrough
         if v.tag == "struct" && v.struct_name == "Future" {
@@ -1337,13 +1630,13 @@ fn eval_expr_inner(node) {
 
     // DynCast: trait object dispatch (.hexa interp doesn't track trait impls
     //   strongly; passthrough the value tagged with trait_name)
-    if k == "DynCast" || k == "DynCastExpr" {
+    if kid == NK_DYN_CAST || kid == NK_DYN_CAST_EXPR {
         return eval_expr(node.expr)
     }
 
     // MacroInvoc: macros are pre-expanded by parser; if seen here, treat
     //   as a tagged Call to a function with the same name
-    if k == "MacroInvoc" || k == "MacroInvocation" {
+    if kid == NK_MACRO_INVOC || kid == NK_MACRO_INVOCATION {
         let mut margs = []
         if type_of(node.args) == "array" {
             for a in node.args { margs = margs.push(eval_expr(a)) }
@@ -1352,7 +1645,7 @@ fn eval_expr_inner(node) {
     }
 
     // TryCatch as expression
-    if k == "TryCatchExpr" || k == "TryCatch" {
+    if kid == NK_TRY_CATCH_EXPR || kid == NK_TRY_CATCH {
         let try_body = node.try_body
         let catch_var = node.catch_var
         let catch_body = node.catch_body
@@ -1375,7 +1668,7 @@ fn eval_expr_inner(node) {
     }
 
     // ── MatchExpr: match expr { pattern -> body, ... } ──────
-    if k == "MatchExpr" {
+    if kid == NK_MATCH_EXPR {
         let scrutinee = eval_expr(node.left)
         let arms = node.arms
         let mut mi = 0
@@ -1426,108 +1719,111 @@ fn eval_expr_inner(node) {
 // ── Binary operations ────────────────────────────────────
 
 fn eval_binop(op, a, b) {
+    // ── Numeric operator dispatch: convert op string → int once ──
+    let oid = op_cached_id(op)
+
     // Int fast path
     if a.tag == "int" && b.tag == "int" {
         let x = a.int_val
         let y = b.int_val
-        if op == "+" { return val_int(x + y) }
-        if op == "-" { return val_int(x - y) }
-        if op == "*" { return val_int(x * y) }
-        if op == "/" {
+        if oid == OP_ADD { return val_int(x + y) }
+        if oid == OP_SUB { return val_int(x - y) }
+        if oid == OP_MUL { return val_int(x * y) }
+        if oid == OP_DIV {
             if y == 0 { println("runtime error: division by zero"); return val_void() }
             return val_int(x / y)
         }
-        if op == "%" {
+        if oid == OP_MOD {
             if y == 0 { println("runtime error: division by zero"); return val_void() }
             return val_int(x % y)
         }
-        if op == "**" { return val_int(pow(x, y)) }
-        if op == "==" { return val_bool(x == y) }
-        if op == "!=" { return val_bool(x != y) }
-        if op == "<" { return val_bool(x < y) }
-        if op == ">" { return val_bool(x > y) }
-        if op == "<=" { return val_bool(x <= y) }
-        if op == ">=" { return val_bool(x >= y) }
-        if op == "&&" { return val_bool(x != 0 && y != 0) }
-        if op == "||" { return val_bool(x != 0 || y != 0) }
+        if oid == OP_POW { return val_int(pow(x, y)) }
+        if oid == OP_EQ { return val_bool(x == y) }
+        if oid == OP_NE { return val_bool(x != y) }
+        if oid == OP_LT { return val_bool(x < y) }
+        if oid == OP_GT { return val_bool(x > y) }
+        if oid == OP_LE { return val_bool(x <= y) }
+        if oid == OP_GE { return val_bool(x >= y) }
+        if oid == OP_AND { return val_bool(x != 0 && y != 0) }
+        if oid == OP_OR { return val_bool(x != 0 || y != 0) }
         // Bitwise operations (ported from src/interpreter.rs eval_binary)
-        if op == "&" {
+        if oid == OP_BIT_AND {
             let r = x & y
             return val_int(r)
         }
-        if op == "|" {
+        if oid == OP_BIT_OR {
             // NOTE: x | y triggers parser lambda-ambiguity inside parens,
             // so we use the identity: x|y = (x+y) - (x&y)
             let r = (x + y) - (x & y)
             return val_int(r)
         }
-        if op == "^" {
+        if oid == OP_BIT_XOR {
             let r = x ^ y
             return val_int(r)
         }
-        if op == "<<" {
+        if oid == OP_SHL {
             // x << y = x * 2^y (avoiding << parser issues)
             let r = x * pow(2, y)
             return val_int(r)
         }
-        if op == ">>" {
+        if oid == OP_SHR {
             // x >> y = x / 2^y (avoiding >> parser issues)
             let r = x / pow(2, y)
             return val_int(r)
         }
     }
     // String concatenation (str + anything)
-    if a.tag == "str" && op == "+" {
+    if a.tag == "str" && oid == OP_ADD {
         return val_str(a.str_val + val_to_string(b))
     }
     // Char + String / Char + Char concatenation
-    if a.tag == "char" && op == "+" {
+    if a.tag == "char" && oid == OP_ADD {
         return val_str(a.str_val + val_to_string(b))
     }
     // Float arithmetic (with int-to-float coercion)
     if (a.tag == "float" || b.tag == "float") {
         let x = to_float(a)
         let y = to_float(b)
-        if op == "+" { return val_float(x + y) }
-        if op == "-" { return val_float(x - y) }
-        if op == "*" { return val_float(x * y) }
-        if op == "/" {
+        if oid == OP_ADD { return val_float(x + y) }
+        if oid == OP_SUB { return val_float(x - y) }
+        if oid == OP_MUL { return val_float(x * y) }
+        if oid == OP_DIV {
             if y == 0.0 { println("runtime error: division by zero"); return val_void() }
             return val_float(x / y)
         }
-        if op == "%" { return val_float(x % y) }
-        if op == "**" { return val_float(pow(x, y)) }
-        if op == "==" { return val_bool(x == y) }
-        if op == "!=" { return val_bool(x != y) }
-        if op == "<" { return val_bool(x < y) }
-        if op == ">" { return val_bool(x > y) }
-        if op == "<=" { return val_bool(x <= y) }
-        if op == ">=" { return val_bool(x >= y) }
+        if oid == OP_MOD { return val_float(x % y) }
+        if oid == OP_POW { return val_float(pow(x, y)) }
+        if oid == OP_EQ { return val_bool(x == y) }
+        if oid == OP_NE { return val_bool(x != y) }
+        if oid == OP_LT { return val_bool(x < y) }
+        if oid == OP_GT { return val_bool(x > y) }
+        if oid == OP_LE { return val_bool(x <= y) }
+        if oid == OP_GE { return val_bool(x >= y) }
     }
     // Bool operations
     if a.tag == "bool" && b.tag == "bool" {
-        if op == "==" { return val_bool(a.bool_val == b.bool_val) }
-        if op == "!=" { return val_bool(a.bool_val != b.bool_val) }
-        if op == "&&" { return val_bool(a.bool_val && b.bool_val) }
-        if op == "||" { return val_bool(a.bool_val || b.bool_val) }
-        if op == "^" { return val_bool(a.bool_val != b.bool_val) }
+        if oid == OP_EQ { return val_bool(a.bool_val == b.bool_val) }
+        if oid == OP_NE { return val_bool(a.bool_val != b.bool_val) }
+        if oid == OP_AND { return val_bool(a.bool_val && b.bool_val) }
+        if oid == OP_OR { return val_bool(a.bool_val || b.bool_val) }
+        if oid == OP_BIT_XOR { return val_bool(a.bool_val != b.bool_val) }
     }
     // String comparisons
     if a.tag == "str" && b.tag == "str" {
-        if op == "==" { return val_bool(a.str_val == b.str_val) }
-        if op == "!=" { return val_bool(a.str_val != b.str_val) }
+        if oid == OP_EQ { return val_bool(a.str_val == b.str_val) }
+        if oid == OP_NE { return val_bool(a.str_val != b.str_val) }
     }
     // Char comparisons
     if a.tag == "char" && b.tag == "char" {
-        if op == "==" { return val_bool(a.str_val == b.str_val) }
-        if op == "!=" { return val_bool(a.str_val != b.str_val) }
-        if op == "<" { return val_bool(a.str_val < b.str_val) }
-        if op == ">" { return val_bool(a.str_val > b.str_val) }
-        if op == "<=" { return val_bool(a.str_val <= b.str_val) }
-        if op == ">=" { return val_bool(a.str_val >= b.str_val) }
+        if oid == OP_EQ { return val_bool(a.str_val == b.str_val) }
+        if oid == OP_NE { return val_bool(a.str_val != b.str_val) }
+        if oid == OP_LT { return val_bool(a.str_val < b.str_val) }
+        if oid == OP_GT { return val_bool(a.str_val > b.str_val) }
+        if oid == OP_LE { return val_bool(a.str_val <= b.str_val) }
+        if oid == OP_GE { return val_bool(a.str_val >= b.str_val) }
     }
     // Array concatenation (ported from src/interpreter.rs)
-    if a.tag == "array" && b.tag == "array" && op == "+" {
+    if a.tag == "array" && b.tag == "array" && oid == OP_ADD {
         let a_items = get_array(a)
         let b_items = get_array(b)
         let mut result = []
@@ -1536,7 +1832,7 @@ fn eval_binop(op, a, b) {
         return val_array(result)
     }
     // Array repetition: [1,2] * 3 => [1,2,1,2,1,2]
-    if a.tag == "array" && b.tag == "int" && op == "*" {
+    if a.tag == "array" && b.tag == "int" && oid == OP_MUL {
         let items = get_array(a)
         let n = b.int_val
         let mut result = []
@@ -1549,7 +1845,7 @@ fn eval_binop(op, a, b) {
     }
     // Array equality
     if a.tag == "array" && b.tag == "array" {
-        if op == "==" {
+        if oid == OP_EQ {
             let a_items = get_array(a)
             let b_items = get_array(b)
             if len(a_items) != len(b_items) { return val_bool(false) }
@@ -1560,14 +1856,14 @@ fn eval_binop(op, a, b) {
             }
             return val_bool(true)
         }
-        if op == "!=" {
+        if oid == OP_NE {
             let eq = eval_binop("==", a, b)
             return val_bool(!eq.bool_val)
         }
     }
     // Cross-type Eq/Ne: different value types are never equal
-    if op == "==" { return val_bool(false) }
-    if op == "!=" { return val_bool(true) }
+    if oid == OP_EQ { return val_bool(false) }
+    if oid == OP_NE { return val_bool(true) }
     return val_void()
 }
 
@@ -1878,6 +2174,7 @@ fn exec_stmt_at(stmts, idx) {
 
     if k == "FnDecl" || k == "AsyncFnDecl" {
         env_fns = env_fns.push([node.name, node.params, node.body])
+        fn_cache_add(node.name, len(env_fns) - 1)
         let fn_val = val_fn(node.name, node.params, node.body)
         env_define(node.name, fn_val)
         // Store @attrs for runtime interception (@memo/@memoize/@cache)
@@ -1954,6 +2251,7 @@ fn exec_stmt_at(stmts, idx) {
             let m = methods[mi]
             let mangled = target + "__" + m.name
             env_fns = env_fns.push([mangled, m.params, m.body])
+            fn_cache_add(mangled, len(env_fns) - 1)
             mi = mi + 1
         }
         return val_void()
@@ -2234,6 +2532,7 @@ fn exec_stmt_at(stmts, idx) {
     if k == "ComptimeFn" || k == "ComptimeFnDecl" {
         // Comptime functions evaluated lazily; treat as regular FnDecl
         env_fns = env_fns.push([node.name, node])
+        fn_cache_add(node.name, len(env_fns) - 1)
         return val_void()
     }
 
@@ -2272,6 +2571,7 @@ fn exec_stmt_at(stmts, idx) {
     //   pure flag so effect calls inside trigger an error.
     if k == "PureFnDecl" {
         env_fns = env_fns.push([node.name, node])
+        fn_cache_add(node.name, len(env_fns) - 1)
         fn_attrs_set(node.name, "pure")
         return val_void()
     }
@@ -2297,6 +2597,7 @@ fn exec_stmt_at(stmts, idx) {
     }
     if k == "ComptimeFnDecl" {
         env_fns = env_fns.push([node.name, node])
+        fn_cache_add(node.name, len(env_fns) - 1)
         return val_void()
     }
 
@@ -2399,6 +2700,29 @@ fn eval_call(node) {
 }
 
 fn find_fn(name) {
+    // O(1) avg via bucket cache. Fall back to linear scan only if
+    // cache is empty (e.g., right after wholesale env_fns swap that
+    // forgot to rebuild — defensive).
+    if len(fn_cache) == 64 {
+        let b = env_hash(name)
+        let bucket = fn_cache[b]
+        // Pick entry with largest index (newest definition = shadowing).
+        let mut best = -1
+        let mut bi = 0
+        let bn = len(bucket)
+        while bi < bn {
+            let entry = bucket[bi]
+            if entry[0] == name {
+                if entry[1] > best { best = entry[1] }
+            }
+            bi = bi + 1
+        }
+        if best >= 0 && best < len(env_fns) {
+            return env_fns[best]
+        }
+        return ""
+    }
+    // Fallback linear scan
     let mut i = len(env_fns) - 1
     while i >= 0 {
         if env_fns[i][0] == name { return env_fns[i] }
@@ -8807,6 +9131,7 @@ fn interpret(ast) {
     env_scopes = [0]
     env_cache_init()
     env_fns = []
+    fn_cache_init()
     return_flag = false
     return_val = val_void()
     break_flag = false
@@ -8826,7 +9151,8 @@ fn interpret(ast) {
     enum_data_store = []
     call_stack = []
     fn_attrs = []
-    memo_cache = []
+    fn_attr_flags = []
+    memo_cache_init()
 
     // ─── FIX-9-1: Top-level FnDecl pre-registration pass ───
     // Rust interpreter.rs:run() 와 동일 패턴. 본 실행 루프 전에 모든 FnDecl 을
@@ -8843,6 +9169,7 @@ fn interpret(ast) {
                 // FnDecl / AsyncFnDecl / PureFnDecl / ComptimeFnDecl 전부 포함
                 if _pk == "FnDecl" || _pk == "AsyncFnDecl" || _pk == "PureFnDecl" {
                     env_fns = env_fns.push([_pn.name, _pn.params, _pn.body])
+                    fn_cache_add(_pn.name, len(env_fns) - 1)
                     let _pfv = val_fn(_pn.name, _pn.params, _pn.body)
                     env_define(_pn.name, _pfv)
                     // @attrs 도 pre-reg 단계에서 등록 (@memo/@memoize/@cache)
