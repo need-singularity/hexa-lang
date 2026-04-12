@@ -63,6 +63,22 @@ fn make_optimizer_state_2d(shape_r, shape_c) {
     return OptState { m: m, v: v, t: 0 }
 }
 
+// ── B2 optimized: flat 1D tensors via BLAS builtin ────────────
+// make_optimizer_state_2d builds array-of-arrays with O(r*c)
+// interpreter dispatches. tensor_zeros is a single C calloc.
+struct OptStateFlat {
+    m: array,
+    v: array,
+    t: int,
+    n: int
+}
+
+fn make_optimizer_state_flat(total_elements) {
+    let m = tensor_zeros(total_elements)
+    let v = tensor_zeros(total_elements)
+    return OptStateFlat { m: m, v: v, t: 0, n: total_elements }
+}
+
 @pure fn pow_int(base, exp_n) {
     let mut r = 1.0
     let mut i = 0
@@ -71,6 +87,13 @@ fn make_optimizer_state_2d(shape_r, shape_c) {
         i = i + 1
     }
     return r
+}
+
+// ── B6 optimized: pow builtin replaces O(n) loop ─────────────
+// pow_int loops exp_n times (10000 iters at step 10000).
+// pow() is a single C-level call — constant time.
+@pure fn pow_fast(base, exp_n) {
+    return pow(base, exp_n * 1.0)
 }
 
 // ── AdamW update (@simd elementwise, @fuse clip+wd+step) ──────
@@ -101,6 +124,54 @@ fn make_optimizer_state_2d(shape_r, shape_c) {
             param[i][j] = param[i][j] - lr * update
             j = j + 1
         }
+        i = i + 1
+    }
+}
+
+// ── B1 optimized: flat tensor AdamW via BLAS builtins ─────────
+// adamw_update_2d does rows*cols interpreter dispatches in a
+// nested while-loop. This version operates on flat 1D tensors
+// using BLAS ops — each call is a single C-level bulk operation.
+//
+// BLAS ops used (each is one interpreter dispatch → C loop):
+//   mat_scale_inplace(a, s)  — a[i] *= s
+//   axpy(W, G, alpha)        — W[i] += alpha * G[i]
+//   hadamard(a, b)           — returns a[i]*b[i] (new tensor)
+//
+// param, grad, state.m, state.v must all be flat tensors of length n.
+@hot fn adamw_update_flat(param, grad, state: OptStateFlat, lr, wd, n) {
+    let b1 = 0.9
+    let b2 = 0.95
+    let eps = 0.00000001
+    let t = state.t + 1
+    state.t = t
+    let m = state.m
+    let v = state.v
+
+    // bias correction factors — pow_fast is O(1) via pow builtin
+    let bc1 = 1.0 - pow_fast(b1, t)
+    let bc2 = 1.0 - pow_fast(b2, t)
+
+    // ── momentum: m = b1*m + (1-b1)*grad ──────────────────────
+    mat_scale_inplace(m, b1)
+    axpy(m, grad, 1.0 - b1)
+
+    // ── velocity: v = b2*v + (1-b2)*grad^2 ────────────────────
+    mat_scale_inplace(v, b2)
+    let grad_sq = hadamard(grad, grad)
+    axpy(v, grad_sq, 1.0 - b2)
+
+    // ── bias-corrected update: param -= lr*(m_hat/(sqrt(v_hat)+eps) + wd*param)
+    // This part still needs element access for the sqrt+eps denominator,
+    // but we minimize dispatches by precomputing scalars outside the loop.
+    let lr_bc1 = lr / bc1
+    let inv_bc2 = 1.0 / bc2
+    let mut i = 0
+    while i < n {
+        let m_hat = m[i] / bc1
+        let v_hat = v[i] * inv_bc2
+        let update = m_hat / (sqrt(v_hat) + eps) + wd * param[i]
+        param[i] = param[i] - lr * update
         i = i + 1
     }
 }

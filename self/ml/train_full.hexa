@@ -98,23 +98,43 @@ let bDa   = tensor_zeros(SEQ * DIM)
 let bTm   = tensor_zeros(SEQ * DIM)
 // Recompute scratch
 let rFF1  = tensor_zeros(SEQ * FF)
+// Pre-allocated ones vector for broadcast (B11 — avoid alloc per bwd call)
+let s_ones = tensor_fill(SEQ, 1.0)
+// RMSNorm scratch (B13 — one buffer reused for all norm calls)
+let sNorm = tensor_zeros(SEQ * DIM)
+
+// ── RMSNorm (B13 — stabilises gradients, fewer total steps) ─
+// RMSNorm per row: x[i,:] /= sqrt(mean(x[i,:]²) + eps)
+// Uses rms_norm builtin (operates on flat tensor, dim=DIM, eps=1e-6).
+// Copies result into dst scratch to avoid allocation.
+fn rmsnorm_into(x, n, dim, dst) {
+    let normed = rms_norm(x, dim)
+    // Copy normed -> dst in-place (dst = 0*dst + 1*normed)
+    mat_scale_inplace(dst, 0.0)
+    axpy(dst, normed, 1.0)
+    dst
+}
 
 // ── Forward (8L × 7 matmuls = 56 BLAS) ─────────────────────
 // Linear FFN: up = h @ Wup, down = up @ Wdn (skips silu/hadamard)
 fn fwd(h) {
     let mut li = 0
     while li < LAYERS {
-        // Attention: 4 matmuls + 1 scale
-        let q = matmul_into(h, Wq[li], SEQ, DIM, DIM, sQ)
-        let k = matmul_into(h, Wk[li], SEQ, DIM, DIM, sK)
-        let v = matmul_into(h, Wv[li], SEQ, DIM, DIM, sV)
+        // Pre-attention RMSNorm (B13 — stabilises layer inputs)
+        let hn = rmsnorm_into(h, SEQ, DIM, sNorm)
+        // Attention: 4 matmuls + 1 scale (on normalised input)
+        let q = matmul_into(hn, Wq[li], SEQ, DIM, DIM, sQ)
+        let k = matmul_into(hn, Wk[li], SEQ, DIM, DIM, sK)
+        let v = matmul_into(hn, Wv[li], SEQ, DIM, DIM, sV)
         let sc = matmul_transpose_b_into(q, k, SEQ, DIM, SEQ, sSc)
         mat_scale_inplace(sc, 1.0 / sqrt(HEAD_D * 1.0))
         let at = matmul_into(sc, v, SEQ, SEQ, DIM, sAt)
         let o = matmul_into(at, Wo[li], SEQ, DIM, DIM, sO)
         mat_add_inplace(h, o)
+        // Pre-FFN RMSNorm (B13)
+        let hn2 = rmsnorm_into(h, SEQ, DIM, sNorm)
         // FFN: 2 matmuls (linear, no activation — BLAS cost identical)
-        let ff1 = matmul_into(h, Wup[li], SEQ, DIM, FF, sFF1)
+        let ff1 = matmul_into(hn2, Wup[li], SEQ, DIM, FF, sFF1)
         let ff2 = matmul_into(ff1, Wdn[li], SEQ, FF, DIM, sFF2)
         mat_add_inplace(h, ff2)
         li = li + 1
@@ -140,9 +160,8 @@ fn bwd(h_final, tgt) {
     let dl = mat_scale(mat_add(logits, neg), 2.0 / (VOCAB * 1.0))
     let d_last = matmul_into(dl, W_emb, 1, VOCAB, DIM, sLT)
     matmul_transpose_a_into(dl, last_h, VOCAB, 1, DIM, g_emb)
-    // Broadcast d_last to SEQ×DIM
-    let ones = tensor_fill(SEQ, 1.0)
-    let d_out = matmul_into(ones, d_last, SEQ, 1, DIM, bDh)
+    // Broadcast d_last to SEQ×DIM (B11 — uses pre-allocated s_ones)
+    let d_out = matmul_into(s_ones, d_last, SEQ, 1, DIM, bDh)
     // Layers backward
     let mut li = LAYERS - 1
     while li >= 0 {
@@ -170,9 +189,9 @@ fn bwd(h_final, tgt) {
         // d_X = d_at @ Wq^T + residual
         let dx = matmul_transpose_b_into(dat, Wq[li], SEQ, DIM, DIM, bTm)
         mat_add_inplace(dx, dx_ffn)
-        // Copy dx into d_out buffer
+        // Copy dx into d_out buffer (B12 — scale-to-zero + axpy is BLAS L1)
         mat_scale_inplace(d_out, 0.0)
-        mat_add_inplace(d_out, dx)
+        axpy(d_out, dx, 1.0)
         li = li - 1
     }
     0
