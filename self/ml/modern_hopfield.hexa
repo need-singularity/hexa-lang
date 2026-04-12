@@ -1,0 +1,585 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/modern_hopfield.hexa — Modern Hopfield Network (#296)
+//
+//  Ramsauer et al., 2021 — continuous associative memory with
+//  exponential storage capacity.
+//
+//  Classical Hopfield: binary states, linear capacity O(D)
+//  Modern Hopfield:    continuous states, exponential capacity O(e^D)
+//
+//  Energy:
+//      E(xi) = -lse(beta * X^T * xi) + 0.5 * ||xi||^2 + const
+//
+//  Update rule:
+//      xi_new = X * softmax(beta * X^T * xi)
+//
+//  Converges to the stored pattern nearest to query.
+//
+//  Connection to attention:
+//      Hopfield retrieval IS attention with Q=query, K=X, V=X
+//      output = V * softmax(beta * K^T * Q)
+//
+//  API:
+//    mh_init(D, n_patterns, beta, seed)           -> model
+//    mh_store(model, patterns)                     -> model
+//    mh_energy(model, query)                       -> float
+//    mh_retrieve(model, query)                     -> pattern
+//    mh_retrieve_iterative(model, query, steps)    -> pattern
+//    mh_attention(model, Q, K, V)                  -> output
+//    mh_train_step(model, queries, targets, lr)    -> model
+//
+//  AI-NATIVE attrs:
+//    @pure  (retrieve/energy)
+//    @hot   (training step)
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Math helpers ──────────────────────────────────────────────────
+
+fn mh_abs(x) { if x < 0.0 { return 0.0 - x } return x }
+
+fn mh_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn mh_sqrt_raw(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x
+    for _i in 0..20 { g = (g + x / g) / 2.0 }
+    return g
+}
+
+fn mh_log(x) {
+    if x <= 0.0 { return -30.0 }
+    let mut v = x
+    let mut count = 0
+    while v > 1.5 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.7 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    // Pade-like via repeated sqrt to bring v very close to 1
+    let mut half_count = 0
+    while v > 1.1 {
+        v = mh_sqrt_raw(v)
+        half_count = half_count + 1
+    }
+    while v < 0.9 {
+        v = mh_sqrt_raw(v)
+        half_count = half_count + 1
+    }
+    let d = v - 1.0
+    let mut ln_v = 0.0
+    let mut term = d
+    for k in 1..16 {
+        if k > 1 { term = 0.0 - term * d * to_float(k - 1) / to_float(k) }
+        ln_v = ln_v + term
+    }
+    // Each sqrt halves the log, so multiply back
+    let mut scale = 1
+    for _i in 0..half_count { scale = scale * 2 }
+    return to_float(count) + ln_v * to_float(scale)
+}
+
+fn mh_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..20 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+// ── Array helpers ─────────────────────────────────────────────────
+
+fn mh_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn mh_zeros_2d(rows, cols) {
+    let mut m = []
+    for _r in 0..rows {
+        let mut row = []
+        for _c in 0..cols { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+fn mh_lcg(state) {
+    return (state * 1103515245 + 12345) % 2147483648
+}
+
+fn mh_uniform(state) {
+    let s = mh_lcg(state)
+    return [to_float(s) / 2147483648.0, to_float(s)]
+}
+
+// ── Softmax ───────────────────────────────────────────────────────
+
+@pure
+fn mh_softmax(logits) {
+    let n = len(logits)
+    let mut mx = logits[0]
+    for i in 1..n {
+        if logits[i] > mx { mx = logits[i] }
+    }
+    let mut out = mh_zeros(n)
+    let mut sum = 0.0
+    for i in 0..n {
+        let e = mh_exp(logits[i] - mx)
+        out[i] = e
+        sum = sum + e
+    }
+    if sum <= 0.0 { sum = 1.0e-12 }
+    for i in 0..n { out[i] = out[i] / sum }
+    return out
+}
+
+// ── Log-sum-exp (numerically stable) ──────────────────────────────
+
+@pure
+fn mh_logsumexp(vals) {
+    let n = len(vals)
+    let mut mx = vals[0]
+    for i in 1..n {
+        if vals[i] > mx { mx = vals[i] }
+    }
+    let mut sum = 0.0
+    for i in 0..n {
+        sum = sum + mh_exp(vals[i] - mx)
+    }
+    return mx + mh_log(sum)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  mh_init — create Modern Hopfield model
+//
+//  D          : pattern dimension
+//  n_patterns : max number of stored patterns
+//  beta       : inverse temperature (sharpness)
+//  seed       : RNG seed
+//
+//  Returns model dict with empty pattern matrix X (n_patterns x D)
+//  and projection weights for attention mode.
+// ═══════════════════════════════════════════════════════════════════
+fn mh_init(D, n_patterns, beta, seed) {
+    let mut state = seed
+    if state <= 0 { state = 1 }
+
+    // Projection weights W_q, W_k, W_v  (D x D) for attention mode
+    let mut W_q = mh_zeros_2d(D, D)
+    let mut W_k = mh_zeros_2d(D, D)
+    let mut W_v = mh_zeros_2d(D, D)
+    let scale = 1.0 / mh_sqrt(to_float(D))
+    for i in 0..D {
+        for j in 0..D {
+            let u1 = mh_uniform(state)
+            state = int(u1[1])
+            if state <= 0 { state = 1 }
+            W_q[i][j] = (u1[0] - 0.5) * scale
+
+            let u2 = mh_uniform(state)
+            state = int(u2[1])
+            if state <= 0 { state = 1 }
+            W_k[i][j] = (u2[0] - 0.5) * scale
+
+            let u3 = mh_uniform(state)
+            state = int(u3[1])
+            if state <= 0 { state = 1 }
+            W_v[i][j] = (u3[0] - 0.5) * scale
+        }
+    }
+
+    return #{
+        "D": D,
+        "n_patterns": n_patterns,
+        "beta": beta,
+        "n_stored": 0,
+        "X": mh_zeros_2d(n_patterns, D),
+        "W_q": W_q,
+        "W_k": W_k,
+        "W_v": W_v
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  mh_store — store pattern matrix X into the model
+//
+//  patterns : list of pattern vectors, each of length D
+//  Returns updated model with patterns stored in X.
+// ═══════════════════════════════════════════════════════════════════
+fn mh_store(model, patterns) {
+    let D = model["D"]
+    let n = len(patterns)
+    let mut X = mh_zeros_2d(n, D)
+    for i in 0..n {
+        for j in 0..D {
+            X[i][j] = patterns[i][j]
+        }
+    }
+    return #{
+        "D": D,
+        "n_patterns": model["n_patterns"],
+        "beta": model["beta"],
+        "n_stored": n,
+        "X": X,
+        "W_q": model["W_q"],
+        "W_k": model["W_k"],
+        "W_v": model["W_v"]
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  mh_energy — compute Hopfield energy for a query state
+//
+//  E(xi) = -lse(beta * X^T * xi) + 0.5 * ||xi||^2
+//
+//  Lower energy = closer to a stored pattern.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn mh_energy(model, query) {
+    let D = model["D"]
+    let n = model["n_stored"]
+    let beta = model["beta"]
+    let X = model["X"]
+
+    if n == 0 { return 0.0 }
+
+    // Compute beta * X^T * xi  for each stored pattern
+    let mut scores = mh_zeros(n)
+    for i in 0..n {
+        let mut dot = 0.0
+        for j in 0..D {
+            dot = dot + X[i][j] * query[j]
+        }
+        scores[i] = beta * dot
+    }
+
+    // -lse(scores)
+    let lse = mh_logsumexp(scores)
+
+    // 0.5 * ||xi||^2
+    let mut norm_sq = 0.0
+    for j in 0..D {
+        norm_sq = norm_sq + query[j] * query[j]
+    }
+
+    return 0.0 - lse + 0.5 * norm_sq
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  mh_retrieve — single-step Modern Hopfield retrieval
+//
+//  xi_new = X^T * softmax(beta * X * xi)
+//         = sum_i  softmax(beta * <x_i, xi>)_i * x_i
+//
+//  Returns the retrieved (continuous) pattern.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn mh_retrieve(model, query) {
+    let D = model["D"]
+    let n = model["n_stored"]
+    let beta = model["beta"]
+    let X = model["X"]
+
+    if n == 0 { return mh_zeros(D) }
+
+    // scores = beta * X * xi
+    let mut scores = mh_zeros(n)
+    for i in 0..n {
+        let mut dot = 0.0
+        for j in 0..D {
+            dot = dot + X[i][j] * query[j]
+        }
+        scores[i] = beta * dot
+    }
+
+    // attention weights = softmax(scores)
+    let weights = mh_softmax(scores)
+
+    // output = X^T * weights  = sum_i w_i * x_i
+    let mut out = mh_zeros(D)
+    for i in 0..n {
+        for j in 0..D {
+            out[j] = out[j] + weights[i] * X[i][j]
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  mh_retrieve_iterative — multi-step retrieval (fixed-point iteration)
+//
+//  Repeatedly applies the update rule:
+//      xi <- X^T * softmax(beta * X * xi)
+//
+//  Converges to the nearest stored pattern (fixed point of energy).
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn mh_retrieve_iterative(model, query, steps) {
+    let D = model["D"]
+    let mut xi = mh_zeros(D)
+    for j in 0..D { xi[j] = query[j] }
+
+    for _step in 0..steps {
+        xi = mh_retrieve(model, xi)
+    }
+    return xi
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  mh_attention — Hopfield-based attention mechanism
+//
+//  Modern Hopfield retrieval IS attention:
+//      output = V * softmax(beta * K^T * Q)
+//
+//  Q : list of query vectors   [n_q x D]
+//  K : list of key vectors     [n_k x D]
+//  V : list of value vectors   [n_k x D_v]
+//
+//  Returns [n_q x D_v] output.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn mh_attention(model, Q, K, V) {
+    let beta = model["beta"]
+    let n_q = len(Q)
+    let n_k = len(K)
+    let D_q = len(Q[0])
+    let D_v = len(V[0])
+
+    let mut output = mh_zeros_2d(n_q, D_v)
+
+    for i in 0..n_q {
+        // scores = beta * K * q_i
+        let mut scores = mh_zeros(n_k)
+        for k in 0..n_k {
+            let mut dot = 0.0
+            for j in 0..D_q {
+                dot = dot + K[k][j] * Q[i][j]
+            }
+            scores[k] = beta * dot
+        }
+
+        // weights = softmax(scores)
+        let weights = mh_softmax(scores)
+
+        // output_i = V^T * weights = sum_k w_k * v_k
+        for k in 0..n_k {
+            for j in 0..D_v {
+                output[i][j] = output[i][j] + weights[k] * V[k][j]
+            }
+        }
+    }
+    return output
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  mh_train_step — train projection weights via gradient descent
+//
+//  Given queries and target patterns, minimise MSE between
+//  projected retrieval and targets.
+//
+//  Forward:
+//      q_proj = W_q * query
+//      k_proj = W_k * x_i  (for each stored pattern)
+//      v_proj = W_v * x_i
+//      scores = beta * K_proj * q_proj
+//      weights = softmax(scores)
+//      output = V_proj^T * weights
+//      loss = 0.5 * ||output - target||^2
+//
+//  Gradients (for one query):
+//      d_output = output - target                            [D]
+//
+//    For V weights:
+//      dL/dV_proj[k] = w_k * d_output
+//      dL/dW_v[d1][d2] += dL/dV_proj[k][d1] * X[k][d2]
+//
+//    For softmax -> scores:
+//      d_scores[k] = sum_j ( V_proj[k][j] * d_output[j] ) * w_k
+//                   - w_k * sum_m w_m * sum_j ( V_proj[m][j] * d_output[j] )
+//                 = w_k * ( v_k^T d_output  - sum_m w_m * v_m^T d_output )
+//
+//    For Q/K weights:
+//      d_scores[k] is scalar per key
+//      dL/dq_proj += beta * d_scores[k] * k_proj[k]
+//      dL/dk_proj[k] = beta * d_scores[k] * q_proj
+//      dL/dW_q += dL/dq_proj * query^T
+//      dL/dW_k += dL/dk_proj[k] * X[k]^T
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn mh_train_step(model, queries, targets, lr) {
+    let D = model["D"]
+    let n = model["n_stored"]
+    let beta = model["beta"]
+    let X = model["X"]
+    let W_q = model["W_q"]
+    let W_k = model["W_k"]
+    let W_v = model["W_v"]
+    let n_q = len(queries)
+
+    if n == 0 { return model }
+    if n_q == 0 { return model }
+
+    // Accumulate gradients
+    let mut gW_q = mh_zeros_2d(D, D)
+    let mut gW_k = mh_zeros_2d(D, D)
+    let mut gW_v = mh_zeros_2d(D, D)
+
+    // Pre-compute K_proj and V_proj for stored patterns (shared across queries)
+    let mut K_proj = mh_zeros_2d(n, D)
+    let mut V_proj = mh_zeros_2d(n, D)
+    for i in 0..n {
+        for d1 in 0..D {
+            let mut sk = 0.0
+            let mut sv = 0.0
+            for d2 in 0..D {
+                sk = sk + W_k[d1][d2] * X[i][d2]
+                sv = sv + W_v[d1][d2] * X[i][d2]
+            }
+            K_proj[i][d1] = sk
+            V_proj[i][d1] = sv
+        }
+    }
+
+    for qi in 0..n_q {
+        let query = queries[qi]
+        let target = targets[qi]
+
+        // q_proj = W_q * query
+        let mut q_proj = mh_zeros(D)
+        for d1 in 0..D {
+            let mut s = 0.0
+            for d2 in 0..D {
+                s = s + W_q[d1][d2] * query[d2]
+            }
+            q_proj[d1] = s
+        }
+
+        // scores = beta * K_proj * q_proj
+        let mut scores = mh_zeros(n)
+        for i in 0..n {
+            let mut dot = 0.0
+            for j in 0..D {
+                dot = dot + K_proj[i][j] * q_proj[j]
+            }
+            scores[i] = beta * dot
+        }
+
+        // weights = softmax(scores)
+        let weights = mh_softmax(scores)
+
+        // output = V_proj^T * weights
+        let mut output = mh_zeros(D)
+        for i in 0..n {
+            for j in 0..D {
+                output[j] = output[j] + weights[i] * V_proj[i][j]
+            }
+        }
+
+        // d_output = output - target
+        let mut d_output = mh_zeros(D)
+        for j in 0..D {
+            d_output[j] = output[j] - target[j]
+        }
+
+        // --- Gradient through V_proj ---
+        // dL/dW_v[d1][d2] += sum_k w_k * d_output[d1] * X[k][d2]
+        for k in 0..n {
+            for d1 in 0..D {
+                let g = weights[k] * d_output[d1]
+                for d2 in 0..D {
+                    gW_v[d1][d2] = gW_v[d1][d2] + g * X[k][d2]
+                }
+            }
+        }
+
+        // --- Gradient through softmax -> scores ---
+        // v_dot[k] = V_proj[k] . d_output
+        let mut v_dot = mh_zeros(n)
+        let mut weighted_v_dot = 0.0
+        for k in 0..n {
+            let mut s = 0.0
+            for j in 0..D {
+                s = s + V_proj[k][j] * d_output[j]
+            }
+            v_dot[k] = s
+            weighted_v_dot = weighted_v_dot + weights[k] * s
+        }
+
+        // d_scores[k] = w_k * (v_dot[k] - weighted_v_dot)
+        let mut d_scores = mh_zeros(n)
+        for k in 0..n {
+            d_scores[k] = weights[k] * (v_dot[k] - weighted_v_dot)
+        }
+
+        // --- Gradient through Q projection ---
+        // dL/dq_proj = beta * sum_k d_scores[k] * K_proj[k]
+        let mut dq_proj = mh_zeros(D)
+        for k in 0..n {
+            let bds = beta * d_scores[k]
+            for j in 0..D {
+                dq_proj[j] = dq_proj[j] + bds * K_proj[k][j]
+            }
+        }
+        // dL/dW_q[d1][d2] += dq_proj[d1] * query[d2]
+        for d1 in 0..D {
+            for d2 in 0..D {
+                gW_q[d1][d2] = gW_q[d1][d2] + dq_proj[d1] * query[d2]
+            }
+        }
+
+        // --- Gradient through K projection ---
+        // dL/dk_proj[k] = beta * d_scores[k] * q_proj
+        // dL/dW_k[d1][d2] += sum_k dk_proj[k][d1] * X[k][d2]
+        for k in 0..n {
+            let bds = beta * d_scores[k]
+            for d1 in 0..D {
+                let g = bds * q_proj[d1]
+                for d2 in 0..D {
+                    gW_k[d1][d2] = gW_k[d1][d2] + g * X[k][d2]
+                }
+            }
+        }
+    }
+
+    // Apply gradients with learning rate
+    let inv_nq = 1.0 / to_float(n_q)
+    let mut W_q_new = mh_zeros_2d(D, D)
+    let mut W_k_new = mh_zeros_2d(D, D)
+    let mut W_v_new = mh_zeros_2d(D, D)
+    for d1 in 0..D {
+        for d2 in 0..D {
+            W_q_new[d1][d2] = W_q[d1][d2] - lr * gW_q[d1][d2] * inv_nq
+            W_k_new[d1][d2] = W_k[d1][d2] - lr * gW_k[d1][d2] * inv_nq
+            W_v_new[d1][d2] = W_v[d1][d2] - lr * gW_v[d1][d2] * inv_nq
+        }
+    }
+
+    return #{
+        "D": D,
+        "n_patterns": model["n_patterns"],
+        "beta": beta,
+        "n_stored": n,
+        "X": X,
+        "W_q": W_q_new,
+        "W_k": W_k_new,
+        "W_v": W_v_new
+    }
+}

@@ -342,12 +342,339 @@ pub fn grpo_batch_loss(batch_new, batch_old, batch_ref, batch_rew, eps_clip, bet
     return total / to_float(n)
 }
 
+// ═══════════════════════════════════════════════════════════════════
+//  Neural-network policy layer
+//
+//  A simple MLP policy: x -> hidden (tanh) -> logits (D_out actions).
+//  Actions are sampled via softmax + Gumbel-argmax.
+//  This wraps the core GRPO math above into a trainable model.
+//
+//  API:
+//    grpo_init(D_in, D_hidden, D_out, group_size, seed) -> model
+//    grpo_policy_logits(model, x)                       -> [float]
+//    grpo_softmax(logits)                               -> [float]
+//    grpo_sample(model, x, seed)                        -> int
+//    grpo_sample_group(model, x, G, seed)               -> [int]
+//    grpo_group_advantage(rewards)                      -> [float]
+//    grpo_kl_penalty(model, ref_model, x, action)       -> float
+//    grpo_loss(model, ref_model, x, actions, rewards, beta) -> float
+//    grpo_train_step(model, ref_model, X, reward_fn, lr, beta) -> model
+// ═══════════════════════════════════════════════════════════════════
+
+fn grpo_zeros_f(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn grpo_zeros_2d(rows, cols) {
+    let mut m = []
+    for _r in 0..rows {
+        let mut row = []
+        for _c in 0..cols { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+fn grpo_lcg(state) {
+    return (state * 1103515245 + 12345) % 2147483648
+}
+
+fn grpo_uniform(state) {
+    let s = grpo_lcg(state)
+    return [to_float(s) / 2147483648.0, to_float(s)]
+}
+
+fn grpo_tanh(x) {
+    let e_pos = grpo_exp(x)
+    let e_neg = grpo_exp(0.0 - x)
+    return (e_pos - e_neg) / (e_pos + e_neg)
+}
+
+// ── init: MLP policy with group_size metadata ────────────────────
+fn grpo_init(D_in, D_hidden, D_out, group_size, seed) {
+    let mut state = seed
+    if state <= 0 { state = 1 }
+    let mut W_h = grpo_zeros_2d(D_hidden, D_in)
+    for i in 0..D_hidden {
+        for j in 0..D_in {
+            let u = grpo_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W_h[i][j] = u[0] - 0.5
+        }
+    }
+    let b_h = grpo_zeros_f(D_hidden)
+    let mut W_o = grpo_zeros_2d(D_out, D_hidden)
+    for k in 0..D_out {
+        for j in 0..D_hidden {
+            let u = grpo_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W_o[k][j] = u[0] - 0.5
+        }
+    }
+    let b_o = grpo_zeros_f(D_out)
+    return #{
+        "D_in": D_in,
+        "D_hidden": D_hidden,
+        "D_out": D_out,
+        "group_size": group_size,
+        "W_h": W_h,
+        "b_h": b_h,
+        "W_o": W_o,
+        "b_o": b_o
+    }
+}
+
+// ── forward: x -> hidden (tanh) -> logits ────────────────────────
+@pure
+fn grpo_policy_logits(model, x) {
+    let W_h = model["W_h"]
+    let b_h = model["b_h"]
+    let W_o = model["W_o"]
+    let b_o = model["b_o"]
+    let D_hidden = model["D_hidden"]
+    let D_in = model["D_in"]
+    let D_out = model["D_out"]
+    let mut hidden = grpo_zeros_f(D_hidden)
+    for i in 0..D_hidden {
+        let mut s = b_h[i]
+        for j in 0..D_in { s = s + W_h[i][j] * x[j] }
+        hidden[i] = grpo_tanh(s)
+    }
+    let mut logits = grpo_zeros_f(D_out)
+    for k in 0..D_out {
+        let mut s = b_o[k]
+        for j in 0..D_hidden { s = s + W_o[k][j] * hidden[j] }
+        logits[k] = s
+    }
+    return logits
+}
+
+// ── softmax over logits ──────────────────────────────────────────
+@pure
+fn grpo_softmax(logits) {
+    let n = len(logits)
+    let mut mx = logits[0]
+    for k in 1..n { if logits[k] > mx { mx = logits[k] } }
+    let mut out = grpo_zeros_f(n)
+    let mut sum = 0.0
+    for k in 0..n {
+        let e = grpo_exp(logits[k] - mx)
+        out[k] = e
+        sum = sum + e
+    }
+    if sum <= 0.0 { sum = 1.0e-12 }
+    for k in 0..n { out[k] = out[k] / sum }
+    return out
+}
+
+// ── sample one action from policy (Gumbel-argmax) ───────────────
+fn grpo_sample(model, x, seed) {
+    let logits = grpo_policy_logits(model, x)
+    let D_out = model["D_out"]
+    let mut state = seed
+    if state <= 0 { state = 1 }
+    let mut best_k = 0
+    let mut best_val = -1.0e30
+    for k in 0..D_out {
+        let u = grpo_uniform(state)
+        state = int(u[1])
+        if state <= 0 { state = 1 }
+        let mut uv = u[0]
+        if uv < 1.0e-10 { uv = 1.0e-10 }
+        if uv > 0.9999999 { uv = 0.9999999 }
+        let gumbel = 0.0 - grpo_log(0.0 - grpo_log(uv))
+        let score = logits[k] + gumbel
+        if score > best_val {
+            best_val = score
+            best_k = k
+        }
+    }
+    return best_k
+}
+
+// ── sample a group of G actions ─────────────────────────────────
+fn grpo_sample_group(model, x, G, seed) {
+    let mut actions = []
+    let mut state = seed
+    if state <= 0 { state = 1 }
+    for _g in 0..G {
+        let a = grpo_sample(model, x, state)
+        actions = actions + [a]
+        state = grpo_lcg(state)
+        if state <= 0 { state = 1 }
+    }
+    return actions
+}
+
+// ── group-relative advantage (wrapper) ──────────────────────────
+@pure
+fn grpo_group_advantage(rewards) {
+    return grpo_advantages(rewards)
+}
+
+// ── KL penalty between model and ref_model for (x, action) ─────
+@pure
+fn grpo_kl_penalty(model, ref_model, x, action) {
+    let logits = grpo_policy_logits(model, x)
+    let probs = grpo_softmax(logits)
+    let ref_logits = grpo_policy_logits(ref_model, x)
+    let ref_probs = grpo_softmax(ref_logits)
+    let mut p = probs[action]
+    if p < 1.0e-12 { p = 1.0e-12 }
+    let mut p_ref = ref_probs[action]
+    if p_ref < 1.0e-12 { p_ref = 1.0e-12 }
+    let log_p = grpo_log(p)
+    let log_ref = grpo_log(p_ref)
+    return grpo_kl_k3(log_p, log_ref)
+}
+
+// ── GRPO loss for a group of actions given one prompt x ─────────
+@pure
+fn grpo_loss(model, ref_model, x, actions, rewards, beta) {
+    let G = len(actions)
+    if G == 0 { return 0.0 }
+    let advs = grpo_group_advantage(rewards)
+    let logits = grpo_policy_logits(model, x)
+    let probs = grpo_softmax(logits)
+    let ref_logits = grpo_policy_logits(ref_model, x)
+    let ref_probs = grpo_softmax(ref_logits)
+    let mut pg_sum = 0.0
+    let mut kl_sum = 0.0
+    for i in 0..G {
+        let a = actions[i]
+        let mut p = probs[a]
+        if p < 1.0e-12 { p = 1.0e-12 }
+        let mut p_ref = ref_probs[a]
+        if p_ref < 1.0e-12 { p_ref = 1.0e-12 }
+        let log_p = grpo_log(p)
+        let log_ref = grpo_log(p_ref)
+        pg_sum = pg_sum + advs[i] * log_p
+        kl_sum = kl_sum + grpo_kl_k3(log_p, log_ref)
+    }
+    return (0.0 - pg_sum / to_float(G)) + beta * (kl_sum / to_float(G))
+}
+
+// ── train step: analytical gradient descent on policy weights ───
+@hot
+fn grpo_train_step(model, ref_model, X, reward_fn, lr, beta) {
+    let N = len(X)
+    if N == 0 { return model }
+    let D_in = model["D_in"]
+    let D_hidden = model["D_hidden"]
+    let D_out = model["D_out"]
+    let G = model["group_size"]
+    let W_h = model["W_h"]
+    let b_h = model["b_h"]
+    let W_o = model["W_o"]
+    let b_o = model["b_o"]
+    let mut gW_h = grpo_zeros_2d(D_hidden, D_in)
+    let mut gb_h = grpo_zeros_f(D_hidden)
+    let mut gW_o = grpo_zeros_2d(D_out, D_hidden)
+    let mut gb_o = grpo_zeros_f(D_out)
+    let mut seed = 12345
+    for n in 0..N {
+        let x = X[n]
+        let actions = grpo_sample_group(model, x, G, seed)
+        seed = grpo_lcg(seed)
+        if seed <= 0 { seed = 1 }
+        let mut rewards = []
+        for gi in 0..G {
+            let r = reward_fn(x, actions[gi])
+            rewards = rewards + [r]
+        }
+        let advs = grpo_group_advantage(rewards)
+        let mut hidden = grpo_zeros_f(D_hidden)
+        for i in 0..D_hidden {
+            let mut s = b_h[i]
+            for j in 0..D_in { s = s + W_h[i][j] * x[j] }
+            hidden[i] = grpo_tanh(s)
+        }
+        let mut logits = grpo_zeros_f(D_out)
+        for k in 0..D_out {
+            let mut s = b_o[k]
+            for j in 0..D_hidden { s = s + W_o[k][j] * hidden[j] }
+            logits[k] = s
+        }
+        let probs = grpo_softmax(logits)
+        let ref_logits = grpo_policy_logits(ref_model, x)
+        let ref_probs = grpo_softmax(ref_logits)
+        let mut d_logits = grpo_zeros_f(D_out)
+        for gi in 0..G {
+            let a = actions[gi]
+            let mut pa = probs[a]
+            if pa < 1.0e-12 { pa = 1.0e-12 }
+            let mut pa_ref = ref_probs[a]
+            if pa_ref < 1.0e-12 { pa_ref = 1.0e-12 }
+            let r_ref = pa_ref / pa
+            for k in 0..D_out {
+                let mut ind = 0.0
+                if k == a { ind = 1.0 }
+                let pg_grad = (0.0 - advs[gi]) * (ind - probs[k]) / to_float(G)
+                let kl_grad = beta * (1.0 - r_ref) * (ind - probs[k]) / to_float(G)
+                d_logits[k] = d_logits[k] + pg_grad + kl_grad
+            }
+        }
+        for k in 0..D_out {
+            gb_o[k] = gb_o[k] + d_logits[k]
+            for j in 0..D_hidden {
+                gW_o[k][j] = gW_o[k][j] + d_logits[k] * hidden[j]
+            }
+        }
+        let mut d_hidden = grpo_zeros_f(D_hidden)
+        for j in 0..D_hidden {
+            let mut s = 0.0
+            for k in 0..D_out { s = s + d_logits[k] * W_o[k][j] }
+            d_hidden[j] = s
+        }
+        let mut delta_h = grpo_zeros_f(D_hidden)
+        for j in 0..D_hidden {
+            delta_h[j] = d_hidden[j] * (1.0 - hidden[j] * hidden[j])
+        }
+        for j in 0..D_hidden {
+            gb_h[j] = gb_h[j] + delta_h[j]
+            for i in 0..D_in {
+                gW_h[j][i] = gW_h[j][i] + delta_h[j] * x[i]
+            }
+        }
+    }
+    let inv_n = 1.0 / to_float(N)
+    let mut W_h_new = grpo_zeros_2d(D_hidden, D_in)
+    let mut b_h_new = grpo_zeros_f(D_hidden)
+    for j in 0..D_hidden {
+        b_h_new[j] = b_h[j] - lr * gb_h[j] * inv_n
+        for i in 0..D_in {
+            W_h_new[j][i] = W_h[j][i] - lr * gW_h[j][i] * inv_n
+        }
+    }
+    let mut W_o_new = grpo_zeros_2d(D_out, D_hidden)
+    let mut b_o_new = grpo_zeros_f(D_out)
+    for k in 0..D_out {
+        b_o_new[k] = b_o[k] - lr * gb_o[k] * inv_n
+        for j in 0..D_hidden {
+            W_o_new[k][j] = W_o[k][j] - lr * gW_o[k][j] * inv_n
+        }
+    }
+    return #{
+        "D_in": D_in,
+        "D_hidden": D_hidden,
+        "D_out": D_out,
+        "group_size": G,
+        "W_h": W_h_new,
+        "b_h": b_h_new,
+        "W_o": W_o_new,
+        "b_o": b_o_new
+    }
+}
+
 // ── quick self-smoke (non-destructive) ──────────────────────────
 pub fn grpo_self_check() {
     let rewards = [1.0, 0.0, 0.5, 0.75]
     let advs = grpo_advantages(rewards)
     let mu = grpo_mean(advs)
-    // Normalized advantages must have ~zero mean
     if grpo_abs(mu) > 1.0e-3 { return 0 }
     return 1
 }

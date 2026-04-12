@@ -1,0 +1,686 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/test_time_compute.hexa — Test-Time Compute (#291)
+//
+//  Test-Time Compute scaling — at inference, use more compute
+//  (beam search, multiple samples + verify, best-of-N) to improve
+//  output quality. Key insight: scaling inference compute can
+//  substitute for model size.
+//
+//  Architecture:
+//    base model:     x -> h -> logits   (D_in -> D_hidden -> D_out)
+//    verifier model: (x, candidate) -> score  (D_in + D_out -> D_hidden -> 1)
+//
+//  API:
+//    ttc_init(D_in, D_hidden, D_out, seed)         -> model
+//    ttc_forward(model, x)                          -> logits
+//    ttc_score(model, x, candidate)                 -> float
+//    ttc_best_of_n(model, x, n, seed)               -> best candidate
+//    ttc_beam_search(model, x, beam_width, depth)   -> best sequence
+//    ttc_adaptive_budget(model, x, max_n)            -> result
+//    ttc_train_step(model, X, Y, lr)                -> model
+//
+//  AI-NATIVE attrs:
+//    @pure  (forward / score)
+//    @hot   (train step)
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Math helpers ──────────────────────────────────────────────────
+
+fn ttc_abs(v) { if v < 0.0 { return 0.0 - v } return v }
+
+fn ttc_exp(v) {
+    let mut x = v
+    if x > 20.0 { x = 20.0 }
+    if x < -20.0 { x = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * x / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn ttc_log(v) {
+    if v <= 0.0 { return -30.0 }
+    let mut x = v
+    let mut count = 0
+    while x > 2.0 {
+        x = x / 2.718281828
+        count = count + 1
+    }
+    while x < 0.5 {
+        x = x * 2.718281828
+        count = count - 1
+    }
+    let d = x - 1.0
+    let ln_x = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_x
+}
+
+fn ttc_tanh(v) {
+    let ep = ttc_exp(v)
+    let en = ttc_exp(0.0 - v)
+    return (ep - en) / (ep + en)
+}
+
+fn ttc_sigmoid(v) {
+    return 1.0 / (1.0 + ttc_exp(0.0 - v))
+}
+
+fn ttc_sqrt(v) {
+    if v <= 0.0 { return 0.0 }
+    let mut x = v
+    for _i in 0..20 {
+        x = (x + v / x) / 2.0
+    }
+    return x
+}
+
+// ── Array helpers ─────────────────────────────────────────────────
+
+fn ttc_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn ttc_zeros_2d(rows, cols) {
+    let mut m = []
+    for _r in 0..rows {
+        let mut row = []
+        for _c in 0..cols { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+// ── RNG (LCG) ─────────────────────────────────────────────────────
+
+fn ttc_lcg(state) {
+    return (state * 1103515245 + 12345) % 2147483648
+}
+
+fn ttc_uniform(state) {
+    let s = ttc_lcg(state)
+    return [to_float(s) / 2147483648.0, to_float(s)]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  ttc_init — create model with base network + verifier
+//
+//    base:      W_h (D_hidden x D_in), b_h, W_o (D_out x D_hidden), b_o
+//    verifier:  W_v (D_hidden x (D_in + D_out)), b_v, w_vs (D_hidden), b_vs
+// ═══════════════════════════════════════════════════════════════════
+fn ttc_init(D_in, D_hidden, D_out, seed) {
+    let mut state = seed
+    if state <= 0 { state = 1 }
+
+    // Base hidden layer: D_hidden x D_in
+    let mut W_h = ttc_zeros_2d(D_hidden, D_in)
+    for i in 0..D_hidden {
+        for j in 0..D_in {
+            let u = ttc_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W_h[i][j] = (u[0] - 0.5) * 0.5
+        }
+    }
+    let b_h = ttc_zeros(D_hidden)
+
+    // Base output layer: D_out x D_hidden
+    let mut W_o = ttc_zeros_2d(D_out, D_hidden)
+    for i in 0..D_out {
+        for j in 0..D_hidden {
+            let u = ttc_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W_o[i][j] = (u[0] - 0.5) * 0.5
+        }
+    }
+    let b_o = ttc_zeros(D_out)
+
+    // Verifier hidden: D_hidden x (D_in + D_out)
+    let V_in = D_in + D_out
+    let mut W_v = ttc_zeros_2d(D_hidden, V_in)
+    for i in 0..D_hidden {
+        for j in 0..V_in {
+            let u = ttc_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W_v[i][j] = (u[0] - 0.5) * 0.5
+        }
+    }
+    let b_v = ttc_zeros(D_hidden)
+
+    // Verifier output: scalar from D_hidden
+    let mut w_vs = ttc_zeros(D_hidden)
+    for j in 0..D_hidden {
+        let u = ttc_uniform(state)
+        state = int(u[1])
+        if state <= 0 { state = 1 }
+        w_vs[j] = (u[0] - 0.5) * 0.5
+    }
+
+    return #{
+        "D_in": D_in,
+        "D_hidden": D_hidden,
+        "D_out": D_out,
+        "W_h": W_h,
+        "b_h": b_h,
+        "W_o": W_o,
+        "b_o": b_o,
+        "W_v": W_v,
+        "b_v": b_v,
+        "w_vs": w_vs,
+        "b_vs": 0.0
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  ttc_forward — single forward pass through base model
+//    h = tanh(W_h * x + b_h)
+//    logits = W_o * h + b_o
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ttc_forward(model, x) {
+    let W_h = model["W_h"]
+    let b_h = model["b_h"]
+    let W_o = model["W_o"]
+    let b_o = model["b_o"]
+    let D_hidden = model["D_hidden"]
+    let D_in = model["D_in"]
+    let D_out = model["D_out"]
+
+    // Hidden layer
+    let mut h = ttc_zeros(D_hidden)
+    for i in 0..D_hidden {
+        let mut s = b_h[i]
+        for j in 0..D_in { s = s + W_h[i][j] * x[j] }
+        h[i] = ttc_tanh(s)
+    }
+
+    // Output logits
+    let mut logits = ttc_zeros(D_out)
+    for i in 0..D_out {
+        let mut s = b_o[i]
+        for j in 0..D_hidden { s = s + W_o[i][j] * h[j] }
+        logits[i] = s
+    }
+    return logits
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  ttc_softmax — softmax over logits vector
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ttc_softmax(logits) {
+    let K = len(logits)
+    let mut mx = logits[0]
+    for k in 1..K { if logits[k] > mx { mx = logits[k] } }
+    let mut out = ttc_zeros(K)
+    let mut sum = 0.0
+    for k in 0..K {
+        let e = ttc_exp(logits[k] - mx)
+        out[k] = e
+        sum = sum + e
+    }
+    if sum <= 0.0 { sum = 1.0e-12 }
+    for k in 0..K { out[k] = out[k] / sum }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  ttc_argmax — index of maximum element
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ttc_argmax(v) {
+    let n = len(v)
+    let mut best = v[0]
+    let mut idx = 0
+    for i in 1..n {
+        if v[i] > best {
+            best = v[i]
+            idx = i
+        }
+    }
+    return idx
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  ttc_score — verifier scores how good a candidate is for input x
+//    concat = [x ; candidate]
+//    h_v = tanh(W_v * concat + b_v)
+//    score = sigmoid(w_vs . h_v + b_vs)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ttc_score(model, x, candidate) {
+    let W_v = model["W_v"]
+    let b_v = model["b_v"]
+    let w_vs = model["w_vs"]
+    let b_vs = model["b_vs"]
+    let D_hidden = model["D_hidden"]
+    let D_in = model["D_in"]
+    let D_out = model["D_out"]
+
+    // Concat input and candidate
+    let mut concat = []
+    for i in 0..D_in { concat = concat + [x[i]] }
+    for i in 0..D_out { concat = concat + [candidate[i]] }
+    let V_in = D_in + D_out
+
+    // Verifier hidden
+    let mut h_v = ttc_zeros(D_hidden)
+    for i in 0..D_hidden {
+        let mut s = b_v[i]
+        for j in 0..V_in { s = s + W_v[i][j] * concat[j] }
+        h_v[i] = ttc_tanh(s)
+    }
+
+    // Scalar score
+    let mut s = b_vs
+    for j in 0..D_hidden { s = s + w_vs[j] * h_v[j] }
+    return ttc_sigmoid(s)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  ttc_sample — sample a candidate from logits with temperature noise
+//    Add Gumbel-like noise scaled by seed-derived randomness
+// ═══════════════════════════════════════════════════════════════════
+fn ttc_sample(model, x, seed) {
+    let logits = ttc_forward(model, x)
+    let D_out = len(logits)
+    let mut state = seed
+    if state <= 0 { state = 1 }
+
+    // Add noise to logits for diversity
+    let mut noisy = ttc_zeros(D_out)
+    for i in 0..D_out {
+        let u = ttc_uniform(state)
+        state = int(u[1])
+        if state <= 0 { state = 1 }
+        // Gumbel-like noise: -log(-log(u))
+        let mut uv = u[0]
+        if uv < 1.0e-6 { uv = 1.0e-6 }
+        if uv > 0.999999 { uv = 0.999999 }
+        let noise = 0.0 - ttc_log(0.0 - ttc_log(uv))
+        noisy[i] = logits[i] + noise * 0.3
+    }
+
+    // Convert to probabilities via softmax
+    let probs = ttc_softmax(noisy)
+    return probs
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  ttc_best_of_n — generate N candidates, score each, return best
+//    Core TTC strategy: sample N times, use verifier to pick best
+// ═══════════════════════════════════════════════════════════════════
+fn ttc_best_of_n(model, x, n, seed) {
+    let mut best_score = -1.0
+    let mut best_candidate = []
+    let mut state = seed
+    if state <= 0 { state = 1 }
+
+    for i in 0..n {
+        state = ttc_lcg(state)
+        if state <= 0 { state = 1 }
+        let candidate = ttc_sample(model, x, state)
+        let sc = ttc_score(model, x, candidate)
+        if sc > best_score {
+            best_score = sc
+            best_candidate = candidate
+        }
+    }
+
+    return #{"candidate": best_candidate, "score": best_score, "n_sampled": n}
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  ttc_beam_search — maintain top-K partial sequences, expand each
+//    At each depth step, expand each beam candidate, keep top beam_width
+//
+//    Beam: each entry is #{"seq": [logit vectors], "score": float}
+//    At each step: forward pass -> score -> prune to beam_width
+// ═══════════════════════════════════════════════════════════════════
+fn ttc_beam_search(model, x, beam_width, depth) {
+    let D_out = model["D_out"]
+
+    // Initialize beams with single forward pass
+    let init_logits = ttc_forward(model, x)
+    let init_probs = ttc_softmax(init_logits)
+    let init_score = ttc_score(model, x, init_probs)
+
+    let mut beams = [#{"seq": [init_probs], "score": init_score}]
+
+    for _step in 0..depth {
+        let mut candidates = []
+
+        for b in 0..len(beams) {
+            let beam = beams[b]
+            let last_probs = beam["seq"][len(beam["seq"]) - 1]
+
+            // Generate variations by perturbing last output
+            for k in 0..beam_width {
+                let mut new_input = ttc_zeros(len(x))
+                for j in 0..len(x) {
+                    // Blend original input with feedback from last output
+                    let feedback = 0.0
+                    if j < D_out { feedback = last_probs[j] * 0.1 }
+                    new_input[j] = x[j] + feedback * to_float(k + 1) / to_float(beam_width)
+                }
+
+                let new_logits = ttc_forward(model, new_input)
+                let new_probs = ttc_softmax(new_logits)
+                let sc = ttc_score(model, x, new_probs)
+
+                // Accumulate score (log-space sum)
+                let total_score = beam["score"] + sc
+
+                let mut new_seq = []
+                for s in 0..len(beam["seq"]) { new_seq = new_seq + [beam["seq"][s]] }
+                new_seq = new_seq + [new_probs]
+
+                candidates = candidates + [#{"seq": new_seq, "score": total_score}]
+            }
+        }
+
+        // Keep top beam_width candidates by score (selection sort)
+        let nc = len(candidates)
+        for i in 0..nc {
+            let mut best_idx = i
+            for j in (i + 1)..nc {
+                if candidates[j]["score"] > candidates[best_idx]["score"] {
+                    best_idx = j
+                }
+            }
+            if best_idx != i {
+                let tmp = candidates[i]
+                candidates[i] = candidates[best_idx]
+                candidates[best_idx] = tmp
+            }
+        }
+
+        let mut new_beams = []
+        let keep = if nc < beam_width { nc } else { beam_width }
+        for i in 0..keep {
+            new_beams = new_beams + [candidates[i]]
+        }
+        beams = new_beams
+    }
+
+    // Return best beam
+    let best = beams[0]
+    let final_seq = best["seq"]
+    let final_candidate = final_seq[len(final_seq) - 1]
+    return #{
+        "candidate": final_candidate,
+        "score": best["score"],
+        "depth": depth,
+        "beam_width": beam_width
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  ttc_entropy — compute entropy of probability distribution
+//    H(p) = -sum(p_i * log(p_i))
+//    Higher entropy = more uncertain = harder problem
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ttc_entropy(probs) {
+    let n = len(probs)
+    let mut h = 0.0
+    for i in 0..n {
+        let mut p = probs[i]
+        if p < 1.0e-12 { p = 1.0e-12 }
+        h = h - p * ttc_log(p)
+    }
+    return h
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  ttc_adaptive_budget — auto-scale N by difficulty
+//    1. Forward pass to get logits
+//    2. Compute entropy as difficulty proxy
+//    3. Scale N proportionally: higher entropy -> more samples
+//    4. Run best-of-N with allocated budget
+// ═══════════════════════════════════════════════════════════════════
+fn ttc_adaptive_budget(model, x, max_n) {
+    let logits = ttc_forward(model, x)
+    let probs = ttc_softmax(logits)
+    let D_out = model["D_out"]
+
+    // Entropy as difficulty measure
+    let h = ttc_entropy(probs)
+    // Max possible entropy = log(D_out)
+    let max_h = ttc_log(to_float(D_out))
+    let mut difficulty = 0.0
+    if max_h > 0.0 { difficulty = h / max_h }
+    if difficulty > 1.0 { difficulty = 1.0 }
+    if difficulty < 0.0 { difficulty = 0.0 }
+
+    // Allocate budget: min 1, scale up to max_n by difficulty
+    let mut budget = int(to_float(max_n) * difficulty)
+    if budget < 1 { budget = 1 }
+    if budget > max_n { budget = max_n }
+
+    // Run best-of-N with allocated budget
+    let result = ttc_best_of_n(model, x, budget, 42)
+
+    return #{
+        "candidate": result["candidate"],
+        "score": result["score"],
+        "entropy": h,
+        "difficulty": difficulty,
+        "budget_used": budget,
+        "max_budget": max_n
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  ttc_train_step — train base model + verifier jointly
+//
+//    Base model: cross-entropy loss on (forward(x), y)
+//    Verifier:   binary loss — correct candidate scores high,
+//                perturbed candidate scores low
+//
+//    Gradients:
+//      Base output: ∂CE/∂logits = softmax(logits) - onehot(y)
+//      Base hidden: backprop through tanh
+//      Verifier:    ∂BCE/∂score for (x, correct) vs (x, perturbed)
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn ttc_train_step(model, X, Y, lr) {
+    let N = len(X)
+    let D_in = model["D_in"]
+    let D_hidden = model["D_hidden"]
+    let D_out = model["D_out"]
+    let W_h = model["W_h"]
+    let b_h = model["b_h"]
+    let W_o = model["W_o"]
+    let b_o = model["b_o"]
+    let W_v = model["W_v"]
+    let b_v = model["b_v"]
+    let w_vs = model["w_vs"]
+    let b_vs = model["b_vs"]
+
+    // Gradient accumulators — base
+    let mut gW_h = ttc_zeros_2d(D_hidden, D_in)
+    let mut gb_h = ttc_zeros(D_hidden)
+    let mut gW_o = ttc_zeros_2d(D_out, D_hidden)
+    let mut gb_o = ttc_zeros(D_out)
+
+    // Gradient accumulators — verifier
+    let V_in = D_in + D_out
+    let mut gW_v = ttc_zeros_2d(D_hidden, V_in)
+    let mut gb_v = ttc_zeros(D_hidden)
+    let mut gw_vs = ttc_zeros(D_hidden)
+    let mut gb_vs = 0.0
+
+    for i in 0..N {
+        let x = X[i]
+        let y = Y[i]
+
+        // ── Forward pass (base) ────────────────────────────────
+        let mut h = ttc_zeros(D_hidden)
+        for hi in 0..D_hidden {
+            let mut s = b_h[hi]
+            for j in 0..D_in { s = s + W_h[hi][j] * x[j] }
+            h[hi] = ttc_tanh(s)
+        }
+        let mut logits = ttc_zeros(D_out)
+        for oi in 0..D_out {
+            let mut s = b_o[oi]
+            for j in 0..D_hidden { s = s + W_o[oi][j] * h[j] }
+            logits[oi] = s
+        }
+        let p = ttc_softmax(logits)
+
+        // ── Base gradient: CE loss ─────────────────────────────
+        let mut u = ttc_zeros(D_out)
+        for k in 0..D_out {
+            u[k] = p[k]
+            if k == y { u[k] = u[k] - 1.0 }
+        }
+
+        // grad W_o, b_o
+        for oi in 0..D_out {
+            gb_o[oi] = gb_o[oi] + u[oi]
+            for j in 0..D_hidden { gW_o[oi][j] = gW_o[oi][j] + u[oi] * h[j] }
+        }
+
+        // grad hidden from base output
+        let mut grad_h = ttc_zeros(D_hidden)
+        for j in 0..D_hidden {
+            let mut s = 0.0
+            for oi in 0..D_out { s = s + u[oi] * W_o[oi][j] }
+            grad_h[j] = s
+        }
+
+        // backprop through tanh
+        let mut delta_h = ttc_zeros(D_hidden)
+        for j in 0..D_hidden {
+            delta_h[j] = grad_h[j] * (1.0 - h[j] * h[j])
+        }
+        for j in 0..D_hidden {
+            gb_h[j] = gb_h[j] + delta_h[j]
+            for ii in 0..D_in { gW_h[j][ii] = gW_h[j][ii] + delta_h[j] * x[ii] }
+        }
+
+        // ── Verifier gradient ──────────────────────────────────
+        // Correct candidate = onehot(y)
+        let mut correct_cand = ttc_zeros(D_out)
+        if y < D_out { correct_cand[y] = 1.0 }
+
+        // Perturbed candidate = uniform noise
+        let mut wrong_cand = ttc_zeros(D_out)
+        for k in 0..D_out { wrong_cand[k] = 1.0 / to_float(D_out) }
+
+        // Verifier forward on correct: should output 1
+        let mut concat_c = []
+        for j in 0..D_in { concat_c = concat_c + [x[j]] }
+        for j in 0..D_out { concat_c = concat_c + [correct_cand[j]] }
+
+        let mut hv_c = ttc_zeros(D_hidden)
+        for vi in 0..D_hidden {
+            let mut s = b_v[vi]
+            for j in 0..V_in { s = s + W_v[vi][j] * concat_c[j] }
+            hv_c[vi] = ttc_tanh(s)
+        }
+        let mut sv_c = b_vs
+        for j in 0..D_hidden { sv_c = sv_c + w_vs[j] * hv_c[j] }
+        let score_c = ttc_sigmoid(sv_c)
+
+        // grad for correct: want score -> 1, so u = score - 1
+        let u_c = score_c - 1.0
+        gb_vs = gb_vs + u_c
+        for j in 0..D_hidden { gw_vs[j] = gw_vs[j] + u_c * hv_c[j] }
+        let mut delta_hv_c = ttc_zeros(D_hidden)
+        for j in 0..D_hidden {
+            delta_hv_c[j] = u_c * w_vs[j] * (1.0 - hv_c[j] * hv_c[j])
+        }
+        for j in 0..D_hidden {
+            gb_v[j] = gb_v[j] + delta_hv_c[j]
+            for jj in 0..V_in { gW_v[j][jj] = gW_v[j][jj] + delta_hv_c[j] * concat_c[jj] }
+        }
+
+        // Verifier forward on wrong: should output 0
+        let mut concat_w = []
+        for j in 0..D_in { concat_w = concat_w + [x[j]] }
+        for j in 0..D_out { concat_w = concat_w + [wrong_cand[j]] }
+
+        let mut hv_w = ttc_zeros(D_hidden)
+        for vi in 0..D_hidden {
+            let mut s = b_v[vi]
+            for j in 0..V_in { s = s + W_v[vi][j] * concat_w[j] }
+            hv_w[vi] = ttc_tanh(s)
+        }
+        let mut sv_w = b_vs
+        for j in 0..D_hidden { sv_w = sv_w + w_vs[j] * hv_w[j] }
+        let score_w = ttc_sigmoid(sv_w)
+
+        // grad for wrong: want score -> 0, so u = score - 0
+        let u_w = score_w
+        gb_vs = gb_vs + u_w
+        for j in 0..D_hidden { gw_vs[j] = gw_vs[j] + u_w * hv_w[j] }
+        let mut delta_hv_w = ttc_zeros(D_hidden)
+        for j in 0..D_hidden {
+            delta_hv_w[j] = u_w * w_vs[j] * (1.0 - hv_w[j] * hv_w[j])
+        }
+        for j in 0..D_hidden {
+            gb_v[j] = gb_v[j] + delta_hv_w[j]
+            for jj in 0..V_in { gW_v[j][jj] = gW_v[j][jj] + delta_hv_w[j] * concat_w[jj] }
+        }
+    }
+
+    // ── Apply gradients ────────────────────────────────────────
+    let inv_n = 1.0 / to_float(N)
+
+    let mut W_h_new = ttc_zeros_2d(D_hidden, D_in)
+    let mut b_h_new = ttc_zeros(D_hidden)
+    for j in 0..D_hidden {
+        b_h_new[j] = b_h[j] - lr * gb_h[j] * inv_n
+        for ii in 0..D_in {
+            W_h_new[j][ii] = W_h[j][ii] - lr * gW_h[j][ii] * inv_n
+        }
+    }
+
+    let mut W_o_new = ttc_zeros_2d(D_out, D_hidden)
+    let mut b_o_new = ttc_zeros(D_out)
+    for oi in 0..D_out {
+        b_o_new[oi] = b_o[oi] - lr * gb_o[oi] * inv_n
+        for j in 0..D_hidden {
+            W_o_new[oi][j] = W_o[oi][j] - lr * gW_o[oi][j] * inv_n
+        }
+    }
+
+    let mut W_v_new = ttc_zeros_2d(D_hidden, V_in)
+    let mut b_v_new = ttc_zeros(D_hidden)
+    for j in 0..D_hidden {
+        b_v_new[j] = b_v[j] - lr * gb_v[j] * inv_n
+        for jj in 0..V_in {
+            W_v_new[j][jj] = W_v[j][jj] - lr * gW_v[j][jj] * inv_n
+        }
+    }
+
+    let mut w_vs_new = ttc_zeros(D_hidden)
+    for j in 0..D_hidden {
+        w_vs_new[j] = w_vs[j] - lr * gw_vs[j] * inv_n
+    }
+    let b_vs_new = b_vs - lr * gb_vs * inv_n
+
+    return #{
+        "D_in": D_in,
+        "D_hidden": D_hidden,
+        "D_out": D_out,
+        "W_h": W_h_new,
+        "b_h": b_h_new,
+        "W_o": W_o_new,
+        "b_o": b_o_new,
+        "W_v": W_v_new,
+        "b_v": b_v_new,
+        "w_vs": w_vs_new,
+        "b_vs": b_vs_new
+    }
+}

@@ -1,0 +1,492 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/consistency_model.hexa — Consistency Model (#289)
+//
+//  Song et al., 2023 — maps any point on a PDE trajectory to its
+//  origin, enabling 1-step generation.
+//
+//  Self-consistency property:
+//      f(x_t, t) = f(x_t', t') for all t, t' on same trajectory
+//
+//  Boundary condition:
+//      f(x, epsilon) = x   (identity at t = epsilon)
+//
+//  Skip connection parameterisation:
+//      f(x, t) = c_skip(t) * x  +  c_out(t) * F_theta(x, t)
+//
+//  where:
+//      c_skip(t) = sigma_data^2 / ((t - epsilon)^2 + sigma_data^2)
+//      c_out(t)  = sigma_data * (t - epsilon) / sqrt(sigma_data^2 + t^2)
+//
+//  API:
+//    cm_init(dim, hidden, sigma_data, eps, seed)  -> model
+//    cm_skip_coeff(sigma_data, eps, t)            -> float
+//    cm_out_coeff(sigma_data, t)                  -> float
+//    cm_denoise(model, x_t, t)                    -> [float]
+//    cm_loss(model, x_0, noise, t_n, t_n1)        -> float
+//    cm_train_step(model, batch_x0, batch_noise,
+//                  batch_tn, batch_tn1, lr)        -> model
+//    cm_sample(model, z)                          -> [float]
+//
+//  AI-NATIVE attrs:
+//    @pure  (forward / coefficients / loss)
+//    @hot   (training step)
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Math helpers ──────────────────────────────────────────────────
+
+fn cm_abs(inp) { if inp < 0.0 { return 0.0 - inp } return inp }
+
+fn cm_exp(inp) {
+    let mut v = inp
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn cm_log(inp) {
+    if inp <= 0.0 { return -30.0 }
+    let mut v = inp
+    let mut count = 0
+    while v > 2.0 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    let d = v - 1.0
+    let ln_v = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_v
+}
+
+fn cm_sqrt(inp) {
+    if inp <= 0.0 { return 0.0 }
+    let mut x = inp
+    for _i in 0..30 {
+        x = 0.5 * (x + inp / x)
+    }
+    return x
+}
+
+fn cm_tanh(inp) {
+    let e_pos = cm_exp(inp)
+    let e_neg = cm_exp(0.0 - inp)
+    return (e_pos - e_neg) / (e_pos + e_neg)
+}
+
+fn cm_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn cm_zeros_2d(rows, cols) {
+    let mut m = []
+    for _r in 0..rows {
+        let mut row = []
+        for _c in 0..cols { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+fn cm_lcg(state) {
+    return (state * 1103515245 + 12345) % 2147483648
+}
+
+fn cm_uniform(state) {
+    let s = cm_lcg(state)
+    return [to_float(s) / 2147483648.0, to_float(s)]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Skip and output coefficients
+//
+//    c_skip(t) = sigma_data^2 / ((t - eps)^2 + sigma_data^2)
+//    c_out(t)  = sigma_data * (t - eps) / sqrt(sigma_data^2 + t^2)
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn cm_skip_coeff(sigma_data, eps, t) {
+    let sd2 = sigma_data * sigma_data
+    let diff = t - eps
+    return sd2 / (diff * diff + sd2)
+}
+
+@pure
+fn cm_out_coeff(sigma_data, t) {
+    let sd2 = sigma_data * sigma_data
+    let diff = t - 0.002
+    return sigma_data * diff / cm_sqrt(sd2 + t * t)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Initialise Consistency Model
+//
+//  Neural network F_theta: two-layer MLP with time embedding
+//    Layer 1:  W1 (hidden x dim), b1 (hidden)
+//    Time emb: W_t (hidden x 1) -- broadcast scalar t
+//    Layer 2:  W2 (dim x hidden), b2 (dim)
+//
+//  Params stored in model dict along with hyperparams.
+// ═══════════════════════════════════════════════════════════════════
+fn cm_init(dim, hidden, sigma_data, eps, seed) {
+    let mut state = seed
+    if state <= 0 { state = 1 }
+
+    // Xavier-ish init scale
+    let scale_1 = 1.0 / cm_sqrt(to_float(dim))
+    let scale_2 = 1.0 / cm_sqrt(to_float(hidden))
+
+    let mut W1 = cm_zeros_2d(hidden, dim)
+    for i in 0..hidden {
+        for j in 0..dim {
+            let u = cm_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W1[i][j] = (u[0] - 0.5) * scale_1
+        }
+    }
+    let b1 = cm_zeros(hidden)
+
+    // Time embedding weights
+    let mut W_t = cm_zeros(hidden)
+    for i in 0..hidden {
+        let u = cm_uniform(state)
+        state = int(u[1])
+        if state <= 0 { state = 1 }
+        W_t[i] = (u[0] - 0.5) * 0.1
+    }
+
+    let mut W2 = cm_zeros_2d(dim, hidden)
+    for i in 0..dim {
+        for j in 0..hidden {
+            let u = cm_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W2[i][j] = (u[0] - 0.5) * scale_2
+        }
+    }
+    let b2 = cm_zeros(dim)
+
+    return #{
+        "dim": dim,
+        "hidden": hidden,
+        "sigma_data": sigma_data,
+        "eps": eps,
+        "W1": W1,
+        "b1": b1,
+        "W_t": W_t,
+        "W2": W2,
+        "b2": b2
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  F_theta(x, t) — the raw neural network output
+//
+//    h = tanh(W1 * x + b1 + W_t * t)
+//    out = W2 * h + b2
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cm_f_theta(model, x, t) {
+    let dim = model["dim"]
+    let hidden = model["hidden"]
+    let W1 = model["W1"]
+    let b1 = model["b1"]
+    let W_t = model["W_t"]
+    let W2 = model["W2"]
+    let b2 = model["b2"]
+
+    // hidden layer
+    let mut h = cm_zeros(hidden)
+    for i in 0..hidden {
+        let mut s = b1[i] + W_t[i] * t
+        for j in 0..dim { s = s + W1[i][j] * x[j] }
+        h[i] = cm_tanh(s)
+    }
+
+    // output layer
+    let mut out = cm_zeros(dim)
+    for i in 0..dim {
+        let mut s = b2[i]
+        for j in 0..hidden { s = s + W2[i][j] * h[j] }
+        out[i] = s
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  cm_denoise — the consistency function
+//
+//    f(x_t, t) = c_skip(t) * x_t  +  c_out(t) * F_theta(x_t, t)
+//
+//  At t = eps this reduces to identity: f(x, eps) = x
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cm_denoise(model, x_t, t) {
+    let sigma_data = model["sigma_data"]
+    let eps = model["eps"]
+    let dim = model["dim"]
+    let c_skip = cm_skip_coeff(sigma_data, eps, t)
+    let c_out = cm_out_coeff(sigma_data, t)
+    let f_out = cm_f_theta(model, x_t, t)
+
+    let mut result = cm_zeros(dim)
+    for i in 0..dim {
+        result[i] = c_skip * x_t[i] + c_out * f_out[i]
+    }
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  cm_add_noise — add Gaussian-like noise at level t
+//
+//    x_t = x_0 + t * noise
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cm_add_noise(x_0, noise, t) {
+    let dim = len(x_0)
+    let mut x_t = cm_zeros(dim)
+    for i in 0..dim {
+        x_t[i] = x_0[i] + t * noise[i]
+    }
+    return x_t
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  cm_loss — consistency distillation loss
+//
+//  Given adjacent time steps t_n > t_n1 (closer to eps):
+//    x_tn  = x_0 + t_n * noise
+//    x_tn1 = x_0 + t_n1 * noise
+//    loss = || f(x_tn, t_n) - f(x_tn1, t_n1) ||^2
+//
+//  This enforces self-consistency: outputs at different noise levels
+//  on the same trajectory should be identical.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cm_loss(model, x_0, noise, t_n, t_n1) {
+    let dim = model["dim"]
+    let x_tn = cm_add_noise(x_0, noise, t_n)
+    let x_tn1 = cm_add_noise(x_0, noise, t_n1)
+    let f_tn = cm_denoise(model, x_tn, t_n)
+    let f_tn1 = cm_denoise(model, x_tn1, t_n1)
+
+    let mut mse = 0.0
+    for i in 0..dim {
+        let diff = f_tn[i] - f_tn1[i]
+        mse = mse + diff * diff
+    }
+    return mse / to_float(dim)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  cm_train_step — one gradient descent step (numerical gradient)
+//
+//  Consistency distillation: minimise sum of cm_loss over batch.
+//  Uses finite-difference gradient for each parameter.
+//
+//  batch_x0, batch_noise: list of [float] samples
+//  batch_tn, batch_tn1: list of float time pairs
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn cm_train_step(model, batch_x0, batch_noise, batch_tn, batch_tn1, lr) {
+    let dim = model["dim"]
+    let hidden = model["hidden"]
+    let sigma_data = model["sigma_data"]
+    let eps_param = model["eps"]
+    let N = len(batch_x0)
+    let delta = 0.001
+
+    // Compute base loss
+    let mut base_loss = 0.0
+    for n in 0..N {
+        base_loss = base_loss + cm_loss(model, batch_x0[n], batch_noise[n], batch_tn[n], batch_tn1[n])
+    }
+    base_loss = base_loss / to_float(N)
+
+    // ── Gradient for W1 ─────────────────────────────────────────
+    let mut W1 = model["W1"]
+    let mut W1_new = cm_zeros_2d(hidden, dim)
+    for i in 0..hidden {
+        for j in 0..dim {
+            let orig = W1[i][j]
+            W1[i][j] = orig + delta
+            let mut m2 = #{
+                "dim": dim, "hidden": hidden, "sigma_data": sigma_data,
+                "eps": eps_param, "W1": W1, "b1": model["b1"],
+                "W_t": model["W_t"], "W2": model["W2"], "b2": model["b2"]
+            }
+            let mut loss_p = 0.0
+            for n in 0..N {
+                loss_p = loss_p + cm_loss(m2, batch_x0[n], batch_noise[n], batch_tn[n], batch_tn1[n])
+            }
+            loss_p = loss_p / to_float(N)
+            let grad = (loss_p - base_loss) / delta
+            W1_new[i][j] = orig - lr * grad
+            W1[i][j] = orig
+        }
+    }
+
+    // ── Gradient for b1 ─────────────────────────────────────────
+    let mut b1 = model["b1"]
+    let mut b1_new = cm_zeros(hidden)
+    for i in 0..hidden {
+        let orig = b1[i]
+        b1[i] = orig + delta
+        let mut m2 = #{
+            "dim": dim, "hidden": hidden, "sigma_data": sigma_data,
+            "eps": eps_param, "W1": model["W1"], "b1": b1,
+            "W_t": model["W_t"], "W2": model["W2"], "b2": model["b2"]
+        }
+        let mut loss_p = 0.0
+        for n in 0..N {
+            loss_p = loss_p + cm_loss(m2, batch_x0[n], batch_noise[n], batch_tn[n], batch_tn1[n])
+        }
+        loss_p = loss_p / to_float(N)
+        let grad = (loss_p - base_loss) / delta
+        b1_new[i] = orig - lr * grad
+        b1[i] = orig
+    }
+
+    // ── Gradient for W_t ────────────────────────────────────────
+    let mut W_t = model["W_t"]
+    let mut W_t_new = cm_zeros(hidden)
+    for i in 0..hidden {
+        let orig = W_t[i]
+        W_t[i] = orig + delta
+        let mut m2 = #{
+            "dim": dim, "hidden": hidden, "sigma_data": sigma_data,
+            "eps": eps_param, "W1": model["W1"], "b1": model["b1"],
+            "W_t": W_t, "W2": model["W2"], "b2": model["b2"]
+        }
+        let mut loss_p = 0.0
+        for n in 0..N {
+            loss_p = loss_p + cm_loss(m2, batch_x0[n], batch_noise[n], batch_tn[n], batch_tn1[n])
+        }
+        loss_p = loss_p / to_float(N)
+        let grad = (loss_p - base_loss) / delta
+        W_t_new[i] = orig - lr * grad
+        W_t[i] = orig
+    }
+
+    // ── Gradient for W2 ─────────────────────────────────────────
+    let mut W2 = model["W2"]
+    let mut W2_new = cm_zeros_2d(dim, hidden)
+    for i in 0..dim {
+        for j in 0..hidden {
+            let orig = W2[i][j]
+            W2[i][j] = orig + delta
+            let mut m2 = #{
+                "dim": dim, "hidden": hidden, "sigma_data": sigma_data,
+                "eps": eps_param, "W1": model["W1"], "b1": model["b1"],
+                "W_t": model["W_t"], "W2": W2, "b2": model["b2"]
+            }
+            let mut loss_p = 0.0
+            for n in 0..N {
+                loss_p = loss_p + cm_loss(m2, batch_x0[n], batch_noise[n], batch_tn[n], batch_tn1[n])
+            }
+            loss_p = loss_p / to_float(N)
+            let grad = (loss_p - base_loss) / delta
+            W2_new[i][j] = orig - lr * grad
+            W2[i][j] = orig
+        }
+    }
+
+    // ── Gradient for b2 ─────────────────────────────────────────
+    let mut b2 = model["b2"]
+    let mut b2_new = cm_zeros(dim)
+    for i in 0..dim {
+        let orig = b2[i]
+        b2[i] = orig + delta
+        let mut m2 = #{
+            "dim": dim, "hidden": hidden, "sigma_data": sigma_data,
+            "eps": eps_param, "W1": model["W1"], "b1": model["b1"],
+            "W_t": model["W_t"], "W2": model["W2"], "b2": b2
+        }
+        let mut loss_p = 0.0
+        for n in 0..N {
+            loss_p = loss_p + cm_loss(m2, batch_x0[n], batch_noise[n], batch_tn[n], batch_tn1[n])
+        }
+        loss_p = loss_p / to_float(N)
+        let grad = (loss_p - base_loss) / delta
+        b2_new[i] = orig - lr * grad
+        b2[i] = orig
+    }
+
+    return #{
+        "dim": dim,
+        "hidden": hidden,
+        "sigma_data": sigma_data,
+        "eps": eps_param,
+        "W1": W1_new,
+        "b1": b1_new,
+        "W_t": W_t_new,
+        "W2": W2_new,
+        "b2": b2_new
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  cm_sample — 1-step generation
+//
+//  Given noise z ~ N(0, I), produce a sample by evaluating the
+//  consistency function at t = T (maximum noise level).
+//
+//    x_hat = f(z, T)
+//
+//  where T = sigma_data * 80  (standard Karras schedule upper bound)
+//  This is the key advantage: only 1 network evaluation needed.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cm_sample(model, z) {
+    let sigma_data = model["sigma_data"]
+    let t_max = sigma_data * 80.0
+    return cm_denoise(model, z, t_max)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  cm_sample_multistep — multi-step generation for better quality
+//
+//  Iteratively denoise from T down to eps in N steps.
+//  schedule: list of decreasing time values [T, t1, t2, ..., eps]
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cm_sample_multistep(model, z, schedule) {
+    let n_steps = len(schedule)
+    let mut x = z
+    for i in 0..n_steps {
+        x = cm_denoise(model, x, schedule[i])
+    }
+    return x
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  cm_make_schedule — create time schedule for training / sampling
+//
+//  Produces N evenly spaced time steps from t_max down to eps.
+//  Returns list of [t_n, t_n1] pairs for training.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cm_make_schedule(t_max, eps, n_steps) {
+    let mut schedule = []
+    let step_size = (t_max - eps) / to_float(n_steps)
+    for i in 0..n_steps {
+        let t_n = t_max - to_float(i) * step_size
+        let t_n1 = t_n - step_size
+        schedule = schedule + [#{
+            "t_n": t_n,
+            "t_n1": t_n1
+        }]
+    }
+    return schedule
+}

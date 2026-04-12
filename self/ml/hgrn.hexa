@@ -1,0 +1,454 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/hgrn.hexa — Hierarchically Gated Recurrent Neural Network (#313)
+//
+//  HGRN (Qin et al., 2023) — Multiple layers of gated recurrence
+//  with hierarchical forget gates that allow different timescales
+//  per layer.
+//
+//  Per layer l at time t:
+//      g_t = sigma(W_g[l] * x_t + b_g[l])   (forget gate)
+//      h_t = g_t . h_{t-1} + (1 - g_t) . (W_h[l] * x_t)
+//      o_t = sigma(W_o[l] * x_t)            (output gate)
+//      y_t = o_t . h_t
+//
+//  Hierarchical: layer l has b_g initialized to l+1, encouraging
+//  longer memory (slower decay) at higher layers. Lower layers
+//  capture fast dynamics, upper layers capture slow dynamics.
+//
+//  Output projection:  out = W_out * y_last_layer + b_out
+//
+//  API:
+//    hgrn_init(D_in, D_hidden, n_layers, D_out, seed) -> model
+//    hgrn_cell(model, layer, x, h) -> [output, new_h]
+//    hgrn_forward_seq(model, xs) -> outputs
+//    hgrn_loss(model, xs, ys) -> float
+//    hgrn_train_step(model, X_seqs, Y_seqs, lr) -> model
+//
+//  AI-NATIVE attrs:
+//    @pure   (cell, forward_seq, loss)
+//    @hot    (train_step)
+// ═══════════════════════════════════════════════════════════════════
+
+// ─── Utility math ─────────────────────────────────────────────────
+
+fn hgrn_abs(inp) { if inp < 0.0 { return 0.0 - inp } return inp }
+
+fn hgrn_exp(inp) {
+    let mut v = inp
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn hgrn_log(inp) {
+    if inp <= 0.0 { return -30.0 }
+    let mut v = inp
+    let mut count = 0
+    while v > 2.0 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    let d = v - 1.0
+    let ln_v = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_v
+}
+
+fn hgrn_sigmoid(inp) {
+    return 1.0 / (1.0 + hgrn_exp(0.0 - inp))
+}
+
+fn hgrn_zeros_f(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn hgrn_zeros_2d(rows, cols) {
+    let mut m = []
+    for _r in 0..rows {
+        let mut row = []
+        for _c in 0..cols { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+fn hgrn_lcg(state) {
+    return (state * 1103515245 + 12345) % 2147483648
+}
+
+fn hgrn_uniform(state) {
+    let s = hgrn_lcg(state)
+    return [to_float(s) / 2147483648.0, to_float(s)]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  hgrn_init — initialise HGRN model
+//
+//  Per layer l (0..n_layers):
+//      W_g[l]  : D_hidden x D_in (layer 0) or D_hidden x D_hidden (layer>0)
+//      b_g[l]  : D_hidden, initialised to (l+1) for hierarchical timescale
+//      W_h[l]  : D_hidden x D_in (layer 0) or D_hidden x D_hidden (layer>0)
+//      W_o[l]  : D_hidden x D_in (layer 0) or D_hidden x D_hidden (layer>0)
+//  Output projection:
+//      W_out   : D_out x D_hidden
+//      b_out   : D_out
+// ═══════════════════════════════════════════════════════════════════
+fn hgrn_init(D_in, D_hidden, n_layers, D_out, seed) {
+    let mut state = seed
+    if state <= 0 { state = 1 }
+
+    let mut W_g_all = []
+    let mut b_g_all = []
+    let mut W_h_all = []
+    let mut W_o_all = []
+
+    for l in 0..n_layers {
+        let inp_dim = if l == 0 { D_in } else { D_hidden }
+
+        // W_g[l]
+        let mut W_g = hgrn_zeros_2d(D_hidden, inp_dim)
+        for i in 0..D_hidden {
+            for j in 0..inp_dim {
+                let u = hgrn_uniform(state)
+                state = int(u[1])
+                if state <= 0 { state = 1 }
+                W_g[i][j] = (u[0] - 0.5) * 0.2
+            }
+        }
+        W_g_all = W_g_all + [W_g]
+
+        // b_g[l] — hierarchical: higher layer => larger bias => gate closer to 1 => slower forget
+        let mut b_g = hgrn_zeros_f(D_hidden)
+        for i in 0..D_hidden {
+            b_g[i] = to_float(l + 1)
+        }
+        b_g_all = b_g_all + [b_g]
+
+        // W_h[l]
+        let mut W_h = hgrn_zeros_2d(D_hidden, inp_dim)
+        for i in 0..D_hidden {
+            for j in 0..inp_dim {
+                let u = hgrn_uniform(state)
+                state = int(u[1])
+                if state <= 0 { state = 1 }
+                W_h[i][j] = (u[0] - 0.5) * 0.5
+            }
+        }
+        W_h_all = W_h_all + [W_h]
+
+        // W_o[l]
+        let mut W_o = hgrn_zeros_2d(D_hidden, inp_dim)
+        for i in 0..D_hidden {
+            for j in 0..inp_dim {
+                let u = hgrn_uniform(state)
+                state = int(u[1])
+                if state <= 0 { state = 1 }
+                W_o[i][j] = (u[0] - 0.5) * 0.5
+            }
+        }
+        W_o_all = W_o_all + [W_o]
+    }
+
+    // Output projection
+    let mut W_out = hgrn_zeros_2d(D_out, D_hidden)
+    for i in 0..D_out {
+        for j in 0..D_hidden {
+            let u = hgrn_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W_out[i][j] = (u[0] - 0.5) * 0.5
+        }
+    }
+    let b_out = hgrn_zeros_f(D_out)
+
+    return #{
+        "D_in": D_in,
+        "D_hidden": D_hidden,
+        "n_layers": n_layers,
+        "D_out": D_out,
+        "W_g": W_g_all,
+        "b_g": b_g_all,
+        "W_h": W_h_all,
+        "W_o": W_o_all,
+        "W_out": W_out,
+        "b_out": b_out
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  hgrn_cell — single time step for one layer
+//
+//  g_t = sigma(W_g * x + b_g)
+//  h_new = g_t . h_prev + (1 - g_t) . (W_h * x)
+//  o_t = sigma(W_o * x)
+//  output = o_t . h_new
+//
+//  Returns [output_vec, h_new_vec]
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn hgrn_cell(model, layer, x, h) {
+    let D_hidden = model["D_hidden"]
+    let W_g = model["W_g"][layer]
+    let b_g = model["b_g"][layer]
+    let W_h = model["W_h"][layer]
+    let W_o = model["W_o"][layer]
+    let inp_dim = len(x)
+
+    let mut gate = hgrn_zeros_f(D_hidden)
+    let mut candidate = hgrn_zeros_f(D_hidden)
+    let mut out_gate = hgrn_zeros_f(D_hidden)
+
+    for i in 0..D_hidden {
+        // Forget gate
+        let mut sg = b_g[i]
+        for j in 0..inp_dim { sg = sg + W_g[i][j] * x[j] }
+        gate[i] = hgrn_sigmoid(sg)
+
+        // Candidate = W_h * x
+        let mut sh = 0.0
+        for j in 0..inp_dim { sh = sh + W_h[i][j] * x[j] }
+        candidate[i] = sh
+
+        // Output gate
+        let mut so = 0.0
+        for j in 0..inp_dim { so = so + W_o[i][j] * x[j] }
+        out_gate[i] = hgrn_sigmoid(so)
+    }
+
+    // h_new = g * h_prev + (1 - g) * candidate
+    let mut h_new = hgrn_zeros_f(D_hidden)
+    let mut output = hgrn_zeros_f(D_hidden)
+    for i in 0..D_hidden {
+        h_new[i] = gate[i] * h[i] + (1.0 - gate[i]) * candidate[i]
+        output[i] = out_gate[i] * h_new[i]
+    }
+
+    return [output, h_new]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  hgrn_forward_seq — run full sequence through all layers
+//
+//  Input: xs = [[x_0], [x_1], ...]  (T x D_in)
+//  Output: outs = [[o_0], [o_1], ...]  (T x D_out)
+//
+//  Each layer processes the full sequence, feeding its output
+//  as input to the next layer.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn hgrn_forward_seq(model, xs) {
+    let n_layers = model["n_layers"]
+    let D_hidden = model["D_hidden"]
+    let D_out = model["D_out"]
+    let W_out = model["W_out"]
+    let b_out = model["b_out"]
+    let T = len(xs)
+
+    // Layer-by-layer processing
+    let mut layer_input = xs
+    for l in 0..n_layers {
+        let mut h = hgrn_zeros_f(D_hidden)
+        let mut layer_output = []
+        for t in 0..T {
+            let result = hgrn_cell(model, l, layer_input[t], h)
+            let cell_out = result[0]
+            h = result[1]
+            layer_output = layer_output + [cell_out]
+        }
+        layer_input = layer_output
+    }
+
+    // Output projection for each timestep
+    let mut outs = []
+    for t in 0..T {
+        let hidden_t = layer_input[t]
+        let mut o = hgrn_zeros_f(D_out)
+        for i in 0..D_out {
+            let mut s = b_out[i]
+            for j in 0..D_hidden { s = s + W_out[i][j] * hidden_t[j] }
+            o[i] = s
+        }
+        outs = outs + [o]
+    }
+    return outs
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  hgrn_loss — MSE loss over a single sequence
+//
+//  xs: [T x D_in],  ys: [T x D_out]
+//  Returns mean squared error
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn hgrn_loss(model, xs, ys) {
+    let preds = hgrn_forward_seq(model, xs)
+    let T = len(preds)
+    let D_out = model["D_out"]
+    let mut total = 0.0
+    let mut count = 0
+    for t in 0..T {
+        for i in 0..D_out {
+            let diff = preds[t][i] - ys[t][i]
+            total = total + diff * diff
+            count = count + 1
+        }
+    }
+    if count == 0 { return 0.0 }
+    return total / to_float(count)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  hgrn_train_step — numerical gradient descent
+//
+//  X_seqs: list of sequences [[T x D_in], ...]
+//  Y_seqs: list of target seqs [[T x D_out], ...]
+//  lr: learning rate
+//
+//  Uses finite-difference gradient estimation per parameter.
+//  For efficiency, we perturb each parameter by eps, measure
+//  the change in average loss, and update.
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn hgrn_train_step(model, X_seqs, Y_seqs, lr) {
+    let N = len(X_seqs)
+    let n_layers = model["n_layers"]
+    let D_hidden = model["D_hidden"]
+    let D_out = model["D_out"]
+    let eps = 0.001
+
+    // Compute base loss
+    let mut base_loss = 0.0
+    for n in 0..N {
+        base_loss = base_loss + hgrn_loss(model, X_seqs[n], Y_seqs[n])
+    }
+    base_loss = base_loss / to_float(N)
+
+    // ── Perturb W_out ──────────────────────────────────────────
+    let mut W_out_new = hgrn_zeros_2d(D_out, D_hidden)
+    for i in 0..D_out {
+        for j in 0..D_hidden {
+            let old_val = model["W_out"][i][j]
+            model["W_out"][i][j] = old_val + eps
+            let mut new_loss = 0.0
+            for n in 0..N {
+                new_loss = new_loss + hgrn_loss(model, X_seqs[n], Y_seqs[n])
+            }
+            new_loss = new_loss / to_float(N)
+            let grad = (new_loss - base_loss) / eps
+            model["W_out"][i][j] = old_val
+            W_out_new[i][j] = old_val - lr * grad
+        }
+    }
+
+    // ── Perturb b_out ──────────────────────────────────────────
+    let mut b_out_new = hgrn_zeros_f(D_out)
+    for i in 0..D_out {
+        let old_val = model["b_out"][i]
+        model["b_out"][i] = old_val + eps
+        let mut new_loss = 0.0
+        for n in 0..N {
+            new_loss = new_loss + hgrn_loss(model, X_seqs[n], Y_seqs[n])
+        }
+        new_loss = new_loss / to_float(N)
+        let grad = (new_loss - base_loss) / eps
+        model["b_out"][i] = old_val
+        b_out_new[i] = old_val - lr * grad
+    }
+
+    // ── Perturb per-layer weights ──────────────────────────────
+    let mut W_g_new = []
+    let mut b_g_new = []
+    let mut W_h_new = []
+    let mut W_o_new = []
+
+    for l in 0..n_layers {
+        let inp_dim = if l == 0 { model["D_in"] } else { D_hidden }
+
+        // W_g
+        let mut Wg = hgrn_zeros_2d(D_hidden, inp_dim)
+        for i in 0..D_hidden {
+            for j in 0..inp_dim {
+                let old_val = model["W_g"][l][i][j]
+                model["W_g"][l][i][j] = old_val + eps
+                let mut nl = 0.0
+                for n in 0..N { nl = nl + hgrn_loss(model, X_seqs[n], Y_seqs[n]) }
+                nl = nl / to_float(N)
+                let grad = (nl - base_loss) / eps
+                model["W_g"][l][i][j] = old_val
+                Wg[i][j] = old_val - lr * grad
+            }
+        }
+        W_g_new = W_g_new + [Wg]
+
+        // b_g
+        let mut bg = hgrn_zeros_f(D_hidden)
+        for i in 0..D_hidden {
+            let old_val = model["b_g"][l][i]
+            model["b_g"][l][i] = old_val + eps
+            let mut nl = 0.0
+            for n in 0..N { nl = nl + hgrn_loss(model, X_seqs[n], Y_seqs[n]) }
+            nl = nl / to_float(N)
+            let grad = (nl - base_loss) / eps
+            model["b_g"][l][i] = old_val
+            bg[i] = old_val - lr * grad
+        }
+        b_g_new = b_g_new + [bg]
+
+        // W_h
+        let mut Wh = hgrn_zeros_2d(D_hidden, inp_dim)
+        for i in 0..D_hidden {
+            for j in 0..inp_dim {
+                let old_val = model["W_h"][l][i][j]
+                model["W_h"][l][i][j] = old_val + eps
+                let mut nl = 0.0
+                for n in 0..N { nl = nl + hgrn_loss(model, X_seqs[n], Y_seqs[n]) }
+                nl = nl / to_float(N)
+                let grad = (nl - base_loss) / eps
+                model["W_h"][l][i][j] = old_val
+                Wh[i][j] = old_val - lr * grad
+            }
+        }
+        W_h_new = W_h_new + [Wh]
+
+        // W_o
+        let mut Wo = hgrn_zeros_2d(D_hidden, inp_dim)
+        for i in 0..D_hidden {
+            for j in 0..inp_dim {
+                let old_val = model["W_o"][l][i][j]
+                model["W_o"][l][i][j] = old_val + eps
+                let mut nl = 0.0
+                for n in 0..N { nl = nl + hgrn_loss(model, X_seqs[n], Y_seqs[n]) }
+                nl = nl / to_float(N)
+                let grad = (nl - base_loss) / eps
+                model["W_o"][l][i][j] = old_val
+                Wo[i][j] = old_val - lr * grad
+            }
+        }
+        W_o_new = W_o_new + [Wo]
+    }
+
+    return #{
+        "D_in": model["D_in"],
+        "D_hidden": D_hidden,
+        "n_layers": n_layers,
+        "D_out": D_out,
+        "W_g": W_g_new,
+        "b_g": b_g_new,
+        "W_h": W_h_new,
+        "W_o": W_o_new,
+        "W_out": W_out_new,
+        "b_out": b_out_new
+    }
+}

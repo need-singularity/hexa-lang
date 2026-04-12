@@ -1,0 +1,539 @@
+// ===============================================================
+//  self/ml/offloading.hexa -- CPU/GPU Offloading (#304)
+//
+//  Layer-wise weight and KV cache offloading pipeline.
+//  Keep only K active layers on "GPU" (simulated), prefetch
+//  next layer from "CPU" asynchronously.
+//
+//  Key concepts:
+//    - Layer pool: only max_gpu_layers resident at a time
+//    - Prefetch: while computing layer i, load layer i+1
+//    - KV offload: completed KV blocks moved to CPU
+//    - Memory budget: track and enforce limits
+//
+//  API (ofl_ prefix):
+//    ofl_init(n_layers, D, max_gpu_layers, seed) -> manager
+//    ofl_create_layer(mgr, layer_id, weights) -> mgr
+//    ofl_load_to_gpu(mgr, layer_id) -> mgr
+//    ofl_offload_to_cpu(mgr, layer_id) -> mgr
+//    ofl_is_on_gpu(mgr, layer_id) -> bool
+//    ofl_forward_layer(mgr, layer_id, input) -> [mgr, output]
+//    ofl_forward_all(mgr, input) -> [mgr, output]
+//    ofl_memory_usage(mgr) -> #{gpu_used, cpu_used, budget}
+//    ofl_train_step(mgr, X, Y, lr) -> mgr
+//
+//  AI-NATIVE attrs:
+//    @pure  (forward / query)
+//    @hot   (training step)
+// ===============================================================
+
+// ---------------------------------------------------------------
+//  Math helpers
+// ---------------------------------------------------------------
+fn ofl_abs(v) { if v < 0.0 { return 0.0 - v } return v }
+
+fn ofl_exp(v) {
+    let mut x = v
+    if x > 20.0 { x = 20.0 }
+    if x < -20.0 { x = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * x / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn ofl_tanh(v) {
+    let ep = ofl_exp(v)
+    let en = ofl_exp(0.0 - v)
+    return (ep - en) / (ep + en)
+}
+
+fn ofl_lcg(state) {
+    return (state * 1103515245 + 12345) % 2147483648
+}
+
+fn ofl_uniform(state) {
+    let s = ofl_lcg(state)
+    return [to_float(s) / 2147483648.0, to_float(s)]
+}
+
+// ---------------------------------------------------------------
+//  Array helpers
+// ---------------------------------------------------------------
+fn ofl_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn ofl_zeros_2d(rows, cols) {
+    let mut m = []
+    for _r in 0..rows {
+        let mut row = []
+        for _c in 0..cols { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+// ---------------------------------------------------------------
+//  ofl_init -- create offloading manager
+//
+//  Fields:
+//    n_layers        total number of layers
+//    D               dimension per layer (input=output=D)
+//    max_gpu_layers  how many layers fit on GPU at once
+//    layers          dict of layer_id -> #{weights, bias, location}
+//                      location: "cpu" | "gpu"
+//    gpu_resident    list of layer_ids currently on GPU
+//    kv_cache        dict of layer_id -> #{keys, values, location}
+//    gpu_mem_used    simulated GPU memory counter (unit = D*D floats)
+//    cpu_mem_used    simulated CPU memory counter
+//    seed            RNG state
+// ---------------------------------------------------------------
+fn ofl_init(n_layers, D, max_gpu_layers, seed) {
+    let mut s = seed
+    if s <= 0 { s = 1 }
+    return #{
+        "n_layers": n_layers,
+        "D": D,
+        "max_gpu_layers": max_gpu_layers,
+        "layers": #{},
+        "gpu_resident": [],
+        "kv_cache": #{},
+        "gpu_mem_used": 0,
+        "cpu_mem_used": 0,
+        "seed": s
+    }
+}
+
+// ---------------------------------------------------------------
+//  ofl_create_layer -- register a layer with random weights
+//    weights is optional: if empty list, generate random
+//    layer starts on CPU
+// ---------------------------------------------------------------
+fn ofl_create_layer(mgr, layer_id, weights) {
+    let D = mgr["D"]
+    let mut state = mgr["seed"]
+    let mut W = ofl_zeros_2d(D, D)
+    let mut bias = ofl_zeros(D)
+
+    if len(weights) > 0 {
+        // use provided weights -- flat array of D*D values
+        for i in 0..D {
+            for j in 0..D {
+                W[i][j] = weights[i * D + j]
+            }
+        }
+    } else {
+        // random init Xavier-like: U(-0.5, 0.5)
+        for i in 0..D {
+            for j in 0..D {
+                let u = ofl_uniform(state)
+                state = int(u[1])
+                if state <= 0 { state = 1 }
+                W[i][j] = u[0] - 0.5
+            }
+        }
+        for i in 0..D {
+            let u = ofl_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            bias[i] = (u[0] - 0.5) * 0.1
+        }
+    }
+
+    let lid = str(layer_id)
+    let layer_info = #{"weights": W, "bias": bias, "location": "cpu"}
+    let mut layers_new = mgr["layers"]
+    layers_new[lid] = layer_info
+
+    let mem_size = D * D + D
+    return #{
+        "n_layers": mgr["n_layers"],
+        "D": D,
+        "max_gpu_layers": mgr["max_gpu_layers"],
+        "layers": layers_new,
+        "gpu_resident": mgr["gpu_resident"],
+        "kv_cache": mgr["kv_cache"],
+        "gpu_mem_used": mgr["gpu_mem_used"],
+        "cpu_mem_used": mgr["cpu_mem_used"] + mem_size,
+        "seed": state
+    }
+}
+
+// ---------------------------------------------------------------
+//  ofl_load_to_gpu -- move layer from CPU to GPU
+//    Evicts oldest GPU layer if at capacity
+// ---------------------------------------------------------------
+fn ofl_load_to_gpu(mgr, layer_id) {
+    let lid = str(layer_id)
+    let layers = mgr["layers"]
+    let layer = layers[lid]
+
+    // already on GPU?
+    if layer["location"] == "gpu" { return mgr }
+
+    let D = mgr["D"]
+    let mem_size = D * D + D
+    let mut gpu_resident = mgr["gpu_resident"]
+    let mut layers_new = layers
+    let mut gpu_used = mgr["gpu_mem_used"]
+    let mut cpu_used = mgr["cpu_mem_used"]
+
+    // evict oldest if at capacity
+    if len(gpu_resident) >= mgr["max_gpu_layers"] {
+        let evict_id = gpu_resident[0]
+        let mut new_resident = []
+        for i in 1..len(gpu_resident) {
+            new_resident = new_resident + [gpu_resident[i]]
+        }
+        gpu_resident = new_resident
+
+        let evict_lid = str(evict_id)
+        let evict_layer = layers_new[evict_lid]
+        layers_new[evict_lid] = #{
+            "weights": evict_layer["weights"],
+            "bias": evict_layer["bias"],
+            "location": "cpu"
+        }
+        gpu_used = gpu_used - mem_size
+        cpu_used = cpu_used + mem_size
+    }
+
+    // load target layer to GPU
+    layers_new[lid] = #{
+        "weights": layer["weights"],
+        "bias": layer["bias"],
+        "location": "gpu"
+    }
+    gpu_resident = gpu_resident + [layer_id]
+    gpu_used = gpu_used + mem_size
+    cpu_used = cpu_used - mem_size
+
+    return #{
+        "n_layers": mgr["n_layers"],
+        "D": D,
+        "max_gpu_layers": mgr["max_gpu_layers"],
+        "layers": layers_new,
+        "gpu_resident": gpu_resident,
+        "kv_cache": mgr["kv_cache"],
+        "gpu_mem_used": gpu_used,
+        "cpu_mem_used": cpu_used,
+        "seed": mgr["seed"]
+    }
+}
+
+// ---------------------------------------------------------------
+//  ofl_offload_to_cpu -- move layer from GPU back to CPU
+// ---------------------------------------------------------------
+fn ofl_offload_to_cpu(mgr, layer_id) {
+    let lid = str(layer_id)
+    let layers = mgr["layers"]
+    let layer = layers[lid]
+
+    if layer["location"] == "cpu" { return mgr }
+
+    let D = mgr["D"]
+    let mem_size = D * D + D
+
+    let mut layers_new = layers
+    layers_new[lid] = #{
+        "weights": layer["weights"],
+        "bias": layer["bias"],
+        "location": "cpu"
+    }
+
+    // remove from gpu_resident
+    let mut new_resident = []
+    for i in 0..len(mgr["gpu_resident"]) {
+        if mgr["gpu_resident"][i] != layer_id {
+            new_resident = new_resident + [mgr["gpu_resident"][i]]
+        }
+    }
+
+    return #{
+        "n_layers": mgr["n_layers"],
+        "D": D,
+        "max_gpu_layers": mgr["max_gpu_layers"],
+        "layers": layers_new,
+        "gpu_resident": new_resident,
+        "kv_cache": mgr["kv_cache"],
+        "gpu_mem_used": mgr["gpu_mem_used"] - mem_size,
+        "cpu_mem_used": mgr["cpu_mem_used"] + mem_size,
+        "seed": mgr["seed"]
+    }
+}
+
+// ---------------------------------------------------------------
+//  ofl_is_on_gpu -- check if a layer is currently on GPU
+// ---------------------------------------------------------------
+@pure
+fn ofl_is_on_gpu(mgr, layer_id) {
+    let lid = str(layer_id)
+    let layer = mgr["layers"][lid]
+    return layer["location"] == "gpu"
+}
+
+// ---------------------------------------------------------------
+//  ofl_forward_layer -- compute output = tanh(W * input + bias)
+//    Automatically loads layer to GPU if not already there.
+//    Returns [mgr, output]
+// ---------------------------------------------------------------
+@pure
+fn ofl_forward_layer(mgr, layer_id, input) {
+    // ensure layer is on GPU
+    let mut m = mgr
+    if ofl_is_on_gpu(m, layer_id) == false {
+        m = ofl_load_to_gpu(m, layer_id)
+    }
+
+    let lid = str(layer_id)
+    let layer = m["layers"][lid]
+    let W = layer["weights"]
+    let bias = layer["bias"]
+    let D = m["D"]
+
+    let mut output = ofl_zeros(D)
+    for i in 0..D {
+        let mut s = bias[i]
+        for j in 0..D {
+            s = s + W[i][j] * input[j]
+        }
+        output[i] = ofl_tanh(s)
+    }
+
+    // store KV cache entry for this layer (simulated)
+    let mut kv = m["kv_cache"]
+    kv[lid] = #{"keys": input, "values": output, "location": "gpu"}
+
+    let mut m2 = #{
+        "n_layers": m["n_layers"],
+        "D": D,
+        "max_gpu_layers": m["max_gpu_layers"],
+        "layers": m["layers"],
+        "gpu_resident": m["gpu_resident"],
+        "kv_cache": kv,
+        "gpu_mem_used": m["gpu_mem_used"],
+        "cpu_mem_used": m["cpu_mem_used"],
+        "seed": m["seed"]
+    }
+
+    return [m2, output]
+}
+
+// ---------------------------------------------------------------
+//  ofl_offload_kv -- move a layer's KV cache from GPU to CPU
+// ---------------------------------------------------------------
+fn ofl_offload_kv(mgr, layer_id) {
+    let lid = str(layer_id)
+    let mut kv = mgr["kv_cache"]
+    let entry = kv[lid]
+    kv[lid] = #{"keys": entry["keys"], "values": entry["values"], "location": "cpu"}
+    return #{
+        "n_layers": mgr["n_layers"],
+        "D": mgr["D"],
+        "max_gpu_layers": mgr["max_gpu_layers"],
+        "layers": mgr["layers"],
+        "gpu_resident": mgr["gpu_resident"],
+        "kv_cache": kv,
+        "gpu_mem_used": mgr["gpu_mem_used"],
+        "cpu_mem_used": mgr["cpu_mem_used"],
+        "seed": mgr["seed"]
+    }
+}
+
+// ---------------------------------------------------------------
+//  ofl_forward_all -- pipeline forward through all layers
+//    with prefetch: while computing layer i, load layer i+1
+//    After a layer completes, offload its KV to CPU.
+//    Returns [mgr, output]
+// ---------------------------------------------------------------
+@pure
+fn ofl_forward_all(mgr, input) {
+    let n = mgr["n_layers"]
+    let mut m = mgr
+    let mut x = input
+
+    for i in 0..n {
+        // prefetch next layer (if exists) before computing current
+        if i + 1 < n {
+            if ofl_is_on_gpu(m, i + 1) == false {
+                m = ofl_load_to_gpu(m, i + 1)
+            }
+        }
+
+        // forward current layer
+        let result = ofl_forward_layer(m, i, x)
+        m = result[0]
+        x = result[1]
+
+        // offload completed layer's KV cache to CPU
+        m = ofl_offload_kv(m, i)
+
+        // offload layer weights if we need room and layer is done
+        if i + 1 < n {
+            // offload layer i to make room for future layers
+            if len(m["gpu_resident"]) >= m["max_gpu_layers"] {
+                m = ofl_offload_to_cpu(m, i)
+            }
+        }
+    }
+
+    return [m, x]
+}
+
+// ---------------------------------------------------------------
+//  ofl_memory_usage -- return GPU/CPU memory usage + budget
+// ---------------------------------------------------------------
+@pure
+fn ofl_memory_usage(mgr) {
+    let D = mgr["D"]
+    let budget = mgr["max_gpu_layers"] * (D * D + D)
+    return #{
+        "gpu_used": mgr["gpu_mem_used"],
+        "cpu_used": mgr["cpu_mem_used"],
+        "budget": budget
+    }
+}
+
+// ---------------------------------------------------------------
+//  ofl_train_step -- simple gradient descent on all layers
+//    Loss = 0.5 * ||forward(x) - y||^2
+//    Numerical gradient via finite differences (epsilon=1e-4)
+//    for each weight, nudge and measure loss change.
+//    Only trains layers one at a time (loads to GPU, trains, offloads).
+// ---------------------------------------------------------------
+@hot
+fn ofl_train_step(mgr, X, Y, lr) {
+    let N = len(X)
+    if N == 0 { return mgr }
+    let D = mgr["D"]
+    let n_layers = mgr["n_layers"]
+    let eps = 0.0001
+
+    // compute base loss
+    let mut base_loss = 0.0
+    for s in 0..N {
+        let res = ofl_forward_all(mgr, X[s])
+        let out = res[1]
+        for d in 0..D {
+            let diff = out[d] - Y[s][d]
+            base_loss = base_loss + 0.5 * diff * diff
+        }
+    }
+    base_loss = base_loss / to_float(N)
+
+    let mut m = mgr
+
+    // train each layer
+    for li in 0..n_layers {
+        let lid = str(li)
+        let layer = m["layers"][lid]
+        let W = layer["weights"]
+        let bias = layer["bias"]
+        let loc = layer["location"]
+
+        let mut W_new = ofl_zeros_2d(D, D)
+        let mut bias_new = ofl_zeros(D)
+
+        // gradient for weights
+        for i in 0..D {
+            for j in 0..D {
+                // perturb W[i][j]
+                let mut W_pert = ofl_zeros_2d(D, D)
+                for ii in 0..D {
+                    for jj in 0..D {
+                        W_pert[ii][jj] = W[ii][jj]
+                    }
+                }
+                W_pert[i][j] = W_pert[i][j] + eps
+
+                // create perturbed manager
+                let mut layers_pert = m["layers"]
+                layers_pert[lid] = #{"weights": W_pert, "bias": bias, "location": loc}
+                let m_pert = #{
+                    "n_layers": n_layers,
+                    "D": D,
+                    "max_gpu_layers": m["max_gpu_layers"],
+                    "layers": layers_pert,
+                    "gpu_resident": m["gpu_resident"],
+                    "kv_cache": m["kv_cache"],
+                    "gpu_mem_used": m["gpu_mem_used"],
+                    "cpu_mem_used": m["cpu_mem_used"],
+                    "seed": m["seed"]
+                }
+
+                let mut pert_loss = 0.0
+                for s in 0..N {
+                    let res = ofl_forward_all(m_pert, X[s])
+                    let out = res[1]
+                    for d in 0..D {
+                        let diff = out[d] - Y[s][d]
+                        pert_loss = pert_loss + 0.5 * diff * diff
+                    }
+                }
+                pert_loss = pert_loss / to_float(N)
+
+                let grad = (pert_loss - base_loss) / eps
+                W_new[i][j] = W[i][j] - lr * grad
+            }
+        }
+
+        // gradient for bias
+        for i in 0..D {
+            let mut bias_pert = ofl_zeros(D)
+            for ii in 0..D { bias_pert[ii] = bias[ii] }
+            bias_pert[i] = bias_pert[i] + eps
+
+            let mut layers_pert = m["layers"]
+            layers_pert[lid] = #{"weights": W, "bias": bias_pert, "location": loc}
+            let m_pert = #{
+                "n_layers": n_layers,
+                "D": D,
+                "max_gpu_layers": m["max_gpu_layers"],
+                "layers": layers_pert,
+                "gpu_resident": m["gpu_resident"],
+                "kv_cache": m["kv_cache"],
+                "gpu_mem_used": m["gpu_mem_used"],
+                "cpu_mem_used": m["cpu_mem_used"],
+                "seed": m["seed"]
+            }
+
+            let mut pert_loss = 0.0
+            for s in 0..N {
+                let res = ofl_forward_all(m_pert, X[s])
+                let out = res[1]
+                for d in 0..D {
+                    let diff = out[d] - Y[s][d]
+                    pert_loss = pert_loss + 0.5 * diff * diff
+                }
+            }
+            pert_loss = pert_loss / to_float(N)
+
+            let grad = (pert_loss - base_loss) / eps
+            bias_new[i] = bias[i] - lr * grad
+        }
+
+        // update layer
+        let mut layers_upd = m["layers"]
+        layers_upd[lid] = #{"weights": W_new, "bias": bias_new, "location": loc}
+        m = #{
+            "n_layers": n_layers,
+            "D": D,
+            "max_gpu_layers": m["max_gpu_layers"],
+            "layers": layers_upd,
+            "gpu_resident": m["gpu_resident"],
+            "kv_cache": m["kv_cache"],
+            "gpu_mem_used": m["gpu_mem_used"],
+            "cpu_mem_used": m["cpu_mem_used"],
+            "seed": m["seed"]
+        }
+    }
+
+    return m
+}

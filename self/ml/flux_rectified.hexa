@@ -1,0 +1,813 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/flux_rectified.hexa — FLUX Rectified Flow (#326)
+//
+//  Rectified flow ODE with MMDiT (Multi-Modal Diffusion Transformer)
+//  blocks, as used in Stable Diffusion 3 and FLUX (Black Forest Labs).
+//
+//  Key ideas:
+//    Rectified flow: straight-line ODE from noise (t=0) to data (t=1)
+//      x_t = (1-t)*noise + t*data
+//      velocity target: v = data - noise  (constant along the path)
+//      ODE: dx/dt = v_theta(x_t, t)
+//
+//    MMDiT block: Multi-Modal DiT with separate streams for
+//      image tokens and conditioning (text) tokens, fused via
+//      cross-attention. Simplified here as:
+//        - Self-attention on image stream
+//        - Cross-attention from image queries to text keys/values
+//        - FFN on image stream
+//
+//    Euler integration for sampling:
+//      x_{k+1} = x_k + dt * v_theta(x_k, t_k)
+//
+//  Architecture (simplified MLP-based MMDiT block):
+//    Image stream:  [x_t; t] -> hidden  (self-attn proxy)
+//    Text stream:   cond -> hidden       (cross-attn proxy)
+//    Fused:         concat(img_h, txt_h) -> velocity
+//
+//  API:
+//    flux_init(D_img, D_cond, D_hidden, n_blocks, seed)  -> model
+//    flux_interpolate(noise, data, t)                     -> x_t
+//    flux_target_velocity(noise, data)                    -> v_target
+//    flux_mmdit_block(block, x_t, t, cond)                -> hidden
+//    flux_predict_velocity(model, x_t, t, cond)           -> v_pred
+//    flux_euler_step(model, x_t, t, dt, cond)             -> x_next
+//    flux_sample(model, noise, cond, steps)                -> generated
+//    flux_loss(model, noise, data, t, cond)                -> float
+//    flux_loss_grad(model, noise, data, t, cond)           -> grads
+//    flux_train_step(model, batch, lr)                     -> model
+//    flux_batch_loss(model, batch, t)                      -> float
+//
+//  AI-NATIVE attrs:
+//    @pure  (forward / loss / interpolation)
+//    @hot   (training step)
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Math helpers ──────────────────────────────────────────────────
+
+fn flux_abs(x) { if x < 0.0 { return 0.0 - x } return x }
+
+fn flux_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn flux_tanh(x) {
+    let ep = flux_exp(x)
+    let en = flux_exp(0.0 - x)
+    return (ep - en) / (ep + en)
+}
+
+fn flux_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 0.001 { g = 0.001 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn flux_gelu(x) {
+    // GELU approximation: x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    let c = 0.7978845608  // sqrt(2/pi)
+    let inner = c * (x + 0.044715 * x * x * x)
+    return x * 0.5 * (1.0 + flux_tanh(inner))
+}
+
+fn flux_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn flux_zeros_2d(rows, cols) {
+    let mut m = []
+    for _r in 0..rows {
+        let mut row = []
+        for _c in 0..cols { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+fn flux_lcg(state) {
+    return (state * 1103515245 + 12345) % 2147483648
+}
+
+fn flux_uniform(state) {
+    let s = flux_lcg(state)
+    return [to_float(s) / 2147483648.0, to_float(s)]
+}
+
+// ── Vector helpers ──────────────────────────────────────────────
+
+fn flux_vec_add(a, b) {
+    let n = len(a)
+    let mut out = flux_zeros(n)
+    for i in 0..n { out[i] = a[i] + b[i] }
+    return out
+}
+
+fn flux_vec_sub(a, b) {
+    let n = len(a)
+    let mut out = flux_zeros(n)
+    for i in 0..n { out[i] = a[i] - b[i] }
+    return out
+}
+
+fn flux_vec_scale(v, s) {
+    let n = len(v)
+    let mut out = flux_zeros(n)
+    for i in 0..n { out[i] = v[i] * s }
+    return out
+}
+
+fn flux_dot(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    for i in 0..n { s = s + a[i] * b[i] }
+    return s
+}
+
+fn flux_norm_sq(v) {
+    return flux_dot(v, v)
+}
+
+// ── Matrix-vector multiply ──────────────────────────────────────
+
+fn flux_matvec(W, x, b) {
+    let rows = len(W)
+    let cols = len(W[0])
+    let mut out = flux_zeros(rows)
+    for i in 0..rows {
+        let mut s = b[i]
+        for j in 0..cols {
+            s = s + W[i][j] * x[j]
+        }
+        out[i] = s
+    }
+    return out
+}
+
+// ── Init matrix with Xavier-like random ─────────────────────────
+
+fn flux_init_matrix(rows, cols, state_in) {
+    let mut state = state_in
+    let scale = flux_sqrt(6.0 / to_float(rows + cols))
+    let mut m = flux_zeros_2d(rows, cols)
+    for i in 0..rows {
+        for j in 0..cols {
+            let u = flux_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            m[i][j] = (u[0] - 0.5) * 2.0 * scale
+        }
+    }
+    return #{"matrix": m, "state": state}
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  flux_init — Initialize FLUX Rectified Flow model
+//
+//  D_img    : image token dimension
+//  D_cond   : conditioning (text) dimension
+//  D_hidden : hidden dimension per block
+//  n_blocks : number of MMDiT blocks (simplified as MLP layers)
+//  seed     : RNG seed
+//
+//  Each MMDiT block (simplified):
+//    W_img : D_hidden x (D_img + 1)     image stream + time embedding
+//    b_img : D_hidden
+//    W_cond: D_hidden x D_cond          conditioning stream
+//    b_cond: D_hidden
+//    W_fuse: D_hidden x (D_hidden * 2)  fuse image + cond hidden
+//    b_fuse: D_hidden
+//
+//  Output head:
+//    W_out : D_img x D_hidden
+//    b_out : D_img
+// ═══════════════════════════════════════════════════════════════════
+fn flux_init(D_img, D_cond, D_hidden, n_blocks, seed) {
+    let mut state = seed
+    if state <= 0 { state = 1 }
+
+    let img_in = D_img + 1  // concat time
+
+    let mut blocks = []
+    for _b in 0..n_blocks {
+        // Image stream weights
+        let r1 = flux_init_matrix(D_hidden, img_in, state)
+        state = r1["state"]
+        let W_img = r1["matrix"]
+        let b_img = flux_zeros(D_hidden)
+
+        // Conditioning stream weights
+        let r2 = flux_init_matrix(D_hidden, D_cond, state)
+        state = r2["state"]
+        let W_cond = r2["matrix"]
+        let b_cond = flux_zeros(D_hidden)
+
+        // Fusion layer: takes concatenated hidden [img_h; cond_h]
+        let fuse_in = D_hidden * 2
+        let r3 = flux_init_matrix(D_hidden, fuse_in, state)
+        state = r3["state"]
+        let W_fuse = r3["matrix"]
+        let b_fuse = flux_zeros(D_hidden)
+
+        blocks = blocks + [#{
+            "W_img": W_img,
+            "b_img": b_img,
+            "W_cond": W_cond,
+            "b_cond": b_cond,
+            "W_fuse": W_fuse,
+            "b_fuse": b_fuse
+        }]
+    }
+
+    // Output head: D_hidden -> D_img
+    let r_out = flux_init_matrix(D_img, D_hidden, state)
+    state = r_out["state"]
+    let W_out = r_out["matrix"]
+    let b_out = flux_zeros(D_img)
+
+    return #{
+        "D_img": D_img,
+        "D_cond": D_cond,
+        "D_hidden": D_hidden,
+        "n_blocks": n_blocks,
+        "blocks": blocks,
+        "W_out": W_out,
+        "b_out": b_out,
+        "rng_state": state
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  flux_interpolate — Rectified flow linear interpolation
+//    x_t = (1-t)*noise + t*data
+//    (noise at t=0, data at t=1)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn flux_interpolate(noise, data, t) {
+    let D = len(noise)
+    let mut xt = flux_zeros(D)
+    for i in 0..D {
+        xt[i] = (1.0 - t) * noise[i] + t * data[i]
+    }
+    return xt
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  flux_target_velocity — Straight-line target
+//    v = data - noise  (constant along the OT path)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn flux_target_velocity(noise, data) {
+    return flux_vec_sub(data, noise)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  flux_mmdit_block — Single simplified MMDiT block
+//
+//    Image stream:  h_img  = gelu( W_img * [x_t; t] + b_img )
+//    Cond stream:   h_cond = gelu( W_cond * cond + b_cond )
+//    Fusion:        h_fuse = tanh( W_fuse * [h_img; h_cond] + b_fuse )
+//
+//  Returns the fused hidden state.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn flux_mmdit_block(block, x_t, t, cond) {
+    let D_img = len(x_t)
+    let D_hidden = len(block["b_img"])
+    let D_cond = len(cond)
+
+    // Build image input: [x_t; t]
+    let img_in = D_img + 1
+    let mut img_input = flux_zeros(img_in)
+    for i in 0..D_img { img_input[i] = x_t[i] }
+    img_input[D_img] = t
+
+    // Image stream
+    let mut h_img = flux_matvec(block["W_img"], img_input, block["b_img"])
+    for i in 0..D_hidden { h_img[i] = flux_gelu(h_img[i]) }
+
+    // Conditioning stream
+    let mut h_cond = flux_matvec(block["W_cond"], cond, block["b_cond"])
+    for i in 0..D_hidden { h_cond[i] = flux_gelu(h_cond[i]) }
+
+    // Fusion: concatenate [h_img; h_cond]
+    let fuse_in = D_hidden * 2
+    let mut fuse_input = flux_zeros(fuse_in)
+    for i in 0..D_hidden { fuse_input[i] = h_img[i] }
+    for i in 0..D_hidden { fuse_input[D_hidden + i] = h_cond[i] }
+
+    let mut h_fuse = flux_matvec(block["W_fuse"], fuse_input, block["b_fuse"])
+    for i in 0..D_hidden { h_fuse[i] = flux_tanh(h_fuse[i]) }
+
+    return h_fuse
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  flux_predict_velocity — Full forward pass through all blocks
+//    Run MMDiT blocks sequentially, each refining the hidden state.
+//    For blocks beyond the first, we use the previous block's output
+//    as a residual-added "image" embedding projected back to D_img.
+//    Final output head maps hidden -> velocity in image space.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn flux_predict_velocity(model, x_t, t, cond) {
+    let n_blocks = model["n_blocks"]
+    let D_hidden = model["D_hidden"]
+    let D_img = model["D_img"]
+    let blocks = model["blocks"]
+
+    // First block gets the raw x_t
+    let mut h = flux_mmdit_block(blocks[0], x_t, t, cond)
+
+    // Subsequent blocks: use h as additional context
+    // Project h back to image dim via simple truncation/padding + residual
+    for b in 1..n_blocks {
+        // Create a pseudo image-input from h (take first D_img dims + residual)
+        let mut x_refined = flux_zeros(D_img)
+        for i in 0..D_img {
+            if i < D_hidden {
+                x_refined[i] = x_t[i] + h[i] * 0.1
+            } else {
+                x_refined[i] = x_t[i]
+            }
+        }
+        h = flux_mmdit_block(blocks[b], x_refined, t, cond)
+    }
+
+    // Output head: h -> velocity
+    let v = flux_matvec(model["W_out"], h, model["b_out"])
+    return v
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  flux_euler_step — Single Euler ODE step
+//    x_next = x_t + dt * v_theta(x_t, t, cond)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn flux_euler_step(model, x_t, t, dt, cond) {
+    let v = flux_predict_velocity(model, x_t, t, cond)
+    let D = len(x_t)
+    let mut x_next = flux_zeros(D)
+    for i in 0..D {
+        x_next[i] = x_t[i] + dt * v[i]
+    }
+    return x_next
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  flux_sample — Multi-step Euler ODE integration
+//    Starting from noise at t=0, integrate to t=1 (data).
+//    t_k = k / steps
+//    x_{k+1} = x_k + (1/steps) * v_theta(x_k, t_k, cond)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn flux_sample(model, noise, cond, steps) {
+    if steps <= 0 { return noise }
+    let D = len(noise)
+    let dt = 1.0 / to_float(steps)
+    let mut x = flux_zeros(D)
+    for i in 0..D { x[i] = noise[i] }
+    for k in 0..steps {
+        let t = to_float(k) / to_float(steps)
+        x = flux_euler_step(model, x, t, dt, cond)
+    }
+    return x
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  flux_loss — Rectified flow MSE loss
+//    L = (1/D) * ||v_theta(x_t, t, cond) - (data - noise)||^2
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn flux_loss(model, noise, data, t, cond) {
+    let x_t = flux_interpolate(noise, data, t)
+    let v_pred = flux_predict_velocity(model, x_t, t, cond)
+    let v_target = flux_target_velocity(noise, data)
+    let D = len(noise)
+    let mut mse = 0.0
+    for i in 0..D {
+        let diff = v_pred[i] - v_target[i]
+        mse = mse + diff * diff
+    }
+    return mse / to_float(D)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  flux_loss_grad — Loss + gradients via manual backprop
+//
+//  For simplicity, we only backprop through a single-block model
+//  (uses block[0] + output head). This is sufficient for training
+//  to demonstrate loss decrease.
+//
+//  Forward (single block):
+//    img_input = [x_t; t]                   (D_img + 1)
+//    pre_img   = W_img * img_input + b_img  (D_hidden)
+//    h_img     = gelu(pre_img)
+//    pre_cond  = W_cond * cond + b_cond     (D_hidden)
+//    h_cond    = gelu(pre_cond)
+//    fuse_in   = [h_img; h_cond]            (D_hidden * 2)
+//    pre_fuse  = W_fuse * fuse_in + b_fuse  (D_hidden)
+//    h         = tanh(pre_fuse)
+//    v         = W_out * h + b_out          (D_img)
+//    loss      = (1/D) * ||v - v_target||^2
+//
+//  Backward:
+//    dv = 2/D * (v - v_target)
+//    dW_out, db_out from dv
+//    dh from dv through W_out
+//    dpre_fuse = dh * (1 - h^2)
+//    dW_fuse, db_fuse, dfuse_in from dpre_fuse
+//    dh_img, dh_cond from dfuse_in
+//    dpre_img = dh_img * gelu'(pre_img)
+//    dW_img, db_img from dpre_img
+// ═══════════════════════════════════════════════════════════════════
+fn flux_loss_grad(model, noise, data, t, cond) {
+    let D_img = model["D_img"]
+    let D_cond = model["D_cond"]
+    let D_hidden = model["D_hidden"]
+    let block = model["blocks"][0]
+    let W_img = block["W_img"]
+    let b_img = block["b_img"]
+    let W_cond = block["W_cond"]
+    let b_cond = block["b_cond"]
+    let W_fuse = block["W_fuse"]
+    let b_fuse = block["b_fuse"]
+    let W_out = model["W_out"]
+    let b_out = model["b_out"]
+
+    let img_in_dim = D_img + 1
+    let fuse_in_dim = D_hidden * 2
+
+    // ── forward ──
+    let x_t = flux_interpolate(noise, data, t)
+    let v_target = flux_target_velocity(noise, data)
+
+    // Build image input
+    let mut img_input = flux_zeros(img_in_dim)
+    for i in 0..D_img { img_input[i] = x_t[i] }
+    img_input[D_img] = t
+
+    // Image stream
+    let mut pre_img = flux_matvec(W_img, img_input, b_img)
+    let mut h_img = flux_zeros(D_hidden)
+    for i in 0..D_hidden { h_img[i] = flux_gelu(pre_img[i]) }
+
+    // Cond stream
+    let mut pre_cond = flux_matvec(W_cond, cond, b_cond)
+    let mut h_cond = flux_zeros(D_hidden)
+    for i in 0..D_hidden { h_cond[i] = flux_gelu(pre_cond[i]) }
+
+    // Fusion
+    let mut fuse_input = flux_zeros(fuse_in_dim)
+    for i in 0..D_hidden { fuse_input[i] = h_img[i] }
+    for i in 0..D_hidden { fuse_input[D_hidden + i] = h_cond[i] }
+
+    let mut pre_fuse = flux_matvec(W_fuse, fuse_input, b_fuse)
+    let mut h = flux_zeros(D_hidden)
+    for i in 0..D_hidden { h[i] = flux_tanh(pre_fuse[i]) }
+
+    // Output
+    let mut v = flux_matvec(W_out, h, b_out)
+
+    // ── loss ──
+    let mut loss = 0.0
+    for i in 0..D_img {
+        let diff = v[i] - v_target[i]
+        loss = loss + diff * diff
+    }
+    loss = loss / to_float(D_img)
+
+    // ── backward ──
+    // dv
+    let mut dv = flux_zeros(D_img)
+    for i in 0..D_img {
+        dv[i] = 2.0 * (v[i] - v_target[i]) / to_float(D_img)
+    }
+
+    // dW_out, db_out
+    let mut dW_out = flux_zeros_2d(D_img, D_hidden)
+    let mut db_out = flux_zeros(D_img)
+    for i in 0..D_img {
+        db_out[i] = dv[i]
+        for j in 0..D_hidden {
+            dW_out[i][j] = dv[i] * h[j]
+        }
+    }
+
+    // dh (from output layer)
+    let mut dh = flux_zeros(D_hidden)
+    for j in 0..D_hidden {
+        let mut s = 0.0
+        for i in 0..D_img { s = s + dv[i] * W_out[i][j] }
+        dh[j] = s
+    }
+
+    // dpre_fuse = dh * (1 - h^2) [tanh derivative]
+    let mut dpre_fuse = flux_zeros(D_hidden)
+    for i in 0..D_hidden {
+        dpre_fuse[i] = dh[i] * (1.0 - h[i] * h[i])
+    }
+
+    // dW_fuse, db_fuse
+    let mut dW_fuse = flux_zeros_2d(D_hidden, fuse_in_dim)
+    let mut db_fuse = flux_zeros(D_hidden)
+    for i in 0..D_hidden {
+        db_fuse[i] = dpre_fuse[i]
+        for j in 0..fuse_in_dim {
+            dW_fuse[i][j] = dpre_fuse[i] * fuse_input[j]
+        }
+    }
+
+    // dfuse_input -> dh_img, dh_cond
+    let mut dfuse_input = flux_zeros(fuse_in_dim)
+    for j in 0..fuse_in_dim {
+        let mut s = 0.0
+        for i in 0..D_hidden { s = s + dpre_fuse[i] * W_fuse[i][j] }
+        dfuse_input[j] = s
+    }
+    let mut dh_img = flux_zeros(D_hidden)
+    let mut dh_cond = flux_zeros(D_hidden)
+    for i in 0..D_hidden {
+        dh_img[i] = dfuse_input[i]
+        dh_cond[i] = dfuse_input[D_hidden + i]
+    }
+
+    // dpre_img = dh_img * gelu'(pre_img)
+    // gelu'(x) ~ 0.5*(1+tanh(c*(x+0.044715*x^3))) + x*0.5*(1-tanh^2(...))*c*(1+3*0.044715*x^2)
+    // Simplified: use numeric approximation gelu'(x) ~ (gelu(x+eps) - gelu(x-eps))/(2*eps)
+    let mut dpre_img = flux_zeros(D_hidden)
+    let eps = 1.0e-4
+    for i in 0..D_hidden {
+        let gelu_deriv = (flux_gelu(pre_img[i] + eps) - flux_gelu(pre_img[i] - eps)) / (2.0 * eps)
+        dpre_img[i] = dh_img[i] * gelu_deriv
+    }
+
+    // dW_img, db_img
+    let mut dW_img = flux_zeros_2d(D_hidden, img_in_dim)
+    let mut db_img = flux_zeros(D_hidden)
+    for i in 0..D_hidden {
+        db_img[i] = dpre_img[i]
+        for j in 0..img_in_dim {
+            dW_img[i][j] = dpre_img[i] * img_input[j]
+        }
+    }
+
+    // dpre_cond (same gelu derivative pattern)
+    let mut dpre_cond = flux_zeros(D_hidden)
+    for i in 0..D_hidden {
+        let gelu_deriv = (flux_gelu(pre_cond[i] + eps) - flux_gelu(pre_cond[i] - eps)) / (2.0 * eps)
+        dpre_cond[i] = dh_cond[i] * gelu_deriv
+    }
+
+    // dW_cond, db_cond
+    let mut dW_cond = flux_zeros_2d(D_hidden, D_cond)
+    let mut db_cond = flux_zeros(D_hidden)
+    for i in 0..D_hidden {
+        db_cond[i] = dpre_cond[i]
+        for j in 0..D_cond {
+            dW_cond[i][j] = dpre_cond[i] * cond[j]
+        }
+    }
+
+    return #{
+        "loss": loss,
+        "dW_img": dW_img,
+        "db_img": db_img,
+        "dW_cond": dW_cond,
+        "db_cond": db_cond,
+        "dW_fuse": dW_fuse,
+        "db_fuse": db_fuse,
+        "dW_out": dW_out,
+        "db_out": db_out
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  flux_train_step — Mini-batch SGD
+//    batch: list of #{"data": [...], "cond": [...]}
+//    Generates random noise + time per sample, computes loss+grad
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn flux_train_step(model, batch, lr) {
+    let D_img = model["D_img"]
+    let D_cond = model["D_cond"]
+    let D_hidden = model["D_hidden"]
+    let n_blocks = model["n_blocks"]
+    let blocks = model["blocks"]
+    let W_out = model["W_out"]
+    let b_out = model["b_out"]
+    let mut rng = model["rng_state"]
+
+    let img_in_dim = D_img + 1
+    let fuse_in_dim = D_hidden * 2
+    let N = len(batch)
+    if N == 0 { return model }
+
+    // Accumulators for block[0] gradients
+    let mut gW_img = flux_zeros_2d(D_hidden, img_in_dim)
+    let mut gb_img = flux_zeros(D_hidden)
+    let mut gW_cond = flux_zeros_2d(D_hidden, D_cond)
+    let mut gb_cond = flux_zeros(D_hidden)
+    let mut gW_fuse = flux_zeros_2d(D_hidden, fuse_in_dim)
+    let mut gb_fuse = flux_zeros(D_hidden)
+    let mut gW_out = flux_zeros_2d(D_img, D_hidden)
+    let mut gb_out = flux_zeros(D_img)
+
+    for n in 0..N {
+        let data = batch[n]["data"]
+        let cond = batch[n]["cond"]
+
+        // Generate noise
+        let mut noise = flux_zeros(D_img)
+        for d in 0..D_img {
+            let u = flux_uniform(rng)
+            rng = int(u[1])
+            if rng <= 0 { rng = 1 }
+            noise[d] = (u[0] - 0.5) * 2.0
+        }
+
+        // Random time
+        let tu = flux_uniform(rng)
+        rng = int(tu[1])
+        if rng <= 0 { rng = 1 }
+        let mut t = tu[0]
+        if t < 0.01 { t = 0.01 }
+        if t > 0.99 { t = 0.99 }
+
+        let grads = flux_loss_grad(model, noise, data, t, cond)
+
+        // Accumulate
+        let dW_img = grads["dW_img"]
+        let db_img_g = grads["db_img"]
+        let dW_cond = grads["dW_cond"]
+        let db_cond_g = grads["db_cond"]
+        let dW_fuse = grads["dW_fuse"]
+        let db_fuse_g = grads["db_fuse"]
+        let dW_out_g = grads["dW_out"]
+        let db_out_g = grads["db_out"]
+
+        for i in 0..D_hidden {
+            gb_img[i] = gb_img[i] + db_img_g[i]
+            for j in 0..img_in_dim {
+                gW_img[i][j] = gW_img[i][j] + dW_img[i][j]
+            }
+            gb_cond[i] = gb_cond[i] + db_cond_g[i]
+            for j in 0..D_cond {
+                gW_cond[i][j] = gW_cond[i][j] + dW_cond[i][j]
+            }
+            gb_fuse[i] = gb_fuse[i] + db_fuse_g[i]
+            for j in 0..fuse_in_dim {
+                gW_fuse[i][j] = gW_fuse[i][j] + dW_fuse[i][j]
+            }
+        }
+        for i in 0..D_img {
+            gb_out[i] = gb_out[i] + db_out_g[i]
+            for j in 0..D_hidden {
+                gW_out[i][j] = gW_out[i][j] + dW_out_g[i][j]
+            }
+        }
+    }
+
+    // Apply averaged gradients
+    let inv_n = 1.0 / to_float(N)
+
+    // Update block[0]
+    let block0 = blocks[0]
+    let mut W_img_new = flux_zeros_2d(D_hidden, img_in_dim)
+    let mut b_img_new = flux_zeros(D_hidden)
+    let mut W_cond_new = flux_zeros_2d(D_hidden, D_cond)
+    let mut b_cond_new = flux_zeros(D_hidden)
+    let mut W_fuse_new = flux_zeros_2d(D_hidden, fuse_in_dim)
+    let mut b_fuse_new = flux_zeros(D_hidden)
+
+    for i in 0..D_hidden {
+        b_img_new[i] = block0["b_img"][i] - lr * gb_img[i] * inv_n
+        for j in 0..img_in_dim {
+            W_img_new[i][j] = block0["W_img"][i][j] - lr * gW_img[i][j] * inv_n
+        }
+        b_cond_new[i] = block0["b_cond"][i] - lr * gb_cond[i] * inv_n
+        for j in 0..D_cond {
+            W_cond_new[i][j] = block0["W_cond"][i][j] - lr * gW_cond[i][j] * inv_n
+        }
+        b_fuse_new[i] = block0["b_fuse"][i] - lr * gb_fuse[i] * inv_n
+        for j in 0..fuse_in_dim {
+            W_fuse_new[i][j] = block0["W_fuse"][i][j] - lr * gW_fuse[i][j] * inv_n
+        }
+    }
+
+    let new_block0 = #{
+        "W_img": W_img_new,
+        "b_img": b_img_new,
+        "W_cond": W_cond_new,
+        "b_cond": b_cond_new,
+        "W_fuse": W_fuse_new,
+        "b_fuse": b_fuse_new
+    }
+
+    // Rebuild blocks list (block[0] updated, rest unchanged)
+    let mut new_blocks = [new_block0]
+    for b in 1..n_blocks {
+        new_blocks = new_blocks + [blocks[b]]
+    }
+
+    // Update output head
+    let mut W_out_new = flux_zeros_2d(D_img, D_hidden)
+    let mut b_out_new = flux_zeros(D_img)
+    for i in 0..D_img {
+        b_out_new[i] = b_out[i] - lr * gb_out[i] * inv_n
+        for j in 0..D_hidden {
+            W_out_new[i][j] = W_out[i][j] - lr * gW_out[i][j] * inv_n
+        }
+    }
+
+    return #{
+        "D_img": D_img,
+        "D_cond": D_cond,
+        "D_hidden": D_hidden,
+        "n_blocks": n_blocks,
+        "blocks": new_blocks,
+        "W_out": W_out_new,
+        "b_out": b_out_new,
+        "rng_state": rng
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  flux_batch_loss — Average loss over a dataset
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn flux_batch_loss(model, batch, t) {
+    let N = len(batch)
+    if N == 0 { return 0.0 }
+    let D_img = model["D_img"]
+    let mut total = 0.0
+    let mut rng = model["rng_state"]
+    for n in 0..N {
+        let data = batch[n]["data"]
+        let cond = batch[n]["cond"]
+        let mut noise = flux_zeros(D_img)
+        for d in 0..D_img {
+            let u = flux_uniform(rng)
+            rng = int(u[1])
+            if rng <= 0 { rng = 1 }
+            noise[d] = (u[0] - 0.5) * 2.0
+        }
+        total = total + flux_loss(model, noise, data, t, cond)
+    }
+    return total / to_float(N)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  flux_guidance_sample — Classifier-free guidance sampling
+//    v_guided = v_uncond + w * (v_cond - v_uncond)
+//    Uses null conditioning (zeros) as unconditioned signal
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn flux_guidance_sample(model, noise, cond, steps, w) {
+    if steps <= 0 { return noise }
+    let D = len(noise)
+    let D_cond = model["D_cond"]
+    let dt = 1.0 / to_float(steps)
+    let null_cond = flux_zeros(D_cond)
+    let mut x = flux_zeros(D)
+    for i in 0..D { x[i] = noise[i] }
+    for k in 0..steps {
+        let t = to_float(k) / to_float(steps)
+        let v_cond = flux_predict_velocity(model, x, t, cond)
+        let v_uncond = flux_predict_velocity(model, x, t, null_cond)
+        for i in 0..D {
+            let v_guided = v_uncond[i] + w * (v_cond[i] - v_uncond[i])
+            x[i] = x[i] + dt * v_guided
+        }
+    }
+    return x
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  flux_time_schedule — Uniform time schedule for sampling
+//    Returns [t_0, t_1, ..., t_steps] with t_0=0, t_steps=1
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn flux_time_schedule(steps) {
+    let mut schedule = []
+    for k in 0..steps {
+        schedule = schedule + [to_float(k) / to_float(steps)]
+    }
+    schedule = schedule + [1.0]
+    return schedule
+}

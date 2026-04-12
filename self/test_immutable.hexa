@@ -1,0 +1,1057 @@
+// =====================================================================
+//  test_immutable.hexa -- ROI #69 @immutable field caching tests
+//
+//  Verifies that @immutable attribute correctly caches repeated
+//  field accesses into local variables, eliminating redundant loads.
+//
+//  Tests (22):
+//    1. Basic repeated field access caching
+//    2. Two fields on same struct cached
+//    3. Field used in arithmetic
+//    4. Field used in conditional
+//    5. Field used in loop
+//    6. Field used in nested expression
+//    7. Single access (no caching needed)
+//    8. Field in return position
+//    9. Multiple structs, different bases
+//   10. Field access in function call arg
+//   11. Field used in comparison
+//   12. Field cached across if/else branches
+//   13. Field in while condition
+//   14. Three accesses to same field
+//   15. Field combined with local var
+//   16. Two functions both @immutable
+//   17. Field in index expression
+//   18. Deep field count (4+ reads)
+//   19. Mixed mutable and immutable access
+//   20. @immutable with accumulator pattern
+//   21. @immutable with string fields
+//   22. @immutable no-op (unique field reads)
+//
+//  Run: ./hexa test self/test_immutable.hexa
+// =====================================================================
+
+// -- Self-contained: no import needed --
+
+struct AstNode {
+    kind: string,
+    name: string,
+    value: string,
+    op: string,
+    left: string,
+    right: string,
+    cond: string,
+    then_body: string,
+    else_body: string,
+    params: string,
+    body: string,
+    args: string,
+    fields: string,
+    items: string,
+    variants: string,
+    arms: string,
+    iter_expr: string,
+    ret_type: string,
+    target: string,
+    trait_name: string,
+    methods: string
+}
+
+// -- Metrics --
+let mut m980_immutable_ok = 0
+let mut m980_immutable_cached = 0
+let mut m980_immutable_violations = 0
+
+// -- anp_split_dot: "base.field" -> ["base", "field"] --
+fn anp_split_dot(s) {
+    let mut i = 0
+    while i < len(s) {
+        if to_string(s[i]) == "." {
+            return [s.substring(0, i), s.substring(i + 1, len(s))]
+        }
+        i = i + 1
+    }
+    return [s]
+}
+
+// -- anp_count_field_reads: walk expr tree, count FieldAccess reads --
+fn anp_count_field_reads_expr(expr, counts) {
+    if type_of(expr) == "string" { return counts }
+    let k = expr.kind
+    if k == "FieldAccess" {
+        if type_of(expr.left) != "string" && expr.left.kind == "Ident" {
+            let key = expr.left.name + "." + expr.name
+            let mut found = false
+            let mut ci = 0
+            while ci < len(counts) {
+                if counts[ci][0] == key {
+                    counts[ci] = [key, counts[ci][1] + 1]
+                    found = true
+                }
+                ci = ci + 1
+            }
+            if !found {
+                counts = counts + [[key, 1]]
+            }
+        }
+        return counts
+    }
+    if k == "BinOp" {
+        counts = anp_count_field_reads_expr(expr.left, counts)
+        counts = anp_count_field_reads_expr(expr.right, counts)
+        return counts
+    }
+    if k == "Call" {
+        counts = anp_count_field_reads_expr(expr.left, counts)
+        if type_of(expr.args) == "array" {
+            let mut ai = 0
+            while ai < len(expr.args) {
+                counts = anp_count_field_reads_expr(expr.args[ai], counts)
+                ai = ai + 1
+            }
+        }
+        return counts
+    }
+    if k == "Index" {
+        counts = anp_count_field_reads_expr(expr.left, counts)
+        counts = anp_count_field_reads_expr(expr.right, counts)
+        return counts
+    }
+    if k == "Ident" || k == "IntLit" || k == "FloatLit" || k == "StringLit" {
+        return counts
+    }
+    return counts
+}
+
+fn anp_count_field_reads_stmt(stmt, counts) {
+    if type_of(stmt) == "string" { return counts }
+    let k = stmt.kind
+    if k == "LetStmt" || k == "LetMutStmt" {
+        counts = anp_count_field_reads_expr(stmt.left, counts)
+        return counts
+    }
+    if k == "ReturnStmt" {
+        counts = anp_count_field_reads_expr(stmt.left, counts)
+        return counts
+    }
+    if k == "AssignStmt" {
+        // LHS field write: skip the LHS FieldAccess itself, only count RHS
+        counts = anp_count_field_reads_expr(stmt.right, counts)
+        // If LHS is an Ident (simple assignment), also walk it... no, skip
+        // If LHS is a FieldAccess, that's a write, don't count it
+        if type_of(stmt.left) != "string" && stmt.left.kind != "FieldAccess" {
+            counts = anp_count_field_reads_expr(stmt.left, counts)
+        }
+        return counts
+    }
+    if k == "ExprStmt" {
+        counts = anp_count_field_reads_expr(stmt.left, counts)
+        return counts
+    }
+    if k == "IfStmt" {
+        counts = anp_count_field_reads_expr(stmt.cond, counts)
+        if type_of(stmt.then_body) == "array" {
+            counts = anp_count_field_reads_body(stmt.then_body, counts)
+        }
+        if type_of(stmt.else_body) == "array" {
+            counts = anp_count_field_reads_body(stmt.else_body, counts)
+        }
+        return counts
+    }
+    if k == "WhileStmt" {
+        counts = anp_count_field_reads_expr(stmt.cond, counts)
+        if type_of(stmt.body) == "array" {
+            counts = anp_count_field_reads_body(stmt.body, counts)
+        }
+        return counts
+    }
+    return counts
+}
+
+fn anp_count_field_reads_body(body, counts) {
+    let mut i = 0
+    while i < len(body) {
+        counts = anp_count_field_reads_stmt(body[i], counts)
+        i = i + 1
+    }
+    return counts
+}
+
+// -- anp_detect_immutable: find repeated field accesses in @immutable fn --
+fn anp_detect_immutable(fn_node) {
+    if type_of(fn_node) == "string" { return [] }
+    if fn_node.kind != "FnDecl" { return [] }
+    let attrs = fn_node.value
+    if type_of(attrs) == "string" {
+        if attrs != "immutable" { return [] }
+    }
+    let body = fn_node.body
+    if type_of(body) != "array" { return [] }
+    let counts = anp_count_field_reads_body(body, [])
+    // Filter to only those with count >= 2
+    let mut result = []
+    let mut i = 0
+    while i < len(counts) {
+        if counts[i][1] >= 2 {
+            result = result + [counts[i]]
+        }
+        i = i + 1
+    }
+    return result
+}
+
+// -- anp_replace_field_expr: replace FieldAccess(base, field) with Ident(__imm_base_field) --
+fn anp_replace_field_expr(expr, key, cache_name) {
+    if type_of(expr) == "string" { return expr }
+    let k = expr.kind
+    if k == "FieldAccess" {
+        if type_of(expr.left) != "string" && expr.left.kind == "Ident" {
+            let ekey = expr.left.name + "." + expr.name
+            if ekey == key {
+                return AstNode {
+                    kind: "Ident", name: cache_name, value: "", op: "",
+                    left: "", right: "", cond: "", then_body: "", else_body: "",
+                    params: "", body: "", args: "", fields: "", items: "",
+                    variants: "", arms: "", iter_expr: "", ret_type: "",
+                    target: "", trait_name: "", methods: ""
+                }
+            }
+        }
+        return expr
+    }
+    if k == "BinOp" {
+        let nl = anp_replace_field_expr(expr.left, key, cache_name)
+        let nr = anp_replace_field_expr(expr.right, key, cache_name)
+        return AstNode {
+            kind: "BinOp", name: expr.name, value: expr.value, op: expr.op,
+            left: nl, right: nr, cond: expr.cond, then_body: expr.then_body, else_body: expr.else_body,
+            params: expr.params, body: expr.body, args: expr.args, fields: expr.fields, items: expr.items,
+            variants: expr.variants, arms: expr.arms, iter_expr: expr.iter_expr, ret_type: expr.ret_type,
+            target: expr.target, trait_name: expr.trait_name, methods: expr.methods
+        }
+    }
+    if k == "Call" {
+        let nl = anp_replace_field_expr(expr.left, key, cache_name)
+        let mut new_args = []
+        if type_of(expr.args) == "array" {
+            let mut ai = 0
+            while ai < len(expr.args) {
+                new_args = new_args + [anp_replace_field_expr(expr.args[ai], key, cache_name)]
+                ai = ai + 1
+            }
+        }
+        return AstNode {
+            kind: "Call", name: expr.name, value: expr.value, op: expr.op,
+            left: nl, right: expr.right, cond: expr.cond, then_body: expr.then_body, else_body: expr.else_body,
+            params: expr.params, body: expr.body, args: new_args, fields: expr.fields, items: expr.items,
+            variants: expr.variants, arms: expr.arms, iter_expr: expr.iter_expr, ret_type: expr.ret_type,
+            target: expr.target, trait_name: expr.trait_name, methods: expr.methods
+        }
+    }
+    if k == "Index" {
+        let nl = anp_replace_field_expr(expr.left, key, cache_name)
+        let nr = anp_replace_field_expr(expr.right, key, cache_name)
+        return AstNode {
+            kind: "Index", name: expr.name, value: expr.value, op: expr.op,
+            left: nl, right: nr, cond: expr.cond, then_body: expr.then_body, else_body: expr.else_body,
+            params: expr.params, body: expr.body, args: expr.args, fields: expr.fields, items: expr.items,
+            variants: expr.variants, arms: expr.arms, iter_expr: expr.iter_expr, ret_type: expr.ret_type,
+            target: expr.target, trait_name: expr.trait_name, methods: expr.methods
+        }
+    }
+    return expr
+}
+
+fn anp_replace_field_stmt(stmt, key, cache_name) {
+    if type_of(stmt) == "string" { return stmt }
+    let k = stmt.kind
+    if k == "LetStmt" || k == "LetMutStmt" {
+        let nl = anp_replace_field_expr(stmt.left, key, cache_name)
+        return AstNode {
+            kind: k, name: stmt.name, value: stmt.value, op: stmt.op,
+            left: nl, right: stmt.right, cond: stmt.cond, then_body: stmt.then_body, else_body: stmt.else_body,
+            params: stmt.params, body: stmt.body, args: stmt.args, fields: stmt.fields, items: stmt.items,
+            variants: stmt.variants, arms: stmt.arms, iter_expr: stmt.iter_expr, ret_type: stmt.ret_type,
+            target: stmt.target, trait_name: stmt.trait_name, methods: stmt.methods
+        }
+    }
+    if k == "ReturnStmt" {
+        let nl = anp_replace_field_expr(stmt.left, key, cache_name)
+        return AstNode {
+            kind: k, name: stmt.name, value: stmt.value, op: stmt.op,
+            left: nl, right: stmt.right, cond: stmt.cond, then_body: stmt.then_body, else_body: stmt.else_body,
+            params: stmt.params, body: stmt.body, args: stmt.args, fields: stmt.fields, items: stmt.items,
+            variants: stmt.variants, arms: stmt.arms, iter_expr: stmt.iter_expr, ret_type: stmt.ret_type,
+            target: stmt.target, trait_name: stmt.trait_name, methods: stmt.methods
+        }
+    }
+    if k == "AssignStmt" {
+        let nl = anp_replace_field_expr(stmt.left, key, cache_name)
+        let nr = anp_replace_field_expr(stmt.right, key, cache_name)
+        return AstNode {
+            kind: k, name: stmt.name, value: stmt.value, op: stmt.op,
+            left: nl, right: nr, cond: stmt.cond, then_body: stmt.then_body, else_body: stmt.else_body,
+            params: stmt.params, body: stmt.body, args: stmt.args, fields: stmt.fields, items: stmt.items,
+            variants: stmt.variants, arms: stmt.arms, iter_expr: stmt.iter_expr, ret_type: stmt.ret_type,
+            target: stmt.target, trait_name: stmt.trait_name, methods: stmt.methods
+        }
+    }
+    if k == "ExprStmt" {
+        let nl = anp_replace_field_expr(stmt.left, key, cache_name)
+        return AstNode {
+            kind: k, name: stmt.name, value: stmt.value, op: stmt.op,
+            left: nl, right: stmt.right, cond: stmt.cond, then_body: stmt.then_body, else_body: stmt.else_body,
+            params: stmt.params, body: stmt.body, args: stmt.args, fields: stmt.fields, items: stmt.items,
+            variants: stmt.variants, arms: stmt.arms, iter_expr: stmt.iter_expr, ret_type: stmt.ret_type,
+            target: stmt.target, trait_name: stmt.trait_name, methods: stmt.methods
+        }
+    }
+    if k == "IfStmt" {
+        let nc = anp_replace_field_expr(stmt.cond, key, cache_name)
+        let mut nt = stmt.then_body
+        if type_of(stmt.then_body) == "array" {
+            nt = anp_replace_field_body(stmt.then_body, key, cache_name)
+        }
+        let mut ne = stmt.else_body
+        if type_of(stmt.else_body) == "array" {
+            ne = anp_replace_field_body(stmt.else_body, key, cache_name)
+        }
+        return AstNode {
+            kind: k, name: stmt.name, value: stmt.value, op: stmt.op,
+            left: stmt.left, right: stmt.right, cond: nc, then_body: nt, else_body: ne,
+            params: stmt.params, body: stmt.body, args: stmt.args, fields: stmt.fields, items: stmt.items,
+            variants: stmt.variants, arms: stmt.arms, iter_expr: stmt.iter_expr, ret_type: stmt.ret_type,
+            target: stmt.target, trait_name: stmt.trait_name, methods: stmt.methods
+        }
+    }
+    if k == "WhileStmt" {
+        let nc = anp_replace_field_expr(stmt.cond, key, cache_name)
+        let mut nb = stmt.body
+        if type_of(stmt.body) == "array" {
+            nb = anp_replace_field_body(stmt.body, key, cache_name)
+        }
+        return AstNode {
+            kind: k, name: stmt.name, value: stmt.value, op: stmt.op,
+            left: stmt.left, right: stmt.right, cond: nc, then_body: stmt.then_body, else_body: stmt.else_body,
+            params: stmt.params, body: nb, args: stmt.args, fields: stmt.fields, items: stmt.items,
+            variants: stmt.variants, arms: stmt.arms, iter_expr: stmt.iter_expr, ret_type: stmt.ret_type,
+            target: stmt.target, trait_name: stmt.trait_name, methods: stmt.methods
+        }
+    }
+    return stmt
+}
+
+fn anp_replace_field_body(body, key, cache_name) {
+    let mut result = []
+    let mut i = 0
+    while i < len(body) {
+        result = result + [anp_replace_field_stmt(body[i], key, cache_name)]
+        i = i + 1
+    }
+    return result
+}
+
+// -- anp_cache_immutable: rewrite fn body to cache repeated field reads --
+fn anp_cache_immutable(fn_node) {
+    let redundant = anp_detect_immutable(fn_node)
+    if len(redundant) == 0 { return fn_node.body }
+    let mut body = fn_node.body
+    let mut prepend = []
+    let mut ri = 0
+    while ri < len(redundant) {
+        let key = redundant[ri][0]
+        let parts = anp_split_dot(key)
+        let base = parts[0]
+        let field = parts[1]
+        let cache_name = "__imm_" + base + "_" + field
+        // Create: let __imm_base_field = base.field
+        let cache_let = AstNode {
+            kind: "LetStmt", name: cache_name, value: "", op: "",
+            left: AstNode {
+                kind: "FieldAccess", name: field, value: "", op: "",
+                left: AstNode {
+                    kind: "Ident", name: base, value: "", op: "",
+                    left: "", right: "", cond: "", then_body: "", else_body: "",
+                    params: "", body: "", args: "", fields: "", items: "",
+                    variants: "", arms: "", iter_expr: "", ret_type: "",
+                    target: "", trait_name: "", methods: ""
+                }, right: "", cond: "", then_body: "", else_body: "",
+                params: "", body: "", args: "", fields: "", items: "",
+                variants: "", arms: "", iter_expr: "", ret_type: "",
+                target: "", trait_name: "", methods: ""
+            }, right: "", cond: "", then_body: "", else_body: "",
+            params: "", body: "", args: "", fields: "", items: "",
+            variants: "", arms: "", iter_expr: "", ret_type: "",
+            target: "", trait_name: "", methods: ""
+        }
+        prepend = prepend + [cache_let]
+        body = anp_replace_field_body(body, key, cache_name)
+        m980_immutable_cached = m980_immutable_cached + redundant[ri][1]
+        ri = ri + 1
+    }
+    return prepend + body
+}
+
+// -- anp_immutable_pass: process array of FnDecl, optimize @immutable ones --
+fn anp_immutable_pass(ast) {
+    let mut result = []
+    let mut i = 0
+    while i < len(ast) {
+        let node = ast[i]
+        if type_of(node) != "string" && node.kind == "FnDecl" {
+            let attrs = node.value
+            let is_immutable = type_of(attrs) == "string" && attrs == "immutable"
+            if is_immutable {
+                let redundant = anp_detect_immutable(node)
+                if len(redundant) > 0 {
+                    let new_body = anp_cache_immutable(node)
+                    let new_fn = AstNode {
+                        kind: "FnDecl", name: node.name, value: node.value, op: node.op,
+                        left: node.left, right: node.right, cond: node.cond, then_body: node.then_body, else_body: node.else_body,
+                        params: node.params, body: new_body, args: node.args, fields: node.fields, items: node.items,
+                        variants: node.variants, arms: node.arms, iter_expr: node.iter_expr, ret_type: node.ret_type,
+                        target: node.target, trait_name: node.trait_name, methods: node.methods
+                    }
+                    result = result + [new_fn]
+                    m980_immutable_ok = m980_immutable_ok + 1
+                } else {
+                    result = result + [node]
+                    m980_immutable_violations = m980_immutable_violations + 1
+                }
+            } else {
+                result = result + [node]
+            }
+        } else {
+            result = result + [node]
+        }
+        i = i + 1
+    }
+    return result
+}
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn check_eq(name, actual, expected) {
+    if to_string(actual) == to_string(expected) {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name + " -- expected: " + to_string(expected) + ", got: " + to_string(actual))
+        fail_count = fail_count + 1
+    }
+}
+
+println("=====================================================")
+println("  @immutable Field Caching (ROI #69) Tests")
+println("=====================================================")
+println("")
+
+// -- Helper: build AST nodes --
+
+fn mk_ident(n) {
+    return AstNode {
+        kind: "Ident", name: n, value: "", op: "",
+        left: "", right: "", cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+}
+
+fn mk_intlit(v) {
+    return AstNode {
+        kind: "IntLit", name: "", value: to_string(v), op: "",
+        left: "", right: "", cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+}
+
+fn mk_field(base_name, field_name) {
+    return AstNode {
+        kind: "FieldAccess", name: field_name, value: "", op: "",
+        left: mk_ident(base_name), right: "", cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+}
+
+fn mk_binop(op, l, r) {
+    return AstNode {
+        kind: "BinOp", name: "", value: "", op: op,
+        left: l, right: r, cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+}
+
+fn mk_let(n, expr) {
+    return AstNode {
+        kind: "LetStmt", name: n, value: "", op: "",
+        left: expr, right: "", cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+}
+
+fn mk_let_mut(n, expr) {
+    return AstNode {
+        kind: "LetMutStmt", name: n, value: "", op: "",
+        left: expr, right: "", cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+}
+
+fn mk_return(expr) {
+    return AstNode {
+        kind: "ReturnStmt", name: "", value: "", op: "",
+        left: expr, right: "", cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+}
+
+fn mk_assign(n, expr) {
+    return AstNode {
+        kind: "AssignStmt", name: n, value: "", op: "",
+        left: mk_ident(n), right: expr, cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+}
+
+fn mk_param(n) {
+    return AstNode {
+        kind: "Param", name: n, value: "", op: "",
+        left: "", right: "", cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+}
+
+fn mk_fn(name, attrs, params, body) {
+    return AstNode {
+        kind: "FnDecl", name: name, value: attrs, op: "",
+        left: "", right: "", cond: "", then_body: "", else_body: "",
+        params: params, body: body, args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+}
+
+fn mk_if(cond, then_body, else_body) {
+    return AstNode {
+        kind: "IfStmt", name: "", value: "", op: "",
+        left: "", right: "", cond: cond, then_body: then_body, else_body: else_body,
+        params: "", body: "", args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+}
+
+fn mk_while(cond, body) {
+    return AstNode {
+        kind: "WhileStmt", name: "", value: "", op: "",
+        left: "", right: "", cond: cond, then_body: "", else_body: "",
+        params: "", body: body, args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+}
+
+fn mk_call(fname, args) {
+    return AstNode {
+        kind: "Call", name: "", value: "", op: "",
+        left: mk_ident(fname), right: "", cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: args, fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+}
+
+fn mk_exprstmt(expr) {
+    return AstNode {
+        kind: "ExprStmt", name: "", value: "", op: "",
+        left: expr, right: "", cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+}
+
+// =====================================================================
+//  1. Basic repeated field access caching
+// =====================================================================
+println("--- 1. basic repeated field ---")
+// fn f(p) { let a = p.x; let b = p.x; return a + b }
+let t1_body = [
+    mk_let("a", mk_field("p", "x")),
+    mk_let("b", mk_field("p", "x")),
+    mk_return(mk_binop("+", mk_ident("a"), mk_ident("b")))
+]
+let t1_fn = mk_fn("f1", "immutable", [mk_param("p")], t1_body)
+let t1_result = anp_detect_immutable(t1_fn)
+check_eq("t1 detect count", len(t1_result), 1)
+check_eq("t1 detect key", t1_result[0][0], "p.x")
+check_eq("t1 detect reads", t1_result[0][1], 2)
+
+// =====================================================================
+//  2. Two fields on same struct cached
+// =====================================================================
+println("")
+println("--- 2. two fields same struct ---")
+// fn f(p) { let a = p.x + p.y; let b = p.x - p.y; return a * b }
+let t2_body = [
+    mk_let("a", mk_binop("+", mk_field("p", "x"), mk_field("p", "y"))),
+    mk_let("b", mk_binop("-", mk_field("p", "x"), mk_field("p", "y"))),
+    mk_return(mk_binop("*", mk_ident("a"), mk_ident("b")))
+]
+let t2_fn = mk_fn("f2", "immutable", [mk_param("p")], t2_body)
+let t2_result = anp_detect_immutable(t2_fn)
+check_eq("t2 detect count", len(t2_result), 2)
+
+// =====================================================================
+//  3. Field used in arithmetic
+// =====================================================================
+println("")
+println("--- 3. field in arithmetic ---")
+let t3_body = [
+    mk_let("sum", mk_binop("+", mk_field("s", "val"), mk_field("s", "val"))),
+    mk_return(mk_ident("sum"))
+]
+let t3_fn = mk_fn("f3", "immutable", [mk_param("s")], t3_body)
+let t3_result = anp_detect_immutable(t3_fn)
+check_eq("t3 detect key", t3_result[0][0], "s.val")
+check_eq("t3 reads=2", t3_result[0][1], 2)
+
+// =====================================================================
+//  4. Field used in conditional
+// =====================================================================
+println("")
+println("--- 4. field in conditional ---")
+let t4_body = [
+    mk_if(
+        mk_binop(">", mk_field("c", "flag"), mk_intlit(0)),
+        [mk_return(mk_field("c", "flag"))],
+        [mk_return(mk_intlit(0))]
+    )
+]
+let t4_fn = mk_fn("f4", "immutable", [mk_param("c")], t4_body)
+let t4_result = anp_detect_immutable(t4_fn)
+check_eq("t4 detect count", len(t4_result), 1)
+check_eq("t4 reads=2", t4_result[0][1], 2)
+
+// =====================================================================
+//  5. Field used in loop
+// =====================================================================
+println("")
+println("--- 5. field in loop ---")
+let t5_body = [
+    mk_let_mut("i", mk_intlit(0)),
+    mk_let_mut("acc", mk_intlit(0)),
+    mk_while(
+        mk_binop("<", mk_ident("i"), mk_field("d", "n")),
+        [
+            mk_assign("acc", mk_binop("+", mk_ident("acc"), mk_field("d", "n"))),
+            mk_assign("i", mk_binop("+", mk_ident("i"), mk_intlit(1)))
+        ]
+    ),
+    mk_return(mk_ident("acc"))
+]
+let t5_fn = mk_fn("f5", "immutable", [mk_param("d")], t5_body)
+let t5_result = anp_detect_immutable(t5_fn)
+check_eq("t5 detect count", len(t5_result), 1)
+check_eq("t5 key", t5_result[0][0], "d.n")
+check_eq("t5 reads=2", t5_result[0][1], 2)
+
+// =====================================================================
+//  6. Field used in nested expression
+// =====================================================================
+println("")
+println("--- 6. nested expression ---")
+let t6_body = [
+    mk_return(mk_binop("+",
+        mk_binop("*", mk_field("q", "a"), mk_intlit(2)),
+        mk_binop("*", mk_field("q", "a"), mk_intlit(3))
+    ))
+]
+let t6_fn = mk_fn("f6", "immutable", [mk_param("q")], t6_body)
+let t6_result = anp_detect_immutable(t6_fn)
+check_eq("t6 detect count", len(t6_result), 1)
+check_eq("t6 reads=2", t6_result[0][1], 2)
+
+// =====================================================================
+//  7. Single access (no caching needed)
+// =====================================================================
+println("")
+println("--- 7. single access (no cache) ---")
+let t7_body = [
+    mk_return(mk_field("z", "val"))
+]
+let t7_fn = mk_fn("f7", "immutable", [mk_param("z")], t7_body)
+let t7_result = anp_detect_immutable(t7_fn)
+check_eq("t7 no redundant", len(t7_result), 0)
+
+// =====================================================================
+//  8. Field in return position
+// =====================================================================
+println("")
+println("--- 8. field in return ---")
+let t8_body = [
+    mk_let("tmp", mk_field("r", "data")),
+    mk_return(mk_field("r", "data"))
+]
+let t8_fn = mk_fn("f8", "immutable", [mk_param("r")], t8_body)
+let t8_result = anp_detect_immutable(t8_fn)
+check_eq("t8 detect count", len(t8_result), 1)
+
+// =====================================================================
+//  9. Multiple structs, different bases
+// =====================================================================
+println("")
+println("--- 9. multiple bases ---")
+let t9_body = [
+    mk_let("a", mk_binop("+", mk_field("x", "val"), mk_field("y", "val"))),
+    mk_let("b", mk_binop("+", mk_field("x", "val"), mk_field("y", "val"))),
+    mk_return(mk_binop("+", mk_ident("a"), mk_ident("b")))
+]
+let t9_fn = mk_fn("f9", "immutable", [mk_param("x"), mk_param("y")], t9_body)
+let t9_result = anp_detect_immutable(t9_fn)
+check_eq("t9 detect 2 keys", len(t9_result), 2)
+
+// =====================================================================
+//  10. Field access in function call arg
+// =====================================================================
+println("")
+println("--- 10. field in call arg ---")
+let t10_body = [
+    mk_exprstmt(mk_call("use", [mk_field("o", "id")])),
+    mk_exprstmt(mk_call("use", [mk_field("o", "id")])),
+    mk_return(mk_intlit(0))
+]
+let t10_fn = mk_fn("f10", "immutable", [mk_param("o")], t10_body)
+let t10_result = anp_detect_immutable(t10_fn)
+check_eq("t10 detect count", len(t10_result), 1)
+check_eq("t10 key", t10_result[0][0], "o.id")
+
+// =====================================================================
+//  11. Field used in comparison
+// =====================================================================
+println("")
+println("--- 11. field in comparison ---")
+let t11_body = [
+    mk_if(
+        mk_binop("==", mk_field("m", "kind"), mk_intlit(1)),
+        [mk_return(mk_field("m", "kind"))],
+        [mk_return(mk_intlit(0))]
+    )
+]
+let t11_fn = mk_fn("f11", "immutable", [mk_param("m")], t11_body)
+let t11_result = anp_detect_immutable(t11_fn)
+check_eq("t11 detect", len(t11_result), 1)
+
+// =====================================================================
+//  12. Field cached across if/else branches
+// =====================================================================
+println("")
+println("--- 12. cross-branch caching ---")
+let t12_body = [
+    mk_if(
+        mk_binop(">", mk_ident("flag"), mk_intlit(0)),
+        [mk_return(mk_field("cfg", "max"))],
+        [mk_return(mk_field("cfg", "max"))]
+    )
+]
+let t12_fn = mk_fn("f12", "immutable", [mk_param("cfg")], t12_body)
+let t12_result = anp_detect_immutable(t12_fn)
+check_eq("t12 detect", len(t12_result), 1)
+
+// =====================================================================
+//  13. Field in while condition
+// =====================================================================
+println("")
+println("--- 13. field in while cond ---")
+let t13_body = [
+    mk_let_mut("i", mk_intlit(0)),
+    mk_while(
+        mk_binop("<", mk_ident("i"), mk_field("lim", "max")),
+        [mk_assign("i", mk_binop("+", mk_ident("i"), mk_field("lim", "max")))]
+    ),
+    mk_return(mk_ident("i"))
+]
+let t13_fn = mk_fn("f13", "immutable", [mk_param("lim")], t13_body)
+let t13_result = anp_detect_immutable(t13_fn)
+check_eq("t13 detect", len(t13_result), 1)
+check_eq("t13 reads=2", t13_result[0][1], 2)
+
+// =====================================================================
+//  14. Three accesses to same field
+// =====================================================================
+println("")
+println("--- 14. triple access ---")
+let t14_body = [
+    mk_let("a", mk_field("t", "v")),
+    mk_let("b", mk_field("t", "v")),
+    mk_return(mk_binop("+", mk_ident("a"), mk_binop("+", mk_ident("b"), mk_field("t", "v"))))
+]
+let t14_fn = mk_fn("f14", "immutable", [mk_param("t")], t14_body)
+let t14_result = anp_detect_immutable(t14_fn)
+check_eq("t14 detect count", len(t14_result), 1)
+check_eq("t14 reads=3", t14_result[0][1], 3)
+
+// =====================================================================
+//  15. Field combined with local var
+// =====================================================================
+println("")
+println("--- 15. field + local var ---")
+let t15_body = [
+    mk_let("x", mk_intlit(10)),
+    mk_let("a", mk_binop("+", mk_ident("x"), mk_field("s", "off"))),
+    mk_let("b", mk_binop("-", mk_ident("x"), mk_field("s", "off"))),
+    mk_return(mk_binop("*", mk_ident("a"), mk_ident("b")))
+]
+let t15_fn = mk_fn("f15", "immutable", [mk_param("s")], t15_body)
+let t15_result = anp_detect_immutable(t15_fn)
+check_eq("t15 detect", len(t15_result), 1)
+check_eq("t15 key", t15_result[0][0], "s.off")
+
+// =====================================================================
+//  16. Two functions both @immutable
+// =====================================================================
+println("")
+println("--- 16. two @immutable fns ---")
+let t16a_body = [
+    mk_let("a", mk_field("p", "x")),
+    mk_return(mk_binop("+", mk_ident("a"), mk_field("p", "x")))
+]
+let t16b_body = [
+    mk_let("b", mk_field("q", "y")),
+    mk_return(mk_binop("*", mk_ident("b"), mk_field("q", "y")))
+]
+let t16a = mk_fn("fa", "immutable", [mk_param("p")], t16a_body)
+let t16b = mk_fn("fb", "immutable", [mk_param("q")], t16b_body)
+// Reset metrics
+m980_immutable_ok = 0
+m980_immutable_cached = 0
+m980_immutable_violations = 0
+let t16_ast = [t16a, t16b]
+let t16_out = anp_immutable_pass(t16_ast)
+check_eq("t16 two fns optimized", m980_immutable_ok, 2)
+check("t16 cached > 0", m980_immutable_cached > 0)
+
+// =====================================================================
+//  17. Field in index expression
+// =====================================================================
+println("")
+println("--- 17. field in index ---")
+let t17_body = [
+    mk_let("a", AstNode {
+        kind: "Index", name: "", value: "", op: "",
+        left: mk_ident("arr"), right: mk_field("idx", "pos"), cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }),
+    mk_let("b", AstNode {
+        kind: "Index", name: "", value: "", op: "",
+        left: mk_ident("arr"), right: mk_field("idx", "pos"), cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }),
+    mk_return(mk_binop("+", mk_ident("a"), mk_ident("b")))
+]
+let t17_fn = mk_fn("f17", "immutable", [mk_param("idx")], t17_body)
+let t17_result = anp_detect_immutable(t17_fn)
+check_eq("t17 detect count", len(t17_result), 1)
+check_eq("t17 key", t17_result[0][0], "idx.pos")
+
+// =====================================================================
+//  18. Deep field count (4+ reads)
+// =====================================================================
+println("")
+println("--- 18. deep field (4 reads) ---")
+let t18_body = [
+    mk_let("a", mk_field("d", "w")),
+    mk_let("b", mk_field("d", "w")),
+    mk_let("c", mk_field("d", "w")),
+    mk_return(mk_field("d", "w"))
+]
+let t18_fn = mk_fn("f18", "immutable", [mk_param("d")], t18_body)
+let t18_result = anp_detect_immutable(t18_fn)
+check_eq("t18 reads=4", t18_result[0][1], 4)
+
+// =====================================================================
+//  19. Mixed mutable and immutable access
+// =====================================================================
+println("")
+println("--- 19. mixed mut/immut ---")
+// fn f(s) { let a = s.x; s.y = 10; let b = s.x; return a + b }
+// AssignStmt LHS is a field write (not counted), s.x reads still count
+let t19_body = [
+    mk_let("a", mk_field("s", "x")),
+    AstNode {
+        kind: "AssignStmt", name: "", value: "", op: "",
+        left: mk_field("s", "y"), right: mk_intlit(10), cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    },
+    mk_let("b", mk_field("s", "x")),
+    mk_return(mk_binop("+", mk_ident("a"), mk_ident("b")))
+]
+let t19_fn = mk_fn("f19", "immutable", [mk_param("s")], t19_body)
+let t19_result = anp_detect_immutable(t19_fn)
+check_eq("t19 s.x detected", len(t19_result), 1)
+check_eq("t19 key", t19_result[0][0], "s.x")
+
+// =====================================================================
+//  20. @immutable with accumulator pattern
+// =====================================================================
+println("")
+println("--- 20. accumulator pattern ---")
+let t20_body = [
+    mk_let_mut("acc", mk_intlit(0)),
+    mk_assign("acc", mk_binop("+", mk_ident("acc"), mk_field("cfg", "step"))),
+    mk_assign("acc", mk_binop("+", mk_ident("acc"), mk_field("cfg", "step"))),
+    mk_assign("acc", mk_binop("+", mk_ident("acc"), mk_field("cfg", "step"))),
+    mk_return(mk_ident("acc"))
+]
+let t20_fn = mk_fn("f20", "immutable", [mk_param("cfg")], t20_body)
+let t20_result = anp_detect_immutable(t20_fn)
+check_eq("t20 detect", len(t20_result), 1)
+check_eq("t20 reads=3", t20_result[0][1], 3)
+
+// =====================================================================
+//  21. @immutable with string fields
+// =====================================================================
+println("")
+println("--- 21. string field ---")
+let t21_body = [
+    mk_let("a", mk_field("obj", "name")),
+    mk_return(mk_binop("+", mk_field("obj", "name"), mk_ident("a")))
+]
+let t21_fn = mk_fn("f21", "immutable", [mk_param("obj")], t21_body)
+let t21_result = anp_detect_immutable(t21_fn)
+check_eq("t21 detect", len(t21_result), 1)
+
+// =====================================================================
+//  22. @immutable no-op (unique field reads)
+// =====================================================================
+println("")
+println("--- 22. unique reads (no cache) ---")
+let t22_body = [
+    mk_let("a", mk_field("u", "x")),
+    mk_let("b", mk_field("u", "y")),
+    mk_let("c", mk_field("u", "z")),
+    mk_return(mk_binop("+", mk_ident("a"), mk_binop("+", mk_ident("b"), mk_ident("c"))))
+]
+let t22_fn = mk_fn("f22", "immutable", [mk_param("u")], t22_body)
+let t22_result = anp_detect_immutable(t22_fn)
+check_eq("t22 no redundant", len(t22_result), 0)
+
+// =====================================================================
+//  Full pass integration test
+// =====================================================================
+println("")
+println("--- integration: anp_immutable_pass ---")
+m980_immutable_ok = 0
+m980_immutable_cached = 0
+m980_immutable_violations = 0
+
+// Build AST with 3 fns: 2 @immutable (1 with redundant, 1 without), 1 normal
+let int_fn1_body = [
+    mk_let("a", mk_field("p", "x")),
+    mk_return(mk_binop("+", mk_ident("a"), mk_field("p", "x")))
+]
+let int_fn1 = mk_fn("imm_yes", "immutable", [mk_param("p")], int_fn1_body)
+
+let int_fn2_body = [
+    mk_return(mk_field("q", "y"))
+]
+let int_fn2 = mk_fn("imm_no", "immutable", [mk_param("q")], int_fn2_body)
+
+let int_fn3_body = [
+    mk_return(mk_intlit(42))
+]
+let int_fn3 = mk_fn("normal", "", [], int_fn3_body)
+
+let int_ast = [int_fn1, int_fn2, int_fn3]
+let int_out = anp_immutable_pass(int_ast)
+
+check_eq("int: output len", len(int_out), 3)
+check_eq("int: immutable_ok=1", m980_immutable_ok, 1)
+check_eq("int: immutable_violations=1", m980_immutable_violations, 1)
+check("int: cached > 0", m980_immutable_cached > 0)
+
+// Verify the rewritten fn has cache let prepended
+let rewritten_fn1 = int_out[0]
+check_eq("int: rewritten kind", rewritten_fn1.kind, "FnDecl")
+// Body should start with a LetStmt for the cache variable
+let first_stmt = rewritten_fn1.body[0]
+check_eq("int: cache let kind", first_stmt.kind, "LetStmt")
+check_eq("int: cache let name", first_stmt.name, "__imm_p_x")
+
+// Non-immutable fn unchanged
+let out_fn3 = int_out[2]
+check_eq("int: normal fn unchanged", out_fn3.name, "normal")
+
+// =====================================================================
+//  anp_cache_immutable body rewrite test
+// =====================================================================
+println("")
+println("--- cache rewrite body check ---")
+m980_immutable_cached = 0
+let cache_body = [
+    mk_let("a", mk_field("s", "v")),
+    mk_let("b", mk_field("s", "v")),
+    mk_return(mk_binop("+", mk_ident("a"), mk_ident("b")))
+]
+let cache_fn = mk_fn("fc", "immutable", [mk_param("s")], cache_body)
+let cache_result = anp_cache_immutable(cache_fn)
+// Should have: 1 cache let + 3 original stmts = 4
+check_eq("cache: body len", len(cache_result), 4)
+check_eq("cache: first is LetStmt", cache_result[0].kind, "LetStmt")
+check_eq("cache: first name __imm_s_v", cache_result[0].name, "__imm_s_v")
+// The original let stmts should now reference __imm_s_v (Ident) instead of s.v (FieldAccess)
+let rewritten_let_a = cache_result[1]
+check_eq("cache: let a uses ident", rewritten_let_a.left.kind, "Ident")
+check_eq("cache: let a uses __imm_s_v", rewritten_let_a.left.name, "__imm_s_v")
+
+// =====================================================================
+//  anp_split_dot helper test
+// =====================================================================
+println("")
+println("--- anp_split_dot ---")
+let dot1 = anp_split_dot("base.field")
+check_eq("split base", dot1[0], "base")
+check_eq("split field", dot1[1], "field")
+let dot2 = anp_split_dot("nodot")
+check_eq("split no dot", dot2[0], "nodot")
+
+// -- Summary --
+println("")
+println("=====================================================")
+println("  @immutable: " + to_string(pass_count) + " passed, " + to_string(fail_count) + " failed")
+println("=====================================================")
+assert(fail_count == 0)

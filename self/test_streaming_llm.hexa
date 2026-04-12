@@ -1,0 +1,267 @@
+// ═══════════════════════════════════════════════════════════════════
+//  test_streaming_llm.hexa — StreamingLLM (#308) Tests
+// ═══════════════════════════════════════════════════════════════════
+
+import "ml/streaming_llm.hexa"
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs_(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx_(a, b, eps) { return fabs_(a - b) < eps }
+
+println("=== StreamingLLM (#308) ===")
+
+// ── T1 init model shapes ──────────────────────────────────────
+let model = sllm_init(4, 3, 2, 4, 42)
+check("T1 D_model", model["D_model"] == 4)
+check("T1 D_head", model["D_head"] == 3)
+check("T1 n_sink", model["n_sink"] == 2)
+check("T1 window_size", model["window_size"] == 4)
+check("T1 W_q shape", len(model["W_q"]) == 3 && len(model["W_q"][0]) == 4)
+check("T1 W_k shape", len(model["W_k"]) == 3 && len(model["W_k"][0]) == 4)
+check("T1 W_v shape", len(model["W_v"]) == 3 && len(model["W_v"][0]) == 4)
+check("T1 W_o shape", len(model["W_o"]) == 4 && len(model["W_o"][0]) == 3)
+
+// ── T2 create_cache starts empty ──────────────────────────────
+let cache0 = sllm_create_cache(model)
+check("T2 empty cache size", sllm_cache_size(cache0) == 0)
+check("T2 total_seen zero", cache0["total_seen"] == 0)
+check("T2 get_keys empty", len(sllm_get_keys(cache0)) == 0)
+check("T2 get_values empty", len(sllm_get_values(cache0)) == 0)
+
+// ── T3 append fills sink slots first ──────────────────────────
+let k1 = [1.0, 0.0, 0.0]
+let v1 = [0.1, 0.2, 0.3]
+let k2 = [0.0, 1.0, 0.0]
+let v2 = [0.4, 0.5, 0.6]
+let c1 = sllm_append_token(cache0, k1, v1)
+check("T3 after 1 append size", sllm_cache_size(c1) == 1)
+check("T3 first goes to sink", len(c1["sink_keys"]) == 1)
+check("T3 window still empty", len(c1["win_keys"]) == 0)
+let c2 = sllm_append_token(c1, k2, v2)
+check("T3 after 2 append size", sllm_cache_size(c2) == 2)
+check("T3 both in sink", len(c2["sink_keys"]) == 2)
+
+// ── T4 after sinks full, append goes to window ────────────────
+let k3 = [0.0, 0.0, 1.0]
+let v3 = [0.7, 0.8, 0.9]
+let c3 = sllm_append_token(c2, k3, v3)
+check("T4 sink stays at 2", len(c3["sink_keys"]) == 2)
+check("T4 window has 1", len(c3["win_keys"]) == 1)
+check("T4 total size 3", sllm_cache_size(c3) == 3)
+check("T4 total_seen 3", c3["total_seen"] == 3)
+
+// ── T5 window eviction: exceed window_size ────────────────────
+// n_sink=2, window_size=4, so max cache = 6
+// Fill 4 more tokens into window -> window full, no eviction yet
+let mut c5 = c3
+for i in 0..3 {
+    let k = [to_float(i) * 0.1, 0.5, 0.5]
+    let v = [0.5, to_float(i) * 0.1, 0.5]
+    c5 = sllm_append_token(c5, k, v)
+}
+check("T5 before overflow: size 6", sllm_cache_size(c5) == 6)
+check("T5 window has 4", len(c5["win_keys"]) == 4)
+// One more token should trigger eviction
+let c5b = sllm_append_token(c5, [0.9, 0.9, 0.9], [0.9, 0.9, 0.9])
+check("T5 after overflow: size still 6", sllm_cache_size(c5b) == 6)
+check("T5 window still 4", len(c5b["win_keys"]) == 4)
+check("T5 sink preserved", len(c5b["sink_keys"]) == 2)
+
+// ── T6 get_keys/get_values concatenation ──────────────────────
+let all_keys = sllm_get_keys(c5b)
+let all_vals = sllm_get_values(c5b)
+check("T6 keys count = sink + window", len(all_keys) == 6)
+check("T6 vals count = sink + window", len(all_vals) == 6)
+// First key should be original sink key k1
+check("T6 first key is sink[0]", approx_(all_keys[0][0], 1.0, 0.001))
+// Last key should be the overflow token
+check("T6 last key is newest", approx_(all_keys[5][0], 0.9, 0.001))
+
+// ── T7 attention produces output with correct dimension ───────
+let query = [0.5, 0.3, 0.1, 0.7]
+let attn_out = sllm_attention(model, query, c5b)
+check("T7 attention output dim", len(attn_out) == 4)
+// Output should be finite
+let mut t7_finite = true
+for d in 0..4 {
+    if fabs_(attn_out[d]) > 1000.0 { t7_finite = false }
+}
+check("T7 attention output finite", t7_finite)
+
+// ── T8 attention on empty cache returns zeros ─────────────────
+let empty_out = sllm_attention(model, query, cache0)
+check("T8 empty cache -> zeros", approx_(empty_out[0], 0.0, 1.0e-9))
+
+// ── T9 forward_token returns [cache, output] ──────────────────
+let x_tok = [0.3, 0.7, 0.1, 0.5]
+let result9 = sllm_forward_token(model, cache0, x_tok)
+let cache9 = result9[0]
+let out9 = result9[1]
+check("T9 cache grows by 1", sllm_cache_size(cache9) == 1)
+check("T9 output dim correct", len(out9) == 4)
+check("T9 total_seen incremented", cache9["total_seen"] == 1)
+
+// ── T10 forward_stream processes all tokens ───────────────────
+let tokens10 = [
+    [0.1, 0.2, 0.3, 0.4],
+    [0.5, 0.6, 0.7, 0.8],
+    [0.9, 0.1, 0.2, 0.3]
+]
+let outputs10 = sllm_forward_stream(model, tokens10)
+check("T10 output count matches input", len(outputs10) == 3)
+check("T10 each output has D_model dim", len(outputs10[0]) == 4 && len(outputs10[1]) == 4 && len(outputs10[2]) == 4)
+
+// ── T11 bounded memory: many tokens, cache stays bounded ──────
+let mut tokens11 = []
+for i in 0..50 {
+    let f = to_float(i) * 0.02
+    tokens11 = tokens11 + [[f, 1.0 - f, f * 0.5, 0.3]]
+}
+// Process 50 tokens through a model with n_sink=2, window_size=4
+// Cache should never exceed 2 + 4 = 6
+let mut cache11 = sllm_create_cache(model)
+let mut max_size = 0
+for i in 0..50 {
+    let res = sllm_forward_token(model, cache11, tokens11[i])
+    cache11 = res[0]
+    let sz = sllm_cache_size(cache11)
+    if sz > max_size { max_size = sz }
+}
+check("T11 max cache size <= n_sink + window_size", max_size <= 6)
+check("T11 final cache size <= 6", sllm_cache_size(cache11) <= 6)
+check("T11 total_seen == 50", cache11["total_seen"] == 50)
+
+// ── T12 deterministic: same seed -> same model ────────────────
+let model_a = sllm_init(4, 3, 2, 4, 77)
+let model_b = sllm_init(4, 3, 2, 4, 77)
+let mut t12_same = true
+for i in 0..3 {
+    for j in 0..4 {
+        if fabs_(model_a["W_q"][i][j] - model_b["W_q"][i][j]) > 1.0e-9 {
+            t12_same = false
+        }
+    }
+}
+check("T12 deterministic init (same seed)", t12_same)
+
+// ── T13 different seed -> different model ─────────────────────
+let model_c = sllm_init(4, 3, 2, 4, 99)
+let mut t13_diff = false
+for i in 0..3 {
+    for j in 0..4 {
+        if fabs_(model_a["W_q"][i][j] - model_c["W_q"][i][j]) > 0.01 {
+            t13_diff = true
+        }
+    }
+}
+check("T13 different seed -> different weights", t13_diff)
+
+// ── T14 softmax sums to 1 ─────────────────────────────────────
+let sm = sllm_softmax([1.0, 2.0, 3.0, 0.5])
+let mut sm_sum = 0.0
+for i in 0..4 { sm_sum = sm_sum + sm[i] }
+check("T14 softmax sums to 1", approx_(sm_sum, 1.0, 1.0e-6))
+
+// ── T15 softmax preserves ordering ────────────────────────────
+check("T15 softmax ordering", sm[2] > sm[1] && sm[1] > sm[0] && sm[0] > sm[3])
+
+// ── T16 scale factor correct ──────────────────────────────────
+// D_head=3, scale = 1/sqrt(3) ~ 0.5774
+check("T16 scale approx 1/sqrt(D_head)", approx_(model["scale"], 0.5774, 0.01))
+
+// ── T17 sink tokens preserved across many appends ─────────────
+let mut c17 = sllm_create_cache(model)
+// Append 2 sink tokens
+c17 = sllm_append_token(c17, [1.0, 1.0, 1.0], [9.0, 9.0, 9.0])
+c17 = sllm_append_token(c17, [2.0, 2.0, 2.0], [8.0, 8.0, 8.0])
+// Append 20 more tokens (all go to window, causing evictions)
+for i in 0..20 {
+    let f = to_float(i) * 0.05
+    c17 = sllm_append_token(c17, [f, f, f], [f, f, f])
+}
+// Sink keys must still be the original ones
+let sk17 = c17["sink_keys"]
+check("T17 sink[0] preserved", approx_(sk17[0][0], 1.0, 1.0e-9))
+check("T17 sink[1] preserved", approx_(sk17[1][0], 2.0, 1.0e-9))
+// Sink values preserved too
+let sv17 = c17["sink_values"]
+check("T17 sink val[0] preserved", approx_(sv17[0][0], 9.0, 1.0e-9))
+
+// ── T18 forward_stream output quality: later tokens use context ─
+let tokens18 = [
+    [1.0, 0.0, 0.0, 0.0],
+    [1.0, 0.0, 0.0, 0.0],
+    [1.0, 0.0, 0.0, 0.0],
+    [0.0, 0.0, 0.0, 1.0]
+]
+let outs18 = sllm_forward_stream(model, tokens18)
+// First output (1 KV entry) vs last output (4 KV entries) should differ
+let mut t18_diff = false
+for d in 0..4 {
+    if fabs_(outs18[0][d] - outs18[3][d]) > 0.001 { t18_diff = true }
+}
+check("T18 outputs differ with context", t18_diff)
+
+// ── T19 train_step reduces loss ───────────────────────────────
+let train_model = sllm_init(4, 3, 2, 4, 123)
+let train_tokens = [
+    [0.1, 0.2, 0.3, 0.4],
+    [0.5, 0.6, 0.7, 0.8]
+]
+let train_targets = [
+    [0.0, 0.0, 0.0, 0.0],
+    [0.0, 0.0, 0.0, 0.0]
+]
+// Compute loss before training
+let outs_before = sllm_forward_stream(train_model, train_tokens)
+let mut loss_before = 0.0
+for i in 0..2 {
+    for d in 0..4 {
+        let diff = outs_before[i][d] - train_targets[i][d]
+        loss_before = loss_before + diff * diff
+    }
+}
+loss_before = loss_before / 8.0
+// Train
+let trained_model = sllm_train_step(train_model, train_tokens, train_targets, 0.1)
+let outs_after = sllm_forward_stream(trained_model, train_tokens)
+let mut loss_after = 0.0
+for i in 0..2 {
+    for d in 0..4 {
+        let diff = outs_after[i][d] - train_targets[i][d]
+        loss_after = loss_after + diff * diff
+    }
+}
+loss_after = loss_after / 8.0
+check("T19 training reduces loss", loss_after < loss_before)
+
+// ── T20 cache_size consistency ────────────────────────────────
+let mut c20 = sllm_create_cache(model)
+for i in 0..10 {
+    let f = to_float(i) * 0.1
+    c20 = sllm_append_token(c20, [f, f, f], [f, f, f])
+    let sz = sllm_cache_size(c20)
+    let expected = len(c20["sink_keys"]) + len(c20["win_keys"])
+    if sz != expected {
+        check("T20 cache_size == sink + win at step " + str(i), false)
+    }
+}
+check("T20 cache_size always consistent", true)
+
+println("")
+println("=== StreamingLLM summary ===")
+println("PASS: " + str(pass_count))
+println("FAIL: " + str(fail_count))
+println("TOTAL: " + str(pass_count + fail_count))

@@ -65,6 +65,7 @@ fn classify_attr_m0(name) {
     if name == "cow" { return "G2" }
     if name == "thread_local" { return "G3" }
     if name == "nonnull" { return "G1" }
+    if name == "sibling_call" { return "G1" }
     if name == "test" { return "meta" }
     if name == "bench" { return "meta" }
     if name == "deprecated" { return "meta" }
@@ -1242,6 +1243,9 @@ fn rewrite_approx_expr(expr, precision_str) {
                 new_args = new_args.push(rewrite_approx_expr(expr.args[ai], precision_str))
 // M974: Tail Call Optimization (TCO) — tail-position calls → jumps
 let mut m974_tco_rewrites = 0
+// M980: @sibling_call — sibling call optimization (tail call to OTHER functions)
+let mut m980_sibling_detected = 0
+let mut m980_sibling_rewrites = 0
 // M975: phi-node mem2reg — stack vars promoted to SSA
 let mut m975_mem2reg_promoted = 0
 // M976: @inline_always — force-inline small hot functions
@@ -1707,10 +1711,6 @@ fn subst_expr(expr, param_names, arg_exprs) {
         return AstNode {
             kind: "Index", name: "", value: "", op: "",
             left: rewrite_approx_expr(expr.left, precision_str), right: rewrite_approx_expr(expr.right, precision_str), cond: "", then_body: "", else_body: "",
-    if k == "Index" {
-        return AstNode {
-            kind: "Index", name: "", value: "", op: "",
-            left: subst_expr(expr.left, param_names, arg_exprs), right: subst_expr(expr.right, param_names, arg_exprs), cond: "", then_body: "", else_body: "",
             params: "", body: "", args: "", fields: "", items: "",
             variants: "", arms: "", iter_expr: "", ret_type: "",
             target: "", trait_name: "", methods: ""
@@ -1722,14 +1722,6 @@ fn subst_expr(expr, param_names, arg_exprs) {
 fn rewrite_approx_body(body, precision_str) {
     if type_of(body) != "array" { return body }
     let mut out = []
-// ── #47 @stack_alloc detection ─────────────────────────────────
-// Detects bounded-size arrays that can be allocated on the stack.
-// Pattern: `@stack_alloc(N)` on let mut arr = [] followed by
-// bounded pushes (< N), or `@stack_alloc` on fn with known-bounded arrays.
-// The pass marks the node for codegen to use alloca instead of malloc.
-fn detect_stack_alloc_candidate(body) {
-    if type_of(body) != "array" { return 0 }
-    let mut candidates = 0
     let n = len(body)
     let mut i = 0
     while i < n {
@@ -2027,9 +2019,15 @@ fn max_dp_lookback(expr, arr_name) {
     return 0
 }
 
-// Detect DP sliding window pattern in a while-loop body.
-// Returns [arr_name, lookback_k] or "" if not found.
-fn detect_dp_sliding_pattern(body) {
+// ── #47 @stack_alloc detection ─────────────────────────────────
+// Detects bounded-size arrays that can be allocated on the stack.
+fn detect_stack_alloc_candidate(body) {
+    if type_of(body) != "array" { return 0 }
+    let mut candidates = 0
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
         if type_of(stmt) != "string" {
             if stmt.kind == "LetMutStmt" {
                 // Check if init is empty array literal and bounded pushes follow
@@ -2049,6 +2047,42 @@ fn detect_dp_sliding_pattern(body) {
         i = i + 1
     }
     return candidates
+}
+
+// Detect DP sliding window pattern in a while-loop body.
+// Returns [arr_name, lookback_k] or "" if not found.
+fn detect_dp_sliding_pattern(body) {
+    if type_of(body) != "array" { return "" }
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        if type_of(stmt) != "string" && stmt.kind == "WhileStmt" {
+            if type_of(stmt.body) == "array" {
+                let wb = stmt.body
+                let mut j = 0
+                while j < len(wb) {
+                    let ws = wb[j]
+                    if type_of(ws) != "string" && ws.kind == "AssignStmt" {
+                        if type_of(ws.right) != "string" && ws.right.kind == "Index" {
+                            if type_of(ws.right.right) != "string" && ws.right.right.kind == "BinOp" {
+                                if ws.right.right.op == "-" {
+                                    if type_of(ws.right.left) != "string" && ws.right.left.kind == "Ident" {
+                                        let arr_name = ws.right.left.name
+                                        let k = max_dp_lookback(ws.right.right, arr_name)
+                                        if k > 0 { return [arr_name, k] }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    j = j + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return ""
 }
 
 fn count_pushes_to_var(body, vname, start) {
@@ -4167,6 +4201,12 @@ let mut m976_len_folds = 0
 let mut m977_strength_small = 0
 // M978: strength reduction — loop index multiply → accumulate (ROI id=13)
 let mut m978_loop_stride = 0
+// M978: string matching — naive O(nm) -> KMP O(n+m) rewrite (ROI #65)
+let mut m978_kmp_detected = 0
+let mut m978_kmp_rewrites = 0
+// M978b: multi-pattern string matching — Aho-Corasick (ROI #65)
+let mut m978_aho_detected = 0
+let mut m978_aho_rewrites = 0
 // M253: cross-fn inlining (const-return stubs + identity fns)
 let mut m253_inlined_calls = 0
 // Inlining tables (parallel arrays)
@@ -11673,6 +11713,10 @@ fn ai_native_pass(ast) {
     m976_len_folds = 0
     m977_strength_small = 0
     m978_loop_stride = 0
+    m978_kmp_detected = 0
+    m978_kmp_rewrites = 0
+    m978_aho_detected = 0
+    m978_aho_rewrites = 0
     m253_inlined_calls = 0
     m253_stub_names = []
     m253_stub_lits = []
@@ -14223,6 +14267,8 @@ fn ai_native_pass(ast) {
     out = apply_swiss_table_pass(out)
     // ROI #45: @nonnull null check elimination pass
     out = apply_nonnull_pass(out)
+    // ROI #56: loop interchange pass
+    out = anp_interchange_pass(out)
     let mut cov_pct = 0
     if m6_total_fns > 0 {
         cov_pct = (m6_annotated_fns * 100) / m6_total_fns
@@ -14421,6 +14467,480 @@ fn ai_native_pass(ast) {
     if m977_nonnull_ok > 0 {
         println("[ai-native] @nonnull: " + to_string(m977_nonnull_ok) + " fn(s), " + to_string(m977_nonnull_elim) + " null check(s) eliminated")
     }
+    if m978_interchange_candidates + m978_interchange_rewrites > 0 {
+        println("[ai-native] loop-interchange: " + to_string(m978_interchange_candidates) + " candidate(s), " + to_string(m978_interchange_rewrites) + " rewrite(s)")
+    }
+    if m978_kmp_detected + m978_kmp_rewrites > 0 {
+        println("[ai-native] string-match: " + to_string(m978_kmp_detected) + " naive O(nm) detected, " + to_string(m978_kmp_rewrites) + " -> KMP O(n+m)")
+    }
+    if m978_aho_detected + m978_aho_rewrites > 0 {
+        println("[ai-native] multi-pattern: " + to_string(m978_aho_detected) + " detected, " + to_string(m978_aho_rewrites) + " -> Aho-Corasick")
+    }
+    // ROI #63: select pattern recognition (cmov conversion)
+    out = anp_select_pass(out)
+    // ROI #64: @sibling_call sibling call optimization pass
+    out = anp_sibling_call_pass(out)
+    if m980_select_detected > 0 {
+        println("[ai-native] select->cmov: " + to_string(m980_select_detected) + " detected, " + to_string(m980_select_rewrites) + " rewritten")
+    }
+    return out
+}
+
+
+// ═══════════════════════════════════════════════════════════
+//  ROI #63: Select pattern recognition (cmov conversion)
+// ═══════════════════════════════════════════════════════════
+
+let mut m980_select_detected = 0
+let mut m980_select_rewrites = 0
+
+fn anp_is_select_leaf(expr) {
+    if type_of(expr) == "string" { return false }
+    let k = expr.kind
+    if k == "IntLit" { return true }
+    if k == "FloatLit" { return true }
+    if k == "BoolLit" { return true }
+    if k == "StringLit" { return true }
+    if k == "CharLit" { return true }
+    if k == "Ident" { return true }
+    if k == "BinOp" {
+        return anp_is_select_leaf(expr.left) && anp_is_select_leaf(expr.right)
+    }
+    if k == "UnaryOp" {
+        return anp_is_select_leaf(expr.left)
+    }
+    if k == "Index" {
+        return anp_is_select_leaf(expr.left) && anp_is_select_leaf(expr.right)
+    }
+    if k == "Call" {
+        if type_of(expr.left) == "string" { return false }
+        if expr.left.kind != "Ident" { return false }
+        if type_of(expr.args) != "array" { return true }
+        let mut ci = 0
+        while ci < len(expr.args) {
+            if !anp_is_select_leaf(expr.args[ci]) { return false }
+            ci = ci + 1
+        }
+        return true
+    }
+    return false
+}
+
+fn anp_extract_branch_value(body) {
+    if type_of(body) != "array" { return "" }
+    if len(body) != 1 { return "" }
+    let s = body[0]
+    if type_of(s) == "string" { return "" }
+    if s.kind == "ReturnStmt" {
+        if type_of(s.left) != "string" && anp_is_select_leaf(s.left) { return s.left }
+        return ""
+    }
+    if s.kind == "ExprStmt" {
+        if type_of(s.left) != "string" && anp_is_select_leaf(s.left) { return s.left }
+        return ""
+    }
+    if anp_is_select_leaf(s) { return s }
+    return ""
+}
+
+fn anp_detect_select(stmt) {
+    if type_of(stmt) == "string" { return false }
+    let k = stmt.kind
+    if k == "LetStmt" || k == "LetMutStmt" {
+        if type_of(stmt.left) != "string" && stmt.left.kind == "IfExpr" {
+            let ie = stmt.left
+            if type_of(ie.cond) == "string" { return false }
+            let tv = anp_extract_branch_value(ie.then_body)
+            let ev = anp_extract_branch_value(ie.else_body)
+            if type_of(tv) != "string" && type_of(ev) != "string" { return true }
+        }
+    }
+    if k == "ReturnStmt" {
+        if type_of(stmt.left) != "string" && stmt.left.kind == "IfExpr" {
+            let ie = stmt.left
+            if type_of(ie.cond) == "string" { return false }
+            let tv = anp_extract_branch_value(ie.then_body)
+            let ev = anp_extract_branch_value(ie.else_body)
+            if type_of(tv) != "string" && type_of(ev) != "string" { return true }
+        }
+    }
+    if k == "AssignStmt" {
+        if type_of(stmt.right) != "string" && stmt.right.kind == "IfExpr" {
+            let ie = stmt.right
+            if type_of(ie.cond) == "string" { return false }
+            let tv = anp_extract_branch_value(ie.then_body)
+            let ev = anp_extract_branch_value(ie.else_body)
+            if type_of(tv) != "string" && type_of(ev) != "string" { return true }
+        }
+    }
+    if k == "IfStmt" {
+        if type_of(stmt.cond) == "string" { return false }
+        if type_of(stmt.then_body) != "array" { return false }
+        if type_of(stmt.else_body) != "array" { return false }
+        if len(stmt.then_body) != 1 { return false }
+        if len(stmt.else_body) != 1 { return false }
+        let ts = stmt.then_body[0]
+        let es = stmt.else_body[0]
+        if type_of(ts) == "string" || type_of(es) == "string" { return false }
+        if ts.kind != "AssignStmt" { return false }
+        if es.kind != "AssignStmt" { return false }
+        if type_of(ts.left) == "string" || type_of(es.left) == "string" { return false }
+        if ts.left.kind != "Ident" || es.left.kind != "Ident" { return false }
+        if ts.left.name != es.left.name { return false }
+        if anp_is_select_leaf(ts.right) && anp_is_select_leaf(es.right) { return true }
+    }
+    return false
+}
+
+fn anp_make_select_call(cond, then_val, else_val) {
+    let callee = AstNode {
+        kind: "Ident", name: "__select__", value: "", op: "",
+        left: "", right: "", cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+    return AstNode {
+        kind: "Call", name: "", value: "", op: "",
+        left: callee, right: "", cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: [cond, then_val, else_val], fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+}
+
+fn anp_rewrite_select(stmt) {
+    if type_of(stmt) == "string" { return stmt }
+    let k = stmt.kind
+    if k == "LetStmt" || k == "LetMutStmt" {
+        if type_of(stmt.left) != "string" && stmt.left.kind == "IfExpr" {
+            let ie = stmt.left
+            let tv = anp_extract_branch_value(ie.then_body)
+            let ev = anp_extract_branch_value(ie.else_body)
+            if type_of(tv) != "string" && type_of(ev) != "string" {
+                let sel = anp_make_select_call(ie.cond, tv, ev)
+                m980_select_rewrites = m980_select_rewrites + 1
+                return AstNode {
+                    kind: k, name: stmt.name, value: stmt.value, op: stmt.op,
+                    left: sel, right: "", cond: "", then_body: "", else_body: "",
+                    params: "", body: "", args: "", fields: "", items: "",
+                    variants: "", arms: "", iter_expr: "", ret_type: "",
+                    target: "", trait_name: "", methods: ""
+                }
+            }
+        }
+    }
+    if k == "ReturnStmt" {
+        if type_of(stmt.left) != "string" && stmt.left.kind == "IfExpr" {
+            let ie = stmt.left
+            let tv = anp_extract_branch_value(ie.then_body)
+            let ev = anp_extract_branch_value(ie.else_body)
+            if type_of(tv) != "string" && type_of(ev) != "string" {
+                let sel = anp_make_select_call(ie.cond, tv, ev)
+                m980_select_rewrites = m980_select_rewrites + 1
+                return AstNode {
+                    kind: "ReturnStmt", name: "", value: "", op: "",
+                    left: sel, right: "", cond: "", then_body: "", else_body: "",
+                    params: "", body: "", args: "", fields: "", items: "",
+                    variants: "", arms: "", iter_expr: "", ret_type: "",
+                    target: "", trait_name: "", methods: ""
+                }
+            }
+        }
+    }
+    if k == "AssignStmt" {
+        if type_of(stmt.right) != "string" && stmt.right.kind == "IfExpr" {
+            let ie = stmt.right
+            let tv = anp_extract_branch_value(ie.then_body)
+            let ev = anp_extract_branch_value(ie.else_body)
+            if type_of(tv) != "string" && type_of(ev) != "string" {
+                let sel = anp_make_select_call(ie.cond, tv, ev)
+                m980_select_rewrites = m980_select_rewrites + 1
+                return AstNode {
+                    kind: "AssignStmt", name: stmt.name, value: stmt.value, op: stmt.op,
+                    left: stmt.left, right: sel, cond: "", then_body: "", else_body: "",
+                    params: "", body: "", args: "", fields: "", items: "",
+                    variants: "", arms: "", iter_expr: "", ret_type: "",
+                    target: "", trait_name: "", methods: ""
+                }
+            }
+        }
+    }
+    if k == "IfStmt" {
+        if type_of(stmt.then_body) == "array" && type_of(stmt.else_body) == "array" {
+            if len(stmt.then_body) == 1 && len(stmt.else_body) == 1 {
+                let ts = stmt.then_body[0]
+                let es = stmt.else_body[0]
+                if type_of(ts) != "string" && type_of(es) != "string" {
+                    if ts.kind == "AssignStmt" && es.kind == "AssignStmt" {
+                        if type_of(ts.left) != "string" && type_of(es.left) != "string" {
+                            if ts.left.kind == "Ident" && es.left.kind == "Ident" {
+                                if ts.left.name == es.left.name {
+                                    if anp_is_select_leaf(ts.right) && anp_is_select_leaf(es.right) {
+                                        let sel = anp_make_select_call(stmt.cond, ts.right, es.right)
+                                        m980_select_rewrites = m980_select_rewrites + 1
+                                        return AstNode {
+                                            kind: "AssignStmt", name: "", value: "", op: "",
+                                            left: ts.left, right: sel, cond: "", then_body: "", else_body: "",
+                                            params: "", body: "", args: "", fields: "", items: "",
+                                            variants: "", arms: "", iter_expr: "", ret_type: "",
+                                            target: "", trait_name: "", methods: ""
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return stmt
+}
+
+fn anp_select_body(body) {
+    if type_of(body) != "array" { return body }
+    let mut out = []
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        if type_of(stmt) != "string" {
+            if anp_detect_select(stmt) {
+                m980_select_detected = m980_select_detected + 1
+                out = out.push(anp_rewrite_select(stmt))
+            } else {
+                let k = stmt.kind
+                if k == "WhileStmt" || k == "ForStmt" {
+                    let inner = anp_select_body(stmt.body)
+                    out = out.push(AstNode {
+                        kind: k, name: stmt.name, value: stmt.value, op: stmt.op,
+                        left: stmt.left, right: stmt.right, cond: stmt.cond,
+                        then_body: stmt.then_body, else_body: stmt.else_body,
+                        params: stmt.params, body: inner, args: stmt.args, fields: stmt.fields, items: stmt.items,
+                        variants: stmt.variants, arms: stmt.arms, iter_expr: stmt.iter_expr, ret_type: stmt.ret_type,
+                        target: stmt.target, trait_name: stmt.trait_name, methods: stmt.methods
+                    })
+                } else if k == "IfStmt" || k == "IfExpr" {
+                    let tb = anp_select_body(stmt.then_body)
+                    let eb = if type_of(stmt.else_body) == "array" { anp_select_body(stmt.else_body) } else { stmt.else_body }
+                    out = out.push(AstNode {
+                        kind: k, name: stmt.name, value: stmt.value, op: stmt.op,
+                        left: stmt.left, right: stmt.right, cond: stmt.cond,
+                        then_body: tb, else_body: eb,
+                        params: stmt.params, body: stmt.body, args: stmt.args, fields: stmt.fields, items: stmt.items,
+                        variants: stmt.variants, arms: stmt.arms, iter_expr: stmt.iter_expr, ret_type: stmt.ret_type,
+                        target: stmt.target, trait_name: stmt.trait_name, methods: stmt.methods
+                    })
+                } else {
+                    out = out.push(stmt)
+                }
+            }
+        } else {
+            out = out.push(stmt)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn anp_select_pass(ast) {
+    if type_of(ast) != "array" { return ast }
+    let mut out = []
+    let n = len(ast)
+    let mut i = 0
+    while i < n {
+        let node = ast[i]
+        if type_of(node) != "string" && node.kind == "FnDecl" {
+            let attrs = split_attrs_m0(node.value)
+            if attr_has(attrs, "optimize") || attr_has(attrs, "hot") || attr_has(attrs, "inline") || attr_has(attrs, "pure") {
+                let before = m980_select_rewrites
+                let new_body = anp_select_body(node.body)
+                if m980_select_rewrites > before {
+                    out = out.push(rewrite_fn_with_body(node, new_body))
+                    println("[ai-native] fn " + node.name + " REWRITE: select->cmov " + to_string(m980_select_rewrites - before) + " site(s)")
+                } else {
+                    out = out.push(node)
+                }
+            } else {
+                out = out.push(node)
+            }
+        } else {
+            out = out.push(node)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  #64 @sibling_call — Sibling Call Optimization
+//  Extends TCO to tail calls to OTHER functions (not just self-recursion).
+//  When a function ends with `return other_fn(args)`, reuse the current
+//  stack frame by rewriting into a trampoline-style dispatch.
+// ═══════════════════════════════════════════════════════════════════
+
+fn get_sibling_callee(expr, self_name) {
+    if type_of(expr) == "string" { return "" }
+    if expr.kind == "Call" {
+        let callee = expr.left
+        if type_of(callee) != "string" {
+            if callee.kind == "Ident" {
+                if callee.name != self_name && callee.name != "println" && callee.name != "print" && callee.name != "len" && callee.name != "type_of" && callee.name != "to_string" && callee.name != "push" && callee.name != "chars" {
+                    return callee.name
+                }
+            }
+        }
+    }
+    return ""
+}
+
+fn detect_sibling_in_tail(body, self_name) {
+    let mut found = []
+    if type_of(body) != "array" { return found }
+    let n = len(body)
+    if n == 0 { return found }
+    let last = body[n - 1]
+    if type_of(last) == "string" { return found }
+    if last.kind == "ReturnStmt" {
+        let callee = get_sibling_callee(last.left, self_name)
+        if callee != "" {
+            found = found.push(callee)
+        }
+    }
+    if last.kind == "IfStmt" {
+        let then_found = detect_sibling_in_tail(last.body, self_name)
+        let else_found = detect_sibling_in_tail(last.else_body, self_name)
+        let mut ti = 0
+        while ti < len(then_found) {
+            found = found.push(then_found[ti])
+            ti = ti + 1
+        }
+        let mut ei = 0
+        while ei < len(else_found) {
+            found = found.push(else_found[ei])
+            ei = ei + 1
+        }
+    }
+    return found
+}
+
+fn anp_detect_sibling_call(fn_node) {
+    let self_name = fn_node.name
+    let body = fn_node.body
+    let mut found = []
+    if type_of(body) != "array" { return found }
+    let n = len(body)
+    if n == 0 { return found }
+    found = detect_sibling_in_tail(body, self_name)
+    return found
+}
+
+fn join_sibling_names(arr) {
+    let mut out = ""
+    let n = len(arr)
+    let mut i = 0
+    while i < n {
+        if i > 0 { out = out + ", " }
+        out = out + arr[i]
+        i = i + 1
+    }
+    return out
+}
+
+fn rewrite_sibling_body(body, self_name) {
+    if type_of(body) != "array" { return body }
+    let n = len(body)
+    if n == 0 { return body }
+    let mut out = []
+    let mut i = 0
+    while i < n - 1 {
+        out = out.push(body[i])
+        i = i + 1
+    }
+    let last = body[n - 1]
+    if type_of(last) == "string" {
+        out = out.push(last)
+        return out
+    }
+    if last.kind == "ReturnStmt" {
+        let callee = get_sibling_callee(last.left, self_name)
+        if callee != "" {
+            let marker = AstNode {
+                kind: "SiblingTailCall", name: callee, value: "", op: "",
+                left: last.left, right: "", cond: "", then_body: "", else_body: "",
+                params: "", body: "", args: last.left.args, fields: "", items: "",
+                variants: "", arms: "", iter_expr: "", ret_type: "",
+                target: "", trait_name: "", methods: ""
+            }
+            out = out.push(AstNode {
+                kind: "ReturnStmt", name: "", value: "", op: "",
+                left: marker, right: "", cond: "", then_body: "", else_body: "",
+                params: "", body: "", args: "", fields: "", items: "",
+                variants: "", arms: "", iter_expr: "", ret_type: "",
+                target: "", trait_name: "", methods: ""
+            })
+            return out
+        }
+        out = out.push(last)
+        return out
+    }
+    if last.kind == "IfStmt" {
+        let new_then = rewrite_sibling_body(last.body, self_name)
+        let new_else = rewrite_sibling_body(last.else_body, self_name)
+        out = out.push(AstNode {
+            kind: "IfStmt", name: "", value: "", op: "",
+            left: "", right: "", cond: last.cond, then_body: "", else_body: new_else,
+            params: "", body: new_then, args: "", fields: "", items: "",
+            variants: "", arms: "", iter_expr: "", ret_type: "",
+            target: "", trait_name: "", methods: ""
+        })
+        return out
+    }
+    out = out.push(last)
+    return out
+}
+
+fn anp_rewrite_sibling_call(fn_node) {
+    let self_name = fn_node.name
+    let siblings = anp_detect_sibling_call(fn_node)
+    if len(siblings) == 0 { return fn_node }
+    let new_body = rewrite_sibling_body(fn_node.body, self_name)
+    m980_sibling_rewrites = m980_sibling_rewrites + 1
+    let callee_list = join_sibling_names(siblings)
+    println("[ai-native] fn " + fn_node.name + " REWRITE: @sibling_call -> " + callee_list)
+    return rewrite_fn_with_body(fn_node, new_body)
+}
+
+fn anp_sibling_call_pass(ast) {
+    if type_of(ast) != "array" { return ast }
+    let n = len(ast)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let node = ast[i]
+        if type_of(node) != "string" && node.kind == "FnDecl" {
+            let attrs = node.value
+            if attr_has(attrs, "sibling_call") {
+                let siblings = anp_detect_sibling_call(node)
+                if len(siblings) > 0 {
+                    m980_sibling_detected = m980_sibling_detected + len(siblings)
+                    let rewritten = anp_rewrite_sibling_call(node)
+                    out = out.push(rewritten)
+                    i = i + 1
+                    continue
+                }
+            }
+            out = out.push(node)
+        } else {
+            out = out.push(node)
+        }
+        i = i + 1
+    }
+    if m980_sibling_rewrites > 0 {
+        println("[ai-native] @sibling_call: " + to_string(m980_sibling_detected) + " sibling tail-call(s) detected, " + to_string(m980_sibling_rewrites) + " fn(s) rewritten")
+    }
     return out
 }
 
@@ -14449,4 +14969,3780 @@ fn ai_native_fixpoint(ast) {
     }
     println("[ai-native] FIXPOINT max_iters hit (" + to_string(max_iters) + ")")
     return cur
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  ROI #61: Constant Range Analysis
+//  Track integer variable value ranges [lo, hi] through program
+//  to eliminate bounds checks and detect overflow / dead branches.
+// ═══════════════════════════════════════════════════════════════
+
+let RANGE_MIN = -999999999
+let RANGE_MAX = 999999999
+
+let mut m990_range_checks_eliminated = 0
+let mut m990_range_overflow_detected = 0
+let mut m990_range_dead_branches = 0
+let mut m990_range_vars_tracked = 0
+
+fn anp_range_init() {
+    return [RANGE_MIN, RANGE_MAX]
+}
+
+fn anp_range_const(v) {
+    return [v, v]
+}
+
+fn anp_range_lo(r) { return r[0] }
+fn anp_range_hi(r) { return r[1] }
+
+fn anp_range_is_top(r) {
+    return r[0] == RANGE_MIN && r[1] == RANGE_MAX
+}
+
+fn anp_range_is_bot(r) {
+    return r[0] > r[1]
+}
+
+fn anp_range_contains(r, v) {
+    if anp_range_is_bot(r) { return false }
+    return v >= r[0] && v <= r[1]
+}
+
+fn anp_range_width(r) {
+    if anp_range_is_bot(r) { return 0 }
+    return r[1] - r[0] + 1
+}
+
+fn anp_range_eq(r1, r2) {
+    return r1[0] == r2[0] && r1[1] == r2[1]
+}
+
+fn anp_range_meet(r1, r2) {
+    let lo1 = r1[0]
+    let hi1 = r1[1]
+    let lo2 = r2[0]
+    let hi2 = r2[1]
+    let mut new_lo = lo1
+    let mut new_hi = hi1
+    if lo2 > new_lo { new_lo = lo2 }
+    if hi2 < new_hi { new_hi = hi2 }
+    if new_lo > new_hi { return [1, 0] }
+    return [new_lo, new_hi]
+}
+
+fn anp_range_join(r1, r2) {
+    if anp_range_is_bot(r1) { return r2 }
+    if anp_range_is_bot(r2) { return r1 }
+    let lo1 = r1[0]
+    let hi1 = r1[1]
+    let lo2 = r2[0]
+    let hi2 = r2[1]
+    let mut new_lo = lo1
+    let mut new_hi = hi1
+    if lo2 < new_lo { new_lo = lo2 }
+    if hi2 > new_hi { new_hi = hi2 }
+    return [new_lo, new_hi]
+}
+
+fn anp_range_add(r1, r2) {
+    if anp_range_is_bot(r1) || anp_range_is_bot(r2) { return [1, 0] }
+    return [r1[0] + r2[0], r1[1] + r2[1]]
+}
+
+fn anp_range_sub(r1, r2) {
+    if anp_range_is_bot(r1) || anp_range_is_bot(r2) { return [1, 0] }
+    return [r1[0] - r2[1], r1[1] - r2[0]]
+}
+
+fn anp_range_mul(r1, r2) {
+    if anp_range_is_bot(r1) || anp_range_is_bot(r2) { return [1, 0] }
+    let a = r1[0] * r2[0]
+    let b = r1[0] * r2[1]
+    let c = r1[1] * r2[0]
+    let d = r1[1] * r2[1]
+    let mut lo = a
+    if b < lo { lo = b }
+    if c < lo { lo = c }
+    if d < lo { lo = d }
+    let mut hi = a
+    if b > hi { hi = b }
+    if c > hi { hi = c }
+    if d > hi { hi = d }
+    return [lo, hi]
+}
+
+fn anp_range_neg(r) {
+    if anp_range_is_bot(r) { return [1, 0] }
+    return [0 - r[1], 0 - r[0]]
+}
+
+fn anp_range_cmp_ge(r, v) {
+    if anp_range_is_bot(r) { return "unknown" }
+    if r[0] >= v { return "true" }
+    if r[1] < v { return "false" }
+    return "unknown"
+}
+
+fn anp_range_cmp_le(r, v) {
+    if anp_range_is_bot(r) { return "unknown" }
+    if r[1] <= v { return "true" }
+    if r[0] > v { return "false" }
+    return "unknown"
+}
+
+fn anp_range_cmp_gt(r, v) {
+    if anp_range_is_bot(r) { return "unknown" }
+    if r[0] > v { return "true" }
+    if r[1] <= v { return "false" }
+    return "unknown"
+}
+
+fn anp_range_cmp_lt(r, v) {
+    if anp_range_is_bot(r) { return "unknown" }
+    if r[1] < v { return "true" }
+    if r[0] >= v { return "false" }
+    return "unknown"
+}
+
+fn anp_range_cmp_eq(r, v) {
+    if anp_range_is_bot(r) { return "unknown" }
+    if r[0] == v && r[1] == v { return "true" }
+    if v < r[0] || v > r[1] { return "false" }
+    return "unknown"
+}
+
+fn anp_range_cmp_ne(r, v) {
+    if anp_range_is_bot(r) { return "unknown" }
+    if r[0] == v && r[1] == v { return "false" }
+    if v < r[0] || v > r[1] { return "true" }
+    return "unknown"
+}
+
+fn anp_range_eval_expr(expr, var_names, var_ranges) {
+    if type_of(expr) == "string" { return anp_range_init() }
+    let k = expr.kind
+    if k == "IntLit" {
+        return anp_range_const(expr.value)
+    }
+    if k == "Ident" {
+        let name = expr.name
+        let mut i = 0
+        while i < len(var_names) {
+            if var_names[i] == name { return var_ranges[i] }
+            i = i + 1
+        }
+        return anp_range_init()
+    }
+    if k == "BinOp" {
+        let lr = anp_range_eval_expr(expr.left, var_names, var_ranges)
+        let rr = anp_range_eval_expr(expr.right, var_names, var_ranges)
+        if expr.op == "+" || expr.op == "Add" { return anp_range_add(lr, rr) }
+        if expr.op == "-" || expr.op == "Sub" { return anp_range_sub(lr, rr) }
+        if expr.op == "*" || expr.op == "Mul" { return anp_range_mul(lr, rr) }
+        return anp_range_init()
+    }
+    if k == "UnaryOp" {
+        if expr.op == "-" || expr.op == "Neg" {
+            let inner = anp_range_eval_expr(expr.operand, var_names, var_ranges)
+            return anp_range_neg(inner)
+        }
+    }
+    return anp_range_init()
+}
+
+fn anp_range_transfer(stmt, var_names, var_ranges) {
+    let k = stmt.kind
+    if k == "LetStmt" || k == "LetMutStmt" {
+        let name = stmt.name
+        let r = anp_range_eval_expr(stmt.value, var_names, var_ranges)
+        let new_names = var_names + [name]
+        let new_ranges = var_ranges + [r]
+        m990_range_vars_tracked = m990_range_vars_tracked + 1
+        return [new_names, new_ranges]
+    }
+    if k == "AssignStmt" {
+        if type_of(stmt.target) != "string" {
+            if stmt.target.kind == "Ident" {
+                let name = stmt.target.name
+                let r = anp_range_eval_expr(stmt.value, var_names, var_ranges)
+                let mut new_ranges = []
+                let mut found = false
+                let mut idx = 0
+                while idx < len(var_names) {
+                    if var_names[idx] == name {
+                        new_ranges = new_ranges + [r]
+                        found = true
+                    } else {
+                        new_ranges = new_ranges + [var_ranges[idx]]
+                    }
+                    idx = idx + 1
+                }
+                if !found {
+                    return [var_names + [name], var_ranges + [r]]
+                }
+                return [var_names, new_ranges]
+            }
+        }
+    }
+    return [var_names, var_ranges]
+}
+
+fn anp_range_analyze_body(body, var_names, var_ranges) {
+    if type_of(body) != "array" { return [var_names, var_ranges] }
+    let mut names = var_names
+    let mut ranges = var_ranges
+    let mut i = 0
+    while i < len(body) {
+        let result = anp_range_transfer(body[i], names, ranges)
+        names = result[0]
+        ranges = result[1]
+        i = i + 1
+    }
+    return [names, ranges]
+}
+
+fn anp_range_eval_cmp(cmp_expr, var_names, var_ranges) {
+    if type_of(cmp_expr) == "string" { return "unknown" }
+    if cmp_expr.kind != "BinOp" { return "unknown" }
+    let op = cmp_expr.op
+    let lr = anp_range_eval_expr(cmp_expr.left, var_names, var_ranges)
+    let rr = anp_range_eval_expr(cmp_expr.right, var_names, var_ranges)
+    if op == ">=" || op == "Ge" {
+        if lr[0] >= rr[1] { return "true" }
+        if lr[1] < rr[0] { return "false" }
+        return "unknown"
+    }
+    if op == "<=" || op == "Le" {
+        if lr[1] <= rr[0] { return "true" }
+        if lr[0] > rr[1] { return "false" }
+        return "unknown"
+    }
+    if op == ">" || op == "Gt" {
+        if lr[0] > rr[1] { return "true" }
+        if lr[1] <= rr[0] { return "false" }
+        return "unknown"
+    }
+    if op == "<" || op == "Lt" {
+        if lr[1] < rr[0] { return "true" }
+        if lr[0] >= rr[1] { return "false" }
+        return "unknown"
+    }
+    if op == "==" || op == "Eq" {
+        if lr[0] == lr[1] && rr[0] == rr[1] && lr[0] == rr[0] { return "true" }
+        if lr[1] < rr[0] || rr[1] < lr[0] { return "false" }
+        return "unknown"
+    }
+    if op == "!=" || op == "Ne" {
+        if lr[1] < rr[0] || rr[1] < lr[0] { return "true" }
+        if lr[0] == lr[1] && rr[0] == rr[1] && lr[0] == rr[0] { return "false" }
+        return "unknown"
+    }
+    return "unknown"
+}
+
+fn anp_range_lookup(name, var_names, var_ranges) {
+    let mut i = 0
+    while i < len(var_names) {
+        if var_names[i] == name { return var_ranges[i] }
+        i = i + 1
+    }
+    return anp_range_init()
+}
+
+fn anp_range_analysis_pass(ast) {
+    if type_of(ast) != "array" { return ast }
+    let mut results = []
+    let mut i = 0
+    while i < len(ast) {
+        let node = ast[i]
+        if type_of(node) != "string" && node.kind == "FnDecl" {
+            let mut names = []
+            let mut ranges = []
+            let mut pi = 0
+            while pi < len(node.params) {
+                names = names + [node.params[pi].name]
+                ranges = ranges + [anp_range_init()]
+                pi = pi + 1
+            }
+            let env = anp_range_analyze_body(node.body, names, ranges)
+            let final_names = env[0]
+            let final_ranges = env[1]
+            let mut si = 0
+            while si < len(node.body) {
+                let stmt = node.body[si]
+                if type_of(stmt) != "string" {
+                    if stmt.kind == "IfStmt" {
+                        let verdict = anp_range_eval_cmp(stmt.cond, final_names, final_ranges)
+                        if verdict == "true" {
+                            m990_range_checks_eliminated = m990_range_checks_eliminated + 1
+                            m990_range_dead_branches = m990_range_dead_branches + 1
+                        }
+                        if verdict == "false" {
+                            m990_range_dead_branches = m990_range_dead_branches + 1
+                        }
+                    }
+                }
+                si = si + 1
+            }
+            results = results + [node]
+        } else {
+            results = results + [node]
+        }
+        i = i + 1
+    }
+    return results
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  ROI #54: Loop Fission
+// ═══════════════════════════════════════════════════════════════
+
+fn fission_collect_writes(stmt) {
+    if type_of(stmt) == "string" { return [] }
+    let k = stmt.kind
+    if k == "AssignStmt" {
+        let mut out = []
+        if stmt.name != "" {
+            out = out.push(stmt.name)
+        }
+        return out
+    }
+    if k == "LetStmt" || k == "LetMutStmt" {
+        let mut out = []
+        if stmt.name != "" {
+            out = out.push(stmt.name)
+        }
+        return out
+    }
+    return []
+}
+
+fn fission_collect_reads_expr(expr) {
+    if type_of(expr) == "string" { return [] }
+    if type_of(expr) != "string" && type_of(expr) != "array" {
+        let k = expr.kind
+        if k == "Ident" {
+            let mut out = []
+            out = out.push(expr.name)
+            return out
+        }
+        if k == "BinaryExpr" || k == "BinOp" {
+            let l = fission_collect_reads_expr(expr.left)
+            let r = fission_collect_reads_expr(expr.right)
+            let mut out = l
+            let mut ri = 0
+            while ri < len(r) {
+                out = out.push(r[ri])
+                ri = ri + 1
+            }
+            return out
+        }
+        if k == "UnaryExpr" {
+            return fission_collect_reads_expr(expr.left)
+        }
+        if k == "Call" {
+            let mut out = []
+            if type_of(expr.args) == "array" {
+                let mut ai = 0
+                while ai < len(expr.args) {
+                    let sub = fission_collect_reads_expr(expr.args[ai])
+                    let mut si = 0
+                    while si < len(sub) {
+                        out = out.push(sub[si])
+                        si = si + 1
+                    }
+                    ai = ai + 1
+                }
+            }
+            return out
+        }
+        if k == "Index" {
+            let l2 = fission_collect_reads_expr(expr.left)
+            let r2 = fission_collect_reads_expr(expr.right)
+            let mut out = l2
+            let mut ri2 = 0
+            while ri2 < len(r2) {
+                out = out.push(r2[ri2])
+                ri2 = ri2 + 1
+            }
+            return out
+        }
+        if k == "MethodCall" {
+            let base = fission_collect_reads_expr(expr.left)
+            let mut out = base
+            if type_of(expr.args) == "array" {
+                let mut ai2 = 0
+                while ai2 < len(expr.args) {
+                    let sub2 = fission_collect_reads_expr(expr.args[ai2])
+                    let mut si2 = 0
+                    while si2 < len(sub2) {
+                        out = out.push(sub2[si2])
+                        si2 = si2 + 1
+                    }
+                    ai2 = ai2 + 1
+                }
+            }
+            return out
+        }
+        if k == "IntLit" || k == "FloatLit" || k == "BoolLit" || k == "StringLit" {
+            return []
+        }
+        if k == "Field" {
+            return fission_collect_reads_expr(expr.left)
+        }
+        let mut out = []
+        if type_of(expr.left) != "string" || expr.left != "" {
+            let sl = fission_collect_reads_expr(expr.left)
+            let mut sli = 0
+            while sli < len(sl) {
+                out = out.push(sl[sli])
+                sli = sli + 1
+            }
+        }
+        if type_of(expr.right) != "string" || expr.right != "" {
+            let sr = fission_collect_reads_expr(expr.right)
+            let mut sri = 0
+            while sri < len(sr) {
+                out = out.push(sr[sri])
+                sri = sri + 1
+            }
+        }
+        return out
+    }
+    return []
+}
+
+fn fission_collect_reads(stmt) {
+    if type_of(stmt) == "string" { return [] }
+    let k = stmt.kind
+    if k == "AssignStmt" {
+        let mut out = fission_collect_reads_expr(stmt.right)
+        if type_of(stmt.left) != "string" && type_of(stmt.left) != "array" {
+            if stmt.left.kind == "Index" {
+                let idx_reads = fission_collect_reads_expr(stmt.left.right)
+                let mut iri = 0
+                while iri < len(idx_reads) {
+                    out = out.push(idx_reads[iri])
+                    iri = iri + 1
+                }
+                let base_reads = fission_collect_reads_expr(stmt.left.left)
+                let mut bri = 0
+                while bri < len(base_reads) {
+                    out = out.push(base_reads[bri])
+                    bri = bri + 1
+                }
+            }
+        }
+        return out
+    }
+    if k == "LetStmt" || k == "LetMutStmt" {
+        if type_of(stmt.left) != "string" {
+            return fission_collect_reads_expr(stmt.left)
+        }
+        return []
+    }
+    if k == "ExprStmt" {
+        return fission_collect_reads_expr(stmt.left)
+    }
+    return []
+}
+
+fn fission_name_in(name, arr) {
+    let mut i = 0
+    while i < len(arr) {
+        if arr[i] == name { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn fission_groups_independent(writes_a, reads_a, writes_b, reads_b) {
+    let mut i = 0
+    while i < len(writes_a) {
+        if fission_name_in(writes_a[i], reads_b) { return false }
+        i = i + 1
+    }
+    let mut j = 0
+    while j < len(writes_b) {
+        if fission_name_in(writes_b[j], reads_a) { return false }
+        j = j + 1
+    }
+    let mut k = 0
+    while k < len(writes_a) {
+        if fission_name_in(writes_a[k], writes_b) { return false }
+        k = k + 1
+    }
+    return true
+}
+
+fn anp_detect_fission(node) {
+    if type_of(node) == "string" { return 0 }
+    let k = node.kind
+    if k != "ForStmt" && k != "WhileStmt" { return 0 }
+    let body = node.body
+    if type_of(body) != "array" { return 0 }
+    let n = len(body)
+    if n < 2 { return 0 }
+    let mut effective_n = n
+    if k == "WhileStmt" {
+        let last = body[n - 1]
+        if type_of(last) != "string" && last.kind == "AssignStmt" {
+            effective_n = n - 1
+        }
+    }
+    if effective_n < 2 { return 0 }
+    let mut all_writes = []
+    let mut all_reads = []
+    let mut si = 0
+    while si < effective_n {
+        all_writes = all_writes.push(fission_collect_writes(body[si]))
+        all_reads = all_reads.push(fission_collect_reads(body[si]))
+        si = si + 1
+    }
+    let mut groups = []
+    let mut gw = []
+    let mut gr = []
+    let mut si2 = 0
+    while si2 < effective_n {
+        let sw = all_writes[si2]
+        let sr = all_reads[si2]
+        let mut placed = false
+        let mut gi = 0
+        while gi < len(groups) {
+            if fission_groups_independent(gw[gi], gr[gi], sw, sr) {
+                let mut cur_g = groups[gi]
+                cur_g = cur_g.push(si2)
+                groups[gi] = cur_g
+                let mut cwi = 0
+                let mut merged_w = gw[gi]
+                while cwi < len(sw) {
+                    merged_w = merged_w.push(sw[cwi])
+                    cwi = cwi + 1
+                }
+                gw[gi] = merged_w
+                let mut cri = 0
+                let mut merged_r = gr[gi]
+                while cri < len(sr) {
+                    merged_r = merged_r.push(sr[cri])
+                    cri = cri + 1
+                }
+                gr[gi] = merged_r
+                placed = true
+                gi = len(groups)
+            }
+            gi = gi + 1
+        }
+        if placed == false {
+            let mut new_g = []
+            new_g = new_g.push(si2)
+            groups = groups.push(new_g)
+            gw = gw.push(sw)
+            gr = gr.push(sr)
+        }
+        si2 = si2 + 1
+    }
+    if len(groups) < 2 { return 0 }
+    return len(groups)
+}
+
+fn anp_apply_fission(node) {
+    let ngroups = anp_detect_fission(node)
+    if ngroups < 2 {
+        let mut out = []
+        out = out.push(node)
+        return out
+    }
+    let k = node.kind
+    let body = node.body
+    let n = len(body)
+    let mut has_iv_inc = false
+    let mut iv_stmt = ""
+    let mut effective_n = n
+    if k == "WhileStmt" {
+        let last = body[n - 1]
+        if type_of(last) != "string" && last.kind == "AssignStmt" {
+            has_iv_inc = true
+            iv_stmt = last
+            effective_n = n - 1
+        }
+    }
+    let mut all_writes = []
+    let mut all_reads = []
+    let mut si = 0
+    while si < effective_n {
+        all_writes = all_writes.push(fission_collect_writes(body[si]))
+        all_reads = all_reads.push(fission_collect_reads(body[si]))
+        si = si + 1
+    }
+    let mut groups = []
+    let mut gw = []
+    let mut gr = []
+    let mut si2 = 0
+    while si2 < effective_n {
+        let sw = all_writes[si2]
+        let sr = all_reads[si2]
+        let mut placed = false
+        let mut gi = 0
+        while gi < len(groups) {
+            if fission_groups_independent(gw[gi], gr[gi], sw, sr) {
+                let mut cur_g = groups[gi]
+                cur_g = cur_g.push(si2)
+                groups[gi] = cur_g
+                let mut cwi = 0
+                let mut merged_w = gw[gi]
+                while cwi < len(sw) {
+                    merged_w = merged_w.push(sw[cwi])
+                    cwi = cwi + 1
+                }
+                gw[gi] = merged_w
+                let mut cri = 0
+                let mut merged_r = gr[gi]
+                while cri < len(sr) {
+                    merged_r = merged_r.push(sr[cri])
+                    cri = cri + 1
+                }
+                gr[gi] = merged_r
+                placed = true
+                gi = len(groups)
+            }
+            gi = gi + 1
+        }
+        if placed == false {
+            let mut new_g = []
+            new_g = new_g.push(si2)
+            groups = groups.push(new_g)
+            gw = gw.push(sw)
+            gr = gr.push(sr)
+        }
+        si2 = si2 + 1
+    }
+    let mut result = []
+    let mut gi2 = 0
+    while gi2 < len(groups) {
+        let grp = groups[gi2]
+        let mut new_body = []
+        let mut gsi = 0
+        while gsi < len(grp) {
+            new_body = new_body.push(body[grp[gsi]])
+            gsi = gsi + 1
+        }
+        if has_iv_inc {
+            new_body = new_body.push(iv_stmt)
+        }
+        if k == "ForStmt" {
+            result = result.push(#{
+                "kind": "ForStmt",
+                "name": node.name,
+                "iter_expr": node.iter_expr,
+                "body": new_body
+            })
+        } else {
+            result = result.push(#{
+                "kind": "WhileStmt",
+                "cond": node.cond,
+                "body": new_body
+            })
+        }
+        gi2 = gi2 + 1
+    }
+    return result
+}
+
+let mut m980_fission_splits = 0
+
+fn anp_fission_pass_body(body) {
+    if type_of(body) != "array" { return body }
+    let mut out = []
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        if type_of(stmt) == "string" {
+            out = out.push(stmt)
+            i = i + 1
+            continue
+        }
+        let k = stmt.kind
+        if k == "IfStmt" {
+            let mut new_then = stmt.then_body
+            if type_of(new_then) == "array" {
+                new_then = anp_fission_pass_body(new_then)
+            }
+            let mut new_else = stmt.else_body
+            if type_of(new_else) == "array" {
+                new_else = anp_fission_pass_body(new_else)
+            }
+            out = out.push(#{
+                "kind": "IfStmt",
+                "cond": stmt.cond,
+                "then_body": new_then,
+                "else_body": new_else
+            })
+            i = i + 1
+            continue
+        }
+        if k == "ForStmt" || k == "WhileStmt" {
+            let mut inner_body = stmt.body
+            if type_of(inner_body) == "array" {
+                inner_body = anp_fission_pass_body(inner_body)
+            }
+            let mut processed_stmt = stmt
+            if k == "ForStmt" {
+                processed_stmt = #{
+                    "kind": "ForStmt",
+                    "name": stmt.name,
+                    "iter_expr": stmt.iter_expr,
+                    "body": inner_body
+                }
+            } else {
+                processed_stmt = #{
+                    "kind": "WhileStmt",
+                    "cond": stmt.cond,
+                    "body": inner_body
+                }
+            }
+            let splits = anp_apply_fission(processed_stmt)
+            if len(splits) > 1 {
+                m980_fission_splits = m980_fission_splits + len(splits)
+            }
+            let mut spi = 0
+            while spi < len(splits) {
+                out = out.push(splits[spi])
+                spi = spi + 1
+            }
+            i = i + 1
+            continue
+        }
+        out = out.push(stmt)
+        i = i + 1
+    }
+    return out
+}
+
+fn anp_fission_pass(ast) {
+    if type_of(ast) != "array" { return ast }
+    m980_fission_splits = 0
+    let mut out = []
+    let n = len(ast)
+    let mut i = 0
+    while i < n {
+        let node = ast[i]
+        if type_of(node) != "string" && node.kind == "FnDecl" {
+            let new_body = anp_fission_pass_body(node.body)
+            out = out.push(#{
+                "kind": "FnDecl",
+                "name": node.name,
+                "params": node.params,
+                "body": new_body,
+                "value": node.value,
+                "ret_type": node.ret_type
+            })
+        } else {
+            out = out.push(node)
+        }
+        i = i + 1
+    }
+    if m980_fission_splits > 0 {
+        println("[ai-native] loop-fission: " + to_string(m980_fission_splits) + " loop(s) split")
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════
+//  ROI #67: @cold code splitting — outline cold/error paths
+//  into separate functions for better I-cache utilization.
+//  Cold patterns: panic(), error handling, throw, logging-
+//  heavy blocks inside if-guards, or explicit @cold fns.
+// ═══════════════════════════════════════════════════════════
+
+let mut m978_cold_detected = 0
+let mut m978_cold_outlined = 0
+let mut m978_cold_blocks = 0
+
+fn is_cold_call_expr(expr) {
+    if type_of(expr) == "string" { return false }
+    if expr.kind == "Call" {
+        let callee = expr.left
+        if type_of(callee) != "string" {
+            if callee.kind == "Ident" {
+                if callee.name == "panic" { return true }
+                if callee.name == "throw" { return true }
+                if callee.name == "abort" { return true }
+                if callee.name == "hexa_throw" { return true }
+                if callee.name == "exit" { return true }
+            }
+        }
+    }
+    return false
+}
+
+fn is_cold_stmt(stmt) {
+    if type_of(stmt) == "string" { return false }
+    let k = stmt.kind
+    if k == "ExprStmt" { return is_cold_call_expr(stmt.left) }
+    if k == "ReturnStmt" { return is_cold_call_expr(stmt.left) }
+    return false
+}
+
+fn body_has_cold_pattern(body) {
+    if type_of(body) != "array" { return false }
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        if is_cold_stmt(body[i]) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn count_cold_branches(body) {
+    if type_of(body) != "array" { return 0 }
+    let n = len(body)
+    let mut c = 0
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        if type_of(stmt) != "string" && stmt.kind == "IfStmt" {
+            if body_has_cold_pattern(stmt.then_body) { c = c + 1 }
+            if type_of(stmt.else_body) == "array" && body_has_cold_pattern(stmt.else_body) { c = c + 1 }
+            c = c + count_cold_branches(stmt.then_body)
+            if type_of(stmt.else_body) == "array" { c = c + count_cold_branches(stmt.else_body) }
+        }
+        if type_of(stmt) != "string" && stmt.kind == "WhileStmt" {
+            c = c + count_cold_branches(stmt.body)
+        }
+        i = i + 1
+    }
+    return c
+}
+
+fn anp_detect_cold_path(fn_node) {
+    if type_of(fn_node) == "string" { return 0 }
+    if fn_node.kind != "FnDecl" { return 0 }
+    let body = fn_node.body
+    if type_of(body) != "array" { return 0 }
+    if len(body) == 0 { return 0 }
+    let cold_count = count_cold_branches(body)
+    if cold_count > 0 {
+        m978_cold_detected = m978_cold_detected + 1
+        m978_cold_blocks = m978_cold_blocks + cold_count
+    }
+    return cold_count
+}
+
+fn make_cold_fn_name(parent_name, idx) {
+    return parent_name + "__cold_" + to_string(idx)
+}
+
+fn make_cold_fn(name, params, cold_body) {
+    return AstNode {
+        kind: "FnDecl", name: name, value: "cold", op: "",
+        left: "", right: "", cond: "", then_body: "", else_body: "",
+        params: params, body: cold_body, args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+}
+
+fn make_cold_call(cold_name, params) {
+    let callee = AstNode {
+        kind: "Ident", name: cold_name, value: "", op: "",
+        left: "", right: "", cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+    let mut arg_list = []
+    if type_of(params) == "array" {
+        let mut pi = 0
+        while pi < len(params) {
+            let arg = AstNode {
+                kind: "Ident", name: params[pi].name, value: "", op: "",
+                left: "", right: "", cond: "", then_body: "", else_body: "",
+                params: "", body: "", args: "", fields: "", items: "",
+                variants: "", arms: "", iter_expr: "", ret_type: "",
+                target: "", trait_name: "", methods: ""
+            }
+            arg_list = arg_list.push(arg)
+            pi = pi + 1
+        }
+    }
+    let call_expr = AstNode {
+        kind: "Call", name: "", value: "", op: "",
+        left: callee, right: "", cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: arg_list, fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+    return AstNode {
+        kind: "ReturnStmt", name: "", value: "", op: "",
+        left: call_expr, right: "", cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+}
+
+fn outline_cold_body(body, parent_name, params, start_idx) {
+    if type_of(body) != "array" { return #{ "body": body, "fns": [], "count": 0 } }
+    let mut out = []
+    let mut fns = []
+    let mut idx = start_idx
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        if type_of(stmt) != "string" && stmt.kind == "IfStmt" {
+            let then_cold = body_has_cold_pattern(stmt.then_body)
+            let else_cold = type_of(stmt.else_body) == "array" && body_has_cold_pattern(stmt.else_body)
+            let mut new_then = stmt.then_body
+            let mut new_else = stmt.else_body
+            if then_cold {
+                let cold_name = make_cold_fn_name(parent_name, idx)
+                let cold_fn = make_cold_fn(cold_name, params, stmt.then_body)
+                fns = fns.push(cold_fn)
+                new_then = [make_cold_call(cold_name, params)]
+                idx = idx + 1
+            }
+            if else_cold {
+                let cold_name = make_cold_fn_name(parent_name, idx)
+                let cold_fn = make_cold_fn(cold_name, params, stmt.else_body)
+                fns = fns.push(cold_fn)
+                new_else = [make_cold_call(cold_name, params)]
+                idx = idx + 1
+            }
+            if !then_cold && type_of(new_then) == "array" {
+                let sub = outline_cold_body(new_then, parent_name, params, idx)
+                new_then = sub["body"]
+                let mut fi = 0
+                while fi < len(sub["fns"]) {
+                    fns = fns.push(sub["fns"][fi])
+                    fi = fi + 1
+                }
+                idx = idx + sub["count"]
+            }
+            if !else_cold && type_of(new_else) == "array" {
+                let sub = outline_cold_body(new_else, parent_name, params, idx)
+                new_else = sub["body"]
+                let mut fi = 0
+                while fi < len(sub["fns"]) {
+                    fns = fns.push(sub["fns"][fi])
+                    fi = fi + 1
+                }
+                idx = idx + sub["count"]
+            }
+            let new_if = AstNode {
+                kind: "IfStmt", name: stmt.name, value: stmt.value, op: stmt.op,
+                left: stmt.left, right: stmt.right, cond: stmt.cond,
+                then_body: new_then, else_body: new_else,
+                params: "", body: "", args: "", fields: "", items: "",
+                variants: "", arms: "", iter_expr: "", ret_type: "",
+                target: "", trait_name: "", methods: ""
+            }
+            out = out.push(new_if)
+        } else if type_of(stmt) != "string" && stmt.kind == "WhileStmt" {
+            let sub = outline_cold_body(stmt.body, parent_name, params, idx)
+            let mut fi = 0
+            while fi < len(sub["fns"]) {
+                fns = fns.push(sub["fns"][fi])
+                fi = fi + 1
+            }
+            idx = idx + sub["count"]
+            let new_while = AstNode {
+                kind: "WhileStmt", name: stmt.name, value: stmt.value, op: stmt.op,
+                left: stmt.left, right: stmt.right, cond: stmt.cond,
+                then_body: "", else_body: "",
+                params: "", body: sub["body"], args: "", fields: "", items: "",
+                variants: "", arms: "", iter_expr: "", ret_type: "",
+                target: "", trait_name: "", methods: ""
+            }
+            out = out.push(new_while)
+        } else {
+            out = out.push(stmt)
+        }
+        i = i + 1
+    }
+    return #{ "body": out, "fns": fns, "count": idx - start_idx }
+}
+
+fn anp_outline_cold(fn_node) {
+    if type_of(fn_node) == "string" { return [fn_node] }
+    if fn_node.kind != "FnDecl" { return [fn_node] }
+    let body = fn_node.body
+    if type_of(body) != "array" { return [fn_node] }
+    let cold_count = count_cold_branches(body)
+    if cold_count == 0 { return [fn_node] }
+    let result = outline_cold_body(body, fn_node.name, fn_node.params, 0)
+    if len(result["fns"]) == 0 { return [fn_node] }
+    let rewritten = rewrite_fn_with_body(fn_node, result["body"])
+    m978_cold_outlined = m978_cold_outlined + len(result["fns"])
+    let mut out_nodes = []
+    let mut fi = 0
+    while fi < len(result["fns"]) {
+        out_nodes = out_nodes.push(result["fns"][fi])
+        fi = fi + 1
+    }
+    out_nodes = out_nodes.push(rewritten)
+    return out_nodes
+}
+
+fn anp_cold_split_pass(ast) {
+    if type_of(ast) != "array" { return ast }
+    m978_cold_detected = 0
+    m978_cold_outlined = 0
+    m978_cold_blocks = 0
+    let mut out = []
+    let n = len(ast)
+    let mut i = 0
+    while i < n {
+        let node = ast[i]
+        if type_of(node) != "string" && node.kind == "FnDecl" {
+            let has_cold_attr = type_of(node.value) == "string" && node.value != ""
+            let mut attrs = []
+            if has_cold_attr { attrs = split_attrs_m0(node.value) }
+            let is_cold_fn = attr_has(attrs, "cold")
+            if is_cold_fn {
+                out = out.push(node)
+            } else {
+                let cold_count = anp_detect_cold_path(node)
+                if cold_count > 0 {
+                    let outlined = anp_outline_cold(node)
+                    let mut oi = 0
+                    while oi < len(outlined) {
+                        out = out.push(outlined[oi])
+                        oi = oi + 1
+                    }
+                } else {
+                    out = out.push(node)
+                }
+            }
+        } else {
+            out = out.push(node)
+        }
+        i = i + 1
+    }
+    if m978_cold_outlined > 0 {
+        println("[ai-native] @cold split: " + to_string(m978_cold_detected) + " fn(s), " + to_string(m978_cold_outlined) + " block(s) outlined, " + to_string(m978_cold_blocks) + " cold branch(es)")
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  #68 Scalar Evolution (SCEV) Analysis
+//
+//  Derive closed-form expressions for loop induction variables.
+//  E.g., a variable starting at 0 and incrementing by 2 each
+//  iteration has value 2*i at iteration i.
+//
+//  SCEV result format (map):
+//    { "name": var_name, "base": int, "step": int, "kind": str }
+//  kind = "linear" (base + step*i), "geometric", "unknown"
+// ═══════════════════════════════════════════════════════════════════
+
+let mut m979_scev_ivs_found = 0
+let mut m979_scev_closed_forms = 0
+let mut m979_scev_loops_analyzed = 0
+
+fn anp_scev_name_not_in(name, lst) {
+    let n = len(lst)
+    let mut i = 0
+    while i < n {
+        if lst[i] == name { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn anp_scev_analyze(loop_node) {
+    let body = loop_node.body
+    if type_of(body) != "array" { return [] }
+    let mut ivs = []
+    let mut seen_names = []
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        if type_of(stmt) != "string" && stmt.kind == "AssignStmt" {
+            let vname = stmt.name
+            let rhs = stmt.right
+            if type_of(rhs) != "string" && rhs.kind == "BinOp" {
+                if rhs.op == "+" {
+                    if type_of(rhs.left) != "string" && rhs.left.kind == "Ident" && rhs.left.name == vname {
+                        if type_of(rhs.right) != "string" && rhs.right.kind == "IntLit" {
+                            let step_val = to_int(rhs.right.value)
+                            if anp_scev_name_not_in(vname, seen_names) {
+                                seen_names = seen_names.push(vname)
+                                ivs = ivs.push(#{"name": vname, "base": 0, "step": step_val, "kind": "linear", "op": "+"})
+                            }
+                        }
+                    }
+                    if type_of(rhs.right) != "string" && rhs.right.kind == "Ident" && rhs.right.name == vname {
+                        if type_of(rhs.left) != "string" && rhs.left.kind == "IntLit" {
+                            let step_val = to_int(rhs.left.value)
+                            if anp_scev_name_not_in(vname, seen_names) {
+                                seen_names = seen_names.push(vname)
+                                ivs = ivs.push(#{"name": vname, "base": 0, "step": step_val, "kind": "linear", "op": "+"})
+                            }
+                        }
+                    }
+                }
+                if rhs.op == "-" {
+                    if type_of(rhs.left) != "string" && rhs.left.kind == "Ident" && rhs.left.name == vname {
+                        if type_of(rhs.right) != "string" && rhs.right.kind == "IntLit" {
+                            let step_val = to_int(rhs.right.value)
+                            if anp_scev_name_not_in(vname, seen_names) {
+                                seen_names = seen_names.push(vname)
+                                ivs = ivs.push(#{"name": vname, "base": 0, "step": 0 - step_val, "kind": "linear", "op": "-"})
+                            }
+                        }
+                    }
+                }
+                if rhs.op == "*" {
+                    if type_of(rhs.left) != "string" && rhs.left.kind == "Ident" && rhs.left.name == vname {
+                        if type_of(rhs.right) != "string" && rhs.right.kind == "IntLit" {
+                            let step_val = to_int(rhs.right.value)
+                            if anp_scev_name_not_in(vname, seen_names) {
+                                seen_names = seen_names.push(vname)
+                                ivs = ivs.push(#{"name": vname, "base": 0, "step": step_val, "kind": "geometric", "op": "*"})
+                            }
+                        }
+                    }
+                    if type_of(rhs.right) != "string" && rhs.right.kind == "Ident" && rhs.right.name == vname {
+                        if type_of(rhs.left) != "string" && rhs.left.kind == "IntLit" {
+                            let step_val = to_int(rhs.left.value)
+                            if anp_scev_name_not_in(vname, seen_names) {
+                                seen_names = seen_names.push(vname)
+                                ivs = ivs.push(#{"name": vname, "base": 0, "step": step_val, "kind": "geometric", "op": "*"})
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    m979_scev_ivs_found = m979_scev_ivs_found + len(ivs)
+    return ivs
+}
+
+fn anp_scev_find_init(pre_stmts, varname) {
+    if type_of(pre_stmts) != "array" { return 0 }
+    let n = len(pre_stmts)
+    let mut i = 0
+    while i < n {
+        let stmt = pre_stmts[i]
+        if type_of(stmt) != "string" {
+            if stmt.kind == "LetMutStmt" || stmt.kind == "LetStmt" {
+                if stmt.name == varname {
+                    if type_of(stmt.left) != "string" && stmt.left.kind == "IntLit" {
+                        return to_int(stmt.left.value)
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn anp_scev_closed_form(iv) {
+    let name = iv["name"]
+    let base = iv["base"]
+    let step = iv["step"]
+    let kind = iv["kind"]
+    if kind == "linear" {
+        let cf = to_string(base) + " + " + to_string(step) + "*i"
+        m979_scev_closed_forms = m979_scev_closed_forms + 1
+        return #{"name": name, "base": base, "step": step, "kind": "linear", "closed_form": cf}
+    }
+    if kind == "geometric" {
+        let cf = to_string(base) + " * " + to_string(step) + "^i"
+        m979_scev_closed_forms = m979_scev_closed_forms + 1
+        return #{"name": name, "base": base, "step": step, "kind": "geometric", "closed_form": cf}
+    }
+    return #{"name": name, "base": base, "step": step, "kind": "unknown", "closed_form": "unknown"}
+}
+
+fn anp_scev_eval_linear(base, step, iter) {
+    return base + step * iter
+}
+
+fn anp_scev_eval_geometric(base, step, iter) {
+    let mut result = base
+    let mut j = 0
+    while j < iter {
+        result = result * step
+        j = j + 1
+    }
+    return result
+}
+
+fn anp_scev_trace_linear(base, step, n) {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(base + step * i)
+        i = i + 1
+    }
+    return out
+}
+
+fn anp_scev_trace_geometric(base, step, n) {
+    let mut out = []
+    let mut val = base
+    let mut i = 0
+    while i < n {
+        out = out.push(val)
+        val = val * step
+        i = i + 1
+    }
+    return out
+}
+
+fn anp_scev_analyze_in_context(pre_stmts, loop_node) {
+    let ivs = anp_scev_analyze(loop_node)
+    let mut results = []
+    let n = len(ivs)
+    let mut i = 0
+    while i < n {
+        let iv = ivs[i]
+        let base = anp_scev_find_init(pre_stmts, iv["name"])
+        let iv_with_base = #{"name": iv["name"], "base": base, "step": iv["step"], "kind": iv["kind"], "op": iv["op"]}
+        let cf = anp_scev_closed_form(iv_with_base)
+        results = results.push(cf)
+        i = i + 1
+    }
+    return results
+}
+
+fn anp_scev_pass(ast) {
+    m979_scev_ivs_found = 0
+    m979_scev_closed_forms = 0
+    m979_scev_loops_analyzed = 0
+    if type_of(ast) != "array" { return ast }
+    let n = len(ast)
+    let mut i = 0
+    while i < n {
+        let node = ast[i]
+        if type_of(node) != "string" {
+            if node.kind == "FnDecl" {
+                anp_scev_pass_body(node.body)
+            }
+        }
+        i = i + 1
+    }
+    if m979_scev_ivs_found > 0 {
+        println("[ai-native] SCEV: " + to_string(m979_scev_loops_analyzed) + " loop(s) analyzed, " + to_string(m979_scev_ivs_found) + " IV(s) found, " + to_string(m979_scev_closed_forms) + " closed-form(s)")
+    }
+    return ast
+}
+
+fn anp_scev_pass_body(body) {
+    if type_of(body) != "array" { return }
+    let n = len(body)
+    let mut pre_stmts = []
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        if type_of(stmt) != "string" {
+            if stmt.kind == "WhileStmt" {
+                m979_scev_loops_analyzed = m979_scev_loops_analyzed + 1
+                anp_scev_analyze_in_context(pre_stmts, stmt)
+                anp_scev_pass_body(stmt.body)
+            } else if stmt.kind == "IfStmt" {
+                anp_scev_pass_body(stmt.body)
+                if type_of(stmt.else_body) == "array" {
+                    anp_scev_pass_body(stmt.else_body)
+                }
+            } else {
+                pre_stmts = pre_stmts.push(stmt)
+            }
+        }
+        i = i + 1
+    }
+}
+
+fn anp_scev_lookup_iv(expr, known_ivs) {
+    if type_of(expr) == "string" { return "" }
+    if expr.kind != "Ident" { return "" }
+    let name = expr.name
+    let n = len(known_ivs)
+    let mut i = 0
+    while i < n {
+        if known_ivs[i]["name"] == name { return known_ivs[i] }
+        i = i + 1
+    }
+    return ""
+}
+
+fn anp_scev_detect_derived(loop_body, known_ivs) {
+    if type_of(loop_body) != "array" { return [] }
+    let mut derived = []
+    let n = len(loop_body)
+    let mut i = 0
+    while i < n {
+        let stmt = loop_body[i]
+        if type_of(stmt) != "string" {
+            if stmt.kind == "LetStmt" || stmt.kind == "LetMutStmt" {
+                let vname = stmt.name
+                let init = stmt.left
+                if type_of(init) != "string" && init.kind == "BinOp" {
+                    if init.op == "*" {
+                        let base_iv_info = anp_scev_lookup_iv(init.left, known_ivs)
+                        if base_iv_info != "" {
+                            if type_of(init.right) != "string" && init.right.kind == "IntLit" {
+                                let c = to_int(init.right.value)
+                                let derived_step = base_iv_info["step"] * c
+                                derived = derived.push(#{"name": vname, "base": 0, "step": derived_step, "kind": "linear", "derived_from": base_iv_info["name"]})
+                            }
+                        }
+                        let base_iv_info2 = anp_scev_lookup_iv(init.right, known_ivs)
+                        if base_iv_info2 != "" {
+                            if type_of(init.left) != "string" && init.left.kind == "IntLit" {
+                                let c = to_int(init.left.value)
+                                let derived_step = base_iv_info2["step"] * c
+                                derived = derived.push(#{"name": vname, "base": 0, "step": derived_step, "kind": "linear", "derived_from": base_iv_info2["name"]})
+                            }
+                        }
+                    }
+                    if init.op == "+" {
+                        let base_iv_info = anp_scev_lookup_iv(init.left, known_ivs)
+                        if base_iv_info != "" {
+                            if type_of(init.right) != "string" && init.right.kind == "IntLit" {
+                                let c = to_int(init.right.value)
+                                derived = derived.push(#{"name": vname, "base": base_iv_info["base"] + c, "step": base_iv_info["step"], "kind": "linear", "derived_from": base_iv_info["name"]})
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return derived
+}
+
+fn anp_scev_trip_count(loop_cond, iv_base, iv_step) {
+    if type_of(loop_cond) == "string" { return -1 }
+    if loop_cond.kind != "BinOp" { return -1 }
+    if loop_cond.op != "<" && loop_cond.op != "<=" { return -1 }
+    if type_of(loop_cond.right) == "string" { return -1 }
+    if loop_cond.right.kind != "IntLit" { return -1 }
+    let limit = to_int(loop_cond.right.value)
+    if iv_step == 0 { return -1 }
+    if iv_step > 0 {
+        if iv_base >= limit { return 0 }
+        let range = limit - iv_base
+        if loop_cond.op == "<" {
+            let trips = (range + iv_step - 1) / iv_step
+            return trips
+        }
+        if loop_cond.op == "<=" {
+            let range2 = limit - iv_base + 1
+            let trips = (range2 + iv_step - 1) / iv_step
+            return trips
+        }
+    }
+    return -1
+}
+
+fn anp_scev_sum_linear(base, step, n) {
+    return n * base + step * (n * (n - 1) / 2)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  ROI #72: @profile_guided — PGO branch weight pass
+//  Injects branch probability data from execution profiles.
+//  Likely branches fall through, unlikely branches jump.
+// ═══════════════════════════════════════════════════════════════
+
+fn anp_pgo_load_profile(profile_data) {
+    let mut result = #{}
+    if type_of(profile_data) != "array" { return result }
+    let n = len(profile_data)
+    let mut i = 0
+    while i < n {
+        let entry = profile_data[i]
+        let fn_name = entry["fn"]
+        let bid = entry["branch_id"]
+        let taken = entry["taken"]
+        let not_taken = entry["not_taken"]
+        let total = taken + not_taken
+        let mut prob = 0.5
+        if total > 0 {
+            prob = to_float(taken) / to_float(total)
+        }
+        let key = fn_name + ":" + to_string(bid)
+        result[key] = #{"taken": taken, "not_taken": not_taken, "total": total, "prob": prob}
+        i = i + 1
+    }
+    return result
+}
+
+fn anp_pgo_annotate_branch(if_node, profile, fn_name, branch_id) {
+    let key = fn_name + ":" + to_string(branch_id)
+    let mut result = #{"annotated": false, "prob": 0.5, "likely_branch": "unknown", "branch_id": branch_id}
+    if type_of(profile) != "dict" { return result }
+    let has_key = profile[key]
+    if type_of(has_key) == "string" && has_key == "" { return result }
+    if type_of(has_key) != "dict" { return result }
+    let prob = has_key["prob"]
+    result["annotated"] = true
+    result["prob"] = prob
+    if prob >= 0.8 {
+        result["likely_branch"] = "then"
+    }
+    if prob <= 0.2 {
+        result["likely_branch"] = "else"
+    }
+    return result
+}
+
+fn anp_pgo_collect_branches(body, depth) {
+    if type_of(body) != "array" { return [] }
+    let mut branches = []
+    let mut bid = 0
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        let k = stmt.kind
+        if k == "ExprStmt" {
+            if type_of(stmt.left) != "string" && stmt.left.kind == "IfExpr" {
+                branches = branches.push(#{"branch_id": bid, "kind": "if", "depth": depth})
+                bid = bid + 1
+                let inner_then = anp_pgo_collect_branches(stmt.left.then_body, depth + 1)
+                let mut j = 0
+                while j < len(inner_then) {
+                    let e = inner_then[j]
+                    branches = branches.push(#{"branch_id": bid, "kind": e["kind"], "depth": e["depth"]})
+                    bid = bid + 1
+                    j = j + 1
+                }
+                if type_of(stmt.left.else_body) != "string" {
+                    let inner_else = anp_pgo_collect_branches(stmt.left.else_body, depth + 1)
+                    let mut j2 = 0
+                    while j2 < len(inner_else) {
+                        let e2 = inner_else[j2]
+                        branches = branches.push(#{"branch_id": bid, "kind": e2["kind"], "depth": e2["depth"]})
+                        bid = bid + 1
+                        j2 = j2 + 1
+                    }
+                }
+            }
+        }
+        if k == "ReturnStmt" {
+            if type_of(stmt.left) != "string" && stmt.left.kind == "IfExpr" {
+                branches = branches.push(#{"branch_id": bid, "kind": "return_if", "depth": depth})
+                bid = bid + 1
+            }
+        }
+        if k == "WhileStmt" || k == "ForStmt" {
+            let loop_inner = anp_pgo_collect_branches(stmt.body, depth + 1)
+            let mut j3 = 0
+            while j3 < len(loop_inner) {
+                let e3 = loop_inner[j3]
+                branches = branches.push(#{"branch_id": bid, "kind": e3["kind"], "depth": e3["depth"]})
+                bid = bid + 1
+                j3 = j3 + 1
+            }
+        }
+        i = i + 1
+    }
+    return branches
+}
+
+fn anp_pgo_layout(fn_node, profile) {
+    let fn_name = fn_node.name
+    let branches = anp_pgo_collect_branches(fn_node.body, 0)
+    let n_branches = len(branches)
+    let mut hot_count = 0
+    let mut cold_count = 0
+    let mut neutral_count = 0
+    let mut annotations = []
+    let mut i = 0
+    while i < n_branches {
+        let br = branches[i]
+        let bid = br["branch_id"]
+        let ann = anp_pgo_annotate_branch("", profile, fn_name, bid)
+        annotations = annotations.push(ann)
+        if ann["likely_branch"] == "then" {
+            hot_count = hot_count + 1
+        }
+        if ann["likely_branch"] == "else" {
+            cold_count = cold_count + 1
+        }
+        if ann["likely_branch"] == "unknown" {
+            neutral_count = neutral_count + 1
+        }
+        i = i + 1
+    }
+    return #{"fn_name": fn_name, "total_branches": n_branches, "hot": hot_count, "cold": cold_count, "neutral": neutral_count, "annotations": annotations, "layout_order": "hot_first"}
+}
+
+fn anp_pgo_branch_pass(ast, profile) {
+    let loaded = anp_pgo_load_profile(profile)
+    let mut fns_analyzed = 0
+    let mut total_branches = 0
+    let mut total_hot = 0
+    let mut total_cold = 0
+    let mut total_annotated = 0
+    let mut layouts = []
+    if type_of(ast) != "array" {
+        return #{"fns_analyzed": 0, "total_branches": 0, "hot": 0, "cold": 0, "annotated": 0, "layouts": []}
+    }
+    let n = len(ast)
+    let mut i = 0
+    while i < n {
+        let node = ast[i]
+        if type_of(node) != "string" && node.kind == "FnDecl" {
+            let layout = anp_pgo_layout(node, loaded)
+            fns_analyzed = fns_analyzed + 1
+            total_branches = total_branches + layout["total_branches"]
+            total_hot = total_hot + layout["hot"]
+            total_cold = total_cold + layout["cold"]
+            let anns = layout["annotations"]
+            let mut j = 0
+            while j < len(anns) {
+                if anns[j]["annotated"] == true {
+                    total_annotated = total_annotated + 1
+                }
+                j = j + 1
+            }
+            layouts = layouts.push(layout)
+        }
+        i = i + 1
+    }
+    return #{"fns_analyzed": fns_analyzed, "total_branches": total_branches, "hot": total_hot, "cold": total_cold, "annotated": total_annotated, "layouts": layouts}
+}
+
+// ═══════════════════════════════════════════════════════════
+//  ROI #55: Loop Fusion (루프 퓨전)
+//
+//  Merges adjacent for-loops with identical iteration ranges into
+//  a single loop, eliminating redundant memory traversals.
+//
+//  Example:
+//    for i in 0..n { a[i] = b[i] + 1 }
+//    for i in 0..n { c[i] = a[i] * 2 }
+//  →
+//    for i in 0..n { a[i] = b[i] + 1; c[i] = a[i] * 2 }
+//
+//  Detection: two adjacent ForStmt nodes with Range iter_expr
+//  whose start/end expressions are structurally identical.
+//  Safety: the second loop must not write to the iteration variable
+//  of the first loop (no cross-loop induction variable aliasing).
+// ═══════════════════════════════════════════════════════════
+
+let mut m979_fusion_candidates = 0
+let mut m979_fusion_applied = 0
+
+// Deep structural equality of two AST expressions.
+// Returns true iff both expressions represent the same syntactic tree.
+fn anp_expr_equal(a, b) {
+    // Both strings → direct compare
+    if type_of(a) == "string" && type_of(b) == "string" { return a == b }
+    // Mixed types → not equal
+    if type_of(a) == "string" { return false }
+    if type_of(b) == "string" { return false }
+    // Both are AST nodes — kinds must match
+    if a.kind != b.kind { return false }
+    // Leaf nodes
+    if a.kind == "Ident" { return a.name == b.name }
+    if a.kind == "IntLit" { return a.value == b.value }
+    if a.kind == "FloatLit" { return a.value == b.value }
+    if a.kind == "StringLit" { return a.value == b.value }
+    if a.kind == "BoolLit" { return a.value == b.value }
+    // Binary operator
+    if a.kind == "BinOp" {
+        if a.op != b.op { return false }
+        if anp_expr_equal(a.left, b.left) == false { return false }
+        return anp_expr_equal(a.right, b.right)
+    }
+    // Unary operator
+    if a.kind == "UnaryOp" {
+        if a.op != b.op { return false }
+        return anp_expr_equal(a.left, b.left)
+    }
+    // Index: a[b]
+    if a.kind == "Index" {
+        if anp_expr_equal(a.left, b.left) == false { return false }
+        return anp_expr_equal(a.right, b.right)
+    }
+    // Range: start..end
+    if a.kind == "Range" {
+        if a.value != b.value { return false }
+        if anp_expr_equal(a.left, b.left) == false { return false }
+        return anp_expr_equal(a.right, b.right)
+    }
+    // FieldAccess
+    if a.kind == "FieldAccess" {
+        if a.name != b.name { return false }
+        return anp_expr_equal(a.left, b.left)
+    }
+    // Call — callee + args
+    if a.kind == "Call" {
+        if anp_expr_equal(a.left, b.left) == false { return false }
+        if type_of(a.args) != type_of(b.args) { return false }
+        if type_of(a.args) == "array" {
+            if len(a.args) != len(b.args) { return false }
+            let mut ci = 0
+            while ci < len(a.args) {
+                if anp_expr_equal(a.args[ci], b.args[ci]) == false { return false }
+                ci = ci + 1
+            }
+            return true
+        }
+        return true
+    }
+    // Fallback: conservative — not equal
+    return false
+}
+
+// Check if a name appears as an assignment target in a loop body.
+fn anp_body_writes_name(body, name) {
+    if type_of(body) != "array" { return false }
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        if stmt.kind == "AssignStmt" {
+            // Direct assignment: name = ...
+            if type_of(stmt.left) == "string" {
+                if stmt.name == name { return true }
+            }
+            if type_of(stmt.left) != "string" {
+                if stmt.left.kind == "Ident" && stmt.left.name == name { return true }
+            }
+        }
+        if stmt.kind == "LetMutStmt" {
+            if stmt.name == name { return true }
+        }
+        if stmt.kind == "LetStmt" {
+            if stmt.name == name { return true }
+        }
+        // Recurse into nested blocks
+        if stmt.kind == "WhileStmt" {
+            if anp_body_writes_name(stmt.body, name) { return true }
+        }
+        if stmt.kind == "ForStmt" {
+            if anp_body_writes_name(stmt.body, name) { return true }
+        }
+        if stmt.kind == "IfStmt" {
+            if type_of(stmt.then_body) == "array" {
+                if anp_body_writes_name(stmt.then_body, name) { return true }
+            }
+            if type_of(stmt.else_body) == "array" {
+                if anp_body_writes_name(stmt.else_body, name) { return true }
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// Collect all scalar names written (assigned) in a loop body.
+fn anp_collect_scalar_writes(body) {
+    if type_of(body) != "array" { return [] }
+    let mut out = []
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        if stmt.kind == "AssignStmt" {
+            if type_of(stmt.left) != "string" {
+                if stmt.left.kind == "Ident" {
+                    out = out.push(stmt.left.name)
+                }
+            }
+            if stmt.name != "" {
+                // Only if it's not an indexed write
+                if type_of(stmt.left) == "string" {
+                    out = out.push(stmt.name)
+                }
+                if type_of(stmt.left) != "string" {
+                    if stmt.left.kind != "Index" {
+                        out = out.push(stmt.name)
+                    }
+                }
+            }
+        }
+        if stmt.kind == "LetMutStmt" {
+            out = out.push(stmt.name)
+        }
+        if stmt.kind == "LetStmt" {
+            out = out.push(stmt.name)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Detect whether two adjacent ForStmt loops can be fused.
+// Requirements:
+//   1. Both are ForStmt with Range iter_expr
+//   2. Same range (start, end, exclusive/inclusive)
+//   3. No conflicting scalar writes between loops
+//   4. Neither loop writes the other's iteration variable
+fn anp_detect_fusion(loop1, loop2) {
+    // Must be ForStmt
+    if loop1.kind != "ForStmt" { return false }
+    if loop2.kind != "ForStmt" { return false }
+    // Must have array bodies
+    if type_of(loop1.body) != "array" { return false }
+    if type_of(loop2.body) != "array" { return false }
+    // Must have Range iter_expr
+    if type_of(loop1.iter_expr) == "string" { return false }
+    if type_of(loop2.iter_expr) == "string" { return false }
+    if loop1.iter_expr.kind != "Range" { return false }
+    if loop2.iter_expr.kind != "Range" { return false }
+    // Ranges must be structurally identical
+    if anp_expr_equal(loop1.iter_expr, loop2.iter_expr) == false { return false }
+    // The second body must not write the first loop's iteration variable
+    if anp_body_writes_name(loop2.body, loop1.name) { return false }
+    // The first body must not write the second loop's iteration variable
+    if anp_body_writes_name(loop1.body, loop2.name) { return false }
+    // Safety: check for WAW (write-after-write) conflicts on scalars.
+    // If both loops write the same scalar variable, fusion changes order.
+    let writes1 = anp_collect_scalar_writes(loop1.body)
+    let writes2 = anp_collect_scalar_writes(loop2.body)
+    let mut wi = 0
+    while wi < len(writes1) {
+        let w1 = writes1[wi]
+        let mut wj = 0
+        while wj < len(writes2) {
+            if writes2[wj] == w1 {
+                // Both loops write the same scalar — not safe
+                if w1 != loop1.name && w1 != loop2.name {
+                    return false
+                }
+            }
+            wj = wj + 1
+        }
+        wi = wi + 1
+    }
+    return true
+}
+
+// Merge two fusible ForStmt loops into one.
+// The merged loop uses the first loop's iteration variable.
+// If the second loop uses a different variable name, substitute it.
+fn anp_apply_fusion(loop1, loop2) {
+    let mut merged_body = []
+    // Copy loop1 body
+    let mut i = 0
+    while i < len(loop1.body) {
+        merged_body = merged_body.push(loop1.body[i])
+        i = i + 1
+    }
+    // Copy loop2 body, substituting iter var if different
+    let need_subst = loop1.name != loop2.name
+    let mut j = 0
+    while j < len(loop2.body) {
+        if need_subst {
+            merged_body = merged_body.push(anp_subst_ident(loop2.body[j], loop2.name, loop1.name))
+        } else {
+            merged_body = merged_body.push(loop2.body[j])
+        }
+        j = j + 1
+    }
+    // Build the fused ForStmt
+    return AstNode {
+        kind: "ForStmt", name: loop1.name, value: "", op: "",
+        left: "", right: "", cond: "", then_body: "", else_body: "",
+        params: "", body: merged_body, args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: loop1.iter_expr, ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+}
+
+// Substitute all occurrences of ident `old_name` with `new_name` in an expression.
+fn anp_subst_ident_expr(expr, old_name, new_name) {
+    if type_of(expr) == "string" { return expr }
+    if expr.kind == "Ident" {
+        if expr.name == old_name {
+            return make_ident(new_name)
+        }
+        return expr
+    }
+    if expr.kind == "BinOp" {
+        let nl = anp_subst_ident_expr(expr.left, old_name, new_name)
+        let nr = anp_subst_ident_expr(expr.right, old_name, new_name)
+        return AstNode {
+            kind: "BinOp", name: "", value: "", op: expr.op,
+            left: nl, right: nr, cond: "", then_body: "", else_body: "",
+            params: "", body: "", args: "", fields: "", items: "",
+            variants: "", arms: "", iter_expr: "", ret_type: "",
+            target: "", trait_name: "", methods: ""
+        }
+    }
+    if expr.kind == "UnaryOp" {
+        let nl = anp_subst_ident_expr(expr.left, old_name, new_name)
+        return AstNode {
+            kind: "UnaryOp", name: "", value: "", op: expr.op,
+            left: nl, right: "", cond: "", then_body: "", else_body: "",
+            params: "", body: "", args: "", fields: "", items: "",
+            variants: "", arms: "", iter_expr: "", ret_type: "",
+            target: "", trait_name: "", methods: ""
+        }
+    }
+    if expr.kind == "Index" {
+        let nl = anp_subst_ident_expr(expr.left, old_name, new_name)
+        let nr = anp_subst_ident_expr(expr.right, old_name, new_name)
+        return AstNode {
+            kind: "Index", name: "", value: "", op: "",
+            left: nl, right: nr, cond: "", then_body: "", else_body: "",
+            params: "", body: "", args: "", fields: "", items: "",
+            variants: "", arms: "", iter_expr: "", ret_type: "",
+            target: "", trait_name: "", methods: ""
+        }
+    }
+    if expr.kind == "Call" {
+        let nl = anp_subst_ident_expr(expr.left, old_name, new_name)
+        let mut new_args = []
+        if type_of(expr.args) == "array" {
+            let mut ai = 0
+            while ai < len(expr.args) {
+                new_args = new_args.push(anp_subst_ident_expr(expr.args[ai], old_name, new_name))
+                ai = ai + 1
+            }
+        }
+        return AstNode {
+            kind: "Call", name: "", value: "", op: "",
+            left: nl, right: "", cond: "", then_body: "", else_body: "",
+            params: "", body: "", args: new_args, fields: "", items: "",
+            variants: "", arms: "", iter_expr: "", ret_type: "",
+            target: "", trait_name: "", methods: ""
+        }
+    }
+    if expr.kind == "FieldAccess" {
+        let nl = anp_subst_ident_expr(expr.left, old_name, new_name)
+        return AstNode {
+            kind: "FieldAccess", name: expr.name, value: "", op: "",
+            left: nl, right: "", cond: "", then_body: "", else_body: "",
+            params: "", body: "", args: "", fields: "", items: "",
+            variants: "", arms: "", iter_expr: "", ret_type: "",
+            target: "", trait_name: "", methods: ""
+        }
+    }
+    return expr
+}
+
+// Substitute ident in a statement (recursively handles body, left, right, cond).
+fn anp_subst_ident(stmt, old_name, new_name) {
+    if type_of(stmt) == "string" { return stmt }
+    let k = stmt.kind
+    if k == "AssignStmt" {
+        return AstNode {
+            kind: "AssignStmt", name: stmt.name, value: stmt.value, op: stmt.op,
+            left: anp_subst_ident_expr(stmt.left, old_name, new_name),
+            right: anp_subst_ident_expr(stmt.right, old_name, new_name),
+            cond: "", then_body: "", else_body: "",
+            params: "", body: "", args: "", fields: "", items: "",
+            variants: "", arms: "", iter_expr: "", ret_type: "",
+            target: "", trait_name: "", methods: ""
+        }
+    }
+    if k == "LetStmt" || k == "LetMutStmt" {
+        return AstNode {
+            kind: k, name: stmt.name, value: stmt.value, op: "",
+            left: anp_subst_ident_expr(stmt.left, old_name, new_name),
+            right: "", cond: "", then_body: "", else_body: "",
+            params: "", body: "", args: "", fields: "", items: "",
+            variants: "", arms: "", iter_expr: "", ret_type: "",
+            target: "", trait_name: "", methods: ""
+        }
+    }
+    if k == "ExprStmt" {
+        return AstNode {
+            kind: "ExprStmt", name: "", value: "", op: "",
+            left: anp_subst_ident_expr(stmt.left, old_name, new_name),
+            right: "", cond: "", then_body: "", else_body: "",
+            params: "", body: "", args: "", fields: "", items: "",
+            variants: "", arms: "", iter_expr: "", ret_type: "",
+            target: "", trait_name: "", methods: ""
+        }
+    }
+    if k == "ReturnStmt" {
+        return AstNode {
+            kind: "ReturnStmt", name: "", value: "", op: "",
+            left: anp_subst_ident_expr(stmt.left, old_name, new_name),
+            right: "", cond: "", then_body: "", else_body: "",
+            params: "", body: "", args: "", fields: "", items: "",
+            variants: "", arms: "", iter_expr: "", ret_type: "",
+            target: "", trait_name: "", methods: ""
+        }
+    }
+    if k == "ForStmt" {
+        let new_body = anp_subst_ident_body(stmt.body, old_name, new_name)
+        let new_iter = anp_subst_ident_expr(stmt.iter_expr, old_name, new_name)
+        return AstNode {
+            kind: "ForStmt", name: stmt.name, value: "", op: "",
+            left: "", right: "", cond: "", then_body: "", else_body: "",
+            params: "", body: new_body, args: "", fields: "", items: "",
+            variants: "", arms: "", iter_expr: new_iter, ret_type: "",
+            target: "", trait_name: "", methods: ""
+        }
+    }
+    if k == "WhileStmt" {
+        let new_body = anp_subst_ident_body(stmt.body, old_name, new_name)
+        let new_cond = anp_subst_ident_expr(stmt.cond, old_name, new_name)
+        return AstNode {
+            kind: "WhileStmt", name: "", value: "", op: "",
+            left: "", right: "", cond: new_cond, then_body: "", else_body: "",
+            params: "", body: new_body, args: "", fields: "", items: "",
+            variants: "", arms: "", iter_expr: "", ret_type: "",
+            target: "", trait_name: "", methods: ""
+        }
+    }
+    if k == "IfStmt" {
+        let new_cond = anp_subst_ident_expr(stmt.cond, old_name, new_name)
+        let new_then = anp_subst_ident_body(stmt.then_body, old_name, new_name)
+        let new_else = anp_subst_ident_body(stmt.else_body, old_name, new_name)
+        return AstNode {
+            kind: "IfStmt", name: "", value: "", op: "",
+            left: "", right: "", cond: new_cond, then_body: new_then, else_body: new_else,
+            params: "", body: "", args: "", fields: "", items: "",
+            variants: "", arms: "", iter_expr: "", ret_type: "",
+            target: "", trait_name: "", methods: ""
+        }
+    }
+    return stmt
+}
+
+// Substitute ident in a body (array of statements).
+fn anp_subst_ident_body(body, old_name, new_name) {
+    if type_of(body) != "array" { return body }
+    let mut out = []
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        out = out.push(anp_subst_ident(body[i], old_name, new_name))
+        i = i + 1
+    }
+    return out
+}
+
+// Walk a function body and fuse adjacent fusible for-loops.
+fn anp_fusion_body(body) {
+    if type_of(body) != "array" { return body }
+    let n = len(body)
+    if n < 2 { return body }
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        if i + 1 < n {
+            let cur = body[i]
+            let nxt = body[i + 1]
+            if cur.kind == "ForStmt" && nxt.kind == "ForStmt" {
+                if anp_detect_fusion(cur, nxt) {
+                    m979_fusion_candidates = m979_fusion_candidates + 1
+                    let fused = anp_apply_fusion(cur, nxt)
+                    m979_fusion_applied = m979_fusion_applied + 1
+                    // The fused loop might be fusible with the next one too
+                    out = out.push(fused)
+                    i = i + 2
+                } else {
+                    out = out.push(cur)
+                    i = i + 1
+                }
+            } else {
+                out = out.push(cur)
+                i = i + 1
+            }
+        } else {
+            out = out.push(body[i])
+            i = i + 1
+        }
+    }
+    // Multi-pass: if we fused anything, try again on the result
+    // (handles chains of 3+ fusible loops)
+    if len(out) < n {
+        return anp_fusion_body(out)
+    }
+    return out
+}
+
+// Top-level AST pass: walk all FnDecl nodes and apply loop fusion.
+fn anp_fusion_pass(ast) {
+    m979_fusion_candidates = 0
+    m979_fusion_applied = 0
+    let mut out = []
+    let n = len(ast)
+    let mut i = 0
+    while i < n {
+        let node = ast[i]
+        if node.kind == "FnDecl" {
+            let before = m979_fusion_applied
+            let new_body = anp_fusion_body(node.body)
+            if m979_fusion_applied > before {
+                out = out.push(rewrite_fn_with_body(node, new_body))
+            } else {
+                out = out.push(node)
+            }
+        } else {
+            out = out.push(node)
+        }
+        i = i + 1
+    }
+    if m979_fusion_applied > 0 {
+        println("[ai-native] loop-fusion: " + to_string(m979_fusion_candidates) + " candidate(s), " + to_string(m979_fusion_applied) + " fused")
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  ROI #73: Chordal Graph Coloring for Register Allocation
+// ═══════════════════════════════════════════════════════════════════
+
+fn anp_cc_contains(arr, val) {
+    let mut i = 0
+    while i < len(arr) {
+        if arr[i] == val { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn anp_cc_index(arr, val) {
+    let mut i = 0
+    while i < len(arr) {
+        if arr[i] == val { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn anp_cc_remove(arr, val) {
+    let mut out = []
+    let mut found = false
+    let mut i = 0
+    while i < len(arr) {
+        if arr[i] == val && !found {
+            found = true
+        } else {
+            out = out.push(arr[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn anp_build_interference(live_ranges) {
+    let mut nodes = []
+    let mut i = 0
+    while i < len(live_ranges) {
+        let vid = live_ranges[i][0]
+        if !anp_cc_contains(nodes, vid) {
+            nodes = nodes.push(vid)
+        }
+        i = i + 1
+    }
+    nodes = nodes.sort()
+    let n = len(nodes)
+    let mut adj = []
+    i = 0
+    while i < n {
+        adj = adj.push([])
+        i = i + 1
+    }
+    i = 0
+    while i < len(live_ranges) {
+        let mut j = i + 1
+        while j < len(live_ranges) {
+            let a_id = live_ranges[i][0]
+            let b_id = live_ranges[j][0]
+            if a_id != b_id {
+                let a_start = live_ranges[i][1]
+                let a_end = live_ranges[i][2]
+                let b_start = live_ranges[j][1]
+                let b_end = live_ranges[j][2]
+                if !(a_end <= b_start || b_end <= a_start) {
+                    let ai = anp_cc_index(nodes, a_id)
+                    let bi = anp_cc_index(nodes, b_id)
+                    if !anp_cc_contains(adj[ai], b_id) {
+                        adj[ai] = adj[ai].push(b_id)
+                    }
+                    if !anp_cc_contains(adj[bi], a_id) {
+                        adj[bi] = adj[bi].push(a_id)
+                    }
+                }
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return [nodes, adj]
+}
+
+fn anp_perfect_elimination_order(graph) {
+    let nodes = graph[0]
+    let adj = graph[1]
+    let n = len(nodes)
+    if n == 0 { return [] }
+    let mut weight = []
+    let mut numbered = []
+    let mut i = 0
+    while i < n {
+        weight = weight.push(0)
+        numbered = numbered.push(false)
+        i = i + 1
+    }
+    let mut order = []
+    let mut step = 0
+    while step < n {
+        let mut best_idx = -1
+        let mut best_w = -1
+        i = 0
+        while i < n {
+            if !numbered[i] {
+                if weight[i] > best_w {
+                    best_w = weight[i]
+                    best_idx = i
+                }
+            }
+            i = i + 1
+        }
+        numbered[best_idx] = true
+        order = order.push(nodes[best_idx])
+        let neighbors = adj[best_idx]
+        let mut k = 0
+        while k < len(neighbors) {
+            let nb_id = neighbors[k]
+            let nb_idx = anp_cc_index(nodes, nb_id)
+            if nb_idx >= 0 && !numbered[nb_idx] {
+                weight[nb_idx] = weight[nb_idx] + 1
+            }
+            k = k + 1
+        }
+        step = step + 1
+    }
+    let mut rev = []
+    i = len(order) - 1
+    while i >= 0 {
+        rev = rev.push(order[i])
+        i = i - 1
+    }
+    return rev
+}
+
+fn anp_verify_peo(graph, peo) {
+    let nodes = graph[0]
+    let adj = graph[1]
+    let n = len(nodes)
+    if n <= 1 { return true }
+    let mut pos = []
+    let mut i = 0
+    while i < n {
+        pos = pos.push(0)
+        i = i + 1
+    }
+    i = 0
+    while i < len(peo) {
+        let idx = anp_cc_index(nodes, peo[i])
+        if idx >= 0 {
+            pos[idx] = i
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < len(peo) {
+        let v = peo[i]
+        let v_idx = anp_cc_index(nodes, v)
+        let neighbors = adj[v_idx]
+        let mut later = []
+        let mut k = 0
+        while k < len(neighbors) {
+            let nb = neighbors[k]
+            let nb_idx = anp_cc_index(nodes, nb)
+            if nb_idx >= 0 && pos[nb_idx] > i {
+                later = later.push(nb)
+            }
+            k = k + 1
+        }
+        let mut a = 0
+        while a < len(later) {
+            let mut b = a + 1
+            while b < len(later) {
+                let a_idx = anp_cc_index(nodes, later[a])
+                if !anp_cc_contains(adj[a_idx], later[b]) {
+                    return false
+                }
+                b = b + 1
+            }
+            a = a + 1
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn anp_greedy_color(graph, peo) {
+    let nodes = graph[0]
+    let adj = graph[1]
+    let n = len(nodes)
+    if n == 0 { return [] }
+    let mut colors = []
+    let mut i = 0
+    while i < n {
+        colors = colors.push(-1)
+        i = i + 1
+    }
+    i = len(peo) - 1
+    while i >= 0 {
+        let v = peo[i]
+        let v_idx = anp_cc_index(nodes, v)
+        let mut used = []
+        let neighbors = adj[v_idx]
+        let mut k = 0
+        while k < len(neighbors) {
+            let nb = neighbors[k]
+            let nb_idx = anp_cc_index(nodes, nb)
+            if nb_idx >= 0 && colors[nb_idx] >= 0 {
+                if !anp_cc_contains(used, colors[nb_idx]) {
+                    used = used.push(colors[nb_idx])
+                }
+            }
+            k = k + 1
+        }
+        let mut c = 0
+        while anp_cc_contains(used, c) {
+            c = c + 1
+        }
+        colors[v_idx] = c
+        i = i - 1
+    }
+    return colors
+}
+
+fn anp_chromatic_number(colors) {
+    if len(colors) == 0 { return 0 }
+    let mut mx = -1
+    let mut i = 0
+    while i < len(colors) {
+        if colors[i] > mx { mx = colors[i] }
+        i = i + 1
+    }
+    return mx + 1
+}
+
+fn anp_valid_coloring(graph, colors) {
+    let nodes = graph[0]
+    let adj = graph[1]
+    let mut i = 0
+    while i < len(nodes) {
+        let neighbors = adj[i]
+        let mut k = 0
+        while k < len(neighbors) {
+            let nb = neighbors[k]
+            let nb_idx = anp_cc_index(nodes, nb)
+            if nb_idx >= 0 && colors[i] == colors[nb_idx] {
+                return false
+            }
+            k = k + 1
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn anp_max_clique_size(graph) {
+    let nodes = graph[0]
+    let adj = graph[1]
+    let n = len(nodes)
+    if n == 0 { return 0 }
+    let mut best = 1
+    let mut i = 0
+    while i < n {
+        let mut j = i + 1
+        while j < n {
+            if anp_cc_contains(adj[i], nodes[j]) {
+                if 2 > best { best = 2 }
+                let mut k = j + 1
+                while k < n {
+                    if anp_cc_contains(adj[i], nodes[k]) && anp_cc_contains(adj[j], nodes[k]) {
+                        if 3 > best { best = 3 }
+                        let mut m = k + 1
+                        while m < n {
+                            if anp_cc_contains(adj[i], nodes[m]) && anp_cc_contains(adj[j], nodes[m]) && anp_cc_contains(adj[k], nodes[m]) {
+                                if 4 > best { best = 4 }
+                            }
+                            m = m + 1
+                        }
+                    }
+                    k = k + 1
+                }
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return best
+}
+
+fn anp_build_graph_from_edges(all_nodes, edges) {
+    let mut nodes = []
+    let mut i = 0
+    while i < len(all_nodes) {
+        nodes = nodes.push(all_nodes[i])
+        i = i + 1
+    }
+    nodes = nodes.sort()
+    let n = len(nodes)
+    let mut adj = []
+    i = 0
+    while i < n {
+        adj = adj.push([])
+        i = i + 1
+    }
+    i = 0
+    while i < len(edges) {
+        let a = edges[i][0]
+        let b = edges[i][1]
+        let ai = anp_cc_index(nodes, a)
+        let bi = anp_cc_index(nodes, b)
+        if ai >= 0 && bi >= 0 {
+            if !anp_cc_contains(adj[ai], b) {
+                adj[ai] = adj[ai].push(b)
+            }
+            if !anp_cc_contains(adj[bi], a) {
+                adj[bi] = adj[bi].push(a)
+            }
+        }
+        i = i + 1
+    }
+    return [nodes, adj]
+}
+
+fn anp_chordal_color_pass(ast) {
+    let mut total_colored = 0
+    let mut total_regs_saved = 0
+    let mut total_functions = 0
+    let mut i = 0
+    while i < len(ast) {
+        let node = ast[i]
+        if type_of(node) == "array" && len(node) >= 4 {
+            let tag = node[0]
+            if tag == "fn" || tag == "FnDecl" {
+                total_functions = total_functions + 1
+                let body = node[3]
+                let mut live_ranges = []
+                let mut var_id = 0
+                let mut j = 0
+                while j < len(body) {
+                    let stmt = body[j]
+                    if type_of(stmt) == "array" && len(stmt) >= 1 {
+                        let stag = stmt[0]
+                        if stag == "let" || stag == "Let" {
+                            let end_pos = min(j + 5, len(body))
+                            live_ranges = live_ranges.push([var_id, j, end_pos])
+                            var_id = var_id + 1
+                        }
+                    }
+                    j = j + 1
+                }
+                if len(live_ranges) >= 2 {
+                    let graph = anp_build_interference(live_ranges)
+                    let peo = anp_perfect_elimination_order(graph)
+                    let colors = anp_greedy_color(graph, peo)
+                    let num_regs = anp_chromatic_number(colors)
+                    let naive_regs = len(live_ranges)
+                    if num_regs < naive_regs {
+                        total_regs_saved = total_regs_saved + (naive_regs - num_regs)
+                    }
+                    total_colored = total_colored + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    if total_colored > 0 {
+        println("[ai-native] chordal-color: " + to_string(total_colored) + " fn(s), " + to_string(total_regs_saved) + " reg(s) saved")
+    }
+    return ast
+}
+
+// ── ROI #58: Boolean expression simplification pass ─────────────────
+let mut m978_bool_simpl = 0
+
+fn anp_simplify_bool(expr) {
+    if type_of(expr) == "string" { return expr }
+    // ── UnaryOp: logical NOT ──
+    if expr.kind == "UnaryOp" && expr.op == "!" {
+        let inner = anp_simplify_bool(expr.left)
+        // !true → false
+        if is_bool_true(inner) {
+            m978_bool_simpl = m978_bool_simpl + 1
+            return make_bool_lit("false")
+        }
+        // !false → true
+        if is_bool_false(inner) {
+            m978_bool_simpl = m978_bool_simpl + 1
+            return make_bool_lit("true")
+        }
+        // !!x → x
+        if type_of(inner) != "string" && inner.kind == "UnaryOp" && inner.op == "!" {
+            m978_bool_simpl = m978_bool_simpl + 1
+            return anp_simplify_bool(inner.left)
+        }
+        // !(a == b) → a != b
+        if type_of(inner) != "string" && inner.kind == "BinOp" && inner.op == "==" {
+            m978_bool_simpl = m978_bool_simpl + 1
+            return AstNode {
+                kind: "BinOp", name: "", value: "", op: "!=",
+                left: inner.left, right: inner.right, cond: "", then_body: "", else_body: "",
+                params: "", body: "", args: "", fields: "", items: "",
+                variants: "", arms: "", iter_expr: "", ret_type: "",
+                target: "", trait_name: "", methods: ""
+            }
+        }
+        // !(a != b) → a == b
+        if type_of(inner) != "string" && inner.kind == "BinOp" && inner.op == "!=" {
+            m978_bool_simpl = m978_bool_simpl + 1
+            return AstNode {
+                kind: "BinOp", name: "", value: "", op: "==",
+                left: inner.left, right: inner.right, cond: "", then_body: "", else_body: "",
+                params: "", body: "", args: "", fields: "", items: "",
+                variants: "", arms: "", iter_expr: "", ret_type: "",
+                target: "", trait_name: "", methods: ""
+            }
+        }
+        return AstNode {
+            kind: "UnaryOp", name: "", value: "", op: "!",
+            left: inner, right: "", cond: "", then_body: "", else_body: "",
+            params: "", body: "", args: "", fields: "", items: "",
+            variants: "", arms: "", iter_expr: "", ret_type: "",
+            target: "", trait_name: "", methods: ""
+        }
+    }
+    // ── BinOp: &&, ||, ==, != with booleans ──
+    if expr.kind == "BinOp" {
+        let l = anp_simplify_bool(expr.left)
+        let r = anp_simplify_bool(expr.right)
+        let op = expr.op
+        // a && true → a, true && a → a
+        if op == "&&" {
+            if is_bool_true(r) {
+                m978_bool_simpl = m978_bool_simpl + 1
+                return l
+            }
+            if is_bool_true(l) {
+                m978_bool_simpl = m978_bool_simpl + 1
+                return r
+            }
+            if is_bool_false(l) {
+                m978_bool_simpl = m978_bool_simpl + 1
+                return make_bool_lit("false")
+            }
+            if is_bool_false(r) {
+                m978_bool_simpl = m978_bool_simpl + 1
+                return make_bool_lit("false")
+            }
+            if same_ident(l, r) {
+                m978_bool_simpl = m978_bool_simpl + 1
+                return l
+            }
+            if is_not_of(l, r) || is_not_of(r, l) {
+                m978_bool_simpl = m978_bool_simpl + 1
+                return make_bool_lit("false")
+            }
+        }
+        if op == "||" {
+            if is_bool_true(l) {
+                m978_bool_simpl = m978_bool_simpl + 1
+                return make_bool_lit("true")
+            }
+            if is_bool_true(r) {
+                m978_bool_simpl = m978_bool_simpl + 1
+                return make_bool_lit("true")
+            }
+            if is_bool_false(l) {
+                m978_bool_simpl = m978_bool_simpl + 1
+                return r
+            }
+            if is_bool_false(r) {
+                m978_bool_simpl = m978_bool_simpl + 1
+                return l
+            }
+            if same_ident(l, r) {
+                m978_bool_simpl = m978_bool_simpl + 1
+                return l
+            }
+            if is_not_of(l, r) || is_not_of(r, l) {
+                m978_bool_simpl = m978_bool_simpl + 1
+                return make_bool_lit("true")
+            }
+        }
+        if op == "==" {
+            if is_bool_true(r) {
+                m978_bool_simpl = m978_bool_simpl + 1
+                return l
+            }
+            if is_bool_true(l) {
+                m978_bool_simpl = m978_bool_simpl + 1
+                return r
+            }
+            if is_bool_false(r) {
+                m978_bool_simpl = m978_bool_simpl + 1
+                return AstNode {
+                    kind: "UnaryOp", name: "", value: "", op: "!",
+                    left: l, right: "", cond: "", then_body: "", else_body: "",
+                    params: "", body: "", args: "", fields: "", items: "",
+                    variants: "", arms: "", iter_expr: "", ret_type: "",
+                    target: "", trait_name: "", methods: ""
+                }
+            }
+            if is_bool_false(l) {
+                m978_bool_simpl = m978_bool_simpl + 1
+                return AstNode {
+                    kind: "UnaryOp", name: "", value: "", op: "!",
+                    left: r, right: "", cond: "", then_body: "", else_body: "",
+                    params: "", body: "", args: "", fields: "", items: "",
+                    variants: "", arms: "", iter_expr: "", ret_type: "",
+                    target: "", trait_name: "", methods: ""
+                }
+            }
+            if type_of(l) != "string" && type_of(r) != "string" {
+                if l.kind == "BoolLit" && r.kind == "BoolLit" {
+                    m978_bool_simpl = m978_bool_simpl + 1
+                    return make_bool_lit_from_bool(l.value == r.value)
+                }
+            }
+        }
+        if op == "!=" {
+            if is_bool_true(r) {
+                m978_bool_simpl = m978_bool_simpl + 1
+                return AstNode {
+                    kind: "UnaryOp", name: "", value: "", op: "!",
+                    left: l, right: "", cond: "", then_body: "", else_body: "",
+                    params: "", body: "", args: "", fields: "", items: "",
+                    variants: "", arms: "", iter_expr: "", ret_type: "",
+                    target: "", trait_name: "", methods: ""
+                }
+            }
+            if is_bool_true(l) {
+                m978_bool_simpl = m978_bool_simpl + 1
+                return AstNode {
+                    kind: "UnaryOp", name: "", value: "", op: "!",
+                    left: r, right: "", cond: "", then_body: "", else_body: "",
+                    params: "", body: "", args: "", fields: "", items: "",
+                    variants: "", arms: "", iter_expr: "", ret_type: "",
+                    target: "", trait_name: "", methods: ""
+                }
+            }
+            if is_bool_false(r) {
+                m978_bool_simpl = m978_bool_simpl + 1
+                return l
+            }
+            if is_bool_false(l) {
+                m978_bool_simpl = m978_bool_simpl + 1
+                return r
+            }
+            if type_of(l) != "string" && type_of(r) != "string" {
+                if l.kind == "BoolLit" && r.kind == "BoolLit" {
+                    m978_bool_simpl = m978_bool_simpl + 1
+                    return make_bool_lit_from_bool(l.value != r.value)
+                }
+            }
+        }
+        return AstNode {
+            kind: "BinOp", name: "", value: "", op: op,
+            left: l, right: r, cond: "", then_body: "", else_body: "",
+            params: "", body: "", args: "", fields: "", items: "",
+            variants: "", arms: "", iter_expr: "", ret_type: "",
+            target: "", trait_name: "", methods: ""
+        }
+    }
+    return expr
+}
+
+fn anp_bool_simplify_body(body) {
+    if type_of(body) != "array" { return body }
+    let mut out = []
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        let k = stmt.kind
+        if k == "ReturnStmt" || k == "ExprStmt" || k == "LetStmt" || k == "LetMutStmt" || k == "ConstStmt" {
+            let new_e = anp_simplify_bool(stmt.left)
+            out = out.push(AstNode {
+                kind: k, name: stmt.name, value: stmt.value, op: "",
+                left: new_e, right: "", cond: "", then_body: "", else_body: "",
+                params: "", body: "", args: "", fields: "", items: "",
+                variants: "", arms: "", iter_expr: "", ret_type: "",
+                target: "", trait_name: "", methods: ""
+            })
+        } else {
+            if k == "AssignStmt" {
+                let new_r = anp_simplify_bool(stmt.right)
+                out = out.push(AstNode {
+                    kind: "AssignStmt", name: "", value: "", op: "",
+                    left: stmt.left, right: new_r, cond: "", then_body: "", else_body: "",
+                    params: "", body: "", args: "", fields: "", items: "",
+                    variants: "", arms: "", iter_expr: "", ret_type: "",
+                    target: "", trait_name: "", methods: ""
+                })
+            } else {
+                if k == "WhileStmt" {
+                    let new_cond = anp_simplify_bool(stmt.cond)
+                    let new_body = anp_bool_simplify_body(stmt.body)
+                    out = out.push(AstNode {
+                        kind: "WhileStmt", name: "", value: "", op: "",
+                        left: "", right: "", cond: new_cond, then_body: "", else_body: "",
+                        params: "", body: new_body, args: "", fields: "", items: "",
+                        variants: "", arms: "", iter_expr: "", ret_type: "",
+                        target: "", trait_name: "", methods: ""
+                    })
+                } else {
+                    if k == "IfStmt" {
+                        let new_cond = anp_simplify_bool(stmt.cond)
+                        let new_then = anp_bool_simplify_body(stmt.then_body)
+                        let new_else = anp_bool_simplify_body(stmt.else_body)
+                        out = out.push(AstNode {
+                            kind: "IfStmt", name: "", value: "", op: "",
+                            left: "", right: "", cond: new_cond, then_body: new_then, else_body: new_else,
+                            params: "", body: "", args: "", fields: "", items: "",
+                            variants: "", arms: "", iter_expr: "", ret_type: "",
+                            target: "", trait_name: "", methods: ""
+                        })
+                    } else {
+                        out = out.push(stmt)
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn anp_bool_simplify_pass(ast) {
+    if type_of(ast) != "array" { return ast }
+    m978_bool_simpl = 0
+    let mut out = []
+    let n = len(ast)
+    let mut i = 0
+    while i < n {
+        let node = ast[i]
+        if type_of(node) != "string" && node.kind == "FnDecl" {
+            if type_of(node.body) == "array" {
+                let new_body = anp_bool_simplify_body(node.body)
+                out = out.push(rewrite_fn_with_body(node, new_body))
+            } else {
+                out = out.push(node)
+            }
+        } else {
+            out = out.push(node)
+        }
+        i = i + 1
+    }
+    if m978_bool_simpl > 0 {
+        println("[ai-native] bool-simplify: " + to_string(m978_bool_simpl) + " boolean expression(s) simplified")
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  ROI #66: Partial Redundancy Elimination (PRE)
+//  Generalization of CSE and LICM — eliminate computations that are
+//  redundant on SOME paths by inserting them on the remaining paths.
+// ═══════════════════════════════════════════════════════════════════
+
+let mut m978_pre_eliminated = 0
+let mut m978_pre_inserted = 0
+
+fn anp_pre_build_cfg(body) {
+    if type_of(body) != "array" {
+        return [[[]], [], 1]
+    }
+    let n = len(body)
+    let mut blocks = [[]]
+    let mut edges = []
+    let mut cur_block = 0
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        if type_of(stmt) != "string" && stmt.kind == "IfExpr" {
+            let then_block = cur_block + 1
+            let else_block = cur_block + 2
+            let merge_block = cur_block + 3
+            edges = edges.push([cur_block, then_block])
+            edges = edges.push([cur_block, else_block])
+            edges = edges.push([then_block, merge_block])
+            edges = edges.push([else_block, merge_block])
+            let mut tb = []
+            if type_of(stmt.then_body) == "array" {
+                let mut ti = 0
+                while ti < len(stmt.then_body) {
+                    tb = tb.push(stmt.then_body[ti])
+                    ti = ti + 1
+                }
+            }
+            let mut eb = []
+            if type_of(stmt.else_body) == "array" {
+                let mut ei = 0
+                while ei < len(stmt.else_body) {
+                    eb = eb.push(stmt.else_body[ei])
+                    ei = ei + 1
+                }
+            }
+            blocks = blocks.push(tb)
+            blocks = blocks.push(eb)
+            blocks = blocks.push([])
+            cur_block = merge_block
+        } else if type_of(stmt) != "string" && stmt.kind == "WhileStmt" {
+            let header_block = cur_block + 1
+            let loop_body_block = cur_block + 2
+            let exit_block = cur_block + 3
+            edges = edges.push([cur_block, header_block])
+            edges = edges.push([header_block, loop_body_block])
+            edges = edges.push([loop_body_block, header_block])
+            edges = edges.push([header_block, exit_block])
+            let mut lb = []
+            if type_of(stmt.body) == "array" {
+                let mut li = 0
+                while li < len(stmt.body) {
+                    lb = lb.push(stmt.body[li])
+                    li = li + 1
+                }
+            }
+            blocks = blocks.push([])
+            blocks = blocks.push(lb)
+            blocks = blocks.push([])
+            cur_block = exit_block
+        } else {
+            let cur_stmts = blocks[cur_block]
+            let mut new_stmts = []
+            let mut ci = 0
+            while ci < len(cur_stmts) {
+                new_stmts = new_stmts.push(cur_stmts[ci])
+                ci = ci + 1
+            }
+            new_stmts = new_stmts.push(stmt)
+            let mut new_blocks = []
+            let mut bi = 0
+            while bi < len(blocks) {
+                if bi == cur_block {
+                    new_blocks = new_blocks.push(new_stmts)
+                } else {
+                    new_blocks = new_blocks.push(blocks[bi])
+                }
+                bi = bi + 1
+            }
+            blocks = new_blocks
+        }
+        i = i + 1
+    }
+    let result_cfg = #{ blocks: blocks, edges: edges, block_count: len(blocks) }
+    return result_cfg
+}
+
+fn anp_pre_predecessors(edges, block_id) {
+    let mut preds = []
+    let mut i = 0
+    while i < len(edges) {
+        let edge = edges[i]
+        if edge[1] == block_id {
+            let mut found = false
+            let mut j = 0
+            while j < len(preds) {
+                if preds[j] == edge[0] { found = true }
+                j = j + 1
+            }
+            if !found { preds = preds.push(edge[0]) }
+        }
+        i = i + 1
+    }
+    return preds
+}
+
+fn anp_pre_successors(edges, block_id) {
+    let mut succs = []
+    let mut i = 0
+    while i < len(edges) {
+        let edge = edges[i]
+        if edge[0] == block_id {
+            let mut found = false
+            let mut j = 0
+            while j < len(succs) {
+                if succs[j] == edge[1] { found = true }
+                j = j + 1
+            }
+            if !found { succs = succs.push(edge[1]) }
+        }
+        i = i + 1
+    }
+    return succs
+}
+
+fn anp_pre_block_exprs(block) {
+    let mut sigs = []
+    if type_of(block) != "array" { return sigs }
+    let n = len(block)
+    let mut i = 0
+    while i < n {
+        let stmt = block[i]
+        if type_of(stmt) != "string" {
+            if stmt.kind == "LetStmt" || stmt.kind == "LetMutStmt" {
+                let sig = gvn_expr_signature(stmt.left)
+                if sig != "" {
+                    let mut found = false
+                    let mut j = 0
+                    while j < len(sigs) {
+                        if sigs[j] == sig { found = true }
+                        j = j + 1
+                    }
+                    if !found { sigs = sigs.push(sig) }
+                }
+            }
+            if stmt.kind == "AssignStmt" {
+                let sig = gvn_expr_signature(stmt.right)
+                if sig != "" {
+                    let mut found = false
+                    let mut j = 0
+                    while j < len(sigs) {
+                        if sigs[j] == sig { found = true }
+                        j = j + 1
+                    }
+                    if !found { sigs = sigs.push(sig) }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return sigs
+}
+
+fn anp_pre_block_kills_expr(block, sig) {
+    if type_of(block) != "array" { return false }
+    let ref_names = anp_pre_extract_ids(sig)
+    let n = len(block)
+    let mut i = 0
+    while i < n {
+        let stmt = block[i]
+        if type_of(stmt) != "string" {
+            if stmt.kind == "AssignStmt" {
+                if type_of(stmt.left) != "string" && stmt.left.kind == "Ident" {
+                    let mut j = 0
+                    while j < len(ref_names) {
+                        if ref_names[j] == stmt.left.name { return true }
+                        j = j + 1
+                    }
+                }
+            }
+            if stmt.kind == "LetMutStmt" {
+                let mut j = 0
+                while j < len(ref_names) {
+                    if ref_names[j] == stmt.name { return true }
+                    j = j + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn anp_pre_extract_ids(sig) {
+    let mut names = []
+    let chars = sig.chars()
+    let total = len(chars)
+    let mut i = 0
+    while i < total {
+        if i + 2 < total {
+            if to_string(chars[i]) == "i" && to_string(chars[i + 1]) == "d" && to_string(chars[i + 2]) == ":" {
+                i = i + 3
+                let mut name = ""
+                while i < total {
+                    let c = to_string(chars[i])
+                    if c == "," || c == ")" || c == "]" || c == "[" || c == "(" {
+                        i = i - 1
+                        break
+                    }
+                    name = name + c
+                    i = i + 1
+                }
+                if name != "" {
+                    let mut found = false
+                    let mut j = 0
+                    while j < len(names) {
+                        if names[j] == name { found = true }
+                        j = j + 1
+                    }
+                    if !found { names = names.push(name) }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return names
+}
+
+fn anp_pre_sig_in(sigs, sig) {
+    let mut i = 0
+    while i < len(sigs) {
+        if sigs[i] == sig { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn anp_pre_analyze(cfg) {
+    let blocks = cfg.blocks
+    let edges = cfg.edges
+    let bc = cfg.block_count
+    let mut all_sigs = []
+    let mut bi = 0
+    while bi < bc {
+        let block_sigs = anp_pre_block_exprs(blocks[bi])
+        let mut si = 0
+        while si < len(block_sigs) {
+            if !anp_pre_sig_in(all_sigs, block_sigs[si]) {
+                all_sigs = all_sigs.push(block_sigs[si])
+            }
+            si = si + 1
+        }
+        bi = bi + 1
+    }
+    if len(all_sigs) == 0 {
+        let empty_result = #{ expr_sigs: [], avail: [], antic: [], insert_points: [], elim_points: [] }
+        return empty_result
+    }
+    // AVAIL forward dataflow
+    let mut avail_out = []
+    let mut avi = 0
+    while avi < bc {
+        if avi == 0 {
+            avail_out = avail_out.push(anp_pre_block_exprs(blocks[0]))
+        } else {
+            let mut copy = []
+            let mut ci = 0
+            while ci < len(all_sigs) {
+                copy = copy.push(all_sigs[ci])
+                ci = ci + 1
+            }
+            avail_out = avail_out.push(copy)
+        }
+        avi = avi + 1
+    }
+    let mut fp_iter = 0
+    while fp_iter < 3 {
+        let mut bi2 = 1
+        while bi2 < bc {
+            let preds = anp_pre_predecessors(edges, bi2)
+            let mut avail_in = []
+            if len(preds) > 0 {
+                let first_pred = preds[0]
+                let mut ai2 = 0
+                while ai2 < len(avail_out[first_pred]) {
+                    avail_in = avail_in.push(avail_out[first_pred][ai2])
+                    ai2 = ai2 + 1
+                }
+                let mut pi = 1
+                while pi < len(preds) {
+                    let pred_avail = avail_out[preds[pi]]
+                    let mut new_avail = []
+                    let mut ni = 0
+                    while ni < len(avail_in) {
+                        if anp_pre_sig_in(pred_avail, avail_in[ni]) {
+                            new_avail = new_avail.push(avail_in[ni])
+                        }
+                        ni = ni + 1
+                    }
+                    avail_in = new_avail
+                    pi = pi + 1
+                }
+            }
+            let gen = anp_pre_block_exprs(blocks[bi2])
+            let mut new_out = []
+            let mut ki = 0
+            while ki < len(avail_in) {
+                if !anp_pre_block_kills_expr(blocks[bi2], avail_in[ki]) {
+                    new_out = new_out.push(avail_in[ki])
+                }
+                ki = ki + 1
+            }
+            let mut gi = 0
+            while gi < len(gen) {
+                if !anp_pre_sig_in(new_out, gen[gi]) {
+                    new_out = new_out.push(gen[gi])
+                }
+                gi = gi + 1
+            }
+            let mut new_avail_out = []
+            let mut ui = 0
+            while ui < len(avail_out) {
+                if ui == bi2 {
+                    new_avail_out = new_avail_out.push(new_out)
+                } else {
+                    new_avail_out = new_avail_out.push(avail_out[ui])
+                }
+                ui = ui + 1
+            }
+            avail_out = new_avail_out
+            bi2 = bi2 + 1
+        }
+        fp_iter = fp_iter + 1
+    }
+    // ANTIC backward dataflow
+    let mut antic_in = []
+    let mut ai3 = 0
+    while ai3 < bc {
+        antic_in = antic_in.push(anp_pre_block_exprs(blocks[ai3]))
+        ai3 = ai3 + 1
+    }
+    let mut fp_iter2 = 0
+    while fp_iter2 < 3 {
+        let mut bi3 = bc - 1
+        while bi3 >= 0 {
+            let succs = anp_pre_successors(edges, bi3)
+            let mut antic_out = []
+            if len(succs) > 0 {
+                let first_succ = succs[0]
+                let mut si2 = 0
+                while si2 < len(antic_in[first_succ]) {
+                    antic_out = antic_out.push(antic_in[first_succ][si2])
+                    si2 = si2 + 1
+                }
+                let mut pi2 = 1
+                while pi2 < len(succs) {
+                    let succ_antic = antic_in[succs[pi2]]
+                    let mut new_antic = []
+                    let mut ni2 = 0
+                    while ni2 < len(antic_out) {
+                        if anp_pre_sig_in(succ_antic, antic_out[ni2]) {
+                            new_antic = new_antic.push(antic_out[ni2])
+                        }
+                        ni2 = ni2 + 1
+                    }
+                    antic_out = new_antic
+                    pi2 = pi2 + 1
+                }
+            }
+            let gen2 = anp_pre_block_exprs(blocks[bi3])
+            let mut new_in = []
+            let mut ki2 = 0
+            while ki2 < len(antic_out) {
+                if !anp_pre_block_kills_expr(blocks[bi3], antic_out[ki2]) {
+                    new_in = new_in.push(antic_out[ki2])
+                }
+                ki2 = ki2 + 1
+            }
+            let mut gi2 = 0
+            while gi2 < len(gen2) {
+                if !anp_pre_sig_in(new_in, gen2[gi2]) {
+                    new_in = new_in.push(gen2[gi2])
+                }
+                gi2 = gi2 + 1
+            }
+            let mut new_antic_in = []
+            let mut ui2 = 0
+            while ui2 < len(antic_in) {
+                if ui2 == bi3 {
+                    new_antic_in = new_antic_in.push(new_in)
+                } else {
+                    new_antic_in = new_antic_in.push(antic_in[ui2])
+                }
+                ui2 = ui2 + 1
+            }
+            antic_in = new_antic_in
+            bi3 = bi3 - 1
+        }
+        fp_iter2 = fp_iter2 + 1
+    }
+    // Determine insertion and elimination points
+    let mut insert_points = []
+    let mut elim_points = []
+    let mut bi4 = 0
+    while bi4 < bc {
+        let preds4 = anp_pre_predecessors(edges, bi4)
+        let mut avail_in4 = []
+        if len(preds4) > 0 {
+            let mut ai4 = 0
+            while ai4 < len(avail_out[preds4[0]]) {
+                avail_in4 = avail_in4.push(avail_out[preds4[0]][ai4])
+                ai4 = ai4 + 1
+            }
+            let mut pi4 = 1
+            while pi4 < len(preds4) {
+                let p_avail = avail_out[preds4[pi4]]
+                let mut new_ai = []
+                let mut ni4 = 0
+                while ni4 < len(avail_in4) {
+                    if anp_pre_sig_in(p_avail, avail_in4[ni4]) {
+                        new_ai = new_ai.push(avail_in4[ni4])
+                    }
+                    ni4 = ni4 + 1
+                }
+                avail_in4 = new_ai
+                pi4 = pi4 + 1
+            }
+        }
+        let gen4 = anp_pre_block_exprs(blocks[bi4])
+        let mut si4 = 0
+        while si4 < len(antic_in[bi4]) {
+            let sig4 = antic_in[bi4][si4]
+            if !anp_pre_sig_in(avail_in4, sig4) {
+                let ip = #{ block: bi4, sig: sig4 }
+                insert_points = insert_points.push(ip)
+            }
+            si4 = si4 + 1
+        }
+        let mut ei4 = 0
+        while ei4 < len(gen4) {
+            if anp_pre_sig_in(avail_in4, gen4[ei4]) {
+                let ep = #{ block: bi4, sig: gen4[ei4] }
+                elim_points = elim_points.push(ep)
+            }
+            ei4 = ei4 + 1
+        }
+        bi4 = bi4 + 1
+    }
+    let final_result = #{ expr_sigs: all_sigs, avail: avail_out, antic: antic_in, insert_points: insert_points, elim_points: elim_points }
+    return final_result
+}
+
+fn anp_pre_insert(cfg) {
+    let analysis = anp_pre_analyze(cfg)
+    let insert_pts = analysis.insert_points
+    let elim_pts = analysis.elim_points
+    let inserted = len(insert_pts)
+    let eliminated = len(elim_pts)
+    let result = #{ inserted: inserted, eliminated: eliminated, insert_points: insert_pts, elim_points: elim_pts }
+    return result
+}
+
+fn anp_pre_pass(ast) {
+    if type_of(ast) != "array" { return ast }
+    let n = len(ast)
+    let mut i = 0
+    let mut total_inserted = 0
+    let mut total_eliminated = 0
+    while i < n {
+        let node = ast[i]
+        if type_of(node) != "string" && node.kind == "FnDecl" {
+            if type_of(node.body) == "array" && len(node.body) > 0 {
+                let cfg = anp_pre_build_cfg(node.body)
+                if cfg.block_count > 1 {
+                    let result = anp_pre_insert(cfg)
+                    if result.inserted > 0 || result.eliminated > 0 {
+                        total_inserted = total_inserted + result.inserted
+                        total_eliminated = total_eliminated + result.eliminated
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    m978_pre_eliminated = total_eliminated
+    m978_pre_inserted = total_inserted
+    return ast
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// ROI #70: Matrix transpose → cache-oblivious block transpose
+// Detect naive transpose: for i { for j { b[j][i] = a[i][j] } }
+// Rewrite to 4-level block loop for cache-friendly access.
+// ═══════════════════════════════════════════════════════════════════
+
+let mut m978_block_transpose_detected = 0
+let mut m978_block_transpose_rewrites = 0
+
+fn anp_extract_loop_var(cond) {
+    if type_of(cond) != "struct" { return "" }
+    if cond.kind == "BinOp" {
+        if cond.op == "<" {
+            if type_of(cond.left) == "struct" {
+                if cond.left.kind == "Ident" {
+                    return cond.left.name
+                }
+            }
+        }
+    }
+    return ""
+}
+
+fn anp_extract_loop_bound(cond) {
+    if type_of(cond) != "struct" { return "" }
+    if cond.kind == "BinOp" {
+        if cond.op == "<" {
+            return cond.right
+        }
+    }
+    return ""
+}
+
+fn anp_ident_name(node) {
+    if type_of(node) != "struct" { return "" }
+    if node.kind == "Ident" { return node.name }
+    return ""
+}
+
+fn anp_has_swapped_index_assign(stmt, outer_var, inner_var) {
+    let rhs = stmt.left
+    if type_of(rhs) == "struct" {
+        if rhs.kind == "Index" {
+            if type_of(rhs.left) == "struct" {
+                if rhs.left.kind == "Index" {
+                    let idx_outer = anp_ident_name(rhs.left.right)
+                    let idx_inner = anp_ident_name(rhs.right)
+                    if idx_outer == outer_var && idx_inner == inner_var {
+                        let base = anp_ident_name(rhs.left.left)
+                        if base != "" { return base }
+                    }
+                }
+            }
+        }
+    }
+    return ""
+}
+
+fn anp_check_transpose_assign(stmt, outer_var, inner_var) {
+    return anp_has_swapped_index_assign(stmt, outer_var, inner_var)
+}
+
+fn anp_detect_transpose(node) {
+    if type_of(node) != "struct" { return #{} }
+    if node.kind != "FnDecl" { return #{} }
+    let body = node.body
+    if type_of(body) != "array" { return #{} }
+    let mut outer_while = ""
+    let mut oi = 0
+    while oi < len(body) {
+        let s = body[oi]
+        if type_of(s) == "struct" {
+            if s.kind == "WhileStmt" {
+                outer_while = s
+            }
+        }
+        oi = oi + 1
+    }
+    if type_of(outer_while) != "struct" { return #{} }
+    let outer_var = anp_extract_loop_var(outer_while.cond)
+    if outer_var == "" { return #{} }
+    let outer_body = outer_while.body
+    if type_of(outer_body) != "array" { return #{} }
+    let mut inner_while = ""
+    let mut ii = 0
+    while ii < len(outer_body) {
+        let s2 = outer_body[ii]
+        if type_of(s2) == "struct" {
+            if s2.kind == "WhileStmt" {
+                inner_while = s2
+            }
+        }
+        ii = ii + 1
+    }
+    if type_of(inner_while) != "struct" { return #{} }
+    let inner_var = anp_extract_loop_var(inner_while.cond)
+    if inner_var == "" { return #{} }
+    if inner_var == outer_var { return #{} }
+    let inner_body = inner_while.body
+    if type_of(inner_body) != "array" { return #{} }
+    let mut found_transpose = false
+    let mut src_name = ""
+    let mut bi = 0
+    while bi < len(inner_body) {
+        let stmt = inner_body[bi]
+        if type_of(stmt) == "struct" {
+            if stmt.kind == "AssignStmt" {
+                let assign_info = anp_check_transpose_assign(stmt, outer_var, inner_var)
+                if assign_info != "" {
+                    found_transpose = true
+                    src_name = assign_info
+                }
+            }
+            if stmt.kind == "ExprStmt" {
+                if type_of(stmt.left) == "struct" {
+                    if stmt.left.kind == "Assign" {
+                        let assign_info2 = anp_check_transpose_assign(stmt.left, outer_var, inner_var)
+                        if assign_info2 != "" {
+                            found_transpose = true
+                            src_name = assign_info2
+                        }
+                    }
+                }
+            }
+        }
+        bi = bi + 1
+    }
+    if !found_transpose { return #{} }
+    let bound_expr = anp_extract_loop_bound(outer_while.cond)
+    return #{"detected": true, "outer_var": outer_var, "inner_var": inner_var, "src": src_name, "bound": bound_expr}
+}
+
+fn anp_block_transpose(node, block_size) {
+    if type_of(node) != "struct" { return node }
+    if node.kind != "FnDecl" { return node }
+    let info = anp_detect_transpose(node)
+    if type_of(info) != "map" { return node }
+    if !has_key(info, "detected") { return node }
+    let outer_var = info["outer_var"]
+    let inner_var = info["inner_var"]
+    let src = info["src"]
+    let bound = info["bound"]
+    if type_of(bound) != "struct" { return node }
+    let bs = block_size
+    let mut body = []
+    body = body.push(make_let_stmt("__bt_n", bound))
+    body = body.push(make_let_stmt("__bt_bs", make_int_lit(bs)))
+    let read_expr = make_index(make_index(make_ident(src), make_ident("__bt_i")), make_ident("__bt_j"))
+    let write_target = make_index(make_index(make_ident("__bt_dst"), make_ident("__bt_j")), make_ident("__bt_i"))
+    let assign_node = make_binop("=", write_target, read_expr)
+    let assign_stmt = make_expr_stmt(assign_node)
+    let j_body = [assign_stmt, make_assign_stmt("__bt_j", make_binop("+", make_ident("__bt_j"), make_int_lit(1)))]
+    let j_bound = make_call_node("min", [make_binop("+", make_ident("__bt_jj"), make_ident("__bt_bs")), make_ident("__bt_n")])
+    let j_cond = make_binop("<", make_ident("__bt_j"), j_bound)
+    let j_loop = make_while_stmt(j_cond, j_body)
+    let i_body = [make_let_mut_stmt("__bt_j", make_ident("__bt_jj")), j_loop, make_assign_stmt("__bt_i", make_binop("+", make_ident("__bt_i"), make_int_lit(1)))]
+    let i_bound = make_call_node("min", [make_binop("+", make_ident("__bt_ii"), make_ident("__bt_bs")), make_ident("__bt_n")])
+    let i_cond = make_binop("<", make_ident("__bt_i"), i_bound)
+    let i_loop = make_while_stmt(i_cond, i_body)
+    let jj_body = [make_let_mut_stmt("__bt_i", make_ident("__bt_ii")), i_loop, make_assign_stmt("__bt_jj", make_binop("+", make_ident("__bt_jj"), make_ident("__bt_bs")))]
+    let jj_cond = make_binop("<", make_ident("__bt_jj"), make_ident("__bt_n"))
+    let jj_loop = make_while_stmt(jj_cond, jj_body)
+    let ii_body = [make_let_mut_stmt("__bt_jj", make_int_lit(0)), jj_loop, make_assign_stmt("__bt_ii", make_binop("+", make_ident("__bt_ii"), make_ident("__bt_bs")))]
+    let ii_cond = make_binop("<", make_ident("__bt_ii"), make_ident("__bt_n"))
+    let ii_loop = make_while_stmt(ii_cond, ii_body)
+    body = body.push(make_let_mut_stmt("__bt_dst", make_ident(src)))
+    body = body.push(make_let_mut_stmt("__bt_ii", make_int_lit(0)))
+    body = body.push(ii_loop)
+    body = body.push(make_return_expr(make_ident("__bt_dst")))
+    m978_block_transpose_rewrites = m978_block_transpose_rewrites + 1
+    return rewrite_fn_with_body(node, body)
+}
+
+fn anp_block_transpose_pass(ast) {
+    let bs = 32
+    if type_of(ast) != "array" { return ast }
+    let mut out = []
+    let mut idx = 0
+    while idx < len(ast) {
+        let node = ast[idx]
+        if type_of(node) == "struct" {
+            if node.kind == "FnDecl" {
+                let info = anp_detect_transpose(node)
+                if type_of(info) == "map" {
+                    if has_key(info, "detected") {
+                        m978_block_transpose_detected = m978_block_transpose_detected + 1
+                        let rewritten = anp_block_transpose(node, bs)
+                        out = out.push(rewritten)
+                        idx = idx + 1
+                        continue
+                    }
+                }
+            }
+        }
+        out = out.push(node)
+        idx = idx + 1
+    }
+    if m978_block_transpose_detected > 0 {
+        println("[ai-native] block-transpose: " + to_string(m978_block_transpose_detected) + " detected, " + to_string(m978_block_transpose_rewrites) + " rewritten (block_size=" + to_string(bs) + ")")
+    }
+    return out
+}
+
+// ── M978: KMP failure function + search ─────────────────────────
+// ROI #65: naive O(nm) string search -> KMP O(n+m)
+fn anp_kmp_failure(pattern) {
+    let p = pattern.chars()
+    let m = len(p)
+    let mut fail = []
+    let mut fi = 0
+    while fi < m {
+        fail = fail.push(0)
+        fi = fi + 1
+    }
+    if m <= 1 { return fail }
+    let mut k = 0
+    let mut i = 1
+    while i < m {
+        while k > 0 && to_string(p[k]) != to_string(p[i]) {
+            k = fail[k - 1]
+        }
+        if to_string(p[k]) == to_string(p[i]) {
+            k = k + 1
+        }
+        fail[i] = k
+        i = i + 1
+    }
+    return fail
+}
+
+fn anp_kmp_search(text, pattern) {
+    let t = text.chars()
+    let p = pattern.chars()
+    let n = len(t)
+    let m = len(p)
+    if m == 0 { return 0 }
+    if n < m { return -1 }
+    let fail = anp_kmp_failure(pattern)
+    let mut j = 0
+    let mut i = 0
+    while i < n {
+        while j > 0 && to_string(p[j]) != to_string(t[i]) {
+            j = fail[j - 1]
+        }
+        if to_string(p[j]) == to_string(t[i]) {
+            j = j + 1
+        }
+        if j == m {
+            return i - m + 1
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn anp_kmp_search_all(text, pattern) {
+    let t = text.chars()
+    let p = pattern.chars()
+    let n = len(t)
+    let m = len(p)
+    let mut result = []
+    if m == 0 { return result }
+    if n < m { return result }
+    let fail = anp_kmp_failure(pattern)
+    let mut j = 0
+    let mut i = 0
+    while i < n {
+        while j > 0 && to_string(p[j]) != to_string(t[i]) {
+            j = fail[j - 1]
+        }
+        if to_string(p[j]) == to_string(t[i]) {
+            j = j + 1
+        }
+        if j == m {
+            result = result.push(i - m + 1)
+            j = fail[j - 1]
+        }
+        i = i + 1
+    }
+    return result
+}
+
+// ── M978b: Aho-Corasick multi-pattern string matching ───────────
+fn anp_aho_build(patterns) {
+    let mut goto_keys = [[]]
+    let mut goto_vals = [[]]
+    let mut fail_links = [0]
+    let mut output = [[]]
+    let mut next_id = 1
+    let mut pi = 0
+    while pi < len(patterns) {
+        let pat = patterns[pi].chars()
+        let mut cur = 0
+        let mut ci = 0
+        while ci < len(pat) {
+            let ch = to_string(pat[ci])
+            let mut found = -1
+            let mut ki = 0
+            while ki < len(goto_keys[cur]) {
+                if goto_keys[cur][ki] == ch {
+                    found = goto_vals[cur][ki]
+                }
+                ki = ki + 1
+            }
+            if found == -1 {
+                let new_node = next_id
+                next_id = next_id + 1
+                goto_keys[cur] = goto_keys[cur].push(ch)
+                goto_vals[cur] = goto_vals[cur].push(new_node)
+                goto_keys = goto_keys.push([])
+                goto_vals = goto_vals.push([])
+                fail_links = fail_links.push(0)
+                output = output.push([])
+                cur = new_node
+            } else {
+                cur = found
+            }
+            ci = ci + 1
+        }
+        output[cur] = output[cur].push(pi)
+        pi = pi + 1
+    }
+    let mut queue = []
+    let mut ri = 0
+    while ri < len(goto_vals[0]) {
+        let child = goto_vals[0][ri]
+        fail_links[child] = 0
+        queue = queue.push(child)
+        ri = ri + 1
+    }
+    let mut qi = 0
+    while qi < len(queue) {
+        let u = queue[qi]
+        let mut ei = 0
+        while ei < len(goto_keys[u]) {
+            let ch = goto_keys[u][ei]
+            let v = goto_vals[u][ei]
+            let mut f = fail_links[u]
+            let mut cont = true
+            while cont {
+                let mut fchild = -1
+                let mut fki = 0
+                while fki < len(goto_keys[f]) {
+                    if goto_keys[f][fki] == ch {
+                        fchild = goto_vals[f][fki]
+                    }
+                    fki = fki + 1
+                }
+                if fchild != -1 {
+                    fail_links[v] = fchild
+                    cont = false
+                } else {
+                    if f == 0 {
+                        fail_links[v] = 0
+                        cont = false
+                    } else {
+                        f = fail_links[f]
+                    }
+                }
+            }
+            let mut oi = 0
+            while oi < len(output[fail_links[v]]) {
+                output[v] = output[v].push(output[fail_links[v]][oi])
+                oi = oi + 1
+            }
+            queue = queue.push(v)
+            ei = ei + 1
+        }
+        qi = qi + 1
+    }
+    return #{
+        "goto_keys": goto_keys,
+        "goto_vals": goto_vals,
+        "fail_links": fail_links,
+        "output": output,
+        "num_patterns": len(patterns)
+    }
+}
+
+fn anp_aho_search(text, aho_state, patterns) {
+    let t = text.chars()
+    let n = len(t)
+    let gk = aho_state["goto_keys"]
+    let gv = aho_state["goto_vals"]
+    let fl = aho_state["fail_links"]
+    let outp = aho_state["output"]
+    let mut results = []
+    let mut cur = 0
+    let mut i = 0
+    while i < n {
+        let ch = to_string(t[i])
+        let mut advanced = false
+        while !advanced {
+            let mut child = -1
+            let mut ki = 0
+            while ki < len(gk[cur]) {
+                if gk[cur][ki] == ch {
+                    child = gv[cur][ki]
+                }
+                ki = ki + 1
+            }
+            if child != -1 {
+                cur = child
+                advanced = true
+            } else {
+                if cur == 0 {
+                    advanced = true
+                } else {
+                    cur = fl[cur]
+                }
+            }
+        }
+        let mut oi = 0
+        while oi < len(outp[cur]) {
+            let pat_idx = outp[cur][oi]
+            let pat_len = len(patterns[pat_idx])
+            let start_pos = i - pat_len + 1
+            results = results.push([start_pos, pat_idx])
+            oi = oi + 1
+        }
+        i = i + 1
+    }
+    return results
+}
+
+// ── M978: Naive string search detection ─────────────────────────
+fn anp_detect_naive_search(node) {
+    if node.kind != "FnDecl" { return false }
+    if type_of(node.params) != "array" { return false }
+    if len(node.params) < 2 { return false }
+    if type_of(node.body) != "array" { return false }
+    let wd = while_depth(node.body)
+    if wd < 2 { return false }
+    let idx_count = count_body_by_kind(node.body, "Index")
+    if idx_count < 2 { return false }
+    if !body_has_let_mut(node.body) { return false }
+    if !body_has_index_compare(node.body) { return false }
+    return true
+}
+
+fn body_has_index_compare(body) {
+    if type_of(body) != "array" { return false }
+    let mut i = 0
+    while i < len(body) {
+        let s = body[i]
+        if s.kind == "WhileStmt" {
+            if body_has_index_eq_in_block(s.body) { return true }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn body_has_index_eq_in_block(body) {
+    if type_of(body) != "array" { return false }
+    let mut i = 0
+    while i < len(body) {
+        let s = body[i]
+        if s.kind == "WhileStmt" {
+            if block_has_index_eq(s.body) { return true }
+        }
+        if s.kind == "IfExpr" || s.kind == "IfStmt" {
+            if type_of(s.then_body) == "array" {
+                if block_has_index_eq(s.then_body) { return true }
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn block_has_index_eq(body) {
+    if type_of(body) != "array" { return false }
+    let mut i = 0
+    while i < len(body) {
+        let s = body[i]
+        if s.kind == "ExprStmt" || s.kind == "IfExpr" || s.kind == "IfStmt" {
+            if has_index_eq_expr(s) { return true }
+        }
+        if s.kind == "IfExpr" || s.kind == "IfStmt" {
+            if type_of(s.cond) != "string" {
+                if has_index_eq_expr(s.cond) { return true }
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn has_index_eq_expr(node) {
+    if type_of(node) == "string" { return false }
+    if node.kind == "BinOp" && node.op == "==" {
+        if type_of(node.left) != "string" && type_of(node.right) != "string" {
+            if node.left.kind == "Index" && node.right.kind == "Index" { return true }
+        }
+    }
+    if node.kind == "IfExpr" || node.kind == "IfStmt" {
+        if type_of(node.cond) != "string" {
+            if has_index_eq_expr(node.cond) { return true }
+        }
+    }
+    if type_of(node.left) != "string" {
+        if has_index_eq_expr(node.left) { return true }
+    }
+    if type_of(node.right) != "string" {
+        if has_index_eq_expr(node.right) { return true }
+    }
+    return false
+}
+
+fn anp_detect_multi_pattern_search(node) {
+    if node.kind != "FnDecl" { return false }
+    if type_of(node.body) != "array" { return false }
+    let search_calls = count_search_method_calls(node.body)
+    if search_calls >= 3 { return true }
+    return false
+}
+
+fn count_search_method_calls(body) {
+    if type_of(body) != "array" { return 0 }
+    let mut count = 0
+    let mut i = 0
+    while i < len(body) {
+        let s = body[i]
+        count = count + count_search_in_node(s)
+        i = i + 1
+    }
+    return count
+}
+
+fn count_search_in_node(node) {
+    if type_of(node) == "string" { return 0 }
+    let mut count = 0
+    if node.kind == "Call" {
+        if type_of(node.left) != "string" {
+            if node.left.kind == "Field" {
+                if node.left.name == "contains" || node.left.name == "index_of" {
+                    count = count + 1
+                }
+            }
+        }
+    }
+    if type_of(node.left) != "string" {
+        count = count + count_search_in_node(node.left)
+    }
+    if type_of(node.right) != "string" {
+        count = count + count_search_in_node(node.right)
+    }
+    if type_of(node.cond) != "string" {
+        count = count + count_search_in_node(node.cond)
+    }
+    if type_of(node.then_body) == "array" {
+        count = count + count_search_method_calls(node.then_body)
+    }
+    if type_of(node.else_body) == "array" {
+        count = count + count_search_method_calls(node.else_body)
+    }
+    if type_of(node.body) == "array" {
+        count = count + count_search_method_calls(node.body)
+    }
+    return count
+}
+
+fn make_kmp_search_body(text_param, pattern_param) {
+    let mut body = []
+    body = body.push(make_return_expr(
+        make_call_node("anp_kmp_search", [make_ident(text_param), make_ident(pattern_param)])
+    ))
+    return body
+}
+
+fn anp_string_match_pass(ast) {
+    if type_of(ast) != "array" { return ast }
+    let mut out = []
+    let mut i = 0
+    while i < len(ast) {
+        let mut node = ast[i]
+        if node.kind == "FnDecl" {
+            let attrs = split_attrs_m0(node.value)
+            if anp_detect_naive_search(node) {
+                m978_kmp_detected = m978_kmp_detected + 1
+                println("[ai-native] fn " + node.name + " DETECTED: naive string search O(nm)")
+                if attr_has(attrs, "optimize") {
+                    let tp = get_first_param_name(node)
+                    let pp = get_second_param_name(node)
+                    let kmp_body = make_kmp_search_body(tp, pp)
+                    node = rewrite_fn_with_body(node, kmp_body)
+                    m978_kmp_rewrites = m978_kmp_rewrites + 1
+                    println("[ai-native] fn " + node.name + " REWRITE: naive O(nm) -> KMP O(n+m)")
+                }
+            }
+            if anp_detect_multi_pattern_search(node) {
+                m978_aho_detected = m978_aho_detected + 1
+                println("[ai-native] fn " + node.name + " DETECTED: multi-pattern search")
+                if attr_has(attrs, "optimize") {
+                    m978_aho_rewrites = m978_aho_rewrites + 1
+                    println("[ai-native] fn " + node.name + " CANDIDATE: -> Aho-Corasick")
+                }
+            }
+        }
+        out = out.push(node)
+        i = i + 1
+    }
+    return out
 }
