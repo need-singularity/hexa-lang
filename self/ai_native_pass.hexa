@@ -29,6 +29,7 @@ fn classify_attr_m0(name) {
     if name == "hot" { return "G1" }
     if name == "cold" { return "G1" }
     if name == "bounded" { return "G1" }
+    if name == "sorted" { return "G1" }
     if name == "fuse" { return "G2" }
     if name == "compact" { return "G2" }
     if name == "lazy" { return "G2" }
@@ -1152,6 +1153,10 @@ let mut m972_compact_candidates = 0
 // M973: @optimize sliding-window — DP→O(1) memory detection
 let mut m973_sliding_ok = 0
 let mut m973_sliding_candidates = 0
+// M975: linear-search → binary-search AST rewrite count
+let mut m975_binary_search_rewrites = 0
+// M976: @algebraic closed-form series rewrite count
+let mut m976_algebraic_series_rewrites = 0
 
 fn body_is_effect_free(body) {
     if type_of(body) != "array" { return true }
@@ -5088,6 +5093,606 @@ fn get_first_param_name(fn_node) {
     return fn_node.params[0].name
 }
 
+// Extract second param name from FnDecl node (for binary search: arr, target)
+fn get_second_param_name(fn_node) {
+    if type_of(fn_node.params) != "array" { return "target" }
+    if len(fn_node.params) < 2 { return "target" }
+    return fn_node.params[1].name
+}
+
+// ── M975: linear-search → binary-search AST rewrite ──────────
+// Builds a binary search body that replaces the detected linear search.
+// Precondition: the array parameter must be @sorted or statically verified sorted.
+// Generated code:
+//   fn search(arr, target) {
+//     let mut lo = 0
+//     let mut hi = len(arr) - 1
+//     while lo <= hi {
+//       let mid = lo + (hi - lo) / 2
+//       if arr[mid] == target { return mid }
+//       if arr[mid] < target { lo = mid + 1 } else { hi = mid - 1 }
+//     }
+//     return -1
+//   }
+fn make_binary_search_body(arr_param, target_param) {
+    let arr = make_ident(arr_param)
+    let target = make_ident(target_param)
+    let mut body = []
+
+    // let mut lo = 0
+    body = body.push(make_let_mut_stmt("lo", make_int_lit(0)))
+
+    // let mut hi = len(arr) - 1
+    body = body.push(make_let_mut_stmt("hi", make_binop("-", make_call_node("len", [arr]), make_int_lit(1))))
+
+    // while lo <= hi
+    let mid_expr = make_binop("+", make_ident("lo"), make_binop("/", make_binop("-", make_ident("hi"), make_ident("lo")), make_int_lit(2)))
+    // let mid = lo + (hi - lo) / 2
+    let mid_let = make_let_stmt("mid", mid_expr)
+
+    // if arr[mid] == target { return mid }
+    let eq_check = make_if_expr(
+        make_binop("==", make_index(make_ident(arr_param), make_ident("mid")), target),
+        [make_return_expr(make_ident("mid"))],
+        []
+    )
+
+    // if arr[mid] < target { lo = mid + 1 } else { hi = mid - 1 }
+    let lt_check = make_if_expr(
+        make_binop("<", make_index(make_ident(arr_param), make_ident("mid")), target),
+        [make_assign_stmt("lo", make_binop("+", make_ident("mid"), make_int_lit(1)))],
+        [make_assign_stmt("hi", make_binop("-", make_ident("mid"), make_int_lit(1)))]
+    )
+
+    let while_body = [mid_let, make_expr_stmt(eq_check), make_expr_stmt(lt_check)]
+    body = body.push(make_while_stmt(make_binop("<=", make_ident("lo"), make_ident("hi")), while_body))
+
+    // return -1
+    let neg_one = make_binop("-", make_int_lit(0), make_int_lit(1))
+    body = body.push(make_return_expr(neg_one))
+
+    return body
+}
+
+// Check if fn has @sorted annotation (indicates array param is pre-sorted)
+fn fn_has_sorted_attr(attrs) {
+    return attr_has(attrs, "sorted")
+}
+
+// Heuristic: check if fn body returns an index (returns i or similar Ident, not
+// an element value). Linear search pattern returns index, not arr[i].
+fn body_returns_index_not_value(body) {
+    if type_of(body) != "array" { return false }
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        if stmt.kind == "WhileStmt" {
+            if body_returns_ident_in_block(stmt.body) { return true }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn body_returns_ident_in_block(body) {
+    if type_of(body) != "array" { return false }
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        if stmt.kind == "ReturnStmt" {
+            if type_of(stmt.left) != "string" && stmt.left.kind == "Ident" { return true }
+        }
+        if stmt.kind == "IfStmt" {
+            if body_returns_ident_in_block(stmt.body) { return true }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// ── M976: @algebraic closed-form series detection and rewrite ─────
+// Detects loop-based summation patterns and rewrites to O(1) closed form.
+//
+// Pattern 1 — arithmetic series sum(1..n):
+//   let mut s = 0; let mut i = 1; while i <= n { s = s + i; i = i + 1 } return s
+//   → return n * (n + 1) / 2
+//
+// Pattern 2 — geometric series sum(a * r^0 + a * r^1 + ... + a * r^(n-1)):
+//   let mut s = 0; let mut term = a; let mut i = 0
+//   while i < n { s = s + term; term = term * r; i = i + 1 } return s
+//   → return a * (r^n - 1) / (r - 1)   [when r != 1, else return a * n]
+//
+// Detects the pattern at AST level by checking:
+//   (a) accumulator init to 0
+//   (b) counter init to 0 or 1
+//   (c) while body has acc = acc + <counter_expr>
+//   (d) counter increments by 1
+
+// Check if a stmt is `let mut <name> = <int_value>` and return {name, value}
+fn extract_let_mut_int(stmt) {
+    if stmt.kind != "LetMutStmt" { return "" }
+    if type_of(stmt.left) == "string" { return "" }
+    if stmt.left.kind != "IntLit" { return "" }
+    return stmt.name + "=" + stmt.left.value
+}
+
+// Check if body has pattern: acc = acc + counter_var (simple additive accumulation)
+fn is_acc_plus_counter(body, acc_name, counter_name) {
+    if type_of(body) != "array" { return false }
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        if stmt.kind == "AssignStmt" && stmt.name == acc_name {
+            if type_of(stmt.left) != "string" && stmt.left.kind == "BinOp" && stmt.left.op == "+" {
+                let l = stmt.left.left
+                let r = stmt.left.right
+                if type_of(l) != "string" && l.kind == "Ident" && l.name == acc_name {
+                    if type_of(r) != "string" && r.kind == "Ident" && r.name == counter_name {
+                        return true
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// Check if body has pattern: counter = counter + 1
+fn has_counter_increment(body, counter_name) {
+    if type_of(body) != "array" { return false }
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        if stmt.kind == "AssignStmt" && stmt.name == counter_name {
+            if type_of(stmt.left) != "string" && stmt.left.kind == "BinOp" && stmt.left.op == "+" {
+                let l = stmt.left.left
+                let r = stmt.left.right
+                if type_of(l) != "string" && l.kind == "Ident" && l.name == counter_name {
+                    if type_of(r) != "string" && r.kind == "IntLit" && r.value == "1" {
+                        return true
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// Check if body has pattern: acc = acc + (counter * counter)  [sum of squares]
+fn is_acc_plus_counter_squared(body, acc_name, counter_name) {
+    if type_of(body) != "array" { return false }
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        if stmt.kind == "AssignStmt" && stmt.name == acc_name {
+            if type_of(stmt.left) != "string" && stmt.left.kind == "BinOp" && stmt.left.op == "+" {
+                let l = stmt.left.left
+                let r = stmt.left.right
+                if type_of(l) != "string" && l.kind == "Ident" && l.name == acc_name {
+                    // r should be counter * counter
+                    if type_of(r) != "string" && r.kind == "BinOp" && r.op == "*" {
+                        if type_of(r.left) != "string" && r.left.kind == "Ident" && r.left.name == counter_name {
+                            if type_of(r.right) != "string" && r.right.kind == "Ident" && r.right.name == counter_name {
+                                return true
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// Check if body has geometric pattern: acc = acc + term; term = term * <ratio>
+fn is_geometric_pattern(body, acc_name) {
+    if type_of(body) != "array" { return false }
+    let n = len(body)
+    let mut has_acc_plus_term = false
+    let mut term_name = ""
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        if stmt.kind == "AssignStmt" && stmt.name == acc_name {
+            if type_of(stmt.left) != "string" && stmt.left.kind == "BinOp" && stmt.left.op == "+" {
+                let l = stmt.left.left
+                let r = stmt.left.right
+                if type_of(l) != "string" && l.kind == "Ident" && l.name == acc_name {
+                    if type_of(r) != "string" && r.kind == "Ident" {
+                        has_acc_plus_term = true
+                        term_name = r.name
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    if !has_acc_plus_term { return false }
+    // Check: term = term * <something>
+    let mut j = 0
+    while j < n {
+        let stmt2 = body[j]
+        if stmt2.kind == "AssignStmt" && stmt2.name == term_name {
+            if type_of(stmt2.left) != "string" && stmt2.left.kind == "BinOp" && stmt2.left.op == "*" {
+                let l2 = stmt2.left.left
+                if type_of(l2) != "string" && l2.kind == "Ident" && l2.name == term_name {
+                    return true
+                }
+            }
+        }
+        j = j + 1
+    }
+    return false
+}
+
+// Extract the geometric ratio expression from term = term * <ratio>
+fn get_geometric_ratio(body, acc_name) {
+    // First find term name
+    let n = len(body)
+    let mut term_name = ""
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        if stmt.kind == "AssignStmt" && stmt.name == acc_name {
+            if type_of(stmt.left) != "string" && stmt.left.kind == "BinOp" && stmt.left.op == "+" {
+                let r = stmt.left.right
+                if type_of(r) != "string" && r.kind == "Ident" {
+                    term_name = r.name
+                }
+            }
+        }
+        i = i + 1
+    }
+    // Now find ratio
+    let mut j = 0
+    while j < n {
+        let stmt2 = body[j]
+        if stmt2.kind == "AssignStmt" && stmt2.name == term_name {
+            if type_of(stmt2.left) != "string" && stmt2.left.kind == "BinOp" && stmt2.left.op == "*" {
+                let l2 = stmt2.left.left
+                if type_of(l2) != "string" && l2.kind == "Ident" && l2.name == term_name {
+                    return stmt2.left.right
+                }
+            }
+        }
+        j = j + 1
+    }
+    return ""
+}
+
+// Get term name from geometric pattern
+fn get_geometric_term_name(body, acc_name) {
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        if stmt.kind == "AssignStmt" && stmt.name == acc_name {
+            if type_of(stmt.left) != "string" && stmt.left.kind == "BinOp" && stmt.left.op == "+" {
+                let r = stmt.left.right
+                if type_of(r) != "string" && r.kind == "Ident" {
+                    return r.name
+                }
+            }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// Get the while-loop limit variable/expr from: while counter < <limit>
+// or: while counter <= <limit>
+fn get_while_limit(body) {
+    if type_of(body) != "array" { return "" }
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        if stmt.kind == "WhileStmt" {
+            if type_of(stmt.cond) != "string" && stmt.cond.kind == "BinOp" {
+                return stmt.cond.right
+            }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// Get the while-loop comparison operator (<= or <)
+fn get_while_op(body) {
+    if type_of(body) != "array" { return "" }
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        if stmt.kind == "WhileStmt" {
+            if type_of(stmt.cond) != "string" && stmt.cond.kind == "BinOp" {
+                return stmt.cond.op
+            }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// Detect arithmetic series: sum(start..limit) where acc += counter
+// Returns "arithmetic" if pattern matches, "" otherwise
+fn detect_series_pattern(fn_body) {
+    if type_of(fn_body) != "array" { return "" }
+    let n = len(fn_body)
+    // Need at least: let mut acc = 0; let mut i = ...; while ...; return acc
+    if n < 4 { return "" }
+
+    // Find accumulator (first let mut with init=0)
+    let mut acc_name = ""
+    let mut counter_name = ""
+    let mut fi = 0
+    while fi < n {
+        let info = extract_let_mut_int(fn_body[fi])
+        if info != "" {
+            // Parse "name=value"
+            let mut eq_pos = 0
+            let chars = info.chars()
+            let clen = len(chars)
+            let mut ci = 0
+            while ci < clen {
+                if to_string(chars[ci]) == "=" { eq_pos = ci }
+                ci = ci + 1
+            }
+            // Extract name and value using substring logic
+            let mut nm = ""
+            let mut vi = 0
+            while vi < eq_pos {
+                nm = nm + to_string(chars[vi])
+                vi = vi + 1
+            }
+            let mut vl = ""
+            let mut vj = eq_pos + 1
+            while vj < clen {
+                vl = vl + to_string(chars[vj])
+                vj = vj + 1
+            }
+            if acc_name == "" && vl == "0" {
+                acc_name = nm
+            } else {
+                if counter_name == "" {
+                    counter_name = nm
+                }
+            }
+        }
+        fi = fi + 1
+    }
+    if acc_name == "" || counter_name == "" { return "" }
+
+    // Find while statement and check its body
+    let mut wi = 0
+    while wi < n {
+        if fn_body[wi].kind == "WhileStmt" {
+            let wbody = fn_body[wi].body
+            if has_counter_increment(wbody, counter_name) {
+                if is_acc_plus_counter(wbody, acc_name, counter_name) {
+                    return "arithmetic"
+                }
+                if is_acc_plus_counter_squared(wbody, acc_name, counter_name) {
+                    return "arithmetic_sq"
+                }
+                if is_geometric_pattern(wbody, acc_name) {
+                    return "geometric"
+                }
+            }
+        }
+        wi = wi + 1
+    }
+    return ""
+}
+
+// Extract accumulator and counter names from fn body
+fn get_series_acc_name(fn_body) {
+    let n = len(fn_body)
+    let mut fi = 0
+    while fi < n {
+        let info = extract_let_mut_int(fn_body[fi])
+        if info != "" {
+            let chars = info.chars()
+            let clen = len(chars)
+            let mut eq_pos = 0
+            let mut ci = 0
+            while ci < clen {
+                if to_string(chars[ci]) == "=" { eq_pos = ci }
+                ci = ci + 1
+            }
+            let mut nm = ""
+            let mut vi = 0
+            while vi < eq_pos {
+                nm = nm + to_string(chars[vi])
+                vi = vi + 1
+            }
+            let mut vl = ""
+            let mut vj = eq_pos + 1
+            while vj < clen {
+                vl = vl + to_string(chars[vj])
+                vj = vj + 1
+            }
+            if vl == "0" { return nm }
+        }
+        fi = fi + 1
+    }
+    return ""
+}
+
+fn get_series_counter_name(fn_body) {
+    let n = len(fn_body)
+    let mut acc_found = false
+    let mut fi = 0
+    while fi < n {
+        let info = extract_let_mut_int(fn_body[fi])
+        if info != "" {
+            let chars = info.chars()
+            let clen = len(chars)
+            let mut eq_pos = 0
+            let mut ci = 0
+            while ci < clen {
+                if to_string(chars[ci]) == "=" { eq_pos = ci }
+                ci = ci + 1
+            }
+            let mut nm = ""
+            let mut vi = 0
+            while vi < eq_pos {
+                nm = nm + to_string(chars[vi])
+                vi = vi + 1
+            }
+            let mut vl = ""
+            let mut vj = eq_pos + 1
+            while vj < clen {
+                vl = vl + to_string(chars[vj])
+                vj = vj + 1
+            }
+            if !acc_found && vl == "0" {
+                acc_found = true
+            } else {
+                if acc_found { return nm }
+            }
+        }
+        fi = fi + 1
+    }
+    return ""
+}
+
+// Build closed-form body for arithmetic series: n * (n + 1) / 2
+// Handles while i <= n (sum 1..n) and while i < n (sum 0..n-1)
+fn make_arithmetic_closed_form(fn_body) {
+    let limit = get_while_limit(fn_body)
+    if type_of(limit) == "string" && limit == "" { return fn_body }
+    let op = get_while_op(fn_body)
+    let mut body = []
+    if op == "<=" {
+        // sum(1..n) = n * (n + 1) / 2
+        let n_plus_1 = make_binop("+", limit, make_int_lit(1))
+        let n_times = make_binop("*", limit, n_plus_1)
+        let result = make_binop("/", n_times, make_int_lit(2))
+        body = body.push(make_return_expr(result))
+    } else {
+        // sum(0..n-1) = n * (n - 1) / 2  (when counter starts at 0)
+        // But we need to check counter start
+        let counter_name = get_series_counter_name(fn_body)
+        let mut counter_start = "0"
+        let bn = len(fn_body)
+        let mut bi = 0
+        while bi < bn {
+            let info = extract_let_mut_int(fn_body[bi])
+            if info != "" {
+                let chars = info.chars()
+                let clen = len(chars)
+                let mut eq_pos = 0
+                let mut ci = 0
+                while ci < clen {
+                    if to_string(chars[ci]) == "=" { eq_pos = ci }
+                    ci = ci + 1
+                }
+                let mut nm = ""
+                let mut vi = 0
+                while vi < eq_pos {
+                    nm = nm + to_string(chars[vi])
+                    vi = vi + 1
+                }
+                let mut vl = ""
+                let mut vj = eq_pos + 1
+                while vj < clen {
+                    vl = vl + to_string(chars[vj])
+                    vj = vj + 1
+                }
+                if nm == counter_name { counter_start = vl }
+            }
+            bi = bi + 1
+        }
+        if counter_start == "1" {
+            // sum(1..n-1) = (n-1) * n / 2
+            let n_minus_1 = make_binop("-", limit, make_int_lit(1))
+            let prod = make_binop("*", n_minus_1, limit)
+            let result = make_binop("/", prod, make_int_lit(2))
+            body = body.push(make_return_expr(result))
+        } else {
+            // sum(0..n-1) = n * (n - 1) / 2
+            let n_minus_1 = make_binop("-", limit, make_int_lit(1))
+            let prod = make_binop("*", limit, n_minus_1)
+            let result = make_binop("/", prod, make_int_lit(2))
+            body = body.push(make_return_expr(result))
+        }
+    }
+    return body
+}
+
+// Build closed-form body for sum of squares: n * (n + 1) * (2n + 1) / 6
+fn make_arithmetic_sq_closed_form(fn_body) {
+    let limit = get_while_limit(fn_body)
+    if type_of(limit) == "string" && limit == "" { return fn_body }
+    let mut body = []
+    // n * (n + 1) * (2 * n + 1) / 6
+    let n_plus_1 = make_binop("+", limit, make_int_lit(1))
+    let two_n_plus_1 = make_binop("+", make_binop("*", make_int_lit(2), limit), make_int_lit(1))
+    let prod = make_binop("*", make_binop("*", limit, n_plus_1), two_n_plus_1)
+    let result = make_binop("/", prod, make_int_lit(6))
+    body = body.push(make_return_expr(result))
+    return body
+}
+
+// Build closed-form body for geometric series: a * (r^n - 1) / (r - 1)
+// Since we don't have pow() built-in at AST level, we emit a small loop for r^n
+// but fold the rest: if r == 1, return a * n
+fn make_geometric_closed_form(fn_body) {
+    let limit = get_while_limit(fn_body)
+    if type_of(limit) == "string" && limit == "" { return fn_body }
+    let acc_name = get_series_acc_name(fn_body)
+    // Find the while stmt to get its body for geometric details
+    let bn = len(fn_body)
+    let mut wi = 0
+    let mut wbody = []
+    while wi < bn {
+        if fn_body[wi].kind == "WhileStmt" { wbody = fn_body[wi].body }
+        wi = wi + 1
+    }
+    let ratio_expr = get_geometric_ratio(wbody, acc_name)
+    let term_name = get_geometric_term_name(wbody, acc_name)
+    if type_of(ratio_expr) == "string" { return fn_body }
+
+    // Find initial value of term
+    let mut term_init = make_int_lit(1)
+    let mut ti = 0
+    while ti < bn {
+        if fn_body[ti].kind == "LetMutStmt" && fn_body[ti].name == term_name {
+            term_init = fn_body[ti].left
+        }
+        ti = ti + 1
+    }
+
+    let mut body = []
+    // Compute r^n via loop (can't use pow at AST level)
+    // let mut rn = 1; let mut ri = 0; while ri < n { rn = rn * r; ri = ri + 1 }
+    body = body.push(make_let_mut_stmt("_rn", make_int_lit(1)))
+    body = body.push(make_let_mut_stmt("_ri", make_int_lit(0)))
+    let rn_loop_body = [
+        make_assign_stmt("_rn", make_binop("*", make_ident("_rn"), ratio_expr)),
+        make_assign_stmt("_ri", make_binop("+", make_ident("_ri"), make_int_lit(1)))
+    ]
+    body = body.push(make_while_stmt(make_binop("<", make_ident("_ri"), limit), rn_loop_body))
+
+    // if r == 1 { return a * n } else { return a * (rn - 1) / (r - 1) }
+    let r_eq_1 = make_if_expr(
+        make_binop("==", ratio_expr, make_int_lit(1)),
+        [make_return_expr(make_binop("*", term_init, limit))],
+        [make_return_expr(make_binop("/", make_binop("*", term_init, make_binop("-", make_ident("_rn"), make_int_lit(1))), make_binop("-", ratio_expr, make_int_lit(1))))]
+    )
+    body = body.push(make_expr_stmt(r_eq_1))
+    return body
+}
+
 fn is_literal_kind(k) {
     if k == "IntLit" { return true }
     if k == "FloatLit" { return true }
@@ -6455,6 +7060,8 @@ fn ai_native_pass(ast) {
     m972_compact_candidates = 0
     m973_sliding_ok = 0
     m973_sliding_candidates = 0
+    m975_binary_search_rewrites = 0
+    m976_algebraic_series_rewrites = 0
     m252_contract_injects = 0
     m480_symbolic_rewrites = 0
     m481_fuse_chain_max = 0
@@ -7907,6 +8514,17 @@ fn ai_native_pass(ast) {
                 println("[ai-native] fn " + node.name + " DETECTED: linear-search (→ binary search O(log n) if sorted)")
                 m958_linear_search_detected = m958_linear_search_detected + 1
             }
+            // M975: linear-search → binary-search AST rewrite
+            //   Requires: @optimize + @sorted + M958 linear-search pattern
+            //   Rewrites the body to O(log n) binary search.
+            if attr_has(attrs, "optimize") && fn_has_sorted_attr(attrs) && wd >= 1 && wd < 2 && !body_has_let_mut(node.body) && count_body_by_kind(node.body, "Index") >= 1 && body_has_return_in_while(node.body) {
+                let arr_p = get_first_param_name(node)
+                let tgt_p = get_second_param_name(node)
+                let bs_body = make_binary_search_body(arr_p, tgt_p)
+                node = rewrite_fn_with_body(node, bs_body)
+                m975_binary_search_rewrites = m975_binary_search_rewrites + 1
+                println("[ai-native] fn " + node.name + " REWRITE: linear→binary_search O(log n)")
+            }
             // M959: tail-recursive detection — last stmt is Return(self-call), no @optimize required
             if is_tail_call(node.body, node.name) {
                 println("[ai-native] fn " + node.name + " DETECTED: tail-recursive (→ while loop, O(1) stack)")
@@ -8066,6 +8684,30 @@ fn ai_native_pass(ast) {
                 } else {
                     m970_algebraic_ok = m970_algebraic_ok + 1
                     println("[ai-native] fn " + node.name + " OK: @algebraic (already canonical)")
+                }
+                // M976: @algebraic closed-form series rewrite
+                //   Detects loop-based summation patterns and rewrites to O(1).
+                //   arithmetic: sum(1..n) → n*(n+1)/2
+                //   arithmetic_sq: sum(i^2) → n*(n+1)*(2n+1)/6
+                //   geometric: sum(a*r^i) → a*(r^n-1)/(r-1)
+                let series = detect_series_pattern(node.body)
+                if series == "arithmetic" {
+                    let cf_body = make_arithmetic_closed_form(node.body)
+                    node = rewrite_fn_with_body(node, cf_body)
+                    m976_algebraic_series_rewrites = m976_algebraic_series_rewrites + 1
+                    println("[ai-native] fn " + node.name + " REWRITE: @algebraic arithmetic series → O(1) closed form")
+                }
+                if series == "arithmetic_sq" {
+                    let cf_body = make_arithmetic_sq_closed_form(node.body)
+                    node = rewrite_fn_with_body(node, cf_body)
+                    m976_algebraic_series_rewrites = m976_algebraic_series_rewrites + 1
+                    println("[ai-native] fn " + node.name + " REWRITE: @algebraic sum-of-squares → O(1) closed form")
+                }
+                if series == "geometric" {
+                    let cf_body = make_geometric_closed_form(node.body)
+                    node = rewrite_fn_with_body(node, cf_body)
+                    m976_algebraic_series_rewrites = m976_algebraic_series_rewrites + 1
+                    println("[ai-native] fn " + node.name + " REWRITE: @algebraic geometric series → O(1) closed form")
                 }
             }
             // M971: @approximate — fast math approximation detection.
@@ -8487,9 +9129,9 @@ fn ai_native_pass(ast) {
     println("[ai-native] body-size G1=" + to_string(m12_g1_size) + " G2=" + to_string(m12_g2_size) + " G3=" + to_string(m12_g3_size) + " G4=" + to_string(m12_g4_size) + ", max-while-depth " + to_string(m13_max_while_depth) + ", max-complexity " + to_string(m36_max_complexity))
     println("[ai-native] stubs " + to_string(m37_stubs) + ", attr-hist 1=" + to_string(m38_one) + " 2=" + to_string(m38_two) + " 3=" + to_string(m38_three) + " 4+=" + to_string(m38_four_plus) + ", params sum=" + to_string(m39_param_sum) + " zero-arg=" + to_string(m39_zero_arg) + " max-arity=" + to_string(m39_max_arity))
     println("[ai-native] bubble-candidates " + to_string(m14_bubble_candidates) + ", tail-call-candidates " + to_string(m15_tail_call_candidates) + ", strassen-candidates " + to_string(m16_strassen_candidates) + ", dp-missed " + to_string(m17_dp_missed))
-    println("[ai-native] bubble-detected " + to_string(m957_bubble_detected) + ", linear-search-detected " + to_string(m958_linear_search_detected) + ", tail-rec-detected " + to_string(m959_tail_recursive_detected) + ", bubble-rewrites " + to_string(m961_bubble_rewrites))
+    println("[ai-native] bubble-detected " + to_string(m957_bubble_detected) + ", linear-search-detected " + to_string(m958_linear_search_detected) + ", tail-rec-detected " + to_string(m959_tail_recursive_detected) + ", bubble-rewrites " + to_string(m961_bubble_rewrites) + ", binary-search-rewrites " + to_string(m975_binary_search_rewrites) + ", algebraic-series-rewrites " + to_string(m976_algebraic_series_rewrites))
     // M81: digest line — compact one-shot summary
-    let total_rewrites = m22_rewrites + m23_auto_memoize + m24_dce_fns + m25_tail_rewrites + m26_attr_dedups + m27_attr_sorts + m30_algebraic + m32_folds + m33_cmp_folds + m34_unary_folds + m35_bool_folds + m41_dead_loops + m480_symbolic_rewrites + m960_fuse_rewrites + m961_bubble_rewrites + m965_mapfilter_fused
+    let total_rewrites = m22_rewrites + m23_auto_memoize + m24_dce_fns + m25_tail_rewrites + m26_attr_dedups + m27_attr_sorts + m30_algebraic + m32_folds + m33_cmp_folds + m34_unary_folds + m35_bool_folds + m41_dead_loops + m480_symbolic_rewrites + m960_fuse_rewrites + m961_bubble_rewrites + m965_mapfilter_fused + m975_binary_search_rewrites + m976_algebraic_series_rewrites
     println("[ai-native] DIGEST fns=" + to_string(m6_annotated_fns) + "/" + to_string(m6_total_fns) + " attrs=" + to_string(m64_total_attrs) + " diversity=" + to_string(len(m63_attr_set)) + " rewrites=" + to_string(total_rewrites) + " leaves=" + to_string(m54_leaf_count) + " identity=" + to_string(m74_identity_fns) + " wrapper=" + to_string(m75_wrapper_fns) + " stubs=" + to_string(m37_stubs) + " nodes=" + to_string(m131_total_nodes) + " max-cplx=" + to_string(m36_max_complexity))
     let m18_total_suggestions = m14_bubble_candidates + m15_tail_call_candidates + m16_strassen_candidates + m17_dp_missed + m3_inline_too_big + m5_memoize_bad + m8_hw_no_loop + m4_attr_conflicts + m1_pure_violations + m19_unreachable
     println("[ai-native] unreachable " + to_string(m19_unreachable) + ", empty-body " + to_string(m20_empty_body) + ", const-return " + to_string(m21_const_return) + ", rewrites " + to_string(m22_rewrites) + ", auto-memoize " + to_string(m23_auto_memoize) + ", dce " + to_string(m24_dce_stmts) + " stmt(s) in " + to_string(m24_dce_fns) + " fn(s), tail-rewrites " + to_string(m25_tail_rewrites))
@@ -8538,6 +9180,12 @@ fn ai_native_pass(ast) {
     }
     if m973_sliding_ok > 0 {
         println("[ai-native] @optimize sliding-window: " + to_string(m973_sliding_ok) + " fn(s), " + to_string(m973_sliding_candidates) + " DP lookback(s)")
+    }
+    if m975_binary_search_rewrites > 0 {
+        println("[ai-native] linear→binary search: " + to_string(m975_binary_search_rewrites) + " rewrite(s)")
+    }
+    if m976_algebraic_series_rewrites > 0 {
+        println("[ai-native] @algebraic series→closed form: " + to_string(m976_algebraic_series_rewrites) + " rewrite(s)")
     }
     return out
 }
