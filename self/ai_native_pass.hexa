@@ -2171,8 +2171,14 @@ fn propagate_copies_body(body) {
 }
 // M252: @contract auto pre-assert injection
 let mut m252_contract_injects = 0
+// M253b: @contract compile-time provability — runtime check elimination
+let mut m253b_contract_elims = 0
 // M480: @symbolic strength reduction (x*pow2 → x<<N, x/pow2 → x>>N, x%pow2 → x&(N-1))
 let mut m480_symbolic_rewrites = 0
+// M481b: @symbolic x*2 → x+x rewrites
+let mut m481b_symbolic_mul2 = 0
+// M481c: @symbolic x**2 → x*x rewrites
+let mut m481c_symbolic_pow2 = 0
 // M481: @fuse call-chain depth (max nested Call depth per @fuse fn)
 let mut m481_fuse_chain_max = 0
 // M482: @fuse candidate count (fns with chain depth >= 2)
@@ -2356,6 +2362,93 @@ fn inject_contract_assert(body, param_name) {
         }
     }
     return out
+}
+
+// ── M253b: @contract compile-time provability ─────────────────────────
+// Attempt to prove a ContractAssert condition is always true given
+// compile-time information. If provable, the runtime assert is elided.
+//
+// Currently handles:
+//   (a) Trivially-true conditions: BoolLit "true"
+//   (b) Constant comparisons: IntLit op IntLit that evaluate to true
+//   (c) Tautologies: x == x, x <= x, x >= x
+//   (d) Implied by param type: (for future extension)
+fn contract_cond_provably_true(cond) {
+    if type_of(cond) == "string" { return false }
+    // (a) literal true
+    if cond.kind == "BoolLit" && cond.value == "true" { return true }
+    // (b) constant int comparison
+    if cond.kind == "BinOp" {
+        let l = cond.left
+        let r = cond.right
+        if type_of(l) != "string" && type_of(r) != "string" {
+            if l.kind == "IntLit" && r.kind == "IntLit" {
+                let lv = parse_int_str(l.value)
+                let rv = parse_int_str(r.value)
+                let op = cond.op
+                if op == ">" { return lv > rv }
+                if op == ">=" { return lv >= rv }
+                if op == "<" { return lv < rv }
+                if op == "<=" { return lv <= rv }
+                if op == "==" { return lv == rv }
+                if op == "!=" { return lv != rv }
+            }
+            // (c) tautology: same ident on both sides
+            if l.kind == "Ident" && r.kind == "Ident" && l.name == r.name {
+                let op = cond.op
+                if op == "==" || op == "<=" || op == ">=" { return true }
+            }
+        }
+        // (d) && — both sides must be provably true
+        if cond.op == "&&" {
+            return contract_cond_provably_true(cond.left) && contract_cond_provably_true(cond.right)
+        }
+        // || — either side provably true suffices
+        if cond.op == "||" {
+            return contract_cond_provably_true(cond.left) || contract_cond_provably_true(cond.right)
+        }
+    }
+    return false
+}
+
+// Eliminate provably-true ContractAssert nodes from a body.
+// Returns [new_body, elim_count].
+fn contract_elim_body(body) {
+    if type_of(body) != "array" { return [body, 0] }
+    let mut out = []
+    let mut elims = 0
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        if stmt.kind == "ContractAssert" {
+            if contract_cond_provably_true(stmt.left) {
+                // Provably true — elide
+                elims = elims + 1
+            } else {
+                out = out.push(stmt)
+            }
+        } else {
+            if stmt.kind == "IfStmt" || stmt.kind == "IfExpr" {
+                // Recurse into branches
+                let then_r = contract_elim_body(stmt.then_body)
+                let else_r = contract_elim_body(stmt.else_body)
+                elims = elims + then_r[1] + else_r[1]
+                out = out.push(AstNode {
+                    kind: stmt.kind, name: stmt.name, value: stmt.value, op: stmt.op,
+                    left: stmt.left, right: stmt.right, cond: stmt.cond,
+                    then_body: then_r[0], else_body: else_r[0],
+                    params: stmt.params, body: stmt.body, args: stmt.args, fields: stmt.fields, items: stmt.items,
+                    variants: stmt.variants, arms: stmt.arms, iter_expr: stmt.iter_expr, ret_type: stmt.ret_type,
+                    target: stmt.target, trait_name: stmt.trait_name, methods: stmt.methods
+                })
+            } else {
+                out = out.push(stmt)
+            }
+        }
+        i = i + 1
+    }
+    return [out, elims]
 }
 
 // Check if expression references an identifier by name (recursive)
@@ -4407,6 +4500,17 @@ fn simplify_expr(expr) {
                 }
             }
         }
+        // M481b: @symbolic x * 2 → x + x (addition cheaper than mul)
+        if type_of(r) != "string" && r.kind == "IntLit" && r.value == "2" {
+            m481b_symbolic_mul2 = m481b_symbolic_mul2 + 1
+            return AstNode {
+                kind: "BinOp", name: "", value: "", op: "+",
+                left: l, right: l, cond: "", then_body: "", else_body: "",
+                params: "", body: "", args: "", fields: "", items: "",
+                variants: "", arms: "", iter_expr: "", ret_type: "",
+                target: "", trait_name: "", methods: ""
+            }
+        }
         // M480: @symbolic strength reduction — x * pow2 → x << log2(pow2)
         if type_of(r) != "string" && r.kind == "IntLit" {
             let rv = parse_int_str(r.value)
@@ -4539,6 +4643,32 @@ fn simplify_expr(expr) {
         if is_not_of(l, r) || is_not_of(r, l) {
             m35_bool_folds = m35_bool_folds + 1
             return make_bool_lit_from_bool(true)
+        }
+    }
+    // M481c: @symbolic x ** 2 → x * x (power lowering)
+    if op == "**" {
+        if type_of(r) != "string" && r.kind == "IntLit" {
+            // x ** 0 → 1
+            if r.value == "0" {
+                m481c_symbolic_pow2 = m481c_symbolic_pow2 + 1
+                return make_int_lit(1)
+            }
+            // x ** 1 → x
+            if r.value == "1" {
+                m481c_symbolic_pow2 = m481c_symbolic_pow2 + 1
+                return l
+            }
+            // x ** 2 → x * x
+            if r.value == "2" {
+                m481c_symbolic_pow2 = m481c_symbolic_pow2 + 1
+                return AstNode {
+                    kind: "BinOp", name: "", value: "", op: "*",
+                    left: l, right: l, cond: "", then_body: "", else_body: "",
+                    params: "", body: "", args: "", fields: "", items: "",
+                    variants: "", arms: "", iter_expr: "", ret_type: "",
+                    target: "", trait_name: "", methods: ""
+                }
+            }
         }
     }
     // Rebuild with simplified children
@@ -6456,7 +6586,10 @@ fn ai_native_pass(ast) {
     m973_sliding_ok = 0
     m973_sliding_candidates = 0
     m252_contract_injects = 0
+    m253b_contract_elims = 0
     m480_symbolic_rewrites = 0
+    m481b_symbolic_mul2 = 0
+    m481c_symbolic_pow2 = 0
     m481_fuse_chain_max = 0
     m482_fuse_candidates = 0
     m960_fuse_rewrites = 0
@@ -8194,6 +8327,17 @@ fn ai_native_pass(ast) {
                     println("[ai-native] fn " + node.name + " REWRITE: @contract assert " + pname + " != 0 prepended")
                 }
             }
+            // M253b: @contract compile-time provability — elide provably-true checks
+            if attr_has(fresh_attrs_ct, "contract") {
+                let ce_result = contract_elim_body(node.body)
+                let ce_body = ce_result[0]
+                let ce_count = ce_result[1]
+                if ce_count > 0 {
+                    node = rewrite_fn_with_body(node, ce_body)
+                    m253b_contract_elims = m253b_contract_elims + ce_count
+                    println("[ai-native] fn " + node.name + " REWRITE: @contract elided " + to_string(ce_count) + " provably-true check(s)")
+                }
+            }
             // M30/M32/M33/M34/M35/M41: folding + dead loop elimination
             let before_alg = m30_algebraic
             let before_fold = m32_folds
@@ -8489,13 +8633,16 @@ fn ai_native_pass(ast) {
     println("[ai-native] bubble-candidates " + to_string(m14_bubble_candidates) + ", tail-call-candidates " + to_string(m15_tail_call_candidates) + ", strassen-candidates " + to_string(m16_strassen_candidates) + ", dp-missed " + to_string(m17_dp_missed))
     println("[ai-native] bubble-detected " + to_string(m957_bubble_detected) + ", linear-search-detected " + to_string(m958_linear_search_detected) + ", tail-rec-detected " + to_string(m959_tail_recursive_detected) + ", bubble-rewrites " + to_string(m961_bubble_rewrites))
     // M81: digest line — compact one-shot summary
-    let total_rewrites = m22_rewrites + m23_auto_memoize + m24_dce_fns + m25_tail_rewrites + m26_attr_dedups + m27_attr_sorts + m30_algebraic + m32_folds + m33_cmp_folds + m34_unary_folds + m35_bool_folds + m41_dead_loops + m480_symbolic_rewrites + m960_fuse_rewrites + m961_bubble_rewrites + m965_mapfilter_fused
+    let total_rewrites = m22_rewrites + m23_auto_memoize + m24_dce_fns + m25_tail_rewrites + m26_attr_dedups + m27_attr_sorts + m30_algebraic + m32_folds + m33_cmp_folds + m34_unary_folds + m35_bool_folds + m41_dead_loops + m480_symbolic_rewrites + m481b_symbolic_mul2 + m481c_symbolic_pow2 + m253b_contract_elims + m960_fuse_rewrites + m961_bubble_rewrites + m965_mapfilter_fused
     println("[ai-native] DIGEST fns=" + to_string(m6_annotated_fns) + "/" + to_string(m6_total_fns) + " attrs=" + to_string(m64_total_attrs) + " diversity=" + to_string(len(m63_attr_set)) + " rewrites=" + to_string(total_rewrites) + " leaves=" + to_string(m54_leaf_count) + " identity=" + to_string(m74_identity_fns) + " wrapper=" + to_string(m75_wrapper_fns) + " stubs=" + to_string(m37_stubs) + " nodes=" + to_string(m131_total_nodes) + " max-cplx=" + to_string(m36_max_complexity))
     let m18_total_suggestions = m14_bubble_candidates + m15_tail_call_candidates + m16_strassen_candidates + m17_dp_missed + m3_inline_too_big + m5_memoize_bad + m8_hw_no_loop + m4_attr_conflicts + m1_pure_violations + m19_unreachable
     println("[ai-native] unreachable " + to_string(m19_unreachable) + ", empty-body " + to_string(m20_empty_body) + ", const-return " + to_string(m21_const_return) + ", rewrites " + to_string(m22_rewrites) + ", auto-memoize " + to_string(m23_auto_memoize) + ", dce " + to_string(m24_dce_stmts) + " stmt(s) in " + to_string(m24_dce_fns) + " fn(s), tail-rewrites " + to_string(m25_tail_rewrites))
     println("[ai-native] TOTAL actionable items: " + to_string(m18_total_suggestions))
-    if m480_symbolic_rewrites > 0 {
-        println("[ai-native] @symbolic strength-reduction: " + to_string(m480_symbolic_rewrites) + " rewrite(s)")
+    if m252_contract_injects > 0 || m253b_contract_elims > 0 {
+        println("[ai-native] @contract: " + to_string(m252_contract_injects) + " assert(s) injected, " + to_string(m253b_contract_elims) + " provably-true check(s) elided")
+    }
+    if m480_symbolic_rewrites > 0 || m481b_symbolic_mul2 > 0 || m481c_symbolic_pow2 > 0 {
+        println("[ai-native] @symbolic: shift-reduction=" + to_string(m480_symbolic_rewrites) + " mul2→add=" + to_string(m481b_symbolic_mul2) + " pow-lower=" + to_string(m481c_symbolic_pow2))
     }
     if m482_fuse_candidates > 0 {
         println("[ai-native] @fuse candidates: " + to_string(m482_fuse_candidates) + " fn(s), max chain depth " + to_string(m481_fuse_chain_max))
@@ -8553,7 +8700,7 @@ fn ai_native_fixpoint(ast) {
     while iter < max_iters {
         let next = ai_native_pass(cur)
         m87_fixpoint_iters = m87_fixpoint_iters + 1
-        let total_rewrites = m22_rewrites + m23_auto_memoize + m24_dce_fns + m25_tail_rewrites + m26_attr_dedups + m27_attr_sorts + m82_auto_inline + m83_wrapper_inline + m84_stub_pure + m116_assert_elim + m152_auto_pure_leaf + m153_trivial_inline + m250_const_prop + m251_dead_stores + m480_symbolic_rewrites
+        let total_rewrites = m22_rewrites + m23_auto_memoize + m24_dce_fns + m25_tail_rewrites + m26_attr_dedups + m27_attr_sorts + m82_auto_inline + m83_wrapper_inline + m84_stub_pure + m116_assert_elim + m152_auto_pure_leaf + m153_trivial_inline + m250_const_prop + m251_dead_stores + m480_symbolic_rewrites + m481b_symbolic_mul2 + m481c_symbolic_pow2 + m253b_contract_elims
         m89_fixpoint_total_rewrites = m89_fixpoint_total_rewrites + total_rewrites
         if total_rewrites == 0 {
             m88_fixpoint_converged = true
