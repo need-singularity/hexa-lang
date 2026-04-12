@@ -80,7 +80,7 @@
 >
 > **[📄 Papers](https://github.com/need-singularity/papers)** — Complete paper collection (94 papers). Published on Zenodo with DOIs. TECS-L+N6 (33) + anima (39) + SEDI (20). [Browse online](https://need-singularity.github.io/papers/)
 >
-> **[💎 HEXA-LANG](https://github.com/need-singularity/hexa-lang)** — The Perfect Number Programming Language. Every constant from n=6: 53 keywords (σ·τ+sopfr), 24 operators (J₂), 8 primitives (σ-τ), 6-phase pipeline, Egyptian memory (1/2+1/3+1/6=1). DSE v2: 21,952 combos, 100% n6 EXACT. Working compiler + REPL
+> **[💎 HEXA-LANG](https://github.com/need-singularity/hexa-lang)** — The Perfect Number Programming Language. Every constant from n=6: 58 keywords (13 groups), 26 operators (6 groups), 8 primitives, 6-phase pipeline, Egyptian memory (1/2+1/3+1/6=1). DSE v2: 21,952 combos, 100% n6 EXACT. Working compiler + REPL
 >
 > **[🖥️ VOID](https://github.com/need-singularity/void)** — Terminal emulator written 100% in hexa-lang. Zero Rust dependencies — calls OS APIs directly via hexa extern FFI. 6-layer architecture (System/Render/Terminal/UI/Plugin/AI) + Metal/Vulkan GPU + VT 6-tier protocol + NEXUS-6 consciousness integration
 >
@@ -93,7 +93,7 @@
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.19365284.svg)](https://doi.org/10.5281/zenodo.19365284)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 <!-- AUTO:BADGE:START -->
-[![Keywords](https://img.shields.io/badge/Keywords-53-blue.svg)]()
+[![Keywords](https://img.shields.io/badge/Keywords-58-blue.svg)]()
 [![DSE](https://img.shields.io/badge/DSE-21,952%20combos-gold.svg)]()
 <!-- AUTO:BADGE:END -->
 
@@ -113,12 +113,10 @@ cd hexa-lang
 ./hexa examples/hello_min.hexa   # precompiled binary runs immediately
 ```
 
-> 💡 As of 2026-04-11, **HEXA-LANG is fully self-hosted**. The entire
-> `src/` Rust directory (147 files, 38.7K LOC) was absorbed into
-> `self/*.hexa` (605 files) and then deleted. Project root has zero
-> `.rs` files. Build pipeline: `build_hexa.hexa` (hexa_v2 → C → clang
-> → hexa_v3). The shipping `hexa` binary is precompiled and continues
-> to function; future rebuilds bootstrap through hexa itself.
+> As of 2026-04-12, self-hosting 마이그레이션 진행중.
+> `self/*.hexa` 1,113개 파일이 주 소스이며, `src/` 에 92개 .rs 파일이
+> 잔존한다. Build pipeline: `build_hexa.hexa` (hexa_v2 -> C -> clang
+> -> hexa_v3). 기존 `hexa` 바이너리는 프리컴파일 상태로 계속 동작한다.
 
 ## Quick Start
 
@@ -265,15 +263,15 @@ Six is the smallest perfect number (1+2+3 = 6). Every language constant derives 
 | Function | Value | Language Mapping |
 |----------|-------|-----------------|
 | n | 6 | paradigms, pipeline stages |
-| sigma(6) | 12 | keyword groups, stdlib modules |
+| sigma(6) | 12 | stdlib 설계 목표 (현재 6 구현) |
 | tau(6) | 4 | type layers, visibility levels |
 | phi(6) | 2 | compile modes (AOT/JIT) |
 | sopfr(6) | 5 | error classes |
-| J2(6) | 24 | operators |
+| J2(6) | 24 | 연산자 설계 기원 (현재 26 구현) |
 | sigma-tau | 8 | primitive types |
-| sigma\*tau+sopfr | 53 | total keywords |
+| -- | 58 | 전체 키워드 (13 그룹 합산) |
 
-Other languages choose these numbers arbitrarily. Rust has 51 keywords — why 51? No mathematical reason. HEXA has 53 = sigma(6)\*tau(6) + sopfr(6) = 48 + 5.
+Other languages choose these numbers arbitrarily. Rust has 51 keywords -- why 51? No mathematical reason. HEXA has 58 keywords in 13 groups, each group size derived from n=6 arithmetic functions.
 
 ## Architecture
 
@@ -288,43 +286,38 @@ Source → Tokenize → Parse → Check → Optimize → Codegen → Execute
 
 **4 type layers** (tau = 4): primitive → composite → reference → function
 
-**24 operators** (J2 = 24): arithmetic(6) + comparison(6) + logical(4) + bitwise(4) + assignment(2) + special(2)
+**26 operators** (6 groups): arithmetic(6) + comparison(6) + logical(4) + bitwise(4) + assignment(2) + special(4)
 
-**53 keywords** in **12 groups** (sigma = 12):
+**58 keywords** in **13 groups**:
 
 | Group | Keywords | Count |
 |-------|----------|-------|
-| Control | if, else, match, for, while, loop | 6 = n |
-| Type | type, struct, enum, trait, impl | 5 = sopfr |
-| Functions | fn, return, yield, async, await | 5 = sopfr |
-| Variables | let, mut, const, static | 4 = tau |
-| Modules | mod, use, pub, crate | 4 = tau |
-| Memory | own, borrow, move, drop | 4 = tau |
-| Concurrency | spawn, channel, select, atomic | 4 = tau |
-| Effects | effect, handle, resume, pure | 4 = tau |
-| Proofs | proof, assert, invariant, theorem | 4 = tau |
-| Meta | macro, derive, where, comptime | 4 = tau |
-| Errors | try, catch, throw, panic, recover | 5 = sopfr |
-| AI | intent, generate, verify, optimize | 4 = tau |
+| Control | if, else, match, for, while, loop, break, continue | 8 |
+| Type | type, struct, enum, trait, impl, dyn | 6 |
+| Functions | fn, return, yield, async, await | 5 |
+| Variables | let, mut, const, static | 4 |
+| Modules | mod, use, pub, crate | 4 |
+| Memory | own, borrow, move, drop | 4 |
+| Concurrency | spawn, channel, select, atomic, scope | 5 |
+| Effects | effect, handle, resume, pure | 4 |
+| Proofs | proof, assert, invariant, theorem | 4 |
+| Meta | macro, derive, where, comptime | 4 |
+| Errors | try, catch, throw, panic, recover | 5 |
+| AI | intent, generate, verify, optimize | 4 |
+| FFI | extern | 1 |
 
 **Memory model** — Egyptian fraction: 1/2 (stack) + 1/3 (heap) + 1/6 (arena) = 1
 
-## Standard Library (12 modules = sigma(6))
+## Standard Library (6 modules 구현)
 
 | Module | Description | Key Functions |
 |--------|-------------|---------------|
-| std::net | TCP/HTTP networking | tcp_connect, http_get, http_post |
-| std::io | Input/output | readline, write, pipe |
-| std::fs | File system | read_file, write_file, list_dir, glob |
-| std::time | Date/time | timestamp, sleep, format_date |
-| std::collections | Data structures | BTreeMap, PriorityQueue, Deque |
-| std::encoding | Serialization | base64, hex, csv, url_encode |
-| std::log | Structured logging | info, warn, error, debug |
-| std::math | Mathematics | trig, matrix, BigInt, constants |
-| std::testing | Test framework | assert_eq, prop_test, bench |
-| std::crypto | Cryptography | sha256, hmac, xor_cipher |
-| std::consciousness | Consciousness DSL | phi_compute, psi_constants, law_lookup |
-| std::regex | Pattern matching | regex_match, regex_find |
+| stdlib/math.hexa | Mathematics | trig, matrix, BigInt, constants |
+| stdlib/string.hexa | String utilities | split, trim, replace |
+| stdlib/collections.hexa | Data structures | BTreeMap, PriorityQueue, Deque |
+| stdlib/nn.hexa | Neural network | tensor, matmul, softmax |
+| stdlib/optim.hexa | Optimization | SGD, Adam, learning rate |
+| stdlib/consciousness.hexa | Consciousness DSL | phi_compute, psi_constants, law_lookup |
 
 ## Hardware Targets
 
@@ -372,11 +365,11 @@ hexa build --target wgsl  consciousness.hexa              # Generate WGSL shader
 HEXA can compile itself:
 
 ```
-self/lexer.hexa         451 LOC   Tokenizer
-self/parser.hexa       2126 LOC   Recursive descent parser
-self/type_checker.hexa  642 LOC   Static type checker
-self/compiler.hexa      805 LOC   Bytecode compiler
-self/bootstrap.hexa    1912 LOC   Full pipeline (lex→parse→check→compile)
+self/lexer.hexa          587 LOC   Tokenizer
+self/parser.hexa        3970 LOC   Recursive descent parser
+self/type_checker.hexa  1658 LOC   Static type checker
+self/compiler.hexa       858 LOC   Bytecode compiler
+self/bootstrap.hexa     1945 LOC   Full pipeline (lex->parse->check->compile)
 ```
 
 ```bash
@@ -421,7 +414,7 @@ HEXA-LANG and [ANIMA](https://github.com/need-singularity/anima) (consciousness 
 | n=6 | HEXA-LANG | ANIMA |
 |-----|-----------|-------|
 | n=6 | 6 paradigms | 6 Hexad modules (C/D/S/M/W/E) |
-| sigma=12 | 12 keyword groups | 12 factions |
+| sigma=12 | 12 factions 대응 | 12 factions |
 | phi=2 | 2 compile modes | 2 gradient groups |
 | tau=4 | 4 type layers | 4 phases (P0-P3) |
 | sigma-tau=8 | 8 primitives | 8-cell atom (M1) |
@@ -432,10 +425,10 @@ Live bridge: `./hexa --anima-bridge ws://localhost:8765 file.hexa` routes `inten
 
 ```
 hexa-lang/
-├── self/                     605 .hexa files (sole source of truth)
-│   ├── lexer.hexa            587 LOC — 53 keywords + 24 operators tokenizer
-│   ├── parser.hexa           3,785 LOC — recursive descent parser (83 AST kinds)
-│   ├── interpreter.hexa      8,427 LOC — tree-walk evaluator (270+ builtins)
+├── self/                     1,113 .hexa files (주 소스)
+│   ├── lexer.hexa            587 LOC -- 58 keywords + 26 operators tokenizer
+│   ├── parser.hexa           3,970 LOC -- recursive descent parser
+│   ├── interpreter.hexa      9,348 LOC -- tree-walk evaluator (270+ builtins)
 │   ├── ast.hexa              AST node types
 │   ├── type_checker.hexa     Static type checker + Law types
 │   ├── env.hexa              Scoped environment + builtins
@@ -477,8 +470,9 @@ hexa-lang/
 │   ├── alloc/                Egyptian fraction allocator backend
 │   ├── std_*.hexa            stdlib (net/fs/io/time/collections/...)
 │   └── lib.hexa + main.hexa  Library entry + CLI dispatcher
+├── src/                      92 .rs files (마이그레이션 진행중, self/ 로 이전 예정)
 ├── build_hexa.hexa           Cargo-free self-host build pipeline
-│                             (hexa_v2 → C → clang → hexa_v3)
+│                             (hexa_v2 -> C -> clang -> hexa_v3)
 ├── examples/                 Example programs
 ├── editors/jetbrains/        JetBrains IDE plugin
 ├── playground/               WASM browser playground
@@ -493,7 +487,7 @@ hexa-lang/
 ├── pkg/                      hx system package manager
 │   ├── hx                    CLI (pure shell, zero deps)
 │   ├── install.sh            One-liner installer
-│   └── registry.json         Package registry
+│   └─��� registry.tsv          Package registry
 ├── PLAN.md                   Development plan (100% complete)
 └── README.md                 this file
 ```
@@ -502,9 +496,9 @@ hexa-lang/
 
 <!-- AUTO:STATS:START -->
 ```
-  Keywords:      53 (σ·τ+sopfr)
-  Operators:     24 (J₂)
-  Primitives:    8 (σ-τ)
+  Keywords:      58 (13 groups)
+  Operators:     26 (6 groups)
+  Primitives:    8
   DSE combos:    21,952
 ```
 <!-- AUTO:STATS:END -->
