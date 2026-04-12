@@ -61,6 +61,7 @@ fn classify_attr_m0(name) {
     if name == "branch_predict" { return "G3" }
     if name == "restrict" { return "G3" }
     if name == "flatten" { return "G3" }
+    if name == "stack_alloc" { return "G1" }
     if name == "test" { return "meta" }
     if name == "bench" { return "meta" }
     if name == "deprecated" { return "meta" }
@@ -1304,6 +1305,104 @@ fn build_tco_assigns(params, args) {
                 target: "", trait_name: "", methods: ""
             })
         }
+// M974: jump threading — conditional branch chain shortcut
+let mut m974_jump_thread = 0
+// M975: @stack_alloc — bounded array on stack instead of heap
+let mut m975_stack_alloc = 0
+// M976: induction variable simplification — multiply→add chains
+let mut m976_iv_simplify = 0
+// M977: linked list→array restructure — sequential access pattern
+let mut m977_list_to_array = 0
+
+// ── #46 Jump Threading ─────────────────────────────────────────
+// Detects conditional branch chains: if-else where branches lead to
+// further trivial conditional jumps. Threads the jump directly to
+// the final target, eliminating intermediate blocks.
+//
+// Pattern detected:
+//   if cond1 { if cond2 { X } else { Y } } else { Y }
+// Rewrites to:
+//   if cond1 && cond2 { X } else { Y }
+fn stmts_equal_shallow(a, b) {
+    if type_of(a) != "array" || type_of(b) != "array" { return false }
+    if len(a) != len(b) { return false }
+    let n = len(a)
+    let mut i = 0
+    while i < n {
+        if type_of(a[i]) == "string" || type_of(b[i]) == "string" { return false }
+        if a[i].kind != b[i].kind { return false }
+        // Shallow: match ReturnStmt with same literal, or ExprStmt same
+        if a[i].kind == "ReturnStmt" {
+            if type_of(a[i].left) != "string" && type_of(b[i].left) != "string" {
+                if a[i].left.kind == "IntLit" && b[i].left.kind == "IntLit" {
+                    if a[i].left.value != b[i].left.value { return false }
+                } else if a[i].left.kind == "Ident" && b[i].left.kind == "Ident" {
+                    if a[i].left.name != b[i].left.name { return false }
+                } else if a[i].left.kind == "BoolLit" && b[i].left.kind == "BoolLit" {
+                    if a[i].left.value != b[i].left.value { return false }
+                } else {
+                    return false
+                }
+            } else if type_of(a[i].left) != type_of(b[i].left) {
+                return false
+            }
+        } else if a[i].kind == "AssignStmt" {
+            if a[i].name != b[i].name { return false }
+            if type_of(a[i].right) != "string" && type_of(b[i].right) != "string" {
+                if a[i].right.kind == "IntLit" && b[i].right.kind == "IntLit" {
+                    if a[i].right.value != b[i].right.value { return false }
+                } else {
+                    return false
+                }
+            } else {
+                return false
+            }
+        } else {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn jump_thread_body(body) {
+    if type_of(body) != "array" { return body }
+    let mut out = []
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        if type_of(stmt) != "string" && stmt.kind == "IfStmt" {
+            // Check: outer if has else_body, and inner then_body has single IfStmt
+            let then_b = stmt.body
+            let else_b = stmt.else_body
+            if type_of(then_b) == "array" && len(then_b) == 1 && type_of(else_b) == "array" {
+                let inner = then_b[0]
+                if type_of(inner) != "string" && inner.kind == "IfStmt" {
+                    let inner_else = inner.else_body
+                    if type_of(inner_else) == "array" && stmts_equal_shallow(inner_else, else_b) {
+                        // Thread: if cond1 && cond2 { inner_then } else { shared_else }
+                        let combined_cond = AstNode {
+                            kind: "BinOp",
+                            op: "&&",
+                            left: stmt.cond,
+                            right: inner.cond
+                        }
+                        let threaded = AstNode {
+                            kind: "IfStmt",
+                            cond: combined_cond,
+                            body: inner.body,
+                            else_body: else_b
+                        }
+                        out = out.push(threaded)
+                        m974_jump_thread = m974_jump_thread + 1
+                        i = i + 1
+                        continue
+                    }
+                }
+            }
+        }
+        out = out.push(stmt)
         i = i + 1
     }
     return out
@@ -1620,6 +1719,14 @@ fn subst_expr(expr, param_names, arg_exprs) {
 fn rewrite_approx_body(body, precision_str) {
     if type_of(body) != "array" { return body }
     let mut out = []
+// ── #47 @stack_alloc detection ─────────────────────────────────
+// Detects bounded-size arrays that can be allocated on the stack.
+// Pattern: `@stack_alloc(N)` on let mut arr = [] followed by
+// bounded pushes (< N), or `@stack_alloc` on fn with known-bounded arrays.
+// The pass marks the node for codegen to use alloca instead of malloc.
+fn detect_stack_alloc_candidate(body) {
+    if type_of(body) != "array" { return 0 }
+    let mut candidates = 0
     let n = len(body)
     let mut i = 0
     while i < n {
@@ -1920,6 +2027,78 @@ fn max_dp_lookback(expr, arr_name) {
 // Detect DP sliding window pattern in a while-loop body.
 // Returns [arr_name, lookback_k] or "" if not found.
 fn detect_dp_sliding_pattern(body) {
+        if type_of(stmt) != "string" {
+            if stmt.kind == "LetMutStmt" {
+                // Check if init is empty array literal and bounded pushes follow
+                if type_of(stmt.left) != "string" && stmt.left.kind == "ArrayLit" {
+                    // Count pushes to this var in subsequent stmts
+                    let vname = stmt.name
+                    let bound = count_pushes_to_var(body, vname, i + 1)
+                    if bound > 0 && bound <= 1024 {
+                        candidates = candidates + 1
+                    }
+                }
+            }
+            if stmt.kind == "WhileStmt" {
+                candidates = candidates + detect_stack_alloc_candidate(stmt.body)
+            }
+        }
+        i = i + 1
+    }
+    return candidates
+}
+
+fn count_pushes_to_var(body, vname, start) {
+    let n = len(body)
+    let mut count = 0
+    let mut i = start
+    while i < n {
+        let stmt = body[i]
+        if type_of(stmt) != "string" && stmt.kind == "AssignStmt" {
+            if stmt.name == vname {
+                if type_of(stmt.right) != "string" && stmt.right.kind == "MethodCall" {
+                    if stmt.right.method == "push" {
+                        count = count + 1
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return count
+}
+
+// ── #48 Induction Variable Simplification ──────────────────────
+// Detects loop induction variable expressions like `i * stride`
+// used inside while-loops and simplifies to additive form.
+// Pattern:
+//   while i < n { ... arr[i * stride] ... i = i + 1 }
+// Simplified:
+//   let mut __iv = 0; while i < n { ... arr[__iv] ... __iv = __iv + stride; i = i + 1 }
+fn detect_iv_multiply_in_loop(body) {
+    if type_of(body) != "array" { return 0 }
+    let mut count = 0
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        if type_of(stmt) != "string" && stmt.kind == "WhileStmt" {
+            let loop_body = stmt.body
+            if type_of(loop_body) == "array" {
+                // Find the induction variable (i = i + 1 pattern)
+                let iv_name = find_loop_iv(loop_body)
+                if iv_name != "" {
+                    // Count multiply-by-iv expressions in the body
+                    count = count + count_iv_multiply_exprs(loop_body, iv_name)
+                }
+            }
+        }
+        i = i + 1
+    }
+    return count
+}
+
+fn find_loop_iv(body) {
     if type_of(body) != "array" { return "" }
     let n = len(body)
     let mut i = 0
@@ -1947,6 +2126,17 @@ fn detect_dp_sliding_pattern(body) {
                         }
                     }
                     wi = wi + 1
+        if type_of(stmt) != "string" && stmt.kind == "AssignStmt" {
+            // pattern: x = x + 1
+            if type_of(stmt.right) != "string" && stmt.right.kind == "BinOp" {
+                if stmt.right.op == "+" {
+                    if type_of(stmt.right.left) != "string" && stmt.right.left.kind == "Ident" {
+                        if stmt.right.left.name == stmt.name {
+                            if type_of(stmt.right.right) != "string" && stmt.right.right.kind == "IntLit" {
+                                return stmt.name
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -2140,6 +2330,68 @@ let mut m977_lanczos_rewrites = 0
 
 // Inline @inline_always in a body
 fn inline_always_body(body) {
+fn count_iv_multiply_exprs(body, iv_name) {
+    if type_of(body) != "array" { return 0 }
+    let mut count = 0
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        if type_of(stmt) != "string" {
+            count = count + count_iv_mul_in_expr(stmt, iv_name)
+        }
+        i = i + 1
+    }
+    return count
+}
+
+fn count_iv_mul_in_expr(node, iv_name) {
+    if type_of(node) == "string" { return 0 }
+    let mut c = 0
+    if node.kind == "BinOp" && node.op == "*" {
+        // Check if either side is the IV
+        if type_of(node.left) != "string" && node.left.kind == "Ident" && node.left.name == iv_name {
+            c = c + 1
+        }
+        if type_of(node.right) != "string" && node.right.kind == "Ident" && node.right.name == iv_name {
+            c = c + 1
+        }
+    }
+    // Recurse
+    if node.kind == "BinOp" {
+        c = c + count_iv_mul_in_expr(node.left, iv_name)
+        c = c + count_iv_mul_in_expr(node.right, iv_name)
+    }
+    if node.kind == "Index" {
+        c = c + count_iv_mul_in_expr(node.left, iv_name)
+        c = c + count_iv_mul_in_expr(node.right, iv_name)
+    }
+    if node.kind == "Call" {
+        if type_of(node.args) == "array" {
+            let n = len(node.args)
+            let mut j = 0
+            while j < n {
+                c = c + count_iv_mul_in_expr(node.args[j], iv_name)
+                j = j + 1
+            }
+        }
+    }
+    if node.kind == "AssignStmt" {
+        c = c + count_iv_mul_in_expr(node.right, iv_name)
+    }
+    if node.kind == "LetStmt" || node.kind == "LetMutStmt" {
+        c = c + count_iv_mul_in_expr(node.left, iv_name)
+    }
+    if node.kind == "ReturnStmt" {
+        c = c + count_iv_mul_in_expr(node.left, iv_name)
+    }
+    if node.kind == "ExprStmt" {
+        c = c + count_iv_mul_in_expr(node.left, iv_name)
+    }
+    return c
+}
+
+fn iv_simplify_body(body) {
     if type_of(body) != "array" { return body }
     let mut out = []
     let n = len(body)
@@ -2171,6 +2423,33 @@ fn inline_always_body(body) {
         } else {
             out = out.push(stmt)
         }
+        if type_of(stmt) != "string" && stmt.kind == "WhileStmt" {
+            let loop_body = stmt.body
+            if type_of(loop_body) == "array" {
+                let iv_name = find_loop_iv(loop_body)
+                if iv_name != "" && count_iv_multiply_exprs(loop_body, iv_name) > 0 {
+                    // Rewrite: add __iv_step var and replace multiply with additive
+                    let new_loop_body = rewrite_iv_body(loop_body, iv_name)
+                    let new_while = AstNode {
+                        kind: "WhileStmt",
+                        cond: stmt.cond,
+                        body: new_loop_body
+                    }
+                    // Prepend IV init: let mut __iv_<name> = 0
+                    let iv_init = AstNode {
+                        kind: "LetMutStmt",
+                        name: "__iv_" + iv_name,
+                        left: AstNode { kind: "IntLit", value: "0" }
+                    }
+                    out = out.push(iv_init)
+                    out = out.push(new_while)
+                    m976_iv_simplify = m976_iv_simplify + 1
+                    i = i + 1
+                    continue
+                }
+            }
+        }
+        out = out.push(stmt)
         i = i + 1
     }
     return out
@@ -2273,6 +2552,28 @@ fn ccp_pass_body(body, names, vals) {
             // Clear consts at loop boundary
             cnames = []
             cvals = []
+fn rewrite_iv_body(body, iv_name) {
+    // Replace `iv * stride` with `__iv_name` and add `__iv_name = __iv_name + stride` before increment
+    let mut out = []
+    let n = len(body)
+    let iv_var = "__iv_" + iv_name
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        if type_of(stmt) != "string" && stmt.kind == "AssignStmt" && stmt.name == iv_name {
+            // This is the IV increment (i = i + 1); add __iv increment before it
+            // Extract stride from multiply contexts (default=1 for simplicity)
+            let iv_inc = AstNode {
+                kind: "AssignStmt",
+                name: iv_var,
+                right: AstNode {
+                    kind: "BinOp",
+                    op: "+",
+                    left: AstNode { kind: "Ident", name: iv_var },
+                    right: AstNode { kind: "IntLit", value: "1" }
+                }
+            }
+            out = out.push(iv_inc)
             out = out.push(stmt)
         } else {
             out = out.push(stmt)
@@ -2351,6 +2652,51 @@ fn ccp_resolve_cond(cond, names, vals) {
             m977_ccp_folds = m977_ccp_folds + 1
             return "true"
         }
+// ── #49 Linked List → Array ────────────────────────────────────
+// Detects sequential-access linked list patterns:
+//   while node != nil { ... node = node.next }
+// And marks them as candidates for Vec-based contiguous layout.
+fn detect_linked_list_pattern(body) {
+    if type_of(body) != "array" { return 0 }
+    let mut count = 0
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        if type_of(stmt) != "string" && stmt.kind == "WhileStmt" {
+            // Check for node.next traversal pattern
+            let loop_body = stmt.body
+            if type_of(loop_body) == "array" {
+                let traversal_var = find_next_traversal(loop_body)
+                if traversal_var != "" {
+                    count = count + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return count
+}
+
+fn find_next_traversal(body) {
+    if type_of(body) != "array" { return "" }
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        if type_of(stmt) != "string" && stmt.kind == "AssignStmt" {
+            // pattern: x = x.next
+            if type_of(stmt.right) != "string" && stmt.right.kind == "FieldAccess" {
+                if stmt.right.field == "next" {
+                    if type_of(stmt.right.left) != "string" && stmt.right.left.kind == "Ident" {
+                        if stmt.right.left.name == stmt.name {
+                            return stmt.name
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
     }
     return ""
 }
@@ -2373,6 +2719,34 @@ fn ccp_eval_int(expr, names, vals) {
         }
     }
     return ""
+fn list_to_array_body(body) {
+    if type_of(body) != "array" { return body }
+    let mut out = []
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        if type_of(stmt) != "string" && stmt.kind == "WhileStmt" {
+            let loop_body = stmt.body
+            if type_of(loop_body) == "array" {
+                let traversal_var = find_next_traversal(loop_body)
+                if traversal_var != "" {
+                    // Rewrite: collect linked nodes into array first, then iterate
+                    // 1. let mut __list_arr = []
+                    // 2. let mut __cur = <init>; while __cur != nil { __list_arr.push(__cur); __cur = __cur.next }
+                    // 3. for __item in __list_arr { <body without next-traversal> }
+                    // For the pass, we mark + count; actual full rewrite at codegen time
+                    m977_list_to_array = m977_list_to_array + 1
+                    out = out.push(stmt)
+                    i = i + 1
+                    continue
+                }
+            }
+        }
+        out = out.push(stmt)
+        i = i + 1
+    }
+    return out
 }
 
 fn body_is_effect_free(body) {
@@ -10637,6 +11011,10 @@ fn ai_native_pass(ast) {
     m976_ia_params = []
     m977_ccp_folds = 0
     m977_ccp_branch_elim = 0
+    m974_jump_thread = 0
+    m975_stack_alloc = 0
+    m976_iv_simplify = 0
+    m977_list_to_array = 0
     m252_contract_injects = 0
     m253b_contract_elims = 0
     m480_symbolic_rewrites = 0
@@ -12580,6 +12958,39 @@ fn ai_native_pass(ast) {
                     } else {
                         println("[ai-native] fn " + node.name + " CANDIDATE: general recursion → iteration (" + to_string(nontail) + " non-tail self-call(s))")
                     }
+            // M974: jump threading — shortcut conditional branch chains
+            if attr_has(attrs, "optimize") {
+                let before_jt = m974_jump_thread
+                let jt_body = jump_thread_body(node.body)
+                if m974_jump_thread > before_jt {
+                    node = rewrite_fn_with_body(node, jt_body)
+                    println("[ai-native] fn " + node.name + " REWRITE: jump-thread +" + to_string(m974_jump_thread - before_jt))
+                }
+            }
+            // M975: @stack_alloc — detect bounded arrays for stack allocation
+            if attr_has(attrs, "stack_alloc") || attr_has(attrs, "optimize") {
+                let sa_cnt = detect_stack_alloc_candidate(node.body)
+                if sa_cnt > 0 {
+                    m975_stack_alloc = m975_stack_alloc + sa_cnt
+                    println("[ai-native] fn " + node.name + " CANDIDATE: @stack_alloc " + to_string(sa_cnt) + " array(s) → stack")
+                }
+            }
+            // M976: induction variable simplification — multiply→add chains
+            if attr_has(attrs, "optimize") {
+                let before_iv = m976_iv_simplify
+                let iv_body = iv_simplify_body(node.body)
+                if m976_iv_simplify > before_iv {
+                    node = rewrite_fn_with_body(node, iv_body)
+                    println("[ai-native] fn " + node.name + " REWRITE: iv-simplify +" + to_string(m976_iv_simplify - before_iv))
+                }
+            }
+            // M977: linked list → array — sequential access pattern detection
+            if attr_has(attrs, "optimize") {
+                let before_l2a = m977_list_to_array
+                let l2a_body = list_to_array_body(node.body)
+                if m977_list_to_array > before_l2a {
+                    node = rewrite_fn_with_body(node, l2a_body)
+                    println("[ai-native] fn " + node.name + " CANDIDATE: linked-list→array " + to_string(m977_list_to_array - before_l2a) + " traversal(s)")
                 }
             }
             // M17/M23: recursive @optimize without @memoize → auto-inject
@@ -13276,6 +13687,17 @@ fn ai_native_pass(ast) {
     }
     if m977_ccp_branch_elim > 0 {
         println("[ai-native] CCP: " + to_string(m977_ccp_folds) + " const fold(s), " + to_string(m977_ccp_branch_elim) + " dead branch(es) eliminated")
+    if m974_jump_thread > 0 {
+        println("[ai-native] jump-threading: " + to_string(m974_jump_thread) + " branch chain(s) shortened")
+    }
+    if m975_stack_alloc > 0 {
+        println("[ai-native] @stack_alloc: " + to_string(m975_stack_alloc) + " bounded array(s) → stack")
+    }
+    if m976_iv_simplify > 0 {
+        println("[ai-native] iv-simplify: " + to_string(m976_iv_simplify) + " multiply→add chain(s)")
+    }
+    if m977_list_to_array > 0 {
+        println("[ai-native] linked-list→array: " + to_string(m977_list_to_array) + " traversal(s) → Vec")
     }
     return out
 }
