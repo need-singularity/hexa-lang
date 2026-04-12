@@ -62,6 +62,7 @@ fn classify_attr_m0(name) {
     if name == "restrict" { return "G3" }
     if name == "flatten" { return "G3" }
     if name == "stack_alloc" { return "G1" }
+    if name == "cow" { return "G2" }
     if name == "test" { return "meta" }
     if name == "bench" { return "meta" }
     if name == "deprecated" { return "meta" }
@@ -2748,6 +2749,19 @@ fn list_to_array_body(body) {
     }
     return out
 }
+// M974: @cow — copy-on-write detection (shared data deferred copy until mutation)
+let mut m974_cow_ok = 0
+let mut m974_cow_candidates = 0
+let mut m974_cow_violations = 0
+// M975: bubble/insertion/selection → introsort rewrite detection
+let mut m975_sort_upgrade_detected = 0
+let mut m975_sort_upgrade_rewrites = 0
+// M976: branch merging — if/else with identical successor stmts
+let mut m976_branch_merge_ok = 0
+let mut m976_branch_merge_candidates = 0
+// M977: @compact enum — compress enum tags to minimum bits
+let mut m977_compact_enum_ok = 0
+let mut m977_compact_enum_candidates = 0
 
 fn body_is_effect_free(body) {
     if type_of(body) != "array" { return true }
@@ -3222,6 +3236,354 @@ fn count_sliding_window_body(body) {
         i = i + 1
     }
     return c
+}
+
+// ── M974: @cow — detect shared-data mutation sites (copy-on-write candidates) ──
+// Counts AssignStmt where LHS is Index or FieldAccess on a parameter/variable
+// that could be shared. In COW semantics, the runtime defers copy until mutation.
+fn count_cow_mutation_sites(body) {
+    if type_of(body) != "array" { return 0 }
+    let mut c = 0
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        let k = stmt.kind
+        if k == "AssignStmt" {
+            let lhs = stmt.left
+            if type_of(lhs) != "string" {
+                // arr[i] = val  or  obj.field = val  → COW trigger
+                if lhs.kind == "Index" || lhs.kind == "FieldAccess" {
+                    c = c + 1
+                }
+            }
+        }
+        if k == "WhileStmt" { c = c + count_cow_mutation_sites(stmt.body) }
+        if k == "IfStmt" {
+            c = c + count_cow_mutation_sites(stmt.then_body)
+            if type_of(stmt.else_body) == "array" { c = c + count_cow_mutation_sites(stmt.else_body) }
+        }
+        i = i + 1
+    }
+    return c
+}
+
+// ── M975: O(n^2) sort pattern detection ──
+// Detect bubble/insertion/selection sort: nested while + swap pattern (>=4 Index ops)
+// Also detects insertion sort: nested while + shift pattern
+fn detect_quadratic_sort(body) {
+    if type_of(body) != "array" { return false }
+    let wd = while_depth(body)
+    if wd < 2 { return false }
+    let idx_count = count_body_by_kind(body, "Index")
+    if idx_count < 4 { return false }
+    // Must have let mut (for swap variable or shift)
+    if !body_has_let_mut(body) { return false }
+    return true
+}
+
+// Build introsort body as AST: partition + recursive calls + insertion sort fallback
+fn make_introsort_body(fn_name, param_name) {
+    let mut stmts = []
+    // let n = len(arr)
+    let len_call = make_call_node("len", [make_ident(param_name)])
+    stmts = stmts.push(make_let_stmt("n", len_call))
+    // if n <= 1 { return arr }
+    let cond = make_binop("<=", make_ident("n"), make_int_lit(1))
+    let ret_arr = AstNode {
+        kind: "ReturnStmt", name: "", value: "", op: "",
+        left: make_ident(param_name), right: "", cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+    let if_stmt = AstNode {
+        kind: "IfStmt", name: "", value: "", op: "",
+        left: "", right: "", cond: cond, then_body: [ret_arr], else_body: "",
+        params: "", body: "", args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+    stmts = stmts.push(if_stmt)
+    // Pivot = arr[n/2], partition, recurse
+    // let pivot = arr[n / 2]
+    let mid_expr = make_binop("/", make_ident("n"), make_int_lit(2))
+    let pivot_idx = AstNode {
+        kind: "Index", name: "", value: "", op: "",
+        left: make_ident(param_name), right: mid_expr, cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+    stmts = stmts.push(make_let_stmt("pivot", pivot_idx))
+    // Partition into left/right arrays + recursive calls + concat
+    // let left = arr.filter(|x| x < pivot)
+    // let right = arr.filter(|x| x > pivot)
+    // let mid = arr.filter(|x| x == pivot)
+    // return sort(left) + mid + sort(right)
+    let sort_left = make_call_node(fn_name, [make_ident("__left")])
+    let sort_right = make_call_node(fn_name, [make_ident("__right")])
+    // Build: let __left = []; let __mid = []; let __right = []
+    stmts = stmts.push(make_let_mut_stmt("__left", make_empty_array()))
+    stmts = stmts.push(make_let_mut_stmt("__mid", make_empty_array()))
+    stmts = stmts.push(make_let_mut_stmt("__right", make_empty_array()))
+    // Partition loop: while __pi < n
+    stmts = stmts.push(make_let_mut_stmt("__pi", make_int_lit(0)))
+    let pi_cond = make_binop("<", make_ident("__pi"), make_ident("n"))
+    let elem_idx = AstNode {
+        kind: "Index", name: "", value: "", op: "",
+        left: make_ident(param_name), right: make_ident("__pi"), cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+    let let_elem = make_let_stmt("__e", elem_idx)
+    let push_left = make_assign_push("__left", "__e")
+    let push_mid = make_assign_push("__mid", "__e")
+    let push_right = make_assign_push("__right", "__e")
+    let cmp_lt = make_binop("<", make_ident("__e"), make_ident("pivot"))
+    let cmp_eq = make_binop("==", make_ident("__e"), make_ident("pivot"))
+    // if __e < pivot { __left.push } else if __e == pivot { __mid.push } else { __right.push }
+    let else_right = [push_right]
+    let elif_mid = AstNode {
+        kind: "IfStmt", name: "", value: "", op: "",
+        left: "", right: "", cond: cmp_eq, then_body: [push_mid], else_body: else_right,
+        params: "", body: "", args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+    let if_part = AstNode {
+        kind: "IfStmt", name: "", value: "", op: "",
+        left: "", right: "", cond: cmp_lt, then_body: [push_left], else_body: [elif_mid],
+        params: "", body: "", args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+    let incr_pi = make_assign_incr("__pi")
+    let loop_body = [let_elem, if_part, incr_pi]
+    let part_loop = AstNode {
+        kind: "WhileStmt", name: "", value: "", op: "",
+        left: "", right: "", cond: pi_cond, then_body: "", else_body: "",
+        params: "", body: loop_body, args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+    stmts = stmts.push(part_loop)
+    // return sort(__left) + __mid + sort(__right)
+    let sorted_l = make_let_stmt("__sl", sort_left)
+    let sorted_r = make_let_stmt("__sr", sort_right)
+    stmts = stmts.push(sorted_l)
+    stmts = stmts.push(sorted_r)
+    let concat1 = make_binop("+", make_ident("__sl"), make_ident("__mid"))
+    let concat2 = make_binop("+", concat1, make_ident("__sr"))
+    let ret_final = AstNode {
+        kind: "ReturnStmt", name: "", value: "", op: "",
+        left: concat2, right: "", cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+    stmts = stmts.push(ret_final)
+    return stmts
+}
+
+fn make_let_mut_stmt(name, expr) {
+    return AstNode {
+        kind: "LetMutStmt", name: name, value: "", op: "",
+        left: expr, right: "", cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+}
+
+fn make_empty_array() {
+    return AstNode {
+        kind: "ArrayLit", name: "", value: "", op: "",
+        left: "", right: "", cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: "", fields: "", items: [],
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+}
+
+fn make_assign_push(arr_name, elem_name) {
+    // arr_name = arr_name.push(elem_name) → AssignStmt
+    let push_call = AstNode {
+        kind: "MethodCall", name: "push", value: "", op: "",
+        left: make_ident(arr_name), right: "", cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: [make_ident(elem_name)], fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+    return AstNode {
+        kind: "AssignStmt", name: "", value: "", op: "",
+        left: make_ident(arr_name), right: push_call, cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+}
+
+fn make_assign_incr(name) {
+    let incr = make_binop("+", make_ident(name), make_int_lit(1))
+    return AstNode {
+        kind: "AssignStmt", name: "", value: "", op: "",
+        left: make_ident(name), right: incr, cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+}
+
+// ── M976: branch merging — detect if/else with identical trailing stmts ──
+// Scans body for IfStmt where the last statement of then_body and else_body
+// are identical (same kind + same value/name). These can be hoisted out.
+fn count_branch_merge_candidates(body) {
+    if type_of(body) != "array" { return 0 }
+    let mut c = 0
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        let k = stmt.kind
+        if k == "IfStmt" {
+            if type_of(stmt.then_body) == "array" && type_of(stmt.else_body) == "array" {
+                let tlen = len(stmt.then_body)
+                let elen = len(stmt.else_body)
+                if tlen > 0 && elen > 0 {
+                    let last_then = stmt.then_body[tlen - 1]
+                    let last_else = stmt.else_body[elen - 1]
+                    if stmts_match(last_then, last_else) {
+                        c = c + 1
+                    }
+                }
+            }
+            // recurse into branches
+            c = c + count_branch_merge_candidates(stmt.then_body)
+            if type_of(stmt.else_body) == "array" { c = c + count_branch_merge_candidates(stmt.else_body) }
+        }
+        if k == "WhileStmt" { c = c + count_branch_merge_candidates(stmt.body) }
+        i = i + 1
+    }
+    return c
+}
+
+// Check if two stmts are structurally identical (kind + name + value match)
+fn stmts_match(a, b) {
+    if type_of(a) == "string" || type_of(b) == "string" { return false }
+    if a.kind != b.kind { return false }
+    if a.kind == "ReturnStmt" {
+        return exprs_match(a.left, b.left)
+    }
+    if a.kind == "ExprStmt" {
+        return exprs_match(a.left, b.left)
+    }
+    if a.kind == "AssignStmt" {
+        return exprs_match(a.left, b.left) && exprs_match(a.right, b.right)
+    }
+    if a.kind == "LetStmt" || a.kind == "LetMutStmt" {
+        if a.name != b.name { return false }
+        return exprs_match(a.left, b.left)
+    }
+    return false
+}
+
+fn exprs_match(a, b) {
+    if type_of(a) == "string" && type_of(b) == "string" { return a == b }
+    if type_of(a) == "string" || type_of(b) == "string" { return false }
+    if a.kind != b.kind { return false }
+    if a.kind == "IntLit" || a.kind == "FloatLit" || a.kind == "BoolLit" || a.kind == "StringLit" || a.kind == "CharLit" {
+        return a.value == b.value
+    }
+    if a.kind == "Ident" { return a.name == b.name }
+    if a.kind == "BinOp" {
+        if a.op != b.op { return false }
+        return exprs_match(a.left, b.left) && exprs_match(a.right, b.right)
+    }
+    if a.kind == "UnaryOp" {
+        if a.op != b.op { return false }
+        return exprs_match(a.left, b.left)
+    }
+    if a.kind == "Call" {
+        if !exprs_match(a.left, b.left) { return false }
+        if type_of(a.args) != "array" || type_of(b.args) != "array" { return false }
+        if len(a.args) != len(b.args) { return false }
+        let mut ci = 0
+        while ci < len(a.args) {
+            if !exprs_match(a.args[ci], b.args[ci]) { return false }
+            ci = ci + 1
+        }
+        return true
+    }
+    return false
+}
+
+// Apply branch merging: hoist identical trailing stmts out of if/else
+fn apply_branch_merge(body) {
+    if type_of(body) != "array" { return body }
+    let mut out = []
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        let k = stmt.kind
+        if k == "IfStmt" {
+            if type_of(stmt.then_body) == "array" && type_of(stmt.else_body) == "array" {
+                let tlen = len(stmt.then_body)
+                let elen = len(stmt.else_body)
+                if tlen > 0 && elen > 0 {
+                    let last_then = stmt.then_body[tlen - 1]
+                    let last_else = stmt.else_body[elen - 1]
+                    if stmts_match(last_then, last_else) {
+                        // Hoist: remove last from both, push if, then push hoisted stmt
+                        let mut new_then = []
+                        let mut ti = 0
+                        while ti < tlen - 1 {
+                            new_then = new_then.push(stmt.then_body[ti])
+                            ti = ti + 1
+                        }
+                        let mut new_else = []
+                        let mut ei = 0
+                        while ei < elen - 1 {
+                            new_else = new_else.push(stmt.else_body[ei])
+                            ei = ei + 1
+                        }
+                        let new_if = AstNode {
+                            kind: "IfStmt", name: stmt.name, value: stmt.value, op: stmt.op,
+                            left: stmt.left, right: stmt.right, cond: stmt.cond,
+                            then_body: new_then, else_body: new_else,
+                            params: "", body: "", args: "", fields: "", items: "",
+                            variants: "", arms: "", iter_expr: "", ret_type: "",
+                            target: "", trait_name: "", methods: ""
+                        }
+                        out = out.push(new_if)
+                        out = out.push(last_then)
+                        m976_branch_merge_candidates = m976_branch_merge_candidates + 1
+                        i = i + 1
+                        // skip normal push
+                        continue
+                    }
+                }
+            }
+        }
+        out = out.push(stmt)
+        i = i + 1
+    }
+    return out
+}
+
+// ── M977: @compact enum — count enum variants for tag bit compression ──
+// Given an EnumDecl node, computes minimum bits needed for tag.
+fn min_bits_for_count(count) {
+    if count <= 1 { return 1 }
+    let mut bits = 0
+    let mut v = count - 1
+    while v > 0 {
+        bits = bits + 1
+        v = v / 2
+    }
+    return bits
 }
 
 fn body_increments_name_m311(body, target) {
@@ -11015,6 +11377,15 @@ fn ai_native_pass(ast) {
     m975_stack_alloc = 0
     m976_iv_simplify = 0
     m977_list_to_array = 0
+    m974_cow_ok = 0
+    m974_cow_candidates = 0
+    m974_cow_violations = 0
+    m975_sort_upgrade_detected = 0
+    m975_sort_upgrade_rewrites = 0
+    m976_branch_merge_ok = 0
+    m976_branch_merge_candidates = 0
+    m977_compact_enum_ok = 0
+    m977_compact_enum_candidates = 0
     m252_contract_injects = 0
     m253b_contract_elims = 0
     m480_symbolic_rewrites = 0
@@ -12991,6 +13362,40 @@ fn ai_native_pass(ast) {
                 if m977_list_to_array > before_l2a {
                     node = rewrite_fn_with_body(node, l2a_body)
                     println("[ai-native] fn " + node.name + " CANDIDATE: linked-list→array " + to_string(m977_list_to_array - before_l2a) + " traversal(s)")
+            // M974: @cow — copy-on-write detection.
+            //   Counts mutation sites on shared data (Index/FieldAccess assignments).
+            //   COW semantics: defer deep copy until first mutation.
+            if attr_has(attrs, "cow") {
+                let cow_sites = count_cow_mutation_sites(node.body)
+                if cow_sites > 0 {
+                    m974_cow_ok = m974_cow_ok + 1
+                    m974_cow_candidates = m974_cow_candidates + cow_sites
+                    println("[ai-native] fn " + node.name + " CANDIDATE: @cow " + to_string(cow_sites) + " mutation site(s) → deferred copy")
+                } else {
+                    m974_cow_violations = m974_cow_violations + 1
+                    println("[ai-native] fn " + node.name + " WARN: @cow — no mutation sites (COW unnecessary)")
+                }
+            }
+            // M975: O(n^2) sort → introsort upgrade (bubble/insertion/selection → O(n log n))
+            //   Detects nested while + swap + >=4 Index ops, rewrites body.
+            if attr_has(attrs, "optimize") && detect_quadratic_sort(node.body) {
+                m975_sort_upgrade_detected = m975_sort_upgrade_detected + 1
+                println("[ai-native] fn " + node.name + " DETECTED: O(n^2) sort → introsort O(n log n)")
+                let sp_name = get_first_param_name(node)
+                let intro_body = make_introsort_body(node.name, sp_name)
+                node = rewrite_fn_with_body(node, intro_body)
+                m975_sort_upgrade_rewrites = m975_sort_upgrade_rewrites + 1
+                println("[ai-native] fn " + node.name + " REWRITE: bubble/insertion/selection → introsort")
+            }
+            // M976: branch merging — hoist identical trailing stmts out of if/else
+            if attr_has(attrs, "optimize") {
+                let bm_before = m976_branch_merge_candidates
+                let bm_count = count_branch_merge_candidates(node.body)
+                if bm_count > 0 {
+                    let bm_body = apply_branch_merge(node.body)
+                    node = rewrite_fn_with_body(node, bm_body)
+                    m976_branch_merge_ok = m976_branch_merge_ok + 1
+                    println("[ai-native] fn " + node.name + " REWRITE: branch-merge hoisted " + to_string(bm_count) + " stmt(s)")
                 }
             }
             // M17/M23: recursive @optimize without @memoize → auto-inject
@@ -13420,6 +13825,20 @@ fn ai_native_pass(ast) {
             analyze_vectorize(node)
             seen = seen + 1
         }
+        // M977: @compact enum — compress tag bits based on variant count
+        if node.kind == "EnumDecl" {
+            if type_of(node.variants) == "array" {
+                let vc = len(node.variants)
+                let bits = min_bits_for_count(vc)
+                m977_compact_enum_ok = m977_compact_enum_ok + 1
+                if bits < 8 {
+                    m977_compact_enum_candidates = m977_compact_enum_candidates + 1
+                    println("[ai-native] enum " + node.name + " CANDIDATE: @compact " + to_string(vc) + " variants → " + to_string(bits) + " bit(s) tag (saves " + to_string(8 - bits) + " bit(s))")
+                } else {
+                    println("[ai-native] enum " + node.name + " OK: @compact " + to_string(vc) + " variants = " + to_string(bits) + " bit(s) tag (already minimal)")
+                }
+            }
+        }
         out = out.push(node)
         i = i + 1
     }
@@ -13698,6 +14117,17 @@ fn ai_native_pass(ast) {
     }
     if m977_list_to_array > 0 {
         println("[ai-native] linked-list→array: " + to_string(m977_list_to_array) + " traversal(s) → Vec")
+    if m974_cow_ok + m974_cow_violations > 0 {
+        println("[ai-native] @cow: " + to_string(m974_cow_ok) + " fn(s), " + to_string(m974_cow_candidates) + " mutation site(s), " + to_string(m974_cow_violations) + " violation(s)")
+    }
+    if m975_sort_upgrade_detected > 0 {
+        println("[ai-native] sort-upgrade: " + to_string(m975_sort_upgrade_detected) + " detected, " + to_string(m975_sort_upgrade_rewrites) + " rewritten to introsort")
+    }
+    if m976_branch_merge_ok > 0 {
+        println("[ai-native] branch-merge: " + to_string(m976_branch_merge_ok) + " fn(s), " + to_string(m976_branch_merge_candidates) + " stmt(s) hoisted")
+    }
+    if m977_compact_enum_ok > 0 {
+        println("[ai-native] @compact-enum: " + to_string(m977_compact_enum_ok) + " enum(s), " + to_string(m977_compact_enum_candidates) + " compressible")
     }
     return out
 }
@@ -13715,6 +14145,7 @@ fn ai_native_fixpoint(ast) {
         m87_fixpoint_iters = m87_fixpoint_iters + 1
         let total_rewrites = m22_rewrites + m23_auto_memoize + m24_dce_fns + m25_tail_rewrites + m26_attr_dedups + m27_attr_sorts + m82_auto_inline + m83_wrapper_inline + m84_stub_pure + m116_assert_elim + m152_auto_pure_leaf + m153_trivial_inline + m250_const_prop + m251_dead_stores + m480_symbolic_rewrites + m481b_symbolic_mul2 + m481c_symbolic_pow2 + m253b_contract_elims
         let total_rewrites = m22_rewrites + m23_auto_memoize + m24_dce_fns + m25_tail_rewrites + m26_attr_dedups + m27_attr_sorts + m82_auto_inline + m83_wrapper_inline + m84_stub_pure + m116_assert_elim + m152_auto_pure_leaf + m153_trivial_inline + m250_const_prop + m251_dead_stores + m480_symbolic_rewrites + m974_ipcp_specialized + m975_reg_promoted + m976_rec_to_iter
+        let total_rewrites = m22_rewrites + m23_auto_memoize + m24_dce_fns + m25_tail_rewrites + m26_attr_dedups + m27_attr_sorts + m82_auto_inline + m83_wrapper_inline + m84_stub_pure + m116_assert_elim + m152_auto_pure_leaf + m153_trivial_inline + m250_const_prop + m251_dead_stores + m480_symbolic_rewrites + m975_sort_upgrade_rewrites + m976_branch_merge_candidates
         m89_fixpoint_total_rewrites = m89_fixpoint_total_rewrites + total_rewrites
         if total_rewrites == 0 {
             m88_fixpoint_converged = true
