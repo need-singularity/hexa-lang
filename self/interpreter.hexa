@@ -105,7 +105,10 @@ pub let mut fn_cache = []     // list of 64 buckets; each bucket is [[name, idx]
 pub let mut return_flag = false
 pub let mut return_val = val_void()
 pub let mut break_flag = false
+pub let mut break_label = ""
 pub let mut continue_flag = false
+pub let mut continue_label = ""
+pub let mut defer_stack = []
 pub let mut throw_flag = false
 pub let mut throw_val = val_void()
 // Panic: unrecoverable abort. Propagates through all enclosing blocks like
@@ -594,6 +597,11 @@ pub let mut impl_store = []
 // Closures capture a snapshot of [env_vars, env_cache] at creation time.
 // On closure call, both arrays are swapped in O(1) — no env_rebuild_cache().
 pub let mut closure_store = []
+
+// ── G22/G23: Named arguments passing ───────────────────
+// Temporary storage for named args during a call dispatch.
+// Each entry: [param_name, evaluated_val]
+pub let mut pending_named_args = []
 
 // ── Callback trampoline storage (G4) ───────────────────
 // Pool of 16 callback slots for interpreter mode.
@@ -1423,45 +1431,18 @@ fn eval_expr_inner(node) {
             println("Runtime error: pipe operator |> requires a function on the right side")
             return val_void()
         }
-=======
-    if k == "IntLit" { return val_int(node.value.parse_int()) }
-    if k == "FloatLit" { return val_float(node.value.parse_float()) }
-    if k == "BoolLit" { return val_bool(node.value == "true") }
-    if k == "StringLit" { return val_str(node.value) }
-    if k == "CharLit" { return val_str(node.value) }
-    if k == "Ident" { return env_lookup(node.name) }
-
-    if k == "BinOp" {
-        // G10: `as` type cast — right side is a type name, not an expression
-        if node.op == "as" {
-            let lv = eval_expr(node.left)
-            let type_name = node.right.name
-            if type_name == "int" {
-                if lv.tag == "int" { return lv }
-                if lv.tag == "float" { return val_int(to_int(lv.float_val)) }
-                if lv.tag == "bool" { if lv.bool_val { return val_int(1) } else { return val_int(0) } }
-                if lv.tag == "str" { return val_int(lv.str_val.parse_int()) }
-                return val_int(0)
-            }
-            if type_name == "float" {
-                if lv.tag == "float" { return lv }
-                if lv.tag == "int" { return val_float(lv.int_val * 1.0) }
-                if lv.tag == "bool" { if lv.bool_val { return val_float(1.0) } else { return val_float(0.0) } }
-                if lv.tag == "str" { return val_float(lv.str_val.parse_float()) }
-                return val_float(0.0)
-            }
-            if type_name == "str" {
-                return val_str(val_to_string(lv))
-            }
-            return lv
-        }
->>>>>>> /tmp/w2_wt.hexa
         let lv = eval_expr(node.left)
         let rv = eval_expr(node.right)
         return eval_binop(node.op, lv, rv)
     }
 
     if kid == NK_UNARY_OP {
+        // G37: typeof operator — returns type name as string
+        if node.op == "typeof" {
+            let v = eval_expr(node.left)
+            let t = tag_name(v.tag)
+            return val_str(t)
+        }
         let v = eval_expr(node.left)
         if node.op == "-" {
             if v.tag == TAG_INT { return val_int(-v.int_val) }
@@ -1703,6 +1684,30 @@ fn eval_expr_inner(node) {
         if node.else_body != "" {
             return eval_block(node.else_body)
         }
+        return val_void()
+    }
+
+    // G32: if let PATTERN = EXPR { body } else { alt }
+    if k == "IfLetExpr" {
+        let pattern = node.left
+        let scrutinee = eval_expr(node.right)
+        let saved_env_vars = env_vars
+        let saved_env_scopes = env_scopes
+        env_push_scope()
+        if match_pattern(pattern, scrutinee) {
+            let result = eval_body(node.then_body)
+            env_pop_scope()
+            env_vars = saved_env_vars
+            env_scopes = saved_env_scopes
+            env_rebuild_cache()
+            if return_flag { return return_val }
+            return result
+        }
+        env_pop_scope()
+        env_vars = saved_env_vars
+        env_scopes = saved_env_scopes
+        env_rebuild_cache()
+        if node.else_body != "" { return eval_block(node.else_body) }
         return val_void()
     }
 
@@ -2707,11 +2712,18 @@ fn exec_stmt_at(stmts, idx) {
 
     if k == "BreakStmt" {
         break_flag = true
+        break_label = node.name
         return val_void()
     }
 
     if k == "ContinueStmt" {
         continue_flag = true
+        continue_label = node.name
+        return val_void()
+    }
+
+    if k == "DeferStmt" {
+        defer_stack = defer_stack.push(node.body)
         return val_void()
     }
 
@@ -2804,6 +2816,7 @@ fn exec_stmt_at(stmts, idx) {
     }
 
     if k == "WhileStmt" {
+        let loop_label = node.value
         while !return_flag && !break_flag && !throw_flag {
             let cond = eval_expr(node.cond)
             if !is_truthy(cond) { return val_void() }
@@ -2817,13 +2830,18 @@ fn exec_stmt_at(stmts, idx) {
                 }
             }
             env_pop_scope()
-            if continue_flag { continue_flag = false }
+            if continue_flag {
+                if continue_label == "" || continue_label == loop_label { continue_flag = false; continue_label = "" }
+            }
         }
-        if break_flag { break_flag = false }
+        if break_flag {
+            if break_label == "" || break_label == loop_label { break_flag = false; break_label = "" }
+        }
         return val_void()
     }
 
-    if k == "ForStmt" {
+    if k == "ForStmt" || k == "ForElseStmt" {
+        let loop_label = node.value
         let iter_val = eval_expr(node.iter_expr)
         // Uniform iteration: array → elements, map → keys (Python-style).
         // Converted to a simple list so the loop body stays identical.
@@ -2832,6 +2850,14 @@ fn exec_stmt_at(stmts, idx) {
             items = get_array(iter_val)
         } else if iter_val.tag == TAG_MAP {
             items = get_map_keys(iter_val)
+        }
+        if k == "ForElseStmt" && len(items) == 0 {
+            if node.else_body != "" {
+                env_push_scope()
+                eval_body(node.else_body)
+                env_pop_scope()
+            }
+            return val_void()
         }
         let mut _fi2 = 0
         while _fi2 < len(items) {
@@ -2847,21 +2873,56 @@ fn exec_stmt_at(stmts, idx) {
                     }
                 }
                 env_pop_scope()
-                if continue_flag { continue_flag = false }
+                if continue_flag {
+                    if continue_label == "" || continue_label == loop_label { continue_flag = false; continue_label = "" }
+                }
                 _fi2 = _fi2 + 1
             }
         }
-        if break_flag { break_flag = false }
+        if break_flag {
+            if break_label == "" || break_label == loop_label { break_flag = false; break_label = "" }
+        }
         return val_void()
     }
 
     if k == "LoopStmt" {
+        let loop_label = node.value
         while !return_flag && !break_flag && !throw_flag {
             env_push_scope()
             eval_body(node.body)
             env_pop_scope()
         }
-        if break_flag { break_flag = false }
+        if break_flag {
+            if break_label == "" || break_label == loop_label { break_flag = false; break_label = "" }
+        }
+        return val_void()
+    }
+
+    if k == "DoWhileStmt" {
+        let loop_label = node.value
+        let mut do_continue = true
+        while do_continue && !return_flag && !break_flag && !throw_flag {
+            env_push_scope()
+            continue_flag = false
+            let mut _dwi = 0
+            while _dwi < len(node.body) {
+                if return_flag || break_flag || continue_flag || throw_flag { _dwi = len(node.body) } else {
+                    exec_stmt_at(node.body, _dwi)
+                    _dwi = _dwi + 1
+                }
+            }
+            env_pop_scope()
+            if continue_flag {
+                if continue_label == "" || continue_label == loop_label { continue_flag = false; continue_label = "" }
+            }
+            if !return_flag && !break_flag && !throw_flag {
+                let cond = eval_expr(node.cond)
+                if !is_truthy(cond) { do_continue = false }
+            }
+        }
+        if break_flag {
+            if break_label == "" || break_label == loop_label { break_flag = false; break_label = "" }
+        }
         return val_void()
     }
 
@@ -3134,6 +3195,7 @@ fn eval_block(stmts) {
 fn eval_call(node) {
     // Collect arguments — G8: spread args support
     let mut args = []
+    let mut named = []
     let raw_args = node.args
     if type_of(raw_args) == "array" {
         for a in raw_args {
@@ -3170,6 +3232,7 @@ fn eval_call(node) {
                 }
             }
         }
+        pending_named_args = saved_named
         return result
     }
 
@@ -3178,12 +3241,18 @@ fn eval_call(node) {
         let name = callee.name
         // User function takes precedence over builtin (allows shadowing)
         let user_info = find_fn(name)
-        if user_info != "" { return call_user_fn(name, args) }
+        if user_info != "" {
+            let r = call_user_fn(name, args)
+            pending_named_args = saved_named
+            return r
+        }
         let builtin_result = call_builtin(name, args)
         if builtin_result.tag != TAG_NOT_BUILTIN {
             return builtin_result
         }
-        return call_user_fn(name, args)
+        let r = call_user_fn(name, args)
+        pending_named_args = saved_named
+        return r
     }
 
     // Indirect call (lambda etc)
@@ -3192,6 +3261,7 @@ fn eval_call(node) {
         return call_fn_val(callee_val, args)
     }
 
+    pending_named_args = saved_named
     return val_void()
 }
 
@@ -3267,7 +3337,9 @@ fn call_user_fn(name, args) {
 
     call_stack = call_stack.push(name)
     env_push_scope()
+    // G22/G23: bind positional args, then named args, then defaults
     let mut i = 0
+    // Phase 1: bind positional args in order
     while i < len(params) && i < len(args) {
         if type_of(params[i]) == "string" {
             env_define(params[i], args[i])
@@ -3276,9 +3348,58 @@ fn call_user_fn(name, args) {
         }
         i = i + 1
     }
+    // Phase 2: for remaining unbound params, try named args then defaults
+    while i < len(params) {
+        let p = params[i]
+        let mut pname = ""
+        if type_of(p) == "string" { pname = p } else { pname = p.name }
+        // G23: check named args for this param
+        let mut found_named = false
+        let mut ni = 0
+        while ni < len(pending_named_args) {
+            if pending_named_args[ni][0] == pname {
+                env_define(pname, pending_named_args[ni][1])
+                found_named = true
+                ni = len(pending_named_args)
+            }
+            ni = ni + 1
+        }
+        if !found_named {
+            // G22: check for default value in param AST node
+            if type_of(p) != "string" && p.left != "" {
+                env_define(pname, eval_expr(p.left))
+            } else {
+                // No arg, no named, no default — bind void
+                env_define(pname, val_void())
+            }
+        }
+        i = i + 1
+    }
+    // G23: bind any named args that target positional params (override)
+    let mut ni2 = 0
+    while ni2 < len(pending_named_args) {
+        let na_name = pending_named_args[ni2][0]
+        let na_val = pending_named_args[ni2][1]
+        // Check if this named arg targets a param already bound positionally
+        let mut pi2 = 0
+        while pi2 < len(params) && pi2 < len(args) {
+            let pp = params[pi2]
+            let mut ppname = ""
+            if type_of(pp) == "string" { ppname = pp } else { ppname = pp.name }
+            if ppname == na_name {
+                // Override the positional binding with the named value
+                env_set(na_name, na_val)
+                pi2 = len(params)
+            }
+            pi2 = pi2 + 1
+        }
+        ni2 = ni2 + 1
+    }
 
     let saved_flag = return_flag
     return_flag = false
+    let saved_defer_stack = defer_stack
+    defer_stack = []
     // Sprint C: save outer generator frame, start a fresh empty buffer
     // so that yields inside this call accumulate here only.
     let saved_gen_buffer = gen_buffer
@@ -3317,6 +3438,19 @@ fn call_user_fn(name, args) {
     }
     gen_buffer = saved_gen_buffer
     gen_active = saved_gen_active
+    // Execute deferred statements in LIFO order before restoring flags
+    let saved_rf = return_flag
+    let saved_tf = throw_flag
+    return_flag = false
+    throw_flag = false
+    let mut _di = len(defer_stack) - 1
+    while _di >= 0 {
+        eval_body(defer_stack[_di])
+        _di = _di - 1
+    }
+    return_flag = saved_rf
+    throw_flag = saved_tf
+    defer_stack = saved_defer_stack
     return_flag = saved_flag
     return_val = val_void()
     env_pop_scope()
@@ -3414,7 +3548,9 @@ fn call_fn_val(fn_val, args) {
     }
 
     env_push_scope()
+    // G22/G23: bind positional args, then named args, then defaults
     let mut i = 0
+    // Phase 1: bind positional args in order
     while i < len(params) && i < len(args) {
         if type_of(params[i]) == "string" {
             env_define(params[i], args[i])
@@ -3423,9 +3559,55 @@ fn call_fn_val(fn_val, args) {
         }
         i = i + 1
     }
+    // Phase 2: for remaining unbound params, try named args then defaults
+    while i < len(params) {
+        let p = params[i]
+        let mut pname = ""
+        if type_of(p) == "string" { pname = p } else { pname = p.name }
+        // G23: check named args
+        let mut found_named = false
+        let mut ni = 0
+        while ni < len(pending_named_args) {
+            if pending_named_args[ni][0] == pname {
+                env_define(pname, pending_named_args[ni][1])
+                found_named = true
+                ni = len(pending_named_args)
+            }
+            ni = ni + 1
+        }
+        if !found_named {
+            // G22: check for default value
+            if type_of(p) != "string" && p.left != "" {
+                env_define(pname, eval_expr(p.left))
+            } else {
+                env_define(pname, val_void())
+            }
+        }
+        i = i + 1
+    }
+    // G23: bind named args targeting already-bound positional params
+    let mut ni2 = 0
+    while ni2 < len(pending_named_args) {
+        let na_name = pending_named_args[ni2][0]
+        let na_val = pending_named_args[ni2][1]
+        let mut pi2 = 0
+        while pi2 < len(params) && pi2 < len(args) {
+            let pp = params[pi2]
+            let mut ppname = ""
+            if type_of(pp) == "string" { ppname = pp } else { ppname = pp.name }
+            if ppname == na_name {
+                env_set(na_name, na_val)
+                pi2 = len(params)
+            }
+            pi2 = pi2 + 1
+        }
+        ni2 = ni2 + 1
+    }
 
     let saved_flag = return_flag
     return_flag = false
+    let saved_defer_stack = defer_stack
+    defer_stack = []
     // Sprint C: generator frame save/restore (see call_user_fn for notes)
     let saved_gen_buffer = gen_buffer
     let saved_gen_active = gen_active
@@ -3444,6 +3626,19 @@ fn call_fn_val(fn_val, args) {
     }
     gen_buffer = saved_gen_buffer
     gen_active = saved_gen_active
+    // Execute deferred statements in LIFO order before restoring flags
+    let saved_rf = return_flag
+    let saved_tf = throw_flag
+    return_flag = false
+    throw_flag = false
+    let mut _di = len(defer_stack) - 1
+    while _di >= 0 {
+        eval_body(defer_stack[_di])
+        _di = _di - 1
+    }
+    return_flag = saved_rf
+    throw_flag = saved_tf
+    defer_stack = saved_defer_stack
     return_flag = saved_flag
     return_val = val_void()
     env_pop_scope()
@@ -8790,10 +8985,11 @@ fn call_method(obj, method, args) {
                         // Bind self to the object
                         env_define("self", obj)
                         // Bind remaining params (skip 'self' if first param)
+                        // G22/G23: also handle defaults and named args
                         let mut pi = 0
                         let mut ai = 0
                         while pi < len(mparams) {
-                            let pname = ""
+                            let mut pname = ""
                             if type_of(mparams[pi]) == "string" {
                                 pname = mparams[pi]
                             } else {
@@ -8805,6 +9001,27 @@ fn call_method(obj, method, args) {
                                 if ai < len(args) {
                                     env_define(pname, args[ai])
                                     ai = ai + 1
+                                } else {
+                                    // G23: check named args
+                                    let mut mp_found = false
+                                    let mut mni = 0
+                                    while mni < len(pending_named_args) {
+                                        if pending_named_args[mni][0] == pname {
+                                            env_define(pname, pending_named_args[mni][1])
+                                            mp_found = true
+                                            mni = len(pending_named_args)
+                                        }
+                                        mni = mni + 1
+                                    }
+                                    if !mp_found {
+                                        // G22: check default
+                                        let mp = mparams[pi]
+                                        if type_of(mp) != "string" && mp.left != "" {
+                                            env_define(pname, eval_expr(mp.left))
+                                        } else {
+                                            env_define(pname, val_void())
+                                        }
+                                    }
                                 }
                             }
                             pi = pi + 1
@@ -9662,7 +9879,10 @@ fn interpret(ast) {
     return_flag = false
     return_val = val_void()
     break_flag = false
+    break_label = ""
     continue_flag = false
+    continue_label = ""
+    defer_stack = []
     throw_flag = false
     throw_val = val_void()
     panic_flag = false
@@ -9751,7 +9971,7 @@ println("Math: abs min max floor ceil round sqrt pow sin cos ln log10 exp")
 println("Math+: tan asin acos atan atan2 sigmoid relu tanh pi e log2 clamp")
 println("Math++: sign gcd lcm factorial fib is_prime mod")
 println("BinOp: + - * / % ** == != < > <= >= && || & | ^ << >> |> ?? in is (int/float/str/char/bool/array/pipe)")
-println("UnaryOp: - ! ~ (neg not bitnot)")
+println("UnaryOp: - ! ~ typeof (neg not bitnot typeof)")
 println("Functional: compose pipe curry identity constant")
 println("Error: error is_error stack_trace")
 println("Format: format() hex() bin() format_number() with {} {N} {:.N} precision")
@@ -9760,4 +9980,6 @@ println("JSON: to_json from_json")
 println("Util: assert range sort random time sleep")
 println("Control: if/else while for for-in loop break continue return match try/catch/throw")
 println("Advanced: closure/lambda struct-init struct-methods(impl) match-expr try/catch/throw")
+println("G22: default parameter values")
+println("G23: named arguments")
 println("Ready for Phase 2 self-hosting pipeline")
