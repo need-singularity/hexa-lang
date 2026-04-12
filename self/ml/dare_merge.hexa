@@ -1,0 +1,382 @@
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/dare_merge.hexa — DARE Merge (#345)
+//
+//  Ref: Yu et al. 2024 — "Language Models are Super Mario: Absorbing
+//       Abilities from Homologous Models as a Free Lunch"
+//
+//  DARE (Drop And REscale): merge fine-tuned models without
+//  additional training by extracting delta parameters, randomly
+//  dropping them, and rescaling.
+//
+//  Pipeline:
+//    1. Delta extraction:   delta_i = theta_ft_i - theta_base
+//    2. Random drop:        mask ~ Bernoulli(1 - p)
+//                           delta_masked = delta * mask
+//    3. Rescale:            delta_rescaled = delta_masked / (1 - p)
+//    4. Multi-model merge:  theta_merged = theta_base + sum(w_i * delta_rescaled_i)
+//
+//  Variants:
+//    - DARE-TIES: DARE drop+rescale followed by TIES sign elect
+//    - DARE-Task: per-task weight allocation
+//    - DARE-Linear: simple weighted sum after drop+rescale
+//
+//  API (pure):
+//    dare_extract_delta(ft, base)            -> [float]
+//    dare_apply_delta(base, delta)           -> [float]
+//    dare_bernoulli_mask(n, drop_rate, seed) -> [float]
+//    dare_drop(delta, drop_rate, seed)       -> [float]
+//    dare_rescale(dropped, drop_rate)        -> [float]
+//    dare_drop_rescale(delta, drop_rate, seed) -> [float]
+//    dare_merge_linear(base, fts, weights, drop_rate, seed) -> [float]
+//    dare_sign_consensus(deltas)             -> [float]
+//    dare_merge_ties(base, fts, weights, drop_rate, density, seed) -> [float]
+//    dare_sparsity(v)                        -> float
+//    dare_cosine_sim(a, b)                   -> float
+//    dare_l2_dist(a, b)                      -> float
+//
+//  AI-NATIVE attrs:
+//    @pure     — no side effects
+//    @parallel — per-parameter independent
+// ═══════════════════════════════════════════════════════════════
+
+// ── helpers ──────────────────────────────────────────────────
+
+fn dm_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn dm_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0e-10 { g = 1.0e-5 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn dm_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn dm_hash(seed, idx) {
+    // Deterministic hash-based pseudo-random in [0, 1)
+    let h = ((seed * 2654435761 + idx * 1315423911) % 10007)
+    if h < 0 { return to_float(0 - h) / 10007.0 }
+    return to_float(h) / 10007.0
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Delta extraction and application
+// ═══════════════════════════════════════════════════════════════
+
+// Extract delta parameters: delta = theta_ft - theta_base
+@pure @parallel
+fn dare_extract_delta(ft, base) {
+    let n = len(ft)
+    let mut delta = dm_zeros(n)
+    for i in 0..n {
+        delta[i] = ft[i] - base[i]
+    }
+    return delta
+}
+
+// Apply delta to base: theta = theta_base + delta
+@pure @parallel
+fn dare_apply_delta(base, delta) {
+    let n = len(base)
+    let mut out = dm_zeros(n)
+    for i in 0..n {
+        out[i] = base[i] + delta[i]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Bernoulli mask generation
+//
+//  mask[i] = 1.0 if hash(seed, i) >= drop_rate, else 0.0
+//  Expected fraction of 1s = (1 - drop_rate)
+// ═══════════════════════════════════════════════════════════════
+
+@pure @parallel
+fn dare_bernoulli_mask(n, drop_rate, seed) {
+    let mut mask = dm_zeros(n)
+    for i in 0..n {
+        let r = dm_hash(seed, i)
+        if r >= drop_rate {
+            mask[i] = 1.0
+        }
+    }
+    return mask
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Drop: apply Bernoulli mask to delta
+// ═══════════════════════════════════════════════════════════════
+
+@pure @parallel
+fn dare_drop(delta, drop_rate, seed) {
+    let n = len(delta)
+    let mask = dare_bernoulli_mask(n, drop_rate, seed)
+    let mut out = dm_zeros(n)
+    for i in 0..n {
+        out[i] = delta[i] * mask[i]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Rescale: compensate for dropped parameters
+//
+//  delta_rescaled = delta_dropped / (1 - p)
+//  This preserves the expected value of the delta in expectation.
+// ═══════════════════════════════════════════════════════════════
+
+@pure @parallel
+fn dare_rescale(dropped, drop_rate) {
+    let n = len(dropped)
+    let scale = if drop_rate < 0.999 { 1.0 / (1.0 - drop_rate) } else { 1.0 }
+    let mut out = dm_zeros(n)
+    for i in 0..n {
+        out[i] = dropped[i] * scale
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Combined drop + rescale (convenience)
+// ═══════════════════════════════════════════════════════════════
+
+@pure @parallel
+fn dare_drop_rescale(delta, drop_rate, seed) {
+    let dropped = dare_drop(delta, drop_rate, seed)
+    return dare_rescale(dropped, drop_rate)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  DARE-Linear merge
+//
+//  theta_merged = theta_base + sum_i( w_i * dare_drop_rescale(delta_i) )
+//
+//  fts: list of fine-tuned model parameter vectors
+//  weights: per-model merge weight
+//  drop_rate: fraction of deltas to drop (e.g. 0.9)
+//  seed: base seed (each model gets seed + model_index * 137)
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn dare_merge_linear(base, fts, weights, drop_rate, seed) {
+    let num_models = len(fts)
+    let n = len(base)
+
+    // Normalize weights
+    let mut total_w = 0.0
+    for m in 0..num_models { total_w = total_w + weights[m] }
+
+    let mut merged_delta = dm_zeros(n)
+    for m in 0..num_models {
+        let delta = dare_extract_delta(fts[m], base)
+        let model_seed = seed + (m + 1) * 137
+        let dr = dare_drop_rescale(delta, drop_rate, model_seed)
+        let w = weights[m] / total_w
+        for i in 0..n {
+            merged_delta[i] = merged_delta[i] + w * dr[i]
+        }
+    }
+
+    return dare_apply_delta(base, merged_delta)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Sign consensus (for DARE-TIES variant)
+//
+//  For each parameter position, count how many models have
+//  positive vs negative deltas. The majority sign wins.
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn dare_sign_consensus(deltas) {
+    let num_models = len(deltas)
+    let n = len(deltas[0])
+    let mut signs = dm_zeros(n)
+    for i in 0..n {
+        let mut pos = 0
+        let mut neg = 0
+        for m in 0..num_models {
+            if deltas[m][i] > 0.0 { pos = pos + 1 }
+            if deltas[m][i] < 0.0 { neg = neg + 1 }
+        }
+        if pos >= neg {
+            signs[i] = 1.0
+        } else {
+            signs[i] = -1.0
+        }
+    }
+    return signs
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Magnitude trim (for DARE-TIES variant)
+//
+//  Keep only top-density% parameters by magnitude, zero rest.
+// ═══════════════════════════════════════════════════════════════
+
+@pure @parallel
+fn dare_magnitude_trim(delta, density) {
+    let n = len(delta)
+    let keep = int(to_float(n) * density)
+    if keep >= n { return delta }
+    if keep <= 0 { return dm_zeros(n) }
+
+    // Sort magnitudes descending to find threshold
+    let mut sorted_mags = []
+    for i in 0..n { sorted_mags = sorted_mags + [dm_abs(delta[i])] }
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if sorted_mags[j] > sorted_mags[i] {
+                let tmp = sorted_mags[i]
+                sorted_mags[i] = sorted_mags[j]
+                sorted_mags[j] = tmp
+            }
+        }
+    }
+    let threshold = sorted_mags[keep - 1]
+
+    let mut out = dm_zeros(n)
+    for i in 0..n {
+        if dm_abs(delta[i]) >= threshold {
+            out[i] = delta[i]
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  DARE-TIES merge
+//
+//  Combines DARE random drop with TIES sign election:
+//    1. Extract deltas
+//    2. DARE drop + rescale each delta
+//    3. Magnitude trim each (density parameter)
+//    4. Sign consensus across models
+//    5. Zero out parameters that disagree with consensus sign
+//    6. Weighted merge
+//    7. Apply merged delta to base
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn dare_merge_ties(base, fts, weights, drop_rate, density, seed) {
+    let num_models = len(fts)
+    let n = len(base)
+
+    // Normalize weights
+    let mut total_w = 0.0
+    for m in 0..num_models { total_w = total_w + weights[m] }
+
+    // Step 1-2: extract deltas, drop + rescale
+    let mut processed = []
+    for m in 0..num_models {
+        let delta = dare_extract_delta(fts[m], base)
+        let model_seed = seed + (m + 1) * 137
+        let dr = dare_drop_rescale(delta, drop_rate, model_seed)
+        processed = processed + [dr]
+    }
+
+    // Step 3: magnitude trim
+    let mut trimmed = []
+    for m in 0..num_models {
+        trimmed = trimmed + [dare_magnitude_trim(processed[m], density)]
+    }
+
+    // Step 4: sign consensus
+    let signs = dare_sign_consensus(trimmed)
+
+    // Step 5: zero out disagreeing signs
+    let mut masked = []
+    for m in 0..num_models {
+        let mut v = dm_zeros(n)
+        for i in 0..n {
+            if signs[i] > 0.0 {
+                if trimmed[m][i] > 0.0 { v[i] = trimmed[m][i] }
+            } else {
+                if trimmed[m][i] < 0.0 { v[i] = trimmed[m][i] }
+            }
+        }
+        masked = masked + [v]
+    }
+
+    // Step 6: weighted merge
+    let mut merged_delta = dm_zeros(n)
+    for i in 0..n {
+        let mut s = 0.0
+        for m in 0..num_models {
+            s = s + masked[m][i] * weights[m] / total_w
+        }
+        merged_delta[i] = s
+    }
+
+    // Step 7: apply to base
+    return dare_apply_delta(base, merged_delta)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Diagnostic utilities
+// ═══════════════════════════════════════════════════════════════
+
+// Sparsity: fraction of zero elements
+@pure
+fn dare_sparsity(v) {
+    let n = len(v)
+    if n == 0 { return 0.0 }
+    let mut zeros = 0
+    for i in 0..n {
+        if dm_abs(v[i]) < 1.0e-10 { zeros = zeros + 1 }
+    }
+    return to_float(zeros) / to_float(n)
+}
+
+// Cosine similarity between two vectors
+@pure
+fn dare_cosine_sim(a, b) {
+    let n = len(a)
+    let mut dot = 0.0
+    let mut norm_a = 0.0
+    let mut norm_b = 0.0
+    for i in 0..n {
+        dot = dot + a[i] * b[i]
+        norm_a = norm_a + a[i] * a[i]
+        norm_b = norm_b + b[i] * b[i]
+    }
+    let denom = dm_sqrt(norm_a) * dm_sqrt(norm_b)
+    if denom < 1.0e-10 { return 0.0 }
+    return dot / denom
+}
+
+// L2 distance between two vectors
+@pure
+fn dare_l2_dist(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    for i in 0..n {
+        let d = a[i] - b[i]
+        s = s + d * d
+    }
+    return dm_sqrt(s)
+}
+
+// Count non-zero elements
+@pure
+fn dare_nnz(v) {
+    let n = len(v)
+    let mut count = 0
+    for i in 0..n {
+        if dm_abs(v[i]) > 1.0e-10 { count = count + 1 }
+    }
+    return count
+}
+
+println("[dare_merge] loaded — DARE: Drop And REscale model merging")

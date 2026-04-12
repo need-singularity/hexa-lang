@@ -1,0 +1,925 @@
+// ═══════════════════════════════════════════════════════════════════
+//  test_jamba.hexa — Jamba Architecture verification (#331)
+//
+//  Tests (32):
+//    #1  ja_zeros produces correct length
+//    #2  ja_exp(0) ~ 1
+//    #3  ja_silu(0) == 0
+//    #4  ja_rms_norm output has unit RMS
+//    #5  ja_softmax sums to 1
+//    #6  ja_softmax all in [0,1]
+//    #7  ja_create_config fields correct
+//    #8  ja_build_plan length == n_layers
+//    #9  ja_build_plan attn layers at correct positions
+//    #10 ja_build_plan moe layers at correct positions
+//    #11 ja_count_plan sums to n_layers
+//    #12 ja_count_plan with no attn (attn_period=0)
+//    #13 ja_mamba_ssm_step output shape
+//    #14 ja_mamba_ssm_step state updates
+//    #15 ja_mamba_layer sequence output shape
+//    #16 ja_mamba_layer state carries forward
+//    #17 ja_sliding_window_attn output shape
+//    #18 ja_sliding_window_attn respects window bound
+//    #19 ja_dense_ffn output shape
+//    #20 ja_dense_ffn zero input -> zero
+//    #21 ja_moe_route picks top_k
+//    #22 ja_moe_route weights sum ~ 1
+//    #23 ja_moe_ffn output shape
+//    #24 ja_block_forward mamba+dense output shape
+//    #25 ja_block_forward attn+moe output shape
+//    #26 ja_forward full pass preserves shape
+//    #27 ja_forward deterministic
+//    #28 ja_forward_chunked matches ja_forward
+//    #29 ja_estimate_kv_memory > 0
+//    #30 ja_estimate_kv_memory scales with window
+//    #31 ja_create_kv_cache structure correct
+//    #32 ja_create_kv_cache kv only on attn layers
+//
+//  Run: PATH=/Users/ghost/.cargo/bin:$PATH ./hexa self/interpreter.hexa self/test_jamba.hexa
+// ═══════════════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ═══════════════════════════════════════════════════════════════════
+//  Inlined jamba module (mirror of self/ml/jamba.hexa)
+// ═══════════════════════════════════════════════════════════════════
+
+// ── math helpers ────────────────────────────────────────────────
+
+fn ja_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn ja_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn ja_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..20 { g = (g + x / g) / 2.0 }
+    return g
+}
+
+fn ja_silu(v) {
+    return v / (1.0 + ja_exp(0.0 - v))
+}
+
+fn ja_max_f(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn ja_min_i(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn ja_max_i(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn ja_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn ja_zeros_2d(rows, cols) {
+    let mut m = []
+    for _r in 0..rows { m = m + [ja_zeros(cols)] }
+    return m
+}
+
+fn ja_ones(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [1.0] }
+    return v
+}
+
+fn ja_vec_add(a, b) {
+    let n = len(a)
+    let mut out = []
+    for i in 0..n { out = out + [a[i] + b[i]] }
+    return out
+}
+
+fn ja_vec_scale(v, s) {
+    let n = len(v)
+    let mut out = []
+    for i in 0..n { out = out + [v[i] * s] }
+    return out
+}
+
+fn ja_mat_vec(mat, v) {
+    let rows = len(mat)
+    let mut out = []
+    for r in 0..rows {
+        let row = mat[r]
+        let n = len(row)
+        let mut s = 0.0
+        for c in 0..n { s = s + row[c] * v[c] }
+        out = out + [s]
+    }
+    return out
+}
+
+fn ja_hash_float(seed, i, j) {
+    let h = ((seed * 2654435761 + i * 1315423911 + j * 2246822519) % 10007)
+    return to_float(h) / 10007.0 - 0.5
+}
+
+fn ja_init_weight(rows, cols, seed) {
+    let scale = 0.2 / ja_sqrt(to_float(cols))
+    let mut m = []
+    for r in 0..rows {
+        let mut row = []
+        for c in 0..cols {
+            row = row + [ja_hash_float(seed, r, c) * scale]
+        }
+        m = m + [row]
+    }
+    return m
+}
+
+fn ja_init_vec(n, seed) {
+    let mut v = []
+    for i in 0..n { v = v + [ja_hash_float(seed, i, 0) * 0.1] }
+    return v
+}
+
+fn ja_rms_norm(x, dim, eps) {
+    let mut sq_sum = 0.0
+    for i in 0..dim { sq_sum = sq_sum + x[i] * x[i] }
+    let rms = ja_sqrt(sq_sum / to_float(dim) + eps)
+    let inv_rms = 1.0 / rms
+    let mut out = []
+    for i in 0..dim { out = out + [x[i] * inv_rms] }
+    return out
+}
+
+fn ja_softmax(logits, n) {
+    let mut mx = logits[0]
+    for i in 1..n {
+        if logits[i] > mx { mx = logits[i] }
+    }
+    let mut exps = []
+    let mut z = 0.0
+    for i in 0..n {
+        let e = ja_exp(logits[i] - mx)
+        exps = exps + [e]
+        z = z + e
+    }
+    let safe_z = if z < 1.0e-12 { 1.0e-12 } else { z }
+    let mut out = []
+    for i in 0..n { out = out + [exps[i] / safe_z] }
+    return out
+}
+
+fn ja_create_config(n_layers, dim, n_heads, d_head, n_experts, top_k, attn_period, moe_period, window_size, chunk_size) {
+    let cfg = #{}
+    cfg["n_layers"] = n_layers
+    cfg["dim"] = dim
+    cfg["n_heads"] = n_heads
+    cfg["d_head"] = d_head
+    cfg["n_experts"] = n_experts
+    cfg["top_k"] = top_k
+    cfg["attn_period"] = attn_period
+    cfg["moe_period"] = moe_period
+    cfg["window_size"] = window_size
+    cfg["chunk_size"] = chunk_size
+    cfg["hidden"] = dim * 4
+    cfg["d_state"] = dim
+    cfg["eps"] = 1.0e-6
+    return cfg
+}
+
+fn ja_build_plan(config) {
+    let n = config["n_layers"]
+    let attn_p = config["attn_period"]
+    let moe_p = config["moe_period"]
+    let mut plan = []
+    for l in 0..n {
+        let entry = #{}
+        if attn_p > 0 && ((l + 1) % attn_p) == 0 {
+            entry["mixer"] = "attn"
+        } else {
+            entry["mixer"] = "mamba"
+        }
+        if moe_p > 0 && ((l + 1) % moe_p) == 0 {
+            entry["ffn"] = "moe"
+        } else {
+            entry["ffn"] = "dense"
+        }
+        plan = plan + [entry]
+    }
+    return plan
+}
+
+fn ja_count_plan(plan) {
+    let n = len(plan)
+    let counts = #{}
+    counts["mamba_dense"] = 0
+    counts["mamba_moe"] = 0
+    counts["attn_dense"] = 0
+    counts["attn_moe"] = 0
+    for i in 0..n {
+        let mixer = plan[i]["mixer"]
+        let ffn = plan[i]["ffn"]
+        let key = mixer + "_" + ffn
+        counts[key] = counts[key] + 1
+    }
+    return counts
+}
+
+fn ja_softplus(x) {
+    if x > 20.0 { return x }
+    return ja_exp(x) + 1.0e-10
+}
+
+fn ja_mamba_ssm_step(state, inp, A_diag, B_flat, C_vec, D_val, dim, d_state) {
+    let mut delta_sum = 0.0
+    for i in 0..dim { delta_sum = delta_sum + ja_abs(inp[i]) }
+    let delta = ja_softplus(delta_sum / to_float(dim))
+
+    let mut new_state = ja_zeros(d_state)
+    for i in 0..d_state {
+        let a_bar = ja_exp(delta * A_diag[i])
+        let mut bx = 0.0
+        for j in 0..dim { bx = bx + B_flat[i * dim + j] * inp[j] }
+        new_state[i] = a_bar * state[i] + delta * bx
+    }
+
+    let mut y = ja_zeros(dim)
+    for i in 0..dim {
+        let mut c_sum = 0.0
+        for j in 0..d_state { c_sum = c_sum + C_vec[j] * new_state[j] }
+        y[i] = c_sum + D_val * inp[i]
+    }
+    return [new_state, y]
+}
+
+fn ja_mamba_layer(state, seq_input, params, dim, d_state) {
+    let A_diag = params["A_diag"]
+    let B_flat = params["B_flat"]
+    let C_vec = params["C_vec"]
+    let D_val = params["D_val"]
+    let W_in = params["W_in"]
+    let W_out = params["W_out"]
+    let seq_len = len(seq_input)
+
+    let mut st = state
+    let mut out = []
+    for t in 0..seq_len {
+        let inp_proj = ja_mat_vec(W_in, seq_input[t])
+        let res = ja_mamba_ssm_step(st, inp_proj, A_diag, B_flat, C_vec, D_val, dim, d_state)
+        st = res[0]
+        let y_raw = res[1]
+        let mut y_gated = ja_zeros(dim)
+        for i in 0..dim {
+            let gate = ja_silu(inp_proj[i])
+            y_gated[i] = y_raw[i] * gate
+        }
+        let y_out = ja_mat_vec(W_out, y_gated)
+        out = out + [y_out]
+    }
+    return [st, out]
+}
+
+fn ja_sliding_window_attn(seq_input, params, seq_len, dim, n_heads, d_head, window) {
+    let Wq = params["Wq"]
+    let Wk = params["Wk"]
+    let Wv = params["Wv"]
+    let Wo = params["Wo"]
+
+    let mut Qs = []
+    let mut Ks = []
+    let mut Vs = []
+    for t in 0..seq_len {
+        Qs = Qs + [ja_mat_vec(Wq, seq_input[t])]
+        Ks = Ks + [ja_mat_vec(Wk, seq_input[t])]
+        Vs = Vs + [ja_mat_vec(Wv, seq_input[t])]
+    }
+
+    let scale = 1.0 / ja_sqrt(to_float(d_head))
+    let mut out = []
+
+    for t in 0..seq_len {
+        let w_start = ja_max_i(0, t - window + 1)
+        let w_end = t + 1
+        let w_len = w_end - w_start
+
+        let mut combined = ja_zeros(dim)
+        for h in 0..n_heads {
+            let h_off = h * d_head
+
+            let mut scores = []
+            for s in w_start..w_end {
+                let mut dot = 0.0
+                for i in 0..d_head {
+                    dot = dot + Qs[t][h_off + i] * Ks[s][h_off + i]
+                }
+                scores = scores + [dot * scale]
+            }
+
+            let probs = ja_softmax(scores, w_len)
+
+            for i in 0..d_head {
+                let mut acc = 0.0
+                for si in 0..w_len {
+                    acc = acc + probs[si] * Vs[w_start + si][h_off + i]
+                }
+                combined[h_off + i] = acc
+            }
+        }
+
+        let o_t = ja_mat_vec(Wo, combined)
+        out = out + [o_t]
+    }
+    return out
+}
+
+fn ja_dense_ffn(inp, W1, W2, W3, dim, hidden) {
+    let gate = ja_mat_vec(W1, inp)
+    let up = ja_mat_vec(W3, inp)
+    let mut h = []
+    for i in 0..hidden {
+        h = h + [ja_silu(gate[i]) * up[i]]
+    }
+    let y = ja_mat_vec(W2, h)
+    return y
+}
+
+fn ja_moe_route(inp, gate_W, n_experts, top_k) {
+    let logits = ja_mat_vec(gate_W, inp)
+
+    let mut used = []
+    for _i in 0..n_experts { used = used + [false] }
+    let mut picks = []
+    let mut picked_logits = []
+    let mut r = 0
+    while r < top_k && r < n_experts {
+        let mut best = -1
+        let mut best_v = -1.0e30
+        for e in 0..n_experts {
+            if used[e] == false {
+                if logits[e] > best_v {
+                    best_v = logits[e]
+                    best = e
+                }
+            }
+        }
+        if best < 0 {
+            r = top_k
+        } else {
+            let mut new_used = []
+            for k in 0..n_experts {
+                if k == best { new_used = new_used + [true] } else { new_used = new_used + [used[k]] }
+            }
+            used = new_used
+            picks = picks + [best]
+            picked_logits = picked_logits + [best_v]
+            r = r + 1
+        }
+    }
+    let k_eff = len(picks)
+    if k_eff == 0 { return [picks, []] }
+    let weights = ja_softmax(picked_logits, k_eff)
+    return [picks, weights]
+}
+
+fn ja_moe_ffn(inp, experts, gate_W, n_experts, top_k, dim, hidden) {
+    let route = ja_moe_route(inp, gate_W, n_experts, top_k)
+    let picks = route[0]
+    let weights = route[1]
+    let k_eff = len(picks)
+
+    let mut y = ja_zeros(dim)
+    for k in 0..k_eff {
+        let idx = picks[k]
+        let w = weights[k]
+        let expert = experts[idx]
+        let eW1 = expert["W1"]
+        let eW2 = expert["W2"]
+        let eW3 = expert["W3"]
+        let ex_out = ja_dense_ffn(inp, eW1, eW2, eW3, dim, hidden)
+        for i in 0..dim { y[i] = y[i] + w * ex_out[i] }
+    }
+    return y
+}
+
+fn ja_block_forward(block_plan, state, seq_input, params, config) {
+    let dim = config["dim"]
+    let d_state = config["d_state"]
+    let n_heads = config["n_heads"]
+    let d_head = config["d_head"]
+    let n_experts = config["n_experts"]
+    let top_k = config["top_k"]
+    let hidden = config["hidden"]
+    let window = config["window_size"]
+    let eps = config["eps"]
+    let seq_len = len(seq_input)
+    let mixer_type = block_plan["mixer"]
+    let ffn_type = block_plan["ffn"]
+
+    let mut mixer_out = []
+    let mut new_state = state
+
+    if mixer_type == "mamba" {
+        let mut normed = []
+        for t in 0..seq_len {
+            normed = normed + [ja_rms_norm(seq_input[t], dim, eps)]
+        }
+        let mamba_res = ja_mamba_layer(state, normed, params, dim, d_state)
+        new_state = mamba_res[0]
+        let mamba_out = mamba_res[1]
+        for t in 0..seq_len {
+            mixer_out = mixer_out + [ja_vec_add(seq_input[t], mamba_out[t])]
+        }
+    }
+    if mixer_type == "attn" {
+        let mut normed = []
+        for t in 0..seq_len {
+            normed = normed + [ja_rms_norm(seq_input[t], dim, eps)]
+        }
+        let attn_out = ja_sliding_window_attn(normed, params, seq_len, dim, n_heads, d_head, window)
+        for t in 0..seq_len {
+            mixer_out = mixer_out + [ja_vec_add(seq_input[t], attn_out[t])]
+        }
+    }
+
+    let mut layer_out = []
+
+    if ffn_type == "dense" {
+        let fW1 = params["ffn_W1"]
+        let fW2 = params["ffn_W2"]
+        let fW3 = params["ffn_W3"]
+        for t in 0..seq_len {
+            let normed_t = ja_rms_norm(mixer_out[t], dim, eps)
+            let ffn_out = ja_dense_ffn(normed_t, fW1, fW2, fW3, dim, hidden)
+            layer_out = layer_out + [ja_vec_add(mixer_out[t], ffn_out)]
+        }
+    }
+    if ffn_type == "moe" {
+        let exp_list = params["experts"]
+        let gW = params["gate_W"]
+        for t in 0..seq_len {
+            let normed_t = ja_rms_norm(mixer_out[t], dim, eps)
+            let moe_out = ja_moe_ffn(normed_t, exp_list, gW, n_experts, top_k, dim, hidden)
+            layer_out = layer_out + [ja_vec_add(mixer_out[t], moe_out)]
+        }
+    }
+
+    return [new_state, layer_out]
+}
+
+fn ja_forward(config, all_params, seq_input) {
+    let n_layers = config["n_layers"]
+    let dim = config["dim"]
+    let d_state = config["d_state"]
+    let plan = ja_build_plan(config)
+
+    let mut h_seq = seq_input
+    for l in 0..n_layers {
+        let init_state = ja_zeros(d_state)
+        let res = ja_block_forward(plan[l], init_state, h_seq, all_params[l], config)
+        h_seq = res[1]
+    }
+    return h_seq
+}
+
+fn ja_forward_chunked(config, all_params, seq_input, total_len) {
+    let n_layers = config["n_layers"]
+    let dim = config["dim"]
+    let d_state = config["d_state"]
+    let chunk_size = config["chunk_size"]
+    let plan = ja_build_plan(config)
+
+    let n_chunks = (total_len + chunk_size - 1) / chunk_size
+
+    let mut layer_states = []
+    for _l in 0..n_layers { layer_states = layer_states + [ja_zeros(d_state)] }
+
+    let mut all_output = []
+
+    for c in 0..n_chunks {
+        let c_start = c * chunk_size
+        let c_end = ja_min_i(c_start + chunk_size, total_len)
+        let c_len = c_end - c_start
+
+        let mut chunk = []
+        for t in c_start..c_end {
+            chunk = chunk + [seq_input[t]]
+        }
+
+        let mut h_seq = chunk
+        for l in 0..n_layers {
+            let res = ja_block_forward(plan[l], layer_states[l], h_seq, all_params[l], config)
+            if plan[l]["mixer"] == "mamba" {
+                let mut new_states = []
+                for li in 0..n_layers {
+                    if li == l { new_states = new_states + [res[0]] } else { new_states = new_states + [layer_states[li]] }
+                }
+                layer_states = new_states
+            }
+            h_seq = res[1]
+        }
+
+        for t in 0..c_len {
+            all_output = all_output + [h_seq[t]]
+        }
+    }
+
+    return all_output
+}
+
+fn ja_estimate_kv_memory(config) {
+    let n_layers = config["n_layers"]
+    let dim = config["dim"]
+    let attn_period = config["attn_period"]
+    let window = config["window_size"]
+    let n_attn = if attn_period > 0 { n_layers / attn_period } else { 0 }
+    let kv_per_layer = 2 * window * dim * 4
+    return n_attn * kv_per_layer
+}
+
+fn ja_create_kv_cache(config, max_len) {
+    let n_layers = config["n_layers"]
+    let dim = config["dim"]
+    let d_state = config["d_state"]
+    let window = config["window_size"]
+    let plan = ja_build_plan(config)
+
+    let cache = #{}
+    let mut mamba_states = []
+    for _l in 0..n_layers { mamba_states = mamba_states + [ja_zeros(d_state)] }
+    cache["mamba_states"] = mamba_states
+
+    let eff_len = ja_min_i(max_len, window)
+    let mut kv_keys = []
+    let mut kv_vals = []
+    for l in 0..n_layers {
+        if plan[l]["mixer"] == "attn" {
+            kv_keys = kv_keys + [ja_zeros_2d(eff_len, dim)]
+            kv_vals = kv_vals + [ja_zeros_2d(eff_len, dim)]
+        } else {
+            kv_keys = kv_keys + [[]]
+            kv_vals = kv_vals + [[]]
+        }
+    }
+    cache["kv_keys"] = kv_keys
+    cache["kv_vals"] = kv_vals
+    cache["n_layers"] = n_layers
+    cache["window"] = window
+    cache["dim"] = dim
+    cache["plan"] = plan
+    return cache
+}
+
+fn ja_create_expert(dim, hidden, seed) {
+    let e = #{}
+    e["W1"] = ja_init_weight(hidden, dim, seed)
+    e["W2"] = ja_init_weight(dim, hidden, seed + 1)
+    e["W3"] = ja_init_weight(hidden, dim, seed + 2)
+    return e
+}
+
+fn ja_default_params(config, seed) {
+    let n_layers = config["n_layers"]
+    let dim = config["dim"]
+    let d_state = config["d_state"]
+    let hidden = config["hidden"]
+    let n_experts = config["n_experts"]
+    let n_heads = config["n_heads"]
+    let d_head = config["d_head"]
+    let plan = ja_build_plan(config)
+
+    let mut params_list = []
+    for l in 0..n_layers {
+        let p = #{}
+        let ls = seed + l * 200
+
+        let mut a_diag = []
+        for i in 0..d_state { a_diag = a_diag + [-0.5 + ja_hash_float(ls, i, 0) * 0.1] }
+        p["A_diag"] = a_diag
+        let mut b_flat = []
+        for i in 0..(d_state * dim) { b_flat = b_flat + [ja_hash_float(ls + 1, i, 0) * 0.1] }
+        p["B_flat"] = b_flat
+        p["C_vec"] = ja_init_vec(d_state, ls + 2)
+        p["D_val"] = 1.0
+        p["W_in"] = ja_init_weight(dim, dim, ls + 3)
+        p["W_out"] = ja_init_weight(dim, dim, ls + 4)
+
+        p["Wq"] = ja_init_weight(dim, dim, ls + 10)
+        p["Wk"] = ja_init_weight(dim, dim, ls + 11)
+        p["Wv"] = ja_init_weight(dim, dim, ls + 12)
+        p["Wo"] = ja_init_weight(dim, dim, ls + 13)
+
+        p["ffn_W1"] = ja_init_weight(hidden, dim, ls + 20)
+        p["ffn_W2"] = ja_init_weight(dim, hidden, ls + 21)
+        p["ffn_W3"] = ja_init_weight(hidden, dim, ls + 22)
+
+        let mut experts = []
+        for e in 0..n_experts {
+            experts = experts + [ja_create_expert(dim, hidden, ls + 50 + e * 10)]
+        }
+        p["experts"] = experts
+        p["gate_W"] = ja_init_weight(n_experts, dim, ls + 99)
+
+        params_list = params_list + [p]
+    }
+    return params_list
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Test constants
+// ═══════════════════════════════════════════════════════════════════
+
+let DIM = 4
+let D_HEAD = 2
+let N_HEADS = 2
+let N_EXPERTS = 3
+let TOP_K = 2
+let N_LAYERS = 8
+let ATTN_PERIOD = 4
+let MOE_PERIOD = 2
+let WINDOW = 3
+let CHUNK = 2
+let SEQ = 4
+let SEED = 42
+let EPS = 1.0e-6
+
+println("=== Jamba Architecture Tests (#331) ===")
+
+// -- #1 ja_zeros length --
+let z4 = ja_zeros(DIM)
+check("#1 ja_zeros length", len(z4) == DIM)
+
+// -- #2 ja_exp(0) ~ 1 --
+check("#2 ja_exp(0) ~ 1", approx(ja_exp(0.0), 1.0, 0.001))
+
+// -- #3 ja_silu(0) == 0 --
+check("#3 ja_silu(0) == 0", approx(ja_silu(0.0), 0.0, 0.001))
+
+// -- #4 rms_norm output has unit RMS --
+let xn = [3.0, 4.0, 0.0, 0.0]
+let normed = ja_rms_norm(xn, DIM, EPS)
+let mut sq = 0.0
+for i in 0..DIM { sq = sq + normed[i] * normed[i] }
+let rms_val = ja_sqrt(sq / to_float(DIM))
+check("#4 rms_norm unit RMS", approx(rms_val, 1.0, 0.01))
+
+// -- #5 softmax sums to 1 --
+let sm = ja_softmax([1.0, 2.0, 3.0, 0.5], 4)
+let mut sm_sum = 0.0
+for i in 0..4 { sm_sum = sm_sum + sm[i] }
+check("#5 softmax sums to 1", approx(sm_sum, 1.0, 0.001))
+
+// -- #6 softmax all in [0,1] --
+let mut sm_ok = true
+for i in 0..4 {
+    if sm[i] < 0.0 || sm[i] > 1.0 { sm_ok = false }
+}
+check("#6 softmax all in [0,1]", sm_ok)
+
+// -- #7 create_config --
+let cfg = ja_create_config(N_LAYERS, DIM, N_HEADS, D_HEAD, N_EXPERTS, TOP_K, ATTN_PERIOD, MOE_PERIOD, WINDOW, CHUNK)
+check("#7 create_config fields",
+    cfg["n_layers"] == N_LAYERS &&
+    cfg["dim"] == DIM &&
+    cfg["n_heads"] == N_HEADS &&
+    cfg["d_head"] == D_HEAD &&
+    cfg["n_experts"] == N_EXPERTS &&
+    cfg["top_k"] == TOP_K &&
+    cfg["attn_period"] == ATTN_PERIOD &&
+    cfg["moe_period"] == MOE_PERIOD &&
+    cfg["window_size"] == WINDOW &&
+    cfg["chunk_size"] == CHUNK)
+
+// -- #8 build_plan length --
+let plan = ja_build_plan(cfg)
+check("#8 plan length == n_layers", len(plan) == N_LAYERS)
+
+// -- #9 attn at correct positions (every 4th: layers 3,7 with 0-index) --
+let mut attn_positions_ok = true
+for l in 0..N_LAYERS {
+    let is_attn = plan[l]["mixer"] == "attn"
+    let should_be_attn = ((l + 1) % ATTN_PERIOD) == 0
+    if is_attn != should_be_attn { attn_positions_ok = false }
+}
+check("#9 attn at correct positions", attn_positions_ok)
+
+// -- #10 moe at correct positions (every 2nd) --
+let mut moe_positions_ok = true
+for l in 0..N_LAYERS {
+    let is_moe = plan[l]["ffn"] == "moe"
+    let should_be_moe = ((l + 1) % MOE_PERIOD) == 0
+    if is_moe != should_be_moe { moe_positions_ok = false }
+}
+check("#10 moe at correct positions", moe_positions_ok)
+
+// -- #11 count_plan sums to n_layers --
+let counts = ja_count_plan(plan)
+let total_ct = counts["mamba_dense"] + counts["mamba_moe"] + counts["attn_dense"] + counts["attn_moe"]
+check("#11 count_plan sum == n_layers", total_ct == N_LAYERS)
+
+// -- #12 no attn when attn_period=0 --
+let cfg_no_attn = ja_create_config(6, DIM, N_HEADS, D_HEAD, N_EXPERTS, TOP_K, 0, 2, WINDOW, CHUNK)
+let plan_no_attn = ja_build_plan(cfg_no_attn)
+let counts_no_attn = ja_count_plan(plan_no_attn)
+check("#12 no attn when attn_period=0",
+    counts_no_attn["attn_dense"] == 0 && counts_no_attn["attn_moe"] == 0)
+
+// -- #13 mamba_ssm_step output shape --
+let state0 = ja_zeros(DIM)
+let x_in = [1.0, 0.5, -0.25, 0.1]
+let mut a_diag = []
+for i in 0..DIM { a_diag = a_diag + [-0.5] }
+let mut b_flat = []
+for i in 0..(DIM * DIM) { b_flat = b_flat + [ja_hash_float(SEED, i, 0) * 0.1] }
+let c_vec = ja_init_vec(DIM, SEED + 1)
+let res13 = ja_mamba_ssm_step(state0, x_in, a_diag, b_flat, c_vec, 1.0, DIM, DIM)
+check("#13 mamba_ssm_step shapes", len(res13[0]) == DIM && len(res13[1]) == DIM)
+
+// -- #14 mamba state updates --
+let mut any_nonzero = false
+for i in 0..DIM {
+    if fabs(res13[0][i]) > 1.0e-9 { any_nonzero = true }
+}
+check("#14 mamba state updates", any_nonzero)
+
+// -- #15 mamba_layer sequence output shape --
+let mut xs = []
+for t in 0..SEQ { xs = xs + [[to_float(t + 1) * 0.1, 0.2, 0.3, 0.4]] }
+let params0 = ja_default_params(cfg, SEED)
+let mamba_res = ja_mamba_layer(state0, xs, params0[0], DIM, DIM)
+check("#15 mamba_layer output shape",
+    len(mamba_res[1]) == SEQ && len(mamba_res[1][0]) == DIM)
+
+// -- #16 mamba_layer state carries forward (non-zero after sequence) --
+let mut state_nz = false
+for i in 0..DIM {
+    if fabs(mamba_res[0][i]) > 1.0e-9 { state_nz = true }
+}
+check("#16 mamba_layer state carries", state_nz)
+
+// -- #17 sliding_window_attn output shape --
+let attn_out = ja_sliding_window_attn(xs, params0[0], SEQ, DIM, N_HEADS, D_HEAD, WINDOW)
+check("#17 sliding_window_attn shape",
+    len(attn_out) == SEQ && len(attn_out[0]) == DIM)
+
+// -- #18 sliding window respects bound --
+// With window=3, position 0 should attend to just 1 position,
+// position 3 should attend to at most 3 positions.
+// We verify by running with window=1 (only self-attention)
+// and checking that the output differs from window=3.
+let attn_w1 = ja_sliding_window_attn(xs, params0[0], SEQ, DIM, N_HEADS, D_HEAD, 1)
+let mut window_differs = false
+for i in 0..DIM {
+    if fabs(attn_out[SEQ - 1][i] - attn_w1[SEQ - 1][i]) > 1.0e-9 { window_differs = true }
+}
+check("#18 sliding window affects output", window_differs)
+
+// -- #19 dense_ffn output shape --
+let ffn_W1 = ja_init_weight(DIM * 4, DIM, SEED + 20)
+let ffn_W2 = ja_init_weight(DIM, DIM * 4, SEED + 21)
+let ffn_W3 = ja_init_weight(DIM * 4, DIM, SEED + 22)
+let ffn_out = ja_dense_ffn(x_in, ffn_W1, ffn_W2, ffn_W3, DIM, DIM * 4)
+check("#19 dense_ffn shape", len(ffn_out) == DIM)
+
+// -- #20 dense_ffn zero input -> zero --
+let ffn_z = ja_dense_ffn(ja_zeros(DIM), ffn_W1, ffn_W2, ffn_W3, DIM, DIM * 4)
+let mut ffn_z_ok = true
+for i in 0..DIM {
+    if fabs(ffn_z[i]) > 1.0e-9 { ffn_z_ok = false }
+}
+check("#20 dense_ffn zero -> zero", ffn_z_ok)
+
+// -- #21 moe_route picks top_k --
+let gate_W = ja_init_weight(N_EXPERTS, DIM, SEED + 50)
+let route21 = ja_moe_route(x_in, gate_W, N_EXPERTS, TOP_K)
+check("#21 moe_route picks k", len(route21[0]) == TOP_K)
+
+// -- #22 moe_route weights sum ~ 1 --
+let mut rsum = 0.0
+for i in 0..TOP_K { rsum = rsum + route21[1][i] }
+check("#22 moe_route weights sum ~ 1", approx(rsum, 1.0, 0.001))
+
+// -- #23 moe_ffn output shape --
+let mut experts_list = []
+for e in 0..N_EXPERTS {
+    experts_list = experts_list + [ja_create_expert(DIM, DIM * 4, SEED + 100 + e * 10)]
+}
+let moe_out = ja_moe_ffn(x_in, experts_list, gate_W, N_EXPERTS, TOP_K, DIM, DIM * 4)
+check("#23 moe_ffn shape", len(moe_out) == DIM)
+
+// -- #24 block_forward mamba+dense shape --
+let plan_md = #{}
+plan_md["mixer"] = "mamba"
+plan_md["ffn"] = "dense"
+let resB24 = ja_block_forward(plan_md, ja_zeros(DIM), xs, params0[0], cfg)
+check("#24 block mamba+dense shape",
+    len(resB24[1]) == SEQ && len(resB24[1][0]) == DIM)
+
+// -- #25 block_forward attn+moe shape --
+let plan_am = #{}
+plan_am["mixer"] = "attn"
+plan_am["ffn"] = "moe"
+let resB25 = ja_block_forward(plan_am, ja_zeros(DIM), xs, params0[0], cfg)
+check("#25 block attn+moe shape",
+    len(resB25[1]) == SEQ && len(resB25[1][0]) == DIM)
+
+// -- #26 ja_forward preserves shape --
+let full_out = ja_forward(cfg, params0, xs)
+check("#26 forward shape",
+    len(full_out) == SEQ && len(full_out[0]) == DIM)
+
+// -- #27 ja_forward deterministic --
+let full_out2 = ja_forward(cfg, params0, xs)
+let mut det_ok = true
+for t in 0..SEQ {
+    for i in 0..DIM {
+        if fabs(full_out[t][i] - full_out2[t][i]) > 1.0e-12 { det_ok = false }
+    }
+}
+check("#27 forward deterministic", det_ok)
+
+// -- #28 chunked forward matches single-chunk forward --
+// With chunk_size == SEQ (whole sequence in one chunk), chunked == non-chunked
+let cfg_1chunk = ja_create_config(N_LAYERS, DIM, N_HEADS, D_HEAD, N_EXPERTS, TOP_K, ATTN_PERIOD, MOE_PERIOD, WINDOW, SEQ)
+let params_1c = ja_default_params(cfg_1chunk, SEED)
+let out_flat = ja_forward(cfg_1chunk, params_1c, xs)
+let out_chunked = ja_forward_chunked(cfg_1chunk, params_1c, xs, SEQ)
+let mut chunk_ok = true
+for t in 0..SEQ {
+    for i in 0..DIM {
+        if fabs(out_flat[t][i] - out_chunked[t][i]) > 1.0e-6 { chunk_ok = false }
+    }
+}
+check("#28 chunked == non-chunked (single chunk)", chunk_ok)
+
+// -- #29 kv_memory > 0 --
+let kv_mem = ja_estimate_kv_memory(cfg)
+check("#29 kv_memory > 0", kv_mem > 0)
+
+// -- #30 kv_memory scales with window --
+let cfg_big_w = ja_create_config(N_LAYERS, DIM, N_HEADS, D_HEAD, N_EXPERTS, TOP_K, ATTN_PERIOD, MOE_PERIOD, WINDOW * 4, CHUNK)
+let kv_mem_big = ja_estimate_kv_memory(cfg_big_w)
+check("#30 kv_memory scales with window", kv_mem_big > kv_mem)
+
+// -- #31 kv_cache structure --
+let cache = ja_create_kv_cache(cfg, 16)
+check("#31 kv_cache structure",
+    cache["n_layers"] == N_LAYERS &&
+    cache["window"] == WINDOW &&
+    cache["dim"] == DIM &&
+    len(cache["mamba_states"]) == N_LAYERS)
+
+// -- #32 kv_cache kv only on attn layers --
+let cache_keys = cache["kv_keys"]
+let cache_plan = cache["plan"]
+let mut kv_ok = true
+for l in 0..N_LAYERS {
+    if cache_plan[l]["mixer"] == "attn" {
+        if len(cache_keys[l]) == 0 { kv_ok = false }
+    } else {
+        if len(cache_keys[l]) != 0 { kv_ok = false }
+    }
+}
+check("#32 kv only on attn layers", kv_ok)
+
+// ═══════════════════════════════════════════════════════════════════
+println("")
+println("=== Results: " + to_string(pass_count) + " PASS, " + to_string(fail_count) + " FAIL ===")
+if fail_count == 0 {
+    println("ALL " + to_string(pass_count) + " TESTS PASSED")
+} else {
+    println("SOME TESTS FAILED")
+}

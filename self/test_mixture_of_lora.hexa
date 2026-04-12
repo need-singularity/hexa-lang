@@ -1,0 +1,857 @@
+// ═══════════════════════════════════════════════════════════════
+//  test_mixture_of_lora.hexa — Mixture of LoRA (#342) tests
+//
+//  Validates:
+//    #1   mlora_zeros1 / mlora_zeros2 helpers
+//    #2   mlora_kaiming shape + deterministic
+//    #3   mlora_matvec correctness
+//    #4   mlora_create_adapter shape + fields
+//    #5   adapter B init = zeros (LoRA convention)
+//    #6   adapter_forward with B=0 => zero delta
+//    #7   adapter_forward output dimension
+//    #8   mlora_create_router shape
+//    #9   mlora_router_logits output dimension
+//    #10  mlora_topk_indices correctness
+//    #11  mlora_softmax_subset sums to 1
+//    #12  mlora_route returns valid indices + weights
+//    #13  mlora_create model structure
+//    #14  mlora_forward output dimension
+//    #15  mlora_forward deterministic
+//    #16  mlora_forward non-zero output
+//    #17  mlora_load_balance_loss non-negative
+//    #18  mlora_adapter_utilization sum = n_inputs * top_k
+//    #19  mlora_train_step returns loss > 0
+//    #20  mlora_train_step loss decreases
+//    #21  mlora_freeze_base sets frozen flag
+//    #22  mlora_merge_adapters shape
+//    #23  mlora_add_adapter increases n_adapters
+//    #24  mlora_remove_adapter decreases n_adapters
+//    #25  mlora_param_count formula
+//    #26  mlora_adapter_overlap self = 1.0
+//    #27  mlora_adapter_overlap range [0, 1]
+//    #28  multi-step training convergence
+//    #29  frozen base weights unchanged after train step
+//    #30  different inputs can route to different adapters
+//    #31  per-adapter alpha scaling
+//    #32  specialization score range
+//    #33  domain tags preserved
+//
+//  Rules: pure .hexa, no Rust, HX3 pitfalls honored.
+//  Run: ./hexa self/interpreter.hexa self/test_mixture_of_lora.hexa
+// ═══════════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ═══════════════════════════════════════════════════════════════
+//  Inline core (mirror of self/ml/mixture_of_lora.hexa)
+// ═══════════════════════════════════════════════════════════════
+
+fn t_zeros1(n) {
+    let mut v = []
+    for i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn t_zeros2(rows, cols) {
+    let mut r = []
+    for i in 0..rows { r = r + [t_zeros1(cols)] }
+    return r
+}
+
+fn t_kaiming(rows, cols, seed) {
+    let mut s = seed
+    let scale = 1.0 / sqrt(to_float(cols))
+    let mut r = []
+    for i in 0..rows {
+        let mut row = []
+        for j in 0..cols {
+            s = (s * 1103515245 + 12345) % 2147483647
+            let v = (to_float(s % 2000) - 1000.0) / 1000.0 * scale
+            row = row + [v]
+        }
+        r = r + [row]
+    }
+    return r
+}
+
+fn t_matvec(w, x, m, n) {
+    let mut y = []
+    for i in 0..m {
+        let mut s = 0.0
+        for j in 0..n { s = s + w[i][j] * x[j] }
+        y = y + [s]
+    }
+    return y
+}
+
+fn t_scale(alpha, rank) {
+    return to_float(alpha) / to_float(rank)
+}
+
+// ── Structs ─────────────────────────────────────────────────
+
+struct TAdapter {
+    name: string,
+    domain: string,
+    a: array,
+    b: array,
+    d_in: int,
+    d_out: int,
+    rank: int,
+    alpha: float
+}
+
+struct TRouter {
+    w: array,
+    n_adapters: int,
+    d_in: int
+}
+
+struct TModel {
+    adapters: array,
+    router: TRouter,
+    base_w: array,
+    d_in: int,
+    d_out: int,
+    rank: int,
+    n_adapters: int,
+    top_k: int,
+    frozen: int
+}
+
+// ── Adapter ─────────────────────────────────────────────────
+
+fn t_create_adapter(name, domain, d_in, d_out, rank, alpha, seed) {
+    let a = t_kaiming(rank, d_in, seed)
+    let b = t_zeros2(d_out, rank)
+    return TAdapter {
+        name: name, domain: domain,
+        a: a, b: b,
+        d_in: d_in, d_out: d_out,
+        rank: rank, alpha: alpha
+    }
+}
+
+fn t_adapter_forward(adapter: TAdapter, x) {
+    let ax = t_matvec(adapter.a, x, adapter.rank, adapter.d_in)
+    let bax = t_matvec(adapter.b, ax, adapter.d_out, adapter.rank)
+    let s = t_scale(adapter.alpha, adapter.rank)
+    let mut out = []
+    for i in 0..adapter.d_out {
+        out = out + [s * bax[i]]
+    }
+    return out
+}
+
+// ── Router ──────────────────────────────────────────────────
+
+fn t_create_router(n_adapters, d_in, seed) {
+    let w = t_kaiming(n_adapters, d_in, seed)
+    return TRouter { w: w, n_adapters: n_adapters, d_in: d_in }
+}
+
+fn t_router_logits(router: TRouter, x) {
+    return t_matvec(router.w, x, router.n_adapters, router.d_in)
+}
+
+fn t_topk_indices(scores, n, k) {
+    let mut used = []
+    for i in 0..n { used = used + [false] }
+    let mut picks = []
+    for r in 0..k {
+        let mut best = 0
+        let mut best_v = -1.0e30
+        let mut found = false
+        for e in 0..n {
+            if !used[e] {
+                if !found {
+                    best = e
+                    best_v = scores[e]
+                    found = true
+                } else {
+                    if scores[e] > best_v {
+                        best_v = scores[e]
+                        best = e
+                    }
+                }
+            }
+        }
+        let mut used2 = []
+        for i in 0..n {
+            if i == best { used2 = used2 + [true] } else { used2 = used2 + [used[i]] }
+        }
+        used = used2
+        picks = picks + [best]
+    }
+    return picks
+}
+
+fn t_softmax_subset(scores, picks, k) {
+    let mut m = scores[picks[0]]
+    for r in 1..k {
+        if scores[picks[r]] > m { m = scores[picks[r]] }
+    }
+    let mut exps = []
+    let mut z = 0.0
+    for r in 0..k {
+        let v = exp(scores[picks[r]] - m)
+        exps = exps + [v]
+        z = z + v
+    }
+    let mut out = []
+    for r in 0..k { out = out + [exps[r] / z] }
+    return out
+}
+
+fn t_softmax_all(scores, n) {
+    let mut m = scores[0]
+    for i in 1..n { if scores[i] > m { m = scores[i] } }
+    let mut exps = []
+    let mut z = 0.0
+    for i in 0..n {
+        let v = exp(scores[i] - m)
+        exps = exps + [v]
+        z = z + v
+    }
+    let mut out = []
+    for i in 0..n { out = out + [exps[i] / z] }
+    return out
+}
+
+fn t_route(router: TRouter, x, top_k) {
+    let logits = t_router_logits(router, x)
+    let picks = t_topk_indices(logits, router.n_adapters, top_k)
+    let weights = t_softmax_subset(logits, picks, top_k)
+    return [picks, weights]
+}
+
+// ── Model ───────────────────────────────────────────────────
+
+fn t_create_model(d_in, d_out, rank, n_adapters, top_k, domains) {
+    let mut adapters = []
+    for i in 0..n_adapters {
+        let name = "adapter_" + to_string(i)
+        let domain = domains[i]
+        let seed = 42 + i * 137
+        let a = t_create_adapter(name, domain, d_in, d_out, rank, 1.0, seed)
+        adapters = adapters + [a]
+    }
+    let router = t_create_router(n_adapters, d_in, 7777)
+    let base_w = t_kaiming(d_out, d_in, 9999)
+    return TModel {
+        adapters: adapters, router: router, base_w: base_w,
+        d_in: d_in, d_out: d_out, rank: rank,
+        n_adapters: n_adapters, top_k: top_k, frozen: 0
+    }
+}
+
+fn t_forward(model: TModel, x) {
+    let base_out = t_matvec(model.base_w, x, model.d_out, model.d_in)
+
+    let route_result = t_route(model.router, x, model.top_k)
+    let picks = route_result[0]
+    let weights = route_result[1]
+
+    let mut delta = t_zeros1(model.d_out)
+    for k in 0..model.top_k {
+        let idx = picks[k]
+        let w_k = weights[k]
+        let adapter = model.adapters[idx]
+        let adapter_out = t_adapter_forward(adapter, x)
+        for d in 0..model.d_out {
+            delta[d] = delta[d] + w_k * adapter_out[d]
+        }
+    }
+
+    let mut y = []
+    for d in 0..model.d_out { y = y + [base_out[d] + delta[d]] }
+    return y
+}
+
+fn t_mse_loss(y, target, dim) {
+    let mut s = 0.0
+    for i in 0..dim {
+        let d = y[i] - target[i]
+        s = s + d * d
+    }
+    return s / to_float(dim)
+}
+
+fn t_mse_grad(y, target, dim) {
+    let mut g = []
+    let inv = 2.0 / to_float(dim)
+    for i in 0..dim { g = g + [(y[i] - target[i]) * inv] }
+    return g
+}
+
+fn t_train_step(model: TModel, x, target, lr) {
+    let d_in = model.d_in
+    let d_out = model.d_out
+    let y = t_forward(model, x)
+    let loss = t_mse_loss(y, target, d_out)
+    let dy = t_mse_grad(y, target, d_out)
+
+    let route_result = t_route(model.router, x, model.top_k)
+    let picks = route_result[0]
+    let weights = route_result[1]
+
+    let mut new_adapters = []
+    for e in 0..model.n_adapters {
+        let adapter = model.adapters[e]
+        let mut is_active = false
+        let mut w_e = 0.0
+        for k in 0..model.top_k {
+            if picks[k] == e {
+                is_active = true
+                w_e = weights[k]
+            }
+        }
+        if is_active {
+            let s = t_scale(adapter.alpha, model.rank)
+            let ax = t_matvec(adapter.a, x, model.rank, d_in)
+            let mut new_b = t_zeros2(d_out, model.rank)
+            for i in 0..d_out {
+                for j in 0..model.rank {
+                    new_b[i][j] = adapter.b[i][j] - lr * w_e * s * dy[i] * ax[j]
+                }
+            }
+            let mut bdy = t_zeros1(model.rank)
+            for j in 0..model.rank {
+                let mut acc = 0.0
+                for i in 0..d_out { acc = acc + adapter.b[i][j] * dy[i] }
+                bdy[j] = acc
+            }
+            let mut new_a = t_zeros2(model.rank, d_in)
+            for i in 0..model.rank {
+                for j in 0..d_in {
+                    new_a[i][j] = adapter.a[i][j] - lr * w_e * s * bdy[i] * x[j]
+                }
+            }
+            let updated = TAdapter {
+                name: adapter.name, domain: adapter.domain,
+                a: new_a, b: new_b,
+                d_in: d_in, d_out: d_out,
+                rank: model.rank, alpha: adapter.alpha
+            }
+            new_adapters = new_adapters + [updated]
+        } else {
+            new_adapters = new_adapters + [adapter]
+        }
+    }
+
+    let mut new_rw = t_zeros2(model.n_adapters, d_in)
+    for i in 0..model.n_adapters {
+        for j in 0..d_in { new_rw[i][j] = model.router.w[i][j] }
+    }
+    for k in 0..model.top_k {
+        let idx = picks[k]
+        let adapter_out = t_adapter_forward(model.adapters[idx], x)
+        let mut contrib = 0.0
+        for d in 0..d_out { contrib = contrib + dy[d] * adapter_out[d] }
+        for j in 0..d_in {
+            new_rw[idx][j] = new_rw[idx][j] - lr * contrib * x[j]
+        }
+    }
+    let new_router = TRouter { w: new_rw, n_adapters: model.n_adapters, d_in: d_in }
+
+    let mut new_base = model.base_w
+    if model.frozen == 0 {
+        new_base = t_zeros2(d_out, d_in)
+        for i in 0..d_out {
+            for j in 0..d_in {
+                new_base[i][j] = model.base_w[i][j] - lr * dy[i] * x[j]
+            }
+        }
+    }
+
+    let new_model = TModel {
+        adapters: new_adapters, router: new_router, base_w: new_base,
+        d_in: d_in, d_out: d_out, rank: model.rank,
+        n_adapters: model.n_adapters, top_k: model.top_k,
+        frozen: model.frozen
+    }
+    return [new_model, loss]
+}
+
+fn t_freeze_base(model: TModel) {
+    return TModel {
+        adapters: model.adapters, router: model.router, base_w: model.base_w,
+        d_in: model.d_in, d_out: model.d_out, rank: model.rank,
+        n_adapters: model.n_adapters, top_k: model.top_k, frozen: 1
+    }
+}
+
+fn t_merge_adapters(model: TModel) {
+    let d = model.d_out
+    let mut merged = t_zeros2(d, model.d_in)
+    for i in 0..d {
+        for j in 0..model.d_in { merged[i][j] = model.base_w[i][j] }
+    }
+    let inv_n = 1.0 / to_float(model.n_adapters)
+    for e in 0..model.n_adapters {
+        let adapter = model.adapters[e]
+        let s = t_scale(adapter.alpha, adapter.rank)
+        for i in 0..d {
+            for j in 0..model.d_in {
+                let mut val = 0.0
+                for r in 0..adapter.rank {
+                    val = val + adapter.b[i][r] * adapter.a[r][j]
+                }
+                merged[i][j] = merged[i][j] + inv_n * s * val
+            }
+        }
+    }
+    return merged
+}
+
+fn t_add_adapter(model: TModel, name, domain, alpha, seed) {
+    let new_adapter = t_create_adapter(
+        name, domain, model.d_in, model.d_out, model.rank, alpha, seed
+    )
+    let new_adapters = model.adapters + [new_adapter]
+    let new_n = model.n_adapters + 1
+
+    let mut new_rw = []
+    for i in 0..model.n_adapters { new_rw = new_rw + [model.router.w[i]] }
+    let new_row_mat = t_kaiming(1, model.d_in, seed + 31337)
+    new_rw = new_rw + [new_row_mat[0]]
+    let new_router = TRouter { w: new_rw, n_adapters: new_n, d_in: model.d_in }
+
+    return TModel {
+        adapters: new_adapters, router: new_router, base_w: model.base_w,
+        d_in: model.d_in, d_out: model.d_out, rank: model.rank,
+        n_adapters: new_n, top_k: model.top_k, frozen: model.frozen
+    }
+}
+
+fn t_remove_adapter(model: TModel, adapter_idx) {
+    let mut new_adapters = []
+    let mut new_rw = []
+    for i in 0..model.n_adapters {
+        if i != adapter_idx {
+            new_adapters = new_adapters + [model.adapters[i]]
+            new_rw = new_rw + [model.router.w[i]]
+        }
+    }
+    let new_n = model.n_adapters - 1
+    let new_router = TRouter { w: new_rw, n_adapters: new_n, d_in: model.d_in }
+    return TModel {
+        adapters: new_adapters, router: new_router, base_w: model.base_w,
+        d_in: model.d_in, d_out: model.d_out, rank: model.rank,
+        n_adapters: new_n, top_k: model.top_k, frozen: model.frozen
+    }
+}
+
+fn t_param_count(model: TModel) {
+    let mut adapter_params = 0
+    for i in 0..model.n_adapters {
+        let a = model.adapters[i]
+        adapter_params = adapter_params + a.rank * a.d_in + a.d_out * a.rank
+    }
+    let router_params = model.n_adapters * model.d_in
+    return adapter_params + router_params
+}
+
+fn t_adapter_overlap(model: TModel, x1, x2) {
+    let logits1 = t_router_logits(model.router, x1)
+    let logits2 = t_router_logits(model.router, x2)
+    let picks1 = t_topk_indices(logits1, model.n_adapters, model.top_k)
+    let picks2 = t_topk_indices(logits2, model.n_adapters, model.top_k)
+
+    let mut overlap = 0
+    for i in 0..model.top_k {
+        for j in 0..model.top_k {
+            if picks1[i] == picks2[j] { overlap = overlap + 1 }
+        }
+    }
+    return to_float(overlap) / to_float(model.top_k)
+}
+
+fn t_load_balance_loss(model: TModel, inputs, n_inputs) {
+    let mut f_counts = t_zeros1(model.n_adapters)
+    let mut p_sum = t_zeros1(model.n_adapters)
+
+    for t in 0..n_inputs {
+        let x = inputs[t]
+        let logits = t_router_logits(model.router, x)
+        let probs = t_softmax_all(logits, model.n_adapters)
+        let picks = t_topk_indices(logits, model.n_adapters, model.top_k)
+
+        for e in 0..model.n_adapters {
+            p_sum[e] = p_sum[e] + probs[e]
+        }
+        for k in 0..model.top_k {
+            let idx = picks[k]
+            f_counts[idx] = f_counts[idx] + 1.0
+        }
+    }
+
+    let n_f = to_float(n_inputs)
+    let mut loss = 0.0
+    for e in 0..model.n_adapters {
+        let f_e = f_counts[e] / n_f
+        let p_e = p_sum[e] / n_f
+        loss = loss + f_e * p_e
+    }
+    return to_float(model.n_adapters) * loss
+}
+
+fn t_adapter_utilization(model: TModel, inputs, n_inputs) {
+    let mut counts = t_zeros1(model.n_adapters)
+    for t in 0..n_inputs {
+        let x = inputs[t]
+        let logits = t_router_logits(model.router, x)
+        let picks = t_topk_indices(logits, model.n_adapters, model.top_k)
+        for k in 0..model.top_k {
+            let idx = picks[k]
+            counts[idx] = counts[idx] + 1.0
+        }
+    }
+    return counts
+}
+
+fn t_specialization_score(model: TModel, inputs, labels, n_inputs, n_clusters) {
+    let mut counts = []
+    for a in 0..model.n_adapters {
+        counts = counts + [t_zeros1(n_clusters)]
+    }
+
+    for t in 0..n_inputs {
+        let x = inputs[t]
+        let cluster = labels[t]
+        let logits = t_router_logits(model.router, x)
+        let picks = t_topk_indices(logits, model.n_adapters, model.top_k)
+        for k in 0..model.top_k {
+            let idx = picks[k]
+            counts[idx][cluster] = counts[idx][cluster] + 1.0
+        }
+    }
+
+    let mut scores = t_zeros1(model.n_adapters)
+    for a in 0..model.n_adapters {
+        let mut total = 0.0
+        let mut mx = 0.0
+        for c in 0..n_clusters {
+            total = total + counts[a][c]
+            if counts[a][c] > mx { mx = counts[a][c] }
+        }
+        if total > 0.0 {
+            scores[a] = mx / total
+        } else {
+            scores[a] = 0.0
+        }
+    }
+    return scores
+}
+
+fn t_set_alpha(model: TModel, adapter_idx, new_alpha) {
+    let mut new_adapters = []
+    for i in 0..model.n_adapters {
+        if i == adapter_idx {
+            let a = model.adapters[i]
+            let updated = TAdapter {
+                name: a.name, domain: a.domain,
+                a: a.a, b: a.b,
+                d_in: a.d_in, d_out: a.d_out,
+                rank: a.rank, alpha: new_alpha
+            }
+            new_adapters = new_adapters + [updated]
+        } else {
+            new_adapters = new_adapters + [model.adapters[i]]
+        }
+    }
+    return TModel {
+        adapters: new_adapters, router: model.router, base_w: model.base_w,
+        d_in: model.d_in, d_out: model.d_out, rank: model.rank,
+        n_adapters: model.n_adapters, top_k: model.top_k, frozen: model.frozen
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Test data
+// ═══════════════════════════════════════════════════════════════
+
+let DIM = 4
+let RANK = 2
+let N_ADAPTERS = 4
+let TOP_K = 2
+
+let DOMAINS = ["math", "code", "text", "vision"]
+
+let x1 = [1.0, 0.5, -0.3, 0.8]
+let x2 = [-0.5, 1.0, 0.2, -0.7]
+let x3 = [0.3, -0.8, 0.6, 0.1]
+
+let target1 = [0.5, -0.3, 0.1, 0.7]
+
+// ═══════════════════════════════════════════════════════════════
+//  Tests
+// ═══════════════════════════════════════════════════════════════
+
+// --- #1 zeros helpers ---
+let z1 = t_zeros1(4)
+let z2 = t_zeros2(3, 4)
+check("#1a zeros1 len=4", len(z1) == 4)
+check("#1b zeros1[0]=0", approx(z1[0], 0.0, 1.0e-9))
+check("#1c zeros2 rows=3", len(z2) == 3)
+check("#1d zeros2 cols=4", len(z2[0]) == 4)
+check("#1e zeros2[1][2]=0", approx(z2[1][2], 0.0, 1.0e-9))
+
+// --- #2 kaiming shape + deterministic ---
+let k1 = t_kaiming(3, 4, 42)
+let k2 = t_kaiming(3, 4, 42)
+check("#2a kaiming rows=3", len(k1) == 3)
+check("#2b kaiming cols=4", len(k1[0]) == 4)
+let mut k_eq = true
+for i in 0..3 {
+    for j in 0..4 {
+        if !approx(k1[i][j], k2[i][j], 1.0e-9) { k_eq = false }
+    }
+}
+check("#2c kaiming deterministic", k_eq)
+
+// --- #3 matvec correctness ---
+let mv_w = [[1.0, 2.0], [3.0, 4.0]]
+let mv_x = [1.0, 1.0]
+let mv_y = t_matvec(mv_w, mv_x, 2, 2)
+check("#3a matvec[0]=3", approx(mv_y[0], 3.0, 1.0e-9))
+check("#3b matvec[1]=7", approx(mv_y[1], 7.0, 1.0e-9))
+
+// --- #4 create_adapter shape + fields ---
+let a1 = t_create_adapter("test", "math", DIM, DIM, RANK, 1.0, 42)
+check("#4a adapter name", a1.name == "test")
+check("#4b adapter domain", a1.domain == "math")
+check("#4c adapter A rows=rank", len(a1.a) == RANK)
+check("#4d adapter A cols=d_in", len(a1.a[0]) == DIM)
+check("#4e adapter B rows=d_out", len(a1.b) == DIM)
+check("#4f adapter B cols=rank", len(a1.b[0]) == RANK)
+check("#4g adapter alpha", approx(a1.alpha, 1.0, 1.0e-9))
+
+// --- #5 adapter B init = zeros ---
+let mut b_zero = true
+for i in 0..DIM {
+    for j in 0..RANK {
+        if !approx(a1.b[i][j], 0.0, 1.0e-9) { b_zero = false }
+    }
+}
+check("#5 adapter B init = zeros", b_zero)
+
+// --- #6 adapter_forward with B=0 => zero delta ---
+let af_out = t_adapter_forward(a1, x1)
+let mut af_zero = true
+for d in 0..DIM {
+    if !approx(af_out[d], 0.0, 1.0e-9) { af_zero = false }
+}
+check("#6 adapter_forward B=0 => zero delta", af_zero)
+
+// --- #7 adapter_forward output dimension ---
+check("#7 adapter_forward output dim", len(af_out) == DIM)
+
+// --- #8 create_router shape ---
+let r1 = t_create_router(N_ADAPTERS, DIM, 123)
+check("#8a router W rows = n_adapters", len(r1.w) == N_ADAPTERS)
+check("#8b router W cols = d_in", len(r1.w[0]) == DIM)
+check("#8c router n_adapters", r1.n_adapters == N_ADAPTERS)
+
+// --- #9 router_logits output dimension ---
+let logits1 = t_router_logits(r1, x1)
+check("#9 router logits len = n_adapters", len(logits1) == N_ADAPTERS)
+
+// --- #10 topk_indices correctness ---
+let scores10 = [0.1, 0.9, 0.3, 0.7]
+let picks10 = t_topk_indices(scores10, 4, 2)
+check("#10a top-1 index = 1 (highest)", picks10[0] == 1)
+check("#10b top-2 index = 3 (second)", picks10[1] == 3)
+
+// --- #11 softmax_subset sums to 1 ---
+let sw11 = t_softmax_subset(scores10, picks10, 2)
+let sw_sum = sw11[0] + sw11[1]
+check("#11 softmax subset sum ~ 1.0", approx(sw_sum, 1.0, 1.0e-6))
+
+// --- #12 route returns valid indices + weights ---
+let route12 = t_route(r1, x1, TOP_K)
+let picks12 = route12[0]
+let weights12 = route12[1]
+check("#12a route returns top_k picks", len(picks12) == TOP_K)
+check("#12b route returns top_k weights", len(weights12) == TOP_K)
+let mut picks_valid = true
+for k in 0..TOP_K {
+    if picks12[k] < 0 { picks_valid = false }
+    if picks12[k] >= N_ADAPTERS { picks_valid = false }
+}
+check("#12c route picks in [0, n_adapters)", picks_valid)
+let w_sum12 = weights12[0] + weights12[1]
+check("#12d route weights sum ~ 1.0", approx(w_sum12, 1.0, 1.0e-6))
+
+// --- #13 create model structure ---
+let model = t_create_model(DIM, DIM, RANK, N_ADAPTERS, TOP_K, DOMAINS)
+check("#13a model adapters count", len(model.adapters) == N_ADAPTERS)
+check("#13b model d_in", model.d_in == DIM)
+check("#13c model d_out", model.d_out == DIM)
+check("#13d model rank", model.rank == RANK)
+check("#13e model n_adapters", model.n_adapters == N_ADAPTERS)
+check("#13f model top_k", model.top_k == TOP_K)
+check("#13g model not frozen", model.frozen == 0)
+
+// --- #14 forward output dimension ---
+let y14 = t_forward(model, x1)
+check("#14 forward output dim", len(y14) == DIM)
+
+// --- #15 forward deterministic ---
+let y15a = t_forward(model, x1)
+let y15b = t_forward(model, x1)
+let mut det_ok = true
+for d in 0..DIM {
+    if !approx(y15a[d], y15b[d], 1.0e-9) { det_ok = false }
+}
+check("#15 forward deterministic", det_ok)
+
+// --- #16 forward non-zero output ---
+let mut nz = false
+for d in 0..DIM {
+    if fabs(y14[d]) > 1.0e-9 { nz = true }
+}
+check("#16 forward non-zero output", nz)
+
+// --- #17 load_balance_loss non-negative ---
+let inputs17 = [x1, x2, x3]
+let lb_loss = t_load_balance_loss(model, inputs17, 3)
+check("#17 load_balance_loss >= 0", lb_loss >= 0.0)
+
+// --- #18 adapter_utilization counts sum = n_inputs * top_k ---
+let util18 = t_adapter_utilization(model, inputs17, 3)
+let mut util_sum = 0.0
+for e in 0..N_ADAPTERS { util_sum = util_sum + util18[e] }
+check("#18 utilization sum = n_inputs * top_k", approx(util_sum, to_float(3 * TOP_K), 1.0e-9))
+
+// --- #19 train_step returns loss > 0 ---
+let res19 = t_train_step(model, x1, target1, 0.01)
+let model19 = res19[0]
+let loss19 = res19[1]
+check("#19 train_step loss > 0", loss19 > 0.0)
+
+// --- #20 train_step loss decreases ---
+let y20_before = t_forward(model, x1)
+let loss20_before = t_mse_loss(y20_before, target1, DIM)
+let y20_after = t_forward(model19, x1)
+let loss20_after = t_mse_loss(y20_after, target1, DIM)
+check("#20 one step reduces loss", loss20_after < loss20_before)
+
+// --- #21 freeze_base sets frozen flag ---
+let frozen_model = t_freeze_base(model)
+check("#21a frozen flag = 1", frozen_model.frozen == 1)
+check("#21b other fields preserved", frozen_model.d_in == DIM)
+
+// --- #22 merge_adapters shape ---
+let merged = t_merge_adapters(model)
+check("#22a merged rows = d_out", len(merged) == DIM)
+check("#22b merged cols = d_in", len(merged[0]) == DIM)
+
+// --- #23 add_adapter increases n_adapters ---
+let model_added = t_add_adapter(model, "new_adapter", "audio", 1.0, 5555)
+check("#23a n_adapters increased", model_added.n_adapters == N_ADAPTERS + 1)
+check("#23b adapters array grew", len(model_added.adapters) == N_ADAPTERS + 1)
+check("#23c router rows grew", len(model_added.router.w) == N_ADAPTERS + 1)
+
+// --- #24 remove_adapter decreases n_adapters ---
+let model_removed = t_remove_adapter(model, 1)
+check("#24a n_adapters decreased", model_removed.n_adapters == N_ADAPTERS - 1)
+check("#24b adapters array shrunk", len(model_removed.adapters) == N_ADAPTERS - 1)
+check("#24c router rows shrunk", len(model_removed.router.w) == N_ADAPTERS - 1)
+
+// --- #25 param_count formula ---
+// each adapter: rank*d_in + d_out*rank = 2*4 + 4*2 = 16, x4 = 64
+// router: 4*4 = 16, total = 80
+let pc = t_param_count(model)
+check("#25 param_count = 80", pc == 80)
+
+// --- #26 adapter_overlap self = 1.0 ---
+let ov_self = t_adapter_overlap(model, x1, x1)
+check("#26 self-overlap = 1.0", approx(ov_self, 1.0, 1.0e-9))
+
+// --- #27 adapter_overlap range [0, 1] ---
+let ov27 = t_adapter_overlap(model, x1, x2)
+check("#27a overlap >= 0", ov27 >= 0.0)
+check("#27b overlap <= 1", ov27 <= 1.0 + 1.0e-9)
+
+// --- #28 multi-step training convergence ---
+let mut model28 = t_create_model(DIM, DIM, RANK, N_ADAPTERS, TOP_K, DOMAINS)
+let y28_init = t_forward(model28, x1)
+let loss28_init = t_mse_loss(y28_init, target1, DIM)
+
+let mut step28 = 0
+while step28 < 50 {
+    let res28 = t_train_step(model28, x1, target1, 0.05)
+    model28 = res28[0]
+    step28 = step28 + 1
+}
+let y28_final = t_forward(model28, x1)
+let loss28_final = t_mse_loss(y28_final, target1, DIM)
+check("#28a 50 steps reduce loss", loss28_final < loss28_init)
+check("#28b 50 steps loss < 50% init", loss28_final < 0.5 * loss28_init)
+
+// --- #29 frozen base weights unchanged after train step ---
+let frozen29 = t_freeze_base(model)
+let base_before = frozen29.base_w
+let res29 = t_train_step(frozen29, x1, target1, 0.1)
+let model29 = res29[0]
+let base_after = model29.base_w
+let mut base_unchanged = true
+for i in 0..DIM {
+    for j in 0..DIM {
+        if !approx(base_before[i][j], base_after[i][j], 1.0e-9) { base_unchanged = false }
+    }
+}
+check("#29 frozen base unchanged after step", base_unchanged)
+
+// --- #30 different inputs can route to different adapters ---
+let shared_router = t_create_router(N_ADAPTERS, DIM, 7777)
+let route30a = t_route(shared_router, x1, TOP_K)
+let route30b = t_route(shared_router, x2, TOP_K)
+let picks30a = route30a[0]
+let picks30b = route30b[0]
+let mut any_diff = false
+for k in 0..TOP_K {
+    if picks30a[k] != picks30b[k] { any_diff = true }
+}
+check("#30 different inputs route differently", any_diff)
+
+// --- #31 per-adapter alpha scaling ---
+let model31 = t_set_alpha(model, 0, 2.0)
+check("#31a alpha changed", approx(model31.adapters[0].alpha, 2.0, 1.0e-9))
+check("#31b others unchanged", approx(model31.adapters[1].alpha, 1.0, 1.0e-9))
+
+// --- #32 specialization score range ---
+let spec_inputs = [x1, x2, x3, x1, x2, x3]
+let spec_labels = [0, 1, 0, 0, 1, 1]
+let spec_scores = t_specialization_score(model, spec_inputs, spec_labels, 6, 2)
+let mut spec_valid = true
+for a in 0..N_ADAPTERS {
+    if spec_scores[a] < 0.0 { spec_valid = false }
+    if spec_scores[a] > 1.0 + 1.0e-9 { spec_valid = false }
+}
+check("#32 specialization scores in [0, 1]", spec_valid)
+
+// --- #33 domain tags preserved ---
+check("#33a domain[0]", model.adapters[0].domain == "math")
+check("#33b domain[1]", model.adapters[1].domain == "code")
+check("#33c domain[2]", model.adapters[2].domain == "text")
+check("#33d domain[3]", model.adapters[3].domain == "vision")
+
+// ═══════════════════════════════════════════════════════════════
+println("")
+println("mixture_of_lora: " + to_string(pass_count) + " PASS / " + to_string(fail_count) + " FAIL")

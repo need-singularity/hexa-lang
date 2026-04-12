@@ -1,0 +1,571 @@
+// ===================================================================
+//  self/ml/activation_beacon.hexa — Activation Beacon (#336)
+//
+//  Activation Beacon compresses KV cache by inserting special
+//  "beacon" tokens at regular intervals. Each beacon attends to
+//  all tokens in its segment and produces a compressed summary KV.
+//  The original KV entries are then replaced by the beacon KVs,
+//  achieving context length extension up to 100x.
+//
+//  Implements:
+//    1. Beacon token insertion — insert beacon at every interval
+//    2. Beacon attention — beacon summarises its segment via
+//       weighted aggregation of segment keys/values
+//    3. Multi-ratio beacons — support 2x, 4x, 8x compression
+//    4. KV cache replacement — swap original KVs for beacon KVs
+//    5. Compressed attention — query against beacon KV cache
+//    6. Full pipeline — insert, summarise, replace, attend
+//    7. Quality metric — cosine similarity between full and
+//       compressed attention output
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+//    @hot   — performance-critical path
+// ===================================================================
+
+// ===================================================================
+//  Utility helpers (ab_ prefix to avoid collisions)
+// ===================================================================
+
+fn ab_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn ab_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn ab_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn ab_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+fn ab_ones(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [1.0] }
+    return v
+}
+
+fn ab_max_f(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn ab_min_f(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn ab_min_i(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn ab_max_i(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn ab_exp_approx(x) {
+    let mut clamped = x
+    if clamped > 20.0 { clamped = 20.0 }
+    if clamped < -20.0 { clamped = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..25 {
+        term = term * clamped / to_float(i)
+        result = result + term
+    }
+    if result < 1.0e-30 { return 1.0e-30 }
+    return result
+}
+
+fn ab_log_approx(x) {
+    if x <= 0.0 { return -30.0 }
+    let mut val = x
+    let mut adjust = 0.0
+    while val > 2.0 {
+        val = val / 2.718281828
+        adjust = adjust + 1.0
+    }
+    while val < 0.5 {
+        val = val * 2.718281828
+        adjust = adjust - 1.0
+    }
+    let y = (val - 1.0) / (val + 1.0)
+    let y2 = y * y
+    let mut s = y
+    let mut t = y
+    for i in 0..8 {
+        t = t * y2
+        let denom = to_float(2 * i + 3)
+        s = s + t / denom
+    }
+    return 2.0 * s + adjust
+}
+
+fn ab_sin_approx(x) {
+    let mut v = x
+    while v > 3.14159265 { v = v - 6.28318530 }
+    while v < -3.14159265 { v = v + 6.28318530 }
+    let x2 = v * v
+    let mut r = v
+    let mut term = v
+    term = term * (0.0 - x2) / 6.0
+    r = r + term
+    term = term * (0.0 - x2) / 20.0
+    r = r + term
+    term = term * (0.0 - x2) / 42.0
+    r = r + term
+    return r
+}
+
+fn ab_cos_approx(x) {
+    return ab_sin_approx(x + 1.5707963)
+}
+
+// Dot product
+@pure
+fn ab_dot(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    for i in 0..n {
+        s = s + a[i] * b[i]
+    }
+    return s
+}
+
+// Vector norm
+@pure
+fn ab_norm(v) {
+    return ab_sqrt(ab_dot(v, v))
+}
+
+// Cosine similarity
+@pure
+fn ab_cosine_sim(a, b) {
+    let na = ab_norm(a)
+    let nb = ab_norm(b)
+    if na < 1.0e-12 { return 0.0 }
+    if nb < 1.0e-12 { return 0.0 }
+    return ab_dot(a, b) / (na * nb)
+}
+
+// Softmax over raw scores
+@pure
+fn ab_softmax(scores) {
+    let n = len(scores)
+    if n == 0 { return [] }
+    let mut mx = scores[0]
+    for i in 1..n {
+        if scores[i] > mx { mx = scores[i] }
+    }
+    let mut exps = ab_zeros(n)
+    let mut total = 0.0
+    for i in 0..n {
+        let e = ab_exp_approx(scores[i] - mx)
+        exps[i] = e
+        total = total + e
+    }
+    if total < 1.0e-30 { total = 1.0e-30 }
+    let mut out = ab_zeros(n)
+    for i in 0..n {
+        out[i] = exps[i] / total
+    }
+    return out
+}
+
+// ===================================================================
+//  1. KV Cache data structure for Activation Beacon
+//
+//  #{
+//    "keys":       [[dim floats], ...],
+//    "values":     [[dim floats], ...],
+//    "dim":        int,
+//    "seq_len":    int           // number of tokens inserted
+//  }
+// ===================================================================
+
+fn ab_create_cache(dim) {
+    return #{
+        "keys": [],
+        "values": [],
+        "dim": dim,
+        "seq_len": 0
+    }
+}
+
+fn ab_cache_size(cache) {
+    return len(cache["keys"])
+}
+
+// Insert a KV pair into cache
+fn ab_cache_insert(cache, key_vec, val_vec) {
+    let mut c = cache
+    let mut ks = c["keys"]
+    ks = ks + [key_vec]
+    c["keys"] = ks
+    let mut vs = c["values"]
+    vs = vs + [val_vec]
+    c["values"] = vs
+    c["seq_len"] = c["seq_len"] + 1
+    return c
+}
+
+// Insert multiple KV pairs
+fn ab_cache_insert_batch(cache, keys_list, vals_list) {
+    let mut c = cache
+    let n = len(keys_list)
+    for i in 0..n {
+        c = ab_cache_insert(c, keys_list[i], vals_list[i])
+    }
+    return c
+}
+
+// ===================================================================
+//  2. Beacon Token Insertion
+//     Insert a beacon token at every `interval` positions.
+//     The beacon token is a learnable vector that will aggregate
+//     information from its segment.
+//
+//     Given a sequence of KV pairs, returns positions where
+//     beacons should be placed and generates beacon embeddings.
+// ===================================================================
+
+// Compute beacon positions for a given sequence length and interval
+@pure
+fn ab_beacon_positions(seq_len, interval) {
+    let mut positions = []
+    let mut pos = interval
+    while pos <= seq_len {
+        positions = positions + [pos]
+        pos = pos + interval
+    }
+    return positions
+}
+
+// Generate a beacon embedding (learnable init, here use mean of segment)
+@pure
+fn ab_beacon_embedding(keys, seg_start, seg_end, dim) {
+    let count = seg_end - seg_start
+    if count <= 0 { return ab_zeros(dim) }
+    let mut emb = ab_zeros(dim)
+    for i in seg_start..seg_end {
+        let k = keys[i]
+        for d in 0..dim {
+            emb[d] = emb[d] + k[d]
+        }
+    }
+    let cf = to_float(count)
+    for d in 0..dim {
+        emb[d] = emb[d] / cf
+    }
+    return emb
+}
+
+// ===================================================================
+//  3. Beacon Attention
+//     Each beacon attends to all tokens in its segment via
+//     scaled dot-product attention. The beacon query is the
+//     beacon embedding, keys/values are from the segment.
+//     Output: compressed KV pair for that segment.
+// ===================================================================
+
+// Beacon attends to segment, producing a single compressed K and V
+@pure @hot
+fn ab_beacon_attend(beacon_query, seg_keys, seg_vals, dim) {
+    let n = len(seg_keys)
+    if n == 0 { return [ab_zeros(dim), ab_zeros(dim)] }
+
+    // Scaled dot-product attention scores
+    let scale = 1.0 / ab_sqrt(to_float(dim))
+    let mut scores = ab_zeros(n)
+    for i in 0..n {
+        scores[i] = ab_dot(beacon_query, seg_keys[i]) * scale
+    }
+
+    // Softmax
+    let weights = ab_softmax(scores)
+
+    // Weighted sum of keys -> compressed key
+    let mut comp_key = ab_zeros(dim)
+    for i in 0..n {
+        let k = seg_keys[i]
+        for d in 0..dim {
+            comp_key[d] = comp_key[d] + weights[i] * k[d]
+        }
+    }
+
+    // Weighted sum of values -> compressed value
+    let mut comp_val = ab_zeros(dim)
+    for i in 0..n {
+        let v = seg_vals[i]
+        for d in 0..dim {
+            comp_val[d] = comp_val[d] + weights[i] * v[d]
+        }
+    }
+
+    return [comp_key, comp_val]
+}
+
+// ===================================================================
+//  4. Multi-Ratio Beacons
+//     Support multiple compression ratios (2x, 4x, 8x).
+//     Each ratio has its own interval. Beacons at different
+//     ratios compress different granularities.
+//
+//     ratios: [2, 4, 8] means intervals of 2, 4, 8 tokens
+//     Returns list of beacon KV pairs for each ratio.
+// ===================================================================
+
+// Compress a full KV cache at a given ratio (interval)
+@pure
+fn ab_compress_at_ratio(cache, ratio) {
+    let keys = cache["keys"]
+    let vals = cache["values"]
+    let dim = cache["dim"]
+    let n = len(keys)
+
+    let positions = ab_beacon_positions(n, ratio)
+    let mut comp_keys = []
+    let mut comp_vals = []
+
+    let n_beacons = len(positions)
+    for bi in 0..n_beacons {
+        let seg_end = positions[bi]
+        let mut seg_start = 0
+        if bi > 0 {
+            seg_start = positions[bi - 1]
+        }
+        // Clamp
+        let actual_start = ab_max_i(seg_start, 0)
+        let actual_end = ab_min_i(seg_end, n)
+
+        // Extract segment keys/values
+        let mut sk = []
+        let mut sv = []
+        for j in actual_start..actual_end {
+            sk = sk + [keys[j]]
+            sv = sv + [vals[j]]
+        }
+
+        // Beacon embedding from segment keys
+        let beacon_q = ab_beacon_embedding(keys, actual_start, actual_end, dim)
+
+        // Beacon attention
+        let kv = ab_beacon_attend(beacon_q, sk, sv, dim)
+        comp_keys = comp_keys + [kv[0]]
+        comp_vals = comp_vals + [kv[1]]
+    }
+
+    return #{"keys": comp_keys, "values": comp_vals, "ratio": ratio, "n_beacons": n_beacons}
+}
+
+// Multi-ratio compression: compress at each ratio
+@pure
+fn ab_multi_ratio_compress(cache, ratios) {
+    let mut results = []
+    let n_ratios = len(ratios)
+    for ri in 0..n_ratios {
+        let r = ratios[ri]
+        let comp = ab_compress_at_ratio(cache, r)
+        results = results + [comp]
+    }
+    return results
+}
+
+// ===================================================================
+//  5. KV Cache Replacement
+//     Replace original KV entries with beacon KV entries.
+//     Build a new cache from compressed beacon KVs.
+// ===================================================================
+
+fn ab_replace_cache(cache, compressed) {
+    let dim = cache["dim"]
+    let mut new_cache = ab_create_cache(dim)
+    let comp_keys = compressed["keys"]
+    let comp_vals = compressed["values"]
+    let n = len(comp_keys)
+    for i in 0..n {
+        new_cache = ab_cache_insert(new_cache, comp_keys[i], comp_vals[i])
+    }
+    return new_cache
+}
+
+// Merge multiple compression levels: concatenate all beacon KVs
+fn ab_merge_multi_ratio(cache, multi_compressed) {
+    let dim = cache["dim"]
+    let mut new_cache = ab_create_cache(dim)
+    let n_levels = len(multi_compressed)
+    for li in 0..n_levels {
+        let comp = multi_compressed[li]
+        let ck = comp["keys"]
+        let cv = comp["values"]
+        let n = len(ck)
+        for i in 0..n {
+            new_cache = ab_cache_insert(new_cache, ck[i], cv[i])
+        }
+    }
+    return new_cache
+}
+
+// ===================================================================
+//  6. Compressed Attention
+//     Standard scaled dot-product attention against a (compressed)
+//     KV cache. Used for inference after beacon compression.
+// ===================================================================
+
+@pure @hot
+fn ab_compressed_attention(query, cache) {
+    let keys = cache["keys"]
+    let vals = cache["values"]
+    let dim = cache["dim"]
+    let n = ab_cache_size(cache)
+
+    if n == 0 { return ab_zeros(dim) }
+
+    let scale = 1.0 / ab_sqrt(to_float(dim))
+    let mut scores = ab_zeros(n)
+    for i in 0..n {
+        scores[i] = ab_dot(query, keys[i]) * scale
+    }
+
+    let weights = ab_softmax(scores)
+
+    let mut out = ab_zeros(dim)
+    for i in 0..n {
+        let v = vals[i]
+        for d in 0..dim {
+            out[d] = out[d] + weights[i] * v[d]
+        }
+    }
+    return out
+}
+
+// Full attention on original (uncompressed) cache
+@pure @hot
+fn ab_full_attention(query, cache) {
+    return ab_compressed_attention(query, cache)
+}
+
+// ===================================================================
+//  7. Full Activation Beacon Pipeline
+//     1. Build KV cache from token sequence
+//     2. Compress via beacon at given ratio(s)
+//     3. Replace original cache with compressed
+//     4. Run attention queries on compressed cache
+//     5. Compare quality vs full attention (cosine similarity)
+// ===================================================================
+
+// Build a synthetic KV cache with n_tokens entries
+fn ab_build_synthetic_cache(n_tokens, dim) {
+    let mut cache = ab_create_cache(dim)
+    for t in 0..n_tokens {
+        let tf = to_float(t)
+        let mut key_vec = ab_zeros(dim)
+        let mut val_vec = ab_zeros(dim)
+        for d in 0..dim {
+            let df = to_float(d)
+            key_vec[d] = ab_sin_approx(tf * 0.1 + df * 0.3)
+            val_vec[d] = ab_cos_approx(tf * 0.2 + df * 0.1)
+        }
+        cache = ab_cache_insert(cache, key_vec, val_vec)
+    }
+    return cache
+}
+
+// Pipeline: compress + compare
+fn ab_pipeline(n_tokens, dim, ratio) {
+    let cache = ab_build_synthetic_cache(n_tokens, dim)
+
+    // Full attention output for reference
+    let mut query = ab_zeros(dim)
+    for d in 0..dim {
+        query[d] = ab_sin_approx(to_float(d) * 0.5)
+    }
+    let full_out = ab_full_attention(query, cache)
+
+    // Compress at given ratio
+    let compressed = ab_compress_at_ratio(cache, ratio)
+    let comp_cache = ab_replace_cache(cache, compressed)
+
+    // Compressed attention output
+    let comp_out = ab_compressed_attention(query, comp_cache)
+
+    // Quality: cosine similarity
+    let sim = ab_cosine_sim(full_out, comp_out)
+
+    let orig_size = ab_cache_size(cache)
+    let comp_size = ab_cache_size(comp_cache)
+
+    return #{
+        "original_size": orig_size,
+        "compressed_size": comp_size,
+        "compression_ratio": to_float(orig_size) / ab_max_f(to_float(comp_size), 1.0),
+        "cosine_similarity": sim,
+        "full_output": full_out,
+        "compressed_output": comp_out
+    }
+}
+
+// Multi-ratio pipeline
+fn ab_pipeline_multi(n_tokens, dim, ratios) {
+    let cache = ab_build_synthetic_cache(n_tokens, dim)
+
+    let mut query = ab_zeros(dim)
+    for d in 0..dim {
+        query[d] = ab_sin_approx(to_float(d) * 0.5)
+    }
+    let full_out = ab_full_attention(query, cache)
+
+    let multi_comp = ab_multi_ratio_compress(cache, ratios)
+    let merged_cache = ab_merge_multi_ratio(cache, multi_comp)
+    let merged_out = ab_compressed_attention(query, merged_cache)
+
+    let sim = ab_cosine_sim(full_out, merged_out)
+
+    return #{
+        "original_size": ab_cache_size(cache),
+        "merged_size": ab_cache_size(merged_cache),
+        "cosine_similarity": sim,
+        "n_ratios": len(ratios)
+    }
+}
+
+// ===================================================================
+//  8. Diagnostics
+// ===================================================================
+@pure
+fn ab_cache_stats(cache) {
+    let n = ab_cache_size(cache)
+    let dim = cache["dim"]
+    let mut total_norm = 0.0
+    let keys = cache["keys"]
+    for i in 0..n {
+        total_norm = total_norm + ab_norm(keys[i])
+    }
+    let mut avg_norm = 0.0
+    if n > 0 { avg_norm = total_norm / to_float(n) }
+    return #{
+        "size": n,
+        "dim": dim,
+        "avg_key_norm": avg_norm,
+        "seq_len": cache["seq_len"]
+    }
+}
+
+println("[activation_beacon] loaded — beacon insertion + beacon attention + multi-ratio (2x/4x/8x) + KV cache replacement + compressed attention + pipeline")

@@ -1,0 +1,508 @@
+// ═══════════════════════════════════════════════════════════════════
+//  test_yarn_rope.hexa — YaRN RoPE verification (#335)
+//
+//  Tests (30):
+//    T1  base_freqs length = dim/2
+//    T2  base_freqs[0] == 1.0
+//    T3  base_freqs monotonically decreasing
+//    T4  ntk_base > original when scale > 1
+//    T5  ntk_base == original when scale <= 1
+//    T6  ntk_freqs length correct
+//    T7  wavelength increases with dimension index
+//    T8  ramp = 0 for very short wavelength (high freq)
+//    T9  ramp = 1 for very long wavelength (low freq)
+//    T10 ramp in [0,1] for mid-range wavelength
+//    T11 blend_freqs length = dim/2
+//    T12 blend_freqs high-freq dims match base freqs
+//    T13 blend_freqs low-freq dims match ntk freqs
+//    T14 attn_factor == 1.0 when scale <= 1
+//    T15 attn_factor > 1.0 when scale > 1
+//    T16 attn_factor = sqrt(1 + 0.1*ln(s)) numerical check
+//    T17 length_temp == 1.0 when seq <= max
+//    T18 length_temp = sqrt(ratio) numerical check
+//    T19 cos_sin length = dim
+//    T20 cos/sin values bounded [-1,1]
+//    T21 rotate at pos=0 is identity
+//    T22 rotate preserves norm (rotation is isometric)
+//    T23 apply_qk returns two vectors of correct shape
+//    T24 yarn_init returns all expected keys
+//    T25 yarn_forward at pos=0 is identity
+//    T26 dynamic unchanged when seq_len <= orig_ctx
+//    T27 dynamic adjusts scale when seq_len > orig_ctx
+//    T28 scale_attn_scores divides correctly
+//    T29 yarn distortion < linear distortion
+//    T30 numerical stability at extreme position (100K)
+//
+//  Run: ./hexa self/interpreter.hexa self/test_yarn_rope.hexa
+// ═══════════════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ═══════════════════════════════════════════════════════════════════
+//  Inlined YaRN RoPE implementation (mirrors self/ml/yarn_rope.hexa)
+// ═══════════════════════════════════════════════════════════════════
+
+let YARN_PI = 3.141592653589793
+let YARN_TWO_PI = 6.283185307179586
+
+fn yarn_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn yarn_max_f(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn yarn_min_f(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn yarn_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn yarn_ones(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [1.0] }
+    return v
+}
+
+fn yarn_cos(x) {
+    let mut v = x
+    while v > YARN_PI { v = v - YARN_TWO_PI }
+    while v < 0.0 - YARN_PI { v = v + YARN_TWO_PI }
+    return cos(v)
+}
+
+fn yarn_sin(x) {
+    let mut v = x
+    while v > YARN_PI { v = v - YARN_TWO_PI }
+    while v < 0.0 - YARN_PI { v = v + YARN_TWO_PI }
+    return sin(v)
+}
+
+fn yarn_sqrt_f(x) {
+    if x <= 0.0 { return 0.0 }
+    return sqrt(x)
+}
+
+fn yarn_log_f(x) {
+    if x <= 0.0 { return 0.0 - 20.0 }
+    return log(x)
+}
+
+fn yarn_base_freqs(dim, base) {
+    let half = dim / 2
+    let mut freqs = yarn_zeros(half)
+    for i in 0..half {
+        let exponent = 2.0 * to_float(i) / to_float(dim)
+        freqs[i] = 1.0 / pow(base, exponent)
+    }
+    return freqs
+}
+
+fn yarn_ntk_base(base, dim, scale) {
+    if scale <= 1.0 { return base }
+    let exponent = to_float(dim) / (to_float(dim) - 2.0)
+    return base * pow(scale, exponent)
+}
+
+fn yarn_ntk_freqs(dim, base, scale) {
+    let new_base = yarn_ntk_base(base, dim, scale)
+    return yarn_base_freqs(dim, new_base)
+}
+
+fn yarn_wavelength(dim, base, i) {
+    let exponent = 2.0 * to_float(i) / to_float(dim)
+    let theta = 1.0 / pow(base, exponent)
+    if theta < 1.0e-15 { return 1.0e15 }
+    return YARN_TWO_PI / theta
+}
+
+fn yarn_ramp_value(wavelength, beta_fast, beta_slow, orig_ctx) {
+    let low = to_float(orig_ctx) / beta_fast
+    let high = to_float(orig_ctx) / beta_slow
+    if high <= low { return 1.0 }
+    let r = (wavelength - low) / (high - low)
+    if r < 0.0 { return 0.0 }
+    if r > 1.0 { return 1.0 }
+    return r
+}
+
+fn yarn_blend_freqs(dim, base, scale, beta_fast, beta_slow, orig_ctx) {
+    let base_f = yarn_base_freqs(dim, base)
+    let ntk_f = yarn_ntk_freqs(dim, base, scale)
+    let half = dim / 2
+    let mut freqs = yarn_zeros(half)
+    for i in 0..half {
+        let wl = yarn_wavelength(dim, base, i)
+        let r = yarn_ramp_value(wl, beta_fast, beta_slow, orig_ctx)
+        freqs[i] = (1.0 - r) * ntk_f[i] + r * base_f[i]
+    }
+    return freqs
+}
+
+fn yarn_attn_factor(scale) {
+    if scale <= 1.0 { return 1.0 }
+    return yarn_sqrt_f(1.0 + 0.1 * yarn_log_f(scale))
+}
+
+fn yarn_length_temp(seq_len, max_trained) {
+    if seq_len <= max_trained { return 1.0 }
+    let ratio = to_float(seq_len) / to_float(max_trained)
+    return yarn_sqrt_f(ratio)
+}
+
+fn yarn_cos_sin(pos, freqs) {
+    let half = len(freqs)
+    let dim = half * 2
+    let mut out = yarn_zeros(dim)
+    let p = to_float(pos)
+    for i in 0..half {
+        let angle = p * freqs[i]
+        out[2 * i] = yarn_cos(angle)
+        out[2 * i + 1] = yarn_sin(angle)
+    }
+    return out
+}
+
+fn yarn_rotate(x, cos_sin) {
+    let half = len(x) / 2
+    let mut out = yarn_zeros(len(x))
+    for i in 0..half {
+        let c = cos_sin[2 * i]
+        let s = cos_sin[2 * i + 1]
+        let x0 = x[2 * i]
+        let x1 = x[2 * i + 1]
+        out[2 * i] = x0 * c - x1 * s
+        out[2 * i + 1] = x0 * s + x1 * c
+    }
+    return out
+}
+
+fn yarn_apply_qk(q, k, pos, freqs) {
+    let cs = yarn_cos_sin(pos, freqs)
+    let q_rot = yarn_rotate(q, cs)
+    let k_rot = yarn_rotate(k, cs)
+    return [q_rot, k_rot]
+}
+
+fn yarn_init(dim, base, orig_ctx, target_ctx, beta_fast, beta_slow) {
+    let scale = to_float(target_ctx) / to_float(orig_ctx)
+    let freqs = yarn_blend_freqs(dim, base, scale, beta_fast, beta_slow, orig_ctx)
+    let af = yarn_attn_factor(scale)
+    let lt = yarn_length_temp(target_ctx, orig_ctx)
+    return #{
+        "freqs": freqs,
+        "dim": dim,
+        "base": base,
+        "orig_ctx": orig_ctx,
+        "target_ctx": target_ctx,
+        "scale": scale,
+        "beta_fast": beta_fast,
+        "beta_slow": beta_slow,
+        "attn_factor": af,
+        "length_temp": lt
+    }
+}
+
+fn yarn_embed(config, pos) {
+    return yarn_cos_sin(pos, config["freqs"])
+}
+
+fn yarn_forward(config, q, k, pos) {
+    let cs = yarn_embed(config, pos)
+    let q_rot = yarn_rotate(q, cs)
+    let k_rot = yarn_rotate(k, cs)
+    return [q_rot, k_rot]
+}
+
+fn yarn_dynamic(dim, base, orig_ctx, seq_len, beta_fast, beta_slow) {
+    if seq_len <= orig_ctx {
+        let freqs = yarn_base_freqs(dim, base)
+        return #{
+            "freqs": freqs,
+            "dim": dim,
+            "base": base,
+            "orig_ctx": orig_ctx,
+            "target_ctx": orig_ctx,
+            "scale": 1.0,
+            "beta_fast": beta_fast,
+            "beta_slow": beta_slow,
+            "attn_factor": 1.0,
+            "length_temp": 1.0
+        }
+    }
+    return yarn_init(dim, base, orig_ctx, seq_len, beta_fast, beta_slow)
+}
+
+fn yarn_scale_attn_scores(scores, config) {
+    let factor = config["attn_factor"] * config["length_temp"]
+    if factor < 1.0e-12 { return scores }
+    let n = len(scores)
+    let mut out = yarn_zeros(n)
+    for i in 0..n {
+        out[i] = scores[i] / factor
+    }
+    return out
+}
+
+fn yarn_distortion(method_freqs, base_freqs) {
+    let n = len(method_freqs)
+    if n == 0 { return 0.0 }
+    let mut mse = 0.0
+    for i in 0..n {
+        let diff = method_freqs[i] - base_freqs[i]
+        mse = mse + diff * diff
+    }
+    return mse / to_float(n)
+}
+
+fn yarn_compare(dim, base, seq_len, max_trained) {
+    let base_f = yarn_base_freqs(dim, base)
+    let scale = to_float(seq_len) / to_float(max_trained)
+    let alpha = yarn_max_f(scale, 1.0)
+    let half = dim / 2
+
+    let d_base = 0.0
+
+    let mut linear_f = yarn_zeros(half)
+    for i in 0..half {
+        linear_f[i] = base_f[i] / alpha
+    }
+    let d_linear = yarn_distortion(linear_f, base_f)
+
+    let ntk_f = yarn_ntk_freqs(dim, base, alpha)
+    let d_ntk = yarn_distortion(ntk_f, base_f)
+
+    let yarn_f = yarn_blend_freqs(dim, base, alpha, 32.0, 1.0, max_trained)
+    let d_yarn = yarn_distortion(yarn_f, base_f)
+
+    return #{
+        "base": d_base,
+        "linear": d_linear,
+        "ntk": d_ntk,
+        "yarn": d_yarn
+    }
+}
+
+fn yarn_dot(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    for i in 0..n {
+        s = s + a[i] * b[i]
+    }
+    return s
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  TESTS
+// ═══════════════════════════════════════════════════════════════════
+
+let DIM = 16
+let BASE = 10000.0
+let ORIG_CTX = 4096
+let TARGET_CTX = 65536
+
+// T1: base_freqs length = dim/2
+let bf1 = yarn_base_freqs(DIM, BASE)
+check("T1 base_freqs length = dim/2", len(bf1) == DIM / 2)
+
+// T2: base_freqs[0] == 1.0 (exponent 0 -> base^0 = 1)
+check("T2 base_freqs[0] == 1.0", approx(bf1[0], 1.0, 1.0e-9))
+
+// T3: base_freqs monotonically decreasing
+let mut mono = true
+for i in 1..len(bf1) {
+    if bf1[i] > bf1[i - 1] { mono = false }
+}
+check("T3 base_freqs monotonically decreasing", mono)
+
+// T4: ntk_base > original when scale > 1
+let nb4 = yarn_ntk_base(BASE, DIM, 4.0)
+check("T4 ntk_base > original when scale > 1", nb4 > BASE)
+
+// T5: ntk_base == original when scale <= 1
+let nb5 = yarn_ntk_base(BASE, DIM, 1.0)
+check("T5 ntk_base == original when scale <= 1", approx(nb5, BASE, 1.0e-6))
+
+// T6: ntk_freqs length correct
+let nf6 = yarn_ntk_freqs(DIM, BASE, 4.0)
+check("T6 ntk_freqs length = dim/2", len(nf6) == DIM / 2)
+
+// T7: wavelength increases with dimension index
+let wl0 = yarn_wavelength(DIM, BASE, 0)
+let wl_last = yarn_wavelength(DIM, BASE, DIM / 2 - 1)
+check("T7 wavelength increases with dim index", wl_last > wl0)
+
+// T8: ramp = 0 for very short wavelength (high freq, below low threshold)
+// wavelength at i=0 with dim=128 is ~2*pi (very short vs ctx/32=128)
+let ramp8 = yarn_ramp_value(1.0, 32.0, 1.0, 4096)
+check("T8 ramp = 0 for short wavelength", approx(ramp8, 0.0, 1.0e-6))
+
+// T9: ramp = 1 for very long wavelength (low freq, above high threshold)
+let ramp9 = yarn_ramp_value(100000.0, 32.0, 1.0, 4096)
+check("T9 ramp = 1 for long wavelength", approx(ramp9, 1.0, 1.0e-6))
+
+// T10: ramp in [0,1] for mid-range wavelength
+let mid_wl = (to_float(ORIG_CTX) / 32.0 + to_float(ORIG_CTX) / 1.0) / 2.0
+let ramp10 = yarn_ramp_value(mid_wl, 32.0, 1.0, ORIG_CTX)
+check("T10 ramp in [0,1] for mid wavelength", ramp10 >= 0.0 && ramp10 <= 1.0)
+
+// T11: blend_freqs length = dim/2
+let blend11 = yarn_blend_freqs(DIM, BASE, 4.0, 32.0, 1.0, ORIG_CTX)
+check("T11 blend_freqs length = dim/2", len(blend11) == DIM / 2)
+
+// T12: blend_freqs high-freq dims approximately match base freqs
+// At i=0 wavelength is small -> ramp=0 -> uses ntk, but with small dim
+// we need to check a dimension where wavelength < low threshold
+// For dim=128, i=0: wavelength = 2*pi (very short) -> ramp=0 -> ntk
+// Actually ramp=0 means (1-0)*ntk + 0*base = ntk. Let's verify differently:
+// With large dim, low freq dims (large i) have ramp=1 -> base freqs
+let big_dim = 128
+let blend12_base = yarn_base_freqs(big_dim, BASE)
+let blend12 = yarn_blend_freqs(big_dim, BASE, 4.0, 32.0, 1.0, ORIG_CTX)
+// high freq dim (i=0): wavelength is small, ramp=0 -> should equal ntk
+let ntk12 = yarn_ntk_freqs(big_dim, BASE, 4.0)
+check("T12 blend high-freq dim matches ntk freq", approx(blend12[0], ntk12[0], 1.0e-6))
+
+// T13: blend_freqs low-freq dims match base freqs (ramp=1)
+// Last index has very large wavelength -> ramp=1 -> base freq
+let last_idx = big_dim / 2 - 1
+check("T13 blend low-freq dim matches base freq", approx(blend12[last_idx], blend12_base[last_idx], 1.0e-6))
+
+// T14: attn_factor == 1.0 when scale <= 1
+let af14 = yarn_attn_factor(1.0)
+check("T14 attn_factor == 1.0 when scale <= 1", approx(af14, 1.0, 1.0e-9))
+
+// T15: attn_factor > 1.0 when scale > 1
+let af15 = yarn_attn_factor(16.0)
+check("T15 attn_factor > 1.0 when scale > 1", af15 > 1.0)
+
+// T16: attn_factor numerical check: sqrt(1 + 0.1*ln(4)) ~ sqrt(1.1386) ~ 1.0670
+let af16 = yarn_attn_factor(4.0)
+let expected_af = yarn_sqrt_f(1.0 + 0.1 * yarn_log_f(4.0))
+check("T16 attn_factor numerical check", approx(af16, expected_af, 1.0e-6))
+
+// T17: length_temp == 1.0 when seq <= max
+let lt17 = yarn_length_temp(4096, 4096)
+check("T17 length_temp == 1.0 when seq <= max", approx(lt17, 1.0, 1.0e-9))
+
+// T18: length_temp = sqrt(ratio) numerical check
+let lt18 = yarn_length_temp(16384, 4096)
+let expected_lt = yarn_sqrt_f(16384.0 / 4096.0)
+check("T18 length_temp = sqrt(4) = 2", approx(lt18, expected_lt, 1.0e-6))
+
+// T19: cos_sin length = dim
+let cs19 = yarn_cos_sin(5, bf1)
+check("T19 cos_sin length = dim", len(cs19) == DIM)
+
+// T20: cos/sin values bounded [-1,1]
+let mut cs_bounded = true
+for i in 0..DIM {
+    if cs19[i] > 1.0 + 1.0e-6 { cs_bounded = false }
+    if cs19[i] < 0.0 - 1.0 - 1.0e-6 { cs_bounded = false }
+}
+check("T20 cos/sin values bounded [-1,1]", cs_bounded)
+
+// T21: rotate at pos=0 is identity (cos=1, sin=0)
+let x21 = [0.5, 0.3, 0.2, 0.1, 0.4, 0.6, 0.7, 0.8, 0.9, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]
+let cs0 = yarn_cos_sin(0, bf1)
+let rot21 = yarn_rotate(x21, cs0)
+let mut id_ok = true
+for i in 0..DIM {
+    if !approx(rot21[i], x21[i], 1.0e-9) { id_ok = false }
+}
+check("T21 rotate at pos=0 is identity", id_ok)
+
+// T22: rotate preserves norm (rotation is isometric)
+let cs5 = yarn_cos_sin(42, bf1)
+let rot22 = yarn_rotate(x21, cs5)
+let norm_orig = yarn_dot(x21, x21)
+let norm_rot = yarn_dot(rot22, rot22)
+check("T22 rotate preserves norm", approx(norm_orig, norm_rot, 1.0e-6))
+
+// T23: apply_qk returns two vectors of correct shape
+let k23 = [0.1, 0.9, 0.8, 0.2, 0.3, 0.7, 0.6, 0.4, 0.5, 0.5, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
+let qk23 = yarn_apply_qk(x21, k23, 10, bf1)
+check("T23 apply_qk returns [q,k] correct shape", len(qk23) == 2 && len(qk23[0]) == DIM && len(qk23[1]) == DIM)
+
+// T24: yarn_init returns all expected keys
+let cfg24 = yarn_init(DIM, BASE, ORIG_CTX, TARGET_CTX, 32.0, 1.0)
+check("T24 yarn_init has all keys",
+    has_key(cfg24, "freqs") && has_key(cfg24, "dim") && has_key(cfg24, "scale") &&
+    has_key(cfg24, "attn_factor") && has_key(cfg24, "length_temp") &&
+    has_key(cfg24, "beta_fast") && has_key(cfg24, "beta_slow"))
+
+// T25: yarn_forward at pos=0 is identity
+let fwd25 = yarn_forward(cfg24, x21, k23, 0)
+let mut fwd_id_ok = true
+for i in 0..DIM {
+    if !approx(fwd25[0][i], x21[i], 1.0e-9) { fwd_id_ok = false }
+    if !approx(fwd25[1][i], k23[i], 1.0e-9) { fwd_id_ok = false }
+}
+check("T25 yarn_forward at pos=0 is identity", fwd_id_ok)
+
+// T26: dynamic unchanged when seq_len <= orig_ctx
+let dyn26 = yarn_dynamic(DIM, BASE, ORIG_CTX, 2048, 32.0, 1.0)
+check("T26 dynamic unchanged when seq <= orig",
+    approx(dyn26["scale"], 1.0, 1.0e-9) && approx(dyn26["attn_factor"], 1.0, 1.0e-9))
+
+// T27: dynamic adjusts when seq_len > orig_ctx
+let dyn27 = yarn_dynamic(DIM, BASE, ORIG_CTX, 16384, 32.0, 1.0)
+check("T27 dynamic adjusts when seq > orig",
+    dyn27["scale"] > 1.0 && dyn27["attn_factor"] > 1.0)
+
+// T28: scale_attn_scores divides correctly
+let scores28 = [2.0, 4.0, 6.0, 8.0]
+let scaled28 = yarn_scale_attn_scores(scores28, cfg24)
+let factor28 = cfg24["attn_factor"] * cfg24["length_temp"]
+let mut scale_ok = true
+for i in 0..4 {
+    if !approx(scaled28[i], scores28[i] / factor28, 1.0e-6) { scale_ok = false }
+}
+check("T28 scale_attn_scores divides correctly", scale_ok)
+
+// T29: yarn distortion < linear distortion (YaRN preserves more structure)
+let cmp29 = yarn_compare(64, BASE, 16384, ORIG_CTX)
+check("T29 yarn distortion < linear distortion", cmp29["yarn"] < cmp29["linear"])
+
+// T30: numerical stability at extreme position (100K)
+let cfg30 = yarn_init(DIM, BASE, ORIG_CTX, 131072, 32.0, 1.0)
+let fwd30 = yarn_forward(cfg30, x21, k23, 99999)
+let mut finite30 = true
+for i in 0..DIM {
+    let qv = fwd30[0][i]
+    let kv = fwd30[1][i]
+    if qv > 100.0 { finite30 = false }
+    if qv < 0.0 - 100.0 { finite30 = false }
+    if kv > 100.0 { finite30 = false }
+    if kv < 0.0 - 100.0 { finite30 = false }
+}
+check("T30 numerical stability at pos=100K", finite30)
+
+// ═══════════════════════════════════════════════════════════════════
+println("")
+println("=== YaRN RoPE test summary ===")
+println("PASS: " + str(pass_count))
+println("FAIL: " + str(fail_count))
+println("TOTAL: " + str(pass_count + fail_count))

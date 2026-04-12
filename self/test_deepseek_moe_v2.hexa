@@ -1,0 +1,230 @@
+// ===================================================================
+//  test_deepseek_moe_v2.hexa — DeepSeek MoE (#332)
+//  Fine-grained expert splitting + shared expert separation
+// ===================================================================
+
+import "ml/deepseek_moe_v2.hexa"
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs_(v) { if v < 0.0 { return 0.0 - v } return v }
+fn approx_(a, b, eps) { return fabs_(a - b) < eps }
+
+println("=== DeepSeek MoE (#332) — Fine-Grained Expert Splitting ===")
+
+// D_in=3, D_hidden=4, n_coarse=2, m_split=2, n_shared=1, top_mk=2
+// => n_sub = 2*2 = 4 sub-experts, D_hidden_sub = 4/2 = 2
+let model = ds2_init(3, 4, 2, 2, 1, 2, 42)
+
+// ── T1 model shape checks ──────────────────────────────────
+check("T1 n_coarse", model["n_coarse"] == 2)
+check("T2 m_split", model["m_split"] == 2)
+check("T3 n_sub == n_coarse*m_split", model["n_sub"] == 4)
+check("T4 n_shared", model["n_shared"] == 1)
+check("T5 top_mk", model["top_mk"] == 2)
+check("T6 D_in", model["D_in"] == 3)
+check("T7 D_hidden", model["D_hidden"] == 4)
+check("T8 D_hidden_sub", model["D_hidden_sub"] == 2)
+
+// ── T9 gate weight shape: n_sub x D_in ──────────────────────
+check("T9 W_gate rows == n_sub", len(model["W_gate"]) == 4)
+check("T10 W_gate cols == D_in", len(model["W_gate"][0]) == 3)
+
+// ── T11 sub-expert shapes ───────────────────────────────────
+let se0 = model["sub_experts"][0]
+check("T11 sub W1 rows == D_hidden_sub", len(se0["W1"]) == 2)
+check("T12 sub W1 cols == D_in", len(se0["W1"][0]) == 3)
+check("T13 sub W2 rows == D_in", len(se0["W2"]) == 3)
+check("T14 sub W2 cols == D_hidden_sub", len(se0["W2"][0]) == 2)
+check("T15 sub_experts count", len(model["sub_experts"]) == 4)
+
+// ── T16 shared expert shapes (full-size) ────────────────────
+let sh0 = model["shared_experts"][0]
+check("T16 shared W1 rows == D_hidden", len(sh0["W1"]) == 4)
+check("T17 shared W1 cols == D_in", len(sh0["W1"][0]) == 3)
+
+// ── T18 routing returns top-mK sub-expert indices ───────────
+let x_test = [0.5, 0.3, 0.8]
+let route = ds2_route(model, x_test)
+let sel_gates = route[0]
+let sel_indices = route[1]
+check("T18 selected count == top_mk", len(sel_indices) == 2)
+check("T19 gate values count == top_mk", len(sel_gates) == 2)
+
+// ── T20 gate values in [0,1] ────────────────────────────────
+let mut gates_ok = true
+for i in 0..len(sel_gates) {
+    if sel_gates[i] < 0.0 { gates_ok = false }
+    if sel_gates[i] > 1.0 { gates_ok = false }
+}
+check("T20 gate values in [0,1]", gates_ok)
+
+// ── T21 selected indices distinct and valid ─────────────────
+check("T21 indices distinct", sel_indices[0] != sel_indices[1])
+let mut idx_valid = true
+for i in 0..len(sel_indices) {
+    if sel_indices[i] < 0 { idx_valid = false }
+    if sel_indices[i] >= 4 { idx_valid = false }
+}
+check("T22 indices in [0, n_sub)", idx_valid)
+
+// ── T23 sub-expert forward output dimension ─────────────────
+let ef = ds2_sub_expert_forward(model, 0, x_test)
+check("T23 sub-expert output dim == D_in", len(ef) == 3)
+
+// ── T24 different sub-experts produce different outputs ──────
+let ef0 = ds2_sub_expert_forward(model, 0, x_test)
+let ef1 = ds2_sub_expert_forward(model, 1, x_test)
+let mut diff_sub = false
+for d in 0..3 {
+    if fabs_(ef0[d] - ef1[d]) > 1.0e-9 { diff_sub = true }
+}
+check("T24 different sub-experts differ", diff_sub)
+
+// ── T25 shared forward output dimension ─────────────────────
+let sf = ds2_shared_forward(model, x_test)
+check("T25 shared output dim == D_in", len(sf) == 3)
+
+// ── T26 shared expert contributes non-zero ──────────────────
+let mut shared_nz = false
+for d in 0..3 {
+    if fabs_(sf[d]) > 1.0e-9 { shared_nz = true }
+}
+check("T26 shared expert non-zero", shared_nz)
+
+// ── T27 full forward output dimension ───────────────────────
+let ff = ds2_forward(model, x_test)
+check("T27 forward output dim == D_in", len(ff) == 3)
+
+// ── T28 softmax sums to 1 ───────────────────────────────────
+let sm = ds2_softmax([1.0, 2.0, 3.0, 0.5])
+let mut sm_sum = 0.0
+for i in 0..4 { sm_sum = sm_sum + sm[i] }
+check("T28 softmax sums to 1", approx_(sm_sum, 1.0, 1.0e-6))
+
+// ── T29 full gate sums to 1 ─────────────────────────────────
+let fg = ds2_full_gate(model, x_test)
+let mut fg_sum = 0.0
+for i in 0..4 { fg_sum = fg_sum + fg[i] }
+check("T29 full gate sums to 1", approx_(fg_sum, 1.0, 1.0e-6))
+
+// ── T30 balance loss non-negative ───────────────────────────
+let X_bal = [[0.1, 0.2, 0.3], [0.9, 0.1, 0.5], [0.3, 0.8, 0.2], [0.7, 0.4, 0.6]]
+let mut gate_hist = []
+for i in 0..4 {
+    let fg_i = ds2_full_gate(model, X_bal[i])
+    let rt = ds2_route(model, X_bal[i])
+    gate_hist = gate_hist + [[fg_i, rt[1]]]
+}
+let bl = ds2_balance_loss(model, gate_hist)
+check("T30 balance loss >= 0", bl >= 0.0)
+
+// ── T31 empty balance loss == 0 ─────────────────────────────
+let bl_empty = ds2_balance_loss(model, [])
+check("T31 empty balance loss == 0", approx_(bl_empty, 0.0, 1.0e-12))
+
+// ── T32 deterministic init ──────────────────────────────────
+let model_a = ds2_init(3, 4, 2, 2, 1, 2, 99)
+let model_b = ds2_init(3, 4, 2, 2, 1, 2, 99)
+let fa = ds2_forward(model_a, [0.1, 0.2, 0.3])
+let fb = ds2_forward(model_b, [0.1, 0.2, 0.3])
+let mut det_ok = true
+for d in 0..3 {
+    if fabs_(fa[d] - fb[d]) > 1.0e-9 { det_ok = false }
+}
+check("T32 deterministic init", det_ok)
+
+// ── T33 different inputs produce different outputs ──────────
+let out_a = ds2_forward(model, [1.0, 0.0, 0.0])
+let out_b = ds2_forward(model, [0.0, 0.0, 1.0])
+let mut diff_out = false
+for d in 0..3 {
+    if fabs_(out_a[d] - out_b[d]) > 1.0e-6 { diff_out = true }
+}
+check("T33 different inputs different outputs", diff_out)
+
+// ── T34 sub-to-coarse mapping ───────────────────────────────
+check("T34 sub 0 -> coarse 0", ds2_sub_to_coarse(0, 2) == 0)
+check("T35 sub 1 -> coarse 0", ds2_sub_to_coarse(1, 2) == 0)
+check("T36 sub 2 -> coarse 1", ds2_sub_to_coarse(2, 2) == 1)
+check("T37 sub 3 -> coarse 1", ds2_sub_to_coarse(3, 2) == 1)
+
+// ── T38 sub local index ─────────────────────────────────────
+check("T38 sub 0 local 0", ds2_sub_local_index(0, 2) == 0)
+check("T39 sub 1 local 1", ds2_sub_local_index(1, 2) == 1)
+check("T40 sub 2 local 0", ds2_sub_local_index(2, 2) == 0)
+check("T41 sub 3 local 1", ds2_sub_local_index(3, 2) == 1)
+
+// ── T42 active coarse experts ───────────────────────────────
+let coarse_set = ds2_active_coarse_experts([0, 3], 2)
+check("T42 coarse set from sub [0,3]", len(coarse_set) == 2)
+
+let coarse_set2 = ds2_active_coarse_experts([0, 1], 2)
+check("T43 coarse set from sub [0,1] (same coarse)", len(coarse_set2) == 1)
+
+// ── T44 batch forward ───────────────────────────────────────
+let batch_in = [[0.1, 0.2, 0.3], [0.9, 0.1, 0.5]]
+let batch_result = ds2_forward_batch(model, batch_in)
+let batch_outs = batch_result[0]
+let batch_ghist = batch_result[1]
+check("T44 batch outputs count", len(batch_outs) == 2)
+check("T45 batch gate history count", len(batch_ghist) == 2)
+check("T46 batch output dim", len(batch_outs[0]) == 3)
+
+// ── T47 balance loss consistent with batch ──────────────────
+let bl_batch = ds2_balance_loss(model, batch_ghist)
+check("T47 batch balance loss >= 0", bl_batch >= 0.0)
+
+// ── T48 forward matches batch forward element-wise ──────────
+let single_0 = ds2_forward(model, batch_in[0])
+let mut match_ok = true
+for d in 0..3 {
+    if fabs_(single_0[d] - batch_outs[0][d]) > 1.0e-9 { match_ok = false }
+}
+check("T48 single forward == batch forward[0]", match_ok)
+
+// ── T49 training reduces loss ───────────────────────────────
+let X_train = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+let Y_train = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+
+let loss_before = ds2_mse_loss(model, X_train, Y_train)
+let mut m_trained = model
+for _step in 0..3 {
+    m_trained = ds2_train_step(m_trained, X_train, Y_train, 0.1)
+}
+let loss_after = ds2_mse_loss(m_trained, X_train, Y_train)
+check("T49 loss decreases after training", loss_after < loss_before)
+
+// ── T50 larger split (m=3) ──────────────────────────────────
+let model3 = ds2_init(3, 6, 2, 3, 1, 3, 77)
+check("T50 m=3 n_sub == 6", model3["n_sub"] == 6)
+check("T51 m=3 D_hidden_sub == 2", model3["D_hidden_sub"] == 2)
+let out3 = ds2_forward(model3, [0.5, 0.3, 0.8])
+check("T52 m=3 forward output dim", len(out3) == 3)
+
+// ── T53 multiple shared experts ─────────────────────────────
+let model_ms = ds2_init(3, 4, 2, 2, 2, 2, 55)
+check("T53 2 shared experts", model_ms["n_shared"] == 2)
+let sf_ms = ds2_shared_forward(model_ms, [0.1, 0.2, 0.3])
+check("T54 multi-shared output dim", len(sf_ms) == 3)
+
+// ── T55 MSE loss non-negative ───────────────────────────────
+let mse = ds2_mse_loss(model, X_train, Y_train)
+check("T55 MSE loss >= 0", mse >= 0.0)
+
+println("")
+println("=== DeepSeek MoE (#332) summary ===")
+println("PASS: " + str(pass_count))
+println("FAIL: " + str(fail_count))
+println("TOTAL: " + str(pass_count + fail_count))

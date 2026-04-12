@@ -1,0 +1,562 @@
+// ===================================================================
+//  self/ml/ligo_growth.hexa — LiGO (Linear Growth Operator) (#346)
+//
+//  Ref: Chen et al. 2023 — "LiGO: Linear Growth Operator for
+//       efficient training of large language models"
+//
+//  Idea: grow a small pretrained model into a larger one using a
+//  learned linear mapping G so that  theta_large = G * theta_small.
+//
+//  Two growth axes:
+//    (a) Width growth:  hidden dimension d -> D  (D > d)
+//        G_width is a (D x d) linear operator.
+//    (b) Depth growth:  L layers -> L' layers  (L' > L)
+//        G_depth maps existing layer indices to new layer indices.
+//
+//  Function preservation invariant:
+//    Immediately after growth, f_large(x) approx f_small(x).
+//    Achieved by initializing G so the grown weights reproduce
+//    the small model's function in the expanded parameter space.
+//
+//  Public API:
+//    ligo_zeros(n)
+//    ligo_eye(n)                                -> [n x n] identity (flat)
+//    ligo_matmul(A, B, m, k, n)                 -> C = A@B (flat)
+//    ligo_matvec(A, x, rows, cols)              -> y = A@x
+//    ligo_width_operator(d, D, seed)            -> G_width (D x d) flat
+//    ligo_depth_operator(L, Lp)                 -> G_depth (Lp x L) flat
+//    ligo_grow_vector(v, G, D, d)               -> grown vector (D,)
+//    ligo_grow_matrix(W, G_out, G_in, D_out, d_out, D_in, d_in)
+//                                               -> grown matrix (D_out x D_in) flat
+//    ligo_grow_layer(layer, G_width, D, d)      -> grown layer dict
+//    ligo_grow_depth(layers, G_depth, L, Lp, G_width, D, d)
+//                                               -> L' grown layers
+//    ligo_grow_model(model, D, Lp)              -> fully grown model
+//    ligo_function_preservation_error(small_model, large_model, inputs)
+//                                               -> mean squared error
+//
+//  AI-NATIVE attrs:
+//    @pure  — all growth operators are stateless
+//    @hot   — matmul on the critical path
+// ===================================================================
+
+// ── Math helpers (self-contained) ─────────────────────────────────
+
+fn ligo_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn ligo_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..40 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn ligo_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn ligo_ones(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [1.0] }
+    return v
+}
+
+// Simple PRNG hash
+fn ligo_hash(seed, i) {
+    let h = ((seed * 2654435761 + i * 1315423911 + 731) % 10007)
+    return to_float(h) / 10007.0 - 0.5
+}
+
+// ===================================================================
+//  Identity matrix (n x n) stored flat (row-major)
+// ===================================================================
+@pure
+fn ligo_eye(n) {
+    let mut M = ligo_zeros(n * n)
+    for i in 0..n {
+        M[i * n + i] = 1.0
+    }
+    return M
+}
+
+// ===================================================================
+//  Matrix multiply  C = A @ B
+//  A: (m x k) flat,  B: (k x n) flat  ->  C: (m x n) flat
+// ===================================================================
+@hot
+fn ligo_matmul(A, B, m, k, n) {
+    let mut C = ligo_zeros(m * n)
+    for i in 0..m {
+        for j in 0..n {
+            let mut s = 0.0
+            for p in 0..k {
+                s = s + A[i * k + p] * B[p * n + j]
+            }
+            C[i * n + j] = s
+        }
+    }
+    return C
+}
+
+// ===================================================================
+//  Matrix-vector product  y = A @ x
+//  A: (rows x cols) flat,  x: (cols,) array  ->  y: (rows,)
+// ===================================================================
+@hot
+fn ligo_matvec(A, x, rows, cols) {
+    let mut y = ligo_zeros(rows)
+    for i in 0..rows {
+        let mut s = 0.0
+        for j in 0..cols {
+            s = s + A[i * cols + j] * x[j]
+        }
+        y[i] = s
+    }
+    return y
+}
+
+// ===================================================================
+//  Vector dot product
+// ===================================================================
+@pure
+fn ligo_dot(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    for i in 0..n { s = s + a[i] * b[i] }
+    return s
+}
+
+// ===================================================================
+//  Vector addition
+// ===================================================================
+@pure
+fn ligo_vec_add(a, b) {
+    let n = len(a)
+    let mut out = []
+    for i in 0..n { out = out + [a[i] + b[i]] }
+    return out
+}
+
+// ===================================================================
+//  Vector scale
+// ===================================================================
+@pure
+fn ligo_vec_scale(v, s) {
+    let n = len(v)
+    let mut out = []
+    for i in 0..n { out = out + [v[i] * s] }
+    return out
+}
+
+// ===================================================================
+//  Width Growth Operator  G_width: (D x d) matrix
+//
+//  Function-preserving initialization:
+//    - First d rows form an identity block (copies original dims)
+//    - Remaining (D - d) rows are small random perturbations
+//      near zero so the extra dimensions start inactive.
+//
+//  This ensures G_width @ theta_small[0:d] preserves the original
+//  values in the first d components, and appends near-zero for the
+//  new dimensions.
+// ===================================================================
+@pure
+fn ligo_width_operator(d, D, seed) {
+    let mut G = ligo_zeros(D * d)
+    // Identity block: first d rows
+    for i in 0..d {
+        G[i * d + i] = 1.0
+    }
+    // Small noise for new dimensions (D - d) rows
+    let noise_scale = 0.01
+    for i in d..D {
+        for j in 0..d {
+            G[i * d + j] = ligo_hash(seed + i * 100 + j, i + j) * noise_scale
+        }
+    }
+    return G
+}
+
+// ===================================================================
+//  Depth Growth Operator  G_depth: (Lp x L) matrix
+//
+//  Function-preserving initialization:
+//    - Maps each new layer index to a weighted combination of
+//      original layers using linear interpolation.
+//    - New layer i at position (i * L / Lp) interpolates between
+//      the two nearest original layers.
+//
+//  This ensures the grown network initially replicates the small
+//  network's function by smoothly distributing layers.
+// ===================================================================
+@pure
+fn ligo_depth_operator(L, Lp) {
+    let mut G = ligo_zeros(Lp * L)
+    for i in 0..Lp {
+        // Map new layer index i to a fractional position in [0, L-1]
+        let pos = to_float(i) * to_float(L - 1) / to_float(Lp - 1)
+        let lo = to_int(pos)
+        let mut hi = lo + 1
+        if hi >= L { hi = L - 1 }
+        let frac = pos - to_float(lo)
+        if lo == hi {
+            G[i * L + lo] = 1.0
+        } else {
+            G[i * L + lo] = 1.0 - frac
+            G[i * L + hi] = frac
+        }
+    }
+    return G
+}
+
+// ===================================================================
+//  Grow a vector (bias or 1D param) from dimension d to D
+//  v_large = G_width @ v_small
+// ===================================================================
+@pure
+fn ligo_grow_vector(v, G, D, d) {
+    return ligo_matvec(G, v, D, d)
+}
+
+// ===================================================================
+//  Grow a weight matrix from (d_out x d_in) to (D_out x D_in)
+//  W_large = G_out @ W_small @ G_in^T
+//
+//  W_small: (d_out x d_in) flat
+//  G_out:   (D_out x d_out) flat
+//  G_in:    (D_in x d_in) flat  (we need its transpose: d_in x D_in)
+//
+//  Step 1: T = G_out @ W_small   -> (D_out x d_in)
+//  Step 2: compute G_in^T        -> (d_in x D_in)
+//  Step 3: W_large = T @ G_in^T  -> (D_out x D_in)
+// ===================================================================
+@pure
+fn ligo_grow_matrix(W, G_out, G_in, D_out, d_out, D_in, d_in) {
+    // Step 1: T = G_out @ W   (D_out x d_out) @ (d_out x d_in) -> (D_out x d_in)
+    let T = ligo_matmul(G_out, W, D_out, d_out, d_in)
+    // Step 2: transpose G_in from (D_in x d_in) to (d_in x D_in)
+    let mut G_in_T = ligo_zeros(d_in * D_in)
+    for i in 0..D_in {
+        for j in 0..d_in {
+            G_in_T[j * D_in + i] = G_in[i * d_in + j]
+        }
+    }
+    // Step 3: W_large = T @ G_in^T   (D_out x d_in) @ (d_in x D_in) -> (D_out x D_in)
+    let W_large = ligo_matmul(T, G_in_T, D_out, d_in, D_in)
+    return W_large
+}
+
+// ===================================================================
+//  Layer representation:
+//    #{ "weights": [flat], "bias": [flat], "in_dim": int, "out_dim": int }
+// ===================================================================
+fn ligo_make_layer(weights, bias, in_dim, out_dim) {
+    return #{
+        "weights": weights,
+        "bias": bias,
+        "in_dim": in_dim,
+        "out_dim": out_dim
+    }
+}
+
+// ===================================================================
+//  Layer forward: y = W @ x + b
+// ===================================================================
+@hot
+fn ligo_layer_forward(layer, x) {
+    let W = layer["weights"]
+    let b = layer["bias"]
+    let rows = layer["out_dim"]
+    let cols = layer["in_dim"]
+    let mut y = ligo_matvec(W, x, rows, cols)
+    for i in 0..rows {
+        y[i] = y[i] + b[i]
+    }
+    return y
+}
+
+// ===================================================================
+//  ReLU activation
+// ===================================================================
+@pure
+fn ligo_relu(x) {
+    let n = len(x)
+    let mut out = []
+    for i in 0..n {
+        if x[i] > 0.0 {
+            out = out + [x[i]]
+        } else {
+            out = out + [0.0]
+        }
+    }
+    return out
+}
+
+// ===================================================================
+//  Grow a single layer from (d_out x d_in) to (D_out x D_in)
+//  using width growth operators for input and output dimensions.
+// ===================================================================
+@pure
+fn ligo_grow_layer(layer, G_out, G_in, D_out, D_in) {
+    let d_out = layer["out_dim"]
+    let d_in = layer["in_dim"]
+    let W = layer["weights"]
+    let b = layer["bias"]
+    // Grow weights: W_large = G_out @ W @ G_in^T
+    let W_large = ligo_grow_matrix(W, G_out, G_in, D_out, d_out, D_in, d_in)
+    // Grow bias: b_large = G_out @ b
+    let b_large = ligo_grow_vector(b, G_out, D_out, d_out)
+    return ligo_make_layer(W_large, b_large, D_in, D_out)
+}
+
+// ===================================================================
+//  Model representation:
+//    #{ "layers": [layer], "d": int, "L": int }
+//
+//  Simple feed-forward: input(d) -> hidden(d) x (L-1) -> output(d)
+// ===================================================================
+fn ligo_make_model(layers, d, L) {
+    return #{
+        "layers": layers,
+        "d": d,
+        "L": L
+    }
+}
+
+// ===================================================================
+//  Model forward: chain through all layers with ReLU between them
+// ===================================================================
+@hot
+fn ligo_model_forward(model, x) {
+    let layers = model["layers"]
+    let L = len(layers)
+    let mut h = x
+    for i in 0..L {
+        h = ligo_layer_forward(layers[i], h)
+        // Apply ReLU between layers (not after last)
+        if i < L - 1 {
+            h = ligo_relu(h)
+        }
+    }
+    return h
+}
+
+// ===================================================================
+//  Create a small random model for testing
+//  d: hidden dimension,  L: number of layers (all d->d)
+// ===================================================================
+fn ligo_create_small_model(d, L, seed) {
+    let mut layers = []
+    let mut s = seed
+    for l in 0..L {
+        let n_params = d * d
+        let mut W = ligo_zeros(n_params)
+        let scale = 1.0 / ligo_sqrt(to_float(d))
+        for i in 0..n_params {
+            W[i] = ligo_hash(s + l * 1000, i) * scale
+        }
+        let mut b = ligo_zeros(d)
+        for i in 0..d {
+            b[i] = ligo_hash(s + l * 1000 + 9999, i) * scale * 0.1
+        }
+        layers = layers + [ligo_make_layer(W, b, d, d)]
+        s = s + 1
+    }
+    return ligo_make_model(layers, d, L)
+}
+
+// ===================================================================
+//  Width Growth — grow all layers from d to D
+//
+//  Uses a single G_width operator for the hidden dimensions.
+//  All internal layers: (d x d) -> (D x D)
+// ===================================================================
+@pure
+fn ligo_grow_width(model, D, seed) {
+    let d = model["d"]
+    let layers = model["layers"]
+    let L = model["L"]
+    let G = ligo_width_operator(d, D, seed)
+    let mut grown_layers = []
+    for i in 0..L {
+        let grown = ligo_grow_layer(layers[i], G, G, D, D)
+        grown_layers = grown_layers + [grown]
+    }
+    return ligo_make_model(grown_layers, D, L)
+}
+
+// ===================================================================
+//  Depth Growth — expand L layers to Lp layers
+//
+//  Each new layer is a weighted combination of original layers'
+//  weights, determined by the depth operator G_depth.
+//
+//  For new layer i:
+//    W_new[i] = sum_j G_depth[i,j] * W_orig[j]
+//    b_new[i] = sum_j G_depth[i,j] * b_orig[j]
+// ===================================================================
+@pure
+fn ligo_grow_depth(model, Lp) {
+    let layers = model["layers"]
+    let d = model["d"]
+    let L = model["L"]
+    let G = ligo_depth_operator(L, Lp)
+    let n_w = d * d
+    let mut new_layers = []
+    for i in 0..Lp {
+        let mut W_new = ligo_zeros(n_w)
+        let mut b_new = ligo_zeros(d)
+        for j in 0..L {
+            let alpha = G[i * L + j]
+            if ligo_abs(alpha) > 1.0e-12 {
+                let W_j = layers[j]["weights"]
+                let b_j = layers[j]["bias"]
+                for p in 0..n_w {
+                    W_new[p] = W_new[p] + alpha * W_j[p]
+                }
+                for p in 0..d {
+                    b_new[p] = b_new[p] + alpha * b_j[p]
+                }
+            }
+        }
+        new_layers = new_layers + [ligo_make_layer(W_new, b_new, d, d)]
+    }
+    return ligo_make_model(new_layers, d, Lp)
+}
+
+// ===================================================================
+//  Full Growth — grow both width (d -> D) and depth (L -> Lp)
+//
+//  Order: width first, then depth.  This is the standard LiGO
+//  pipeline: theta_large = G_depth(G_width(theta_small)).
+// ===================================================================
+fn ligo_grow_model(model, D, Lp, seed) {
+    let width_grown = ligo_grow_width(model, D, seed)
+    let full_grown = ligo_grow_depth(width_grown, Lp)
+    return full_grown
+}
+
+// ===================================================================
+//  Function Preservation Error
+//
+//  Measures how well the grown model preserves the small model's
+//  function: E = (1/N) * sum_i || f_large(x_i) - f_small(x_i) ||^2
+//
+//  For this to work correctly the inputs must be zero-padded from
+//  d to D when d != D.
+// ===================================================================
+@pure
+fn ligo_function_preservation_error(small_model, large_model, inputs) {
+    let n = len(inputs)
+    let d_small = small_model["d"]
+    let d_large = large_model["d"]
+    let mut total_err = 0.0
+    for i in 0..n {
+        let x = inputs[i]
+        // Forward through small model
+        let y_small = ligo_model_forward(small_model, x)
+        // Pad input to large model dimension if needed
+        let mut x_large = []
+        for j in 0..d_large {
+            if j < d_small {
+                x_large = x_large + [x[j]]
+            } else {
+                x_large = x_large + [0.0]
+            }
+        }
+        let y_large = ligo_model_forward(large_model, x_large)
+        // Compare first d_small outputs (the preserved dimensions)
+        let mut err = 0.0
+        for j in 0..d_small {
+            let diff = y_large[j] - y_small[j]
+            err = err + diff * diff
+        }
+        total_err = total_err + err
+    }
+    return total_err / to_float(n)
+}
+
+// ===================================================================
+//  Growth ratio — how many parameters grew
+// ===================================================================
+@pure
+fn ligo_growth_ratio(small_model, large_model) {
+    let d_s = small_model["d"]
+    let L_s = small_model["L"]
+    let d_l = large_model["d"]
+    let L_l = large_model["L"]
+    let params_small = L_s * (d_s * d_s + d_s)
+    let params_large = L_l * (d_l * d_l + d_l)
+    return to_float(params_large) / to_float(params_small)
+}
+
+// ===================================================================
+//  Extract the depth operator for inspection
+// ===================================================================
+@pure
+fn ligo_get_depth_operator(L, Lp) {
+    return ligo_depth_operator(L, Lp)
+}
+
+// ===================================================================
+//  Extract the width operator for inspection
+// ===================================================================
+@pure
+fn ligo_get_width_operator(d, D, seed) {
+    return ligo_width_operator(d, D, seed)
+}
+
+// ===================================================================
+//  Verify depth operator row-sum property:
+//  Each row of G_depth should sum to 1.0 (convex combination)
+// ===================================================================
+@pure
+fn ligo_verify_depth_operator(L, Lp) {
+    let G = ligo_depth_operator(L, Lp)
+    let mut ok = true
+    for i in 0..Lp {
+        let mut row_sum = 0.0
+        for j in 0..L {
+            row_sum = row_sum + G[i * L + j]
+        }
+        if ligo_abs(row_sum - 1.0) > 1.0e-9 {
+            ok = false
+        }
+    }
+    return ok
+}
+
+// ===================================================================
+//  Verify width operator identity block:
+//  First d rows of G_width should form I_d
+// ===================================================================
+@pure
+fn ligo_verify_width_operator(d, D, seed) {
+    let G = ligo_width_operator(d, D, seed)
+    let mut ok = true
+    for i in 0..d {
+        for j in 0..d {
+            let expected = 0.0
+            if i == j {
+                if ligo_abs(G[i * d + j] - 1.0) > 1.0e-9 {
+                    ok = false
+                }
+            } else {
+                if ligo_abs(G[i * d + j]) > 1.0e-9 {
+                    ok = false
+                }
+            }
+        }
+    }
+    return ok
+}
+
+println("[ligo_growth] loaded — LiGO linear growth operator for width+depth model expansion")

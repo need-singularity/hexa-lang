@@ -1,0 +1,482 @@
+// ===================================================================
+//  test_schedule_free.hexa — Schedule-Free Optimizer verification (#340)
+//
+//  Tests (30):
+//    T1  default optimizer lr = 0.001
+//    T2  default optimizer beta1 = 0.9
+//    T3  default optimizer beta2 = 0.999
+//    T4  default optimizer eps = 1e-8
+//    T5  default optimizer weight_decay = 0.0
+//    T6  default optimizer warmup_steps = 0
+//    T7  init_state z equals init_params
+//    T8  init_state y equals init_params
+//    T9  init_state v is all zeros
+//    T10 warmup_factor at step=0 with warmup=100 is 0.01
+//    T11 warmup_factor at step=49 with warmup=100 is 0.5
+//    T12 warmup_factor at step=99 with warmup=100 is 1.0
+//    T13 warmup_factor with warmup=0 is 1.0
+//    T14 single step updates z (moves from init)
+//    T15 single step updates y (moves from init)
+//    T16 single step updates v (non-zero after gradient)
+//    T17 eval params = (1-b1)*z + b1*y
+//    T18 train params = y
+//    T19 single step reduces quadratic loss (eval point)
+//    T20 weight decay shrinks z toward zero
+//    T21 grad clipping reduces norm
+//    T22 grad clipping preserves direction
+//    T23 clipped step works end-to-end
+//    T24 multiple steps converge on quadratic (>90% loss drop)
+//    T25 z and y diverge (z is slower than y)
+//    T26 eval point x is between z and y
+//    T27 sf vs adamw both reduce loss
+//    T28 warmup reduces effective lr (step in warmup < step after)
+//    T29 step counter increments
+//    T30 memory usage: sf and adam same footprint
+//
+//  Run: ./hexa self/interpreter.hexa self/test_schedule_free.hexa
+// ===================================================================
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ===================================================================
+//  Inlined from schedule_free.hexa
+// ===================================================================
+
+fn sf_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn sf_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..40 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn sf_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn sf_max_f(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn sf_min_f(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn sf_create(lr, beta1, beta2, eps, weight_decay, warmup_steps) {
+    return #{
+        "lr": lr,
+        "beta1": beta1,
+        "beta2": beta2,
+        "eps": eps,
+        "weight_decay": weight_decay,
+        "warmup_steps": warmup_steps
+    }
+}
+
+fn sf_create_default() {
+    return sf_create(0.001, 0.9, 0.999, 1.0e-8, 0.0, 0)
+}
+
+fn sf_init_state(dim, init_params) {
+    let mut z = sf_zeros(dim)
+    let mut y = sf_zeros(dim)
+    for i in 0..dim {
+        z[i] = init_params[i]
+        y[i] = init_params[i]
+    }
+    return #{
+        "z": z,
+        "y": y,
+        "v": sf_zeros(dim),
+        "step": 0
+    }
+}
+
+fn sf_warmup_factor(step, warmup_steps) {
+    if warmup_steps <= 0 { return 1.0 }
+    if step >= warmup_steps { return 1.0 }
+    return to_float(step + 1) / to_float(warmup_steps)
+}
+
+fn sf_step(opt, grads, state, step) {
+    let lr = opt["lr"]
+    let b1 = opt["beta1"]
+    let b2 = opt["beta2"]
+    let eps = opt["eps"]
+    let wd = opt["weight_decay"]
+    let warmup = opt["warmup_steps"]
+
+    let z = state["z"]
+    let y = state["y"]
+    let v = state["v"]
+    let dim = len(z)
+
+    let mut new_z = sf_zeros(dim)
+    let mut new_y = sf_zeros(dim)
+    let mut new_v = sf_zeros(dim)
+
+    let wf = sf_warmup_factor(step, warmup)
+    let lr_t = lr * wf
+
+    let mut b2_pow = 1.0
+    for _i in 0..(step + 1) {
+        b2_pow = b2_pow * b2
+    }
+    let b2_corr = 1.0 - b2_pow
+
+    let k_inv = 1.0 / to_float(step + 2)
+
+    for i in 0..dim {
+        new_v[i] = b2 * v[i] + (1.0 - b2) * grads[i] * grads[i]
+        let v_hat = new_v[i] / b2_corr
+        let adam_update = grads[i] / (sf_sqrt(v_hat) + eps)
+        new_z[i] = z[i] - lr_t * (adam_update + wd * z[i])
+        new_y[i] = (1.0 - k_inv) * y[i] + k_inv * new_z[i]
+    }
+
+    return #{
+        "z": new_z,
+        "y": new_y,
+        "v": new_v,
+        "step": step + 1
+    }
+}
+
+fn sf_get_eval_params(opt, state) {
+    let b1 = opt["beta1"]
+    let z = state["z"]
+    let y = state["y"]
+    let dim = len(z)
+    let mut x = sf_zeros(dim)
+    for i in 0..dim {
+        x[i] = (1.0 - b1) * z[i] + b1 * y[i]
+    }
+    return x
+}
+
+fn sf_get_train_params(state) {
+    return state["y"]
+}
+
+fn sf_grad_norm(grads) {
+    let mut norm_sq = 0.0
+    let n = len(grads)
+    for i in 0..n {
+        norm_sq = norm_sq + grads[i] * grads[i]
+    }
+    return sf_sqrt(norm_sq)
+}
+
+fn sf_clip_global_norm(grads, max_norm) {
+    let norm = sf_grad_norm(grads)
+    if norm <= max_norm { return grads }
+    let scale = max_norm / norm
+    let n = len(grads)
+    let mut clipped = sf_zeros(n)
+    for i in 0..n {
+        clipped[i] = grads[i] * scale
+    }
+    return clipped
+}
+
+fn sf_step_clipped(opt, grads, state, step, max_norm) {
+    let clipped = sf_clip_global_norm(grads, max_norm)
+    return sf_step(opt, clipped, state, step)
+}
+
+fn sf_quadratic_loss(params) {
+    let mut loss = 0.0
+    let n = len(params)
+    for i in 0..n {
+        loss = loss + 0.5 * params[i] * params[i]
+    }
+    return loss
+}
+
+fn sf_quadratic_grad(params) {
+    let n = len(params)
+    let mut g = sf_zeros(n)
+    for i in 0..n {
+        g[i] = params[i]
+    }
+    return g
+}
+
+fn sf_adamw_step(params, grads, m, v, lr, b1, b2, eps, wd, t) {
+    let dim = len(params)
+    let mut new_params = sf_zeros(dim)
+    let mut new_m = sf_zeros(dim)
+    let mut new_v = sf_zeros(dim)
+
+    let mut b1_pow = 1.0
+    let mut b2_pow = 1.0
+    for _i in 0..t {
+        b1_pow = b1_pow * b1
+        b2_pow = b2_pow * b2
+    }
+    let b1_corr = 1.0 - b1_pow
+    let b2_corr = 1.0 - b2_pow
+
+    for i in 0..dim {
+        new_m[i] = b1 * m[i] + (1.0 - b1) * grads[i]
+        new_v[i] = b2 * v[i] + (1.0 - b2) * grads[i] * grads[i]
+        let m_hat = new_m[i] / b1_corr
+        let v_hat = new_v[i] / b2_corr
+        new_params[i] = params[i] - lr * (m_hat / (sf_sqrt(v_hat) + eps) + wd * params[i])
+    }
+
+    return [new_params, new_m, new_v]
+}
+
+fn sf_compare(init_params, n_steps) {
+    let dim = len(init_params)
+
+    let sf_opt = sf_create(0.01, 0.9, 0.999, 1.0e-8, 0.0, 0)
+    let mut sf_state = sf_init_state(dim, init_params)
+
+    let mut a_params = sf_zeros(dim)
+    for i in 0..dim { a_params[i] = init_params[i] }
+    let mut a_m = sf_zeros(dim)
+    let mut a_v = sf_zeros(dim)
+
+    for step in 0..n_steps {
+        let y = sf_get_train_params(sf_state)
+        let sf_g = sf_quadratic_grad(y)
+        sf_state = sf_step(sf_opt, sf_g, sf_state, step)
+
+        let a_g = sf_quadratic_grad(a_params)
+        let a_result = sf_adamw_step(
+            a_params, a_g, a_m, a_v,
+            0.01, 0.9, 0.999, 1.0e-8, 0.0, step + 1
+        )
+        a_params = a_result[0]
+        a_m = a_result[1]
+        a_v = a_result[2]
+    }
+
+    let sf_x = sf_get_eval_params(sf_opt, sf_state)
+    let sf_loss = sf_quadratic_loss(sf_x)
+    let a_loss = sf_quadratic_loss(a_params)
+    return [sf_loss, a_loss]
+}
+
+fn sf_memory_usage(dim, n_params) {
+    let total_dim = dim * n_params
+    let bytes_per_float = 8
+    let sf_bytes = total_dim * bytes_per_float * 3
+    let adam_bytes = total_dim * bytes_per_float * 3
+    return [sf_bytes, adam_bytes]
+}
+
+// ===================================================================
+//  TESTS
+// ===================================================================
+
+// T1-T6: default optimizer config
+let opt = sf_create_default()
+check("T1 default lr = 0.001", approx(opt["lr"], 0.001, 1.0e-10))
+check("T2 default beta1 = 0.9", approx(opt["beta1"], 0.9, 1.0e-10))
+check("T3 default beta2 = 0.999", approx(opt["beta2"], 0.999, 1.0e-10))
+check("T4 default eps = 1e-8", approx(opt["eps"], 1.0e-8, 1.0e-12))
+check("T5 default weight_decay = 0.0", approx(opt["weight_decay"], 0.0, 1.0e-10))
+check("T6 default warmup_steps = 0", opt["warmup_steps"] == 0)
+
+// T7-T9: init state
+let init_p = [3.0, -2.0, 1.5]
+let s0 = sf_init_state(3, init_p)
+let z0 = s0["z"]
+let y0 = s0["y"]
+let v0 = s0["v"]
+
+let mut z_matches = true
+let mut y_matches = true
+let mut v_zero = true
+for i in 0..3 {
+    if fabs(z0[i] - init_p[i]) > 1.0e-10 { z_matches = false }
+    if fabs(y0[i] - init_p[i]) > 1.0e-10 { y_matches = false }
+    if fabs(v0[i]) > 1.0e-10 { v_zero = false }
+}
+check("T7 init z = init_params", z_matches)
+check("T8 init y = init_params", y_matches)
+check("T9 init v = zeros", v_zero)
+
+// T10-T13: warmup factor
+check("T10 warmup step=0/100 = 0.01", approx(sf_warmup_factor(0, 100), 0.01, 1.0e-10))
+check("T11 warmup step=49/100 = 0.5", approx(sf_warmup_factor(49, 100), 0.5, 1.0e-10))
+check("T12 warmup step=99/100 = 1.0", approx(sf_warmup_factor(99, 100), 1.0, 1.0e-10))
+check("T13 warmup with warmup=0 is 1.0", approx(sf_warmup_factor(0, 0), 1.0, 1.0e-10))
+
+// T14-T16: single step updates
+let p14 = [5.0, -3.0]
+let opt14 = sf_create(0.01, 0.9, 0.999, 1.0e-8, 0.0, 0)
+let s14 = sf_init_state(2, p14)
+let g14 = sf_quadratic_grad(p14)
+let r14 = sf_step(opt14, g14, s14, 0)
+
+let z14 = r14["z"]
+let y14 = r14["y"]
+let v14 = r14["v"]
+
+let mut z_moved = false
+for i in 0..2 {
+    if fabs(z14[i] - p14[i]) > 1.0e-10 { z_moved = true }
+}
+check("T14 z moves after step", z_moved)
+
+let mut y_moved = false
+for i in 0..2 {
+    if fabs(y14[i] - p14[i]) > 1.0e-10 { y_moved = true }
+}
+check("T15 y moves after step", y_moved)
+
+let mut v_nonzero = false
+for i in 0..2 {
+    if fabs(v14[i]) > 1.0e-12 { v_nonzero = true }
+}
+check("T16 v non-zero after gradient", v_nonzero)
+
+// T17: eval params = (1 - b1) * z + b1 * y
+let x17 = sf_get_eval_params(opt14, r14)
+let mut eval_correct = true
+for i in 0..2 {
+    let expected = (1.0 - 0.9) * z14[i] + 0.9 * y14[i]
+    if fabs(x17[i] - expected) > 1.0e-10 { eval_correct = false }
+}
+check("T17 eval params = (1-b1)*z + b1*y", eval_correct)
+
+// T18: train params = y
+let train18 = sf_get_train_params(r14)
+let mut train_eq_y = true
+for i in 0..2 {
+    if fabs(train18[i] - y14[i]) > 1.0e-10 { train_eq_y = false }
+}
+check("T18 train params = y", train_eq_y)
+
+// T19: single step reduces quadratic loss at eval point
+let loss_before = sf_quadratic_loss(p14)
+let loss_after = sf_quadratic_loss(x17)
+check("T19 single step reduces quadratic loss", loss_after < loss_before)
+
+// T20: weight decay shrinks z toward zero
+let opt20 = sf_create(0.01, 0.9, 0.999, 1.0e-8, 0.5, 0)
+let p20 = [10.0]
+let s20 = sf_init_state(1, p20)
+// Use zero gradient to isolate weight decay effect
+let r20 = sf_step(opt20, [0.0], s20, 0)
+let z20 = r20["z"]
+// With zero grad, adam_update=0, z = z - lr * wd * z = 10 - 0.01*0.5*10 = 10 - 0.05 = 9.95
+check("T20 weight decay shrinks z", z20[0] < p20[0])
+
+// T21: grad clipping reduces norm
+let big_grad = [3.0, 4.0]
+let clipped = sf_clip_global_norm(big_grad, 1.0)
+let clipped_norm = sf_grad_norm(clipped)
+check("T21 clipped norm <= max_norm", clipped_norm <= 1.0 + 1.0e-6)
+
+// T22: grad clipping preserves direction
+let ratio_orig = 3.0 / 4.0
+let ratio_clipped = clipped[0] / clipped[1]
+check("T22 clipping preserves direction", approx(ratio_clipped, ratio_orig, 1.0e-6))
+
+// T23: clipped step works end-to-end
+let opt23 = sf_create(0.01, 0.9, 0.999, 1.0e-8, 0.0, 0)
+let s23 = sf_init_state(2, [5.0, -3.0])
+let r23 = sf_step_clipped(opt23, [5.0, -3.0], s23, 0, 1.0)
+let x23 = sf_get_eval_params(opt23, r23)
+let loss23 = sf_quadratic_loss(x23)
+let loss23_init = sf_quadratic_loss([5.0, -3.0])
+check("T23 clipped step reduces loss", loss23 < loss23_init)
+
+// T24: multiple steps converge on quadratic (>90% loss drop)
+let p24 = [5.0, -3.0, 7.0, -1.0]
+let opt24 = sf_create(0.05, 0.9, 0.999, 1.0e-8, 0.0, 0)
+let mut state24 = sf_init_state(4, p24)
+let loss24_init = sf_quadratic_loss(p24)
+for step24 in 0..300 {
+    let y24 = sf_get_train_params(state24)
+    let g24 = sf_quadratic_grad(y24)
+    state24 = sf_step(opt24, g24, state24, step24)
+}
+let x24 = sf_get_eval_params(opt24, state24)
+let loss24_final = sf_quadratic_loss(x24)
+check("T24 300 steps converge: loss drops >90%", loss24_final < loss24_init * 0.1)
+
+// T25: z and y diverge (z is base/slow, y is fast)
+let z25 = state24["z"]
+let y25 = state24["y"]
+let mut zy_differ = false
+for i in 0..4 {
+    if fabs(z25[i] - y25[i]) > 1.0e-6 { zy_differ = true }
+}
+check("T25 z and y diverge", zy_differ)
+
+// T26: eval point x is between z and y (componentwise, since b1 in (0,1))
+let x26 = sf_get_eval_params(opt24, state24)
+let mut x_between = true
+for i in 0..4 {
+    let lo = sf_min_f(z25[i], y25[i])
+    let hi = sf_max_f(z25[i], y25[i])
+    if x26[i] < lo - 1.0e-10 { x_between = false }
+    if x26[i] > hi + 1.0e-10 { x_between = false }
+}
+check("T26 eval x is between z and y", x_between)
+
+// T27: sf vs adamw both reduce loss
+let init27 = [3.0, -2.0, 4.0, -1.0]
+let cmp27 = sf_compare(init27, 100)
+let init27_loss = sf_quadratic_loss(init27)
+check("T27 Schedule-Free reduces loss", cmp27[0] < init27_loss)
+check("T27b AdamW reduces loss", cmp27[1] < init27_loss)
+
+// T28: warmup reduces effective lr
+// Step during warmup should produce smaller z update than step without warmup
+let opt28w = sf_create(0.1, 0.9, 0.999, 1.0e-8, 0.0, 100)
+let opt28n = sf_create(0.1, 0.9, 0.999, 1.0e-8, 0.0, 0)
+let p28 = [5.0]
+let s28 = sf_init_state(1, p28)
+let g28 = [5.0]
+let r28w = sf_step(opt28w, g28, s28, 0)
+let r28n = sf_step(opt28n, g28, s28, 0)
+// With warmup, z moves less
+let z_delta_w = fabs(r28w["z"][0] - p28[0])
+let z_delta_n = fabs(r28n["z"][0] - p28[0])
+check("T28 warmup reduces z movement", z_delta_w < z_delta_n)
+
+// T29: step counter increments
+check("T29 step counter increments", r14["step"] == 1)
+
+// T30: memory usage same for sf and adam
+let mem30 = sf_memory_usage(512, 100)
+check("T30 sf and adam same memory", mem30[0] == mem30[1])
+
+// ===================================================================
+println("")
+println("=== schedule_free test summary ===")
+println("PASS: " + str(pass_count))
+println("FAIL: " + str(fail_count))
+println("TOTAL: " + str(pass_count + fail_count))

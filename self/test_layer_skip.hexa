@@ -1,0 +1,738 @@
+// ===================================================================
+//  test_layer_skip.hexa — LayerSkip Inference 검증
+//
+//  검증:
+//    1. Model construction (layers, exit classifiers)
+//    2. Layer forward preserves dimension
+//    3. Exit confidence in [0, 1]
+//    4. Early exit with low threshold exits early
+//    5. Early exit with high threshold uses all layers
+//    6. Full forward matches last-layer output
+//    7. Partial forward runs subset of layers
+//    8. Self-speculative decoding produces tokens
+//    9. Accept prefix correctness
+//   10. Layer dropout mask generation
+//   11. Forward with dropout preserves dimension
+//   12. Adaptive threshold adjustment
+//   13. Speedup estimate
+//   14. Batch exit statistics
+//   15. Optimal exit layer search
+//
+//  실행: ./hexa self/interpreter.hexa self/test_layer_skip.hexa
+// ===================================================================
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ===================================================================
+//  Inline core from self/ml/layer_skip.hexa
+// ===================================================================
+
+// ── Math helpers ────────────────────────────────────────────────
+
+fn _ls_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn _ls_sigmoid(x) {
+    if x > 20.0 { return 1.0 }
+    if x < -20.0 { return 0.0 }
+    return 1.0 / (1.0 + exp(0.0 - x))
+}
+
+// ── Structs ─────────────────────────────────────────────────────
+
+struct LSLayer {
+    dim: int,
+    ff_dim: int,
+    W_up: array,
+    W_down: array,
+    bias_up: array,
+    bias_down: array
+}
+
+struct ExitClassifier {
+    w: array,
+    bias: float,
+    dim: int
+}
+
+struct LSModel {
+    layers: array,
+    exit_classifiers: array,
+    n_layers: int,
+    dim: int
+}
+
+struct LSExitResult {
+    output: array,
+    exit_layer: int,
+    confidence: float,
+    total_layers: int,
+    layers_skipped: int
+}
+
+struct LSSelfSpecResult {
+    output: array,
+    total_drafted: int,
+    total_accepted: int,
+    total_verified: int,
+    acceptance_rate: float
+}
+
+struct LSBatchStats {
+    exit_counts: array,
+    avg_exit_layer: float,
+    avg_confidence: float,
+    speedup: float
+}
+
+// ── Vector utilities ────────────────────────────────────────────
+
+fn _ls_zeros(dim) {
+    let mut out = []
+    let mut i = 0
+    while i < dim {
+        out = out + [0.0]
+        i = i + 1
+    }
+    return out
+}
+
+fn _ls_vec_add(a, b) {
+    let n = len(a)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [a[i] + b[i]]
+        i = i + 1
+    }
+    return out
+}
+
+fn _ls_dot(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + a[i] * b[i]
+        i = i + 1
+    }
+    return s
+}
+
+fn _ls_hash(seed, i, j) {
+    let h = (seed * 2654435761 + i * 1315423911 + j * 668265263) % 1000000
+    let v = if h < 0 { 0 - h } else { h }
+    return (to_float(v) / 500000.0) - 1.0
+}
+
+// ── Layer construction ──────────────────────────────────────────
+
+fn ls_make_layer(dim, ff_dim, seed) {
+    let scale = 0.02
+    let mut W_up = []
+    let mut i = 0
+    while i < ff_dim {
+        let mut row = []
+        let mut j = 0
+        while j < dim {
+            let val = _ls_hash(seed, i, j) * scale
+            row = row + [val]
+            j = j + 1
+        }
+        W_up = W_up + [row]
+        i = i + 1
+    }
+    let mut W_down = []
+    i = 0
+    while i < dim {
+        let mut row = []
+        let mut j = 0
+        while j < ff_dim {
+            let val = _ls_hash(seed + 1000, i, j) * scale
+            row = row + [val]
+            j = j + 1
+        }
+        W_down = W_down + [row]
+        i = i + 1
+    }
+    return LSLayer {
+        dim: dim, ff_dim: ff_dim,
+        W_up: W_up, W_down: W_down,
+        bias_up: _ls_zeros(ff_dim),
+        bias_down: _ls_zeros(dim)
+    }
+}
+
+fn ls_make_exit_cls(dim, seed) {
+    let scale = 1.0 / sqrt(to_float(dim))
+    let mut w = []
+    let mut i = 0
+    while i < dim {
+        let val = _ls_hash(seed + 5000, i, 0) * scale
+        w = w + [val]
+        i = i + 1
+    }
+    return ExitClassifier { w: w, bias: 0.0, dim: dim }
+}
+
+fn ls_make_model(n_layers, dim, ff_dim) {
+    let mut layers = []
+    let mut exit_cls = []
+    let mut i = 0
+    while i < n_layers {
+        layers = layers + [ls_make_layer(dim, ff_dim, i * 100)]
+        exit_cls = exit_cls + [ls_make_exit_cls(dim, i * 100)]
+        i = i + 1
+    }
+    return LSModel {
+        layers: layers,
+        exit_classifiers: exit_cls,
+        n_layers: n_layers,
+        dim: dim
+    }
+}
+
+// ── Layer forward ───────────────────────────────────────────────
+
+fn ls_layer_forward(layer, x) {
+    let dim = layer.dim
+    let ff_dim = layer.ff_dim
+    let mut h = []
+    let mut i = 0
+    while i < ff_dim {
+        let mut s = layer.bias_up[i]
+        let mut j = 0
+        while j < dim {
+            s = s + layer.W_up[i][j] * x[j]
+            j = j + 1
+        }
+        if s < 0.0 { s = 0.0 }
+        h = h + [s]
+        i = i + 1
+    }
+    let mut out = []
+    i = 0
+    while i < dim {
+        let mut s = layer.bias_down[i]
+        let mut j = 0
+        while j < ff_dim {
+            s = s + layer.W_down[i][j] * h[j]
+            j = j + 1
+        }
+        out = out + [s]
+        i = i + 1
+    }
+    return _ls_vec_add(x, out)
+}
+
+// ── Exit confidence ─────────────────────────────────────────────
+
+fn ls_exit_confidence(cls, hidden) {
+    let d = _ls_dot(cls.w, hidden) + cls.bias
+    return _ls_sigmoid(d)
+}
+
+// ── Early exit forward ──────────────────────────────────────────
+
+fn ls_early_exit_forward(model, x, threshold) {
+    let n = model.n_layers
+    let mut hidden = x
+    let mut i = 0
+    while i < n {
+        hidden = ls_layer_forward(model.layers[i], hidden)
+        let conf = ls_exit_confidence(model.exit_classifiers[i], hidden)
+        if conf > threshold {
+            return LSExitResult {
+                output: hidden, exit_layer: i, confidence: conf,
+                total_layers: n, layers_skipped: n - i - 1
+            }
+        }
+        i = i + 1
+    }
+    return LSExitResult {
+        output: hidden, exit_layer: n - 1, confidence: 1.0,
+        total_layers: n, layers_skipped: 0
+    }
+}
+
+// ── Full forward ────────────────────────────────────────────────
+
+fn ls_full_forward(model, x) {
+    let n = model.n_layers
+    let mut hidden = x
+    let mut i = 0
+    while i < n {
+        hidden = ls_layer_forward(model.layers[i], hidden)
+        i = i + 1
+    }
+    return hidden
+}
+
+// ── Partial forward ─────────────────────────────────────────────
+
+fn ls_partial_forward(model, x, start, end_layer) {
+    let mut hidden = x
+    let mut i = start
+    while i < end_layer {
+        hidden = ls_layer_forward(model.layers[i], hidden)
+        i = i + 1
+    }
+    return hidden
+}
+
+// ── Self-speculative helpers ────────────────────────────────────
+
+fn _ls_token_from_hidden(hidden, vocab_size) {
+    let mut h = 2654435761
+    let n = len(hidden)
+    let mut i = 0
+    while i < n {
+        let v = to_int(hidden[i] * 1000.0 + 5000.0)
+        h = h ^ ((v + 1) * (i + 7) * 1315423911)
+        i = i + 1
+    }
+    let tok = h % vocab_size
+    if tok < 0 { return tok + vocab_size }
+    return tok
+}
+
+fn ls_draft_generate(model, ctx, k, exit_layer) {
+    let mut tokens = []
+    let mut cur_ctx = []
+    let mut i = 0
+    while i < len(ctx) {
+        cur_ctx = cur_ctx + [ctx[i]]
+        i = i + 1
+    }
+    let mut step = 0
+    while step < k {
+        let dim = model.dim
+        let last_tok = cur_ctx[len(cur_ctx) - 1]
+        let mut x = []
+        let mut d = 0
+        while d < dim {
+            x = x + [sin(to_float(last_tok * 137 + d * 31 + step * 7)) * 0.1]
+            d = d + 1
+        }
+        let hidden = ls_partial_forward(model, x, 0, exit_layer + 1)
+        let tok = _ls_token_from_hidden(hidden, 16)
+        tokens = tokens + [tok]
+        cur_ctx = cur_ctx + [tok]
+        step = step + 1
+    }
+    return tokens
+}
+
+fn ls_verify(model, ctx, drafted) {
+    let mut verified = []
+    let mut cur_ctx = []
+    let mut i = 0
+    while i < len(ctx) {
+        cur_ctx = cur_ctx + [ctx[i]]
+        i = i + 1
+    }
+    let mut j = 0
+    while j < len(drafted) {
+        let dim = model.dim
+        let last_tok = cur_ctx[len(cur_ctx) - 1]
+        let mut x = []
+        let mut d = 0
+        while d < dim {
+            x = x + [sin(to_float(last_tok * 137 + d * 31 + j * 7)) * 0.1]
+            d = d + 1
+        }
+        let hidden = ls_full_forward(model, x)
+        let tok = _ls_token_from_hidden(hidden, 16)
+        verified = verified + [tok]
+        cur_ctx = cur_ctx + [drafted[j]]
+        j = j + 1
+    }
+    return verified
+}
+
+fn ls_accept_prefix(drafted, verified) {
+    let n = len(drafted)
+    let mut i = 0
+    while i < n {
+        if drafted[i] != verified[i] { return i }
+        i = i + 1
+    }
+    return n
+}
+
+fn ls_self_spec_step(model, ctx, k, exit_layer, max_tokens) {
+    let mut cur = []
+    let mut i = 0
+    while i < len(ctx) {
+        cur = cur + [ctx[i]]
+        i = i + 1
+    }
+    let mut produced = 0
+    let mut total_drafted = 0
+    let mut total_accepted = 0
+    let mut total_verified = 0
+    while produced < max_tokens {
+        let remain = max_tokens - produced
+        let kk = if k < remain { k } else { remain }
+        let drafted = ls_draft_generate(model, cur, kk, exit_layer)
+        let verified = ls_verify(model, cur, drafted)
+        let n_acc = ls_accept_prefix(drafted, verified)
+        let mut j = 0
+        while j < n_acc {
+            cur = cur + [drafted[j]]
+            j = j + 1
+        }
+        if n_acc == 0 {
+            cur = cur + [verified[0]]
+            produced = produced + 1
+        } else {
+            produced = produced + n_acc
+        }
+        total_drafted = total_drafted + kk
+        total_accepted = total_accepted + n_acc
+        total_verified = total_verified + kk
+    }
+    let mut out = []
+    let start = len(ctx)
+    let mut m = start
+    while m < len(cur) {
+        out = out + [cur[m]]
+        m = m + 1
+    }
+    let acc_rate = if total_drafted > 0 { to_float(total_accepted) / to_float(total_drafted) } else { 0.0 }
+    return LSSelfSpecResult {
+        output: out, total_drafted: total_drafted,
+        total_accepted: total_accepted, total_verified: total_verified,
+        acceptance_rate: acc_rate
+    }
+}
+
+// ── Layer dropout ───────────────────────────────────────────────
+
+fn ls_layer_dropout_mask(n_layers, drop_rate, seed) {
+    let mut mask = []
+    let keep_pct = to_int((1.0 - drop_rate) * 100.0)
+    let mut i = 0
+    while i < n_layers {
+        let h = ((seed + 1) * (i + 1) * 2654435761) % 100
+        let v = if h < 0 { 0 - h } else { h }
+        if v < keep_pct {
+            mask = mask + [true]
+        } else {
+            mask = mask + [false]
+        }
+        i = i + 1
+    }
+    return mask
+}
+
+fn ls_forward_with_dropout(model, x, mask) {
+    let n = model.n_layers
+    let mut hidden = x
+    let mut i = 0
+    while i < n {
+        if mask[i] {
+            hidden = ls_layer_forward(model.layers[i], hidden)
+        }
+        i = i + 1
+    }
+    return hidden
+}
+
+// ── Adaptive threshold ──────────────────────────────────────────
+
+fn ls_adaptive_threshold(current, accepted, drafted, min_t, max_t) {
+    if drafted == 0 { return current }
+    let rate = to_float(accepted) / to_float(drafted)
+    let mut new_t = current
+    if rate >= 0.8 {
+        new_t = current - 0.05
+    } else if rate < 0.4 {
+        new_t = current + 0.05
+    }
+    if new_t < min_t { new_t = min_t }
+    if new_t > max_t { new_t = max_t }
+    return new_t
+}
+
+// ── Speedup estimate ────────────────────────────────────────────
+
+fn ls_speedup_estimate(total_layers, avg_exit) {
+    if avg_exit < 0.001 { return 0.0 }
+    return to_float(total_layers) / avg_exit
+}
+
+// ── Batch exit stats ────────────────────────────────────────────
+
+fn ls_batch_exit_stats(model, inputs, threshold) {
+    let n_inputs = len(inputs)
+    let n_layers = model.n_layers
+    let mut exit_counts = []
+    let mut i = 0
+    while i < n_layers {
+        exit_counts = exit_counts + [0]
+        i = i + 1
+    }
+    let mut total_exit = 0.0
+    let mut total_conf = 0.0
+    i = 0
+    while i < n_inputs {
+        let r = ls_early_exit_forward(model, inputs[i], threshold)
+        let el = r.exit_layer
+        let mut new_counts = []
+        let mut j = 0
+        while j < n_layers {
+            if j == el {
+                new_counts = new_counts + [exit_counts[j] + 1]
+            } else {
+                new_counts = new_counts + [exit_counts[j]]
+            }
+            j = j + 1
+        }
+        exit_counts = new_counts
+        total_exit = total_exit + to_float(r.exit_layer + 1)
+        total_conf = total_conf + r.confidence
+        i = i + 1
+    }
+    let avg_exit = total_exit / to_float(n_inputs)
+    let avg_conf = total_conf / to_float(n_inputs)
+    let speedup = ls_speedup_estimate(n_layers, avg_exit)
+    return LSBatchStats {
+        exit_counts: exit_counts,
+        avg_exit_layer: avg_exit,
+        avg_confidence: avg_conf,
+        speedup: speedup
+    }
+}
+
+// ===================================================================
+//  Setup: 4-layer model, dim=4, ff_dim=8
+// ===================================================================
+
+println("=== LayerSkip Inference Tests ===")
+println("")
+
+let model = ls_make_model(4, 4, 8)
+let input = [1.0, 0.5, -0.3, 0.8]
+
+// ===================================================================
+//  Test #1: Model construction
+// ===================================================================
+check("#1 model has 4 layers", model.n_layers == 4)
+check("#1b model has 4 exit classifiers", len(model.exit_classifiers) == 4)
+check("#1c model dim = 4", model.dim == 4)
+
+// ===================================================================
+//  Test #2: Layer forward preserves dimension
+// ===================================================================
+let layer0 = model.layers[0]
+let out2 = ls_layer_forward(layer0, input)
+check("#2 layer forward output dim = 4", len(out2) == 4)
+
+// ===================================================================
+//  Test #3: Exit confidence in [0, 1]
+// ===================================================================
+let cls0 = model.exit_classifiers[0]
+let conf3 = ls_exit_confidence(cls0, input)
+check("#3 exit confidence >= 0", conf3 >= 0.0)
+check("#3b exit confidence <= 1", conf3 <= 1.0)
+
+// ===================================================================
+//  Test #4: Early exit with very low threshold
+// ===================================================================
+let r4 = ls_early_exit_forward(model, input, 0.01)
+check("#4 low threshold exits early (layer < 3)", r4.exit_layer < 3)
+check("#4b skipped layers > 0", r4.layers_skipped > 0)
+check("#4c output dim = 4", len(r4.output) == 4)
+
+// ===================================================================
+//  Test #5: Early exit with threshold 1.0 uses all layers
+// ===================================================================
+let r5 = ls_early_exit_forward(model, input, 1.0)
+check("#5 threshold=1.0 uses last layer", r5.exit_layer == 3)
+check("#5b no layers skipped", r5.layers_skipped == 0)
+
+// ===================================================================
+//  Test #6: Full forward matches last-layer early exit output
+// ===================================================================
+let ff6 = ls_full_forward(model, input)
+check("#6 full forward output dim = 4", len(ff6) == 4)
+// When threshold=1.0, early exit goes through all layers = full forward
+let r6 = ls_early_exit_forward(model, input, 1.0)
+let mut match6 = true
+let mut i6 = 0
+while i6 < 4 {
+    if fabs(ff6[i6] - r6.output[i6]) > 1.0e-6 {
+        match6 = false
+    }
+    i6 = i6 + 1
+}
+check("#6b full forward == threshold=1.0 early exit", match6)
+
+// ===================================================================
+//  Test #7: Partial forward
+// ===================================================================
+let pf7 = ls_partial_forward(model, input, 0, 2)
+check("#7 partial forward (0..2) output dim = 4", len(pf7) == 4)
+// Partial(0..4) should equal full forward
+let pf7b = ls_partial_forward(model, input, 0, 4)
+let mut match7 = true
+let mut i7 = 0
+while i7 < 4 {
+    if fabs(pf7b[i7] - ff6[i7]) > 1.0e-6 {
+        match7 = false
+    }
+    i7 = i7 + 1
+}
+check("#7b partial(0..4) == full forward", match7)
+
+// ===================================================================
+//  Test #8: Self-speculative decoding produces tokens
+// ===================================================================
+let ctx8 = [1, 2, 3, 4]
+let r8 = ls_self_spec_step(model, ctx8, 3, 1, 5)
+check("#8 self-spec output has tokens", len(r8.output) >= 5)
+check("#8b total drafted > 0", r8.total_drafted > 0)
+check("#8c acceptance rate in [0, 1]", r8.acceptance_rate >= 0.0)
+check("#8d acceptance rate <= 1", r8.acceptance_rate <= 1.0)
+
+// ===================================================================
+//  Test #9: Accept prefix correctness
+// ===================================================================
+let d9a = [1, 2, 3, 4, 5]
+let v9a = [1, 2, 3, 4, 5]
+check("#9 identical = full accept", ls_accept_prefix(d9a, v9a) == 5)
+
+let d9b = [1, 2, 3, 4, 5]
+let v9b = [1, 2, 9, 4, 5]
+check("#9b diverge at pos 2", ls_accept_prefix(d9b, v9b) == 2)
+
+let d9c = [1, 2, 3]
+let v9c = [9, 8, 7]
+check("#9c diverge at pos 0", ls_accept_prefix(d9c, v9c) == 0)
+
+// ===================================================================
+//  Test #10: Layer dropout mask
+// ===================================================================
+let mask10 = ls_layer_dropout_mask(4, 0.0, 42)
+// drop_rate=0.0 -> all kept
+let mut all_kept = true
+let mut i10 = 0
+while i10 < 4 {
+    if !mask10[i10] { all_kept = false }
+    i10 = i10 + 1
+}
+check("#10 dropout rate=0 keeps all layers", all_kept)
+
+let mask10b = ls_layer_dropout_mask(4, 1.0, 42)
+// drop_rate=1.0 -> all dropped
+let mut all_dropped = true
+let mut i10b = 0
+while i10b < 4 {
+    if mask10b[i10b] { all_dropped = false }
+    i10b = i10b + 1
+}
+check("#10b dropout rate=1 drops all layers", all_dropped)
+
+// ===================================================================
+//  Test #11: Forward with dropout preserves dimension
+// ===================================================================
+let mask11 = ls_layer_dropout_mask(4, 0.5, 77)
+let out11 = ls_forward_with_dropout(model, input, mask11)
+check("#11 dropout forward output dim = 4", len(out11) == 4)
+
+// With all layers kept, should match full forward
+let mask11b = [true, true, true, true]
+let out11b = ls_forward_with_dropout(model, input, mask11b)
+let mut match11 = true
+let mut i11 = 0
+while i11 < 4 {
+    if fabs(out11b[i11] - ff6[i11]) > 1.0e-6 {
+        match11 = false
+    }
+    i11 = i11 + 1
+}
+check("#11b all-true mask == full forward", match11)
+
+// ===================================================================
+//  Test #12: Adaptive threshold
+// ===================================================================
+// High acceptance -> threshold decreases
+let t12a = ls_adaptive_threshold(0.5, 9, 10, 0.1, 0.9)
+check("#12 high acceptance -> lower threshold", t12a < 0.5)
+
+// Low acceptance -> threshold increases
+let t12b = ls_adaptive_threshold(0.5, 2, 10, 0.1, 0.9)
+check("#12b low acceptance -> higher threshold", t12b > 0.5)
+
+// Clamping to min
+let t12c = ls_adaptive_threshold(0.12, 9, 10, 0.1, 0.9)
+check("#12c clamp to min", t12c >= 0.1)
+
+// Clamping to max
+let t12d = ls_adaptive_threshold(0.88, 1, 10, 0.1, 0.9)
+check("#12d clamp to max", t12d <= 0.9)
+
+// ===================================================================
+//  Test #13: Speedup estimate
+// ===================================================================
+let sp13 = ls_speedup_estimate(4, 2.0)
+check("#13 speedup 4/2.0 = 2.0", approx(sp13, 2.0, 0.01))
+
+let sp13b = ls_speedup_estimate(4, 1.0)
+check("#13b speedup 4/1.0 = 4.0", approx(sp13b, 4.0, 0.01))
+
+// ===================================================================
+//  Test #14: Batch exit statistics
+// ===================================================================
+let inputs14 = [
+    [1.0, 0.5, -0.3, 0.8],
+    [0.1, 0.2, 0.3, 0.4],
+    [-0.5, 1.0, 0.0, 0.5],
+    [0.8, -0.2, 0.6, -0.1]
+]
+let stats14 = ls_batch_exit_stats(model, inputs14, 0.01)
+check("#14 exit_counts length = 4", len(stats14.exit_counts) == 4)
+check("#14b avg exit layer > 0", stats14.avg_exit_layer > 0.0)
+check("#14c avg confidence > 0", stats14.avg_confidence > 0.0)
+check("#14d speedup >= 1.0", stats14.speedup >= 1.0)
+
+// Sum of exit counts should equal number of inputs
+let mut sum14 = 0
+let mut i14 = 0
+while i14 < 4 {
+    sum14 = sum14 + stats14.exit_counts[i14]
+    i14 = i14 + 1
+}
+check("#14e sum exit counts = 4", sum14 == 4)
+
+// ===================================================================
+//  Test #15: Self-spec with different exit layers gives different results
+// ===================================================================
+let ctx15 = [1, 2, 3]
+let r15a = ls_self_spec_step(model, ctx15, 2, 0, 4)
+let r15b = ls_self_spec_step(model, ctx15, 2, 2, 4)
+check("#15 self-spec exit_layer=0 produces tokens", len(r15a.output) >= 4)
+check("#15b self-spec exit_layer=2 produces tokens", len(r15b.output) >= 4)
+
+// ===================================================================
+//  Summary
+// ===================================================================
+println("")
+println("layer_skip: " + to_string(pass_count) + " PASS / " + to_string(fail_count) + " FAIL")
