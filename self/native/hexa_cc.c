@@ -107,6 +107,13 @@ HexaVal p_pending_link;
 HexaVal p_pending_attrs;
 HexaVal p_errors;
 HexaVal p_max_errors;
+/* rt-35 fix: disambiguate struct-literal from control-flow block.
+ * When parsing the condition expression of if/while or the scrutinee of match,
+ * or the iter-expr of for, we must NOT interpret `IDENT {` as a struct
+ * literal, otherwise `if t == TAG_INT { return "int" }` is parsed as
+ * `if (t == TAG_INT { return: "int" })` (a struct init with return: "int").
+ * Set to 1 while parsing these contexts; parse_primary consults it. */
+int p_no_struct_lit = 0;
 
 HexaVal Token(HexaVal kind, HexaVal value, HexaVal line, HexaVal col) {
     HexaVal __s = hexa_map_new();
@@ -358,7 +365,10 @@ HexaVal p_expect_ident(void) {
 
 
 HexaVal p_skip_newlines(void) {
-    while (hexa_truthy(hexa_eq(p_peek_kind(), hexa_str("Newline")))) {
+    /* rt-35 fix: treat `;` as a statement terminator equivalent to Newline,
+     * so `a; b; c` inside a block parses as three statements. */
+    while (hexa_truthy(hexa_eq(p_peek_kind(), hexa_str("Newline")))
+        || hexa_truthy(hexa_eq(p_peek_kind(), hexa_str("Semicolon")))) {
         p_pos = hexa_add(p_pos, hexa_int(1));
     }
     return hexa_void();
@@ -422,6 +432,18 @@ HexaVal parse_strict(HexaVal tokens) {
 
 HexaVal parse_stmt(void) {
     p_skip_newlines();
+    /* rt-35 fix: accept `pub` visibility prefix on declarations.
+     * `pub let ...`, `pub fn ...`, `pub struct ...` etc. We consume `pub`
+     * (and optional `pub(scope)`) and fall through to the normal stmt parse. */
+    if (hexa_truthy(hexa_eq(p_peek_kind(), hexa_str("Pub")))) {
+        p_advance();
+        if (hexa_truthy(hexa_eq(p_peek_kind(), hexa_str("LParen")))) {
+            p_advance();
+            if (hexa_truthy(hexa_eq(p_peek_kind(), hexa_str("Ident")))) { p_advance(); }
+            if (hexa_truthy(hexa_eq(p_peek_kind(), hexa_str("RParen")))) { p_advance(); }
+        }
+        p_skip_newlines();
+    }
     while (hexa_truthy(hexa_eq(p_peek_kind(), hexa_str("At")))) {
         p_advance();
         HexaVal attr_name = p_expect_ident();
@@ -914,7 +936,9 @@ HexaVal parse_for_stmt(void) {
         p_record_error(hexa_map_get(in_tok, "line"), hexa_map_get(in_tok, "col"), for_msg);
         hexa_println(hexa_add(hexa_str("Parse error: "), for_msg));
     }
+    int __prev_nsl_for = p_no_struct_lit; p_no_struct_lit = 1;
     HexaVal iter = parse_expr();
+    p_no_struct_lit = __prev_nsl_for;
     HexaVal body = parse_block();
     return hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_new(), "kind", hexa_str("ForStmt")), "name", var), "value", hexa_str("")), "op", hexa_str("")), "left", hexa_str("")), "right", hexa_str("")), "cond", hexa_str("")), "then_body", hexa_str("")), "else_body", hexa_str("")), "params", hexa_str("")), "body", body), "args", hexa_str("")), "fields", hexa_str("")), "items", hexa_str("")), "variants", hexa_str("")), "arms", hexa_str("")), "iter_expr", iter), "ret_type", hexa_str("")), "target", hexa_str("")), "trait_name", hexa_str("")), "methods", hexa_str(""));
     return hexa_void();
@@ -923,7 +947,9 @@ HexaVal parse_for_stmt(void) {
 
 HexaVal parse_while_stmt(void) {
     p_advance();
+    int __prev_nsl = p_no_struct_lit; p_no_struct_lit = 1;
     HexaVal cond = parse_expr();
+    p_no_struct_lit = __prev_nsl;
     HexaVal body = parse_block();
     return hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_new(), "kind", hexa_str("WhileStmt")), "name", hexa_str("")), "value", hexa_str("")), "op", hexa_str("")), "left", hexa_str("")), "right", hexa_str("")), "cond", cond), "then_body", hexa_str("")), "else_body", hexa_str("")), "params", hexa_str("")), "body", body), "args", hexa_str("")), "fields", hexa_str("")), "items", hexa_str("")), "variants", hexa_str("")), "arms", hexa_str("")), "iter_expr", hexa_str("")), "ret_type", hexa_str("")), "target", hexa_str("")), "trait_name", hexa_str("")), "methods", hexa_str(""));
     return hexa_void();
@@ -940,7 +966,9 @@ HexaVal parse_loop_stmt(void) {
 
 HexaVal parse_if_expr(void) {
     p_advance();
+    int __prev_nsl = p_no_struct_lit; p_no_struct_lit = 1;
     HexaVal cond = parse_expr();
+    p_no_struct_lit = __prev_nsl;
     HexaVal then_b = parse_block();
     HexaVal saved = p_pos;
     p_skip_newlines();
@@ -963,7 +991,9 @@ HexaVal parse_if_expr(void) {
 
 HexaVal parse_match_expr(void) {
     p_advance();
+    int __prev_nsl_m = p_no_struct_lit; p_no_struct_lit = 1;
     HexaVal scrutinee = parse_expr();
+    p_no_struct_lit = __prev_nsl_m;
     p_expect(hexa_str("LBrace"));
     p_skip_newlines();
     HexaVal arms = hexa_array_new();
@@ -1235,7 +1265,7 @@ HexaVal parse_primary(void) {
                 }
             }
         }
-        if (hexa_truthy(hexa_eq(p_peek_kind(), hexa_str("LBrace")))) {
+        if (hexa_truthy(hexa_eq(p_peek_kind(), hexa_str("LBrace"))) && !p_no_struct_lit) {
             HexaVal chars = hexa_str_chars(name);
             if (hexa_truthy(hexa_bool((hexa_int(hexa_len(chars))).i > (hexa_int(0)).i))) {
                 HexaVal first_ch = hexa_index_get(chars, hexa_int(0));
@@ -4479,7 +4509,7 @@ HexaVal codegen_c2(HexaVal ast) {
                         } else {
                             if (hexa_truthy(hexa_eq(k, hexa_str("TraitDecl")))) {
                             } else {
-                                if (hexa_truthy(hexa_eq(k, hexa_str("LetMutStmt")))) {
+                                if (hexa_truthy(hexa_bool(hexa_truthy(hexa_eq(k, hexa_str("LetMutStmt"))) || hexa_truthy(hexa_eq(k, hexa_str("LetStmt")))))) {
                                     global_parts = hexa_array_push(global_parts, hexa_add(hexa_add(hexa_str("HexaVal "), hexa_map_get(hexa_index_get(ast, i), "name")), hexa_str(";\n")));
                                     if (hexa_truthy(hexa_bool(!hexa_truthy(hexa_eq(hexa_type_of(hexa_map_get(hexa_index_get(ast, i), "left")), hexa_str("string")))))) {
                                         main_parts = hexa_array_push(main_parts, hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("    "), hexa_map_get(hexa_index_get(ast, i), "name")), hexa_str(" = ")), gen2_expr(hexa_map_get(hexa_index_get(ast, i), "left"))), hexa_str(";\n")));
@@ -6256,7 +6286,7 @@ HexaVal codegen_c2_full(HexaVal ast) {
                         } else {
                             if (hexa_truthy(hexa_eq(k, hexa_str("TraitDecl")))) {
                             } else {
-                                if (hexa_truthy(hexa_eq(k, hexa_str("LetMutStmt")))) {
+                                if (hexa_truthy(hexa_bool(hexa_truthy(hexa_eq(k, hexa_str("LetMutStmt"))) || hexa_truthy(hexa_eq(k, hexa_str("LetStmt")))))) {
                                     global_parts = hexa_array_push(global_parts, hexa_add(hexa_add(hexa_str("HexaVal "), hexa_map_get(hexa_index_get(ast, i), "name")), hexa_str(";\n")));
                                     if (hexa_truthy(hexa_bool(!hexa_truthy(hexa_eq(hexa_type_of(hexa_map_get(hexa_index_get(ast, i), "left")), hexa_str("string")))))) {
                                         main_parts = hexa_array_push(main_parts, hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("    "), hexa_map_get(hexa_index_get(ast, i), "name")), hexa_str(" = ")), gen2_expr(hexa_map_get(hexa_index_get(ast, i), "left"))), hexa_str(";\n")));
