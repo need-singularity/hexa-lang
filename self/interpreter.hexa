@@ -180,6 +180,8 @@ let NK_MACRO_INVOCATION = 48
 let NK_TRY_CATCH_EXPR = 49
 let NK_TRY_CATCH     = 50
 let NK_MATCH_EXPR    = 51
+let NK_OPT_FIELD     = 52
+let NK_LIST_COMP     = 53
 
 // ── Numeric dispatch IDs — binary operators ─────────────
 let OP_UNKNOWN  = 0
@@ -202,6 +204,10 @@ let OP_BIT_OR   = 16
 let OP_BIT_XOR  = 17
 let OP_SHL      = 18
 let OP_SHR      = 19
+let OP_NULL_COAL = 20
+let OP_PIPE      = 21
+let OP_IN        = 22
+let OP_IS        = 23
 
 // ── Node-kind string → int conversion (called once per node) ──
 fn node_kind_to_id(kind) {
@@ -256,6 +262,8 @@ fn node_kind_to_id(kind) {
     if kind == "TryCatchExpr" { return NK_TRY_CATCH_EXPR }
     if kind == "TryCatch" { return NK_TRY_CATCH }
     if kind == "MatchExpr" { return NK_MATCH_EXPR }
+    if kind == "OptField" { return NK_OPT_FIELD }
+    if kind == "ListComp" { return NK_LIST_COMP }
     return NK_UNKNOWN
 }
 
@@ -280,6 +288,10 @@ fn op_to_id(op) {
     if op == "^" { return OP_BIT_XOR }
     if op == "<<" { return OP_SHL }
     if op == ">>" { return OP_SHR }
+    if op == "??" { return OP_NULL_COAL }
+    if op == "|>" { return OP_PIPE }
+    if op == "in" { return OP_IN }
+    if op == "is" { return OP_IS }
     return OP_UNKNOWN
 }
 
@@ -893,7 +905,7 @@ fn try_fuse_chain(obj_expr, final_method, final_args) {
                 if current.kind == "Call" {
                     // parser AST stores callee in `left` field
                     let callee = current.left
-                    if type_of(callee) != "string" && callee.kind == "Field" {
+                    if type_of(callee) != "string" && (callee.kind == "Field" || callee.kind == "OptField") {
                         let m = callee.name
                         if m == "map" || m == "filter" {
                             ops_methods = ops_methods.push(m)
@@ -1331,6 +1343,109 @@ fn eval_expr_inner(node) {
     if kid == NK_IDENT { return env_lookup(node.name) }
 
     if kid == NK_BIN_OP {
+        // ── is operator: v is int — type check without evaluating RHS ──
+        if node.op == "is" {
+            let lv = eval_expr(node.left)
+            let type_name = node.right.name
+            if type_name == "int" { return val_bool(lv.tag == TAG_INT) }
+            if type_name == "float" { return val_bool(lv.tag == TAG_FLOAT) }
+            if type_name == "str" || type_name == "string" { return val_bool(lv.tag == TAG_STR) }
+            if type_name == "bool" { return val_bool(lv.tag == TAG_BOOL) }
+            if type_name == "char" { return val_bool(lv.tag == TAG_CHAR) }
+            if type_name == "array" { return val_bool(lv.tag == TAG_ARRAY) }
+            if type_name == "map" { return val_bool(lv.tag == TAG_MAP) }
+            if type_name == "fn" || type_name == "function" { return val_bool(lv.tag == TAG_FN) }
+            if type_name == "void" { return val_bool(lv.tag == TAG_VOID) }
+            if type_name == "struct" { return val_bool(lv.tag == TAG_STRUCT) }
+            if type_name == "enum" { return val_bool(lv.tag == TAG_ENUM) }
+            if type_name == "error" { return val_bool(lv.tag == TAG_ERROR) }
+            // User-defined struct type name
+            if lv.tag == TAG_STRUCT && lv.struct_name == type_name { return val_bool(true) }
+            return val_bool(false)
+        }
+        // ── Pipe operator: x |> f  desugars to  f(x) ──
+        if node.op == "|>" {
+            let lv = eval_expr(node.left)
+            if throw_flag || panic_flag { return val_void() }
+            let rk = node.right.kind
+            // x |> f(y)  =>  f(x, y)  — partial call, prepend left as first arg
+            if rk == "Call" {
+                let mut call_args = [lv]
+                let raw_args = node.right.args
+                if type_of(raw_args) == "array" {
+                    let mut _ai = 0
+                    while _ai < len(raw_args) {
+                        call_args = call_args.push(eval_expr_at(raw_args, _ai))
+                        if throw_flag || panic_flag { return val_void() }
+                        _ai = _ai + 1
+                    }
+                }
+                let callee = node.right.left
+                if type_of(callee) != "string" && callee.kind == "Ident" {
+                    let fname = callee.name
+                    let user_info = find_fn(fname)
+                    if user_info != "" { return call_user_fn(fname, call_args) }
+                    let br = call_builtin(fname, call_args)
+                    if br.tag != "__not_builtin__" { return br }
+                    return call_user_fn(fname, call_args)
+                }
+                if type_of(callee) != "string" && callee.kind == "Field" {
+                    let obj = eval_expr(callee.left)
+                    let method = callee.name
+                    return call_method(obj, method, call_args)
+                }
+                let callee_val = eval_expr(callee)
+                if callee_val.tag == "fn" { return call_fn_val(callee_val, call_args) }
+                return val_void()
+            }
+            // x |> f  =>  f(x)  — bare function name
+            if rk == "Ident" {
+                let fname = node.right.name
+                let args = [lv]
+                let user_info = find_fn(fname)
+                if user_info != "" { return call_user_fn(fname, args) }
+                let br = call_builtin(fname, args)
+                if br.tag != "__not_builtin__" { return br }
+                // Could be a closure/variable holding a fn value
+                let fn_val = env_lookup(fname)
+                if fn_val.tag == "fn" { return call_fn_val(fn_val, args) }
+                return call_user_fn(fname, args)
+            }
+            // x |> (fn(a) { ... })  =>  lambda(x)
+            if rk == "Lambda" {
+                let rv = eval_expr(node.right)
+                if rv.tag == "fn" { return call_fn_val(rv, [lv]) }
+                return val_void()
+            }
+            // Fallback: evaluate right side and try to call it
+            let rv = eval_expr(node.right)
+            if rv.tag == "fn" { return call_fn_val(rv, [lv]) }
+            println("Runtime error: pipe operator |> requires a function on the right side")
+            return val_void()
+        }
+=======
+        // 'is' operator: right side is a type name, not a value — do not evaluate it
+        if node.op == "is" {
+            let lv = eval_expr(node.left)
+            let type_name = node.right.name
+            if type_name == "int" { return val_bool(lv.tag == "int") }
+            if type_name == "float" { return val_bool(lv.tag == "float") }
+            if type_name == "str" || type_name == "string" { return val_bool(lv.tag == "str") }
+            if type_name == "bool" { return val_bool(lv.tag == "bool") }
+            if type_name == "char" { return val_bool(lv.tag == "char") }
+            if type_name == "array" { return val_bool(lv.tag == "array") }
+            if type_name == "map" { return val_bool(lv.tag == "map") }
+            if type_name == "fn" || type_name == "function" { return val_bool(lv.tag == "fn") }
+            if type_name == "void" { return val_bool(lv.tag == "void") }
+            if type_name == "struct" { return val_bool(lv.tag == "struct") }
+            if type_name == "enum" { return val_bool(lv.tag == "enum") }
+            if type_name == "error" { return val_bool(lv.tag == "error") }
+            if type_name == "pointer" { return val_bool(lv.tag == "pointer") }
+            // For user-defined struct types: check struct_name
+            if lv.tag == "struct" && lv.struct_name == type_name { return val_bool(true) }
+            return val_bool(false)
+        }
+>>>>>>> /tmp/gm_wt_interp.hexa
         let lv = eval_expr(node.left)
         let rv = eval_expr(node.right)
         return eval_binop(node.op, lv, rv)
@@ -1358,6 +1473,35 @@ fn eval_expr_inner(node) {
             items = items.push(eval_expr(item))
         }
         return val_array(items)
+    }
+
+    // List comprehension: [expr for var in iterable if cond]
+    if kid == NK_LIST_COMP {
+        let iter_val = eval_expr(node.iter_expr)
+        let mut src_items = []
+        if iter_val.tag == TAG_ARRAY {
+            src_items = get_array(iter_val)
+        } else if iter_val.tag == TAG_MAP {
+            src_items = get_map_keys(iter_val)
+        }
+        let has_filter = type_of(node.cond) != "string"
+        let mut result = []
+        let mut _lci = 0
+        while _lci < len(src_items) {
+            env_push_scope()
+            env_define(node.name, src_items[_lci])
+            if has_filter {
+                let cond_val = eval_expr(node.cond)
+                if is_truthy(cond_val) {
+                    result = result.push(eval_expr(node.left))
+                }
+            } else {
+                result = result.push(eval_expr(node.left))
+            }
+            env_pop_scope()
+            _lci = _lci + 1
+        }
+        return val_array(result)
     }
 
     if kid == NK_INDEX {
@@ -1446,7 +1590,9 @@ fn eval_expr_inner(node) {
             if br.tag != TAG_NOT_BUILTIN { return br }
             return call_user_fn(fname, call_args)
         }
-        if type_of(callee) != "string" && callee.kind == "Field" {
+        if type_of(callee) != "string" && (callee.kind == "Field" || callee.kind == "OptField") {
+            // Optional chaining: if callee is OptField and receiver is void, short-circuit
+            let is_opt_call = callee.kind == "OptField"
             // Effect call: if receiver is an Ident naming a registered effect,
             // route to eval_effect_call. effect_def_lookup returns either a
             // host array (of op names) or val_void() on miss.
@@ -1465,6 +1611,8 @@ fn eval_expr_inner(node) {
             if fuse_result.tag != TAG_NOT_FUSED { return fuse_result }
 
             let obj = eval_expr(callee.left)
+            // Optional chaining short-circuit: obj?.method() → void when obj is void
+            if is_opt_call && obj.tag == "void" { return val_void() }
             let method = callee.name
             let result = call_method(obj, method, call_args)
             // In-place mutation: if receiver is a plain Ident and method is a mutator,
@@ -1480,6 +1628,18 @@ fn eval_expr_inner(node) {
         }
         let callee_val = eval_expr(callee)
         if callee_val.tag == TAG_FN { return call_fn_val(callee_val, call_args) }
+        return val_void()
+    }
+
+    // Optional chaining: obj?.field — return void if obj is void
+    if kid == NK_OPT_FIELD {
+        let obj = eval_expr(node.left)
+        if obj.tag == TAG_VOID { return val_void() }
+        let field = node.name
+        if obj.tag == TAG_STRUCT {
+            let fields = get_struct_fields(obj)
+            return fields[field]
+        }
         return val_void()
     }
 
@@ -1803,6 +1963,33 @@ fn eval_binop(op, a, b) {
     // ── Numeric operator dispatch: convert op string → int once ──
     let oid = op_cached_id(op)
 
+    // Null coalescing: a ?? b → if a is void or empty string, return b
+    if oid == OP_NULL_COAL {
+        if a.tag == TAG_VOID { return b }
+        if a.tag == TAG_STR && a.str_val == "" { return b }
+        return a
+    }
+
+    // in operator: x in arr / key in map / sub in str
+    if oid == OP_IN {
+        if b.tag == TAG_ARRAY {
+            let items = get_array(b)
+            let mut _ii = 0
+            while _ii < len(items) {
+                if vals_equal(a, items[_ii]) { return val_bool(true) }
+                _ii = _ii + 1
+            }
+            return val_bool(false)
+        }
+        if b.tag == TAG_MAP {
+            return val_bool(map_contains_key(b, a.str_val))
+        }
+        if b.tag == TAG_STR && a.tag == TAG_STR {
+            return val_bool(b.str_val.contains(a.str_val))
+        }
+        return val_bool(false)
+    }
+
     // Int fast path
     if a.tag == TAG_INT && b.tag == TAG_INT {
         let x = a.int_val
@@ -1941,6 +2128,27 @@ fn eval_binop(op, a, b) {
             let eq = eval_binop("==", a, b)
             return val_bool(!eq.bool_val)
         }
+    }
+    // 'in' operator: a in b — membership test
+    if op == "in" {
+        if b.tag == "array" {
+            let items = get_array(b)
+            let mut ii = 0
+            while ii < len(items) {
+                if vals_equal(a, items[ii]) { return val_bool(true) }
+                ii = ii + 1
+            }
+            return val_bool(false)
+        }
+        if b.tag == "map" {
+            return val_bool(map_contains_key(b, a))
+        }
+        if b.tag == "str" {
+            if a.tag == "str" { return val_bool(b.str_val.contains(a.str_val)) }
+            if a.tag == "char" { return val_bool(b.str_val.contains(a.str_val)) }
+            return val_bool(false)
+        }
+        return val_bool(false)
     }
     // Cross-type Eq/Ne: different value types are never equal
     if oid == OP_EQ { return val_bool(false) }
@@ -2302,6 +2510,28 @@ fn exec_stmt_at(stmts, idx) {
         let result = eval_binop(node.op, lv, rv)
         if node.left.kind == "Ident" {
             env_set(node.left.name, result)
+        }
+        if node.left.kind == "Index" {
+            let arr = eval_expr(node.left.left)
+            let idx = eval_expr(node.left.right)
+            if arr.tag == "array" {
+                let items = get_array(arr)
+                let mut new_items = []
+                let mut ai = 0
+                while ai < len(items) {
+                    if ai == idx.int_val {
+                        new_items = new_items.push(result)
+                    } else {
+                        new_items = new_items.push(items[ai])
+                    }
+                    ai = ai + 1
+                }
+                array_store[arr.int_val] = new_items
+            }
+            if arr.tag == "map" {
+                let new_map = map_set(arr, idx, result)
+                map_store[arr.int_val] = map_store[new_map.int_val]
+            }
         }
         return val_void()
     }
@@ -2742,10 +2972,12 @@ fn eval_call(node) {
         }
     }
 
-    // Method call: obj.method(args)
+    // Method call: obj.method(args) or obj?.method(args)
     let callee = node.left
-    if type_of(callee) != "string" && callee.kind == "Field" {
+    if type_of(callee) != "string" && (callee.kind == "Field" || callee.kind == "OptField") {
         let obj = eval_expr(callee.left)
+        // Optional chaining short-circuit: obj?.method() → void when obj is void
+        if callee.kind == "OptField" && obj.tag == "void" { return val_void() }
         let method = callee.name
         let result = call_method(obj, method, args)
         if type_of(callee.left) != "string" && callee.left.kind == "Ident" {
@@ -9335,7 +9567,7 @@ println("Map+: to_array from_array invert count any all")
 println("Math: abs min max floor ceil round sqrt pow sin cos ln log10 exp")
 println("Math+: tan asin acos atan atan2 sigmoid relu tanh pi e log2 clamp")
 println("Math++: sign gcd lcm factorial fib is_prime mod")
-println("BinOp: + - * / % ** == != < > <= >= && || & | ^ << >> (int/float/str/char/bool/array)")
+println("BinOp: + - * / % ** == != < > <= >= && || & | ^ << >> |> ?? in is (int/float/str/char/bool/array/pipe)")
 println("UnaryOp: - ! ~ (neg not bitnot)")
 println("Functional: compose pipe curry identity constant")
 println("Error: error is_error stack_trace")

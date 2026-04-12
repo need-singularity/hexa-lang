@@ -148,6 +148,7 @@ HexaVal hexa_str_chars(HexaVal s);
 HexaVal hexa_format_n(HexaVal fmt, HexaVal args);
 HexaVal hexa_array_new(void);
 HexaVal hexa_void(void);
+HexaVal hexa_null_coal(HexaVal a, HexaVal b);
 int hexa_is_type(HexaVal v, const char* type_name);
 
 // ── Tagged Value ─────────────────────────────────────────
@@ -293,6 +294,13 @@ HexaVal hexa_int(int64_t n) { return (HexaVal){.tag=TAG_INT, .i=n}; }
 HexaVal hexa_float(double f) { return (HexaVal){.tag=TAG_FLOAT, .f=f}; }
 HexaVal hexa_bool(int b) { return (HexaVal){.tag=TAG_BOOL, .b=b}; }
 HexaVal hexa_void() { return (HexaVal){.tag=TAG_VOID}; }
+
+// Null coalescing: a ?? b — if a is void or empty string, return b
+HexaVal hexa_null_coal(HexaVal a, HexaVal b) {
+    if (a.tag == TAG_VOID) return b;
+    if (a.tag == TAG_STR && (a.s == NULL || a.s[0] == '\0')) return b;
+    return a;
+}
 
 HexaVal hexa_str(const char* s) {
     HexaVal v = {.tag=TAG_STR};

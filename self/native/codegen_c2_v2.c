@@ -807,6 +807,9 @@ HexaVal gen2_expr(HexaVal node) {
         if (hexa_truthy(hexa_eq(op, hexa_str("||")))) {
             return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_bool(hexa_truthy("), l), hexa_str(") || hexa_truthy(")), r), hexa_str("))"));
         }
+        if (hexa_truthy(hexa_eq(op, hexa_str("??")))) {
+            return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_null_coal("), l), hexa_str(", ")), r), hexa_str(")"));
+        }
         return hexa_add(hexa_add(hexa_str("/* binop "), op), hexa_str(" */"));
     }
     if (hexa_truthy(hexa_eq(k, hexa_str("UnaryOp")))) {

@@ -829,6 +829,9 @@ HexaVal tc_infer_expr(HexaVal node) {
         if (hexa_truthy(hexa_bool(hexa_truthy(hexa_bool(hexa_truthy(hexa_bool(hexa_truthy(hexa_bool(hexa_truthy(hexa_bool(hexa_truthy(hexa_eq(op, hexa_str("=="))) || hexa_truthy(hexa_eq(op, hexa_str("!="))))) || hexa_truthy(hexa_eq(op, hexa_str("<"))))) || hexa_truthy(hexa_eq(op, hexa_str(">"))))) || hexa_truthy(hexa_eq(op, hexa_str("<="))))) || hexa_truthy(hexa_eq(op, hexa_str(">=")))))) {
             return hexa_str("bool");
         }
+        if (hexa_truthy(hexa_eq(op, hexa_str("??")))) {
+            return rt;
+        }
         if (hexa_truthy(hexa_bool(hexa_truthy(hexa_bool(hexa_truthy(hexa_eq(op, hexa_str("&&"))) || hexa_truthy(hexa_eq(op, hexa_str("||"))))) || hexa_truthy(hexa_eq(op, hexa_str("^^")))))) {
             if (hexa_truthy(hexa_bool(hexa_truthy(hexa_bool(!hexa_truthy(hexa_eq(lt, hexa_str("bool"))))) && hexa_truthy(hexa_bool(!hexa_truthy(hexa_eq(lt, hexa_str("unknown")))))))) {
                 tc_error(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("Logical operator '"), op), hexa_str("' expects bool, got '")), lt), hexa_str("'")));

@@ -560,6 +560,17 @@ HexaVal tokenize(HexaVal source) {
                                                                                         pos = hexa_add(pos, hexa_int(1));
                                                                                         col = hexa_add(col, hexa_int(1));
                                                                                     } else {
+                                                                                        if (hexa_truthy(hexa_eq(ch, hexa_str("?")))) {
+                                                                                            if (hexa_truthy(hexa_bool(hexa_truthy(hexa_bool((hexa_add(pos, hexa_int(1))).i < (total).i)) && hexa_truthy(hexa_eq(hexa_index_get(chars, hexa_add(pos, hexa_int(1))), hexa_str("?")))))) {
+                                                                                                tokens = hexa_array_push(tokens, Token(hexa_str("NullCoal"), hexa_str("??"), line, start_col));
+                                                                                                pos = hexa_add(pos, hexa_int(2));
+                                                                                                col = hexa_add(col, hexa_int(2));
+                                                                                            } else {
+                                                                                                tokens = hexa_array_push(tokens, Token(hexa_str("Question"), hexa_str("?"), line, start_col));
+                                                                                                pos = hexa_add(pos, hexa_int(1));
+                                                                                                col = hexa_add(col, hexa_int(1));
+                                                                                            }
+                                                                                        } else {
                                                                                         if (hexa_truthy(hexa_eq(ch, hexa_str("@")))) {
                                                                                             tokens = hexa_array_push(tokens, Token(hexa_str("At"), hexa_str("@"), line, start_col));
                                                                                             pos = hexa_add(pos, hexa_int(1));
@@ -686,6 +697,7 @@ HexaVal tokenize(HexaVal source) {
                                                     }
                                                 }
                                             }
+                                        }
                                         }
                                     }
                                 }

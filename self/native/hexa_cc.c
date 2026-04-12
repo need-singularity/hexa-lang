@@ -52,6 +52,7 @@ HexaVal parse_match_expr(void);
 HexaVal parse_match_pattern(void);
 HexaVal parse_block(void);
 HexaVal parse_expr(void);
+HexaVal parse_null_coal(void);
 HexaVal parse_or(void);
 HexaVal parse_and(void);
 HexaVal parse_comparison(void);
@@ -1045,7 +1046,19 @@ HexaVal parse_block(void) {
 
 
 HexaVal parse_expr(void) {
-    return parse_or();
+    return parse_null_coal();
+    return hexa_void();
+}
+
+
+HexaVal parse_null_coal(void) {
+    HexaVal left = parse_or();
+    while (hexa_truthy(hexa_eq(p_peek_kind(), hexa_str("NullCoal")))) {
+        HexaVal op_tok = p_advance();
+        HexaVal right = parse_or();
+        left = hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_new(), "kind", hexa_str("BinOp")), "name", hexa_str("")), "value", hexa_str("")), "op", hexa_map_get(op_tok, "value")), "left", left), "right", right), "cond", hexa_str("")), "then_body", hexa_str("")), "else_body", hexa_str("")), "params", hexa_str("")), "body", hexa_str("")), "args", hexa_str("")), "fields", hexa_str("")), "items", hexa_str("")), "variants", hexa_str("")), "arms", hexa_str("")), "iter_expr", hexa_str("")), "ret_type", hexa_str("")), "target", hexa_str("")), "trait_name", hexa_str("")), "methods", hexa_str(""));
+    }
+    return left;
     return hexa_void();
 }
 
@@ -2716,6 +2729,17 @@ HexaVal tokenize(HexaVal source) {
                                                                                         pos = hexa_add(pos, hexa_int(1));
                                                                                         col = hexa_add(col, hexa_int(1));
                                                                                     } else {
+                                                                                        if (hexa_truthy(hexa_eq(ch, hexa_str("?")))) {
+                                                                                            if (hexa_truthy(hexa_bool(hexa_truthy(hexa_bool((hexa_add(pos, hexa_int(1))).i < (total).i)) && hexa_truthy(hexa_eq(hexa_index_get(chars, hexa_add(pos, hexa_int(1))), hexa_str("?")))))) {
+                                                                                                tokens = hexa_array_push(tokens, Token(hexa_str("NullCoal"), hexa_str("??"), line, start_col));
+                                                                                                pos = hexa_add(pos, hexa_int(2));
+                                                                                                col = hexa_add(col, hexa_int(2));
+                                                                                            } else {
+                                                                                                tokens = hexa_array_push(tokens, Token(hexa_str("Question"), hexa_str("?"), line, start_col));
+                                                                                                pos = hexa_add(pos, hexa_int(1));
+                                                                                                col = hexa_add(col, hexa_int(1));
+                                                                                            }
+                                                                                        } else {
                                                                                         if (hexa_truthy(hexa_eq(ch, hexa_str(":")))) {
                                                                                             if (hexa_truthy(hexa_bool(hexa_truthy(hexa_bool((hexa_add(pos, hexa_int(1))).i < (total).i)) && hexa_truthy(hexa_eq(hexa_index_get(chars, hexa_add(pos, hexa_int(1))), hexa_str("=")))))) {
                                                                                                 tokens = hexa_array_push(tokens, Token(hexa_str("ColonEq"), hexa_str(":="), line, start_col));
@@ -2829,6 +2853,7 @@ HexaVal tokenize(HexaVal source) {
                                                         }
                                                     }
                                                 }
+                                            }
                                             }
                                         }
                                     }
@@ -3667,6 +3692,9 @@ HexaVal tc_infer_expr(HexaVal node) {
         HexaVal op = hexa_map_get(node, "op");
         if (hexa_truthy(hexa_bool(hexa_truthy(hexa_bool(hexa_truthy(hexa_bool(hexa_truthy(hexa_bool(hexa_truthy(hexa_bool(hexa_truthy(hexa_eq(op, hexa_str("=="))) || hexa_truthy(hexa_eq(op, hexa_str("!="))))) || hexa_truthy(hexa_eq(op, hexa_str("<"))))) || hexa_truthy(hexa_eq(op, hexa_str(">"))))) || hexa_truthy(hexa_eq(op, hexa_str("<="))))) || hexa_truthy(hexa_eq(op, hexa_str(">=")))))) {
             return hexa_str("bool");
+        }
+        if (hexa_truthy(hexa_eq(op, hexa_str("??")))) {
+            return rt;
         }
         if (hexa_truthy(hexa_bool(hexa_truthy(hexa_bool(hexa_truthy(hexa_eq(op, hexa_str("&&"))) || hexa_truthy(hexa_eq(op, hexa_str("||"))))) || hexa_truthy(hexa_eq(op, hexa_str("^^")))))) {
             if (hexa_truthy(hexa_bool(hexa_truthy(hexa_bool(!hexa_truthy(hexa_eq(lt, hexa_str("bool"))))) && hexa_truthy(hexa_bool(!hexa_truthy(hexa_eq(lt, hexa_str("unknown")))))))) {
@@ -5146,6 +5174,9 @@ HexaVal gen2_expr(HexaVal node) {
         }
         if (hexa_truthy(hexa_eq(op, hexa_str("||")))) {
             return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_bool(hexa_truthy("), l), hexa_str(") || hexa_truthy(")), r), hexa_str("))"));
+        }
+        if (hexa_truthy(hexa_eq(op, hexa_str("??")))) {
+            return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_null_coal("), l), hexa_str(", ")), r), hexa_str(")"));
         }
         return hexa_add(hexa_add(hexa_str("/* binop "), op), hexa_str(" */"));
     }
