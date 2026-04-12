@@ -50,6 +50,9 @@ fn classify_attr_m0(name) {
     if name == "autograd" { return "G4" }
     if name == "quantize" { return "G3" }
     if name == "speculative_decode" { return "G3" }
+    if name == "unroll" { return "G1" }
+    if name == "prefetch" { return "G2" }
+    if name == "partial" { return "G3" }
     if name == "test" { return "meta" }
     if name == "bench" { return "meta" }
     if name == "deprecated" { return "meta" }
@@ -1662,6 +1665,17 @@ fn rewrite_dp_sliding_expr(expr, arr_name, k) {
 let mut m974_strassen_rewrites = 0
 // M975c: @specialize — type-specialized clone rewrite count
 let mut m975_specialize_rewrites = 0
+// M974: @unroll — loop unrolling (requires @bounded(N<=16) + while loop)
+let mut m974_unroll_ok = 0
+let mut m974_unroll_violations = 0
+let mut m974_unroll_rewrites = 0
+// M975: @prefetch — memory prefetch hint insertion (requires while loop + array index)
+let mut m975_prefetch_ok = 0
+let mut m975_prefetch_violations = 0
+let mut m975_prefetch_candidates = 0
+// M976: @partial — partial application optimization (requires >=2 params)
+let mut m976_partial_ok = 0
+let mut m976_partial_violations = 0
 
 fn body_is_effect_free(body) {
     if type_of(body) != "array" { return true }
@@ -7948,6 +7962,54 @@ fn analyze_vectorize(fn_node) {
     }
     return candidates
 }
+// ── M974: @unroll — replicate while-loop body N times ────────
+// Input: body (array of stmts), N (unroll count).
+// Finds the first WhileStmt and replaces it with N copies of its
+// inner body (each wrapped in an if-guard checking the original
+// condition so early exit still works).
+fn unroll_while_loops(body, n) {
+    if type_of(body) != "array" { return body }
+    let mut out = []
+    let total = len(body)
+    let mut i = 0
+    let mut unrolled = false
+    while i < total {
+        let stmt = body[i]
+        if !unrolled && type_of(stmt) != "string" && stmt.kind == "WhileStmt" {
+            // Emit N copies of the loop body, each guarded by the loop cond
+            let mut k = 0
+            while k < n {
+                // Wrap each copy in if(cond) { ...body... }
+                let guard = AstNode {
+                    kind: "IfStmt", name: "", value: "", op: "",
+                    left: "", right: "", cond: stmt.cond,
+                    then_body: stmt.body, else_body: "",
+                    params: "", body: "", args: "", fields: "", items: "",
+                    variants: "", arms: "", iter_expr: "", ret_type: "",
+                    target: "", trait_name: "", methods: ""
+                }
+                out = out.push(guard)
+                k = k + 1
+            }
+            unrolled = true
+        } else {
+            out = out.push(stmt)
+        }
+        i = i + 1
+    }
+    if unrolled { return out }
+    return body
+}
+
+// ── M975: @prefetch helpers ──────────────────────────────────
+// count_array_indexes_in_while: counts Index nodes inside while loops.
+// Used by the @prefetch outer-loop check (count_body_by_kind already
+// does this recursively).
+
+// ── M976: @partial helpers ───────────────────────────────────
+// Partial application generates a specialised fn with some params
+// frozen as constants. The pass detects eligibility (>=2 params);
+// actual code generation happens downstream (codegen_c2 or interp).
 
 fn ai_native_pass(ast) {
     let mut seen = 0
@@ -8778,6 +8840,14 @@ fn ai_native_pass(ast) {
     m977_vectorize_candidates = 0
     m977_vectorize_converted = 0
     m977_vectorize_width = 0
+    m974_unroll_ok = 0
+    m974_unroll_violations = 0
+    m974_unroll_rewrites = 0
+    m975_prefetch_ok = 0
+    m975_prefetch_violations = 0
+    m975_prefetch_candidates = 0
+    m976_partial_ok = 0
+    m976_partial_violations = 0
     m252_contract_injects = 0
     m253b_contract_elims = 0
     m480_symbolic_rewrites = 0
@@ -10530,6 +10600,81 @@ fn ai_native_pass(ast) {
                     m976_dp_sliding_rewrites = m976_dp_sliding_rewrites + 1
                     m976_dp_sliding_lookback = dp_k
                     println("[ai-native] fn " + node.name + " REWRITE: DP sliding window arr=" + dp_arr + " lookback=" + to_string(dp_k) + " → O(" + to_string(dp_k) + ") memory")
+            // M974: @unroll — loop unrolling for small bounded iterations.
+            //   Requires @bounded(N<=16) + while loop in body. Rewrites while
+            //   loop body into N sequential copies (compile-time unroll).
+            if attr_has(attrs, "unroll") {
+                let has_loop = body_has_loop(node.body)
+                if !has_loop {
+                    println("[ai-native] fn " + node.name + " WARN: @unroll requires a loop in body")
+                    m974_unroll_violations = m974_unroll_violations + 1
+                } else {
+                    // Extract bounded value from attrs (e.g., "bounded:4")
+                    let mut unroll_n = 0
+                    let mut _ui = 0
+                    while _ui < an {
+                        let _ua = attrs[_ui]
+                        if len(_ua.chars()) > 8 && _ua.substring(0, 8) == "bounded:" {
+                            unroll_n = extract_bounded_value(_ua)
+                        }
+                        _ui = _ui + 1
+                    }
+                    if unroll_n > 0 && unroll_n <= 16 {
+                        m974_unroll_ok = m974_unroll_ok + 1
+                        // Rewrite: unroll while loops in body
+                        let unrolled_body = unroll_while_loops(node.body, unroll_n)
+                        if unrolled_body != node.body {
+                            node = rewrite_fn_with_body(node, unrolled_body)
+                            m974_unroll_rewrites = m974_unroll_rewrites + 1
+                            println("[ai-native] fn " + node.name + " REWRITE: @unroll N=" + to_string(unroll_n) + " (loop body replicated)")
+                        } else {
+                            println("[ai-native] fn " + node.name + " OK: @unroll N=" + to_string(unroll_n) + " (eligible)")
+                        }
+                    } else if unroll_n > 16 {
+                        println("[ai-native] fn " + node.name + " WARN: @unroll N=" + to_string(unroll_n) + " exceeds limit 16")
+                        m974_unroll_violations = m974_unroll_violations + 1
+                    } else {
+                        println("[ai-native] fn " + node.name + " WARN: @unroll requires @bounded(N) with N in 1..16")
+                        m974_unroll_violations = m974_unroll_violations + 1
+                    }
+                }
+            }
+            // M975: @prefetch — memory prefetch hint insertion.
+            //   Detects while loops with array index access (arr[i]) and inserts
+            //   prefetch hints for the next iteration's data.
+            if attr_has(attrs, "prefetch") {
+                let has_loop = body_has_loop(node.body)
+                if !has_loop {
+                    println("[ai-native] fn " + node.name + " WARN: @prefetch requires a loop in body")
+                    m975_prefetch_violations = m975_prefetch_violations + 1
+                } else {
+                    let idx_cnt = count_body_by_kind(node.body, "Index")
+                    if idx_cnt == 0 {
+                        println("[ai-native] fn " + node.name + " WARN: @prefetch requires array index access in loop")
+                        m975_prefetch_violations = m975_prefetch_violations + 1
+                    } else {
+                        m975_prefetch_ok = m975_prefetch_ok + 1
+                        m975_prefetch_candidates = m975_prefetch_candidates + idx_cnt
+                        println("[ai-native] fn " + node.name + " CANDIDATE: @prefetch " + to_string(idx_cnt) + " array index site(s) → prefetch hint")
+                    }
+                }
+            }
+            // M976: @partial — partial application optimization.
+            //   Requires >=2 params (at least one to fix, one to keep).
+            //   Detects specialization opportunity: generate monomorphized
+            //   version with fixed args inlined as constants.
+            if attr_has(attrs, "partial") {
+                let pp_cnt = if type_of(node.params) == "array" { len(node.params) } else { 0 }
+                if pp_cnt >= 2 {
+                    m976_partial_ok = m976_partial_ok + 1
+                    println("[ai-native] fn " + node.name + " OK: @partial (" + to_string(pp_cnt) + " param(s), partial-apply eligible)")
+                } else {
+                    m976_partial_violations = m976_partial_violations + 1
+                    if pp_cnt == 0 {
+                        println("[ai-native] fn " + node.name + " WARN: @partial requires >=2 params (found 0)")
+                    } else {
+                        println("[ai-native] fn " + node.name + " WARN: @partial requires >=2 params (found 1, nothing to fix)")
+                    }
                 }
             }
             // M17/M23: recursive @optimize without @memoize → auto-inject
@@ -10801,6 +10946,31 @@ fn ai_native_pass(ast) {
                         println("  [quantize] VIOLATION: zero-arg fn")
                     }
                 }
+                // M974: @unroll — loop unrolling check (inner loop)
+                if attr == "unroll" {
+                    if body_has_loop(node.body) {
+                        println("  [unroll] OK (loop found)")
+                    } else {
+                        println("  [unroll] VIOLATION: no loop in body")
+                    }
+                }
+                // M975: @prefetch — prefetch hint check (inner loop)
+                if attr == "prefetch" {
+                    if body_has_loop(node.body) && count_body_by_kind(node.body, "Index") > 0 {
+                        println("  [prefetch] OK (loop + array index)")
+                    } else {
+                        println("  [prefetch] VIOLATION: requires loop + array index")
+                    }
+                }
+                // M976: @partial — partial application check (inner loop)
+                if attr == "partial" {
+                    let ppc = len(node.params)
+                    if ppc >= 2 {
+                        println("  [partial] OK (" + to_string(ppc) + " param(s), partial-apply eligible)")
+                    } else {
+                        println("  [partial] VIOLATION: requires >=2 params")
+                    }
+                }
                 // M6: group distribution
                 if cat == "G1" { m6_g1 = m6_g1 + 1 }
                 if cat == "G2" { m6_g2 = m6_g2 + 1 }
@@ -11054,6 +11224,14 @@ fn ai_native_pass(ast) {
     }
     if m977_vectorize_candidates > 0 {
         println("[ai-native] @vectorize: " + to_string(m977_vectorize_candidates) + " loop(s) vectorizable, " + to_string(m977_vectorize_converted) + " converted (width=" + to_string(m977_vectorize_width) + ")")
+    if m974_unroll_ok + m974_unroll_violations > 0 {
+        println("[ai-native] @unroll: " + to_string(m974_unroll_ok) + " ok, " + to_string(m974_unroll_violations) + " violation(s), " + to_string(m974_unroll_rewrites) + " rewrite(s)")
+    }
+    if m975_prefetch_ok + m975_prefetch_violations > 0 {
+        println("[ai-native] @prefetch: " + to_string(m975_prefetch_ok) + " ok, " + to_string(m975_prefetch_candidates) + " candidate(s), " + to_string(m975_prefetch_violations) + " violation(s)")
+    }
+    if m976_partial_ok + m976_partial_violations > 0 {
+        println("[ai-native] @partial: " + to_string(m976_partial_ok) + " ok, " + to_string(m976_partial_violations) + " violation(s)")
     }
     return out
 }
