@@ -1622,6 +1622,20 @@ fn struct_field_index(struct_name, field_name) {
     }
     return -1
 }
+// struct 이름 모를 때 등록된 모든 struct에서 field_name 검색 (첫 매치 반환)
+fn struct_field_index_global(field_name) {
+    let mut si = 0
+    while si < len(struct_tab_names) {
+        let fields = struct_tab_fields[si]
+        let mut fi = 0
+        while fi < len(fields) {
+            if fields[fi] == field_name { return fi }
+            fi = fi + 1
+        }
+        si = si + 1
+    }
+    return -1
+}
 
 fn env_lookup(name) {
     // O(1) avg: hash bucket, newest-idx-wins (shadowing). Defensive
@@ -1999,23 +2013,33 @@ fn emit_expr(node) {
         return "/* unsupported method ." + mname + " */ 0"
     }
     if node.kind == "Field" {
-        // obj.field → obj[idx], idx는 obj의 struct 타입에서 lookup
+        // obj.field → ((long*)obj)[idx] — 모든 값 long 통일, 역캐스트
         let obj = node.left
         let mut sname = ""
         if obj.kind == "Ident" {
             sname = env_lookup(obj.value)
+            // env에 struct 이름 없으면 lsb (let-struct-bind) 에서 찾기
+            if sname == "" || sname == "Int" || sname == "StructPtr" {
+                let lsb = lsb_get(obj.value)
+                if lsb != "" { sname = lsb }
+            }
         }
         if obj.kind == "StructLit" {
             sname = obj.value
         }
         let idx = struct_field_index(sname, node.value)
-        if idx < 0 {
-            return "/* unknown field " + node.value + " */ 0"
+        if idx >= 0 {
+            return "((long*)" + emit_expr(obj) + ")[" + to_string(idx) + "]"
         }
-        return emit_expr(obj) + "[" + to_string(idx) + "]"
+        // struct 이름 모를 때도 등록된 전체 struct에서 필드 검색
+        let gidx = struct_field_index_global(node.value)
+        if gidx >= 0 {
+            return "((long*)" + emit_expr(obj) + ")[" + to_string(gidx) + "]"
+        }
+        return "/* unknown field " + node.value + " */ 0"
     }
     if node.kind == "StructLit" {
-        let mut s = "hexa_struct_alloc((long[]){"
+        let mut s = "(long)hexa_struct_alloc((long[]){"
         let mut i = 0
         while i < len(node.args) {
             if i > 0 { s = s + ", " }
@@ -2357,13 +2381,19 @@ fn emit_expr(node) {
         if callee.kind == "Ident" && enum_is_variant(callee.value) {
             return to_string(enum_lookup_value(callee.value))
         }
-        // 사용자 함수 호출 (모두 long 반환 가정)
+        // 사용자 함수 호출 — 모든 인자 (long) 캐스트로 통일
         if callee.kind == "Ident" {
             let mut s = user_fn_name(callee.value) + "("
             let mut i = 0
             while i < len(node.args) {
                 if i > 0 { s = s + ", " }
-                s = s + emit_expr(node.args[i])
+                let arg = node.args[i]
+                let at = resolve_expr_type(arg)
+                if at == "Str" || at == "StructPtr" || arg.kind == "Str" || arg.kind == "StructLit" {
+                    s = s + "(long)(" + emit_expr(arg) + ")"
+                } else {
+                    s = s + emit_expr(arg)
+                }
                 i = i + 1
             }
             s = s + ")"
@@ -2472,10 +2502,10 @@ fn emit_stmt(node) {
         }
         if val.kind == "StructLit" {
             env_set_struct(node.value, val.value)
-            // Heap-allocate via hexa_struct_alloc so the pointer is safe
-            // to return from a function (was: long t[N] on stack — UB).
+            lsb_set(node.value, val.value)
+            // Heap-allocate, cast to long for uniform value representation
             let n_fields = len(val.args)
-            let mut s = pad() + "long* " + node.value + " = hexa_struct_alloc((long[]){"
+            let mut s = pad() + "long " + node.value + " = (long)hexa_struct_alloc((long[]){"
             let mut i = 0
             while i < n_fields {
                 if i > 0 { s = s + ", " }
@@ -2507,13 +2537,14 @@ fn emit_stmt(node) {
                 let sn = fn_lookup_struct(val.left.value)
                 if sn != "" {
                     env_set_struct(node.value, sn)
+                    lsb_set(node.value, sn)
                 } else {
                     env_set(node.value, "StructPtr")
                 }
             } else {
                 env_set(node.value, "StructPtr")
             }
-            return pad() + "long* " + uvn + " = " + emit_expr(val) + ";\n"
+            return pad() + "long " + uvn + " = " + emit_expr(val) + ";\n"
         }
         if t == "StrArr" {
             return pad() + "long " + uvn + " = " + emit_expr(val) + ";\n"
@@ -3257,7 +3288,7 @@ fn emit_fn_decl(node) {
     if rt2 == "Float" { ret_c = "long" }
     if rt2 == "DynArr" { ret_c = "long" }
     if rt2 == "StrArr" { ret_c = "long" }
-    if rt2 == "StructPtr" { ret_c = "long*" }
+    if rt2 == "StructPtr" { ret_c = "long" }
     current_fn_ret = rt2
     current_fn_simd = fn_has_attr(node, "simd")
     current_fn_parallel = fn_has_attr(node, "parallel")
@@ -3303,7 +3334,7 @@ fn emit_fn_proto(node) {
     if rt3 == "Float" { ret_c = "long" }
     if rt3 == "DynArr" { ret_c = "long" }
     if rt3 == "StrArr" { ret_c = "long" }
-    if rt3 == "StructPtr" { ret_c = "long*" }
+    if rt3 == "StructPtr" { ret_c = "long" }
     let mut s = ret_c + " " + user_fn_name(node.value) + "("
     let mut i = 0
     while i < len(params) {
