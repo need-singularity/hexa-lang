@@ -1825,6 +1825,19 @@ fn eval_expr_inner(node) {
                 array_store[arr.int_val] = new_items
             }
         }
+        // Perf #11: struct field assignment — obj.field = val
+        // Uses COW: if the struct is shared, copy before mutating.
+        if node.left.kind == "Field" {
+            let obj = eval_expr(node.left.left)
+            if obj.tag == TAG_STRUCT {
+                let field_name = node.left.name
+                let updated = set_struct_field(obj, field_name, val)
+                // Write back to the variable if the receiver is an Ident
+                if type_of(node.left.left) != "string" && node.left.left.kind == "Ident" {
+                    env_set(node.left.left.name, updated)
+                }
+            }
+        }
         return val
     }
 
@@ -2596,6 +2609,17 @@ fn exec_stmt_at(stmts, idx) {
         if node.left.kind == "Ident" {
             env_set(node.left.name, val)
         }
+        // Perf #11: struct field assignment in AssignStmt
+        if node.left.kind == "Field" {
+            let obj = eval_expr(node.left.left)
+            if obj.tag == TAG_STRUCT {
+                let field_name = node.left.name
+                let updated = set_struct_field(obj, field_name, val)
+                if type_of(node.left.left) != "string" && node.left.left.kind == "Ident" {
+                    env_set(node.left.left.name, updated)
+                }
+            }
+        }
         return val_void()
     }
 
@@ -2681,7 +2705,7 @@ fn exec_stmt_at(stmts, idx) {
         if node.left.kind == "Index" {
             let arr = eval_expr(node.left.left)
             let idx = eval_expr(node.left.right)
-            if arr.tag == "array" {
+            if arr.tag == "array" || arr.tag == TAG_ARRAY {
                 let items = get_array(arr)
                 let mut new_items = []
                 let mut ai = 0
@@ -2698,6 +2722,17 @@ fn exec_stmt_at(stmts, idx) {
             if arr.tag == "map" {
                 let new_map = map_set(arr, idx, result)
                 map_store[arr.int_val] = map_store[new_map.int_val]
+            }
+        }
+        // Perf #11: struct field compound assignment — obj.field += val
+        if node.left.kind == "Field" {
+            let obj = eval_expr(node.left.left)
+            if obj.tag == TAG_STRUCT {
+                let field_name = node.left.name
+                let updated = set_struct_field(obj, field_name, result)
+                if type_of(node.left.left) != "string" && node.left.left.kind == "Ident" {
+                    env_set(node.left.left.name, updated)
+                }
             }
         }
         return val_void()
@@ -6847,9 +6882,8 @@ fn call_builtin(name, args) {
     }
     if name == "push" {
         if len(args) >= 2 && args[0].tag == TAG_ARRAY {
-            let items = get_array(args[0])
-            let new_items = items.push(args[1])
-            return val_array(new_items)
+            // Perf #10: in-place push when sole owner
+            return array_push_inplace(args[0], args[1])
         }
         return args[0]
     }
@@ -8554,7 +8588,8 @@ fn call_method(obj, method, args) {
     if obj.tag == TAG_ARRAY {
         let items = get_array(obj)
         if method == "len" { return val_int(len(items)) }
-        if method == "push" { return val_array(items.push(args[0])) }
+        // Perf #10: in-place push when sole owner (refcount==1), else COW
+        if method == "push" { return array_push_inplace(obj, args[0]) }
         if method == "pop" {
             if len(items) == 0 { return val_array([]) }
             let mut result = []
@@ -9396,13 +9431,67 @@ fn to_float_val(v) {
 
 // ── Array storage (using host arrays) ────────────────────
 // We store arrays as actual hexa arrays wrapped in Val
+// Perf #10: reference counting for in-place push.
+// array_refcounts tracks how many Val handles point to each array_store slot.
+// When refcount==1 (sole owner), push can mutate array_store[idx] directly
+// instead of allocating a new slot — turning O(n) copy into O(1) amortized.
 
 pub let mut array_store = []
+pub let mut array_refcounts = []   // parallel to array_store; each entry is an int >= 1
 
 fn val_array(items) {
     let idx = len(array_store)
     array_store = array_store.push(items)
+    array_refcounts = array_refcounts.push(1)
     return Val { tag: TAG_ARRAY, int_val: idx, float_val: 0.0, bool_val: false, str_val: "", char_val: "", array_val: "", fn_name: "", fn_params: "", fn_body: "", struct_name: "", struct_fields: "" }
+}
+
+// val_array_reuse: create a Val pointing to an existing array_store slot.
+// Increments refcount. Used when a variable is copied (assignment, param passing)
+// without mutation — the two Vals share the same backing store until one writes.
+fn val_array_reuse(idx) {
+    if idx >= 0 && idx < len(array_refcounts) {
+        array_refcounts[idx] = array_refcounts[idx] + 1
+    }
+    return Val { tag: TAG_ARRAY, int_val: idx, float_val: 0.0, bool_val: false, str_val: "", char_val: "", array_val: "", fn_name: "", fn_params: "", fn_body: "", struct_name: "", struct_fields: "" }
+}
+
+fn array_incref(idx) {
+    if idx >= 0 && idx < len(array_refcounts) {
+        array_refcounts[idx] = array_refcounts[idx] + 1
+    }
+}
+
+fn array_decref(idx) {
+    if idx >= 0 && idx < len(array_refcounts) {
+        if array_refcounts[idx] > 0 {
+            array_refcounts[idx] = array_refcounts[idx] - 1
+        }
+    }
+}
+
+fn array_is_sole_owner(idx) {
+    if idx >= 0 && idx < len(array_refcounts) {
+        return array_refcounts[idx] <= 1
+    }
+    return true
+}
+
+// array_push_inplace: O(1) amortized push when sole owner, else COW.
+// Returns a Val pointing to the (possibly new) array slot.
+fn array_push_inplace(arr_val, item) {
+    let idx = arr_val.int_val
+    if array_is_sole_owner(idx) {
+        // Sole owner: mutate the backing store directly (host .push is O(1) amortized)
+        let items = array_store[idx]
+        array_store[idx] = items.push(item)
+        return arr_val
+    }
+    // Shared: COW — allocate new slot with old items + new item
+    let items = array_store[idx]
+    let new_items = items.push(item)
+    array_decref(idx)
+    return val_array(new_items)
 }
 
 fn get_array(v) {
@@ -9573,16 +9662,78 @@ fn val_eq(a, b) {
 }
 
 // ── Struct storage ───────────────────────────────────────
+// Perf #11: COW (copy-on-write) for structs.
+// struct_refcounts tracks how many Val handles share each struct_store slot.
+// On assignment/param-pass, we share the slot (incref) instead of deep-copying.
+// On mutation (field write), if refcount > 1 we COW: copy fields to a new slot,
+// decref the old, and return the fresh sole-owner Val.
 pub let mut struct_store = []
+pub let mut struct_refcounts = []   // parallel to struct_store
 
 fn val_struct(name, fields) {
     let idx = len(struct_store)
     struct_store = struct_store.push(fields)
+    struct_refcounts = struct_refcounts.push(1)
     return Val { tag: TAG_STRUCT, int_val: idx, float_val: 0.0, bool_val: false, str_val: "", char_val: "", array_val: "", fn_name: "", fn_params: "", fn_body: "", struct_name: name, struct_fields: "" }
+}
+
+// val_struct_reuse: share an existing struct_store slot (bump refcount).
+// Used when a struct Val is copied without mutation (assignment, param pass, return).
+fn val_struct_reuse(v) {
+    let idx = v.int_val
+    if idx >= 0 && idx < len(struct_refcounts) {
+        struct_refcounts[idx] = struct_refcounts[idx] + 1
+    }
+    return v
+}
+
+fn struct_incref(idx) {
+    if idx >= 0 && idx < len(struct_refcounts) {
+        struct_refcounts[idx] = struct_refcounts[idx] + 1
+    }
+}
+
+fn struct_decref(idx) {
+    if idx >= 0 && idx < len(struct_refcounts) {
+        if struct_refcounts[idx] > 0 {
+            struct_refcounts[idx] = struct_refcounts[idx] - 1
+        }
+    }
+}
+
+fn struct_is_sole_owner(idx) {
+    if idx >= 0 && idx < len(struct_refcounts) {
+        return struct_refcounts[idx] <= 1
+    }
+    return true
+}
+
+// struct_cow_if_shared: if the struct is shared (refcount > 1), copy fields
+// to a new slot and return a fresh sole-owner Val. Otherwise return as-is.
+// Call this before any field mutation.
+fn struct_cow_if_shared(v) {
+    let idx = v.int_val
+    if !struct_is_sole_owner(idx) {
+        // COW: deep-copy fields to new slot
+        let old_fields = struct_store[idx]
+        struct_decref(idx)
+        return val_struct(v.struct_name, old_fields)
+    }
+    return v
 }
 
 fn get_struct_fields(v) {
     return struct_store[v.int_val]
+}
+
+// set_struct_field: COW-aware field mutation.
+// Returns the (possibly new) Val with the field updated.
+fn set_struct_field(v, field_name, new_val) {
+    let sv = struct_cow_if_shared(v)
+    let fields = struct_store[sv.int_val]
+    fields[field_name] = new_val
+    struct_store[sv.int_val] = fields
+    return sv
 }
 
 // ── Enum value storage ──────────────────────────────────
@@ -9640,29 +9791,17 @@ fn cow_is_shared(idx) {
 }
 
 fn cow_copy_on_write(v) {
-    if v.tag == "array" {
-        let idx = v.int_val
-        cow_ensure_capacity(idx)
-        if cow_ref_counts[idx] > 1 {
-            let old_data = array_store[idx]
-            let new_idx = len(array_store)
-            array_store = array_store.push(old_data)
-            cow_ref_counts[idx] = cow_ref_counts[idx] - 1
-            cow_ensure_capacity(new_idx)
-            return Val { tag: "array", int_val: new_idx, float_val: 0.0, bool_val: false, str_val: "", char_val: "", array_val: "", fn_name: "", fn_params: "", fn_body: "", struct_name: "", struct_fields: "" }
+    // Perf #10/#11: delegate to per-type refcount-based COW.
+    // Fixes original bug: used string tags "array"/"struct" instead of numeric TAG_*.
+    if v.tag == TAG_ARRAY {
+        if !array_is_sole_owner(v.int_val) {
+            let old_data = array_store[v.int_val]
+            array_decref(v.int_val)
+            return val_array(old_data)
         }
     }
-    if v.tag == "struct" {
-        let idx = v.int_val
-        cow_ensure_capacity(idx)
-        if cow_ref_counts[idx] > 1 {
-            let old_fields = struct_store[idx]
-            let new_idx = len(struct_store)
-            struct_store = struct_store.push(old_fields)
-            cow_ref_counts[idx] = cow_ref_counts[idx] - 1
-            cow_ensure_capacity(new_idx)
-            return Val { tag: "struct", int_val: new_idx, float_val: 0.0, bool_val: false, str_val: v.str_val, char_val: "", array_val: "", fn_name: "", fn_params: "", fn_body: "", struct_name: v.struct_name, struct_fields: "" }
-        }
+    if v.tag == TAG_STRUCT {
+        return struct_cow_if_shared(v)
     }
     return v
 }
@@ -10033,8 +10172,10 @@ fn interpret(ast) {
     gen_buffer = []
     gen_active = false
     array_store = []
+    array_refcounts = []
     map_store = []
     struct_store = []
+    struct_refcounts = []
     impl_store = []
     closure_store = []
     extern_fns = []
