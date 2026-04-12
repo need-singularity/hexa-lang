@@ -25,4 +25,6 @@ ref:
   ai-native docs/ai-native.md                    24종 벡터
   ml        shared/hexa-lang/ml-next-level.json  15+N 다음 레벨
   ml-cmd    shared/hexa-lang/ml-commands.json    ml/ml go/ml next
+  roi       shared/hexa-lang/roi.json            ROI 개선 목록
+  roi-cmd   shared/hexa-lang/roi-commands.json   roi/roi go/roi next/roi scan
   api       shared/CLAUDE.md

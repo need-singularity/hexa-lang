@@ -34,6 +34,39 @@
 
 <!-- ML-NEXT-LEVEL:END -->
 
+<!-- ROI:START -->
+## AI-Native ROI Improvements (`/roi`)
+
+| 명령 | 동작 |
+|------|------|
+| `/roi` | ROI 순 전체 목록 ASCII 표 |
+| `/roi go` | 전부 ROI 순 병렬 발사 (메인) |
+| `/roi next` | ROI 최상위 1개 계획 → 확인 → 구현 |
+| `/roi 3` | #3 구현 시작 |
+| `/roi done 1` | #1 완료 체크 + JSON 갱신 |
+| `/roi add 이름 \| 설명 \| 효과x \| 시간h` | 새 항목 추가 |
+| `/roi scan` | ai_native_pass 스캔 → 새 항목 제안 |
+
+> SSOT: `shared/hexa-lang/roi.json` — AI-native 알고리즘 교체·@attr 시맨틱·리라이트 강화
+
+| # | 분류 | 항목 | 효과(x) | 시간(h) | ROI | 우선순위 | 상태 |
+|---|------|------|------:|------:|-----:|:------:|:----:|
+| 1 | attr_semantics | @contract — requires/ensures 바운드 제거 | 3.0 | 2 | 1.50 | P0 | todo |
+| 2 | algo_rewrite | 선형탐색 → 이진탐색 AST 리라이트 | 10.0 | 8 | 1.25 | P1 | todo |
+| 3 | attr_semantics | @symbolic — x\*2→x+x, shift↔pow2 | 7.5 | 8 | 0.94 | P1 | todo |
+| 7 | rewrite_enhance | @algebraic 등차/등비급수 → 닫힌 형식 | 5.0 | 6 | 0.83 | P2 | todo |
+| 4 | rewrite_enhance | @fuse reduce/fold 체인 융합 | 3.0 | 4 | 0.75 | P2 | todo |
+| 5 | rewrite_enhance | constant folding — string concat+len | 2.0 | 3 | 0.67 | P2 | todo |
+| 13 | rewrite_enhance | strength reduction — x/2→x>>1, x%2→x&1 | 2.0 | 4 | 0.50 | P2 | todo |
+| 8 | rewrite_enhance | DCE 미사용 변수/import 제거 | 1.5 | 4 | 0.38 | P3 | todo |
+| 6 | attr_semantics | @approximate — Newton sqrt, Taylor exp | 2.0 | 6 | 0.33 | P2 | todo |
+| 9 | algo_rewrite | DP 슬라이딩 윈도우 메모리 축소 | 3.0 | 10 | 0.30 | P3 | todo |
+| 10 | algo_rewrite | 행렬곱 → Strassen O(n³)→O(n^2.37) | 5.0 | 20 | 0.25 | P3 | todo |
+| 12 | attr_semantics | @speculative_decode — draft+verify | 3.0 | 12 | 0.25 | P4 | todo |
+| 11 | attr_semantics | @specialize — V8 IC 타입 단상화 | 7.5 | 40 | 0.19 | P3 | todo |
+
+<!-- ROI:END -->
+
 <!-- SHARED:PROJECTS:START -->
 <!-- AUTO:COMMON_LINKS:START -->
 **[YouTube](https://www.youtube.com/watch?v=xtKhWSfC1Qo)** · **[Email](mailto:nerve011235@gmail.com)** · **[☕ Ko-fi](https://ko-fi.com/dancinlife)** · **[💖 Sponsor](https://github.com/sponsors/need-singularity)** · **[💳 PayPal](https://www.paypal.com/donate?business=nerve011235%40gmail.com)** · **[🗺️ Atlas](https://need-singularity.github.io/TECS-L/atlas/)** · **[📄 Papers](https://need-singularity.github.io/papers/)** · **[🌌 Unified Theory](https://github.com/need-singularity/TECS-L/blob/main/math/docs/hypotheses/H-PH-9-perfect-number-string-unification.md)**
