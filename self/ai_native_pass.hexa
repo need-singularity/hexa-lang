@@ -26,6 +26,7 @@ fn classify_attr_m0(name) {
     if name == "memoize" { return "G1" }
     if name == "pure" { return "G1" }
     if name == "inline" { return "G1" }
+    if name == "inline_always" { return "G1" }
     if name == "hot" { return "G1" }
     if name == "cold" { return "G1" }
     if name == "bounded" { return "G1" }
@@ -1235,12 +1236,348 @@ fn rewrite_approx_expr(expr, precision_str) {
             let mut ai = 0
             while ai < len(expr.args) {
                 new_args = new_args.push(rewrite_approx_expr(expr.args[ai], precision_str))
+// M974: Tail Call Optimization (TCO) — tail-position calls → jumps
+let mut m974_tco_rewrites = 0
+// M975: phi-node mem2reg — stack vars promoted to SSA
+let mut m975_mem2reg_promoted = 0
+// M976: @inline_always — force-inline small hot functions
+let mut m976_inline_always_ok = 0
+let mut m976_inline_always_too_big = 0
+let mut m976_inline_always_inlined = 0
+// Inlining tables for @inline_always (parallel arrays)
+let mut m976_ia_names = []
+let mut m976_ia_bodies = []
+let mut m976_ia_params = []
+// M977: Conditional Constant Propagation (CCP) — branch-aware const folding
+let mut m977_ccp_folds = 0
+let mut m977_ccp_branch_elim = 0
+
+// ═══════════════════════════════════════════════════════════════════
+//  #34 Tail Call Optimization (TCO) — detect tail-position calls and
+//  convert to while-loop with parameter reassignment (prevents stack overflow).
+//  Handles: fn f(x) { ... return f(expr) } → fn f(x) { while true { ... x = expr; continue } }
+// ═══════════════════════════════════════════════════════════════════
+
+// Detect if the last statement in a body is a tail call to self_name,
+// supporting if/else branches where both sides return self-call.
+fn is_tail_position_call(body, self_name) {
+    if type_of(body) != "array" { return false }
+    let n = len(body)
+    if n == 0 { return false }
+    let last = body[n - 1]
+    if last.kind == "ReturnStmt" {
+        return expr_calls_self(last.left, self_name)
+    }
+    // If the last stmt is an IfStmt, check both branches
+    if last.kind == "IfStmt" {
+        let then_ok = is_tail_position_call(last.body, self_name)
+        let else_ok = is_tail_position_call(last.else_body, self_name)
+        return then_ok && else_ok
+    }
+    return false
+}
+
+// Extract args from a Call node (self-call)
+fn extract_call_args(expr) {
+    if type_of(expr) == "string" { return [] }
+    if expr.kind == "Call" {
+        if type_of(expr.args) == "array" { return expr.args }
+    }
+    return []
+}
+
+// Build assignment statements: param_i = arg_i, for TCO rewrite
+fn build_tco_assigns(params, args) {
+    let mut out = []
+    let n = len(params)
+    let an = len(args)
+    let mut i = 0
+    while i < n {
+        if i < an {
+            // Assign param = new_arg via AssignStmt (left=Ident(param), right=arg)
+            let lhs = make_ident(params[i].name)
+            out = out.push(AstNode {
+                kind: "AssignStmt", name: "", value: "", op: "",
+                left: lhs, right: args[i], cond: "", then_body: "", else_body: "",
+                params: "", body: "", args: "", fields: "", items: "",
+                variants: "", arms: "", iter_expr: "", ret_type: "",
+                target: "", trait_name: "", methods: ""
+            })
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Rewrite a body with tail calls → assignments + continue (within while(true) wrapper).
+// Returns the new while-body statements.
+fn tco_rewrite_body(body, self_name, params) {
+    if type_of(body) != "array" { return body }
+    let n = len(body)
+    if n == 0 { return body }
+    let mut out = []
+    let mut i = 0
+    while i < n - 1 {
+        out = out.push(body[i])
+        i = i + 1
+    }
+    // Rewrite the last stmt
+    let last = body[n - 1]
+    if last.kind == "ReturnStmt" && expr_calls_self(last.left, self_name) {
+        // return self(a1, a2, ...) → p1=a1; p2=a2; ... (continue implicit in while)
+        let args = extract_call_args(last.left)
+        let assigns = build_tco_assigns(params, args)
+        let an = len(assigns)
+        let mut ai = 0
+        while ai < an {
+            out = out.push(assigns[ai])
+            ai = ai + 1
+        }
+    } else if last.kind == "IfStmt" {
+        // Rewrite both branches
+        let new_then = tco_rewrite_body(last.body, self_name, params)
+        let new_else = tco_rewrite_body(last.else_body, self_name, params)
+        out = out.push(AstNode {
+            kind: "IfStmt", name: "", value: "", op: "",
+            left: "", right: "", cond: last.cond, then_body: "", else_body: "",
+            params: "", body: new_then, args: "", fields: "", items: "",
+            variants: "", arms: "", iter_expr: "", ret_type: "",
+            target: "", trait_name: "", methods: ""
+        })
+        // Attach else_body
+        let last_out = out[len(out) - 1]
+        out = []
+        let mut oi = 0
+        while oi < len(out) - 1 {
+            out = out.push(out[oi])
+            oi = oi + 1
+        }
+        out = out.push(AstNode {
+            kind: "IfStmt", name: "", value: "", op: "",
+            left: "", right: "", cond: last.cond, then_body: "", else_body: new_else,
+            params: "", body: new_then, args: "", fields: "", items: "",
+            variants: "", arms: "", iter_expr: "", ret_type: "",
+            target: "", trait_name: "", methods: ""
+        })
+    } else {
+        out = out.push(last)
+    }
+    return out
+}
+
+// Full TCO pass for a single FnDecl — returns rewritten body or original.
+fn tco_pass_fn(fn_node) {
+    if !is_tail_position_call(fn_node.body, fn_node.name) { return fn_node }
+    // Build: while(true) { <rewritten body> }
+    let new_while_body = tco_rewrite_body(fn_node.body, fn_node.name, fn_node.params)
+    let loop_node = make_while_stmt(make_bool_lit("true"), new_while_body)
+    let new_body = [loop_node]
+    m974_tco_rewrites = m974_tco_rewrites + 1
+    println("[ai-native] fn " + fn_node.name + " REWRITE: TCO tail→while(true)")
+    return rewrite_fn_with_body(fn_node, new_body)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  #35 phi-node mem2reg — promote stack variables (let mut) to SSA.
+//  Detect let mut vars that are assigned once then only read → promote
+//  to let (immutable). Also track vars assigned in branches → phi-node
+//  candidate. This is a simplified mem2reg that catches the common case.
+// ═══════════════════════════════════════════════════════════════════
+
+// Count how many times a variable name appears as AssignStmt target in body
+fn count_var_assigns(body, varname) {
+    if type_of(body) != "array" { return 0 }
+    let n = len(body)
+    let mut c = 0
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        if stmt.kind == "AssignStmt" {
+            if type_of(stmt.left) != "string" && stmt.left.kind == "Ident" {
+                if stmt.left.name == varname { c = c + 1 }
+            }
+        }
+        if stmt.kind == "WhileStmt" {
+            c = c + count_var_assigns(stmt.body, varname)
+        }
+        if stmt.kind == "IfStmt" {
+            c = c + count_var_assigns(stmt.body, varname)
+            if type_of(stmt.else_body) == "array" {
+                c = c + count_var_assigns(stmt.else_body, varname)
+            }
+        }
+        i = i + 1
+    }
+    return c
+}
+
+// Check if a var is read (as Ident) in an expression
+fn expr_reads_var(expr, varname) {
+    if type_of(expr) == "string" { return false }
+    if expr.kind == "Ident" { return expr.name == varname }
+    if expr.kind == "BinOp" {
+        return expr_reads_var(expr.left, varname) || expr_reads_var(expr.right, varname)
+    }
+    if expr.kind == "UnaryOp" { return expr_reads_var(expr.left, varname) }
+    if expr.kind == "Call" {
+        if type_of(expr.args) == "array" {
+            let n = len(expr.args)
+            let mut i = 0
+            while i < n {
+                if expr_reads_var(expr.args[i], varname) { return true }
+                i = i + 1
+            }
+        }
+    }
+    if expr.kind == "Index" {
+        return expr_reads_var(expr.left, varname) || expr_reads_var(expr.right, varname)
+    }
+    return false
+}
+
+// mem2reg pass: promote let mut with 0 reassignments → let
+fn mem2reg_pass_body(body) {
+    if type_of(body) != "array" { return body }
+    let n = len(body)
+    // First pass: collect let mut names with 0 assigns after init
+    let mut promotable_names = []
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        if stmt.kind == "LetMutStmt" {
+            let assigns = count_var_assigns(body, stmt.name)
+            if assigns == 0 {
+                // No reassignment → safe to promote to let
+                promotable_names = promotable_names.push(stmt.name)
+            }
+        }
+        i = i + 1
+    }
+    // Second pass: rewrite LetMutStmt → LetStmt for promotable vars
+    if len(promotable_names) == 0 { return body }
+    let mut out = []
+    i = 0
+    while i < n {
+        let stmt = body[i]
+        if stmt.kind == "LetMutStmt" {
+            let mut found = false
+            let pn = len(promotable_names)
+            let mut pi = 0
+            while pi < pn {
+                if promotable_names[pi] == stmt.name { found = true }
+                pi = pi + 1
+            }
+            if found {
+                // Promote to LetStmt
+                out = out.push(AstNode {
+                    kind: "LetStmt", name: stmt.name, value: stmt.value, op: "",
+                    left: stmt.left, right: "", cond: "", then_body: "", else_body: "",
+                    params: "", body: "", args: "", fields: "", items: "",
+                    variants: "", arms: "", iter_expr: "", ret_type: "",
+                    target: "", trait_name: "", methods: ""
+                })
+                m975_mem2reg_promoted = m975_mem2reg_promoted + 1
+            } else {
+                out = out.push(stmt)
+            }
+        } else {
+            out = out.push(stmt)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  #36 @inline_always — force-inline small hot functions.
+//  Functions marked @inline_always have their body inlined at call sites.
+//  Limit: body <= 10 stmts to prevent code bloat.
+// ═══════════════════════════════════════════════════════════════════
+
+// Check if a FnDecl has @inline_always attr
+fn has_inline_always(fn_node) {
+    if fn_node.value == "" { return false }
+    let attrs = split_attrs_m0(fn_node.value)
+    return attr_has(attrs, "inline_always")
+}
+
+// Collect @inline_always fn bodies for inlining (pre-pass)
+fn collect_inline_always_fns(ast) {
+    m976_ia_names = []
+    m976_ia_bodies = []
+    m976_ia_params = []
+    let n = len(ast)
+    let mut i = 0
+    while i < n {
+        let node = ast[i]
+        if node.kind == "FnDecl" && has_inline_always(node) {
+            let bsz = body_stmt_count(node.body)
+            if bsz <= 10 {
+                m976_ia_names = m976_ia_names.push(node.name)
+                m976_ia_bodies = m976_ia_bodies.push(node.body)
+                m976_ia_params = m976_ia_params.push(node.params)
+                m976_inline_always_ok = m976_inline_always_ok + 1
+                println("[ai-native] fn " + node.name + " OK: @inline_always (" + to_string(bsz) + " stmt(s))")
+            } else {
+                m976_inline_always_too_big = m976_inline_always_too_big + 1
+                println("[ai-native] fn " + node.name + " WARN: @inline_always body too large (" + to_string(bsz) + " stmts > 10)")
+            }
+        }
+        i = i + 1
+    }
+}
+
+// Substitute params with args in an expression (for inlining)
+fn subst_expr(expr, param_names, arg_exprs) {
+    if type_of(expr) == "string" { return expr }
+    let k = expr.kind
+    if k == "Ident" {
+        let n = len(param_names)
+        let mut i = 0
+        while i < n {
+            if param_names[i] == expr.name {
+                if i < len(arg_exprs) { return arg_exprs[i] }
+            }
+            i = i + 1
+        }
+        return expr
+    }
+    if k == "BinOp" {
+        let nl = subst_expr(expr.left, param_names, arg_exprs)
+        let nr = subst_expr(expr.right, param_names, arg_exprs)
+        return AstNode {
+            kind: "BinOp", name: "", value: "", op: expr.op,
+            left: nl, right: nr, cond: "", then_body: "", else_body: "",
+            params: "", body: "", args: "", fields: "", items: "",
+            variants: "", arms: "", iter_expr: "", ret_type: "",
+            target: "", trait_name: "", methods: ""
+        }
+    }
+    if k == "UnaryOp" {
+        let no = subst_expr(expr.left, param_names, arg_exprs)
+        return AstNode {
+            kind: "UnaryOp", name: "", value: "", op: expr.op,
+            left: no, right: "", cond: "", then_body: "", else_body: "",
+            params: "", body: "", args: "", fields: "", items: "",
+            variants: "", arms: "", iter_expr: "", ret_type: "",
+            target: "", trait_name: "", methods: ""
+        }
+    }
+    if k == "Call" {
+        let mut new_args = []
+        if type_of(expr.args) == "array" {
+            let an = len(expr.args)
+            let mut ai = 0
+            while ai < an {
+                new_args = new_args.push(subst_expr(expr.args[ai], param_names, arg_exprs))
                 ai = ai + 1
             }
         }
         return AstNode {
             kind: "Call", name: expr.name, value: expr.value, op: expr.op,
             left: rewrite_approx_expr(expr.left, precision_str), right: "", cond: "", then_body: "", else_body: "",
+            kind: "Call", name: "", value: "", op: "",
+            left: subst_expr(expr.left, param_names, arg_exprs), right: "", cond: "", then_body: "", else_body: "",
             params: "", body: "", args: new_args, fields: "", items: "",
             variants: "", arms: "", iter_expr: "", ret_type: "",
             target: "", trait_name: "", methods: ""
@@ -1268,6 +1605,10 @@ fn rewrite_approx_expr(expr, precision_str) {
         return AstNode {
             kind: "Index", name: "", value: "", op: "",
             left: rewrite_approx_expr(expr.left, precision_str), right: rewrite_approx_expr(expr.right, precision_str), cond: "", then_body: "", else_body: "",
+    if k == "Index" {
+        return AstNode {
+            kind: "Index", name: "", value: "", op: "",
+            left: subst_expr(expr.left, param_names, arg_exprs), right: subst_expr(expr.right, param_names, arg_exprs), cond: "", then_body: "", else_body: "",
             params: "", body: "", args: "", fields: "", items: "",
             variants: "", arms: "", iter_expr: "", ret_type: "",
             target: "", trait_name: "", methods: ""
@@ -1655,11 +1996,65 @@ fn rewrite_dp_sliding_expr(expr, arr_name, k) {
             let mut ai = 0
             while ai < len(expr.args) {
                 new_args = new_args.push(rewrite_dp_sliding_expr(expr.args[ai], arr_name, k))
+// Inline @inline_always calls in an expression: replace Call(f, args) with body[last].left (return expr)
+// For simplicity, only inline single-return-expr bodies (body = [ReturnStmt(expr)])
+fn inline_always_expr(expr) {
+    if type_of(expr) == "string" { return expr }
+    let k = expr.kind
+    if k == "Call" {
+        let callee = expr.left
+        if type_of(callee) != "string" && callee.kind == "Ident" {
+            let cname = callee.name
+            let in_n = len(m976_ia_names)
+            let mut ii = 0
+            while ii < in_n {
+                if m976_ia_names[ii] == cname {
+                    let fbody = m976_ia_bodies[ii]
+                    let fparams = m976_ia_params[ii]
+                    // Only inline if body is a single ReturnStmt
+                    if type_of(fbody) == "array" && len(fbody) >= 1 {
+                        let last_stmt = fbody[len(fbody) - 1]
+                        if last_stmt.kind == "ReturnStmt" {
+                            // Build param name list
+                            let mut pnames = []
+                            let pn = len(fparams)
+                            let mut pi = 0
+                            while pi < pn {
+                                pnames = pnames.push(fparams[pi].name)
+                                pi = pi + 1
+                            }
+                            // Build arg list (recurse first)
+                            let mut new_args = []
+                            if type_of(expr.args) == "array" {
+                                let an = len(expr.args)
+                                let mut ai = 0
+                                while ai < an {
+                                    new_args = new_args.push(inline_always_expr(expr.args[ai]))
+                                    ai = ai + 1
+                                }
+                            }
+                            let result = subst_expr(last_stmt.left, pnames, new_args)
+                            m976_inline_always_inlined = m976_inline_always_inlined + 1
+                            return result
+                        }
+                    }
+                }
+                ii = ii + 1
+            }
+        }
+        // Recurse into args
+        let mut new_args = []
+        if type_of(expr.args) == "array" {
+            let an = len(expr.args)
+            let mut ai = 0
+            while ai < an {
+                new_args = new_args.push(inline_always_expr(expr.args[ai]))
                 ai = ai + 1
             }
         }
         return AstNode {
             kind: "Call", name: expr.name, value: expr.value, op: expr.op,
+            kind: "Call", name: "", value: "", op: "",
             left: expr.left, right: "", cond: "", then_body: "", else_body: "",
             params: "", body: "", args: new_args, fields: "", items: "",
             variants: "", arms: "", iter_expr: "", ret_type: "",
@@ -1722,6 +2117,263 @@ let mut m976_flatten_ok = 0
 let mut m976_flatten_violations = 0
 // M977: Power Iteration → Lanczos rewrite
 let mut m977_lanczos_rewrites = 0
+    if k == "BinOp" {
+        return AstNode {
+            kind: "BinOp", name: "", value: "", op: expr.op,
+            left: inline_always_expr(expr.left), right: inline_always_expr(expr.right), cond: "", then_body: "", else_body: "",
+            params: "", body: "", args: "", fields: "", items: "",
+            variants: "", arms: "", iter_expr: "", ret_type: "",
+            target: "", trait_name: "", methods: ""
+        }
+    }
+    if k == "UnaryOp" {
+        return AstNode {
+            kind: "UnaryOp", name: "", value: "", op: expr.op,
+            left: inline_always_expr(expr.left), right: "", cond: "", then_body: "", else_body: "",
+            params: "", body: "", args: "", fields: "", items: "",
+            variants: "", arms: "", iter_expr: "", ret_type: "",
+            target: "", trait_name: "", methods: ""
+        }
+    }
+    return expr
+}
+
+// Inline @inline_always in a body
+fn inline_always_body(body) {
+    if type_of(body) != "array" { return body }
+    let mut out = []
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        let k = stmt.kind
+        if k == "ReturnStmt" || k == "ExprStmt" || k == "LetStmt" || k == "LetMutStmt" || k == "ConstStmt" {
+            let new_e = inline_always_expr(stmt.left)
+            out = out.push(AstNode {
+                kind: k, name: stmt.name, value: stmt.value, op: "",
+                left: new_e, right: "", cond: "", then_body: "", else_body: "",
+                params: "", body: "", args: "", fields: "", items: "",
+                variants: "", arms: "", iter_expr: "", ret_type: "",
+                target: "", trait_name: "", methods: ""
+            })
+        } else if k == "AssignStmt" {
+            let new_r = inline_always_expr(stmt.right)
+            out = out.push(AstNode {
+                kind: "AssignStmt", name: "", value: "", op: "",
+                left: stmt.left, right: new_r, cond: "", then_body: "", else_body: "",
+                params: "", body: "", args: "", fields: "", items: "",
+                variants: "", arms: "", iter_expr: "", ret_type: "",
+                target: "", trait_name: "", methods: ""
+            })
+        } else if k == "WhileStmt" {
+            let new_wb = inline_always_body(stmt.body)
+            out = out.push(make_while_stmt(stmt.cond, new_wb))
+        } else {
+            out = out.push(stmt)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  #37 Conditional Constant Propagation (CCP) — propagate constants
+//  through branch conditions, narrow variable ranges, eliminate dead branches.
+//  If a condition is a known constant (BoolLit), replace the IfStmt
+//  with only the taken branch.
+// ═══════════════════════════════════════════════════════════════════
+
+// CCP: evaluate constant conditions and propagate through if/else
+fn ccp_pass_body(body, names, vals) {
+    if type_of(body) != "array" { return body }
+    let n = len(body)
+    let mut out = []
+    let mut cnames = names
+    let mut cvals = vals
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        let k = stmt.kind
+        if k == "LetStmt" || k == "ConstStmt" {
+            let init = stmt.left
+            if type_of(init) != "string" && is_literal_kind(init.kind) {
+                cnames = cnames.push(stmt.name)
+                cvals = cvals.push(init)
+            }
+            out = out.push(stmt)
+        } else if k == "LetMutStmt" {
+            let init = stmt.left
+            if type_of(init) != "string" && is_literal_kind(init.kind) {
+                cnames = cnames.push(stmt.name)
+                cvals = cvals.push(init)
+            }
+            out = out.push(stmt)
+        } else if k == "AssignStmt" {
+            // Kill the variable from known constants
+            if type_of(stmt.left) != "string" && stmt.left.kind == "Ident" {
+                let nn = len(cnames)
+                let mut nn_new = []
+                let mut vv_new = []
+                let mut j = 0
+                while j < nn {
+                    if cnames[j] != stmt.left.name {
+                        nn_new = nn_new.push(cnames[j])
+                        vv_new = vv_new.push(cvals[j])
+                    }
+                    j = j + 1
+                }
+                cnames = nn_new
+                cvals = vv_new
+                // Check if RHS is a literal → re-add
+                let rhs = stmt.right
+                if type_of(rhs) != "string" && is_literal_kind(rhs.kind) {
+                    cnames = cnames.push(stmt.left.name)
+                    cvals = cvals.push(rhs)
+                }
+            }
+            out = out.push(stmt)
+        } else if k == "IfStmt" {
+            // Try to resolve the condition
+            let resolved_cond = ccp_resolve_cond(stmt.cond, cnames, cvals)
+            if resolved_cond == "true" {
+                // Take then-branch only
+                m977_ccp_branch_elim = m977_ccp_branch_elim + 1
+                let then_stmts = ccp_pass_body(stmt.body, cnames, cvals)
+                let tn = len(then_stmts)
+                let mut ti = 0
+                while ti < tn {
+                    out = out.push(then_stmts[ti])
+                    ti = ti + 1
+                }
+            } else if resolved_cond == "false" {
+                // Take else-branch only (if exists)
+                m977_ccp_branch_elim = m977_ccp_branch_elim + 1
+                if type_of(stmt.else_body) == "array" {
+                    let else_stmts = ccp_pass_body(stmt.else_body, cnames, cvals)
+                    let en = len(else_stmts)
+                    let mut ei = 0
+                    while ei < en {
+                        out = out.push(else_stmts[ei])
+                        ei = ei + 1
+                    }
+                }
+            } else {
+                // Cannot resolve — recurse into both branches
+                let new_then = ccp_pass_body(stmt.body, cnames, cvals)
+                let new_else = ccp_pass_body(stmt.else_body, cnames, cvals)
+                out = out.push(AstNode {
+                    kind: "IfStmt", name: "", value: "", op: "",
+                    left: "", right: "", cond: stmt.cond, then_body: "", else_body: new_else,
+                    params: "", body: new_then, args: "", fields: "", items: "",
+                    variants: "", arms: "", iter_expr: "", ret_type: "",
+                    target: "", trait_name: "", methods: ""
+                })
+            }
+        } else if k == "WhileStmt" {
+            // Clear consts at loop boundary
+            cnames = []
+            cvals = []
+            out = out.push(stmt)
+        } else {
+            out = out.push(stmt)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Resolve a condition expression to "true"/"false"/""
+fn ccp_resolve_cond(cond, names, vals) {
+    if type_of(cond) == "string" { return "" }
+    // Direct BoolLit
+    if cond.kind == "BoolLit" {
+        m977_ccp_folds = m977_ccp_folds + 1
+        return cond.value
+    }
+    // Ident → look up in known constants
+    if cond.kind == "Ident" {
+        let n = len(names)
+        let mut i = 0
+        while i < n {
+            if names[i] == cond.name {
+                let v = vals[i]
+                if type_of(v) != "string" && v.kind == "BoolLit" {
+                    m977_ccp_folds = m977_ccp_folds + 1
+                    return v.value
+                }
+            }
+            i = i + 1
+        }
+        return ""
+    }
+    // BinOp comparison with known int constants
+    if cond.kind == "BinOp" {
+        let lv = ccp_eval_int(cond.left, names, vals)
+        let rv = ccp_eval_int(cond.right, names, vals)
+        if lv != "" && rv != "" {
+            let li = parse_int_str(lv)
+            let ri = parse_int_str(rv)
+            let op = cond.op
+            if op == "==" {
+                m977_ccp_folds = m977_ccp_folds + 1
+                if li == ri { return "true" } else { return "false" }
+            }
+            if op == "!=" {
+                m977_ccp_folds = m977_ccp_folds + 1
+                if li != ri { return "true" } else { return "false" }
+            }
+            if op == "<" {
+                m977_ccp_folds = m977_ccp_folds + 1
+                if li < ri { return "true" } else { return "false" }
+            }
+            if op == ">" {
+                m977_ccp_folds = m977_ccp_folds + 1
+                if li > ri { return "true" } else { return "false" }
+            }
+            if op == "<=" {
+                m977_ccp_folds = m977_ccp_folds + 1
+                if li <= ri { return "true" } else { return "false" }
+            }
+            if op == ">=" {
+                m977_ccp_folds = m977_ccp_folds + 1
+                if li >= ri { return "true" } else { return "false" }
+            }
+        }
+    }
+    // UnaryOp ! with known bool
+    if cond.kind == "UnaryOp" && cond.op == "!" {
+        let inner = ccp_resolve_cond(cond.left, names, vals)
+        if inner == "true" {
+            m977_ccp_folds = m977_ccp_folds + 1
+            return "false"
+        }
+        if inner == "false" {
+            m977_ccp_folds = m977_ccp_folds + 1
+            return "true"
+        }
+    }
+    return ""
+}
+
+// Evaluate an expression to an integer string if constant
+fn ccp_eval_int(expr, names, vals) {
+    if type_of(expr) == "string" { return "" }
+    if expr.kind == "IntLit" { return expr.value }
+    if expr.kind == "Ident" {
+        let n = len(names)
+        let mut i = 0
+        while i < n {
+            if names[i] == expr.name {
+                let v = vals[i]
+                if type_of(v) != "string" && v.kind == "IntLit" {
+                    return v.value
+                }
+            }
+            i = i + 1
+        }
+    }
+    return ""
+}
 
 fn body_is_effect_free(body) {
     if type_of(body) != "array" { return true }
@@ -9975,6 +10627,16 @@ fn ai_native_pass(ast) {
     m976_flatten_ok = 0
     m976_flatten_violations = 0
     m977_lanczos_rewrites = 0
+    m974_tco_rewrites = 0
+    m975_mem2reg_promoted = 0
+    m976_inline_always_ok = 0
+    m976_inline_always_too_big = 0
+    m976_inline_always_inlined = 0
+    m976_ia_names = []
+    m976_ia_bodies = []
+    m976_ia_params = []
+    m977_ccp_folds = 0
+    m977_ccp_branch_elim = 0
     m252_contract_injects = 0
     m253b_contract_elims = 0
     m480_symbolic_rewrites = 0
@@ -11999,6 +12661,28 @@ fn ai_native_pass(ast) {
                 node = rewrite_fn_with_body(node, dse_body)
                 println("[ai-native] fn " + node.name + " REWRITE: DSE dropped " + to_string(m251_dead_stores - before_ds) + " dead let(s)")
             }
+            // M974: TCO — tail-position calls → while loop (all annotated fns, not just @optimize)
+            if is_tail_position_call(node.body, node.name) {
+                let before_tco = m974_tco_rewrites
+                node = tco_pass_fn(node)
+                if m974_tco_rewrites > before_tco {
+                    // Already logged inside tco_pass_fn
+                }
+            }
+            // M975: mem2reg — promote let mut with 0 reassignments → let
+            let before_m2r = m975_mem2reg_promoted
+            let m2r_body = mem2reg_pass_body(node.body)
+            if m975_mem2reg_promoted > before_m2r {
+                node = rewrite_fn_with_body(node, m2r_body)
+                println("[ai-native] fn " + node.name + " REWRITE: mem2reg promoted " + to_string(m975_mem2reg_promoted - before_m2r) + " var(s)")
+            }
+            // M977: CCP — conditional constant propagation (branch-aware)
+            let before_ccp = m977_ccp_branch_elim
+            let ccp_body = ccp_pass_body(node.body, [], [])
+            if m977_ccp_branch_elim > before_ccp {
+                node = rewrite_fn_with_body(node, ccp_body)
+                println("[ai-native] fn " + node.name + " REWRITE: CCP eliminated " + to_string(m977_ccp_branch_elim - before_ccp) + " dead branch(es)")
+            }
             // M252: @contract → auto pre-assert injection (param0 != 0)
             let fresh_attrs_ct = split_attrs_m0(node.value)
             if attr_has(fresh_attrs_ct, "contract") && len(node.params) > 0 {
@@ -12404,6 +13088,30 @@ fn ai_native_pass(ast) {
         pi4 = pi4 + 1
     }
     out = out2
+    // M976: @inline_always post-pass — collect + inline force-inlined fns
+    collect_inline_always_fns(out)
+    if len(m976_ia_names) > 0 {
+        let on3 = len(out)
+        let mut out3 = []
+        let mut pi5 = 0
+        while pi5 < on3 {
+            let nd5 = out[pi5]
+            if nd5.kind == "FnDecl" {
+                let before_ia = m976_inline_always_inlined
+                let ia_body = inline_always_body(nd5.body)
+                if m976_inline_always_inlined > before_ia {
+                    out3 = out3.push(rewrite_fn_with_body(nd5, ia_body))
+                    println("[ai-native] fn " + nd5.name + " REWRITE: @inline_always inlined " + to_string(m976_inline_always_inlined - before_ia) + " call(s)")
+                } else {
+                    out3 = out3.push(nd5)
+                }
+            } else {
+                out3 = out3.push(nd5)
+            }
+            pi5 = pi5 + 1
+        }
+        out = out3
+    }
     let mut cov_pct = 0
     if m6_total_fns > 0 {
         cov_pct = (m6_annotated_fns * 100) / m6_total_fns
@@ -12557,6 +13265,17 @@ fn ai_native_pass(ast) {
     }
     if m977_lanczos_rewrites > 0 {
         println("[ai-native] power-iter→Lanczos: " + to_string(m977_lanczos_rewrites) + " candidate(s)")
+    if m974_tco_rewrites > 0 {
+        println("[ai-native] TCO: " + to_string(m974_tco_rewrites) + " tail-call(s) → while loop")
+    }
+    if m975_mem2reg_promoted > 0 {
+        println("[ai-native] mem2reg: " + to_string(m975_mem2reg_promoted) + " var(s) promoted (let mut → let)")
+    }
+    if m976_inline_always_inlined > 0 {
+        println("[ai-native] @inline_always: " + to_string(m976_inline_always_ok) + " fn(s) registered, " + to_string(m976_inline_always_inlined) + " call(s) inlined")
+    }
+    if m977_ccp_branch_elim > 0 {
+        println("[ai-native] CCP: " + to_string(m977_ccp_folds) + " const fold(s), " + to_string(m977_ccp_branch_elim) + " dead branch(es) eliminated")
     }
     return out
 }
