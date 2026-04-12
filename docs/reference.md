@@ -780,27 +780,27 @@ println(c_cos(0.0))  // 1.0
 
 Literals `true` and `false` are boolean values, not keywords.
 
-## CLI
+## CLI (stage1, go/cargo style — 2026-04-13~)
 
 ```
-hexa <file.hexa>              Run a file
-hexa --test <file.hexa>       Run proof blocks as tests
-hexa --vm <file.hexa>         Run with bytecode VM
-hexa --native <file.hexa>     Run with Cranelift JIT
-hexa --lsp                    Start language server
-hexa --bench                  Run benchmarks
-hexa init <name>              Create new project
-hexa run                      Run src/main.hexa
-hexa test                     Run all tests in tests/
-hexa fmt <file.hexa>          Format source file
-hexa lint <file.hexa>         Run linter
-hexa add <pkg>                Add dependency
-hexa publish                  Create package manifest
-hexa --mem-stats <file.hexa>  Show memory usage
-hexa --memory-budget N <f>    Set memory budget (bytes)
-hexa build --target <t> <f>   Cross-compile (cpu/esp32/fpga/wgpu)
-hexa dream <file.hexa>        Consciousness exploration mode
+hexa run <file.hexa>          Execute a .hexa script via stage0 interpreter
+hexa build <file.hexa> -o X   Compile .hexa → native binary (hexa_v2 + clang + codesign)
+hexa cc                       Rebuild the transpiler (self/native/hexa_v2)
+hexa status                   Show toolchain state
+hexa version                  Print CLI version
+hexa help                     Show usage
+
+# 호환 모드 (python/node 스타일, 내부적으로 run 로 위임):
+hexa <file.hexa>              Auto-dispatches to `hexa run <file>`
 ```
+
+### 과거 플래그 (stage0 인터프리터 바이너리 호출로 남아있음 — deprecated)
+```
+./build/hexa_stage0 --test <f>   proof 블록 실행
+./build/hexa_stage0 --vm <f>     VM tier 강제
+./build/hexa_stage0 --native <f> JIT 경로
+```
+향후 stage1 CLI 서브커맨드(`hexa test`, `hexa fmt` 등)로 이관 예정.
 
 ## Comments
 

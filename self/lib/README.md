@@ -53,11 +53,11 @@ println(set_size(s2))  // unique aliquot values
 각 파일은 자체 테스트 포함. 직접 실행:
 
 ```
-./hexa self/lib/sieve.hexa
-./hexa self/lib/fraction.hexa
-./hexa self/lib/set_emu.hexa
-./hexa self/lib/nan_sentinel.hexa
-./hexa self/lib/str_utils.hexa
+./hexa run self/lib/sieve.hexa
+./hexa run self/lib/fraction.hexa
+./hexa run self/lib/set_emu.hexa
+./hexa run self/lib/nan_sentinel.hexa
+./hexa run self/lib/str_utils.hexa
 ```
 
 ## 미해결 (이 라이브러리로 못 푸는 것)

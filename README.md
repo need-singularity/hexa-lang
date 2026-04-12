@@ -110,22 +110,25 @@ sigma(n) * phi(n) = n * tau(n)    holds for n >= 2    if and only if n = 6
 # 100% self-hosted — no Rust toolchain required
 git clone https://github.com/need-singularity/hexa-lang.git
 cd hexa-lang
-./hexa examples/hello_min.hexa   # precompiled binary runs immediately
+./hexa run examples/hello_min.hexa   # stage1 CLI, go/cargo-style subcommands
 ```
 
-> As of 2026-04-12, self-hosting 마이그레이션 진행중.
-> `self/*.hexa` 1,113개 파일이 주 소스이며, `src/` 에 92개 .rs 파일이
-> 잔존한다. Build pipeline: `build_hexa.hexa` (hexa_v2 -> C -> clang
-> -> hexa_v3). 기존 `hexa` 바이너리는 프리컴파일 상태로 계속 동작한다.
+> As of 2026-04-13, CLI는 go/cargo 스타일 서브커맨드로 전환됨.
+> `./hexa` 는 77KB stage1 디스패처이고 인터프리터 본체는
+> `build/hexa_stage0` 에 아카이브된 351KB 바이너리가 담당한다.
+> Rust (`src/`, `target/`, `Cargo.*`) 는 완전 폐기 — 100% 셀프호스트.
 
 ## Quick Start
 
 ```bash
-./hexa                                     # Interactive REPL
-./hexa examples/hello_min.hexa             # Run a file
-./hexa --test examples/test_builtins.hexa  # Run tests
-./hexa --dump-ast examples/fib.hexa        # Show parser output
-./hexa --check examples/fib.hexa           # Lex + parse only
+./hexa run examples/hello_min.hexa      # Run a .hexa file (interpreter)
+./hexa build examples/hello_min.hexa -o hello   # Compile to native binary
+./hexa status                           # Toolchain status
+./hexa version                          # Version
+./hexa help                             # Full usage
+
+# 호환 모드 (python/node 스타일, 내부적으로 run으로 위임):
+./hexa examples/hello_min.hexa          # 같은 결과
 ```
 
 ## Example
@@ -373,9 +376,9 @@ self/bootstrap.hexa     1945 LOC   Full pipeline (lex->parse->check->compile)
 ```
 
 ```bash
-./hexa self/bootstrap.hexa        # Compile HEXA programs using HEXA-written compiler
-./hexa self/test_bootstrap.hexa   # 10/10 lexer tests
-./hexa self/test_bootstrap_compiler.hexa  # 16/16 pipeline tests
+./hexa run self/bootstrap.hexa        # Compile HEXA programs using HEXA-written compiler
+./hexa run self/test_bootstrap.hexa   # 10/10 lexer tests
+./hexa run self/test_bootstrap_compiler.hexa  # 16/16 pipeline tests
 ```
 
 ## Package Manager
