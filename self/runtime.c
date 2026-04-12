@@ -13,6 +13,115 @@
 #include <time.h>
 #include <unistd.h>
 
+// ═══════════════════════════════════════════════════════════
+//  Optimization #11: String Interning
+//  Hash-set of unique strings. Short strings (< 64 chars)
+//  are interned; comparison becomes pointer equality (==).
+//  Lazily initialized on first hexa_intern() call.
+// ═══════════════════════════════════════════════════════════
+
+#define INTERN_INIT_CAP   256
+#define INTERN_MAX_LEN    64
+#define INTERN_LOAD_MAX   75   // percent
+
+static uint32_t hexa_fnv1a(const char* s, size_t len) {
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < len; i++) {
+        h ^= (uint8_t)s[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+
+// Also used by the hash-map (#10)
+static uint32_t hexa_fnv1a_str(const char* s) {
+    uint32_t h = 2166136261u;
+    for (; *s; s++) {
+        h ^= (uint8_t)*s;
+        h *= 16777619u;
+    }
+    return h;
+}
+
+typedef struct {
+    char** buckets;      // array of interned string pointers (NULL = empty)
+    uint32_t* hashes;    // cached hash per slot
+    int cap;             // power-of-2 capacity
+    int count;           // number of occupied slots
+} HexaInternTable;
+
+static HexaInternTable __hexa_intern = {NULL, NULL, 0, 0};
+
+static void hexa_intern_init(void) {
+    __hexa_intern.cap = INTERN_INIT_CAP;
+    __hexa_intern.count = 0;
+    __hexa_intern.buckets = (char**)calloc(INTERN_INIT_CAP, sizeof(char*));
+    __hexa_intern.hashes  = (uint32_t*)calloc(INTERN_INIT_CAP, sizeof(uint32_t));
+}
+
+static void hexa_intern_grow(void) {
+    int old_cap = __hexa_intern.cap;
+    char** old_buckets = __hexa_intern.buckets;
+    uint32_t* old_hashes = __hexa_intern.hashes;
+    int new_cap = old_cap * 2;
+    char** new_buckets = (char**)calloc(new_cap, sizeof(char*));
+    uint32_t* new_hashes = (uint32_t*)calloc(new_cap, sizeof(uint32_t));
+    uint32_t mask = (uint32_t)(new_cap - 1);
+    for (int i = 0; i < old_cap; i++) {
+        if (old_buckets[i]) {
+            uint32_t idx = old_hashes[i] & mask;
+            while (new_buckets[idx]) idx = (idx + 1) & mask;
+            new_buckets[idx] = old_buckets[i];
+            new_hashes[idx] = old_hashes[i];
+        }
+    }
+    free(old_buckets);
+    free(old_hashes);
+    __hexa_intern.buckets = new_buckets;
+    __hexa_intern.hashes  = new_hashes;
+    __hexa_intern.cap = new_cap;
+}
+
+// Intern a string: returns a canonical pointer.
+// If the string is already interned, returns the existing pointer.
+// Only interns strings shorter than INTERN_MAX_LEN.
+// The returned pointer is owned by the intern table -- callers must NOT free it.
+static const char* hexa_intern(const char* s) {
+    if (!s) return s;
+    size_t slen = strlen(s);
+    if (slen >= INTERN_MAX_LEN) return NULL;  // too long, skip interning
+
+    // Lazy init
+    if (!__hexa_intern.buckets) hexa_intern_init();
+
+    uint32_t h = hexa_fnv1a(s, slen);
+    uint32_t mask = (uint32_t)(__hexa_intern.cap - 1);
+    uint32_t idx = h & mask;
+
+    while (__hexa_intern.buckets[idx]) {
+        if (__hexa_intern.hashes[idx] == h &&
+            strcmp(__hexa_intern.buckets[idx], s) == 0) {
+            return __hexa_intern.buckets[idx];  // already interned
+        }
+        idx = (idx + 1) & mask;
+    }
+
+    // Not found -- insert
+    if (__hexa_intern.count * 100 / __hexa_intern.cap >= INTERN_LOAD_MAX) {
+        hexa_intern_grow();
+        // Recompute slot after grow
+        mask = (uint32_t)(__hexa_intern.cap - 1);
+        idx = h & mask;
+        while (__hexa_intern.buckets[idx]) idx = (idx + 1) & mask;
+    }
+
+    char* dup = strdup(s);
+    __hexa_intern.buckets[idx] = dup;
+    __hexa_intern.hashes[idx]  = h;
+    __hexa_intern.count++;
+    return dup;
+}
+
 // Forward declarations for all runtime functions
 typedef struct HexaVal HexaVal;
 HexaVal hexa_add(HexaVal a, HexaVal b);
@@ -49,6 +158,31 @@ typedef enum {
     TAG_ARRAY, TAG_MAP, TAG_FN, TAG_CHAR, TAG_CLOSURE
 } HexaTag;
 
+// ── Optimization #10: Hash-map backing store ─────────────
+// Open-addressing hash table (Robin Hood not needed at this scale).
+// Stored on the heap; the HexaVal map union holds a pointer + len.
+// Keeps a parallel insertion-order array for keys()/values()/iter.
+
+#define HMAP_INIT_CAP   16
+#define HMAP_LOAD_MAX   75  // percent
+
+typedef struct {
+    char*  key;       // owned string (strdup'd) -- NULL means empty slot
+    uint32_t hash;    // cached FNV-1a of key
+} HexaMapSlot;
+
+typedef struct {
+    HexaMapSlot* slots;   // hash table (power-of-2 sized)
+    struct HexaVal* vals;  // parallel values array (same indices as slots)
+    int ht_cap;            // hash table capacity (power-of-2)
+
+    // Insertion-order arrays for keys()/values()/for-in iteration
+    char** order_keys;     // ordered key pointers (point into slots[].key)
+    struct HexaVal* order_vals; // ordered values
+    int len;               // number of entries
+    int order_cap;         // allocated capacity for order arrays
+} HexaMapTable;
+
 typedef struct HexaVal {
     HexaTag tag;
     union {
@@ -62,10 +196,8 @@ typedef struct HexaVal {
             int cap;
         } arr;
         struct {
-            char** keys;
-            struct HexaVal* vals;
-            int len;
-            int cap;
+            HexaMapTable* tbl;   // heap-allocated hash table
+            int len;             // cached count (== tbl->len when tbl != NULL)
         } map;
         struct {
             void* fn_ptr;
@@ -164,7 +296,13 @@ HexaVal hexa_void() { return (HexaVal){.tag=TAG_VOID}; }
 
 HexaVal hexa_str(const char* s) {
     HexaVal v = {.tag=TAG_STR};
-    v.s = strdup(s);
+    // Optimization #11: intern short strings for pointer-equality comparison
+    const char* interned = hexa_intern(s);
+    if (interned) {
+        v.s = (char*)interned;  // owned by intern table, not caller
+    } else {
+        v.s = strdup(s);        // long/unique strings: traditional copy
+    }
     return v;
 }
 
@@ -180,17 +318,28 @@ HexaVal hexa_array_new() {
     return v;
 }
 
+// Optimization #12: reserve capacity up front when size is known.
+HexaVal hexa_array_reserve(HexaVal arr, int n) {
+    if (n <= arr.arr.cap) return arr;
+    HexaVal* new_items = realloc(arr.arr.items, sizeof(HexaVal) * n);
+    if (!new_items) { fprintf(stderr, "OOM in array_reserve\n"); exit(1); }
+    arr.arr.items = new_items;
+    arr.arr.cap = n;
+    return arr;
+}
+
+// Optimization #12: grow from current cap (2x), not from new_len.
+// Only realloc when len exceeds cap; growth factor 2x amortizes cost.
 HexaVal hexa_array_push(HexaVal arr, HexaVal item) {
-    int new_len = arr.arr.len + 1;
-    if (new_len > arr.arr.cap) {
-        int new_cap = new_len < 8 ? 8 : new_len * 2;
+    if (arr.arr.len >= arr.arr.cap) {
+        int new_cap = arr.arr.cap < 8 ? 8 : arr.arr.cap * 2;
         HexaVal* new_items = realloc(arr.arr.items, sizeof(HexaVal) * new_cap);
         if (!new_items) { fprintf(stderr, "OOM in array_push\n"); exit(1); }
         arr.arr.items = new_items;
         arr.arr.cap = new_cap;
     }
     arr.arr.items[arr.arr.len] = item;
-    arr.arr.len = new_len;
+    arr.arr.len++;
     return arr;
 }
 
@@ -221,79 +370,202 @@ int hexa_len(HexaVal v) {
     return 0;
 }
 
-// ── Map operations ───────────────────────────────────────
+// ── Map operations (Optimization #10: hash table) ───────
+
+// Allocate a new HexaMapTable with given hash-table capacity.
+static HexaMapTable* hmap_alloc(int ht_cap) {
+    HexaMapTable* t = (HexaMapTable*)calloc(1, sizeof(HexaMapTable));
+    t->ht_cap = ht_cap;
+    t->slots = (HexaMapSlot*)calloc(ht_cap, sizeof(HexaMapSlot));
+    t->vals  = (HexaVal*)calloc(ht_cap, sizeof(HexaVal));
+    int order_init = ht_cap < 8 ? 8 : ht_cap;
+    t->order_keys = (char**)malloc(sizeof(char*) * order_init);
+    t->order_vals = (HexaVal*)malloc(sizeof(HexaVal) * order_init);
+    t->order_cap = order_init;
+    t->len = 0;
+    return t;
+}
+
+// Rehash the table to double its capacity.
+static void hmap_grow(HexaMapTable* t) {
+    int old_cap = t->ht_cap;
+    HexaMapSlot* old_slots = t->slots;
+    HexaVal* old_vals = t->vals;
+    int new_cap = old_cap * 2;
+    HexaMapSlot* new_slots = (HexaMapSlot*)calloc(new_cap, sizeof(HexaMapSlot));
+    HexaVal* new_vals = (HexaVal*)calloc(new_cap, sizeof(HexaVal));
+    uint32_t mask = (uint32_t)(new_cap - 1);
+    for (int i = 0; i < old_cap; i++) {
+        if (old_slots[i].key) {
+            uint32_t idx = old_slots[i].hash & mask;
+            while (new_slots[idx].key) idx = (idx + 1) & mask;
+            new_slots[idx] = old_slots[i];
+            new_vals[idx]  = old_vals[i];
+        }
+    }
+    free(old_slots);
+    free(old_vals);
+    t->slots = new_slots;
+    t->vals  = new_vals;
+    t->ht_cap = new_cap;
+}
+
+// Find slot index for key, or -1 if not found.
+static int hmap_find(HexaMapTable* t, const char* key, uint32_t h) {
+    uint32_t mask = (uint32_t)(t->ht_cap - 1);
+    uint32_t idx = h & mask;
+    while (t->slots[idx].key) {
+        if (t->slots[idx].hash == h && strcmp(t->slots[idx].key, key) == 0)
+            return (int)idx;
+        idx = (idx + 1) & mask;
+    }
+    return -1;
+}
 
 HexaVal hexa_map_new() {
     HexaVal v = {.tag=TAG_MAP};
-    v.map.keys = NULL; v.map.vals = NULL; v.map.len = 0; v.map.cap = 0;
+    v.map.tbl = NULL;
+    v.map.len = 0;
     return v;
 }
 
 HexaVal hexa_map_set(HexaVal m, const char* key, HexaVal val) {
-    // Check if key exists
-    for (int i = 0; i < m.map.len; i++) {
-        if (strcmp(m.map.keys[i], key) == 0) {
-            m.map.vals[i] = val;
-            return m;
+    // Lazy-alloc table on first insert
+    if (!m.map.tbl) {
+        m.map.tbl = hmap_alloc(HMAP_INIT_CAP);
+    }
+    HexaMapTable* t = m.map.tbl;
+    uint32_t h = hexa_fnv1a_str(key);
+
+    // Check if key exists (O(1) average)
+    int si = hmap_find(t, key, h);
+    if (si >= 0) {
+        t->vals[si] = val;
+        // Also update in the order array
+        for (int i = 0; i < t->len; i++) {
+            if (t->order_keys[i] == t->slots[si].key) {
+                t->order_vals[i] = val;
+                break;
+            }
         }
+        return m;
     }
-    // Add new key
-    int new_len = m.map.len + 1;
-    if (new_len > m.map.cap) {
-        int new_cap = new_len * 2;
-        m.map.keys = realloc(m.map.keys, sizeof(char*) * new_cap);
-        m.map.vals = realloc(m.map.vals, sizeof(HexaVal) * new_cap);
-        m.map.cap = new_cap;
+
+    // Grow hash table if needed
+    if (t->len * 100 / t->ht_cap >= HMAP_LOAD_MAX) {
+        hmap_grow(t);
     }
-    m.map.keys[m.map.len] = strdup(key);
-    m.map.vals[m.map.len] = val;
-    m.map.len = new_len;
+
+    // Insert into hash table
+    uint32_t mask = (uint32_t)(t->ht_cap - 1);
+    uint32_t idx = h & mask;
+    while (t->slots[idx].key) idx = (idx + 1) & mask;
+    t->slots[idx].key  = strdup(key);
+    t->slots[idx].hash = h;
+    t->vals[idx] = val;
+
+    // Append to insertion-order arrays
+    if (t->len >= t->order_cap) {
+        t->order_cap *= 2;
+        t->order_keys = (char**)realloc(t->order_keys, sizeof(char*) * t->order_cap);
+        t->order_vals = (HexaVal*)realloc(t->order_vals, sizeof(HexaVal) * t->order_cap);
+    }
+    t->order_keys[t->len] = t->slots[idx].key;  // shared pointer, not a copy
+    t->order_vals[t->len] = val;
+    t->len++;
+    m.map.len = t->len;
     return m;
 }
 
 HexaVal hexa_map_get(HexaVal m, const char* key) {
-    for (int i = 0; i < m.map.len; i++) {
-        if (strcmp(m.map.keys[i], key) == 0) return m.map.vals[i];
+    if (!m.map.tbl) {
+        fprintf(stderr, "map key '%s' not found\n", key);
+        return hexa_void();
     }
+    HexaMapTable* t = m.map.tbl;
+    uint32_t h = hexa_fnv1a_str(key);
+    int si = hmap_find(t, key, h);
+    if (si >= 0) return t->vals[si];
     fprintf(stderr, "map key '%s' not found\n", key);
     return hexa_void();
 }
 
 HexaVal hexa_map_keys(HexaVal m) {
     HexaVal arr = hexa_array_new();
-    for (int i = 0; i < m.map.len; i++) {
-        arr = hexa_array_push(arr, hexa_str(m.map.keys[i]));
+    if (!m.map.tbl) return arr;
+    HexaMapTable* t = m.map.tbl;
+    arr = hexa_array_reserve(arr, t->len);
+    for (int i = 0; i < t->len; i++) {
+        arr = hexa_array_push(arr, hexa_str(t->order_keys[i]));
     }
     return arr;
 }
 
 HexaVal hexa_map_values(HexaVal m) {
     HexaVal arr = hexa_array_new();
-    for (int i = 0; i < m.map.len; i++) {
-        arr = hexa_array_push(arr, m.map.vals[i]);
+    if (!m.map.tbl) return arr;
+    HexaMapTable* t = m.map.tbl;
+    arr = hexa_array_reserve(arr, t->len);
+    for (int i = 0; i < t->len; i++) {
+        arr = hexa_array_push(arr, t->order_vals[i]);
     }
     return arr;
 }
 
 int hexa_map_contains_key(HexaVal m, const char* key) {
-    for (int i = 0; i < m.map.len; i++) {
-        if (strcmp(m.map.keys[i], key) == 0) return 1;
-    }
-    return 0;
+    if (!m.map.tbl) return 0;
+    uint32_t h = hexa_fnv1a_str(key);
+    return hmap_find(m.map.tbl, key, h) >= 0;
 }
 
 HexaVal hexa_map_remove(HexaVal m, const char* key) {
-    for (int i = 0; i < m.map.len; i++) {
-        if (strcmp(m.map.keys[i], key) == 0) {
-            free(m.map.keys[i]);
-            for (int j = i; j < m.map.len - 1; j++) {
-                m.map.keys[j] = m.map.keys[j+1];
-                m.map.vals[j] = m.map.vals[j+1];
+    if (!m.map.tbl) return m;
+    HexaMapTable* t = m.map.tbl;
+    uint32_t h = hexa_fnv1a_str(key);
+    int si = hmap_find(t, key, h);
+    if (si < 0) return m;
+
+    // Remove from insertion-order arrays
+    char* removed_key = t->slots[si].key;
+    for (int i = 0; i < t->len; i++) {
+        if (t->order_keys[i] == removed_key) {
+            for (int j = i; j < t->len - 1; j++) {
+                t->order_keys[j] = t->order_keys[j+1];
+                t->order_vals[j] = t->order_vals[j+1];
             }
-            m.map.len--;
-            return m;
+            break;
         }
     }
+
+    // Remove from hash table: mark slot empty and re-insert displaced entries
+    free(t->slots[si].key);
+    t->slots[si].key = NULL;
+    t->slots[si].hash = 0;
+    // Robin Hood deletion: re-probe subsequent slots
+    uint32_t mask = (uint32_t)(t->ht_cap - 1);
+    uint32_t ci = ((uint32_t)si + 1) & mask;
+    while (t->slots[ci].key) {
+        // Remove and re-insert this entry
+        HexaMapSlot saved_slot = t->slots[ci];
+        HexaVal saved_val = t->vals[ci];
+        t->slots[ci].key = NULL;
+        t->slots[ci].hash = 0;
+        uint32_t ri = saved_slot.hash & mask;
+        while (t->slots[ri].key) ri = (ri + 1) & mask;
+        t->slots[ri] = saved_slot;
+        t->vals[ri] = saved_val;
+        // Update order_keys pointer if it moved
+        for (int k = 0; k < t->len; k++) {
+            if (t->order_keys[k] == saved_slot.key) {
+                // pointer unchanged, just slot index moved -- no action needed
+                break;
+            }
+        }
+        ci = (ci + 1) & mask;
+    }
+
+    t->len--;
+    m.map.len = t->len;
     return m;
 }
 
@@ -305,16 +577,15 @@ HexaVal hexa_index_get(HexaVal container, HexaVal key) {
     return hexa_array_get(container, key.i);
 }
 
-// For-in dispatch: array → element, map → key as string.
-// Used by `for x in collection { ... }` codegen so maps iterate their keys
-// (Python-style). hexa_len already handles both tags, so no separate length.
+// For-in dispatch: array -> element, map -> key as string.
+// Uses insertion-order arrays so maps iterate in insertion order (Python-style).
 HexaVal hexa_iter_get(HexaVal v, int64_t idx) {
     if (v.tag == TAG_MAP) {
-        if (idx < 0 || idx >= v.map.len) {
+        if (!v.map.tbl || idx < 0 || idx >= v.map.len) {
             fprintf(stderr, "map iter index %lld out of bounds (len %d)\n", (long long)idx, v.map.len);
             exit(1);
         }
-        return hexa_str(v.map.keys[idx]);
+        return hexa_str(v.map.tbl->order_keys[idx]);
     }
     return hexa_array_get(v, idx);
 }
@@ -329,15 +600,14 @@ HexaVal hexa_index_set(HexaVal container, HexaVal key, HexaVal val) {
 
 // Silent type check for struct method dispatch (codegen_c2 ImplBlock support).
 // Returns 1 if v is a TAG_MAP carrying a "__type__" field equal to type_name.
+// Uses hash lookup instead of linear scan.
 int hexa_is_type(HexaVal v, const char* type_name) {
-    if (v.tag != TAG_MAP) return 0;
-    for (int i = 0; i < v.map.len; i++) {
-        if (strcmp(v.map.keys[i], "__type__") == 0) {
-            HexaVal t = v.map.vals[i];
-            return t.tag == TAG_STR && t.s && strcmp(t.s, type_name) == 0;
-        }
-    }
-    return 0;
+    if (v.tag != TAG_MAP || !v.map.tbl) return 0;
+    uint32_t h = hexa_fnv1a_str("__type__");
+    int si = hmap_find(v.map.tbl, "__type__", h);
+    if (si < 0) return 0;
+    HexaVal t = v.map.tbl->vals[si];
+    return t.tag == TAG_STR && t.s && strcmp(t.s, type_name) == 0;
 }
 
 // ── String operations ────────────────────────────────────
@@ -366,6 +636,8 @@ int hexa_str_contains(HexaVal s, HexaVal sub) {
 
 int hexa_str_eq(HexaVal a, HexaVal b) {
     if (a.tag != TAG_STR || b.tag != TAG_STR) return 0;
+    // Optimization #11: interned strings share pointers
+    if (a.s == b.s) return 1;
     return strcmp(a.s, b.s) == 0;
 }
 
@@ -566,7 +838,7 @@ HexaVal hexa_eq(HexaVal a, HexaVal b) {
         case TAG_INT: return hexa_bool(a.i == b.i);
         case TAG_FLOAT: return hexa_bool(a.f == b.f);
         case TAG_BOOL: return hexa_bool(a.b == b.b);
-        case TAG_STR: return hexa_bool(strcmp(a.s, b.s) == 0);
+        case TAG_STR: return hexa_bool(a.s == b.s || strcmp(a.s, b.s) == 0);
         case TAG_VOID: return hexa_bool(1);
         default: return hexa_bool(0);
     }
