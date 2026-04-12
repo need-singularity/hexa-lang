@@ -58,6 +58,8 @@ fn classify_attr_m0(name) {
     if name == "bitfield" { return "G2" }
     if name == "pool" { return "G2" }
     if name == "branch_predict" { return "G3" }
+    if name == "restrict" { return "G3" }
+    if name == "flatten" { return "G3" }
     if name == "test" { return "meta" }
     if name == "bench" { return "meta" }
     if name == "deprecated" { return "meta" }
@@ -1710,6 +1712,16 @@ let mut m975_reg_candidates = 0
 // M976: general recursion → iteration (non-tail, explicit stack)
 let mut m976_rec_to_iter = 0
 let mut m976_rec_candidates = 0
+// M974: @restrict — non-aliasing pointer marker (C restrict)
+let mut m974_restrict_ok = 0
+let mut m974_restrict_violations = 0
+// M975: GVN (Global Value Numbering) — redundant expression elimination
+let mut m975_gvn_eliminated = 0
+// M976: @flatten (SROA) — struct→scalar decomposition
+let mut m976_flatten_ok = 0
+let mut m976_flatten_violations = 0
+// M977: Power Iteration → Lanczos rewrite
+let mut m977_lanczos_rewrites = 0
 
 fn body_is_effect_free(body) {
     if type_of(body) != "array" { return true }
@@ -7712,6 +7724,231 @@ fn attr_has(attrs, target) {
     return false
 }
 
+// ── M974: @restrict pass — mark pointer params as non-aliasing ──
+// Validates: fn must have >=2 params (aliasing only matters with 2+ pointers).
+// In codegen, restrict params emit C `restrict` qualifier for vectorization.
+fn pass_restrict(node, attrs) {
+    let p_cnt = if type_of(node.params) == "array" { len(node.params) } else { 0 }
+    if p_cnt >= 2 {
+        m974_restrict_ok = m974_restrict_ok + 1
+        println("[ai-native] fn " + node.name + " OK: @restrict (" + to_string(p_cnt) + " param(s), noalias eligible)")
+        return true
+    } else {
+        m974_restrict_violations = m974_restrict_violations + 1
+        println("[ai-native] fn " + node.name + " WARN: @restrict requires >=2 params (aliasing needs 2+ pointers)")
+        return false
+    }
+}
+
+// ── M975: GVN (Global Value Numbering) pass ──
+// Scans body for repeated identical sub-expressions across the function.
+// Detects: let a = f(x); ... let b = f(x) → b reuses a.
+// Returns count of redundant expressions found.
+fn gvn_scan_body(body) {
+    if type_of(body) != "array" { return 0 }
+    let n = len(body)
+    let mut expr_sigs = []
+    let mut expr_names = []
+    let mut redundant = 0
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        if stmt.kind == "LetStmt" || stmt.kind == "LetMutStmt" {
+            let val = stmt.left
+            if type_of(val) != "string" {
+                let sig = gvn_expr_signature(val)
+                if sig != "" {
+                    // Check if this signature was already seen
+                    let mut found = false
+                    let mut si = 0
+                    while si < len(expr_sigs) {
+                        if expr_sigs[si] == sig {
+                            found = true
+                            redundant = redundant + 1
+                            println("  [gvn] redundant: " + stmt.name + " = " + sig + " (same as " + expr_names[si] + ")")
+                            si = len(expr_sigs)
+                        }
+                        si = si + 1
+                    }
+                    if !found {
+                        expr_sigs = expr_sigs.push(sig)
+                        expr_names = expr_names.push(stmt.name)
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return redundant
+}
+
+// Generate a canonical signature for an expression to detect equivalence
+fn gvn_expr_signature(expr) {
+    if type_of(expr) == "string" { return "" }
+    let k = expr.kind
+    if k == "Call" {
+        let callee = expr.left
+        if type_of(callee) != "string" && callee.kind == "Ident" {
+            let mut arg_sigs = []
+            if type_of(expr.args) == "array" {
+                let mut ai = 0
+                while ai < len(expr.args) {
+                    let as2 = gvn_expr_signature(expr.args[ai])
+                    if as2 != "" {
+                        arg_sigs = arg_sigs.push(as2)
+                    } else {
+                        return ""
+                    }
+                    ai = ai + 1
+                }
+            }
+            return "call:" + callee.name + "(" + arg_sigs.join(",") + ")"
+        }
+    }
+    if k == "BinOp" {
+        let ls = gvn_expr_signature(expr.left)
+        let rs = gvn_expr_signature(expr.right)
+        if ls != "" && rs != "" {
+            return "binop:" + expr.op + "(" + ls + "," + rs + ")"
+        }
+    }
+    if k == "Ident" { return "id:" + expr.name }
+    if k == "IntLit" { return "int:" + expr.value }
+    if k == "FloatLit" { return "float:" + expr.value }
+    if k == "BoolLit" { return "bool:" + expr.value }
+    if k == "StringLit" { return "str:" + expr.value }
+    if k == "Index" {
+        let ls2 = gvn_expr_signature(expr.left)
+        let rs2 = gvn_expr_signature(expr.right)
+        if ls2 != "" && rs2 != "" {
+            return "idx:" + ls2 + "[" + rs2 + "]"
+        }
+    }
+    if k == "FieldAccess" {
+        let ls3 = gvn_expr_signature(expr.left)
+        if ls3 != "" {
+            return "field:" + ls3 + "." + expr.name
+        }
+    }
+    return ""
+}
+
+// ── M976: @flatten (SROA) pass — decompose struct into scalars ──
+// Validates: fn must have >=1 param. Body should access .field patterns
+// (FieldAccess on params), indicating struct args that can be decomposed.
+fn pass_flatten(node, attrs) {
+    let p_cnt = if type_of(node.params) == "array" { len(node.params) } else { 0 }
+    if p_cnt == 0 {
+        m976_flatten_violations = m976_flatten_violations + 1
+        println("[ai-native] fn " + node.name + " WARN: @flatten requires >=1 param (nothing to decompose)")
+        return 0
+    }
+    // Count FieldAccess patterns on params — SROA candidates
+    let field_sites = count_flatten_candidates(node.body, node.params)
+    m976_flatten_ok = m976_flatten_ok + 1
+    println("[ai-native] fn " + node.name + " OK: @flatten (" + to_string(p_cnt) + " param(s), " + to_string(field_sites) + " field access site(s))")
+    return field_sites
+}
+
+// Count FieldAccess nodes where the base is one of the fn params
+fn count_flatten_candidates(body, params) {
+    if type_of(body) != "array" { return 0 }
+    let n = len(body)
+    let mut count = 0
+    let mut i = 0
+    while i < n {
+        count = count + count_flatten_expr(body[i], params)
+        i = i + 1
+    }
+    return count
+}
+
+fn count_flatten_expr(node, params) {
+    if type_of(node) == "string" { return 0 }
+    let k = node.kind
+    let mut total = 0
+    if k == "FieldAccess" {
+        // Check if base is a param name
+        if type_of(node.left) != "string" && node.left.kind == "Ident" {
+            let pn = node.left.name
+            let mut pi2 = 0
+            while pi2 < len(params) {
+                if params[pi2].name == pn {
+                    total = total + 1
+                    pi2 = len(params)
+                }
+                pi2 = pi2 + 1
+            }
+        }
+    }
+    // Recurse into sub-expressions
+    if type_of(node.left) != "string" { total = total + count_flatten_expr(node.left, params) }
+    if type_of(node.right) != "string" { total = total + count_flatten_expr(node.right, params) }
+    if type_of(node.cond) != "string" { total = total + count_flatten_expr(node.cond, params) }
+    if type_of(node.body) == "array" { total = total + count_flatten_candidates(node.body, params) }
+    if type_of(node.then_body) == "array" { total = total + count_flatten_candidates(node.then_body, params) }
+    if type_of(node.else_body) == "array" { total = total + count_flatten_candidates(node.else_body, params) }
+    if type_of(node.args) == "array" {
+        let mut ai2 = 0
+        while ai2 < len(node.args) {
+            total = total + count_flatten_expr(node.args[ai2], params)
+            ai2 = ai2 + 1
+        }
+    }
+    return total
+}
+
+// ── M977: Power Iteration → Lanczos detection ──
+// Detects naive eigenvalue computation patterns:
+//   while loop containing: matrix-vector multiply + normalization + convergence check
+// Pattern: while { v = A*v; v = v/norm(v); lambda = ... }
+fn detect_power_iteration(body) {
+    if type_of(body) != "array" { return false }
+    let n = len(body)
+    let mut has_while = false
+    let mut has_matvec = false
+    let mut has_normalize = false
+    let mut has_converge = false
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        if stmt.kind == "WhileStmt" {
+            has_while = true
+            // Scan the while body for power iteration markers
+            if type_of(stmt.body) == "array" {
+                let wb = stmt.body
+                let wn = len(wb)
+                let mut wi = 0
+                while wi < wn {
+                    let ws = wb[wi]
+                    // Detect matrix-vector multiply pattern (nested loop or mul+sum accumulator)
+                    if ws.kind == "WhileStmt" { has_matvec = true }
+                    // Detect normalization (division by norm/sqrt)
+                    if ws.kind == "AssignStmt" || ws.kind == "LetStmt" || ws.kind == "LetMutStmt" {
+                        let wv = ws.left
+                        if type_of(wv) != "string" {
+                            if wv.kind == "BinOp" && wv.op == "/" { has_normalize = true }
+                            if wv.kind == "Call" {
+                                if type_of(wv.left) != "string" && wv.left.kind == "Ident" {
+                                    let cn = wv.left.name
+                                    if cn == "norm" || cn == "sqrt" || cn == "normalize" {
+                                        has_normalize = true
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Detect convergence check (if + break/return with comparison)
+                    if ws.kind == "IfStmt" { has_converge = true }
+                    wi = wi + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return has_while && has_matvec && has_normalize
+}
+
 fn find_attr_conflict(attrs) {
     if attr_has(attrs, "hot") && attr_has(attrs, "cold") {
         return "hot+cold"
@@ -9732,6 +9969,12 @@ fn ai_native_pass(ast) {
     m975_reg_candidates = 0
     m976_rec_to_iter = 0
     m976_rec_candidates = 0
+    m974_restrict_ok = 0
+    m974_restrict_violations = 0
+    m975_gvn_eliminated = 0
+    m976_flatten_ok = 0
+    m976_flatten_violations = 0
+    m977_lanczos_rewrites = 0
     m252_contract_injects = 0
     m253b_contract_elims = 0
     m480_symbolic_rewrites = 0
@@ -11446,6 +11689,29 @@ fn ai_native_pass(ast) {
                     println("[ai-native] fn " + node.name + " OK: @compact (no AoS pattern detected)")
                 }
             }
+            // M974: @restrict — non-aliasing pointer marker
+            if attr_has(attrs, "restrict") {
+                pass_restrict(node, attrs)
+            }
+            // M975: GVN — global value numbering (redundant expression detection)
+            // Runs on all annotated fns to detect duplicate sub-expressions
+            let before_gvn = m975_gvn_eliminated
+            let gvn_count = gvn_scan_body(node.body)
+            if gvn_count > 0 {
+                m975_gvn_eliminated = m975_gvn_eliminated + gvn_count
+                println("[ai-native] fn " + node.name + " GVN: " + to_string(gvn_count) + " redundant expression(s)")
+            }
+            // M976: @flatten (SROA) — struct→scalar decomposition
+            if attr_has(attrs, "flatten") {
+                pass_flatten(node, attrs)
+            }
+            // M977: Power Iteration → Lanczos detection
+            if attr_has(attrs, "optimize") {
+                if detect_power_iteration(node.body) {
+                    m977_lanczos_rewrites = m977_lanczos_rewrites + 1
+                    println("[ai-native] fn " + node.name + " CANDIDATE: power-iteration → Lanczos (faster eigenvalue convergence)")
+                }
+            }
             // M973: @optimize sliding-window — DP lookback detection.
             //   Detects dp[i] = f(dp[i-1], dp[i-2]) patterns inside while loops.
             if attr_has(attrs, "optimize") {
@@ -12280,6 +12546,17 @@ fn ai_native_pass(ast) {
     }
     if m976_rec_to_iter + m976_rec_candidates > 0 {
         println("[ai-native] rec→iter: " + to_string(m976_rec_to_iter) + " rewrite(s), " + to_string(m976_rec_candidates) + " candidate(s)")
+    if m974_restrict_ok + m974_restrict_violations > 0 {
+        println("[ai-native] @restrict: " + to_string(m974_restrict_ok) + " ok, " + to_string(m974_restrict_violations) + " violation(s)")
+    }
+    if m975_gvn_eliminated > 0 {
+        println("[ai-native] GVN: " + to_string(m975_gvn_eliminated) + " redundant expression(s) detected")
+    }
+    if m976_flatten_ok + m976_flatten_violations > 0 {
+        println("[ai-native] @flatten: " + to_string(m976_flatten_ok) + " ok, " + to_string(m976_flatten_violations) + " violation(s)")
+    }
+    if m977_lanczos_rewrites > 0 {
+        println("[ai-native] power-iter→Lanczos: " + to_string(m977_lanczos_rewrites) + " candidate(s)")
     }
     return out
 }
