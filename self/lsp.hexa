@@ -3,7 +3,7 @@
 // LSP server for HEXA-LANG.
 // Speaks JSON-RPC over stdin/stdout with Content-Length framing.
 // Supports: initialize/shutdown/exit, textDocument/didOpen, didChange,
-// completion, definition, hover, rename.
+// completion, definition, hover, rename, semanticTokens/full.
 
 // ── JSON Value type ──────────────────────────────────────────
 
@@ -117,6 +117,358 @@ fn get_builtins() -> [string] {
         "tension_link",
         "exec", "exec_with_status", "input", "readline"
     ]
+}
+
+// ── Semantic Token Types (LSP spec order) ────────────────
+// Index in this array = tokenType id sent to client.
+// https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#semanticTokenTypes
+
+fn get_semantic_token_types() -> [string] {
+    return [
+        "namespace",    // 0
+        "type",         // 1
+        "class",        // 2
+        "enum",         // 3
+        "struct",       // 4
+        "parameter",    // 5
+        "variable",     // 6
+        "property",     // 7
+        "function",     // 8
+        "keyword",      // 9
+        "comment",      // 10
+        "string",       // 11
+        "number",       // 12
+        "operator",     // 13
+        "decorator"     // 14
+    ]
+}
+
+fn get_semantic_token_modifiers() -> [string] {
+    return [
+        "declaration",   // 0
+        "definition",    // 1
+        "readonly",      // 2
+        "defaultLibrary" // 3
+    ]
+}
+
+// ── LSP Semantic Tokenizer ───────────────────────────────
+// Re-tokenizes source for semantic highlighting.
+// Unlike self/lexer.hexa tokenize(), this also emits comment tokens
+// and records raw source positions needed by the LSP delta encoding.
+
+struct SemanticToken {
+    line: int,       // 0-based
+    col: int,        // 0-based
+    length: int,
+    token_type: int, // index into get_semantic_token_types()
+    modifiers: int   // bitmask into get_semantic_token_modifiers()
+}
+
+fn semantic_tokenize(source: string) -> [SemanticToken] {
+    let mut tokens = []
+    let chars = source.chars()
+    let mut pos = 0
+    let mut line = 0
+    let mut col = 0
+    let total = len(chars)
+    let kw_list = get_keywords()
+    let bi_list = get_builtins()
+
+    // Build keyword set as map for O(1) lookup
+    let kw_set = #{}
+    for k in kw_list {
+        kw_set[k] = true
+    }
+    let bi_set = #{}
+    for b in bi_list {
+        bi_set[b] = true
+    }
+    while pos < total {
+        let ch = chars[pos]
+
+        // ── whitespace ──
+        if ch == ' ' || ch == '\t' || ch == '\r' {
+            pos = pos + 1
+            col = col + 1
+        } else if ch == '\n' {
+            pos = pos + 1
+            line = line + 1
+            col = 0
+        // ── line comment ──
+        } else if ch == '/' && (pos + 1) < total && chars[pos + 1] == '/' {
+            let start_col = col
+            let mut clen = 0
+            while pos < total && chars[pos] != '\n' {
+                pos = pos + 1
+                clen = clen + 1
+            }
+            tokens = tokens.push(SemanticToken { line: line, col: start_col, length: clen, token_type: 10, modifiers: 0 })
+        // ── block comment ──
+        } else if ch == '/' && (pos + 1) < total && chars[pos + 1] == '*' {
+            let start_line = line
+            let start_col = col
+            let start_pos = pos
+            pos = pos + 2
+            col = col + 2
+            let mut depth = 1
+            while depth > 0 && pos < total {
+                if (pos + 1) < total && chars[pos] == '/' && chars[pos + 1] == '*' {
+                    depth = depth + 1
+                    pos = pos + 2
+                    col = col + 2
+                } else if (pos + 1) < total && chars[pos] == '*' && chars[pos + 1] == '/' {
+                    depth = depth - 1
+                    pos = pos + 2
+                    col = col + 2
+                } else if chars[pos] == '\n' {
+                    pos = pos + 1
+                    line = line + 1
+                    col = 0
+                } else {
+                    pos = pos + 1
+                    col = col + 1
+                }
+            }
+            // Emit one comment token per line of the block comment
+            // For simplicity emit single token on start line with length to end-of-first-line
+            let clen = pos - start_pos
+            tokens = tokens.push(SemanticToken { line: start_line, col: start_col, length: clen, token_type: 10, modifiers: 0 })
+        // ── identifiers / keywords ──
+        } else if is_alpha(ch) || ch == '_' {
+            let start_col = col
+            let mut wlen = 0
+            while pos < total && (is_alphanumeric(chars[pos]) || chars[pos] == '_') {
+                pos = pos + 1
+                col = col + 1
+                wlen = wlen + 1
+            }
+            // Extract word
+            let word_parts = []
+            let mut wi = pos - wlen
+            while wi < pos {
+                word_parts.push(to_string(chars[wi]))
+                wi = wi + 1
+            }
+            let word = join(word_parts, "")
+
+            // Classify
+            if word == "true" || word == "false" {
+                // boolean literal — treat as keyword
+                tokens = tokens.push(SemanticToken { line: line, col: start_col, length: wlen, token_type: 9, modifiers: 0 })
+            } else if has_key(kw_set, word) {
+                tokens = tokens.push(SemanticToken { line: line, col: start_col, length: wlen, token_type: 9, modifiers: 0 })
+            } else if has_key(bi_set, word) {
+                // builtin function
+                tokens = tokens.push(SemanticToken { line: line, col: start_col, length: wlen, token_type: 8, modifiers: 8 })
+            } else {
+                // Check if first char is uppercase -> type name
+                let first_ch = chars[pos - wlen]
+                if is_alpha(first_ch) && to_string(first_ch) == to_string(first_ch).to_upper() {
+                    tokens = tokens.push(SemanticToken { line: line, col: start_col, length: wlen, token_type: 1, modifiers: 0 })
+                } else {
+                    // Check if followed by '(' -> function call
+                    let mut peek = pos
+                    while peek < total && (chars[peek] == ' ' || chars[peek] == '\t') {
+                        peek = peek + 1
+                    }
+                    if peek < total && chars[peek] == '(' {
+                        tokens = tokens.push(SemanticToken { line: line, col: start_col, length: wlen, token_type: 8, modifiers: 0 })
+                    } else {
+                        tokens = tokens.push(SemanticToken { line: line, col: start_col, length: wlen, token_type: 6, modifiers: 0 })
+                    }
+                }
+            }
+        // ── number literals ──
+        } else if is_digit(ch) {
+            let start_col = col
+            let mut nlen = 0
+            while pos < total && (is_digit(chars[pos]) || chars[pos] == '_') {
+                pos = pos + 1
+                col = col + 1
+                nlen = nlen + 1
+            }
+            // Decimal part
+            if pos < total && chars[pos] == '.' && (pos + 1) < total && is_digit(chars[pos + 1]) {
+                pos = pos + 1
+                col = col + 1
+                nlen = nlen + 1
+                while pos < total && (is_digit(chars[pos]) || chars[pos] == '_') {
+                    pos = pos + 1
+                    col = col + 1
+                    nlen = nlen + 1
+                }
+            }
+            tokens = tokens.push(SemanticToken { line: line, col: start_col, length: nlen, token_type: 12, modifiers: 0 })
+        // ── string literals ──
+        } else if ch == '"' {
+            let mut start_col = col
+            let mut slen = 1
+            pos = pos + 1
+            col = col + 1
+            // Check triple-quote
+            if (pos + 1) < total && chars[pos] == '"' && chars[pos + 1] == '"' {
+                // Triple-quoted string — scan to closing """
+                pos = pos + 2
+                col = col + 2
+                slen = slen + 2
+                let mut closed = false
+                while pos < total && !closed {
+                    if (pos + 2) < total && chars[pos] == '"' && chars[pos + 1] == '"' && chars[pos + 2] == '"' {
+                        closed = true
+                        pos = pos + 3
+                        col = col + 3
+                        slen = slen + 3
+                    } else if chars[pos] == '\n' {
+                        // Emit token for this line, start new segment
+                        tokens = tokens.push(SemanticToken { line: line, col: start_col, length: slen, token_type: 11, modifiers: 0 })
+                        pos = pos + 1
+                        line = line + 1
+                        col = 0
+                        start_col = 0
+                        slen = 0
+                    } else {
+                        pos = pos + 1
+                        col = col + 1
+                        slen = slen + 1
+                    }
+                }
+                if slen > 0 {
+                    tokens = tokens.push(SemanticToken { line: line, col: start_col, length: slen, token_type: 11, modifiers: 0 })
+                }
+            } else {
+                // Regular string
+                let mut done = false
+                while pos < total && !done {
+                    if chars[pos] == '"' {
+                        done = true
+                        pos = pos + 1
+                        col = col + 1
+                        slen = slen + 1
+                    } else if chars[pos] == '\\' && (pos + 1) < total {
+                        pos = pos + 2
+                        col = col + 2
+                        slen = slen + 2
+                    } else if chars[pos] == '\n' {
+                        pos = pos + 1
+                        line = line + 1
+                        col = 0
+                        slen = slen + 1
+                    } else {
+                        pos = pos + 1
+                        col = col + 1
+                        slen = slen + 1
+                    }
+                }
+                tokens = tokens.push(SemanticToken { line: line, col: start_col, length: slen, token_type: 11, modifiers: 0 })
+            }
+        // ── char literals ──
+        } else if ch == '\'' {
+            let start_col = col
+            let mut clen = 1
+            pos = pos + 1
+            col = col + 1
+            if pos < total && chars[pos] == '\\' && (pos + 1) < total {
+                pos = pos + 2
+                col = col + 2
+                clen = clen + 2
+            } else if pos < total {
+                pos = pos + 1
+                col = col + 1
+                clen = clen + 1
+            }
+            if pos < total && chars[pos] == '\'' {
+                pos = pos + 1
+                col = col + 1
+                clen = clen + 1
+            }
+            tokens = tokens.push(SemanticToken { line: line, col: start_col, length: clen, token_type: 11, modifiers: 0 })
+        // ── @ decorator ──
+        } else if ch == '@' {
+            let start_col = col
+            let mut alen = 1
+            pos = pos + 1
+            col = col + 1
+            while pos < total && (is_alphanumeric(chars[pos]) || chars[pos] == '_') {
+                pos = pos + 1
+                col = col + 1
+                alen = alen + 1
+            }
+            tokens = tokens.push(SemanticToken { line: line, col: start_col, length: alen, token_type: 14, modifiers: 0 })
+        // ── operators (multi-char) ──
+        } else if ch == '-' && (pos + 1) < total && chars[pos + 1] == '>' {
+            tokens = tokens.push(SemanticToken { line: line, col: col, length: 2, token_type: 13, modifiers: 0 })
+            pos = pos + 2
+            col = col + 2
+        } else if ch == '=' && (pos + 1) < total && chars[pos + 1] == '>' {
+            tokens = tokens.push(SemanticToken { line: line, col: col, length: 2, token_type: 13, modifiers: 0 })
+            pos = pos + 2
+            col = col + 2
+        } else if ch == '.' && (pos + 1) < total && chars[pos + 1] == '.' {
+            if (pos + 2) < total && chars[pos + 2] == '=' {
+                tokens = tokens.push(SemanticToken { line: line, col: col, length: 3, token_type: 13, modifiers: 0 })
+                pos = pos + 3
+                col = col + 3
+            } else {
+                tokens = tokens.push(SemanticToken { line: line, col: col, length: 2, token_type: 13, modifiers: 0 })
+                pos = pos + 2
+                col = col + 2
+            }
+        } else if (ch == '=' || ch == '!' || ch == '<' || ch == '>' || ch == '+' || ch == '-' || ch == '*' || ch == '/' || ch == '%') && (pos + 1) < total && chars[pos + 1] == '=' {
+            tokens = tokens.push(SemanticToken { line: line, col: col, length: 2, token_type: 13, modifiers: 0 })
+            pos = pos + 2
+            col = col + 2
+        } else if (ch == '&' && (pos + 1) < total && chars[pos + 1] == '&') || (ch == '|' && (pos + 1) < total && chars[pos + 1] == '|') || (ch == '^' && (pos + 1) < total && chars[pos + 1] == '^') || (ch == '*' && (pos + 1) < total && chars[pos + 1] == '*') || (ch == ':' && (pos + 1) < total && chars[pos + 1] == ':') || (ch == ':' && (pos + 1) < total && chars[pos + 1] == '=') {
+            tokens = tokens.push(SemanticToken { line: line, col: col, length: 2, token_type: 13, modifiers: 0 })
+            pos = pos + 2
+            col = col + 2
+        } else if ch == '+' || ch == '-' || ch == '*' || ch == '/' || ch == '%' || ch == '=' || ch == '<' || ch == '>' || ch == '!' || ch == '&' || ch == '|' || ch == '^' || ch == '~' || ch == ':' {
+            tokens = tokens.push(SemanticToken { line: line, col: col, length: 1, token_type: 13, modifiers: 0 })
+            pos = pos + 1
+            col = col + 1
+        // ── delimiters and punctuation — skip (no semantic highlight) ──
+        } else {
+            pos = pos + 1
+            col = col + 1
+        }
+    }
+    return tokens
+}
+
+// Encode semantic tokens into LSP delta format.
+// Returns a flat array of ints: [deltaLine, deltaStartChar, length, tokenType, tokenModifiers, ...]
+fn encode_semantic_tokens(stokens: [SemanticToken]) -> [int] {
+    let mut result = []
+    let mut prev_line = 0
+    let mut prev_col = 0
+    for tok in stokens {
+        let delta_line = tok.line - prev_line
+        let mut delta_col = tok.col
+        if delta_line == 0 {
+            delta_col = tok.col - prev_col
+        }
+        result = result.push(delta_line)
+        result = result.push(delta_col)
+        result = result.push(tok.length)
+        result = result.push(tok.token_type)
+        result = result.push(tok.modifiers)
+        prev_line = tok.line
+        prev_col = tok.col
+    }
+    return result
+}
+
+// ── Handle textDocument/semanticTokens/full ───────────────
+fn handle_semantic_tokens_full(source: string) -> string {
+    let stokens = semantic_tokenize(source)
+    let encoded = encode_semantic_tokens(stokens)
+    // Build JSON array of ints
+    let mut parts = []
+    for v in encoded {
+        parts = parts.push(to_string(v))
+    }
+    let data_json = "[" + join(parts, ",") + "]"
+    return "{\"data\":" + data_json + "}"
 }
 
 // ── Symbol table ──────────────────────────────────────────
@@ -254,10 +606,181 @@ fn handle_rename(uri: string, source: string, line: int, character: int, new_nam
     return "null"
 }
 
+// ── Server capabilities ──────────────────────────────────
+
+fn build_semantic_tokens_legend() -> string {
+    let types = get_semantic_token_types()
+    let mods = get_semantic_token_modifiers()
+    let mut type_parts = []
+    for t in types {
+        type_parts = type_parts.push("\"" + t + "\"")
+    }
+    let mut mod_parts = []
+    for m in mods {
+        mod_parts = mod_parts.push("\"" + m + "\"")
+    }
+    return "{\"tokenTypes\":[" + join(type_parts, ",") + "],\"tokenModifiers\":[" + join(mod_parts, ",") + "]}"
+}
+
+fn build_capabilities() -> string {
+    let legend = build_semantic_tokens_legend()
+    return "{" +
+        "\"textDocumentSync\":1," +
+        "\"completionProvider\":{\"triggerCharacters\":[\".\",\":\",\"@\"]}," +
+        "\"hoverProvider\":true," +
+        "\"definitionProvider\":true," +
+        "\"renameProvider\":true," +
+        "\"semanticTokensProvider\":{" +
+            "\"legend\":" + legend + "," +
+            "\"full\":true" +
+        "}" +
+    "}"
+}
+
+// ── JSON-RPC field extraction (minimal) ──────────────────
+// Extract a string value for a given key from a JSON object string.
+// Handles simple cases: "key":"value" and "key":number
+
+fn json_get_string(json: string, key: string) -> string {
+    let search = "\"" + key + "\":"
+    let idx = json.index_of(search)
+    if idx < 0 { return "" }
+    let after = json.substring(idx + len(search), len(json))
+    let trimmed = after.trim()
+    if len(trimmed) == 0 { return "" }
+    let first_chars = trimmed.chars()
+    if to_string(first_chars[0]) == "\"" {
+        // String value — find closing quote (skip escapes)
+        let mut i = 1
+        let mut result_parts = []
+        let tlen = len(first_chars)
+        while i < tlen {
+            let c = first_chars[i]
+            if c == '\\' && (i + 1) < tlen {
+                result_parts = result_parts.push(to_string(first_chars[i + 1]))
+                i = i + 2
+            } else if c == '"' {
+                return join(result_parts, "")
+            } else {
+                result_parts = result_parts.push(to_string(c))
+                i = i + 1
+            }
+        }
+        return join(result_parts, "")
+    }
+    // Numeric or other — collect until , } or whitespace
+    let mut i = 0
+    let mut val_parts = []
+    let tlen = len(first_chars)
+    while i < tlen {
+        let c = first_chars[i]
+        if c == ',' || c == '}' || c == ' ' || c == '\n' || c == '\r' {
+            return join(val_parts, "")
+        }
+        val_parts = val_parts.push(to_string(c))
+        i = i + 1
+    }
+    return join(val_parts, "")
+}
+
+// ── Document store ──────────────────────────────────────────
+// In-memory map of URI -> source text for open documents.
+
+let mut doc_store = #{}
+
+fn store_document(uri: string, text: string) {
+    doc_store[uri] = text
+}
+
+fn get_document(uri: string) -> string {
+    if has_key(doc_store, uri) {
+        return doc_store[uri]
+    }
+    return ""
+}
+
 // ── Main LSP loop ──────────────────────────────────────────
 
 fn run_lsp() {
-    // Main LSP loop: read JSON-RPC messages from stdin, dispatch, write responses
-    // In full impl: loop { read_message -> dispatch -> send_message }
-    print("HEXA LSP server started")
+    // Read JSON-RPC messages from stdin, dispatch, write responses to stdout.
+    // Content-Length framing per LSP spec.
+    let mut running = true
+    while running {
+        // Read Content-Length header
+        let header = readline()
+        if header == "" {
+            running = false
+        } else {
+            // Parse Content-Length
+            let hdr_trimmed = header.trim()
+            if hdr_trimmed.starts_with("Content-Length:") {
+                let len_str = hdr_trimmed.substring(15, len(hdr_trimmed)).trim()
+                let content_len = to_int(len_str)
+                // Skip blank line after headers
+                let blank = readline()
+                // Read body
+                let body = input(content_len)
+                // Dispatch
+                let method = json_get_string(body, "method")
+                let id = json_get_string(body, "id")
+
+                if method == "initialize" {
+                    let caps = build_capabilities()
+                    let result = "{\"capabilities\":" + caps + ",\"serverInfo\":{\"name\":\"hexa-lsp\",\"version\":\"0.1.0\"}}"
+                    let resp = make_response(id, result)
+                    print(send_message(resp))
+                } else if method == "initialized" {
+                    // No response needed
+                } else if method == "shutdown" {
+                    let resp = make_response(id, "null")
+                    print(send_message(resp))
+                } else if method == "exit" {
+                    running = false
+                } else if method == "textDocument/didOpen" {
+                    // Extract uri and text from params.textDocument
+                    let uri = json_get_string(body, "uri")
+                    let text = json_get_string(body, "text")
+                    store_document(uri, text)
+                    // Publish diagnostics
+                    let diags = diagnose(text)
+                    let notif = make_notification("textDocument/publishDiagnostics", "{\"uri\":\"" + escape_json_str(uri) + "\",\"diagnostics\":[]}")
+                    print(send_message(notif))
+                } else if method == "textDocument/didChange" {
+                    let uri = json_get_string(body, "uri")
+                    let text = json_get_string(body, "text")
+                    if text != "" {
+                        store_document(uri, text)
+                    }
+                } else if method == "textDocument/hover" {
+                    let uri = json_get_string(body, "uri")
+                    let source = get_document(uri)
+                    let line_str = json_get_string(body, "line")
+                    let char_str = json_get_string(body, "character")
+                    let result = handle_hover(source, to_int(line_str), to_int(char_str))
+                    let resp = make_response(id, result)
+                    print(send_message(resp))
+                } else if method == "textDocument/definition" {
+                    let uri = json_get_string(body, "uri")
+                    let source = get_document(uri)
+                    let line_str = json_get_string(body, "line")
+                    let char_str = json_get_string(body, "character")
+                    let result = handle_definition(uri, source, to_int(line_str), to_int(char_str))
+                    let resp = make_response(id, result)
+                    print(send_message(resp))
+                } else if method == "textDocument/semanticTokens/full" {
+                    let uri = json_get_string(body, "uri")
+                    let source = get_document(uri)
+                    let result = handle_semantic_tokens_full(source)
+                    let resp = make_response(id, result)
+                    print(send_message(resp))
+                } else {
+                    // Unknown method — if it has an id, respond with method-not-found
+                    if id != "" {
+                        let resp = make_response(id, "null")
+                        print(send_message(resp))
+                    }
+                }
+            }
+        }
+    }
 }
