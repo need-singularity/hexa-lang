@@ -156,6 +156,13 @@ pub let mut p_pending_symbol = ""   // @symbol("name") — pending C symbol alia
 pub let mut p_pending_link = ""     // @link("lib") — pending library name
 // M0: AI-native @attr accumulator — parse_stmt fills this, parse_fn_decl consumes
 pub let mut p_pending_attrs = ""
+// @contract desugar: pending requires/ensures AST expressions
+// Filled by parse_stmt's @attr loop when attr_name == "contract"
+// Consumed by parse_fn_decl → injected as ContractAssert nodes
+pub let mut p_pending_contract_requires = ""   // AST expr or ""
+pub let mut p_pending_contract_ensures = ""    // AST expr or ""
+pub let mut p_pending_contract_req_text = ""   // source text for error msg
+pub let mut p_pending_contract_ens_text = ""   // source text for error msg
 // Struct literal disambiguation: when set, `Name {` is NOT parsed as
 // struct literal (used inside if/while/match conditions where `{` is body).
 pub let mut p_suppress_struct_lit = false
@@ -307,6 +314,10 @@ fn parse(tokens) {
     p_pos = 0
     p_pending_symbol = ""
     p_pending_link = ""
+    p_pending_contract_requires = ""
+    p_pending_contract_ensures = ""
+    p_pending_contract_req_text = ""
+    p_pending_contract_ens_text = ""
     p_errors = []
     let mut stmts = []
     p_skip_newlines()
@@ -368,25 +379,84 @@ fn parse_stmt() {
             attr_name = next_tok.value
             p_advance()
         }
-        // Optional parenthesized argument: @symbol("x"), @link("libm"), ...
-        let mut attr_arg = ""
-        if p_peek_kind() == "LParen" {
-            p_advance()
-            if p_peek_kind() != "RParen" {
-                let tok = p_advance()
-                attr_arg = tok.value
-                // Skip any remaining tokens until RParen (simple skip)
-                while p_peek_kind() != "RParen" && p_peek_kind() != "Eof" {
+        // ── @contract — parse requires/ensures clauses ──────
+        if attr_name == "contract" && p_peek_kind() == "LParen" {
+            p_advance() // consume (
+            p_pending_contract_requires = ""
+            p_pending_contract_ensures = ""
+            p_pending_contract_req_text = ""
+            p_pending_contract_ens_text = ""
+            while p_peek_kind() != "RParen" && p_peek_kind() != "Eof" {
+                // Expect "requires" or "ensures" identifier
+                let clause_tok = p_advance()
+                let clause_name = clause_tok.value
+                // Consume the colon after requires/ensures
+                if p_peek_kind() == "Colon" {
+                    p_advance()
+                }
+                // Capture token position for source text extraction
+                let expr_start = p_pos
+                // Parse the clause expression using the full expression parser
+                let clause_expr = parse_expr()
+                // Build source text from consumed tokens for error messages
+                let mut src_text = ""
+                let mut _si = expr_start
+                while _si < p_pos {
+                    if src_text != "" {
+                        src_text = src_text + " "
+                    }
+                    src_text = src_text + p_tokens[_si].value
+                    _si = _si + 1
+                }
+                if clause_name == "requires" {
+                    p_pending_contract_requires = clause_expr
+                    p_pending_contract_req_text = src_text
+                } else if clause_name == "ensures" {
+                    p_pending_contract_ensures = clause_expr
+                    p_pending_contract_ens_text = src_text
+                }
+                // Skip comma separator between clauses
+                if p_peek_kind() == "Comma" {
                     p_advance()
                 }
             }
             p_expect("RParen")
-        }
-        if attr_name == "symbol" {
-            p_pending_symbol = attr_arg
-        } else if attr_name == "link" {
-            p_pending_link = attr_arg
+            if p_pending_attrs == "" {
+                p_pending_attrs = "contract"
+            } else {
+                p_pending_attrs = p_pending_attrs + ",contract"
+            }
+        } else if attr_name == "symbol" || attr_name == "link" {
+            // @symbol("x") / @link("libm") — single string argument
+            let mut attr_arg = ""
+            if p_peek_kind() == "LParen" {
+                p_advance()
+                if p_peek_kind() != "RParen" {
+                    let tok = p_advance()
+                    attr_arg = tok.value
+                    while p_peek_kind() != "RParen" && p_peek_kind() != "Eof" {
+                        p_advance()
+                    }
+                }
+                p_expect("RParen")
+            }
+            if attr_name == "symbol" {
+                p_pending_symbol = attr_arg
+            } else {
+                p_pending_link = attr_arg
+            }
         } else {
+            // Generic attribute — skip optional parenthesized content
+            if p_peek_kind() == "LParen" {
+                p_advance()
+                if p_peek_kind() != "RParen" {
+                    let tok = p_advance()
+                    while p_peek_kind() != "RParen" && p_peek_kind() != "Eof" {
+                        p_advance()
+                    }
+                }
+                p_expect("RParen")
+            }
             if p_pending_attrs == "" {
                 p_pending_attrs = attr_name
             } else {
@@ -715,13 +785,128 @@ fn parse_fn_decl() {
     // M0: consume any pending @attrs into FnDecl.value (comma-separated)
     let attrs = p_pending_attrs
     p_pending_attrs = ""
+
+    // ── @contract desugar: inject ContractAssert nodes ──────
+    let mut final_body = body
+    let req_expr = p_pending_contract_requires
+    let ens_expr = p_pending_contract_ensures
+    let req_text = p_pending_contract_req_text
+    let ens_text = p_pending_contract_ens_text
+    p_pending_contract_requires = ""
+    p_pending_contract_ensures = ""
+    p_pending_contract_req_text = ""
+    p_pending_contract_ens_text = ""
+
+    if req_expr != "" {
+        // Prepend requires check: if !(<requires_expr>) throw "contract ..."
+        let req_node = #{
+            "kind": "ContractAssert", "name": name, "value": "requires: " + req_text, "op": "requires",
+            "left": req_expr, "right": "", "cond": "", "then_body": "", "else_body": "",
+            "params": "", "body": "", "args": "", "fields": "", "items": "",
+            "variants": "", "arms": "", "iter_expr": "", "ret_type": "",
+            "target": "", "trait_name": "", "methods": ""
+        }
+        let mut new_body = [req_node]
+        for stmt in final_body {
+            new_body = new_body.push(stmt)
+        }
+        final_body = new_body
+    }
+
+    if ens_expr != "" {
+        // Walk body and wrap every ReturnStmt with ensures check.
+        // Replace: return <expr>
+        // With:    let __contract_result = <expr>
+        //          ContractAssert(ensures_expr)  // result bound to __contract_result
+        //          return __contract_result
+        final_body = contract_wrap_returns(final_body, ens_expr, name, ens_text)
+    }
+
     return #{
         "kind": "FnDecl", "name": name, "value": attrs, "op": "",
         "left": "", "right": "", "cond": "", "then_body": "", "else_body": "",
-        "params": params, "body": body, "args": "", "fields": "", "items": tparams,
+        "params": params, "body": final_body, "args": "", "fields": "", "items": tparams,
         "variants": "", "arms": "", "iter_expr": "", "ret_type": ret,
         "target": "", "trait_name": "", "methods": ""
     }
+}
+
+// ── @contract ensures: wrap return statements ───────────────
+// Walks a body array, replacing every ReturnStmt with a 3-node sequence:
+//   1. let __contract_result = <return_expr>
+//   2. ContractAssert(ensures_expr)   — interpreter binds `result`
+//   3. return __contract_result
+// Recurses into if/else blocks to catch early returns in branches.
+
+fn contract_wrap_returns(body, ens_expr, fn_name, ens_text) {
+    let mut out = []
+    for stmt in body {
+        if type_of(stmt) == "string" {
+            out = out.push(stmt)
+        } else if stmt.kind == "ReturnStmt" || stmt.kind == "Return" {
+            // 1. let __contract_result = <original return expr>
+            let let_node = #{
+                "kind": "LetStmt", "name": "__contract_result", "value": "", "op": "",
+                "left": stmt.left, "right": "", "cond": "", "then_body": "", "else_body": "",
+                "params": "", "body": "", "args": "", "fields": "", "items": "",
+                "variants": "", "arms": "", "iter_expr": "", "ret_type": "",
+                "target": "", "trait_name": "", "methods": ""
+            }
+            // 2. ContractAssert — ensures check (result = __contract_result)
+            let assert_node = #{
+                "kind": "ContractAssert", "name": fn_name, "value": "ensures: " + ens_text, "op": "ensures",
+                "left": ens_expr, "right": "", "cond": "", "then_body": "", "else_body": "",
+                "params": "", "body": "", "args": "", "fields": "", "items": "",
+                "variants": "", "arms": "", "iter_expr": "", "ret_type": "",
+                "target": "", "trait_name": "", "methods": ""
+            }
+            // 3. return __contract_result
+            let ret_node = #{
+                "kind": "ReturnStmt", "name": "", "value": "", "op": "",
+                "left": node_ident("__contract_result"),
+                "right": "", "cond": "", "then_body": "", "else_body": "",
+                "params": "", "body": "", "args": "", "fields": "", "items": "",
+                "variants": "", "arms": "", "iter_expr": "", "ret_type": "",
+                "target": "", "trait_name": "", "methods": ""
+            }
+            out = out.push(let_node)
+            out = out.push(assert_node)
+            out = out.push(ret_node)
+        } else if stmt.kind == "IfStmt" {
+            // Recurse into if/else branches to catch returns there
+            let mut wrapped = stmt
+            if type_of(stmt.then_body) == "array" {
+                wrapped = #{
+                    "kind": "IfStmt", "name": stmt.name, "value": stmt.value, "op": stmt.op,
+                    "left": stmt.left, "right": stmt.right, "cond": stmt.cond,
+                    "then_body": contract_wrap_returns(stmt.then_body, ens_expr, fn_name, ens_text),
+                    "else_body": stmt.else_body,
+                    "params": stmt.params, "body": stmt.body, "args": stmt.args,
+                    "fields": stmt.fields, "items": stmt.items,
+                    "variants": stmt.variants, "arms": stmt.arms,
+                    "iter_expr": stmt.iter_expr, "ret_type": stmt.ret_type,
+                    "target": stmt.target, "trait_name": stmt.trait_name, "methods": stmt.methods
+                }
+            }
+            if type_of(wrapped.else_body) == "array" {
+                wrapped = #{
+                    "kind": "IfStmt", "name": wrapped.name, "value": wrapped.value, "op": wrapped.op,
+                    "left": wrapped.left, "right": wrapped.right, "cond": wrapped.cond,
+                    "then_body": wrapped.then_body,
+                    "else_body": contract_wrap_returns(wrapped.else_body, ens_expr, fn_name, ens_text),
+                    "params": wrapped.params, "body": wrapped.body, "args": wrapped.args,
+                    "fields": wrapped.fields, "items": wrapped.items,
+                    "variants": wrapped.variants, "arms": wrapped.arms,
+                    "iter_expr": wrapped.iter_expr, "ret_type": wrapped.ret_type,
+                    "target": wrapped.target, "trait_name": wrapped.trait_name, "methods": wrapped.methods
+                }
+            }
+            out = out.push(wrapped)
+        } else {
+            out = out.push(stmt)
+        }
+    }
+    return out
 }
 
 // Parse a type annotation after ':' — supports Ident and *Ident (pointer types)

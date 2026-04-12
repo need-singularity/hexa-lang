@@ -958,7 +958,8 @@ static int64_t hexa_ffi_marshal_arg(HexaVal v) {
     }
 }
 
-// Raw extern call dispatch — supports 0 to 10 arguments.
+// Raw extern call dispatch — supports 0 to 12 arguments.
+// Extended 2026-04-12 from 10 to 12 to support cuLaunchKernel (11 args).
 // Uses transmute (cast) to call through a function pointer with the right arity.
 static int64_t hexa_call_extern_raw(void* fn_ptr, int64_t* args, int nargs) {
     typedef int64_t (*Fn0)(void);
@@ -972,6 +973,8 @@ static int64_t hexa_call_extern_raw(void* fn_ptr, int64_t* args, int nargs) {
     typedef int64_t (*Fn8)(int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t);
     typedef int64_t (*Fn9)(int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t);
     typedef int64_t (*Fn10)(int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t);
+    typedef int64_t (*Fn11)(int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t);
+    typedef int64_t (*Fn12)(int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t);
 
     switch (nargs) {
         case 0:  return ((Fn0)fn_ptr)();
@@ -985,8 +988,10 @@ static int64_t hexa_call_extern_raw(void* fn_ptr, int64_t* args, int nargs) {
         case 8:  return ((Fn8)fn_ptr)(args[0],args[1],args[2],args[3],args[4],args[5],args[6],args[7]);
         case 9:  return ((Fn9)fn_ptr)(args[0],args[1],args[2],args[3],args[4],args[5],args[6],args[7],args[8]);
         case 10: return ((Fn10)fn_ptr)(args[0],args[1],args[2],args[3],args[4],args[5],args[6],args[7],args[8],args[9]);
+        case 11: return ((Fn11)fn_ptr)(args[0],args[1],args[2],args[3],args[4],args[5],args[6],args[7],args[8],args[9],args[10]);
+        case 12: return ((Fn12)fn_ptr)(args[0],args[1],args[2],args[3],args[4],args[5],args[6],args[7],args[8],args[9],args[10],args[11]);
         default:
-            fprintf(stderr, "[hexa-ffi] extern call with %d args not supported (max 10)\n", nargs);
+            fprintf(stderr, "[hexa-ffi] extern call with %d args not supported (max 12)\n", nargs);
             return 0;
     }
 }
@@ -994,8 +999,8 @@ static int64_t hexa_call_extern_raw(void* fn_ptr, int64_t* args, int nargs) {
 // High-level extern call: resolve, marshal, call, unmarshal.
 // ret_kind: 0=void, 1=int, 2=float, 3=bool, 4=pointer/string
 HexaVal hexa_extern_call(void* fn_ptr, HexaVal* hargs, int nargs, int ret_kind) {
-    int64_t cargs[10];
-    for (int i = 0; i < nargs && i < 10; i++) {
+    int64_t cargs[12];  // was 10; extended for cuLaunchKernel (11 args)
+    for (int i = 0; i < nargs && i < 12; i++) {
         cargs[i] = hexa_ffi_marshal_arg(hargs[i]);
     }
     int64_t ret = hexa_call_extern_raw(fn_ptr, cargs, nargs);
