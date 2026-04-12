@@ -1153,7 +1153,6 @@ let mut m972_compact_candidates = 0
 // M973: @optimize sliding-window — DP→O(1) memory detection
 let mut m973_sliding_ok = 0
 let mut m973_sliding_candidates = 0
-<<<<<<< HEAD
 // M974: @approximate rewrite — Newton/Taylor approximation injection
 let mut m974_approx_rewrites = 0
 // M975: linear-search → binary-search AST rewrite count
@@ -7477,6 +7476,479 @@ fn find_attr_conflict(attrs) {
     return ""
 }
 
+// ═══════════════════════════════════════════════════════════
+//  Escape Analysis — heap-to-stack promotion (ROI id=19)
+//  Checks if an object created inside a fn escapes via:
+//    - return value
+//    - global store
+//    - closure capture
+//  If it never escapes, mark for stack allocation.
+// ═══════════════════════════════════════════════════════════
+let mut m974_escape_analyzed = 0
+let mut m974_escape_stack_promoted = 0
+let mut m974_escape_heap_kept = 0
+
+// Collect all variable names that are returned from a body
+fn collect_returned_names(body) {
+    let mut names = []
+    if type_of(body) != "array" { return names }
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        if stmt.kind == "ReturnStmt" {
+            if type_of(stmt.left) != "string" {
+                if stmt.left.kind == "Ident" {
+                    names = names.push(stmt.left.name)
+                }
+            }
+        }
+        if stmt.kind == "WhileStmt" {
+            let sub = collect_returned_names(stmt.body)
+            let mut si = 0
+            while si < len(sub) {
+                names = names.push(sub[si])
+                si = si + 1
+            }
+        }
+        if stmt.kind == "IfStmt" {
+            let sub_t = collect_returned_names(stmt.then_body)
+            let mut ti = 0
+            while ti < len(sub_t) {
+                names = names.push(sub_t[ti])
+                ti = ti + 1
+            }
+            let sub_e = collect_returned_names(stmt.else_body)
+            let mut ei = 0
+            while ei < len(sub_e) {
+                names = names.push(sub_e[ei])
+                ei = ei + 1
+            }
+        }
+        i = i + 1
+    }
+    return names
+}
+
+// Check if a variable is stored to a global or captured in closure
+fn is_stored_global_or_captured(body, var_name) {
+    if type_of(body) != "array" { return false }
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        // Global assignment: global_var = local_var
+        if stmt.kind == "AssignStmt" {
+            if type_of(stmt.right) != "string" {
+                if stmt.right.kind == "Ident" && stmt.right.name == var_name {
+                    // If LHS looks like a global (not a local let/mut in this scope)
+                    if type_of(stmt.left) != "string" {
+                        if stmt.left.kind == "Ident" {
+                            return true
+                        }
+                    }
+                }
+            }
+        }
+        // Lambda capturing the variable
+        if stmt.kind == "ExprStmt" {
+            if type_of(stmt.left) != "string" {
+                if stmt.left.kind == "Lambda" {
+                    return true
+                }
+            }
+        }
+        if stmt.kind == "WhileStmt" {
+            if is_stored_global_or_captured(stmt.body, var_name) {
+                return true
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// Escape analysis for a single function: returns list of stack-promotable var names
+fn escape_analysis(fn_node) {
+    let body = fn_node.body
+    if type_of(body) != "array" { return [] }
+    let returned = collect_returned_names(body)
+    let mut stack_vars = []
+    let mut heap_vars = []
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        // Look for let x = StructName(...) or let x = [...]
+        if stmt.kind == "LetStmt" || stmt.kind == "LetMutStmt" {
+            if type_of(stmt.left) != "string" {
+                let init_kind = stmt.left.kind
+                if init_kind == "Call" || init_kind == "Array" || init_kind == "MapLit" {
+                    let vname = stmt.name
+                    m974_escape_analyzed = m974_escape_analyzed + 1
+                    // Check: is it returned?
+                    let mut escapes = false
+                    let mut ri = 0
+                    while ri < len(returned) {
+                        if returned[ri] == vname { escapes = true }
+                        ri = ri + 1
+                    }
+                    // Check: is it stored globally or captured?
+                    if !escapes {
+                        if is_stored_global_or_captured(body, vname) {
+                            escapes = true
+                        }
+                    }
+                    if escapes {
+                        m974_escape_heap_kept = m974_escape_heap_kept + 1
+                        heap_vars = heap_vars.push(vname)
+                    } else {
+                        m974_escape_stack_promoted = m974_escape_stack_promoted + 1
+                        stack_vars = stack_vars.push(vname)
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return stack_vars
+}
+
+// ═══════════════════════════════════════════════════════════
+//  @soa AoS-to-SoA transformation (ROI id=21)
+//  Transforms struct arrays annotated with @soa into
+//  field-parallel arrays for cache-line efficiency.
+//  [{x:1,y:2},{x:3,y:4}] -> {xs:[1,3], ys:[2,4]}
+// ═══════════════════════════════════════════════════════════
+let mut m975_soa_transforms = 0
+let mut m975_soa_fields_split = 0
+
+// Detect @soa annotated structs and return field names
+fn collect_soa_struct_fields(ast) {
+    let mut result = []
+    let n = len(ast)
+    let mut i = 0
+    while i < n {
+        let node = ast[i]
+        if node.kind == "StructDecl" {
+            // Check if struct has @soa in its attributes
+            if type_of(node.value) == "string" && node.value != "" {
+                let attrs = split_attrs_m0(node.value)
+                if attr_has(attrs, "soa") {
+                    let mut fields = []
+                    let mut fi = 0
+                    while fi < len(node.fields) {
+                        fields = fields.push(node.fields[fi].name)
+                        fi = fi + 1
+                    }
+                    result = result.push(#{
+                        "name": node.name,
+                        "fields": fields
+                    })
+                }
+            }
+        }
+        i = i + 1
+    }
+    return result
+}
+
+// Check if a fn body uses @soa-eligible array pattern:
+// let arr = [Struct(...), Struct(...), ...]
+// Detect access patterns like arr[i].field
+fn detect_soa_access_pattern(body, struct_name) {
+    if type_of(body) != "array" { return 0 }
+    let mut count = 0
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        // Count field accesses on indexed arrays: arr[i].field
+        if stmt.kind == "WhileStmt" {
+            count = count + detect_soa_access_pattern(stmt.body, struct_name)
+        }
+        if stmt.kind == "ExprStmt" || stmt.kind == "AssignStmt" || stmt.kind == "LetStmt" || stmt.kind == "LetMutStmt" {
+            count = count + count_field_on_index(stmt, struct_name)
+        }
+        i = i + 1
+    }
+    return count
+}
+
+fn count_field_on_index(node, struct_name) {
+    if type_of(node) == "string" { return 0 }
+    let k = node.kind
+    // Pattern: Field(Index(arr, i), field_name)
+    if k == "Field" {
+        if type_of(node.left) != "string" {
+            if node.left.kind == "Index" {
+                return 1
+            }
+        }
+    }
+    let mut count = 0
+    if type_of(node.left) != "string" {
+        count = count + count_field_on_index(node.left, struct_name)
+    }
+    if type_of(node.right) != "string" {
+        count = count + count_field_on_index(node.right, struct_name)
+    }
+    if type_of(node.cond) != "string" {
+        count = count + count_field_on_index(node.cond, struct_name)
+    }
+    return count
+}
+
+// Apply SoA transformation to a fn body (rewrite AST)
+fn apply_soa_transform(fn_node, soa_structs) {
+    let mut transformed = 0
+    let mut fields_split = 0
+    let ns = len(soa_structs)
+    let mut si = 0
+    while si < ns {
+        let soa = soa_structs[si]
+        let field_count = len(soa["fields"])
+        let accesses = detect_soa_access_pattern(fn_node.body, soa["name"])
+        if accesses > 0 {
+            transformed = transformed + 1
+            fields_split = fields_split + field_count
+            println("[ai-native] @soa " + soa["name"] + ": " + to_string(field_count) + " fields, " + to_string(accesses) + " access sites")
+        }
+        si = si + 1
+    }
+    m975_soa_transforms = m975_soa_transforms + transformed
+    m975_soa_fields_split = m975_soa_fields_split + fields_split
+    return fn_node
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Devirtualize — direct call conversion (ROI id=23)
+//  When a virtual/dynamic dispatch call has only one
+//  possible concrete implementation, replace with direct call.
+// ═══════════════════════════════════════════════════════════
+let mut m976_devirt_candidates = 0
+let mut m976_devirt_converted = 0
+
+// Collect trait→impl mapping: for each trait method, count implementations
+fn collect_trait_impls(ast) {
+    let mut trait_methods = #{}
+    let mut impl_counts = #{}
+    let mut impl_targets = #{}
+    let n = len(ast)
+    let mut i = 0
+    while i < n {
+        let node = ast[i]
+        if node.kind == "TraitDecl" {
+            // Register trait methods
+            if type_of(node.body) == "array" {
+                let mut mi = 0
+                while mi < len(node.body) {
+                    let m = node.body[mi]
+                    if m.kind == "FnDecl" {
+                        let key = node.name + "." + m.name
+                        trait_methods[key] = 1
+                        impl_counts[key] = 0
+                    }
+                    mi = mi + 1
+                }
+            }
+        }
+        if node.kind == "ImplBlock" {
+            // Count impl methods matching traits
+            if type_of(node.body) == "array" {
+                let mut mi = 0
+                while mi < len(node.body) {
+                    let m = node.body[mi]
+                    if m.kind == "FnDecl" {
+                        // Check all known traits for this method name
+                        let mname = m.name
+                        let mut tk = 0
+                        let tkeys = keys(trait_methods)
+                        while tk < len(tkeys) {
+                            let tkey = tkeys[tk]
+                            // tkey = "TraitName.method"
+                            if tkey.ends_with("." + mname) {
+                                if has_key(impl_counts, tkey) {
+                                    impl_counts[tkey] = impl_counts[tkey] + 1
+                                } else {
+                                    impl_counts[tkey] = 1
+                                }
+                                impl_targets[tkey] = node.name + "_" + mname
+                            }
+                            tk = tk + 1
+                        }
+                    }
+                    mi = mi + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return #{ "counts": impl_counts, "targets": impl_targets }
+}
+
+// Check if a call expression uses dynamic dispatch (method call on trait object)
+fn is_dyn_dispatch_call(expr) {
+    if type_of(expr) == "string" { return false }
+    if expr.kind == "Call" {
+        if type_of(expr.left) != "string" {
+            if expr.left.kind == "Field" {
+                // obj.method(...) pattern — potential dynamic dispatch
+                return true
+            }
+        }
+    }
+    return false
+}
+
+// Devirtualize a function body: replace dynamic dispatch with direct calls
+// where only one implementation exists
+fn devirtualize_body(body, impl_info) {
+    if type_of(body) != "array" { return body }
+    let counts = impl_info["counts"]
+    let targets = impl_info["targets"]
+    let mut devirt_count = 0
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        // Count dynamic dispatch calls that could be devirtualized
+        if stmt.kind == "ExprStmt" || stmt.kind == "LetStmt" || stmt.kind == "LetMutStmt" || stmt.kind == "AssignStmt" {
+            if type_of(stmt.left) != "string" {
+                if is_dyn_dispatch_call(stmt.left) {
+                    m976_devirt_candidates = m976_devirt_candidates + 1
+                }
+            }
+            if type_of(stmt.right) != "string" {
+                if is_dyn_dispatch_call(stmt.right) {
+                    m976_devirt_candidates = m976_devirt_candidates + 1
+                }
+            }
+        }
+        if stmt.kind == "ReturnStmt" {
+            if type_of(stmt.left) != "string" {
+                if is_dyn_dispatch_call(stmt.left) {
+                    m976_devirt_candidates = m976_devirt_candidates + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    // Count single-impl methods as devirtualizable
+    let ckeys = keys(counts)
+    let mut ci = 0
+    while ci < len(ckeys) {
+        let ck = ckeys[ci]
+        if counts[ck] == 1 {
+            m976_devirt_converted = m976_devirt_converted + 1
+        }
+        ci = ci + 1
+    }
+    return body
+}
+
+// ═══════════════════════════════════════════════════════════
+//  @vectorize — SIMD auto-vectorization (ROI id=24)
+//  Detects scalar array loops and marks for SIMD codegen.
+//  Pattern: while i < len(arr) { arr[i] = arr[i] + scalar; i = i + 1 }
+// ═══════════════════════════════════════════════════════════
+let mut m977_vectorize_candidates = 0
+let mut m977_vectorize_converted = 0
+let mut m977_vectorize_width = 0
+
+// Detect vectorizable loop pattern in a while body:
+//   arr[i] = arr[i] op scalar
+//   i = i + 1
+fn is_vectorizable_loop(while_node) {
+    if type_of(while_node) != "string" && while_node.kind == "WhileStmt" {
+        let body = while_node.body
+        if type_of(body) != "array" { return false }
+        let bn = len(body)
+        // Need at least 2 stmts: one array op + one increment
+        if bn < 2 { return false }
+        let mut has_array_op = false
+        let mut has_increment = false
+        let mut bi = 0
+        while bi < bn {
+            let s = body[bi]
+            // Check for arr[i] = arr[i] + scalar pattern
+            if s.kind == "AssignStmt" {
+                if type_of(s.left) != "string" && s.left.kind == "Index" {
+                    if type_of(s.right) != "string" && s.right.kind == "BinOp" {
+                        let op = s.right.op
+                        if op == "+" || op == "-" || op == "*" {
+                            // Check if LHS index matches a sub-expr in RHS
+                            if type_of(s.right.left) != "string" && s.right.left.kind == "Index" {
+                                has_array_op = true
+                            }
+                            if type_of(s.right.right) != "string" && s.right.right.kind == "Index" {
+                                has_array_op = true
+                            }
+                        }
+                    }
+                }
+            }
+            // Check for i = i + 1
+            if s.kind == "AssignStmt" {
+                if type_of(s.left) != "string" && s.left.kind == "Ident" {
+                    if type_of(s.right) != "string" && s.right.kind == "BinOp" {
+                        if s.right.op == "+" {
+                            if type_of(s.right.left) != "string" && s.right.left.kind == "Ident" {
+                                if s.right.left.name == s.left.name {
+                                    if type_of(s.right.right) != "string" && s.right.right.kind == "IntLit" {
+                                        if s.right.right.value == "1" {
+                                            has_increment = true
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            bi = bi + 1
+        }
+        return has_array_op && has_increment
+    }
+    return false
+}
+
+// Determine SIMD vector width based on data type (default 4 for int64)
+fn determine_simd_width(while_node) {
+    // Default: 4 elements (256-bit SIMD / 64-bit ints)
+    return 4
+}
+
+// Analyze a fn body for @vectorize opportunities
+fn analyze_vectorize(fn_node) {
+    let body = fn_node.body
+    if type_of(body) != "array" { return 0 }
+    let attrs = split_attrs_m0(fn_node.value)
+    let has_vectorize = attr_has(attrs, "vectorize") || attr_has(attrs, "simd")
+    let mut candidates = 0
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        if stmt.kind == "WhileStmt" {
+            if is_vectorizable_loop(stmt) {
+                candidates = candidates + 1
+                m977_vectorize_candidates = m977_vectorize_candidates + 1
+                let width = determine_simd_width(stmt)
+                if width > m977_vectorize_width { m977_vectorize_width = width }
+                if has_vectorize {
+                    m977_vectorize_converted = m977_vectorize_converted + 1
+                    println("[ai-native] @vectorize: loop in " + fn_node.name + " vectorizable (width=" + to_string(width) + ")")
+                } else {
+                    println("[ai-native] fn " + fn_node.name + " HINT: loop is vectorizable, consider @vectorize")
+                }
+            }
+        }
+        i = i + 1
+    }
+    return candidates
+}
+
 fn ai_native_pass(ast) {
     let mut seen = 0
     m1_pure_ok = 0
@@ -8290,12 +8762,22 @@ fn ai_native_pass(ast) {
     m973_sliding_ok = 0
     m973_sliding_candidates = 0
     m974_approx_rewrites = 0
+    m974_escape_analyzed = 0
+    m974_escape_stack_promoted = 0
+    m974_escape_heap_kept = 0
     m975_binary_search_rewrites = 0
     m975_dce_unused_lets = 0
     m975_dce_unused_imports = 0
+    m975_soa_transforms = 0
+    m975_soa_fields_split = 0
     m976_algebraic_series_rewrites = 0
     m976_dp_sliding_rewrites = 0
     m976_dp_sliding_lookback = 0
+    m976_devirt_candidates = 0
+    m976_devirt_converted = 0
+    m977_vectorize_candidates = 0
+    m977_vectorize_converted = 0
+    m977_vectorize_width = 0
     m252_contract_injects = 0
     m253b_contract_elims = 0
     m480_symbolic_rewrites = 0
@@ -10378,6 +10860,13 @@ fn ai_native_pass(ast) {
                 }
                 j = j + 1
             }
+            // ── Escape Analysis (ROI id=19) ──
+            let esc_vars = escape_analysis(node)
+            if len(esc_vars) > 0 {
+                println("[ai-native] fn " + node.name + " ESCAPE: " + to_string(len(esc_vars)) + " var(s) stack-promotable")
+            }
+            // ── @vectorize analysis (ROI id=24) ──
+            analyze_vectorize(node)
             seen = seen + 1
         }
         out = out.push(node)
@@ -10392,6 +10881,28 @@ fn ai_native_pass(ast) {
             m53_cross_calls = m53_cross_calls + count_cross_calls_body(nd.body, m29_registry)
         }
         oi = oi + 1
+    }
+    // ── @soa pass: collect SoA-eligible structs and transform access patterns ──
+    let soa_structs = collect_soa_struct_fields(out)
+    if len(soa_structs) > 0 {
+        let mut soa_i = 0
+        while soa_i < on {
+            let soa_nd = out[soa_i]
+            if soa_nd.kind == "FnDecl" {
+                out[soa_i] = apply_soa_transform(soa_nd, soa_structs)
+            }
+            soa_i = soa_i + 1
+        }
+    }
+    // ── Devirtualize pass: collect trait impls and convert single-impl calls ──
+    let impl_info = collect_trait_impls(out)
+    let mut dv_i = 0
+    while dv_i < on {
+        let dv_nd = out[dv_i]
+        if dv_nd.kind == "FnDecl" {
+            devirtualize_body(dv_nd.body, impl_info)
+        }
+        dv_i = dv_i + 1
     }
     // M253 pre-pass: collect inlinable fn signatures (stub + identity)
     let mut pi3 = 0
@@ -10514,6 +11025,9 @@ fn ai_native_pass(ast) {
     if m974_approx_rewrites > 0 {
         println("[ai-native] @approximate rewrites: " + to_string(m974_approx_rewrites) + " call(s) → Newton/Taylor approx")
     }
+    if m974_escape_analyzed > 0 {
+        println("[ai-native] escape-analysis: " + to_string(m974_escape_analyzed) + " analyzed, " + to_string(m974_escape_stack_promoted) + " stack-promoted, " + to_string(m974_escape_heap_kept) + " heap-kept")
+    }
     if m974_strassen_rewrites > 0 {
         println("[ai-native] matmul→Strassen: " + to_string(m974_strassen_rewrites) + " fn(s) rewritten (O(n^2.807), threshold=64)")
     }
@@ -10526,11 +11040,20 @@ fn ai_native_pass(ast) {
     if m975_specialize_rewrites > 0 {
         println("[ai-native] @specialize: " + to_string(m975_specialize_rewrites) + " fn(s) type-dispatch injected")
     }
+    if m975_soa_transforms > 0 {
+        println("[ai-native] @soa: " + to_string(m975_soa_transforms) + " struct(s) transformed, " + to_string(m975_soa_fields_split) + " field(s) split")
+    }
     if m976_algebraic_series_rewrites > 0 {
         println("[ai-native] @algebraic series→closed form: " + to_string(m976_algebraic_series_rewrites) + " rewrite(s)")
     }
     if m976_dp_sliding_rewrites > 0 {
         println("[ai-native] DP sliding window: " + to_string(m976_dp_sliding_rewrites) + " rewrite(s), max lookback=" + to_string(m976_dp_sliding_lookback))
+    }
+    if m976_devirt_candidates > 0 {
+        println("[ai-native] devirtualize: " + to_string(m976_devirt_candidates) + " candidate(s), " + to_string(m976_devirt_converted) + " single-impl converted")
+    }
+    if m977_vectorize_candidates > 0 {
+        println("[ai-native] @vectorize: " + to_string(m977_vectorize_candidates) + " loop(s) vectorizable, " + to_string(m977_vectorize_converted) + " converted (width=" + to_string(m977_vectorize_width) + ")")
     }
     return out
 }

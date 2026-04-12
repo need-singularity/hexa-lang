@@ -1,0 +1,500 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/coconut_cot.hexa — COCONUT Latent CoT (#293)
+//
+//  COCONUT (Chain of Continuous Thought, Meta 2024) — reasoning in
+//  latent space without generating explicit text tokens. The model
+//  maintains a continuous "thought" vector that evolves through
+//  reasoning steps, eliminating CoT token cost entirely.
+//
+//    h_0     = encode(x)              input -> initial thought
+//    h_{t+1} = f_theta(h_t)          iterate in latent space
+//    output  = decode(h_T)            final thought -> output
+//
+//  Train: minimize CE(decode(h_T), y) with gradient through all T
+//  reasoning steps.
+//
+//  Architecture:
+//    Encoder:   h_0 = tanh(W_enc * x + b_enc)     D_in -> D_hidden
+//    Think step: h' = tanh(W_think * h + b_think)  D_hidden -> D_hidden
+//    Decoder:   out = softmax(W_dec * h_T + b_dec) D_hidden -> D_out
+//
+//  API:
+//    cc_init(D_in, D_hidden, D_out, n_steps, seed) -> model
+//    cc_encode(model, x)       -> h0
+//    cc_think_step(model, h)   -> h'
+//    cc_think(model, h0, steps)-> h_T
+//    cc_decode(model, h)       -> output (softmax probs)
+//    cc_forward(model, x)      -> output (encode + think + decode)
+//    cc_loss(model, x, y)      -> float  (cross-entropy)
+//    cc_train_step(model, X, Y, lr) -> model
+//
+//  AI-NATIVE attrs:
+//    @pure  (forward / loss / encode / decode / think)
+//    @hot   (train_step)
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Math helpers ──────────────────────────────────────────────────
+
+fn cc_abs(v) { if v < 0.0 { return 0.0 - v } return v }
+
+fn cc_exp(v) {
+    let mut x = v
+    if x > 20.0 { x = 20.0 }
+    if x < -20.0 { x = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * x / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn cc_log(v) {
+    if v <= 0.0 { return -30.0 }
+    let mut x = v
+    let mut count = 0
+    while x > 2.0 {
+        x = x / 2.718281828
+        count = count + 1
+    }
+    while x < 0.5 {
+        x = x * 2.718281828
+        count = count - 1
+    }
+    let d = x - 1.0
+    let ln_x = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_x
+}
+
+fn cc_tanh(v) {
+    let ep = cc_exp(v)
+    let en = cc_exp(0.0 - v)
+    return (ep - en) / (ep + en)
+}
+
+fn cc_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn cc_zeros_2d(rows, cols) {
+    let mut m = []
+    for _r in 0..rows {
+        let mut row = []
+        for _c in 0..cols { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+fn cc_lcg(state) {
+    return (state * 1103515245 + 12345) % 2147483648
+}
+
+fn cc_uniform(state) {
+    let s = cc_lcg(state)
+    return [to_float(s) / 2147483648.0, to_float(s)]
+}
+
+fn cc_softmax(logits) {
+    let K = len(logits)
+    let mut mx = logits[0]
+    for k in 1..K { if logits[k] > mx { mx = logits[k] } }
+    let mut out = cc_zeros(K)
+    let mut sum = 0.0
+    for k in 0..K {
+        let e = cc_exp(logits[k] - mx)
+        out[k] = e
+        sum = sum + e
+    }
+    if sum <= 0.0 { sum = 1.0e-12 }
+    for k in 0..K { out[k] = out[k] / sum }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Initialise COCONUT model
+//    W_enc   : D_hidden x D_in
+//    b_enc   : D_hidden
+//    W_think : D_hidden x D_hidden
+//    b_think : D_hidden
+//    W_dec   : D_out x D_hidden
+//    b_dec   : D_out
+// ═══════════════════════════════════════════════════════════════════
+fn cc_init(D_in, D_hidden, D_out, n_steps, seed) {
+    let mut state = seed
+    if state <= 0 { state = 1 }
+
+    // Encoder weights
+    let mut W_enc = cc_zeros_2d(D_hidden, D_in)
+    for i in 0..D_hidden {
+        for j in 0..D_in {
+            let u = cc_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W_enc[i][j] = u[0] - 0.5
+        }
+    }
+    let b_enc = cc_zeros(D_hidden)
+
+    // Think weights (latent transition)
+    let mut W_think = cc_zeros_2d(D_hidden, D_hidden)
+    for i in 0..D_hidden {
+        for j in 0..D_hidden {
+            let u = cc_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W_think[i][j] = u[0] - 0.5
+        }
+    }
+    let b_think = cc_zeros(D_hidden)
+
+    // Decoder weights
+    let mut W_dec = cc_zeros_2d(D_out, D_hidden)
+    for i in 0..D_out {
+        for j in 0..D_hidden {
+            let u = cc_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W_dec[i][j] = u[0] - 0.5
+        }
+    }
+    let b_dec = cc_zeros(D_out)
+
+    return #{
+        "D_in": D_in,
+        "D_hidden": D_hidden,
+        "D_out": D_out,
+        "n_steps": n_steps,
+        "W_enc": W_enc,
+        "b_enc": b_enc,
+        "W_think": W_think,
+        "b_think": b_think,
+        "W_dec": W_dec,
+        "b_dec": b_dec
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Encode: x -> h_0 (initial thought in latent space)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cc_encode(model, x) {
+    let W_enc = model["W_enc"]
+    let b_enc = model["b_enc"]
+    let D_hidden = model["D_hidden"]
+    let D_in = model["D_in"]
+    let mut h = cc_zeros(D_hidden)
+    for i in 0..D_hidden {
+        let mut s = b_enc[i]
+        for j in 0..D_in { s = s + W_enc[i][j] * x[j] }
+        h[i] = cc_tanh(s)
+    }
+    return h
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Think step: h -> h' (one latent reasoning iteration)
+//    h' = tanh(W_think * h + b_think)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cc_think_step(model, h) {
+    let W_think = model["W_think"]
+    let b_think = model["b_think"]
+    let D_hidden = model["D_hidden"]
+    let mut h_next = cc_zeros(D_hidden)
+    for i in 0..D_hidden {
+        let mut s = b_think[i]
+        for j in 0..D_hidden { s = s + W_think[i][j] * h[j] }
+        h_next[i] = cc_tanh(s)
+    }
+    return h_next
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Think: h_0 -> h_T (full reasoning chain through T steps)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cc_think(model, h0, steps) {
+    let mut h = h0
+    for _t in 0..steps {
+        h = cc_think_step(model, h)
+    }
+    return h
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Decode: h_T -> output logits -> softmax probabilities
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cc_decode(model, h) {
+    let W_dec = model["W_dec"]
+    let b_dec = model["b_dec"]
+    let D_out = model["D_out"]
+    let D_hidden = model["D_hidden"]
+    let mut logits = cc_zeros(D_out)
+    for i in 0..D_out {
+        let mut s = b_dec[i]
+        for j in 0..D_hidden { s = s + W_dec[i][j] * h[j] }
+        logits[i] = s
+    }
+    return cc_softmax(logits)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Forward: encode + think + decode  (full pipeline)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cc_forward(model, x) {
+    let h0 = cc_encode(model, x)
+    let n_steps = model["n_steps"]
+    let hT = cc_think(model, h0, n_steps)
+    return cc_decode(model, hT)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Loss: cross-entropy  CE = -log(p[y])
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cc_loss(model, x, y) {
+    let probs = cc_forward(model, x)
+    let mut py = probs[y]
+    if py < 1.0e-12 { py = 1.0e-12 }
+    return 0.0 - cc_log(py)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Predict: argmax of forward output
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cc_predict(model, x) {
+    let probs = cc_forward(model, x)
+    let K = len(probs)
+    let mut best = probs[0]
+    let mut idx = 0
+    for k in 1..K {
+        if probs[k] > best {
+            best = probs[k]
+            idx = k
+        }
+    }
+    return idx
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Accuracy helper
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn cc_accuracy(model, X, Y) {
+    let N = len(X)
+    if N == 0 { return 0.0 }
+    let mut correct = 0
+    for i in 0..N {
+        if cc_predict(model, X[i]) == Y[i] { correct = correct + 1 }
+    }
+    return to_float(correct) / to_float(N)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Training step — gradient through full latent chain
+//
+//  Forward (per sample):
+//    h_0 = tanh(W_enc * x + b_enc)
+//    h_t = tanh(W_think * h_{t-1} + b_think)   for t = 1..T
+//    logits = W_dec * h_T + b_dec
+//    probs  = softmax(logits)
+//    loss   = -log(probs[y])
+//
+//  Backward:
+//    d_logits[k] = probs[k] - onehot(y)[k]
+//
+//    d_W_dec[k][j] += d_logits[k] * h_T[j]
+//    d_b_dec[k]    += d_logits[k]
+//
+//    d_h_T[j] = sum_k( d_logits[k] * W_dec[k][j] )
+//
+//    Unroll through T think steps (BPTT):
+//      d_pre_t[j] = d_h_t[j] * (1 - h_t[j]^2)     (tanh derivative)
+//      d_W_think[i][j] += d_pre_t[i] * h_{t-1}[j]
+//      d_b_think[i]    += d_pre_t[i]
+//      d_h_{t-1}[j]    = sum_i( d_pre_t[i] * W_think[i][j] )
+//
+//    After unrolling to h_0:
+//      d_pre_0[j] = d_h_0[j] * (1 - h_0[j]^2)
+//      d_W_enc[i][j] += d_pre_0[i] * x[j]
+//      d_b_enc[i]    += d_pre_0[i]
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn cc_train_step(model, X, Y, lr) {
+    let N = len(X)
+    let D_in = model["D_in"]
+    let D_hidden = model["D_hidden"]
+    let D_out = model["D_out"]
+    let n_steps = model["n_steps"]
+    let W_enc = model["W_enc"]
+    let b_enc = model["b_enc"]
+    let W_think = model["W_think"]
+    let b_think = model["b_think"]
+    let W_dec = model["W_dec"]
+    let b_dec = model["b_dec"]
+
+    // Accumulate gradients
+    let mut gW_enc = cc_zeros_2d(D_hidden, D_in)
+    let mut gb_enc = cc_zeros(D_hidden)
+    let mut gW_think = cc_zeros_2d(D_hidden, D_hidden)
+    let mut gb_think = cc_zeros(D_hidden)
+    let mut gW_dec = cc_zeros_2d(D_out, D_hidden)
+    let mut gb_dec = cc_zeros(D_out)
+
+    for n in 0..N {
+        let x = X[n]
+        let y = Y[n]
+
+        // ── Forward: store all hidden states for BPTT ──────────
+        // h_0 = encode
+        let mut h0 = cc_zeros(D_hidden)
+        for i in 0..D_hidden {
+            let mut s = b_enc[i]
+            for j in 0..D_in { s = s + W_enc[i][j] * x[j] }
+            h0[i] = cc_tanh(s)
+        }
+
+        // h_1 .. h_T through think steps, store all states
+        let mut h_states = [h0]
+        let mut h_cur = h0
+        for _t in 0..n_steps {
+            let mut h_next = cc_zeros(D_hidden)
+            for i in 0..D_hidden {
+                let mut s = b_think[i]
+                for j in 0..D_hidden { s = s + W_think[i][j] * h_cur[j] }
+                h_next[i] = cc_tanh(s)
+            }
+            h_states = h_states + [h_next]
+            h_cur = h_next
+        }
+
+        let hT = h_states[n_steps]
+
+        // ── Decode: logits + softmax ───────────────────────────
+        let mut logits = cc_zeros(D_out)
+        for i in 0..D_out {
+            let mut s = b_dec[i]
+            for j in 0..D_hidden { s = s + W_dec[i][j] * hT[j] }
+            logits[i] = s
+        }
+        let probs = cc_softmax(logits)
+
+        // ── Backward: d_logits = probs - onehot(y) ────────────
+        let mut d_logits = cc_zeros(D_out)
+        for k in 0..D_out {
+            d_logits[k] = probs[k]
+            if k == y { d_logits[k] = d_logits[k] - 1.0 }
+        }
+
+        // grad W_dec, b_dec
+        for k in 0..D_out {
+            gb_dec[k] = gb_dec[k] + d_logits[k]
+            for j in 0..D_hidden {
+                gW_dec[k][j] = gW_dec[k][j] + d_logits[k] * hT[j]
+            }
+        }
+
+        // d_hT from decoder
+        let mut d_h = cc_zeros(D_hidden)
+        for j in 0..D_hidden {
+            let mut s = 0.0
+            for k in 0..D_out { s = s + d_logits[k] * W_dec[k][j] }
+            d_h[j] = s
+        }
+
+        // ── BPTT through think steps (t = T down to 1) ────────
+        let mut t = n_steps
+        while t > 0 {
+            let h_t = h_states[t]
+            let h_prev = h_states[t - 1]
+
+            // d_pre = d_h * tanh'(h_t) = d_h * (1 - h_t^2)
+            let mut d_pre = cc_zeros(D_hidden)
+            for i in 0..D_hidden {
+                d_pre[i] = d_h[i] * (1.0 - h_t[i] * h_t[i])
+            }
+
+            // grad W_think, b_think
+            for i in 0..D_hidden {
+                gb_think[i] = gb_think[i] + d_pre[i]
+                for j in 0..D_hidden {
+                    gW_think[i][j] = gW_think[i][j] + d_pre[i] * h_prev[j]
+                }
+            }
+
+            // d_h_prev = W_think^T * d_pre
+            let mut d_h_prev = cc_zeros(D_hidden)
+            for j in 0..D_hidden {
+                let mut s = 0.0
+                for i in 0..D_hidden { s = s + d_pre[i] * W_think[i][j] }
+                d_h_prev[j] = s
+            }
+            d_h = d_h_prev
+            t = t - 1
+        }
+
+        // ── Backprop through encoder ───────────────────────────
+        let h_0_state = h_states[0]
+        let mut d_pre_enc = cc_zeros(D_hidden)
+        for i in 0..D_hidden {
+            d_pre_enc[i] = d_h[i] * (1.0 - h_0_state[i] * h_0_state[i])
+        }
+        for i in 0..D_hidden {
+            gb_enc[i] = gb_enc[i] + d_pre_enc[i]
+            for j in 0..D_in {
+                gW_enc[i][j] = gW_enc[i][j] + d_pre_enc[i] * x[j]
+            }
+        }
+    }
+
+    // ── Apply gradients (SGD) ──────────────────────────────────
+    let inv_n = 1.0 / to_float(N)
+
+    let mut W_enc_new = cc_zeros_2d(D_hidden, D_in)
+    let mut b_enc_new = cc_zeros(D_hidden)
+    for i in 0..D_hidden {
+        b_enc_new[i] = b_enc[i] - lr * gb_enc[i] * inv_n
+        for j in 0..D_in {
+            W_enc_new[i][j] = W_enc[i][j] - lr * gW_enc[i][j] * inv_n
+        }
+    }
+
+    let mut W_think_new = cc_zeros_2d(D_hidden, D_hidden)
+    let mut b_think_new = cc_zeros(D_hidden)
+    for i in 0..D_hidden {
+        b_think_new[i] = b_think[i] - lr * gb_think[i] * inv_n
+        for j in 0..D_hidden {
+            W_think_new[i][j] = W_think[i][j] - lr * gW_think[i][j] * inv_n
+        }
+    }
+
+    let mut W_dec_new = cc_zeros_2d(D_out, D_hidden)
+    let mut b_dec_new = cc_zeros(D_out)
+    for k in 0..D_out {
+        b_dec_new[k] = b_dec[k] - lr * gb_dec[k] * inv_n
+        for j in 0..D_hidden {
+            W_dec_new[k][j] = W_dec[k][j] - lr * gW_dec[k][j] * inv_n
+        }
+    }
+
+    return #{
+        "D_in": D_in,
+        "D_hidden": D_hidden,
+        "D_out": D_out,
+        "n_steps": n_steps,
+        "W_enc": W_enc_new,
+        "b_enc": b_enc_new,
+        "W_think": W_think_new,
+        "b_think": b_think_new,
+        "W_dec": W_dec_new,
+        "b_dec": b_dec_new
+    }
+}
