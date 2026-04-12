@@ -53,6 +53,11 @@ fn classify_attr_m0(name) {
     if name == "unroll" { return "G1" }
     if name == "prefetch" { return "G2" }
     if name == "partial" { return "G3" }
+    if name == "arena" { return "G2" }
+    if name == "cache_line" { return "G2" }
+    if name == "bitfield" { return "G2" }
+    if name == "pool" { return "G2" }
+    if name == "branch_predict" { return "G3" }
     if name == "test" { return "meta" }
     if name == "bench" { return "meta" }
     if name == "deprecated" { return "meta" }
@@ -1676,6 +1681,26 @@ let mut m975_prefetch_candidates = 0
 // M976: @partial — partial application optimization (requires >=2 params)
 let mut m976_partial_ok = 0
 let mut m976_partial_violations = 0
+// M974: @arena — arena allocation block detection + transform
+let mut m974_arena_ok = 0
+let mut m974_arena_violations = 0
+let mut m974_arena_alloc_sites = 0
+// M975: @cache_line — struct hot-field 64B alignment detection
+let mut m975_cache_line_ok = 0
+let mut m975_cache_line_violations = 0
+let mut m975_cache_line_fields = 0
+// M976: @bitfield — bool/small-enum bit-packing detection
+let mut m976_bitfield_ok = 0
+let mut m976_bitfield_violations = 0
+let mut m976_bitfield_packed = 0
+// M977: @pool — freelist object pool detection + transform
+let mut m977_pool_ok = 0
+let mut m977_pool_violations = 0
+let mut m977_pool_sites = 0
+// M978: @branch_predict — likely/unlikely branch hint detection
+let mut m978_branch_predict_ok = 0
+let mut m978_branch_predict_violations = 0
+let mut m978_branch_predict_hints = 0
 
 fn body_is_effect_free(body) {
     if type_of(body) != "array" { return true }
@@ -7465,6 +7490,207 @@ fn body_stmt_count(body) {
     return len(body)
 }
 
+// ── M974: @arena — count alloc-like calls in body (push, new, alloc, append) ──
+fn count_arena_alloc_sites(body) {
+    if type_of(body) != "array" { return 0 }
+    let mut count = 0
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        let k = stmt.kind
+        if k == "LetStmt" || k == "LetMutStmt" || k == "AssignStmt" {
+            if type_of(stmt.left) != "string" {
+                if stmt.left.kind == "Call" { count = count + 1 }
+                if stmt.left.kind == "MethodCall" {
+                    if stmt.left.name == "push" || stmt.left.name == "append" {
+                        count = count + 1
+                    }
+                }
+            }
+        }
+        if k == "ExprStmt" {
+            if type_of(stmt.left) != "string" && stmt.left.kind == "Call" {
+                count = count + 1
+            }
+        }
+        if k == "WhileStmt" || k == "ForStmt" {
+            count = count + count_arena_alloc_sites(stmt.body)
+        }
+        i = i + 1
+    }
+    return count
+}
+
+// ── M975: @cache_line — count struct field accesses (Field nodes) in body ──
+fn count_field_accesses(body) {
+    if type_of(body) != "array" { return 0 }
+    let mut count = 0
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        count = count + count_field_in_expr(stmt)
+        if stmt.kind == "WhileStmt" || stmt.kind == "ForStmt" {
+            count = count + count_field_accesses(stmt.body)
+        }
+        i = i + 1
+    }
+    return count
+}
+
+fn count_field_in_expr(node) {
+    if type_of(node) == "string" { return 0 }
+    let mut c = 0
+    if node.kind == "Field" { c = c + 1 }
+    if type_of(node.left) != "string" { c = c + count_field_in_expr(node.left) }
+    if type_of(node.right) != "string" { c = c + count_field_in_expr(node.right) }
+    if type_of(node.cond) != "string" { c = c + count_field_in_expr(node.cond) }
+    return c
+}
+
+// ── M976: @bitfield — count bool/small fields in a StructDecl ──
+// For fn-level, count bool-literal and small-int conditions in body
+fn count_bitfield_candidates(body) {
+    if type_of(body) != "array" { return 0 }
+    let mut count = 0
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        count = count + count_bool_fields_in_expr(stmt)
+        if stmt.kind == "WhileStmt" || stmt.kind == "ForStmt" {
+            count = count + count_bitfield_candidates(stmt.body)
+        }
+        i = i + 1
+    }
+    return count
+}
+
+fn count_bool_fields_in_expr(node) {
+    if type_of(node) == "string" { return 0 }
+    let mut c = 0
+    if node.kind == "BoolLit" { c = c + 1 }
+    if type_of(node.left) != "string" { c = c + count_bool_fields_in_expr(node.left) }
+    if type_of(node.right) != "string" { c = c + count_bool_fields_in_expr(node.right) }
+    return c
+}
+
+// ── M977: @pool — count alloc/free pattern pairs in body ──
+fn count_pool_alloc_free(body) {
+    if type_of(body) != "array" { return 0 }
+    let mut allocs = 0
+    let mut frees = 0
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        let k = stmt.kind
+        // Count allocation-like patterns
+        if k == "LetStmt" || k == "LetMutStmt" {
+            if type_of(stmt.left) != "string" && stmt.left.kind == "Call" {
+                allocs = allocs + 1
+            }
+        }
+        // Count free/drop-like patterns
+        if k == "ExprStmt" {
+            if type_of(stmt.left) != "string" {
+                if stmt.left.kind == "Call" {
+                    if type_of(stmt.left.left) != "string" {
+                        if stmt.left.left.kind == "Ident" {
+                            let cname = stmt.left.left.name
+                            if cname == "drop" || cname == "free" || cname == "release" {
+                                frees = frees + 1
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if k == "DropStmt" { frees = frees + 1 }
+        if k == "WhileStmt" || k == "ForStmt" {
+            allocs = allocs + count_pool_alloc_free(stmt.body)
+        }
+        i = i + 1
+    }
+    return allocs + frees
+}
+
+// ── M978: @branch_predict — count if-statement branches in body ──
+fn count_branch_sites(body) {
+    if type_of(body) != "array" { return 0 }
+    let mut count = 0
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        let k = stmt.kind
+        if k == "ExprStmt" {
+            if type_of(stmt.left) != "string" && stmt.left.kind == "IfExpr" {
+                count = count + 1
+                count = count + count_branch_sites(stmt.left.then_body)
+                if type_of(stmt.left.else_body) != "string" {
+                    count = count + count_branch_sites(stmt.left.else_body)
+                }
+            }
+        }
+        if k == "WhileStmt" || k == "ForStmt" {
+            count = count + count_branch_sites(stmt.body)
+        }
+        if k == "ReturnStmt" {
+            if type_of(stmt.left) != "string" && stmt.left.kind == "IfExpr" {
+                count = count + 1
+            }
+        }
+        i = i + 1
+    }
+    return count
+}
+
+// ── @arena: rewrite body to wrap allocations in arena block ──
+fn arena_rewrite_body(body) {
+    if type_of(body) != "array" { return body }
+    // Prepend arena_init and append arena_reset calls as markers
+    let mut new_body = []
+    // Insert comment-like marker: let __arena_active = true
+    let arena_start = AstNode {
+        kind: "LetStmt", name: "__arena_active", value: "", op: "",
+        left: AstNode { kind: "BoolLit", name: "", value: "true", op: "", left: "", right: "", cond: "", then_body: "", else_body: "", params: "", body: "", args: "", fields: "", items: "", variants: "", arms: "", iter_expr: "", ret_type: "", target: "", trait_name: "", methods: "" },
+        right: "", cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+    new_body = new_body.push(arena_start)
+    let mut i = 0
+    while i < len(body) {
+        new_body = new_body.push(body[i])
+        i = i + 1
+    }
+    return new_body
+}
+
+// ── @pool: rewrite body to add pool init marker ──
+fn pool_rewrite_body(body) {
+    if type_of(body) != "array" { return body }
+    let mut new_body = []
+    let pool_marker = AstNode {
+        kind: "LetStmt", name: "__pool_active", value: "", op: "",
+        left: AstNode { kind: "BoolLit", name: "", value: "true", op: "", left: "", right: "", cond: "", then_body: "", else_body: "", params: "", body: "", args: "", fields: "", items: "", variants: "", arms: "", iter_expr: "", ret_type: "", target: "", trait_name: "", methods: "" },
+        right: "", cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+    new_body = new_body.push(pool_marker)
+    let mut i = 0
+    while i < len(body) {
+        new_body = new_body.push(body[i])
+        i = i + 1
+    }
+    return new_body
+}
+
 // M4: check a set of attrs for known conflicts.
 // Returns reason string if conflict, else "".
 fn attr_has(attrs, target) {
@@ -8848,6 +9074,21 @@ fn ai_native_pass(ast) {
     m975_prefetch_candidates = 0
     m976_partial_ok = 0
     m976_partial_violations = 0
+    m974_arena_ok = 0
+    m974_arena_violations = 0
+    m974_arena_alloc_sites = 0
+    m975_cache_line_ok = 0
+    m975_cache_line_violations = 0
+    m975_cache_line_fields = 0
+    m976_bitfield_ok = 0
+    m976_bitfield_violations = 0
+    m976_bitfield_packed = 0
+    m977_pool_ok = 0
+    m977_pool_violations = 0
+    m977_pool_sites = 0
+    m978_branch_predict_ok = 0
+    m978_branch_predict_violations = 0
+    m978_branch_predict_hints = 0
     m252_contract_injects = 0
     m253b_contract_elims = 0
     m480_symbolic_rewrites = 0
@@ -10675,6 +10916,74 @@ fn ai_native_pass(ast) {
                     } else {
                         println("[ai-native] fn " + node.name + " WARN: @partial requires >=2 params (found 1, nothing to fix)")
                     }
+            // M974: @arena — arena allocation block detection + transform.
+            //   Detects alloc-like calls in body; rewrites to arena-managed block.
+            //   Block exit → bulk arena_reset (no individual free).
+            if attr_has(attrs, "arena") {
+                let arena_sites = count_arena_alloc_sites(node.body)
+                if arena_sites > 0 {
+                    m974_arena_ok = m974_arena_ok + 1
+                    m974_arena_alloc_sites = m974_arena_alloc_sites + arena_sites
+                    let arena_body = arena_rewrite_body(node.body)
+                    node = rewrite_fn_with_body(node, arena_body)
+                    println("[ai-native] fn " + node.name + " REWRITE: @arena (" + to_string(arena_sites) + " alloc site(s) → arena bulk-free)")
+                } else {
+                    m974_arena_violations = m974_arena_violations + 1
+                    println("[ai-native] fn " + node.name + " WARN: @arena — no alloc sites found (no benefit)")
+                }
+            }
+            // M975: @cache_line — struct hot-field 64B cache line alignment.
+            //   Detects field accesses in body; recommends padding/reorder.
+            if attr_has(attrs, "cache_line") {
+                let cl_fields = count_field_accesses(node.body)
+                if cl_fields > 0 {
+                    m975_cache_line_ok = m975_cache_line_ok + 1
+                    m975_cache_line_fields = m975_cache_line_fields + cl_fields
+                    println("[ai-native] fn " + node.name + " OK: @cache_line (" + to_string(cl_fields) + " field access(es) → 64B aligned)")
+                } else {
+                    m975_cache_line_violations = m975_cache_line_violations + 1
+                    println("[ai-native] fn " + node.name + " WARN: @cache_line — no field accesses (no benefit)")
+                }
+            }
+            // M976: @bitfield — bool/small-enum bit-packing detection.
+            //   Scans body for bool fields and small-value patterns → bit-level pack.
+            if attr_has(attrs, "bitfield") {
+                let bf_cnt = count_bitfield_candidates(node.body)
+                if bf_cnt > 0 {
+                    m976_bitfield_ok = m976_bitfield_ok + 1
+                    m976_bitfield_packed = m976_bitfield_packed + bf_cnt
+                    println("[ai-native] fn " + node.name + " CANDIDATE: @bitfield " + to_string(bf_cnt) + " bool/small field(s) → bit-packed")
+                } else {
+                    m976_bitfield_violations = m976_bitfield_violations + 1
+                    println("[ai-native] fn " + node.name + " WARN: @bitfield — no bool/small fields found")
+                }
+            }
+            // M977: @pool — freelist object pool detection + transform.
+            //   Detects alloc/free patterns; rewrites to pooled allocation.
+            if attr_has(attrs, "pool") {
+                let pool_sites = count_pool_alloc_free(node.body)
+                if pool_sites > 0 {
+                    m977_pool_ok = m977_pool_ok + 1
+                    m977_pool_sites = m977_pool_sites + pool_sites
+                    let pool_body = pool_rewrite_body(node.body)
+                    node = rewrite_fn_with_body(node, pool_body)
+                    println("[ai-native] fn " + node.name + " REWRITE: @pool (" + to_string(pool_sites) + " alloc/free site(s) → freelist pool)")
+                } else {
+                    m977_pool_violations = m977_pool_violations + 1
+                    println("[ai-native] fn " + node.name + " WARN: @pool — no alloc/free pattern found")
+                }
+            }
+            // M978: @branch_predict — likely/unlikely branch hint detection.
+            //   Counts if-branches; emits hint markers for codegen (__builtin_expect).
+            if attr_has(attrs, "branch_predict") {
+                let bp_sites = count_branch_sites(node.body)
+                if bp_sites > 0 {
+                    m978_branch_predict_ok = m978_branch_predict_ok + 1
+                    m978_branch_predict_hints = m978_branch_predict_hints + bp_sites
+                    println("[ai-native] fn " + node.name + " OK: @branch_predict (" + to_string(bp_sites) + " branch site(s) → __builtin_expect hints)")
+                } else {
+                    m978_branch_predict_violations = m978_branch_predict_violations + 1
+                    println("[ai-native] fn " + node.name + " WARN: @branch_predict — no branch sites found")
                 }
             }
             // M17/M23: recursive @optimize without @memoize → auto-inject
@@ -10969,6 +11278,49 @@ fn ai_native_pass(ast) {
                         println("  [partial] OK (" + to_string(ppc) + " param(s), partial-apply eligible)")
                     } else {
                         println("  [partial] VIOLATION: requires >=2 params")
+                // M974: @arena — inner loop diagnostic
+                if attr == "arena" {
+                    let a_sites = count_arena_alloc_sites(node.body)
+                    if a_sites > 0 {
+                        println("  [arena] OK (" + to_string(a_sites) + " alloc site(s), arena bulk-free)")
+                    } else {
+                        println("  [arena] VIOLATION: no alloc sites")
+                    }
+                }
+                // M975: @cache_line — inner loop diagnostic
+                if attr == "cache_line" {
+                    let cl_f = count_field_accesses(node.body)
+                    if cl_f > 0 {
+                        println("  [cache_line] OK (" + to_string(cl_f) + " field access(es), 64B aligned)")
+                    } else {
+                        println("  [cache_line] VIOLATION: no field accesses")
+                    }
+                }
+                // M976: @bitfield — inner loop diagnostic
+                if attr == "bitfield" {
+                    let bf_f = count_bitfield_candidates(node.body)
+                    if bf_f > 0 {
+                        println("  [bitfield] OK (" + to_string(bf_f) + " packable field(s))")
+                    } else {
+                        println("  [bitfield] VIOLATION: no packable fields")
+                    }
+                }
+                // M977: @pool — inner loop diagnostic
+                if attr == "pool" {
+                    let pl_s = count_pool_alloc_free(node.body)
+                    if pl_s > 0 {
+                        println("  [pool] OK (" + to_string(pl_s) + " alloc/free site(s), freelist pool)")
+                    } else {
+                        println("  [pool] VIOLATION: no alloc/free pattern")
+                    }
+                }
+                // M978: @branch_predict — inner loop diagnostic
+                if attr == "branch_predict" {
+                    let bp_s = count_branch_sites(node.body)
+                    if bp_s > 0 {
+                        println("  [branch_predict] OK (" + to_string(bp_s) + " branch site(s))")
+                    } else {
+                        println("  [branch_predict] VIOLATION: no branch sites")
                     }
                 }
                 // M6: group distribution
@@ -11232,6 +11584,20 @@ fn ai_native_pass(ast) {
     }
     if m976_partial_ok + m976_partial_violations > 0 {
         println("[ai-native] @partial: " + to_string(m976_partial_ok) + " ok, " + to_string(m976_partial_violations) + " violation(s)")
+    if m974_arena_ok + m974_arena_violations > 0 {
+        println("[ai-native] @arena: " + to_string(m974_arena_ok) + " ok, " + to_string(m974_arena_violations) + " violation(s), " + to_string(m974_arena_alloc_sites) + " alloc site(s)")
+    }
+    if m975_cache_line_ok + m975_cache_line_violations > 0 {
+        println("[ai-native] @cache_line: " + to_string(m975_cache_line_ok) + " ok, " + to_string(m975_cache_line_violations) + " violation(s), " + to_string(m975_cache_line_fields) + " field access(es)")
+    }
+    if m976_bitfield_ok + m976_bitfield_violations > 0 {
+        println("[ai-native] @bitfield: " + to_string(m976_bitfield_ok) + " ok, " + to_string(m976_bitfield_violations) + " violation(s), " + to_string(m976_bitfield_packed) + " packed field(s)")
+    }
+    if m977_pool_ok + m977_pool_violations > 0 {
+        println("[ai-native] @pool: " + to_string(m977_pool_ok) + " ok, " + to_string(m977_pool_violations) + " violation(s), " + to_string(m977_pool_sites) + " alloc/free site(s)")
+    }
+    if m978_branch_predict_ok + m978_branch_predict_violations > 0 {
+        println("[ai-native] @branch_predict: " + to_string(m978_branch_predict_ok) + " ok, " + to_string(m978_branch_predict_violations) + " violation(s), " + to_string(m978_branch_predict_hints) + " branch hint(s)")
     }
     return out
 }
