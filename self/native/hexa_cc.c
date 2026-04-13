@@ -6211,7 +6211,39 @@ HexaVal gen2_struct_decl(HexaVal node) {
     //     return hexa_struct_pack_map("Name", N, _k, _v);
     // which pre-sizes the hash table once (no rehash) and batch-inserts.
     // For Val with 12 fields this collapses 14 alloc-counter bumps to 1.
+    //
+    // rt 32-G Phase 0: further specialize `Val` (12 fields, ~3.37M
+    // constructions on d64 200-step) → hexa_valstruct_new_v flat struct.
+    // Zero hash-table involvement; one malloc per Val construction.
     HexaVal name = hexa_map_get(node, "name");
+    // Val special case: emit flat-struct constructor.
+    if (name.tag == TAG_STR && strcmp(name.s, "Val") == 0) {
+        HexaVal fields = hexa_map_get(node, "fields");
+        int nf = (int)hexa_len(fields);
+        if (nf == 12) {
+            HexaVal params_v = hexa_array_new();
+            HexaVal args_v = hexa_array_new();
+            for (int k = 0; k < nf; k++) {
+                HexaVal f = hexa_index_get(fields, hexa_int(k));
+                HexaVal fname = hexa_map_get(f, "name");
+                if (k > 0) {
+                    params_v = hexa_array_push(params_v, hexa_str(", "));
+                    args_v = hexa_array_push(args_v, hexa_str(", "));
+                }
+                params_v = hexa_array_push(params_v, hexa_add(hexa_str("HexaVal "), fname));
+                args_v = hexa_array_push(args_v, fname);
+            }
+            HexaVal sig = hexa_str_join(params_v, hexa_str(""));
+            HexaVal call_args = hexa_str_join(args_v, hexa_str(""));
+            return
+                hexa_add(hexa_str("HexaVal Val("),
+                hexa_add(sig,
+                hexa_add(hexa_str(") {\n    return hexa_valstruct_new_v("),
+                hexa_add(call_args,
+                hexa_str(");\n}\n")))));
+        }
+        // else fall through — mismatched field count; legacy emit covers it.
+    }
     HexaVal params = hexa_array_new();
     HexaVal keys_parts = hexa_array_new();
     HexaVal vals_parts = hexa_array_new();
