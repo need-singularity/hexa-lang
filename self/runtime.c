@@ -434,10 +434,14 @@ static int64_t _hx_stats_arena_alloc    = 0;   // total arena bump allocations
 static int64_t _hx_stats_arena_blocks   = 0;   // blocks created
 static int64_t _hx_stats_arena_bytes    = 0;   // bytes currently reserved in blocks
 static int64_t _hx_stats_str_concat_arena = 0; // str_concat calls that hit arena
+// rt 32-M: array arena counters
+static int64_t _hx_stats_array_arena_alloc   = 0; // push that went arena (initial slot buf)
+static int64_t _hx_stats_array_arena_promote = 0; // arena→heap promotions on grow
+static int64_t _hx_stats_array_arena_heapify = 0; // heapify copies of arena item buffers
 static int _hx_stats_enabled = -1;             // lazy probe of env
 
 static void _hx_stats_dump(void) {
-    fprintf(stderr, "[HEXA_ALLOC_STATS] array_new=%lld push=%lld grow=%lld reserve=%lld str_concat=%lld map_new=%lld map_set=%lld arena_alloc=%lld arena_blocks=%lld arena_bytes=%lld str_concat_arena=%lld\n",
+    fprintf(stderr, "[HEXA_ALLOC_STATS] array_new=%lld push=%lld grow=%lld reserve=%lld str_concat=%lld map_new=%lld map_set=%lld arena_alloc=%lld arena_blocks=%lld arena_bytes=%lld str_concat_arena=%lld arr_arena_alloc=%lld arr_arena_promote=%lld arr_arena_heapify=%lld\n",
         (long long)_hx_stats_array_new,
         (long long)_hx_stats_array_push,
         (long long)_hx_stats_array_grow,
@@ -448,7 +452,10 @@ static void _hx_stats_dump(void) {
         (long long)_hx_stats_arena_alloc,
         (long long)_hx_stats_arena_blocks,
         (long long)_hx_stats_arena_bytes,
-        (long long)_hx_stats_str_concat_arena);
+        (long long)_hx_stats_str_concat_arena,
+        (long long)_hx_stats_array_arena_alloc,
+        (long long)_hx_stats_array_arena_promote,
+        (long long)_hx_stats_array_arena_heapify);
 }
 
 static int _hx_stats_on(void) {
@@ -462,6 +469,71 @@ static int _hx_stats_on(void) {
     return _hx_stats_enabled;
 }
 
+// ── rt 32-M: Array arena allocator ──────────────────────
+// Bump-allocate the array slot buffer (HexaVal*) from the shared bump arena
+// during an active fn-call mark (__hexa_val_mark_top > 0). On grow beyond the
+// initial slot capacity, promote the buffer to malloc (can't realloc an arena
+// region). On heapify, deep-copy the item buffer to malloc before the arena
+// rewind point.
+//
+// Encoding: negative cap = from_arena (arr.items points into arena). This
+// preserves HexaVal width/ABI — no new field in the .arr struct. Consumers
+// that read .cap positively must treat (cap < 0) as |cap|.
+//
+// Gate: HEXA_ARRAY_ARENA env var. Default ON. Set =0 to fall back to pure
+// malloc/realloc path bit-for-bit.
+//
+// Rationale: fib(20)×30 shows array_new=4.6M, push=28.9M, grow=4.6M — the
+// dominant RSS driver. rt 32-L heapified HexaValStruct but left the array
+// .items buffer on the malloc heap (rt 32-L comment explicitly calls this
+// out: "Array .items lives on heap — hexa_array_push uses realloc"). This
+// change addresses that gap.
+extern int __hexa_val_mark_top;  // shared with rt 32-L Val arena
+static int hexa_val_arena_on(void);
+static void* hexa_val_arena_calloc(size_t n);
+void* hexa_arena_alloc(size_t n);  // rt 32-D bump allocator (shared block chain)
+
+static int __hexa_array_arena_enabled = -1;
+static int hexa_array_arena_on(void) {
+    if (__hexa_array_arena_enabled < 0) {
+        const char* e = getenv("HEXA_ARRAY_ARENA");
+        // Default ON. Export HEXA_ARRAY_ARENA=0 to disable.
+        if (!e || !e[0]) __hexa_array_arena_enabled = 1;
+        else             __hexa_array_arena_enabled = (e[0] != '0') ? 1 : 0;
+    }
+    return __hexa_array_arena_enabled;
+}
+
+// Arena-alloc a HexaVal slot buffer. Caller sets cap to -n so the "from_arena"
+// sentinel survives the return. Returns NULL if arena is off / not in scope.
+// Does NOT zero the buffer — caller memcpy's over it (slice_fast) or writes
+// len items before reading. Skipping the memset is a measurable win on hot
+// paths (the Val arena's calloc variant memset'd a 4MB block front-to-back
+// every few thousand calls, costing ~8% wall on fib K=30).
+static HexaVal* hexa_array_arena_alloc_items(int n) {
+    if (!hexa_array_arena_on()) return NULL;
+    // Must be inside a live scope mark — otherwise there's no rewind point to
+    // catch the allocation (module-init arrays stay on heap).
+    if (__hexa_val_mark_top <= 0) return NULL;
+    // Reuse the shared bump allocator (same block chain as rt 32-L). The
+    // existing rt 32-L scope-push/pop discipline automatically reclaims the
+    // array buffers too — no parallel mark stack needed.
+    HexaVal* p = (HexaVal*)hexa_arena_alloc((size_t)n * sizeof(HexaVal));
+    return p;  // NULL if arena OOM — caller falls back to malloc
+}
+
+// Promote an arena-backed slot buffer to malloc. len = current live slot count
+// to copy; new_cap = target capacity. Used by grow (new_cap > |old_cap|) and
+// heapify (new_cap == |old_cap|). Returns NULL on OOM (caller handles).
+static HexaVal* hexa_array_promote_to_heap(HexaVal* arena_items, int len, int new_cap) {
+    HexaVal* heap = (HexaVal*)malloc(sizeof(HexaVal) * (size_t)new_cap);
+    if (!heap) return NULL;
+    if (arena_items && len > 0) {
+        memcpy(heap, arena_items, sizeof(HexaVal) * (size_t)len);
+    }
+    return heap;
+}
+
 HexaVal hexa_array_new() {
     if (_hx_stats_on()) _hx_stats_array_new++;
     HexaVal v = {.tag=TAG_ARRAY};
@@ -470,27 +542,76 @@ HexaVal hexa_array_new() {
 }
 
 // Optimization #12: reserve capacity up front when size is known.
+// rt 32-M: respect arena-backed items (cap<0) — promote to heap on grow.
 HexaVal hexa_array_reserve(HexaVal arr, int n) {
-    if (n <= arr.arr.cap) return arr;
+    int real_cap = arr.arr.cap < 0 ? -arr.arr.cap : arr.arr.cap;
+    if (n <= real_cap) return arr;
     if (_hx_stats_on()) _hx_stats_array_reserve++;
-    HexaVal* new_items = realloc(arr.arr.items, sizeof(HexaVal) * n);
-    if (!new_items) { fprintf(stderr, "OOM in array_reserve\n"); exit(1); }
-    arr.arr.items = new_items;
-    arr.arr.cap = n;
+    if (arr.arr.cap < 0) {
+        if (_hx_stats_on()) _hx_stats_array_arena_promote++;
+        HexaVal* heap = hexa_array_promote_to_heap(arr.arr.items, arr.arr.len, n);
+        if (!heap) { fprintf(stderr, "OOM in array_reserve\n"); exit(1); }
+        arr.arr.items = heap;
+        arr.arr.cap = n;
+    } else {
+        HexaVal* new_items = realloc(arr.arr.items, sizeof(HexaVal) * (size_t)n);
+        if (!new_items) { fprintf(stderr, "OOM in array_reserve\n"); exit(1); }
+        arr.arr.items = new_items;
+        arr.arr.cap = n;
+    }
     return arr;
 }
 
 // Optimization #12: grow from current cap (2x), not from new_len.
 // Only realloc when len exceeds cap; growth factor 2x amortizes cost.
+// rt 32-M: arena-alloc the initial slot buffer when a fn-call scope mark is
+// live (HEXA_ARRAY_ARENA=1 default). On grow beyond the arena buffer, promote
+// to heap with malloc+memcpy — the arena region cannot be realloc'd. Negative
+// `cap` encodes from_arena; abs(cap) is the real capacity.
 HexaVal hexa_array_push(HexaVal arr, HexaVal item) {
     if (_hx_stats_on()) _hx_stats_array_push++;
-    if (arr.arr.len >= arr.arr.cap) {
+    int real_cap = arr.arr.cap < 0 ? -arr.arr.cap : arr.arr.cap;
+    if (arr.arr.len >= real_cap) {
         if (_hx_stats_on()) _hx_stats_array_grow++;
-        int new_cap = arr.arr.cap < 8 ? 8 : arr.arr.cap * 2;
-        HexaVal* new_items = realloc(arr.arr.items, sizeof(HexaVal) * new_cap);
-        if (!new_items) { fprintf(stderr, "OOM in array_push\n"); exit(1); }
-        arr.arr.items = new_items;
-        arr.arr.cap = new_cap;
+        int new_cap = real_cap < 8 ? 8 : real_cap * 2;
+        if (arr.arr.cap < 0) {
+            // Arena-backed buffer: cannot realloc. Allocate a NEW arena slab
+            // if still inside a live mark and there's room; else promote to
+            // malloc heap. Keeping it arena-resident preserves the RSS win
+            // for arrays that grow incrementally inside the same scope.
+            HexaVal* next_items = NULL;
+            if (__hexa_val_mark_top > 0 && hexa_array_arena_on()) {
+                next_items = hexa_array_arena_alloc_items(new_cap);
+            }
+            if (next_items) {
+                if (arr.arr.len > 0) {
+                    memcpy(next_items, arr.arr.items, sizeof(HexaVal) * (size_t)arr.arr.len);
+                }
+                arr.arr.items = next_items;
+                arr.arr.cap = -new_cap;
+            } else {
+                // Promote to heap.
+                if (_hx_stats_on()) _hx_stats_array_arena_promote++;
+                HexaVal* heap = hexa_array_promote_to_heap(arr.arr.items, arr.arr.len, new_cap);
+                if (!heap) { fprintf(stderr, "OOM in array_push (arena promote)\n"); exit(1); }
+                arr.arr.items = heap;
+                arr.arr.cap = new_cap;  // positive → heap
+            }
+        } else {
+            // Plain heap grow (unchanged). Arena push-on-init attempted in
+            // rt 32-M prototype but disabled: Hexa pass-by-value semantics
+            // (I1) make caller snapshots of pushed arrays become invalid
+            // when the callee arena-allocates new items for the global the
+            // snapshot captured. Full safety requires either (a) a heap-only
+            // initial bucket and arena-only-on-grow policy with promote-on-
+            // snapshot (too invasive for this pass) or (b) transpiler-emitted
+            // scoped hints. Arena currently only fires on slice_fast (NK_CALL
+            // scratch-args) where lifetime is provably scope-local.
+            HexaVal* new_items = realloc(arr.arr.items, sizeof(HexaVal) * (size_t)new_cap);
+            if (!new_items) { fprintf(stderr, "OOM in array_push\n"); exit(1); }
+            arr.arr.items = new_items;
+            arr.arr.cap = new_cap;
+        }
     }
     arr.arr.items[arr.arr.len] = item;
     arr.arr.len++;
@@ -504,12 +625,22 @@ HexaVal hexa_array_push(HexaVal arr, HexaVal item) {
 // amortises across the whole program and should not inflate the per-call
 // push/grow histogram.
 HexaVal hexa_array_push_nostat(HexaVal arr, HexaVal item) {
-    if (arr.arr.len >= arr.arr.cap) {
-        int new_cap = arr.arr.cap < 8 ? 8 : arr.arr.cap * 2;
-        HexaVal* new_items = realloc(arr.arr.items, sizeof(HexaVal) * new_cap);
-        if (!new_items) { fprintf(stderr, "OOM in array_push_nostat\n"); exit(1); }
-        arr.arr.items = new_items;
-        arr.arr.cap = new_cap;
+    // rt 32-M: stays on heap (call_arg_buf is long-lived — arena rewind would
+    // invalidate it). If an arena buffer somehow lands here, promote to heap.
+    int real_cap = arr.arr.cap < 0 ? -arr.arr.cap : arr.arr.cap;
+    if (arr.arr.len >= real_cap) {
+        int new_cap = real_cap < 8 ? 8 : real_cap * 2;
+        if (arr.arr.cap < 0) {
+            HexaVal* heap = hexa_array_promote_to_heap(arr.arr.items, arr.arr.len, new_cap);
+            if (!heap) { fprintf(stderr, "OOM in array_push_nostat\n"); exit(1); }
+            arr.arr.items = heap;
+            arr.arr.cap = new_cap;
+        } else {
+            HexaVal* new_items = realloc(arr.arr.items, sizeof(HexaVal) * (size_t)new_cap);
+            if (!new_items) { fprintf(stderr, "OOM in array_push_nostat\n"); exit(1); }
+            arr.arr.items = new_items;
+            arr.arr.cap = new_cap;
+        }
     }
     arr.arr.items[arr.arr.len] = item;
     arr.arr.len++;
@@ -532,12 +663,36 @@ HexaVal hexa_array_slice_fast(HexaVal arr, HexaVal start, HexaVal end) {
     if (a > b) a = b;
     int m = b - a;
     if (m <= 0) return out;
-    HexaVal* items = (HexaVal*)malloc(sizeof(HexaVal) * m);
-    if (!items) { fprintf(stderr, "OOM in array_slice_fast\n"); exit(1); }
-    memcpy(items, arr.arr.items + a, sizeof(HexaVal) * m);
+    // rt 32-M: arena-allocate slice items when inside a live fn-scope mark.
+    // Slice_fast is used primarily for the NK_CALL scratch-args pattern (rt 32-B)
+    // where the slice is immediately handed to call_user_fn as args, consumed
+    // (each element copied into env_define), and discarded on fn return — a
+    // lifetime that fits exactly within the callee's mark frontier.
+    //
+    // Safety: call_stack.slice(...) at call_user_fn exit happens BEFORE the
+    // __HEXA_ARENA_POP__, so the caller sees a slice whose items pointer is
+    // NOT rewound. But call_stack.slice is built from truncation on line 8341
+    // AFTER the pop — so it runs at outer mark. We guard by only arena-
+    // allocating when mark_top > 0 AND the SOURCE array is heap (cap >= 0).
+    // For call_stack.slice(0, len-1) after pop, the source is heap; the result
+    // lives at the outer's arena frontier which the outer's pop eventually
+    // reclaims — call_stack is reassigned every call anyway, so the old slice
+    // is unreachable by the next cycle. Heapify-on-return handles fn-return
+    // escapes.
+    HexaVal* items = NULL;
+    int use_arena = 0;
+    if (hexa_array_arena_on() && __hexa_val_mark_top > 0) {
+        items = hexa_array_arena_alloc_items(m);
+        if (items) { use_arena = 1; if (_hx_stats_on()) _hx_stats_array_arena_alloc++; }
+    }
+    if (!items) {
+        items = (HexaVal*)malloc(sizeof(HexaVal) * (size_t)m);
+        if (!items) { fprintf(stderr, "OOM in array_slice_fast\n"); exit(1); }
+    }
+    memcpy(items, arr.arr.items + a, sizeof(HexaVal) * (size_t)m);
     out.arr.items = items;
     out.arr.len = m;
-    out.arr.cap = m;
+    out.arr.cap = use_arena ? -m : m;
     return out;
 }
 
@@ -1360,6 +1515,12 @@ static void hexa_val_arena_scope_push(void) {
 // Pop scope mark and rewind arena to it. Caller must have heapified any Val
 // that escapes the popped scope BEFORE calling this. If the stack is empty
 // (under-pop), no-op (defensive).
+//
+// rt 32-M: array arena currently fires only for slice_fast (lifetime-safe
+// by construction — the slice is consumed by call_user_fn's args parameter
+// and never stored persistently). Push-arena (first-push into arena) was
+// prototyped + reverted; see hexa_array_push comment for the Hexa
+// pass-by-value / snapshot-ABA blocker.
 static void hexa_val_arena_scope_pop(void) {
     if (__hexa_val_mark_top <= 0) return;
     HexaValMark m = __hexa_val_marks[--__hexa_val_mark_top];
@@ -1437,13 +1598,26 @@ HexaVal hexa_val_heapify(HexaVal v) {
                 }
             }
             return v;
-        case TAG_ARRAY:
-            // Array .items lives on heap (hexa_array_push uses realloc); we
-            // only need to heapify nested elements that may be arena maps.
+        case TAG_ARRAY: {
+            // rt 32-M: if cap<0, items buffer is arena-backed — deep-copy to
+            // malloc before the rewind. Then heapify nested elements (rt 32-L
+            // handles nested arena maps / valstructs / strings).
+            if (v.arr.cap < 0 && v.arr.items) {
+                if (_hx_stats_on()) _hx_stats_array_arena_heapify++;
+                int real_cap = -v.arr.cap;
+                HexaVal* heap = hexa_array_promote_to_heap(v.arr.items, v.arr.len, real_cap);
+                if (heap) {
+                    v.arr.items = heap;
+                    v.arr.cap = real_cap;  // positive → heap
+                }
+                // On OOM we leave the arena pointer; caller may see invalid
+                // memory after rewind — best-effort semantics match Val arena.
+            }
             for (int i = 0; i < v.arr.len; i++) {
                 v.arr.items[i] = hexa_val_heapify(v.arr.items[i]);
             }
             return v;
+        }
         case TAG_STR: {
             // Conservative: if the arena owns the string (i.e. between any
             // arena block start and frontier), strdup it. Detection via
