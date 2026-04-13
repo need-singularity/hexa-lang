@@ -5258,17 +5258,21 @@ HexaVal gen2_stmt(HexaVal node, HexaVal depth) {
         if (hexa_truthy(hexa_eq(op, hexa_str("+=")))) {
             return hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(pad, lhs), hexa_str(" = hexa_add(")), lhs), hexa_str(", ")), rhs), hexa_str(");\n"));
         }
+        /* T23 fix: route -= /= *= %= through runtime helpers so that
+         * float operands use .f instead of reading .i from a union that
+         * was populated via .f (which produces the bit-pattern of the
+         * double cast to int64_t → garbage arithmetic). */
         if (hexa_truthy(hexa_eq(op, hexa_str("-=")))) {
-            return hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(pad, lhs), hexa_str(" = hexa_int((")), lhs), hexa_str(").i - (")), rhs), hexa_str(").i);\n"));
+            return hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(pad, lhs), hexa_str(" = hexa_sub(")), lhs), hexa_str(", ")), rhs), hexa_str(");\n"));
         }
         if (hexa_truthy(hexa_eq(op, hexa_str("*=")))) {
-            return hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(pad, lhs), hexa_str(" = hexa_int((")), lhs), hexa_str(").i * (")), rhs), hexa_str(").i);\n"));
+            return hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(pad, lhs), hexa_str(" = hexa_mul(")), lhs), hexa_str(", ")), rhs), hexa_str(");\n"));
         }
         if (hexa_truthy(hexa_eq(op, hexa_str("/=")))) {
-            return hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(pad, lhs), hexa_str(" = hexa_int((")), lhs), hexa_str(").i / (")), rhs), hexa_str(").i);\n"));
+            return hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(pad, lhs), hexa_str(" = hexa_div(")), lhs), hexa_str(", ")), rhs), hexa_str(");\n"));
         }
         if (hexa_truthy(hexa_eq(op, hexa_str("%=")))) {
-            return hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(pad, lhs), hexa_str(" = hexa_int((")), lhs), hexa_str(").i % (")), rhs), hexa_str(").i);\n"));
+            return hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(pad, lhs), hexa_str(" = hexa_mod(")), lhs), hexa_str(", ")), rhs), hexa_str(");\n"));
         }
         return hexa_add(hexa_add(hexa_add(pad, hexa_str("/* compound ")), op), hexa_str(" */\n"));
     }
@@ -5572,17 +5576,23 @@ HexaVal gen2_expr(HexaVal node) {
         if (hexa_truthy(hexa_eq(op, hexa_str("+")))) {
             return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_add("), l), hexa_str(", ")), r), hexa_str(")"));
         }
+        /* T23 fix: route -, *, /, % through runtime helpers (hexa_sub/
+         * hexa_mul/hexa_div/hexa_mod) which inspect the TAG_FLOAT tag
+         * and use .f for float operands. The old code always read .i
+         * from the HexaVal union, producing the raw bit pattern of the
+         * double for float operands (garbage arithmetic). + already
+         * used hexa_add so it was unaffected. */
         if (hexa_truthy(hexa_eq(op, hexa_str("-")))) {
-            return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_int(("), l), hexa_str(").i - (")), r), hexa_str(").i)"));
+            return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_sub("), l), hexa_str(", ")), r), hexa_str(")"));
         }
         if (hexa_truthy(hexa_eq(op, hexa_str("*")))) {
-            return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_int(("), l), hexa_str(").i * (")), r), hexa_str(").i)"));
+            return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_mul("), l), hexa_str(", ")), r), hexa_str(")"));
         }
         if (hexa_truthy(hexa_eq(op, hexa_str("/")))) {
-            return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_int(("), l), hexa_str(").i / (")), r), hexa_str(").i)"));
+            return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_div("), l), hexa_str(", ")), r), hexa_str(")"));
         }
         if (hexa_truthy(hexa_eq(op, hexa_str("%")))) {
-            return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_int(("), l), hexa_str(").i % (")), r), hexa_str(").i)"));
+            return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_mod("), l), hexa_str(", ")), r), hexa_str(")"));
         }
         if (hexa_truthy(hexa_eq(op, hexa_str("==")))) {
             return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_eq("), l), hexa_str(", ")), r), hexa_str(")"));
@@ -5590,17 +5600,26 @@ HexaVal gen2_expr(HexaVal node) {
         if (hexa_truthy(hexa_eq(op, hexa_str("!=")))) {
             return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_bool(!hexa_truthy(hexa_eq("), l), hexa_str(", ")), r), hexa_str(")))"));
         }
+        /* T23 fix: ordered comparisons must honor TAG_FLOAT. The old
+         * code read .i unconditionally which, for float operands,
+         * compares the IEEE bit patterns as int64 — technically that
+         * preserves order for same-sign positive floats but breaks for
+         * mixed signs, int/float compares, and produces nonsensical
+         * "false" results when the bit layout diverges. We emit a GCC
+         * statement expression (already used by runtime.c hot macros)
+         * that evaluates each side exactly once and promotes to double
+         * when either operand is TAG_FLOAT. */
         if (hexa_truthy(hexa_eq(op, hexa_str("<")))) {
-            return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_bool(("), l), hexa_str(").i < (")), r), hexa_str(").i)"));
+            return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_bool(__extension__ ({ HexaVal __l=("), l), hexa_str("); HexaVal __r=(")), r), hexa_str("); (__l.tag==TAG_FLOAT||__r.tag==TAG_FLOAT) ? ((__l.tag==TAG_FLOAT?__l.f:(double)__l.i) < (__r.tag==TAG_FLOAT?__r.f:(double)__r.i)) : (__l.i < __r.i); }))"));
         }
         if (hexa_truthy(hexa_eq(op, hexa_str(">")))) {
-            return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_bool(("), l), hexa_str(").i > (")), r), hexa_str(").i)"));
+            return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_bool(__extension__ ({ HexaVal __l=("), l), hexa_str("); HexaVal __r=(")), r), hexa_str("); (__l.tag==TAG_FLOAT||__r.tag==TAG_FLOAT) ? ((__l.tag==TAG_FLOAT?__l.f:(double)__l.i) > (__r.tag==TAG_FLOAT?__r.f:(double)__r.i)) : (__l.i > __r.i); }))"));
         }
         if (hexa_truthy(hexa_eq(op, hexa_str("<=")))) {
-            return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_bool(("), l), hexa_str(").i <= (")), r), hexa_str(").i)"));
+            return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_bool(__extension__ ({ HexaVal __l=("), l), hexa_str("); HexaVal __r=(")), r), hexa_str("); (__l.tag==TAG_FLOAT||__r.tag==TAG_FLOAT) ? ((__l.tag==TAG_FLOAT?__l.f:(double)__l.i) <= (__r.tag==TAG_FLOAT?__r.f:(double)__r.i)) : (__l.i <= __r.i); }))"));
         }
         if (hexa_truthy(hexa_eq(op, hexa_str(">=")))) {
-            return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_bool(("), l), hexa_str(").i >= (")), r), hexa_str(").i)"));
+            return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_bool(__extension__ ({ HexaVal __l=("), l), hexa_str("); HexaVal __r=(")), r), hexa_str("); (__l.tag==TAG_FLOAT||__r.tag==TAG_FLOAT) ? ((__l.tag==TAG_FLOAT?__l.f:(double)__l.i) >= (__r.tag==TAG_FLOAT?__r.f:(double)__r.i)) : (__l.i >= __r.i); }))"));
         }
         if (hexa_truthy(hexa_eq(op, hexa_str("&&")))) {
             return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_bool(hexa_truthy("), l), hexa_str(") && hexa_truthy(")), r), hexa_str("))"));
@@ -5635,8 +5654,10 @@ HexaVal gen2_expr(HexaVal node) {
         return hexa_add(hexa_add(hexa_str("/* binop "), op), hexa_str(" */"));
     }
     if (hexa_truthy(hexa_eq(k, hexa_str("UnaryOp")))) {
+        /* T23 fix: unary minus must honor TAG_FLOAT. Use hexa_sub(0, x)
+         * which routes through the float-aware runtime helper. */
         if (hexa_truthy(hexa_eq(hexa_map_get(node, "op"), hexa_str("-")))) {
-            return hexa_add(hexa_add(hexa_str("hexa_int(-("), gen2_expr(hexa_map_get(node, "left"))), hexa_str(").i)"));
+            return hexa_add(hexa_add(hexa_str("hexa_sub(hexa_int(0), "), gen2_expr(hexa_map_get(node, "left"))), hexa_str(")"));
         }
         if (hexa_truthy(hexa_eq(hexa_map_get(node, "op"), hexa_str("!")))) {
             return hexa_add(hexa_add(hexa_str("hexa_bool(!hexa_truthy("), gen2_expr(hexa_map_get(node, "left"))), hexa_str("))"));

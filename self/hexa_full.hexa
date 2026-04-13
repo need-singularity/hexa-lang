@@ -3118,6 +3118,22 @@ fn parse_primary() {
         }
     }
 
+    // T26: comptime { expr } — compile-time evaluated block in expression position.
+    // MVP: parse as a block expression wrapped in ComptimeExpr; the inner block
+    // is evaluated at runtime. Full comptime semantics (evaluation during
+    // parse/analysis, literal folding) can be tightened later.
+    if k == "Comptime" {
+        p_advance() // consume 'comptime'
+        let cbody = parse_block()
+        return #{
+            "kind": "ComptimeExpr", "name": "", "value": "", "op": "",
+            "left": "", "right": "", "cond": "", "then_body": "", "else_body": "",
+            "params": "", "body": cbody, "args": "", "fields": "", "items": "",
+            "variants": "", "arms": "", "iter_expr": "", "ret_type": "",
+            "target": "", "trait_name": "", "methods": ""
+        }
+    }
+
     // Unknown token
     let msg3 = "unexpected token " + tok.kind + " ('" + tok.value + "')"
     p_record_error(tok.line, tok.col, msg3)
@@ -4274,6 +4290,9 @@ fn ast_to_string(node, indent) {
     if k == "ComptimeBlock" {
         return pad + "ComptimeBlock([" + to_string(len(node.body)) + " stmts])"
     }
+    if k == "ComptimeExpr" {
+        return pad + "ComptimeExpr([" + to_string(len(node.body)) + " stmts])"
+    }
     if k == "ComptimeAssert" {
         return pad + "ComptimeAssert(" + ast_to_string(node.left, 0) + ")"
     }
@@ -4575,6 +4594,37 @@ pub let mut call_stack = []    // stack trace: array of function names
 // non-generator calls are unaffected.
 pub let mut gen_buffer = []
 pub let mut gen_active = false
+
+// T25 fix: enum declaration registry so `EnumName.Variant` field access
+// can produce a proper enum value instead of dropping to void.
+// Layout: [[enum_name, [variant_name, ...]], ...]
+pub let mut enum_decls = []
+
+fn enum_decls_register(name, variant_names) {
+    // Simple append — later entries shadow earlier on lookup (we scan forward
+    // but `enum_decls_has_variant` returns false only when name matches but
+    // variant is absent, so duplicate registrations with the same name and
+    // overlapping variants are harmless). Avoids in-place slot assignment.
+    enum_decls = enum_decls.push([name, variant_names])
+    return val_void()
+}
+
+fn enum_decls_has_variant(name, variant) {
+    // Scan all entries (last-wins is handled by never early-returning false).
+    let mut i = 0
+    while i < len(enum_decls) {
+        if enum_decls[i][0] == name {
+            let vs = enum_decls[i][1]
+            let mut j = 0
+            while j < len(vs) {
+                if vs[j] == variant { return true }
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
 
 // ═══════════════════════════════════════════════════════════
 // rt 32-B: reusable args accumulator for NK_CALL path
@@ -6332,6 +6382,13 @@ fn eval_expr_inner(node) {
             let fields = get_struct_fields(obj)
             return fields[field]
         }
+        // T25 fix: EnumName.Variant — when left is an Ident that names a
+        // registered enum and obj lookup returned void, produce enum value.
+        if obj.tag == TAG_VOID && left_f.kind == "Ident" {
+            if enum_decls_has_variant(left_f.name, field) {
+                return val_enum(left_f.name, field, "")
+            }
+        }
         return val_void()
     }
 
@@ -6582,9 +6639,12 @@ fn eval_expr_inner(node) {
         return val_void()
     }
 
-    // Comptime expression: evaluate at compile time (here just eval normally)
+    // Comptime expression: evaluate at compile time (here just eval normally).
+    // T26: parser emits ComptimeExpr with `.body` as an array of stmts (block form).
+    // Fallback: if body is empty, try `.left` (single-expression wrapper form).
     if kid == NK_COMPTIME || kid == NK_COMPTIME_EXPR {
-        return eval_expr(node.expr)
+        if type_of(node.body) == "array" { return eval_block(node.body) }
+        return eval_expr(node.left)
     }
 
     // Template / string interpolation: concatenate parts
@@ -7440,6 +7500,22 @@ fn exec_stmt_at(stmts, idx) {
 
     if k == "StructDecl" || k == "EnumDecl" || k == "TraitDecl" {
         // Type declarations — store for later use
+        // T25 fix: register enum variants so `EnumName.Variant` produces a value
+        if k == "EnumDecl" {
+            let vs = node.variants
+            if type_of(vs) == "array" {
+                let mut vnames = []
+                let mut vi = 0
+                while vi < len(vs) {
+                    let v = vs[vi]
+                    if type_of(v) == "struct" || type_of(v) == "map" {
+                        vnames = vnames.push(v.name)
+                    }
+                    vi = vi + 1
+                }
+                enum_decls_register(node.name, vnames)
+            }
+        }
         return val_void()
     }
 
@@ -11362,8 +11438,51 @@ fn call_builtin(name, args) {
         if v.tag == TAG_INT { return v }
         if v.tag == TAG_FLOAT { return val_int(floor(v.float_val)) }
         if v.tag == TAG_STR {
+            // Validate: strings that don't represent an integer must raise
+            // a runtime error so `try/catch` can trap them (T24).
+            // Empty / whitespace-only strings keep the historical "return 0"
+            // behavior to avoid regressing existing call sites.
+            let s = v.str_val
+            let trimmed = s.trim()
+            if len(trimmed) == 0 { return val_int(0) }
+            // Allow optional leading sign and an optional 0x/0X hex prefix.
+            let mut start = 0
+            let cs0 = trimmed.chars()
+            let first = to_string(cs0[0])
+            if first == "+" || first == "-" { start = 1 }
+            let mut is_hex = false
+            if len(trimmed) >= start + 2 {
+                let p0 = to_string(cs0[start])
+                let p1 = to_string(cs0[start + 1])
+                if p0 == "0" && (p1 == "x" || p1 == "X") {
+                    is_hex = true
+                    start = start + 2
+                }
+            }
+            if start >= len(trimmed) {
+                exec_throw(val_str("to_int: invalid integer literal \"" + s + "\""))
+                return val_int(0)
+            }
+            let mut i = start
+            let mut ok = true
+            while i < len(trimmed) {
+                let c = to_string(cs0[i])
+                let code = char_code(c, 0)
+                let is_dec = code >= 48 && code <= 57
+                let is_hex_digit = is_hex && ((code >= 65 && code <= 70) || (code >= 97 && code <= 102))
+                if !is_dec && !is_hex_digit {
+                    ok = false
+                    i = len(trimmed)
+                } else {
+                    i = i + 1
+                }
+            }
+            if !ok {
+                exec_throw(val_str("to_int: invalid integer literal \"" + s + "\""))
+                return val_int(0)
+            }
             // Use host string method parse_int (avoids recursing into our to_int)
-            return val_int(v.str_val.parse_int())
+            return val_int(trimmed.parse_int())
         }
         if v.tag == TAG_BOOL { if v.bool_val { return val_int(1) } else { return val_int(0) } }
         return val_int(0)
@@ -11374,8 +11493,51 @@ fn call_builtin(name, args) {
         if v.tag == TAG_FLOAT { return v }
         if v.tag == TAG_INT { return val_float(v.int_val * 1.0) }
         if v.tag == TAG_STR {
+            // Validate: strings that don't represent a number must raise
+            // a runtime error so `try/catch` can trap them (T24).
+            // Empty / whitespace-only strings keep the historical "return 0.0"
+            // behavior to avoid regressing existing call sites.
+            let s = v.str_val
+            let trimmed = s.trim()
+            if len(trimmed) == 0 { return val_float(0.0) }
+            let cs0 = trimmed.chars()
+            let mut i = 0
+            let first = to_string(cs0[0])
+            if first == "+" || first == "-" { i = 1 }
+            let mut seen_digit = false
+            let mut seen_dot = false
+            let mut seen_exp = false
+            let mut ok = true
+            while i < len(trimmed) {
+                let c = to_string(cs0[i])
+                let code = char_code(c, 0)
+                let is_dec = code >= 48 && code <= 57
+                if is_dec {
+                    seen_digit = true
+                    i = i + 1
+                } else if c == "." && !seen_dot && !seen_exp {
+                    seen_dot = true
+                    i = i + 1
+                } else if (c == "e" || c == "E") && seen_digit && !seen_exp {
+                    seen_exp = true
+                    i = i + 1
+                    if i < len(trimmed) {
+                        let cn = to_string(cs0[i])
+                        if cn == "+" || cn == "-" { i = i + 1 }
+                    }
+                    // must have at least one digit after e
+                    seen_digit = false
+                } else {
+                    ok = false
+                    i = len(trimmed)
+                }
+            }
+            if !ok || !seen_digit {
+                exec_throw(val_str("to_float: invalid float literal \"" + s + "\""))
+                return val_float(0.0)
+            }
             // Use host string method parse_float (avoids recursing into our to_float)
-            return val_float(v.str_val.parse_float())
+            return val_float(trimmed.parse_float())
         }
         return val_float(0.0)
     }
@@ -14953,6 +15115,7 @@ fn interpret(ast) {
     panic_msg = ""
     gen_buffer = []
     gen_active = false
+    enum_decls = []
     array_store = []
     array_refcounts = []
     array_free_list = []
