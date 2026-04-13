@@ -5739,28 +5739,34 @@ HexaVal gen2_expr(HexaVal node) {
                 return hexa_add(hexa_add(hexa_str("hexa_abs("), gen2_expr(hexa_index_get(hexa_map_get(node, "args"), hexa_int(0)))), hexa_str(")"));
             }
             if (hexa_truthy(hexa_eq(name, hexa_str("round")))) {
+                /* T32 pattern fix: unwrap TAG_VALSTRUCT via __hx_to_double */
                 HexaVal a = gen2_expr(hexa_index_get(hexa_map_get(node, "args"), hexa_int(0)));
-                return hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_int((int64_t)round("), a), hexa_str(".tag==TAG_FLOAT?")), a), hexa_str(".f:(double)")), a), hexa_str(".i))"));
+                return hexa_add(hexa_add(hexa_str("hexa_int((int64_t)round(__hx_to_double("), a), hexa_str(")))"));
             }
             if (hexa_truthy(hexa_bool(hexa_truthy(hexa_eq(name, hexa_str("ln"))) || hexa_truthy(hexa_eq(name, hexa_str("log")))))) {
+                /* T32 pattern fix: unwrap TAG_VALSTRUCT via __hx_to_double */
                 HexaVal a = gen2_expr(hexa_index_get(hexa_map_get(node, "args"), hexa_int(0)));
-                return hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_float(log("), a), hexa_str(".tag==TAG_FLOAT?")), a), hexa_str(".f:(double)")), a), hexa_str(".i))"));
+                return hexa_add(hexa_add(hexa_str("hexa_float(log(__hx_to_double("), a), hexa_str(")))"));
             }
             if (hexa_truthy(hexa_eq(name, hexa_str("log10")))) {
+                /* T32 pattern fix: unwrap TAG_VALSTRUCT via __hx_to_double */
                 HexaVal a = gen2_expr(hexa_index_get(hexa_map_get(node, "args"), hexa_int(0)));
-                return hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_float(log10("), a), hexa_str(".tag==TAG_FLOAT?")), a), hexa_str(".f:(double)")), a), hexa_str(".i))"));
+                return hexa_add(hexa_add(hexa_str("hexa_float(log10(__hx_to_double("), a), hexa_str(")))"));
             }
             if (hexa_truthy(hexa_eq(name, hexa_str("exp")))) {
+                /* T32 pattern fix: unwrap TAG_VALSTRUCT via __hx_to_double */
                 HexaVal a = gen2_expr(hexa_index_get(hexa_map_get(node, "args"), hexa_int(0)));
-                return hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_float(exp("), a), hexa_str(".tag==TAG_FLOAT?")), a), hexa_str(".f:(double)")), a), hexa_str(".i))"));
+                return hexa_add(hexa_add(hexa_str("hexa_float(exp(__hx_to_double("), a), hexa_str(")))"));
             }
             if (hexa_truthy(hexa_eq(name, hexa_str("sin")))) {
+                /* T32 pattern fix: unwrap TAG_VALSTRUCT via __hx_to_double */
                 HexaVal a = gen2_expr(hexa_index_get(hexa_map_get(node, "args"), hexa_int(0)));
-                return hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_float(sin("), a), hexa_str(".tag==TAG_FLOAT?")), a), hexa_str(".f:(double)")), a), hexa_str(".i))"));
+                return hexa_add(hexa_add(hexa_str("hexa_float(sin(__hx_to_double("), a), hexa_str(")))"));
             }
             if (hexa_truthy(hexa_eq(name, hexa_str("cos")))) {
+                /* T32 pattern fix: unwrap TAG_VALSTRUCT via __hx_to_double */
                 HexaVal a = gen2_expr(hexa_index_get(hexa_map_get(node, "args"), hexa_int(0)));
-                return hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_float(cos("), a), hexa_str(".tag==TAG_FLOAT?")), a), hexa_str(".f:(double)")), a), hexa_str(".i))"));
+                return hexa_add(hexa_add(hexa_str("hexa_float(cos(__hx_to_double("), a), hexa_str(")))"));
             }
             if (hexa_truthy(hexa_eq(name, hexa_str("pow")))) {
                 return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_pow("), gen2_expr(hexa_index_get(hexa_map_get(node, "args"), hexa_int(0)))), hexa_str(", ")), gen2_expr(hexa_index_get(hexa_map_get(node, "args"), hexa_int(1)))), hexa_str(")"));

@@ -888,11 +888,20 @@ static void hmap_grow(HexaMapTable* t) {
             new_vals[idx]  = old_vals[i];
         }
     }
-    free(old_slots);
-    free(old_vals);
+    // T33: do NOT free arena-allocated old buffers — free() on arena mem is UB.
+    // The arena will reclaim them on scope pop.
+    if (!t->from_arena) {
+        free(old_slots);
+        free(old_vals);
+    }
     t->slots = new_slots;
     t->vals  = new_vals;
     t->ht_cap = new_cap;
+    // Mark table as heap-backed for future growth/free decisions — the slots/
+    // vals/order arrays may still be arena, but new_slots/new_vals here are
+    // heap, so subsequent free(t->slots) after arena pop would be safe. Keep
+    // from_arena unchanged since order_keys/order_vals still carry the
+    // original allocation site.
 }
 
 // Find slot index for key, or -1 if not found.
@@ -1042,9 +1051,25 @@ HexaVal hexa_map_set(HexaVal m, const char* key, HexaVal val) {
 
     // Append to insertion-order arrays
     if (t->len >= t->order_cap) {
-        t->order_cap *= 2;
-        t->order_keys = (char**)realloc(t->order_keys, sizeof(char*) * t->order_cap);
-        t->order_vals = (HexaVal*)realloc(t->order_vals, sizeof(HexaVal) * t->order_cap);
+        int new_cap = t->order_cap * 2;
+        if (t->from_arena) {
+            // T33: arena-backed tables cannot realloc — promote order arrays
+            // to heap before grow. After promotion from_arena stays 1 for
+            // slots/vals (still arena) but the order_* arrays are now heap.
+            // The final heapify() will malloc-copy everything anyway; this
+            // only handles the mid-scope growth case.
+            char** new_keys = (char**)malloc(sizeof(char*) * new_cap);
+            HexaVal* new_vals = (HexaVal*)malloc(sizeof(HexaVal) * new_cap);
+            if (!new_keys || !new_vals) { fprintf(stderr, "OOM in map_set grow\n"); exit(1); }
+            memcpy(new_keys, t->order_keys, sizeof(char*) * t->len);
+            memcpy(new_vals, t->order_vals, sizeof(HexaVal) * t->len);
+            t->order_keys = new_keys;
+            t->order_vals = new_vals;
+        } else {
+            t->order_keys = (char**)realloc(t->order_keys, sizeof(char*) * new_cap);
+            t->order_vals = (HexaVal*)realloc(t->order_vals, sizeof(HexaVal) * new_cap);
+        }
+        t->order_cap = new_cap;
     }
     t->order_keys[t->len] = t->slots[idx].key;  // shared pointer, not a copy
     t->order_vals[t->len] = val;
@@ -1656,6 +1681,8 @@ static int hexa_val_arena_on(void) {
     if (__hexa_val_arena_enabled < 0) {
         const char* e = getenv("HEXA_VAL_ARENA");
         // T31: default OFF. Opt-in with HEXA_VAL_ARENA=1 after scope-pop audit.
+        // T33: partial — hmap realloc/free on arena memory fixed (hmap_set +
+        // hmap_grow), but module_loader use-path OOB remains. Default stays OFF.
         if (!e || !e[0]) {
             __hexa_val_arena_enabled = 0;
         } else {
