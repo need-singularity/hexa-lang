@@ -5899,7 +5899,7 @@ HexaVal gen2_expr(HexaVal node) {
             }
             if (hexa_truthy(hexa_eq(name, hexa_str("to_int")))) {
                 HexaVal a = gen2_expr(hexa_index_get(hexa_map_get(node, "args"), hexa_int(0)));
-                return hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_int(("), a), hexa_str(".tag==TAG_FLOAT?(int64_t)")), a), hexa_str(".f:")), a), hexa_str(".tag==TAG_STR?atoll(")), a), hexa_str(".s):")), a), hexa_str(".i))"));
+                return hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_int(("), a), hexa_str(".tag==TAG_FLOAT?hexa_float_to_int(")), a), hexa_str(".f):")), a), hexa_str(".tag==TAG_STR?atoll(")), a), hexa_str(".s):")), a), hexa_str(".i))"));
             }
             if (hexa_truthy(hexa_eq(name, hexa_str("min")))) {
                 HexaVal a = gen2_expr(hexa_index_get(hexa_map_get(node, "args"), hexa_int(0)));

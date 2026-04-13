@@ -3297,6 +3297,16 @@ static double _hexa_f(HexaVal v) {
     return 0.0;
 }
 
+// Safe float→int64 cast. C cast of NaN/Inf/out-of-range double is UB
+// (typically INT64_MIN on x86). Returns 0 for NaN/Inf, clamps to int64
+// range otherwise. Used by to_int() builtin.
+int64_t hexa_float_to_int(double f) {
+    if (isnan(f) || isinf(f)) return 0;
+    if (f >= 9.2233720368547758e+18) return (int64_t)0x7fffffffffffffffLL;
+    if (f <= -9.2233720368547758e+18) return (int64_t)0x8000000000000000LL;
+    return (int64_t)f;
+}
+
 HexaVal hexa_math_tanh(HexaVal x) { return hexa_float(tanh(_hexa_f(x))); }
 HexaVal hexa_math_sin(HexaVal x)  { return hexa_float(sin(_hexa_f(x))); }
 HexaVal hexa_math_cos(HexaVal x)  { return hexa_float(cos(_hexa_f(x))); }
