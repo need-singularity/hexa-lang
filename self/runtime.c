@@ -382,6 +382,20 @@ HexaVal hexa_array_set(HexaVal arr, int64_t idx, HexaVal val) {
     return arr;
 }
 
+// bt 55 — in-place truncate. Used by env_pop_scope to avoid the
+// `new_vars.push` rebuild loop which realloc-leaks the old backing buffer
+// every scope pop. Retains capacity for amortized re-growth.
+// No free of arr.items here (HexaVal entries may still be shared); we only
+// shrink the logical length. Safe because the slots beyond `new_len` become
+// unreachable through this handle.
+HexaVal hexa_array_truncate(HexaVal arr, int64_t new_len) {
+    if (arr.tag != TAG_ARRAY) return arr;
+    if (new_len < 0) new_len = 0;
+    if (new_len > arr.arr.len) new_len = arr.arr.len;
+    arr.arr.len = (int)new_len;
+    return arr;
+}
+
 int hexa_len(HexaVal v) {
     if (v.tag == TAG_STR) return strlen(v.s);
     if (v.tag == TAG_ARRAY) return v.arr.len;
