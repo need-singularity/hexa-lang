@@ -15,6 +15,7 @@
 static const char* HEXA_RESERVED_RUNTIME_NAMES[] = {
     "TAG_INT", "TAG_FLOAT", "TAG_BOOL", "TAG_STR", "TAG_VOID",
     "TAG_ARRAY", "TAG_MAP", "TAG_FN", "TAG_CHAR", "TAG_CLOSURE",
+    "main",
     NULL
 };
 static int hexa_name_is_reserved(const char* s) {
@@ -4658,7 +4659,7 @@ HexaVal gen2_fn_forward(HexaVal node) {
     if (hexa_truthy(hexa_eq(p, hexa_str("")))) {
         p = hexa_str("void");
     }
-    return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("HexaVal "), hexa_map_get(node, "name")), hexa_str("(")), p), hexa_str(");"));
+    return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("HexaVal "), hexa_mangle_ident(hexa_map_get(node, "name"))), hexa_str("(")), p), hexa_str(");"));
     return hexa_void();
 }
 
@@ -4722,7 +4723,7 @@ HexaVal gen2_fn_decl(HexaVal node) {
         _ii = hexa_add(_ii, hexa_int(1));
     }
     HexaVal chunks = hexa_array_new();
-    chunks = hexa_array_push(chunks, hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("HexaVal "), hexa_map_get(node, "name")), hexa_str("(")), p), hexa_str(") {\n")));
+    chunks = hexa_array_push(chunks, hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("HexaVal "), hexa_mangle_ident(hexa_map_get(node, "name"))), hexa_str("(")), p), hexa_str(") {\n")));
     HexaVal _hj = hexa_int(0);
     while (hexa_truthy(hexa_bool((_hj).i < (hexa_int(hexa_len(_hoists))).i))) {
         chunks = hexa_array_push(chunks, hexa_index_get(_hoists, _hj));
@@ -6125,7 +6126,7 @@ HexaVal gen2_expr(HexaVal node) {
                 ai = hexa_add(ai, hexa_int(1));
             }
             if (hexa_truthy(_is_known_fn_global(name))) {
-                return hexa_add(hexa_add(hexa_add(name, hexa_str("(")), hexa_str_join(arg_strs, hexa_str(", "))), hexa_str(")"));
+                return hexa_add(hexa_add(hexa_add(hexa_mangle_ident(name), hexa_str("(")), hexa_str_join(arg_strs, hexa_str(", "))), hexa_str(")"));
             }
             HexaVal nargs = hexa_int(hexa_len(hexa_map_get(node, "args")));
             if (hexa_truthy(hexa_eq(nargs, hexa_int(0)))) {
