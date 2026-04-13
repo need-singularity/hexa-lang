@@ -34,6 +34,7 @@ fn cmd_help() {
     println("    run <file> [args...]    Execute a .hexa script (interpreter)")
     println("    build <file> [-o out]   Compile .hexa to native binary")
     println("    cc                      Rebuild the transpiler (hexa_cc)")
+    println("    gc [--dry-run]          Prune .hexa-cache slots older than 30d")
     println("    status                  Show toolchain status")
     println("    version                 Print version")
     println("    help                    Show this help")
@@ -71,6 +72,63 @@ fn cmd_cc() {
         println(r)
     }
     println("OK: hexa_cc rebuilt")
+}
+
+// ── bt 38: cmd_gc — .hexa-cache GC (mtime > 30일 슬롯 정리) ─
+// 목적: `hexa run`/`hexa build` AOT 캐시($HOME/Dev/hexa-lang/.hexa-cache/<hash>)
+//       가 무한 누적되는 것을 막는다. 파일 삭제돼도 슬롯은 남기 때문에
+//       최종 접근(mtime) 기준 30일 경과한 디렉토리를 주기적으로 정리.
+//
+// 플래그:
+//   --dry-run   삭제 없이 후보 슬롯만 나열 (안전 점검용)
+//   --days N    임계 일수 오버라이드 (기본 30; 테스트 용이)
+//
+// 설계 메모:
+//   - cache_root() 는 HOME 기반 절대경로라 cwd 영향 없음.
+//   - find -mindepth 1 -maxdepth 1 로 최상위 슬롯 디렉토리만 열거(파일 제외).
+//   - I1 pass-by-value: 리스트를 직접 변이하지 않고 split 한 번 + 인덱스 순회.
+//   - POSIX 호환: macOS BSD find / GNU find 모두 -mtime +N 지원.
+fn cmd_gc(dry_run, days_str) {
+    let root = cache_root()
+    let exists = exec("test -d '" + root + "' && printf yes || printf no")
+    if exists != "yes" {
+        println("hexa gc: cache directory does not exist (" + root + ")")
+        println("  0 slots removed")
+        return
+    }
+    // mindepth 1 / maxdepth 1: 최상위 슬롯 디렉토리만 대상.
+    // -mtime +N: mtime 이 N일 이전(초과). BSD/GNU find 동일.
+    let list_cmd = "find '" + root + "' -mindepth 1 -maxdepth 1 -type d -mtime +" + days_str + " 2>/dev/null"
+    let listing = exec(list_cmd)
+    let candidates = listing.split("\n")
+    let mut removed = 0
+    let mut i = 0
+    let tag = if dry_run { "  (dry-run)" } else { "" }
+    println("hexa gc: root=" + root + " threshold=" + days_str + "d" + tag)
+    while i < len(candidates) {
+        let slot = candidates[i]
+        if len(slot) > 0 {
+            if dry_run {
+                println("  [dry-run] would remove: " + slot)
+                removed = removed + 1
+            } else {
+                // rm -rf 는 슬롯 단위만 — root 자체는 건드리지 않음.
+                let rm = exec("rm -rf '" + slot + "' 2>&1")
+                if len(rm) > 0 {
+                    println("  ERR removing " + slot + ": " + rm)
+                } else {
+                    println("  removed: " + slot)
+                    removed = removed + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    if dry_run {
+        println("  " + removed + " slot(s) would be removed (dry-run)")
+    } else {
+        println("  " + removed + " slot(s) removed")
+    }
 }
 
 // ── bt 50 Phase C: cmd_regen_cc — 자동 재생성 파이프라인 ──────
@@ -210,6 +268,42 @@ fn ends_with_dot_hexa(s) {
     return r == "yes"
 }
 
+// ── bt 40: macOS Gatekeeper codesign helper ───────────────
+// 목적: AOT/build 로 생성된 exe 를 macOS Gatekeeper 가 거부하지 않도록
+//       ad-hoc 서명(`codesign --sign -`) 자동 수행. Linux/기타 OS 에서는
+//       skip, codesign 바이너리 부재/실패 시 warning 만 남기고 진행.
+// 호출처:
+//   (1) cmd_build — `hexa build` 직접 경로 (bt 37 atomic rename 직전)
+//   (2) AOT 캐시 슬롯 — `.hexa-cache/<hash>/exe` 생성 경로 (bt 36 재개 시)
+// 실패정책: warning only (R1 stage0 경로 보존 — 서명 실패가 실행을 막지 않음).
+fn is_macos() {
+    // uname 결과가 "Darwin" 인지 판정. 공백/개행 제거.
+    // Linux 에서는 "Linux" 반환 → false → codesign skip.
+    let u = exec("uname 2>/dev/null | tr -d ' \\n\\t'")
+    return u == "Darwin"
+}
+
+fn codesign_if_macos(exe) {
+    // macOS 한정 ad-hoc 서명. 기타 OS 는 no-op.
+    // codesign 부재/실패 시 stderr 경고만 출력하고 계속 진행.
+    if !is_macos() {
+        return
+    }
+    let has = exec("command -v codesign >/dev/null 2>&1 && printf yes || printf no")
+    if has != "yes" {
+        println("warning: codesign not found — skipping signature (" + exe + ")")
+        return
+    }
+    // `--force` 재서명 허용, `--sign -` ad-hoc 서명(배포 아닌 로컬 실행용).
+    // macOS Sonoma+ 는 clang 출력이 이미 ad-hoc 서명 상태 → codesign 이
+    // "replacing existing signature" 를 stderr 로 출력(정상). 이를 warning 으로
+    // 간주하지 않도록 `grep -v` 로 필터. 실제 실패는 "errSec*" 또는 "invalid" 포함.
+    let r = exec("codesign --force --sign - '" + exe + "' 2>&1 | grep -v 'replacing existing signature' || true")
+    if len(r) > 0 {
+        println("warning: codesign failed for " + exe + ": " + r)
+    }
+}
+
 fn cmd_build(src, out) {
     // bt 37: AOT 캐시 atomic rename.
     // 문제: 두 `hexa build` 가 동일 `out` 을 쓰면 clang 이 같은 파일을 동시에
@@ -234,8 +328,10 @@ fn cmd_build(src, out) {
     println("  [2/2] " + compile)
     let r2 = exec(compile)
     if len(r2) > 0 { println("    " + r2) }
-    // codesign tmp (macOS Gatekeeper 호환) — rename 전에 서명해야 한다.
-    let sign = exec("codesign --force --sign - '" + tmp + "' 2>&1")
+    // bt 40: codesign tmp (macOS Gatekeeper 호환) — rename 전에 서명.
+    //   - macOS: ad-hoc 서명 수행. Linux 등: skip (no-op).
+    //   - codesign 부재/실패: warning only, 빌드는 계속 진행.
+    codesign_if_macos(tmp)
     // atomic rename: tmp → out. 실패 시 tmp 보존으로 디버깅 가능.
     let mv = exec("mv -f '" + tmp + "' '" + out + "' 2>&1")
     if len(mv) > 0 { println("    mv: " + mv) }
@@ -282,6 +378,44 @@ fn cache_hit(slot, fp) {
     // slot dir must exist with exe + meta matching fp.
     let chk = exec("test -x '" + slot + "/exe' && test -f '" + slot + "/meta' && cat '" + slot + "/meta' 2>/dev/null | tr -d '\\n'")
     return chk == fp
+}
+
+// ── bt 40: AOT 캐시 슬롯 빌드 + codesign ──────────────────
+// file → .hexa-cache/<hash>/exe (ad-hoc 서명 완료) 생성.
+// 반환: exe 절대경로 (성공) 또는 "" (실패 — 호출자는 stage0 fallback).
+// 호출처: 향후 cmd_run AOT 경로 복원 시 또는 `hexa cache build` 전용 커맨드.
+// bt 37 패턴 답습: `exe.tmp.$$` + codesign + mv -f (atomic rename).
+fn aot_build_slot(file) {
+    let root = cache_root()
+    let key = source_key(file)
+    let slot = root + "/" + key
+    let fp = src_fingerprint(file)
+    // 캐시 히트 — 이미 서명된 exe 재사용.
+    if cache_hit(slot, fp) {
+        return slot + "/exe"
+    }
+    // 슬롯 디렉토리 준비.
+    let _mk = exec("mkdir -p '" + slot + "' 2>/dev/null")
+    // 1) 트랜스파일: file.hexa → slot/src.c
+    let c_file = slot + "/src.c"
+    let trans = exec("./self/native/hexa_v2 '" + file + "' '" + c_file + "' 2>&1")
+    let ok_c = exec("test -f '" + c_file + "' && printf yes || printf no")
+    if ok_c != "yes" {
+        return ""
+    }
+    // 2) clang → slot/exe.tmp.$$ (atomic rename 준비, bt 37 패턴)
+    let tmp = exec("printf '%s/exe.tmp.%s' '" + slot + "' \"$$\"")
+    let compile = exec("clang -O2 -Wno-int-conversion -Wno-incompatible-pointer-types -Wno-implicit-function-declaration -I self '" + c_file + "' -o '" + tmp + "' 2>&1")
+    let ok_tmp = exec("test -x '" + tmp + "' && printf yes || printf no")
+    if ok_tmp != "yes" {
+        return ""
+    }
+    // 3) bt 40: codesign (macOS 한정, 실패 시 warning only)
+    codesign_if_macos(tmp)
+    // 4) atomic rename tmp → exe, meta 기록.
+    let _mv = exec("mv -f '" + tmp + "' '" + slot + "/exe' 2>&1")
+    let _meta = exec("printf '%s' '" + fp + "' > '" + slot + "/meta'")
+    return slot + "/exe"
 }
 
 // ── bt 39: argv forwarding helpers ────────────────────────
@@ -354,6 +488,31 @@ if len(av) < 3 {
         } else {
             cmd_cc()
         }
+    } else if sub == "gc" {
+        // bt 38: .hexa-cache GC — mtime > 30일 슬롯 정리
+        //   hexa gc               실제 삭제 (기본 30일)
+        //   hexa gc --dry-run     후보만 나열 (삭제 없음)
+        //   hexa gc --days N      임계 일수 오버라이드 (테스트용)
+        let mut gc_dry = false
+        let mut gc_days = "30"
+        let mut gi = 3
+        while gi < len(av) {
+            let a = av[gi]
+            if a == "--dry-run" {
+                gc_dry = true
+                gi = gi + 1
+            } else if a == "--days" {
+                if gi + 1 < len(av) {
+                    gc_days = av[gi + 1]
+                    gi = gi + 2
+                } else {
+                    gi = gi + 1
+                }
+            } else {
+                gi = gi + 1
+            }
+        }
+        cmd_gc(gc_dry, gc_days)
     } else if sub == "run" {
         if len(av) < 4 {
             println("error: 'run' requires <file>")
