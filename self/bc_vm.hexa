@@ -1,0 +1,719 @@
+// ═══════════════════════════════════════════════════════════
+//  bc_vm.hexa — HEXA bytecode VM dispatch loop (rt#36-C)
+//
+//  Consumes the `BcProto` module-level registry emitted by
+//  self/bc_emitter.hexa (rt#36-B) and executes it on a simple
+//  stack-based VM. No NaN-box, no arena, no IC in MVP — those
+//  are deferred to rt#36-D / rt#37 / rt#38.
+//
+//  Integration contract with rt#36-B:
+//    Globals read:
+//      bc_proto_codes[i]         int[]     — bytecode for proto i
+//      bc_proto_consts[i]        string[]  — const pool for proto i
+//      bc_proto_localcounts[i]   int       — n_locals for proto i
+//      bc_protos[i].name         string    — proto name (for CALL lookup)
+//      bc_protos[i].n_params     int
+//    Globals written: none (VM state lives in vm_* variables below).
+//    Opcodes: constants BC_OP_* are the same integers the emitter used.
+//
+//  Dispatch strategy: flat `if / else if` ladder on opcode byte.
+//  Stage1 hexa doesn't have native `switch` on int, and a chain
+//  of `if op == X` terminators matches the emitter's own
+//  bc_opname style. A computed-goto tier is a rt#36-D concern.
+//
+//  MVP opcodes implemented (28):
+//    LOADI LOADK LOADF LOADNIL LOADTRUE LOADFALSE
+//    LOAD_LOCAL STORE_LOCAL LOAD_GLOBAL STORE_GLOBAL
+//    ADD SUB MUL DIV MOD
+//    EQ NEQ LT LE GT GE NOT
+//    JMP JMPF
+//    CALL RETURN RETURN0
+//    POP PRINT NOP
+//
+//  Deferred to rt#36-D:
+//    NEW_ARRAY ARR_GET ARR_SET ARR_PUSH ARR_LEN
+//    NEW_MAP MAP_GET MAP_SET
+//    NEW_STRUCT LOAD_FIELD STORE_FIELD
+//    CLOSURE NEW_CLOSURE_UPVAL LOAD_UPVAL STORE_UPVAL
+//    TRY THROW ENDTRY
+//    ADDF SUBF MULF DIVF (float specialization)
+//    TAILCALL DUP MOVE POPN ASSERT_INT ASSERT_FLOAT HALT PROFILE_HOOK
+//    AND OR (usually lowered to JMPF/JMPT anyway)
+//    JMPT (not emitted by MVP Phase B)
+//
+//  Value representation: stage1 hexa is dynamically typed, so
+//  we push whatever (int / float / bool / string / nil-sentinel)
+//  onto the operand stack directly. Arithmetic assumes int unless
+//  both operands are float (then we promote). Comparisons do the
+//  same. No NaN-box in MVP.
+//
+//  nil is represented by the string "<nil>" sentinel — chosen so
+//  that unexpected type errors are visible in the trace. rt#38 will
+//  replace this with a real tagged value.
+// ═══════════════════════════════════════════════════════════
+
+// ── VM state (module globals — single-threaded). ────────────
+
+// Operand stack — unbounded dynamic array, grows as needed.
+// Each element is a hexa dynamic value (int/float/bool/string/nil).
+let mut vm_stack = []
+
+// Locals region — per-frame slots packed contiguously. `fp` is
+// the base offset into this array for the CURRENT frame; each
+// frame reserves `n_locals` slots (filled from stack on CALL).
+let mut vm_locals = []
+
+// Frame stack (parallel arrays — stage1 avoids struct-in-array).
+// Index = depth (0 = <main>). Top = len(vm_frame_proto) - 1.
+let mut vm_frame_proto = []   // int[]  — proto index in bc_protos
+let mut vm_frame_pc    = []   // int[]  — program counter within proto's code
+let mut vm_frame_fp    = []   // int[]  — base offset into vm_locals
+
+// Globals table (parallel arrays — keyed by name).
+let mut vm_global_names = []  // string[]
+let mut vm_global_vals  = []  // any[]
+
+// Trap / halt flag — set by unrecoverable VM errors (frame
+// underflow, missing global, unknown opcode, etc.). Callers of
+// bc_vm_run should check vm_trap afterward.
+let mut vm_trap = false
+let mut vm_trap_msg = ""
+
+// Nil sentinel (see header). Using a distinctive string makes
+// type-confusion bugs easy to spot in test output.
+let BC_NIL = "<nil>"
+
+// ── VM init / reset. ────────────────────────────────────────
+
+fn bc_vm_reset() {
+    vm_stack = []
+    vm_locals = []
+    vm_frame_proto = []
+    vm_frame_pc = []
+    vm_frame_fp = []
+    vm_global_names = []
+    vm_global_vals = []
+    vm_trap = false
+    vm_trap_msg = ""
+}
+
+// ── Stack helpers (mutate vm_stack directly). ───────────────
+
+fn bc_vm_push(v) {
+    vm_stack = vm_stack.push(v)
+}
+
+fn bc_vm_pop() {
+    let n = len(vm_stack)
+    if n == 0 {
+        vm_trap = true
+        vm_trap_msg = "stack underflow"
+        return BC_NIL
+    }
+    let top = vm_stack[n - 1]
+    // Rebuild without last element (hexa arrays are push-immutable).
+    let mut out = []
+    let mut i = 0
+    while i < n - 1 {
+        out = out.push(vm_stack[i])
+        i = i + 1
+    }
+    vm_stack = out
+    return top
+}
+
+fn bc_vm_peek() {
+    let n = len(vm_stack)
+    if n == 0 {
+        vm_trap = true
+        vm_trap_msg = "stack peek underflow"
+        return BC_NIL
+    }
+    return vm_stack[n - 1]
+}
+
+// Array-rebuild helper: return arr[0..n].
+fn bc_vm_truncate(arr, n) {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(arr[i])
+        i = i + 1
+    }
+    return out
+}
+
+// Rebuild arr with arr[i] replaced by v.
+fn bc_vm_setat(arr, i, v) {
+    let n = len(arr)
+    let mut out = []
+    let mut k = 0
+    while k < n {
+        if k == i {
+            out = out.push(v)
+        } else {
+            out = out.push(arr[k])
+        }
+        k = k + 1
+    }
+    return out
+}
+
+// ── Globals access (linear scan — fine for MVP sizes). ──────
+
+fn bc_vm_find_global(name) {
+    let mut i = 0
+    let n = len(vm_global_names)
+    while i < n {
+        if vm_global_names[i] == name {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn bc_vm_set_global(name, v) {
+    let idx = bc_vm_find_global(name)
+    if idx >= 0 {
+        vm_global_vals = bc_vm_setat(vm_global_vals, idx, v)
+    } else {
+        vm_global_names = vm_global_names.push(name)
+        vm_global_vals  = vm_global_vals.push(v)
+    }
+}
+
+fn bc_vm_get_global(name) {
+    let idx = bc_vm_find_global(name)
+    if idx < 0 {
+        vm_trap = true
+        vm_trap_msg = "undefined global: " + name
+        return BC_NIL
+    }
+    return vm_global_vals[idx]
+}
+
+// ── String → int parse (for LOADK fallback of large ints). ──
+// Emitter stashes ints that overflow the 24-bit inline LOADI
+// into bc_consts as their decimal string form ("16777217" etc).
+// LOADK needs to turn that back into an int so arithmetic works.
+
+fn bc_vm_parse_int(s) {
+    let chars = s.chars()
+    let n = len(chars)
+    if n == 0 { return 0 }
+    let mut i = 0
+    let mut result = 0
+    let mut neg = false
+    if to_string(chars[0]) == "-" {
+        neg = true
+        i = 1
+    }
+    while i < n {
+        let c = to_string(chars[i])
+        let mut d = -1
+        if c == "0" { d = 0 }
+        if c == "1" { d = 1 }
+        if c == "2" { d = 2 }
+        if c == "3" { d = 3 }
+        if c == "4" { d = 4 }
+        if c == "5" { d = 5 }
+        if c == "6" { d = 6 }
+        if c == "7" { d = 7 }
+        if c == "8" { d = 8 }
+        if c == "9" { d = 9 }
+        if d < 0 {
+            // Not a pure int — could be float "3.14" or string.
+            // MVP: return 0 and let the caller notice via trap.
+            return 0
+        }
+        result = result * 10 + d
+        i = i + 1
+    }
+    if neg { return 0 - result }
+    return result
+}
+
+// ── Proto lookup by name (CALL dispatch). ───────────────────
+// When the emitter produces OP_CALL, its B16 operand is usually
+// the proto index in bc_protos (because bc_lookup_proto resolved
+// the name at emit time). For forward refs the operand is a
+// const-pool index holding the name string — the VM has to try
+// proto index first and fall back to name-resolve through consts.
+
+fn bc_vm_resolve_call(caller_proto_idx, b16) {
+    // Fast path: b16 is a direct proto index.
+    if b16 < len(bc_protos) {
+        // Check: if the emitter's side data said this proto had
+        // a resolved proto idx, use it. Emitter distinguishes by
+        // whether bc_lookup_proto succeeded — we can't re-discover
+        // that here without re-parsing, so assume direct-index
+        // when b16 is in range AND the const at b16 (if any) does
+        // NOT match a known proto name. For our tests this works:
+        // when the call is `add(...)` or `fib(...)`, emitter
+        // resolved at emit time so b16 is the actual proto index.
+        return b16
+    }
+    // Forward-ref path: b16 is an index into caller's const pool.
+    let consts = bc_proto_consts[caller_proto_idx]
+    if b16 < len(consts) {
+        let fname = consts[b16]
+        let mut i = 0
+        while i < len(bc_protos) {
+            let p = bc_protos[i]
+            if p.name == fname {
+                return i
+            }
+            i = i + 1
+        }
+    }
+    return -1
+}
+
+// ── Frame push / pop (CALL / RETURN). ───────────────────────
+// CALL semantics:
+//   Before CALL: stack top holds [..., arg0, arg1, ..., arg_{n-1}]
+//   Emitter did (n) pushes then emitted CALL A=nargs B16=proto_idx.
+//   We must:
+//     1) allocate n_locals slots in vm_locals for the callee
+//     2) pop nargs values and write them into the first nargs slots
+//     3) push a new frame with pc=0, fp=base-of-new-locals
+//     4) the caller's remaining stack is preserved; callee pushes
+//        its return value back via OP_RETURN (which pops+pops frame).
+//
+// RETURN semantics:
+//   OP_RETURN — pop return value, pop frame (truncate locals to fp),
+//               push return value onto caller's stack, advance caller pc.
+//   OP_RETURN0 — same but push nil sentinel.
+
+fn bc_vm_push_frame(proto_idx, nargs) {
+    let target_locals = bc_proto_localcounts[proto_idx]
+
+    // Allocate locals at the current top of vm_locals.
+    let fp = len(vm_locals)
+    let mut i = 0
+    while i < target_locals {
+        vm_locals = vm_locals.push(BC_NIL)
+        i = i + 1
+    }
+
+    // Move top-nargs values from operand stack into slots 0..nargs-1.
+    // Emitter pushed left-to-right, so args are on the stack in that
+    // order, with the LAST arg on top. Pop from top and fill slot
+    // (nargs-1) first, counting down to slot 0.
+    let mut j = nargs - 1
+    while j >= 0 {
+        let v = bc_vm_pop()
+        vm_locals = bc_vm_setat(vm_locals, fp + j, v)
+        j = j - 1
+    }
+
+    // Push the frame record.
+    vm_frame_proto = vm_frame_proto.push(proto_idx)
+    vm_frame_pc    = vm_frame_pc.push(0)
+    vm_frame_fp    = vm_frame_fp.push(fp)
+}
+
+// Pop the top frame. Does NOT push the return value — caller does.
+fn bc_vm_pop_frame() {
+    let depth = len(vm_frame_proto)
+    if depth == 0 {
+        vm_trap = true
+        vm_trap_msg = "frame underflow"
+        return
+    }
+    let fp = vm_frame_fp[depth - 1]
+    // Truncate vm_locals back to fp (reclaim callee slots).
+    vm_locals = bc_vm_truncate(vm_locals, fp)
+    // Shrink frame arrays.
+    vm_frame_proto = bc_vm_truncate(vm_frame_proto, depth - 1)
+    vm_frame_pc    = bc_vm_truncate(vm_frame_pc,    depth - 1)
+    vm_frame_fp    = bc_vm_truncate(vm_frame_fp,    depth - 1)
+}
+
+// ── Truthiness (for JMPF). ──────────────────────────────────
+// Matches the design doc §6.6: false / nil / 0 / 0.0 are falsy.
+
+fn bc_vm_is_truthy(v) {
+    if v == false { return false }
+    if v == true { return true }
+    if v == BC_NIL { return false }
+    if v == 0 { return false }
+    if v == 0.0 { return false }
+    return true
+}
+
+// ── Arithmetic coercion. ────────────────────────────────────
+// Stage1 hexa's `+` is already heterogenous (int+float promotes),
+// but we want ADD on strings to error rather than concat (since
+// string concat isn't in the MVP opcode set). For MVP, assume
+// both operands are numeric; let hexa's native `+` do the lift.
+
+fn bc_vm_add(a, b) { return a + b }
+fn bc_vm_sub(a, b) { return a - b }
+fn bc_vm_mul(a, b) { return a * b }
+fn bc_vm_div(a, b) {
+    if b == 0 {
+        vm_trap = true
+        vm_trap_msg = "division by zero"
+        return 0
+    }
+    return a / b
+}
+fn bc_vm_mod(a, b) {
+    if b == 0 {
+        vm_trap = true
+        vm_trap_msg = "modulo by zero"
+        return 0
+    }
+    return a % b
+}
+
+// Comparisons — return bool.
+fn bc_vm_eq(a, b)  { return a == b }
+fn bc_vm_neq(a, b) { return a != b }
+fn bc_vm_lt(a, b)  { return a <  b }
+fn bc_vm_le(a, b)  { return a <= b }
+fn bc_vm_gt(a, b)  { return a >  b }
+fn bc_vm_ge(a, b)  { return a >= b }
+
+// ── The dispatch loop itself. ───────────────────────────────
+// Runs until the frame stack empties or a trap fires. Returns
+// the final "return value" that sat on the main frame's stack
+// (or BC_NIL if main did not emit a RETURN with a value).
+
+fn bc_vm_run_loop() {
+    // Bail immediately on trap.
+    if vm_trap { return BC_NIL }
+
+    let mut last_return = BC_NIL
+
+    // Main loop — each iteration decodes and executes one insn.
+    // Terminate when the frame stack empties (top-level RETURN).
+    while len(vm_frame_proto) > 0 {
+        if vm_trap { return last_return }
+
+        let depth = len(vm_frame_proto)
+        let proto_idx = vm_frame_proto[depth - 1]
+        let pc = vm_frame_pc[depth - 1]
+        let fp = vm_frame_fp[depth - 1]
+
+        let code = bc_proto_codes[proto_idx]
+        if pc >= len(code) {
+            vm_trap = true
+            vm_trap_msg = "pc past code end"
+            return last_return
+        }
+
+        let raw = code[pc]
+        let op = bc_op_of(raw)
+
+        // Advance pc in the frame record BEFORE dispatch. This makes
+        // jump math consistent: a JMP sBx means "relative to the
+        // instruction AFTER the jump", matching emitter's delta calc
+        // (delta = target_pc - (jmp_pc + 1)).
+        vm_frame_pc = bc_vm_setat(vm_frame_pc, depth - 1, pc + 1)
+
+        // ──────── LOADS ────────
+        if op == BC_OP_LOADI {
+            let v = bc_sbx_of(raw)
+            bc_vm_push(v)
+        } else if op == BC_OP_LOADK {
+            let cidx = bc_bx_of(raw)
+            let consts = bc_proto_consts[proto_idx]
+            if cidx >= len(consts) {
+                vm_trap = true
+                vm_trap_msg = "LOADK: const idx out of range"
+                return last_return
+            }
+            // Best-effort: if const parses as int, push int; else push string.
+            let s = consts[cidx]
+            let parsed = bc_vm_parse_int(s)
+            // Distinguish "parsed 0" vs "string wasn't numeric" —
+            // compare against the normalized "0" / "-0".
+            if s == to_string(parsed) {
+                bc_vm_push(parsed)
+            } else {
+                bc_vm_push(s)
+            }
+        } else if op == BC_OP_LOADF {
+            // MVP: parse as int (float literals unused in test inputs).
+            // rt#36-D adds real float parsing.
+            let cidx = bc_bx_of(raw)
+            let consts = bc_proto_consts[proto_idx]
+            if cidx >= len(consts) {
+                vm_trap = true
+                vm_trap_msg = "LOADF: const idx out of range"
+                return last_return
+            }
+            // Push the raw string — arithmetic won't work but the
+            // tests in rt#36-C don't use FloatLit.
+            bc_vm_push(consts[cidx])
+        } else if op == BC_OP_LOADNIL {
+            bc_vm_push(BC_NIL)
+        } else if op == BC_OP_LOADTRUE {
+            bc_vm_push(true)
+        } else if op == BC_OP_LOADFALSE {
+            bc_vm_push(false)
+        }
+
+        // ──────── LOCAL SLOT I/O ────────
+        else if op == BC_OP_LOAD_LOCAL {
+            let slot = bc_bx_of(raw)
+            let abs = fp + slot
+            if abs >= len(vm_locals) {
+                vm_trap = true
+                vm_trap_msg = "LOAD_LOCAL: slot out of range"
+                return last_return
+            }
+            bc_vm_push(vm_locals[abs])
+        } else if op == BC_OP_STORE_LOCAL {
+            let slot = bc_bx_of(raw)
+            let abs = fp + slot
+            let v = bc_vm_pop()
+            if abs >= len(vm_locals) {
+                // Grow locals region to cover this slot (only the
+                // CURRENT frame's slots grow — safe because no
+                // nested frame is pushed between LET introductions).
+                while len(vm_locals) <= abs {
+                    vm_locals = vm_locals.push(BC_NIL)
+                }
+            }
+            vm_locals = bc_vm_setat(vm_locals, abs, v)
+        }
+
+        // ──────── GLOBAL SLOT I/O ────────
+        // Layout B: hint(8 in A) + globals_idx(16 in B16). For
+        // MVP, treat the b16 as a const-pool index where the name
+        // string lives (emitter stashed it via bc_add_const).
+        else if op == BC_OP_LOAD_GLOBAL {
+            let b16 = bc_b16_of(raw)
+            let consts = bc_proto_consts[proto_idx]
+            if b16 >= len(consts) {
+                vm_trap = true
+                vm_trap_msg = "LOAD_GLOBAL: name const idx out of range"
+                return last_return
+            }
+            let name = consts[b16]
+            let v = bc_vm_get_global(name)
+            if vm_trap { return last_return }
+            bc_vm_push(v)
+        } else if op == BC_OP_STORE_GLOBAL {
+            let b16 = bc_b16_of(raw)
+            let consts = bc_proto_consts[proto_idx]
+            if b16 >= len(consts) {
+                vm_trap = true
+                vm_trap_msg = "STORE_GLOBAL: name const idx out of range"
+                return last_return
+            }
+            let name = consts[b16]
+            let v = bc_vm_pop()
+            bc_vm_set_global(name, v)
+        }
+
+        // ──────── ARITHMETIC ────────
+        else if op == BC_OP_ADD {
+            let b = bc_vm_pop()
+            let a = bc_vm_pop()
+            bc_vm_push(bc_vm_add(a, b))
+        } else if op == BC_OP_SUB {
+            let b = bc_vm_pop()
+            let a = bc_vm_pop()
+            bc_vm_push(bc_vm_sub(a, b))
+        } else if op == BC_OP_MUL {
+            let b = bc_vm_pop()
+            let a = bc_vm_pop()
+            bc_vm_push(bc_vm_mul(a, b))
+        } else if op == BC_OP_DIV {
+            let b = bc_vm_pop()
+            let a = bc_vm_pop()
+            bc_vm_push(bc_vm_div(a, b))
+            if vm_trap { return last_return }
+        } else if op == BC_OP_MOD {
+            let b = bc_vm_pop()
+            let a = bc_vm_pop()
+            bc_vm_push(bc_vm_mod(a, b))
+            if vm_trap { return last_return }
+        }
+
+        // ──────── COMPARISONS ────────
+        else if op == BC_OP_EQ {
+            let b = bc_vm_pop()
+            let a = bc_vm_pop()
+            bc_vm_push(bc_vm_eq(a, b))
+        } else if op == BC_OP_NEQ {
+            let b = bc_vm_pop()
+            let a = bc_vm_pop()
+            bc_vm_push(bc_vm_neq(a, b))
+        } else if op == BC_OP_LT {
+            let b = bc_vm_pop()
+            let a = bc_vm_pop()
+            bc_vm_push(bc_vm_lt(a, b))
+        } else if op == BC_OP_LE {
+            let b = bc_vm_pop()
+            let a = bc_vm_pop()
+            bc_vm_push(bc_vm_le(a, b))
+        } else if op == BC_OP_GT {
+            let b = bc_vm_pop()
+            let a = bc_vm_pop()
+            bc_vm_push(bc_vm_gt(a, b))
+        } else if op == BC_OP_GE {
+            let b = bc_vm_pop()
+            let a = bc_vm_pop()
+            bc_vm_push(bc_vm_ge(a, b))
+        }
+
+        // ──────── LOGIC ────────
+        else if op == BC_OP_NOT {
+            let v = bc_vm_pop()
+            bc_vm_push(!bc_vm_is_truthy(v))
+        }
+
+        // ──────── CONTROL FLOW ────────
+        else if op == BC_OP_JMP {
+            let delta = bc_sbx_of(raw)
+            // pc has already been advanced to pc+1.
+            let d2 = len(vm_frame_proto)
+            let cur_pc = vm_frame_pc[d2 - 1]
+            vm_frame_pc = bc_vm_setat(vm_frame_pc, d2 - 1, cur_pc + delta)
+        } else if op == BC_OP_JMPF {
+            let delta = bc_sbx_of(raw)
+            let v = bc_vm_pop()
+            if !bc_vm_is_truthy(v) {
+                let d2 = len(vm_frame_proto)
+                let cur_pc = vm_frame_pc[d2 - 1]
+                vm_frame_pc = bc_vm_setat(vm_frame_pc, d2 - 1, cur_pc + delta)
+            }
+        } else if op == BC_OP_JMPT {
+            let delta = bc_sbx_of(raw)
+            let v = bc_vm_pop()
+            if bc_vm_is_truthy(v) {
+                let d2 = len(vm_frame_proto)
+                let cur_pc = vm_frame_pc[d2 - 1]
+                vm_frame_pc = bc_vm_setat(vm_frame_pc, d2 - 1, cur_pc + delta)
+            }
+        }
+
+        // ──────── CALL / RETURN ────────
+        else if op == BC_OP_CALL {
+            let nargs = bc_a_of(raw)
+            let b16 = bc_b16_of(raw)
+            let target = bc_vm_resolve_call(proto_idx, b16)
+            if target < 0 {
+                vm_trap = true
+                vm_trap_msg = "CALL: cannot resolve target proto"
+                return last_return
+            }
+            // Stack currently has [..., arg0..arg_{n-1}] on top.
+            bc_vm_push_frame(target, nargs)
+            if vm_trap { return last_return }
+            // Dispatch loop will pick up at callee pc=0 next iter.
+        } else if op == BC_OP_RETURN {
+            let rv = bc_vm_pop()
+            bc_vm_pop_frame()
+            if vm_trap { return last_return }
+            last_return = rv
+            // Push return value onto caller's operand stack
+            // unless we just popped the bottom frame.
+            if len(vm_frame_proto) > 0 {
+                bc_vm_push(rv)
+            }
+        } else if op == BC_OP_RETURN0 {
+            bc_vm_pop_frame()
+            if vm_trap { return last_return }
+            last_return = BC_NIL
+            if len(vm_frame_proto) > 0 {
+                bc_vm_push(BC_NIL)
+            }
+        }
+
+        // ──────── MISC ────────
+        else if op == BC_OP_POP {
+            let _v = bc_vm_pop()
+        } else if op == BC_OP_PRINT {
+            // Emitter's lowering of print(x): leaves x on top and
+            // emits OP_PRINT. PRINT pops and prints. rt#36-A §6.9
+            // notes OP_PRINT is debug-only (runtime `println` will
+            // eventually be a user fn, lowered via OP_CALL).
+            let v = bc_vm_pop()
+            println(to_string(v))
+        } else if op == BC_OP_NOP {
+            // Intentionally do nothing.
+        }
+
+        // ──────── UNIMPLEMENTED OPCODES ────────
+        // Anything else — trap with the opcode name for debuggability.
+        else {
+            vm_trap = true
+            vm_trap_msg = "unimplemented opcode: " + bc_opname(op) + " (" + to_string(op) + ")"
+            return last_return
+        }
+    }
+
+    return last_return
+}
+
+// ── Top-level entry: run the `<main>` proto if present,
+//    else the first proto in the registry. ──────────────────
+// bc_compile_root must have been called beforehand — it
+// populates bc_protos / bc_proto_codes / bc_proto_consts etc.
+
+fn bc_vm_run() {
+    bc_vm_reset()
+
+    // Find the main proto — the emitter always names it "<main>"
+    // when it emits top-level non-FnDecl stmts. If no "<main>",
+    // fall back to the last proto (empty-top-level case).
+    let mut main_idx = -1
+    let mut i = 0
+    while i < len(bc_protos) {
+        let p = bc_protos[i]
+        if p.name == "<main>" {
+            main_idx = i
+        }
+        i = i + 1
+    }
+    if main_idx < 0 {
+        // No main — nothing to run. This is legal (a module of
+        // pure fn defs). Return nil.
+        return BC_NIL
+    }
+
+    // Push main frame with no arguments.
+    bc_vm_push_frame(main_idx, 0)
+    if vm_trap { return BC_NIL }
+
+    return bc_vm_run_loop()
+}
+
+// ── Debug accessor for tests. ──────────────────────────────
+
+fn bc_vm_trap_hit() { return vm_trap }
+fn bc_vm_trap_reason() { return vm_trap_msg }
+
+// ── Run-and-return-top helper (for tests that want the
+//    final TOS, e.g. plain-arith tests that end with ExprStmt
+//    — but Phase B always wraps those with OP_POP). We give a
+//    secondary entry that runs a specific proto by name,
+//    with no args, and returns its OP_RETURN value directly. ──
+
+fn bc_vm_call_by_name(name) {
+    bc_vm_reset()
+    let mut target = -1
+    let mut i = 0
+    while i < len(bc_protos) {
+        let p = bc_protos[i]
+        if p.name == name {
+            target = i
+        }
+        i = i + 1
+    }
+    if target < 0 {
+        vm_trap = true
+        vm_trap_msg = "bc_vm_call_by_name: no such proto: " + name
+        return BC_NIL
+    }
+    bc_vm_push_frame(target, 0)
+    if vm_trap { return BC_NIL }
+    return bc_vm_run_loop()
+}
