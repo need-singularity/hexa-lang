@@ -146,6 +146,17 @@ HexaVal hexa_str_to_upper(HexaVal s);
 HexaVal hexa_str_to_lower(HexaVal s);
 HexaVal hexa_str_chars(HexaVal s);
 HexaVal hexa_format_n(HexaVal fmt, HexaVal args);
+HexaVal hexa_str_parse_int(HexaVal s);
+HexaVal hexa_str_parse_float(HexaVal s);
+HexaVal hexa_str_trim_start(HexaVal s);
+HexaVal hexa_str_trim_end(HexaVal s);
+HexaVal hexa_str_slice(HexaVal s, HexaVal start, HexaVal end);
+HexaVal hexa_str_bytes(HexaVal s);
+HexaVal hexa_array_slice(HexaVal arr, HexaVal start, HexaVal end);
+HexaVal hexa_array_map(HexaVal arr, HexaVal fn);
+HexaVal hexa_array_filter(HexaVal arr, HexaVal fn);
+HexaVal hexa_array_fold(HexaVal arr, HexaVal init, HexaVal fn);
+HexaVal hexa_array_index_of(HexaVal arr, HexaVal item);
 HexaVal hexa_array_new(void);
 HexaVal hexa_void(void);
 HexaVal hexa_null_coal(HexaVal a, HexaVal b);
@@ -1800,3 +1811,354 @@ HexaVal char_code(HexaVal s, HexaVal idx) {
     if (i < 0 || i >= (int)strlen(s.s)) return hexa_int(0);
     return hexa_int((unsigned char)s.s[i]);
 }
+
+// ── Added: method-dispatch helpers (bt 34) ────────────────────
+HexaVal hexa_str_parse_int(HexaVal s) {
+    if (s.tag != TAG_STR) return hexa_int(0);
+    return hexa_int((int64_t)strtoll(s.s, NULL, 10));
+}
+
+HexaVal hexa_str_parse_float(HexaVal s) {
+    if (s.tag != TAG_STR) return hexa_float(0.0);
+    return hexa_float(strtod(s.s, NULL));
+}
+
+HexaVal hexa_str_trim_start(HexaVal s) {
+    if (s.tag != TAG_STR) return s;
+    char* p = s.s;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    return hexa_str_own(strdup(p));
+}
+
+HexaVal hexa_str_trim_end(HexaVal s) {
+    if (s.tag != TAG_STR) return s;
+    int len = strlen(s.s);
+    while (len > 0 && (s.s[len-1] == ' ' || s.s[len-1] == '\t' || s.s[len-1] == '\n' || s.s[len-1] == '\r')) len--;
+    return hexa_str_own(strndup(s.s, len));
+}
+
+// Byte-based slice: [start, end) clamped to length
+HexaVal hexa_str_slice(HexaVal s, HexaVal start, HexaVal end) {
+    if (s.tag != TAG_STR) return hexa_str("");
+    int len = (int)strlen(s.s);
+    int a = (int)start.i, b = (int)end.i;
+    if (a < 0) a = 0;
+    if (b > len) b = len;
+    if (a > b) a = b;
+    return hexa_str_own(strndup(s.s + a, b - a));
+}
+
+HexaVal hexa_array_slice(HexaVal arr, HexaVal start, HexaVal end) {
+    if (arr.tag != TAG_ARRAY) return hexa_array_new();
+    int n = arr.arr.len;
+    int a = (int)start.i, b = (int)end.i;
+    if (a < 0) a = 0;
+    if (b > n) b = n;
+    if (a > b) a = b;
+    HexaVal out = hexa_array_new();
+    for (int i = a; i < b; i++) out = hexa_array_push(out, arr.arr.items[i]);
+    return out;
+}
+
+HexaVal hexa_array_map(HexaVal arr, HexaVal fn) {
+    if (arr.tag != TAG_ARRAY) return hexa_array_new();
+    HexaVal out = hexa_array_new();
+    for (int i = 0; i < arr.arr.len; i++) {
+        out = hexa_array_push(out, hexa_call1(fn, arr.arr.items[i]));
+    }
+    return out;
+}
+
+HexaVal hexa_array_filter(HexaVal arr, HexaVal fn) {
+    if (arr.tag != TAG_ARRAY) return hexa_array_new();
+    HexaVal out = hexa_array_new();
+    for (int i = 0; i < arr.arr.len; i++) {
+        HexaVal keep = hexa_call1(fn, arr.arr.items[i]);
+        if (hexa_truthy(keep)) out = hexa_array_push(out, arr.arr.items[i]);
+    }
+    return out;
+}
+
+HexaVal hexa_array_fold(HexaVal arr, HexaVal init, HexaVal fn) {
+    if (arr.tag != TAG_ARRAY) return init;
+    HexaVal acc = init;
+    for (int i = 0; i < arr.arr.len; i++) {
+        acc = hexa_call2(fn, acc, arr.arr.items[i]);
+    }
+    return acc;
+}
+
+HexaVal hexa_array_index_of(HexaVal arr, HexaVal item) {
+    if (arr.tag != TAG_ARRAY) return hexa_int(-1);
+    for (int i = 0; i < arr.arr.len; i++) {
+        if (hexa_truthy(hexa_eq(arr.arr.items[i], item))) return hexa_int(i);
+    }
+    return hexa_int(-1);
+}
+
+HexaVal hexa_str_bytes(HexaVal s) {
+    if (s.tag != TAG_STR) return hexa_array_new();
+    HexaVal out = hexa_array_new();
+    for (const unsigned char* p = (const unsigned char*)s.s; *p; p++) {
+        out = hexa_array_push(out, hexa_int((int64_t)*p));
+    }
+    return out;
+}
+
+// ── bt-71: libc / builtin family wrappers ────────────────────────────
+// interpreter.hexa references bare idents like `exit(code)`, `tanh(x)`,
+// `input()`, `is_error(v)`, `read_lines(p)`, `env_var(n)`, `hex(n)`, etc.
+// Codegen used to emit `hexa_call1(exit, hexa_int(0))` which passes the
+// libc function pointer (wrong type) to hexa_call1(HexaVal, HexaVal).
+// We now wrap each in a HexaVal-returning stub so codegen can emit a
+// direct call with correct types.
+#include <unistd.h>
+#include <time.h>
+
+HexaVal hexa_exit(HexaVal code) {
+    int c = (code.tag == TAG_INT) ? (int)code.i
+          : (code.tag == TAG_FLOAT) ? (int)code.f
+          : 0;
+    fflush(stdout); fflush(stderr);
+    exit(c);
+    return hexa_void(); // unreachable
+}
+
+HexaVal hexa_sleep(HexaVal sec) {
+    double s = (sec.tag == TAG_FLOAT) ? sec.f
+             : (sec.tag == TAG_INT)   ? (double)sec.i
+             : 0.0;
+    if (s <= 0.0) return hexa_void();
+    struct timespec ts;
+    ts.tv_sec  = (time_t)s;
+    ts.tv_nsec = (long)((s - (double)ts.tv_sec) * 1e9);
+    nanosleep(&ts, NULL);
+    return hexa_void();
+}
+
+// Math family — accept int or float, return float
+static double _hexa_f(HexaVal v) {
+    if (v.tag == TAG_FLOAT) return v.f;
+    if (v.tag == TAG_INT)   return (double)v.i;
+    if (v.tag == TAG_BOOL)  return v.b ? 1.0 : 0.0;
+    return 0.0;
+}
+
+HexaVal hexa_math_tanh(HexaVal x) { return hexa_float(tanh(_hexa_f(x))); }
+HexaVal hexa_math_sin(HexaVal x)  { return hexa_float(sin(_hexa_f(x))); }
+HexaVal hexa_math_cos(HexaVal x)  { return hexa_float(cos(_hexa_f(x))); }
+HexaVal hexa_math_tan(HexaVal x)  { return hexa_float(tan(_hexa_f(x))); }
+HexaVal hexa_math_asin(HexaVal x) { return hexa_float(asin(_hexa_f(x))); }
+HexaVal hexa_math_acos(HexaVal x) { return hexa_float(acos(_hexa_f(x))); }
+HexaVal hexa_math_atan(HexaVal x) { return hexa_float(atan(_hexa_f(x))); }
+HexaVal hexa_math_atan2(HexaVal y, HexaVal x) { return hexa_float(atan2(_hexa_f(y), _hexa_f(x))); }
+HexaVal hexa_math_log(HexaVal x)  { return hexa_float(log(_hexa_f(x))); }
+HexaVal hexa_math_exp(HexaVal x)  { return hexa_float(exp(_hexa_f(x))); }
+
+HexaVal hexa_input(HexaVal prompt) {
+    if (prompt.tag == TAG_STR && prompt.s && prompt.s[0]) {
+        fputs(prompt.s, stdout);
+        fflush(stdout);
+    }
+    char* buf = NULL;
+    size_t cap = 0;
+    ssize_t n = getline(&buf, &cap, stdin);
+    if (n < 0) {
+        if (buf) free(buf);
+        return hexa_str("");
+    }
+    // strip trailing \n
+    if (n > 0 && buf[n-1] == '\n') buf[n-1] = 0;
+    return hexa_str_own(buf);
+}
+
+HexaVal hexa_is_error(HexaVal v) {
+    // No TAG_ERROR in runtime; interpreter uses ad-hoc Val(TAG_ERROR,...)
+    // convention (TAG_ERROR name not defined in runtime tags). Treat as
+    // "false" here unless TAG_STR and starts with "ERR:" sentinel.
+    if (v.tag == TAG_STR && v.s && strncmp(v.s, "ERR:", 4) == 0) return hexa_bool(1);
+    return hexa_bool(0);
+}
+
+HexaVal hexa_read_lines(HexaVal path) {
+    HexaVal content = hexa_read_file(path);
+    if (content.tag != TAG_STR) return hexa_array_new();
+    HexaVal out = hexa_array_new();
+    const char* p = content.s;
+    const char* start = p;
+    while (*p) {
+        if (*p == '\n') {
+            size_t len = (size_t)(p - start);
+            char* line = (char*)malloc(len + 1);
+            memcpy(line, start, len);
+            line[len] = 0;
+            out = hexa_array_push(out, hexa_str_own(line));
+            start = p + 1;
+        }
+        p++;
+    }
+    if (p > start) {
+        size_t len = (size_t)(p - start);
+        char* line = (char*)malloc(len + 1);
+        memcpy(line, start, len);
+        line[len] = 0;
+        out = hexa_array_push(out, hexa_str_own(line));
+    }
+    return out;
+}
+
+HexaVal hexa_from_char_code(HexaVal n) {
+    int64_t code = (n.tag == TAG_INT) ? n.i : (int64_t)_hexa_f(n);
+    if (code < 0) code = 0;
+    if (code < 0x80) {
+        char* s = (char*)malloc(2); s[0] = (char)code; s[1] = 0;
+        return hexa_str_own(s);
+    }
+    // UTF-8 encode
+    char buf[5] = {0};
+    if (code < 0x800) {
+        buf[0] = (char)(0xC0 | (code >> 6));
+        buf[1] = (char)(0x80 | (code & 0x3F));
+    } else if (code < 0x10000) {
+        buf[0] = (char)(0xE0 | (code >> 12));
+        buf[1] = (char)(0x80 | ((code >> 6) & 0x3F));
+        buf[2] = (char)(0x80 | (code & 0x3F));
+    } else {
+        buf[0] = (char)(0xF0 | (code >> 18));
+        buf[1] = (char)(0x80 | ((code >> 12) & 0x3F));
+        buf[2] = (char)(0x80 | ((code >> 6) & 0x3F));
+        buf[3] = (char)(0x80 | (code & 0x3F));
+    }
+    char* out = strdup(buf);
+    return hexa_str_own(out);
+}
+
+HexaVal hexa_env_var(HexaVal name) {
+    if (name.tag != TAG_STR || !name.s) return hexa_str("");
+    const char* v = getenv(name.s);
+    return hexa_str(v ? v : "");
+}
+
+HexaVal hexa_delete_file(HexaVal path) {
+    if (path.tag != TAG_STR || !path.s) return hexa_void();
+    (void)unlink(path.s);
+    return hexa_void();
+}
+
+HexaVal hexa_append_file(HexaVal path, HexaVal content) {
+    if (path.tag != TAG_STR || !path.s) return hexa_void();
+    const char* data = (content.tag == TAG_STR && content.s) ? content.s : "";
+    FILE* f = fopen(path.s, "ab");
+    if (!f) return hexa_void();
+    fwrite(data, 1, strlen(data), f);
+    fclose(f);
+    return hexa_void();
+}
+
+HexaVal hexa_bin(HexaVal n) {
+    uint64_t v = (n.tag == TAG_INT) ? (uint64_t)n.i : (uint64_t)_hexa_f(n);
+    char buf[65]; int pos = 0;
+    if (v == 0) { buf[pos++] = '0'; }
+    while (v > 0 && pos < 64) { buf[pos++] = (char)('0' + (v & 1)); v >>= 1; }
+    char* out = (char*)malloc(pos + 1);
+    for (int i = 0; i < pos; i++) out[i] = buf[pos - 1 - i];
+    out[pos] = 0;
+    return hexa_str_own(out);
+}
+
+HexaVal hexa_hex(HexaVal n) {
+    uint64_t v = (n.tag == TAG_INT) ? (uint64_t)n.i : (uint64_t)_hexa_f(n);
+    char* out = (char*)malloc(20);
+    snprintf(out, 20, "%llx", (unsigned long long)v);
+    return hexa_str_own(out);
+}
+
+HexaVal hexa_timestamp(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return hexa_int((int64_t)ts.tv_sec);
+}
+
+// Base64 (RFC 4648)
+static const char _b64_enc[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+HexaVal hexa_base64_encode(HexaVal s) {
+    if (s.tag != TAG_STR || !s.s) return hexa_str("");
+    const unsigned char* in = (const unsigned char*)s.s;
+    size_t n = strlen(s.s);
+    size_t olen = 4 * ((n + 2) / 3);
+    char* out = (char*)malloc(olen + 1);
+    size_t i = 0, j = 0;
+    while (i + 3 <= n) {
+        uint32_t t = (in[i] << 16) | (in[i+1] << 8) | in[i+2];
+        out[j++] = _b64_enc[(t >> 18) & 0x3F];
+        out[j++] = _b64_enc[(t >> 12) & 0x3F];
+        out[j++] = _b64_enc[(t >> 6) & 0x3F];
+        out[j++] = _b64_enc[t & 0x3F];
+        i += 3;
+    }
+    if (i < n) {
+        uint32_t t = in[i] << 16;
+        int rem = (int)(n - i);
+        if (rem == 2) t |= in[i+1] << 8;
+        out[j++] = _b64_enc[(t >> 18) & 0x3F];
+        out[j++] = _b64_enc[(t >> 12) & 0x3F];
+        out[j++] = (rem == 2) ? _b64_enc[(t >> 6) & 0x3F] : '=';
+        out[j++] = '=';
+    }
+    out[j] = 0;
+    return hexa_str_own(out);
+}
+
+HexaVal hexa_base64_decode(HexaVal s) {
+    if (s.tag != TAG_STR || !s.s) return hexa_str("");
+    static int dec[256];
+    static int dec_init = 0;
+    if (!dec_init) {
+        for (int i = 0; i < 256; i++) dec[i] = -1;
+        for (int i = 0; i < 64; i++) dec[(unsigned char)_b64_enc[i]] = i;
+        dec_init = 1;
+    }
+    const unsigned char* in = (const unsigned char*)s.s;
+    size_t n = strlen(s.s);
+    char* out = (char*)malloc(n + 1);
+    size_t j = 0;
+    int bits = 0, vbits = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (in[i] == '=') break;
+        int v = dec[in[i]];
+        if (v < 0) continue;
+        bits = (bits << 6) | v;
+        vbits += 6;
+        if (vbits >= 8) {
+            vbits -= 8;
+            out[j++] = (char)((bits >> vbits) & 0xFF);
+        }
+    }
+    out[j] = 0;
+    return hexa_str_own(out);
+}
+
+// ── bt 73: bare-ident HexaVal globals for transpiled builtin dispatch ──
+// Self-host codegen (self/native/hexa_cc.c gen2_expr Call fallback, ~line 5642+)
+// emits `hexa_call0(timestamp)`, `hexa_call1(base64_encode, s)`, … where the
+// callee is a BARE C identifier. For the linker to resolve these, each name
+// must exist as a `HexaVal` variable holding a TAG_FN that wraps the real
+// implementation. bt 71 supplied the hexa_*-prefixed C functions; this block
+// wires them to the bare names the transpiler expects.
+//
+// hexa_call0/hexa_call1 (defined above in this file) already branch on
+// TAG_FN and cast fn_ptr to `HexaVal (*)(…)`, so HexaVal-returning wrappers
+// with matching arity work directly.
+//
+// Wrapper for `timestamp` — hexa_timestamp is declared above without params;
+// expose under the void→HexaVal signature hexa_call0 expects.
+static HexaVal _bt73_timestamp_w(void) { return hexa_timestamp(); }
+static HexaVal _bt73_base64_encode_w(HexaVal s) { return hexa_base64_encode(s); }
+static HexaVal _bt73_base64_decode_w(HexaVal s) { return hexa_base64_decode(s); }
+
+HexaVal timestamp     = {.tag=TAG_FN, .fn={.fn_ptr=(void*)_bt73_timestamp_w,     .arity=0}};
+HexaVal base64_encode = {.tag=TAG_FN, .fn={.fn_ptr=(void*)_bt73_base64_encode_w, .arity=1}};
+HexaVal base64_decode = {.tag=TAG_FN, .fn={.fn_ptr=(void*)_bt73_base64_decode_w, .arity=1}};
+

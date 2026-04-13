@@ -1,6 +1,37 @@
 // HEXA self-hosted compiler — combined native build
 #include "runtime.c"
 
+// ─── bt-53 fix: mangle user-level global identifiers that collide with
+// runtime.c's internal enum values (TAG_INT, TAG_FLOAT, ..., TAG_CLOSURE).
+// User code declares `let TAG_INT = 0` expecting a HexaVal global, but the
+// generated C also includes runtime.c which defines `enum { TAG_INT=0, ... }`.
+// Without mangling, the same symbol is declared as both an enum constant and
+// a HexaVal variable → compile error. We prefix colliding user idents with
+// `u_` so `let TAG_INT = 0` emits `HexaVal u_TAG_INT;` / `u_TAG_INT = hexa_int(0);`
+// and any `Ident("TAG_INT")` reference emits `u_TAG_INT`. Runtime-internal
+// references in hexa_cc.c's own emissions (e.g. `v.tag == TAG_INT` inside
+// emitted C) stay unchanged because those are literal string fragments, not
+// Ident AST nodes.
+static const char* HEXA_RESERVED_RUNTIME_NAMES[] = {
+    "TAG_INT", "TAG_FLOAT", "TAG_BOOL", "TAG_STR", "TAG_VOID",
+    "TAG_ARRAY", "TAG_MAP", "TAG_FN", "TAG_CHAR", "TAG_CLOSURE",
+    NULL
+};
+static int hexa_name_is_reserved(const char* s) {
+    if (!s) return 0;
+    for (int i = 0; HEXA_RESERVED_RUNTIME_NAMES[i]; i++) {
+        if (strcmp(s, HEXA_RESERVED_RUNTIME_NAMES[i]) == 0) return 1;
+    }
+    return 0;
+}
+HexaVal hexa_mangle_ident(HexaVal name) {
+    if (name.tag != TAG_STR || !name.s) return name;
+    if (hexa_name_is_reserved(name.s)) {
+        return hexa_add(hexa_str("u_"), name);
+    }
+    return name;
+}
+
 // === parser + tokenizer ===
 
 HexaVal empty_node(void);
@@ -1131,7 +1162,14 @@ HexaVal parse_comparison(void) {
 
 HexaVal parse_addition(void) {
     HexaVal left = parse_multiplication();
-    while (hexa_truthy(hexa_bool(hexa_truthy(hexa_eq(p_peek_kind(), hexa_str("Plus"))) || hexa_truthy(hexa_eq(p_peek_kind(), hexa_str("Minus")))))) {
+    /* rt-35 fix: accept bitwise &, |, ^ at additive precedence so
+     * `x & y`, `x ^ y`, `x | y` parse as binary expressions. Ambiguity
+     * with lambda `|...|` is avoided because lambdas start *expressions*,
+     * not mid-expression. */
+    while (hexa_truthy(hexa_bool(hexa_truthy(hexa_eq(p_peek_kind(), hexa_str("Plus"))) || hexa_truthy(hexa_eq(p_peek_kind(), hexa_str("Minus")))))
+        || hexa_truthy(hexa_eq(p_peek_kind(), hexa_str("BitAnd")))
+        || hexa_truthy(hexa_eq(p_peek_kind(), hexa_str("BitOr")))
+        || hexa_truthy(hexa_eq(p_peek_kind(), hexa_str("BitXor")))) {
         HexaVal op_tok = p_advance();
         HexaVal right = parse_multiplication();
         left = hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_new(), "kind", hexa_str("BinOp")), "name", hexa_str("")), "value", hexa_str("")), "op", hexa_map_get(op_tok, "value")), "left", left), "right", right), "cond", hexa_str("")), "then_body", hexa_str("")), "else_body", hexa_str("")), "params", hexa_str("")), "body", hexa_str("")), "args", hexa_str("")), "fields", hexa_str("")), "items", hexa_str("")), "variants", hexa_str("")), "arms", hexa_str("")), "iter_expr", hexa_str("")), "ret_type", hexa_str("")), "target", hexa_str("")), "trait_name", hexa_str("")), "methods", hexa_str(""));
@@ -2519,6 +2557,46 @@ HexaVal tokenize(HexaVal source) {
                                             pos = hexa_add(pos, hexa_int(1));
                                             col = hexa_add(col, hexa_int(1));
                                         }
+                                    }
+                                }
+                            }
+                            /* rt-35 fix: scientific notation `1e-10`, `1.0E+5`, `2e8`.
+                             * After optional fractional part, accept e|E, optional +|-, digits.
+                             * Force FloatLit when exponent present. */
+                            if ((pos).i < (total).i) {
+                                HexaVal __ech = hexa_index_get(chars, pos);
+                                if (hexa_truthy(hexa_eq(__ech, hexa_str("e"))) || hexa_truthy(hexa_eq(__ech, hexa_str("E")))) {
+                                    HexaVal __save_pos = pos;
+                                    HexaVal __save_col = col;
+                                    HexaVal __exp_str = hexa_str("e");
+                                    pos = hexa_add(pos, hexa_int(1));
+                                    col = hexa_add(col, hexa_int(1));
+                                    if ((pos).i < (total).i) {
+                                        HexaVal __sch = hexa_index_get(chars, pos);
+                                        if (hexa_truthy(hexa_eq(__sch, hexa_str("+"))) || hexa_truthy(hexa_eq(__sch, hexa_str("-")))) {
+                                            __exp_str = hexa_add(__exp_str, hexa_to_string(__sch));
+                                            pos = hexa_add(pos, hexa_int(1));
+                                            col = hexa_add(col, hexa_int(1));
+                                        }
+                                    }
+                                    int __have_digit = 0;
+                                    while ((pos).i < (total).i) {
+                                        HexaVal __dch = hexa_index_get(chars, pos);
+                                        if ((__dch.tag==TAG_STR && __dch.s && isdigit((unsigned char)__dch.s[0])) || (__dch.tag==TAG_CHAR && isdigit((unsigned char)__dch.i))) {
+                                            __exp_str = hexa_add(__exp_str, hexa_to_string(__dch));
+                                            pos = hexa_add(pos, hexa_int(1));
+                                            col = hexa_add(col, hexa_int(1));
+                                            __have_digit = 1;
+                                        } else {
+                                            break;
+                                        }
+                                    }
+                                    if (__have_digit) {
+                                        num_str = hexa_add(num_str, __exp_str);
+                                        is_float = hexa_bool(1);
+                                    } else {
+                                        pos = __save_pos;
+                                        col = __save_col;
                                     }
                                 }
                             }
@@ -4402,6 +4480,9 @@ HexaVal param_node(HexaVal name, HexaVal typ) {
 HexaVal codegen_c2(HexaVal ast);
 HexaVal gen2_fn_forward(HexaVal node);
 HexaVal gen2_fn_decl(HexaVal node);
+// bt 72: forward decls so gen2_fn_decl can call the hoist helpers
+HexaVal _gen2_collect_lets(HexaVal stmts, HexaVal names);
+HexaVal _gen2_has_decl(HexaVal name);
 HexaVal gen2_extern_ret_kind(HexaVal ret_type);
 HexaVal gen2_ffi_c_type(HexaVal typ);
 HexaVal gen2_ffi_c_ret_type(HexaVal ret_type);
@@ -4441,6 +4522,10 @@ HexaVal _lambda_counter;
 HexaVal _lambda_def_parts;
 HexaVal _known_fn_globals;
 HexaVal _known_nonlocal_names;
+// bt 72: per-function set of C identifiers already declared. Hexa permits
+// `let x = ...` shadow-rebind in the same block; C forbids it. We track
+// declared names here and emit subsequent `let x = ...` as plain assignment.
+HexaVal _gen2_declared_names;
 
 HexaVal codegen_c2(HexaVal ast) {
     HexaVal parts = hexa_array_new();
@@ -4450,6 +4535,7 @@ HexaVal codegen_c2(HexaVal ast) {
     _known_nonlocal_names = hexa_array_new();
     _lambda_counter = hexa_int(0);
     _lambda_def_parts = hexa_array_new();
+    _gen2_declared_names = hexa_array_new();
     HexaVal _gi = hexa_int(0);
     while (hexa_truthy(hexa_bool((_gi).i < (hexa_int(hexa_len(ast))).i))) {
         HexaVal _gk = hexa_map_get(hexa_index_get(ast, _gi), "kind");
@@ -4510,11 +4596,13 @@ HexaVal codegen_c2(HexaVal ast) {
                             if (hexa_truthy(hexa_eq(k, hexa_str("TraitDecl")))) {
                             } else {
                                 if (hexa_truthy(hexa_bool(hexa_truthy(hexa_eq(k, hexa_str("LetMutStmt"))) || hexa_truthy(hexa_eq(k, hexa_str("LetStmt")))))) {
-                                    global_parts = hexa_array_push(global_parts, hexa_add(hexa_add(hexa_str("HexaVal "), hexa_map_get(hexa_index_get(ast, i), "name")), hexa_str(";\n")));
+                                    /* bt-53: mangle reserved runtime names (TAG_INT etc.) */
+                                    HexaVal __user_name = hexa_mangle_ident(hexa_map_get(hexa_index_get(ast, i), "name"));
+                                    global_parts = hexa_array_push(global_parts, hexa_add(hexa_add(hexa_str("HexaVal "), __user_name), hexa_str(";\n")));
                                     if (hexa_truthy(hexa_bool(!hexa_truthy(hexa_eq(hexa_type_of(hexa_map_get(hexa_index_get(ast, i), "left")), hexa_str("string")))))) {
-                                        main_parts = hexa_array_push(main_parts, hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("    "), hexa_map_get(hexa_index_get(ast, i), "name")), hexa_str(" = ")), gen2_expr(hexa_map_get(hexa_index_get(ast, i), "left"))), hexa_str(";\n")));
+                                        main_parts = hexa_array_push(main_parts, hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("    "), __user_name), hexa_str(" = ")), gen2_expr(hexa_map_get(hexa_index_get(ast, i), "left"))), hexa_str(";\n")));
                                     } else {
-                                        main_parts = hexa_array_push(main_parts, hexa_add(hexa_add(hexa_str("    "), hexa_map_get(hexa_index_get(ast, i), "name")), hexa_str(" = hexa_void();\n")));
+                                        main_parts = hexa_array_push(main_parts, hexa_add(hexa_add(hexa_str("    "), __user_name), hexa_str(" = hexa_void();\n")));
                                     }
                                 } else {
                                     main_parts = hexa_array_push(main_parts, gen2_stmt(hexa_index_get(ast, i), hexa_int(1)));
@@ -4568,8 +4656,60 @@ HexaVal gen2_fn_decl(HexaVal node) {
     if (hexa_truthy(hexa_eq(p, hexa_str("")))) {
         p = hexa_str("void");
     }
+    // bt 72: per-function shadow-handling via hoisting.
+    // Pre-scan body to count LetStmt occurrences. Names appearing >1 times
+    // (shadowed across branches/loops) are hoisted to the top of the C fn
+    // as `HexaVal x = hexa_void();` and LetStmt emits as plain assignment.
+    _gen2_declared_names = hexa_array_new();
+    HexaVal _pi = hexa_int(0);
+    while (hexa_truthy(hexa_bool((_pi).i < (hexa_int(hexa_len(hexa_map_get(node, "params")))).i))) {
+        _gen2_declared_names = hexa_array_push(_gen2_declared_names, hexa_map_get(hexa_index_get(hexa_map_get(node, "params"), _pi), "name"));
+        _pi = hexa_add(_pi, hexa_int(1));
+    }
+    // Collect all LetStmt names (with duplicates from multiple branches).
+    HexaVal _all_names = _gen2_collect_lets(hexa_map_get(node, "body"), hexa_array_new());
+    // Count duplicates: names appearing >1 times need hoisting.
+    HexaVal _hoisted = hexa_array_new();
+    HexaVal _hoists = hexa_array_new();
+    HexaVal _ii = hexa_int(0);
+    HexaVal _nn = hexa_int(hexa_len(_all_names));
+    while (hexa_truthy(hexa_bool((_ii).i < (_nn).i))) {
+        HexaVal _nm = hexa_index_get(_all_names, _ii);
+        // Skip if already hoisted or if the name is a parameter (already in
+        // _gen2_declared_names via the param seeding above).
+        HexaVal _already = _gen2_has_decl(_nm);
+        HexaVal _jj = hexa_int(0);
+        while (hexa_truthy(hexa_bool((_jj).i < (hexa_int(hexa_len(_hoisted))).i))) {
+            if (hexa_truthy(hexa_eq(hexa_index_get(_hoisted, _jj), _nm))) {
+                _already = hexa_bool(1);
+            }
+            _jj = hexa_add(_jj, hexa_int(1));
+        }
+        if (hexa_truthy(hexa_bool(!hexa_truthy(_already)))) {
+            // Count remaining occurrences.
+            HexaVal _cnt = hexa_int(0);
+            HexaVal _kk = hexa_int(0);
+            while (hexa_truthy(hexa_bool((_kk).i < (_nn).i))) {
+                if (hexa_truthy(hexa_eq(hexa_index_get(_all_names, _kk), _nm))) {
+                    _cnt = hexa_add(_cnt, hexa_int(1));
+                }
+                _kk = hexa_add(_kk, hexa_int(1));
+            }
+            if (hexa_truthy(hexa_bool((_cnt).i > (hexa_int(1)).i))) {
+                _hoisted = hexa_array_push(_hoisted, _nm);
+                _gen2_declared_names = hexa_array_push(_gen2_declared_names, _nm);
+                _hoists = hexa_array_push(_hoists, hexa_add(hexa_add(hexa_str("    HexaVal "), _nm), hexa_str(" = hexa_void();\n")));
+            }
+        }
+        _ii = hexa_add(_ii, hexa_int(1));
+    }
     HexaVal chunks = hexa_array_new();
     chunks = hexa_array_push(chunks, hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("HexaVal "), hexa_map_get(node, "name")), hexa_str("(")), p), hexa_str(") {\n")));
+    HexaVal _hj = hexa_int(0);
+    while (hexa_truthy(hexa_bool((_hj).i < (hexa_int(hexa_len(_hoists))).i))) {
+        chunks = hexa_array_push(chunks, hexa_index_get(_hoists, _hj));
+        _hj = hexa_add(_hj, hexa_int(1));
+    }
     HexaVal bi = hexa_int(0);
     while (hexa_truthy(hexa_bool((bi).i < (hexa_int(hexa_len(hexa_map_get(node, "body")))).i))) {
         chunks = hexa_array_push(chunks, gen2_stmt(hexa_index_get(hexa_map_get(node, "body"), bi), hexa_int(1)));
@@ -4872,6 +5012,80 @@ HexaVal gen2_indent(HexaVal n) {
     return hexa_void();
 }
 
+// bt 72: return truthy if name hoisted (declared at fn top) for this function.
+HexaVal _gen2_has_decl(HexaVal name) {
+    HexaVal n = hexa_int(hexa_len(_gen2_declared_names));
+    HexaVal i = hexa_int(0);
+    while (hexa_truthy(hexa_bool((i).i < (n).i))) {
+        if (hexa_truthy(hexa_eq(hexa_index_get(_gen2_declared_names, i), name))) {
+            return hexa_bool(1);
+        }
+        i = hexa_add(i, hexa_int(1));
+    }
+    return hexa_bool(0);
+}
+
+// bt 72: recursively collect LetStmt names into a flat array (with duplicates)
+// from a statement list, including nested if/while/for/match bodies.
+HexaVal _gen2_collect_lets(HexaVal stmts, HexaVal names);
+HexaVal _gen2_collect_lets_stmt(HexaVal node, HexaVal names) {
+    if (hexa_truthy(hexa_eq(hexa_type_of(node), hexa_str("string")))) {
+        return names;
+    }
+    HexaVal sk = hexa_map_get(node, "kind");
+    if (hexa_truthy(hexa_bool(hexa_truthy(hexa_eq(sk, hexa_str("LetStmt"))) || hexa_truthy(hexa_eq(sk, hexa_str("LetMutStmt")))))) {
+        names = hexa_array_push(names, hexa_map_get(node, "name"));
+    }
+    HexaVal tb = hexa_map_get(node, "then_body");
+    if (hexa_truthy(hexa_bool(!hexa_truthy(hexa_eq(hexa_type_of(tb), hexa_str("string")))))) {
+        names = _gen2_collect_lets(tb, names);
+    }
+    HexaVal eb = hexa_map_get(node, "else_body");
+    if (hexa_truthy(hexa_bool(!hexa_truthy(hexa_eq(hexa_type_of(eb), hexa_str("string")))))) {
+        names = _gen2_collect_lets(eb, names);
+    }
+    HexaVal bd = hexa_map_get(node, "body");
+    if (hexa_truthy(hexa_bool(!hexa_truthy(hexa_eq(hexa_type_of(bd), hexa_str("string")))))) {
+        names = _gen2_collect_lets(bd, names);
+    }
+    HexaVal arms = hexa_map_get(node, "arms");
+    if (hexa_truthy(hexa_bool(!hexa_truthy(hexa_eq(hexa_type_of(arms), hexa_str("string")))))) {
+        HexaVal ai = hexa_int(0);
+        while (hexa_truthy(hexa_bool((ai).i < (hexa_int(hexa_len(arms))).i))) {
+            HexaVal arm = hexa_index_get(arms, ai);
+            if (hexa_truthy(hexa_bool(!hexa_truthy(hexa_eq(hexa_type_of(arm), hexa_str("string")))))) {
+                HexaVal ab = hexa_map_get(arm, "body");
+                if (hexa_truthy(hexa_bool(!hexa_truthy(hexa_eq(hexa_type_of(ab), hexa_str("string")))))) {
+                    names = _gen2_collect_lets(ab, names);
+                }
+            }
+            ai = hexa_add(ai, hexa_int(1));
+        }
+    }
+    // bt 72: for ExprStmt-wrapped IfExpr/MatchExpr used as a statement, the
+    // if body lives on node.left — recurse only when kind is ExprStmt to
+    // avoid walking general expression trees (which can loop/explode).
+    if (hexa_truthy(hexa_eq(sk, hexa_str("ExprStmt")))) {
+        HexaVal lf = hexa_map_get(node, "left");
+        if (hexa_truthy(hexa_bool(!hexa_truthy(hexa_eq(hexa_type_of(lf), hexa_str("string")))))) {
+            names = _gen2_collect_lets_stmt(lf, names);
+        }
+    }
+    return names;
+}
+HexaVal _gen2_collect_lets(HexaVal stmts, HexaVal names) {
+    if (hexa_truthy(hexa_eq(hexa_type_of(stmts), hexa_str("string")))) {
+        return names;
+    }
+    HexaVal i = hexa_int(0);
+    HexaVal n = hexa_int(hexa_len(stmts));
+    while (hexa_truthy(hexa_bool((i).i < (n).i))) {
+        names = _gen2_collect_lets_stmt(hexa_index_get(stmts, i), names);
+        i = hexa_add(i, hexa_int(1));
+    }
+    return names;
+}
+
 
 HexaVal gen2_stmt(HexaVal node, HexaVal depth) {
     HexaVal pad = gen2_indent(depth);
@@ -4881,7 +5095,13 @@ HexaVal gen2_stmt(HexaVal node, HexaVal depth) {
         if (hexa_truthy(hexa_bool(!hexa_truthy(hexa_eq(hexa_type_of(hexa_map_get(node, "left")), hexa_str("string")))))) {
             init = gen2_expr(hexa_map_get(node, "left"));
         }
-        return hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(pad, hexa_str("HexaVal ")), hexa_map_get(node, "name")), hexa_str(" = ")), init), hexa_str(";\n"));
+        HexaVal _ln = hexa_map_get(node, "name");
+        // bt 72: if this name was hoisted to function top, emit plain assignment
+        // (avoids C "redefinition" errors from Hexa's let-shadow semantics).
+        if (hexa_truthy(_gen2_has_decl(_ln))) {
+            return hexa_add(hexa_add(hexa_add(hexa_add(pad, _ln), hexa_str(" = ")), init), hexa_str(";\n"));
+        }
+        return hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(pad, hexa_str("HexaVal ")), _ln), hexa_str(" = ")), init), hexa_str(";\n"));
     }
     if (hexa_truthy(hexa_eq(k, hexa_str("ConstStmt")))) {
         return hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(pad, hexa_str("HexaVal ")), hexa_map_get(node, "name")), hexa_str(" = ")), gen2_expr(hexa_map_get(node, "left"))), hexa_str(";\n"));
@@ -5134,6 +5354,45 @@ HexaVal gen2_method_builtin(HexaVal obj_expr, HexaVal method, HexaVal args) {
     if (hexa_truthy(hexa_eq(method, hexa_str("sort")))) {
         return hexa_add(hexa_add(hexa_str("hexa_array_sort("), obj_expr), hexa_str(")"));
     }
+    if (hexa_truthy(hexa_eq(method, hexa_str("parse_int")))) {
+        return hexa_add(hexa_add(hexa_str("hexa_str_parse_int("), obj_expr), hexa_str(")"));
+    }
+    if (hexa_truthy(hexa_eq(method, hexa_str("parse_float")))) {
+        return hexa_add(hexa_add(hexa_str("hexa_str_parse_float("), obj_expr), hexa_str(")"));
+    }
+    if (hexa_truthy(hexa_eq(method, hexa_str("trim_start")))) {
+        return hexa_add(hexa_add(hexa_str("hexa_str_trim_start("), obj_expr), hexa_str(")"));
+    }
+    if (hexa_truthy(hexa_eq(method, hexa_str("trim_end")))) {
+        return hexa_add(hexa_add(hexa_str("hexa_str_trim_end("), obj_expr), hexa_str(")"));
+    }
+    if (hexa_truthy(hexa_eq(method, hexa_str("bytes")))) {
+        return hexa_add(hexa_add(hexa_str("hexa_str_bytes("), obj_expr), hexa_str(")"));
+    }
+    if (hexa_truthy(hexa_eq(method, hexa_str("pad_left")))) {
+        return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_pad_left("), obj_expr), hexa_str(", ")), gen2_expr(hexa_index_get(args, hexa_int(0)))), hexa_str(")"));
+    }
+    if (hexa_truthy(hexa_eq(method, hexa_str("pad_right")))) {
+        return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_pad_right("), obj_expr), hexa_str(", ")), gen2_expr(hexa_index_get(args, hexa_int(0)))), hexa_str(")"));
+    }
+    if (hexa_truthy(hexa_eq(method, hexa_str("to_string")))) {
+        return hexa_add(hexa_add(hexa_str("hexa_to_string("), obj_expr), hexa_str(")"));
+    }
+    if (hexa_truthy(hexa_eq(method, hexa_str("slice")))) {
+        if (hexa_truthy(hexa_bool((hexa_int(hexa_len(args))).i >= (hexa_int(2)).i))) {
+            return hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_array_slice("), obj_expr), hexa_str(", ")), gen2_expr(hexa_index_get(args, hexa_int(0)))), hexa_str(", ")), gen2_expr(hexa_index_get(args, hexa_int(1)))), hexa_str(")"));
+        }
+        return hexa_add(hexa_add(hexa_add(hexa_str("hexa_array_slice("), obj_expr), hexa_str(", ")), hexa_add(gen2_expr(hexa_index_get(args, hexa_int(0))), hexa_str(", hexa_int(0x7fffffff))")));
+    }
+    if (hexa_truthy(hexa_eq(method, hexa_str("map")))) {
+        return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_array_map("), obj_expr), hexa_str(", ")), gen2_expr(hexa_index_get(args, hexa_int(0)))), hexa_str(")"));
+    }
+    if (hexa_truthy(hexa_eq(method, hexa_str("filter")))) {
+        return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_array_filter("), obj_expr), hexa_str(", ")), gen2_expr(hexa_index_get(args, hexa_int(0)))), hexa_str(")"));
+    }
+    if (hexa_truthy(hexa_eq(method, hexa_str("fold")))) {
+        return hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_array_fold("), obj_expr), hexa_str(", ")), gen2_expr(hexa_index_get(args, hexa_int(0)))), hexa_str(", ")), gen2_expr(hexa_index_get(args, hexa_int(1)))), hexa_str(")"));
+    }
     return hexa_add(hexa_add(hexa_str("hexa_void() /* unknown method."), method), hexa_str(" */"));
     return hexa_void();
 }
@@ -5160,7 +5419,9 @@ HexaVal gen2_expr(HexaVal node) {
         return hexa_add(hexa_add(hexa_str("hexa_str(\""), c_escape(hexa_map_get(node, "value"))), hexa_str("\")"));
     }
     if (hexa_truthy(hexa_eq(k, hexa_str("Ident")))) {
-        return hexa_map_get(node, "name");
+        /* bt-53: mangle reserved runtime names (TAG_INT etc.) so references
+         * match the mangled global declarations emitted at LetStmt sites. */
+        return hexa_mangle_ident(hexa_map_get(node, "name"));
     }
     if (hexa_truthy(hexa_eq(k, hexa_str("BinOp")))) {
         HexaVal l = gen2_expr(hexa_map_get(node, "left"));
@@ -5208,6 +5469,27 @@ HexaVal gen2_expr(HexaVal node) {
         if (hexa_truthy(hexa_eq(op, hexa_str("??")))) {
             return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_null_coal("), l), hexa_str(", ")), r), hexa_str(")"));
         }
+        // bt-68 fix: bitwise binops — parser already emits BitAnd/BitOr/BitXor
+        // tokens with op values "&" / "|" / "^" (see parse_addition rt-35 patch).
+        // Previously the codegen fell through to the placeholder comment,
+        // producing empty C expressions (fatal syntax errors). Emit direct .i
+        // bitwise ops; shifts `<<` / `>>` are future-proofed (parser lacks
+        // shift tokens today but adding here is harmless).
+        if (hexa_truthy(hexa_eq(op, hexa_str("&")))) {
+            return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_int(("), l), hexa_str(").i & (")), r), hexa_str(").i)"));
+        }
+        if (hexa_truthy(hexa_eq(op, hexa_str("|")))) {
+            return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_int(("), l), hexa_str(").i | (")), r), hexa_str(").i)"));
+        }
+        if (hexa_truthy(hexa_eq(op, hexa_str("^")))) {
+            return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_int(("), l), hexa_str(").i ^ (")), r), hexa_str(").i)"));
+        }
+        if (hexa_truthy(hexa_eq(op, hexa_str("<<")))) {
+            return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_int(("), l), hexa_str(").i << (")), r), hexa_str(").i)"));
+        }
+        if (hexa_truthy(hexa_eq(op, hexa_str(">>")))) {
+            return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_int(("), l), hexa_str(").i >> (")), r), hexa_str(").i)"));
+        }
         return hexa_add(hexa_add(hexa_str("/* binop "), op), hexa_str(" */"));
     }
     if (hexa_truthy(hexa_eq(k, hexa_str("UnaryOp")))) {
@@ -5217,7 +5499,10 @@ HexaVal gen2_expr(HexaVal node) {
         if (hexa_truthy(hexa_eq(hexa_map_get(node, "op"), hexa_str("!")))) {
             return hexa_add(hexa_add(hexa_str("hexa_bool(!hexa_truthy("), gen2_expr(hexa_map_get(node, "left"))), hexa_str("))"));
         }
-        return hexa_str("/* unary */");
+        if (hexa_truthy(hexa_eq(hexa_map_get(node, "op"), hexa_str("~")))) {
+            return hexa_add(hexa_add(hexa_str("hexa_int(~("), gen2_expr(hexa_map_get(node, "left"))), hexa_str(").i)"));
+        }
+        return hexa_add(hexa_add(hexa_str("/* unary "), hexa_map_get(node, "op")), hexa_str(" */"));
     }
     if (hexa_truthy(hexa_eq(k, hexa_str("Field")))) {
         HexaVal obj = gen2_expr(hexa_map_get(node, "left"));
@@ -5461,6 +5746,119 @@ HexaVal gen2_expr(HexaVal node) {
             if (hexa_truthy(hexa_eq(name, hexa_str("struct_free")))) {
                 return hexa_add(hexa_add(hexa_str("hexa_struct_free("), gen2_expr(hexa_index_get(hexa_map_get(node, "args"), hexa_int(0)))), hexa_str(")"));
             }
+            // ─── bt-66 fix: free-fn call of a builtin method name ──────────────────
+            // source:  contains(attrs, "memoize")   (bare ident, not a.method form)
+            // previous codegen emitted:  hexa_call2(contains, attrs, ...)
+            // which references `contains` as a C symbol — undefined → link fail.
+            // If `name` is a known string-method builtin and not a user global,
+            // rewrite to the receiver-first builtin dispatch (args[0] = receiver).
+            if (hexa_truthy(hexa_bool(!hexa_truthy(_is_known_fn_global(name))))) {
+                HexaVal nargs_mr = hexa_int(hexa_len(hexa_map_get(node, "args")));
+                if (hexa_truthy(hexa_bool((nargs_mr).i >= (hexa_int(2)).i))) {
+                    HexaVal recv_mr = gen2_expr(hexa_index_get(hexa_map_get(node, "args"), hexa_int(0)));
+                    HexaVal arg1_mr = gen2_expr(hexa_index_get(hexa_map_get(node, "args"), hexa_int(1)));
+                    if (hexa_truthy(hexa_eq(name, hexa_str("contains")))) {
+                        return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_bool(hexa_str_contains("), recv_mr), hexa_str(", ")), arg1_mr), hexa_str("))"));
+                    }
+                    if (hexa_truthy(hexa_eq(name, hexa_str("starts_with")))) {
+                        return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_bool(hexa_str_starts_with("), recv_mr), hexa_str(", ")), arg1_mr), hexa_str("))"));
+                    }
+                    if (hexa_truthy(hexa_eq(name, hexa_str("ends_with")))) {
+                        return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_bool(hexa_str_ends_with("), recv_mr), hexa_str(", ")), arg1_mr), hexa_str("))"));
+                    }
+                }
+            }
+            // ─── bt-71 fix: libc / builtin family dispatch ─────────────────────────
+            if (hexa_truthy(hexa_bool(!hexa_truthy(_is_known_fn_global(name))))) {
+                HexaVal n71 = hexa_int(hexa_len(hexa_map_get(node, "args")));
+                if (hexa_truthy(hexa_eq(n71, hexa_int(0)))) {
+                    if (hexa_truthy(hexa_eq(name, hexa_str("timestamp")))) {
+                        return hexa_str("hexa_timestamp()");
+                    }
+                    if (hexa_truthy(hexa_eq(name, hexa_str("input")))) {
+                        return hexa_str("hexa_input(hexa_str(\"\"))");
+                    }
+                    if (hexa_truthy(hexa_eq(name, hexa_str("random")))) {
+                        return hexa_str("hexa_random()");
+                    }
+                }
+                if (hexa_truthy(hexa_eq(n71, hexa_int(1)))) {
+                    HexaVal a0 = gen2_expr(hexa_index_get(hexa_map_get(node, "args"), hexa_int(0)));
+                    if (hexa_truthy(hexa_eq(name, hexa_str("exit")))) {
+                        return hexa_add(hexa_add(hexa_str("hexa_exit("), a0), hexa_str(")"));
+                    }
+                    if (hexa_truthy(hexa_eq(name, hexa_str("sleep")))) {
+                        return hexa_add(hexa_add(hexa_str("hexa_sleep("), a0), hexa_str(")"));
+                    }
+                    if (hexa_truthy(hexa_eq(name, hexa_str("tanh")))) {
+                        return hexa_add(hexa_add(hexa_str("hexa_math_tanh("), a0), hexa_str(")"));
+                    }
+                    if (hexa_truthy(hexa_eq(name, hexa_str("sin")))) {
+                        return hexa_add(hexa_add(hexa_str("hexa_math_sin("), a0), hexa_str(")"));
+                    }
+                    if (hexa_truthy(hexa_eq(name, hexa_str("cos")))) {
+                        return hexa_add(hexa_add(hexa_str("hexa_math_cos("), a0), hexa_str(")"));
+                    }
+                    if (hexa_truthy(hexa_eq(name, hexa_str("tan")))) {
+                        return hexa_add(hexa_add(hexa_str("hexa_math_tan("), a0), hexa_str(")"));
+                    }
+                    if (hexa_truthy(hexa_eq(name, hexa_str("asin")))) {
+                        return hexa_add(hexa_add(hexa_str("hexa_math_asin("), a0), hexa_str(")"));
+                    }
+                    if (hexa_truthy(hexa_eq(name, hexa_str("acos")))) {
+                        return hexa_add(hexa_add(hexa_str("hexa_math_acos("), a0), hexa_str(")"));
+                    }
+                    if (hexa_truthy(hexa_eq(name, hexa_str("atan")))) {
+                        return hexa_add(hexa_add(hexa_str("hexa_math_atan("), a0), hexa_str(")"));
+                    }
+                    if (hexa_truthy(hexa_eq(name, hexa_str("log")))) {
+                        return hexa_add(hexa_add(hexa_str("hexa_math_log("), a0), hexa_str(")"));
+                    }
+                    if (hexa_truthy(hexa_eq(name, hexa_str("exp")))) {
+                        return hexa_add(hexa_add(hexa_str("hexa_math_exp("), a0), hexa_str(")"));
+                    }
+                    if (hexa_truthy(hexa_eq(name, hexa_str("input")))) {
+                        return hexa_add(hexa_add(hexa_str("hexa_input("), a0), hexa_str(")"));
+                    }
+                    if (hexa_truthy(hexa_eq(name, hexa_str("is_error")))) {
+                        return hexa_add(hexa_add(hexa_str("hexa_is_error("), a0), hexa_str(")"));
+                    }
+                    if (hexa_truthy(hexa_eq(name, hexa_str("read_lines")))) {
+                        return hexa_add(hexa_add(hexa_str("hexa_read_lines("), a0), hexa_str(")"));
+                    }
+                    if (hexa_truthy(hexa_eq(name, hexa_str("from_char_code")))) {
+                        return hexa_add(hexa_add(hexa_str("hexa_from_char_code("), a0), hexa_str(")"));
+                    }
+                    if (hexa_truthy(hexa_eq(name, hexa_str("env_var")))) {
+                        return hexa_add(hexa_add(hexa_str("hexa_env_var("), a0), hexa_str(")"));
+                    }
+                    if (hexa_truthy(hexa_eq(name, hexa_str("delete_file")))) {
+                        return hexa_add(hexa_add(hexa_str("hexa_delete_file("), a0), hexa_str(")"));
+                    }
+                    if (hexa_truthy(hexa_eq(name, hexa_str("bin")))) {
+                        return hexa_add(hexa_add(hexa_str("hexa_bin("), a0), hexa_str(")"));
+                    }
+                    if (hexa_truthy(hexa_eq(name, hexa_str("hex")))) {
+                        return hexa_add(hexa_add(hexa_str("hexa_hex("), a0), hexa_str(")"));
+                    }
+                    if (hexa_truthy(hexa_eq(name, hexa_str("base64_encode")))) {
+                        return hexa_add(hexa_add(hexa_str("hexa_base64_encode("), a0), hexa_str(")"));
+                    }
+                    if (hexa_truthy(hexa_eq(name, hexa_str("base64_decode")))) {
+                        return hexa_add(hexa_add(hexa_str("hexa_base64_decode("), a0), hexa_str(")"));
+                    }
+                }
+                if (hexa_truthy(hexa_eq(n71, hexa_int(2)))) {
+                    HexaVal b0 = gen2_expr(hexa_index_get(hexa_map_get(node, "args"), hexa_int(0)));
+                    HexaVal b1 = gen2_expr(hexa_index_get(hexa_map_get(node, "args"), hexa_int(1)));
+                    if (hexa_truthy(hexa_eq(name, hexa_str("append_file")))) {
+                        return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_append_file("), b0), hexa_str(", ")), b1), hexa_str(")"));
+                    }
+                    if (hexa_truthy(hexa_eq(name, hexa_str("atan2")))) {
+                        return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_math_atan2("), b0), hexa_str(", ")), b1), hexa_str(")"));
+                    }
+                }
+            }
             HexaVal arg_strs = hexa_array_new();
             HexaVal ai = hexa_int(0);
             while (hexa_truthy(hexa_bool((ai).i < (hexa_int(hexa_len(hexa_map_get(node, "args")))).i))) {
@@ -5578,6 +5976,45 @@ HexaVal gen2_expr(HexaVal node) {
             }
             if (hexa_truthy(hexa_eq(method, hexa_str("sort")))) {
                 return hexa_add(hexa_add(hexa_str("hexa_array_sort("), obj), hexa_str(")"));
+            }
+            if (hexa_truthy(hexa_eq(method, hexa_str("parse_int")))) {
+                return hexa_add(hexa_add(hexa_str("hexa_str_parse_int("), obj), hexa_str(")"));
+            }
+            if (hexa_truthy(hexa_eq(method, hexa_str("parse_float")))) {
+                return hexa_add(hexa_add(hexa_str("hexa_str_parse_float("), obj), hexa_str(")"));
+            }
+            if (hexa_truthy(hexa_eq(method, hexa_str("trim_start")))) {
+                return hexa_add(hexa_add(hexa_str("hexa_str_trim_start("), obj), hexa_str(")"));
+            }
+            if (hexa_truthy(hexa_eq(method, hexa_str("trim_end")))) {
+                return hexa_add(hexa_add(hexa_str("hexa_str_trim_end("), obj), hexa_str(")"));
+            }
+            if (hexa_truthy(hexa_eq(method, hexa_str("bytes")))) {
+                return hexa_add(hexa_add(hexa_str("hexa_str_bytes("), obj), hexa_str(")"));
+            }
+            if (hexa_truthy(hexa_eq(method, hexa_str("pad_left")))) {
+                return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_pad_left("), obj), hexa_str(", ")), gen2_expr(hexa_index_get(hexa_map_get(node, "args"), hexa_int(0)))), hexa_str(")"));
+            }
+            if (hexa_truthy(hexa_eq(method, hexa_str("pad_right")))) {
+                return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_pad_right("), obj), hexa_str(", ")), gen2_expr(hexa_index_get(hexa_map_get(node, "args"), hexa_int(0)))), hexa_str(")"));
+            }
+            if (hexa_truthy(hexa_eq(method, hexa_str("to_string")))) {
+                return hexa_add(hexa_add(hexa_str("hexa_to_string("), obj), hexa_str(")"));
+            }
+            if (hexa_truthy(hexa_eq(method, hexa_str("slice")))) {
+                if (hexa_truthy(hexa_bool((hexa_int(hexa_len(hexa_map_get(node, "args")))).i >= (hexa_int(2)).i))) {
+                    return hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_array_slice("), obj), hexa_str(", ")), gen2_expr(hexa_index_get(hexa_map_get(node, "args"), hexa_int(0)))), hexa_str(", ")), gen2_expr(hexa_index_get(hexa_map_get(node, "args"), hexa_int(1)))), hexa_str(")"));
+                }
+                return hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_array_slice("), obj), hexa_str(", ")), gen2_expr(hexa_index_get(hexa_map_get(node, "args"), hexa_int(0)))), hexa_str(", hexa_int(0x7fffffff))")), hexa_str(""));
+            }
+            if (hexa_truthy(hexa_eq(method, hexa_str("map")))) {
+                return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_array_map("), obj), hexa_str(", ")), gen2_expr(hexa_index_get(hexa_map_get(node, "args"), hexa_int(0)))), hexa_str(")"));
+            }
+            if (hexa_truthy(hexa_eq(method, hexa_str("filter")))) {
+                return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_array_filter("), obj), hexa_str(", ")), gen2_expr(hexa_index_get(hexa_map_get(node, "args"), hexa_int(0)))), hexa_str(")"));
+            }
+            if (hexa_truthy(hexa_eq(method, hexa_str("fold")))) {
+                return hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_array_fold("), obj), hexa_str(", ")), gen2_expr(hexa_index_get(hexa_map_get(node, "args"), hexa_int(0)))), hexa_str(", ")), gen2_expr(hexa_index_get(hexa_map_get(node, "args"), hexa_int(1)))), hexa_str(")"));
             }
             return hexa_add(hexa_add(hexa_str("/* method."), method), hexa_str(" */"));
         }
@@ -6229,6 +6666,7 @@ HexaVal codegen_c2_full(HexaVal ast) {
     _method_registry = hexa_array_new();
     _known_fn_globals = hexa_array_new();
     _known_nonlocal_names = hexa_array_new();
+    _gen2_declared_names = hexa_array_new();
     HexaVal gi = hexa_int(0);
     while (hexa_truthy(hexa_bool((gi).i < (hexa_int(hexa_len(ast))).i))) {
         HexaVal gk = hexa_map_get(hexa_index_get(ast, gi), "kind");
@@ -6287,11 +6725,13 @@ HexaVal codegen_c2_full(HexaVal ast) {
                             if (hexa_truthy(hexa_eq(k, hexa_str("TraitDecl")))) {
                             } else {
                                 if (hexa_truthy(hexa_bool(hexa_truthy(hexa_eq(k, hexa_str("LetMutStmt"))) || hexa_truthy(hexa_eq(k, hexa_str("LetStmt")))))) {
-                                    global_parts = hexa_array_push(global_parts, hexa_add(hexa_add(hexa_str("HexaVal "), hexa_map_get(hexa_index_get(ast, i), "name")), hexa_str(";\n")));
+                                    /* bt-53: mangle reserved runtime names (TAG_INT etc.) */
+                                    HexaVal __user_name = hexa_mangle_ident(hexa_map_get(hexa_index_get(ast, i), "name"));
+                                    global_parts = hexa_array_push(global_parts, hexa_add(hexa_add(hexa_str("HexaVal "), __user_name), hexa_str(";\n")));
                                     if (hexa_truthy(hexa_bool(!hexa_truthy(hexa_eq(hexa_type_of(hexa_map_get(hexa_index_get(ast, i), "left")), hexa_str("string")))))) {
-                                        main_parts = hexa_array_push(main_parts, hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("    "), hexa_map_get(hexa_index_get(ast, i), "name")), hexa_str(" = ")), gen2_expr(hexa_map_get(hexa_index_get(ast, i), "left"))), hexa_str(";\n")));
+                                        main_parts = hexa_array_push(main_parts, hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("    "), __user_name), hexa_str(" = ")), gen2_expr(hexa_map_get(hexa_index_get(ast, i), "left"))), hexa_str(";\n")));
                                     } else {
-                                        main_parts = hexa_array_push(main_parts, hexa_add(hexa_add(hexa_str("    "), hexa_map_get(hexa_index_get(ast, i), "name")), hexa_str(" = hexa_void();\n")));
+                                        main_parts = hexa_array_push(main_parts, hexa_add(hexa_add(hexa_str("    "), __user_name), hexa_str(" = hexa_void();\n")));
                                     }
                                 } else {
                                     main_parts = hexa_array_push(main_parts, gen2_stmt(hexa_index_get(ast, i), hexa_int(1)));

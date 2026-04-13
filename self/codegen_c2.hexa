@@ -248,6 +248,42 @@ fn gen2_fn_decl(node) {
         }
         if _sa_cur == "stack_alloc" { has_stack_alloc = true }
     }
+    // bt 72: per-function shadow handling via hoisting. Seed declared-names
+    // with params so `let x` where x is a param emits as assignment.
+    _gen2_declared_names = []
+    let mut _pi = 0
+    while _pi < len(node.params) {
+        _gen2_declared_names = _gen2_declared_names.push(node.params[_pi].name)
+        _pi = _pi + 1
+    }
+    // Collect all LetStmt names (with duplicates).
+    let all_names = _gen2_collect_lets(node.body, [])
+    let mut _hoisted = []
+    let mut hoists = []
+    let mut ii = 0
+    while ii < len(all_names) {
+        let nm = all_names[ii]
+        let mut already = _gen2_has_decl(nm)
+        let mut jj = 0
+        while jj < len(_hoisted) {
+            if _hoisted[jj] == nm { already = true }
+            jj = jj + 1
+        }
+        if !already {
+            let mut cnt = 0
+            let mut kk = 0
+            while kk < len(all_names) {
+                if all_names[kk] == nm { cnt = cnt + 1 }
+                kk = kk + 1
+            }
+            if cnt > 1 {
+                _hoisted = _hoisted.push(nm)
+                _gen2_declared_names = _gen2_declared_names.push(nm)
+                hoists = hoists.push("    HexaVal " + nm + " = hexa_void();\n")
+            }
+        }
+        ii = ii + 1
+    }
     let mut chunks = []
     if has_flatten {
         // @flatten (SROA): emit comment marking struct decomposition intent
@@ -261,6 +297,12 @@ fn gen2_fn_decl(node) {
     let mut prefix = ""
     if gen2_has_inline_always(node) { prefix = "static inline " }
     chunks = chunks.push(prefix + "HexaVal " + node.name + "(" + p + ") {\n")
+    // bt 72: emit hoisted declarations at fn top
+    let mut hj = 0
+    while hj < len(hoists) {
+        chunks = chunks.push(hoists[hj])
+        hj = hj + 1
+    }
     if has_stack_alloc {
         chunks = chunks.push("    /* @stack_alloc: bounded arrays use alloca */\n")
     }
@@ -597,6 +639,58 @@ fn gen2_indent(n) {
     return parts.join("")
 }
 
+// bt 72: per-function set of C identifiers already declared. Hexa permits
+// `let x = ...` shadow-rebind in the same block; C forbids it. gen2_fn_decl
+// pre-scans the body and hoists any name declared >1 times to the function
+// top as `HexaVal x = hexa_void();`, then LetStmt emits as plain assignment.
+_gen2_declared_names = []
+
+fn _gen2_has_decl(name) {
+    let n = len(_gen2_declared_names)
+    let mut i = 0
+    while i < n {
+        if _gen2_declared_names[i] == name { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _gen2_collect_lets_stmt(node, names) {
+    if type_of(node) == "string" { return names }
+    let sk = node.kind
+    if sk == "LetStmt" || sk == "LetMutStmt" {
+        names = names.push(node.name)
+    }
+    if type_of(node.then_body) != "string" { names = _gen2_collect_lets(node.then_body, names) }
+    if type_of(node.else_body) != "string" { names = _gen2_collect_lets(node.else_body, names) }
+    if type_of(node.body) != "string" { names = _gen2_collect_lets(node.body, names) }
+    if type_of(node.arms) != "string" {
+        let mut ai = 0
+        while ai < len(node.arms) {
+            let arm = node.arms[ai]
+            if type_of(arm) != "string" && type_of(arm.body) != "string" {
+                names = _gen2_collect_lets(arm.body, names)
+            }
+            ai = ai + 1
+        }
+    }
+    // ExprStmt-wrapped IfExpr/MatchExpr used as a statement
+    if sk == "ExprStmt" && type_of(node.left) != "string" {
+        names = _gen2_collect_lets_stmt(node.left, names)
+    }
+    return names
+}
+
+fn _gen2_collect_lets(stmts, names) {
+    if type_of(stmts) == "string" { return names }
+    let mut i = 0
+    while i < len(stmts) {
+        names = _gen2_collect_lets_stmt(stmts[i], names)
+        i = i + 1
+    }
+    return names
+}
+
 fn gen2_stmt(node, depth) {
     let pad = gen2_indent(depth)
     let k = node.kind
@@ -609,6 +703,11 @@ fn gen2_stmt(node, depth) {
         // M975: register promotion — if value == "__reg_promote__", emit `register`
         if k == "LetMutStmt" && node.value == "__reg_promote__" {
             return pad + "register HexaVal " + node.name + " = " + init + "; /* reg-promoted */\n"
+        }
+        // bt 72: if this name was hoisted (or matches a param), emit plain
+        // assignment to avoid C "redefinition" errors from shadow semantics.
+        if _gen2_has_decl(node.name) {
+            return pad + node.name + " = " + init + ";\n"
         }
         return pad + "HexaVal " + node.name + " = " + init + ";\n"
     }
@@ -1291,6 +1390,58 @@ fn gen2_expr(node) {
             }
             if _is_known_fn_global(name) {
                 return name + "(" + arg_strs.join(", ") + ")"
+            }
+            // ── bt-66: free-fn call of a string-method builtin ──────────────
+            // `contains(attrs, "memoize")` (bare ident) used to emit
+            // `hexa_call2(contains, attrs, ...)` with `contains` undefined in C.
+            // Rewrite to receiver-first builtin dispatch (args[0] = receiver).
+            if len(node.args) >= 2 {
+                if name == "contains" {
+                    return "hexa_bool(hexa_str_contains(" + arg_strs[0] + ", " + arg_strs[1] + "))"
+                }
+                if name == "starts_with" {
+                    return "hexa_bool(hexa_str_starts_with(" + arg_strs[0] + ", " + arg_strs[1] + "))"
+                }
+                if name == "ends_with" {
+                    return "hexa_bool(hexa_str_ends_with(" + arg_strs[0] + ", " + arg_strs[1] + "))"
+                }
+            }
+            // ── bt-71: libc / builtin family dispatch ───────────────────────
+            // exit/sleep/tanh/sin/cos/log/input/is_error/read_lines/env_var/hex/
+            // bin/from_char_code/delete_file/append_file/timestamp/base64_* →
+            // route through typed hexa_<name> wrappers (see runtime.c).
+            if len(node.args) == 0 {
+                if name == "timestamp" { return "hexa_timestamp()" }
+                if name == "input"     { return "hexa_input(hexa_str(\"\"))" }
+                if name == "random"    { return "hexa_random()" }
+            }
+            if len(node.args) == 1 {
+                let a0 = arg_strs[0]
+                if name == "exit"           { return "hexa_exit(" + a0 + ")" }
+                if name == "sleep"          { return "hexa_sleep(" + a0 + ")" }
+                if name == "tanh"           { return "hexa_math_tanh(" + a0 + ")" }
+                if name == "sin"            { return "hexa_math_sin(" + a0 + ")" }
+                if name == "cos"            { return "hexa_math_cos(" + a0 + ")" }
+                if name == "tan"            { return "hexa_math_tan(" + a0 + ")" }
+                if name == "asin"           { return "hexa_math_asin(" + a0 + ")" }
+                if name == "acos"           { return "hexa_math_acos(" + a0 + ")" }
+                if name == "atan"           { return "hexa_math_atan(" + a0 + ")" }
+                if name == "log"            { return "hexa_math_log(" + a0 + ")" }
+                if name == "exp"            { return "hexa_math_exp(" + a0 + ")" }
+                if name == "input"          { return "hexa_input(" + a0 + ")" }
+                if name == "is_error"       { return "hexa_is_error(" + a0 + ")" }
+                if name == "read_lines"     { return "hexa_read_lines(" + a0 + ")" }
+                if name == "from_char_code" { return "hexa_from_char_code(" + a0 + ")" }
+                if name == "env_var"        { return "hexa_env_var(" + a0 + ")" }
+                if name == "delete_file"    { return "hexa_delete_file(" + a0 + ")" }
+                if name == "bin"            { return "hexa_bin(" + a0 + ")" }
+                if name == "hex"            { return "hexa_hex(" + a0 + ")" }
+                if name == "base64_encode"  { return "hexa_base64_encode(" + a0 + ")" }
+                if name == "base64_decode"  { return "hexa_base64_decode(" + a0 + ")" }
+            }
+            if len(node.args) == 2 {
+                if name == "append_file" { return "hexa_append_file(" + arg_strs[0] + ", " + arg_strs[1] + ")" }
+                if name == "atan2"       { return "hexa_math_atan2(" + arg_strs[0] + ", " + arg_strs[1] + ")" }
             }
             let nargs = len(node.args)
             if nargs == 0 { return "hexa_call0(" + name + ")" }
