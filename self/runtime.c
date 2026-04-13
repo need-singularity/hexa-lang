@@ -782,6 +782,13 @@ HexaVal hexa_array_slice_fast(HexaVal arr, HexaVal start, HexaVal end) {
 }
 
 HexaVal hexa_array_get(HexaVal arr, int64_t idx) {
+    // B13: tag guard — without this, a TAG_STR (from hexa_add fallthrough)
+    // reaches here and we read .arr.len from an unrelated union slot
+    // (uninitialized stack residue). Explicit panic instead of silent OOB.
+    if (arr.tag != TAG_ARRAY) {
+        fprintf(stderr, "array[%lld]: container is not an array (tag=%d)\n", (long long)idx, (int)arr.tag);
+        exit(1);
+    }
     if (idx < 0) idx += arr.arr.len;
     if (idx < 0 || idx >= arr.arr.len) {
         fprintf(stderr, "index %lld out of bounds (len %d)\n", (long long)idx, arr.arr.len);
@@ -2041,6 +2048,27 @@ HexaVal hexa_exec(HexaVal cmd) {
     return hexa_str_own(result);
 }
 
+// exec_replace — replace current process via execvp("/bin/sh", "-c", cmd).
+// Does not return on success. Used by `hexa lsp` to hand stdin/stdout fully
+// to the stage0 interpreter so bidirectional streaming (JSON-RPC) works
+// without popen buffering or the __HEXA_RC sentinel interleaving into the
+// response body. On failure, returns empty string and the caller falls
+// back to regular hexa_exec().
+HexaVal hexa_exec_replace(HexaVal cmd) {
+    if (cmd.tag != TAG_STR) return hexa_str("");
+    // fflush to avoid duplicated stdio buffers in the replacement.
+    fflush(stdout); fflush(stderr);
+    char* argv[4];
+    argv[0] = (char*)"/bin/sh";
+    argv[1] = (char*)"-c";
+    argv[2] = cmd.s;
+    argv[3] = NULL;
+    execvp(argv[0], argv);
+    // execvp returned → failure; surface errno and fall through.
+    perror("exec_replace");
+    return hexa_str("");
+}
+
 // ── Stderr ──────────────────────────────────────────
 void hexa_eprint_val(HexaVal v) {
     if (v.tag == TAG_STR) fprintf(stderr, "%s", v.s);
@@ -2154,6 +2182,16 @@ HexaVal hexa_add(HexaVal a, HexaVal b) {
         double fa = a.tag == TAG_FLOAT ? a.f : (double)a.i;
         double fb = b.tag == TAG_FLOAT ? b.f : (double)b.i;
         return hexa_float(fa + fb);
+    }
+    // B13: array concat. Interpreter (hexa_full.hexa:6954) does this but
+    // codegen emits bare hexa_add(l,r) — without this branch, two arrays
+    // fall through to to_string+str_concat → TAG_STR, then later arr[i]
+    // reads .arr.len from a TAG_STR union slot (stack residue → random OOB).
+    if (a.tag == TAG_ARRAY && b.tag == TAG_ARRAY) {
+        HexaVal out = hexa_array_new();
+        for (int i = 0; i < a.arr.len; i++) out = hexa_array_push(out, a.arr.items[i]);
+        for (int i = 0; i < b.arr.len; i++) out = hexa_array_push(out, b.arr.items[i]);
+        return out;
     }
     HexaVal sa = hexa_to_string(a);
     HexaVal sb = hexa_to_string(b);

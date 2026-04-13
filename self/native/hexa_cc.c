@@ -1167,6 +1167,23 @@ HexaVal parse_comparison(void) {
 }
 
 
+/* T35+ (B11 fix): line-leading `+` continuation. Returns 1 if current tok
+ * is Newline AND first non-newline ahead is `+` — advances past newlines
+ * so caller's loop sees `+` next. Minus excluded (unary-ambiguous). */
+static int _p_cont_plus(void) {
+    if (!hexa_truthy(hexa_eq(p_peek_kind(), hexa_str("Newline")))) return 0;
+    long long o = 1;
+    for (;;) {
+        HexaVal t = p_peek_ahead(hexa_int(o));
+        HexaVal tk = hexa_map_get(t, "kind");
+        if (!hexa_truthy(hexa_eq(tk, hexa_str("Newline"))) && !hexa_truthy(hexa_eq(tk, hexa_str("Semicolon")))) {
+            if (hexa_truthy(hexa_eq(tk, hexa_str("Plus")))) { p_skip_newlines(); return 1; }
+            return 0;
+        }
+        o++;
+    }
+}
+
 HexaVal parse_addition(void) {
     HexaVal left = parse_multiplication();
     /* rt-35 fix: accept bitwise &, |, ^ at additive precedence so
@@ -1176,7 +1193,8 @@ HexaVal parse_addition(void) {
     while (hexa_truthy(hexa_bool(hexa_truthy(hexa_eq(p_peek_kind(), hexa_str("Plus"))) || hexa_truthy(hexa_eq(p_peek_kind(), hexa_str("Minus")))))
         || hexa_truthy(hexa_eq(p_peek_kind(), hexa_str("BitAnd")))
         || hexa_truthy(hexa_eq(p_peek_kind(), hexa_str("BitOr")))
-        || hexa_truthy(hexa_eq(p_peek_kind(), hexa_str("BitXor")))) {
+        || hexa_truthy(hexa_eq(p_peek_kind(), hexa_str("BitXor")))
+        || _p_cont_plus()) {
         HexaVal op_tok = p_advance();
         HexaVal right = parse_multiplication();
         left = hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_new(), "kind", hexa_str("BinOp")), "name", hexa_str("")), "value", hexa_str("")), "op", hexa_map_get(op_tok, "value")), "left", left), "right", right), "cond", hexa_str("")), "then_body", hexa_str("")), "else_body", hexa_str("")), "params", hexa_str("")), "body", hexa_str("")), "args", hexa_str("")), "fields", hexa_str("")), "items", hexa_str("")), "variants", hexa_str("")), "arms", hexa_str("")), "iter_expr", hexa_str("")), "ret_type", hexa_str("")), "target", hexa_str("")), "trait_name", hexa_str("")), "methods", hexa_str(""));
