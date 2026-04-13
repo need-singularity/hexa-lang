@@ -166,6 +166,7 @@ HexaVal hexa_struct_pack_map(const char* type_name, int n,
                              const char* const* keys, const HexaVal* vals);
 // rt 32-B: scratch-buffer primitives for reusable args vector (NK_CALL path).
 HexaVal hexa_array_push_nostat(HexaVal arr, HexaVal item);
+HexaVal hexa_val_snapshot_array(HexaVal v);  // rt#32-N forward decl
 HexaVal hexa_array_slice_fast(HexaVal arr, HexaVal start, HexaVal end);
 
 // rt 32-G Phase 0: flat Val struct forward decls (implementation below).
@@ -552,6 +553,45 @@ HexaVal hexa_array_new() {
     return v;
 }
 
+// rt#32-N: snapshot-promote helper. Invoked by the transpiler around every
+// `let y = x` and fn-argument expression where x may be a TAG_ARRAY whose items
+// buffer is arena-allocated (cap < 0). Deep-copies arena items to malloc so
+// the snapshot is insulated from subsequent arena rewinds + callee arena
+// re-allocations. Passthrough for non-array / non-arena values.
+//
+// Rationale: Hexa is pass-by-value at the HexaVal level (I1), but the .items
+// pointer inside arr.* is shared. rt#32-M enabled arena-alloc only for the
+// slice_fast path because a caller-local snapshot of a persistent global could
+// alias the same arena buffer that the callee subsequently re-arena-alloc'd
+// (ABA). Snapshot-promote cuts the alias by forcing the caller's copy onto
+// the malloc heap at capture time.
+HexaVal hexa_val_snapshot_array(HexaVal v) {
+    if (v.tag != TAG_ARRAY) return v;
+    if (v.arr.cap >= 0) return v;  // heap-backed — no aliasing with arena rewind
+    // cap < 0: arena-backed — promote to heap.
+    if (_hx_stats_on()) _hx_stats_array_arena_heapify++;
+    int real_cap = -v.arr.cap;
+    HexaVal* heap = hexa_array_promote_to_heap(v.arr.items, v.arr.len, real_cap);
+    if (!heap) return v;  // OOM — best-effort, caller may see stale pointer
+    v.arr.items = heap;
+    v.arr.cap = real_cap;  // positive → heap
+    return v;
+}
+
+// rt#32-N: push-arena gate. Default OFF until snapshot-promote is fully wired
+// into the transpiler + interpreter source (self/hexa_full.hexa). Set
+// HEXA_ARRAY_PUSH_ARENA=1 to enable arena-alloc on first push (cap=0 → cap=-8)
+// after snapshot-promote is proven safe.
+static int __hexa_array_push_arena_enabled = -1;
+static int hexa_array_push_arena_on(void) {
+    if (__hexa_array_push_arena_enabled < 0) {
+        const char* e = getenv("HEXA_ARRAY_PUSH_ARENA");
+        if (!e || !e[0]) __hexa_array_push_arena_enabled = 0;  // default OFF
+        else             __hexa_array_push_arena_enabled = (e[0] != '0') ? 1 : 0;
+    }
+    return __hexa_array_push_arena_enabled;
+}
+
 // Optimization #12: reserve capacity up front when size is known.
 // rt 32-M: respect arena-backed items (cap<0) — promote to heap on grow.
 HexaVal hexa_array_reserve(HexaVal arr, int n) {
@@ -609,19 +649,37 @@ HexaVal hexa_array_push(HexaVal arr, HexaVal item) {
                 arr.arr.cap = new_cap;  // positive → heap
             }
         } else {
-            // Plain heap grow (unchanged). Arena push-on-init attempted in
-            // rt 32-M prototype but disabled: Hexa pass-by-value semantics
-            // (I1) make caller snapshots of pushed arrays become invalid
-            // when the callee arena-allocates new items for the global the
-            // snapshot captured. Full safety requires either (a) a heap-only
-            // initial bucket and arena-only-on-grow policy with promote-on-
-            // snapshot (too invasive for this pass) or (b) transpiler-emitted
-            // scoped hints. Arena currently only fires on slice_fast (NK_CALL
-            // scratch-args) where lifetime is provably scope-local.
-            HexaVal* new_items = realloc(arr.arr.items, sizeof(HexaVal) * (size_t)new_cap);
-            if (!new_items) { fprintf(stderr, "OOM in array_push\n"); exit(1); }
-            arr.arr.items = new_items;
-            arr.arr.cap = new_cap;
+            // rt#32-N: push-arena path (cap=0 first-push or existing heap
+            // grow). Enabled by HEXA_ARRAY_PUSH_ARENA=1 once the transpiler
+            // wraps snapshot-capture sites with hexa_val_snapshot_array.
+            // Without snapshot-promote, Hexa pass-by-value (I1) aliasing
+            // makes caller snapshots invalid across callee arena rewinds.
+            //
+            // Only fires on FIRST allocation (cap==0) — subsequent grows on
+            // an existing heap buffer continue to realloc as before (no
+            // aliasing delta). When mark_top > 0 and arena is on, the fresh
+            // buffer is arena-allocated with cap=-new_cap.
+            HexaVal* next_items = NULL;
+            int use_arena = 0;
+            if (real_cap == 0
+                && __hexa_val_mark_top > 0
+                && hexa_array_arena_on()
+                && hexa_array_push_arena_on()) {
+                next_items = hexa_array_arena_alloc_items(new_cap);
+                if (next_items) {
+                    use_arena = 1;
+                    if (_hx_stats_on()) _hx_stats_array_arena_alloc++;
+                }
+            }
+            if (use_arena) {
+                arr.arr.items = next_items;
+                arr.arr.cap = -new_cap;  // negative → from_arena sentinel
+            } else {
+                HexaVal* new_items = realloc(arr.arr.items, sizeof(HexaVal) * (size_t)new_cap);
+                if (!new_items) { fprintf(stderr, "OOM in array_push\n"); exit(1); }
+                arr.arr.items = new_items;
+                arr.arr.cap = new_cap;
+            }
         }
     }
     arr.arr.items[arr.arr.len] = item;
@@ -1041,15 +1099,18 @@ static inline int hexa_ic_stats_on(void) {
 // Slow path: full scan + update cache. Kept out-of-line to shrink the inline
 // hot path macro footprint. Stats bump lives here so hits stay counter-free
 // when HEXA_IC_STATS is unset.
+// rt#32-N build-fix: rt#37 referenced m.map.{keys,vals} which were removed by
+// rt#32-G when map storage moved to HexaMapTable. Redirect through .tbl.
 static HexaVal hexa_map_get_ic_slow(HexaVal m, const char* key, HexaIC* ic) {
     if (hexa_ic_stats_on()) { ic->misses++; g_hexa_ic_misses++; }
-    if (m.tag == TAG_MAP) {
-        for (int i = 0; i < m.map.len; i++) {
-            if (strcmp(m.map.keys[i], key) == 0) {
-                ic->keys_ptr = (void*)m.map.keys;
-                ic->len      = m.map.len;
+    if (m.tag == TAG_MAP && m.map.tbl) {
+        HexaMapTable* t = m.map.tbl;
+        for (int i = 0; i < t->len; i++) {
+            if (strcmp(t->order_keys[i], key) == 0) {
+                ic->keys_ptr = (void*)t->order_keys;
+                ic->len      = t->len;
                 ic->idx      = i;
-                return m.map.vals[i];
+                return t->order_vals[i];
             }
         }
     }
@@ -1063,14 +1124,16 @@ static HexaVal hexa_map_get_ic_slow(HexaVal m, const char* key, HexaIC* ic) {
 //   - else                                                   -> slow fallback
 // The stat bump on the hot path is compiled out when HEXA_IC_STATS is unset
 // because g_hexa_ic_stats_enabled flips to 0 on first slow path miss.
+// rt#32-N build-fix: m.map.{keys,vals} -> m.map.tbl->{order_keys,order_vals}
 #define hexa_map_get_ic(M, KEY, IC) \
     ({ HexaVal __ic_m = (M); HexaIC* __ic = (IC); \
-       ((void*)__ic_m.map.keys == __ic->keys_ptr \
-        && __ic_m.map.len == __ic->len \
+       (__ic_m.map.tbl \
+        && (void*)__ic_m.map.tbl->order_keys == __ic->keys_ptr \
+        && __ic_m.map.tbl->len == __ic->len \
         && __ic->idx < __ic->len) \
            ? (g_hexa_ic_stats_enabled > 0 \
-              ? (__ic->hits++, g_hexa_ic_hits++, __ic_m.map.vals[__ic->idx]) \
-              : __ic_m.map.vals[__ic->idx]) \
+              ? (__ic->hits++, g_hexa_ic_hits++, __ic_m.map.tbl->order_vals[__ic->idx]) \
+              : __ic_m.map.tbl->order_vals[__ic->idx]) \
            : hexa_map_get_ic_slow(__ic_m, (KEY), __ic); })
 
 
@@ -1778,7 +1841,15 @@ HexaVal hexa_val_heapify(HexaVal v) {
 // C global). Declared extern; the symbol is provided by the generated C from
 // hexa_full.hexa. Guarded by a weak-link check at call time so this object can
 // link standalone (e.g. test harnesses that don't include hexa_full.hexa).
-extern HexaVal return_val __attribute__((weak));
+// rt#32-N build-fix: on macOS arm64 clang drops the weak attribute through
+// plain extern; add weak_import so unresolved → NULL at runtime. Also provide
+// a weak fallback definition so programs without a global `return_val` (like
+// hexa_cc.c's own build) still link. When hexa_full.hexa's generated C
+// defines `HexaVal return_val;` later, the strong definition wins (weak
+// resolves to the strong one). A duplicate-weak -Wignored-attributes warning
+// is harmless.
+extern HexaVal return_val __attribute__((weak_import, weak));
+__attribute__((weak)) HexaVal return_val __attribute__((common));
 static void hexa_val_arena_heapify_return(void) {
     if (&return_val) {
         return_val = hexa_val_heapify(return_val);

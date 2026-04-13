@@ -5099,13 +5099,66 @@ HexaVal _gen2_collect_lets(HexaVal stmts, HexaVal names) {
 }
 
 
+// rt#32-N: conservative hot-globals list for snapshot-promote. These are
+// the arrays that exhibit the pass-by-value ABA blocker documented in
+// rt#32-M when the push-arena path fires. Widening this list is cheap;
+// starting narrow minimises blast radius of the transpiler change.
+//
+// The list covers the 14 interpreter globals from rt#32-M's mitigation
+// attempt. A `let x = <name>` where <name> is in this list gets wrapped
+// with hexa_val_snapshot_array(...) so the snapshot is insulated from
+// subsequent callee arena-rewinds.
+static int _gen2_is_snapshot_hot_global(HexaVal name_v) {
+    if (name_v.tag != TAG_STR || !name_v.s) return 0;
+    const char* n = name_v.s;
+    static const char* hot[] = {
+        "env_var_names", "env_var_vals", "env_scopes", "env_scope_dirty",
+        "env_cache_names", "env_cache_idxs", "env_vars", "env_cache",
+        "env_fns", "fn_cache", "call_stack", "defer_stack",
+        "gen_buffer", "call_arg_buf",
+        NULL
+    };
+    for (int i = 0; hot[i]; i++) {
+        if (strcmp(n, hot[i]) == 0) return 1;
+    }
+    return 0;
+}
+
+// rt#32-N: gate via HEXA_CODEGEN_SNAPSHOT env var. Default ON. Set to "0"
+// to regenerate C without snapshot wrappers for a bit-identical comparison.
+static int _gen2_snapshot_enabled_cache = -1;
+static int _gen2_snapshot_enabled(void) {
+    if (_gen2_snapshot_enabled_cache < 0) {
+        const char* e = getenv("HEXA_CODEGEN_SNAPSHOT");
+        if (!e || !e[0]) _gen2_snapshot_enabled_cache = 1;  // default ON
+        else             _gen2_snapshot_enabled_cache = (e[0] != '0') ? 1 : 0;
+    }
+    return _gen2_snapshot_enabled_cache;
+}
+
+// Wrap an init C expression with hexa_val_snapshot_array(...) iff the RHS
+// AST node is an Ident referencing a hot global. Low risk: passthrough for
+// all other expressions (literals, calls, binops, etc.).
+static HexaVal _gen2_maybe_snapshot(HexaVal init_c, HexaVal rhs_node) {
+    if (!_gen2_snapshot_enabled()) return init_c;
+    if (hexa_truthy(hexa_eq(hexa_type_of(rhs_node), hexa_str("string")))) return init_c;
+    HexaVal kind = hexa_map_get(rhs_node, "kind");
+    if (!hexa_truthy(hexa_eq(kind, hexa_str("Ident")))) return init_c;
+    HexaVal name = hexa_map_get(rhs_node, "name");
+    if (!_gen2_is_snapshot_hot_global(name)) return init_c;
+    return hexa_add(hexa_add(hexa_str("hexa_val_snapshot_array("), init_c), hexa_str(")"));
+}
+
 HexaVal gen2_stmt(HexaVal node, HexaVal depth) {
     HexaVal pad = gen2_indent(depth);
     HexaVal k = hexa_map_get(node, "kind");
     if (hexa_truthy(hexa_bool(hexa_truthy(hexa_eq(k, hexa_str("LetStmt"))) || hexa_truthy(hexa_eq(k, hexa_str("LetMutStmt")))))) {
         HexaVal init = hexa_str("hexa_void()");
-        if (hexa_truthy(hexa_bool(!hexa_truthy(hexa_eq(hexa_type_of(hexa_map_get(node, "left")), hexa_str("string")))))) {
-            init = gen2_expr(hexa_map_get(node, "left"));
+        HexaVal rhs_node = hexa_map_get(node, "left");
+        if (hexa_truthy(hexa_bool(!hexa_truthy(hexa_eq(hexa_type_of(rhs_node), hexa_str("string")))))) {
+            init = gen2_expr(rhs_node);
+            // rt#32-N: snapshot-wrap hot-global Ident RHS
+            init = _gen2_maybe_snapshot(init, rhs_node);
         }
         HexaVal _ln = hexa_map_get(node, "name");
         // bt 72: if this name was hoisted to function top, emit plain assignment
