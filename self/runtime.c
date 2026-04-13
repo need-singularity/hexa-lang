@@ -331,7 +331,38 @@ HexaVal hexa_str_own(char* s) {
 
 // ── Array operations ─────────────────────────────────────
 
+// rt 32: alloc/COW stats (HEXA_ALLOC_STATS=1 env enables atexit dump).
+// Counts hot-path C runtime allocations so we can diagnose where 10GB
+// RSS ML microbench pressure originates without sample/leaks tooling.
+static int64_t _hx_stats_array_new      = 0;
+static int64_t _hx_stats_array_push     = 0;
+static int64_t _hx_stats_array_grow     = 0;   // realloc that actually grows cap
+static int64_t _hx_stats_str_concat     = 0;
+static int64_t _hx_stats_array_reserve  = 0;
+static int _hx_stats_enabled = -1;             // lazy probe of env
+
+static void _hx_stats_dump(void) {
+    fprintf(stderr, "[HEXA_ALLOC_STATS] array_new=%lld push=%lld grow=%lld reserve=%lld str_concat=%lld\n",
+        (long long)_hx_stats_array_new,
+        (long long)_hx_stats_array_push,
+        (long long)_hx_stats_array_grow,
+        (long long)_hx_stats_array_reserve,
+        (long long)_hx_stats_str_concat);
+}
+
+static int _hx_stats_on(void) {
+    if (_hx_stats_enabled < 0) {
+        const char* e = getenv("HEXA_ALLOC_STATS");
+        _hx_stats_enabled = (e && e[0] && e[0] != '0') ? 1 : 0;
+        if (_hx_stats_enabled) {
+            atexit(_hx_stats_dump);
+        }
+    }
+    return _hx_stats_enabled;
+}
+
 HexaVal hexa_array_new() {
+    if (_hx_stats_on()) _hx_stats_array_new++;
     HexaVal v = {.tag=TAG_ARRAY};
     v.arr.items = NULL; v.arr.len = 0; v.arr.cap = 0;
     return v;
@@ -340,6 +371,7 @@ HexaVal hexa_array_new() {
 // Optimization #12: reserve capacity up front when size is known.
 HexaVal hexa_array_reserve(HexaVal arr, int n) {
     if (n <= arr.arr.cap) return arr;
+    if (_hx_stats_on()) _hx_stats_array_reserve++;
     HexaVal* new_items = realloc(arr.arr.items, sizeof(HexaVal) * n);
     if (!new_items) { fprintf(stderr, "OOM in array_reserve\n"); exit(1); }
     arr.arr.items = new_items;
@@ -350,7 +382,9 @@ HexaVal hexa_array_reserve(HexaVal arr, int n) {
 // Optimization #12: grow from current cap (2x), not from new_len.
 // Only realloc when len exceeds cap; growth factor 2x amortizes cost.
 HexaVal hexa_array_push(HexaVal arr, HexaVal item) {
+    if (_hx_stats_on()) _hx_stats_array_push++;
     if (arr.arr.len >= arr.arr.cap) {
+        if (_hx_stats_on()) _hx_stats_array_grow++;
         int new_cap = arr.arr.cap < 8 ? 8 : arr.arr.cap * 2;
         HexaVal* new_items = realloc(arr.arr.items, sizeof(HexaVal) * new_cap);
         if (!new_items) { fprintf(stderr, "OOM in array_push\n"); exit(1); }
@@ -388,8 +422,9 @@ HexaVal hexa_array_set(HexaVal arr, int64_t idx, HexaVal val) {
 // No free of arr.items here (HexaVal entries may still be shared); we only
 // shrink the logical length. Safe because the slots beyond `new_len` become
 // unreachable through this handle.
-HexaVal hexa_array_truncate(HexaVal arr, int64_t new_len) {
+HexaVal hexa_array_truncate(HexaVal arr, HexaVal new_len_v) {
     if (arr.tag != TAG_ARRAY) return arr;
+    int64_t new_len = (new_len_v.tag == TAG_INT) ? new_len_v.i : (int64_t)new_len_v.i;
     if (new_len < 0) new_len = 0;
     if (new_len > arr.arr.len) new_len = arr.arr.len;
     arr.arr.len = (int)new_len;
@@ -646,6 +681,7 @@ int hexa_is_type(HexaVal v, const char* type_name) {
 // ── String operations ────────────────────────────────────
 
 HexaVal hexa_str_concat(HexaVal a, HexaVal b) {
+    if (_hx_stats_on()) _hx_stats_str_concat++;
     char* sa = a.tag == TAG_STR ? a.s : "";
     char* sb = b.tag == TAG_STR ? b.s : "";
     char* result = malloc(strlen(sa) + strlen(sb) + 1);

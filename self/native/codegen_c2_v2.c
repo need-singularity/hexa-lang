@@ -736,6 +736,10 @@ HexaVal gen2_method_builtin(HexaVal obj_expr, HexaVal method, HexaVal args) {
     if (hexa_truthy(hexa_eq(method, hexa_str("sort")))) {
         return hexa_add(hexa_add(hexa_str("hexa_array_sort("), obj_expr), hexa_str(")"));
     }
+    // bt 55 — in-place array length shrink; caller must reassign.
+    if (hexa_truthy(hexa_eq(method, hexa_str("truncate")))) {
+        return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_array_truncate("), obj_expr), hexa_str(", ")), gen2_expr(hexa_index_get(args, hexa_int(0)))), hexa_str(")"));
+    }
     return hexa_add(hexa_add(hexa_str("hexa_void() /* unknown method."), method), hexa_str(" */"));
     return hexa_void();
 }
@@ -1175,6 +1179,10 @@ HexaVal gen2_expr(HexaVal node) {
             }
             if (hexa_truthy(hexa_eq(method, hexa_str("sort")))) {
                 return hexa_add(hexa_add(hexa_str("hexa_array_sort("), obj), hexa_str(")"));
+            }
+            // bt 55 — in-place array length shrink; caller must reassign.
+            if (hexa_truthy(hexa_eq(method, hexa_str("truncate")))) {
+                return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_array_truncate("), obj), hexa_str(", ")), gen2_expr(hexa_index_get(hexa_map_get(node, "args"), hexa_int(0)))), hexa_str(")"));
             }
             return hexa_add(hexa_add(hexa_str("/* method."), method), hexa_str(" */"));
         }

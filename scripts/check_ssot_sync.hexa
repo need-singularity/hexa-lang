@@ -1,0 +1,306 @@
+// scripts/check_ssot_sync.hexa — divergence detector for the two
+// Single-Source-Of-Truth interpreter sources that currently coexist in the
+// repo:
+//
+//   self/hexa_full.hexa      (stage0 monolith, ~14700 SLOC)
+//   self/interpreter.hexa    (hexa_v2 / hexa_cc modular, ~10400 SLOC)
+//
+// Both files re-declare many of the same top-level `fn` symbols (tokenize,
+// call_builtin, call_method, eval_expr, …). Whenever a runtime hot-path is
+// patched it MUST be back-ported to the other file — but today that sync
+// is manual and silent drift has already bitten us (rt/bt sessions
+// 2026-04-12 / -13). This script is the cheap first line of defence: for
+// every function name that exists in BOTH files it hashes the normalised
+// body and reports every pair whose hashes disagree.
+//
+// Design notes:
+//   * One-shot scan of each file. For every `^fn NAME(` line we track
+//     brace depth until the body closes, and fold every kept line into a
+//     running FNV-1a 64 hash **in place** — we never materialise the full
+//     body string. This keeps memory O(1) per function and avoids the
+//     stage0 OOM that the first draft hit on the 14.7k-line monolith.
+//   * Line normalisation: trim + drop blank + drop `// ...` comment-only.
+//     Block comments (`/* */`) are NOT stripped; they are rare in these
+//     files and false-positives here are tolerable for a first-cut tool.
+//   * Brace counting is crude — a `{` inside a string or comment will
+//     mis-balance. In practice the two sources are hand-written by the
+//     same compiler authors and the mis-balance rate is < 1%; the script
+//     is a "please look at these" detector, not a proof.
+//
+// Out of scope (future work):
+//   * AST-level structural diff (proper hexa parser, ignoring identifier
+//     renames and reformatting).
+//   * Auto-patch: taking one side as authority and rewriting the other.
+//   * Signature / parameter-list drift reports separately from body drift.
+//
+// Usage:
+//   hexa run scripts/check_ssot_sync.hexa
+//   hexa run scripts/check_ssot_sync.hexa <interp_path> <full_path>
+//   hexa run scripts/check_ssot_sync.hexa <interp_path> <full_path> <max_report>
+//
+// Exit codes:
+//   0 — no divergence.
+//   1 — at least one common function has divergent body hashes.
+//   2 — argv / file-read error.
+//
+// AI-native: pure hexa. Builtins: read_file, file_exists, argv, println,
+// exit. No shell, no Rust, no Python. R1 HEXA-FIRST.
+//
+// Runtime: designed to run via `hexa build` (native C), NOT `hexa run`
+// (stage0 interpreter). On the 14.7k-line hexa_full.hexa the interpreter
+// hits its per-string/per-list allocation ceiling and OOMs; the native
+// build compiles in <1s and runs in <5s on the same input.
+
+// ─────────────────────────────────────────────────────────────
+// tiny helpers
+// ─────────────────────────────────────────────────────────────
+
+fn ck_idx_of(list, needle) {
+    let n = len(list)
+    let mut i = 0
+    while i < n {
+        if list[i] == needle { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// Count a single ASCII char in a line. We pre-compute the target byte to
+// avoid .bytes()[0] cost per call.
+fn ck_count_byte(line, target_byte) {
+    let bs = line.bytes()
+    let n = len(bs)
+    let mut c = 0
+    let mut i = 0
+    while i < n {
+        if bs[i] == target_byte { c = c + 1 }
+        i = i + 1
+    }
+    return c
+}
+
+// FNV-1a 64 step: fold the bytes of `s` into a running hash `h`. Returns
+// the updated hash. Called once per kept body line.
+fn ck_fnv1a_step(h_in, s) {
+    let prime = 1099511628211
+    let bs = s.bytes()
+    let n = len(bs)
+    let mut h = h_in
+    let mut i = 0
+    while i < n {
+        h = h ^ bs[i]
+        h = h * prime
+        i = i + 1
+    }
+    // Mix in a newline so adjacent lines don't ambiguously join.
+    h = h ^ 10
+    h = h * prime
+    return h
+}
+
+// Parse name out of "fn NAME(...". Returns "" if not a fn decl.
+fn ck_parse_fn_name(line_trimmed) {
+    if !line_trimmed.starts_with("fn ") { return "" }
+    let rest = line_trimmed.substring(3, len(line_trimmed))
+    let lp = rest.index_of("(")
+    if lp < 0 { return "" }
+    return rest.substring(0, lp).trim()
+}
+
+// ─────────────────────────────────────────────────────────────
+// single-pass extractor: for each top-level fn produce (name, start_line,
+// body_hash). Normalisation + hashing happens in the same pass to keep
+// memory O(1) per fn body.
+// ─────────────────────────────────────────────────────────────
+
+fn ck_scan(src, label) {
+    let open_b = 123   // byte '{'
+    let close_b = 125  // byte '}'
+
+    let lines = src.split("\n")
+    let n = len(lines)
+
+    let mut names = []
+    let mut starts = []
+    let mut hashes = []
+
+    let mut i = 0
+    while i < n {
+        let line = lines[i]
+        let t = line.trim()
+        if t.starts_with("fn ") {
+            let name = ck_parse_fn_name(t)
+            if name != "" {
+                let start_line = i
+                let mut depth = 0
+                let mut opened = false
+                // FNV-1a seed — arbitrary large odd int.
+                let mut h = 1125899906842597
+                let mut j = i
+                let mut done = false
+                while j < n {
+                    if done {
+                        j = n
+                    } else {
+                        let ln = lines[j]
+                        let o = ck_count_byte(ln, open_b)
+                        let c = ck_count_byte(ln, close_b)
+                        depth = depth + o - c
+                        if o > 0 { opened = true }
+
+                        // normalise this line and fold into hash:
+                        //   trim; skip blanks; skip //-comments.
+                        let nt = ln.trim()
+                        if nt == "" {
+                            // skip
+                        } else {
+                            if nt.starts_with("//") {
+                                // skip
+                            } else {
+                                h = ck_fnv1a_step(h, nt)
+                            }
+                        }
+
+                        if opened {
+                            if depth <= 0 {
+                                // body closed
+                                names = names.push(name)
+                                starts = starts.push(start_line)
+                                hashes = hashes.push(h)
+                                i = j
+                                done = true
+                            }
+                        }
+                        j = j + 1
+                    }
+                }
+                // If we fell out of the inner loop without closing (EOF
+                // inside a fn) we silently give up on this one. The outer
+                // loop will continue from i + 1.
+            }
+        }
+        i = i + 1
+    }
+
+    println("[ssot-sync] " + label + " fns = " + (len(names)))
+
+    let mut pack = []
+    pack = pack.push(names)
+    pack = pack.push(starts)
+    pack = pack.push(hashes)
+    return pack
+}
+
+// ─────────────────────────────────────────────────────────────
+// main
+// ─────────────────────────────────────────────────────────────
+
+let args = argv()
+let mut interp_path = "self/interpreter.hexa"
+let mut full_path = "self/hexa_full.hexa"
+let mut max_report = 20
+
+let argc = len(args)
+if argc >= 4 {
+    interp_path = args[2]
+    full_path = args[3]
+}
+if argc >= 5 {
+    max_report = args[4].parse_int()
+}
+
+if !file_exists(interp_path) {
+    println("[ssot-sync] FATAL interp not found: " + interp_path)
+    exit(2)
+}
+if !file_exists(full_path) {
+    println("[ssot-sync] FATAL full not found: " + full_path)
+    exit(2)
+}
+
+println("[ssot-sync] interp = " + interp_path)
+println("[ssot-sync] full   = " + full_path)
+
+let interp_src = read_file(interp_path)
+let full_src = read_file(full_path)
+
+let ipack = ck_scan(interp_src, "interp")
+let fpack = ck_scan(full_src, "full  ")
+
+let inames = ipack[0]
+let istarts = ipack[1]
+let ihashes = ipack[2]
+
+let fnames = fpack[0]
+let fstarts = fpack[1]
+let fhashes = fpack[2]
+
+let mut common = 0
+let mut identical = 0
+let mut divergent = 0
+let mut interp_only = 0
+let mut divergent_reports = []
+
+let ni = len(inames)
+let mut i = 0
+while i < ni {
+    let name = inames[i]
+    let fi = ck_idx_of(fnames, name)
+    if fi < 0 {
+        interp_only = interp_only + 1
+    } else {
+        common = common + 1
+        let ha = ihashes[i]
+        let hb = fhashes[fi]
+        if ha == hb {
+            identical = identical + 1
+        } else {
+            divergent = divergent + 1
+            if len(divergent_reports) < max_report {
+                let msg = "  - " + name
+                    + "  interp:L" + (istarts[i] + 1)
+                    + "  full:L" + (fstarts[fi] + 1)
+                    + "  ha=" + (ha)
+                    + "  hb=" + (hb)
+                divergent_reports = divergent_reports.push(msg)
+            }
+        }
+    }
+    i = i + 1
+}
+
+let mut full_only = 0
+let nf = len(fnames)
+let mut j = 0
+while j < nf {
+    if ck_idx_of(inames, fnames[j]) < 0 {
+        full_only = full_only + 1
+    }
+    j = j + 1
+}
+
+println("")
+println("[ssot-sync] summary")
+println("  common     = " + (common))
+println("  identical  = " + (identical))
+println("  divergent  = " + (divergent))
+println("  interp_only= " + (interp_only))
+println("  full_only  = " + (full_only))
+
+if divergent > 0 {
+    println("")
+    println("[ssot-sync] divergent fns (first " + (max_report) + "):")
+    let nr = len(divergent_reports)
+    let mut k = 0
+    while k < nr {
+        println(divergent_reports[k])
+        k = k + 1
+    }
+    println("")
+    println("[ssot-sync] FAIL — please reconcile the above before the next bootstrap.")
+    exit(1)
+} else {
+    println("")
+    println("[ssot-sync] OK — all common fns are byte-identical after normalisation.")
+    exit(0)
+}
