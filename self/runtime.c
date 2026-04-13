@@ -173,7 +173,14 @@ HexaVal hexa_array_slice_fast(HexaVal arr, HexaVal start, HexaVal end);
 
 typedef enum {
     TAG_INT = 0, TAG_FLOAT, TAG_BOOL, TAG_STR, TAG_VOID,
-    TAG_ARRAY, TAG_MAP, TAG_FN, TAG_CHAR, TAG_CLOSURE
+    TAG_ARRAY, TAG_MAP, TAG_FN, TAG_CHAR, TAG_CLOSURE,
+    // rt 32-G Phase 0: flat C struct replacement for interpreter `Val` map.
+    // Val is the interpreter's tagged value carrier — constructed ~3.37M
+    // times per d64 200-step run. Each map-backed Val = 1 map_new + 12 map_set
+    // = 13 hash-table insertions. Replacing with a flat 12-field C struct
+    // collapses that to a single heap alloc, eliminating 7GB+ of RSS pressure.
+    // Fields match `struct Val` in self/hexa_full.hexa exactly (12 fields).
+    TAG_VALSTRUCT
 } HexaTag;
 
 // ── Optimization #10: Hash-map backing store ─────────────
@@ -200,6 +207,30 @@ typedef struct {
     int len;               // number of entries
     int order_cap;         // allocated capacity for order arrays
 } HexaMapTable;
+
+// rt 32-G Phase 0: flat C struct replacement for `Val` map.
+// Fields MUST mirror self/hexa_full.hexa `struct Val` exactly (order + types).
+// Heap-allocated once per Val construction, shared by value via pointer copy
+// of the containing HexaVal (no deep copy — mirrors current map.tbl pointer
+// sharing semantics). Lifetime: leak-compatible with current interpreter
+// (no free, same as existing map-backed Vals).
+typedef struct HexaValStruct {
+    int64_t tag_i;          // TAG_INT / TAG_FLOAT / ... (interpreter-level tag, not HexaTag)
+    int64_t int_val;
+    double  float_val;
+    int     bool_val;
+    // All string fields stored as owned char* (NULL-terminated).
+    // Empty-string literals point to the shared static "" sentinel to avoid
+    // 12×strdup("") per void-Val construction.
+    const char* str_val;
+    const char* char_val;
+    const char* array_val;
+    const char* fn_name;
+    const char* fn_params;
+    const char* fn_body;
+    const char* struct_name;
+    const char* struct_fields;
+} HexaValStruct;
 
 typedef struct HexaVal {
     HexaTag tag;
@@ -228,6 +259,8 @@ typedef struct HexaVal {
             int arity;              // number of user params (excluding env)
             struct HexaVal* env_box;// heap box holding a single TAG_ARRAY HexaVal
         } clo;
+        // rt 32-G: heap-allocated flat struct pointer (TAG_VALSTRUCT).
+        HexaValStruct* vs;
     };
 } HexaVal;
 
