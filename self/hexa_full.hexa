@@ -4518,16 +4518,29 @@ fn val_void() { return __VAL_VOID }
 // Without `pub`, lookups from within import dispatch see uninitialized
 // captures and fail with "undefined variable: env_vars".
 
-pub let mut env_vars = []      // array of {name, value} pairs
+// rt 32-E: split tuple-of-arrays → struct-of-arrays to eliminate the
+// per-env_define `[name, value]` inner allocation. Before: every define
+// allocated a fresh 2-element array (1 array_new + 2 pushes just for the
+// tuple) on top of the env_vars append. After: two parallel pushes, no
+// tuple alloc. env_vars itself is kept as a legacy alias (always empty)
+// purely for closure-capture backward compat paths that snapshot it.
+pub let mut env_var_names = []   // parallel: binding names
+pub let mut env_var_vals = []    // parallel: binding values
+pub let mut env_vars = []        // legacy snapshot target; unused in hot path
 pub let mut env_scopes = [0]   // scope boundary stack
 // ── O(1) env_lookup cache (perf) ──────────────────────────
-// Parallel to env_vars: 64 buckets, each a list of [name, env_index].
+// Parallel to env_var_names/vals: 64 buckets. rt 32-E also splits each
+// bucket into parallel (names, idxs) arrays to eliminate the per-define
+// `[name, idx]` inner alloc. Same 6-push → 4-push / -2 array_new savings
+// applies to the cache side.
 // env_define appends; env_lookup/set scan only the name's bucket and
 // pick the entry with the largest index (newest binding still in scope).
 // env_pop_scope prunes entries whose index >= new boundary.
 // Bucket count 64 = power of two, empirically covers typical
 // top-level fn + let counts (~100) with avg chain length <2.
-pub let mut env_cache = []     // list of 64 buckets; each bucket is [[name, idx], ...]
+pub let mut env_cache_names = []   // list of 64 buckets; each bucket is [name, ...]
+pub let mut env_cache_idxs = []    // list of 64 buckets; each bucket is [idx, ...]
+pub let mut env_cache = []     // legacy alias: len==64 flag retained for fallback branch
 // ── Scope-dirty tracking (perf opt #8) ──────────────────────
 // Stack of dirty-bucket sets, one per scope. Each entry is an array of
 // bucket indices that were modified (by env_define) during that scope.
@@ -5586,25 +5599,34 @@ fn env_hash(name) {
 }
 
 fn env_cache_init() {
-    let mut buckets = []
+    // rt 32-E: init both parallel cache arrays (names, idxs). env_cache
+    // retained as legacy len==64 sentinel checked by fallback branches.
+    let mut names_buckets = []
+    let mut idxs_buckets = []
+    let mut legacy_buckets = []
     let mut i = 0
     while i < 64 {
-        buckets = buckets.push([])
+        names_buckets = names_buckets.push([])
+        idxs_buckets = idxs_buckets.push([])
+        legacy_buckets = legacy_buckets.push([])
         i = i + 1
     }
-    env_cache = buckets
+    env_cache_names = names_buckets
+    env_cache_idxs = idxs_buckets
+    env_cache = legacy_buckets
 }
 
-// Rebuild cache from current env_vars. Fallback for cases where a
+// Rebuild cache from current env_var_names. Fallback for cases where a
 // cached snapshot is unavailable (e.g., interpret() reset, legacy paths).
 fn env_rebuild_cache() {
     env_cache_init()
     let mut i = 0
-    let n = len(env_vars)
+    let n = len(env_var_names)
     while i < n {
-        let pair = env_vars[i]
-        let b = env_hash(pair[0])
-        env_cache[b] = env_cache[b].push([pair[0], i])
+        let nm = env_var_names[i]
+        let b = env_hash(nm)
+        env_cache_names[b] = env_cache_names[b].push(nm)
+        env_cache_idxs[b] = env_cache_idxs[b].push(i)
         i = i + 1
     }
 }
@@ -5641,7 +5663,7 @@ fn fn_rebuild_cache() {
 }
 
 fn env_push_scope() {
-    env_scopes = env_scopes.push(len(env_vars))
+    env_scopes = env_scopes.push(len(env_var_names))
     // rt 32: defer the per-scope `[]` allocation to env_define when actually
     // needed. ML hot loops (matvec inner col loop) push hundreds of scopes
     // with zero defines — pre-allocating a host array each time was a major
@@ -5659,15 +5681,14 @@ fn env_pop_scope() {
     // (hexa lists pass-by-value) via reassignment.
     // Remove the last scope marker
     env_scopes = env_scopes.truncate(len(env_scopes) - 1)
-    // rt 32: decref array/struct slots before truncating env_vars. Without
+    // rt 32: decref array/struct slots before truncating env_var_vals. Without
     // this the array_store freelist never reclaims slots (refcount stays
     // ≥ 1 even after the binding goes out of scope), defeating the slot
     // reuse optimization and leaking ~64 floats × N steps per matvec.
-    let env_len = len(env_vars)
+    let env_len = len(env_var_names)
     let mut _di = boundary
     while _di < env_len {
-        let pair = env_vars[_di]
-        let old_val = pair[1]
+        let old_val = env_var_vals[_di]
         if old_val.tag == TAG_ARRAY {
             array_decref(old_val.int_val)
         }
@@ -5676,8 +5697,9 @@ fn env_pop_scope() {
         }
         _di = _di + 1
     }
-    // Truncate vars to boundary
-    env_vars = env_vars.truncate(boundary)
+    // Truncate parallel arrays to boundary
+    env_var_names = env_var_names.truncate(boundary)
+    env_var_vals = env_var_vals.truncate(boundary)
     // Prune cache: only scan buckets that were modified during this scope.
     // Dirty-tracking reduces O(64 + total_cache_entries) to O(dirty_buckets).
     let sdn = len(env_scope_dirty)
@@ -5693,18 +5715,24 @@ fn env_pop_scope() {
             let dn = len(dirty)
             while _pdi < dn {
                 let bi = dirty[_pdi]
-                let bucket = env_cache[bi]
-                let mut kept = []
+                // rt 32-E: walk parallel (names, idxs) buckets; keep only
+                // entries whose idx is still < boundary.
+                let b_names = env_cache_names[bi]
+                let b_idxs = env_cache_idxs[bi]
+                let mut kept_names = []
+                let mut kept_idxs = []
                 let mut ki = 0
-                let bn = len(bucket)
+                let bn = len(b_idxs)
                 while ki < bn {
-                    let entry = bucket[ki]
-                    if entry[1] < boundary {
-                        kept = kept.push(entry)
+                    let eidx = b_idxs[ki]
+                    if eidx < boundary {
+                        kept_names = kept_names.push(b_names[ki])
+                        kept_idxs = kept_idxs.push(eidx)
                     }
                     ki = ki + 1
                 }
-                env_cache[bi] = kept
+                env_cache_names[bi] = kept_names
+                env_cache_idxs[bi] = kept_idxs
                 _pdi = _pdi + 1
             }
         }
@@ -5719,12 +5747,18 @@ fn env_define(name, value) {
     if value.tag == TAG_STRUCT {
         struct_incref(value.int_val)
     }
-    let idx = len(env_vars)
-    env_vars = env_vars.push([name, value])
+    // rt 32-E: parallel push — no `[name, value]` tuple alloc (-1 array_new,
+    // -2 array_push per define; counting charges: was 1 push+2 push+1 push
+    // for outer/inner/outer = 4 stat pushes, now just 2).
+    let idx = len(env_var_names)
+    env_var_names = env_var_names.push(name)
+    env_var_vals = env_var_vals.push(value)
     // Lazily init cache on first define after reset.
-    if len(env_cache) != 64 { env_cache_init() }
+    if len(env_cache_names) != 64 { env_cache_init() }
     let b = env_hash(name)
-    env_cache[b] = env_cache[b].push([name, idx])
+    // rt 32-E: parallel push to (names, idxs) bucket — no tuple alloc.
+    env_cache_names[b] = env_cache_names[b].push(name)
+    env_cache_idxs[b] = env_cache_idxs[b].push(idx)
     // Track dirty bucket in current scope (opt #8)
     let sdn = len(env_scope_dirty)
     if sdn > 0 {
@@ -5752,30 +5786,31 @@ fn env_lookup(name) {
     // O(1) avg via bucket cache. Fall back to linear scan only if
     // cache is empty (e.g., right after wholesale env_vars swap that
     // forgot to rebuild — defensive).
-    if len(env_cache) == 64 {
+    if len(env_cache_names) == 64 {
         let b = env_hash(name)
-        let bucket = env_cache[b]
+        let b_names = env_cache_names[b]
+        let b_idxs = env_cache_idxs[b]
         // Pick entry with largest index (newest binding still in scope).
         let mut best = -1
         let mut bi = 0
-        let bn = len(bucket)
+        let bn = len(b_names)
         while bi < bn {
-            let entry = bucket[bi]
-            if entry[0] == name {
-                if entry[1] > best { best = entry[1] }
+            if b_names[bi] == name {
+                let ei = b_idxs[bi]
+                if ei > best { best = ei }
             }
             bi = bi + 1
         }
-        if best >= 0 && best < len(env_vars) {
-            return env_vars[best][1]
+        if best >= 0 && best < len(env_var_vals) {
+            return env_var_vals[best]
         }
         return val_void()
     }
     // Fallback linear scan
-    let mut i = len(env_vars) - 1
+    let mut i = len(env_var_names) - 1
     while i >= 0 {
-        if env_vars[i][0] == name {
-            return env_vars[i][1]
+        if env_var_names[i] == name {
+            return env_var_vals[i]
         }
         i = i - 1
     }
@@ -5790,45 +5825,46 @@ fn env_set(name, value) {
     if value.tag == TAG_STRUCT {
         struct_incref(value.int_val)
     }
-    if len(env_cache) == 64 {
+    if len(env_cache_names) == 64 {
         let b = env_hash(name)
-        let bucket = env_cache[b]
+        let b_names = env_cache_names[b]
+        let b_idxs = env_cache_idxs[b]
         let mut best = -1
         let mut bi = 0
-        let bn = len(bucket)
+        let bn = len(b_names)
         while bi < bn {
-            let entry = bucket[bi]
-            if entry[0] == name {
-                if entry[1] > best { best = entry[1] }
+            if b_names[bi] == name {
+                let ei = b_idxs[bi]
+                if ei > best { best = ei }
             }
             bi = bi + 1
         }
-        if best >= 0 && best < len(env_vars) {
+        if best >= 0 && best < len(env_var_vals) {
             // Decref old value if it was an array or struct
-            let old_val = env_vars[best][1]
+            let old_val = env_var_vals[best]
             if old_val.tag == TAG_ARRAY {
                 array_decref(old_val.int_val)
             }
             if old_val.tag == TAG_STRUCT {
                 struct_decref(old_val.int_val)
             }
-            env_vars[best] = [name, value]
+            env_var_vals[best] = value
             return true
         }
         return false
     }
-    let mut i = len(env_vars) - 1
+    let mut i = len(env_var_names) - 1
     while i >= 0 {
-        if env_vars[i][0] == name {
+        if env_var_names[i] == name {
             // Decref old value if it was an array or struct
-            let old_val = env_vars[i][1]
+            let old_val = env_var_vals[i]
             if old_val.tag == TAG_ARRAY {
                 array_decref(old_val.int_val)
             }
             if old_val.tag == TAG_STRUCT {
                 struct_decref(old_val.int_val)
             }
-            env_vars[i] = [name, value]
+            env_var_vals[i] = value
             return true
         }
         i = i - 1
@@ -5863,8 +5899,13 @@ fn eval_expr_at(arr, idx) {
 }
 
 fn eval_expr(node) {
-    let _tmp_arr = [node]
-    return eval_expr_at(_tmp_arr, 0)
+    // rt 32-E: eliminate the `let _tmp_arr = [node]` 1-element array that
+    // every eval_expr call was creating (1 array_new + 1 push PER call).
+    // d64 micro: ~8-10M eval_expr calls in matvec inner col loop alone.
+    // eval_expr_inner already has identical fast-path literal dispatch;
+    // direct forwarding is semantically equivalent and orders of magnitude
+    // cheaper on the hot path.
+    return eval_expr_inner(node)
 }
 
 fn eval_expr_inner(node) {
@@ -6292,20 +6333,24 @@ fn eval_expr_inner(node) {
     if k == "IfLetExpr" {
         let pattern = node.left
         let scrutinee = eval_expr(node.right)
-        let saved_env_vars = env_vars
+        // rt 32-E: snapshot parallel env arrays
+        let saved_env_names = env_var_names
+        let saved_env_vals = env_var_vals
         let saved_env_scopes = env_scopes
         env_push_scope()
         if match_pattern(pattern, scrutinee) {
             let result = eval_body(node.then_body)
             env_pop_scope()
-            env_vars = saved_env_vars
+            env_var_names = saved_env_names
+            env_var_vals = saved_env_vals
             env_scopes = saved_env_scopes
             env_rebuild_cache()
             if return_flag { return return_val }
             return result
         }
         env_pop_scope()
-        env_vars = saved_env_vars
+        env_var_names = saved_env_names
+        env_var_vals = saved_env_vals
         env_scopes = saved_env_scopes
         env_rebuild_cache()
         if node.else_body != "" { return eval_block(node.else_body) }
@@ -6314,10 +6359,12 @@ fn eval_expr_inner(node) {
 
     if kid == NK_LAMBDA {
         // Capture current environment for closure
+        // rt 32-E: captured still uses [name,value] tuples (read by
+        // val_closure and call_fn_val which unpack with snap[0]/snap[1]).
         let mut captured = []
         let mut ci = 0
-        while ci < len(env_vars) {
-            captured = captured.push([env_vars[ci][0], env_vars[ci][1]])
+        while ci < len(env_var_names) {
+            captured = captured.push([env_var_names[ci], env_var_vals[ci]])
             ci = ci + 1
         }
         return val_closure("__lambda__", node.params, node.left, captured)
@@ -6613,9 +6660,12 @@ fn eval_expr_inner(node) {
             // Save env state before each arm — explicit snapshot ensures
             // pattern bindings never leak to the parent scope, even if
             // env_push/pop_scope is defeated by nested calls.
-            let saved_env_vars = env_vars
+            // rt 32-E: snapshot parallel arrays instead of tuple env_vars
+            let saved_env_names = env_var_names
+            let saved_env_vals = env_var_vals
             let saved_env_scopes = env_scopes
-            let saved_env_cache = env_cache
+            let saved_env_cache_names = env_cache_names
+            let saved_env_cache_idxs = env_cache_idxs
             let saved_env_dirty = env_scope_dirty
             env_push_scope()
             if match_pattern(pattern, scrutinee) {
@@ -6629,9 +6679,11 @@ fn eval_expr_inner(node) {
                     let result = eval_body(arm_body)
                     env_pop_scope()
                     // Restore env to pre-match state — O(1) swap, no rebuild
-                    env_vars = saved_env_vars
+                    env_var_names = saved_env_names
+                    env_var_vals = saved_env_vals
                     env_scopes = saved_env_scopes
-                    env_cache = saved_env_cache
+                    env_cache_names = saved_env_cache_names
+                    env_cache_idxs = saved_env_cache_idxs
                     env_scope_dirty = saved_env_dirty
                     if return_flag {
                         return return_val
@@ -6641,9 +6693,11 @@ fn eval_expr_inner(node) {
             }
             env_pop_scope()
             // Restore env to pre-match state for failed arms too — O(1)
-            env_vars = saved_env_vars
+            env_var_names = saved_env_names
+            env_var_vals = saved_env_vals
             env_scopes = saved_env_scopes
-            env_cache = saved_env_cache
+            env_cache_names = saved_env_cache_names
+            env_cache_idxs = saved_env_cache_idxs
             env_scope_dirty = saved_env_dirty
             mi = mi + 1
         }
@@ -6999,10 +7053,11 @@ fn match_pattern(pattern, value) {
     if pk == "Ident" {
         let name = pattern.name
         // Check if it's a known enum constant (e.g., None)
-        let mut ei = len(env_vars) - 1
+        // rt 32-E: parallel arrays lookup
+        let mut ei = len(env_var_names) - 1
         while ei >= 0 {
-            if env_vars[ei][0] == name {
-                let existing = env_vars[ei][1]
+            if env_var_names[ei] == name {
+                let existing = env_var_vals[ei]
                 if existing.tag == TAG_ENUM {
                     // Compare enum values
                     return vals_equal(existing, value)
@@ -8227,23 +8282,37 @@ fn call_fn_val(fn_val, args) {
     let is_closure = fn_val.str_val == "closure"
 
     // For closures, save current env triple and restore captured env+cache O(1)
-    let mut saved_vars = []
+    // rt 32-E: snap[0] is a list of [name, value] tuples (closure capture
+    // retains tuple format since it's a one-shot alloc at lambda creation,
+    // not on every env_define). Unpack into parallel arrays on restore.
+    let mut saved_names = []
+    let mut saved_vals = []
     let mut saved_scopes = []
-    let mut saved_cache = []
+    let mut saved_cache_names = []
+    let mut saved_cache_idxs = []
     let mut saved_dirty = []
     if is_closure {
-        saved_vars = env_vars
+        saved_names = env_var_names
+        saved_vals = env_var_vals
         saved_scopes = env_scopes
-        saved_cache = env_cache
+        saved_cache_names = env_cache_names
+        saved_cache_idxs = env_cache_idxs
         saved_dirty = env_scope_dirty
         let snap = closure_store[fn_val.int_val]
-        env_vars = snap[0]
-        // Restore cached bucket array if available; otherwise rebuild
-        if len(snap[1]) == 64 {
-            env_cache = snap[1]
-        } else {
-            env_rebuild_cache()
+        let captured = snap[0]
+        let mut _cn = []
+        let mut _cv = []
+        let mut _ci = 0
+        while _ci < len(captured) {
+            _cn = _cn.push(captured[_ci][0])
+            _cv = _cv.push(captured[_ci][1])
+            _ci = _ci + 1
         }
+        env_var_names = _cn
+        env_var_vals = _cv
+        // Always rebuild cache — the cached bucket snapshot uses the old
+        // tuple format which is no longer compatible with parallel buckets.
+        env_rebuild_cache()
         env_scopes = [0]
         env_scope_dirty = []
     }
@@ -8346,9 +8415,11 @@ fn call_fn_val(fn_val, args) {
 
     // Restore env for closures — O(1) swap back, no rebuild needed
     if is_closure {
-        env_vars = saved_vars
+        env_var_names = saved_names
+        env_var_vals = saved_vals
         env_scopes = saved_scopes
-        env_cache = saved_cache
+        env_cache_names = saved_cache_names
+        env_cache_idxs = saved_cache_idxs
         env_scope_dirty = saved_dirty
     }
 
@@ -12252,8 +12323,8 @@ fn call_builtin(name, args) {
             // Build a closure that captures f and g
             let mut captured = []
             let mut ci = 0
-            while ci < len(env_vars) {
-                captured = captured.push([env_vars[ci][0], env_vars[ci][1]])
+            while ci < len(env_var_names) {
+                captured = captured.push([env_var_names[ci], env_var_vals[ci]])
                 ci = ci + 1
             }
             captured = captured.push(["__compose_f", f])
@@ -12291,8 +12362,8 @@ fn call_builtin(name, args) {
             // Build closure capturing f and partial args
             let mut captured = []
             let mut ci = 0
-            while ci < len(env_vars) {
-                captured = captured.push([env_vars[ci][0], env_vars[ci][1]])
+            while ci < len(env_var_names) {
+                captured = captured.push([env_var_names[ci], env_var_vals[ci]])
                 ci = ci + 1
             }
             captured = captured.push(["__curry_fn", f])
@@ -12312,8 +12383,8 @@ fn call_builtin(name, args) {
             let val = args[0]
             let mut captured = []
             let mut ci = 0
-            while ci < len(env_vars) {
-                captured = captured.push([env_vars[ci][0], env_vars[ci][1]])
+            while ci < len(env_var_names) {
+                captured = captured.push([env_var_names[ci], env_var_vals[ci]])
                 ci = ci + 1
             }
             captured = captured.push(["__constant_val", val])
@@ -14187,28 +14258,16 @@ fn val_fn(name, params, body) {
 }
 
 fn val_closure(name, params, body, captured_env) {
-    // Store [env_vars_snapshot, env_cache_snapshot] in closure_store.
-    // On closure call, both are swapped in O(1) — no env_rebuild_cache().
+    // Store [captured_env_tuples, cache_snap] in closure_store.
+    // rt 32-E: cache_snap left empty — call_fn_val always env_rebuild_cache()s
+    // because the old tuple-bucket snap is incompatible with the split
+    // (names, idxs) parallel buckets. captured_env is still a list of
+    // [name, value] tuples (legacy). The per-closure cache rebuild cost
+    // is amortised by not allocating/scanning the 64-bucket snapshot on
+    // every lambda creation (hot in matvec/gelu which create no closures,
+    // but still avoids the tuple-bucket double-filter pass).
     let idx = len(closure_store)
-    // Snapshot the current cache alongside the vars
-    let mut cache_snap = []
-    if len(env_cache) == 64 {
-        let mut ci = 0
-        while ci < 64 {
-            let bucket = env_cache[ci]
-            let mut bc = []
-            let mut bi = 0
-            while bi < len(bucket) {
-                if bucket[bi][1] < len(captured_env) {
-                    bc = bc.push(bucket[bi])
-                }
-                bi = bi + 1
-            }
-            cache_snap = cache_snap.push(bc)
-            ci = ci + 1
-        }
-    }
-    closure_store = closure_store.push([captured_env, cache_snap])
+    closure_store = closure_store.push([captured_env, []])
     return Val { tag: TAG_FN, int_val: idx, float_val: 0.0, bool_val: false, str_val: "closure", char_val: "", array_val: "", fn_name: name, fn_params: params, fn_body: body, struct_name: "", struct_fields: "" }
 }
 
@@ -14793,6 +14852,9 @@ fn format_stack_trace() {
 
 fn interpret(ast) {
     // Reset state
+    // rt 32-E: reset parallel env arrays (names + vals).
+    env_var_names = []
+    env_var_vals = []
     env_vars = []
     env_scopes = [0]
     env_cache_init()
