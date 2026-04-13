@@ -339,15 +339,19 @@ static int64_t _hx_stats_array_push     = 0;
 static int64_t _hx_stats_array_grow     = 0;   // realloc that actually grows cap
 static int64_t _hx_stats_str_concat     = 0;
 static int64_t _hx_stats_array_reserve  = 0;
+static int64_t _hx_stats_map_new        = 0;
+static int64_t _hx_stats_map_set        = 0;
 static int _hx_stats_enabled = -1;             // lazy probe of env
 
 static void _hx_stats_dump(void) {
-    fprintf(stderr, "[HEXA_ALLOC_STATS] array_new=%lld push=%lld grow=%lld reserve=%lld str_concat=%lld\n",
+    fprintf(stderr, "[HEXA_ALLOC_STATS] array_new=%lld push=%lld grow=%lld reserve=%lld str_concat=%lld map_new=%lld map_set=%lld\n",
         (long long)_hx_stats_array_new,
         (long long)_hx_stats_array_push,
         (long long)_hx_stats_array_grow,
         (long long)_hx_stats_array_reserve,
-        (long long)_hx_stats_str_concat);
+        (long long)_hx_stats_str_concat,
+        (long long)_hx_stats_map_new,
+        (long long)_hx_stats_map_set);
 }
 
 static int _hx_stats_on(void) {
@@ -491,6 +495,7 @@ static int hmap_find(HexaMapTable* t, const char* key, uint32_t h) {
 }
 
 HexaVal hexa_map_new() {
+    if (_hx_stats_on()) _hx_stats_map_new++;
     HexaVal v = {.tag=TAG_MAP};
     v.map.tbl = NULL;
     v.map.len = 0;
@@ -498,6 +503,7 @@ HexaVal hexa_map_new() {
 }
 
 HexaVal hexa_map_set(HexaVal m, const char* key, HexaVal val) {
+    if (_hx_stats_on()) _hx_stats_map_set++;
     // Lazy-alloc table on first insert
     if (!m.map.tbl) {
         m.map.tbl = hmap_alloc(HMAP_INIT_CAP);
