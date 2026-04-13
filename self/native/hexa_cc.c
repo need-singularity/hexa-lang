@@ -7186,6 +7186,19 @@ int main(int argc, char** argv) {
         return 1;
     }
     HexaVal src = hexa_read_file(hexa_str(argv[1]));
+    // B10 safety net: hexa_v2 does NOT resolve `use "..."` imports.
+    // They become UseStmt placeholders and cross-module symbols fail link.
+    // Warn so users don't get silent undefined-reference errors at clang.
+    // flatten_imports stamps output with a marker — suppress if present.
+    if (src.tag == TAG_STR && src.s &&
+        (strstr(src.s, "\nuse \"") || strncmp(src.s, "use \"", 5) == 0) &&
+        strncmp(src.s, "// === FLATTENED", 16) != 0) {
+        fprintf(stderr,
+            "warn: %s has `use \"...\"` but hexa_v2 does not resolve imports.\n"
+            "      Run `hexa build %s -o <out.c> --c-only` for auto-bundle,\n"
+            "      or `hexa run scripts/flatten_imports.hexa %s <bundled.hexa>` first.\n",
+            argv[1], argv[1], argv[1]);
+    }
     HexaVal tokens = tokenize(src);
     HexaVal ast = parse(tokens);
     long long __err_n = (p_error_count()).i;
