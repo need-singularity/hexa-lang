@@ -5149,6 +5149,71 @@ static HexaVal _gen2_maybe_snapshot(HexaVal init_c, HexaVal rhs_node) {
     return hexa_add(hexa_add(hexa_str("hexa_val_snapshot_array("), init_c), hexa_str(")"));
 }
 
+// rt#32-O: snapshot-promote for NK_CALL arguments. Root cause: when an arg
+// expression yields an arena-backed array (cap<0), a *prior* call in the same
+// args-tuple may push+rewind an arena mark, invalidating the stored .items
+// pointer. This crash was seen with HEXA_ARRAY_PUSH_ARENA=1 on fib(2):
+//   f(n-1) + f(n-2)
+// Here n-1's callee pops a mark; the outer call's cached pointer for an arg
+// that came back as arena-backed (or referenced one pre-call) aliases freed
+// arena memory.
+//
+// Fix: wrap arg evaluations with hexa_val_snapshot_array(...). Runtime behavior
+// is O(1) passthrough for non-arrays (tag!=TAG_ARRAY) and for heap arrays
+// (cap>=0); only genuinely arena-backed arrays pay a promote-to-heap memcpy.
+//
+// Two modes, gated by HEXA_CODEGEN_SNAPSHOT_ARGS:
+//   "0"             → off (pre-rt#32-O behavior)
+//   "conservative"  → wrap only Ident args that reference hot globals
+//   anything else   → aggressive: wrap every non-literal arg  (DEFAULT)
+static int _gen2_snapshot_args_mode_cache = -2;  // -2=unread, -1=off, 0=conservative, 1=aggressive
+static int _gen2_snapshot_args_mode(void) {
+    if (_gen2_snapshot_args_mode_cache == -2) {
+        const char* e = getenv("HEXA_CODEGEN_SNAPSHOT_ARGS");
+        if (!e || !e[0]) _gen2_snapshot_args_mode_cache = 1;  // default aggressive
+        else if (e[0] == '0') _gen2_snapshot_args_mode_cache = -1;
+        else if (strcmp(e, "conservative") == 0) _gen2_snapshot_args_mode_cache = 0;
+        else _gen2_snapshot_args_mode_cache = 1;
+    }
+    return _gen2_snapshot_args_mode_cache;
+}
+
+// Returns 1 if arg_node is a "trivially non-array" literal that can never
+// need snapshot-promote. Covers the overwhelmingly common numeric/string arg
+// shapes (fib(n-1) → the "n-1" Binary still wraps under aggressive, but plain
+// "42" / "\"s\"" / true / 'c' / 1.5 skip the wrapper).
+static int _gen2_arg_is_trivial_literal(HexaVal arg_node) {
+    if (hexa_truthy(hexa_eq(hexa_type_of(arg_node), hexa_str("string")))) return 1;
+    HexaVal kind = hexa_map_get(arg_node, "kind");
+    if (hexa_truthy(hexa_eq(kind, hexa_str("IntLit")))) return 1;
+    if (hexa_truthy(hexa_eq(kind, hexa_str("FloatLit")))) return 1;
+    if (hexa_truthy(hexa_eq(kind, hexa_str("BoolLit")))) return 1;
+    if (hexa_truthy(hexa_eq(kind, hexa_str("CharLit")))) return 1;
+    if (hexa_truthy(hexa_eq(kind, hexa_str("StringLit")))) return 1;
+    return 0;
+}
+
+// Wrap a single arg C expression with hexa_val_snapshot_array(...) per the
+// current HEXA_CODEGEN_SNAPSHOT_ARGS mode. Caller must also respect the outer
+// HEXA_CODEGEN_SNAPSHOT master gate.
+static HexaVal _gen2_maybe_snapshot_arg(HexaVal arg_c, HexaVal arg_node) {
+    if (!_gen2_snapshot_enabled()) return arg_c;
+    int mode = _gen2_snapshot_args_mode();
+    if (mode < 0) return arg_c;  // disabled
+    // Trivial literals never carry array items.
+    if (_gen2_arg_is_trivial_literal(arg_node)) return arg_c;
+    if (mode == 0) {
+        // conservative — Ident of hot-global only.
+        if (hexa_truthy(hexa_eq(hexa_type_of(arg_node), hexa_str("string")))) return arg_c;
+        HexaVal kind = hexa_map_get(arg_node, "kind");
+        if (!hexa_truthy(hexa_eq(kind, hexa_str("Ident")))) return arg_c;
+        HexaVal name = hexa_map_get(arg_node, "name");
+        if (!_gen2_is_snapshot_hot_global(name)) return arg_c;
+    }
+    // mode == 1 (aggressive): wrap every non-literal.
+    return hexa_add(hexa_add(hexa_str("hexa_val_snapshot_array("), arg_c), hexa_str(")"));
+}
+
 HexaVal gen2_stmt(HexaVal node, HexaVal depth) {
     HexaVal pad = gen2_indent(depth);
     HexaVal k = hexa_map_get(node, "kind");
@@ -5961,7 +6026,12 @@ HexaVal gen2_expr(HexaVal node) {
             HexaVal arg_strs = hexa_array_new();
             HexaVal ai = hexa_int(0);
             while (hexa_truthy(hexa_bool((ai).i < (hexa_int(hexa_len(hexa_map_get(node, "args")))).i))) {
-                arg_strs = hexa_array_push(arg_strs, gen2_expr(hexa_index_get(hexa_map_get(node, "args"), ai)));
+                // rt#32-O: snapshot-wrap each arg to insulate arena-backed
+                // arrays from peer args that may rewind arena marks.
+                HexaVal _arg_node = hexa_index_get(hexa_map_get(node, "args"), ai);
+                HexaVal _arg_c = gen2_expr(_arg_node);
+                _arg_c = _gen2_maybe_snapshot_arg(_arg_c, _arg_node);
+                arg_strs = hexa_array_push(arg_strs, _arg_c);
                 ai = hexa_add(ai, hexa_int(1));
             }
             if (hexa_truthy(_is_known_fn_global(name))) {
@@ -6134,7 +6204,11 @@ HexaVal gen2_expr(HexaVal node) {
         HexaVal cargs = hexa_array_new();
         HexaVal ci = hexa_int(0);
         while (hexa_truthy(hexa_bool((ci).i < (nargs).i))) {
-            cargs = hexa_array_push(cargs, gen2_expr(hexa_index_get(hexa_map_get(node, "args"), ci)));
+            // rt#32-O: snapshot-wrap each arg (indirect call path).
+            HexaVal _arg_node = hexa_index_get(hexa_map_get(node, "args"), ci);
+            HexaVal _arg_c = gen2_expr(_arg_node);
+            _arg_c = _gen2_maybe_snapshot_arg(_arg_c, _arg_node);
+            cargs = hexa_array_push(cargs, _arg_c);
             ci = hexa_add(ci, hexa_int(1));
         }
         if (hexa_truthy(hexa_eq(nargs, hexa_int(0)))) {

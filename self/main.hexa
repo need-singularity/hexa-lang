@@ -32,6 +32,7 @@ fn cmd_help() {
     println("")
     println("SUBCOMMANDS:")
     println("    run <file> [args...]    Execute a .hexa script (interpreter)")
+    println("    parse <file>            Parse-only check (no exec, no codegen)")
     println("    build <file> [-o out]   Compile .hexa to native binary")
     println("    bench <file> [opts]     Benchmark a .hexa script (wall/RSS/alloc)")
     println("                              opts: --runs N (default 3)")
@@ -309,6 +310,40 @@ fn codesign_if_macos(exe) {
     }
 }
 
+// ── T28: hexa_v2 binary path resolution ──────────────────
+// 목적: `hexa build` / `hexa parse` 가 cwd 무관하게 hexa_v2 트랜스파일러를
+//       찾을 수 있도록 한다. 과거에는 `./self/native/hexa_v2` (cwd 의존)
+//       하드코딩이라, hexa-lang 리포 바깥에서 실행하면 바이너리 미발견
+//       상태에서도 exec 가 빈 파일/실패 출력을 찍고 조용히 exit 0 하는
+//       silent-failure 회귀가 있었다 (T28).
+//
+// 탐색 순서:
+//   1) ./self/native/hexa_v2 (cwd — 리포 안에서 실행 시 기존 동작 유지)
+//   2) $HOME/Dev/hexa-lang/self/native/hexa_v2 (개발 fallback — bench 와 동일)
+// 둘 다 없으면 빈 문자열 반환. 호출자가 명시 오류 + exit(1) 처리.
+fn resolve_hexa_v2() {
+    let cwd_bin = "./self/native/hexa_v2"
+    let cwd_chk = exec("test -x '" + cwd_bin + "' && printf yes || printf no")
+    if cwd_chk == "yes" {
+        return cwd_bin
+    }
+    let home_bin = exec("printf '%s' \"$HOME/Dev/hexa-lang/self/native/hexa_v2\"")
+    let home_chk = exec("test -x '" + home_bin + "' && printf yes || printf no")
+    if home_chk == "yes" {
+        return home_bin
+    }
+    return ""
+}
+
+// 실패 메시지 공통화 — silent exit 0 회귀 재발 방지.
+fn die_no_hexa_v2() {
+    println("error: hexa_v2 transpiler binary not found")
+    println("       searched: ./self/native/hexa_v2")
+    println("                 $HOME/Dev/hexa-lang/self/native/hexa_v2")
+    println("       run `hexa cc` (inside hexa-lang repo) to build it")
+    exit(1)
+}
+
 fn cmd_build(src, out) {
     // bt 37: AOT 캐시 atomic rename.
     // 문제: 두 `hexa build` 가 동일 `out` 을 쓰면 clang 이 같은 파일을 동시에
@@ -320,10 +355,23 @@ fn cmd_build(src, out) {
     //       - 마지막으로 rename 한 쪽이 승자. 두 프로세스 모두 exit 0, exe 유효.
     // 캐시 슬롯: `.hexa-cache/<hash>/exe.tmp.$$` 도 동일 패턴 — 향후 AOT cache
     //       경로를 cmd_run 에 복원할 때 재사용 (현재는 cmd_build 출력 경로에만 적용).
+    //
+    // T28: 소스 파일 존재 확인 + hexa_v2 경로 resolve. 둘 중 하나라도 실패하면
+    //      이전처럼 clang 호출 → mv → OK 를 찍으며 exit 0 하는 silent-failure 대신
+    //      명시 오류 + exit(1) 로 실패하도록 한다.
+    let src_exists = exec("test -f '" + src + "' && printf yes || printf no")
+    if src_exists != "yes" {
+        println("error: source file not found: " + src)
+        exit(1)
+    }
+    let v2 = resolve_hexa_v2()
+    if len(v2) == 0 {
+        die_no_hexa_v2()
+    }
     println("=== Building " + src + " -> " + out + " ===")
     let stem = basename_stem(out)
     let c_file = "build/artifacts/" + stem + ".c"
-    let trans = "./self/native/hexa_v2 " + src + " " + c_file + " 2>&1"
+    let trans = v2 + " " + src + " " + c_file + " 2>&1"
     println("  [1/2] " + trans)
     let r1 = exec(trans)
     if len(r1) > 0 { println("    " + r1) }
@@ -886,6 +934,45 @@ fn cmd_bench(file, runs, json_mode, compare_bin) {
     }
 }
 
+// ── T27: cmd_parse — parse-only verification (no exec, no codegen) ──
+// 목적: L0 guard 등이 `.hexa` 파일 구문 유효성만 확인하고 싶을 때, 현재는
+//       `hexa run` (실제 실행) 으로 검증하는 안전 문제가 있었다. `hexa parse`
+//       는 트랜스파일러를 호출해 파싱까지만 수행하고, 결과 .c 는 버리며
+//       "Parse error" 라인 존재 여부로 exit code 를 결정한다.
+//
+// 구현 메모:
+//   - hexa_v2 는 현재 파싱 실패를 stdout 에 "Parse error at L:C: ..." 로 찍고도
+//     exit 0 하는 특성이 있어 (코드생성은 best-effort 로 진행), 출력 grep 으로
+//     판정한다. 바이너리 자체 exit 코드 버그는 별도 추적.
+//   - 출력 .c 는 /tmp/hexa_parse_check_$$.c 로 임시. 후처리 삭제.
+//   - 성공: "OK" 한 줄, exit 0. 실패: 파서 에러 라인 그대로 + exit(1).
+fn cmd_parse(src) {
+    let src_exists = exec("test -f '" + src + "' && printf yes || printf no")
+    if src_exists != "yes" {
+        println("error: source file not found: " + src)
+        exit(1)
+    }
+    let v2 = resolve_hexa_v2()
+    if len(v2) == 0 {
+        die_no_hexa_v2()
+    }
+    // /tmp/hexa_parse_check.<PID>.c — 셸 PID 로 충돌 회피.
+    let tmp_c = exec("printf '/tmp/hexa_parse_check.%s.c' \"$$\"")
+    let trans = v2 + " '" + src + "' '" + tmp_c + "' 2>&1"
+    let r = exec(trans)
+    // 정리 — 생성되었든 안 되었든 best-effort.
+    let _rm = exec("rm -f '" + tmp_c + "' 2>/dev/null")
+    // hexa_v2 출력에 "Parse error" 라인이 있으면 파서 실패.
+    // grep -q 는 일치 시 exit 0, 미일치 시 exit 1.
+    let has_err = exec("printf '%s' \"" + r + "\" | grep -q 'Parse error' && printf yes || printf no")
+    if has_err == "yes" {
+        // 원본 stderr/stdout 재출력 (사용자가 라인/컬럼 정보를 볼 수 있도록).
+        println(r)
+        exit(1)
+    }
+    println("OK: " + src + " parses cleanly")
+}
+
 // == Entry ==
 // 런타임이 argv[0]을 중복 삽입하므로 실제 사용자 인자는 av[2]부터 시작.
 // av[0]=exec경로, av[1]=exec경로(중복), av[2]=서브커맨드, av[3..]=서브 인자
@@ -987,6 +1074,15 @@ if len(av) < 3 {
                 }
             }
             cmd_bench(bopts[0], bopts[1], bopts[2] == 1, bopts[3])
+        }
+    } else if sub == "parse" {
+        // T27: parse-only check — exit 0 OK, exit 1 with error on stderr/stdout.
+        if len(av) < 4 {
+            println("error: 'parse' requires <file>")
+            cmd_help()
+            exit(1)
+        } else {
+            cmd_parse(av[3])
         }
     } else if sub == "build" {
         if len(av) < 4 {
