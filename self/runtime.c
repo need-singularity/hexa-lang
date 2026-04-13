@@ -41,6 +41,17 @@ HexaVal hexa_array_new(void);
 HexaVal hexa_void(void);
 int hexa_is_type(HexaVal v, const char* type_name);
 
+// rt#37: inline cache for obj.field — the struct is defined here so every
+// generated C file (via #include "runtime.c") can declare `static HexaIC`
+// slots. The lookup itself is defined below as `static inline`.
+typedef struct HexaIC {
+    void* keys_ptr;   // last-seen m.map.keys pointer (shape id)
+    int   len;        // last-seen m.map.len
+    int   idx;        // cached field offset
+    uint64_t hits;
+    uint64_t misses;
+} HexaIC;
+
 // ── Tagged Value ─────────────────────────────────────────
 // All HEXA values are represented as tagged unions (NaN-boxing alternative)
 
@@ -258,6 +269,84 @@ HexaVal hexa_map_get(HexaVal m, const char* key) {
     fprintf(stderr, "map key '%s' not found\n", key);
     return hexa_void();
 }
+
+// ── rt#37: Inline cache for field access ─────────────────
+// Each call site of `obj.field` gets a static HexaIC slot. On hit, we skip
+// the strcmp-chain and return m.map.vals[ic->idx] directly. On miss we fall
+// back to hexa_map_get and repopulate. Shape check uses (keys_ptr, len) —
+// a struct constructor inserts keys in a fixed order, so once its (keys, len)
+// is stable, idx is valid for every subsequent access.
+//
+// Invalidation: if keys pointer or len differ, we treat it as a miss. That
+// covers (a) a different struct instance reused through the same call site
+// and (b) a struct mutated via hexa_map_set (which may realloc the keys
+// array). A monomorphic call site converges to ~100% hit rate after 1 call.
+//
+// Gate: HEXA_IC_STATS=1 dumps per-process hit/miss totals at exit.
+
+static uint64_t g_hexa_ic_hits   = 0;
+static uint64_t g_hexa_ic_misses = 0;
+static int      g_hexa_ic_stats_enabled   = -1; // -1=unchecked, 0=off, 1=on
+static int      g_hexa_ic_stats_installed = 0;
+
+static void hexa_ic_dump_stats(void) {
+    uint64_t total = g_hexa_ic_hits + g_hexa_ic_misses;
+    double rate = total ? (100.0 * (double)g_hexa_ic_hits / (double)total) : 0.0;
+    fprintf(stderr,
+        "[rt#37 IC] hits=%llu misses=%llu total=%llu hit_rate=%.2f%%\n",
+        (unsigned long long)g_hexa_ic_hits,
+        (unsigned long long)g_hexa_ic_misses,
+        (unsigned long long)total,
+        rate);
+}
+
+static inline int hexa_ic_stats_on(void) {
+    if (g_hexa_ic_stats_enabled < 0) {
+        const char* on = getenv("HEXA_IC_STATS");
+        g_hexa_ic_stats_enabled = (on && on[0] != '0' && on[0] != '\0') ? 1 : 0;
+        if (g_hexa_ic_stats_enabled && !g_hexa_ic_stats_installed) {
+            g_hexa_ic_stats_installed = 1;
+            atexit(hexa_ic_dump_stats);
+        }
+    }
+    return g_hexa_ic_stats_enabled;
+}
+
+// Slow path: full scan + update cache. Kept out-of-line to shrink the inline
+// hot path macro footprint. Stats bump lives here so hits stay counter-free
+// when HEXA_IC_STATS is unset.
+static HexaVal hexa_map_get_ic_slow(HexaVal m, const char* key, HexaIC* ic) {
+    if (hexa_ic_stats_on()) { ic->misses++; g_hexa_ic_misses++; }
+    if (m.tag == TAG_MAP) {
+        for (int i = 0; i < m.map.len; i++) {
+            if (strcmp(m.map.keys[i], key) == 0) {
+                ic->keys_ptr = (void*)m.map.keys;
+                ic->len      = m.map.len;
+                ic->idx      = i;
+                return m.map.vals[i];
+            }
+        }
+    }
+    return hexa_map_get(m, key);
+}
+
+// Hot path as a MACRO so the fast path avoids the 32-byte HexaVal call ABI
+// altogether. We evaluate `m` exactly once via __ic_m to be safe with side
+// effects, then:
+//   - if (m.map.keys == ic->keys_ptr && m.map.len == ic->len) -> return cached
+//   - else                                                   -> slow fallback
+// The stat bump on the hot path is compiled out when HEXA_IC_STATS is unset
+// because g_hexa_ic_stats_enabled flips to 0 on first slow path miss.
+#define hexa_map_get_ic(M, KEY, IC) \
+    ({ HexaVal __ic_m = (M); HexaIC* __ic = (IC); \
+       ((void*)__ic_m.map.keys == __ic->keys_ptr \
+        && __ic_m.map.len == __ic->len \
+        && __ic->idx < __ic->len) \
+           ? (g_hexa_ic_stats_enabled > 0 \
+              ? (__ic->hits++, g_hexa_ic_hits++, __ic_m.map.vals[__ic->idx]) \
+              : __ic_m.map.vals[__ic->idx]) \
+           : hexa_map_get_ic_slow(__ic_m, (KEY), __ic); })
+
 
 HexaVal hexa_map_keys(HexaVal m) {
     HexaVal arr = hexa_array_new();
