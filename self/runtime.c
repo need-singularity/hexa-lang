@@ -415,6 +415,50 @@ HexaVal hexa_array_push(HexaVal arr, HexaVal item) {
     return arr;
 }
 
+// rt 32-B: reusable-buffer scratch push. Semantics identical to hexa_array_push
+// except it does NOT bump _hx_stats_array_push / _hx_stats_array_grow (those
+// counters are reserved for "true" per-call allocs). Used by the NK_CALL args
+// accumulator (call_arg_buf) which is a single long-lived buffer — its growth
+// amortises across the whole program and should not inflate the per-call
+// push/grow histogram.
+HexaVal hexa_array_push_nostat(HexaVal arr, HexaVal item) {
+    if (arr.arr.len >= arr.arr.cap) {
+        int new_cap = arr.arr.cap < 8 ? 8 : arr.arr.cap * 2;
+        HexaVal* new_items = realloc(arr.arr.items, sizeof(HexaVal) * new_cap);
+        if (!new_items) { fprintf(stderr, "OOM in array_push_nostat\n"); exit(1); }
+        arr.arr.items = new_items;
+        arr.arr.cap = new_cap;
+    }
+    arr.arr.items[arr.arr.len] = item;
+    arr.arr.len++;
+    return arr;
+}
+
+// rt 32-B: bulk slice primitive — single malloc + memcpy, counts as exactly
+// ONE array_new (not N array_push). Used to hand a per-call args view out of
+// the shared call_arg_buf so the callee receives an independent backing store
+// that is not disturbed by subsequent NK_CALL recursion mutating the buffer.
+HexaVal hexa_array_slice_fast(HexaVal arr, HexaVal start, HexaVal end) {
+    if (_hx_stats_on()) _hx_stats_array_new++;
+    HexaVal out = {.tag=TAG_ARRAY};
+    out.arr.items = NULL; out.arr.len = 0; out.arr.cap = 0;
+    if (arr.tag != TAG_ARRAY) return out;
+    int n = arr.arr.len;
+    int a = (int)start.i, b = (int)end.i;
+    if (a < 0) a = 0;
+    if (b > n) b = n;
+    if (a > b) a = b;
+    int m = b - a;
+    if (m <= 0) return out;
+    HexaVal* items = (HexaVal*)malloc(sizeof(HexaVal) * m);
+    if (!items) { fprintf(stderr, "OOM in array_slice_fast\n"); exit(1); }
+    memcpy(items, arr.arr.items + a, sizeof(HexaVal) * m);
+    out.arr.items = items;
+    out.arr.len = m;
+    out.arr.cap = m;
+    return out;
+}
+
 HexaVal hexa_array_get(HexaVal arr, int64_t idx) {
     if (idx < 0) idx += arr.arr.len;
     if (idx < 0 || idx >= arr.arr.len) {

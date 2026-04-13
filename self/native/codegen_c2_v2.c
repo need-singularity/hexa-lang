@@ -740,6 +740,13 @@ HexaVal gen2_method_builtin(HexaVal obj_expr, HexaVal method, HexaVal args) {
     if (hexa_truthy(hexa_eq(method, hexa_str("truncate")))) {
         return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_array_truncate("), obj_expr), hexa_str(", ")), gen2_expr(hexa_index_get(args, hexa_int(0)))), hexa_str(")"));
     }
+    // rt 32-B — scratch push (no stats) + bulk slice for reusable call_arg_buf.
+    if (hexa_truthy(hexa_eq(method, hexa_str("push_nostat")))) {
+        return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_array_push_nostat("), obj_expr), hexa_str(", ")), gen2_expr(hexa_index_get(args, hexa_int(0)))), hexa_str(")"));
+    }
+    if (hexa_truthy(hexa_eq(method, hexa_str("slice_fast")))) {
+        return hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_array_slice_fast("), obj_expr), hexa_str(", ")), gen2_expr(hexa_index_get(args, hexa_int(0)))), hexa_str(", ")), gen2_expr(hexa_index_get(args, hexa_int(1)))), hexa_str(")"));
+    }
     return hexa_add(hexa_add(hexa_str("hexa_void() /* unknown method."), method), hexa_str(" */"));
     return hexa_void();
 }
@@ -1183,6 +1190,13 @@ HexaVal gen2_expr(HexaVal node) {
             // bt 55 — in-place array length shrink; caller must reassign.
             if (hexa_truthy(hexa_eq(method, hexa_str("truncate")))) {
                 return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_array_truncate("), obj), hexa_str(", ")), gen2_expr(hexa_index_get(hexa_map_get(node, "args"), hexa_int(0)))), hexa_str(")"));
+            }
+            // rt 32-B — scratch push (no stats) + bulk slice for reusable call_arg_buf.
+            if (hexa_truthy(hexa_eq(method, hexa_str("push_nostat")))) {
+                return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_array_push_nostat("), obj), hexa_str(", ")), gen2_expr(hexa_index_get(hexa_map_get(node, "args"), hexa_int(0)))), hexa_str(")"));
+            }
+            if (hexa_truthy(hexa_eq(method, hexa_str("slice_fast")))) {
+                return hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_array_slice_fast("), obj), hexa_str(", ")), gen2_expr(hexa_index_get(hexa_map_get(node, "args"), hexa_int(0)))), hexa_str(", ")), gen2_expr(hexa_index_get(hexa_map_get(node, "args"), hexa_int(1)))), hexa_str(")"));
             }
             return hexa_add(hexa_add(hexa_str("/* method."), method), hexa_str(" */"));
         }
