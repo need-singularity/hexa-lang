@@ -967,6 +967,9 @@ HexaVal gen2_expr(HexaVal node) {
                 HexaVal a = gen2_expr(hexa_index_get(hexa_map_get(node, "args"), hexa_int(0)));
                 return hexa_add(hexa_add(hexa_str("hexa_bool(access("), a), hexa_str(".s, F_OK) == 0)"));
             }
+            if (hexa_truthy(hexa_bool(hexa_truthy(hexa_eq(name, hexa_str("env"))) || hexa_truthy(hexa_eq(name, hexa_str("env_var")))))) {
+                return hexa_add(hexa_add(hexa_str("hexa_env_var("), gen2_expr(hexa_index_get(hexa_map_get(node, "args"), hexa_int(0)))), hexa_str(")"));
+            }
             if (hexa_truthy(hexa_eq(name, hexa_str("format")))) {
                 HexaVal fmt_args = hexa_str("hexa_array_new()");
                 HexaVal fi = hexa_int(1);
@@ -1683,6 +1686,12 @@ HexaVal _is_builtin_name(HexaVal name) {
         return hexa_bool(1);
     }
     if (hexa_truthy(hexa_eq(name, hexa_str("false")))) {
+        return hexa_bool(1);
+    }
+    if (hexa_truthy(hexa_eq(name, hexa_str("env")))) {
+        return hexa_bool(1);
+    }
+    if (hexa_truthy(hexa_eq(name, hexa_str("env_var")))) {
         return hexa_bool(1);
     }
     return hexa_bool(0);

@@ -743,6 +743,12 @@ HexaVal parse_assert_stmt(void) {
 
 HexaVal parse_use_decl(void) {
     p_advance();
+    if (hexa_truthy(hexa_eq(p_peek_kind(), hexa_str("StringLit")))) {
+        HexaVal str_tok = p_advance();
+        HexaVal str_val = hexa_map_get(str_tok, "value");
+        HexaVal str_items = hexa_array_push(hexa_array_new(), str_val);
+        return hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_new(), "kind", hexa_str("UseStmt")), "name", str_val), "value", hexa_str("")), "op", hexa_str("")), "left", hexa_str("")), "right", hexa_str("")), "cond", hexa_str("")), "then_body", hexa_str("")), "else_body", hexa_str("")), "params", hexa_str("")), "body", hexa_str("")), "args", hexa_str("")), "fields", hexa_str("")), "items", str_items), "variants", hexa_str("")), "arms", hexa_str("")), "iter_expr", hexa_str("")), "ret_type", hexa_str("")), "target", hexa_str("")), "trait_name", hexa_str("")), "methods", hexa_str(""));
+    }
     HexaVal path = hexa_array_new();
     path = hexa_array_push(path, p_expect_ident());
     while (hexa_truthy(hexa_eq(p_peek_kind(), hexa_str("ColonColon")))) {
@@ -5149,6 +5155,52 @@ static HexaVal _gen2_maybe_snapshot(HexaVal init_c, HexaVal rhs_node) {
     return hexa_add(hexa_add(hexa_str("hexa_val_snapshot_array("), init_c), hexa_str(")"));
 }
 
+// rt#32-O (extension): hot-*locals* whose RHS is a slice_fast / method-call on
+// a hot global. The interpreter's NK_CALL path does:
+//   let call_args = call_arg_buf.slice_fast(_ca_base, call_arg_top)
+//   call_arg_buf = call_arg_buf.truncate(_ca_base)
+//   callee(call_args)  // recurses and rewinds arena → dangles call_args.items
+// The call_args.items pointer lives inside the shared call_arg_buf arena;
+// recursive NK_CALLs push+rewind that arena, invalidating the parent slice.
+// We cut the alias by promoting `call_args` (and peer locals that follow the
+// same capture-then-pass-to-recursive-callee pattern) to heap at capture.
+static int _gen2_is_snapshot_hot_local(HexaVal name_v) {
+    if (name_v.tag != TAG_STR || !name_v.s) return 0;
+    const char* n = name_v.s;
+    static const char* hot[] = {
+        "call_args",      // interpreter NK_CALL arg slice
+        "spread_items",   // G8 spread — `f(...arr)` arena-backed
+        "args",           // call_fn_val / call_user_fn parameter lists
+        "raw_args",       // AST args list alias before eval loop
+        // call_user_fn locals: these hold arena-backed slices of fn_info
+        // whose storage lives in the parent eval frame's call_arg_buf
+        // window; a recursive callee truncates call_arg_buf and invalidates
+        // params/body → infinite fib recursion observed without snapshot.
+        "fn_info",
+        "params",
+        "body",
+        // AST nodes that the outer eval_expr/exec_stmt loop reads repeatedly
+        // across a nested call. In fib's `f(n-1) + f(n-2)` the Binary handler
+        // holds `node`, calls eval_expr(node.left), then eval_expr(node.right).
+        // If the nested call's arena rewind clobbers whatever backs `node`,
+        // the second dereference returns garbage and we loop.
+        "node",
+        "expr",
+        "stmt",
+        "callee",
+        NULL
+    };
+    for (int i = 0; hot[i]; i++) {
+        if (strcmp(n, hot[i]) == 0) return 1;
+    }
+    return 0;
+}
+static HexaVal _gen2_maybe_snapshot_local(HexaVal init_c, HexaVal lhs_name) {
+    if (!_gen2_snapshot_enabled()) return init_c;
+    if (!_gen2_is_snapshot_hot_local(lhs_name)) return init_c;
+    return hexa_add(hexa_add(hexa_str("hexa_val_snapshot_array("), init_c), hexa_str(")"));
+}
+
 // rt#32-O: snapshot-promote for NK_CALL arguments. Root cause: when an arg
 // expression yields an arena-backed array (cap<0), a *prior* call in the same
 // args-tuple may push+rewind an arena mark, invalidating the stored .items
@@ -5220,10 +5272,13 @@ HexaVal gen2_stmt(HexaVal node, HexaVal depth) {
     if (hexa_truthy(hexa_bool(hexa_truthy(hexa_eq(k, hexa_str("LetStmt"))) || hexa_truthy(hexa_eq(k, hexa_str("LetMutStmt")))))) {
         HexaVal init = hexa_str("hexa_void()");
         HexaVal rhs_node = hexa_map_get(node, "left");
+        HexaVal __lhs_name = hexa_map_get(node, "name");
         if (hexa_truthy(hexa_bool(!hexa_truthy(hexa_eq(hexa_type_of(rhs_node), hexa_str("string")))))) {
             init = gen2_expr(rhs_node);
             // rt#32-N: snapshot-wrap hot-global Ident RHS
             init = _gen2_maybe_snapshot(init, rhs_node);
+            // rt#32-O (local): snapshot-wrap hot-local LHS RHS (any shape)
+            init = _gen2_maybe_snapshot_local(init, __lhs_name);
         }
         HexaVal _ln = hexa_map_get(node, "name");
         // bt 72: if this name was hoisted to function top, emit plain assignment
@@ -6026,6 +6081,9 @@ HexaVal gen2_expr(HexaVal node) {
                         return hexa_add(hexa_add(hexa_str("hexa_from_char_code("), a0), hexa_str(")"));
                     }
                     if (hexa_truthy(hexa_eq(name, hexa_str("env_var")))) {
+                        return hexa_add(hexa_add(hexa_str("hexa_env_var("), a0), hexa_str(")"));
+                    }
+                    if (hexa_truthy(hexa_eq(name, hexa_str("env")))) {
                         return hexa_add(hexa_add(hexa_str("hexa_env_var("), a0), hexa_str(")"));
                     }
                     if (hexa_truthy(hexa_eq(name, hexa_str("delete_file")))) {
@@ -7107,9 +7165,15 @@ int main(int argc, char** argv) {
         printf("hexa-cc: HEXA self-hosted compiler\nUsage: hexa-cc <input.hexa> <output.c>\n");
         return 1;
     }
+    p_max_errors = hexa_int(50);
     HexaVal src = hexa_read_file(hexa_str(argv[1]));
     HexaVal tokens = tokenize(src);
     HexaVal ast = parse(tokens);
+    long long __err_n = (p_error_count()).i;
+    if (__err_n > 0) {
+        fprintf(stderr, "error: %s — %lld parse error(s)\n", argv[1], __err_n);
+        return 2;
+    }
     HexaVal c_code = codegen_c2_full(ast);
     hexa_write_file(hexa_str(argv[2]), c_code);
     printf("OK: %s\n", argv[2]);

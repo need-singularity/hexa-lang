@@ -40,6 +40,7 @@ fn cmd_help() {
     println("                                    --compare <other_bin> (A/B vs second binary)")
     println("    cc                      Rebuild the transpiler (hexa_cc)")
     println("    gc [--dry-run]          Prune .hexa-cache slots older than 30d")
+    println("    lsp                     Start LSP server (stdin/stdout, JSON-RPC)")
     println("    status                  Show toolchain status")
     println("    version                 Print version")
     println("    help                    Show this help")
@@ -68,9 +69,42 @@ fn cmd_status() {
     println("  artifacts:   " + art_cnt + " files")
 }
 
+// ── OS-specific clang flags (Mac vs Linux/glibc) ────────────
+// glibc 는 POSIX/GNU 확장(strdup/popen/pclose) 을 기본 숨김 → `-D_GNU_SOURCE`.
+// 수학 심볼(sqrt/pow/fmod) 은 자동 링크 안 됨 → `-lm`.
+// macOS libSystem 은 두 플래그 모두 무의미하므로 Darwin 에서는 빈 문자열.
+fn os_clang_cflags() {
+    if exec("uname 2>/dev/null | tr -d ' \\n\\t'") == "Linux" {
+        return "-D_GNU_SOURCE "
+    }
+    return ""
+}
+fn os_clang_ldflags() {
+    if exec("uname 2>/dev/null | tr -d ' \\n\\t'") == "Linux" {
+        return " -lm"
+    }
+    return ""
+}
+
 fn cmd_cc() {
     println("=== Rebuilding hexa_cc (transpiler) ===")
-    let cmd = "clang -O2 -I. self/native/hexa_cc.c -o self/native/hexa_v2 2>&1"
+    // OS 분기: Linux 에서는 glibc 의 POSIX/GNU 확장(strdup, getline 등)을
+    //          사용하기 위해 `-D_GNU_SOURCE` 가 필요하고, 수학 심볼 참조
+    //          (fmod/sqrt 등) 는 `-lm` 로 링크해야 한다. macOS 는 두 플래그
+    //          모두 no-op (libSystem 이 기본 포함) 이므로 동일 적용해도
+    //          무해하다. `-I self` 는 #include "runtime.c" (self/runtime.c)
+    //          경로 해석에 필수 — 구 `-I.` 는 프로젝트 루트만 가리켜 Mac
+    //          에서도 runtime.c 를 찾지 못했다. 본 수정으로 Mac/Linux 양쪽
+    //          에서 안정화. null-char warning 2건은 non-fatal — 무시.
+    let uname = exec("uname 2>/dev/null | tr -d ' \\n\\t'")
+    let mut cmd = ""
+    if uname == "Linux" {
+        cmd = "clang -O2 -D_GNU_SOURCE -I . -I self self/native/hexa_cc.c -o self/native/hexa_v2 -lm 2>&1"
+    } else {
+        // macOS (Darwin) — libSystem 이 libm 자동 포함, _GNU_SOURCE 무의미.
+        // 단, `-I self` 는 runtime.c 경로 해석에 반드시 필요.
+        cmd = "clang -O2 -I . -I self self/native/hexa_cc.c -o self/native/hexa_v2 2>&1"
+    }
     println("  " + cmd)
     let r = exec(cmd)
     if len(r) > 0 {
@@ -153,7 +187,13 @@ fn cmd_gc(dry_run, days_str) {
 //       lexer는 Token/tokenize/is_keyword 등 최상위 이름 공유 없음.
 fn regen_one_module(src, out_c) {
     // hexa_v2 SSOT → C 변환 한 모듈. 성공이면 "ok", 실패면 exec 출력.
-    let cmd = "./self/native/hexa_v2 " + src + " " + out_c + " 2>&1"
+    // buglist#5: resolve_hexa_v2() 경유 — cwd 무관 install_dir 기반 탐색.
+    let v2 = resolve_hexa_v2()
+    if len(v2) == 0 {
+        println("  [transpile] error: hexa_v2 not found")
+        return false
+    }
+    let cmd = v2 + " " + src + " " + out_c + " 2>&1"
     println("  [transpile] " + cmd)
     let r = exec(cmd)
     if len(r) > 0 { println("    " + r) }
@@ -204,10 +244,10 @@ fn merge_modules_awk(out_path) {
 fn cmd_regen_cc() {
     println("=== hexa cc --regen : hexa_cc.c 자동 재생성 ===")
     println("  SSOT: self/{lexer,parser,type_checker,codegen_c2}.hexa")
-    // preflight
-    let v2 = exec("test -x ./self/native/hexa_v2 && printf yes || printf no")
-    if v2 != "yes" {
-        println("error: ./self/native/hexa_v2 not found — run `hexa cc` first")
+    // preflight — buglist#5: resolve_hexa_v2() 로 cwd/$HOME/argv[0] 모두 탐색.
+    let v2 = resolve_hexa_v2()
+    if len(v2) == 0 {
+        println("error: hexa_v2 not found — run `hexa cc` first")
         return
     }
     // Step 1-4: hexa_v2 transpile each SSOT → /tmp/_*.c
@@ -247,7 +287,7 @@ fn cmd_regen_cc() {
     // `-x c` forces C language since `.new` extension is unrecognized.
     // `-I self` mirrors the standard hexa_cc.c build (runtime.c lives in self/).
     // bt 54: int→ptr / implicit-fn 근본 해소 — 플래그 제거. -Wno-trigraphs만 유지.
-    let cc = "clang -O2 -I self -x c -Wno-trigraphs " + out_new + " -o /tmp/hexa_v2.new 2>&1 | head -40"
+    let cc = "clang -O2 " + os_clang_cflags() + "-I self -x c -Wno-trigraphs " + out_new + " -o /tmp/hexa_v2.new" + os_clang_ldflags() + " 2>&1 | head -40"
     println("  " + cc)
     let cc_out = exec(cc)
     if len(cc_out) > 0 { println(cc_out) }
@@ -310,23 +350,64 @@ fn codesign_if_macos(exe) {
     }
 }
 
-// ── T28: hexa_v2 binary path resolution ──────────────────
+// ── T28 / buglist#5: hexa_v2 binary path resolution ──────
 // 목적: `hexa build` / `hexa parse` 가 cwd 무관하게 hexa_v2 트랜스파일러를
 //       찾을 수 있도록 한다. 과거에는 `./self/native/hexa_v2` (cwd 의존)
 //       하드코딩이라, hexa-lang 리포 바깥에서 실행하면 바이너리 미발견
 //       상태에서도 exec 가 빈 파일/실패 출력을 찍고 조용히 exit 0 하는
 //       silent-failure 회귀가 있었다 (T28).
 //
+// buglist#5 (hetzner airgenome 재현): cwd=airgenome 에서 `hexa build ...` →
+//       "sh: 1: ./self/native/hexa_v2: not found". cwd 기반 탐색도, $HOME
+//       기반 탐색도 airgenome 사용자 경로에서는 hexa-lang 리포를 못 찾음.
+//       해법: args()[0] 즉 `./hexa` 실행 파일 자체의 절대 경로에서 install
+//       디렉토리(dirname(exe))를 도출 → `<install_dir>/self/native/hexa_v2`.
+//       이것이 가장 신뢰할 수 있는 경로 (`./hexa` 와 `./self/...` 는 같은
+//       하위 트리). 심볼릭 링크는 `cd $(dirname ..) && pwd -P` 로 해결.
+//
 // 탐색 순서:
-//   1) ./self/native/hexa_v2 (cwd — 리포 안에서 실행 시 기존 동작 유지)
-//   2) $HOME/Dev/hexa-lang/self/native/hexa_v2 (개발 fallback — bench 와 동일)
-// 둘 다 없으면 빈 문자열 반환. 호출자가 명시 오류 + exit(1) 처리.
+//   1) argv[0] 기반 install_dir (최우선 — cwd / $HOME 와 독립)
+//   2) ./self/native/hexa_v2 (cwd — 리포 안에서 실행 시 기존 동작 유지)
+//   3) $HOME/Dev/hexa-lang/self/native/hexa_v2 (개발 fallback — bench 와 동일)
+// 셋 다 없으면 빈 문자열 반환. 호출자가 명시 오류 + exit(1) 처리.
+fn install_dir_from_argv0() {
+    // args()[0] = 런타임이 삽입한 exec 경로 (상대/절대/심볼릭 모두 가능).
+    // `cd $(dirname EXE) && pwd -P` 로 심볼릭 해석까지 수행한 절대 디렉토리.
+    // 빈 문자열(비정상) / 해석 실패 시 "" 반환 → 호출자가 다음 fallback.
+    let av0 = args()
+    if len(av0) == 0 {
+        return ""
+    }
+    let exe = av0[0]
+    if len(exe) == 0 {
+        return ""
+    }
+    // shell quoting: exe 가 `./hexa`, `hexa`, `/abs/path/hexa` 어느 형태든
+    // 파일이 존재해야 dirname 을 취할 수 있다. PATH 해석은 `command -v` 사용.
+    // 먼저 exe 를 그대로 파일로 취급, 실패 시 PATH lookup.
+    let resolve_cmd = "EXE='" + exe + "'; if [ -f \"$EXE\" ]; then D=\"$(cd \"$(dirname \"$EXE\")\" 2>/dev/null && pwd -P)\"; else P=\"$(command -v \"$EXE\" 2>/dev/null)\"; if [ -n \"$P\" ] && [ -f \"$P\" ]; then D=\"$(cd \"$(dirname \"$P\")\" 2>/dev/null && pwd -P)\"; else D=\"\"; fi; fi; printf '%s' \"$D\""
+    let d = exec(resolve_cmd)
+    return d
+}
+
 fn resolve_hexa_v2() {
+    // 1) argv[0] 기반 — 가장 우선. 설치 디렉토리와 `./hexa` 실행 경로가 같은
+    //    서브트리라는 성질 이용 (dirname(./hexa) + /self/native/hexa_v2).
+    let inst = install_dir_from_argv0()
+    if len(inst) > 0 {
+        let argv_bin = inst + "/self/native/hexa_v2"
+        let argv_chk = exec("test -x '" + argv_bin + "' && printf yes || printf no")
+        if argv_chk == "yes" {
+            return argv_bin
+        }
+    }
+    // 2) cwd-relative — 리포 루트에서 실행 시 기존 동작 유지.
     let cwd_bin = "./self/native/hexa_v2"
     let cwd_chk = exec("test -x '" + cwd_bin + "' && printf yes || printf no")
     if cwd_chk == "yes" {
         return cwd_bin
     }
+    // 3) $HOME fallback — 개발 기본 위치.
     let home_bin = exec("printf '%s' \"$HOME/Dev/hexa-lang/self/native/hexa_v2\"")
     let home_chk = exec("test -x '" + home_bin + "' && printf yes || printf no")
     if home_chk == "yes" {
@@ -338,8 +419,13 @@ fn resolve_hexa_v2() {
 // 실패 메시지 공통화 — silent exit 0 회귀 재발 방지.
 fn die_no_hexa_v2() {
     println("error: hexa_v2 transpiler binary not found")
-    println("       searched: ./self/native/hexa_v2")
-    println("                 $HOME/Dev/hexa-lang/self/native/hexa_v2")
+    println("       searched:")
+    let inst = install_dir_from_argv0()
+    if len(inst) > 0 {
+        println("         " + inst + "/self/native/hexa_v2  (from argv[0])")
+    }
+    println("         ./self/native/hexa_v2  (cwd)")
+    println("         $HOME/Dev/hexa-lang/self/native/hexa_v2  (dev fallback)")
     println("       run `hexa cc` (inside hexa-lang repo) to build it")
     exit(1)
 }
@@ -369,19 +455,68 @@ fn cmd_build(src, out) {
         die_no_hexa_v2()
     }
     println("=== Building " + src + " -> " + out + " ===")
+    // buglist#9: flatten use graph — transpiler 가 `use "..."` 를 silent-drop
+    //   하므로 `scripts/flatten_imports.hexa` 로 의존성을 단일 파일로 bundle
+    //   한 뒤 transpile. use 없는 파일은 src 그대로 진행.
+    let __inst = install_dir_from_argv0()
+    let __fl_script = __inst + "/scripts/flatten_imports.hexa"
+    let mut __actual_src = src
+    let __has_fl = exec("test -f '" + __fl_script + "' && printf yes || printf no")
+    if __has_fl == "yes" {
+        let __has_use = exec("grep -c '^use \"' '" + src + "' 2>/dev/null | tr -d ' \\n'")
+        if __has_use != "0" && __has_use != "" {
+            let __bundle = exec("printf '/tmp/hexa_bundle.%s.hexa' \"$$\" | tr -d ' \\n'")
+            let __hexa_bin = __inst + "/hexa"
+            let __fl_cmd = "'" + __hexa_bin + "' run '" + __fl_script + "' '" + src + "' '" + __bundle + "' 2>&1"
+            println("  [flat] " + __has_use + " use(s) → " + __bundle)
+            let __fl_out = exec(__fl_cmd)
+            let __fl_ok = exec("test -f '" + __bundle + "' && printf yes || printf no")
+            if __fl_ok == "yes" {
+                __actual_src = __bundle
+            } else {
+                println("  [flat] warn: failed — " + __fl_out)
+            }
+        }
+    }
     let stem = basename_stem(out)
     let c_file = "build/artifacts/" + stem + ".c"
-    let trans = v2 + " " + src + " " + c_file + " 2>&1"
+    // buglist#6 phase [1/2]: transpile → .c 산출물 존재 확인 필수. 과거에는
+    //   trans 출력만 캡처하고 .c 미생성 여부를 검사하지 않아, clang 이 존재
+    //   하지 않는 .c 를 컴파일하려 → mv 실패 → 그래도 "OK: built" 출력하는
+    //   false-positive exit 0 회귀가 있었다. 이제 .c existence 를 명시 체크.
+    // 산출물 디렉토리 선제 생성 (없으면 hexa_v2 가 stderr 로 실패).
+    let _mk_art = exec("mkdir -p build/artifacts 2>/dev/null")
+    let trans = v2 + " " + __actual_src + " " + c_file + " 2>&1"
     println("  [1/2] " + trans)
     let r1 = exec(trans)
     if len(r1) > 0 { println("    " + r1) }
+    // 파싱 실패는 hexa_v2 가 stdout 에 "Parse error" 로 찍고도 exit 0 인
+    // 특성이 있어(cmd_parse 주석 참고), 출력 grep + .c 파일 존재로 2중 판정.
+    let has_perr = exec("printf '%s' \"" + r1 + "\" | grep -q 'Parse error' && printf yes || printf no")
+    if has_perr == "yes" {
+        println("error: transpile failed (parse error) — " + src)
+        exit(1)
+    }
+    let c_exists = exec("test -f '" + c_file + "' && printf yes || printf no")
+    if c_exists != "yes" {
+        println("error: transpile failed — C file not produced: " + c_file)
+        exit(1)
+    }
     // Stage B: clang → `<out>.tmp.<PID>` (동일 디렉토리 → 동일 FS → rename atomic)
     let tmp = exec("printf '%s.tmp.%s' '" + out + "' \"$$\"")
     // bt 54: int→ptr / implicit-fn 근본 해소 — 플래그 제거.
-    let compile = "clang -O2 -Wno-trigraphs -I self " + c_file + " -o '" + tmp + "' 2>&1"
+    // buglist#5: -I self 도 install_dir 절대경로로 — cwd 무관 runtime.c 탐색.
+    let compile = "clang -O2 " + os_clang_cflags() + "-Wno-trigraphs -I '" + __inst + "/self' " + c_file + " -o '" + tmp + "'" + os_clang_ldflags() + " 2>&1"
     println("  [2/2] " + compile)
     let r2 = exec(compile)
     if len(r2) > 0 { println("    " + r2) }
+    // buglist#6 phase [2/2]: clang 산출물(tmp) 존재 확인. 실패 시 조기 exit(1)
+    // — mv 단계에서 '파일 없음'이 묻혀 false-positive 로 이어지지 않도록.
+    let tmp_chk = exec("test -x '" + tmp + "' && printf yes || printf no")
+    if tmp_chk != "yes" {
+        println("error: clang compile failed — binary not produced: " + tmp)
+        exit(1)
+    }
     // bt 40: codesign tmp (macOS Gatekeeper 호환) — rename 전에 서명.
     //   - macOS: ad-hoc 서명 수행. Linux 등: skip (no-op).
     //   - codesign 부재/실패: warning only, 빌드는 계속 진행.
@@ -389,8 +524,8 @@ fn cmd_build(src, out) {
     // atomic rename: tmp → out. 실패 시 tmp 보존으로 디버깅 가능.
     let mv = exec("mv -f '" + tmp + "' '" + out + "' 2>&1")
     if len(mv) > 0 { println("    mv: " + mv) }
-    // T28: 최종 산출물이 실제 실행 가능한지 검증 — clang 실패/mv 실패 등
-    // 중간 단계가 silent 하게 지나가더라도 여기서 확실히 실패 exit 하도록.
+    // buglist#6: 최종 산출물 re-verify — clang 실패/mv 실패 등 중간 단계가
+    // 어떤 이유로든 silent 하게 지나가더라도 여기서 확실히 실패 exit 하도록.
     let out_chk = exec("test -x '" + out + "' && printf yes || printf no")
     if out_chk != "yes" {
         println("error: build failed — output binary missing: " + out)
@@ -458,8 +593,13 @@ fn aot_build_slot(file) {
     // 슬롯 디렉토리 준비.
     let _mk = exec("mkdir -p '" + slot + "' 2>/dev/null")
     // 1) 트랜스파일: file.hexa → slot/src.c
+    //    buglist#5: resolve_hexa_v2() 경유 — cwd 무관하게 install_dir 기반 탐색.
+    let v2 = resolve_hexa_v2()
+    if len(v2) == 0 {
+        return ""
+    }
     let c_file = slot + "/src.c"
-    let trans = exec("./self/native/hexa_v2 '" + file + "' '" + c_file + "' 2>&1")
+    let _trans = exec(v2 + " '" + file + "' '" + c_file + "' 2>&1")
     let ok_c = exec("test -f '" + c_file + "' && printf yes || printf no")
     if ok_c != "yes" {
         return ""
@@ -467,7 +607,9 @@ fn aot_build_slot(file) {
     // 2) clang → slot/exe.tmp.$$ (atomic rename 준비, bt 37 패턴)
     let tmp = exec("printf '%s/exe.tmp.%s' '" + slot + "' \"$$\"")
     // bt 54: int→ptr / implicit-fn 근본 해소 — 플래그 제거.
-    let compile = exec("clang -O2 -Wno-trigraphs -I self '" + c_file + "' -o '" + tmp + "' 2>&1")
+    // buglist#5: -I self 도 install_dir 절대경로로.
+    let __inst_a = install_dir_from_argv0()
+    let compile = exec("clang -O2 " + os_clang_cflags() + "-Wno-trigraphs -I '" + __inst_a + "/self' '" + c_file + "' -o '" + tmp + "'" + os_clang_ldflags() + " 2>&1")
     let ok_tmp = exec("test -x '" + tmp + "' && printf yes || printf no")
     if ok_tmp != "yes" {
         return ""
@@ -1125,6 +1267,11 @@ if len(av) < 3 {
         } else {
             cmd_parse(av[3])
         }
+    } else if sub == "lsp" || sub == "--lsp" {
+        // LSP server entry — editors/vscode/extension.js spawns `hexa --lsp`.
+        // Forward to stage0 interpreter running self/lsp.hexa (run_lsp loop).
+        // cmd_run handles stage0 locate + stdin fd 3 plumbing + rc propagation.
+        cmd_run("self/lsp.hexa", [])
     } else if sub == "build" {
         if len(av) < 4 {
             println("error: 'build' requires <file>")
