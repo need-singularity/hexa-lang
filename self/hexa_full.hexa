@@ -5570,7 +5570,12 @@ fn fn_rebuild_cache() {
 
 fn env_push_scope() {
     env_scopes = env_scopes.push(len(env_vars))
-    env_scope_dirty = env_scope_dirty.push([])
+    // rt 32: defer the per-scope `[]` allocation to env_define when actually
+    // needed. ML hot loops (matvec inner col loop) push hundreds of scopes
+    // with zero defines — pre-allocating a host array each time was a major
+    // hexa_array_new contributor (~900K/d64 micro). Sentinel `0` marks
+    // an empty scope; env_define lazy-converts to a real bucket list.
+    env_scope_dirty = env_scope_dirty.push(0)
 }
 
 fn env_pop_scope() {
@@ -5582,6 +5587,23 @@ fn env_pop_scope() {
     // (hexa lists pass-by-value) via reassignment.
     // Remove the last scope marker
     env_scopes = env_scopes.truncate(len(env_scopes) - 1)
+    // rt 32: decref array/struct slots before truncating env_vars. Without
+    // this the array_store freelist never reclaims slots (refcount stays
+    // ≥ 1 even after the binding goes out of scope), defeating the slot
+    // reuse optimization and leaking ~64 floats × N steps per matvec.
+    let env_len = len(env_vars)
+    let mut _di = boundary
+    while _di < env_len {
+        let pair = env_vars[_di]
+        let old_val = pair[1]
+        if old_val.tag == TAG_ARRAY {
+            array_decref(old_val.int_val)
+        }
+        if old_val.tag == TAG_STRUCT {
+            struct_decref(old_val.int_val)
+        }
+        _di = _di + 1
+    }
     // Truncate vars to boundary
     env_vars = env_vars.truncate(boundary)
     // Prune cache: only scan buckets that were modified during this scope.
@@ -5591,24 +5613,28 @@ fn env_pop_scope() {
         let dirty = env_scope_dirty[sdn - 1]
         // Pop the dirty set
         env_scope_dirty = env_scope_dirty.truncate(sdn - 1)
-        // Only prune buckets that were touched
-        let mut di = 0
-        let dn = len(dirty)
-        while di < dn {
-            let bi = dirty[di]
-            let bucket = env_cache[bi]
-            let mut kept = []
-            let mut ki = 0
-            let bn = len(bucket)
-            while ki < bn {
-                let entry = bucket[ki]
-                if entry[1] < boundary {
-                    kept = kept.push(entry)
+        // rt 32: sentinel `0` (int) means scope had no defines → no cache
+        // pruning needed. Skips the entire dirty loop for empty scopes
+        // (matvec/vec_gelu inner while bodies — hottest path).
+        if type_of(dirty) != "int" {
+            let mut _pdi = 0
+            let dn = len(dirty)
+            while _pdi < dn {
+                let bi = dirty[_pdi]
+                let bucket = env_cache[bi]
+                let mut kept = []
+                let mut ki = 0
+                let bn = len(bucket)
+                while ki < bn {
+                    let entry = bucket[ki]
+                    if entry[1] < boundary {
+                        kept = kept.push(entry)
+                    }
+                    ki = ki + 1
                 }
-                ki = ki + 1
+                env_cache[bi] = kept
+                _pdi = _pdi + 1
             }
-            env_cache[bi] = kept
-            di = di + 1
         }
     }
 }
@@ -5631,15 +5657,21 @@ fn env_define(name, value) {
     let sdn = len(env_scope_dirty)
     if sdn > 0 {
         let top = env_scope_dirty[sdn - 1]
-        // Avoid duplicate bucket entries in the dirty set
-        let mut already = false
-        let mut di = 0
-        while di < len(top) {
-            if top[di] == b { already = true }
-            di = di + 1
-        }
-        if !already {
-            env_scope_dirty[sdn - 1] = top.push(b)
+        // rt 32: lazy bucket — sentinel `0` (int) means empty.  Allocate the
+        // real bucket list on first define in this scope.
+        if type_of(top) == "int" {
+            env_scope_dirty[sdn - 1] = [b]
+        } else {
+            // Avoid duplicate bucket entries in the dirty set
+            let mut already = false
+            let mut di = 0
+            while di < len(top) {
+                if top[di] == b { already = true }
+                di = di + 1
+            }
+            if !already {
+                env_scope_dirty[sdn - 1] = top.push(b)
+            }
         }
     }
 }
@@ -13919,8 +13951,24 @@ fn to_float_val(v) {
 
 pub let mut array_store = []
 pub let mut array_refcounts = []   // parallel to array_store; each entry is an int >= 1
+// rt 32: freelist for array_store slot reclamation. When a slot's refcount
+// drops to 0 (in array_decref), we push the idx here and clear the slot's
+// items to a tiny placeholder. Subsequent val_array() calls pop from this
+// list before extending array_store. Bounds total array_store length to
+// max-live count instead of monotonic growth, eliminating multi-GB
+// retention seen in d64 ML microbench (rt B agent, 2026-04-13).
+pub let mut array_free_list = []
 
 fn val_array(items) {
+    // rt 32: reuse a freed slot if available — bounds array_store growth.
+    let fl_n = len(array_free_list)
+    if fl_n > 0 {
+        let idx = array_free_list[fl_n - 1]
+        array_free_list = array_free_list.truncate(fl_n - 1)
+        array_store[idx] = items
+        array_refcounts[idx] = 1
+        return Val { tag: TAG_ARRAY, int_val: idx, float_val: 0.0, bool_val: false, str_val: "", char_val: "", array_val: "", fn_name: "", fn_params: "", fn_body: "", struct_name: "", struct_fields: "" }
+    }
     let idx = len(array_store)
     array_store = array_store.push(items)
     array_refcounts = array_refcounts.push(1)
@@ -13947,6 +13995,13 @@ fn array_decref(idx) {
     if idx >= 0 && idx < len(array_refcounts) {
         if array_refcounts[idx] > 0 {
             array_refcounts[idx] = array_refcounts[idx] - 1
+            // rt 32: reclaim slot when refcount hits 0. Drop the items array
+            // (host array becomes garbage at C runtime — buffer freed) and
+            // record the slot in the freelist for val_array() reuse.
+            if array_refcounts[idx] == 0 {
+                array_store[idx] = []
+                array_free_list = array_free_list.push(idx)
+            }
         }
     }
 }
@@ -14654,6 +14709,7 @@ fn interpret(ast) {
     gen_active = false
     array_store = []
     array_refcounts = []
+    array_free_list = []
     map_store = []
     struct_store = []
     struct_refcounts = []
