@@ -3,6 +3,32 @@
 //  runtime.c와 함께 사용: 문자열, 배열, Map 지원
 // ═══════════════════════════════════════════════════════════
 
+// bt-53: mangle user-level global identifiers that collide with runtime.c's
+// internal enum values (TAG_INT, TAG_FLOAT, …, TAG_CLOSURE) and `main`. Without
+// mangling, `let TAG_INT = 0` emits `HexaVal TAG_INT;` at file scope, which
+// collides with runtime.c's `enum { TAG_INT=0, … }` (same ordinary namespace).
+// Reserved names get `u_` prefix at every global-decl and reference site.
+fn _hexa_name_is_reserved(s) {
+    if s == "TAG_INT" { return true }
+    if s == "TAG_FLOAT" { return true }
+    if s == "TAG_BOOL" { return true }
+    if s == "TAG_STR" { return true }
+    if s == "TAG_VOID" { return true }
+    if s == "TAG_ARRAY" { return true }
+    if s == "TAG_MAP" { return true }
+    if s == "TAG_FN" { return true }
+    if s == "TAG_CHAR" { return true }
+    if s == "TAG_CLOSURE" { return true }
+    if s == "main" { return true }
+    return false
+}
+
+fn _hexa_mangle_ident(name) {
+    if type_of(name) != "string" { return name }
+    if _hexa_name_is_reserved(name) { return "u_" + name }
+    return name
+}
+
 fn codegen_c2(ast) {
     // Use arrays to avoid O(n²) string concatenation
     let mut parts = []
@@ -86,7 +112,10 @@ fn codegen_c2(ast) {
         } else if k == "ImportStmt" || k == "UseStmt" {
             eprintln("[codegen_c2] WARNING: import/use not fully resolved: " + ast[i].name)
             main_parts = main_parts.push("    /* import: " + ast[i].name + " */\n")
-        } else if k == "LetMutStmt" {
+        } else if k == "LetMutStmt" || k == "LetStmt" {
+            // bt-53: mangle `TAG_INT`/`main`/… global names to avoid collision
+            // with runtime.c's enum constants at link time.
+            let _user_name = _hexa_mangle_ident(ast[i].name)
             // ROI #43: @thread_local → _Thread_local C storage class
             let _tls_val = ast[i].value
             let _is_tls = false
@@ -96,14 +125,14 @@ fn codegen_c2(ast) {
                 }
             }
             if _is_tls {
-                global_parts = global_parts.push("_Thread_local HexaVal " + ast[i].name + ";\n")
+                global_parts = global_parts.push("_Thread_local HexaVal " + _user_name + ";\n")
             } else {
-                global_parts = global_parts.push("HexaVal " + ast[i].name + ";\n")
+                global_parts = global_parts.push("HexaVal " + _user_name + ";\n")
             }
             if type_of(ast[i].left) != "string" {
-                main_parts = main_parts.push("    " + ast[i].name + " = " + gen2_expr(ast[i].left) + ";\n")
+                main_parts = main_parts.push("    " + _user_name + " = " + gen2_expr(ast[i].left) + ";\n")
             } else {
-                main_parts = main_parts.push("    " + ast[i].name + " = hexa_void();\n")
+                main_parts = main_parts.push("    " + _user_name + " = hexa_void();\n")
             }
         } else {
             main_parts = main_parts.push(gen2_stmt(ast[i], 1))
@@ -191,7 +220,7 @@ fn gen2_fn_forward(node) {
     if p == "" { p = "void" }
     let mut prefix = ""
     if gen2_has_inline_always(node) { prefix = "static inline " }
-    return prefix + "HexaVal " + node.name + "(" + p + ");"
+    return prefix + "HexaVal " + _hexa_mangle_ident(node.name) + "(" + p + ");"
 }
 
 // ── @specialize codegen: type-specialized fast path ─────────
@@ -301,14 +330,17 @@ fn gen2_fn_decl(node) {
         // @flatten (SROA): emit comment marking struct decomposition intent
         chunks = chunks.push("/* @flatten: SROA — struct params decomposed to scalars */\n")
     }
-    chunks = chunks.push("HexaVal " + node.name + "(" + p + ") {\n")
+    // bt-53: mangle user fn name to avoid collision with runtime.c's `main`
+    // and enum constants at link time.
+    let _fn_name = _hexa_mangle_ident(node.name)
+    chunks = chunks.push("HexaVal " + _fn_name + "(" + p + ") {\n")
     // @specialize: emit type-specialized guard at entry
     if gen2_has_specialize(node) {
         chunks = chunks.push(gen2_specialize_guard(node))
     }
     let mut prefix = ""
     if gen2_has_inline_always(node) { prefix = "static inline " }
-    chunks = chunks.push(prefix + "HexaVal " + node.name + "(" + p + ") {\n")
+    chunks = chunks.push(prefix + "HexaVal " + _fn_name + "(" + p + ") {\n")
     // bt 72: emit hoisted declarations at fn top
     let mut hj = 0
     while hj < len(hoists) {
@@ -1042,7 +1074,9 @@ fn gen2_expr(node) {
         // so char literals must also be TAG_STR for hexa_eq to work
         return "hexa_str(\"" + c_escape(node.value) + "\")"
     }
-    if k == "Ident" { return node.name }
+    // bt-53: mangle reserved runtime names (TAG_INT etc.) so references match
+    // the mangled global declarations emitted at LetStmt/FnDecl sites.
+    if k == "Ident" { return _hexa_mangle_ident(node.name) }
 
     if k == "BinOp" {
         let l = gen2_expr(node.left)
@@ -1411,7 +1445,8 @@ fn gen2_expr(node) {
                 ai = ai + 1
             }
             if _is_known_fn_global(name) {
-                return name + "(" + arg_strs.join(", ") + ")"
+                // bt-53: mangled emission for reserved fn names (e.g. user `fn main`).
+                return _hexa_mangle_ident(name) + "(" + arg_strs.join(", ") + ")"
             }
             // ── bt-66: free-fn call of a string-method builtin ──────────────
             // `contains(attrs, "memoize")` (bare ident) used to emit
@@ -2491,7 +2526,9 @@ fn codegen_c2_full(ast) {
         } else if k == "ImportStmt" || k == "UseStmt" {
             eprintln("[codegen_c2] WARNING: import/use not fully resolved: " + ast[i].name)
             main_parts = main_parts.push("    /* import: " + ast[i].name + " */\n")
-        } else if k == "LetMutStmt" {
+        } else if k == "LetMutStmt" || k == "LetStmt" {
+            // bt-53: mangle reserved runtime names (TAG_INT etc.)
+            let _user_name2 = _hexa_mangle_ident(ast[i].name)
             // ROI #43: @thread_local → _Thread_local C storage class
             let _tls_val2 = ast[i].value
             let _is_tls2 = false
@@ -2501,14 +2538,14 @@ fn codegen_c2_full(ast) {
                 }
             }
             if _is_tls2 {
-                global_parts = global_parts.push("_Thread_local HexaVal " + ast[i].name + ";\n")
+                global_parts = global_parts.push("_Thread_local HexaVal " + _user_name2 + ";\n")
             } else {
-                global_parts = global_parts.push("HexaVal " + ast[i].name + ";\n")
+                global_parts = global_parts.push("HexaVal " + _user_name2 + ";\n")
             }
             if type_of(ast[i].left) != "string" {
-                main_parts = main_parts.push("    " + ast[i].name + " = " + gen2_expr(ast[i].left) + ";\n")
+                main_parts = main_parts.push("    " + _user_name2 + " = " + gen2_expr(ast[i].left) + ";\n")
             } else {
-                main_parts = main_parts.push("    " + ast[i].name + " = hexa_void();\n")
+                main_parts = main_parts.push("    " + _user_name2 + " = hexa_void();\n")
             }
         } else {
             main_parts = main_parts.push(gen2_stmt(ast[i], 1))
