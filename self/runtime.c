@@ -161,6 +161,9 @@ HexaVal hexa_array_new(void);
 HexaVal hexa_void(void);
 HexaVal hexa_null_coal(HexaVal a, HexaVal b);
 int hexa_is_type(HexaVal v, const char* type_name);
+// rt 32-A: bulk struct constructor (see below for docstring).
+HexaVal hexa_struct_pack_map(const char* type_name, int n,
+                             const char* const* keys, const HexaVal* vals);
 
 // ── Tagged Value ─────────────────────────────────────────
 // All HEXA values are represented as tagged unions (NaN-boxing alternative)
@@ -499,6 +502,54 @@ HexaVal hexa_map_new() {
     HexaVal v = {.tag=TAG_MAP};
     v.map.tbl = NULL;
     v.map.len = 0;
+    return v;
+}
+
+// rt 32-A: bulk struct constructor — collapses 1 map_new + N map_set into a
+// single pre-sized table allocation + tight insertion loop. Used by
+// gen2_struct_decl for `Val { ... }` and other struct literals. Avoids N
+// successive hexa_map_set calls (each with its own stats bump + load-factor
+// check). Key array is NOT freed; strings must be string literals (stable).
+HexaVal hexa_struct_pack_map(const char* type_name, int n,
+                             const char* const* keys, const HexaVal* vals) {
+    if (_hx_stats_on()) _hx_stats_map_new++;
+    HexaVal v = {.tag=TAG_MAP};
+    // Pre-size: (n+1) entries including __type__, target load < HMAP_LOAD_MAX/100.
+    // Solve for smallest power-of-2 cap where (n+1)*100/cap < HMAP_LOAD_MAX.
+    int need = (n + 1) * 100 / HMAP_LOAD_MAX + 1;
+    int cap = HMAP_INIT_CAP;
+    while (cap < need) cap <<= 1;
+    HexaMapTable* t = hmap_alloc(cap);
+    v.map.tbl = t;
+    uint32_t mask = (uint32_t)(cap - 1);
+    // Insert __type__ first (skip for anonymous map literals where
+    // type_name is "" — they don't carry a __type__ field).
+    if (type_name && type_name[0]) {
+        uint32_t h = hexa_fnv1a_str("__type__");
+        uint32_t idx = h & mask;
+        while (t->slots[idx].key) idx = (idx + 1) & mask;
+        t->slots[idx].key = strdup("__type__");
+        t->slots[idx].hash = h;
+        HexaVal tv = {.tag=TAG_STR};
+        tv.s = strdup(type_name);
+        t->vals[idx] = tv;
+        t->order_keys[t->len] = t->slots[idx].key;
+        t->order_vals[t->len] = tv;
+        t->len++;
+    }
+    for (int i = 0; i < n; i++) {
+        const char* k = keys[i];
+        uint32_t h = hexa_fnv1a_str(k);
+        uint32_t idx = h & mask;
+        while (t->slots[idx].key) idx = (idx + 1) & mask;
+        t->slots[idx].key = strdup(k);
+        t->slots[idx].hash = h;
+        t->vals[idx] = vals[i];
+        t->order_keys[t->len] = t->slots[idx].key;
+        t->order_vals[t->len] = vals[i];
+        t->len++;
+    }
+    v.map.len = t->len;
     return v;
 }
 
