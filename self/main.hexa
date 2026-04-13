@@ -33,6 +33,10 @@ fn cmd_help() {
     println("SUBCOMMANDS:")
     println("    run <file> [args...]    Execute a .hexa script (interpreter)")
     println("    build <file> [-o out]   Compile .hexa to native binary")
+    println("    bench <file> [opts]     Benchmark a .hexa script (wall/RSS/alloc)")
+    println("                              opts: --runs N (default 3)")
+    println("                                    --json (JSON output, no table)")
+    println("                                    --compare <other_bin> (A/B vs second binary)")
     println("    cc                      Rebuild the transpiler (hexa_cc)")
     println("    gc [--dry-run]          Prune .hexa-cache slots older than 30d")
     println("    status                  Show toolchain status")
@@ -504,6 +508,384 @@ fn cmd_run(file, extra_args) {
     print(out)
 }
 
+// ─── bt 81: hexa bench harness ────────────────────────────
+// 목적: 자체 호스트 .hexa 스크립트를 N회 반복 실행하면서
+//       wall_s, RSS(KB), HEXA_ALLOC_STATS 카운터를 수집하고
+//       median/min/max 표 또는 JSON을 출력한다. --compare 모드는
+//       동일 파일을 두 바이너리로 돌려 delta % 를 보여줌으로써
+//       stage0 vs hexa_v2/v3, 또는 빌드 전/후 회귀 확인 용도.
+//
+// 설계:
+//   - 측정은 외부 `/usr/bin/time` 에 위임 — 인터프리터 외부에서
+//     wall/RSS 를 객관적으로 캡처. macOS는 `-l`(BSD), Linux는 `-v`(GNU).
+//   - HEXA_ALLOC_STATS=1 환경변수로 self/runtime.c 의 atexit dump를
+//     stderr 로 받아 grep + awk 로 5개 카운터(array_new/push/grow/
+//     map_new/map_set) 추출.
+//   - median 은 외부 sort 로 정렬한 결과의 중간 인덱스. N=3 권장.
+//   - JSON 직렬화는 hexa 표준 라이브러리에 직렬화기가 없어
+//     문자열 직접 조립 — 키 순서/이스케이프 고정.
+//
+// 한계:
+//   - run-to-run 분산은 BSD/GNU time 해상도(10ms)에 의해 결정.
+//     ns/op 측정에는 self/bench_env_get.hexa 류의 in-process clock()
+//     기반 마이크로벤치가 더 적합.
+//   - 첫 회 실행은 cold (디스크 캐시) — N>=3 권장, median 사용으로 흡수.
+
+fn bench_time_cmd(bin, file) {
+    // /usr/bin/time 호출 한 회. 결과 stderr 를 임시파일에 캡처해서
+    // grep/awk 로 wall/RSS 추출. stdout 은 통째로 버린다(스크립트 무관).
+    // tmp 경로는 PID 구분으로 동시 호출 충돌 방지(bt 37 패턴 차용).
+    //
+    // 중요: `./hexa run <file>` dispatcher 는 stage0 child 의 stderr 를 자기
+    // stdout 으로 합치면서 동시에 `print(out)` 으로 다시 stdout 에 흘리기 때문에,
+    // stage0 의 HEXA_ALLOC_STATS dump 가 parent 의 stderr 에 도달하지 못한다.
+    // 따라서 parent 의 HEXA_ALLOC_STATS 만 stats_file 에 남고(작은 수치),
+    // 진짜 워크로드 카운터는 사라진다.
+    //
+    // 회피: stage0 binary(`build/hexa_stage0`) 를 직접 호출. 이렇게 하면
+    // 인터프리터가 단일 프로세스로 돌고 atexit dump 가 해당 프로세스의 stderr
+    // (= /usr/bin/time stderr 에 함께 묶여 stats_file 에 적힘) 에 정확히 한 번만
+    // 출력된다. `bin` 인자가 ./hexa 면 같은 디렉토리의 build/hexa_stage0 사용,
+    // 그렇지 않으면 (--compare 등) bin 자체가 stage0-호환 인터프리터라고
+    // 가정하고 직접 실행.
+    let stats_file = exec("printf '%s' \"/tmp/hexa_bench_stats.$$.$RANDOM.txt\"")
+    let alloc_env = "HEXA_ALLOC_STATS=1"
+    let flag = if is_macos() { "-l" } else { "-v" }
+    // bin 처리 룰:
+    //   1) bin basename 이 'hexa_stage0*' 으로 시작 → 직접 호출(파일만 인자).
+    //   2) bin 옆에 build/hexa_stage0 존재 → 그것을 직접 호출.
+    //   3) 그 외 → bin run <file> (./hexa style dispatcher 가정).
+    // 1) 과 2) 는 atexit dump 가 단일 프로세스에서 한 번만 나오므로
+    // HEXA_ALLOC_STATS 가 정확하게 캡처된다.
+    let bn = exec("basename '" + bin + "' | tr -d ' \\n'")
+    let bn_starts_stage0 = exec("printf '%s' '" + bn + "' | awk '{ if (index($0, \"hexa_stage0\") == 1) print \"yes\"; else print \"no\" }' | tr -d ' \\n'")
+    let dir = exec("dirname '" + bin + "' | tr -d ' \\n'")
+    let stage0_path = dir + "/build/hexa_stage0"
+    let has_stage0 = exec("test -x '" + stage0_path + "' && printf yes || printf no")
+    let mut runner = bin
+    let mut runner_args = " run "
+    if bn_starts_stage0 == "yes" {
+        // bin 자체가 stage0 binary — 그대로 사용, run 서브커맨드 없음.
+        runner_args = " "
+    } else if has_stage0 == "yes" {
+        // bin 은 dispatcher (./hexa) — 옆의 stage0 직접 호출.
+        runner = stage0_path
+        runner_args = " "
+    }
+    let cmd = alloc_env + " /usr/bin/time " + flag + " '" + runner + "'" + runner_args + "'" + file + "' > /dev/null 2> '" + stats_file + "'"
+    let _ = exec(cmd)
+    return stats_file
+}
+
+fn parse_wall_s(stats_file) {
+    // BSD: line like "        0.07 real         0.00 user         0.01 sys"
+    //   awk '/ real/ {print $1; exit}' 로 첫 토큰만.
+    // GNU: "Elapsed (wall clock) time (h:mm:ss or m:ss): 0:00.07"
+    //   tail token 을 ':' 로 split 후 마지막 두 필드를 60×+합산.
+    if is_macos() {
+        let v = exec("awk '/ real/ {print $1; exit}' '" + stats_file + "' 2>/dev/null | tr -d ' \\n'")
+        if len(v) == 0 { return "0.0" }
+        return v
+    }
+    // GNU time path
+    let raw = exec("awk -F': ' '/Elapsed/ {print $NF; exit}' '" + stats_file + "' 2>/dev/null | tr -d ' \\n'")
+    if len(raw) == 0 { return "0.0" }
+    // raw 형식: "m:ss.cc" 또는 "h:mm:ss"
+    let parsed = exec("printf '%s' '" + raw + "' | awk -F: '{ if (NF==2) printf \"%.3f\", $1*60+$2; else if (NF==3) printf \"%.3f\", $1*3600+$2*60+$3; else printf \"%s\", $0 }'")
+    return parsed
+}
+
+fn parse_rss_kb(stats_file) {
+    // BSD: "             1474560  maximum resident set size"  (bytes!)
+    //   → divide by 1024 to get KB.
+    // GNU: "Maximum resident set size (kbytes): 1234"  (already KB)
+    if is_macos() {
+        let bytes = exec("awk '/maximum resident set size/ {print $1; exit}' '" + stats_file + "' 2>/dev/null | tr -d ' \\n'")
+        if len(bytes) == 0 { return "0" }
+        let kb = exec("printf '%s' '" + bytes + "' | awk '{ printf \"%d\", $1/1024 }'")
+        return kb
+    }
+    let v = exec("awk -F': ' '/Maximum resident set size/ {print $2; exit}' '" + stats_file + "' 2>/dev/null | tr -d ' \\n'")
+    if len(v) == 0 { return "0" }
+    return v
+}
+
+fn parse_alloc_counter(stats_file, key) {
+    // self/runtime.c 의 atexit dump 라인은 한 줄짜리:
+    //   [HEXA_ALLOC_STATS] array_new=N push=N grow=N reserve=N str_concat=N map_new=N map_set=N ...
+    // 주의: `./hexa` (parent dispatcher) + stage0 (child interpreter) 가 둘 다
+    // dump 라인을 출력해서 한 stderr 파일에 두 개가 적힌다. 첫 줄은 dispatcher
+    // overhead(작은 숫자)이고, 두 번째 줄이 실제 측정 대상(스크립트). `tail -1`
+    // 로 마지막 줄(=stage0 child) 을 잡아서 워크로드 통계를 정확히 캡처.
+    let cmd = "grep '\\[HEXA_ALLOC_STATS\\]' '" + stats_file + "' 2>/dev/null | tail -1 | awk -v k='" + key + "' '{ for (i=1;i<=NF;i++) { if (index($i, k\"=\") == 1) { split($i, p, \"=\"); print p[2]; exit } } }' | tr -d ' \\n'"
+    let v = exec(cmd)
+    if len(v) == 0 { return "0" }
+    return v
+}
+
+fn median_str(values) {
+    // 문자열 숫자 배열 → median 문자열. sort -g 사용(소수점 처리).
+    // empty 보호: 0 반환.
+    let n = len(values)
+    if n == 0 { return "0" }
+    let mut joined = ""
+    let mut i = 0
+    while i < n {
+        joined = joined + values[i] + "\n"
+        i = i + 1
+    }
+    let mid = n / 2 + 1
+    // hexa_v2 트랜스파일러는 builtin `str()` dispatch 가 없어
+    // 빈 문자열 + int 를 통한 implicit hexa_to_string 으로 변환.
+    let mid_s = "" + mid
+    let cmd = "printf '%s' '" + joined + "' | sort -g | sed -n '" + mid_s + "p' | tr -d ' \\n'"
+    let m = exec(cmd)
+    if len(m) == 0 { return values[0] }
+    return m
+}
+
+fn min_str(values) {
+    let n = len(values)
+    if n == 0 { return "0" }
+    let mut joined = ""
+    let mut i = 0
+    while i < n { joined = joined + values[i] + "\n"; i = i + 1 }
+    let m = exec("printf '%s' '" + joined + "' | sort -g | head -1 | tr -d ' \\n'")
+    if len(m) == 0 { return values[0] }
+    return m
+}
+
+fn max_str(values) {
+    let n = len(values)
+    if n == 0 { return "0" }
+    let mut joined = ""
+    let mut i = 0
+    while i < n { joined = joined + values[i] + "\n"; i = i + 1 }
+    let m = exec("printf '%s' '" + joined + "' | sort -g | tail -1 | tr -d ' \\n'")
+    if len(m) == 0 { return values[0] }
+    return m
+}
+
+// 결과는 hexa_v2 트랜스파일러가 map 리터럴을 지원하지 않아
+// 11-원소 배열로 반환 (인덱스 컨벤션 — bench_idx_* 헬퍼).
+//
+// idx 의미:
+//   0 median_wall_s   1 min_wall_s     2 max_wall_s
+//   3 median_rss_kb   4 min_rss_kb     5 max_rss_kb
+//   6 array_new       7 array_push     8 array_grow
+//   9 map_new        10 map_set
+fn bench_run_one_binary(bin, file, runs) {
+    let mut wall_arr = []
+    let mut rss_arr = []
+    let mut an_arr = []
+    let mut ap_arr = []
+    let mut ag_arr = []
+    let mut mn_arr = []
+    let mut ms_arr = []
+    let mut i = 0
+    while i < runs {
+        let sf = bench_time_cmd(bin, file)
+        wall_arr = wall_arr.push(parse_wall_s(sf))
+        rss_arr = rss_arr.push(parse_rss_kb(sf))
+        an_arr = an_arr.push(parse_alloc_counter(sf, "array_new"))
+        ap_arr = ap_arr.push(parse_alloc_counter(sf, "push"))
+        ag_arr = ag_arr.push(parse_alloc_counter(sf, "grow"))
+        mn_arr = mn_arr.push(parse_alloc_counter(sf, "map_new"))
+        ms_arr = ms_arr.push(parse_alloc_counter(sf, "map_set"))
+        let _ = exec("rm -f '" + sf + "' 2>/dev/null")
+        i = i + 1
+    }
+    let mut r = []
+    r = r.push(median_str(wall_arr))
+    r = r.push(min_str(wall_arr))
+    r = r.push(max_str(wall_arr))
+    r = r.push(median_str(rss_arr))
+    r = r.push(min_str(rss_arr))
+    r = r.push(max_str(rss_arr))
+    r = r.push(median_str(an_arr))
+    r = r.push(median_str(ap_arr))
+    r = r.push(median_str(ag_arr))
+    r = r.push(median_str(mn_arr))
+    r = r.push(median_str(ms_arr))
+    return r
+}
+
+fn bench_print_table(bin, file, runs, r) {
+    println("=== hexa bench ===")
+    println("  binary:    " + bin)
+    println("  file:      " + file)
+    println("  runs:      " + runs)
+    println("")
+    println("  metric                median        min           max")
+    println("  ────────────────────  ────────────  ────────────  ────────────")
+    println("  wall (s)              " + r[0] + "         " + r[1] + "         " + r[2])
+    println("  rss  (KB)             " + r[3] + "         " + r[4] + "         " + r[5])
+    println("")
+    println("  HEXA_ALLOC_STATS (median)")
+    println("    array_new:  " + r[6])
+    println("    array_push: " + r[7])
+    println("    array_grow: " + r[8])
+    println("    map_new:    " + r[9])
+    println("    map_set:    " + r[10])
+}
+
+fn bench_print_json(file, runs, r) {
+    // 수동 직렬화 — 키 순서 고정, 값은 숫자 그대로 (인용 없음).
+    // file 만 문자열로 quote. 외부 jq/python json.load 로 검증 가능.
+    // hexa_v2 트랜스파일러가 다중행 `+` 연결을 지원하지 않아 한 줄 누적.
+    let mut s = "{"
+    s = s + "\"file\":\"" + file + "\","
+    s = s + "\"runs\":" + runs + ","
+    s = s + "\"median_wall_s\":" + r[0] + ","
+    s = s + "\"min_wall_s\":" + r[1] + ","
+    s = s + "\"max_wall_s\":" + r[2] + ","
+    s = s + "\"median_rss_kb\":" + r[3] + ","
+    s = s + "\"min_rss_kb\":" + r[4] + ","
+    s = s + "\"max_rss_kb\":" + r[5] + ","
+    s = s + "\"alloc_stats\":{"
+    s = s + "\"array_new\":" + r[6] + ","
+    s = s + "\"array_push\":" + r[7] + ","
+    s = s + "\"array_grow\":" + r[8] + ","
+    s = s + "\"map_new\":" + r[9] + ","
+    s = s + "\"map_set\":" + r[10]
+    s = s + "}}"
+    println(s)
+}
+
+fn bench_print_compare(file, runs, ra, rb, bin_a, bin_b) {
+    // delta% = (B - A) / A * 100  ;  positive = B is slower / heavier.
+    println("=== hexa bench --compare ===")
+    println("  file:      " + file)
+    println("  runs:      " + runs)
+    println("  A:         " + bin_a)
+    println("  B:         " + bin_b)
+    println("")
+    println("  metric         A (median)    B (median)    delta%")
+    println("  ─────────────  ────────────  ────────────  ────────")
+    let aw = ra[0]
+    let bw = rb[0]
+    let dw = exec("awk -v a='" + aw + "' -v b='" + bw + "' 'BEGIN { if (a+0==0) printf \"n/a\"; else printf \"%+.2f\", (b-a)/a*100 }'")
+    let ar = ra[3]
+    let br = rb[3]
+    let dr = exec("awk -v a='" + ar + "' -v b='" + br + "' 'BEGIN { if (a+0==0) printf \"n/a\"; else printf \"%+.2f\", (b-a)/a*100 }'")
+    println("  wall (s)       " + aw + "         " + bw + "         " + dw + "%")
+    println("  rss  (KB)      " + ar + "         " + br + "         " + dr + "%")
+    println("")
+    println("  alloc-stats (median: A → B)")
+    println("    array_new:  " + ra[6] + " → " + rb[6])
+    println("    array_push: " + ra[7] + " → " + rb[7])
+    println("    array_grow: " + ra[8] + " → " + rb[8])
+    println("    map_new:    " + ra[9] + " → " + rb[9])
+    println("    map_set:    " + ra[10] + " → " + rb[10])
+}
+
+// digit-string → int. 네이티브 hexa(stage1+) 는 string 인덱싱이 없어 stage0
+// 와 다르게 s[i] 가 동작하지 않는다(hexa_index_get → hexa_array_get fall-through
+// 으로 'index out of bounds' 발생). 외부 awk 위임 후 int 타입으로 누적.
+fn parse_int_str(s) {
+    // 1차: awk 로 양의 정수만 통과시키고 길이 캡 5(<=99999) 적용.
+    let cleaned = exec("printf '%s' '" + s + "' | awk '{ if ($1 ~ /^[0-9]+$/ && length($1) <= 5) print int($1); else print 0 }' | tr -d ' \\n'")
+    if len(cleaned) == 0 { return 0 }
+    if cleaned == "0" { return 0 }
+    // 2차: 한 번에 하나씩 trim 하면서 자릿수 누적.
+    // awk 가 "23" 식으로 돌려주지만 hexa 에서 int 타입으로 끌어와야 한다.
+    // sequence of `case ${s} in 1*) printf 1 ;; ...` 식의 1자리 검사로
+    // string→int 변환을 우회한다. stage0 에서는 직접 변환 가능.
+    // hexa_v2 트랜스파일러는 빈 string match 를 정확히 처리 못하므로
+    // grep -c 로 카운트 비교를 통한 0/N 확인.
+    //
+    // MVP: cleaned 가 "1".."99999" 범위면 길이별로 분기, awk 로 cumulative
+    // 곱셈 수행. case 문 안 쓰고 awk -v 로 처리.
+    //
+    // 실제로는 5번까지 1-digit 추출 후 hexa int 로 변환:
+    let len_cmd = exec("printf '%s' '" + cleaned + "' | awk '{ print length($1) }' | tr -d ' \\n'")
+    let mut result = 0
+    if len_cmd == "1" {
+        result = digit_to_int(cleaned)
+    } else if len_cmd == "2" {
+        let d0 = exec("printf '%s' '" + cleaned + "' | cut -c1")
+        let d1 = exec("printf '%s' '" + cleaned + "' | cut -c2")
+        result = digit_to_int(d0) * 10 + digit_to_int(d1)
+    } else if len_cmd == "3" {
+        let d0 = exec("printf '%s' '" + cleaned + "' | cut -c1")
+        let d1 = exec("printf '%s' '" + cleaned + "' | cut -c2")
+        let d2 = exec("printf '%s' '" + cleaned + "' | cut -c3")
+        result = digit_to_int(d0) * 100 + digit_to_int(d1) * 10 + digit_to_int(d2)
+    } else if len_cmd == "4" {
+        let d0 = exec("printf '%s' '" + cleaned + "' | cut -c1")
+        let d1 = exec("printf '%s' '" + cleaned + "' | cut -c2")
+        let d2 = exec("printf '%s' '" + cleaned + "' | cut -c3")
+        let d3 = exec("printf '%s' '" + cleaned + "' | cut -c4")
+        result = digit_to_int(d0) * 1000 + digit_to_int(d1) * 100 + digit_to_int(d2) * 10 + digit_to_int(d3)
+    }
+    return result
+}
+
+fn digit_to_int(d) {
+    // 한 자리 숫자 string → int. 비교 평등성으로 분기 (string indexing 없이).
+    if d == "0" { return 0 }
+    if d == "1" { return 1 }
+    if d == "2" { return 2 }
+    if d == "3" { return 3 }
+    if d == "4" { return 4 }
+    if d == "5" { return 5 }
+    if d == "6" { return 6 }
+    if d == "7" { return 7 }
+    if d == "8" { return 8 }
+    if d == "9" { return 9 }
+    return 0
+}
+
+fn cmd_bench(file, runs, json_mode, compare_bin) {
+    // 자기 자신(./hexa) 을 기본 A, --compare 인자가 있으면 그것이 B.
+    // cwd 의 ./hexa 우선, 없으면 $HOME/Dev/hexa-lang/hexa fallback
+    // (워크트리/포크에서도 동작하도록).
+    let cwd_hexa = exec("printf '%s/hexa' \"$(pwd)\"")
+    let cwd_chk = exec("test -x '" + cwd_hexa + "' && printf yes || printf no")
+    let mut self_bin = ""
+    if cwd_chk == "yes" {
+        self_bin = cwd_hexa
+    } else {
+        self_bin = exec("printf '%s' \"$HOME/Dev/hexa-lang/hexa\"")
+    }
+    let exists = exec("test -f '" + file + "' && printf yes || printf no")
+    if exists != "yes" {
+        println("error: bench file not found: " + file)
+        return
+    }
+    let bin_check = exec("test -x '" + self_bin + "' && printf yes || printf no")
+    if bin_check != "yes" {
+        println("error: ./hexa not executable at " + self_bin)
+        return
+    }
+    let ra = bench_run_one_binary(self_bin, file, runs)
+    if len(compare_bin) > 0 {
+        let cb_check = exec("test -x '" + compare_bin + "' && printf yes || printf no")
+        if cb_check != "yes" {
+            println("error: --compare binary not executable: " + compare_bin)
+            return
+        }
+        let rb = bench_run_one_binary(compare_bin, file, runs)
+        if json_mode {
+            // compare + json: a/b 각각의 median 만 직렬화 (단순화).
+            let mut j = "{\"file\":\"" + file + "\",\"runs\":" + runs
+            j = j + ",\"a\":{\"binary\":\"" + self_bin + "\",\"median_wall_s\":" + ra[0]
+            j = j + ",\"median_rss_kb\":" + ra[3] + "}"
+            j = j + ",\"b\":{\"binary\":\"" + compare_bin + "\",\"median_wall_s\":" + rb[0]
+            j = j + ",\"median_rss_kb\":" + rb[3] + "}}"
+            println(j)
+        } else {
+            bench_print_compare(file, runs, ra, rb, self_bin, compare_bin)
+        }
+        return
+    }
+    if json_mode {
+        bench_print_json(file, runs, ra)
+    } else {
+        bench_print_table(self_bin, file, runs, ra)
+    }
+}
+
 // == Entry ==
 // 런타임이 argv[0]을 중복 삽입하므로 실제 사용자 인자는 av[2]부터 시작.
 // av[0]=exec경로, av[1]=exec경로(중복), av[2]=서브커맨드, av[3..]=서브 인자
@@ -563,6 +945,48 @@ if len(av) < 3 {
                 ri = ri + 1
             }
             cmd_run(av[3], run_args)
+        }
+    } else if sub == "bench" {
+        // bt 81: hexa bench <file> [--runs N] [--json] [--compare <other_bin>]
+        if len(av) < 4 {
+            println("error: 'bench' requires <file>")
+            cmd_help()
+        } else {
+            // hexa_v2 트랜스파일러: dispatch 블록 내부에서 `let mut` 시퀀스의
+            // 일부 HexaVal decl 이 누락되는 회귀가 확인됨(원인 추적은 별도
+            // 작업). 회피책: 모든 인자를 단일 배열 `bopts` 에 담아 cmd_bench 로
+            // 한 번에 위임. 배열 push/index 는 정상.
+            //   bopts[0] = file (str)
+            //   bopts[1] = runs (int)
+            //   bopts[2] = json_mode (0/1)
+            //   bopts[3] = compare_bin (str, "" if absent)
+            let mut bopts = [av[3], 3, 0, ""]
+            let mut bi = 4
+            while bi < len(av) {
+                let a = av[bi]
+                if a == "--runs" {
+                    if bi + 1 < len(av) {
+                        let parsed = parse_int_str(av[bi + 1])
+                        if parsed > 0 { bopts = [bopts[0], parsed, bopts[2], bopts[3]] }
+                        bi = bi + 2
+                    } else {
+                        bi = bi + 1
+                    }
+                } else if a == "--json" {
+                    bopts = [bopts[0], bopts[1], 1, bopts[3]]
+                    bi = bi + 1
+                } else if a == "--compare" {
+                    if bi + 1 < len(av) {
+                        bopts = [bopts[0], bopts[1], bopts[2], av[bi + 1]]
+                        bi = bi + 2
+                    } else {
+                        bi = bi + 1
+                    }
+                } else {
+                    bi = bi + 1
+                }
+            }
+            cmd_bench(bopts[0], bopts[1], bopts[2] == 1, bopts[3])
         }
     } else if sub == "build" {
         if len(av) < 4 {
