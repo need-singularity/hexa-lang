@@ -1613,9 +1613,13 @@ void hexa_arena_reset(void) {
 // expose mark/pop/heapify via the `env(...)` builtin path with reserved
 // `__HEXA_ARENA_*` keys — no transpiler edit needed.
 //
-// Gate: HEXA_VAL_ARENA env var. Default ON for the rt 32-L commit (verified
-// against examples/test_closures.hexa 16/16 + verify_suite); set to "0" to
-// fall back to the pre-rt-32-L heap path bit-for-bit.
+// Gate: HEXA_VAL_ARENA env var. Default OFF as of T31 fix (2026-04-13) —
+// arena-allocated structs/maps survive past arena reset on multi-line fn
+// body + use directive paths, leaking the raw arena pointer (~16GB VA) as
+// an array index ("index 16245672440 out of bounds (len 0)"). To opt-in
+// for the rt#32-L perf gain (fib K=30 wall -3.7%), export HEXA_VAL_ARENA=1
+// after auditing module_loader / interpreter scope-pop sites for
+// hexa_val_heapify on every cross-scope return. Bisect: 1c5a74f.
 
 // Per-scope mark stack. Sized for deep recursion (fib(30) ≈ 30 frames; we
 // budget 64K to cover ML stack depths). Overflow falls back to silently
@@ -1635,11 +1639,11 @@ static int __hexa_val_arena_enabled = -1;  // -1 = lazy probe
 static int hexa_val_arena_on(void) {
     if (__hexa_val_arena_enabled < 0) {
         const char* e = getenv("HEXA_VAL_ARENA");
-        // Default ON. To disable, export HEXA_VAL_ARENA=0.
+        // T31: default OFF. Opt-in with HEXA_VAL_ARENA=1 after scope-pop audit.
         if (!e || !e[0]) {
-            __hexa_val_arena_enabled = 1;
+            __hexa_val_arena_enabled = 0;
         } else {
-            __hexa_val_arena_enabled = (e[0] != '0') ? 1 : 0;
+            __hexa_val_arena_enabled = (e[0] == '1' || e[0] == 'y' || e[0] == 'Y') ? 1 : 0;
         }
     }
     return __hexa_val_arena_enabled;
