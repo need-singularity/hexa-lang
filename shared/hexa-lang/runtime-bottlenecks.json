@@ -315,9 +315,54 @@
         "RT 32-D (P2) partial 2026-04-13: self/runtime.c에 linked-block bump arena 구현 (`hexa_arena_alloc/mark/rewind/reset`, 4MB default block, 8-byte aligned). `hexa_str_concat`가 `HEXA_STR_ARENA=1` 게이트에서 arena 경로 사용 — 개별 malloc 제거, strcpy+strcat → memcpy×2. 측정 (str_concat micro, 200 step × 500 iter × 3 concat = 300,010 calls, 3-run median): baseline wall 1.63s RSS 3.58GB / arena-on wall 1.49s RSS 3.58GB / arena_alloc=300010 arena_blocks=2 arena_bytes=8.0MB. CPU -8.6% (sys -22% — malloc syscall 제거 반영), RSS 동일 (array_new 2.7M이 지배적, str_concat는 본 micro에서 minority). d64 실제 ML workload에서의 RSS 효과는 matvec/gelu temp string 경로 의존. Safety: gate 기본 OFF (string escape 미처리 — return/closure/map-insert 시 arena 수명 넘을 수 있음). mark/rewind API 공개되어 있으므로 followup에서 env_push_scope/env_pop_scope wiring (hexa_full.hexa + stage0 재빌드) 후 gate 기본 ON 가능. verify_suite runtime 6/6 PASS. followup: (a) hexa-level env_push_scope → hexa_arena_mark FFI 바인딩, (b) 반환값/맵 삽입 시 heap 복사 휴리스틱, (c) d64 실제 workload RSS 재측정.",
         "RT 32-D (P2) original: str_concat arena — 본 micro에서는 71회로 무관하지만 다른 워크로드용.",
         "RT 32-E (P0) done 2026-04-13 (commit a9c825f): **eval_expr `_tmp_arr` 1-element wrapper 제거 — 본 세션 최대 임팩트.** 본래 `fn eval_expr(node) { let _tmp_arr = [node]; return eval_expr_at(_tmp_arr, 0) }` 패턴이 매 호출마다 1 array_new + 1 push 발생. eval_expr_inner는 이미 동일한 fast-path literal dispatch를 갖고 있어 의미는 그대로, hot path 비용만 dramatic하게 감소. 변경: `fn eval_expr(node) { return eval_expr_inner(node) }` (단일 라인). 측정 (3-run median, d64 micro 200-step, HEXA_ALLOC_STATS=1, macOS arm64 stage0): array_new 16,934,820 → 261,507 (-98.5%), push 20,745,052 → 2,309,015 (-88.9%), grow 16,848,622 → 175,199 (-99.0%), map_new 3.37M 동일(Val struct는 여전히 맵), wall 11s → 6s (-45%), RSS 9.1GB → 8.6GB (-5.5%). **prompt 목표 -20% push 4배 초과 달성**. 부차 fix: bt 74-D 미러가 자동 포팅한 env_var_names/env_cache_names parallel arrays 분할이 val_closure cache_snap을 빈 리스트로 저장해 closure 호환성 깨졌던 SIGABRT(test_closures.hexa 16/16 → 2/16) 해결 — cache_snap을 parallel (cache_names, cache_idxs) bucket 형태로 저장. legacy 2-elem 엔트리(compose/curry/constant builtin)는 fallback rebuild 유지. 회귀: examples/test_closures.hexa 16/16 PASS, verify_suite 4/4 ossified PASS, verify_interp_builtins 9 PASS / 6 FAIL (baseline 동일, 무관). env-attribution이 push의 대다수가 아니었음이 사후 측정으로 확인됨 — eval_expr wrapper가 압도적이라 env split 자체의 측정 가능 효과는 미미.",
-        "RT 32-F (P1) followup needed: env_var_names/env_cache_names parallel arrays 분할 자체 효과 측정. RT 32-E의 eval_expr 수정이 너무 압도적이라 isolated impact 측정 불가했음. 가설: env split만 적용 시 push 약 -17%, array_new 약 -10% (이전 RT 32-E rebase 전 측정값). 만약 다른 hot wrapper가 또 있다면 (call_arg_buf 외 NK_BINOP/IndexExpr/MethodCall 임시 배열 등) 식별해서 동일 패턴(`return inner_fn(node)`) 적용. d64 micro에 남은 2.3M push 출처: env_push_scope/env_pop_scope의 env_scopes/env_scope_dirty push, env_define의 4 pushes/define, user-level out.push() — 측정 도구 추가 필요.",
+        "RT 32-F (P1) done 2026-04-13 (branch rt-32-f-env-split-measure): **env_var_names/env_cache_names parallel arrays 분할 isolated 효과 측정 완료 — verdict: rt32f_env_split_measured**. 구축: Variant A = 50f166a(pre-bt74-D) hexa_full.hexa + `fn eval_expr(node) { return eval_expr_inner(node) }` 단일 라인 패치(rt 32-E eval_expr 유지, env split 미적용). Variant B = 현재 HEAD (env split + rt 32-E). 둘 다 fresh transpile(hexa_v2) + clang -O2 + codesign 후 test_closures.hexa 전체 PASS + println('ok') smoke PASS 확인. 측정: `/usr/bin/time -l ./build/hexa_stage0_variant_{a,b} self/test_anima_lm.hexa` 3-run median, macOS arm64. Variant A: array_new=454,602, push=1,165,898, grow=419,398, map_new=140,566, wall=0.39s, RSS=550MB. Variant B: array_new=325,154, push=998,556, grow=289,869, map_new=140,567, wall=0.28s, RSS=516MB. **Isolated env split delta A→B**: array_new -28.5% (128,448 감소), push -14.4% (167,342 감소), grow -30.9%, map_new ~0%, wall -28.2%, RSS -6.1%. 가설(-17% push, -10% array_new) 대비 push는 근사 일치(-14.4%), array_new는 가설 대폭 초과(-28.5% vs 예상 -10%). env_define 경로 per-define 4-push→2-push + inner tuple array_new 제거 + env_cache bucket parallel push 동일 절감이 주효. rt 32-E + bt 74-D env split의 누적 gain이 사후 분리 측정으로 확인됨. 전체 d64 micro 기준 알로케이션 본령이 3개 hot wrapper(eval_expr, env_define tuple, env_cache tuple)의 합산이었음이 입증. followup 없음(측정 종결). verify: test_closures.hexa 전체 PASS 양 variant 공통.",
         "RT 32-G (P2) followup: RSS 8.6GB → <1GB 목표는 여전히 RT 32-A Phase 2 (Val struct flat C struct) 필수. 본 세션 RT 32-E는 alloc 횟수 99% 감축으로 wall -45%, RSS는 -5%만 — RSS 본령은 여전히 3.37M Val 인스턴스 × 32-slot map = 7+GB 하한 (Phase 1 분석 동일)."
       ]
+    },
+    {
+      "id": "32-F",
+      "category": "interpreter_alloc",
+      "name": "env split parallel arrays isolated impact — measured",
+      "description": "env_var_names/env_var_vals + env_cache_names/env_cache_idxs parallel-array 분할(bt 74-D auto-mirror)의 isolated 측정. rt 32-E eval_expr wrapper 제거 위 추가 효과 단독 분리. Variant A(50f166a + eval_expr patch, env split 없음) vs Variant B(현재 HEAD) 3-run median test_anima_lm.hexa d64 micro 200-step.",
+      "impact": "array_new -28.5%, push -14.4%, grow -30.9%, wall -28.2%, RSS -6.1% (gross gain on top of rt 32-E)",
+      "status": "done_hexa",
+      "priority": "P1",
+      "difficulty": "easy",
+      "hexa_impl": "94e26ea bt 74-D auto-mirror + a9c825f rt 32-E closure cache fix (env split 원본은 rt 32-E WIP, bt 74-D 미러로 커밋됨)",
+      "verdict": "rt32f_env_split_measured",
+      "measured_at": "2026-04-13",
+      "measured_branch": "rt-32-f-env-split-measure",
+      "before_metrics": {
+        "label": "Variant A — 50f166a base + eval_expr simplification only (env split reverted)",
+        "wall_s_median": 0.39,
+        "rss_bytes_median": 550060032,
+        "array_new": 454602,
+        "array_push": 1165898,
+        "array_grow": 419398,
+        "map_new": 140566,
+        "map_set": 0
+      },
+      "after_metrics": {
+        "label": "Variant B — current HEAD (env split + rt 32-E eval_expr + closure cache_snap fix)",
+        "wall_s_median": 0.28,
+        "rss_bytes_median": 516636672,
+        "array_new": 325154,
+        "array_push": 998556,
+        "array_grow": 289869,
+        "map_new": 140567,
+        "map_set": 0
+      },
+      "delta": {
+        "array_new_pct": -28.5,
+        "array_push_pct": -14.4,
+        "array_grow_pct": -30.9,
+        "map_new_pct": 0.0,
+        "wall_pct": -28.2,
+        "rss_pct": -6.1
+      },
+      "hypothesis_vs_actual": "가설: push -17%, array_new -10%. 실측: push -14.4%(가설 근사 일치), array_new -28.5%(가설 대폭 초과). array_new 절감의 진원지 = env_define per-define inner tuple `[name, value]` 배열 제거 + env_cache bucket per-define inner tuple `[name, idx]` 배열 제거. 누적 2×N_defines alloc 절감이 d64 micro에서 ~130K array_new에 해당.",
+      "verify": "examples/test_closures.hexa 전체 PASS 양 variant, println('ok') smoke PASS 양 variant, 3-run median 각 metric 변동 <0.1% (deterministic)",
+      "build_pipeline": "hexa_v2 transpile (0.35s) → clang -O2 -std=c11 -Wno-trigraphs -I self (8s) → codesign --force --sign -. 각 variant binary: build/hexa_stage0_variant_{a,b} (회귀 재현 가능, main build/hexa_stage0 미변경)"
     }
   ],
   "moved_to_bt_on_20260413": {
