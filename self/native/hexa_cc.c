@@ -5720,7 +5720,7 @@ HexaVal gen2_expr(HexaVal node) {
                     si = hexa_add(si, hexa_int(1));
                 }
                 HexaVal n = hexa_to_string(hexa_int(hexa_len(hexa_map_get(node, "args"))));
-                return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_struct_pack((HexaVal[]){"), hexa_str_join(a_strs, hexa_str(", "))), hexa_str("}, ")), n), hexa_str(")"));
+                return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_struct_pack_map((HexaVal[]){"), hexa_str_join(a_strs, hexa_str(", "))), hexa_str("}, ")), n), hexa_str(")"));
             }
             if (hexa_truthy(hexa_eq(name, hexa_str("struct_pack_f32")))) {
                 HexaVal a_strs = hexa_array_new();
@@ -6108,18 +6108,65 @@ HexaVal gen2_expr(HexaVal node) {
         return out;
     }
     if (hexa_truthy(hexa_eq(k, hexa_str("MapLit")))) {
-        HexaVal out = hexa_str("hexa_map_new()");
-        if (hexa_truthy(hexa_bool(!hexa_truthy(hexa_eq(hexa_type_of(hexa_map_get(node, "items")), hexa_str("string")))))) {
-            HexaVal mi = hexa_int(0);
-            while (hexa_truthy(hexa_bool((mi).i < (hexa_int(hexa_len(hexa_map_get(node, "items")))).i))) {
-                HexaVal entry = hexa_index_get(hexa_map_get(node, "items"), mi);
-                HexaVal key_c = gen2_expr(hexa_map_get(entry, "left"));
-                if (hexa_truthy(hexa_bool(hexa_truthy(hexa_bool(!hexa_truthy(hexa_eq(hexa_type_of(hexa_map_get(entry, "left")), hexa_str("string"))))) && hexa_truthy(hexa_eq(hexa_map_get(hexa_map_get(entry, "left"), "kind"), hexa_str("StringLit")))))) {
-                    key_c = hexa_add(hexa_add(hexa_str("\""), c_escape(hexa_map_get(hexa_map_get(entry, "left"), "value"))), hexa_str("\""));
-                }
-                out = hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_map_set("), out), hexa_str(", ")), key_c), hexa_str(", ")), gen2_expr(hexa_map_get(entry, "right"))), hexa_str(")"));
-                mi = hexa_add(mi, hexa_int(1));
+        // rt 32-A: MapLit fast-path — if every key is a StringLit, emit a
+        // single hexa_struct_pack_map call using C99 compound literals.
+        // This collapses N chained hexa_map_set calls into 1 bulk op.
+        // Fallback to the old chained hexa_map_set for non-literal keys.
+        HexaVal items = hexa_map_get(node, "items");
+        if (hexa_truthy(hexa_eq(hexa_type_of(items), hexa_str("string")))) {
+            return hexa_str("hexa_map_new()");
+        }
+        HexaVal nitems = hexa_int(hexa_len(items));
+        if (hexa_truthy(hexa_eq(nitems, hexa_int(0)))) {
+            return hexa_str("hexa_map_new()");
+        }
+        // Scan: are all keys StringLit?
+        HexaVal mi = hexa_int(0);
+        HexaVal all_lit = hexa_bool(1);
+        while (hexa_truthy(hexa_bool((mi).i < (nitems).i))) {
+            HexaVal entry = hexa_index_get(items, mi);
+            HexaVal left = hexa_map_get(entry, "left");
+            if (hexa_truthy(hexa_bool(hexa_truthy(hexa_eq(hexa_type_of(left), hexa_str("string"))) || !hexa_truthy(hexa_eq(hexa_map_get(left, "kind"), hexa_str("StringLit")))))) {
+                all_lit = hexa_bool(0);
+                break;
             }
+            mi = hexa_add(mi, hexa_int(1));
+        }
+        if (hexa_truthy(all_lit)) {
+            HexaVal keys_s = hexa_array_new();
+            HexaVal vals_s = hexa_array_new();
+            HexaVal j = hexa_int(0);
+            while (hexa_truthy(hexa_bool((j).i < (nitems).i))) {
+                HexaVal e = hexa_index_get(items, j);
+                if (hexa_truthy(hexa_bool((j).i > (hexa_int(0)).i))) {
+                    keys_s = hexa_array_push(keys_s, hexa_str(", "));
+                    vals_s = hexa_array_push(vals_s, hexa_str(", "));
+                }
+                keys_s = hexa_array_push(keys_s, hexa_add(hexa_add(hexa_str("\""), c_escape(hexa_map_get(hexa_map_get(e, "left"), "value"))), hexa_str("\"")));
+                vals_s = hexa_array_push(vals_s, gen2_expr(hexa_map_get(e, "right")));
+                j = hexa_add(j, hexa_int(1));
+            }
+            HexaVal nstr = hexa_to_string(nitems);
+            HexaVal r = hexa_str("hexa_struct_pack_map(\"\", ");
+            r = hexa_add(r, nstr);
+            r = hexa_add(r, hexa_str(", (const char*[]){"));
+            r = hexa_add(r, hexa_str_join(keys_s, hexa_str("")));
+            r = hexa_add(r, hexa_str("}, (HexaVal[]){"));
+            r = hexa_add(r, hexa_str_join(vals_s, hexa_str("")));
+            r = hexa_add(r, hexa_str("})"));
+            return r;
+        }
+        // Fallback: chained hexa_map_set (non-literal keys).
+        HexaVal out = hexa_str("hexa_map_new()");
+        HexaVal mi2 = hexa_int(0);
+        while (hexa_truthy(hexa_bool((mi2).i < (nitems).i))) {
+            HexaVal entry = hexa_index_get(items, mi2);
+            HexaVal key_c = gen2_expr(hexa_map_get(entry, "left"));
+            if (hexa_truthy(hexa_bool(hexa_truthy(hexa_bool(!hexa_truthy(hexa_eq(hexa_type_of(hexa_map_get(entry, "left")), hexa_str("string"))))) && hexa_truthy(hexa_eq(hexa_map_get(hexa_map_get(entry, "left"), "kind"), hexa_str("StringLit")))))) {
+                key_c = hexa_add(hexa_add(hexa_str("\""), c_escape(hexa_map_get(hexa_map_get(entry, "left"), "value"))), hexa_str("\""));
+            }
+            out = hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_map_set("), out), hexa_str(", ")), key_c), hexa_str(", ")), gen2_expr(hexa_map_get(entry, "right"))), hexa_str(")"));
+            mi2 = hexa_add(mi2, hexa_int(1));
         }
         return out;
     }
@@ -6138,23 +6185,59 @@ HexaVal gen2_expr(HexaVal node) {
 
 
 HexaVal gen2_struct_decl(HexaVal node) {
+    // rt 32-A: struct constructor fast-path.  Instead of emitting:
+    //     HexaVal __s = hexa_map_new();
+    //     __s = hexa_map_set(__s, "__type__", ...);
+    //     __s = hexa_map_set(__s, "field_i", field_i);  // ×N
+    // we now emit a single bulk call:
+    //     static const char* _k[] = {"f0","f1",...};
+    //     HexaVal _v[] = {f0, f1, ...};
+    //     return hexa_struct_pack_map("Name", N, _k, _v);
+    // which pre-sizes the hash table once (no rehash) and batch-inserts.
+    // For Val with 12 fields this collapses 14 alloc-counter bumps to 1.
     HexaVal name = hexa_map_get(node, "name");
     HexaVal params = hexa_array_new();
-    HexaVal body_parts = hexa_array_new();
-    body_parts = hexa_array_push(body_parts, hexa_str("    HexaVal __s = hexa_map_new();\n"));
-    body_parts = hexa_array_push(body_parts, hexa_add(hexa_add(hexa_str("    __s = hexa_map_set(__s, \"__type__\", hexa_str(\""), name), hexa_str("\"));\n")));
+    HexaVal keys_parts = hexa_array_new();
+    HexaVal vals_parts = hexa_array_new();
+    HexaVal nfields = hexa_int(hexa_len(hexa_map_get(node, "fields")));
     HexaVal i = hexa_int(0);
-    while (hexa_truthy(hexa_bool((i).i < (hexa_int(hexa_len(hexa_map_get(node, "fields")))).i))) {
+    while (hexa_truthy(hexa_bool((i).i < (nfields).i))) {
         HexaVal f = hexa_index_get(hexa_map_get(node, "fields"), i);
-        params = hexa_array_push(params, hexa_add(hexa_str("HexaVal "), hexa_map_get(f, "name")));
-        body_parts = hexa_array_push(body_parts, hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("    __s = hexa_map_set(__s, \""), hexa_map_get(f, "name")), hexa_str("\", ")), hexa_map_get(f, "name")), hexa_str(");\n")));
+        HexaVal fname = hexa_map_get(f, "name");
+        params = hexa_array_push(params, hexa_add(hexa_str("HexaVal "), fname));
+        if (hexa_truthy(hexa_bool((i).i > (hexa_int(0)).i))) {
+            keys_parts = hexa_array_push(keys_parts, hexa_str(", "));
+            vals_parts = hexa_array_push(vals_parts, hexa_str(", "));
+        }
+        keys_parts = hexa_array_push(keys_parts, hexa_add(hexa_add(hexa_str("\""), fname), hexa_str("\"")));
+        vals_parts = hexa_array_push(vals_parts, fname);
         i = hexa_add(i, hexa_int(1));
     }
     HexaVal p = hexa_str_join(params, hexa_str(", "));
     if (hexa_truthy(hexa_eq(p, hexa_str("")))) {
         p = hexa_str("void");
     }
-    return hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("HexaVal "), name), hexa_str("(")), p), hexa_str(") {\n")), hexa_str_join(body_parts, hexa_str(""))), hexa_str("    return __s;\n}\n"));
+    HexaVal body = hexa_str("");
+    // Handle zero-field structs: still need valid array syntax.
+    if (hexa_truthy(hexa_eq(nfields, hexa_int(0)))) {
+        body = hexa_add(
+            hexa_add(hexa_str("    return hexa_struct_pack_map(\""), name),
+            hexa_str("\", 0, (const char* const*)0, (const HexaVal*)0);\n"));
+    } else {
+        HexaVal nstr = hexa_to_string(nfields);
+        body = hexa_add(
+            hexa_add(hexa_add(hexa_str("    static const char* const _k[] = {"), hexa_str_join(keys_parts, hexa_str(""))),
+                     hexa_str("};\n")),
+            hexa_add(hexa_add(hexa_str("    HexaVal _v[] = {"), hexa_str_join(vals_parts, hexa_str(""))),
+                     hexa_str("};\n")));
+        body = hexa_add(body,
+            hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("    return hexa_struct_pack_map(\""), name),
+                                       hexa_str("\", ")), nstr),
+                     hexa_str(", _k, _v);\n")));
+    }
+    return hexa_add(
+        hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("HexaVal "), name), hexa_str("(")), p), hexa_str(") {\n")),
+        hexa_add(body, hexa_str("}\n")));
     return hexa_void();
 }
 
