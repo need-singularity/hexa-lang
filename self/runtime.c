@@ -164,6 +164,9 @@ int hexa_is_type(HexaVal v, const char* type_name);
 // rt 32-A: bulk struct constructor (see below for docstring).
 HexaVal hexa_struct_pack_map(const char* type_name, int n,
                              const char* const* keys, const HexaVal* vals);
+// rt 32-B: scratch-buffer primitives for reusable args vector (NK_CALL path).
+HexaVal hexa_array_push_nostat(HexaVal arr, HexaVal item);
+HexaVal hexa_array_slice_fast(HexaVal arr, HexaVal start, HexaVal end);
 
 // ── Tagged Value ─────────────────────────────────────────
 // All HEXA values are represented as tagged unions (NaN-boxing alternative)
@@ -344,17 +347,26 @@ static int64_t _hx_stats_str_concat     = 0;
 static int64_t _hx_stats_array_reserve  = 0;
 static int64_t _hx_stats_map_new        = 0;
 static int64_t _hx_stats_map_set        = 0;
+// rt 32-D: arena allocator stats (str_concat hot-path)
+static int64_t _hx_stats_arena_alloc    = 0;   // total arena bump allocations
+static int64_t _hx_stats_arena_blocks   = 0;   // blocks created
+static int64_t _hx_stats_arena_bytes    = 0;   // bytes currently reserved in blocks
+static int64_t _hx_stats_str_concat_arena = 0; // str_concat calls that hit arena
 static int _hx_stats_enabled = -1;             // lazy probe of env
 
 static void _hx_stats_dump(void) {
-    fprintf(stderr, "[HEXA_ALLOC_STATS] array_new=%lld push=%lld grow=%lld reserve=%lld str_concat=%lld map_new=%lld map_set=%lld\n",
+    fprintf(stderr, "[HEXA_ALLOC_STATS] array_new=%lld push=%lld grow=%lld reserve=%lld str_concat=%lld map_new=%lld map_set=%lld arena_alloc=%lld arena_blocks=%lld arena_bytes=%lld str_concat_arena=%lld\n",
         (long long)_hx_stats_array_new,
         (long long)_hx_stats_array_push,
         (long long)_hx_stats_array_grow,
         (long long)_hx_stats_array_reserve,
         (long long)_hx_stats_str_concat,
         (long long)_hx_stats_map_new,
-        (long long)_hx_stats_map_set);
+        (long long)_hx_stats_map_set,
+        (long long)_hx_stats_arena_alloc,
+        (long long)_hx_stats_arena_blocks,
+        (long long)_hx_stats_arena_bytes,
+        (long long)_hx_stats_str_concat_arena);
 }
 
 static int _hx_stats_on(void) {
@@ -735,14 +747,176 @@ int hexa_is_type(HexaVal v, const char* type_name) {
     return t.tag == TAG_STR && t.s && strcmp(t.s, type_name) == 0;
 }
 
+// ── rt 32-D: scope-local arena allocator ─────────────────
+// Problem: hexa_str_concat was doing `malloc(strlen(a)+strlen(b)+1)` per call
+// with no free (no GC). d64 ML micro calls it 10^5+ times → heap fragmentation
+// and accumulated RSS pressure even if individual strings are short-lived.
+//
+// Solution: linked-block bump allocator. Each hexa_arena_alloc() returns
+// memory from the current block; when full, we chain a new block (default 4MB,
+// or large enough for the request). `hexa_arena_mark()` + `hexa_arena_rewind()`
+// give O(1) bulk-free semantics so a caller (env_push_scope / env_pop_scope or
+// a future FFI binding) can dispose an entire scope's worth of string
+// temporaries in one pointer reset.
+//
+// Opt-in via HEXA_STR_ARENA=1. Default OFF for safety: strings returned by
+// hexa_str_concat can escape the caller's scope through closures, return
+// values, or map inserts, and without real escape analysis we cannot prove
+// the lifetime matches the surrounding scope. Enabling the arena in
+// short-lived bench processes (d64 200 step micro) is safe in practice
+// because the process exit frees everything anyway; longer-running programs
+// should adopt mark/rewind discipline on scope transitions before turning
+// this on.
+//
+// P2 scope (accepted partial): mark/rewind API + opt-in gate only. Hexa-level
+// wiring into env_push_scope/env_pop_scope is a follow-up (requires
+// hexa_full.hexa edits + stage0 rebuild, deferred per task description).
+
+#define HEXA_ARENA_BLOCK_SIZE (4 * 1024 * 1024)   // 4MB default block
+
+typedef struct HexaArenaBlock {
+    struct HexaArenaBlock* next;   // NULL for last block
+    size_t cap;                    // usable bytes in data[]
+    size_t used;                   // bytes allocated from this block
+    char   data[];                 // flexible; cap bytes follow the header
+} HexaArenaBlock;
+
+typedef struct {
+    HexaArenaBlock* head;   // first block (never freed until hexa_arena_destroy)
+    HexaArenaBlock* cur;    // current bump block
+} HexaArena;
+
+// Arena mark: captures current allocation frontier for O(1) rewind.
+typedef struct {
+    HexaArenaBlock* block;
+    size_t used;
+} HexaArenaMark;
+
+static HexaArena __hexa_arena = {NULL, NULL};
+static int __hexa_arena_enabled = -1;     // lazy env probe
+
+static int hexa_arena_on(void) {
+    if (__hexa_arena_enabled < 0) {
+        const char* e = getenv("HEXA_STR_ARENA");
+        __hexa_arena_enabled = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return __hexa_arena_enabled;
+}
+
+static HexaArenaBlock* hexa_arena_new_block(size_t min_cap) {
+    size_t cap = min_cap > HEXA_ARENA_BLOCK_SIZE ? min_cap : HEXA_ARENA_BLOCK_SIZE;
+    HexaArenaBlock* b = (HexaArenaBlock*)malloc(sizeof(HexaArenaBlock) + cap);
+    if (!b) return NULL;
+    b->next = NULL;
+    b->cap = cap;
+    b->used = 0;
+    if (_hx_stats_on()) {
+        _hx_stats_arena_blocks++;
+        _hx_stats_arena_bytes += (int64_t)(sizeof(HexaArenaBlock) + cap);
+    }
+    return b;
+}
+
+// Allocate `n` bytes from the arena, 8-byte aligned. Returns NULL on OOM.
+// Public so future FFI consumers (env_push/pop_scope, parser temporaries)
+// can opt in. Thread-safety: single-threaded runtime; no locks needed.
+void* hexa_arena_alloc(size_t n) {
+    // Round up to 8-byte alignment so we can safely return the pointer to
+    // any caller that may store it where alignment matters.
+    n = (n + 7u) & ~(size_t)7u;
+    if (n == 0) n = 8;
+    if (!__hexa_arena.head) {
+        __hexa_arena.head = hexa_arena_new_block(n);
+        __hexa_arena.cur = __hexa_arena.head;
+        if (!__hexa_arena.head) return NULL;
+    }
+    HexaArenaBlock* b = __hexa_arena.cur;
+    if (b->used + n > b->cap) {
+        // Walk forward first: rewind may have left empty tail blocks we can reuse.
+        HexaArenaBlock* nb = b->next;
+        while (nb && nb->cap < n) nb = nb->next;
+        if (!nb) {
+            nb = hexa_arena_new_block(n);
+            if (!nb) return NULL;
+            // Append to end of chain (preserve any rewound-empty tail blocks).
+            HexaArenaBlock* tail = __hexa_arena.cur;
+            while (tail->next) tail = tail->next;
+            tail->next = nb;
+        }
+        nb->used = 0;
+        __hexa_arena.cur = nb;
+        b = nb;
+    }
+    void* p = (void*)(b->data + b->used);
+    b->used += n;
+    if (_hx_stats_on()) _hx_stats_arena_alloc++;
+    return p;
+}
+
+// Save current allocation frontier. Callers pair with hexa_arena_rewind.
+HexaArenaMark hexa_arena_mark(void) {
+    HexaArenaMark m;
+    m.block = __hexa_arena.cur;
+    m.used = __hexa_arena.cur ? __hexa_arena.cur->used : 0;
+    return m;
+}
+
+// Rewind arena to a previously captured mark. O(1). Blocks after `mark.block`
+// retain their backing memory (for reuse on next alloc) but are logically
+// empty.
+void hexa_arena_rewind(HexaArenaMark m) {
+    if (!m.block) {
+        if (__hexa_arena.head) {
+            __hexa_arena.head->used = 0;
+            __hexa_arena.cur = __hexa_arena.head;
+        }
+        return;
+    }
+    m.block->used = m.used;
+    // Mark all subsequent blocks as empty (they stay linked, reusable).
+    for (HexaArenaBlock* b = m.block->next; b; b = b->next) b->used = 0;
+    __hexa_arena.cur = m.block;
+}
+
+// Rewind to beginning (keep blocks for reuse). Public for follow-up wiring.
+void hexa_arena_reset(void) {
+    if (!__hexa_arena.head) return;
+    for (HexaArenaBlock* b = __hexa_arena.head; b; b = b->next) b->used = 0;
+    __hexa_arena.cur = __hexa_arena.head;
+}
+
 // ── String operations ────────────────────────────────────
 
+// rt 32-D: optional arena path. Under HEXA_STR_ARENA=1, temporary concat
+// results are bump-allocated from the scope arena instead of malloc'd
+// individually. Safety: strings that escape the arena's lifetime (returns,
+// map inserts, closure captures) must be copied into the persistent heap
+// by the caller — for now we do NOT perform automatic escape analysis, so
+// the gate defaults to OFF. With the gate OFF behavior is bit-identical to
+// pre-rt-32-D (every concat still does its own malloc).
 HexaVal hexa_str_concat(HexaVal a, HexaVal b) {
     if (_hx_stats_on()) _hx_stats_str_concat++;
     char* sa = a.tag == TAG_STR ? a.s : "";
     char* sb = b.tag == TAG_STR ? b.s : "";
-    char* result = malloc(strlen(sa) + strlen(sb) + 1);
-    strcpy(result, sa); strcat(result, sb);
+    size_t la = strlen(sa);
+    size_t lb = strlen(sb);
+    size_t total = la + lb + 1;
+    char* result;
+    if (hexa_arena_on()) {
+        result = (char*)hexa_arena_alloc(total);
+        if (!result) {
+            // Fallback: arena OOM → heap malloc so we stay correct.
+            result = (char*)malloc(total);
+        } else {
+            if (_hx_stats_on()) _hx_stats_str_concat_arena++;
+        }
+    } else {
+        result = (char*)malloc(total);
+    }
+    // memcpy avoids the strcpy+strcat double walk.
+    memcpy(result, sa, la);
+    memcpy(result + la, sb, lb);
+    result[la + lb] = '\0';
     return hexa_str_own(result);
 }
 
