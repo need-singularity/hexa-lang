@@ -451,6 +451,7 @@ HexaVal parse_strict(HexaVal tokens) {
     p_pending_symbol = hexa_str("");
     p_pending_link = hexa_str("");
     p_errors = hexa_array_new();
+    p_max_errors = hexa_int(50);
     HexaVal stmts = hexa_array_new();
     p_skip_newlines();
     while (hexa_truthy(hexa_bool(!hexa_truthy(p_at_end())))) {
@@ -7184,7 +7185,6 @@ int main(int argc, char** argv) {
         printf("hexa-cc: HEXA self-hosted compiler\nUsage: hexa-cc <input.hexa> <output.c>\n");
         return 1;
     }
-    p_max_errors = hexa_int(50);
     HexaVal src = hexa_read_file(hexa_str(argv[1]));
     HexaVal tokens = tokenize(src);
     HexaVal ast = parse(tokens);
