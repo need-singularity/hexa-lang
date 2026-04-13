@@ -232,6 +232,13 @@ typedef struct {
     struct HexaVal* order_vals; // ordered values
     int len;               // number of entries
     int order_cap;         // allocated capacity for order arrays
+    // rt 32-L: Val-arena support. When non-zero, this table + its slot/val/
+    // order arrays were allocated from the bump arena (NOT malloc). Such tables
+    // MUST be heapified before they outlive the current scope; otherwise an
+    // arena rewind invalidates the backing storage. Slots' .key strings are
+    // ALWAYS strdup'd (heap) regardless of from_arena, because the arena is
+    // bulk-rewound and per-string lifetime tracking is impractical here.
+    int from_arena;
 } HexaMapTable;
 
 // HexaVal must be defined before HexaValStruct so that HexaValStruct's
@@ -573,18 +580,48 @@ int hexa_len(HexaVal v) {
 
 // ── Map operations (Optimization #10: hash table) ───────
 
+// rt 32-L: forward decls — Val arena lives below the str_concat arena
+// (shared block chain via hexa_arena_alloc) but maintains its own scope-mark
+// stack so str-concat marks aren't perturbed by Val scope push/pop.
+static int hexa_val_arena_on(void);
+static void* hexa_val_arena_calloc(size_t n);
+
 // Allocate a new HexaMapTable with given hash-table capacity.
-static HexaMapTable* hmap_alloc(int ht_cap) {
-    HexaMapTable* t = (HexaMapTable*)calloc(1, sizeof(HexaMapTable));
-    t->ht_cap = ht_cap;
-    t->slots = (HexaMapSlot*)calloc(ht_cap, sizeof(HexaMapSlot));
-    t->vals  = (HexaVal*)calloc(ht_cap, sizeof(HexaVal));
+// rt 32-L: when from_arena=1, use bump-arena instead of malloc/calloc. Caller
+// guarantees the table will be heapified (via hexa_val_heapify) before the
+// arena rewind point catches up. When from_arena=0, behavior is unchanged.
+static HexaMapTable* hmap_alloc_ex(int ht_cap, int from_arena) {
+    HexaMapTable* t;
     int order_init = ht_cap < 8 ? 8 : ht_cap;
-    t->order_keys = (char**)malloc(sizeof(char*) * order_init);
-    t->order_vals = (HexaVal*)malloc(sizeof(HexaVal) * order_init);
+    if (from_arena) {
+        // All four allocations satisfied from the same bump frontier — single
+        // O(1) reset frees them in bulk. Zeroing via memset is required to
+        // satisfy the pre-existing calloc guarantees that hmap_find / load-
+        // factor checks rely on (slots[].key == NULL means empty).
+        t = (HexaMapTable*)hexa_val_arena_calloc(sizeof(HexaMapTable));
+        t->slots = (HexaMapSlot*)hexa_val_arena_calloc(ht_cap * sizeof(HexaMapSlot));
+        t->vals  = (HexaVal*)hexa_val_arena_calloc(ht_cap * sizeof(HexaVal));
+        t->order_keys = (char**)hexa_val_arena_calloc(sizeof(char*) * order_init);
+        t->order_vals = (HexaVal*)hexa_val_arena_calloc(sizeof(HexaVal) * order_init);
+        t->from_arena = 1;
+    } else {
+        t = (HexaMapTable*)calloc(1, sizeof(HexaMapTable));
+        t->slots = (HexaMapSlot*)calloc(ht_cap, sizeof(HexaMapSlot));
+        t->vals  = (HexaVal*)calloc(ht_cap, sizeof(HexaVal));
+        t->order_keys = (char**)malloc(sizeof(char*) * order_init);
+        t->order_vals = (HexaVal*)malloc(sizeof(HexaVal) * order_init);
+        t->from_arena = 0;
+    }
+    t->ht_cap = ht_cap;
     t->order_cap = order_init;
     t->len = 0;
     return t;
+}
+
+// Backward-compat wrapper — preserves the heap-only signature for callers that
+// must guarantee long-lived storage (env caches, fn body maps, etc.).
+static HexaMapTable* hmap_alloc(int ht_cap) {
+    return hmap_alloc_ex(ht_cap, 0);
 }
 
 // Rehash the table to double its capacity.
@@ -645,7 +682,15 @@ HexaVal hexa_struct_pack_map(const char* type_name, int n,
     int need = (n + 1) * 100 / HMAP_LOAD_MAX + 1;
     int cap = HMAP_INIT_CAP;
     while (cap < need) cap <<= 1;
-    HexaMapTable* t = hmap_alloc(cap);
+    // rt 32-L: opt-in arena allocation for struct literals. Anonymous map
+    // literals (type_name == "" or NULL) are excluded — they often back
+    // long-lived data (config, AST nodes, registries) where the heapify
+    // discipline is not currently wired. Type_named struct literals are the
+    // hot fib path (every Val{...} in the interpreter) and the primary RSS
+    // contributor at K=30. The arena gate is HEXA_VAL_ARENA (separate from
+    // HEXA_STR_ARENA so the two can be tuned independently).
+    int from_arena = (type_name && type_name[0]) ? hexa_val_arena_on() : 0;
+    HexaMapTable* t = hmap_alloc_ex(cap, from_arena);
     v.map.tbl = t;
     uint32_t mask = (uint32_t)(cap - 1);
     // Insert __type__ first (skip for anonymous map literals where
@@ -654,13 +699,34 @@ HexaVal hexa_struct_pack_map(const char* type_name, int n,
         uint32_t h = hexa_fnv1a_str("__type__");
         uint32_t idx = h & mask;
         while (t->slots[idx].key) idx = (idx + 1) & mask;
-        t->slots[idx].key = strdup("__type__");
-        t->slots[idx].hash = h;
-        HexaVal tv = {.tag=TAG_STR};
-        tv.s = strdup(type_name);
-        t->vals[idx] = tv;
-        t->order_keys[t->len] = t->slots[idx].key;
-        t->order_vals[t->len] = tv;
+        // Keys/values strdup'd into heap regardless of from_arena: heapify()
+        // can shallow-share these strings (keys are usually literal-like and
+        // the arena would otherwise force per-string heap copies on every
+        // heapify call, defeating the win). The TAG_STR value `tv` payload is
+        // also strdup'd; for arena path we instead arena-alloc to keep the
+        // bulk-free property.
+        if (from_arena) {
+            char* kdup = (char*)hexa_arena_alloc(strlen("__type__") + 1);
+            memcpy(kdup, "__type__", 9);
+            t->slots[idx].key = kdup;
+            HexaVal tv = {.tag=TAG_STR};
+            size_t tnl = strlen(type_name);
+            char* tdup = (char*)hexa_arena_alloc(tnl + 1);
+            memcpy(tdup, type_name, tnl + 1);
+            tv.s = tdup;
+            t->slots[idx].hash = h;
+            t->vals[idx] = tv;
+            t->order_keys[t->len] = t->slots[idx].key;
+            t->order_vals[t->len] = tv;
+        } else {
+            t->slots[idx].key = strdup("__type__");
+            t->slots[idx].hash = h;
+            HexaVal tv = {.tag=TAG_STR};
+            tv.s = strdup(type_name);
+            t->vals[idx] = tv;
+            t->order_keys[t->len] = t->slots[idx].key;
+            t->order_vals[t->len] = tv;
+        }
         t->len++;
     }
     for (int i = 0; i < n; i++) {
@@ -668,7 +734,14 @@ HexaVal hexa_struct_pack_map(const char* type_name, int n,
         uint32_t h = hexa_fnv1a_str(k);
         uint32_t idx = h & mask;
         while (t->slots[idx].key) idx = (idx + 1) & mask;
-        t->slots[idx].key = strdup(k);
+        if (from_arena) {
+            size_t kl = strlen(k);
+            char* kdup = (char*)hexa_arena_alloc(kl + 1);
+            memcpy(kdup, k, kl + 1);
+            t->slots[idx].key = kdup;
+        } else {
+            t->slots[idx].key = strdup(k);
+        }
         t->slots[idx].hash = h;
         t->vals[idx] = vals[i];
         t->order_keys[t->len] = t->slots[idx].key;
