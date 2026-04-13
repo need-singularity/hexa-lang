@@ -406,6 +406,22 @@ HexaVal hexa_float(double f) { return (HexaVal){.tag=TAG_FLOAT, .f=f}; }
 HexaVal hexa_bool(int b) { return (HexaVal){.tag=TAG_BOOL, .b=b}; }
 HexaVal hexa_void() { return (HexaVal){.tag=TAG_VOID}; }
 
+// T32: unwrap a HexaVal (possibly VALSTRUCT-wrapped by the interpreter) into
+// a raw C double. The prior inline `v.tag==TAG_FLOAT?v.f:(double)v.i` read
+// only the outer tag, so interpreter values (which carry TAG_VALSTRUCT with
+// the real tag in vs->tag_i) fell through and cast the vs pointer bits to
+// double — producing garbage. Centralising here lets to_float / exp / sin /
+// cos / log / log10 / round share one correct unwrap.
+static inline double __hx_to_double(HexaVal v) {
+    if (v.tag == TAG_FLOAT) return v.f;
+    if (v.tag == TAG_INT)   return (double)v.i;
+    if (v.tag == TAG_VALSTRUCT && v.vs) {
+        if (v.vs->tag_i == TAG_FLOAT) return v.vs->float_val;
+        if (v.vs->tag_i == TAG_INT)   return (double)v.vs->int_val;
+    }
+    return 0.0;
+}
+
 // Null coalescing: a ?? b — if a is void or empty string, return b
 HexaVal hexa_null_coal(HexaVal a, HexaVal b) {
     if (a.tag == TAG_VOID) return b;

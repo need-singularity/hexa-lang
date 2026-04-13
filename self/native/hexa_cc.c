@@ -5766,8 +5766,13 @@ HexaVal gen2_expr(HexaVal node) {
                 return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_pow("), gen2_expr(hexa_index_get(hexa_map_get(node, "args"), hexa_int(0)))), hexa_str(", ")), gen2_expr(hexa_index_get(hexa_map_get(node, "args"), hexa_int(1)))), hexa_str(")"));
             }
             if (hexa_truthy(hexa_eq(name, hexa_str("to_float")))) {
+                /* T32 fix: old inline `v.tag==TAG_FLOAT?v.f:(double)v.i`
+                 * read only the outer HexaVal tag, so interpreter values
+                 * (TAG_VALSTRUCT) fell through and cast the vs pointer
+                 * bits to double. __hx_to_double (self/runtime.c) unwraps
+                 * TAG_VALSTRUCT via vs->tag_i / vs->float_val / vs->int_val. */
                 HexaVal a = gen2_expr(hexa_index_get(hexa_map_get(node, "args"), hexa_int(0)));
-                return hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_float("), a), hexa_str(".tag==TAG_FLOAT?")), a), hexa_str(".f:(double)")), a), hexa_str(".i)"));
+                return hexa_add(hexa_add(hexa_str("hexa_float(__hx_to_double("), a), hexa_str("))"));
             }
             if (hexa_truthy(hexa_eq(name, hexa_str("is_alpha")))) {
                 HexaVal a = gen2_expr(hexa_index_get(hexa_map_get(node, "args"), hexa_int(0)));
