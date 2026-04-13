@@ -168,6 +168,33 @@ HexaVal hexa_struct_pack_map(const char* type_name, int n,
 HexaVal hexa_array_push_nostat(HexaVal arr, HexaVal item);
 HexaVal hexa_array_slice_fast(HexaVal arr, HexaVal start, HexaVal end);
 
+// rt 32-G Phase 0: flat Val struct forward decls (implementation below).
+// NOTE: parameter-less typedef stays outside so the struct body later in
+// this file keeps using the same name. Function decls reference HexaVal
+// (defined below) and the fully-defined HexaValStruct — OK because the C
+// compiler only needs full types at call sites, not at forward decls.
+typedef struct HexaValStruct HexaValStruct;
+HexaVal hexa_valstruct_new(int64_t tag_i, int64_t int_val, double float_val,
+    int bool_val, const char* str_val, const char* char_val,
+    const char* array_val, const char* fn_name, const char* fn_params,
+    const char* fn_body, const char* struct_name, const char* struct_fields);
+HexaVal hexa_valstruct_new_v(HexaVal, HexaVal, HexaVal, HexaVal, HexaVal,
+    HexaVal, HexaVal, HexaVal, HexaVal, HexaVal, HexaVal, HexaVal);
+HexaVal hexa_valstruct_tag(HexaVal v);
+HexaVal hexa_valstruct_int(HexaVal v);
+HexaVal hexa_valstruct_float(HexaVal v);
+HexaVal hexa_valstruct_bool(HexaVal v);
+HexaVal hexa_valstruct_str(HexaVal v);
+HexaVal hexa_valstruct_char(HexaVal v);
+HexaVal hexa_valstruct_array(HexaVal v);
+HexaVal hexa_valstruct_fn_name(HexaVal v);
+HexaVal hexa_valstruct_fn_params(HexaVal v);
+HexaVal hexa_valstruct_fn_body(HexaVal v);
+HexaVal hexa_valstruct_struct_name(HexaVal v);
+HexaVal hexa_valstruct_struct_fields(HexaVal v);
+HexaVal hexa_valstruct_get_by_key(HexaVal v, const char* key);
+HexaVal hexa_valstruct_set_by_key(HexaVal v, const char* key, HexaVal val);
+
 // ── Tagged Value ─────────────────────────────────────────
 // All HEXA values are represented as tagged unions (NaN-boxing alternative)
 
@@ -175,11 +202,11 @@ typedef enum {
     TAG_INT = 0, TAG_FLOAT, TAG_BOOL, TAG_STR, TAG_VOID,
     TAG_ARRAY, TAG_MAP, TAG_FN, TAG_CHAR, TAG_CLOSURE,
     // rt 32-G Phase 0: flat C struct replacement for interpreter `Val` map.
-    // Val is the interpreter's tagged value carrier — constructed ~3.37M
-    // times per d64 200-step run. Each map-backed Val = 1 map_new + 12 map_set
-    // = 13 hash-table insertions. Replacing with a flat 12-field C struct
-    // collapses that to a single heap alloc, eliminating 7GB+ of RSS pressure.
-    // Fields match `struct Val` in self/hexa_full.hexa exactly (12 fields).
+    // Val is the interpreter's tagged value carrier — ~3.37M constructions
+    // per d64 200-step run. Each map-backed Val = 1 map_new + 12 map_set =
+    // 13 hash-table insertions. Replacing with a flat 12-field C struct
+    // collapses that to a single heap alloc, eliminating 7GB+ RSS pressure.
+    // Fields mirror `struct Val` in self/hexa_full.hexa exactly (12 fields).
     TAG_VALSTRUCT
 } HexaTag;
 
@@ -215,13 +242,12 @@ typedef struct {
 // sharing semantics). Lifetime: leak-compatible with current interpreter
 // (no free, same as existing map-backed Vals).
 typedef struct HexaValStruct {
-    int64_t tag_i;          // TAG_INT / TAG_FLOAT / ... (interpreter-level tag, not HexaTag)
+    int64_t tag_i;          // Hexa-level Val.tag (TAG_INT / TAG_FLOAT / ...)
     int64_t int_val;
     double  float_val;
     int     bool_val;
-    // All string fields stored as owned char* (NULL-terminated).
-    // Empty-string literals point to the shared static "" sentinel to avoid
-    // 12×strdup("") per void-Val construction.
+    // All string fields stored as char* (NULL-terminated).
+    // Empty-string literals share the static "" sentinel.
     const char* str_val;
     const char* char_val;
     const char* array_val;
@@ -643,6 +669,10 @@ HexaVal hexa_struct_pack_map(const char* type_name, int n,
 }
 
 HexaVal hexa_map_set(HexaVal m, const char* key, HexaVal val) {
+    // rt 32-G: route Val field mutation to flat struct.
+    if (m.tag == TAG_VALSTRUCT) {
+        return hexa_valstruct_set_by_key(m, key, val);
+    }
     if (_hx_stats_on()) _hx_stats_map_set++;
     // Lazy-alloc table on first insert
     if (!m.map.tbl) {
@@ -692,6 +722,10 @@ HexaVal hexa_map_set(HexaVal m, const char* key, HexaVal val) {
 }
 
 HexaVal hexa_map_get(HexaVal m, const char* key) {
+    // rt 32-G: route Val field access to flat struct accessor.
+    if (m.tag == TAG_VALSTRUCT) {
+        return hexa_valstruct_get_by_key(m, key);
+    }
     if (!m.map.tbl) {
         fprintf(stderr, "map key '%s' not found\n", key);
         return hexa_void();
@@ -813,15 +847,217 @@ HexaVal hexa_index_set(HexaVal container, HexaVal key, HexaVal val) {
 }
 
 // Silent type check for struct method dispatch (codegen_c2 ImplBlock support).
-// Returns 1 if v is a TAG_MAP carrying a "__type__" field equal to type_name.
+// Returns 1 if v is a TAG_MAP carrying a "__type__" field equal to type_name,
+// or TAG_VALSTRUCT (always type "Val" — rt 32-G flat struct).
 // Uses hash lookup instead of linear scan.
 int hexa_is_type(HexaVal v, const char* type_name) {
+    if (v.tag == TAG_VALSTRUCT) {
+        return type_name && strcmp(type_name, "Val") == 0;
+    }
     if (v.tag != TAG_MAP || !v.map.tbl) return 0;
     uint32_t h = hexa_fnv1a_str("__type__");
     int si = hmap_find(v.map.tbl, "__type__", h);
     if (si < 0) return 0;
     HexaVal t = v.map.tbl->vals[si];
     return t.tag == TAG_STR && t.s && strcmp(t.s, type_name) == 0;
+}
+
+// ══════════════════════════════════════════════════════════════
+//  rt 32-G Phase 0: flat Val struct implementations
+// ══════════════════════════════════════════════════════════════
+
+static const char* HEXA_EMPTY_STR = "";
+
+HexaVal hexa_valstruct_new(
+    int64_t tag_i, int64_t int_val, double float_val, int bool_val,
+    const char* str_val, const char* char_val, const char* array_val,
+    const char* fn_name, const char* fn_params, const char* fn_body,
+    const char* struct_name, const char* struct_fields)
+{
+    HexaValStruct* s = (HexaValStruct*)malloc(sizeof(HexaValStruct));
+    if (!s) { fprintf(stderr, "OOM in valstruct_new\n"); exit(1); }
+    s->tag_i       = tag_i;
+    s->int_val     = int_val;
+    s->float_val   = float_val;
+    s->bool_val    = bool_val;
+    // Empty strings share the "" sentinel (avoids 12×strdup("") per void-Val).
+    s->str_val       = (str_val       && str_val[0])       ? str_val       : HEXA_EMPTY_STR;
+    s->char_val      = (char_val      && char_val[0])      ? char_val      : HEXA_EMPTY_STR;
+    s->array_val     = (array_val     && array_val[0])     ? array_val     : HEXA_EMPTY_STR;
+    s->fn_name       = (fn_name       && fn_name[0])       ? fn_name       : HEXA_EMPTY_STR;
+    s->fn_params     = (fn_params     && fn_params[0])     ? fn_params     : HEXA_EMPTY_STR;
+    s->fn_body       = (fn_body       && fn_body[0])       ? fn_body       : HEXA_EMPTY_STR;
+    s->struct_name   = (struct_name   && struct_name[0])   ? struct_name   : HEXA_EMPTY_STR;
+    s->struct_fields = (struct_fields && struct_fields[0]) ? struct_fields : HEXA_EMPTY_STR;
+    HexaVal v = {.tag = TAG_VALSTRUCT};
+    v.vs = s;
+    return v;
+}
+
+HexaVal hexa_valstruct_new_v(
+    HexaVal tag_v, HexaVal int_v, HexaVal float_v, HexaVal bool_v,
+    HexaVal str_v, HexaVal char_v, HexaVal array_v,
+    HexaVal fn_name_v, HexaVal fn_params_v, HexaVal fn_body_v,
+    HexaVal struct_name_v, HexaVal struct_fields_v)
+{
+    return hexa_valstruct_new(
+        tag_v.tag == TAG_INT ? tag_v.i : 0,
+        int_v.tag == TAG_INT ? int_v.i : 0,
+        float_v.tag == TAG_FLOAT ? float_v.f :
+            (float_v.tag == TAG_INT ? (double)float_v.i : 0.0),
+        bool_v.tag == TAG_BOOL ? bool_v.b :
+            (bool_v.tag == TAG_INT ? (int)bool_v.i : 0),
+        str_v.tag == TAG_STR ? str_v.s : "",
+        char_v.tag == TAG_STR ? char_v.s : "",
+        array_v.tag == TAG_STR ? array_v.s : "",
+        fn_name_v.tag == TAG_STR ? fn_name_v.s : "",
+        fn_params_v.tag == TAG_STR ? fn_params_v.s : "",
+        fn_body_v.tag == TAG_STR ? fn_body_v.s : "",
+        struct_name_v.tag == TAG_STR ? struct_name_v.s : "",
+        struct_fields_v.tag == TAG_STR ? struct_fields_v.s : "");
+}
+
+HexaVal hexa_valstruct_tag(HexaVal v) {
+    if (v.tag != TAG_VALSTRUCT || !v.vs) return hexa_int(0);
+    return hexa_int(v.vs->tag_i);
+}
+HexaVal hexa_valstruct_int(HexaVal v) {
+    if (v.tag != TAG_VALSTRUCT || !v.vs) return hexa_int(0);
+    return hexa_int(v.vs->int_val);
+}
+HexaVal hexa_valstruct_float(HexaVal v) {
+    if (v.tag != TAG_VALSTRUCT || !v.vs) return hexa_float(0.0);
+    return hexa_float(v.vs->float_val);
+}
+HexaVal hexa_valstruct_bool(HexaVal v) {
+    if (v.tag != TAG_VALSTRUCT || !v.vs) return hexa_bool(0);
+    return hexa_bool(v.vs->bool_val);
+}
+HexaVal hexa_valstruct_str(HexaVal v) {
+    if (v.tag != TAG_VALSTRUCT || !v.vs) return hexa_str("");
+    return hexa_str(v.vs->str_val);
+}
+HexaVal hexa_valstruct_char(HexaVal v) {
+    if (v.tag != TAG_VALSTRUCT || !v.vs) return hexa_str("");
+    return hexa_str(v.vs->char_val);
+}
+HexaVal hexa_valstruct_array(HexaVal v) {
+    if (v.tag != TAG_VALSTRUCT || !v.vs) return hexa_str("");
+    return hexa_str(v.vs->array_val);
+}
+HexaVal hexa_valstruct_fn_name(HexaVal v) {
+    if (v.tag != TAG_VALSTRUCT || !v.vs) return hexa_str("");
+    return hexa_str(v.vs->fn_name);
+}
+HexaVal hexa_valstruct_fn_params(HexaVal v) {
+    if (v.tag != TAG_VALSTRUCT || !v.vs) return hexa_str("");
+    return hexa_str(v.vs->fn_params);
+}
+HexaVal hexa_valstruct_fn_body(HexaVal v) {
+    if (v.tag != TAG_VALSTRUCT || !v.vs) return hexa_str("");
+    return hexa_str(v.vs->fn_body);
+}
+HexaVal hexa_valstruct_struct_name(HexaVal v) {
+    if (v.tag != TAG_VALSTRUCT || !v.vs) return hexa_str("");
+    return hexa_str(v.vs->struct_name);
+}
+HexaVal hexa_valstruct_struct_fields(HexaVal v) {
+    if (v.tag != TAG_VALSTRUCT || !v.vs) return hexa_str("");
+    return hexa_str(v.vs->struct_fields);
+}
+
+// Key-string dispatch — branches on key[0] to amortize strcmp.
+HexaVal hexa_valstruct_get_by_key(HexaVal v, const char* key) {
+    if (v.tag != TAG_VALSTRUCT || !v.vs) {
+        fprintf(stderr, "valstruct_get: not a TAG_VALSTRUCT\n");
+        return hexa_void();
+    }
+    if (!key) return hexa_void();
+    switch (key[0]) {
+        case 't':
+            if (!strcmp(key, "tag"))           return hexa_int(v.vs->tag_i);
+            break;
+        case 'i':
+            if (!strcmp(key, "int_val"))       return hexa_int(v.vs->int_val);
+            break;
+        case 'f':
+            if (!strcmp(key, "float_val"))     return hexa_float(v.vs->float_val);
+            if (!strcmp(key, "fn_name"))       return hexa_str(v.vs->fn_name);
+            if (!strcmp(key, "fn_params"))     return hexa_str(v.vs->fn_params);
+            if (!strcmp(key, "fn_body"))       return hexa_str(v.vs->fn_body);
+            break;
+        case 'b':
+            if (!strcmp(key, "bool_val"))      return hexa_bool(v.vs->bool_val);
+            break;
+        case 's':
+            if (!strcmp(key, "str_val"))       return hexa_str(v.vs->str_val);
+            if (!strcmp(key, "struct_name"))   return hexa_str(v.vs->struct_name);
+            if (!strcmp(key, "struct_fields")) return hexa_str(v.vs->struct_fields);
+            break;
+        case 'c':
+            if (!strcmp(key, "char_val"))      return hexa_str(v.vs->char_val);
+            break;
+        case 'a':
+            if (!strcmp(key, "array_val"))     return hexa_str(v.vs->array_val);
+            break;
+        case '_':
+            if (!strcmp(key, "__type__"))      return hexa_str("Val");
+            break;
+    }
+    fprintf(stderr, "valstruct_get: unknown key '%s'\n", key);
+    return hexa_void();
+}
+
+HexaVal hexa_valstruct_set_by_key(HexaVal v, const char* key, HexaVal val) {
+    if (v.tag != TAG_VALSTRUCT || !v.vs) {
+        fprintf(stderr, "valstruct_set: not a TAG_VALSTRUCT\n");
+        return v;
+    }
+    if (!key) return v;
+    switch (key[0]) {
+        case 't':
+            if (!strcmp(key, "tag")) {
+                v.vs->tag_i = (val.tag == TAG_INT) ? val.i : v.vs->tag_i;
+                return v;
+            }
+            break;
+        case 'i':
+            if (!strcmp(key, "int_val")) {
+                v.vs->int_val = (val.tag == TAG_INT) ? val.i : v.vs->int_val;
+                return v;
+            }
+            break;
+        case 'f':
+            if (!strcmp(key, "float_val")) {
+                if (val.tag == TAG_FLOAT) v.vs->float_val = val.f;
+                else if (val.tag == TAG_INT) v.vs->float_val = (double)val.i;
+                return v;
+            }
+            if (!strcmp(key, "fn_name"))   { if (val.tag == TAG_STR) v.vs->fn_name   = val.s; return v; }
+            if (!strcmp(key, "fn_params")) { if (val.tag == TAG_STR) v.vs->fn_params = val.s; return v; }
+            if (!strcmp(key, "fn_body"))   { if (val.tag == TAG_STR) v.vs->fn_body   = val.s; return v; }
+            break;
+        case 'b':
+            if (!strcmp(key, "bool_val")) {
+                v.vs->bool_val = (val.tag == TAG_BOOL) ? val.b :
+                                 (val.tag == TAG_INT ? (int)val.i : v.vs->bool_val);
+                return v;
+            }
+            break;
+        case 's':
+            if (!strcmp(key, "str_val"))       { if (val.tag == TAG_STR) v.vs->str_val       = val.s; return v; }
+            if (!strcmp(key, "struct_name"))   { if (val.tag == TAG_STR) v.vs->struct_name   = val.s; return v; }
+            if (!strcmp(key, "struct_fields")) { if (val.tag == TAG_STR) v.vs->struct_fields = val.s; return v; }
+            break;
+        case 'c':
+            if (!strcmp(key, "char_val"))  { if (val.tag == TAG_STR) v.vs->char_val  = val.s; return v; }
+            break;
+        case 'a':
+            if (!strcmp(key, "array_val")) { if (val.tag == TAG_STR) v.vs->array_val = val.s; return v; }
+            break;
+    }
+    fprintf(stderr, "valstruct_set: unknown key '%s'\n", key);
+    return v;
 }
 
 // ── rt 32-D: scope-local arena allocator ─────────────────
@@ -1162,6 +1398,14 @@ HexaVal hexa_to_string(HexaVal v) {
         case TAG_BOOL: return hexa_str(v.b ? "true" : "false");
         case TAG_STR: return v;
         case TAG_VOID: return hexa_str("void");
+        // rt 32-G: minimal fallback repr — interpreter has its own
+        // val_to_string for the full form.
+        case TAG_VALSTRUCT: {
+            if (!v.vs) return hexa_str("<Val null>");
+            snprintf(buf, 64, "Val{tag=%lld,i=%lld}",
+                (long long)v.vs->tag_i, (long long)v.vs->int_val);
+            return hexa_str(buf);
+        }
         default: return hexa_str("<value>");
     }
 }
@@ -1174,6 +1418,8 @@ int hexa_truthy(HexaVal v) {
         case TAG_INT: return v.i != 0;
         case TAG_STR: return v.s[0] != 0;
         case TAG_VOID: return 0;
+        // rt 32-G: TAG_VALSTRUCT truthy iff .vs pointer non-null.
+        case TAG_VALSTRUCT: return v.vs != NULL;
         default: return 1;
     }
 }
@@ -1189,6 +1435,8 @@ HexaVal hexa_type_of(HexaVal v) {
         case TAG_VOID: return hexa_str("void");
         case TAG_ARRAY: return hexa_str("array");
         case TAG_MAP: return hexa_str("map");
+        // rt 32-G: Val is a struct at the Hexa level; surface "struct".
+        case TAG_VALSTRUCT: return hexa_str("struct");
         default: return hexa_str("unknown");
     }
 }
@@ -1217,6 +1465,10 @@ HexaVal hexa_eq(HexaVal a, HexaVal b) {
         case TAG_BOOL: return hexa_bool(a.b == b.b);
         case TAG_STR: return hexa_bool(a.s == b.s || strcmp(a.s, b.s) == 0);
         case TAG_VOID: return hexa_bool(1);
+        // rt 32-G: Val identity is pointer-equality of heap struct (matches
+        // TAG_MAP semantics — two separately constructed maps never compare
+        // equal by value).
+        case TAG_VALSTRUCT: return hexa_bool(a.vs == b.vs);
         default: return hexa_bool(0);
     }
 }
