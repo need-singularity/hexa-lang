@@ -5766,6 +5766,9 @@ HexaVal gen2_expr(HexaVal node) {
                     if (hexa_truthy(hexa_eq(name, hexa_str("ends_with")))) {
                         return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_bool(hexa_str_ends_with("), recv_mr), hexa_str(", ")), arg1_mr), hexa_str("))"));
                     }
+                    if (hexa_truthy(hexa_eq(name, hexa_str("join")))) {
+                        return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_str_join("), recv_mr), hexa_str(", ")), arg1_mr), hexa_str(")"));
+                    }
                 }
             }
             // ─── bt-71 fix: libc / builtin family dispatch ─────────────────────────
