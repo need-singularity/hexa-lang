@@ -122,6 +122,14 @@ let BC_MAP_TAG = "<bc_map>"
 // type-specializer will also key shape ICs on it.
 let BC_STRUCT_TAG = "<bc_struct>"
 
+// T47 closure-shape tag. Closures live on the VM stack as a
+// 4-element array ["<bc_closure>", proto_idx, upval_names[],
+// upval_vals[]]. OP_CLOSURE pushes an empty-upvalue seed;
+// OP_NEW_CLOSURE_UPVAL appends one (name, value) binding per emit
+// loop iteration. CALL-of-closure dispatch (rt#36-E) distinguishes
+// by the sentinel before resolving the proto.
+let BC_CLOSURE_TAG = "<bc_closure>"
+
 // ── VM init / reset. ────────────────────────────────────────
 
 fn bc_vm_reset() {
@@ -782,7 +790,151 @@ fn bc_vm_run_loop() {
         // ──────── MISC ────────
         else if op == BC_OP_POP {
             let _v = bc_vm_pop()
-        } else if op == BC_OP_PRINT {
+        }
+        // T47 — POPN Bx: pop N values at once. Equivalent to repeated
+        // POP but saves dispatch cycles when the emitter knows how many
+        // slots to discard (e.g. end of a scope with K temps).
+        else if op == BC_OP_POPN {
+            let popn_count = bc_bx_of(raw)
+            let mut popn_i = 0
+            while popn_i < popn_count {
+                let _v = bc_vm_pop()
+                if vm_trap { return last_return }
+                popn_i = popn_i + 1
+            }
+        }
+        // T47 — DUP: duplicate the top of the operand stack. Required
+        // by rt#37's scope verifier and by any optimization pass that
+        // reuses a result (e.g. short-circuit && lowering `a && a`).
+        else if op == BC_OP_DUP {
+            let dup_n = len(vm_stack)
+            if dup_n == 0 {
+                vm_trap = true
+                vm_trap_msg = "DUP: stack underflow"
+                return last_return
+            }
+            bc_vm_push(vm_stack[dup_n - 1])
+        }
+        // T47 — MOVE A B: copy local slot B into local slot A within
+        // the current frame. Register-move form — no stack interaction.
+        // `a` in Layout C's high byte is the destination; `b` in B16's
+        // low byte is the source. MVP treats both as 8-bit slot indices
+        // even though Layout C nominally makes B 16-bit; rt#37 extends
+        // the encoding if the locals table grows past 255 slots.
+        else if op == BC_OP_MOVE {
+            let mv_dst = bc_a_of(raw)
+            let mv_src = bc_b16_of(raw)
+            let mv_fp = fp
+            let mv_src_abs = mv_fp + mv_src
+            let mv_dst_abs = mv_fp + mv_dst
+            if mv_src_abs >= len(vm_locals) {
+                vm_trap = true
+                vm_trap_msg = "MOVE: src slot out of range"
+                return last_return
+            }
+            // Grow locals to cover destination if needed.
+            while len(vm_locals) <= mv_dst_abs {
+                vm_locals = vm_locals.push(BC_NIL)
+            }
+            vm_locals = bc_vm_setat(vm_locals, mv_dst_abs, vm_locals[mv_src_abs])
+        }
+        // T47 — TAILCALL A=nargs B16=proto_or_name: semantically
+        // equivalent to CALL followed by RETURN of the callee's value.
+        // MVP implementation: fall back to the ordinary CALL path —
+        // correctness is preserved; the frame-reuse optimization that
+        // distinguishes TAILCALL from CALL is deferred to rt#37 (where
+        // scope verification guarantees the current frame has no live
+        // locals after the tail call). Without that verification a
+        // frame-reuse TAILCALL would corrupt outer-local references.
+        else if op == BC_OP_TAILCALL {
+            let tc_nargs = bc_a_of(raw)
+            let tc_b16 = bc_b16_of(raw)
+            let tc_target = bc_vm_resolve_call(proto_idx, tc_b16)
+            if tc_target < 0 {
+                vm_trap = true
+                vm_trap_msg = "TAILCALL: cannot resolve target proto"
+                return last_return
+            }
+            bc_vm_push_frame(tc_target, tc_nargs)
+            if vm_trap { return last_return }
+        }
+        // T47 — CLOSURE Bx=proto_idx: build a closure value referencing
+        // the given proto with an empty upvalue table, push onto stack.
+        // Subsequent NEW_CLOSURE_UPVAL ops populate the upvalue slots.
+        // Shape: [BC_CLOSURE_TAG, proto_idx, upval_names[], upval_vals[]].
+        // Lambda emit (bc_emitter.hexa) is deferred to rt#36-E — this
+        // dispatch is present so hand-rolled bytecode can exercise the
+        // path end-to-end (test_bc_vm_closure.hexa) and so the opcode
+        // count reaches 62/62.
+        else if op == BC_OP_CLOSURE {
+            let cl_pidx = bc_bx_of(raw)
+            if cl_pidx >= len(bc_protos) {
+                vm_trap = true
+                vm_trap_msg = "CLOSURE: proto idx out of range"
+                return last_return
+            }
+            let cl_obj = [BC_CLOSURE_TAG, cl_pidx, [], []]
+            bc_vm_push(cl_obj)
+        }
+        // T47 — NEW_CLOSURE_UPVAL Bx=name_const_idx: pop value, pop
+        // closure, append (name, value) to the closure's upvalue
+        // arrays, push the updated closure. Emit order:
+        //   CLOSURE proto_idx
+        //   [push val_0]   NEW_CLOSURE_UPVAL name_0
+        //   [push val_1]   NEW_CLOSURE_UPVAL name_1
+        //   ...
+        // so the stack top always holds the work-in-progress closure.
+        else if op == BC_OP_NEW_CLOSURE_UPVAL {
+            let uv_cidx = bc_bx_of(raw)
+            let uv_consts = bc_proto_consts[proto_idx]
+            let mut uv_name = ""
+            if uv_cidx < len(uv_consts) {
+                uv_name = uv_consts[uv_cidx]
+            }
+            let uv_val = bc_vm_pop()
+            let uv_closure = bc_vm_pop()
+            if vm_trap { return last_return }
+            let mut uv_tag_ok = false
+            let mut uv_pidx = -1
+            let mut uv_names = []
+            let mut uv_vals = []
+            if type_of(uv_closure) == "array" {
+                if len(uv_closure) == 4 {
+                    if uv_closure[0] == BC_CLOSURE_TAG {
+                        uv_tag_ok = true
+                        uv_pidx = uv_closure[1]
+                        uv_names = uv_closure[2]
+                        uv_vals = uv_closure[3]
+                    }
+                }
+            }
+            if !uv_tag_ok {
+                vm_trap = true
+                vm_trap_msg = "NEW_CLOSURE_UPVAL: not a closure"
+                return last_return
+            }
+            let uv_new_names = uv_names.push(uv_name)
+            let uv_new_vals  = uv_vals.push(uv_val)
+            let uv_out = [BC_CLOSURE_TAG, uv_pidx, uv_new_names, uv_new_vals]
+            bc_vm_push(uv_out)
+        }
+        // T47 — LOAD_UPVAL Bx=name_const_idx: look up the named upvalue
+        // on the current frame's closure binding. MVP has no per-frame
+        // closure-binding register yet (the emitter doesn't wire Lambda
+        // calls), so this traps — kept as a stub so the opcode exists
+        // and so the dispatch ladder is exhaustive for the verifier.
+        else if op == BC_OP_LOAD_UPVAL {
+            vm_trap = true
+            vm_trap_msg = "LOAD_UPVAL: closure-frame upvalue binding not wired (rt#36-E)"
+            return last_return
+        }
+        else if op == BC_OP_STORE_UPVAL {
+            vm_trap = true
+            vm_trap_msg = "STORE_UPVAL: closure-frame upvalue binding not wired (rt#36-E)"
+            return last_return
+        }
+        // PRINT (debug-only) — keep adjacent to MISC family for locality.
+        else if op == BC_OP_PRINT {
             // Emitter's lowering of print(x): leaves x on top and
             // emits OP_PRINT. PRINT pops and prints. rt#36-A §6.9
             // notes OP_PRINT is debug-only (runtime `println` will
