@@ -130,3 +130,62 @@ docs/to-n6-architecture-2026-04-14.md    (본 답신)      [untracked]
 — hexa-lang 측 claude11 세션, 2026-04-14 21:47
 
 문서 끝.
+
+---
+
+## bench wave 2026-04-14 22:08
+
+### 환경
+- binary: `/Users/ghost/Dev/hexa-lang/hexa` (version `hexa 0.1.0-stage1`, stage1 orchestrator)
+- stage0: `build/hexa_stage0` 1,813,792 B (2026-04-14 21:52) — T44 bundle 직후
+- symlinks 대상: `/Users/ghost/Dev/n6-architecture/engine/arch_*.hexa`
+- 플립 확인: T43 `HEXA_VAL_ARENA=1` default ON 가동 중 (env 미설정 = ARENA=1)
+- 호스트: darwin 24.6.0 arm64 (Apple Silicon)
+- 측정: `/usr/bin/time -p` 5회 × (ARENA=1, ARENA=0), 별도로 `hexa bench --runs 5 --json`
+
+### 테스트 대상 (3/12)
+arch_selforg.hexa, arch_adaptive.hexa, arch_quantum.hexa — 나머지 9 파일 (rtl_*, sim_noc_*, verify_anima_soc, atlas_*, boot_matrix_*, ecosystem_*, ouroboros_*, arch_unified) 은 이번 wave 범위 밖.
+
+### 요약표 (time -p real, 5런 산술평균)
+
+| 파일 | ARENA=1 avg (s) | ARENA=0 avg (s) | delta | stdout bytes | exit |
+|---|---:|---:|---:|---:|---:|
+| arch_selforg  | 0.342 | 0.340 | +0.59% | 4613 | 0 |
+| arch_adaptive | 0.232 | 0.234 | -0.85% | 824  | 0 |
+| arch_quantum  | 0.068 | 0.064 | +6.25% | 982  | 0 |
+
+5-run raw (real seconds):
+- arch_selforg  ARENA=1: 0.35 0.34 0.34 0.34 0.34
+- arch_selforg  ARENA=0: 0.34 0.34 0.34 0.34 0.34
+- arch_adaptive ARENA=1: 0.24 0.23 0.23 0.23 0.23
+- arch_adaptive ARENA=0: 0.24 0.23 0.23 0.24 0.23
+- arch_quantum  ARENA=1: 0.06 0.07 0.07 0.07 0.07
+- arch_quantum  ARENA=0: 0.06 0.06 0.06 0.07 0.07
+
+### `hexa bench --runs 5 --json` (median wall, RSS, alloc)
+
+arch_selforg:
+- ARENA=1: median_wall=0.29s, RSS=55,648 KB, array_new=223690, array_push=770097, array_grow=179634, map_new=2889, map_set=22323
+- ARENA=0: median_wall=0.29s, RSS=57,440 KB (+3.2%), alloc counts 동일
+
+arch_adaptive:
+- ARENA=1: median_wall=0.17s, RSS=40,512 KB, array_new=151277, array_push=505378, array_grow=127293, map_new=2495, map_set=17955
+- ARENA=0: median_wall=0.17s, RSS=42,544 KB (+5.0%), alloc counts 동일
+
+arch_quantum:
+- ARENA=1: median_wall=0.01s, RSS=10,592 KB, array_new=17615, array_push=61050, array_grow=14178, map_new=2151, map_set=16023
+- ARENA=0: median_wall=0.01s, RSS=10,832 KB (+2.3%), alloc counts 동일
+
+### 관찰
+
+1. **ARENA=1 default flip 은 경로 3개 모두 regression-free.** 큰 3종 (selforg/adaptive/quantum) 에서 wall-time 차이가 노이즈 범위 (≤1%), stdout 바이트/exit code 완전 일치. T43 flip 안전.
+2. **ARENA=1 RSS 일관 감소 (2~5%).** `hexa bench` median RSS 기준 arena-on 쪽이 selforg -1792 KB, adaptive -2032 KB, quantum -240 KB. alloc counts (array_new/push/grow, map_new/set) 가 ARENA=0/1 동일하다는 점에서, 이 감소분은 순수 arena 재사용 효과로 해석 가능.
+3. **arch_quantum ARENA=1 쪽 +6.25% 는 표본 분산.** 절대값 4ms 차이 (0.064→0.068) 고 최소 단위가 0.01s 로 quantize 되어 있어 통계적 의미 미만. 다음 wave 에서 runs=20 으로 재측정 권장.
+4. **`hexa bench` JSON 이미 alloc_stats 동봉** — n6 측 growth_bus 기록 시 `array_grow/map_set` 를 ratio 지표로 흘려보내면 cross-project 비교 가능 (rt#36-C Array/Map bridge landed 덕).
+
+### 미실행 항목 (follow-up 후보)
+- arch_unified.hexa: 4-mode dispatch — bytecode regression 조준, bench wave 3 대상.
+- ecosystem_9projects.hexa, ouroboros_5phase.hexa: bridge 계열, 최상단 top-level call 유무 확인 후 합류.
+- rtl_*.hexa 3종: 의존 해석 필요 (외부 DSL 참조 가능성).
+
+— hexa-lang 측 agent bench wave, 2026-04-14 22:08

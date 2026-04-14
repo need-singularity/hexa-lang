@@ -513,6 +513,64 @@ fn bc_mk_index(arr_idx, index_idx) {
     return len(bc_node_pool) - 1
 }
 
+// T45 — Struct literal: `Name { f1: v1, f2: v2, ... }`. Bridge
+// flattens fields into bc_arg_list as alternating
+// name_literal_node_idx, value_node_idx. args_end - args_start
+// must be even; int_val caches field count. `name` holds the
+// source-level struct type (e.g. "Point"); emitter adds it to
+// the const pool so NEW_STRUCT can resolve by index.
+fn bc_mk_struct_init(struct_name, items_start, items_end) {
+    let field_count = (items_end - items_start) / 2
+    let n = BcNode {
+        kind: "StructInit",
+        int_val: field_count,
+        float_val: 0.0, bool_val: false,
+        str_val: "", name: struct_name, op: "",
+        left_idx: -1, right_idx: -1,
+        body_start: -1, body_end: -1, else_start: -1, else_end: -1,
+        args_start: items_start, args_end: items_end,
+        n_params: 0, params_start: -1, params_end: -1
+    }
+    bc_node_pool = bc_node_pool.push(n)
+    return len(bc_node_pool) - 1
+}
+
+// T45 — Field access: `obj.name`. left_idx = obj expr, `name` =
+// source-level field name. Emitter adds the name to the const
+// pool and encodes the index in LOAD_FIELD's Bx operand.
+fn bc_mk_field_access(obj_idx, field_name) {
+    let n = BcNode {
+        kind: "FieldAccess",
+        int_val: 0, float_val: 0.0, bool_val: false,
+        str_val: "", name: field_name, op: "",
+        left_idx: obj_idx, right_idx: -1,
+        body_start: -1, body_end: -1, else_start: -1, else_end: -1,
+        args_start: -1, args_end: -1,
+        n_params: 0, params_start: -1, params_end: -1
+    }
+    bc_node_pool = bc_node_pool.push(n)
+    return len(bc_node_pool) - 1
+}
+
+// T45 — Field assignment stmt: `obj.name = v`. MVP restricts
+// the base to a simple Ident (bridge enforces) so the emitter
+// can round-trip LOAD_LOCAL/GLOBAL → STORE_FIELD → STORE_LOCAL/
+// GLOBAL without re-walking an LHS expression. `name` = base
+// ident, `str_val` = field name, `left_idx` = value expr.
+fn bc_mk_field_assign_stmt(obj_ident, field_name, value_idx) {
+    let n = BcNode {
+        kind: "FieldAssignStmt",
+        int_val: 0, float_val: 0.0, bool_val: false,
+        str_val: field_name, name: obj_ident, op: "",
+        left_idx: value_idx, right_idx: -1,
+        body_start: -1, body_end: -1, else_start: -1, else_end: -1,
+        args_start: -1, args_end: -1,
+        n_params: 0, params_start: -1, params_end: -1
+    }
+    bc_node_pool = bc_node_pool.push(n)
+    return len(bc_node_pool) - 1
+}
+
 // Map literal: #{ k0: v0, k1: v1, ... } — the bridge flattens pairs
 // into bc_arg_list as alternating key,value,key,value. args_end -
 // args_start must therefore be even; int_val stores pair count.
@@ -1116,6 +1174,47 @@ fn bc_compile_expr(idx) {
         return
     }
 
+    // T45 — StructInit: `Name { f1: v1, ... }`. Same flatten-pairs
+    // strategy as MapLit but each pair is (field_name_literal, val).
+    // Bridge pushes StringLit BcNodes for names so compile_expr
+    // naturally lowers them to LOADK; the VM's NEW_STRUCT then pops
+    // 2N values expecting strings-on-odd, vals-on-even slots.
+    if k == "StructInit" {
+        let mut si = node.args_start
+        let mut sfields = 0
+        if si >= 0 {
+            while si < node.args_end {
+                let snk = bc_arg_list[si]
+                bc_compile_expr(snk)   // field name (StringLit → LOADK)
+                si = si + 1
+                if si < node.args_end {
+                    let svk = bc_arg_list[si]
+                    bc_compile_expr(svk)   // field value
+                    si = si + 1
+                } else {
+                    let _rns = bc_emit_raw(bc_enc_abx(BC_OP_LOADNIL, 0))
+                    bc_push1()
+                }
+                sfields = sfields + 1
+            }
+        }
+        let sname_cidx = bc_add_const(node.name)
+        let _r = bc_emit_raw(bc_enc_ab16(BC_OP_NEW_STRUCT, sfields, sname_cidx))
+        bc_pop(sfields * 2)
+        bc_push1()
+        return
+    }
+
+    // T45 — FieldAccess: `obj.field`. Compile obj (push), then
+    // OP_LOAD_FIELD with field name const idx in Bx.
+    if k == "FieldAccess" {
+        bc_compile_expr(node.left_idx)   // obj
+        let facc_cidx = bc_add_const(node.name)
+        let _r = bc_emit_raw(bc_enc_abx(BC_OP_LOAD_FIELD, facc_cidx))
+        // (-1, +1) net 0
+        return
+    }
+
     // Fallback — unknown kind. Emit nil so the stack stays valid.
     let _r = bc_emit_raw(bc_enc_abx(BC_OP_LOADNIL, 0))
     bc_push1()
@@ -1144,6 +1243,44 @@ fn bc_compile_stmt(idx) {
         } else {
             let cidx = bc_add_const(node.name)
             let _r = bc_emit_raw(bc_enc_ab16(BC_OP_STORE_GLOBAL, 0, cidx))
+        }
+        bc_pop(1)
+        return
+    }
+
+    // T45 — FieldAssignStmt: `obj.field = v` with obj a simple Ident.
+    // Sequence: LOAD obj → compile v → STORE_FIELD(field_cidx) → STORE obj.
+    // Bridge guarantees base is an Ident; more complex bases (chained
+    // field assign, index-then-field) fall through to generic ExprStmt.
+    if k == "FieldAssignStmt" {
+        let obj_name = node.name
+        let field_name = node.str_val
+        let val_idx = node.left_idx
+
+        // Load current obj onto stack.
+        let fs_slot = bc_resolve_local(obj_name)
+        if fs_slot >= 0 {
+            let _rl = bc_emit_raw(bc_enc_abx(BC_OP_LOAD_LOCAL, fs_slot))
+        } else {
+            let fs_lcidx = bc_add_const(obj_name)
+            let _rl = bc_emit_raw(bc_enc_ab16(BC_OP_LOAD_GLOBAL, 0, fs_lcidx))
+        }
+        bc_push1()
+
+        // Push new value.
+        bc_compile_expr(val_idx)
+
+        // Patch field (-2, +1).
+        let fs_fcidx = bc_add_const(field_name)
+        let _rs = bc_emit_raw(bc_enc_abx(BC_OP_STORE_FIELD, fs_fcidx))
+        bc_pop(1)
+
+        // Store rebuilt struct back into obj binding.
+        if fs_slot >= 0 {
+            let _rw = bc_emit_raw(bc_enc_abx(BC_OP_STORE_LOCAL, fs_slot))
+        } else {
+            let fs_scidx = bc_add_const(obj_name)
+            let _rw = bc_emit_raw(bc_enc_ab16(BC_OP_STORE_GLOBAL, 0, fs_scidx))
         }
         bc_pop(1)
         return
@@ -1978,6 +2115,49 @@ fn ast_to_bc_expr(node) {
         return bc_mk_map_lit(mstart, mend)
     }
 
+    // T45 — Field access: `obj.field`. Parser produces
+    // {kind: "Field", name: field, left: obj}. Lower obj recursively
+    // and build a FieldAccess BcNode so the compiler emits
+    // OP_LOAD_FIELD with the name const idx.
+    if k == "Field" {
+        let oi = ast_to_bc_expr(node.left)
+        return bc_mk_field_access(oi, node.name)
+    }
+
+    // T45 — Struct literal: `Name { f: v, ... }`. Parser shape
+    // (hexa_full.hexa L3068): node.name = type_name,
+    // node.fields = [{kind: "FieldInit", name: fname, left: val}, ...].
+    // Flatten into bc_arg_list as alternating (StringLit(fname),
+    // val_bcnode_idx) pairs so bc_compile_expr's StructInit branch
+    // reads the same layout.
+    if k == "StructInit" {
+        let raw_fields = node.fields
+        let mut flat_idxs = []
+        if type_of(raw_fields) == "array" {
+            let mut i = 0
+            while i < len(raw_fields) {
+                let f = raw_fields[i]
+                if type_of(f) == "struct" || type_of(f) == "map" {
+                    // Name → literal StringLit BcNode (so compile_expr
+                    // emits LOADK on the field name at runtime).
+                    let kidx = bc_mk_string_lit(f.name)
+                    let vidx = ast_to_bc_expr(f.left)
+                    flat_idxs = flat_idxs.push(kidx)
+                    flat_idxs = flat_idxs.push(vidx)
+                }
+                i = i + 1
+            }
+        }
+        let sstart = len(bc_arg_list)
+        let mut j = 0
+        while j < len(flat_idxs) {
+            bc_arg_list = bc_arg_list.push(flat_idxs[j])
+            j = j + 1
+        }
+        let send = len(bc_arg_list)
+        return bc_mk_struct_init(node.name, sstart, send)
+    }
+
     // Unsupported expr — return a harmless IntLit 0 placeholder.
     return bc_mk_int_lit(0)
 }
@@ -2024,8 +2204,27 @@ fn ast_to_bc_stmt(node) {
         // Parser shape (hexa_full.hexa:1376): name="", left=LHS Ident,
         // right=RHS expr. Lower RHS, then resolve the binding name from
         // the LHS Ident node's `name` field.
-        let vi = ast_to_bc_expr(node.right)
+        //
+        // T45 extension: if LHS is a `Field` node with a simple Ident
+        // base (e.g. `obj.x = v`), lower to FieldAssignStmt so the
+        // compiler emits STORE_FIELD round-tripped through the base
+        // binding. More complex bases (chained `.`, index+field, etc.)
+        // fall through to the generic ident path and currently produce
+        // a degenerate no-op — rt#36-E extends this when IC shapes land.
         let lhs = node.left
+        if type_of(lhs) == "map" {
+            let lk = lhs.kind
+            if lk == "Field" {
+                let base = lhs.left
+                if type_of(base) == "map" {
+                    if base.kind == "Ident" {
+                        let vi_fs = ast_to_bc_expr(node.right)
+                        return bc_mk_field_assign_stmt(base.name, lhs.name, vi_fs)
+                    }
+                }
+            }
+        }
+        let vi = ast_to_bc_expr(node.right)
         let mut tgt = ""
         if type_of(lhs) == "map" { tgt = lhs.name }
         return bc_mk_assign_stmt(tgt, vi)

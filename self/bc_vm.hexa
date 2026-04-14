@@ -96,6 +96,14 @@ let BC_NIL = "<nil>"
 // appears in user data so false positives are negligible.
 let BC_MAP_TAG = "<bc_map>"
 
+// T45 struct-shape tag. Structs live on the VM stack as a 4-element
+// array ["<bc_struct>", type_name, keys[], vals[]]. Same sentinel
+// strategy as BC_MAP_TAG so LOAD_FIELD / STORE_FIELD can verify
+// shape before indexing. type_name is the source-level struct
+// type (e.g. "Point") and is preserved for debuggability — rt#37's
+// type-specializer will also key shape ICs on it.
+let BC_STRUCT_TAG = "<bc_struct>"
+
 // ── VM init / reset. ────────────────────────────────────────
 
 fn bc_vm_reset() {
@@ -984,6 +992,138 @@ fn bc_vm_run_loop() {
             }
             let m2b = [BC_MAP_TAG, new_keys, new_vals]
             bc_vm_push(m2b)
+        }
+
+        // ──────── STRUCT OPCODES (rt#36-D T45) ────────
+        // Structs mirror the NEW_MAP pair-encoding but carry an
+        // extra type-name slot so LOAD_FIELD / STORE_FIELD can
+        // distinguish structs from maps and so diagnostics show
+        // the source-level type (e.g. "Point" vs "Vec2").
+        //
+        // NEW_STRUCT A=n_fields B16=name_const_idx:
+        //   pop 2n values (field_name, val pairs pushed left-to-right),
+        //   resolve type name from current proto's const pool,
+        //   build [BC_STRUCT_TAG, name, keys, vals], push.
+        else if op == BC_OP_NEW_STRUCT {
+            let n_fields = bc_a_of(raw)
+            let name_cidx = bc_b16_of(raw)
+            let consts_ns = bc_proto_consts[proto_idx]
+            let mut sname = ""
+            if name_cidx < len(consts_ns) {
+                sname = consts_ns[name_cidx]
+            }
+            let mut sval_buf = []
+            let mut skey_buf = []
+            let mut sk = 0
+            while sk < n_fields {
+                sval_buf = sval_buf.push(bc_vm_pop())
+                if vm_trap { return last_return }
+                skey_buf = skey_buf.push(bc_vm_pop())
+                if vm_trap { return last_return }
+                sk = sk + 1
+            }
+            // Reverse into source order.
+            let mut skeys = []
+            let mut svals = []
+            let mut sj = n_fields - 1
+            while sj >= 0 {
+                skeys = skeys.push(skey_buf[sj])
+                svals = svals.push(sval_buf[sj])
+                sj = sj - 1
+            }
+            let sobj = [BC_STRUCT_TAG, sname, skeys, svals]
+            bc_vm_push(sobj)
+        }
+        // LOAD_FIELD Bx=field_name_const_idx:
+        //   pop struct, linear-scan keys, push matching val (BC_NIL on miss).
+        //   Miss returning BC_NIL matches hexa's "void on missing field"
+        //   semantics — downstream code tolerates it without crashing.
+        else if op == BC_OP_LOAD_FIELD {
+            let fcidx = bc_bx_of(raw)
+            let consts_lf = bc_proto_consts[proto_idx]
+            let mut fname = ""
+            if fcidx < len(consts_lf) {
+                fname = consts_lf[fcidx]
+            }
+            let sobj_lf = bc_vm_pop()
+            if vm_trap { return last_return }
+            let mut lf_hit = BC_NIL
+            if type_of(sobj_lf) == "array" {
+                if len(sobj_lf) == 4 {
+                    if sobj_lf[0] == BC_STRUCT_TAG {
+                        let lf_keys = sobj_lf[2]
+                        let lf_vals = sobj_lf[3]
+                        let lf_n = len(lf_keys)
+                        let mut lf_i = 0
+                        while lf_i < lf_n {
+                            if lf_keys[lf_i] == fname {
+                                lf_hit = lf_vals[lf_i]
+                                lf_i = lf_n
+                            } else {
+                                lf_i = lf_i + 1
+                            }
+                        }
+                    }
+                }
+            }
+            bc_vm_push(lf_hit)
+        }
+        // STORE_FIELD Bx=field_name_const_idx:
+        //   pop val, pop struct; rebuild with field patched (or
+        //   appended if absent, matching struct-init-extend semantics);
+        //   push updated struct. Caller's emitter typically follows
+        //   with STORE_LOCAL / STORE_GLOBAL to rebind the base ident.
+        else if op == BC_OP_STORE_FIELD {
+            let sfcidx = bc_bx_of(raw)
+            let consts_sf = bc_proto_consts[proto_idx]
+            let mut sfname = ""
+            if sfcidx < len(consts_sf) {
+                sfname = consts_sf[sfcidx]
+            }
+            let sf_val = bc_vm_pop()
+            let sf_obj = bc_vm_pop()
+            if vm_trap { return last_return }
+            let mut sf_tag = ""
+            let mut sf_type = ""
+            let mut sf_keys = []
+            let mut sf_vals = []
+            if type_of(sf_obj) == "array" {
+                if len(sf_obj) == 4 {
+                    if sf_obj[0] == BC_STRUCT_TAG {
+                        sf_tag = sf_obj[0]
+                        sf_type = sf_obj[1]
+                        sf_keys = sf_obj[2]
+                        sf_vals = sf_obj[3]
+                    }
+                }
+            }
+            if sf_tag == "" {
+                // Not a struct — trap, preserve MVP invariants.
+                vm_trap = true
+                vm_trap_msg = "STORE_FIELD: not a struct value"
+                return last_return
+            }
+            let sf_nk = len(sf_keys)
+            let mut sf_hitidx = -1
+            let mut sf_i = 0
+            while sf_i < sf_nk {
+                if sf_keys[sf_i] == sfname {
+                    sf_hitidx = sf_i
+                    sf_i = sf_nk
+                } else {
+                    sf_i = sf_i + 1
+                }
+            }
+            let mut sf_new_keys = sf_keys
+            let mut sf_new_vals = sf_vals
+            if sf_hitidx >= 0 {
+                sf_new_vals = bc_vm_setat(sf_vals, sf_hitidx, sf_val)
+            } else {
+                sf_new_keys = sf_keys.push(sfname)
+                sf_new_vals = sf_vals.push(sf_val)
+            }
+            let sf_out = [BC_STRUCT_TAG, sf_type, sf_new_keys, sf_new_vals]
+            bc_vm_push(sf_out)
         }
 
         // ──────── UNIMPLEMENTED OPCODES ────────
