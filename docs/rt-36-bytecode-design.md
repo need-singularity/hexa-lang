@@ -662,3 +662,36 @@ overhead 가 tree-walker 의 `env_get` 비용을 역전.
 
 bt#85 는 T52 (프레임 풀 리팩토링) 완료 후 재측정.
 
+### §18.2 bt#85 ship (T53, 2026-04-15) — **양 게이트 통과**
+
+T52 가 지목한 rebuild-loop 병목을 hexa 런타임의 in-place 경로로 치환:
+
+- `hexa_array_truncate(arr, new_len)` — `.len` 만 축소, realloc 없음,
+  capacity 유지. `bc_vm_pop`, `bc_vm_truncate`, `bc_vm_arr_*` 이 사용.
+- `hexa_array_set(arr, i, v)` — `.items[i] = v` 직접. `bc_vm_setat` 가
+  사용 (`arr[i] = v` → codegen_c2 → `hexa_index_set`).
+
+**결과** (3-run median, wall):
+
+| bench | interp | VM | speedup | 게이트 | 판정 |
+|-------|--------|-----|---------|-------|------|
+| fib(K=30) | 3.41 s | 0.56 s | **6.09×** | ≥2× | ✅ |
+| call_heavy | 2.65 s | 0.34 s | **7.79×** | ≥3× | ✅ |
+
+**메모리** (VM):
+
+| | T52 (before) | T53 (after) | 비율 |
+|--|--|--|--|
+| fib RSS | 7.7 GB | 2.4 MB | ~3000× |
+| fib `array_new` | 16,090,862 | 394 | ~40,841× |
+| call_heavy RSS | 2.6 GB | 2.5 MB | ~1000× |
+
+**회귀**: closure_mvp 5/5 + verify_{attr13 13≥13, tests146 453≥146,
+ir_phase1 23/23, g12_g13} 전부 PASS. regression_harness 171/236 PASS,
+0 regressions.
+
+**커밋**: `54ba510` on feat/dict-likely-codegen (pushed to origin).
+
+rt#36 Phase D 종료 — bt#85 ship. 이후 작업은 별도 트랙 (T52 #2
+STORE_UPVAL / block-body lambda / nested closure, rt#37 IC, rt#38 NaN-box).
+
