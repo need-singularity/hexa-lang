@@ -610,6 +610,430 @@ fn check_invariant_forbid_field(src, target, exempt) {
     return viols
 }
 
+// ── 공통 헬퍼: 문자열 리터럴 마스킹 ──────────────────────────
+// 한 줄 내부의 `"..."`, `'...'` 안쪽을 공백으로 치환하여 false-positive
+// 를 줄인다. 이스케이프(`\"`) 는 무시 — stage0 문법이 escape 미지원이라
+// 단순 토글로 충분. 주석 (`//...`) 제거는 호출자에서 처리.
+fn ic_mask_strings(line) {
+    let cs = line.chars()
+    let total = len(cs)
+    let mut buf = []
+    let mut i = 0
+    let mut in_str = false
+    let mut quote = ' '
+    while i < total {
+        let c = cs[i]
+        if !in_str {
+            if c == '"' || c == '\'' {
+                in_str = true
+                quote = c
+                buf = buf.push(to_string(c))
+            } else {
+                buf = buf.push(to_string(c))
+            }
+        } else {
+            if c == quote {
+                in_str = false
+                buf = buf.push(to_string(c))
+            } else {
+                // mask inside-string content with space to preserve column
+                buf = buf.push(" ")
+            }
+        }
+        i = i + 1
+    }
+    return buf.join("")
+}
+
+// 한 줄에서 `//` 이후를 잘라낸다 (단, 문자열 리터럴 안의 // 는 보존).
+// 단순화를 위해 ic_mask_strings 이후의 결과에 대해 // 를 검색한다.
+fn ic_strip_line_comment(line) {
+    let masked = ic_mask_strings(line)
+    let ms = masked.chars()
+    let total = len(ms)
+    let mut i = 0
+    while i + 1 < total {
+        if ms[i] == '/' {
+            if ms[i + 1] == '/' { return line.substring(0, i) }
+        }
+        i = i + 1
+    }
+    return line
+}
+
+// ── ensure_type checker — symbol 선언·파라미터·반환 타입 일관성 ──
+// 입력: src 전체, target symbol 이름, expected type, exempt fn 리스트
+// 반환: violations 배열
+//
+// 알고리즘 (라인 스캔):
+//   1) 문자열 리터럴 마스킹 + 주석 제거된 라인에서
+//        · `let [mut] <symbol>: <type>`           — 변수 선언
+//        · `<symbol>: <type>` — 파라미터 (fn 시그니처 또는 struct field)
+//        · `fn <symbol>(...) -> <type>`           — 반환 타입
+//      중 어떤 occurrence 의 타입이 expected 와 다르면 위반.
+//   2) 한 줄에 여러 `name: type` 이 있어도 첫 번째 `<symbol>:` 만 검사.
+//   3) expected 비교는 prefix 토큰 기준 (`Int` vs `IntList` 구별 위해
+//      다음 char 가 ident-char 가 아닌 경우만 통과).
+//
+// 한계 (AST 부재로 인한 보수적 선택):
+//   - same-name shadowing 무시 (모든 occurrence 동일 심볼로 취급).
+//   - 복합 타입 (`Vec<Int>` 등 generic) 은 `<` 이전까지만 비교.
+fn check_invariant_ensure_type(src, symbol, expected_type, exempt) {
+    let mut viols = []
+    let lines = src.split("\n")
+    let n = len(lines)
+    let mut cur_fn = ""
+    let mut i = 0
+    while i < n {
+        let raw_line = lines[i]
+        let trimmed = ic_lstrip(raw_line)
+        // Track fn scope
+        if trimmed.starts_with("fn ") {
+            let after_fn = trimmed.substring(3, len(trimmed))
+            let csn = after_fn.chars()
+            let totaln = len(csn)
+            let mut nm_end = 0
+            let mut q = 0
+            while q < totaln {
+                let ch = csn[q]
+                if ch == '(' || ch == ' ' || ch == '\t' || ch == '<' { nm_end = q; q = totaln + 1 }
+                else { q = q + 1 }
+            }
+            if nm_end > 0 { cur_fn = after_fn.substring(0, nm_end) }
+        }
+        // Skip pure-comment lines
+        if trimmed.starts_with("//") {
+            i = i + 1
+        } else {
+            // Work on a string-masked, comment-stripped variant
+            let scan_line = ic_strip_line_comment(ic_mask_strings(raw_line))
+            let ms = scan_line.chars()
+            let total = len(ms)
+            // Build the needle `<symbol>:` and scan for it.
+            // Also consider `-> <type>` for fn-return.
+            let sym_needle = symbol + ":"
+            let sn_chars = sym_needle.chars()
+            let snlen = len(sn_chars)
+            let mut found_pos = -1
+            let mut j = 0
+            let last = total - snlen + 1
+            while j < last {
+                // Match sym_needle at j
+                let mut ok = true
+                let mut k = 0
+                while k < snlen {
+                    if ms[j + k] != sn_chars[k] { ok = false; k = snlen }
+                    else { k = k + 1 }
+                }
+                if ok {
+                    // Guard: char before must not be ident-char (word boundary)
+                    let mut boundary_ok = true
+                    if j > 0 {
+                        let prev = ms[j - 1]
+                        if ic_is_ident_char(prev) { boundary_ok = false }
+                    }
+                    if boundary_ok { found_pos = j; j = last }
+                    else { j = j + 1 }
+                } else {
+                    j = j + 1
+                }
+            }
+            if found_pos >= 0 {
+                // Parse type after `<symbol>:`
+                let mut tp = found_pos + snlen
+                // skip whitespace
+                while tp < total {
+                    let wc = ms[tp]
+                    if wc == ' ' || wc == '\t' { tp = tp + 1 }
+                    else { tp = total + 1 }
+                }
+                // tp currently past end if exit via + 1, need actual position
+                let mut tp_real = found_pos + snlen
+                while tp_real < total {
+                    let wc2 = ms[tp_real]
+                    if wc2 == ' ' || wc2 == '\t' { tp_real = tp_real + 1 }
+                    else { tp = tp_real; tp_real = total + 1 }
+                }
+                // consume type token (ident + optional generic `<...>`)
+                let mut te = tp
+                while te < total {
+                    let tc = ms[te]
+                    let is_id = ic_is_ident_char(tc)
+                    if is_id { te = te + 1 }
+                    else { te = total + 1 }
+                }
+                // restore actual end
+                let mut te_real = tp
+                while te_real < total {
+                    let tc2 = ms[te_real]
+                    let is_id2 = ic_is_ident_char(tc2)
+                    if is_id2 { te_real = te_real + 1 }
+                    else { te = te_real; te_real = total + 1 }
+                }
+                if te == tp && tp < total {
+                    // No type token present (e.g. `symbol: ,` — bad syntax, skip)
+                    i = i + 1
+                } else {
+                    let actual_type = scan_line.substring(tp, te)
+                    if actual_type != expected_type && len(actual_type) > 0 {
+                        let is_exempt = ic_list_contains(exempt, cur_fn)
+                        if !is_exempt {
+                            let leading = len(raw_line) - len(trimmed)
+                            viols = viols.push(#{
+                                "invariant_id": "ensure_type",
+                                "line": i + 1,
+                                "col": found_pos + 1,
+                                "snippet": trimmed,
+                                "fn_name": cur_fn
+                            })
+                        }
+                    }
+                    i = i + 1
+                }
+            } else {
+                i = i + 1
+            }
+        }
+    }
+    return viols
+}
+
+// ── require checker — target pattern 이 반드시 등장해야 함 ──
+// 입력: src 전체, target substring
+// 반환: violations 배열 — 0건이면 만족, 1건이면 "zero matches" 리포트.
+//
+// 알고리즘:
+//   1) 전체 라인 순회, 문자열/주석 마스킹 후 target substring 이 등장하는
+//      라인이 하나라도 있는지 확인.
+//   2) 매칭 0 이면 src 에 `"file:1 — require 'target' not found"` 1건 보고.
+//   3) pattern 이 정규식이 아니라 literal substring (stage0 에서 regex 엔진
+//      부재 — 이는 한계로 주석 기재).
+fn check_invariant_require(src, target) {
+    let mut viols = []
+    if len(target) == 0 { return viols }
+    let lines = src.split("\n")
+    let n = len(lines)
+    let mut i = 0
+    let mut found = false
+    while i < n {
+        let raw_line = lines[i]
+        let trimmed = ic_lstrip(raw_line)
+        if !trimmed.starts_with("//") {
+            let scan_line = ic_strip_line_comment(ic_mask_strings(raw_line))
+            let idx = ic_find_substr(scan_line, target)
+            if idx >= 0 { found = true; i = n }
+            else { i = i + 1 }
+        } else {
+            i = i + 1
+        }
+    }
+    if !found {
+        viols = viols.push(#{
+            "invariant_id": "require",
+            "line": 1,
+            "col": 1,
+            "snippet": "(missing) require: '" + target + "'",
+            "fn_name": ""
+        })
+    }
+    return viols
+}
+
+// ── audit_type checker — 정보성 리포트 (비차단) ──
+// 입력: src 전체, target type 이름
+// 반환: 빈 배열 — 위반 0, 대신 stdout 에 audit 로그를 출력.
+//
+// 알고리즘:
+//   1) 전체 라인 순회, 문자열/주석 마스킹 후 `<target>` 을 단어 경계로 검색.
+//   2) 매칭 count + 첫 3건 location 을 출력.
+//   3) 항상 0 violations 리턴 (count_violations 예약어는 별도 predicate
+//      에서 처리 — 본 함수는 audit 전용).
+//
+// 한계: partial match 방지 위해 단어 경계 체크 — 앞뒤 char 가 ident-char
+//       면 skip.
+fn check_invariant_audit_type(src, type_name) {
+    let lines = src.split("\n")
+    let n = len(lines)
+    let mut count = 0
+    let mut samples = []
+    let mut i = 0
+    let tn_chars = type_name.chars()
+    let tnlen = len(tn_chars)
+    while i < n {
+        let raw_line = lines[i]
+        let trimmed = ic_lstrip(raw_line)
+        if !trimmed.starts_with("//") && tnlen > 0 {
+            let scan_line = ic_strip_line_comment(ic_mask_strings(raw_line))
+            let ms = scan_line.chars()
+            let total = len(ms)
+            let mut j = 0
+            let last = total - tnlen + 1
+            let mut line_has_match = false
+            while j < last {
+                let mut ok = true
+                let mut k = 0
+                while k < tnlen {
+                    if ms[j + k] != tn_chars[k] { ok = false; k = tnlen }
+                    else { k = k + 1 }
+                }
+                if ok {
+                    // word boundary before + after
+                    let mut bound_ok = true
+                    if j > 0 {
+                        let prev = ms[j - 1]
+                        if ic_is_ident_char(prev) { bound_ok = false }
+                    }
+                    if bound_ok {
+                        let after_pos = j + tnlen
+                        if after_pos < total {
+                            let nxt = ms[after_pos]
+                            if ic_is_ident_char(nxt) { bound_ok = false }
+                        }
+                    }
+                    if bound_ok {
+                        count = count + 1
+                        if !line_has_match && len(samples) < 3 {
+                            samples = samples.push(to_string(i + 1) + ": " + trimmed)
+                            line_has_match = true
+                        }
+                        j = j + tnlen
+                    } else {
+                        j = j + 1
+                    }
+                } else {
+                    j = j + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    println("  [audit_type] '" + type_name + "' found " + to_string(count) + " reference(s)")
+    let sn = len(samples)
+    let mut si = 0
+    while si < sn {
+        println("    " + samples[si])
+        si = si + 1
+    }
+    return []
+}
+
+// ── I3 checker — deny_call on global function <target> ─────
+// 입력: src 전체, target 전역 함수 이름, exempt 함수 이름 리스트
+// 반환: violations 배열 — 각 원소 #{invariant_id, line, col, snippet, fn_name}
+//
+// 알고리즘 (라인 기반 스캔, context="global_call"):
+//   I1(deny_method) 가 `<ident>.<target>(` 를 감지하는 반면, I3(deny_call) 은
+//   메서드가 아닌 **전역 함수 호출** `<target>(` 를 감지한다. 주로
+//   `exit(...)`, `panic(...)`, `unwrap(...)` 같은 라이브러리-수준 anti-pattern
+//   방지용.
+//
+//   1) 라인 단위 순회. `fn name(` 로 현재 함수 스코프 추적.
+//   2) 주석 라인 (// ...) skip.
+//   3) 라인 내부에서 identifier 경계가 정확히 `<target>(` 에 일치하는
+//      위치를 스캔. 앞 문자는 식별자 글자가 아니어야 함 (예: `my_exit(` 은
+//      매치하지 않음, `exit(` 만 매치).
+//   4) 메서드 호출 (앞에 `.` 가 오는 경우) 은 제외 — 그건 I1 의 영역.
+//   5) fn 선언 자체의 이름 (`fn exit(...)`) 은 제외 — 호출이 아니라 정의.
+//   6) col = 매치 시작 컬럼 (1-indexed).
+//
+// 한계:
+//   - 문자열 리터럴 안의 `exit(` 는 false positive 가능.
+//   - 여러 호출이 한 줄에 있으면 첫 매치만 보고.
+fn check_invariant_deny_call(src, target, exempt) {
+    let mut viols = []
+    let lines = src.split("\n")
+    let n = len(lines)
+    let mut cur_fn = ""
+    let mut i = 0
+    let needle = target + "("
+    let nlen = len(needle.chars())
+    let tlen = len(target.chars())
+    while i < n {
+        let line = lines[i]
+        let trimmed = ic_lstrip(line)
+        // Detect `fn name(` declarations to track current scope
+        if trimmed.starts_with("fn ") {
+            let after_fn = trimmed.substring(3, len(trimmed))
+            let csn = after_fn.chars()
+            let totaln = len(csn)
+            let mut nm_end = 0
+            let mut k = 0
+            while k < totaln {
+                let ch = csn[k]
+                if ch == '(' || ch == ' ' || ch == '\t' || ch == '<' { nm_end = k; k = totaln + 1 }
+                else { k = k + 1 }
+            }
+            if nm_end > 0 {
+                cur_fn = after_fn.substring(0, nm_end)
+            }
+        }
+        // Skip pure-comment lines
+        if trimmed.starts_with("//") {
+            i = i + 1
+        } else {
+            // Skip `fn <target>(` declaration itself — we want CALLS only.
+            let mut is_decl_line = false
+            if trimmed.starts_with("fn ") {
+                let after2 = trimmed.substring(3, len(trimmed))
+                if after2.starts_with(needle) { is_decl_line = true }
+            }
+            if is_decl_line {
+                i = i + 1
+            } else {
+                // Scan line for `<target>(` at an identifier boundary,
+                // not preceded by `.` (that would be a method, I1 territory).
+                let cs = line.chars()
+                let total = len(cs)
+                let mut matched_col = -1
+                let mut p = 0
+                let last = total - nlen + 1
+                while p < last {
+                    // Check substring match
+                    let mut ok = true
+                    let mut kk = 0
+                    let nc = needle.chars()
+                    while kk < nlen {
+                        if cs[p + kk] != nc[kk] { ok = false; kk = nlen }
+                        else { kk = kk + 1 }
+                    }
+                    if ok {
+                        // Boundary check: char before must not be ident char or `.`
+                        let mut prev_ok = true
+                        if p > 0 {
+                            let pc = cs[p - 1]
+                            if ic_is_ident_char(pc) { prev_ok = false }
+                            if pc == '.' { prev_ok = false }
+                        }
+                        if prev_ok {
+                            matched_col = p
+                            p = last + 1
+                        } else {
+                            p = p + 1
+                        }
+                    } else {
+                        p = p + 1
+                    }
+                }
+                if matched_col >= 0 {
+                    let is_exempt = ic_list_contains(exempt, cur_fn)
+                    if !is_exempt {
+                        let col = matched_col + 1
+                        viols = viols.push(#{
+                            "invariant_id": "I3",
+                            "line": i + 1,
+                            "col": col,
+                            "snippet": trimmed,
+                            "fn_name": cur_fn
+                        })
+                    }
+                }
+                i = i + 1
+            }
+        }
+    }
+    return viols
+}
+
 // ── 모든 invariant 순회 ───────────────────────────────────
 // 입력: src, invs (ic_extract_invariants 결과)
 // 반환: violations 배열
@@ -657,8 +1081,71 @@ fn verify_all_invariants(src, invs) {
                 all_viols = all_viols.push(v_ff2)
                 vi_ff = vi_ff + 1
             }
+        } else if pred == "ensure_type" {
+            // target = symbol name, context = expected type
+            let tgt_et = inv["target"]
+            let ctx_et = inv["context"]
+            let exempt_et = inv["exempt"]
+            if len(tgt_et) > 0 && len(ctx_et) > 0 {
+                let viols_et = check_invariant_ensure_type(src, tgt_et, ctx_et, exempt_et)
+                let nv_et = len(viols_et)
+                let mut vi_et = 0
+                while vi_et < nv_et {
+                    let v_et = viols_et[vi_et]
+                    let v_et2 = #{
+                        "invariant_id": inv["id"],
+                        "line": v_et["line"],
+                        "col": v_et["col"],
+                        "snippet": v_et["snippet"],
+                        "fn_name": v_et["fn_name"]
+                    }
+                    all_viols = all_viols.push(v_et2)
+                    vi_et = vi_et + 1
+                }
+            } else {
+                println("  [WARN] " + inv["id"] + " ensure_type needs target + context")
+            }
+        } else if pred == "require" {
+            let tgt_rq = inv["target"]
+            let viols_rq = check_invariant_require(src, tgt_rq)
+            let nv_rq = len(viols_rq)
+            let mut vi_rq = 0
+            while vi_rq < nv_rq {
+                let v_rq = viols_rq[vi_rq]
+                let v_rq2 = #{
+                    "invariant_id": inv["id"],
+                    "line": v_rq["line"],
+                    "col": v_rq["col"],
+                    "snippet": v_rq["snippet"],
+                    "fn_name": v_rq["fn_name"]
+                }
+                all_viols = all_viols.push(v_rq2)
+                vi_rq = vi_rq + 1
+            }
+        } else if pred == "audit_type" {
+            // informational only — never contributes to violation count
+            let tgt_at = inv["target"]
+            let _ = check_invariant_audit_type(src, tgt_at)
+        } else if pred == "deny_call" {
+            let tgt_dc = inv["target"]
+            let exempt_dc = inv["exempt"]
+            let viols_dc = check_invariant_deny_call(src, tgt_dc, exempt_dc)
+            let nv_dc = len(viols_dc)
+            let mut vi_dc = 0
+            while vi_dc < nv_dc {
+                let v_dc = viols_dc[vi_dc]
+                let v_dc2 = #{
+                    "invariant_id": inv["id"],
+                    "line": v_dc["line"],
+                    "col": v_dc["col"],
+                    "snippet": v_dc["snippet"],
+                    "fn_name": v_dc["fn_name"]
+                }
+                all_viols = all_viols.push(v_dc2)
+                vi_dc = vi_dc + 1
+            }
         } else if pred == "ident_name" || pred == "host_args_offset" || pred == "binary_gitignored" {
-            // I2~I4 stubs — TODO checker not implemented yet
+            // I4 legacy stubs — TODO checker not implemented yet
             println("  [TODO] " + inv["id"] + " predicate=" + pred + " not yet implemented")
         } else {
             println("  [WARN] " + inv["id"] + " unknown predicate=" + pred)
