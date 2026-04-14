@@ -323,6 +323,16 @@ let mut bc_save_depth = []
 let mut bc_save_cursp = []
 let mut bc_save_maxsp = []
 
+// ── Loop context stacks (Phase 1: BreakStmt / ContinueStmt). ───
+// One entry per active enclosing loop. WhileStmt pushes on entry
+// and pops + backpatches on exit. BreakStmt appends its own
+// JMP-pc to the topmost bc_break_pcs[]; ContinueStmt reads the
+// topmost loop_start_pc and emits a backward JMP directly.
+//   bc_loop_start_stack : int[]      — pc to jump to on `continue`
+//   bc_break_pcs        : Array<int[]> — pending break JMP pcs per loop
+let mut bc_loop_start_stack = []
+let mut bc_break_pcs = []
+
 // ── Pool accessors (AST input). ─────────────────────────
 // The caller populates `bc_node_pool` and optional index lists
 // `bc_stmt_list` / `bc_arg_list` / `bc_param_list`, then calls
@@ -358,6 +368,8 @@ fn bc_reset() {
     bc_save_depth = []
     bc_save_cursp = []
     bc_save_maxsp = []
+    bc_loop_start_stack = []
+    bc_break_pcs = []
 }
 
 // Hard-reset pools only (caller rebuilds AST each compile).
@@ -1020,6 +1032,14 @@ fn bc_compile_stmt(idx) {
         //   JMP ->loop_start
         // loop_end:
         let loop_start_pc = len(bc_code)
+
+        // Phase 1: push loop context so nested BreakStmt /
+        // ContinueStmt know which loop they target. Per-loop
+        // break-pc list starts empty; entries are appended by
+        // BreakStmt and backpatched after loop_end_pc is known.
+        bc_loop_start_stack = bc_loop_start_stack.push(loop_start_pc)
+        bc_break_pcs        = bc_break_pcs.push([])
+
         bc_compile_expr(node.left_idx)    // cond
 
         let jmpf_pc = len(bc_code)
@@ -1037,6 +1057,103 @@ fn bc_compile_stmt(idx) {
         let loop_end_pc = len(bc_code)
         let fwd_delta = loop_end_pc - (jmpf_pc + 1)
         bc_patch_code(jmpf_pc, bc_enc_sbx(BC_OP_JMPF, fwd_delta))
+
+        // Phase 1: backpatch every BreakStmt's JMP placeholder
+        // to point at loop_end_pc, then pop loop context.
+        let _btop = len(bc_break_pcs) - 1
+        let _bpcs = bc_break_pcs[_btop]
+        let mut _bi = 0
+        while _bi < len(_bpcs) {
+            let _bpc = _bpcs[_bi]
+            let _bdelta = loop_end_pc - (_bpc + 1)
+            bc_patch_code(_bpc, bc_enc_sbx(BC_OP_JMP, _bdelta))
+            _bi = _bi + 1
+        }
+        bc_break_pcs        = bc_shrink(bc_break_pcs, _btop)
+        bc_loop_start_stack = bc_shrink_int(bc_loop_start_stack, len(bc_loop_start_stack) - 1)
+        return
+    }
+
+    if k == "BreakStmt" {
+        // Emit a JMP placeholder; the enclosing WhileStmt
+        // backpatches the delta when loop_end_pc is known.
+        // Outside any loop: NOP (defensive — parser should reject).
+        if len(bc_break_pcs) == 0 {
+            let _r = bc_emit_raw(bc_enc_abx(BC_OP_NOP, 0))
+            return
+        }
+        let _bpc = len(bc_code)
+        let _r = bc_emit_raw(bc_enc_sbx(BC_OP_JMP, 0))
+        let _btop = len(bc_break_pcs) - 1
+        let _list = bc_break_pcs[_btop].push(_bpc)
+        bc_break_pcs = bc_vm_setat(bc_break_pcs, _btop, _list)
+        return
+    }
+
+    if k == "ContinueStmt" {
+        // Jump back to the topmost loop_start_pc. Delta is
+        // computed immediately; no patching needed.
+        if len(bc_loop_start_stack) == 0 {
+            let _r = bc_emit_raw(bc_enc_abx(BC_OP_NOP, 0))
+            return
+        }
+        let _ltop = len(bc_loop_start_stack) - 1
+        let _lstart = bc_loop_start_stack[_ltop]
+        let _here = len(bc_code)
+        let _delta = _lstart - (_here + 1)
+        let _r = bc_emit_raw(bc_enc_sbx(BC_OP_JMP, _delta))
+        return
+    }
+
+    if k == "CompoundAssign" {
+        // `lhs op= rhs` desugars to `lhs = lhs op rhs`.
+        // bridge wraps node.left = LHS Ident (resolved by name) and
+        // node.right_idx = RHS expr. We lower as:
+        //   load lhs ; eval rhs ; binop ; store lhs
+        let _lhs_idx = node.left_idx
+        let _rhs_idx = node.right_idx
+        let _name = node.name
+        if _lhs_idx < 0 {
+            return
+        }
+        // Load LHS (the bridge stores an Ident node at left_idx).
+        bc_compile_expr(_lhs_idx)
+        // Eval RHS.
+        bc_compile_expr(_rhs_idx)
+        // Binop matching node.op (subset: +, -, *, /, %).
+        let _op = node.op
+        let mut _opc = -1
+        let _is_float = bc_is_float_expr(_lhs_idx) || bc_is_float_expr(_rhs_idx)
+        if _op == "+" {
+            if _is_float { _opc = BC_OP_ADDF } else { _opc = BC_OP_ADD }
+        }
+        if _op == "-" {
+            if _is_float { _opc = BC_OP_SUBF } else { _opc = BC_OP_SUB }
+        }
+        if _op == "*" {
+            if _is_float { _opc = BC_OP_MULF } else { _opc = BC_OP_MUL }
+        }
+        if _op == "/" {
+            if _is_float { _opc = BC_OP_DIVF } else { _opc = BC_OP_DIV }
+        }
+        if _op == "%" { _opc = BC_OP_MOD }
+        if _opc < 0 {
+            // Unknown compound op — pop and bail.
+            let _rn = bc_emit_raw(bc_enc_abx(BC_OP_NOP, 0))
+            bc_pop(2)
+            return
+        }
+        let _rb = bc_emit_raw(bc_enc_abx(_opc, 0))
+        bc_pop(1)
+        // Store back into the LHS binding by name.
+        let _slot = bc_resolve_local(_name)
+        if _slot >= 0 {
+            let _rs = bc_emit_raw(bc_enc_abx(BC_OP_STORE_LOCAL, _slot))
+        } else {
+            let _cidx = bc_add_const(_name)
+            let _rs = bc_emit_raw(bc_enc_ab16(BC_OP_STORE_GLOBAL, 0, _cidx))
+        }
+        bc_pop(1)
         return
     }
 
@@ -1714,6 +1831,63 @@ fn ast_to_bc_stmt(node) {
         let body = node.body
         let bb = ast_to_bc_walk_body(body)
         return bc_mk_while_stmt(ci, bb[0], bb[1])
+    }
+
+    // Phase 1 additions ─────────────────────────────────────────
+    // BreakStmt / ContinueStmt — the parser puts the optional label
+    // in `node.name`; we ignore it (Phase 1 supports only innermost
+    // loop targeting). bc_compile_stmt's branches above emit the
+    // JMP placeholder + backpatch / direct backward JMP.
+    if k == "BreakStmt" {
+        let _bn = BcNode {
+            kind: "BreakStmt", int_val: 0, float_val: 0.0, bool_val: false,
+            str_val: "", name: node.name, op: "",
+            left_idx: -1, right_idx: -1,
+            body_start: -1, body_end: -1,
+            else_start: -1, else_end: -1,
+            args_start: -1, args_end: -1,
+            n_params: 0, params_start: -1, params_end: -1
+        }
+        bc_node_pool = bc_node_pool.push(_bn)
+        return len(bc_node_pool) - 1
+    }
+    if k == "ContinueStmt" {
+        let _cn = BcNode {
+            kind: "ContinueStmt", int_val: 0, float_val: 0.0, bool_val: false,
+            str_val: "", name: node.name, op: "",
+            left_idx: -1, right_idx: -1,
+            body_start: -1, body_end: -1,
+            else_start: -1, else_end: -1,
+            args_start: -1, args_end: -1,
+            n_params: 0, params_start: -1, params_end: -1
+        }
+        bc_node_pool = bc_node_pool.push(_cn)
+        return len(bc_node_pool) - 1
+    }
+    // CompoundAssign — parser shape: left=LHS expr (Ident),
+    // right=RHS expr, op="+/-/*/// %". Lower LHS + RHS into the
+    // pool and stash the binding name on the BcNode so
+    // bc_compile_stmt's CompoundAssign branch can do
+    //   load lhs ; eval rhs ; binop ; store name.
+    if k == "CompoundAssign" {
+        let _lhs = node.left
+        let _li = ast_to_bc_expr(_lhs)
+        let _ri = ast_to_bc_expr(node.right)
+        let mut _tgt = ""
+        if type_of(_lhs) == "map" || type_of(_lhs) == "struct" {
+            if _lhs.kind == "Ident" { _tgt = _lhs.name }
+        }
+        let _ca = BcNode {
+            kind: "CompoundAssign", int_val: 0, float_val: 0.0, bool_val: false,
+            str_val: "", name: _tgt, op: node.op,
+            left_idx: _li, right_idx: _ri,
+            body_start: -1, body_end: -1,
+            else_start: -1, else_end: -1,
+            args_start: -1, args_end: -1,
+            n_params: 0, params_start: -1, params_end: -1
+        }
+        bc_node_pool = bc_node_pool.push(_ca)
+        return len(bc_node_pool) - 1
     }
 
     if k == "IfExpr" || k == "IfStmt" {
