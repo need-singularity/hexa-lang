@@ -38,14 +38,21 @@
 
 /* ── Instrumentation counters (per-TU static — header-inline OK
  *    because we only link one bridge consumer per test binary) ── */
-static uint64_t hexa_nb_shadow_int_ctor_count   = 0;
-static uint64_t hexa_nb_shadow_int_heap_allocs  = 0;  /* must stay 0 */
+static uint64_t hexa_nb_shadow_int_ctor_count    = 0;
+static uint64_t hexa_nb_shadow_int_heap_allocs   = 0;  /* must stay 0 */
+/* Phase 3 — float path counters, parallel to Phase 2 int counters */
+static uint64_t hexa_nb_shadow_float_ctor_count  = 0;
+static uint64_t hexa_nb_shadow_float_heap_allocs = 0;  /* must stay 0 */
 
 static inline uint64_t hexa_nb_shadow_int_count(void)      { return hexa_nb_shadow_int_ctor_count; }
 static inline uint64_t hexa_nb_shadow_heap_alloc(void)     { return hexa_nb_shadow_int_heap_allocs; }
+static inline uint64_t hexa_nb_shadow_float_count(void)    { return hexa_nb_shadow_float_ctor_count; }
+static inline uint64_t hexa_nb_shadow_float_heap_alloc(void) { return hexa_nb_shadow_float_heap_allocs; }
 static inline void     hexa_nb_shadow_reset(void) {
-    hexa_nb_shadow_int_ctor_count  = 0;
-    hexa_nb_shadow_int_heap_allocs = 0;
+    hexa_nb_shadow_int_ctor_count    = 0;
+    hexa_nb_shadow_int_heap_allocs   = 0;
+    hexa_nb_shadow_float_ctor_count  = 0;
+    hexa_nb_shadow_float_heap_allocs = 0;
 }
 
 /* ── Shadow constructors (ZERO heap alloc — value in register) ── */
@@ -58,7 +65,24 @@ static inline HexaV hexa_nb_shadow_int(int64_t n) {
     return hexa_nb_int32((int32_t)n);
 }
 
+/* Phase 3 — float shadow constructor.
+ *
+ *  Mirrors Phase 2's hexa_nb_shadow_int contract: counts constructions,
+ *  never touches the heap. Wraps Phase-1's hexa_nb_float which handles
+ *  NaN canonicalisation so a double NaN payload cannot collide with the
+ *  QNaN-tagged namespace (see hexa_nanbox.h comment on HEXA_NB_QNAN_MASK).
+ *
+ *  Round-trip contract:
+ *    - Finite doubles (including ±0, subnormals, ±inf, integer-valued)
+ *      bit-preserved through hexa_nb_shadow_as_float.
+ *    - NaN inputs canonicalise to 0x7FF8000000000000ULL. The "is NaN"
+ *      property survives, but non-canonical NaN payloads are lost.
+ *    - Signalling NaNs — same story, mapped to canonical QNaN.
+ *
+ *  This matches the Phase-1 ABI contract. rt#38-B big-float / extended
+ *  precision support is deferred. */
 static inline HexaV hexa_nb_shadow_float(double f) {
+    hexa_nb_shadow_float_ctor_count++;
     return hexa_nb_float(f);
 }
 
@@ -73,6 +97,13 @@ static inline HexaV hexa_nb_shadow_nil(void) {
 /* ── Shadow accessors ───────────────────────────────────────── */
 static inline int64_t hexa_nb_shadow_as_int(HexaV v) {
     return hexa_nb_as_int(v);
+}
+
+/* Phase 3 — float shadow accessor. Round-trip partner of
+ * hexa_nb_shadow_float. Thin passthrough to the Phase-1 bit-cast
+ * accessor; kept here for symmetry with _as_int. */
+static inline double hexa_nb_shadow_as_float(HexaV v) {
+    return hexa_nb_as_float(v);
 }
 
 /* ── Bridge: legacy HexaVal → NaN-box HexaV ──────────────────
