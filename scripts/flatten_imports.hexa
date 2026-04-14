@@ -345,6 +345,19 @@ if !file_exists(target) {
 g_base_dir = fl_dirname(target)
 fl_walk(target)
 
+// HEXA ARRAY ALIASING WORKAROUND: g_order is a host-array TAG_ARRAY that
+// the interpreter stores in array_store by index. Pushing to g_bodies /
+// g_decls inside a loop that reads g_order can clobber g_order's slot via
+// host-array reuse, dropping its len from 2 to 0 mid-iteration. snap_order
+// is a fresh local that survives the pushes — see also airgenome / VM
+// `@hot var aliasing JIT` known issue (memory: feedback_hot_attr_dict_mutation).
+let mut snap_order = []
+let mut snap_i = 0
+while snap_i < len(g_order) {
+    snap_order = snap_order.push(g_order[snap_i])
+    snap_i = snap_i + 1
+}
+
 // ── 1차 패스: 전 파일의 non-pub top-level decl 수집 + 카운트 ──
 //
 // 동일 이름이 2+ 파일에 있으면 "collided" — mangle 대상.
@@ -356,9 +369,14 @@ let mut g_decls  = []  // 각 파일 non-pub decl 이름 리스트 (병렬 배�
 let mut all_names   = []
 let mut all_counts  = []
 
+// HEXA ARRAY ALIASING WORKAROUND: reading g_order[i] inside a loop that
+// also pushes to g_bodies / g_decls clobbers g_order's array_store slot in
+// the host interpreter. snap_order is a private copy that survives the
+// pushes. Without this the loop crashes with "index 1 out of bounds (len 0)"
+// on iteration 1 because g_order's len gets reset to 0 by the prior push.
 let mut i = 0
 while i < m {
-    let f = g_order[i]
+    let f = snap_order[i]
     let body = read_file(f)
     g_bodies = g_bodies.push(body)
     let decls = fl_scan_private_decls(body)
@@ -407,21 +425,44 @@ if len(collided) > 0 {
 }
 
 // ── 2차 패스: 파일별 mangle + strip_uses + emit ─────────────
+//
+// EMIT ORDER FIX (stage0 rebuild regression unblock):
+//   g_order is leaves-first (DFS post-order). For the C backend that means
+//   `runtime_core.hexa` is concatenated BEFORE `hexa_full.hexa`. The current
+//   hexa_v2 binary does NOT emit forward declarations for struct
+//   constructors (`HexaVal Val(...)` etc.), so any leaf file that uses
+//   `Val { ... }` struct literals before the struct's definition triggers
+//   `error: call to undeclared function 'Val'` and `conflicting types`.
+//
+//   Function call cross-references are unaffected because hexa_v2 DOES
+//   emit `HexaVal name(...);` forward decls at the top of the C file, so
+//   reversing the order is safe for fn-call edges (hexa_full → runtime_core)
+//   while fixing the struct edge (runtime_core → hexa_full's `struct Val`).
+//
+//   We emit in REVERSE topological order: the entry file (target) first,
+//   leaves (deps) last. This keeps struct definitions visible to dependents
+//   without touching codegen_c2 / hexa_v2.
 
 let mut buf = []
 buf = buf.push("// === FLATTENED by scripts/flatten_imports.hexa ===")
 buf = buf.push("// target: " + target)
 buf = buf.push("// files:  " + str(len(g_order)))
+buf = buf.push("// order:  reverse-topo (root-first, leaves-last) — see emit-order note above")
 if len(collided) > 0 {
     buf = buf.push("// mangled: " + collided.join(", "))
 }
 buf = buf.push("")
 
+// Forward-index iteration with mapped lookup: idx = (m - 1 - i2) gives
+// reverse-topo order (root first) using only forward iteration. Use
+// snap_order instead of g_order for the same array-aliasing workaround
+// described in pass 1.
 let mut i2 = 0
 while i2 < m {
-    let f = g_order[i2]
-    let body = g_bodies[i2]
-    let decls = g_decls[i2]
+    let idx = m - 1 - i2
+    let f = snap_order[idx]
+    let body = g_bodies[idx]
+    let decls = g_decls[idx]
     let prefix = fl_mangle_prefix(f)
 
     // 이 파일의 decl 중 collided 인 것만 골라 rename 적용

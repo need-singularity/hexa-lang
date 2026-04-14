@@ -16,9 +16,12 @@
 // Design notes:
 //   * One-shot scan of each file. For every `^fn NAME(` line we track
 //     brace depth until the body closes, and fold every kept line into a
-//     running FNV-1a 64 hash **in place** — we never materialise the full
-//     body string. This keeps memory O(1) per function and avoids the
+//     running DJB2 polynomial hash **in place** — we never materialise the
+//     full body string. This keeps memory O(1) per function and avoids the
 //     stage0 OOM that the first draft hit on the 14.7k-line monolith.
+//     (We started with FNV-1a 64 but the native transpiler does not yet
+//     parse `^`; DJB2 uses only `*` and `+` so the same source builds in
+//     both stage0 and hexa_v2 / hexa_cc.)
 //   * Line normalisation: trim + drop blank + drop `// ...` comment-only.
 //     Block comments (`/* */`) are NOT stripped; they are rare in these
 //     files and false-positives here are tolerable for a first-cut tool.
@@ -81,22 +84,29 @@ fn ck_count_byte(line, target_byte) {
     return c
 }
 
-// FNV-1a 64 step: fold the bytes of `s` into a running hash `h`. Returns
-// the updated hash. Called once per kept body line.
-fn ck_fnv1a_step(h_in, s) {
-    let prime = 1099511628211
+// DJB2-style polynomial hash step: fold the bytes of `s` into a running
+// hash `h`. Returns the updated hash. Called once per kept body line.
+//
+// History: this slot was originally FNV-1a 64, but FNV-1a needs a per-byte
+// `h ^ byte` step and the native transpiler (hexa_v2 / hexa_cc) does not
+// yet parse the BitXor `^` token (Parse error at 93:15). We swap to DJB2
+// `h = h * 33 + byte` which uses only `*` and `+`, so the same source
+// builds under both stage0 and the native back-end. Collision rate is
+// slightly higher than FNV-1a but more than enough to flag silent drift
+// across two ~10k-line interpreter sources.
+fn ck_djb2_step(h_in, s) {
     let bs = s.bytes()
     let n = len(bs)
     let mut h = h_in
     let mut i = 0
     while i < n {
-        h = h ^ bs[i]
-        h = h * prime
+        // h * 33 + byte, expressed without bit-shift so the native
+        // transpiler can lower it.
+        h = h * 33 + bs[i]
         i = i + 1
     }
-    // Mix in a newline so adjacent lines don't ambiguously join.
-    h = h ^ 10
-    h = h * prime
+    // Mix in a newline (byte 10) so adjacent lines don't ambiguously join.
+    h = h * 33 + 10
     return h
 }
 
@@ -136,8 +146,8 @@ fn ck_scan(src, label) {
                 let start_line = i
                 let mut depth = 0
                 let mut opened = false
-                // FNV-1a seed — arbitrary large odd int.
-                let mut h = 1125899906842597
+                // DJB2 seed — classic 5381.
+                let mut h = 5381
                 let mut j = i
                 let mut done = false
                 while j < n {
@@ -159,7 +169,7 @@ fn ck_scan(src, label) {
                             if nt.starts_with("//") {
                                 // skip
                             } else {
-                                h = ck_fnv1a_step(h, nt)
+                                h = ck_djb2_step(h, nt)
                             }
                         }
 
@@ -293,6 +303,44 @@ println("  identical  = " + (identical))
 println("  divergent  = " + (divergent))
 println("  interp_only= " + (interp_only))
 println("  full_only  = " + (full_only))
+
+// ─────────────────────────────────────────────────────────────
+// Snapshot current divergence to shared/hexa-lang/ for ROI / pre-commit
+// tooling. We write the file unconditionally so a clean run also leaves
+// an explicit "0 drift" certificate behind. Best-effort: any write
+// failure (read-only fs, permission) is swallowed by the runtime.
+// ─────────────────────────────────────────────────────────────
+let snap_path = "shared/hexa-lang/ssot_current_divergence.json"
+let mut json = "{\n"
+json = json + "  \"interp\": \"" + interp_path + "\",\n"
+json = json + "  \"full\": \"" + full_path + "\",\n"
+json = json + "  \"interp_fns\": " + (len(inames)) + ",\n"
+json = json + "  \"full_fns\": " + (len(fnames)) + ",\n"
+json = json + "  \"common\": " + (common) + ",\n"
+json = json + "  \"identical\": " + (identical) + ",\n"
+json = json + "  \"divergent\": " + (divergent) + ",\n"
+json = json + "  \"interp_only\": " + (interp_only) + ",\n"
+json = json + "  \"full_only\": " + (full_only) + ",\n"
+json = json + "  \"hash\": \"djb2\",\n"
+json = json + "  \"divergent_fns\": [\n"
+let mut si = 0
+let mut sj = 0
+let nin = len(inames)
+while si < nin {
+    let nm = inames[si]
+    let fi2 = ck_idx_of(fnames, nm)
+    if fi2 >= 0 {
+        if ihashes[si] != fhashes[fi2] {
+            if sj > 0 { json = json + ",\n" }
+            json = json + "    {\"name\": \"" + nm + "\", \"interp_line\": " + (istarts[si] + 1) + ", \"full_line\": " + (fstarts[fi2] + 1) + "}"
+            sj = sj + 1
+        }
+    }
+    si = si + 1
+}
+json = json + "\n  ]\n}\n"
+write_file(snap_path, json)
+println("[ssot-sync] snapshot -> " + snap_path)
 
 if divergent > 0 {
     println("")

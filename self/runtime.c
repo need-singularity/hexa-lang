@@ -1763,6 +1763,33 @@ static void hexa_val_arena_scope_pop(void) {
 // Forward decl — heapify itself is recursive over nested arena maps.
 HexaVal hexa_val_heapify(HexaVal v);
 
+// T33 Fix 4: weak-link to the interpreter's array_store / map_store globals.
+// These are emitted as `HexaVal array_store;` / `HexaVal map_store;` by the
+// codegen for `pub let mut array_store = []` in interpreter.hexa. They are
+// host-array TAG_ARRAY HexaVals that hold the *contents* of every interpreter
+// array / map (the wrapped HexaValStruct only carries a slot index in
+// vs->int_val). Because hexa_val_heapify previously stopped at the index-
+// holding VALSTRUCT, arena-allocated child elements stored *inside*
+// array_store[idx] / map_store[idx] were never deep-copied — when the arena
+// rewound on scope-pop, those elements turned into dangling memory that
+// later prints as "index 5702266960 out of bounds" or as the wrong tag.
+//
+// We weak-link so this object can also link into translation units that
+// don't include hexa_full.hexa (e.g. the bootstrap_compiler.c stub or
+// standalone test harnesses). At runtime we NULL-check before deref.
+extern HexaVal array_store __attribute__((weak_import, weak));
+extern HexaVal map_store   __attribute__((weak_import, weak));
+__attribute__((weak)) HexaVal array_store __attribute__((common));
+__attribute__((weak)) HexaVal map_store   __attribute__((common));
+
+// Interpreter-level Val.tag constants (see self/interpreter.hexa lines 20-30).
+// Hardcoded here because the hexa-side `let TAG_ARRAY = 5` is emitted as a
+// HexaVal, not a C #define. Mismatch with runtime.c's HexaTag enum is
+// intentional — these are *interpreter Val tags* (vs->tag_i), not the
+// outer HexaVal.tag.
+#define HEXA_INTERP_TAG_ARRAY 5
+#define HEXA_INTERP_TAG_MAP   10
+
 // Deep-copy an arena-allocated HexaMapTable to malloc'd storage. Recursive
 // over nested values (TAG_MAP and TAG_ARRAY descend; scalars + already-heap
 // strings are bit-copied; TAG_STR with arena-pointing s gets strdup'd).
@@ -1899,6 +1926,37 @@ HexaVal hexa_val_heapify(HexaVal v) {
                 v.vs->fn_body      = hexa_val_heapify(v.vs->fn_body);
                 v.vs->struct_name  = hexa_val_heapify(v.vs->struct_name);
                 v.vs->struct_fields= hexa_val_heapify(v.vs->struct_fields);
+            }
+            // T33 Fix 4: when the interpreter Val is a TAG_ARRAY (5) or
+            // TAG_MAP (10), its contents live in array_store / map_store
+            // indexed by vs->int_val — NOT in the VALSTRUCT itself. Heapify
+            // the host array slot so each element survives arena rewind.
+            //
+            // We only descend if the corresponding global symbol is linked
+            // (weak_import: &foo == NULL when absent — e.g. bootstrap stub).
+            // Bounds-check against the host array length to defend against
+            // freed / reused slot indices observed during T33 repro.
+            if (v.vs->tag_i == HEXA_INTERP_TAG_ARRAY && &array_store != 0) {
+                if (array_store.tag == TAG_ARRAY && array_store.arr.items) {
+                    int64_t idx = v.vs->int_val;
+                    if (idx >= 0 && idx < (int64_t)array_store.arr.len) {
+                        // The slot itself is a TAG_ARRAY HexaVal (host array
+                        // of element Vals). Heapifying it walks each element.
+                        array_store.arr.items[idx] =
+                            hexa_val_heapify(array_store.arr.items[idx]);
+                    }
+                }
+            } else if (v.vs->tag_i == HEXA_INTERP_TAG_MAP && &map_store != 0) {
+                if (map_store.tag == TAG_ARRAY && map_store.arr.items) {
+                    int64_t idx = v.vs->int_val;
+                    if (idx >= 0 && idx < (int64_t)map_store.arr.len) {
+                        // map_store[idx] is a TAG_ARRAY of length 2:
+                        // [keys_array, values_array]. Heapifying the outer
+                        // array walks both keys and values transitively.
+                        map_store.arr.items[idx] =
+                            hexa_val_heapify(map_store.arr.items[idx]);
+                    }
+                }
             }
             return v;
         }

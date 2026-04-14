@@ -34,6 +34,44 @@ if [ ! -f "$SRC_HEXA" ]; then
     exit 1
 fi
 
+# T33-rebuild: prefer hexa_cc_dedup4.c (T33 method-dispatch additions for
+# slice_fast / push_nostat / parse_int / pad_left / etc.) when available.
+# The mainline self/native/hexa_v2 binary was built before these dispatches
+# were added, so transpiling current hexa_full.hexa drops to an unhandled-
+# method exit(1) at every Call. dedup4 mirrors the same SSOT changes that
+# already exist in self/codegen_c2.hexa (uncommitted) and in self/native/
+# hexa_cc.c — we only need a fresh binary built from it.
+HEXA_V2_DEDUP_SRC="$HEXA_DIR/self/native/hexa_cc_dedup4.c"
+HEXA_V2_DEDUP_BIN="${HEXA_V2_DEDUP_BIN:-$HEXA_DIR/build/hexa_v2_dedup4}"
+if [ -f "$HEXA_V2_DEDUP_SRC" ]; then
+    NEED_REBUILD=0
+    if [ ! -x "$HEXA_V2_DEDUP_BIN" ]; then
+        NEED_REBUILD=1
+    elif [ "$HEXA_V2_DEDUP_SRC" -nt "$HEXA_V2_DEDUP_BIN" ]; then
+        NEED_REBUILD=1
+    fi
+    if [ "$NEED_REBUILD" = "1" ]; then
+        UNAME_TMP="$(uname 2>/dev/null | tr -d ' \n\t')"
+        case "$UNAME_TMP" in
+            Linux)  HEXA_V2_CFLAGS="-O2 -D_GNU_SOURCE -std=gnu11 -I . -I $HEXA_DIR/self -lm" ;;
+            *)      HEXA_V2_CFLAGS="-O2 -I . -I $HEXA_DIR/self" ;;
+        esac
+        echo "[build_stage0] (re)building $HEXA_V2_DEDUP_BIN from $HEXA_V2_DEDUP_SRC"
+        mkdir -p "$HEXA_DIR/build"
+        # shellcheck disable=SC2086
+        if "$CLANG" $HEXA_V2_CFLAGS "$HEXA_V2_DEDUP_SRC" -o "$HEXA_V2_DEDUP_BIN" 2>/tmp/.hexa_v2_dedup_build.log; then
+            echo "[build_stage0] dedup4 hexa_v2 built OK"
+        else
+            echo "[build_stage0] WARN: dedup4 hexa_v2 build failed — see /tmp/.hexa_v2_dedup_build.log; falling back to mainline hexa_v2"
+            HEXA_V2_DEDUP_BIN=""
+        fi
+    fi
+    if [ -n "$HEXA_V2_DEDUP_BIN" ] && [ -x "$HEXA_V2_DEDUP_BIN" ]; then
+        HEXA_V2="$HEXA_V2_DEDUP_BIN"
+        echo "[build_stage0] using dedup4 hexa_v2 = $HEXA_V2"
+    fi
+fi
+
 if [ ! -x "$HEXA_V2" ]; then
     echo "error: hexa_v2 missing or not executable: $HEXA_V2" >&2
     echo "       Linux 부트스트랩은 먼저 hexa_v2 빌드 필요:" >&2
@@ -75,6 +113,22 @@ fi
 if [ ! -f "$SRC_C" ]; then
     echo "error: transpiled C missing: $SRC_C" >&2
     exit 1
+fi
+
+# 1.5) Refresh runtime.c sibling next to $SRC_C.
+#      Why: the transpiled .c file lives in /tmp by default, and emits
+#      `#include "runtime.c"`. C `#include "..."` first searches the
+#      including file's OWN directory before honoring `-I`. If a stale
+#      /tmp/runtime.c (left by an earlier build) shadows the SSOT
+#      $HEXA_DIR/self/runtime.c, the build silently links against the old
+#      shim — the recent fix that reintroduced `char_code` as a static
+#      TAG_FN var (vs. legacy plain function) gets lost, leaving the
+#      compile failing with `passing HexaVal (HexaVal,HexaVal) to HexaVal`.
+#      Copy the SSOT next to $SRC_C every build to make the sibling the
+#      authoritative copy.
+SRC_C_DIR="$(cd "$(dirname "$SRC_C")" && pwd)"
+if [ "$SRC_C_DIR" != "$HEXA_DIR/self" ]; then
+    cp -f "$HEXA_DIR/self/runtime.c" "$SRC_C_DIR/runtime.c"
 fi
 
 # 2) Compile
