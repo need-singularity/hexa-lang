@@ -171,29 +171,19 @@ fn bc_vm_reset() {
 // try-frame parallel arrays and for operand-stack truncation on
 // OP_THROW.
 
+// T53 (bt#85) — rebuild loops replaced by in-place .truncate(n),
+// which compiles to hexa_array_truncate (len-only shrink, no realloc,
+// retains capacity). Prior O(N) rebuild per pop/throw was the hot
+// allocator pressure in bt#85 fib(K=30).
 fn bc_vm_arr_shrink_last(arr) {
     let n = len(arr)
     if n <= 0 { return arr }
-    let mut out = []
-    let mut i = 0
-    while i < n - 1 {
-        out = out.push(arr[i])
-        i = i + 1
-    }
-    return out
+    return arr.truncate(n - 1)
 }
 
 fn bc_vm_arr_truncate(arr, keep_n) {
-    let n = len(arr)
-    if keep_n >= n { return arr }
-    if keep_n < 0 { return [] }
-    let mut out = []
-    let mut i = 0
-    while i < keep_n {
-        out = out.push(arr[i])
-        i = i + 1
-    }
-    return out
+    if keep_n < 0 { keep_n = 0 }
+    return arr.truncate(keep_n)
 }
 
 // ── Stack helpers (mutate vm_stack directly). ───────────────
@@ -210,14 +200,9 @@ fn bc_vm_pop() {
         return BC_NIL
     }
     let top = vm_stack[n - 1]
-    // Rebuild without last element (hexa arrays are push-immutable).
-    let mut out = []
-    let mut i = 0
-    while i < n - 1 {
-        out = out.push(vm_stack[i])
-        i = i + 1
-    }
-    vm_stack = out
+    // T53 (bt#85) — in-place truncate. Was O(N) rebuild loop; now
+    // O(1) len-only shrink via hexa_array_truncate, capacity retained.
+    vm_stack = vm_stack.truncate(n - 1)
     return top
 }
 
@@ -231,31 +216,19 @@ fn bc_vm_peek() {
     return vm_stack[n - 1]
 }
 
-// Array-rebuild helper: return arr[0..n].
+// T53 (bt#85) — in-place ops. Prior versions rebuilt arrays (O(N)
+// per op). Now delegate to hexa_array_truncate / hexa_array_set
+// which mutate .items in place and return the same struct. Caller
+// convention `arr = helper(arr, ...)` is preserved so upstream
+// code is unchanged.
 fn bc_vm_truncate(arr, n) {
-    let mut out = []
-    let mut i = 0
-    while i < n {
-        out = out.push(arr[i])
-        i = i + 1
-    }
-    return out
+    if n < 0 { n = 0 }
+    return arr.truncate(n)
 }
 
-// Rebuild arr with arr[i] replaced by v.
 fn bc_vm_setat(arr, i, v) {
-    let n = len(arr)
-    let mut out = []
-    let mut k = 0
-    while k < n {
-        if k == i {
-            out = out.push(v)
-        } else {
-            out = out.push(arr[k])
-        }
-        k = k + 1
-    }
-    return out
+    arr[i] = v
+    return arr
 }
 
 // ── Globals access (linear scan — fine for MVP sizes). ──────
@@ -1057,15 +1030,66 @@ fn bc_vm_run_loop() {
             }
             bc_vm_push(lu_val)
         }
-        // STORE_UPVAL — MVP captures are immutable. Source-level
-        // mutation of a captured binding from inside a lambda is a
-        // T52 feature (requires hoisting to a cell so both the outer
-        // env and the closure share storage). Stay as a trap so the
-        // verifier stays exhaustive and the runtime loudly rejects.
+        // T52 (rt#36-E #1) — STORE_UPVAL Bx=name_const_idx.
+        // Mirror of LOAD_UPVAL but reversed: pop TOS as the new value,
+        // resolve the upval name through the executing proto's const
+        // pool, rebuild the current frame's closure with the new
+        // upval_vals[idx], and write it back to vm_frame_closure[top].
+        //
+        // Scope: T52 step #1 — within-call mutation only. Across-call
+        // persistence (outer `let mut x` staying in sync with the
+        // closure's captured slot) needs the indirect-cell step
+        // documented in closure_upval.hexa. A later step replaces the
+        // rebuild-on-store below with a cell dereference.
         else if op == BC_OP_STORE_UPVAL {
-            vm_trap = true
-            vm_trap_msg = "STORE_UPVAL: mutable captures deferred (T52)"
-            return last_return
+            let su_cidx = bc_bx_of(raw)
+            let su_consts = bc_proto_consts[proto_idx]
+            if su_cidx >= len(su_consts) {
+                vm_trap = true
+                vm_trap_msg = "STORE_UPVAL: const idx out of range"
+                return last_return
+            }
+            let su_name = su_consts[su_cidx]
+            let su_depth = len(vm_frame_closure)
+            if su_depth == 0 {
+                vm_trap = true
+                vm_trap_msg = "STORE_UPVAL: no active frame"
+                return last_return
+            }
+            let su_val = bc_vm_pop()
+            if vm_trap { return last_return }
+            let su_cl = vm_frame_closure[su_depth - 1]
+            let mut su_found = false
+            if type_of(su_cl) == "array" {
+                if len(su_cl) == 4 {
+                    if su_cl[0] == BC_CLOSURE_TAG {
+                        let su_pidx = su_cl[1]
+                        let su_names = su_cl[2]
+                        let su_vals  = su_cl[3]
+                        let mut su_i = 0
+                        let su_n = len(su_names)
+                        let mut su_new_vals = []
+                        while su_i < su_n {
+                            if su_names[su_i] == su_name {
+                                su_new_vals = su_new_vals.push(su_val)
+                                su_found = true
+                            } else {
+                                su_new_vals = su_new_vals.push(su_vals[su_i])
+                            }
+                            su_i = su_i + 1
+                        }
+                        if su_found {
+                            let su_out = [BC_CLOSURE_TAG, su_pidx, su_names, su_new_vals]
+                            vm_frame_closure = bc_vm_setat(vm_frame_closure, su_depth - 1, su_out)
+                        }
+                    }
+                }
+            }
+            if !su_found {
+                vm_trap = true
+                vm_trap_msg = "STORE_UPVAL: upvalue not bound: " + su_name
+                return last_return
+            }
         }
         // PRINT (debug-only) — keep adjacent to MISC family for locality.
         else if op == BC_OP_PRINT {
