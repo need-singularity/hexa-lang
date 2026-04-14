@@ -41,10 +41,35 @@ if [ ! -x "$HEXA_V2" ]; then
     exit 1
 fi
 
-# 1) Transpile
+# 1) Transpile — T1 Phase B: flatten `use "runtime_core"` 가 있으면 선행 병합
+#    flatten_imports 는 `use "name"` → <target_dir>/<name>.hexa 로 파일들을
+#    단일 translation unit 으로 concat. hexa_v2 는 `use` 를 silent-drop 하므로
+#    직접 transpile 시 runtime_core 의 fn 들이 사라져 Stage0 가 링크 실패한다.
 if [ -z "$SKIP_TRANSPILE" ]; then
-    echo "[build_stage0] transpile: $HEXA_V2 $SRC_HEXA $SRC_C"
-    "$HEXA_V2" "$SRC_HEXA" "$SRC_C"
+    SRC_FOR_TRANSPILE="$SRC_HEXA"
+    if grep -q '^use "runtime_core"' "$SRC_HEXA" 2>/dev/null; then
+        FLAT_HEXA="${HEXA_STAGE0_FLAT:-/tmp/hexa_full_flat.hexa}"
+        STAGE0_PREV="$HEXA_DIR/build/hexa_stage0"
+        FLATTEN_RUNNER=""
+        if [ -x "$STAGE0_PREV" ]; then
+            FLATTEN_RUNNER="$STAGE0_PREV"
+        elif [ -x "$HEXA_DIR/hexa" ]; then
+            FLATTEN_RUNNER="$HEXA_DIR/hexa"
+        fi
+        if [ -z "$FLATTEN_RUNNER" ]; then
+            echo "error: flatten runner missing (need build/hexa_stage0 or ./hexa)" >&2
+            exit 1
+        fi
+        echo "[build_stage0] flatten: $FLATTEN_RUNNER scripts/flatten_imports.hexa $SRC_HEXA $FLAT_HEXA"
+        "$FLATTEN_RUNNER" "$HEXA_DIR/scripts/flatten_imports.hexa" "$SRC_HEXA" "$FLAT_HEXA"
+        if [ ! -f "$FLAT_HEXA" ]; then
+            echo "error: flatten output missing: $FLAT_HEXA" >&2
+            exit 1
+        fi
+        SRC_FOR_TRANSPILE="$FLAT_HEXA"
+    fi
+    echo "[build_stage0] transpile: $HEXA_V2 $SRC_FOR_TRANSPILE $SRC_C"
+    "$HEXA_V2" "$SRC_FOR_TRANSPILE" "$SRC_C"
 fi
 
 if [ ! -f "$SRC_C" ]; then
