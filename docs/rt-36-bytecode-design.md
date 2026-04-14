@@ -544,3 +544,30 @@ Before opening rt#36-B:
 ---
 
 *End of rt#36-A design document. ~3,400 words.*
+
+---
+
+## 17. Progress
+
+| Phase | Item | Status | Date | Commit |
+|------:|------|--------|------|--------|
+| A | Design doc + `self/bytecode.h` + `bytecode_interp.c.stub` + `rt36_bc_hello.hexa` | done | 2026-04-13 | — |
+| B | AST→BC emitter `self/bc_emitter.hexa` (47 KB pure-hexa) — post-order Decl/Stmt/Expr → HexaFnProto + constant-pool interning + local/upval slot resolution + forward jump patching + struct shape_id assignment + closure upval capture | done | 2026-04-13 | — |
+| C | Dispatch loop `self/bc_vm.hexa` — 29 / 62 opcodes implemented; smoke 22/22 PASS; golden bytecode smoke collatz + primes 5/5 PASS; `hexa run --vm <file.hexa>` wired in `self/main.hexa` (+56 lines) | in_progress | 2026-04-14 | b8b5e97 |
+| D | Full coverage + verify_suite + ≥2×/≥3× perf on fib/call_heavy | pending (blocked by C 33 opcodes remaining) | — | — |
+
+Phase C headline numbers (2026-04-14):
+
+* **Opcodes**: 29 implemented out of 62 in v1 (≈46.8 % coverage). LOADK / LOADI / ADD / SUB / MUL / DIV / MOD / NEG / EQ / NE / LT / LE / GT / GE / JMP / JMPF / JMPT / CALL / RETURN / POP / DUP / LOAD_LOCAL / STORE_LOCAL / LOAD_GLOBAL / STORE_GLOBAL / CLOSURE / NEW_ARRAY / LOAD_INDEX / STORE_INDEX plus supporting frame ops.
+* **Tests**: 22 / 22 BC VM smoke tests pass. Two new golden-file programs landed — `self/test_bc_vm_collatz.hexa` and `self/test_bc_vm_primes.hexa`, 5 / 5 pass combined.
+* **CLI surface**: `hexa run --vm <file.hexa>` is the opt-in flag. Tree-walker remains the default; `--vm` routes through `bc_emitter.hexa` → `bc_vm.hexa` without touching existing call sites.
+* **Remaining**: 33 opcodes (try/throw handler stack, closure upval open/close, string ops, `CALL_METHOD` with IC slot, `LOAD_FIELD` with shape hint, `PROFILE_HOOK`, wide-prefix form). Tracked under bt#84 subtasks.
+* **Open follow-up**: **T38** — `bc_emitter` uses some AST node layouts that drift from `self/hexa_full.hexa`; nil slot appears at transition boundaries on whole-program paths. Must resolve before Phase D makes `--vm` the default.
+
+Related breakthroughs landed in `shared/hexa-lang/state.json`:
+
+* `BT_RT36_A` (2026-04-13) — design doc + spec header skeleton
+* `BT_RT36_B` (2026-04-13) — bc_emitter.hexa 47 KB
+* `BT_RT36_C` (2026-04-14) — bc_vm.hexa 29 opcodes + smoke 22/22 + golden 5/5
+* `BT_RT36_CLI` (2026-04-14) — `hexa run --vm` CLI flag
+

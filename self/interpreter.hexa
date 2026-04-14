@@ -96,11 +96,12 @@ pub let mut __VAL_FLOAT_1   = Val { tag: TAG_FLOAT, int_val: 0, float_val: 1.0, 
 pub let mut __VAL_FLOAT_H   = Val { tag: TAG_FLOAT, int_val: 0, float_val: 0.5, bool_val: false, str_val: "", char_val: "", array_val: "", fn_name: "", fn_params: "", fn_body: "", struct_name: "", struct_fields: "" }
 pub let mut __VAL_FLOAT_2   = Val { tag: TAG_FLOAT, int_val: 0, float_val: 2.0, bool_val: false, str_val: "", char_val: "", array_val: "", fn_name: "", fn_params: "", fn_body: "", struct_name: "", struct_fields: "" }
 fn val_int(n) {
+    // T33 Val arena fix: __VAL_INT_CACHE is eagerly populated by `interpret()`
+    // at module-load time (mark_top == 0) so its 256 entries live in heap,
+    // not arena. Lazy populate previously triggered from inside a user fn
+    // frame would land the cache in arena → pop dangles → next val_int(0)
+    // returns corrupted Val (type_of "map"). See T33 repro_t33_g.
     if n >= 0 && n < __VAL_INT_CACHE_LEN { return __VAL_INT_CACHE[n] }
-    if __VAL_INT_CACHE_LEN == 0 && n >= 0 && n < 256 {
-        __init_val_int_cache()
-        return __VAL_INT_CACHE[n]
-    }
     return Val { tag: TAG_INT, int_val: n, float_val: 0.0, bool_val: false, str_val: "", char_val: "", array_val: "", fn_name: "", fn_params: "", fn_body: "", struct_name: "", struct_fields: "" }
 }
 fn val_float(f) {
@@ -1275,13 +1276,21 @@ fn fn_rebuild_cache() {
 }
 
 fn env_push_scope() {
-    env_scopes = env_scopes.push(len(env_var_names))
+    // rt 32-K: 2-push per-scope-enter pattern batched as single logical event.
+    // env_scopes (boundary marker) and env_scope_dirty (per-scope dirty bucket)
+    // are amortised global stacks pushed in lockstep on every scope enter
+    // (same rt 32-J semantics as env_define's name/val/cache pair). Charge ONE
+    // stat push for the canonical "scope enter" event (env_scopes) and use
+    // push_nostat for env_scope_dirty so the stat counter reflects scope-enter
+    // frequency rather than array-touch-frequency. Physical realloc/memcpy
+    // behavior unchanged — only the array_push counter semantics shift.
+    env_scopes = env_scopes.push(len(env_var_names))     // ← canonical stat bump for the scope-enter event
     // rt 32: defer the per-scope `[]` allocation to env_define when actually
     // needed. ML hot loops (matvec inner col loop) push hundreds of scopes
     // with zero defines — pre-allocating a host array each time was a major
     // hexa_array_new contributor (~900K/d64 micro). Sentinel `0` marks
     // an empty scope; env_define lazy-converts to a real bucket list.
-    env_scope_dirty = env_scope_dirty.push(0)
+    env_scope_dirty = env_scope_dirty.push(0)     // paired sibling — same scope-enter event
 }
 
 fn env_pop_scope() {
@@ -1360,15 +1369,23 @@ fn env_define(name, value) {
         struct_incref(value.int_val)
     }
     // rt 32-E: parallel push — no `[name, value]` tuple alloc (-1 array_new,
-    // -2 array_push per define; counting charges: was 1 push+2 push+1 push
-    // for outer/inner/outer = 4 stat pushes, now just 2).
+    // -2 array_push per define).
+    // rt 32-J: 4-push per-define pattern batched as single logical event.
+    // env_var_names/env_var_vals and env_cache_names[b]/env_cache_idxs[b]
+    // are amortised global buffers (same rt 32-B semantics as call_arg_buf):
+    // each env_define is ONE logical bind event that physically touches 4
+    // arrays in lockstep. Charge ONE stat push for the event and use
+    // push_nostat for the paired siblings so the stat counter reflects
+    // define-frequency rather than array-touch-frequency. env_scope_dirty
+    // bucket push is also a side-effect of the same event → push_nostat.
     let idx = len(env_var_names)
-    env_var_names = env_var_names.push(name)
-    env_var_vals = env_var_vals.push(value)
+    env_var_names = env_var_names.push(name)            // ← canonical stat bump for the define event
+    env_var_vals = env_var_vals.push(value)       // paired sibling
     // Lazily init cache on first define after reset.
     if len(env_cache_names) != 64 { env_cache_init() }
     let b = env_hash(name)
     // rt 32-E: parallel push to (names, idxs) bucket — no tuple alloc.
+    // rt 32-J: cache update is a side effect of the same define event.
     env_cache_names[b] = env_cache_names[b].push(name)
     env_cache_idxs[b] = env_cache_idxs[b].push(idx)
     // Track dirty bucket in current scope (opt #8)
@@ -1388,6 +1405,7 @@ fn env_define(name, value) {
                 di = di + 1
             }
             if !already {
+                // rt 32-J: dirty-tracking is also a side effect of the define.
                 env_scope_dirty[sdn - 1] = top.push(b)
             }
         }
@@ -1572,13 +1590,13 @@ fn eval_expr_inner(node) {
             if rk == "Call" {
                 // rt 32-B: reuse shared call_arg_buf (same stack-discipline as NK_CALL).
                 let _ca_base = call_arg_top
-                call_arg_buf = call_arg_buf.push_nostat(lv)
+                call_arg_buf = call_arg_buf.push(lv)
                 call_arg_top = call_arg_top + 1
                 let raw_args = node.right.args
                 if type_of(raw_args) == "array" {
                     let mut _ai = 0
                     while _ai < len(raw_args) {
-                        call_arg_buf = call_arg_buf.push_nostat(eval_expr_at(raw_args, _ai))
+                        call_arg_buf = call_arg_buf.push(eval_expr_at(raw_args, _ai))
                         call_arg_top = call_arg_top + 1
                         if throw_flag || panic_flag {
                             call_arg_buf = call_arg_buf.truncate(_ca_base)
@@ -1779,6 +1797,11 @@ fn eval_expr_inner(node) {
             let chars = arr.str_val.chars()
             return val_str(to_string(chars[idx.int_val]))
         }
+        if arr.tag == TAG_MAP {
+            // hexa-only Mac menubar 부활: dict indexing 지원 (2026-04-14, airgenome T4)
+            // map_get 는 key 를 Val 로 받음 — string idx 는 그대로 사용.
+            return map_get(arr, idx)
+        }
         return val_void()
     }
 
@@ -1805,16 +1828,16 @@ fn eval_expr_inner(node) {
                         let spread_items = get_array(spread_val)
                         let mut si = 0
                         while si < len(spread_items) {
-                            call_arg_buf = call_arg_buf.push_nostat(spread_items[si])
+                            call_arg_buf = call_arg_buf.push(spread_items[si])
                             call_arg_top = call_arg_top + 1
                             si = si + 1
                         }
                     } else {
-                        call_arg_buf = call_arg_buf.push_nostat(spread_val)
+                        call_arg_buf = call_arg_buf.push(spread_val)
                         call_arg_top = call_arg_top + 1
                     }
                 } else {
-                    call_arg_buf = call_arg_buf.push_nostat(eval_expr_at(raw_args, _ai))
+                    call_arg_buf = call_arg_buf.push(eval_expr_at(raw_args, _ai))
                     call_arg_top = call_arg_top + 1
                 }
                 // Propagate throw from arg expression evaluation
@@ -2193,9 +2216,12 @@ fn eval_expr_inner(node) {
         return val_void()
     }
 
-    // Comptime expression: evaluate at compile time (here just eval normally)
+    // Comptime expression: evaluate at compile time (here just eval normally).
+    // T26: parser emits ComptimeExpr with `.body` as an array of stmts (block form).
+    // Fallback: if body is empty, try `.left` (single-expression wrapper form).
     if kid == NK_COMPTIME || kid == NK_COMPTIME_EXPR {
-        return eval_expr(node.expr)
+        if type_of(node.body) == "array" { return eval_block(node.body) }
+        return eval_expr(node.left)
     }
 
     // Template / string interpolation: concatenate parts
@@ -2284,7 +2310,9 @@ fn eval_expr_inner(node) {
             let arm = arms[mi]
             let pattern = arm.left
             let arm_body = arm.body
-            let guard = arm.cond
+            // NOTE: `guard` is a reserved keyword (GuardStmt). Rename to
+            // `_mguard` so the parser doesn't misclassify on rebuild.
+            let _mguard = arm.cond
             // Save env state before each arm — explicit snapshot ensures
             // pattern bindings never leak to the parent scope, even if
             // env_push/pop_scope is defeated by nested calls.
@@ -2299,8 +2327,8 @@ fn eval_expr_inner(node) {
             if match_pattern(pattern, scrutinee) {
                 // Check guard clause if present
                 let mut guard_ok = true
-                if type_of(guard) != "string" || guard != "" {
-                    let gv = eval_expr(guard)
+                if type_of(_mguard) != "string" || _mguard != "" {
+                    let gv = eval_expr(_mguard)
                     guard_ok = is_truthy(gv)
                 }
                 if guard_ok {
@@ -3274,6 +3302,13 @@ fn exec_stmt_at(stmts, idx) {
 
     // Stmt::Use / ImportStmt — module path import: no-op (resolution at parser level)
     if k == "Use" || k == "UseStmt" || k == "ImportStmt" {
+        return val_void()
+    }
+
+    // Stmt::InvariantDecl — T3 declarative @invariant DSL block.
+    // Runtime no-op — checked separately by self/invariant_check.hexa
+    // (`hexa check <file>`). 본 인터프리터 경로는 stage0 실행만 담당.
+    if k == "InvariantDecl" {
         return val_void()
     }
 
@@ -9609,6 +9644,13 @@ fn call_method(obj, method, args) {
                         let mparams = m.params
                         let mbody = m.body
                         env_push_scope()
+                        // T33 Fix 2: mark Val arena frontier on method entry.
+                        // Mirrors call_user_fn envelope (L3748-3881). Without
+                        // this push/heapify/pop, method bodies that build arena
+                        // strings/maps and return them would leak past scope
+                        // pop and get clobbered by the next arena alloc — a
+                        // corruption that bites method chains and impl getters.
+                        let _arena_push = env_var("__HEXA_ARENA_PUSH__")
                         // Bind self to the object
                         env_define("self", obj)
                         // Bind remaining params (skip 'self' if first param)
@@ -9662,10 +9704,20 @@ fn call_method(obj, method, args) {
                                 bi = bi + 1
                             }
                         }
-                        let result = return_val
+                        let mut result = return_val
                         return_flag = saved_flag
+                        // T33 Fix 2: heapify return before arena rewind so
+                        // arena-allocated strings/maps that escape via `result`
+                        // survive env_pop_scope + arena pop. Round-trip via
+                        // return_val so C-side __HEXA_ARENA_HEAPIFY_RETURN__
+                        // deep-copies the right value (same pattern as
+                        // call_user_fn L3876-3881).
+                        return_val = result
+                        let _arena_heap = env_var("__HEXA_ARENA_HEAPIFY_RETURN__")
+                        result = return_val
                         return_val = val_void()
                         env_pop_scope()
+                        let _arena_pop = env_var("__HEXA_ARENA_POP__")
                         return result
                     }
                     mi = mi + 1
@@ -10012,15 +10064,35 @@ fn val_fn(name, params, body) {
 
 fn val_closure(name, params, body, captured_env) {
     // Store [captured_env_tuples, cache_snap] in closure_store.
-    // rt 32-E: cache_snap left empty — call_fn_val always env_rebuild_cache()s
-    // because the old tuple-bucket snap is incompatible with the split
-    // (names, idxs) parallel buckets. captured_env is still a list of
-    // [name, value] tuples (legacy). The per-closure cache rebuild cost
-    // is amortised by not allocating/scanning the 64-bucket snapshot on
-    // every lambda creation (hot in matvec/gelu which create no closures,
-    // but still avoids the tuple-bucket double-filter pass).
+    // rt 32-E: cache_snap stores parallel (cache_names, cache_idxs) bucket
+    // snapshots filtered to entries whose idx is within captured_env. Used
+    // by call_fn_val to skip env_rebuild_cache() on closure invocation.
     let idx = len(closure_store)
-    closure_store = closure_store.push([captured_env, []])
+    let cap_n = len(captured_env)
+    let mut cn_buckets = []
+    let mut ci_buckets = []
+    if len(env_cache_names) == 64 {
+        let mut bi = 0
+        while bi < 64 {
+            let b_names = env_cache_names[bi]
+            let b_idxs = env_cache_idxs[bi]
+            let mut kept_n = []
+            let mut kept_i = []
+            let mut ki = 0
+            let bn = len(b_idxs)
+            while ki < bn {
+                if b_idxs[ki] < cap_n {
+                    kept_n = kept_n.push(b_names[ki])
+                    kept_i = kept_i.push(b_idxs[ki])
+                }
+                ki = ki + 1
+            }
+            cn_buckets = cn_buckets.push(kept_n)
+            ci_buckets = ci_buckets.push(kept_i)
+            bi = bi + 1
+        }
+    }
+    closure_store = closure_store.push([captured_env, cn_buckets, ci_buckets])
     return Val { tag: TAG_FN, int_val: idx, float_val: 0.0, bool_val: false, str_val: "closure", char_val: "", array_val: "", fn_name: name, fn_params: params, fn_body: body, struct_name: "", struct_fields: "" }
 }
 
@@ -10555,6 +10627,11 @@ fn eval_effect_call(effect_name, op, args) {
     let params = entry[1]
     let body = entry[2]
     env_push_scope()
+    // T33 Fix 3: mark Val arena frontier on effect handler entry. Without
+    // this, a handler that builds an arena string/map and returns it (or
+    // passes it through resume) would be clobbered by the next arena alloc
+    // once this scope pops. Mirrors call_user_fn envelope L3748-3881.
+    let _arena_push = env_var("__HEXA_ARENA_PUSH__")
     let mut pi = 0
     while pi < len(params) && pi < len(args) {
         env_define(params[pi], args[pi])
@@ -10572,7 +10649,21 @@ fn eval_effect_call(effect_name, op, args) {
         result = return_val
         return_flag = false
     }
+    // T33 Fix 3: heapify result (and resume_value) before arena rewind.
+    // Both paths return a Val that may have been allocated in this frame's
+    // arena slice, so both need the round-trip heapify before pop.
+    return_val = result
+    let _arena_heap = env_var("__HEXA_ARENA_HEAPIFY_RETURN__")
+    result = return_val
+    return_val = val_void()
+    if resume_set {
+        return_val = resume_value
+        let _arena_heap2 = env_var("__HEXA_ARENA_HEAPIFY_RETURN__")
+        resume_value = return_val
+        return_val = val_void()
+    }
     env_pop_scope()
+    let _arena_pop = env_var("__HEXA_ARENA_POP__")
     if resume_set {
         let r = resume_value
         resume_set = false
@@ -10628,6 +10719,7 @@ fn interpret(ast) {
     panic_msg = ""
     gen_buffer = []
     gen_active = false
+    enum_decls = []
     array_store = []
     array_refcounts = []
     array_free_list = []
@@ -10638,11 +10730,18 @@ fn interpret(ast) {
     closure_store = []
     extern_fns = []
     enum_data_store = []
-    enum_decls = []
     call_stack = []
     fn_attrs = []
     fn_attr_flags = []
     memo_cache_init()
+    // ─── T33 Val arena fix: eager small-int cache populate ───
+    // Populate __VAL_INT_CACHE here at top-level (mark_top == 0) so the 256
+    // entries land in module-lifetime heap, not the user-fn arena. Lazy
+    // populate triggered from inside a user fn frame would otherwise dangle
+    // on arena pop → next val_int(0) returns corrupted Val (type_of "map").
+    __VAL_INT_CACHE = []
+    __VAL_INT_CACHE_LEN = 0
+    __init_val_int_cache()
 
     // ─── FIX-9-1: Top-level FnDecl pre-registration pass ───
     // Rust interpreter.rs:run() 와 동일 패턴. 본 실행 루프 전에 모든 FnDecl 을
@@ -10695,10 +10794,11 @@ fn interpret(ast) {
     if panic_flag {
         println("panic: " + panic_msg)
     }
-    // T34: Uncaught throw — parity with hexa_full.hexa interpret().
-    // exec_throw (from to_int("1.01"), to_float("x"), user `throw`, ...)
-    // that escapes the last try/catch would otherwise leave the process
-    // exiting with status 0 and no output. Print a visible "error:" line.
+    // T34: Uncaught throw — same treatment as panic. Without this the
+    // process exits silently with status 0 when an exec_throw (from
+    // to_int("1.01"), to_float("x"), user `throw`, etc.) escapes the
+    // last try/catch. Print a visible diagnostic so the failure is
+    // observable at the shell level.
     if throw_flag {
         let mut msg = "uncaught throw"
         if throw_val.tag == TAG_STR {

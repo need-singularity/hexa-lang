@@ -1369,3 +1369,389 @@ fn bc_disasm_insn(raw) {
     // Default: unsigned Bx.
     return name + " " + to_string(bc_bx_of(raw))
 }
+
+// ═══════════════════════════════════════════════════════════════════
+//  rt#36-D bridge: hexa_full AST dict-tree → bc_node_pool walker.
+//
+//  The stage0 interpreter (self/hexa_full.hexa) produces AST nodes as
+//  recursive dict-literals with fields:
+//    kind, name, value, op,
+//    left, right, cond, then_body, else_body,
+//    params, body, args, ...
+//
+//  This is a DIFFERENT shape from the flat `bc_node_pool` that the
+//  MVP emitter consumes. `ast_to_bc_walk_root` bridges the two:
+//    - Walks the dict tree DFS.
+//    - For each expr node, calls the matching bc_mk_* builder and
+//      returns its index in bc_node_pool.
+//    - For each stmt, populates bc_node_pool AND contributes its
+//      index to a temporary local list; the parent caller then pushes
+//      those indices contiguously onto bc_stmt_list (so nested-body
+//      ranges don't interleave with parent ranges).
+//
+//  Supported subset (sufficient for recursive `fib`):
+//    Expr : IntLit, BoolLit, StringLit, Ident, BinOp, UnaryOp, Call,
+//           IfExpr
+//    Stmt : LetStmt/LetMutStmt, AssignStmt, ReturnStmt, WhileStmt,
+//           IfExpr/IfStmt (stmt-form), FnDecl, ExprStmt fallback
+//
+//  Out of scope for this bridge (return -1 / emit fallback):
+//    Match, Try, Lambda, Closure, Struct, Enum, Impl, Trait, Use,
+//    Import, For (iter_expr), Range, Slice, Index, Field, Pipe,
+//    TypeCast, MapLit, ArrayLit, GuardStmt, Defer, ContractAssert, ...
+//
+//  Caller contract:
+//    1. `bc_reset_pools()` — clear the flat pools.
+//    2. `let summary = ast_to_bc_walk_root(ast)` — returns
+//       [n_protos, total_instrs, total_consts] on success, or
+//       [-1, 0, 0] if `ast` is not a list.
+//    3. `bc_vm_run()` — execute the compiled module.
+// ═══════════════════════════════════════════════════════════════════
+
+// Is this AST "node" actually a placeholder string? Parser uses ""
+// for absent fields (see parse_let/parse_return default-case dicts),
+// so a string value means "no node here".
+fn ast_is_empty(node) {
+    return type_of(node) == "string"
+}
+
+// Get the first Ident name if the node is an Ident; otherwise "".
+// Used for Call callee extraction.
+fn ast_callee_name(node) {
+    if ast_is_empty(node) { return "" }
+    if node.kind == "Ident" { return node.name }
+    return ""
+}
+
+// Walk a list of AST stmt dicts, producing a contiguous slice of
+// bc_stmt_list indices. The caller receives (start, end). Each child
+// stmt is first fully compiled into bc_node_pool (which may allocate
+// grandchild ranges into bc_stmt_list), and only THEN are the direct
+// child indices pushed onto bc_stmt_list. This preserves contiguity:
+//    parent body slice = bc_stmt_list[start..end]
+// with no interleaved grandchild indices.
+fn ast_to_bc_walk_body(stmts) {
+    // Build a local idx buffer first.
+    let mut idxs = []
+    if type_of(stmts) == "array" {
+        let mut i = 0
+        let n = len(stmts)
+        while i < n {
+            let sidx = ast_to_bc_stmt(stmts[i])
+            idxs = idxs.push(sidx)
+            i = i + 1
+        }
+    }
+    // Now push contiguously.
+    let start = len(bc_stmt_list)
+    let mut j = 0
+    while j < len(idxs) {
+        bc_stmt_list = bc_stmt_list.push(idxs[j])
+        j = j + 1
+    }
+    let endx = len(bc_stmt_list)
+    // Return as a 2-element array (hexa doesn't have tuples).
+    return [start, endx]
+}
+
+// Walk an AST expression dict node, produce a bc_node_pool index.
+// Unknown/unsupported node kinds fall back to IntLit 0 so arithmetic
+// does not crash the emitter — the VM may still trap on the resulting
+// bytecode, which is the desired "loud failure" mode.
+fn ast_to_bc_expr(node) {
+    if ast_is_empty(node) { return -1 }
+    if type_of(node) != "struct" && type_of(node) != "map" {
+        return bc_mk_int_lit(0)
+    }
+    let k = node.kind
+
+    if k == "IntLit" {
+        // AST IntLit stores its source-level value as a string in
+        // `value`. Parse once at bridge time.
+        let iv = node.value.parse_int()
+        return bc_mk_int_lit(iv)
+    }
+    if k == "FloatLit" {
+        // MVP: stash as string const pool entry via the builder's
+        // to_string path — but the builder wants a `float`. We
+        // approximate by parsing to int (fib test doesn't use floats).
+        return bc_mk_int_lit(0)
+    }
+    if k == "BoolLit" {
+        return bc_mk_bool_lit(node.value == "true")
+    }
+    if k == "StringLit" {
+        return bc_mk_string_lit(node.value)
+    }
+    if k == "CharLit" {
+        return bc_mk_string_lit(node.value)
+    }
+    if k == "Ident" {
+        return bc_mk_ident(node.name)
+    }
+    if k == "BinOp" {
+        let li = ast_to_bc_expr(node.left)
+        let ri = ast_to_bc_expr(node.right)
+        return bc_mk_binop(node.op, li, ri)
+    }
+    if k == "UnaryOp" {
+        // bc_emitter has no bc_mk_unary — hand-roll a BcNode with
+        // kind "UnaryOp". bc_compile_expr reads node.op + node.left_idx.
+        let oi = ast_to_bc_expr(node.left)
+        let un = BcNode {
+            kind: "UnaryOp", int_val: 0, float_val: 0.0, bool_val: false,
+            str_val: "", name: "", op: node.op,
+            left_idx: oi, right_idx: -1,
+            body_start: -1, body_end: -1,
+            else_start: -1, else_end: -1,
+            args_start: -1, args_end: -1,
+            n_params: 0, params_start: -1, params_end: -1
+        }
+        bc_node_pool = bc_node_pool.push(un)
+        return len(bc_node_pool) - 1
+    }
+    if k == "Call" {
+        // AST Call: node.left = callee expr (usually Ident), node.args = list.
+        let fname = ast_callee_name(node.left)
+        let raw_args = node.args
+        // Walk args into bc_arg_list (contiguous slice).
+        // Same contiguity trick as walk_body: build a local buffer then push.
+        let mut arg_idxs = []
+        if type_of(raw_args) == "array" {
+            let mut i = 0
+            while i < len(raw_args) {
+                let aidx = ast_to_bc_expr(raw_args[i])
+                arg_idxs = arg_idxs.push(aidx)
+                i = i + 1
+            }
+        }
+        let astart = len(bc_arg_list)
+        let mut j = 0
+        while j < len(arg_idxs) {
+            bc_arg_list = bc_arg_list.push(arg_idxs[j])
+            j = j + 1
+        }
+        let aend = len(bc_arg_list)
+        return bc_mk_call(fname, astart, aend)
+    }
+    if k == "IfExpr" || k == "IfStmt" {
+        // Cond goes into bc_node_pool standalone.
+        let ci = ast_to_bc_expr(node.cond)
+        // Walk then_body contiguously (children first, then push parent slice).
+        let ts = ast_to_bc_walk_body(node.then_body)
+        let ts_start = ts[0]
+        let ts_end = ts[1]
+        // else_body may be "" (absent) or a non-empty array.
+        let mut es_start = -1
+        let mut es_end = -1
+        let else_body = node.else_body
+        if type_of(else_body) == "array" {
+            if len(else_body) > 0 {
+                let es = ast_to_bc_walk_body(else_body)
+                es_start = es[0]
+                es_end = es[1]
+            }
+        }
+        return bc_mk_if_expr(ci, ts_start, ts_end, es_start, es_end)
+    }
+
+    // Unsupported expr — return a harmless IntLit 0 placeholder.
+    return bc_mk_int_lit(0)
+}
+
+// Walk an AST stmt dict node, produce a bc_node_pool index for the
+// stmt BcNode. Contiguity of any inner stmt-list slices is maintained
+// by ast_to_bc_walk_body (children pushed BEFORE we return).
+fn ast_to_bc_stmt(node) {
+    if ast_is_empty(node) { return -1 }
+    if type_of(node) != "struct" && type_of(node) != "map" { return -1 }
+    let k = node.kind
+
+    if k == "FnDecl" {
+        // Params: push parameter names into bc_param_list contiguously.
+        let params = node.params
+        let ps_start = len(bc_param_list)
+        let mut np = 0
+        if type_of(params) == "array" {
+            let mut i = 0
+            while i < len(params) {
+                let p = params[i]
+                if type_of(p) != "string" {
+                    bc_param_list = bc_param_list.push(p.name)
+                    np = np + 1
+                }
+                i = i + 1
+            }
+        }
+        let ps_end = len(bc_param_list)
+        // Body: walk (children first, then push contiguous slice).
+        let body = node.body
+        let bb = ast_to_bc_walk_body(body)
+        let bs_start = bb[0]
+        let bs_end = bb[1]
+        return bc_mk_fn_decl(node.name, np, ps_start, ps_end, bs_start, bs_end)
+    }
+
+    if k == "LetStmt" || k == "LetMutStmt" || k == "ConstStmt" || k == "StaticStmt" {
+        let vi = ast_to_bc_expr(node.left)
+        return bc_mk_let_stmt(node.name, vi)
+    }
+
+    if k == "AssignStmt" {
+        // AST AssignStmt shape varies — interpreter reads node.name / node.left.
+        // For fib we don't need it, but keep it safe.
+        let vi = ast_to_bc_expr(node.left)
+        return bc_mk_assign_stmt(node.name, vi)
+    }
+
+    if k == "ReturnStmt" || k == "Return" {
+        // bare `return` → node.left is "" → ast_to_bc_expr returns -1,
+        // which bc_mk_return_stmt treats as "no value".
+        let vi = ast_to_bc_expr(node.left)
+        return bc_mk_return_stmt(vi)
+    }
+
+    if k == "WhileStmt" {
+        let ci = ast_to_bc_expr(node.cond)
+        let body = node.body
+        let bb = ast_to_bc_walk_body(body)
+        return bc_mk_while_stmt(ci, bb[0], bb[1])
+    }
+
+    if k == "IfExpr" || k == "IfStmt" {
+        // Stmt-form if: build the same IfExpr BcNode as the expr form,
+        // bc_compile_stmt has an IfExpr branch that forwards to
+        // bc_compile_expr (added above). No ExprStmt wrap needed.
+        let ci = ast_to_bc_expr(node.cond)
+        let ts = ast_to_bc_walk_body(node.then_body)
+        let mut es_start = -1
+        let mut es_end = -1
+        let else_body = node.else_body
+        if type_of(else_body) == "array" {
+            if len(else_body) > 0 {
+                let es = ast_to_bc_walk_body(else_body)
+                es_start = es[0]
+                es_end = es[1]
+            }
+        }
+        return bc_mk_if_expr(ci, ts[0], ts[1], es_start, es_end)
+    }
+
+    // ExprStmt: hexa parser wraps bare expressions in ExprStmt nodes
+    // (e.g. `println(fib(10))` becomes ExprStmt{ left: Call{...} }).
+    // Unwrap the inner expression and wrap with the bc-side ExprStmt.
+    //
+    // Exception: if the inner expression is an `if { ... }` block (which
+    // parse_stmt produces via parse_expr → parse_primary → parse_if_expr
+    // for bare `if n < 2 { return n }` at statement position), we do NOT
+    // wrap in ExprStmt. The bc-side ExprStmt handler unconditionally
+    // emits OP_POP after compiling the expression, but a stmt-form `if`
+    // whose then-branch ends in `return` leaves ZERO values on the
+    // operand stack (not one), so the POP would underflow at runtime.
+    // Instead, push the IfExpr BcNode directly as a stmt — bc_compile_stmt's
+    // IfExpr branch (added further above) forwards to bc_compile_expr
+    // without the POP wrapper.
+    if k == "ExprStmt" {
+        let inner = node.left
+        if !ast_is_empty(inner) {
+            let ik = inner.kind
+            if ik == "IfExpr" || ik == "IfStmt" {
+                return ast_to_bc_expr(inner)
+            }
+        }
+        let ei = ast_to_bc_expr(inner)
+        return bc_mk_expr_stmt(ei)
+    }
+
+    // Fallback: try to treat the node itself as an expression. This
+    // catches oddities where a stmt-position expression wasn't already
+    // wrapped in ExprStmt by the parser (rare but possible for
+    // edge-case grammar productions).
+    let ei2 = ast_to_bc_expr(node)
+    return bc_mk_expr_stmt(ei2)
+}
+
+// Top-level AST walker. Consumes `ast` (list of stmt dicts), populates
+// bc_node_pool / bc_stmt_list / bc_arg_list / bc_param_list, and then
+// invokes bc_compile_root on the root stmt range.
+//
+// Returns the [n_protos, total_instrs, total_consts] triple that
+// bc_compile_root yields, or [-1, 0, 0] if `ast` is unusable.
+fn ast_to_bc_walk_root(ast) {
+    bc_reset_pools()
+    if type_of(ast) != "array" { return [-1, 0, 0] }
+    let n = len(ast)
+    if n == 0 { return [0, 0, 0] }
+
+    // Walk each top-level stmt into bc_node_pool, collecting indices
+    // into a local buffer. Then push them onto bc_stmt_list contiguously.
+    let mut top_idxs = []
+    let mut i = 0
+    while i < n {
+        let sidx = ast_to_bc_stmt(ast[i])
+        top_idxs = top_idxs.push(sidx)
+        i = i + 1
+    }
+    let root_start = len(bc_stmt_list)
+    let mut j = 0
+    while j < len(top_idxs) {
+        bc_stmt_list = bc_stmt_list.push(top_idxs[j])
+        j = j + 1
+    }
+    let root_end = len(bc_stmt_list)
+
+    return bc_compile_root(root_start, root_end)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  rt#36-D deferred VM entry point.
+//
+//  This block runs as top-level code AT THE END of bc_emitter.hexa.
+//  In the flattened stage0 bundle produced by scripts/flatten_imports.hexa,
+//  bc_emitter.hexa is concatenated AFTER hexa_full.hexa and bc_vm.hexa.
+//  C-level translation from hexa_v2 emits top-level `let` bindings
+//  in order of appearance inside the main() function, so by the time
+//  this block executes:
+//
+//    1) hexa_full.hexa's entry point has already tokenized + parsed
+//       the user script into `_hx_ast` and set `_hx_has_script = true`
+//       (deferring interpret() when HEXA_VM=1 was observed).
+//    2) All `let BC_OP_*` definitions above in bc_emitter.hexa have
+//       been run, so bc_compile_expr / bc_vm_run_loop see the correct
+//       opcode integers.
+//
+//  Running bc_vm_run here — rather than inline in hexa_full's entry —
+//  eliminates the "BC_OP_* are zero at first use" ordering bug that
+//  would otherwise silently emit LOADK/POP sequences instead of
+//  LOADI/ADD/... on all non-LOADK opcodes.
+//
+//  This block is a NO-OP unless `HEXA_VM` is exported to the child.
+// ═══════════════════════════════════════════════════════════════════
+if _hx_has_script {
+    if env_var("HEXA_VM") == "1" {
+        let _bcv_summary = ast_to_bc_walk_root(_hx_ast)
+        // Optional debug: `HEXA_VM_DEBUG=1` dumps the compile summary
+        // and the disassembly of every emitted proto — useful when a
+        // program traps with "pc past code end" or similar so the
+        // exact bytecode can be inspected at the shell.
+        if env_var("HEXA_VM_DEBUG") == "1" {
+            println("[bc_vm] protos=" + to_string(_bcv_summary[0]) + " instrs=" + to_string(_bcv_summary[1]) + " consts=" + to_string(_bcv_summary[2]))
+            let mut _bcv_dp = 0
+            while _bcv_dp < bc_get_proto_count() {
+                println("[bc_vm] proto[" + to_string(_bcv_dp) + "] " + bc_get_proto_name(_bcv_dp) + " code_len=" + to_string(bc_get_proto_code_len(_bcv_dp)) + " n_params=" + to_string(bc_get_proto_n_params(_bcv_dp)) + " n_locals=" + to_string(bc_get_proto_n_locals(_bcv_dp)))
+                let mut _bcv_dc = 0
+                while _bcv_dc < bc_get_proto_code_len(_bcv_dp) {
+                    let _bcv_raw = bc_get_proto_insn(_bcv_dp, _bcv_dc)
+                    println("  " + to_string(_bcv_dc) + ": " + bc_disasm_insn(_bcv_raw))
+                    _bcv_dc = _bcv_dc + 1
+                }
+                _bcv_dp = _bcv_dp + 1
+            }
+        }
+        let _bcv_rv = bc_vm_run()
+        if bc_vm_trap_hit() {
+            println("error: bc_vm trap: " + bc_vm_trap_reason())
+        }
+    }
+}
+

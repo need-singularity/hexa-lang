@@ -21,14 +21,16 @@
 //  of `if op == X` terminators matches the emitter's own
 //  bc_opname style. A computed-goto tier is a rt#36-D concern.
 //
-//  MVP opcodes implemented (28):
+//  Opcodes implemented (37 — rt#36-C trivial-7 extension applied):
 //    LOADI LOADK LOADF LOADNIL LOADTRUE LOADFALSE
 //    LOAD_LOCAL STORE_LOCAL LOAD_GLOBAL STORE_GLOBAL
 //    ADD SUB MUL DIV MOD
+//    ADDF SUBF MULF DIVF                    (rt#36-C float arith)
 //    EQ NEQ LT LE GT GE NOT
-//    JMP JMPF
+//    JMP JMPF JMPT
 //    CALL RETURN RETURN0
 //    POP PRINT NOP
+//    HALT ASSERT_INT ASSERT_FLOAT           (rt#36-C halt/asserts)
 //
 //  Deferred to rt#36-D:
 //    NEW_ARRAY ARR_GET ARR_SET ARR_PUSH ARR_LEN
@@ -36,10 +38,8 @@
 //    NEW_STRUCT LOAD_FIELD STORE_FIELD
 //    CLOSURE NEW_CLOSURE_UPVAL LOAD_UPVAL STORE_UPVAL
 //    TRY THROW ENDTRY
-//    ADDF SUBF MULF DIVF (float specialization)
-//    TAILCALL DUP MOVE POPN ASSERT_INT ASSERT_FLOAT HALT PROFILE_HOOK
+//    TAILCALL DUP MOVE POPN PROFILE_HOOK
 //    AND OR (usually lowered to JMPF/JMPT anyway)
-//    JMPT (not emitted by MVP Phase B)
 //
 //  Value representation: stage1 hexa is dynamically typed, so
 //  we push whatever (int / float / bool / string / nil-sentinel)
@@ -79,6 +79,12 @@ let mut vm_global_vals  = []  // any[]
 let mut vm_trap = false
 let mut vm_trap_msg = ""
 
+// Halt flag — set by OP_HALT to cleanly terminate the dispatch
+// loop without marking it as a trap. Semantically distinct from
+// vm_trap: halt is a cooperative program end (e.g. `exit(0)`),
+// trap is an unrecoverable VM error. bc_vm_reset clears both.
+let mut vm_halted = false
+
 // Nil sentinel (see header). Using a distinctive string makes
 // type-confusion bugs easy to spot in test output.
 let BC_NIL = "<nil>"
@@ -95,6 +101,7 @@ fn bc_vm_reset() {
     vm_global_vals = []
     vm_trap = false
     vm_trap_msg = ""
+    vm_halted = false
 }
 
 // ── Stack helpers (mutate vm_stack directly). ───────────────
@@ -369,6 +376,34 @@ fn bc_vm_mod(a, b) {
     return a % b
 }
 
+// Float-specialized arithmetic — forces both operands to float
+// via to_float() before combining. Matches rt#36-A §6.2 spec:
+// ADDF/SUBF/MULF/DIVF ALWAYS produce a float result regardless
+// of operand tags. Used by the emitter when the static type of
+// both operands is float; the VM trusts the emitter's type
+// analysis and performs the lift defensively via to_float.
+fn bc_vm_addf(a, b) { return to_float(a) + to_float(b) }
+fn bc_vm_subf(a, b) { return to_float(a) - to_float(b) }
+fn bc_vm_mulf(a, b) { return to_float(a) * to_float(b) }
+fn bc_vm_divf(a, b) {
+    let fb = to_float(b)
+    if fb == 0.0 {
+        vm_trap = true
+        vm_trap_msg = "float division by zero"
+        return 0.0
+    }
+    return to_float(a) / fb
+}
+
+// Parse a decimal float string ("3.14", "-0.5", "7") into a
+// float value. Stage1 hexa has `to_float` as a builtin that
+// accepts strings directly — this wrapper exists for symmetry
+// with bc_vm_parse_int and to centralize error handling if we
+// later need NaN/Inf rejection. rt#36-D will harden this.
+fn bc_vm_parse_float(s) {
+    return to_float(s)
+}
+
 // Comparisons — return bool.
 fn bc_vm_eq(a, b)  { return a == b }
 fn bc_vm_neq(a, b) { return a != b }
@@ -437,8 +472,10 @@ fn bc_vm_run_loop() {
                 bc_vm_push(s)
             }
         } else if op == BC_OP_LOADF {
-            // MVP: parse as int (float literals unused in test inputs).
-            // rt#36-D adds real float parsing.
+            // rt#36-C float extension: parse the const-pool string
+            // into an actual float. Emitter's FloatLit lowering does
+            //   bc_add_const(to_string(node.float_val))
+            // so the const slot always holds a decimal like "3.14".
             let cidx = bc_bx_of(raw)
             let consts = bc_proto_consts[proto_idx]
             if cidx >= len(consts) {
@@ -446,9 +483,7 @@ fn bc_vm_run_loop() {
                 vm_trap_msg = "LOADF: const idx out of range"
                 return last_return
             }
-            // Push the raw string — arithmetic won't work but the
-            // tests in rt#36-C don't use FloatLit.
-            bc_vm_push(consts[cidx])
+            bc_vm_push(bc_vm_parse_float(consts[cidx]))
         } else if op == BC_OP_LOADNIL {
             bc_vm_push(BC_NIL)
         } else if op == BC_OP_LOADTRUE {
@@ -533,6 +568,29 @@ fn bc_vm_run_loop() {
             let b = bc_vm_pop()
             let a = bc_vm_pop()
             bc_vm_push(bc_vm_mod(a, b))
+            if vm_trap { return last_return }
+        }
+
+        // ──────── FLOAT ARITHMETIC (rt#36-C) ────────
+        // ADDF/SUBF/MULF/DIVF always produce a float result.
+        // Operands are coerced via to_float() so mixed int/float
+        // inputs (common after LOADI → promote) work transparently.
+        else if op == BC_OP_ADDF {
+            let b = bc_vm_pop()
+            let a = bc_vm_pop()
+            bc_vm_push(bc_vm_addf(a, b))
+        } else if op == BC_OP_SUBF {
+            let b = bc_vm_pop()
+            let a = bc_vm_pop()
+            bc_vm_push(bc_vm_subf(a, b))
+        } else if op == BC_OP_MULF {
+            let b = bc_vm_pop()
+            let a = bc_vm_pop()
+            bc_vm_push(bc_vm_mulf(a, b))
+        } else if op == BC_OP_DIVF {
+            let b = bc_vm_pop()
+            let a = bc_vm_pop()
+            bc_vm_push(bc_vm_divf(a, b))
             if vm_trap { return last_return }
         }
 
@@ -641,6 +699,43 @@ fn bc_vm_run_loop() {
             // Intentionally do nothing.
         }
 
+        // ──────── HALT / ASSERTIONS (rt#36-C) ────────
+        // HALT — cooperative loop terminator. Unlike a trap this
+        // is NOT an error: it signals "program reached end of
+        // logical execution". We set vm_halted and bail out of
+        // the dispatch loop; the current TOS (if any) is returned
+        // as last_return so tests can inspect the halt value.
+        else if op == BC_OP_HALT {
+            let n = len(vm_stack)
+            if n > 0 {
+                last_return = vm_stack[n - 1]
+            }
+            vm_halted = true
+            return last_return
+        }
+        // ASSERT_INT — peek TOS, trap if type_of != "int".
+        // Non-consuming so the asserted value remains available
+        // for the next instruction (matches x86 assert semantics).
+        else if op == BC_OP_ASSERT_INT {
+            let v = bc_vm_peek()
+            if vm_trap { return last_return }
+            if type_of(v) != "int" {
+                vm_trap = true
+                vm_trap_msg = "ASSERT_INT failed: got " + type_of(v)
+                return last_return
+            }
+        }
+        // ASSERT_FLOAT — peek TOS, trap if type_of != "float".
+        else if op == BC_OP_ASSERT_FLOAT {
+            let v = bc_vm_peek()
+            if vm_trap { return last_return }
+            if type_of(v) != "float" {
+                vm_trap = true
+                vm_trap_msg = "ASSERT_FLOAT failed: got " + type_of(v)
+                return last_return
+            }
+        }
+
         // ──────── UNIMPLEMENTED OPCODES ────────
         // Anything else — trap with the opcode name for debuggability.
         else {
@@ -690,6 +785,7 @@ fn bc_vm_run() {
 
 fn bc_vm_trap_hit() { return vm_trap }
 fn bc_vm_trap_reason() { return vm_trap_msg }
+fn bc_vm_halted_hit() { return vm_halted }
 
 // ── Run-and-return-top helper (for tests that want the
 //    final TOS, e.g. plain-arith tests that end with ExprStmt

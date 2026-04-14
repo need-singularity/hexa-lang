@@ -28,6 +28,14 @@
 // scripts/build_stage0.sh 의 flatten 단계가 파일들을 하나로 합친 뒤 transpile 한다.
 use "runtime_core"
 
+// ── rt#36-D bridge: bc_emitter + bc_vm for `hexa run --vm ...` ──
+// flatten_imports.hexa 가 토포 정렬로 self/bc_emitter.hexa + self/bc_vm.hexa
+// 의 정의들을 stage0 번들에 포함시킨다. HEXA_VM 환경변수가 "1" 이면 parse
+// 직후 interpret() 대신 ast_to_bc_walk_root → bc_compile_root → bc_vm_run()
+// 경로로 라우팅된다. (See entry-point block at EOF.)
+use "bc_emitter"
+use "bc_vm"
+
 // ── T3 Phase A: declarative @invariant DSL (replaces shell-grep above) ──
 // 위 주석형 invariant 는 R1 (보존 우선) 으로 그대로 유지하되, 본 phase 에서는
 // AST 기반 checker 가 인식하는 정식 InvariantDecl 노드로 I1 을 병기한다.
@@ -4659,11 +4667,12 @@ fn __init_val_int_cache() {
 }
 
 fn val_int(n) {
+    // T33 Val arena fix: __VAL_INT_CACHE is eagerly populated by `interpret()`
+    // at module-load time (mark_top == 0) so its 256 entries live in heap,
+    // not arena. Lazy populate previously triggered from inside a user fn
+    // frame would land the cache in arena → pop dangles → next val_int(0)
+    // returns corrupted Val (type_of "map"). See T33 repro_t33_g.
     if n >= 0 && n < __VAL_INT_CACHE_LEN { return __VAL_INT_CACHE[n] }
-    if __VAL_INT_CACHE_LEN == 0 && n >= 0 && n < 256 {
-        __init_val_int_cache()
-        return __VAL_INT_CACHE[n]
-    }
     return Val { tag: TAG_INT, int_val: n, float_val: 0.0, bool_val: false, str_val: "", char_val: "", array_val: "", fn_name: "", fn_params: "", fn_body: "", struct_name: "", struct_fields: "" }
 }
 // rt 32-C: val_float 싱글톤 캐시 — gelu/sigmoid/tanh/layernorm 수식이 0.0/1.0/0.5/2.0
@@ -13787,6 +13796,13 @@ fn call_method(obj, method, args) {
                         let mparams = m.params
                         let mbody = m.body
                         env_push_scope()
+                        // T33 Fix 2: mark Val arena frontier on method entry.
+                        // Mirrors call_user_fn envelope (L7914+L8049). Without
+                        // this push/heapify/pop, method bodies that build arena
+                        // strings/maps and return them would leak past scope
+                        // pop and get clobbered by the next arena alloc — a
+                        // corruption that bites method chains and impl getters.
+                        let _arena_push = env_var("__HEXA_ARENA_PUSH__")
                         // Bind self to the object
                         env_define("self", obj)
                         // Bind remaining params (skip 'self' if first param)
@@ -13840,10 +13856,20 @@ fn call_method(obj, method, args) {
                                 bi = bi + 1
                             }
                         }
-                        let result = return_val
+                        let mut result = return_val
                         return_flag = saved_flag
+                        // T33 Fix 2: heapify return before arena rewind so
+                        // arena-allocated strings/maps that escape via `result`
+                        // survive env_pop_scope + arena pop. Round-trip via
+                        // return_val so C-side __HEXA_ARENA_HEAPIFY_RETURN__
+                        // deep-copies the right value (same pattern as
+                        // call_user_fn L8045-8050).
+                        return_val = result
+                        let _arena_heap = env_var("__HEXA_ARENA_HEAPIFY_RETURN__")
+                        result = return_val
                         return_val = val_void()
                         env_pop_scope()
+                        let _arena_pop = env_var("__HEXA_ARENA_POP__")
                         return result
                     }
                     mi = mi + 1
@@ -14760,6 +14786,11 @@ fn eval_effect_call(effect_name, op, args) {
     let params = entry[1]
     let body = entry[2]
     env_push_scope()
+    // T33 Fix 3: mark Val arena frontier on effect handler entry. Without
+    // this, a handler that builds an arena string/map and returns it (or
+    // passes it through resume) would be clobbered by the next arena alloc
+    // once this scope pops. Mirrors call_user_fn envelope L7914+L8049.
+    let _arena_push = env_var("__HEXA_ARENA_PUSH__")
     let mut pi = 0
     while pi < len(params) && pi < len(args) {
         env_define(params[pi], args[pi])
@@ -14777,7 +14808,21 @@ fn eval_effect_call(effect_name, op, args) {
         result = return_val
         return_flag = false
     }
+    // T33 Fix 3: heapify result (and resume_value) before arena rewind.
+    // Both paths return a Val that may have been allocated in this frame's
+    // arena slice, so both need the round-trip heapify before pop.
+    return_val = result
+    let _arena_heap = env_var("__HEXA_ARENA_HEAPIFY_RETURN__")
+    result = return_val
+    return_val = val_void()
+    if resume_set {
+        return_val = resume_value
+        let _arena_heap2 = env_var("__HEXA_ARENA_HEAPIFY_RETURN__")
+        resume_value = return_val
+        return_val = val_void()
+    }
     env_pop_scope()
+    let _arena_pop = env_var("__HEXA_ARENA_POP__")
     if resume_set {
         let r = resume_value
         resume_set = false
@@ -14839,6 +14884,14 @@ fn interpret(ast) {
     fn_attrs = []
     fn_attr_flags = []
     memo_cache_init()
+    // ─── T33 Val arena fix: eager small-int cache populate ───
+    // Populate __VAL_INT_CACHE here at top-level (mark_top == 0) so the 256
+    // entries land in module-lifetime heap, not the user-fn arena. Lazy
+    // populate triggered from inside a user fn frame would otherwise dangle
+    // on arena pop → next val_int(0) returns corrupted Val (type_of "map").
+    __VAL_INT_CACHE = []
+    __VAL_INT_CACHE_LEN = 0
+    __init_val_int_cache()
 
     // ─── FIX-9-1: Top-level FnDecl pre-registration pass ───
     // Rust interpreter.rs:run() 와 동일 패턴. 본 실행 루프 전에 모든 FnDecl 을
@@ -14919,10 +14972,29 @@ fn interpret(ast) {
 
 // ── Script execution entry (2026-04-13) ──────────────────
 // If argv provides a file path, read + tokenize + parse + execute it.
+//
+// rt#36-D bridge: when HEXA_VM=1, we DEFER execution to the bottom of
+// bc_emitter.hexa (which is concatenated AFTER this file by
+// scripts/flatten_imports.hexa). The deferral is required because the
+// bc_emitter's opcode constants (BC_OP_LOADI, BC_OP_ADD, ...) are
+// top-level `let` bindings that init in the C main() in appearance
+// order — and this entry point appears BEFORE bc_emitter in the flat
+// file, so running bc_vm_run() here would read uninitialized (zero)
+// opcode constants. Saving parsed AST + flag into module globals and
+// letting bc_emitter.hexa's tail block run after its own let-inits
+// resolves the ordering.
+let mut _hx_ast = []
+let mut _hx_has_script = false
 let _hx_av = args()
 if len(_hx_av) >= 3 {
     let _hx_src = read_file(_hx_av[2])
     let _hx_tokens = tokenize(_hx_src)
-    let _hx_ast = parse(_hx_tokens)
-    interpret(_hx_ast)
+    _hx_ast = parse(_hx_tokens)
+    _hx_has_script = true
+    // Classic path: run the tree-walking interpreter inline ONLY if
+    // we are not in VM mode. In VM mode, bc_emitter.hexa's tail block
+    // picks this up via the (_hx_has_script, _hx_ast) globals.
+    if env_var("HEXA_VM") != "1" {
+        interpret(_hx_ast)
+    }
 }

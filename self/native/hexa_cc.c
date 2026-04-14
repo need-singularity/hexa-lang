@@ -8280,8 +8280,11 @@ HexaVal gen2_expr(HexaVal node) {
                 return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_pow("), gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_234), hexa_int(0)))), hexa_str(", ")), gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_235), hexa_int(1)))), hexa_str(")"));
             }
             if (hexa_truthy(hexa_eq(name, hexa_str("to_float")))) {
+                // T32: route through __hx_to_double (runtime.c:415) which
+                // unwraps TAG_VALSTRUCT (interpreter Vals); prior inline
+                // (a.tag==TAG_FLOAT?a.f:(double)a.i) read only the outer C tag.
                 a = gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_236), hexa_int(0)));
-                return hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_float("), a), hexa_str(".tag==TAG_FLOAT?")), a), hexa_str(".f:(double)")), a), hexa_str(".i)"));
+                return hexa_add(hexa_add(hexa_str("hexa_float(__hx_to_double("), a), hexa_str("))"));
             }
             if (hexa_truthy(hexa_eq(name, hexa_str("is_alpha")))) {
                 a = gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_237), hexa_int(0)));
