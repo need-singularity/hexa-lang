@@ -644,6 +644,41 @@ fn bc_mk_while_stmt(cond_idx, body_start, body_end) {
     return len(bc_node_pool) - 1
 }
 
+// T48 — IndexAssignStmt: `obj[idx] = v` with obj a simple Ident.
+// Routed through OP_ARR_SET which is polymorphic array/map in the
+// VM (T48 patch). `name` = base ident, `left_idx` = index expr,
+// `right_idx` = value expr.
+fn bc_mk_index_assign_stmt(obj_ident, idx_expr, val_expr) {
+    let n = BcNode {
+        kind: "IndexAssignStmt", int_val: 0, float_val: 0.0, bool_val: false,
+        str_val: "", name: obj_ident, op: "",
+        left_idx: idx_expr, right_idx: val_expr,
+        body_start: -1, body_end: -1, else_start: -1, else_end: -1,
+        args_start: -1, args_end: -1,
+        n_params: 0, params_start: -1, params_end: -1
+    }
+    bc_node_pool = bc_node_pool.push(n)
+    return len(bc_node_pool) - 1
+}
+
+// T48 — ArrPushExpr: `obj.push(val)` as an expression (returns new
+// array / map — hexa's value-returning collection semantics). The
+// caller typically binds the result (`a = a.push(v)`); bare form
+// falls through ExprStmt and is discarded via OP_POP. left_idx =
+// obj expr, right_idx = val expr.
+fn bc_mk_arr_push_expr(obj_expr, val_expr) {
+    let n = BcNode {
+        kind: "ArrPushExpr", int_val: 0, float_val: 0.0, bool_val: false,
+        str_val: "", name: "", op: "",
+        left_idx: obj_expr, right_idx: val_expr,
+        body_start: -1, body_end: -1, else_start: -1, else_end: -1,
+        args_start: -1, args_end: -1,
+        n_params: 0, params_start: -1, params_end: -1
+    }
+    bc_node_pool = bc_node_pool.push(n)
+    return len(bc_node_pool) - 1
+}
+
 // T46 — TryCatch: `try { body } catch e { handler }`. body_start/end
 // hold the try body's stmt slice; else_start/end hold the catch
 // handler's stmt slice. `name` is the catch-binding identifier.
@@ -1246,6 +1281,18 @@ fn bc_compile_expr(idx) {
         return
     }
 
+    // T48 — ArrPushExpr: `obj.push(val)` lowered by the bridge. Emits
+    // obj + val + OP_ARR_PUSH, leaving the new collection on TOS for
+    // the caller to bind (AssignStmt) or discard (ExprStmt → POP).
+    if k == "ArrPushExpr" {
+        bc_compile_expr(node.left_idx)    // obj
+        bc_compile_expr(node.right_idx)   // val
+        let _r = bc_emit_raw(bc_enc_abx(BC_OP_ARR_PUSH, 0))
+        // (-2, +1) net -1
+        bc_pop(1)
+        return
+    }
+
     // Fallback — unknown kind. Emit nil so the stack stays valid.
     let _r = bc_emit_raw(bc_enc_abx(BC_OP_LOADNIL, 0))
     bc_push1()
@@ -1274,6 +1321,44 @@ fn bc_compile_stmt(idx) {
         } else {
             let cidx = bc_add_const(node.name)
             let _r = bc_emit_raw(bc_enc_ab16(BC_OP_STORE_GLOBAL, 0, cidx))
+        }
+        bc_pop(1)
+        return
+    }
+
+    // T48 — IndexAssignStmt: `obj[idx] = v` with obj a simple Ident.
+    // Polymorphic over array/map: VM's OP_ARR_SET auto-detects
+    // BC_MAP_TAG shape and routes to map-semantics.
+    // Sequence: LOAD obj → compile idx → compile v → ARR_SET → STORE obj.
+    if k == "IndexAssignStmt" {
+        let ia_name = node.name
+        let ia_idx_e = node.left_idx
+        let ia_val_e = node.right_idx
+
+        // LOAD obj onto stack.
+        let ia_slot = bc_resolve_local(ia_name)
+        if ia_slot >= 0 {
+            let _rl = bc_emit_raw(bc_enc_abx(BC_OP_LOAD_LOCAL, ia_slot))
+        } else {
+            let ia_lcidx = bc_add_const(ia_name)
+            let _rl = bc_emit_raw(bc_enc_ab16(BC_OP_LOAD_GLOBAL, 0, ia_lcidx))
+        }
+        bc_push1()
+
+        // Compile idx + val onto stack.
+        bc_compile_expr(ia_idx_e)
+        bc_compile_expr(ia_val_e)
+
+        // ARR_SET — pops val, idx, arr; pushes new array/map. Net (-3, +1).
+        let _rs = bc_emit_raw(bc_enc_abx(BC_OP_ARR_SET, 0))
+        bc_pop(2)
+
+        // STORE updated collection back to obj binding.
+        if ia_slot >= 0 {
+            let _rw = bc_emit_raw(bc_enc_abx(BC_OP_STORE_LOCAL, ia_slot))
+        } else {
+            let ia_scidx = bc_add_const(ia_name)
+            let _rw = bc_emit_raw(bc_enc_ab16(BC_OP_STORE_GLOBAL, 0, ia_scidx))
         }
         bc_pop(1)
         return
@@ -2089,6 +2174,24 @@ fn ast_to_bc_expr(node) {
     }
     if k == "Call" {
         // AST Call: node.left = callee expr (usually Ident), node.args = list.
+        // T48 — method-call sugar: `obj.push(val)` lowers to ArrPushExpr.
+        // Detect Field callee with matching method name + arity 1, route
+        // to the bc-side ArrPushExpr so compile_expr emits OP_ARR_PUSH.
+        let callee_n = node.left
+        if type_of(callee_n) == "map" {
+            if callee_n.kind == "Field" {
+                if callee_n.name == "push" {
+                    let mc_args = node.args
+                    if type_of(mc_args) == "array" {
+                        if len(mc_args) == 1 {
+                            let mc_obj = ast_to_bc_expr(callee_n.left)
+                            let mc_val = ast_to_bc_expr(mc_args[0])
+                            return bc_mk_arr_push_expr(mc_obj, mc_val)
+                        }
+                    }
+                }
+            }
+        }
         let fname = ast_callee_name(node.left)
         let raw_args = node.args
         // Walk args into bc_arg_list (contiguous slice).
@@ -2296,6 +2399,11 @@ fn ast_to_bc_stmt(node) {
         // binding. More complex bases (chained `.`, index+field, etc.)
         // fall through to the generic ident path and currently produce
         // a degenerate no-op — rt#36-E extends this when IC shapes land.
+        //
+        // T48 extension: if LHS is an `Index` node with a simple Ident
+        // base (e.g. `arr[i] = v` or `m[k] = v`), lower to
+        // IndexAssignStmt. Routes through OP_ARR_SET (polymorphic
+        // array/map in the VM).
         let lhs = node.left
         if type_of(lhs) == "map" {
             let lk = lhs.kind
@@ -2305,6 +2413,16 @@ fn ast_to_bc_stmt(node) {
                     if base.kind == "Ident" {
                         let vi_fs = ast_to_bc_expr(node.right)
                         return bc_mk_field_assign_stmt(base.name, lhs.name, vi_fs)
+                    }
+                }
+            }
+            if lk == "Index" {
+                let ibase = lhs.left
+                if type_of(ibase) == "map" {
+                    if ibase.kind == "Ident" {
+                        let ii = ast_to_bc_expr(lhs.right)   // idx expr
+                        let iv = ast_to_bc_expr(node.right)  // value expr
+                        return bc_mk_index_assign_stmt(ibase.name, ii, iv)
                     }
                 }
             }
