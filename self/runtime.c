@@ -2115,9 +2115,10 @@ HexaVal hexa_exec(HexaVal cmd) {
     size_t cap = 4096;
     while (fgets(buf, sizeof(buf), fp)) {
         size_t len = strlen(buf);
-        if (total + len >= cap) { cap *= 2; result = (char*)realloc(result, cap); }
-        strcat(result, buf);
+        while (total + len + 1 > cap) { cap *= 2; result = (char*)realloc(result, cap); }
+        memcpy(result + total, buf, len);
         total += len;
+        result[total] = '\0';
     }
     pclose(fp);
     return hexa_str_own(result);
@@ -2391,7 +2392,9 @@ HexaVal hexa_format(HexaVal fmt, HexaVal arg) {
 HexaVal hexa_format_n(HexaVal fmt, HexaVal args) {
     // Multi-arg: replace {} and {:.N} with successive args
     if (fmt.tag != TAG_STR || args.tag != TAG_ARRAY) return fmt;
-    char* result = malloc(strlen(fmt.s) * 4 + args.arr.len * 64 + 256);
+    size_t cap = strlen(fmt.s) * 4 + args.arr.len * 64 + 256;
+    char* result = malloc(cap);
+    size_t total = 0;
     result[0] = 0;
     char* src = fmt.s;
     int ai = 0;
@@ -2418,16 +2421,22 @@ HexaVal hexa_format_n(HexaVal fmt, HexaVal args) {
                     HexaVal s = hexa_to_string(arg);
                     strncpy(buf, s.s, sizeof(buf)-1); buf[sizeof(buf)-1]=0;
                 }
-                strcat(result, buf);
+                size_t blen = strlen(buf);
+                while (total + blen + 1 > cap) { cap *= 2; result = realloc(result, cap); }
+                memcpy(result + total, buf, blen);
+                total += blen;
+                result[total] = 0;
                 src = close + 1;
             } else {
-                int len = strlen(result);
-                result[len] = *src; result[len+1] = 0;
+                while (total + 2 > cap) { cap *= 2; result = realloc(result, cap); }
+                result[total++] = *src;
+                result[total] = 0;
                 src++;
             }
         } else {
-            int len = strlen(result);
-            result[len] = *src; result[len+1] = 0;
+            while (total + 2 > cap) { cap *= 2; result = realloc(result, cap); }
+            result[total++] = *src;
+            result[total] = 0;
             src++;
         }
     }
@@ -2466,15 +2475,30 @@ HexaVal hexa_str_trim(HexaVal s) {
 
 HexaVal hexa_str_replace(HexaVal s, HexaVal old, HexaVal new_s) {
     if (s.tag != TAG_STR) return s;
-    char* result = malloc(strlen(s.s) * 2 + 1);
+    size_t cap = strlen(s.s) * 2 + 1;
+    char* result = malloc(cap);
+    size_t total = 0;
     result[0] = 0;
     char* pos = s.s;
     int oldlen = strlen(old.s);
+    size_t newlen = strlen(new_s.s);
     while (1) {
         char* found = strstr(pos, old.s);
-        if (!found) { strcat(result, pos); break; }
-        strncat(result, pos, found - pos);
-        strcat(result, new_s.s);
+        if (!found) {
+            size_t rlen = strlen(pos);
+            while (total + rlen + 1 > cap) { cap *= 2; result = realloc(result, cap); }
+            memcpy(result + total, pos, rlen);
+            total += rlen;
+            result[total] = 0;
+            break;
+        }
+        size_t seg = (size_t)(found - pos);
+        while (total + seg + newlen + 1 > cap) { cap *= 2; result = realloc(result, cap); }
+        memcpy(result + total, pos, seg);
+        total += seg;
+        memcpy(result + total, new_s.s, newlen);
+        total += newlen;
+        result[total] = 0;
         pos = found + oldlen;
     }
     return hexa_str_own(result);
@@ -2496,19 +2520,26 @@ HexaVal hexa_str_to_lower(HexaVal s) {
 
 HexaVal hexa_str_join(HexaVal arr, HexaVal sep) {
     if (arr.tag != TAG_ARRAY || arr.arr.len == 0) return hexa_str("");
-    int total = 0;
+    size_t total_size = 0;
     for (int i = 0; i < arr.arr.len; i++) {
         HexaVal s = hexa_to_string(arr.arr.items[i]);
-        total += strlen(s.s);
+        total_size += strlen(s.s);
     }
-    total += (arr.arr.len - 1) * strlen(sep.s);
-    char* result = malloc(total + 1);
-    result[0] = 0;
+    size_t seplen = strlen(sep.s);
+    total_size += (arr.arr.len - 1) * seplen;
+    char* result = malloc(total_size + 1);
+    size_t total = 0;
     for (int i = 0; i < arr.arr.len; i++) {
-        if (i > 0) strcat(result, sep.s);
+        if (i > 0) {
+            memcpy(result + total, sep.s, seplen);
+            total += seplen;
+        }
         HexaVal s = hexa_to_string(arr.arr.items[i]);
-        strcat(result, s.s);
+        size_t slen = strlen(s.s);
+        memcpy(result + total, s.s, slen);
+        total += slen;
     }
+    result[total] = 0;
     return hexa_str_own(result);
 }
 static int utf8_cpcount(const char* s) {
@@ -2573,10 +2604,15 @@ HexaVal hexa_mod(HexaVal a, HexaVal b) {
 HexaVal hexa_str_repeat(HexaVal s, HexaVal n) {
     if (s.tag != TAG_STR) return s;
     int count = n.i;
-    int slen = strlen(s.s);
-    char* result = malloc(slen * count + 1);
-    result[0] = 0;
-    for (int i = 0; i < count; i++) strcat(result, s.s);
+    if (count <= 0) return hexa_str("");
+    size_t slen = strlen(s.s);
+    char* result = malloc(slen * (size_t)count + 1);
+    size_t total = 0;
+    for (int i = 0; i < count; i++) {
+        memcpy(result + total, s.s, slen);
+        total += slen;
+    }
+    result[total] = 0;
     return hexa_str_own(result);
 }
 
