@@ -219,4 +219,11 @@ static inline int hexa_nb_is_struct(HexaV v)  { return !hexa_nb_is_double(v) && 
 static inline int hexa_nb_is_closure(HexaV v) { return !hexa_nb_is_double(v) && hexa_nb_tag(v) == HEXA_NB_TAG_CLOSURE; }
 static inline int hexa_nb_is_fn(HexaV v)      { return !hexa_nb_is_double(v) && hexa_nb_tag(v) == HEXA_NB_TAG_FN; }
 
+/* Any heap-ptr bucket (STR/ARRAY/MAP/STRUCT/CLOSURE/FN). */
+static inline int hexa_nb_is_ptr_any(HexaV v) {
+    if (hexa_nb_is_double(v)) return 0;
+    uint32_t t = hexa_nb_tag(v);
+    return t >= HEXA_NB_TAG_STR && t <= HEXA_NB_TAG_FN;
+}
+
 #endif  /* HEXA_NANBOX_H */
