@@ -1672,6 +1672,19 @@ void hexa_arena_reset(void) {
 // for the rt#32-L perf gain (fib K=30 wall -3.7%), export HEXA_VAL_ARENA=1
 // after auditing module_loader / interpreter scope-pop sites for
 // hexa_val_heapify on every cross-scope return. Bisect: 1c5a74f.
+//
+// T33 audit (2026-04-14): minimum repro still failing is array-passthrough
+// through two nested user fns — e.g.
+//     fn wrap(){return ["a","b","c"]}  fn touch(x){return x}
+//     fn inner(){let l=wrap(); let z=touch(l); println(type_of(l[0]))}
+// prints "map" under ARENA=1 (expect "str"). Symptom: array_store slot gets
+// reclaimed (array_store[K] = []) even though `l` and `z` still hold it —
+// consistent with a missed env_pop_scope decref path that operates on a
+// stale-tag HexaValStruct after arena rewind. Canary test: T33b-on in
+// tests/regression_stage1.hexa. Fix is blocked on the stage0 rebuild
+// regression (codegen_c2 FnDecl + forward-decl issue; see task tracker).
+// Keep default OFF until both the canary flips PASS and the module_loader
+// use-path smoke (see ml_resolve heapify discussion above) goes green.
 
 // Per-scope mark stack. Sized for deep recursion (fib(30) ≈ 30 frames; we
 // budget 64K to cover ML stack depths). Overflow falls back to silently
