@@ -80,7 +80,7 @@
 >
 > **[📄 Papers](https://github.com/need-singularity/papers)** — Complete paper collection (94 papers). Published on Zenodo with DOIs. TECS-L+N6 (33) + anima (39) + SEDI (20). [Browse online](https://need-singularity.github.io/papers/)
 >
-> **[💎 HEXA-LANG](https://github.com/need-singularity/hexa-lang)** — The Perfect Number Programming Language. Every constant from n=6: 58 keywords (13 groups), 26 operators (6 groups), 8 primitives, 6-phase pipeline, Egyptian memory (1/2+1/3+1/6=1). DSE v2: 21,952 combos, 100% n6 EXACT. Working compiler + REPL
+> **[💎 HEXA-LANG](https://github.com/need-singularity/hexa-lang)** — The Perfect Number Programming Language. Every constant from n=6: 65 keywords (14 groups), 46 operators (9 groups), 8 primitives, 6-phase pipeline, Egyptian memory (1/2+1/3+1/6=1). DSE v2: 21,952 combos, 100% n6 EXACT. Working compiler + REPL
 >
 > **[🖥️ VOID](https://github.com/need-singularity/void)** — Terminal emulator written 100% in hexa-lang. Zero Rust dependencies — calls OS APIs directly via hexa extern FFI. 6-layer architecture (System/Render/Terminal/UI/Plugin/AI) + Metal/Vulkan GPU + VT 6-tier protocol + NEXUS-6 consciousness integration
 >
@@ -292,11 +292,11 @@ Six is the smallest perfect number (1+2+3 = 6). Every language constant derives 
 | tau(6) | 4 | type layers, visibility levels |
 | phi(6) | 2 | compile modes (AOT/JIT) |
 | sopfr(6) | 5 | error classes |
-| J2(6) | 24 | operator design origin (26 currently implemented) |
+| J2(6) | 24 | operator design origin (46 currently implemented across 9 groups) |
 | sigma-tau | 8 | primitive types |
-| -- | 58 | total keywords (13 groups combined) |
+| -- | 65 | total keywords (14 groups combined) |
 
-Other languages choose these numbers arbitrarily. Rust has 51 keywords -- why 51? No mathematical reason. HEXA has 58 keywords in 13 groups, each group size derived from n=6 arithmetic functions.
+Other languages choose these numbers arbitrarily. Rust has 51 keywords -- why 51? No mathematical reason. HEXA has 65 keywords in 14 groups, each group size derived from n=6 arithmetic functions.
 
 ## Architecture
 
@@ -311,13 +311,13 @@ Source → Tokenize → Parse → Check → Optimize → Codegen → Execute
 
 **4 type layers** (tau = 4): primitive → composite → reference → function
 
-**26 operators** (6 groups): arithmetic(6) + comparison(6) + logical(4) + bitwise(4) + assignment(2) + special(4)
+**46 operators** (9 groups): arithmetic(6) + comparison(6) + logical(4) + bitwise(6) + assignment(8) + special(4) + null_safe(4) + type_check(4) + slice(4)
 
-**58 keywords** in **13 groups**:
+**65 keywords** in **14 groups**:
 
 | Group | Keywords | Count |
 |-------|----------|-------|
-| Control | if, else, match, for, while, loop, break, continue | 8 |
+| Control | if, else, match, for, while, loop, break, continue, do, defer | 10 |
 | Type | type, struct, enum, trait, impl, dyn | 6 |
 | Functions | fn, return, yield, async, await | 5 |
 | Variables | let, mut, const, static | 4 |
@@ -330,6 +330,7 @@ Source → Tokenize → Parse → Check → Optimize → Codegen → Execute
 | Errors | try, catch, throw, panic, recover | 5 |
 | AI | intent, generate, verify, optimize | 4 |
 | FFI | extern | 1 |
+| TypeOps | as, is, in, typeof, step | 5 |
 
 **Memory model** — Egyptian fraction: 1/2 (stack) + 1/3 (heap) + 1/6 (arena) = 1
 
@@ -451,7 +452,7 @@ Live bridge: `./hexa --anima-bridge ws://localhost:8765 file.hexa` routes `inten
 ```
 hexa-lang/
 ├── self/                     1,113 .hexa files (primary source)
-│   ├── lexer.hexa            727 LOC — 58 keywords + 26 operators tokenizer
+│   ├── lexer.hexa            727 LOC — 65 keywords + 46 operators tokenizer
 │   ├── parser.hexa           3,815 LOC — recursive descent parser
 │   ├── interpreter.hexa      10,914 LOC — tree-walk evaluator (270+ builtins)
 │   ├── ast.hexa              AST node types
@@ -521,8 +522,8 @@ hexa-lang/
 
 <!-- AUTO:STATS:START -->
 ```
-  Keywords:      58 (13 groups)
-  Operators:     26 (6 groups)
+  Keywords:      65 (14 groups)
+  Operators:     46 (9 groups)
   Primitives:    8
   DSE combos:    21,952
 ```
