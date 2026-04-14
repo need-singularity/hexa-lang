@@ -616,10 +616,19 @@ Related breakthroughs landed in `shared/hexa-lang/state.json`:
 
 **회귀**: bridge_mvp 12/12 + bridge_arr/map + interpreter regression_stage1 14/14 전부 양 모드 유지.
 
-**rt#36-E 작업 큐 (deferred)**:
-- Lambda emit: free-var 분석 + CLOSURE + N×NEW_CLOSURE_UPVAL
-- CALL-of-closure: sentinel check before proto resolution (closure vs proto_idx)
-- UPVAL binding: per-frame closure-binding 레지스터 (LOAD/STORE_UPVAL wiring)
-- TAILCALL frame-reuse: scope verifier 의존
+**rt#36-E 작업 큐**:
+- ✓ **Lambda emit** (T51, 2026-04-14) — free-var 분석 + CLOSURE + N×NEW_CLOSURE_UPVAL.
+  expr-body Lambda full wiring, `bc_compile_lambda_proto` + `bc_collect_free_vars_*`
+  + Ident 브랜치 upval 라우팅. 5/5 smoke `closure_mvp.hexa` PASS (no-capture/single/
+  multi/two-arg/zero-arg).
+- ✓ **CALL-of-closure** (T51) — `BC_CALL_INDIRECT` (b16=65535) sentinel. Callee 가
+  스택의 args 아래에 위치하면 VM이 closure[1]에서 proto_idx 추출, 프레임에 바인딩.
+- ✓ **LOAD_UPVAL 배선** (T51) — `vm_frame_closure[]` 평행 배열 + 이름 기반 선형
+  탐색. STORE_UPVAL 은 mutable capture 가 T52 (현재는 명시적 trap).
+- TAILCALL frame-reuse: scope verifier 의존 (T52+)
+- STORE_UPVAL mutable captures (T52) — outer 바인딩 동기화는 cell hoisting 필요
+- Block-body lambda `|x| { ... }` (T52) — 현재는 expr-body 만 지원, block 은 RETURN0 stub
+- Nested lambda closure chain (T52) — 현재는 inner lambda 가 outer lambda 의 upval 을
+  경유하지 못함 (free-var scan 이 Lambda 노드를 건너뜀)
 - `hexa run --vm` default flip 검토 (전체 stage1 regression + bench)
 

@@ -69,6 +69,15 @@ let mut vm_frame_proto = []   // int[]  — proto index in bc_protos
 let mut vm_frame_pc    = []   // int[]  — program counter within proto's code
 let mut vm_frame_fp    = []   // int[]  — base offset into vm_locals
 
+// T51 (rt#36-E #1) — per-frame closure binding. Set to a closure
+// value (4-elem array [BC_CLOSURE_TAG, proto_idx, names[], vals[]])
+// when the frame was entered via CALL-of-closure; BC_NIL otherwise.
+// OP_LOAD_UPVAL / OP_STORE_UPVAL consult the top entry to resolve
+// names → values. Parallel with vm_frame_proto/pc/fp (same length
+// invariant: all four grow together on push_frame and shrink together
+// on pop_frame).
+let mut vm_frame_closure = []  // (array|string)[]  — closure or BC_NIL
+
 // Globals table (parallel arrays — keyed by name).
 let mut vm_global_names = []  // string[]
 let mut vm_global_vals  = []  // any[]
@@ -130,6 +139,13 @@ let BC_STRUCT_TAG = "<bc_struct>"
 // by the sentinel before resolving the proto.
 let BC_CLOSURE_TAG = "<bc_closure>"
 
+// T51 (rt#36-E #1) — CALL-of-closure sentinel. When OP_CALL's b16
+// equals this, the callee is the value at stack[top - nargs] and
+// must be closure-shaped (tag BC_CLOSURE_TAG). See bc_emitter.hexa
+// BC_CALL_INDIRECT for the emitter-side definition — values must
+// match.
+let BC_CALL_INDIRECT = 65535
+
 // ── VM init / reset. ────────────────────────────────────────
 
 fn bc_vm_reset() {
@@ -138,6 +154,7 @@ fn bc_vm_reset() {
     vm_frame_proto = []
     vm_frame_pc = []
     vm_frame_fp = []
+    vm_frame_closure = []
     vm_global_names = []
     vm_global_vals = []
     vm_trap = false
@@ -391,9 +408,43 @@ fn bc_vm_push_frame(proto_idx, nargs) {
     }
 
     // Push the frame record.
-    vm_frame_proto = vm_frame_proto.push(proto_idx)
-    vm_frame_pc    = vm_frame_pc.push(0)
-    vm_frame_fp    = vm_frame_fp.push(fp)
+    vm_frame_proto   = vm_frame_proto.push(proto_idx)
+    vm_frame_pc      = vm_frame_pc.push(0)
+    vm_frame_fp      = vm_frame_fp.push(fp)
+    // T51 — parallel closure slot. Direct CALL has no closure binding.
+    vm_frame_closure = vm_frame_closure.push(BC_NIL)
+}
+
+// T51 (rt#36-E #1) — frame push for CALL-of-closure. Operand stack
+// at entry: [..., callee, arg0, ..., arg_{n-1}] where `callee` is a
+// closure-shape 4-elem array. We pop nargs into slots 0..n-1, pop
+// the callee (discard — its proto_idx was extracted by the caller),
+// and push a frame whose closure-slot retains `callee` so LOAD_UPVAL
+// can resolve by name.
+fn bc_vm_push_frame_indirect(proto_idx, nargs, closure) {
+    let target_locals = bc_proto_localcounts[proto_idx]
+    let fp = len(vm_locals)
+    let mut i = 0
+    while i < target_locals {
+        vm_locals = vm_locals.push(BC_NIL)
+        i = i + 1
+    }
+    // Pop args into slots 0..nargs-1 (last-arg-on-top convention).
+    let mut j = nargs - 1
+    while j >= 0 {
+        let v = bc_vm_pop()
+        if vm_trap { return }
+        vm_locals = bc_vm_setat(vm_locals, fp + j, v)
+        j = j - 1
+    }
+    // Pop callee (already captured in `closure`).
+    let _discard = bc_vm_pop()
+    if vm_trap { return }
+
+    vm_frame_proto   = vm_frame_proto.push(proto_idx)
+    vm_frame_pc      = vm_frame_pc.push(0)
+    vm_frame_fp      = vm_frame_fp.push(fp)
+    vm_frame_closure = vm_frame_closure.push(closure)
 }
 
 // Pop the top frame. Does NOT push the return value — caller does.
@@ -408,9 +459,10 @@ fn bc_vm_pop_frame() {
     // Truncate vm_locals back to fp (reclaim callee slots).
     vm_locals = bc_vm_truncate(vm_locals, fp)
     // Shrink frame arrays.
-    vm_frame_proto = bc_vm_truncate(vm_frame_proto, depth - 1)
-    vm_frame_pc    = bc_vm_truncate(vm_frame_pc,    depth - 1)
-    vm_frame_fp    = bc_vm_truncate(vm_frame_fp,    depth - 1)
+    vm_frame_proto   = bc_vm_truncate(vm_frame_proto,   depth - 1)
+    vm_frame_pc      = bc_vm_truncate(vm_frame_pc,      depth - 1)
+    vm_frame_fp      = bc_vm_truncate(vm_frame_fp,      depth - 1)
+    vm_frame_closure = bc_vm_truncate(vm_frame_closure, depth - 1)
 }
 
 // ── Truthiness (for JMPF). ──────────────────────────────────
@@ -758,15 +810,51 @@ fn bc_vm_run_loop() {
         else if op == BC_OP_CALL {
             let nargs = bc_a_of(raw)
             let b16 = bc_b16_of(raw)
-            let target = bc_vm_resolve_call(proto_idx, b16)
-            if target < 0 {
-                vm_trap = true
-                vm_trap_msg = "CALL: cannot resolve target proto"
-                return last_return
+            // T51 (rt#36-E #1) — closure call: callee sits on the
+            // operand stack below the nargs args. Emitter set
+            // b16 = BC_CALL_INDIRECT (65535) to signal this shape.
+            if b16 == BC_CALL_INDIRECT {
+                let n_stack = len(vm_stack)
+                let callee_idx = n_stack - nargs - 1
+                if callee_idx < 0 {
+                    vm_trap = true
+                    vm_trap_msg = "CALL indirect: stack underflow (missing callee)"
+                    return last_return
+                }
+                let callee = vm_stack[callee_idx]
+                // Validate closure shape — 4-elem array, tag slot == BC_CLOSURE_TAG.
+                let mut ok = false
+                let mut target_proto = -1
+                if type_of(callee) == "array" {
+                    if len(callee) == 4 {
+                        if callee[0] == BC_CLOSURE_TAG {
+                            target_proto = callee[1]
+                            if target_proto >= 0 {
+                                if target_proto < len(bc_protos) {
+                                    ok = true
+                                }
+                            }
+                        }
+                    }
+                }
+                if !ok {
+                    vm_trap = true
+                    vm_trap_msg = "CALL indirect: callee is not a closure"
+                    return last_return
+                }
+                bc_vm_push_frame_indirect(target_proto, nargs, callee)
+                if vm_trap { return last_return }
+            } else {
+                let target = bc_vm_resolve_call(proto_idx, b16)
+                if target < 0 {
+                    vm_trap = true
+                    vm_trap_msg = "CALL: cannot resolve target proto"
+                    return last_return
+                }
+                // Stack currently has [..., arg0..arg_{n-1}] on top.
+                bc_vm_push_frame(target, nargs)
+                if vm_trap { return last_return }
             }
-            // Stack currently has [..., arg0..arg_{n-1}] on top.
-            bc_vm_push_frame(target, nargs)
-            if vm_trap { return last_return }
             // Dispatch loop will pick up at callee pc=0 next iter.
         } else if op == BC_OP_RETURN {
             let rv = bc_vm_pop()
@@ -918,19 +1006,65 @@ fn bc_vm_run_loop() {
             let uv_out = [BC_CLOSURE_TAG, uv_pidx, uv_new_names, uv_new_vals]
             bc_vm_push(uv_out)
         }
-        // T47 — LOAD_UPVAL Bx=name_const_idx: look up the named upvalue
-        // on the current frame's closure binding. MVP has no per-frame
-        // closure-binding register yet (the emitter doesn't wire Lambda
-        // calls), so this traps — kept as a stub so the opcode exists
-        // and so the dispatch ladder is exhaustive for the verifier.
+        // T51 (rt#36-E #1) — LOAD_UPVAL Bx=name_const_idx.
+        // Resolve the named upvalue against the current frame's closure
+        // binding (vm_frame_closure[top]). The closure was attached on
+        // CALL-of-closure; LOAD_UPVAL is invalid in a direct-call frame.
+        // The name is read from the EXECUTING proto's const pool — the
+        // emitter interned the upval names in the lambda proto's pool at
+        // compile time (see bc_compile_lambda_proto).
         else if op == BC_OP_LOAD_UPVAL {
-            vm_trap = true
-            vm_trap_msg = "LOAD_UPVAL: closure-frame upvalue binding not wired (rt#36-E)"
-            return last_return
+            let lu_cidx = bc_bx_of(raw)
+            let lu_consts = bc_proto_consts[proto_idx]
+            if lu_cidx >= len(lu_consts) {
+                vm_trap = true
+                vm_trap_msg = "LOAD_UPVAL: const idx out of range"
+                return last_return
+            }
+            let lu_name = lu_consts[lu_cidx]
+            let lu_depth = len(vm_frame_closure)
+            if lu_depth == 0 {
+                vm_trap = true
+                vm_trap_msg = "LOAD_UPVAL: no active frame"
+                return last_return
+            }
+            let lu_cl = vm_frame_closure[lu_depth - 1]
+            let mut lu_found = false
+            let mut lu_val = BC_NIL
+            if type_of(lu_cl) == "array" {
+                if len(lu_cl) == 4 {
+                    if lu_cl[0] == BC_CLOSURE_TAG {
+                        let lu_names = lu_cl[2]
+                        let lu_vals  = lu_cl[3]
+                        let mut lu_i = 0
+                        let lu_n = len(lu_names)
+                        while lu_i < lu_n {
+                            if lu_names[lu_i] == lu_name {
+                                lu_val = lu_vals[lu_i]
+                                lu_found = true
+                                lu_i = lu_n
+                            } else {
+                                lu_i = lu_i + 1
+                            }
+                        }
+                    }
+                }
+            }
+            if !lu_found {
+                vm_trap = true
+                vm_trap_msg = "LOAD_UPVAL: upvalue not bound: " + lu_name
+                return last_return
+            }
+            bc_vm_push(lu_val)
         }
+        // STORE_UPVAL — MVP captures are immutable. Source-level
+        // mutation of a captured binding from inside a lambda is a
+        // T52 feature (requires hoisting to a cell so both the outer
+        // env and the closure share storage). Stay as a trap so the
+        // verifier stays exhaustive and the runtime loudly rejects.
         else if op == BC_OP_STORE_UPVAL {
             vm_trap = true
-            vm_trap_msg = "STORE_UPVAL: closure-frame upvalue binding not wired (rt#36-E)"
+            vm_trap_msg = "STORE_UPVAL: mutable captures deferred (T52)"
             return last_return
         }
         // PRINT (debug-only) — keep adjacent to MISC family for locality.
@@ -1426,10 +1560,12 @@ fn bc_vm_run_loop() {
             vm_try_frame_depth = bc_vm_arr_shrink_last(vm_try_frame_depth)
 
             // Unwind operand + frame stacks to snapshots.
-            vm_stack       = bc_vm_arr_truncate(vm_stack, th_saved_sp)
-            vm_frame_proto = bc_vm_arr_truncate(vm_frame_proto, th_saved_fd)
-            vm_frame_pc    = bc_vm_arr_truncate(vm_frame_pc,    th_saved_fd)
-            vm_frame_fp    = bc_vm_arr_truncate(vm_frame_fp,    th_saved_fd)
+            vm_stack         = bc_vm_arr_truncate(vm_stack, th_saved_sp)
+            vm_frame_proto   = bc_vm_arr_truncate(vm_frame_proto,   th_saved_fd)
+            vm_frame_pc      = bc_vm_arr_truncate(vm_frame_pc,      th_saved_fd)
+            vm_frame_fp      = bc_vm_arr_truncate(vm_frame_fp,      th_saved_fd)
+            // T51 — keep closure parallel with the other frame arrays.
+            vm_frame_closure = bc_vm_arr_truncate(vm_frame_closure, th_saved_fd)
 
             // Push thrown value; handler consumes via STORE_LOCAL.
             bc_vm_push(th_val)
