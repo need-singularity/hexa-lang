@@ -554,7 +554,8 @@ Before opening rt#36-B:
 | A | Design doc + `self/bytecode.h` + `bytecode_interp.c.stub` + `rt36_bc_hello.hexa` | done | 2026-04-13 | — |
 | B | AST→BC emitter `self/bc_emitter.hexa` (47 KB pure-hexa) — post-order Decl/Stmt/Expr → HexaFnProto + constant-pool interning + local/upval slot resolution + forward jump patching + struct shape_id assignment + closure upval capture | done | 2026-04-13 | — |
 | C | Dispatch loop `self/bc_vm.hexa` — 29 / 62 opcodes implemented; smoke 22/22 PASS; golden bytecode smoke collatz + primes 5/5 PASS; `hexa run --vm <file.hexa>` wired in `self/main.hexa` (+56 lines) | in_progress | 2026-04-14 | b8b5e97 |
-| D | Full coverage + verify_suite + ≥2×/≥3× perf on fib/call_heavy | pending (blocked by C 33 opcodes remaining) | — | — |
+| C | AST→BC bridge MVP 12/12 PASS — AssignStmt + forward-decl patch (T41); Break/Continue/CompoundAssign emit (T42); HEXA_VAL_ARENA default ON after T31/T33/T37/T40 closure (T43). New emit nodes pulled opcode coverage to ~47/62 (≈75.8 %). 3 deferred (Array / Index / MapLit) blocked on VM opcodes (NEW_ARRAY body / LOAD_INDEX / NEW_MAP). | landed | 2026-04-14 | 90b01a0 · 79f438c · 3ae3d7a |
+| D | Full coverage + verify_suite + ≥2×/≥3× perf on fib/call_heavy | pending (blocked on remaining ~15 VM opcodes + default `--vm` flip) | — | — |
 
 Phase C headline numbers (2026-04-14):
 
@@ -570,4 +571,7 @@ Related breakthroughs landed in `shared/hexa-lang/state.json`:
 * `BT_RT36_B` (2026-04-13) — bc_emitter.hexa 47 KB
 * `BT_RT36_C` (2026-04-14) — bc_vm.hexa 29 opcodes + smoke 22/22 + golden 5/5
 * `BT_RT36_CLI` (2026-04-14) — `hexa run --vm` CLI flag
+* `BT_T41_BRIDGE_UNBLOCK` (2026-04-14, 90b01a0) — AST→BC bridge MVP 12/12 PASS (recursive fib, while, if/else)
+* `BT_T42_PHASE1_CTRL` (2026-04-14, 79f438c) — Break / Continue / CompoundAssign emit path (3 deferred: Array / Index / MapLit waiting on VM opcodes)
+* `BT_T43_ARENA_DEFAULT_ON` (2026-04-14, 3ae3d7a) — HEXA_VAL_ARENA default flip; T31/T33/T37/T40 all closed
 

@@ -89,6 +89,13 @@ let mut vm_halted = false
 // type-confusion bugs easy to spot in test output.
 let BC_NIL = "<nil>"
 
+// T44 map-shape tag. Maps live on the VM stack as a 3-element
+// array ["<bc_map>", keys[], vals[]] — the leading tag lets
+// OP_ARR_GET dispatch between array indexing and parallel-array
+// linear-scan without heuristics. Distinct, reserved, rarely
+// appears in user data so false positives are negligible.
+let BC_MAP_TAG = "<bc_map>"
+
 // ── VM init / reset. ────────────────────────────────────────
 
 fn bc_vm_reset() {
@@ -761,6 +768,222 @@ fn bc_vm_run_loop() {
                 vm_trap_msg = "ASSERT_FLOAT failed: got " + type_of(v)
                 return last_return
             }
+        }
+
+        // ──────── ARRAY / MAP OPCODES (rt#36-C Phase 1 — T44) ────────
+        // Collection values live on the operand stack as hexa-native
+        // arrays (`[]`) and maps (`#{}`). This trades VM portability
+        // for simplicity: we do NOT wire into interpreter's
+        // array_store / map_store (which are IR-time heap tables
+        // scoped to the tree-walker); stage0 hexa's intrinsic dict
+        // + array already supply `arr[i]`, `arr.push(v)`, `len(arr)`,
+        // `m[k]`, `m.set(k,v)` — all immutable / value-returning
+        // which is exactly the semantic these opcodes need.
+        //
+        // NEW_ARRAY B — pop B values, build array, push.
+        //   Items were pushed left-to-right so the LAST item is on
+        //   top; we walk right-to-left while popping, then reverse
+        //   the collected buffer to restore source order.
+        else if op == BC_OP_NEW_ARRAY {
+            let count = bc_b16_of(raw)
+            let mut buf = []
+            let mut k = 0
+            while k < count {
+                buf = buf.push(bc_vm_pop())
+                if vm_trap { return last_return }
+                k = k + 1
+            }
+            // Reverse into source order.
+            let mut arr = []
+            let mut j = count - 1
+            while j >= 0 {
+                arr = arr.push(buf[j])
+                j = j - 1
+            }
+            bc_vm_push(arr)
+        }
+        // ARR_GET — pops idx, pops arr, pushes arr[idx].
+        //
+        //   Polymorphic dispatch: the emitter uses this opcode for
+        //   any `x[k]` source pattern because stage1 hexa has no
+        //   static type info to tell arrays from maps. We detect
+        //   the NEW_MAP-produced shape ["<bc_map>", keys, vals] by
+        //   its leading BC_MAP_TAG sentinel and route to a linear
+        //   key scan; otherwise fall back to hexa-native indexing.
+        else if op == BC_OP_ARR_GET {
+            let idx = bc_vm_pop()
+            let arr = bc_vm_pop()
+            if vm_trap { return last_return }
+            let mut is_map_shape = false
+            if type_of(arr) == "array" {
+                if len(arr) == 3 {
+                    if arr[0] == BC_MAP_TAG {
+                        is_map_shape = true
+                    }
+                }
+            }
+            if is_map_shape {
+                let mks = arr[1]
+                let mvs = arr[2]
+                let mkn = len(mks)
+                let mut mi = 0
+                let mut mhit = BC_NIL
+                while mi < mkn {
+                    if mks[mi] == idx {
+                        mhit = mvs[mi]
+                        mi = mkn
+                    } else {
+                        mi = mi + 1
+                    }
+                }
+                bc_vm_push(mhit)
+            } else {
+                bc_vm_push(arr[idx])
+            }
+        }
+        // ARR_SET — pops val, idx, arr; pushes new arr with arr[idx]=val.
+        //   Uses the existing bc_vm_setat helper (rebuild one slot).
+        //   Semantically matches hexa's value-returning array update.
+        else if op == BC_OP_ARR_SET {
+            let v = bc_vm_pop()
+            let idx = bc_vm_pop()
+            let arr = bc_vm_pop()
+            if vm_trap { return last_return }
+            bc_vm_push(bc_vm_setat(arr, idx, v))
+        }
+        // ARR_PUSH — pops val, arr; pushes arr.push(val) (immutable).
+        else if op == BC_OP_ARR_PUSH {
+            let v = bc_vm_pop()
+            let arr = bc_vm_pop()
+            if vm_trap { return last_return }
+            bc_vm_push(arr.push(v))
+        }
+        // ARR_LEN — pops arr; pushes len(arr).
+        //   Polymorphic: a BC_MAP_TAG-tagged 3-element shape reports
+        //   its pair count (len of the keys slot) — matches what
+        //   `len(m)` on a hexa dict would return.
+        else if op == BC_OP_ARR_LEN {
+            let arr = bc_vm_pop()
+            if vm_trap { return last_return }
+            let mut n = 0
+            if type_of(arr) == "array" {
+                if len(arr) == 3 {
+                    if arr[0] == BC_MAP_TAG {
+                        n = len(arr[1])
+                    } else {
+                        n = len(arr)
+                    }
+                } else {
+                    n = len(arr)
+                }
+            } else {
+                n = len(arr)
+            }
+            bc_vm_push(n)
+        }
+        // NEW_MAP B — pops 2B values (key/val pairs, emitted in
+        //   source order), builds map, pushes it.
+        //
+        //   Implementation note: hexa_v2 (the C transpiler used to
+        //   build stage0) does NOT dispatch `.set()` as a method on
+        //   maps — only `#{k:v}` LITERALS are recognized for dict
+        //   construction, and those must be fully static. To build a
+        //   dynamic map here we therefore represent map values as
+        //   parallel arrays: `[keys, values]` (a 2-element outer
+        //   array whose first slot is the key array and second is
+        //   the value array). MAP_GET does linear scan; MAP_SET
+        //   appends or overwrites. This matches how interpreter.hexa
+        //   models its map_store (see T33 notes in runtime.c) and
+        //   stays fully within hexa's native array ops.
+        //
+        //   Emit order: push k0, v0, k1, v1, ..., so v_{B-1} is on
+        //   top. Pop in reverse; reinsert in source order.
+        else if op == BC_OP_NEW_MAP {
+            let pair_count = bc_b16_of(raw)
+            let mut kbuf = []
+            let mut vbuf = []
+            let mut k2 = 0
+            while k2 < pair_count {
+                let vp = bc_vm_pop()
+                let kp = bc_vm_pop()
+                if vm_trap { return last_return }
+                kbuf = kbuf.push(kp)
+                vbuf = vbuf.push(vp)
+                k2 = k2 + 1
+            }
+            // Reverse into source order.
+            let mut keys = []
+            let mut vals = []
+            let mut j2 = pair_count - 1
+            while j2 >= 0 {
+                keys = keys.push(kbuf[j2])
+                vals = vals.push(vbuf[j2])
+                j2 = j2 - 1
+            }
+            // Tagged map shape: [BC_MAP_TAG, keys, vals].
+            let m2 = [BC_MAP_TAG, keys, vals]
+            bc_vm_push(m2)
+        }
+        // MAP_GET — pops key, map; pushes map[key] (BC_NIL if absent).
+        //   Linear scan over the keys array; returns the parallel
+        //   value on hit. Miss returns BC_NIL so subsequent ops do
+        //   not crash — matches the interpreter's "void on miss"
+        //   behavior that source-level code already tolerates.
+        //
+        //   Note: the emitter currently routes Index AST nodes to
+        //   OP_ARR_GET (polymorphic). OP_MAP_GET is reserved for
+        //   future explicit map-access lowerings (e.g. when an
+        //   emitter upgrade gains enough type info to disambiguate).
+        else if op == BC_OP_MAP_GET {
+            let key_mg = bc_vm_pop()
+            let m_mg = bc_vm_pop()
+            if vm_trap { return last_return }
+            let keys_mg = m_mg[1]
+            let vals_mg = m_mg[2]
+            let nk = len(keys_mg)
+            let mut i_mg = 0
+            let mut hit_val = BC_NIL
+            while i_mg < nk {
+                if keys_mg[i_mg] == key_mg {
+                    hit_val = vals_mg[i_mg]
+                    i_mg = nk
+                } else {
+                    i_mg = i_mg + 1
+                }
+            }
+            bc_vm_push(hit_val)
+        }
+        // MAP_SET — pops val, key, map; pushes updated map.
+        //   If key already exists, rebuild values with v patched in.
+        //   Else append key/value to each parallel array.
+        else if op == BC_OP_MAP_SET {
+            let v_ms = bc_vm_pop()
+            let key_ms = bc_vm_pop()
+            let m_ms = bc_vm_pop()
+            if vm_trap { return last_return }
+            let keys_ms = m_ms[1]
+            let vals_ms = m_ms[2]
+            let nk2 = len(keys_ms)
+            let mut found_idx = -1
+            let mut i_ms = 0
+            while i_ms < nk2 {
+                if keys_ms[i_ms] == key_ms {
+                    found_idx = i_ms
+                    i_ms = nk2
+                } else {
+                    i_ms = i_ms + 1
+                }
+            }
+            let mut new_keys = keys_ms
+            let mut new_vals = vals_ms
+            if found_idx >= 0 {
+                new_vals = bc_vm_setat(vals_ms, found_idx, v_ms)
+            } else {
+                new_keys = keys_ms.push(key_ms)
+                new_vals = vals_ms.push(v_ms)
+            }
+            let m2b = [BC_MAP_TAG, new_keys, new_vals]
+            bc_vm_push(m2b)
         }
 
         // ──────── UNIMPLEMENTED OPCODES ────────

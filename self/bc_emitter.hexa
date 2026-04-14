@@ -475,6 +475,63 @@ fn bc_mk_if_expr(cond_idx, then_start, then_end, else_start, else_end) {
     return len(bc_node_pool) - 1
 }
 
+// T44 Phase 1 — Array / Index / MapLit builders.
+// These reuse the existing args_start/args_end slice of bc_arg_list
+// to hold a contiguous list of child node indices. The AST bridge
+// (ast_to_bc_expr) populates the slice in source order.
+
+// Array literal: [e0, e1, ..., eN-1] — items is a slice in bc_arg_list.
+// `int_val` stashes the item count as a sanity check (emitter reads
+// it straight; VM reads from OP_NEW_ARRAY's B16 operand).
+fn bc_mk_array(items_start, items_end) {
+    let n = BcNode {
+        kind: "ArrayLit",
+        int_val: items_end - items_start,
+        float_val: 0.0, bool_val: false,
+        str_val: "", name: "", op: "",
+        left_idx: -1, right_idx: -1,
+        body_start: -1, body_end: -1, else_start: -1, else_end: -1,
+        args_start: items_start, args_end: items_end,
+        n_params: 0, params_start: -1, params_end: -1
+    }
+    bc_node_pool = bc_node_pool.push(n)
+    return len(bc_node_pool) - 1
+}
+
+// Index expression: arr[idx] — left_idx = arr, right_idx = idx.
+fn bc_mk_index(arr_idx, index_idx) {
+    let n = BcNode {
+        kind: "IndexExpr",
+        int_val: 0, float_val: 0.0, bool_val: false,
+        str_val: "", name: "", op: "",
+        left_idx: arr_idx, right_idx: index_idx,
+        body_start: -1, body_end: -1, else_start: -1, else_end: -1,
+        args_start: -1, args_end: -1,
+        n_params: 0, params_start: -1, params_end: -1
+    }
+    bc_node_pool = bc_node_pool.push(n)
+    return len(bc_node_pool) - 1
+}
+
+// Map literal: #{ k0: v0, k1: v1, ... } — the bridge flattens pairs
+// into bc_arg_list as alternating key,value,key,value. args_end -
+// args_start must therefore be even; int_val stores pair count.
+fn bc_mk_map_lit(items_start, items_end) {
+    let pair_count = (items_end - items_start) / 2
+    let n = BcNode {
+        kind: "MapLit",
+        int_val: pair_count,
+        float_val: 0.0, bool_val: false,
+        str_val: "", name: "", op: "",
+        left_idx: -1, right_idx: -1,
+        body_start: -1, body_end: -1, else_start: -1, else_end: -1,
+        args_start: items_start, args_end: items_end,
+        n_params: 0, params_start: -1, params_end: -1
+    }
+    bc_node_pool = bc_node_pool.push(n)
+    return len(bc_node_pool) - 1
+}
+
 fn bc_mk_let_stmt(name, value_idx) {
     let n = BcNode {
         kind: "LetStmt", int_val: 0, float_val: 0.0, bool_val: false,
@@ -916,6 +973,18 @@ fn bc_compile_expr(idx) {
             return
         }
 
+        // T44 Phase 1 — `len(x)` is a builtin: lower to OP_ARR_LEN.
+        // Works for arrays (int length) and polymorphic for maps
+        // (len of hexa dict returns pair count natively). Requires
+        // exactly 1 arg; otherwise fall through to the generic CALL
+        // path so downstream error stays loud.
+        if fname == "len" && nargs == 1 {
+            let _r = bc_emit_raw(bc_enc_abx(BC_OP_ARR_LEN, 0))
+            bc_pop(nargs)
+            bc_push1()
+            return
+        }
+
         // User function — look up by name in bc_protos.
         let pidx = bc_lookup_proto(fname)
         if pidx >= 0 {
@@ -976,6 +1045,74 @@ fn bc_compile_expr(idx) {
             let delta_j = end_pc - (jmp_pc + 1)
             bc_patch_code(jmp_pc, bc_enc_sbx(BC_OP_JMP, delta_j))
         }
+        return
+    }
+
+    // T44 Phase 1 — ArrayLit: push each item left-to-right, then
+    // emit OP_NEW_ARRAY with B16 = item count. The VM pops exactly
+    // that many values (source order restored) and builds the array.
+    if k == "ArrayLit" {
+        let mut ai = node.args_start
+        let mut nitems = 0
+        if ai >= 0 {
+            while ai < node.args_end {
+                let iidx = bc_arg_list[ai]
+                bc_compile_expr(iidx)
+                ai = ai + 1
+                nitems = nitems + 1
+            }
+        }
+        // NEW_ARRAY uses Layout C (op | A | B16). We only need B16
+        // for the count — put it there so the VM can decode with
+        // bc_b16_of(raw). A is left 0 (reserved / spec-compatible).
+        let _r = bc_emit_raw(bc_enc_ab16(BC_OP_NEW_ARRAY, 0, nitems))
+        bc_pop(nitems)
+        bc_push1()
+        return
+    }
+
+    // T44 Phase 1 — IndexExpr: `arr[idx]` lowers to push arr, push
+    // idx, OP_ARR_GET. Stack effect (-2, +1). Works for both arrays
+    // (int idx) and maps (any idx) because the VM dispatches to
+    // hexa's native `x[k]` which is polymorphic across array/dict.
+    if k == "IndexExpr" {
+        bc_compile_expr(node.left_idx)   // array / map
+        bc_compile_expr(node.right_idx)  // index / key
+        let _r = bc_emit_raw(bc_enc_abx(BC_OP_ARR_GET, 0))
+        bc_pop(1)  // (-2,+1) net -1 after the two pushes above
+        return
+    }
+
+    // T44 Phase 1 — MapLit: pair list is flattened into bc_arg_list
+    // as alternating key,value,key,value,... Push each in source
+    // order, emit OP_NEW_MAP with B16 = pair count.
+    if k == "MapLit" {
+        let mut mi = node.args_start
+        let mut npairs = 0
+        if mi >= 0 {
+            while mi < node.args_end {
+                // key
+                let kidx = bc_arg_list[mi]
+                bc_compile_expr(kidx)
+                mi = mi + 1
+                // value (slice length was validated to be even by
+                // bc_mk_map_lit; if mi == args_end here something is
+                // wrong — emit LOADNIL to keep the stack balanced).
+                if mi < node.args_end {
+                    let vidx = bc_arg_list[mi]
+                    bc_compile_expr(vidx)
+                    mi = mi + 1
+                } else {
+                    let _rn = bc_emit_raw(bc_enc_abx(BC_OP_LOADNIL, 0))
+                    bc_push1()
+                }
+                npairs = npairs + 1
+            }
+        }
+        let _r = bc_emit_raw(bc_enc_ab16(BC_OP_NEW_MAP, 0, npairs))
+        // -2N pops (each pair), +1 push for the map.
+        bc_pop(npairs * 2)
+        bc_push1()
         return
     }
 
@@ -1577,6 +1714,13 @@ fn bc_disasm_insn(raw) {
     if op == BC_OP_TRY {
         return name + " " + to_string(bc_sbx_of(raw))
     }
+    // T44 Phase 1 — NEW_ARRAY / NEW_MAP use Layout C with B16 = count.
+    if op == BC_OP_NEW_ARRAY {
+        return name + " " + to_string(bc_b16_of(raw))
+    }
+    if op == BC_OP_NEW_MAP {
+        return name + " " + to_string(bc_b16_of(raw))
+    }
     // Default: unsigned Bx.
     return name + " " + to_string(bc_bx_of(raw))
 }
@@ -1764,6 +1908,74 @@ fn ast_to_bc_expr(node) {
             }
         }
         return bc_mk_if_expr(ci, ts_start, ts_end, es_start, es_end)
+    }
+
+    // T44 Phase 1 — Array literal. Parser uses kind "Array" with
+    // node.items as the list of item expr dicts (see
+    // self/hexa_full.hexa L3180-3185). Flatten child indices
+    // contiguously into bc_arg_list, matching the Call-args trick.
+    if k == "Array" {
+        let raw_items = node.items
+        let mut item_idxs = []
+        if type_of(raw_items) == "array" {
+            let mut i = 0
+            while i < len(raw_items) {
+                let iidx = ast_to_bc_expr(raw_items[i])
+                item_idxs = item_idxs.push(iidx)
+                i = i + 1
+            }
+        }
+        let istart = len(bc_arg_list)
+        let mut j = 0
+        while j < len(item_idxs) {
+            bc_arg_list = bc_arg_list.push(item_idxs[j])
+            j = j + 1
+        }
+        let iend = len(bc_arg_list)
+        return bc_mk_array(istart, iend)
+    }
+
+    // T44 Phase 1 — Index expression (`arr[idx]` / `m[k]`). Parser
+    // produces kind "Index" with node.left (container) and
+    // node.right (subscript expr). See self/hexa_full.hexa L2882.
+    if k == "Index" {
+        let li = ast_to_bc_expr(node.left)
+        let ri = ast_to_bc_expr(node.right)
+        return bc_mk_index(li, ri)
+    }
+
+    // T44 Phase 1 — Map literal (`#{ k: v, ... }`). Parser produces
+    // kind "MapLit" with node.items = list of MapEntry dicts; each
+    // MapEntry has .left = key expr, .right = value expr
+    // (self/hexa_full.hexa L3196-3214). We flatten into bc_arg_list
+    // as alternating key,value,key,value — bc_compile_expr reads
+    // the same layout.
+    if k == "MapLit" {
+        let raw_items = node.items
+        let mut flat_idxs = []
+        if type_of(raw_items) == "array" {
+            let mut i = 0
+            while i < len(raw_items) {
+                let pair = raw_items[i]
+                // Defensive: skip malformed entries (stage1 parser
+                // guarantees MapEntry shape, but stay robust).
+                if type_of(pair) == "struct" || type_of(pair) == "map" {
+                    let kidx = ast_to_bc_expr(pair.left)
+                    let vidx = ast_to_bc_expr(pair.right)
+                    flat_idxs = flat_idxs.push(kidx)
+                    flat_idxs = flat_idxs.push(vidx)
+                }
+                i = i + 1
+            }
+        }
+        let mstart = len(bc_arg_list)
+        let mut j = 0
+        while j < len(flat_idxs) {
+            bc_arg_list = bc_arg_list.push(flat_idxs[j])
+            j = j + 1
+        }
+        let mend = len(bc_arg_list)
+        return bc_mk_map_lit(mstart, mend)
     }
 
     // Unsupported expr — return a harmless IntLit 0 placeholder.
