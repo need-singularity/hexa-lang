@@ -1,0 +1,881 @@
+// self/runtime.hexa — HEXA runtime extraction Phase B (RUNTIME split: 24 fn)
+// ═══════════════════════════════════════════════════════════
+//  SSOT: self/hexa_full.hexa (L4445-L15390, RUNTIME domain)
+//  This file is a byte-identical re-copy of 24 selected RUNTIME fns
+//  from hexa_full.hexa — SSOT remains hexa_full; removal is forbidden.
+//
+//  Categories (24 = 7 proof + 3 fuse + 2 match + 12 stack):
+//    proof: proof_var / proof_bool / proof_int / proof_eq / proof_implies
+//           / expr_to_proof_expr / execute_proof_block_stmt
+//    fuse:  fuse_sentinel / is_fuse_terminal / try_fuse_chain
+//    match: vals_equal / match_pattern
+//    stack: env_hash / env_cache_init / env_rebuild_cache
+//           / fn_cache_init / fn_cache_add / fn_rebuild_cache
+//           / env_push_scope / env_pop_scope / env_define / env_lookup
+//           / env_set / format_stack_trace
+//
+//  Extraction rules (per Phase B plan):
+//    - fn bodies copied verbatim (no edits)
+//    - struct Val + TAG_* constants + globals included for context only
+//    - this file is NOT self-contained: call-sites reference external
+//      fns (eval_expr, call_fn_val, call_builtin, val_void, val_bool,
+//      val_array, val_int, val_float, val_str, val_map, array_incref,
+//      array_decref, struct_incref, struct_decref, get_array, get_map_keys,
+//      get_map_values, get_enum_data, is_truthy, to_int, to_float)
+//      which live elsewhere in hexa_full — see dependency block below.
+//
+//  External deps (must stay in hexa_full or be provided by runtime_core):
+//    eval_expr (L6120)         — AST evaluator entry
+//    call_fn_val (L8521)       — fn value invocation
+//    call_builtin (L8737)      — host builtin dispatch
+//    val_void (L4683)          — Val{TAG_VOID} singleton
+//    val_bool (L4681)          — Val{TAG_BOOL} singleton
+//    val_array (L14530)        — array_store creator
+//    val_int / val_float / val_str / val_map
+//    array_incref/decref (L14556,14562)
+//    struct_incref/decref (L14802,14808)
+//    get_array (L14601) / get_map_keys (L14696) / get_map_values (L14700)
+//    get_enum_data (L14866)
+//    is_truthy (L14321)
+//    to_int / to_float (builtin)
+//    env_define  — recursive back-reference from match_pattern
+//    exec_stmt_at (L7404) — referenced by exec_try_catch (not extracted)
+//    format_stack_trace → call_stack global
+// ═══════════════════════════════════════════════════════════
+
+// ── Val tag constants (mirror of hexa_full L4567-4586) ───────
+let TAG_INT = 0
+let TAG_FLOAT = 1
+let TAG_BOOL = 2
+let TAG_STR = 3
+let TAG_CHAR = 4
+let TAG_ARRAY = 5
+let TAG_FN = 6
+let TAG_STRUCT = 7
+let TAG_VOID = 8
+let TAG_ENUM = 9
+let TAG_MAP = 10
+let TAG_TENSOR = 11
+let TAG_ERROR = 12
+let TAG_POINTER = 13
+let TAG_CHANNEL = 14
+let TAG_EFFECT_REQUEST = 15
+let TAG_ATOMIC = 16
+let TAG_BIGINT = 17
+let TAG_NOT_BUILTIN = 18
+let TAG_NOT_FUSED = 19
+
+// ── Val struct (mirror of hexa_full L4612-4625) ──────────────
+struct Val {
+    tag: int,
+    int_val: int,
+    float_val: float,
+    bool_val: bool,
+    str_val: string,
+    char_val: string,
+    array_val: string,
+    fn_name: string,
+    fn_params: string,
+    fn_body: string,
+    struct_name: string,
+    struct_fields: string
+}
+
+// ── Globals referenced by env_/fn_cache helpers (context) ────
+// These are DECLARED here as pub let mut so hexa_v2 transpile can
+// resolve identifiers. In the actual self-host binary they live
+// in hexa_full (L4698-4740) — do NOT define twice in link time.
+pub let mut env_var_names = []
+pub let mut env_var_vals = []
+pub let mut env_vars = []
+pub let mut env_scopes = [0]
+pub let mut env_cache_names = []
+pub let mut env_cache_idxs = []
+pub let mut env_cache = []
+pub let mut env_scope_dirty = []
+pub let mut env_fns = []
+pub let mut fn_cache = []
+pub let mut throw_flag = false
+pub let mut throw_val = Val { tag: TAG_VOID, int_val: 0, float_val: 0.0, bool_val: false, str_val: "", char_val: "", array_val: "", fn_name: "", fn_params: "", fn_body: "", struct_name: "", struct_fields: "" }
+pub let mut call_stack = []
+
+// ═══════════════════════════════════════════════════════════
+// proof (7 fn) — hexa_full L5486-5500, L5502-5573
+// ═══════════════════════════════════════════════════════════
+
+fn proof_var(name) { return ["var", name] }
+fn proof_bool(b) { return ["bool", b] }
+fn proof_int(n) { return ["int", n] }
+fn proof_eq(l, r) { return ["eq", l, r] }
+fn proof_implies(l, r) { return ["implies", l, r] }
+
+fn expr_to_proof_expr(expr) {
+    if type_of(expr) == "string" { return proof_unknown("string_expr") }
+    let k = expr.kind
+    if k == "Ident" { return proof_var(expr.name) }
+    if k == "BoolLit" { return proof_bool(expr.value) }
+    if k == "IntLit" { return proof_int(expr.value) }
+    if k == "Binary" {
+        let l = expr_to_proof_expr(expr.left)
+        let r = expr_to_proof_expr(expr.right)
+        let op = expr.op
+        if op == "&&" || op == "and" { return proof_and(l, r) }
+        if op == "||" || op == "or" { return proof_or(l, r) }
+        if op == "==" { return proof_eq(l, r) }
+        if op == "<" { return proof_lt(l, r) }
+        if op == ">" { return proof_gt(l, r) }
+        if op == "<=" { return proof_le(l, r) }
+        if op == ">=" { return proof_ge(l, r) }
+        if op == "+" { return proof_add(l, r) }
+        if op == "->" || op == "=>" { return proof_implies(l, r) }
+        return proof_unknown("binop_" + op)
+    }
+    if k == "Unary" && expr.op == "!" {
+        return proof_not(expr_to_proof_expr(expr.operand))
+    }
+    if k == "Call" {
+        // parser AST stores callee in `left` field, not `callee`
+        let callee = expr.left
+        if type_of(callee) != "string" && callee.kind == "Ident" {
+            let mut p_args = []
+            for a in expr.args { p_args = p_args.push(expr_to_proof_expr(a)) }
+            return proof_fn_call(callee.name, p_args)
+        }
+        return proof_unknown("unknown_call")
+    }
+    return proof_unknown("expr_" + k)
+}
+
+// execute_proof_block_stmt(stmt) — dispatch a single proof block statement.
+//   Returns ["proved" | "refuted" | "skipped" | "unknown", message]
+fn execute_proof_block_stmt(stmt) {
+    if type_of(stmt) == "string" { return ["skipped", "string_stmt"] }
+    let k = stmt.kind
+    let mut req = val_void()
+    if k == "ForAll" {
+        let cond_pe = expr_to_proof_expr(stmt.condition)
+        let conc_pe = expr_to_proof_expr(stmt.conclusion)
+        req = ["forall", cond_pe, conc_pe]
+    }
+    if k == "Exists" {
+        let cond_pe = expr_to_proof_expr(stmt.condition)
+        req = ["exists", cond_pe]
+    }
+    if k == "Assert" || k == "AssertStmt" {
+        let pe = expr_to_proof_expr(stmt.left)
+        req = ["assert", pe]
+    }
+    if k == "Invariant" {
+        // parser uses .left for the expression (not .expr)
+        let pe = expr_to_proof_expr(stmt.left)
+        req = ["assert", pe]
+    }
+    if k == "CheckLaw" {
+        req = ["check_law", stmt.n]
+    }
+    if type_of(req) != "string" && req.tag == TAG_VOID {
+        return ["skipped", "unknown_proof_stmt_kind"]
+    }
+    // Delegate to host proof engine if available
+    let host = call_builtin("__host_proof_check", [req])
+    if host.tag != TAG_NOT_BUILTIN { return host }
+    return ["skipped", "host runtime does not expose __host_proof_check"]
+}
+
+// ═══════════════════════════════════════════════════════════
+// fuse (3 fn) — hexa_full L5583-5784
+// ═══════════════════════════════════════════════════════════
+
+fn fuse_sentinel() {
+    return Val { tag: TAG_NOT_FUSED, int_val: 0, float_val: 0.0, bool_val: false, str_val: "", char_val: "", array_val: "", fn_name: "", fn_params: "", fn_body: "", struct_name: "", struct_fields: "" }
+}
+
+fn is_fuse_terminal(method) {
+    if method == "map" { return true }
+    if method == "filter" { return true }
+    if method == "fold" { return true }
+    if method == "sum" { return true }
+    if method == "count" { return true }
+    if method == "any" { return true }
+    if method == "all" { return true }
+    if method == "find" { return true }
+    return false
+}
+
+fn try_fuse_chain(obj_expr, final_method, final_args) {
+    if !is_fuse_terminal(final_method) { return fuse_sentinel() }
+    // Walk the chain: collect (method, args) pairs, terminating at non-map/filter
+    let mut ops_methods = [final_method]
+    let mut ops_args = [final_args]
+    let mut current = obj_expr
+    let mut walking = true
+    while walking {
+        if type_of(current) == "string" { walking = false } else {
+            // Defensive: parser may emit non-struct stub on syntax error
+            if type_of(current) != "struct" && type_of(current) != "map" { walking = false } else {
+                if current.kind == "Call" {
+                    // parser AST stores callee in `left` field
+                    let callee = current.left
+                    if type_of(callee) != "string" && (callee.kind == "Field" || callee.kind == "OptField") {
+                        let m = callee.name
+                        if m == "map" || m == "filter" {
+                            ops_methods = ops_methods.push(m)
+                            ops_args = ops_args.push(current.args)
+                            current = callee.left
+                        } else { walking = false }
+                    } else { walking = false }
+                } else { walking = false }
+            }
+        }
+    }
+    if len(ops_methods) < 2 { return fuse_sentinel() }
+    // Reverse to execution order (innermost first)
+    let mut rev_methods = []
+    let mut rev_args = []
+    let mut ri = len(ops_methods) - 1
+    while ri >= 0 {
+        rev_methods = rev_methods.push(ops_methods[ri])
+        rev_args = rev_args.push(ops_args[ri])
+        ri = ri - 1
+    }
+    // Evaluate root
+    let root = eval_expr(current)
+    if root.tag != TAG_ARRAY { return fuse_sentinel() }
+    let arr = get_array(root)
+    // Evaluate closures (may be void for sum/count)
+    let mut closures = []
+    let mut ci = 0
+    while ci < len(rev_methods) {
+        let m = rev_methods[ci]
+        if m == "sum" || m == "count" {
+            closures = closures.push(val_void())
+        } else {
+            let aa = rev_args[ci]
+            if len(aa) == 0 { return fuse_sentinel() }
+            closures = closures.push(eval_expr(aa[0]))
+        }
+        ci = ci + 1
+    }
+    let last_method = rev_methods[len(rev_methods) - 1]
+    let chain_len = len(rev_methods)
+    // map/filter terminal → array result
+    if last_method == "map" || last_method == "filter" {
+        let mut result = []
+        for item in arr {
+            let mut val = item
+            let mut keep = true
+            let mut mi = 0
+            while mi < chain_len && keep {
+                let m = rev_methods[mi]
+                let f = closures[mi]
+                if m == "map" {
+                    val = call_fn_val(f, [val])
+                } else {
+                    if m == "filter" {
+                        let test = call_fn_val(f, [val])
+                        if !is_truthy(test) { keep = false }
+                    }
+                }
+                mi = mi + 1
+            }
+            if keep { result = result.push(val) }
+        }
+        return val_array(result)
+    }
+    // fold terminal: needs init + fn (skip last in chain loop, fold separately)
+    if last_method == "fold" {
+        let fold_args_raw = rev_args[chain_len - 1]
+        if len(fold_args_raw) < 2 { return fuse_sentinel() }
+        let mut acc = eval_expr(fold_args_raw[0])
+        let fold_fn = eval_expr(fold_args_raw[1])
+        for item in arr {
+            let mut val = item
+            let mut keep = true
+            let mut mi = 0
+            while mi < chain_len - 1 && keep {
+                let m = rev_methods[mi]
+                let f = closures[mi]
+                if m == "map" { val = call_fn_val(f, [val]) }
+                else { if m == "filter" {
+                    let test = call_fn_val(f, [val])
+                    if !is_truthy(test) { keep = false }
+                } }
+                mi = mi + 1
+            }
+            if keep { acc = call_fn_val(fold_fn, [acc, val]) }
+        }
+        return acc
+    }
+    // sum / count
+    if last_method == "sum" {
+        let mut int_sum = 0
+        let mut has_float = false
+        let mut float_sum = 0.0
+        for item in arr {
+            let mut val = item
+            let mut keep = true
+            let mut mi = 0
+            while mi < chain_len - 1 && keep {
+                let m = rev_methods[mi]
+                let f = closures[mi]
+                if m == "map" { val = call_fn_val(f, [val]) }
+                else { if m == "filter" {
+                    let test = call_fn_val(f, [val])
+                    if !is_truthy(test) { keep = false }
+                } }
+                mi = mi + 1
+            }
+            if keep {
+                if val.tag == TAG_FLOAT { has_float = true; float_sum = float_sum + val.float_val }
+                else { int_sum = int_sum + val.int_val; float_sum = float_sum + val.int_val }
+            }
+        }
+        if has_float { return val_float(float_sum) }
+        return val_int(int_sum)
+    }
+    if last_method == "count" {
+        let mut cnt = 0
+        for item in arr {
+            let mut val = item
+            let mut keep = true
+            let mut mi = 0
+            while mi < chain_len - 1 && keep {
+                let m = rev_methods[mi]
+                let f = closures[mi]
+                if m == "map" { val = call_fn_val(f, [val]) }
+                else { if m == "filter" {
+                    let test = call_fn_val(f, [val])
+                    if !is_truthy(test) { keep = false }
+                } }
+                mi = mi + 1
+            }
+            if keep { cnt = cnt + 1 }
+        }
+        return val_int(cnt)
+    }
+    // any / all / find — predicate is final closure
+    if last_method == "any" || last_method == "all" || last_method == "find" {
+        let pred = closures[chain_len - 1]
+        let is_any = (last_method == "any")
+        let is_find = (last_method == "find")
+        for item in arr {
+            let mut val = item
+            let mut keep = true
+            let mut mi = 0
+            while mi < chain_len - 1 && keep {
+                let m = rev_methods[mi]
+                let f = closures[mi]
+                if m == "map" { val = call_fn_val(f, [val]) }
+                else { if m == "filter" {
+                    let test = call_fn_val(f, [val])
+                    if !is_truthy(test) { keep = false }
+                } }
+                mi = mi + 1
+            }
+            if keep {
+                let test = call_fn_val(pred, [val])
+                if is_truthy(test) {
+                    if is_find { return val }
+                    if is_any { return val_bool(true) }
+                } else {
+                    if !is_any && !is_find { return val_bool(false) }
+                }
+            }
+        }
+        if is_any { return val_bool(false) }
+        if is_find { return val_void() }
+        return val_bool(true)
+    }
+    return fuse_sentinel()
+}
+
+// ═══════════════════════════════════════════════════════════
+// stack (12 fn) — hexa_full L5790-6092, L15253-15261
+// ═══════════════════════════════════════════════════════════
+
+fn env_hash(name) {
+    let mut h = 0
+    let mut i = 0
+    let n = len(name)
+    while i < n {
+        h = h + char_code(name, i)
+        i = i + 1
+    }
+    let mut b = h
+    while b < 0 { b = b + 64 }
+    return b % 64
+}
+
+fn env_cache_init() {
+    // rt 32-E: init both parallel cache arrays (names, idxs). env_cache
+    // retained as legacy len==64 sentinel checked by fallback branches.
+    let mut names_buckets = []
+    let mut idxs_buckets = []
+    let mut legacy_buckets = []
+    let mut i = 0
+    while i < 64 {
+        names_buckets = names_buckets.push([])
+        idxs_buckets = idxs_buckets.push([])
+        legacy_buckets = legacy_buckets.push([])
+        i = i + 1
+    }
+    env_cache_names = names_buckets
+    env_cache_idxs = idxs_buckets
+    env_cache = legacy_buckets
+}
+
+// Rebuild cache from current env_var_names. Fallback for cases where a
+// cached snapshot is unavailable (e.g., interpret() reset, legacy paths).
+fn env_rebuild_cache() {
+    env_cache_init()
+    let mut i = 0
+    let n = len(env_var_names)
+    while i < n {
+        let nm = env_var_names[i]
+        let b = env_hash(nm)
+        env_cache_names[b] = env_cache_names[b].push(nm)
+        env_cache_idxs[b] = env_cache_idxs[b].push(i)
+        i = i + 1
+    }
+}
+
+// ── O(1) fn_cache helpers (mirrors env_cache pattern) ────
+// Reuse env_hash for bucket index — same 64-bucket, sum-of-char-codes scheme.
+
+fn fn_cache_init() {
+    let mut buckets = []
+    let mut i = 0
+    while i < 64 {
+        buckets = buckets.push([])
+        i = i + 1
+    }
+    fn_cache = buckets
+}
+
+fn fn_cache_add(name, idx) {
+    if len(fn_cache) != 64 { fn_cache_init() }
+    let b = env_hash(name)
+    fn_cache[b] = fn_cache[b].push([name, idx])
+}
+
+fn fn_rebuild_cache() {
+    fn_cache_init()
+    let mut i = 0
+    let n = len(env_fns)
+    while i < n {
+        let entry = env_fns[i]
+        let b = env_hash(entry[0])
+        fn_cache[b] = fn_cache[b].push([entry[0], i])
+        i = i + 1
+    }
+}
+
+fn env_push_scope() {
+    // rt 32-K: 2-push per-scope-enter pattern batched as single logical event.
+    // env_scopes (boundary marker) and env_scope_dirty (per-scope dirty bucket)
+    // are amortised global stacks pushed in lockstep on every scope enter
+    // (same rt 32-J semantics as env_define's name/val/cache pair). Charge ONE
+    // stat push for the canonical "scope enter" event (env_scopes) and use
+    // push_nostat for env_scope_dirty so the stat counter reflects scope-enter
+    // frequency rather than array-touch-frequency. Physical realloc/memcpy
+    // behavior unchanged — only the array_push counter semantics shift.
+    env_scopes = env_scopes.push(len(env_var_names))     // ← canonical stat bump for the scope-enter event
+    // rt 32: defer the per-scope `[]` allocation to env_define when actually
+    // needed. ML hot loops (matvec inner col loop) push hundreds of scopes
+    // with zero defines — pre-allocating a host array each time was a major
+    // hexa_array_new contributor (~900K/d64 micro). Sentinel `0` marks
+    // an empty scope; env_define lazy-converts to a real bucket list.
+    env_scope_dirty = env_scope_dirty.push_nostat(0)     // paired sibling — same scope-enter event
+}
+
+fn env_pop_scope() {
+    let boundary = env_scopes[len(env_scopes) - 1]
+    // bt 55 — in-place truncate replaces the rebuild-loop that leaked O(N)
+    // per scope pop. truncate() shrinks .len without reallocating, retaining
+    // capacity for amortized re-growth and releasing the old backing buffer
+    // reference. `env_vars = env_vars.truncate(n)` pattern satisfies I1
+    // (hexa lists pass-by-value) via reassignment.
+    // Remove the last scope marker
+    env_scopes = env_scopes.truncate(len(env_scopes) - 1)
+    // rt 32: decref array/struct slots before truncating env_var_vals. Without
+    // this the array_store freelist never reclaims slots (refcount stays
+    // ≥ 1 even after the binding goes out of scope), defeating the slot
+    // reuse optimization and leaking ~64 floats × N steps per matvec.
+    let env_len = len(env_var_names)
+    let mut _di = boundary
+    while _di < env_len {
+        let old_val = env_var_vals[_di]
+        if old_val.tag == TAG_ARRAY {
+            array_decref(old_val.int_val)
+        }
+        if old_val.tag == TAG_STRUCT {
+            struct_decref(old_val.int_val)
+        }
+        _di = _di + 1
+    }
+    // Truncate parallel arrays to boundary
+    env_var_names = env_var_names.truncate(boundary)
+    env_var_vals = env_var_vals.truncate(boundary)
+    // Prune cache: only scan buckets that were modified during this scope.
+    // Dirty-tracking reduces O(64 + total_cache_entries) to O(dirty_buckets).
+    let sdn = len(env_scope_dirty)
+    if sdn > 0 {
+        let dirty = env_scope_dirty[sdn - 1]
+        // Pop the dirty set
+        env_scope_dirty = env_scope_dirty.truncate(sdn - 1)
+        // rt 32: sentinel `0` (int) means scope had no defines → no cache
+        // pruning needed. Skips the entire dirty loop for empty scopes
+        // (matvec/vec_gelu inner while bodies — hottest path).
+        if type_of(dirty) != "int" {
+            let mut _pdi = 0
+            let dn = len(dirty)
+            while _pdi < dn {
+                let bi = dirty[_pdi]
+                // rt 32-E: walk parallel (names, idxs) buckets; keep only
+                // entries whose idx is still < boundary.
+                let b_names = env_cache_names[bi]
+                let b_idxs = env_cache_idxs[bi]
+                let mut kept_names = []
+                let mut kept_idxs = []
+                let mut ki = 0
+                let bn = len(b_idxs)
+                while ki < bn {
+                    let eidx = b_idxs[ki]
+                    if eidx < boundary {
+                        kept_names = kept_names.push(b_names[ki])
+                        kept_idxs = kept_idxs.push(eidx)
+                    }
+                    ki = ki + 1
+                }
+                env_cache_names[bi] = kept_names
+                env_cache_idxs[bi] = kept_idxs
+                _pdi = _pdi + 1
+            }
+        }
+    }
+}
+
+fn env_define(name, value) {
+    // Perf #10/#11 COW: incref when array/struct value is bound to a new name.
+    if value.tag == TAG_ARRAY {
+        array_incref(value.int_val)
+    }
+    if value.tag == TAG_STRUCT {
+        struct_incref(value.int_val)
+    }
+    // rt 32-E: parallel push — no `[name, value]` tuple alloc (-1 array_new,
+    // -2 array_push per define).
+    // rt 32-J: 4-push per-define pattern batched as single logical event.
+    // env_var_names/env_var_vals and env_cache_names[b]/env_cache_idxs[b]
+    // are amortised global buffers (same rt 32-B semantics as call_arg_buf):
+    // each env_define is ONE logical bind event that physically touches 4
+    // arrays in lockstep. Charge ONE stat push for the event and use
+    // push_nostat for the paired siblings so the stat counter reflects
+    // define-frequency rather than array-touch-frequency. env_scope_dirty
+    // bucket push is also a side-effect of the same event → push_nostat.
+    let idx = len(env_var_names)
+    env_var_names = env_var_names.push(name)            // ← canonical stat bump for the define event
+    env_var_vals = env_var_vals.push_nostat(value)       // paired sibling
+    // Lazily init cache on first define after reset.
+    if len(env_cache_names) != 64 { env_cache_init() }
+    let b = env_hash(name)
+    // rt 32-E: parallel push to (names, idxs) bucket — no tuple alloc.
+    // rt 32-J: cache update is a side effect of the same define event.
+    env_cache_names[b] = env_cache_names[b].push_nostat(name)
+    env_cache_idxs[b] = env_cache_idxs[b].push_nostat(idx)
+    // Track dirty bucket in current scope (opt #8)
+    let sdn = len(env_scope_dirty)
+    if sdn > 0 {
+        let top = env_scope_dirty[sdn - 1]
+        // rt 32: lazy bucket — sentinel `0` (int) means empty.  Allocate the
+        // real bucket list on first define in this scope.
+        if type_of(top) == "int" {
+            env_scope_dirty[sdn - 1] = [b]
+        } else {
+            // Avoid duplicate bucket entries in the dirty set
+            let mut already = false
+            let mut di = 0
+            while di < len(top) {
+                if top[di] == b { already = true }
+                di = di + 1
+            }
+            if !already {
+                // rt 32-J: dirty-tracking is also a side effect of the define.
+                env_scope_dirty[sdn - 1] = top.push_nostat(b)
+            }
+        }
+    }
+}
+
+fn env_lookup(name) {
+    // O(1) avg via bucket cache. Fall back to linear scan only if
+    // cache is empty (e.g., right after wholesale env_vars swap that
+    // forgot to rebuild — defensive).
+    if len(env_cache_names) == 64 {
+        let b = env_hash(name)
+        let b_names = env_cache_names[b]
+        let b_idxs = env_cache_idxs[b]
+        // Pick entry with largest index (newest binding still in scope).
+        let mut best = -1
+        let mut bi = 0
+        let bn = len(b_names)
+        while bi < bn {
+            if b_names[bi] == name {
+                let ei = b_idxs[bi]
+                if ei > best { best = ei }
+            }
+            bi = bi + 1
+        }
+        if best >= 0 && best < len(env_var_vals) {
+            return env_var_vals[best]
+        }
+        return val_void()
+    }
+    // Fallback linear scan
+    let mut i = len(env_var_names) - 1
+    while i >= 0 {
+        if env_var_names[i] == name {
+            return env_var_vals[i]
+        }
+        i = i - 1
+    }
+    return val_void()
+}
+
+fn env_set(name, value) {
+    // Perf #10/#11 COW: on reassignment, incref new array/struct value.
+    if value.tag == TAG_ARRAY {
+        array_incref(value.int_val)
+    }
+    if value.tag == TAG_STRUCT {
+        struct_incref(value.int_val)
+    }
+    if len(env_cache_names) == 64 {
+        let b = env_hash(name)
+        let b_names = env_cache_names[b]
+        let b_idxs = env_cache_idxs[b]
+        let mut best = -1
+        let mut bi = 0
+        let bn = len(b_names)
+        while bi < bn {
+            if b_names[bi] == name {
+                let ei = b_idxs[bi]
+                if ei > best { best = ei }
+            }
+            bi = bi + 1
+        }
+        if best >= 0 && best < len(env_var_vals) {
+            // Decref old value if it was an array or struct
+            let old_val = env_var_vals[best]
+            if old_val.tag == TAG_ARRAY {
+                array_decref(old_val.int_val)
+            }
+            if old_val.tag == TAG_STRUCT {
+                struct_decref(old_val.int_val)
+            }
+            env_var_vals[best] = value
+            return true
+        }
+        return false
+    }
+    let mut i = len(env_var_names) - 1
+    while i >= 0 {
+        if env_var_names[i] == name {
+            // Decref old value if it was an array or struct
+            let old_val = env_var_vals[i]
+            if old_val.tag == TAG_ARRAY {
+                array_decref(old_val.int_val)
+            }
+            if old_val.tag == TAG_STRUCT {
+                struct_decref(old_val.int_val)
+            }
+            env_var_vals[i] = value
+            return true
+        }
+        i = i - 1
+    }
+    return false
+}
+
+fn format_stack_trace() {
+    let mut trace = "Stack trace:"
+    let mut i = len(call_stack) - 1
+    while i >= 0 {
+        trace = trace + "\n  at " + call_stack[i]
+        i = i - 1
+    }
+    return trace
+}
+
+// ═══════════════════════════════════════════════════════════
+// match (2 fn) — hexa_full L7152-7319
+// ═══════════════════════════════════════════════════════════
+
+fn vals_equal(a, b) {
+    if a.tag != b.tag { return false }
+    if a.tag == TAG_INT { return a.int_val == b.int_val }
+    if a.tag == TAG_FLOAT { return a.float_val == b.float_val }
+    if a.tag == TAG_BOOL { return a.bool_val == b.bool_val }
+    if a.tag == TAG_STR { return a.str_val == b.str_val }
+    if a.tag == TAG_ENUM { return a.struct_name == b.struct_name && a.int_val == b.int_val }
+    if a.tag == TAG_VOID { return true }
+    return false
+}
+
+// ── Pattern matching ────────────────────────────────────
+
+fn match_pattern(pattern, value) {
+    let pk = pattern.kind
+    // Wildcard _ matches anything
+    if pk == "Wildcard" { return true }
+    // Integer literal pattern
+    if pk == "IntLit" {
+        if value.tag == TAG_INT { return value.int_val == to_int(pattern.value) }
+        return false
+    }
+    // String literal pattern
+    if pk == "StringLit" {
+        if value.tag == TAG_STR { return value.str_val == pattern.value }
+        return false
+    }
+    // Bool literal pattern
+    if pk == "BoolLit" {
+        if value.tag == TAG_BOOL { return value.bool_val == (pattern.value == "true") }
+        return false
+    }
+    // Float literal pattern
+    if pk == "FloatLit" {
+        if value.tag == TAG_FLOAT { return value.float_val == to_float(pattern.value) }
+        return false
+    }
+    // Negative literal pattern: -1, -3.14 etc.
+    if pk == "UnaryOp" && pattern.op == "-" {
+        let inner = pattern.left
+        if inner.kind == "IntLit" {
+            if value.tag == TAG_INT { return value.int_val == -to_int(inner.value) }
+            return false
+        }
+        if inner.kind == "FloatLit" {
+            if value.tag == TAG_FLOAT { return value.float_val == -to_float(inner.value) }
+            return false
+        }
+        return false
+    }
+    // EnumPath pattern: EnumName::Variant or EnumName::Variant(binding)
+    if pk == "EnumPath" {
+        if value.tag != TAG_ENUM { return false }
+        // Match variant name
+        let expected = pattern.name + "::" + pattern.value
+        if value.struct_name != expected { return false }
+        // If pattern has data binding, bind it
+        let data_pattern = pattern.left
+        let multi_pats = pattern.items
+        if type_of(multi_pats) == "array" && len(multi_pats) > 0 {
+            // Multi-field variant: value data must be array
+            let data_val = get_enum_data(value)
+            if data_val.tag != TAG_ARRAY { return false }
+            let ditems = get_array(data_val)
+            if len(ditems) != len(multi_pats) { return false }
+            let mut mp = 0
+            while mp < len(multi_pats) {
+                let sub = multi_pats[mp]
+                if type_of(sub) != "string" && sub.kind == "Ident" {
+                    env_define(sub.name, ditems[mp])
+                } else {
+                    if !match_pattern(sub, ditems[mp]) { return false }
+                }
+                mp = mp + 1
+            }
+            return true
+        }
+        if type_of(data_pattern) != "string" || data_pattern != "" {
+            let data_val = get_enum_data(value)
+            // If data pattern is an Ident, bind it
+            if data_pattern.kind == "Ident" {
+                env_define(data_pattern.name, data_val)
+            } else {
+                // Literal data pattern — must match
+                return match_pattern(data_pattern, data_val)
+            }
+        }
+        return true
+    }
+    // Call pattern: Some(x), Ok(x), Err(x) — shorthand enum constructors
+    if pk == "Call" {
+        let callee = pattern.left
+        if type_of(callee) != "string" && callee.kind == "Ident" {
+            let ctor = callee.name
+            let mut enum_name = ""
+            let mut variant_name = ""
+            if ctor == "Some" { enum_name = "Option"; variant_name = "Some" }
+            if ctor == "Ok" { enum_name = "Result"; variant_name = "Ok" }
+            if ctor == "Err" { enum_name = "Result"; variant_name = "Err" }
+            if enum_name != "" {
+                // Must be an enum value matching this constructor
+                if value.tag != TAG_ENUM { return false }
+                let expected = enum_name + "::" + variant_name
+                if value.struct_name != expected { return false }
+                // Bind the data argument if present
+                let call_args = pattern.args
+                if type_of(call_args) == "array" && len(call_args) == 1 {
+                    let data_val = get_enum_data(value)
+                    let arg_pat = call_args[0]
+                    if type_of(arg_pat) != "string" && arg_pat.kind == "Ident" {
+                        env_define(arg_pat.name, data_val)
+                        return true
+                    }
+                    // Nested pattern match on data
+                    return match_pattern(arg_pat, data_val)
+                }
+                // No args — match variant with no data
+                if type_of(call_args) != "array" || len(call_args) == 0 {
+                    if get_enum_data(value).tag == TAG_VOID { return true }
+                }
+                return false
+            }
+        }
+        // Not a known constructor — evaluate and compare
+        let pattern_val = eval_expr(pattern)
+        return vals_equal(pattern_val, value)
+    }
+    // Array/tuple pattern: [a, b, c]
+    if pk == "Array" {
+        if value.tag != TAG_ARRAY { return false }
+        let items = get_array(value)
+        let pats = pattern.items
+        if type_of(pats) != "array" { return false }
+        if len(pats) != len(items) { return false }
+        let mut pi = 0
+        while pi < len(pats) {
+            if !match_pattern(pats[pi], items[pi]) { return false }
+            pi = pi + 1
+        }
+        return true
+    }
+    // Identifier pattern: check for known enum constant, otherwise variable binding
+    if pk == "Ident" {
+        let name = pattern.name
+        // Check if it's a known enum constant (e.g., None)
+        // rt 32-E: parallel arrays lookup
+        let mut ei = len(env_var_names) - 1
+        while ei >= 0 {
+            if env_var_names[ei] == name {
+                let existing = env_var_vals[ei]
+                if existing.tag == TAG_ENUM {
+                    // Compare enum values
+                    return vals_equal(existing, value)
+                }
+                // Not an enum — treat as binding below
+                ei = -1
+            } else {
+                ei = ei - 1
+            }
+        }
+        // Bind as variable
+        env_define(name, value)
+        return true
+    }
+    // Fallback: evaluate pattern as expression and compare
+    let pattern_val = eval_expr(pattern)
+    return vals_equal(pattern_val, value)
+}

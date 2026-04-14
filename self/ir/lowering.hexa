@@ -1,0 +1,278 @@
+// ═══════════════════════════════════════════════════════════
+//  self/ir/lowering.hexa — AST → HEXA-IR Lowering (T11 초안)
+//
+//  Depends on (concat-link order): types.hexa, instr.hexa, builder.hexa,
+//  ast.hexa (for Expr/Stmt struct types).
+//
+//  Scope (T11 P1 — 5개 AST 노드만):
+//    - IntLit        →  load imm_i64 Value
+//    - FloatLit      →  load imm_f64 Value   (Operand 재사용: imm_f64 kind 지원)
+//    - BinOp Add/Sub/Mul/Div/Mod → ADD/SUB/MUL/DIV/MOD opcode
+//    - Return        →  RETURN opcode (terminator)
+//    - FnDecl        →  IrFunction + entry BasicBlock
+//
+//  Lowering 실패 (unknown kind) 시에는 마커 Value 를 반환하고 TODO 주석을
+//  emit 하여 전체 컴파일이 깨지지 않도록 한다. 이 번엔 standalone 이므로
+//  codegen_c2 파이프라인에는 접속하지 않는다.
+// ═══════════════════════════════════════════════════════════
+
+// ── Env: 식별자 → ValueId (아주 얕은 지역 스코프) ─────────────
+struct LowerEnv {
+    names:  array,  // array of string
+    vids:   array   // array of int (ValueId)
+}
+
+fn lower_env_new() {
+    return LowerEnv { names: [], vids: [] }
+}
+
+fn lower_env_bind(env, name, vid) {
+    push(env.names, name)
+    push(env.vids, vid)
+}
+
+fn lower_env_lookup(env, name) {
+    let i = 0
+    while i < len(env.names) {
+        if env.names[i] == name {
+            return env.vids[i]
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// ── Expression Lowering ─────────────────────────────────────
+// e  : Expr struct with `kind` tag (see ast.hexa)
+// returns ValueId (>=0) or -1 on failure.
+
+fn lower_int_lit(m, b, e) {
+    // IntLit → "load imm_i64" with i64 type.
+    return bld_const_i64(m, b, e.int_val)
+}
+
+fn lower_float_lit(m, b, e) {
+    // FloatLit → emit "load" with imm_f64 operand, f64 type.
+    // imm_f64 payload stored in Operand.a (int slot) is a 64-bit bit-pattern
+    // placeholder. Full f64 lowering requires a float-literal table; for now
+    // we store 0 and rely on caller to look up e.float_val separately.
+    let op = Operand { kind: "imm_f64", a: 0, b: 0, cmp: "" }
+    return builder_emit(m, b, "load", [op], "f64")
+}
+
+// Map AST BinOp string → IR mnemonic string.
+fn lower_binop_mnemonic(op_str) {
+    if op_str == "add" { return "add" }
+    if op_str == "sub" { return "sub" }
+    if op_str == "mul" { return "mul" }
+    if op_str == "div" { return "div" }
+    if op_str == "rem" { return "mod" }   // AST uses "rem"; IR opcode is "mod"
+    if op_str == "mod" { return "mod" }
+    return ""   // unsupported
+}
+
+// Lower BinOp. `lhs_vid` / `rhs_vid` must already be lowered (caller drives
+// the recursion over the parse tree — lowering.hexa is flat to avoid
+// re-parsing serialized children).
+fn lower_binop_from_vids(m, b, op_str, lhs_vid, rhs_vid, ty) {
+    let mnem = lower_binop_mnemonic(op_str)
+    if mnem == "" {
+        // TODO: lower BinOp kind unsupported ("+op_str+")
+        return -1
+    }
+    if mnem == "add" { return bld_add(m, b, lhs_vid, rhs_vid, ty) }
+    if mnem == "sub" { return bld_sub(m, b, lhs_vid, rhs_vid, ty) }
+    if mnem == "mul" { return bld_mul(m, b, lhs_vid, rhs_vid, ty) }
+    if mnem == "div" { return bld_div(m, b, lhs_vid, rhs_vid, ty) }
+    if mnem == "mod" { return bld_modulo(m, b, lhs_vid, rhs_vid, ty) }
+    return -1
+}
+
+// Single-expr dispatcher. Only handles leaf / already-lowered kinds listed
+// in scope. Unknown kinds return -1 and emit a placeholder.
+fn lower_expr(m, b, e, env) {
+    let k = e.kind
+    if k == "int_lit" {
+        return lower_int_lit(m, b, e)
+    }
+    if k == "float_lit" {
+        return lower_float_lit(m, b, e)
+    }
+    if k == "ident" {
+        let vid = lower_env_lookup(env, e.name)
+        if vid >= 0 {
+            return vid
+        }
+        // TODO: lower unresolved ident — inject a placeholder load
+        return bld_const_i64(m, b, 0)
+    }
+    // TODO: lower Expr kind (k) — call/if/match/block/lambda etc.
+    return -1
+}
+
+// ── Statement Lowering ──────────────────────────────────────
+// Minimal statement set: Return + let-binding (for env threading during
+// self-test construction; not a full let lowering yet).
+
+fn lower_return(m, b, val_vid) {
+    // RETURN opcode. val_vid <0 means "ret void".
+    return bld_ret(m, b, val_vid)
+}
+
+// ── Function Lowering ───────────────────────────────────────
+//  name        : string
+//  params      : array of [name, ir-type-kind-string]
+//  ret_type    : string (IrType kind)
+//  returns     : (func_id, builder)
+//
+// Body population is performed by the caller — this scaffold creates the
+// skeleton so that smaller lowerings can be composed.
+
+fn lower_fn_decl_skeleton(m, name, params, ret_type) {
+    let fid = module_add_function(m, name, params, ret_type)
+    let b = builder_new(m, fid)
+    return [fid, b]
+}
+
+// Convenience: materialize a simple `fn name(...) -> ret_type { return <body> }`
+// where `body_vid` is the ValueId produced by prior lower_expr calls.
+fn lower_simple_return_fn(m, name, params, ret_type, body_vid) {
+    let skel = lower_fn_decl_skeleton(m, name, params, ret_type)
+    let fid = skel[0]
+    let b = skel[1]
+    lower_return(m, b, body_vid)
+    return fid
+}
+
+// ── Self-tests ──────────────────────────────────────────────
+// Each test builds an IrModule, lowers a tiny AST by hand, and asserts the
+// resulting opcode sequence matches the expected list.
+
+fn _collect_opcodes(f) {
+    let out = []
+    let i = 0
+    while i < len(f.blocks) {
+        let bb = f.blocks[i]
+        let j = 0
+        while j < len(bb.instructions) {
+            push(out, bb.instructions[j].op)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn _ops_eq(a, b) {
+    if len(a) != len(b) {
+        return false
+    }
+    let i = 0
+    while i < len(a) {
+        if a[i] != b[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// T1: IntLit → load imm_i64 + ret.
+fn _lowering_test_int_return() {
+    let m = make_ir_module("t1")
+    let skel = lower_fn_decl_skeleton(m, "k42", [], "i64")
+    let fid = skel[0]
+    let b = skel[1]
+    let v = lower_int_lit(m, b, expr_int(42))
+    lower_return(m, b, v)
+    let got = _collect_opcodes(m.functions[fid])
+    assert _ops_eq(got, ["load", "ret"])
+}
+
+// T2: BinOp Add of two IntLits → load, load, add, ret.
+fn _lowering_test_add() {
+    let m = make_ir_module("t2")
+    let skel = lower_fn_decl_skeleton(m, "add3_4", [], "i64")
+    let fid = skel[0]
+    let b = skel[1]
+    let l = lower_int_lit(m, b, expr_int(3))
+    let r = lower_int_lit(m, b, expr_int(4))
+    let s = lower_binop_from_vids(m, b, "add", l, r, "i64")
+    lower_return(m, b, s)
+    let got = _collect_opcodes(m.functions[fid])
+    assert _ops_eq(got, ["load", "load", "add", "ret"])
+}
+
+// T3: (3*4) - (2+1) → load×4, mul, add, sub, ret.
+fn _lowering_test_nested_arith() {
+    let m = make_ir_module("t3")
+    let skel = lower_fn_decl_skeleton(m, "mix", [], "i64")
+    let fid = skel[0]
+    let b = skel[1]
+    let a = lower_int_lit(m, b, expr_int(3))
+    let c = lower_int_lit(m, b, expr_int(4))
+    let prod = lower_binop_from_vids(m, b, "mul", a, c, "i64")
+    let x = lower_int_lit(m, b, expr_int(2))
+    let y = lower_int_lit(m, b, expr_int(1))
+    let sum = lower_binop_from_vids(m, b, "add", x, y, "i64")
+    let diff = lower_binop_from_vids(m, b, "sub", prod, sum, "i64")
+    lower_return(m, b, diff)
+    let got = _collect_opcodes(m.functions[fid])
+    assert _ops_eq(got, ["load", "load", "mul", "load", "load", "add", "sub", "ret"])
+}
+
+// T4: Div / Mod coverage.
+fn _lowering_test_div_mod() {
+    let m = make_ir_module("t4")
+    let skel = lower_fn_decl_skeleton(m, "dm", [], "i64")
+    let fid = skel[0]
+    let b = skel[1]
+    let a = lower_int_lit(m, b, expr_int(10))
+    let c = lower_int_lit(m, b, expr_int(3))
+    let q = lower_binop_from_vids(m, b, "div", a, c, "i64")
+    let a2 = lower_int_lit(m, b, expr_int(10))
+    let c2 = lower_int_lit(m, b, expr_int(3))
+    let r = lower_binop_from_vids(m, b, "rem", a2, c2, "i64")   // AST "rem" → IR "mod"
+    let s = lower_binop_from_vids(m, b, "add", q, r, "i64")
+    lower_return(m, b, s)
+    let got = _collect_opcodes(m.functions[fid])
+    assert _ops_eq(got, ["load", "load", "div", "load", "load", "mod", "add", "ret"])
+}
+
+// T5: FloatLit lowering type tag ("f64") on the load instruction.
+fn _lowering_test_float_lit() {
+    let m = make_ir_module("t5")
+    let skel = lower_fn_decl_skeleton(m, "pi", [], "f64")
+    let fid = skel[0]
+    let b = skel[1]
+    let v = lower_float_lit(m, b, expr_float(3.14))
+    lower_return(m, b, v)
+    let f = m.functions[fid]
+    // First instruction is load; its type must be f64.
+    assert len(f.blocks) > 0
+    assert len(f.blocks[0].instructions) == 2
+    assert f.blocks[0].instructions[0].op == "load"
+    assert f.blocks[0].instructions[0].ty == "f64"
+    assert f.blocks[0].instructions[1].op == "ret"
+}
+
+// T6: Unsupported BinOp → returns -1, emits TODO (no crash).
+fn _lowering_test_unsupported_binop() {
+    let m = make_ir_module("t6")
+    let skel = lower_fn_decl_skeleton(m, "bad", [], "i64")
+    let b = skel[1]
+    let a = lower_int_lit(m, b, expr_int(1))
+    let c = lower_int_lit(m, b, expr_int(2))
+    let r = lower_binop_from_vids(m, b, "pow", a, c, "i64")
+    assert r == -1
+}
+
+fn lowering_run_tests() {
+    _lowering_test_int_return()
+    _lowering_test_add()
+    _lowering_test_nested_arith()
+    _lowering_test_div_mod()
+    _lowering_test_float_lit()
+    _lowering_test_unsupported_binop()
+    println("lowering: 6 tests PASS")
+}
