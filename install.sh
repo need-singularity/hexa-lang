@@ -65,7 +65,7 @@ install_hexa() {
 
     local tmp
     tmp="$(mktemp -d)"
-    trap 'rm -rf "$tmp"' EXIT
+    HEXA_TMPDIR="$tmp"
 
     dim "  fetching $url"
     if ! curl -fsSL "$url" -o "$tmp/hexa.tar.gz" 2>/dev/null; then
@@ -80,13 +80,16 @@ install_hexa() {
     fi
 
     tar -xzf "$tmp/hexa.tar.gz" -C "$tmp"
-    # Archive layout: hexa-{target}/{hexa,hexa_stage0}
+    # Archive layout: hexa-{target}/{hexa, build/hexa_stage0}
+    # The dispatcher resolves stage0 relative to argv[0] (<dir>/build/hexa_stage0),
+    # so we preserve the build/ directory alongside the hexa binary.
     local src="$tmp/hexa-${target}"
     [ -d "$src" ] || src="$tmp"
 
     install -m 0755 "$src/hexa" "$HX_BIN/hexa"
-    if [ -f "$src/hexa_stage0" ]; then
-        install -m 0755 "$src/hexa_stage0" "$HX_BIN/hexa_stage0"
+    if [ -f "$src/build/hexa_stage0" ]; then
+        mkdir -p "$HX_BIN/build"
+        install -m 0755 "$src/build/hexa_stage0" "$HX_BIN/build/hexa_stage0"
     fi
     green "  ✓ $HX_BIN/hexa"
 }
@@ -122,6 +125,11 @@ update_path_hint() {
         echo "    export PATH=\"\$HOME/.hx/bin:\$PATH\""
     fi
 }
+
+cleanup() {
+    [ -n "${HEXA_TMPDIR:-}" ] && [ -d "$HEXA_TMPDIR" ] && rm -rf "$HEXA_TMPDIR"
+}
+trap cleanup EXIT
 
 main() {
     need_cmd curl
