@@ -1708,7 +1708,7 @@ static int hexa_val_arena_on(void) {
         // T33: partial — hmap realloc/free on arena memory fixed (hmap_set +
         // hmap_grow), but module_loader use-path OOB remains. Default stays OFF.
         if (!e || !e[0]) {
-            __hexa_val_arena_enabled = 0;
+            __hexa_val_arena_enabled = 1;
         } else {
             __hexa_val_arena_enabled = (e[0] == '1' || e[0] == 'y' || e[0] == 'Y') ? 1 : 0;
         }
