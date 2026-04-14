@@ -632,3 +632,33 @@ Related breakthroughs landed in `shared/hexa-lang/state.json`:
   경유하지 못함 (free-var scan 이 Lambda 노드를 건너뜀)
 - `hexa run --vm` default flip 검토 (전체 stage1 regression + bench)
 
+### §18.1 bt#85 baseline (T52, 2026-04-15) — **게이트 미달성**
+
+모든 rt#36-E 배선 완료 후 첫 3-run median 측정. bench_fib_K30.hexa 는
+range-for (미지원) 이므로 동형 while-loop 로 `bench_fib_K30_vm.hexa`
+/ `bench_call_heavy.hexa` 추가 후 측정.
+
+| bench | interp (s) | VM (s) | VM/interp | 게이트 | 판정 |
+|-------|-----------|--------|-----------|--------|------|
+| fib(K=30) = fib(20)×30 | 3.09 | 3.37 | **0.92×** | ≥2× | ❌ REGRESSION |
+| call_heavy = 500K tiny call | 2.38 | 1.72 | **1.38×** | ≥3× | ❌ 2.17× 부족 |
+
+**Allocation profile** (fib(K=30) VM): `array_new=16M`, `array_push=16M`,
+RSS 7.7 GB (interp 1.2 GB 의 6.4×). 원인 — `bc_vm_push_frame`/
+`bc_vm_push_frame_indirect` 가 콜 당 `vm_locals.push(BC_NIL)` 반복 +
+`vm_frame_{proto,pc,fp,closure}.push(...)` 4회 + `bc_vm_setat` 으로
+args 슬롯 세팅 (매번 array 복사). Hexa 의 pass-by-value 배열 semantics
+때문에 모든 push/setat 가 신규 할당. 657K 콜 × ~N locals × GC/alloc
+overhead 가 tree-walker 의 `env_get` 비용을 역전.
+
+**잔여 블로커 (ship 게이트)**:
+
+1. **프레임 풀** (T52) — `vm_locals` 를 사전 할당 큰 배열 + fp 포인터 로
+   전환. 콜 당 O(N) push → O(1) index 이동. 추정: fib 8× 개선 여지.
+2. **operand stack 고정 용량** — `vm_stack` 도 같은 구조 필요.
+3. **@bytecode 속성 선택적 적용** — hot path 만 VM, cold path interp.
+4. **flamegraph (§14 risk register)** — ≥60% time inside opcode bodies
+   확보 전 게이트 통과 불가 (현재 로는 push/setat 가 지배적 추정).
+
+bt#85 는 T52 (프레임 풀 리팩토링) 완료 후 재측정.
+
