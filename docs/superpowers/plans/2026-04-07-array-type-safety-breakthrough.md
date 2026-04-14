@@ -63,7 +63,7 @@ fn test_int_float_coercion_array() {
 
 - [ ] **Step 2: 테스트 실패 확인**
 
-Run: `cd /Users/ghost/Dev/hexa-lang && cargo test test_heterogeneous_array_error -- --nocapture 2>&1 | tail -5`
+Run: `cd $HEXA_LANG && cargo test test_heterogeneous_array_error -- --nocapture 2>&1 | tail -5`
 Expected: FAIL — 현재는 이질 배열이 에러 없이 통과
 
 - [ ] **Step 3: check_expr에서 배열 원소 타입 검증 구현**
@@ -116,13 +116,13 @@ Expr::Array(items) => {
 
 - [ ] **Step 5: 테스트 통과 확인**
 
-Run: `cd /Users/ghost/Dev/hexa-lang && cargo test test_heterogeneous_array -- --nocapture 2>&1 | tail -10`
+Run: `cd $HEXA_LANG && cargo test test_heterogeneous_array -- --nocapture 2>&1 | tail -10`
 Expected: 4개 테스트 모두 PASS
 
 - [ ] **Step 6: 커밋**
 
 ```bash
-cd /Users/ghost/Dev/hexa-lang
+cd $HEXA_LANG
 git add src/type_checker.rs
 git commit -m "feat(type): array element homogeneity check — mixed types now caught at compile time"
 ```
@@ -154,7 +154,7 @@ fn test_array_eq_type() {
 
 - [ ] **Step 2: 테스트 실패 확인**
 
-Run: `cd /Users/ghost/Dev/hexa-lang && cargo test test_array_concat_type -- --nocapture 2>&1 | tail -5`
+Run: `cd $HEXA_LANG && cargo test test_array_concat_type -- --nocapture 2>&1 | tail -5`
 Expected: FAIL 또는 Unknown 타입 반환
 
 - [ ] **Step 3: BinOp에 Array 연산 추가**
@@ -190,13 +190,13 @@ BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div
 
 - [ ] **Step 4: 테스트 통과 확인**
 
-Run: `cd /Users/ghost/Dev/hexa-lang && cargo test test_array_concat_type test_array_eq_type -- --nocapture 2>&1 | tail -10`
+Run: `cd $HEXA_LANG && cargo test test_array_concat_type test_array_eq_type -- --nocapture 2>&1 | tail -10`
 Expected: PASS
 
 - [ ] **Step 5: 커밋**
 
 ```bash
-cd /Users/ghost/Dev/hexa-lang
+cd $HEXA_LANG
 git add src/type_checker.rs
 git commit -m "feat(type): array BinOp type inference — concat, repeat, comparison"
 ```
@@ -289,7 +289,7 @@ fn test_array_equality() {
 
 - [ ] **Step 2: 테스트 실패 확인**
 
-Run: `cd /Users/ghost/Dev/hexa-lang && cargo test test_array_pop test_negative_index test_array_repeat test_array_equality -- --nocapture 2>&1 | tail -10`
+Run: `cd $HEXA_LANG && cargo test test_array_pop test_negative_index test_array_repeat test_array_equality -- --nocapture 2>&1 | tail -10`
 Expected: FAIL
 
 - [ ] **Step 3: 누락 메서드 6종 구현 (pop, find, find_index, any, all, swap, fill)**
@@ -480,13 +480,13 @@ Expr::Index(arr_expr, idx_expr) => {
 
 - [ ] **Step 9: 테스트 통과 확인**
 
-Run: `cd /Users/ghost/Dev/hexa-lang && cargo test test_array_pop test_array_find test_array_find_index test_array_any test_array_all test_array_swap test_array_fill test_negative_index test_negative_index_assign test_array_repeat test_array_equality -- --nocapture 2>&1 | tail -20`
+Run: `cd $HEXA_LANG && cargo test test_array_pop test_array_find test_array_find_index test_array_any test_array_all test_array_swap test_array_fill test_negative_index test_negative_index_assign test_array_repeat test_array_equality -- --nocapture 2>&1 | tail -20`
 Expected: 모두 PASS
 
 - [ ] **Step 10: 커밋**
 
 ```bash
-cd /Users/ghost/Dev/hexa-lang
+cd $HEXA_LANG
 git add src/interpreter.rs
 git commit -m "feat(array): 7 new methods + negative indexing + repeat + equality comparison"
 ```
@@ -555,7 +555,7 @@ match x {
 
 - [ ] **Step 2: 테스트 실패 확인**
 
-Run: `cd /Users/ghost/Dev/hexa-lang && cargo test test_match_array_literal -- --nocapture 2>&1 | tail -5`
+Run: `cd $HEXA_LANG && cargo test test_match_array_literal -- --nocapture 2>&1 | tail -5`
 Expected: FAIL
 
 - [ ] **Step 3: AST에 ArrayPattern 추가**
@@ -680,18 +680,18 @@ Expr::Ident(name) => {
 
 - [ ] **Step 7: 테스트 통과 확인**
 
-Run: `cd /Users/ghost/Dev/hexa-lang && cargo test test_match_array -- --nocapture 2>&1 | tail -15`
+Run: `cd $HEXA_LANG && cargo test test_match_array -- --nocapture 2>&1 | tail -15`
 Expected: 4개 모두 PASS
 
 - [ ] **Step 8: 기존 테스트 전체 통과 확인**
 
-Run: `cd /Users/ghost/Dev/hexa-lang && cargo test 2>&1 | tail -5`
+Run: `cd $HEXA_LANG && cargo test 2>&1 | tail -5`
 Expected: 전체 PASS (기존 match 테스트 포함)
 
 - [ ] **Step 9: 커밋**
 
 ```bash
-cd /Users/ghost/Dev/hexa-lang
+cd $HEXA_LANG
 git add src/ast.rs src/parser.rs src/interpreter.rs
 git commit -m "feat(match): array pattern matching — [a, b, ...rest] destructuring in match"
 ```
@@ -737,18 +737,18 @@ Expr::ArrayPattern(pats, _) => {
 
 - [ ] **Step 3: 컴파일 확인**
 
-Run: `cd /Users/ghost/Dev/hexa-lang && cargo build 2>&1 | tail -10`
+Run: `cd $HEXA_LANG && cargo build 2>&1 | tail -10`
 Expected: 컴파일 성공 (exhaustive match 경고 없음)
 
 - [ ] **Step 4: 전체 테스트**
 
-Run: `cd /Users/ghost/Dev/hexa-lang && cargo test 2>&1 | tail -5`
+Run: `cd $HEXA_LANG && cargo test 2>&1 | tail -5`
 Expected: 전체 PASS
 
 - [ ] **Step 5: 커밋**
 
 ```bash
-cd /Users/ghost/Dev/hexa-lang
+cd $HEXA_LANG
 git add src/jit.rs src/ownership.rs
 git commit -m "fix: propagate ArrayPattern to JIT/ownership for exhaustive match coverage"
 ```
@@ -800,13 +800,13 @@ fn test_array_all_methods() {
 
 - [ ] **Step 2: 전체 빌드 + 테스트**
 
-Run: `cd /Users/ghost/Dev/hexa-lang && bash build.sh test 2>&1 | tail -20`
+Run: `cd $HEXA_LANG && bash build.sh test 2>&1 | tail -20`
 Expected: 전체 PASS
 
 - [ ] **Step 3: 커밋**
 
 ```bash
-cd /Users/ghost/Dev/hexa-lang
+cd $HEXA_LANG
 git add src/interpreter.rs
 git commit -m "test: array breakthrough integration tests — all scenarios PASS"
 ```

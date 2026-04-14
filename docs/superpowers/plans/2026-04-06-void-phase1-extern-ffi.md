@@ -44,7 +44,7 @@ In the keyword lookup (match or HashMap), add `"extern" => Token::Extern`.
 
 - [ ] **Step 4: Verify compilation**
 
-Run: `cd /Users/ghost/Dev/hexa-lang && export PATH="$HOME/.cargo/bin:$PATH" && cargo check 2>&1 | tail -5`
+Run: `cd $HEXA_LANG && export PATH="$HOME/.cargo/bin:$PATH" && cargo check 2>&1 | tail -5`
 Expected: compiles (warnings about unused Extern OK)
 
 - [ ] **Step 5: Commit**
@@ -552,7 +552,7 @@ println("=== All extern FFI tests passed ===")
 
 - [ ] **Step 2: Build hexa**
 
-Run: `cd /Users/ghost/Dev/hexa-lang && export PATH="$HOME/.cargo/bin:$PATH" && bash build.sh 2>&1 | tail -5`
+Run: `cd $HEXA_LANG && export PATH="$HOME/.cargo/bin:$PATH" && bash build.sh 2>&1 | tail -5`
 
 - [ ] **Step 3: Run test with interpreter**
 

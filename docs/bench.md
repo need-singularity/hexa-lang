@@ -24,7 +24,7 @@ Examples:
 ```bash
 hexa bench bench/fib_rec.hexa --runs 5
 hexa bench bench/probe.hexa --json
-hexa bench bench/alloc_heavy.hexa --compare /Users/ghost/Dev/hexa-lang/build/hexa_stage0_prev
+hexa bench bench/alloc_heavy.hexa --compare $HEXA_LANG/build/hexa_stage0_prev
 ```
 
 ## Sample Output
@@ -33,7 +33,7 @@ Table mode:
 
 ```
 === hexa bench ===
-  binary:    /Users/ghost/Dev/hexa-lang/hexa
+  binary:    $HEXA_LANG/hexa
   file:      bench/alloc_heavy.hexa
   runs:      3
 
@@ -62,8 +62,8 @@ Compare mode (positive delta% = B is slower / heavier than A):
 === hexa bench --compare ===
   file:      bench/alloc_heavy.hexa
   runs:      2
-  A:         /Users/ghost/Dev/hexa-lang/.claude/worktrees/bt-81/hexa
-  B:         /Users/ghost/Dev/hexa-lang/hexa
+  A:         $HEXA_LANG/.claude/worktrees/bt-81/hexa
+  B:         $HEXA_LANG/hexa
 
   metric         A (median)    B (median)    delta%
   ─────────────  ────────────  ────────────  ────────

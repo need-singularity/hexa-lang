@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust (rustc, no cargo), tree-walk interpreter first, LLVM backend later. Tests via `#[cfg(test)]`.
 
-**Repo:** `/Users/ghost/Dev/hexa-lang/`
+**Repo:** `$HEXA_LANG/`
 
 ---
 
