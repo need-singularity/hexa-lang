@@ -2254,8 +2254,10 @@ HexaVal hexa_type_of(HexaVal v) {
 HexaVal hexa_add(HexaVal a, HexaVal b) {
     if (a.tag == TAG_INT && b.tag == TAG_INT) return hexa_int(a.i + b.i);
     if (a.tag == TAG_FLOAT || b.tag == TAG_FLOAT) {
-        double fa = a.tag == TAG_FLOAT ? a.f : (double)a.i;
-        double fb = b.tag == TAG_FLOAT ? b.f : (double)b.i;
+        // T39: unwrap via __hx_to_double so TAG_VALSTRUCT wrappers don't
+        // cast the vs pointer to double (same root as T32 to_float bug).
+        double fa = __hx_to_double(a);
+        double fb = __hx_to_double(b);
         return hexa_float(fa + fb);
     }
     // B13: array concat. Interpreter (hexa_full.hexa:6954) does this but
@@ -2344,23 +2346,22 @@ HexaVal hexa_args() {
 
 #include <math.h>
 
+// T39: math helpers route through __hx_to_double so TAG_VALSTRUCT
+// wrappers (interpreter Vals) don't cast vs pointer bits to double.
 HexaVal hexa_sqrt(HexaVal v) {
-    double x = v.tag == TAG_FLOAT ? v.f : (double)v.i;
-    return hexa_float(sqrt(x));
+    return hexa_float(sqrt(__hx_to_double(v)));
 }
 
 HexaVal hexa_pow(HexaVal base, HexaVal exp) {
-    double b = base.tag == TAG_FLOAT ? base.f : (double)base.i;
-    double e = exp.tag == TAG_FLOAT ? exp.f : (double)exp.i;
-    return hexa_float(pow(b, e));
+    return hexa_float(pow(__hx_to_double(base), __hx_to_double(exp)));
 }
 
 HexaVal hexa_floor(HexaVal v) {
-    return hexa_int((int64_t)floor(v.tag == TAG_FLOAT ? v.f : (double)v.i));
+    return hexa_int((int64_t)floor(__hx_to_double(v)));
 }
 
 HexaVal hexa_ceil(HexaVal v) {
-    return hexa_int((int64_t)ceil(v.tag == TAG_FLOAT ? v.f : (double)v.i));
+    return hexa_int((int64_t)ceil(__hx_to_double(v)));
 }
 
 HexaVal hexa_abs(HexaVal v) {
@@ -2548,27 +2549,22 @@ HexaVal hexa_pad_right(HexaVal s, HexaVal width) {
     return hexa_str_own(result);
 }
 
-// B-19: Polymorphic arithmetic
+// B-19: Polymorphic arithmetic — T39 routes through __hx_to_double.
 HexaVal hexa_sub(HexaVal a, HexaVal b) {
     if (a.tag == TAG_INT && b.tag == TAG_INT) return hexa_int(a.i - b.i);
-    double fa = a.tag == TAG_FLOAT ? a.f : (double)a.i;
-    double fb = b.tag == TAG_FLOAT ? b.f : (double)b.i;
-    return hexa_float(fa - fb);
+    return hexa_float(__hx_to_double(a) - __hx_to_double(b));
 }
 HexaVal hexa_mul(HexaVal a, HexaVal b) {
     if (a.tag == TAG_INT && b.tag == TAG_INT) return hexa_int(a.i * b.i);
-    double fa = a.tag == TAG_FLOAT ? a.f : (double)a.i;
-    double fb = b.tag == TAG_FLOAT ? b.f : (double)b.i;
-    return hexa_float(fa * fb);
+    return hexa_float(__hx_to_double(a) * __hx_to_double(b));
 }
 HexaVal hexa_div(HexaVal a, HexaVal b) {
     if (a.tag == TAG_INT && b.tag == TAG_INT) {
         if (b.i == 0) return hexa_int(0);
         return hexa_int(a.i / b.i);
     }
-    double fa = a.tag == TAG_FLOAT ? a.f : (double)a.i;
-    double fb = b.tag == TAG_FLOAT ? b.f : (double)b.i;
-    return hexa_float(fa / fb);
+    double fb = __hx_to_double(b);
+    return hexa_float(__hx_to_double(a) / fb);
 }
 HexaVal hexa_mod(HexaVal a, HexaVal b) {
     if (a.tag == TAG_INT && b.tag == TAG_INT) return hexa_int(b.i ? a.i % b.i : 0);
@@ -2593,7 +2589,7 @@ int hexa_array_contains(HexaVal arr, HexaVal item) {
 }
 
 HexaVal hexa_format_float(HexaVal f, HexaVal prec) {
-    double v = f.tag == TAG_FLOAT ? f.f : (double)f.i;
+    double v = __hx_to_double(f);
     int p = prec.i;
     char buf[64];
     snprintf(buf, 64, "%.*f", p, v);
@@ -2601,7 +2597,7 @@ HexaVal hexa_format_float(HexaVal f, HexaVal prec) {
 }
 
 HexaVal hexa_format_float_sci(HexaVal f, HexaVal prec) {
-    double v = f.tag == TAG_FLOAT ? f.f : (double)f.i;
+    double v = __hx_to_double(f);
     int p = prec.i;
     char buf[64];
     snprintf(buf, 64, "%.*e", p, v);
@@ -2883,7 +2879,7 @@ HexaVal hexa_ptr_write_f32(HexaVal ptr, HexaVal offset, HexaVal val) {
     int64_t p = (ptr.tag == TAG_INT) ? ptr.i : 0;
     int64_t off = (offset.tag == TAG_INT) ? offset.i : 0;
     if (p == 0) return hexa_void();
-    float f = (float)(val.tag == TAG_FLOAT ? val.f : (double)val.i);
+    float f = (float)__hx_to_double(val);
     memcpy((uint8_t*)(uintptr_t)p + off, &f, sizeof(float));
     return hexa_void();
 }

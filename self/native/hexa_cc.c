@@ -8253,28 +8253,35 @@ HexaVal gen2_expr(HexaVal node) {
                 return hexa_add(hexa_add(hexa_str("hexa_abs("), gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_227), hexa_int(0)))), hexa_str(")"));
             }
             if (hexa_truthy(hexa_eq(name, hexa_str("round")))) {
+                // T32: route through __hx_to_double (runtime.c:415) to unwrap
+                // TAG_VALSTRUCT interpreter Vals correctly.
                 a = gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_228), hexa_int(0)));
-                return hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_int((int64_t)round("), a), hexa_str(".tag==TAG_FLOAT?")), a), hexa_str(".f:(double)")), a), hexa_str(".i))"));
+                return hexa_add(hexa_add(hexa_str("hexa_int((int64_t)round(__hx_to_double("), a), hexa_str(")))"));
             }
             if (hexa_truthy(hexa_bool(hexa_truthy(hexa_eq(name, hexa_str("ln"))) || hexa_truthy(hexa_eq(name, hexa_str("log")))))) {
+                // T32: route through __hx_to_double for VALSTRUCT unwrap.
                 a = gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_229), hexa_int(0)));
-                return hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_float(log("), a), hexa_str(".tag==TAG_FLOAT?")), a), hexa_str(".f:(double)")), a), hexa_str(".i))"));
+                return hexa_add(hexa_add(hexa_str("hexa_float(log(__hx_to_double("), a), hexa_str(")))"));
             }
             if (hexa_truthy(hexa_eq(name, hexa_str("log10")))) {
+                // T32: route through __hx_to_double for VALSTRUCT unwrap.
                 a = gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_230), hexa_int(0)));
-                return hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_float(log10("), a), hexa_str(".tag==TAG_FLOAT?")), a), hexa_str(".f:(double)")), a), hexa_str(".i))"));
+                return hexa_add(hexa_add(hexa_str("hexa_float(log10(__hx_to_double("), a), hexa_str(")))"));
             }
             if (hexa_truthy(hexa_eq(name, hexa_str("exp")))) {
+                // T32: route through __hx_to_double for VALSTRUCT unwrap.
                 a = gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_231), hexa_int(0)));
-                return hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_float(exp("), a), hexa_str(".tag==TAG_FLOAT?")), a), hexa_str(".f:(double)")), a), hexa_str(".i))"));
+                return hexa_add(hexa_add(hexa_str("hexa_float(exp(__hx_to_double("), a), hexa_str(")))"));
             }
             if (hexa_truthy(hexa_eq(name, hexa_str("sin")))) {
+                // T32: route through __hx_to_double for VALSTRUCT unwrap.
                 a = gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_232), hexa_int(0)));
-                return hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_float(sin("), a), hexa_str(".tag==TAG_FLOAT?")), a), hexa_str(".f:(double)")), a), hexa_str(".i))"));
+                return hexa_add(hexa_add(hexa_str("hexa_float(sin(__hx_to_double("), a), hexa_str(")))"));
             }
             if (hexa_truthy(hexa_eq(name, hexa_str("cos")))) {
+                // T32: route through __hx_to_double for VALSTRUCT unwrap.
                 a = gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_233), hexa_int(0)));
-                return hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_float(cos("), a), hexa_str(".tag==TAG_FLOAT?")), a), hexa_str(".f:(double)")), a), hexa_str(".i))"));
+                return hexa_add(hexa_add(hexa_str("hexa_float(cos(__hx_to_double("), a), hexa_str(")))"));
             }
             if (hexa_truthy(hexa_eq(name, hexa_str("pow")))) {
                 return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_pow("), gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_234), hexa_int(0)))), hexa_str(", ")), gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_235), hexa_int(1)))), hexa_str(")"));
@@ -8324,8 +8331,11 @@ HexaVal gen2_expr(HexaVal node) {
                 return hexa_add(hexa_add(hexa_str("hexa_exec("), gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_246), hexa_int(0)))), hexa_str(")"));
             }
             if (hexa_truthy(hexa_eq(name, hexa_str("to_int")))) {
+                // T32: route numeric tags through __hx_to_double (runtime.c:415)
+                // so TAG_VALSTRUCT interpreter Vals unwrap correctly; keep
+                // atoll for TAG_STR to preserve full int64 range.
                 a = gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_247), hexa_int(0)));
-                return hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_int(("), a), hexa_str(".tag==TAG_FLOAT?(int64_t)")), a), hexa_str(".f:")), a), hexa_str(".tag==TAG_STR?atoll(")), a), hexa_str(".s):")), a), hexa_str(".i))"));
+                return hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_int(("), a), hexa_str(".tag==TAG_STR?atoll(")), a), hexa_str(".s):(int64_t)__hx_to_double(")), a), hexa_str(")))"));
             }
             if (hexa_truthy(hexa_eq(name, hexa_str("min")))) {
                 a = gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_248), hexa_int(0)));
@@ -8470,8 +8480,11 @@ HexaVal gen2_expr(HexaVal node) {
                 return gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_323), hexa_int(0)));
             }
             if (hexa_truthy(hexa_eq(name, hexa_str("int")))) {
+                // T32: route numeric tags through __hx_to_double (runtime.c:415)
+                // so TAG_VALSTRUCT interpreter Vals unwrap correctly; keep
+                // atoll for TAG_STR to preserve full int64 range.
                 a = gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_324), hexa_int(0)));
-                return hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_int(("), a), hexa_str(".tag==TAG_FLOAT?(int64_t)")), a), hexa_str(".f:")), a), hexa_str(".tag==TAG_STR?atoll(")), a), hexa_str(".s):")), a), hexa_str(".i))"));
+                return hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_int(("), a), hexa_str(".tag==TAG_STR?atoll(")), a), hexa_str(".s):(int64_t)__hx_to_double(")), a), hexa_str(")))"));
             }
             if (hexa_truthy(hexa_eq(name, hexa_str("str")))) {
                 return hexa_add(hexa_add(hexa_str("hexa_to_string("), gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_325), hexa_int(0)))), hexa_str(")"));
