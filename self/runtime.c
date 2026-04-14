@@ -2458,6 +2458,11 @@ HexaVal hexa_pad_left(HexaVal s, HexaVal width) {
 }
 
 
+// Bootstrap shim: hexa-level `join(arr, sep)` free-fn idiom in SSOT modules
+// emits `hexa_call2(join, arr, sep)` via TAG_FN lookup. Once hexa_v2 is rebuilt
+// from codegen_c2.hexa's join-builtin dispatch, this becomes unused.
+static HexaVal join = {.tag = TAG_FN, .fn = {.fn_ptr = (void*)hexa_str_join, .arity = 2}};
+
 HexaVal hexa_pad_right(HexaVal s, HexaVal width) {
     HexaVal str = hexa_to_string(s);
     int w = width.i;
@@ -3162,7 +3167,12 @@ HexaVal hexa_random(void) {
     return hexa_float(rand() / (double)RAND_MAX);
 }
 
-HexaVal char_code(HexaVal s, HexaVal idx) {
+HexaVal hexa_char_code(HexaVal s, HexaVal idx);
+// Bootstrap shim (same rationale as `join` above): SSOT modules use
+// `char_code(s, i)` free-fn idiom which old hexa_v2 emits as
+// `hexa_call2(char_code, ...)`. Shim binds the bare identifier to TAG_FN.
+static HexaVal char_code = {.tag = TAG_FN, .fn = {.fn_ptr = (void*)hexa_char_code, .arity = 2}};
+HexaVal hexa_char_code(HexaVal s, HexaVal idx) {
     if (s.tag != TAG_STR) return hexa_int(0);
     int i = idx.i;
     if (i < 0 || i >= (int)strlen(s.s)) return hexa_int(0);
