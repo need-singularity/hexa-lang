@@ -7023,10 +7023,12 @@ HexaVal codegen_c2(HexaVal ast) {
     HexaVal fn_parts = hexa_array_new();
     HexaVal main_parts = hexa_array_new();
     HexaVal extern_fns = hexa_array_new();
+    HexaVal has_user_main = hexa_bool(0); /* T23: emit u_main() call from C main */
     HexaVal i = hexa_int(0);
     while (hexa_truthy(hexa_bool(__extension__ ({ HexaVal __l=(i); HexaVal __r=(hexa_int(hexa_len(ast))); (__l.tag==TAG_FLOAT||__r.tag==TAG_FLOAT) ? ((__l.tag==TAG_FLOAT?__l.f:(double)__l.i) < (__r.tag==TAG_FLOAT?__r.f:(double)__r.i)) : (__l.i < __r.i); })))) {
         HexaVal k = hexa_map_get_ic(hexa_index_get(ast, i), "kind", &__hexa_codegen_c2_ic_8);
         if (hexa_truthy(hexa_eq(k, hexa_str("FnDecl")))) {
+            if (hexa_truthy(hexa_eq(hexa_map_get(hexa_index_get(ast, i), "name"), hexa_str("main")))) { has_user_main = hexa_bool(1); }
             fwd_parts = hexa_array_push(fwd_parts, hexa_add(gen2_fn_forward(hexa_index_get(ast, i)), hexa_str("\n")));
             fn_parts = hexa_array_push(fn_parts, hexa_add(gen2_fn_decl(hexa_index_get(ast, i)), hexa_str("\n\n")));
         } else {
@@ -7122,6 +7124,7 @@ HexaVal codegen_c2(HexaVal ast) {
     parts = hexa_array_push(parts, hexa_str("int main(int argc, char** argv) {\n"));
     parts = hexa_array_push(parts, hexa_str("    hexa_set_args(argc, argv);\n"));
     parts = hexa_array_push(parts, hexa_str_join(main_parts, hexa_str("")));
+    if (hexa_truthy(has_user_main)) { parts = hexa_array_push(parts, hexa_str("    u_main();\n")); }
     parts = hexa_array_push(parts, hexa_str("    return 0;\n}\n"));
     return hexa_str_join(parts, hexa_str(""));
     return hexa_void();
@@ -9754,10 +9757,12 @@ HexaVal codegen_c2_full(HexaVal ast) {
     HexaVal global_parts = hexa_array_new();
     HexaVal fn_parts = hexa_array_new();
     HexaVal main_parts = hexa_array_new();
+    HexaVal has_user_main = hexa_bool(0); /* T23: emit u_main() call from C main (full) */
     HexaVal i = hexa_int(0);
     while (hexa_truthy(hexa_bool(__extension__ ({ HexaVal __l=(i); HexaVal __r=(hexa_int(hexa_len(ast))); (__l.tag==TAG_FLOAT||__r.tag==TAG_FLOAT) ? ((__l.tag==TAG_FLOAT?__l.f:(double)__l.i) < (__r.tag==TAG_FLOAT?__r.f:(double)__r.i)) : (__l.i < __r.i); })))) {
         HexaVal k = hexa_map_get_ic(hexa_index_get(ast, i), "kind", &__hexa_codegen_c2_ic_519);
         if (hexa_truthy(hexa_eq(k, hexa_str("FnDecl")))) {
+            if (hexa_truthy(hexa_eq(hexa_map_get(hexa_index_get(ast, i), "name"), hexa_str("main")))) { has_user_main = hexa_bool(1); }
             fwd_parts = hexa_array_push(fwd_parts, hexa_add(gen2_fn_forward(hexa_index_get(ast, i)), hexa_str("\n")));
             fn_parts = hexa_array_push(fn_parts, hexa_add(gen2_fn_decl(hexa_index_get(ast, i)), hexa_str("\n\n")));
         } else {
@@ -9855,6 +9860,7 @@ HexaVal codegen_c2_full(HexaVal ast) {
     out_parts = hexa_array_push(out_parts, hexa_str("int main(int argc, char** argv) {\n"));
     out_parts = hexa_array_push(out_parts, hexa_str("    hexa_set_args(argc, argv);\n"));
     out_parts = hexa_array_push(out_parts, hexa_str_join(main_parts, hexa_str("")));
+    if (hexa_truthy(has_user_main)) { out_parts = hexa_array_push(out_parts, hexa_str("    u_main();\n")); }
     out_parts = hexa_array_push(out_parts, hexa_str("    return 0;\n}\n"));
     return hexa_str_join(out_parts, hexa_str(""));
     return hexa_void();
